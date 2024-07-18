@@ -220,13 +220,22 @@ class FlaxDbrxAttention(FlaxAttentionModule):
         query_states, key_value_states = jnp.split(qkv_states, [query_size], axis=2)
         key_states, value_states = jnp.split(key_value_states, [key_size], axis=2)
         query_states = query_states.reshape(
-            batch_size, sequence_length, self.num_attention_heads, self.head_dim
+            batch_size,
+            sequence_length,
+            self.num_attention_heads,
+            self.head_dim,
         )
         key_states = key_states.reshape(
-            batch_size, sequence_length, self.num_key_value_heads, self.head_dim
+            batch_size,
+            sequence_length,
+            self.num_key_value_heads,
+            self.head_dim,
         )
         value_states = value_states.reshape(
-            batch_size, sequence_length, self.num_key_value_heads, self.head_dim
+            batch_size,
+            sequence_length,
+            self.num_key_value_heads,
+            self.head_dim,
         )
         query_states, key_states, value_states = self.apply_rotary(
             query=query_states,

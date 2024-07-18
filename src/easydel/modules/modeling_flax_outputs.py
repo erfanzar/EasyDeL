@@ -866,6 +866,7 @@ class MoeCausalLMOutput(FlaxMaskedLMOutput):
 
     aux_loss: Optional[jnp.ndarray] = None
     router_logits: Optional[Tuple[jnp.ndarray]] = None
+    all_router_losses: Optional[Tuple[jnp.ndarray]] = None
 
 
 @flax.struct.dataclass
