@@ -1,17 +1,20 @@
 import functools
 import math
 from functools import partial
-from typing import List, Literal, Optional, Sequence
+from typing import Any, Dict, List, Literal, Optional, Sequence, Union
 
 import chex
 import einops
 import fjformer
 import jax
+import jax.tree_util
 from einops import rearrange
 from fjformer.bit_quantization import config as q_config
 from fjformer.bit_quantization import q_flax
+from fjformer.custom_array import Array4Bit, Array8Bit
 from flax import linen as nn
 from flax.linen import combine_masks
+from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax import numpy as jnp
 from jax.experimental.mesh_utils import create_device_mesh
@@ -20,9 +23,11 @@ from jax.interpreters import pxla
 from jax.sharding import PartitionSpec
 
 from easydel.etils.errors import EasyDeLBlockWiseFFNError
+from easydel.etils.etils import get_logger
 from easydel.etils.partition_module import PartitionAxis
 from easydel.modules.modeling_utils import EasyMethod
 
+logger = get_logger(__name__)
 ACT2FN = {
     "gelu": partial(nn.gelu, approximate=False),
     "relu": nn.relu,
@@ -816,3 +821,112 @@ def dequantize_kv_cache(
     if reformat:
         uq = uq.transpose(0, 2, 1, 3)
     return uq
+
+
+def is_flatten(pytree: dict):
+    """The is_flatten function checks if the pytree is flattened.
+        If it is, then the first key in the dictionary will be a tuple of (mpl, mpl_id).
+        Otherwise, it will be an integer representing mpl_id.
+
+    Args:
+        pytree: dict: Pass the pytree to the function
+
+    Returns:
+        True if the pytree is a flattened tree, and false otherwise
+    """
+    mpl = [k for k in pytree.keys()][0]
+    return True if isinstance(mpl, tuple) else False
+
+
+def quantize_params_8bit(
+    params: Union[Dict[str, Any], Any],
+    embedding_layer_name: Optional[str] = None,
+    layers_to_ignore: Optional[list[str]] = None,
+) -> Union[Dict[str, Any], Any]:
+    """
+    Quantize parameters to 8-bit precision, excluding specified layers.
+
+    Args:
+        params: The parameters to quantize. Can be a nested dictionary or a flat structure.
+        embedding_layer_name: Name of the embedding layer to ignore during quantization.
+        layers_to_ignore: List of additional layer names to ignore during quantization.
+
+    Returns:
+        Quantized parameters in the same structure as the input.
+    """
+    embedding_layer_name = embedding_layer_name or "embedding"
+    layers_to_ignore = set(layers_to_ignore or [])
+    layers_to_ignore.add(embedding_layer_name)
+
+    flatten = not isinstance(params, dict)
+    if not flatten:
+        params = flatten_dict(params)
+
+    def quantize(path, array):
+        layer_name = ".".join(path[0].key)
+        if any(ignore in layer_name for ignore in layers_to_ignore):
+            logger.info(f"Layer {layer_name} is not quantized.")
+            return array
+        return Array8Bit.quantize(array)
+
+    params = jax.tree_util.tree_map_with_path(quantize, params)
+
+    if not flatten:
+        params = unflatten_dict(params)
+
+    return params
+
+
+def quantize_params_nf4(
+    params: Union[Dict[str, Any], Any],
+    embedding_layer_name: Optional[str] = None,
+    layers_to_ignore: Optional[list[str]] = None,
+    block_size: Literal[32, 64, 128, 256, 512, 1024, 2048, 4096] = 64,
+    contraction_axis: int = 0,
+) -> Union[Dict[str, Any], Any]:
+    """
+    Quantize parameters to nf4 4-bit precision, excluding specified layers.
+
+    Args:
+        params: The parameters to quantize. Can be a nested dictionary or a flat structure.
+        embedding_layer_name: Name of the embedding layer to ignore during quantization.
+        layers_to_ignore: List of additional layer names to ignore during quantization.
+        block_size (Literal[32, 64, 128, 256, 512, 1024, 2048, 4096]): Size of each quantization block.
+        contraction_axis (int): Axis along which contraction is performed.
+
+    Returns:
+        Quantized parameters in the same structure as the input.
+    """
+    embedding_layer_name = embedding_layer_name or "embedding"
+    layers_to_ignore = set(layers_to_ignore or [])
+    layers_to_ignore.add(embedding_layer_name)
+
+    flatten = not isinstance(params, dict)
+    if not flatten:
+        params = flatten_dict(params)
+
+    def quantize(path, array):
+        layer_name = ".".join(path[0].key)
+        if any(ignore in layer_name for ignore in layers_to_ignore):
+            logger.info(f"Layer {layer_name} is not quantized (ignored).")
+            return array
+        elif array.ndim > 2:
+            logger.info(f"Layer {layer_name} is not quantized (ndim > 2).")
+            return array
+        if not (array.shape[contraction_axis] / 16).is_integer():
+            logger.info(
+                f"Layer {layer_name} is not quantized (shape[contraction_axis] % 16 != 0)."
+            )
+            return array
+        return Array4Bit.quantize(
+            array=array,
+            block_size=block_size,
+            contraction_axis=contraction_axis,
+        )
+
+    params = jax.tree_util.tree_map_with_path(quantize, params)
+
+    if not flatten:
+        params = unflatten_dict(params)
+
+    return params
