@@ -800,7 +800,10 @@ class ArcticPreTrainedModel(EDPretrainedModel):
         )
 
     def init_weights(
-        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+        self,
+        rng: jax.random.PRNGKey,
+        input_shape: Tuple,
+        params: FrozenDict = None,
     ) -> FrozenDict:
         """The init_weights function is used to initialize the weights of a model.
         It takes in a rng, which is a random number generator key that can be used to generate random numbers.

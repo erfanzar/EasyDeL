@@ -235,9 +235,12 @@ from easydel.transform import (
     torch_dict_to_easydel_params as torch_dict_to_easydel_params,
 )
 
+from easydel import modules as modules
+from easydel import etils as etils
+
 import fjformer as _fj
 
-assert _fj.__version__ == "0.0.71", (
+assert _fj.__version__ == "0.0.72", (
     f"this version os EasyDeL is only compatible with fjformer==0.0.70,"
     f" but found fjformer {_fj.__version__}"
 )
