@@ -1,3 +1,4 @@
+import fjformer
 import pathlib
 import re
 import warnings
@@ -15,7 +16,7 @@ from typing import (
 import jax
 import jax.numpy as jnp
 import numpy as np
-from fjformer.lora import LoraRapture, RaptureConfig
+from fjformer import LoraRapture, RaptureConfig
 from jax.sharding import PartitionSpec
 from jax.tree_util import PyTreeDef
 

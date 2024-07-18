@@ -50,6 +50,18 @@ logger = get_logger(__name__)
 DEFAULT_K_BLOCK = 512
 DEFAULT_Q_BLOCK = 512
 
+def _get_jax_dtype_from_string(dtype_string):
+    dtype_mapping = {
+        "<class 'jax.numpy.float32'>": jnp.float32,
+        "<class 'jax.numpy.float64'>": jnp.float64,
+        "<class 'jax.numpy.int32'>": jnp.int32,
+        "<class 'jax.numpy.int64'>": jnp.int64,
+        "<class 'jax.numpy.bool_'>": jnp.bool_,
+        "<class 'jax.numpy.complex64'>": jnp.complex64,
+        "<class 'jax.numpy.complex128'>": jnp.complex128,
+    }
+    
+    return dtype_mapping.get(dtype_string, None)
 
 @dataclass
 class AttentionOutput:
@@ -403,7 +415,9 @@ class FlexibleAttentionModule(object):
             raise OSError("splash attention is only supported on TPU.")
         if attn_mechanism == "cudnn" and self.platform != "gpu":
             raise OSError("flash attention is only supported on GPU.")
-
+        if isinstance(self.dtype, str):
+            self.dtype = _get_jax_dtype_from_string(self.dtype)
+            assert self.dtype is not None,"Please consider passing attn_dtype to config."
     def get_block_size_splash_attn(self, q_seq, k_seq):
         return BlockSizesSplashAttn(
             block_q=min(self.block_q, q_seq),
@@ -1114,7 +1128,10 @@ class FlexibleAttentionModule(object):
             value_states = fjformer.with_sharding_constraint(value_states, vps)
 
             query_states, key_states, value_states = promote_dtype(
-                query_states, key_states, value_states, dtype=self.dtype
+                query_states,
+                key_states,
+                value_states,
+                dtype=self.dtype,
             )
 
             query_states = query_states * self.sm_scale
