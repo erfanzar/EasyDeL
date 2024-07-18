@@ -3,7 +3,6 @@ import math
 from typing import Optional, Tuple, Union
 
 import chex
-import fjformer
 import flax
 import jax
 from fjformer.functions import auxiliary_load_balancing_loss_func
@@ -103,7 +102,7 @@ class FlaxArcticAttention(FlaxAttentionModule):
         self.q_proj = dense(self.num_heads * self.head_dim)
         self.k_proj = dense(self.num_key_value_heads * self.head_dim)
         self.v_proj = dense(self.num_key_value_heads * self.head_dim)
-        self.o_proj = dense(self.num_key_value_heads * self.head_dim)
+        self.o_proj = dense(self.num_heads * self.head_dim)
         self.rotary = FlaxArcticRotaryEmbedding(self.dtype)
         self.attention_performer = FlexibleAttentionModule(
             num_attention_heads=self.config.num_attention_heads,
@@ -223,7 +222,9 @@ class FlaxArcticAttention(FlaxAttentionModule):
             )
 
         key_states, value_states = self.repeat_key_value(
-            key_states, value_states, self.num_key_value_groups
+            key_states,
+            value_states,
+            self.num_key_value_groups,
         )
         assert_msg = (
             "num_attention_heads repeat wont work likely\n"
@@ -234,16 +235,7 @@ class FlaxArcticAttention(FlaxAttentionModule):
         assert query_states.shape[-2] == self.config.num_attention_heads, assert_msg
         assert key_states.shape[-2] == self.config.num_attention_heads, assert_msg
         assert value_states.shape[-2] == self.config.num_attention_heads, assert_msg
-        # if self.config.use_sharding_constraint:
-        #     query_states = with_sharding_constraint(
-        #         query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)
-        #     )
-        #     key_states = with_sharding_constraint(
-        #         key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-        #     )
-        #     value_states = with_sharding_constraint(
-        #         value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-        #     )
+
         attention_bias = lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -635,7 +627,6 @@ class FlaxArcticDecoderLayer(nn.Module):
         # deterministic: bool = True
         # init_cache: bool = False
         # output_attentions: bool = True
-
         hidden_states, self_attn_weights = self.self_attn(
             hidden_states,
             freq_cis,
@@ -647,7 +638,6 @@ class FlaxArcticDecoderLayer(nn.Module):
             init_cache,
             output_attentions,
         )
-
         hidden_states = residual_input + hidden_states
 
         residual_attn = hidden_states
