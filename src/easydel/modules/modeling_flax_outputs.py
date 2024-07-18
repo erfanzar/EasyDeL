@@ -1,8 +1,9 @@
-from typing import Dict, Optional, Tuple, OrderedDict, Any, List
+from dataclasses import fields, is_dataclass
+from typing import Any, Dict, List, Optional, OrderedDict, Tuple
+
 import flax
 import jax.numpy as jnp
 from jax.core import Tracer
-from dataclasses import fields, is_dataclass
 
 
 def _is_array(array):
@@ -818,7 +819,7 @@ class FlaxSeq2SeqQuestionAnsweringModelOutput(ModelOutput):
 
 
 @flax.struct.dataclass
-class MoeModelOutput:
+class MoeModelOutput(FlaxMaskedLMOutput):
     """
     Base class for MoE model outputs.
 
@@ -846,6 +847,7 @@ class MoeModelOutput:
     hidden_states: Optional[Tuple[jnp.ndarray]] = None
     attentions: Optional[Tuple[jnp.ndarray]] = None
     router_logits: Optional[Tuple[jnp.ndarray]] = None
+    all_router_losses: Optional[Tuple[jnp.ndarray]] = None
 
 
 @flax.struct.dataclass
