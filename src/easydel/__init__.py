@@ -1,5 +1,6 @@
 __version__ = "0.0.80"
 
+import fjformer
 import os as _os
 
 if bool(
@@ -237,6 +238,7 @@ from easydel.transform import (
 
 import fjformer as _fj
 
-assert (
-    _fj.__version__ == "0.0.70"
-), f"this version os EasyDeL is only compatible with fjformer==0.0.70, but found fjformer {_fj.__version__}"
+assert _fj.__version__ == "0.0.71", (
+    f"this version os EasyDeL is only compatible with fjformer==0.0.70,"
+    f" but found fjformer {_fj.__version__}"
+)
