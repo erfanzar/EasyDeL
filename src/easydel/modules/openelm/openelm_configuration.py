@@ -51,6 +51,68 @@ def compute_heads(model_dim: int, head_dim: int) -> int:
 
 
 class OpenELMConfig(EDPretrainedConfig):
+    """
+    Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read
+    the documentation from [`EDPretrainedConfig`] for more information.
+
+    Args:
+        vocab_size (`int`, *optional*, defaults to 32000):
+            Vocabulary size of the OpenELM model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed to the forward method.
+        max_context_length (`int`, *optional*, defaults to 2048):
+            The maximum sequence length that this model might ever be used with. Typically set this to something large
+            just in case (e.g., 2048 or 4096).
+        num_transformer_layers (`int`, *optional*, defaults to 12):
+            Number of hidden layers in the Transformer encoder.
+        model_dim (`int`, *optional*, defaults to 2048):
+            Dimensionality of the encoder layers and the pooler layer.
+        head_dim (`int`, *optional*, defaults to 128):
+            Dimensionality of the attention heads.
+        qkv_multipliers (`float` or `list` of `float`, *optional*, defaults to 1.0):
+            The multiplier for the query, key, and value projections.
+        num_query_heads (`int`, *optional*):
+            Number of query heads. If not provided, it will be calculated based on `model_dim` and `head_dim`.
+        num_gqa_groups (`int`, *optional*, defaults to 1):
+            Number of GQA (Grouped Query Attention) groups.
+        ffn_multipliers (`float` or `list` of `float`, *optional*, defaults to 4.0):
+            The multiplier for the feed-forward network.
+        ffn_with_glu (`bool`, *optional*, defaults to `True`):
+            Whether to use a gated linear unit (GLU) in the feed-forward network.
+        ffn_dim_divisor (`int`, *optional*, defaults to 256):
+            The divisor for the feed-forward network dimension.
+        activation_fn_name (`str`, *optional*, defaults to `"swish"`):
+            The activation function to use.
+        normalization_layer_name (`str`, *optional*, defaults to `"rms_norm"`):
+            The normalization layer to use.
+        normalize_qk_projections (`bool`, *optional*, defaults to `False`):
+            Whether to normalize the query and key projections.
+        share_input_output_layers (`bool`, *optional*, defaults to `False`):
+            Whether to share the input and output layers.
+        rope_freq_constant (`int`, *optional*, defaults to 10000):
+            The frequency constant for Rotary Position Embeddings (RoPE).
+        rope_max_length (`int`, *optional*, defaults to 4096):
+            The maximum length for RoPE.
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether or not the model should return the last key/values attentions (not used by all models). Only
+            relevant if `config.is_decoder=True`.
+        bos_token_id (`int`, *optional*, defaults to 1):
+            The id of the *beginning-of-sequence* token.
+        eos_token_id (`int`, *optional*, defaults to 2):
+            The id of the *end-of-sequence* token.
+        rope_scaling (`Dict[str, Union[str, float]]`, *optional*):
+            The configuration for rope scaling.
+        gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
+            The gradient checkpointing configuration.
+        use_scan_mlp (`bool`, *optional*, defaults to `False`):
+            Whether to use the scan implementation for the MLP.
+        scan_mlp_chunk_size (`int`, *optional*, defaults to 1024):
+            The chunk size to use when scanning the MLP.
+        bits (`int`, *optional*):
+            The number of bits to quantize the model to.
+    """
+
     model_type: str = "openelm"
 
     def __init__(
@@ -180,18 +242,15 @@ class OpenELMConfig(EDPretrainedConfig):
         self.__post_init__()
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
-        """The get_partition_rules function is used to define the partitioning scheme for a model.
-        It returns a list of tuples, where each tuple contains two elements:
-          1) A regex string that matches the name of one or more parameters in the model.
-          2) A PartitionScheme object that defines how those parameters should be partitioned.
+        """
+        Get the partition rules for the model.
 
         Args:
-            fully_sharded_data_parallel: bool: Determine whether to use
-                the fully_sharded_data_parallel partitioning scheme or
-                not
+            fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
+                Whether to use fully sharded data parallelism.
 
         Returns:
-            A list of tuples
+            `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
         """
         return (
             (

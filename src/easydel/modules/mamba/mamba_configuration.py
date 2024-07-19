@@ -4,6 +4,64 @@ from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
 class MambaConfig(EDPretrainedConfig):
+    """
+    Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read
+    the documentation from [`EDPretrainedConfig`] for more information.
+
+    Args:
+        vocab_size (`int`, *optional*, defaults to 50280):
+            Vocabulary size of the Mamba model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed to the forward method.
+        hidden_size (`int`, *optional*, defaults to 768):
+            Dimensionality of the encoder layers and the pooler layer.
+        state_size (`int`, *optional*, defaults to 16):
+            State size of the Mamba model.
+        num_hidden_layers (`int`, *optional*, defaults to 32):
+            Number of hidden layers in the Transformer encoder.
+        layer_norm_epsilon (`float`, *optional*, defaults to 1e-5):
+            The epsilon used by the layer normalization layers.
+        pad_token_id (`int`, *optional*, defaults to 0):
+            The index of the padding token in the vocabulary.
+        bos_token_id (`int`, *optional*, defaults to 0):
+            The id of the *beginning-of-sequence* token.
+        eos_token_id (`int`, *optional*, defaults to 0):
+            The id of the *end-of-sequence* token.
+        expand (`int`, *optional*, defaults to 2):
+            Expansion factor for the intermediate size.
+        conv_kernel (`int`, *optional*, defaults to 4):
+            Kernel size of the convolution layer.
+        use_bias (`bool`, *optional*, defaults to `False`):
+            Whether to use bias in the linear layers.
+        use_conv_bias (`bool`, *optional*, defaults to `True`):
+            Whether to use bias in the convolution layer.
+        hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
+            The non-linear activation function (function or string) to use in the encoder and pooler. If string,
+            `"gelu"`, `"relu"`, `"swish"` and `"gelu_new"` are supported.
+        initializer_range (`float`, *optional*, defaults to 0.1):
+            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+        residual_in_fp32 (`bool`, *optional*, defaults to `True`):
+            Whether to compute the residual connection in float32.
+        time_step_rank (`str` or `int`, *optional*, defaults to `"auto"`):
+            The rank of the time step embedding. If set to `"auto"`, the rank is calculated as
+            `math.ceil(self.hidden_size / 16)`.
+        time_step_scale (`float`, *optional*, defaults to 1.0):
+            The scale factor for the time step embedding.
+        time_step_min (`float`, *optional*, defaults to 0.001):
+            The minimum value for the time step embedding.
+        time_step_max (`float`, *optional*, defaults to 0.1):
+            The maximum value for the time step embedding.
+        time_step_init_scheme (`str`, *optional*, defaults to `"random"`):
+            The initialization scheme for the time step embedding. Possible values are `"random"` and `"uniform"`.
+        time_step_floor (`float`, *optional*, defaults to 1e-4):
+            The floor value for the time step embedding.
+        rescale_prenorm_residual (`bool`, *optional*, defaults to `False`):
+            Whether to rescale the pre-norm residual.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether or not the model should return the last key/values attentions (not used by all models). Only
+            relevant if `config.is_decoder=True`.
+        gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
+            The gradient checkpointing configuration.
+    """
     model_type: str = "mamba"
 
     def __init__(
@@ -66,6 +124,16 @@ class MambaConfig(EDPretrainedConfig):
         super().__init__(**kwargs)
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+        """
+        Get the partition rules for the model.
+
+        Args:
+            fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
+                Whether to use fully sharded data parallelism.
+
+        Returns:
+            `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+        """
         return super().get_partition_rules(
             fully_sharded_data_parallel=fully_sharded_data_parallel
         )

@@ -1,6 +1,6 @@
 import dataclasses
 from functools import partial
-from typing import Optional, Union,Dict
+from typing import Dict, Optional, Union
 
 import jax
 from jax import numpy as jnp
@@ -8,6 +8,20 @@ from jax import random, sharding
 
 
 class GenerationPipelineConfig:
+    """
+    Configuration class for the text generation pipeline.
+
+    Attributes:
+        max_new_tokens: Maximum number of tokens to generate.
+        temperature: Temperature parameter for sampling.
+        top_p: Top-p (nucleus) sampling threshold.
+        top_k: Top-k sampling parameter.
+        repetition_penalty: Penalty for repeating tokens.
+        length_penalty: Penalty for generating longer sequences.
+        pad_token_id: ID of the padding token.
+        bos_token_id: ID of the beginning-of-sequence token.
+        eos_token_id: ID of the end-of-sequence token.
+    """
 
     def __init__(
         self,
@@ -34,6 +48,20 @@ class GenerationPipelineConfig:
 
 
 class _DynamicGenerationConfig:
+    """
+    Dynamic configuration class for the text generation pipeline.
+
+    This class holds the subset of generation parameters that can be
+    dynamically updated during the generation process.
+
+    Attributes:
+        temperature: Temperature parameter for sampling.
+        top_k: Top-k sampling parameter.
+        top_p: Top-p (nucleus) sampling threshold.
+        repetition_penalty: Penalty for repeating tokens.
+        length_penalty: Penalty for generating longer sequences.
+    """
+
     def __init__(self, config):
         self.temperature = config.temperature
         self.top_k = config.top_k
@@ -52,6 +80,22 @@ def compile_function(
     static_argnums=None,
     donate_argnums=None,
 ):
+    """
+    Compiles a JAX function with optional sharding and mesh configuration.
+
+    Args:
+        func: The JAX function to compile.
+        func_input_args: Input arguments for the function.
+        func_input_kwargs: Input keyword arguments for the function.
+        mesh: Optional JAX mesh for distributed execution.
+        in_shardings: Optional input sharding specifications.
+        out_shardings: Optional output sharding specifications.
+        static_argnums: Indices of static arguments.
+        donate_argnums: Indices of arguments to donate.
+
+    Returns:
+        Compiled JAX function.
+    """
     if mesh is None:
         return (
             jax.jit(
@@ -81,6 +125,18 @@ def compile_function(
 @jax.tree_util.register_pytree_node_class
 @dataclasses.dataclass
 class SampleState:
+    """
+    Data class representing the state of the sampling process.
+
+    Attributes:
+        cur_len: Current length of the generated sequence.
+        sequences: Generated token sequences.
+        running_token: The last generated token for each sequence.
+        is_sent_finished: Boolean array indicating finished sequences.
+        prng_key: JAX PRNG key for random sampling.
+        model_kwargs: Keyword arguments passed to the model.
+    """
+
     cur_len: Union[jax.Array, sharding.NamedSharding]
     sequences: Union[jax.Array, sharding.NamedSharding]
     running_token: Union[jax.Array, sharding.NamedSharding]
@@ -104,7 +160,17 @@ class SampleState:
 
 
 def apply_repetition_penalty(logits, tokens, penalty):
-    """Applies repetition penalty efficiently using JAX operations."""
+    """
+    Applies repetition penalty to the logits.
+
+    Args:
+        logits: Logits tensor.
+        tokens: Previously generated tokens.
+        penalty: Repetition penalty factor.
+
+    Returns:
+        Logits tensor with repetition penalty applied.
+    """
 
     # Create a mask for the tokens that appear in the input
     vocab_size = logits.shape[-1]
@@ -118,7 +184,18 @@ def apply_repetition_penalty(logits, tokens, penalty):
 
 
 def apply_length_penalty(logits, cur_len, max_len, length_penalty):
-    """Applies length penalty to logits."""
+    """
+    Applies length penalty to the logits.
+
+    Args:
+        logits: Logits tensor.
+        cur_len: Current length of the generated sequence.
+        max_len: Maximum length of the sequence.
+        length_penalty: Length penalty factor.
+
+    Returns:
+        Logits tensor with length penalty applied.
+    """
 
     # Calculate the penalty factor
     penalty_factor = ((5 + cur_len) / 6) ** length_penalty
@@ -129,7 +206,16 @@ def apply_length_penalty(logits, cur_len, max_len, length_penalty):
 
 @partial(jax.jit, static_argnames=["top_k"])
 def apply_top_k_sampling(logits, top_k):
-    """Applies top-k sampling to the logits."""
+    """
+    Applies top-k sampling to the logits.
+
+    Args:
+        logits: Logits tensor.
+        top_k: Number of top logits to consider.
+
+    Returns:
+        Logits tensor with top-k sampling applied.
+    """
     batch_size, vocab_size = logits.shape
     next_logits_flat = jnp.full(batch_size * vocab_size, -float("Inf"))
 
@@ -147,7 +233,16 @@ def apply_top_k_sampling(logits, top_k):
 
 
 def apply_top_p_sampling(logits, top_p):
-    """Applies top-p (nucleus) sampling to the logits."""
+    """
+    Applies top-p (nucleus) sampling to the logits.
+
+    Args:
+        logits: Logits tensor.
+        top_p: Top-p sampling threshold.
+
+    Returns:
+        Logits tensor with top-p sampling applied.
+    """
     topk_logits, topk_indices = jax.lax.top_k(logits, logits.shape[-1])
 
     mask_logits = jnp.full_like(logits, -float("Inf"))
@@ -164,10 +259,33 @@ def apply_top_p_sampling(logits, top_p):
 
 
 def sampling(sampling_logits, key):
+    """
+    Samples from the logits using categorical distribution.
+
+    Args:
+        sampling_logits: Logits tensor.
+        key: JAX PRNG key.
+
+    Returns:
+        Sampled token IDs.
+    """
     return jax.random.categorical(key, sampling_logits).reshape(-1)
 
 
 def temperature_branch(logits, prng_key, top_k, temperature, top_p):
+    """
+    Applies temperature scaling, top-k and top-p sampling to the logits.
+
+    Args:
+        logits: Logits tensor.
+        prng_key: JAX PRNG key.
+        top_k: Number of top logits to consider.
+        temperature: Temperature scaling factor.
+        top_p: Top-p sampling threshold.
+
+    Returns:
+        Sampled token IDs.
+    """
     logits = logits / temperature
     if top_k > 1:
         logits = apply_top_k_sampling(logits=logits, top_k=top_k)
@@ -177,6 +295,15 @@ def temperature_branch(logits, prng_key, top_k, temperature, top_p):
 
 
 def gready_branch(logits):
+    """
+    Performs greedy decoding on the logits.
+
+    Args:
+        logits: Logits tensor.
+
+    Returns:
+        Token IDs with the highest logits.
+    """
     return jnp.argmax(logits, axis=-1).reshape(-1)
 
 
@@ -188,6 +315,23 @@ def inference_step(
     cur_len,
     max_length,
 ):
+    """
+    Performs a single inference step in the text generation process.
+
+    This function applies repetition and length penalties to the logits,
+    and then performs either temperature-based sampling or greedy decoding.
+
+    Args:
+        logits: Model's logits for the current step.
+        tokens: Previously generated tokens.
+        prng_key: JAX PRNG key for random sampling.
+        config: GenerationPipelineConfig object.
+        cur_len: Current length of the generated sequence.
+        max_length: Maximum allowed length for the generated sequence.
+
+    Returns:
+        jax.Array: An array of generated token IDs.
+    """
     length_penalty = config.length_penalty
     repetition_penalty = config.repetition_penalty
     # Apply repetition penalty

@@ -5,6 +5,7 @@ from typing import Callable, List, Mapping, Optional
 import jax
 import transformers
 from fjformer.checkpoint import get_dtype
+from fjformer.custom_array import Array8Bit
 from flax import traverse_util
 from flax.traverse_util import flatten_dict
 from jax import numpy as jnp
@@ -189,8 +190,13 @@ def torch_dict_to_easydel_params(
                 else:
                     missed_shardings += 1
             # TODO : FIX 4BIT and 8BIT Quant
-            # if convert_to_8bit and params_pattern_selection.search("/".join(key_tuple)):
-            #     array = flax.linen.linen.Int8Params(*flax.linen.quantize(array))
+            if (
+                convert_to_8bit
+                and params_pattern_selection.search("/".join(key_tuple))
+                and key_tuple[-1]
+                != "embedding"  # make sure embedding weights are not quantized.
+            ):
+                array = Array8Bit.quantize(array)
             flax_dict[key_tuple] = array
             pbar.set_postfix(missed_shardings=missed_shardings)
             pbar.update(1)

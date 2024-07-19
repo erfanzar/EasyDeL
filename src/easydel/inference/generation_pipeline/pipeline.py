@@ -18,6 +18,24 @@ _DynamicGenerationConfig = inference_utils._DynamicGenerationConfig
 
 
 class GenerationPipeline:
+    """
+    This class implements the generation pipeline for text generation models using JAX/Flax.
+
+    Args:
+        model (EDPretrainedModel): The pretrained model to use for generation.
+        params (Union[flax.core.FrozenDict, dict]): The model parameters.
+        tokenizer (PreTrainedTokenizer): The tokenizer associated with the model.
+        generation_config (Optional[GenerationPipelineConfig], optional): The configuration for the generation
+            pipeline. Defaults to None.
+        add_params_field (None, optional): Deprecated argument.
+        seed (Optional[int], optional): The random seed for generation. Defaults to None.
+        input_partition_spec (PartitionSpec, optional): The partition specification for input data.
+            Defaults to PartitionSpec(("dp", "fsdp")).
+        partition_rules (None, optional): Custom partition rules for sharding. Defaults to None, which uses
+            model's default partition rules.
+        parameters_are_quantized (bool, optional): Whether the model parameters are quantized. Defaults to False.
+    """
+
     def __init__(
         self,
         model: EDPretrainedModel,
@@ -28,6 +46,7 @@ class GenerationPipeline:
         seed: Optional[int] = None,
         input_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp")),
         partition_rules=None,
+        parameters_are_quantized: bool = False,
     ):
         if add_params_field is not None:
             warnings.warn("`add_params_field` is deprecated and soon will be removed.")
@@ -41,6 +60,7 @@ class GenerationPipeline:
         self.params = params
         self.tokenizer = tokenizer
         self.generation_config = generation_config
+        self.parameters_are_quantized = parameters_are_quantized
         self._shard_state = None
         self.compiled_func = None
         self.over_compiled_func = None
@@ -85,6 +105,20 @@ class GenerationPipeline:
         position_ids: Optional[jax.Array] = None,
         echo: bool = False,
     ):
+        """
+        Generates text sequences based on the provided input_ids.
+
+        Args:
+            input_ids (jax.Array): The input token IDs.
+            attention_mask (Optional[jax.Array], optional): The attention mask for the input_ids.
+                Defaults to None.
+            position_ids (Optional[jax.Array], optional): The position IDs for the input_ids.
+                Defaults to None.
+            echo (bool, optional): Whether to echo the input sequence in the output. Defaults to False.
+
+        Yields:
+            jax.Array: Generated token IDs.
+        """
         paxis = self.model.config.partition_axis
         mesh = self.mesh
         eos_token_id = jnp.array(self.generation_config.eos_token_id, dtype=jnp.int32)
@@ -146,6 +180,16 @@ class GenerationPipeline:
             return ~jnp.logical_or(all_sequence_finished, state.cur_len >= max_length)
 
         def sample_fn(params, state: inference_utils.SampleState):
+            """
+            Performs a single sampling step for text generation.
+
+            Args:
+                params: Model parameters.
+                state (inference_utils.SampleState): The current generation state.
+
+            Returns:
+                inference_utils.SampleState: The updated generation state.
+            """
             model_outputs = self.model(
                 input_ids=state.running_token,
                 params=params,
@@ -187,7 +231,22 @@ class GenerationPipeline:
 
         with self.mesh:
             if input_ids.shape[1] > 1:
-                generation_state = sample_fn(self.params, generation_state)
+                if self.parameters_are_quantized:
+
+                    @jax.jit
+                    @fjformer.core.implicit_compact
+                    def call_with_maybe_quant(params_, generation_state_):
+                        return sample_fn(params_, generation_state_)
+
+                    generation_state = call_with_maybe_quant(
+                        self.params,
+                        generation_state,
+                    )
+                else:
+                    generation_state = sample_fn(
+                        self.params,
+                        generation_state,
+                    )
             while True:
                 if sample_search_cond_fn(generation_state):
                     yield (
@@ -211,6 +270,12 @@ class GenerationPipeline:
 
     @property
     def partition_rules(self):
+        """
+        Defines the partition rules for model sharding.
+
+        Returns:
+            tuple: A tuple of partition rules for different model components.
+        """
         paxis = self.model.config.partition_axis
         return (
             (
@@ -260,6 +325,17 @@ class GenerationPipeline:
         )
 
     def get_model_arguments_sharding(self, input_ids, max_length, attention_mask):
+        """
+        Determines the sharding strategy for model arguments.
+
+        Args:
+            input_ids (jax.Array): Input token IDs.
+            max_length (int): Maximum sequence length.
+            attention_mask (jax.Array): Attention mask.
+
+        Returns:
+            jax.tree_util.tree_map: Sharding specifications for model arguments.
+        """
         return jax.tree_util.tree_map(
             lambda spec: NamedSharding(spec=spec, mesh=self.mesh),
             fjformer.match_partition_rules(
@@ -273,6 +349,15 @@ class GenerationPipeline:
         )
 
     def update_generation_config(self, **kwargs):
+        """
+        Updates the dynamic generation configuration.
+
+        Args:
+            **kwargs: Keyword arguments for updating the configuration.
+
+        Raises:
+            AttributeError: If an invalid configuration key is provided.
+        """
         for key, value in kwargs.items():
             if hasattr(self._dynamic_config, key):
                 setattr(self._dynamic_config, key, value)
@@ -287,6 +372,14 @@ class GenerationPipeline:
         generation_state,
         sample_fn,
     ):
+        """
+        Compiles the sampling function for efficient execution.
+
+        Args:
+            model_kwargs_sharding: Sharding specifications for model keyword arguments.
+            generation_state (inference_utils.SampleState): Initial generation state.
+            sample_fn: The sampling function to compile.
+        """
         state_sharding = inference_utils.SampleState(
             self.empty_sharding,
             self.input_sharding,
@@ -315,7 +408,7 @@ class GenerationPipeline:
 
         self._shard_state = _shard_state
         self.compiled_sample_fn = inference_utils.compile_function(
-            sample_fn,
+            fjformer.core.implicit_compact(sample_fn),
             (self.params, generation_state),
             {},
             mesh=self.mesh,
@@ -329,6 +422,17 @@ class GenerationPipeline:
         generation_state,
         sample_fn,
     ):
+        """
+        Compiles and returns the compiled sampling function.
+
+        Args:
+            model_kwargs_sharding: Sharding specifications for model keyword arguments.
+            generation_state (inference_utils.SampleState): Initial generation state.
+            sample_fn: The sampling function to compile.
+
+        Returns:
+            Callable: The compiled sampling function.
+        """
         if self.compiled_sample_fn is None:
             self._compile_sample_fn(
                 model_kwargs_sharding,
@@ -339,6 +443,16 @@ class GenerationPipeline:
 
 
 class ChatPipeline:
+    """
+    This class extends the GenerationPipeline for conversational text generation.
+
+    Args:
+        pipeline (GenerationPipeline): The underlying generation pipeline.
+        max_prefill_length (int): The maximum length of the conversation history to consider.
+        chat_template (str | None, optional): The chat template to use for formatting
+            conversations. Defaults to None.
+    """
+
     def __init__(
         self,
         pipeline: GenerationPipeline,
@@ -350,6 +464,15 @@ class ChatPipeline:
         self.chat_template = chat_template
 
     def stream_generate(self, conversation):
+        """
+        Generates text for a conversational context in a streaming fashion.
+
+        Args:
+            conversation: The conversation history.
+
+        Yields:
+            str: Generated text chunks.
+        """
         self.pipeline.tokenizer.padding_side = "left"
         inputs = self.pipeline.tokenizer.apply_chat_template(
             conversation=conversation,
@@ -370,6 +493,15 @@ class ChatPipeline:
             captured_length += len(decoded_sequence)
 
     def generate(self, conversation):
+        """
+        Generates text for a conversational context.
+
+        Args:
+            conversation: The conversation history.
+
+        Returns:
+            str: The generated text.
+        """
         self.pipeline.tokenizer.padding_side = "left"
         inputs = self.pipeline.tokenizer.apply_chat_template(
             conversation=conversation,

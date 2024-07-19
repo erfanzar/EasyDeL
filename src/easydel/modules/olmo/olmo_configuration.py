@@ -6,7 +6,63 @@ from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
 class OlmoConfig(EDPretrainedConfig):
-    """OLMo (model) configuration."""
+    """
+    Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read
+    the documentation from [`EDPretrainedConfig`] for more information.
+
+    Args:
+        vocab_size (`int`, *optional*, defaults to 50304):
+            Vocabulary size of the Olmo model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed to the forward method.
+        hidden_size (`int`, *optional*, defaults to 4096):
+            Dimensionality of the encoder layers and the pooler layer.
+        intermediate_size (`int`, *optional*, defaults to 11008):
+            Dimensionality of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
+        num_hidden_layers (`int`, *optional*, defaults to 32):
+            Number of hidden layers in the Transformer encoder.
+        num_attention_heads (`int`, *optional*, defaults to 32):
+            Number of attention heads for each attention layer in the Transformer encoder.
+        num_key_value_heads (`int`, *optional*):
+            Number of key and value heads for each attention layer in the Transformer encoder. Will default to
+            `num_attention_heads` if not set.
+        hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
+            The non-linear activation function (function or string) to use in the encoder and pooler. If string,
+            `"gelu"`, `"relu"`, `"swish"` and `"gelu_new"` are supported.
+        max_position_embeddings (`int`, *optional*, defaults to 2048):
+            The maximum sequence length that this model might ever be used with. Typically set this to something large
+            just in case (e.g., 2048 or 4096).
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether or not the model should return the last key/values attentions (not used by all models). Only
+            relevant if `config.is_decoder=True`.
+        pad_token_id (`int`, *optional*, defaults to 1):
+            The index of the padding token in the vocabulary.
+        bos_token_id (`int`, *optional*):
+            The id of the *beginning-of-sequence* token.
+        eos_token_id (`int`, *optional*, defaults to 50279):
+            The id of the *end-of-sequence* token.
+        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether to tie the weights of the input embeddings and the output embeddings.
+        rope_theta (`float`, *optional*, defaults to 10000.0):
+            The theta value to use for rotary position embeddings.
+        rope_scaling (`Dict[str, Union[str, float]]`, *optional*):
+            The configuration for rope scaling.
+        attention_bias (`bool`, *optional*, defaults to `False`):
+            Whether to use attention bias.
+        attention_dropout (`float`, *optional*, defaults to 0.0):
+            The dropout ratio for the attention probabilities.
+        clip_qkv (`float`, *optional*):
+            The clip value applied to the query, key, and value tensors.
+        gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
+            The gradient checkpointing configuration.
+        use_scan_mlp (`bool`, *optional*, defaults to `False`):
+            Whether to use the scan implementation for the MLP.
+        scan_mlp_chunk_size (`int`, *optional*, defaults to 1024):
+            The chunk size to use when scanning the MLP.
+        bits (`int`, *optional*):
+            The number of bits to quantize the model to.
+    """
 
     model_type = "olmo"
 
@@ -82,17 +138,15 @@ class OlmoConfig(EDPretrainedConfig):
         self.bits = bits
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
-        """The get_partition_rules function is used to define the partitioning scheme for a model.
-        It returns a list of tuples, where each tuple contains two elements:
-            1) A regex string that matches the name of one or more parameters in the model.
-            2) A PartitionScheme object that defines how those parameters should be partitioned across devices.
+        """
+        Get the partition rules for the model.
 
         Args:
-            fully_sharded_data_parallel: bool: Determine whether to
-                partition the model fully or not
+            fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
+                Whether to use fully sharded data parallelism.
 
         Returns:
-            A list of tuples
+            `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
         """
         return (
             (

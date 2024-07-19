@@ -1,12 +1,14 @@
 import json
 from dataclasses import dataclass
 from typing import Dict, Generator, List
+
 import requests
+
 from easydel.etils.etils import get_logger
 
 logger = get_logger(__name__)
 try:
-    from websocket import create_connection
+    from websocket import create_connection  # noqa #type:ignore
 except ModuleNotFoundError:
     create_connection = None
     logger.warn("couldn't import websocket, ServerEngine client side won't work.")
@@ -124,7 +126,7 @@ def generate_gradio(
         GenerateGradioOutput
     """
     try:
-        from gradio_client import Client
+        from gradio_client import Client  # noqa # type:ignore
     except ModuleNotFoundError:
         raise ModuleNotFoundError(
             "`gradio_client` no found consider running `pip install gradio_client gradio`"

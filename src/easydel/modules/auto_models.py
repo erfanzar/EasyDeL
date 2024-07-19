@@ -10,6 +10,7 @@ from fjformer import make_shard_and_gather_fns, match_partition_rules
 from flax.traverse_util import unflatten_dict
 from jax.sharding import PartitionSpec
 
+from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLRuntimeError
 from easydel.etils.etils import get_logger
 from easydel.etils.partition_module import PartitionAxis
@@ -18,7 +19,6 @@ from easydel.modules.modeling_utils import (
     EDPretrainedModel,
 )
 from easydel.transform.parameters_transformation import torch_dict_to_easydel_params
-from easydel.etils.easystate import EasyDeLState
 
 logger = get_logger(name=__name__)
 
@@ -547,7 +547,9 @@ class AutoEasyDeLModelForCausalLM:
                     "since `bit_targeted_params` is set to None, auto loader will convert all of"
                     " kernels(weights) and embeddings to 8bit by default"
                 )
-                bit_targeted_params = ["kernel", "embedding"]
+                bit_targeted_params = [
+                    "kernel",
+                ]
 
                 params_pattern_selection = re.compile(
                     "({})".format("|".join(bit_targeted_params))

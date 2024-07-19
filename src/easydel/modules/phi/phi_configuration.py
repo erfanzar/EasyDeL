@@ -6,7 +6,63 @@ from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
 class PhiConfig(EDPretrainedConfig):
-    """Phi configuration."""
+    """
+    Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read
+    the documentation from [`EDPretrainedConfig`] for more information.
+
+    Args:
+        vocab_size (`int`, *optional*, defaults to 51200):
+            Vocabulary size of the Phi model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed to the forward method.
+        hidden_size (`int`, *optional*, defaults to 2048):
+            Dimensionality of the encoder layers and the pooler layer.
+        intermediate_size (`int`, *optional*, defaults to 8192):
+            Dimensionality of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
+        num_hidden_layers (`int`, *optional*, defaults to 24):
+            Number of hidden layers in the Transformer encoder.
+        num_attention_heads (`int`, *optional*, defaults to 32):
+            Number of attention heads for each attention layer in the Transformer encoder.
+        num_key_value_heads (`int`, *optional*):
+            Number of key and value heads for each attention layer in the Transformer encoder. Will default to
+            `num_attention_heads` if not set.
+        resid_pdrop (`float`, *optional*, defaults to 0.0):
+            The dropout probability for all fully connected layers in the embeddings, encoder, and pooler.
+        embd_pdrop (`float`, *optional*, defaults to 0.0):
+            The dropout ratio for the embeddings.
+        attention_dropout (`float`, *optional*, defaults to 0.0):
+            The dropout ratio for the attention probabilities.
+        hidden_act (`str` or `function`, *optional*, defaults to `"gelu_new"`):
+            The non-linear activation function (function or string) to use in the encoder and pooler. If string,
+            `"gelu"`, `"relu"`, `"swish"` and `"gelu_new"` are supported.
+        max_position_embeddings (`int`, *optional*, defaults to 2048):
+            The maximum sequence length that this model might ever be used with. Typically set this to something large
+            just in case (e.g., 2048 or 4096).
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+        layer_norm_eps (`float`, *optional*, defaults to 1e-5):
+            The epsilon used by the layer normalization layers.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether or not the model should return the last key/values attentions (not used by all models). Only
+            relevant if `config.is_decoder=True`.
+        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether to tie the weights of the input embeddings and the output embeddings.
+        rope_theta (`float`, *optional*, defaults to 10000.0):
+            The theta value to use for rotary position embeddings.
+        rope_scaling (`Dict[str, Union[str, float]]`, *optional*):
+            The configuration for rope scaling.
+        partial_rotary_factor (`float`, *optional*, defaults to 0.5):
+            The factor for partial rotary embeddings.
+        qk_layernorm (`bool`, *optional*, defaults to `False`):
+            Whether to apply layer normalization to the query and key tensors.
+        bos_token_id (`int`, *optional*, defaults to 1):
+            The id of the *beginning-of-sequence* token.
+        eos_token_id (`int`, *optional*, defaults to 2):
+            The id of the *end-of-sequence* token.
+        bits (`int`, *optional*):
+            The number of bits to quantize the model to.
+        gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
+            The gradient checkpointing configuration.
+    """
 
     model_type: str = "phi"
     attribute_map = {
@@ -88,6 +144,16 @@ class PhiConfig(EDPretrainedConfig):
                 setattr(self, k, v)
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+        """
+        Get the partition rules for the model.
+
+        Args:
+            fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
+                Whether to use fully sharded data parallelism.
+
+        Returns:
+            `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+        """
         return (
             (
                 ("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),

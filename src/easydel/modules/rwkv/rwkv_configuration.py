@@ -6,8 +6,45 @@ from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
 class RwkvConfig(EDPretrainedConfig):
-    """RWKV configuration."""
 
+    """
+    Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read
+    the documentation from [`EDPretrainedConfig`] for more information.
+
+    Args:
+        vocab_size (`int`, *optional*, defaults to 50277):
+            Vocabulary size of the RWKV model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed when calling [`~easydel.modules.RwkvModel`].
+        context_length (`int`, *optional*, defaults to 1024):
+            The maximum sequence length that this model might ever be used with.
+        hidden_size (`int`, *optional*, defaults to 4096):
+            Dimensionality of the encoder layers and the pooler layer.
+        num_hidden_layers (`int`, *optional*, defaults to 32):
+            Number of hidden layers in the Transformer encoder.
+        attention_hidden_size (`int`, *optional*):
+            Dimensionality of the query/key/value of the MultiHead Attention layer of the RWKV* model. If None, it is
+            set to `hidden_size`.
+        intermediate_size (`int`, *optional*):
+            Dimensionality of the "intermediate" (often named feed-forward) layer in the Transformer encoder. If None,
+            it is set to `4 * hidden_size`.
+        layer_norm_epsilon (`float`, *optional*, defaults to 1e-5):
+            The epsilon used by the layer normalization layers.
+        rescale_every (`int`, *optional*, defaults to 6):
+            Interval of layers at which to rescale the attention scores.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether or not the model should return the last key/values attentions (not used by all models).
+        bos_token_id (`int`, *optional*, defaults to 0):
+            The id for the beginning of stream token.
+        eos_token_id (`int`, *optional*, defaults to 0):
+            The id for the end of stream token.
+        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether to tie the weights of the input embeddings and the output embeddings.
+        bits (`int`, *optional*):
+            The number of bits to quantize the model to. If None, the model is not quantized.
+        gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
+            What to save during gradient checkpointing. Choose one of `"nothing_saveable"`, `"first_half_saveable"`,
+            `"full_saveable"`.
+    """
     model_type: str = "rwkv"
     attribute_map = {"max_position_embeddings": "context_length"}
 
@@ -70,6 +107,16 @@ class RwkvConfig(EDPretrainedConfig):
                 setattr(self, k, v)
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+        """
+        Get the partition rules for the model.
+
+        Args:
+            fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
+                Whether to use fully sharded data parallelism.
+
+        Returns:
+            `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+        """
         return (
             ((".*", PartitionSpec(("sp", "fsdp"))),)
             if fully_sharded_data_parallel
