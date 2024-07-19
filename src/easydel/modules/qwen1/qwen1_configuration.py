@@ -6,6 +6,67 @@ from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
 class Qwen1Config(EDPretrainedConfig):
+    """Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read
+    the documentation from [`EDPretrainedConfig`] for more information.
+
+    Args:
+        vocab_size (`int`, *optional*, defaults to 151936):
+            Vocabulary size of the Qwen model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed to the forward method.
+        hidden_size (`int`, *optional*, defaults to 4096):
+            Dimensionality of the encoder layers and the pooler layer.
+        num_hidden_layers (`int`, *optional*, defaults to 32):
+            Number of hidden layers in the Transformer encoder.
+        num_attention_heads (`int`, *optional*, defaults to 32):
+            Number of attention heads for each attention layer in the Transformer encoder.
+        emb_dropout_prob (`float`, *optional*, defaults to 0.0):
+            The dropout ratio for the embeddings.
+        attn_dropout_prob (`float`, *optional*, defaults to 0.0):
+            The dropout ratio for the attention probabilities.
+        layer_norm_epsilon (`float`, *optional*, defaults to 1e-6):
+            The epsilon used by the layer normalization layers.
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+        seq_length (`int`, *optional*, defaults to 8192):
+            The maximum sequence length that this model might ever be used with. Typically set this to something large
+            just in case (e.g., 512 or 1024 or 2048).
+        scale_attn_weights (`bool`, *optional*, defaults to `True`):
+            Scale attention weights by dividing by sqrt(hidden_size).
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether or not the model should return the last key/values attentions (not used by all models). Only
+            relevant if `config.is_decoder=True`.
+        kv_channels (`int`, *optional*, defaults to 128):
+            The number of key-value channels.
+        rotary_pct (`float`, *optional*, defaults to 1.0):
+            The percentage of the hidden dimension to use for rotary embeddings.
+        rotary_emb_base (`int`, *optional*, defaults to 10000):
+            The base for the rotary position embedding.
+        use_dynamic_ntk (`bool`, *optional*, defaults to `True`):
+            Whether to use dynamic NTK scaling.
+        use_logn_attn (`bool`, *optional*, defaults to `True`):
+            Whether to use log-n attention.
+        intermediate_size (`int`, *optional*, defaults to 22016):
+            Dimensionality of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
+        no_bias (`bool`, *optional*, defaults to `True`):
+            Whether to use bias in the linear layers.
+        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether to tie the weights of the input embeddings and the output embeddings.
+        softmax_in_fp32 (`bool`, *optional*, defaults to `False`):
+            Whether to compute the softmax in float32.
+        gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
+            The gradient checkpointing configuration.
+        use_scan_mlp (`bool`, *optional*, defaults to `False`):
+            Whether to use scan for the MLP.
+        scan_mlp_chunk_size (`int`, *optional*, defaults to 1024):
+            The chunk size for the MLP scan.
+        bits (`int`, *optional*):
+            The number of bits to quantize the model to.
+        scan_layers (`bool`, *optional*, defaults to `True`):
+            Whether to use the scan implementation for the layers.
+        init_rope_cache_auto (`bool`, *optional*, defaults to `False`):
+            Whether to initialize the RoPE cache automatically.
+    """
+
     model_type: str = "qwen"
 
     def __init__(
@@ -73,17 +134,15 @@ class Qwen1Config(EDPretrainedConfig):
         )
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
-        """The get_partition_rules function is used to define the partitioning scheme for a model.
-        It returns a list of tuples, where each tuple contains two elements:
-            1) A regex string that matches the name of one or more parameters in the model.
-            2) A PartitionScheme object that defines how those parameters should be partitioned across devices.
+        """
+        Get the partition rules for the model.
 
         Args:
-            fully_sharded_data_parallel: bool: Determine whether to
-                partition the model fully or not
+            fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
+                Whether to use fully sharded data parallelism.
 
         Returns:
-            A list of tuples
+            `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
         """
         return (
             (

@@ -6,6 +6,73 @@ from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
 class Qwen2MoeConfig(EDPretrainedConfig):
+    """
+    Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read
+    the documentation from [`EDPretrainedConfig`] for more information.
+
+    Args:
+        vocab_size (`int`, *optional*, defaults to 151936):
+            Vocabulary size of the Qwen-2 MoE model. Defines the number of different tokens that can be represented by
+            the `inputs_ids` passed to the forward method.
+        hidden_size (`int`, *optional*, defaults to 2048):
+            Dimensionality of the encoder layers and the pooler layer.
+        intermediate_size (`int`, *optional*, defaults to 5632):
+            Dimensionality of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
+        num_hidden_layers (`int`, *optional*, defaults to 24):
+            Number of hidden layers in the Transformer encoder.
+        num_attention_heads (`int`, *optional*, defaults to 16):
+            Number of attention heads for each attention layer in the Transformer encoder.
+        num_key_value_heads (`int`, *optional*, defaults to 16):
+            Number of key and value heads for each attention layer in the Transformer encoder.
+        hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
+            The non-linear activation function (function or string) to use in the encoder and pooler. If string,
+            `"gelu"`, `"relu"`, `"swish"` and `"gelu_new"` are supported.
+        max_position_embeddings (`int`, *optional*, defaults to 32768):
+            The maximum sequence length that this model might ever be used with. Typically set this to something large
+            just in case (e.g., 2048 or 4096).
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+        rms_norm_eps (`float`, *optional*, defaults to 1e-6):
+            The epsilon used by the rms normalization layers.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether or not the model should return the last key/values attentions (not used by all models). Only
+            relevant if `config.is_decoder=True`.
+        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether to tie the weights of the input embeddings and the output embeddings.
+        rope_theta (`float`, *optional*, defaults to 10000.0):
+            The theta value to use for rotary position embeddings.
+        use_sliding_window (`bool`, *optional*, defaults to `False`):
+            Whether to use a sliding window attention.
+        sliding_window (`int`, *optional*, defaults to 4096):
+            The sliding window size.
+        max_window_layers (`int`, *optional*, defaults to 28):
+            The maximum number of layers to use for the sliding window attention.
+        attention_dropout (`float`, *optional*, defaults to 0.0):
+            The dropout ratio for the attention probabilities.
+        decoder_sparse_step (`int`, *optional*, defaults to 1):
+            The sparse step for the decoder.
+        moe_intermediate_size (`int`, *optional*, defaults to 1408):
+            The intermediate size of the MoE layer.
+        shared_expert_intermediate_size (`int`, *optional*, defaults to 5632):
+            The intermediate size of the shared expert.
+        num_experts_per_tok (`int`, *optional*, defaults to 4):
+            The number of experts per token.
+        num_experts (`int`, *optional*, defaults to 60):
+            The number of experts.
+        norm_topk_prob (`bool`, *optional*, defaults to `False`):
+            Whether to normalize the top-k probabilities.
+        output_router_logits (`bool`, *optional*, defaults to `False`):
+            Whether to output the router logits.
+        router_aux_loss_coef (`float`, *optional*, defaults to 0.001):
+            The coefficient for the router auxiliary loss.
+        mlp_only_layers (`list` of `int`, *optional*):
+            The layers that should only contain an MLP.
+        gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
+            The gradient checkpointing configuration.
+        bits (`int`, *optional*):
+            The number of bits to quantize the model to.
+    """
+
     model_type: str = "qwen2_moe"
 
     def __init__(
@@ -76,17 +143,15 @@ class Qwen2MoeConfig(EDPretrainedConfig):
         )
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
-        """The get_partition_rules function is used to define the partitioning scheme for a model.
-        It returns a list of tuples, where each tuple contains two elements:
-            1) A regex string that matches the name of one or more parameters in the model.
-            2) A PartitionScheme object that defines how those parameters should be partitioned across devices.
+        """
+        Get the partition rules for the model.
 
         Args:
-            fully_sharded_data_parallel: bool: Determine whether to
-                partition the model fully or not
+            fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
+                Whether to use fully sharded data parallelism.
 
         Returns:
-            A list of tuples
+            `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
         """
         return (
             (

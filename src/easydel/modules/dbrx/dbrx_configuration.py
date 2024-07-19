@@ -9,6 +9,20 @@ DBRX_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 
 
 class DbrxAttentionConfig(EDPretrainedConfig):
+    """
+    This is the configuration class to store the attention related configuration of a [`DbrxModel`].
+
+    Args:
+        attn_pdrop (`float`, *optional*, defaults to 0.0):
+            The dropout probability applied to the attention output.
+        clip_qkv (`float`, *optional*, defaults to 8.0):
+            The clip value applied to the query, key, and value tensors.
+        kv_n_heads (`int`, *optional*, defaults to 1):
+            The number of attention heads for the key and value tensors.
+        rope_theta (`float`, *optional*, defaults to 10000.0):
+            The theta value for the rotary position embedding.
+    """
+
     def __init__(
         self,
         attn_pdrop: float = 0,
@@ -56,6 +70,28 @@ class DbrxAttentionConfig(EDPretrainedConfig):
 
 
 class DbrxFFNConfig(EDPretrainedConfig):
+    """
+    This is the configuration class to store the feed forward related configuration of a [`DbrxModel`].
+
+    Args:
+        ffn_act_fn (`dict`, *optional*):
+            The activation function configuration for the feed-forward network.
+        ffn_hidden_size (`int`, *optional*, defaults to 3584):
+            The hidden size of the feed-forward network.
+        moe_num_experts (`int`, *optional*, defaults to 4):
+            The number of experts in the Mixture-of-Experts (MoE) layer.
+        moe_top_k (`int`, *optional*, defaults to 1):
+            The number of top experts to use in the MoE layer.
+        moe_jitter_eps (`float`, *optional*):
+            The jitter epsilon value for the MoE layer.
+        moe_loss_weight (`float`, *optional*, defaults to 0.01):
+            The loss weight for the MoE auxiliary loss.
+        moe_normalize_expert_weights (`float`, *optional*, defaults to 1.0):
+            The normalization factor for the expert weights in the MoE layer.
+        uniform_expert_assignment (`bool`, *optional*, defaults to `False`):
+            Whether to use uniform expert assignment in the MoE layer.
+    """
+
     def __init__(
         self,
         ffn_act_fn: Optional[dict] = None,
@@ -113,6 +149,41 @@ class DbrxFFNConfig(EDPretrainedConfig):
 
 
 class DbrxConfig(EDPretrainedConfig):
+    """
+    Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read
+    the documentation from [`EDPretrainedConfig`] for more information.
+
+    Args:
+        d_model (`int`, *optional*, defaults to 2048):
+            Dimensionality of the encoder layers and the pooler layer.
+        n_heads (`int`, *optional*, defaults to 16):
+            Number of attention heads for each attention layer in the Transformer encoder.
+        n_layers (`int`, *optional*, defaults to 24):
+            Number of hidden layers in the Transformer encoder.
+        max_seq_len (`int`, *optional*, defaults to 2048):
+            The maximum sequence length that this model might ever be used with. Typically set this to something large
+            just in case (e.g., 2048 or 4096).
+        vocab_size (`int`, *optional*, defaults to 32000):
+            Vocabulary size of the DBRX model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed to the forward method.
+        resid_pdrop (`float`, *optional*, defaults to 0.0):
+            The dropout probability for all fully connected layers in the embeddings, encoder, and pooler.
+        emb_pdrop (`float`, *optional*, defaults to 0.0):
+            The dropout ratio for the attention probabilities.
+        attn_config ([`DbrxAttentionConfig`], *optional*):
+            The configuration of the attention layer.
+        ffn_config ([`DbrxFFNConfig`], *optional*):
+            The configuration of the feed forward layer.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether or not the model should return the last key/values attentions (not used by all models). Only
+            relevant if `config.is_decoder=True`.
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+        output_router_logits (`bool`, *optional*, defaults to `False`):
+            Whether or not to output the router logits.
+        router_aux_loss_coef (`float`, *optional*, defaults to 0.05):
+            The coefficient of the router auxiliary loss.
+    """
     model_type: str = "dbrx"
     attribute_map = {
         "num_attention_heads": "n_heads",

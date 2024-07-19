@@ -6,6 +6,62 @@ from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
 class Grok1Config(EDPretrainedConfig):
+    """
+    Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read
+    the documentation from [`EDPretrainedConfig`] for more information.
+
+    Args:
+        vocab_size (`int`, *optional*, defaults to 32000):
+            Vocabulary size of the Grok-1 model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed to the forward method.
+        hidden_size (`int`, *optional*, defaults to 4096):
+            Dimensionality of the encoder layers and the pooler layer.
+        intermediate_size (`int`, *optional*, defaults to 32768):
+            Dimensionality of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
+        num_hidden_layers (`int`, *optional*, defaults to 32):
+            Number of hidden layers in the Transformer encoder.
+        num_attention_heads (`int`, *optional*, defaults to 32):
+            Number of attention heads for each attention layer in the Transformer encoder.
+        num_key_value_heads (`int`, *optional*, defaults to 32):
+            Number of key and value heads for each attention layer in the Transformer encoder.
+        attn_output_multiplier (`float`, *optional*, defaults to 1.0):
+            The multiplier value applied to the attention output.
+        max_attn_value (`float`, *optional*, defaults to 1.0):
+            The maximum value of the attention weights.
+        max_position_embeddings (`int`, *optional*, defaults to 4096):
+            The maximum sequence length that this model might ever be used with. Typically set this to something large
+            just in case (e.g., 2048 or 4096).
+        embedding_multiplier_scale (`float`, *optional*, defaults to 1.0):
+            The scale factor for the embedding layer.
+        output_multiplier_scale (`float`, *optional*, defaults to 1.0):
+            The scale factor for the output layer.
+        rms_norm_eps (`float`, *optional*, defaults to 1e-5):
+            The epsilon used by the rms normalization layers.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether or not the model should return the last key/values attentions (not used by all models). Only
+            relevant if `config.is_decoder=True`.
+        pad_token_id (`int`, *optional*):
+            The index of the padding token in the vocabulary.
+        bos_token_id (`int`, *optional*, defaults to 1):
+            The index of the beginning of sequence token in the vocabulary.
+        eos_token_id (`int`, *optional*, defaults to 2):
+            The index of the end of sequence token in the vocabulary.
+        tie_word_embeddings (`bool`, *optional*, defaults to `True`):
+            Whether to tie the weights of the input embeddings and the output embeddings.
+        num_experts_per_tok (`int`, *optional*, defaults to 2):
+            The number of experts per token.
+        num_experts (`int`, *optional*, defaults to 8):
+            The number of experts.
+        output_router_logits (`bool`, *optional*, defaults to `False`):
+            Whether to output router logits.
+        router_aux_loss_coef (`float`, *optional*, defaults to 0.001):
+            The router auxiliary loss coefficient.
+        gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
+            The gradient checkpointing configuration.
+        bits (`int`, *optional*):
+            The number of bits to quantize the model to.
+    """
+
     model_type: str = "grok-1"
 
     def __init__(
@@ -69,17 +125,15 @@ class Grok1Config(EDPretrainedConfig):
         )
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
-        """The get_partition_rules function is used to define the partitioning scheme for a model.
-        It returns a list of tuples, where each tuple contains two elements:
-            1) A regex string that matches the name of one or more parameters in the model.
-            2) A PartitionScheme object that defines how those parameters should be partitioned across devices.
+        """
+        Get the partition rules for the model.
 
         Args:
-            fully_sharded_data_parallel: bool: Determine whether to
-                partition the model fully or not
+            fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
+                Whether to use fully sharded data parallelism.
 
         Returns:
-            A list of tuples
+            `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
         """
         return (
             (

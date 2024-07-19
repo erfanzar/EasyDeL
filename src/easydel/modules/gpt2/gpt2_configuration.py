@@ -6,6 +6,71 @@ from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
 class GPT2Config(EDPretrainedConfig):
+    """
+    Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read
+    the documentation from [`EDPretrainedConfig`] for more information.
+
+    Args:
+        vocab_size (`int`, *optional*, defaults to 50257):
+            Vocabulary size of the GPT-2 model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed to the forward method.
+        n_positions (`int`, *optional*, defaults to 1024):
+            The maximum sequence length that this model might ever be used with. Typically set this to something large
+            just in case (e.g., 2048 or 4096).
+        n_embd (`int`, *optional*, defaults to 768):
+            Dimensionality of the encoder layers and the pooler layer.
+        n_layer (`int`, *optional*, defaults to 12):
+            Number of hidden layers in the Transformer encoder.
+        n_head (`int`, *optional*, defaults to 12):
+            Number of attention heads for each attention layer in the Transformer encoder.
+        n_inner (`int`, *optional*):
+            Dimensionality of the inner feed-forward layers.
+        activation_function (`str`, *optional*, defaults to `"gelu_new"`):
+            The non-linear activation function (function or string) to use in the encoder and pooler. If string,
+            `"gelu"`, `"relu"`, `"swish"` and `"gelu_new"` are supported.
+        resid_pdrop (`float`, *optional*, defaults to 0.1):
+            The dropout probability for all fully connected layers in the embeddings, encoder, and pooler.
+        embd_pdrop (`float`, *optional*, defaults to 0.1):
+            The dropout ratio for the embeddings.
+        attn_pdrop (`float`, *optional*, defaults to 0.1):
+            The dropout ratio for the attention probabilities.
+        layer_norm_epsilon (`float`, *optional*, defaults to 1e-5):
+            The epsilon to use in the layer normalization layers.
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+        summary_type (`str`, *optional*, defaults to `"cls_index"`):
+            The summary type to use. Possible values are `"cls_index"` (equivalent to the output of the last token
+            of the first sentence in a sequence) and `"last"` (equivalent to the output of the last token in
+            the sequence).
+        summary_use_proj (`bool`, *optional*, defaults to `True`):
+            Whether to use a projection after the vector extraction.
+        summary_activation (`str`, *optional*):
+            The activation to use for the summary.
+        summary_proj_to_labels (`bool`, *optional*, defaults to `True`):
+            Whether to project the summary to the labels.
+        summary_first_dropout (`float`, *optional*, defaults to 0.1):
+            The dropout ratio to be used after the projection and activation.
+        scale_attn_weights (`bool`, *optional*, defaults to `True`):
+            Scale attention weights by dividing by sqrt(hidden_size).
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether or not the model should return the last key/values attentions (not used by all models). Only
+            relevant if `config.is_decoder=True`.
+        bos_token_id (`int`, *optional*, defaults to 50256):
+            The id of the *beginning-of-sequence* token.
+        eos_token_id (`int`, *optional*, defaults to 50256):
+            The id of the *end-of-sequence* token.
+        scale_attn_by_inverse_layer_idx (`bool`, *optional*, defaults to `False`):
+            Whether to scale attention weights by `1 / layer_idx + 1`.
+        reorder_and_upcast_attn (`bool`, *optional*, defaults to `False`):
+            Whether to reorder and upcast attention.
+        gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
+            The gradient checkpointing configuration.
+        tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+            Whether to tie the weights of the input embeddings and the output embeddings.
+        bits (`int`, *optional*):
+            The number of bits to quantize the model to.
+    """
+
     model_type: str = "gpt2"
     keys_to_ignore_at_inference = ["past_key_values"]
     attribute_map = {
@@ -91,6 +156,16 @@ class GPT2Config(EDPretrainedConfig):
                 setattr(self, k, v)
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+        """
+        Get the partition rules for the model.
+
+        Args:
+            fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
+                Whether to use fully sharded data parallelism.
+
+        Returns:
+            `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+        """
         return (
             (
                 "transformer/wte/embedding",

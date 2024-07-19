@@ -76,8 +76,8 @@ def get_logger(name, level: int = logging.INFO) -> logging.Logger:
     """
     Function to create and configure a logger.
     Args:
-        name: str: The name of the logger.
-        level: int: The logging level. Defaults to logging.INFO.
+        name (str): The name of the logger.
+        level (int): The logging level. Defaults to logging.INFO.
     Returns:
         logging.Logger: The configured logger instance.
     """

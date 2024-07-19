@@ -340,15 +340,15 @@ class EDPretrainedConfig(PretrainedConfig):
         return self.get_mesh()
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
-        """The get_partition_rules function is used to specify how the parameters of a model are partitioned across devices.
+        """
+        Get the partition rules for the model.
 
         Args:
-            self: Access the attributes of the class
-            fully_sharded_data_parallel: bool: Determine whether the
-                model is fully sharded or not
+            fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
+                Whether to use fully sharded data parallelism.
 
         Returns:
-            A tuple of tuples
+            `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
         """
         if not fully_sharded_data_parallel:
             raise NotImplementedError()

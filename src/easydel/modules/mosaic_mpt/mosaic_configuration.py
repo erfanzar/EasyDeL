@@ -6,6 +6,32 @@ from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
 class MptAttentionConfig(EDPretrainedConfig):
+    """
+    This is the configuration class to store the attention related configuration of a [`MptModel`].
+
+    Args:
+        attn_type (`str`, *optional*, defaults to `"multihead_attention"`):
+            The type of attention to use. Can be either `"multihead_attention"` or `"multiquery_attention"`.
+        attn_pdrop (`float`, *optional*, defaults to 0.0):
+            The dropout probability applied to the attention output.
+        attn_impl (`str`, *optional*, defaults to `"torch"`):
+            The implementation of the attention mechanism. Can be either `"torch"` or `"flash"`.
+        clip_qkv (`float`, *optional*):
+            The clip value applied to the query, key, and value tensors.
+        softmax_scale (`float`, *optional*):
+            The scale factor applied to the softmax function in the attention layer.
+        prefix_lm (`bool`, *optional*, defaults to `False`):
+            Whether to use a prefix LM.
+        qk_ln (`bool`, *optional*, defaults to `False`):
+            Whether to apply layer normalization to the query and key tensors.
+        attn_uses_sequence_id (`bool`, *optional*, defaults to `False`):
+            Whether the attention layer uses sequence IDs.
+        alibi (`bool`, *optional*, defaults to `True`):
+            Whether to use the ALiBi (Attention with Linear Biases) method.
+        alibi_bias_max (`int`, *optional*, defaults to 8):
+            The maximum value for the ALiBi bias.
+    """
+
     def __init__(
         self,
         attn_type="multihead_attention",
@@ -51,6 +77,70 @@ class MptAttentionConfig(EDPretrainedConfig):
 
 
 class MptConfig(EDPretrainedConfig):
+    """
+    Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read
+    the documentation from [`EDPretrainedConfig`] for more information.
+
+    Args:
+        d_model (`int`, *optional*, defaults to 2048):
+            Dimensionality of the encoder layers and the pooler layer.
+        n_heads (`int`, *optional*, defaults to 16):
+            Number of attention heads for each attention layer in the Transformer encoder.
+        n_layers (`int`, *optional*, defaults to 24):
+            Number of hidden layers in the Transformer encoder.
+        expansion_ratio (`int`, *optional*, defaults to 4):
+            Expansion ratio of the feed-forward layer.
+        max_seq_len (`int`, *optional*, defaults to 2048):
+            The maximum sequence length that this model might ever be used with. Typically set this to something large
+            just in case (e.g., 2048 or 4096).
+        vocab_size (`int`, *optional*, defaults to 50368):
+            Vocabulary size of the MPT model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed to the forward method.
+        resid_prob_drop (`float`, *optional*, defaults to 0.0):
+            The dropout probability for all fully connected layers in the embeddings, encoder, and pooler.
+        layer_norm_epsilon (`float`, *optional*, defaults to 1e-5):
+            The epsilon used by the layer normalization layers.
+        emb_prob_drop (`float`, *optional*, defaults to 0.0):
+            The dropout ratio for the embeddings.
+        learned_pos_emb (`bool`, *optional*, defaults to `True`):
+            Whether to learn positional embeddings.
+        attn_config ([`MptAttentionConfig`], *optional*):
+            The configuration of the attention layer.
+        init_device (`str`, *optional*, defaults to `"cpu"`):
+            The device to initialize the model on.
+        logit_scale (`float` or `str`, *optional*):
+            The logit scale. If set to `"inv_sqrt_d_model"`, the logit scale is calculated as `1 / math.sqrt(d_model)`.
+        no_bias (`bool`, *optional*, defaults to `True`):
+            Whether to use bias in the linear layers.
+        verbose (`int`, *optional*, defaults to 0):
+            The verbosity level.
+        embedding_fraction (`float`, *optional*, defaults to 1.0):
+            The fraction of the embedding matrix to use.
+        norm_type (`str`, *optional*, defaults to `"low_precision_layernorm"`):
+            The type of layer normalization to use.
+        use_cache (`bool`, *optional*, defaults to `False`):
+            Whether or not the model should return the last key/values attentions (not used by all models). Only
+            relevant if `config.is_decoder=True`.
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+        alibi (`bool`, *optional*, defaults to `True`):
+            Whether to use ALiBi (Attention with Linear Biases) method.
+        use_bias (`bool`, *optional*, defaults to `False`):
+            Whether to use bias in the linear layers.
+        act_fn (`str`, *optional*, defaults to `"gelu"`):
+            The activation function to use.
+        qk_ln (`bool`, *optional*, defaults to `False`):
+            Whether to apply layer normalization to the query and key tensors.
+        use_lm_head (`bool`, *optional*, defaults to `False`):
+            Whether to use a language modeling head.
+        use_norm_bias (`bool`, *optional*, defaults to `False`):
+            Whether to use bias in the layer normalization layers.
+        gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
+            The gradient checkpointing configuration.
+        bits (`int`, *optional*):
+            The number of bits to quantize the model to.
+    """
+
     model_type = "mpt"
     attribute_map = {
         "num_attention_heads": "n_heads",
@@ -132,6 +222,16 @@ class MptConfig(EDPretrainedConfig):
         return config
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+        """
+        Get the partition rules for the model.
+
+        Args:
+            fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
+                Whether to use fully sharded data parallelism.
+
+        Returns:
+            `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+        """
         return (
             (
                 ("transformer/wte/embedding", PartitionSpec("tp", ("fsdp", "sp"))),

@@ -4,6 +4,86 @@ from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
 class WhisperConfig(EDPretrainedConfig):
+    """
+    Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read
+    the documentation from [`EDPretrainedConfig`] for more information.
+
+    Args:
+        vocab_size (`int`, *optional*, defaults to 51865):
+            Vocabulary size of the Whisper model. Defines the number of different tokens that can be represented by
+            the `inputs_ids` passed when calling [`~easydel.modules.WhisperModel`].
+        num_mel_bins (`int`, *optional*, defaults to 80):
+            Number of mel bins used by the feature extractor.
+        encoder_layers (`int`, *optional*, defaults to 6):
+            Number of encoder layers.
+        encoder_attention_heads (`int`, *optional*, defaults to 4):
+            Number of attention heads for each attention layer in the Transformer encoder.
+        decoder_layers (`int`, *optional*, defaults to 6):
+            Number of decoder layers.
+        decoder_attention_heads (`int`, *optional*, defaults to 4):
+            Number of attention heads for each attention layer in the Transformer decoder.
+        decoder_ffn_dim (`int`, *optional*, defaults to 1536):
+            Dimensionality of the decoder feed-forward network (FFN) layer.
+        encoder_ffn_dim (`int`, *optional*, defaults to 1536):
+            Dimensionality of the encoder feed-forward network (FFN) layer.
+        encoder_layerdrop (`float`, *optional*, defaults to 0.0):
+            The LayerDrop probability for the encoder. See the [LayerDrop paper](https://arxiv.org/abs/1909.11556) for
+            more details.
+        decoder_layerdrop (`float`, *optional*, defaults to 0.0):
+            The LayerDrop probability for the decoder. See the [LayerDrop paper](https://arxiv.org/abs/1909.11556) for
+            more details.
+        d_model (`int`, *optional*, defaults to 256):
+            Dimensionality of the layers and the pooler layer.
+        activation_function (`str`, *optional*, defaults to `"gelu"`):
+            The non-linear activation function (function or string) in the encoder and pooler. If string, `"gelu"`,
+            `"relu"`, `"silu"` and `"gelu_new"` are supported.
+        dropout (`float`, *optional*, defaults to 0.1):
+            The dropout probability for all fully connected layers in the embeddings, encoder, and pooler.
+        attention_dropout (`float`, *optional*, defaults to 0.0):
+            The dropout ratio for the attention probabilities.
+        activation_dropout (`float`, *optional*, defaults to 0.0):
+            The dropout ratio for activations inside the fully connected layer.
+        init_std (`float`, *optional*, defaults to 0.02):
+            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+        scale_embedding (`bool`, *optional*, defaults to False):
+            Scale embeddings by dividing by sqrt(d_model).
+        max_source_positions (`int`, *optional*, defaults to 1500):
+            The maximum sequence length allowed for the source text input to the model. Any longer inputs will be
+            truncated.
+        max_target_positions (`int`, *optional*, defaults to 448):
+            The maximum sequence length allowed for the target text input to the model. Any longer inputs will be
+            truncated.
+        use_cache (`bool`, *optional*, defaults to `True`):
+            Whether or not the model should return the last key/values attentions (not used by all models).
+        apply_spec_augment (`bool`, *optional*, defaults to `False`):
+            Whether to apply SpecAugment data augmentation.
+        mask_time_prob (`float`, *optional*, defaults to 0.05):
+            Propability of each feature vector along the time axis to be chosen as the start of the vector span to
+            be masked. Approximately `mask_time_prob * sequence_length // mask_time_length` feature vectors will
+            be masked along the time axis. This is only relevant if `apply_spec_augment` is set to `True`.
+        mask_time_length (`int`, *optional*, defaults to 10):
+            Length of vector span along the time axis.
+        mask_time_min_masks (`int`, *optional*, defaults to 2):
+            The minimum number of masks of length `mask_feature_length` generated along the time axis, each time
+            mask, the mask will be filled with floats sampled in (random_lower_bound, random_upper_bound).
+        mask_feature_prob (`float`, *optional*, defaults to 0.0):
+            Propability of each feature vector along the feature axis to be chosen as the start of the vector span to
+            be masked. Approximately `mask_time_prob * hidden_size // mask_feature_length` feature vectors will be
+            masked along the time axis. This is only relevant if `apply_spec_augment` is set to `True`.
+        mask_feature_length (`int`, *optional*, defaults to 10):
+            Length of vector span along the feature axis.
+        mask_feature_min_masks (`int`, *optional*, defaults to 0):
+            The minimum number of masks of length `mask_feature_length` generated along the feature axis, each time
+            mask, the mask will be filled with floats sampled in (random_lower_bound, random_upper_bound).
+        median_filter_width (`int`, *optional*, defaults to 7):
+            The width of the median filter applied to the mask.
+        bits (`int`, *optional*):
+            The number of bits to quantize the model to. If None, the model is not quantized.
+        gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
+            What to save during gradient checkpointing. Choose one of `"nothing_saveable"`, `"first_half_saveable"`,
+            `"full_saveable"`.
+    """
+
     model_type: str = "whisper"
     attribute_map = {
         "num_attention_heads": "encoder_attention_heads",
@@ -116,3 +196,6 @@ class WhisperConfig(EDPretrainedConfig):
         for k, v in kwargs.items():
             if not hasattr(self, k):
                 setattr(self, k, v)
+
+    def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+        return super().get_partition_rules(fully_sharded_data_parallel)

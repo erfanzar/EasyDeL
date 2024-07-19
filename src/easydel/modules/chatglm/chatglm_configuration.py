@@ -6,6 +6,73 @@ from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
 class ChatGLMConfig(EDPretrainedConfig):
+    """
+    Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read
+    the documentation from [`EDPretrainedConfig`] for more information.
+
+    Args:
+        num_layers (`int`, *optional*, defaults to 28):
+            Number of hidden layers in the Transformer encoder.
+        padded_vocab_size (`int`, *optional*, defaults to 65024):
+            Vocabulary size of the ChatGLM model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed to the forward method.
+        hidden_size (`int`, *optional*, defaults to 4096):
+            Dimensionality of the encoder layers and the pooler layer.
+        ffn_hidden_size (`int`, *optional*, defaults to 13696):
+            Dimensionality of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
+        kv_channels (`int`, *optional*, defaults to 128):
+            Dimensionality of the key and value projection layers in the attention layer.
+        num_attention_heads (`int`, *optional*, defaults to 32):
+            Number of attention heads for each attention layer in the Transformer encoder.
+        seq_length (`int`, *optional*, defaults to 2048):
+            The maximum sequence length that this model might ever be used with. Typically set this to something large
+            just in case (e.g., 512 or 1024 or 2048).
+        hidden_dropout (`float`, *optional*, defaults to 0.0):
+            The dropout probability for all fully connected layers in the embeddings, encoder, and pooler.
+        classifier_dropout (`float`, *optional*):
+            The dropout ratio for classifier.
+        attention_dropout (`float`, *optional*, defaults to 0.0):
+            The dropout ratio for the attention probabilities.
+        layernorm_epsilon (`float`, *optional*, defaults to 1e-5):
+            The epsilon used by the layer normalization layers.
+        rmsnorm (`bool`, *optional*, defaults to `True`):
+            Whether to use RMS norm instead of layer norm.
+        apply_residual_connection_post_layernorm (`bool`, *optional*, defaults to `False`):
+            Whether to apply residual connection after layer normalization.
+        post_layer_norm (`bool`, *optional*, defaults to `True`):
+            Whether to use post-layernorm architecture.
+        add_bias_linear (`bool`, *optional*, defaults to `False`):
+            Whether to add bias to the linear layers.
+        add_qkv_bias (`bool`, *optional*, defaults to `False`):
+            Whether to add bias to the query, key, and value projection layers in the attention layer.
+        bias_dropout_fusion (`bool`, *optional*, defaults to `True`):
+            Whether to use bias dropout fusion.
+        multi_query_attention (`bool`, *optional*, defaults to `False`):
+            Whether to use multi-query attention.
+        multi_query_group_num (`int`, *optional*, defaults to 1):
+            The number of groups in multi-query attention.
+        rope_ratio (`float`, *optional*, defaults to 1.0):
+            The ratio of the rotary position embedding.
+        apply_query_key_layer_scaling (`bool`, *optional*, defaults to `True`):
+            Whether to apply query key layer scaling.
+        attention_softmax_in_fp32 (`bool`, *optional*, defaults to `True`):
+            Whether to compute attention softmax in float32.
+        fp32_residual_connection (`bool`, *optional*, defaults to `False`):
+            Whether to compute residual connection in float32.
+        gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
+            The gradient checkpointing configuration.
+        rope_scaling (`Dict[str, Union[str, float]]`, *optional*):
+            The rope scaling configuration.
+        scan_mlp_chunk_size (`int`, *optional*, defaults to 1024):
+            The chunk size of the scanned MLP.
+        bits (`int`, *optional*):
+            The number of bits to quantize the model to.
+        mlp_bias (`bool`, *optional*, defaults to `False`):
+            Whether the MLP layers should have bias.
+        scan_layers (`bool`, *optional*, defaults to `False`):
+            Whether to use the scan implementation of the layers.
+    """
+
     model_type: str = "chatglm"
 
     def __init__(
@@ -79,17 +146,15 @@ class ChatGLMConfig(EDPretrainedConfig):
         )
 
     def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
-        """The get_partition_rules function is used to define the partitioning scheme for a model.
-        It returns a list of tuples, where each tuple contains two elements:
-            1) A regex string that matches the name of one or more parameters in the model.
-            2) A PartitionScheme object that defines how those parameters should be partitioned across devices.
+        """
+        Get the partition rules for the model.
 
         Args:
-            fully_sharded_data_parallel: bool: Determine whether to
-                partition the model fully or not
+            fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
+                Whether to use fully sharded data parallelism.
 
         Returns:
-            A list of tuples
+            `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
         """
         return (
             (

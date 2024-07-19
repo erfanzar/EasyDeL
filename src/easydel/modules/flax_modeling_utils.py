@@ -21,6 +21,7 @@ from jax.experimental.mesh_utils import create_device_mesh
 from jax.experimental.shard_map import shard_map
 from jax.interpreters import pxla
 from jax.sharding import PartitionSpec
+from tqdm.auto import tqdm
 
 from easydel.etils.errors import EasyDeLBlockWiseFFNError
 from easydel.etils.etils import get_logger
@@ -842,6 +843,7 @@ def quantize_params_8bit(
     params: Union[Dict[str, Any], Any],
     embedding_layer_name: Optional[str] = None,
     layers_to_ignore: Optional[list[str]] = None,
+    verbose: bool = True,
 ) -> Union[Dict[str, Any], Any]:
     """
     Quantize parameters to 8-bit precision, excluding specified layers.
@@ -850,6 +852,7 @@ def quantize_params_8bit(
         params: The parameters to quantize. Can be a nested dictionary or a flat structure.
         embedding_layer_name: Name of the embedding layer to ignore during quantization.
         layers_to_ignore: List of additional layer names to ignore during quantization.
+        verbose (bool): whenever to use tqdm for logging stuff.
 
     Returns:
         Quantized parameters in the same structure as the input.
@@ -869,7 +872,20 @@ def quantize_params_8bit(
             return array
         return Array8Bit.quantize(array)
 
-    params = jax.tree_util.tree_map_with_path(quantize, params)
+    total_params = len(jax.tree_util.tree_leaves(params))
+    with tqdm(
+        total=total_params,
+        desc="Quantizing to 8-bit",
+        disable=not verbose,
+    ) as pbar:
+
+        def quantize_with_progress(path, array):
+            pbar.set_postfix_str(".".join(path[0].key))
+            result = quantize(path, array)
+            pbar.update(1)
+            return result
+
+        params = jax.tree_util.tree_map_with_path(quantize_with_progress, params)
 
     if not flatten:
         params = unflatten_dict(params)
@@ -883,6 +899,7 @@ def quantize_params_nf4(
     layers_to_ignore: Optional[list[str]] = None,
     block_size: Literal[32, 64, 128, 256, 512, 1024, 2048, 4096] = 64,
     contraction_axis: int = 0,
+    verbose: bool = True,
 ) -> Union[Dict[str, Any], Any]:
     """
     Quantize parameters to nf4 4-bit precision, excluding specified layers.
@@ -893,6 +910,7 @@ def quantize_params_nf4(
         layers_to_ignore: List of additional layer names to ignore during quantization.
         block_size (Literal[32, 64, 128, 256, 512, 1024, 2048, 4096]): Size of each quantization block.
         contraction_axis (int): Axis along which contraction is performed.
+        verbose (bool): whenever to use tqdm for logging stuff.
 
     Returns:
         Quantized parameters in the same structure as the input.
@@ -924,7 +942,20 @@ def quantize_params_nf4(
             contraction_axis=contraction_axis,
         )
 
-    params = jax.tree_util.tree_map_with_path(quantize, params)
+    total_params = len(jax.tree_util.tree_leaves(params))
+    with tqdm(
+        total=total_params,
+        desc="Quantizing to NF4",
+        disable=not verbose,
+    ) as pbar:
+
+        def quantize_with_progress(path, array):
+            pbar.set_postfix_str(".".join(path[0].key))
+            result = quantize(path, array)
+            pbar.update(1)
+            return result
+
+        params = jax.tree_util.tree_map_with_path(quantize_with_progress, params)
 
     if not flatten:
         params = unflatten_dict(params)
