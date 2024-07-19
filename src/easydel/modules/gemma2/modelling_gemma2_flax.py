@@ -246,13 +246,22 @@ class FlaxGemma2Attention(FlaxAttentionModule):
         )
 
         query_states = query_states.reshape(
-            batch_size, sequence_length, self.num_heads, self.head_dim
+            batch_size,
+            sequence_length,
+            self.num_heads,
+            self.head_dim,
         )
         key_states = key_states.reshape(
-            batch_size, sequence_length, self.num_key_value_heads, self.head_dim
+            batch_size,
+            sequence_length,
+            self.num_key_value_heads,
+            self.head_dim,
         )
         value_states = value_states.reshape(
-            batch_size, sequence_length, self.num_key_value_heads, self.head_dim
+            batch_size,
+            sequence_length,
+            self.num_key_value_heads,
+            self.head_dim,
         )
         query_states, key_states, value_states = self.apply_rotary(
             query_states.shape[0],
