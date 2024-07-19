@@ -121,35 +121,151 @@ class EDPretrainedConfig(PretrainedConfig):
         attn_dtype: jnp.dtype = jnp.float32,
         **kwargs,
     ):
-        self.axis_dims = axis_dims
-        self.axis_names = axis_names
-        self.backend = backend if backend is not None else ""
-        self.easy_method = easy_method
-        self.attn_mechanism = attn_mechanism
-        self.block_b = block_b
-        self.block_k = block_k
-        self.block_q = block_q
-        self.block_k_major = block_k_major or block_k
-        self.block_q_major_dkv = block_q_major_dkv or block_q
-        self.block_k_major_dkv = block_k_major_dkv or block_k
-        self.block_k_dkv = block_k_dkv or block_k
-        self.block_q_dkv = block_q_dkv or block_q
-        self.block_k_major_dq = block_k_major_dq or block_k
-        self.block_k_dq = block_k_dq or block_k
-        self.block_q_dq = block_q_dq or block_q
-        self.partition_axis = partition_axis
-        self.shard_attention_computation = shard_attention_computation
-        self.bits = bits
-        self.scan_attention_layers = scan_attention_layers
-        self.scan_ring_attention = scan_ring_attention
-        self.use_sharded_kv_caching = use_sharded_kv_caching
-        self.use_scan_mlp = use_scan_mlp
-        self.scan_mlp_chunk_size = scan_mlp_chunk_size
-        self.use_sharding_constraint = use_sharding_constraint
-        self.attention_axis_name = attention_axis_name
-        self.quantize_kv_cache = quantize_kv_cache
-        self.flash_attention_backward_pass_impl = flash_attention_backward_pass_impl
-        self.attn_dtype = attn_dtype
+        self.axis_dims = getattr(
+            self,
+            "axis_dims",
+            axis_dims,
+        )
+        self.axis_names = getattr(
+            self,
+            "axis_names",
+            axis_names,
+        )
+        self.backend = getattr(
+            self,
+            "backend",
+            backend if backend is not None else "",
+        )
+        self.easy_method = getattr(
+            self,
+            "easy_method",
+            easy_method,
+        )
+        self.attn_mechanism = getattr(
+            self,
+            "attn_mechanism",
+            attn_mechanism,
+        )
+        self.block_b = getattr(
+            self,
+            "block_b",
+            block_b,
+        )
+        self.block_k = getattr(
+            self,
+            "block_k",
+            block_k,
+        )
+        self.block_q = getattr(
+            self,
+            "block_q",
+            block_q,
+        )
+        self.block_k_major = getattr(
+            self,
+            "block_k_major",
+            block_k_major or block_k,
+        )
+        self.block_q_major_dkv = getattr(
+            self,
+            "block_q_major_dkv",
+            block_q_major_dkv or block_q,
+        )
+        self.block_k_major_dkv = getattr(
+            self,
+            "block_k_major_dkv",
+            block_k_major_dkv or block_k,
+        )
+        self.block_k_dkv = getattr(
+            self,
+            "block_k_dkv",
+            block_k_dkv or block_k,
+        )
+        self.block_q_dkv = getattr(
+            self,
+            "block_q_dkv",
+            block_q_dkv or block_q,
+        )
+        self.block_k_major_dq = getattr(
+            self,
+            "block_k_major_dq",
+            block_k_major_dq or block_k,
+        )
+        self.block_k_dq = getattr(
+            self,
+            "block_k_dq",
+            block_k_dq or block_k,
+        )
+        self.block_q_dq = getattr(
+            self,
+            "block_q_dq",
+            block_q_dq or block_q,
+        )
+        self.partition_axis = getattr(
+            self,
+            "partition_axis",
+            partition_axis,
+        )
+        self.shard_attention_computation = getattr(
+            self,
+            "shard_attention_computation",
+            shard_attention_computation,
+        )
+        self.bits = getattr(
+            self,
+            "bits",
+            bits,
+        )
+        self.scan_attention_layers = getattr(
+            self,
+            "scan_attention_layers",
+            scan_attention_layers,
+        )
+        self.scan_ring_attention = getattr(
+            self,
+            "scan_ring_attention",
+            scan_ring_attention,
+        )
+        self.use_sharded_kv_caching = getattr(
+            self,
+            "use_sharded_kv_caching",
+            use_sharded_kv_caching,
+        )
+        self.use_scan_mlp = getattr(
+            self,
+            "use_scan_mlp",
+            use_scan_mlp,
+        )
+        self.scan_mlp_chunk_size = getattr(
+            self,
+            "scan_mlp_chunk_size",
+            scan_mlp_chunk_size,
+        )
+        self.use_sharding_constraint = getattr(
+            self,
+            "use_sharding_constraint",
+            use_sharding_constraint,
+        )
+        self.attention_axis_name = getattr(
+            self,
+            "attention_axis_name",
+            attention_axis_name,
+        )
+        self.quantize_kv_cache = getattr(
+            self,
+            "quantize_kv_cache",
+            quantize_kv_cache,
+        )
+        self.flash_attention_backward_pass_impl = getattr(
+            self,
+            "flash_attention_backward_pass_impl",
+            flash_attention_backward_pass_impl,
+        )
+        self.attn_dtype = getattr(
+            self,
+            "attn_dtype",
+            attn_dtype,
+        )
         super().__init__(**kwargs)
 
     @staticmethod

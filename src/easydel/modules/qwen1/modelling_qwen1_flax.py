@@ -314,13 +314,13 @@ class FlaxQwen1Attention(FlaxAttentionModule):
         query_states, key_states, value_states = jnp.split(mixed_x_layer, 3, 2)
 
         query_states = query_states.reshape(
-            batch_size, sequence_length, self.config.num_attention_heads, self.head_dim
+            batch_size, sequence_length, self.config.num_attention_heads, self.head_dim,
         )
         key_states = key_states.reshape(
-            batch_size, sequence_length, self.config.num_attention_heads, self.head_dim
+            batch_size, sequence_length, self.config.num_attention_heads, self.head_dim,
         )
         value_states = value_states.reshape(
-            batch_size, sequence_length, self.config.num_attention_heads, self.head_dim
+            batch_size, sequence_length, self.config.num_attention_heads, self.head_dim,
         )
 
         query_states, key_states, value_states = self.apply_rotary(
