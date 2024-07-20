@@ -109,6 +109,7 @@ class GenerationPipeline:
         attention_mask: Optional[jax.Array] = None,
         position_ids: Optional[jax.Array] = None,
         echo: bool = False,
+        **kwargs # Ignored arguments.
     ):
         """
         Generates text sequences based on the provided input_ids.
