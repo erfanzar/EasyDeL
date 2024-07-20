@@ -4,16 +4,15 @@ import pprint
 import sys
 import threading
 import time
-import warnings
 from abc import abstractmethod
 from dataclasses import dataclass
 from glob import glob
 from typing import Any, Callable, Iterator, Literal, Mapping, Optional, Union
 
-from flax.core import unfreeze
 import jax
 import numpy as np
 from fjformer.checkpoint import CheckpointManager
+from flax.core import unfreeze
 from jax.sharding import Mesh
 from optax import GradientTransformation, Schedule
 
@@ -23,10 +22,9 @@ except ImportError:
     wandb = None
 
 from easydel.etils.etils import get_logger
-from easydel.modules.auto_models import AutoEasyDeLModelForCausalLM
 from easydel.modules.modeling_utils import (
-    EDPretrainedModel,
     EDPretrainedConfig,
+    EDPretrainedModel,
 )
 from easydel.smi import get_capacity_matrix, initialise_tracking
 from easydel.trainers.training_configurations import TrainArguments
@@ -482,11 +480,11 @@ class BaseTrainer(abc.ABC):
             TrainerConfigureModelOutput: An object containing the configured model, optimizer, scheduler, and configuration.
         """
         extra_configs = self.arguments.extra_configs or {}
-
-        if self.arguments.model_class is not None:
-            model = self._configure_custom_model(extra_configs)
-        else:
-            model = self._configure_auto_model(extra_configs)
+        assert self.arguments.model_class is not None, (
+            "`model_class` is a required field "
+            "please pass `model_class` to `TrainArguments`"
+        )
+        model = self._configure_custom_model(extra_configs)
 
         tx, scheduler = self.arguments.get_optimizer_and_scheduler(
             self.max_training_steps
@@ -524,51 +522,13 @@ class BaseTrainer(abc.ABC):
                 "pass custom_rule for partition rules."
             )
 
-        self.arguments.configs_to_initialize_model_class[
-            "config"
-        ].axis_dims = self.arguments.sharding_array
+        self.arguments.configs_to_initialize_model_class["config"].axis_dims = (
+            self.arguments.sharding_array
+        )
 
         return self.arguments.model_class(
             **self.arguments.configs_to_initialize_model_class, _do_init=False
         )
-
-    def _configure_auto_model(self, extra_configs):
-        """
-        Configures a model automatically using AutoEasyDeLModelForCausalLM.
-
-        This method retrieves a pre-trained model using AutoEasyDeLModelForCausalLM, applies
-        extra configurations, sets the data type and parameter data type, and handles
-        gradient checkpointing.
-
-        Args:
-            extra_configs (dict): Additional configurations to apply to the model.
-
-        Returns:
-            EDPretrainedModel: The configured model.
-
-        Warnings:
-            If no model configuration is detected, the `config` attribute is set to None, which
-            may cause errors later.
-        """
-        extra_configs["gradient_checkpointing"] = self.arguments.gradient_checkpointing
-
-        model = AutoEasyDeLModelForCausalLM.from_pretrained(
-            self.arguments.model_huggingface_repo_id,
-            dtype=self.arguments.dtype,
-            param_dtype=self.arguments.param_dtype,
-            _do_init=False,
-        )
-
-        if hasattr(model, "config"):
-            for k, v in extra_configs.items():
-                setattr(model.config, k, v)
-        else:
-            warnings.warn(
-                "Config is being set to None due to not detecting Model Configuration from the given Model. "
-                "This may cause errors later."
-            )
-
-        return model
 
     def _save_state(
         self,

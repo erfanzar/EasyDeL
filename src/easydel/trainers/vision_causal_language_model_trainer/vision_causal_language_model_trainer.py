@@ -2,15 +2,12 @@ import copy
 import os
 import time
 import typing
-
-import termcolor
-
-
 from typing import Callable, Mapping, Optional
 
 import chex
 import flax
 import jax
+import termcolor
 from fjformer import (
     make_shard_and_gather_fns,
     match_partition_rules,
@@ -21,6 +18,7 @@ from tqdm.autonotebook import tqdm
 
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLTimerError
+from easydel.etils.etils import get_logger
 from easydel.trainers.base_trainer import TrainerConfigureFunctionOutput
 from easydel.trainers.causal_language_model_trainer import CausalLanguageModelTrainer
 from easydel.trainers.vision_causal_language_model_trainer.fwd_bwd_functions import (
@@ -31,8 +29,6 @@ from easydel.trainers.vision_causal_language_model_trainer.fwd_bwd_functions imp
 from easydel.trainers.vision_causal_language_model_trainer.modelling_output import (
     VisionCausalLMTrainerOutput,
 )
-
-from easydel.etils.etils import get_logger
 
 logger = get_logger(__name__)
 
@@ -237,28 +233,10 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
             )
             if state is not None:
                 sharded_state = state
-                params = (
-                    sharded_state.params
-                    if not self.arguments.do_shard_fns
-                    else jax.tree_util.tree_map(
-                        lambda f, x: f(x), shard_fns.params, sharded_state.params
-                    )
-                )
-                sharded_state.params = params
                 if sharded_state.opt_state is None:
                     logger.info("Optimizer State is not Found!, initializing one.")
                     with jax.default_device(self.arguments.offload_device):
                         sharded_state = sharded_state.init_opt_state()
-                        opt_state = (
-                            sharded_state.opt_state
-                            if not self.arguments.do_shard_fns
-                            else jax.tree_util.tree_map(
-                                lambda f, x: f(x),
-                                shard_fns.opt_state,
-                                sharded_state.opt_state,
-                            )
-                        )
-                        sharded_state = sharded_state.replace(opt_state=opt_state)
             elif self.finetune:
                 if model_parameters is None and self.checkpoint_path is not None:
                     logger.info(f"Loading Model From {self.checkpoint_path}")
@@ -327,16 +305,6 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                             "Model Parameters should be like FrozenDict({'params': params}) make sure to "
                             "pass as type FrozenDict in case of not getting UnExcepted Errors ",
                         )
-
-                    model_parameters = (
-                        model_parameters
-                        if not self.arguments.do_shard_fns
-                        else jax.tree_util.tree_map(
-                            lambda f, x: f(x),
-                            shard_fns.params,
-                            model_parameters,
-                        )
-                    )
                     sharded_state = self.create_sharded_state_from_params_function(
                         model_parameters
                     )
@@ -350,15 +318,6 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                     )
             else:
                 sharded_state = self.initialize_state_function()
-                params = (
-                    sharded_state.params
-                    if not self.arguments.do_shard_fns
-                    else jax.tree_util.tree_map(
-                        lambda f, x: f(x), shard_fns.params, sharded_state.params
-                    )
-                )
-                sharded_state.params = params
-
             self.sharded_state = sharded_state
             return sharded_state, shard_fns, gather_fns
 

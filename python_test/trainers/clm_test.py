@@ -58,7 +58,7 @@ def main(use_iterable_dataset: bool):
     )
 
     model = FlaxMistralForCausalLM(config=config, _do_init=True)
-    params = model.params
+    params = model.shard_params(model.params)
 
     def data_generator(num_rows: int):
         for i in range(num_rows):
@@ -71,17 +71,21 @@ def main(use_iterable_dataset: bool):
 
     if not use_iterable_dataset:
         example_train_data = Dataset.from_generator(
-            data_generator, gen_kwargs={"num_rows": NUM_TRAIN_EXAMPLES}
+            data_generator,
+            gen_kwargs={"num_rows": NUM_TRAIN_EXAMPLES},
         )
         example_eval_data = Dataset.from_generator(
-            data_generator, gen_kwargs={"num_rows": NUM_EVAL_EXAMPLES}
+            data_generator,
+            gen_kwargs={"num_rows": NUM_EVAL_EXAMPLES},
         )
     else:
         example_train_data = IterableDataset.from_generator(
-            data_generator, gen_kwargs={"num_rows": NUM_TRAIN_EXAMPLES}
+            data_generator,
+            gen_kwargs={"num_rows": NUM_TRAIN_EXAMPLES},
         )
         example_eval_data = IterableDataset.from_generator(
-            data_generator, gen_kwargs={"num_rows": NUM_EVAL_EXAMPLES}
+            data_generator,
+            gen_kwargs={"num_rows": NUM_EVAL_EXAMPLES},
         )
     dtype = jnp.float16
     trainer = CausalLanguageModelTrainer(
@@ -93,7 +97,6 @@ def main(use_iterable_dataset: bool):
             max_training_steps=max_training_steps,
             max_evaluation_steps=max_evaluation_steps,
             model_class=type(model),
-            do_shard_fns=True,
             do_train=True,
             do_eval=True,
             max_sequence_length=sequence_length,
@@ -116,7 +119,7 @@ def main(use_iterable_dataset: bool):
             optimizer=EasyDeLOptimizers.ADAMW,
             scheduler=EasyDeLSchedulers.COSINE,
             clip_grad=1.0,
-            warmup_steps=5
+            warmup_steps=5,
         ),
         dataset_train=example_train_data,
         dataset_eval=example_eval_data,

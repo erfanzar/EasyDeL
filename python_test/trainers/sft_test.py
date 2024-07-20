@@ -15,12 +15,12 @@ import jax  # noqa: E402
 jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 
 import flax.core  # noqa: E402
-from transformers import AutoTokenizer  # noqa: E402
+from datasets import load_dataset  # noqa: E402
+from easydel import FlaxMistralForCausalLM, MistralConfig, TrainArguments  # noqa: E402
 from easydel.trainers import conversations_formatting_function  # noqa: E402
 from easydel.trainers.supervised_fine_tuning_trainer import SFTTrainer  # noqa: E402
-from easydel import TrainArguments, FlaxMistralForCausalLM, MistralConfig  # noqa: E402
 from jax import numpy as jnp  # noqa: E402
-from datasets import load_dataset  # noqa: E402
+from transformers import AutoTokenizer  # noqa: E402
 
 
 def main():
@@ -47,7 +47,7 @@ def main():
     train_dataset = load_dataset("HuggingFaceH4/deita-10k-v0-sft", split="train_sft")
 
     model = FlaxMistralForCausalLM(config=config, _do_init=True)
-    params = model.params
+    params = model.shard_params(model.params)
 
     dtype = jnp.float32
     trainer = SFTTrainer(
@@ -58,7 +58,6 @@ def main():
             gradient_accumulation_steps=2,
             use_wandb=False,
             model_class=type(model),
-            do_shard_fns=False,
             do_train=True,
             do_eval=False,
             max_sequence_length=sequence_length,
@@ -87,7 +86,7 @@ def main():
         packing=True,
         num_of_sequences=1024,
         chars_per_token=2.1,
-        dataset_num_proc=32
+        dataset_num_proc=32,
     )
     return trainer.train(model_parameters=flax.core.FrozenDict({"params": params}))
 

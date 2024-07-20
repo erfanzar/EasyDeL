@@ -66,7 +66,6 @@ class TrainArguments:
         model_name (Optional[str]): Name of the model.
         num_train_epochs (Optional[int]): Number of training epochs.
         model_class (Optional[EDPretrainedModel]): The EasyDeL Flax Pretrained Model class to use.
-        model_huggingface_repo_id (Optional[str]): Hugging Face repository ID for the model.
         total_batch_size (int): Total batch size for training.
         max_training_steps (Optional[int]): Maximum number of training steps.
         max_evaluation_steps (Optional[int]):  Maximum number of evaluation steps.
@@ -102,7 +101,6 @@ class TrainArguments:
         configs_to_initialize_model_class (Optional[dict]): Configurations used to initialize the model class.
         do_last_save (bool): Whether to save the final model checkpoint.
         model_parameters (Optional[dict]): Model parameters for initialization.
-        do_shard_fns (bool): Whether to shard model functions for parallelism.
         track_memory (Optional[bool]): Whether to track memory usage during training.
         loss_re_mat (str): Regular expression for loss rematerialization.
         loss_chunk (int): Chunk size for loss computation.
@@ -168,7 +166,6 @@ class TrainArguments:
     model_name: str = "Model"
     num_train_epochs: int = 10
     model_class: Optional["EDPretrainedModel"] = None  # type: ignore # noqa: F821
-    model_huggingface_repo_id: Optional[str] = None
     total_batch_size: int = 32
     max_training_steps: Optional[int] = None
     max_evaluation_steps: Optional[int] = None
@@ -206,7 +203,6 @@ class TrainArguments:
     configs_to_initialize_model_class: Optional[dict] = None
     do_last_save: bool = True
     model_parameters: Optional[dict] = None
-    do_shard_fns: bool = True
     track_memory: Optional[bool] = None
     loss_re_mat: str = ""
     loss_chunk: int = 1024

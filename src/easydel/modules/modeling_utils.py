@@ -2,9 +2,11 @@ import os
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Literal, Mapping, Optional, Sequence, Tuple, Union
 
 import chex
+import fjformer
+import fjformer.sharding
 import flax
 import flax.linen
 import jax
@@ -816,7 +818,9 @@ class EDPretrainedModel(FlaxPreTrainedModel):
         return self._config  # type:ignore
 
     def to_easydel_state(
-        self, params: flax.core.FrozenDict, auto_check_params: bool = True
+        self,
+        params: flax.core.FrozenDict,
+        auto_check_params: bool = True,
     ):
         """
         Convert the Model to EasyDeLState
@@ -1375,3 +1379,95 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
                 pass
 
         return model, unflatten_dict(state)
+
+    def shard_params(
+        self,
+        params,
+        partition_rules: Optional[
+            Union[Mapping[str, Callable], Mapping[tuple, Callable]]
+        ] = None,
+        mesh: Optional[jax.sharding.Mesh] = None,
+    ):
+        """
+        Shards model parameters according to the provided partition rules.
+
+        Args:
+            params: A PyTree representing the model parameters.
+            partition_rules: A dictionary mapping parameter names or a tuple of parameter names to
+                partitioning functions. The partitioning functions should take the shape and dtype of
+                the parameter as input and return a `jax.sharding.PartitionSpec`. If `None`, defaults to
+                the partition rules specified in the model configuration for fully sharded data parallelism.
+            mesh: The `jax.sharding.Mesh` object specifying the device mesh. If `None`, defaults to the mesh
+                defined in the model configuration.
+
+        Returns:
+            A sharded version of the input parameters, where each parameter is partitioned across devices
+            according to the specified rules and mesh.
+        """
+        if mesh is None:
+            mesh = self.config.mesh
+        if partition_rules is None:
+            partition_rules = self.config.get_partition_rules(
+                fully_sharded_data_parallel=True
+            )
+        partition_specs = fjformer.sharding.match_partition_rules(
+            rules=partition_rules,
+            params=params,
+        )
+        shard_fns = fjformer.sharding.make_shard_and_gather_fns(
+            partition_specs=partition_specs,
+            mesh=mesh,
+        )[0]
+        params = jax.tree_util.tree_map(
+            lambda f, x: f(x),
+            shard_fns,
+            params,
+        )
+        return params
+
+    def gather_params(
+        self,
+        params,
+        partition_rules: Optional[
+            Union[Mapping[str, Callable], Mapping[tuple, Callable]]
+        ] = None,
+        mesh: Optional[jax.sharding.Mesh] = None,
+    ):
+        """
+        Gathers sharded model parameters to the host device.
+
+        This method reverses the sharding process performed by `shard_params`, collecting the parameter shards
+        from different devices and aggregating them into a single PyTree on the host device.
+
+        Args:
+            params: A PyTree representing the sharded model parameters.
+            partition_rules: A dictionary mapping parameter names or a tuple of parameter names to
+                partitioning functions. The partitioning functions should take the shape and dtype of
+                the parameter as input and return a `jax.sharding.PartitionSpec`. If `None`, defaults to
+                the partition rules specified in the model configuration for fully sharded data parallelism.
+            mesh: The `jax.sharding.Mesh` object specifying the device mesh. If `None`, defaults to the mesh
+                defined in the model configuration.
+
+        Returns:
+            A non-sharded version of the input parameters, where all parameters are gathered onto the host device.
+        """
+        if mesh is None:
+            mesh = self.config.mesh
+        if partition_rules is None:
+            partition_rules = self.config.get_partition_rules(
+                fully_sharded_data_parallel=True
+            )
+        partition_specs = fjformer.sharding.match_partition_rules(
+            rules=partition_rules,
+            params=params,
+        )
+        gather_fns = fjformer.sharding.make_shard_and_gather_fns(
+            partition_specs=partition_specs,
+            mesh=mesh,
+        )[1]
+        params = jax.tree_util.tree_map(
+            lambda f, x: f(x),
+            gather_fns,
+            params,
+        )
+        return params

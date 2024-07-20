@@ -1,10 +1,11 @@
 # EasyDeL 🔮
 
 [**Key Features**](#key-features)
-| [**Vision**](#future-updates-and-vision-🚀)
+| [**Latest Updates**](#latest-updates-)
+| [**Vision**](#future-updates-and-vision-)
 | [**Quick Start**](#quick-start)
 | [**Reference docs**](https://easydel.readthedocs.io/en/latest/)
-| [**License**](#license-📜)
+| [**License**](#license-)
 
 EasyDeL is an open-source framework designed to enhance and streamline the training process of machine learning models, with a primary focus on Jax/Flax. It provides convenient and effective solutions for training and serving Flax/Jax models on TPU/GPU at scale.
 
@@ -91,8 +92,23 @@ ed.FlexibleAttentionModule.test_attentions()
 
 Comprehensive documentation and examples are available at [EasyDeL Documentation](https://easydel.readthedocs.io/en/latest/).
 
+Here's an improved version of your latest updates:
+
 ## Latest Updates 🔥
 
+- Optimized KeyValueCache:
+   - Improved performance for `inference`
+   - Added support for `8bit_cache`
+- GenerationPipeline Enhancements:
+    - Now supports `int8` and `nf4` for generation tasks.
+- Enhanced Trainers: Both `DPO` and `ORPO` trainers have been upgraded.
+- Simplified Parameter Sharding: You can now shard parameters directly with the model using:
+   ```python
+   params = model.shard_params(params)
+   params = model.gather_params(params)
+   ```
+- Training Argument Change: `do_shard_params` has been removed from `TrainArguments`. To shard parameters, you must now do so manually before training.
+-  DPOTrainer Improvement: Added support for int8 training for reference models.
 - Added `ApiEngine` and `engine_client`
 - Improved `SFT`, `DPO`, `ORPO`, `CLM` Trainers
 - Added support for Gemma2, OLMo models
