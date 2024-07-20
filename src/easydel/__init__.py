@@ -240,7 +240,8 @@ from easydel import etils as etils
 
 import fjformer as _fj
 
-assert _fj.__version__ == "0.0.72", (
-    f"this version os EasyDeL is only compatible with fjformer==0.0.70,"
+_targeted_version = "0.0.73"
+assert _fj.__version__ == _targeted_version, (
+    f"this version os EasyDeL is only compatible with fjformer=={_targeted_version},"
     f" but found fjformer {_fj.__version__}"
 )
