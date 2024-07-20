@@ -66,6 +66,7 @@ class GenerationPipeline:
         self.parameters_are_quantized = parameters_are_quantized
         self.force_sharding = force_sharding
         self._shard_state = None
+        self._call_with_maybe_quant = None
         self.compiled_func = None
         self.over_compiled_func = None
         self._rng_gen = GenerateRNG(seed or 42)
@@ -236,13 +237,7 @@ class GenerationPipeline:
         with self.mesh:
             if input_ids.shape[1] > 1:
                 if self.parameters_are_quantized:
-
-                    @jax.jit
-                    @fjformer.core.implicit_compact
-                    def call_with_maybe_quant(params_, generation_state_):
-                        return sample_fn(params_, generation_state_)
-
-                    generation_state = call_with_maybe_quant(
+                    generation_state = self.call_with_maybe_quant(sample_fn)(
                         self.params,
                         generation_state,
                     )
@@ -289,30 +284,6 @@ class GenerationPipeline:
             (
                 "attention_mask",
                 PartitionSpec(paxis.batch_axis, None),
-            ),
-            (
-                "cached_key_scale",
-                PartitionSpec(
-                    paxis.batch_axis, paxis.key_sequence_axis, paxis.head_axis, None
-                ),
-            ),
-            (
-                "cached_value_scale",
-                PartitionSpec(
-                    paxis.batch_axis, paxis.key_sequence_axis, paxis.head_axis, None
-                ),
-            ),
-            (
-                "cached_key_minval",
-                PartitionSpec(
-                    paxis.batch_axis, paxis.key_sequence_axis, paxis.head_axis, None
-                ),
-            ),
-            (
-                "cached_value_minval",
-                PartitionSpec(
-                    paxis.batch_axis, paxis.key_sequence_axis, paxis.head_axis, None
-                ),
             ),
             (
                 "cached_key",
@@ -426,6 +397,17 @@ class GenerationPipeline:
             ),
             out_shardings=state_sharding if self.force_sharding else None,
         )
+
+    def call_with_maybe_quant(self, sample_fn):
+        if self._call_with_maybe_quant is None:
+
+            @jax.jit
+            @fjformer.core.implicit_compact
+            def call_with_maybe_quant(params_, generation_state_):
+                return sample_fn(params_, generation_state_)
+
+            self._call_with_maybe_quant = call_with_maybe_quant
+        return self._call_with_maybe_quant
 
     def compiled_sample_state(
         self,
