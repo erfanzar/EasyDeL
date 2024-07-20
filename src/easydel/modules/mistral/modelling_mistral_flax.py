@@ -1355,18 +1355,29 @@ class FlaxVisionMistralModule(nn.Module):
             initial_rope_kwargs = dict(
                 scaling_factor=scaling_factor, rope_type=scaling_type
             )
+        head_dim = getattr(
+            self.config,
+            "head_dim",
+            None,
+        )
+        head_dim = (
+            head_dim
+            if head_dim is not None
+            else (config.hidden_size // config.num_attention_heads)
+        )
         self.freq_cis = precompute_freq_cis(
             max_position_embeddings=(
                 getattr(
-                    self.config,
+                    config,
                     "freq_max_position_embeddings",
-                    self.config.max_position_embeddings,
+                    config.max_position_embeddings,
                 )
             ),
-            dim=config.hidden_size // config.num_attention_heads,
+            dim=head_dim,
             base=config.rope_theta,
             **initial_rope_kwargs,
         )
+        self.config.head_dim = head_dim
 
     def __call__(
         self,
