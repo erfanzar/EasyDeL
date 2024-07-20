@@ -122,7 +122,17 @@ class FlaxMistralAttention(FlaxAttentionModule):
     def setup(self):
         config = self.config
         self.hidden_size = config.hidden_size
-        self.head_dim = self.config.hidden_size // self.config.num_attention_heads
+        self.head_dim = getattr(
+            self.config,
+            "head_dim",
+            None,
+        )
+        self.head_dim = (
+            self.head_dim
+            if self.head_dim is not None
+            else (self.config.hidden_size // self.config.num_attention_heads)
+        )
+        self.config.head_dim = self.head_dim # Fixes Nemo Model Bug 
         self.num_key_value_groups = (
             self.config.num_attention_heads // self.config.num_key_value_heads
         )
@@ -260,13 +270,22 @@ class FlaxMistralAttention(FlaxAttentionModule):
         )
 
         query_states = query_states.reshape(
-            batch_size, sequence_length, self.config.num_attention_heads, self.head_dim,
+            batch_size,
+            sequence_length,
+            self.config.num_attention_heads,
+            self.head_dim,
         )
         key_states = key_states.reshape(
-            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim,
+            batch_size,
+            sequence_length,
+            self.config.num_key_value_heads,
+            self.head_dim,
         )
         value_states = value_states.reshape(
-            batch_size, sequence_length, self.config.num_key_value_heads, self.head_dim,
+            batch_size,
+            sequence_length,
+            self.config.num_key_value_heads,
+            self.head_dim,
         )
 
         query_states, key_states, value_states = self.apply_rotary(
