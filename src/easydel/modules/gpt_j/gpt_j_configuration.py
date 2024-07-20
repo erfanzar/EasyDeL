@@ -157,9 +157,8 @@ class GPTJConfig(EDPretrainedConfig):
                 ("mlp/fc_in/kernel", PartitionSpec(("fsdp", "tp"))),
                 ("mlp/fc_in/bias", PartitionSpec(("fsdp", "tp"))),
                 ("lm_head/kernel", PartitionSpec(("fsdp", "tp"))),
-                ("lm_head/bias", PartitionSpec(("fsdp", "tp")))(
-                    ".*", PartitionSpec(None)
-                ),
+                ("lm_head/bias", PartitionSpec(("fsdp", "tp"))),
+                (".*", PartitionSpec(None)),
             )
             if fully_sharded_data_parallel
             else (

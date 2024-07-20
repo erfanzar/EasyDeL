@@ -266,6 +266,13 @@ class EDPretrainedConfig(PretrainedConfig):
             "attn_dtype",
             attn_dtype,
         )
+        if self.quantize_kv_cache and self.use_sharded_kv_caching:
+            quantize_kv_cache = self.quantize_kv_cache
+            use_sharded_kv_caching = self.use_sharded_kv_caching
+            logger.warn(
+                f"`{quantize_kv_cache=}` and `{use_sharded_kv_caching=}`"
+                " can't be used together at the moment."
+            )
         super().__init__(**kwargs)
 
     @staticmethod

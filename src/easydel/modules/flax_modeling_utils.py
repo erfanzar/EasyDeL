@@ -1,5 +1,6 @@
 import functools
 import math
+import warnings
 from functools import partial
 from typing import Any, Dict, List, Literal, Optional, Sequence, Union
 
@@ -28,6 +29,10 @@ from easydel.etils.etils import get_logger
 from easydel.etils.partition_module import PartitionAxis
 from easydel.modules.modeling_utils import EasyMethod
 
+warnings.filterwarnings(
+    "ignore",
+    message="Primitive dynamic_update_slice was not handled by class",
+)
 logger = get_logger(__name__)
 ACT2FN = {
     "gelu": partial(nn.gelu, approximate=False),
@@ -441,8 +446,7 @@ class FlaxAttentionModule(nn.Module):
             self: Access the variables stored in the cache
             key: Store the keys of the encoder-decoder attention
             value: Initialize the cached_value variable
-            query_states: Determine the number of cache vectors to
-                update
+            query_states: Determine the number of cache vectors to update
             attention_mask: Mask out the padded vectors in the cache
 
         Returns:
@@ -452,61 +456,49 @@ class FlaxAttentionModule(nn.Module):
         is_initialized = self.has_variable("cache", "cached_key")
         if do_quantize_kv_cache:
             cached_key = self.variable(
-                "cache", "cached_key", jnp.zeros, key.shape, jnp.uint8
+                "cache",
+                "cached_key",
+                lambda: Array8Bit.quantize(jnp.zeros(key.shape, dtype=key.dtype)),
             )
             cached_value = self.variable(
-                "cache", "cached_value", jnp.zeros, value.shape, jnp.uint8
-            )
-            cached_key_scale = self.variable(
                 "cache",
-                "cached_key_scale",
-                jnp.zeros,
-                key.shape[0:-1] + (1,),
-                key.dtype,
-            )
-            cached_value_scale = self.variable(
-                "cache",
-                "cached_value_scale",
-                jnp.zeros,
-                value.shape[0:-1] + (1,),
-                value.dtype,
-            )
-            cached_key_minval = self.variable(
-                "cache",
-                "cached_key_minval",
-                jnp.zeros,
-                key.shape[0:-1] + (1,),
-                key.dtype,
-            )
-            cached_value_minval = self.variable(
-                "cache",
-                "cached_value_minval",
-                jnp.zeros,
-                value.shape[0:-1] + (1,),
-                value.dtype,
+                "cached_value",
+                lambda: Array8Bit.quantize(jnp.zeros(value.shape, dtype=value.dtype)),
             )
             cache_index = self.variable(
-                "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
+                "cache",
+                "cache_index",
+                lambda: jnp.array(0, dtype=jnp.int32),
             )
         else:
-            cached_key_scale = None
-            cached_value_scale = None
-            cached_value_minval = None
-            cached_key_minval = None
             cached_key = self.variable(
-                "cache", "cached_key", jnp.zeros, key.shape, key.dtype
+                "cache",
+                "cached_key",
+                jnp.zeros,
+                key.shape,
+                key.dtype,
             )
             cached_value = self.variable(
-                "cache", "cached_value", jnp.zeros, value.shape, value.dtype
+                "cache",
+                "cached_value",
+                jnp.zeros,
+                value.shape,
+                value.dtype,
             )
             cache_index = self.variable(
-                "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
+                "cache",
+                "cache_index",
+                lambda: jnp.array(0, dtype=jnp.int32),
             )
         paxs: PartitionAxis = self.config.partition_axis
         if is_initialized:
             *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
             cur_index = cache_index.value
-            if query_states.shape[1] == 1 and self.config.use_sharded_kv_caching:
+            if (
+                query_states.shape[1] == 1
+                and self.config.use_sharded_kv_caching
+                and not do_quantize_kv_cache
+            ):
                 mesh = self.config.mesh
 
                 def fn(_cached_key, _cached_value, _key, _value, _cur_index):
@@ -582,22 +574,8 @@ class FlaxAttentionModule(nn.Module):
                 )
                 cur_index = cache_index.value
                 indices = (0,) * len(batch_dims) + (cur_index, 0, 0)  # type:ignore
-                if do_quantize_kv_cache:
-                    key_val = dequantize_kv_cache(
-                        cached_key.value,
-                        cached_key_scale.value,
-                        cached_key_minval.value,
-                        key.dtype,
-                    )
-                    value_val = dequantize_kv_cache(
-                        cached_value.value,
-                        cached_value_scale.value,
-                        cached_key_minval.value,
-                        value.dtype,
-                    )
-                else:
-                    key_val = cached_key.value
-                    value_val = cached_value.value
+                key_val = cached_key.value
+                value_val = cached_value.value
 
                 key = lax.dynamic_update_slice(key_val, key, indices)
                 value = lax.dynamic_update_slice(value_val, value, indices)
@@ -608,16 +586,8 @@ class FlaxAttentionModule(nn.Module):
                 )
                 attention_mask = combine_masks(pad_mask, attention_mask)
             if do_quantize_kv_cache:
-                kq, ks, km = quantize_kv_cache(key)
-                vq, vs, vm = quantize_kv_cache(value)
-
-                cached_key.value = kq
-                cached_key_scale.value = ks.astype(self.dtype)
-                cached_key_minval.value = km.astype(self.dtype)
-
-                cached_value.value = vq
-                cached_value_scale.value = vs.astype(self.dtype)
-                cached_value_minval.value = vm.astype(self.dtype)
+                cached_key.value = Array8Bit.quantize(key)
+                cached_value.value = Array8Bit.quantize(value)
             else:
                 cached_key.value = key
                 cached_value.value = value

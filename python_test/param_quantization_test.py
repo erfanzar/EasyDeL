@@ -58,7 +58,7 @@ def main():
         max_position_embeddings=512,
         use_scan_mlp=False,
         axis_dims=(1, 1, 1, -1),
-        quantize_kv_cache=False,
+        quantize_kv_cache=True,
     )
     model = FlaxLlamaForCausalLM(
         config=config,
