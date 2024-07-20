@@ -9,7 +9,7 @@ license = { text = "Apache-2.0" }
 dependencies = [
     "jax>=0.4.30",
     "jaxlib>=0.4.30",
-    "fjformer==0.0.72",
+    "fjformer==0.0.73",
     "transformers>=4.40.0",
     "optax~=0.2.2",
     "tensorflow~=2.17.0",
@@ -18,7 +18,6 @@ dependencies = [
     "tqdm~=4.64.1",
     "datasets~=2.19.2",
     "tensorboard~=2.17.0",
-    "numpy~=1.26.2",
     "tensorflow-datasets~=4.9.6",
     "scipy==1.13.1",
     "websocket-client~=1.8.0",
