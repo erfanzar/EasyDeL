@@ -70,8 +70,6 @@ class DPOTrainer(BaseTrainer, ABC):
             precompute_ref_log_probs (bool): Whether to precompute reference model log probabilities.
             reference_free (bool): Whether to use a reference-free DPO variant.
             is_encoder_decoder (bool): Whether the model is an encoder-decoder architecture.
-            auto_shard_model_state (bool): Whether to automatically shard the model state.
-            auto_shard_ref_model_state (bool): Whether to automatically shard the reference model state.
             dataset_map_arguments (Optional[dict]): Arguments to pass to the dataset `map` function for tokenization.
             low_mem_usage (bool): Whether to prioritize low memory usage during training.
             auto_fix_data (bool): Whether to automatically fix data issues.
@@ -199,7 +197,8 @@ class DPOTrainer(BaseTrainer, ABC):
         ...     pretrained_model_name_or_path=model_name_or_path,
         ...     dtype=dtype,
         ...     param_dtype=dtype,
-        ...     init_optimizer_state=False,
+        ...     auto_shard_params=True, # shard parameters
+        ...     init_optimizer_state=False, # let trainer configure optimizer
         ...     free_optimizer_state=True,
         ...     sharding_axis_dims=sharding_axis_dims,
         ...     sharding_axis_names=sharding_axis_names,
@@ -220,6 +219,8 @@ class DPOTrainer(BaseTrainer, ABC):
         ...     free_optimizer_state=True,
         ...     sharding_axis_dims=sharding_axis_dims,
         ...     sharding_axis_names=sharding_axis_names,
+        ...     load_in_8bit=True, # Now you can train DPO with ref_state in 8Bit (4Bit, NF4 is coming soon.)
+        ...     auto_shard_params=True, # shard parameters
         ...     partition_axis=easydel.PartitionAxis(
         ...         batch_axis=("dp", "fsdp"),
         ...         query_sequence_axis="sp",
@@ -247,8 +248,6 @@ class DPOTrainer(BaseTrainer, ABC):
         ...         "batched": True,
         ...         "batch_size": 100,
         ...     },
-        ...     auto_shard_model_state=True,
-        ...     auto_shard_ref_model_state=True,
         ...     loss_type="sigmoid",
         ...     data_collator=None,  # Pass None in order to use default data_collector (you can create your own)
         ... )
@@ -281,8 +280,6 @@ class DPOTrainer(BaseTrainer, ABC):
         model_init_kwargs: Optional[Dict] = None,
         ref_model_init_kwargs: Optional[Dict] = None,
         reference_free: bool = False,
-        auto_shard_model_state: bool = True,
-        auto_shard_ref_model_state: bool = True,
         is_encoder_decoder: Optional[bool] = False,
         dataset_map_arguments: Optional[dict] = None,
         low_mem_usage: bool = True,
@@ -411,13 +408,14 @@ class DPOTrainer(BaseTrainer, ABC):
             padding_value is not None
         ), "`padding_value` can not be set as `None` it must be an integer."
 
-        self.concatenated_forward = create_dpo_concatenated_forward(
-            is_encoder_decoder=self.is_encoder_decoder,
-            padding_value=padding_value,
-            label_pad_token_id=label_pad_token_id,
+        self.concatenated_forward = jax.jit(
+            create_dpo_concatenated_forward(
+                is_encoder_decoder=self.is_encoder_decoder,
+                padding_value=padding_value,
+                label_pad_token_id=label_pad_token_id,
+            ),
+            static_argnums=[0],
         )
-        self.auto_shard_ref_model_state = auto_shard_ref_model_state
-        self.auto_shard_model_state = auto_shard_model_state
 
         self._cached_p_l_s = None
         self._cached_c_l_s = None
@@ -698,7 +696,8 @@ class DPOTrainer(BaseTrainer, ABC):
         )
         spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
         empty_sharding = jax.sharding.NamedSharding(
-            spec=PartitionSpec(), mesh=self.arguments.get_mesh()
+            spec=PartitionSpec(),
+            mesh=self.arguments.get_mesh(),
         )
         create_sharded_state_from_params_function = jax.jit(
             create_state_from_params_function,
@@ -719,7 +718,8 @@ class DPOTrainer(BaseTrainer, ABC):
             in_shardings=(
                 spec_named_sharding,
                 jax.sharding.NamedSharding(
-                    spec=self.arguments.step_partition_spec, mesh=self.mesh
+                    spec=self.arguments.step_partition_spec,
+                    mesh=self.mesh,
                 ),
             ),
             out_shardings=(spec_named_sharding, empty_sharding),
@@ -739,7 +739,8 @@ class DPOTrainer(BaseTrainer, ABC):
             in_shardings=(
                 spec_named_sharding,
                 jax.sharding.NamedSharding(
-                    spec=self.arguments.step_partition_spec, mesh=self.mesh
+                    spec=self.arguments.step_partition_spec,
+                    mesh=self.mesh,
                 ),
             ),
             out_shardings=(spec_named_sharding, empty_sharding),
@@ -768,45 +769,28 @@ class DPOTrainer(BaseTrainer, ABC):
         defined in the model configuration. It also initializes the optimizer and scheduler
         for the sharded model state.
         """
-        module_operation_name = "configure functions and sharding them"
-        with self.timer(module_operation_name):
-            if self.auto_shard_model_state:
-                target_operation_name = "Sharding Model State"
-                with self.timer(target_operation_name):
-                    self.model_state: EasyDeLState = self.shard_states(
-                        self.model_state,
-                        self.model_state.module.config.get_partition_rules(
-                            self.arguments.fully_sharded_data_parallel
-                        ),
-                    )
-                    inner_module_operation_name = (
-                        "initializing TX and Schedulers for `model_state`"
-                    )
-                    with self.timer(inner_module_operation_name):
-                        params_with_opt = (
-                            self.model_state.params["params"]
-                            if "_overwrite_with_gradient" in self.model_state.params
-                            else self.model_state.params
-                        )
-                        opt_state = self.tx.init(params_with_opt)
+        if self.model_state.tx is None or self.model_state.opt_state is None:
+            inner_module_operation_name = (
+                "initializing TX and Schedulers for `model_state`"
+            )
+            with self.timer(inner_module_operation_name):
+                params_with_opt = (
+                    self.model_state.params["params"]
+                    if "_overwrite_with_gradient" in self.model_state.params
+                    else self.model_state.params
+                )
+                opt_state = self.tx.init(params_with_opt)
 
-                        self.model_state = self.model_state.replace(
-                            opt_state=opt_state, tx=self.tx
-                        )
-                    self.timer.log(inner_module_operation_name)
-
-                self.timer.log(target_operation_name)
-            if self.auto_shard_ref_model_state and self.ref_model_state is not None:
-                target_operation_name = "Sharding Ref Model State"
-                with self.timer(target_operation_name):
-                    self.ref_model_state = self.shard_states(
-                        self.ref_model_state,
-                        self.ref_model_state.module.config.get_partition_rules(
-                            self.arguments.fully_sharded_data_parallel
-                        ),
-                    )
-                self.timer.log(target_operation_name)
-        self.timer.log(module_operation_name)
+                self.model_state = self.model_state.replace(
+                    opt_state=opt_state,
+                    tx=self.tx,
+                )
+            self.timer.log(inner_module_operation_name)
+        else:
+            logger.info(
+                "Found an existing TX and OptimizerState for "
+                "model_state (ignore sharding and tx_init)."
+            )
 
     def create_collect_function(
         self,
@@ -827,49 +811,6 @@ class DPOTrainer(BaseTrainer, ABC):
             Callable: The data collator function.
         """
         return self.data_collator
-
-    def shard_states(self, state, rules):
-        """
-        Shards the provided state (EasyDeLState) according to the given sharding rules.
-
-        This method creates sharding specifications, applies JIT compilation to the sharding
-        function, and then shards the provided state.
-
-        Args:
-            state (EasyDeLState): The EasyDeLState object to be sharded.
-            rules (Any): The sharding rules to apply.
-
-        Returns:
-            EasyDeLState: The sharded EasyDeLState object.
-        """
-        with self.arguments.get_mesh():
-            partition_spec = match_partition_rules(
-                rules=rules, params=jax.eval_shape(lambda: state)
-            )
-
-            spec_named_sharding = self.specs_to_name_sharding(partition_spec)
-            empty_sharding = jax.sharding.NamedSharding(
-                spec=PartitionSpec(), mesh=self.arguments.get_mesh()
-            )
-
-            def _shard(x):
-                """
-                The inner sharding function that applies the sharding specifications.
-
-                Args:
-                    x (EasyDeLState): The EasyDeLState to shard.
-
-                Returns:
-                    EasyDeLState: The sharded EasyDeLState.
-                """
-                return x
-
-            shard = jax.jit(
-                _shard,
-                in_shardings=(empty_sharding,),
-                out_shardings=spec_named_sharding,
-            )
-            return shard(state)
 
     def _get_train_dataloader(self) -> "tensorflow.data.Dataset":  # noqa #type:ignore
         """

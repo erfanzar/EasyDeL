@@ -102,8 +102,12 @@ class ORPOTrainer(BaseTrainer, ABC):
         padding_value: int = None,
         data_collator: Optional[DPODataCollatorWithPadding] = None,
         train_dataset: Optional["Dataset"] = None,  # noqa #type:ignore
-        eval_dataset: Optional[Union["Dataset", Dict[str, "Dataset"]]] = None,  # noqa #type:ignore
-        tokenizer: Optional["transformers.PreTrainedTokenizerBase"] = None,  # noqa #type:ignore
+        eval_dataset: Optional[
+            Union["Dataset", Dict[str, "Dataset"]]  # noqa #type:ignore
+        ] = None,
+        tokenizer: Optional[
+            "transformers.PreTrainedTokenizerBase"  # noqa #type:ignore
+        ] = None,
         dataset_num_proc: Optional[int] = None,
         _do_init_fns: bool = True,
         dataset_map_arguments: Optional[Dict[str, Any]] = None,
@@ -724,28 +728,10 @@ class ORPOTrainer(BaseTrainer, ABC):
             )
             if state is not None:
                 sharded_state = state
-                params = (
-                    sharded_state.params
-                    if not self.arguments.do_shard_fns
-                    else jax.tree_util.tree_map(
-                        lambda f, x: f(x), shard_fns.params, sharded_state.params
-                    )
-                )
-                sharded_state.params = params
                 if sharded_state.opt_state is None:
                     logger.info("Optimizer State is not Found!, initializing one.")
                     with jax.default_device(self.arguments.offload_device):
                         sharded_state = sharded_state.init_opt_state()
-                        opt_state = (
-                            sharded_state.opt_state
-                            if not self.arguments.do_shard_fns
-                            else jax.tree_util.tree_map(
-                                lambda f, x: f(x),
-                                shard_fns.opt_state,
-                                sharded_state.opt_state,
-                            )
-                        )
-                        sharded_state = sharded_state.replace(opt_state=opt_state)
             elif self.finetune:
                 if model_parameters is None and self.checkpoint_path is not None:
                     logger.info(f"Loading Model From {self.checkpoint_path}")
@@ -819,16 +805,6 @@ class ORPOTrainer(BaseTrainer, ABC):
                             "Model Parameters should be like FrozenDict({'params': params}) make sure to "
                             "pass as type FrozenDict in case of not getting UnExcepted Errors ",
                         )
-
-                    model_parameters = (
-                        model_parameters
-                        if not self.arguments.do_shard_fns
-                        else jax.tree_util.tree_map(
-                            lambda f, x: f(x),
-                            shard_fns.params,
-                            model_parameters,
-                        )
-                    )
                     sharded_state = self.create_sharded_state_from_params_function(
                         model_parameters
                     )
@@ -842,14 +818,6 @@ class ORPOTrainer(BaseTrainer, ABC):
                     )
             else:
                 sharded_state = self.initialize_state_function()
-                params = (
-                    sharded_state.params
-                    if not self.arguments.do_shard_fns
-                    else jax.tree_util.tree_map(
-                        lambda f, x: f(x), shard_fns.params, sharded_state.params
-                    )
-                )
-                sharded_state.params = params
 
             self.sharded_state = sharded_state
             return sharded_state, shard_fns, gather_fns

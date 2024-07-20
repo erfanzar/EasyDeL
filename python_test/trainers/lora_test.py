@@ -86,7 +86,6 @@ def main(use_iterable_dataset: bool):
             max_training_steps=max_training_steps,
             max_evaluation_steps=max_evaluation_steps,
             model_class=type(model),
-            do_shard_fns=False,
             do_train=True,
             do_eval=True,
             max_sequence_length=sequence_length,

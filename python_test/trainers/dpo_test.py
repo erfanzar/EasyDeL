@@ -14,19 +14,19 @@ sys.path.append(
 import jax  # noqa: E402
 
 jax.config.update("jax_platform_name", "cpu")  # CPU Test !
-import jax  # noqa: E402
-from jax import numpy as jnp  # noqa: E402
+from typing import Dict, Optional  # noqa: E402
 
+import jax  # noqa: E402
+from datasets import Dataset, load_dataset  # noqa: E402
 from easydel import (  # noqa: E402
+    DPOTrainer,
     EasyDeLState,
     FlaxLlamaForCausalLM,
     LlamaConfig,
-    DPOTrainer,
     TrainArguments,
 )
-
-from typing import Dict, Optional  # noqa: E402
-from datasets import Dataset, load_dataset  # noqa: E402
+from easydel.modules.flax_modeling_utils import quantize_params_8bit  # noqa
+from jax import numpy as jnp  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 
 
@@ -124,16 +124,20 @@ def main():
             _do_init=True,
             input_shape=(8, 8),
         )
-        
+
         state = EasyDeLState.load(
             module=module,
             apply_fn=module.__call__,
-            params={"params": module.params},
+            params={"params": module.shard_params(module.params)},
         )
         ref_state = EasyDeLState.load(
             module=ref_module,
             apply_fn=ref_module.__call__,
-            params={"params": ref_module.params},
+            params={
+                "params": quantize_params_8bit(
+                    ref_module.shard_params(ref_module.params),
+                )
+            },
         )
 
         max_length = 512
@@ -152,7 +156,7 @@ def main():
             max_target_length=max_target_length,
             max_prompt_length=max_prompt_length,
             dataset_map_arguments={
-                "num_proc": os.cpu_count(),
+                "num_proc": 2,
             },
         )
 

@@ -1,13 +1,15 @@
+import functools
 import typing
+from typing import Callable, Dict, List, Literal, Tuple, Union
+
 import chex
+import fjformer
 import flax.core
 import jax
-
-from typing import Literal, Dict, Union, Tuple, List, Callable
-
-from jax import numpy as jnp
-from easydel.etils.easystate import EasyDeLState
 from flax.struct import dataclass
+from jax import numpy as jnp
+
+from easydel.etils.easystate import EasyDeLState
 from easydel.trainers.direct_preference_optimization_trainer.utils import pad_to_length
 
 
@@ -19,11 +21,11 @@ class DPOStepOut:
 
 
 def create_dpo_concatenated_forward(
-        is_encoder_decoder,
-        label_pad_token_id,
-        padding_value,
-        truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
-        fixed_max_length: int | None = None,
+    is_encoder_decoder,
+    label_pad_token_id,
+    padding_value,
+    truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
+    fixed_max_length: int | None = None,
 ):
     """The create_dpo_concatenated_forward function is a helper function that creates a forward pass function for the
     model. The forward pass function takes in an apply_fn, which is the model's apply_fn, and runs it on concatenated
@@ -45,10 +47,12 @@ def create_dpo_concatenated_forward(
         inputs,
     """
 
+    # Will be Moved under jax.jit.
+    @fjformer.core.implicit_compact
     def concatenated_forward(
-            apply_fn: Callable,
-            params: dict | flax.core.FrozenDict,
-            batch: Dict[str, Union[List, chex.Array]],
+        apply_fn: Callable,
+        params: dict | flax.core.FrozenDict,
+        batch: Dict[str, Union[List, chex.Array]],
     ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
         """The concatenated_forward function is used to compute the log-probabilities of both chosen and rejected labels.
 
@@ -64,7 +68,7 @@ def create_dpo_concatenated_forward(
             their corresponding logits
         """
         assert (
-                padding_value is not None
+            padding_value is not None
         ), "`padding_value` can not be set as `None` it must be an integer."
         concatenated_batch = concatenated_dpo_inputs(
             batch,
@@ -120,25 +124,30 @@ def create_dpo_concatenated_forward(
     return concatenated_forward
 
 
+@functools.partial(
+    jax.jit,
+    static_argnames=[
+        "average_log_prob",
+        "is_encoder_decoder",
+        "label_pad_token_id",
+    ],
+)
 def get_batch_log_probs(
-        logits: chex.Array,
-        labels: chex.Array,
-        average_log_prob: bool = False,
-        label_pad_token_id: int = -100,
-        is_encoder_decoder: bool = False,
+    logits: chex.Array,
+    labels: chex.Array,
+    average_log_prob: bool = False,
+    label_pad_token_id: int = -100,
+    is_encoder_decoder: bool = False,
 ) -> chex.Array:
-    """The get_batch_log_probs function computes the log probability of a batch of sequences.
+    """
+    The get_batch_log_probs function computes the log probability of a batch of sequences.
 
     Args:
-        logits: chex.Array: Compute the log_softmax of the input
-        labels: chex.Array: Mask the logits
-        average_log_prob: bool: Determine whether to average the log
-            prob over the sequence length
-        label_pad_token_id: int: Mask out the padding tokens in the
-            labels
-        is_encoder_decoder: bool: Indicate whether the model is an
-            encoder-decoder model
-    :param : Determine whether to average the log probability over all tokens or not
+        logits: chex.Array: Compute the log_softmax of the input.
+        labels: chex.Array: Mask the logits.
+        average_log_prob: bool: Determine whether to average the log prob over the sequence length.
+        label_pad_token_id: int: Mask out the padding tokens in the labels.
+        is_encoder_decoder: bool: Indicate whether the model is an encoder-decoder model.
 
     Returns:
         The log probability of the labels given the logits
@@ -181,12 +190,12 @@ def get_batch_log_probs(
 
 
 def concatenated_dpo_inputs(
-        batch: Dict[str, Union[List, chex.Array]],
-        is_encoder_decoder: bool = False,
-        label_pad_token_id: int = -100,
-        padding_value: int = 0,
-        truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
-        fixed_max_length: int | None = None,
+    batch: Dict[str, Union[List, chex.Array]],
+    is_encoder_decoder: bool = False,
+    label_pad_token_id: int = -100,
+    padding_value: int = 0,
+    truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
+    fixed_max_length: int | None = None,
 ) -> Dict[str, chex.Array]:
     """The concatenated_dpo_inputs function takes a batch of chosen and rejected examples,
     and concatenates them together. This is useful for training the model to predict whether an example was chosen
@@ -247,7 +256,7 @@ def concatenated_dpo_inputs(
                 pad_value = label_pad_token_id
             elif k.endswith("_input_ids"):
                 assert (
-                        padding_value is not None
+                    padding_value is not None
                 ), "`padding_value` can not be set as `None`"
                 pad_value = padding_value
             elif k.endswith("_attention_mask"):
@@ -280,12 +289,12 @@ def concatenated_dpo_inputs(
 
 
 def create_dpo_train_function(
-        concatenated_forward: Callable,
-        ref_state: EasyDeLState = None,
-        beta: float = 0.1,
-        label_smoothing: float = 0,
-        loss_type: Literal["sigmoid", "hinge", "ipo", "kto"] = "sigmoid",
-        reference_free: bool = False,
+    concatenated_forward: Callable,
+    ref_state: EasyDeLState = None,
+    beta: float = 0.1,
+    label_smoothing: float = 0,
+    loss_type: Literal["sigmoid", "hinge", "ipo", "kto"] = "sigmoid",
+    reference_free: bool = False,
 ):
     """The create_dpo_train_function function is a helper function that creates the DPO training step.
 
@@ -305,11 +314,11 @@ def create_dpo_train_function(
     """
 
     def _sigmoid_dpo_loss(
-            logits: chex.Array,
-            policy_chosen_log_probs: chex.Array = None,  # IGNORED
-            reference_chosen_log_probs: chex.Array = None,  # IGNORED
-            policy_rejected_log_probs: chex.Array = None,  # IGNORED
-            reference_rejected_log_probs: chex.Array = None,  # IGNORED
+        logits: chex.Array,
+        policy_chosen_log_probs: chex.Array = None,  # IGNORED
+        reference_chosen_log_probs: chex.Array = None,  # IGNORED
+        policy_rejected_log_probs: chex.Array = None,  # IGNORED
+        reference_rejected_log_probs: chex.Array = None,  # IGNORED
     ):
         """The _sigmoid_dpo_loss function is a helper function for the sigmoid_dpo_loss
             function. It computes the loss of each example in a batch, given its logits
@@ -330,17 +339,17 @@ def create_dpo_train_function(
             an array represent loss
         """
         losses = (
-                -jax.nn.log_sigmoid(beta * logits) * (1 - label_smoothing)
-                - jax.nn.log_sigmoid(-beta * logits) * label_smoothing
+            -jax.nn.log_sigmoid(beta * logits) * (1 - label_smoothing)
+            - jax.nn.log_sigmoid(-beta * logits) * label_smoothing
         )
         return losses
 
     def _hinge_dpo_loss(
-            logits: chex.Array,
-            policy_chosen_log_probs: chex.Array,  # IGNORED
-            reference_chosen_log_probs: chex.Array,  # IGNORED
-            policy_rejected_log_probs: chex.Array,  # IGNORED
-            reference_rejected_log_probs: chex.Array,  # IGNORED
+        logits: chex.Array,
+        policy_chosen_log_probs: chex.Array,  # IGNORED
+        reference_chosen_log_probs: chex.Array,  # IGNORED
+        policy_rejected_log_probs: chex.Array,  # IGNORED
+        reference_rejected_log_probs: chex.Array,  # IGNORED
     ):
         """The _hinge_dpo_loss function is a helper function that computes the loss for DPO.
 
@@ -360,11 +369,11 @@ def create_dpo_train_function(
         return jax.relu(1 - beta * logits)
 
     def _ipo_dpo_loss(
-            logits: chex.Array,
-            policy_chosen_log_probs: chex.Array,  # IGNORED
-            reference_chosen_log_probs: chex.Array,  # IGNORED
-            policy_rejected_log_probs: chex.Array,  # IGNORED
-            reference_rejected_log_probs: chex.Array,  # IGNORED
+        logits: chex.Array,
+        policy_chosen_log_probs: chex.Array,  # IGNORED
+        reference_chosen_log_probs: chex.Array,  # IGNORED
+        policy_rejected_log_probs: chex.Array,  # IGNORED
+        reference_rejected_log_probs: chex.Array,  # IGNORED
     ):
         """The _ipo_dpo_loss function is a helper function that calculates the loss for
         the IPO-DPO algorithm. It takes in the logits, policy_chosen_log_probs,
@@ -382,11 +391,11 @@ def create_dpo_train_function(
         return (logits - 1 / (2 * beta)) ** 2
 
     def _kto_pair_dpo_loss(
-            logits: chex.Array,  # IGNORED
-            policy_chosen_log_probs: chex.Array,
-            reference_chosen_log_probs: chex.Array,
-            policy_rejected_log_probs: chex.Array,
-            reference_rejected_log_probs: chex.Array,
+        logits: chex.Array,  # IGNORED
+        policy_chosen_log_probs: chex.Array,
+        reference_chosen_log_probs: chex.Array,
+        policy_rejected_log_probs: chex.Array,
+        reference_rejected_log_probs: chex.Array,
     ):
         """The _kto_pair_dpo_loss function is a helper function that computes the loss for
         a single pair of trajectories. It takes in two sets of log probabilities, one from
@@ -468,8 +477,8 @@ def create_dpo_train_function(
             ) = concatenated_forward(state.apply_fn, params, batch)
 
             if (
-                    "reference_chosen_log_probs" in batch
-                    and "reference_rejected_log_probs" in batch
+                "reference_chosen_log_probs" in batch
+                and "reference_rejected_log_probs" in batch
             ):
                 reference_chosen_log_probs = batch["reference_chosen_log_probs"]
                 reference_rejected_log_probs = batch["reference_rejected_log_probs"]
@@ -480,7 +489,11 @@ def create_dpo_train_function(
                         reference_rejected_log_probs,
                         _,
                         _,
-                    ) = concatenated_forward(state.apply_fn, state.params, batch)
+                    ) = concatenated_forward(
+                        state.apply_fn,
+                        state.params,
+                        batch,
+                    )
                 else:
                     (
                         reference_chosen_log_probs,
@@ -488,17 +501,23 @@ def create_dpo_train_function(
                         _,
                         _,
                     ) = concatenated_forward(
-                        ref_state.apply_fn, ref_state.params, batch
+                        ref_state.apply_fn,
+                        ref_state.params,
+                        batch,
                     )
-            reference_chosen_log_probs = jax.lax.stop_gradient(reference_chosen_log_probs)
-            reference_rejected_log_probs = jax.lax.stop_gradient(reference_rejected_log_probs)
+            reference_chosen_log_probs = jax.lax.stop_gradient(
+                reference_chosen_log_probs
+            )
+            reference_rejected_log_probs = jax.lax.stop_gradient(
+                reference_rejected_log_probs
+            )
             pi_log_ratios = policy_chosen_log_probs - policy_rejected_log_probs
 
             if reference_free:
                 ref_log_ratios = 0
             else:
                 ref_log_ratios = (
-                        reference_chosen_log_probs - reference_rejected_log_probs
+                    reference_chosen_log_probs - reference_rejected_log_probs
                 )
 
             logits = pi_log_ratios - ref_log_ratios
@@ -509,8 +528,12 @@ def create_dpo_train_function(
                 policy_rejected_log_probs,
                 reference_rejected_log_probs,
             )
-            chosen_rewards = beta * jax.lax.stop_gradient(policy_chosen_log_probs - reference_chosen_log_probs)
-            rejected_rewards = beta * jax.lax.stop_gradient(policy_rejected_log_probs - reference_rejected_log_probs)
+            chosen_rewards = beta * jax.lax.stop_gradient(
+                policy_chosen_log_probs - reference_chosen_log_probs
+            )
+            rejected_rewards = beta * jax.lax.stop_gradient(
+                policy_rejected_log_probs - reference_rejected_log_probs
+            )
 
             return losses.mean(), (chosen_rewards, rejected_rewards)
 
@@ -527,12 +550,12 @@ def create_dpo_train_function(
 
 
 def create_dpo_eval_function(
-        concatenated_forward: Callable,
-        ref_state: EasyDeLState = None,
-        beta: float = 0.1,
-        label_smoothing: float = 0,
-        loss_type: Literal["sigmoid", "hinge", "ipo", "kto"] = "sigmoid",
-        reference_free: bool = False,
+    concatenated_forward: Callable,
+    ref_state: EasyDeLState = None,
+    beta: float = 0.1,
+    label_smoothing: float = 0,
+    loss_type: Literal["sigmoid", "hinge", "ipo", "kto"] = "sigmoid",
+    reference_free: bool = False,
 ):
     """The create_dpo_eval_function function is a helper function that creates the DPO evaluating step.
 
@@ -552,11 +575,11 @@ def create_dpo_eval_function(
     """
 
     def _sigmoid_dpo_loss(
-            logits: chex.Array,
-            policy_chosen_log_probs: chex.Array = None,  # IGNORED
-            reference_chosen_log_probs: chex.Array = None,  # IGNORED
-            policy_rejected_log_probs: chex.Array = None,  # IGNORED
-            reference_rejected_log_probs: chex.Array = None,  # IGNORED
+        logits: chex.Array,
+        policy_chosen_log_probs: chex.Array = None,  # IGNORED
+        reference_chosen_log_probs: chex.Array = None,  # IGNORED
+        policy_rejected_log_probs: chex.Array = None,  # IGNORED
+        reference_rejected_log_probs: chex.Array = None,  # IGNORED
     ):
         """The _sigmoid_dpo_loss function is a helper function for the sigmoid_dpo_loss
             function. It computes the loss of each example in a batch, given its logits
@@ -577,17 +600,17 @@ def create_dpo_eval_function(
             an array represent loss
         """
         losses = (
-                -jax.nn.log_sigmoid(beta * logits) * (1 - label_smoothing)
-                - jax.nn.log_sigmoid(-beta * logits) * label_smoothing
+            -jax.nn.log_sigmoid(beta * logits) * (1 - label_smoothing)
+            - jax.nn.log_sigmoid(-beta * logits) * label_smoothing
         )
         return losses
 
     def _hinge_dpo_loss(
-            logits: chex.Array,
-            policy_chosen_log_probs: chex.Array,  # IGNORED
-            reference_chosen_log_probs: chex.Array,  # IGNORED
-            policy_rejected_log_probs: chex.Array,  # IGNORED
-            reference_rejected_log_probs: chex.Array,  # IGNORED
+        logits: chex.Array,
+        policy_chosen_log_probs: chex.Array,  # IGNORED
+        reference_chosen_log_probs: chex.Array,  # IGNORED
+        policy_rejected_log_probs: chex.Array,  # IGNORED
+        reference_rejected_log_probs: chex.Array,  # IGNORED
     ):
         """The _hinge_dpo_loss function is a helper function that computes the loss for DPO.
 
@@ -607,11 +630,11 @@ def create_dpo_eval_function(
         return jax.relu(1 - beta * logits)
 
     def _ipo_dpo_loss(
-            logits: chex.Array,
-            policy_chosen_log_probs: chex.Array,  # IGNORED
-            reference_chosen_log_probs: chex.Array,  # IGNORED
-            policy_rejected_log_probs: chex.Array,  # IGNORED
-            reference_rejected_log_probs: chex.Array,  # IGNORED
+        logits: chex.Array,
+        policy_chosen_log_probs: chex.Array,  # IGNORED
+        reference_chosen_log_probs: chex.Array,  # IGNORED
+        policy_rejected_log_probs: chex.Array,  # IGNORED
+        reference_rejected_log_probs: chex.Array,  # IGNORED
     ):
         """The _ipo_dpo_loss function is a helper function that calculates the loss for
         the IPO-DPO algorithm. It takes in the logits, policy_chosen_log_probs,
@@ -629,11 +652,11 @@ def create_dpo_eval_function(
         return (logits - 1 / (2 * beta)) ** 2
 
     def _kto_pair_dpo_loss(
-            logits: chex.Array,  # IGNORED
-            policy_chosen_log_probs: chex.Array,
-            reference_chosen_log_probs: chex.Array,
-            policy_rejected_log_probs: chex.Array,
-            reference_rejected_log_probs: chex.Array,
+        logits: chex.Array,  # IGNORED
+        policy_chosen_log_probs: chex.Array,
+        reference_chosen_log_probs: chex.Array,
+        policy_rejected_log_probs: chex.Array,
+        reference_rejected_log_probs: chex.Array,
     ):
         """The _kto_pair_dpo_loss function is a helper function that computes the loss for
         a single pair of trajectories. It takes in two sets of log probabilities, one from
@@ -714,8 +737,8 @@ def create_dpo_eval_function(
             ) = concatenated_forward(state.apply_fn, params, batch)
 
             if (
-                    "reference_chosen_log_probs" in batch
-                    and "reference_rejected_log_probs" in batch
+                "reference_chosen_log_probs" in batch
+                and "reference_rejected_log_probs" in batch
             ):
                 reference_chosen_log_probs = batch["reference_chosen_log_probs"]
                 reference_rejected_log_probs = batch["reference_rejected_log_probs"]
@@ -743,7 +766,7 @@ def create_dpo_eval_function(
                 ref_log_ratios = 0
             else:
                 ref_log_ratios = (
-                        reference_chosen_log_probs - reference_rejected_log_probs
+                    reference_chosen_log_probs - reference_rejected_log_probs
                 )
 
             logits = pi_log_ratios - ref_log_ratios
@@ -755,10 +778,10 @@ def create_dpo_eval_function(
                 reference_rejected_log_probs,
             )
             chosen_rewards = beta * (
-                    policy_chosen_log_probs - reference_chosen_log_probs
+                policy_chosen_log_probs - reference_chosen_log_probs
             )
             rejected_rewards = beta * (
-                    policy_rejected_log_probs - reference_rejected_log_probs
+                policy_rejected_log_probs - reference_rejected_log_probs
             )
             return losses[0], (chosen_rewards, rejected_rewards)
 

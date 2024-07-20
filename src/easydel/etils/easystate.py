@@ -6,6 +6,7 @@ from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple, Unio
 import fjformer
 import jax.tree_util
 import optax
+from fjformer.custom_array import Array8Bit
 from flax import core, struct, traverse_util
 from flax.core import FrozenDict
 from flax.linen.fp8_ops import OVERWRITE_WITH_GRADIENT
@@ -13,11 +14,11 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import numpy as jnp
 from jax.sharding import Mesh, PartitionSpec
 from safetensors._safetensors_rust import SafetensorError
+
 from easydel.etils.auto_tx import get_optimizer_and_scheduler
 from easydel.etils.errors import EasyDeLRuntimeError
 from easydel.etils.etils import AVAILABLE_OPTIMIZERS, AVAILABLE_SCHEDULERS, get_logger
 from easydel.etils.partition_module import PartitionAxis
-from fjformer.custom_array import Array8Bit
 
 logger = get_logger(__name__)
 TYPE_SEP = "<*TYPE*>"
@@ -611,7 +612,7 @@ class EasyDeLState(struct.PyTreeNode):
         optimizer: AVAILABLE_OPTIMIZERS = "adamw",
         scheduler: AVAILABLE_SCHEDULERS = "none",
         tx_init: Optional[dict] = None,
-        device=jax.devices("cpu")[0],
+        device: Optional[jax.Device] = None,
         dtype: jax.numpy.dtype = jax.numpy.float32,
         param_dtype: jax.numpy.dtype = jax.numpy.float32,
         precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
@@ -619,6 +620,7 @@ class EasyDeLState(struct.PyTreeNode):
         sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
         partition_axis: PartitionAxis = PartitionAxis(),
         shard_attention_computation: bool = True,
+        auto_shard_params:bool=False,
         input_shape: Sequence[int] = (1, 1),
         backend: Optional[str] = None,
         init_optimizer_state: bool = False,
@@ -639,7 +641,7 @@ class EasyDeLState(struct.PyTreeNode):
             optimizer (AVAILABLE_OPTIMIZERS, optional): The optimizer to use for training. Defaults to "adamw".
             scheduler (AVAILABLE_SCHEDULERS, optional): The learning rate scheduler to use during training. Defaults to "none".
             tx_init (Optional[dict], optional): A dictionary of optimizer initialization parameters. Defaults to None.
-            device (optional): The device to load the model on. Defaults to jax.devices('cpu')[0].
+            device (optional): The device to load the model on. Defaults to None -> jax.devices('cpu')[0].
             dtype (jax.numpy.dtype, optional): The data type to use for the model parameters. Defaults to jax.numpy.float32.
             param_dtype (jax.numpy.dtype, optional): The data type to use for the model parameters during training. Defaults to jax.numpy.float32.
             precision (Optional[jax.lax.Precision], optional): The precision to use for computations. Defaults to jax.lax.Precision("fastest").
@@ -647,6 +649,7 @@ class EasyDeLState(struct.PyTreeNode):
             sharding_axis_names (Sequence[str], optional): The names of the axes for sharding. Defaults to ("dp", "fsdp", "tp", "sp").
             partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
             shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
+            auto_shard_params (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
             input_shape (Sequence[int], optional): The shape of the input data. Defaults to (1, 1).
             backend (Optional[str], optional): The backend to use for computations. Defaults to None.
             init_optimizer_state (bool, optional): Whether to initialize the optimizer state. Defaults to False.
@@ -662,6 +665,8 @@ class EasyDeLState(struct.PyTreeNode):
         Raises:
             EasyDeLRuntimeError: If both `free_optimizer_state` and `init_optimizer_state` are set to True.
         """
+        if device is None:
+            device = jax.devices("cpu")[0]
         if free_optimizer_state and init_optimizer_state:
             raise EasyDeLRuntimeError(
                 "You can't use `free_optimizer_state` and `init_optimizer_state` True at same Time"
@@ -683,6 +688,7 @@ class EasyDeLState(struct.PyTreeNode):
                 input_shape=input_shape,  # type:ignore
                 backend=backend,
                 config_kwargs=config_kwargs,
+                auto_shard_params=auto_shard_params,
                 **kwargs,
             )
             if tx_init is None:

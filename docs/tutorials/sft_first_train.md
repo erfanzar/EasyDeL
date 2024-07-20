@@ -185,7 +185,6 @@ train_arguments = ed.TrainArguments(
     param_dtype=dtype,
     step_start_point=0,
     do_last_save=False,
-    do_shard_fns=False,
     model_name=new_repo_id.split("/")[-1].split("-v0")[0],
     training_time="7H", 
     force_batch_and_gradient_accumulation_steps_calculation=False,

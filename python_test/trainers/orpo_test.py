@@ -15,16 +15,18 @@ import jax  # noqa: E402
 jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 
 import jax.numpy  # noqa: E402
-from flax.core import FrozenDict  # noqa: E402
-
-from easydel import MistralConfig, FlaxMistralForCausalLM  # noqa: E402
+from datasets import load_dataset  # noqa: E402
+from easydel import (  # noqa: E402
+    FlaxMistralForCausalLM,
+    MistralConfig,
+    TrainArguments,  # noqa: E402
+)
 from easydel.trainers.odds_ratio_preference_optimization_trainer import (  # noqa: E402
     ORPOTrainer,
 )
-from easydel import TrainArguments  # noqa: E402
-from transformers import AutoTokenizer  # noqa: E402
-from datasets import load_dataset  # noqa: E402
+from flax.core import FrozenDict  # noqa: E402
 from jax import numpy as jnp  # noqa: E402
+from transformers import AutoTokenizer  # noqa: E402
 
 SEQUENCE_LENGTH = 128
 NUM_TRAIN_EXAMPLES = 50
@@ -97,7 +99,6 @@ def orpo_main():
             total_batch_size=TOTAL_BATCH_SIZE,
             gradient_accumulation_steps=2,
             model_class=type(model),
-            do_shard_fns=False,
             do_train=True,
             configs_to_initialize_model_class={
                 "config": model.config,
@@ -115,7 +116,9 @@ def orpo_main():
         ),
     )
 
-    trainer.train(model_parameters=FrozenDict({"params": model.params}))
+    trainer.train(
+        model_parameters=FrozenDict({"params": model.shard_params(model.params)})
+    )
 
 
 if __name__ == "__main__":
