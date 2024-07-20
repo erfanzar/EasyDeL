@@ -34,6 +34,8 @@ class GenerationPipeline:
         partition_rules (None, optional): Custom partition rules for sharding. Defaults to None, which uses
             model's default partition rules.
         parameters_are_quantized (bool, optional): Whether the model parameters are quantized. Defaults to False.
+        force_sharding (bool): Whether to pass in and out shardings to `jax.jit` function
+            (must be off in case of using `parameters_are_quantized`). Defaults to False.
     """
 
     def __init__(
@@ -47,6 +49,7 @@ class GenerationPipeline:
         input_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp")),
         partition_rules=None,
         parameters_are_quantized: bool = False,
+        force_sharding: bool = False,
     ):
         if add_params_field is not None:
             warnings.warn("`add_params_field` is deprecated and soon will be removed.")
@@ -61,6 +64,7 @@ class GenerationPipeline:
         self.tokenizer = tokenizer
         self.generation_config = generation_config
         self.parameters_are_quantized = parameters_are_quantized
+        self.force_sharding = force_sharding
         self._shard_state = None
         self.compiled_func = None
         self.over_compiled_func = None
@@ -412,8 +416,15 @@ class GenerationPipeline:
             (self.params, generation_state),
             {},
             mesh=self.mesh,
-            in_shardings=(self.model_sharding, state_sharding),
-            out_shardings=state_sharding,
+            in_shardings=(
+                (
+                    self.model_sharding,
+                    state_sharding,
+                )
+                if self.force_sharding
+                else None
+            ),
+            out_shardings=state_sharding if self.force_sharding else None,
         )
 
     def compiled_sample_state(
