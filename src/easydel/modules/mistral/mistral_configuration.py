@@ -74,6 +74,7 @@ class MistralConfig(EDPretrainedConfig):
         vocab_size=32000,
         hidden_size=4096,
         intermediate_size=14336,
+        head_dim: Optional[int] = None,
         num_hidden_layers=32,
         num_attention_heads=32,
         num_key_value_heads=8,
@@ -103,6 +104,7 @@ class MistralConfig(EDPretrainedConfig):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
+        self.head_dim = head_dim
         self.num_attention_heads = num_attention_heads
         self.sliding_window = sliding_window
         self.bits = bits
