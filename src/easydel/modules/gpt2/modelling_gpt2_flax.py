@@ -234,7 +234,13 @@ class FlaxGPT2Attention(FlaxAttentionModule):
             attn_output = with_sharding_constraint(
                 attn_output,
                 PartitionSpec(
-                    ("dp", "fsdp"), "sp" if attn_output.shape[1] != 1 else None, "tp"
+                    self.config.partition_axis.batch_axis,
+                    (
+                        self.config.partition_axis.sequence_axis
+                        if attn_output.shape[1] != 1
+                        else None
+                    ),
+                    self.config.partition_axis.hidden_state_axis,
                 ),
             )
         attn_output = self.c_proj(attn_output)

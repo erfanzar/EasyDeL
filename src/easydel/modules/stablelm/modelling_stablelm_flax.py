@@ -346,7 +346,7 @@ class FlaxStableLmAttention(FlaxAttentionModule):
                 attention weights or not
             fcm_mask: Mask out the attention weights between the input
                 and output tokens
-        :param : Determine if the attention is causal or not
+
 
         Returns:
             A tuple of two arrays
@@ -473,7 +473,13 @@ class FlaxStableLmAttention(FlaxAttentionModule):
             attn_output = with_sharding_constraint(
                 attn_output,
                 PartitionSpec(
-                    ("dp", "fsdp"), "sp" if attn_output.shape[1] != 1 else None, "tp"
+                    self.config.partition_axis.batch_axis,
+                    (
+                        self.config.partition_axis.sequence_axis
+                        if attn_output.shape[1] != 1
+                        else None
+                    ),
+                    self.config.partition_axis.hidden_state_axis,
                 ),
             )
         attn_output = self.o_proj(attn_output)

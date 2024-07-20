@@ -122,17 +122,8 @@ class FlaxMistralAttention(FlaxAttentionModule):
     def setup(self):
         config = self.config
         self.hidden_size = config.hidden_size
-        self.head_dim = getattr(
-            self.config,
-            "head_dim",
-            None,
-        )
-        self.head_dim = (
-            self.head_dim
-            if self.head_dim is not None
-            else (self.config.hidden_size // self.config.num_attention_heads)
-        )
-        self.config.head_dim = self.head_dim  # Fixes Nemo Model Bug
+        self.head_dim = self.config.head_dim
+
         self.num_key_value_groups = (
             self.config.num_attention_heads // self.config.num_key_value_heads
         )
@@ -192,10 +183,17 @@ class FlaxMistralAttention(FlaxAttentionModule):
         )
 
     def _merge_heads(self, hidden_states):
-        return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
+        return hidden_states.reshape(hidden_states.shape[:2] + (-1,))
 
     def apply_rotary(
-        self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
+        self,
+        batch_size,
+        sequence_length,
+        query,
+        key,
+        value,
+        freq_cis,
+        position_ids,
     ):
         """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
         The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
@@ -257,7 +255,7 @@ class FlaxMistralAttention(FlaxAttentionModule):
                 attention weights or not
             fcm_mask: Mask out the attention weights between the input
                 and output tokens
-        :param : Determine if the attention is causal or not
+
 
         Returns:
             A tuple of two arrays
@@ -330,18 +328,10 @@ class FlaxMistralAttention(FlaxAttentionModule):
             )
 
         key_states, value_states = self.repeat_key_value(
-            key_states, value_states, self.num_key_value_groups
+            key_states,
+            value_states,
+            self.num_key_value_groups,
         )
-        # if self.config.use_sharding_constraint:
-        #     query_states = with_sharding_constraint(
-        #         query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)
-        #     )
-        #     key_states = with_sharding_constraint(
-        #         key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-        #     )
-        #     value_states = with_sharding_constraint(
-        #         value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-        #     )
         attention_bias = lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -373,7 +363,13 @@ class FlaxMistralAttention(FlaxAttentionModule):
             attn_output = with_sharding_constraint(
                 attn_output,
                 PartitionSpec(
-                    ("dp", "fsdp"), "sp" if attn_output.shape[1] != 1 else None, "tp"
+                    self.config.partition_axis.batch_axis,
+                    (
+                        self.config.partition_axis.sequence_axis
+                        if attn_output.shape[1] != 1
+                        else None
+                    ),
+                    self.config.partition_axis.hidden_state_axis,
                 ),
             )
         attn_output = self.o_proj(attn_output)
@@ -853,16 +849,7 @@ class FlaxMistralModule(nn.Module):
                 scaling_factor=scaling_factor, rope_type=scaling_type
             )
         config = self.config
-        head_dim = getattr(
-            self.config,
-            "head_dim",
-            None,
-        )
-        head_dim = (
-            head_dim
-            if head_dim is not None
-            else (config.hidden_size // config.num_attention_heads)
-        )
+
         self.freq_cis = precompute_freq_cis(
             max_position_embeddings=(
                 getattr(
@@ -871,11 +858,10 @@ class FlaxMistralModule(nn.Module):
                     config.max_position_embeddings,
                 )
             ),
-            dim=head_dim,
+            dim=self.config.head_dim,
             base=config.rope_theta,
             **initial_rope_kwargs,
         )
-        self.config.head_dim = head_dim
         self.causal_mask = nn.make_causal_mask(
             jnp.ones(
                 (
@@ -1367,16 +1353,7 @@ class FlaxVisionMistralModule(nn.Module):
             initial_rope_kwargs = dict(
                 scaling_factor=scaling_factor, rope_type=scaling_type
             )
-        head_dim = getattr(
-            self.config,
-            "head_dim",
-            None,
-        )
-        head_dim = (
-            head_dim
-            if head_dim is not None
-            else (config.hidden_size // config.num_attention_heads)
-        )
+
         self.freq_cis = precompute_freq_cis(
             max_position_embeddings=(
                 getattr(
@@ -1385,11 +1362,10 @@ class FlaxVisionMistralModule(nn.Module):
                     config.max_position_embeddings,
                 )
             ),
-            dim=head_dim,
+            dim=self.config.head_dim,
             base=config.rope_theta,
             **initial_rope_kwargs,
         )
-        self.config.head_dim = head_dim
 
     def __call__(
         self,

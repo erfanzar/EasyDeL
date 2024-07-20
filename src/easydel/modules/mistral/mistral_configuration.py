@@ -18,6 +18,8 @@ class MistralConfig(EDPretrainedConfig):
             Dimensionality of the encoder layers and the pooler layer.
         intermediate_size (`int`, *optional*, defaults to 14336):
             Dimensionality of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
+        head_dim (`int`, defaults to 128):
+            Dimensionality of the head for attention.
         num_hidden_layers (`int`, *optional*, defaults to 32):
             Number of hidden layers in the Transformer encoder.
         num_attention_heads (`int`, *optional*, defaults to 32):
@@ -71,21 +73,21 @@ class MistralConfig(EDPretrainedConfig):
 
     def __init__(
         self,
-        vocab_size=32000,
-        hidden_size=4096,
-        intermediate_size=14336,
-        head_dim: Optional[int] = None,
-        num_hidden_layers=32,
-        num_attention_heads=32,
-        num_key_value_heads=8,
+        vocab_size: int = 32000,
+        hidden_size: int = 4096,
+        intermediate_size: int = 14336,
+        head_dim: int = 128,
+        num_hidden_layers: int = 32,
+        num_attention_heads: int = 32,
+        num_key_value_heads: int = 8,
         hidden_act="silu",
         max_position_embeddings=4096 * 32,
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         use_cache=True,
         pad_token_id=None,
-        bos_token_id=1,
-        eos_token_id=2,
+        bos_token_id: int = 1,
+        eos_token_id: int = 2,
         tie_word_embeddings=False,
         rope_theta=10000.0,
         rope_scaling: Dict[str, Union[str, float]] = None,
