@@ -132,7 +132,7 @@ class FlaxMistralAttention(FlaxAttentionModule):
             if self.head_dim is not None
             else (self.config.hidden_size // self.config.num_attention_heads)
         )
-        self.config.head_dim = self.head_dim # Fixes Nemo Model Bug 
+        self.config.head_dim = self.head_dim  # Fixes Nemo Model Bug
         self.num_key_value_groups = (
             self.config.num_attention_heads // self.config.num_key_value_heads
         )
@@ -852,18 +852,30 @@ class FlaxMistralModule(nn.Module):
             initial_rope_kwargs = dict(
                 scaling_factor=scaling_factor, rope_type=scaling_type
             )
+        config = self.config
+        head_dim = getattr(
+            self.config,
+            "head_dim",
+            None,
+        )
+        head_dim = (
+            head_dim
+            if head_dim is not None
+            else (config.hidden_size // config.num_attention_heads)
+        )
         self.freq_cis = precompute_freq_cis(
             max_position_embeddings=(
                 getattr(
-                    self.config,
+                    config,
                     "freq_max_position_embeddings",
-                    self.config.max_position_embeddings,
+                    config.max_position_embeddings,
                 )
             ),
-            dim=self.config.hidden_size // self.config.num_attention_heads,
-            base=self.config.rope_theta,
+            dim=head_dim,
+            base=config.rope_theta,
             **initial_rope_kwargs,
         )
+        self.config.head_dim = head_dim
         self.causal_mask = nn.make_causal_mask(
             jnp.ones(
                 (
