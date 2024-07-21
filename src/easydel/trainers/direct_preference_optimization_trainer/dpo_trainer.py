@@ -137,7 +137,7 @@ class DPOTrainer(BaseTrainer, ABC):
 
 
         >>> def extract_anthropic_prompt(prompt_and_response):
-        ...     search_term = "\n\nAssistant:"
+        ...     search_term = "\\n\\nAssistant:"
         ...     search_term_idx = prompt_and_response.rfind(search_term)
         ...     assert search_term_idx != -1, f"Prompt and response does not contain '{search_term}'"
         ...     return prompt_and_response[: search_term_idx + len(search_term)]
