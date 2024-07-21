@@ -139,6 +139,7 @@ def get_optimizer_and_scheduler(
                 steps=steps,
                 gradient_accumulation_steps=gradient_accumulation_steps,
                 clip_grad=clip_grad,
+                warmup_steps=warmup_steps,
                 **kwargs,
             )
         elif scheduler == EasyDeLSchedulers.COSINE:
@@ -148,6 +149,7 @@ def get_optimizer_and_scheduler(
                 steps=steps,
                 weight_decay=weight_decay,
                 clip_grad=clip_grad,
+                warmup_steps=warmup_steps,
                 **kwargs,
             )
         elif scheduler == EasyDeLSchedulers.NONE:
