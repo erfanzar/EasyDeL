@@ -620,7 +620,7 @@ class FlaxFalconModule(nn.Module):
             epsilon=config.layer_norm_epsilon,
         )
         c_length = getattr(
-            config, "c_max_position_embeddings", config.max_position_embeddings
+            config, "mask_max_position_embeddings", config.max_position_embeddings
         )
         freqs_length = getattr(
             self.config,

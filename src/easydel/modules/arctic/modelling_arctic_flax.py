@@ -1062,7 +1062,7 @@ class FlaxArcticModule(nn.Module):
                     1,
                     getattr(
                         self.config,
-                        "c_max_position_embeddings",
+                        "mask_max_position_embeddings",
                         self.config.max_position_embeddings,
                     ),
                 ),

@@ -924,7 +924,7 @@ class FlaxQwen2Module(nn.Module):
                     1,
                     getattr(
                         config,
-                        "c_max_position_embeddings",
+                        "mask_max_position_embeddings",
                         config.max_position_embeddings,
                     ),
                 ),

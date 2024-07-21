@@ -1062,7 +1062,7 @@ class FlaxQwen1Module(nn.Module):
             self.rotary_ndims = int(config.kv_channels * config.rotary_pct)
         self.causal_mask = make_causal_mask(
             jnp.ones(
-                (1, getattr(config, "c_max_position_embeddings", config.seq_length)),
+                (1, getattr(config, "mask_max_position_embeddings", config.seq_length)),
                 dtype="bool",
             ),
             dtype="bool",
