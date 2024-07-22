@@ -71,9 +71,10 @@ class GenerationPipeline:
         self.generation_config = generation_config
         self.parameters_are_quantized = parameters_are_quantized
         self.force_sharding = force_sharding
-        self._shard_state = None
+        self.shard_generation_state = None
         self.compiled_sample_fn_over = None
         self.compiled_func = None
+        self.compiled_model_kwargs_sharding = None
         self.over_compiled_func = None
         self._rng_gen = GenerateRNG(seed or 42)
         self.input_partition_spec = input_partition_spec
@@ -96,7 +97,7 @@ class GenerationPipeline:
             mesh=self.model.mesh,
         )
         self.compiled_sample_fn = None
-        self.compiled_sample_fn_ms = None  # multi sequences
+        self.compiled_sample_fn_multi_sequence = None  # multi sequences
         # Ensure essential token IDs are set
         if self.generation_config.pad_token_id is None:
             self.generation_config.pad_token_id = tokenizer.pad_token_id
@@ -104,7 +105,9 @@ class GenerationPipeline:
             self.generation_config.eos_token_id = tokenizer.eos_token_id
         if self.generation_config.bos_token_id is None:
             self.generation_config.bos_token_id = tokenizer.bos_token_id
-        self._dynamic_config = _DynamicGenerationConfig(self.generation_config)
+        self.dynamic_generation_config = _DynamicGenerationConfig(
+            self.generation_config
+        )
         assert self.generation_config.pad_token_id is not None, (
             "`pad_token_id` cannot be None. "
             "(Set `tokenizer.pad_token_id = tokenizer.eos_token_id` if undefined)"
@@ -135,16 +138,16 @@ class GenerationPipeline:
         Yields:
             jax.Array: Generated token IDs.
         """
-        paxis = self.model.config.partition_axis
+        partition_axes = self.model.config.partition_axis
         mesh = self.mesh
         eos_token_id = jnp.array(self.generation_config.eos_token_id, dtype=jnp.int32)
         pad_token_id = jnp.array(self.generation_config.pad_token_id, dtype=jnp.int32)
-        batch_size, cur_len = input_ids.shape
-        max_length = cur_len + self.generation_config.max_new_tokens
-        cur_len = jnp.array(cur_len)
+        batch_size, current_length = input_ids.shape
+        max_length = current_length + self.generation_config.max_new_tokens
+        current_length = jnp.array(current_length)
         sequences = jnp.full((batch_size, max_length), pad_token_id, dtype=jnp.int32)
         sequences = lax.dynamic_update_slice(sequences, input_ids, (0, 0))
-        is_sent_finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
+        is_sequence_finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
 
         if attention_mask is None:
             warnings.warn(
@@ -158,44 +161,52 @@ class GenerationPipeline:
         with mesh:
             input_ids = fjformer.with_sharding_constraint(
                 input_ids,
-                PartitionSpec(paxis.batch_axis, paxis.key_sequence_axis),
+                PartitionSpec(
+                    partition_axes.batch_axis, partition_axes.key_sequence_axis
+                ),
             )
             attention_mask = fjformer.with_sharding_constraint(
                 attention_mask,
-                PartitionSpec(paxis.batch_axis, paxis.key_sequence_axis),
+                PartitionSpec(
+                    partition_axes.batch_axis, partition_axes.key_sequence_axis
+                ),
             )
             position_ids = fjformer.with_sharding_constraint(
                 position_ids,
-                PartitionSpec(paxis.batch_axis, paxis.key_sequence_axis),
+                PartitionSpec(
+                    partition_axes.batch_axis, partition_axes.key_sequence_axis
+                ),
             )
         assert (
             position_ids.shape == attention_mask.shape
         ), "`position_ids` and `attention_mask` must have the same shape."
-        model_kwargs_sharding = self.get_model_arguments_sharding(
+        model_kwargs_sharding_spec = self.get_model_arguments_sharding(
             input_ids, max_length, attention_mask
         )
-        model_kwargs = jax.jit(
-            lambda: self.model.prepare_inputs_for_generation(
-                input_ids, max_length, attention_mask
-            ),
-            out_shardings=model_kwargs_sharding,
+
+        model_kwargs = self.get_compiled_model_kwargs_sharding(
+            input_ids,
+            max_length,
+            attention_mask,
+            model_kwargs_sharding_spec,
         )()
-        # Initial GenerationContent
         generation_state = inference_utils.SampleState(
-            cur_len=cur_len,
+            current_length=current_length,
             sequences=sequences,
             running_token=input_ids,
-            is_sent_finished=is_sent_finished,
+            is_sequence_finished=is_sequence_finished,
             prng_key=self._rng_gen.rng,
             model_kwargs=model_kwargs,
         )
 
-        def sample_search_cond_fn(state):
+        def should_continue_sampling(state):
             """state termination condition fn."""
-            all_sequence_finished = jnp.all(state.is_sent_finished)
-            return ~jnp.logical_or(all_sequence_finished, state.cur_len >= max_length)
+            all_sequence_finished = jnp.all(state.is_sequence_finished)
+            return ~jnp.logical_or(
+                all_sequence_finished, state.current_length >= max_length
+            )
 
-        def sample_fn(params, state: inference_utils.SampleState):
+        def perform_sampling_step(params, state: inference_utils.SampleState):
             """
             Performs a single sampling step for text generation.
 
@@ -218,29 +229,31 @@ class GenerationPipeline:
                 state.sequences,
                 state.prng_key,
                 self.generation_config,
-                cur_len,
+                current_length,
                 self.generation_config.max_new_tokens,
             )
 
             next_token = (
-                next_token * ~state.is_sent_finished
-                + pad_token_id * state.is_sent_finished
+                next_token * ~state.is_sequence_finished
+                + pad_token_id * state.is_sequence_finished
             )
 
-            next_is_sent_finished = state.is_sent_finished | next_token == eos_token_id
+            next_sequence_finished = (
+                state.is_sequence_finished | next_token == eos_token_id
+            )
 
             next_token = next_token[:, None]
             next_sequences = lax.dynamic_update_slice(
-                state.sequences, next_token, (0, state.cur_len)
+                state.sequences, next_token, (0, state.current_length)
             )
             next_model_kwargs = self.model.update_inputs_for_generation(
                 model_outputs, state.model_kwargs
             )
             return inference_utils.SampleState(
-                cur_len=state.cur_len + 1,
+                current_length=state.current_length + 1,
                 sequences=next_sequences,
                 running_token=next_token,
-                is_sent_finished=next_is_sent_finished,
+                is_sequence_finished=next_sequence_finished,
                 prng_key=random.split(state.prng_key, 2)[0],
                 model_kwargs=next_model_kwargs,
             )
@@ -248,32 +261,32 @@ class GenerationPipeline:
         with self.mesh:
             if input_ids.shape[1] > 1:
                 if self.parameters_are_quantized:
-                    generation_state = self.compiled_sample_state_over(
-                        sample_fn=sample_fn,
+                    generation_state = self.compile_multi_step_sampling(
+                        perform_sampling_step=perform_sampling_step,
                         generation_state=generation_state,
-                        model_kwargs_sharding=model_kwargs_sharding,
+                        model_kwargs_sharding_spec=model_kwargs_sharding_spec,
                     )(
                         self.params,
                         generation_state,
                     )
                 else:
-                    generation_state = sample_fn(
+                    generation_state = perform_sampling_step(
                         self.params,
                         generation_state,
                     )
             while True:
-                if sample_search_cond_fn(generation_state):
+                if should_continue_sampling(generation_state):
                     yield (
                         generation_state.sequences[
-                            :, cur_len : generation_state.cur_len
+                            :, current_length : generation_state.current_length
                         ]
                         if echo
                         else generation_state.running_token
                     )
-                    generation_state = self.compiled_sample_state(
-                        sample_fn=sample_fn,
+                    generation_state = self.get_or_compile_sampling_function(
+                        perform_sampling_step=perform_sampling_step,
                         generation_state=generation_state,
-                        model_kwargs_sharding=model_kwargs_sharding,
+                        model_kwargs_sharding_spec=model_kwargs_sharding_spec,
                     )(self.params, generation_state)
                 else:
                     break
@@ -290,31 +303,31 @@ class GenerationPipeline:
         Returns:
             tuple: A tuple of partition rules for different model components.
         """
-        paxis = self.model.config.partition_axis
+        partition_axes = self.model.config.partition_axis
         return (
             (
                 "position_ids",
-                PartitionSpec(paxis.batch_axis, None),
+                PartitionSpec(partition_axes.batch_axis, None),
             ),
             (
                 "attention_mask",
-                PartitionSpec(paxis.batch_axis, None),
+                PartitionSpec(partition_axes.batch_axis, None),
             ),
             (
                 "cached_key",
                 PartitionSpec(
-                    paxis.batch_axis,
-                    paxis.key_sequence_axis,
-                    paxis.head_axis,
+                    partition_axes.batch_axis,
+                    partition_axes.key_sequence_axis,
+                    partition_axes.head_axis,
                     None,
                 ),
             ),
             (
                 "cached_value",
                 PartitionSpec(
-                    paxis.batch_axis,
-                    paxis.key_sequence_axis,
-                    paxis.head_axis,
+                    partition_axes.batch_axis,
+                    partition_axes.key_sequence_axis,
+                    partition_axes.head_axis,
                     None,
                 ),
             ),
@@ -355,26 +368,26 @@ class GenerationPipeline:
             AttributeError: If an invalid configuration key is provided.
         """
         for key, value in kwargs.items():
-            if hasattr(self._dynamic_config, key):
-                setattr(self._dynamic_config, key, value)
+            if hasattr(self.dynamic_generation_config, key):
+                setattr(self.dynamic_generation_config, key, value)
             else:
                 raise AttributeError(
                     f"DynamicGenerationConfig has no attribute '{key}'"
                 )
 
-    def _compile_sample_fn(
+    def compile_sampling_function(
         self,
-        model_kwargs_sharding,
+        model_kwargs_sharding_spec,
         generation_state,
-        sample_fn,
+        perform_sampling_step,
     ):
         """
         Compiles the sampling function for efficient execution.
 
         Args:
-            model_kwargs_sharding: Sharding specifications for model keyword arguments.
+            model_kwargs_sharding_spec: Sharding specifications for model keyword arguments.
             generation_state (inference_utils.SampleState): Initial generation state.
-            sample_fn: The sampling function to compile.
+            perform_sampling_step: The sampling function to compile.
         """
         state_sharding = inference_utils.SampleState(
             self.empty_sharding,
@@ -382,7 +395,7 @@ class GenerationPipeline:
             self.gen_input_sharding,
             self.empty_sharding,
             self.empty_sharding,
-            model_kwargs_sharding,
+            model_kwargs_sharding_spec,
         )
 
         @functools.partial(
@@ -399,12 +412,12 @@ class GenerationPipeline:
             ),
             out_shardings=state_sharding,
         )
-        def _shard_state(st):
+        def shard_generation_state(st):
             return st
 
-        self._shard_state = _shard_state
+        self.shard_generation_state = shard_generation_state
         self.compiled_sample_fn = inference_utils.compile_function(
-            fjformer.core.implicit_compact(sample_fn),
+            fjformer.core.implicit_compact(perform_sampling_step),
             (self.params, generation_state),
             {},
             mesh=self.mesh,
@@ -419,18 +432,39 @@ class GenerationPipeline:
             out_shardings=state_sharding if self.force_sharding else None,
         )
 
-    def compiled_sample_state_over(
+    def get_compiled_model_kwargs_sharding(
         self,
-        model_kwargs_sharding,
+        input_ids,
+        max_length,
+        attention_mask,
+        model_kwargs_sharding_spec,
+    ):
+        if self.compiled_model_kwargs_sharding is None:
+            logger.info("compiling `model_kwargs_sharding`.")
+            self.compiled_model_kwargs_sharding = inference_utils.compile_function(
+                lambda: self.model.prepare_inputs_for_generation(
+                    input_ids,
+                    max_length,
+                    attention_mask,
+                ),
+                out_shardings=model_kwargs_sharding_spec,
+                func_input_args=(),
+                func_input_kwargs=dict(),
+            )
+        return self.compiled_model_kwargs_sharding
+
+    def compile_multi_step_sampling(
+        self,
+        model_kwargs_sharding_spec,
         generation_state,
-        sample_fn,
+        perform_sampling_step,
     ):
         if self.compiled_sample_fn_over is None:
             logger.info("compiling `sample_fn_over`.")
 
             @fjformer.core.implicit_compact
-            def compiled_sample_state_over(params_, generation_state_):
-                return sample_fn(params_, generation_state_)
+            def compile_multi_step_sampling(params_, generation_state_):
+                return perform_sampling_step(params_, generation_state_)
 
             state_sharding = inference_utils.SampleState(
                 self.empty_sharding,
@@ -438,10 +472,10 @@ class GenerationPipeline:
                 self.input_sharding,
                 self.empty_sharding,
                 self.empty_sharding,
-                model_kwargs_sharding,
+                model_kwargs_sharding_spec,
             )
             self.compiled_sample_fn_over = inference_utils.compile_function(
-                compiled_sample_state_over,
+                compile_multi_step_sampling,
                 (self.params, generation_state),
                 {},
                 mesh=self.mesh,
@@ -458,29 +492,29 @@ class GenerationPipeline:
 
         return self.compiled_sample_fn_over
 
-    def compiled_sample_state(
+    def get_or_compile_sampling_function(
         self,
-        model_kwargs_sharding,
+        model_kwargs_sharding_spec,
         generation_state,
-        sample_fn,
+        perform_sampling_step,
     ):
         """
         Compiles and returns the compiled sampling function.
 
         Args:
-            model_kwargs_sharding: Sharding specifications for model keyword arguments.
+            model_kwargs_sharding_spec: Sharding specifications for model keyword arguments.
             generation_state (inference_utils.SampleState): Initial generation state.
-            sample_fn: The sampling function to compile.
+            perform_sampling_step: The sampling function to compile.
 
         Returns:
             Callable: The compiled sampling function.
         """
         if self.compiled_sample_fn is None:
-            logger.info("compiling `sample_fn`.")
-            self._compile_sample_fn(
-                model_kwargs_sharding,
+            logger.info("compiling `perform_sampling_step`.")
+            self.compile_sampling_function(
+                model_kwargs_sharding_spec,
                 generation_state,
-                sample_fn,
+                perform_sampling_step,
             )
         return self.compiled_sample_fn
 
@@ -498,18 +532,30 @@ class GenerationPipeline:
         path.mkdir(parents=True, exist_ok=True)
 
         if self.compiled_sample_fn is not None:
-            serialized_fn, in_tree, out_tree = serialize(self.compiled_sample_fn)
+            serialized_function, in_tree, out_tree = serialize(self.compiled_sample_fn)
             base_name = f"serialized_gen_step_{hash(self.generation_config)}"
             with open(path / f"{base_name}.fn", "wb") as buffer:
-                buffer.write(serialized_fn)
+                buffer.write(serialized_function)
             with open(path / f"{base_name}.tree", "wb") as buffer:
                 pickle.dump((in_tree, out_tree), buffer)
 
         if self.compiled_sample_fn_over is not None:
-            serialized_fn, in_tree, out_tree = serialize(self.compiled_sample_fn_over)
+            serialized_function, in_tree, out_tree = serialize(
+                self.compiled_sample_fn_over
+            )
             base_name = f"serialized_gen_over_{hash(self.generation_config)}"
             with open(path / f"{base_name}.fn", "wb") as buffer:
-                buffer.write(serialized_fn)
+                buffer.write(serialized_function)
+            with open(path / f"{base_name}.tree", "wb") as buffer:
+                pickle.dump((in_tree, out_tree), buffer)
+
+        if self.compiled_model_kwargs_sharding is not None:
+            serialized_function, in_tree, out_tree = serialize(
+                self.compiled_model_kwargs_sharding
+            )
+            base_name = f"serialized_kwarg_{hash(self.generation_config)}"
+            with open(path / f"{base_name}.fn", "wb") as buffer:
+                buffer.write(serialized_function)
             with open(path / f"{base_name}.tree", "wb") as buffer:
                 pickle.dump((in_tree, out_tree), buffer)
 
@@ -527,16 +573,16 @@ class GenerationPipeline:
 
         # Load compiled_sample_fn
         base_name = f"serialized_gen_step_{hash(self.generation_config)}"
-        fn_path = path / f"{base_name}.fn"
-        tree_path = path / f"{base_name}.tree"
+        function_path = path / f"{base_name}.fn"
+        tree_structure_path = path / f"{base_name}.tree"
 
-        if fn_path.exists() and tree_path.exists():
-            with open(fn_path, "rb") as fn_buffer:
-                serialized_fn = fn_buffer.read()
-            with open(tree_path, "rb") as tree_buffer:
+        if function_path.exists() and tree_structure_path.exists():
+            with open(function_path, "rb") as fn_buffer:
+                serialized_function = fn_buffer.read()
+            with open(tree_structure_path, "rb") as tree_buffer:
                 in_tree, out_tree = pickle.load(tree_buffer)
             self.compiled_sample_fn = deserialize_and_load(
-                serialized_fn,
+                serialized_function,
                 in_tree,
                 out_tree,
             )
@@ -546,16 +592,34 @@ class GenerationPipeline:
 
         # Load compiled_sample_fn_over
         base_name = f"serialized_gen_over_{hash(self.generation_config)}"
-        fn_path = path / f"{base_name}.fn"
-        tree_path = path / f"{base_name}.tree"
+        function_path = path / f"{base_name}.fn"
+        tree_structure_path = path / f"{base_name}.tree"
 
-        if fn_path.exists() and tree_path.exists():
-            with open(fn_path, "rb") as fn_buffer:
-                serialized_fn = fn_buffer.read()
-            with open(tree_path, "rb") as tree_buffer:
+        if function_path.exists() and tree_structure_path.exists():
+            with open(function_path, "rb") as fn_buffer:
+                serialized_function = fn_buffer.read()
+            with open(tree_structure_path, "rb") as tree_buffer:
                 in_tree, out_tree = pickle.load(tree_buffer)
             self.compiled_sample_fn_over = deserialize_and_load(
-                serialized_fn,
+                serialized_function,
+                in_tree,
+                out_tree,
+            )
+            logger.info("`compiled_model_kwargs_sharding` loaded.")
+        else:
+            logger.warn("Couldn't load `compiled_model_kwargs_sharding`")
+
+        base_name = f"serialized_kwarg_{hash(self.generation_config)}"
+        function_path = path / f"{base_name}.fn"
+        tree_structure_path = path / f"{base_name}.tree"
+
+        if function_path.exists() and tree_structure_path.exists():
+            with open(function_path, "rb") as fn_buffer:
+                serialized_function = fn_buffer.read()
+            with open(tree_structure_path, "rb") as tree_buffer:
+                in_tree, out_tree = pickle.load(tree_buffer)
+            self.compiled_sample_fn_over = deserialize_and_load(
+                serialized_function,
                 in_tree,
                 out_tree,
             )
