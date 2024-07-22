@@ -230,7 +230,7 @@ class EasyDeLState(struct.PyTreeNode):
         )
         if tx is None:
             logger.warn(
-                "`tx` is set to None in case that you want to train model first add a tx. (use `state.replace_tx`)"
+                "`tx` is set to None in case that you want to add a tx. (use `state.replace_tx`)"
             )
         opt_state = tx.init(params_with_opt) if tx is not None else None
         if module_config is not None:

@@ -1,20 +1,26 @@
 import functools
+import pathlib
+import pickle
 import warnings
 from typing import Optional, Union
 
 import fjformer
 import flax.core
 import jax
+import jax.experimental
 from fjformer import GenerateRNG
 from jax import lax, random
 from jax import numpy as jnp
+from jax.experimental.serialize_executable import deserialize_and_load, serialize
 from jax.sharding import NamedSharding, PartitionSpec
 
+from easydel.etils.etils import get_logger
 from easydel.inference.generation_pipeline import utils as inference_utils
 from easydel.modules.modeling_utils import EDPretrainedModel
 
 GenerationPipelineConfig = inference_utils.GenerationPipelineConfig
 _DynamicGenerationConfig = inference_utils._DynamicGenerationConfig
+logger = get_logger(__name__)
 
 
 class GenerationPipeline:
@@ -66,7 +72,7 @@ class GenerationPipeline:
         self.parameters_are_quantized = parameters_are_quantized
         self.force_sharding = force_sharding
         self._shard_state = None
-        self._call_with_maybe_quant = None
+        self.compiled_sample_fn_over = None
         self.compiled_func = None
         self.over_compiled_func = None
         self._rng_gen = GenerateRNG(seed or 42)
@@ -78,9 +84,13 @@ class GenerationPipeline:
             partition_rules=partition_rules
         )
         self.input_sharding = NamedSharding(
-            spec=input_partition_spec, mesh=self.model.mesh
+            spec=input_partition_spec,
+            mesh=self.model.mesh,
         )
-        self.empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=self.model.mesh)
+        self.empty_sharding = NamedSharding(
+            spec=PartitionSpec(),
+            mesh=self.model.mesh,
+        )
         self.gen_input_sharding = NamedSharding(
             spec=PartitionSpec(input_partition_spec[0], None),
             mesh=self.model.mesh,
@@ -109,7 +119,7 @@ class GenerationPipeline:
         attention_mask: Optional[jax.Array] = None,
         position_ids: Optional[jax.Array] = None,
         echo: bool = False,
-        **kwargs # Ignored arguments.
+        **kwargs,  # Ignored arguments.
     ):
         """
         Generates text sequences based on the provided input_ids.
@@ -238,7 +248,11 @@ class GenerationPipeline:
         with self.mesh:
             if input_ids.shape[1] > 1:
                 if self.parameters_are_quantized:
-                    generation_state = self.call_with_maybe_quant(sample_fn)(
+                    generation_state = self.compiled_sample_state_over(
+                        sample_fn=sample_fn,
+                        generation_state=generation_state,
+                        model_kwargs_sharding=model_kwargs_sharding,
+                    )(
                         self.params,
                         generation_state,
                     )
@@ -289,13 +303,19 @@ class GenerationPipeline:
             (
                 "cached_key",
                 PartitionSpec(
-                    paxis.batch_axis, paxis.key_sequence_axis, paxis.head_axis, None
+                    paxis.batch_axis,
+                    paxis.key_sequence_axis,
+                    paxis.head_axis,
+                    None,
                 ),
             ),
             (
                 "cached_value",
                 PartitionSpec(
-                    paxis.batch_axis, paxis.key_sequence_axis, paxis.head_axis, None
+                    paxis.batch_axis,
+                    paxis.key_sequence_axis,
+                    paxis.head_axis,
+                    None,
                 ),
             ),
         )
@@ -399,16 +419,44 @@ class GenerationPipeline:
             out_shardings=state_sharding if self.force_sharding else None,
         )
 
-    def call_with_maybe_quant(self, sample_fn):
-        if self._call_with_maybe_quant is None:
+    def compiled_sample_state_over(
+        self,
+        model_kwargs_sharding,
+        generation_state,
+        sample_fn,
+    ):
+        if self.compiled_sample_fn_over is None:
+            logger.info("compiling `sample_fn_over`.")
 
-            @jax.jit
             @fjformer.core.implicit_compact
-            def call_with_maybe_quant(params_, generation_state_):
+            def compiled_sample_state_over(params_, generation_state_):
                 return sample_fn(params_, generation_state_)
 
-            self._call_with_maybe_quant = call_with_maybe_quant
-        return self._call_with_maybe_quant
+            state_sharding = inference_utils.SampleState(
+                self.empty_sharding,
+                self.input_sharding,
+                self.input_sharding,
+                self.empty_sharding,
+                self.empty_sharding,
+                model_kwargs_sharding,
+            )
+            self.compiled_sample_fn_over = inference_utils.compile_function(
+                compiled_sample_state_over,
+                (self.params, generation_state),
+                {},
+                mesh=self.mesh,
+                in_shardings=(
+                    (
+                        self.model_sharding,
+                        state_sharding,
+                    )
+                    if self.force_sharding
+                    else None
+                ),
+                out_shardings=state_sharding if self.force_sharding else None,
+            )
+
+        return self.compiled_sample_fn_over
 
     def compiled_sample_state(
         self,
@@ -428,12 +476,92 @@ class GenerationPipeline:
             Callable: The compiled sampling function.
         """
         if self.compiled_sample_fn is None:
+            logger.info("compiling `sample_fn`.")
             self._compile_sample_fn(
                 model_kwargs_sharding,
                 generation_state,
                 sample_fn,
             )
         return self.compiled_sample_fn
+
+    def save_aot_functions(self, path: str):
+        """
+        Save the ahead-of-time (AOT) compiled functions to disk.
+
+        This method serializes and saves the compiled sample functions if they exist.
+        It saves the serialized function and its associated tree structures in separate files.
+
+        Args:
+            path (str): The directory path where the serialized functions will be saved.
+        """
+        path = pathlib.Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+
+        if self.compiled_sample_fn is not None:
+            serialized_fn, in_tree, out_tree = serialize(self.compiled_sample_fn)
+            base_name = f"serialized_gen_step_{hash(self.generation_config)}"
+            with open(path / f"{base_name}.fn", "wb") as buffer:
+                buffer.write(serialized_fn)
+            with open(path / f"{base_name}.tree", "wb") as buffer:
+                pickle.dump((in_tree, out_tree), buffer)
+
+        if self.compiled_sample_fn_over is not None:
+            serialized_fn, in_tree, out_tree = serialize(self.compiled_sample_fn_over)
+            base_name = f"serialized_gen_over_{hash(self.generation_config)}"
+            with open(path / f"{base_name}.fn", "wb") as buffer:
+                buffer.write(serialized_fn)
+            with open(path / f"{base_name}.tree", "wb") as buffer:
+                pickle.dump((in_tree, out_tree), buffer)
+
+    def load_aot_functions(self, path: str):
+        """
+        Load the ahead-of-time (AOT) compiled functions from disk.
+
+        This method deserializes and loads the compiled sample functions if they exist on disk.
+        It loads the serialized function and its associated tree structures from separate files.
+
+        Args:
+            path (str): The directory path where the serialized functions are stored.
+        """
+        path = pathlib.Path(path)
+
+        # Load compiled_sample_fn
+        base_name = f"serialized_gen_step_{hash(self.generation_config)}"
+        fn_path = path / f"{base_name}.fn"
+        tree_path = path / f"{base_name}.tree"
+
+        if fn_path.exists() and tree_path.exists():
+            with open(fn_path, "rb") as fn_buffer:
+                serialized_fn = fn_buffer.read()
+            with open(tree_path, "rb") as tree_buffer:
+                in_tree, out_tree = pickle.load(tree_buffer)
+            self.compiled_sample_fn = deserialize_and_load(
+                serialized_fn,
+                in_tree,
+                out_tree,
+            )
+            logger.info("`compiled_sample_fn` loaded.")
+        else:
+            logger.warn("Couldn't load `compiled_sample_fn`")
+
+        # Load compiled_sample_fn_over
+        base_name = f"serialized_gen_over_{hash(self.generation_config)}"
+        fn_path = path / f"{base_name}.fn"
+        tree_path = path / f"{base_name}.tree"
+
+        if fn_path.exists() and tree_path.exists():
+            with open(fn_path, "rb") as fn_buffer:
+                serialized_fn = fn_buffer.read()
+            with open(tree_path, "rb") as tree_buffer:
+                in_tree, out_tree = pickle.load(tree_buffer)
+            self.compiled_sample_fn_over = deserialize_and_load(
+                serialized_fn,
+                in_tree,
+                out_tree,
+            )
+            logger.info("`compiled_sample_fn_over` loaded.")
+        else:
+            logger.warn("Couldn't load `compiled_sample_fn_over`")
 
 
 class ChatPipeline:
