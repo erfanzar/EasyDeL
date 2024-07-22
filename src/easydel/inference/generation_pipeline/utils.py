@@ -151,27 +151,27 @@ class SampleState:
     Data class representing the state of the sampling process.
 
     Attributes:
-        cur_len: Current length of the generated sequence.
+        current_length: Current length of the generated sequence.
         sequences: Generated token sequences.
         running_token: The last generated token for each sequence.
-        is_sent_finished: Boolean array indicating finished sequences.
+        is_sequence_finished: Boolean array indicating finished sequences.
         prng_key: JAX PRNG key for random sampling.
         model_kwargs: Keyword arguments passed to the model.
     """
 
-    cur_len: Union[jax.Array, sharding.NamedSharding]
+    current_length: Union[jax.Array, sharding.NamedSharding]
     sequences: Union[jax.Array, sharding.NamedSharding]
     running_token: Union[jax.Array, sharding.NamedSharding]
-    is_sent_finished: Union[jax.Array, sharding.NamedSharding]
+    is_sequence_finished: Union[jax.Array, sharding.NamedSharding]
     prng_key: Union[random.PRNGKey, sharding.NamedSharding]
     model_kwargs: Union[Dict[str, jax.Array], sharding.NamedSharding]
 
     def tree_flatten(self):
         return (
-            self.cur_len,
+            self.current_length,
             self.sequences,
             self.running_token,
-            self.is_sent_finished,
+            self.is_sequence_finished,
             self.prng_key,
             self.model_kwargs,
         ), {}
@@ -205,13 +205,13 @@ def apply_repetition_penalty(logits, tokens, penalty):
     return logits
 
 
-def apply_length_penalty(logits, cur_len, max_len, length_penalty):
+def apply_length_penalty(logits, current_length, max_len, length_penalty):
     """
     Applies length penalty to the logits.
 
     Args:
         logits: Logits tensor.
-        cur_len: Current length of the generated sequence.
+        current_length: Current length of the generated sequence.
         max_len: Maximum length of the sequence.
         length_penalty: Length penalty factor.
 
@@ -220,7 +220,7 @@ def apply_length_penalty(logits, cur_len, max_len, length_penalty):
     """
 
     # Calculate the penalty factor
-    penalty_factor = ((5 + cur_len) / 6) ** length_penalty
+    penalty_factor = ((5 + current_length) / 6) ** length_penalty
 
     # Apply the penalty
     return logits / penalty_factor
@@ -334,7 +334,7 @@ def inference_step(
     tokens,
     prng_key,
     config,
-    cur_len,
+    current_length,
     max_length,
 ):
     """
@@ -348,7 +348,7 @@ def inference_step(
         tokens: Previously generated tokens.
         prng_key: JAX PRNG key for random sampling.
         config: GenerationPipelineConfig object.
-        cur_len: Current length of the generated sequence.
+        current_length: Current length of the generated sequence.
         max_length: Maximum allowed length for the generated sequence.
 
     Returns:
@@ -372,7 +372,7 @@ def inference_step(
         apply_length_penalty,
         lambda x, *u: x,
         logits,
-        cur_len,
+        current_length,
         max_length,
         length_penalty,
     )
