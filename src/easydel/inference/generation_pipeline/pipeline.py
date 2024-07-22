@@ -605,9 +605,9 @@ class GenerationPipeline:
                 in_tree,
                 out_tree,
             )
-            logger.info("`compiled_model_kwargs_sharding` loaded.")
+            logger.info("`compiled_sample_fn_over` loaded.")
         else:
-            logger.warn("Couldn't load `compiled_model_kwargs_sharding`")
+            logger.warn("Couldn't load `compiled_sample_fn_over`")
 
         base_name = f"serialized_kwarg_{hash(self.generation_config)}"
         function_path = path / f"{base_name}.fn"
@@ -618,14 +618,14 @@ class GenerationPipeline:
                 serialized_function = fn_buffer.read()
             with open(tree_structure_path, "rb") as tree_buffer:
                 in_tree, out_tree = pickle.load(tree_buffer)
-            self.compiled_sample_fn_over = deserialize_and_load(
+            self.compiled_model_kwargs_sharding = deserialize_and_load(
                 serialized_function,
                 in_tree,
                 out_tree,
             )
-            logger.info("`compiled_sample_fn_over` loaded.")
+            logger.info("`compiled_model_kwargs_sharding` loaded.")
         else:
-            logger.warn("Couldn't load `compiled_sample_fn_over`")
+            logger.warn("Couldn't load `compiled_model_kwargs_sharding`")
 
 
 class ChatPipeline:
