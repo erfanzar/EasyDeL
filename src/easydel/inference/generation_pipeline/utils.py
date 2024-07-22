@@ -3,8 +3,15 @@ from functools import partial
 from typing import Dict, Optional, Union
 
 import jax
+import jax.random
 from jax import numpy as jnp
 from jax import random, sharding
+
+from easydel.generation.logits_process import (
+    FlaxTemperatureLogitsWarper,
+    FlaxTopKLogitsWarper,
+    FlaxTopPLogitsWarper,
+)
 
 
 class GenerationPipelineConfig:
@@ -45,6 +52,21 @@ class GenerationPipelineConfig:
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
+
+    def __hash__(self) -> int:
+        int_hash = int(
+            (
+                "---".join(
+                    str(cu)
+                    for cu in self.__dict__.values()
+                    if isinstance(cu, (float, int))
+                )
+            )
+            .replace("---", "")
+            .replace(".", "")
+        )
+
+        return int_hash
 
 
 class _DynamicGenerationConfig:
@@ -286,12 +308,12 @@ def temperature_branch(logits, prng_key, top_k, temperature, top_p):
     Returns:
         Sampled token IDs.
     """
-    logits = logits / temperature
+    logits = FlaxTemperatureLogitsWarper(temperature=temperature)(None, logits, None)
     if top_k > 1:
-        logits = apply_top_k_sampling(logits=logits, top_k=top_k)
+        logits = FlaxTopKLogitsWarper(top_k=top_k)(None, logits, None)
     if 0 < top_p < 1.0:
-        logits = apply_top_p_sampling(logits=logits, top_p=top_p)
-    return sampling(jax.nn.softmax(logits, axis=-1), key=prng_key)
+        logits = FlaxTopPLogitsWarper(top_p=top_p)(None, logits, None)
+    return jax.random.categorical(key=prng_key, logits=logits)
 
 
 def gready_branch(logits):
@@ -367,5 +389,6 @@ def inference_step(
 
 
 inference_step_compiled = jax.jit(
-    inference_step, static_argnames=["max_length", "config"]
+    inference_step,
+    static_argnames=["max_length", "config"],
 )
