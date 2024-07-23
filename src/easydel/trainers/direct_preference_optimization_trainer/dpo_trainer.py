@@ -1087,6 +1087,7 @@ class DPOTrainer(BaseTrainer, ABC):
             else (self.tokenizer.eos_token_id if end else self.tokenizer.bos_token_id)
         )
         special_token = jnp.array(token).reshape(1, 1)
+        array = jnp.atleast_2d(array)
         return (
             jnp.concatenate((special_token, array), axis=-1)
             if not end
