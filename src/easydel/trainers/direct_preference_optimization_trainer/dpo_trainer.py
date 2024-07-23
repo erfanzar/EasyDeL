@@ -37,6 +37,7 @@ from easydel.trainers.direct_preference_optimization_trainer.modelling_output im
 from easydel.trainers.direct_preference_optimization_trainer.utils import (
     DPODataCollatorWithPadding,
     leave_alone_context_manager,
+    pad_to_length
 )
 from easydel.trainers.training_configurations import TrainArguments
 
