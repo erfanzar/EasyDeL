@@ -1113,6 +1113,67 @@ class DPOTrainer(BaseTrainer, ABC):
 
             batch[f"{prefix}{type_key}"] = token_array
 
+    def build_tokenized_answer(self, prompt, answer):
+        """
+        Tokenizes a prompt and answer pair, handling special tokens and padding/truncation.
+        This method tokenizes the prompt and answer separately, then concatenates them
+        while ensuring correct token alignment. It also handles adding special tokens
+        (BOS and EOS) and padding/truncating sequences to the appropriate lengths.
+        Args:
+            prompt (str): The prompt text.
+            answer (str): The answer text.
+        Returns:
+            Dict: A dictionary containing the tokenized prompt and answer, along with attention masks.
+        """
+
+        full_tokenized = self.tokenizer(prompt + answer, add_special_tokens=False)
+        prompt_input_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+
+        answer_input_ids = full_tokenized["input_ids"][len(prompt_input_ids) :]
+        answer_attention_mask = full_tokenized["attention_mask"][
+            len(prompt_input_ids) :
+        ]
+        prompt_input_ids = jnp.asarray(prompt_input_ids, dtype="i4")
+        answer_input_ids = jnp.asarray(answer_input_ids, dtype="i4")
+        full_concat_input_ids = jnp.concatenate((prompt_input_ids, answer_input_ids))
+
+        # Prepare input tokens for token by token comparison
+        full_input_ids = jnp.array(full_tokenized["input_ids"])
+
+        if len(full_input_ids) != len(full_concat_input_ids):
+            raise ValueError(
+                "Prompt input ids and answer input ids should have the same length."
+            )
+
+        response_token_ids_start_idx = len(prompt_input_ids)
+        if (
+            prompt_input_ids.tolist()
+            != full_tokenized["input_ids"][:response_token_ids_start_idx]
+        ):
+            response_token_ids_start_idx -= 1
+
+        prompt_input_ids = full_tokenized["input_ids"][:response_token_ids_start_idx]
+        prompt_attention_mask = full_tokenized["attention_mask"][
+            :response_token_ids_start_idx
+        ]
+
+        if len(prompt_input_ids) != len(prompt_attention_mask):
+            raise ValueError(
+                "Prompt input ids and attention mask should have the same length."
+            )
+
+        answer_input_ids = full_tokenized["input_ids"][response_token_ids_start_idx:]
+        answer_attention_mask = full_tokenized["attention_mask"][
+            response_token_ids_start_idx:
+        ]
+
+        return dict(
+            prompt_input_ids=jnp.array(prompt_input_ids, dtype="i4"),
+            prompt_attention_mask=jnp.array(prompt_attention_mask, dtype="i4"),
+            input_ids=jnp.array(answer_input_ids, dtype="i4"),
+            attention_mask=jnp.array(answer_attention_mask, dtype="i4"),
+        )
+
     def compute_reference_log_probs(
         self,
         state: EasyDeLState,
