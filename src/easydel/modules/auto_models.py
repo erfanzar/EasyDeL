@@ -455,7 +455,11 @@ class AutoEasyDeLModelForCausalLM:
             )
 
         logger.debug(f"Downloading model config from {pretrained_model_name_or_path}")
-        config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
+        trust_remote_code = kwargs.get("trust_remote_code", False)
+        config = AutoConfig.from_pretrained(
+            pretrained_model_name_or_path,
+            trust_remote_code=trust_remote_code,
+        )
         model_type: str = config.model_type
 
         cfg, module, trf = get_modules_by_type(model_type)
@@ -538,6 +542,7 @@ class AutoEasyDeLModelForCausalLM:
                 backend=backend,
                 input_shape=input_shape,  # type:ignore
                 config_kwargs=config_kwargs,
+                trust_remote_code=trust_remote_code,
             )
         logger.debug("converting huggingface-model to easydel-model.")
         params_pattern_selection = None
@@ -757,6 +762,7 @@ class AutoShardAndGatherFunctions:
         config_kwargs: Optional[Mapping[str, Any]] = None,
         depth_target: Optional[List[str]] = None,
         from_torch: bool = False,
+        trust_remote_code:bool=False,
     ) -> Tuple[Mapping[str, Callable], Mapping[str, Callable]]:
         """
         Generates shard and gather functions based on a pretrained model name or path.
@@ -775,6 +781,7 @@ class AutoShardAndGatherFunctions:
             config_kwargs: Additional keyword arguments to pass to the `AutoEasyDeLConfig` constructor. Defaults to None.
             depth_target: Pad the sharding to depth, for example make {params:tensor} with depth_target = ["row"] to {row:{params:tensor}}. Defaults to None.
             from_torch: should config be loaded from torch models or not.
+            trust_remote_code (bool): whenever to trust remote code loaded from HF.
         Returns:
             A tuple containing the shard and gather functions.
         """
@@ -786,6 +793,7 @@ class AutoShardAndGatherFunctions:
             shard_attention_computation=shard_attention_computation,
             backend=backend,
             from_torch=from_torch,
+            trust_remote_code=trust_remote_code,
         )
         if config_kwargs is not None:
             for k, v in config_kwargs.items():
