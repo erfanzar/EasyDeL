@@ -112,7 +112,6 @@ def create_dpo_concatenated_forward(
             is_encoder_decoder=is_encoder_decoder,
             label_pad_token_id=label_pad_token_id,
         )
-
         chosen_log_probs = all_log_probs[:len_chosen]
         rejected_log_probs = all_log_probs[len_chosen:]
 
