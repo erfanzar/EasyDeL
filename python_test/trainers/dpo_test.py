@@ -16,6 +16,7 @@ import jax  # noqa: E402
 jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 from typing import Dict, Optional  # noqa: E402
 
+import easydel as ed  # noqa
 import jax  # noqa: E402
 from datasets import Dataset, load_dataset  # noqa: E402
 from easydel import (  # noqa: E402
@@ -79,6 +80,16 @@ def get_hh(
 
 
 def main():
+    num_devices = len(jax.devices())
+    sharding_axis_dims = (1, 1, 1, -1)
+
+
+    max_length = 512
+    max_target_length = 256
+    max_prompt_length = 256
+    input_shape = (num_devices, max_length)
+    dtype = jnp.bfloat16
+
     assert len(jax.devices("cpu")) == 8, "XLA Device manipulation failed."
     with jax.default_device(jax.devices("cpu")[0]):
         model_name_or_path = "erfanzar/LLamaStory-70M"
@@ -97,6 +108,24 @@ def main():
             model_name="DPO_TEST",
             total_batch_size=8,
             use_wandb=False,
+            learning_rate=7e-5,
+            learning_rate_end=9e-6,
+            warmup_steps=100,
+            optimizer=ed.EasyDeLOptimizers.ADAMW,
+            scheduler=ed.EasyDeLSchedulers.WARM_UP_COSINE,
+            weight_decay=0.02,
+            max_sequence_length=max_length,
+            gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
+            sharding_array=sharding_axis_dims,
+            gradient_accumulation_steps=1,
+            init_input_shape=input_shape,
+            dtype=dtype,
+            param_dtype=dtype,
+            step_start_point=0,
+            do_last_save=False,
+            training_time="7H",
+            force_batch_and_gradient_accumulation_steps_calculation=False,
+            track_memory=True,
         )
 
         tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
@@ -139,10 +168,6 @@ def main():
                 )
             },
         )
-
-        max_length = 512
-        max_target_length = 256
-        max_prompt_length = 256
 
         dpo_trainer = DPOTrainer(
             model_state=state,

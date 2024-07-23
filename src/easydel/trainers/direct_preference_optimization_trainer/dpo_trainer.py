@@ -5,6 +5,7 @@ import typing
 import warnings
 from abc import ABC
 from collections import defaultdict
+from functools import partial  # noqa
 from typing import Any, Callable, Dict, Literal, Mapping, Optional, Union
 
 import flax.core
@@ -36,7 +37,6 @@ from easydel.trainers.direct_preference_optimization_trainer.modelling_output im
 from easydel.trainers.direct_preference_optimization_trainer.utils import (
     DPODataCollatorWithPadding,
     leave_alone_context_manager,
-    pad_to_length,
 )
 from easydel.trainers.training_configurations import TrainArguments
 
@@ -1064,6 +1064,7 @@ class DPOTrainer(BaseTrainer, ABC):
             attention_mask=jnp.array(answer_attention_mask, dtype="i4"),
         )
 
+    # @partial(jax.jit, static_argnums=(0,))
     def tokenize_row(self, feature, state: EasyDeLState = None) -> Dict:
         """
         Tokenizes a single row of data from the DPO dataset.
@@ -1082,224 +1083,112 @@ class DPOTrainer(BaseTrainer, ABC):
         Raises:
             ValueError: If the input data types are incorrect.
         """
-        batch = {}
         prompt = feature["prompt"]
         chosen = feature["chosen"]
         rejected = feature["rejected"]
 
-        if not isinstance(prompt, str):
-            raise ValueError(
-                f"prompt should be an str but got {type(prompt)} , {prompt}"
-            )
+        # Tokenize inputs
         prompt_tokens = self.tokenizer(
-            prompt,
-            add_special_tokens=False,
-            return_tensors="np",
+            prompt, add_special_tokens=False, return_tensors="np"
         )
-        prompt_tokens = {f"prompt_{k}": v for k, v in prompt_tokens.items()}
-
-        if not isinstance(chosen, str):
-            raise ValueError(
-                f"chosen should be an str but got {type(chosen)} , {chosen}"
-            )
         chosen_tokens = self.build_tokenized_answer(prompt, chosen)
-
-        if not isinstance(rejected, str):
-            raise ValueError(f"rejected should be an str but got {type(rejected)}")
         rejected_tokens = self.build_tokenized_answer(prompt, rejected)
-        v2d = lambda ar: ar.reshape(1, -1) if ar.ndim == 1 else ar  # noqa
 
+        # Helper functions
         def add_tkn(n, ar):
-            return jnp.concatenate((jnp.array(n).reshape(1, 1), v2d(ar)), axis=-1)
+            return jnp.concatenate((jnp.array([[n]]), ar), axis=1)
 
         def add_post_tkn(n, ar):
-            return jnp.concatenate((v2d(ar), jnp.array(n).reshape(1, 1)), axis=-1)
+            return jnp.concatenate((ar, jnp.array([[n]])), axis=1)
 
-        prompt_tokens["prompt_input_ids"] = add_tkn(
-            self.tokenizer.bos_token_id, prompt_tokens["prompt_input_ids"]
-        )
-        chosen_tokens["prompt_input_ids"] = add_tkn(
-            self.tokenizer.bos_token_id, chosen_tokens["prompt_input_ids"]
-        )
-        rejected_tokens["prompt_input_ids"] = add_tkn(
-            self.tokenizer.bos_token_id, rejected_tokens["prompt_input_ids"]
-        )
-
-        prompt_tokens["prompt_attention_mask"] = add_tkn(
-            1, prompt_tokens["prompt_attention_mask"]
-        )
-        chosen_tokens["prompt_attention_mask"] = add_tkn(
-            1, chosen_tokens["prompt_attention_mask"]
-        )
-        rejected_tokens["prompt_attention_mask"] = add_tkn(
-            1, rejected_tokens["prompt_attention_mask"]
-        )
-
-        # add EOS token to end of answer
-        chosen_tokens["input_ids"] = add_post_tkn(
-            self.tokenizer.eos_token_id, chosen_tokens["input_ids"]
-        )
-        chosen_tokens["attention_mask"] = add_post_tkn(
-            1, chosen_tokens["attention_mask"]
-        )
-
-        rejected_tokens["input_ids"] = add_post_tkn(
-            self.tokenizer.eos_token_id, rejected_tokens["input_ids"]
-        )
-        rejected_tokens["attention_mask"] = add_post_tkn(
-            1, rejected_tokens["attention_mask"]
-        )
-
-        longer_response_length = max(
-            chosen_tokens["input_ids"].shape[-1], rejected_tokens["input_ids"].shape[-1]
-        )
-
-        # if combined sequence is too long, truncate the prompt
-        for answer_tokens in [chosen_tokens, rejected_tokens, prompt_tokens]:
-            length_rn = (
-                answer_tokens["prompt_input_ids"].shape[-1] + longer_response_length
+        # Add special tokens
+        for tokens in [prompt_tokens, chosen_tokens, rejected_tokens]:
+            tokens["input_ids"] = add_tkn(
+                self.tokenizer.bos_token_id, tokens["input_ids"]
             )
-            if length_rn > self.max_length:
-                if self.truncation_mode == "keep_start":
-                    for k in ["prompt_input_ids", "prompt_attention_mask"]:
-                        answer_tokens[k] = answer_tokens[k][:, : self.max_prompt_length]
-                elif self.truncation_mode == "keep_end":
-                    for k in ["prompt_input_ids", "prompt_attention_mask"]:
-                        answer_tokens[k] = answer_tokens[k][
-                            :, -self.max_prompt_length :
-                        ]
-                else:
-                    raise ValueError(f"Unknown truncation mode: {self.truncation_mode}")
-        # if that's still too long, truncate the response
-        for answer_tokens in [chosen_tokens, rejected_tokens]:
-            if (
-                answer_tokens["prompt_input_ids"].shape[-1] + longer_response_length
-                > self.max_length
-            ):
-                for k in ["input_ids", "attention_mask"]:
-                    answer_tokens[k] = answer_tokens[k][
-                        :, : self.max_length - self.max_prompt_length
-                    ]
+            tokens["attention_mask"] = add_tkn(1, tokens["attention_mask"])
 
-        chosen_sequence_tokens = {
-            k: jnp.concatenate(
-                (v2d(chosen_tokens[f"prompt_{k}"]), v2d(chosen_tokens[k])), axis=-1
+        # Add EOS token to answers
+        for tokens in [chosen_tokens, rejected_tokens]:
+            tokens["input_ids"] = add_post_tkn(
+                self.tokenizer.eos_token_id, tokens["input_ids"]
             )
-            for k in ["input_ids", "attention_mask"]
+            tokens["attention_mask"] = add_post_tkn(1, tokens["attention_mask"])
+
+        # Truncate if necessary
+        max_prompt_length = self.max_prompt_length
+        max_answer_length = self.max_length - max_prompt_length
+
+        def truncate(tokens):
+            if self.truncation_mode == "keep_start":
+                return jax.tree_map(lambda x: x[:, :max_prompt_length], tokens)
+            elif self.truncation_mode == "keep_end":
+                return jax.tree_map(lambda x: x[:, -max_prompt_length:], tokens)
+            else:
+                raise ValueError(f"Unknown truncation mode: {self.truncation_mode}")
+
+        prompt_tokens = truncate(prompt_tokens)
+        chosen_tokens = jax.tree_map(lambda x: x[:, :max_answer_length], chosen_tokens)
+        rejected_tokens = jax.tree_map(
+            lambda x: x[:, :max_answer_length], rejected_tokens
+        )
+
+        # Concatenate sequences
+        def concatenate_sequence(prompt, answer):
+            return {
+                k: jnp.concatenate((prompt[k], answer[k]), axis=1)
+                for k in ["input_ids", "attention_mask"]
+            }
+
+        chosen_sequence = concatenate_sequence(prompt_tokens, chosen_tokens)
+        rejected_sequence = concatenate_sequence(prompt_tokens, rejected_tokens)
+
+        # Create labels
+        chosen_sequence["labels"] = (
+            chosen_sequence["input_ids"]
+            .at[:, : prompt_tokens["input_ids"].shape[1]]
+            .set(self.label_pad_token_id)
+        )
+        rejected_sequence["labels"] = (
+            rejected_sequence["input_ids"]
+            .at[:, : prompt_tokens["input_ids"].shape[1]]
+            .set(self.label_pad_token_id)
+        )
+
+        # Pad sequences
+        def pad_sequence(sequence, max_length, pad_value):
+            return jax.tree_map(
+                lambda x: jnp.pad(
+                    x,
+                    ((0, 0), (0, max_length - x.shape[1])),
+                    mode="constant",
+                    constant_values=pad_value,
+                ),
+                sequence,
+            )
+
+        chosen_sequence = pad_sequence(
+            chosen_sequence, self.max_target_length, self.padding_value
+        )
+        rejected_sequence = pad_sequence(
+            rejected_sequence, self.max_target_length, self.padding_value
+        )
+        prompt_tokens = pad_sequence(
+            prompt_tokens, self.max_prompt_length, self.padding_value
+        )
+
+        # Combine results
+        batch = {
+            "chosen_input_ids": chosen_sequence["input_ids"],
+            "chosen_attention_mask": chosen_sequence["attention_mask"],
+            "chosen_labels": chosen_sequence["labels"],
+            "rejected_input_ids": rejected_sequence["input_ids"],
+            "rejected_attention_mask": rejected_sequence["attention_mask"],
+            "rejected_labels": rejected_sequence["labels"],
+            "prompt_input_ids": prompt_tokens["input_ids"],
+            "prompt_attention_mask": prompt_tokens["attention_mask"],
         }
-        rejected_sequence_tokens = {
-            k: jnp.concatenate(
-                (v2d(rejected_tokens[f"prompt_{k}"]), v2d(rejected_tokens[k])), axis=-1
-            )
-            for k in ["input_ids", "attention_mask"]
-        }
-        chosen_sequence_tokens["labels"] = chosen_sequence_tokens["input_ids"][:]
-        chosen_sequence_tokens["labels"] = (
-            chosen_sequence_tokens["labels"]
-            .at[: len(chosen_tokens["prompt_input_ids"])]
-            .set([self.label_pad_token_id] * len(chosen_tokens["prompt_input_ids"]))
-        )
-        rejected_sequence_tokens["labels"] = rejected_sequence_tokens["input_ids"][:]
-        rejected_sequence_tokens["labels"] = (
-            rejected_sequence_tokens["labels"]
-            .at[: len(rejected_tokens["prompt_input_ids"])]
-            .set(([self.label_pad_token_id] * len(rejected_tokens["prompt_input_ids"])))
-        )
 
-        for k, tokens_ in {
-            "chosen_": chosen_sequence_tokens,
-            "rejected_": rejected_sequence_tokens,
-            "": prompt_tokens,
-        }.items():
-            for type_key, tokens in tokens_.items():
-                if type_key == "token_type_ids":
-                    continue
-
-                b, s = tokens.shape
-
-                if self.max_prompt_length > s:
-                    if k == "chosen_":
-                        if type_key == "input_ids":
-                            tokens = pad_to_length(
-                                tokens,
-                                self.max_target_length,
-                                pad_value=self.padding_value,
-                                axis=-1,
-                            )
-                        elif type_key == "attention_mask":
-                            tokens = pad_to_length(
-                                tokens, self.max_target_length, pad_value=0, axis=-1
-                            )
-                        elif type_key == "labels":
-                            tokens = pad_to_length(
-                                tokens,
-                                self.max_target_length,
-                                pad_value=self.padding_value,
-                                axis=-1,
-                            )
-
-                        tokens = tokens[..., : self.max_target_length]
-
-                        if tokens.shape[-1] != self.max_target_length:
-                            raise ValueError(
-                                f"there was an error in padding token with `type_key` of {type_key}"
-                                f". it must have sequence_length of {self.max_target_length} but we got {tokens.shape[-1]}"
-                                f" From {k}{type_key}"
-                            )
-                        tokens = tokens[..., : self.max_target_length]
-                    elif k == "rejected_":
-                        if type_key == "input_ids":
-                            tokens = pad_to_length(
-                                tokens,
-                                self.max_target_length,
-                                pad_value=self.padding_value,
-                                axis=-1,
-                            )
-                        elif type_key == "attention_mask":
-                            tokens = pad_to_length(
-                                tokens, self.max_target_length, pad_value=0, axis=-1
-                            )
-                        elif type_key == "labels":
-                            tokens = pad_to_length(
-                                tokens,
-                                self.max_target_length,
-                                pad_value=self.padding_value,
-                                axis=-1,
-                            )
-                        tokens = tokens[..., : self.max_target_length]
-                        if tokens.shape[-1] != self.max_target_length:
-                            raise ValueError(
-                                f"there was an error in padding token with `type_key` of {type_key}"
-                                f". it must have sequence_length of {self.max_target_length} but we got {tokens.shape[-1]}"
-                                f" From {k}{type_key}"
-                            )
-                    elif k == "":
-                        if type_key == "prompt_input_ids":
-                            tokens = pad_to_length(
-                                tokens,
-                                self.max_prompt_length,
-                                pad_value=self.padding_value,
-                                axis=-1,
-                            )
-                        elif type_key == "prompt_attention_mask":
-                            tokens = pad_to_length(
-                                tokens, self.max_prompt_length, pad_value=0, axis=-1
-                            )
-                        elif type_key == "prompt_labels":
-                            tokens = pad_to_length(
-                                tokens,
-                                self.max_prompt_length,
-                                pad_value=self.padding_value,
-                                axis=-1,
-                            )
-                        tokens = tokens[..., : self.max_prompt_length]
-                        if tokens.shape[-1] != self.max_prompt_length:
-                            raise ValueError(
-                                f"there was an error in padding token with `type_key` of {type_key}"
-                                f". it must have sequence_length of {self.max_prompt_length} but we got {tokens.shape[-1]}"
-                                f" From {k}{type_key}"
-                            )
-                batch[f"{k}{type_key}"] = tokens
         return batch
 
     def compute_reference_log_probs(
