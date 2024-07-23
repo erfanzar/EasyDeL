@@ -1096,9 +1096,13 @@ class DPOTrainer(BaseTrainer, ABC):
 
         # Helper functions
         def add_tkn(n, ar):
+            if ar.ndim ==1:
+                ar = ar.reshape(1,-1)
             return jnp.concatenate((jnp.array([[n]]), ar), axis=1)
 
         def add_post_tkn(n, ar):
+            if ar.ndim == 1:
+                ar = ar.reshape(1, -1)
             return jnp.concatenate((ar, jnp.array([[n]])), axis=1)
 
         # Add special tokens
