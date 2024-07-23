@@ -466,35 +466,37 @@ class TrainArguments:
             from torch import Tensor
         except ModuleNotFoundError:
             Tensor = None
-        with jax.spmd_mode("allow_all"):
-            # Log to WandB
-            if self.use_wandb and wandb is not None and wandb.run is not None:
-                wandb_metrics = {}
-                for key, value in metrics.items():
-                    if isinstance(value, (list, tuple, np.ndarray)):
-                        wandb_metrics[key] = wandb.Histogram(value)
-                    elif isinstance(value, (jnp.ndarray, Tensor)):
-                        wandb_metrics[key] = wandb.Histogram(
-                            value.cpu().numpy()
-                            if hasattr(value, "cpu")
-                            else np.array(value)
-                        )
-                    else:
-                        wandb_metrics[key] = value
-                wandb.log(wandb_metrics, step=step)
+        try:
+            with jax.spmd_mode("allow_all"):
+                if self.use_wandb and wandb is not None and wandb.run is not None:
+                    wandb_metrics = {}
+                    for key, value in metrics.items():
+                        if isinstance(value, (list, tuple, np.ndarray)):
+                            wandb_metrics[key] = wandb.Histogram(value)
+                        elif isinstance(value, (jnp.ndarray, Tensor)):
+                            wandb_metrics[key] = wandb.Histogram(
+                                value.cpu().numpy()
+                                if hasattr(value, "cpu")
+                                else np.array(value)
+                            )
+                        else:
+                            wandb_metrics[key] = value
+                    wandb.log(wandb_metrics, step=step)
 
-            # Log to TensorBoard
-            summary_writer = self.get_board()
-            for key, value in metrics.items():
-                if isinstance(value, (float, int)):
-                    summary_writer.scalar(key, value, step=step)
-                elif isinstance(value, (list, tuple, np.ndarray, jnp.ndarray, Tensor)):  # type: ignore
-                    if hasattr(value, "cpu"):
-                        value = value.cpu().numpy()
-                    elif isinstance(value, jnp.ndarray):
-                        value = np.array(value)
-                    summary_writer.histogram(key, value, step=step)
-            summary_writer.flush()
+                # Log to TensorBoard
+                summary_writer = self.get_board()
+                for key, value in metrics.items():
+                    if isinstance(value, (float, int)):
+                        summary_writer.scalar(key, value, step=step)
+                    elif isinstance(value, (list, tuple, np.ndarray, jnp.ndarray, Tensor)):  # type: ignore
+                        if hasattr(value, "cpu"):
+                            value = value.cpu().numpy()
+                        elif isinstance(value, jnp.ndarray):
+                            value = np.array(value)
+                        summary_writer.histogram(key, value, step=step)
+                summary_writer.flush()
+        except Exception as exc:
+            warnings.warn(exc)
 
     def to_dict(self) -> Dict[str, Any]:
         """
