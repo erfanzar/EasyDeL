@@ -543,10 +543,6 @@ class AutoEasyDeLModelForCausalLM:
         params_pattern_selection = None
         if load_in_8bit:
             if bit_targeted_params is None:
-                warnings.warn(
-                    "since `bit_targeted_params` is set to None, auto loader will convert all of"
-                    " kernels(weights) and embeddings to 8bit by default"
-                )
                 bit_targeted_params = [
                     "kernel",
                 ]
@@ -714,9 +710,6 @@ class AutoShardAndGatherFunctions:
             A tuple containing the shard and gather functions.
         """
         if partition_rules is None:
-            warnings.warn(
-                "Using config partition rules from `get_partition_rules(fully_sharded_data_parallel=True)`"
-            )
             partition_rules = config.get_partition_rules(True)
         _, module, _ = get_modules_by_type(config.model_type)
         model = module(config=config, _do_init=False, input_shape=input_shape)
