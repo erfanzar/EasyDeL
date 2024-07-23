@@ -2,7 +2,7 @@ import os
 import sys
 
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
+# os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 dirname = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(dirname)  # noqa: E402
 sys.path.append(
@@ -11,13 +11,11 @@ sys.path.append(
         "../../src",
     )
 )  # noqa: E402
-import jax  # noqa: E402
-
-jax.config.update("jax_platform_name", "cpu")  # CPU Test !
+# jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 from typing import Dict, Optional  # noqa: E402
 
 import easydel as ed  # noqa
-import jax  # noqa: E402
+import jax  # noqa: E402  # noqa
 from datasets import Dataset, load_dataset  # noqa: E402
 from easydel import (  # noqa: E402
     DPOTrainer,
@@ -83,15 +81,14 @@ def main():
     num_devices = len(jax.devices())
     sharding_axis_dims = (1, 1, 1, -1)
 
-
     max_length = 512
     max_target_length = 256
     max_prompt_length = 256
     input_shape = (num_devices, max_length)
     dtype = jnp.bfloat16
 
-    assert len(jax.devices("cpu")) == 8, "XLA Device manipulation failed."
-    with jax.default_device(jax.devices("cpu")[0]):
+    # assert len(jax.devices("cpu")) == 8, "XLA Device manipulation failed."
+    with jax.default_device(jax.devices("gpu")[0]):
         model_name_or_path = "erfanzar/LLamaStory-70M"
         conf = LlamaConfig(
             hidden_size=128,

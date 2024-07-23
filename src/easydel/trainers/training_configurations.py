@@ -27,6 +27,7 @@ from easydel.etils.etils import (
     EasyDeLGradientCheckPointers,
     EasyDeLOptimizers,
     EasyDeLSchedulers,
+    get_logger,
 )
 from easydel.trainers.utils import JaxDistributedConfig
 
@@ -37,6 +38,8 @@ except ImportError:
 
 
 import flax.metrics.tensorboard
+
+logger = get_logger(__name__)
 
 
 class LoraRaptureConfig(RaptureConfig):  # Don't Make user involved with FJFormer
@@ -460,43 +463,123 @@ class TrainArguments:
                 A dictionary where keys are metric names and values are metric values.
             step (int): The current training step or iteration.
         """
-        if not metrics:
-            return
-        try:
-            from torch import Tensor
-        except ModuleNotFoundError:
-            Tensor = None
-        try:
-            with jax.spmd_mode("allow_all"):
-                if self.use_wandb and wandb is not None and wandb.run is not None:
-                    wandb_metrics = {}
-                    for key, value in metrics.items():
-                        if isinstance(value, (list, tuple, np.ndarray)):
-                            wandb_metrics[key] = wandb.Histogram(value)
-                        elif isinstance(value, (jnp.ndarray, Tensor)):
-                            wandb_metrics[key] = wandb.Histogram(
-                                value.cpu().numpy()
-                                if hasattr(value, "cpu")
-                                else np.array(value)
-                            )
-                        else:
-                            wandb_metrics[key] = value
-                    wandb.log(wandb_metrics, step=step)
+        with jax.spmd_mode("allow_all"):
+            self._log_to_wandb(metrics, step)
+            self._log_to_tensorboard(metrics, step)
 
-                # Log to TensorBoard
-                summary_writer = self.get_board()
-                for key, value in metrics.items():
-                    if isinstance(value, (float, int)):
-                        summary_writer.scalar(key, value, step=step)
-                    elif isinstance(value, (list, tuple, np.ndarray, jnp.ndarray, Tensor)):  # type: ignore
-                        if hasattr(value, "cpu"):
-                            value = value.cpu().numpy()
-                        elif isinstance(value, jnp.ndarray):
-                            value = np.array(value)
-                        summary_writer.histogram(key, value, step=step)
-                summary_writer.flush()
-        except Exception as exc:
-            warnings.warn(exc)
+    def _log_to_wandb(self, metrics, step):
+        """
+        Log metrics to Weights & Biases (wandb).
+
+        This method processes the given metrics and logs them to wandb if it's enabled and properly initialized.
+
+        Args:
+            metrics (dict): A dictionary of metrics to log. Keys are metric names, values are the metric values.
+            step (int): The current step or iteration number.
+
+        Notes:
+            - If a metric value is a list, tuple, or numpy array, it's converted to a wandb.Histogram.
+            - For JAX arrays or PyTorch tensors, they're converted to numpy arrays before creating a histogram.
+            - Other types of values are logged as-is.
+            - Any exceptions during logging are caught and warned about, allowing the process to continue.
+        """
+        if self.use_wandb and wandb is not None and wandb.run is not None:
+            wandb_metrics = {}
+            for key, value in metrics.items():
+                try:
+                    if isinstance(value, (list, tuple, np.ndarray)):
+                        wandb_metrics[key] = self._create_wandb_histogram(value)
+                    elif isinstance(
+                        value,
+                        (
+                            jnp.ndarray,
+                            "torch.Tensor",
+                        ),
+                    ):  # Use string for Tensor to avoid import issues
+                        wandb_metrics[key] = self._create_wandb_histogram(
+                            value.cpu().numpy()
+                            if hasattr(value, "cpu")
+                            else np.array(value)
+                        )
+                    else:
+                        wandb_metrics[key] = value
+                except Exception as e:
+                    logger.warn(f"Failed to log metric {key} to wandb: {e}")
+
+            wandb.log(wandb_metrics, step=step)
+
+    def _log_to_tensorboard(self, metrics, step):
+        """
+        Log metrics to TensorBoard.
+
+        This method processes the given metrics and logs them to TensorBoard.
+
+        Args:
+            metrics (dict): A dictionary of metrics to log. Keys are metric names, values are the metric values.
+            step (int): The current step or iteration number.
+
+        Notes:
+            - Scalar values (float, int) are logged using summary_writer.scalar().
+            - Lists, tuples, numpy arrays, JAX arrays, and PyTorch tensors are logged as histograms.
+            - JAX arrays and PyTorch tensors are converted to numpy arrays before logging.
+            - Any exceptions during logging are caught and warned about, allowing the process to continue.
+            - The summary writer is flushed after logging all metrics.
+        """
+        summary_writer = self.get_board()
+        for key, value in metrics.items():
+            try:
+                if isinstance(value, (float, int)):
+                    summary_writer.scalar(key, value, step)
+                elif isinstance(
+                    value,
+                    (
+                        list,
+                        tuple,
+                        np.ndarray,
+                        jnp.ndarray,
+                        "torch.Tensor",
+                    ),
+                ):
+                    if hasattr(value, "cpu"):
+                        value = value.cpu().numpy()
+                    elif isinstance(value, jnp.ndarray):
+                        value = np.array(value)
+                    summary_writer.histogram(key, value, step)
+            except Exception as e:
+                logger.warn(f"Failed to log metric {key} to TensorBoard: {e}")
+
+        summary_writer.flush()
+
+    def _create_wandb_histogram(self, value):
+        """
+        Create a wandb.Histogram object from the given value.
+
+        This method handles the conversion of various data types to a format suitable for wandb histograms.
+
+        Args:
+            value: The value to convert into a wandb.Histogram. Can be a list, tuple, numpy array, etc.
+
+        Returns:
+            wandb.Histogram or None: A wandb.Histogram object if successful, None if an error occurs.
+
+        Notes:
+            - Non-numpy array inputs are converted to numpy arrays.
+            - float16 and bfloat16 dtypes are converted to float32 to avoid potential issues.
+            - Any exceptions during histogram creation are caught and logged, returning None in such cases.
+        """
+        try:
+            # Convert to numpy array if it's not already
+            if not isinstance(value, np.ndarray):
+                value = np.array(value)
+
+            # Handle different dtypes
+            if value.dtype in [np.float16, np.bfloat16]:
+                value = value.astype(np.float32)
+
+            return wandb.Histogram(value)
+        except Exception as e:
+            (f"Failed to create wandb histogram: {e}")
+            return None
 
     def to_dict(self) -> Dict[str, Any]:
         """
