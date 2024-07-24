@@ -405,7 +405,7 @@ class TrainArguments:
         """
         import os.path
 
-        from fjformer import CheckpointManager
+        from fjformer.checkpoint import CheckpointManager
 
         return CheckpointManager(
             os.path.join(self.save_dir, self.model_name),
@@ -484,6 +484,13 @@ class TrainArguments:
             - Any exceptions during logging are caught and warned about, allowing the process to continue.
         """
         if self.use_wandb and wandb is not None and wandb.run is not None:
+
+            class Tensor: ...
+
+            try:
+                from torch import Tensor
+            except ModuleNotFoundError:
+                ...
             wandb_metrics = {}
             for key, value in metrics.items():
                 try:
@@ -493,7 +500,7 @@ class TrainArguments:
                         value,
                         (
                             jnp.ndarray,
-                            "torch.Tensor",
+                            Tensor,
                         ),
                     ):  # Use string for Tensor to avoid import issues
                         wandb_metrics[key] = self._create_wandb_histogram(
@@ -525,6 +532,13 @@ class TrainArguments:
             - Any exceptions during logging are caught and warned about, allowing the process to continue.
             - The summary writer is flushed after logging all metrics.
         """
+
+        class Tensor: ...
+
+        try:
+            from torch import Tensor
+        except ModuleNotFoundError:
+            ...
         summary_writer = self.get_board()
         for key, value in metrics.items():
             try:
@@ -537,7 +551,7 @@ class TrainArguments:
                         tuple,
                         np.ndarray,
                         jnp.ndarray,
-                        "torch.Tensor",
+                        Tensor,
                     ),
                 ):
                     if hasattr(value, "cpu"):

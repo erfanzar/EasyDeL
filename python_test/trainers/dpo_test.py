@@ -88,7 +88,7 @@ def main():
     dtype = jnp.bfloat16
 
     # assert len(jax.devices("cpu")) == 8, "XLA Device manipulation failed."
-    with jax.default_device(jax.devices("gpu")[0]):
+    with jax.default_device(jax.devices("cpu")[0]):
         model_name_or_path = "erfanzar/LLamaStory-70M"
         conf = LlamaConfig(
             hidden_size=128,
