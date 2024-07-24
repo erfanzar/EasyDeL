@@ -742,6 +742,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
             current_step = int(jax.device_get(sharded_state.step))
             loss_sum = None
             accuracy_sum = None
+            filename = None
             pbar.update(sharded_state.step.tolist())  # type: ignore
 
             model_parameters_number = (
