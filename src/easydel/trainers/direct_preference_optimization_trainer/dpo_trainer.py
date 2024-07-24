@@ -1299,6 +1299,7 @@ class DPOTrainer(BaseTrainer, ABC):
                 loss_sum = None
                 chosen_rewards_sum = None
                 rejected_rewards_sum = None
+                filename = None
 
                 try:
                     for epoch_index in range(self.arguments.num_train_epochs):

@@ -1124,6 +1124,7 @@ class ORPOTrainer(BaseTrainer, ABC):
                 )
 
                 loss_sum = None
+                filename = None
 
                 try:
                     for epoch_index in range(self.arguments.num_train_epochs):

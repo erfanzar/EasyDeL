@@ -366,6 +366,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
             current_step = int(jax.device_get(sharded_state.step))
 
             loss_sum = None
+            filename = None
             vision_loss_sum = None
             vision_accuracy_sum = None
             text_loss_sum = None
