@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, Literal, Mapping, Optional, Union
 
 import flax.core
 import jax
+import numpy as np
 import termcolor
 from fjformer.sharding import make_shard_and_gather_fns, match_partition_rules
 from jax import numpy as jnp
@@ -388,9 +389,16 @@ class DPOTrainer(BaseTrainer, ABC):
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
         if dataset_map_arguments is None:
             dataset_map_arguments = {}
-        train_dataset = train_dataset.map(self.tokenize_row, **dataset_map_arguments)
-        if eval_dataset is not None:
-            eval_dataset = eval_dataset.map(self.tokenize_row, **dataset_map_arguments)
+        with jax.default_device(jax.devices("cpu")[0]):
+            train_dataset = train_dataset.map(
+                self.tokenize_row,
+                **dataset_map_arguments,
+            )
+            if eval_dataset is not None:
+                eval_dataset = eval_dataset.map(
+                    self.tokenize_row,
+                    **dataset_map_arguments,
+                )
 
         self.arguments = arguments
         self.hp_name = None
@@ -1068,30 +1076,29 @@ class DPOTrainer(BaseTrainer, ABC):
 
     def _create_sequence_tokens(self, tokens: Dict) -> Dict:
         sequence_tokens = {
-            k: jnp.concatenate((tokens[f"prompt_{k}"], tokens[k]), axis=-1)
+            k: np.concatenate((tokens[f"prompt_{k}"], tokens[k]), axis=-1)
             for k in ["input_ids", "attention_mask"]
         }
-        sequence_tokens["labels"] = (
-            sequence_tokens["input_ids"]
-            .at[: len(tokens["prompt_input_ids"])]
-            .set(self.label_pad_token_id)
+        sequence_tokens["labels"] = sequence_tokens["input_ids"]
+        sequence_tokens["labels"][: len(tokens["prompt_input_ids"])] = (
+            self.label_pad_token_id
         )
         return sequence_tokens
 
     def _add_special_tokens(
-        self, array: jnp.ndarray, token: int = None, end: bool = False
-    ) -> jnp.ndarray:
+        self, array: np.ndarray, token: int = None, end: bool = False
+    ) -> np.ndarray:
         token = (
             token
             if token is not None
             else (self.tokenizer.eos_token_id if end else self.tokenizer.bos_token_id)
         )
-        special_token = jnp.array(token).reshape(1, 1)
-        array = jnp.atleast_2d(array)
+        special_token = np.array(token).reshape(1, 1)
+        array = np.atleast_2d(array)
         return (
-            jnp.concatenate((special_token, array), axis=-1)
+            np.concatenate((special_token, array), axis=-1)
             if not end
-            else jnp.concatenate((array, special_token), axis=-1)
+            else np.concatenate((array, special_token), axis=-1)
         )
 
     def _add_to_batch(self, batch: Dict, prefix: str, tokens: Dict) -> None:
@@ -1103,13 +1110,17 @@ class DPOTrainer(BaseTrainer, ABC):
             pad_value = 0 if type_key == "attention_mask" else self.padding_value
 
             token_array = pad_to_length(
-                token_array, max_length, pad_value=pad_value, axis=-1
+                token_array.astype("i4"),
+                max_length,
+                pad_value=pad_value,
+                axis=-1,
             )
             token_array = token_array[..., :max_length]
 
             if token_array.shape[-1] != max_length:
                 raise ValueError(
-                    f"Padding error for {prefix}{type_key}. Expected length {max_length}, got {token_array.shape[-1]}"
+                    f"Padding error for {prefix}{type_key}. Expected length "
+                    f"{max_length}, got {token_array.shape[-1]}"
                 )
 
             batch[f"{prefix}{type_key}"] = token_array
@@ -1134,12 +1145,12 @@ class DPOTrainer(BaseTrainer, ABC):
         answer_attention_mask = full_tokenized["attention_mask"][
             len(prompt_input_ids) :
         ]
-        prompt_input_ids = jnp.asarray(prompt_input_ids, dtype="i4")
-        answer_input_ids = jnp.asarray(answer_input_ids, dtype="i4")
-        full_concat_input_ids = jnp.concatenate((prompt_input_ids, answer_input_ids))
+        prompt_input_ids = np.asarray(prompt_input_ids, dtype="i4")
+        answer_input_ids = np.asarray(answer_input_ids, dtype="i4")
+        full_concat_input_ids = np.concatenate((prompt_input_ids, answer_input_ids))
 
         # Prepare input tokens for token by token comparison
-        full_input_ids = jnp.array(full_tokenized["input_ids"])
+        full_input_ids = np.array(full_tokenized["input_ids"])
 
         if len(full_input_ids) != len(full_concat_input_ids):
             raise ValueError(
@@ -1169,10 +1180,10 @@ class DPOTrainer(BaseTrainer, ABC):
         ]
 
         return dict(
-            prompt_input_ids=jnp.array(prompt_input_ids, dtype="i4"),
-            prompt_attention_mask=jnp.array(prompt_attention_mask, dtype="i4"),
-            input_ids=jnp.array(answer_input_ids, dtype="i4"),
-            attention_mask=jnp.array(answer_attention_mask, dtype="i4"),
+            prompt_input_ids=np.array(prompt_input_ids, dtype="i4"),
+            prompt_attention_mask=np.array(prompt_attention_mask, dtype="i4"),
+            input_ids=np.array(answer_input_ids, dtype="i4"),
+            attention_mask=np.array(answer_attention_mask, dtype="i4"),
         )
 
     def compute_reference_log_probs(

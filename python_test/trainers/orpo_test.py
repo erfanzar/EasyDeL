@@ -41,7 +41,7 @@ def orpo_main():
     #####################
     # Model & Tokenizer #
     #####################
-    with jax.default_device(jax.devices("cpu")[0]):
+    with jax.default_device(jax.devices("gpu")[0]):
         model_name_or_path = "erfanzar/LLamaStory-70M"
         conf = MistralConfig(
             hidden_size=128,
@@ -93,6 +93,7 @@ def orpo_main():
         max_completion_length=SEQUENCE_LENGTH * 2,
         train_dataset=train_dataset,
         tokenizer=tokenizer,
+        dataset_num_proc=4,
         arguments=TrainArguments(
             model_name="ORPO_TEST",
             num_train_epochs=NUM_TRAIN_EPOCHS,

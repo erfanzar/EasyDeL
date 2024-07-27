@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Union
 
 import flax.core
 import jax
+import numpy as np
 import termcolor
 from fjformer.sharding import make_shard_and_gather_fns, match_partition_rules
 from flax.core import FrozenDict
@@ -201,13 +202,18 @@ class ORPOTrainer(BaseTrainer, ABC):
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
         if dataset_map_arguments is None:
             dataset_map_arguments = {}
-        train_dataset = train_dataset.map(
-            self.tokenize_row, num_proc=dataset_num_proc, **dataset_map_arguments
-        )
-        if eval_dataset is not None:
-            eval_dataset = eval_dataset.map(
-                self.tokenize_row, num_proc=dataset_num_proc, **dataset_map_arguments
+        with jax.default_device(jax.devices("cpu")[0]):
+            train_dataset = train_dataset.map(
+                self.tokenize_row,
+                num_proc=dataset_num_proc,
+                **dataset_map_arguments,
             )
+            if eval_dataset is not None:
+                eval_dataset = eval_dataset.map(
+                    self.tokenize_row,
+                    num_proc=dataset_num_proc,
+                    **dataset_map_arguments,
+                )
 
         self.arguments = arguments
         self.hp_name = None
@@ -266,12 +272,12 @@ class ORPOTrainer(BaseTrainer, ABC):
         answer_attention_mask = full_tokenized["attention_mask"][
             len(prompt_input_ids) :
         ]
-        prompt_input_ids = jnp.asarray(prompt_input_ids, dtype="i4")
-        answer_input_ids = jnp.asarray(answer_input_ids, dtype="i4")
-        full_concat_input_ids = jnp.concatenate((prompt_input_ids, answer_input_ids))
+        prompt_input_ids = np.asarray(prompt_input_ids, dtype="i4")
+        answer_input_ids = np.asarray(answer_input_ids, dtype="i4")
+        full_concat_input_ids = np.concatenate((prompt_input_ids, answer_input_ids))
 
         # Prepare input tokens for token by token comparison
-        full_input_ids = jnp.array(full_tokenized["input_ids"])
+        full_input_ids = np.array(full_tokenized["input_ids"])
 
         if len(full_input_ids) != len(full_concat_input_ids):
             raise ValueError(
@@ -301,10 +307,10 @@ class ORPOTrainer(BaseTrainer, ABC):
         ]
 
         return dict(
-            prompt_input_ids=jnp.array(prompt_input_ids, dtype="i4"),
-            prompt_attention_mask=jnp.array(prompt_attention_mask, dtype="i4"),
-            input_ids=jnp.array(answer_input_ids, dtype="i4"),
-            attention_mask=jnp.array(answer_attention_mask, dtype="i4"),
+            prompt_input_ids=np.array(prompt_input_ids, dtype="i4"),
+            prompt_attention_mask=np.array(prompt_attention_mask, dtype="i4"),
+            input_ids=np.array(answer_input_ids, dtype="i4"),
+            attention_mask=np.array(answer_attention_mask, dtype="i4"),
         )
 
     def tokenize_row(self, feature, state: EasyDeLState = None) -> Dict:
@@ -350,13 +356,24 @@ class ORPOTrainer(BaseTrainer, ABC):
         if not isinstance(rejected, str):
             raise ValueError(f"rejected should be an str but got {type(rejected)}")
         rejected_tokens = self.build_tokenized_answer(prompt, rejected)
-        v2d = lambda ar: ar.reshape(1, -1) if ar.ndim == 1 else ar  # noqa
 
         def add_tkn(n, ar):
-            return jnp.concatenate((jnp.array(n).reshape(1, 1), v2d(ar)), axis=-1)
+            return np.concatenate(
+                (
+                    np.array(n).reshape(1, 1).astype("i4"),
+                    np.atleast_2d(ar).astype("i4"),
+                ),
+                axis=-1,
+            )
 
         def add_post_tkn(n, ar):
-            return jnp.concatenate((v2d(ar), jnp.array(n).reshape(1, 1)), axis=-1)
+            return np.concatenate(
+                (
+                    np.atleast_2d(ar).astype("i4"),
+                    np.array(n).reshape(1, 1).astype("i4"),
+                ),
+                axis=-1,
+            )
 
         prompt_tokens["prompt_input_ids"] = add_tkn(
             self.tokenizer.bos_token_id, prompt_tokens["prompt_input_ids"]
@@ -425,29 +442,34 @@ class ORPOTrainer(BaseTrainer, ABC):
                     ]
 
         chosen_sequence_tokens = {
-            k: jnp.concatenate(
-                (v2d(chosen_tokens[f"prompt_{k}"]), v2d(chosen_tokens[k])), axis=-1
+            k: np.concatenate(
+                (
+                    np.atleast_2d(chosen_tokens[f"prompt_{k}"]).astype("i4"),
+                    np.atleast_2d(chosen_tokens[k]).astype("i4"),
+                ),
+                axis=-1,
             )
             for k in ["input_ids", "attention_mask"]
         }
         rejected_sequence_tokens = {
-            k: jnp.concatenate(
-                (v2d(rejected_tokens[f"prompt_{k}"]), v2d(rejected_tokens[k])), axis=-1
+            k: np.concatenate(
+                (
+                    np.atleast_2d(rejected_tokens[f"prompt_{k}"]).astype("i4"),
+                    np.atleast_2d(rejected_tokens[k]).astype("i4"),
+                ),
+                axis=-1,
             )
             for k in ["input_ids", "attention_mask"]
         }
         chosen_sequence_tokens["labels"] = chosen_sequence_tokens["input_ids"][:]
-        chosen_sequence_tokens["labels"] = (
-            chosen_sequence_tokens["labels"]
-            .at[: len(chosen_tokens["prompt_input_ids"])]
-            .set([self.label_pad_token_id] * len(chosen_tokens["prompt_input_ids"]))
-        )
+        chosen_sequence_tokens["labels"][: len(chosen_tokens["prompt_input_ids"])] = [
+            self.label_pad_token_id
+        ] * len(chosen_tokens["prompt_input_ids"])
+
         rejected_sequence_tokens["labels"] = rejected_sequence_tokens["input_ids"][:]
-        rejected_sequence_tokens["labels"] = (
-            rejected_sequence_tokens["labels"]
-            .at[: len(rejected_tokens["prompt_input_ids"])]
-            .set(([self.label_pad_token_id] * len(rejected_tokens["prompt_input_ids"])))
-        )
+        rejected_sequence_tokens["labels"][
+            : len(rejected_tokens["prompt_input_ids"])
+        ] = [self.label_pad_token_id] * len(rejected_tokens["prompt_input_ids"])
 
         for k, tokens_ in {
             "chosen_": chosen_sequence_tokens,
@@ -1134,6 +1156,8 @@ class ORPOTrainer(BaseTrainer, ABC):
                                 ...
                             elif current_step < self.max_training_steps:
                                 time_start = time.time()
+                                # for k, v in batch.items():
+                                #     print(k, v.shape)
                                 self.model_state, outputs = (
                                     self.sharded_train_step_function(
                                         self.model_state, batch
