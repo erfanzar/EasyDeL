@@ -133,7 +133,7 @@ def main():
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
-        train_dataset = get_hh("train[:15%]", sanity_check=True)
+        train_dataset = get_hh("train[:17%]", sanity_check=True)
         eval_dataset = get_hh("test[:10%]", sanity_check=True)
 
         module = FlaxLlamaForCausalLM(
