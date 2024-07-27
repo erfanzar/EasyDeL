@@ -88,7 +88,7 @@ def main():
     dtype = jnp.bfloat16
 
     # assert len(jax.devices("cpu")) == 8, "XLA Device manipulation failed."
-    with jax.default_device(jax.devices("cpu")[0]):
+    with jax.default_device(jax.devices("gpu")[0]):
         model_name_or_path = "erfanzar/LLamaStory-70M"
         conf = LlamaConfig(
             hidden_size=128,
@@ -133,7 +133,7 @@ def main():
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
-        train_dataset = get_hh("train[:10%]", sanity_check=True)
+        train_dataset = get_hh("train[:15%]", sanity_check=True)
         eval_dataset = get_hh("test[:10%]", sanity_check=True)
 
         module = FlaxLlamaForCausalLM(
@@ -177,7 +177,7 @@ def main():
             max_length=max_length,
             max_target_length=max_target_length,
             max_prompt_length=max_prompt_length,
-            # dataset_map_arguments={"num_proc": os.cpu_count()},
+            dataset_map_arguments={"num_proc": 4},
         )
 
         dpo_trainer.train()
