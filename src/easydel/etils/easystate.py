@@ -4,6 +4,7 @@ import os
 from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import fjformer
+import fjformer.checkpoint
 import jax.tree_util
 import optax
 from fjformer.custom_array import Array8Bit
@@ -789,7 +790,7 @@ class EasyDeLState(struct.PyTreeNode):
         Raises:
             EasyDeLRuntimeError: If `shard_fns` and `rules` are both None and the model does not have a `module_config`.
         """
-        dtype = fjformer.get_dtype(dtype)
+        dtype = fjformer.checkpoint.get_dtype(dtype)
         if shard_fns is None and self.module_config is None and rules is None:
             raise EasyDeLRuntimeError(
                 "the model doesn't carrying `module_config` you should pass `shard_fns` or `rules`"
