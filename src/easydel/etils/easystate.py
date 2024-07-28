@@ -621,7 +621,7 @@ class EasyDeLState(struct.PyTreeNode):
         sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
         partition_axis: PartitionAxis = PartitionAxis(),
         shard_attention_computation: bool = True,
-        auto_shard_params:bool=False,
+        auto_shard_params: bool = False,
         input_shape: Sequence[int] = (1, 1),
         backend: Optional[str] = None,
         init_optimizer_state: bool = False,
@@ -791,26 +791,40 @@ class EasyDeLState(struct.PyTreeNode):
             EasyDeLRuntimeError: If `shard_fns` and `rules` are both None and the model does not have a `module_config`.
         """
         dtype = fjformer.checkpoint.get_dtype(dtype)
-        if shard_fns is None and self.module_config is None and rules is None:
-            raise EasyDeLRuntimeError(
-                "the model doesn't carrying `module_config` you should pass `shard_fns` or `rules`"
-            )
-        elif shard_fns is None and rules is not None or self.module_config is not None:
-            from fjformer import make_shard_and_gather_fns, match_partition_rules
 
-            rules = rules or self.module_config.get_partition_rules(
-                fully_sharded_data_parallel
-            )
-            partition_specs = match_partition_rules(rules=rules, params=self.params)
-            shard_fns, gather_fns = make_shard_and_gather_fns(
-                partition_specs=partition_specs, mesh=mesh
-            )
         if mesh is None:
             mesh = self.module_config.mesh
+        assert mesh is not None, "consider passing mesh"
         with mesh:
-            return self.replace(
-                params=jax.tree_util.tree_map(lambda f, p: f(p), shard_fns, self.params)
-            )
+            if shard_fns is None and self.module_config is None and rules is None:
+                raise EasyDeLRuntimeError(
+                    "the model doesn't carrying `module_config` you should pass `shard_fns` or `rules`"
+                )
+            elif (
+                shard_fns is None
+                and rules is not None
+                or self.module_config is not None
+            ):
+                from fjformer import make_shard_and_gather_fns, match_partition_rules
+
+                rules = rules or self.module_config.get_partition_rules(
+                    fully_sharded_data_parallel
+                )
+                partition_specs = match_partition_rules(
+                    rules=rules,
+                    params=self.params,
+                )
+                shard_fns, gather_fns = make_shard_and_gather_fns(
+                    partition_specs=partition_specs,
+                    mesh=mesh,
+                )
+                return self.replace(
+                    params=jax.tree_util.tree_map(
+                        lambda f, p: f(p),
+                        shard_fns,
+                        self.params,
+                    )
+                )
 
     @staticmethod
     def create_hyperparameters(model_type: str):
