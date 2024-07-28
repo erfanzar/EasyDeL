@@ -68,20 +68,11 @@ def orpo_main():
     #################
     # Dataset       #
     #################
-    ds = load_dataset("orpo-explorers/OpenHermesPreferences-10k", split="train[:1%]")
+    train_dataset = load_dataset(
+        "orpo-explorers/OpenHermesPreferences-10k", split="train[:3%]"
+    )
     if tokenizer.chat_template is None:
         tokenizer.chat_template = "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
-
-    def process(row):
-        row["chosen"] = tokenizer.apply_chat_template(row["chosen"], tokenize=False)
-        row["rejected"] = tokenizer.apply_chat_template(row["rejected"], tokenize=False)
-        return row
-
-    train_dataset = ds.map(
-        process,
-        # num_proc=multiprocessing.cpu_count(),
-        load_from_cache_file=False,
-    )
 
     ################
     # Training     #
@@ -94,6 +85,7 @@ def orpo_main():
         train_dataset=train_dataset,
         tokenizer=tokenizer,
         dataset_num_proc=4,
+        apply_chat_template=True,
         arguments=TrainArguments(
             model_name="ORPO_TEST",
             num_train_epochs=NUM_TRAIN_EPOCHS,
@@ -114,11 +106,18 @@ def orpo_main():
             learning_rate=5e-4,
             do_last_save=True,
             init_input_shape=(8, 8),
+            # max_training_steps=1
         ),
     )
 
-    trainer.train(
-        model_parameters=FrozenDict({"params": model.shard_params(model.params)})
+    out = trainer.train(  # noqa
+        model_parameters=FrozenDict(
+            {
+                "params": model.shard_params(
+                    model.params,
+                ),
+            },
+        )
     )
 
 

@@ -770,7 +770,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
                         except StopIteration:
                             train_iter = iter(self.dataloader_train)
                             batch = next(train_iter)
-                        current_step += 1
                         if (
                             self.arguments.step_start_point is not None
                             and self.arguments.step_start_point > current_step
@@ -809,10 +808,10 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                     else accuracy_sum + accuracy
                                 )
                                 mean_loss = loss_sum / (
-                                    current_step - self.arguments.step_start_point
+                                    (current_step + 1) - self.arguments.step_start_point
                                 )
                                 mean_accuracy = accuracy_sum / (
-                                    current_step - self.arguments.step_start_point
+                                    (current_step + 1) - self.arguments.step_start_point
                                 )
                                 perplexity = jnp.exp(loss)
                                 calculating_metrics_end = time.time()
@@ -885,6 +884,8 @@ class CausalLanguageModelTrainer(BaseTrainer):
                             )
                         else:
                             break
+
+                        current_step += 1
                         if (
                             self.arguments.save_steps is not None
                             and current_step % self.arguments.save_steps == 0
@@ -910,6 +911,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                                         force_color=True,
                                     ),
                                 )
+
             except KeyboardInterrupt:
                 termcolor.cprint(
                     "KeyboardInterrupt At training model Will return Current State of the Model with Parameters.",
@@ -1012,7 +1014,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     except StopIteration:
                         eval_iter = iter(self.dataloader_eval)
                         batch = next(eval_iter)
-                    current_step += 1
                     time_start = time.time()
                     for key in self.arguments.ids_to_pop_from_dataset:
                         _ = batch.pop(key, None)
@@ -1031,9 +1032,9 @@ class CausalLanguageModelTrainer(BaseTrainer):
                     eval_metrics = {
                         "eval/loss": loss.tolist(),
                         "eval/mean_loss": loss_sum
-                        / (current_step - self.arguments.step_start_point),
+                        / ((current_step + 1) - self.arguments.step_start_point),
                         "eval/mean_accuracy_sum": accuracy_sum
-                        / (current_step - self.arguments.step_start_point),
+                        / ((current_step + 1) - self.arguments.step_start_point),
                         "eval/step": current_step,
                         "eval/step_time": total_time,
                         "eval/perplexity": jnp.exp(loss).tolist(),
@@ -1050,6 +1051,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
                         **{k.replace("eval/", ""): v for k, v in log_metrics.items()}
                     )
                     yield log_metrics
+                    current_step += 1
             except KeyboardInterrupt:
                 termcolor.cprint(
                     "KeyboardInterrupt At Evaluation model Will return Nothing and just pass.",
