@@ -388,7 +388,6 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
             try:
                 for epoch in range(self.arguments.num_train_epochs):
                     for batch in self.dataloader_train:
-                        current_step += 1
                         if (
                             self.arguments.step_start_point is not None
                             and self.arguments.step_start_point > current_step
@@ -454,8 +453,8 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                             )
 
                             total_roved_steps = (
-                                current_step - self.arguments.step_start_point
-                            )
+                                current_step + 1
+                            ) - self.arguments.step_start_point
 
                             with jax.spmd_mode("allow_all"):
                                 train_metrics = {
@@ -502,6 +501,8 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                             )
                         else:
                             break
+
+                        current_step += 1
                         if (
                             self.arguments.save_steps is not None
                             and current_step % self.arguments.save_steps == 0
@@ -625,7 +626,6 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
             )
             try:
                 for batch in self.dataloader_eval:
-                    current_step += 1
                     time_start = time.time()
                     for key in self.arguments.ids_to_pop_from_dataset:
                         _ = batch.pop(key, None)
@@ -664,7 +664,9 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                         else (text_accuracy_sum + text_accuracy)
                     )
 
-                    total_roved_steps = current_step - self.arguments.step_start_point
+                    total_roved_steps = (
+                        current_step + 1
+                    ) - self.arguments.step_start_point
 
                     eval_metrics = {
                         "eval/loss": loss.tolist(),
@@ -693,6 +695,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
                         **{k.replace("eval/", ""): v for k, v in log_metrics.items()}
                     )
                     yield eval_metrics
+                    current_step += 1
             except KeyboardInterrupt:
                 termcolor.cprint(
                     "KeyboardInterrupt At Evaluation model Will return Nothing and just pass.",

@@ -29,7 +29,6 @@ from easydel.trainers.base_trainer import (
 from easydel.trainers.direct_preference_optimization_trainer.utils import (
     DPODataCollatorWithPadding,
     leave_alone_context_manager,
-    pad_to_length,
 )
 from easydel.trainers.odds_ratio_preference_optimization_trainer.fwd_bwd_functions import (
     create_orpo_concatenated_forward,
@@ -113,6 +112,7 @@ class ORPOTrainer(BaseTrainer, ABC):
         _do_init_fns: bool = True,
         dataset_map_arguments: Optional[Dict[str, Any]] = None,
         low_mem_usage: bool = False,
+        apply_chat_template: bool = False,
     ):
         """
         Initializes the ORPOTrainer.
@@ -135,6 +135,7 @@ class ORPOTrainer(BaseTrainer, ABC):
             _do_init_fns (bool, optional): Whether to automatically initialize trainer functions. Defaults to True.
             dataset_map_arguments (Optional[Dict[str, Any]], optional): Arguments to pass to the dataset `map` function for tokenization. Defaults to None.
             low_mem_usage (bool, optional): Whether to prioritize low memory usage during training. Defaults to False.
+            apply_chat_template (bool): Whether to apply chat template from tokenizer on `rejected` and `chosen` fields in dataset.
 
         Raises:
             ValueError: If `arguments` is not provided or is not a `TrainArguments` instance, or if `tokenizer` is not provided.
@@ -188,6 +189,7 @@ class ORPOTrainer(BaseTrainer, ABC):
         self.low_mem_usage = low_mem_usage
         self.beta = beta
         self.dataset_num_proc = dataset_num_proc
+        self.apply_chat_template = apply_chat_template
         data_collator = (
             DPODataCollatorWithPadding(
                 max_prompt_length=self.max_prompt_length,
@@ -249,51 +251,45 @@ class ORPOTrainer(BaseTrainer, ABC):
             _do_init_fns=_do_init_fns,
         )
 
-    def build_tokenized_answer(self, prompt, answer):
+    def build_tokenized_answer(self, prompt: str, answer: str) -> Dict[str, np.ndarray]:
         """
         Tokenizes a prompt and answer pair, handling special tokens and padding/truncation.
-
-        This method tokenizes the prompt and answer separately, then concatenates them
-        while ensuring correct token alignment. It also handles adding special tokens
-        (BOS and EOS) and padding/truncating sequences to the appropriate lengths.
 
         Args:
             prompt (str): The prompt text.
             answer (str): The answer text.
 
         Returns:
-            Dict: A dictionary containing the tokenized prompt and answer, along with attention masks.
-        """
+            Dict[str, np.ndarray]: A dictionary containing the tokenized prompt and answer, along with attention masks.
 
+        Raises:
+            ValueError: If there's a mismatch in token lengths.
+        """
         full_tokenized = self.tokenizer(prompt + answer, add_special_tokens=False)
         prompt_input_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
 
-        answer_input_ids = full_tokenized["input_ids"][len(prompt_input_ids) :]
-        answer_attention_mask = full_tokenized["attention_mask"][
-            len(prompt_input_ids) :
-        ]
-        prompt_input_ids = np.asarray(prompt_input_ids, dtype="i4")
-        answer_input_ids = np.asarray(answer_input_ids, dtype="i4")
-        full_concat_input_ids = np.concatenate((prompt_input_ids, answer_input_ids))
-
-        # Prepare input tokens for token by token comparison
+        # Convert to numpy arrays for consistency
         full_input_ids = np.array(full_tokenized["input_ids"])
-
-        if len(full_input_ids) != len(full_concat_input_ids):
-            raise ValueError(
-                "Prompt input ids and answer input ids should have the same length."
-            )
+        prompt_input_ids = np.array(prompt_input_ids)
 
         response_token_ids_start_idx = len(prompt_input_ids)
-        if (
-            prompt_input_ids.tolist()
-            != full_tokenized["input_ids"][:response_token_ids_start_idx]
+
+        # Check for potential off-by-one error
+        if not np.array_equal(
+            prompt_input_ids, full_input_ids[:response_token_ids_start_idx]
         ):
             response_token_ids_start_idx -= 1
+            if not np.array_equal(
+                prompt_input_ids, full_input_ids[:response_token_ids_start_idx]
+            ):
+                raise ValueError("Mismatch in prompt tokenization")
 
-        prompt_input_ids = full_tokenized["input_ids"][:response_token_ids_start_idx]
         prompt_attention_mask = full_tokenized["attention_mask"][
             :response_token_ids_start_idx
+        ]
+        answer_input_ids = full_input_ids[response_token_ids_start_idx:]
+        answer_attention_mask = full_tokenized["attention_mask"][
+            response_token_ids_start_idx:
         ]
 
         if len(prompt_input_ids) != len(prompt_attention_mask):
@@ -301,19 +297,18 @@ class ORPOTrainer(BaseTrainer, ABC):
                 "Prompt input ids and attention mask should have the same length."
             )
 
-        answer_input_ids = full_tokenized["input_ids"][response_token_ids_start_idx:]
-        answer_attention_mask = full_tokenized["attention_mask"][
-            response_token_ids_start_idx:
-        ]
+        return {
+            "prompt_input_ids": prompt_input_ids.astype(np.int32),
+            "prompt_attention_mask": np.array(prompt_attention_mask, dtype=np.int32),
+            "input_ids": answer_input_ids.astype(np.int32),
+            "attention_mask": np.array(answer_attention_mask, dtype=np.int32),
+        }
 
-        return dict(
-            prompt_input_ids=np.array(prompt_input_ids, dtype="i4"),
-            prompt_attention_mask=np.array(prompt_attention_mask, dtype="i4"),
-            input_ids=np.array(answer_input_ids, dtype="i4"),
-            attention_mask=np.array(answer_attention_mask, dtype="i4"),
-        )
-
-    def tokenize_row(self, feature, state: EasyDeLState = None) -> Dict:
+    def tokenize_row(
+        self,
+        feature: Dict[str, str],
+        state: Optional[object] = None,
+    ) -> Dict[str, np.ndarray]:
         """
         Tokenizes a single row of data from the ORPO dataset.
 
@@ -331,241 +326,146 @@ class ORPOTrainer(BaseTrainer, ABC):
         Raises:
             ValueError: If the input data types are incorrect.
         """
+        prompt = self._validate_input(feature, "prompt")
+        chosen = self._validate_input(feature, "chosen")
+        rejected = self._validate_input(feature, "rejected")
+
+        prompt_tokens = self._tokenize_prompt(prompt)
+        chosen_tokens = self._tokenize_answer(prompt, chosen)
+        rejected_tokens = self._tokenize_answer(prompt, rejected)
+
+        chosen_sequence = self._create_sequence(prompt_tokens, chosen_tokens)
+        rejected_sequence = self._create_sequence(prompt_tokens, rejected_tokens)
+
+        return self._prepare_final_batch(
+            prompt_tokens,
+            chosen_sequence,
+            rejected_sequence,
+        )
+
+    def _validate_input(self, feature: Dict[str, str], key: str) -> str:
+        """Validates input and returns the corresponding value."""
+        value = feature[key]
+        if self.apply_chat_template and key in ["chosen", "rejected"]:
+            value = self.tokenizer.apply_chat_template(value, tokenize=False)
+        if not isinstance(value, str):
+            raise ValueError(f"{key} should be a string but got {type(value)}")
+        return value
+
+    def _tokenize_prompt(self, prompt: str) -> Dict[str, np.ndarray]:
+        """Tokenizes the prompt."""
+        tokens = self.tokenizer(prompt, add_special_tokens=False, return_tensors="np")
+        return {f"prompt_{k}": v for k, v in tokens.items()}
+
+    def _tokenize_answer(self, prompt: str, answer: str) -> Dict[str, np.ndarray]:
+        """Tokenizes the answer in context of the prompt."""
+        full_tokenized = self.tokenizer(prompt + answer, add_special_tokens=False)
+        prompt_length = len(
+            self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        )
+
+        return {
+            "prompt_input_ids": np.array(
+                full_tokenized["input_ids"][:prompt_length], dtype=np.int32
+            ),
+            "prompt_attention_mask": np.array(
+                full_tokenized["attention_mask"][:prompt_length], dtype=np.int32
+            ),
+            "input_ids": np.array(
+                full_tokenized["input_ids"][prompt_length:], dtype=np.int32
+            ),
+            "attention_mask": np.array(
+                full_tokenized["attention_mask"][prompt_length:], dtype=np.int32
+            ),
+        }
+
+    def _create_sequence(
+        self,
+        prompt_tokens: Dict[str, np.ndarray],
+        answer_tokens: Dict[str, np.ndarray],
+    ) -> Dict[str, np.ndarray]:
+        """Creates a full sequence by combining prompt and answer tokens."""
+        sequence = {}
+        for key in ["input_ids", "attention_mask"]:
+            sequence[key] = np.concatenate(
+                [
+                    self._add_special_token(
+                        prompt_tokens[f"prompt_{key}"],
+                        self.tokenizer.bos_token_id,
+                        start=True,
+                    ),
+                    self._add_special_token(
+                        answer_tokens[key],
+                        self.tokenizer.eos_token_id,
+                        start=False,
+                    ),
+                ],
+                axis=1,
+            )
+        sequence["labels"] = self._create_labels(
+            sequence["input_ids"], len(prompt_tokens["prompt_input_ids"])
+        )
+        return sequence
+
+    def _add_special_token(
+        self,
+        array: np.ndarray,
+        token_id: int,
+        start: bool,
+    ) -> np.ndarray:
+        """Adds a special token to the start or end of an array."""
+        token = np.array([[token_id]], dtype=np.int32)
+        array = np.atleast_2d(array)
+        return np.concatenate([token, array] if start else [array, token], axis=1)
+
+    def _create_labels(self, input_ids: np.ndarray, prompt_length: int) -> np.ndarray:
+        """Creates labels for the sequence, masking the prompt part."""
+        labels = input_ids.copy()
+        labels[:, :prompt_length] = self.label_pad_token_id
+        return labels
+
+    def _prepare_final_batch(
+        self,
+        prompt_tokens: Dict[str, np.ndarray],
+        chosen_sequence: Dict[str, np.ndarray],
+        rejected_sequence: Dict[str, np.ndarray],
+    ) -> Dict[str, np.ndarray]:
+        """Prepares the final batch by padding and truncating sequences."""
         batch = {}
-        prompt = feature["prompt"]
-        chosen = feature["chosen"]
-        rejected = feature["rejected"]
-
-        if not isinstance(prompt, str):
-            raise ValueError(
-                f"prompt should be an str but got {type(prompt)} , {prompt}"
-            )
-        prompt_tokens = self.tokenizer(
-            prompt,
-            add_special_tokens=False,
-            return_tensors="np",
-        )
-        prompt_tokens = {f"prompt_{k}": v for k, v in prompt_tokens.items()}
-
-        if not isinstance(chosen, str):
-            raise ValueError(
-                f"chosen should be an str but got {type(chosen)} , {chosen}"
-            )
-        chosen_tokens = self.build_tokenized_answer(prompt, chosen)
-
-        if not isinstance(rejected, str):
-            raise ValueError(f"rejected should be an str but got {type(rejected)}")
-        rejected_tokens = self.build_tokenized_answer(prompt, rejected)
-
-        def add_tkn(n, ar):
-            return np.concatenate(
-                (
-                    np.array(n).reshape(1, 1).astype("i4"),
-                    np.atleast_2d(ar).astype("i4"),
-                ),
-                axis=-1,
-            )
-
-        def add_post_tkn(n, ar):
-            return np.concatenate(
-                (
-                    np.atleast_2d(ar).astype("i4"),
-                    np.array(n).reshape(1, 1).astype("i4"),
-                ),
-                axis=-1,
-            )
-
-        prompt_tokens["prompt_input_ids"] = add_tkn(
-            self.tokenizer.bos_token_id, prompt_tokens["prompt_input_ids"]
-        )
-        chosen_tokens["prompt_input_ids"] = add_tkn(
-            self.tokenizer.bos_token_id, chosen_tokens["prompt_input_ids"]
-        )
-        rejected_tokens["prompt_input_ids"] = add_tkn(
-            self.tokenizer.bos_token_id, rejected_tokens["prompt_input_ids"]
-        )
-
-        prompt_tokens["prompt_attention_mask"] = add_tkn(
-            1, prompt_tokens["prompt_attention_mask"]
-        )
-        chosen_tokens["prompt_attention_mask"] = add_tkn(
-            1, chosen_tokens["prompt_attention_mask"]
-        )
-        rejected_tokens["prompt_attention_mask"] = add_tkn(
-            1, rejected_tokens["prompt_attention_mask"]
-        )
-
-        # add EOS token to end of answer
-        chosen_tokens["input_ids"] = add_post_tkn(
-            self.tokenizer.eos_token_id, chosen_tokens["input_ids"]
-        )
-        chosen_tokens["attention_mask"] = add_post_tkn(
-            1, chosen_tokens["attention_mask"]
-        )
-
-        rejected_tokens["input_ids"] = add_post_tkn(
-            self.tokenizer.eos_token_id, rejected_tokens["input_ids"]
-        )
-        rejected_tokens["attention_mask"] = add_post_tkn(
-            1, rejected_tokens["attention_mask"]
-        )
-
-        longer_response_length = max(
-            chosen_tokens["input_ids"].shape[-1], rejected_tokens["input_ids"].shape[-1]
-        )
-
-        # if combined sequence is too long, truncate the prompt
-        for answer_tokens in [chosen_tokens, rejected_tokens, prompt_tokens]:
-            length_rn = (
-                answer_tokens["prompt_input_ids"].shape[-1] + longer_response_length
-            )
-            if length_rn > self.max_length:
-                if self.truncation_mode == "keep_start":
-                    for k in ["prompt_input_ids", "prompt_attention_mask"]:
-                        answer_tokens[k] = answer_tokens[k][:, : self.max_prompt_length]
-                elif self.truncation_mode == "keep_end":
-                    for k in ["prompt_input_ids", "prompt_attention_mask"]:
-                        answer_tokens[k] = answer_tokens[k][
-                            :, -self.max_prompt_length :
-                        ]
-                else:
-                    raise ValueError(f"Unknown truncation mode: {self.truncation_mode}")
-        # if that's still too long, truncate the response
-        for answer_tokens in [chosen_tokens, rejected_tokens]:
-            if (
-                answer_tokens["prompt_input_ids"].shape[-1] + longer_response_length
-                > self.max_length
-            ):
-                for k in ["input_ids", "attention_mask"]:
-                    answer_tokens[k] = answer_tokens[k][
-                        :, : self.max_length - self.max_prompt_length
-                    ]
-
-        chosen_sequence_tokens = {
-            k: np.concatenate(
-                (
-                    np.atleast_2d(chosen_tokens[f"prompt_{k}"]).astype("i4"),
-                    np.atleast_2d(chosen_tokens[k]).astype("i4"),
-                ),
-                axis=-1,
-            )
-            for k in ["input_ids", "attention_mask"]
-        }
-        rejected_sequence_tokens = {
-            k: np.concatenate(
-                (
-                    np.atleast_2d(rejected_tokens[f"prompt_{k}"]).astype("i4"),
-                    np.atleast_2d(rejected_tokens[k]).astype("i4"),
-                ),
-                axis=-1,
-            )
-            for k in ["input_ids", "attention_mask"]
-        }
-        chosen_sequence_tokens["labels"] = chosen_sequence_tokens["input_ids"][:]
-        chosen_sequence_tokens["labels"][: len(chosen_tokens["prompt_input_ids"])] = [
-            self.label_pad_token_id
-        ] * len(chosen_tokens["prompt_input_ids"])
-
-        rejected_sequence_tokens["labels"] = rejected_sequence_tokens["input_ids"][:]
-        rejected_sequence_tokens["labels"][
-            : len(rejected_tokens["prompt_input_ids"])
-        ] = [self.label_pad_token_id] * len(rejected_tokens["prompt_input_ids"])
-
-        for k, tokens_ in {
-            "chosen_": chosen_sequence_tokens,
-            "rejected_": rejected_sequence_tokens,
-            "": prompt_tokens,
-        }.items():
-            for type_key, tokens in tokens_.items():
-                if type_key == "token_type_ids":
+        for prefix, tokens in [
+            ("", prompt_tokens),
+            ("chosen_", chosen_sequence),
+            ("rejected_", rejected_sequence),
+        ]:
+            for key, value in tokens.items():
+                if key == "token_type_ids":
                     continue
-
-                b, s = tokens.shape
-
-                if self.max_prompt_length > s:
-                    if k == "chosen_":
-                        if type_key == "input_ids":
-                            tokens = pad_to_length(
-                                tokens,
-                                self.max_completion_length,
-                                pad_value=self.padding_value,
-                                axis=-1,
-                            )
-                        elif type_key == "attention_mask":
-                            tokens = pad_to_length(
-                                tokens, self.max_completion_length, pad_value=0, axis=-1
-                            )
-                        elif type_key == "labels":
-                            tokens = pad_to_length(
-                                tokens,
-                                self.max_completion_length,
-                                pad_value=self.padding_value,
-                                axis=-1,
-                            )
-
-                        tokens = tokens[..., : self.max_completion_length]
-
-                        if tokens.shape[-1] != self.max_completion_length:
-                            raise ValueError(
-                                f"there was an error in padding token with `type_key` of {type_key}"
-                                f". it must have sequence_length of {self.max_completion_length} but we got {tokens.shape[-1]}"
-                                f" From {k}{type_key}"
-                            )
-                        tokens = tokens[..., : self.max_completion_length]
-                    elif k == "rejected_":
-                        if type_key == "input_ids":
-                            tokens = pad_to_length(
-                                tokens,
-                                self.max_completion_length,
-                                pad_value=self.padding_value,
-                                axis=-1,
-                            )
-                        elif type_key == "attention_mask":
-                            tokens = pad_to_length(
-                                tokens, self.max_completion_length, pad_value=0, axis=-1
-                            )
-                        elif type_key == "labels":
-                            tokens = pad_to_length(
-                                tokens,
-                                self.max_completion_length,
-                                pad_value=self.padding_value,
-                                axis=-1,
-                            )
-                        tokens = tokens[..., : self.max_completion_length]
-                        if tokens.shape[-1] != self.max_completion_length:
-                            raise ValueError(
-                                f"there was an error in padding token with `type_key` of {type_key}"
-                                f". it must have sequence_length of {self.max_completion_length} but we got {tokens.shape[-1]}"
-                                f" From {k}{type_key}"
-                            )
-                    elif k == "":
-                        if type_key == "prompt_input_ids":
-                            tokens = pad_to_length(
-                                tokens,
-                                self.max_prompt_length,
-                                pad_value=self.padding_value,
-                                axis=-1,
-                            )
-                        elif type_key == "prompt_attention_mask":
-                            tokens = pad_to_length(
-                                tokens, self.max_prompt_length, pad_value=0, axis=-1
-                            )
-                        elif type_key == "prompt_labels":
-                            tokens = pad_to_length(
-                                tokens,
-                                self.max_prompt_length,
-                                pad_value=self.padding_value,
-                                axis=-1,
-                            )
-                        tokens = tokens[..., : self.max_prompt_length]
-                        if tokens.shape[-1] != self.max_prompt_length:
-                            raise ValueError(
-                                f"there was an error in padding token with `type_key` of {type_key}"
-                                f". it must have sequence_length of {self.max_prompt_length} but we got {tokens.shape[-1]}"
-                                f" From {k}{type_key}"
-                            )
-                batch[f"{k}{type_key}"] = tokens
+                max_length = (
+                    self.max_prompt_length
+                    if prefix == ""
+                    else self.max_completion_length
+                )
+                pad_value = self.padding_value if key in ["input_ids", "labels"] else 0
+                batch[f"{prefix}{key}"] = self._pad_and_truncate(
+                    value, max_length, pad_value
+                )
         return batch
+
+    def _pad_and_truncate(
+        self,
+        array: np.ndarray,
+        max_length: int,
+        pad_value: int,
+    ) -> np.ndarray:
+        """Pads or truncates an array to the specified length."""
+        if array.shape[1] < max_length:
+            padding = np.full(
+                (array.shape[0], max_length - array.shape[1]),
+                pad_value,
+                dtype=array.dtype,
+            )
+            return np.concatenate([array, padding], axis=1)
+        return array[:, :max_length]
 
     def configure_functions(self) -> TrainerConfigureFunctionOutput:
         """
@@ -1151,13 +1051,17 @@ class ORPOTrainer(BaseTrainer, ABC):
                 try:
                     for epoch_index in range(self.arguments.num_train_epochs):
                         for batch in self.dataloader_train:
-                            current_step += 1
                             if self.arguments.step_start_point > current_step:
                                 ...
                             elif current_step < self.max_training_steps:
                                 time_start = time.time()
                                 # for k, v in batch.items():
                                 #     print(k, v.shape)
+                                #     try:
+                                #         print(self.tokenizer.decode(v[0]))
+                                #     except:
+                                #         ...
+                                # # print()
                                 self.model_state, outputs = (
                                     self.sharded_train_step_function(
                                         self.model_state, batch
@@ -1176,7 +1080,7 @@ class ORPOTrainer(BaseTrainer, ABC):
                                 train_metrics = {
                                     "train/loss": loss.tolist(),
                                     "train/mean_loss": loss_sum
-                                    / (current_step - self.arguments.step_start_point),
+                                    / ((current_step + 1) - self.arguments.step_start_point),
                                     "train/learning_rate": self.scheduler(
                                         jax.device_get(self.model_state.step)
                                     ).tolist(),
@@ -1202,6 +1106,8 @@ class ORPOTrainer(BaseTrainer, ABC):
                                 )
                             else:
                                 break
+
+                            current_step += 1
                 except KeyboardInterrupt:
                     termcolor.cprint(
                         "KeyboardInterrupt At training model Will return Current State of the Model with Parameters.",
@@ -1308,7 +1214,6 @@ class ORPOTrainer(BaseTrainer, ABC):
             loss_sum = None
             try:
                 for batch in self.dataloader_eval:
-                    current_step += 1
                     time_start = time.time()
                     for key in self.arguments.ids_to_pop_from_dataset:
                         _ = batch.pop(key, None)
@@ -1328,7 +1233,7 @@ class ORPOTrainer(BaseTrainer, ABC):
                     eval_metrics = {
                         "eval/loss": loss.tolist(),
                         "eval/mean_loss": loss_sum
-                        / (current_step - self.arguments.step_start_point),
+                        / ((current_step + 1) - self.arguments.step_start_point),
                         "eval/step": current_step,
                         "eval/step_time": total_time,
                         "eval/perplexity": jnp.exp(loss).tolist(),
@@ -1344,6 +1249,7 @@ class ORPOTrainer(BaseTrainer, ABC):
                         **{k.replace("eval/", ""): v for k, v in log_metrics.items()}
                     )
                     yield eval_metrics
+                    current_step += 1
             except KeyboardInterrupt:
                 termcolor.cprint(
                     "KeyboardInterrupt At Evaluation model Will return Nothing and just pass.",

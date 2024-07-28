@@ -1080,9 +1080,9 @@ class DPOTrainer(BaseTrainer, ABC):
             for k in ["input_ids", "attention_mask"]
         }
         sequence_tokens["labels"] = sequence_tokens["input_ids"]
-        sequence_tokens["labels"][: len(tokens["prompt_input_ids"])] = (
-            self.label_pad_token_id
-        )
+        sequence_tokens["labels"][
+            : len(tokens["prompt_input_ids"])
+        ] = self.label_pad_token_id
         return sequence_tokens
 
     def _add_special_tokens(
@@ -1315,7 +1315,6 @@ class DPOTrainer(BaseTrainer, ABC):
                 try:
                     for epoch_index in range(self.arguments.num_train_epochs):
                         for batch in self.dataloader_train:
-                            current_step += 1
                             if self.arguments.step_start_point > current_step:
                                 ...
                             elif current_step < self.max_training_steps:
@@ -1352,11 +1351,20 @@ class DPOTrainer(BaseTrainer, ABC):
                                 train_metrics = {
                                     "train/loss": loss.tolist(),
                                     "train/mean_loss": loss_sum
-                                    / (current_step - self.arguments.step_start_point),
+                                    / (
+                                        (current_step + 1)
+                                        - self.arguments.step_start_point
+                                    ),
                                     "train/mean_rejected_rewards": rejected_rewards_sum
-                                    / (current_step - self.arguments.step_start_point),
+                                    / (
+                                        (current_step + 1)
+                                        - self.arguments.step_start_point
+                                    ),
                                     "train/mean_chosen_rewards": chosen_rewards_sum
-                                    / (current_step - self.arguments.step_start_point),
+                                    / (
+                                        (current_step + 1)
+                                        - self.arguments.step_start_point
+                                    ),
                                     "train/learning_rate": self.scheduler(
                                         jax.device_get(self.model_state.step)
                                     ).tolist(),
@@ -1381,6 +1389,8 @@ class DPOTrainer(BaseTrainer, ABC):
                                 )
                             else:
                                 break
+
+                            current_step += 1
                 except KeyboardInterrupt:
                     termcolor.cprint(
                         "KeyboardInterrupt At training model Will return Current State of the Model with Parameters.",
@@ -1492,7 +1502,6 @@ class DPOTrainer(BaseTrainer, ABC):
 
             try:
                 for batch in self.dataloader_eval:
-                    current_step += 1
                     time_start = time.time()
                     for key in self.arguments.ids_to_pop_from_dataset:
                         _ = batch.pop(key, None)
@@ -1528,11 +1537,11 @@ class DPOTrainer(BaseTrainer, ABC):
                     eval_metrics = {
                         "eval/loss": loss.tolist(),
                         "eval/mean_loss": loss_sum
-                        / (current_step - self.arguments.step_start_point),
+                        / ((current_step + 1) - self.arguments.step_start_point),
                         "eval/mean_rejected_rewards": rejected_rewards_sum
-                        / (current_step - self.arguments.step_start_point),
+                        / ((current_step + 1) - self.arguments.step_start_point),
                         "eval/mean_chosen_rewards": chosen_rewards_sum
-                        / (current_step - self.arguments.step_start_point),
+                        / ((current_step + 1) - self.arguments.step_start_point),
                         "eval/step": current_step,
                         "eval/step_time": total_time,
                         "eval/perplexity": jnp.exp(loss).tolist(),
@@ -1547,6 +1556,7 @@ class DPOTrainer(BaseTrainer, ABC):
                         **{k.replace("eval/", ""): v for k, v in log_metrics.items()}
                     )
                     yield eval_metrics
+                    current_step += 1
             except KeyboardInterrupt:
                 termcolor.cprint(
                     "KeyboardInterrupt At Evaluation model Will return Nothing and just pass.",
