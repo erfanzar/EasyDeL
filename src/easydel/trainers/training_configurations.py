@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import pathlib
 import re
 import warnings
@@ -168,7 +170,7 @@ class TrainArguments:
 
     model_name: str = "Model"
     num_train_epochs: int = 10
-    model_class: Optional["EDPretrainedModel"] = None  # type: ignore # noqa: F821
+    model_class: Optional[EDPretrainedModel] = None
     total_batch_size: int = 32
     max_training_steps: Optional[int] = None
     max_evaluation_steps: Optional[int] = None
@@ -646,3 +648,7 @@ class TrainArguments:
             else:
                 result.append(" " * (indent + 2) + str(value))
         return "\n".join(result)
+
+
+class EDPretrainedModel:
+    pass
