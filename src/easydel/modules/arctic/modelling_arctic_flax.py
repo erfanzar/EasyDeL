@@ -74,6 +74,17 @@ class FlaxArcticRotaryEmbedding(nn.Module):
 
 
 class FlaxArcticAttention(FlaxAttentionModule):
+    """
+    FlaxArcticAttention implements an attention mechanism with rotary embeddings.
+
+    Attributes:
+        config (ArcticConfig): Configuration for the attention module.
+        layer_index (int): Index of the current layer.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
+    """
+
     config: ArcticConfig
     layer_index: int
     dtype: jnp.dtype = jnp.bfloat16
@@ -81,6 +92,17 @@ class FlaxArcticAttention(FlaxAttentionModule):
     precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
+        """
+        Sets up the attention module by initializing projection layers, rotary embeddings, and other parameters.
+
+        The setup method initializes the following:
+        - `hidden_size`, `num_heads`, `head_dim`: Dimensions and size attributes based on the configuration.
+        - `num_key_value_heads`, `num_key_value_groups`: Configuration for key-value heads.
+        - `max_position_embeddings`: Maximum number of position embeddings.
+        - `q_proj`, `k_proj`, `v_proj`, `o_proj`: Dense layers for query, key, value, and output projections.
+        - `rotary`: Rotary embedding module.
+        - `attention_performer`: Flexible attention module handling the main attention computations.
+        """
         config = self.config
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -106,29 +128,47 @@ class FlaxArcticAttention(FlaxAttentionModule):
         self.rotary = FlaxArcticRotaryEmbedding(self.dtype)
         self.attention_performer = FlexibleAttentionModule(
             num_attention_heads=self.config.num_attention_heads,
-            attention_dropout=self.config.attention_dropout,
             head_dims=self.head_dim,
-            shard_attention_computation=self.config.shard_attention_computation,
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
-            dtype=self.config.attn_dtype,
-            partition_axis=self.config.partition_axis,
-            scan_ring_attention=self.config.scan_ring_attention,
-            mesh=self.config.mesh,
             sm_scale=1 / math.sqrt(self.head_dim),
-            axis_name=self.config.attention_axis_name,
             backward_pass_impl=self.config.flash_attention_backward_pass_impl,
+            base_config=self.config,
         )
 
     def apply_rotary(self, query, key, freq_cis, position_ids):
+        """
+        Applies rotary positional embeddings to the query and key tensors.
+
+        Args:
+            query (chex.Array): Query tensor.
+            key (chex.Array): Key tensor.
+            freq_cis (Tuple[chex.Array, chex.Array]): Tuple containing cosine and sine components for rotary embeddings.
+            position_ids (chex.Array): Position indices for the tokens.
+
+        Returns:
+            Tuple[chex.Array, chex.Array]: The modified query and key tensors after applying rotary embeddings.
+        """
         query, key = self._transpose_sequence_head(query, key)
         query, key = self.rotary(
-            position_ids=position_ids, query=query, key=key, freq_cis=freq_cis
+            position_ids=position_ids,
+            query=query,
+            key=key,
+            freq_cis=freq_cis,
         )
         return self._transpose_sequence_head(query, key)
 
     def _merge_heads(self, hidden_states):
+        """
+        Merges the attention heads into a single hidden state tensor.
+
+        Args:
+            hidden_states (chex.Array): The hidden states with separate head dimensions.
+
+        Returns:
+            chex.Array: The hidden states with merged head dimensions.
+        """
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
     def __call__(
@@ -143,25 +183,22 @@ class FlaxArcticAttention(FlaxAttentionModule):
         init_cache: bool = False,
         output_attentions: bool = True,
     ):
-        """The __call__ function is the main function of a JAX module.
-        It defines how the module behaves when called as a function, and it's what you'll use to call your model in practice.
-        The __call__ method takes an input tensor (x) and returns an output tensor (y).
-        In this case, we're defining our model to be a simple linear layer with no activation: y = x @ w + b.
+        """
+        Forward pass of the attention module.
 
         Args:
-            self: Refer to the object itself
-            hidden_states: chex.Array: Pass in the hidden state of the model
-            freq_cis: Tuple[chex.Array, chex.Array],: Create the apply_rotary variable
-            attention_mask: chex.Array: Mask the attention weights
-            causal_mask: chex.Array: Mask the attention weights
-            position_ids: chex.Array: Specify the position of each token in a sequence
-            deterministic: bool: Determine whether to use dropout or not
-            init_cache: bool: Initialize the cache
-            output_attentions: bool: Determine whether to return the
-                attention weights
+            hidden_states (chex.Array): Input hidden states.
+            freq_cis (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            attention_mask (chex.Array): Mask to apply on the attention scores.
+            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+            position_ids (chex.Array): Position indices for the tokens.
+            segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            deterministic (bool): If True, disables dropout for deterministic behavior.
+            init_cache (bool): If True, initializes cache for caching keys and values.
+            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
 
         Returns:
-            A tuple of (out, attn_output)
+            Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
         """
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = (
@@ -286,7 +323,11 @@ class FlaxArcticAttention(FlaxAttentionModule):
                 ),
             )
         attn_output = self.o_proj(attn_output)
-        outputs = (attn_output, attentions.attention_weights)
+        outputs = (
+            (attn_output, attentions.attention_weights)
+            if output_attentions
+            else (attn_output,)
+        )
         return outputs
 
 
@@ -604,31 +645,22 @@ class FlaxArcticDecoderLayer(nn.Module):
         init_cache: bool = False,
         output_attentions: bool = True,
     ):
-        """The __call__ function is the main function of a TransformerEncoderLayer.
-        It takes in the following arguments:
-            hidden_states (chex.Array): The input to the encoder layer, which is also its output after being processed
-            by all sublayers.
-            freq_cis (chex.Array): A tensor containing frequency-domain representations of each token's context vector,
-             used for computing self-attention weights and biases in a more efficient manner than using position
-             embeddings or sinusoidal positional encoding vectors would allow
+        """
+        Forward pass of the attention module.
 
         Args:
-            self: Represent the instance of the class
-            hidden_states: chex.Array: Represent the input to the
-                encoder layer
-            freq_cis: Tuple[chex.Array, chex.Array],: Pass the frequency
-                information to the attention layer
-            attention_mask: chex.Array: Mask out the attention weights
-                for certain positions
-            causal_mask: chex.Array: Mask the future tokens
-            position_ids: chex.Array: Indicate the position of each
-                token in the sequence
-            deterministic: bool: Determine whether to use dropout or not
-            init_cache: bool: Initialize the cache for the self-
-                attention layer
+            hidden_states (chex.Array): Input hidden states.
+            freq_cis (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            attention_mask (chex.Array): Mask to apply on the attention scores.
+            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+            position_ids (chex.Array): Position indices for the tokens.
+            segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            deterministic (bool): If True, disables dropout for deterministic behavior.
+            init_cache (bool): If True, initializes cache for caching keys and values.
+            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
 
         Returns:
-            A tuple of hidden_states and attention_output
+            Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
         """
         residual_input = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -642,7 +674,7 @@ class FlaxArcticDecoderLayer(nn.Module):
         # deterministic: bool = True
         # init_cache: bool = False
         # output_attentions: bool = True
-        hidden_states, self_attn_weights = self.self_attn(
+        attn_out = self.self_attn(
             hidden_states,
             freq_cis,
             attention_mask,
@@ -652,6 +684,9 @@ class FlaxArcticDecoderLayer(nn.Module):
             deterministic,
             init_cache,
             output_attentions,
+        )
+        hidden_states, self_attn_weights = (
+            attn_out if output_attentions else (attn_out[0], None)
         )
         hidden_states = residual_input + hidden_states
 
@@ -1045,27 +1080,14 @@ class FlaxArcticModule(nn.Module):
                 scaling_factor=scaling_factor, rope_type=scaling_type
             )
         self.freq_cis = precompute_freq_cis(
-            max_position_embeddings=(
-                getattr(
-                    self.config,
-                    "freq_max_position_embeddings",
-                    self.config.max_position_embeddings,
-                )
-            ),
+            max_position_embeddings=self.config.granted_freq_max_position_embedding,
             dim=self.config.hidden_size // self.config.num_attention_heads,
             base=self.config.rope_theta,
             **initial_rope_kwargs,
         )
         self.causal_mask = flax.linen.make_causal_mask(
             jnp.ones(
-                (
-                    1,
-                    getattr(
-                        self.config,
-                        "mask_max_position_embeddings",
-                        self.config.max_position_embeddings,
-                    ),
-                ),
+                shape=(1, self.config.granted_mask_max_position_embedding),
                 dtype="bool",
             ),
             dtype="bool",

@@ -148,6 +148,15 @@ class FlaxGrok1Attention(FlaxAttentionModule):
         self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
 
     def _merge_heads(self, hidden_states):
+        """
+        Merges the attention heads into a single hidden state tensor.
+
+        Args:
+            hidden_states (chex.Array): The hidden states with separate head dimensions.
+
+        Returns:
+            chex.Array: The hidden states with merged head dimensions.
+        """
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
     def apply_rotary(
