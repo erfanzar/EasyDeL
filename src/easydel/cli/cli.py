@@ -1,15 +1,11 @@
 import argparse
 import sys
 
-from easydel.cli.utils import create_parser_from_dataclass
-from easydel.trainers.training_configurations import TrainArguments
-
-
-def train_sft(args):
-    config = TrainArguments(**vars(args))
-    print("Training SFT model with config:")
-    for key, value in vars(config).items():
-        print(f"  {key}: {value}")
+from easydel.cli.train.clm import train_clm as train_clm
+from easydel.cli.train.dpo import train_dpo as train_dpo
+from easydel.cli.train.sft import train_sft as train_sft
+from easydel.cli.utils import get_parser_from_class as get_parser_from_class
+from easydel.trainers.training_configurations import TrainArguments as TrainArguments
 
 
 def main():
@@ -19,32 +15,44 @@ def main():
     subparsers = parser.add_subparsers(dest="command")
 
     # Train parser
-    train_parser = subparsers.add_parser("train", help="Train models")
-    train_subparsers = train_parser.add_subparsers(dest="model_type")
+    train_parser = subparsers.add_parser(
+        "train",
+        help="Train models",
+    )
+    train_subparsers = train_parser.add_subparsers(
+        dest="trainer_type",
+    )
 
     # SFT parser
-    sft_parser = train_subparsers.add_parser("sft", help="Supervised Fine-Tuning")
-    sft_parser = create_parser_from_dataclass(TrainArguments)
-    sft_parser.set_defaults(func=train_sft)
+    train_subparsers.add_parser("sft", help="Supervised Fine-Tuning")
+    train_subparsers.add_parser("dpo", help="Direct Preference Optimization")
+    train_subparsers.add_parser("clm", help="Causal Language Model")
+
+    train_argument_parser = get_parser_from_class(TrainArguments)
 
     args = parser.parse_args()
-
     if args.command is None:
         parser.print_help()
         sys.exit(1)
 
     if args.command == "train":
-        if args.model_type is None:
+        if args.trainer_type is None:
             train_parser.print_help()
             sys.exit(1)
-        elif args.model_type == "sft":
-            if hasattr(args, "func"):
-                args.func(args)
-            else:
-                print("Error: SFT command not properly configured.")
-                sys.exit(1)
+        elif args.trainer_type == "sft":
+            train_sft(
+                train_argument_parser=train_argument_parser,
+            )
+        elif args.trainer_type == "dpo":
+            train_dpo(
+                train_argument_parser=train_argument_parser,
+            )
+        elif args.trainer_type == "clm":
+            train_clm(
+                train_argument_parser=train_argument_parser,
+            )
         else:
-            print(f"Unknown model type: {args.model_type}")
+            print(f"Unknown trainer_type: {args.model_type}")
             sys.exit(1)
     else:
         print(f"Unknown command: {args.command}")
