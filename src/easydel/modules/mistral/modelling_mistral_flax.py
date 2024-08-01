@@ -658,13 +658,13 @@ class FlaxMistralPretrainedModel(EDPretrainedModel):
 
     def __call__(
         self,
-        input_ids: chex.Array,
+        input_ids: Optional[chex.Array] = None,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
         segment_ids: Optional[chex.Array] = None,
         inputs_embeds: Optional[chex.Array] = None,
         params: dict = None,
-        past_key_values: dict = None,
+        past_key_values: Optional[dict] = None,
         dropout_rng: jax.random.PRNGKey = None,
         train: bool = False,
         output_attentions: Optional[bool] = None,
@@ -708,7 +708,9 @@ class FlaxMistralPretrainedModel(EDPretrainedModel):
         return_dict = (
             return_dict if return_dict is not None else self.config.return_dict
         )
-        batch_size, sequence_length = input_ids.shape
+        batch_size, sequence_length = (
+            input_ids.shape if input_ids is not None else inputs_embeds.shape[:2]
+        )
 
         if position_ids is None:
             if past_key_values is not None:
@@ -1065,7 +1067,7 @@ class FlaxMistralForCausalLMModule(nn.Module):
 
     def __call__(
         self,
-        input_ids: chex.Array,
+        input_ids: Optional[chex.Array] = None,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
         segment_ids: Optional[chex.Array] = None,
@@ -1080,9 +1082,9 @@ class FlaxMistralForCausalLMModule(nn.Module):
         Forward pass through the Mistral module.
 
         Args:
-            input_ids (chex.Array): Input tensor containing token IDs.
-            attention_mask (chex.Array): Mask for attention.
-            position_ids (chex.Array): Positional indices.
+            input_ids (Optional[chex.Array]): Input tensor containing token IDs.
+            attention_mask (Optional[chex.Array]): Mask for attention.
+            position_ids (Optional[chex.Array]): Positional indices.
             segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
             inputs_embeds (Optional[chex.Array]): Embedded input tensor.
             output_attentions (Optional[bool]): If True, output attention weights.
@@ -1094,8 +1096,10 @@ class FlaxMistralForCausalLMModule(nn.Module):
         Returns:
             FlaxCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
         """
-        batch_size, seq_length = input_ids.shape
 
+        batch_size, seq_length = (
+            input_ids.shape if input_ids is not None else inputs_embeds.shape[:2]
+        )
         if attention_mask is None:
             attention_mask = jnp.ones_like(input_ids)
         if position_ids is None:
@@ -1164,7 +1168,10 @@ class FlaxMistralForCausalLM(FlaxMistralPretrainedModel):
         self.module.lm_head = new_embeddings
 
     def prepare_inputs_for_generation(
-        self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
+        self,
+        input_ids,
+        max_length,
+        attention_mask: Optional[chex.Array] = None,
     ):
         batch_size, seq_length = input_ids.shape
 
@@ -1284,7 +1291,7 @@ class FlaxVisionMistralPreTrainedModel(EDPretrainedModel):
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
         params: dict = None,
-        past_key_values: dict = None,
+        past_key_values: Optional[dict] = None,
         dropout_rng: jax.random.PRNGKey = None,
         train: bool = False,
         output_attentions: Optional[bool] = None,
