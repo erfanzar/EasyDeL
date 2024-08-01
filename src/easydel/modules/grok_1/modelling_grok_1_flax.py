@@ -25,8 +25,8 @@ from easydel.modules.flax_modeling_utils import (
     control_mlp_sharding,
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
-    precompute_freq_cis,
     with_sharding_constraint,
+    precompute_frequencies,
 )
 from easydel.modules.grok_1.grok_1_configuration import Grok1Config as Grok1Config
 from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
@@ -52,8 +52,8 @@ class MoeCausalLMOutput(FlaxMaskedLMOutput):
 class FlaxGrok1Embedding(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
-    def __call__(self, query, key, freq_cis, position_ids):
-        sin, cos = freq_cis
+    def __call__(self, query, key, frequencies, position_ids):
+        sin, cos = frequencies
 
         sin = sin[position_ids][:, None, :, :]
         cos = cos[position_ids][:, None, :, :]
@@ -144,14 +144,14 @@ class FlaxGrok1Attention(FlaxAttentionModule):
         """
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
-    def apply_rotary(self, query, key, freq_cis, position_ids):
+    def apply_rotary(self, query, key, frequencies, position_ids):
         """
         Applies rotary positional embeddings to the query and key tensors.
 
         Args:
             query (chex.Array): Query tensor.
             key (chex.Array): Key tensor.
-            freq_cis (Tuple[chex.Array, chex.Array]): Tuple containing cosine and sine components for rotary embeddings.
+            frequencies (Tuple[chex.Array, chex.Array]): Tuple containing cosine and sine components for rotary embeddings.
             position_ids (chex.Array): Position indices for the tokens.
 
         Returns:
@@ -166,14 +166,14 @@ class FlaxGrok1Attention(FlaxAttentionModule):
             position_ids=position_ids,
             query=query,
             key=key,
-            freq_cis=freq_cis,
+            frequencies=frequencies,
         )
         return self._transpose_sequence_head(query, key)
 
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        frequencies: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
@@ -188,7 +188,7 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 
         Args:
             hidden_states (chex.Array): Input hidden states.
-            freq_cis (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
             attention_mask (chex.Array): Mask to apply on the attention scores.
             position_ids (chex.Array): Position indices for the tokens.
             causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
@@ -230,7 +230,7 @@ class FlaxGrok1Attention(FlaxAttentionModule):
             query=query_states,
             key=key_states,
             position_ids=position_ids,
-            freq_cis=freq_cis,
+            frequencies=frequencies,
         )
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
@@ -498,7 +498,7 @@ class FlaxGrok1DecoderLayer(nn.Module):
 
     def setup(self) -> None:
         # hidden_states: chex.Array
-        # freq_cis: Tuple[chex.Array, chex.Array],
+        # frequencies: Tuple[chex.Array, chex.Array],
         # attention_mask: chex.Array
         # causal_mask: chex.Array
         # position_ids: chex.Array
@@ -564,7 +564,7 @@ class FlaxGrok1DecoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        frequencies: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
@@ -580,7 +580,7 @@ class FlaxGrok1DecoderLayer(nn.Module):
 
         Args:
             hidden_states (chex.Array): Input hidden states.
-            freq_cis (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
             attention_mask (chex.Array): Mask to apply on the attention scores.
             position_ids (chex.Array): Position indices for the tokens.
             causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
@@ -597,7 +597,7 @@ class FlaxGrok1DecoderLayer(nn.Module):
         hidden_states = self.pre_attn_norm(hidden_states)
         hidden_states, attention_weights = self.attn(
             hidden_states,
-            freq_cis,
+            frequencies,
             attention_mask,
             position_ids,
             causal_mask,
@@ -647,7 +647,7 @@ class FlaxGrok1DecoderLayerCollection(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        frequencies: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
@@ -664,7 +664,7 @@ class FlaxGrok1DecoderLayerCollection(nn.Module):
 
         Args:
             hidden_states (chex.Array): Input hidden states.
-            freq_cis (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
             attention_mask (chex.Array): Mask to apply on the attention scores.
             position_ids (chex.Array): Position indices for the tokens.
             causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
@@ -693,7 +693,7 @@ class FlaxGrok1DecoderLayerCollection(nn.Module):
                 output_attentions=output_attentions,
                 output_router_logits=output_router_logits,
                 init_cache=init_cache,
-                freq_cis=freq_cis,
+                frequencies=frequencies,
                 causal_mask=causal_mask,
                 deterministic=deterministic,
                 segment_ids=segment_ids,
@@ -1019,7 +1019,7 @@ class FlaxGrok1Module(nn.Module):
             initial_rope_kwargs = dict(
                 scaling_factor=scaling_factor, rope_type=scaling_type
             )
-        self.freq_cis = precompute_freq_cis(
+        self.frequencies = precompute_frequencies(
             max_position_embeddings=self.config.granted_freq_max_position_embedding,
             dim=self.config.hidden_size // self.config.num_attention_heads,
             base=self.config.rope_theta,
@@ -1099,7 +1099,7 @@ class FlaxGrok1Module(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             causal_mask=self.causal_mask,
-            freq_cis=self.freq_cis,
+            frequencies=self.frequencies,
             output_attentions=output_attentions,
             output_router_logits=output_router_logits,
             output_hidden_states=output_hidden_states,

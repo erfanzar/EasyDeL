@@ -24,8 +24,8 @@ from easydel.modules.flax_modeling_utils import (
     control_mlp_sharding,
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
-    precompute_freq_cis,
     with_sharding_constraint,
+    precompute_frequencies,
 )
 from easydel.modules.modeling_flax_outputs import (
     FlaxBaseModelOutput,
@@ -45,8 +45,8 @@ re_mat = nn_partitioning.remat
 class FlaxOpenELMRotaryEmbedding(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
-    def __call__(self, key, query, freq_cis, position_ids):
-        sin, cos = freq_cis
+    def __call__(self, key, query, frequencies, position_ids):
+        sin, cos = frequencies
 
         key_len = key.shape[2]
         query_len = query.shape[2]
@@ -173,10 +173,17 @@ class FlaxOpenELMMultiHeadCausalAttention(FlaxAttentionModule):
         )
 
     def apply_rotary(
-        self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
+        self,
+        batch_size,
+        sequence_length,
+        query,
+        key,
+        value,
+        frequencies,
+        position_ids,
     ):
         """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
-        The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
+        The main difference is that it takes in an additional argument, frequencies, which are used to calculate
         the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
 
         Args:
@@ -186,7 +193,7 @@ class FlaxOpenELMMultiHeadCausalAttention(FlaxAttentionModule):
             query: Calculate the attention weights
             key: Calculate the attention
             value: Compute the attention weights
-            freq_cis: Calculate the frequency of each word in the
+            frequencies: Calculate the frequency of each word in the
                 vocabulary
             position_ids: Identify the position of each token in the
                 sequence
@@ -204,14 +211,17 @@ class FlaxOpenELMMultiHeadCausalAttention(FlaxAttentionModule):
 
         query, key, value = self._transpose_sequence_head(query, key, value)
         query, key = self.rotary(
-            position_ids=position_ids, query=query, key=key, freq_cis=freq_cis
+            position_ids=position_ids,
+            query=query,
+            key=key,
+            frequencies=frequencies,
         )
         return self._transpose_sequence_head(query, key, value)
 
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        frequencies: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
@@ -229,7 +239,7 @@ class FlaxOpenELMMultiHeadCausalAttention(FlaxAttentionModule):
             self: Access variables that belong to the class
             hidden_states: chex.Array: Pass the hidden states of the
                 previous layer
-            freq_cis: Tuple[chex.Array, chex.Array],: Pass in the
+            frequencies: Tuple[chex.Array, chex.Array],: Pass in the
                 frequency coefficients for each position
             attention_mask: chex.Array: Mask out certain tokens in the
                 input sequence
@@ -283,7 +293,7 @@ class FlaxOpenELMMultiHeadCausalAttention(FlaxAttentionModule):
             key=key_states,
             value=value_states,
             position_ids=position_ids,
-            freq_cis=freq_cis,
+            frequencies=frequencies,
             batch_size=batch_size,
             sequence_length=sequence_length,
         )
@@ -455,7 +465,7 @@ class FlaxOpenELMDecoderLayer(nn.Module):
         mlp_block = FlaxOpenELMFeedForwardNetwork
         if self.config.gradient_checkpointing != "":
             # hidden_states: chex.Array,
-            # freq_cis: Tuple[chex.Array, chex.Array],
+            # frequencies: Tuple[chex.Array, chex.Array],
             # attention_mask: chex.Array,
             # position_ids: chex.Array,
             # causal_mask: chex.Array,
@@ -509,7 +519,7 @@ class FlaxOpenELMDecoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        frequencies: Tuple[chex.Array, chex.Array],
         causal_mask: chex.Array,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
@@ -524,7 +534,7 @@ class FlaxOpenELMDecoderLayer(nn.Module):
         # Self Attention
 
         # hidden_states: chex.Array,
-        # freq_cis: Tuple[chex.Array, chex.Array],
+        # frequencies: Tuple[chex.Array, chex.Array],
         # attention_mask: chex.Array,
         # position_ids: chex.Array,
         # causal_mask: chex.Array,
@@ -535,7 +545,7 @@ class FlaxOpenELMDecoderLayer(nn.Module):
         # fcm_mask = None,
         hidden_states, self_attn_weights = self.attn(
             hidden_states,
-            freq_cis,
+            frequencies,
             attention_mask,
             position_ids,
             causal_mask,
@@ -594,7 +604,7 @@ class FlaxOpenELMDecoderLayerCollection(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        frequencies: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         causal_mask: chex.Array,
         position_ids: chex.Array,
@@ -611,7 +621,7 @@ class FlaxOpenELMDecoderLayerCollection(nn.Module):
 
             output = layer(
                 hidden_states=hidden_states,
-                freq_cis=freq_cis,
+                frequencies=frequencies,
                 attention_mask=attention_mask,
                 causal_mask=causal_mask,
                 output_attentions=output_attentions,
@@ -671,7 +681,7 @@ class FlaxOpenELMModule(nn.Module):
             initial_rope_kwargs = dict(
                 scaling_factor=scaling_factor, rope_type=scaling_type
             )
-        self.freq_cis = precompute_freq_cis(
+        self.frequencies = precompute_frequencies(
             max_position_embeddings=(
                 getattr(
                     self.config,
@@ -746,7 +756,7 @@ class FlaxOpenELMModule(nn.Module):
             hidden_states=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            freq_cis=self.freq_cis,
+            frequencies=self.frequencies,
             init_cache=init_cache,
             output_attentions=output_attentions,
             deterministic=deterministic,

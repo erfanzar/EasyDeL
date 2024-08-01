@@ -25,8 +25,8 @@ from easydel.modules.flax_modeling_utils import (
     control_mlp_sharding,
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
-    precompute_freq_cis,
     with_sharding_constraint,
+    precompute_frequencies,
 )
 from easydel.modules.modeling_flax_outputs import MoeCausalLMOutput, MoeModelOutput
 from easydel.modules.modeling_utils import EDPretrainedModel
@@ -61,8 +61,8 @@ class ArcticRMSNorm(nn.Module):
 class FlaxArcticRotaryEmbedding(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
-    def __call__(self, key, query, freq_cis, position_ids):
-        sin, cos = freq_cis
+    def __call__(self, key, query, frequencies, position_ids):
+        sin, cos = frequencies
 
         sin = sin[position_ids][:, None, :, :]
         cos = cos[position_ids][:, None, :, :]
@@ -137,14 +137,14 @@ class FlaxArcticAttention(FlaxAttentionModule):
             base_config=self.config,
         )
 
-    def apply_rotary(self, query, key, freq_cis, position_ids):
+    def apply_rotary(self, query, key, frequencies, position_ids):
         """
         Applies rotary positional embeddings to the query and key tensors.
 
         Args:
             query (chex.Array): Query tensor.
             key (chex.Array): Key tensor.
-            freq_cis (Tuple[chex.Array, chex.Array]): Tuple containing cosine and sine components for rotary embeddings.
+            frequencies (Tuple[chex.Array, chex.Array]): Tuple containing cosine and sine components for rotary embeddings.
             position_ids (chex.Array): Position indices for the tokens.
 
         Returns:
@@ -155,7 +155,7 @@ class FlaxArcticAttention(FlaxAttentionModule):
             position_ids=position_ids,
             query=query,
             key=key,
-            freq_cis=freq_cis,
+            frequencies=frequencies,
         )
         return self._transpose_sequence_head(query, key)
 
@@ -174,7 +174,7 @@ class FlaxArcticAttention(FlaxAttentionModule):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        frequencies: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         causal_mask: chex.Array,
         position_ids: chex.Array,
@@ -188,7 +188,7 @@ class FlaxArcticAttention(FlaxAttentionModule):
 
         Args:
             hidden_states (chex.Array): Input hidden states.
-            freq_cis (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
             attention_mask (chex.Array): Mask to apply on the attention scores.
             causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
             position_ids (chex.Array): Position indices for the tokens.
@@ -230,7 +230,7 @@ class FlaxArcticAttention(FlaxAttentionModule):
             query=query_states,
             key=key_states,
             position_ids=position_ids,
-            freq_cis=freq_cis,
+            frequencies=frequencies,
         )
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
@@ -726,7 +726,7 @@ class FlaxArcticDecoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        frequencies: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         causal_mask: chex.Array,
         position_ids: chex.Array,
@@ -740,7 +740,7 @@ class FlaxArcticDecoderLayer(nn.Module):
 
         Args:
             hidden_states (chex.Array): Input tensor containing the hidden states.
-            freq_cis (Tuple[chex.Array, chex.Array]): Frequency positional encodings.
+            frequencies (Tuple[chex.Array, chex.Array]): Frequency positional encodings.
             attention_mask (chex.Array): Mask to apply during attention.
             causal_mask (chex.Array): Causal mask for autoregressive decoding.
             position_ids (chex.Array): Positional indices for the sequence.
@@ -759,7 +759,7 @@ class FlaxArcticDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
         attn_out = self.self_attn(
             hidden_states,
-            freq_cis,
+            frequencies,
             attention_mask,
             causal_mask,
             position_ids,
@@ -827,7 +827,7 @@ class FlaxArcticDecoderLayerCollection(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        frequencies: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         causal_mask: chex.Array,
         position_ids: chex.Array,
@@ -842,7 +842,7 @@ class FlaxArcticDecoderLayerCollection(nn.Module):
 
         Args:
             hidden_states (chex.Array): The hidden states input to the decoder.
-            freq_cis (Tuple[chex.Array, chex.Array]): Frequency components for positional embeddings.
+            frequencies (Tuple[chex.Array, chex.Array]): Frequency components for positional embeddings.
             attention_mask (chex.Array): Mask for attention mechanism.
             causal_mask (chex.Array): Causal mask for autoregressive decoding.
             position_ids (chex.Array): Positional indices.
@@ -867,7 +867,7 @@ class FlaxArcticDecoderLayerCollection(nn.Module):
                 position_ids=position_ids,
                 output_attentions=output_attentions,
                 init_cache=init_cache,
-                freq_cis=freq_cis,
+                frequencies=frequencies,
                 causal_mask=causal_mask,
                 deterministic=deterministic,
                 segment_ids=segment_ids,
@@ -1193,7 +1193,7 @@ class FlaxArcticModule(nn.Module):
             initial_rope_kwargs = dict(
                 scaling_factor=scaling_factor, rope_type=scaling_type
             )
-        self.freq_cis = precompute_freq_cis(
+        self.frequencies = precompute_frequencies(
             max_position_embeddings=self.config.granted_freq_max_position_embedding,
             dim=self.config.hidden_size // self.config.num_attention_heads,
             base=self.config.rope_theta,
@@ -1265,7 +1265,7 @@ class FlaxArcticModule(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             causal_mask=self.causal_mask,
-            freq_cis=self.freq_cis,
+            frequencies=self.frequencies,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             init_cache=init_cache,

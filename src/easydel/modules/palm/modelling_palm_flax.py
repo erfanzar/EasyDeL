@@ -18,25 +18,25 @@ from easydel.modules.palm.palm_configuration import PalmConfig as PalmConfig
 
 
 def pre_compute_freq_cis(dim, max_length, theta: int = 10000.0, dtype=jnp.bfloat16):
-    freq_cis = 1 / (theta ** (jnp.arange(0, dim, 2).astype(dtype=dtype) / dim))
+    frequencies = 1 / (theta ** (jnp.arange(0, dim, 2).astype(dtype=dtype) / dim))
     length = jnp.arange(max_length)
-    cis = jnp.outer(length, freq_cis).astype(dtype)
+    cis = jnp.outer(length, frequencies).astype(dtype)
     sin = jnp.sin(cis)
     cos = jnp.cos(cis)
-    freq_cis = jnp.complex64(cos + 1j * sin)
-    return jnp.asarray(freq_cis)
+    frequencies = jnp.complex64(cos + 1j * sin)
+    return jnp.asarray(frequencies)
 
 
-def apply_rotary_embedding(xq, xk, freq_cis, dtype=jnp.bfloat16):
+def apply_rotary_embedding(xq, xk, frequencies, dtype=jnp.bfloat16):
     reshape_xq = xq.astype(jnp.flaot32).reshape(xq.shape[:-1], -1, 2)
     reshape_xk = xk.astype(jnp.flaot32).reshape(xk.shape[:-1], -1, 2)
 
     complex_q = jax.lax.complex(reshape_xq[..., 0], reshape_xq[..., 1])
     complex_k = jax.lax.complex(reshape_xk[..., 0], reshape_xk[..., 1])
 
-    freq_cis = freq_cis.reshape(*freq_cis[:2], 1, *freq_cis[2:])
-    xq = complex_q * freq_cis
-    xk = complex_k * freq_cis
+    frequencies = frequencies.reshape(*frequencies[:2], 1, *frequencies[2:])
+    xq = complex_q * frequencies
+    xk = complex_k * frequencies
     xq = jnp.stack([jnp.real(xq), jnp.imag(xq)], axis=-1).reshape(xq.shape[:-1], -1)
     xk = jnp.stack([jnp.real(xk), jnp.imag(xk)], axis=-1).reshape(xk.shape[:-1], -1)
     return xq.astype(dtype), xk.astype(dtype)
@@ -96,7 +96,7 @@ class ParallelPalmBlock(nn.Module):
         self.num_attention_heads: int = self.config.num_attention_heads
         self.scale: float = self.config.dim_head**-0.5
 
-    def __call__(self, hidden_state, freq_cis, causal_mask):
+    def __call__(self, hidden_state, frequencies, causal_mask):
         split_indices = onp.cumsum(self.fused_dims[:-1])
 
         hidden_state = self.norm(hidden_state)
@@ -105,7 +105,7 @@ class ParallelPalmBlock(nn.Module):
         q = rearrange(q, "b s (h d)-> b s h d", h=self.num_attention_heads)
         k = rearrange(k, "b s (h d)-> b s h d", h=self.num_attention_heads)
 
-        q, k = apply_rotary_embedding(q, k, freq_cis, self.dtype)
+        q, k = apply_rotary_embedding(q, k, frequencies, self.dtype)
         q = rearrange(q, "b s h d -> b s (h d)")
         k = rearrange(k, "b s h d -> b s (h d)")
         q = (
@@ -155,13 +155,13 @@ class ParallelCollection(nn.Module):
             for i in range(self.config.num_hidden_layers)
         ]
 
-    def __call__(self, hidden_state, freq_cis, causal_mask, output_attention=False):
+    def __call__(self, hidden_state, frequencies, causal_mask, output_attention=False):
         saves = []
         for block in self.blocks:
             hidden_state = (
                 block(
                     hidden_state=hidden_state,
-                    freq_cis=freq_cis,
+                    frequencies=frequencies,
                     causal_mask=causal_mask,
                 )
                 + hidden_state
@@ -259,7 +259,7 @@ class FlaxPalmModule(nn.Module):
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
-        self.freq_cis = pre_compute_freq_cis(
+        self.frequencies = pre_compute_freq_cis(
             self.config.dim_head, self.config.max_length, dtype=self.dtype
         )
 
@@ -297,7 +297,7 @@ class FlaxPalmModule(nn.Module):
             hidden_state=hidden_state,
             causal_mask=mask,
             output_attention=output_attention,
-            freq_cis=self.freq_cis[:seq_len].reshape(1, seq_len, -1),
+            frequencies=self.frequencies[:seq_len].reshape(1, seq_len, -1),
         )
         hidden_state = self.ln_f(hidden_state)
 
