@@ -285,7 +285,7 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
             TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
                                             maximum number of training and evaluation steps.
         """
-                
+
         import tensorflow_datasets as tfds
         dataloader_train = tfds.as_numpy(
             self.dataset_train.to_tf_dataset(
@@ -306,7 +306,7 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
         if self.dataset_eval is not None and self.arguments.do_eval:
             dataloader_eval = tfds.as_numpy(
                 self.dataset_eval.to_tf_dataset(
-                    batch_size=self.arguments.total_batch_size,
+                    batch_size=self.arguments.eval_batch_size,
                     drop_remainder=True,
                     shuffle=True,
                     num_workers=self.arguments.dataloader_num_workers,
