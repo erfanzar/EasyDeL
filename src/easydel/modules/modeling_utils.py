@@ -61,31 +61,28 @@ class EDPretrainedConfig(PretrainedConfig):
     """It initializes all the attributes of an object, and it's called when you create a new instance of that class.
 
     Args:
-        self: Refer to the instance of the class
-        axis_dims: Sequence[int]: Specify the number of dimensions for
-            each axis
-        axis_names: Sequence[str]: Set the names of the axes
-        attn_mechanism: Literal["vanilla", "flash", "splash", "ring"]:
-            attention mechanism to use
-        block_k: int: block size of key_states
-        block_q: int: block size of query_states
-        block_b: int: block size of bias
-        block_q_major_dkv: int: block size of block_q_major_dkv
-        block_k_major_dkv: int: block size of block_k_major_dkv
-        block_k_dkv: int: block size of block_k_dkv
-        block_q_dkv: int: block size of block_q_dkv
-        block_k_major_dq: int: block size of block_k_major_dq
-        block_k_dq: int: block size of block_k_dq
-        block_q_dq: int: block size of block_q_dq
+        axis_dims (Sequence[int]): Specify the number of dimensions for each axis
+        axis_names (Sequence[str]): Set the names of the axes
+        attn_mechanism (Literal["vanilla", "flash", "splash", "ring"]): attention mechanism to use
+        block_k (int): block size of key_states
+        block_q (int): block size of query_states
+        block_b (int): block size of bias
+        block_q_major_dkv (int): block size of block_q_major_dkv
+        block_k_major_dkv (int): block size of block_k_major_dkv
+        block_k_dkv (int): block size of block_k_dkv
+        block_q_dkv (int): block size of block_q_dkv
+        block_k_major_dq (int): block size of block_k_major_dq
+        block_k_dq (int): block size of block_k_dq
+        block_q_dq (int): block size of block_q_dq
         partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
-        shard_attention_computation: bool: whenever to shard qkv b for
-            attention
-        use_sharding_constraint: bool: whether to use sharding
-            constraint for the arrays
-        use_scan_mlp: bool: Determine whether to use scan_mlp or not
-        backend: Optional[None]: Specify the backend to use
-        flash_attention_backward_pass_impl: Literal["triton", "xla"]:
-            Specify the backward pass kernel for flash attention
+        shard_attention_computation (bool): whenever to shard qkv b for attention
+        use_sharding_constraint (bool): whether to use sharding constraint for the arrays
+        use_scan_mlp (bool): Determine whether to use scan_mlp or not
+        backend (Optional[None]): Specify the backend to use
+        flash_attention_backward_pass_impl (Literal["triton", "xla"]): Specify the backward pass kernel for flash attention
+        attn_dtype (jnp.dtype): data type for computing attention.
+        fcm_max_ratio (float): value for fcm mask - max ratio
+        fcm_min_ratio (float): value for fcm mask - min ratio
     """
 
     _show_private_attrs: bool = False
@@ -121,6 +118,8 @@ class EDPretrainedConfig(PretrainedConfig):
         quantize_kv_cache: bool = False,
         flash_attention_backward_pass_impl: Literal["triton", "xla"] = "triton",
         attn_dtype: jnp.dtype = jnp.float32,
+        fcm_max_ratio: float = 0.0,
+        fcm_min_ratio: float = 0.0,
         **kwargs,
     ):
         self.axis_dims = getattr(
@@ -267,6 +266,17 @@ class EDPretrainedConfig(PretrainedConfig):
             self,
             "attn_dtype",
             attn_dtype,
+        )
+
+        self.fcm_max_ratio = getattr(
+            self,
+            "fcm_max_ratio",
+            fcm_max_ratio,
+        )
+        self.fcm_min_ratio = getattr(
+            self,
+            "fcm_min_ratio",
+            fcm_min_ratio,
         )
         if self.quantize_kv_cache and self.use_sharded_kv_caching:
             quantize_kv_cache = self.quantize_kv_cache

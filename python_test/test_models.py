@@ -603,9 +603,12 @@ class EasyModelsTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
-    # test = EasyModelsTest()
-    # test.setUp()
-    # test.test_mistral()
+    # unittest.main()
+    test = EasyModelsTest()
+    test.setUp()
+    test.test_mistral()
     # test.test_gemma2()
     # test.test_llama()
+    # test.test_arctic()
+    # test.test_cohere()
+    test.test_dbrx()

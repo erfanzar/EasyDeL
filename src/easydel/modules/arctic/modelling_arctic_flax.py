@@ -332,6 +332,18 @@ class FlaxArcticAttention(FlaxAttentionModule):
 
 
 class ArcticMLP(nn.Module):
+    """
+    ArcticMLP is a multi-layer perceptron (MLP) module for neural network models,
+    configured with specific settings and optional residual connections.
+
+    Attributes:
+        config (ArcticConfig): Configuration object containing model parameters.
+        dtype (jnp.dtype): Data type for computation (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for model parameters (default is jnp.bfloat16).
+        precision (Optional[jax.lax.Precision]): Precision setting for JAX operations (default is "fastest").
+        is_residual_mlp (bool): Flag to determine if the MLP includes residual connections (default is False).
+    """
+
     config: ArcticConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
@@ -339,6 +351,13 @@ class ArcticMLP(nn.Module):
     is_residual_mlp: bool = False
 
     def setup(self) -> None:
+        """
+        Initializes the MLP module by setting up dense layers and activation functions.
+
+        The setup method determines the dimensions for the hidden layers and intermediate layers
+        based on the configuration and whether the MLP is residual. It also initializes the dense
+        layers and the activation function.
+        """
         config = self.config
         self.hidden_dim = config.hidden_size
         self.ffn_dim = (
@@ -359,11 +378,32 @@ class ArcticMLP(nn.Module):
         self.act_fn = ACT2FN[self.config.hidden_act]
 
     def __call__(self, x: chex.Array, e=None):
+        """
+        Forward pass of the MLP module.
+
+        Args:
+            x (chex.Array): Input tensor.
+            e (Optional): Unused parameter (for compatibility).
+
+        Returns:
+            chex.Array: Output tensor after applying dense layers and activation functions.
+        """
         x = control_mlp_sharding(x, self.config.partition_axis)
         return self.w2(self.act_fn(self.w1(x)) * self.w3(x))
 
 
 class FlaxArcticBlocKSparesMLPCollection(nn.Module):
+    """
+    FlaxArcticBlocKSparesMLPCollection is a collection of MLP layers that can be selectively activated,
+    forming a part of a Mixture of Experts (MoE) architecture.
+
+    Attributes:
+        config (ArcticConfig): Configuration object containing model parameters.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for model parameters (default is jnp.bfloat16).
+        precision (Optional[jax.lax.Precision]): Precision setting for JAX operations (default is "fastest").
+    """
+
     config: ArcticConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
@@ -390,6 +430,20 @@ class FlaxArcticBlocKSparesMLPCollection(nn.Module):
         sequence_length: int,
         hidden_dim: int,
     ) -> chex.Array:
+        """
+        Forward pass that applies the selected experts to the input hidden states.
+
+        Args:
+            selected_experts (chex.Array): Indices of selected experts for each token.
+            hidden_states (chex.Array): Input tensor containing the hidden states.
+            routing_weights (chex.Array): Weights assigned by the router for each expert.
+            batch_size (int): Batch size of the input data.
+            sequence_length (int): Sequence length of the input data.
+            hidden_dim (int): Hidden dimension of the input data.
+
+        Returns:
+            chex.Array: The final output after processing through the experts.
+        """
         final_hidden_state = jnp.zeros_like(hidden_states)
 
         for index in range(self.config.num_local_experts):
@@ -415,6 +469,17 @@ class FlaxArcticBlocKSparesMLPCollection(nn.Module):
 
 
 class FlaxArcticMoE(nn.Module):
+    """
+    FlaxArcticMoE implements a Mixture of Experts (MoE) layer, where each input can be processed by one or more experts.
+
+    Attributes:
+        config (ArcticConfig): Configuration object containing model parameters.
+        layer_id (int): The index of the layer in the overall network.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for model parameters (default is jnp.bfloat16).
+        precision (Optional[jax.lax.Precision]): Precision setting for JAX operations (default is "fastest").
+    """
+
     config: ArcticConfig
     layer_id: int
     dtype: jnp.dtype = jnp.bfloat16
@@ -459,6 +524,16 @@ class FlaxArcticMoE(nn.Module):
         hidden_states: chex.Array,
         e: bool = False,  # Ignored
     ) -> Tuple[chex.Array, chex.Array]:
+        """
+        Processes the input through the MoE layer, involving gating and expert selection.
+
+        Args:
+            hidden_states (chex.Array): The input tensor.
+            e (bool): An optional parameter, ignored in this implementation.
+
+        Returns:
+            Tuple[chex.Array, chex.Array]: The processed output and an auxiliary loss.
+        """
         hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
         batch_size, sequence_length, hidden_dim = hidden_states.shape
 
@@ -487,6 +562,16 @@ class FlaxArcticMoE(nn.Module):
         )
 
     def __call__(self, hidden_states: chex.Array, e: bool = False):  # Ignored
+        """
+        Determines whether to use the MoE layer or a standard MLP, based on the configuration.
+
+        Args:
+            hidden_states (chex.Array): The input tensor containing hidden states.
+            e (bool): An optional parameter, ignored in this implementation.
+
+        Returns:
+            Tuple[chex.Array, chex.Array]: The output tensor and a scalar auxiliary loss.
+        """
         if self.is_moe_layer:
             return self._call_moe(hidden_states=hidden_states, e=e)
         return self.mlp(hidden_states, e=e), jnp.array(0.0, dtype=hidden_states.dtype)
@@ -557,6 +642,18 @@ class FlaxArcticSparseMoeBlock(nn.Module):
 
 
 class FlaxArcticDecoderLayer(nn.Module):
+    """
+    FlaxArcticDecoderLayer represents a single layer in a Transformer-like model,
+    incorporating self-attention and Mixture of Experts (MoE) mechanisms.
+
+    Attributes:
+        config (ArcticConfig): Configuration object containing model parameters.
+        layer_index (int): The index of the current layer.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for model parameters (default is jnp.bfloat16).
+        precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
+    """
+
     config: ArcticConfig
     layer_index: int
     dtype: jnp.dtype = jnp.bfloat16
@@ -564,14 +661,7 @@ class FlaxArcticDecoderLayer(nn.Module):
     precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
-        # hidden_states: chex.Array
-        # freq_cis: Tuple[chex.Array, chex.Array],
-        # attention_mask: chex.Array
-        # causal_mask: chex.Array
-        # position_ids: chex.Array
-        # deterministic: bool = True
-        # init_cache: bool = False
-        # output_attentions: bool = True
+        """Initializes the layer components, including attention and MoE blocks, and layer normalization."""
 
         attn_block = FlaxArcticAttention
         mlp_block = FlaxArcticSparseMoeBlock
@@ -644,36 +734,29 @@ class FlaxArcticDecoderLayer(nn.Module):
         deterministic: bool = True,
         init_cache: bool = False,
         output_attentions: bool = True,
-    ):
+    ) -> Tuple[chex.Array, Optional[chex.Array], chex.Array]:
         """
-        Forward pass of the attention module.
+        Forward pass for the decoder layer, applying self-attention and MoE transformations.
 
         Args:
-            hidden_states (chex.Array): Input hidden states.
-            freq_cis (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
-            attention_mask (chex.Array): Mask to apply on the attention scores.
-            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-            position_ids (chex.Array): Position indices for the tokens.
-            segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-            deterministic (bool): If True, disables dropout for deterministic behavior.
-            init_cache (bool): If True, initializes cache for caching keys and values.
-            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
+            hidden_states (chex.Array): Input tensor containing the hidden states.
+            freq_cis (Tuple[chex.Array, chex.Array]): Frequency positional encodings.
+            attention_mask (chex.Array): Mask to apply during attention.
+            causal_mask (chex.Array): Causal mask for autoregressive decoding.
+            position_ids (chex.Array): Positional indices for the sequence.
+            segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
+            deterministic (bool): If True, disables dropout.
+            init_cache (bool): If True, initializes caching mechanism for fast decoding.
+            output_attentions (bool): If True, returns attention weights.
 
         Returns:
-            Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+            Tuple[chex.Array, Optional[chex.Array], chex.Array]:
+                - hidden_states: The output tensor after layer processing.
+                - self_attn_weights: Attention weights (if `output_attentions` is True).
+                - gate_loss: Loss associated with the MoE gating mechanism.
         """
         residual_input = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-
-        # hidden_states: chex.Array
-        # freq_cis: Tuple[chex.Array, chex.Array],
-        # attention_mask: chex.Array
-        # causal_mask: chex.Array
-        # position_ids: chex.Array
-        # segment_ids: Optional[chex.Array] = None
-        # deterministic: bool = True
-        # init_cache: bool = False
-        # output_attentions: bool = True
         attn_out = self.self_attn(
             hidden_states,
             freq_cis,
@@ -713,6 +796,16 @@ class FlaxArcticDecoderLayer(nn.Module):
 
 
 class FlaxArcticDecoderLayerCollection(nn.Module):
+    """
+    Collection of Flax Arctic Decoder Layers.
+
+    Attributes:
+        config (ArcticConfig): Configuration object with model hyperparameters.
+        dtype (jnp.dtype): Data type for the computations.
+        param_dtype (jnp.dtype): Data type for the model parameters.
+        precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
+    """
+
     config: ArcticConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
@@ -738,39 +831,29 @@ class FlaxArcticDecoderLayerCollection(nn.Module):
         attention_mask: chex.Array,
         causal_mask: chex.Array,
         position_ids: chex.Array,
+        segment_ids: chex.Array,
         deterministic: bool = True,
         init_cache: bool = False,
         output_hidden_states: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
-    ):
-        """The __call__ function is the main function of a TransformerEncoderLayer.
-        It takes in the following arguments:
-            hidden_states (chex.Array): The input to the encoder layer, which is also its output after being processed
-             by all sublayers.
-            freq_cis (chex.Array): A tensor containing frequency-domain representations of each token's context vector
-            , used for computing self-attention weights and biases in a more efficient manner than using position
-            embeddings or sinusoidal positional encoding vectors would allow for [2].
+    ) -> Tuple:
+        """
+        Forward pass through the collection of decoder layers.
 
         Args:
-            self: Represent the instance of the class
-            hidden_states: chex.Array: Represent the input to the
-                encoder layer
-            freq_cis: Tuple[chex.Array, chex.Array],: Pass the frequency
-                information to the attention layer
-            attention_mask: chex.Array: Mask out the attention weights
-                for certain positions
-            causal_mask: chex.Array: Mask the future tokens
-            position_ids: chex.Array: Indicate the position of each
-                token in the sequence
-            deterministic: bool: Determine whether to use dropout or not
-            init_cache: bool: Initialize the cache for the self-
-                attention layer
-            output_attentions: bool: Determine whether to return the
-                attention weights or not
+            hidden_states (chex.Array): The hidden states input to the decoder.
+            freq_cis (Tuple[chex.Array, chex.Array]): Frequency components for positional embeddings.
+            attention_mask (chex.Array): Mask for attention mechanism.
+            causal_mask (chex.Array): Causal mask for autoregressive decoding.
+            position_ids (chex.Array): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
+            deterministic (bool): If True, disable dropout.
+            init_cache (bool): If True, initialize cache for decoding.
+            output_hidden_states (Optional[bool]): If True, output all hidden states.
+            output_attentions (Optional[bool]): If True, output attention weights.
 
         Returns:
-            A tuple of hidden_states, attention_output,
-            all_hidden_states and all_router_losses
+            Tuple: The final hidden state, optional attention weights, and router losses.
         """
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
@@ -787,6 +870,7 @@ class FlaxArcticDecoderLayerCollection(nn.Module):
                 freq_cis=freq_cis,
                 causal_mask=causal_mask,
                 deterministic=deterministic,
+                segment_ids=segment_ids,
             )
 
             hidden_states = layer_outputs[0]
@@ -806,11 +890,18 @@ class FlaxArcticDecoderLayerCollection(nn.Module):
 
 
 class ArcticPreTrainedModel(EDPretrainedModel):
+    """
+    Base class for Arctic models providing initialization and configuration.
+
+    Attributes:
+        config_class (ArcticConfig): The configuration class for the model.
+        module_class (nn.Module): The class representing the model's architecture.
+        base_model_prefix (str): The prefix for the base model parameters.
+    """
+
     config_class: ArcticConfig = ArcticConfig
     module_class: nn.Module = None
     base_model_prefix = "model"
-
-    # main_input_name = "input_ids"
 
     def __init__(
         self,
@@ -823,6 +914,19 @@ class ArcticPreTrainedModel(EDPretrainedModel):
         _do_init: bool = False,
         **kwargs,
     ):
+        """
+        Initializes the pre-trained model with the given configuration.
+
+        Args:
+            config (ArcticConfig): Configuration for the model.
+            dtype (jnp.dtype): Data type for computations.
+            param_dtype (jnp.dtype): Data type for model parameters.
+            precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
+            input_shape (Tuple[int, int]): Shape of the input tensor.
+            seed (int): Seed for random number generation.
+            _do_init (bool): If True, initialize model weights.
+            **kwargs: Additional keyword arguments.
+        """
         module = self.module_class(
             config=config,
             dtype=dtype,
@@ -846,21 +950,16 @@ class ArcticPreTrainedModel(EDPretrainedModel):
         input_shape: Tuple,
         params: FrozenDict = None,
     ) -> FrozenDict:
-        """The init_weights function is used to initialize the weights of a model.
-        It takes in a rng, which is a random number generator key that can be used to generate random numbers.
-        The input_shape parameter specifies the shape of the inputs that will be fed into this model.
-        The params parameter allows you to pass in pre-trained weights for your model, if you have them available.
+        """
+        Initializes the model weights.
 
         Args:
-            self: Access variables that belong to the class
-            rng: jax.random.PRNGKey: Initialize the weights of the model
-            input_shape: Tuple: Initialize the input_ids, attention_mask
-                and position_ids
-            params: flax.core.FrozenDict: Pass in the parameters of a
-                pre-trained model
+            rng (jax.random.PRNGKey): Random number generator key.
+            input_shape (Tuple): Shape of the input tensor for initializing weights.
+            params (FrozenDict, optional): Existing parameters to initialize with.
 
         Returns:
-            A frozendict of parameters
+            FrozenDict: Initialized model parameters.
         """
 
         self.config.initialization_of_moe = True
@@ -906,6 +1005,16 @@ class ArcticPreTrainedModel(EDPretrainedModel):
             return random_params
 
     def init_cache(self, batch_size, max_length):
+        """
+        Initializes the cache for autoregressive generation.
+
+        Args:
+            batch_size (int): Batch size for the cache.
+            max_length (int): Maximum length for the cache.
+
+        Returns:
+            dict: Initialized cache.
+        """
         input_ids = jnp.ones((batch_size, max_length))
         attention_mask = jnp.ones_like(input_ids)
         position_ids = jnp.broadcast_to(
@@ -927,6 +1036,8 @@ class ArcticPreTrainedModel(EDPretrainedModel):
         input_ids: chex.Array,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
+        segment_ids: Optional[chex.Array] = None,
+        inputs_embeds: Optional[chex.Array] = None,
         params: dict = None,
         past_key_values: dict = None,
         dropout_rng: jax.random.PRNGKey = None,
@@ -937,37 +1048,28 @@ class ArcticPreTrainedModel(EDPretrainedModel):
         add_params_field: bool = False,
         **kwargs,
     ):
-        """The __call__ function is the main function of a JAX module.
-        It takes as input:
-        - The parameters of the model (self.params)
-        - The inputs to the model (input_ids, attention_mask, position_ids)
-        - Whether we are training (train=True/False) and whether we want to return all hidden states and
-        attentions weights at each layer in addition to just the last layer output (output_hidden_states=True/False).
+        """
+        Forward pass through the model.
 
         Args:
-            self: Represent the instance of the class
-            input_ids: Pass the input sequence to the model
-            attention_mask: Mask out the padding tokens
-            position_ids: Specify the position of each token in the
-                sequence
-            params: dict: Pass in the parameters of the model
-            past_key_values: dict: Pass the past key values to the model
-            dropout_rng: jax.random.PRNGKey: Pass in a random number
-                generator key to the model
-            train: bool: Determine whether to use dropout or not
-            output_attentions: Optional[bool]: Determine whether to
-                return the attention weights
-            output_hidden_states: Optional[bool]: Determine whether to
-                return the hidden states of all layers
-            return_dict: Optional[bool]: Return a dictionary of the
-                outputs
-            add_params_field: bool: Add a params field to the inputs
-                dictionary
+            input_ids (chex.Array): Input tensor containing token IDs.
+            attention_mask (Optional[chex.Array]): Mask for attention.
+            position_ids (Optional[chex.Array]): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
+            inputs_embeds (Optional[chex.Array]): embedding inputs to be used instead of input_ids.
+            params (dict, optional): Parameters for the model.
+            past_key_values (dict, optional): Past key and value states for caching.
+            dropout_rng (jax.random.PRNGKey, optional): RNG key for dropout.
+            train (bool): If True, the model is in training mode.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            return_dict (Optional[bool]): If True, return a dictionary of outputs.
+            add_params_field (bool): If True, include the parameters in the input dictionary.
+            **kwargs: Additional arguments.
 
         Returns:
-            A tuple of (last_hidden_state, past_key_values)
+            Output type depends on the model configuration.
         """
-
         output_attentions = (
             output_attentions
             if output_attentions is not None
@@ -981,9 +1083,13 @@ class ArcticPreTrainedModel(EDPretrainedModel):
         return_dict = (
             return_dict if return_dict is not None else self.config.return_dict
         )
-
-        batch_size, sequence_length = input_ids.shape
-
+        if input_ids is not None:
+            batch_size, sequence_length = input_ids.shape
+        else:
+            assert (
+                inputs_embeds is not None
+            ), "both `input_ids` and `input_embeds` can't be None"
+            batch_size, sequence_length, _ = inputs_embeds.shape
         if position_ids is None:
             if past_key_values is not None:
                 raise ValueError(
@@ -1017,18 +1123,16 @@ class ArcticPreTrainedModel(EDPretrainedModel):
 
         outputs = self.module.apply(
             inputs,
-            jnp.array(input_ids, dtype="i4"),  # input_ids: chex.Array
-            # attention_mask: Optional[chex.Array] = None
-            jnp.array(attention_mask, dtype="i4"),
-            # position_ids: Optional[chex.Array] = None
-            jnp.array(position_ids, dtype="i4"),
-            None,  # inputs_embeds: Optional[chex.Array] = None
-            output_attentions,  # output_attentions: Optional[bool] = None
-            # output_hidden_states: Optional[bool] = None
-            output_hidden_states,
-            False,  # init_cache: bool = False
-            not train,  # deterministic: bool = True
-            return_dict,  # return_dict: bool = True
+            input_ids=jnp.array(input_ids, dtype="i4"),
+            attention_mask=jnp.array(attention_mask, dtype="i4"),
+            position_ids=jnp.array(position_ids, dtype="i4"),
+            segment_ids=segment_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            init_cache=False,
+            deterministic=not train,
+            return_dict=return_dict,
             rngs=rng_s,
             mutable=mutable,
         )
@@ -1045,6 +1149,16 @@ class ArcticPreTrainedModel(EDPretrainedModel):
 
 
 class FlaxArcticModule(nn.Module):
+    """
+    Core module of the Arctic model, including embedding, decoder layers, and normalization.
+
+    Attributes:
+        config (ArcticConfig): Configuration object with model hyperparameters.
+        dtype (jnp.dtype): Data type for the computations.
+        param_dtype (jnp.dtype): Data type for the model parameters.
+        precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
+    """
+
     config: ArcticConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
@@ -1098,6 +1212,7 @@ class FlaxArcticModule(nn.Module):
         input_ids: chex.Array,
         attention_mask: chex.Array,
         position_ids: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
         inputs_embeds: Optional[chex.Array] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -1105,6 +1220,24 @@ class FlaxArcticModule(nn.Module):
         deterministic: bool = True,
         return_dict: bool = True,
     ) -> MoeModelOutput | Tuple:
+        """
+        Forward pass through the Arctic module.
+
+        Args:
+            input_ids (chex.Array): Input tensor containing token IDs.
+            attention_mask (chex.Array): Mask for attention.
+            position_ids (chex.Array): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
+            inputs_embeds (Optional[chex.Array]): Embedded input tensor.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            init_cache (bool): If True, initialize cache for decoding.
+            deterministic (bool): If True, disable dropout.
+            return_dict (bool): If True, return a dictionary of outputs.
+
+        Returns:
+            MoeModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
+        """
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError(
                 "You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time"
@@ -1137,6 +1270,7 @@ class FlaxArcticModule(nn.Module):
             output_hidden_states=output_hidden_states,
             init_cache=init_cache,
             deterministic=deterministic,
+            segment_ids=segment_ids,
         )
         all_self_attns = None
         all_hidden_states = None
@@ -1171,6 +1305,13 @@ class FlaxArcticModule(nn.Module):
 
 
 class FlaxArcticModel(ArcticPreTrainedModel):
+    """
+    Wrapper class for the Arctic model, handling the setup and interaction with the core module.
+
+    Attributes:
+        module_class: The class representing the core module of the model.
+    """
+
     module_class = FlaxArcticModule
 
     def set_input_embeddings(self, value):
@@ -1181,6 +1322,16 @@ class FlaxArcticModel(ArcticPreTrainedModel):
 
 
 class FlaxArcticForCausalLMModule(nn.Module):
+    """
+    Arctic model for causal language modeling, including the language model head.
+
+    Attributes:
+        config (ArcticConfig): Configuration object with model hyperparameters.
+        dtype (jnp.dtype): Data type for the computations.
+        param_dtype (jnp.dtype): Data type for the model parameters.
+        precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
+    """
+
     config: ArcticConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
@@ -1206,8 +1357,9 @@ class FlaxArcticForCausalLMModule(nn.Module):
     def __call__(
         self,
         input_ids: chex.Array,
-        attention_mask: Optional[chex.Array] = None,
-        position_ids: Optional[chex.Array] = None,
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
         inputs_embeds: Optional[chex.Array] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -1215,6 +1367,24 @@ class FlaxArcticForCausalLMModule(nn.Module):
         deterministic: bool = True,
         return_dict: bool = True,
     ) -> MoeCausalLMOutput | Tuple:
+        """
+        Forward pass through the causal language modeling module.
+
+        Args:
+            input_ids (chex.Array): Input tensor containing token IDs.
+            attention_mask (chex.Array): Mask for attention.
+            position_ids (chex.Array): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
+            inputs_embeds (Optional[chex.Array]): Embedded input tensor.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            init_cache (bool): If True, initialize cache for decoding.
+            deterministic (bool): If True, disable dropout.
+            return_dict (bool): If True, return a dictionary of outputs.
+
+        Returns:
+            MoeCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
+        """
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1225,6 +1395,7 @@ class FlaxArcticForCausalLMModule(nn.Module):
             init_cache=init_cache,
             deterministic=deterministic,
             return_dict=True,
+            segment_ids=segment_ids,
         )
         logits = self.lm_head(outputs.last_hidden_state)
 
@@ -1273,7 +1444,10 @@ class FlaxArcticForCausalLM(ArcticPreTrainedModel):
         self.module.lm_head = new_embeddings
 
     def prepare_inputs_for_generation(
-        self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
+        self,
+        input_ids,
+        max_length,
+        attention_mask: Optional[chex.Array] = None,
     ):
         """The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
 

@@ -238,3 +238,19 @@ class MistralConfig(EDPretrainedConfig):
     @staticmethod
     def rng_keys():
         return "params", "dropout", "fcm"
+
+    @property
+    def granted_freq_max_position_embedding(self) -> int:
+        return getattr(
+            self,
+            "freq_max_position_embeddings",
+            self.max_position_embeddings,
+        )
+
+    @property
+    def granted_mask_max_position_embedding(self) -> int:
+        return getattr(
+            self,
+            "mask_max_position_embeddings",
+            self.max_position_embeddings,
+        )

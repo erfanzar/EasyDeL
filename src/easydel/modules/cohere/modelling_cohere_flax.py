@@ -89,12 +89,33 @@ class RMSNorm(nn.Module):
 
 
 class FlaxCohereAttention(FlaxAttentionModule):
+    """
+    FlaxCohereAttention implements an attention mechanism with rotary embeddings.
+
+    Attributes:
+        config (CohereConfig): Configuration for the attention module.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
+    """
+
     config: CohereConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
+        """
+        Sets up the attention module by initializing projection layers, rotary embeddings, and other parameters.
+
+        The setup method initializes the following:
+        - `hidden_size`, `num_heads`, `head_dim`: Dimensions and size attributes based on the configuration.
+        - `num_key_value_heads`, `num_key_value_groups`: Configuration for key-value heads.
+        - `max_position_embeddings`: Maximum number of position embeddings.
+        - `q_proj`, `k_proj`, `v_proj`, `o_proj`: Dense layers for query, key, value, and output projections.
+        - `rotary`: Rotary embedding module.
+        - `attention_performer`: Flexible attention module handling the main attention computations.
+        """
         config = self.config
         self.hidden_size = config.hidden_size
         self.head_dim = self.config.hidden_size // self.config.num_attention_heads
@@ -162,31 +183,16 @@ class FlaxCohereAttention(FlaxAttentionModule):
 
         self.rotary = FlaxCohereEmbedding(self.dtype)
         self.attention_performer = FlexibleAttentionModule(
-            use_sharding_constraint=self.config.use_sharding_constraint,
-            block_k_major=self.config.block_k_major,
-            block_b=self.config.block_b,
-            block_q=self.config.block_q,
-            block_k=self.config.block_k,
-            block_q_major_dkv=self.config.block_q_major_dkv,
-            block_k_major_dkv=self.config.block_k_major_dkv,
-            block_k_major_dq=self.config.block_k_major_dq,
-            block_k_dkv=self.config.block_k_dkv,
-            block_q_dkv=self.config.block_q_dkv,
-            block_q_dq=self.config.block_q_dq,
-            block_k_dq=self.config.block_k_dq,
             num_attention_heads=self.config.num_attention_heads,
             attention_dropout=self.config.attention_dropout,
             head_dims=self.head_dim,
-            shard_attention_computation=self.config.shard_attention_computation,
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
-            dtype=self.config.attn_dtype,
-            partition_axis=self.config.partition_axis,
-            scan_ring_attention=self.config.scan_ring_attention,
             mesh=self.config.mesh,
             sm_scale=1 / math.sqrt(self.head_dim),
             axis_name=self.config.attention_axis_name,
+            base_config=self.config,
             backward_pass_impl=self.config.flash_attention_backward_pass_impl,
         )
 
@@ -202,33 +208,27 @@ class FlaxCohereAttention(FlaxAttentionModule):
         """
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
-    def apply_rotary(
-        self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
-    ):
-        """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
-        The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
-        the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
+    def apply_rotary(self, query, key, freq_cis, position_ids):
+        """
+        Applies rotary positional embeddings to the query and key tensors.
 
         Args:
-            self: Access variables that belong to the class
-            batch_size: Reshape the query, key and value tensors
-            sequence_length: Reshape the query, key and value tensors
-            query: Calculate the attention weights
-            key: Calculate the attention
-            value: Compute the attention weights
-            freq_cis: Calculate the frequency of each word in the
-                vocabulary
-            position_ids: Identify the position of each token in the
-                sequence
+            query (chex.Array): Query tensor.
+            key (chex.Array): Key tensor.
+            freq_cis (Tuple[chex.Array, chex.Array]): Tuple containing cosine and sine components for rotary embeddings.
+            position_ids (chex.Array): Position indices for the tokens.
 
         Returns:
-            A tuple of 3 tensors: query, key and value
+            Tuple[chex.Array, chex.Array]: The modified query and key tensors after applying rotary embeddings.
         """
-        query, key, value = self._transpose_sequence_head(query, key, value)
+        query, key = self._transpose_sequence_head(query, key)
         query, key = self.rotary(
-            position_ids=position_ids, query=query, key=key, freq_cis=freq_cis
+            position_ids=position_ids,
+            query=query,
+            key=key,
+            freq_cis=freq_cis,
         )
-        return self._transpose_sequence_head(query, key, value)
+        return self._transpose_sequence_head(query, key)
 
     def __call__(
         self,
@@ -241,34 +241,24 @@ class FlaxCohereAttention(FlaxAttentionModule):
         deterministic: bool = True,
         init_cache: bool = False,
         output_attentions: bool = False,
-        fcm_mask=None,
+        fcm_mask: Optional[chex.Array] = None,
     ):
-        """The __call__ function is the main function of a JAX module. It defines how the module behaves when called
-        with inputs. The __call__ function can be thought of as a &quot;forward pass&quot; through the model,
-        and it should return all outputs that are needed for training or inference.
+        """
+        Forward pass of the attention module.
 
         Args:
-            self: Access variables that belong to the class
-            hidden_states: chex.Array: Pass the hidden states of the
-                previous layer
-            freq_cis: Tuple[chex.Array, chex.Array],: Pass in the
-                frequency coefficients for each position
-            attention_mask: chex.Array: Mask out certain tokens in the
-                input sequence
-            position_ids: chex.Array: Determine the position of each
-                token in a sequence
-            causal_mask: chex.Array: Mask out the future tokens in the
-                decoder
-            deterministic: bool: Determine whether to use dropout or not
-            init_cache: bool: Initialize the cache
-            output_attentions: bool: Determine whether to return the
-                attention weights or not
-            fcm_mask: Mask out the attention weights between the input
-                and output tokens
-
-
+            hidden_states (chex.Array): Input hidden states.
+            freq_cis (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            attention_mask (chex.Array): Mask to apply on the attention scores.
+            position_ids (chex.Array): Position indices for the tokens.
+            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            deterministic (bool): If True, disables dropout for deterministic behavior.
+            init_cache (bool): If True, initializes cache for caching keys and values.
+            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
+            fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
         Returns:
-            A tuple of two arrays
+            Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
         """
         batch_size, sequence_length = hidden_states.shape[:2]
         (query_states, key_states, value_states) = (
@@ -299,14 +289,11 @@ class FlaxCohereAttention(FlaxAttentionModule):
             self.head_dim,
         )
 
-        query_states, key_states, value_states = self.apply_rotary(
+        query_states, key_states = self.apply_rotary(
             query=query_states,
             key=key_states,
-            value=value_states,
             position_ids=position_ids,
             freq_cis=freq_cis,
-            batch_size=batch_size,
-            sequence_length=sequence_length,
         )
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
@@ -355,16 +342,7 @@ class FlaxCohereAttention(FlaxAttentionModule):
         assert query_states.shape[-2] == self.config.num_attention_heads, assert_msg
         assert key_states.shape[-2] == self.config.num_attention_heads, assert_msg
         assert value_states.shape[-2] == self.config.num_attention_heads, assert_msg
-        # if self.config.use_sharding_constraint:
-        #     query_states = with_sharding_constraint(
-        #         query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)
-        #     )
-        #     key_states = with_sharding_constraint(
-        #         key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-        #     )
-        #     value_states = with_sharding_constraint(
-        #         value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-        #     )
+
         attention_bias = lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -416,12 +394,27 @@ class FlaxCohereAttention(FlaxAttentionModule):
 
 
 class FlaxCohereMLP(nn.Module):
+    """
+    FlaxCohereMLP is a multi-layer perceptron (MLP) module for neural network models,
+    configured with specific settings.
+
+    Attributes:
+        config (CohereConfig): Configuration object containing model parameters.
+        dtype (jnp.dtype): Data type for computation (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for model parameters (default is jnp.bfloat16).
+        precision (Optional[jax.lax.Precision]): Precision setting for JAX operations (default is "fastest").
+
+    """
+
     config: CohereConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
+        """
+        Initializes the MLP module by setting up dense layers and activation functions.
+        """
         config = self.config
 
         self.gate_proj = nn.Dense(
@@ -453,18 +446,15 @@ class FlaxCohereMLP(nn.Module):
         )
 
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-        """The __call__ function is the main function of a class.
-        It is called when an instance of the class (an object) is invoked as a function, i.e., obj(arguments).
-        The __call__ method enables instances of a class to be called like standard Python functions.
+        """
+        Forward pass of the MLP module.
 
         Args:
-            self: Represent the instance of the class
-            x: jnp.ndarray: Pass in the input to the layer
-            deterministic: bool: Determine whether to use dropout
+            x (chex.Array): Input tensor.
+            e (Optional): Unused parameter (for compatibility).
 
         Returns:
-            A tensor that is the result of applying a dropout function
-            to x
+            chex.Array: Output tensor after applying dense layers and activation functions.
         """
 
         x = control_mlp_sharding(x, self.config.partition_axis)
@@ -530,34 +520,24 @@ class FlaxCohereBlock(nn.Module):
         deterministic: bool = True,
         init_cache: bool = False,
         output_attentions: bool = False,
-        fcm_mask: Optional[jnp.ndarray] = None,
+        fcm_mask: Optional[chex.Array] = None,
     ):
-        """The __call__ function is the main function of a TransformerEncoderLayer.
-        It takes in hidden states, frequency-domain inputs, and masks as input. It then
-        applies self-attention to the hidden states using those inputs and returns an
-        output tensor with shape (batch_size, sequence_length, model_dim).
+        """
+        Forward pass of the module block.
 
         Args:
-            self: Refer to the class instance itself
-            hidden_states: chex.Array: Pass in the hidden state of the
-                previous layer
-            freq_cis: Tuple[chex.Array, chex.Array],: Pass in the
-                frequency information
-            attention_mask: chex.Array: Mask out the attention weights
-                for padding tokens
-            position_ids: chex.Array: Determine the position of each
-                token in the sequence
-            causal_mask: chex.Array: Mask the attention weights
-            deterministic: bool: Control whether the dropout is applied
-                or not
-            init_cache: bool: Initialize the cache in the attention
-                layer
-            output_attentions: bool: Return the attention weights
-            fcm_mask: Optional[jnp.ndarray]: Mask the self-attention
-
-
+            hidden_states (chex.Array): Input hidden states.
+            freq_cis (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            attention_mask (chex.Array): Mask to apply on the attention scores.
+            position_ids (chex.Array): Position indices for the tokens.
+            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            deterministic (bool): If True, disables dropout for deterministic behavior.
+            init_cache (bool): If True, initializes cache for caching keys and values.
+            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
+            fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
         Returns:
-            A tuple of two items
+            Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
         """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -596,6 +576,15 @@ class FlaxCohereBlock(nn.Module):
 
 
 class FlaxCoherePreTrainedModel(EDPretrainedModel):
+    """
+    Base class for Cohere models providing initialization and configuration.
+
+    Attributes:
+        config_class (CohereConfig): The configuration class for the model.
+        module_class (nn.Module): The class representing the model's architecture.
+        base_model_prefix (str): The prefix for the base model parameters.
+    """
+
     config_class = CohereConfig
     base_model_prefix = "model"
     module_class: nn.Module = None
@@ -603,56 +592,60 @@ class FlaxCoherePreTrainedModel(EDPretrainedModel):
     def __init__(
         self,
         config: CohereConfig,
-        input_shape: Tuple = (1, 1),
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+        input_shape: Tuple[int, int] = (1, 1),
         seed: int = 0,
-        dtype: jnp.dtype = jnp.float32,
-        _do_init: bool = True,
+        _do_init: bool = False,
         **kwargs,
     ):
-        """The __init__ function is called when the class is instantiated.
-        It sets up the instance of the class, and defines what happens when it's created.
-        The __init__ function can take arguments, but self is always required (it refers to the instance of the object).
+        """
+        Initializes the pre-trained model with the given configuration.
 
         Args:
-            self: Refer to the object itself
-            config: CohereConfig: Pass the configuration to the module
-            input_shape: Tuple: Specify the shape of the input to the
-                model
-            seed: int: Set the seed for random number generation
-            dtype: jnp.dtype: Specify the data type of the input
-            _do_init: bool: Control whether the module is initialized or
-                not
-            **kwargs: Pass in any additional parameters that the
-                module_class might need
-        :param : Specify the number of layers in the network
-
-        Returns:
-            The super() of the class
+            config (CohereConfig): Configuration for the model.
+            dtype (jnp.dtype): Data type for computations.
+            param_dtype (jnp.dtype): Data type for model parameters.
+            precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
+            input_shape (Tuple[int, int]): Shape of the input tensor.
+            seed (int): Seed for random number generation.
+            _do_init (bool): If True, initialize model weights.
+            **kwargs: Additional keyword arguments.
         """
-        module = self.module_class(config=config, dtype=dtype, **kwargs)
+        module = self.module_class(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            **kwargs,
+        )
+
         super().__init__(
-            config,
-            module,
-            input_shape=input_shape,
-            seed=seed,
             dtype=dtype,
             _do_init=_do_init,
+            module=module,
+            config=config,
+            input_shape=input_shape,
+            seed=seed,
         )
 
     def init_weights(
-        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+        self,
+        rng: jax.random.PRNGKey,
+        input_shape: Tuple,
+        params: FrozenDict = None,
     ) -> FrozenDict:
-        """The init_weights function is used to initialize the weights of a model.
+        """
+        Initializes the model weights.
 
         Args:
-            self: Access variables that belong to the class
-            rng: jax.random.PRNGKey: Initialize the weights of the model
-            input_shape: Tuple: Specify the shape of the input tensor
-            params: FrozenDict: Pass in the parameters of a pre-trained
-                model
+            rng (jax.random.PRNGKey): Random number generator key.
+            input_shape (Tuple): Shape of the input tensor for initializing weights.
+            params (FrozenDict, optional): Existing parameters to initialize with.
 
         Returns:
-            A frozendict of parameters
+            FrozenDict: Initialized model parameters.
         """
         input_ids = jnp.zeros(input_shape, dtype="i4")
         attention_mask = jnp.ones_like(input_ids)
@@ -676,7 +669,11 @@ class FlaxCoherePreTrainedModel(EDPretrainedModel):
             )
         else:
             module_init_outputs = self.module.init(
-                rngs, input_ids, attention_mask, position_ids, return_dict=False
+                rngs,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                return_dict=False,
             )
 
         random_params = module_init_outputs["params"]
@@ -692,18 +689,15 @@ class FlaxCoherePreTrainedModel(EDPretrainedModel):
             return random_params
 
     def init_cache(self, batch_size, max_length):
-        """The init_cache function is used to initialize the cache for a given batch size and sequence length.
-        The cache is a dictionary that contains all the intermediate states from each layer in the model.
-        This allows us to run inference on multiple batches without having to re-run forward passes through every layer in
-        the model, which would be very slow.
+        """
+        Initializes the cache for autoregressive generation.
 
         Args:
-            self: Access the module
-            batch_size: Define the batch size of the input tensors
-            max_length: Set the length of the input sequence
+            batch_size (int): Batch size for the cache.
+            max_length (int): Maximum length for the cache.
 
         Returns:
-            A dictionary with the following keys:
+            dict: Initialized cache.
         """
         input_ids = jnp.ones((batch_size, max_length))
         attention_mask = jnp.ones_like(input_ids)
@@ -713,9 +707,9 @@ class FlaxCoherePreTrainedModel(EDPretrainedModel):
 
         init_variables = self.module.init(
             jax.random.PRNGKey(0),
-            input_ids,
-            attention_mask,
-            position_ids,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
             return_dict=False,
             init_cache=True,
         )
@@ -724,8 +718,10 @@ class FlaxCoherePreTrainedModel(EDPretrainedModel):
     def __call__(
         self,
         input_ids: chex.Array,
-        attention_mask: chex.Array = None,
-        position_ids: chex.Array = None,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        segment_ids: Optional[chex.Array] = None,
+        inputs_embeds: Optional[chex.Array] = None,
         params: dict = None,
         past_key_values: dict = None,
         dropout_rng: jax.random.PRNGKey = None,
@@ -733,40 +729,30 @@ class FlaxCoherePreTrainedModel(EDPretrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
         add_params_field: bool = False,
         **kwargs,
     ):
-        """The __call__ function is the main function of a JAX module.
-        It takes in inputs and returns outputs, but it also has some other important features:
-        - It can take in mutable state (e.g., past_key_values) that will be updated during the call and returned at the end.
-        - It can take in random number generators (rngs) that are used to generate random numbers for dropout or sampling operations.
+        """
+        Forward pass through the model.
 
         Args:
-            self: Represent the instance of the class
-            input_ids: chex.Array: Pass in the input tokens
-            attention_mask: chex.Array: Mask out certain tokens in the
-                input
-            position_ids: chex.Array: Create the positional embeddings
-            params: dict: Pass in the parameters of the model
-            past_key_values: dict: Pass in the past key values from a
-                previous call to __call__
-            dropout_rng: jax.random.PRNGKey: Make sure that the dropout
-                is applied in a random way
-            train: bool: Determine whether to use dropout or not
-            output_attentions: Optional[bool]: Determine whether to
-                return the attention weights
-            output_hidden_states: Optional[bool]: Return the hidden
-                states of all layers
-            return_dict: Optional[bool]: Determine whether to return a
-                dictionary or not
-            extra_embedding: Optional[Union[jnp.ndarray,None]]: Pass in
-                the embedding for the input_ids
-            add_params_field: bool: Add the params field to the inputs
-                dictionary
+            input_ids (chex.Array): Input tensor containing token IDs.
+            attention_mask (Optional[chex.Array]): Mask for attention.
+            position_ids (Optional[chex.Array]): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
+            inputs_embeds (Optional[chex.Array]): embedding inputs to be used instead of input_ids.
+            params (dict, optional): Parameters for the model.
+            past_key_values (dict, optional): Past key and value states for caching.
+            dropout_rng (jax.random.PRNGKey, optional): RNG key for dropout.
+            train (bool): If True, the model is in training mode.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            return_dict (Optional[bool]): If True, return a dictionary of outputs.
+            add_params_field (bool): If True, include the parameters in the input dictionary.
+            **kwargs: Additional arguments.
 
         Returns:
-            A tuple of the following:
+            Output type depends on the model configuration.
         """
         output_attentions = (
             output_attentions
@@ -822,15 +808,16 @@ class FlaxCoherePreTrainedModel(EDPretrainedModel):
 
         outputs = self.module.apply(
             inputs,
-            jnp.array(input_ids, dtype="i4"),
-            jnp.array(attention_mask, dtype="i4"),
-            jnp.array(position_ids, dtype="i4"),
-            not train,
-            False,
-            output_attentions,
-            output_hidden_states,
-            return_dict,
-            extra_embedding,
+            input_ids=jnp.array(input_ids, dtype="i4"),
+            attention_mask=jnp.array(attention_mask, dtype="i4"),
+            position_ids=jnp.array(position_ids, dtype="i4"),
+            deterministic=not train,
+            init_cache=False,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            inputs_embeds=inputs_embeds,
+            segment_ids=segment_ids,
             rngs=rngs,
             mutable=mutable,
         )
@@ -847,6 +834,17 @@ class FlaxCoherePreTrainedModel(EDPretrainedModel):
 
 
 class FlaxCohereBlockCollection(nn.Module):
+    """
+    FlaxCohereBlockCollection represents a single layer in a Transformer-like model,
+    incorporating self-attention and MLP.
+
+    Attributes:
+        config (CohereConfig): Configuration object containing model parameters.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for model parameters (default is jnp.bfloat16).
+        precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
+    """
+
     config: CohereConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -869,43 +867,35 @@ class FlaxCohereBlockCollection(nn.Module):
         hidden_states: chex.Array,
         freq_cis: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
-        position_ids: chex.Array,
         causal_mask: chex.Array,
+        position_ids: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
         deterministic: bool = True,
         init_cache: bool = False,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
-        return_dict: bool = True,
-    ):
-        """The __call__ function is the main function of a JAX nn.Module.
-        It defines how the module behaves when called as a function, and it's what you'll use to call your model
-         in training loops or inference scripts.
-        The __call__ method should take all inputs that are necessary for computing outputs from the module,
-        and return all outputs that are computed by this module.
+    ) -> Tuple[chex.Array, Optional[chex.Array], chex.Array]:
+        """
+        Forward pass through the collection of decoder layers.
 
         Args:
-            self: Represent the instance of the class
-            hidden_states: chex.Array: Pass the input tensor to the
-                encoder
-            freq_cis: Tuple[chex.Array, chex.Array],: Pass in the
-                frequency of each token
-            attention_mask: chex.Array: Mask out certain tokens in the
-                input sequence
-            position_ids: chex.Array: Specify the position of each token
-                in a sequence
-            causal_mask: chex.Array: Mask the attention weights
-            deterministic: bool: Determine whether the model is in
-                training or evaluation mode
-            init_cache: bool: Initialize the cache for each layer
-            output_attentions: bool: Determine whether to output the
-                attention weights
-            output_hidden_states: bool: Determine whether to return the
-                hidden states of each layer
-            return_dict: bool: Return a dictionary of the outputs
-        :param : Determine whether to use the forgetful causal mask
+            hidden_states (chex.Array): Input tensor containing the hidden states.
+            freq_cis (Tuple[chex.Array, chex.Array]): Frequency positional encodings.
+            attention_mask (chex.Array): Mask to apply during attention.
+            causal_mask (chex.Array): Causal mask for autoregressive decoding.
+            position_ids (chex.Array): Positional indices for the sequence.
+            segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
+            deterministic (bool): If True, disables dropout.
+            init_cache (bool): If True, initializes caching mechanism for fast decoding.
+            output_attentions (bool): If True, returns attention weights.
+            output_hidden_states (bool): If True, returns hidden states.
 
         Returns:
-            A tuple of 3 values
+            Tuple[chex.Array, Optional[chex.Array], chex.Array]:
+                - hidden_states: The output tensor after layer processing.
+                - all_hidden_states: all of Hidden states (if `output_hidden_states` is True).
+                - self_attn_weights: Attention weights (if `output_attentions` is True).
+
         """
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
@@ -944,6 +934,7 @@ class FlaxCohereBlockCollection(nn.Module):
                 init_cache=init_cache,
                 output_attentions=output_attentions,
                 fcm_mask=fcm_mask,
+                segment_ids=segment_ids,
             )
             hidden_states = layer_outputs[0]
 
@@ -956,6 +947,16 @@ class FlaxCohereBlockCollection(nn.Module):
 
 
 class FlaxCohereModule(nn.Module):
+    """
+    Core module of the Cohere model, including embedding, decoder layers, and normalization.
+
+    Attributes:
+        config (CohereConfig): Configuration object with model hyperparameters.
+        dtype (jnp.dtype): Data type for the computations.
+        param_dtype (jnp.dtype): Data type for the model parameters.
+        precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
+    """
+
     config: CohereConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -986,14 +987,7 @@ class FlaxCohereModule(nn.Module):
         config = self.config
         self.causal_mask = flax.linen.make_causal_mask(
             jnp.ones(
-                (
-                    1,
-                    getattr(
-                        self.config,
-                        "mask_max_position_embeddings",
-                        self.config.max_position_embeddings,
-                    ),
-                ),
+                shape=(1, self.config.granted_mask_max_position_embedding),
                 dtype="bool",
             ),
             dtype="bool",
@@ -1007,13 +1001,7 @@ class FlaxCohereModule(nn.Module):
                 scaling_factor=scaling_factor, rope_type=scaling_type
             )
         self.freq_cis = precompute_freq_cis(
-            max_position_embeddings=(
-                getattr(
-                    self.config,
-                    "freq_max_position_embeddings",
-                    self.config.max_position_embeddings,
-                )
-            ),
+            max_position_embeddings=self.config.granted_freq_max_position_embedding,
             dim=config.hidden_size // config.num_attention_heads,
             base=config.rope_theta,
             **initial_rope_kwargs,
@@ -1022,58 +1010,45 @@ class FlaxCohereModule(nn.Module):
     def __call__(
         self,
         input_ids: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        deterministic: bool = True,
-        inputs_embeds: chex.Array = None,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        segment_ids: Optional[chex.Array] = None,
+        inputs_embeds: Optional[chex.Array] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
         init_cache: bool = False,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
+        deterministic: bool = True,
         return_dict: bool = True,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-    ):
-        """The __call__ function is the main function of a Flax model. It takes in input_ids, attention_mask, and position_ids
-        and returns the output of the model. The __call__ function also has optional arguments that can be used to control
-        the behavior of the model (e.g., deterministic=True). These optional arguments are passed as keyword arguments when
-        calling a Flax model.
+    ) -> Union[FlaxBaseModelOutput, Tuple]:
+        """
+        Forward pass through the Cohere module.
 
         Args:
-            self: Represent the instance of the class
-            input_ids: chex.Array: Pass in the input token ids
-            attention_mask: chex.Array: Mask out the padding tokens
-            position_ids: chex.Array: Indicate the position of each
-                token in a sequence
-            deterministic: bool: Control whether dropout is applied or
-                not
-            inputs_embeds: chex.Array: Pass in the embeddings of the
-                input tokens
-            init_cache: bool: Initialize the cache
-            output_attentions: bool: Determine whether to return the
-                attentions or not
-            output_hidden_states: bool: Determine whether to return
-                hidden states
-            return_dict: bool: Return a dictionary of the output or not
-            extra_embedding: Optional[Union[jnp.ndarray]]: Pass in the
-                embedding of the
-            None]]: Pass in the extra embedding
+            input_ids (chex.Array): Input tensor containing token IDs.
+            attention_mask (chex.Array): Mask for attention.
+            position_ids (chex.Array): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
+            inputs_embeds (Optional[chex.Array]): Embedded input tensor.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            init_cache (bool): If True, initialize cache for decoding.
+            deterministic (bool): If True, disable dropout.
+            return_dict (bool): If True, return a dictionary of outputs.
 
         Returns:
-            A tuple of:
+            FlaxBaseModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
         """
-        if inputs_embeds is None:
+        if inputs_embeds is None and input_ids is not None:
             inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
-
+        else:
+            raise ValueError(
+                "you should specify inputs_embeds or input_ids one of them"
+            )
         batch_size, sequence_length, _ = inputs_embeds.shape
 
         assert (
             sequence_length <= self.config.max_position_embeddings
         ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
-
-        inputs_embeds = (
-            inputs_embeds + extra_embedding
-            if extra_embedding is not None
-            else inputs_embeds
-        )
 
         outputs = self.layers(
             hidden_states=inputs_embeds,
@@ -1085,7 +1060,7 @@ class FlaxCohereModule(nn.Module):
             init_cache=init_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+            segment_ids=segment_ids,
         )
 
         hidden_states = outputs[0]
@@ -1118,6 +1093,16 @@ class FlaxCohereModel(FlaxCoherePreTrainedModel):
 
 
 class FlaxCohereForCausalLMModule(nn.Module):
+    """
+    Cohere model for causal language modeling, including the language model head.
+
+    Attributes:
+        config (CohereConfig): Configuration object with model hyperparameters.
+        dtype (jnp.dtype): Data type for the computations.
+        param_dtype (jnp.dtype): Data type for the model parameters.
+        precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
+    """
+
     config: CohereConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -1147,36 +1132,33 @@ class FlaxCohereForCausalLMModule(nn.Module):
     def __call__(
         self,
         input_ids: chex.Array,
-        attention_mask: chex.Array = None,
-        position_ids: chex.Array = None,
-        deterministic: bool = True,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        segment_ids: Optional[chex.Array] = None,
+        inputs_embeds: Optional[chex.Array] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
         init_cache: bool = False,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
+        deterministic: bool = True,
         return_dict: bool = True,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-    ):
-        """The __call__ function is the main function of a Flax module. It takes in inputs and returns outputs.
+    ) -> Union[FlaxCausalLMOutput, Tuple]:
+        """
+        Forward pass through the Cohere module.
 
         Args:
-            self: Refer to the object itself
-            input_ids: chex.Array: Pass the input token ids to the model
-            attention_mask: chex.Array: Mask out the padding tokens
-            position_ids: chex.Array: Specify the position of each token
-                in the input sequence
-            deterministic: bool: Control whether the model is trained or
-                not
-            init_cache: bool: Initialize the cache for the decoder
-            output_attentions: bool: Return the attention weights
-            output_hidden_states: bool: Determine whether to return the
-                hidden states
-            return_dict: bool: Return a dictionary of the outputs or not
-            extra_embedding: Optional[Union[jnp.ndarray]]: Pass in the
-                embedding of the word that we want to predict
-            None]]: Pass in the extra embedding
+            input_ids (chex.Array): Input tensor containing token IDs.
+            attention_mask (chex.Array): Mask for attention.
+            position_ids (chex.Array): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
+            inputs_embeds (Optional[chex.Array]): Embedded input tensor.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            init_cache (bool): If True, initialize cache for decoding.
+            deterministic (bool): If True, disable dropout.
+            return_dict (bool): If True, return a dictionary of outputs.
 
         Returns:
-            The logits and the hidden states
+            FlaxCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
         """
         batch_size, seq_length = input_ids.shape
         if attention_mask is None:
@@ -1187,15 +1169,16 @@ class FlaxCohereForCausalLMModule(nn.Module):
                 (batch_size, seq_length),
             )
         outputs = self.model(
-            input_ids,
-            attention_mask,
-            position_ids,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
             deterministic=deterministic,
             init_cache=init_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            extra_embedding=extra_embedding,
+            inputs_embeds=inputs_embeds,
+            segment_ids=segment_ids,
         )
 
         hidden_states = outputs[0]
@@ -1223,21 +1206,15 @@ class FlaxCohereForCausalLMModule(nn.Module):
 
 
 class FlaxCohereForCausalLM(FlaxCoherePreTrainedModel):
+
     module_class = FlaxCohereForCausalLMModule
 
     def prepare_inputs_for_generation(
-        self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
+        self,
+        input_ids,
+        max_length,
+        attention_mask: Optional[chex.Array] = None,
     ):
-        """
-        The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
-
-        :param self: Access variables that belong to the class
-        :param input_ids: Pass in the input tokens
-        :param max_length: Set the length of the sequence to be generated
-        :param attention_mask: Optional[chex.Array]: Mask the attention weights
-        :return: A dictionary of the past_key_values, attention_mask and position ids
-
-        """
         batch_size, seq_length = input_ids.shape
 
         past_key_values = self.init_cache(batch_size, max_length)

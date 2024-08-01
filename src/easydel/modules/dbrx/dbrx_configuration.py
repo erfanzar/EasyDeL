@@ -184,6 +184,7 @@ class DbrxConfig(EDPretrainedConfig):
         router_aux_loss_coef (`float`, *optional*, defaults to 0.05):
             The coefficient of the router auxiliary loss.
     """
+
     model_type: str = "dbrx"
     attribute_map = {
         "num_attention_heads": "n_heads",
@@ -242,4 +243,20 @@ class DbrxConfig(EDPretrainedConfig):
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
+        )
+
+    @property
+    def granted_freq_max_position_embedding(self) -> int:
+        return getattr(
+            self,
+            "freq_max_position_embeddings",
+            self.max_position_embeddings,
+        )
+
+    @property
+    def granted_mask_max_position_embedding(self) -> int:
+        return getattr(
+            self,
+            "mask_max_position_embeddings",
+            self.max_position_embeddings,
         )
