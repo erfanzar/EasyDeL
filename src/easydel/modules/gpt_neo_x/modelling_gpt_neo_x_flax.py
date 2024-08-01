@@ -70,7 +70,7 @@ class FlaxGPTNeoXAttention(FlaxAttentionModule):
 
     def setup(self) -> None:
         self.head_size = self.config.hidden_size // self.config.num_attention_heads
-        self.freq_cis = precompute_freqs_cis(
+        self.frequencies = precompute_freqs_cis(
             dtype=self.dtype,
             dim=self.head_size,
             end=self.config.max_position_embeddings,
@@ -99,7 +99,7 @@ class FlaxGPTNeoXAttention(FlaxAttentionModule):
     ):
         b, s, d = hidden_states.shape
         q, k, v = jnp.split(self.w_qkv(hidden_states), indices_or_sections=3, axis=-1)
-        freq = self.freq_cis[:s].reshape(1, s, -1)
+        freq = self.frequencies[:s].reshape(1, s, -1)
 
         q = rearrange(q, "b s (h d) -> b s h d", h=self.config.num_attention_heads)
         k = rearrange(k, "b s (h d) -> b s h d", h=self.config.num_attention_heads)

@@ -22,8 +22,8 @@ from easydel.modules.flax_modeling_utils import (
     control_mlp_sharding,
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
-    precompute_freq_cis,
     with_sharding_constraint,
+    precompute_frequencies,
 )
 from easydel.modules.modeling_flax_outputs import (
     FlaxBaseModelOutput,
@@ -98,8 +98,8 @@ def dropout_add(
 class FlaxFalconRotaryEmbedding(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
-    def __call__(self, query, key, freq_cis, position_ids):
-        sin, cos = freq_cis
+    def __call__(self, query, key, frequencies, position_ids):
+        sin, cos = frequencies
 
         sin = sin[position_ids][:, jnp.newaxis, :, :]
         cos = cos[position_ids][:, jnp.newaxis, :, :]
@@ -259,7 +259,7 @@ class FlaxFalconAttention(FlaxAttentionModule):
         causal_mask: chex.Array = None,
         segment_ids: Optional[chex.Array] = None,
         alibi: Optional[chex.Array] = None,
-        freq_cis: Tuple[chex.Array, chex.Array] = None,
+        frequencies: Tuple[chex.Array, chex.Array] = None,
         init_cache: bool = False,
         output_attentions: bool = False,
         deterministic: bool = False,
@@ -274,7 +274,7 @@ class FlaxFalconAttention(FlaxAttentionModule):
             causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior.
             segment_ids (Optional[chex.Array], optional): Segment IDs for segment-based attention.
             alibi (Optional[chex.Array], optional): Alibi tensor for adding positional bias.
-            freq_cis (Tuple[chex.Array, chex.Array], optional): Cosine and sine components for rotary embeddings.
+            frequencies (Tuple[chex.Array, chex.Array], optional): Cosine and sine components for rotary embeddings.
             init_cache (bool, optional): If True, initializes cache for caching keys and values.
             output_attentions (bool, optional): If True, outputs attention weights alongside the hidden states.
             deterministic (bool, optional): If True, disables dropout for deterministic behavior.
@@ -336,7 +336,7 @@ class FlaxFalconAttention(FlaxAttentionModule):
             query_layer, key_layer = self.rotary(
                 query_layer,
                 key_layer,
-                freq_cis,
+                frequencies,
                 position_ids,
             )
             query_layer, key_layer = map(
@@ -501,7 +501,7 @@ class FlaxFalconBlock(nn.Module):
             # causal_mask: chex.Array = None, 3
             # segment_ids: Optional[chex.Array] = None, 4
             # alibi: Optional[chex.Array] = None, 5
-            # freq_cis: Tuple[chex.Array, chex.Array] = None, 6
+            # frequencies: Tuple[chex.Array, chex.Array] = None, 6
             # init_cache: bool = False, 7
             # output_attentions: bool = False, 8
             # deterministic: bool = False, 9
@@ -545,7 +545,7 @@ class FlaxFalconBlock(nn.Module):
         causal_mask: chex.Array = None,
         segment_ids: Optional[chex.Array] = None,
         alibi: Optional[chex.Array] = None,
-        freq_cis: Tuple[chex.Array, chex.Array] = None,
+        frequencies: Tuple[chex.Array, chex.Array] = None,
         init_cache: bool = False,
         output_attentions: bool = False,
         deterministic: bool = False,
@@ -560,7 +560,7 @@ class FlaxFalconBlock(nn.Module):
             causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior.
             segment_ids (Optional[chex.Array], optional): Segment IDs for segment-based attention.
             alibi (Optional[chex.Array], optional): Alibi tensor for adding positional bias.
-            freq_cis (Tuple[chex.Array, chex.Array], optional): Cosine and sine components for rotary embeddings.
+            frequencies (Tuple[chex.Array, chex.Array], optional): Cosine and sine components for rotary embeddings.
             init_cache (bool, optional): If True, initializes cache for caching keys and values.
             output_attentions (bool, optional): If True, outputs attention weights alongside the hidden states.
             deterministic (bool, optional): If True, disables dropout for deterministic behavior.
@@ -582,7 +582,7 @@ class FlaxFalconBlock(nn.Module):
         # causal_mask: chex.Array = None,
         # segment_ids: Optional[chex.Array] = None,
         # alibi: Optional[chex.Array] = None,
-        # freq_cis: Tuple[chex.Array, chex.Array] = None,
+        # frequencies: Tuple[chex.Array, chex.Array] = None,
         # init_cache: bool = False,
         # output_attentions: bool = False,
         # deterministic: bool = False,
@@ -593,7 +593,7 @@ class FlaxFalconBlock(nn.Module):
             causal_mask,
             segment_ids,
             alibi,
-            freq_cis,
+            frequencies,
             init_cache,
             output_attentions,
             deterministic,
@@ -663,7 +663,7 @@ class FlaxFalconCollection(nn.Module):
         self,
         hidden_states: chex.Array,
         attention_mask: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        frequencies: Tuple[chex.Array, chex.Array],
         position_ids: chex.Array,
         causal_mask: chex.Array,
         alibi: Optional[chex.Array] = None,
@@ -679,7 +679,7 @@ class FlaxFalconCollection(nn.Module):
         Args:
             hidden_states (chex.Array): Input hidden states.
             attention_mask (chex.Array): Mask to apply on the attention scores.
-            freq_cis (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
             position_ids (chex.Array): Position indices for the tokens.
             causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
             alibi (Optional[chex.Array], optional): Alibi tensor for adding positional bias.
@@ -703,7 +703,7 @@ class FlaxFalconCollection(nn.Module):
                 hidden_states=hidden_states,
                 alibi=alibi,
                 attention_mask=attention_mask,
-                freq_cis=freq_cis,
+                frequencies=frequencies,
                 position_ids=position_ids,
                 causal_mask=causal_mask,
                 init_cache=init_cache,
@@ -751,7 +751,7 @@ class FlaxFalconModule(nn.Module):
             ),
             dtype="bool",
         )
-        self.freq_cis = None
+        self.frequencies = None
         if not self.config.alibi:
             initial_rope_kwargs = dict(rope_type="none")
             if config.rope_scaling is not None:
@@ -760,7 +760,7 @@ class FlaxFalconModule(nn.Module):
                 initial_rope_kwargs = dict(
                     scaling_factor=scaling_factor, rope_type=scaling_type
                 )
-            self.freq_cis = precompute_freq_cis(
+            self.frequencies = precompute_frequencies(
                 max_position_embeddings=self.config.granted_freq_max_position_embedding,
                 dim=config.hidden_size // config.num_attention_heads,
                 base=config.rope_theta,
@@ -824,7 +824,7 @@ class FlaxFalconModule(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             alibi=alibi,
-            freq_cis=self.freq_cis,
+            frequencies=self.frequencies,
             causal_mask=self.causal_mask,
             output_attentions=output_attentions,
             deterministic=deterministic,

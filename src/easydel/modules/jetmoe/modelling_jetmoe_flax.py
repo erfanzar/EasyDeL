@@ -411,8 +411,8 @@ class JetMoERMSNorm(nn.Module):
 class FlaxJetMoERotaryEmbedding(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
-    def __call__(self, key, query, freq_cis, position_ids):
-        sin, cos = freq_cis
+    def __call__(self, key, query, frequencies, position_ids):
+        sin, cos = frequencies
 
         sin = sin[position_ids][:, None, :, :]
         cos = cos[position_ids][:, None, :, :]

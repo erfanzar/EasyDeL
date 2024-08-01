@@ -92,6 +92,7 @@ class EasyModelsTest(unittest.TestCase):
         self.use_sharding_constraint = False
         self.header_config = None
         self.pad_token_id = None
+        self.rope_scaling = None
 
     def create_test_for_models(self, module_name: str, hf_module_class):
         module_config, module_class, transform_function = ed.get_modules_by_type(
@@ -123,6 +124,7 @@ class EasyModelsTest(unittest.TestCase):
                 parallel_attn=True,
                 use_parallel_residual=self.use_parallel_residual,
                 qk_layernorm=self.qk_layernorm,
+                rope_scaling=self.rope_scaling,
                 # tie_word_embedding=True,
                 # residual_in_fp32=True
             )
@@ -289,10 +291,17 @@ class EasyModelsTest(unittest.TestCase):
             return jnp.allclose(hf_output.loss.detach().cpu().numpy(), loss)
 
     def test_llama(self):
-
         self.header_config = None
+        self.rope_scaling = {
+            "factor": 8.0,
+            "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 8192,
+            "rope_type": "llama3",
+        }
         res, err = self.create_test_for_models("llama", transformers.LlamaForCausalLM)
         self.assertTrue(res, f"Llama model Failed [ERROR {err}]")
+        self.rope_scaling = None
 
     def test_mpt(self):
         self.header_config = ed.MptConfig(
@@ -310,7 +319,6 @@ class EasyModelsTest(unittest.TestCase):
         self.assertTrue(res, f"MPT model Failed [ERROR {err}]")
 
     def test_falcon(self):
-
         # conf = transformers.AutoConfig.from_pretrained(
         #     "tiiuae/falcon-11B", trust_remote_code=True
         # )
@@ -350,7 +358,6 @@ class EasyModelsTest(unittest.TestCase):
         self.assertTrue(res, f"Falcon model Failed [ERROR {err}]")
 
     def test_mistral(self):
-
         self.header_config = None
         res, err = self.create_test_for_models(
             "mistral", transformers.MistralForCausalLM
@@ -358,7 +365,6 @@ class EasyModelsTest(unittest.TestCase):
         self.assertTrue(res, f"Mistral model Failed [ERROR {err}]")
 
     def test_mixtral(self):
-
         self.header_config = None
         res, err = self.create_test_for_models(
             "mixtral", transformers.MixtralForCausalLM
@@ -366,37 +372,31 @@ class EasyModelsTest(unittest.TestCase):
         self.assertTrue(res, f"Mixtral model Failed [ERROR {err}]")
 
     def test_gpt2(self):
-
         self.header_config = None
         res, err = self.create_test_for_models("gpt2", transformers.GPT2LMHeadModel)
         self.assertTrue(res, f"GPT2 model Failed [ERROR {err}]")
 
     def test_gptj(self):
-
         self.header_config = None
         res, err = self.create_test_for_models("gptj", transformers.GPTJForCausalLM)
         self.assertTrue(res, f"GPT-J model Failed [ERROR {err}]")
 
     def test_qwen2(self):
-
         self.header_config = None
         res, err = self.create_test_for_models("qwen2", transformers.Qwen2ForCausalLM)
         self.assertTrue(res, f"Qwen 2 model Failed [ERROR {err}]")
 
     def test_olmo(self):
-
         self.header_config = None
         res, err = self.create_test_for_models("olmo", transformers.OlmoForCausalLM)
         self.assertTrue(res, f"OLMo model Failed [ERROR {err}]")
 
     def test_phi(self):
-
         self.header_config = None
         res, err = self.create_test_for_models("phi", transformers.PhiForCausalLM)
         self.assertTrue(res, f"PHI 2 model Failed [ERROR {err}]")
 
     def test_gemma(self):
-
         self.header_config = None
         org = self.tie_word_embeddings
         self.tie_word_embeddings = True
@@ -632,13 +632,13 @@ class EasyModelsTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    # unittest.main()
-    test = EasyModelsTest()
-    test.setUp()
+    unittest.main()
+    # test = EasyModelsTest()
+    # test.setUp()
     # test.test_mistral() # Passed
     # test.test_gemma() # Passed
     # test.test_gemma2()  # Passed
-    # test.test_llama()  # Passed
+    # test.test_llama()  #  Llama 3.1 Passed
     # test.test_arctic()
     # test.test_cohere() # Passed
     # test.test_dbrx() # Passed

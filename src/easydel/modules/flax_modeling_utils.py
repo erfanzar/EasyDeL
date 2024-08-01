@@ -2,7 +2,7 @@ import functools
 import math
 import warnings
 from functools import partial
-from typing import Any, Dict, List, Literal, Optional, Sequence, Union
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 import chex
 import einops
@@ -67,7 +67,7 @@ def canonicalize_dtype(
         the specified dtype instead and dtype inference is disabled.
       inexact: When True, the output dtype must be a subdtype
       of `jnp.inexact`. Inexact dtypes are real or complex floating points. This
-      is useful when you want to apply operations that don't work directly on
+      is useful when you want to apply operations that don'position_ids work directly on
       integers like taking a mean for example.
     Returns:
       The dtype that *args should be cast to.
@@ -153,132 +153,193 @@ def get_gradient_checkpoint_policy(name):
     return gradients[name]
 
 
-def precompute_freq_cis(
-    dim,
-    max_position_embeddings=2048,
-    base=10000,
-    scaling_factor=1.0,
+def calculate_adaptive_scaling(
+    sequence_expansion: float, original_max_position_embeddings: int
+) -> float:
+    if sequence_expansion <= 1.0:
+        return 1.0
+    return math.sqrt(
+        1 + math.log(sequence_expansion) / math.log(original_max_position_embeddings)
+    )
+
+
+def compute_standard_frequencies(
+    position_ids: jnp.ndarray, inverse_frequencies: jnp.ndarray
+) -> jnp.ndarray:
+    return jnp.einsum("i,j->ij", position_ids, inverse_frequencies).astype("float32")
+
+
+def compute_linear_frequencies(
+    position_ids: jnp.ndarray, inverse_frequencies: jnp.ndarray, scaling_factor: float
+) -> jnp.ndarray:
+    scaled_positions = position_ids / scaling_factor
+    return jnp.einsum("i,j->ij", scaled_positions, inverse_frequencies).astype(
+        "float32"
+    )
+
+
+def compute_dynamic_frequencies(
+    position_ids: jnp.ndarray, base: float, dim: int, scaling_factor: float
+) -> jnp.ndarray:
+    adjusted_base = base * (scaling_factor - (scaling_factor - 1)) ** (dim / (dim - 2))
+    adjusted_inverse_freq = 1.0 / (
+        adjusted_base ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim)
+    )
+    return jnp.einsum("i,j->ij", position_ids, adjusted_inverse_freq).astype("float32")
+
+
+def compute_su_yarn_frequencies(
+    position_ids: jnp.ndarray,
+    base: float,
+    dim: int,
+    max_position_embeddings: int,
+    original_max_position_embeddings: int,
+    extrapolation_factor: jnp.ndarray,
+    time_dtype: jnp.dtype,
+) -> Tuple[jnp.ndarray, float]:
+    scaled_inverse_freq = (
+        1.0
+        / (
+            extrapolation_factor
+            * base
+            ** (jnp.arange(0, dim, 2, dtype=time_dtype).astype(jnp.float32) / dim)
+        )[None, :, None]
+    )
+    expanded_position_ids = position_ids.reshape(1, -1)[:, None, :].astype("float32")
+    frequencies = (scaled_inverse_freq @ expanded_position_ids).transpose(0, 2, 1)
+    scaling_factor = calculate_adaptive_scaling(
+        max_position_embeddings / original_max_position_embeddings,
+        original_max_position_embeddings,
+    )
+    return frequencies, scaling_factor
+
+
+def compute_llama3_frequencies(
+    position_ids: jnp.ndarray,
+    inverse_frequencies: jnp.ndarray,
+    original_max_position_embeddings: int,
+    low_freq_factor: float,
+    high_freq_factor: float,
+    scaling_factor: float,
+) -> jnp.ndarray:  # JIT Compatible.
+    low_freq_wavelen = original_max_position_embeddings / low_freq_factor
+    high_freq_wavelen = original_max_position_embeddings / high_freq_factor
+
+    def compute_new_freq(freq):
+        wavelen = 2 * math.pi / freq
+
+        def case_low(freq):
+            return freq
+
+        def case_high(freq):
+            return freq / scaling_factor
+
+        def case_mid(freq):
+            smooth = (original_max_position_embeddings / wavelen - low_freq_factor) / (
+                high_freq_factor - low_freq_factor
+            )
+            return (1 - smooth) * freq / scaling_factor + smooth * freq
+
+        return jax.lax.cond(
+            wavelen < high_freq_wavelen,
+            case_low,
+            lambda f: jax.lax.cond(
+                wavelen > low_freq_wavelen,
+                case_high,
+                case_mid,
+                f,
+            ),
+            freq,
+        )
+
+    new_freqs = jax.vmap(compute_new_freq)(inverse_frequencies)
+    return jnp.einsum("i,j->ij", position_ids, new_freqs).astype("float32")
+
+
+def precompute_frequencies(
+    dim: int,
+    max_position_embeddings: int = 2048,
+    base: float = 10000,
+    scaling_factor: float = 1.0,
     rope_type: Optional[
-        Literal[
-            "none",
-            "linear",
-            "dynamic",
-            "yarn",
-            "su",
-        ]
+        Literal["none", "linear", "dynamic", "yarn", "su", "llama3"]
     ] = None,
-    t_dtype: jnp.dtype = jnp.int32,
+    time_dtype: jnp.dtype = jnp.int32,
     original_max_position_embeddings: Optional[int] = None,
     long_factor: Optional[List[float]] = None,
     short_factor: Optional[List[float]] = None,
+    low_freq_factor: Optional[float] = None,
+    high_freq_factor: Optional[float] = None,
 ):
-    def _calc_yarn_scaling_factor(scale):
-        if scale <= 1.0:
-            return 1.0
-        return math.sqrt(
-            1 + math.log(scale) / math.log(original_max_position_embeddings)
-        )
-
-    def _calc_su_scaling_factor(scale):
-        if scale <= 1.0:
-            return 1.0
-        return math.sqrt(
-            1 + math.log(scale) / math.log(original_max_position_embeddings)
-        )
-
-    if t_dtype == jnp.int64:
+    if time_dtype == jnp.int64:
         jax.config.update("jax_enable_x64", True)
 
+    position_ids = jnp.arange(max_position_embeddings, dtype=time_dtype)
+    inverse_frequencies = 1.0 / (
+        base ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim)
+    )
+
     if rope_type is None or rope_type == "none":
-        t = jax.numpy.arange(max_position_embeddings, dtype=t_dtype)
-        inv_freq = 1.0 / (
-            base ** (jax.numpy.arange(0, dim, 2, dtype=jax.numpy.float32) / dim)
-        )
-        freq = jax.numpy.einsum("i , j -> i j", t, inv_freq).astype("float32")
-        embed = jax.numpy.concatenate((freq, freq), axis=-1)
-        return jax.numpy.sin(embed)[:, :], jax.numpy.cos(embed)[:, :]
+        frequencies = compute_standard_frequencies(position_ids, inverse_frequencies)
     elif rope_type == "linear":
-        t = jax.numpy.arange(max_position_embeddings, dtype=t_dtype)
-        t = t / scaling_factor
-        inv_freq = 1.0 / (
-            base ** (jax.numpy.arange(0, dim, 2, dtype=jax.numpy.float32) / dim)
+        frequencies = compute_linear_frequencies(
+            position_ids, inverse_frequencies, scaling_factor
         )
-        freq = jax.numpy.einsum("i , j -> i j", t, inv_freq).astype("float32")
-
-        embed = jax.numpy.concatenate((freq, freq), axis=-1)
-        return jax.numpy.sin(embed)[:, :], jax.numpy.cos(embed)[:, :]
     elif rope_type == "dynamic":
-        t = jax.numpy.arange(max_position_embeddings, dtype=t_dtype)
-        base = base * (scaling_factor - (scaling_factor - 1)) ** (dim / (dim - 2))
-        inv_freq = 1.0 / (
-            base ** (jax.numpy.arange(0, dim, 2, dtype=jax.numpy.float32) / dim)
+        frequencies = compute_dynamic_frequencies(
+            position_ids, base, dim, scaling_factor
         )
-        freq = jax.numpy.einsum("i , j -> i j", t, inv_freq).astype("float32")
-
-        embed = jax.numpy.concatenate((freq, freq), axis=-1)
-        return jax.numpy.sin(embed)[:, :], jax.numpy.cos(embed)[:, :]
-    elif rope_type == "su":
+    elif rope_type in ["su", "yarn"]:
         assert (
             original_max_position_embeddings is not None
-        ), "No original max position embeddings is provided"
-        if max_position_embeddings > original_max_position_embeddings:
-            ext_factors = jnp.array(long_factor, dtype=jnp.float32)
-        else:
-            ext_factors = jnp.array(short_factor, dtype=jnp.float32)
-
-        inv_freq = (
-            1.0
-            / (
-                ext_factors
-                * base
-                ** (jnp.arange(0, dim, 2, dtype=t_dtype).astype(jnp.float32) / dim)
-            )[None, :, None]
+        ), "No original max position embeddings provided"
+        ext_factors = jnp.array(
+            (
+                long_factor
+                if max_position_embeddings > original_max_position_embeddings
+                else short_factor
+            ),
+            dtype=jnp.float32,
         )
-        position_ids = (
-            jnp.arange(0, max_position_embeddings, dtype="i4")
-            .reshape(1, -1)[:, None, :]
-            .astype("float32")
+        frequencies, scaling_factor = compute_su_yarn_frequencies(
+            position_ids,
+            base,
+            dim,
+            max_position_embeddings,
+            original_max_position_embeddings,
+            ext_factors,
+            time_dtype,
         )
-        freqs = (inv_freq @ position_ids).transpose(0, 2, 1)
-        scaling_factor = _calc_su_scaling_factor(
-            max_position_embeddings / original_max_position_embeddings
+    elif rope_type == "llama3":
+        assert all(
+            x is not None
+            for x in [
+                original_max_position_embeddings,
+                low_freq_factor,
+                high_freq_factor,
+            ]
+        ), "Missing parameters for llama3 RoPE"
+        frequencies = compute_llama3_frequencies(
+            position_ids,
+            inverse_frequencies,
+            original_max_position_embeddings,
+            low_freq_factor,
+            high_freq_factor,
+            scaling_factor,
         )
-        emb = jnp.concatenate((freqs, freqs), axis=-1)
-        cos = jnp.cos(emb) * scaling_factor
-        sin = jnp.sin(emb) * scaling_factor
-        return sin[0], cos[0]
-    elif rope_type == "yarn":
-        assert (
-            original_max_position_embeddings is not None
-        ), "No original max position embeddings is provided"
-        if max_position_embeddings > original_max_position_embeddings:
-            ext_factors = jnp.array(long_factor, dtype=jnp.float32)
-        else:
-            ext_factors = jnp.array(short_factor, dtype=jnp.float32)
-
-        inv_freq = (
-            1.0
-            / (
-                ext_factors
-                * base
-                ** (jnp.arange(0, dim, 2, dtype=t_dtype).astype(jnp.float32) / dim)
-            )[None, :, None]
-        )
-        position_ids = (
-            jnp.arange(0, max_position_embeddings, dtype="i4")
-            .reshape(1, -1)[:, None, :]
-            .astype("float32")
-        )
-        freqs = (inv_freq @ position_ids).transpose(0, 2, 1)
-        scaling_factor = _calc_yarn_scaling_factor(
-            max_position_embeddings / original_max_position_embeddings
-        )
-        emb = jnp.concatenate((freqs, freqs), axis=-1)
-        cos = jnp.cos(emb) * scaling_factor
-        sin = jnp.sin(emb) * scaling_factor
-        return sin[0], cos[0]
     else:
-        raise "wrong rope type has been given"
+        raise ValueError(f"Invalid rope_type: {rope_type}")
+
+    rotational_angles = jnp.concatenate((frequencies, frequencies), axis=-1)
+    sin_encoding, cos_encoding = jnp.sin(rotational_angles), jnp.cos(rotational_angles)
+
+    if rope_type in ["su", "yarn"]:
+        sin_encoding, cos_encoding = (
+            sin_encoding[0] * scaling_factor,
+            cos_encoding[0] * scaling_factor,
+        )
+
+    return sin_encoding, cos_encoding
 
 
 def rotate_half(x):
@@ -636,7 +697,7 @@ def block_wise_ffn(remat_ffn, inputs, chunk_size: int, deterministic: bool):
     except Exception as e:
         raise EasyDeLBlockWiseFFNError(
             "You Are using BlockWise FFN from near-infinite-context length paper and you might be passing "
-            "input arguments in wrong way in case that you don't want to use this just pass `use_scan_mlp=False` in "
+            "input arguments in wrong way in case that you don'position_ids want to use this just pass `use_scan_mlp=False` in "
             "model config or in config_kwargs in AutoEasyDeLModelForCausalLM or change `scan_mlp_chunk_size` "
             f"in configs for more information read Docs.\nOriginal Error\n{e}"
         )

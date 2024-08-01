@@ -28,8 +28,8 @@ from easydel.modules.flax_modeling_utils import (
     apply_rotary_pos_emb,
     control_mlp_sharding,
     get_dot_general_by_bits,
-    precompute_freq_cis,
     with_sharding_constraint,
+    precompute_frequencies,
 )
 from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
 from easydel.modules.modeling_utils import EDPretrainedModel
@@ -52,8 +52,8 @@ class MoeCausalLMOutput(FlaxMaskedLMOutput):
 class FlaxDbrxEmbedding(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
-    def __call__(self, query, key, freq_cis, position_ids):
-        sin, cos = freq_cis
+    def __call__(self, query, key, frequencies, position_ids):
+        sin, cos = frequencies
 
         sin = sin[position_ids][:, None, :, :]
         cos = cos[position_ids][:, None, :, :]
@@ -137,14 +137,14 @@ class FlaxDbrxAttention(FlaxAttentionModule):
         """
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
-    def apply_rotary(self, query, key, freq_cis, position_ids):
+    def apply_rotary(self, query, key, frequencies, position_ids):
         """
         Applies rotary positional embeddings to the query and key tensors.
 
         Args:
             query (chex.Array): Query tensor.
             key (chex.Array): Key tensor.
-            freq_cis (Tuple[chex.Array, chex.Array]): Tuple containing cosine and sine components for rotary embeddings.
+            frequencies (Tuple[chex.Array, chex.Array]): Tuple containing cosine and sine components for rotary embeddings.
             position_ids (chex.Array): Position indices for the tokens.
 
         Returns:
@@ -159,14 +159,14 @@ class FlaxDbrxAttention(FlaxAttentionModule):
             position_ids=position_ids,
             query=query,
             key=key,
-            freq_cis=freq_cis,
+            frequencies=frequencies,
         )
         return self._transpose_sequence_head(query, key)
 
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        frequencies: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
@@ -181,7 +181,7 @@ class FlaxDbrxAttention(FlaxAttentionModule):
 
         Args:
             hidden_states (chex.Array): Input hidden states.
-            freq_cis (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
             attention_mask (chex.Array): Mask to apply on the attention scores.
             position_ids (chex.Array): Position indices for the tokens.
             causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
@@ -228,7 +228,7 @@ class FlaxDbrxAttention(FlaxAttentionModule):
             query=query_states,
             key=key_states,
             position_ids=position_ids,
-            freq_cis=freq_cis,
+            frequencies=frequencies,
         )
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
@@ -352,7 +352,7 @@ class FlaxDbrxNormAttentionNorm(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        frequencies: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
@@ -367,7 +367,7 @@ class FlaxDbrxNormAttentionNorm(nn.Module):
 
         Args:
             hidden_states (chex.Array): Input hidden states.
-            freq_cis (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
             attention_mask (chex.Array): Mask to apply on the attention scores.
             position_ids (chex.Array): Position indices for the tokens.
             causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
@@ -387,7 +387,7 @@ class FlaxDbrxNormAttentionNorm(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             output_attentions=output_attentions,
-            freq_cis=freq_cis,
+            frequencies=frequencies,
             causal_mask=causal_mask,
             segment_ids=segment_ids,
             init_cache=init_cache,
@@ -616,7 +616,7 @@ class FlaxDbrxBlock(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        frequencies: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
@@ -632,7 +632,7 @@ class FlaxDbrxBlock(nn.Module):
 
         Args:
             hidden_states (chex.Array): Input hidden states.
-            freq_cis (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
             attention_mask (chex.Array): Mask to apply on the attention scores.
             position_ids (chex.Array): Position indices for the tokens.
             causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
@@ -647,7 +647,7 @@ class FlaxDbrxBlock(nn.Module):
         """
         resid_states, hidden_states, self_attn_weights = self.norm_attn_norm(
             hidden_states=hidden_states,
-            freq_cis=freq_cis,
+            frequencies=frequencies,
             attention_mask=attention_mask,
             causal_mask=causal_mask,
             position_ids=position_ids,
@@ -695,7 +695,7 @@ class FlaxDbrxBlockCollection(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        frequencies: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
@@ -712,7 +712,7 @@ class FlaxDbrxBlockCollection(nn.Module):
 
         Args:
             hidden_states (chex.Array): Input hidden states.
-            freq_cis (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
             attention_mask (chex.Array): Mask to apply on the attention scores.
             position_ids (chex.Array): Position indices for the tokens.
             causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
@@ -735,7 +735,7 @@ class FlaxDbrxBlockCollection(nn.Module):
                 all_hidden_states += (hidden_states,)
             outputs = block(
                 hidden_states=hidden_states,
-                freq_cis=freq_cis,
+                frequencies=frequencies,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 causal_mask=causal_mask,
@@ -1052,7 +1052,7 @@ class FlaxDbrxModule(nn.Module):
             initial_rope_kwargs = dict(
                 scaling_factor=scaling_factor, rope_type=scaling_type
             )
-        self.freq_cis = precompute_freq_cis(
+        self.frequencies = precompute_frequencies(
             max_position_embeddings=self.config.granted_freq_max_position_embedding,
             dim=self.config.d_model // self.config.n_heads,
             base=self.config.attn_config.rope_theta,
@@ -1132,7 +1132,7 @@ class FlaxDbrxModule(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             causal_mask=self.causal_mask,
-            freq_cis=self.freq_cis,
+            frequencies=self.frequencies,
             output_attentions=output_attentions,
             output_router_logits=output_router_logits,
             output_hidden_states=output_hidden_states,

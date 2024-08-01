@@ -19,8 +19,11 @@ from transformers.generation.flax_utils import (
 )
 
 from easydel.etils.etils import get_logger
-from easydel.modules.flax_modeling_utils import precompute_freq_cis
-from easydel.modules.llama.modelling_llama_flax import FlaxLlamaBlockCollection, RMSNorm
+from easydel.modules.llama.modelling_llama_flax import (
+    FlaxLlamaBlockCollection,
+    RMSNorm,
+    precompute_frequencies,
+)
 from easydel.modules.llama.vision_llama_configuration import VisionLlamaConfig
 from easydel.modules.modeling_flax_outputs import (
     FlaxBaseModelOutput,
@@ -260,7 +263,7 @@ class FlaxVisionLlamaModule(nn.Module):
             initial_rope_kwargs = dict(
                 scaling_factor=scaling_factor, rope_type=scaling_type
             )
-        self.freq_cis = precompute_freq_cis(
+        self.frequencies = precompute_frequencies(
             max_position_embeddings=(
                 getattr(
                     self.config,
@@ -319,7 +322,7 @@ class FlaxVisionLlamaModule(nn.Module):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             causal_mask=self.causal_mask,
-            freq_cis=self.freq_cis,
+            frequencies=self.frequencies,
         )
 
         hidden_states = outputs[0]

@@ -23,7 +23,7 @@ from easydel.modules.flax_modeling_utils import (
     control_mlp_sharding,
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
-    precompute_freq_cis,
+    precompute_frequencies,
 )
 from easydel.modules.gemma.gemma_configuration import GemmaConfig as GemmaConfig
 from easydel.modules.modeling_flax_outputs import (
@@ -106,8 +106,8 @@ class FlaxGemmaRotaryEmbedding(nn.Module):
     config: GemmaConfig
     dtype: jnp.dtype = jnp.float32
 
-    def __call__(self, freq_cis, key_states, query_states, position_ids):
-        sin, cos = freq_cis
+    def __call__(self, frequencies, key_states, query_states, position_ids):
+        sin, cos = frequencies
 
         sin = sin[position_ids][:, None, :, :]
         cos = cos[position_ids][:, None, :, :]
@@ -207,14 +207,14 @@ class FlaxGemmaAttention(FlaxAttentionModule):
             hidden_states.shape[:2] + (num_heads, self.head_dim)
         )
 
-    def apply_rotary(self, query, key, freq_cis, position_ids):
+    def apply_rotary(self, query, key, frequencies, position_ids):
         """
         Applies rotary positional embeddings to the query and key tensors.
 
         Args:
             query (chex.Array): Query tensor.
             key (chex.Array): Key tensor.
-            freq_cis (Tuple[chex.Array, chex.Array]): Tuple containing cosine and sine components for rotary embeddings.
+            frequencies (Tuple[chex.Array, chex.Array]): Tuple containing cosine and sine components for rotary embeddings.
             position_ids (chex.Array): Position indices for the tokens.
 
         Returns:
@@ -229,14 +229,14 @@ class FlaxGemmaAttention(FlaxAttentionModule):
             position_ids=position_ids,
             query_states=query,
             key_states=key,
-            freq_cis=freq_cis,
+            frequencies=frequencies,
         )
         return self._transpose_sequence_head(query, key)
 
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        frequencies: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
@@ -251,7 +251,7 @@ class FlaxGemmaAttention(FlaxAttentionModule):
 
         Args:
             hidden_states (chex.Array): Input hidden states.
-            freq_cis (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
             attention_mask (chex.Array): Mask to apply on the attention scores.
             position_ids (chex.Array): Position indices for the tokens.
             causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
@@ -291,7 +291,7 @@ class FlaxGemmaAttention(FlaxAttentionModule):
         query_states, key_states = self.apply_rotary(
             query_states,
             key_states,
-            freq_cis,
+            frequencies,
             position_ids,
         )
 
@@ -489,7 +489,7 @@ class FlaxGemmaDecoderLayer(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        frequencies: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
@@ -504,7 +504,7 @@ class FlaxGemmaDecoderLayer(nn.Module):
 
         Args:
             hidden_states (chex.Array): Input hidden states.
-            freq_cis (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
             attention_mask (chex.Array): Mask to apply on the attention scores.
             position_ids (chex.Array): Position indices for the tokens.
             causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
@@ -521,7 +521,7 @@ class FlaxGemmaDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
         outputs = self.self_attn(
             hidden_states,
-            freq_cis,
+            frequencies,
             attention_mask,
             position_ids,
             causal_mask,
@@ -805,7 +805,7 @@ class FlaxGemmaLayerCollection(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
+        frequencies: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         causal_mask: chex.Array,
         position_ids: chex.Array,
@@ -820,7 +820,7 @@ class FlaxGemmaLayerCollection(nn.Module):
 
         Args:
             hidden_states (chex.Array): Input tensor containing the hidden states.
-            freq_cis (Tuple[chex.Array, chex.Array]): Frequency positional encodings.
+            frequencies (Tuple[chex.Array, chex.Array]): Frequency positional encodings.
             attention_mask (chex.Array): Mask to apply during attention.
             causal_mask (chex.Array): Causal mask for autoregressive decoding.
             position_ids (chex.Array): Positional indices for the sequence.
@@ -863,7 +863,7 @@ class FlaxGemmaLayerCollection(nn.Module):
                 all_hidden_states += (hidden_states,)
             layer_outputs = block(
                 hidden_states=hidden_states,
-                freq_cis=freq_cis,
+                frequencies=frequencies,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 causal_mask=causal_mask,
@@ -910,7 +910,7 @@ class FlaxGemmaModule(nn.Module):
             self.config,
             dtype=self.dtype,
         )
-        self.freq_cis = precompute_freq_cis(
+        self.frequencies = precompute_frequencies(
             max_position_embeddings=self.config.granted_freq_max_position_embedding,
             dim=self.config.head_dim,
             base=self.config.rope_theta,
@@ -972,7 +972,7 @@ class FlaxGemmaModule(nn.Module):
 
         outputs = self.layers(
             hidden_states=inputs_embeds,
-            freq_cis=self.freq_cis,
+            frequencies=self.frequencies,
             attention_mask=attention_mask,
             position_ids=position_ids,
             causal_mask=self.causal_mask,
