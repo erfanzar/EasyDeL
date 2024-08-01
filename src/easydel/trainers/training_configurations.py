@@ -72,6 +72,7 @@ class TrainArguments:
         num_train_epochs (Optional[int]): Number of training epochs.
         model_class (Optional[EDPretrainedModel]): The EasyDeL Flax Pretrained Model class to use.
         total_batch_size (int): Total batch size for training.
+        eval_batch_size (int): Total batch size for evaluation of model.
         max_training_steps (Optional[int]): Maximum number of training steps.
         max_evaluation_steps (Optional[int]):  Maximum number of evaluation steps.
         optimizer (AVAILABLE_OPTIMIZERS): Optimizer to use for training.
@@ -172,6 +173,7 @@ class TrainArguments:
     num_train_epochs: int = 10
     model_class: Optional[EDPretrainedModel] = None
     total_batch_size: int = 32
+    eval_batch_size:int =64
     max_training_steps: Optional[int] = None
     max_evaluation_steps: Optional[int] = None
     optimizer: AVAILABLE_OPTIMIZERS = EasyDeLOptimizers.ADAMW

@@ -881,7 +881,7 @@ class DPOTrainer(BaseTrainer, ABC):
 
         return tensorflow_datasets.as_numpy(
             eval_dataset.to_tf_dataset(
-                batch_size=self.arguments.total_batch_size,
+                batch_size=self.arguments.eval_batch_size,
                 collate_fn=self.data_collator,
                 num_workers=self.arguments.dataloader_num_workers,
                 shuffle=False,
@@ -971,7 +971,7 @@ class DPOTrainer(BaseTrainer, ABC):
             # prepare dataloader
             data_loader = tensorflow_datasets.as_numpy(
                 eval_dataset.to_tf_dataset(
-                    batch_size=self.arguments.total_batch_size,
+                    batch_size=self.arguments.eval_batch_size,
                     collate_fn=self.data_collator,
                     num_workers=self.arguments.dataloader_num_workers,
                     shuffle=False,

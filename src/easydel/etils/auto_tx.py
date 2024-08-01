@@ -70,6 +70,7 @@ def get_optimizer_and_scheduler(
                 steps=steps,
                 weight_decay=weight_decay,
                 gradient_accumulation_steps=gradient_accumulation_steps,
+                warmup_steps=warmup_steps,
                 **kwargs,
             )
         elif scheduler == EasyDeLSchedulers.WARM_UP_LINEAR:
@@ -115,6 +116,7 @@ def get_optimizer_and_scheduler(
                 learning_rate=learning_rate,
                 steps=steps,
                 gradient_accumulation_steps=gradient_accumulation_steps,
+                warmup_steps=warmup_steps,
                 **kwargs,
             )
 
@@ -168,6 +170,7 @@ def get_optimizer_and_scheduler(
                 weight_decay=weight_decay,
                 gradient_accumulation_steps=gradient_accumulation_steps,
                 clip_grad=clip_grad,
+                warmup_steps=warmup_steps,
                 **kwargs,
             )
         elif scheduler == EasyDeLSchedulers.WARM_UP_LINEAR:
@@ -216,6 +219,7 @@ def get_optimizer_and_scheduler(
                 steps=steps,
                 weight_decay=weight_decay,
                 gradient_accumulation_steps=gradient_accumulation_steps,
+                warmup_steps=warmup_steps,
                 **kwargs,
             )
         elif scheduler == EasyDeLSchedulers.WARM_UP_LINEAR:
