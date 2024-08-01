@@ -18,12 +18,8 @@ from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.dbrx.dbrx_configuration import (
     DbrxAttentionConfig as DbrxAttentionConfig,
 )
-from easydel.modules.dbrx.dbrx_configuration import (
-    DbrxConfig as DbrxConfig,
-)
-from easydel.modules.dbrx.dbrx_configuration import (
-    DbrxFFNConfig as DbrxFFNConfig,
-)
+from easydel.modules.dbrx.dbrx_configuration import DbrxConfig as DbrxConfig
+from easydel.modules.dbrx.dbrx_configuration import DbrxFFNConfig as DbrxFFNConfig
 
 # easydel.modules
 from easydel.modules.flax_modeling_utils import (
@@ -69,6 +65,16 @@ class FlaxDbrxEmbedding(nn.Module):
 
 
 class FlaxDbrxAttention(FlaxAttentionModule):
+    """
+    FlaxDbrxAttention implements an attention mechanism with rotary embeddings.
+
+    Attributes:
+        config (DbrxConfig): Configuration for the attention module.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
+    """
+
     config: DbrxConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -105,18 +111,6 @@ class FlaxDbrxAttention(FlaxAttentionModule):
 
         self.rotary = FlaxDbrxEmbedding(self.dtype)
         self.attention_performer = FlexibleAttentionModule(
-            use_sharding_constraint=self.config.use_sharding_constraint,
-            block_k_major=self.config.block_k_major,
-            block_b=self.config.block_b,
-            block_q=self.config.block_q,
-            block_k=self.config.block_k,
-            block_q_major_dkv=self.config.block_q_major_dkv,
-            block_k_major_dkv=self.config.block_k_major_dkv,
-            block_k_major_dq=self.config.block_k_major_dq,
-            block_k_dkv=self.config.block_k_dkv,
-            block_q_dkv=self.config.block_q_dkv,
-            block_q_dq=self.config.block_q_dq,
-            block_k_dq=self.config.block_k_dq,
             num_attention_heads=self.num_attention_heads,
             attention_dropout=self.config.attn_config.attn_pdrop,
             head_dims=self.head_dim,
@@ -124,13 +118,10 @@ class FlaxDbrxAttention(FlaxAttentionModule):
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
-            dtype=self.config.attn_dtype,
-            partition_axis=self.config.partition_axis,
-            scan_ring_attention=self.config.scan_ring_attention,
             mesh=self.config.mesh,
             sm_scale=1 / math.sqrt(self.head_dim),
             axis_name=self.config.attention_axis_name,
-            backward_pass_impl=self.config.flash_attention_backward_pass_impl,
+            base_config=self.config,
         )
         self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
 
@@ -146,34 +137,31 @@ class FlaxDbrxAttention(FlaxAttentionModule):
         """
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
-    def apply_rotary(
-        self, batch_size, sequence_length, query, key, value, freq_cis, position_ids
-    ):
-        """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
-        The main difference is that it takes in an additional argument, freq_cis, which are used to calculate
-        the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
+    def apply_rotary(self, query, key, freq_cis, position_ids):
+        """
+        Applies rotary positional embeddings to the query and key tensors.
 
         Args:
-            self: Access variables that belong to the class
-            batch_size: Reshape the query, key and value tensors
-            sequence_length: Reshape the query, key and value tensors
-            query: Calculate the attention weights
-            key: Calculate the attention
-            value: Compute the attention weights
-            freq_cis: Calculate the frequency of each word in the
-                vocabulary
-            position_ids: Identify the position of each token in the
-                sequence
+            query (chex.Array): Query tensor.
+            key (chex.Array): Key tensor.
+            freq_cis (Tuple[chex.Array, chex.Array]): Tuple containing cosine and sine components for rotary embeddings.
+            position_ids (chex.Array): Position indices for the tokens.
 
         Returns:
-            A tuple of 3 tensors: query, key and value
+            Tuple[chex.Array, chex.Array]: The modified query and key tensors after applying rotary embeddings.
         """
 
-        query, key, value = self._transpose_sequence_head(query, key, value)
-        query, key = self.rotary(
-            position_ids=position_ids, query=query, key=key, freq_cis=freq_cis
+        query, key = self._transpose_sequence_head(
+            query,
+            key,
         )
-        return self._transpose_sequence_head(query, key, value)
+        query, key = self.rotary(
+            position_ids=position_ids,
+            query=query,
+            key=key,
+            freq_cis=freq_cis,
+        )
+        return self._transpose_sequence_head(query, key)
 
     def __call__(
         self,
@@ -186,34 +174,24 @@ class FlaxDbrxAttention(FlaxAttentionModule):
         deterministic: bool = True,
         init_cache: bool = False,
         output_attentions: bool = False,
-        fcm_mask=None,
+        fcm_mask: Optional[chex.Array] = None,
     ):
-        """The __call__ function is the main function of a JAX module. It defines how the module behaves when called
-        with inputs. The __call__ function can be thought of as a &quot;forward pass&quot; through the model,
-        and it should return all outputs that are needed for training or inference.
+        """
+        Forward pass of the attention module.
 
         Args:
-            self: Access variables that belong to the class
-            hidden_states: chex.Array: Pass the hidden states of the
-                previous layer
-            freq_cis: Tuple[chex.Array, chex.Array],: Pass in the
-                frequency coefficients for each position
-            attention_mask: chex.Array: Mask out certain tokens in the
-                input sequence
-            position_ids: chex.Array: Determine the position of each
-                token in a sequence
-            causal_mask: chex.Array: Mask out the future tokens in the
-                decoder
-            deterministic: bool: Determine whether to use dropout or not
-            init_cache: bool: Initialize the cache
-            output_attentions: bool: Determine whether to return the
-                attention weights or not
-            fcm_mask: Mask out the attention weights between the input
-                and output tokens
-
-
+            hidden_states (chex.Array): Input hidden states.
+            freq_cis (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            attention_mask (chex.Array): Mask to apply on the attention scores.
+            position_ids (chex.Array): Position indices for the tokens.
+            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            deterministic (bool): If True, disables dropout for deterministic behavior.
+            init_cache (bool): If True, initializes cache for caching keys and values.
+            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
+            fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
         Returns:
-            A tuple of two arrays
+            Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
         """
         batch_size, sequence_length = hidden_states.shape[:2]
         qkv_states = self.Wqkv(hidden_states)
@@ -246,14 +224,11 @@ class FlaxDbrxAttention(FlaxAttentionModule):
             self.num_key_value_heads,
             self.head_dim,
         )
-        query_states, key_states, value_states = self.apply_rotary(
+        query_states, key_states = self.apply_rotary(
             query=query_states,
             key=key_states,
-            value=value_states,
             position_ids=position_ids,
             freq_cis=freq_cis,
-            batch_size=batch_size,
-            sequence_length=sequence_length,
         )
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
@@ -346,7 +321,10 @@ class FlaxDbrxAttention(FlaxAttentionModule):
         attn_output = self.out_proj(attn_output)
 
         attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
-        return attn_output, attentions.attention_weights
+        outputs = (attn_output,)
+        if output_attentions:
+            outputs += (output_attentions,)
+        return outputs
 
 
 class FlaxDbrxNormAttentionNorm(nn.Module):
@@ -382,12 +360,29 @@ class FlaxDbrxNormAttentionNorm(nn.Module):
         deterministic: bool = True,
         init_cache: bool = False,
         output_attentions: bool = False,
-        fcm_mask=None,
-    ):
+        fcm_mask: Optional[chex.Array] = None,
+    ) -> Tuple[chex.Array, chex.Array, Optional[chex.Array]]:
+        """
+        Forward pass of the attentionNrom module.
+
+        Args:
+            hidden_states (chex.Array): Input hidden states.
+            freq_cis (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            attention_mask (chex.Array): Mask to apply on the attention scores.
+            position_ids (chex.Array): Position indices for the tokens.
+            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            deterministic (bool): If True, disables dropout for deterministic behavior.
+            init_cache (bool): If True, initializes cache for caching keys and values.
+            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
+            fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+        Returns:
+            Tuple[chex.Array, chex.Array, Optional[chex.Array]]: A tuple containing the residual_states, hidden states, and the attention weights.
+        """
         residual_states = hidden_states
         hidden_states = self.norm_1(hidden_states)
 
-        hidden_states, attn_weights = self.attn(
+        attn_out = self.attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -399,7 +394,9 @@ class FlaxDbrxNormAttentionNorm(nn.Module):
             deterministic=deterministic,
             fcm_mask=fcm_mask,
         )
-
+        hidden_states, attn_weights = (
+            attn_out if output_attentions else (attn_out[0], None)
+        )
         hidden_states = self.dropout(hidden_states, deterministic=deterministic)
         hidden_states = hidden_states + residual_states
 
@@ -438,15 +435,21 @@ class FlaxDbrxExpertGLU(nn.Module):
         expert_w2 = self.w2.reshape(expert_shape)[expert_idx]
 
         x1 = jax.lax.batch_matmul(
-            x, jnp.expand_dims(expert_w1.T, 0), precision=self.precision
+            x,
+            jnp.expand_dims(expert_w1.T, 0),
+            precision=self.precision,
         )
         x2 = jax.lax.batch_matmul(
-            x, jnp.expand_dims(expert_v1.T, 0), precision=self.precision
+            x,
+            jnp.expand_dims(expert_v1.T, 0),
+            precision=self.precision,
         )
         x1 = self.activation_fn(x1)
         x1 = x1 * x2
         x1 = jax.lax.batch_matmul(
-            x1, jnp.expand_dims(expert_w2, 0), precision=self.precision
+            x1,
+            jnp.expand_dims(expert_w2, 0),
+            precision=self.precision,
         )
         return x1
 
@@ -622,8 +625,26 @@ class FlaxDbrxBlock(nn.Module):
         init_cache: bool = False,
         output_attentions: bool = False,
         output_router_logits: bool = False,
-        fcm_mask=None,
-    ):
+        fcm_mask: Optional[chex.Array] = None,
+    ) -> Tuple[chex.Array, chex.Array, Optional[chex.Array]]:
+        """
+        Forward pass of the attentionNrom module.
+
+        Args:
+            hidden_states (chex.Array): Input hidden states.
+            freq_cis (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            attention_mask (chex.Array): Mask to apply on the attention scores.
+            position_ids (chex.Array): Position indices for the tokens.
+            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            deterministic (bool): If True, disables dropout for deterministic behavior.
+            init_cache (bool): If True, initializes cache for caching keys and values.
+            output_attentions (bool): If True, outputs attention weights.
+            output_router_logits (bool): If True, outputs router logits.
+            fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+        Returns:
+            Tuple[chex.Array, chex.Array, Optional[chex.Array]]: A tuple containing the residual_states, hidden states, and the attention weights.
+        """
         resid_states, hidden_states, self_attn_weights = self.norm_attn_norm(
             hidden_states=hidden_states,
             freq_cis=freq_cis,
@@ -632,6 +653,9 @@ class FlaxDbrxBlock(nn.Module):
             position_ids=position_ids,
             output_attentions=output_attentions,
             init_cache=init_cache,
+            deterministic=deterministic,
+            segment_ids=segment_ids,
+            fcm_mask=fcm_mask,
         )
 
         hidden_states, router_logits = self.ffn(
@@ -681,8 +705,28 @@ class FlaxDbrxBlockCollection(nn.Module):
         output_attentions: bool = False,
         output_router_logits: bool = False,
         output_hidden_states: bool = False,
-        fcm_mask=None,
-    ):
+        fcm_mask: Optional[chex.Array] = None,
+    ) -> Tuple[chex.Array, chex.Array, Optional[chex.Array]]:
+        """
+        Forward pass of the attentionNrom module.
+
+        Args:
+            hidden_states (chex.Array): Input hidden states.
+            freq_cis (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            attention_mask (chex.Array): Mask to apply on the attention scores.
+            position_ids (chex.Array): Position indices for the tokens.
+            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            deterministic (bool): If True, disables dropout for deterministic behavior.
+            init_cache (bool): If True, initializes cache for caching keys and values.
+            output_attentions (bool): If True, outputs attention weights.
+            output_router_logits (bool): If True, outputs router logits.
+            output_hidden_states (bool): If True, outputs all of hidden states.
+            fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+        Returns:
+            Tuple[chex.Array, Optional[chex.Array], Optional[chex.Array], Optional[chex.Array]]:
+                A tuple containing the hidden_states, all_attentions, all_hidden_states, all_router_logits.
+        """
         all_hidden_states = ()
         all_router_logits = ()
         all_attentions = ()
@@ -716,6 +760,15 @@ class FlaxDbrxBlockCollection(nn.Module):
 
 
 class DbrxPreTrainedModel(EDPretrainedModel):
+    """
+    Base class for DBrX models providing initialization and configuration.
+
+    Attributes:
+        config_class (DbrxConfig): The configuration class for the model.
+        module_class (nn.Module): The class representing the model's architecture.
+        base_model_prefix (str): The prefix for the base model parameters.
+    """
+
     config_class: DbrxConfig = DbrxConfig
     module_class: nn.Module = None
     base_model_prefix = "model"
@@ -731,6 +784,19 @@ class DbrxPreTrainedModel(EDPretrainedModel):
         _do_init: bool = False,
         **kwargs,
     ):
+        """
+        Initializes the pre-trained model with the given configuration.
+
+        Args:
+            config (DbrxConfig): Configuration for the model.
+            dtype (jnp.dtype): Data type for computations.
+            param_dtype (jnp.dtype): Data type for model parameters.
+            precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
+            input_shape (Tuple[int, int]): Shape of the input tensor.
+            seed (int): Seed for random number generation.
+            _do_init (bool): If True, initialize model weights.
+            **kwargs: Additional keyword arguments.
+        """
         module = self.module_class(
             config=config,
             dtype=dtype,
@@ -749,23 +815,21 @@ class DbrxPreTrainedModel(EDPretrainedModel):
         )
 
     def init_weights(
-        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+        self,
+        rng: jax.random.PRNGKey,
+        input_shape: Tuple,
+        params: FrozenDict = None,
     ) -> FrozenDict:
-        """The init_weights function is used to initialize the weights of a model.
-        It takes in a rng, which is a random number generator key that can be used to generate random numbers.
-        The input_shape parameter specifies the shape of the inputs that will be fed into this model.
-        The params parameter allows you to pass in pre-trained weights for your model, if you have them available.
+        """
+        Initializes the model weights.
 
         Args:
-            self: Access variables that belong to the class
-            rng: jax.random.PRNGKey: Initialize the weights of the model
-            input_shape: Tuple: Initialize the input_ids, attention_mask
-                and position_ids
-            params: flax.core.FrozenDict: Pass in the parameters of a
-                pre-trained model
+            rng (jax.random.PRNGKey): Random number generator key.
+            input_shape (Tuple): Shape of the input tensor for initializing weights.
+            params (FrozenDict, optional): Existing parameters to initialize with.
 
         Returns:
-            A frozendict of parameters
+            FrozenDict: Initialized model parameters.
         """
 
         self.config.initialization_of_moe = True
@@ -811,7 +875,16 @@ class DbrxPreTrainedModel(EDPretrainedModel):
             return random_params
 
     def init_cache(self, batch_size, max_length):
+        """
+        Initializes the cache for autoregressive generation.
 
+        Args:
+            batch_size (int): Batch size for the cache.
+            max_length (int): Maximum length for the cache.
+
+        Returns:
+            dict: Initialized cache.
+        """
         input_ids = jnp.ones((batch_size, max_length))
         attention_mask = jnp.ones_like(input_ids)
         position_ids = jnp.broadcast_to(
@@ -833,6 +906,8 @@ class DbrxPreTrainedModel(EDPretrainedModel):
         input_ids: chex.Array,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
+        segment_ids: Optional[chex.Array] = None,
+        inputs_embeds: Optional[chex.Array] = None,
         params: dict = None,
         past_key_values: dict = None,
         dropout_rng: jax.random.PRNGKey = None,
@@ -844,35 +919,28 @@ class DbrxPreTrainedModel(EDPretrainedModel):
         add_params_field: bool = False,
         **kwargs,
     ):
-        """The __call__ function is the main function of a JAX module.
-        It takes as input:
-        - The parameters of the model (self.params)
-        - The inputs to the model (input_ids, attention_mask, position_ids)
-        - Whether we are training (train=True/False) and whether we want to return all hidden states and
-        attentions weights at each layer in addition to just the last layer output (output_hidden_states=True/False).
+        """
+        Forward pass through the model.
 
         Args:
-            self: Represent the instance of the class
-            input_ids: Pass the input sequence to the model
-            attention_mask: Mask out the padding tokens
-            position_ids: Specify the position of each token in the
-                sequence
-            params: dict: Pass in the parameters of the model
-            past_key_values: dict: Pass the past key values to the model
-            dropout_rng: jax.random.PRNGKey: Pass in a random number
-                generator key to the model
-            train: bool: Determine whether to use dropout or not
-            output_attentions: Optional[bool]: Determine whether to
-                return the attention weights
-            output_hidden_states: Optional[bool]: Determine whether to
-                return the hidden states of all layers
-            return_dict: Optional[bool]: Return a dictionary of the
-                outputs
-            add_params_field: bool: Add a params field to the inputs
-                dictionary
+            input_ids (chex.Array): Input tensor containing token IDs.
+            attention_mask (Optional[chex.Array]): Mask for attention.
+            position_ids (Optional[chex.Array]): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
+            inputs_embeds (Optional[chex.Array]): embedding inputs to be used instead of input_ids.
+            params (dict, optional): Parameters for the model.
+            past_key_values (dict, optional): Past key and value states for caching.
+            dropout_rng (jax.random.PRNGKey, optional): RNG key for dropout.
+            train (bool): If True, the model is in training mode.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            output_router_logits (Optional[bool]): If True, output router logits.
+            return_dict (Optional[bool]): If True, return a dictionary of outputs.
+            add_params_field (bool): If True, include the parameters in the input dictionary.
+            **kwargs: Additional arguments.
 
         Returns:
-            A tuple of (last_hidden_state, past_key_values)
+            Output type depends on the model configuration.
         """
 
         output_attentions = (
@@ -924,20 +992,17 @@ class DbrxPreTrainedModel(EDPretrainedModel):
 
         outputs = self.module.apply(
             inputs,
-            jnp.array(input_ids, dtype="i4"),  # input_ids: chex.Array
-            # attention_mask: Optional[chex.Array] = None
-            jnp.array(attention_mask, dtype="i4"),
-            # position_ids: Optional[chex.Array] = None
-            jnp.array(position_ids, dtype="i4"),
-            None,  # inputs_embeds: Optional[chex.Array] = None
-            output_attentions,  # output_attentions: Optional[bool] = None
-            # output_hidden_states: Optional[bool] = None
-            output_hidden_states,
-            # output_router_logits: Optional[bool] = None
-            output_router_logits,
-            False,  # init_cache: bool = False
-            not train,  # deterministic: bool = True
-            return_dict,  # return_dict: bool = True
+            input_ids=jnp.array(input_ids, dtype="i4"),
+            attention_mask=jnp.array(attention_mask, dtype="i4"),
+            position_ids=jnp.array(position_ids, dtype="i4"),
+            segment_ids=segment_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
+            init_cache=False,
+            deterministic=not train,
+            return_dict=return_dict,
             rngs=rng_s,
             mutable=mutable,
         )
@@ -988,25 +1053,14 @@ class FlaxDbrxModule(nn.Module):
                 scaling_factor=scaling_factor, rope_type=scaling_type
             )
         self.freq_cis = precompute_freq_cis(
-            max_position_embeddings=(
-                getattr(
-                    self.config, "freq_max_position_embeddings", self.config.max_seq_len
-                )
-            ),
+            max_position_embeddings=self.config.granted_freq_max_position_embedding,
             dim=self.config.d_model // self.config.n_heads,
             base=self.config.attn_config.rope_theta,
             **initial_rope_kwargs,
         )
         self.causal_mask = flax.linen.make_causal_mask(
             jnp.ones(
-                (
-                    1,
-                    getattr(
-                        self.config,
-                        "mask_max_position_embeddings",
-                        self.config.max_seq_len,
-                    ),
-                ),
+                (1, self.config.granted_mask_max_position_embedding),
                 dtype="bool",
             ),
             dtype="bool",
@@ -1017,6 +1071,7 @@ class FlaxDbrxModule(nn.Module):
         input_ids: chex.Array,
         attention_mask: chex.Array,
         position_ids: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
         inputs_embeds: Optional[chex.Array] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -1024,7 +1079,26 @@ class FlaxDbrxModule(nn.Module):
         init_cache: bool = False,
         deterministic: bool = True,
         return_dict: bool = True,
-    ) -> Union[Tuple, MoeModelOutput]:
+    ) -> MoeModelOutput | Tuple:
+        """
+        Forward pass through the Dbrx module.
+
+        Args:
+            input_ids (chex.Array): Input tensor containing token IDs.
+            attention_mask (chex.Array): Mask for attention.
+            position_ids (chex.Array): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
+            inputs_embeds (Optional[chex.Array]): Embedded input tensor.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            output_router_logits (Optional[bool]): If True, output router logits.
+            init_cache (bool): If True, initialize cache for decoding.
+            deterministic (bool): If True, disable dropout.
+            return_dict (bool): If True, return a dictionary of outputs.
+
+        Returns:
+            MoeModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
+        """
         if output_router_logits is None:
             output_router_logits = self.config.output_router_logits
         if input_ids is not None and inputs_embeds is not None:
@@ -1064,6 +1138,7 @@ class FlaxDbrxModule(nn.Module):
             output_hidden_states=output_hidden_states,
             init_cache=init_cache,
             deterministic=deterministic,
+            segment_ids=segment_ids,
         )
         all_self_attns = None
         all_hidden_states = None
@@ -1103,6 +1178,16 @@ class FlaxDbrxModel(DbrxPreTrainedModel):
 
 
 class FlaxDbrxForCausalLMModule(nn.Module):
+    """
+    Dbrx model for causal language modeling, including the language model head.
+
+    Attributes:
+        config (DbrxConfig): Configuration object with model hyperparameters.
+        dtype (jnp.dtype): Data type for the computations.
+        param_dtype (jnp.dtype): Data type for the model parameters.
+        precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
+    """
+
     config: DbrxConfig
     dtype: jnp.dtype = jnp.bfloat16
     param_dtype: jnp.dtype = jnp.bfloat16
@@ -1128,8 +1213,9 @@ class FlaxDbrxForCausalLMModule(nn.Module):
     def __call__(
         self,
         input_ids: chex.Array,
-        attention_mask: Optional[chex.Array] = None,
-        position_ids: Optional[chex.Array] = None,
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
         inputs_embeds: Optional[chex.Array] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -1138,7 +1224,25 @@ class FlaxDbrxForCausalLMModule(nn.Module):
         deterministic: bool = True,
         return_dict: bool = True,
     ) -> MoeCausalLMOutput | Tuple:
+        """
+        Forward pass through the Dbrx module.
 
+        Args:
+            input_ids (chex.Array): Input tensor containing token IDs.
+            attention_mask (chex.Array): Mask for attention.
+            position_ids (chex.Array): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
+            inputs_embeds (Optional[chex.Array]): Embedded input tensor.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            output_router_logits (Optional[bool]): If True, output router logits.
+            init_cache (bool): If True, initialize cache for decoding.
+            deterministic (bool): If True, disable dropout.
+            return_dict (bool): If True, return a dictionary of outputs.
+
+        Returns:
+            MoeCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
+        """
         if output_router_logits is None:
             output_router_logits = self.config.output_router_logits
         outputs = self.transformer(
@@ -1152,6 +1256,7 @@ class FlaxDbrxForCausalLMModule(nn.Module):
             init_cache=init_cache,
             deterministic=deterministic,
             return_dict=True,
+            segment_ids=segment_ids,
         )
         logits = self.lm_head(outputs.last_hidden_state)
         batch_size, seq_length, hd = logits.shape
@@ -1195,17 +1300,23 @@ class FlaxDbrxForCausalLM(DbrxPreTrainedModel):
     module_class = FlaxDbrxForCausalLMModule
 
     def prepare_inputs_for_generation(
-        self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
+        self,
+        input_ids,
+        max_length,
+        attention_mask: Optional[chex.Array] = None,
     ):
-        """
-        The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
+        """The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
 
-        :param self: Access variables that belong to the class
-        :param input_ids: Pass in the input tokens
-        :param max_length: Set the length of the sequence to be generated
-        :param attention_mask: Optional[chex.Array]: Mask the attention weights
-        :return: A dictionary of the past_key_values, attention_mask and position ids
+        Args:
+            self: Access variables that belong to the class
+            input_ids: Pass in the input tokens
+            max_length: Set the length of the sequence to be generated
+            attention_mask: Optional[chex.Array]: Mask the attention
+                weights
 
+        Returns:
+            A dictionary of the past_key_values, attention_mask and
+            position ids
         """
         batch_size, seq_length = input_ids.shape
 

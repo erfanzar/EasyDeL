@@ -1050,23 +1050,21 @@ class DeepseekV2PreTrainedModel(EDPretrainedModel):
         )
 
     def init_weights(
-        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+        self,
+        rng: jax.random.PRNGKey,
+        input_shape: Tuple,
+        params: FrozenDict = None,
     ) -> FrozenDict:
-        """The init_weights function is used to initialize the weights of a model.
-        It takes in a rng, which is a random number generator key that can be used to generate random numbers.
-        The input_shape parameter specifies the shape of the inputs that will be fed into this model.
-        The params parameter allows you to pass in pre-trained weights for your model, if you have them available.
+        """
+        Initializes the model weights.
 
         Args:
-            self: Access variables that belong to the class
-            rng: jax.random.PRNGKey: Initialize the weights of the model
-            input_shape: Tuple: Initialize the input_ids, attention_mask
-                and position_ids
-            params: flax.core.FrozenDict: Pass in the parameters of a
-                pre-trained model
+            rng (jax.random.PRNGKey): Random number generator key.
+            input_shape (Tuple): Shape of the input tensor for initializing weights.
+            params (FrozenDict, optional): Existing parameters to initialize with.
 
         Returns:
-            A frozendict of parameters
+            FrozenDict: Initialized model parameters.
         """
 
         self.config.initialization_of_moe = True

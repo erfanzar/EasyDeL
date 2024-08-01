@@ -246,7 +246,7 @@ class ArcticConfig(EDPretrainedConfig):
         return "params", "dropout", "fcm"
 
     @property
-    def granted_freq_max_position_embedding(self) -> None:
+    def granted_freq_max_position_embedding(self) -> int:
         return getattr(
             self,
             "freq_max_position_embeddings",
@@ -254,7 +254,7 @@ class ArcticConfig(EDPretrainedConfig):
         )
 
     @property
-    def granted_mask_max_position_embedding(self) -> None:
+    def granted_mask_max_position_embedding(self) -> int:
         return getattr(
             self,
             "mask_max_position_embeddings",
