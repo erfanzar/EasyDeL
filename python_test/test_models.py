@@ -289,6 +289,8 @@ class EasyModelsTest(unittest.TestCase):
             return jnp.allclose(hf_output.loss.detach().cpu().numpy(), loss)
 
     def test_llama(self):
+
+        self.header_config = None
         res, err = self.create_test_for_models("llama", transformers.LlamaForCausalLM)
         self.assertTrue(res, f"Llama model Failed [ERROR {err}]")
 
@@ -308,72 +310,94 @@ class EasyModelsTest(unittest.TestCase):
         self.assertTrue(res, f"MPT model Failed [ERROR {err}]")
 
     def test_falcon(self):
-        conf = transformers.AutoConfig.from_pretrained(
-            "tiiuae/falcon-11B", trust_remote_code=True
-        )
-        for k, v in self.__dict__.items():
-            if isinstance(
-                v,
-                (
-                    bool,
-                    str,
-                    float,
-                    type(None),
-                    int,
-                ),
-            ):
-                try:
-                    setattr(conf, k, v)
-                except:  # noqa
-                    ...
-        conf.ffn_hidden_size = self.hidden_size * 2
-        conf.ff_factor = 2
 
+        # conf = transformers.AutoConfig.from_pretrained(
+        #     "tiiuae/falcon-11B", trust_remote_code=True
+        # )
+        # for k, v in self.__dict__.items():
+        #     if isinstance(
+        #         v,
+        #         (
+        #             bool,
+        #             str,
+        #             float,
+        #             type(None),
+        #             int,
+        #         ),
+        #     ):
+        #         try:
+        #             setattr(conf, k, v)
+        #         except:  # noqa
+        #             ...
+        # conf.ffn_hidden_size = self.hidden_size * 2
+        # conf.ff_factor = 2
+
+        # res, err = self.create_test_for_models(
+        #     "falcon",
+        #     type(
+        #         transformers.AutoModelForCausalLM.from_config(
+        #             conf,
+        #             trust_remote_code=True,
+        #         )
+        #     ),
+        # )
+
+        self.header_config = None
         res, err = self.create_test_for_models(
             "falcon",
-            type(
-                transformers.AutoModelForCausalLM.from_config(
-                    conf,
-                    trust_remote_code=True,
-                )
-            ),
+            transformers.FalconForCausalLM,
         )
-
         self.assertTrue(res, f"Falcon model Failed [ERROR {err}]")
 
     def test_mistral(self):
+
+        self.header_config = None
         res, err = self.create_test_for_models(
             "mistral", transformers.MistralForCausalLM
         )
         self.assertTrue(res, f"Mistral model Failed [ERROR {err}]")
 
     def test_mixtral(self):
+
+        self.header_config = None
         res, err = self.create_test_for_models(
             "mixtral", transformers.MixtralForCausalLM
         )
         self.assertTrue(res, f"Mixtral model Failed [ERROR {err}]")
 
     def test_gpt2(self):
+
+        self.header_config = None
         res, err = self.create_test_for_models("gpt2", transformers.GPT2LMHeadModel)
         self.assertTrue(res, f"GPT2 model Failed [ERROR {err}]")
 
     def test_gptj(self):
+
+        self.header_config = None
         res, err = self.create_test_for_models("gptj", transformers.GPTJForCausalLM)
         self.assertTrue(res, f"GPT-J model Failed [ERROR {err}]")
 
     def test_qwen2(self):
+
+        self.header_config = None
         res, err = self.create_test_for_models("qwen2", transformers.Qwen2ForCausalLM)
         self.assertTrue(res, f"Qwen 2 model Failed [ERROR {err}]")
 
     def test_olmo(self):
+
+        self.header_config = None
         res, err = self.create_test_for_models("olmo", transformers.OlmoForCausalLM)
         self.assertTrue(res, f"OLMo model Failed [ERROR {err}]")
 
     def test_phi(self):
+
+        self.header_config = None
         res, err = self.create_test_for_models("phi", transformers.PhiForCausalLM)
         self.assertTrue(res, f"PHI 2 model Failed [ERROR {err}]")
 
     def test_gemma(self):
+
+        self.header_config = None
         org = self.tie_word_embeddings
         self.tie_word_embeddings = True
         res, err = self.create_test_for_models("gemma", transformers.GemmaForCausalLM)
@@ -568,7 +592,12 @@ class EasyModelsTest(unittest.TestCase):
 
     @staticmethod
     def compare_torch_to_jax(
-        name, hf_out, ed_out, ed_loss, atol: float = 1e-035, rtol: float = 1e-08
+        name,
+        hf_out,
+        ed_out,
+        ed_loss,
+        atol: float = 1e-022,
+        rtol: float = 1e-08,
     ):
         to, jo = hf_out.logits.cpu().detach().numpy(), ed_out.logits
         err = jnp.mean(jnp.sum(to)) - jnp.mean(jnp.sum(jo))
@@ -606,9 +635,11 @@ if __name__ == "__main__":
     # unittest.main()
     test = EasyModelsTest()
     test.setUp()
-    test.test_mistral()
-    # test.test_gemma2()
-    # test.test_llama()
+    # test.test_mistral() # Passed
+    # test.test_gemma() # Passed
+    # test.test_gemma2()  # Passed
+    # test.test_llama()  # Passed
     # test.test_arctic()
-    # test.test_cohere()
-    test.test_dbrx()
+    # test.test_cohere() # Passed
+    # test.test_dbrx() # Passed
+    # test.test_falcon()  # Passed

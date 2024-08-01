@@ -542,7 +542,7 @@ class FlaxGPT2PreTrainedModel(EDPretrainedModel):
         encoder_hidden_states: Optional[jnp.ndarray] = None,
         encoder_attention_mask: Optional[jnp.ndarray] = None,
         params: dict = None,
-        past_key_values: dict = None,
+        past_key_values: Optional[dict] = None,
         dropout_rng: jax.random.PRNGKey = None,
         train: bool = False,
         add_params_field: bool = False,

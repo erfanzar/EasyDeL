@@ -110,6 +110,21 @@ class FlaxFalconRotaryEmbedding(nn.Module):
 
 
 class FlaxFalconAttention(FlaxAttentionModule):
+    """
+    Implements the attention mechanism for the Falcon model.
+
+    This attention mechanism supports multiple variants depending on the configuration:
+    - Multi-Query Attention: Uses a single head for keys and values and multiple heads for queries.
+    - New Decoder Architecture: Uses a different arrangement of heads for queries, keys, and values.
+
+    Attributes:
+        config (FalconConfig): Configuration for the attention module.
+        dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+        param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+        precision (Optional[Union[jax.lax.Precision, str]]): Precision setting for JAX operations.
+
+    """
+
     config: FalconConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -172,6 +187,15 @@ class FlaxFalconAttention(FlaxAttentionModule):
     def _split_heads(
         self, qkv: chex.Array
     ) -> Tuple[chex.Array, chex.Array, chex.Array]:
+        """
+        Splits the query, key, and value tensors into separate heads.
+
+        Args:
+            qkv (chex.Array): Combined query, key, and value tensor.
+
+        Returns:
+            Tuple[chex.Array, chex.Array, chex.Array]: A tuple containing the query, key, and value tensors split into heads.
+        """
         batch_size, sequence_length, _ = qkv.shape
 
         if self.config.new_decoder_architecture:
@@ -209,6 +233,15 @@ class FlaxFalconAttention(FlaxAttentionModule):
         return query_states, key_states, value_states
 
     def _merge_heads(self, x: chex.Array) -> chex.Array:
+        """
+        Merges the attention heads into a single tensor.
+
+        Args:
+            x (chex.Array): Tensor with separate attention heads.
+
+        Returns:
+            chex.Array: Tensor with merged attention heads.
+        """
         batch_size_and_num_heads, seq_length, _ = x.shape
         batch_size = batch_size_and_num_heads // self.num_heads
         x = x.reshape(
@@ -224,12 +257,31 @@ class FlaxFalconAttention(FlaxAttentionModule):
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array = None,
-        alibi: chex.Array = None,
+        segment_ids: Optional[chex.Array] = None,
+        alibi: Optional[chex.Array] = None,
         freq_cis: Tuple[chex.Array, chex.Array] = None,
         init_cache: bool = False,
         output_attentions: bool = False,
         deterministic: bool = False,
     ):
+        """
+        Forward pass of the attention module.
+
+        Args:
+            hidden_states (chex.Array): Input hidden states.
+            attention_mask (chex.Array): Mask to apply on the attention scores.
+            position_ids (chex.Array): Position indices for the tokens.
+            causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior.
+            segment_ids (Optional[chex.Array], optional): Segment IDs for segment-based attention.
+            alibi (Optional[chex.Array], optional): Alibi tensor for adding positional bias.
+            freq_cis (Tuple[chex.Array, chex.Array], optional): Cosine and sine components for rotary embeddings.
+            init_cache (bool, optional): If True, initializes cache for caching keys and values.
+            output_attentions (bool, optional): If True, outputs attention weights alongside the hidden states.
+            deterministic (bool, optional): If True, disables dropout for deterministic behavior.
+
+        Returns:
+            Union[chex.Array, Tuple[chex.Array, chex.Array]]: The output tensor and optionally the attention weights.
+        """
         fused_qkv = self.query_key_value(
             hidden_states
         )  # [batch_size, seq_length, 3 x hidden_size]
@@ -241,13 +293,22 @@ class FlaxFalconAttention(FlaxAttentionModule):
         batch_size, query_length, _, _ = query_layer.shape
         key_length = query_length
         query_layer = query_layer.reshape(
-            batch_size, query_length, self.num_heads, self.head_dim
+            batch_size,
+            query_length,
+            self.num_heads,
+            self.head_dim,
         )
         key_layer = key_layer.reshape(
-            batch_size, query_length, num_kv_heads, self.head_dim
+            batch_size,
+            query_length,
+            num_kv_heads,
+            self.head_dim,
         )
         value_layer = value_layer.reshape(
-            batch_size, query_length, num_kv_heads, self.head_dim
+            batch_size,
+            query_length,
+            num_kv_heads,
+            self.head_dim,
         )
 
         if self.has_variable("cache", "cached_key"):
@@ -269,13 +330,18 @@ class FlaxFalconAttention(FlaxAttentionModule):
         attention_mask = combine_masks(attention_mask, causal_mask)
         if alibi is None:
             query_layer, key_layer = map(
-                lambda x: x.transpose(0, 2, 1, 3), [query_layer, key_layer]
+                lambda x: x.transpose(0, 2, 1, 3),
+                [query_layer, key_layer],
             )  # noqa
             query_layer, key_layer = self.rotary(
-                query_layer, key_layer, freq_cis, position_ids
+                query_layer,
+                key_layer,
+                freq_cis,
+                position_ids,
             )
             query_layer, key_layer = map(
-                lambda x: x.transpose(0, 2, 1, 3), [query_layer, key_layer]
+                lambda x: x.transpose(0, 2, 1, 3),
+                [query_layer, key_layer],
             )  # noqa
 
         if self.has_variable("cache", "cached_key") or init_cache:
@@ -305,7 +371,7 @@ class FlaxFalconAttention(FlaxAttentionModule):
                 causal_mask=causal_mask,
                 attention_mask=attention_mask,
                 deterministic=deterministic,
-                segment_ids=None,
+                segment_ids=segment_ids,
                 query_sequence_length=query_length,
                 key_value_sequence_length=key_length,
                 uses_cache=self.has_variable("cache", "cached_key") or init_cache,
@@ -428,12 +494,23 @@ class FlaxFalconBlock(nn.Module):
         attn_block = FlaxFalconAttention
         mlp_block = FlaxFalconMlp
         if self.config.gradient_checkpointing != "":
+
+            # hidden_states: chex.Array, 0
+            # attention_mask: chex.Array, 1
+            # position_ids: chex.Array, 2
+            # causal_mask: chex.Array = None, 3
+            # segment_ids: Optional[chex.Array] = None, 4
+            # alibi: Optional[chex.Array] = None, 5
+            # freq_cis: Tuple[chex.Array, chex.Array] = None, 6
+            # init_cache: bool = False, 7
+            # output_attentions: bool = False, 8
+            # deterministic: bool = False, 9
             attn_block = flax.linen.partitioning.remat(
                 attn_block,
                 policy=get_gradient_checkpoint_policy(
                     self.config.gradient_checkpointing
                 ),
-                static_argnums=(3, 5, 6, 7, 8),
+                static_argnums=(1, 3, 6, 7, 8, 9),
             )
 
             mlp_block = flax.linen.partitioning.remat(
@@ -463,15 +540,34 @@ class FlaxFalconBlock(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        alibi: chex.Array,
         attention_mask: chex.Array,
-        freq_cis: Tuple[chex.Array, chex.Array],
         position_ids: chex.Array,
-        causal_mask: chex.Array,
+        causal_mask: chex.Array = None,
+        segment_ids: Optional[chex.Array] = None,
+        alibi: Optional[chex.Array] = None,
+        freq_cis: Tuple[chex.Array, chex.Array] = None,
         init_cache: bool = False,
         output_attentions: bool = False,
-        deterministic: bool = True,
+        deterministic: bool = False,
     ):
+        """
+        Forward pass of the FalconBlock module.
+
+        Args:
+            hidden_states (chex.Array): Input hidden states.
+            attention_mask (chex.Array): Mask to apply on the attention scores.
+            position_ids (chex.Array): Position indices for the tokens.
+            causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior.
+            segment_ids (Optional[chex.Array], optional): Segment IDs for segment-based attention.
+            alibi (Optional[chex.Array], optional): Alibi tensor for adding positional bias.
+            freq_cis (Tuple[chex.Array, chex.Array], optional): Cosine and sine components for rotary embeddings.
+            init_cache (bool, optional): If True, initializes cache for caching keys and values.
+            output_attentions (bool, optional): If True, outputs attention weights alongside the hidden states.
+            deterministic (bool, optional): If True, disables dropout for deterministic behavior.
+
+        Returns:
+            Union[chex.Array, Tuple[chex.Array, chex.Array]]: The output tensor and optionally the attention weights.
+        """
         residual = hidden_states
 
         if self.config.num_ln_in_parallel_attn == 2:
@@ -480,21 +576,22 @@ class FlaxFalconBlock(nn.Module):
         else:
             attention_layernorm_out = self.input_layernorm(hidden_states)
 
-        # hidden_states: chex.Array
-        # attention_mask: chex.Array
-        # position_ids: chex.Array
-        # causal_mask: chex.Array = None
-        # alibi: chex.Array = None
-        # freq_cis: Tuple[chex.Array, chex.Array] = None
-        # init_cache: bool = False
-        # output_attentions: bool = False
-        # deterministic: bool = False
-
+        # hidden_states: chex.Array,
+        # attention_mask: chex.Array,
+        # position_ids: chex.Array,
+        # causal_mask: chex.Array = None,
+        # segment_ids: Optional[chex.Array] = None,
+        # alibi: Optional[chex.Array] = None,
+        # freq_cis: Tuple[chex.Array, chex.Array] = None,
+        # init_cache: bool = False,
+        # output_attentions: bool = False,
+        # deterministic: bool = False,
         attention_output, attn_score = self.self_attention(
             attention_layernorm_out,
             attention_mask,
             position_ids,
             causal_mask,
+            segment_ids,
             alibi,
             freq_cis,
             init_cache,
@@ -532,6 +629,19 @@ class FlaxFalconBlock(nn.Module):
 
 
 class FlaxFalconCollection(nn.Module):
+    """
+    Represents a collection of FlaxFalconBlock modules, forming the main body of the Falcon model.
+
+    This module stacks multiple FlaxFalconBlock layers and handles the forward pass through them,
+    optionally collecting hidden states and attention scores.
+
+    Attributes:
+        config (FalconConfig): Configuration for the Falcon model.
+        dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+        param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+        precision (Optional[Union[jax.lax.Precision, str]]): Precision setting for JAX operations.
+    """
+
     config: FalconConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -553,38 +663,53 @@ class FlaxFalconCollection(nn.Module):
         self,
         hidden_states: chex.Array,
         attention_mask: chex.Array,
-        alibi: chex.Array,
         freq_cis: Tuple[chex.Array, chex.Array],
         position_ids: chex.Array,
         causal_mask: chex.Array,
+        alibi: Optional[chex.Array] = None,
+        segment_ids: Optional[chex.Array] = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         init_cache: bool = False,
         deterministic: bool = True,
     ):
+        """
+        Forward pass through the collection of FlaxFalconBlock layers.
+
+        Args:
+            hidden_states (chex.Array): Input hidden states.
+            attention_mask (chex.Array): Mask to apply on the attention scores.
+            freq_cis (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            position_ids (chex.Array): Position indices for the tokens.
+            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+            alibi (Optional[chex.Array], optional): Alibi tensor for adding positional bias.
+            segment_ids (Optional[chex.Array], optional): Segment IDs for segment-based attention.
+            output_attentions (bool, optional): If True, returns attention scores from each layer.
+            output_hidden_states (bool, optional): If True, returns hidden states from each layer.
+            init_cache (bool, optional): If True, initializes cache for caching keys and values.
+            deterministic (bool, optional): If True, disables dropout for deterministic behavior.
+
+        Returns:
+            Tuple[chex.Array, Tuple[chex.Array], Tuple[chex.Array]]: A tuple containing:
+                - The final hidden states.
+                - A tuple of hidden states from all layers (if output_hidden_states is True).
+                - A tuple of attention scores from all layers (if output_attentions is True).
+        """
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
         for layer in self.layers:
-            # hidden_states: chex.Array
-            # alibi: chex.Array
-            # attention_mask: chex.Array
-            # freq_cis: Tuple[chex.Array, chex.Array]
-            # position_ids: chex.Array
-            # causal_mask: chex.Array
-            # init_cache: bool = False
-            # output_attentions: bool = False
-            # deterministic: bool = True
 
             hidden_states, score = layer(
-                hidden_states,
-                alibi,
-                attention_mask,
-                freq_cis,
-                position_ids,
-                causal_mask,
-                init_cache,
-                output_attentions,
-                deterministic,
+                hidden_states=hidden_states,
+                alibi=alibi,
+                attention_mask=attention_mask,
+                freq_cis=freq_cis,
+                position_ids=position_ids,
+                causal_mask=causal_mask,
+                init_cache=init_cache,
+                output_attentions=output_attentions,
+                deterministic=deterministic,
+                segment_ids=segment_ids,
             )
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -619,16 +744,12 @@ class FlaxFalconModule(nn.Module):
             param_dtype=self.param_dtype,
             epsilon=config.layer_norm_epsilon,
         )
-        c_length = getattr(
-            config, "mask_max_position_embeddings", config.max_position_embeddings
-        )
-        freqs_length = getattr(
-            self.config,
-            "freq_max_position_embeddings",
-            self.config.max_position_embeddings,
-        )
         self.causal_mask = flax.linen.make_causal_mask(
-            jnp.ones((1, c_length), dtype="bool"), dtype="bool"
+            jnp.ones(
+                shape=(1, self.config.granted_mask_max_position_embedding),
+                dtype="bool",
+            ),
+            dtype="bool",
         )
         self.freq_cis = None
         if not self.config.alibi:
@@ -640,7 +761,7 @@ class FlaxFalconModule(nn.Module):
                     scaling_factor=scaling_factor, rope_type=scaling_type
                 )
             self.freq_cis = precompute_freq_cis(
-                max_position_embeddings=freqs_length,
+                max_position_embeddings=self.config.granted_freq_max_position_embedding,
                 dim=config.hidden_size // config.num_attention_heads,
                 base=config.rope_theta,
                 **initial_rope_kwargs,
@@ -648,32 +769,58 @@ class FlaxFalconModule(nn.Module):
 
     def __call__(
         self,
-        input_ids: chex.Array,
+        input_ids: Optional[chex.Array] = None,
         attention_mask: Optional[chex.Array] = None,
-        head_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
-        output_attentions: bool = False,
-        deterministic: bool = True,
+        segment_ids: Optional[chex.Array] = None,
+        inputs_embeds: Optional[chex.Array] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
         init_cache: bool = False,
-        return_dict: Optional[bool] = True,
-    ):
-        batch, sequence_length = input_ids.shape
+        deterministic: bool = True,
+        return_dict: bool = True,
+    ) -> Union[FlaxBaseModelOutput, Tuple]:
+        """
+        Forward pass through the Mistral module.
 
-        hidden_states = self.word_embeddings(inputs=input_ids.astype(jnp.int32))
+        Args:
+            input_ids (chex.Array): Input tensor containing token IDs.
+            attention_mask (chex.Array): Mask for attention.
+            position_ids (chex.Array): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
+            inputs_embeds (Optional[chex.Array]): Embedded input tensor.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            init_cache (bool): If True, initialize cache for decoding.
+            deterministic (bool): If True, disable dropout.
+            return_dict (bool): If True, return a dictionary of outputs.
+
+        Returns:
+            FlaxBaseModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
+        """
+        if inputs_embeds is None and input_ids is not None:
+            inputs_embeds = self.word_embeddings(input_ids.astype("i4"))
+        else:
+            raise ValueError(
+                "you should specify inputs_embeds or input_ids one of them"
+            )
+        batch_size, sequence_length, _ = inputs_embeds.shape
+
         alibi = None
         if self.config.alibi:
             alibi = built_bloom_alibi(
-                attention_mask, self.config.num_attention_heads
-            ).astype(hidden_states.dtype)
+                attention_mask,
+                self.config.num_attention_heads,
+            ).astype(inputs_embeds.dtype)
         elif position_ids is None:
             position_ids = jnp.arange(0, sequence_length).reshape(1, -1)
         if attention_mask is None:
-            attention_mask = jnp.ones((batch, sequence_length), dtype="i4")
+            attention_mask = jnp.ones((batch_size, sequence_length), dtype="i4")
         if attention_mask.ndim == 2:
             attention_mask = jnp.expand_dims(attention_mask, (-3, -2))
 
         hidden_states, all_hidden_states, all_attentions = self.h(
-            hidden_states=hidden_states,
+            hidden_states=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
             alibi=alibi,
@@ -681,7 +828,9 @@ class FlaxFalconModule(nn.Module):
             causal_mask=self.causal_mask,
             output_attentions=output_attentions,
             deterministic=deterministic,
+            output_hidden_states=output_hidden_states,
             init_cache=init_cache,
+            segment_ids=segment_ids,
         )
         hidden_states = self.ln_f(hidden_states)
         if all_hidden_states is not None:
@@ -718,7 +867,10 @@ class FlaxFalconPretrainedModel(EDPretrainedModel):
         ),
     ):
         module = self.module_class(
-            config=config, dtype=dtype, param_dtype=param_dtype, precision=precision
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
         )
         super().__init__(
             _do_init=_do_init,
@@ -729,7 +881,10 @@ class FlaxFalconPretrainedModel(EDPretrainedModel):
         )
 
     def init_weights(
-        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+        self,
+        rng: jax.random.PRNGKey,
+        input_shape: Tuple,
+        params: FrozenDict = None,
     ) -> FrozenDict:
         """The init_weights function is used to initialize the weights of a model.
 
@@ -782,28 +937,59 @@ class FlaxFalconPretrainedModel(EDPretrainedModel):
 
     def __call__(
         self,
-        input_ids: chex.Array,
+        input_ids: Optional[chex.Array] = None,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
-        past_key_values: Optional[nn.Module] = None,
-        output_attentions: bool = False,
-        train: bool = True,
-        return_dict: Optional[bool] = True,
-        params: FrozenDict = None,
+        segment_ids: Optional[chex.Array] = None,
+        inputs_embeds: Optional[chex.Array] = None,
+        params: dict = None,
+        past_key_values: Optional[dict] = None,
+        dropout_rng: jax.random.PRNGKey = None,
+        train: bool = False,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
         add_params_field: bool = False,
         **kwargs,
     ):
-        input_ids = jnp.asarray(input_ids, dtype=jnp.int32)
-        inputs = (
-            {"params": params or self.params}
-            if add_params_field
-            else params or self.params
+        """
+        Forward pass through the model.
+
+        Args:
+            input_ids (chex.Array): Input tensor containing token IDs.
+            attention_mask (Optional[chex.Array]): Mask for attention.
+            position_ids (Optional[chex.Array]): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
+            inputs_embeds (Optional[chex.Array]): embedding inputs to be used instead of input_ids.
+            params (dict, optional): Parameters for the model.
+            past_key_values (dict, optional): Past key and value states for caching.
+            dropout_rng (jax.random.PRNGKey, optional): RNG key for dropout.
+            train (bool): If True, the model is in training mode.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            return_dict (Optional[bool]): If True, return a dictionary of outputs.
+            add_params_field (bool): If True, include the parameters in the input dictionary.
+            **kwargs: Additional arguments.
+
+        Returns:
+            Output type depends on the model configuration.
+        """
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
         )
-        if past_key_values is not None:
-            inputs["cache"] = past_key_values
-            mutable = ["cache"]
-        else:
-            mutable = False
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.return_dict
+        )
+        batch_size, sequence_length = (
+            input_ids.shape if input_ids is not None else inputs_embeds.shape[:2]
+        )
 
         if position_ids is None:
             if past_key_values is not None:
@@ -812,26 +998,43 @@ class FlaxFalconPretrainedModel(EDPretrainedModel):
                 )
 
             position_ids = jnp.broadcast_to(
-                jnp.arange(input_ids.shape[1])[None, :],
-                (input_ids.shape[0], input_ids.shape[1]),
+                jnp.arange(sequence_length)[None, :], (batch_size, sequence_length)
             )
-        rngs = {}
-        if self.config.bits is not None:
-            rngs["params"] = jax.random.key(0)
+
         if attention_mask is None:
-            attention_mask = jnp.ones((input_ids.shape[0], input_ids.shape[1]))
+            attention_mask = jnp.ones((batch_size, sequence_length))
+        rng_s = {}
+        if dropout_rng is not None:
+            rng_s["dropout"] = dropout_rng
+
+        inputs = (
+            {"params": params or self.params}
+            if add_params_field
+            else params or self.params
+        )
+
+        if self.config.bits is not None:
+            rng_s["params"] = jax.random.key(0)
+        if past_key_values is not None:
+            inputs["cache"] = past_key_values
+            mutable = ["cache"]
+        else:
+            mutable = False
 
         outputs = self.module.apply(
             inputs,
-            jnp.array(input_ids, dtype="i4"),
-            jnp.array(attention_mask, dtype="i4"),
-            jnp.array(position_ids, dtype="i4"),
-            output_attentions,
-            not train,
-            False,
-            return_dict,
+            input_ids=jnp.array(input_ids, dtype="i4"),
+            attention_mask=jnp.array(attention_mask, dtype="i4"),
+            position_ids=jnp.array(position_ids, dtype="i4"),
+            deterministic=not train,
+            init_cache=False,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            inputs_embeds=inputs_embeds,
+            segment_ids=segment_ids,
+            rngs=rng_s,
             mutable=mutable,
-            rngs=rngs,
         )
 
         if past_key_values is not None and return_dict:
@@ -921,14 +1124,35 @@ class FlaxFalconForCausalLMModule(nn.Module):
 
     def __call__(
         self,
-        input_ids: chex.Array,
+        input_ids: Optional[chex.Array] = None,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
-        output_attentions: bool = False,
+        segment_ids: Optional[chex.Array] = None,
+        inputs_embeds: Optional[chex.Array] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        init_cache: bool = False,
         deterministic: bool = True,
-        init_cache: Optional[bool] = None,
-        return_dict: Optional[bool] = False,
-    ):
+        return_dict: bool = True,
+    ) -> Union[FlaxCausalLMOutput, Tuple]:
+        """
+        Forward pass through the Mistral module.
+
+        Args:
+            input_ids (Optional[chex.Array]): Input tensor containing token IDs.
+            attention_mask (Optional[chex.Array]): Mask for attention.
+            position_ids (Optional[chex.Array]): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
+            inputs_embeds (Optional[chex.Array]): Embedded input tensor.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            init_cache (bool): If True, initialize cache for decoding.
+            deterministic (bool): If True, disable dropout.
+            return_dict (bool): If True, return a dictionary of outputs.
+
+        Returns:
+            FlaxCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
+        """
         transformer_output = self.transformer(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -936,6 +1160,10 @@ class FlaxFalconForCausalLMModule(nn.Module):
             output_attentions=output_attentions,
             init_cache=init_cache,
             return_dict=return_dict,
+            inputs_embeds=inputs_embeds,
+            deterministic=deterministic,
+            output_hidden_states=output_hidden_states,
+            segment_ids=segment_ids,
         )
         if return_dict:
             hidden_state = transformer_output.last_hidden_state

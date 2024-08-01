@@ -89,7 +89,7 @@ class GemmaConfig(EDPretrainedConfig):
         gradient_checkpointing: str = "nothing_saveable",
         bits: Optional[int] = None,
         scan_layers: bool = False,
-        hidden_activation=None,
+        hidden_activation="gelu_pytorch_tanh",
         **kwargs,
     ):
 
@@ -193,3 +193,19 @@ class GemmaConfig(EDPretrainedConfig):
     @staticmethod
     def rng_keys():
         return "params", "dropout", "fcm"
+
+    @property
+    def granted_freq_max_position_embedding(self) -> int:
+        return getattr(
+            self,
+            "freq_max_position_embeddings",
+            self.max_position_embeddings,
+        )
+
+    @property
+    def granted_mask_max_position_embedding(self) -> int:
+        return getattr(
+            self,
+            "mask_max_position_embeddings",
+            self.max_position_embeddings,
+        )

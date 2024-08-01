@@ -909,7 +909,7 @@ class DbrxPreTrainedModel(EDPretrainedModel):
         segment_ids: Optional[chex.Array] = None,
         inputs_embeds: Optional[chex.Array] = None,
         params: dict = None,
-        past_key_values: dict = None,
+        past_key_values: Optional[dict] = None,
         dropout_rng: jax.random.PRNGKey = None,
         train: bool = False,
         output_attentions: Optional[bool] = None,

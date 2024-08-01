@@ -754,7 +754,7 @@ class FlaxQwen1PreTrainedModel(EDPretrainedModel):
         attention_mask: chex.Array = None,
         position_ids: chex.Array = None,
         params: dict = None,
-        past_key_values: dict = None,
+        past_key_values: Optional[dict] = None,
         # past_rope_cache: dict = None,
         dropout_rng: jax.random.PRNGKey = None,
         train: bool = False,
