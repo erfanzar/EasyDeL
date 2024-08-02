@@ -697,9 +697,9 @@ class FlaxGPTJModule(nn.Module):
         output_hidden_states: bool = False,
         return_dict: bool = True,
     ):
-        inputs_embeds = self.wte(input_ids.astype("i4"))
+        input_embeds = self.wte(input_ids.astype("i4"))
 
-        hidden_states = self.dropout(inputs_embeds, deterministic=deterministic)
+        hidden_states = self.dropout(input_embeds, deterministic=deterministic)
 
         outputs = self.h(
             hidden_states,

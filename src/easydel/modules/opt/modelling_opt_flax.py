@@ -434,13 +434,13 @@ class FlaxOPTDecoder(nn.Module):
         input_shape = input_ids.shape
         input_ids = input_ids.reshape(-1, input_shape[-1])
 
-        inputs_embeds = self.embed_tokens(input_ids)
+        input_embeds = self.embed_tokens(input_ids)
         if self.project_in is not None:
-            inputs_embeds = self.project_in(inputs_embeds)
+            input_embeds = self.project_in(input_embeds)
 
         positions = self.embed_positions(position_ids)
 
-        hidden_states = inputs_embeds + positions
+        hidden_states = input_embeds + positions
 
         hidden_state, all_hidden_states, attentions = self.layers(
             hidden_states,

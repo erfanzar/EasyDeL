@@ -25,8 +25,8 @@ from easydel.modules.flax_modeling_utils import (
     control_mlp_sharding,
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
-    with_sharding_constraint,
     precompute_frequencies,
+    with_sharding_constraint,
 )
 from easydel.modules.modeling_flax_outputs import MoeCausalLMOutput, MoeModelOutput
 from easydel.modules.modeling_utils import EDPretrainedModel
@@ -1037,7 +1037,7 @@ class ArcticPreTrainedModel(EDPretrainedModel):
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
         segment_ids: Optional[chex.Array] = None,
-        inputs_embeds: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         params: dict = None,
         past_key_values: Optional[dict] = None,
         dropout_rng: jax.random.PRNGKey = None,
@@ -1056,7 +1056,7 @@ class ArcticPreTrainedModel(EDPretrainedModel):
             attention_mask (Optional[chex.Array]): Mask for attention.
             position_ids (Optional[chex.Array]): Positional indices.
             segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
-            inputs_embeds (Optional[chex.Array]): embedding inputs to be used instead of input_ids.
+            input_embeds (Optional[chex.Array]): embedding inputs to be used instead of input_ids.
             params (dict, optional): Parameters for the model.
             past_key_values (dict, optional): Past key and value states for caching.
             dropout_rng (jax.random.PRNGKey, optional): RNG key for dropout.
@@ -1087,9 +1087,9 @@ class ArcticPreTrainedModel(EDPretrainedModel):
             batch_size, sequence_length = input_ids.shape
         else:
             assert (
-                inputs_embeds is not None
+                input_embeds is not None
             ), "both `input_ids` and `input_embeds` can't be None"
-            batch_size, sequence_length, _ = inputs_embeds.shape
+            batch_size, sequence_length, _ = input_embeds.shape
         if position_ids is None:
             if past_key_values is not None:
                 raise ValueError(
@@ -1127,7 +1127,7 @@ class ArcticPreTrainedModel(EDPretrainedModel):
             attention_mask=jnp.array(attention_mask, dtype="i4"),
             position_ids=jnp.array(position_ids, dtype="i4"),
             segment_ids=segment_ids,
-            inputs_embeds=inputs_embeds,
+            input_embeds=input_embeds,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             init_cache=False,
@@ -1213,7 +1213,7 @@ class FlaxArcticModule(nn.Module):
         attention_mask: chex.Array,
         position_ids: chex.Array,
         segment_ids: Optional[chex.Array] = None,
-        inputs_embeds: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         init_cache: bool = False,
@@ -1228,7 +1228,7 @@ class FlaxArcticModule(nn.Module):
             attention_mask (chex.Array): Mask for attention.
             position_ids (chex.Array): Positional indices.
             segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-            inputs_embeds (Optional[chex.Array]): Embedded input tensor.
+            input_embeds (Optional[chex.Array]): Embedded input tensor.
             output_attentions (Optional[bool]): If True, output attention weights.
             output_hidden_states (Optional[bool]): If True, output hidden states.
             init_cache (bool): If True, initialize cache for decoding.
@@ -1238,17 +1238,15 @@ class FlaxArcticModule(nn.Module):
         Returns:
             MoeModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
         """
-        if input_ids is not None and inputs_embeds is not None:
+        if input_ids is not None and input_embeds is not None:
             raise ValueError(
-                "You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time"
+                "You cannot specify both decoder_input_ids and decoder_input_embeds at the same time"
             )
 
-        if inputs_embeds is None and input_ids is not None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+        if input_embeds is None and input_ids is not None:
+            input_embeds = self.embed_tokens(input_ids.astype("i4"))
         else:
-            raise ValueError(
-                "you should specify inputs_embeds or input_ids one of them"
-            )
+            raise ValueError("you should specify input_embeds or input_ids one of them")
         output_attentions = (
             output_attentions
             if output_attentions is not None
@@ -1261,7 +1259,7 @@ class FlaxArcticModule(nn.Module):
             else self.config.output_hidden_states
         )
         collection_outputs = self.layers(
-            hidden_states=inputs_embeds,
+            hidden_states=input_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
             causal_mask=self.causal_mask,
@@ -1360,7 +1358,7 @@ class FlaxArcticForCausalLMModule(nn.Module):
         attention_mask: chex.Array,
         position_ids: chex.Array,
         segment_ids: Optional[chex.Array] = None,
-        inputs_embeds: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         init_cache: bool = False,
@@ -1375,7 +1373,7 @@ class FlaxArcticForCausalLMModule(nn.Module):
             attention_mask (chex.Array): Mask for attention.
             position_ids (chex.Array): Positional indices.
             segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-            inputs_embeds (Optional[chex.Array]): Embedded input tensor.
+            input_embeds (Optional[chex.Array]): Embedded input tensor.
             output_attentions (Optional[bool]): If True, output attention weights.
             output_hidden_states (Optional[bool]): If True, output hidden states.
             init_cache (bool): If True, initialize cache for decoding.
@@ -1389,7 +1387,7 @@ class FlaxArcticForCausalLMModule(nn.Module):
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
+            input_embeds=input_embeds,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             init_cache=init_cache,

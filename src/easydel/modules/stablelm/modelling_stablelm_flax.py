@@ -23,8 +23,8 @@ from easydel.modules.flax_modeling_utils import (
     control_mlp_sharding,
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
-    with_sharding_constraint,
     precompute_frequencies,
+    with_sharding_constraint,
 )
 from easydel.modules.modeling_flax_outputs import (
     FlaxBaseModelOutput,
@@ -785,7 +785,7 @@ class FlaxStableLmModule(nn.Module):
     def __call__(
         self,
         input_ids: Optional[chex.Array] = None,
-        inputs_embeds: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
         extra_embedding: Optional[chex.Array] = None,
@@ -795,12 +795,12 @@ class FlaxStableLmModule(nn.Module):
         init_cache: bool = False,
         return_dict: bool = True,
     ) -> tuple[tuple[Any, ...], ...] | FlaxBaseModelOutput:
-        if input_ids is None and inputs_embeds is None:
-            raise RuntimeError("Both `input_ids` and `inputs_embeds` can not be None !")
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+        if input_ids is None and input_embeds is None:
+            raise RuntimeError("Both `input_ids` and `input_embeds` can not be None !")
+        if input_embeds is None:
+            input_embeds = self.embed_tokens(input_ids.astype("i4"))
 
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        batch_size, sequence_length, _ = input_embeds.shape
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, sequence_length), dtype="i4")
         if position_ids is None:
@@ -813,14 +813,14 @@ class FlaxStableLmModule(nn.Module):
             sequence_length <= self.config.max_position_embeddings
         ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 
-        inputs_embeds = (
-            inputs_embeds + extra_embedding
+        input_embeds = (
+            input_embeds + extra_embedding
             if extra_embedding is not None
-            else inputs_embeds
+            else input_embeds
         )
 
         outputs = self.layers(
-            hidden_states=inputs_embeds,
+            hidden_states=input_embeds,
             frequencies=self.frequencies,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -877,7 +877,7 @@ class FlaxStableLmForCausalLMModule(nn.Module):
     def __call__(
         self,
         input_ids: Optional[chex.Array] = None,
-        inputs_embeds: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
         extra_embedding: Optional[chex.Array] = None,
@@ -1048,7 +1048,7 @@ class FlaxStableLmPreTrainedModel(EDPretrainedModel):
         outputs = self.module.apply(
             inputs,
             input_ids=input_ids,
-            inputs_embeds=None,
+            input_embeds=None,
             attention_mask=attention_mask,
             position_ids=position_ids,
             extra_embedding=extra_embedding,

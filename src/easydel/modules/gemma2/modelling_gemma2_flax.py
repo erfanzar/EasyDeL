@@ -643,10 +643,10 @@ class FlaxGemma2PreTrainedModel(EDPretrainedModel):
     def __call__(
         self,
         input_ids: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
         segment_ids: Optional[chex.Array] = None,
-        inputs_embeds: Optional[chex.Array] = None,
         params: dict = None,
         past_key_values: Optional[dict] = None,
         dropout_rng: jax.random.PRNGKey = None,
@@ -662,10 +662,10 @@ class FlaxGemma2PreTrainedModel(EDPretrainedModel):
 
         Args:
             input_ids (chex.Array): Input tensor containing token IDs.
+            input_embeds (Optional[chex.Array]): embedding inputs to be used instead of input_ids.
             attention_mask (Optional[chex.Array]): Mask for attention.
             position_ids (Optional[chex.Array]): Positional indices.
             segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
-            inputs_embeds (Optional[chex.Array]): embedding inputs to be used instead of input_ids.
             params (dict, optional): Parameters for the model.
             past_key_values (dict, optional): Past key and value states for caching.
             dropout_rng (jax.random.PRNGKey, optional): RNG key for dropout.
@@ -694,7 +694,7 @@ class FlaxGemma2PreTrainedModel(EDPretrainedModel):
         )
 
         batch_size, sequence_length = (
-            input_ids.shape if input_ids is not None else inputs_embeds.shape[:2]
+            input_ids.shape if input_ids is not None else input_embeds.shape[:2]
         )
 
         if position_ids is None:
@@ -736,7 +736,7 @@ class FlaxGemma2PreTrainedModel(EDPretrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            inputs_embeds=inputs_embeds,
+            input_embeds=input_embeds,
             segment_ids=segment_ids,
             rngs=rngs,
             mutable=mutable,
@@ -900,7 +900,7 @@ class FlaxGemma2Module(nn.Module):
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
         segment_ids: Optional[chex.Array] = None,
-        inputs_embeds: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         init_cache: bool = False,
@@ -915,7 +915,7 @@ class FlaxGemma2Module(nn.Module):
             attention_mask (chex.Array): Mask for attention.
             position_ids (chex.Array): Positional indices.
             segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-            inputs_embeds (Optional[chex.Array]): Embedded input tensor.
+            input_embeds (Optional[chex.Array]): Embedded input tensor.
             output_attentions (Optional[bool]): If True, output attention weights.
             output_hidden_states (Optional[bool]): If True, output hidden states.
             init_cache (bool): If True, initialize cache for decoding.
@@ -925,15 +925,13 @@ class FlaxGemma2Module(nn.Module):
         Returns:
             FlaxBaseModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
         """
-        if inputs_embeds is None and input_ids is not None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+        if input_embeds is None and input_ids is not None:
+            input_embeds = self.embed_tokens(input_ids.astype("i4"))
         else:
-            raise ValueError(
-                "you should specify inputs_embeds or input_ids one of them"
-            )
-        batch_size, sequence_length, _ = inputs_embeds.shape
+            raise ValueError("you should specify input_embeds or input_ids one of them")
+        batch_size, sequence_length, _ = input_embeds.shape
 
-        inputs_embeds = inputs_embeds * (self.config.hidden_size**0.5)
+        input_embeds = input_embeds * (self.config.hidden_size**0.5)
         assert (
             sequence_length <= self.config.max_position_embeddings
         ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
@@ -941,7 +939,7 @@ class FlaxGemma2Module(nn.Module):
             attention_mask = jnp.expand_dims(attention_mask, (1, 2))
 
         outputs = self.layers(
-            hidden_states=inputs_embeds,
+            hidden_states=input_embeds,
             frequencies=self.frequencies,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -1007,7 +1005,7 @@ class FlaxGemma2ForCausalLMModule(nn.Module):
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
         segment_ids: Optional[chex.Array] = None,
-        inputs_embeds: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         init_cache: bool = False,
@@ -1022,7 +1020,7 @@ class FlaxGemma2ForCausalLMModule(nn.Module):
             attention_mask (Optional[chex.Array]): Mask for attention.
             position_ids (Optional[chex.Array]): Positional indices.
             segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-            inputs_embeds (Optional[chex.Array]): Embedded input tensor.
+            input_embeds (Optional[chex.Array]): Embedded input tensor.
             output_attentions (Optional[bool]): If True, output attention weights.
             output_hidden_states (Optional[bool]): If True, output hidden states.
             init_cache (bool): If True, initialize cache for decoding.
@@ -1034,7 +1032,7 @@ class FlaxGemma2ForCausalLMModule(nn.Module):
         """
 
         batch_size, seq_length = (
-            input_ids.shape if input_ids is not None else inputs_embeds.shape[:2]
+            input_ids.shape if input_ids is not None else input_embeds.shape[:2]
         )
         if attention_mask is None:
             attention_mask = jnp.ones_like(input_ids)
@@ -1052,7 +1050,7 @@ class FlaxGemma2ForCausalLMModule(nn.Module):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            inputs_embeds=inputs_embeds,
+            input_embeds=input_embeds,
             segment_ids=segment_ids,
         )
 
