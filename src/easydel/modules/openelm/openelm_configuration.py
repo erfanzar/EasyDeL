@@ -196,7 +196,6 @@ class OpenELMConfig(EDPretrainedConfig):
             attention_bias: bool: when ever to use attention_bias
             **kwargs: Pass a variable number of keyword arguments to a
                 function
-        :param : Define the number of layers in the model
 
         Returns:
             An instance of the class
@@ -414,3 +413,19 @@ class OpenELMConfig(EDPretrainedConfig):
         # check num_query_heads divisible by num_kv_heads for every layer
         for layer_idx in range(len(query_dims)):
             assert self.num_query_heads[layer_idx] % self.num_kv_heads[layer_idx] == 0
+
+    @property
+    def granted_freq_max_position_embedding(self) -> int:
+        return getattr(
+            self,
+            "freq_max_position_embeddings",
+            self.max_context_length,
+        )
+
+    @property
+    def granted_mask_max_position_embedding(self) -> int:
+        return getattr(
+            self,
+            "mask_max_position_embeddings",
+            self.max_context_length,
+        )

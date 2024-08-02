@@ -24,8 +24,8 @@ from easydel.modules.flax_modeling_utils import (
     control_mlp_sharding,
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
-    with_sharding_constraint,
     precompute_frequencies,
+    with_sharding_constraint,
 )
 from easydel.modules.modeling_flax_outputs import (
     FlaxBaseModelOutput,
@@ -721,7 +721,7 @@ class FlaxCoherePreTrainedModel(EDPretrainedModel):
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
         segment_ids: Optional[chex.Array] = None,
-        inputs_embeds: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         params: dict = None,
         past_key_values: Optional[dict] = None,
         dropout_rng: jax.random.PRNGKey = None,
@@ -740,7 +740,7 @@ class FlaxCoherePreTrainedModel(EDPretrainedModel):
             attention_mask (Optional[chex.Array]): Mask for attention.
             position_ids (Optional[chex.Array]): Positional indices.
             segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
-            inputs_embeds (Optional[chex.Array]): embedding inputs to be used instead of input_ids.
+            input_embeds (Optional[chex.Array]): embedding inputs to be used instead of input_ids.
             params (dict, optional): Parameters for the model.
             past_key_values (dict, optional): Past key and value states for caching.
             dropout_rng (jax.random.PRNGKey, optional): RNG key for dropout.
@@ -816,7 +816,7 @@ class FlaxCoherePreTrainedModel(EDPretrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            inputs_embeds=inputs_embeds,
+            input_embeds=input_embeds,
             segment_ids=segment_ids,
             rngs=rngs,
             mutable=mutable,
@@ -1013,7 +1013,7 @@ class FlaxCohereModule(nn.Module):
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
         segment_ids: Optional[chex.Array] = None,
-        inputs_embeds: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         init_cache: bool = False,
@@ -1028,7 +1028,7 @@ class FlaxCohereModule(nn.Module):
             attention_mask (chex.Array): Mask for attention.
             position_ids (chex.Array): Positional indices.
             segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-            inputs_embeds (Optional[chex.Array]): Embedded input tensor.
+            input_embeds (Optional[chex.Array]): Embedded input tensor.
             output_attentions (Optional[bool]): If True, output attention weights.
             output_hidden_states (Optional[bool]): If True, output hidden states.
             init_cache (bool): If True, initialize cache for decoding.
@@ -1038,20 +1038,18 @@ class FlaxCohereModule(nn.Module):
         Returns:
             FlaxBaseModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
         """
-        if inputs_embeds is None and input_ids is not None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+        if input_embeds is None and input_ids is not None:
+            input_embeds = self.embed_tokens(input_ids.astype("i4"))
         else:
-            raise ValueError(
-                "you should specify inputs_embeds or input_ids one of them"
-            )
-        batch_size, sequence_length, _ = inputs_embeds.shape
+            raise ValueError("you should specify input_embeds or input_ids one of them")
+        batch_size, sequence_length, _ = input_embeds.shape
 
         assert (
             sequence_length <= self.config.max_position_embeddings
         ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 
         outputs = self.layers(
-            hidden_states=inputs_embeds,
+            hidden_states=input_embeds,
             frequencies=self.frequencies,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -1135,7 +1133,7 @@ class FlaxCohereForCausalLMModule(nn.Module):
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
         segment_ids: Optional[chex.Array] = None,
-        inputs_embeds: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         init_cache: bool = False,
@@ -1150,7 +1148,7 @@ class FlaxCohereForCausalLMModule(nn.Module):
             attention_mask (chex.Array): Mask for attention.
             position_ids (chex.Array): Positional indices.
             segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-            inputs_embeds (Optional[chex.Array]): Embedded input tensor.
+            input_embeds (Optional[chex.Array]): Embedded input tensor.
             output_attentions (Optional[bool]): If True, output attention weights.
             output_hidden_states (Optional[bool]): If True, output hidden states.
             init_cache (bool): If True, initialize cache for decoding.
@@ -1177,7 +1175,7 @@ class FlaxCohereForCausalLMModule(nn.Module):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            inputs_embeds=inputs_embeds,
+            input_embeds=input_embeds,
             segment_ids=segment_ids,
         )
 

@@ -24,8 +24,8 @@ from easydel.modules.flax_modeling_utils import (
     control_mlp_sharding,
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
-    with_sharding_constraint,
     precompute_frequencies,
+    with_sharding_constraint,
 )
 from easydel.modules.modeling_flax_outputs import (
     FlaxBaseModelOutput,
@@ -978,7 +978,7 @@ class FlaxQwen2Module(nn.Module):
         attention_mask: chex.Array,
         position_ids: chex.Array,
         deterministic: bool = True,
-        inputs_embeds: chex.Array = None,
+        input_embeds: chex.Array = None,
         init_cache: bool = False,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
@@ -998,7 +998,7 @@ class FlaxQwen2Module(nn.Module):
                 token in a sequence
             deterministic: bool: Control whether dropout is applied or
                 not
-            inputs_embeds: chex.Array: Pass in the embeddings of the
+            input_embeds: chex.Array: Pass in the embeddings of the
                 input tokens
             init_cache: bool: Initialize the cache
             output_attentions: bool: Determine whether to return the
@@ -1013,21 +1013,21 @@ class FlaxQwen2Module(nn.Module):
         Returns:
             A tuple of:
         """
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+        if input_embeds is None:
+            input_embeds = self.embed_tokens(input_ids.astype("i4"))
 
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        batch_size, sequence_length, _ = input_embeds.shape
 
         assert (
             sequence_length <= self.config.max_position_embeddings
         ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 
-        inputs_embeds = (
-            inputs_embeds + extra_embedding
+        input_embeds = (
+            input_embeds + extra_embedding
             if extra_embedding is not None
-            else inputs_embeds
+            else input_embeds
         )
-        hidden_states = self.dropout(inputs_embeds, deterministic=deterministic)
+        hidden_states = self.dropout(input_embeds, deterministic=deterministic)
 
         outputs = self.layers(
             hidden_states=hidden_states,

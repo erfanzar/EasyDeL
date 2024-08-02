@@ -1319,7 +1319,7 @@ class FlaxChatGLMModel(nn.Module):
         input_ids,
         position_ids: Optional[jax.Array] = None,
         attention_mask: Optional[jax.Array] = None,
-        inputs_embeds: Optional[jax.Array] = None,
+        input_embeds: Optional[jax.Array] = None,
         init_cache: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -1336,8 +1336,8 @@ class FlaxChatGLMModel(nn.Module):
 
         batch_size, seq_length = input_ids.shape
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embedding(input_ids)
+        if input_embeds is None:
+            input_embeds = self.embedding(input_ids)
         # Rotary positional embeddings
         rotary_pos_emb = self.rotary_pos_emb(self.seq_length)
         if position_ids is not None:
@@ -1349,7 +1349,7 @@ class FlaxChatGLMModel(nn.Module):
         hidden_states, all_hidden_states, all_self_attentions = self.encoder(
             attention_mask=attention_mask,
             causal_mask=self.causal_mask,
-            hidden_states=inputs_embeds,
+            hidden_states=input_embeds,
             frequencies=rotary_pos_emb,
             deterministic=deterministic,
             init_cache=init_cache,

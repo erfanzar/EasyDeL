@@ -67,7 +67,7 @@ class EasyModelsTest(unittest.TestCase):
         self.shard_attention_computation: bool = True
         self.rotary_dim = 32
         self.dtype: jax.numpy.dtype = jnp.float32
-        self.precision = jax.lax.Precision("fastest")
+        self.precision = jax.lax.Precision("highest")
         self.attn_mechanism: Literal[
             "vanilla",
             "flash",
@@ -503,7 +503,7 @@ class EasyModelsTest(unittest.TestCase):
                 )
             ),
         )
-
+        self.header_config = None
         self.assertTrue(res, f"OpenELM model Failed [ERROR {err}]")
 
     def test_arctic(self):
@@ -632,14 +632,17 @@ class EasyModelsTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
-    # test = EasyModelsTest()
-    # test.setUp()
-    # test.test_mistral() # Passed
-    # test.test_gemma() # Passed
-    # test.test_gemma2()  # Passed
-    # test.test_llama()  #  Llama 3.1 Passed
+    # unittest.main()
+    test = EasyModelsTest()
+    test.setUp()
+    # test.test_mistral() # Passed v0.0.70
+    # test.test_gemma() # Passed v0.0.70
+    # test.test_gemma2()  # Passed v0.0.70
+    # test.test_llama()  #  Llama 3.1 Passed v0.0.70
     # test.test_arctic()
-    # test.test_cohere() # Passed
-    # test.test_dbrx() # Passed
-    # test.test_falcon()  # Passed
+    # test.test_cohere() # Passed v0.0.70
+    # test.test_dbrx() # Passed v0.0.70
+    # test.test_falcon()  # Passed v0.0.70
+    # test.test_mpt() # Passed v0.0.70
+    # test.test_olmo()  # Passed v0.0.70
+    # test.test_openelm()  # Passed v0.0.70

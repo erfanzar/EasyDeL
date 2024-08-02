@@ -1092,7 +1092,7 @@ class FlaxQwen1Module(nn.Module):
         attention_mask: chex.Array,
         position_ids: chex.Array,
         deterministic: bool = True,
-        inputs_embeds: chex.Array = None,
+        input_embeds: chex.Array = None,
         init_cache: bool = False,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
@@ -1112,7 +1112,7 @@ class FlaxQwen1Module(nn.Module):
                 token in a sequence
             deterministic: bool: Control whether dropout is applied or
                 not
-            inputs_embeds: chex.Array: Pass in the embeddings of the
+            input_embeds: chex.Array: Pass in the embeddings of the
                 input tokens
             init_cache: bool: Initialize the cache
             output_attentions: bool: Determine whether to return the
@@ -1126,10 +1126,10 @@ class FlaxQwen1Module(nn.Module):
         Returns:
             A tuple of:
         """
-        if inputs_embeds is None:
-            inputs_embeds = self.wte(input_ids.astype("i4"))
+        if input_embeds is None:
+            input_embeds = self.wte(input_ids.astype("i4"))
 
-        batch_size, sequence_length, _ = inputs_embeds.shape
+        batch_size, sequence_length, _ = input_embeds.shape
         kv_seq_len = sequence_length
 
         if self.h.blocks[0].attn.has_variable("cache", "cached_key"):
@@ -1140,13 +1140,13 @@ class FlaxQwen1Module(nn.Module):
 
         # if deterministic or not self.config.use_dynamic_ntk:
         #     ntk_alpha_list = [1.0]
-        # elif kv_seq_len != inputs_embeds.shape[1]:
+        # elif kv_seq_len != input_embeds.shape[1]:
         #     ntk_alpha_list = self.rotary_emb._ntk_alpha_cached_list
         # else:
         #     ntk_alpha_list = []
         #     if attention_mask is not None and kv_seq_len > self.seq_length:
         #         true_seq_lens = jnp.sum(attention_mask.reshape(batch_size, 1, 1, -1) == 0, axis=-1, dtype=jnp.float32)
-        #         for i in range(inputs_embeds.shape[0]):
+        #         for i in range(input_embeds.shape[0]):
         #             true_seq_len = true_seq_lens[i].item()
         #             ntk_alpha = self.get_ntk_alpha(true_seq_len)
         #             ntk_alpha_list.append(ntk_alpha)
@@ -1158,12 +1158,12 @@ class FlaxQwen1Module(nn.Module):
         assert (
             sequence_length <= self.config.seq_length
         ), "Maximum Position Embedding Reached !"
-        inputs_embeds = (
-            inputs_embeds + extra_embedding
+        input_embeds = (
+            input_embeds + extra_embedding
             if extra_embedding is not None
-            else inputs_embeds
+            else input_embeds
         )
-        hidden_states = self.drop(inputs_embeds, deterministic=deterministic)
+        hidden_states = self.drop(input_embeds, deterministic=deterministic)
 
         outputs = self.h(
             hidden_states=hidden_states,

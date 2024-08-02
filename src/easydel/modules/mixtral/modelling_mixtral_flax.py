@@ -25,8 +25,8 @@ from easydel.modules.flax_modeling_utils import (
     control_mlp_sharding,
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
-    with_sharding_constraint,
     precompute_frequencies,
+    with_sharding_constraint,
 )
 from easydel.modules.mixtral.mixtral_configuration import MixtralConfig as MixtralConfig
 from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
@@ -96,18 +96,6 @@ class FlaxMixtralAttention(FlaxAttentionModule):
         self.o_proj = dense(self.hidden_size)
         self.rotary = FlaxMixtralRotaryEmbedding(self.dtype)
         self.attention_performer = FlexibleAttentionModule(
-            use_sharding_constraint=self.config.use_sharding_constraint,
-            block_k_major=self.config.block_k_major,
-            block_b=self.config.block_b,
-            block_q=self.config.block_q,
-            block_k=self.config.block_k,
-            block_q_major_dkv=self.config.block_q_major_dkv,
-            block_k_major_dkv=self.config.block_k_major_dkv,
-            block_k_major_dq=self.config.block_k_major_dq,
-            block_k_dkv=self.config.block_k_dkv,
-            block_q_dkv=self.config.block_q_dkv,
-            block_q_dq=self.config.block_q_dq,
-            block_k_dq=self.config.block_k_dq,
             num_attention_heads=self.config.num_attention_heads,
             attention_dropout=self.config.attention_dropout,
             head_dims=self.head_dim,
@@ -121,27 +109,34 @@ class FlaxMixtralAttention(FlaxAttentionModule):
             mesh=self.config.mesh,
             sm_scale=1 / math.sqrt(self.head_dim),
             axis_name=self.config.attention_axis_name,
+            base_config=self.config,
         )
 
-    def apply_rotary(
-        self,
-        batch_size,
-        sequence_length,
-        query,
-        key,
-        value,
-        frequencies,
-        position_ids,
-    ):
+    def apply_rotary(self, query, key, frequencies, position_ids):
+        """
+        Applies rotary positional embeddings to the query and key tensors.
 
-        query, key, value = self._transpose_sequence_head(query, key, value)
+        Args:
+            query (chex.Array): Query tensor.
+            key (chex.Array): Key tensor.
+            frequencies (Tuple[chex.Array, chex.Array]): Tuple containing cosine and sine components for rotary embeddings.
+            position_ids (chex.Array): Position indices for the tokens.
+
+        Returns:
+            Tuple[chex.Array, chex.Array]: The modified query and key tensors after applying rotary embeddings.
+        """
+
+        query, key = self._transpose_sequence_head(
+            query,
+            key,
+        )
         query, key = self.rotary(
             position_ids=position_ids,
             query=query,
             key=key,
             frequencies=frequencies,
         )
-        return self._transpose_sequence_head(query, key, value)
+        return self._transpose_sequence_head(query, key)
 
     def _merge_heads(self, hidden_states):
         """
@@ -160,35 +155,30 @@ class FlaxMixtralAttention(FlaxAttentionModule):
         hidden_states: chex.Array,
         frequencies: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
-        causal_mask: chex.Array,
         position_ids: chex.Array,
+        causal_mask: chex.Array,
         segment_ids: Optional[chex.Array] = None,
         deterministic: bool = True,
         init_cache: bool = False,
-        output_attentions: bool = True,
+        output_attentions: bool = False,
+        fcm_mask: Optional[chex.Array] = None,
     ):
-        """The __call__ function is the main function of a JAX module.
-        It defines how the module behaves when called as a function, and it's what you'll use to call your model in practice.
-        The __call__ method takes an input tensor (x) and returns an output tensor (y).
-        In this case, we're defining our model to be a simple linear layer with no activation: y = x @ w + b.
+        """
+        Forward pass of the attention module.
 
         Args:
-            self: Refer to the object itself
-            hidden_states: chex.Array: Pass in the hidden state of the
-                model
-            frequencies: Tuple[chex.Array, chex.Array],: Create the
-                apply_rotary variable
-            attention_mask: chex.Array: Mask the attention weights
-            causal_mask: chex.Array: Mask the attention weights
-            position_ids: chex.Array: Specify the position of each token
-                in a sequence
-            deterministic: bool: Determine whether to use dropout or not
-            init_cache: bool: Initialize the cache
-            output_attentions: bool: Determine whether to return the
-                attention weights
-
+            hidden_states (chex.Array): Input hidden states.
+            frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            attention_mask (chex.Array): Mask to apply on the attention scores.
+            position_ids (chex.Array): Position indices for the tokens.
+            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            deterministic (bool): If True, disables dropout for deterministic behavior.
+            init_cache (bool): If True, initializes cache for caching keys and values.
+            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
+            fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
         Returns:
-            A tuple of (out, attn_output)
+            Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
         """
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = (
@@ -244,11 +234,10 @@ class FlaxMixtralAttention(FlaxAttentionModule):
             causal_mask, (batch_size,) + causal_mask.shape[1:]
         )
         attention_mask = jnp.broadcast_to(
-            jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape
+            jnp.expand_dims(attention_mask, axis=(-3, -2)),
+            causal_mask.shape,
         )
-        attention_mask = combine_masks(attention_mask, causal_mask)
-        if attention_mask.ndim == 2:
-            attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+        attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
 
         dropout_rng = None
 
@@ -261,18 +250,10 @@ class FlaxMixtralAttention(FlaxAttentionModule):
             )
 
         key_states, value_states = self.repeat_key_value(
-            key_states, value_states, self.num_key_value_groups
+            key_states,
+            value_states,
+            self.num_key_value_groups,
         )
-        # if self.config.use_sharding_constraint:
-        #     query_states = with_sharding_constraint(
-        #         query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)
-        #     )
-        #     key_states = with_sharding_constraint(
-        #         key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-        #     )
-        #     value_states = with_sharding_constraint(
-        #         value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-        #     )
         attention_bias = lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -314,7 +295,11 @@ class FlaxMixtralAttention(FlaxAttentionModule):
                 ),
             )
         attn_output = self.o_proj(attn_output)
-        outputs = (attn_output, attentions.attention_weights)
+        outputs = (
+            (attn_output, attentions.attention_weights)
+            if output_attentions
+            else (attn_output,)
+        )
         return outputs
 
 
@@ -482,7 +467,7 @@ class FlaxMixtralDecoderLayer(nn.Module):
                 policy=get_gradient_checkpoint_policy(
                     self.config.gradient_checkpointing
                 ),
-                static_argnums=(1, 3, 4, 6, 7, 8, 9),
+                static_argnums=(1, 3, 4, 6, 7, 8),
             )
             mlp_block = re_mat(
                 mlp_block,
@@ -522,38 +507,32 @@ class FlaxMixtralDecoderLayer(nn.Module):
         hidden_states: chex.Array,
         frequencies: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
-        causal_mask: chex.Array,
         position_ids: chex.Array,
+        causal_mask: chex.Array,
         segment_ids: Optional[chex.Array] = None,
         deterministic: bool = True,
         init_cache: bool = False,
-        output_attentions: bool = True,
-        output_router_logits: Optional[bool] = None,
-    ):
-        """The __call__ function is the main function of a TransformerEncoderLayer.
-        It takes in the following arguments:
-            hidden_states (chex.Array): The input to the encoder layer, which is also its output after being processed by all sublayers.
-            frequencies (chex.Array): A tensor containing frequency-domain representations of each token's context vector, used for computing self-attention weights and biases in a more efficient manner than using position embeddings or sinusoidal positional encoding vectors would allow for [2]. This tensor has shape `(batch_size, num
+        output_attentions: bool = False,
+        output_router_logits: bool = False,
+        fcm_mask: Optional[chex.Array] = None,
+    ) -> Tuple[chex.Array, chex.Array, Optional[chex.Array]]:
+        """
+        Forward pass of the attentionNrom module.
 
         Args:
-            self: Represent the instance of the class
-            hidden_states: chex.Array: Represent the input to the
-                encoder layer
-            frequencies: Tuple[chex.Array, chex.Array],: Pass the frequency
-                information to the attention layer
-            attention_mask: chex.Array: Mask out the attention weights
-                for certain positions
-            causal_mask: chex.Array: Mask the future tokens
-            position_ids: chex.Array: Indicate the position of each
-                token in the sequence
-            deterministic: bool: Determine whether to use dropout or not
-            init_cache: bool: Initialize the cache for the self-
-                attention layer
-            output_attentions: bool: Determine whether to return the
-                attention weights or not
-
+            hidden_states (chex.Array): Input hidden states.
+            frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            attention_mask (chex.Array): Mask to apply on the attention scores.
+            position_ids (chex.Array): Position indices for the tokens.
+            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            deterministic (bool): If True, disables dropout for deterministic behavior.
+            init_cache (bool): If True, initializes cache for caching keys and values.
+            output_attentions (bool): If True, outputs attention weights.
+            output_router_logits (bool): If True, outputs router logits.
+            fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
         Returns:
-            A tuple of hidden_states and attention_output
+            Tuple[chex.Array, chex.Array, Optional[chex.Array]]: A tuple containing the residual_states, hidden states, and the attention weights.
         """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -568,18 +547,21 @@ class FlaxMixtralDecoderLayer(nn.Module):
         # init_cache: bool = False
         # output_attentions: bool = True
 
-        hidden_states, self_attn_weights = self.self_attn(
+        attn_out = self.self_attn(
             hidden_states,
             frequencies,
             attention_mask,
-            causal_mask,
             position_ids,
+            causal_mask,
             segment_ids,
             deterministic,
             init_cache,
             output_attentions,
+            fcm_mask,
         )
-
+        hidden_states, self_attn_weights = (
+            attn_out if output_attentions else (attn_out[0], None)
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -619,44 +601,57 @@ class FlaxMixtralDecoderLayerCollection(nn.Module):
         hidden_states: chex.Array,
         frequencies: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
-        causal_mask: chex.Array,
         position_ids: chex.Array,
+        causal_mask: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
         deterministic: bool = True,
         init_cache: bool = False,
-        output_hidden_states: Optional[bool] = False,
-        output_attentions: Optional[bool] = False,
-        output_router_logits: Optional[bool] = None,
-    ):
-        """The __call__ function is the main function of a TransformerEncoderLayer.
-        It takes in the following arguments:
-            hidden_states (chex.Array): The input to the encoder layer, which is also its output after being processed by all sublayers.
-            frequencies (chex.Array): A tensor containing frequency-domain representations of each token's context vector, used for computing self-attention weights and biases in a more efficient manner than using position embeddings or sinusoidal positional encoding vectors would allow for [2]. This tensor has shape `(batch_size, num
+        output_attentions: bool = False,
+        output_router_logits: bool = False,
+        output_hidden_states: bool = False,
+    ) -> Tuple[chex.Array, chex.Array, Optional[chex.Array]]:
+        """
+        Forward pass of the attentionNrom module.
 
         Args:
-            self: Represent the instance of the class
-            hidden_states: chex.Array: Represent the input to the
-                encoder layer
-            frequencies: Tuple[chex.Array, chex.Array],: Pass the frequency
-                information to the attention layer
-            attention_mask: chex.Array: Mask out the attention weights
-                for certain positions
-            causal_mask: chex.Array: Mask the future tokens
-            position_ids: chex.Array: Indicate the position of each
-                token in the sequence
-            deterministic: bool: Determine whether to use dropout or not
-            init_cache: bool: Initialize the cache for the self-
-                attention layer
-            output_attentions: bool: Determine whether to return the
-                attention weights or not
-
+            hidden_states (chex.Array): Input hidden states.
+            frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            attention_mask (chex.Array): Mask to apply on the attention scores.
+            position_ids (chex.Array): Position indices for the tokens.
+            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            deterministic (bool): If True, disables dropout for deterministic behavior.
+            init_cache (bool): If True, initializes cache for caching keys and values.
+            output_attentions (bool): If True, outputs attention weights.
+            output_router_logits (bool): If True, outputs router logits.
+            output_hidden_states (bool): If True, outputs all of hidden states.
         Returns:
-            A tuple of hidden_states, attention_output,
-            all_hidden_states and all_router_logits
+            Tuple[chex.Array, Optional[chex.Array], Optional[chex.Array], Optional[chex.Array]]:
+                A tuple containing the hidden_states, all_attentions, all_hidden_states, all_router_logits.
         """
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         all_router_logits = () if output_router_logits else None
-
+        if not deterministic and self.config.fcm_max_ratio > 0:
+            # Apply forgetful causal mask
+            batch_size, seq_length = hidden_states.shape[0], hidden_states.shape[1]
+            fcm_ratio = jax.random.uniform(
+                self.make_rng("fcm"),
+                shape=(batch_size, 1, 1, 1),
+                minval=self.config.fcm_min_ratio,
+                maxval=self.config.fcm_max_ratio,
+            )
+            fcm_mask = (
+                jax.random.uniform(
+                    self.make_rng("fcm"),
+                    shape=(batch_size, 1, seq_length, seq_length),
+                )
+                > fcm_ratio
+            )
+            fcm_mask = fcm_mask.at[:, :, :, 0].set(True)
+            fcm_mask = fcm_mask.astype("bool")
+        else:
+            fcm_mask = None
         for block in self.blocks:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -670,6 +665,8 @@ class FlaxMixtralDecoderLayerCollection(nn.Module):
                 frequencies=frequencies,
                 causal_mask=causal_mask,
                 deterministic=deterministic,
+                segment_ids=segment_ids,
+                fcm_mask=fcm_mask,
             )
 
             hidden_states = layer_outputs[0]
@@ -691,6 +688,15 @@ class FlaxMixtralDecoderLayerCollection(nn.Module):
 
 
 class MixtralPreTrainedModel(EDPretrainedModel):
+    """
+    Base class for Mixtral models providing initialization and configuration.
+
+    Attributes:
+        config_class (MixtralConfig): The configuration class for the model.
+        module_class (nn.Module): The class representing the model's architecture.
+        base_model_prefix (str): The prefix for the base model parameters.
+    """
+
     config_class: MixtralConfig = MixtralConfig
     module_class: nn.Module = None
     base_model_prefix = "model"
@@ -708,6 +714,19 @@ class MixtralPreTrainedModel(EDPretrainedModel):
         _do_init: bool = False,
         **kwargs,
     ):
+        """
+        Initializes the pre-trained model with the given configuration.
+
+        Args:
+            config (MixtralConfig): Configuration for the model.
+            dtype (jnp.dtype): Data type for computations.
+            param_dtype (jnp.dtype): Data type for model parameters.
+            precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
+            input_shape (Tuple[int, int]): Shape of the input tensor.
+            seed (int): Seed for random number generation.
+            _do_init (bool): If True, initialize model weights.
+            **kwargs: Additional keyword arguments.
+        """
         module = self.module_class(
             config=config,
             dtype=dtype,
@@ -808,6 +827,8 @@ class MixtralPreTrainedModel(EDPretrainedModel):
         input_ids: chex.Array,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
+        segment_ids: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         params: dict = None,
         past_key_values: Optional[dict] = None,
         dropout_rng: jax.random.PRNGKey = None,
@@ -819,35 +840,28 @@ class MixtralPreTrainedModel(EDPretrainedModel):
         add_params_field: bool = False,
         **kwargs,
     ):
-        """The __call__ function is the main function of a JAX module.
-        It takes as input:
-        - The parameters of the model (self.params)
-        - The inputs to the model (input_ids, attention_mask, position_ids)
-        - Whether we are training (train=True/False) and whether we want to return all hidden states and
-        attentions weights at each layer in addition to just the last layer output (output_hidden_states=True/False).
+        """
+        Forward pass through the model.
 
         Args:
-            self: Represent the instance of the class
-            input_ids: Pass the input sequence to the model
-            attention_mask: Mask out the padding tokens
-            position_ids: Specify the position of each token in the
-                sequence
-            params: dict: Pass in the parameters of the model
-            past_key_values: dict: Pass the past key values to the model
-            dropout_rng: jax.random.PRNGKey: Pass in a random number
-                generator key to the model
-            train: bool: Determine whether to use dropout or not
-            output_attentions: Optional[bool]: Determine whether to
-                return the attention weights
-            output_hidden_states: Optional[bool]: Determine whether to
-                return the hidden states of all layers
-            return_dict: Optional[bool]: Return a dictionary of the
-                outputs
-            add_params_field: bool: Add a params field to the inputs
-                dictionary
+            input_ids (chex.Array): Input tensor containing token IDs.
+            attention_mask (Optional[chex.Array]): Mask for attention.
+            position_ids (Optional[chex.Array]): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
+            input_embeds (Optional[chex.Array]): embedding inputs to be used instead of input_ids.
+            params (dict, optional): Parameters for the model.
+            past_key_values (dict, optional): Past key and value states for caching.
+            dropout_rng (jax.random.PRNGKey, optional): RNG key for dropout.
+            train (bool): If True, the model is in training mode.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            output_router_logits (Optional[bool]): If True, output router logits.
+            return_dict (Optional[bool]): If True, return a dictionary of outputs.
+            add_params_field (bool): If True, include the parameters in the input dictionary.
+            **kwargs: Additional arguments.
 
         Returns:
-            A tuple of (last_hidden_state, past_key_values)
+            Output type depends on the model configuration.
         """
 
         output_attentions = (
@@ -899,20 +913,17 @@ class MixtralPreTrainedModel(EDPretrainedModel):
 
         outputs = self.module.apply(
             inputs,
-            jnp.array(input_ids, dtype="i4"),  # input_ids: chex.Array
-            # attention_mask: Optional[chex.Array] = None
-            jnp.array(attention_mask, dtype="i4"),
-            # position_ids: Optional[chex.Array] = None
-            jnp.array(position_ids, dtype="i4"),
-            None,  # inputs_embeds: Optional[chex.Array] = None
-            output_attentions,  # output_attentions: Optional[bool] = None
-            # output_hidden_states: Optional[bool] = None
-            output_hidden_states,
-            # output_router_logits: Optional[bool] = None
-            output_router_logits,
-            False,  # init_cache: bool = False
-            not train,  # deterministic: bool = True
-            return_dict,  # return_dict: bool = True
+            input_ids=jnp.array(input_ids, dtype="i4"),
+            attention_mask=jnp.array(attention_mask, dtype="i4"),
+            position_ids=jnp.array(position_ids, dtype="i4"),
+            segment_ids=segment_ids,
+            input_embeds=input_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
+            init_cache=False,
+            deterministic=not train,
+            return_dict=return_dict,
             rngs=rng_s,
             mutable=mutable,
         )
@@ -964,27 +975,14 @@ class FlaxMixtralModule(nn.Module):
                 scaling_factor=scaling_factor, rope_type=scaling_type
             )
         self.frequencies = precompute_frequencies(
-            max_position_embeddings=(
-                getattr(
-                    self.config,
-                    "freq_max_position_embeddings",
-                    self.config.max_position_embeddings,
-                )
-            ),
+            max_position_embeddings=self.config.granted_freq_max_position_embedding,
             dim=self.config.hidden_size // self.config.num_attention_heads,
             base=self.config.rope_theta,
             **initial_rope_kwargs,
         )
         self.causal_mask = flax.linen.make_causal_mask(
             jnp.ones(
-                (
-                    1,
-                    getattr(
-                        self.config,
-                        "mask_max_position_embeddings",
-                        self.config.max_position_embeddings,
-                    ),
-                ),
+                shape=(1, self.config.granted_mask_max_position_embedding),
                 dtype="bool",
             ),
             dtype="bool",
@@ -995,7 +993,8 @@ class FlaxMixtralModule(nn.Module):
         input_ids: chex.Array,
         attention_mask: chex.Array,
         position_ids: chex.Array,
-        inputs_embeds: Optional[chex.Array] = None,
+        segment_ids: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
@@ -1003,19 +1002,36 @@ class FlaxMixtralModule(nn.Module):
         deterministic: bool = True,
         return_dict: bool = True,
     ) -> MoeModelOutput | Tuple:
+        """
+        Forward pass through the Mixtral module.
+
+        Args:
+            input_ids (chex.Array): Input tensor containing token IDs.
+            attention_mask (chex.Array): Mask for attention.
+            position_ids (chex.Array): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
+            input_embeds (Optional[chex.Array]): Embedded input tensor.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            output_router_logits (Optional[bool]): If True, output router logits.
+            init_cache (bool): If True, initialize cache for decoding.
+            deterministic (bool): If True, disable dropout.
+            return_dict (bool): If True, return a dictionary of outputs.
+
+        Returns:
+            MoeModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
+        """
         if output_router_logits is None:
             output_router_logits = self.config.output_router_logits
-        if input_ids is not None and inputs_embeds is not None:
+        if input_ids is not None and input_embeds is not None:
             raise ValueError(
-                "You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time"
+                "You cannot specify both decoder_input_ids and decoder_input_embeds at the same time"
             )
 
-        if inputs_embeds is None and input_ids is not None:
-            inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+        if input_embeds is None and input_ids is not None:
+            input_embeds = self.embed_tokens(input_ids.astype("i4"))
         else:
-            raise ValueError(
-                "you should specify inputs_embeds or input_ids one of them"
-            )
+            raise ValueError("you should specify input_embeds or input_ids one of them")
         output_attentions = (
             output_attentions
             if output_attentions is not None
@@ -1032,12 +1048,13 @@ class FlaxMixtralModule(nn.Module):
             else self.config.output_hidden_states
         )
         collection_outputs = self.layers(
-            hidden_states=inputs_embeds,
+            hidden_states=input_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
             causal_mask=self.causal_mask,
             frequencies=self.frequencies,
             output_attentions=output_attentions,
+            segment_ids=segment_ids,
             output_router_logits=output_router_logits,
             output_hidden_states=output_hidden_states,
             init_cache=init_cache,
@@ -1112,9 +1129,10 @@ class FlaxMixtralForCausalLMModule(nn.Module):
     def __call__(
         self,
         input_ids: chex.Array,
-        attention_mask: Optional[chex.Array] = None,
-        position_ids: Optional[chex.Array] = None,
-        inputs_embeds: Optional[chex.Array] = None,
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
@@ -1122,6 +1140,25 @@ class FlaxMixtralForCausalLMModule(nn.Module):
         deterministic: bool = True,
         return_dict: bool = True,
     ) -> MoeCausalLMOutput | Tuple:
+        """
+        Forward pass through the Mixtral module.
+
+        Args:
+            input_ids (chex.Array): Input tensor containing token IDs.
+            attention_mask (chex.Array): Mask for attention.
+            position_ids (chex.Array): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
+            input_embeds (Optional[chex.Array]): Embedded input tensor.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            output_router_logits (Optional[bool]): If True, output router logits.
+            init_cache (bool): If True, initialize cache for decoding.
+            deterministic (bool): If True, disable dropout.
+            return_dict (bool): If True, return a dictionary of outputs.
+
+        Returns:
+            MoeCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
+        """
 
         if output_router_logits is None:
             output_router_logits = self.config.output_router_logits
@@ -1129,13 +1166,14 @@ class FlaxMixtralForCausalLMModule(nn.Module):
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
+            input_embeds=input_embeds,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
             init_cache=init_cache,
             deterministic=deterministic,
             return_dict=True,
+            segment_ids=segment_ids,
         )
         logits = self.lm_head(outputs.last_hidden_state)
         batch_size, seq_length, hd = logits.shape
