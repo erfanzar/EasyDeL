@@ -97,10 +97,10 @@ class FlaxPhi3MLP(nn.Module):
 
 class FlaxPhi3Attention(FlaxAttentionModule):
     """
-    FlaxMistralAttention implements an attention mechanism with rotary embeddings.
+    FlaxPhi3Attention implements an attention mechanism with rotary embeddings.
 
     Attributes:
-        config (MistralConfig): Configuration for the attention module.
+        config (Phi3Config): Configuration for the attention module.
         dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
         param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
         precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
@@ -477,11 +477,11 @@ class FlaxPhi3DecoderLayer(nn.Module):
 
 class FlaxPhiDecoderLayerCollection(nn.Module):
     """
-    FlaxMistralDecoratorCollection represents a single layer in a Transformer-like model,
+    FlaxPhi3DecoratorCollection represents a single layer in a Transformer-like model,
     incorporating self-attention and MLP.
 
     Attributes:
-        config (MistralConfig): Configuration object containing model parameters.
+        config (Phi3Config): Configuration object containing model parameters.
         dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
         param_dtype (jnp.dtype): Data type for model parameters (default is jnp.bfloat16).
         precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
@@ -588,10 +588,10 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
 
 class FlaxPhi3Module(nn.Module):
     """
-    Core module of the Mistral model, including embedding, decoder layers, and normalization.
+    Core module of the Phi3 model, including embedding, decoder layers, and normalization.
 
     Attributes:
-        config (MistralConfig): Configuration object with model hyperparameters.
+        config (Phi3Config): Configuration object with model hyperparameters.
         dtype (jnp.dtype): Data type for the computations.
         param_dtype (jnp.dtype): Data type for the model parameters.
         precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
@@ -671,7 +671,7 @@ class FlaxPhi3Module(nn.Module):
         return_dict: bool = True,
     ) -> Union[FlaxBaseModelOutput, Tuple]:
         """
-        Forward pass through the Mistral module.
+        Forward pass through the Phi3 module.
 
         Args:
             input_ids (chex.Array): Input tensor containing token IDs.
@@ -734,10 +734,10 @@ class FlaxPhi3Module(nn.Module):
 
 class FlaxPhi3ForCausalLMModule(nn.Module):
     """
-    Mistral model for causal language modeling, including the language model head.
+    Phi3 model for causal language modeling, including the language model head.
 
     Attributes:
-        config (MistralConfig): Configuration object with model hyperparameters.
+        config (Phi3Config): Configuration object with model hyperparameters.
         dtype (jnp.dtype): Data type for the computations.
         param_dtype (jnp.dtype): Data type for the model parameters.
         precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
@@ -779,7 +779,7 @@ class FlaxPhi3ForCausalLMModule(nn.Module):
         return_dict: bool = True,
     ) -> Union[FlaxCausalLMOutput, Tuple]:
         """
-        Forward pass through the Mistral module.
+        Forward pass through the Phi3 module.
 
         Args:
             input_ids (Optional[chex.Array]): Input tensor containing token IDs.
