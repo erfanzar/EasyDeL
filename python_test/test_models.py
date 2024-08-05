@@ -392,8 +392,31 @@ class EasyModelsTest(unittest.TestCase):
         self.assertTrue(res, f"OLMo model Failed [ERROR {err}]")
 
     def test_phi(self):
-        self.header_config = None
+        self.header_config = ed.PhiConfig(
+            vocab_size=51200,
+            hidden_size=256,
+            intermediate_size=512,
+            num_hidden_layers=8,
+            num_attention_heads=8,
+            num_key_value_heads=None,
+            resid_pdrop=0.0,
+            embd_pdrop=0.0,
+            attention_dropout=0.0,
+            hidden_act="gelu_new",
+            max_position_embeddings=2048,
+            initializer_range=0.02,
+            layer_norm_eps=1e-5,
+            use_cache=True,
+            tie_word_embeddings=False,
+            rope_theta=10000.0,
+            rope_scaling=None,
+            partial_rotary_factor=0.5,
+            qk_layernorm=False,
+            bos_token_id=1,
+            eos_token_id=2,
+        )
         res, err = self.create_test_for_models("phi", transformers.PhiForCausalLM)
+        self.header_config = None
         self.assertTrue(res, f"PHI 2 model Failed [ERROR {err}]")
 
     def test_gemma(self):
@@ -646,3 +669,5 @@ if __name__ == "__main__":
     # test.test_mpt() # Passed v0.0.70
     # test.test_olmo()  # Passed v0.0.70
     # test.test_openelm()  # Passed v0.0.70
+    # test.test_phi() # Passed v0.0.70
+    # test.test_phi3() # Passed v0.0.70
