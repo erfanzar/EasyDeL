@@ -1138,7 +1138,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 
                 shard_fns, gather_fns = make_shard_and_gather_fns(
                     partition_specs=match_partition_rules(
-                        rules=self.model_state.module.config.get_partition_rules(
+                        rules=self.model_state.module_config.get_partition_rules(
                             self.arguments.fully_sharded_data_parallel
                         ),
                         params=jax.eval_shape(lambda: self.model_state),
