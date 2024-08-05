@@ -273,3 +273,19 @@ class Phi3Config(EDPretrainedConfig):
             raise ValueError(
                 f"`rope_scaling`'s long_factor field must have length {self.hidden_size // self.num_attention_heads // 2}, got {len(rope_scaling_long_factor)}"
             )
+
+    @property
+    def granted_freq_max_position_embedding(self) -> int:
+        return getattr(
+            self,
+            "freq_max_position_embeddings",
+            self.max_position_embeddings,
+        )
+
+    @property
+    def granted_mask_max_position_embedding(self) -> int:
+        return getattr(
+            self,
+            "mask_max_position_embeddings",
+            self.max_position_embeddings,
+        )
