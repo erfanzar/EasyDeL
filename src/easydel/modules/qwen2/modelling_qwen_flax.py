@@ -53,11 +53,11 @@ class FlaxQwen2Embedding(nn.Module):
 
 class FlaxQwen2MLP(nn.Module):
     """
-    FlaxMistralMLP is a multi-layer perceptron (MLP) module for neural network models,
+    FlaxQwen2MLP is a multi-layer perceptron (MLP) module for neural network models,
     configured with specific settings.
 
     Attributes:
-        config (MistralConfig): Configuration object containing model parameters.
+        config (Qwen2Config): Configuration object containing model parameters.
         dtype (jnp.dtype): Data type for computation (default is jnp.bfloat16).
         param_dtype (jnp.dtype): Data type for model parameters (default is jnp.bfloat16).
         precision (Optional[jax.lax.Precision]): Precision setting for JAX operations (default is "fastest").
@@ -120,10 +120,10 @@ class FlaxQwen2MLP(nn.Module):
 
 class FlaxQwen2Attention(FlaxAttentionModule):
     """
-    FlaxMistralAttention implements an attention mechanism with rotary embeddings.
+    FlaxQwen2Attention implements an attention mechanism with rotary embeddings.
 
     Attributes:
-        config (MistralConfig): Configuration for the attention module.
+        config (Qwen2Config): Configuration for the attention module.
         dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
         param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
         precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
@@ -505,10 +505,10 @@ class FlaxQwen2Block(nn.Module):
 
 class FlaxQwen2PreTrainedModel(EDPretrainedModel):
     """
-    Base class for Mistral models providing initialization and configuration.
+    Base class for Qwen2 models providing initialization and configuration.
 
     Attributes:
-        config_class (MistralConfig): The configuration class for the model.
+        config_class (Qwen2Config): The configuration class for the model.
         module_class (nn.Module): The class representing the model's architecture.
         base_model_prefix (str): The prefix for the base model parameters.
     """
@@ -532,7 +532,7 @@ class FlaxQwen2PreTrainedModel(EDPretrainedModel):
         Initializes the pre-trained model with the given configuration.
 
         Args:
-            config (MistralConfig): Configuration for the model.
+            config (Qwen2Config): Configuration for the model.
             dtype (jnp.dtype): Data type for computations.
             param_dtype (jnp.dtype): Data type for model parameters.
             precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
@@ -758,11 +758,11 @@ class FlaxQwen2PreTrainedModel(EDPretrainedModel):
 
 class FlaxQwen2BlockCollection(nn.Module):
     """
-    FlaxMistralDecoratorCollection represents a single layer in a Transformer-like model,
+    FlaxQwen2DecoratorCollection represents a single layer in a Transformer-like model,
     incorporating self-attention and MLP.
 
     Attributes:
-        config (MistralConfig): Configuration object containing model parameters.
+        config (Qwen2Config): Configuration object containing model parameters.
         dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
         param_dtype (jnp.dtype): Data type for model parameters (default is jnp.bfloat16).
         precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
@@ -867,10 +867,10 @@ class FlaxQwen2BlockCollection(nn.Module):
 
 class FlaxQwen2Module(nn.Module):
     """
-    Core module of the Mistral model, including embedding, decoder layers, and normalization.
+    Core module of the Qwen2 model, including embedding, decoder layers, and normalization.
 
     Attributes:
-        config (MistralConfig): Configuration object with model hyperparameters.
+        config (Qwen2Config): Configuration object with model hyperparameters.
         dtype (jnp.dtype): Data type for the computations.
         param_dtype (jnp.dtype): Data type for the model parameters.
         precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
@@ -941,7 +941,7 @@ class FlaxQwen2Module(nn.Module):
         return_dict: bool = True,
     ) -> Union[FlaxBaseModelOutput, Tuple]:
         """
-        Forward pass through the Mistral module.
+        Forward pass through the Qwen2 module.
 
         Args:
             input_ids (chex.Array): Input tensor containing token IDs.
@@ -1014,10 +1014,10 @@ class FlaxQwen2Model(FlaxQwen2PreTrainedModel):
 
 class FlaxQwen2ForCausalLMModule(nn.Module):
     """
-    Mistral model for causal language modeling, including the language model head.
+    Qwen2 model for causal language modeling, including the language model head.
 
     Attributes:
-        config (MistralConfig): Configuration object with model hyperparameters.
+        config (Qwen2Config): Configuration object with model hyperparameters.
         dtype (jnp.dtype): Data type for the computations.
         param_dtype (jnp.dtype): Data type for the model parameters.
         precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
@@ -1062,7 +1062,7 @@ class FlaxQwen2ForCausalLMModule(nn.Module):
         return_dict: bool = True,
     ) -> Union[FlaxCausalLMOutput, Tuple]:
         """
-        Forward pass through the Mistral module.
+        Forward pass through the Qwen2 module.
 
         Args:
             input_ids (Optional[chex.Array]): Input tensor containing token IDs.
@@ -1236,7 +1236,7 @@ class FlaxQwen2ForSequenceClassificationModule(nn.Module):
         return_dict: bool = True,
     ) -> Union[FlaxCausalLMOutput, Tuple]:
         """
-        Forward pass through the Mistral module.
+        Forward pass through the Qwen2 module.
 
         Args:
             input_ids (Optional[chex.Array]): Input tensor containing token IDs.
