@@ -386,6 +386,24 @@ class EasyModelsTest(unittest.TestCase):
         res, err = self.create_test_for_models("qwen2", transformers.Qwen2ForCausalLM)
         self.assertTrue(res, f"Qwen 2 model Failed [ERROR {err}]")
 
+    def test_qwen1(self):
+        conf = transformers.AutoConfig.from_pretrained(
+            "Qwen/Qwen1-7B-Chat", trust_remote_code=True
+        )
+        for k, v in self.__dict__.items():
+            if isinstance(v, (bool, str, float, type(None), int)):
+                setattr(conf, k, v)
+        res, err = self.create_test_for_models(
+            "qwen",
+            type(
+                transformers.AutoModelForCausalLM.from_config(
+                    conf,
+                    trust_remote_code=True,
+                )
+            ),
+        )
+        self.assertTrue(res, f"Qwen model Failed [ERROR {err}]")
+
     def test_olmo(self):
         self.header_config = None
         res, err = self.create_test_for_models("olmo", transformers.OlmoForCausalLM)
@@ -455,16 +473,7 @@ class EasyModelsTest(unittest.TestCase):
             "microsoft/Phi-3-mini-128k-instruct", trust_remote_code=True
         )
         for k, v in self.__dict__.items():
-            if isinstance(
-                v,
-                (
-                    bool,
-                    str,
-                    float,
-                    type(None),
-                    int,
-                ),
-            ):
+            if isinstance(v, (bool, str, float, type(None), int)):
                 setattr(conf, k, v)
         res, err = self.create_test_for_models(
             "phi3",
@@ -671,3 +680,5 @@ if __name__ == "__main__":
     # test.test_openelm()  # Passed v0.0.70
     # test.test_phi() # Passed v0.0.70
     # test.test_phi3() # Passed v0.0.70
+    # test.test_qwen2()  # Passed v0.0.70
+    test.test_qwen1()

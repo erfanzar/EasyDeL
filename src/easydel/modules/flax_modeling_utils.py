@@ -51,8 +51,10 @@ ACT2FN = {
 
 
 def canonicalize_dtype(
-    *args, dtype: Optional[chex.ArrayDType] = None, inexact: bool = True
-) -> chex.ArrayDType:
+    *args,
+    dtype: Optional[chex.ArrayDType] = None,  # type:ignore
+    inexact: bool = True,
+) -> chex.ArrayDType:  # type:ignore
     """Canonicalize an optional dtype to the definitive dtype.
 
     If the ``dtype`` is None this function will infer the dtype. If it is not
