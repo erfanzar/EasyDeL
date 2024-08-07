@@ -5,7 +5,7 @@ import chex
 import flax.linen
 import jax
 import jax.numpy as jnp
-from einops import einops, rearrange
+from einops import rearrange
 from flax import linen as nn
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import Dense, combine_masks, make_causal_mask
@@ -18,6 +18,7 @@ from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.common import RMSNorm as RMSNorm
 from easydel.modules.flax_modeling_utils import (
     FlaxAttentionModule,
+    block_wise_ffn,
     control_mlp_sharding,
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
@@ -49,13 +50,13 @@ class FlaxQwen1EmbeddingApplyer(nn.Module):
         self,
         query: chex.Array,
         key: chex.Array,
-        rotary_pos_emb_list: list[chex.Array] | None = None,
+        frequencies: list[chex.Array] | None = None,
         position_ids: chex.Array | None = None,
     ):
-        if rotary_pos_emb_list is not None:
+        if frequencies is not None:
             current_length = query.shape[1]
-            if len(rotary_pos_emb_list) == 1:
-                rotary_pos_emb = rotary_pos_emb_list[0]
+            if len(frequencies) == 1:
+                rotary_pos_emb = frequencies[0]
                 rotary_pos_emb = [i[:, -current_length:, :, :] for i in rotary_pos_emb]
                 rotary_pos_emb = (rotary_pos_emb,) * 2
                 q_pos_emb, k_pos_emb = rotary_pos_emb
@@ -64,7 +65,7 @@ class FlaxQwen1EmbeddingApplyer(nn.Module):
             else:
                 query_list = []
                 key_list = []
-                for i, rotary_pos_emb in enumerate(rotary_pos_emb_list):
+                for i, rotary_pos_emb in enumerate(frequencies):
                     rotary_pos_emb = [
                         i[:, -current_length:, :, :] for i in rotary_pos_emb
                     ]
@@ -156,6 +157,16 @@ class FlaxQwen1MLP(nn.Module):
 
 
 class FlaxQwen1Attention(FlaxAttentionModule):
+    """
+    FlaxQwen1Attention implements an attention mechanism with rotary embeddings.
+
+    Attributes:
+        config (Qwen1Config): Configuration for the attention module.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
+    """
+
     config: Qwen1Config
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -199,18 +210,6 @@ class FlaxQwen1Attention(FlaxAttentionModule):
         self.logn_tensor = logn_tensor
         self.rotary = FlaxQwen1EmbeddingApplyer(self.dtype)
         self.attention_performer = FlexibleAttentionModule(
-            use_sharding_constraint=self.config.use_sharding_constraint,
-            block_k_major=self.config.block_k_major,
-            block_b=self.config.block_b,
-            block_q=self.config.block_q,
-            block_k=self.config.block_k,
-            block_q_major_dkv=self.config.block_q_major_dkv,
-            block_k_major_dkv=self.config.block_k_major_dkv,
-            block_k_major_dq=self.config.block_k_major_dq,
-            block_k_dkv=self.config.block_k_dkv,
-            block_q_dkv=self.config.block_q_dkv,
-            block_q_dq=self.config.block_q_dq,
-            block_k_dq=self.config.block_k_dq,
             num_attention_heads=self.config.num_attention_heads,
             attention_dropout=self.config.attn_dropout_prob,
             head_dims=self.head_dim,
@@ -224,7 +223,7 @@ class FlaxQwen1Attention(FlaxAttentionModule):
             mesh=self.config.mesh,
             sm_scale=1 / math.sqrt(self.head_dim),
             axis_name=self.config.attention_axis_name,
-            backward_pass_impl=self.config.flash_attention_backward_pass_impl,
+            base_config=self.config,
         )
 
     def _merge_heads(self, hidden_states):
@@ -237,49 +236,34 @@ class FlaxQwen1Attention(FlaxAttentionModule):
         Returns:
             chex.Array: The hidden states with merged head dimensions.
         """
-        return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
+        return hidden_states.reshape(hidden_states.shape[:2] + (-1,))
 
-    def apply_rotary(
-        self,
-        batch_size,
-        sequence_length,
-        query,
-        key,
-        value,
-        rotary_pos_emb_list,
-        position_ids,
-    ):
-        """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
-        The main difference is that it takes in an additional argument, rotary_pos_emb_list, which are used to calculate
-        the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
+    def apply_rotary(self, query, key, frequencies, position_ids):
+        """
+        Applies rotary positional embeddings to the query and key tensors.
 
         Args:
-            self: Access variables that belong to the class
-            batch_size: Reshape the query, key and value tensors
-            sequence_length: Reshape the query, key and value tensors
-            query_states: Calculate the attention weights
-            key: Calculate the attention
-            value: Compute the attention weights
-            rotary_pos_emb_list: Calculate the frequency of each word in
-                the vocabulary
-            position_ids: Identify the position of each token in the
-                sequence
+            query (chex.Array): Query tensor.
+            key (chex.Array): Key tensor.
+            frequencies (Tuple[chex.Array, chex.Array]): Tuple containing cosine and sine components for rotary embeddings.
+            position_ids (chex.Array): Position indices for the tokens.
 
         Returns:
-            A tuple of 3 tensors: query_states, key and value
+            Tuple[chex.Array, chex.Array]: The modified query and key tensors after applying rotary embeddings.
         """
-        query_states, key = self.rotary(
+
+        query, key = self.rotary(
             position_ids=position_ids,
             query_states=query,
             key=key,
-            rotary_pos_emb_list=rotary_pos_emb_list,
+            frequencies=frequencies,
         )
-        return query_states, key, value
+        return query, key
 
     def __call__(
         self,
         hidden_states: chex.Array,
-        rotary_pos_emb_list: list[chex.Array],
+        frequencies: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
@@ -287,36 +271,24 @@ class FlaxQwen1Attention(FlaxAttentionModule):
         deterministic: bool = True,
         init_cache: bool = False,
         output_attentions: bool = False,
-        encoder_hidden_states: Optional[chex.Array] = None,
-        encoder_attention_mask: Optional[chex.Array] = None,
-        fcm_mask=None,
+        fcm_mask: Optional[chex.Array] = None,
     ):
-        """The __call__ function is the main function of a JAX module. It defines how the module behaves when called
-        with inputs. The __call__ function can be thought of as a &quot;forward pass&quot; through the model,
-        and it should return all outputs that are needed for training or inference.
+        """
+        Forward pass of the attention module.
 
         Args:
-            self: Access variables that belong to the class
-            hidden_states: chex.Array: Pass the hidden states of the
-                previous layer
-            rotary_pos_emb_list: list[chex.Array]: Pass in the frequency
-                coefficients for each position
-            attention_mask: chex.Array: Mask out certain tokens in the
-                input sequence
-            position_ids: chex.Array: Determine the position of each
-                token in a sequence
-            causal_mask: chex.Array: Mask out the future tokens in the
-                decoder
-            deterministic: bool: Determine whether to use dropout or not
-            init_cache: bool: Initialize the cache
-            output_attentions: bool: Determine whether to return the
-                attention weights or not
-            fcm_mask: Mask out the attention weights between the input
-                and output tokens
-
-
+            hidden_states (chex.Array): Input hidden states.
+            frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            attention_mask (chex.Array): Mask to apply on the attention scores.
+            position_ids (chex.Array): Position indices for the tokens.
+            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            deterministic (bool): If True, disables dropout for deterministic behavior.
+            init_cache (bool): If True, initializes cache for caching keys and values.
+            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
+            fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
         Returns:
-            A tuple of two arrays
+            Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
         """
         batch_size, sequence_length = hidden_states.shape[:2]
         mixed_x_layer: chex.Array = self.c_attn(hidden_states)
@@ -341,14 +313,11 @@ class FlaxQwen1Attention(FlaxAttentionModule):
             self.head_dim,
         )
 
-        query_states, key_states, value_states = self.apply_rotary(
+        query_states, key_states = self.apply_rotary(
             query=query_states,
             key=key_states,
-            value=value_states,
             position_ids=position_ids,
-            rotary_pos_emb_list=rotary_pos_emb_list,
-            batch_size=batch_size,
-            sequence_length=sequence_length,
+            frequencies=frequencies,
         )
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
@@ -367,12 +336,10 @@ class FlaxQwen1Attention(FlaxAttentionModule):
         causal_mask = jnp.broadcast_to(
             causal_mask, (batch_size,) + causal_mask.shape[1:]
         )
-        attention_mask = jnp.broadcast_to(
-            jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape
-        )
-        attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
         if attention_mask.ndim == 2:
             attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+        attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
+        attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
 
         dropout_rng = None
 
@@ -383,16 +350,7 @@ class FlaxQwen1Attention(FlaxAttentionModule):
             key_states, value_states, attention_mask = self._concatenate_to_cache(
                 key_states, value_states, query_states, attention_mask
             )
-        # if self.config.use_sharding_constraint:
-        #     query_states = with_sharding_constraint(
-        #         query_states, PartitionSpec(("dp", "fsdp"), "sp" if query_states.shape[1] != 1 else None, "tp", None)
-        #     )
-        #     key_states = with_sharding_constraint(
-        #         key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-        #     )
-        #     value_states = with_sharding_constraint(
-        #         value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-        #     )
+
         attention_bias = lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -455,7 +413,7 @@ class FlaxQwen1Block(nn.Module):
         if self.config.gradient_checkpointing != "":
             attn_block = nn_partitioning.remat(
                 FlaxQwen1Attention,
-                static_argnums=(1, 3, 4, 6, 7, 8, 9, 10, 11),
+                static_argnums=(1, 3, 4, 6, 7, 8),
                 policy=get_gradient_checkpoint_policy(
                     self.config.gradient_checkpointing
                 ),
@@ -500,7 +458,7 @@ class FlaxQwen1Block(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        rotary_pos_emb_list: list[chex.Array],
+        frequencies: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
@@ -508,52 +466,29 @@ class FlaxQwen1Block(nn.Module):
         deterministic: bool = True,
         init_cache: bool = False,
         output_attentions: bool = False,
-        encoder_hidden_states: Optional[chex.Array] = None,
-        encoder_attention_mask: Optional[chex.Array] = None,
-        fcm_mask: Optional[jnp.ndarray] = None,
+        fcm_mask: Optional[chex.Array] = None,
     ):
-        """The __call__ function is the main function of a TransformerEncoderLayer.
-        It takes in hidden states, frequency-domain inputs, and masks as input. It then
-        applies self-attention to the hidden states using those inputs and returns an
-        output tensor with shape (batch_size, sequence_length, model_dim).
+        """
+        Forward pass of the module block.
 
         Args:
-            self: Refer to the class instance itself
-            hidden_states: chex.Array: Pass in the hidden state of the
-                previous layer
-            rotary_pos_emb_list: list[chex.Array]: Pass in the frequency
-                information
-            attention_mask: chex.Array: Mask out the attention weights
-                for padding tokens
-            position_ids: chex.Array: Determine the position of each
-                token in the sequence
-            causal_mask: chex.Array: Mask the attention weights
-            deterministic: bool: Control whether the dropout is applied
-                or not
-            init_cache: bool: Initialize the cache in the attention
-                layer
-            output_attentions: bool: Return the attention weights
-            fcm_mask: Optional[jnp.ndarray]: Mask the self-attention
-
-
+            hidden_states (chex.Array): Input hidden states.
+            frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            attention_mask (chex.Array): Mask to apply on the attention scores.
+            position_ids (chex.Array): Position indices for the tokens.
+            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            deterministic (bool): If True, disables dropout for deterministic behavior.
+            init_cache (bool): If True, initializes cache for caching keys and values.
+            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
+            fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
         Returns:
-            A tuple of two items
+            Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
         """
-        # hidden_states: chex.Array
-        # rotary_pos_emb_list: list[chex.Array]
-        # attention_mask: chex.Array
-        # position_ids: chex.Array
-        # causal_mask: chex.Array
-        # deterministic: bool = True
-        # init_cache: bool = False
-        # output_attentions: bool = False
-        # encoder_hidden_states: Optional[chex.Array] = None
-        # encoder_attention_mask: Optional[chex.Array] = None
-        # fcm_mask = None
 
         attn_outputs = self.attn(
             self.ln_1(hidden_states),
-            rotary_pos_emb_list,
+            frequencies,
             attention_mask,
             position_ids,
             causal_mask,
@@ -561,40 +496,23 @@ class FlaxQwen1Block(nn.Module):
             deterministic,
             init_cache,
             output_attentions,
-            encoder_attention_mask,
-            encoder_hidden_states,
             fcm_mask,
         )
         attn_output = attn_outputs[0]
         hidden_states = hidden_states + attn_output
 
-        feed_forward_input = self.ln_2(hidden_states)
+        ffd_inp = self.ln_2(hidden_states)
 
         if self.config.use_scan_mlp:
-            feed_forward_input = einops.rearrange(
-                feed_forward_input,
-                "... (b s) d -> ... b s d",
-                b=self.config.scan_mlp_chunk_size,
-            )
-
-            def mlp_forward(mlp, carry, x):
-                return None, mlp(x, deterministic)
-
-            scan_axis = feed_forward_input.ndim - 3
-
-            _, feed_forward_hidden_states = nn.scan(
-                mlp_forward,
-                variable_broadcast="params",
-                split_rngs={"params": False, "dropout": True},
-                in_axes=scan_axis,
-                out_axes=scan_axis,
-            )(self.mlp, None, feed_forward_input)
-            feed_forward_hidden_states = einops.rearrange(
-                feed_forward_hidden_states, "... b s d -> ... (b s) d"
+            feed_forward_hidden_states = block_wise_ffn(
+                self.mlp,
+                ffd_inp,
+                self.config.scan_mlp_chunk_size,
+                deterministic,
             )
         else:
             feed_forward_hidden_states = self.mlp(
-                feed_forward_input,
+                ffd_inp,
                 deterministic,
             )
 
@@ -604,60 +522,73 @@ class FlaxQwen1Block(nn.Module):
 
 
 class FlaxQwen1PreTrainedModel(EDPretrainedModel):
+    """
+    Base class for Qwen1 models providing initialization and configuration.
+
+    Attributes:
+        config_class (Qwen1Config): The configuration class for the transformer.
+        module_class (nn.Module): The class representing the transformer's architecture.
+        base_model_prefix (str): The prefix for the base transformer parameters.
+    """
+
     config_class = Qwen1Config
-    base_model_prefix = "model"
+    base_model_prefix = "transformer"
     module_class: nn.Module = None
 
     def __init__(
         self,
         config: Qwen1Config,
-        input_shape: Tuple = (1, 1),
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+        input_shape: Tuple[int, int] = (1, 1),
         seed: int = 0,
-        dtype: jnp.dtype = jnp.float32,
-        _do_init: bool = True,
+        _do_init: bool = False,
         **kwargs,
     ):
-        """The __init__ function is called when the class is instantiated.
-        It sets up the instance of the class, and defines what happens when it's created.
-        The __init__ function can take arguments, but self is always required (it refers to the instance of the object).
+        """
+        Initializes the pre-trained transformer with the given configuration.
 
         Args:
-            self: Refer to the object itself
-            config: Qwen1Config: Pass the configuration to the module
-            input_shape: Tuple: Specify the shape of the input to the
-                model
-            seed: int: Set the seed for random number generation
-            dtype: jnp.dtype: Specify the data type of the input
-            _do_init: bool: Control whether the module is initialized or
-                not
-            **kwargs: Pass in any additional parameters that the
-                module_class might need
-        :param : Specify the number of h in the network
-
-        Returns:
-            The super() of the class
+            config (Qwen1Config): Configuration for the transformer.
+            dtype (jnp.dtype): Data type for computations.
+            param_dtype (jnp.dtype): Data type for transformer parameters.
+            precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
+            input_shape (Tuple[int, int]): Shape of the input tensor.
+            seed (int): Seed for random number generation.
+            _do_init (bool): If True, initialize transformer weights.
+            **kwargs: Additional keyword arguments.
         """
-        module = self.module_class(config=config, dtype=dtype, **kwargs)
+        module = self.module_class(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            **kwargs,
+        )
         super().__init__(
-            config,
-            module,
-            input_shape=input_shape,
-            seed=seed,
             dtype=dtype,
             _do_init=_do_init,
+            module=module,
+            config=config,
+            input_shape=input_shape,
+            seed=seed,
         )
 
     def init_weights(
-        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+        self,
+        rng: jax.random.PRNGKey,
+        input_shape: Tuple,
+        params: FrozenDict = None,
     ) -> FrozenDict:
-        """The init_weights function is used to initialize the weights of a model.
+        """The init_weights function is used to initialize the weights of a transformer.
 
         Args:
             self: Access variables that belong to the class
-            rng: jax.random.PRNGKey: Initialize the weights of the model
+            rng: jax.random.PRNGKey: Initialize the weights of the transformer
             input_shape: Tuple: Specify the shape of the input tensor
             params: FrozenDict: Pass in the parameters of a pre-trained
-                model
+                transformer
 
         Returns:
             A frozendict of parameters
@@ -701,9 +632,9 @@ class FlaxQwen1PreTrainedModel(EDPretrainedModel):
 
     def init_cache(self, batch_size, max_length):
         """The init_cache function is used to initialize the cache for a given batch size and sequence length.
-        The cache is a dictionary that contains all the intermediate states from each layer in the model.
+        The cache is a dictionary that contains all the intermediate states from each layer in the transformer.
         This allows us to run inference on multiple batches without having to re-run forward passes through every layer in
-        the model, which would be very slow.
+        the transformer, which would be very slow.
 
         Args:
             self: Access the module
@@ -729,72 +660,44 @@ class FlaxQwen1PreTrainedModel(EDPretrainedModel):
         )
         return init_variables["cache"]
 
-    # def init_rope(self, batch_size, max_length):
-    #     """
-    #     The init_rope function is used to initialize the rope for a given batch size and sequence length.
-    #     The cache is a dictionary that contains all the intermediate states from each layer in the model.
-    #
-    #     :param self: Access the module
-    #     :param batch_size: Define the batch size of the input tensors
-    #     :param max_length: Set the length of the input sequence
-    #     """
-    #     input_ids = jnp.ones((batch_size, max_length))
-    #     attention_mask = jnp.ones_like(input_ids)
-    #     position_ids = jnp.broadcast_to(jnp.arange(
-    #         jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
-    #
-    #     init_variables = self.module.init(
-    #         jax.random.PRNGKey(0), input_ids, attention_mask, position_ids, return_dict=False, init_cache=True
-    #     )
-    #     return init_variables["rope_cache"]
-
     def __call__(
         self,
-        input_ids: chex.Array,
-        attention_mask: chex.Array = None,
-        position_ids: chex.Array = None,
+        input_ids: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        segment_ids: Optional[chex.Array] = None,
         params: dict = None,
         past_key_values: Optional[dict] = None,
-        # past_rope_cache: dict = None,
         dropout_rng: jax.random.PRNGKey = None,
         train: bool = False,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = True,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+        return_dict: Optional[bool] = None,
         add_params_field: bool = False,
         **kwargs,
     ):
-        """The __call__ function is the main function of a JAX module.
-        It takes in inputs and returns outputs, but it also has some other important features:
-        - It can take in mutable state (e.g., past_key_values) that will be updated during the call and returned at the end.
-        - It can take in random number generators (rngs) that are used to generate random numbers for dropout or sampling operations.
+        """
+        Forward pass through the transformer.
 
         Args:
-            self: Represent the instance of the class
-            input_ids: chex.Array: Pass in the input tokens
-            attention_mask: chex.Array: Mask out certain tokens in the
-                input
-            position_ids: chex.Array: Create the positional embeddings
-            params: dict: Pass in the parameters of the model
-            past_key_values: dict: Pass in the past key values from a
-                previous call to __call__
-            dropout_rng: jax.random.PRNGKey: Make sure that the dropout
-                is applied in a random way
-            train: bool: Determine whether to use dropout or not
-            output_attentions: Optional[bool]: Determine whether to
-                return the attention weights
-            output_hidden_states: Optional[bool]: Return the hidden
-                states of all h
-            return_dict: Optional[bool]: Determine whether to return a
-                dictionary or not
-            extra_embedding: Optional[Union[jnp.ndarray,None]]: Pass in
-                the embedding for the input_ids
-            add_params_field: bool: Add the params field to the inputs
-                dictionary
+            input_ids (chex.Array): Input tensor containing token IDs.
+            input_embeds (Optional[chex.Array]): embedding inputs to be used instead of input_ids.
+            attention_mask (Optional[chex.Array]): Mask for attention.
+            position_ids (Optional[chex.Array]): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
+            params (dict, optional): Parameters for the transformer.
+            past_key_values (dict, optional): Past key and value states for caching.
+            dropout_rng (jax.random.PRNGKey, optional): RNG key for dropout.
+            train (bool): If True, the transformer is in training mode.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            return_dict (Optional[bool]): If True, return a dictionary of outputs.
+            add_params_field (bool): If True, include the parameters in the input dictionary.
+            **kwargs: Additional arguments.
 
         Returns:
-            A tuple of the following:
+            Output type depends on the transformer configuration.
         """
         output_attentions = (
             output_attentions
@@ -809,12 +712,9 @@ class FlaxQwen1PreTrainedModel(EDPretrainedModel):
         return_dict = (
             return_dict if return_dict is not None else self.config.return_dict
         )
-
-        batch_size, sequence_length = input_ids.shape
-
-        assert (
-            sequence_length <= self.config.seq_length
-        ), "Maximum Position Embedding Reached !"
+        batch_size, sequence_length = (
+            input_ids.shape if input_ids is not None else input_embeds.shape[:2]
+        )
 
         if position_ids is None:
             if past_key_values is not None:
@@ -829,43 +729,37 @@ class FlaxQwen1PreTrainedModel(EDPretrainedModel):
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, sequence_length))
 
-        rngs = {}
+        rng_s = {}
         if dropout_rng is not None:
-            rngs["dropout"] = dropout_rng
-
-        if self.config.bits is not None:
-            rngs["params"] = jax.random.key(0)
+            rng_s["dropout"] = dropout_rng
 
         inputs = (
             {"params": params or self.params}
             if add_params_field
             else params or self.params
         )
-        mutable = False
+
+        if self.config.bits is not None:
+            rng_s["params"] = jax.random.key(0)
         if past_key_values is not None:
             inputs["cache"] = past_key_values
             mutable = ["cache"]
+        else:
+            mutable = False
 
-        # if past_rope_cache is not None:
-        #     inputs["rope_cache"] = past_rope_cache
-        # elif self.config.init_rope_cache_auto:
-        #     inputs["rope_cache"] = self.init_rope(batch_size=batch_size, max_length=sequence_length)
-        # else:
-        #     raise ValueError(
-        #         "if you are setting `init_rope_cache_auto=False` you should pass `rope_cache` beside param"
-        #     )
         outputs = self.module.apply(
             inputs,
-            jnp.array(input_ids, dtype="i4"),
-            jnp.array(attention_mask, dtype="i4"),
-            jnp.array(position_ids, dtype="i4"),
-            not train,
-            False,
-            output_attentions,
-            output_hidden_states,
-            return_dict,
-            extra_embedding,
-            rngs=rngs,
+            input_ids=jnp.array(input_ids, dtype="i4"),
+            input_embeds=input_embeds,
+            attention_mask=jnp.array(attention_mask, dtype="i4"),
+            position_ids=jnp.array(position_ids, dtype="i4"),
+            deterministic=not train,
+            init_cache=False,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            segment_ids=segment_ids,
+            rngs=rng_s,
             mutable=mutable,
         )
 
@@ -876,14 +770,14 @@ class FlaxQwen1PreTrainedModel(EDPretrainedModel):
         elif past_key_values is not None and not return_dict:
             outputs, past_key_values = outputs
             outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
-        # if return_dict:
-        #     outputs["past_rope_cache"] = unfreeze(rope_cache["rope_cache"])
-        # else:
-        #     outputs = outputs, unfreeze(rope_cache["rope_cache"])
+
         return outputs
 
     def prepare_inputs_for_generation(
-        self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
+        self,
+        input_ids,
+        max_length,
+        attention_mask: Optional[chex.Array] = None,
     ):
         """The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
 
@@ -925,6 +819,17 @@ class FlaxQwen1PreTrainedModel(EDPretrainedModel):
 
 
 class FlaxQwen1BlockCollection(nn.Module):
+    """
+    FlaxQwen1DecoratorCollection represents a single layer in a Transformer-like model,
+    incorporating self-attention and MLP.
+
+    Attributes:
+        config (Qwen1Config): Configuration object containing transformer parameters.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for transformer parameters (default is jnp.bfloat16).
+        precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
+    """
+
     config: Qwen1Config
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -945,49 +850,40 @@ class FlaxQwen1BlockCollection(nn.Module):
     def __call__(
         self,
         hidden_states: chex.Array,
-        rotary_pos_emb_list: list[chex.Array],
+        frequencies: Tuple[chex.Array, chex.Array],
         attention_mask: chex.Array,
-        position_ids: chex.Array,
         causal_mask: chex.Array,
+        position_ids: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
         deterministic: bool = True,
         init_cache: bool = False,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
-        return_dict: bool = True,
-    ):
-        """The __call__ function is the main function of a JAX nn.Module.
-        It defines how the module behaves when called as a function, and it's what you'll use to call your model
-         in training loops or inference scripts.
-        The __call__ method should take all inputs that are necessary for computing outputs from the module,
-        and return all outputs that are computed by this module.
+    ) -> Tuple[chex.Array, Optional[chex.Array], chex.Array]:
+        """
+        Forward pass through the collection of decoder layers.
 
         Args:
-            self: Represent the instance of the class
-            hidden_states: chex.Array: Pass the input tensor to the
-                encoder
-            rotary_pos_emb_list: chex.Array: Pass in the frequency of
-                each token
-            attention_mask: chex.Array: Mask out certain tokens in the
-                input sequence
-            position_ids: chex.Array: Specify the position of each token
-                in a sequence
-            causal_mask: chex.Array: Mask the attention weights
-            deterministic: bool: Determine whether the model is in
-                training or evaluation mode
-            init_cache: bool: Initialize the cache for each layer
-            output_attentions: bool: Determine whether to output the
-                attention weights
-            output_hidden_states: bool: Determine whether to return the
-                hidden states of each layer
-            return_dict: bool: Return a dictionary of the outputs
-        :param : Determine whether to use the forgetful causal mask
+            hidden_states (chex.Array): Input tensor containing the hidden states.
+            frequencies (Tuple[chex.Array, chex.Array]): Frequency positional encodings.
+            attention_mask (chex.Array): Mask to apply during attention.
+            causal_mask (chex.Array): Causal mask for autoregressive decoding.
+            position_ids (chex.Array): Positional indices for the sequence.
+            segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
+            deterministic (bool): If True, disables dropout.
+            init_cache (bool): If True, initializes caching mechanism for fast decoding.
+            output_attentions (bool): If True, returns attention weights.
+            output_hidden_states (bool): If True, returns hidden states.
 
         Returns:
-            A tuple of 3 values
+            Tuple[chex.Array, Optional[chex.Array], chex.Array]:
+                - hidden_states: The output tensor after layer processing.
+                - all_hidden_states: all of Hidden states (if `output_hidden_states` is True).
+                - self_attn_weights: Attention weights (if `output_attentions` is True).
+
         """
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
-
         if not deterministic and self.config.fcm_max_ratio > 0:
             # Apply forgetful causal mask
             batch_size, seq_length = hidden_states.shape[0], hidden_states.shape[1]
@@ -1007,14 +903,13 @@ class FlaxQwen1BlockCollection(nn.Module):
             fcm_mask = fcm_mask.astype("bool")
         else:
             fcm_mask = None
-
-        for block in self.blocks:
+        for layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = block(
+            output = layer(
                 hidden_states=hidden_states,
-                rotary_pos_emb_list=rotary_pos_emb_list,
+                frequencies=frequencies,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 causal_mask=causal_mask,
@@ -1022,15 +917,14 @@ class FlaxQwen1BlockCollection(nn.Module):
                 init_cache=init_cache,
                 output_attentions=output_attentions,
                 fcm_mask=fcm_mask,
+                segment_ids=segment_ids,
             )
-            hidden_states = layer_outputs[0]
+            hidden_states = output[0]
 
             if output_attentions:
-                all_attentions += (layer_outputs[1],)
+                output_attentions += (output[1],)
 
-        outputs = (hidden_states, all_hidden_states, all_attentions)
-
-        return outputs
+        return hidden_states, all_hidden_states, all_attentions
 
 
 class FlaxQwen1Module(nn.Module):
@@ -1040,7 +934,6 @@ class FlaxQwen1Module(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
-
         self.wte = nn.Embed(
             self.config.vocab_size,
             self.config.hidden_size,
@@ -1071,103 +964,78 @@ class FlaxQwen1Module(nn.Module):
             self.rotary_ndims = int(config.kv_channels * config.rotary_pct)
         self.causal_mask = make_causal_mask(
             jnp.ones(
-                (1, getattr(config, "mask_max_position_embeddings", config.seq_length)),
+                shape=(1, self.config.granted_mask_max_position_embedding),
                 dtype="bool",
             ),
             dtype="bool",
         )
-        self.rope_cache = compute_qwen1_rope(
-            dim=(
-                self.rotary_ndims
-                if self.rotary_ndims is not None
-                else config.kv_channels
-            ),
-            base=self.config.rotary_emb_base,
-            seqlen=getattr(config, "freq_max_position_embeddings", config.seq_length),
-        )
+        self.rope_cache = [
+            compute_qwen1_rope(
+                dim=(
+                    self.rotary_ndims
+                    if self.rotary_ndims is not None
+                    else config.kv_channels
+                ),
+                base=self.config.rotary_emb_base,
+                seqlen=self.config.granted_freq_max_position_embedding,
+            )
+        ]
 
     def __call__(
         self,
         input_ids: chex.Array,
-        attention_mask: chex.Array,
-        position_ids: chex.Array,
-        deterministic: bool = True,
-        input_embeds: chex.Array = None,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        segment_ids: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
         init_cache: bool = False,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
+        deterministic: bool = True,
         return_dict: bool = True,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-    ):
-        """The __call__ function is the main function of a Flax model. It takes in input_ids, attention_mask, and position_ids
-        and returns the output of the model. The __call__ function also has optional arguments that can be used to control
-        the behavior of the model (e.g., deterministic=True). These optional arguments are passed as keyword arguments when
-        calling a Flax model.
+    ) -> Union[FlaxBaseModelOutput, Tuple]:
+        """
+        Forward pass through the Qwen1 module.
 
         Args:
-            self: Represent the instance of the class
-            input_ids: chex.Array: Pass in the input token ids
-            attention_mask: chex.Array: Mask out the padding tokens
-            position_ids: chex.Array: Indicate the position of each
-                token in a sequence
-            deterministic: bool: Control whether dropout is applied or
-                not
-            input_embeds: chex.Array: Pass in the embeddings of the
-                input tokens
-            init_cache: bool: Initialize the cache
-            output_attentions: bool: Determine whether to return the
-                attentions or not
-            output_hidden_states: bool: Determine whether to return
-                hidden states
-            return_dict: bool: Return a dictionary of the output or not
-            extra_embedding: Optional[Union[jnp.ndarray, None]]: Pass in
-                the embedding of the
+            input_ids (chex.Array): Input tensor containing token IDs.
+            attention_mask (chex.Array): Mask for attention.
+            position_ids (chex.Array): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
+            input_embeds (Optional[chex.Array]): Embedded input tensor.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            init_cache (bool): If True, initialize cache for decoding.
+            deterministic (bool): If True, disable dropout.
+            return_dict (bool): If True, return a dictionary of outputs.
 
         Returns:
-            A tuple of:
+            FlaxBaseModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
         """
-        if input_embeds is None:
-            input_embeds = self.wte(input_ids.astype("i4"))
-
-        batch_size, sequence_length, _ = input_embeds.shape
+        if input_embeds is None and input_ids is not None:
+            input_embeds = self.embed_tokens(input_ids.astype("i4"))
+        else:
+            raise ValueError("you should specify input_embeds or input_ids one of them")
+        sequence_length = input_embeds.shape[1]
         kv_seq_len = sequence_length
 
         if self.h.blocks[0].attn.has_variable("cache", "cached_key"):
             cache_index = self.h.blocks[0].attn.get_variable(
-                "cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32)
+                "cache",
+                "cache_index",
+                lambda: jnp.array(0, dtype=jnp.int32),
             )
             kv_seq_len += cache_index
 
-        # if deterministic or not self.config.use_dynamic_ntk:
-        #     ntk_alpha_list = [1.0]
-        # elif kv_seq_len != input_embeds.shape[1]:
-        #     ntk_alpha_list = self.rotary_emb._ntk_alpha_cached_list
-        # else:
-        #     ntk_alpha_list = []
-        #     if attention_mask is not None and kv_seq_len > self.seq_length:
-        #         true_seq_lens = jnp.sum(attention_mask.reshape(batch_size, 1, 1, -1) == 0, axis=-1, dtype=jnp.float32)
-        #         for i in range(input_embeds.shape[0]):
-        #             true_seq_len = true_seq_lens[i].item()
-        #             ntk_alpha = self.get_ntk_alpha(true_seq_len)
-        #             ntk_alpha_list.append(ntk_alpha)
-        #     else:
-        #         ntk_alpha = self.get_ntk_alpha(kv_seq_len)
-        #         ntk_alpha_list.append(ntk_alpha)
-        # self.rotary_emb.set_ntk_alpha_cached_list(ntk_alpha_list)
-        # rotary_pos_emb_list = []
         assert (
             sequence_length <= self.config.seq_length
         ), "Maximum Position Embedding Reached !"
-        input_embeds = (
-            input_embeds + extra_embedding
-            if extra_embedding is not None
-            else input_embeds
-        )
+
         hidden_states = self.drop(input_embeds, deterministic=deterministic)
 
         outputs = self.h(
-            hidden_states=hidden_states,
-            rotary_pos_emb_list=[self.rope_cache],
+            hidden_states=input_embeds,
+            frequencies=self.rope_cache,
             attention_mask=attention_mask,
             position_ids=position_ids,
             causal_mask=self.causal_mask,
@@ -1175,7 +1043,7 @@ class FlaxQwen1Module(nn.Module):
             init_cache=init_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+            segment_ids=segment_ids,
         )
 
         hidden_states = outputs[0]
@@ -1215,7 +1083,7 @@ class FlaxQwen1ForCausalLMModule(nn.Module):
 
     def setup(self):
         self.transformer = FlaxQwen1Module(
-            self.config,
+            config=self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
@@ -1235,39 +1103,39 @@ class FlaxQwen1ForCausalLMModule(nn.Module):
 
     def __call__(
         self,
-        input_ids: chex.Array,
-        attention_mask: chex.Array = None,
-        position_ids: chex.Array = None,
-        deterministic: bool = True,
+        input_ids: Optional[chex.Array] = None,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        segment_ids: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
         init_cache: bool = False,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
+        deterministic: bool = True,
         return_dict: bool = True,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-    ):
-        """The __call__ function is the main function of a Flax module. It takes in inputs and returns outputs.
+    ) -> Union[FlaxCausalLMOutput, Tuple]:
+        """
+        Forward pass through the Qwen1 module.
 
         Args:
-            self: Refer to the object itself
-            input_ids: chex.Array: Pass the input token ids to the model
-            attention_mask: chex.Array: Mask out the padding tokens
-            position_ids: chex.Array: Specify the position of each token
-                in the input sequence
-            deterministic: bool: Control whether the model is trained or
-                not
-            init_cache: bool: Initialize the cache for the decoder
-            output_attentions: bool: Return the attention weights
-            output_hidden_states: bool: Determine whether to return the
-                hidden states
-            return_dict: bool: Return a dictionary of the outputs or not
-            extra_embedding: Optional[Union[jnp.ndarray]]: Pass in the
-                embedding of the word that we want to predict
-            None]]: Pass in the extra embedding
+            input_ids (Optional[chex.Array]): Input tensor containing token IDs.
+            attention_mask (Optional[chex.Array]): Mask for attention.
+            position_ids (Optional[chex.Array]): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
+            input_embeds (Optional[chex.Array]): Embedded input tensor.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            init_cache (bool): If True, initialize cache for decoding.
+            deterministic (bool): If True, disable dropout.
+            return_dict (bool): If True, return a dictionary of outputs.
 
         Returns:
-            The logits and the hidden states
+            FlaxCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
         """
-        batch_size, seq_length = input_ids.shape
+
+        batch_size, seq_length = (
+            input_ids.shape if input_ids is not None else input_embeds.shape[:2]
+        )
         if attention_mask is None:
             attention_mask = jnp.ones_like(input_ids)
         if position_ids is None:
@@ -1276,23 +1144,24 @@ class FlaxQwen1ForCausalLMModule(nn.Module):
                 (batch_size, seq_length),
             )
         outputs = self.transformer(
-            input_ids,
-            attention_mask,
-            position_ids,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
             deterministic=deterministic,
             init_cache=init_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            extra_embedding=extra_embedding,
+            input_embeds=input_embeds,
+            segment_ids=segment_ids,
         )
 
         hidden_states = outputs[0]
 
         if self.config.tie_word_embeddings:
-            shared_kernel = self.model.variables["params"]["wte"]["embedding"].T.astype(
-                self.param_dtype
-            )
+            shared_kernel = self.transformer.variables["params"]["wte"][
+                "embedding"
+            ].T.astype(self.param_dtype)
             lm_logits = self.lm_head.apply(
                 {"params": {"kernel": shared_kernel}},
                 hidden_states,
@@ -1316,16 +1185,16 @@ class FlaxQwen1ForCausalLM(FlaxQwen1PreTrainedModel):
     module_class = FlaxQwen1ForCausalLMModule
 
     def set_input_embeddings(self, value):
-        self.module.model.wte = value
+        self.module.transformer.wte = value
 
     def get_input_embeddings(self):
-        return self.module.model.wte
+        return self.module.transformer.wte
 
     def set_decoder(self, decoder):
-        self.module.model = decoder
+        self.module.transformer = decoder
 
     def get_decoder(self):
-        return self.module.model
+        return self.module.transformer
 
     def get_output_embeddings(self):
         return self.module.lm_head
@@ -1343,15 +1212,20 @@ class FlaxQwen1ForSequenceClassificationModule(nn.Module):
 
     def setup(self):
         """The setup function is called once at the beginning of training.
-        It initializes the model and optimizer, and sets up any other state that needs to be initialized.
+        It initializes the transformer and optimizer, and sets up any other state that needs to be initialized.
 
         Args:
             self: Access variables that belong to the class
 
         Returns:
-            A tuple of the model and the classifier
+            A tuple of the transformer and the classifier
         """
-        self.model = FlaxQwen1Module(self.config, dtype=self.dtype)
+        self.transformer = FlaxQwen1Module(
+            self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+        )
         self.classifier = Dense(
             self.num_classes,
             dtype=self.dtype,
@@ -1365,42 +1239,36 @@ class FlaxQwen1ForSequenceClassificationModule(nn.Module):
 
     def __call__(
         self,
-        input_ids: chex.Array,
-        attention_mask: chex.Array = None,
-        position_ids: chex.Array = None,
-        deterministic: bool = True,
+        input_ids: Optional[chex.Array] = None,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        segment_ids: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
         init_cache: bool = False,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
+        deterministic: bool = True,
         return_dict: bool = True,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-    ):
-        """The __call__ function is the main function of a Flax module.
-        It takes in all the inputs to the model and returns all outputs from it.
-        The __call__ function can be called directly on an instance of a class, or by using parentheses after an instance:
-            &gt;&gt;&gt; my_model = MyModel()  # instantiate your model class
-            &gt;&gt;&gt; output = my_model(input)  # call your model with input data as arguments to __call__
+    ) -> Union[FlaxCausalLMOutput, Tuple]:
+        """
+        Forward pass through the Qwen1 module.
 
         Args:
-            self: Refer to the class instance
-            input_ids: chex.Array: Pass the input to the model
-            attention_mask: chex.Array: Specify which tokens are masked
-            position_ids: chex.Array: Specify the position of each token
-                in the sequence
-            deterministic: bool: Control whether the model is run in
-                deterministic or stochastic mode
-            init_cache: bool: Initialize the cache for the transformer
-            output_attentions: bool: Return the attention weights
-            output_hidden_states: bool: Return the hidden states of all
-                h
-            return_dict: bool: Return a dictionary of outputs
-            extra_embedding: Optional[Union[jnp.ndarray]]: Pass in the
-                embedding of a new word
-            None]]: Pass the extra embedding to the model
+            input_ids (Optional[chex.Array]): Input tensor containing token IDs.
+            attention_mask (Optional[chex.Array]): Mask for attention.
+            position_ids (Optional[chex.Array]): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
+            input_embeds (Optional[chex.Array]): Embedded input tensor.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            init_cache (bool): If True, initialize cache for decoding.
+            deterministic (bool): If True, disable dropout.
+            return_dict (bool): If True, return a dictionary of outputs.
 
         Returns:
-            A tuple of logits and hidden_states
+            FlaxCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
         """
+
         batch_size, seq_length = input_ids.shape
         if attention_mask is None:
             attention_mask = jnp.ones_like(input_ids)
@@ -1409,16 +1277,17 @@ class FlaxQwen1ForSequenceClassificationModule(nn.Module):
                 jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
                 (batch_size, seq_length),
             )
-        outputs = self.model(
-            input_ids,
-            attention_mask,
-            position_ids,
+        outputs = self.transformer(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
             deterministic=deterministic,
             init_cache=init_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            extra_embedding=extra_embedding,
+            input_embeds=input_embeds,
+            segment_ids=segment_ids,
         )
 
         hidden_states = outputs[0]
@@ -1427,8 +1296,8 @@ class FlaxQwen1ForSequenceClassificationModule(nn.Module):
             return FlaxSequenceClassifierOutput(
                 logits=prediction, hidden_states=hidden_states
             )
-        else:
-            return (prediction,)
+
+        return (prediction,)
 
 
 class FlaxQwen1ForSequenceClassification(FlaxQwen1PreTrainedModel):

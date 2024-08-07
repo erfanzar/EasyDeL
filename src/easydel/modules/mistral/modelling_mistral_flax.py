@@ -97,7 +97,7 @@ class FlaxMistralMLP(nn.Module):
         param_dtype (jnp.dtype): Data type for model parameters (default is jnp.bfloat16).
         precision (Optional[jax.lax.Precision]): Precision setting for JAX operations (default is "fastest").
 
-    """
+    """ 
 
     config: MistralConfig
     dtype: jnp.dtype = jnp.bfloat16
