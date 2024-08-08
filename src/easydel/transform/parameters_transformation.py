@@ -1,11 +1,11 @@
 import gc
 import re
-from typing import Callable, List, Mapping, Optional, Tuple
+from typing import Callable, List, Mapping, Optional, Tuple, Literal
 
 import jax
 import transformers
 from fjformer.checkpoint import get_dtype
-from fjformer.custom_array import Array8Bit
+from fjformer.custom_array import Array8Bit, Array4Lt
 from flax import traverse_util
 from flax.traverse_util import flatten_dict
 from jax import numpy as jnp
@@ -117,7 +117,7 @@ def torch_dict_to_easydel_params(
     embedding_layer_names: Optional[List[str]] = None,
     layer_norm_names: Optional[List[str]] = None,
     shard_fns: Optional[Mapping[tuple, Callable]] = None,
-    convert_to_8bit: bool = False,
+    quantization_method: Optional[Literal["4bit", "8bit"]],
     params_pattern_selection: Optional[re.Pattern] = None,
     dtype: jax.numpy.dtype = jax.numpy.float16,
     rnn_based_or_rwkv: bool = False,
@@ -162,7 +162,7 @@ def torch_dict_to_easydel_params(
     embedding_layer_names = set(embedding_layer_names or [])
     layer_norm_names = set(layer_norm_names or [])
 
-    if convert_to_8bit and params_pattern_selection is None:
+    if quantization_method == "8bit" and params_pattern_selection is None:
         raise ValueError(
             "In case of converting parameters to 8bit you should pass "
             "`params_pattern_selection` too, to tell the quantizer which parameters should be quantized."
@@ -191,12 +191,20 @@ def torch_dict_to_easydel_params(
                 key_tuple, jax_array = result
                 if shard_fns and key_tuple in shard_fns:
                     jax_array = shard_fns[key_tuple](jax_array)
-                if (
-                    convert_to_8bit
-                    and params_pattern_selection.search("/".join(key_tuple))
-                    and key_tuple[-1] != "embedding"
-                ):
-                    jax_array = Array8Bit.quantize(jax_array)
+                if quantization_method is not None:
+                    if (
+                        quantization_method == "8bit"
+                        and params_pattern_selection.search("/".join(key_tuple))
+                        and key_tuple[-1] != "embedding"
+                    ):
+                        jax_array = Array8Bit.quantize(jax_array)
+                    elif quantization_method == "4bit" and key_tuple[-1] != "embedding":
+                        jax_array = Array4Lt.quantize(jax_array)
+                    else:
+                        raise ValueError(
+                            f"Unknown quantized_method {quantization_method}, "
+                            "(supported [8bit, 4bit])"
+                        )
                 flax_dict[key_tuple] = jax_array
             pbar.update(1)
 

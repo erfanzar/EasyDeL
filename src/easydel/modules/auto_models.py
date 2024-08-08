@@ -2,7 +2,18 @@ import functools
 import gc
 import re
 import warnings
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Type
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+)
 
 import flax.traverse_util
 import jax.numpy
@@ -335,7 +346,7 @@ class AutoEasyDeLModelForCausalLM:
         config_kwargs: Optional[Mapping[str, Any]] = None,
         auto_shard_params: bool = False,
         partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]] = None,
-        load_in_8bit: bool = False,
+        quantization_method: Optional[Literal["4bit", "8bit"]] = None,
         bit_targeted_params: Optional[List[str]] = None,
         verbose_params: bool = False,
         safe: bool = True,
@@ -361,8 +372,8 @@ class AutoEasyDeLModelForCausalLM:
             config_kwargs (Optional[Mapping[str, Any]], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
             auto_shard_params (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
             partition_rules (Optional[Tuple[Tuple[str, PartitionSpec]]], optional): Custom partition rules for parameter sharding. If not None, shard_fns should also be provided. Defaults to None.
-            load_in_8bit (bool, optional): Whether to load the model parameters in 8-bit precision. Defaults to False.
-            bit_targeted_params (Optional[List[str]], optional): List of parameter names to convert to 8-bit precision. If  None and load_in_8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
+            quantization_method (Literal["4bit", "8bit"], optional): quantization_method to be used to quantize model weights. Defaults to None.
+            bit_targeted_params (Optional[List[str]], optional): List of parameter names to convert to 8-bit precision. If  None and 8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
             verbose_params (bool): whenever to log number of parameters in converting state.
             safe (bool): whenever to use safetensors to load engine or parameters (requires engine or parameters to be saved with safe=True while saving them)
             from_torch (bool): whenever to load the model from transformers-pytorch.
@@ -383,7 +394,7 @@ class AutoEasyDeLModelForCausalLM:
                 backend=backend,
                 verbose_params=verbose_params,
                 partition_axis=partition_axis,
-                load_in_8bit=load_in_8bit,
+                quantization_method=quantization_method,
                 partition_rules=partition_rules,
                 bit_targeted_params=bit_targeted_params,
                 sharding_axis_names=sharding_axis_names,
@@ -428,7 +439,7 @@ class AutoEasyDeLModelForCausalLM:
         config_kwargs: Optional[Mapping[str, Any]],
         auto_shard_params: bool,
         partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]],
-        load_in_8bit: bool,
+        quantization_method: Optional[Literal["4bit", "8bit"]],
         bit_targeted_params: Optional[List[str]],
         verbose_params: bool,
         **kwargs,
@@ -550,22 +561,26 @@ class AutoEasyDeLModelForCausalLM:
             )
         logger.debug("converting huggingface-model to easydel-model.")
         params_pattern_selection = None
-        if load_in_8bit:
+        if quantization_method == "8bit":
             if bit_targeted_params is None:
-                bit_targeted_params = [
-                    "kernel",
-                ]
-
+                bit_targeted_params = ["kernel"]
                 params_pattern_selection = re.compile(
                     "({})".format("|".join(bit_targeted_params))
                 )
+
+        leg_load_8bit_detected = kwargs.get("load_8bit", None)
+        if leg_load_8bit_detected is not None:
+            warnings.warn(
+                "load_8bit=True Detected, "
+                "please use `quantization_method=='8bit'` (automatically setting quantization_method to 8bit)"
+            )
         uses_tie_word_embedding = getattr(config, "tie_word_embeddings", False)
         params = trf(
             state_dict,
             config=config,
             device=device,
             shard_fns=shard_fns,
-            convert_to_8bit=load_in_8bit,
+            quantization_method=quantization_method,
             params_pattern_selection=params_pattern_selection,
             remove_state_dict=True,
             uses_tie_word_embedding=uses_tie_word_embedding,
@@ -857,8 +872,8 @@ class AutoStateForCausalLM:
             config_kwargs (Optional[Mapping[str, Any]], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
             auto_shard_params (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
             partition_rules (Optional[Tuple[Tuple[str, PartitionSpec]]], optional): Custom partition rules for parameter sharding. If not None, shard_fns should also be provided. Defaults to None.
-            load_in_8bit (bool, optional): Whether to load the model parameters in 8-bit precision. Defaults to False.
-            bit_targeted_params (Optional[List[str]], optional): List of parameter names to convert to 8-bit precision. If  None and load_in_8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
+            quantization_method (Literal["4bit", "8bit"], optional): quantization_method to be used to quantize model weights. Defaults to None.
+            bit_targeted_params (Optional[List[str]], optional): List of parameter names to convert to 8-bit precision. If  None and 8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
             verbose_params (bool): whenever to log number of parameters in converting state.
             safe (bool): whenever to use safetensors to load engine or parameters (requires engine or parameters to be saved with safe=True while saving them)
             from_torch (bool): whenever to load the model from transformers-pytorch.
