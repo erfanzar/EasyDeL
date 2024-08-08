@@ -1050,7 +1050,7 @@ class FlaxDeepseekV2Module(nn.Module):
         return_dict: bool = True,
     ) -> Union[FlaxBaseModelOutput, Tuple]:
         """
-        Forward pass through the Mistral module.
+        Forward pass through the Deepseekv2 module.
 
         Args:
             input_ids (chex.Array): Input tensor containing token IDs.
@@ -1372,7 +1372,7 @@ class FlaxDeepseekV2ForCausalLMModule(nn.Module):
         return_dict: bool = True,
     ) -> Union[FlaxCausalLMOutput, Tuple]:
         """
-        Forward pass through the Mistral module.
+        Forward pass through the Deepseekv2 module.
 
         Args:
             input_ids (chex.Array): Input tensor containing token IDs.

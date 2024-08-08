@@ -205,6 +205,12 @@ from easydel.modules.whisper import (
     WhisperConfig as WhisperConfig,
 )
 
+from easydel.modules.xerxes import (
+    XerxesConfig as XerxesConfig,
+    FlaxXerxesForCausalLM as FlaxXerxesForCausalLM,
+    FlaxXerxesModel as FlaxXerxesModel,
+)
+
 from easydel.smi import (
     get_mem as get_mem,
     initialise_tracking as initialise_tracking,
