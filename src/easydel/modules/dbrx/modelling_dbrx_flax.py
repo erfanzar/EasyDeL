@@ -10,6 +10,7 @@ from fjformer.functions import auxiliary_load_balancing_loss_func
 from flax import linen as nn
 from flax.core import FrozenDict, freeze, unfreeze
 from flax.linen import Dense, combine_masks
+from flax.linen.partitioning import remat
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
@@ -28,6 +29,7 @@ from easydel.modules.flax_modeling_utils import (
     apply_rotary_pos_emb,
     control_mlp_sharding,
     get_dot_general_by_bits,
+    get_gradient_checkpoint_policy,
     precompute_frequencies,
     with_sharding_constraint,
 )
@@ -600,13 +602,31 @@ class FlaxDbrxBlock(nn.Module):
     def setup(self) -> None:
         self.hidden_size = self.config.d_model
         self.resid_pdrop = self.config.resid_pdrop
-        self.norm_attn_norm = FlaxDbrxNormAttentionNorm(
+        attn_block = FlaxDbrxNormAttentionNorm
+        ffn_block = FlaxDbrxFFN
+
+        if self.config.gradient_checkpointing != "":
+            attn_block = remat(
+                attn_block,
+                static_argnums=(1, 3, 4, 6, 7, 8),
+                policy=get_gradient_checkpoint_policy(
+                    self.config.gradient_checkpointing
+                ),
+            )
+            ffn_block = remat(
+                ffn_block,
+                static_argnums=(1,),
+                policy=get_gradient_checkpoint_policy(
+                    self.config.gradient_checkpointing
+                ),
+            )
+        self.norm_attn_norm = attn_block(
             config=self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
-        self.ffn = FlaxDbrxFFN(
+        self.ffn = ffn_block(
             config=self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -645,22 +665,21 @@ class FlaxDbrxBlock(nn.Module):
         Returns:
             Tuple[chex.Array, chex.Array, Optional[chex.Array]]: A tuple containing the residual_states, hidden states, and the attention weights.
         """
+
         resid_states, hidden_states, self_attn_weights = self.norm_attn_norm(
-            hidden_states=hidden_states,
-            frequencies=frequencies,
-            attention_mask=attention_mask,
-            causal_mask=causal_mask,
-            position_ids=position_ids,
-            output_attentions=output_attentions,
-            init_cache=init_cache,
-            deterministic=deterministic,
-            segment_ids=segment_ids,
-            fcm_mask=fcm_mask,
+            hidden_states,
+            frequencies,
+            attention_mask,
+            position_ids,
+            causal_mask,
+            segment_ids,
+            deterministic,
+            init_cache,
+            output_attentions,
+            fcm_mask,
         )
 
-        hidden_states, router_logits = self.ffn(
-            hidden_states, deterministic=deterministic
-        )
+        hidden_states, router_logits = self.ffn(hidden_states, deterministic)
         hidden_states = resid_states + hidden_states
 
         outputs = (hidden_states,)
