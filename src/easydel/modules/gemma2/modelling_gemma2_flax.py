@@ -549,7 +549,7 @@ class FlaxGemma2PreTrainedModel(EDPretrainedModel):
         Initializes the pre-trained model with the given configuration.
 
         Args:
-            config (MistralConfig): Configuration for the model.
+            config (Gemma2Config): Configuration for the model.
             dtype (jnp.dtype): Data type for computations.
             param_dtype (jnp.dtype): Data type for model parameters.
             precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
@@ -908,7 +908,7 @@ class FlaxGemma2Module(nn.Module):
         return_dict: bool = True,
     ) -> Union[FlaxBaseModelOutput, Tuple]:
         """
-        Forward pass through the Mistral module.
+        Forward pass through the Gemma2 module.
 
         Args:
             input_ids (chex.Array): Input tensor containing token IDs.
@@ -1013,7 +1013,7 @@ class FlaxGemma2ForCausalLMModule(nn.Module):
         return_dict: bool = True,
     ) -> Union[FlaxCausalLMOutput, Tuple]:
         """
-        Forward pass through the Mistral module.
+        Forward pass through the Gemma2 module.
 
         Args:
             input_ids (Optional[chex.Array]): Input tensor containing token IDs.

@@ -169,3 +169,9 @@ from easydel.modules.whisper import (
     FlaxWhisperTimeStampLogitsProcessor as FlaxWhisperTimeStampLogitsProcessor,
     WhisperConfig as WhisperConfig,
 )
+
+from easydel.modules.xerxes import (
+    XerxesConfig as XerxesConfig,
+    FlaxXerxesForCausalLM as FlaxXerxesForCausalLM,
+    FlaxXerxesModel as FlaxXerxesModel,
+)

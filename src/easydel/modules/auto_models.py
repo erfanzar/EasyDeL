@@ -224,11 +224,15 @@ CAUSAL_LANGUAGE_MODELS_CONFIG: Dict[str, Tuple[str, str, str, Dict[str, Any]]] =
         "FlaxOlmoForCausalLM",
         {"embedding_layer_names": ["embed_tokens"]},
     ),
+    "xerxes": (
+        "easydel.modules.xerxes",
+        "XerxesConfig",
+        "FlaxXerxesForCausalLM",
+        {"embedding_layer_names": ["embed_tokens"]},
+    ),
 }
 
-AUTO_ARC_MAP = {
-    "causal-language-model": CAUSAL_LANGUAGE_MODELS_CONFIG,
-}
+AUTO_ARC_MAP = {"causal-language-model": CAUSAL_LANGUAGE_MODELS_CONFIG}
 
 
 def get_modules_by_type(
@@ -317,7 +321,7 @@ class AutoEasyDeLModelForCausalLM:
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
-        device=jax.devices("cpu")[0],
+        device: jax.Device = jax.devices("cpu")[0],
         dtype: jax.numpy.dtype = jax.numpy.float32,
         param_dtype: jax.numpy.dtype = jax.numpy.float32,
         precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
@@ -343,7 +347,7 @@ class AutoEasyDeLModelForCausalLM:
 
         Args:
             pretrained_model_name_or_path (str): Path or name of the pretrained model in the Hugging Face Hub.
-            device (jax.Array, optional): Device to load the model on. Defaults to the first CPU.
+            device (jax.Device, optional): Device to load the model on. Defaults to the first CPU.
             dtype (jax.numpy.dtype, optional): Data type of the model. Defaults to jax.numpy.float32.
             param_dtype (jax.numpy.dtype, optional): Data type of the model parameters. Defaults to jax.numpy.float32.
             precision (jax.lax.Precision, optional): Precision for computations. Defaults to jax.lax.Precision("fastest").
@@ -762,7 +766,7 @@ class AutoShardAndGatherFunctions:
         config_kwargs: Optional[Mapping[str, Any]] = None,
         depth_target: Optional[List[str]] = None,
         from_torch: bool = False,
-        trust_remote_code:bool=False,
+        trust_remote_code: bool = False,
     ) -> Tuple[Mapping[str, Callable], Mapping[str, Callable]]:
         """
         Generates shard and gather functions based on a pretrained model name or path.
@@ -812,7 +816,7 @@ class AutoStateForCausalLM:
     def from_pretrained(
         cls,
         pretrained_model_name_or_path: str,
-        device=jax.devices("cpu")[0],
+        device: jax.Device = jax.devices("cpu")[0],
         dtype: jax.numpy.dtype = jax.numpy.float32,
         param_dtype: jax.numpy.dtype = jax.numpy.float32,
         precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
@@ -833,6 +837,36 @@ class AutoStateForCausalLM:
         from_torch: bool = True,
         **kwargs,
     ) -> EasyDeLState:
+        """
+        Loads and shards a pretrained causal language model from the Hugging Face Hub and converts it into an
+        EasyDeL compatible state.
+
+        Args:
+            pretrained_model_name_or_path (str): Path or name of the pretrained model in the Hugging Face Hub.
+            device (jax.Device, optional): Device to load the model on. Defaults to the first CPU.
+            dtype (jax.numpy.dtype, optional): Data type of the model. Defaults to jax.numpy.float32.
+            param_dtype (jax.numpy.dtype, optional): Data type of the model parameters. Defaults to jax.numpy.float32.
+            precision (jax.lax.Precision, optional): Precision for computations. Defaults to jax.lax.Precision("fastest").
+            sharding_axis_dims (Sequence[int], optional): Dimensions of each sharding axis. Defaults to (1, -1, 1, 1).
+            sharding_axis_names (Sequence[str], optional): Names of the sharding axes. Defaults to ("dp", "fsdp", "tp", "sp").
+            partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
+            shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
+            input_shape (Tuple[int, int], optional): Shape of the input to the model. Defaults to (1, 1).
+            shard_fns (Optional[Mapping[tuple, Callable] | dict], optional): Sharding functions to use for the model. If None, auto-sharding is used if auto_shard_params is True. Defaults to None.
+            backend (Optional[str], optional): Backend to use for the model. Defaults to None.
+            config_kwargs (Optional[Mapping[str, Any]], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
+            auto_shard_params (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
+            partition_rules (Optional[Tuple[Tuple[str, PartitionSpec]]], optional): Custom partition rules for parameter sharding. If not None, shard_fns should also be provided. Defaults to None.
+            load_in_8bit (bool, optional): Whether to load the model parameters in 8-bit precision. Defaults to False.
+            bit_targeted_params (Optional[List[str]], optional): List of parameter names to convert to 8-bit precision. If  None and load_in_8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
+            verbose_params (bool): whenever to log number of parameters in converting state.
+            safe (bool): whenever to use safetensors to load engine or parameters (requires engine or parameters to be saved with safe=True while saving them)
+            from_torch (bool): whenever to load the model from transformers-pytorch.
+            **kwargs: Additional keyword arguments to pass to the model and config classes.
+
+        Returns:
+            EasyDeLState: containing the EasyDeL state and the loaded and sharded model parameters.
+        """
         model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             device=device,
@@ -862,4 +896,5 @@ class AutoStateForCausalLM:
             module=model,
             module_config=model.config,
             tx=None,
+            tx_init=None,
         )
