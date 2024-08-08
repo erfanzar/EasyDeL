@@ -11,6 +11,8 @@ if bool(
     _os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     _os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.99"
     _os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+
 # EasyDel Imports
 from easydel.etils.easystate import EasyDeLState as EasyDeLState
 from easydel.etils.errors import (
@@ -244,10 +246,13 @@ from easydel.transform import (
 from easydel import modules as modules
 from easydel import etils as etils
 
-import fjformer as _fj
+from fjformer import __version__ as _fjv
+from packaging.version import Version
 
-_targeted_version = "0.0.73"
-assert _fj.__version__ == _targeted_version, (
-    f"this version os EasyDeL is only compatible with fjformer=={_targeted_version},"
-    f" but found fjformer {_fj.__version__}"
+_targeted_versions = ["0.0.73", "0.0.74"]
+assert Version(_fjv) in [
+    Version(_targeted_version) for _targeted_version in _targeted_versions
+], (
+    f"this version os EasyDeL is only compatible with fjformer {', '.join(_targeted_versions)},"
+    f" but found fjformer {_fjv}"
 )

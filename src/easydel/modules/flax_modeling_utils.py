@@ -12,7 +12,7 @@ import jax.tree_util
 from einops import rearrange
 from fjformer.bit_quantization import config as q_config
 from fjformer.bit_quantization import q_flax
-from fjformer.custom_array import Array4Bit, Array8Bit
+from fjformer.custom_array import Array4Bit, Array8Bit, Array4Lt
 from flax import linen as nn
 from flax.linen import combine_masks
 from flax.traverse_util import flatten_dict, unflatten_dict
@@ -979,6 +979,60 @@ def quantize_params_nf4(
     with tqdm(
         total=total_params,
         desc="Quantizing to NF4",
+        disable=not verbose,
+    ) as pbar:
+
+        def quantize_with_progress(path, array):
+            pbar.set_postfix_str(".".join(path[0].key))
+            result = quantize(path, array)
+            pbar.update(1)
+            return result
+
+        params = jax.tree_util.tree_map_with_path(quantize_with_progress, params)
+
+    if not flatten:
+        params = unflatten_dict(params)
+
+    return params
+
+
+def quantize_params_4bit(
+    params: Union[Dict[str, Any], Any],
+    embedding_layer_name: Optional[str] = None,
+    layers_to_ignore: Optional[list[str]] = None,
+    verbose: bool = True,
+) -> Union[Dict[str, Any], Any]:
+    """
+    Quantize parameters to  4-bit precision, excluding specified layers.
+
+    Args:
+        params: The parameters to quantize. Can be a nested dictionary or a flat structure.
+        embedding_layer_name: Name of the embedding layer to ignore during quantization.
+        layers_to_ignore: List of additional layer names to ignore during quantization.
+        verbose (bool): whenever to use tqdm for logging stuff.
+
+    Returns:
+        Quantized parameters in the same structure as the input.
+    """
+    embedding_layer_name = embedding_layer_name or "embedding"
+    layers_to_ignore = set(layers_to_ignore or [])
+    layers_to_ignore.add(embedding_layer_name)
+
+    flatten = not isinstance(params, dict)
+    if not flatten:
+        params = flatten_dict(params)
+
+    def quantize(path, array):
+        layer_name = ".".join(path[0].key)
+        if any(ignore in layer_name for ignore in layers_to_ignore):
+            logger.info(f"Layer {layer_name} is not quantized (ignored).")
+            return array
+        return Array4Lt.quantize(array=array, dtype=array.dtype)
+
+    total_params = len(jax.tree_util.tree_leaves(params))
+    with tqdm(
+        total=total_params,
+        desc="Quantizing to 4-bit",
         disable=not verbose,
     ) as pbar:
 
