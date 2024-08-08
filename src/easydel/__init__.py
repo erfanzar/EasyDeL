@@ -249,7 +249,7 @@ from easydel import etils as etils
 from fjformer import __version__ as _fjv
 from packaging.version import Version
 
-_targeted_versions = ["0.0.73", "0.0.74"]
+_targeted_versions = ["0.0.74"]
 assert Version(_fjv) in [
     Version(_targeted_version) for _targeted_version in _targeted_versions
 ], (
