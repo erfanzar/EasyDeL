@@ -139,7 +139,7 @@ def torch_dict_to_easydel_params(
         device: Determine which device the model will be loaded on
         layer_norm_names: Replaces weight or kernel with (scale)
         shard_fns: Optional[Mapping[tuple, Callable]]: Sharding Function to be used to shard model
-        convert_to_8bit: bool: whenever to convert the into 8bit format
+        quantization_method (Literal["4bit", "8bit"], optional): quantization_method to be used to quantize model weights. Defaults to None.
         params_pattern_selection: Optional[re.Pattern]: patter to use to find the parameters of the model which will
         dtype: jax.numpy.dtype: Specify the data type of the tensors
         rnn_based_or_rwkv: bool: rnn_based_or_rwkv is a conditioner  which decide whenever it finds a value in tree
@@ -158,7 +158,12 @@ def torch_dict_to_easydel_params(
         _clear = torch.cuda.empty_cache if torch.cuda.is_available() else gc.collect
     except ModuleNotFoundError:
         _clear = gc.collect
-
+    
+    if quantization_method is not None and quantization_method not in ["4bit", "8bit"]:
+        raise ValueError(
+            f"Unknown quantized_method {quantization_method}, "
+            "(supported [8bit, 4bit])"
+        )
     embedding_layer_names = set(embedding_layer_names or [])
     layer_norm_names = set(layer_norm_names or [])
 
@@ -191,20 +196,14 @@ def torch_dict_to_easydel_params(
                 key_tuple, jax_array = result
                 if shard_fns and key_tuple in shard_fns:
                     jax_array = shard_fns[key_tuple](jax_array)
-                if quantization_method is not None:
-                    if (
-                        quantization_method == "8bit"
-                        and params_pattern_selection.search("/".join(key_tuple))
-                        and key_tuple[-1] != "embedding"
-                    ):
-                        jax_array = Array8Bit.quantize(jax_array)
-                    elif quantization_method == "4bit" and key_tuple[-1] != "embedding":
-                        jax_array = Array4Lt.quantize(jax_array)
-                    else:
-                        raise ValueError(
-                            f"Unknown quantized_method {quantization_method}, "
-                            "(supported [8bit, 4bit])"
-                        )
+                if (
+                    quantization_method == "8bit"
+                    and params_pattern_selection.search("/".join(key_tuple))
+                    and key_tuple[-1] != "embedding"
+                ):
+                    jax_array = Array8Bit.quantize(jax_array)
+                elif quantization_method == "4bit" and key_tuple[-1] != "embedding":
+                    jax_array = Array4Lt.quantize(jax_array)
                 flax_dict[key_tuple] = jax_array
             pbar.update(1)
 
