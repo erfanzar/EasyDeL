@@ -68,6 +68,18 @@ class FlaxQwen2MoeEmbedding(nn.Module):
 
 
 class FlaxQwen2MoeMLP(nn.Module):
+    """
+    FlaxQwen2MoeMLP is a multi-layer perceptron (MLP) module for neural network models,
+    configured with specific settings.
+
+    Attributes:
+        config (Qwen2MoeConfig): Configuration object containing model parameters.
+        dtype (jnp.dtype): Data type for computation (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for model parameters (default is jnp.bfloat16).
+        precision (Optional[jax.lax.Precision]): Precision setting for JAX operations (default is "fastest").
+
+    """
+
     config: Qwen2MoeConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -110,12 +122,10 @@ class FlaxQwen2MoeMLP(nn.Module):
         )
 
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-        """The __call__ function is the main function of a class.
-        It is called when an instance of the class (an object) is invoked as a function, i.e., obj(arguments).
-        The __call__ method enables instances of a class to be called like standard Python functions.
+        """
+        Forward pass of the MLP module.
 
         Args:
-            self: Represent the instance of the class
             x: jnp.ndarray: Pass in the input to the layer
             deterministic: bool: Determine whether to use dropout
 
@@ -130,6 +140,16 @@ class FlaxQwen2MoeMLP(nn.Module):
 
 
 class FlaxQwen2MoeAttention(FlaxAttentionModule):
+    """
+    FlaxQwen2MoeAttention implements an attention mechanism with rotary embeddings.
+
+    Attributes:
+        config (Qwen2MoeConfig): Configuration for the attention module.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
+    """
+
     config: Qwen2MoeConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -184,18 +204,6 @@ class FlaxQwen2MoeAttention(FlaxAttentionModule):
 
         self.rotary = FlaxQwen2MoeEmbedding(self.dtype)
         self.attention_performer = FlexibleAttentionModule(
-            use_sharding_constraint=self.config.use_sharding_constraint,
-            block_k_major=self.config.block_k_major,
-            block_b=self.config.block_b,
-            block_q=self.config.block_q,
-            block_k=self.config.block_k,
-            block_q_major_dkv=self.config.block_q_major_dkv,
-            block_k_major_dkv=self.config.block_k_major_dkv,
-            block_k_major_dq=self.config.block_k_major_dq,
-            block_k_dkv=self.config.block_k_dkv,
-            block_q_dkv=self.config.block_q_dkv,
-            block_q_dq=self.config.block_q_dq,
-            block_k_dq=self.config.block_k_dq,
             num_attention_heads=self.config.num_attention_heads,
             attention_dropout=self.config.attention_dropout,
             head_dims=self.head_dim,
@@ -208,8 +216,7 @@ class FlaxQwen2MoeAttention(FlaxAttentionModule):
             scan_ring_attention=self.config.scan_ring_attention,
             mesh=self.config.mesh,
             sm_scale=1 / math.sqrt(self.head_dim),
-            axis_name=self.config.attention_axis_name,
-            backward_pass_impl=self.config.flash_attention_backward_pass_impl,
+            base_config=self.config,
         )
         self.resid_dropout = flax.linen.Dropout(rate=config.attention_dropout)
 
@@ -225,43 +232,31 @@ class FlaxQwen2MoeAttention(FlaxAttentionModule):
         """
         return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
-    def apply_rotary(
-        self,
-        batch_size,
-        sequence_length,
-        query,
-        key,
-        value,
-        frequencies,
-        position_ids,
-    ):
-        """The apply_rotary function is a modified version of the apply_attention function in the BertModel class.
-        The main difference is that it takes in an additional argument, frequencies, which are used to calculate
-        the rotary attention weights. The other differences are minor and mostly related to reshaping tensors.
+    def apply_rotary(self, query, key, frequencies, position_ids):
+        """
+        Applies rotary positional embeddings to the query and key tensors.
 
         Args:
-            self: Access variables that belong to the class
-            batch_size: Reshape the query, key and value tensors
-            sequence_length: Reshape the query, key and value tensors
-            query: Calculate the attention weights
-            key: Calculate the attention
-            value: Compute the attention weights
-            frequencies: Calculate the frequency of each word in the
-                vocabulary
-            position_ids: Identify the position of each token in the
-                sequence
+            query (chex.Array): Query tensor.
+            key (chex.Array): Key tensor.
+            frequencies (Tuple[chex.Array, chex.Array]): Tuple containing cosine and sine components for rotary embeddings.
+            position_ids (chex.Array): Position indices for the tokens.
 
         Returns:
-            A tuple of 3 tensors: query, key and value
+            Tuple[chex.Array, chex.Array]: The modified query and key tensors after applying rotary embeddings.
         """
-        query, key, value = self._transpose_sequence_head(query, key, value)
+
+        query, key = self._transpose_sequence_head(
+            query,
+            key,
+        )
         query, key = self.rotary(
             position_ids=position_ids,
             query=query,
             key=key,
             frequencies=frequencies,
         )
-        return self._transpose_sequence_head(query, key, value)
+        return self._transpose_sequence_head(query, key)
 
     def __call__(
         self,
@@ -274,34 +269,24 @@ class FlaxQwen2MoeAttention(FlaxAttentionModule):
         deterministic: bool = True,
         init_cache: bool = False,
         output_attentions: bool = False,
-        fcm_mask=None,
+        fcm_mask: Optional[chex.Array] = None,
     ):
-        """The __call__ function is the main function of a JAX module. It defines how the module behaves when called
-        with inputs. The __call__ function can be thought of as a &quot;forward pass&quot; through the model,
-        and it should return all outputs that are needed for training or inference.
+        """
+        Forward pass of the attention module.
 
         Args:
-            self: Access variables that belong to the class
-            hidden_states: chex.Array: Pass the hidden states of the
-                previous layer
-            frequencies: Tuple[chex.Array, chex.Array],: Pass in the
-                frequency coefficients for each position
-            attention_mask: chex.Array: Mask out certain tokens in the
-                input sequence
-            position_ids: chex.Array: Determine the position of each
-                token in a sequence
-            causal_mask: chex.Array: Mask out the future tokens in the
-                decoder
-            deterministic: bool: Determine whether to use dropout or not
-            init_cache: bool: Initialize the cache
-            output_attentions: bool: Determine whether to return the
-                attention weights or not
-            fcm_mask: Mask out the attention weights between the input
-                and output tokens
-
-
+            hidden_states (chex.Array): Input hidden states.
+            frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            attention_mask (chex.Array): Mask to apply on the attention scores.
+            position_ids (chex.Array): Position indices for the tokens.
+            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            deterministic (bool): If True, disables dropout for deterministic behavior.
+            init_cache (bool): If True, initializes cache for caching keys and values.
+            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
+            fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
         Returns:
-            A tuple of two arrays
+            Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
         """
         batch_size, sequence_length = hidden_states.shape[:2]
         query_states, key_states, value_states = (
@@ -329,14 +314,11 @@ class FlaxQwen2MoeAttention(FlaxAttentionModule):
             self.head_dim,
         )
 
-        query_states, key_states, value_states = self.apply_rotary(
+        query_states, key_states = self.apply_rotary(
             query=query_states,
             key=key_states,
-            value=value_states,
             position_ids=position_ids,
             frequencies=frequencies,
-            batch_size=batch_size,
-            sequence_length=sequence_length,
         )
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
@@ -356,12 +338,10 @@ class FlaxQwen2MoeAttention(FlaxAttentionModule):
         causal_mask = jnp.broadcast_to(
             causal_mask, (batch_size,) + causal_mask.shape[1:]
         )
-        attention_mask = jnp.broadcast_to(
-            jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape
-        )
-        attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
         if attention_mask.ndim == 2:
             attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+        attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
+        attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
 
         dropout_rng = None
 
@@ -374,26 +354,10 @@ class FlaxQwen2MoeAttention(FlaxAttentionModule):
             )
 
         key_states, value_states = self.repeat_key_value(
-            key_states, value_states, self.num_key_value_groups
+            key_states,
+            value_states,
+            self.num_key_value_groups,
         )
-
-        if self.config.use_sharding_constraint:
-            query_states = with_sharding_constraint(
-                query_states,
-                jax.sharding.PartitionSpec(
-                    ("dp", "fsdp"),
-                    "sp" if query_states.shape[1] != 1 else None,
-                    "tp",
-                    None,
-                ),
-            )
-            key_states = with_sharding_constraint(
-                key_states, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None)
-            )
-            value_states = with_sharding_constraint(
-                value_states,
-                jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None),
-            )
         attention_bias = lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -401,6 +365,7 @@ class FlaxQwen2MoeAttention(FlaxAttentionModule):
                 self.dtype
             ),
         )
+
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
         attentions = self.attention_performer(
@@ -545,7 +510,9 @@ class FlaxQwen2MoeSparseMoeBlock(nn.Module):
         )
 
     def __call__(
-        self, hidden_states: chex.Array, e: bool = False  # Ignored
+        self,
+        hidden_states: chex.Array,
+        e: bool = False,  # Ignored
     ) -> Tuple[chex.Array, chex.Array]:
         hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -559,7 +526,8 @@ class FlaxQwen2MoeSparseMoeBlock(nn.Module):
         )
 
         routing_weights, selected_experts = jax.lax.top_k(
-            routing_weights, k=self.config.num_experts_per_tok
+            routing_weights,
+            k=self.config.num_experts_per_tok,
         )
 
         if self.config.norm_topk_prob:
@@ -591,21 +559,7 @@ class FlaxQwen2MoeBlock(nn.Module):
 
     def setup(self) -> None:
         attn_block = FlaxQwen2MoeAttention
-        if self.config.gradient_checkpointing != "":
-            attn_block = nn_partitioning.remat(
-                FlaxQwen2MoeAttention,
-                static_argnums=(1, 3, 4, 6, 7, 8, 9),
-                policy=get_gradient_checkpoint_policy(
-                    self.config.gradient_checkpointing
-                ),
-            )
 
-        self.self_attn = attn_block(
-            self.config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
-        )
         mlp_block = (
             FlaxQwen2MoeSparseMoeBlock
             if (self.layer_idx not in self.config.mlp_only_layers)
@@ -615,8 +569,15 @@ class FlaxQwen2MoeBlock(nn.Module):
             )
             else FlaxQwen2MoeMLP
         )
-
         if self.config.gradient_checkpointing != "":
+            attn_block = nn_partitioning.remat(
+                FlaxQwen2MoeAttention,
+                static_argnums=(1, 3, 4, 6, 7, 8),
+                policy=get_gradient_checkpoint_policy(
+                    self.config.gradient_checkpointing
+                ),
+            )
+
             mlp_block = nn_partitioning.remat(
                 mlp_block,
                 static_argnums=(1,),
@@ -624,21 +585,27 @@ class FlaxQwen2MoeBlock(nn.Module):
                     self.config.gradient_checkpointing
                 ),
             )
+        self.self_attn = attn_block(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+        )
 
         self.mlp = mlp_block(
-            self.config,
+            config=self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
         self.input_layernorm = RMSNorm(
-            self.config.hidden_size,
+            dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
         self.post_attention_layernorm = RMSNorm(
-            self.config.hidden_size,
+            dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -651,42 +618,32 @@ class FlaxQwen2MoeBlock(nn.Module):
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
         deterministic: bool = True,
         init_cache: bool = False,
-        output_attentions: Optional[bool] = False,
-        output_hidden_states: Optional[bool] = False,
-        output_router_logits: Optional[bool] = None,
-        return_dict: bool = True,
-        segment_ids: Optional[chex.Array] = None,
-        fcm_mask: Optional[jnp.ndarray] = None,
-    ):
-        """The __call__ function is the main function of a TransformerEncoderLayer.
-        It takes in hidden states, frequency-domain inputs, and masks as input. It then
-        applies self-attention to the hidden states using those inputs and returns an
-        output tensor with shape (batch_size, sequence_length, model_dim).
+        output_attentions: bool = False,
+        output_router_logits: bool = False,
+        fcm_mask: Optional[chex.Array] = None,
+    ) -> Tuple[chex.Array, chex.Array, Optional[chex.Array]]:
+        """
+        Forward pass of the attentionNrom module.
 
         Args:
-            self: Refer to the class instance itself
-            hidden_states: chex.Array: Pass in the hidden state of the
-                previous layer
-            frequencies: Tuple[chex.Array, chex.Array],: Pass in the
-                frequency information
-            attention_mask: chex.Array: Mask out the attention weights
-                for padding tokens
-            position_ids: chex.Array: Determine the position of each
-                token in the sequence
-            causal_mask: chex.Array: Mask the attention weights
-            deterministic: bool: Control whether the dropout is applied
-                or not
-            init_cache: bool: Initialize the cache in the attention
-                layer
-            output_attentions: bool: Return the attention weights
-            fcm_mask: Optional[jnp.ndarray]: Mask the self-attention
-
-
+            hidden_states (chex.Array): Input hidden states.
+            frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            attention_mask (chex.Array): Mask to apply on the attention scores.
+            position_ids (chex.Array): Position indices for the tokens.
+            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            deterministic (bool): If True, disables dropout for deterministic behavior.
+            init_cache (bool): If True, initializes cache for caching keys and values.
+            output_attentions (bool): If True, outputs attention weights.
+            output_router_logits (bool): If True, outputs router logits.
+            fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
         Returns:
-            A tuple of two items
+            Tuple[chex.Array, chex.Array, Optional[chex.Array]]: A tuple containing the residual_states, hidden states, and the attention weights.
         """
+
         attn_outputs = self.self_attn(
             self.input_layernorm(hidden_states),
             frequencies,
@@ -721,6 +678,15 @@ class FlaxQwen2MoeBlock(nn.Module):
 
 
 class FlaxQwen2MoePreTrainedModel(EDPretrainedModel):
+    """
+    Base class for Qwen2Moe models providing initialization and configuration.
+
+    Attributes:
+        config_class (Qwen2MoeConfig): The configuration class for the model.
+        module_class (nn.Module): The class representing the model's architecture.
+        base_model_prefix (str): The prefix for the base model parameters.
+    """
+
     config_class = Qwen2MoeConfig
     base_model_prefix = "model"
     module_class: nn.Module = None
@@ -728,56 +694,59 @@ class FlaxQwen2MoePreTrainedModel(EDPretrainedModel):
     def __init__(
         self,
         config: Qwen2MoeConfig,
-        input_shape: Tuple = (1, 1),
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+        input_shape: Tuple[int, int] = (1, 1),
         seed: int = 0,
-        dtype: jnp.dtype = jnp.float32,
-        _do_init: bool = True,
+        _do_init: bool = False,
         **kwargs,
     ):
-        """The __init__ function is called when the class is instantiated.
-        It sets up the instance of the class, and defines what happens when it's created.
-        The __init__ function can take arguments, but self is always required (it refers to the instance of the object).
+        """
+        Initializes the pre-trained model with the given configuration.
 
         Args:
-            self: Refer to the object itself
-            config: Qwen2MoeConfig: Pass the configuration to the module
-            input_shape: Tuple: Specify the shape of the input to the
-                model
-            seed: int: Set the seed for random number generation
-            dtype: jnp.dtype: Specify the data type of the input
-            _do_init: bool: Control whether the module is initialized or
-                not
-            **kwargs: Pass in any additional parameters that the
-                module_class might need
-        :param : Specify the number of layers in the network
-
-        Returns:
-            The super() of the class
+            config (Qwen2MoeConfig): Configuration for the model.
+            dtype (jnp.dtype): Data type for computations.
+            param_dtype (jnp.dtype): Data type for model parameters.
+            precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
+            input_shape (Tuple[int, int]): Shape of the input tensor.
+            seed (int): Seed for random number generation.
+            _do_init (bool): If True, initialize model weights.
+            **kwargs: Additional keyword arguments.
         """
-        module = self.module_class(config=config, dtype=dtype, **kwargs)
+        module = self.module_class(
+            config=config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            **kwargs,
+        )
         super().__init__(
-            config,
-            module,
-            input_shape=input_shape,
-            seed=seed,
             dtype=dtype,
             _do_init=_do_init,
+            module=module,
+            config=config,
+            input_shape=input_shape,
+            seed=seed,
         )
 
     def init_weights(
-        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+        self,
+        rng: jax.random.PRNGKey,
+        input_shape: Tuple,
+        params: FrozenDict = None,
     ) -> FrozenDict:
-        """The init_weights function is used to initialize the weights of a model.
+        """
+        Initializes the model weights.
 
         Args:
-            self: Access variables that belong to the class
-            rng: jax.random.PRNGKey: Initialize the weights of the model
-            input_shape: Tuple: Specify the shape of the input tensor
-            params: FrozenDict: Pass in the parameters of a pre-trained
-                model
+            rng (jax.random.PRNGKey): Random number generator key.
+            input_shape (Tuple): Shape of the input tensor for initializing weights.
+            params (FrozenDict, optional): Existing parameters to initialize with.
 
         Returns:
-            A frozendict of parameters
+            FrozenDict: Initialized model parameters.
         """
         input_ids = jnp.zeros(input_shape, dtype="i4")
         attention_mask = jnp.ones_like(input_ids)
@@ -785,13 +754,13 @@ class FlaxQwen2MoePreTrainedModel(EDPretrainedModel):
             jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape
         )
         params_rng, dropout_rng = jax.random.split(rng)
-        rngs = {"params": params_rng, "dropout": dropout_rng}
+        rng_s = {"params": params_rng, "dropout": dropout_rng}
 
         if self.config.add_cross_attention:
             encoder_hidden_states = jnp.zeros(input_shape + (self.config.hidden_size,))
             encoder_attention_mask = attention_mask
             module_init_outputs = self.module.init(
-                rngs,
+                rng_s,
                 input_ids,
                 attention_mask,
                 position_ids,
@@ -801,7 +770,11 @@ class FlaxQwen2MoePreTrainedModel(EDPretrainedModel):
             )
         else:
             module_init_outputs = self.module.init(
-                rngs, input_ids, attention_mask, position_ids, return_dict=False
+                rng_s,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                return_dict=False,
             )
 
         random_params = module_init_outputs["params"]
@@ -817,18 +790,15 @@ class FlaxQwen2MoePreTrainedModel(EDPretrainedModel):
             return random_params
 
     def init_cache(self, batch_size, max_length):
-        """The init_cache function is used to initialize the cache for a given batch size and sequence length.
-        The cache is a dictionary that contains all the intermediate states from each layer in the model.
-        This allows us to run inference on multiple batches without having to re-run forward passes through every layer in
-        the model, which would be very slow.
+        """
+        Initializes the cache for autoregressive generation.
 
         Args:
-            self: Access the module
-            batch_size: Define the batch size of the input tensors
-            max_length: Set the length of the input sequence
+            batch_size (int): Batch size for the cache.
+            max_length (int): Maximum length for the cache.
 
         Returns:
-            A dictionary with the following keys:
+            dict: Initialized cache.
         """
         input_ids = jnp.ones((batch_size, max_length))
         attention_mask = jnp.ones_like(input_ids)
@@ -849,8 +819,10 @@ class FlaxQwen2MoePreTrainedModel(EDPretrainedModel):
     def __call__(
         self,
         input_ids: chex.Array,
-        attention_mask: chex.Array = None,
-        position_ids: chex.Array = None,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        segment_ids: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         params: dict = None,
         past_key_values: Optional[dict] = None,
         dropout_rng: jax.random.PRNGKey = None,
@@ -859,41 +831,33 @@ class FlaxQwen2MoePreTrainedModel(EDPretrainedModel):
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
         add_params_field: bool = False,
         **kwargs,
     ):
-        """The __call__ function is the main function of a JAX module.
-        It takes in inputs and returns outputs, but it also has some other important features:
-        - It can take in mutable state (e.g., past_key_values) that will be updated during the call and returned at the end.
-        - It can take in random number generators (rngs) that are used to generate random numbers for dropout or sampling operations.
+        """
+        Forward pass through the model.
 
         Args:
-            self: Represent the instance of the class
-            input_ids: chex.Array: Pass in the input tokens
-            attention_mask: chex.Array: Mask out certain tokens in the
-                input
-            position_ids: chex.Array: Create the positional embeddings
-            params: dict: Pass in the parameters of the model
-            past_key_values: dict: Pass in the past key values from a
-                previous call to __call__
-            dropout_rng: jax.random.PRNGKey: Make sure that the dropout
-                is applied in a random way
-            train: bool: Determine whether to use dropout or not
-            output_attentions: Optional[bool]: Determine whether to
-                return the attention weights
-            output_hidden_states: Optional[bool]: Return the hidden
-                states of all layers
-            return_dict: Optional[bool]: Determine whether to return a
-                dictionary or not
-            extra_embedding: Optional[Union[jnp.ndarray,None]]: Pass in
-                the embedding for the input_ids
-            add_params_field: bool: Add the params field to the inputs
-                dictionary
+            input_ids (chex.Array): Input tensor containing token IDs.
+            attention_mask (Optional[chex.Array]): Mask for attention.
+            position_ids (Optional[chex.Array]): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
+            input_embeds (Optional[chex.Array]): embedding inputs to be used instead of input_ids.
+            params (dict, optional): Parameters for the model.
+            past_key_values (dict, optional): Past key and value states for caching.
+            dropout_rng (jax.random.PRNGKey, optional): RNG key for dropout.
+            train (bool): If True, the model is in training mode.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            output_router_logits (Optional[bool]): If True, output router logits.
+            return_dict (Optional[bool]): If True, return a dictionary of outputs.
+            add_params_field (bool): If True, include the parameters in the input dictionary.
+            **kwargs: Additional arguments.
 
         Returns:
-            A tuple of the following:
+            Output type depends on the model configuration.
         """
+
         output_attentions = (
             output_attentions
             if output_attentions is not None
@@ -904,21 +868,11 @@ class FlaxQwen2MoePreTrainedModel(EDPretrainedModel):
             if output_hidden_states is not None
             else self.config.output_hidden_states
         )
-        output_router_logits = (
-            output_router_logits
-            if output_router_logits is not None
-            else self.config.output_router_logits
-        )
-
         return_dict = (
             return_dict if return_dict is not None else self.config.return_dict
         )
 
         batch_size, sequence_length = input_ids.shape
-
-        assert (
-            sequence_length <= self.config.max_position_embeddings
-        ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 
         if position_ids is None:
             if past_key_values is not None:
@@ -933,12 +887,9 @@ class FlaxQwen2MoePreTrainedModel(EDPretrainedModel):
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, sequence_length))
 
-        rngs = {}
+        rng_s = {}
         if dropout_rng is not None:
-            rngs["dropout"] = dropout_rng
-
-        if self.config.bits is not None:
-            rngs["params"] = jax.random.key(0)
+            rng_s["dropout"] = dropout_rng
 
         inputs = (
             {"params": params or self.params}
@@ -946,6 +897,8 @@ class FlaxQwen2MoePreTrainedModel(EDPretrainedModel):
             else params or self.params
         )
 
+        if self.config.bits is not None:
+            rng_s["params"] = jax.random.key(0)
         if past_key_values is not None:
             inputs["cache"] = past_key_values
             mutable = ["cache"]
@@ -954,17 +907,18 @@ class FlaxQwen2MoePreTrainedModel(EDPretrainedModel):
 
         outputs = self.module.apply(
             inputs,
-            jnp.array(input_ids, dtype="i4"),
-            jnp.array(attention_mask, dtype="i4"),
-            jnp.array(position_ids, dtype="i4"),
-            not train,
-            False,
-            output_attentions,
-            output_hidden_states,
-            output_router_logits,
-            return_dict,
-            extra_embedding,
-            rngs=rngs,
+            input_ids=jnp.array(input_ids, dtype="i4"),
+            attention_mask=jnp.array(attention_mask, dtype="i4"),
+            position_ids=jnp.array(position_ids, dtype="i4"),
+            segment_ids=segment_ids,
+            input_embeds=input_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
+            init_cache=False,
+            deterministic=not train,
+            return_dict=return_dict,
+            rngs=rng_s,
             mutable=mutable,
         )
 
@@ -1005,46 +959,37 @@ class FlaxQwen2MoeBlockCollection(nn.Module):
         attention_mask: chex.Array,
         position_ids: chex.Array,
         causal_mask: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
         deterministic: bool = True,
         init_cache: bool = False,
-        output_attentions: Optional[bool] = False,
-        output_hidden_states: Optional[bool] = False,
-        output_router_logits: Optional[bool] = None,
-        return_dict: bool = True,
-    ):
-        """The __call__ function is the main function of a JAX nn.Module.
-        It defines how the module behaves when called as a function, and it's what you'll use to call your model
-         in training loops or inference scripts.
-        The __call__ method should take all inputs that are necessary for computing outputs from the module,
-        and return all outputs that are computed by this module.
+        output_attentions: bool = False,
+        output_router_logits: bool = False,
+        output_hidden_states: bool = False,
+        fcm_mask: Optional[chex.Array] = None,
+    ) -> Tuple[chex.Array, chex.Array, Optional[chex.Array]]:
+        """
+        Forward pass of the Qwen2MoeBlock module.
 
         Args:
-            self: Represent the instance of the class
-            hidden_states: chex.Array: Pass the input tensor to the
-                encoder
-            frequencies: Tuple[chex.Array, chex.Array],: Pass in the
-                frequency of each token
-            attention_mask: chex.Array: Mask out certain tokens in the
-                input sequence
-            position_ids: chex.Array: Specify the position of each token
-                in a sequence
-            causal_mask: chex.Array: Mask the attention weights
-            deterministic: bool: Determine whether the model is in
-                training or evaluation mode
-            init_cache: bool: Initialize the cache for each layer
-            output_attentions: bool: Determine whether to output the
-                attention weights
-            output_hidden_states: bool: Determine whether to return the
-                hidden states of each layer
-            return_dict: bool: Return a dictionary of the outputs
-        :param : Determine whether to use the forgetful causal mask
-
+            hidden_states (chex.Array): Input hidden states.
+            frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            attention_mask (chex.Array): Mask to apply on the attention scores.
+            position_ids (chex.Array): Position indices for the tokens.
+            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            deterministic (bool): If True, disables dropout for deterministic behavior.
+            init_cache (bool): If True, initializes cache for caching keys and values.
+            output_attentions (bool): If True, outputs attention weights.
+            output_router_logits (bool): If True, outputs router logits.
+            output_hidden_states (bool): If True, outputs all of hidden states.
+            fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
         Returns:
-            A tuple of 3 values
+            Tuple[chex.Array, Optional[chex.Array], Optional[chex.Array], Optional[chex.Array]]:
+                A tuple containing the hidden_states, all_self_attns, all_hidden_states, all_router_logits.
         """
-        all_attentions = () if output_attentions else None
-        all_hidden_states = () if output_hidden_states else None
-        all_router_logits = () if output_router_logits else None
+        all_hidden_states = ()
+        all_router_logits = ()
+        all_self_attns = ()
 
         if not deterministic and self.config.fcm_max_ratio > 0:
             # Apply forgetful causal mask
@@ -1076,21 +1021,26 @@ class FlaxQwen2MoeBlockCollection(nn.Module):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 causal_mask=causal_mask,
+                segment_ids=segment_ids,
                 deterministic=deterministic,
                 init_cache=init_cache,
                 output_attentions=output_attentions,
+                output_router_logits=output_router_logits,
                 fcm_mask=fcm_mask,
             )
             hidden_states = layer_outputs[0]
 
             if output_attentions:
-                all_attentions += (layer_outputs[1],)
+                all_self_attns += (layer_outputs[1],)
             if output_router_logits:
                 all_router_logits += (layer_outputs[-1],)
 
-        outputs = (hidden_states, all_hidden_states, all_attentions, all_router_logits)
-
-        return outputs
+        return (
+            hidden_states,
+            all_self_attns,
+            all_hidden_states,
+            all_router_logits,
+        )
 
 
 class FlaxQwen2MoeModule(nn.Module):
@@ -1125,14 +1075,7 @@ class FlaxQwen2MoeModule(nn.Module):
         config = self.config
         self.causal_mask = make_causal_mask(
             jnp.ones(
-                (
-                    1,
-                    getattr(
-                        config,
-                        "mask_max_position_embeddings",
-                        config.max_position_embeddings,
-                    ),
-                ),
+                (1, self.config.granted_mask_max_position_embedding),
                 dtype="bool",
             ),
             dtype="bool",
@@ -1146,13 +1089,7 @@ class FlaxQwen2MoeModule(nn.Module):
                 scaling_factor=scaling_factor, rope_type=scaling_type
             )
         self.frequencies = precompute_frequencies(
-            max_position_embeddings=(
-                getattr(
-                    self.config,
-                    "freq_max_position_embeddings",
-                    self.config.max_position_embeddings,
-                )
-            ),
+            max_position_embeddings=self.config.granted_freq_max_position_embedding,
             dim=config.hidden_size // config.num_attention_heads,
             base=config.rope_theta,
             **initial_rope_kwargs,
@@ -1163,81 +1100,104 @@ class FlaxQwen2MoeModule(nn.Module):
         input_ids: chex.Array,
         attention_mask: chex.Array,
         position_ids: chex.Array,
-        deterministic: bool = True,
-        input_embeds: chex.Array = None,
-        init_cache: bool = False,
-        output_attentions: Optional[bool] = False,
-        output_hidden_states: Optional[bool] = False,
+        segment_ids: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
+        init_cache: bool = False,
+        deterministic: bool = True,
         return_dict: bool = True,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-    ) -> tuple | MoeModelOutput:
+    ) -> MoeModelOutput | Tuple:
+        """
+        Forward pass through the Qwen2Moe module.
 
+        Args:
+            input_ids (chex.Array): Input tensor containing token IDs.
+            attention_mask (chex.Array): Mask for attention.
+            position_ids (chex.Array): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
+            input_embeds (Optional[chex.Array]): Embedded input tensor.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            output_router_logits (Optional[bool]): If True, output router logits.
+            init_cache (bool): If True, initialize cache for decoding.
+            deterministic (bool): If True, disable dropout.
+            return_dict (bool): If True, return a dictionary of outputs.
+
+        Returns:
+            MoeModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
+        """
         if output_router_logits is None:
             output_router_logits = self.config.output_router_logits
-        """
-        The __call__ function is the main function of a Flax model. It takes in input_ids, attention_mask, and position_ids
-        and returns the output of the model. The __call__ function also has optional arguments that can be used to control
-        the behavior of the model (e.g., deterministic=True). These optional arguments are passed as keyword arguments when
-        calling a Flax model.
-
-        :param self: Represent the instance of the class
-        :param input_ids: chex.Array: Pass in the input token ids
-        :param attention_mask: chex.Array: Mask out the padding tokens
-        :param position_ids: chex.Array: Indicate the position of each token in a sequence
-        :param deterministic: bool: Control whether dropout is applied or not
-        :param input_embeds: chex.Array: Pass in the embeddings of the input tokens
-        :param init_cache: bool: Initialize the cache
-        :param output_attentions: bool: Determine whether to return the attentions or not
-        :param output_hidden_states: bool: Determine whether to return hidden states
-        :param return_dict: bool: Return a dictionary of the output or not
-        :param extra_embedding: Optional[Union[jnp.ndarray,None]]:: Pass in the embedding of the
-        :return: A tuple of:
-
-        """
-        if input_embeds is None:
-            input_embeds = self.embed_tokens(input_ids.astype("i4"))
-
-        batch_size, sequence_length, _ = input_embeds.shape
-
-        assert (
-            sequence_length <= self.config.max_position_embeddings
-        ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
-
-        input_embeds = (
-            input_embeds + extra_embedding
-            if extra_embedding is not None
-            else input_embeds
-        )
-
-        hidden_states, all_hidden_states, all_attentions, all_router_logits = (
-            self.layers(
-                hidden_states=input_embeds,
-                frequencies=self.frequencies,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                causal_mask=self.causal_mask,
-                deterministic=deterministic,
-                init_cache=init_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                output_router_logits=output_router_logits,
-                return_dict=return_dict,
+        if input_ids is not None and input_embeds is not None:
+            raise ValueError(
+                "You cannot specify both decoder_input_ids and decoder_input_embeds at the same time"
             )
+
+        if input_embeds is None and input_ids is not None:
+            input_embeds = self.embed_tokens(input_ids.astype("i4"))
+        else:
+            raise ValueError("you should specify input_embeds or input_ids one of them")
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
         )
+        output_router_logits = (
+            output_router_logits
+            if output_router_logits is not None
+            else self.config.output_router_logits
+        )
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+
+        collection_outputs = self.layers(
+            hidden_states=input_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            causal_mask=self.causal_mask,
+            frequencies=self.frequencies,
+            output_attentions=output_attentions,
+            output_router_logits=output_router_logits,
+            output_hidden_states=output_hidden_states,
+            init_cache=init_cache,
+            deterministic=deterministic,
+            segment_ids=segment_ids,
+        )
+        all_self_attns = None
+        all_hidden_states = None
+        all_router_logits = None
+        hidden_states = collection_outputs[0]
+        if output_attentions:
+            all_self_attns = collection_outputs[1]
+        if output_hidden_states:
+            all_hidden_states = collection_outputs[2 if output_attentions else 1]
+        if output_router_logits:
+            all_router_logits = collection_outputs[-1]
 
         hidden_states = self.norm(hidden_states)
 
-        outputs = (hidden_states, all_hidden_states, all_attentions, all_router_logits)
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
         if not return_dict:
-            return tuple(v for v in outputs if v is not None)
-
+            return tuple(
+                v
+                for v in [
+                    hidden_states,
+                    all_hidden_states,
+                    all_self_attns,
+                    all_router_logits,
+                ]
+                if v is not None
+            )
         return MoeModelOutput(
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
-            attentions=all_attentions,
+            attentions=all_self_attns,
             router_logits=all_router_logits,
         )
 
@@ -1253,6 +1213,16 @@ class FlaxQwen2MoeModel(FlaxQwen2MoePreTrainedModel):
 
 
 class FlaxQwen2MoeForCausalLMModule(nn.Module):
+    """
+    Qwen2Moe model for causal language modeling, including the language model head.
+
+    Attributes:
+        config (Qwen2MoeConfig): Configuration object with model hyperparameters.
+        dtype (jnp.dtype): Data type for the computations.
+        param_dtype (jnp.dtype): Data type for the model parameters.
+        precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
+    """
+
     config: Qwen2MoeConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -1281,37 +1251,35 @@ class FlaxQwen2MoeForCausalLMModule(nn.Module):
     def __call__(
         self,
         input_ids: chex.Array,
-        attention_mask: chex.Array = None,
-        position_ids: chex.Array = None,
-        deterministic: bool = True,
-        init_cache: bool = False,
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
+        init_cache: bool = False,
+        deterministic: bool = True,
         return_dict: bool = True,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-    ):
-        """The __call__ function is the main function of a Flax module. It takes in inputs and returns outputs.
+    ) -> MoeCausalLMOutput | Tuple:
+        """
+        Forward pass through the Qwen2Moe module.
 
         Args:
-            self: Refer to the object itself
-            input_ids: chex.Array: Pass the input token ids to the model
-            attention_mask: chex.Array: Mask out the padding tokens
-            position_ids: chex.Array: Specify the position of each token
-                in the input sequence
-            deterministic: bool: Control whether the model is trained or
-                not
-            init_cache: bool: Initialize the cache for the decoder
-            output_attentions: bool: Return the attention weights
-            output_hidden_states: bool: Determine whether to return the
-                hidden states
-            return_dict: bool: Return a dictionary of the outputs or not
-            extra_embedding: Optional[Union[jnp.ndarray]]: Pass in the
-                embedding of the word that we want to predict
-            None]]: Pass in the extra embedding
+            input_ids (chex.Array): Input tensor containing token IDs.
+            attention_mask (chex.Array): Mask for attention.
+            position_ids (chex.Array): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
+            input_embeds (Optional[chex.Array]): Embedded input tensor.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            output_router_logits (Optional[bool]): If True, output router logits.
+            init_cache (bool): If True, initialize cache for decoding.
+            deterministic (bool): If True, disable dropout.
+            return_dict (bool): If True, return a dictionary of outputs.
 
         Returns:
-            The logits and the hidden states
+            MoeCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
         """
         if output_router_logits is None:
             output_router_logits = self.config.output_router_logits
@@ -1323,12 +1291,14 @@ class FlaxQwen2MoeForCausalLMModule(nn.Module):
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            input_embeds=input_embeds,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
             init_cache=init_cache,
             deterministic=deterministic,
             return_dict=True,
+            segment_ids=segment_ids,
         )
         hidden_states = outputs.last_hidden_state
         if self.config.tie_word_embeddings:
@@ -1475,59 +1445,54 @@ class FlaxQwen2MoeForSequenceClassificationModule(nn.Module):
     def __call__(
         self,
         input_ids: chex.Array,
-        attention_mask: chex.Array = None,
-        position_ids: chex.Array = None,
-        deterministic: bool = True,
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_router_logits: Optional[bool] = None,
         init_cache: bool = False,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
+        deterministic: bool = True,
         return_dict: bool = True,
-        extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-    ):
-        """The __call__ function is the main function of a Flax module.
-        It takes in all the inputs to the model and returns all outputs from it.
-        The __call__ function can be called directly on an instance of a class, or by using parentheses after an instance:
-            &gt;&gt;&gt; my_model = MyModel()  # instantiate your model class
-            &gt;&gt;&gt; output = my_model(input)  # call your model with input data as arguments to __call__
+    ) -> MoeCausalLMOutput | Tuple:
+        """
+        Forward pass through the Qwen2Moe module.
 
         Args:
-            self: Refer to the class instance
-            input_ids: chex.Array: Pass the input to the model
-            attention_mask: chex.Array: Specify which tokens are masked
-            position_ids: chex.Array: Specify the position of each token
-                in the sequence
-            deterministic: bool: Control whether the model is run in
-                deterministic or stochastic mode
-            init_cache: bool: Initialize the cache for the transformer
-            output_attentions: bool: Return the attention weights
-            output_hidden_states: bool: Return the hidden states of all
-                layers
-            return_dict: bool: Return a dictionary of outputs
-            extra_embedding: Optional[Union[jnp.ndarray]]: Pass in the
-                embedding of a new word
-            None]]: Pass the extra embedding to the model
+            input_ids (chex.Array): Input tensor containing token IDs.
+            attention_mask (chex.Array): Mask for attention.
+            position_ids (chex.Array): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
+            input_embeds (Optional[chex.Array]): Embedded input tensor.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            output_router_logits (Optional[bool]): If True, output router logits.
+            init_cache (bool): If True, initialize cache for decoding.
+            deterministic (bool): If True, disable dropout.
+            return_dict (bool): If True, return a dictionary of outputs.
 
         Returns:
-            A tuple of logits and hidden_states
+            MoeCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
         """
-        batch_size, seq_length = input_ids.shape
-        if attention_mask is None:
-            attention_mask = jnp.ones_like(input_ids)
-        if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-                (batch_size, seq_length),
-            )
+        if output_router_logits is None:
+            output_router_logits = self.config.output_router_logits
+        if output_hidden_states is None:
+            output_hidden_states = self.config.output_hidden_states
+        if output_attentions is None:
+            output_attentions = self.config.output_attentions
         outputs = self.model(
-            input_ids,
-            attention_mask,
-            position_ids,
-            deterministic=deterministic,
-            init_cache=init_cache,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            input_embeds=input_embeds,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            extra_embedding=extra_embedding,
+            output_router_logits=output_router_logits,
+            init_cache=init_cache,
+            deterministic=deterministic,
+            return_dict=True,
+            segment_ids=segment_ids,
         )
 
         hidden_states = outputs[0]

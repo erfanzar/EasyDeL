@@ -451,72 +451,121 @@ class EDPretrainedConfig(PretrainedConfig):
         flash_attention_backward_pass_impl: Literal["triton", "xla"] = ...,
         attn_dtype: jnp.dtype = ...,
     ):
-        """It initializes all the attributes of an object, and it's called when you create a new instance of that class.
+        """
+        It initializes all the attributes of an object, and it's called when you create a new instance of that class.
 
         Args:
-            self: Refer to the instance of the class
-            axis_dims: Sequence[int]: Specify the number of dimensions
-                for each axis
-            axis_names: Sequence[str]: Set the names of the axes
-            attn_mechanism: Literal["vanilla", "flash", "splash"]:
-                attention mechanism to use
-            block_k: int: block size of key_states
-            block_q: int: block size of query_states
-            block_b: int: block size of bias
-            block_k_major: int: block size if key major
-            block_q_major_dkv: int: block size of block_q_major_dkv
-            block_k_major_dkv: int: block size of block_k_major_dkv
-            block_k_dkv: int: block size of block_k_dkv
-            block_q_dkv: int: block size of block_q_dkv
-            block_k_major_dq: int: block size of block_k_major_dq
-            block_k_dq: int: block size of block_k_dq
+            axis_dims (Sequence[int]): Specify the number of dimensions for each axis
+            axis_names (Sequence[str]): Set the names of the axes
+            attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS): attention mechanism to use
+            block_k (int): block size of key_states
+            block_q (int): block size of query_states
+            block_b (int): block size of bias
+            block_k_major (int): block size if key major
+            block_q_major_dkv (int): block size of block_q_major_dkv
+            block_k_major_dkv (int): block size of block_k_major_dkv
+            block_k_dkv (int): block size of block_k_dkv
+            block_q_dkv (int): block size of block_q_dkv
+            block_k_major_dq (int): block size of block_k_major_dq
+            block_k_dq (int): block size of block_k_dq
             block_q_dq: int: block size of block_q_dq
-
             partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
-            shard_attention_computation: bool: whenever to use shard_map
-                for attention
-            use_sharded_kv_caching: bool: whenever to use shard_map and
-                sharding for key and value
-            backend: Optional[None]: Specify the backend to use
-            easy_method: Literal["train", "serve", "convert"]: easydel
-                Quantization Method to be applied for
-            bits: Optional[int]: Model bits for quantization
-            use_sharding_constraint: bool: whether to use sharding
-                constraint for the arrays
-            scan_ring_attention: bool: Whether to use can for ring
-                attention
-            scan_attention_layers: bool: Whether to use can for
-                attention layers
-            use_scan_mlp: bool: Determine whether to use scan_mlp or not
-            scan_mlp_chunk_size: int: Size of chunks in scan MLP.
-            attention_axis_name: str: Name of the attention axis name
-            quantize_kv_cache: bool: Whether to quantize Key/Value in
-                attention for generation process.
-            flash_attention_backward_pass_impl: Literal["triton", "xla"]: Specify the backward pass kernel for flash attention
-        in generation process
-        in generation process
+            shard_attention_computation (bool): whenever to use shard_map for attention
+            use_sharded_kv_caching (bool): whenever to use shard_map and sharding for key and value
+            backend (Optional[None]): Specify the backend to use
+            easy_method (Literal["train", "serve", "convert"]): easydel Quantization Method to be applied for
+            bits (Optional[int]): Model bits for quantization
+            use_sharding_constraint (bool): whether to use sharding constraint for the arrays
+            scan_ring_attention (bool): Whether to use can for ring attention
+            scan_attention_layers (bool): Whether to use can for attention layers
+            use_scan_mlp (bool): Determine whether to use scan_mlp or not
+            scan_mlp_chunk_size (int): Size of chunks in scan MLP.
+            attention_axis_name (str): Name of the attention axis name
+            quantize_kv_cache (bool): Whether to quantize Key/Value in attention for generation process.
+            flash_attention_backward_pass_impl (Literal["triton", "xla"]): Specify the backward pass kernel for flash attention
         """
-        set_attrs_smartly(self, "axis_dims", (1, -1, 1, 1), axis_dims)
-        set_attrs_smartly(self, "axis_names", ("dp", "fsdp", "tp", "sp"), axis_names)
-
-        set_attrs_smartly(self, "block_q", 1024, block_q)
-        set_attrs_smartly(self, "block_k", 1024, block_k)
-        set_attrs_smartly(self, "block_b", 1024, block_b)
-
-        set_attrs_smartly(self, "partition_axis", PartitionAxis(), partition_axis)
+        set_attrs_smartly(
+            self,
+            "axis_dims",
+            (1, -1, 1, 1),
+            axis_dims,
+        )
+        set_attrs_smartly(
+            self,
+            "axis_names",
+            ("dp", "fsdp", "tp", "sp"),
+            axis_names,
+        )
 
         set_attrs_smartly(
-            self, "use_sharding_constraint", False, use_sharding_constraint
+            self,
+            "block_q",
+            1024,
+            block_q,
         )
-        set_attrs_smartly(self, "backend", jax.default_backend(), backend)
         set_attrs_smartly(
-            self, "shard_attention_computation", True, shard_attention_computation
+            self,
+            "block_k",
+            1024,
+            block_k,
         )
-        set_attrs_smartly(self, "use_sharded_kv_caching", True, use_sharded_kv_caching)
-        set_attrs_smartly(self, "attn_mechanism", "sharded_vanilla", attn_mechanism)
+        set_attrs_smartly(
+            self,
+            "block_b",
+            1024,
+            block_b,
+        )
 
-        set_attrs_smartly(self, "block_k_dkv", block_k_dkv or self.block_k, block_k_dkv)
-        set_attrs_smartly(self, "block_q_dkv", block_q_dkv or self.block_q, block_q_dkv)
+        set_attrs_smartly(
+            self,
+            "partition_axis",
+            PartitionAxis(),
+            partition_axis,
+        )
+
+        set_attrs_smartly(
+            self,
+            "use_sharding_constraint",
+            False,
+            use_sharding_constraint,
+        )
+        set_attrs_smartly(
+            self,
+            "backend",
+            jax.default_backend(),
+            backend,
+        )
+        set_attrs_smartly(
+            self,
+            "shard_attention_computation",
+            True,
+            shard_attention_computation,
+        )
+        set_attrs_smartly(
+            self,
+            "use_sharded_kv_caching",
+            True,
+            use_sharded_kv_caching,
+        )
+        set_attrs_smartly(
+            self,
+            "attn_mechanism",
+            "sharded_vanilla",
+            attn_mechanism,
+        )
+
+        set_attrs_smartly(
+            self,
+            "block_k_dkv",
+            block_k_dkv or self.block_k,
+            block_k_dkv,
+        )
+        set_attrs_smartly(
+            self,
+            "block_q_dkv",
+            block_q_dkv or self.block_q,
+            block_q_dkv,
+        )
 
         set_attrs_smartly(
             self,
@@ -532,23 +581,79 @@ class EDPretrainedConfig(PretrainedConfig):
         )
 
         set_attrs_smartly(
-            self, "block_k_major", block_k_major or self.block_k, block_k_major
+            self,
+            "block_k_major",
+            block_k_major or self.block_k,
+            block_k_major,
         )
         set_attrs_smartly(
-            self, "block_k_major_dq", block_k_major_dq or self.block_k, block_k_major_dq
+            self,
+            "block_k_major_dq",
+            block_k_major_dq or self.block_k,
+            block_k_major_dq,
         )
 
-        set_attrs_smartly(self, "block_k_dq", block_k_dq or self.block_k, block_k_dq)
-        set_attrs_smartly(self, "block_q_dq", block_q_dq or self.block_q, block_q_dq)
+        set_attrs_smartly(
+            self,
+            "block_k_dq",
+            block_k_dq or self.block_k,
+            block_k_dq,
+        )
+        set_attrs_smartly(
+            self,
+            "block_q_dq",
+            block_q_dq or self.block_q,
+            block_q_dq,
+        )
 
-        set_attrs_smartly(self, "easy_method", EasyMethod.TRAIN, easy_method)
-        set_attrs_smartly(self, "bits", None, bits)
-        set_attrs_smartly(self, "scan_attention_layers", True, scan_attention_layers)
-        set_attrs_smartly(self, "scan_ring_attention", True, scan_ring_attention)
-        set_attrs_smartly(self, "use_scan_mlp", True, use_scan_mlp)
-        set_attrs_smartly(self, "scan_mlp_chunk_size", 1024, scan_mlp_chunk_size)
-        set_attrs_smartly(self, "attention_axis_name", "sp", attention_axis_name)
-        set_attrs_smartly(self, "quantize_kv_cache", False, quantize_kv_cache)
+        set_attrs_smartly(
+            self,
+            "easy_method",
+            EasyMethod.TRAIN,
+            easy_method,
+        )
+        set_attrs_smartly(
+            self,
+            "bits",
+            None,
+            bits,
+        )
+        set_attrs_smartly(
+            self,
+            "scan_attention_layers",
+            True,
+            scan_attention_layers,
+        )
+        set_attrs_smartly(
+            self,
+            "scan_ring_attention",
+            True,
+            scan_ring_attention,
+        )
+        set_attrs_smartly(
+            self,
+            "use_scan_mlp",
+            True,
+            use_scan_mlp,
+        )
+        set_attrs_smartly(
+            self,
+            "scan_mlp_chunk_size",
+            1024,
+            scan_mlp_chunk_size,
+        )
+        set_attrs_smartly(
+            self,
+            "attention_axis_name",
+            "sp",
+            attention_axis_name,
+        )
+        set_attrs_smartly(
+            self,
+            "quantize_kv_cache",
+            False,
+            quantize_kv_cache,
+        )
         set_attrs_smartly(
             self,
             "flash_attention_backward_pass_impl",

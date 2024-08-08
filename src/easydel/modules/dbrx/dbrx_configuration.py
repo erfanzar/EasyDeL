@@ -208,6 +208,7 @@ class DbrxConfig(EDPretrainedConfig):
         initializer_range: float = 0.02,
         output_router_logits: bool = False,
         router_aux_loss_coef: float = 0.05,
+        gradient_checkpointing: str = "nothing_saveable",
         **kwargs: Any,
     ):
         if attn_config is None:
@@ -235,6 +236,7 @@ class DbrxConfig(EDPretrainedConfig):
         self.initializer_range = initializer_range
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
+        self.gradient_checkpointing = gradient_checkpointing
 
         tie_word_embeddings = kwargs.pop("tie_word_embeddings", False)
         if tie_word_embeddings:

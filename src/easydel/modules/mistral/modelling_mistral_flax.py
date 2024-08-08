@@ -18,7 +18,7 @@ from easydel.etils.etils import get_logger
 from easydel.generation.flax_utils import (
     FlaxLogitsProcessorList,
     FlaxSampleOutput,
-    SampleState,
+    SampleState, 
 )
 from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.common import RMSNorm
@@ -1121,7 +1121,7 @@ class FlaxMistralForCausalLMModule(nn.Module):
         hidden_states = outputs[0]
 
         if self.config.tie_word_embeddings:
-            shared_kernel = self.transformer.variables["params"]["embed_tokens"][
+            shared_kernel = self.model.variables["params"]["embed_tokens"][
                 "embedding"
             ].T.astype(self.param_dtype)
             lm_logits = self.lm_head.apply(
