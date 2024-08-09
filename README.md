@@ -95,6 +95,7 @@ Comprehensive documentation and examples are available at [EasyDeL Documentation
 Here's an improved version of your latest updates:
 
 ## Latest Updates 🔥
+- EXAONE is added.
 - all of the Models have Architecture improvements.
 - Optimized KeyValueCache:
    - Improved performance for `inference`

@@ -243,7 +243,10 @@ class FlaxRobertaSelfAttention(FlaxAttentionModule):
 
         if self.causal and (self.has_variable("cache", "cached_key") or init_cache):
             key_states, value_states, attention_mask = self._concatenate_to_cache(
-                key_states, value_states, query_states, attention_mask
+                key_states,
+                value_states,
+                query_states,
+                attention_mask,
             )
 
         if attention_mask is not None:

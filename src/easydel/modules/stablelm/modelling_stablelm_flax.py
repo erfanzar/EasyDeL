@@ -404,7 +404,10 @@ class FlaxStableLmAttention(FlaxAttentionModule):
             dropout_rng = self.make_rng("dropout")
         if self.has_variable("cache", "cached_key") or init_cache:
             key_states, value_states, attention_mask = self._concatenate_to_cache(
-                key_states, value_states, query_states, attention_mask
+                key_states,
+                value_states,
+                query_states,
+                attention_mask,
             )
 
         key_states, value_states = self.repeat_key_value(

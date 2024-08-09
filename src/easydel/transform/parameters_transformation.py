@@ -117,7 +117,7 @@ def torch_dict_to_easydel_params(
     embedding_layer_names: Optional[List[str]] = None,
     layer_norm_names: Optional[List[str]] = None,
     shard_fns: Optional[Mapping[tuple, Callable]] = None,
-    quantization_method: Optional[Literal["4bit", "8bit"]],
+    quantization_method: Optional[Literal["4bit", "8bit"]] = None,
     params_pattern_selection: Optional[re.Pattern] = None,
     dtype: jax.numpy.dtype = jax.numpy.float16,
     rnn_based_or_rwkv: bool = False,
@@ -158,7 +158,7 @@ def torch_dict_to_easydel_params(
         _clear = torch.cuda.empty_cache if torch.cuda.is_available() else gc.collect
     except ModuleNotFoundError:
         _clear = gc.collect
-    
+
     if quantization_method is not None and quantization_method not in ["4bit", "8bit"]:
         raise ValueError(
             f"Unknown quantized_method {quantization_method}, "

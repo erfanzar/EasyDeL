@@ -27,6 +27,7 @@ import numpy as np
 import torch
 import transformers
 from fjformer.functions import cross_entropy_loss_and_accuracy
+from flax.traverse_util import flatten_dict, unflatten_dict  # noqa
 from jax import numpy as jnp
 
 torch.manual_seed(42)
@@ -96,7 +97,7 @@ class EasyModelsTest(unittest.TestCase):
         self.rope_scaling = None
 
     def create_test_for_models(self, module_name: str, hf_module_class):
-        module_config, module_class, transform_function = ed.get_modules_by_type(
+        (module_config, module_class, transform_function) = ed.get_modules_by_type(
             module_name
         )
         if self.header_config is None:
@@ -108,6 +109,7 @@ class EasyModelsTest(unittest.TestCase):
                 hidden_size=self.hidden_size,
                 num_attention_heads=self.num_attention_heads,
                 num_hidden_layers=self.num_hidden_layers,
+                num_layers=self.num_hidden_layers,
                 gradient_checkpointing=self.gradient_checkpointing,
                 max_position_embeddings=self.max_position_embeddings,
                 num_key_value_heads=self.num_key_value_heads,
@@ -134,6 +136,7 @@ class EasyModelsTest(unittest.TestCase):
 
         hf_model = hf_module_class(config=copy.deepcopy(config))
         hf_model.eval()
+
         params = {
             "params": transform_function(
                 state_dict=hf_model.state_dict(),
@@ -161,14 +164,21 @@ class EasyModelsTest(unittest.TestCase):
                 block_k=self.block_k,
                 block_q=self.block_q,
             )
-            # prm = flax.traverse_util.flatten_dict(params, sep=".")
+            if module_name == "exaone":  # it's EXAONE Issue
+                flatten_params = flatten_dict(params, sep=".")
+                params = {}
+                for k in list(flatten_params.keys()):
+                    params[k.replace("attn.attention", "attn")] = flatten_params[k]
+                params = unflatten_dict(params, sep=".")
 
             torch_input_ids, jax_input_ids = self.make_input_id(
-                self.vocab_size, (self.batch_size, self.sequence_length + 1)
+                self.vocab_size,
+                (self.batch_size, self.sequence_length + 1),
             )
             hf_output = hf_model(
                 input_ids=torch_input_ids[:, :-1],
                 labels=torch_input_ids[:, 1:],
+                past_key_values=None,
             )
             ed_model = module_class(
                 config=config,
@@ -317,45 +327,17 @@ class EasyModelsTest(unittest.TestCase):
             attn_config=ed.MptAttentionConfig(),
         )
         res, err = self.create_test_for_models("mpt", transformers.MptForCausalLM)
+        self.header_config = None
         self.assertTrue(res, f"MPT model Failed [ERROR {err}]")
 
     def test_falcon(self):
-        # conf = transformers.AutoConfig.from_pretrained(
-        #     "tiiuae/falcon-11B", trust_remote_code=True
-        # )
-        # for k, v in self.__dict__.items():
-        #     if isinstance(
-        #         v,
-        #         (
-        #             bool,
-        #             str,
-        #             float,
-        #             type(None),
-        #             int,
-        #         ),
-        #     ):
-        #         try:
-        #             setattr(conf, k, v)
-        #         except:  # noqa
-        #             ...
-        # conf.ffn_hidden_size = self.hidden_size * 2
-        # conf.ff_factor = 2
-
-        # res, err = self.create_test_for_models(
-        #     "falcon",
-        #     type(
-        #         transformers.AutoModelForCausalLM.from_config(
-        #             conf,
-        #             trust_remote_code=True,
-        #         )
-        #     ),
-        # )
-
+        # hf_model, conf = self.get_hf_model_from_hub("tiiuae/falcon-11B")
         self.header_config = None
         res, err = self.create_test_for_models(
             "falcon",
             transformers.FalconForCausalLM,
         )
+        self.header_config = None
         self.assertTrue(res, f"Falcon model Failed [ERROR {err}]")
 
     def test_mistral(self):
@@ -364,6 +346,13 @@ class EasyModelsTest(unittest.TestCase):
             "mistral", transformers.MistralForCausalLM
         )
         self.assertTrue(res, f"Mistral model Failed [ERROR {err}]")
+
+    def test_exaone(self):
+        hf_model, conf = self.get_hf_model_from_hub(
+            "LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct"
+        )
+        res, err = self.create_test_for_models("exaone", hf_model)
+        self.assertTrue(res, f"EXAONE model Failed [ERROR {err}]")
 
     def test_mixtral(self):
         self.header_config = None
@@ -388,21 +377,8 @@ class EasyModelsTest(unittest.TestCase):
         self.assertTrue(res, f"Qwen 2 model Failed [ERROR {err}]")
 
     def test_qwen1(self):
-        conf = transformers.AutoConfig.from_pretrained(
-            "Qwen/Qwen1-7B-Chat", trust_remote_code=True
-        )
-        for k, v in self.__dict__.items():
-            if isinstance(v, (bool, str, float, type(None), int)):
-                setattr(conf, k, v)
-        res, err = self.create_test_for_models(
-            "qwen",
-            type(
-                transformers.AutoModelForCausalLM.from_config(
-                    conf,
-                    trust_remote_code=True,
-                )
-            ),
-        )
+        hf_model, conf = self.get_hf_model_from_hub("Qwen/Qwen1-7B-Chat")
+        res, err = self.create_test_for_models("qwen", hf_model)
         self.assertTrue(res, f"Qwen model Failed [ERROR {err}]")
 
     def test_olmo(self):
@@ -470,101 +446,33 @@ class EasyModelsTest(unittest.TestCase):
         self.assertTrue(res, f"StableLM model Failed [ERROR {err}]")
 
     def test_phi3(self):
-        conf = transformers.AutoConfig.from_pretrained(
-            "microsoft/Phi-3-mini-128k-instruct", trust_remote_code=True
+        hf_model, conf = self.get_hf_model_from_hub(
+            "microsoft/Phi-3-mini-128k-instruct"
         )
-        for k, v in self.__dict__.items():
-            if isinstance(v, (bool, str, float, type(None), int)):
-                setattr(conf, k, v)
-        res, err = self.create_test_for_models(
-            "phi3",
-            type(
-                transformers.AutoModelForCausalLM.from_config(
-                    conf,
-                    trust_remote_code=True,
-                )
-            ),
-        )
-
+        res, err = self.create_test_for_models("phi3", hf_model)
         self.assertTrue(res, f"PHI3 model Failed [ERROR {err}]")
 
     def test_deepseek_v2(self):
-        conf = transformers.AutoConfig.from_pretrained(
-            "deepseek-ai/DeepSeek-V2", trust_remote_code=True
-        )
-        for k, v in self.__dict__.items():
-            if isinstance(
-                v,
-                (
-                    bool,
-                    str,
-                    float,
-                    type(None),
-                    int,
-                ),
-            ):
-                setattr(conf, k, v)
-        conf._attn_implementation = "eager"
-        res, err = self.create_test_for_models(
-            "deepseek_v2",
-            type(
-                transformers.AutoModelForCausalLM.from_config(
-                    conf,
-                    trust_remote_code=True,
-                )
-            ),
-        )
+        hf_model, conf = self.get_hf_model_from_hub("deepseek-ai/DeepSeek-V2")
+        res, err = self.create_test_for_models("deepseek_v2", hf_model)
 
-        self.assertTrue(res, f"PHI3 model Failed [ERROR {err}]")
+        self.assertTrue(res, f"DeepSeekv2 model Failed [ERROR {err}]")
 
     def test_openelm(self):
-        conf = transformers.AutoConfig.from_pretrained(
-            "apple/OpenELM-270M-Instruct", trust_remote_code=True
-        )
-        from easydel import OpenELMConfig
-
-        conf_f = OpenELMConfig()
+        hf_model, conf = self.get_hf_model_from_hub("apple/OpenELM-270M-Instruct")
+        conf_f = ed.OpenELMConfig()
         for k, v in conf.__dict__.items():
             setattr(conf_f, k, v)
         self.header_config = conf_f
-        res, err = self.create_test_for_models(
-            "openelm",
-            type(
-                transformers.AutoModelForCausalLM.from_config(
-                    conf,
-                    trust_remote_code=True,
-                )
-            ),
-        )
+        res, err = self.create_test_for_models("openelm", hf_model)
         self.header_config = None
         self.assertTrue(res, f"OpenELM model Failed [ERROR {err}]")
 
     def test_arctic(self):
-        conf = transformers.AutoConfig.from_pretrained(
-            "Snowflake/snowflake-arctic-instruct", trust_remote_code=True
+        hf_model, conf = self.get_hf_model_from_hub(
+            "Snowflake/snowflake-arctic-instruct"
         )
-        for k, v in self.__dict__.items():
-            if isinstance(
-                v,
-                (
-                    bool,
-                    str,
-                    float,
-                    type(None),
-                    int,
-                ),
-            ):
-                setattr(conf, k, v)
-        res, err = self.create_test_for_models(
-            "arctic",
-            type(
-                transformers.AutoModelForCausalLM.from_config(
-                    conf,
-                    trust_remote_code=True,
-                )
-            ),
-        )
-
+        res, err = self.create_test_for_models("arctic", hf_model)
         self.assertTrue(res, f"ARCTIC model Failed [ERROR {err}]")
 
     def test_rwkv(self):
@@ -619,8 +527,6 @@ class EasyModelsTest(unittest.TestCase):
         self.header_config = ed.Gemma2Config(
             32000, 128, 256, 4, 8, 4, 128 // 8, use_scan_mlp=False
         )
-        # self.sequence_length=8
-        # self.max_position_embeddings=16
         res, err = self.create_test_for_models("gemma2", transformers.Gemma2ForCausalLM)
         self.assertTrue(res, f"Gemma2 model Failed [ERROR {err}]")
 
@@ -665,6 +571,7 @@ class EasyModelsTest(unittest.TestCase):
             attn_config=ed.DbrxAttentionConfig(),
         )
         res = self.create_moe_test_for_models("dbrx", transformers.DbrxForCausalLM)
+        self.header_config = None
         self.assertTrue(res)
 
     @staticmethod
@@ -707,6 +614,23 @@ class EasyModelsTest(unittest.TestCase):
             jnp.asarray(np_input_ids, dtype="i4"),
         )
 
+    def get_hf_model_from_hub(self, repo_id):
+        conf = transformers.AutoConfig.from_pretrained(
+            repo_id,
+            trust_remote_code=True,
+        )
+        for k, v in self.__dict__.items():
+            if isinstance(v, (bool, str, float, type(None), int)):
+                setattr(conf, k, v)
+        model = type(
+            transformers.AutoModelForCausalLM.from_config(
+                conf,
+                trust_remote_code=True,
+            )
+        )
+
+        return model, conf
+
 
 if __name__ == "__main__":
     # unittest.main()
@@ -730,3 +654,4 @@ if __name__ == "__main__":
     # test.test_xerxes()  # Passed v0.0.80
     # test.test_qwen2_moe()  # Passed v0.0.80
     # test.test_stablelm()  # Passed v0.0.80
+    test.test_exaone()

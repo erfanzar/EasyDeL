@@ -200,6 +200,13 @@ from easydel.modules.t5 import (
     FlaxT5Model as FlaxT5Model,
     T5Config as T5Config,
 )
+from easydel.modules.exaone.modeling_exaone_flax import (
+    ExaoneConfig as ExaoneConfig,
+    FlaxExaoneForCausalLM as FlaxExaoneForCausalLM,
+    FlaxExaoneForCausalLMModule as FlaxExaoneForCausalLMModule,
+    FlaxExaoneModel as FlaxExaoneModel,
+    FlaxExaoneModule as FlaxExaoneModule,
+)
 from easydel.modules.whisper import (
     FlaxWhisperForAudioClassification as FlaxWhisperForAudioClassification,
     FlaxWhisperForConditionalGeneration as FlaxWhisperForConditionalGeneration,
