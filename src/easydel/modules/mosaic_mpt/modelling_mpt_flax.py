@@ -203,7 +203,10 @@ class FlaxMptAttention(FlaxAttentionModule):
 
         if self.has_variable("cache", "cached_key") or init_cache:
             key_states, value_states, attention_mask = self._concatenate_to_cache(
-                key_states, value_states, query_states, attention_mask
+                key_states,
+                value_states,
+                query_states,
+                attention_mask,
             )
         if position_bias is not None:
             key_length = key_states.shape[1]

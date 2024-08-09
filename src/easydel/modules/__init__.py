@@ -175,3 +175,11 @@ from easydel.modules.xerxes import (
     FlaxXerxesForCausalLM as FlaxXerxesForCausalLM,
     FlaxXerxesModel as FlaxXerxesModel,
 )
+
+from easydel.modules.exaone.modeling_exaone_flax import (
+    ExaoneConfig as ExaoneConfig,
+    FlaxExaoneForCausalLM as FlaxExaoneForCausalLM,
+    FlaxExaoneForCausalLMModule as FlaxExaoneForCausalLMModule,
+    FlaxExaoneModel as FlaxExaoneModel,
+    FlaxExaoneModule as FlaxExaoneModule,
+)

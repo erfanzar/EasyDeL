@@ -8,7 +8,8 @@ import jax.lax
 from chex import Array
 from flax import linen as nn
 from flax.core import FrozenDict, freeze, unfreeze
-from flax.linen import Dense, combine_masks, partitioning as nn_partitioning
+from flax.linen import Dense, combine_masks
+from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax import numpy as jnp
@@ -288,7 +289,10 @@ class FlaxPhi3Attention(FlaxAttentionModule):
 
         if self.has_variable("cache", "cached_key") or init_cache:
             key_states, value_states, attention_mask = self._concatenate_to_cache(
-                key_states, value_states, query_states, attention_mask
+                key_states,
+                value_states,
+                query_states,
+                attention_mask,
             )
 
         key_states, value_states = self.repeat_key_value(

@@ -82,6 +82,12 @@ CAUSAL_LANGUAGE_MODELS_CONFIG: Dict[str, Tuple[str, str, str, Dict[str, Any]]] =
         "FlaxMistralForCausalLM",
         {"embedding_layer_names": ["embed_tokens"]},
     ),
+    "exaone": (
+        "easydel.modules.exaone",
+        "ExaoneConfig",
+        "FlaxExaoneForCausalLM",
+        {"embedding_layer_names": ["wte"]},
+    ),
     "gptj": (
         "easydel.modules.gpt_j",
         "GPTJConfig",
