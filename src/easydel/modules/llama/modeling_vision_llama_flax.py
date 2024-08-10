@@ -19,7 +19,7 @@ from transformers.generation.flax_utils import (
 )
 
 from easydel.etils.etils import get_logger
-from easydel.modules.llama.modelling_llama_flax import (
+from easydel.modules.llama.modeling_llama_flax import (
     FlaxLlamaBlockCollection,
     RMSNorm,
     precompute_frequencies,

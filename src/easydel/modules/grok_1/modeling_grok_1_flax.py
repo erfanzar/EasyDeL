@@ -2,19 +2,20 @@ import math
 from typing import Optional, Tuple, Union
 
 import chex
-import flax.linen
+import flax.linen.partitioning
+import flax.struct
 import jax
 import jax.numpy as jnp
+from fjformer.functions import auxiliary_load_balancing_loss_func
 from flax import linen as nn
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import Dense, combine_masks
-from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
 
 from easydel.modules.attention_module import FlexibleAttentionModule
-from easydel.modules.common import RMSNorm
+from easydel.modules.common import RMSNorm as FlaxGrok1RMSNorm
 
 # easydel.modules
 from easydel.modules.flax_modeling_utils import (
@@ -27,16 +28,28 @@ from easydel.modules.flax_modeling_utils import (
     precompute_frequencies,
     with_sharding_constraint,
 )
-from easydel.modules.llama.llama_configuration import LlamaConfig as LlamaConfig
-from easydel.modules.modeling_flax_outputs import (
-    FlaxBaseModelOutput,
-    FlaxCausalLMOutput,
-    FlaxSequenceClassifierOutput,
-)
+from easydel.modules.grok_1.grok_1_configuration import Grok1Config as Grok1Config
+from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
 from easydel.modules.modeling_utils import EDPretrainedModel
 
+re_mat = flax.linen.partitioning.remat
 
-class FlaxLlamaEmbedding(nn.Module):
+
+@flax.struct.dataclass
+class MoeModelOutput:
+    last_hidden_state: chex.Array = None
+    hidden_states: Optional[Tuple[chex.Array]] = None
+    attentions: Optional[Tuple[chex.Array]] = None
+    router_logits: Optional[Tuple[chex.Array]] = None
+
+
+@flax.struct.dataclass
+class MoeCausalLMOutput(FlaxMaskedLMOutput):
+    aux_loss: Optional[chex.Array] = None
+    router_logits: Optional[Tuple[chex.Array]] = None
+
+
+class FlaxGrok1Embedding(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
     def __call__(self, query, key, frequencies, position_ids):
@@ -51,18 +64,8 @@ class FlaxLlamaEmbedding(nn.Module):
         return query.astype(self.dtype), key.astype(self.dtype)
 
 
-class FlaxLlamaAttention(FlaxAttentionModule):
-    """
-    FlaxLlamaAttention implements an attention mechanism with rotary embeddings.
-
-    Attributes:
-        config (LlamaConfig): Configuration for the attention module.
-        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
-        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
-        precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
-    """
-
-    config: LlamaConfig
+class FlaxGrok1Attention(FlaxAttentionModule):
+    config: Grok1Config
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
@@ -81,7 +84,7 @@ class FlaxLlamaAttention(FlaxAttentionModule):
             config.num_attention_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            use_bias=self.config.attention_bias,
+            use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
@@ -90,7 +93,7 @@ class FlaxLlamaAttention(FlaxAttentionModule):
             config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            use_bias=self.config.attention_bias,
+            use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
@@ -99,7 +102,7 @@ class FlaxLlamaAttention(FlaxAttentionModule):
             config.num_key_value_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            use_bias=self.config.attention_bias,
+            use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
@@ -114,18 +117,17 @@ class FlaxLlamaAttention(FlaxAttentionModule):
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
-        self.rotary = FlaxLlamaEmbedding(self.dtype)
+        self.rotary = FlaxGrok1Embedding(self.dtype)
         self.attention_performer = FlexibleAttentionModule(
-            attention_dropout=self.config.attention_dropout,
             num_attention_heads=self.config.num_attention_heads,
+            attention_dropout=self.config.attention_dropout,
             head_dims=self.head_dim,
+            shard_attention_computation=self.config.shard_attention_computation,
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
-            dtype=self.config.attn_dtype,
             mesh=self.config.mesh,
             sm_scale=1 / math.sqrt(self.head_dim),
-            axis_name=self.config.attention_axis_name,
             base_config=self.config,
         )
         self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
@@ -140,7 +142,7 @@ class FlaxLlamaAttention(FlaxAttentionModule):
         Returns:
             chex.Array: The hidden states with merged head dimensions.
         """
-        return hidden_states.reshape(hidden_states.shape[:2] + (-1,))
+        return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
     def apply_rotary(self, query, key, frequencies, position_ids):
         """
@@ -199,7 +201,7 @@ class FlaxLlamaAttention(FlaxAttentionModule):
             Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
         """
         batch_size, sequence_length = hidden_states.shape[:2]
-        (query_states, key_states, value_states) = (
+        query_states, key_states, value_states = (
             self.q_proj(hidden_states),
             self.k_proj(hidden_states),
             self.v_proj(hidden_states),
@@ -265,18 +267,12 @@ class FlaxLlamaAttention(FlaxAttentionModule):
                 query_states,
                 attention_mask,
             )
-        key_states, value_states = self.repeat_key_value(
-            key_states, value_states, self.num_key_value_groups
-        )
-        assert_msg = (
-            "num_attention_heads repeat wont work likely\n"
-            f"INFO :\n\trepeat_key_values Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
-            f"NH : {self.config.num_attention_heads} KVH : {self.config.num_attention_heads}"
-        )
 
-        assert query_states.shape[-2] == self.config.num_attention_heads, assert_msg
-        assert key_states.shape[-2] == self.config.num_attention_heads, assert_msg
-        assert value_states.shape[-2] == self.config.num_attention_heads, assert_msg
+        key_states, value_states = self.repeat_key_value(
+            key_states,
+            value_states,
+            self.num_key_value_groups,
+        )
 
         attention_bias = lax.select(
             attention_mask > 0,
@@ -329,8 +325,8 @@ class FlaxLlamaAttention(FlaxAttentionModule):
         return outputs
 
 
-class FlaxLlamaMLP(nn.Module):
-    config: LlamaConfig
+class FlaxGrok1BLockSparseMLP(nn.Module):
+    config: Grok1Config
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
@@ -338,34 +334,33 @@ class FlaxLlamaMLP(nn.Module):
     def setup(self) -> None:
         config = self.config
 
-        self.gate_proj = Dense(
+        self.linear = Dense(
             config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            use_bias=self.config.mlp_bias,
+            use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
-        self.down_proj = Dense(
+        self.linear_1 = Dense(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            use_bias=self.config.mlp_bias,
+            use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
-        self.up_proj = Dense(
+        self.linear_v = Dense(
             config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            use_bias=self.config.mlp_bias,
+            use_bias=False,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
-        self.dropout = flax.linen.Dropout(rate=self.config.resid_pdrop)
 
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
         """The __call__ function is the main function of a class.
@@ -375,7 +370,8 @@ class FlaxLlamaMLP(nn.Module):
         Args:
             self: Represent the instance of the class
             x: jnp.ndarray: Pass in the input to the layer
-            deterministic: bool: Determine whether to use dropout
+            deterministic: bool: Determine whether to use dropout #
+                IGNORED
 
         Returns:
             A tensor that is the result of applying a dropout function
@@ -383,59 +379,188 @@ class FlaxLlamaMLP(nn.Module):
         """
 
         x = control_mlp_sharding(x, self.config.partition_axis)
-        x = self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
-        x = self.dropout(x, deterministic=deterministic)
-        return x
+        return self.linear_1(nn.gelu(self.linear(x)) * self.linear_v(x))
 
 
-class FlaxLlamaBlock(nn.Module):
-    config: LlamaConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+class FlaxGrok1BlocKSparesTop2MLPCollection(nn.Module):
+    config: Grok1Config
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
+    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
 
     def setup(self) -> None:
-        attn_block = FlaxLlamaAttention
+        self.layers = [
+            FlaxGrok1BLockSparseMLP(
+                config=self.config,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                precision=self.precision,
+                name=str(i),
+            )
+            for i in range(self.config.num_experts)
+        ]
+
+    def __call__(
+        self,
+        selected_experts: chex.Array,
+        hidden_states: chex.Array,
+        routing_weights: chex.Array,
+        batch_size: int,
+        sequence_length: int,
+        hidden_dim: int,
+    ) -> chex.Array:
+        final_hidden_state = jnp.zeros_like(hidden_states)
+
+        for index in range(self.config.num_experts):
+            expert_layer_output = (
+                block_wise_ffn(
+                    self.layers[index],
+                    hidden_states,
+                    self.config.scan_mlp_chunk_size,
+                    False,
+                )
+                if self.config.use_scan_mlp
+                else self.layers[index](hidden_states)
+            )
+            expert_layer_output_exp = (
+                jnp.sum(
+                    jnp.multiply(selected_experts == index, routing_weights), axis=-1
+                )[:, :, None]
+                * expert_layer_output
+            )
+            final_hidden_state += expert_layer_output_exp
+        return final_hidden_state
+
+
+class FlaxGrok1SparseMoeBlock(nn.Module):
+    """This implementation is
+    strictly equivalent to standard MoE with full capacity (no
+    dropped tokens). It's faster since it formulates MoE operations
+    in terms of block-sparse operations to accomodate imbalanced
+    assignments of tokens to experts, whereas standard MoE either
+    (1) drop tokens at the cost of reduced performance or (2) set
+    capacity factor to number of experts and thus waste computation
+    and memory on padding.
+    """
+
+    config: Grok1Config
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
+    precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision("fastest")
+
+    def setup(self) -> None:
+        self.gate = Dense(
+            self.config.num_experts,
+            use_bias=False,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+            kernel_init=nn.initializers.normal(),
+        )
+
+        self.experts = FlaxGrok1BlocKSparesTop2MLPCollection(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+        )
+
+    def __call__(
+        self, hidden_states: chex.Array, e: bool = False  # Ignored
+    ) -> Tuple[chex.Array, chex.Array]:
+        hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+
+        router_logits = self.gate(hidden_states).astype(
+            jnp.promote_types(self.dtype, jnp.float32)
+        )
+        routing_weights, selected_experts = jax.lax.top_k(
+            router_logits, k=self.config.num_experts_per_tok
+        )
+        routing_weights = jax.nn.softmax(
+            routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=-1
+        )
+
+        return (
+            self.experts(
+                selected_experts=selected_experts,
+                batch_size=batch_size,
+                sequence_length=sequence_length,
+                hidden_dim=hidden_dim,
+                hidden_states=hidden_states,
+                routing_weights=routing_weights,
+            ),
+            router_logits,
+        )
+
+
+class FlaxGrok1DecoderLayer(nn.Module):
+    config: Grok1Config
+    layer_index: int
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
+    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+
+    def setup(self) -> None:
+        # hidden_states: chex.Array
+        # frequencies: Tuple[chex.Array, chex.Array],
+        # attention_mask: chex.Array
+        # causal_mask: chex.Array
+        # position_ids: chex.Array
+        # deterministic: bool = True
+        # init_cache: bool = False
+        # output_attentions: bool = True
+
+        attn_block = FlaxGrok1Attention
+        mlp_block = FlaxGrok1SparseMoeBlock
         if self.config.gradient_checkpointing != "":
-            attn_block = nn_partitioning.remat(
-                FlaxLlamaAttention,
+            attn_block = re_mat(
+                attn_block,
+                policy=get_gradient_checkpoint_policy(
+                    self.config.gradient_checkpointing
+                ),
                 static_argnums=(1, 3, 4, 6, 7, 8),
+            )
+            mlp_block = re_mat(
+                mlp_block,
                 policy=get_gradient_checkpoint_policy(
                     self.config.gradient_checkpointing
                 ),
-            )
-
-        self.self_attn = attn_block(
-            self.config,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
-        )
-        mlp_block = FlaxLlamaMLP
-
-        if self.config.gradient_checkpointing != "":
-            mlp_block = nn_partitioning.remat(
-                FlaxLlamaMLP,
                 static_argnums=(1,),
-                policy=get_gradient_checkpoint_policy(
-                    self.config.gradient_checkpointing
-                ),
             )
-
-        self.mlp = mlp_block(
-            self.config,
+        self.attn = attn_block(
+            config=self.config,
+            layer_index=self.layer_index,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
-        self.input_layernorm = RMSNorm(
-            self.config.hidden_size,
+        self.moe_block = mlp_block(
+            config=self.config,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            precision=self.precision,
+        )
+        self.pre_attn_norm = FlaxGrok1RMSNorm(
+            dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
-        self.post_attention_layernorm = RMSNorm(
-            self.config.hidden_size,
+        self.post_attn_norm = FlaxGrok1RMSNorm(
+            dim=self.config.hidden_size,
+            eps=self.config.rms_norm_eps,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+        )
+        self.pre_moe_norm = FlaxGrok1RMSNorm(
+            dim=self.config.hidden_size,
+            eps=self.config.rms_norm_eps,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+        )
+        self.post_moe_norm = FlaxGrok1RMSNorm(
+            dim=self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -452,10 +577,11 @@ class FlaxLlamaBlock(nn.Module):
         deterministic: bool = True,
         init_cache: bool = False,
         output_attentions: bool = False,
+        output_router_logits: bool = False,
         fcm_mask: Optional[chex.Array] = None,
-    ):
+    ) -> Tuple[chex.Array, chex.Array, Optional[chex.Array]]:
         """
-        Forward pass of the module block.
+        Forward pass of the attentionNrom module.
 
         Args:
             hidden_states (chex.Array): Input hidden states.
@@ -466,13 +592,16 @@ class FlaxLlamaBlock(nn.Module):
             segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
             deterministic (bool): If True, disables dropout for deterministic behavior.
             init_cache (bool): If True, initializes cache for caching keys and values.
-            output_attentions (bool): If True, outputs attention weights alongside the hidden states.
+            output_attentions (bool): If True, outputs attention weights.
+            output_router_logits (bool): If True, outputs router logits.
             fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
         Returns:
-            Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+            Tuple[chex.Array, chex.Array, Optional[chex.Array]]: A tuple containing the residual_states, hidden states, and the attention weights.
         """
-        attn_outputs = self.self_attn(
-            self.input_layernorm(hidden_states),
+        residual = hidden_states
+        hidden_states = self.pre_attn_norm(hidden_states)
+        hidden_states, attention_weights = self.attn(
+            hidden_states,
             frequencies,
             attention_mask,
             position_ids,
@@ -483,46 +612,153 @@ class FlaxLlamaBlock(nn.Module):
             output_attentions,
             fcm_mask,
         )
-        attn_output = attn_outputs[0]
-        hidden_states = hidden_states + attn_output
 
-        feed_forward_input = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.post_attn_norm(hidden_states)
+        hidden_states = residual + hidden_states
 
-        if self.config.use_scan_mlp:
-            feed_forward_hidden_states = block_wise_ffn(
-                self.mlp,
-                feed_forward_input,
-                self.config.scan_mlp_chunk_size,
-                deterministic,
+        residual = hidden_states
+        hidden_states = self.pre_moe_norm(hidden_states)
+        hidden_states, router_logits = self.moe_block(hidden_states)
+        hidden_states = self.post_moe_norm(hidden_states)
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs += (attention_weights,)
+        if output_router_logits:
+            outputs += (router_logits,)
+        return outputs
+
+
+class FlaxGrok1DecoderLayerCollection(nn.Module):
+    config: Grok1Config
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
+    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+
+    def setup(self) -> None:
+        self.blocks = [
+            FlaxGrok1DecoderLayer(
+                layer_index=layer_index,
+                config=self.config,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                precision=self.precision,
+                name=str(layer_index),
             )
+            for layer_index in range(self.config.num_hidden_layers)
+        ]
+
+    def __call__(
+        self,
+        hidden_states: chex.Array,
+        frequencies: Tuple[chex.Array, chex.Array],
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
+        causal_mask: chex.Array,
+        segment_ids: Optional[chex.Array] = None,
+        deterministic: bool = True,
+        init_cache: bool = False,
+        output_attentions: bool = False,
+        output_router_logits: bool = False,
+        output_hidden_states: bool = False,
+    ) -> Tuple[chex.Array, chex.Array, Optional[chex.Array]]:
+        """
+        Forward pass of the attentionNrom module.
+
+        Args:
+            hidden_states (chex.Array): Input hidden states.
+            frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+            attention_mask (chex.Array): Mask to apply on the attention scores.
+            position_ids (chex.Array): Position indices for the tokens.
+            causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+            segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+            deterministic (bool): If True, disables dropout for deterministic behavior.
+            init_cache (bool): If True, initializes cache for caching keys and values.
+            output_attentions (bool): If True, outputs attention weights.
+            output_router_logits (bool): If True, outputs router logits.
+            output_hidden_states (bool): If True, outputs all of hidden states.
+        Returns:
+            Tuple[chex.Array, Optional[chex.Array], Optional[chex.Array], Optional[chex.Array]]:
+                A tuple containing the hidden_states, all_attentions, all_hidden_states, all_router_logits.
+        """
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+        all_router_logits = () if output_router_logits else None
+        if not deterministic and self.config.fcm_max_ratio > 0:
+            # Apply forgetful causal mask
+            batch_size, seq_length = hidden_states.shape[0], hidden_states.shape[1]
+            fcm_ratio = jax.random.uniform(
+                self.make_rng("fcm"),
+                shape=(batch_size, 1, 1, 1),
+                minval=self.config.fcm_min_ratio,
+                maxval=self.config.fcm_max_ratio,
+            )
+            fcm_mask = (
+                jax.random.uniform(
+                    self.make_rng("fcm"),
+                    shape=(batch_size, 1, seq_length, seq_length),
+                )
+                > fcm_ratio
+            )
+            fcm_mask = fcm_mask.at[:, :, :, 0].set(True)
+            fcm_mask = fcm_mask.astype("bool")
         else:
-            feed_forward_hidden_states = self.mlp(
-                feed_forward_input,
-                deterministic,
+            fcm_mask = None
+        for block in self.blocks:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+            layer_outputs = block(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                output_attentions=output_attentions,
+                output_router_logits=output_router_logits,
+                init_cache=init_cache,
+                frequencies=frequencies,
+                causal_mask=causal_mask,
+                deterministic=deterministic,
+                segment_ids=segment_ids,
+                fcm_mask=fcm_mask,
             )
 
-        hidden_states = hidden_states + feed_forward_hidden_states
+            hidden_states = layer_outputs[0]
 
-        return (hidden_states,) + attn_outputs[1:]
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+
+            if output_router_logits:
+                all_router_logits += (layer_outputs[-1],)
+
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs += (all_self_attns,)
+        if output_hidden_states:
+            outputs += (all_hidden_states,)
+        if output_router_logits:
+            outputs += (all_router_logits,)
+        return outputs
 
 
-class FlaxLlamaPreTrainedModel(EDPretrainedModel):
+class Grok1PreTrainedModel(EDPretrainedModel):
     """
-    Base class for Llama models providing initialization and configuration.
+    Base class for Grok1 models providing initialization and configuration.
 
     Attributes:
-        config_class (LlamaConfig): The configuration class for the model.
+        config_class (Grok1Config): The configuration class for the model.
         module_class (nn.Module): The class representing the model's architecture.
         base_model_prefix (str): The prefix for the base model parameters.
     """
 
-    config_class = LlamaConfig
-    base_model_prefix = "model"
+    config_class: Grok1Config = Grok1Config
     module_class: nn.Module = None
+    base_model_prefix = "model"
+
+    # main_input_name = "input_ids"
 
     def __init__(
         self,
-        config: LlamaConfig,
+        config: Grok1Config,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
@@ -535,7 +771,7 @@ class FlaxLlamaPreTrainedModel(EDPretrainedModel):
         Initializes the pre-trained model with the given configuration.
 
         Args:
-            config (LlamaConfig): Configuration for the model.
+            config (Grok1Config): Configuration for the model.
             dtype (jnp.dtype): Data type for computations.
             param_dtype (jnp.dtype): Data type for model parameters.
             precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
@@ -551,6 +787,7 @@ class FlaxLlamaPreTrainedModel(EDPretrainedModel):
             precision=precision,
             **kwargs,
         )
+
         super().__init__(
             dtype=dtype,
             _do_init=_do_init,
@@ -564,27 +801,34 @@ class FlaxLlamaPreTrainedModel(EDPretrainedModel):
         self,
         rng: jax.random.PRNGKey,
         input_shape: Tuple,
-        params: FrozenDict = None,
+        params: Optional[FrozenDict] = None,
     ) -> FrozenDict:
-        """
-        Initializes the model weights.
+        """The init_weights function is used to initialize the weights of a model.
+        It takes in a rng, which is a random number generator key that can be used to generate random numbers.
+        The input_shape parameter specifies the shape of the inputs that will be fed into this model.
+        The params parameter allows you to pass in pre-trained weights for your model, if you have them available.
 
         Args:
-            rng (jax.random.PRNGKey): Random number generator key.
-            input_shape (Tuple): Shape of the input tensor for initializing weights.
-            params (FrozenDict, optional): Existing parameters to initialize with.
+            self: Access variables that belong to the class
+            rng: jax.random.PRNGKey: Initialize the weights of the model
+            input_shape: Tuple: Initialize the input_ids, attention_mask
+                and position_ids
+            params: flax.core.FrozenDict: Pass in the parameters of a
+                pre-trained model
 
         Returns:
-            FrozenDict: Initialized model parameters.
+            A frozendict of parameters
         """
+
+        self.config.initialization_of_moe = True
         input_ids = jnp.zeros(input_shape, dtype="i4")
-        attention_mask = jnp.ones_like(input_ids)
+        attention_mask = jnp.ones_like(input_ids, dtype="i4")
         position_ids = jnp.broadcast_to(
-            jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape
+            jnp.arange(jnp.atleast_2d(input_ids).shape[-1], dtype="i4"),
+            input_shape,
         )
         params_rng, dropout_rng = jax.random.split(rng)
         rngs = {"params": params_rng, "dropout": dropout_rng}
-
         if self.config.add_cross_attention:
             encoder_hidden_states = jnp.zeros(input_shape + (self.config.hidden_size,))
             encoder_attention_mask = attention_mask
@@ -605,9 +849,9 @@ class FlaxLlamaPreTrainedModel(EDPretrainedModel):
                 position_ids=position_ids,
                 return_dict=False,
             )
-
         random_params = module_init_outputs["params"]
 
+        self.config.initialization_of_moe = False
         if params is not None:
             random_params = flatten_dict(unfreeze(random_params))
             params = flatten_dict(unfreeze(params))
@@ -619,19 +863,17 @@ class FlaxLlamaPreTrainedModel(EDPretrainedModel):
             return random_params
 
     def init_cache(self, batch_size, max_length):
-        """The init_cache function is used to initialize the cache for a given batch size and sequence length.
-        The cache is a dictionary that contains all the intermediate states from each layer in the model.
-        This allows us to run inference on multiple batches without having to re-run forward passes through every layer in
-        the model, which would be very slow.
+        """
+        Initializes the cache for autoregressive generation.
 
         Args:
-            self: Access the module
-            batch_size: Define the batch size of the input tensors
-            max_length: Set the length of the input sequence
+            batch_size (int): Batch size for the cache.
+            max_length (int): Maximum length for the cache.
 
         Returns:
-            A dictionary with the following keys:
+            dict: Initialized cache.
         """
+
         input_ids = jnp.ones((batch_size, max_length))
         attention_mask = jnp.ones_like(input_ids)
         position_ids = jnp.broadcast_to(
@@ -650,17 +892,18 @@ class FlaxLlamaPreTrainedModel(EDPretrainedModel):
 
     def __call__(
         self,
-        input_ids: Optional[chex.Array] = None,
-        input_embeds: Optional[chex.Array] = None,
+        input_ids: chex.Array,
         attention_mask: Optional[chex.Array] = None,
         position_ids: Optional[chex.Array] = None,
         segment_ids: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
         params: dict = None,
         past_key_values: Optional[dict] = None,
         dropout_rng: jax.random.PRNGKey = None,
         train: bool = False,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         add_params_field: bool = False,
         **kwargs,
@@ -670,16 +913,17 @@ class FlaxLlamaPreTrainedModel(EDPretrainedModel):
 
         Args:
             input_ids (chex.Array): Input tensor containing token IDs.
-            input_embeds (Optional[chex.Array]): embedding inputs to be used instead of input_ids.
             attention_mask (Optional[chex.Array]): Mask for attention.
             position_ids (Optional[chex.Array]): Positional indices.
             segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
+            input_embeds (Optional[chex.Array]): embedding inputs to be used instead of input_ids.
             params (dict, optional): Parameters for the model.
             past_key_values (dict, optional): Past key and value states for caching.
             dropout_rng (jax.random.PRNGKey, optional): RNG key for dropout.
             train (bool): If True, the model is in training mode.
             output_attentions (Optional[bool]): If True, output attention weights.
             output_hidden_states (Optional[bool]): If True, output hidden states.
+            output_router_logits (Optional[bool]): If True, output router logits.
             return_dict (Optional[bool]): If True, return a dictionary of outputs.
             add_params_field (bool): If True, include the parameters in the input dictionary.
             **kwargs: Additional arguments.
@@ -687,6 +931,7 @@ class FlaxLlamaPreTrainedModel(EDPretrainedModel):
         Returns:
             Output type depends on the model configuration.
         """
+
         output_attentions = (
             output_attentions
             if output_attentions is not None
@@ -700,9 +945,8 @@ class FlaxLlamaPreTrainedModel(EDPretrainedModel):
         return_dict = (
             return_dict if return_dict is not None else self.config.return_dict
         )
-        batch_size, sequence_length = (
-            input_ids.shape if input_ids is not None else input_embeds.shape[:2]
-        )
+
+        batch_size, sequence_length = input_ids.shape
 
         if position_ids is None:
             if past_key_values is not None:
@@ -717,12 +961,9 @@ class FlaxLlamaPreTrainedModel(EDPretrainedModel):
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, sequence_length))
 
-        rngs = {}
+        rng_s = {}
         if dropout_rng is not None:
-            rngs["dropout"] = dropout_rng
-
-        if self.config.bits is not None:
-            rngs["params"] = jax.random.key(0)
+            rng_s["dropout"] = dropout_rng
 
         inputs = (
             {"params": params or self.params}
@@ -730,6 +971,8 @@ class FlaxLlamaPreTrainedModel(EDPretrainedModel):
             else params or self.params
         )
 
+        if self.config.bits is not None:
+            rng_s["params"] = jax.random.key(0)
         if past_key_values is not None:
             inputs["cache"] = past_key_values
             mutable = ["cache"]
@@ -741,14 +984,15 @@ class FlaxLlamaPreTrainedModel(EDPretrainedModel):
             input_ids=jnp.array(input_ids, dtype="i4"),
             attention_mask=jnp.array(attention_mask, dtype="i4"),
             position_ids=jnp.array(position_ids, dtype="i4"),
-            deterministic=not train,
-            init_cache=False,
+            segment_ids=segment_ids,
+            input_embeds=input_embeds,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            output_router_logits=output_router_logits,
+            init_cache=False,
+            deterministic=not train,
             return_dict=return_dict,
-            input_embeds=input_embeds,
-            segment_ids=segment_ids,
-            rngs=rngs,
+            rngs=rng_s,
             mutable=mutable,
         )
 
@@ -763,150 +1007,48 @@ class FlaxLlamaPreTrainedModel(EDPretrainedModel):
         return outputs
 
 
-class FlaxLlamaBlockCollection(nn.Module):
-    """
-    FlaxLlamaBlockCollection represents a single layer in a Transformer-like model,
-    incorporating self-attention and MLP.
+class FlaxGrok1Module(nn.Module):
+    config: Grok1Config
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
+    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
 
-    Attributes:
-        config (LlamaConfig): Configuration object containing model parameters.
-        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
-        param_dtype (jnp.dtype): Data type for model parameters (default is jnp.bfloat16).
-        precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
-    """
-
-    config: LlamaConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
-
-    def setup(self):
-        self.blocks = [
-            FlaxLlamaBlock(
-                self.config,
-                name=str(i),
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-                precision=self.precision,
-            )
-            for i in range(self.config.num_hidden_layers)
-        ]
-
-    def __call__(
-        self,
-        hidden_states: chex.Array,
-        frequencies: Tuple[chex.Array, chex.Array],
-        attention_mask: chex.Array,
-        causal_mask: chex.Array,
-        position_ids: chex.Array,
-        segment_ids: Optional[chex.Array] = None,
-        deterministic: bool = True,
-        init_cache: bool = False,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-    ) -> Tuple[chex.Array, Optional[chex.Array], chex.Array]:
-        """
-        Forward pass through the collection of decoder layers.
-
-        Args:
-            hidden_states (chex.Array): Input tensor containing the hidden states.
-            frequencies (Tuple[chex.Array, chex.Array]): Frequency positional encodings.
-            attention_mask (chex.Array): Mask to apply during attention.
-            causal_mask (chex.Array): Causal mask for autoregressive decoding.
-            position_ids (chex.Array): Positional indices for the sequence.
-            segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
-            deterministic (bool): If True, disables dropout.
-            init_cache (bool): If True, initializes caching mechanism for fast decoding.
-            output_attentions (bool): If True, returns attention weights.
-            output_hidden_states (bool): If True, returns hidden states.
-
-        Returns:
-            Tuple[chex.Array, Optional[chex.Array], chex.Array]:
-                - hidden_states: The output tensor after layer processing.
-                - all_hidden_states: all of Hidden states (if `output_hidden_states` is True).
-                - self_attn_weights: Attention weights (if `output_attentions` is True).
-
-        """
-        all_attentions = () if output_attentions else None
-        all_hidden_states = () if output_hidden_states else None
-
-        if not deterministic and self.config.fcm_max_ratio > 0:
-            # Apply forgetful causal mask
-            batch_size, seq_length = hidden_states.shape[0], hidden_states.shape[1]
-            fcm_ratio = jax.random.uniform(
-                self.make_rng("fcm"),
-                shape=(batch_size, 1, 1, 1),
-                minval=self.config.fcm_min_ratio,
-                maxval=self.config.fcm_max_ratio,
-            )
-            fcm_mask = (
-                jax.random.uniform(
-                    self.make_rng("fcm"), shape=(batch_size, 1, seq_length, seq_length)
-                )
-                > fcm_ratio
-            )
-            fcm_mask = fcm_mask.at[:, :, :, 0].set(True)
-            fcm_mask = fcm_mask.astype("bool")
-        else:
-            fcm_mask = None
-
-        for block in self.blocks:
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            layer_outputs = block(
-                hidden_states=hidden_states,
-                frequencies=frequencies,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                causal_mask=causal_mask,
-                deterministic=deterministic,
-                init_cache=init_cache,
-                output_attentions=output_attentions,
-                fcm_mask=fcm_mask,
-                segment_ids=segment_ids,
-            )
-            hidden_states = layer_outputs[0]
-
-            if output_attentions:
-                all_attentions += (layer_outputs[1],)
-
-        outputs = (hidden_states, all_hidden_states, all_attentions)
-
-        return outputs
-
-
-class FlaxLlamaModule(nn.Module):
-    config: LlamaConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
-
-    def setup(self):
+    def setup(self) -> None:
         self.embed_tokens = nn.Embed(
             self.config.vocab_size,
             self.config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(
-                stddev=self.config.initializer_range
-            ),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
-        self.dropout = flax.linen.Dropout(rate=self.config.embd_pdrop)
-        self.layers = FlaxLlamaBlockCollection(
-            self.config,
+
+        self.layers = FlaxGrok1DecoderLayerCollection(
+            config=self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
-        self.norm = RMSNorm(
+
+        self.norm = FlaxGrok1RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
-        config = self.config
-        self.causal_mask = nn.make_causal_mask(
+
+        initial_rope_kwargs = dict(rope_type="none")
+        if self.config.rope_scaling is not None:
+            scaling_type = self.config.rope_scaling["type"]
+            scaling_factor = self.config.rope_scaling["factor"]
+            initial_rope_kwargs = dict(
+                scaling_factor=scaling_factor, rope_type=scaling_type
+            )
+        self.frequencies = precompute_frequencies(
+            max_position_embeddings=self.config.granted_freq_max_position_embedding,
+            dim=self.config.hidden_size // self.config.num_attention_heads,
+            base=self.config.rope_theta,
+            **initial_rope_kwargs,
+        )
+        self.causal_mask = flax.linen.make_causal_mask(
             jnp.ones(
                 shape=(1, self.config.granted_mask_max_position_embedding),
                 dtype="bool",
@@ -914,58 +1056,22 @@ class FlaxLlamaModule(nn.Module):
             dtype="bool",
         )
 
-        initial_rope_kwargs = dict(rope_type="none")
-        if config.rope_scaling is not None:
-            scaling_type = config.rope_scaling.get(
-                "type",
-                config.rope_scaling.get("rope_type"),
-            )
-            scaling_factor = config.rope_scaling.get("factor")
-
-            low_freq_factor = config.rope_scaling.get(
-                "low_freq_factor",
-                None,
-            )
-            high_freq_factor = config.rope_scaling.get(
-                "high_freq_factor",
-                None,
-            )
-            original_max_position_embeddings = config.rope_scaling.get(
-                "original_max_position_embeddings",
-                None,
-            )
-            initial_rope_kwargs = dict(
-                scaling_factor=scaling_factor,
-                rope_type=scaling_type,
-                low_freq_factor=low_freq_factor,
-                high_freq_factor=high_freq_factor,
-                original_max_position_embeddings=original_max_position_embeddings,
-            )
-
-        self.frequencies = precompute_frequencies(
-            max_position_embeddings=self.config.granted_freq_max_position_embedding,
-            dim=config.hidden_size // config.num_attention_heads,
-            base=config.rope_theta,
-            **initial_rope_kwargs,
-        )
-
-    from transformers import LlamaForCausalLM
-
     def __call__(
         self,
         input_ids: chex.Array,
-        attention_mask: Optional[chex.Array] = None,
-        position_ids: Optional[chex.Array] = None,
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
         segment_ids: Optional[chex.Array] = None,
         input_embeds: Optional[chex.Array] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        output_router_logits: Optional[bool] = None,
         init_cache: bool = False,
         deterministic: bool = True,
         return_dict: bool = True,
-    ) -> Union[FlaxBaseModelOutput, Tuple]:
+    ) -> MoeModelOutput | Tuple:
         """
-        Forward pass through the Llama module.
+        Forward pass through the Grok1 module.
 
         Args:
             input_ids (chex.Array): Input tensor containing token IDs.
@@ -975,198 +1081,220 @@ class FlaxLlamaModule(nn.Module):
             input_embeds (Optional[chex.Array]): Embedded input tensor.
             output_attentions (Optional[bool]): If True, output attention weights.
             output_hidden_states (Optional[bool]): If True, output hidden states.
+            output_router_logits (Optional[bool]): If True, output router logits.
             init_cache (bool): If True, initialize cache for decoding.
             deterministic (bool): If True, disable dropout.
             return_dict (bool): If True, return a dictionary of outputs.
 
         Returns:
-            FlaxBaseModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
+            MoeModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
         """
+        if output_router_logits is None:
+            output_router_logits = self.config.output_router_logits
+        if input_ids is not None and input_embeds is not None:
+            raise ValueError(
+                "You cannot specify both decoder_input_ids and decoder_input_embeds at the same time"
+            )
+
         if input_embeds is None and input_ids is not None:
-            input_embeds = self.embed_tokens(input_ids.astype("i4"))
+            input_embeds = self.wte(input_ids.astype("i4"))
         else:
             raise ValueError("you should specify input_embeds or input_ids one of them")
-        batch_size, sequence_length, _ = input_embeds.shape
-
-        assert (
-            sequence_length <= self.config.max_position_embeddings
-        ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
-        if attention_mask.ndim == 2:
-            attention_mask = jnp.expand_dims(attention_mask, (1, 2))
-
-        hidden_states = self.dropout(input_embeds, deterministic=deterministic)
-
-        outputs = self.layers(
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
+        output_router_logits = (
+            output_router_logits
+            if output_router_logits is not None
+            else self.config.output_router_logits
+        )
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        collection_outputs = self.layers(
             hidden_states=input_embeds,
-            frequencies=self.frequencies,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            causal_mask=self.causal_mask,
-            deterministic=deterministic,
-            init_cache=init_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
             segment_ids=segment_ids,
+            causal_mask=self.causal_mask,
+            frequencies=self.frequencies,
+            output_attentions=output_attentions,
+            output_router_logits=output_router_logits,
+            output_hidden_states=output_hidden_states,
+            init_cache=init_cache,
+            deterministic=deterministic,
         )
-
-        hidden_states = outputs[0]
+        all_self_attns = None
+        all_hidden_states = None
+        all_router_logits = None
+        hidden_states = collection_outputs[0]
+        if output_attentions:
+            all_self_attns = collection_outputs[1]
+        if output_hidden_states:
+            all_hidden_states = collection_outputs[2 if output_attentions else 1]
+        if output_router_logits:
+            all_router_logits = collection_outputs[-1]
         hidden_states = self.norm(hidden_states)
 
         if output_hidden_states:
-            all_hidden_states = outputs[1] + (hidden_states,)
-            outputs = (hidden_states, all_hidden_states) + outputs[2:]
-        else:
-            outputs = (hidden_states,) + outputs[1:]
-
+            all_hidden_states += (hidden_states,)
         if not return_dict:
-            return tuple(v for v in outputs if v is not None)
-
-        return FlaxBaseModelOutput(
+            return tuple(
+                v
+                for v in [
+                    hidden_states,
+                    all_hidden_states,
+                    all_self_attns,
+                    all_router_logits,
+                ]
+                if v is not None
+            )
+        return MoeModelOutput(
             last_hidden_state=hidden_states,
-            hidden_states=outputs[1],
-            attentions=outputs[-1],
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+            router_logits=all_router_logits,
         )
 
 
-class FlaxLlamaModel(FlaxLlamaPreTrainedModel):
-    module_class = FlaxLlamaModule
-
-    def set_input_embeddings(self, value):
-        self.module.embed_tokens = value
-
-    def get_input_embeddings(self):
-        return self.module.embed_tokens
+class FlaxGrok1Model(Grok1PreTrainedModel):
+    module_class = FlaxGrok1Module
 
 
-class FlaxLlamaForCausalLMModule(nn.Module):
-    config: LlamaConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
+class FlaxGrok1ForCausalLMModule(nn.Module):
+    """
+    Grok1 model for causal language modeling, including the language model head.
 
-    def setup(self):
-        self.model = FlaxLlamaModule(
-            self.config,
+    Attributes:
+        config (Grok1Config): Configuration object with model hyperparameters.
+        dtype (jnp.dtype): Data type for the computations.
+        param_dtype (jnp.dtype): Data type for the model parameters.
+        precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
+    """
+
+    config: Grok1Config
+    dtype: jnp.dtype = jnp.bfloat16
+    param_dtype: jnp.dtype = jnp.bfloat16
+    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+
+    def setup(self) -> None:
+        self.model = FlaxGrok1Module(
+            config=self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
-
         self.lm_head = Dense(
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(
-                stddev=self.config.initializer_range
-            ),
             precision=self.precision,
+            use_bias=False,
+            kernel_init=nn.initializers.normal(self.config.initializer_range),
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
+        self.output_multiplier_scale = self.config.output_multiplier_scale
+
     def __call__(
         self,
-        input_ids: Optional[chex.Array] = None,
-        attention_mask: Optional[chex.Array] = None,
-        position_ids: Optional[chex.Array] = None,
+        input_ids: chex.Array,
+        attention_mask: chex.Array,
+        position_ids: chex.Array,
         segment_ids: Optional[chex.Array] = None,
         input_embeds: Optional[chex.Array] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        output_router_logits: Optional[bool] = None,
         init_cache: bool = False,
         deterministic: bool = True,
         return_dict: bool = True,
-    ) -> Union[FlaxCausalLMOutput, Tuple]:
+    ) -> MoeCausalLMOutput | Tuple:
         """
-        Forward pass through the Llama module.
+        Forward pass through the Grok1 module.
 
         Args:
-            input_ids (Optional[chex.Array]): Input tensor containing token IDs.
-            attention_mask (Optional[chex.Array]): Mask for attention.
-            position_ids (Optional[chex.Array]): Positional indices.
+            input_ids (chex.Array): Input tensor containing token IDs.
+            attention_mask (chex.Array): Mask for attention.
+            position_ids (chex.Array): Positional indices.
             segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
             input_embeds (Optional[chex.Array]): Embedded input tensor.
             output_attentions (Optional[bool]): If True, output attention weights.
             output_hidden_states (Optional[bool]): If True, output hidden states.
+            output_router_logits (Optional[bool]): If True, output router logits.
             init_cache (bool): If True, initialize cache for decoding.
             deterministic (bool): If True, disable dropout.
             return_dict (bool): If True, return a dictionary of outputs.
 
         Returns:
-            FlaxCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
+            MoeCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
         """
-
-        batch_size, seq_length = (
-            input_ids.shape if input_ids is not None else input_embeds.shape[:2]
-        )
-        if attention_mask is None:
-            attention_mask = jnp.ones_like(input_ids)
-        if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-                (batch_size, seq_length),
-            )
+        if output_router_logits is None:
+            output_router_logits = self.config.output_router_logits
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            deterministic=deterministic,
-            init_cache=init_cache,
+            input_embeds=input_embeds,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            input_embeds=input_embeds,
+            output_router_logits=output_router_logits,
+            init_cache=init_cache,
+            deterministic=deterministic,
+            return_dict=True,
             segment_ids=segment_ids,
         )
-
-        hidden_states = outputs[0]
-
-        if self.config.tie_word_embeddings:
-            shared_kernel = self.model.variables["params"]["embed_tokens"][
-                "embedding"
-            ].T.astype(self.param_dtype)
-            lm_logits = self.lm_head.apply(
-                {"params": {"kernel": shared_kernel}},
-                hidden_states,
+        logits = self.lm_head(outputs.last_hidden_state)
+        logits = logits * self.output_multiplier_scale
+        batch_size, seq_length, hd = logits.shape
+        aux_loss = None
+        if output_router_logits and outputs.router_logits is not None:
+            aux_loss = auxiliary_load_balancing_loss_func(
+                gate_logits=tuple(
+                    [
+                        logit.reshape(batch_size * seq_length, -1)
+                        for logit in outputs.router_logits
+                    ]
+                ),
+                num_experts=self.num_experts,
+                top_k=self.num_experts_per_tok,
+                attention_mask=attention_mask,
             )
-        else:
-            lm_logits = self.lm_head(hidden_states)
-
-        lm_logits = lm_logits.astype(jnp.float32)
-
+            aux_loss = aux_loss * self.config.router_aux_loss_coef
         if not return_dict:
-            return (lm_logits,) + outputs[1:]
+            outputs = (logits,) + tuple(
+                v
+                for v in [
+                    aux_loss,
+                    outputs.hidden_states,
+                    outputs.attentions,
+                    outputs.router_logits,
+                ]
+                if v is not None
+            )
+            return outputs
 
-        return FlaxCausalLMOutput(
-            logits=lm_logits,
+        return MoeCausalLMOutput(
+            aux_loss=aux_loss,
+            logits=logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            router_logits=outputs.router_logits,
         )
 
 
-class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
-    module_class = FlaxLlamaForCausalLMModule
-
-    def set_input_embeddings(self, value):
-        self.module.model.embed_tokens = value
-
-    def get_input_embeddings(self):
-        return self.module.model.embed_tokens
-
-    def set_decoder(self, decoder):
-        self.module.model = decoder
-
-    def get_decoder(self):
-        return self.module.model
-
-    def get_output_embeddings(self):
-        return self.module.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.module.lm_head = new_embeddings
+class FlaxGrok1ForCausalLM(Grok1PreTrainedModel):
+    module_class = FlaxGrok1ForCausalLMModule
 
     def prepare_inputs_for_generation(
-        self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
+        self,
+        input_ids,
+        max_length,
+        attention_mask: Optional[chex.Array] = None,
     ):
         """The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
 
@@ -1188,7 +1316,9 @@ class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
         if attention_mask is not None:
             position_ids = attention_mask.cumsum(axis=-1) - 1
             extended_attention_mask = lax.dynamic_update_slice(
-                extended_attention_mask, attention_mask, (0, 0)
+                extended_attention_mask,
+                attention_mask,
+                (0, 0),
             )
         else:
             position_ids = jnp.broadcast_to(
@@ -1205,102 +1335,3 @@ class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
         model_kwargs["past_key_values"] = model_outputs.past_key_values
         model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
         return model_kwargs
-
-
-class FlaxLlamaForSequenceClassificationModule(nn.Module):
-    num_classes: int
-    config: LlamaConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[jax.lax.Precision, str]] = None
-
-    def setup(self):
-        """The setup function is called once at the beginning of training.
-        It initializes the model and optimizer, and sets up any other state that needs to be initialized.
-
-        Args:
-            self: Access variables that belong to the class
-
-        Returns:
-            A tuple of the model and the classifier
-        """
-        self.model = FlaxLlamaModule(self.config, dtype=self.dtype)
-        self.classifier = Dense(
-            self.num_classes,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            use_bias=False,
-            kernel_init=jax.nn.initializers.normal(
-                stddev=self.config.initializer_range
-            ),
-            precision=self.precision,
-        )
-
-    def __call__(
-        self,
-        input_ids: Optional[chex.Array] = None,
-        attention_mask: Optional[chex.Array] = None,
-        position_ids: Optional[chex.Array] = None,
-        segment_ids: Optional[chex.Array] = None,
-        input_embeds: Optional[chex.Array] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        init_cache: bool = False,
-        deterministic: bool = True,
-        return_dict: bool = True,
-    ) -> Union[FlaxSequenceClassifierOutput, Tuple]:
-        """
-        Forward pass through the Llama module.
-
-        Args:
-            input_ids (Optional[chex.Array]): Input tensor containing token IDs.
-            attention_mask (Optional[chex.Array]): Mask for attention.
-            position_ids (Optional[chex.Array]): Positional indices.
-            segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-            input_embeds (Optional[chex.Array]): Embedded input tensor.
-            output_attentions (Optional[bool]): If True, output attention weights.
-            output_hidden_states (Optional[bool]): If True, output hidden states.
-            init_cache (bool): If True, initialize cache for decoding.
-            deterministic (bool): If True, disable dropout.
-            return_dict (bool): If True, return a dictionary of outputs.
-
-        Returns:
-            FlaxSequenceClassifierOutput | Tuple: Model output, either as a named tuple or a standard tuple.
-        """
-
-        batch_size, seq_length = (
-            input_ids.shape if input_ids is not None else input_embeds.shape[:2]
-        )
-        if attention_mask is None:
-            attention_mask = jnp.ones_like(input_ids)
-        if position_ids is None:
-            position_ids = jnp.broadcast_to(
-                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-                (batch_size, seq_length),
-            )
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            deterministic=deterministic,
-            init_cache=init_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            input_embeds=input_embeds,
-            segment_ids=segment_ids,
-        )
-
-        hidden_states = outputs[0]
-        prediction = self.classifier(hidden_states)
-        if return_dict:
-            return FlaxSequenceClassifierOutput(
-                logits=prediction,
-                hidden_states=hidden_states,
-            )
-        else:
-            return (prediction,)
-
-
-class FlaxLlamaForSequenceClassification(FlaxLlamaPreTrainedModel):
-    module_class = FlaxLlamaForSequenceClassificationModule
