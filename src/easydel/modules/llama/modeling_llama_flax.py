@@ -1,22 +1,23 @@
-from functools import partial
+import math
 from typing import Optional, Tuple, Union
 
 import chex
-import flax.linen.partitioning
+import flax.linen
 import jax
 import jax.numpy as jnp
-from fjformer import with_sharding_constraint
 from flax import linen as nn
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
-from flax.linen import Dense, combine_masks, make_causal_mask
+from flax.linen import Dense, combine_masks
+from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
 
-from easydel.etils.etils import get_logger
 from easydel.modules.attention_module import FlexibleAttentionModule
+from easydel.modules.common import RMSNorm
+
+# easydel.modules
 from easydel.modules.flax_modeling_utils import (
-    ACT2FN,
     FlaxAttentionModule,
     apply_rotary_pos_emb,
     block_wise_ffn,
@@ -24,151 +25,110 @@ from easydel.modules.flax_modeling_utils import (
     get_dot_general_by_bits,
     get_gradient_checkpoint_policy,
     precompute_frequencies,
+    with_sharding_constraint,
 )
-from easydel.modules.gemma2.gemma2_configuration import Gemma2Config as Gemma2Config
+from easydel.modules.llama.llama_configuration import LlamaConfig as LlamaConfig
 from easydel.modules.modeling_flax_outputs import (
     FlaxBaseModelOutput,
     FlaxCausalLMOutput,
+    FlaxSequenceClassifierOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
 
-logger = get_logger(__name__)
 
-
-def add_positional_embedding(
-    input_embedding: jax.Array,
-    position: int,
-    theta: int = 10_000,
-) -> jax.Array:
-    """Adds positional embeddings to input embeddings. From DeepMind Gemma"""
-    embed_dim = input_embedding.shape[-1]
-    num_timescales = embed_dim // 2
-    log_timescale_increment = jnp.log(float(theta)) / jnp.maximum(
-        jnp.asarray(num_timescales, dtype=jnp.float32) - 1, 1
-    )
-    inv_timescales = jnp.exp(
-        jnp.arange(num_timescales, dtype=jnp.float32) * -log_timescale_increment
-    )
-    scaled_time = position * inv_timescales
-    signal = jnp.concatenate([jnp.sin(scaled_time), jnp.cos(scaled_time)])
-    signal = jnp.pad(signal, [[0, jnp.mod(embed_dim, 2)]])
-    position_embedding = signal.astype(jnp.float32)
-
-    return input_embedding + position_embedding
-
-
-def apply_rope(
-    inputs: jax.Array,  # [B, L]
-    positions: jax.Array,  # [B, L]
-    head_dim: int,
-    theta: int = 10_000,
-) -> jax.Array:
-    """Applies RoPE. From DeepMind Gemma"""
-    fraction = 2 * jnp.arange(0, head_dim // 2) / head_dim
-    timescale = theta**fraction
-
-    sinusoid_inp = positions[..., jnp.newaxis] / timescale[jnp.newaxis, jnp.newaxis, :]
-    sinusoid_inp = sinusoid_inp[..., jnp.newaxis, :]
-    sin = jnp.sin(sinusoid_inp)
-    cos = jnp.cos(sinusoid_inp)
-
-    first_half, second_half = jnp.split(inputs, 2, axis=-1)
-    first_part = first_half * cos - second_half * sin
-    second_part = second_half * cos + first_half * sin
-    out = jnp.concatenate([first_part, second_part], axis=-1)
-    return out.astype(inputs.dtype)
-
-
-class FlaxGemma2RMSNorm(nn.Module):
-    config: Gemma2Config
+class FlaxLlamaEmbedding(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
-    def setup(self):
-        self.epsilon = self.config.rms_norm_eps
-        self.weight_kernel = self.param(
-            "kernel",
-            lambda _, shape: jnp.ones(shape),
-            self.config.hidden_size,
-        )
-
-    def __call__(self, hidden_states):
-        variance = jnp.asarray(hidden_states, dtype=jnp.float32)
-        variance = jnp.power(variance, 2)
-        variance = variance.mean(-1, keepdims=True)
-        hidden_states = hidden_states / jnp.sqrt(variance + self.epsilon)
-        w = 1 + self.weight_kernel.astype(self.dtype)
-        return (w * jnp.asarray(hidden_states, dtype=self.dtype)).astype(
-            hidden_states.dtype
-        )
-
-
-class FlaxGemma2RotaryEmbedding(nn.Module):
-    config: Gemma2Config
-    dtype: jnp.dtype = jnp.float32
-
-    def __call__(self, frequencies, key_states, query_states, position_ids):
+    def __call__(self, query, key, frequencies, position_ids):
         sin, cos = frequencies
 
         sin = sin[position_ids][:, None, :, :]
         cos = cos[position_ids][:, None, :, :]
 
-        key = apply_rotary_pos_emb(key_states, sin, cos)
-        query = apply_rotary_pos_emb(query_states, sin, cos)
+        key = apply_rotary_pos_emb(key, sin, cos)
+        query = apply_rotary_pos_emb(query, sin, cos)
 
         return query.astype(self.dtype), key.astype(self.dtype)
 
 
-class FlaxGemma2Attention(FlaxAttentionModule):
-    config: Gemma2Config
-    layer_idx: int
+class FlaxLlamaAttention(FlaxAttentionModule):
+    """
+    FlaxLlamaAttention implements an attention mechanism with rotary embeddings.
+
+    Attributes:
+        config (LlamaConfig): Configuration for the attention module.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
+        precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
+    """
+
+    config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
-    causal: bool = True
-    is_cross_attention: bool = False
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
         config = self.config
-        self.embed_dim = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = config.head_dim
-        self.attention_softmax_in_fp32 = self.dtype is not jnp.float32
+        self.hidden_size = config.hidden_size
+        self.head_dim = self.config.hidden_size // self.config.num_attention_heads
+        self.num_key_value_groups = (
+            self.config.num_attention_heads // self.config.num_key_value_heads
+        )
 
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-
-        kernel = jax.nn.initializers.normal(self.config.initializer_range)
-
-        dense_class = partial(
-            Dense,
-            use_bias=config.attention_bias,
+        if self.num_key_value_groups == 1:
+            assert self.config.num_attention_heads == self.config.num_key_value_heads
+        self.q_proj = Dense(
+            config.num_attention_heads * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
+            use_bias=self.config.attention_bias,
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            kernel_init=kernel,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
-        self.q_proj = dense_class(self.num_heads * self.head_dim)
-        self.k_proj = dense_class(self.num_key_value_heads * self.head_dim)
-        self.v_proj = dense_class(self.num_key_value_heads * self.head_dim)
-        self.o_proj = dense_class(self.embed_dim)
-        self.sliding_window = (
-            config.sliding_window if (self.layer_idx % 2 == 0) else None
+        self.k_proj = Dense(
+            config.num_key_value_heads * self.head_dim,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=self.config.attention_bias,
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            precision=self.precision,
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
+        self.v_proj = Dense(
+            config.num_key_value_heads * self.head_dim,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=self.config.attention_bias,
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            precision=self.precision,
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+        )
+        self.o_proj = Dense(
+            config.hidden_size,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            precision=self.precision,
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+        )
+
+        self.rotary = FlaxLlamaEmbedding(self.dtype)
         self.attention_performer = FlexibleAttentionModule(
-            num_attention_heads=self.config.num_attention_heads,
             attention_dropout=self.config.attention_dropout,
+            num_attention_heads=self.config.num_attention_heads,
             head_dims=self.head_dim,
-            shard_attention_computation=self.config.shard_attention_computation,
             precision=self.precision,
             force_float32_tpu=True,
             attn_mechanism=self.config.attn_mechanism,
+            dtype=self.config.attn_dtype,
             mesh=self.config.mesh,
-            sm_scale=self.config.query_pre_attn_scalar**-0.5,
+            sm_scale=1 / math.sqrt(self.head_dim),
+            axis_name=self.config.attention_axis_name,
             base_config=self.config,
         )
-
-        self.rotary_emb = FlaxGemma2RotaryEmbedding(config, dtype=self.dtype)
+        self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
 
     def _merge_heads(self, hidden_states):
         """
@@ -180,14 +140,7 @@ class FlaxGemma2Attention(FlaxAttentionModule):
         Returns:
             chex.Array: The hidden states with merged head dimensions.
         """
-        return hidden_states.reshape(
-            hidden_states.shape[:2] + (self.num_heads * self.head_dim,)
-        )
-
-    def _split_heads(self, hidden_states, num_heads):
-        return hidden_states.reshape(
-            hidden_states.shape[:2] + (num_heads, self.head_dim)
-        )
+        return hidden_states.reshape(hidden_states.shape[:2] + (-1,))
 
     def apply_rotary(self, query, key, frequencies, position_ids):
         """
@@ -207,10 +160,10 @@ class FlaxGemma2Attention(FlaxAttentionModule):
             query,
             key,
         )
-        query, key = self.rotary_emb(
+        query, key = self.rotary(
             position_ids=position_ids,
-            query_states=query,
-            key_states=key,
+            query=query,
+            key=key,
             frequencies=frequencies,
         )
         return self._transpose_sequence_head(query, key)
@@ -255,26 +208,27 @@ class FlaxGemma2Attention(FlaxAttentionModule):
         query_states = query_states.reshape(
             batch_size,
             sequence_length,
-            self.num_heads,
+            self.config.num_attention_heads,
             self.head_dim,
         )
         key_states = key_states.reshape(
             batch_size,
             sequence_length,
-            self.num_key_value_heads,
+            self.config.num_key_value_heads,
             self.head_dim,
         )
         value_states = value_states.reshape(
             batch_size,
             sequence_length,
-            self.num_key_value_heads,
+            self.config.num_key_value_heads,
             self.head_dim,
         )
+
         query_states, key_states = self.apply_rotary(
-            query_states,
-            key_states,
-            frequencies,
-            position_ids,
+            query=query_states,
+            key=key_states,
+            position_ids=position_ids,
+            frequencies=frequencies,
         )
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
@@ -300,6 +254,7 @@ class FlaxGemma2Attention(FlaxAttentionModule):
         attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
 
         dropout_rng = None
+
         if not deterministic and self.config.attention_dropout > 0.0:
             dropout_rng = self.make_rng("dropout")
 
@@ -310,18 +265,21 @@ class FlaxGemma2Attention(FlaxAttentionModule):
                 query_states,
                 attention_mask,
             )
-
         key_states, value_states = self.repeat_key_value(
-            key_states, value_states, self.num_key_value_groups
+            key_states,
+            value_states,
+            self.num_key_value_groups,
+        )
+        assert_msg = (
+            "num_attention_heads repeat wont work likely\n"
+            f"INFO :\n\trepeat_key_values Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
+            f"NH : {self.config.num_attention_heads} KVH : {self.config.num_attention_heads}"
         )
 
-        if bool((self.layer_idx % 2) == 0):
-            sliding_window_mask = jnp.tril(
-                jnp.ones_like(attention_mask, dtype=jnp.bool),
-                k=-self.sliding_window,
-            )
-            window_mask = jnp.where(sliding_window_mask, 0, 1)
-            attention_mask = jnp.logical_and(window_mask, attention_mask)
+        assert query_states.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert key_states.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert value_states.shape[-2] == self.config.num_attention_heads, assert_msg
+
         attention_bias = lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -329,9 +287,6 @@ class FlaxGemma2Attention(FlaxAttentionModule):
                 self.dtype
             ),
         )
-        if bool((self.layer_idx % 2) == 0):
-            if attention_bias.shape[-1] <= 1:  # when decoding
-                attention_bias = attention_bias[:, :, :, -self.sliding_window :]
 
         query_length, key_length = query_states.shape[1], key_states.shape[1]
 
@@ -350,6 +305,7 @@ class FlaxGemma2Attention(FlaxAttentionModule):
             segment_ids=segment_ids,
             causal_mask=causal_mask,
         )
+
         attn_output = self._merge_heads(attentions.attention_outputs)
         if self.config.shard_attention_computation:
             attn_output = with_sharding_constraint(
@@ -366,101 +322,125 @@ class FlaxGemma2Attention(FlaxAttentionModule):
             )
         attn_output = self.o_proj(attn_output)
 
-        # jax.debug.print("{}", attn_output[0, 0, :5])
-        return (
+        attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
+        outputs = (
             (attn_output, attentions.attention_weights)
             if output_attentions
-            else (attn_output, None)
+            else (attn_output,)
         )
+        return outputs
 
 
-class FlaxGemma2MLP(nn.Module):
-    config: Gemma2Config
+class FlaxLlamaMLP(nn.Module):
+    config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
-    def setup(self):
+    def setup(self) -> None:
+        config = self.config
 
-        kernel_init = jax.nn.initializers.normal(self.config.initializer_range)
-
-        self.act = ACT2FN[self.config.hidden_activation]
-        dense_class = partial(
-            Dense,
-            use_bias=False,
+        self.gate_proj = Dense(
+            config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
+            use_bias=self.config.mlp_bias,
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
-            kernel_init=kernel_init,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
-        self.gate_proj = dense_class(self.config.intermediate_size)
-        self.up_proj = dense_class(self.config.intermediate_size)
-        self.down_proj = dense_class(self.config.hidden_size)
-
-    def __call__(self, hidden_states, deterministic=False):
-        hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-        return self.down_proj(
-            self.act(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+        self.down_proj = Dense(
+            config.hidden_size,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=self.config.mlp_bias,
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            precision=self.precision,
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
+        self.up_proj = Dense(
+            config.intermediate_size,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=self.config.mlp_bias,
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            precision=self.precision,
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+        )
+        self.dropout = flax.linen.Dropout(rate=self.config.resid_pdrop)
+
+    def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
+        """The __call__ function is the main function of a class.
+        It is called when an instance of the class (an object) is invoked as a function, i.e., obj(arguments).
+        The __call__ method enables instances of a class to be called like standard Python functions.
+
+        Args:
+            self: Represent the instance of the class
+            x: jnp.ndarray: Pass in the input to the layer
+            deterministic: bool: Determine whether to use dropout
+
+        Returns:
+            A tensor that is the result of applying a dropout function
+            to x
+        """
+
+        x = control_mlp_sharding(x, self.config.partition_axis)
+        x = self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        x = self.dropout(x, deterministic=deterministic)
+        return x
 
 
-class FlaxGemma2DecoderLayer(nn.Module):
-    config: Gemma2Config
-    layer_idx: int
+class FlaxLlamaBlock(nn.Module):
+    config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
-    def setup(self):
-        mlp_block = FlaxGemma2MLP
-        attn_block = FlaxGemma2Attention
-
+    def setup(self) -> None:
+        attn_block = FlaxLlamaAttention
         if self.config.gradient_checkpointing != "":
-            mlp_block = flax.linen.partitioning.remat(
-                mlp_block,
-                policy=get_gradient_checkpoint_policy(
-                    self.config.gradient_checkpointing
-                ),
-                static_argnums=(1,),
-            )
-            attn_block = flax.linen.partitioning.remat(
-                attn_block,
-                policy=get_gradient_checkpoint_policy(
-                    self.config.gradient_checkpointing
-                ),
+            attn_block = nn_partitioning.remat(
+                FlaxLlamaAttention,
                 static_argnums=(1, 3, 4, 6, 7, 8),
+                policy=get_gradient_checkpoint_policy(
+                    self.config.gradient_checkpointing
+                ),
             )
-        self.is_sliding = bool(self.layer_idx % 2)
+
         self.self_attn = attn_block(
             self.config,
-            layer_idx=self.layer_idx,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
+        mlp_block = FlaxLlamaMLP
+
+        if self.config.gradient_checkpointing != "":
+            mlp_block = nn_partitioning.remat(
+                FlaxLlamaMLP,
+                static_argnums=(1,),
+                policy=get_gradient_checkpoint_policy(
+                    self.config.gradient_checkpointing
+                ),
+            )
+
         self.mlp = mlp_block(
             self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
-
-        self.input_layernorm = FlaxGemma2RMSNorm(
-            self.config,
+        self.input_layernorm = RMSNorm(
+            self.config.hidden_size,
+            eps=self.config.rms_norm_eps,
             dtype=self.dtype,
+            param_dtype=self.param_dtype,
         )
-        self.post_attention_layernorm = FlaxGemma2RMSNorm(
-            self.config,
+        self.post_attention_layernorm = RMSNorm(
+            self.config.hidden_size,
+            eps=self.config.rms_norm_eps,
             dtype=self.dtype,
-        )
-        self.pre_feedforward_layernorm = FlaxGemma2RMSNorm(
-            self.config,
-            dtype=self.dtype,
-        )
-        self.post_feedforward_layernorm = FlaxGemma2RMSNorm(
-            self.config,
-            dtype=self.dtype,
+            param_dtype=self.param_dtype,
         )
 
     def __call__(
@@ -493,11 +473,8 @@ class FlaxGemma2DecoderLayer(nn.Module):
         Returns:
             Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
         """
-        residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states, attn_weight = self.self_attn(
-            hidden_states,
+        attn_outputs = self.self_attn(
+            self.input_layernorm(hidden_states),
             frequencies,
             attention_mask,
             position_ids,
@@ -508,51 +485,59 @@ class FlaxGemma2DecoderLayer(nn.Module):
             output_attentions,
             fcm_mask,
         )
+        attn_output = attn_outputs[0]
+        hidden_states = hidden_states + attn_output
 
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
+        feed_forward_input = self.post_attention_layernorm(hidden_states)
 
-        residual = hidden_states
-        hidden_states = self.pre_feedforward_layernorm(hidden_states)
         if self.config.use_scan_mlp:
-            hidden_states = block_wise_ffn(
-                self.mlp, hidden_states, self.config.scan_mlp_chunk_size, deterministic
+            feed_forward_hidden_states = block_wise_ffn(
+                self.mlp,
+                feed_forward_input,
+                self.config.scan_mlp_chunk_size,
+                deterministic,
             )
         else:
-            hidden_states = self.mlp(hidden_states, deterministic)
+            feed_forward_hidden_states = self.mlp(
+                feed_forward_input,
+                deterministic,
+            )
 
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states, attn_weight
+        hidden_states = hidden_states + feed_forward_hidden_states
+
+        return (hidden_states,) + attn_outputs[1:]
 
 
-class FlaxGemma2PreTrainedModel(EDPretrainedModel):
-    """An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
-    models.
+class FlaxLlamaPreTrainedModel(EDPretrainedModel):
+    """
+    Base class for Llama models providing initialization and configuration.
+
+    Attributes:
+        config_class (LlamaConfig): The configuration class for the model.
+        module_class (nn.Module): The class representing the model's architecture.
+        base_model_prefix (str): The prefix for the base model parameters.
     """
 
-    config_class = Gemma2Config
+    config_class = LlamaConfig
     base_model_prefix = "model"
     module_class: nn.Module = None
 
     def __init__(
         self,
-        config: Gemma2Config,
-        input_shape: Tuple = (1, 1),
+        config: LlamaConfig,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+        input_shape: Tuple[int, int] = (1, 1),
         seed: int = 0,
-        dtype: jnp.dtype = jnp.float32,
-        param_dtype: jnp.dtype = jnp.float32,
-        precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision(
-            "fastest"
-        ),
-        _do_init: bool = True,
+        _do_init: bool = False,
         **kwargs,
     ):
         """
         Initializes the pre-trained model with the given configuration.
 
         Args:
-            config (Gemma2Config): Configuration for the model.
+            config (LlamaConfig): Configuration for the model.
             dtype (jnp.dtype): Data type for computations.
             param_dtype (jnp.dtype): Data type for model parameters.
             precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
@@ -564,45 +549,18 @@ class FlaxGemma2PreTrainedModel(EDPretrainedModel):
         module = self.module_class(
             config=config,
             dtype=dtype,
-            precision=precision,
             param_dtype=param_dtype,
+            precision=precision,
             **kwargs,
         )
         super().__init__(
-            config,
-            module,
-            input_shape=input_shape,
-            seed=seed,
             dtype=dtype,
             _do_init=_do_init,
+            module=module,
+            config=config,
+            input_shape=input_shape,
+            seed=seed,
         )
-
-    def init_cache(self, batch_size, max_length):
-        """
-        Initializes the cache for autoregressive generation.
-
-        Args:
-            batch_size (int): Batch size for the cache.
-            max_length (int): Maximum length for the cache.
-
-        Returns:
-            dict: Initialized cache.
-        """
-        input_ids = jnp.ones((batch_size, max_length))
-        attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(
-            jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape
-        )
-
-        init_variables = self.module.init(
-            jax.random.PRNGKey(0),
-            input_ids,
-            attention_mask,
-            position_ids,
-            return_dict=False,
-            init_cache=True,
-        )
-        return init_variables["cache"]
 
     def init_weights(
         self,
@@ -629,9 +587,28 @@ class FlaxGemma2PreTrainedModel(EDPretrainedModel):
         params_rng, dropout_rng = jax.random.split(rng)
         rngs = {"params": params_rng, "dropout": dropout_rng}
 
-        random_params = self.module.init(
-            rngs, input_ids, attention_mask, position_ids, return_dict=False
-        )["params"]
+        if self.config.add_cross_attention:
+            encoder_hidden_states = jnp.zeros(input_shape + (self.config.hidden_size,))
+            encoder_attention_mask = attention_mask
+            module_init_outputs = self.module.init(
+                rngs,
+                input_ids,
+                attention_mask,
+                position_ids,
+                encoder_hidden_states,
+                encoder_attention_mask,
+                return_dict=False,
+            )
+        else:
+            module_init_outputs = self.module.init(
+                rngs,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                return_dict=False,
+            )
+
+        random_params = module_init_outputs["params"]
 
         if params is not None:
             random_params = flatten_dict(unfreeze(random_params))
@@ -642,6 +619,36 @@ class FlaxGemma2PreTrainedModel(EDPretrainedModel):
             return freeze(unflatten_dict(params))
         else:
             return random_params
+
+    def init_cache(self, batch_size, max_length):
+        """The init_cache function is used to initialize the cache for a given batch size and sequence length.
+        The cache is a dictionary that contains all the intermediate states from each layer in the model.
+        This allows us to run inference on multiple batches without having to re-run forward passes through every layer in
+        the model, which would be very slow.
+
+        Args:
+            self: Access the module
+            batch_size: Define the batch size of the input tensors
+            max_length: Set the length of the input sequence
+
+        Returns:
+            A dictionary with the following keys:
+        """
+        input_ids = jnp.ones((batch_size, max_length))
+        attention_mask = jnp.ones_like(input_ids)
+        position_ids = jnp.broadcast_to(
+            jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape
+        )
+
+        init_variables = self.module.init(
+            jax.random.PRNGKey(0),
+            input_ids,
+            attention_mask,
+            position_ids,
+            return_dict=False,
+            init_cache=True,
+        )
+        return init_variables["cache"]
 
     def __call__(
         self,
@@ -695,7 +702,6 @@ class FlaxGemma2PreTrainedModel(EDPretrainedModel):
         return_dict = (
             return_dict if return_dict is not None else self.config.return_dict
         )
-
         batch_size, sequence_length = (
             input_ids.shape if input_ids is not None else input_embeds.shape[:2]
         )
@@ -716,6 +722,9 @@ class FlaxGemma2PreTrainedModel(EDPretrainedModel):
         rngs = {}
         if dropout_rng is not None:
             rngs["dropout"] = dropout_rng
+
+        if self.config.bits is not None:
+            rngs["params"] = jax.random.key(0)
 
         inputs = (
             {"params": params or self.params}
@@ -756,21 +765,31 @@ class FlaxGemma2PreTrainedModel(EDPretrainedModel):
         return outputs
 
 
-class FlaxGemma2LayerCollection(nn.Module):
-    config: Gemma2Config
+class FlaxLlamaBlockCollection(nn.Module):
+    """
+    FlaxLlamaBlockCollection represents a single layer in a Transformer-like model,
+    incorporating self-attention and MLP.
+
+    Attributes:
+        config (LlamaConfig): Configuration object containing model parameters.
+        dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
+        param_dtype (jnp.dtype): Data type for model parameters (default is jnp.bfloat16).
+        precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
+    """
+
+    config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
         self.blocks = [
-            FlaxGemma2DecoderLayer(
+            FlaxLlamaBlock(
                 self.config,
-                layer_idx=i,
+                name=str(i),
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
                 precision=self.precision,
-                name=str(i),
             )
             for i in range(self.config.num_hidden_layers)
         ]
@@ -812,6 +831,7 @@ class FlaxGemma2LayerCollection(nn.Module):
         """
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
+
         if not deterministic and self.config.fcm_max_ratio > 0:
             # Apply forgetful causal mask
             batch_size, seq_length = hidden_states.shape[0], hidden_states.shape[1]
@@ -831,9 +851,11 @@ class FlaxGemma2LayerCollection(nn.Module):
             fcm_mask = fcm_mask.astype("bool")
         else:
             fcm_mask = None
+
         for block in self.blocks:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
+
             layer_outputs = block(
                 hidden_states=hidden_states,
                 frequencies=frequencies,
@@ -856,39 +878,37 @@ class FlaxGemma2LayerCollection(nn.Module):
         return outputs
 
 
-class FlaxGemma2Module(nn.Module):
-    config: Gemma2Config
+class FlaxLlamaModule(nn.Module):
+    config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
-        self.hidden_size = self.config.hidden_size
         self.embed_tokens = nn.Embed(
             self.config.vocab_size,
-            self.hidden_size,
+            self.config.hidden_size,
             embedding_init=jax.nn.initializers.normal(
                 stddev=self.config.initializer_range
             ),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
-        self.layers = FlaxGemma2LayerCollection(
+        self.dropout = flax.linen.Dropout(rate=self.config.embd_pdrop)
+        self.layers = FlaxLlamaBlockCollection(
             self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
-        self.norm = FlaxGemma2RMSNorm(
-            self.config,
+        self.norm = RMSNorm(
+            self.config.hidden_size,
+            eps=self.config.rms_norm_eps,
             dtype=self.dtype,
+            param_dtype=self.param_dtype,
         )
-        self.frequencies = precompute_frequencies(
-            max_position_embeddings=self.config.granted_freq_max_position_embedding,
-            dim=self.config.head_dim,
-            base=self.config.rope_theta,
-        )
-        self.causal_mask = make_causal_mask(
+        config = self.config
+        self.causal_mask = nn.make_causal_mask(
             jnp.ones(
                 shape=(1, self.config.granted_mask_max_position_embedding),
                 dtype="bool",
@@ -896,7 +916,43 @@ class FlaxGemma2Module(nn.Module):
             dtype="bool",
         )
 
-    # Ignore copy
+        initial_rope_kwargs = dict(rope_type="none")
+        if config.rope_scaling is not None:
+            scaling_type = config.rope_scaling.get(
+                "type",
+                config.rope_scaling.get("rope_type"),
+            )
+            scaling_factor = config.rope_scaling.get("factor")
+
+            low_freq_factor = config.rope_scaling.get(
+                "low_freq_factor",
+                None,
+            )
+            high_freq_factor = config.rope_scaling.get(
+                "high_freq_factor",
+                None,
+            )
+            original_max_position_embeddings = config.rope_scaling.get(
+                "original_max_position_embeddings",
+                None,
+            )
+            initial_rope_kwargs = dict(
+                scaling_factor=scaling_factor,
+                rope_type=scaling_type,
+                low_freq_factor=low_freq_factor,
+                high_freq_factor=high_freq_factor,
+                original_max_position_embeddings=original_max_position_embeddings,
+            )
+
+        self.frequencies = precompute_frequencies(
+            max_position_embeddings=self.config.granted_freq_max_position_embedding,
+            dim=config.hidden_size // config.num_attention_heads,
+            base=config.rope_theta,
+            **initial_rope_kwargs,
+        )
+
+    from transformers import LlamaForCausalLM
+
     def __call__(
         self,
         input_ids: chex.Array,
@@ -911,7 +967,7 @@ class FlaxGemma2Module(nn.Module):
         return_dict: bool = True,
     ) -> Union[FlaxBaseModelOutput, Tuple]:
         """
-        Forward pass through the Gemma2 module.
+        Forward pass through the Llama module.
 
         Args:
             input_ids (chex.Array): Input tensor containing token IDs.
@@ -934,12 +990,13 @@ class FlaxGemma2Module(nn.Module):
             raise ValueError("you should specify input_embeds or input_ids one of them")
         batch_size, sequence_length, _ = input_embeds.shape
 
-        input_embeds = input_embeds * (self.config.hidden_size**0.5)
         assert (
             sequence_length <= self.config.max_position_embeddings
         ), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
         if attention_mask.ndim == 2:
             attention_mask = jnp.expand_dims(attention_mask, (1, 2))
+
+        hidden_states = self.dropout(input_embeds, deterministic=deterministic)
 
         outputs = self.layers(
             hidden_states=input_embeds,
@@ -973,32 +1030,39 @@ class FlaxGemma2Module(nn.Module):
         )
 
 
-class FlaxGemma2Model(FlaxGemma2PreTrainedModel):
-    module_class = FlaxGemma2Module
+class FlaxLlamaModel(FlaxLlamaPreTrainedModel):
+    module_class = FlaxLlamaModule
+
+    def set_input_embeddings(self, value):
+        self.module.embed_tokens = value
+
+    def get_input_embeddings(self):
+        return self.module.embed_tokens
 
 
-class FlaxGemma2ForCausalLMModule(nn.Module):
-    config: Gemma2Config
+class FlaxLlamaForCausalLMModule(nn.Module):
+    config: LlamaConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
-    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
-        self.model = FlaxGemma2Module(
+        self.model = FlaxLlamaModule(
             self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
+
         self.lm_head = Dense(
             self.config.vocab_size,
-            use_bias=False,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            precision=self.precision,
+            use_bias=False,
             kernel_init=jax.nn.initializers.normal(
                 stddev=self.config.initializer_range
             ),
+            precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
@@ -1016,7 +1080,7 @@ class FlaxGemma2ForCausalLMModule(nn.Module):
         return_dict: bool = True,
     ) -> Union[FlaxCausalLMOutput, Tuple]:
         """
-        Forward pass through the Gemma2 module.
+        Forward pass through the Llama module.
 
         Args:
             input_ids (Optional[chex.Array]): Input tensor containing token IDs.
@@ -1058,6 +1122,7 @@ class FlaxGemma2ForCausalLMModule(nn.Module):
         )
 
         hidden_states = outputs[0]
+
         if self.config.tie_word_embeddings:
             shared_kernel = self.model.variables["params"]["embed_tokens"][
                 "embedding"
@@ -1069,11 +1134,8 @@ class FlaxGemma2ForCausalLMModule(nn.Module):
         else:
             lm_logits = self.lm_head(hidden_states)
 
-        if self.config.final_logit_softcapping is not None:
-            lm_logits = lm_logits / self.config.final_logit_softcapping
-            lm_logits = jax.nn.tanh(lm_logits)
-            lm_logits = lm_logits * self.config.final_logit_softcapping
         lm_logits = lm_logits.astype(jnp.float32)
+
         if not return_dict:
             return (lm_logits,) + outputs[1:]
 
@@ -1084,13 +1146,43 @@ class FlaxGemma2ForCausalLMModule(nn.Module):
         )
 
 
-class FlaxGemma2ForCausalLM(FlaxGemma2PreTrainedModel):
-    module_class = FlaxGemma2ForCausalLMModule
+class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
+    module_class = FlaxLlamaForCausalLMModule
+
+    def set_input_embeddings(self, value):
+        self.module.model.embed_tokens = value
+
+    def get_input_embeddings(self):
+        return self.module.model.embed_tokens
+
+    def set_decoder(self, decoder):
+        self.module.model = decoder
+
+    def get_decoder(self):
+        return self.module.model
+
+    def get_output_embeddings(self):
+        return self.module.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.module.lm_head = new_embeddings
 
     def prepare_inputs_for_generation(
-        self, input_ids, max_length, attention_mask: Optional[jax.Array] = None
+        self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
     ):
+        """The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
 
+        Args:
+            self: Access variables that belong to the class
+            input_ids: Pass in the input tokens
+            max_length: Set the length of the sequence to be generated
+            attention_mask: Optional[chex.Array]: Mask the attention
+                weights
+
+        Returns:
+            A dictionary of the past_key_values, attention_mask and
+            position ids
+        """
         batch_size, seq_length = input_ids.shape
 
         past_key_values = self.init_cache(batch_size, max_length)
@@ -1116,28 +1208,101 @@ class FlaxGemma2ForCausalLM(FlaxGemma2PreTrainedModel):
         model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
         return model_kwargs
 
-    def init_weights(
-        self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
-    ) -> FrozenDict:
 
-        input_ids = jnp.zeros(input_shape, dtype="i4")
-        attention_mask = jnp.ones_like(input_ids)
-        position_ids = jnp.broadcast_to(
-            jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape
+class FlaxLlamaForSequenceClassificationModule(nn.Module):
+    num_classes: int
+    config: LlamaConfig
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[jax.lax.Precision, str]] = None
+
+    def setup(self):
+        """The setup function is called once at the beginning of training.
+        It initializes the model and optimizer, and sets up any other state that needs to be initialized.
+
+        Args:
+            self: Access variables that belong to the class
+
+        Returns:
+            A tuple of the model and the classifier
+        """
+        self.model = FlaxLlamaModule(self.config, dtype=self.dtype)
+        self.classifier = Dense(
+            self.num_classes,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(
+                stddev=self.config.initializer_range
+            ),
+            precision=self.precision,
         )
-        params_rng, dropout_rng = jax.random.split(rng)
-        rngs = {"params": params_rng, "dropout": dropout_rng}
 
-        random_params = self.module.init(
-            rngs, input_ids, attention_mask, position_ids, return_dict=False
-        )["params"]
+    def __call__(
+        self,
+        input_ids: Optional[chex.Array] = None,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        segment_ids: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        init_cache: bool = False,
+        deterministic: bool = True,
+        return_dict: bool = True,
+    ) -> Union[FlaxSequenceClassifierOutput, Tuple]:
+        """
+        Forward pass through the Llama module.
 
-        if params is not None:
-            random_params = flatten_dict(unfreeze(random_params))
-            params = flatten_dict(unfreeze(params))
-            for missing_key in self._missing_keys:
-                params[missing_key] = random_params[missing_key]
-            self._missing_keys = set()
-            return freeze(unflatten_dict(params))
+        Args:
+            input_ids (Optional[chex.Array]): Input tensor containing token IDs.
+            attention_mask (Optional[chex.Array]): Mask for attention.
+            position_ids (Optional[chex.Array]): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
+            input_embeds (Optional[chex.Array]): Embedded input tensor.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            init_cache (bool): If True, initialize cache for decoding.
+            deterministic (bool): If True, disable dropout.
+            return_dict (bool): If True, return a dictionary of outputs.
+
+        Returns:
+            FlaxSequenceClassifierOutput | Tuple: Model output, either as a named tuple or a standard tuple.
+        """
+
+        batch_size, seq_length = (
+            input_ids.shape if input_ids is not None else input_embeds.shape[:2]
+        )
+        if attention_mask is None:
+            attention_mask = jnp.ones_like(input_ids)
+        if position_ids is None:
+            position_ids = jnp.broadcast_to(
+                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+                (batch_size, seq_length),
+            )
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            deterministic=deterministic,
+            init_cache=init_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            input_embeds=input_embeds,
+            segment_ids=segment_ids,
+        )
+
+        hidden_states = outputs[0]
+        prediction = self.classifier(hidden_states)
+        if return_dict:
+            return FlaxSequenceClassifierOutput(
+                logits=prediction,
+                hidden_states=hidden_states,
+            )
         else:
-            return random_params
+            return (prediction,)
+
+
+class FlaxLlamaForSequenceClassification(FlaxLlamaPreTrainedModel):
+    module_class = FlaxLlamaForSequenceClassificationModule

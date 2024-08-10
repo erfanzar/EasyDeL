@@ -190,6 +190,12 @@ CAUSAL_LANGUAGE_MODELS_CONFIG: Dict[str, Tuple[str, str, str, Dict[str, Any]]] =
         "FlaxGrok1ForCausalLM",
         {"embedding_layer_names": ["embed_tokens"]},
     ),
+    "internlm2": (
+        "easydel.modules.internlm2",
+        "InternLM2Config",
+        "FlaxInternLM2MoeForCausalLM",
+        {"embedding_layer_names": ["tok_embeddings"]},
+    ),
     "qwen2_moe": (
         "easydel.modules.qwen2_moe",
         "Qwen2MoeConfig",

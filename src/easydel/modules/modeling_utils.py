@@ -278,6 +278,7 @@ class EDPretrainedConfig(PretrainedConfig):
             "fcm_min_ratio",
             fcm_min_ratio,
         )
+        self.pretraining_tp = 1 # it's for pytorch models.
         if self.quantize_kv_cache and self.use_sharded_kv_caching:
             quantize_kv_cache = self.quantize_kv_cache
             use_sharded_kv_caching = self.use_sharded_kv_caching

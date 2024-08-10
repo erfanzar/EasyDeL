@@ -335,7 +335,9 @@ class FlaxQwen2Attention(FlaxAttentionModule):
             )
 
         key_states, value_states = self.repeat_key_value(
-            key_states, value_states, self.num_key_value_groups
+            key_states,
+            value_states,
+            self.num_key_value_groups,
         )
 
         attention_bias = lax.select(

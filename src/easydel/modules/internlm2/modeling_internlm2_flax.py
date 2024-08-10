@@ -3,19 +3,20 @@ import math
 from typing import Optional, Tuple, Union
 
 import chex
+import flax.linen
 import jax
 import jax.numpy as jnp
+from einops import rearrange
 from flax import linen as nn
-from flax.core import FrozenDict
-from flax.core.frozen_dict import freeze, unfreeze
+from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import Dense, combine_masks
-from flax.linen.partitioning import remat
+from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
 
 from easydel.modules.attention_module import FlexibleAttentionModule
-from easydel.modules.common import LayerNormRaw
+from easydel.modules.common import RMSNorm
 
 # easydel.modules
 from easydel.modules.flax_modeling_utils import (
@@ -29,20 +30,21 @@ from easydel.modules.flax_modeling_utils import (
     precompute_frequencies,
     with_sharding_constraint,
 )
+from easydel.modules.internlm2.internlm2_configuration import (
+    InternLM2Config as InternLM2Config,
+)
 from easydel.modules.modeling_flax_outputs import (
     FlaxBaseModelOutput,
     FlaxCausalLMOutput,
+    FlaxSequenceClassifierOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
-from easydel.modules.olmo.olmo_configuration import OlmoConfig
-
-re_mat = remat
 
 
-class FlaxOlmoRotaryEmbedding(nn.Module):
+class FlaxInternLM2Embedding(nn.Module):
     dtype: jnp.dtype = jnp.float32
 
-    def __call__(self, key, query, frequencies, position_ids):
+    def __call__(self, query, key, frequencies, position_ids):
         sin, cos = frequencies
 
         sin = sin[position_ids][:, None, :, :]
@@ -54,44 +56,18 @@ class FlaxOlmoRotaryEmbedding(nn.Module):
         return query.astype(self.dtype), key.astype(self.dtype)
 
 
-class FlaxOlmoMLP(nn.Module):
-    config: OlmoConfig
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
-
-    def setup(self) -> None:
-        dense = functools.partial(
-            Dense,
-            use_bias=False,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            precision=self.precision,
-            kernel_init=nn.initializers.normal(),
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
-        )
-        self.gate_proj = dense(self.config.intermediate_size)
-        self.up_proj = dense(self.config.intermediate_size)
-        self.down_proj = dense(self.config.hidden_size)
-        self.act_fn = ACT2FN[self.config.hidden_act]
-
-    def __call__(self, x: chex.Array, e: bool = False):  # Ignored
-        x = control_mlp_sharding(x, self.config.partition_axis)
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-
-
-class FlaxOlmoAttention(FlaxAttentionModule):
+class FlaxInternLM2Attention(FlaxAttentionModule):
     """
-    FlaxOlmoAttention implements an attention mechanism with rotary embeddings.
+    FlaxInternLM2Attention implements an attention mechanism with rotary embeddings.
 
     Attributes:
-        config (OlmoConfig): Configuration for the attention module.
+        config (InternLM2Config): Configuration for the attention module.
         dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
         param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
         precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
     """
 
-    config: OlmoConfig
+    config: InternLM2Config
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
@@ -99,51 +75,36 @@ class FlaxOlmoAttention(FlaxAttentionModule):
     def setup(self):
         config = self.config
         self.hidden_size = config.hidden_size
-        self.head_dim = self.config.hidden_size // self.config.num_attention_heads
-        self.num_key_value_groups = (
-            self.config.num_attention_heads // self.config.num_key_value_heads
-        )
-
-        if self.num_key_value_groups == 1:
-            assert self.config.num_attention_heads == self.config.num_key_value_heads
-        self.q_proj = Dense(
-            config.num_attention_heads * self.head_dim,
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+        if (self.head_dim * self.num_heads) != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+                f" and `num_heads`: {self.num_heads})."
+            )
+        self.wqkv = Dense(
+            (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            use_bias=self.config.attention_bias,
+            use_bias=self.config.bias,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
-        self.k_proj = Dense(
-            config.num_key_value_heads * self.head_dim,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            use_bias=self.config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-            precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
-        )
-        self.v_proj = Dense(
-            config.num_key_value_heads * self.head_dim,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            use_bias=self.config.attention_bias,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-            precision=self.precision,
-            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
-        )
-        self.o_proj = Dense(
+        self.wo = Dense(
             config.hidden_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
-            use_bias=False,
+            use_bias=self.config.bias,
             kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
             precision=self.precision,
             **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
         )
 
-        self.rotary = FlaxOlmoRotaryEmbedding(self.dtype)
+        self.rotary = FlaxInternLM2Embedding(self.dtype)
         self.attention_performer = FlexibleAttentionModule(
             attention_dropout=self.config.attention_dropout,
             num_attention_heads=self.config.num_attention_heads,
@@ -157,6 +118,7 @@ class FlaxOlmoAttention(FlaxAttentionModule):
             axis_name=self.config.attention_axis_name,
             base_config=self.config,
         )
+        self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
 
     def _merge_heads(self, hidden_states):
         """
@@ -168,7 +130,7 @@ class FlaxOlmoAttention(FlaxAttentionModule):
         Returns:
             chex.Array: The hidden states with merged head dimensions.
         """
-        return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
+        return hidden_states.reshape(hidden_states.shape[:2] + (-1,))
 
     def apply_rotary(self, query, key, frequencies, position_ids):
         """
@@ -184,10 +146,7 @@ class FlaxOlmoAttention(FlaxAttentionModule):
             Tuple[chex.Array, chex.Array]: The modified query and key tensors after applying rotary embeddings.
         """
 
-        query, key = self._transpose_sequence_head(
-            query,
-            key,
-        )
+        query, key = self._transpose_sequence_head(query, key)
         query, key = self.rotary(
             position_ids=position_ids,
             query=query,
@@ -226,40 +185,19 @@ class FlaxOlmoAttention(FlaxAttentionModule):
         Returns:
             Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
         """
-        batch_size, sequence_length = hidden_states.shape[:2]
-        query_states, key_states, value_states = (
-            self.q_proj(hidden_states),
-            self.k_proj(hidden_states),
-            self.v_proj(hidden_states),
+        batch_size = hidden_states.shape[0]
+
+        qkv_states = rearrange(
+            self.wqkv(hidden_states),
+            "b q (h gs d) -> b q h gs d",
+            gs=2 + self.num_key_value_groups,
+            d=self.head_dim,
         )
 
-        if self.config.clip_qkv is not None:
-            query_states, key_states, value_states = map(
-                lambda x: jnp.clip(
-                    x, min=-self.config.clip_qkv, max=self.config.clip_qkv
-                ),
-                [query_states, key_states, value_states],
-            )
-
-        query_states = query_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_attention_heads,
-            self.head_dim,
-        )
-        key_states = key_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_key_value_heads,
-            self.head_dim,
-        )
-        value_states = value_states.reshape(
-            batch_size,
-            sequence_length,
-            self.config.num_key_value_heads,
-            self.head_dim,
-        )
-
+        query_states = qkv_states[..., : self.num_key_value_groups, :]
+        query_states = rearrange(query_states, "b q h gs d -> b q (h gs) d")
+        key_states = qkv_states[..., -2, :]
+        value_states = qkv_states[..., -1, :]
         query_states, key_states = self.apply_rotary(
             query=query_states,
             key=key_states,
@@ -293,6 +231,7 @@ class FlaxOlmoAttention(FlaxAttentionModule):
 
         if not deterministic and self.config.attention_dropout > 0.0:
             dropout_rng = self.make_rng("dropout")
+
         if self.has_variable("cache", "cached_key") or init_cache:
             key_states, value_states, attention_mask = self._concatenate_to_cache(
                 key_states,
@@ -300,12 +239,21 @@ class FlaxOlmoAttention(FlaxAttentionModule):
                 query_states,
                 attention_mask,
             )
-
         key_states, value_states = self.repeat_key_value(
             key_states,
             value_states,
             self.num_key_value_groups,
         )
+        assert_msg = (
+            "num_attention_heads repeat wont work likely\n"
+            f"INFO :\n\trepeat_key_values Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
+            f"NH : {self.config.num_attention_heads} KVH : {self.config.num_attention_heads}"
+        )
+
+        assert query_states.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert key_states.shape[-2] == self.config.num_attention_heads, assert_msg
+        assert value_states.shape[-2] == self.config.num_attention_heads, assert_msg
+
         attention_bias = lax.select(
             attention_mask > 0,
             jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -346,8 +294,9 @@ class FlaxOlmoAttention(FlaxAttentionModule):
                     self.config.partition_axis.hidden_state_axis,
                 ),
             )
-        attn_output = self.o_proj(attn_output)
+        attn_output = self.wo(attn_output)
 
+        attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
         outputs = (
             (attn_output, attentions.attention_weights)
             if output_attentions
@@ -356,48 +305,93 @@ class FlaxOlmoAttention(FlaxAttentionModule):
         return outputs
 
 
-class FlaxOlmoDecoderLayer(nn.Module):
-    config: OlmoConfig
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+class FlaxInternLM2MLP(nn.Module):
+    config: InternLM2Config
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self) -> None:
-        attn_block = FlaxOlmoAttention
-        mlp_block = FlaxOlmoMLP
+        config = self.config
+        dense_class = functools.partial(
+            Dense,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            precision=self.precision,
+            **get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+        )
+        self.w1 = dense_class(config.intermediate_size)
+        self.w3 = dense_class(config.intermediate_size)
+        self.w2 = dense_class(config.hidden_size)
+        self.act_fn = ACT2FN[config.hidden_act]
 
+    def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
+        """
+        Args:
+            self: Represent the instance of the class
+            x: jnp.ndarray: Pass in the input to the layer
+            deterministic: bool: Determine whether to use dropout
+
+        Returns:
+            A tensor that is the result of applying a dropout function
+            to x
+        """
+
+        x = control_mlp_sharding(x, self.config.partition_axis)
+        return self.w2(self.act_fn(self.w1(x)) * self.w3(x))
+
+
+class FlaxInternLM2Block(nn.Module):
+    config: InternLM2Config
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[jax.lax.Precision, str]] = None
+
+    def setup(self) -> None:
+        attn_block = FlaxInternLM2Attention
+        mlp_block = FlaxInternLM2MLP
         if self.config.gradient_checkpointing != "":
-            attn_block = re_mat(
-                attn_block,
-                policy=get_gradient_checkpoint_policy(
-                    self.config.gradient_checkpointing
-                ),
+            attn_block = nn_partitioning.remat(
+                FlaxInternLM2Attention,
                 static_argnums=(1, 3, 4, 6, 7, 8),
-            )
-            mlp_block = re_mat(
-                mlp_block,
                 policy=get_gradient_checkpoint_policy(
                     self.config.gradient_checkpointing
                 ),
-                static_argnums=(1,),
             )
-        self.self_attn = attn_block(
-            config=self.config,
+            mlp_block = nn_partitioning.remat(
+                FlaxInternLM2MLP,
+                static_argnums=(1,),
+                policy=get_gradient_checkpoint_policy(
+                    self.config.gradient_checkpointing
+                ),
+            )
+
+        self.attention = attn_block(
+            confg=self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
-        self.mlp = mlp_block(
-            config=self.config,
+
+        self.feed_forward = mlp_block(
+            confg=self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
-        self.input_layernorm = LayerNormRaw(
-            eps=1e-5,
+        self.attention_norm = RMSNorm(
+            dim=self.config.hidden_size,
+            eps=self.config.rms_norm_eps,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
         )
-        self.post_attention_layernorm = LayerNormRaw(
-            eps=1e-5,
+        self.ffn_norm = RMSNorm(
+            dim=self.config.hidden_size,
+            eps=self.config.rms_norm_eps,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
         )
 
     def __call__(
@@ -430,10 +424,8 @@ class FlaxOlmoDecoderLayer(nn.Module):
         Returns:
             Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
         """
-
-        residual = hidden_states
-        attention_output = self.self_attn(
-            self.input_layernorm(hidden_states),
+        attn_outputs = self.attention(
+            self.attention_norm(hidden_states),
             frequencies,
             attention_mask,
             position_ids,
@@ -444,46 +436,46 @@ class FlaxOlmoDecoderLayer(nn.Module):
             output_attentions,
             fcm_mask,
         )
+        attn_output = attn_outputs[0]
+        hidden_states = hidden_states + attn_output
 
-        hidden_states = attention_output[0] + residual
-        ffd_inp = self.post_attention_layernorm(hidden_states)
+        feed_forward_input = self.ffn_norm(hidden_states)
+
         if self.config.use_scan_mlp:
             feed_forward_hidden_states = block_wise_ffn(
-                self.mlp,
-                ffd_inp,
+                self.feed_forward,
+                feed_forward_input,
                 self.config.scan_mlp_chunk_size,
                 deterministic,
             )
         else:
-            feed_forward_hidden_states = self.mlp(
-                ffd_inp,
+            feed_forward_hidden_states = self.feed_forward(
+                feed_forward_input,
                 deterministic,
             )
 
         hidden_states = hidden_states + feed_forward_hidden_states
-        outputs = (hidden_states,)
-        if output_attentions:
-            outputs += (attention_output[1],)
-        return outputs
+
+        return (hidden_states,) + attn_outputs[1:]
 
 
-class FlaxOlmoPretrainedModel(EDPretrainedModel):
+class FlaxInternLM2PreTrainedModel(EDPretrainedModel):
     """
-    Base class for Olmo models providing initialization and configuration.
+    Base class for InternLM2 models providing initialization and configuration.
 
     Attributes:
-        config_class (OlmoConfig): The configuration class for the model.
+        config_class (InternLM2Config): The configuration class for the model.
         module_class (nn.Module): The class representing the model's architecture.
         base_model_prefix (str): The prefix for the base model parameters.
     """
 
-    config_class = OlmoConfig
+    config_class = InternLM2Config
     base_model_prefix = "model"
     module_class: nn.Module = None
 
     def __init__(
         self,
-        config: OlmoConfig,
+        config: InternLM2Config,
         dtype: jnp.dtype = jnp.bfloat16,
         param_dtype: jnp.dtype = jnp.bfloat16,
         precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
@@ -496,7 +488,7 @@ class FlaxOlmoPretrainedModel(EDPretrainedModel):
         Initializes the pre-trained model with the given configuration.
 
         Args:
-            config (OlmoConfig): Configuration for the model.
+            config (InternLM2Config): Configuration for the model.
             dtype (jnp.dtype): Data type for computations.
             param_dtype (jnp.dtype): Data type for model parameters.
             precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
@@ -544,13 +536,13 @@ class FlaxOlmoPretrainedModel(EDPretrainedModel):
             jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape
         )
         params_rng, dropout_rng = jax.random.split(rng)
-        rng_s = {"params": params_rng, "dropout": dropout_rng}
+        rngs = {"params": params_rng, "dropout": dropout_rng}
 
         if self.config.add_cross_attention:
             encoder_hidden_states = jnp.zeros(input_shape + (self.config.hidden_size,))
             encoder_attention_mask = attention_mask
             module_init_outputs = self.module.init(
-                rng_s,
+                rngs,
                 input_ids,
                 attention_mask,
                 position_ids,
@@ -560,7 +552,7 @@ class FlaxOlmoPretrainedModel(EDPretrainedModel):
             )
         else:
             module_init_outputs = self.module.init(
-                rng_s,
+                rngs,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -580,15 +572,18 @@ class FlaxOlmoPretrainedModel(EDPretrainedModel):
             return random_params
 
     def init_cache(self, batch_size, max_length):
-        """
-        Initializes the cache for autoregressive generation.
+        """The init_cache function is used to initialize the cache for a given batch size and sequence length.
+        The cache is a dictionary that contains all the intermediate states from each layer in the model.
+        This allows us to run inference on multiple batches without having to re-run forward passes through every layer in
+        the model, which would be very slow.
 
         Args:
-            batch_size (int): Batch size for the cache.
-            max_length (int): Maximum length for the cache.
+            self: Access the module
+            batch_size: Define the batch size of the input tensors
+            max_length: Set the length of the input sequence
 
         Returns:
-            dict: Initialized cache.
+            A dictionary with the following keys:
         """
         input_ids = jnp.ones((batch_size, max_length))
         attention_mask = jnp.ones_like(input_ids)
@@ -675,9 +670,12 @@ class FlaxOlmoPretrainedModel(EDPretrainedModel):
         if attention_mask is None:
             attention_mask = jnp.ones((batch_size, sequence_length))
 
-        rng_s = {}
+        rngs = {}
         if dropout_rng is not None:
-            rng_s["dropout"] = dropout_rng
+            rngs["dropout"] = dropout_rng
+
+        if self.config.bits is not None:
+            rngs["params"] = jax.random.key(0)
 
         inputs = (
             {"params": params or self.params}
@@ -685,8 +683,6 @@ class FlaxOlmoPretrainedModel(EDPretrainedModel):
             else params or self.params
         )
 
-        if self.config.bits is not None:
-            rng_s["params"] = jax.random.key(0)
         if past_key_values is not None:
             inputs["cache"] = past_key_values
             mutable = ["cache"]
@@ -696,7 +692,6 @@ class FlaxOlmoPretrainedModel(EDPretrainedModel):
         outputs = self.module.apply(
             inputs,
             input_ids=jnp.array(input_ids, dtype="i4"),
-            input_embeds=input_embeds,
             attention_mask=jnp.array(attention_mask, dtype="i4"),
             position_ids=jnp.array(position_ids, dtype="i4"),
             deterministic=not train,
@@ -704,8 +699,9 @@ class FlaxOlmoPretrainedModel(EDPretrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            input_embeds=input_embeds,
             segment_ids=segment_ids,
-            rngs=rng_s,
+            rngs=rngs,
             mutable=mutable,
         )
 
@@ -720,31 +716,31 @@ class FlaxOlmoPretrainedModel(EDPretrainedModel):
         return outputs
 
 
-class FlaxOlmoDecoratorCollection(nn.Module):
+class FlaxInternLM2BlockCollection(nn.Module):
     """
-    FlaxOlmoDecoratorCollection represents a single layer in a Transformer-like model,
+    FlaxInternLM2BlockCollection represents a single layer in a Transformer-like model,
     incorporating self-attention and MLP.
 
     Attributes:
-        config (OlmoConfig): Configuration object containing model parameters.
+        config (InternLM2Config): Configuration object containing model parameters.
         dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
         param_dtype (jnp.dtype): Data type for model parameters (default is jnp.bfloat16).
         precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
     """
 
-    config: OlmoConfig
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
-    precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+    config: InternLM2Config
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[jax.lax.Precision, str]] = None
 
-    def setup(self) -> None:
-        self.layers = [
-            FlaxOlmoDecoderLayer(
-                config=self.config,
+    def setup(self):
+        self.blocks = [
+            FlaxInternLM2Block(
+                self.config,
+                name=str(i),
                 dtype=self.dtype,
                 param_dtype=self.param_dtype,
                 precision=self.precision,
-                name=str(i),
             )
             for i in range(self.config.num_hidden_layers)
         ]
@@ -786,6 +782,7 @@ class FlaxOlmoDecoratorCollection(nn.Module):
         """
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
+
         if not deterministic and self.config.fcm_max_ratio > 0:
             # Apply forgetful causal mask
             batch_size, seq_length = hidden_states.shape[0], hidden_states.shape[1]
@@ -805,11 +802,12 @@ class FlaxOlmoDecoratorCollection(nn.Module):
             fcm_mask = fcm_mask.astype("bool")
         else:
             fcm_mask = None
-        for layer in self.layers:
+
+        for block in self.blocks:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            output = layer(
+            layer_outputs = block(
                 hidden_states=hidden_states,
                 frequencies=frequencies,
                 attention_mask=attention_mask,
@@ -821,33 +819,24 @@ class FlaxOlmoDecoratorCollection(nn.Module):
                 fcm_mask=fcm_mask,
                 segment_ids=segment_ids,
             )
-            hidden_states = output[0]
+            hidden_states = layer_outputs[0]
 
             if output_attentions:
-                output_attentions += (output[1],)
+                all_attentions += (layer_outputs[1],)
 
-        return hidden_states, all_hidden_states, all_attentions
+        outputs = (hidden_states, all_hidden_states, all_attentions)
+
+        return outputs
 
 
-class FlaxOlmoModule(nn.Module):
-    """
-    Core module of the Olmo model, including embedding, decoder layers, and normalization.
-
-    Attributes:
-        config (OlmoConfig): Configuration object with model hyperparameters.
-        dtype (jnp.dtype): Data type for the computations.
-        param_dtype (jnp.dtype): Data type for the model parameters.
-        precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
-    """
-
-    config: OlmoConfig
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
+class FlaxInternLM2Module(nn.Module):
+    config: InternLM2Config
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
-
-        self.embed_tokens = nn.Embed(
+        self.tok_embeddings = nn.Embed(
             self.config.vocab_size,
             self.config.hidden_size,
             embedding_init=jax.nn.initializers.normal(
@@ -856,32 +845,19 @@ class FlaxOlmoModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
-
-        self.layers = FlaxOlmoDecoratorCollection(
-            self.config,
+        self.layers = FlaxInternLM2BlockCollection(
+            config=self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
-        self.norm = LayerNormRaw(
-            eps=1e-5,
+        self.norm = RMSNorm(
+            dim=self.config.hidden_size,
+            eps=self.config.rms_norm_eps,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
         )
-
-        initial_rope_kwargs = dict(rope_type="none")
-        if self.config.rope_scaling is not None:
-            scaling_type = self.config.rope_scaling["type"]
-            scaling_factor = self.config.rope_scaling["factor"]
-            initial_rope_kwargs = dict(
-                scaling_factor=scaling_factor,
-                rope_type=scaling_type,
-            )
-
-        self.frequencies = precompute_frequencies(
-            max_position_embeddings=self.config.granted_freq_max_position_embedding,
-            dim=self.config.hidden_size // self.config.num_attention_heads,
-            base=self.config.rope_theta,
-            **initial_rope_kwargs,
-        )
+        config = self.config
         self.causal_mask = nn.make_causal_mask(
             jnp.ones(
                 shape=(1, self.config.granted_mask_max_position_embedding),
@@ -889,6 +865,43 @@ class FlaxOlmoModule(nn.Module):
             ),
             dtype="bool",
         )
+
+        initial_rope_kwargs = dict(rope_type="none")
+        if config.rope_scaling is not None:
+            scaling_type = config.rope_scaling.get(
+                "type",
+                config.rope_scaling.get("rope_type"),
+            )
+            scaling_factor = config.rope_scaling.get("factor")
+
+            low_freq_factor = config.rope_scaling.get(
+                "low_freq_factor",
+                None,
+            )
+            high_freq_factor = config.rope_scaling.get(
+                "high_freq_factor",
+                None,
+            )
+            original_max_position_embeddings = config.rope_scaling.get(
+                "original_max_position_embeddings",
+                None,
+            )
+            initial_rope_kwargs = dict(
+                scaling_factor=scaling_factor,
+                rope_type=scaling_type,
+                low_freq_factor=low_freq_factor,
+                high_freq_factor=high_freq_factor,
+                original_max_position_embeddings=original_max_position_embeddings,
+            )
+
+        self.frequencies = precompute_frequencies(
+            max_position_embeddings=self.config.granted_freq_max_position_embedding,
+            dim=config.hidden_size // config.num_attention_heads,
+            base=config.rope_theta,
+            **initial_rope_kwargs,
+        )
+
+    from transformers import InternLM2ForCausalLM
 
     def __call__(
         self,
@@ -904,7 +917,7 @@ class FlaxOlmoModule(nn.Module):
         return_dict: bool = True,
     ) -> Union[FlaxBaseModelOutput, Tuple]:
         """
-        Forward pass through the Olmo module.
+        Forward pass through the InternLM2 module.
 
         Args:
             input_ids (chex.Array): Input tensor containing token IDs.
@@ -922,7 +935,7 @@ class FlaxOlmoModule(nn.Module):
             FlaxBaseModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
         """
         if input_embeds is None and input_ids is not None:
-            input_embeds = self.embed_tokens(input_ids.astype("i4"))
+            input_embeds = self.tok_embeddings(input_ids.astype("i4"))
         else:
             raise ValueError("you should specify input_embeds or input_ids one of them")
         batch_size, sequence_length, _ = input_embeds.shape
@@ -933,17 +946,19 @@ class FlaxOlmoModule(nn.Module):
         if attention_mask.ndim == 2:
             attention_mask = jnp.expand_dims(attention_mask, (1, 2))
 
+        hidden_states = input_embeds
+
         outputs = self.layers(
             hidden_states=input_embeds,
+            frequencies=self.frequencies,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            frequencies=self.frequencies,
+            causal_mask=self.causal_mask,
+            deterministic=deterministic,
             init_cache=init_cache,
             output_attentions=output_attentions,
-            deterministic=deterministic,
-            causal_mask=self.causal_mask,
-            segment_ids=segment_ids,
             output_hidden_states=output_hidden_states,
+            segment_ids=segment_ids,
         )
 
         hidden_states = outputs[0]
@@ -956,7 +971,7 @@ class FlaxOlmoModule(nn.Module):
             outputs = (hidden_states,) + outputs[1:]
 
         if not return_dict:
-            return tuple(value for value in outputs if value is not None)
+            return tuple(v for v in outputs if v is not None)
 
         return FlaxBaseModelOutput(
             last_hidden_state=hidden_states,
@@ -965,31 +980,31 @@ class FlaxOlmoModule(nn.Module):
         )
 
 
-class FlaxOlmoModel(FlaxOlmoPretrainedModel):
-    module_class = FlaxOlmoModule
+class FlaxInternLM2Model(FlaxInternLM2PreTrainedModel):
+    module_class = FlaxInternLM2Module
 
     def set_input_embeddings(self, value):
-        self.module.embed_tokens = value
+        self.module.tok_embeddings = value
 
     def get_input_embeddings(self):
-        return self.module.embed_tokens
+        return self.module.tok_embeddings
 
 
-class FlaxOlmoForCausalLMModule(nn.Module):
-    config: OlmoConfig
-    dtype: jnp.dtype = jnp.bfloat16
-    param_dtype: jnp.dtype = jnp.bfloat16
+class FlaxInternLM2ForCausalLMModule(nn.Module):
+    config: InternLM2Config
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]] = None
 
     def setup(self):
-        self.model: FlaxOlmoModule = FlaxOlmoModule(
+        self.model = FlaxInternLM2Module(
             self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
 
-        self.lm_head = Dense(
+        self.output = Dense(
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -1015,7 +1030,7 @@ class FlaxOlmoForCausalLMModule(nn.Module):
         return_dict: bool = True,
     ) -> Union[FlaxCausalLMOutput, Tuple]:
         """
-        Forward pass through the Olmo module.
+        Forward pass through the InternLM2 module.
 
         Args:
             input_ids (Optional[chex.Array]): Input tensor containing token IDs.
@@ -1048,26 +1063,29 @@ class FlaxOlmoForCausalLMModule(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             deterministic=deterministic,
-            input_embeds=input_embeds,
             init_cache=init_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            input_embeds=input_embeds,
+            segment_ids=segment_ids,
         )
 
         hidden_states = outputs[0]
 
         if self.config.tie_word_embeddings:
-            shared_kernel = self.transformer.variables["params"]["embed_tokens"][
+            shared_kernel = self.model.variables["params"]["tok_embeddings "][
                 "embedding"
             ].T.astype(self.param_dtype)
-            lm_logits = self.lm_head.apply(
+            lm_logits = self.output.apply(
                 {"params": {"kernel": shared_kernel}},
                 hidden_states,
             )
         else:
-            lm_logits = self.lm_head(hidden_states)
+            lm_logits = self.output(hidden_states)
+
         lm_logits = lm_logits.astype(jnp.float32)
+
         if not return_dict:
             return (lm_logits,) + outputs[1:]
 
@@ -1078,14 +1096,14 @@ class FlaxOlmoForCausalLMModule(nn.Module):
         )
 
 
-class FlaxOlmoForCausalLM(FlaxOlmoPretrainedModel):
-    module_class = FlaxOlmoForCausalLMModule
+class FlaxInternLM2ForCausalLM(FlaxInternLM2PreTrainedModel):
+    module_class = FlaxInternLM2ForCausalLMModule
 
     def set_input_embeddings(self, value):
-        self.module.model.embed_tokens = value
+        self.module.model.tok_embeddings = value
 
     def get_input_embeddings(self):
-        return self.module.model.embed_tokens
+        return self.module.model.tok_embeddings
 
     def set_decoder(self, decoder):
         self.module.model = decoder
@@ -1094,21 +1112,34 @@ class FlaxOlmoForCausalLM(FlaxOlmoPretrainedModel):
         return self.module.model
 
     def get_output_embeddings(self):
-        return self.module.lm_head
+        return self.module.output
 
     def set_output_embeddings(self, new_embeddings):
-        self.module.lm_head = new_embeddings
+        self.module.output = new_embeddings
 
     def prepare_inputs_for_generation(
         self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
     ):
+        """The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
+
+        Args:
+            self: Access variables that belong to the class
+            input_ids: Pass in the input tokens
+            max_length: Set the length of the sequence to be generated
+            attention_mask: Optional[chex.Array]: Mask the attention
+                weights
+
+        Returns:
+            A dictionary of the past_key_values, attention_mask and
+            position ids
+        """
         batch_size, seq_length = input_ids.shape
 
         past_key_values = self.init_cache(batch_size, max_length)
         extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
         if attention_mask is not None:
             position_ids = attention_mask.cumsum(axis=-1) - 1
-            extended_attention_mask = jax.lax.dynamic_update_slice(
+            extended_attention_mask = lax.dynamic_update_slice(
                 extended_attention_mask, attention_mask, (0, 0)
             )
         else:
@@ -1126,3 +1157,102 @@ class FlaxOlmoForCausalLM(FlaxOlmoPretrainedModel):
         model_kwargs["past_key_values"] = model_outputs.past_key_values
         model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
         return model_kwargs
+
+
+class FlaxInternLM2ForSequenceClassificationModule(nn.Module):
+    num_classes: int
+    config: InternLM2Config
+    dtype: jnp.dtype = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
+    precision: Optional[Union[jax.lax.Precision, str]] = None
+
+    def setup(self):
+        """The setup function is called once at the beginning of training.
+        It initializes the model and optimizer, and sets up any other state that needs to be initialized.
+
+        Args:
+            self: Access variables that belong to the class
+
+        Returns:
+            A tuple of the model and the classifier
+        """
+        self.model = FlaxInternLM2Module(self.config, dtype=self.dtype)
+        self.score = Dense(
+            self.num_classes,
+            dtype=self.dtype,
+            param_dtype=self.param_dtype,
+            use_bias=False,
+            kernel_init=jax.nn.initializers.normal(
+                stddev=self.config.initializer_range
+            ),
+            precision=self.precision,
+        )
+
+    def __call__(
+        self,
+        input_ids: Optional[chex.Array] = None,
+        attention_mask: Optional[chex.Array] = None,
+        position_ids: Optional[chex.Array] = None,
+        segment_ids: Optional[chex.Array] = None,
+        input_embeds: Optional[chex.Array] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        init_cache: bool = False,
+        deterministic: bool = True,
+        return_dict: bool = True,
+    ) -> Union[FlaxSequenceClassifierOutput, Tuple]:
+        """
+        Forward pass through the InternLM2 module.
+
+        Args:
+            input_ids (Optional[chex.Array]): Input tensor containing token IDs.
+            attention_mask (Optional[chex.Array]): Mask for attention.
+            position_ids (Optional[chex.Array]): Positional indices.
+            segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
+            input_embeds (Optional[chex.Array]): Embedded input tensor.
+            output_attentions (Optional[bool]): If True, output attention weights.
+            output_hidden_states (Optional[bool]): If True, output hidden states.
+            init_cache (bool): If True, initialize cache for decoding.
+            deterministic (bool): If True, disable dropout.
+            return_dict (bool): If True, return a dictionary of outputs.
+
+        Returns:
+            FlaxSequenceClassifierOutput | Tuple: Model output, either as a named tuple or a standard tuple.
+        """
+
+        batch_size, seq_length = (
+            input_ids.shape if input_ids is not None else input_embeds.shape[:2]
+        )
+        if attention_mask is None:
+            attention_mask = jnp.ones_like(input_ids)
+        if position_ids is None:
+            position_ids = jnp.broadcast_to(
+                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+                (batch_size, seq_length),
+            )
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            deterministic=deterministic,
+            init_cache=init_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            input_embeds=input_embeds,
+            segment_ids=segment_ids,
+        )
+
+        hidden_states = outputs[0]
+        prediction = self.score(hidden_states)
+        if return_dict:
+            return FlaxSequenceClassifierOutput(
+                logits=prediction,
+                hidden_states=hidden_states,
+            )
+        else:
+            return (prediction,)
+
+
+class FlaxInternLM2ForSequenceClassification(FlaxInternLM2PreTrainedModel):
+    module_class = FlaxInternLM2ForSequenceClassificationModule

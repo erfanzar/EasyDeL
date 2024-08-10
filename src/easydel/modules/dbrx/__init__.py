@@ -5,5 +5,7 @@ from easydel.modules.dbrx.dbrx_configuration import (
 )
 from easydel.modules.dbrx.modelling_dbrx_flax import (
     FlaxDbrxModel as FlaxDbrxModel,
+    FlaxDbrxModule as FlaxDbrxModule,
     FlaxDbrxForCausalLM as FlaxDbrxForCausalLM,
+    FlaxDbrxForCausalLMModule as FlaxDbrxForCausalLMModule,
 )
