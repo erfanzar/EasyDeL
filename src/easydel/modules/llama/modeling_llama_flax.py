@@ -951,8 +951,6 @@ class FlaxLlamaModule(nn.Module):
             **initial_rope_kwargs,
         )
 
-    from transformers import LlamaForCausalLM
-
     def __call__(
         self,
         input_ids: chex.Array,

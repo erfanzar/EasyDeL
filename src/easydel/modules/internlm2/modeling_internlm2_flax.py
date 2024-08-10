@@ -901,8 +901,6 @@ class FlaxInternLM2Module(nn.Module):
             **initial_rope_kwargs,
         )
 
-    from transformers import InternLM2ForCausalLM
-
     def __call__(
         self,
         input_ids: chex.Array,

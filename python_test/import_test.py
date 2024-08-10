@@ -2,14 +2,12 @@ import os
 import sys
 import time
 
-dirname = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(dirname)  # noqa: E402
 sys.path.append(
     os.path.join(
-        dirname,
-        "..",
+        os.path.dirname(os.path.abspath(__file__)),
+        "../src",
     )
-)  # noqa: E402
+)
 
 
 def main():
