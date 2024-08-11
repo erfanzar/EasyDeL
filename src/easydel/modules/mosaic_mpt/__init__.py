@@ -3,8 +3,8 @@ from easydel.modules.mosaic_mpt.mosaic_configuration import (
     MptAttentionConfig as MptAttentionConfig,
 )
 from easydel.modules.mosaic_mpt.modelling_mpt_flax import (
-    FlaxMptForCausalLM as FlaxMptForCausalLM,
-    FlaxMptForCausalLMModule as FlaxMptForCausalLMModule,
     FlaxMptModel as FlaxMptModel,
     FlaxMptModule as FlaxMptModule,
+    FlaxMptForCausalLM as FlaxMptForCausalLM,
+    FlaxMptForCausalLMModule as FlaxMptForCausalLMModule,
 )
