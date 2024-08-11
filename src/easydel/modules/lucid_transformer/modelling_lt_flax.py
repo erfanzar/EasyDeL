@@ -277,7 +277,7 @@ class FlaxLTModel(FlaxLTPretrainedModel):
     module_class = FlaxLTModule
 
 
-class FlaxLTModelForCausalLMModule(nn.Module):
+class FlaxLTForCausalLMModule(nn.Module):
     config: FlaxLTConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -322,4 +322,4 @@ class FlaxLTModelForCausalLMModule(nn.Module):
 
 
 class FlaxLTForCausalLM(FlaxLTPretrainedModel):
-    module_class = FlaxLTModelForCausalLMModule
+    module_class = FlaxLTForCausalLMModule

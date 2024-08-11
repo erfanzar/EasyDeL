@@ -3,4 +3,6 @@ from easydel.modules.whisper.modelling_whisper_flax import (
     FlaxWhisperForConditionalGeneration as FlaxWhisperForConditionalGeneration,
     FlaxWhisperForAudioClassification as FlaxWhisperForAudioClassification,
     FlaxWhisperTimeStampLogitsProcessor as FlaxWhisperTimeStampLogitsProcessor,
+    FlaxWhisperForConditionalGenerationModule as FlaxWhisperForConditionalGenerationModule,
+    FlaxWhisperForAudioClassificationModule as FlaxWhisperForAudioClassificationModule,
 )
