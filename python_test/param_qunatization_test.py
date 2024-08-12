@@ -2,17 +2,7 @@ import inspect
 import os
 import sys
 
-try:
-    import easydel as ed  # noqa
-except ModuleNotFoundError:
-
-    os.environ["JAX_TRACEBACK_FILTERING"] = "off"
-    os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
-    dirname = os.path.dirname(os.path.abspath(__file__))
-    dirname_ed = os.path.join(dirname, "../src")
-    sys.path.append(dirname)
-    sys.path.append(dirname_ed)
-    import easydel as ed  # noqa
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../src"))
 
 from typing import Callable, List
 
@@ -22,6 +12,7 @@ from easydel import (
     GenerationPipelineConfig,
     LlamaConfig,
 )
+from easydel.modules.flax_modeling_utils import quantize_params
 from jax import lax
 from jax import numpy as jnp
 from transformers import AutoTokenizer
@@ -78,8 +69,7 @@ def main():
     )
     input_ids = tokens["input_ids"]
     attention_mask = tokens["attention_mask"]
-    params = ed.modules.flax_modeling_utils.quantize_params_4bit(model.params)
-
+    params = quantize_params(model.params, method="nf4")
     pipeline = GenerationPipeline(
         model=model,
         params=params,

@@ -30,6 +30,7 @@ from easydel.modules.modeling_utils import (
     EDPretrainedModel,
 )
 from easydel.transform.parameters_transformation import torch_dict_to_easydel_params
+from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN
 
 logger = get_logger(name=__name__)
 
@@ -358,7 +359,7 @@ class AutoEasyDeLModelForCausalLM:
         config_kwargs: Optional[Mapping[str, Any]] = None,
         auto_shard_params: bool = False,
         partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]] = None,
-        quantization_method: Optional[Literal["4bit", "8bit"]] = None,
+        quantization_method: Optional[Literal["nf4", "8bit"]] = None,
         bit_targeted_params: Optional[List[str]] = None,
         verbose_params: bool = False,
         safe: bool = True,
@@ -384,7 +385,7 @@ class AutoEasyDeLModelForCausalLM:
             config_kwargs (Optional[Mapping[str, Any]], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
             auto_shard_params (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
             partition_rules (Optional[Tuple[Tuple[str, PartitionSpec]]], optional): Custom partition rules for parameter sharding. If not None, shard_fns should also be provided. Defaults to None.
-            quantization_method (Literal["4bit", "8bit"], optional): quantization_method to be used to quantize model weights. Defaults to None.
+            quantization_method (Literal["nf4", "8bit"], optional): quantization_method to be used to quantize model weights. Defaults to None.
             bit_targeted_params (Optional[List[str]], optional): List of parameter names to convert to 8-bit precision. If  None and 8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
             verbose_params (bool): whenever to log number of parameters in converting state.
             safe (bool): whenever to use safetensors to load engine or parameters (requires engine or parameters to be saved with safe=True while saving them)
@@ -451,7 +452,7 @@ class AutoEasyDeLModelForCausalLM:
         config_kwargs: Optional[Mapping[str, Any]],
         auto_shard_params: bool,
         partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]],
-        quantization_method: Optional[Literal["4bit", "8bit"]],
+        quantization_method: Optional[Literal["nf4", "8bit"]],
         bit_targeted_params: Optional[List[str]],
         verbose_params: bool,
         **kwargs,
@@ -573,12 +574,8 @@ class AutoEasyDeLModelForCausalLM:
             )
         logger.debug("converting huggingface-model to easydel-model.")
         params_pattern_selection = None
-        if quantization_method == "8bit":
-            if bit_targeted_params is None:
-                bit_targeted_params = ["kernel"]
-                params_pattern_selection = re.compile(
-                    "({})".format("|".join(bit_targeted_params))
-                )
+        if bit_targeted_params is None:
+            params_pattern_selection = re.compile(DEFAULT_QUANTIZATION_PATTERN)
 
         leg_load_8bit_detected = kwargs.get("load_8bit", None)
         if leg_load_8bit_detected is not None:
@@ -884,7 +881,7 @@ class AutoStateForCausalLM:
             config_kwargs (Optional[Mapping[str, Any]], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
             auto_shard_params (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
             partition_rules (Optional[Tuple[Tuple[str, PartitionSpec]]], optional): Custom partition rules for parameter sharding. If not None, shard_fns should also be provided. Defaults to None.
-            quantization_method (Literal["4bit", "8bit"], optional): quantization_method to be used to quantize model weights. Defaults to None.
+            quantization_method (Literal["nf4", "8bit"], optional): quantization_method to be used to quantize model weights. Defaults to None.
             bit_targeted_params (Optional[List[str]], optional): List of parameter names to convert to 8-bit precision. If  None and 8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
             verbose_params (bool): whenever to log number of parameters in converting state.
             safe (bool): whenever to use safetensors to load engine or parameters (requires engine or parameters to be saved with safe=True while saving them)

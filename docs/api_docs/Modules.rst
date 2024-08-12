@@ -10,26 +10,26 @@ Modules
    modules.lucid_transformer.modelling_lt_flax
    modules.lucid_transformer.lt_configuration
    modules.qwen1.qwen1_configuration
-   modules.qwen1.modelling_qwen1_flax
+   modules.qwen1.modeling_qwen1_flax
    modules.phi.modelling_phi_flax
    modules.phi.phi_configuration
    modules.jetmoe.jetmoe_configuration
    modules.jetmoe.modelling_jetmoe_flax
    modules.chatglm.chatglm_configuration
    modules.chatglm.modelling_chatglm_flax
+   modules.llama.modeling_vision_llama_flax
    modules.llama.llama_configuration
-   modules.llama.modelling_llama_flax
-   modules.llama.modelling_vision_llama_flax
+   modules.llama.modeling_llama_flax
    modules.llama.vision_llama_configuration
    modules.whisper.modelling_whisper_flax
    modules.whisper.whisper_configuration
    modules.phi3.phi3_configuration
    modules.phi3.modelling_phi3_flax
    modules.auto_models
-   modules.falcon.modelling_falcon_flax
    modules.falcon.falcon_configuration
-   modules.gpt2.modelling_gpt2_flax
+   modules.falcon.modeling_falcon_flax
    modules.gpt2.gpt2_configuration
+   modules.gpt2.modeling_gpt2_flax
    modules.openelm.openelm_configuration
    modules.openelm.modelling_openelm_flax
    modules.opt.opt_configuration
@@ -37,17 +37,21 @@ Modules
    modules.mosaic_mpt.modelling_mpt_flax
    modules.mosaic_mpt.mosaic_configuration
    modules.qwen2.qwen_configuration
-   modules.qwen2.modelling_qwen_flax
+   modules.qwen2.modeling_qwen_flax
    modules.modeling_utils
    modules.mixtral.modelling_mixtral_flax
    modules.mixtral.mixtral_configuration
+   modules.internlm2.internlm2_configuration
+   modules.internlm2.modeling_internlm2_flax
    modules.mistral.vision_mistral_configuration
    modules.mistral.modelling_mistral_flax
    modules.mistral.mistral_configuration
+   modules.xerxes.xerxes_configuration
+   modules.xerxes.modeling_xerxes_flax
    modules.grok_1.grok_1_configuration
-   modules.grok_1.modelling_grok_1_flax
+   modules.grok_1.modeling_grok_1_flax
    modules.gpt_j.gpt_j_configuration
-   modules.gpt_j.modelling_gpt_j_flax
+   modules.gpt_j.modeling_gpt_j_flax
    modules.qwen2_moe.configuration_qwen2_moe
    modules.qwen2_moe.modeling_qwen2_moe_flax
    modules.roberta.roberta_configuration
@@ -59,10 +63,12 @@ Modules
    modules.olmo.olmo_configuration
    modules.modeling_flax_outputs
    modules.flax_modeling_utils
-   modules.gemma.modelling_gemma_flax
+   modules.exaone.exaone_configuration
+   modules.exaone.modeling_exaone_flax
+   modules.gemma.modeling_gemma_flax
    modules.gemma.gemma_configuration
    modules.gemma2.gemma2_configuration
-   modules.gemma2.modelling_gemma2_flax
+   modules.gemma2.modeling_gemma2_flax
    modules.rwkv.modelling_rwkv_flax
    modules.rwkv.rwkv_configuration
    modules.t5.t5_configuration
@@ -78,7 +84,7 @@ Modules
    modules.arctic.modelling_arctic_flax
    modules.palm.palm_configuration
    modules.palm.modelling_palm_flax
+   modules.gpt_neo_x.modeling_gpt_neo_x_flax
    modules.gpt_neo_x.gpt_neo_x_configuration
-   modules.gpt_neo_x.modelling_gpt_neo_x_flax
    modules.cohere.modelling_cohere_flax
    modules.cohere.cohere_configuration

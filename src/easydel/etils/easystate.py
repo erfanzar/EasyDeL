@@ -7,7 +7,7 @@ import fjformer
 import fjformer.checkpoint
 import jax.tree_util
 import optax
-from fjformer.custom_array import Array8Bit
+from fjformer.dtypes import Array8Bit
 from flax import core, struct, traverse_util
 from flax.core import FrozenDict
 from flax.linen.fp8_ops import OVERWRITE_WITH_GRADIENT
@@ -736,7 +736,7 @@ class EasyDeLState(struct.PyTreeNode):
 
     def to_8bit(self, quantization_fields=None):
         if quantization_fields is None:
-            quantization_fields = ["kernel", "embedding"]
+            quantization_fields = ["kernel"]
 
         def quantize_params(params: dict) -> dict:
             """Quantizes model parameters using Array8Bit.
