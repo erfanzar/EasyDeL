@@ -95,7 +95,7 @@ Comprehensive documentation and examples are available at [EasyDeL Documentation
 Here's an improved version of your latest updates:
 
 ## Latest Updates 🔥
-- NF4 Arrays are not supported.
+- NF4 Arrays are now supported.
 - EXAONE and InternLM2 is added.
 - all of the Models have Architecture improvements.
 - Optimized KeyValueCache:
