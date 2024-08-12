@@ -9,11 +9,9 @@ from fjformer import make_shard_and_gather_fns, match_partition_rules
 try:
     import easydel as ed
 except ModuleNotFoundError:
-    dirname = os.path.dirname(os.path.abspath(__file__))
-    sys.path.append(dirname)  # noqa: E402
     sys.path.append(
         os.path.join(
-            dirname,
+            os.path.dirname(os.path.abspath(__file__)),
             "../src",
         )
     )
@@ -354,6 +352,11 @@ class EasyModelsTest(unittest.TestCase):
         res, err = self.create_test_for_models("exaone", hf_model)
         self.assertTrue(res, f"EXAONE model Failed [ERROR {err}]")
 
+    def test_internlm2(self):
+        hf_model, conf = self.get_hf_model_from_hub("internlm/internlm2_5-7b-chat")
+        res, err = self.create_test_for_models("internlm2", hf_model)
+        self.assertTrue(res, f"INTERNLM2 model Failed [ERROR {err}]")
+
     def test_mixtral(self):
         self.header_config = None
         res, err = self.create_test_for_models(
@@ -654,4 +657,5 @@ if __name__ == "__main__":
     # test.test_xerxes()  # Passed v0.0.80
     # test.test_qwen2_moe()  # Passed v0.0.80
     # test.test_stablelm()  # Passed v0.0.80
-    test.test_exaone()
+    # test.test_exaone()  # Passed v0.0.80
+    # test.test_internlm2()  # Passed v0.0.80
