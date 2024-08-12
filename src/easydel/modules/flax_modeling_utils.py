@@ -1,5 +1,6 @@
 import functools
 import math
+import re
 import warnings
 from functools import partial
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
@@ -12,7 +13,7 @@ import jax.tree_util
 from einops import rearrange
 from fjformer.bit_quantization import config as q_config
 from fjformer.bit_quantization import q_flax
-from fjformer.custom_array import Array4Bit, Array8Bit, Array4Lt
+from fjformer.dtypes import Array8Bit
 from flax import linen as nn
 from flax.linen import combine_masks
 from flax.traverse_util import flatten_dict, unflatten_dict
@@ -28,6 +29,7 @@ from easydel.etils.errors import EasyDeLBlockWiseFFNError
 from easydel.etils.etils import get_logger
 from easydel.etils.partition_module import PartitionAxis
 from easydel.modules.modeling_utils import EasyMethod
+from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN, EasyQuantizer
 
 warnings.filterwarnings(
     "ignore",
@@ -872,167 +874,56 @@ def is_flatten(pytree: dict):
     return True if isinstance(mpl, tuple) else False
 
 
-def quantize_params_8bit(
+def quantize_params(
     params: Union[Dict[str, Any], Any],
+    method: Literal["nf4", "8bit"] = "nf4",
     embedding_layer_name: Optional[str] = None,
-    layers_to_ignore: Optional[list[str]] = None,
-    verbose: bool = True,
-) -> Union[Dict[str, Any], Any]:
-    """
-    Quantize parameters to 8-bit precision, excluding specified layers.
-
-    Args:
-        params: The parameters to quantize. Can be a nested dictionary or a flat structure.
-        embedding_layer_name: Name of the embedding layer to ignore during quantization.
-        layers_to_ignore: List of additional layer names to ignore during quantization.
-        verbose (bool): whenever to use tqdm for logging stuff.
-
-    Returns:
-        Quantized parameters in the same structure as the input.
-    """
-    embedding_layer_name = embedding_layer_name or "embedding"
-    layers_to_ignore = set(layers_to_ignore or [])
-    layers_to_ignore.add(embedding_layer_name)
-
-    flatten = not isinstance(params, dict)
-    if not flatten:
-        params = flatten_dict(params)
-
-    def quantize(path, array):
-        layer_name = ".".join(path[0].key)
-        if any(ignore in layer_name for ignore in layers_to_ignore):
-            logger.info(f"Layer {layer_name} is not quantized.")
-            return array
-        return Array8Bit.quantize(array)
-
-    total_params = len(jax.tree_util.tree_leaves(params))
-    with tqdm(
-        total=total_params,
-        desc="Quantizing to 8-bit",
-        disable=not verbose,
-    ) as pbar:
-
-        def quantize_with_progress(path, array):
-            pbar.set_postfix_str(".".join(path[0].key))
-            result = quantize(path, array)
-            pbar.update(1)
-            return result
-
-        params = jax.tree_util.tree_map_with_path(quantize_with_progress, params)
-
-    if not flatten:
-        params = unflatten_dict(params)
-
-    return params
-
-
-def quantize_params_nf4(
-    params: Union[Dict[str, Any], Any],
-    embedding_layer_name: Optional[str] = None,
-    layers_to_ignore: Optional[list[str]] = None,
     block_size: Literal[32, 64, 128, 256, 512, 1024, 2048, 4096] = 64,
-    contraction_axis: int = 0,
+    scalar_block_size: Optional[
+        Literal[32, 64, 128, 256, 512, 1024, 2048, 4096]
+    ] = None,
+    quantization_pattern: str = DEFAULT_QUANTIZATION_PATTERN,
     verbose: bool = True,
 ) -> Union[Dict[str, Any], Any]:
     """
-    Quantize parameters to nf4 4-bit precision, excluding specified layers.
+    Quantize parameters to 8-bit or nf4 precision, excluding specified layers.
 
     Args:
         params: The parameters to quantize. Can be a nested dictionary or a flat structure.
         embedding_layer_name: Name of the embedding layer to ignore during quantization.
-        layers_to_ignore: List of additional layer names to ignore during quantization.
         block_size (Literal[32, 64, 128, 256, 512, 1024, 2048, 4096]): Size of each quantization block.
-        contraction_axis (int): Axis along which contraction is performed.
+        scalar_block_size (Optional[Literal[32, 64, 128, 256, 512, 1024, 2048, 4096]]): Size of each quantization block.
+        quantization_pattern (str): re pattern for layers to be quantized.
         verbose (bool): whenever to use tqdm for logging stuff.
 
     Returns:
         Quantized parameters in the same structure as the input.
     """
+    # warnings.filterwarnings(
+    #     "ignore",
+    #     "ImplicitArray dtype float16 does not match materialization dtype float32",
+    # )
     embedding_layer_name = embedding_layer_name or "embedding"
-    layers_to_ignore = set(layers_to_ignore or [])
-    layers_to_ignore.add(embedding_layer_name)
-
+    pattern = re.compile(quantization_pattern)
     flatten = not isinstance(params, dict)
     if not flatten:
         params = flatten_dict(params)
+    quantizer = EasyQuantizer(
+        quantization_method=method,
+        block_size=block_size,
+        scalar_block_size=scalar_block_size,
+    )
 
     def quantize(path, array):
         layer_name = ".".join(path[0].key)
-        if any(ignore in layer_name for ignore in layers_to_ignore):
-            logger.info(f"Layer {layer_name} is not quantized (ignored).")
-            return array
-        elif array.ndim > 2:
-            logger.info(f"Layer {layer_name} is not quantized (ndim > 2).")
-            return array
-        if not (array.shape[contraction_axis] / 16).is_integer():
-            logger.info(
-                f"Layer {layer_name} is not quantized (shape[contraction_axis] % 16 != 0)."
-            )
-            return array
-        return Array4Bit.quantize(
-            array=array,
-            block_size=block_size,
-            contraction_axis=contraction_axis,
-        )
+        if pattern.search(layer_name):
+            return quantizer(array=array)
+        return array
 
     total_params = len(jax.tree_util.tree_leaves(params))
     with tqdm(
         total=total_params,
-        desc="Quantizing to NF4",
-        disable=not verbose,
-    ) as pbar:
-
-        def quantize_with_progress(path, array):
-            pbar.set_postfix_str(".".join(path[0].key))
-            result = quantize(path, array)
-            pbar.update(1)
-            return result
-
-        params = jax.tree_util.tree_map_with_path(quantize_with_progress, params)
-
-    if not flatten:
-        params = unflatten_dict(params)
-
-    return params
-
-
-def quantize_params_4bit(
-    params: Union[Dict[str, Any], Any],
-    embedding_layer_name: Optional[str] = None,
-    layers_to_ignore: Optional[list[str]] = None,
-    verbose: bool = True,
-) -> Union[Dict[str, Any], Any]:
-    """
-    Quantize parameters to  4-bit precision, excluding specified layers.
-
-    Args:
-        params: The parameters to quantize. Can be a nested dictionary or a flat structure.
-        embedding_layer_name: Name of the embedding layer to ignore during quantization.
-        layers_to_ignore: List of additional layer names to ignore during quantization.
-        verbose (bool): whenever to use tqdm for logging stuff.
-
-    Returns:
-        Quantized parameters in the same structure as the input.
-    """
-    embedding_layer_name = embedding_layer_name or "embedding"
-    layers_to_ignore = set(layers_to_ignore or [])
-    layers_to_ignore.add(embedding_layer_name)
-
-    flatten = not isinstance(params, dict)
-    if not flatten:
-        params = flatten_dict(params)
-
-    def quantize(path, array):
-        layer_name = ".".join(path[0].key)
-        if any(ignore in layer_name for ignore in layers_to_ignore):
-            logger.info(f"Layer {layer_name} is not quantized (ignored).")
-            return array
-        return Array4Lt.quantize(array=array, dtype=array.dtype)
-
-    total_params = len(jax.tree_util.tree_leaves(params))
-    with tqdm(
-        total=total_params,
-        desc="Quantizing to 4-bit",
+        desc=f"Quantizing to {method}",
         disable=not verbose,
     ) as pbar:
 

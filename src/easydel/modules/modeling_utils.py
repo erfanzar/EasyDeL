@@ -11,7 +11,7 @@ import flax
 import flax.linen
 import jax
 from fjformer.checkpoint import CheckpointManager
-from fjformer.custom_array import Array8Bit
+from fjformer.dtypes import Array8Bit
 from fjformer.sharding import match_partition_rules
 from flax.core import FrozenDict, unfreeze
 from flax.traverse_util import flatten_dict, unflatten_dict
@@ -278,7 +278,7 @@ class EDPretrainedConfig(PretrainedConfig):
             "fcm_min_ratio",
             fcm_min_ratio,
         )
-        self.pretraining_tp = 1 # it's for pytorch models.
+        self.pretraining_tp = 1  # it's for pytorch models.
         if self.quantize_kv_cache and self.use_sharded_kv_caching:
             quantize_kv_cache = self.quantize_kv_cache
             use_sharded_kv_caching = self.use_sharded_kv_caching

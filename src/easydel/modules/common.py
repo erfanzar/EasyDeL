@@ -23,8 +23,9 @@ class RMSNorm(nn.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
         output = self._norm(x).astype(self.dtype)
+
         weight = self.weight.astype(self.dtype)
-        return output * weight
+        return weight * output
 
 
 class LayerNormRaw(nn.Module):

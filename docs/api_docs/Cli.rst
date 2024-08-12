@@ -4,5 +4,8 @@ Cli
 .. toctree::
    :maxdepth: 2
 
-   cli.train.cl_train_cli
+   cli.train.clm
+   cli.train.sft
+   cli.train.dpo
+   cli.utils
    cli.cli

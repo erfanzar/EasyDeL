@@ -1,7 +1,7 @@
-qwen2.modelling_qwen_flax package
+gpt_j.modeling_gpt_j_flax package
 =================================
 
-.. automodule:: easydel.modules.qwen2.modelling_qwen_flax
+.. automodule:: easydel.modules.gpt_j.modeling_gpt_j_flax
     :members:
     :undoc-members:
     :show-inheritance:
