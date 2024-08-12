@@ -124,6 +124,7 @@ class InternLM2Config(EDPretrainedConfig):
         self.rope_scaling = rope_scaling
         self.bits = bits
         self.scan_layers = scan_layers
+        self.attn_implementation = "eager"  # HF: AttributeError: 'InternLM2Config' object has no attribute 'attn_implementation'. Did you mean: '_attn_implementation'?
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

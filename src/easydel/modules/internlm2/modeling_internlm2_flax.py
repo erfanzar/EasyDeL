@@ -3,7 +3,6 @@ import math
 from typing import Optional, Tuple, Union
 
 import chex
-import flax.linen
 import jax
 import jax.numpy as jnp
 from einops import rearrange
@@ -106,7 +105,6 @@ class FlaxInternLM2Attention(FlaxAttentionModule):
 
         self.rotary = FlaxInternLM2Embedding(self.dtype)
         self.attention_performer = FlexibleAttentionModule(
-            attention_dropout=self.config.attention_dropout,
             num_attention_heads=self.config.num_attention_heads,
             head_dims=self.head_dim,
             precision=self.precision,
@@ -118,7 +116,6 @@ class FlaxInternLM2Attention(FlaxAttentionModule):
             axis_name=self.config.attention_axis_name,
             base_config=self.config,
         )
-        self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
 
     def _merge_heads(self, hidden_states):
         """
@@ -296,7 +293,6 @@ class FlaxInternLM2Attention(FlaxAttentionModule):
             )
         attn_output = self.wo(attn_output)
 
-        attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
         outputs = (
             (attn_output, attentions.attention_weights)
             if output_attentions
@@ -369,14 +365,14 @@ class FlaxInternLM2Block(nn.Module):
             )
 
         self.attention = attn_block(
-            confg=self.config,
+            config=self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
         )
 
         self.feed_forward = mlp_block(
-            confg=self.config,
+            config=self.config,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             precision=self.precision,
