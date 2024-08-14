@@ -360,6 +360,7 @@ class AutoEasyDeLModelForCausalLM:
         auto_shard_params: bool = False,
         partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]] = None,
         quantization_method: Optional[Literal["nf4", "8bit"]] = None,
+        quantization_block_size: int = 256,
         bit_targeted_params: Optional[List[str]] = None,
         verbose_params: bool = False,
         safe: bool = True,
@@ -386,6 +387,7 @@ class AutoEasyDeLModelForCausalLM:
             auto_shard_params (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
             partition_rules (Optional[Tuple[Tuple[str, PartitionSpec]]], optional): Custom partition rules for parameter sharding. If not None, shard_fns should also be provided. Defaults to None.
             quantization_method (Literal["nf4", "8bit"], optional): quantization_method to be used to quantize model weights. Defaults to None.
+            quantization_block_size (int): block size to be used for quantizing arrays (only for NF4).
             bit_targeted_params (Optional[List[str]], optional): List of parameter names to convert to 8-bit precision. If  None and 8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
             verbose_params (bool): whenever to log number of parameters in converting state.
             safe (bool): whenever to use safetensors to load engine or parameters (requires engine or parameters to be saved with safe=True while saving them)
@@ -408,6 +410,7 @@ class AutoEasyDeLModelForCausalLM:
                 verbose_params=verbose_params,
                 partition_axis=partition_axis,
                 quantization_method=quantization_method,
+                quantization_block_size=quantization_block_size,
                 partition_rules=partition_rules,
                 bit_targeted_params=bit_targeted_params,
                 sharding_axis_names=sharding_axis_names,
@@ -453,6 +456,7 @@ class AutoEasyDeLModelForCausalLM:
         auto_shard_params: bool,
         partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]],
         quantization_method: Optional[Literal["nf4", "8bit"]],
+        quantization_block_size: int,
         bit_targeted_params: Optional[List[str]],
         verbose_params: bool,
         **kwargs,
@@ -594,6 +598,7 @@ class AutoEasyDeLModelForCausalLM:
             remove_state_dict=True,
             uses_tie_word_embedding=uses_tie_word_embedding,
             dtype=param_dtype,
+            block_size=quantization_block_size,
         )
 
         # Clear and collect memory after converting the model
