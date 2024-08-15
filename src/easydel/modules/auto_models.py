@@ -1,5 +1,6 @@
 import functools
 import gc
+import os
 import re
 import warnings
 from typing import (
@@ -13,6 +14,7 @@ from typing import (
     Sequence,
     Tuple,
     Type,
+    Union,
 )
 
 import flax.traverse_util
@@ -364,7 +366,7 @@ class AutoEasyDeLModelForCausalLM:
         bit_targeted_params: Optional[List[str]] = None,
         verbose_params: bool = False,
         safe: bool = True,
-        from_torch: bool = True,
+        from_torch: Optional[bool] = None,
         **kwargs,
     ) -> Tuple[EDPretrainedModel, dict]:
         """Loads and shards a pretrained causal language model from the Hugging Face Hub and converts it into an
@@ -398,6 +400,11 @@ class AutoEasyDeLModelForCausalLM:
             Tuple[EDPretrainedModel, dict]: A tuple containing the EasyDeL model and the loaded and sharded
                 model parameters.
         """
+        if from_torch is None:
+            from_torch = not cls._is_easydel(
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+            )
+
         if from_torch:
             return cls._from_torch(
                 pretrained_model_name_or_path=pretrained_model_name_or_path,
@@ -435,7 +442,11 @@ class AutoEasyDeLModelForCausalLM:
                 precision=precision,
                 dtype=dtype,
                 pretrained_model_name_or_path=pretrained_model_name_or_path,
+                quantization_method=quantization_method,
+                quantization_block_size=quantization_block_size,
+                bit_targeted_params=bit_targeted_params,
                 safe=safe,
+                **kwargs,
             )
 
     @staticmethod
@@ -628,12 +639,14 @@ class AutoEasyDeLModelForCausalLM:
         partition_axis: PartitionAxis,
         input_shape: Tuple[int, int],
         shard_fns: Optional[Mapping[tuple, Callable] | dict],
+        quantization_method: Optional[Literal["nf4", "8bit"]],
+        bit_targeted_params: Optional[List[str]],
+        quantization_block_size: int,
         config_kwargs: Optional[Mapping[str, Any]],
         auto_shard_params: bool,
         partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]],
         safe: bool,
-        # load_in_8bit: bool,
-        # bit_targeted_params: Optional[List[str]],
+        **kwargs,
     ):
         from easydel.modules.modeling_utils import EDPretrainedModel
 
@@ -650,8 +663,88 @@ class AutoEasyDeLModelForCausalLM:
             sharding_axis_names=sharding_axis_names,
             config_kwargs=config_kwargs,
             partition_rules=partition_rules,
+            quantization_method=quantization_method,
+            bit_targeted_params=bit_targeted_params,
+            quantization_block_size=quantization_block_size,
             safe=safe,
+            **kwargs,
         )
+
+    @classmethod
+    def _is_easydel(
+        cls,
+        pretrained_model_name_or_path,
+        FLAX_WEIGHTS_NAME="easydel-model.parameters",
+        cache_dir: Optional[Union[str, os.PathLike]] = None,
+        force_download: bool = False,
+        local_files_only: bool = False,
+        token: Optional[Union[str, bool]] = None,
+        revision: str = "main",
+    ):
+        from transformers.utils import cached_file as _cached_file
+        from transformers.utils import download_url as _download_url
+        from transformers.utils import is_remote_url as _is_remote_url
+
+        proxies = None
+        subfolder = ""
+        commit_hash = None
+        pretrained_model_name_or_path = str(pretrained_model_name_or_path)
+        if os.path.isdir(pretrained_model_name_or_path):
+            if os.path.isfile(
+                os.path.join(
+                    pretrained_model_name_or_path,
+                    subfolder,
+                    FLAX_WEIGHTS_NAME,
+                )
+            ):
+                archive_file = os.path.join(  # noqa
+                    pretrained_model_name_or_path,
+                    subfolder,
+                    FLAX_WEIGHTS_NAME,
+                )
+            else:
+                raise EnvironmentError(
+                    f"Error no file named {FLAX_WEIGHTS_NAME} found in"
+                    f" directory {pretrained_model_name_or_path}"
+                )
+        elif os.path.isfile(os.path.join(subfolder, pretrained_model_name_or_path)):
+            ...
+        elif _is_remote_url(pretrained_model_name_or_path):
+            filename = pretrained_model_name_or_path
+            resolved_archive_file = _download_url(pretrained_model_name_or_path)
+        else:
+            filename = FLAX_WEIGHTS_NAME
+            try:
+                cached_file_kwargs = {
+                    "cache_dir": cache_dir,
+                    "force_download": force_download,
+                    "proxies": proxies,
+                    "local_files_only": local_files_only,
+                    "token": token,
+                    "user_agent": {
+                        "file_type": "model",
+                        "framework": "flax",
+                        "from_auto_class": False,
+                    },
+                    "revision": revision,
+                    "subfolder": subfolder,
+                    "_raise_exceptions_for_gated_repo": False,
+                    "_raise_exceptions_for_missing_entries": False,
+                    "_commit_hash": commit_hash,
+                }
+                resolved_archive_file = _cached_file(
+                    pretrained_model_name_or_path,
+                    filename,
+                    **cached_file_kwargs,
+                )
+
+                if resolved_archive_file is None:
+                    return False
+            except EnvironmentError:
+                raise
+            except Exception:
+                return False
+        return True
 
 
 class AutoEasyDeLConfig:
