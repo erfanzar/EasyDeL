@@ -1,8 +1,19 @@
 import os
+import re
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Mapping, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import chex
 import fjformer
@@ -10,6 +21,7 @@ import fjformer.sharding
 import flax
 import flax.linen
 import jax
+import jax.tree_util
 from fjformer.checkpoint import CheckpointManager
 from fjformer.dtypes import Array8Bit
 from fjformer.sharding import match_partition_rules
@@ -24,6 +36,8 @@ from transformers.modeling_flax_utils import FlaxPreTrainedModel
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.etils import get_logger
 from easydel.etils.partition_module import PartitionAxis
+from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN, EasyQuantizer
+from tqdm.auto import tqdm
 
 logger = get_logger(__name__)
 AVAILABLE_ATTENTION_MECHANISMS = Literal[
@@ -1184,6 +1198,9 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
         input_shape: Optional[Tuple[int, int]] = None,
         config_kwargs: Optional[dict[str, Any]] = None,
         partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
+        quantization_method: Optional[Literal["nf4", "8bit"]] = None,
+        bit_targeted_params: Optional[List[str]] = None,
+        quantization_block_size: int = 4096,
         shard_fns: dict[Callable] = None,
         auto_shard_params: bool = False,
         remove_dict_prefix=None,
@@ -1204,20 +1221,11 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
         """
 
         from transformers import GenerationConfig
-        from transformers.utils import (
-            cached_file as _cached_file,
-        )
-        from transformers.utils import (
-            download_url as _download_url,
-        )
-        from transformers.utils import (
-            is_offline_mode as _is_offline_mode,
-        )
-        from transformers.utils import (
-            is_remote_url as _is_remote_url,
-        )
+        from transformers.utils import cached_file as _cached_file
+        from transformers.utils import download_url as _download_url
+        from transformers.utils import is_offline_mode as _is_offline_mode
+        from transformers.utils import is_remote_url as _is_remote_url
 
-        resume_download = kwargs.pop("resume_download", False)
         proxies = kwargs.pop("proxies", None)
         trust_remote_code = kwargs.pop("trust_remote_code", None)
         from_pipeline = kwargs.pop("_from_pipeline", None)
@@ -1272,7 +1280,6 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
             cache_dir=cache_dir,
             return_unused_kwargs=True,
             force_download=force_download,
-            resume_download=resume_download,
             proxies=proxies,
             local_files_only=local_files_only,
             token=token,
@@ -1328,7 +1335,6 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
                         "cache_dir": cache_dir,
                         "force_download": force_download,
                         "proxies": proxies,
-                        "resume_download": resume_download,
                         "local_files_only": local_files_only,
                         "token": token,
                         "user_agent": user_agent,
@@ -1371,13 +1377,11 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
             # experience this error.
             _, cls, _ = get_modules_by_type(config.model_type)
         model = cls(
-            config,
-            *model_args,
+            config=config,
             dtype=dtype,
             param_dtype=param_dtype,
             precision=precision,
             _do_init=False,
-            **model_kwargs,
         )
         if safe:
             state, _ = CheckpointManager.load_checkpoint_safe(
@@ -1478,7 +1482,6 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
                     pretrained_model_name_or_path,
                     cache_dir=cache_dir,
                     force_download=force_download,
-                    resume_download=resume_download,
                     proxies=proxies,
                     local_files_only=local_files_only,
                     token=token,
@@ -1494,6 +1497,27 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
                 )
                 pass
 
+        if bit_targeted_params is None:
+            params_pattern_selection = re.compile(DEFAULT_QUANTIZATION_PATTERN)
+        else:
+            params_pattern_selection = bit_targeted_params
+        if quantization_method is not None:
+
+            quantizer = EasyQuantizer(
+                quantization_method=quantization_method,
+                block_size=quantization_block_size,
+            )
+            pbar = tqdm(list(state.keys()))
+            for key_tuple in pbar:
+                if (
+                    quantizer is not None
+                    and key_tuple[-1] != "embedding"
+                    and params_pattern_selection.search("/".join(key_tuple))
+                ):
+                    state[key_tuple] = quantizer(array=state[key_tuple])
+                    pbar.set_description(
+                        f"Quantizing {'.'.join(key_tuple)} ({quantization_method})"
+                    )
         return model, unflatten_dict(state)
 
     def shard_params(

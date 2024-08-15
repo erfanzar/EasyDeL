@@ -6,7 +6,7 @@ from fjformer.dtypes import Array8Bit, ArrayNF4
 DEFAULT_QUANTIZATION_PATTERN = (
     "(wo|wq|wk|wv|q_proj|k_proj|v_proj|o_proj|w1|w2|w3|"
     "gate_proj|up_proj|down_proj|dense_4h_to_h|dense_h_to_4h|query_key_value|wqkv|Wqkv|"
-    "dense)"
+    "dense|proj_1|proj_2|out_proj|qkv_proj)"
 )
 
 
