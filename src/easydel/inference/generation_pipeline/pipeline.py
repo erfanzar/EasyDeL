@@ -1,3 +1,5 @@
+"""Module for text generation pipeline using JAX/Flax."""
+
 import functools
 import pathlib
 import pickle
@@ -439,6 +441,19 @@ class GenerationPipeline:
         attention_mask,
         model_kwargs_sharding_spec,
     ):
+        """Get or compile the model keyword arguments sharding function.
+
+        Args:
+            input_ids: Input token IDs.
+            max_length: Maximum sequence length.
+            attention_mask: Attention mask.
+            model_kwargs_sharding_spec: Sharding specifications for model
+                keyword arguments.
+
+        Returns:
+            Callable: The compiled function for model keyword arguments
+                sharding.
+        """
         if self.compiled_model_kwargs_sharding is None:
             logger.info("compiling `model_kwargs_sharding`.")
             self.compiled_model_kwargs_sharding = inference_utils.compile_function(
@@ -459,6 +474,17 @@ class GenerationPipeline:
         generation_state,
         perform_sampling_step,
     ):
+        """Compile the multi-step sampling function.
+
+        Args:
+            model_kwargs_sharding_spec: Sharding specifications for
+                model keyword arguments.
+            generation_state: Initial generation state.
+            perform_sampling_step: The sampling function to compile.
+
+        Returns:
+            Callable: The compiled multi-step sampling function.
+        """
         if self.compiled_sample_fn_over is None:
             logger.info("compiling `sample_fn_over`.")
 

@@ -1,3 +1,5 @@
+"""Module for client-side interaction with EasyDeL API Engine."""
+
 import json
 from dataclasses import dataclass
 from typing import Dict, Generator, List
@@ -16,6 +18,8 @@ except ModuleNotFoundError:
 
 @dataclass
 class GenerateGradioOutput:
+    """Dataclass to store Gradio generation output."""
+
     sequence: str
     sequence_stream: str
     token_count: int
@@ -25,6 +29,8 @@ class GenerateGradioOutput:
 
 @dataclass
 class GenerationProcessOutput:
+    """Dataclass to store generation process output."""
+
     step: int
     tokens_generated: int
     char_generated: int
@@ -34,12 +40,16 @@ class GenerationProcessOutput:
 
 @dataclass
 class SocketGenerationOutput:
+    """Dataclass to store socket generation output."""
+
     progress: GenerationProcessOutput
     response: str
 
 
 @dataclass
 class HttpGenerationProcessOutput:
+    """Dataclass for HTTP generation process output."""
+
     tokens_generated: int
     char_generated: int
     elapsed_time: float
@@ -48,6 +58,8 @@ class HttpGenerationProcessOutput:
 
 @dataclass
 class HttpGenerationOutput:
+    """Dataclass for HTTP generation output."""
+
     progress: HttpGenerationProcessOutput
     response: str
 
@@ -58,6 +70,19 @@ def generate_https(
     path: str = "conversation",
     verify_ssl: bool = False,
 ) -> HttpGenerationOutput:
+    """Generate text using HTTPS.
+
+    Args:
+        hostname (str): The hostname of the server.
+        conversation (List[Dict]): The conversation history.
+        path (str, optional): The path to the generation endpoint.
+            Defaults to "conversation".
+        verify_ssl (bool, optional): Whether to verify SSL certificate.
+            Defaults to False.
+
+    Returns:
+        HttpGenerationOutput: The generated text and progress information.
+    """
     params = {"conversation": json.dumps(conversation)}
     try:
         response = requests.get(
@@ -85,6 +110,17 @@ def generate_websocket(
     conversation: List[Dict],
     path: str = "conversation",
 ) -> Generator[SocketGenerationOutput, None, None]:
+    """Generate text using WebSockets.
+
+    Args:
+        hostname (str): The hostname of the server.
+        conversation (List[Dict]): The conversation history.
+        path (str, optional): The path to the generation endpoint.
+            Defaults to "conversation".
+
+    Yields:
+        SocketGenerationOutput: The generated text and progress information.
+    """
     hostname = (
         hostname.replace("https://", "")
         .replace("http://", "")
@@ -108,28 +144,24 @@ def generate_websocket(
 
 
 def generate_gradio(
-    url,
+    url: str,
     conversation: Dict,
 ):
-    """
-    Generate responses using a Gradio client.
+    """Generate responses using a Gradio client.
 
     Args:
         url (str): The URL of the Gradio server.
         conversation (Dict): The conversation history.
-        max_tokens (Optional[int]): Maximum number of tokens to generate.
-        temperature (Optional[float]): Sampling temperature.
-        top_p (Optional[float]): Top-p sampling parameter.
-        top_k (Optional[int]): Top-k sampling parameter.
 
     Yields:
-        GenerateGradioOutput
+        GenerateGradioOutput: The generated output information.
     """
     try:
         from gradio_client import Client  # noqa # type:ignore
     except ModuleNotFoundError:
         raise ModuleNotFoundError(
-            "`gradio_client` no found consider running `pip install gradio_client gradio`"
+            "`gradio_client` no found consider running "
+            "`pip install gradio_client gradio`"
         )
     job_arguments = {
         "conversation": conversation,
