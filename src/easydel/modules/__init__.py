@@ -194,6 +194,14 @@ from easydel.modules.phi3 import (
     FlaxPhi3ForCausalLM as FlaxPhi3ForCausalLM,
     FlaxPhi3ForCausalLMModule as FlaxPhi3ForCausalLMModule,
 )
+from easydel.modules.phimoe import (
+    PhiMoeConfig as PhiMoeConfig,
+    FlaxPhiMoeModel as FlaxPhiMoeModel,
+    FlaxPhiMoeModule as FlaxPhiMoeModule,
+    FlaxPhiMoeForCausalLM as FlaxPhiMoeForCausalLM,
+    FlaxPhiMoeForCausalLMModule as FlaxPhiMoeForCausalLMModule,
+)
+
 from easydel.modules.qwen1 import (
     Qwen1Config as Qwen1Config,
     FlaxQwen1Model as FlaxQwen1Model,
