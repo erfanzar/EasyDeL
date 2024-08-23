@@ -1,4 +1,6 @@
 import asyncio
+import json
+import time
 from asyncio import TimeoutError, wait_for
 
 try:
@@ -11,9 +13,6 @@ try:
 except ModuleNotFoundError:
     gr = None
 
-
-import json
-import time
 from easydel.etils.etils import get_logger
 from easydel.inference.generation_pipeline.pipeline import ChatPipeline
 
@@ -25,21 +24,20 @@ except ModuleNotFoundError:
 
 
 class ApiEngine:
-    """
-    **Example:**
+    """Exposes a ChatPipeline through HTTP, WebSockets, and Gradio.
 
+    This class provides a unified interface for interacting with a
+    ChatPipeline using different protocols.
 
-
+    Example:
         >>> import easydel as ed
         >>> from transformers import AutoTokenizer
         >>> from jax import numpy as jnp
-
         >>> # Load your pre-trained model and tokenizer
         >>> model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(...)
         >>> tokenizer = AutoTokenizer.from_pretrained(...)
         >>> tokenizer.padding_side = "left"
         >>> tokenizer.truncation_side = "left"
-
         >>> # Create a GenerationPipeline
         >>> pipeline = ed.ChatPipeline(
         ...     pipeline=ed.GenerationPipeline(
@@ -67,9 +65,17 @@ class ApiEngine:
         hostname: str = "0.0.0.0",
         port: int = 11550,
     ):
+        """Initializes the ApiEngine.
+
+        Args:
+            pipeline: The ChatPipeline to expose.
+            hostname: The hostname to bind to.
+            port: The port to bind to.
+        """
         if websockets is None:
             raise ModuleNotFoundError(
-                "you are trying to use ApiEngine and you don't have `websockets` installed (run `pip install websocket websockets`)"
+                "you are trying to use ApiEngine and you don't have `websockets` "
+                "installed (run `pip install websocket websockets`)"
             )
         self._logger = get_logger(__name__)
         self.pipeline = pipeline
@@ -78,6 +84,7 @@ class ApiEngine:
 
     @property
     def logger(self):
+        """Returns the logger."""
         return self._logger
 
     @property
@@ -100,6 +107,14 @@ class ApiEngine:
         return json.dumps(dictionary)
 
     async def _conversation_http_get(self, request):
+        """Handles HTTP GET requests for conversation generation.
+
+        Args:
+            request: The aiohttp request object.
+
+        Returns:
+            The aiohttp response object.
+        """
         try:
             conversation = request.query.get("conversation")
             if conversation is None:
@@ -115,14 +130,15 @@ class ApiEngine:
             for idx, response in enumerate(
                 self.pipeline.stream_generate(json.loads(conversation))
             ):
-                sequence = self.tokenizer.decode(response)
+                sequence = self.pipeline.tokenizer.decode(response)
                 full_response += sequence
 
             elapsed_time = time.time() - start_time
             tokens_per_second = (idx + 1) / elapsed_time if elapsed_time > 0 else 0
 
             self.logger.info(
-                f"HTTP GET generation completed. Time: {elapsed_time}, Tokens/second: {tokens_per_second}, Generated Tokens: {idx + 1}"
+                f"HTTP GET generation completed. Time: {elapsed_time}, "
+                f"Tokens/second: {tokens_per_second}, Generated Tokens: {idx + 1}"
             )
 
             return web.json_response(
@@ -152,6 +168,11 @@ class ApiEngine:
         self,
         websocket: "websockets.WebSocketServerProtocol",  # type:ignore
     ):
+        """Handles WebSocket requests for conversation generation.
+
+        Args:
+            websocket: The WebSocket object.
+        """
         user_request = json.loads(await wait_for(websocket.recv(), timeout=10))
         conversation = user_request.get("conversation", None)
         if conversation is None:
@@ -189,10 +210,16 @@ class ApiEngine:
 
         await websocket.send(self._jsn({"done": True}))
         self.logger.info(
-            f"generation completed Time: {elapsed_time}, Tokens/second: {tokens_per_second}, Generated Tokens:{idx + 1}"
+            f"generation completed Time: {elapsed_time}, "
+            f"Tokens/second: {tokens_per_second}, Generated Tokens:{idx + 1}"
         )
 
     def _request_gradio_components(self) -> None:
+        """Creates Gradio components for interacting with the pipeline.
+
+        Returns:
+            None
+        """
         with gr.Blocks(
             title="EasyDeL-API",
             analytics_enabled=False,
@@ -303,7 +330,9 @@ class ApiEngine:
                     )
 
                 self.logger.info(
-                    f"[gradio] generation completed Time: {elapsed_time}, Tokens/second: {tokens_per_second}, Generated Tokens:{idx + 1}"
+                    f"[gradio] generation completed Time: {elapsed_time}, "
+                    f"Tokens/second: {tokens_per_second}, "
+                    f"Generated Tokens:{idx + 1}"
                 )
 
             submit.click(
@@ -318,6 +347,12 @@ class ApiEngine:
         websocket: "websockets.WebSocketServerProtocol",  # type:ignore
         path: str,
     ):
+        """Chooses the appropriate handler based on the WebSocket path.
+
+        Args:
+            websocket: The WebSocket object.
+            path: The path of the WebSocket request.
+        """
         try:
             if path == "/conversation":
                 self.logger.info(
@@ -376,6 +411,8 @@ class ApiEngine:
             )
 
     def fire(self):
+        """Starts the HTTP, WebSocket, and Gradio servers."""
+
         async def _run():
             # HTTP Application
             app = web.Application()
@@ -404,7 +441,8 @@ class ApiEngine:
                 )
             else:
                 self.logger.error(
-                    "Gradio Server wont be launched, gradio not found! (run `pip install gradio`)."
+                    "Gradio Server wont be launched, gradio not found! "
+                    "(run `pip install gradio`)."
                 )
 
             # Start all servers
@@ -418,7 +456,8 @@ class ApiEngine:
 
             if gr is not None:
                 self.logger.info(
-                    f"Gradio server started on http://{self.hostname}:{self.port + 2}"
+                    f"Gradio server started on "
+                    f"http://{self.hostname}:{self.port + 2}"
                 )
 
             # Keep the servers running
@@ -426,6 +465,7 @@ class ApiEngine:
                 await asyncio.Future()
             finally:
                 await runner.cleanup()
-                await gradio_server.close()
+                if gr is not None:
+                    await gradio_server.close()
 
         asyncio.run(_run())
