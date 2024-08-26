@@ -1,5 +1,7 @@
 import os
+import functools
 import sys
+
 
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 os.environ["XLA_FLAGS"] = (
@@ -19,6 +21,11 @@ sys.path.append(
 import jax
 
 jax.config.update("jax_platform_name", "cpu")  # CPU Test !
+import fjformer
+import fjformer.jaxpruner.sparsity_distributions
+
+import fjformer.jaxpruner.sparsity_schedules
+
 import flax.core
 from datasets import Dataset, IterableDataset
 from easydel import (
@@ -33,7 +40,7 @@ from easydel import (
 
 from jax import numpy as jnp, random
 
-TOTAL_BATCH_SIZE = 8
+TOTAL_BATCH_SIZE = 32
 NUM_TRAIN_EXAMPLES = TOTAL_BATCH_SIZE * 15
 NUM_EVAL_EXAMPLES = TOTAL_BATCH_SIZE * 15
 NUM_TRAIN_EPOCHS = 3
@@ -120,6 +127,12 @@ def main(use_iterable_dataset: bool):
 			scheduler=EasyDeLSchedulers.COSINE,
 			clip_grad=1.0,
 			warmup_steps=5,
+			pruning_module=fjformer.jaxpruner.MagnitudePruning(
+				sparsity_distribution_fn=functools.partial(
+					fjformer.jaxpruner.sparsity_distributions.uniform, sparsity=0.8
+				),
+				scheduler=fjformer.jaxpruner.sparsity_schedules.OneShotSchedule(0),
+			),
 		),
 		dataset_train=example_train_data,
 		dataset_eval=example_eval_data,

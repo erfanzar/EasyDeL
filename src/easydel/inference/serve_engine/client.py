@@ -10,170 +10,169 @@ from easydel.etils.etils import get_logger
 
 logger = get_logger(__name__)
 try:
-    from websocket import create_connection  # noqa #type:ignore
+	from websocket import create_connection  # noqa #type:ignore
 except ModuleNotFoundError:
-    create_connection = None
-    logger.warn("couldn't import websocket, ServerEngine client side won't work.")
+	create_connection = None
+	logger.warn("couldn't import websocket, ServerEngine client side won't work.")
 
 
 @dataclass
 class GenerateGradioOutput:
-    """Dataclass to store Gradio generation output."""
+	"""Dataclass to store Gradio generation output."""
 
-    sequence: str
-    sequence_stream: str
-    token_count: int
-    elapsed_time: float
-    tokens_per_second: float
+	sequence: str
+	sequence_stream: str
+	token_count: int
+	elapsed_time: float
+	tokens_per_second: float
 
 
 @dataclass
 class GenerationProcessOutput:
-    """Dataclass to store generation process output."""
+	"""Dataclass to store generation process output."""
 
-    step: int
-    tokens_generated: int
-    char_generated: int
-    elapsed_time: float
-    tokens_per_second: float
+	step: int
+	tokens_generated: int
+	char_generated: int
+	elapsed_time: float
+	tokens_per_second: float
 
 
 @dataclass
 class SocketGenerationOutput:
-    """Dataclass to store socket generation output."""
+	"""Dataclass to store socket generation output."""
 
-    progress: GenerationProcessOutput
-    response: str
+	progress: GenerationProcessOutput
+	response: str
 
 
 @dataclass
 class HttpGenerationProcessOutput:
-    """Dataclass for HTTP generation process output."""
+	"""Dataclass for HTTP generation process output."""
 
-    tokens_generated: int
-    char_generated: int
-    elapsed_time: float
-    tokens_per_second: float
+	tokens_generated: int
+	char_generated: int
+	elapsed_time: float
+	tokens_per_second: float
 
 
 @dataclass
 class HttpGenerationOutput:
-    """Dataclass for HTTP generation output."""
+	"""Dataclass for HTTP generation output."""
 
-    progress: HttpGenerationProcessOutput
-    response: str
+	progress: HttpGenerationProcessOutput
+	response: str
 
 
 def generate_https(
-    hostname: str,
-    conversation: List[Dict],
-    path: str = "conversation",
-    verify_ssl: bool = False,
+	hostname: str,
+	conversation: List[Dict],
+	path: str = "conversation",
+	verify_ssl: bool = False,
 ) -> HttpGenerationOutput:
-    """Generate text using HTTPS.
+	"""Generate text using HTTPS.
 
-    Args:
-        hostname (str): The hostname of the server.
-        conversation (List[Dict]): The conversation history.
-        path (str, optional): The path to the generation endpoint.
-            Defaults to "conversation".
-        verify_ssl (bool, optional): Whether to verify SSL certificate.
-            Defaults to False.
+	Args:
+	    hostname (str): The hostname of the server.
+	    conversation (List[Dict]): The conversation history.
+	    path (str, optional): The path to the generation endpoint.
+	        Defaults to "conversation".
+	    verify_ssl (bool, optional): Whether to verify SSL certificate.
+	        Defaults to False.
 
-    Returns:
-        HttpGenerationOutput: The generated text and progress information.
-    """
-    params = {"conversation": json.dumps(conversation)}
-    try:
-        response = requests.get(
-            f"https://{hostname}/{path}",
-            params=params,
-            verify=verify_ssl,
-        )
-        response.raise_for_status()  # Raise an exception for bad status codes
-    except requests.exceptions.RequestException as e:
-        print(f"An error occurred: {e}")
-        if e.response:
-            print(f"Response status code: {e.response.status_code}")
-            print(f"Response headers: {e.response.headers}")
-            print(f"Response content: {e.response.text}")
-        raise
-    data = response.json()
-    return HttpGenerationOutput(
-        response=data["response"],
-        progress=HttpGenerationProcessOutput(**data["progress"]),
-    )
+	Returns:
+	    HttpGenerationOutput: The generated text and progress information.
+	"""
+	params = {"conversation": json.dumps(conversation)}
+	try:
+		response = requests.get(
+			f"https://{hostname}/{path}",
+			params=params,
+			verify=verify_ssl,
+		)
+		response.raise_for_status()  # Raise an exception for bad status codes
+	except requests.exceptions.RequestException as e:
+		print(f"An error occurred: {e}")
+		if e.response:
+			print(f"Response status code: {e.response.status_code}")
+			print(f"Response headers: {e.response.headers}")
+			print(f"Response content: {e.response.text}")
+		raise
+	data = response.json()
+	return HttpGenerationOutput(
+		response=data["response"],
+		progress=HttpGenerationProcessOutput(**data["progress"]),
+	)
 
 
 def generate_websocket(
-    hostname: str,
-    conversation: List[Dict],
-    path: str = "conversation",
+	hostname: str,
+	conversation: List[Dict],
+	path: str = "conversation",
 ) -> Generator[SocketGenerationOutput, None, None]:
-    """Generate text using WebSockets.
+	"""Generate text using WebSockets.
 
-    Args:
-        hostname (str): The hostname of the server.
-        conversation (List[Dict]): The conversation history.
-        path (str, optional): The path to the generation endpoint.
-            Defaults to "conversation".
+	Args:
+	    hostname (str): The hostname of the server.
+	    conversation (List[Dict]): The conversation history.
+	    path (str, optional): The path to the generation endpoint.
+	        Defaults to "conversation".
 
-    Yields:
-        SocketGenerationOutput: The generated text and progress information.
-    """
-    hostname = (
-        hostname.replace("https://", "")
-        .replace("http://", "")
-        .replace("ws://", "")
-        .replace("/", "")
-    )
-    ws = create_connection(f"ws://{hostname}/{path}")
-    data_to_send = {"conversation": conversation}
+	Yields:
+	    SocketGenerationOutput: The generated text and progress information.
+	"""
+	hostname = (
+		hostname.replace("https://", "")
+		.replace("http://", "")
+		.replace("ws://", "")
+		.replace("/", "")
+	)
+	ws = create_connection(f"ws://{hostname}/{path}")
+	data_to_send = {"conversation": conversation}
 
-    ws.send(json.dumps(data_to_send))
+	ws.send(json.dumps(data_to_send))
 
-    while True:
-        response = ws.recv()
-        response_data = json.loads(response)
-        if response_data["done"]:
-            break
-        yield SocketGenerationOutput(
-            response=response_data["response"],
-            progress=GenerationProcessOutput(**response_data["progress"]),
-        )
+	while True:
+		response = ws.recv()
+		response_data = json.loads(response)
+		if response_data["done"]:
+			break
+		yield SocketGenerationOutput(
+			response=response_data["response"],
+			progress=GenerationProcessOutput(**response_data["progress"]),
+		)
 
 
 def generate_gradio(
-    url: str,
-    conversation: Dict,
+	url: str,
+	conversation: Dict,
 ):
-    """Generate responses using a Gradio client.
+	"""Generate responses using a Gradio client.
 
-    Args:
-        url (str): The URL of the Gradio server.
-        conversation (Dict): The conversation history.
+	Args:
+	    url (str): The URL of the Gradio server.
+	    conversation (Dict): The conversation history.
 
-    Yields:
-        GenerateGradioOutput: The generated output information.
-    """
-    try:
-        from gradio_client import Client  # noqa # type:ignore
-    except ModuleNotFoundError:
-        raise ModuleNotFoundError(
-            "`gradio_client` no found consider running "
-            "`pip install gradio_client gradio`"
-        )
-    job_arguments = {
-        "conversation": conversation,
-    }
+	Yields:
+	    GenerateGradioOutput: The generated output information.
+	"""
+	try:
+		from gradio_client import Client  # noqa # type:ignore
+	except ModuleNotFoundError:
+		raise ModuleNotFoundError(
+			"`gradio_client` no found consider running " "`pip install gradio_client gradio`"
+		)
+	job_arguments = {
+		"conversation": conversation,
+	}
 
-    client = Client(url, verbose=False)
-    job = client.submit(**job_arguments, api_name="/generate_request")
-    last_sequence = ""
-    while not job.done():
-        response = job.outputs()
-        if len(response) > 0 and last_sequence != response[-1][0]:
-            last_response = list(response[-1])
-            last_response[1] = last_response[0][len(last_sequence) :]
-            yield GenerateGradioOutput(*last_response)
-            last_sequence = last_response[0]
+	client = Client(url, verbose=False)
+	job = client.submit(**job_arguments, api_name="/generate_request")
+	last_sequence = ""
+	while not job.done():
+		response = job.outputs()
+		if len(response) > 0 and last_sequence != response[-1][0]:
+			last_response = list(response[-1])
+			last_response[1] = last_response[0][len(last_sequence) :]
+			yield GenerateGradioOutput(*last_response)
+			last_sequence = last_response[0]
