@@ -40,7 +40,7 @@ def main():
 
 
 def load():
-	state = EasyDeLState.load_state(
+	state = EasyDeLState.load_state(  # noqa
 		"state.easy",
 		init_optimizer_state=False,
 		verbose=True,

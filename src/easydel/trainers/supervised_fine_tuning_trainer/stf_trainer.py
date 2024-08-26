@@ -206,7 +206,8 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
 			arguments.neftune_noise_alpha = neftune_noise_alpha
 			warnings.warn(
 				"You passed a `neftune_noise_alpha` argument to the SFTTrainer, the value you passed will override "
-				"the one in the `TrainArguments`."
+				"the one in the `TrainArguments`.",
+				stacklevel=1
 			)
 		elif not self._trainer_supports_neftune:
 			self.neftune_noise_alpha = neftune_noise_alpha
@@ -261,7 +262,8 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
 			warnings.warn(
 				"You passed a tokenizer with `padding_side` not equal to `right` to the SFTTrainer. This might lead "
 				"to some unexpected behaviour due to overflow issues when training a model in half-precision. "
-				"You might consider adding `tokenizer.padding_side = 'right'` to your code."
+				"You might consider adding `tokenizer.padding_side = 'right'` to your code.",
+				stacklevel=1
 			)
 
 		super().__init__(
@@ -468,7 +470,8 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
 				"the default collator and yield to errors. If you want to inspect dataset other columns "
 				f"(in this case {extra_columns}), you can subclass `DataCollatorForLanguageModeling` in case you "
 				"used the default collator and create your own data collator in order to inspect the "
-				"unused dataset columns."
+				"unused dataset columns.",
+				stacklevel=1
 			)
 
 		tokenized_dataset = dataset.map(
