@@ -1,6 +1,6 @@
 jax>=0.4.30
 jaxlib>=0.4.30
-fjformer==0.0.77
+fjformer==0.0.78
 transformers>=4.40.0
 optax~=0.2.2
 msgpack~=1.0.7
