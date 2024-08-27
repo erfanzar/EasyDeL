@@ -17,7 +17,6 @@ from tqdm.autonotebook import tqdm
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import get_logger
-from easydel.modules.flax_modeling_utils import apply_sparsity_to_params
 from easydel.trainers.base_trainer import (
 	BaseTrainer,
 	TrainerConfigureFunctionOutput,
