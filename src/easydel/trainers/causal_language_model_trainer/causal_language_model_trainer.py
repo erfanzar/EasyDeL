@@ -680,13 +680,14 @@ class CausalLanguageModelTrainer(BaseTrainer):
 			else:
 				sharded_state = self.initialize_state_function()
 			if self.arguments.sparsify_module:
-				sharded_state = sharded_state.replace(
-					params=apply_sparsity_to_params(
-						params=sharded_state.params,
-						sparsify_module=self.arguments.sparse_module_type,
-						verbose=True,
-					)
-				)
+				...  # disabled at the moment to fix shardings..
+				# sharded_state = sharded_state.replace(
+				# 	params=apply_sparsity_to_params(
+				# 		params=sharded_state.params,
+				# 		sparsify_module=self.arguments.sparse_module_type,
+				# 		verbose=True,
+				# 	)
+				# )
 			self.sharded_state = sharded_state
 			return sharded_state, shard_fns, gather_fns
 
@@ -801,6 +802,14 @@ class CausalLanguageModelTrainer(BaseTrainer):
 
 							for ssb in self.arguments.ids_to_pop_from_dataset:
 								_ = batch.pop(ssb, None)
+
+							if self.pruning_module is not None:
+								sharded_state = sharded_state.replace(
+									params=self.pruning_module.pre_forward_update(
+										sharded_state.params,
+										sharded_state.opt_state,
+									)
+								)
 
 							(
 								sharded_state,
