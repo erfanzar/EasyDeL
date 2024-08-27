@@ -52,10 +52,25 @@ def main():
 	model = FlaxMistralForCausalLM(config=config, _do_init=True)
 	params = model.shard_params(model.params)
 
-	# def _sh(*a, **kw):
-	# 	return ((".*", PartitionSpec(("fsdp", "sp"))),)
+	def _sh(*a, **kw):
+		return (
+			("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
+			(
+				"self_attn/(q_proj|k_proj|v_proj)/kernel",
+				PartitionSpec(("fsdp", "sp")),
+			),
+			("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+			("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+			("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+			("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+			("input_layernorm/kernel", PartitionSpec(None)),
+			("post_attention_layernorm/kernel", PartitionSpec(None)),
+			("model/norm/kernel", PartitionSpec(None)),
+			("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
+			(".*", PartitionSpec(("fsdp", "sp"))),
+		)
 
-	# model.config.get_partition_rules = _sh
+	model.config.get_partition_rules = _sh
 	dtype = jnp.float32
 	trainer = SFTTrainer(
 		arguments=TrainArguments(
