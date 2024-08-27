@@ -8,13 +8,15 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 import chex
 import einops
 import fjformer
+import flax.core
 import jax
+import jax.experimental
 import jax.tree_util
 from einops import rearrange
 from fjformer.bit_quantization import config as q_config
 from fjformer.bit_quantization import q_flax
 from fjformer.dtypes import Array8Bit
-from flax import linen as nn
+import flax
 from flax.linen import combine_masks
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
@@ -24,9 +26,9 @@ from jax.experimental.shard_map import shard_map
 from jax.interpreters import pxla
 from jax.sharding import PartitionSpec
 from tqdm.auto import tqdm
-
+from flax import linen as nn
 from easydel.etils.errors import EasyDeLBlockWiseFFNError
-from easydel.etils.etils import get_logger
+from easydel.etils.etils import AVAILABLE_SPARSE_MODULE_TYPES, get_logger
 from easydel.etils.partition_module import PartitionAxis
 from easydel.modules.modeling_utils import EasyMethod
 from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN, EasyQuantizer
@@ -693,7 +695,7 @@ def block_wise_ffn(remat_ffn, inputs, chunk_size: int, deterministic: bool):
 			"input arguments in wrong way in case that you don'position_ids want to use this just pass `use_scan_mlp=False` in "
 			"model config or in config_kwargs in AutoEasyDeLModelForCausalLM or change `scan_mlp_chunk_size` "
 			f"in configs for more information read Docs.\nOriginal Error\n{e}"
-		)
+		) from e
 
 
 def read_depth(params: dict, path: str | None = None, state: dict | None = None):
@@ -714,7 +716,7 @@ def read_depth(params: dict, path: str | None = None, state: dict | None = None)
 def get_maximum_depths(dictionary: dict):
 	maximums = {}
 	minimums = {}
-	for k, v in dictionary.items():
+	for k, _ in dictionary.items():
 		splits = k.split("/")
 		for index, split in enumerate(splits):
 			try:
@@ -884,13 +886,11 @@ def quantize_params(
 	Returns:
 	    Quantized parameters in the same structure as the input.
 	"""
-	# warnings.filterwarnings(
-	#     "ignore",
-	#     "ImplicitArray dtype float16 does not match materialization dtype float32",
-	# )
+
+	its_frozen = isinstance(params, flax.core.FrozenDict)
 	embedding_layer_name = embedding_layer_name or "embedding"
 	pattern = re.compile(quantization_pattern)
-	flatten = not isinstance(params, dict)
+	flatten = is_flatten(params)
 	if not flatten:
 		params = flatten_dict(params)
 	quantizer = EasyQuantizer(
@@ -923,4 +923,63 @@ def quantize_params(
 	if not flatten:
 		params = unflatten_dict(params)
 
+	if its_frozen:
+		return flax.core.FrozenDict(params)
+	return params
+
+
+def print_pytree(pytree):
+	jax.tree_util.tree_map_with_path(
+		lambda p, v: print(
+			f"{fjformer.tree_path_to_string(p,'.')}: dtype:{v.dtype}, shape:{v.shape}"
+		),
+		pytree,
+	)
+
+
+def apply_sparsity_to_params(
+	params: Union[Dict[str, Any], Any],
+	sparsify_module: AVAILABLE_SPARSE_MODULE_TYPES = "bcoo",
+	verbose: bool = True,
+) -> Union[Dict[str, Any], Any]:
+	its_frozen = isinstance(params, flax.core.FrozenDict)
+	flatten = is_flatten(params)
+	if not flatten:
+		params = flatten_dict(params)
+	from jax.experimental import sparse
+
+	sparser = {
+		"bcoo": sparse.BCOO,
+		"bcsr": sparse.BCSR,
+		"coo": sparse.COO,
+		"csr": sparse.CSR,
+	}.get(sparsify_module, None)
+	assert sparser is not None, f"unkown type of sparser {sparsify_module}"
+
+	def filter_params(path, array):
+		layer_name = ".".join(path[0].key)
+		# print(layer_name)
+		if layer_name.endswith("kernel") and 4 > array.ndim > 1:
+			array = sparser.fromdense(array)
+		return array
+
+	total_params = len(jax.tree_util.tree_leaves(params))
+	with tqdm(
+		total=total_params,
+		desc=f"{sparsify_module.capitalize()}",
+		disable=not verbose,
+	) as pbar:
+
+		def _with_progress(path, array):
+			pbar.set_postfix_str(".".join(path[0].key))
+			result = filter_params(path, array)
+			pbar.update(1)
+			return result
+
+		params = jax.tree_util.tree_map_with_path(_with_progress, params)
+
+	if not flatten:
+		params = unflatten_dict(params)
+	if its_frozen:
+		return flax.core.FrozenDict(params)
 	return params

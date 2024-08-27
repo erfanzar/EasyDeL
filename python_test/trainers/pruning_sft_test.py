@@ -1,7 +1,9 @@
-import fjformer
 import functools
 import os
 import sys
+
+import fjformer
+import jax.experimental
 
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 dirname = os.path.dirname(os.path.abspath(__file__))
@@ -23,6 +25,7 @@ from easydel.trainers import conversations_formatting_function
 from easydel.trainers.supervised_fine_tuning_trainer import SFTTrainer
 from jax import numpy as jnp
 from transformers import AutoTokenizer
+from jax.sharding import PartitionSpec
 
 
 def main():
@@ -49,6 +52,10 @@ def main():
 	model = FlaxMistralForCausalLM(config=config, _do_init=True)
 	params = model.shard_params(model.params)
 
+	# def _sh(*a, **kw):
+	# 	return ((".*", PartitionSpec(("fsdp", "sp"))),)
+
+	# model.config.get_partition_rules = _sh
 	dtype = jnp.float32
 	trainer = SFTTrainer(
 		arguments=TrainArguments(
@@ -79,10 +86,12 @@ def main():
 			do_last_save=False,
 			pruning_module=fjformer.jaxpruner.MagnitudePruning(
 				sparsity_distribution_fn=functools.partial(
-					fjformer.jaxpruner.sparsity_distributions.uniform, sparsity=0.8
+					fjformer.jaxpruner.sparsity_distributions.uniform, sparsity=0.4
 				),
 				scheduler=fjformer.jaxpruner.sparsity_schedules.OneShotSchedule(0),
 			),
+			sparsify_module=True,
+			sparse_module_type="bcsr",
 		),
 		train_dataset=train_dataset,
 		eval_dataset=None,  # we don't have eval dataset rn :)

@@ -25,8 +25,9 @@ from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import (
 	AVAILABLE_GRADIENT_CHECKPOINTS,
 	AVAILABLE_OPTIMIZERS,
-	AVAILABLE_SCHEDULERS,
 	AVAILABLE_PRUNING_TYPE,
+	AVAILABLE_SCHEDULERS,
+	AVAILABLE_SPARSE_MODULE_TYPES,
 	EasyDeLGradientCheckPointers,
 	EasyDeLOptimizers,
 	EasyDeLSchedulers,
@@ -127,6 +128,8 @@ class TrainArguments:
 	    offload_device (jax.Device): Device to offload computations to.
 	    rapture_config (Optional[LoraRaptureConfig]): Configuration for XRapTure (LoRA).
 			pruning_module (Optional[AVAILABLE_PRUNING_TYPE]): Configuration Pruning Module.
+			sparse_module_type (AVAILABLE_SPARSE_MODULE_TYPES): sparse model type to be used to prune the params.
+			sparsify_module (bool): whenever to use sparse apply method for faster and better training.
 	    merge_lora_rapture_parameters (bool): Merge LoRA parameters with model parameters.
 	    state_apply_fn_kwarguments_to_model (Optional[dict]): Keyword arguments for the model's apply function.
 	    remove_unused_columns (bool): Remove unused columns from the dataset.
@@ -231,6 +234,8 @@ class TrainArguments:
 	offload_device: jax.Device = jax.devices("cpu")[0]
 	rapture_config: Optional[LoraRaptureConfig] = None
 	pruning_module: AVAILABLE_PRUNING_TYPE = None
+	sparsify_module: bool = False
+	sparse_module_type:AVAILABLE_SPARSE_MODULE_TYPES = "bcoo"
 	merge_lora_rapture_parameters: bool = True
 	state_apply_fn_kwarguments_to_model: Optional[dict] = None
 	remove_unused_columns: bool = True

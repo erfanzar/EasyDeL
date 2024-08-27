@@ -10,12 +10,14 @@ import termcolor
 from fjformer.sharding import make_shard_and_gather_fns, match_partition_rules
 from flax.core import FrozenDict
 from jax import numpy as jnp
+from jax.experimental import sparse
 from jax.sharding import PartitionSpec
 from tqdm.autonotebook import tqdm
 
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import get_logger
+from easydel.modules.flax_modeling_utils import apply_sparsity_to_params
 from easydel.trainers.base_trainer import (
 	BaseTrainer,
 	TrainerConfigureFunctionOutput,
@@ -380,6 +382,8 @@ class CausalLanguageModelTrainer(BaseTrainer):
 		Returns:
 		    TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
 		"""
+		if self.arguments.sparsify_module:
+			self.model.__call__ = sparse.sparsify(self.model.__call__)
 
 		def initialize_state_function():
 			initialized_parameters = self.model.init_weights(
@@ -675,7 +679,14 @@ class CausalLanguageModelTrainer(BaseTrainer):
 					)
 			else:
 				sharded_state = self.initialize_state_function()
-
+			if self.arguments.sparsify_module:
+				sharded_state = sharded_state.replace(
+					params=apply_sparsity_to_params(
+						params=sharded_state.params,
+						sparsify_module=self.arguments.sparse_module_type,
+						verbose=True,
+					)
+				)
 			self.sharded_state = sharded_state
 			return sharded_state, shard_fns, gather_fns
 
