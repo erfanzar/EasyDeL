@@ -117,7 +117,7 @@ class EDPretrainedConfig(PretrainedConfig):
 		block_k_major_dq: int | None = None,
 		block_k_dq: int | None = None,
 		block_q_dq: int | None = None,
-		partition_axis: PartitionAxis = PartitionAxis(),
+		partition_axis: PartitionAxis = PartitionAxis(),  # noqa
 		shard_attention_computation: bool = True,
 		use_sharded_kv_caching: bool = True,
 		use_sharding_constraint: bool = False,
@@ -326,14 +326,16 @@ class EDPretrainedConfig(PretrainedConfig):
 			warnings.warn(
 				"axis_dims argument is not a Sequence of int and it's an string. "
 				"(backbone Warning in EasyDeLModuleConfig)\n"
-				f"\tchanged to {axis_dims}"
+				f"\tchanged to {axis_dims}",
+				stacklevel=1,
 			)
 		if isinstance(axis_names, str):
 			axis_names = eval(axis_names)
 			warnings.warn(
 				"axis_names argument is not a Sequence of strings and it's an string class. "
 				"(backbone Warning in EasyDeLModuleConfig)\n"
-				f"\tchanged to {axis_names}"
+				f"\tchanged to {axis_names}",
+				stacklevel=1,
 			)
 		resh = array_devices.reshape(axis_dims).shape
 
@@ -370,7 +372,7 @@ class EDPretrainedConfig(PretrainedConfig):
 		)
 
 	def jax_mesh(self):
-		warnings.warn("`jax_mesh` is deprecated use `get_mesh` or `mesh`")
+		warnings.warn("`jax_mesh` is deprecated use `get_mesh` or `mesh`", stacklevel=1)
 		return self.get_mesh()
 
 	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
@@ -715,7 +717,7 @@ class EDPretrainedConfig(PretrainedConfig):
 
 	def add_jax_args(self, **kwargs):
 		for k, v in kwargs.items():
-			set_attrs_smartly(self, "k", v, v)
+			set_attrs_smartly(self, k, v, v)
 
 	def __str__(self):
 		"""The __str__ function is called when you use the print function or when str() is used.
@@ -1188,11 +1190,11 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 		pretrained_model_name_or_path: Union[str, os.PathLike],
 		sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
 		sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-		partition_axis: PartitionAxis = PartitionAxis(),
+		partition_axis: PartitionAxis = PartitionAxis(),  # noqa
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
 		safe: bool = True,
-		precision: jax.lax.PrecisionLike = jax.lax.Precision("fastest"),
+		precision: jax.lax.PrecisionLike = jax.lax.Precision("fastest"),  # noqa
 		input_shape: Optional[Tuple[int, int]] = None,
 		config_kwargs: Optional[dict[str, Any]] = None,
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
@@ -1341,7 +1343,9 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 						"_commit_hash": commit_hash,
 					}
 					resolved_archive_file = _cached_file(
-						pretrained_model_name_or_path, filename, **cached_file_kwargs
+						pretrained_model_name_or_path,
+						filename,
+						**cached_file_kwargs,
 					)
 
 					if resolved_archive_file is None:
@@ -1354,7 +1358,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 						" from 'https://huggingface.co/models', make sure you don't have a local directory with the"
 						f" same name. Otherwise, make sure '{pretrained_model_name_or_path}' is the correct path to a"
 						f" directory containing a file named {FLAX_WEIGHTS_NAME}."
-					)
+					) from None
 
 			if is_local:
 				logger.info(f"loading weights file {archive_file}")

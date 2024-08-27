@@ -6,19 +6,20 @@ from typing import (
 	Dict,
 	List,
 	Literal,
-	Tuple,
 	Optional,
+	Tuple,
 	Union,
 )
+
 from fjformer.jaxpruner import (
+	GlobalMagnitudePruning,
+	GlobalSaliencyPruning,
 	MagnitudePruning,
 	NoPruning,
 	RandomPruning,
 	SaliencyPruning,
-	SteRandomPruning,
 	SteMagnitudePruning,
-	GlobalSaliencyPruning,
-	GlobalMagnitudePruning,
+	SteRandomPruning,
 )
 
 
@@ -104,6 +105,7 @@ AVAILABLE_PRUNING_TYPE = Optional[
 		GlobalMagnitudePruning,
 	]
 ]
+AVAILABLE_SPARSE_MODULE_TYPES = Literal["bcoo", "bcsr", "coo", "csr"]
 
 
 def get_logger(name, level: int = logging.INFO) -> logging.Logger:

@@ -16,8 +16,9 @@ from jax import numpy as jnp
 from jax.experimental.serialize_executable import deserialize_and_load, serialize
 from jax.sharding import NamedSharding, PartitionSpec
 
-from easydel.etils.etils import get_logger
+from easydel.etils.etils import AVAILABLE_SPARSE_MODULE_TYPES, get_logger
 from easydel.inference.generation_pipeline import utils as inference_utils
+from easydel.modules.flax_modeling_utils import apply_sparsity_to_params
 from easydel.modules.modeling_utils import EDPretrainedModel
 
 GenerationPipelineConfig = inference_utils.GenerationPipelineConfig
@@ -44,6 +45,8 @@ class GenerationPipeline:
 	    parameters_are_quantized (bool, optional): Whether the model parameters are quantized. Defaults to False.
 	    force_sharding (bool): Whether to pass in and out shardings to `jax.jit` function
 	        (must be off in case of using `parameters_are_quantized`). Defaults to False.
+			sparse_module_type (AVAILABLE_SPARSE_MODULE_TYPES): sparse model type to be used to prune the params.
+			use_pruner (bool): whenever to use prunner for faster inference.
 	"""
 
 	def __init__(
@@ -54,19 +57,32 @@ class GenerationPipeline:
 		generation_config: Optional[GenerationPipelineConfig] = None,
 		add_params_field=None,
 		seed: Optional[int] = None,
-		input_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp")),
+		input_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp")),  # noqa
 		partition_rules=None,
 		parameters_are_quantized: bool = False,
 		force_sharding: bool = False,
+		sparse_module_type: AVAILABLE_SPARSE_MODULE_TYPES = "bcoo",
+		use_pruner: bool = False,
 	):
 		if add_params_field is not None:
-			warnings.warn("`add_params_field` is deprecated and soon will be removed.")
+			warnings.warn(
+				"`add_params_field` is deprecated and soon will be removed.",
+				stacklevel=1,
+			)
 		if generation_config is None:
 			generation_config = GenerationPipelineConfig()
 		params_get = params.get("params", None)
 		if params_get is not None:
-			warnings.warn("`params` field should be like {k:v} not {'params':{k:v}}")
+			warnings.warn(
+				"`params` field should be like {k:v} not {'params':{k:v}}",
+				stacklevel=1,
+			)
 			params = params_get
+		if use_pruner:
+			params = apply_sparsity_to_params(
+				params=parameters_are_quantized,
+				sparsify_module=sparse_module_type,
+			)
 		self.model = model
 		self.params = params
 		self.tokenizer = tokenizer
@@ -150,7 +166,8 @@ class GenerationPipeline:
 		if attention_mask is None:
 			warnings.warn(
 				"`attention_mask` is not provided, it's recommended to "
-				"pass an attention mask for better results."
+				"pass an attention mask for better results.",
+				stacklevel=1,
 			)
 			attention_mask = jnp.ones_like(input_ids)
 
