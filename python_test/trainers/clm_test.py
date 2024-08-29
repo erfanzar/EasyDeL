@@ -16,31 +16,35 @@ sys.path.append(
 		"../../src",
 	)
 )
-import jax
+# import jax
 
-jax.config.update("jax_platform_name", "cpu")  # CPU Test !
+import fjformer
+
+# jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 import flax.core
 from datasets import Dataset, IterableDataset
 from easydel import (
 	AttentionMechanisms,
 	CausalLanguageModelTrainer,
+	EasyDeLOptimizers,
+	EasyDeLSchedulers,
 	FlaxMistralForCausalLM,
 	MistralConfig,
 	TrainArguments,
-	EasyDeLOptimizers,
-	EasyDeLSchedulers,
 )
-
-from jax import numpy as jnp, random
+from jax import numpy as jnp
+from jax import random
 
 TOTAL_BATCH_SIZE = 8
-NUM_TRAIN_EXAMPLES = TOTAL_BATCH_SIZE * 15
-NUM_EVAL_EXAMPLES = TOTAL_BATCH_SIZE * 15
+UPPER = 300
+NUM_TRAIN_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
+NUM_EVAL_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
 NUM_TRAIN_EPOCHS = 3
+rng = fjformer.GenerateRNG()
 
 
 def main(use_iterable_dataset: bool):
-	sequence_length = 512
+	sequence_length = 128
 	max_training_steps = NUM_TRAIN_EXAMPLES // TOTAL_BATCH_SIZE * NUM_TRAIN_EPOCHS
 	max_evaluation_steps = NUM_EVAL_EXAMPLES // TOTAL_BATCH_SIZE
 	config = MistralConfig(
@@ -49,12 +53,11 @@ def main(use_iterable_dataset: bool):
 		num_key_value_heads=4,
 		num_hidden_layers=4,
 		intermediate_size=256,
-		gradient_checkpointing="",
 		max_position_embeddings=sequence_length,
 		attn_dtype=jnp.float16,
 		attn_mechanism=AttentionMechanisms.pallas_flash,
-		block_k=128,
-		block_q=128,
+		block_k=32,
+		block_q=32,
 	)
 
 	model = FlaxMistralForCausalLM(config=config, _do_init=True)
@@ -64,9 +67,7 @@ def main(use_iterable_dataset: bool):
 		for _ in range(num_rows):
 			yield {
 				"attention_mask": jnp.ones((sequence_length,), dtype="i4"),
-				"input_ids": random.randint(
-					random.PRNGKey(0), (sequence_length,), 0, 32000, dtype="i4"
-				),
+				"input_ids": random.randint(rng.rng, (sequence_length,), 0, 32000, dtype="i4"),
 			}
 
 	if not use_iterable_dataset:
@@ -124,7 +125,7 @@ def main(use_iterable_dataset: bool):
 		dataset_train=example_train_data,
 		dataset_eval=example_eval_data,
 	)
-
+	
 	output = trainer.train(model_parameters=flax.core.FrozenDict({"params": params}))
 	trainer.save_pretrained(output.state, to_torch=True)
 

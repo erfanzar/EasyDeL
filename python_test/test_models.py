@@ -615,7 +615,7 @@ if __name__ == "__main__":
 	# unittest.main()
 	test = EasyModelsTest()
 	test.setUp()
-	# test.test_mistral() # Passed v0.0.80
+	test.test_mistral()  # Passed v0.0.80
 	# test.test_gemma() # Passed v0.0.80
 	# test.test_gemma2()  # Passed v0.0.80
 	# test.test_llama()  #  Llama 3.1 Passed v0.0.80

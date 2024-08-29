@@ -125,7 +125,7 @@ def main():
         shard_attention_computation=config.shard_attention_computation,
         precision=lax.Precision("fastest"),
         force_float32_tpu=True,
-        attn_mechanism="sharded_vanilla",
+        attn_mechanism="jax_flash_attn2",
         dtype=jnp.float32,
         scan_ring_attention=config.scan_ring_attention,
         mesh=config.mesh,

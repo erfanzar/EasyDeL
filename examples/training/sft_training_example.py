@@ -1,27 +1,26 @@
-import transformers
-
 import easydel
+import jax
+import transformers
+from datasets import load_dataset
 from easydel import (
     AutoEasyDeLModelForCausalLM,
-    TrainArguments,
+    EasyDeLGradientCheckPointers,
     EasyDeLOptimizers,
     EasyDeLSchedulers,
-    EasyDeLGradientCheckPointers,
     EasyDeLState,
     LoraRaptureConfig,
     SFTTrainer,
-    get_modules_by_type,
-    easystate_to_huggingface_model,
+    TrainArguments,
     conversations_formatting_function,
+    easystate_to_huggingface_model,
+    get_modules_by_type,
 )
-from datasets import load_dataset
-from flax.core import FrozenDict
-from transformers import AutoTokenizer
-from jax import numpy as jnp, sharding
-import jax
-from transformers import AutoConfig
-from huggingface_hub import HfApi
 from easydel.etils import define_flags_with_default
+from flax.core import FrozenDict
+from huggingface_hub import HfApi
+from jax import numpy as jnp
+from jax import sharding
+from transformers import AutoConfig, AutoTokenizer
 
 PartitionSpec = sharding.PartitionSpec
 api = HfApi()
@@ -37,7 +36,7 @@ FLAGS, DEF_FLAGS = define_flags_with_default(
     input_shape=(8, 2048),
     use_lora=False,
     block_size=512,
-    attn_mechanism="sharded_vanilla",
+    attn_mechanism="jax_flash_attn2",
     weight_decay=0.02,
     total_batch_size=24,
     gradient_accumulation_steps=1,

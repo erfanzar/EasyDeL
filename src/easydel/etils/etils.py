@@ -105,6 +105,35 @@ AVAILABLE_PRUNING_TYPE = Optional[
 		GlobalMagnitudePruning,
 	]
 ]
+_AVAILABLE_ATTENTION_MECHANISMS = [
+	"vanilla",
+	"flash",
+	"jax_flash_attn2",
+	"splash",
+	"ring",
+	"cudnn",
+	"local_ring",
+	"sharded_vanilla",
+	"legacy_sharded_vanilla",
+	"wise_ring",
+	"blockwise",
+	"pallas_flash",
+]
+AVAILABLE_ATTENTION_MECHANISMS = Literal[
+	"vanilla",
+	"flash",
+	"jax_flash_attn2",
+	"splash",
+	"ring",
+	"cudnn",
+	"local_ring",
+	"sharded_vanilla",
+	"legacy_sharded_vanilla",
+	"wise_ring",
+	"blockwise",
+	"pallas_flash",
+]
+
 AVAILABLE_SPARSE_MODULE_TYPES = Literal["bcoo", "bcsr", "coo", "csr"]
 
 

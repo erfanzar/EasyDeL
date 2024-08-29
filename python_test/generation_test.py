@@ -1,8 +1,7 @@
-import unittest
-from unittest import TestCase
-
 import os
 import sys
+import unittest
+from unittest import TestCase
 
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 dirname = os.path.dirname(os.path.abspath(__file__))
@@ -13,14 +12,15 @@ sys.path.append(
 		"../src",
 	)
 )
-import easydel as ed
 from typing import Dict, Literal, Optional, Union
 
+import easydel as ed
 import jax
 import numpy as np
 import torch
 import transformers
 from jax import numpy as jnp
+from src.easydel.etils.etils import AVAILABLE_ATTENTION_MECHANISMS
 
 torch.manual_seed(42)
 
@@ -62,19 +62,9 @@ class EasyModelsGenerationTest(TestCase):
 		self.rotary_dim = 32
 		self.dtype: jax.numpy.dtype = jnp.float32
 		self.precision = jax.lax.Precision("fastest")
-		self.attn_mechanism: Literal[
-			"vanilla",
-			"flash",
-			"splash",
-			"ring",
-			"cudnn",
-			"local_ring",
-			"sharded_vanilla",
-			"legacy_sharded_vanilla",
-			"wise_ring",
-			"blockwise",
-			"pallas_flash",
-		] = "sharded_vanilla"
+		self.attn_mechanism: ed.etils.etils.AVAILABLE_ATTENTION_MECHANISMS = (
+			"jax_flash_attn2"
+		)
 		self.block_k: int = 64
 		self.block_q: int = 64
 		self.scan_mlp_chunk_size = self.sequence_length // 2

@@ -32,7 +32,7 @@ from jax import numpy as jnp
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec
 
-from easydel.etils.etils import get_logger
+from easydel.etils.etils import get_logger, AVAILABLE_ATTENTION_MECHANISMS
 from easydel.etils.partition_module import PartitionAxis
 from easydel.modules._blockwise_attention import blockwise_attn
 from easydel.modules._ring_attention import ring_attention_standard, wise_ring_attention
@@ -42,6 +42,7 @@ from easydel.modules._vanilla_attention import (
 )
 from easydel.modules.flax_modeling_utils import get_gradient_checkpoint_policy
 from easydel.modules.modeling_utils import EDPretrainedConfig
+from easydel.modules._flash_attention import flash_attention2 as jax_flash_attention2
 
 logger = get_logger(__name__)
 
@@ -73,6 +74,7 @@ class AttentionOutput:
 
 @dataclass
 class AttentionMechanisms:
+	jax_flash_attn2: Literal["jax_flash_attn2"] = "jax_flash_attn2"
 	vanilla: Literal["vanilla"] = "vanilla"
 	flash: Literal["flash"] = "flash"
 	splash: Literal["splash"] = "splash"
@@ -204,22 +206,10 @@ class FlexibleAttentionModule(object):
 	def __init__(
 		self,
 		mesh: Mesh,
-		attn_mechanism: Literal[
-			"vanilla",
-			"flash",
-			"splash",
-			"ring",
-			"cudnn",
-			"local_ring",
-			"sharded_vanilla",
-			"legacy_sharded_vanilla",
-			"wise_ring",
-			"blockwise",
-			"pallas_flash",
-		],
 		sm_scale: float,
 		num_attention_heads: int,
 		head_dims: int,
+		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = AttentionMechanisms.jax_flash_attn2,
 		block_k: int = ...,
 		block_q: int = ...,
 		block_b: int = ...,
@@ -652,16 +642,25 @@ class FlexibleAttentionModule(object):
 					query_sequence_length=query_sequence_length,
 					key_value_sequence_length=key_value_sequence_length,
 				)
-			if self.attn_mechanism == "flash":
+			if self.attn_mechanism == AttentionMechanisms.jax_flash_attn2:
+				return self.jax_flash_attn2(
+					query_states=query_states,
+					key_states=key_states,
+					value_states=value_states,
+					bias=bias,
+				)
+			elif self.attn_mechanism == "flash":
 				if segment_ids is not None:
 					warnings.warn(
 						"Flash attention don't support `segment_ids` this argument will be ignored",
 						UserWarning,
+						stacklevel=1,
 					)
 				if self.attention_dropout != 0.0:
 					warnings.warn(
 						"Flash attention don't support `attention_dropout` this argument will be ignored",
 						UserWarning,
+						stacklevel=1,
 					)
 
 				return self.flash_attention(
@@ -734,16 +733,19 @@ class FlexibleAttentionModule(object):
 					warnings.warn(
 						"Splash attention don't support `segment_ids` this argument will be ignored",
 						UserWarning,
+						stacklevel=1,
 					)
 				if self.attention_dropout != 0.0:
 					warnings.warn(
 						"Splash attention don't support `attention_dropout` this argument will be ignored",
 						UserWarning,
+						stacklevel=1,
 					)
 				if bias is not None:
 					warnings.warn(
 						"Splash attention don't support `bias` this argument will be ignored",
 						UserWarning,
+						stacklevel=1,
 					)
 
 				return self.splash_attention(
@@ -759,6 +761,7 @@ class FlexibleAttentionModule(object):
 					warnings.warn(
 						"BlockWise Attention don't support `segment_ids` this argument will be ignored",
 						UserWarning,
+						stacklevel=1,
 					)
 				return self.blockwise_attention(
 					query_states=query_states,
@@ -786,11 +789,13 @@ class FlexibleAttentionModule(object):
 					warnings.warn(
 						"LocalRing Attention don't support `segment_ids` this argument will be ignored",
 						UserWarning,
+						stacklevel=1,
 					)
 				if self.attention_dropout != 0.0:
 					warnings.warn(
 						"LocalRing Attention don't support `attention_dropout` this argument will be ignored",
 						UserWarning,
+						stacklevel=1,
 					)
 
 				return self.local_ring_attention(
@@ -806,11 +811,13 @@ class FlexibleAttentionModule(object):
 					warnings.warn(
 						"WiseRing Attention don't support `segment_ids` this argument will be ignored",
 						UserWarning,
+						stacklevel=1,
 					)
 				if self.attention_dropout != 0.0:
 					warnings.warn(
 						"WiseRing Attention don't support `attention_dropout` this argument will be ignored",
 						UserWarning,
+						stacklevel=1,
 					)
 
 				return self.wise_ring_attention(
@@ -824,6 +831,52 @@ class FlexibleAttentionModule(object):
 				)
 			else:
 				raise ValueError(f"Unknown Attention mechanism of {self.attn_mechanism}")
+
+	def jax_flash_attn2(
+		self,
+		*,  # it's Kwarg Only
+		query_states: Array,
+		key_states: Array,
+		value_states: Array,
+		bias: Optional[Array] = None,
+		mask: Optional[Array] = None,
+	):
+		query_states, key_states, value_states = map(
+			lambda x: x.transpose(0, 2, 1, 3),
+			[query_states, key_states, value_states],
+		)
+		# qps, kps, vps, bps, aps, _ = self.get_bhsd_partition_specs(query_states.shape[2])
+		# attention_outputs = shard_map(
+		# 	partial(
+		# 		jax_flash_attention2,
+		# 		q_block=self.block_q,
+		# 		k_block=self.block_k,
+		# 		precision=self.precision,
+		# 		dtype=self.dtype,
+		# 	),
+		# 	mesh=self.mesh,
+		# 	in_specs=(
+		# 		qps,
+		# 		kps,
+		# 		vps,
+		# 		None,
+		# 		bps,
+		# 	),
+		# 	out_specs=aps,
+		# 	check_rep=False,
+		# )(query_states, key_states, value_states, None, bias)
+		attention_outputs = jax_flash_attention2(
+			q=query_states,
+			k=key_states,
+			v=value_states,
+			mask=mask,
+			bias=bias,
+			q_block=self.block_q,
+			k_block=self.block_k,
+			precision=self.precision,
+			dtype=self.dtype,
+		)
+		return AttentionOutput(attention_weights=None, attention_outputs=attention_outputs)
 
 	def local_ring_attention(
 		self,
@@ -922,7 +975,8 @@ class FlexibleAttentionModule(object):
 					"`ring_attention_sharded`"
 					f" Usage conditions was\nscan_ring_attention = {self.scan_ring_attention} [MUST BE TRUE]"
 					f"\nquery_states.shape[1]({query_states.shape[1]}) > max({self.block_q},{self.block_k})"
-					f"({max(self.block_q, self.block_k)})"
+					f"({max(self.block_q, self.block_k)})",
+					stacklevel=1,
 				)
 			query_sequence_partition = (
 				self.partition_axis.generation_query_sequence_axis
@@ -1014,7 +1068,8 @@ class FlexibleAttentionModule(object):
 			chunk = seq_length > max(self.block_q, self.block_k)
 			warnings.warn(
 				f"generation process detected, switching to local ring attention"
-				f" [CHUNK : {chunk}, SCAN : {self.scan_ring_attention}, {self.block_k=}, {self.block_q=}, {seq_length=}]"
+				f" [CHUNK : {chunk}, SCAN : {self.scan_ring_attention}, {self.block_k=}, {self.block_q=}, {seq_length=}]",
+				stacklevel=1,
 			)
 			return self.local_ring_attention(
 				query_states=query_states,
@@ -1293,7 +1348,8 @@ class FlexibleAttentionModule(object):
 			attention_mask = SegmentIds(attention_mask, attention_mask)
 		else:
 			warnings.warn(
-				"`attention_mask` is not passed to SplashAttention. (except miss computation problem)"
+				"`attention_mask` is not passed to SplashAttention. (except miss computation problem)",
+				stacklevel=1,
 			)
 
 		@partial(
@@ -1404,8 +1460,8 @@ class FlexibleAttentionModule(object):
 			raise RuntimeError(
 				"Please install transformer_engine first. you can install that by running "
 				f"`pip install git+https://github.com/NVIDIA/TransformerEngine`"
-				f"\nhere's extra information on error\n{err}"
-			)
+				f"\nhere's extra information on error\n{err}",
+			) from err
 		batch, query_sequence_length, num_attention_heads, head_dim = query_states.shape
 
 		qkv_layout = QKVLayout.BS3HD
@@ -1480,7 +1536,7 @@ class FlexibleAttentionModule(object):
 		head_dim=128,
 		dtype=jnp.float16,
 		calculate_gradients: bool = True,
-		test_attentions=[
+		test_attentions=[  # noqa: B006
 			"local_ring",
 			"blockwise",
 			"vanilla",
@@ -1500,7 +1556,7 @@ class FlexibleAttentionModule(object):
 		try:
 			import pandas
 		except (ModuleNotFoundError, ImportError):
-			warnings.warn("couldn't import pandas ... please install pandas")
+			warnings.warn("couldn't import pandas ... please install pandas", stacklevel=1)
 			pandas = None
 		from fjformer import GenerateRNG
 

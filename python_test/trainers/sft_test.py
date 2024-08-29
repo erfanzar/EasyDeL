@@ -10,13 +10,18 @@ sys.path.append(
 		"../../src",
 	)
 )
-import jax
+# import jax
 
-jax.config.update("jax_platform_name", "cpu")  # CPU Test !
+# jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 
 import flax.core
 from datasets import load_dataset
-from easydel import FlaxMistralForCausalLM, MistralConfig, TrainArguments
+from easydel import (
+	FlaxMistralForCausalLM,
+	MistralConfig,
+	TrainArguments,
+	AttentionMechanisms,
+)
 from easydel.trainers import conversations_formatting_function
 from easydel.trainers.supervised_fine_tuning_trainer import SFTTrainer
 from jax import numpy as jnp
@@ -33,6 +38,10 @@ def main():
 		intermediate_size=256,
 		gradient_checkpointing="",
 		max_position_embeddings=sequence_length,
+		attn_dtype=jnp.float16,
+		attn_mechanism=AttentionMechanisms.pallas_flash,
+		block_k=32,
+		block_q=32,
 	)
 
 	tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
@@ -72,9 +81,9 @@ def main():
 			label_smoothing_factor=0.1,
 			z_loss=0.0001,
 			train_on_inputs=True,
-			save_steps=500,
+			# save_steps=500,
 			save_total_limit=1,
-			do_last_save=False,
+			do_last_save=True,
 		),
 		train_dataset=train_dataset,
 		eval_dataset=None,  # we don't have eval dataset rn :)
