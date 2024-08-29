@@ -876,7 +876,10 @@ class FlexibleAttentionModule(object):
 			precision=self.precision,
 			dtype=self.dtype,
 		)
-		return AttentionOutput(attention_weights=None, attention_outputs=attention_outputs)
+		return AttentionOutput(
+			attention_weights=None,
+			attention_outputs=attention_outputs.transpose(0, 2, 1, 3),
+		)
 
 	def local_ring_attention(
 		self,
