@@ -44,10 +44,11 @@ EasyDeL provides unparalleled flexibility in customizing and optimizing your mod
 - **Algorithm Customization**: Modify and fine-tune algorithms to suit your specific needs and hardware configurations.
 
 - **Attention Mechanisms**: Choose from over 10 types of attention mechanisms optimized for GPU/TPU/CPU, including:
-  - Flash Attention
-  - Blockwise Attention
-  - Ring Attention
-  - Splash Attention
+  - Flash Attention 2 (CPU/GPU/TPU | Jax)
+  - Flash Attention (GPU | Triton-Jax)
+  - Blockwise Attention (CPU/GPU/TPU | Pallas-Jax)
+  - Ring Attention (CPU/GPU/TPU | Pallas-Jax)
+  - Splash Attention (TPU | Pallas)
   - And many more!
 
 This level of customization allows you to squeeze every ounce of performance from your hardware while tailoring the model behavior to your exact requirements.
