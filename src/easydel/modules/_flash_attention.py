@@ -100,8 +100,6 @@ def flash_attention2(
 @functools.partial(
 	jax.custom_vjp,
 	nondiff_argnums=(
-		3,
-		4,
 		5,
 		6,
 		7,
@@ -269,12 +267,12 @@ def _fwd_flash_attn(
 		q,  #: jax.Array
 		k,  #: jax.Array
 		v,  #: jax.Array
+		mask,
+		bias,
 	)
 
 
 def _bwd_flash_attn(
-	mask,
-	bias,
 	dropout: float,
 	inference: bool,
 	key: Optional[jax.random.PRNGKey],
@@ -295,6 +293,8 @@ def _bwd_flash_attn(
 		q,
 		k,
 		v,
+		mask,
+		bias,
 	) = residuals
 	dO = grad_in
 
@@ -398,7 +398,7 @@ def _bwd_flash_attn(
 		call_o,
 		(0, dQ, dK, dV),
 	)
-	return dQ, dK, dV
+	return dQ, dK, dV, None, None
 
 
 _flash_attn.defvjp(_fwd_flash_attn, _bwd_flash_attn)
