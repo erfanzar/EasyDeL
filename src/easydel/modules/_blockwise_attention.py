@@ -24,7 +24,7 @@ def blockwise_attn(
 	query_chunk_size=2048,
 	key_chunk_size=2048,
 	dtype=jnp.float32,
-	policy=jax.checkpoint_policies.nothing_saveable(),
+	policy=jax.checkpoint_policies.nothing_saveable(),  # noqa: B008
 	precision=None,
 	float32_logits=True,
 	prevent_cse=True,

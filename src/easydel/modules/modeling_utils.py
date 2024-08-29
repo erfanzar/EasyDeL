@@ -30,29 +30,17 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import numpy as jnp
 from jax.experimental.mesh_utils import create_device_mesh
 from jax.sharding import Mesh, PartitionSpec
+from tqdm.auto import tqdm
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_flax_utils import FlaxPreTrainedModel
 
 from easydel.etils.easystate import EasyDeLState
-from easydel.etils.etils import get_logger
+from easydel.etils.etils import AVAILABLE_ATTENTION_MECHANISMS, get_logger
 from easydel.etils.partition_module import PartitionAxis
 from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN, EasyQuantizer
-from tqdm.auto import tqdm
 
 logger = get_logger(__name__)
-AVAILABLE_ATTENTION_MECHANISMS = Literal[
-	"vanilla",
-	"flash",
-	"splash",
-	"ring",
-	"cudnn",
-	"local_ring",
-	"sharded_vanilla",
-	"legacy_sharded_vanilla",
-	"wise_ring",
-	"blockwise",
-	"pallas_flash",
-]
+
 FLAX_WEIGHTS_NAME = "easydel-model.parameters"
 
 
@@ -77,7 +65,7 @@ class EDPretrainedConfig(PretrainedConfig):
 	Args:
 	    axis_dims (Sequence[int]): Specify the number of dimensions for each axis
 	    axis_names (Sequence[str]): Set the names of the axes
-	    attn_mechanism (Literal["vanilla", "flash", "splash", "ring"]): attention mechanism to use
+	    attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS): attention mechanism to use
 	    block_k (int): block size of key_states
 	    block_q (int): block size of query_states
 	    block_b (int): block size of bias
@@ -105,7 +93,7 @@ class EDPretrainedConfig(PretrainedConfig):
 		self,
 		axis_dims: Sequence[int] = (1, -1, 1, 1),
 		axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "sharded_vanilla",
+		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "jax_flash_attn2",
 		block_k: int = 128,
 		block_q: int = 128,
 		block_b: int = 1,
@@ -567,7 +555,7 @@ class EDPretrainedConfig(PretrainedConfig):
 		set_attrs_smartly(
 			self,
 			"attn_mechanism",
-			"sharded_vanilla",
+			"jax_flash_attn2",
 			attn_mechanism,
 		)
 
