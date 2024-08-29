@@ -167,15 +167,16 @@ def _fwd_flash_attn(
 	o = jnp.zeros(o_shape, dtype=dtype)
 
 	lse = jnp.full((b, h, q_seq), fill_value=-jnp.inf, dtype=jnp.float32)
-	if isinstance(q.sharding, jax.sharding.NamedSharding):
-		with q.sharding.mesh:
-			o = with_sharding_constraint(o, q.sharding.spec)
-			lse = with_sharding_constraint(lse, q.sharding.spec[:3])
-	elif isinstance(q.sharding, jax.sharding.SingleDeviceSharding) and hasattr(
-		q.sharding, "_device"
-	):
-		o = jax.device_put(o, q.sharding._device)
-		lse = jax.device_put(lse, q.sharding._device)
+	if hasattr(q, "sharding"):
+		if isinstance(q.sharding, jax.sharding.NamedSharding):
+			with q.sharding.mesh:
+				o = with_sharding_constraint(o, q.sharding.spec)
+				lse = with_sharding_constraint(lse, q.sharding.spec[:3])
+		elif isinstance(q.sharding, jax.sharding.SingleDeviceSharding) and hasattr(
+			q.sharding, "_device"
+		):
+			o = jax.device_put(o, q.sharding._device)
+			lse = jax.device_put(lse, q.sharding._device)
 
 	global_mask = mask
 
