@@ -6,18 +6,16 @@ import unittest
 import jax.random
 from fjformer import make_shard_and_gather_fns, match_partition_rules
 
-
 sys.path.append(
 	os.path.join(
 		os.path.dirname(os.path.abspath(__file__)),
 		"../src",
 	)
 )
-import easydel as ed
-
 import copy
-from typing import Dict, Literal, Optional, Union
+from typing import Dict, Optional, Union
 
+import easydel as ed
 import jax
 import numpy as np
 import torch
@@ -25,6 +23,8 @@ import transformers
 from fjformer.functions import cross_entropy_loss_and_accuracy
 from flax.traverse_util import flatten_dict, unflatten_dict  # noqa
 from jax import numpy as jnp
+
+from easydel.etils.etils import AVAILABLE_ATTENTION_MECHANISMS
 
 torch.manual_seed(42)
 
@@ -66,19 +66,7 @@ class EasyModelsTest(unittest.TestCase):
 		self.rotary_dim = 32
 		self.dtype: jax.numpy.dtype = jnp.float32
 		self.precision = jax.lax.Precision("highest")
-		self.attn_mechanism: Literal[
-			"vanilla",
-			"flash",
-			"splash",
-			"ring",
-			"cudnn",
-			"local_ring",
-			"sharded_vanilla",
-			"legacy_sharded_vanilla",
-			"wise_ring",
-			"blockwise",
-			"pallas_flash",
-		] = "sharded_vanilla"
+		self.attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "jax_flash_attn2"
 		self.block_k: int = 32
 		self.block_q: int = 32
 		self.sequence_length = 64
