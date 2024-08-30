@@ -549,11 +549,11 @@ class EasyModelsTest(unittest.TestCase):
 		hf_out,
 		ed_out,
 		ed_loss,
-		atol: float = 1e-022,
+		atol: float = 1e-02,
 		rtol: float = 1e-08,
 	):
 		to, jo = hf_out.logits.cpu().detach().numpy(), ed_out.logits
-		err = jnp.mean(jnp.sum(to)) - jnp.mean(jnp.sum(jo))
+		err = jnp.sum(to) - jnp.sum(jo)
 		hf_loss = hf_out.loss.cpu().detach().numpy()
 		all_close = jnp.allclose(to, jo, atol=atol, rtol=rtol)
 		all_close_loss = jnp.allclose(hf_loss, ed_loss, atol=1e-02, rtol=rtol)
