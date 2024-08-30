@@ -32,9 +32,10 @@ from jax import numpy as jnp
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec
 
-from easydel.etils.etils import get_logger, AVAILABLE_ATTENTION_MECHANISMS
+from easydel.etils.etils import AVAILABLE_ATTENTION_MECHANISMS, get_logger
 from easydel.etils.partition_module import PartitionAxis
 from easydel.modules._blockwise_attention import blockwise_attn
+from easydel.modules._flash_attention import flash_attention2 as jax_flash_attention2
 from easydel.modules._ring_attention import ring_attention_standard, wise_ring_attention
 from easydel.modules._vanilla_attention import (
 	shard_vanilla_attention,
@@ -42,7 +43,6 @@ from easydel.modules._vanilla_attention import (
 )
 from easydel.modules.flax_modeling_utils import get_gradient_checkpoint_policy
 from easydel.modules.modeling_utils import EDPretrainedConfig
-from easydel.modules._flash_attention import flash_attention2 as jax_flash_attention2
 
 logger = get_logger(__name__)
 
@@ -845,37 +845,39 @@ class FlexibleAttentionModule(object):
 			lambda x: x.transpose(0, 2, 1, 3),
 			[query_states, key_states, value_states],
 		)
-		# qps, kps, vps, bps, aps, _ = self.get_bhsd_partition_specs(query_states.shape[2])
-		# attention_outputs = shard_map(
-		# 	partial(
-		# 		jax_flash_attention2,
-		# 		q_block=self.block_q,
-		# 		k_block=self.block_k,
-		# 		precision=self.precision,
-		# 		dtype=self.dtype,
-		# 	),
-		# 	mesh=self.mesh,
-		# 	in_specs=(
-		# 		qps,
-		# 		kps,
-		# 		vps,
-		# 		None,
-		# 		bps,
-		# 	),
-		# 	out_specs=aps,
-		# 	check_rep=False,
-		# )(query_states, key_states, value_states, None, bias)
-		attention_outputs = jax_flash_attention2(
-			q=query_states,
-			k=key_states,
-			v=value_states,
-			mask=mask,
-			bias=bias,
-			q_block=self.block_q,
-			k_block=self.block_k,
-			precision=self.precision,
-			dtype=self.dtype,
-		)
+		qps, kps, vps, bps, aps, _ = self.get_bhsd_partition_specs(query_states.shape[2])
+		attention_outputs = shard_map(
+			partial(
+				jax_flash_attention2,
+				q_block=self.block_q,
+				k_block=self.block_k,
+				precision=self.precision,
+				dtype=self.dtype,
+				softmax_scale=self.sm_scale,
+			),
+			mesh=self.mesh,
+			in_specs=(
+				qps,
+				kps,
+				vps,
+				None,
+				bps,
+			),
+			out_specs=aps,
+			check_rep=False,
+		)(query_states, key_states, value_states, None, bias)
+		# attention_outputs = jax_flash_attention2(
+		# 	q=query_states,
+		# 	k=key_states,
+		# 	v=value_states,
+		# 	mask=mask,
+		# 	bias=bias,
+		# 	q_block=self.block_q,
+		# 	k_block=self.block_k,
+		# 	precision=self.precision,
+		# 	dtype=self.dtype,
+		# 	softmax_scale=self.sm_scale,
+		# )
 		return AttentionOutput(
 			attention_weights=None,
 			attention_outputs=attention_outputs.transpose(0, 2, 1, 3),

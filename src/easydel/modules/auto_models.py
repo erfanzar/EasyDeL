@@ -346,13 +346,13 @@ class AutoEasyDeLModelForCausalLM:
 	def from_pretrained(
 		cls,
 		pretrained_model_name_or_path: str,
-		device: jax.Device = jax.devices("cpu")[0],
+		device: Optional[jax.Device] = None,
 		dtype: jax.numpy.dtype = jax.numpy.float32,
 		param_dtype: jax.numpy.dtype = jax.numpy.float32,
-		precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+		precision: Optional[jax.lax.Precision] = None,
 		sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
 		sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-		partition_axis: PartitionAxis = PartitionAxis(),
+		partition_axis: Optional[PartitionAxis] = None,
 		shard_attention_computation: bool = True,
 		input_shape: Tuple[int, int] = (1, 1),
 		shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
@@ -399,6 +399,12 @@ class AutoEasyDeLModelForCausalLM:
 		    Tuple[EDPretrainedModel, dict]: A tuple containing the EasyDeL model and the loaded and sharded
 		        model parameters.
 		"""
+		if device is None:
+			device = jax.devices("cpu")[0]
+		if precision is None:
+			precision = jax.lax.Precision("fastest")
+		if partition_axis is None:
+			partition_axis = PartitionAxis()
 		if from_torch is None:
 			from_torch = not cls._is_easydel(
 				pretrained_model_name_or_path=pretrained_model_name_or_path,
@@ -490,11 +496,11 @@ class AutoEasyDeLModelForCausalLM:
 				def _clear():
 					gc.collect()
 
-		except ModuleNotFoundError:
+		except ModuleNotFoundError as er:
 			raise ModuleNotFoundError(
 				"in order to load model from torch you should install torch first "
 				"run `pip install torch`"
-			)
+			) from er
 
 		logger.debug(f"Downloading model config from {pretrained_model_name_or_path}")
 		trust_remote_code = kwargs.get("trust_remote_code", False)
@@ -564,7 +570,8 @@ class AutoEasyDeLModelForCausalLM:
 		if shard_fns is not None:
 			if auto_shard_params:
 				warnings.warn(
-					"`auto_shard_params` will be ignored since you are passing custom sharding functions"
+					"`auto_shard_params` will be ignored since you are passing custom sharding functions",
+					stacklevel=1,
 				)
 			logger.debug("sharding model parameters based on the given shard_fns.")
 			if not is_flatten(shard_fns):
@@ -591,7 +598,8 @@ class AutoEasyDeLModelForCausalLM:
 		if leg_load_8bit_detected is not None:
 			warnings.warn(
 				"load_8bit=True Detected, "
-				"please use `quantization_method=='8bit'` (automatically setting quantization_method to 8bit)"
+				"please use `quantization_method=='8bit'` (automatically setting quantization_method to 8bit)",
+				stacklevel=1,
 			)
 		uses_tie_word_embedding = getattr(config, "tie_word_embeddings", False)
 		params = trf(
@@ -749,7 +757,7 @@ class AutoEasyDeLConfig:
 		pretrained_model_name_or_path: str,
 		sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
 		sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-		partition_axis: PartitionAxis = PartitionAxis(),
+		partition_axis: Optional[PartitionAxis] = None,
 		shard_attention_computation: bool = True,
 		backend: Optional[str] = None,
 		from_torch: bool = False,
@@ -774,6 +782,8 @@ class AutoEasyDeLConfig:
 		Returns:
 		    A Model Config
 		"""
+		if partition_axis is None:
+			partition_axis = PartitionAxis()
 		from transformers import AutoConfig
 
 		cls_main = AutoConfig if from_torch else EDPretrainedConfig
@@ -873,7 +883,7 @@ class AutoShardAndGatherFunctions:
 		input_shape: Tuple[int, int] = (1, 1),
 		sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
 		sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-		partition_axis: PartitionAxis = PartitionAxis(),
+		partition_axis: Optional[PartitionAxis] = None,
 		shard_attention_computation: bool = True,
 		backend: Optional[str] = None,
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
@@ -904,6 +914,8 @@ class AutoShardAndGatherFunctions:
 		Returns:
 		    A tuple containing the shard and gather functions.
 		"""
+		if partition_axis is None:
+			partition_axis = PartitionAxis()
 		config = AutoEasyDeLConfig.from_pretrained(
 			pretrained_model_name_or_path,
 			sharding_axis_dims=sharding_axis_dims,
@@ -931,13 +943,13 @@ class AutoStateForCausalLM:
 	def from_pretrained(
 		cls,
 		pretrained_model_name_or_path: str,
-		device: jax.Device = jax.devices("cpu")[0],
+		device: Optional[jax.Device] = None,
 		dtype: jax.numpy.dtype = jax.numpy.float32,
 		param_dtype: jax.numpy.dtype = jax.numpy.float32,
-		precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+		precision: Optional[jax.lax.Precision] = None,
 		sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
 		sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-		partition_axis: PartitionAxis = PartitionAxis(),
+		partition_axis: Optional[PartitionAxis] = None,
 		shard_attention_computation: bool = True,
 		input_shape: Tuple[int, int] = (1, 1),
 		shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
