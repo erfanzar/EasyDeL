@@ -12,6 +12,15 @@ from fjformer.sharding import with_sharding_constraint
 from jax import lax
 
 
+@functools.partial(
+	jax.jit,
+	static_argnames=[
+		"dtype",
+		"precision",
+		"q_block",
+		"k_block",
+	],
+)
 def flash_attention2(
 	query_state: jax.Array,
 	key_state: jax.Array,

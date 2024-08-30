@@ -1,9 +1,15 @@
 import gc
 import os
+
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 import sys
 import unittest
+import jax
+
+jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 
 import jax.random
+
 from fjformer import make_shard_and_gather_fns, match_partition_rules
 
 sys.path.append(
@@ -102,7 +108,7 @@ class EasyModelsTest(unittest.TestCase):
 				rotary_dim=self.rotary_dim,
 				rms_norm_eps=self.rms_norm_eps,
 				layer_norm_eps=self.layer_norm_eps,
-				axis_dims=(1, -1, 1, 1),
+				axis_dims=(1, 1, 1,-1),
 				head_dim=self.head_dim,
 				new_decoder_architecture=True,
 				num_kv_heads=self.num_key_value_heads,

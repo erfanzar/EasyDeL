@@ -846,42 +846,59 @@ class FlexibleAttentionModule(object):
 			[query_states, key_states, value_states],
 		)
 		qps, kps, vps, bps, aps, _ = self.get_bhsd_partition_specs(query_states.shape[2])
-		attention_outputs = shard_map(
-			partial(
-				jax_flash_attention2,
+		# attention_outputs = shard_map(
+		# 	partial(
+		# 		jax_flash_attention2,
+		# 		q_block=self.block_q,
+		# 		k_block=self.block_k,
+		# 		precision=self.precision,
+		# 		dtype=self.dtype,
+		# 		softmax_scale=self.sm_scale,
+		# 	),
+		# 	mesh=self.mesh,
+		# 	in_specs=(
+		# 		qps,
+		# 		kps,
+		# 		vps,
+		# 		None,
+		# 		bps,
+		# 	),
+		# 	out_specs=aps,
+		# 	check_rep=False,
+		# )(query_states, key_states, value_states, None, bias)
+
+		with self.mesh:
+			attention_outputs = jax_flash_attention2(
+				# query_state=query_states,
+				query_state=with_sharding_constraint(query_states, qps),
+				# key_state=key_states,
+				key_state=with_sharding_constraint(key_states, kps),
+				# value_state=value_states,
+				value_state=with_sharding_constraint(value_states, vps),
+				mask=mask,
+				# bias=bias,
+				bias=with_sharding_constraint(bias, bps),
 				q_block=self.block_q,
 				k_block=self.block_k,
 				precision=self.precision,
 				dtype=self.dtype,
 				softmax_scale=self.sm_scale,
-			),
-			mesh=self.mesh,
-			in_specs=(
-				qps,
-				kps,
-				vps,
-				None,
-				bps,
-			),
-			out_specs=aps,
-			check_rep=False,
-		)(query_states, key_states, value_states, None, bias)
-		# attention_outputs = jax_flash_attention2(
-		# 	q=query_states,
-		# 	k=key_states,
-		# 	v=value_states,
-		# 	mask=mask,
-		# 	bias=bias,
-		# 	q_block=self.block_q,
-		# 	k_block=self.block_k,
-		# 	precision=self.precision,
-		# 	dtype=self.dtype,
-		# 	softmax_scale=self.sm_scale,
-		# )
-		return AttentionOutput(
-			attention_weights=None,
-			attention_outputs=attention_outputs.transpose(0, 2, 1, 3),
-		)
+			)
+			return AttentionOutput(
+				attention_weights=None,
+				attention_outputs=with_sharding_constraint(attention_outputs, aps).transpose(
+					0,
+					2,
+					1,
+					3,
+				),
+				# attention_outputs=attention_outputs.transpose(
+				# 	0,
+				# 	2,
+				# 	1,
+				# 	3,
+				# ),
+			)
 
 	def local_ring_attention(
 		self,
