@@ -29,6 +29,7 @@ from easydel.modules.flax_modeling_utils import (
 	with_sharding_constraint,
 )
 from easydel.modules.mixtral.mixtral_configuration import MixtralConfig as MixtralConfig
+from easydel.modules.mixtral.kernels import mixtral_mlp_pallas
 from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
 from easydel.modules.modeling_utils import EDPretrainedModel
 
@@ -206,14 +207,11 @@ class FlaxMixtralAttention(FlaxAttentionModule):
 			self.head_dim,
 		)
 
-		query_states, key_states, value_states = self.apply_rotary(
+		query_states, key_states = self.apply_rotary(
 			query=query_states,
 			key=key_states,
-			value=value_states,
 			position_ids=position_ids,
 			frequencies=frequencies,
-			batch_size=batch_size,
-			sequence_length=sequence_length,
 		)
 
 		query_length, key_length = query_states.shape[1], key_states.shape[1]
@@ -306,7 +304,7 @@ class FlaxMixtralBLockSparseTop2MLP(nn.Module):
 	config: MixtralConfig
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		dense = functools.partial(
@@ -324,6 +322,26 @@ class FlaxMixtralBLockSparseTop2MLP(nn.Module):
 		self.act_fn = ACT2FN[self.config.hidden_act]
 
 	def __call__(self, x: chex.Array):
+		x = control_mlp_sharding(x, self.config.partition_axis)
+		if self.config.pallas_runtime and self.w2.variables.get("params", None) is not None:
+			return jax.vmap(
+				functools.partial(
+					mixtral_mlp_pallas,
+					act_fn=self.act_fn,
+					blocksize_k=self.config.pallas_k_block_size,
+					blocksize_m=self.config.pallas_m_block_size,
+					blocksize_n=self.config.pallas_n_block_size,
+					po_dtype=self.dtype,
+					precision=self.precision,
+				),
+				in_axes=(0, None, None, None),
+			)(
+				x,
+				self.w1.variables["params"]["kernel"],
+				self.w2.variables["params"]["kernel"],
+				self.w3.variables["params"]["kernel"],
+			)
+
 		return self.w2(self.act_fn(self.w1(x)) * self.w3(x))
 
 
@@ -331,7 +349,7 @@ class FlaxMixtralBlocKSparesTop2MLPCollection(nn.Module):
 	config: MixtralConfig
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		self.layers = [
@@ -577,7 +595,7 @@ class FlaxMixtralDecoderLayerCollection(nn.Module):
 	config: MixtralConfig
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		self.blocks = [
@@ -704,7 +722,7 @@ class MixtralPreTrainedModel(EDPretrainedModel):
 		config: MixtralConfig,
 		dtype: jnp.dtype = jnp.bfloat16,
 		param_dtype: jnp.dtype = jnp.bfloat16,
-		precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+		precision: Optional[jax.lax.Precision] = None,
 		input_shape: Tuple[int, int] = (1, 1),
 		seed: int = 0,
 		_do_init: bool = False,
@@ -934,7 +952,7 @@ class FlaxMixtralModule(nn.Module):
 	config: MixtralConfig
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		self.embed_tokens = nn.Embed(
@@ -1096,7 +1114,7 @@ class FlaxMixtralForCausalLMModule(nn.Module):
 	config: MixtralConfig
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		self.model = FlaxMixtralModule(

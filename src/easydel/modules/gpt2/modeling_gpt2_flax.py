@@ -48,7 +48,7 @@ class FlaxConv1D(nn.Module):
 	use_bias: bool = True
 	dtype: Any = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 	dot_general: Optional[None] = None
 
 	@nn.compact
@@ -83,7 +83,7 @@ class FlaxGPT2Attention(FlaxAttentionModule):
 	config: GPT2Config
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 	causal: bool = True
 	is_cross_attention: bool = False
 
@@ -260,7 +260,7 @@ class FlaxGPT2MLP(nn.Module):
 	intermediate_size: int
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self):
 		embed_dim = self.config.hidden_size
@@ -293,7 +293,7 @@ class FlaxGPT2Block(nn.Module):
 	config: GPT2Config
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self):
 		hidden_size = self.config.hidden_size
@@ -443,7 +443,7 @@ class FlaxGPT2PreTrainedModel(EDPretrainedModel):
 		seed: int = 0,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+		precision: Optional[jax.lax.Precision] = None,
 		_do_init: bool = True,
 		**kwargs,
 	):
@@ -616,7 +616,7 @@ class FlaxGPT2BlockCollection(nn.Module):
 	config: GPT2Config
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self):
 		self.blocks = [
@@ -685,7 +685,7 @@ class FlaxGPT2Module(nn.Module):
 	config: GPT2Config
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self):
 		self.embed_dim = self.config.hidden_size
@@ -791,7 +791,7 @@ class FlaxGPT2LMHeadModule(nn.Module):
 	config: GPT2Config
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self):
 		self.transformer = FlaxGPT2Module(

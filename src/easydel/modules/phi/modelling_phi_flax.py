@@ -57,7 +57,7 @@ class FlaxPhiMLP(nn.Module):
 	layer_idx: Optional[int] = None
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	"""Multi-Layer Perceptron.
     Reference:
@@ -102,7 +102,7 @@ class FlaxPhiAttention(FlaxAttentionModule):
 	layer_idx: Optional[int] = None
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self):
 		config = self.config
@@ -379,7 +379,7 @@ class FlaxPhiDecoderLayer(nn.Module):
 	layer_idx: int
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self):
 		attn_block = FlaxPhiAttention
@@ -495,7 +495,7 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
 	config: PhiConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		self.layers = [
@@ -605,7 +605,7 @@ class FlaxPhiModule(nn.Module):
 	config: PhiConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		config = self.config
@@ -746,7 +746,7 @@ class FlaxPhiForCausalLMModule(nn.Module):
 	config: PhiConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		self.model = FlaxPhiModule(
@@ -862,7 +862,7 @@ class FlaxPhiPreTrainedModel(EDPretrainedModel):
 		config: PhiConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+		precision: Optional[jax.lax.Precision] = None,
 		input_shape=(1, 1),
 		seed: int = 42,
 		_do_init: bool = False,

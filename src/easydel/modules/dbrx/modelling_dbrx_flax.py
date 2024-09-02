@@ -785,7 +785,7 @@ class DbrxPreTrainedModel(EDPretrainedModel):
 		config: DbrxConfig,
 		dtype: jnp.dtype = jnp.bfloat16,
 		param_dtype: jnp.dtype = jnp.bfloat16,
-		precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+		precision: Optional[jax.lax.Precision] = None,
 		input_shape: Tuple[int, int] = (1, 1),
 		seed: int = 0,
 		_do_init: bool = False,
@@ -1190,7 +1190,7 @@ class FlaxDbrxForCausalLMModule(nn.Module):
 	config: DbrxConfig
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		self.transformer = FlaxDbrxModule(

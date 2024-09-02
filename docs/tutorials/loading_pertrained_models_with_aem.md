@@ -38,7 +38,7 @@ class AutoEasyDeLModelForCausalLM:
         device=jax.devices("cpu")[0],      # Device for initial model loading (CPU recommended for large models)
         dtype: jax.numpy.dtype = jax.numpy.float32, # Data type for model computations (float32 is standard)
         param_dtype: jax.numpy.dtype = jax.numpy.float32, # Data type for storing model parameters (float32 is standard)
-        precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"), # Computational precision (use "fastest" for optimal performance on your hardware)
+        precision: Optional[jax.lax.Precision] = None, # Computational precision (use "fastest" for optimal performance on your hardware)
         sharding_axis_dims: Sequence[int] = (1, -1, 1, 1), # Sharding dimensions for (dp, fsdp, tp, sp)
         sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"), # Names corresponding to sharding dimensions
         partition_axis: PartitionAxis = PartitionAxis(), # For advanced sharding with EasyDeL's PartitionAxis module (usually leave as default) 

@@ -33,6 +33,7 @@ from easydel.modules.flax_modeling_utils import (
 	precompute_frequencies,
 	with_sharding_constraint,
 )
+from easydel.modules.mistral.kernels import mistral_mlp_pallas
 from easydel.modules.mistral.mistral_configuration import MistralConfig as MistralConfig
 from easydel.modules.mistral.vision_mistral_configuration import (
 	VisionMistralConfig as VisionMistralConfig,
@@ -131,6 +132,27 @@ class FlaxMistralMLP(nn.Module):
 		    chex.Array: Output tensor after applying dense layers and activation functions.
 		"""
 		x = control_mlp_sharding(x, self.config.partition_axis)
+		if (
+			self.config.pallas_runtime
+			and self.gate_proj.variables.get("params", None) is not None
+		):
+			return jax.vmap(
+				functools.partial(
+					mistral_mlp_pallas,
+					act_fn=self.act_fn,
+					blocksize_k=self.config.pallas_k_block_size,
+					blocksize_m=self.config.pallas_m_block_size,
+					blocksize_n=self.config.pallas_n_block_size,
+					po_dtype=self.dtype,
+					precision=self.precision,
+				),
+				in_axes=(0, None, None, None),
+			)(
+				x,
+				self.gate_proj.variables["params"]["kernel"],
+				self.down_proj.variables["params"]["kernel"],
+				self.up_proj.variables["params"]["kernel"],
+			)
 		return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -403,7 +425,7 @@ class FlaxMistralDecoderLayer(nn.Module):
 	config: MistralConfig
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		attn_block = FlaxMistralAttention
@@ -531,7 +553,7 @@ class FlaxMistralPretrainedModel(EDPretrainedModel):
 		config: MistralConfig,
 		dtype: jnp.dtype = jnp.bfloat16,
 		param_dtype: jnp.dtype = jnp.bfloat16,
-		precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),  # noqa: B008
+		precision: Optional[jax.lax.Precision] = None,  # noqa: B008
 		input_shape: Tuple[int, int] = (1, 1),
 		seed: int = 0,
 		_do_init: bool = False,

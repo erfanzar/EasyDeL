@@ -1,3 +1,4 @@
+import functools
 import math
 from typing import Optional, Tuple, Union
 
@@ -15,9 +16,8 @@ from jax.sharding import PartitionSpec
 
 from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.common import RMSNorm
-
-# easydel.modules
 from easydel.modules.flax_modeling_utils import (
+	ACT2FN,
 	FlaxAttentionModule,
 	apply_rotary_pos_emb,
 	block_wise_ffn,
@@ -27,6 +27,9 @@ from easydel.modules.flax_modeling_utils import (
 	precompute_frequencies,
 	with_sharding_constraint,
 )
+
+# easydel.modules
+from easydel.modules.llama.kernels import llama_mlp_pallas
 from easydel.modules.llama.llama_configuration import LlamaConfig as LlamaConfig
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
@@ -364,6 +367,7 @@ class FlaxLlamaMLP(nn.Module):
 			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
 		)
 		self.dropout = flax.linen.Dropout(rate=self.config.resid_pdrop)
+		self.act_fn = ACT2FN[self.config.hidden_act]
 
 	def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
 		"""The __call__ function is the main function of a class.
@@ -381,7 +385,30 @@ class FlaxLlamaMLP(nn.Module):
 		"""
 
 		x = control_mlp_sharding(x, self.config.partition_axis)
-		x = self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
+		if (
+			self.config.pallas_runtime
+			and self.gate_proj.variables.get("params", None) is not None
+		):
+			x = jax.vmap(
+				functools.partial(
+					llama_mlp_pallas,
+					act_fn=self.act_fn,
+					blocksize_k=self.config.pallas_k_block_size,
+					blocksize_m=self.config.pallas_m_block_size,
+					blocksize_n=self.config.pallas_n_block_size,
+					po_dtype=self.dtype,
+					precision=self.precision,
+				),
+				in_axes=(0, None, None, None),
+			)(
+				x,
+				self.gate_proj.variables["params"]["kernel"],
+				self.down_proj.variables["params"]["kernel"],
+				self.up_proj.variables["params"]["kernel"],
+			)
+		else:
+			x = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 		x = self.dropout(x, deterministic=deterministic)
 		return x
 
@@ -519,7 +546,7 @@ class FlaxLlamaPreTrainedModel(EDPretrainedModel):
 		config: LlamaConfig,
 		dtype: jnp.dtype = jnp.bfloat16,
 		param_dtype: jnp.dtype = jnp.bfloat16,
-		precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+		precision: Optional[jax.lax.Precision] = None,
 		input_shape: Tuple[int, int] = (1, 1),
 		seed: int = 0,
 		_do_init: bool = False,

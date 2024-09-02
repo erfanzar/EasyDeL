@@ -58,7 +58,7 @@ class FlaxPhi3MLP(nn.Module):
 	layer_idx: Optional[int] = None
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	"""Multi-Layer Perceptron.
     Reference:
@@ -110,7 +110,7 @@ class FlaxPhi3Attention(FlaxAttentionModule):
 	layer_idx: Optional[int] = None
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self):
 		config = self.config
@@ -350,7 +350,7 @@ class FlaxPhi3DecoderLayer(nn.Module):
 	layer_idx: int
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self):
 		attn_block = FlaxPhi3Attention
@@ -486,7 +486,7 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
 	config: Phi3Config
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		self.layers = [
@@ -739,7 +739,7 @@ class FlaxPhi3ForCausalLMModule(nn.Module):
 	config: Phi3Config
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		self.model = FlaxPhi3Module(
@@ -847,7 +847,7 @@ class FlaxPhiPreTrainedModel(EDPretrainedModel):
 		config: Phi3Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+		precision: Optional[jax.lax.Precision] = None,
 		input_shape=(1, 1),
 		seed: int = 42,
 		_do_init: bool = False,
