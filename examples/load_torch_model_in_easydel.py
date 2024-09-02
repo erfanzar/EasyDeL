@@ -1,6 +1,7 @@
-from easydel import AutoEasyDeLModelForCausalLM, PartitionAxis
+from typing import Optional, Sequence, Tuple
+
 import jax
-from typing import Sequence, Optional, Tuple
+from easydel import AutoEasyDeLModelForCausalLM, PartitionAxis
 
 
 def load_model(
@@ -8,7 +9,7 @@ def load_model(
         device=jax.devices('cpu')[0],  # Device to be used in order to Load Model on (Offload device)
         dtype: jax.numpy.dtype = jax.numpy.float32,
         param_dtype: jax.numpy.dtype = jax.numpy.float32,
-        precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+        precision: Optional[jax.lax.Precision] = None,
         sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
         sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
         partition_axis: PartitionAxis = PartitionAxis(),

@@ -6,6 +6,15 @@ import chex
 import flax.linen.partitioning
 import jax.lax
 from chex import Array
+from flax import linen as nn
+from flax.core import FrozenDict, freeze, unfreeze
+from flax.linen import Dense, combine_masks
+from flax.linen import partitioning as nn_partitioning
+from flax.traverse_util import flatten_dict, unflatten_dict
+from jax import lax
+from jax import numpy as jnp
+from jax.sharding import PartitionSpec
+
 from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.common import RMSNorm as RMSNorm
 from easydel.modules.flax_modeling_utils import (
@@ -25,14 +34,6 @@ from easydel.modules.modeling_flax_outputs import (
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
 from easydel.modules.phimoe.phimoe_configuration import PhiMoeConfig as PhiMoeConfig
-from flax import linen as nn
-from flax.core import FrozenDict, freeze, unfreeze
-from flax.linen import Dense, combine_masks
-from flax.linen import partitioning as nn_partitioning
-from flax.traverse_util import flatten_dict, unflatten_dict
-from jax import lax
-from jax import numpy as jnp
-from jax.sharding import PartitionSpec
 
 re_mat = nn_partitioning.remat
 
@@ -57,7 +58,7 @@ class FlaxPhiMoEBlockSparseTop2MLP(nn.Module):
 	layer_idx: Optional[int] = None
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		dense_class = functools.partial(
@@ -101,7 +102,7 @@ class FlaxPhiMoEAttention(FlaxAttentionModule):
 	layer_idx: Optional[int] = None
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self):
 		config = self.config
@@ -339,7 +340,7 @@ class FlaxPhiMoeBlocKSparesTop2MLPCollection(nn.Module):
 	config: PhiMoeConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		config = self.config
@@ -474,7 +475,7 @@ class FlaxPhiMoeDecoderLayer(nn.Module):
 	layer_idx: int
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self):
 		attn_block = FlaxPhiMoEAttention
@@ -603,7 +604,7 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
 	config: PhiMoeConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		self.layers = [
@@ -856,7 +857,7 @@ class FlaxPhiMoeForCausalLMModule(nn.Module):
 	config: PhiMoeConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		self.model = FlaxPhiMoeModule(
@@ -964,7 +965,7 @@ class FlaxPhiPreTrainedModel(EDPretrainedModel):
 		config: PhiMoeConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+		precision: Optional[jax.lax.Precision] = None,
 		input_shape=(1, 1),
 		seed: int = 42,
 		_do_init: bool = False,

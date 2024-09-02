@@ -85,6 +85,10 @@ class EDPretrainedConfig(PretrainedConfig):
 	    attn_dtype (jnp.dtype): data type for computing attention.
 	    fcm_max_ratio (float): value for fcm mask - max ratio
 	    fcm_min_ratio (float): value for fcm mask - min ratio
+			pallas_runtime (bool): whenever to switch to custom pallas kernels instead of JAX
+			pallas_m_block_size (int): block size m dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`.
+			pallas_k_block_size (int): block size k dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`.
+			pallas_n_block_size (int): block size n dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`.
 	"""
 
 	_show_private_attrs: bool = False
@@ -122,6 +126,10 @@ class EDPretrainedConfig(PretrainedConfig):
 		attn_dtype: jnp.dtype = jnp.float32,
 		fcm_max_ratio: float = 0.0,
 		fcm_min_ratio: float = 0.0,
+		pallas_runtime: bool = True,
+		pallas_m_block_size: int = 32,
+		pallas_k_block_size: int = 256,
+		pallas_n_block_size: int = 32,
 		**kwargs,
 	):
 		self.axis_dims = getattr(
@@ -280,6 +288,28 @@ class EDPretrainedConfig(PretrainedConfig):
 			"fcm_min_ratio",
 			fcm_min_ratio,
 		)
+
+		self.pallas_runtime = getattr(
+			self,
+			"pallas_runtime",
+			pallas_runtime,
+		)
+		self.pallas_m_block_size = getattr(
+			self,
+			"pallas_m_block_size",
+			pallas_m_block_size,
+		)
+		self.pallas_k_block_size = getattr(
+			self,
+			"pallas_k_block_size",
+			pallas_k_block_size,
+		)
+		self.pallas_n_block_size = getattr(
+			self,
+			"pallas_n_block_size",
+			pallas_n_block_size,
+		)
+
 		self.pretraining_tp = 1  # it's for pytorch models.
 		if self.quantize_kv_cache and self.use_sharded_kv_caching:
 			quantize_kv_cache = self.quantize_kv_cache
@@ -455,6 +485,10 @@ class EDPretrainedConfig(PretrainedConfig):
 		quantize_kv_cache: bool = ...,
 		flash_attention_backward_pass_impl: Literal["triton", "xla"] = ...,
 		attn_dtype: jnp.dtype = ...,
+		pallas_runtime: bool = ...,
+		pallas_m_block_size: int = ...,
+		pallas_k_block_size: int = ...,
+		pallas_n_block_size: int = ...,
 	):
 		"""
 		It initializes all the attributes of an object, and it's called when you create a new instance of that class.
@@ -488,6 +522,10 @@ class EDPretrainedConfig(PretrainedConfig):
 		    attention_axis_name (str): Name of the attention axis name
 		    quantize_kv_cache (bool): Whether to quantize Key/Value in attention for generation process.
 		    flash_attention_backward_pass_impl (Literal["triton", "xla"]): Specify the backward pass kernel for flash attention
+				pallas_runtime (bool): whenever to switch to custom pallas kernels instead of JAX.
+				pallas_m_block_size (int): block size m dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`.
+				pallas_k_block_size (int): block size k dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`.
+				pallas_n_block_size (int): block size n dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`.
 		"""
 		set_attrs_smartly(
 			self,
@@ -671,6 +709,34 @@ class EDPretrainedConfig(PretrainedConfig):
 			"attn_dtype",
 			jnp.float32,
 			attn_dtype,
+		)
+
+		set_attrs_smartly(
+			self,
+			"pallas_runtime",
+			True,
+			pallas_runtime,
+		)
+
+		set_attrs_smartly(
+			self,
+			"pallas_m_block_size",
+			32,
+			pallas_m_block_size,
+		)
+
+		set_attrs_smartly(
+			self,
+			"pallas_k_block_size",
+			256,
+			pallas_k_block_size,
+		)
+
+		set_attrs_smartly(
+			self,
+			"pallas_n_block_size",
+			32,
+			pallas_n_block_size,
 		)
 
 	def __repr__(self):

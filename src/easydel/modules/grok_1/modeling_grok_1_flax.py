@@ -382,7 +382,7 @@ class FlaxGrok1BlocKSparesTop2MLPCollection(nn.Module):
 	config: Grok1Config
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		self.layers = [
@@ -628,7 +628,7 @@ class FlaxGrok1DecoderLayerCollection(nn.Module):
 	config: Grok1Config
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		self.blocks = [
@@ -755,7 +755,7 @@ class Grok1PreTrainedModel(EDPretrainedModel):
 		config: Grok1Config,
 		dtype: jnp.dtype = jnp.bfloat16,
 		param_dtype: jnp.dtype = jnp.bfloat16,
-		precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+		precision: Optional[jax.lax.Precision] = None,
 		input_shape: Tuple[int, int] = (1, 1),
 		seed: int = 0,
 		_do_init: bool = False,
@@ -1001,7 +1001,7 @@ class FlaxGrok1Module(nn.Module):
 	config: Grok1Config
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		self.embed_tokens = nn.Embed(
@@ -1167,7 +1167,7 @@ class FlaxGrok1ForCausalLMModule(nn.Module):
 	config: Grok1Config
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		self.model = FlaxGrok1Module(

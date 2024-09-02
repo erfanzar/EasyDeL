@@ -82,7 +82,7 @@ def _call_matmul_kernel_fwd(
 	precision: jax.lax.PrecisionLike = None,
 ):
 	# A(mk)@B(kn)=C(mn)
-	assert A.ndim == 2 and B.ndim == 2
+	assert A.ndim == 2 and B.ndim == 2, f"got {A.shape=} and {B.shape=}"
 	assert A.shape[1] == B.shape[0]
 	m, k, n = A.shape[0], A.shape[1], B.shape[1]
 	blocksize_k = min(k, blocksize_k)

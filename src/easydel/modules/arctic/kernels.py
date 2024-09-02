@@ -4,7 +4,7 @@ from jax import numpy as jnp
 from easydel.kernels.matmul import matmul_kernel
 
 
-def mistral_mlp_pallas(
+def arctic_mlp_pallas(
 	x,
 	w1,
 	w2,

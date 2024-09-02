@@ -463,7 +463,7 @@ class FlaxStableLmDecoderLayer(nn.Module):
 	config: StableLmConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self):
 		attn_block = FlaxStableLmAttention
@@ -612,7 +612,7 @@ class FlaxStableLmPreTrainedModel(EDPretrainedModel):
 		config: StableLmConfig,
 		dtype: jnp.dtype = jnp.bfloat16,
 		param_dtype: jnp.dtype = jnp.bfloat16,
-		precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+		precision: Optional[jax.lax.Precision] = None,
 		input_shape: Tuple[int, int] = (1, 1),
 		seed: int = 0,
 		_do_init: bool = False,
@@ -857,7 +857,7 @@ class FlaxStableLmDecoderLayerCollection(nn.Module):
 	config: StableLmConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		self.layers = [
@@ -966,7 +966,7 @@ class FlaxStableLmModule(nn.Module):
 	config: StableLmConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		config = self.config
@@ -1106,7 +1106,7 @@ class FlaxStableLmForCausalLMModule(nn.Module):
 	config: StableLmConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest")
+	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
 		self.model = FlaxStableLmModule(
