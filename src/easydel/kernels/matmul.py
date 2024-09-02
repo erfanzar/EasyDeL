@@ -214,11 +214,16 @@ _m.defvjp(_call_matmul_kernel_fwd_g, _call_matmul_kernel_bwd)
 
 
 def matmul_test():
+	print("RES TEST")
 	intermediate_size = 2048
 	hidden_size = 512
 	dtype = jnp.float16
-	A = jax.random.normal(rng.rng, (hidden_size, intermediate_size), dtype=dtype)
-	B = jax.random.normal(rng.rng, (intermediate_size, hidden_size), dtype=dtype)
+	A = jax.nn.initializers.normal(0.02, dtype=dtype)(
+		rng.rng, (hidden_size, intermediate_size)
+	)
+	B = jax.nn.initializers.normal(0.02, dtype=dtype)(
+		rng.rng, (intermediate_size, hidden_size)
+	)
 	y_ = matmul_kernel(A, B)
 	y = A @ B
 	print(jnp.allclose(y_, y, atol=0.125, rtol=0))
@@ -229,17 +234,23 @@ def matmul_test():
 
 
 def matmul_grad_test():
+	print("GRAD TEST")
 	intermediate_size = 2048
 	hidden_size = 512
 	dtype = jnp.float16
-	A = jax.random.normal(rng.rng, (hidden_size, intermediate_size), dtype=dtype)
-	B = jax.random.normal(rng.rng, (intermediate_size, hidden_size), dtype=dtype)
+	A = jax.nn.initializers.normal(0.02, dtype=dtype)(
+		rng.rng, (hidden_size, intermediate_size)
+	)
+	B = jax.nn.initializers.normal(0.02, dtype=dtype)(
+		rng.rng, (intermediate_size, hidden_size)
+	)
 	g = jax.grad(lambda x, e: jnp.sum(x @ e))(A, B)
 	g_ = jax.grad(lambda x, e: jnp.sum(matmul_kernel(x, e)))(A, B)
-
+	print(jnp.allclose(g, g_, atol=0.125, rtol=0))
 	print(g_[0])
 	print(g[0])
 
 
 if __name__ == "__main__":
+	matmul_test()
 	matmul_grad_test()
