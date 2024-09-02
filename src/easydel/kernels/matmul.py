@@ -1,3 +1,5 @@
+# Implementation by @erfanzar,
+# with a few bug fixes and adjustments.
 from functools import partial
 
 import jax
