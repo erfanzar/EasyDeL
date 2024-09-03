@@ -632,6 +632,10 @@ class FlaxAttentionModule(nn.Module):
 				indices = (0,) * len(batch_dims) + (cur_index, 0, 0)  # type:ignore
 				key_val = cached_key.value
 				value_val = cached_value.value
+				if hasattr(key_val, "materialize"):
+					key_val = key_val.materialize()
+				if hasattr(value_val, "materialize"):
+					value_val = value_val.materialize()
 
 				key = lax.dynamic_update_slice(key_val, key, indices)
 				value = lax.dynamic_update_slice(value_val, value, indices)

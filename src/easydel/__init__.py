@@ -6,7 +6,11 @@ if bool(
 	_os.environ.get("EASYDEL_AUTO", "true")
 ):  # Taking care of some optional GPU FLAGs
 	_os.environ["XLA_FLAGS"] = (
-		_os.environ.get("XLA_FLAGS", "") + " --xla_gpu_enable_command_buffer="
+		_os.environ.get("XLA_FLAGS", "") + "--xla_gpu_enable_triton_softmax_fusion=true \ "
+		"--xla_gpu_triton_gemm_any=True \ "
+		"--xla_gpu_enable_async_collectives=true \ "
+		"--xla_gpu_enable_latency_hiding_scheduler=true \ "
+		"--xla_gpu_enable_highest_priority_async_stream=true \ "
 	)
 	_os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 	_os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.99"

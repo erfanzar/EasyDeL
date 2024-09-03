@@ -12,7 +12,7 @@ sys.path.append(
 		"../src",
 	)
 )
-from typing import Dict, Literal, Optional, Union
+from typing import Dict, Optional, Union
 
 import easydel as ed
 import jax
@@ -20,7 +20,6 @@ import numpy as np
 import torch
 import transformers
 from jax import numpy as jnp
-from src.easydel.etils.etils import AVAILABLE_ATTENTION_MECHANISMS
 
 torch.manual_seed(42)
 
@@ -122,7 +121,8 @@ class EasyModelsGenerationTest(TestCase):
 			tokenizer=self.tokenizer,
 		)
 		response = None
-		for response, tokens_used in server.sample(""):  # noqa
+
+		for i, (response, tokens_used) in enumerate(server.sample("")):  # noqa
 			...
 		return response
 
