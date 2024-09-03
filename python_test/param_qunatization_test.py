@@ -89,7 +89,7 @@ def main():
 			length_penalty=1.2,
 			repetition_penalty=1.2,
 		),
-		# parameters_are_quantized=True,
+		parameters_are_quantized=True,
 	)
 
 	time_start = None
