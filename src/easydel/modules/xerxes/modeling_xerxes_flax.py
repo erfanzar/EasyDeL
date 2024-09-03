@@ -56,7 +56,7 @@ class FlaxXerxesAttention(FlaxAttentionModule):
 	layer_idx: int
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 	causal: bool = True
 	is_cross_attention: bool = False
 
@@ -306,7 +306,7 @@ class FlaxXerxesMLP(nn.Module):
 	config: XerxesConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
 		kernel_init = jax.nn.initializers.normal(self.config.initializer_range)
@@ -337,7 +337,7 @@ class FlaxXerxesDecoderLayer(nn.Module):
 	layer_idx: int
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
 		mlp_block = FlaxXerxesMLP
@@ -458,7 +458,7 @@ class FlaxXerxesPreTrainedModel(EDPretrainedModel):
 		seed: int = 0,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest"),
+		precision: Optional[Union[str, jax.lax.Precision]] = None,
 		_do_init: bool = True,
 		**kwargs,
 	):
@@ -670,7 +670,7 @@ class FlaxXerxesLayerCollection(nn.Module):
 	config: XerxesConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
 		self.blocks = [
@@ -770,7 +770,7 @@ class FlaxXerxesModule(nn.Module):
 	config: XerxesConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
 		self.hidden_size = self.config.hidden_size
@@ -891,7 +891,7 @@ class FlaxXerxesForCausalLMModule(nn.Module):
 	config: XerxesConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
 		self.model = FlaxXerxesModule(

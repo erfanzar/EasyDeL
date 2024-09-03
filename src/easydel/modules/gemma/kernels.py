@@ -4,7 +4,7 @@ from jax import numpy as jnp
 from easydel.kernels.matmul import matmul_kernel
 
 
-def arctic_mlp_pallas(
+def gemma_mlp_pallas(
 	x,
 	w1,
 	w2,
@@ -25,20 +25,7 @@ def arctic_mlp_pallas(
 		precision=precision,
 	)
 	return matmul_kernel(
-		(
-			act_fn(
-				matmul_kernel(
-					x,
-					w1,
-					**args,
-				)
-			)
-			* matmul_kernel(
-				x,
-				w3,
-				**args,
-			)
-		),
+		(act_fn(matmul_kernel(x, w1, **args)) * matmul_kernel(x, w3, **args)),
 		w2,
 		**args,
 	)

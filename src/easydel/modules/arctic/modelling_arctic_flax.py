@@ -16,6 +16,7 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 from easydel.modules.arctic.arctic_configuration import ArcticConfig
+from easydel.modules.arctic.kernels import arctic_mlp_pallas
 from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
@@ -89,7 +90,7 @@ class FlaxArcticAttention(FlaxAttentionModule):
 	layer_index: int
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self) -> None:
 		"""
@@ -388,6 +389,27 @@ class ArcticMLP(nn.Module):
 		    chex.Array: Output tensor after applying dense layers and activation functions.
 		"""
 		x = control_mlp_sharding(x, self.config.partition_axis)
+		if (
+			self.config.pallas_runtime
+			and self.w1.variables.get("params", None) is not None
+		):
+			return jax.vmap(
+				functools.partial(
+					arctic_mlp_pallas,
+					act_fn=self.act_fn,
+					blocksize_k=self.config.pallas_k_block_size,
+					blocksize_m=self.config.pallas_m_block_size,
+					blocksize_n=self.config.pallas_n_block_size,
+					po_dtype=self.dtype,
+					precision=self.precision,
+				),
+				in_axes=(0, None, None, None),
+			)(
+				x,
+				self.w1.variables["params"]["kernel"],
+				self.w2.variables["params"]["kernel"],
+				self.w3.variables["params"]["kernel"],
+			)
 		return self.w2(self.act_fn(self.w1(x)) * self.w3(x))
 
 
@@ -657,7 +679,7 @@ class FlaxArcticDecoderLayer(nn.Module):
 	layer_index: int
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self) -> None:
 		"""Initializes the layer components, including attention and MoE blocks, and layer normalization."""

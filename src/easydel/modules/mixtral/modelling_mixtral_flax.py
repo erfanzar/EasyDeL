@@ -28,8 +28,8 @@ from easydel.modules.flax_modeling_utils import (
 	precompute_frequencies,
 	with_sharding_constraint,
 )
-from easydel.modules.mixtral.mixtral_configuration import MixtralConfig as MixtralConfig
 from easydel.modules.mixtral.kernels import mixtral_mlp_pallas
+from easydel.modules.mixtral.mixtral_configuration import MixtralConfig as MixtralConfig
 from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
 from easydel.modules.modeling_utils import EDPretrainedModel
 
@@ -70,7 +70,7 @@ class FlaxMixtralAttention(FlaxAttentionModule):
 	layer_index: int
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self) -> None:
 		config = self.config
@@ -465,7 +465,7 @@ class FlaxMixtralDecoderLayer(nn.Module):
 	layer_index: int
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self) -> None:
 		# hidden_states: chex.Array

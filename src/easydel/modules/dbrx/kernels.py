@@ -4,11 +4,11 @@ from jax import numpy as jnp
 from easydel.kernels.matmul import matmul_kernel
 
 
-def arctic_mlp_pallas(
+def dbrx_mlp_pallas(
 	x,
-	w1,
-	w2,
-	w3,
+	expert_w1,
+	expert_v1,
+	expert_w2,
 	*,
 	act_fn,
 	blocksize_m: int = 16,
@@ -24,21 +24,8 @@ def arctic_mlp_pallas(
 		po_dtype=po_dtype,
 		precision=precision,
 	)
-	return matmul_kernel(
-		(
-			act_fn(
-				matmul_kernel(
-					x,
-					w1,
-					**args,
-				)
-			)
-			* matmul_kernel(
-				x,
-				w3,
-				**args,
-			)
-		),
-		w2,
-		**args,
-	)
+	x1 = matmul_kernel(x, expert_w1.T, **args)
+	x2 = matmul_kernel(x, expert_v1.T, **args)
+	x1 = act_fn(x1)
+	x1 = matmul_kernel(x1 * x2, expert_w2, **args)
+	return x1

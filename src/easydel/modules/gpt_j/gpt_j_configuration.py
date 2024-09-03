@@ -113,28 +113,6 @@ class GPTJConfig(EDPretrainedConfig):
 			**kwargs,
 		)
 
-	@staticmethod
-	def set_custom_partition(
-		embedding_partition: PartitionSpec,
-		kvq_partition: PartitionSpec,
-		o_proj_partition: PartitionSpec,
-		fc_out_partition: PartitionSpec,
-		fc_in_partition: PartitionSpec,
-		fc_lm_head_partition: PartitionSpec,
-		rest_partitions: PartitionSpec = PartitionSpec(None),
-	):
-		return (
-			("model/wte/embedding", embedding_partition),
-			("attn/(k_proj|v_proj|q_proj)/kernel", kvq_partition),
-			("attn/out_proj/kernel", o_proj_partition),
-			("mlp/fc_out/kernel", fc_out_partition),
-			("mlp/fc_out/bias", fc_out_partition),
-			("mlp/fc_in/kernel", fc_in_partition),
-			("mlp/fc_in/bias", fc_in_partition),
-			("lm_head/kernel", fc_lm_head_partition),
-			("lm_head/bias", fc_lm_head_partition),
-			(".*", rest_partitions),
-		)
 
 	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
 		"""
@@ -149,15 +127,15 @@ class GPTJConfig(EDPretrainedConfig):
 		"""
 		return (
 			(
-				("model/wte/embedding", PartitionSpec(("fsdp", "tp"))),
-				("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec(("fsdp", "tp"))),
-				("attn/out_proj/kernel", PartitionSpec(("fsdp", "tp"))),
-				("mlp/fc_out/kernel", PartitionSpec(("fsdp", "tp"))),
-				("mlp/fc_out/bias", PartitionSpec(("fsdp", "tp"))),
-				("mlp/fc_in/kernel", PartitionSpec(("fsdp", "tp"))),
-				("mlp/fc_in/bias", PartitionSpec(("fsdp", "tp"))),
-				("lm_head/kernel", PartitionSpec(("fsdp", "tp"))),
-				("lm_head/bias", PartitionSpec(("fsdp", "tp"))),
+				("model/wte/embedding", PartitionSpec(("fsdp", "sp"))),
+				("attn/(k_proj|v_proj|q_proj)/kernel", PartitionSpec(("fsdp", "sp"))),
+				("attn/out_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+				("mlp/fc_out/kernel", PartitionSpec(("fsdp", "sp"))),
+				("mlp/fc_out/bias", PartitionSpec(("fsdp", "sp"))),
+				("mlp/fc_in/kernel", PartitionSpec(("fsdp", "sp"))),
+				("mlp/fc_in/bias", PartitionSpec(("fsdp", "sp"))),
+				("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
+				("lm_head/bias", PartitionSpec(("fsdp", "sp"))),
 				(".*", PartitionSpec(None)),
 			)
 			if fully_sharded_data_parallel
@@ -180,7 +158,7 @@ class GPTJConfig(EDPretrainedConfig):
 
 	@staticmethod
 	def get_mesh_names():
-		return "dp", "fsdp", "tp", "sp"
+		return "dp", "fsdp", "sp", "sp"
 
 	def add_jax_args(
 		self,

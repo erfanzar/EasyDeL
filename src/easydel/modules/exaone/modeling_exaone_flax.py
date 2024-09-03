@@ -17,6 +17,7 @@ from easydel.etils.etils import get_logger
 from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.common import RMSNorm
 from easydel.modules.exaone.exaone_configuration import ExaoneConfig as ExaoneConfig
+from easydel.modules.exaone.kernels import exaone_mlp_pallas
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
 	FlaxAttentionModule,
@@ -69,7 +70,7 @@ class FlaxExaoneGatedMLP(nn.Module):
 	config: ExaoneConfig
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self) -> None:
 		dense = functools.partial(
@@ -98,6 +99,27 @@ class FlaxExaoneGatedMLP(nn.Module):
 		    chex.Array: Output tensor after applying dense layers and activation functions.
 		"""
 		x = control_mlp_sharding(x, self.config.partition_axis)
+		if (
+			self.config.pallas_runtime
+			and self.c_fc_1.variables.get("params", None) is not None
+		):
+			return jax.vmap(
+				functools.partial(
+					exaone_mlp_pallas,
+					act_fn=self.act_fn,
+					blocksize_k=self.config.pallas_k_block_size,
+					blocksize_m=self.config.pallas_m_block_size,
+					blocksize_n=self.config.pallas_n_block_size,
+					po_dtype=self.dtype,
+					precision=self.precision,
+				),
+				in_axes=(0, None, None, None),
+			)(
+				x,
+				self.c_fc_0.variables["params"]["kernel"],
+				self.c_proj.variables["params"]["kernel"],
+				self.c_fc_1.variables["params"]["kernel"],
+			)
 		return self.c_proj(self.act_fn(self.c_fc_0(x)) * self.c_fc_1(x))
 
 
@@ -726,7 +748,7 @@ class FlaxExaoneDecoratorCollection(nn.Module):
 	config: ExaoneConfig
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self) -> None:
 		self.layers = [

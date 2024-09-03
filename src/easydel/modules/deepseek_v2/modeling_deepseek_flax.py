@@ -20,6 +20,7 @@ from easydel.modules.common import RMSNorm
 from easydel.modules.deepseek_v2.deepseek_configuration import (
 	DeepseekV2Config as DeepseekV2Config,
 )
+from easydel.modules.deepseek_v2.kernels import deepseekv2_mlp_pallas
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
 	FlaxAttentionModule,
@@ -191,7 +192,7 @@ class FlaxDeepseekV2MLP(nn.Module):
 	config: DeepseekV2Config
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 	hidden_size: Optional[int] = None
 	intermediate_size: Optional[int] = None
 
@@ -216,6 +217,27 @@ class FlaxDeepseekV2MLP(nn.Module):
 		e: bool = False,  # Ignored
 	):
 		x = control_mlp_sharding(x, self.config.partition_axis)
+		if (
+			self.config.pallas_runtime
+			and self.up_proj.variables.get("params", None) is not None
+		):
+			return jax.vmap(
+				functools.partial(
+					deepseekv2_mlp_pallas,
+					act_fn=self.act_fn,
+					blocksize_k=self.config.pallas_k_block_size,
+					blocksize_m=self.config.pallas_m_block_size,
+					blocksize_n=self.config.pallas_n_block_size,
+					po_dtype=self.dtype,
+					precision=self.precision,
+				),
+				in_axes=(0, None, None, None),
+			)(
+				x,
+				self.gate_proj.variables["params"]["kernel"],
+				self.down_proj.variables["params"]["kernel"],
+				self.up_proj.variables["params"]["kernel"],
+			)
 		return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -223,7 +245,7 @@ class FlaxMoEGate(nn.Module):
 	config: DeepseekV2Config
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self) -> None:
 		config = self.config
@@ -330,7 +352,7 @@ class FlaxDeepseekV2MLPCollection(nn.Module):
 	config: DeepseekV2Config
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self) -> None:
 		self.experts = [
@@ -356,7 +378,7 @@ class FlaxDeepseekV2MoE(nn.Module):
 	config: DeepseekV2Config
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self) -> None:
 		config = self.config
@@ -414,7 +436,7 @@ class FlaxDeepseekV2Attention(FlaxAttentionModule):
 	layer_idx: int
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self) -> None:
 		config = self.config
@@ -703,7 +725,7 @@ class FlaxDeepseekV2DecoderLayer(nn.Module):
 	layer_idx: int
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
 		config = self.config
@@ -854,7 +876,7 @@ class FlaxDeepseekV2DecoratorCollection(nn.Module):
 	config: DeepseekV2Config
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self) -> None:
 		self.layers = [

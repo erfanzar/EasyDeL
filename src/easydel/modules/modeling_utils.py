@@ -121,7 +121,7 @@ class EDPretrainedConfig(PretrainedConfig):
 		bits: Optional[int] = None,
 		scan_ring_attention: bool = True,
 		scan_attention_layers: bool = False,
-		use_scan_mlp: bool = True,
+		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
 		attention_axis_name: str = "sp",
 		quantize_kv_cache: bool = False,

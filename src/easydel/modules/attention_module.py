@@ -539,25 +539,25 @@ class FlexibleAttentionModule(object):
 			query_partition_spec = PartitionSpec(
 				self.partition_axis.batch_axis,
 				self.partition_axis.head_axis,
-				self.partition_axis.generation_query_sequence_axis,
+				self.partition_axis.query_sequence_axis,
 				self.partition_axis.attention_dim_axis,
 			)
 			key_partition_spec = PartitionSpec(
 				self.partition_axis.batch_axis,
 				self.partition_axis.head_axis,
-				self.partition_axis.generation_key_sequence_axis,
+				self.partition_axis.key_sequence_axis,
 				self.partition_axis.attention_dim_axis,
 			)
 			value_partition_spec = PartitionSpec(
 				self.partition_axis.batch_axis,
 				self.partition_axis.head_axis,
-				self.partition_axis.generation_key_sequence_axis,
+				self.partition_axis.key_sequence_axis,
 				self.partition_axis.attention_dim_axis,
 			)
 			bias_partition_spec = PartitionSpec(
 				self.partition_axis.batch_axis,
 				self.partition_axis.bias_head_sequence_axis,
-				self.partition_axis.generation_query_sequence_axis,
+				self.partition_axis.query_sequence_axis,
 				self.partition_axis.bias_key_sequence_axis,
 			)
 			attention_partition_spec = query_partition_spec
@@ -649,7 +649,7 @@ class FlexibleAttentionModule(object):
 					value_states=value_states,
 					bias=bias,
 				)
-			elif self.attn_mechanism == "flash":
+			elif self.attn_mechanism == AttentionMechanisms.flash:
 				if segment_ids is not None:
 					warnings.warn(
 						"Flash attention don't support `segment_ids` this argument will be ignored",
@@ -674,7 +674,7 @@ class FlexibleAttentionModule(object):
 					attention_mask=attention_mask,
 				)
 
-			elif self.attn_mechanism == "vanilla":
+			elif self.attn_mechanism == AttentionMechanisms.vanilla:
 				return self.vanilla_attention(
 					query_states=query_states,
 					key_states=key_states,
@@ -685,7 +685,7 @@ class FlexibleAttentionModule(object):
 					query_sequence_length=query_sequence_length,
 					key_value_sequence_length=key_value_sequence_length,
 				)
-			elif self.attn_mechanism == "sharded_vanilla":
+			elif self.attn_mechanism == AttentionMechanisms.sharded_vanilla:
 				return self.sharded_vanilla_attention(
 					query_states=query_states,
 					key_states=key_states,
@@ -696,7 +696,7 @@ class FlexibleAttentionModule(object):
 					query_sequence_length=query_sequence_length,
 					key_value_sequence_length=key_value_sequence_length,
 				)
-			elif self.attn_mechanism == "legacy_sharded_vanilla":
+			elif self.attn_mechanism == AttentionMechanisms.legacy_sharded_vanilla:
 				return self.legacy_sharded_vanilla_attention(
 					query_states=query_states,
 					key_states=key_states,
@@ -707,7 +707,7 @@ class FlexibleAttentionModule(object):
 					query_sequence_length=query_sequence_length,
 					key_value_sequence_length=key_value_sequence_length,
 				)
-			elif self.attn_mechanism == "ring":
+			elif self.attn_mechanism == AttentionMechanisms.ring:
 				return self.ring_attention(
 					query_states=query_states,
 					key_states=key_states,
@@ -720,7 +720,7 @@ class FlexibleAttentionModule(object):
 					query_sequence_length=query_sequence_length,
 					key_value_sequence_length=key_value_sequence_length,
 				)
-			elif self.attn_mechanism == "pallas_flash":
+			elif self.attn_mechanism == AttentionMechanisms.pallas_flash:
 				return self.pallas_flash_attention(
 					query_states=query_states,
 					key_states=key_states,
@@ -728,7 +728,7 @@ class FlexibleAttentionModule(object):
 					query_sequence_length=query_sequence_length,
 					bias=bias,
 				)
-			elif self.attn_mechanism == "splash":
+			elif self.attn_mechanism == AttentionMechanisms.splash:
 				if segment_ids is not None:
 					warnings.warn(
 						"Splash attention don't support `segment_ids` this argument will be ignored",
@@ -756,7 +756,7 @@ class FlexibleAttentionModule(object):
 					key_value_sequence_length=key_value_sequence_length,
 					attention_mask=attention_mask,
 				)
-			elif self.attn_mechanism == "blockwise":
+			elif self.attn_mechanism == AttentionMechanisms.blockwise:
 				if segment_ids is not None:
 					warnings.warn(
 						"BlockWise Attention don't support `segment_ids` this argument will be ignored",
@@ -773,7 +773,7 @@ class FlexibleAttentionModule(object):
 					query_sequence_length=query_sequence_length,
 					key_value_sequence_length=key_value_sequence_length,
 				)
-			elif self.attn_mechanism == "cudnn":
+			elif self.attn_mechanism == AttentionMechanisms.cudnn:
 				return self.cuddn_flash_attention(
 					query_states=query_states,
 					key_states=key_states,
@@ -784,7 +784,7 @@ class FlexibleAttentionModule(object):
 					query_sequence_length=query_sequence_length,
 					key_value_sequence_length=key_value_sequence_length,
 				)
-			elif self.attn_mechanism == "local_ring":
+			elif self.attn_mechanism == AttentionMechanisms.local_ring:
 				if segment_ids is not None:
 					warnings.warn(
 						"LocalRing Attention don't support `segment_ids` this argument will be ignored",
@@ -806,7 +806,7 @@ class FlexibleAttentionModule(object):
 					query_sequence_length=query_sequence_length,
 					key_value_sequence_length=key_value_sequence_length,
 				)
-			elif self.attn_mechanism == "wise_ring":
+			elif self.attn_mechanism == AttentionMechanisms.wise_ring:
 				if segment_ids is not None:
 					warnings.warn(
 						"WiseRing Attention don't support `segment_ids` this argument will be ignored",
@@ -884,20 +884,11 @@ class FlexibleAttentionModule(object):
 				dtype=self.dtype,
 				softmax_scale=self.sm_scale,
 			)
+			
+			attention_outputs = with_sharding_constraint(attention_outputs, aps)
 			return AttentionOutput(
 				attention_weights=None,
-				attention_outputs=with_sharding_constraint(attention_outputs, aps).transpose(
-					0,
-					2,
-					1,
-					3,
-				),
-				# attention_outputs=attention_outputs.transpose(
-				# 	0,
-				# 	2,
-				# 	1,
-				# 	3,
-				# ),
+				attention_outputs=attention_outputs.transpose(0, 2, 1, 3),
 			)
 
 	def local_ring_attention(

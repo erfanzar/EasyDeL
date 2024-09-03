@@ -1,3 +1,4 @@
+import functools
 from functools import partial
 from typing import Optional, Tuple, Union
 
@@ -26,6 +27,7 @@ from easydel.modules.flax_modeling_utils import (
 	precompute_frequencies,
 )
 from easydel.modules.gemma2.gemma2_configuration import Gemma2Config as Gemma2Config
+from easydel.modules.gemma2.kernels import gemma2_mlp_pallas
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
@@ -123,7 +125,7 @@ class FlaxGemma2Attention(FlaxAttentionModule):
 	layer_idx: int
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 	causal: bool = True
 	is_cross_attention: bool = False
 
@@ -372,7 +374,7 @@ class FlaxGemma2MLP(nn.Module):
 	config: Gemma2Config
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
 		kernel_init = jax.nn.initializers.normal(self.config.initializer_range)
@@ -393,9 +395,31 @@ class FlaxGemma2MLP(nn.Module):
 
 	def __call__(self, hidden_states, deterministic=False):
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-		return self.down_proj(
+		if (
+			self.config.pallas_runtime
+			and self.up_proj.variables.get("params", None) is not None
+		):
+			return jax.vmap(
+				functools.partial(
+					gemma2_mlp_pallas,
+					act_fn=self.act,
+					blocksize_k=self.config.pallas_k_block_size,
+					blocksize_m=self.config.pallas_m_block_size,
+					blocksize_n=self.config.pallas_n_block_size,
+					po_dtype=self.dtype,
+					precision=self.precision,
+				),
+				in_axes=(0, None, None, None),
+			)(
+				hidden_states,
+				self.gate_proj.variables["params"]["kernel"],
+				self.down_proj.variables["params"]["kernel"],
+				self.up_proj.variables["params"]["kernel"],
+			)
+		hidden_states = self.down_proj(
 			self.act(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
 		)
+		return hidden_states
 
 
 class FlaxGemma2DecoderLayer(nn.Module):
@@ -403,7 +427,7 @@ class FlaxGemma2DecoderLayer(nn.Module):
 	layer_idx: int
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
 		mlp_block = FlaxGemma2MLP
@@ -531,7 +555,7 @@ class FlaxGemma2PreTrainedModel(EDPretrainedModel):
 		seed: int = 0,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest"),
+		precision: Optional[Union[str, jax.lax.Precision]] = None,
 		_do_init: bool = True,
 		**kwargs,
 	):
@@ -743,7 +767,7 @@ class FlaxGemma2LayerCollection(nn.Module):
 	config: Gemma2Config
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
 		self.blocks = [
@@ -843,7 +867,7 @@ class FlaxGemma2Module(nn.Module):
 	config: Gemma2Config
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
 		self.hidden_size = self.config.hidden_size
@@ -962,7 +986,7 @@ class FlaxGemma2ForCausalLMModule(nn.Module):
 	config: Gemma2Config
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
 		self.model = FlaxGemma2Module(

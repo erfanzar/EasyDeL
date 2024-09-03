@@ -497,7 +497,7 @@ class FlaxGrok1DecoderLayer(nn.Module):
 	layer_index: int
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self) -> None:
 		# hidden_states: chex.Array
