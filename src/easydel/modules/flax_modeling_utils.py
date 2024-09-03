@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 import chex
 import einops
 import fjformer
+import flax
 import flax.core
 import jax
 import jax.experimental
@@ -16,7 +17,7 @@ from einops import rearrange
 from fjformer.bit_quantization import config as q_config
 from fjformer.bit_quantization import q_flax
 from fjformer.dtypes import Array8Bit
-import flax
+from flax import linen as nn
 from flax.linen import combine_masks
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
@@ -25,8 +26,9 @@ from jax.experimental.mesh_utils import create_device_mesh
 from jax.experimental.shard_map import shard_map
 from jax.interpreters import pxla
 from jax.sharding import PartitionSpec
+from numpy import dtype
 from tqdm.auto import tqdm
-from flax import linen as nn
+
 from easydel.etils.errors import EasyDeLBlockWiseFFNError
 from easydel.etils.etils import AVAILABLE_SPARSE_MODULE_TYPES, get_logger
 from easydel.etils.partition_module import PartitionAxis
@@ -259,18 +261,57 @@ def compute_llama3_frequencies(
 	return jnp.einsum("i,j->ij", position_ids, new_freqs).astype("float32")
 
 
+def compute_long_rope_scaled(
+	dim,
+	max_position_embeddings,
+	rope_theta,
+	short_factor,
+	long_factor,
+	short_mscale,
+	long_mscale,
+	original_max_position_embeddings,
+	dtype=jnp.float32,
+):
+	seq_len = max_position_embeddings
+
+	if seq_len > original_max_position_embeddings:
+		rescale_factors = jnp.array(long_factor, dtype=jnp.float32)
+		mscale = long_mscale
+	else:
+		rescale_factors = jnp.array(short_factor, dtype=jnp.float32)
+		mscale = short_mscale
+
+	assert rescale_factors.shape == (
+		dim // 2,
+	), f"misaligned shape for LongRoPE rescale factors: {rescale_factors.shape}"
+
+	inv_freq = 1.0 / (
+		rescale_factors * (rope_theta ** (jnp.arange(0, dim, 2).astype(jnp.float32) / dim))
+	)
+
+	t = jnp.arange(seq_len, dtype=jnp.float32)
+	freqs = jnp.outer(t, inv_freq).astype(dtype)
+	emb = jnp.concatenate([freqs, freqs], axis=-1)
+	cos_emb = jnp.cos(emb) * mscale
+	sin_emb = jnp.sin(emb) * mscale
+
+	return (sin_emb.astype(dtype), cos_emb.astype(dtype))
+
+
 def precompute_frequencies(
 	dim: int,
 	max_position_embeddings: int = 2048,
 	base: float = 10000,
 	scaling_factor: float = 1.0,
 	rope_type: Optional[
-		Literal["none", "linear", "dynamic", "yarn", "su", "llama3"]
+		Literal["none", "linear", "dynamic", "yarn", "su", "llama3", "longrope"]
 	] = None,
 	time_dtype: jnp.dtype = jnp.int32,
 	original_max_position_embeddings: Optional[int] = None,
 	long_factor: Optional[List[float]] = None,
 	short_factor: Optional[List[float]] = None,
+	long_mscale: Optional[List[float]] = None,
+	short_mscale: Optional[List[float]] = None,
 	low_freq_factor: Optional[float] = None,
 	high_freq_factor: Optional[float] = None,
 ):
@@ -326,6 +367,31 @@ def precompute_frequencies(
 			high_freq_factor,
 			scaling_factor,
 		)
+	elif rope_type == "longrope":
+		assert all(
+			x is not None
+			for x in [
+				long_factor,
+				long_mscale,
+				max_position_embeddings,
+				original_max_position_embeddings,
+				base,
+				short_factor,
+				short_mscale,
+			]
+		), "Missing parameters for longrope"
+		sin_encoding, cos_encoding = compute_long_rope_scaled(
+			dim=dim,
+			dtype=jnp.float32,
+			long_factor=long_factor,
+			long_mscale=long_mscale,
+			max_position_embeddings=max_position_embeddings,
+			original_max_position_embeddings=original_max_position_embeddings,
+			rope_theta=base,
+			short_factor=short_factor,
+			short_mscale=short_mscale,
+		)
+		return sin_encoding, cos_encoding
 	else:
 		raise ValueError(f"Invalid rope_type: {rope_type}")
 

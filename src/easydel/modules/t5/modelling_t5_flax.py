@@ -16,6 +16,7 @@
 """Flax T5 model."""
 
 import copy
+import functools
 from typing import Callable, Optional, Tuple
 
 import chex
@@ -48,6 +49,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxSeq2SeqModelOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.t5.kernels import t5_mlp_pallas
 from easydel.modules.t5.t5_configuration import T5Config as T5Config
 
 remat = nn_partitioning.remat
@@ -109,6 +111,23 @@ class FlaxT5DenseActDense(nn.Module):
 		self.act = ACT2FN[self.config.dense_act_fn]
 
 	def __call__(self, hidden_states, deterministic=True):
+		if self.config.pallas_runtime and self.wi.variables.get("params", None) is not None:
+			return jax.vmap(
+				functools.partial(
+					t5_mlp_pallas,
+					act_fn=self.act,
+					blocksize_k=self.config.pallas_k_block_size,
+					blocksize_m=self.config.pallas_m_block_size,
+					blocksize_n=self.config.pallas_n_block_size,
+					po_dtype=self.dtype,
+					precision=self.precision,
+				),
+				in_axes=(0, None, None),
+			)(
+				hidden_states,
+				self.wi.variables["params"]["kernel"],
+				self.wo.variables["params"]["kernel"],
+			)
 		hidden_states = self.wi(hidden_states)
 		hidden_states = self.act(hidden_states)
 		hidden_states = self.dropout(hidden_states, deterministic=deterministic)
@@ -741,7 +760,7 @@ class FlaxT5BlockCollection(nn.Module):
 		position_bias = None
 		encoder_decoder_position_bias = None
 
-		for i, layer_module in enumerate(self.blocks):
+		for _, layer_module in enumerate(self.blocks):
 			if output_hidden_states:
 				all_hidden_states = all_hidden_states + (hidden_states,)
 

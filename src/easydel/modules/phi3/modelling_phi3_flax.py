@@ -33,6 +33,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.phi3.kernels import phi3_mlp_pallas
 from easydel.modules.phi3.phi3_configuration import Phi3Config as Phi3Config
 
 re_mat = nn_partitioning.remat
@@ -87,6 +88,26 @@ class FlaxPhi3MLP(nn.Module):
 
 	def __call__(self, hidden_states: Array, e: bool = False) -> Array:  # Ignored
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
+		if (
+			self.config.pallas_runtime
+			and self.down_proj.variables.get("params", None) is not None
+		):
+			return jax.vmap(
+				functools.partial(
+					phi3_mlp_pallas,
+					act_fn=self.activation_fn,
+					blocksize_k=self.config.pallas_k_block_size,
+					blocksize_m=self.config.pallas_m_block_size,
+					blocksize_n=self.config.pallas_n_block_size,
+					po_dtype=self.dtype,
+					precision=self.precision,
+				),
+				in_axes=(0, None, None),
+			)(
+				hidden_states,
+				self.gate_up_proj.variables["params"]["kernel"],
+				self.down_proj.variables["params"]["kernel"],
+			)
 		up_states = self.gate_up_proj(hidden_states)
 
 		gate, up_states = jnp.split(up_states, 2, axis=-1)

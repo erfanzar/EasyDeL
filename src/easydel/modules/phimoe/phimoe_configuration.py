@@ -1,7 +1,8 @@
 from typing import Optional
 
-from easydel.modules.modeling_utils import EDPretrainedConfig
 from jax.sharding import PartitionSpec
+
+from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
 class PhiMoeConfig(EDPretrainedConfig):
@@ -109,6 +110,7 @@ class PhiMoeConfig(EDPretrainedConfig):
 		router_jitter_noise=0.01,
 		input_jitter_noise=0.0,
 		attention_bias=False,
+		embd_pdrop: float = 0.0,
 		lm_head_bias=False,
 		bits: Optional[int] = None,
 		gradient_checkpointing: str = "nothing_saveable",
@@ -141,8 +143,8 @@ class PhiMoeConfig(EDPretrainedConfig):
 		self.router_aux_loss_coef = router_aux_loss_coef
 		self.router_jitter_noise = router_jitter_noise
 		self.input_jitter_noise = input_jitter_noise
-
-		self.rope_scaling = rope_scaling
+		self.embd_pdrop = embd_pdrop
+		self.rope_scaling = rope_scaling or {}
 		self._rope_scaling_validation()
 		self.bits = bits
 		self.gradient_checkpointing = gradient_checkpointing
@@ -158,10 +160,12 @@ class PhiMoeConfig(EDPretrainedConfig):
 	def add_jax_args(
 		self,
 		bits: Optional[int] = None,
+		embd_pdrop: float = 0.0,
 		gradient_checkpointing: str = "nothing_saveable",
 		**kwargs,
 	):
 		self.bits = bits
+		self.embd_pdrop = embd_pdrop
 		self.gradient_checkpointing = gradient_checkpointing
 		for k, v in kwargs.items():
 			if not hasattr(self, k):

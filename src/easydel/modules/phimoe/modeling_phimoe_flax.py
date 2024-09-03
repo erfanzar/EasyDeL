@@ -33,6 +33,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.phimoe.kernels import phimoe_mlp_pallas
 from easydel.modules.phimoe.phimoe_configuration import PhiMoeConfig as PhiMoeConfig
 
 re_mat = nn_partitioning.remat
@@ -82,9 +83,25 @@ class FlaxPhiMoEBlockSparseTop2MLP(nn.Module):
 		hidden_states: Array,
 		deterministic: bool = False,  # noqa
 	) -> Array:
-		current_hidden_states = self.act_fn(self.w1(hidden_states)) * self.w3(hidden_states)
-		current_hidden_states = self.w2(current_hidden_states)
-		return current_hidden_states
+		if self.config.pallas_runtime and self.w1.variables.get("params", None) is not None:
+			return jax.vmap(
+				functools.partial(
+					phimoe_mlp_pallas,
+					act_fn=self.act_fn,
+					blocksize_k=self.config.pallas_k_block_size,
+					blocksize_m=self.config.pallas_m_block_size,
+					blocksize_n=self.config.pallas_n_block_size,
+					po_dtype=self.dtype,
+					precision=self.precision,
+				),
+				in_axes=(0, None, None, None),
+			)(
+				hidden_states,
+				self.w1.variables["params"]["kernel"],
+				self.w2.variables["params"]["kernel"],
+				self.w3.variables["params"]["kernel"],
+			)
+		return self.w2(self.act_fn(self.w1(hidden_states)) * self.w3(hidden_states))
 
 
 class FlaxPhiMoEAttention(FlaxAttentionModule):
@@ -113,7 +130,9 @@ class FlaxPhiMoEAttention(FlaxAttentionModule):
 		self.num_key_value_heads = config.num_key_value_heads
 		self.num_key_value_groups = self.num_heads // self.num_key_value_heads
 		self.max_position_embeddings = config.max_position_embeddings
-		self.original_max_position_embeddings = config.original_max_position_embeddings
+		self.original_max_position_embeddings = config.rope_scaling.get(
+			"original_max_position_embeddings", None
+		)
 		self.rope_theta = config.rope_theta
 		self.rope_scaling = config.rope_scaling
 		self.is_causal = True
@@ -409,6 +428,7 @@ class FlaxPhiMoeSparseMoeBlock(nn.Module):
 	"""
 
 	config: PhiMoeConfig
+	layer_idx: int
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
 	precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision("fastest")
@@ -419,9 +439,6 @@ class FlaxPhiMoeSparseMoeBlock(nn.Module):
 		self.ffn_dim = config.intermediate_size
 		self.num_experts = config.num_local_experts
 		self.top_k = config.num_experts_per_tok
-		global iterations
-		iterations += 1
-		self.iter = iterations
 		self.gate = Dense(
 			self.config.num_local_experts,
 			use_bias=False,
@@ -752,15 +769,15 @@ class FlaxPhiMoeModule(nn.Module):
 		initial_rope_kwargs = dict(rope_type="none")
 		if hasattr(config, "rope_scaling"):
 			if config.rope_scaling is not None:
-				original_max_position_embeddings = (config.original_max_position_embeddings,)
-				long_factor = (config.rope_scaling["long_factor"],)
-				short_factor = (config.rope_scaling["short_factor"],)
-				rope_type = config.rope_scaling["type"]
 				initial_rope_kwargs = dict(
-					long_factor=long_factor,
-					short_factor=short_factor,
-					rope_type=rope_type,
-					original_max_position_embeddings=original_max_position_embeddings,
+					long_factor=config.rope_scaling.get("long_factor", None),
+					short_factor=config.rope_scaling.get("short_factor", None),
+					rope_type=config.rope_scaling.get("type", None),
+					original_max_position_embeddings=config.rope_scaling.get(
+						"original_max_position_embeddings", None
+					),
+					long_mscale=config.rope_scaling.get("long_mscale", None),
+					short_mscale=config.rope_scaling.get("short_mscale", None),
 				)
 		self.frequencies = precompute_frequencies(
 			max_position_embeddings=self.config.granted_freq_max_position_embedding,

@@ -1,3 +1,4 @@
+import functools
 import math
 from typing import Optional, Tuple, Union
 
@@ -31,6 +32,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.stablelm.kernels import stablelm_mlp_pallas
 from easydel.modules.stablelm.stablelm_configuration import (
 	StableLmConfig as StableLmConfig,
 )
@@ -101,6 +103,27 @@ class FlaxStableLmMLP(nn.Module):
 		"""
 
 		x = control_mlp_sharding(x, self.config.partition_axis)
+		if (
+			self.config.pallas_runtime
+			and self.gate_proj.variables.get("params", None) is not None
+		):
+			return jax.vmap(
+				functools.partial(
+					stablelm_mlp_pallas,
+					act_fn=self.act_fn,
+					blocksize_k=self.config.pallas_k_block_size,
+					blocksize_m=self.config.pallas_m_block_size,
+					blocksize_n=self.config.pallas_n_block_size,
+					po_dtype=self.dtype,
+					precision=self.precision,
+				),
+				in_axes=(0, None, None, None),
+			)(
+				x,
+				self.gate_proj.variables["params"]["kernel"],
+				self.down_proj.variables["params"]["kernel"],
+				self.up_proj.variables["params"]["kernel"],
+			)
 		return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
