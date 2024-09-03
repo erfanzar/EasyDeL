@@ -330,11 +330,13 @@ class EasyModelsTest(unittest.TestCase):
 		self.assertTrue(res, f"Mistral model Failed [ERROR {err}]")
 
 	def test_exaone(self):
+		self.header_config = None
 		hf_model, conf = self.get_hf_model_from_hub("LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct")
 		res, err = self.create_test_for_models("exaone", hf_model)
 		self.assertTrue(res, f"EXAONE model Failed [ERROR {err}]")
 
 	def test_internlm2(self):
+		self.header_config = None
 		hf_model, conf = self.get_hf_model_from_hub("internlm/internlm2_5-7b-chat")
 		res, err = self.create_test_for_models("internlm2", hf_model)
 		self.assertTrue(res, f"INTERNLM2 model Failed [ERROR {err}]")
@@ -360,6 +362,7 @@ class EasyModelsTest(unittest.TestCase):
 		self.assertTrue(res, f"Qwen 2 model Failed [ERROR {err}]")
 
 	def test_qwen1(self):
+		self.header_config = None
 		hf_model, conf = self.get_hf_model_from_hub("Qwen/Qwen1-7B-Chat")
 		res, err = self.create_test_for_models("qwen", hf_model)
 		self.assertTrue(res, f"Qwen model Failed [ERROR {err}]")
@@ -422,22 +425,26 @@ class EasyModelsTest(unittest.TestCase):
 		self.assertTrue(res, f"DBRX model Failed [ERROR {err}]")
 
 	def test_stablelm(self):
+		self.header_config = None
 		res, err = self.create_test_for_models("stablelm", transformers.StableLmForCausalLM)
 
 		self.assertTrue(res, f"StableLM model Failed [ERROR {err}]")
 
 	def test_phi3(self):
+		self.header_config = None
 		hf_model, conf = self.get_hf_model_from_hub("microsoft/Phi-3-mini-128k-instruct")
 		res, err = self.create_test_for_models("phi3", hf_model)
 		self.assertTrue(res, f"PHI3 model Failed [ERROR {err}]")
 
 	def test_deepseek_v2(self):
+		self.header_config = None
 		hf_model, conf = self.get_hf_model_from_hub("deepseek-ai/DeepSeek-V2")
 		res, err = self.create_test_for_models("deepseek_v2", hf_model)
 
 		self.assertTrue(res, f"DeepSeekv2 model Failed [ERROR {err}]")
 
 	def test_openelm(self):
+		self.header_config = None
 		hf_model, conf = self.get_hf_model_from_hub("apple/OpenELM-270M-Instruct")
 		conf_f = ed.OpenELMConfig()
 		for k, v in conf.__dict__.items():
@@ -448,15 +455,18 @@ class EasyModelsTest(unittest.TestCase):
 		self.assertTrue(res, f"OpenELM model Failed [ERROR {err}]")
 
 	def test_arctic(self):
+		self.header_config = None
 		hf_model, conf = self.get_hf_model_from_hub("Snowflake/snowflake-arctic-instruct")
 		res, err = self.create_test_for_models("arctic", hf_model)
 		self.assertTrue(res, f"ARCTIC model Failed [ERROR {err}]")
 
 	def test_rwkv(self):
+		self.header_config = None
 		res, err = self.create_test_for_models("rwkv", transformers.RwkvForCausalLM)
 		self.assertTrue(res, f"RWKV model Failed [ERROR {err}]")
 
 	def test_xerxes(self):
+		self.header_config = None
 		model = ed.FlaxXerxesForCausalLM(
 			ed.XerxesConfig(
 				32000,
@@ -508,26 +518,31 @@ class EasyModelsTest(unittest.TestCase):
 		self.assertTrue(res, f"Gemma2 model Failed [ERROR {err}]")
 
 	def test_mamba(self):
+		self.header_config = None
 		res, err = self.create_test_for_models("mamba", transformers.MambaForCausalLM)
 
 		self.assertTrue(res, f"MAMBA model Failed [ERROR {err}]")
 
 	def test_cohere(self):
+		self.header_config = None
 		res, err = self.create_test_for_models("cohere", transformers.CohereForCausalLM)
 
 		self.assertTrue(res, f"CoHERE model Failed [ERROR {err}]")
 
 	def test_qwen2_moe(self):
+		self.header_config = None
 		res, err = self.create_test_for_models(
 			"qwen2_moe", transformers.Qwen2MoeForCausalLM
 		)
 		self.assertTrue(res, f"Qwen2Moe model Failed [ERROR {err}]")
 
 	def test_moe_mixtral(self):
+		self.header_config = None
 		res = self.create_moe_test_for_models("mixtral", transformers.MixtralForCausalLM)
 		self.assertTrue(res)
 
 	def test_moe_qwen2_moe(self):
+		self.header_config = None
 		res = self.create_moe_test_for_models("qwen2_moe", transformers.Qwen2MoeForCausalLM)
 		self.assertTrue(res)
 
