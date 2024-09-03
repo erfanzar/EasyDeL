@@ -282,9 +282,7 @@ class FlaxGPT2MLP(nn.Module):
 		self.dropout = flax.linen.Dropout(rate=self.config.resid_pdrop)
 
 	def __call__(self, hidden_states, deterministic: bool = True):
-		hidden_states = self.c_fc(hidden_states)
-		hidden_states = self.act(hidden_states)
-		hidden_states = self.c_proj(hidden_states)
+		hidden_states = self.c_proj(self.act(self.c_fc(hidden_states)))
 		hidden_states = self.dropout(hidden_states, deterministic=deterministic)
 		return hidden_states
 

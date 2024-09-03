@@ -1,3 +1,4 @@
+from functools import partial
 import math
 from typing import Optional, Tuple, Union
 
@@ -24,6 +25,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.mosaic_mpt.kernels import mpt_mlp_pallas
 from easydel.modules.mosaic_mpt.mosaic_configuration import (
 	MptConfig as MptConfig,
 )
@@ -36,8 +38,8 @@ class FlaxMptMLP(nn.Module):
 	precision: Optional[Union[jax.lax.Precision, str]] = None
 
 	def setup(self) -> None:
-		self.up_proj = Dense(
-			self.config.expansion_ratio * self.config.hidden_size,
+		dense_class = partial(
+			Dense,
 			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
 			use_bias=self.config.use_bias,
 			dtype=self.dtype,
@@ -45,15 +47,8 @@ class FlaxMptMLP(nn.Module):
 			precision=self.precision,
 			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
 		)
-		self.down_proj = Dense(
-			self.config.hidden_size,
-			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-			use_bias=self.config.use_bias,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
-		)
+		self.up_proj = dense_class(self.config.expansion_ratio * self.config.hidden_size)
+		self.down_proj = dense_class(self.config.hidden_size)
 		self.hidden_dropout = nn.Dropout(self.config.attn_config.attn_pdrop)
 
 	def __call__(
@@ -63,13 +58,32 @@ class FlaxMptMLP(nn.Module):
 		deterministic: bool = False,
 	):
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-		return (
-			self.hidden_dropout(
-				self.down_proj(jax.nn.gelu(self.up_proj(hidden_states), approximate=False)),
-				deterministic=deterministic,
+		if (
+			self.config.pallas_runtime
+			and self.up_proj.variables.get("params", None) is not None
+		):
+			hidden_states = jax.vmap(
+				partial(
+					mpt_mlp_pallas,
+					act_fn=jax.nn.gelu,
+					blocksize_k=self.config.pallas_k_block_size,
+					blocksize_m=self.config.pallas_m_block_size,
+					blocksize_n=self.config.pallas_n_block_size,
+					po_dtype=self.dtype,
+					precision=self.precision,
+				),
+				in_axes=(0, None, None),
+			)(
+				hidden_states,
+				self.up_proj.variables["params"]["kernel"],
+				self.down_proj.variables["params"]["kernel"],
 			)
-			+ residual
-		)
+		else:
+			hidden_states = self.down_proj(
+				jax.nn.gelu(self.up_proj(hidden_states), approximate=False)
+			)
+
+		return self.hidden_dropout(hidden_states, deterministic=deterministic) + residual
 
 
 class FlaxMptAttention(FlaxAttentionModule):
@@ -104,6 +118,7 @@ class FlaxMptAttention(FlaxAttentionModule):
 		self.max_seq_length = self.config.max_seq_len
 		self.head_dim = self.hidden_size // self.n_heads
 		self.softmax_scale = self.config.attn_config.softmax_scale
+
 		if self.softmax_scale is None:
 			self.softmax_scale = 1 / math.sqrt(self.hidden_size / self.n_heads)
 
@@ -255,16 +270,6 @@ class FlaxMptBlock(nn.Module):
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 				static_argnums=(2,),
 			)
-
-			# hidden_states: chex.Array
-			# position_bias: chex.Array | Tuple[chex.Array, chex.Array]
-			# attention_mask: chex.Array
-			# causal_mask: chex.Array
-			# segment_ids: Optional[chex.Array] = None
-			# deterministic: bool = True
-			# init_cache: bool = False
-			# output_attentions: bool = False
-			# fcm_mask: Optional[chex.Array] = None
 			attn_block = remat(
 				attn_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
@@ -482,7 +487,8 @@ class FlaxMptModule(nn.Module):
 
 	def setup(self) -> None:
 		self.wte = nn.Embed(
-			num_embeddings=self.config.vocab_size, features=self.config.d_model
+			num_embeddings=self.config.vocab_size,
+			features=self.config.d_model,
 		)
 
 		self.blocks = FlaxMptDecoratorCollection(

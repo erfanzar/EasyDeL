@@ -26,6 +26,7 @@ def _matmul_kernel_fwd(
 	precision,
 ):
 	row_id, col_id = pl.program_id(0), pl.program_id(1)
+
 	m, n = a_ref.shape[0], b_ref.shape[1]
 	col_slice = pl.dslice(col_id * blocksize_n, blocksize_n)
 	row_slice = pl.dslice(row_id * blocksize_m, blocksize_m)
@@ -82,7 +83,6 @@ def _get_compiler_params(
 	params = None
 	platform = xla_bridge.get_backend().platform
 	if platform == "gpu":
-		
 		num_warps = min(max((blocksize_m * blocksize_n) // 2, 4), 32)
 		num_stages = min(max(blocksize_k // 64, 3), 6)
 
@@ -102,7 +102,9 @@ def _call_matmul_kernel_fwd(
 ):
 	# A(mk)@B(kn)=C(mn)
 	assert A.ndim == 2 and B.ndim == 2, f"got {A.shape=} and {B.shape=}"
-	assert A.shape[1] == B.shape[0]
+	assert (
+		A.shape[1] == B.shape[0]
+	), f"matmul can't be operated with these shapes {A.shape=} {B.shape=} "
 	m, n = A.shape[0], B.shape[1]
 	grid = (pl.cdiv(m, blocksize_m), pl.cdiv(n, blocksize_n))
 

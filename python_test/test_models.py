@@ -77,7 +77,7 @@ class EasyModelsTest(unittest.TestCase):
 		self.block_q: int = 32
 		self.sequence_length = 64
 		self.scan_mlp_chunk_size = self.sequence_length // 2
-		self.head_dim = 256
+		self.head_dim = self.hidden_size // self.num_attention_heads
 		self.use_parallel_residual = True
 		self.qk_layernorm = True
 		self.max_position_embeddings: int = self.sequence_length
@@ -132,12 +132,14 @@ class EasyModelsTest(unittest.TestCase):
 				remove_state_dict=True,
 			)
 		}
+
 		config.add_jax_args()
 		config.add_basic_configurations(
 			shard_attention_computation=self.shard_attention_computation,
 			use_sharding_constraint=self.use_sharding_constraint,
 			scan_mlp_chunk_size=self.scan_mlp_chunk_size,
 		)
+
 		mesh = config.mesh
 
 		with mesh:
@@ -166,6 +168,7 @@ class EasyModelsTest(unittest.TestCase):
 				labels=torch_input_ids[:, 1:],
 				past_key_values=None,
 			)
+
 			ed_model = module_class(
 				config=config,
 				dtype=self.dtype,
@@ -303,12 +306,8 @@ class EasyModelsTest(unittest.TestCase):
 			d_model=self.hidden_size,
 			n_heads=self.num_attention_heads,
 			n_layers=1,
-			ffn_config=ed.DbrxFFNConfig(
-				ffn_hidden_size=self.intermediate_size,
-				moe_top_k=self.num_experts_per_tok,
-				moe_num_experts=self.num_local_experts,
-			),
 			attn_config=ed.MptAttentionConfig(),
+			axis_dims=(1, 1, 1, -1),
 		)
 		res, err = self.create_test_for_models("mpt", transformers.MptForCausalLM)
 		self.header_config = None
@@ -578,18 +577,18 @@ class EasyModelsTest(unittest.TestCase):
 		all_close_loss = jnp.allclose(hf_loss, ed_loss, atol=1e-02, rtol=rtol)
 
 		if not all_close:
-			print(f"\n{name} LAST F HF : ", to[0, -1, -5:])
-			print(f"{name} LAST F ED : ", jo[0, -1, -5:])
+			print(f"\n{name} LAST F HuggingFace : ", to[0, -1, -5:])
+			print(f"{name} LAST F EasyDeL       : ", jo[0, -1, -5:])
 			print(
 				f"{name} CORRECT % : ",
 				jnp.mean(
 					jnp.where(jnp.isclose(to, jo, atol=atol, rtol=rtol), 1, 0).reshape(-1)
 				),
 			)
-			print(f"{name} ERROR : {err}")
-			print(f"{name} LOSS F HF : ", hf_loss)
-			print(f"{name} LOSS F ED : ", ed_loss)
-			print("IS LOSS CLOSE    : ", all_close_loss)
+			print(f"{name} ERROR     : {err}")
+			print(f"{name} LOSS F HuggingFace : ", hf_loss)
+			print(f"{name} LOSS F EasyDeL     : ", ed_loss)
+			print("IS LOSS CLOSE     : ", all_close_loss)
 		return all_close or all_close_loss, err
 
 	@staticmethod
@@ -626,11 +625,21 @@ if __name__ == "__main__":
 	# test.test_cohere() # Passed v0.0.80 - P Runtime
 	# test.test_dbrx()  # Passed  v0.0.80 - P Runtime
 	# test.test_deepseek_v2() # Passed v0.0.80 - P Runtime
-	# test.test_exaone() # Passed v0.0.80 - P Runtime
+	# test.test_exaone()      # Passed v0.0.80 - P Runtime
 	# test.test_falcon() # Passed v0.0.80 - P Runtime
 	# test.test_gemma() # Passed v0.0.80 - P Runtime
 	# test.test_gemma2() # Passed v0.0.80 - P Runtime
 	# test.test_gptj() # Passed v0.0.80 - P Runtime
+	# test.test_gpt2()
+	# test.test_grok1() # should be impl
+	# test.test_internlm2()
+	# test.test_llama() # Passed v0.0.80 - P Runtime
+	# test.test_mamba() # Passed v0.0.80 - P Runtime
+	# test.test_mistral() # Passed v0.0.80 - P Runtime
+	# test.test_mixtral() # Passed v0.0.80 - P Runtime
+	# test.test_mpt() # Passed v0.0.80 - P Runtime
+	# test.test_olmo() # Passed v0.0.80 - P Runtime
+	# test.test_openelm() # Passed v0.0.80 - P Runtime
 	# -----------------------------------------------
 	# test.test_mistral()  # Passed v0.0.80
 	# test.test_mixtral()

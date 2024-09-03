@@ -25,20 +25,5 @@ def mistral_mlp_pallas(
 		precision=precision,
 	)
 	return matmul_kernel(
-		(
-			act_fn(
-				matmul_kernel(
-					x,
-					w1,
-					**args,
-				)
-			)
-			* matmul_kernel(
-				x,
-				w3,
-				**args,
-			)
-		),
-		w2,
-		**args,
+		(act_fn(matmul_kernel(x, w1, **args)) * matmul_kernel(x, w3, **args)), w2, **args
 	)

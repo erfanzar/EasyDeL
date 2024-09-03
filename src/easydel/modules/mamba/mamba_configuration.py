@@ -91,6 +91,7 @@ class MambaConfig(EDPretrainedConfig):
 		rescale_prenorm_residual=False,
 		use_cache=True,
 		gradient_checkpointing: str = "nothing_saveable",
+		use_mambapy: bool = False,
 		**kwargs,
 	):
 		self.vocab_size = vocab_size
@@ -120,6 +121,7 @@ class MambaConfig(EDPretrainedConfig):
 		self.residual_in_fp32 = residual_in_fp32
 		self.use_cache = use_cache
 		self.gradient_checkpointing = gradient_checkpointing
+		self.use_mambapy = use_mambapy
 		super().__init__(**kwargs)
 
 	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):

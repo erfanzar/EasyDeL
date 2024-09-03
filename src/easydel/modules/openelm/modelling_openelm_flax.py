@@ -1,3 +1,4 @@
+import functools
 import math
 from typing import Optional, Tuple, Union
 
@@ -31,6 +32,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.openelm.kernels import openelm_mlp_pallas
 from easydel.modules.openelm.openelm_configuration import (
 	OpenELMConfig as OpenELMConfig,
 )
@@ -418,6 +420,28 @@ class FlaxOpenELMFeedForwardNetwork(nn.Module):
 
 	def __call__(self, x: chex.Array, e: bool = False) -> chex.Array:
 		x = control_mlp_sharding(x, self.config.partition_axis)
+
+		if (
+			self.config.pallas_runtime
+			and self.proj_2.variables.get("params", None) is not None
+		):
+			return jax.vmap(
+				functools.partial(
+					openelm_mlp_pallas,
+					act_fn=self.act,
+					ffn_with_glu=self.ffn_with_glu,
+					blocksize_k=self.config.pallas_k_block_size,
+					blocksize_m=self.config.pallas_m_block_size,
+					blocksize_n=self.config.pallas_n_block_size,
+					po_dtype=self.dtype,
+					precision=self.precision,
+				),
+				in_axes=(0, None, None),
+			)(
+				x,
+				self.proj_1.variables["params"]["kernel"],
+				self.proj_2.variables["params"]["kernel"],
+			)
 		if self.ffn_with_glu:
 			y_12 = self.proj_1(x)
 			y_1, y_2 = jnp.split(y_12, 2, axis=-1)
