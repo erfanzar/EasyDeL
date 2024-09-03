@@ -42,6 +42,9 @@ from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN, EasyQuantizer
 logger = get_logger(__name__)
 
 FLAX_WEIGHTS_NAME = "easydel-model.parameters"
+DEFAULT_PALLAS_M_BLOCK_SIZE = 16
+DEFAULT_PALLAS_K_BLOCK_SIZE = 64
+DEFAULT_PALLAS_N_BLOCK_SIZE = 16
 
 
 def set_attrs_smartly(self, attr_name: str, default: Any, new_attr: Any):
@@ -127,9 +130,9 @@ class EDPretrainedConfig(PretrainedConfig):
 		fcm_max_ratio: float = 0.0,
 		fcm_min_ratio: float = 0.0,
 		pallas_runtime: bool = True,
-		pallas_m_block_size: int = 32,
-		pallas_k_block_size: int = 256,
-		pallas_n_block_size: int = 32,
+		pallas_m_block_size: int = DEFAULT_PALLAS_M_BLOCK_SIZE,
+		pallas_k_block_size: int = DEFAULT_PALLAS_K_BLOCK_SIZE,
+		pallas_n_block_size: int = DEFAULT_PALLAS_N_BLOCK_SIZE,
 		**kwargs,
 	):
 		self.axis_dims = getattr(
@@ -676,7 +679,7 @@ class EDPretrainedConfig(PretrainedConfig):
 		set_attrs_smartly(
 			self,
 			"use_scan_mlp",
-			True,
+			False,
 			use_scan_mlp,
 		)
 		set_attrs_smartly(
@@ -721,21 +724,21 @@ class EDPretrainedConfig(PretrainedConfig):
 		set_attrs_smartly(
 			self,
 			"pallas_m_block_size",
-			32,
+			DEFAULT_PALLAS_M_BLOCK_SIZE,
 			pallas_m_block_size,
 		)
 
 		set_attrs_smartly(
 			self,
 			"pallas_k_block_size",
-			256,
+			DEFAULT_PALLAS_K_BLOCK_SIZE,
 			pallas_k_block_size,
 		)
 
 		set_attrs_smartly(
 			self,
 			"pallas_n_block_size",
-			32,
+			DEFAULT_PALLAS_N_BLOCK_SIZE,
 			pallas_n_block_size,
 		)
 

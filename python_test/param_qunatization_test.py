@@ -4,6 +4,7 @@ import sys
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../src"))
 
+import time
 from typing import Callable, List
 
 from easydel import (
@@ -42,21 +43,26 @@ def main():
 	tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B")
 	tokenizer.padding_side = "left"
 	tokenizer.pad_token = tokenizer.eos_token
+	max_position_embeddings = 512
 	config = LlamaConfig(
-		hidden_size=128,
-		intermediate_size=256,
+		hidden_size=512,
+		intermediate_size=1024,
 		num_hidden_layers=4,
-		max_position_embeddings=512,
+		max_position_embeddings=max_position_embeddings + 128,
 		use_scan_mlp=False,
-		axis_dims=(1, 1, 1, -1),
+		axis_dims=(1, -1, 1, 1),
 		quantize_kv_cache=True,
+		q_block=32,
+		k_block=32,
+		pallas_runtime=True,
+		# attn_mechanism="pallas_flash"
 	)
 	model = FlaxLlamaForCausalLM(
 		config=config,
 		dtype=jnp.float16,
 		param_dtype=jnp.float16,
 		precision=lax.Precision("fastest"),
-		input_shape=(1, 2),
+		input_shape=(2, 2),
 		_do_init=True,
 		seed=81,
 	)
@@ -64,12 +70,12 @@ def main():
 	tokens = tokenizer(
 		"SOME TEXT",
 		return_tensors="np",
-		max_length=32,
+		max_length=max_position_embeddings,
 		padding="max_length",
 	)
 	input_ids = tokens["input_ids"]
 	attention_mask = tokens["attention_mask"]
-	params = quantize_params(model.params, method="nf4")
+	params = quantize_params(model.params, method="8bit") if False else model.params
 	pipeline = GenerationPipeline(
 		model=model,
 		params=params,
@@ -83,14 +89,19 @@ def main():
 			length_penalty=1.2,
 			repetition_penalty=1.2,
 		),
-		parameters_are_quantized=True,
+		# parameters_are_quantized=True,
 	)
-	for token in pipeline.generate(input_ids, attention_mask):
+
+	time_start = None
+	for gen, token in enumerate(pipeline.generate(input_ids, attention_mask)):  # noqa: B007
+		if time_start is None:
+			time_start = time.time()
 		print(token, end="")
-	print("\n")
-	print("*" * 50)
-	for token in pipeline.generate(input_ids, attention_mask):
-		print(token, end="")
+	print("\nTPS : %f \n" % ((gen + 1) / (time.time() - time_start)))
+	# print("\n")
+	# print("*" * 50)
+	# for token in pipeline.generate(input_ids, attention_mask):
+	# 	print(token, end="")
 
 
 if __name__ == "__main__":

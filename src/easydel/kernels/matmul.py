@@ -3,10 +3,13 @@
 from functools import partial
 
 import jax
+import jax.interpreters
+import jax.interpreters.pxla
 import jax.random
 from fjformer import GenerateRNG
 from jax import numpy as jnp
 from jax.experimental import pallas as pl
+from jax.lib import xla_bridge
 
 rng = GenerateRNG()
 
@@ -71,6 +74,22 @@ def _matmul_kernel_fwd(
 	)
 
 
+def _get_compiler_params(
+	blocksize_m: int,
+	blocksize_k: int,
+	blocksize_n: int,
+):
+	params = None
+	platform = xla_bridge.get_backend().platform
+	if platform == "gpu":
+		
+		num_warps = min(max((blocksize_m * blocksize_n) // 2, 4), 32)
+		num_stages = min(max(blocksize_k // 64, 3), 6)
+
+		params = dict(triton=dict(num_stages=num_stages, num_warps=num_warps))
+	return params
+
+
 def _call_matmul_kernel_fwd(
 	A: jax.Array,
 	B: jax.Array,
@@ -84,17 +103,15 @@ def _call_matmul_kernel_fwd(
 	# A(mk)@B(kn)=C(mn)
 	assert A.ndim == 2 and B.ndim == 2, f"got {A.shape=} and {B.shape=}"
 	assert A.shape[1] == B.shape[0]
-	m, k, n = A.shape[0], A.shape[1], B.shape[1]
-	blocksize_k = min(k, blocksize_k)
+	m, n = A.shape[0], B.shape[1]
 	grid = (pl.cdiv(m, blocksize_m), pl.cdiv(n, blocksize_n))
 
 	in_specs = [
 		pl.BlockSpec(lambda *_: (0,) * A.ndim, A.shape),
 		pl.BlockSpec(lambda *_: (0,) * B.ndim, B.shape),
 	]
-
-	# interpret = list(A.devices())[0].platform == "cpu"
-	interpret = True
+	platform = xla_bridge.get_backend().platform
+	interpret = platform == "cpu"
 	out_specs = pl.BlockSpec(lambda *_: (0,) * A.ndim, (m, n))
 	return pl.pallas_call(
 		f=partial(
@@ -111,6 +128,11 @@ def _call_matmul_kernel_fwd(
 		grid=grid,
 		in_specs=in_specs,
 		out_specs=out_specs,
+		compiler_params=_get_compiler_params(
+			blocksize_m=blocksize_m,
+			blocksize_n=blocksize_n,
+			blocksize_k=blocksize_k,
+		),
 	)(A, B)
 
 
