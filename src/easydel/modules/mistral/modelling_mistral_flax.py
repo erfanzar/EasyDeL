@@ -103,7 +103,7 @@ class FlaxMistralMLP(nn.Module):
 	config: MistralConfig
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self) -> None:
 		dense = functools.partial(
@@ -798,7 +798,7 @@ class FlaxMistralDecoratorCollection(nn.Module):
 	config: MistralConfig
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self) -> None:
 		self.layers = [

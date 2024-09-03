@@ -1,3 +1,4 @@
+import functools
 import warnings
 from typing import Optional, Tuple, Union
 
@@ -26,6 +27,7 @@ from easydel.modules.flax_modeling_utils import (
 	precompute_frequencies,
 )
 from easydel.modules.gemma.gemma_configuration import GemmaConfig as GemmaConfig
+from easydel.modules.gemma.kernels import gemma_mlp_pallas
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
@@ -122,7 +124,7 @@ class FlaxGemmaAttention(FlaxAttentionModule):
 	config: GemmaConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 	causal: bool = True
 	is_cross_attention: bool = False
 
@@ -381,7 +383,7 @@ class FlaxGemmaMLP(nn.Module):
 	config: GemmaConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
 		embed_dim = self.config.hidden_size
@@ -396,7 +398,8 @@ class FlaxGemmaMLP(nn.Module):
 				"Gemma's activation function should be approximate GeLU and not exact GeLU. "
 				"Changing the activation function to `gelu_pytorch_tanh`."
 				f"if you want to use the legacy `{self.config.hidden_act}`, "
-				f"edit the `model.config` to set `hidden_activation={self.config.hidden_act}` "
+				f"edit the `model.config` to set `hidden_activation={self.config.hidden_act}` ",
+				stacklevel=1,
 			)
 			hidden_activation = "gelu_pytorch_tanh"
 		else:
@@ -433,10 +436,31 @@ class FlaxGemmaMLP(nn.Module):
 
 	def __call__(self, hidden_states, deterministic=False):
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-		up_proj_states = self.up_proj(hidden_states)
-		gate_states = self.act(self.gate_proj(hidden_states))
 
-		hidden_states = self.down_proj(up_proj_states * gate_states)
+		if (
+			self.config.pallas_runtime
+			and self.up_proj.variables.get("params", None) is not None
+		):
+			return jax.vmap(
+				functools.partial(
+					gemma_mlp_pallas,
+					act_fn=self.act,
+					blocksize_k=self.config.pallas_k_block_size,
+					blocksize_m=self.config.pallas_m_block_size,
+					blocksize_n=self.config.pallas_n_block_size,
+					po_dtype=self.dtype,
+					precision=self.precision,
+				),
+				in_axes=(0, None, None, None),
+			)(
+				hidden_states,
+				self.gate_proj.variables["params"]["kernel"],
+				self.down_proj.variables["params"]["kernel"],
+				self.up_proj.variables["params"]["kernel"],
+			)
+		hidden_states = self.down_proj(
+			self.act(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+		)
 		return hidden_states
 
 
@@ -444,7 +468,7 @@ class FlaxGemmaDecoderLayer(nn.Module):
 	config: GemmaConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
 		mlp_block = FlaxGemmaMLP
@@ -774,7 +798,7 @@ class FlaxGemmaLayerCollection(nn.Module):
 	config: GemmaConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
 		self.blocks = [
@@ -873,7 +897,7 @@ class FlaxGemmaModule(nn.Module):
 	config: GemmaConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
 		self.hidden_size = self.config.hidden_size
@@ -991,7 +1015,7 @@ class FlaxGemmaForCausalLMModule(nn.Module):
 	config: GemmaConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
 		self.model = FlaxGemmaModule(

@@ -66,7 +66,7 @@ class FlaxOpenELMMLP(nn.Module):
 	config: OpenELMConfig
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 
 class FlaxOpenELMMultiHeadCausalAttention(FlaxAttentionModule):
@@ -573,7 +573,7 @@ class FlaxOpenELMDecoderLayerCollection(nn.Module):
 	config: OpenELMConfig
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self) -> None:
 		self.layers = [
@@ -683,7 +683,7 @@ class FlaxOpenELMModule(nn.Module):
 	config: OpenELMConfig
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest")
+	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self) -> None:
 		config = self.config

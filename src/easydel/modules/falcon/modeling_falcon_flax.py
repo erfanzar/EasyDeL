@@ -1,3 +1,4 @@
+import functools
 import math
 from typing import Optional, Tuple, Union
 
@@ -15,6 +16,7 @@ from jax.sharding import PartitionSpec
 
 from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.falcon.falcon_configuration import FalconConfig as FalconConfig
+from easydel.modules.falcon.kernels import falcon_mlp_pallas
 from easydel.modules.flax_modeling_utils import (
 	FlaxAttentionModule,
 	apply_rotary_pos_emb,
@@ -448,6 +450,25 @@ class FlaxFalconMlp(nn.Module):
 
 	def __call__(self, x: chex.Array, deterministic: bool = True):
 		x = control_mlp_sharding(x, self.config.partition_axis)
+		if (
+			self.config.pallas_runtime
+			and self.dense_4h_to_h.variables.get("params", None) is not None
+		):
+			return jax.vmap(
+				functools.partial(
+					falcon_mlp_pallas,
+					blocksize_k=self.config.pallas_k_block_size,
+					blocksize_m=self.config.pallas_m_block_size,
+					blocksize_n=self.config.pallas_n_block_size,
+					po_dtype=self.dtype,
+					precision=self.precision,
+				),
+				in_axes=(0, None, None),
+			)(
+				x,
+				self.dense_h_to_4h.variables["params"]["kernel"],
+				self.dense_4h_to_h.variables["params"]["kernel"],
+			)
 		return self.dense_4h_to_h(nn.gelu(self.dense_h_to_4h(x), approximate=False))
 
 
@@ -840,7 +861,7 @@ class FlaxFalconPretrainedModel(EDPretrainedModel):
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
 		input_shape: Tuple = (1, 1),
-		precision: Optional[Union[str, jax.lax.Precision]] = jax.lax.Precision("fastest"),
+		precision: Optional[Union[str, jax.lax.Precision]] = None,
 	):
 		module = self.module_class(
 			config=config,

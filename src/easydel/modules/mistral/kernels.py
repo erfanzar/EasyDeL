@@ -11,9 +11,9 @@ def mistral_mlp_pallas(
 	w3,
 	*,
 	act_fn,
-	blocksize_m: int = 32,
-	blocksize_k: int = 256,
-	blocksize_n: int = 32,
+	blocksize_m: int = 16,
+	blocksize_k: int = 64,
+	blocksize_n: int = 16,
 	po_dtype: jnp.dtype = jnp.float32,
 	precision: lax.PrecisionLike = None,
 ):

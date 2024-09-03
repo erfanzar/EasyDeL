@@ -1,3 +1,4 @@
+import functools
 import math
 from functools import partial
 from typing import Optional, Tuple, Union
@@ -25,6 +26,7 @@ from easydel.modules.flax_modeling_utils import (
 	get_gradient_checkpoint_policy,
 )
 from easydel.modules.gpt_j.gpt_j_configuration import GPTJConfig as GPTJConfig
+from easydel.modules.gpt_j.kernels import gptj_mlp_pallas
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
@@ -321,9 +323,28 @@ class FlaxGPTJMLP(nn.Module):
 		self.dropout = flax.linen.Dropout(rate=self.config.resid_pdrop)
 
 	def __call__(self, hidden_states, deterministic: bool = True):
-		hidden_states = self.fc_in(hidden_states)
-		hidden_states = self.act(hidden_states)
-		hidden_states = self.fc_out(hidden_states)
+		if (
+			self.config.pallas_runtime
+			and self.fc_out.variables.get("params", None) is not None
+		):
+			hidden_states = jax.vmap(
+				functools.partial(
+					gptj_mlp_pallas,
+					act_fn=self.act,
+					blocksize_k=self.config.pallas_k_block_size,
+					blocksize_m=self.config.pallas_m_block_size,
+					blocksize_n=self.config.pallas_n_block_size,
+					po_dtype=self.dtype,
+					precision=self.precision,
+				),
+				in_axes=(0, None, None),
+			)(
+				hidden_states,
+				self.fc_in.variables["params"]["kernel"],
+				self.fc_out.variables["params"]["kernel"],
+			)
+		else:
+			hidden_states = self.fc_out(self.act(self.fc_in(hidden_states)))
 		hidden_states = self.dropout(hidden_states, deterministic=deterministic)
 		return hidden_states
 

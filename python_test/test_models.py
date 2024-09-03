@@ -108,7 +108,6 @@ class EasyModelsTest(unittest.TestCase):
 				rotary_dim=self.rotary_dim,
 				rms_norm_eps=self.rms_norm_eps,
 				layer_norm_eps=self.layer_norm_eps,
-				axis_dims=(1, 1, 1, -1),
 				head_dim=self.head_dim,
 				new_decoder_architecture=True,
 				num_kv_heads=self.num_key_value_heads,
@@ -118,12 +117,11 @@ class EasyModelsTest(unittest.TestCase):
 				use_parallel_residual=self.use_parallel_residual,
 				qk_layernorm=self.qk_layernorm,
 				rope_scaling=self.rope_scaling,
-				# tie_word_embedding=True,
-				# residual_in_fp32=True
 			)
 		else:
 			config = self.header_config
 
+		config.axis_dims = (1, 1, 1, -1)
 		hf_model = hf_module_class(config=copy.deepcopy(config))
 		hf_model.eval()
 
@@ -609,8 +607,18 @@ if __name__ == "__main__":
 	# unittest.main()
 	test = EasyModelsTest()
 	test.setUp()
+	# test.test_arctic() # Passed v0.0.80 - P Runtime
+	# test.test_cohere() # Passed v0.0.80 - P Runtime
+	# test.test_dbrx()  # Passed  v0.0.80 - P Runtime
+	# test.test_deepseek_v2() # Passed v0.0.80 - P Runtime
+	# test.test_exaone() # Passed v0.0.80 - P Runtime
+	# test.test_falcon() # Passed v0.0.80 - P Runtime
+	# test.test_gemma() # Passed v0.0.80 - P Runtime
+	# test.test_gemma2() # Passed v0.0.80 - P Runtime
+	# test.test_gptj() # Passed v0.0.80 - P Runtime
+	# -----------------------------------------------
 	# test.test_mistral()  # Passed v0.0.80
-	test.test_mixtral()
+	# test.test_mixtral()
 	# test.test_gemma() # Passed v0.0.80
 	# test.test_gemma2()  # Passed v0.0.80
 	# test.test_llama()  #  Llama 3.1 Passed v0.0.80
