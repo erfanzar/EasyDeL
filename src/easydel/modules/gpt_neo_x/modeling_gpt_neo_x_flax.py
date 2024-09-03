@@ -1,3 +1,4 @@
+import functools
 from typing import Dict, Optional, Tuple, Union
 
 import chex
@@ -20,6 +21,7 @@ from easydel.modules.flax_modeling_utils import (
 from easydel.modules.gpt_neo_x.gpt_neo_x_configuration import (
 	GPTNeoXConfig as GPTNeoXConfig,
 )
+from easydel.modules.gpt_neo_x.kernels import gptneox_mlp_pallas
 from easydel.modules.modeling_flax_outputs import FlaxBaseModelOutput
 from easydel.modules.modeling_utils import EDPretrainedModel
 
@@ -147,6 +149,27 @@ class FlaxGPTNeoXMlp(nn.Module):
 
 	def __call__(self, x):
 		x = control_mlp_sharding(x, self.config.partition_axis)
+		if (
+			self.config.pallas_runtime
+			and self.dense_4h_to_h.variables.get("params", None) is not None
+		):
+			return jax.vmap(
+				functools.partial(
+					gptneox_mlp_pallas,
+					act_fn=self.act,
+					blocksize_k=self.config.pallas_k_block_size,
+					blocksize_m=self.config.pallas_m_block_size,
+					blocksize_n=self.config.pallas_n_block_size,
+					po_dtype=self.dtype,
+					precision=self.precision,
+				),
+				in_axes=(0, None, None),
+			)(
+				x,
+				self.dense_h_to_4h.variables["params"]["kernel"],
+				self.dense_4h_to_h.variables["params"]["kernel"],
+			)
+
 		return self.dense_4h_to_h(self.act(self.dense_h_to_4h(x)))
 
 
@@ -252,7 +275,7 @@ class FlaxGPTNeoXModule(nn.Module):
 
 	def __call__(
 		self,
-		input_ids: jnp.int32 = None,
+		input_ids: jnp.dtype = None,
 		attention_mask: Optional[chex.Array] = None,
 		return_dict: Optional[bool] = None,
 	):

@@ -158,7 +158,7 @@ class MptConfig(EDPretrainedConfig):
 		layer_norm_epsilon: float = 1e-5,
 		emb_prob_drop: float = 0.0,
 		learned_pos_emb: bool = True,
-		attn_config: MptAttentionConfig = None,
+		attn_config: Optional[MptAttentionConfig] = None,
 		init_device: str = "cpu",
 		logit_scale: Optional[Union[float, str]] = None,
 		no_bias: bool = True,
@@ -178,9 +178,9 @@ class MptConfig(EDPretrainedConfig):
 		**kwargs,
 	):
 		if attn_config is None:
-			self.attn_config = MptAttentionConfig()
+			self.attn_config = MptAttentionConfig(**kwargs)
 		elif isinstance(attn_config, dict):
-			self.attn_config = MptAttentionConfig(**attn_config)
+			self.attn_config = MptAttentionConfig(**attn_config | kwargs)
 		else:
 			self.attn_config = attn_config
 		self.d_model = d_model
@@ -210,6 +210,7 @@ class MptConfig(EDPretrainedConfig):
 		self.bits = bits
 		self.layer_norm_epsilon = layer_norm_epsilon
 		self.from_pt = False
+
 		super().__init__(bits=bits, **kwargs)
 
 	@staticmethod
@@ -266,7 +267,8 @@ class MptConfig(EDPretrainedConfig):
 	):
 		if hasattr(self, "attn_config"):
 			for k, v in self.attn_config.__dict__.items():
-				setattr(self, k, v)
+				if not hasattr(self, k):
+					setattr(self, k, v)
 		basics = dict(bits=bits, gradient_checkpointing=gradient_checkpointing, **kwargs)
 		for k, v in basics.items():
 			if not hasattr(self, k):

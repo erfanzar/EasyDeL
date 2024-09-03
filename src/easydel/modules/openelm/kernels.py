@@ -4,13 +4,13 @@ from jax import numpy as jnp
 from easydel.kernels.matmul import matmul_kernel
 
 
-def arctic_mlp_pallas(
+def openelm_mlp_pallas(
 	x,
-	w1,
-	w2,
-	w3,
+	proj_1,
+	proj_2,
 	*,
 	act_fn,
+	ffn_with_glu,
 	blocksize_m: int = 16,
 	blocksize_k: int = 64,
 	blocksize_n: int = 16,
@@ -24,6 +24,8 @@ def arctic_mlp_pallas(
 		po_dtype=po_dtype,
 		precision=precision,
 	)
-	return matmul_kernel(
-		(act_fn(matmul_kernel(x, w1, **args)) * matmul_kernel(x, w3, **args)), w2, **args
-	)
+	if ffn_with_glu:
+		y_12 = matmul_kernel(x, proj_1, **args)
+		y_1, y_2 = jnp.split(y_12, 2, axis=-1)
+		return matmul_kernel(act_fn(y_1) * y_2, proj_2, **args)
+	return matmul_kernel(act_fn(matmul_kernel(x, proj_1, **args)), proj_2, **args)

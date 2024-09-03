@@ -1,16 +1,16 @@
 from jax import lax
 from jax import numpy as jnp
+import jax
 
 from easydel.kernels.matmul import matmul_kernel
 
 
-def arctic_mlp_pallas(
+def grok1_mlp_pallas(
 	x,
-	w1,
-	w2,
-	w3,
+	linear,
+	linear_1,
+	linear_v,
 	*,
-	act_fn,
 	blocksize_m: int = 16,
 	blocksize_k: int = 64,
 	blocksize_n: int = 16,
@@ -24,6 +24,12 @@ def arctic_mlp_pallas(
 		po_dtype=po_dtype,
 		precision=precision,
 	)
+	
+
 	return matmul_kernel(
-		(act_fn(matmul_kernel(x, w1, **args)) * matmul_kernel(x, w3, **args)), w2, **args
+		(
+			jax.nn.gelu(matmul_kernel(x, linear, **args)) * matmul_kernel(x, linear_v, **args)
+		),
+		linear_1,
+		**args,
 	)
