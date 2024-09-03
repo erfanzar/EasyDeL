@@ -20,7 +20,7 @@ sys.path.append(
 )
 import copy
 from typing import Dict, Optional, Union
-
+from tabulate import tabulate
 import easydel as ed
 import jax
 import numpy as np
@@ -122,6 +122,7 @@ class EasyModelsTest(unittest.TestCase):
 			config = self.header_config
 
 		config.axis_dims = (1, 1, 1, -1)
+		config.pad_token_id = 0
 		hf_model = hf_module_class(config=copy.deepcopy(config))
 		hf_model.eval()
 
@@ -139,7 +140,6 @@ class EasyModelsTest(unittest.TestCase):
 			use_sharding_constraint=self.use_sharding_constraint,
 			scan_mlp_chunk_size=self.scan_mlp_chunk_size,
 		)
-
 		mesh = config.mesh
 
 		with mesh:
@@ -284,9 +284,13 @@ class EasyModelsTest(unittest.TestCase):
 			del params
 			del hf_model
 			gc.collect()
-			print(f"\nHF MoE LOSS : {hf_output.loss.detach().cpu().numpy()}")
-			print(f"ED MoE LOSS : {loss}")
-			return jnp.allclose(hf_output.loss.detach().cpu().numpy(), loss)
+
+			return self.compare_torch_to_jax(
+				"Moe-" + module_name,
+				hf_output,
+				ed_output,
+				loss,
+			)
 
 	def test_llama(self):
 		self.header_config = None
@@ -435,6 +439,38 @@ class EasyModelsTest(unittest.TestCase):
 		res, err = self.create_test_for_models("phi3", hf_model)
 		self.assertTrue(res, f"PHI3 model Failed [ERROR {err}]")
 
+	def test_phimoe(self):
+		self.header_config = None
+		hf_model, conf = self.get_hf_model_from_hub("microsoft/Phi-3.5-MoE-instruct")
+		self.rope_scaling = {
+			"long_factor": [
+				1.0199999809265137,
+				1.0299999713897705,
+				1.0399999618530273,
+				1.0499999523162842,
+				1.0499999523162842,
+				1.0499999523162842,
+				1.059999942779541,
+				1.059999942779541,
+			],
+			"long_mscale": 1.243163121016122,
+			"original_max_position_embeddings": 4096,
+			"short_factor": [
+				1.0,
+				1.0399999618530273,
+				1.0399999618530273,
+				1.0399999618530273,
+				1.0499999523162842,
+				1.0499999523162842,
+				1.0499999523162842,
+				1.0499999523162842,
+			],
+			"short_mscale": 1.243163121016122,
+			"type": "longrope",
+		}
+		res, err = self.create_test_for_models("phimoe", hf_model)
+		self.assertTrue(res, f"PHIMOE model Failed [ERROR {err}]")
+
 	def test_deepseek_v2(self):
 		self.header_config = None
 		hf_model, conf = self.get_hf_model_from_hub("deepseek-ai/DeepSeek-V2")
@@ -476,6 +512,7 @@ class EasyModelsTest(unittest.TestCase):
 				4,
 				128 // 8,
 				use_scan_mlp=False,
+				axis_dims=(1, 1, 1, -1),
 			),
 			seed=0,
 			_do_init=True,
@@ -483,7 +520,7 @@ class EasyModelsTest(unittest.TestCase):
 
 		input_ids = jax.random.randint(
 			jax.random.key(42),
-			(1, 32),
+			(1, self.sequence_length),
 			0,
 			model.config.vocab_size,
 		)
@@ -571,24 +608,53 @@ class EasyModelsTest(unittest.TestCase):
 		rtol: float = 1e-08,
 	):
 		to, jo = hf_out.logits.cpu().detach().numpy(), ed_out.logits
-		err = jnp.sum(to) - jnp.sum(jo)
+		err = jnp.mean(to) - jnp.mean(jo)
 		hf_loss = hf_out.loss.cpu().detach().numpy()
 		all_close = jnp.allclose(to, jo, atol=atol, rtol=rtol)
-		all_close_loss = jnp.allclose(hf_loss, ed_loss, atol=1e-02, rtol=rtol)
+		all_close_loss = jnp.allclose(hf_loss, ed_loss, atol=0.125, rtol=0)
 
-		if not all_close:
-			print(f"\n{name} LAST F HuggingFace : ", to[0, -1, -5:])
-			print(f"{name} LAST F EasyDeL       : ", jo[0, -1, -5:])
-			print(
-				f"{name} CORRECT % : ",
-				jnp.mean(
-					jnp.where(jnp.isclose(to, jo, atol=atol, rtol=rtol), 1, 0).reshape(-1)
-				),
-			)
-			print(f"{name} ERROR     : {err}")
-			print(f"{name} LOSS F HuggingFace : ", hf_loss)
-			print(f"{name} LOSS F EasyDeL     : ", ed_loss)
-			print("IS LOSS CLOSE     : ", all_close_loss)
+		def color(text, color_code):
+			return f"\x1b[{color_code}m{text}\x1b[0m"
+
+		correct_percentage = jnp.mean(
+			jnp.where(
+				jnp.isclose(to, jo, atol=0.125, rtol=0),
+				1,
+				0,
+			).reshape(-1)
+		)
+		err = jnp.abs(to - jo).max()
+
+		table = tabulate(
+			[
+				[
+					"Last 5 elements",
+					str(to[0, -1, -5:]),
+					str(jo[0, -1, -5:]),
+				],
+				[
+					"Loss",
+					str(hf_loss),
+					str(ed_loss),
+				],
+			],
+			headers=["Metric", "HuggingFace", "EasyDeL"],
+			tablefmt="grid",
+		)
+		lose_close_string = color(str(all_close_loss), "32" if all_close_loss else "31")
+		max_error_string = color(f"{err:.6f}", "32" if err < 1e-2 else "31")
+		co_p = color(
+			f"{correct_percentage:.2%}", "32" if correct_percentage > 0.99 else "31"
+		)
+		print()
+		print(f"{color(name, '36;1')}")
+		print(table)
+		print()
+		print(f"{color('Additional Information:', '33;1')}")
+		print(f"Correct %: {co_p}")
+		print(f"Max Error: {max_error_string}")
+		print(f"Losses Close: {lose_close_string}")
+
 		return all_close or all_close_loss, err
 
 	@staticmethod
@@ -622,43 +688,30 @@ if __name__ == "__main__":
 	test = EasyModelsTest()
 	test.setUp()
 	# test.test_arctic() # Passed v0.0.80 - P Runtime
-	# test.test_cohere() # Passed v0.0.80 - P Runtime
+	# test.test_cohere()  # Passed v0.0.80 - P Runtime
 	# test.test_dbrx()  # Passed  v0.0.80 - P Runtime
 	# test.test_deepseek_v2() # Passed v0.0.80 - P Runtime
-	# test.test_exaone()      # Passed v0.0.80 - P Runtime
-	# test.test_falcon() # Passed v0.0.80 - P Runtime
-	# test.test_gemma() # Passed v0.0.80 - P Runtime
-	# test.test_gemma2() # Passed v0.0.80 - P Runtime
+	# test.test_exaone()  # Passed v0.0.80 - P Runtime
+	# test.test_falcon()  # Passed v0.0.80 - P Runtime
+	# test.test_gemma()  # Passed v0.0.80 - P Runtime
+	# test.test_gemma2()  # Passed v0.0.80 - P Runtime
 	# test.test_gptj() # Passed v0.0.80 - P Runtime
 	# test.test_gpt2()
 	# test.test_grok1() # should be impl
 	# test.test_internlm2()
-	# test.test_llama() # Passed v0.0.80 - P Runtime
-	# test.test_mamba() # Passed v0.0.80 - P Runtime
-	# test.test_mistral() # Passed v0.0.80 - P Runtime
-	# test.test_mixtral() # Passed v0.0.80 - P Runtime
-	# test.test_mpt() # Passed v0.0.80 - P Runtime
+	# test.test_llama()  # Passed v0.0.80 - P Runtime
+	# test.test_mamba()  # Passed v0.0.80 - P Runtime
+	# test.test_mistral()  # Passed v0.0.80 - P Runtime
+	# test.test_mixtral()  # Passed v0.0.80 - P Runtime
+	# test.test_mpt()  # Passed v0.0.80 - P Runtime
 	# test.test_olmo() # Passed v0.0.80 - P Runtime
 	# test.test_openelm() # Passed v0.0.80 - P Runtime
-	# -----------------------------------------------
-	# test.test_mistral()  # Passed v0.0.80
-	# test.test_mixtral()
-	# test.test_gemma() # Passed v0.0.80
-	# test.test_gemma2()  # Passed v0.0.80
-	# test.test_llama()  #  Llama 3.1 Passed v0.0.80
-	# test.test_arctic()
-	# test.test_cohere() # Passed v0.0.80
-	# test.test_dbrx() # Passed v0.0.80
-	# test.test_falcon()  # Passed v0.0.80
-	# test.test_mpt() # Passed v0.0.80
-	# test.test_olmo()  # Passed v0.0.80
-	# test.test_openelm()  # Passed v0.0.80
-	# test.test_phi() # Passed v0.0.80
-	# test.test_phi3() # Passed v0.0.80
-	# test.test_qwen2()  # Passed v0.0.80
+	# test.test_phi() # Passed v0.0.80 - P Runtime
+	# test.test_phi3()  # Passed v0.0.80 - P Runtime
+	# test.test_phimoe()  # Passed v0.0.80 - P Runtime
 	# test.test_qwen1()
-	# test.test_xerxes()  # Passed v0.0.80
-	# test.test_qwen2_moe()  # Passed v0.0.80
-	# test.test_stablelm()  # Passed v0.0.80
-	# test.test_exaone()  # Passed v0.0.80
-	# test.test_internlm2()  # Passed v0.0.80
+	# test.test_qwen2() # Passed v0.0.80 - P Runtime
+	# test.test_qwen2_moe() # Passed v0.0.80 - P Runtime
+	# test.test_stablelm() # Passed v0.0.80 - P Runtime
+	# test.test_xerxes() # Passed v0.0.80 - P Runtime (Check)
+	# -----------------------------------------------

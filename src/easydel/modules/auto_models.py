@@ -226,6 +226,19 @@ CAUSAL_LANGUAGE_MODELS_CONFIG: Dict[str, Tuple[str, str, str, Dict[str, Any]]] =
 		"FlaxPhi3ForCausalLM",
 		{"embedding_layer_names": ["embed_tokens"]},
 	),
+	"phimoe": (
+		"easydel.modules.phimoe",
+		"PhiMoeConfig",
+		"FlaxPhiMoeForCausalLM",
+		{
+			"embedding_layer_names": ["embed_tokens"],
+			"layer_norm_names": [
+				"norm",
+				"input_layernorm",
+				"post_attention_layernorm",
+			],
+		},
+	),
 	"arctic": (
 		"easydel.modules.arctic",
 		"ArcticConfig",

@@ -30,6 +30,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.xerxes.kernels import xerxes_mlp_pallas
 from easydel.modules.xerxes.xerxes_configuration import XerxesConfig as XerxesConfig
 
 logger = get_logger(__name__)
@@ -327,6 +328,27 @@ class FlaxXerxesMLP(nn.Module):
 
 	def __call__(self, hidden_states, deterministic=False):
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
+		if (
+			self.config.pallas_runtime
+			and self.up_proj.variables.get("params", None) is not None
+		):
+			return jax.vmap(
+				functools.partial(
+					xerxes_mlp_pallas,
+					act_fn=self.act,
+					blocksize_k=self.config.pallas_k_block_size,
+					blocksize_m=self.config.pallas_m_block_size,
+					blocksize_n=self.config.pallas_n_block_size,
+					po_dtype=self.dtype,
+					precision=self.precision,
+				),
+				in_axes=(0, None, None, None),
+			)(
+				hidden_states,
+				self.gate_proj.variables["params"]["kernel"],
+				self.down_proj.variables["params"]["kernel"],
+				self.up_proj.variables["params"]["kernel"],
+			)
 		return self.down_proj(
 			self.act(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
 		)
