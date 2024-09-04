@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -48,7 +47,7 @@ from jax.sharding import Mesh, PartitionSpec
 from tqdm.auto import tqdm
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_flax_utils import FlaxPreTrainedModel
-
+from jax.lib import xla_bridge
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.etils import AVAILABLE_ATTENTION_MECHANISMS, get_logger
 from easydel.etils.partition_module import PartitionAxis
@@ -60,7 +59,7 @@ FLAX_WEIGHTS_NAME = "easydel-model.parameters"
 DEFAULT_PALLAS_M_BLOCK_SIZE = 64
 DEFAULT_PALLAS_K_BLOCK_SIZE = 128
 DEFAULT_PALLAS_N_BLOCK_SIZE = 64
-
+DEFAULT_PALLAS_RUNTIME = True if xla_bridge.get_backend().platform == "gpu" else False
 # if xla_bridge.get_backend().platform == "gpu":
 # 	DEFAULT_PALLAS_M_BLOCK_SIZE = 16
 # 	DEFAULT_PALLAS_K_BLOCK_SIZE = 16
@@ -149,7 +148,7 @@ class EDPretrainedConfig(PretrainedConfig):
 		attn_dtype: jnp.dtype = jnp.float32,
 		fcm_max_ratio: float = 0.0,
 		fcm_min_ratio: float = 0.0,
-		pallas_runtime: bool = True,
+		pallas_runtime: bool = DEFAULT_PALLAS_RUNTIME,
 		pallas_m_block_size: int = DEFAULT_PALLAS_M_BLOCK_SIZE,
 		pallas_k_block_size: int = DEFAULT_PALLAS_K_BLOCK_SIZE,
 		pallas_n_block_size: int = DEFAULT_PALLAS_N_BLOCK_SIZE,
@@ -737,7 +736,7 @@ class EDPretrainedConfig(PretrainedConfig):
 		set_attrs_smartly(
 			self,
 			"pallas_runtime",
-			True,
+			DEFAULT_PALLAS_RUNTIME,
 			pallas_runtime,
 		)
 
