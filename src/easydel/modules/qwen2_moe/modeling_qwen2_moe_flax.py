@@ -1319,7 +1319,7 @@ class FlaxQwen2MoeForCausalLMModule(nn.Module):
 		else:
 			logits = self.lm_head(hidden_states)
 
-		logits = logits.astype(jnp.float32)
+		
 		batch_size, seq_length, hd = logits.shape
 		aux_loss = None
 		if output_router_logits and outputs.router_logits is not None:

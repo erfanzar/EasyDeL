@@ -1076,7 +1076,7 @@ class FlaxGemma2ForCausalLMModule(nn.Module):
 			lm_logits = lm_logits / self.config.final_logit_softcapping
 			lm_logits = jax.nn.tanh(lm_logits)
 			lm_logits = lm_logits * self.config.final_logit_softcapping
-		lm_logits = lm_logits.astype(jnp.float32)
+		
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
 

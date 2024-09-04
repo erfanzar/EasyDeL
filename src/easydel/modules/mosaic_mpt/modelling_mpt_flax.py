@@ -1,5 +1,5 @@
-from functools import partial
 import math
+from functools import partial
 from typing import Optional, Tuple, Union
 
 import chex
@@ -824,7 +824,7 @@ class FlaxMptForCausalLMModule(nn.Module):
 			)
 		else:
 			logits = self.lm_head(last_hidden_state)
-		logits = logits.astype(jnp.float32)
+		
 		if return_dict:
 			return FlaxCausalLMOutput(logits=logits, hidden_states=predict.hidden_states)
 		return logits, predict.hidden_states if output_hidden_states else (logits,)

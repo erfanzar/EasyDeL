@@ -16,6 +16,7 @@ from jax import numpy as jnp
 from jax.experimental.serialize_executable import deserialize_and_load, serialize
 from jax.sharding import NamedSharding, PartitionSpec
 
+
 from easydel.etils.etils import AVAILABLE_SPARSE_MODULE_TYPES, get_logger
 from easydel.inference.generation_pipeline import utils as inference_utils
 from easydel.modules.flax_modeling_utils import apply_sparsity_to_params
@@ -70,7 +71,18 @@ class GenerationPipeline:
 				stacklevel=1,
 			)
 		if generation_config is None:
-			generation_config = GenerationPipelineConfig()
+			if model.generation_config is not None:
+				generation_config = GenerationPipelineConfig(
+					bos_token_id=model.generation_config.bos_token_id,
+					eos_token_id=model.generation_config.eos_token_id,
+					pad_token_id=model.generation_config.pad_token_id,
+					top_k=model.generation_config.top_k,
+					top_p=model.generation_config.top_p,
+					temperature=model.generation_config.temperature,
+					max_new_tokens=model.generation_config.max_new_tokens or 512,
+				)
+			else:
+				generation_config = GenerationPipelineConfig()
 		params_get = params.get("params", None)
 		if params_get is not None:
 			warnings.warn(
@@ -154,7 +166,10 @@ class GenerationPipeline:
 		"""
 		partition_axes = self.model.config.partition_axis
 		mesh = self.mesh
-		eos_token_id = jnp.array(self.generation_config.eos_token_id, dtype=jnp.int32)
+		eos_token_id = jnp.array(
+			self.generation_config.eos_token_id,
+			dtype=jnp.int32 if self.generation_config.eos_token_id is not None else None,
+		)
 		pad_token_id = jnp.array(self.generation_config.pad_token_id, dtype=jnp.int32)
 		batch_size, current_length = input_ids.shape
 		max_length = current_length + self.generation_config.max_new_tokens
@@ -245,15 +260,21 @@ class GenerationPipeline:
 				+ pad_token_id * state.is_sequence_finished
 			)
 
-			next_sequence_finished = state.is_sequence_finished | next_token == eos_token_id
-
+			next_sequence_finished = state.is_sequence_finished | jnp.isin(
+				next_token,
+				eos_token_id,
+			)
 			next_token = next_token[:, None]
 			next_sequences = lax.dynamic_update_slice(
-				state.sequences, next_token, (0, state.current_length)
+				state.sequences,
+				next_token,
+				(0, state.current_length),
 			)
 			next_model_kwargs = self.model.update_inputs_for_generation(
-				model_outputs, state.model_kwargs
+				model_outputs,
+				state.model_kwargs,
 			)
+
 			return inference_utils.SampleState(
 				current_length=state.current_length + 1,
 				sequences=next_sequences,
@@ -652,6 +673,30 @@ class GenerationPipeline:
 		else:
 			logger.warn("Couldn't load `compiled_model_kwargs_sharding`")
 
+	def __repr__(self):
+		"""
+		Args:
+		    self: Refer to the instance of the class
+
+		Returns:
+		    A string representation of the object
+		"""
+		string = f"{self.__class__.__name__}(\n"
+		for k, v in self.__dict__.items():
+			if not k.startswith("_"):
+				try:
+					repr_src = f"  {k} : " + v.__str__().replace("\n", "\n  ") + "\n"
+					string += (
+						repr_src
+						if len(repr_src) < 500
+						else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
+					)
+				except TypeError:
+					pass
+		return string.strip() + "\n)"
+
+	__str__ = __repr__
+
 
 class ChatPipeline:
 	"""
@@ -726,3 +771,27 @@ class ChatPipeline:
 		for sequence in self.pipeline.generate(echo=True, **inputs):
 			decoded_sequence = self.pipeline.tokenizer.decode(sequence[0])
 		return decoded_sequence
+
+	def __repr__(self):
+		"""
+		Args:
+		    self: Refer to the instance of the class
+
+		Returns:
+		    A string representation of the object
+		"""
+		string = f"{self.__class__.__name__}(\n"
+		for k, v in self.__dict__.items():
+			if not k.startswith("_"):
+				try:
+					repr_src = f"  {k} : " + v.__str__().replace("\n", "\n  ") + "\n"
+					string += (
+						repr_src
+						if len(repr_src) < 500
+						else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
+					)
+				except TypeError:
+					pass
+		return string.strip() + "\n)"
+
+	__str__ = __repr__

@@ -42,9 +42,14 @@ from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN, EasyQuantizer
 logger = get_logger(__name__)
 
 FLAX_WEIGHTS_NAME = "easydel-model.parameters"
-DEFAULT_PALLAS_M_BLOCK_SIZE = 16
-DEFAULT_PALLAS_K_BLOCK_SIZE = 64
-DEFAULT_PALLAS_N_BLOCK_SIZE = 16
+DEFAULT_PALLAS_M_BLOCK_SIZE = 64
+DEFAULT_PALLAS_K_BLOCK_SIZE = 128
+DEFAULT_PALLAS_N_BLOCK_SIZE = 64
+
+# if xla_bridge.get_backend().platform == "gpu":
+# 	DEFAULT_PALLAS_M_BLOCK_SIZE = 16
+# 	DEFAULT_PALLAS_K_BLOCK_SIZE = 16
+# 	DEFAULT_PALLAS_N_BLOCK_SIZE = 16
 
 
 def set_attrs_smartly(self, attr_name: str, default: Any, new_attr: Any):
@@ -762,11 +767,11 @@ class EDPretrainedConfig(PretrainedConfig):
 				continue
 			if not k.startswith("_"):
 				try:
-					repr_src = f"\t{k} : " + v.__str__().replace("\n", "\n\t") + "\n"
+					repr_src = f"  {k} : " + v.__str__().replace("\n", "\n  ") + "\n"
 					string += (
 						repr_src
 						if len(repr_src) < 500
-						else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+						else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
 					)
 				except TypeError:
 					pass
@@ -978,11 +983,11 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 		for k, v in self.__dict__.items():
 			if not k.startswith("_"):
 				try:
-					repr_src = f"\t{k} : " + v.__str__().replace("\n", "\n\t") + "\n"
+					repr_src = f"  {k} : " + v.__str__().replace("\n", "\n  ") + "\n"
 					string += (
 						repr_src
 						if len(repr_src) < 500
-						else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+						else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
 					)
 				except TypeError:
 					pass

@@ -527,8 +527,10 @@ class AutoEasyDeLModelForCausalLM:
 
 		logger.debug(f"Downloading model weights from {pretrained_model_name_or_path}")
 		model = AutoModelForCausalLM.from_pretrained(
-			pretrained_model_name_or_path, **kwargs
+			pretrained_model_name_or_path,
+			**kwargs,
 		)
+		generation_config = getattr(model, "generation_config", None)
 		if verbose_params:
 			print(
 				f"PyTorch - HF Model contains {sum(p.numel() for p in model.parameters()) / 1e9} Billion Parameters"
@@ -562,7 +564,7 @@ class AutoEasyDeLModelForCausalLM:
 			precision=precision,
 			input_shape=input_shape,
 		)
-
+		ed_model.generation_config = generation_config
 		needs = [
 			s.replace(".kernel", ".weight")
 			.replace(".scale", ".weight")

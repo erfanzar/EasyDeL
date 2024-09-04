@@ -1419,7 +1419,7 @@ class FlaxDeepseekV2ForCausalLMModule(nn.Module):
 		else:
 			lm_logits = self.lm_head(hidden_states)
 
-		lm_logits = lm_logits.astype(jnp.float32)
+		
 
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]

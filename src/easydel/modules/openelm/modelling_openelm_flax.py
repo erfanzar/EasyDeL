@@ -1144,7 +1144,7 @@ class FlaxOpenELMForCausalLMModule(nn.Module):
 			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
-		lm_logits = lm_logits.astype(jnp.float32)
+		
 		lm_logits = lm_logits[:, : self.config.vocab_size]
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]

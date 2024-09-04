@@ -844,7 +844,7 @@ class FlaxPhi3ForCausalLMModule(nn.Module):
 		else:
 			lm_logits = self.lm_head(outputs.last_hidden_state)
 
-		lm_logits = lm_logits.astype(jnp.float32)
+		
 
 		if not return_dict:
 			return (lm_logits,) + outputs[0:]

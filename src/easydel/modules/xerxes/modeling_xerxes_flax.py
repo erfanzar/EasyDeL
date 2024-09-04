@@ -1000,7 +1000,7 @@ class FlaxXerxesForCausalLMModule(nn.Module):
 			lm_logits = self.lm_head(hidden_states)
 
 		lm_logits = jax.nn.tanh(lm_logits / 30.0) * 30.0
-		lm_logits = lm_logits.astype(jnp.float32)
+		
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
 
