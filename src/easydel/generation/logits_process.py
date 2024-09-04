@@ -5,7 +5,6 @@ import jax.lax as lax
 import jax.numpy as jnp
 from jax.experimental import sparse
 
-
 from easydel.etils.etils import get_logger
 
 

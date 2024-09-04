@@ -1,44 +1,39 @@
+
+# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import functools
 import math
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import chex
 import jax
-import transformers
 from flax import linen as nn
-from flax.core import FrozenDict, freeze, unfreeze
 from flax.linen import Dense, combine_masks
 from flax.linen import partitioning as nn_partitioning
-from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import get_logger
-from easydel.generation.flax_utils import (
-	FlaxLogitsProcessorList,
-	FlaxSampleOutput,
-	SampleState,
-)
 from easydel.modules.attention_module import FlexibleAttentionModule
-from easydel.modules.common import RMSNorm
 from easydel.modules.flax_modeling_utils import (
-	ACT2FN,
 	FlaxAttentionModule,
 	apply_rotary_pos_emb,
-	block_wise_ffn,
-	control_mlp_sharding,
 	get_dot_general_by_bits,
-	get_gradient_checkpoint_policy,
-	precompute_frequencies,
 	with_sharding_constraint,
 )
-
-from easydel.modules.modeling_flax_outputs import (
-	FlaxBaseModelOutput,
-	FlaxCausalLMOutput,
-)
-from easydel.modules.modeling_utils import EDPretrainedModel
 from src.easydel.modules.zamba2.zamba2_configuration import Zamba2Config
 
 re_mat = nn_partitioning.remat
