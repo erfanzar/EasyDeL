@@ -410,12 +410,13 @@ def matmul_benchmark():
 							f"Skipping configuration due to OOM : block_m={block_m},"
 							f" block_n={block_n}, block_k={block_k}"
 						)
+						print(e)
 						pass
 
 		return best_config, best_time
 
 	# Example usage
-	m, n, k = 6144, 4096, 4096 * 4
+	m, n, k = 1, 4096, 4096 * 4
 	best_config, best_time = autotune_block_sizes(m, n, k, jnp.float16)
 	print(f"Best configuration for {m}x{n}x{k} matmul: {best_config}")
 	print(f"Best time: {best_time:.6f} seconds")
