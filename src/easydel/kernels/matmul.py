@@ -27,6 +27,9 @@ from jax import numpy as jnp
 from jax.experimental import pallas as pl
 from jax.lib import xla_bridge
 
+
+PLATFORM = xla_bridge.get_backend().platform
+INTERPRET = PLATFORM == "cpu"
 rng = GenerateRNG()
 
 
@@ -153,8 +156,7 @@ def _call_matmul_kernel_fwd(
 		pl.BlockSpec(lambda *_: (0,) * A.ndim, A.shape),
 		pl.BlockSpec(lambda *_: (0,) * B.ndim, B.shape),
 	]
-	platform = xla_bridge.get_backend().platform
-	interpret = platform == "cpu"
+	
 	out_specs = pl.BlockSpec(lambda *_: (0,) * A.ndim, (m, n))
 	return pl.pallas_call(
 		f=partial(
@@ -167,7 +169,7 @@ def _call_matmul_kernel_fwd(
 		),
 		out_shape=jax.ShapeDtypeStruct(shape=(m, n), dtype=A.dtype),
 		debug=False,
-		interpret=interpret,
+		interpret=INTERPRET,
 		grid=grid,
 		in_specs=in_specs,
 		out_specs=out_specs,
