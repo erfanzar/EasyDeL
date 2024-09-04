@@ -256,13 +256,14 @@ def _fwd_flash_attn(
 			return (
 				i,
 				j + 1,
-				o_i,
-				q_i,
+				o_i.astype(dtype),
+				q_i.astype(dtype),
 				jnp.log(jnp.exp(lse_i - m_ij) + l_ij) + m_ij,
-				m_ij,
+				m_ij.astype(dtype),
 			)
 
 		j_end = jnp.minimum(i + 1, Tc) if mask is not None else Tc
+
 		_, _, o_i, _, lse_i, m_i = jax.lax.while_loop(
 			lambda state: state[1] < j_end,
 			call_qk,
@@ -271,7 +272,7 @@ def _fwd_flash_attn(
 		o_scale = jnp.exp(m_i - lse_i)
 		o_i = o_i * jnp.expand_dims(o_scale, -1)
 
-		o = jax.lax.dynamic_update_slice_in_dim(o, o_i, i * q_block, 2)
+		o = jax.lax.dynamic_update_slice_in_dim(o, o_i.astype(o.dtype), i * q_block, 2)
 		lse = jax.lax.dynamic_update_slice_in_dim(
 			lse,
 			lse_i.astype(lse.dtype),

@@ -1244,18 +1244,18 @@ class ORPOTrainer(BaseTrainer, ABC):
 		for k, v in self.__dict__.items():
 			if not k.startswith("_"):
 				try:
-					repr_src = f"\t{k} : " + v.__str__().replace("\n", "\n\t") + "\n"
+					repr_src = f"  {k} : " + v.__str__().replace("\n", "\n  ") + "\n"
 					string += (
 						repr_src
 						if len(repr_src) < 350
-						else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+						else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
 					)
 				except TypeError:
 					repr_src = f"\t{k} : " + "EasyDeLReadingError" + "\n"
 					string += (
 						repr_src
 						if len(repr_src) < 350
-						else f"\t{k} : " + f"{v.__class__.__name__}(...)" + "\n"
+						else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
 					)
 
 		return string + ")"

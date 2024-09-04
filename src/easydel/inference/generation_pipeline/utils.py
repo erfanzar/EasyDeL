@@ -66,6 +66,30 @@ class GenerationPipelineConfig:
 
 		return int_hash
 
+	def __repr__(self):
+		"""
+		Args:
+		    self: Refer to the instance of the class
+
+		Returns:
+		    A string representation of the object
+		"""
+		string = f"{self.__class__.__name__}(\n"
+		for k, v in self.__dict__.items():
+			if not k.startswith("_"):
+				try:
+					repr_src = f"  {k} : " + v.__str__().replace("\n", "\n  ") + "\n"
+					string += (
+						repr_src
+						if len(repr_src) < 500
+						else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
+					)
+				except TypeError:
+					pass
+		return string.strip() + "\n)"
+
+	__str__ = __repr__
+
 
 class _DynamicGenerationConfig:
 	"""
@@ -88,6 +112,30 @@ class _DynamicGenerationConfig:
 		self.top_p = config.top_p
 		self.repetition_penalty = config.repetition_penalty
 		self.length_penalty = config.length_penalty
+
+	def __repr__(self):
+		"""
+		Args:
+		    self: Refer to the instance of the class
+
+		Returns:
+		    A string representation of the object
+		"""
+		string = f"{self.__class__.__name__}(\n"
+		for k, v in self.__dict__.items():
+			if not k.startswith("_"):
+				try:
+					repr_src = f"  {k} : " + v.__str__().replace("\n", "\n  ") + "\n"
+					string += (
+						repr_src
+						if len(repr_src) < 500
+						else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
+					)
+				except TypeError:
+					pass
+		return string.strip() + "\n)"
+
+	__str__ = __repr__
 
 
 def compile_function(
@@ -177,6 +225,30 @@ class SampleState:
 	@classmethod
 	def tree_unflatten(cls, aux, children):
 		return cls(*children)
+
+	def __repr__(self):
+		"""
+		Args:
+		    self: Refer to the instance of the class
+
+		Returns:
+		    A string representation of the object
+		"""
+		string = f"{self.__class__.__name__}(\n"
+		for k, v in self.__dict__.items():
+			if not k.startswith("_"):
+				try:
+					repr_src = f"  {k} : " + v.__str__().replace("\n", "\n  ") + "\n"
+					string += (
+						repr_src
+						if len(repr_src) < 500
+						else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
+					)
+				except TypeError:
+					pass
+		return string.strip() + "\n)"
+
+	__str__ = __repr__
 
 
 def apply_repetition_penalty(logits, tokens, penalty):

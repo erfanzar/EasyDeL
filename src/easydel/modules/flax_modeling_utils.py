@@ -26,7 +26,6 @@ from jax.experimental.mesh_utils import create_device_mesh
 from jax.experimental.shard_map import shard_map
 from jax.interpreters import pxla
 from jax.sharding import PartitionSpec
-from numpy import dtype
 from tqdm.auto import tqdm
 
 from easydel.etils.errors import EasyDeLBlockWiseFFNError
