@@ -406,13 +406,15 @@ def matmul_benchmark():
 								f"block_n={block_n}, block_k={block_k} with Time: {best_time:.4f} seconds"
 							)
 					except Exception as e:  # noqa
-						print(
-							f"Skipping configuration due to OOM : block_m={block_m},"
-							f" block_n={block_n}, block_k={block_k}"
-						)
-						print(e)
-						pass
-
+						if "RESOURCE_EXHAUSTED" in e.__str__():
+							print(
+								f"Skipping configuration due to OOM : block_m={block_m},"
+								f" block_n={block_n}, block_k={block_k}"
+							)
+							print(e)
+							pass
+						else:
+							raise e
 		return best_config, best_time
 
 	# Example usage
