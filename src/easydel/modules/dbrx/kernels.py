@@ -29,14 +29,14 @@ def dbrx_mlp_pallas(
 	blocksize_m: int = 16,
 	blocksize_k: int = 64,
 	blocksize_n: int = 16,
-	po_dtype: jnp.dtype = jnp.float32,
+	prod_dtype: jnp.dtype = jnp.float32,
 	precision: lax.PrecisionLike = None,
 ):
 	args = dict(
 		blocksize_k=blocksize_k,
 		blocksize_m=blocksize_m,
 		blocksize_n=blocksize_n,
-		po_dtype=po_dtype,
+		prod_dtype=prod_dtype,
 		precision=precision,
 	)
 	x1 = matmul_kernel(x, expert_w1.T, **args)

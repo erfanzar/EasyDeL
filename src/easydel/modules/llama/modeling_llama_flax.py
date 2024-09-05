@@ -412,7 +412,7 @@ class FlaxLlamaMLP(nn.Module):
 					blocksize_k=self.config.pallas_k_block_size,
 					blocksize_m=self.config.pallas_m_block_size,
 					blocksize_n=self.config.pallas_n_block_size,
-					po_dtype=self.dtype,
+					prod_dtype=self.dtype,
 					precision=self.precision,
 				),
 				in_axes=(0, None, None, None),

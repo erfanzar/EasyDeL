@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,16 +19,19 @@ import os as _os
 if bool(
 	_os.environ.get("EASYDEL_AUTO", "true")
 ):  # Taking care of some optional GPU FLAGs
+	_os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 	_os.environ["XLA_FLAGS"] = (
 		_os.environ.get("XLA_FLAGS", "") + " "
-		"--xla_gpu_enable_triton_softmax_fusion=true \ "
+		# "--xla_gpu_enable_triton_softmax_fusion=true \ "
 		"--xla_gpu_triton_gemm_any=True \ "
 		"--xla_gpu_enable_async_collectives=true \ "
 		"--xla_gpu_enable_latency_hiding_scheduler=true \ "
 		"--xla_gpu_enable_highest_priority_async_stream=true \ "
+		"--xla_gpu_disable_async_collectives=allreduce,allgather,reducescatter,collectivebroadcast,alltoall,collectivepermute \ "
+		"--xla_gpu_enable_command_buffer= \ "
 	)
 	_os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-	_os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.99"
+	_os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "1.0"
 	_os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 

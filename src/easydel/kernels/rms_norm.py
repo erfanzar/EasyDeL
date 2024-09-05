@@ -39,17 +39,16 @@ def _get_compiler_params():
 	return None
 
 
-def _pl_fwd_rms_kernel(x_ref, w_ref, o_ref, *, blocksize_x, eps, po_dtype):
+def _pl_fwd_rms_kernel(x_ref, w_ref, o_ref, *, blocksize_x, eps, prod_dtype):
 	pid = pl.program_id(0)
 	xslice = (pl.dslice(pid * blocksize_x, blocksize_x), pl.dslice(None))
 	xi = (pid * blocksize_x + jnp.arange(blocksize_x) < x_ref.shape[0])[:, None]
 	xj = (jnp.arange(x_ref.shape[1]) < x_ref.shape[1])[None, :]
 	xmask = xi & xj
-	x = pl.load(x_ref, xslice, mask=xmask).astype(po_dtype)
+	x = pl.load(x_ref, xslice, mask=xmask).astype(prod_dtype)
 	scale = 1 / jnp.sqrt(jnp.mean(jnp.square(x), keepdims=True, axis=-1) + eps).astype(
 		jnp.float32
 	)
-
 	_normed = scale.astype(x) * x
 	w = pl.load(w_ref, pl.dslice(0, x_ref.shape[1]))
 	o = _normed.astype(o_ref.dtype) * w
@@ -98,7 +97,7 @@ def _pl_bwd_rms_kernel(
 	pl.store(dX_ref, dX_slice, val=grad_x.astype(dX_ref), mask=dX_mask)
 
 
-def _call_fwd_rms_kernel(x, w, blocksize_x, eps, po_dtype):
+def _call_fwd_rms_kernel(x, w, blocksize_x, eps, prod_dtype):
 	assert x.ndim == 2 and w.ndim == 1
 	in_specs = [
 		pl.BlockSpec(x.shape, lambda *p: (0, 0)),
@@ -112,7 +111,7 @@ def _call_fwd_rms_kernel(x, w, blocksize_x, eps, po_dtype):
 			_pl_fwd_rms_kernel,
 			blocksize_x=blocksize_x,
 			eps=eps,
-			po_dtype=po_dtype,
+			prod_dtype=prod_dtype,
 		),
 		in_specs=in_specs,
 		out_specs=out_specs,
@@ -126,18 +125,18 @@ def _call_fwd_rms_kernel(x, w, blocksize_x, eps, po_dtype):
 	return out
 
 
-def _call_fwd_rms_kernel_with_residual(x, w, blocksize_x, eps, po_dtype):
+def _call_fwd_rms_kernel_with_residual(x, w, blocksize_x, eps, prod_dtype):
 	o = _call_fwd_rms_kernel(
 		x=x,
 		w=w,
 		blocksize_x=blocksize_x,
 		eps=eps,
-		po_dtype=po_dtype,
+		prod_dtype=prod_dtype,
 	)
 	return o, (x, w, blocksize_x, eps)
 
 
-def _call_bwd_rms_kernel(po_dtype, res, gO):
+def _call_bwd_rms_kernel(prod_dtype, res, gO):
 	(
 		x,
 		w,
@@ -158,7 +157,7 @@ def _call_bwd_rms_kernel(po_dtype, res, gO):
 			blocksize_x=blocksize_x,
 			eps=eps,
 			n_cols=N,
-			dtype=po_dtype,
+			dtype=prod_dtype,
 		),
 		in_specs=in_specs,
 		out_specs=out_specs,
@@ -172,13 +171,13 @@ def _call_bwd_rms_kernel(po_dtype, res, gO):
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(4,))
-def _rms_call(x, w, blocksize_x, eps, po_dtype):
+def _rms_call(x, w, blocksize_x, eps, prod_dtype):
 	return _call_fwd_rms_kernel(
 		x=x,
 		w=w,
 		blocksize_x=blocksize_x,
 		eps=eps,
-		po_dtype=po_dtype,
+		prod_dtype=prod_dtype,
 	)
 
 
@@ -190,9 +189,9 @@ def rms_norm(
 	w: jax.Array,
 	blocksize_x: int = 8,
 	eps: float = 1e-5,
-	po_dtype: jnp.dtype = jnp.float32,
+	prod_dtype: jnp.dtype = jnp.float32,
 ):
-	return _rms_call(x, w, blocksize_x, eps, po_dtype)
+	return _rms_call(x, w, blocksize_x, eps, prod_dtype)
 
 
 def test_fwd_call():
@@ -209,7 +208,7 @@ def test_fwd_call():
 		w,
 		blocksize_x=64,
 		eps=eps,
-		po_dtype=jnp.float32,
+		prod_dtype=jnp.float32,
 	)
 	print("is Prediciton Ok?      = ", jnp.allclose(y_, y, atol=0.125, rtol=0))
 	print("Orginal Prediciton     = ", y[0, :4])
