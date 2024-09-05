@@ -438,7 +438,7 @@ def _call_tpu_matmul_kernel_bwd(
 	return gA, gB
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(2, 3, 4, 5, 6))
+@partial(jax.custom_vjp, nondiff_argnums=(2, 3, 4, 5))
 def _tpu_matmul(
 	A: jax.Array,
 	B: jax.Array,
