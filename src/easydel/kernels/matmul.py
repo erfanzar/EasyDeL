@@ -15,23 +15,11 @@
 # Implementation by @erfanzar,
 # with a few bug fixes and adjustments.
 
-import os as _os
+import logging
+from dataclasses import dataclass
 from functools import partial
+from typing import Optional, Tuple
 
-if bool(
-	_os.environ.get("EASYDEL_AUTO", "true")
-):  # Taking care of some optional GPU FLAGs
-	_os.environ["XLA_FLAGS"] = (
-		_os.environ.get("XLA_FLAGS", "") + " "
-		"--xla_gpu_enable_triton_softmax_fusion=true \ "
-		"--xla_gpu_triton_gemm_any=True \ "
-		"--xla_gpu_enable_async_collectives=true \ "
-		"--xla_gpu_enable_latency_hiding_scheduler=true \ "
-		"--xla_gpu_enable_highest_priority_async_stream=true \ "
-	)
-	_os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-	_os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.99"
-	_os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 import jax
 import jax.interpreters
 import jax.interpreters.pxla
@@ -39,14 +27,20 @@ import jax.random
 from fjformer import GenerateRNG
 from jax import numpy as jnp
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+from jax.lax import PrecisionLike
+
+# from jax.experimental.pallas import gpu as pltr
 from jax.lib import xla_bridge
 
 PLATFORM = xla_bridge.get_backend().platform
 INTERPRET = PLATFORM == "cpu"
 rng = GenerateRNG()
 
+# GPU KERNEL
 
-def _matmul_kernel_fwd(
+
+def _gpu_matmul_kernel_fwd(
 	a_ref,
 	b_ref,
 	o_ref,
@@ -54,7 +48,7 @@ def _matmul_kernel_fwd(
 	blocksize_m,
 	blocksize_k,
 	blocksize_n,
-	po_dtype,
+	prod_dtype,
 	precision,
 ):
 	row_id, col_id = pl.program_id(0), pl.program_id(1)
@@ -91,7 +85,7 @@ def _matmul_kernel_fwd(
 		0,
 		pl.cdiv(b_ref.shape[0], blocksize_k),
 		body,
-		jnp.zeros((blocksize_m, blocksize_n), dtype=po_dtype),
+		jnp.zeros((blocksize_m, blocksize_n), dtype=prod_dtype),
 	)
 	omi = (row_id * blocksize_m + jnp.arange(blocksize_m) < o_ref.shape[0])[:, None]
 	omj = (col_id * blocksize_n + jnp.arange(blocksize_n) < o_ref.shape[1])[None, :]
@@ -147,14 +141,54 @@ def _get_compiler_params(
 	return params
 
 
-def _call_matmul_kernel_fwd(
+def get_best_block_size(A, B):
+	# A is assumed to be of shape (m, k) and B is of shape (k, n)
+	m, k = A.shape[0], A.shape[1]
+	n = B.shape[1]
+
+	# Initialize block sizes
+	bm, bk, bn = 16, 16, 16
+
+	# Adjust block size for m
+	if m > 1000:
+		bm = 32
+	if m > 2000:
+		bm = 64
+	if m > 8000:
+		bm = 128
+
+	# Adjust block size for k
+	if k > 1000:
+		bk = 32
+	if k > 2000:
+		bk = 64
+	if k > 8000:
+		bk = 128
+
+	# Adjust block size for n
+	if n > 1000:
+		bn = 32  # bn maxes out at 32
+
+	return bm, bk, bn
+
+
+@partial(
+	jax.jit,
+	static_argnames=[
+		"blocksize_m",
+		"blocksize_k",
+		"blocksize_n",
+		"prod_dtype",
+		"precision",
+	],
+)
+def _call_gpu_matmul_kernel_fwd(
 	A: jax.Array,
 	B: jax.Array,
-	*,
-	blocksize_m: int = 32,
-	blocksize_k: int = 128,
-	blocksize_n: int = 32,
-	po_dtype: jnp.dtype = jnp.float32,
+	blocksize_m: Optional[int],
+	blocksize_k: Optional[int],
+	blocksize_n: Optional[int],
+	prod_dtype: jnp.dtype,
 	precision: jax.lax.PrecisionLike = None,
 ):
 	# A(mk)@B(kn)=C(mn)
@@ -163,21 +197,26 @@ def _call_matmul_kernel_fwd(
 		A.shape[1] == B.shape[0]
 	), f"matmul can't be operated with these shapes {A.shape=} {B.shape=} "
 	m, n = A.shape[0], B.shape[1]
-	grid = (pl.cdiv(m, blocksize_m), pl.cdiv(n, blocksize_n))
+	pbm, pbk, pbn = get_best_block_size(A, B)
 
+	blocksize_m = blocksize_m or pbm
+	blocksize_n = blocksize_n or pbn
+	blocksize_k = blocksize_k or pbk
+
+	grid = (pl.cdiv(m, blocksize_m), pl.cdiv(n, blocksize_n))
 	in_specs = [
-		pl.BlockSpec(lambda *_: (0,) * A.ndim, A.shape),
-		pl.BlockSpec(lambda *_: (0,) * B.ndim, B.shape),
+		pl.BlockSpec(A.shape, lambda *_: (0,) * A.ndim),
+		pl.BlockSpec(B.shape, lambda *_: (0,) * B.ndim),
 	]
 
-	out_specs = pl.BlockSpec(lambda *_: (0,) * A.ndim, (m, n))
+	out_specs = pl.BlockSpec((m, n), lambda *_: (0,) * A.ndim)
 	return pl.pallas_call(
 		f=partial(
-			_matmul_kernel_fwd,
+			_gpu_matmul_kernel_fwd,
 			blocksize_m=blocksize_m,
 			blocksize_n=blocksize_n,
 			blocksize_k=blocksize_k,
-			po_dtype=po_dtype,
+			prod_dtype=prod_dtype,
 			precision=precision,
 		),
 		out_shape=jax.ShapeDtypeStruct(shape=(m, n), dtype=A.dtype),
@@ -195,22 +234,22 @@ def _call_matmul_kernel_fwd(
 	)(A, B)
 
 
-def _call_matmul_kernel_fwd_g(
+def _call_gpu_matmul_kernel_fwd_residual(
 	A: jax.Array,
 	B: jax.Array,
-	blocksize_m: int = 32,
-	blocksize_k: int = 128,
-	blocksize_n: int = 32,
-	po_dtype: jnp.dtype = jnp.float32,
+	blocksize_m: Optional[int],
+	blocksize_k: Optional[int],
+	blocksize_n: Optional[int],
+	prod_dtype: jnp.dtype,
 	precision: jax.lax.PrecisionLike = None,
 ):
-	return _call_matmul_kernel_fwd(
+	return _call_gpu_matmul_kernel_fwd(
 		A=A,
 		B=B,
 		blocksize_m=blocksize_m,
 		blocksize_k=blocksize_k,
 		blocksize_n=blocksize_n,
-		po_dtype=po_dtype,
+		prod_dtype=prod_dtype,
 		precision=precision,
 	), (
 		A,
@@ -218,14 +257,14 @@ def _call_matmul_kernel_fwd_g(
 	)
 
 
-def _call_matmul_kernel_bwd(
+def _call_gpu_matmul_kernel_bwd(
 	blocksize_m,
 	blocksize_k,
 	blocksize_n,
-	po_dtype,
+	prod_dtype,
 	precision,
 	res,
-	gin,
+	gO,
 ):
 	# A(mk)@B(kn)=C(mn)
 
@@ -234,71 +273,229 @@ def _call_matmul_kernel_bwd(
 		B,
 	) = res
 
-	gA = _call_matmul_kernel_fwd(
-		A=gin,
+	gA = _call_gpu_matmul_kernel_fwd(
+		A=gO,
 		B=B.transpose(1, 0),
 		blocksize_m=blocksize_m,
 		blocksize_k=blocksize_k,
 		blocksize_n=blocksize_n,
-		po_dtype=po_dtype,
+		prod_dtype=prod_dtype,
 		precision=precision,
 	)
-	gB = _call_matmul_kernel_fwd(
+	gB = _call_gpu_matmul_kernel_fwd(
 		A=A.transpose(1, 0),
-		B=gin,
+		B=gO,
 		blocksize_m=blocksize_m,
 		blocksize_k=blocksize_k,
 		blocksize_n=blocksize_n,
-		po_dtype=po_dtype,
+		prod_dtype=prod_dtype,
 		precision=precision,
 	)
 	return gA, gB
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(2, 3, 4, 5, 6))
+def _gpu_matmul(
+	A: jax.Array,
+	B: jax.Array,
+	blocksize_m: Optional[int],
+	blocksize_k: Optional[int],
+	blocksize_n: Optional[int],
+	prod_dtype: jnp.dtype,
+	precision: jax.lax.PrecisionLike = None,
+):
+	return _call_gpu_matmul_kernel_fwd(
+		A=A,
+		B=B,
+		blocksize_m=blocksize_m,
+		blocksize_k=blocksize_k,
+		blocksize_n=blocksize_n,
+		prod_dtype=prod_dtype,
+		precision=precision,
+	)
+
+
+_gpu_matmul.defvjp(_call_gpu_matmul_kernel_fwd_residual, _call_gpu_matmul_kernel_bwd)
+
+# TPU KERNEL
+
+
+def _tpu_matmul_kernel_fwd(a_ref, b_ref, o_ref, ac_ref, *, precision, k_grid):
+	@pl.when(pl.program_id(2) == 0)
+	def _():
+		ac_ref[...] = jnp.zeros_like(ac_ref)
+
+	ac_ref[...] += jnp.dot(
+		a_ref[...].astype(jnp.float32),
+		b_ref[...].astype(jnp.float32),
+		preferred_element_type=jnp.float32,
+		precision=precision,
+	)
+
+	@pl.when(pl.program_id(2) == k_grid - 1)
+	def _():
+		o_ref[...] = ac_ref[...].astype(o_ref.dtype)
+
+
+@partial(
+	jax.jit,
+	static_argnames=[
+		"blocksize_m",
+		"blocksize_k",
+		"blocksize_n",
+		"precision",
+	],
+)
+def _call_tpu_matmul_kernel_fwd(
+	A: jax.Array,
+	B: jax.Array,
+	*,
+	blocksize_m: int,
+	blocksize_k: int,
+	blocksize_n: int,
+	precision: jax.lax.PrecisionLike = None,
+):
+	assert A.ndim == 2 and B.ndim == 2, f"got {A.shape=} and {B.shape=}"
+	assert (
+		A.shape[1] == B.shape[0]
+	), f"matmul can't be operated with these shapes {A.shape=} {B.shape=} "
+	m, k, n = A.shape[0], B.shape[0], B.shape[1]
+
+	grid = (
+		pl.cdiv(m, blocksize_m),
+		pl.cdiv(n, blocksize_n),
+		pl.cdiv(k, blocksize_k),
+	)
+
+	in_specs = [
+		pl.BlockSpec((blocksize_m, blocksize_k), lambda mi, ni, ki: (mi, ki)),
+		pl.BlockSpec((blocksize_k, blocksize_n), lambda mi, ni, ki: (ki, ni)),
+	]
+
+	out_specs = pl.BlockSpec((blocksize_m, blocksize_n), lambda mi, ni, ki: (mi, ni))
+	return pl.pallas_call(
+		f=partial(_tpu_matmul_kernel_fwd, precision=precision, k_grid=grid[-1]),
+		out_shape=jax.ShapeDtypeStruct(shape=(m, n), dtype=A.dtype),
+		debug=False,
+		interpret=False,
+		grid_spec=pltpu.PrefetchScalarGridSpec(
+			num_scalar_prefetch=0,
+			grid=grid,
+			in_specs=in_specs,
+			out_specs=out_specs,
+			scratch_shapes=[pltpu.VMEM((blocksize_m, blocksize_n), jnp.float32)],
+		),
+		compiler_params=dict(
+			mosaic=dict(dimension_semantics=("parallel", "parallel", "arbitrary"))
+		),
+	)(A, B)
+
+
+def _call_tpu_matmul_kernel_fwd_residual(
+	A: jax.Array,
+	B: jax.Array,
+	blocksize_m: int,
+	blocksize_k: int,
+	blocksize_n: int,
+	precision: jax.lax.PrecisionLike = None,
+):
+	return _call_tpu_matmul_kernel_fwd(
+		A=A,
+		B=B,
+		blocksize_m=blocksize_m,
+		blocksize_k=blocksize_k,
+		blocksize_n=blocksize_n,
+		precision=precision,
+	), (A, B)
+
+
+def _call_tpu_matmul_kernel_bwd(
+	blocksize_m: int,
+	blocksize_k: int,
+	blocksize_n: int,
+	precision: jax.lax.PrecisionLike,
+	res,
+	gO,
+):
+	(A, B) = res
+	gA = _call_tpu_matmul_kernel_fwd(
+		A=gO,
+		B=B.transpose(1, 0),
+		blocksize_m=blocksize_m,
+		blocksize_k=blocksize_k,
+		blocksize_n=blocksize_n,
+		precision=precision,
+	)
+
+	gB = _call_tpu_matmul_kernel_fwd(
+		A=A.transpose(1, 0),
+		B=gO,
+		blocksize_m=blocksize_m,
+		blocksize_k=blocksize_k,
+		blocksize_n=blocksize_n,
+		precision=precision,
+	)
+	return gA, gB
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(2, 3, 4, 5, 6))
+def _tpu_matmul(
+	A: jax.Array,
+	B: jax.Array,
+	blocksize_m: int,
+	blocksize_k: int,
+	blocksize_n: int,
+	precision: jax.lax.PrecisionLike = None,
+):
+	return _call_tpu_matmul_kernel_fwd(
+		A=A,
+		B=B,
+		blocksize_m=blocksize_m,
+		blocksize_k=blocksize_k,
+		blocksize_n=blocksize_n,
+		precision=precision,
+	)
+
+
+_tpu_matmul.defvjp(_call_tpu_matmul_kernel_fwd_residual, _call_tpu_matmul_kernel_bwd)
 
 
 def matmul_kernel(
 	A: jax.Array,
 	B: jax.Array,
 	*,
-	blocksize_m: int = 32,
-	blocksize_k: int = 128,
-	blocksize_n: int = 32,
-	po_dtype: jnp.dtype = jnp.float32,
-	precision: jax.lax.PrecisionLike = None,
+	blocksize_m: Optional[int] = None,
+	blocksize_k: Optional[int] = None,
+	blocksize_n: Optional[int] = None,
+	prod_dtype: jnp.dtype = jnp.float32,
+	precision: PrecisionLike = None,
 ):
-	return _m(
-		A,
-		B,
-		blocksize_m,
-		blocksize_k,
-		blocksize_n,
-		po_dtype,
-		precision,
-	)
-
-
-@partial(jax.custom_vjp, nondiff_argnums=(2, 3, 4, 5, 6))
-# @jax.custom_vjp
-def _m(
-	A: jax.Array,
-	B: jax.Array,
-	blocksize_m: int = 32,
-	blocksize_k: int = 128,
-	blocksize_n: int = 32,
-	po_dtype: jnp.dtype = jnp.float32,
-	precision: jax.lax.PrecisionLike = None,
-):
-	return _call_matmul_kernel_fwd_g(
-		A=A,
-		B=B,
-		blocksize_m=blocksize_m,
-		blocksize_k=blocksize_k,
-		blocksize_n=blocksize_n,
-		po_dtype=po_dtype,
-		precision=precision,
-	)[0]
-
-
-_m.defvjp(_call_matmul_kernel_fwd_g, _call_matmul_kernel_bwd)
+	if PLATFORM in ["gpu", "cpu"]:
+		return _gpu_matmul(
+			A,
+			B,
+			blocksize_m,
+			blocksize_k,
+			blocksize_n,
+			prod_dtype,
+			precision,
+		)
+	elif PLATFORM in ["tpu", "cpu"]:
+		org_dtype = A.dtype
+		A = A.astype(jnp.promote_types(jnp.bfloat16, A.dtype))
+		B = B.astype(jnp.promote_types(jnp.bfloat16, B.dtype))
+		return _tpu_matmul(
+			A,
+			B,
+			blocksize_m,
+			blocksize_k,
+			blocksize_n,
+			precision,
+		).astype(org_dtype)
+	else:
+		raise NotImplementedError(
+			f"`matmul_kernel` is not implemented for request platform {PLATFORM}"
+		)
 
 
 def matmul_test():
@@ -339,89 +536,155 @@ def matmul_grad_test():
 	print(g[0])
 
 
+def _matmul_flops(m: int, k: int, n: int):
+	return 2 * m * k * n
+
+
+def _matmul_membw(m: int, k: int, n: int, dtype: jnp.dtype):
+	return (m * k + k * n + m * n) * jnp.dtype(dtype).itemsize
+
+
+def _matmul_flops_intensity(m: int, k: int, n: int, dtype: jnp.dtype):
+	flops = _matmul_flops(m, k, n)
+	membw = _matmul_membw(m, k, n, dtype)
+	return flops / membw
+
+
+def _benchmark(f, ntrials: int = 100):
+	import timeit
+
+	def run(*args, **kwargs):
+		jax.block_until_ready(f(*args, **kwargs))
+		result = timeit.timeit(
+			lambda: jax.block_until_ready(f(*args, **kwargs)), number=ntrials
+		)
+		time = result / ntrials
+		return time
+
+	return run
+
+
+def _analyze_matmul(m: int, k: int, n: int, dtype: jnp.dtype, mm_func):
+	from tabulate import tabulate
+
+	x = jnp.ones((m, k), dtype=dtype)
+	y = jnp.ones((k, n), dtype=dtype)
+	time = _benchmark(mm_func)(x, y)
+	time_org = _benchmark(jnp.matmul)(x, y)
+	mm_flops = _matmul_flops(m, k, n) / time
+	mm_flops_org = _matmul_flops(m, k, n) / time_org
+
+	print(
+		tabulate(
+			[
+				["Time (s)", f"{time:.6f}", f"{time_org:.6f}"],
+				["FLOP/s", f"{mm_flops:.2e}", f"{mm_flops_org:.2e}"],
+			],
+			headers=[f"Metric ({m}x{k}x{n})", "PAL Matmul", "JAX Matmul"],
+			tablefmt="grid",
+		)
+	)
+	return time, mm_flops
+
+
+@dataclass
+class _MatMulConfig:
+	block_m: int
+	block_n: int
+	block_k: int
+	time: float
+	flops: float
+
+
 def matmul_benchmark():
-	import time
+	BLOCK_SIZES = [16, 32, 64, 128] if PLATFORM == "gpu" else [128, 256, 512, 1024]
+	logging.basicConfig(
+		level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+	)
 
-	def benchmark_matmul(m, n, k, block_m, block_n, block_k, dtype=jnp.float32):
-		# Compile the kernel with given block sizes
-		kernel = matmul_kernel
+	def log_configuration(config: _MatMulConfig, is_time_best: bool, is_flops_best: bool):
+		log_message = f"Configuration: block_m={config.block_m}, block_n={config.block_n}, block_k={config.block_k}"
+		if is_time_best:
+			logging.info(f"New best time {log_message} - Time: {config.time:.6f} seconds")
+		if is_flops_best:
+			logging.info(f"New best FLOP/s {log_message} - FLOP/s: {config.flops:.2e}")
 
-		# Generate random matrices
-		a = jax.random.normal(jax.random.PRNGKey(0), (m, k), dtype=dtype)
-		b = jax.random.normal(jax.random.PRNGKey(1), (k, n), dtype=dtype)
+	def autotune_block_sizes(
+		m: int, n: int, k: int, dtype: jnp.dtype = jnp.float32
+	) -> Tuple[Tuple[int, int, int], float]:
+		best_time_config = None
+		best_flops_config = None
 
-		# Warm-up run
-		kernel(
-			a,
-			b,
-			blocksize_m=block_m,
-			blocksize_k=block_k,
-			blocksize_n=block_n,
-			po_dtype=dtype,
-		)
-
-		# Timed run
-		start = time.time()
-		for _ in range(10):  # Run multiple times for more stable results
-			kernel(
-				a,
-				b,
-				blocksize_m=block_m,
-				blocksize_k=block_k,
-				blocksize_n=block_n,
-				po_dtype=dtype,
-			)
-		jax.block_until_ready(
-			kernel(
-				a,
-				b,
-				blocksize_m=block_m,
-				blocksize_k=block_k,
-				blocksize_n=block_n,
-				po_dtype=dtype,
-			)
-		)
-		end = time.time()
-
-		return (end - start) / 10
-
-	def autotune_block_sizes(m, n, k, dtype=jnp.float32):
-		best_time = float("inf")
-		best_config = None
-
-		for block_m in [16, 32, 64, 128]:
-			for block_n in [16, 32, 64, 128]:
-				for block_k in [16, 32, 64, 128]:
+		for block_m in BLOCK_SIZES:
+			for block_n in BLOCK_SIZES:
+				for block_k in BLOCK_SIZES:
 					try:
-						time = benchmark_matmul(m, n, k, block_m, block_n, block_k, dtype)
-						print(
-							f"Configuration: block_m={block_m}, block_n={block_n}, "
-							f"block_k={block_k} -> Time: {time:.4f} seconds"
+						time, flops = _analyze_matmul(
+							m,
+							k,
+							n,
+							dtype,
+							partial(
+								matmul_kernel,
+								blocksize_m=block_m,
+								blocksize_n=block_n,
+								blocksize_k=block_k,
+								prod_dtype=dtype,
+								precision=None,
+							),
 						)
-						if time < best_time:
-							best_time = time
-							best_config = (block_m, block_n, block_k)
-							print(
-								f"New best configuration found: block_m={block_m}, "
-								f"block_n={block_n}, block_k={block_k} with Time: {best_time:.4f} seconds"
-							)
-					except Exception as e:  # noqa
-						if "RESOURCE_EXHAUSTED" in e.__str__():
-							print(
-								f"Skipping configuration due to OOM : block_m={block_m},"
-								f" block_n={block_n}, block_k={block_k}"
-							)
-							print(e)
-							pass
-						else:
-							raise e
-		return best_config, best_time
+						current_config = _MatMulConfig(block_m, block_n, block_k, time, flops)
 
-	# Example usage
-	m, n, k = 1, 4096, 4096 * 4
-	best_config, best_time = autotune_block_sizes(m, n, k, jnp.float16)
-	print(f"Best configuration for {m}x{n}x{k} matmul: {best_config}")
-	print(f"Best time: {best_time:.6f} seconds")
+						is_time_best = best_time_config is None or time < best_time_config.time
+						is_flops_best = best_flops_config is None or flops > best_flops_config.flops
+
+						if is_time_best:
+							best_time_config = current_config
+						if is_flops_best:
+							best_flops_config = current_config
+
+						log_configuration(current_config, is_time_best, is_flops_best)
+
+					except Exception as e:
+						if "RESOURCE_EXHAUSTED" in str(e):
+							logging.warning(
+								f"OOM error for configuration: block_m={block_m}, block_n={block_n}, block_k={block_k}"
+							)
+						else:
+							logging.error(
+								f"Unexpected error for configuration: block_m={block_m}, block_n={block_n}, block_k={block_k}: {str(e)}"
+							)
+
+		return (
+			best_time_config.block_m,
+			best_time_config.block_n,
+			best_time_config.block_k,
+		), best_time_config.time
+
+	logging.basicConfig(
+		level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+	)
+	# Define a list of matrix sizes to benchmark
+	matrix_sizes = [
+		(1000, 1000, 1000),
+		(2000, 2000, 2000),
+		(4000, 4000, 4000),
+		(8000, 8000, 8000),
+		(10000, 10000, 10000),
+	]
+
+	# Run the benchmark for each matrix size
+	best_configs = {}
+	for m, k, n in matrix_sizes:
+		logging.info(f"\nBenchmarking matrix multiplication: ({m} x {k}) * ({k} x {n})")
+		best_config, best_time = autotune_block_sizes(m, n, k, dtype=jnp.float32)
+		logging.info(
+			f"Best configuration ({m}x{k}x{n}): block_m={best_config[0]}, "
+			f"block_n={best_config[1]}, block_k={best_config[2]}"
+		)
+		best_configs[f"{m}x{k}x{n}"] = best_config
+		logging.info(f"Best time: {best_time:.6f} seconds")
+	print(best_configs)
 
 
 if __name__ == "__main__":

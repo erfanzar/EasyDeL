@@ -43,11 +43,12 @@ from flax.core import FrozenDict, unfreeze
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import numpy as jnp
 from jax.experimental.mesh_utils import create_device_mesh
+from jax.lib import xla_bridge
 from jax.sharding import Mesh, PartitionSpec
 from tqdm.auto import tqdm
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_flax_utils import FlaxPreTrainedModel
-from jax.lib import xla_bridge
+
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.etils import AVAILABLE_ATTENTION_MECHANISMS, get_logger
 from easydel.etils.partition_module import PartitionAxis
@@ -56,14 +57,14 @@ from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN, EasyQuantizer
 logger = get_logger(__name__)
 
 FLAX_WEIGHTS_NAME = "easydel-model.parameters"
-DEFAULT_PALLAS_M_BLOCK_SIZE = 64
+DEFAULT_PALLAS_M_BLOCK_SIZE = 128
 DEFAULT_PALLAS_K_BLOCK_SIZE = 128
-DEFAULT_PALLAS_N_BLOCK_SIZE = 64
+DEFAULT_PALLAS_N_BLOCK_SIZE = 128
 DEFAULT_PALLAS_RUNTIME = True if xla_bridge.get_backend().platform == "gpu" else False
-# if xla_bridge.get_backend().platform == "gpu":
-# 	DEFAULT_PALLAS_M_BLOCK_SIZE = 16
-# 	DEFAULT_PALLAS_K_BLOCK_SIZE = 16
-# 	DEFAULT_PALLAS_N_BLOCK_SIZE = 16
+if xla_bridge.get_backend().platform == "gpu":
+	DEFAULT_PALLAS_M_BLOCK_SIZE = None  # Autoset
+	DEFAULT_PALLAS_K_BLOCK_SIZE = None  # Autoset
+	DEFAULT_PALLAS_N_BLOCK_SIZE = None  # Autoset
 
 
 def set_attrs_smartly(self, attr_name: str, default: Any, new_attr: Any):
