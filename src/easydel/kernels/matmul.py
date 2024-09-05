@@ -102,9 +102,9 @@ def _gpu_matmul_kernel_fwd(
 
 
 def _get_compiler_params(
-	blocksize_m: int,
-	blocksize_k: int,
-	blocksize_n: int,
+	blocksize_m: Optional[int],
+	blocksize_k: Optional[int],
+	blocksize_n: Optional[int],
 	dtype: jnp.dtype,
 ):
 	params = None
@@ -139,6 +139,33 @@ def _get_compiler_params(
 		params = dict(triton=dict(num_stages=num_stages, num_warps=num_warps))
 
 	return params
+
+
+def get_best_block_size_tpu(A, B):
+	# A is assumed to be of shape (m, k) and B is of shape (k, n)
+	m, k = A.shape[0], A.shape[1]
+	n = B.shape[1]
+
+	# Initialize block sizes
+	bm, bk, bn = 16, 16, 16
+
+	# Adjust block size for m
+	if m >= 1024:
+		bm = 1024
+
+	# Adjust block size for k
+	if k > 128:
+		bk = 128
+	if k >= 2048:
+		bk = 1024
+
+	# Adjust block size for n
+	if n >= 1024:
+		bn = 1024
+	if n >= 2048:
+		bn = 256
+
+	return bm, bk, bn
 
 
 def get_best_block_size(A, B):
@@ -350,9 +377,9 @@ def _call_tpu_matmul_kernel_fwd(
 	A: jax.Array,
 	B: jax.Array,
 	*,
-	blocksize_m: int,
-	blocksize_k: int,
-	blocksize_n: int,
+	blocksize_m: Optional[int],
+	blocksize_k: Optional[int],
+	blocksize_n: Optional[int],
 	precision: jax.lax.PrecisionLike = None,
 ):
 	assert A.ndim == 2 and B.ndim == 2, f"got {A.shape=} and {B.shape=}"
@@ -360,6 +387,11 @@ def _call_tpu_matmul_kernel_fwd(
 		A.shape[1] == B.shape[0]
 	), f"matmul can't be operated with these shapes {A.shape=} {B.shape=} "
 	m, k, n = A.shape[0], B.shape[0], B.shape[1]
+	pbm, pbk, pbn = get_best_block_size(A, B)
+
+	blocksize_m = blocksize_m or pbm
+	blocksize_n = blocksize_n or pbn
+	blocksize_k = blocksize_k or pbk
 
 	grid = (
 		pl.cdiv(m, blocksize_m),
@@ -377,7 +409,7 @@ def _call_tpu_matmul_kernel_fwd(
 		f=partial(_tpu_matmul_kernel_fwd, precision=precision, k_grid=grid[-1]),
 		out_shape=jax.ShapeDtypeStruct(shape=(m, n), dtype=A.dtype),
 		debug=False,
-		interpret=False,
+		interpret=INTERPRET,
 		grid_spec=pltpu.PrefetchScalarGridSpec(
 			num_scalar_prefetch=0,
 			grid=grid,
@@ -394,9 +426,9 @@ def _call_tpu_matmul_kernel_fwd(
 def _call_tpu_matmul_kernel_fwd_residual(
 	A: jax.Array,
 	B: jax.Array,
-	blocksize_m: int,
-	blocksize_k: int,
-	blocksize_n: int,
+	blocksize_m: Optional[int],
+	blocksize_k: Optional[int],
+	blocksize_n: Optional[int],
 	precision: jax.lax.PrecisionLike = None,
 ):
 	return _call_tpu_matmul_kernel_fwd(
@@ -410,9 +442,9 @@ def _call_tpu_matmul_kernel_fwd_residual(
 
 
 def _call_tpu_matmul_kernel_bwd(
-	blocksize_m: int,
-	blocksize_k: int,
-	blocksize_n: int,
+	blocksize_m: Optional[int],
+	blocksize_k: Optional[int],
+	blocksize_n: Optional[int],
 	precision: jax.lax.PrecisionLike,
 	res,
 	gO,
@@ -442,9 +474,9 @@ def _call_tpu_matmul_kernel_bwd(
 def _tpu_matmul(
 	A: jax.Array,
 	B: jax.Array,
-	blocksize_m: int,
-	blocksize_k: int,
-	blocksize_n: int,
+	blocksize_m: Optional[int],
+	blocksize_k: Optional[int],
+	blocksize_n: Optional[int],
 	precision: jax.lax.PrecisionLike = None,
 ):
 	return _call_tpu_matmul_kernel_fwd(
@@ -509,7 +541,7 @@ def matmul_test():
 	B = jax.nn.initializers.normal(0.02, dtype=dtype)(
 		rng.rng, (intermediate_size, hidden_size)
 	)
-	y_ = matmul_kernel(A, B)
+	y_ = _tpu_matmul(A, B, None, None, None)
 	y = A @ B
 	print(jnp.allclose(y_, y, atol=0.125, rtol=0))
 	print(y[0, :5])

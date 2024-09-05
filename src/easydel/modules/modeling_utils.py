@@ -57,11 +57,19 @@ from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN, EasyQuantizer
 logger = get_logger(__name__)
 
 FLAX_WEIGHTS_NAME = "easydel-model.parameters"
+
 DEFAULT_PALLAS_M_BLOCK_SIZE = 128
 DEFAULT_PALLAS_K_BLOCK_SIZE = 128
 DEFAULT_PALLAS_N_BLOCK_SIZE = 128
+
 DEFAULT_PALLAS_RUNTIME = True if xla_bridge.get_backend().platform == "gpu" else False
+
 if xla_bridge.get_backend().platform == "gpu":
+	DEFAULT_PALLAS_M_BLOCK_SIZE = None  # Autoset
+	DEFAULT_PALLAS_K_BLOCK_SIZE = None  # Autoset
+	DEFAULT_PALLAS_N_BLOCK_SIZE = None  # Autoset
+
+if xla_bridge.get_backend().platform == "tpu":
 	DEFAULT_PALLAS_M_BLOCK_SIZE = None  # Autoset
 	DEFAULT_PALLAS_K_BLOCK_SIZE = None  # Autoset
 	DEFAULT_PALLAS_N_BLOCK_SIZE = None  # Autoset

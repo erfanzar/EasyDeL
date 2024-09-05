@@ -202,17 +202,19 @@ def test_fwd_call():
 	inputs = jax.random.normal(jax.random.key(564), (seq, dim), dtype=dtype)
 
 	w = jnp.ones((dim,), dtype=dtype)
-	y = basic_layer_norm(inputs, w, eps)
-	y_ = rms_norm(
-		inputs,
-		w,
-		blocksize_x=64,
-		eps=eps,
-		prod_dtype=jnp.float32,
-	)
-	print("is Prediciton Ok?      = ", jnp.allclose(y_, y, atol=0.125, rtol=0))
-	print("Orginal Prediciton     = ", y[0, :4])
-	print("Kernel  Prediction     = ", y_[0, :4])
+
+	print(jax.vjp(basic_layer_norm, inputs, w, eps)[1])
+	# y = basic_layer_norm(inputs, w, eps)
+	# y_ = rms_norm(
+	# 	inputs,
+	# 	w,
+	# 	blocksize_x=64,
+	# 	eps=eps,
+	# 	prod_dtype=jnp.float32,
+	# )
+	# print("is Prediciton Ok?      = ", jnp.allclose(y_, y, atol=0.125, rtol=0))
+	# print("Orginal Prediciton     = ", y[0, :4])
+	# print("Kernel  Prediction     = ", y_[0, :4])
 
 
 def test_bwd_call():
