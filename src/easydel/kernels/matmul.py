@@ -666,11 +666,11 @@ def matmul_benchmark():
 	)
 	# Define a list of matrix sizes to benchmark
 	matrix_sizes = [
-		(1000, 1000, 1000),
-		(2000, 2000, 2000),
-		(4000, 4000, 4000),
-		(8000, 8000, 8000),
-		(10000, 10000, 10000),
+		(1024, 1024, 1024),
+		(2048, 2048, 2048),
+		(4096, 4096, 4096),
+		(8192, 8192, 8192),
+		(10240, 10240, 10240),
 	]
 
 	# Run the benchmark for each matrix size
