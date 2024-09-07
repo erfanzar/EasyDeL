@@ -596,13 +596,43 @@ def _benchmark(f, ntrials: int = 100):
 	return run
 
 
-def _analyze_matmul(m: int, k: int, n: int, dtype: jnp.dtype, mm_func):
+def _analyze_matmul(
+	m: int,
+	k: int,
+	n: int,
+	block_m,
+	block_n,
+	block_k,
+	dtype: jnp.dtype,
+	mm_func,
+):
 	from tabulate import tabulate
 
 	x = jnp.ones((m, k), dtype=dtype)
 	y = jnp.ones((k, n), dtype=dtype)
-	time = _benchmark(mm_func)(x, y)
-	time_org = _benchmark(jnp.matmul)(x, y)
+	try:
+		time = _benchmark(mm_func)(x, y)
+	except Exception as e:
+		time = 1e6
+		if "RESOURCE_EXHAUSTED" in str(e):
+			logging.warning(
+				f"OOM error for configuration: block_m={block_m}, block_n={block_n}, block_k={block_k}"
+			)
+		else:
+			logging.error(
+				f"Unexpected error for configuration: block_m={block_m}, block_n={block_n}, block_k={block_k}: {str(e)}"
+			)
+
+	try:
+		time_org = _benchmark(jnp.matmul)(x, y)
+	except Exception as e:
+		time_org = 1e6
+		if "RESOURCE_EXHAUSTED" in str(e):
+			logging.warning("OOM error for native matmul")
+		else:
+			logging.error(
+				f"Unexpected error for configuration: block_m={block_m}, block_n={block_n}, block_k={block_k}: {str(e)}"
+			)
 	mm_flops = _matmul_flops(m, k, n) / time
 	mm_flops_org = _matmul_flops(m, k, n) / time_org
 
@@ -650,42 +680,34 @@ def matmul_benchmark():
 		for block_m in BLOCK_SIZES:
 			for block_n in BLOCK_SIZES:
 				for block_k in BLOCK_SIZES:
-					try:
-						time, flops = _analyze_matmul(
-							m,
-							k,
-							n,
-							dtype,
-							partial(
-								matmul_kernel,
-								blocksize_m=block_m,
-								blocksize_n=block_n,
-								blocksize_k=block_k,
-								prod_dtype=dtype,
-								precision=None,
-							),
-						)
-						current_config = _MatMulConfig(block_m, block_n, block_k, time, flops)
+					time, flops = _analyze_matmul(
+						block_m=block_m,
+						m=m,
+						block_k=block_k,
+						k=k,
+						block_n=block_n,
+						n=n,
+						dtype=dtype,
+						mm_func=partial(
+							matmul_kernel,
+							blocksize_m=block_m,
+							blocksize_n=block_n,
+							blocksize_k=block_k,
+							prod_dtype=dtype,
+							precision=None,
+						),
+					)
+					current_config = _MatMulConfig(block_m, block_n, block_k, time, flops)
 
-						is_time_best = best_time_config is None or time < best_time_config.time
-						is_flops_best = best_flops_config is None or flops > best_flops_config.flops
+					is_time_best = best_time_config is None or time < best_time_config.time
+					is_flops_best = best_flops_config is None or flops > best_flops_config.flops
 
-						if is_time_best:
-							best_time_config = current_config
-						if is_flops_best:
-							best_flops_config = current_config
+					if is_time_best:
+						best_time_config = current_config
+					if is_flops_best:
+						best_flops_config = current_config
 
-						log_configuration(current_config, is_time_best, is_flops_best)
-
-					except Exception as e:
-						if "RESOURCE_EXHAUSTED" in str(e):
-							logging.warning(
-								f"OOM error for configuration: block_m={block_m}, block_n={block_n}, block_k={block_k}"
-							)
-						else:
-							logging.error(
-								f"Unexpected error for configuration: block_m={block_m}, block_n={block_n}, block_k={block_k}: {str(e)}"
-							)
+					log_configuration(current_config, is_time_best, is_flops_best)
 
 		return (
 			best_time_config.block_m,
@@ -703,6 +725,11 @@ def matmul_benchmark():
 		(4096, 4096, 4096),
 		(8192, 8192, 8192),
 		(10240, 10240, 10240),
+		(12288, 12288, 12288),
+		(14336, 14336, 14336),
+		(16384, 16384, 16384),
+		(18432, 18432, 18432),
+		(20480, 20480, 20480),
 	]
 
 	# Run the benchmark for each matrix size
