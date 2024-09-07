@@ -57,13 +57,13 @@ def _gpu_fwd_flash_attn_kernel(
 	kblock,
 	seqlen_q,
 	seqlen_k,
-	seqlen_q_rounded,
+	# seqlen_q_rounded,
 	softmax_scale,
 	nheads,
 	block_headdim,
 ):
-	# grid pl.cdiv(seqlen_q, qblock), batch_size, nheads
-	qg, bg, nhg = pl.program_id(0), pl.program_id(1), pl.program_id(2)
+	qg, nhbg = pl.program_id(0), pl.program_id(1)
+	bg, nhg = nhbg // nheads, nhbg % nheads
 	qs_mask = qg * qblock + jnp.arange(0, qblock) < seqlen_q
 	headdim_mask = jnp.arange(0, block_headdim) < q_ref.shape[3]
 	qmask = qs_mask[:, None] & headdim_mask[None, :]
@@ -81,21 +81,25 @@ def _gpu_fwd_flash_attn_kernel(
 		ks_mask = idx * kblock + jnp.arange(0, kblock) < seqlen_k
 		kv_mask = ks_mask[:, None] & headdim_mask[None, :]
 		k = pl.load(k_ref, idx=kv_idx, mask=kv_mask, other=0.0)
-		qk = jnp.dot(q, k.transpose(1, 0))
+		qk = jnp.dot(q, k.transpose(1, 0)).astype(jnp.float32)
+
 		if b_ref is not None:
-			bslice = (
-				bg,
-				nhg,
-				pl.dslice(qg * qblock, qblock),
-				pl.dslice(idx * kblock, kblock),
-			)
-			bmask = qs_mask[:, None] & ks_mask[None, :]
-			b = pl.load(b_ref, idx=bslice, mask=bmask, other=0.0)
-			qk = qk * softmax_scale + b
+			qk = (qk * softmax_scale) + pl.load(
+				b_ref,
+				idx=(
+					bg,
+					nhg,
+					pl.dslice(qg * qblock, qblock),
+					pl.dslice(idx * kblock, kblock),
+				),
+				mask=qs_mask[:, None] & ks_mask[None, :],
+				other=float("-inf"),
+			).astype(jnp.float32)
+			max_ij = jnp.maximum(jnp.max(qk, -1), lse_i)
+			p = jnp.exp(qk - max_ij[:, None])
 		else:
-			qk = qk * softmax_scale
-		max_ij = jnp.maximum(jnp.max(qk, -1), lse_i)
-		p = jnp.exp(qk - max_ij[:, None])
+			max_ij = jnp.maximum(jnp.max(qk, -1) * softmax_scale, lse_i)
+			p = jnp.exp(qk * softmax_scale - max_ij[:, None])
 		lse_ij = jnp.sum(p, -1)
 		acc_o_scale = jnp.exp(max_i - max_ij)
 		acc_o = acc_o * acc_o_scale[:, None]
@@ -112,16 +116,25 @@ def _gpu_fwd_flash_attn_kernel(
 		jnp.full((qblock,), -float("inf"), dtype=jnp.float32),
 	)
 
-	i, o, max_i, lse_i = jax.lax.while_loop(
-		lambda state: state[0] < end_krange, body, init_block
+	_, o, max_i, lse_i = jax.lax.while_loop(
+		lambda state: state[0] < end_krange,
+		body,
+		init_block,
 	)
 	o_scale = jnp.exp(max_i - lse_i)
 	o = o * o_scale[:, None]
 	pl.store(
 		o_ref,
-		val=o,
+		val=o.astype(dtype),
 		idx=(bg, pl.dslice(qg * qblock, qblock), nhg, pl.dslice(None)),
 		mask=qmask,
+	)
+
+	pl.store(
+		lse_ref,
+		val=lse_i,
+		idx=(bg, nhg, pl.dslice(qg * qblock, qblock)),
+		mask=qs_mask,
 	)
 
 
@@ -129,7 +142,7 @@ def _call_gpu_fwd_flash_attn(
 	q: jax.Array,
 	k: jax.Array,
 	v: jax.Array,
-	b: Optional[jax.Array],
+	b: Optional[jax.Array] = None,
 	dtype: jnp.dtype = jnp.float32,
 	qblock: int = 128,
 	kblock: int = 128,
@@ -138,10 +151,10 @@ def _call_gpu_fwd_flash_attn(
 	batch_size, seqlen_q, nheads, dim = q.shape
 	seqlen_k = k.shape[1]
 	softmax_scale = softmax_scale or 1.0 / math.sqrt(dim)
+	# kblock = min(kblock, seqlen_k)
+	# seqlen_q_rounded = math.ceil(seqlen_q / 128) * 128
 
-	seqlen_q_rounded = math.ceil(seqlen_q / 128) * 128
-
-	lse_shape = (batch_size, nheads, seqlen_q_rounded)
+	lse_shape = (batch_size, nheads, seqlen_q)
 	in_specs = [
 		pl.BlockSpec(q.shape, lambda *_: (0,) * q.ndim),
 		pl.BlockSpec(k.shape, lambda *_: (0,) * k.ndim),
@@ -153,14 +166,14 @@ def _call_gpu_fwd_flash_attn(
 
 	out_shape = [
 		jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
-		jax.ShapeDtypeStruct(shape=lse_shape, dtype=q.dtype),
+		jax.ShapeDtypeStruct(shape=lse_shape, dtype=jnp.float32),
 	]
 
 	out_specs = [
 		pl.BlockSpec(q.shape, lambda *_: (0,) * q.ndim),
 		pl.BlockSpec(lse_shape, lambda *_: (0,) * len(lse_shape)),
 	]
-	grid = (pl.cdiv(seqlen_q, qblock), batch_size, nheads)
+	grid = (pl.cdiv(seqlen_q, qblock), batch_size * nheads)
 
 	method = pl.pallas_call(
 		f=partial(
@@ -170,7 +183,7 @@ def _call_gpu_fwd_flash_attn(
 			kblock=kblock,
 			seqlen_q=seqlen_q,
 			seqlen_k=seqlen_k,
-			seqlen_q_rounded=seqlen_q_rounded,
+			# seqlen_q_rounded=seqlen_q_rounded,
 			softmax_scale=softmax_scale,
 			nheads=nheads,
 			block_headdim=dim,
@@ -185,7 +198,32 @@ def _call_gpu_fwd_flash_attn(
 	)
 
 	o, lse = method(q, k, v, b)
+	print(lse)
 	return o, (o, lse)
+
+
+def _call_gpu_bwd_flash_attn_kernel(
+	q_ref,
+	k_ref,
+	v_ref,
+	b_ref,
+	o_ref,
+	lse_ref,
+	dO_ref,
+	dQ_ref,
+	dK_ref,
+	dV_ref,
+	*,
+	dtype,
+	qblock,
+	kblock,
+	seqlen_q,
+	seqlen_k,
+	# seqlen_q_rounded,
+	softmax_scale,
+	nheads,
+	block_headdim,
+): ...
 
 
 def _call_gpu_bwd_flash_attn(
@@ -225,11 +263,8 @@ _gpu_flash_attn.defvjp(_call_gpu_fwd_flash_attn, _call_gpu_bwd_flash_attn)
 
 
 def main():
-	b, h, qs, s, d = 1, 2, 2, 2, 4
+	b, h, qs, s, d = 1, 8, 1, 16, 128
 	dtype = jnp.float32
-
-	def transposehs(x):
-		return x.transpose(0, 2, 1, 3)
 
 	q = jrand.normal(rng.rng, shape=(b, qs, h, d), dtype=dtype)
 	k = jrand.normal(rng.rng, shape=(b, s, h, d), dtype=dtype)
@@ -240,19 +275,24 @@ def main():
 		jnp.finfo(dtype).min,
 	)
 
-	excepted_result = _dot_product_attention(query=q, key=k, value=v, bias=b)
+	excepted_result = _dot_product_attention(
+		query=q,
+		key=k,
+		value=v,
+		bias=b,
+	)
 	result = _call_gpu_fwd_flash_attn(
 		q,
 		k,
 		v,
 		b,
 		dtype=dtype,
-		qblock=32,
-		kblock=32,
+		qblock=64,
+		kblock=64,
 	)[0]
 	print(f"PRED : \n {result} \n")
 	print(f"ORGN : \n {excepted_result} \n")
-	
+
 	print(jnp.allclose(excepted_result, result, 0.125, 0))
 
 
