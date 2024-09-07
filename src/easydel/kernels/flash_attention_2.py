@@ -12,20 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import math
 from functools import partial
 from typing import Optional
@@ -33,7 +19,8 @@ from typing import Optional
 import jax
 from fjformer import GenerateRNG
 from flax.linen.attention import dot_product_attention as _dot_product_attention
-from jax import custom_vjp, numpy as jnp
+from jax import custom_vjp
+from jax import numpy as jnp
 from jax import random as jrand
 from jax.experimental import pallas as pl
 from jax.lib import xla_bridge
@@ -57,7 +44,6 @@ def _gpu_fwd_flash_attn_kernel(
 	kblock,
 	seqlen_q,
 	seqlen_k,
-	# seqlen_q_rounded,
 	softmax_scale,
 	nheads,
 	block_headdim,
@@ -151,8 +137,6 @@ def _call_gpu_fwd_flash_attn(
 	batch_size, seqlen_q, nheads, dim = q.shape
 	seqlen_k = k.shape[1]
 	softmax_scale = softmax_scale or 1.0 / math.sqrt(dim)
-	# kblock = min(kblock, seqlen_k)
-	# seqlen_q_rounded = math.ceil(seqlen_q / 128) * 128
 
 	lse_shape = (batch_size, nheads, seqlen_q)
 	in_specs = [
@@ -183,7 +167,6 @@ def _call_gpu_fwd_flash_attn(
 			kblock=kblock,
 			seqlen_q=seqlen_q,
 			seqlen_k=seqlen_k,
-			# seqlen_q_rounded=seqlen_q_rounded,
 			softmax_scale=softmax_scale,
 			nheads=nheads,
 			block_headdim=dim,
@@ -193,16 +176,63 @@ def _call_gpu_fwd_flash_attn(
 		in_specs=in_specs,
 		out_shape=out_shape,
 		compiler_params=dict(triton=dict(num_wraps=4 if dim <= 64 else 8, num_stages=1)),
-		interpret=True,
+		interpret=INTERPRET,
 		debug=False,
 	)
 
 	o, lse = method(q, k, v, b)
-	print(lse)
-	return o, (o, lse)
+
+	return o, (
+		q,
+		k,
+		v,
+		b,
+		o,
+		lse,
+	)
 
 
-def _call_gpu_bwd_flash_attn_kernel(
+def _gpu_bwd_do_o_dot(
+	o_ref,
+	dO_ref,
+	delta_ref,
+	*,
+	nheads,
+	seqlen_q,
+	headdim,
+	qblock,
+	block_headdim,
+):
+	qg, bnhg = pl.program_id(0), pl.program_id(1)
+	bg = bnhg // nheads
+	nhg = bnhg % nheads
+
+	qs_mask = qg * qblock + jnp.arange(0, qblock) < seqlen_q
+	headdim_mask = jnp.arange(0, block_headdim) < headdim
+	omask = qs_mask[:, None] & headdim_mask[None, :]
+
+	o = pl.load(
+		o_ref,
+		idx=(bg, pl.dslice(qg * qblock, qblock), nhg, pl.dslice(None)),
+		mask=omask,
+		other=0.0,
+	).astype(jnp.float32)
+	dO = pl.load(
+		dO_ref,
+		idx=(bg, pl.dslice(qg * qblock, qblock), nhg, pl.dslice(None)),
+		mask=omask,
+		other=0.0,
+	).astype(jnp.float32)
+	delta = jnp.sum(o * dO, -1)
+	pl.store(
+		delta_ref,
+		idx=(bg, nhg, pl.dslice(qg * qblock, qblock)),
+		val=delta,
+		mask=omask,
+	)
+
+
+def _gpu_bwd_flash_attn_kernel(
 	q_ref,
 	k_ref,
 	v_ref,
@@ -223,7 +253,14 @@ def _call_gpu_bwd_flash_attn_kernel(
 	softmax_scale,
 	nheads,
 	block_headdim,
-): ...
+):
+	qg, bnhg = pl.program_id(0), pl.program_id(1)
+	bg = bnhg // nheads
+	nhg = bnhg % nheads
+
+	qs_mask = qg * qblock + jnp.arange(0, qblock) < seqlen_q
+	headdim_mask = jnp.arange(0, block_headdim) < q_ref.shape[3]
+	qmask = qs_mask[:, None] & headdim_mask[None, :]
 
 
 def _call_gpu_bwd_flash_attn(
@@ -233,7 +270,84 @@ def _call_gpu_bwd_flash_attn(
 	softmax_scale: float,
 	res,
 	dO,
-): ...
+):
+	(
+		q,
+		k,
+		v,
+		b,
+		o,
+		lse,
+	) = res
+	batch_size, seqlen_q, nheads, dim = q.shape
+	seqlen_k = k.shape[1]
+	softmax_scale = softmax_scale or 1.0 / math.sqrt(dim)
+
+	bias_spec = None if b is None else pl.BlockSpec(b.shape, lambda *_: (0,) * b.ndim)
+	in_specs = [
+		pl.BlockSpec(q.shape, lambda *_: (0,) * q.ndim),
+		pl.BlockSpec(k.shape, lambda *_: (0,) * k.ndim),
+		pl.BlockSpec(v.shape, lambda *_: (0,) * v.ndim),
+		bias_spec,
+		pl.BlockSpec(o.shape, lambda *_: (0,) * o.ndim),
+		pl.BlockSpec(lse.shape, lambda *_: (0,) * lse.ndim),
+		pl.BlockSpec(dO.shape, lambda *_: (0,) * dO.ndim),
+	]
+
+	out_shape = [
+		jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
+		jax.ShapeDtypeStruct(shape=k.shape, dtype=k.dtype),
+		jax.ShapeDtypeStruct(shape=v.shape, dtype=v.dtype),
+	]
+
+	out_specs = [
+		pl.BlockSpec(q.shape, lambda *_: (0,) * q.ndim),
+		pl.BlockSpec(k.shape, lambda *_: (0,) * k.ndim),
+		pl.BlockSpec(v.shape, lambda *_: (0,) * v.ndim),
+	]
+	grid = (pl.cdiv(seqlen_q, qblock), batch_size * nheads)
+
+	delta = pl.pallas_call(
+		f=partial(
+			_gpu_bwd_do_o_dot,
+			qblock=qblock,
+			seqlen_q=seqlen_q,
+			nheads=nheads,
+			block_headdim=dim,
+		),
+		compiler_params=dict(triton=dict(num_wraps=4 if dim <= 64 else 8, num_stages=1)),
+		in_specs=[
+			pl.BlockSpec(o.shape, lambda *_: (0,) * o.ndim),
+			pl.BlockSpec(dO.shape, lambda *_: (0,) * dO.ndim),
+		],
+		out_specs=pl.BlockSpec(lse.shape, lambda *_: (0,) * lse.ndim),
+		out_shape=jax.ShapeDtypeStruct(shape=lse.shape, dtype=o.dtype),
+		interpret=INTERPRET,
+		debug=False,
+	)(o, dO)
+
+	method = pl.pallas_call(
+		f=partial(
+			_gpu_bwd_flash_attn_kernel,
+			dtype=dtype,
+			qblock=qblock,
+			kblock=kblock,
+			seqlen_q=seqlen_q,
+			seqlen_k=seqlen_k,
+			softmax_scale=softmax_scale,
+			nheads=nheads,
+			block_headdim=dim,
+		),
+		grid=grid,
+		out_shape=out_shape,
+		out_specs=out_specs,
+		in_specs=in_specs,
+		compiler_params=dict(triton=dict(num_wraps=4 if dim <= 64 else 8, num_stages=1)),
+		interpret=INTERPRET,
+		debug=False,
+	)
+	dq, dk, dv = method(q, k, v, b, o, lse, dO)
+	return dq, dk, dv, None
 
 
 @partial(custom_vjp, nondiff_argnums=(4, 5, 6, 7))
@@ -282,10 +396,10 @@ def main():
 		bias=b,
 	)
 	result = _call_gpu_fwd_flash_attn(
-		q,
-		k,
-		v,
-		b,
+		q=q,
+		k=k,
+		v=b,
+		b=b,
 		dtype=dtype,
 		qblock=64,
 		kblock=64,
