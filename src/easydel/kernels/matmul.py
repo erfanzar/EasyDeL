@@ -258,6 +258,7 @@ def _call_gpu_matmul_kernel_fwd(
 			blocksize_k=blocksize_k,
 			dtype=A.dtype,
 		),
+		name="gpu_matmul_kernel_fwd",
 	)(A, B)
 
 
@@ -420,6 +421,7 @@ def _call_tpu_matmul_kernel_fwd(
 		compiler_params=dict(
 			mosaic=dict(dimension_semantics=("parallel", "parallel", "arbitrary"))
 		),
+		name="tpu_matmul_kernel_fwd",
 	)(A, B)
 
 

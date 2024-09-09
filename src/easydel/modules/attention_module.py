@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -58,6 +57,7 @@ from easydel.modules._vanilla_attention import (
 )
 from easydel.modules.flax_modeling_utils import get_gradient_checkpoint_policy
 from easydel.modules.modeling_utils import EDPretrainedConfig
+from easydel.kernels.flash_attention_2 import flash_attn2
 
 logger = get_logger(__name__)
 
@@ -90,6 +90,7 @@ class AttentionOutput:
 @dataclass
 class AttentionMechanisms:
 	jax_flash_attn2: Literal["jax_flash_attn2"] = "jax_flash_attn2"
+	jax_flash_attn2: Literal["flash_attn2"] = "flash_attn2"
 	vanilla: Literal["vanilla"] = "vanilla"
 	flash: Literal["flash"] = "flash"
 	splash: Literal["splash"] = "splash"
@@ -664,6 +665,13 @@ class FlexibleAttentionModule(object):
 					value_states=value_states,
 					bias=bias,
 				)
+			elif self.attn_mechanism == AttentionMechanisms.flash_attn2:
+				return self.flash_attn2(
+					query_states=query_states,
+					key_states=key_states,
+					value_states=value_states,
+					bias=bias,
+				)
 			elif self.attn_mechanism == AttentionMechanisms.flash:
 				if segment_ids is not None:
 					warnings.warn(
@@ -861,37 +869,12 @@ class FlexibleAttentionModule(object):
 			[query_states, key_states, value_states],
 		)
 		qps, kps, vps, bps, aps, _ = self.get_bhsd_partition_specs(query_states.shape[2])
-		# attention_outputs = shard_map(
-		# 	partial(
-		# 		jax_flash_attention2,
-		# 		q_block=self.block_q,
-		# 		k_block=self.block_k,
-		# 		precision=self.precision,
-		# 		dtype=self.dtype,
-		# 		softmax_scale=self.sm_scale,
-		# 	),
-		# 	mesh=self.mesh,
-		# 	in_specs=(
-		# 		qps,
-		# 		kps,
-		# 		vps,
-		# 		None,
-		# 		bps,
-		# 	),
-		# 	out_specs=aps,
-		# 	check_rep=False,
-		# )(query_states, key_states, value_states, None, bias)
-
 		with self.mesh:
 			attention_outputs = jax_flash_attention2(
-				# query_state=query_states,
 				query_state=with_sharding_constraint(query_states, qps),
-				# key_state=key_states,
 				key_state=with_sharding_constraint(key_states, kps),
-				# value_state=value_states,
 				value_state=with_sharding_constraint(value_states, vps),
 				mask=mask,
-				# bias=bias,
 				bias=with_sharding_constraint(bias, bps),
 				q_block=self.block_q,
 				k_block=self.block_k,
@@ -899,11 +882,38 @@ class FlexibleAttentionModule(object):
 				dtype=self.dtype,
 				softmax_scale=self.sm_scale,
 			)
-			
+
 			attention_outputs = with_sharding_constraint(attention_outputs, aps)
 			return AttentionOutput(
 				attention_weights=None,
 				attention_outputs=attention_outputs.transpose(0, 2, 1, 3),
+			)
+
+	def flash_attn2(
+		self,
+		*,  # it's Kwarg Only
+		query_states: Array,
+		key_states: Array,
+		value_states: Array,
+		bias: Optional[Array] = None,
+	):
+		qps, kps, vps, bps, aps, _ = self.get_bshd_partition_specs(query_states.shape[1])
+
+		with self.mesh:
+			attention_outputs = flash_attn2(
+				q=with_sharding_constraint(query_states, qps),
+				k=with_sharding_constraint(key_states, kps),
+				v=with_sharding_constraint(value_states, vps),
+				b=with_sharding_constraint(bias, bps),
+				qblock=self.block_q,
+				kblock=self.block_k,
+				dtype=self.dtype,
+				softmax_scale=self.sm_scale,
+			)
+
+			return AttentionOutput(
+				attention_weights=None,
+				attention_outputs=with_sharding_constraint(attention_outputs, aps),
 			)
 
 	def local_ring_attention(

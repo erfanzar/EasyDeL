@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -60,6 +59,7 @@ class GenerationPipeline:
 	    parameters_are_quantized (bool, optional): Whether the model parameters are quantized. Defaults to False.
 	    force_sharding (bool): Whether to pass in and out shardings to `jax.jit` function
 	        (must be off in case of using `parameters_are_quantized`). Defaults to False.
+			max_new_tokens (int): default max_new_tokens to be used in case of not passing any generation config.
 			sparse_module_type (AVAILABLE_SPARSE_MODULE_TYPES): sparse model type to be used to prune the params.
 			use_pruner (bool): whenever to use prunner for faster inference.
 	"""
@@ -76,6 +76,7 @@ class GenerationPipeline:
 		partition_rules=None,
 		parameters_are_quantized: bool = False,
 		force_sharding: bool = False,
+		max_new_tokens: int = 512,
 		sparse_module_type: AVAILABLE_SPARSE_MODULE_TYPES = "bcoo",
 		use_pruner: bool = False,
 	):
@@ -93,10 +94,10 @@ class GenerationPipeline:
 					top_k=model.generation_config.top_k,
 					top_p=model.generation_config.top_p,
 					temperature=model.generation_config.temperature,
-					max_new_tokens=model.generation_config.max_new_tokens or 512,
+					max_new_tokens=model.generation_config.max_new_tokens or max_new_tokens,
 				)
 			else:
-				generation_config = GenerationPipelineConfig()
+				generation_config = GenerationPipelineConfig(max_new_tokens=max_new_tokens)
 		params_get = params.get("params", None)
 		if params_get is not None:
 			warnings.warn(
