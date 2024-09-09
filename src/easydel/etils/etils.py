@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -124,6 +123,7 @@ _AVAILABLE_ATTENTION_MECHANISMS = [
 	"vanilla",
 	"flash",
 	"jax_flash_attn2",
+	"flash_attn2",
 	"splash",
 	"ring",
 	"cudnn",
@@ -138,6 +138,7 @@ AVAILABLE_ATTENTION_MECHANISMS = Literal[
 	"vanilla",
 	"flash",
 	"jax_flash_attn2",
+	"flash_attn2",
 	"splash",
 	"ring",
 	"cudnn",

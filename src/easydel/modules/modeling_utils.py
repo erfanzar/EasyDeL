@@ -62,7 +62,7 @@ DEFAULT_PALLAS_M_BLOCK_SIZE = 128
 DEFAULT_PALLAS_K_BLOCK_SIZE = 128
 DEFAULT_PALLAS_N_BLOCK_SIZE = 128
 
-DEFAULT_PALLAS_RUNTIME = True if xla_bridge.get_backend().platform == "gpu" else False
+DEFAULT_PALLAS_RUNTIME = False
 
 if xla_bridge.get_backend().platform == "gpu":
 	DEFAULT_PALLAS_M_BLOCK_SIZE = None  # Autoset
