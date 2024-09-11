@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -668,21 +667,25 @@ class FlaxLlamaPreTrainedModel(EDPretrainedModel):
 		Returns:
 		    A dictionary with the following keys:
 		"""
-		input_ids = jnp.ones((batch_size, max_length))
-		attention_mask = jnp.ones_like(input_ids)
-		position_ids = jnp.broadcast_to(
-			jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape
-		)
 
-		init_variables = self.module.init(
-			jax.random.PRNGKey(0),
-			input_ids,
-			attention_mask,
-			position_ids,
-			return_dict=False,
-			init_cache=True,
-		)
-		return init_variables["cache"]
+		def init_fn():
+			input_ids = jnp.ones((batch_size, max_length), dtype=jnp.int32)
+			attention_mask = jnp.ones_like(input_ids)
+			position_ids = jnp.broadcast_to(
+				jnp.arange(jnp.atleast_2d(input_ids).shape[-1]),
+				input_ids.shape,
+			)
+			init_variables = self.module.init(
+				jax.random.PRNGKey(0),
+				input_ids,
+				attention_mask,
+				position_ids,
+				return_dict=False,
+				init_cache=True,
+			)
+			return init_variables["cache"]
+
+		return jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), jax.eval_shape(init_fn))
 
 	def __call__(
 		self,
@@ -1157,8 +1160,6 @@ class FlaxLlamaForCausalLMModule(nn.Module):
 			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
-
-		
 
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
