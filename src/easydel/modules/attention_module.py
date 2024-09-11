@@ -44,6 +44,7 @@ from flax.struct import dataclass
 from jax import lax, random
 from jax import numpy as jnp
 from jax.experimental.shard_map import shard_map
+import jax.lib
 from jax.sharding import Mesh, PartitionSpec
 
 from easydel.etils.etils import AVAILABLE_ATTENTION_MECHANISMS, get_logger
@@ -898,7 +899,9 @@ class FlexibleAttentionModule(object):
 		bias: Optional[Array] = None,
 	):
 		qps, kps, vps, bps, aps, _ = self.get_bshd_partition_specs(query_states.shape[1])
-
+		assert bias.ndim == 4
+		if bias is not None and bias.shape[1] != query_states.shape[2]:
+			bias = jnp.repeat(bias, query_states.shape[2], 1)
 		with self.mesh:
 			attention_outputs = flash_attn2(
 				q=with_sharding_constraint(query_states, qps),
@@ -1428,6 +1431,7 @@ class FlexibleAttentionModule(object):
 		query_sequence_length: int = None,
 		bias: Optional[Array] = None,
 	) -> AttentionOutput:
+		assert jax.lib.xla_bridge.get_backend().platform == "gpu"
 		if query_sequence_length is None:
 			query_sequence_length = query_states.shape[1]
 		qps, kps, vps, bps, aps, is_gen = self.get_bshd_partition_specs(
