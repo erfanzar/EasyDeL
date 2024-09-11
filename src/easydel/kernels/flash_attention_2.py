@@ -16,6 +16,7 @@ import math
 from functools import partial
 from typing import Optional
 
+import chex
 import jax
 from fjformer import GenerateRNG
 from flax.linen.attention import dot_product_attention as _dot_product_attention
@@ -27,7 +28,7 @@ from jax.lib import xla_bridge
 
 _PLATFORM = xla_bridge.get_backend().platform
 _INTERPRET = _PLATFORM == "cpu"
-_TEST_DTYPE = jnp.float32
+_TEST_DTYPE = jnp.float16
 # _INTERPRET = True
 _rng = GenerateRNG()
 
@@ -602,6 +603,11 @@ def flash_attn2(
 	kblock: int = 128,
 	softmax_scale: float = None,
 ):
+	chex.assert_equal_shape(inputs=(k, v), dims=(0, 1, 2, 3))
+	chex.assert_equal_rank([q, k, v])
+	if b is not None:
+		if q.shape[2] != b.shape[1]:
+			raise AssertionError(f"nheads missmatched in q,b {q.shape=},{b.shape=}")
 	if _PLATFORM in ["gpu", "cpu"]:
 		return _gpu_flash_attn(
 			q=q,
@@ -619,7 +625,7 @@ def flash_attn2(
 
 
 def gpu_fwd_test():
-	b, h, qs, s, d = 1, 8, 1, 64, 128
+	b, h, qs, s, d = 1, 32, 2048, 2048, 128
 	dtype = _TEST_DTYPE
 
 	q = jrand.normal(_rng.rng, shape=(b, qs, h, d), dtype=dtype)
@@ -637,14 +643,14 @@ def gpu_fwd_test():
 		value=v,
 		bias=b,
 	)
-	result = _gpu_flash_attn(
+	result = flash_attn2(
 		q=q,
 		k=k,
 		v=v,
 		b=b,
-		dtype=dtype,
-		qblock=64,
-		kblock=64,
+		dtype=jnp.float16,
+		qblock=16,
+		kblock=16,
 	)
 	print(f"PRED : {result[0,0,0,:5]}")
 	print(f"ORGN : {excepted_result[0,0,0,:5]}")
@@ -690,5 +696,5 @@ def gpu_bwd_test():
 
 
 if __name__ == "__main__":
-	# gpu_fwd_test()
-	gpu_bwd_test()
+	gpu_fwd_test()
+	# gpu_bwd_test()
