@@ -150,6 +150,7 @@ AVAILABLE_ATTENTION_MECHANISMS = Literal[
 	"pallas_flash",
 ]
 
+DEFAULT_ATTENTION_MECHANISM = "sharded_vanilla"
 AVAILABLE_SPARSE_MODULE_TYPES = Literal["bcoo", "bcsr", "coo", "csr"]
 
 

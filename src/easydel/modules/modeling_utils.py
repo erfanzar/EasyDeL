@@ -50,7 +50,11 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_flax_utils import FlaxPreTrainedModel
 
 from easydel.etils.easystate import EasyDeLState
-from easydel.etils.etils import AVAILABLE_ATTENTION_MECHANISMS, get_logger
+from easydel.etils.etils import (
+	AVAILABLE_ATTENTION_MECHANISMS,
+	DEFAULT_ATTENTION_MECHANISM,
+	get_logger,
+)
 from easydel.etils.partition_module import PartitionAxis
 from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN, EasyQuantizer
 
@@ -128,7 +132,7 @@ class EDPretrainedConfig(PretrainedConfig):
 		self,
 		axis_dims: Sequence[int] = (1, -1, 1, 1),
 		axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "jax_flash_attn2",
+		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_ATTENTION_MECHANISM,
 		block_k: int = 128,
 		block_q: int = 128,
 		block_b: int = 1,

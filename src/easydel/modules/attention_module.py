@@ -90,7 +90,7 @@ class AttentionOutput:
 @dataclass
 class AttentionMechanisms:
 	jax_flash_attn2: Literal["jax_flash_attn2"] = "jax_flash_attn2"
-	jax_flash_attn2: Literal["flash_attn2"] = "flash_attn2"
+	flash_attn2: Literal["flash_attn2"] = "flash_attn2"
 	vanilla: Literal["vanilla"] = "vanilla"
 	flash: Literal["flash"] = "flash"
 	splash: Literal["splash"] = "splash"
