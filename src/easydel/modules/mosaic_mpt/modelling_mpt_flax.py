@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -627,17 +626,20 @@ class FlaxMptPretrainedModel(EDPretrainedModel):
 		)
 
 	def init_cache(self, batch_size, max_length):
-		input_ids = jnp.ones((batch_size, max_length), dtype="i4")
-		attention_mask = jnp.ones_like(input_ids)
+		def init_fn():
+			input_ids = jnp.ones((batch_size, max_length), dtype=jnp.int32)
+			attention_mask = jnp.ones_like(input_ids)
 
-		init_variables = self.module.init(
-			jax.random.PRNGKey(0),
-			input_ids=input_ids,
-			attention_mask=attention_mask,
-			return_dict=False,
-			init_cache=True,
-		)
-		return init_variables["cache"]
+			init_variables = self.module.init(
+				jax.random.PRNGKey(0),
+				input_ids=input_ids,
+				attention_mask=attention_mask,
+				return_dict=False,
+				init_cache=True,
+			)
+			return init_variables["cache"]
+
+		return jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), jax.eval_shape(init_fn))
 
 	def init_weights(
 		self,
@@ -839,7 +841,7 @@ class FlaxMptForCausalLMModule(nn.Module):
 			)
 		else:
 			logits = self.lm_head(last_hidden_state)
-		
+
 		if return_dict:
 			return FlaxCausalLMOutput(logits=logits, hidden_states=predict.hidden_states)
 		return logits, predict.hidden_states if output_hidden_states else (logits,)
