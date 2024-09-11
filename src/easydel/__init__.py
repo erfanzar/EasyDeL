@@ -33,6 +33,7 @@ if bool(
 	_os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 	_os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "1.0"
 	_os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+	_os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
 
 # EasyDel Imports

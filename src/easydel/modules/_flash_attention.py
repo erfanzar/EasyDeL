@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,16 +14,22 @@
 
 # Implementation based on FlashAttention 2 (https://arxiv.org/pdf/2307.08691) by @erfanzar,
 # with a few bug fixes and adjustments.
+
 import functools
 import math
 from typing import Optional
 
+import flax
+import flax.linen
 import jax
 import jax.numpy as jnp
-import jax.random
+import jax.random as jrand
 import jax.sharding
 from fjformer.sharding import with_sharding_constraint
+from fjformer import GenerateRNG
 from jax import lax
+
+rng = GenerateRNG()
 
 
 @functools.partial(
@@ -222,7 +227,7 @@ def _fwd_flash_attn(
 		o_i = jax.lax.dynamic_slice_in_dim(o, i * q_block, q_block, 2)
 		lse_i = jax.lax.dynamic_slice_in_dim(lse, i * q_block, q_block, 2)
 		m_i = jnp.full((b, h, q_block), fill_value=-jnp.inf, dtype=dtype)
- 
+
 		@functools.partial(jax.named_call, name="_fwd_flash_attn_call_o_call_qk")
 		def call_qk(state):
 			i, j, o_i, q_i, lse_i, m_i = state
@@ -398,9 +403,8 @@ def _bwd_flash_attn(
 				mask = jnp.broadcast_to(mask, p_ij.shape)
 				p_ij = lax.select(mask, p_ij / keep_prob, jnp.zeros_like(p_ij))
 
-			dV_j = dV_j + jnp.einsum(
-				"...nm,...mk->...nk",
-				p_ij,
+			dV_j = dV_j + jnp.matmul(
+				p_ij.transpose(0, 1, 3, 2),
 				dO_i,
 				precision=precision,
 			)
@@ -411,7 +415,9 @@ def _bwd_flash_attn(
 				v_j,
 				precision=precision,
 			)
+
 			dS_ij = p_ij * (dP_ij - D_i[..., None])
+
 			dQ_i = dQ_i + jnp.einsum(
 				"...id,...dj->...ij",
 				dS_ij,
@@ -455,7 +461,88 @@ def _bwd_flash_attn(
 		call_o,
 		(0, dQ, dK, dV),
 	)
+
 	return dQ, dK, dV, None, None
 
 
 _flash_attn.defvjp(_fwd_flash_attn, _bwd_flash_attn)
+
+
+def fwd_test():
+	b, h, qs, s, d = 1, 8, 32, 32, 128
+	dtype = jnp.float16
+
+	q = jrand.normal(rng.rng, shape=(b, qs, h, d), dtype=dtype)
+	k = jrand.normal(rng.rng, shape=(b, s, h, d), dtype=dtype)
+	v = jrand.normal(rng.rng, shape=(b, s, h, d), dtype=dtype)
+	b = jnp.where(
+		jrand.randint(rng.rng, shape=(b, h, qs, s), minval=0, maxval=3) > 1,
+		0,
+		jnp.finfo(dtype).min,
+	)
+
+	excepted_result = flax.linen.attention.dot_product_attention(
+		query=q,
+		key=k,
+		value=v,
+		bias=b,
+	)
+	result = flash_attention2(
+		query_state=q.transpose(0, 2, 1, 3),
+		key_state=k.transpose(0, 2, 1, 3),
+		value_state=v.transpose(0, 2, 1, 3),
+		bias=b,
+		dtype=dtype,
+		q_block=64,
+		k_block=64,
+	).transpose(0, 2, 1, 3)
+
+	print(f"PRED : {result[0,0,0,:5]}")
+	print(f"ORGN : {excepted_result[0,0,0,:5]}")
+
+	print(jnp.allclose(excepted_result, result, atol=0.125, rtol=0))
+
+
+def bwd_test():
+	b, h, qs, s, d = 1, 1, 1, 32, 64
+	dtype = jnp.float32
+
+	q = jrand.normal(rng.rng, shape=(b, qs, h, d), dtype=dtype)
+	k = jrand.normal(rng.rng, shape=(b, s, h, d), dtype=dtype)
+	v = jrand.normal(rng.rng, shape=(b, s, h, d), dtype=dtype)
+	b = jnp.where(
+		jrand.randint(rng.rng, shape=(b, h, qs, s), minval=0, maxval=3) > 1,
+		0,
+		jnp.finfo(dtype).min,
+	)
+
+	excepted_result = jax.grad(
+		lambda *x: flax.linen.attention.dot_product_attention(*x).sum()
+	)(
+		q,
+		k,
+		v,
+	)
+	result = jax.grad(
+		lambda *x: flash_attention2(
+			*x,
+			dtype=dtype,
+			q_block=qs,
+			k_block=s,
+			precision=jax.lax.Precision("HIGHEST".lower()),
+		).sum()
+	)(
+		q.transpose(0, 2, 1, 3),
+		k.transpose(0, 2, 1, 3),
+		v.transpose(0, 2, 1, 3),
+	).transpose(0, 2, 1, 3)
+
+	print(f"PRED BWD : {result[0,0,0,:5]}")
+	print(f"ORGN BWD : {excepted_result[0,0,0,:5]}")
+
+	print(jnp.allclose(excepted_result, result, atol=0.125, rtol=0))
+
+
+if __name__ == "__main__":
+	# fwd_test()
+	bwd_test()

@@ -55,8 +55,9 @@ def main():
 		q_block=32,
 		k_block=32,
 		pallas_runtime=True,
-		# attn_mechanism="pallas_flash"
+		attn_mechanism="flash_attn2",
 	)
+	
 	model = FlaxLlamaForCausalLM(
 		config=config,
 		dtype=jnp.float16,

@@ -30,7 +30,10 @@ from fjformer.functions import cross_entropy_loss_and_accuracy
 from flax.traverse_util import flatten_dict, unflatten_dict  # noqa
 from jax import numpy as jnp
 
-from easydel.etils.etils import AVAILABLE_ATTENTION_MECHANISMS
+from easydel.etils.etils import (
+	AVAILABLE_ATTENTION_MECHANISMS,
+	DEFAULT_ATTENTION_MECHANISM,
+)
 
 torch.manual_seed(42)
 
@@ -72,7 +75,7 @@ class EasyModelsTest(unittest.TestCase):
 		self.rotary_dim = 32
 		self.dtype: jax.numpy.dtype = jnp.float32
 		self.precision = jax.lax.Precision("highest")
-		self.attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "jax_flash_attn2"
+		self.attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_ATTENTION_MECHANISM
 		self.block_k: int = 32
 		self.block_q: int = 32
 		self.sequence_length = 64
