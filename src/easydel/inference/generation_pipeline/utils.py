@@ -55,8 +55,7 @@ class GenerationPipelineConfig:
 		length_penalty: float = 1.0,
 		pad_token_id: Optional[int] = None,
 		bos_token_id: Optional[int] = None,
-		eos_token_id: Optional[int] = None,
-		**kwargs,
+		eos_token_id: Optional[int] = None
 	):
 		self.max_new_tokens = max_new_tokens
 		self.temperature = temperature

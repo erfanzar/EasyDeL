@@ -609,24 +609,7 @@ class FlaxInternLM2PreTrainedModel(EDPretrainedModel):
 		    A dictionary with the following keys:
 		"""
 
-		def init_fn():
-			input_ids = jnp.ones((batch_size, max_length), dtype=jnp.int32)
-			attention_mask = jnp.ones_like(input_ids)
-			position_ids = jnp.broadcast_to(
-				jnp.arange(jnp.atleast_2d(input_ids).shape[-1]),
-				input_ids.shape,
-			)
-			init_variables = self.module.init(
-				jax.random.PRNGKey(0),
-				input_ids,
-				attention_mask,
-				position_ids,
-				return_dict=False,
-				init_cache=True,
-			)
-			return init_variables["cache"]
-
-		return jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), jax.eval_shape(init_fn))
+		return super().init_cache(batch_size=batch_size, max_length=max_length)
 
 	def __call__(
 		self,

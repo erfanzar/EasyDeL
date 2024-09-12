@@ -593,6 +593,7 @@ _gpu_flash_attn.defvjp(
 )
 
 
+@jax.named_scope("ed_flash_attention_2")
 def flash_attn2(
 	q: jax.Array,
 	k: jax.Array,
