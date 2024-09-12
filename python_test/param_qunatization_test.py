@@ -57,7 +57,7 @@ def main():
 		pallas_runtime=True,
 		attn_mechanism="flash_attn2",
 	)
-	
+
 	model = FlaxLlamaForCausalLM(
 		config=config,
 		dtype=jnp.float16,
@@ -83,7 +83,7 @@ def main():
 		tokenizer=tokenizer,
 		generation_config=GenerationPipelineConfig(
 			max_new_tokens=128,
-			temprature=0.8,
+			temperature=0.8,
 			top_p=0.95,
 			top_k=10,
 			eos_token_id=23070,
