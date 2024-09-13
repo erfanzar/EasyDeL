@@ -55,14 +55,14 @@ build-backend = "flit_core.buildapi"
 select = ["E4", "E7", "E9", "F", "B"]
 
 # 2. Avoid enforcing line-length violations and zip issue (`E501`, `B905`)
-ignore = ["E501","B905"]
+ignore = ["E501","B905","B007"]
 
 # 3. Avoid trying to fix flake8-bugbear (`B`) violations.
 unfixable = ["B"]
 
 # 4. Ignore `E402` (import violations) in all `__init__.py` files, and in selected subdirectories.
 [tool.ruff.lint.per-file-ignores]
-"__init__.py" = ["E402"]
+"__init__.py" = ["E402","F401"]
 "**/{tests,docs,tools}/*" = ["E402"]
 "python_test/*"=["E402"]
 

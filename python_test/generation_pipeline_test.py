@@ -92,13 +92,15 @@ def main():
 		),
 		parameters_are_quantized=True,
 	)
+	pipeline.jit_generate(input_ids, pipeline.params, attention_mask)
+	time_start = time.time()
 
-	time_start = None
-	for gen, token in enumerate(pipeline.generate(input_ids, attention_mask)):  # noqa: B007
-		if time_start is None:
-			time_start = time.time()
-		print(token, end="")
-	print("\nTPS : %f \n" % ((gen + 1) / (time.time() - time_start)))
+	out = pipeline.jit_generate(input_ids, pipeline.params, attention_mask)
+	print(out.sequences)
+	print(
+		"\nTPS : %f \n"
+		% ((out.current_length - input_ids.shape[-1]) / (time.time() - time_start))
+	)
 	# print("\n")
 	# print("*" * 50)
 	# for token in pipeline.generate(input_ids, attention_mask):

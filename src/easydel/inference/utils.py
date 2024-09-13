@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +14,7 @@
 
 import dataclasses
 from functools import partial
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Union, List
 
 import jax
 import jax.random
@@ -29,43 +28,43 @@ from easydel.generation.logits_process import (
 )
 
 
-class GenerationPipelineConfig:
-	"""
-	Configuration class for the text generation pipeline.
+@jax.tree_util.register_pytree_node_class
+@dataclasses.dataclass
+class vInferenceConfig:
+	max_new_tokens: int = 64
+	streaming_chunks: int = 1
+	temperature: float = 0.0
+	top_p: float = 0.95
+	top_k: int = 50
+	repetition_penalty: float = 1.0
+	length_penalty: float = 1.0
+	pad_token_id: Optional[int] = None
+	bos_token_id: Optional[int] = None
+	eos_token_id: Optional[Union[int, List[int]]] = None
+	_loop_max_tokens: Optional[int] = None
 
-	Attributes:
-	    max_new_tokens: Maximum number of tokens to generate.
-	    temperature: Temperature parameter for sampling.
-	    top_p: Top-p (nucleus) sampling threshold.
-	    top_k: Top-k sampling parameter.
-	    repetition_penalty: Penalty for repeating tokens.
-	    length_penalty: Penalty for generating longer sequences.
-	    pad_token_id: ID of the padding token.
-	    bos_token_id: ID of the beginning-of-sequence token.
-	    eos_token_id: ID of the end-of-sequence token.
-	"""
+	def __post_init__(self):
+		assert self.max_new_tokens % self.streaming_chunks == 0
+		self._loop_max_tokens = self.max_new_tokens // self.streaming_chunks
 
-	def __init__(
-		self,
-		max_new_tokens: int = 64,
-		temperature: float = 0.0,
-		top_p: float = 0.95,
-		top_k: int = 50,
-		repetition_penalty: float = 1.0,
-		length_penalty: float = 1.0,
-		pad_token_id: Optional[int] = None,
-		bos_token_id: Optional[int] = None,
-		eos_token_id: Optional[int] = None
-	):
-		self.max_new_tokens = max_new_tokens
-		self.temperature = temperature
-		self.top_p = top_p
-		self.top_k = top_k
-		self.repetition_penalty = repetition_penalty
-		self.length_penalty = length_penalty
-		self.pad_token_id = pad_token_id
-		self.bos_token_id = bos_token_id
-		self.eos_token_id = eos_token_id
+	def tree_flatten(self):
+		return (
+			self.max_new_tokens,
+			self.streaming_chunks,
+			self.temperature,
+			self.top_p,
+			self.top_k,
+			self.repetition_penalty,
+			self.length_penalty,
+			self.pad_token_id,
+			self.bos_token_id,
+			self.eos_token_id,
+			self._loop_max_tokens,
+		), {}
+
+	@classmethod
+	def tree_unflatten(cls, aux, children):
+		return cls(*children)
 
 	def __hash__(self) -> int:
 		int_hash = int(
@@ -105,27 +104,56 @@ class GenerationPipelineConfig:
 	__str__ = __repr__
 
 
-class _DynamicGenerationConfig:
+class GenerationPipelineConfig:
 	"""
-	Dynamic configuration class for the text generation pipeline.
-
-	This class holds the subset of generation parameters that can be
-	dynamically updated during the generation process.
+	Configuration class for the text generation pipeline.
 
 	Attributes:
+	    max_new_tokens: Maximum number of tokens to generate.
 	    temperature: Temperature parameter for sampling.
-	    top_k: Top-k sampling parameter.
 	    top_p: Top-p (nucleus) sampling threshold.
+	    top_k: Top-k sampling parameter.
 	    repetition_penalty: Penalty for repeating tokens.
 	    length_penalty: Penalty for generating longer sequences.
+	    pad_token_id: ID of the padding token.
+	    bos_token_id: ID of the beginning-of-sequence token.
+	    eos_token_id: ID of the end-of-sequence token.
 	"""
 
-	def __init__(self, config):
-		self.temperature = config.temperature
-		self.top_k = config.top_k
-		self.top_p = config.top_p
-		self.repetition_penalty = config.repetition_penalty
-		self.length_penalty = config.length_penalty
+	def __init__(
+		self,
+		max_new_tokens: int = 64,
+		temperature: float = 0.0,
+		top_p: float = 0.95,
+		top_k: int = 50,
+		repetition_penalty: float = 1.0,
+		length_penalty: float = 1.0,
+		pad_token_id: Optional[int] = None,
+		bos_token_id: Optional[int] = None,
+		eos_token_id: Optional[int] = None,
+	):
+		self.max_new_tokens = max_new_tokens
+		self.temperature = temperature
+		self.top_p = top_p
+		self.top_k = top_k
+		self.repetition_penalty = repetition_penalty
+		self.length_penalty = length_penalty
+		self.pad_token_id = pad_token_id
+		self.bos_token_id = bos_token_id
+		self.eos_token_id = eos_token_id
+
+	def __hash__(self) -> int:
+		int_hash = int(
+			(
+				"---".join(
+					str(cu) for cu in self.__dict__.values() if isinstance(cu, (float, int))
+				)
+			)
+			.replace("---", "")
+			.replace(".", "")
+		)
+
+		return int_hash
 
 	def __repr__(self):
 		"""
