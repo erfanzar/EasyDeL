@@ -31,12 +31,11 @@ from jax.experimental.serialize_executable import deserialize_and_load, serializ
 from jax.sharding import NamedSharding, PartitionSpec
 
 from easydel.etils.etils import AVAILABLE_SPARSE_MODULE_TYPES, get_logger
-from easydel.inference.generation_pipeline import utils as inference_utils
+from easydel.inference import utils as inference_utils
 from easydel.modules.flax_modeling_utils import apply_sparsity_to_params
 from easydel.modules.modeling_utils import EDPretrainedModel
 
 GenerationPipelineConfig = inference_utils.GenerationPipelineConfig
-_DynamicGenerationConfig = inference_utils._DynamicGenerationConfig
 logger = get_logger(__name__)
 
 
@@ -148,7 +147,6 @@ class GenerationPipeline:
 			self.generation_config.eos_token_id = tokenizer.eos_token_id
 		if self.generation_config.bos_token_id is None:
 			self.generation_config.bos_token_id = tokenizer.bos_token_id
-		self.dynamic_generation_config = _DynamicGenerationConfig(self.generation_config)
 		assert self.generation_config.pad_token_id is not None, (
 			"`pad_token_id` cannot be None. "
 			"(Set `tokenizer.pad_token_id = tokenizer.eos_token_id` if undefined)"
@@ -397,22 +395,6 @@ class GenerationPipeline:
 				),
 			),
 		)
-
-	def update_generation_config(self, **kwargs):
-		"""
-		Updates the dynamic generation configuration.
-
-		Args:
-		    **kwargs: Keyword arguments for updating the configuration.
-
-		Raises:
-		    AttributeError: If an invalid configuration key is provided.
-		"""
-		for key, value in kwargs.items():
-			if hasattr(self.dynamic_generation_config, key):
-				setattr(self.dynamic_generation_config, key, value)
-			else:
-				raise AttributeError(f"DynamicGenerationConfig has no attribute '{key}'")
 
 	def compile_sampling_function(
 		self,
