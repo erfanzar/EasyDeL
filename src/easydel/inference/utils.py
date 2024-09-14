@@ -41,11 +41,11 @@ class vInferenceConfig:
 	pad_token_id: Optional[int] = None
 	bos_token_id: Optional[int] = None
 	eos_token_id: Optional[Union[int, List[int]]] = None
-	_loop_max_tokens: Optional[int] = None
+	_loop_rows: Optional[int] = None
 
 	def __post_init__(self):
 		assert self.max_new_tokens % self.streaming_chunks == 0
-		self._loop_max_tokens = self.max_new_tokens // self.streaming_chunks
+		self._loop_rows = self.max_new_tokens // self.streaming_chunks
 
 	def tree_flatten(self):
 		return (
@@ -59,7 +59,7 @@ class vInferenceConfig:
 			self.pad_token_id,
 			self.bos_token_id,
 			self.eos_token_id,
-			self._loop_max_tokens,
+			self._loop_rows,
 		), {}
 
 	@classmethod

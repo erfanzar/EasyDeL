@@ -42,18 +42,19 @@ def main():
 	tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B")
 	tokenizer.padding_side = "left"
 	tokenizer.pad_token = tokenizer.eos_token
-	max_position_embeddings = 512
+	max_position_embeddings = 4096
+	max_new_tokens = 2048
 	config = LlamaConfig(
 		hidden_size=512,
 		intermediate_size=1024,
 		num_hidden_layers=4,
-		max_position_embeddings=max_position_embeddings + 128,
+		max_position_embeddings=max_position_embeddings + max_new_tokens,
 		use_scan_mlp=False,
 		axis_dims=(1, -1, 1, 1),
 		quantize_kv_cache=True,
 		use_sharded_kv_caching=False,
 		q_block=32,
-		k_block=32,
+		k_block=64,
 		pallas_runtime=True,
 		attn_mechanism="flash_attn2",
 	)
@@ -82,19 +83,19 @@ def main():
 		params=params,
 		tokenizer=tokenizer,
 		generation_config=vInferenceConfig(
-			max_new_tokens=128,
+			max_new_tokens=max_new_tokens,
 			temperature=0.8,
 			top_p=0.95,
 			top_k=10,
 			eos_token_id=23070,
 			length_penalty=1.2,
 			repetition_penalty=1.2,
-			streaming_chunks=32,
+			streaming_chunks=max_new_tokens,
 		),
 	)
-	[_ for _ in engine.generate(input_ids=input_ids, attention_mask=attention_mask)]
+	engine.precompile(*input_ids.shape)
 	start = time.time()
-	
+
 	for res in engine.generate(input_ids=input_ids, attention_mask=attention_mask):
 		...
 	time_spent = time.time() - start
