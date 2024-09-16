@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -138,36 +137,6 @@ class Conv1D(nn.Module):
 				f" but input has shape {x.shape}.",
 			)
 
-		# def rava_run(input_rava):
-		#     input_rava = jnp.expand_dims(input_rava, 0)
-		#     input_rava = lax.conv_general_dilated(
-		#         lhs=input_rava,
-		#         rhs=jnp.asarray(kernel, dtype=self.dtype),
-		#         window_strides=stride,
-		#         padding=padding,
-		#         rhs_dilation=dilation,
-		#         feature_group_count=self.groups,
-		#     )
-		#     input_rava = jnp.squeeze(input_rava, axis=0)
-		#     if self.use_bias:
-		#         bias = self.param(
-		#             "bias",
-		#             nn.initializers.zeros_init(),
-		#             (self.features,) + (1,) * self.num_spatial_dims,
-		#             self.param_dtype
-		#         )
-		#         input_rava = input_rava + jnp.asarray(bias, dtype=self.dtype)
-		#     return input_rava
-
-		# return nn.vmap(
-		#     rava_run,
-		#     in_axes=0,
-		#     out_axes=0,
-		#     variable_axes={"params": 0},
-		#     split_rngs={"params": False}
-		# )(x)
-
-		# x = jnp.expand_dims(x, 0)
 		x = lax.conv_general_dilated(
 			lhs=x,
 			rhs=jnp.asarray(kernel, dtype=self.dtype),
@@ -428,16 +397,6 @@ class FlaxMambaMixer(nn.Module):
 		time_step_rank = config.time_step_rank
 
 		self.conv1d = Conv1D(
-			# features=config.intermediate_size,
-			# kernel_size=(config.conv_kernel,),
-			# feature_group_count=config.intermediate_size,
-			# padding="SAME",
-			# strides=(1,),
-			# dtype=self.dtype,
-			# param_dtype=self.param_dtype,
-			# precision=self.precision,
-			# use_bias=config.use_conv_bias,
-			# #  ---- # #
 			features=config.intermediate_size,
 			kernel_size=config.conv_kernel,
 			groups=config.intermediate_size,
