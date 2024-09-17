@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,23 +13,13 @@
 # limitations under the License.
 
 from easydel.modules.dbrx.dbrx_configuration import (
-	DbrxAttentionConfig as DbrxAttentionConfig,
-)
-from easydel.modules.dbrx.dbrx_configuration import (
-	DbrxConfig as DbrxConfig,
-)
-from easydel.modules.dbrx.dbrx_configuration import (
-	DbrxFFNConfig as DbrxFFNConfig,
+	DbrxAttentionConfig,
+	DbrxConfig,
+	DbrxFFNConfig,
 )
 from easydel.modules.dbrx.modelling_dbrx_flax import (
-	FlaxDbrxForCausalLM as FlaxDbrxForCausalLM,
-)
-from easydel.modules.dbrx.modelling_dbrx_flax import (
-	FlaxDbrxForCausalLMModule as FlaxDbrxForCausalLMModule,
-)
-from easydel.modules.dbrx.modelling_dbrx_flax import (
-	FlaxDbrxModel as FlaxDbrxModel,
-)
-from easydel.modules.dbrx.modelling_dbrx_flax import (
-	FlaxDbrxModule as FlaxDbrxModule,
+	FlaxDbrxForCausalLM,
+	FlaxDbrxForCausalLMModule,
+	FlaxDbrxModel,
+	FlaxDbrxModule,
 )

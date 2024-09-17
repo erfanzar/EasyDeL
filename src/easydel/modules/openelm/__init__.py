@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,15 +13,9 @@
 # limitations under the License.
 
 from easydel.modules.openelm.modelling_openelm_flax import (
-	FlaxOpenELMForCausalLM as FlaxOpenELMForCausalLM,
+	FlaxOpenELMForCausalLM,
+	FlaxOpenELMForCausalLMModule,
+	FlaxOpenELMModel,
+	FlaxOpenELMModule,
 )
-from easydel.modules.openelm.modelling_openelm_flax import (
-	FlaxOpenELMForCausalLMModule as FlaxOpenELMForCausalLMModule,
-)
-from easydel.modules.openelm.modelling_openelm_flax import (
-	FlaxOpenELMModel as FlaxOpenELMModel,
-)
-from easydel.modules.openelm.modelling_openelm_flax import (
-	FlaxOpenELMModule as FlaxOpenELMModule,
-)
-from easydel.modules.openelm.openelm_configuration import OpenELMConfig as OpenELMConfig
+from easydel.modules.openelm.openelm_configuration import OpenELMConfig

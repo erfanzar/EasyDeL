@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,18 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.lucid_transformer.lt_configuration import (
-	FlaxLTConfig as FlaxLTConfig,
-)
+from easydel.modules.lucid_transformer.lt_configuration import FlaxLTConfig
 from easydel.modules.lucid_transformer.modelling_lt_flax import (
-	FlaxLTForCausalLM as FlaxLTForCausalLM,
-)
-from easydel.modules.lucid_transformer.modelling_lt_flax import (
-	FlaxLTForCausalLMModule as FlaxLTForCausalLMModule,
-)
-from easydel.modules.lucid_transformer.modelling_lt_flax import (
-	FlaxLTModel as FlaxLTModel,
-)
-from easydel.modules.lucid_transformer.modelling_lt_flax import (
-	FlaxLTModule as FlaxLTModule,
+	FlaxLTForCausalLM,
+	FlaxLTForCausalLMModule,
+	FlaxLTModel,
+	FlaxLTModule,
 )

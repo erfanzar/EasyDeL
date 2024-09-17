@@ -12,5 +12,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.inference.vinference.engine import vInference as vInference
-from easydel.inference.vinference.engine import vInferenceConfig as vInferenceConfig
+from easydel.inference.vinference.engine import vInference
+from easydel.inference.vinference.engine import vInferenceConfig

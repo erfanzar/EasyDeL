@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,8 +13,6 @@
 # limitations under the License.
 
 from easydel.trainers.vision_causal_language_model_trainer.vision_causal_language_model_trainer import (
-	VisionCausalLanguageModelTrainer as VisionCausalLanguageModelTrainer,
-)
-from easydel.trainers.vision_causal_language_model_trainer.vision_causal_language_model_trainer import (
-	VisionCausalLMTrainerOutput as VisionCausalLMTrainerOutput,
+	VisionCausalLanguageModelTrainer,
+	VisionCausalLMTrainerOutput,
 )

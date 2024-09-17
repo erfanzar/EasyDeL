@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,28 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.llama.llama_configuration import LlamaConfig as LlamaConfig
+from easydel.modules.llama.llama_configuration import LlamaConfig
 from easydel.modules.llama.modeling_llama_flax import (
-	FlaxLlamaForCausalLM as FlaxLlamaForCausalLM,
+	FlaxLlamaForCausalLM,
+	FlaxLlamaForCausalLMModule,
+	FlaxLlamaForSequenceClassification,
+	FlaxLlamaForSequenceClassificationModule,
+	FlaxLlamaModel,
+	FlaxLlamaModule,
 )
-from easydel.modules.llama.modeling_llama_flax import (
-	FlaxLlamaForCausalLMModule as FlaxLlamaForCausalLMModule,
-)
-from easydel.modules.llama.modeling_llama_flax import (
-	FlaxLlamaForSequenceClassification as FlaxLlamaForSequenceClassification,
-)
-from easydel.modules.llama.modeling_llama_flax import (
-	FlaxLlamaForSequenceClassificationModule as FlaxLlamaForSequenceClassificationModule,
-)
-from easydel.modules.llama.modeling_llama_flax import (
-	FlaxLlamaModel as FlaxLlamaModel,
-)
-from easydel.modules.llama.modeling_llama_flax import (
-	FlaxLlamaModule as FlaxLlamaModule,
-)
-from easydel.modules.llama.modeling_vision_llama_flax import (
-	FlaxVisionLlamaForCausalLM as FlaxVisionLlamaForCausalLM,
-)
-from easydel.modules.llama.vision_llama_configuration import (
-	VisionLlamaConfig as VisionLlamaConfig,
-)
+from easydel.modules.llama.modeling_vision_llama_flax import FlaxVisionLlamaForCausalLM
+from easydel.modules.llama.vision_llama_configuration import VisionLlamaConfig

@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,16 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.gpt_j.gpt_j_configuration import GPTJConfig as GPTJConfig
+from easydel.modules.gpt_j.gpt_j_configuration import GPTJConfig
 from easydel.modules.gpt_j.modeling_gpt_j_flax import (
-	FlaxGPTJForCausalLM as FlaxGPTJForCausalLM,
-)
-from easydel.modules.gpt_j.modeling_gpt_j_flax import (
-	FlaxGPTJForCausalLMModule as FlaxGPTJForCausalLMModule,
-)
-from easydel.modules.gpt_j.modeling_gpt_j_flax import (
-	FlaxGPTJModel as FlaxGPTJModel,
-)
-from easydel.modules.gpt_j.modeling_gpt_j_flax import (
-	FlaxGPTJModule as FlaxGPTJModule,
+	FlaxGPTJForCausalLM,
+	FlaxGPTJForCausalLMModule,
+	FlaxGPTJModel,
+	FlaxGPTJModule,
 )

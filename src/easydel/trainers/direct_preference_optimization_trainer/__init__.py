@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,8 +13,6 @@
 # limitations under the License.
 
 from easydel.trainers.direct_preference_optimization_trainer.dpo_trainer import (
-	DPOTrainer as DPOTrainer,
-)
-from easydel.trainers.direct_preference_optimization_trainer.dpo_trainer import (
-	DPOTrainerOutput as DPOTrainerOutput,
+	DPOTrainer,
+	DPOTrainerOutput,
 )

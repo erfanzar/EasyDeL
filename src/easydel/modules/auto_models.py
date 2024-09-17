@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -200,6 +199,12 @@ CAUSAL_LANGUAGE_MODELS_CONFIG: Dict[str, Tuple[str, str, str, Dict[str, Any]]] =
 		"easydel.modules.mamba",
 		"MambaConfig",
 		"FlaxMambaForCausalLM",
+		{"embedding_layer_names": ["embeddings"]},
+	),
+	"mamba2": (
+		"easydel.modules.mamba2",
+		"Mamba2Config",
+		"FlaxMamba2ForCausalLM",
 		{"embedding_layer_names": ["embeddings"]},
 	),
 	"grok-1": (

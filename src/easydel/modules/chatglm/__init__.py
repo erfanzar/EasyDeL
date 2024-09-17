@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,10 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.chatglm.chatglm_configuration import ChatGLMConfig as ChatGLMConfig
+from easydel.modules.chatglm.chatglm_configuration import ChatGLMConfig
 from easydel.modules.chatglm.modelling_chatglm_flax import (
-	FlaxChatGLMModel as FlaxChatGLMModel,
-)
-from easydel.modules.chatglm.modelling_chatglm_flax import (
-	FlaxChatGLMTransformer as FlaxChatGLMTransformer,
+	FlaxChatGLMModel,
+	FlaxChatGLMTransformer,
 )

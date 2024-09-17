@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,21 +13,11 @@
 # limitations under the License.
 
 from easydel.modules.qwen2.modeling_qwen_flax import (
-	FlaxQwen2ForCausalLM as FlaxQwen2ForCausalLM,
+	FlaxQwen2ForCausalLM,
+	FlaxQwen2ForCausalLMModule,
+	FlaxQwen2ForSequenceClassification,
+	FlaxQwen2ForSequenceClassificationModule,
+	FlaxQwen2Model,
+	FlaxQwen2Module,
 )
-from easydel.modules.qwen2.modeling_qwen_flax import (
-	FlaxQwen2ForCausalLMModule as FlaxQwen2ForCausalLMModule,
-)
-from easydel.modules.qwen2.modeling_qwen_flax import (
-	FlaxQwen2ForSequenceClassification as FlaxQwen2ForSequenceClassification,
-)
-from easydel.modules.qwen2.modeling_qwen_flax import (
-	FlaxQwen2ForSequenceClassificationModule as FlaxQwen2ForSequenceClassificationModule,
-)
-from easydel.modules.qwen2.modeling_qwen_flax import (
-	FlaxQwen2Model as FlaxQwen2Model,
-)
-from easydel.modules.qwen2.modeling_qwen_flax import (
-	FlaxQwen2Module as FlaxQwen2Module,
-)
-from easydel.modules.qwen2.qwen_configuration import Qwen2Config as Qwen2Config
+from easydel.modules.qwen2.qwen_configuration import Qwen2Config

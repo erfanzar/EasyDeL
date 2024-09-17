@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,15 +13,9 @@
 # limitations under the License.
 
 from easydel.modules.rwkv.modelling_rwkv_flax import (
-	FlaxRwkvForCausalLM as FlaxRwkvForCausalLM,
+	FlaxRwkvForCausalLM,
+	FlaxRwkvForCausalLMModule,
+	FlaxRwkvModel,
+	FlaxRwkvModule,
 )
-from easydel.modules.rwkv.modelling_rwkv_flax import (
-	FlaxRwkvForCausalLMModule as FlaxRwkvForCausalLMModule,
-)
-from easydel.modules.rwkv.modelling_rwkv_flax import (
-	FlaxRwkvModel as FlaxRwkvModel,
-)
-from easydel.modules.rwkv.modelling_rwkv_flax import (
-	FlaxRwkvModule as FlaxRwkvModule,
-)
-from easydel.modules.rwkv.rwkv_configuration import RwkvConfig as RwkvConfig
+from easydel.modules.rwkv.rwkv_configuration import RwkvConfig

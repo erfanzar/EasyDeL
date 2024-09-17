@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,17 +13,9 @@
 # limitations under the License.
 
 from easydel.modules.stablelm.modelling_stablelm_flax import (
-	FlaxStableLmForCausalLM as FlaxStableLmForCausalLM,
+	FlaxStableLmForCausalLM,
+	FlaxStableLmForCausalLMModule,
+	FlaxStableLmModel,
+	FlaxStableLmModule,
 )
-from easydel.modules.stablelm.modelling_stablelm_flax import (
-	FlaxStableLmForCausalLMModule as FlaxStableLmForCausalLMModule,
-)
-from easydel.modules.stablelm.modelling_stablelm_flax import (
-	FlaxStableLmModel as FlaxStableLmModel,
-)
-from easydel.modules.stablelm.modelling_stablelm_flax import (
-	FlaxStableLmModule as FlaxStableLmModule,
-)
-from easydel.modules.stablelm.stablelm_configuration import (
-	StableLmConfig as StableLmConfig,
-)
+from easydel.modules.stablelm.stablelm_configuration import StableLmConfig

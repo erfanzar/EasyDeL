@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,21 +13,11 @@
 # limitations under the License.
 
 from easydel.modules.roberta.modelling_roberta_flax import (
-	FlaxRobertaForCausalLM as FlaxRobertaForCausalLM,
+	FlaxRobertaForCausalLM,
+	FlaxRobertaForMaskedLMModule,
+	FlaxRobertaForMultipleChoice,
+	FlaxRobertaForQuestionAnswering,
+	FlaxRobertaForSequenceClassification,
+	FlaxRobertaForTokenClassification,
 )
-from easydel.modules.roberta.modelling_roberta_flax import (
-	FlaxRobertaForMaskedLMModule as FlaxRobertaForMaskedLMModule,
-)
-from easydel.modules.roberta.modelling_roberta_flax import (
-	FlaxRobertaForMultipleChoice as FlaxRobertaForMultipleChoice,
-)
-from easydel.modules.roberta.modelling_roberta_flax import (
-	FlaxRobertaForQuestionAnswering as FlaxRobertaForQuestionAnswering,
-)
-from easydel.modules.roberta.modelling_roberta_flax import (
-	FlaxRobertaForSequenceClassification as FlaxRobertaForSequenceClassification,
-)
-from easydel.modules.roberta.modelling_roberta_flax import (
-	FlaxRobertaForTokenClassification as FlaxRobertaForTokenClassification,
-)
-from easydel.modules.roberta.roberta_configuration import RobertaConfig as RobertaConfig
+from easydel.modules.roberta.roberta_configuration import RobertaConfig

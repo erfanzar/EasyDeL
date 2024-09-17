@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,11 +13,7 @@
 # limitations under the License.
 
 from easydel.inference.generation_pipeline.pipeline import (
-	ChatPipeline as ChatPipeline,
-)
-from easydel.inference.generation_pipeline.pipeline import (
-	GenerationPipeline as GenerationPipeline,
-)
-from easydel.inference.generation_pipeline.pipeline import (
-	GenerationPipelineConfig as GenerationPipelineConfig,
+	ChatPipeline,
+	GenerationPipeline,
+	GenerationPipelineConfig,
 )

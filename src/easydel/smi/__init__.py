@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,15 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.smi.smi import (
-	get_capacity_matrix as get_capacity_matrix,
-)
-from easydel.smi.smi import (
-	get_mem as get_mem,
-)
-from easydel.smi.smi import (
-	initialise_tracking as initialise_tracking,
-)
-from easydel.smi.smi import (
-	run as run,
-)
+from easydel.smi.smi import get_capacity_matrix, get_mem, initialise_tracking, run

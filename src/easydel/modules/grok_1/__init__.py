@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,16 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.grok_1.grok_1_configuration import Grok1Config as Grok1Config
+from easydel.modules.grok_1.grok_1_configuration import Grok1Config
 from easydel.modules.grok_1.modeling_grok_1_flax import (
-	FlaxGrok1ForCausalLM as FlaxGrok1ForCausalLM,
-)
-from easydel.modules.grok_1.modeling_grok_1_flax import (
-	FlaxGrok1ForCausalLMModule as FlaxGrok1ForCausalLMModule,
-)
-from easydel.modules.grok_1.modeling_grok_1_flax import (
-	FlaxGrok1Model as FlaxGrok1Model,
-)
-from easydel.modules.grok_1.modeling_grok_1_flax import (
-	FlaxGrok1Module as FlaxGrok1Module,
+	FlaxGrok1ForCausalLM,
+	FlaxGrok1ForCausalLMModule,
+	FlaxGrok1Model,
+	FlaxGrok1Module,
 )
