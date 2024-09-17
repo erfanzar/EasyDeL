@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,15 +13,9 @@
 # limitations under the License.
 
 from easydel.modules.phi.modelling_phi_flax import (
-	FlaxPhiForCausalLM as FlaxPhiForCausalLM,
+	FlaxPhiForCausalLM,
+	FlaxPhiForCausalLMModule,
+	FlaxPhiModel,
+	FlaxPhiModule,
 )
-from easydel.modules.phi.modelling_phi_flax import (
-	FlaxPhiForCausalLMModule as FlaxPhiForCausalLMModule,
-)
-from easydel.modules.phi.modelling_phi_flax import (
-	FlaxPhiModel as FlaxPhiModel,
-)
-from easydel.modules.phi.modelling_phi_flax import (
-	FlaxPhiModule as FlaxPhiModule,
-)
-from easydel.modules.phi.phi_configuration import PhiConfig as PhiConfig
+from easydel.modules.phi.phi_configuration import PhiConfig

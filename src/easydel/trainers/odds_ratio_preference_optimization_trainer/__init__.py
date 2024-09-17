@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,8 +13,6 @@
 # limitations under the License.
 
 from easydel.trainers.odds_ratio_preference_optimization_trainer.orpo_trainer import (
-	ORPOTrainer as ORPOTrainer,
-)
-from easydel.trainers.odds_ratio_preference_optimization_trainer.orpo_trainer import (
-	ORPOTrainerOutput as ORPOTrainerOutput,
+	ORPOTrainer,
+	ORPOTrainerOutput,
 )

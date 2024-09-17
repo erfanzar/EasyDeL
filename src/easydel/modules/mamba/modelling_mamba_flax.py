@@ -1000,3 +1000,4 @@ class FlaxMambaForCausalLM(FlaxMambaPretrainedModel):
 
 	def prepare_inputs_for_generation(self, input_ids, max_length, **kwargs):
 		return {"cache_params": kwargs.get("cache_params", None)}
+ 

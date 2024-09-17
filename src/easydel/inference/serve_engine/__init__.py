@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,6 +13,6 @@
 # limitations under the License.
 
 from easydel.inference.serve_engine import client as engine_client
-from easydel.inference.serve_engine.serve import ApiEngine as ApiEngine
+from easydel.inference.serve_engine.serve import ApiEngine
 
 engine_client = engine_client  # Ide will find this one here

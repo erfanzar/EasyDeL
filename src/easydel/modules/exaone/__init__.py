@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,16 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.exaone.exaone_configuration import ExaoneConfig as ExaoneConfig
+from easydel.modules.exaone.exaone_configuration import ExaoneConfig
 from easydel.modules.exaone.modeling_exaone_flax import (
-	FlaxExaoneForCausalLM as FlaxExaoneForCausalLM,
-)
-from easydel.modules.exaone.modeling_exaone_flax import (
-	FlaxExaoneForCausalLMModule as FlaxExaoneForCausalLMModule,
-)
-from easydel.modules.exaone.modeling_exaone_flax import (
-	FlaxExaoneModel as FlaxExaoneModel,
-)
-from easydel.modules.exaone.modeling_exaone_flax import (
-	FlaxExaoneModule as FlaxExaoneModule,
+	FlaxExaoneForCausalLM,
+	FlaxExaoneForCausalLMModule,
+	FlaxExaoneModel,
+	FlaxExaoneModule,
 )

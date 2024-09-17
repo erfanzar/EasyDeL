@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,15 +13,9 @@
 # limitations under the License.
 
 from easydel.modules.xerxes.modeling_xerxes_flax import (
-	FlaxXerxesForCausalLM as FlaxXerxesForCausalLM,
+	FlaxXerxesForCausalLM,
+	FlaxXerxesForCausalLMModule,
+	FlaxXerxesModel,
+	FlaxXerxesModule,
 )
-from easydel.modules.xerxes.modeling_xerxes_flax import (
-	FlaxXerxesForCausalLMModule as FlaxXerxesForCausalLMModule,
-)
-from easydel.modules.xerxes.modeling_xerxes_flax import (
-	FlaxXerxesModel as FlaxXerxesModel,
-)
-from easydel.modules.xerxes.modeling_xerxes_flax import (
-	FlaxXerxesModule as FlaxXerxesModule,
-)
-from easydel.modules.xerxes.xerxes_configuration import XerxesConfig as XerxesConfig
+from easydel.modules.xerxes.xerxes_configuration import XerxesConfig

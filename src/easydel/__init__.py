@@ -191,6 +191,14 @@ from easydel.modules.mamba import (
 	FlaxMambaModule,
 	MambaConfig,
 )
+from easydel.modules.mamba2 import (
+	FlaxMamba2Cache,
+	FlaxMamba2ForCausalLM,
+	FlaxMamba2ForCausalLMModule,
+	FlaxMamba2Model,
+	FlaxMamba2Module,
+	Mamba2Config,
+)
 from easydel.modules.mistral import (
 	FlaxMistralForCausalLM,
 	FlaxMistralForCausalLMModule,

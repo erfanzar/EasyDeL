@@ -64,8 +64,6 @@ class Mamba2Config(EDPretrainedConfig):
 	        The minimum value for the time step embedding.
 	    time_step_max (`float`, *optional*, defaults to 0.1):
 	        The maximum value for the time step embedding.
-	    time_step_init_scheme (`str`, *optional*, defaults to `"random"`):
-	        The initialization scheme for the time step embedding. Possible values are `"random"` and `"uniform"`.
 	    time_step_floor (`float`, *optional*, defaults to 1e-4):
 	        The floor value for the time step embedding.
 	    rescale_prenorm_residual (`bool`, *optional*, defaults to `False`):
@@ -147,6 +145,7 @@ class Mamba2Config(EDPretrainedConfig):
 		self.time_step_limit = time_step_limit
 		self.tie_word_embeddings = tie_word_embeddings
 		self.gradient_checkpointing = gradient_checkpointing
+		self.intermediate_size = int(expand * hidden_size)
 		super().__init__(**kwargs)
 
 	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):

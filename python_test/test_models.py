@@ -559,8 +559,17 @@ class EasyModelsTest(unittest.TestCase):
 	def test_mamba(self):
 		self.header_config = None
 		res, err = self.create_test_for_models("mamba", transformers.MambaForCausalLM)
-
 		self.assertTrue(res, f"MAMBA model Failed [ERROR {err}]")
+
+	def test_mamba2(self):
+		self.header_config = ed.Mamba2Config(
+			hidden_size=256,
+			num_hidden_layers=16,
+			num_heads=8,
+		)
+		res, err = self.create_test_for_models("mamba2", transformers.Mamba2ForCausalLM)
+		self.assertTrue(res, f"Mamba 2 model Failed [ERROR {err}]")
+		self.header_config = None
 
 	def test_cohere(self):
 		self.header_config = None
@@ -690,6 +699,7 @@ if __name__ == "__main__":
 	# unittest.main()
 	test = EasyModelsTest()
 	test.setUp()
+	test.test_mamba2()
 	# test.test_arctic() # Passed v0.0.80 - P Runtime
 	# test.test_cohere()  # Passed v0.0.80 - P Runtime
 	# test.test_dbrx()  # Passed  v0.0.80 - P Runtime

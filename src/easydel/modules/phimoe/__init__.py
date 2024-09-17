@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,15 +13,9 @@
 # limitations under the License.
 
 from easydel.modules.phimoe.modeling_phimoe_flax import (
-	FlaxPhiMoeForCausalLM as FlaxPhiMoeForCausalLM,
+	FlaxPhiMoeForCausalLM,
+	FlaxPhiMoeForCausalLMModule,
+	FlaxPhiMoeModel,
+	FlaxPhiMoeModule,
 )
-from easydel.modules.phimoe.modeling_phimoe_flax import (
-	FlaxPhiMoeForCausalLMModule as FlaxPhiMoeForCausalLMModule,
-)
-from easydel.modules.phimoe.modeling_phimoe_flax import (
-	FlaxPhiMoeModel as FlaxPhiMoeModel,
-)
-from easydel.modules.phimoe.modeling_phimoe_flax import (
-	FlaxPhiMoeModule as FlaxPhiMoeModule,
-)
-from easydel.modules.phimoe.phimoe_configuration import PhiMoeConfig as PhiMoeConfig
+from easydel.modules.phimoe.phimoe_configuration import PhiMoeConfig

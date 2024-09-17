@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,15 +13,9 @@
 # limitations under the License.
 
 from easydel.modules.t5.modelling_t5_flax import (
-	FlaxT5ForConditionalGeneration as FlaxT5ForConditionalGeneration,
+	FlaxT5ForConditionalGeneration,
+	FlaxT5ForConditionalGenerationModule,
+	FlaxT5Model,
+	FlaxT5Module,
 )
-from easydel.modules.t5.modelling_t5_flax import (
-	FlaxT5ForConditionalGenerationModule as FlaxT5ForConditionalGenerationModule,
-)
-from easydel.modules.t5.modelling_t5_flax import (
-	FlaxT5Model as FlaxT5Model,
-)
-from easydel.modules.t5.modelling_t5_flax import (
-	FlaxT5Module as FlaxT5Module,
-)
-from easydel.modules.t5.t5_configuration import T5Config as T5Config
+from easydel.modules.t5.t5_configuration import T5Config

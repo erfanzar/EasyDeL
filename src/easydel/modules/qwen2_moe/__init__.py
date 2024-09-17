@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,18 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.qwen2_moe.configuration_qwen2_moe import (
-	Qwen2MoeConfig as Qwen2MoeConfig,
-)
+from easydel.modules.qwen2_moe.configuration_qwen2_moe import Qwen2MoeConfig
 from easydel.modules.qwen2_moe.modeling_qwen2_moe_flax import (
-	FlaxQwen2MoeForCausalLM as FlaxQwen2MoeForCausalLM,
-)
-from easydel.modules.qwen2_moe.modeling_qwen2_moe_flax import (
-	FlaxQwen2MoeForCausalLMModule as FlaxQwen2MoeForCausalLMModule,
-)
-from easydel.modules.qwen2_moe.modeling_qwen2_moe_flax import (
-	FlaxQwen2MoeModel as FlaxQwen2MoeModel,
-)
-from easydel.modules.qwen2_moe.modeling_qwen2_moe_flax import (
-	FlaxQwen2MoeModule as FlaxQwen2MoeModule,
+	FlaxQwen2MoeForCausalLM,
+	FlaxQwen2MoeForCausalLMModule,
+	FlaxQwen2MoeModel,
+	FlaxQwen2MoeModule,
 )

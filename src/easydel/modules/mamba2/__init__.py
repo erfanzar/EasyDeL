@@ -11,3 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from easydel.modules.mamba2.mamba2_configuration import Mamba2Config
+from easydel.modules.mamba2.modelling_mamba2_flax import (
+	FlaxMamba2Cache,
+	FlaxMamba2ForCausalLM,
+	FlaxMamba2ForCausalLMModule,
+	FlaxMamba2Model,
+	FlaxMamba2Module,
+)

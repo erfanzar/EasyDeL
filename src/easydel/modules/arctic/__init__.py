@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,16 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.arctic.arctic_configuration import ArcticConfig as ArcticConfig
+from easydel.modules.arctic.arctic_configuration import ArcticConfig
 from easydel.modules.arctic.modelling_arctic_flax import (
-	FlaxArcticForCausalLM as FlaxArcticForCausalLM,
-)
-from easydel.modules.arctic.modelling_arctic_flax import (
-	FlaxArcticForCausalLMModule as FlaxArcticForCausalLMModule,
-)
-from easydel.modules.arctic.modelling_arctic_flax import (
-	FlaxArcticModel as FlaxArcticModel,
-)
-from easydel.modules.arctic.modelling_arctic_flax import (
-	FlaxArcticModule as FlaxArcticModule,
+	FlaxArcticForCausalLM,
+	FlaxArcticForCausalLMModule,
+	FlaxArcticModel,
+	FlaxArcticModule,
 )

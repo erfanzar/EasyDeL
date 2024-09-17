@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,16 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.falcon.falcon_configuration import FalconConfig as FalconConfig
+from easydel.modules.falcon.falcon_configuration import FalconConfig
 from easydel.modules.falcon.modeling_falcon_flax import (
-	FlaxFalconForCausalLM as FlaxFalconForCausalLM,
-)
-from easydel.modules.falcon.modeling_falcon_flax import (
-	FlaxFalconForCausalLMModule as FlaxFalconForCausalLMModule,
-)
-from easydel.modules.falcon.modeling_falcon_flax import (
-	FlaxFalconModel as FlaxFalconModel,
-)
-from easydel.modules.falcon.modeling_falcon_flax import (
-	FlaxFalconModule as FlaxFalconModule,
+	FlaxFalconForCausalLM,
+	FlaxFalconForCausalLMModule,
+	FlaxFalconModel,
+	FlaxFalconModule,
 )

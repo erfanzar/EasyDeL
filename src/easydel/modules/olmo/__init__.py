@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,15 +13,9 @@
 # limitations under the License.
 
 from easydel.modules.olmo.modelling_olmo_flax import (
-	FlaxOlmoForCausalLM as FlaxOlmoForCausalLM,
+	FlaxOlmoForCausalLM,
+	FlaxOlmoForCausalLMModule,
+	FlaxOlmoModel,
+	FlaxOlmoModule,
 )
-from easydel.modules.olmo.modelling_olmo_flax import (
-	FlaxOlmoForCausalLMModule as FlaxOlmoForCausalLMModule,
-)
-from easydel.modules.olmo.modelling_olmo_flax import (
-	FlaxOlmoModel as FlaxOlmoModel,
-)
-from easydel.modules.olmo.modelling_olmo_flax import (
-	FlaxOlmoModule as FlaxOlmoModule,
-)
-from easydel.modules.olmo.olmo_configuration import OlmoConfig as OlmoConfig
+from easydel.modules.olmo.olmo_configuration import OlmoConfig

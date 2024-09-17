@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,20 +13,12 @@
 # limitations under the License.
 
 from easydel.modules.mosaic_mpt.modelling_mpt_flax import (
-	FlaxMptForCausalLM as FlaxMptForCausalLM,
-)
-from easydel.modules.mosaic_mpt.modelling_mpt_flax import (
-	FlaxMptForCausalLMModule as FlaxMptForCausalLMModule,
-)
-from easydel.modules.mosaic_mpt.modelling_mpt_flax import (
-	FlaxMptModel as FlaxMptModel,
-)
-from easydel.modules.mosaic_mpt.modelling_mpt_flax import (
-	FlaxMptModule as FlaxMptModule,
+	FlaxMptForCausalLM,
+	FlaxMptForCausalLMModule,
+	FlaxMptModel,
+	FlaxMptModule,
 )
 from easydel.modules.mosaic_mpt.mosaic_configuration import (
-	MptAttentionConfig as MptAttentionConfig,
-)
-from easydel.modules.mosaic_mpt.mosaic_configuration import (
-	MptConfig as MptConfig,
+	MptAttentionConfig,
+	MptConfig,
 )

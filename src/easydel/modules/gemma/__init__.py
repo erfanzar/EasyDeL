@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,16 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.gemma.gemma_configuration import GemmaConfig as GemmaConfig
+from easydel.modules.gemma.gemma_configuration import GemmaConfig
 from easydel.modules.gemma.modeling_gemma_flax import (
-	FlaxGemmaForCausalLM as FlaxGemmaForCausalLM,
-)
-from easydel.modules.gemma.modeling_gemma_flax import (
-	FlaxGemmaForCausalLMModule as FlaxGemmaForCausalLMModule,
-)
-from easydel.modules.gemma.modeling_gemma_flax import (
-	FlaxGemmaModel as FlaxGemmaModel,
-)
-from easydel.modules.gemma.modeling_gemma_flax import (
-	FlaxGemmaModule as FlaxGemmaModule,
+	FlaxGemmaForCausalLM,
+	FlaxGemmaForCausalLMModule,
+	FlaxGemmaModel,
+	FlaxGemmaModule,
 )

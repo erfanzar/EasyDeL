@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,18 +13,10 @@
 # limitations under the License.
 
 from easydel.modules.whisper.modelling_whisper_flax import (
-	FlaxWhisperForAudioClassification as FlaxWhisperForAudioClassification,
+	FlaxWhisperForAudioClassification,
+	FlaxWhisperForAudioClassificationModule,
+	FlaxWhisperForConditionalGeneration,
+	FlaxWhisperForConditionalGenerationModule,
+	FlaxWhisperTimeStampLogitsProcessor,
 )
-from easydel.modules.whisper.modelling_whisper_flax import (
-	FlaxWhisperForAudioClassificationModule as FlaxWhisperForAudioClassificationModule,
-)
-from easydel.modules.whisper.modelling_whisper_flax import (
-	FlaxWhisperForConditionalGeneration as FlaxWhisperForConditionalGeneration,
-)
-from easydel.modules.whisper.modelling_whisper_flax import (
-	FlaxWhisperForConditionalGenerationModule as FlaxWhisperForConditionalGenerationModule,
-)
-from easydel.modules.whisper.modelling_whisper_flax import (
-	FlaxWhisperTimeStampLogitsProcessor as FlaxWhisperTimeStampLogitsProcessor,
-)
-from easydel.modules.whisper.whisper_configuration import WhisperConfig as WhisperConfig
+from easydel.modules.whisper.whisper_configuration import WhisperConfig

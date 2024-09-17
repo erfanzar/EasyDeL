@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,15 +13,9 @@
 # limitations under the License.
 
 from easydel.modules.palm.modelling_palm_flax import (
-	FlaxPalmForCausalLM as FlaxPalmForCausalLM,
+	FlaxPalmForCausalLM,
+	FlaxPalmForCausalLMModule,
+	FlaxPalmModel,
+	FlaxPalmModule,
 )
-from easydel.modules.palm.modelling_palm_flax import (
-	FlaxPalmForCausalLMModule as FlaxPalmForCausalLMModule,
-)
-from easydel.modules.palm.modelling_palm_flax import (
-	FlaxPalmModel as FlaxPalmModel,
-)
-from easydel.modules.palm.modelling_palm_flax import (
-	FlaxPalmModule as FlaxPalmModule,
-)
-from easydel.modules.palm.palm_configuration import PalmConfig as PalmConfig
+from easydel.modules.palm.palm_configuration import PalmConfig

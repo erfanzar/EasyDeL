@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,15 +13,9 @@
 # limitations under the License.
 
 from easydel.modules.opt.modelling_opt_flax import (
-	FlaxOPTForCausalLM as FlaxOPTForCausalLM,
+	FlaxOPTForCausalLM,
+	FlaxOPTForCausalLMModule,
+	FlaxOPTModel,
+	FlaxOPTModule,
 )
-from easydel.modules.opt.modelling_opt_flax import (
-	FlaxOPTForCausalLMModule as FlaxOPTForCausalLMModule,
-)
-from easydel.modules.opt.modelling_opt_flax import (
-	FlaxOPTModel as FlaxOPTModel,
-)
-from easydel.modules.opt.modelling_opt_flax import (
-	FlaxOPTModule as FlaxOPTModule,
-)
-from easydel.modules.opt.opt_configuration import OPTConfig as OPTConfig
+from easydel.modules.opt.opt_configuration import OPTConfig

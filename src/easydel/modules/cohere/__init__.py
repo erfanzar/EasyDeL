@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,16 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.cohere.cohere_configuration import CohereConfig as CohereConfig
+from easydel.modules.cohere.cohere_configuration import CohereConfig
 from easydel.modules.cohere.modelling_cohere_flax import (
-	FlaxCohereForCausalLM as FlaxCohereForCausalLM,
-)
-from easydel.modules.cohere.modelling_cohere_flax import (
-	FlaxCohereForCausalLMModule as FlaxCohereForCausalLMModule,
-)
-from easydel.modules.cohere.modelling_cohere_flax import (
-	FlaxCohereModel as FlaxCohereModel,
-)
-from easydel.modules.cohere.modelling_cohere_flax import (
-	FlaxCohereModule as FlaxCohereModule,
+	FlaxCohereForCausalLM,
+	FlaxCohereForCausalLMModule,
+	FlaxCohereModel,
+	FlaxCohereModule,
 )
