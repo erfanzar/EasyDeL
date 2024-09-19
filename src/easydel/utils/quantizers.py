@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Literal, Optional
+from typing import Literal
 
 import chex
 from fjformer.dtypes import Array8Bit, ArrayNF4
@@ -29,11 +28,10 @@ class EasyQuantizer:
 	def __init__(
 		self,
 		quantization_method: Literal["nf4", "8bit"] = "nf4",
-		block_size: int = 256,
-		scalar_block_size: Optional[int] = None,
+		**kwargs,
 	) -> None:
-		self.scalar_block_size = scalar_block_size
-		self.block_size = block_size
+		self.scalar_block_size = 32
+		self.block_size = 128
 		self.quantization_method = quantization_method
 
 	def __call__(self, array) -> chex.Array:
@@ -41,20 +39,10 @@ class EasyQuantizer:
 			return Array8Bit.quantize(array=array)
 		elif self.quantization_method == "nf4":
 			should_be_quantized = True
-			scalar_block_size = self.scalar_block_size
-			if scalar_block_size is None:
-				scalar_block_size = float(array.size / self.block_size)
-
-				if scalar_block_size.is_integer():
-					scalar_block_size = int(scalar_block_size)
-				else:
-					should_be_quantized = True
+			if array.shape[0] % 128 != 0:
+				should_be_quantized = False
 			if array.ndim <= 2 and should_be_quantized:
-				return ArrayNF4.quantize(
-					array=array,
-					block_size=self.block_size,
-					scaler_block_size=self.scalar_block_size,
-				)
+				return ArrayNF4.quantize(array=array)
 			return array
 		else:
 			raise ValueError(f"unknown quantization_method {self.quantization_method}.")

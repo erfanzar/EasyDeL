@@ -166,10 +166,10 @@ def _compiled_generate(
 		if input_ids.shape[-1] > 1:
 			state = sampling_step(params=params, state=state)
 
-	def interval_sample(state):
-		return sampling_step(params=params, state=state)
+	# def interval_sample(state):
+	# 	return sampling_step(params=params, state=state)
 
-	state = jax.lax.while_loop(cond_fn, body_fun=interval_sample, init_val=state)
+	# state = jax.lax.while_loop(cond_fn, body_fun=interval_sample, init_val=state)
 	return state
 
 
@@ -394,18 +394,19 @@ class vInference:
 		input_ids = jnp.ones((batch_size, input_tokens_length), dtype="i4")
 		attention_mask = jnp.ones_like(input_ids)
 		position_ids = attention_mask.cumsum(axis=-1, dtype="i4") - 1
+		state = _compiled_generate(
+			model=self.model,
+			params=self.params,
+			input_ids=input_ids,
+			attention_mask=attention_mask,
+			position_ids=position_ids,
+			generation_config=self.generation_config,
+			rng=self._rng_generator.rng,
+		)
 		_compiled_interval_generate(
 			model=self.model,
 			params=self.params,
-			state=_compiled_generate(
-				model=self.model,
-				params=self.params,
-				input_ids=input_ids,
-				attention_mask=attention_mask,
-				position_ids=position_ids,
-				generation_config=self.generation_config,
-				rng=self._rng_generator.rng,
-			),
+			state=state,
 			generation_config=self.generation_config,
 			loop_max_tokens=self.generation_config.streaming_chunks,
 			start_length=input_tokens_length,
