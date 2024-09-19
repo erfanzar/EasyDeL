@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -450,7 +449,9 @@ def apply_rotary_pos_emb(tensor, sin_, cos_):
 	    A tensor with the same shape as the input tensor
 	"""
 	b, h, s, d = tensor.shape
-	return (tensor * cos_[:, :, :s, :]) + (rotate_half(tensor) * sin_[:, :, :s, :])
+	return (tensor.astype(cos_.dtype) * cos_[:, :, :s, :]) + (
+		rotate_half(tensor.astype(cos_.dtype)) * sin_[:, :, :s, :]
+	)
 
 
 def get_ranks_and_size(mesh):

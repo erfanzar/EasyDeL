@@ -61,8 +61,8 @@ def main():
 
 	model = FlaxLlamaForCausalLM(
 		config=config,
-		dtype=jnp.float16,
-		param_dtype=jnp.float16,
+		dtype=jnp.float8_e5m2,
+		param_dtype=jnp.float8_e5m2,
 		precision=lax.Precision("fastest"),
 		input_shape=(2, 2),
 		_do_init=True,
