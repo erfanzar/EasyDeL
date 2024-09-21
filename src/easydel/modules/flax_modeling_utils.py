@@ -978,7 +978,7 @@ def quantize_params(
 
 	def quantize(path, array):
 		layer_name = ".".join(path[0].key)
-		if pattern.search(layer_name):
+		if pattern.search(layer_name) and embedding_layer_name not in layer_name:
 			return quantizer(array=array)
 		return array
 
