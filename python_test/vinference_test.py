@@ -2,6 +2,9 @@ import inspect
 import os
 import sys
 
+import jax
+
+jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../src"))
 
 import time
@@ -45,8 +48,8 @@ def main():
 	max_position_embeddings = 4096
 	max_new_tokens = 2048
 	config = LlamaConfig(
-		hidden_size=512,
-		intermediate_size=1024,
+		hidden_size=128,
+		intermediate_size=256,
 		num_hidden_layers=4,
 		max_position_embeddings=max_position_embeddings + max_new_tokens,
 		use_scan_mlp=False,
@@ -55,14 +58,14 @@ def main():
 		use_sharded_kv_caching=False,
 		q_block=32,
 		k_block=64,
-		pallas_runtime=True,
-		attn_mechanism="flash_attn2",
+		# pallas_runtime=True,
+		# attn_mechanism="flash_attn2",
 	)
 
 	model = FlaxLlamaForCausalLM(
 		config=config,
-		dtype=jnp.float8_e5m2,
-		param_dtype=jnp.float8_e5m2,
+		dtype=jnp.float16,
+		param_dtype=jnp.float16,
 		precision=lax.Precision("fastest"),
 		input_shape=(2, 2),
 		_do_init=True,
@@ -77,7 +80,7 @@ def main():
 	)
 	input_ids = tokens["input_ids"]
 	attention_mask = tokens["attention_mask"]
-	params = quantize_params(model.params, method="8bit") if False else model.params
+	params = quantize_params(model.params, method="nf4") if False else model.params
 	engine = vInference(
 		model=model,
 		params=params,
@@ -87,13 +90,15 @@ def main():
 			temperature=0.8,
 			top_p=0.95,
 			top_k=10,
-			eos_token_id=23070,
+			eos_token_id=55555555555555555,
 			length_penalty=1.2,
 			repetition_penalty=1.2,
 			streaming_chunks=max_new_tokens,
 		),
 	)
+
 	engine.precompile(*input_ids.shape)
+	jax.profiler.save_device_memory_profile("mem.prof")
 	start = time.time()
 
 	for res in engine.generate(input_ids=input_ids, attention_mask=attention_mask):

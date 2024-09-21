@@ -952,8 +952,6 @@ def quantize_params(
 	params: Union[Dict[str, Any], Any],
 	method: Literal["nf4", "8bit"] = "nf4",
 	embedding_layer_name: Optional[str] = None,
-	block_size: Literal[32, 64, 128, 256, 512, 1024, 2048, 4096] = 64,
-	scalar_block_size: Optional[Literal[32, 64, 128, 256, 512, 1024, 2048, 4096]] = None,
 	quantization_pattern: str = DEFAULT_QUANTIZATION_PATTERN,
 	verbose: bool = True,
 ) -> Union[Dict[str, Any], Any]:
@@ -963,8 +961,6 @@ def quantize_params(
 	Args:
 	    params: The parameters to quantize. Can be a nested dictionary or a flat structure.
 	    embedding_layer_name: Name of the embedding layer to ignore during quantization.
-	    block_size (Literal[32, 64, 128, 256, 512, 1024, 2048, 4096]): Size of each quantization block.
-	    scalar_block_size (Optional[Literal[32, 64, 128, 256, 512, 1024, 2048, 4096]]): Size of each quantization block.
 	    quantization_pattern (str): re pattern for layers to be quantized.
 	    verbose (bool): whenever to use tqdm for logging stuff.
 
@@ -978,11 +974,7 @@ def quantize_params(
 	flatten = is_flatten(params)
 	if not flatten:
 		params = flatten_dict(params)
-	quantizer = EasyQuantizer(
-		quantization_method=method,
-		block_size=block_size,
-		scalar_block_size=scalar_block_size,
-	)
+	quantizer = EasyQuantizer(quantization_method=method)
 
 	def quantize(path, array):
 		layer_name = ".".join(path[0].key)
