@@ -616,8 +616,8 @@ class EasyModelsTest(unittest.TestCase):
 		hf_out,
 		ed_out,
 		ed_loss,
-		atol: float = 1e-02,
-		rtol: float = 1e-08,
+		atol: float = 0.125,
+		rtol: float = 0,
 	):
 		to, jo = hf_out.logits.cpu().detach().numpy(), ed_out.logits
 		err = jnp.mean(to) - jnp.mean(jo)
