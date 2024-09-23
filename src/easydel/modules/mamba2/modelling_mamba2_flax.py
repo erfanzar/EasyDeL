@@ -1242,7 +1242,11 @@ class FlaxMamba2ForCausalLM(FlaxMambaPretrainedModel):
 		return model_kwargs
 
 	def prepare_inputs_for_generation(self, input_ids, max_length, **kwargs):
-		return {"cache_params": kwargs.get("cache_params", None)}
+		return {
+			"cache_params": self.init_cache(
+				batch_size=input_ids.shape[0], max_length=max_length
+			)
+		} | kwargs
 
 	def init_cache(self, batch_size, max_length):
 		return FlaxMamba2Cache(self.config, batch_size, self.module.dtype)
