@@ -14,7 +14,7 @@
 
 import itertools
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar, Union
-
+from dataclasses import dataclass
 import chex
 import flax.struct
 import jax
@@ -127,39 +127,49 @@ def segment_sum(input_tensor):
 _T = TypeVar("_T")
 
 
+@jax.tree_util.register_pytree_node_class
+@dataclass
 class FlaxMamba2Cache:
-	def __init__(
-		self,
-		config: Mamba2Config,
-		batch_size: int,
-		dtype=jnp.float16,
-	):
-		self.seqlen_offset = 0
-		self.dtype = dtype
-		self.config = config
-		self.conv_states = {
-			i: jnp.zeros(
-				(
-					batch_size,
-					self.intermediate_size + 2 * config.n_groups * config.state_size,
-					self.conv_kernel_size,
-				),
-				dtype=dtype,
-			)
-			for i in range(config.num_hidden_layers)
-		}
-		self.ssm_states = {
-			i: jnp.zeros(
-				(batch_size, config.num_heads, config.head_dim, config.state_size), dtype=dtype
-			)
-			for i in range(config.num_hidden_layers)
-		}
+	config: Mamba2Config
+	batch_size: int
+	dtype = jnp.float16
+	conv_states: Optional[chex.Array] = None
+	ssm_states: Optional[chex.Array] = None
+	seqlen_offset: Optional[int] = None
+
+	def __post_init__(self):
+		self.seqlen_offset = 0 if self.seqlen_offset is None else self.seqlen_offset
+		if self.conv_states is None:
+			self.conv_states = {
+				i: jnp.zeros(
+					(
+						self.batch_size,
+						self.intermediate_size + 2 * self.config.n_groups * self.config.state_size,
+						self.conv_kernel_size,
+					),
+					dtype=self.dtype,
+				)
+				for i in range(self.config.num_hidden_layers)
+			}
+		if self.ssm_states is None:
+			self.ssm_states = {
+				i: jnp.zeros(
+					(
+						self.batch_size,
+						self.config.num_heads,
+						self.config.head_dim,
+						self.config.state_size,
+					),
+					dtype=self.dtype,
+				)
+				for i in range(self.config.num_hidden_layers)
+			}
 
 	def reset(self):
 		self.conv_states = {
 			i: jnp.zeros(
 				(
-					self.conv_states[0].shape[0],
+					self.batch_size,
 					self.intermediate_size + 2 * self.config.n_groups * self.config.state_size,
 					self.conv_kernel_size,
 				),
@@ -170,7 +180,7 @@ class FlaxMamba2Cache:
 		self.ssm_states = {
 			i: jnp.zeros(
 				(
-					self.ssm_states[0].shape[0],
+					self.batch_size,
 					self.config.num_heads,
 					self.config.head_dim,
 					self.config.state_size,
@@ -179,6 +189,19 @@ class FlaxMamba2Cache:
 			)
 			for i in range(self.config.num_hidden_layers)
 		}
+
+	def tree_flatten(self):
+		return (
+			self.config,
+			self.batch_size,
+			self.dtype,
+			self.conv_states,
+			self.ssm_states,
+			self.seqlen_offset,
+		), {}
+
+	def tree_unflatten(cls, aux, children):
+		return cls(*children)
 
 
 def create_tuple_parser(n: int) -> Callable[[Union[_T, Sequence[_T]]], tuple[_T, ...]]:
@@ -858,12 +881,17 @@ class FlaxMamba2Block(nn.Module):
 		self,
 		hidden_states: chex.Array,
 		cache_params: Optional[FlaxMamba2Cache] = None,
+		attention_mask: Optional[chex.Array] = None,
 	) -> chex.Array:
 		residual = hidden_states
 		hidden_states = self.norm(hidden_states)
 		if self.residual_in_fp32:
 			residual = residual.astype(jnp.float32)
-		hidden_states = self.mixer(hidden_states, cache_params)
+		hidden_states = self.mixer(
+			hidden_states,
+			cache_params,
+			attention_mask,
+		)
 		hidden_states = residual + hidden_states
 		return hidden_states
 
@@ -891,11 +919,16 @@ class FlaxMamba2LayerCollection(nn.Module):
 		self,
 		hidden_states: chex.Array,
 		cache_params: Optional[FlaxMamba2Cache] = None,
+		attention_mask: Optional[chex.Array] = None,
 		output_hidden_states: bool = False,
 	) -> Tuple[chex.Array, Union[None, Tuple[chex.Array, ...]]]:
 		all_hidden_states = () if output_hidden_states else None
 		for block in self.blocks:
-			hidden_states = block(hidden_states, cache_params)
+			hidden_states = block(
+				hidden_states=hidden_states,
+				cache_params=cache_params,
+				attention_mask=attention_mask,
+			)
 
 			if output_hidden_states:
 				all_hidden_states = all_hidden_states + (hidden_states,)
@@ -935,6 +968,7 @@ class FlaxMamba2Module(nn.Module):
 		self,
 		input_ids: Optional[chex.Array] = None,
 		input_embeds: Optional[chex.Array] = None,
+		attention_mask: Optional[chex.Array] = None,
 		cache_params: Optional[chex.Array] = None,
 		deterministic: bool = True,
 		use_cache: Optional[bool] = None,
@@ -976,7 +1010,10 @@ class FlaxMamba2Module(nn.Module):
 
 		hidden_states = input_embeds
 		hidden_states, all_hidden_states = self.layers(
-			hidden_states, cache_params=cache_params
+			hidden_states=hidden_states,
+			cache_params=cache_params,
+			attention_mask=attention_mask,
+			output_hidden_states=output_hidden_states,
 		)
 
 		if use_cache:
@@ -1021,6 +1058,7 @@ class FlaxMamba2ForCausalLMModule(nn.Module):
 		self,
 		input_ids: Optional[chex.Array] = None,
 		input_embeds: Optional[chex.Array] = None,
+		attention_mask: Optional[chex.Array] = None,
 		cache_params: Optional[chex.Array] = None,
 		deterministic: bool = True,
 		use_cache: Optional[bool] = None,
@@ -1034,6 +1072,7 @@ class FlaxMamba2ForCausalLMModule(nn.Module):
 		mamba_outputs = self.backbone(
 			input_ids=input_ids,
 			input_embeds=input_embeds,
+			attention_mask=attention_mask,
 			deterministic=deterministic,
 			cache_params=cache_params,
 			use_cache=use_cache,
@@ -1111,7 +1150,10 @@ class FlaxMambaPretrainedModel(EDPretrainedModel):
 		)
 
 	def init_weights(
-		self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+		self,
+		rng: jax.random.PRNGKey,
+		input_shape: Tuple,
+		params: FrozenDict = None,
 	) -> FrozenDict:
 		"""The init_weights function is used to initialize the weights of a model.
 
@@ -1150,6 +1192,7 @@ class FlaxMambaPretrainedModel(EDPretrainedModel):
 		self,
 		input_ids: Optional[chex.Array] = None,
 		input_embeds: Optional[chex.Array] = None,
+		attention_mask: Optional[chex.Array] = None,
 		cache_params: dict = None,
 		deterministic: bool = True,
 		params: dict = None,
@@ -1159,9 +1202,6 @@ class FlaxMambaPretrainedModel(EDPretrainedModel):
 		return_dict: Optional[bool] = None,
 		extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
 		add_params_field: bool = False,
-		attention_mask: Optional[
-			chex.Array
-		] = None,  # Ignored(we are using an SSM model not attention)
 		use_cache: bool = False,
 		**kwargs,
 	):
@@ -1213,13 +1253,14 @@ class FlaxMambaPretrainedModel(EDPretrainedModel):
 
 		return self.module.apply(
 			inputs,
-			input_ids,
-			input_embeds,
-			cache_params,
-			train,
-			use_cache,
-			output_hidden_states,
-			return_dict,
+			input_ids=input_ids,
+			input_embeds=input_embeds,
+			attention_mask=attention_mask,
+			cache_params=cache_params,
+			deterministic=not train,
+			use_cache=use_cache,
+			output_hidden_states=output_hidden_states,
+			return_dict=return_dict,
 			rngs=rngs,
 			mutable=False,
 		)
@@ -1241,12 +1282,24 @@ class FlaxMamba2ForCausalLM(FlaxMambaPretrainedModel):
 		model_kwargs["cache_params"] = outputs.get("cache_params", None)
 		return model_kwargs
 
-	def prepare_inputs_for_generation(self, input_ids, max_length, **kwargs):
-		return {
-			"cache_params": self.init_cache(
-				batch_size=input_ids.shape[0], max_length=max_length
+	def prepare_inputs_for_generation(
+		self,
+		input_ids,
+		max_length,
+		attention_mask: Optional[chex.Array] = None,
+	):
+		batch_size, seq_length = input_ids.shape
+		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
+		if attention_mask is not None:
+			extended_attention_mask = jax.lax.dynamic_update_slice(
+				extended_attention_mask,
+				attention_mask,
+				(0, 0),
 			)
-		} | kwargs
+		return {
+			"cache_params": self.init_cache(batch_size=batch_size, max_length=max_length),
+			"attention_mask": extended_attention_mask,
+		}
 
 	def init_cache(self, batch_size, max_length):
 		return FlaxMamba2Cache(self.config, batch_size, self.module.dtype)
