@@ -233,7 +233,7 @@ class FlaxDeepseekV2MLP(nn.Module):
 	):
 		x = control_mlp_sharding(x, self.config.partition_axis)
 		if (
-			self.config.pallas_runtime
+			self.config.hardware_abstraction
 			and self.up_proj.variables.get("params", None) is not None
 		):
 			return jax.vmap(

@@ -349,7 +349,7 @@ class FlaxInternLM2MLP(nn.Module):
 
 		x = control_mlp_sharding(x, self.config.partition_axis)
 
-		if self.config.pallas_runtime and self.w2.variables.get("params", None) is not None:
+		if self.config.hardware_abstraction and self.w2.variables.get("params", None) is not None:
 			return jax.vmap(
 				functools.partial(
 					internlm2_mlp_pallas,

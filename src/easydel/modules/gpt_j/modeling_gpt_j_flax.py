@@ -339,7 +339,7 @@ class FlaxGPTJMLP(nn.Module):
 
 	def __call__(self, hidden_states, deterministic: bool = True):
 		if (
-			self.config.pallas_runtime
+			self.config.hardware_abstraction
 			and self.fc_out.variables.get("params", None) is not None
 		):
 			hidden_states = jax.vmap(

@@ -126,7 +126,7 @@ class FlaxT5DenseActDense(nn.Module):
 		self.act = ACT2FN[self.config.dense_act_fn]
 
 	def __call__(self, hidden_states, deterministic=True):
-		if self.config.pallas_runtime and self.wi.variables.get("params", None) is not None:
+		if self.config.hardware_abstraction and self.wi.variables.get("params", None) is not None:
 			return jax.vmap(
 				functools.partial(
 					t5_mlp_pallas,

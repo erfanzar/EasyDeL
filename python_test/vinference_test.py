@@ -58,7 +58,7 @@ def main():
 		use_sharded_kv_caching=False,
 		q_block=32,
 		k_block=64,
-		# pallas_runtime=True,
+		# hardware_abstraction=True,
 		# attn_mechanism="flash_attn2",
 	)
 

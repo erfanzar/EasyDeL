@@ -104,7 +104,7 @@ class FlaxPhi3MLP(nn.Module):
 	def __call__(self, hidden_states: Array, e: bool = False) -> Array:  # Ignored
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
 		if (
-			self.config.pallas_runtime
+			self.config.hardware_abstraction
 			and self.down_proj.variables.get("params", None) is not None
 		):
 			return jax.vmap(

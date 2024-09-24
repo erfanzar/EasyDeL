@@ -98,7 +98,7 @@ class FlaxPhiMoEBlockSparseTop2MLP(nn.Module):
 		hidden_states: Array,
 		deterministic: bool = False,  # noqa
 	) -> Array:
-		if self.config.pallas_runtime and self.w1.variables.get("params", None) is not None:
+		if self.config.hardware_abstraction and self.w1.variables.get("params", None) is not None:
 			return jax.vmap(
 				functools.partial(
 					phimoe_mlp_pallas,

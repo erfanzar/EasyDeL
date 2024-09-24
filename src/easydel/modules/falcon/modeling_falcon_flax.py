@@ -466,7 +466,7 @@ class FlaxFalconMlp(nn.Module):
 	def __call__(self, x: chex.Array, deterministic: bool = True):
 		x = control_mlp_sharding(x, self.config.partition_axis)
 		if (
-			self.config.pallas_runtime
+			self.config.hardware_abstraction
 			and self.dense_4h_to_h.variables.get("params", None) is not None
 		):
 			return jax.vmap(

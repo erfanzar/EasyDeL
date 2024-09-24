@@ -16,7 +16,7 @@
 from jax import lax
 from jax import numpy as jnp
 
-from easydel.kernels.matmul import matmul_kernel
+from easydel.kernels.gemm import gemm_kernel
 
 
 def phi3_mlp_pallas(
@@ -38,6 +38,6 @@ def phi3_mlp_pallas(
 		prod_dtype=prod_dtype,
 		precision=precision,
 	)
-	y_12 = matmul_kernel(x, proj_1, **args)
+	y_12 = gemm_kernel(x, proj_1, **args)
 	y_1, y_2 = jnp.split(y_12, 2, axis=-1)
-	return matmul_kernel(act_fn(y_1) * y_2, proj_2, **args)
+	return gemm_kernel(act_fn(y_1) * y_2, proj_2, **args)

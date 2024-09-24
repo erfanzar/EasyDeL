@@ -65,18 +65,19 @@ FLAX_WEIGHTS_NAME = "easydel-model.parameters"
 DEFAULT_PALLAS_M_BLOCK_SIZE = 128
 DEFAULT_PALLAS_K_BLOCK_SIZE = 128
 DEFAULT_PALLAS_N_BLOCK_SIZE = 128
+DEFAULT_HARDWARE_ABSTRACTION = False
 
-DEFAULT_PALLAS_RUNTIME = False
-
-if xla_bridge.get_backend().platform == "gpu":
-	DEFAULT_PALLAS_M_BLOCK_SIZE = None  # Autoset
-	DEFAULT_PALLAS_K_BLOCK_SIZE = None  # Autoset
-	DEFAULT_PALLAS_N_BLOCK_SIZE = None  # Autoset
-
+# if xla_bridge.get_backend().platform == "gpu":
+# 	DEFAULT_HARDWARE_ABSTRACTION = True # TODO: Debug Vmap
+ 
+ 
 if xla_bridge.get_backend().platform == "tpu":
 	DEFAULT_PALLAS_M_BLOCK_SIZE = None  # Autoset
 	DEFAULT_PALLAS_K_BLOCK_SIZE = None  # Autoset
 	DEFAULT_PALLAS_N_BLOCK_SIZE = None  # Autoset
+
+if DEFAULT_HARDWARE_ABSTRACTION:
+	logger.info("HARDWARE_ABSTRACTION is ON by default")
 
 
 def set_attrs_smartly(self, attr_name: str, default: Any, new_attr: Any):
@@ -129,7 +130,7 @@ class EDPretrainedConfig(PretrainedConfig):
 	    attn_dtype (jnp.dtype): data type for computing attention.
 	    fcm_max_ratio (float): value for fcm mask - max ratio
 	    fcm_min_ratio (float): value for fcm mask - min ratio
-			pallas_runtime (bool): whenever to switch to custom pallas kernels instead of JAX
+			hardware_abstraction (bool): whenever to switch to custom pallas kernels instead of JAX
 			pallas_m_block_size (int): block size m dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`.
 			pallas_k_block_size (int): block size k dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`.
 			pallas_n_block_size (int): block size n dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`.
@@ -170,7 +171,7 @@ class EDPretrainedConfig(PretrainedConfig):
 		attn_dtype: jnp.dtype = jnp.float32,
 		fcm_max_ratio: float = 0.0,
 		fcm_min_ratio: float = 0.0,
-		pallas_runtime: bool = DEFAULT_PALLAS_RUNTIME,
+		hardware_abstraction: bool = DEFAULT_HARDWARE_ABSTRACTION,
 		pallas_m_block_size: int = DEFAULT_PALLAS_M_BLOCK_SIZE,
 		pallas_k_block_size: int = DEFAULT_PALLAS_K_BLOCK_SIZE,
 		pallas_n_block_size: int = DEFAULT_PALLAS_N_BLOCK_SIZE,
@@ -333,10 +334,10 @@ class EDPretrainedConfig(PretrainedConfig):
 			fcm_min_ratio,
 		)
 
-		self.pallas_runtime = getattr(
+		self.hardware_abstraction = getattr(
 			self,
-			"pallas_runtime",
-			pallas_runtime,
+			"hardware_abstraction",
+			hardware_abstraction,
 		)
 		self.pallas_m_block_size = getattr(
 			self,
@@ -529,7 +530,7 @@ class EDPretrainedConfig(PretrainedConfig):
 		quantize_kv_cache: bool = ...,
 		flash_attention_backward_pass_impl: Literal["triton", "xla"] = ...,
 		attn_dtype: jnp.dtype = ...,
-		pallas_runtime: bool = ...,
+		hardware_abstraction: bool = ...,
 		pallas_m_block_size: int = ...,
 		pallas_k_block_size: int = ...,
 		pallas_n_block_size: int = ...,
@@ -566,7 +567,7 @@ class EDPretrainedConfig(PretrainedConfig):
 		    attention_axis_name (str): Name of the attention axis name
 		    quantize_kv_cache (bool): Whether to quantize Key/Value in attention for generation process.
 		    flash_attention_backward_pass_impl (Literal["triton", "xla"]): Specify the backward pass kernel for flash attention
-				pallas_runtime (bool): whenever to switch to custom pallas kernels instead of JAX.
+				hardware_abstraction (bool): whenever to switch to custom pallas kernels instead of JAX.
 				pallas_m_block_size (int): block size m dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`.
 				pallas_k_block_size (int): block size k dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`.
 				pallas_n_block_size (int): block size n dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`.
@@ -757,9 +758,9 @@ class EDPretrainedConfig(PretrainedConfig):
 
 		set_attrs_smartly(
 			self,
-			"pallas_runtime",
-			DEFAULT_PALLAS_RUNTIME,
-			pallas_runtime,
+			"hardware_abstraction",
+			DEFAULT_HARDWARE_ABSTRACTION,
+			hardware_abstraction,
 		)
 
 		set_attrs_smartly(
