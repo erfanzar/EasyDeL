@@ -1,12 +1,12 @@
 import gc
 import os
 
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
+# os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 import sys
 import unittest
 import jax
 
-jax.config.update("jax_platform_name", "cpu")  # CPU Test !
+# jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 
 import jax.random
 
@@ -40,7 +40,7 @@ torch.manual_seed(42)
 
 class EasyModelsTest(unittest.TestCase):
 	def setUp(self) -> None:
-		self.batch_size: int = 1
+		self.batch_size: int = 2
 		self.vocab_size: int = 32000
 		self.hidden_size: int = 128
 		self.intermediate_size: int = 256
@@ -699,7 +699,7 @@ if __name__ == "__main__":
 	# unittest.main()
 	test = EasyModelsTest()
 	test.setUp()
-	test.test_mamba2()
+	# test.test_mamba2()
 	# test.test_arctic() # Passed v0.0.80 - P Runtime
 	# test.test_cohere()  # Passed v0.0.80 - P Runtime
 	# test.test_dbrx()  # Passed  v0.0.80 - P Runtime
@@ -712,7 +712,7 @@ if __name__ == "__main__":
 	# test.test_gpt2()
 	# test.test_grok1() # should be impl
 	# test.test_internlm2()
-	# test.test_llama()  # Passed v0.0.80 - P Runtime
+	test.test_llama()  # Passed v0.0.80 - P Runtime
 	# test.test_mamba()  # Passed v0.0.80 - P Runtime
 	# test.test_mistral()  # Passed v0.0.80 - P Runtime
 	# test.test_mixtral()  # Passed v0.0.80 - P Runtime

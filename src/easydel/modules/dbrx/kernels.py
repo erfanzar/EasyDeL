@@ -16,7 +16,7 @@
 from jax import lax
 from jax import numpy as jnp
 
-from easydel.kernels.matmul import matmul_kernel
+from easydel.kernels.gemm import gemm_kernel
 
 
 def dbrx_mlp_pallas(
@@ -39,8 +39,8 @@ def dbrx_mlp_pallas(
 		prod_dtype=prod_dtype,
 		precision=precision,
 	)
-	x1 = matmul_kernel(x, expert_w1.T, **args)
-	x2 = matmul_kernel(x, expert_v1.T, **args)
+	x1 = gemm_kernel(x, expert_w1.T, **args)
+	x2 = gemm_kernel(x, expert_v1.T, **args)
 	x1 = act_fn(x1)
-	x1 = matmul_kernel(x1 * x2, expert_w2, **args)
+	x1 = gemm_kernel(x1 * x2, expert_w2, **args)
 	return x1

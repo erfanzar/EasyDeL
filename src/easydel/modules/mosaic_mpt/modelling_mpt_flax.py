@@ -73,7 +73,7 @@ class FlaxMptMLP(nn.Module):
 	):
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
 		if (
-			self.config.pallas_runtime
+			self.config.hardware_abstraction
 			and self.up_proj.variables.get("params", None) is not None
 		):
 			hidden_states = jax.vmap(

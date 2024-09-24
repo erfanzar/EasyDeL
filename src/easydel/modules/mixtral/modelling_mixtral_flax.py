@@ -338,7 +338,7 @@ class FlaxMixtralBLockSparseTop2MLP(nn.Module):
 
 	def __call__(self, x: chex.Array):
 		x = control_mlp_sharding(x, self.config.partition_axis)
-		if self.config.pallas_runtime and self.w2.variables.get("params", None) is not None:
+		if self.config.hardware_abstraction and self.w2.variables.get("params", None) is not None:
 			return jax.vmap(
 				functools.partial(
 					mixtral_mlp_pallas,

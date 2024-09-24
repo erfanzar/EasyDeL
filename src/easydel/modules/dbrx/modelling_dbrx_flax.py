@@ -454,7 +454,7 @@ class FlaxDbrxExpertGLU(nn.Module):
 		expert_w1 = self.w1.reshape(expert_shape)[expert_idx]
 		expert_v1 = self.v1.reshape(expert_shape)[expert_idx]
 		expert_w2 = self.w2.reshape(expert_shape)[expert_idx]
-		if self.config.pallas_runtime:
+		if self.config.hardware_abstraction:
 			return jax.vmap(
 				functools.partial(
 					dbrx_mlp_pallas,

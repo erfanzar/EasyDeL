@@ -54,7 +54,7 @@ def main():
 		quantize_kv_cache=True,
 		q_block=32,
 		k_block=32,
-		pallas_runtime=True,
+		hardware_abstraction=True,
 		attn_mechanism="flash_attn2",
 	)
 
