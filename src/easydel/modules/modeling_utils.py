@@ -67,8 +67,8 @@ DEFAULT_PALLAS_K_BLOCK_SIZE = 128
 DEFAULT_PALLAS_N_BLOCK_SIZE = 128
 DEFAULT_HARDWARE_ABSTRACTION = False
 
-# if xla_bridge.get_backend().platform == "gpu":
-# 	DEFAULT_HARDWARE_ABSTRACTION = True # TODO: Debug Vmap
+if xla_bridge.get_backend().platform == "gpu":
+	DEFAULT_HARDWARE_ABSTRACTION = True # TODO: Debug Vmap
  
  
 if xla_bridge.get_backend().platform == "tpu":
