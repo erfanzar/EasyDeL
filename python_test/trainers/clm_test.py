@@ -1,13 +1,6 @@
 import os
 import sys
 
-os.environ["JAX_TRACEBACK_FILTERING"] = "off"
-os.environ["XLA_FLAGS"] = (
-	os.environ.get("XLA_FLAGS", "") + " --xla_gpu_enable_command_buffer="
-)
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.99"
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 dirname = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(dirname)
 sys.path.append(
@@ -18,11 +11,6 @@ sys.path.append(
 )
 # import jax
 
-import fjformer
-
-# jax.config.update("jax_platform_name", "cpu")  # CPU Test !
-import flax.core
-from datasets import Dataset, IterableDataset
 from easydel import (
 	AttentionMechanisms,
 	CausalLanguageModelTrainer,
@@ -32,6 +20,11 @@ from easydel import (
 	MistralConfig,
 	TrainArguments,
 )
+import fjformer
+
+# jax.config.update("jax_platform_name", "cpu")  # CPU Test !
+import flax.core
+from datasets import Dataset, IterableDataset
 from jax import numpy as jnp
 from jax import random
 
@@ -49,18 +42,25 @@ def main(use_iterable_dataset: bool):
 	max_evaluation_steps = NUM_EVAL_EXAMPLES // TOTAL_BATCH_SIZE
 	config = MistralConfig(
 		hidden_size=128,
+		head_dim=8,
 		num_attention_heads=8,
 		num_key_value_heads=4,
 		num_hidden_layers=4,
 		intermediate_size=256,
 		max_position_embeddings=sequence_length,
-		attn_dtype=jnp.float16,
-		attn_mechanism=AttentionMechanisms.pallas_flash,
+		attn_dtype=jnp.float32,
+		attn_mechanism=AttentionMechanisms.vanilla,
 		block_k=32,
 		block_q=32,
 	)
 
-	model = FlaxMistralForCausalLM(config=config, _do_init=True)
+	dtype = jnp.bfloat16
+	model = FlaxMistralForCausalLM(
+		config=config,
+		_do_init=True,
+		dtype=dtype,
+		param_dtype=dtype,
+	)
 	params = model.shard_params(model.params)
 
 	def data_generator(num_rows: int):
@@ -88,7 +88,6 @@ def main(use_iterable_dataset: bool):
 			data_generator,
 			gen_kwargs={"num_rows": NUM_EVAL_EXAMPLES},
 		)
-	dtype = jnp.float16
 	trainer = CausalLanguageModelTrainer(
 		arguments=TrainArguments(
 			model_name="CLM_TEST",
@@ -111,9 +110,9 @@ def main(use_iterable_dataset: bool):
 			param_dtype=dtype,
 			track_memory=True,
 			use_wandb=True,
-			learning_rate=5e-4,
+			learning_rate=3e-4,
 			label_smoothing_factor=0.1,
-			z_loss=0.0001,
+			# z_loss=0.0001,
 			train_on_inputs=True,
 			do_last_save=True,
 			training_time="80Min",
@@ -125,7 +124,7 @@ def main(use_iterable_dataset: bool):
 		dataset_train=example_train_data,
 		dataset_eval=example_eval_data,
 	)
-	
+
 	output = trainer.train(model_parameters=flax.core.FrozenDict({"params": params}))
 	trainer.save_pretrained(output.state, to_torch=True)
 

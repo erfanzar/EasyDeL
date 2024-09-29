@@ -699,16 +699,16 @@ if __name__ == "__main__":
 	# unittest.main()
 	test = EasyModelsTest()
 	test.setUp()
-	# test.test_mamba2()
-	# test.test_arctic() # Passed v0.0.80 - P Runtime
+	# test.test_mamba2()  # Passed v0.0.80 - P Runtime
+	# test.test_arctic()  # Passed v0.0.80 - P Runtime
 	# test.test_cohere()  # Passed v0.0.80 - P Runtime
 	# test.test_dbrx()  # Passed  v0.0.80 - P Runtime
-	# test.test_deepseek_v2() # Passed v0.0.80 - P Runtime
+	# test.test_deepseek_v2()  # Passed v0.0.80 - P Runtime
 	# test.test_exaone()  # Passed v0.0.80 - P Runtime
 	# test.test_falcon()  # Passed v0.0.80 - P Runtime
 	# test.test_gemma()  # Passed v0.0.80 - P Runtime
 	# test.test_gemma2()  # Passed v0.0.80 - P Runtime
-	# test.test_gptj() # Passed v0.0.80 - P Runtime
+	# test.test_gptj()  # Passed v0.0.80 - P Runtime
 	# test.test_gpt2()
 	# test.test_grok1() # should be impl
 	# test.test_internlm2()
@@ -717,14 +717,14 @@ if __name__ == "__main__":
 	# test.test_mistral()  # Passed v0.0.80 - P Runtime
 	# test.test_mixtral()  # Passed v0.0.80 - P Runtime
 	# test.test_mpt()  # Passed v0.0.80 - P Runtime
-	# test.test_olmo() # Passed v0.0.80 - P Runtime
-	# test.test_openelm() # Passed v0.0.80 - P Runtime
-	# test.test_phi() # Passed v0.0.80 - P Runtime
+	# test.test_olmo()  # Passed v0.0.80 - P Runtime
+	# test.test_openelm()  # Passed v0.0.80 - P Runtime
+	# test.test_phi()  # Passed v0.0.80 - P Runtime
 	# test.test_phi3()  # Passed v0.0.80 - P Runtime
 	# test.test_phimoe()  # Passed v0.0.80 - P Runtime
 	# test.test_qwen1()
-	# test.test_qwen2() # Passed v0.0.80 - P Runtime
-	# test.test_qwen2_moe() # Passed v0.0.80 - P Runtime
-	# test.test_stablelm() # Passed v0.0.80 - P Runtime
-	# test.test_xerxes() # Passed v0.0.80 - P Runtime (Check)
+	# test.test_qwen2()  # Passed v0.0.80 - P Runtime
+	# test.test_qwen2_moe()  # Passed v0.0.80 - P Runtime
+	# test.test_stablelm()  # Passed v0.0.80 - P Runtime
+	# test.test_xerxes()  # Passed v0.0.80 - P Runtime (Check)
 	# -----------------------------------------------

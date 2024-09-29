@@ -20,6 +20,7 @@ from typing import Any, Literal, Optional, Tuple
 
 import fjformer
 import jax
+import jax.lib
 from chex import Array
 from fjformer import with_sharding_constraint
 from fjformer.pallas_operations.pallas_attention import flash_attention
@@ -44,11 +45,11 @@ from flax.struct import dataclass
 from jax import lax, random
 from jax import numpy as jnp
 from jax.experimental.shard_map import shard_map
-import jax.lib
 from jax.sharding import Mesh, PartitionSpec
 
 from easydel.etils.etils import AVAILABLE_ATTENTION_MECHANISMS, get_logger
 from easydel.etils.partition_module import PartitionAxis
+from easydel.kernels.flash_attention_2 import flash_attn2
 from easydel.modules._blockwise_attention import blockwise_attn
 from easydel.modules._flash_attention import flash_attention2 as jax_flash_attention2
 from easydel.modules._ring_attention import ring_attention_standard, wise_ring_attention
@@ -58,7 +59,6 @@ from easydel.modules._vanilla_attention import (
 )
 from easydel.modules.flax_modeling_utils import get_gradient_checkpoint_policy
 from easydel.modules.modeling_utils import EDPretrainedConfig
-from easydel.kernels.flash_attention_2 import flash_attn2
 
 logger = get_logger(__name__)
 
@@ -409,7 +409,7 @@ class FlexibleAttentionModule(object):
 
 		self.mesh = mesh
 		self.attn_mechanism = attn_mechanism
-		self.platform = jax.lib.xla_bridge.get_backend().platform
+		self.platform = jax.extend.backend.get_backend().platform
 		self.sm_scale = sm_scale
 		self.num_attention_heads = num_attention_heads
 		self.head_dims = head_dims
@@ -1431,7 +1431,7 @@ class FlexibleAttentionModule(object):
 		query_sequence_length: int = None,
 		bias: Optional[Array] = None,
 	) -> AttentionOutput:
-		assert jax.lib.xla_bridge.get_backend().platform == "gpu"
+		assert jax.extend.backend.get_backend().platform == "gpu"
 		if query_sequence_length is None:
 			query_sequence_length = query_states.shape[1]
 		qps, kps, vps, bps, aps, is_gen = self.get_bshd_partition_specs(

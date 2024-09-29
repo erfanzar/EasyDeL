@@ -35,6 +35,7 @@ import fjformer.sharding
 import flax
 import flax.linen
 import jax
+import jax.extend
 import jax.tree_util
 from fjformer.checkpoint import CheckpointManager
 from fjformer.dtypes import Array8Bit
@@ -43,7 +44,6 @@ from flax.core import FrozenDict, unfreeze
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import numpy as jnp
 from jax.experimental.mesh_utils import create_device_mesh
-from jax.lib import xla_bridge
 from jax.sharding import Mesh, PartitionSpec
 from tqdm.auto import tqdm
 from transformers.configuration_utils import PretrainedConfig
@@ -66,18 +66,38 @@ DEFAULT_PALLAS_M_BLOCK_SIZE = 128
 DEFAULT_PALLAS_K_BLOCK_SIZE = 128
 DEFAULT_PALLAS_N_BLOCK_SIZE = 128
 DEFAULT_HARDWARE_ABSTRACTION = False
+ED_DEFAULT_HARDWARE_ABSTRACTION = os.environ.get(
+	"ED_DEFAULT_HARDWARE_ABSTRACTION",
+	default="true",
+).lower() in ["true", "1", "yes"]
 
-if xla_bridge.get_backend().platform == "gpu":
-	DEFAULT_HARDWARE_ABSTRACTION = True # TODO: Debug Vmap
- 
- 
-if xla_bridge.get_backend().platform == "tpu":
+ED_CUSTOM_OP = os.environ.get(
+	"ED_CUSTOM_OP",
+	default="true",
+).lower() in ["true", "1", "yes"]
+
+if (
+	jax.extend.backend.get_backend().platform == "gpu" and ED_DEFAULT_HARDWARE_ABSTRACTION
+):
+	DEFAULT_HARDWARE_ABSTRACTION = True  # TODO: Debug Vmap
+
+
+if jax.extend.backend.get_backend().platform == "tpu":
 	DEFAULT_PALLAS_M_BLOCK_SIZE = None  # Autoset
 	DEFAULT_PALLAS_K_BLOCK_SIZE = None  # Autoset
 	DEFAULT_PALLAS_N_BLOCK_SIZE = None  # Autoset
 
 if DEFAULT_HARDWARE_ABSTRACTION:
 	logger.info("HARDWARE_ABSTRACTION is ON by default")
+	if jax.extend.backend.get_backend().platform == "gpu" and ED_CUSTOM_OP:
+		logger.info(
+			"ED_CUSTOM_OP is ON (GPU-only) and some operations will "
+			"automatically be replaced by EasyDeL, this behavior can be disabled by "
+			"setting os env `ED_CUSTOM_OP` to `false`."
+		)
+		from easydel.kernels.gemm import replace_dot_general_with_gemm_kernel
+
+		replace_dot_general_with_gemm_kernel()
 
 
 def set_attrs_smartly(self, attr_name: str, default: Any, new_attr: Any):
@@ -496,7 +516,7 @@ class EDPretrainedConfig(PretrainedConfig):
 		return (
 			self.backend
 			if not self.backend == ""
-			else jax.lib.xla_bridge.get_backend().platform
+			else jax.extend.backend.get_backend().platform
 		)
 
 	def add_basic_configurations(

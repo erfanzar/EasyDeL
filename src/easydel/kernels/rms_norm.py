@@ -15,13 +15,14 @@
 from functools import partial
 
 import jax.experimental.pallas as pl
+import jax.extend
 import jax.random
 from jax import numpy as jnp
-from jax.lib import xla_bridge
 
-PLATFORM = xla_bridge.get_backend().platform
+PLATFORM = jax.extend.backend.get_backend().platform
 INTERPRET = PLATFORM == "cpu"
 # INTERPRET = True  # Debuging
+# TODO :ISSUE IN JAX 0.4.33
 
 
 def basic_layer_norm(
@@ -107,7 +108,7 @@ def _call_fwd_rms_kernel(x, w, blocksize_x, eps, prod_dtype):
 	out_shape = jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype)
 
 	method = pl.pallas_call(
-		f=partial(
+		partial(
 			_pl_fwd_rms_kernel,
 			blocksize_x=blocksize_x,
 			eps=eps,

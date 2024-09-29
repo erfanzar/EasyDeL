@@ -24,9 +24,9 @@ from jax import custom_vjp
 from jax import numpy as jnp
 from jax import random as jrand
 from jax.experimental import pallas as pl
-from jax.lib import xla_bridge
+from jax import extend
 
-_PLATFORM = xla_bridge.get_backend().platform
+_PLATFORM = extend.backend.get_backend().platform
 _INTERPRET = _PLATFORM == "cpu"
 _TEST_DTYPE = jnp.float16
 # _INTERPRET = True
@@ -282,7 +282,7 @@ def _call_gpu_fwd_flash_attn(
 	grid = (pl.cdiv(seqlen_q, qblock), batch_size * nheads)
 
 	method = pl.pallas_call(
-		f=partial(
+		partial(
 			_gpu_fwd_flash_attn_kernel,
 			dtype=dtype,
 			qblock=qblock,
@@ -531,7 +531,7 @@ def _call_gpu_bwd_flash_attn(
 	]
 
 	delta = pl.pallas_call(
-		f=partial(
+		partial(
 			_gpu_bwd_do_o_dot,
 			qblock=qblock,
 			seqlen_q=seqlen_q,
@@ -552,7 +552,7 @@ def _call_gpu_bwd_flash_attn(
 		name="gpu_bwd_flash_attn",
 	)(o, dO)
 	method = pl.pallas_call(
-		f=partial(
+		partial(
 			_gpu_bwd_flash_attn_kernel,
 			dtype=dtype,
 			qblock=qblock,
@@ -651,7 +651,7 @@ def flash_attn2(
 
 
 def gpu_fwd_test():
-	b, h, qs, s, d = 1, 32, 2048, 2048, 128
+	b, h, qs, s, d = 2, 32, 2048, 2048, 128
 	dtype = _TEST_DTYPE
 
 	q = jrand.normal(_rng.rng, shape=(b, qs, h, d), dtype=dtype)
@@ -675,8 +675,8 @@ def gpu_fwd_test():
 		v=v,
 		b=b,
 		dtype=jnp.float16,
-		qblock=16,
-		kblock=16,
+		qblock=32,
+		kblock=32,
 	)
 	print(f"PRED : {result[-1,-1,-1,:5]}")
 	print(f"ORGN : {excepted_result[-1,-1,-1,:5]}")
@@ -685,7 +685,8 @@ def gpu_fwd_test():
 
 
 def gpu_bwd_test():
-	b, h, qs, s, d = 1, 8, 32, 32, 16
+	b, h, qs, s, d = 2, 32, 2048, 2048, 128
+	# b, h, qs, s, d = 1, 8, 32, 32, 16
 	# b, h, qs, s, d = 1, 1, 1, 2, 16
 	dtype = _TEST_DTYPE
 
@@ -707,8 +708,8 @@ def gpu_bwd_test():
 		lambda *x: _gpu_flash_attn(
 			*x,
 			dtype=dtype,
-			qblock=16,
-			kblock=16,
+			qblock=32,
+			kblock=32,
 		).sum()
 	)(
 		q,
@@ -722,5 +723,5 @@ def gpu_bwd_test():
 
 
 if __name__ == "__main__":
-	# gpu_fwd_test()
+	gpu_fwd_test()
 	gpu_bwd_test()

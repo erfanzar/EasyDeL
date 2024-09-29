@@ -1,7 +1,6 @@
 import os
 import sys
 
-os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 dirname = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(dirname)
 sys.path.append(
@@ -14,14 +13,14 @@ sys.path.append(
 
 # jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 
-import flax.core
-from datasets import load_dataset
 from easydel import (
 	FlaxMistralForCausalLM,
 	MistralConfig,
 	TrainArguments,
 	AttentionMechanisms,
 )
+import flax.core
+from datasets import load_dataset
 from easydel.trainers import conversations_formatting_function
 from easydel.trainers.supervised_fine_tuning_trainer import SFTTrainer
 from jax import numpy as jnp
@@ -39,7 +38,7 @@ def main():
 		gradient_checkpointing="",
 		max_position_embeddings=sequence_length,
 		attn_dtype=jnp.float16,
-		attn_mechanism=AttentionMechanisms.pallas_flash,
+		attn_mechanism=AttentionMechanisms.vanilla,
 		block_k=32,
 		block_q=32,
 	)
