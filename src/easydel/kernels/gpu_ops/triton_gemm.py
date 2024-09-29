@@ -342,7 +342,11 @@ def impt_prim(A, B):
 
 op_prim.def_impl(partial(xla.apply_primitive, op_prim))
 
-mlir.register_lowering(op_prim, mlir.lower_fun(fun=impt_prim, multiple_results=False))
+mlir.register_lowering(
+	op_prim,
+	mlir.lower_fun(fun=impt_prim, multiple_results=False),
+	platform="gpu",
+)
 
 
 @op_prim.def_abstract_eval

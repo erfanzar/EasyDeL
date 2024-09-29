@@ -15,30 +15,32 @@
 # Implementation by @erfanzar,
 # with a few bug fixes and adjustments.
 
-import os
-import sys
+# import os
+# import sys
 
-sys.path.append(
-	os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../src")
-)
+# sys.path.append(
+# 	os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../../src")
+# )
+
 import logging
 from dataclasses import dataclass
 from functools import partial
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import jax
 import jax.interpreters
 import jax.interpreters.pxla
 import jax.random
+import numpy as np
 from fjformer import GenerateRNG
+from jax import lax
 from jax import numpy as jnp
 from jax.lax import PrecisionLike
-from jax.lib import xla_bridge
 
 from easydel.kernels.gpu_ops.triton_gemm import gemm as triton_gemm
 from easydel.kernels.tpu_ops.pallas_gemm import pallas_gemm
 
-PLATFORM = xla_bridge.get_backend().platform
+PLATFORM = jax.extend.backend.get_backend().platform
 INTERPRET = PLATFORM == "cpu"
 rng = GenerateRNG()
 
@@ -52,10 +54,11 @@ def gemm_kernel(
 	blocksize_n: Optional[int] = None,
 	prod_dtype: jnp.dtype = jnp.float32,
 	precision: PrecisionLike = None,
+	**_,
 ):
-	if PLATFORM in ["gpu", "cpu"]:
+	if PLATFORM == "gpu":
 		return triton_gemm(A, B)
-	elif PLATFORM in ["tpu", "cpu"]:
+	elif PLATFORM == "tpu":
 		org_dtype = A.dtype
 		A = A.astype(jnp.promote_types(jnp.bfloat16, A.dtype))
 		B = B.astype(jnp.promote_types(jnp.bfloat16, B.dtype))
@@ -67,10 +70,86 @@ def gemm_kernel(
 			blocksize_n,
 			precision,
 		).astype(org_dtype)
+	elif PLATFORM == "cpu":
+		return jax.lax.batch_matmul(A, B, precision=precision)
 	else:
 		raise NotImplementedError(
 			f"`gemm_kernel` is not implemented for request platform {PLATFORM}"
 		)
+
+
+def custom_dot_general_kernel(
+	lhs: jnp.ndarray,
+	rhs: jnp.ndarray,
+	dimension_numbers: Optional[
+		Tuple[
+			Tuple[Sequence[int], Sequence[int]],
+			Tuple[Sequence[int], Sequence[int]],
+		]
+	] = None,
+	precision=None,
+	preferred_element_type=None,
+	*args,
+	**kwargs,
+):
+	if preferred_element_type is None:
+		preferred_element_type = rhs.dtype
+
+	if dimension_numbers is None:
+		raise ValueError(
+			"dimension_numbers must be provided for general tensor contractions"
+		)
+
+	((lhs_contract, rhs_contract), (lhs_batch, rhs_batch)) = dimension_numbers
+
+	# Helper function to reshape inputs to 2D based on contract and batch dimensions
+	def reshape_for_contraction(x, contract_dims, batch_dims):
+		other_dims = [
+			i for i in range(x.ndim) if i not in contract_dims and i not in batch_dims
+		]
+		perm = list(batch_dims) + other_dims + list(contract_dims)
+		x = jnp.transpose(x, perm)
+		batch_shape = [int(x.shape[i]) for i in range(len(batch_dims))]
+		other_shape = [
+			int(x.shape[i]) for i in range(len(batch_dims), x.ndim - len(contract_dims))
+		]
+		contract_shape = tuple(
+			int(x.shape[i]) for i in range(x.ndim - len(contract_dims), x.ndim)
+		)
+		return (
+			x.reshape(
+				-1,
+				np.prod(other_shape).astype("i4"),
+				np.prod(contract_shape).astype("i4"),
+			),
+			batch_shape,
+			other_shape,
+		)
+
+	# Reshape lhs and rhs for contraction
+	lhs_reshaped, lhs_batch_shape, lhs_other_shape = reshape_for_contraction(
+		lhs, lhs_contract, lhs_batch
+	)
+	rhs_reshaped, rhs_batch_shape, rhs_other_shape = reshape_for_contraction(
+		rhs, rhs_contract, rhs_batch
+	)
+
+	# Ensure batch dimensions are compatible
+	if lhs_batch_shape != rhs_batch_shape:
+		raise ValueError("Batch dimensions must match for batched matrix multiplication")
+
+	# Perform batched matrix multiplication using vmap
+	result_3d = jax.vmap(gemm_kernel)(
+		lhs_reshaped, jnp.transpose(rhs_reshaped, (0, 2, 1))
+	)
+
+	# Reshape result back to the original batch and output dimensions
+	final_shape = lhs_batch_shape + lhs_other_shape + rhs_other_shape
+	return result_3d.reshape(final_shape).astype(preferred_element_type)
+
+
+def replace_dot_general_with_gemm_kernel():
+	jax.lax.dot_general = custom_dot_general_kernel
 
 
 def matmul_test():
@@ -263,7 +342,8 @@ def matmul_benchmark(unused_args=None):
 		), best_time_config.time
 
 	logging.basicConfig(
-		level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+		level=logging.INFO,
+		format="%(asctime)s - %(levelname)s - %(message)s",
 	)
 	# Define a list of matrix sizes to benchmark
 	matrix_sizes = [
@@ -297,8 +377,134 @@ def matmul_benchmark(unused_args=None):
 		print(best_configs)
 
 
+def test_dot_general_replacer():
+	print("Example 1: Standard matrix multiplication")
+	lhs1 = jnp.arange(6).reshape(2, 3)
+	rhs1 = jnp.arange(6).reshape(3, 2)
+
+	result1_custom = custom_dot_general_kernel(
+		lhs1,
+		rhs1,
+		dimension_numbers=(((1,), (0,)), ((), ())),
+	)
+	result1_original = lax.dot_general(
+		lhs1,
+		rhs1,
+		dimension_numbers=(((1,), (0,)), ((), ())),
+	)
+
+	print("Custom Result:\n", result1_custom)
+	print("Original Result:\n", result1_original)
+	assert jnp.allclose(
+		result1_custom,
+		result1_original,
+		atol=0.125,
+		rtol=0,
+	), "Test 1 failed: Results do not match!"
+
+	# Example 2: Batched matrix multiplication
+	print("\nExample 2: Batched matrix multiplication")
+	lhs2 = jnp.arange(24).reshape(2, 3, 4)
+	rhs2 = jnp.arange(24).reshape(2, 4, 3)
+
+	result2_custom = custom_dot_general_kernel(
+		lhs2,
+		rhs2,
+		dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+	)
+	result2_original = lax.dot_general(
+		lhs2,
+		rhs2,
+		dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+	)
+
+	print("Custom Result:\n", result2_custom)
+	print("Original Result:\n", result2_original)
+	assert jnp.allclose(
+		result2_custom,
+		result2_original,
+		atol=0.125,
+		rtol=0,
+	), "Test 2 failed: Results do not match!"
+
+	# Example 3: Explicit dimension numbers
+	print("\nExample 3: Explicit dimension numbers")
+	lhs3 = jnp.arange(24).reshape(2, 3, 4)
+	rhs3 = jnp.arange(24).reshape(4, 3, 2)
+
+	result3_custom = custom_dot_general_kernel(
+		lhs3,
+		rhs3,
+		dimension_numbers=(((2,), (0,)), ((0,), (2,))),
+	)
+	result3_original = lax.dot_general(
+		lhs3,
+		rhs3,
+		dimension_numbers=(((2,), (0,)), ((0,), (2,))),
+	)
+
+	print("Custom Result:\n", result3_custom)
+	print("Original Result:\n", result3_original)
+	assert jnp.allclose(
+		result3_custom,
+		result3_original,
+		atol=0.125,
+		rtol=0,
+	), "Test 3 failed: Results do not match!"
+
+	# Example 4: Vector dot product
+	print("\nExample 4: Vector dot product")
+	lhs4 = jnp.arange(3)
+	rhs4 = jnp.arange(3)
+
+	result4_custom = custom_dot_general_kernel(
+		lhs4,
+		rhs4,
+		dimension_numbers=(((0,), (0,)), ((), ())),
+	)
+	result4_original = lax.dot_general(
+		lhs4,
+		rhs4,
+		dimension_numbers=(((0,), (0,)), ((), ())),
+	)
+
+	print("Custom Result:\n", result4_custom)
+	print("Original Result:\n", result4_original)
+	assert jnp.allclose(
+		result4_custom,
+		result4_original,
+		atol=0.125,
+		rtol=0,
+	), "Test 4 failed: Results do not match!"
+	print("\nExample 5: Complex tensor contraction")
+	lhs5 = jax.random.normal(jax.random.key(0), (128 * 2 * 2,)).reshape(2, -1, 128)
+	rhs5 = jax.random.normal(jax.random.key(1), (128 * 2,)).reshape(128, -1)
+
+	result5_original = lax.dot_general(
+		lhs5,
+		rhs5,
+		dimension_numbers=(((2,), (0,)), ((), ())),
+	)
+	result5_custom = custom_dot_general_kernel(
+		lhs5,
+		rhs5,
+		dimension_numbers=(((2,), (0,)), ((), ())),
+	)
+
+	print("Custom Result:\n", result5_custom)
+	print("Original Result:\n", result5_original)
+	assert jnp.allclose(
+		result5_custom,
+		result5_original,
+		atol=0.125,
+		rtol=0,
+	), "Test 5 failed: Results do not match!"
+	print("ALL Tests are passed!")
+
+
 if __name__ == "__main__":
 	matmul_test()
 	matmul_grad_test()
+	test_dot_general_replacer()
 	# from absl import app
 	# app.run(matmul_benchmark)

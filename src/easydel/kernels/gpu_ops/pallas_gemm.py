@@ -26,9 +26,7 @@ from fjformer import GenerateRNG
 from jax import numpy as jnp
 from jax.experimental import pallas as pl
 
-from jax.lib import xla_bridge
-
-PLATFORM = xla_bridge.get_backend().platform
+PLATFORM = jax.extend.backend.get_backend().platform
 INTERPRET = PLATFORM == "cpu"
 rng = GenerateRNG()
 
@@ -103,7 +101,7 @@ def _get_compiler_params(
 	dtype: jnp.dtype,
 ):
 	params = None
-	platform = xla_bridge.get_backend().platform
+	platform = jax.extend.backend.get_backend().platform
 	dtype_size = jnp.dtype(dtype).itemsize
 	if platform == "gpu":
 		dtype_size = jnp.dtype(dtype).itemsize
