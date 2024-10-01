@@ -65,8 +65,8 @@ unfixable = ["B"]
 "__init__.py" = ["E402","F401"]
 "**/{tests,docs,tools}/*" = ["E402"]
 "python_test/*"=["E402"]
-
-
+"triton_*"=["E741","ISC001","E501"]
+  
 [tool.ruff.format]
 # 5. Use single quotes in `ruff format`.
 quote-style = "double"
@@ -77,4 +77,5 @@ docstring-code-format = true
 [tool.ruff]
 target-version = "py311"
 line-length = 88
-indent-width = 2
+indent-width = 2 
+ 
