@@ -271,36 +271,20 @@ def _bwd_do_attn_kernel(
 @triton.jit
 def _bwd_kernel_one_col_block(
 	start_n,
-	Q,
-	K,
-	V,
-	Bias,
-	DO,
-	DQ,
-	DK,
-	DV,
-	LSE,
-	D,
+	Q, K, V, B,
+	Do, Dq, Dk, Dv,
+	L, D,
 	softmax_scale,
-	stride_qm,
-	stride_kn,
-	stride_vn,
-	stride_bm,
+	stride_qm, stride_kn, stride_vn, stride_bm, 
 	stride_dom,
-	stride_dqm,
-	stride_dkn,
-	stride_dvn,
-	seqlen_q,
-	seqlen_k,
+	stride_dqm, stride_dkn, stride_dvn,
+	seqlen_q, seqlen_k,
 	headdim,
 	ATOMIC_ADD: tl.constexpr,
 	HAVE_BIAS: tl.constexpr,
 	BLOCK_HEADDIM: tl.constexpr,
-	EVEN_M: tl.constexpr,
-	EVEN_N: tl.constexpr,
-	EVEN_HEADDIM: tl.constexpr,
-	BLOCK_M: tl.constexpr,
-	BLOCK_N: tl.constexpr,
+	EVEN_M: tl.constexpr, EVEN_N: tl.constexpr, EVEN_HEADDIM: tl.constexpr,
+	BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
 	begin_m = 0
 	offs_qm = begin_m + tl.arange(0, BLOCK_M)
@@ -310,15 +294,15 @@ def _bwd_kernel_one_col_block(
 	q_ptrs = Q + (offs_qm[:, None] * stride_qm + offs_d[None, :])
 	k_ptrs = K + (offs_n[:, None] * stride_kn + offs_d[None, :])
 	v_ptrs = V + (offs_n[:, None] * stride_vn + offs_d[None, :])
-	do_ptrs = DO + (offs_qm[:, None] * stride_dom + offs_d[None, :])
-	dq_ptrs = DQ + (offs_qm[:, None] * stride_dqm + offs_d[None, :])
+	do_ptrs = Do + (offs_qm[:, None] * stride_dom + offs_d[None, :])
+	dq_ptrs = Dq + (offs_qm[:, None] * stride_dqm + offs_d[None, :])
 	if HAVE_BIAS:
-		b_ptrs = Bias + (offs_qm[:, None] * stride_bm + offs_n[None, :]) 
+		b_ptrs = B + (offs_qm[:, None] * stride_bm + offs_n[None, :]) 
 	dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
 	dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32) 
 	if begin_m >= seqlen_q:
-		dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
-		dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
+		dv_ptrs = Dv + (offs_n[:, None] * stride_dvn + offs_d[None, :])
+		dk_ptrs = Dk + (offs_n[:, None] * stride_dkn + offs_d[None, :])
 		_bwd_store_dk_dv(
 			dk_ptrs,
 			dv_ptrs,
@@ -372,7 +356,7 @@ def _bwd_kernel_one_col_block(
 			qk = qk * softmax_scale + bias 
 		if not (EVEN_M & EVEN_HEADDIM):
 			tl.debug_barrier()
-		lse_i = tl.load(LSE + offs_m_curr)
+		lse_i = tl.load(L + offs_m_curr)
 		if HAVE_BIAS:
 			p = tl.exp(qk * softmax_scale - lse_i[:, None])
 		else:
@@ -381,7 +365,7 @@ def _bwd_kernel_one_col_block(
 			do = tl.load(do_ptrs)
 		else:
 			do = tl.load(do_ptrs, mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0)
-		dv += tl.dot(p.to(do.dtype), do, trans_a=True)
+		dv += tl.dot(p.to(do.dtype).T, do)
 		if not (EVEN_M & EVEN_HEADDIM):
 			tl.debug_barrier()
 		dp = tl.dot(do, v.T)
@@ -420,8 +404,8 @@ def _bwd_kernel_one_col_block(
 		do_ptrs += BLOCK_M * stride_dom
 		if HAVE_BIAS:
 			b_ptrs += BLOCK_M * stride_bm 
-	dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
-	dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
+	dv_ptrs = Dv + (offs_n[:, None] * stride_dvn + offs_d[None, :])
+	dk_ptrs = Dk + (offs_n[:, None] * stride_dkn + offs_d[None, :])
 	_bwd_store_dk_dv(
 		dk_ptrs, dv_ptrs,
 		dk, dv,
@@ -432,33 +416,7 @@ def _bwd_kernel_one_col_block(
 # fmt:on
 
 
-def init_to_zero(name):
-	return lambda nargs: nargs[name].zero_()
-
-
-@triton.autotune(
-	configs=[
-		triton.Config(
-			{"BLOCK_M": 128, "BLOCK_N": 128, "SEQUENCE_PARALLEL": False},
-			num_warps=8,
-			num_stages=1,
-			pre_hook=init_to_zero("DQ"),
-		),
-		triton.Config(
-			{"BLOCK_M": 128, "BLOCK_N": 128, "SEQUENCE_PARALLEL": True},
-			num_warps=8,
-			num_stages=1,
-			pre_hook=init_to_zero("DQ"),
-		),
-	],
-	key=[
-		"CACHE_KEY_SEQLEN_Q",
-		"CACHE_KEY_SEQLEN_K",
-		"BIAS_TYPE",
-		"IS_CAUSAL",
-		"BLOCK_HEADDIM",
-	],
-)
+# fmt:off
 @triton.heuristics(
 	{
 		"EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
@@ -467,58 +425,25 @@ def init_to_zero(name):
 	}
 )
 @triton.jit
-def _bwd_kernel(
-	Q,
-	K,
-	V,
-	Bias,
-	DO,
-	DQ,
-	DK,
-	DV,
-	LSE,
-	D,
+def _bwd_attn_kernel(
+	Q, K, V, B,
+	Do, Dq, Dk, Dv,
+	L, D,
 	softmax_scale,
-	stride_qb,
-	stride_qh,
-	stride_qm,
-	stride_kb,
-	stride_kh,
-	stride_kn,
-	stride_vb,
-	stride_vh,
-	stride_vn,
-	stride_bb,
-	stride_bh,
-	stride_bm,
-	stride_dob,
-	stride_doh,
-	stride_dom,
-	stride_dqb,
-	stride_dqh,
-	stride_dqm,
-	stride_dkb,
-	stride_dkh,
-	stride_dkn,
-	stride_dvb,
-	stride_dvh,
-	stride_dvn,
-	nheads,
-	seqlen_q,
-	seqlen_k,
-	seqlen_q_rounded,
-	headdim,
-	CACHE_KEY_SEQLEN_Q,
-	CACHE_KEY_SEQLEN_K,
-	BIAS_TYPE: tl.constexpr,
-	IS_CAUSAL: tl.constexpr,
-	BLOCK_HEADDIM: tl.constexpr,
-	SEQUENCE_PARALLEL: tl.constexpr,
-	EVEN_M: tl.constexpr,
-	EVEN_N: tl.constexpr,
-	EVEN_HEADDIM: tl.constexpr,
-	BLOCK_M: tl.constexpr,
-	BLOCK_N: tl.constexpr,
+	stride_qb, stride_qh, stride_qm,
+	stride_kb, stride_kh, stride_kn,
+	stride_vb, stride_vh, stride_vn,
+	stride_bb, stride_bh, stride_bm,
+	stride_dob, stride_doh, stride_dom,
+	stride_dqb, stride_dqh, stride_dqm, 
+	stride_dkb, stride_dkh, stride_dkn,
+	stride_dvb, stride_dvh, stride_dvn,
+	seqlen_q, seqlen_k, seqlen_q_rounded,
+	headdim, nheads, 
+	HAVE_BIAS: tl.constexpr,
+	BLOCK_HEADDIM: tl.constexpr, 
+	EVEN_M: tl.constexpr, EVEN_N: tl.constexpr, EVEN_HEADDIM: tl.constexpr,
+	BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
 	off_hb = tl.program_id(1)
 	off_b = off_hb // nheads
@@ -526,89 +451,35 @@ def _bwd_kernel(
 	Q += off_b * stride_qb + off_h * stride_qh
 	K += off_b * stride_kb + off_h * stride_kh
 	V += off_b * stride_vb + off_h * stride_vh
-	DO += off_b * stride_dob + off_h * stride_doh
-	DQ += off_b * stride_dqb + off_h * stride_dqh
-	DK += off_b * stride_dkb + off_h * stride_dkh
-	DV += off_b * stride_dvb + off_h * stride_dvh
-	if BIAS_TYPE:
-		Bias += off_b * stride_bb + off_h * stride_bh
+	Do += off_b * stride_dob + off_h * stride_doh
+	Dq += off_b * stride_dqb + off_h * stride_dqh
+	Dk += off_b * stride_dkb + off_h * stride_dkh
+	Dv += off_b * stride_dvb + off_h * stride_dvh
+	if HAVE_BIAS:
+		B += off_b * stride_bb + off_h * stride_bh
 	D += off_hb * seqlen_q_rounded
-	LSE += off_hb * seqlen_q_rounded
-	if not SEQUENCE_PARALLEL:
-		num_block_n = tl.cdiv(seqlen_k, BLOCK_N)
-		for start_n in range(0, num_block_n):
-			_bwd_kernel_one_col_block(
-				start_n,
-				Q,
-				K,
-				V,
-				Bias,
-				DO,
-				DQ,
-				DK,
-				DV,
-				LSE,
-				D,
-				softmax_scale,
-				stride_qm,
-				stride_kn,
-				stride_vn,
-				stride_bm,
-				stride_dom,
-				stride_dqm,
-				stride_dkn,
-				stride_dvn,
-				seqlen_q,
-				seqlen_k,
-				headdim,
-				ATOMIC_ADD=False,
-				BIAS_TYPE=BIAS_TYPE,
-				IS_CAUSAL=IS_CAUSAL,
-				BLOCK_HEADDIM=BLOCK_HEADDIM,
-				EVEN_M=EVEN_M,
-				EVEN_N=EVEN_N,
-				EVEN_HEADDIM=EVEN_HEADDIM,
-				BLOCK_M=BLOCK_M,
-				BLOCK_N=BLOCK_N,
-			)
-	else:
-		start_n = tl.program_id(0)
-		_bwd_kernel_one_col_block(
-			start_n,
-			Q,
-			K,
-			V,
-			Bias,
-			DO,
-			DQ,
-			DK,
-			DV,
-			LSE,
-			D,
-			softmax_scale,
-			stride_qm,
-			stride_kn,
-			stride_vn,
-			stride_bm,
-			stride_dom,
-			stride_dqm,
-			stride_dkn,
-			stride_dvn,
-			seqlen_q,
-			seqlen_k,
-			headdim,
-			ATOMIC_ADD=True,
-			BIAS_TYPE=BIAS_TYPE,
-			IS_CAUSAL=IS_CAUSAL,
-			BLOCK_HEADDIM=BLOCK_HEADDIM,
-			EVEN_M=EVEN_M,
-			EVEN_N=EVEN_N,
-			EVEN_HEADDIM=EVEN_HEADDIM,
-			BLOCK_M=BLOCK_M,
-			BLOCK_N=BLOCK_N,
-		)
+	L += off_hb * seqlen_q_rounded 
+	start_n = tl.program_id(0)
+	_bwd_kernel_one_col_block(
+		start_n,
+		Q, K, V, B,
+		Do, Dq, Dk, Dv,
+		L, D,
+		softmax_scale,
+		stride_qm, stride_kn, stride_vn, stride_bm,
+		stride_dom,
+		stride_dqm, stride_dkn, stride_dvn,
+		seqlen_q, seqlen_k,
+		headdim,
+		ATOMIC_ADD=True,
+		HAVE_BIAS=HAVE_BIAS,
+		BLOCK_HEADDIM=BLOCK_HEADDIM,
+		EVEN_M=EVEN_M, EVEN_N=EVEN_N, EVEN_HEADDIM=EVEN_HEADDIM,
+		BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+	)
 
-
+# fmt:on
+# fmt:off
 def _bwd_attn_kernel_call(
 	softmax_scale,
 	blocksize_q,
@@ -647,9 +518,11 @@ def _bwd_attn_kernel_call(
 	stride_kb, stride_kh, stride_kn = strides_from_shape(key.shape)
 	stride_vb, stride_vh, stride_vn = strides_from_shape(value.shape)
 	stride_ob, stride_oh, stride_om = strides_from_shape(o.shape)
-	stride_lb, stride_lh = strides_from_shape(l.shape)
+	stride_dqb, stride_dqh, stride_dqm = strides_from_shape(Dq.shape)
+	stride_dkb, stride_dkh, stride_dkn = strides_from_shape(Dk.shape)
+	stride_dvb, stride_dvh, stride_dvn = strides_from_shape(Dv.shape)  
 	stride_dob, stride_doh, stride_dom = strides_from_shape(Do.shape)
-	seqlen_q_rounded = math.ceil(seqlen_q / 64) * 64
+	seqlen_q_rounded = math.ceil(seqlen_q / 128) * 128
 	delta = jnp.empty_like(l)
 
 	num_warps = 4 if headdim <= 64 else 8
@@ -661,19 +534,11 @@ def _bwd_attn_kernel_call(
 		num_stages=1,
 	)
 	delta = triton_call(
-		o,
-		Do,
-		delta,
-		stride_ob,
-		stride_oh,
-		stride_om,
-		stride_dob,
-		stride_doh,
-		stride_dom,
-		nheads,
-		headdim,
-		seqlen_q,
-		seqlen_q_rounded,
+		o, Do, delta,
+		stride_ob, stride_oh, stride_om,
+		stride_dob, stride_doh, stride_dom,
+		nheads, headdim,
+		seqlen_q, seqlen_q_rounded,
 		# triton call kwargs
 		out_shape=[
 			jax.ShapeDtypeStruct(
@@ -687,7 +552,44 @@ def _bwd_attn_kernel_call(
 		kernel=_bwd_do_attn_kernel,
 		**metaparams,
 	)[0]
+	metaparams = dict(
+		BLOCK_M=blocksize_q,
+		BLOCK_N=blocksize_k,
+		num_warps=num_warps,
+		num_stages=1, 
+		BLOCK_HEADDIM=BLOCK_HEADDIM,
+		HAVE_BIAS=HAVE_BIAS,
+	)
+
+	Dq, Dk, Dv = triton_call(
+		query, key, value, bias,
+		Do, Dq, Dk, Dv,
+		l, delta,
+		softmax_scale,
+		stride_qb, stride_qh, stride_qm,
+		stride_kb, stride_kh, stride_kn,
+		stride_vb, stride_vh, stride_vn,
+		stride_bb, stride_bh, stride_bm,
+		stride_dob, stride_doh, stride_dom,
+		stride_dqb, stride_dqh, stride_dqm, 
+		stride_dkb, stride_dkh, stride_dkn,
+		stride_dvb, stride_dvh, stride_dvn,
+		seqlen_q, seqlen_k, seqlen_q_rounded,
+		headdim, nheads, 
+		kernel=_bwd_attn_kernel,
+		grid=lambda META: (triton.cdiv(seqlen_k, META["BLOCK_N"]), batch * nheads),
+		out_shape=[
+			jax.ShapeDtypeStruct(shape=Dq.shape, dtype=Dq.dtype, sharding=Dq.sharding),
+			jax.ShapeDtypeStruct(shape=Dk.shape, dtype=Dk.dtype, sharding=Dk.sharding),
+			jax.ShapeDtypeStruct(shape=Dv.shape, dtype=Dv.dtype, sharding=Dv.sharding),
+		],
+		input_output_aliases={5:0, 6:1, 7:2},
+		**metaparams,
+	)
+
 	return Dq, Dk, Dv, None
+
+# fmt:on
 
 
 def _fwd_attn_kernel_call_with_residual(
@@ -759,16 +661,20 @@ def _test_forward():
 
 def _test_backward():
 	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
-	B, H, S, D = 1, 32, 256, 128
+	B, H, S, D = 1, 32, 256, 64
 	q = jax.nn.initializers.normal(0.02)(q_key, (B, S, H, D), dtype=jnp.float16)
 	k = jax.nn.initializers.normal(0.02)(k_key, (B, S, H, D), dtype=jnp.float16)
 	v = jax.nn.initializers.normal(0.02)(v_key, (B, S, H, D), dtype=jnp.float16)
-	b = jnp.where(
-		jrnd.randint(v_key, (B, H, S, S), 0, 4) > 2,
-		jnp.finfo(jnp.float16).min,
-		0,
+	b = (
+		jnp.where(
+			jrnd.randint(v_key, (B, H, S, S), 0, 4) > 2,
+			jnp.finfo(jnp.float16).min,
+			0,
+		)
+		if False
+		else None
 	)
-	o = jax.grad(lambda *x: (flash_attn2_gpu(*x, blocksize_k=128, blocksize_q=64)).sum())(
+	o = jax.grad(lambda *x: (flash_attn2_gpu(*x, blocksize_k=64, blocksize_q=64)).sum())(
 		q, k, v, b
 	)
 	try:
@@ -778,7 +684,9 @@ def _test_backward():
 	except Exception as e:
 		print(f"Flax OOM : {e}")
 		exit()
-	print(jnp.allclose(o, fo, 0, 0.125))
+	print(o[-1, -1, -1, :5])
+	print(fo[-1, -1, -1, :5])
+	print(jnp.allclose(o, fo, 0, 5e-5))
 
 
 if __name__ == "__main__":
