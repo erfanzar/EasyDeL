@@ -174,10 +174,13 @@ def _get_hip_autotune_config():
 
 
 def _get_autotune_config():
-	if _is_cuda():
+	try:
+		if _is_cuda():
+			return _get_cuda_autotune_config()
+		else:
+			return _get_hip_autotune_config()
+	except:  # noqa
 		return _get_cuda_autotune_config()
-	else:
-		return _get_hip_autotune_config()
 
 
 @triton.autotune(configs=_get_autotune_config(), key=["M", "N", "K"])
