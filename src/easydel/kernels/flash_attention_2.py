@@ -24,6 +24,7 @@ from jax import custom_vjp
 from jax import numpy as jnp
 from jax import random as jrand
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import gpu as plg
 from jax import extend
 
 _PLATFORM = extend.backend.get_backend().platform
@@ -122,8 +123,12 @@ def _jax_bwd_flash_attn(
 			(0, j, dQ, dK_j, dV_j),
 		)
 
-		dK = jax.lax.dynamic_update_slice_in_dim(dK, dK_j.astype(dK.dtype), j * qblock, 2)
-		dV = jax.lax.dynamic_update_slice_in_dim(dV, dV_j.astype(dV.dtype), j * qblock, 2)
+		dK = jax.lax.dynamic_update_slice_in_dim(
+			dK, dK_j.astype(dK.dtype), j * qblock, 2
+		)
+		dV = jax.lax.dynamic_update_slice_in_dim(
+			dV, dV_j.astype(dV.dtype), j * qblock, 2
+		)
 
 		return j + 1, dQ, dK, dV
 
@@ -297,7 +302,9 @@ def _call_gpu_fwd_flash_attn(
 		out_specs=out_specs,
 		in_specs=in_specs,
 		out_shape=out_shape,
-		compiler_params=dict(triton=dict(num_wraps=4 if dim <= 64 else 8, num_stages=1)),
+		compiler_params=dict(
+			triton=dict(num_wraps=4 if dim <= 64 else 8, num_stages=1)
+		),
 		interpret=_INTERPRET,
 		debug=False,
 		name=f"gpu_fwd_flash_attn_{inference_mode}",
@@ -440,13 +447,13 @@ def _gpu_bwd_flash_attn_kernel(
 			p = jnp.exp(qk - lse_i)
 		else:
 			p = jnp.exp(qk * softmax_scale - lse_i)
-
-		dVj = dVj + jnp.dot(p.astype(jnp.float32).transpose(1, 0), dOi.astype(jnp.float32))
+		dVj = dVj + jnp.dot(
+			p.astype(jnp.float32).transpose(1, 0), dOi.astype(jnp.float32)
+		)
 		dP = jnp.dot(dOi.astype(jnp.float32), vj.transpose(1, 0).astype(jnp.float32))
-
 		delta = pl.load(delta_ref, idx=ld_idx, mask=q_seq_mask, other=0.0)[..., None]
 		dS = p * (dP - delta) * softmax_scale
-
+		pl.debug_print("{}", pQ)
 		dQi = pQ + jnp.dot(dS, kj.astype(dS.dtype))
 		dKj += jnp.dot(dS.transpose(1, 0), qi)
 		pl.store(
@@ -540,7 +547,9 @@ def _call_gpu_bwd_flash_attn(
 			headdim=dim,
 		),
 		grid=(pl.cdiv(seqlen_q, qblock), batch_size * nheads),
-		compiler_params=dict(triton=dict(num_wraps=4 if dim <= 64 else 8, num_stages=1)),
+		compiler_params=dict(
+			triton=dict(num_wraps=4 if dim <= 64 else 8, num_stages=1)
+		),
 		in_specs=[
 			pl.BlockSpec(o.shape, lambda *_: (0,) * o.ndim),
 			pl.BlockSpec(dO.shape, lambda *_: (0,) * dO.ndim),
@@ -551,6 +560,7 @@ def _call_gpu_bwd_flash_attn(
 		debug=False,
 		name="gpu_bwd_flash_attn",
 	)(o, dO)
+
 	method = pl.pallas_call(
 		partial(
 			_gpu_bwd_flash_attn_kernel,
@@ -567,7 +577,9 @@ def _call_gpu_bwd_flash_attn(
 		out_shape=out_shape,
 		out_specs=out_specs,
 		in_specs=in_specs,
-		compiler_params=dict(triton=dict(num_wraps=4 if dim <= 64 else 8, num_stages=1)),
+		compiler_params=dict(
+			triton=dict(num_wraps=4 if dim <= 64 else 8, num_stages=1)
+		),
 		interpret=True,  # TODO: DEBUG THIS
 		input_output_aliases={6: 0},
 		debug=False,
@@ -584,6 +596,11 @@ def _call_gpu_bwd_flash_attn(
 		jnp.zeros_like(q),
 	)
 
+	# for i in range(16):
+	# 	for j in range(16):
+	# 		print(f"pid (0, 0, 0) idx ({i}, {j}) q:", dq[0, i, 0, j])
+	# 		print(f"pid (0, 0, 0) idx ({i}, {j}) k:", dk[0, i, 0, j])
+	# 		print(f"pid (0, 0, 0) idx ({i}, {j}) v:", dv[0, i, 0, j])
 	return dq, dk, dv, None
 
 
@@ -685,37 +702,33 @@ def gpu_fwd_test():
 
 
 def gpu_bwd_test():
-	b, h, qs, s, d = 2, 32, 2048, 2048, 128
-	# b, h, qs, s, d = 1, 8, 32, 32, 16
-	# b, h, qs, s, d = 1, 1, 1, 2, 16
+	q_key, k_key, v_key = jrand.split(jrand.PRNGKey(8), 3)
+	B, H, S, D = 1, 2, 16, 16
+	blocksize_k = 16
+	blocksize_q = 16
+	q = jax.nn.initializers.normal(2)(q_key, (B, S, H, D), dtype=jnp.float32)
+	k = jax.nn.initializers.normal(2)(k_key, (B, S, H, D), dtype=jnp.float32)
+	v = jax.nn.initializers.normal(2)(v_key, (B, S, H, D), dtype=jnp.float32)
+	b = (
+		jnp.where(
+			jrand.randint(v_key, (B, H, S, S), 0, 4) > 2,
+			jnp.finfo(jnp.float32).min,
+			0,
+		)
+		if False
+		else None
+	)
 	dtype = _TEST_DTYPE
 
-	q = jrand.normal(_rng.rng, shape=(b, qs, h, d), dtype=dtype)
-	k = jrand.normal(_rng.rng, shape=(b, s, h, d), dtype=dtype)
-	v = jrand.normal(_rng.rng, shape=(b, s, h, d), dtype=dtype)
-	b = jnp.where(
-		jrand.randint(_rng.rng, shape=(b, h, qs, s), minval=0, maxval=3) > 1,
-		0,
-		jnp.finfo(dtype).min,
-	)
-
-	excepted_result = jax.grad(lambda *x: _dot_product_attention(*x).sum())(
-		q,
-		k,
-		v,
-	)
+	excepted_result = jax.grad(lambda *x: _dot_product_attention(*x).sum())(q, k, v, b)
 	result = jax.grad(
 		lambda *x: _gpu_flash_attn(
 			*x,
 			dtype=dtype,
-			qblock=32,
-			kblock=32,
+			qblock=blocksize_q,
+			kblock=blocksize_k,
 		).sum()
-	)(
-		q,
-		k,
-		v,
-	)
+	)(q, k, v, b)
 	print(f"PRED BWD : {result[-1,-1,-1,:5]}")
 	print(f"ORGN BWD : {excepted_result[-1,-1,-1,:5]}")
 
@@ -723,5 +736,5 @@ def gpu_bwd_test():
 
 
 if __name__ == "__main__":
-	gpu_fwd_test()
+	# gpu_fwd_test()
 	gpu_bwd_test()
