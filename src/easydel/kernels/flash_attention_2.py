@@ -452,8 +452,7 @@ def _gpu_bwd_flash_attn_kernel(
 		)
 		dP = jnp.dot(dOi.astype(jnp.float32), vj.transpose(1, 0).astype(jnp.float32))
 		delta = pl.load(delta_ref, idx=ld_idx, mask=q_seq_mask, other=0.0)[..., None]
-		dS = p * (dP - delta) * softmax_scale
-		pl.debug_print("{}", pQ)
+		dS = p * (dP - delta) * softmax_scale 
 		dQi = pQ + jnp.dot(dS, kj.astype(dS.dtype))
 		dKj += jnp.dot(dS.transpose(1, 0), qi)
 		pl.store(
@@ -495,8 +494,7 @@ def _gpu_bwd_flash_attn_kernel(
 		idx=(bg, pl.dslice(j * kblock, kblock), nhg, slice(None)),
 		val=dVj.astype(dV_ref),
 		mask=kv_seq_mask[:, None] & headdim_mask[None, :],
-	)
-	# jax.debug.print("{}", dQ_ref)
+	) 
 
 
 def _call_gpu_bwd_flash_attn(
@@ -594,13 +592,7 @@ def _call_gpu_bwd_flash_attn(
 		lse,
 		dO,
 		jnp.zeros_like(q),
-	)
-
-	# for i in range(16):
-	# 	for j in range(16):
-	# 		print(f"pid (0, 0, 0) idx ({i}, {j}) q:", dq[0, i, 0, j])
-	# 		print(f"pid (0, 0, 0) idx ({i}, {j}) k:", dk[0, i, 0, j])
-	# 		print(f"pid (0, 0, 0) idx ({i}, {j}) v:", dv[0, i, 0, j])
+	) 
 	return dq, dk, dv, None
 
 
