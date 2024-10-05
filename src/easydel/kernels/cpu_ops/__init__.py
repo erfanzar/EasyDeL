@@ -12,7 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Implementation by @erfanzar,
-# with a few bug fixes and adjustments.
-
-from easydel.kernels.tpu_ops.pallas_gemm import pallas_gemm
+from easydel.kernels.cpu_ops.jax_flash_attention_2 import jax_flash_attn_2_mu

@@ -116,7 +116,7 @@ def flash_attention2(
 		query_state = query_state * softmax_scale
 	else:
 		query_state = query_state / math.sqrt(float(query_state.shape[-1]))
-	return _flash_attn(
+	return _flash_attn2(
 		query_state,
 		key_state,
 		value_state,
@@ -144,7 +144,7 @@ def flash_attention2(
 		11,
 	),
 )
-def _flash_attn(
+def _flash_attn2(
 	query_state: jax.Array,
 	key_state: jax.Array,
 	value_state: jax.Array,
@@ -220,6 +220,7 @@ def _fwd_flash_attn(
 
 	global_mask = mask
 
+	@jax.jit
 	@functools.partial(jax.named_call, name="_fwd_flash_attn_call_o")
 	def call_o(state):
 		i, o, lse = state
@@ -228,6 +229,7 @@ def _fwd_flash_attn(
 		lse_i = jax.lax.dynamic_slice_in_dim(lse, i * q_block, q_block, 2)
 		m_i = jnp.full((b, h, q_block), fill_value=-jnp.inf, dtype=dtype)
 
+		@jax.jit
 		@functools.partial(jax.named_call, name="_fwd_flash_attn_call_o_call_qk")
 		def call_qk(state):
 			i, j, o_i, q_i, lse_i, m_i = state
@@ -246,7 +248,9 @@ def _fwd_flash_attn(
 				b_ij = jax.lax.dynamic_slice_in_dim(b_i, j * k_block, k_block, 3)
 				s_ij = s_ij + b_ij
 			if global_mask is not None:
-				ma_i = jax.lax.dynamic_slice_in_dim(global_mask, i * q_block, q_block, 2)
+				ma_i = jax.lax.dynamic_slice_in_dim(
+					global_mask, i * q_block, q_block, 2
+				)
 				ma_ij = jax.lax.dynamic_slice_in_dim(ma_i, j * k_block, k_block, 3)
 				s_ij = jnp.where(ma_ij, s_ij, -1e10)
 
@@ -356,6 +360,7 @@ def _bwd_flash_attn(
 	global_mask = mask
 	is_causal = mask is not None
 
+	@jax.jit
 	@functools.partial(jax.named_call, name="_bwd_flash_attn_call_o")
 	def call_o(state):
 		j, dQ, dK, dV = state
@@ -365,6 +370,7 @@ def _bwd_flash_attn(
 		dK_j = jax.lax.dynamic_slice_in_dim(dK, j * k_block, k_block, 2)
 		dV_j = jax.lax.dynamic_slice_in_dim(dV, j * k_block, k_block, 2)
 
+		@jax.jit
 		@functools.partial(jax.named_call, name="_bwd_flash_attn_call_o_call_qk")
 		def do_inner_block(state):
 			i, j, dQ, dK_j, dV_j = state
@@ -389,7 +395,9 @@ def _bwd_flash_attn(
 				s_ij = s_ij + b_ij
 
 			if global_mask is not None:
-				ma_i = jax.lax.dynamic_slice_in_dim(global_mask, i * q_block, q_block, 2)
+				ma_i = jax.lax.dynamic_slice_in_dim(
+					global_mask, i * q_block, q_block, 2
+				)
 				ma_ij = jax.lax.dynamic_slice_in_dim(ma_i, j * k_block, k_block, 3)
 				s_ij = jnp.where(ma_ij, s_ij, -1e10)
 
@@ -404,31 +412,15 @@ def _bwd_flash_attn(
 				p_ij = lax.select(mask, p_ij / keep_prob, jnp.zeros_like(p_ij))
 
 			dV_j = dV_j + jnp.matmul(
-				p_ij.transpose(0, 1, 3, 2),
-				dO_i,
-				precision=precision,
+				p_ij.transpose(0, 1, 3, 2), dO_i, precision=precision
 			)
 
-			dP_ij = jnp.einsum(
-				"...ik,...jk->...ij",
-				dO_i,
-				v_j,
-				precision=precision,
-			)
+			dP_ij = jnp.matmul(dO_i, v_j.transpose(0, 1, 3, 2), precision=precision)
 
 			dS_ij = p_ij * (dP_ij - D_i[..., None])
-
-			dQ_i = dQ_i + jnp.einsum(
-				"...id,...dj->...ij",
-				dS_ij,
-				k_j,
-				precision=precision,
-			)
-			dK_j = dK_j + jnp.einsum(
-				"...nm,...mk->...nk",
-				dS_ij,
-				q_i,
-				precision=precision,
+			dQ_i = dQ_i + jnp.matmul(dS_ij, k_j, precision=precision)
+			dK_j = dK_j + jnp.matmul(
+				dS_ij.transpose(0, 1, 3, 2), q_i, precision=precision
 			)
 			dQ = jax.lax.dynamic_update_slice_in_dim(
 				dQ,
@@ -451,8 +443,12 @@ def _bwd_flash_attn(
 			(i_start, j, dQ, dK_j, dV_j),
 		)
 
-		dK = jax.lax.dynamic_update_slice_in_dim(dK, dK_j.astype(dK.dtype), j * q_block, 2)
-		dV = jax.lax.dynamic_update_slice_in_dim(dV, dV_j.astype(dV.dtype), j * q_block, 2)
+		dK = jax.lax.dynamic_update_slice_in_dim(
+			dK, dK_j.astype(dK.dtype), j * q_block, 2
+		)
+		dV = jax.lax.dynamic_update_slice_in_dim(
+			dV, dV_j.astype(dV.dtype), j * q_block, 2
+		)
 
 		return j + 1, dQ, dK, dV
 
@@ -465,11 +461,11 @@ def _bwd_flash_attn(
 	return dQ, dK, dV, None, None
 
 
-_flash_attn.defvjp(_fwd_flash_attn, _bwd_flash_attn)
+_flash_attn2.defvjp(_fwd_flash_attn, _bwd_flash_attn)
 
 
 def fwd_test():
-	b, h, qs, s, d = 1, 8, 32, 32, 128
+	b, h, qs, s, d = 1, 8, 32, 128, 128
 	dtype = jnp.float16
 
 	q = jrand.normal(rng.rng, shape=(b, qs, h, d), dtype=dtype)
@@ -504,7 +500,7 @@ def fwd_test():
 
 
 def bwd_test():
-	b, h, qs, s, d = 1, 1, 1, 32, 64
+	b, h, qs, s, d = 2, 32, 64, 64, 64
 	dtype = jnp.float32
 
 	q = jrand.normal(rng.rng, shape=(b, qs, h, d), dtype=dtype)
@@ -518,11 +514,7 @@ def bwd_test():
 
 	excepted_result = jax.grad(
 		lambda *x: flax.linen.attention.dot_product_attention(*x).sum()
-	)(
-		q,
-		k,
-		v,
-	)
+	)(q, k, v)
 	result = jax.grad(
 		lambda *x: flash_attention2(
 			*x,
@@ -543,6 +535,10 @@ def bwd_test():
 	print(jnp.allclose(excepted_result, result, atol=0.125, rtol=0))
 
 
+jax_flash_attn_2_mu = _flash_attn2
+
+__all__ = ["jax_flash_attn_2_mu"]
+
 if __name__ == "__main__":
-	# fwd_test()
+	fwd_test()
 	bwd_test()

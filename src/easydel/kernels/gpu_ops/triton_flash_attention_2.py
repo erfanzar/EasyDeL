@@ -16,6 +16,22 @@ from jax import random as jrnd
 from triton import language as tl
 import numpy as np
 
+FLASH_ATTN_BWD_ = False
+
+
+def _simp_attn(query, key, value, bias, softmax_scale):
+	dtype = query.dtype
+	assert query.ndim == key.ndim, "q, k must have same rank."
+	assert query.shape[:-3] == key.shape[:-3], "q, k batch dims must match."
+	assert query.shape[-2] == key.shape[-2], "q, k num_heads must match."
+	assert query.shape[-1] == key.shape[-1], "q, k depths must match."
+	query = query * softmax_scale
+	attn_weights = jnp.einsum("...qhd,...khd->...hqk", query, key)
+	if bias is not None:
+		attn_weights = attn_weights + bias
+	attn_weights = jax.nn.softmax(attn_weights).astype(dtype)
+	return jnp.einsum("...hqk,...khd->...qhd", attn_weights, value)
+
 
 def get_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
 	size = np.prod(shape)
@@ -27,15 +43,12 @@ def get_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
 
 
 def apply_stride(self):
+	size = np.prod(self.shape)
+	strides = []
+	for s in self.shape:
+		strides.append(int(size // s))
+
 	def func(idx) -> int:
-		size = np.prod(self.shape)
-		strides = []
-		for s in self.shape:
-			size = int(size // s)
-			if size != 1:
-				strides.append(size)
-		if len(strides) == 0:
-			strides.append(1)
 		return int(strides[idx])
 
 	self.stride = func
@@ -127,7 +140,7 @@ def _fwd_attn_kernel(
 		tl.program_id(0),
 		tl.program_id(1),
 		tl.program_id(2),
-	)  # this one was the bug the whole time ...
+	) #this one was the bug the whole time ...
 	offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
 	offs_d = tl.arange(0, BLOCK_HEADDIM)
 	offs_n = tl.arange(0, BLOCK_N)
@@ -451,7 +464,7 @@ def _bwd_attn_kernel(
 		start_m = tl.multiple_of(start_m, BLOCK_M)
 		m_loop_offs = start_m + offs_m
 		# fmt:off
-		if EVEN_M & EVEN_HEADDIM:  
+		if EVEN_M & EVEN_HEADDIM:
 			q = tl.load(q_ptrs + start_m)
 		else:
 			if EVEN_HEADDIM:
@@ -493,9 +506,11 @@ def _bwd_attn_kernel(
 
 		# fmt:off
 		dq = tl.dot(ds, k)
-		pq = tl.load(dq_ptrs, mask=(m_loop_offs[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0)
-		res= dq + pq
-		tl.store(dq_ptrs, value=res, mask=(m_loop_offs[:, None] < seqlen_q) & (offs_d[None, :] < headdim))
+		pq = tl.load(dq_ptrs, mask=(m_loop_offs[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0, eviction_policy="evict_last")
+		res = dq + pq
+		tl.store(dq_ptrs, value=res, mask=(m_loop_offs[:, None] < seqlen_q) & (offs_d[None, :] < headdim), eviction_policy="evict_last")
+		epq = tl.load(dq_ptrs, mask=(m_loop_offs[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0, eviction_policy="evict_last")
+		tl.device_print("epq", epq)
 		# fmt:on
 
 	# fmt:off
@@ -526,128 +541,130 @@ def _bwd_attn_kernel_call(
 		nheads,
 		headdim,
 	), "shape missmatch between key, value."
-	assert headdim in {16, 32, 64, 128, 256}, "given headdim is not supported."
-	assert query.dtype == key.dtype == value.dtype, "tensors must have the same dtype."
-	assert query.dtype in [jnp.float16, jnp.bfloat16], "only support fp16 and bf16."
 	softmax_scale = softmax_scale or 1.0 / math.sqrt(headdim)
-	HAVE_BIAS = True if bias is not None else False
-	BLOCK_HEADDIM = max(triton.next_power_of_2(headdim), 16)
+	if FLASH_ATTN_BWD_:
+		assert headdim in {16, 32, 64, 128, 256}, "given headdim is not supported."
+		assert (
+			query.dtype == key.dtype == value.dtype
+		), "tensors must have the same dtype."
+		assert query.dtype in [jnp.float16, jnp.bfloat16], "only support fp16 and bf16."
+		HAVE_BIAS = True if bias is not None else False
+		BLOCK_HEADDIM = max(triton.next_power_of_2(headdim), 16)
 
-	stride_bb, stride_bh, stride_bm, stride_bn = (
-		get_strides(bias.shape) if HAVE_BIAS else (0, 0, 0, 0)
-	)
-	query = apply_stride(query)
-	key = apply_stride(key)
-	value = apply_stride(value)
-	l = apply_stride(l)
-	o = apply_stride(o)
-	delta = apply_stride(jnp.empty_like(l))
+		stride_bb, stride_bh, stride_bm = (
+			get_strides(bias.shape)[:-1] if HAVE_BIAS else (0, 0, 0)
+		)
+		query = apply_stride(query)
+		key = apply_stride(key)
+		value = apply_stride(value)
+		l = apply_stride(l)
+		o = apply_stride(o)
 
-	num_warps = 4 if headdim <= 64 else 8
+		delta = apply_stride(jnp.empty_like(l))
 
-	# kernel kwargs
-	metaparams = dict(
-		BLOCK_M=blocksize_q,
-		BLOCK_HEADDIM=BLOCK_HEADDIM,
-		num_warps=num_warps,
-		num_stages=1,
-	)
-	delta = triton_call(
-		o,
-		Do,
-		delta,
-		query.stride(0),
-		query.stride(2),
-		query.stride(1),
-		query.stride(0),
-		query.stride(2),
-		query.stride(1),
-		delta.stride(0),
-		delta.stride(1),
-		nheads,
-		headdim,
-		seqlen_q,
-		out_shape=[
-			jax.ShapeDtypeStruct(
-				shape=delta.shape,
-				dtype=delta.dtype,
-				sharding=delta.sharding,
-			)
-		],
-		input_output_aliases={2: 0},
-		grid=lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch, nheads),
-		kernel=_bwd_do_attn_kernel,
-		name="triton::ops::_bwd_do_attn_kernel",
-		**metaparams,
-	)[0]
-	metaparams = dict(
-		BLOCK_M=blocksize_q,
-		BLOCK_N=blocksize_k,
-		num_warps=num_warps,
-		num_stages=1,
-		BLOCK_HEADDIM=BLOCK_HEADDIM,
-		HAVE_BIAS=HAVE_BIAS,
-	)
+		num_warps = 4 if headdim <= 64 else 8
 
-	Dq, Dk, Dv = triton_call(
-		query,
-		key,
-		value,
-		bias if bias is not None else jnp.zeros((1,), jnp.float16),
-		Do,
-		l,
-		delta,
-		softmax_scale,
-		query.stride(0),
-		query.stride(2),
-		query.stride(1),
-		key.stride(0),
-		key.stride(2),
-		key.stride(1),
-		value.stride(0),
-		value.stride(2),
-		value.stride(1),
-		stride_bb,
-		stride_bh,
-		stride_bm,
-		query.stride(0),  # Do
-		query.stride(2),  # Do
-		query.stride(1),  # Do
-		query.stride(0),  # Dq
-		query.stride(2),  # Dq
-		query.stride(1),  # Dq
-		key.stride(0),  # Dk
-		key.stride(2),  # Dk
-		key.stride(1),  # Dk
-		value.stride(0),  # Dv
-		value.stride(2),  # Dv
-		value.stride(1),  # Dv
-		l.stride(0),
-		l.stride(1),
-		seqlen_q,
-		seqlen_k,
-		headdim,
-		nheads,
-		# Dq,
-		kernel=_bwd_attn_kernel,
-		grid=lambda META: (triton.cdiv(seqlen_k, META["BLOCK_N"]), batch, nheads),
-		out_shape=[
-			jax.ShapeDtypeStruct(
-				shape=query.shape, dtype=query.dtype, sharding=query.sharding
-			),
-			jax.ShapeDtypeStruct(
-				shape=key.shape, dtype=key.dtype, sharding=key.sharding
-			),
-			jax.ShapeDtypeStruct(
-				shape=value.shape, dtype=value.dtype, sharding=value.sharding
-			),
-		],
-		# input_output_aliases={5: 0},
-		name="triton::ops::_bwd_attn_kernel",
-		**metaparams,
-	)
+		# kernel kwargs
+		metaparams = dict(
+			BLOCK_M=blocksize_q,
+			BLOCK_HEADDIM=BLOCK_HEADDIM,
+			num_warps=num_warps,
+			num_stages=1,
+		)
+		delta = triton_call(
+			o,
+			Do,
+			delta,
+			query.stride(0),
+			query.stride(2),
+			query.stride(1),
+			query.stride(0),
+			query.stride(2),
+			query.stride(1),
+			delta.stride(0),
+			delta.stride(1),
+			nheads,
+			headdim,
+			seqlen_q,
+			out_shape=[
+				jax.ShapeDtypeStruct(
+					shape=delta.shape,
+					dtype=delta.dtype,
+					sharding=delta.sharding,
+				)
+			],
+			input_output_aliases={2: 0},
+			grid=lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch, nheads),
+			kernel=_bwd_do_attn_kernel,
+			name="triton::ops::_bwd_do_attn_kernel",
+			**metaparams,
+		)[0]
+		metaparams = dict(
+			BLOCK_M=blocksize_q,
+			BLOCK_N=blocksize_k,
+			num_warps=num_warps,
+			num_stages=1,
+			BLOCK_HEADDIM=BLOCK_HEADDIM,
+			HAVE_BIAS=HAVE_BIAS,
+		)
+		query_strides = (query.stride(0), query.stride(2), query.stride(1))
+		key_strides = (key.stride(0), key.stride(2), key.stride(1))
+		value_strides = (value.stride(0), value.stride(2), value.stride(1))
+		bias_strides = (stride_bb, stride_bh, stride_bm)
+		d_output_strides = (query.stride(0), query.stride(2), query.stride(1))
+		d_query_strides = (query.stride(0), query.stride(2), query.stride(1))
+		d_key_strides = (key.stride(0), key.stride(2), key.stride(1))
+		d_value_strides = (value.stride(0), value.stride(2), value.stride(1))
+		lse_strides = (l.stride(0), l.stride(1))
+		Dq, Dk, Dv = triton_call(
+			query,
+			key,
+			value,
+			bias if bias is not None else jnp.zeros((1,), jnp.float16),
+			Do,
+			l,
+			delta,
+			softmax_scale,
+			*query_strides,
+			*key_strides,
+			*value_strides,
+			*bias_strides,
+			*d_output_strides,
+			*d_query_strides,
+			*d_key_strides,
+			*d_value_strides,
+			*lse_strides,
+			seqlen_q,
+			seqlen_k,
+			headdim,
+			nheads,
+			kernel=_bwd_attn_kernel,
+			grid=lambda META: (triton.cdiv(seqlen_k, META["BLOCK_N"]), batch, nheads),
+			out_shape=[
+				jax.ShapeDtypeStruct(
+					shape=query.shape, dtype=query.dtype, sharding=query.sharding
+				),
+				jax.ShapeDtypeStruct(
+					shape=key.shape, dtype=key.dtype, sharding=key.sharding
+				),
+				jax.ShapeDtypeStruct(
+					shape=value.shape, dtype=value.dtype, sharding=value.sharding
+				),
+			],
+			name="triton::ops::_bwd_attn_kernel",
+			**metaparams,
+		)
 
-	return Dq, Dk, Dv, None
+		return Dq, Dk, Dv, None
+	else:  # Flash attn bwd have some issue at the moment
+		_, f_vjp = jax.vjp(
+			functools.partial(_simp_attn, softmax_scale=softmax_scale),
+			query,
+			key,
+			value,
+			bias,
+		)
+		return f_vjp(Do)
 
 
 def _fwd_attn_kernel_call_with_residual(
@@ -672,7 +689,7 @@ def _fwd_attn_kernel_call_with_residual(
 
 
 @functools.partial(custom_vjp, nondiff_argnums=[4, 5, 6])
-def flash_attn2_gpu(
+def _flash_attn2(
 	query: Optional[chex.Array],
 	key: Optional[chex.Array],
 	value: Optional[chex.Array],
@@ -692,7 +709,7 @@ def flash_attn2_gpu(
 	)[0]
 
 
-flash_attn2_gpu.defvjp(
+_flash_attn2.defvjp(
 	_fwd_attn_kernel_call_with_residual,
 	_bwd_attn_kernel_call,
 )
@@ -717,7 +734,7 @@ def _test_forward():
 	)
 	print("QKV Allocated")
 	try:
-		co = flash_attn2_gpu(
+		co = _flash_attn2(
 			q, k, v, b, None, blocksize_k, blocksize_q
 		)  # passes 256K on 24G GPU 3090
 		print(co[-1, -1, -1, :5])
@@ -736,7 +753,7 @@ def _test_forward():
 
 def _test_backward():
 	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
-	B, H, S, D = 1, 2, 16, 16
+	B, H, S, D = 1, 1, 3, 16
 	blocksize_k = 16
 	blocksize_q = 16
 	q = jax.nn.initializers.normal(2)(q_key, (B, S, H, D), dtype=jnp.float16)
@@ -752,7 +769,7 @@ def _test_backward():
 		if False
 		else None
 	)
-	o = jax.grad(lambda *x: flash_attn2_gpu(*x, None, blocksize_q, blocksize_k).sum())(
+	o = jax.grad(lambda *x: _flash_attn2(*x, None, blocksize_q, blocksize_k).sum())(
 		q, k, v, b
 	)
 	try:
@@ -767,6 +784,9 @@ def _test_backward():
 	print(jnp.allclose(o, fo, 0, 0.125))
 
 
+triton_flash_attn_2_gpu = _flash_attn2
+__all__ = ["triton_flash_attn_2_gpu"]
+
 if __name__ == "__main__":
-	# _test_forward()
+	_test_forward()
 	_test_backward()

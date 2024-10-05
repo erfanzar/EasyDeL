@@ -234,3 +234,5 @@ def pallas_gemm(
 
 
 pallas_gemm.defvjp(_call_tpu_matmul_kernel_fwd_residual, _call_tpu_matmul_kernel_bwd)
+
+__all__ = ["pallas_gemm"]
