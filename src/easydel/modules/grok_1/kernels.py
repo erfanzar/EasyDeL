@@ -17,7 +17,7 @@ import jax
 from jax import lax
 from jax import numpy as jnp
 
-from easydel.kernels.gemm import gemm_kernel
+from easydel.kernels.gemm import gemm
 
 
 def grok1_mlp_pallas(
@@ -41,9 +41,9 @@ def grok1_mlp_pallas(
 	)
 	
 
-	return gemm_kernel(
+	return gemm(
 		(
-			jax.nn.gelu(gemm_kernel(x, linear, **args)) * gemm_kernel(x, linear_v, **args)
+			jax.nn.gelu(gemm(x, linear, **args)) * gemm(x, linear_v, **args)
 		),
 		linear_1,
 		**args,

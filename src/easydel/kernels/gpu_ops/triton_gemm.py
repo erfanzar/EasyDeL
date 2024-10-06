@@ -185,7 +185,7 @@ def _get_autotune_config():
 
 @triton.autotune(configs=_get_autotune_config(), key=["M", "N", "K"])
 @triton.jit
-def _triton_gemm_kernel(
+def _triton_gemm(
 	a_ptr,
 	b_ptr,
 	c_ptr,
@@ -282,7 +282,7 @@ def _gemm_activation_kernel(
 	tl.store(c_ptrs, acc, mask=c_mask)
 
 
-def _triton_call_gemm_kernel(A, B):
+def _triton_call_gemm(A, B):
 	M, K, N = A.shape[0], A.shape[1], B.shape[1]
 	out_shape = jax.ShapeDtypeStruct(
 		(A.shape[0], B.shape[1]),
@@ -316,7 +316,7 @@ def _triton_call_gemm_kernel(A, B):
 	return jt.triton_call(
 		A,
 		B,
-		kernel=_triton_gemm_kernel,
+		kernel=_triton_gemm,
 		grid=lambda META: (
 			triton.cdiv(META["M"], META["BLOCK_SIZE_M"])
 			* triton.cdiv(META["N"], META["BLOCK_SIZE_N"]),
@@ -337,7 +337,7 @@ def impt_prim(A, B):
 		compute_dtype = jnp.float16
 	else:
 		compute_dtype = jnp.float32
-	return _triton_call_gemm_kernel(
+	return _triton_call_gemm(
 		A.astype(compute_dtype),
 		B.astype(compute_dtype),
 	).astype(A.dtype)
@@ -480,6 +480,6 @@ __all__ = ["gemm"]
 if __name__ == "__main__":
 	from absl import app
 
-	app.run(test_run)
-	app.run(test_vmap)
+	# app.run(test_run)
+	# app.run(test_vmap)
 	app.run(bench)

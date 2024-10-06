@@ -132,6 +132,7 @@ class FlaxLlamaAttention(FlaxAttentionModule):
 		)
 
 		self.rotary = FlaxLlamaEmbedding(self.dtype)
+
 		self.attention_performer = FlexibleAttentionModule(
 			attention_dropout=self.config.attention_dropout,
 			num_attention_heads=self.config.num_attention_heads,
@@ -262,7 +263,9 @@ class FlaxLlamaAttention(FlaxAttentionModule):
 			causal_mask = causal_mask[:, :, :query_length, :key_length]
 
 		batch_size = hidden_states.shape[0]
-		causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
+		causal_mask = jnp.broadcast_to(
+			causal_mask, (batch_size,) + causal_mask.shape[1:]
+		)
 		if attention_mask.ndim == 2:
 			attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
 		attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
@@ -298,7 +301,9 @@ class FlaxLlamaAttention(FlaxAttentionModule):
 		attention_bias = lax.select(
 			attention_mask > 0,
 			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-			jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+			jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(
+				self.dtype
+			),
 		)
 
 		query_length, key_length = query_states.shape[1], key_states.shape[1]
@@ -439,7 +444,9 @@ class FlaxLlamaBlock(nn.Module):
 			attn_block = nn_partitioning.remat(
 				FlaxLlamaAttention,
 				static_argnums=(1, 3, 4, 6, 7, 8),
-				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+				policy=get_gradient_checkpoint_policy(
+					self.config.gradient_checkpointing
+				),
 			)
 
 		self.self_attn = attn_block(
@@ -454,7 +461,9 @@ class FlaxLlamaBlock(nn.Module):
 			mlp_block = nn_partitioning.remat(
 				FlaxLlamaMLP,
 				static_argnums=(1,),
-				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+				policy=get_gradient_checkpoint_policy(
+					self.config.gradient_checkpointing
+				),
 			)
 
 		self.mlp = mlp_block(
@@ -719,7 +728,9 @@ class FlaxLlamaPreTrainedModel(EDPretrainedModel):
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
 		)
-		return_dict = return_dict if return_dict is not None else self.config.return_dict
+		return_dict = (
+			return_dict if return_dict is not None else self.config.return_dict
+		)
 		batch_size, sequence_length = (
 			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
 		)
@@ -745,7 +756,9 @@ class FlaxLlamaPreTrainedModel(EDPretrainedModel):
 			rngs["params"] = jax.random.key(0)
 
 		inputs = (
-			{"params": params or self.params} if add_params_field else params or self.params
+			{"params": params or self.params}
+			if add_params_field
+			else params or self.params
 		)
 
 		if past_key_values is not None:
@@ -904,7 +917,9 @@ class FlaxLlamaModule(nn.Module):
 		self.embed_tokens = nn.Embed(
 			self.config.vocab_size,
 			self.config.hidden_size,
-			embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+			embedding_init=jax.nn.initializers.normal(
+				stddev=self.config.initializer_range
+			),
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 		)
@@ -1071,7 +1086,9 @@ class FlaxLlamaForCausalLMModule(nn.Module):
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(
+				stddev=self.config.initializer_range
+			),
 			precision=self.precision,
 			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
 		)
@@ -1243,7 +1260,9 @@ class FlaxLlamaForSequenceClassificationModule(nn.Module):
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(
+				stddev=self.config.initializer_range
+			),
 			precision=self.precision,
 		)
 

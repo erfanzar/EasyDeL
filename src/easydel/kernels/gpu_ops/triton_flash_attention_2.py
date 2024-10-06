@@ -19,7 +19,25 @@ import numpy as np
 FLASH_ATTN_BWD_ = False
 
 
-def _simp_attn(query, key, value, bias, softmax_scale):
+def _simp_attn(
+	query: chex.Array,
+	key: chex.Array,
+	value: chex.Array,
+	bias: Optional[chex.Array],
+	softmax_scale: float,
+) -> chex.Array:
+	"""Simplified attention function for testing and comparison.
+
+	Args:
+		query: Query array of shape (..., num_heads, seq_len_q, head_dim).
+		key: Key array of shape (..., num_heads, seq_len_k, head_dim).
+		value: Value array of shape (..., num_heads, seq_len_k, head_dim).
+		bias: Optional bias array of shape (..., num_heads, seq_len_q, seq_len_k).
+		softmax_scale: Scaling factor for the softmax function.
+
+	Returns:
+		Output array of shape (..., num_heads, seq_len_q, head_dim).
+	"""
 	dtype = query.dtype
 	assert query.ndim == key.ndim, "q, k must have same rank."
 	assert query.shape[:-3] == key.shape[:-3], "q, k batch dims must match."
@@ -34,6 +52,14 @@ def _simp_attn(query, key, value, bias, softmax_scale):
 
 
 def get_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
+	"""Calculates strides for a given shape.
+
+	Args:
+		shape: Shape of the array.
+
+	Returns:
+		Tuple of strides.
+	"""
 	size = np.prod(shape)
 	strides = []
 	for s in shape:
@@ -42,26 +68,66 @@ def get_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
 	return tuple(strides)
 
 
-def apply_stride(self):
+def apply_stride(self: chex.Array):
+	"""Applies stride to an array.
+
+	Args:
+		self: Array to apply stride to.
+
+	Returns:
+		Array with stride applied.
+	"""
 	size = np.prod(self.shape)
 	strides = []
 	for s in self.shape:
 		strides.append(int(size // s))
 
-	def func(idx) -> int:
+	def func(idx: int) -> int:
 		return int(strides[idx])
 
 	self.stride = func
 	return self
 
 
-def get_sharding(arr):
+def get_sharding(arr: chex.Array):
+	"""Gets the sharding of an array.
+
+	Args:
+		arr: Array to get sharding from.
+
+	Returns:
+		Sharding of the array.
+	"""
 	return getattr(arr, "sharding", None)
 
 
 def check_shapes_and_dtypes(
-	query, key, value, batch, seqlen_k, nheads, headdim, blocksize_k, blocksize_q
+	query: chex.Array,
+	key: chex.Array,
+	value: chex.Array,
+	batch: int,
+	seqlen_k: int,
+	nheads: int,
+	headdim: int,
+	blocksize_k: int,
+	blocksize_q: int,
 ):
+	"""Checks the shapes and dtypes of the input arrays.
+
+	Args:
+		query: Query array.
+		key: Key array.
+		value: Value array.
+		batch: Batch size.
+		seqlen_k: Sequence length of the key.
+		nheads: Number of heads.
+		headdim: Head dimension.
+		blocksize_k: Block size for the key.
+		blocksize_q: Block size for the query.
+
+	Raises:
+		AssertionError: If the shapes or dtypes are not valid.
+	"""
 	chex.assert_shape(
 		key,
 		(batch, seqlen_k, nheads, headdim),
@@ -104,28 +170,28 @@ def _fwd_attn_kernel(
 	K,
 	V,
 	B,
-	softmax_scale,
-	stride_qb,
-	stride_qh,
-	stride_qm,
-	stride_kb,
-	stride_kh,
-	stride_kn,
-	stride_vb,
-	stride_vh,
-	stride_vn,
-	stride_bb,
-	stride_bh,
-	stride_bm,
-	stride_bn,
-	stride_ob,
-	stride_oh,
-	stride_om,
-	stride_lb,
-	stride_lh,
-	headdim,
-	seqlen_q,
-	seqlen_k,
+	softmax_scale: float,
+	stride_qb: int,
+	stride_qh: int,
+	stride_qm: int,
+	stride_kb: int,
+	stride_kh: int,
+	stride_kn: int,
+	stride_vb: int,
+	stride_vh: int,
+	stride_vn: int,
+	stride_bb: int,
+	stride_bh: int,
+	stride_bm: int,
+	stride_bn: int,
+	stride_ob: int,
+	stride_oh: int,
+	stride_om: int,
+	stride_lb: int,
+	stride_lh: int,
+	headdim: int,
+	seqlen_q: int,
+	seqlen_k: int,
 	O,
 	L,
 	HAVE_BIAS: tl.constexpr,
@@ -136,6 +202,45 @@ def _fwd_attn_kernel(
 	BLOCK_M: tl.constexpr,
 	BLOCK_N: tl.constexpr,
 ):
+	"""Triton kernel for the forward pass of the attention mechanism.
+
+	Args:
+		Q: Query array.
+		K: Key array.
+		V: Value array.
+		B: Bias array.
+		softmax_scale: Scaling factor for the softmax function.
+		stride_qb: Stride for the query batch dimension.
+		stride_qh: Stride for the query head dimension.
+		stride_qm: Stride for the query sequence dimension.
+		stride_kb: Stride for the key batch dimension.
+		stride_kh: Stride for the key head dimension.
+		stride_kn: Stride for the key sequence dimension.
+		stride_vb: Stride for the value batch dimension.
+		stride_vh: Stride for the value head dimension.
+		stride_vn: Stride for the value sequence dimension.
+		stride_bb: Stride for the bias batch dimension.
+		stride_bh: Stride for the bias head dimension.
+		stride_bm: Stride for the bias query sequence dimension.
+		stride_bn: Stride for the bias key sequence dimension.
+		stride_ob: Stride for the output batch dimension.
+		stride_oh: Stride for the output head dimension.
+		stride_om: Stride for the output sequence dimension.
+		stride_lb: Stride for the log-sum-exp batch dimension.
+		stride_lh: Stride for the log-sum-exp head dimension.
+		headdim: Head dimension.
+		seqlen_q: Sequence length of the query.
+		seqlen_k: Sequence length of the key.
+		O: Output array.
+		L: Log-sum-exp array.
+		HAVE_BIAS: Whether bias is present.
+		BLOCK_HEADDIM: Block size for the head dimension.
+		EVEN_M: Whether the query sequence length is divisible by the block size.
+		EVEN_N: Whether the key sequence length is divisible by the block size.
+		EVEN_HEADDIM: Whether the head dimension is divisible by the block size.
+		BLOCK_M: Block size for the query sequence dimension.
+		BLOCK_N: Block size for the key sequence dimension.
+	"""
 	start_m, off_b, off_h = (
 		tl.program_id(0),
 		tl.program_id(1),
@@ -243,6 +348,20 @@ def _fwd_attn_kernel_call(
 	blocksize_q: int = 128,
 	blocksize_k: int = 128,
 ):
+	"""Calls the Triton kernel for the forward pass of the attention mechanism.
+
+	Args:
+		query: Query array.
+		key: Key array.
+		value: Value array.
+		bias: Bias array.
+		softmax_scale: Scaling factor for the softmax function.
+		blocksize_q: Block size for the query sequence dimension.
+		blocksize_k: Block size for the key sequence dimension.
+
+	Returns:
+		Tuple of the output array and the log-sum-exp array.
+	"""
 	query = apply_stride(query)
 	key = apply_stride(key)
 	value = apply_stride(value)
@@ -320,20 +439,40 @@ def _bwd_do_attn_kernel(
 	O,
 	Do,
 	De,
-	stride_ob,
-	stride_om,
-	stride_oh,
-	stride_dob,
-	stride_dom,
-	stride_doh,
-	stride_deb,
-	stride_deh,
-	nheads,
-	headdim,
-	seqlen_q,
+	stride_ob: int,
+	stride_om: int,
+	stride_oh: int,
+	stride_dob: int,
+	stride_dom: int,
+	stride_doh: int,
+	stride_deb: int,
+	stride_deh: int,
+	nheads: int,
+	headdim: int,
+	seqlen_q: int,
 	BLOCK_M: tl.constexpr,
 	BLOCK_HEADDIM: tl.constexpr,
 ):
+	"""Triton kernel for the backward pass of the attention mechanism with respect to the output gradient.
+
+	Args:
+		O: Output array.
+		Do: Output gradient array.
+		De: Delta array.
+		stride_ob: Stride for the output batch dimension.
+		stride_om: Stride for the output sequence dimension.
+		stride_oh: Stride for the output head dimension.
+		stride_dob: Stride for the output gradient batch dimension.
+		stride_dom: Stride for the output gradient sequence dimension.
+		stride_doh: Stride for the output gradient head dimension.
+		stride_deb: Stride for the delta batch dimension.
+		stride_deh: Stride for the delta head dimension.
+		nheads: Number of heads.
+		headdim: Head dimension.
+		seqlen_q: Sequence length of the query.
+		BLOCK_M: Block size for the query sequence dimension.
+		BLOCK_HEADDIM: Block size for the head dimension.
+	"""
 	off_q = tl.program_id(0)
 	off_hb = tl.program_id(1)
 	off_b = off_hb // nheads
@@ -388,40 +527,40 @@ def _bwd_attn_kernel(
 	Do,
 	L,
 	D,
-	softmax_scale,
-	stride_qb,
-	stride_qh,
-	stride_qm,
-	stride_kb,
-	stride_kh,
-	stride_kn,
-	stride_vb,
-	stride_vh,
-	stride_vn,
-	stride_bb,
-	stride_bh,
-	stride_bm,
-	stride_dob,
-	stride_doh,
-	stride_dom,
-	stride_dqb,
-	stride_dqh,
-	stride_dqm,
-	stride_dkb,
-	stride_dkh,
-	stride_dkn,
-	stride_dvb,
-	stride_dvh,
-	stride_dvn,
-	stride_lb,
-	stride_lh,
-	seqlen_q,
-	seqlen_k,
-	headdim,
-	nheads,
-	Dq,
-	Dk,
-	Dv,
+	softmax_scale: float,
+	stride_qb: int,
+	stride_qh: int,
+	stride_qm: int,
+	stride_kb: int,
+	stride_kh: int,
+	stride_kn: int,
+	stride_vb: int,
+	stride_vh: int,
+	stride_vn: int,
+	stride_bb: int,
+	stride_bh: int,
+	stride_bm: int,
+	stride_dob: int,
+	stride_doh: int,
+	stride_dom: int,
+	stride_dqb: int,
+	stride_dqh: int,
+	stride_dqm: int,
+	stride_dkb: int,
+	stride_dkh: int,
+	stride_dkn: int,
+	stride_dvb: int,
+	stride_dvh: int,
+	stride_dvn: int,
+	stride_lb: int,
+	stride_lh: int,
+	seqlen_q: int,
+	seqlen_k: int,
+	headdim: int,
+	nheads: int,
+	Dq: chex.Array,
+	Dk: chex.Array,
+	Dv: chex.Array,
 	HAVE_BIAS: tl.constexpr,
 	BLOCK_HEADDIM: tl.constexpr,
 	EVEN_M: tl.constexpr,
@@ -430,6 +569,58 @@ def _bwd_attn_kernel(
 	BLOCK_M: tl.constexpr,
 	BLOCK_N: tl.constexpr,
 ):
+	"""Triton kernel for the backward pass of the attention mechanism.
+
+	Args:
+		Q: Query array.
+		K: Key array.
+		V: Value array.
+		B: Bias array.
+		Do: Output gradient array.
+		L: Log-sum-exp array.
+		D: Delta array.
+		softmax_scale: Scaling factor for the softmax function.
+		stride_qb: Stride for the query batch dimension.
+		stride_qh: Stride for the query head dimension.
+		stride_qm: Stride for the query sequence dimension.
+		stride_kb: Stride for the key batch dimension.
+		stride_kh: Stride for the key head dimension.
+		stride_kn: Stride for the key sequence dimension.
+		stride_vb: Stride for the value batch dimension.
+		stride_vh: Stride for the value head dimension.
+		stride_vn: Stride for the value sequence dimension.
+		stride_bb: Stride for the bias batch dimension.
+		stride_bh: Stride for the bias head dimension.
+		stride_bm: Stride for the bias query sequence dimension.
+		stride_dob: Stride for the output gradient batch dimension.
+		stride_doh: Stride for the output gradient head dimension.
+		stride_dom: Stride for the output gradient sequence dimension.
+		stride_dqb: Stride for the query gradient batch dimension.
+		stride_dqh: Stride for the query gradient head dimension.
+		stride_dqm: Stride for the query gradient sequence dimension.
+		stride_dkb: Stride for the key gradient batch dimension.
+		stride_dkh: Stride for the key gradient head dimension.
+		stride_dkn: Stride for the key gradient sequence dimension.
+		stride_dvb: Stride for the value gradient batch dimension.
+		stride_dvh: Stride for the value gradient head dimension.
+		stride_dvn: Stride for the value gradient sequence dimension.
+		stride_lb: Stride for the log-sum-exp batch dimension.
+		stride_lh: Stride for the log-sum-exp head dimension.
+		seqlen_q: Sequence length of the query.
+		seqlen_k: Sequence length of the key.
+		headdim: Head dimension.
+		nheads: Number of heads.
+		Dq: Query gradient array.
+		Dk: Key gradient array.
+		Dv: Value gradient array.
+		HAVE_BIAS: Whether bias is present.
+		BLOCK_HEADDIM: Block size for the head dimension.
+		EVEN_M: Whether the query sequence length is divisible by the block size.
+		EVEN_N: Whether the key sequence length is divisible by the block size.
+		EVEN_HEADDIM: Whether the head dimension is divisible by the block size.
+		BLOCK_M: Block size for the query sequence dimension.
+		BLOCK_N: Block size for the key sequence dimension.
+	"""
 	# fmt:on
 	off_n, off_b, off_h = (
 		tl.program_id(0),
@@ -506,11 +697,9 @@ def _bwd_attn_kernel(
 
 		# fmt:off
 		dq = tl.dot(ds, k)
-		pq = tl.load(dq_ptrs, mask=(m_loop_offs[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0, eviction_policy="evict_last")
+		pq = tl.load(dq_ptrs + start_m, mask=(m_loop_offs[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0, eviction_policy="evict_last")
 		res = dq + pq
-		tl.store(dq_ptrs, value=res, mask=(m_loop_offs[:, None] < seqlen_q) & (offs_d[None, :] < headdim), eviction_policy="evict_last")
-		epq = tl.load(dq_ptrs, mask=(m_loop_offs[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0, eviction_policy="evict_last")
-		tl.device_print("epq", epq)
+		tl.store(dq_ptrs + start_m, value=res, mask=(m_loop_offs[:, None] < seqlen_q) & (offs_d[None, :] < headdim), eviction_policy="evict_last")
 		# fmt:on
 
 	# fmt:off
@@ -520,12 +709,24 @@ def _bwd_attn_kernel(
 
 
 def _bwd_attn_kernel_call(
-	softmax_scale,
-	blocksize_q,
-	blocksize_k,
+	softmax_scale: float,
+	blocksize_q: int,
+	blocksize_k: int,
 	residual,
-	Do,
+	Do: chex.Array,
 ):
+	"""Calls the Triton kernel for the backward pass of the attention mechanism.
+
+	Args:
+		softmax_scale: Scaling factor for the softmax function.
+		blocksize_q: Block size for the query sequence dimension.
+		blocksize_k: Block size for the key sequence dimension.
+		residual: Residual from the forward pass.
+		Do: Output gradient array.
+
+	Returns:
+		Tuple of the gradients of the query, key, value, and bias arrays.
+	"""
 	(o, l, query, key, value, bias) = residual
 	batch, seqlen_q, nheads, headdim = query.shape
 	_, seqlen_k, _, _ = key.shape
@@ -676,6 +877,20 @@ def _fwd_attn_kernel_call_with_residual(
 	blocksize_q: int = 128,
 	blocksize_k: int = 128,
 ):
+	"""Calls the Triton kernel for the forward pass of the attention mechanism and returns the residual.
+
+	Args:
+		query: Query array.
+		key: Key array.
+		value: Value array.
+		bias: Bias array.
+		softmax_scale: Scaling factor for the softmax function.
+		blocksize_q: Block size for the query sequence dimension.
+		blocksize_k: Block size for the key sequence dimension.
+
+	Returns:
+		Tuple of the output array and the residual.
+	"""
 	o, l = _fwd_attn_kernel_call(
 		query=query,
 		key=key,
@@ -690,14 +905,28 @@ def _fwd_attn_kernel_call_with_residual(
 
 @functools.partial(custom_vjp, nondiff_argnums=[4, 5, 6])
 def _flash_attn2(
-	query: Optional[chex.Array],
-	key: Optional[chex.Array],
-	value: Optional[chex.Array],
+	query: chex.Array,
+	key: chex.Array,
+	value: chex.Array,
 	bias: Optional[chex.Array] = None,
 	softmax_scale: Optional[float] = None,
 	blocksize_q: int = 128,
 	blocksize_k: int = 128,
-):
+) -> chex.Array:
+	"""Computes the attention mechanism using the Triton kernel.
+
+	Args:
+		query: Query array of shape (batch, seq_len_q, num_heads, head_dim).
+		key: Key array of shape (batch, seq_len_k, num_heads, head_dim).
+		value: Value array of shape (batch, seq_len_k, num_heads, head_dim).
+		bias: Optional bias array of shape (batch, num_heads, seq_len_q, seq_len_k).
+		softmax_scale: Scaling factor for the softmax function.
+		blocksize_q: Block size for the query sequence dimension.
+		blocksize_k: Block size for the key sequence dimension.
+
+	Returns:
+		Output array of shape (batch, seq_len_q, num_heads, head_dim).
+	"""
 	return _fwd_attn_kernel_call(
 		query=query,
 		key=key,
@@ -716,6 +945,7 @@ _flash_attn2.defvjp(
 
 
 def _test_forward():
+	"""Tests the forward pass of the attention mechanism."""
 	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
 	B, H, QS, KS, D = 1, 32, 1, 128_000, 128
 	blocksize_k = 64
@@ -748,10 +978,13 @@ def _test_forward():
 		print("Flax OOM", er)
 		fo = None
 	if fo is not None and co is not None:
-		print(jnp.allclose(co, fo, 0, 0.125))
+		print(
+			"Results are Close" if jnp.allclose(co, fo, 0, 0.125) else "Wrong results!"
+		)
 
 
 def _test_backward():
+	"""Tests the backward pass of the attention mechanism."""
 	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
 	B, H, S, D = 1, 1, 3, 16
 	blocksize_k = 16
@@ -766,22 +999,36 @@ def _test_backward():
 			jnp.finfo(jnp.float16).min,
 			0,
 		)
-		if False
+		if False  # Set to True to test with bias
 		else None
 	)
-	o = jax.grad(lambda *x: _flash_attn2(*x, None, blocksize_q, blocksize_k).sum())(
-		q, k, v, b
-	)
+
+	try:
+		co = jax.grad(
+			lambda *x: _flash_attn2(*x, None, blocksize_q, blocksize_k).sum()
+		)(q, k, v, b)
+		print("Custom op backward pass gradients:")
+		print(co[-1][-1, -1, :5])  # Print last 5 elements of last head of last batch
+	except Exception as er:
+		print(f"Custom op backward pass failed: {er}")
+		co = None
+
 	try:
 		fo = jax.grad(lambda *x: flax.linen.attention.dot_product_attention(*x).sum())(
 			q, k, v, b
 		)
+		print("Flax backward pass gradients:")
+		print(fo[-1][-1, -1, :5])  # Print last 5 elements of last head of last batch
 	except Exception as e:
-		print(f"Flax OOM : {e}")
+		print(f"Flax backward pass failed : {e}")
+		fo = None
 		exit()
-	print(o[-1, -1, -1, :5])
-	print(fo[-1, -1, -1, :5])
-	print(jnp.allclose(o, fo, 0, 0.125))
+
+	if fo is not None and co is not None:
+		if jnp.allclose(co, fo, atol=0.125):
+			print("Backward pass results are close.")
+		else:
+			print("Backward pass results differ significantly!")
 
 
 triton_flash_attn_2_gpu = _flash_attn2
