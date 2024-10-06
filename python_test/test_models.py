@@ -73,11 +73,11 @@ class EasyModelsTest(unittest.TestCase):
 		self.scan_layers: bool = False
 		self.shard_attention_computation: bool = True
 		self.rotary_dim = 32
-		self.dtype: jax.numpy.dtype = jnp.float32
+		self.dtype: jax.numpy.dtype = jnp.float16
 		self.precision = jax.lax.Precision("highest")
-		self.attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_ATTENTION_MECHANISM
-		self.block_k: int = 32
-		self.block_q: int = 32
+		self.attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "ring" #"flash_attn2"
+		self.block_k: int = 64
+		self.block_q: int = 128
 		self.sequence_length = 64
 		self.scan_mlp_chunk_size = self.sequence_length // 2
 		self.head_dim = self.hidden_size // self.num_attention_heads

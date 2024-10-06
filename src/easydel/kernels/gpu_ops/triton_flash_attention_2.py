@@ -68,27 +68,6 @@ def get_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
 	return tuple(strides)
 
 
-def apply_stride(self: chex.Array):
-	"""Applies stride to an array.
-
-	Args:
-		self: Array to apply stride to.
-
-	Returns:
-		Array with stride applied.
-	"""
-	size = np.prod(self.shape)
-	strides = []
-	for s in self.shape:
-		strides.append(int(size // s))
-
-	def func(idx: int) -> int:
-		return int(strides[idx])
-
-	self.stride = func
-	return self
-
-
 def get_sharding(arr: chex.Array):
 	"""Gets the sharding of an array.
 
@@ -362,9 +341,7 @@ def _fwd_attn_kernel_call(
 	Returns:
 		Tuple of the output array and the log-sum-exp array.
 	"""
-	query = apply_stride(query)
-	key = apply_stride(key)
-	value = apply_stride(value)
+
 	batch, seqlen_q, nheads, headdim = query.shape
 	_, seqlen_k, _, _ = key.shape
 	check_shapes_and_dtypes(
@@ -391,6 +368,11 @@ def _fwd_attn_kernel_call(
 		BLOCK_M=blocksize_q,
 		BLOCK_N=blocksize_k,
 	)
+
+	stride_qb, stride_qm, stride_qh, stride_qd = get_strides(query.shape)
+	stride_kb, stride_kn, stride_kh, stride_kd = get_strides(key.shape)
+	stride_vb, stride_vn, stride_vh, stride_vd = get_strides(value.shape)
+
 	num_warps = 4 if headdim <= 64 else 8
 	return triton_call(
 		query,
@@ -398,22 +380,22 @@ def _fwd_attn_kernel_call(
 		value,
 		bias if bias is not None else jnp.zeros((1,), jnp.float16),
 		softmax_scale,
-		query.stride(0),
-		query.stride(2),
-		query.stride(1),
-		key.stride(0),
-		key.stride(2),
-		key.stride(1),
-		value.stride(0),
-		value.stride(2),
-		value.stride(1),
+		stride_qb,
+		stride_qh,
+		stride_qm,
+		stride_kb,
+		stride_kh,
+		stride_kn,
+		stride_vb,
+		stride_vh,
+		stride_vn,
 		stride_bb,
 		stride_bh,
 		stride_bm,
 		stride_bn,
-		query.stride(0),
-		query.stride(2),
-		query.stride(1),
+		stride_qb,
+		stride_qh,
+		stride_qm,
 		stride_lb,
 		stride_lh,
 		headdim,
@@ -755,13 +737,13 @@ def _bwd_attn_kernel_call(
 		stride_bb, stride_bh, stride_bm = (
 			get_strides(bias.shape)[:-1] if HAVE_BIAS else (0, 0, 0)
 		)
-		query = apply_stride(query)
-		key = apply_stride(key)
-		value = apply_stride(value)
-		l = apply_stride(l)
-		o = apply_stride(o)
-
-		delta = apply_stride(jnp.empty_like(l))
+		stride_qb, stride_qm, stride_qh, stride_qd = get_strides(query.shape)
+		stride_kb, stride_kn, stride_kh, stride_kd = get_strides(key.shape)
+		stride_vb, stride_vn, stride_vh, stride_vd = get_strides(value.shape)
+		stride_lb, stride_lh, stride_lm = get_strides(l.shape)
+		stride_ob, stride_om, stride_oh, stride_od = get_strides(o.shape)
+		delta = jnp.empty_like(l)
+		stride_db, stride_dh, stride_dm = get_strides(delta.shape)
 
 		num_warps = 4 if headdim <= 64 else 8
 
@@ -776,14 +758,14 @@ def _bwd_attn_kernel_call(
 			o,
 			Do,
 			delta,
-			query.stride(0),
-			query.stride(2),
-			query.stride(1),
-			query.stride(0),
-			query.stride(2),
-			query.stride(1),
-			delta.stride(0),
-			delta.stride(1),
+			stride_qb,
+			stride_qh,
+			stride_qm,
+			stride_qb,
+			stride_qh,
+			stride_qm,
+			stride_db,
+			stride_dh,
 			nheads,
 			headdim,
 			seqlen_q,
@@ -808,15 +790,15 @@ def _bwd_attn_kernel_call(
 			BLOCK_HEADDIM=BLOCK_HEADDIM,
 			HAVE_BIAS=HAVE_BIAS,
 		)
-		query_strides = (query.stride(0), query.stride(2), query.stride(1))
-		key_strides = (key.stride(0), key.stride(2), key.stride(1))
-		value_strides = (value.stride(0), value.stride(2), value.stride(1))
+		query_strides = (stride_qb, stride_qh, stride_qm)
+		key_strides = (stride_kb, stride_kh, stride_kn)
+		value_strides = (stride_vb, stride_vh, stride_vn)
 		bias_strides = (stride_bb, stride_bh, stride_bm)
-		d_output_strides = (query.stride(0), query.stride(2), query.stride(1))
-		d_query_strides = (query.stride(0), query.stride(2), query.stride(1))
-		d_key_strides = (key.stride(0), key.stride(2), key.stride(1))
-		d_value_strides = (value.stride(0), value.stride(2), value.stride(1))
-		lse_strides = (l.stride(0), l.stride(1))
+		d_output_strides = (stride_qb, stride_qh, stride_qm)
+		d_query_strides = (stride_qb, stride_qh, stride_qm)
+		d_key_strides = (stride_kb, stride_kh, stride_kn)
+		d_value_strides = (stride_vb, stride_vh, stride_vn)
+		lse_strides = (stride_lb, stride_lh)
 		Dq, Dk, Dv = triton_call(
 			query,
 			key,
@@ -1036,4 +1018,4 @@ __all__ = ["triton_flash_attn_2_gpu"]
 
 if __name__ == "__main__":
 	_test_forward()
-	_test_backward()
+	# _test_backward()

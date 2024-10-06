@@ -80,9 +80,9 @@ class EasyDeLGradientCheckPointers:
 	EVERYTHING_SAVEABLE: Literal["everything_saveable"] = "everything_saveable"
 	NOTHING_SAVEABLE: Literal["nothing_saveable"] = "nothing_saveable"
 	CHECKPOINT_DOTS: Literal["checkpoint_dots"] = "checkpoint_dots"
-	CHECKPOINT_DOTS_WITH_NO_BATCH_DMIS: Literal["checkpoint_dots_with_no_batch_dims"] = (
+	CHECKPOINT_DOTS_WITH_NO_BATCH_DMIS: Literal[
 		"checkpoint_dots_with_no_batch_dims"
-	)
+	] = "checkpoint_dots_with_no_batch_dims"
 
 
 AVAILABLE_GRADIENT_CHECKPOINTS = Literal[
@@ -121,33 +121,21 @@ AVAILABLE_PRUNING_TYPE = Optional[
 ]
 _AVAILABLE_ATTENTION_MECHANISMS = [
 	"vanilla",
-	"flash",
-	"jax_flash_attn2",
 	"flash_attn2",
 	"splash",
 	"ring",
 	"cudnn",
-	"local_ring",
 	"sharded_vanilla",
-	"legacy_sharded_vanilla",
-	"wise_ring",
 	"blockwise",
-	"pallas_flash",
 ]
 AVAILABLE_ATTENTION_MECHANISMS = Literal[
 	"vanilla",
-	"flash",
-	"jax_flash_attn2",
 	"flash_attn2",
 	"splash",
 	"ring",
 	"cudnn",
-	"local_ring",
 	"sharded_vanilla",
-	"legacy_sharded_vanilla",
-	"wise_ring",
 	"blockwise",
-	"pallas_flash",
 ]
 
 DEFAULT_ATTENTION_MECHANISM = "sharded_vanilla"
