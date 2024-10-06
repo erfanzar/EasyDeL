@@ -45,14 +45,13 @@ INTERPRET = PLATFORM == "cpu"
 rng = GenerateRNG()
 
 
-def gemm_kernel(
+def gemm(
 	A: jax.Array,
 	B: jax.Array,
 	*,
 	blocksize_m: Optional[int] = None,
 	blocksize_k: Optional[int] = None,
 	blocksize_n: Optional[int] = None,
-	prod_dtype: jnp.dtype = jnp.float32,
 	precision: PrecisionLike = None,
 	**_,
 ):
@@ -74,7 +73,7 @@ def gemm_kernel(
 		return jax.lax.batch_matmul(A, B, precision=precision)
 	else:
 		raise NotImplementedError(
-			f"`gemm_kernel` is not implemented for request platform {PLATFORM}"
+			f"`gemm` is not implemented for request platform {PLATFORM}"
 		)
 
 
@@ -136,19 +135,19 @@ def custom_dot_general_kernel(
 
 	# Ensure batch dimensions are compatible
 	if lhs_batch_shape != rhs_batch_shape:
-		raise ValueError("Batch dimensions must match for batched matrix multiplication")
+		raise ValueError(
+			"Batch dimensions must match for batched matrix multiplication"
+		)
 
 	# Perform batched matrix multiplication using vmap
-	result_3d = jax.vmap(gemm_kernel)(
-		lhs_reshaped, jnp.transpose(rhs_reshaped, (0, 2, 1))
-	)
+	result_3d = jax.vmap(gemm)(lhs_reshaped, jnp.transpose(rhs_reshaped, (0, 2, 1)))
 
 	# Reshape result back to the original batch and output dimensions
 	final_shape = lhs_batch_shape + lhs_other_shape + rhs_other_shape
 	return result_3d.reshape(final_shape).astype(preferred_element_type)
 
 
-def replace_dot_general_with_gemm_kernel():
+def replace_dot_general_with_gemm():
 	jax.lax.dot_general = custom_dot_general_kernel
 
 
@@ -232,7 +231,7 @@ def _analyze_matmul(
 	dtype: jnp.dtype,
 	mm_func,
 ):
-	from tabulate import tabulate
+	from tabulate import tabulate  # type:ignore # noqa
 
 	x = jnp.ones((m, k), dtype=dtype)
 	y = jnp.ones((k, n), dtype=dtype)
@@ -285,15 +284,21 @@ class _MatMulConfig:
 
 
 def matmul_benchmark(unused_args=None):
-	BLOCK_SIZES = [1] if PLATFORM == "gpu" else [128, 256, 512, 1024]  # GPU is autotuned
+	BLOCK_SIZES = (
+		[1] if PLATFORM == "gpu" else [128, 256, 512, 1024]
+	)  # GPU is autotuned
 	logging.basicConfig(
 		level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 	)
 
-	def log_configuration(config: _MatMulConfig, is_time_best: bool, is_flops_best: bool):
+	def log_configuration(
+		config: _MatMulConfig, is_time_best: bool, is_flops_best: bool
+	):
 		log_message = f"Configuration: block_m={config.block_m}, block_n={config.block_n}, block_k={config.block_k}"
 		if is_time_best:
-			logging.info(f"New best time {log_message} - Time: {config.time:.6f} seconds")
+			logging.info(
+				f"New best time {log_message} - Time: {config.time:.6f} seconds"
+			)
 		if is_flops_best:
 			logging.info(f"New best FLOP/s {log_message} - FLOP/s: {config.flops:.2e}")
 
@@ -315,7 +320,7 @@ def matmul_benchmark(unused_args=None):
 						n=n,
 						dtype=dtype,
 						mm_func=partial(
-							gemm_kernel,
+							gemm,
 							blocksize_m=block_m,
 							blocksize_n=block_n,
 							blocksize_k=block_k,
@@ -323,10 +328,16 @@ def matmul_benchmark(unused_args=None):
 							precision=None,
 						),
 					)
-					current_config = _MatMulConfig(block_m, block_n, block_k, time, flops)
+					current_config = _MatMulConfig(
+						block_m, block_n, block_k, time, flops
+					)
 
-					is_time_best = best_time_config is None or time < best_time_config.time
-					is_flops_best = best_flops_config is None or flops > best_flops_config.flops
+					is_time_best = (
+						best_time_config is None or time < best_time_config.time
+					)
+					is_flops_best = (
+						best_flops_config is None or flops > best_flops_config.flops
+					)
 
 					if is_time_best:
 						best_time_config = current_config
@@ -362,7 +373,9 @@ def matmul_benchmark(unused_args=None):
 	best_configs = {}
 	for m, k, n in matrix_sizes:
 		if PLATFORM != "gpu":
-			logging.info(f"\nBenchmarking matrix multiplication: ({m} x {k}) * ({k} x {n})")
+			logging.info(
+				f"\nBenchmarking matrix multiplication: ({m} x {k}) * ({k} x {n})"
+			)
 		best_config, best_time = autotune_block_sizes(m, n, k, dtype=jnp.float32)
 
 		if PLATFORM != "gpu":

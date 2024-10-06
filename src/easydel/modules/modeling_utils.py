@@ -95,9 +95,9 @@ if DEFAULT_HARDWARE_ABSTRACTION:
 			"automatically be replaced by EasyDeL, this behavior can be disabled by "
 			"setting os env `ED_CUSTOM_OP` to `false`."
 		)
-		from easydel.kernels.gemm import replace_dot_general_with_gemm_kernel
+		from easydel.kernels.gemm import replace_dot_general_with_gemm
 
-		replace_dot_general_with_gemm_kernel()
+		replace_dot_general_with_gemm()
 
 
 def set_attrs_smartly(self, attr_name: str, default: Any, new_attr: Any):

@@ -17,7 +17,7 @@ import jax
 from jax import lax
 from jax import numpy as jnp
 
-from easydel.kernels.gemm import gemm_kernel
+from easydel.kernels.gemm import gemm
 
 
 def falcon_mlp_pallas(
@@ -38,8 +38,8 @@ def falcon_mlp_pallas(
 		prod_dtype=prod_dtype,
 		precision=precision,
 	)
-	return gemm_kernel(
-		jax.nn.gelu(gemm_kernel(x, dense_h_to_4h, **args), approximate=False),
+	return gemm(
+		jax.nn.gelu(gemm(x, dense_h_to_4h, **args), approximate=False),
 		dense_4h_to_h,
 		**args,
 	)

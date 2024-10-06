@@ -16,7 +16,7 @@
 from jax import lax
 from jax import numpy as jnp
 
-from easydel.kernels.gemm import gemm_kernel
+from easydel.kernels.gemm import gemm
 
 
 def t5_mlp_pallas(
@@ -38,4 +38,4 @@ def t5_mlp_pallas(
 		prod_dtype=prod_dtype,
 		precision=precision,
 	)
-	return gemm_kernel((act_fn(gemm_kernel(x, wi, **args))), wo, **args)
+	return gemm((act_fn(gemm(x, wi, **args))), wo, **args)
