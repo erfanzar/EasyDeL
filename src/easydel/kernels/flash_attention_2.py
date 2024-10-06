@@ -13,7 +13,8 @@
 # limitations under the License.
 
 from typing import Literal, Optional
-
+from jax import numpy as jnp, random as jrnd
+import jax
 import chex
 from jax.experimental.pallas.ops.tpu.flash_attention import (
 	BlockSizes as TPUBlockSizes,
@@ -41,9 +42,9 @@ def flash_attention2(
 	backend: AVAILABLE_FLASH_ATTENTION2_BACKENDS = ...,
 	platform=...,
 ):
-	if isinstance(platform, Ellipsis):
+	if backend == Ellipsis:
 		platform = PLATFORM
-	if isinstance(backend, Ellipsis):
+	if backend == Ellipsis:
 		match platform:
 			case "gpu":
 				backend = "triton"
@@ -54,7 +55,7 @@ def flash_attention2(
 			case _:
 				backend = ...
 
-	if isinstance(backend, Ellipsis):
+	if backend == Ellipsis:
 		raise NotImplementedError(
 			f"there's no available backend for platform {platform}"
 		)
@@ -177,3 +178,43 @@ def gpu_fwd_test():
 		fo = None
 	if fo is not None and co is not None:
 		print(jnp.allclose(co, fo, 0, 0.125))
+
+
+def _test_forward():
+	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
+	B, H, QS, KS, D = 1, 32, 1, 128_000, 128
+	blocksize_k = 64
+	blocksize_q = 128
+	q = jax.nn.initializers.normal(2)(q_key, (B, QS, H, D), dtype=jnp.float16)
+	k = jax.nn.initializers.normal(2)(k_key, (B, KS, H, D), dtype=jnp.float16)
+	v = jax.nn.initializers.normal(2)(v_key, (B, KS, H, D), dtype=jnp.float16)
+	b = (
+		jnp.where(
+			jrnd.randint(v_key, (B, H, QS, KS), 0, 4) > 2,
+			jnp.finfo(jnp.float16).min,
+			0,
+		)
+		if False
+		else None
+	)
+	print("QKV Allocated")
+	try:
+		co = flash_attention2(q, k, v, b, None, blocksize_k, blocksize_q)
+		print(co[-1, -1, -1, :5])
+	except Exception as er:
+		print("Flash OOM", er)
+		co = None
+	try:
+		import flax
+
+		fo = flax.linen.attention.dot_product_attention(q, k, v, b)
+		print(fo[-1, -1, -1, :5])
+	except Exception as er:
+		print("Flax OOM", er)
+		fo = None
+	if fo is not None and co is not None:
+		print(jnp.allclose(co, fo, 0, 0.125))
+
+
+if __name__ == "__main__":
+	_test_forward()

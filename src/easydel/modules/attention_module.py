@@ -56,8 +56,6 @@ from easydel.modules.modeling_utils import EDPretrainedConfig
 
 logger = get_logger(__name__)
 
-# DEFAULT VALUES ...
-
 DEFAULT_K_BLOCK = 128
 DEFAULT_Q_BLOCK = 64
 
@@ -72,7 +70,6 @@ def _get_jax_dtype_from_string(dtype_string):
 		"<class 'jax.numpy.complex64'>": jnp.complex64,
 		"<class 'jax.numpy.complex128'>": jnp.complex128,
 	}
-
 	return dtype_mapping.get(dtype_string, None)
 
 
