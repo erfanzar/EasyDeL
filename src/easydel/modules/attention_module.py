@@ -20,39 +20,40 @@ from typing import Any, Literal, Optional, Tuple
 
 import fjformer
 import jax
+import jax.extend
 import jax.lib
 from chex import Array
 from fjformer import with_sharding_constraint
-from jax.experimental.pallas.ops.tpu.flash_attention import (
-	BlockSizes as BlockSizesFlashAttn,
-)
-from jax.experimental.pallas.ops.tpu.splash_attention import (
-	BlockSizes as BlockSizesSplashAttn,
-	CausalMask,
-	MultiHeadMask,
-	SegmentIds,
-	make_splash_mha,
-)
 from flax.linen.dtypes import promote_dtype
 from flax.struct import dataclass
 from jax import lax, random
 from jax import numpy as jnp
+from jax.experimental.pallas.ops.tpu.splash_attention import (
+	BlockSizes as BlockSizesSplashAttn,
+)
+from jax.experimental.pallas.ops.tpu.splash_attention import CausalMask as CausalMask
+from jax.experimental.pallas.ops.tpu.splash_attention import (
+	MultiHeadMask as MultiHeadMask,
+)
+from jax.experimental.pallas.ops.tpu.splash_attention import SegmentIds as SegmentIds
+from jax.experimental.pallas.ops.tpu.splash_attention import (
+	make_splash_mha as make_splash_mha,
+)
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec
+
 from easydel.etils.etils import AVAILABLE_ATTENTION_MECHANISMS, get_logger
 from easydel.etils.partition_module import PartitionAxis
 from easydel.kernels.flash_attention_2 import flash_attention2
+from easydel.kernels.ring_attention import ring_attention
 from easydel.modules._blockwise_attention import blockwise_attn
-from easydel.modules._ring_attention import ring_attention_standard, wise_ring_attention
-from easydel.modules._vanilla_attention import (
-	shard_vanilla_attention,
-	vanilla_attention,
-)
-from easydel.modules.flax_modeling_utils import get_gradient_checkpoint_policy
+from easydel.modules._vanilla_attention import vanilla_attention
 from easydel.modules.modeling_utils import EDPretrainedConfig
 
 logger = get_logger(__name__)
 
+AVAILABLE_BACKENDS = Literal["triton", "pallas", "jax"]
+AVAILABLE_PLATFORMS = Literal["gpu", "tpu", "cpu"]
 DEFAULT_K_BLOCK = 128
 DEFAULT_Q_BLOCK = 64
 
@@ -79,14 +80,11 @@ class AttentionOutput:
 @dataclass
 class AttentionMechanisms:
 	flash_attn2: Literal["flash_attn2"] = "flash_attn2"
+	ring: Literal["ring"] = "ring"
 	vanilla: Literal["vanilla"] = "vanilla"
 	splash: Literal["splash"] = "splash"
-	ring: Literal["ring"] = "ring"
 	cudnn: Literal["cudnn"] = "cudnn"
-	local_ring: Literal["local_ring"] = "local_ring"
 	sharded_vanilla: Literal["sharded_vanilla"] = "sharded_vanilla"
-	legacy_sharded_vanilla: Literal["legacy_sharded_vanilla"] = "legacy_sharded_vanilla"
-	wise_ring: Literal["wise_ring"] = "wise_ring"
 	blockwise: Literal["blockwise"] = "blockwise"
 
 
@@ -227,6 +225,7 @@ class FlexibleAttentionModule(object):
 		shard_attention_computation: bool = ...,
 		use_sharding_constraint: Optional[bool] = ...,
 		axis_name: str = ...,
+		backend: AVAILABLE_BACKENDS = ...,
 		backward_pass_impl: Literal["triton", "xla"] = "triton",
 		base_config: Optional[EDPretrainedConfig] = None,
 		_do_check: bool = True,
@@ -242,6 +241,7 @@ class FlexibleAttentionModule(object):
 		self.shard_attention_computation: bool = ...
 		self.use_sharding_constraint: Optional[bool] = ...
 		self.axis_name: str = ...
+		self.backend: str =...
 		set_attrs_smartly_with_prp(self, "use_sharding_constraint", False, use_sharding_constraint, base_config)
 		set_attrs_smartly_with_prp(self, "block_q", DEFAULT_Q_BLOCK, block_q, base_config)
 		set_attrs_smartly_with_prp(self, "block_k", DEFAULT_K_BLOCK, block_k, base_config)
@@ -253,6 +253,8 @@ class FlexibleAttentionModule(object):
 		set_attrs_smartly_with_prp(self, "precision", lax.Precision("fastest"), precision)  # DON'T READ FROM CONFIG
 		set_attrs_smartly_with_prp(self, "force_float32_tpu", True, force_float32_tpu)  # DON'T READ FROM CONFIG
 		set_attrs_smartly_with_prp(self, "axis_name", "sp", axis_name, base_config, "attention_axis_name")  # DON'T READ FROM CONFIG
+		set_attrs_smartly_with_prp(self, "axis_name", "sp", axis_name, base_config, "attention_axis_name")  # DON'T READ FROM CONFIG 
+		set_attrs_smartly_with_prp(self, "backend", ..., backend, base_config, "backend")  # DON'T READ FROM CONFIG
 		self.mesh = mesh
 		self.attn_mechanism = attn_mechanism
 		self.platform = jax.extend.backend.get_backend().platform
@@ -286,23 +288,10 @@ class FlexibleAttentionModule(object):
 			block_kv_dq=min(self.block_k, k_seq),
 		)
 
-	def get_block_size_flash_attn(self, q_seq, k_seq):
-		return BlockSizesFlashAttn(
-			block_q=min(self.block_q, q_seq),
-			block_k=min(self.block_k, k_seq),
-			block_q_dkv=min(self.block_q, q_seq),
-			block_k_dq=min(self.block_k, k_seq),
-			block_k_dkv=min(self.block_k, k_seq),
-			block_q_dq=min(self.block_q, q_seq),
-			block_b=1,
-			block_k_major=min(self.block_k, k_seq),
-			block_k_major_dq=min(self.block_k, k_seq),
-			block_k_major_dkv=min(self.block_k, k_seq),
-			block_q_major_dkv=min(self.block_q, q_seq),
-		)
-
 	def get_bshd_partition_specs(
-		self, query_sequence_length
+		self,
+		query_sequence_length,
+		bias_dim_eql=False,
 	) -> Tuple[
 		PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, bool
 	]:
@@ -328,7 +317,9 @@ class FlexibleAttentionModule(object):
 			)
 			bias_partition_spec = PartitionSpec(
 				self.partition_axis.batch_axis,
-				self.partition_axis.bias_head_sequence_axis,
+				self.partition_axis.bias_head_sequence_axis
+				if not bias_dim_eql
+				else self.partition_axis.head_axis,
 				self.partition_axis.query_sequence_axis,
 				self.partition_axis.bias_key_sequence_axis,
 			)
@@ -354,7 +345,9 @@ class FlexibleAttentionModule(object):
 			)
 			bias_partition_spec = PartitionSpec(
 				self.partition_axis.batch_axis,
-				self.partition_axis.bias_head_sequence_axis,
+				self.partition_axis.bias_head_sequence_axis
+				if not bias_dim_eql
+				else self.partition_axis.head_axis,
 				self.partition_axis.generation_query_sequence_axis,
 				self.partition_axis.bias_key_sequence_axis,
 			)
@@ -537,17 +530,7 @@ class FlexibleAttentionModule(object):
 					query_sequence_length=query_sequence_length,
 					key_value_sequence_length=key_value_sequence_length,
 				)
-			elif self.attn_mechanism == AttentionMechanisms.legacy_sharded_vanilla:
-				return self.legacy_sharded_vanilla_attention(
-					query_states=query_states,
-					key_states=key_states,
-					value_states=value_states,
-					bias=bias,
-					dropout_rng=dropout_rng,
-					deterministic=deterministic,
-					query_sequence_length=query_sequence_length,
-					key_value_sequence_length=key_value_sequence_length,
-				)
+			
 			elif self.attn_mechanism == AttentionMechanisms.ring:
 				return self.ring_attention(
 					query_states=query_states,
@@ -601,35 +584,6 @@ class FlexibleAttentionModule(object):
 					query_sequence_length=query_sequence_length,
 					key_value_sequence_length=key_value_sequence_length,
 				)
-			elif self.attn_mechanism == AttentionMechanisms.local_ring:
-				if segment_ids is not None:
-					warnings.warn("LocalRing Attention don't support `segment_ids` this argument will be ignored", UserWarning, stacklevel=1)
-				if self.attention_dropout != 0.0:
-					warnings.warn("LocalRing Attention don't support `attention_dropout` this argument will be ignored", UserWarning, stacklevel=1)
-
-				return self.local_ring_attention(
-					query_states=query_states,
-					key_states=key_states,
-					value_states=value_states,
-					bias=bias,
-					query_sequence_length=query_sequence_length,
-					key_value_sequence_length=key_value_sequence_length,
-				)
-			elif self.attn_mechanism == AttentionMechanisms.wise_ring:
-				if segment_ids is not None:
-					warnings.warn("WiseRing Attention don't support `segment_ids` this argument will be ignored", UserWarning, stacklevel=1)
-				if self.attention_dropout != 0.0:
-					warnings.warn("WiseRing Attention don't support `attention_dropout` this argument will be ignored", UserWarning, stacklevel=1)
-
-				return self.wise_ring_attention(
-					query_states=query_states,
-					bias=bias,
-					value_states=value_states,
-					key_states=key_states,
-					segment_ids=segment_ids,
-					query_sequence_length=query_sequence_length,
-					key_value_sequence_length=key_value_sequence_length,
-				)
 			else:
 				raise ValueError(f"Unknown Attention mechanism of {self.attn_mechanism}")
 		# fmt:on
@@ -642,9 +596,8 @@ class FlexibleAttentionModule(object):
 		value_states: Array,
 		bias: Optional[Array] = None,
 	):
-		qps, kps, vps, bps, aps, _ = self.get_bshd_partition_specs(
-			query_states.shape[1]
-		)
+		# fmt:off
+		qps, kps, vps, bps, aps, _ = self.get_bshd_partition_specs(query_states.shape[1])
 		assert bias.ndim == 4
 		if bias is not None and bias.shape[1] != query_states.shape[2]:
 			bias = jnp.repeat(bias, query_states.shape[2], 1)
@@ -658,45 +611,12 @@ class FlexibleAttentionModule(object):
 				blocksize_k=self.block_k,
 				softmax_scale=self.sm_scale,
 			)
-
 			return AttentionOutput(
 				attention_weights=None,
 				attention_outputs=with_sharding_constraint(attention_outputs, aps),
 			)
 
-	def local_ring_attention(
-		self,
-		*,  # it's Kwarg Only
-		query_states: Array,
-		key_states: Array,
-		value_states: Array,
-		query_sequence_length: int,
-		key_value_sequence_length: int,
-		bias: Optional[Array] = None,
-	):
-		qps, kps, vps, bps, aps, _ = self.get_bshd_partition_specs(
-			query_sequence_length
-		)
-		attention_outputs = shard_map(
-			partial(
-				ring_attention_standard,
-				axis_name=self.axis_name,
-				scale=1 / self.sm_scale,
-				float32_logits=self.platform == "tpu" and self.force_float32_tpu,
-			),
-			mesh=self.mesh,
-			in_specs=(
-				qps,
-				kps,
-				vps,
-				bps,
-			),
-			out_specs=aps,
-			check_rep=False,
-		)(query_states, key_states, value_states, bias)
-		return AttentionOutput(
-			attention_weights=None, attention_outputs=attention_outputs
-		)
+		# fmt:on
 
 	def ring_attention(
 		self,
@@ -712,88 +632,38 @@ class FlexibleAttentionModule(object):
 		dropout_rng: Optional[random.PRNGKey] = None,
 		segment_ids: Optional[Array] = None,
 	):
-		# TODO:RE-impl ring attn
-		return self.sharded_vanilla_attention(
-			query_states=query_states,
-			key_states=key_states,
-			value_states=value_states,
-			bias=bias,
-			dropout_rng=dropout_rng,
-			deterministic=deterministic,
-			query_sequence_length=query_sequence_length,
-			key_value_sequence_length=key_value_sequence_length,
-		)
-		# return AttentionOutput(attention_weights=None, attention_outputs=attn_output)
-
-	def wise_ring_attention(
-		self,
-		*,  # it's Kwarg Only
-		query_states: Array,
-		key_states: Array,
-		value_states: Array,
-		query_sequence_length: int,
-		key_value_sequence_length: int,
-		bias: Optional[Array] = None,
-		deterministic: bool = False,
-		dropout_rng: Optional[random.PRNGKey] = None,
-		segment_ids: Optional[Array] = None,
-	):
 		qps, kps, vps, bps, aps, _ = self.get_bshd_partition_specs(
-			query_sequence_length
+			query_states.shape[1], True
 		)
-		if segment_ids is None:
-			segment_ids = jnp.zeros(
-				(query_states.shape[0], query_sequence_length), dtype="i4"
-			)
-		if self.scan_ring_attention and query_states.shape[1] > max(
-			self.block_q, self.block_k
-		):
-			ring_attention_sharded = shard_map(
-				partial(
-					wise_ring_attention,
-					axis_name=self.axis_name,
-					float32_logits=True,
-					block_wise_kwargs=dict(
-						deterministic=deterministic,
-						dropout_rng=dropout_rng,
-						attn_pdrop=self.attention_dropout,
-						causal=True,
-						query_chunk_size=self.block_q,
-						key_chunk_size=self.block_k,
-						dtype=self.dtype,
-						policy=get_gradient_checkpoint_policy("nothing_saveable"),
-						precision=self.precision,
-						prevent_cse=not self.scan_attention_layers,
-					),
-				),
-				mesh=self.mesh,
-				in_specs=(qps, kps, vps, bps, PartitionSpec(qps[0], qps[1])),
-				out_specs=aps,
-				check_rep=False,
-			)
-			attn_output = ring_attention_sharded(
-				query_states, key_states, value_states, bias, segment_ids
-			)
-			attn_output = with_sharding_constraint(attn_output, aps)
-			return AttentionOutput(
-				attention_weights=None, attention_outputs=attn_output
-			)
-		else:
-			seq_length = query_states.shape[1]
-			chunk = seq_length > max(self.block_q, self.block_k)
-			warnings.warn(
-				f"generation process detected, switching to local ring attention"
-				f" [CHUNK : {chunk}, SCAN : {self.scan_ring_attention}, {self.block_k=}, {self.block_q=}, {seq_length=}]",
-				stacklevel=1,
-			)
-			return self.local_ring_attention(
-				query_states=query_states,
-				key_states=key_states,
-				value_states=value_states,
-				bias=bias,
-				query_sequence_length=query_sequence_length,
-				key_value_sequence_length=key_value_sequence_length,
-			)
+		attn_output = shard_map(
+			partial(
+				ring_attention,
+				axis_name=self.axis_name,
+				float32_logits=False
+				if jax.extend.backend.get_backend().platform == "gpu"
+				else True,
+				platform=self.platform,
+				backend=self.backend,
+				autocheck=True,
+				blocksize_c=None,
+				blocksize_k=self.block_k,
+				blocksize_q=self.block_q,
+				dtype=self.dtype,
+				softmax_scale=self.sm_scale,
+				deterministic=deterministic,
+				dropout_rng=dropout_rng,
+			),
+			in_specs=[qps, kps, vps, bps],
+			out_specs=[aps],
+			mesh=self.mesh,
+			check_rep=False,
+		)(
+			query_states,
+			key_states,
+			value_states,
+			bias,
+		)
+		return AttentionOutput(attention_weights=None, attention_outputs=attn_output)
 
 	def vanilla_attention(
 		self,
@@ -927,54 +797,6 @@ class FlexibleAttentionModule(object):
 			attention = fjformer.with_sharding_constraint(attention, aps)
 			return AttentionOutput(
 				attention_weights=attention_weight, attention_outputs=attention
-			)
-
-	def legacy_sharded_vanilla_attention(
-		self,
-		*,  # it's Kwarg Only
-		query_states: Array,
-		key_states: Array,
-		value_states: Array,
-		bias: Optional[Array] = None,
-		deterministic: bool = False,
-		dropout_rng: Optional[random.PRNGKey] = None,
-		query_sequence_length: int,
-		key_value_sequence_length: int,
-	) -> AttentionOutput:
-		qps, kps, vps, bps, aps, is_gen = self.get_bshd_partition_specs(
-			query_sequence_length
-		)
-
-		with self.mesh:
-			attention_outputs = shard_map(
-				partial(
-					shard_vanilla_attention,
-					deterministic=deterministic,
-					dropout_rng=dropout_rng,
-					dtype=self.dtype,
-					precision=self.precision,
-					attention_dropout=self.attention_dropout,
-				),
-				in_specs=(
-					qps,
-					kps,
-					vps,
-					(
-						PartitionSpec(bps[0], None, None, None)
-						if bias is not None
-						else None
-					),
-				),
-				out_specs=aps,
-				check_rep=False,
-				mesh=self.mesh,
-			)(query_states, key_states, value_states, bias)
-			attention_outputs = fjformer.with_sharding_constraint(
-				attention_outputs, aps
-			)
-
-			return AttentionOutput(
-				attention_weights=None, attention_outputs=attention_outputs
 			)
 
 	def splash_attention(

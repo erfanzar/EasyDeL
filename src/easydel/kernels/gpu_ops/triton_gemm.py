@@ -219,8 +219,12 @@ def _triton_gemm(
 	b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 	acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 	for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-		a_data = tl.load(a_ptrs, mask=offs_k[None, :] < (K - k * BLOCK_SIZE_K), other=0.0)
-		b_data = tl.load(b_ptrs, mask=offs_k[:, None] < (K - k * BLOCK_SIZE_K), other=0.0)
+		a_data = tl.load(
+			a_ptrs, mask=offs_k[None, :] < (K - k * BLOCK_SIZE_K), other=0.0
+		)
+		b_data = tl.load(
+			b_ptrs, mask=offs_k[:, None] < (K - k * BLOCK_SIZE_K), other=0.0
+		)
 		acc += tl.dot(a_data, b_data)
 		a_ptrs += BLOCK_SIZE_K * stride_ak
 		b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -269,8 +273,12 @@ def _gemm_activation_kernel(
 	b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 	acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 	for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-		a_data = tl.load(a_ptrs, mask=offs_k[None, :] < (K - k * BLOCK_SIZE_K), other=0.0)
-		b_data = tl.load(b_ptrs, mask=offs_k[:, None] < (K - k * BLOCK_SIZE_K), other=0.0)
+		a_data = tl.load(
+			a_ptrs, mask=offs_k[None, :] < (K - k * BLOCK_SIZE_K), other=0.0
+		)
+		b_data = tl.load(
+			b_ptrs, mask=offs_k[:, None] < (K - k * BLOCK_SIZE_K), other=0.0
+		)
 		acc += tl.dot(a_data, b_data)
 		a_ptrs += BLOCK_SIZE_K * stride_ak
 		b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -483,3 +491,4 @@ if __name__ == "__main__":
 	# app.run(test_run)
 	# app.run(test_vmap)
 	app.run(bench)
+

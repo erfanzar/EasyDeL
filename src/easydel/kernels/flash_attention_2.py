@@ -13,9 +13,11 @@
 # limitations under the License.
 
 from typing import Literal, Optional
-from jax import numpy as jnp, random as jrnd
-import jax
+
 import chex
+import jax
+from jax import numpy as jnp
+from jax import random as jrnd
 from jax.experimental.pallas.ops.tpu.flash_attention import (
 	BlockSizes as TPUBlockSizes,
 )
@@ -28,6 +30,7 @@ from easydel.kernels.cpu_ops import jax_flash_attn_2_mu
 from easydel.kernels.gpu_ops import pallas_flash_attn_2_gpu, triton_flash_attn_2_gpu
 
 AVAILABLE_FLASH_ATTENTION2_BACKENDS = Literal["triton", "pallas", "jax"]
+AVAILABLE_PLATFORMS = Literal["gpu", "tpu", "cpu"]
 PLATFORM = get_backend().platform
 
 
@@ -40,7 +43,7 @@ def flash_attention2(
 	blocksize_q: int = 128,
 	blocksize_k: int = 128,
 	backend: AVAILABLE_FLASH_ATTENTION2_BACKENDS = ...,
-	platform=...,
+	platform: AVAILABLE_PLATFORMS = ...,
 ):
 	if backend == Ellipsis:
 		platform = PLATFORM
@@ -137,16 +140,59 @@ def flash_attention2(
 	raise NotImplementedError(f"NotImplemented {platform}-{backend}")
 
 
-def gpu_fwd_test():
-	import flax
-	import flax.linen
-	import flax.linen.attention
-	import jax
-	from jax import numpy as jnp
-	from jax import random as jrnd
-
+def _test_backward():
+	"""Tests the backward pass of the attention mechanism."""
 	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
-	B, H, QS, KS, D = 1, 32, 1, 128_000, 128
+	B, H, S, D = 1, 1, 3, 16
+	blocksize_k = 16
+	blocksize_q = 16
+	q = jax.nn.initializers.normal(2)(q_key, (B, S, H, D), dtype=jnp.float16)
+	k = jax.nn.initializers.normal(2)(k_key, (B, S, H, D), dtype=jnp.float16)
+	v = jax.nn.initializers.normal(2)(v_key, (B, S, H, D), dtype=jnp.float16)
+
+	b = (
+		jnp.where(
+			jrnd.randint(v_key, (B, H, S, S), 0, 4) > 2,
+			jnp.finfo(jnp.float16).min,
+			0,
+		)
+		if False  # Set to True to test with bias
+		else None
+	)
+
+	try:
+		co = jax.grad(
+			lambda *x: flash_attention2(*x, None, blocksize_k, blocksize_q).sum()
+		)(q, k, v, b)
+		print("Custom op backward pass gradients:")
+		print(co[-1][-1, -1, :5])  # Print last 5 elements of last head of last batch
+	except Exception as er:
+		print(f"Custom op backward pass failed: {er}")
+		co = None
+
+	try:
+		import flax
+
+		fo = jax.grad(lambda *x: flax.linen.attention.dot_product_attention(*x).sum())(
+			q, k, v, b
+		)
+		print("Flax backward pass gradients:")
+		print(fo[-1][-1, -1, :5])  # Print last 5 elements of last head of last batch
+	except Exception as e:
+		print(f"Flax backward pass failed : {e}")
+		fo = None
+		exit()
+
+	if fo is not None and co is not None:
+		if jnp.allclose(co, fo, atol=0.125):
+			print("Backward pass results are close.")
+		else:
+			print("Backward pass results differ significantly!")
+
+
+def _test_forward():
+	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
+	B, H, QS, KS, D = 1, 32, 2048, 2048, 128
 	blocksize_k = 64
 	blocksize_q = 128
 	q = jax.nn.initializers.normal(2)(q_key, (B, QS, H, D), dtype=jnp.float16)
@@ -164,42 +210,16 @@ def gpu_fwd_test():
 	print("QKV Allocated")
 	try:
 		co = flash_attention2(
-			q, k, v, b, None, blocksize_k, blocksize_q
-		)  # passes 256K on 24G GPU 3090
-		print(co[-1, -1, -1, :5])
-	except Exception as er:
-		print("Flash OOM", er)
-		co = None
-	try:
-		fo = flax.linen.attention.dot_product_attention(q, k, v, b)
-		print(fo[-1, -1, -1, :5])
-	except Exception as er:
-		print("Flax OOM", er)
-		fo = None
-	if fo is not None and co is not None:
-		print(jnp.allclose(co, fo, 0, 0.125))
-
-
-def _test_forward():
-	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
-	B, H, QS, KS, D = 1, 32, 1, 128_000, 128
-	blocksize_k = 64
-	blocksize_q = 128
-	q = jax.nn.initializers.normal(2)(q_key, (B, QS, H, D), dtype=jnp.float16)
-	k = jax.nn.initializers.normal(2)(k_key, (B, KS, H, D), dtype=jnp.float16)
-	v = jax.nn.initializers.normal(2)(v_key, (B, KS, H, D), dtype=jnp.float16)
-	b = (
-		jnp.where(
-			jrnd.randint(v_key, (B, H, QS, KS), 0, 4) > 2,
-			jnp.finfo(jnp.float16).min,
-			0,
+			q,
+			k,
+			v,
+			b,
+			None,
+			blocksize_q,
+			blocksize_k,
+			platform="gpu",
+			backend="triton",
 		)
-		if False
-		else None
-	)
-	print("QKV Allocated")
-	try:
-		co = flash_attention2(q, k, v, b, None, blocksize_k, blocksize_q)
 		print(co[-1, -1, -1, :5])
 	except Exception as er:
 		print("Flash OOM", er)
@@ -218,3 +238,4 @@ def _test_forward():
 
 if __name__ == "__main__":
 	_test_forward()
+	# _test_backward()
