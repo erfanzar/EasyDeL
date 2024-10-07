@@ -536,7 +536,7 @@ class FlaxMamba2Mixer(nn.Module):
 				)
 				* (jnp.log(self.config.time_step_max) - jnp.log(self.config.time_step_min))
 				+ jnp.log(self.config.time_step_min)
-			),
+			).astype(jnp.float32),
 			1e9,
 		)
 

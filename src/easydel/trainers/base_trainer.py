@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,6 +13,8 @@
 # limitations under the License.
 
 import abc
+from collections import defaultdict
+from logging import warning
 import os
 import pprint
 import sys
@@ -22,14 +23,21 @@ import time
 from abc import abstractmethod
 from dataclasses import dataclass
 from glob import glob
-from typing import Any, Callable, Iterator, Literal, Mapping, Optional, Union
+from typing import Any, Callable, Iterator, Literal, Mapping, Optional, Union, Dict
 
+import termcolor
+import tqdm
+
+from easydel.etils.easystate import EasyDeLState
+from easydel.etils.errors import EasyDeLTimerError
+import flax.core
 import jax
 import numpy as np
 from fjformer.checkpoint import CheckpointManager
 from flax.core import unfreeze
 from jax.sharding import Mesh
 from optax import GradientTransformation, Schedule
+import flax
 
 try:
 	import wandb  # noqa: F821 # type:ignore
@@ -44,6 +52,7 @@ from easydel.modules.modeling_utils import (
 from easydel.smi import get_capacity_matrix, initialise_tracking
 from easydel.trainers.training_configurations import TrainArguments
 from easydel.utils import Timers
+from jax import numpy as jnp
 
 logger = get_logger(__name__)
 
@@ -72,6 +81,38 @@ class TrainerConfigureFunctionOutput:
 	checkpoint_manager: CheckpointManager
 	initialize_state_function: Callable
 	sharded_eval_step_function: Optional[Callable] = None
+
+
+@dataclass
+class TrainerOutput:
+	state: EasyDeLState
+	mesh: Optional[jax.sharding.Mesh]
+	checkpoint_manager: Any
+	gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None
+	shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None
+	last_save_file_name: Optional[str] = None
+	checkpoint_path: Optional[str] = None
+
+
+def get_layer_names(frozen_dict, prefix=""):
+	"""
+	Recursively retrieves layer names and their corresponding parameter arrays from a FrozenDict.
+
+	Args:
+			frozen_dict (FrozenDict): The FrozenDict containing the model parameters.
+			prefix (str, optional): A prefix to add to the layer names. Defaults to "".
+
+	Returns:
+			dict[str, jnp.ndarray]: A dictionary mapping layer names to their parameter arrays.
+	"""
+	layer_names = {}
+	for key, value in frozen_dict.items():
+		if isinstance(value, flax.core.FrozenDict):
+			layer_names.update(get_layer_names(value, prefix=f"{prefix}_{key}"))
+		else:
+			layer_name = f"{prefix}_{key}".lstrip("/")
+			layer_names[layer_name] = value
+	return layer_names
 
 
 class BaseTrainer(abc.ABC):
@@ -173,7 +214,7 @@ class BaseTrainer(abc.ABC):
 					time.sleep(1.5)
 			except FileNotFoundError as err:
 				if "directory: 'go'" in err.__str__():
-					logger.warn(
+					warning(
 						"in order to capture memory you need to have `go-lang` already installed.(ignoring memory capture action)"
 					)
 				else:
@@ -566,7 +607,7 @@ class BaseTrainer(abc.ABC):
 		self._manage_checkpoint_limit(checkpoint_dir)
 
 		filename = self._generate_checkpoint_filename(step, milestone)
-		logger.info(f"Saving Model {filename}.")
+		logger.info(f"saving state {filename}.")
 
 		state.save_state(
 			filename=filename,
@@ -832,3 +873,283 @@ partition_rules = {partition_rules}
 			* sum(x.size for x in jax.tree_util.tree_flatten(unfreeze(params))[0])
 			* (self.arguments.total_batch_size * self.arguments.max_sequence_length)
 		) / jax.device_count()
+
+	@staticmethod
+	def count_model_parameters(prm):
+		"""Prints the number of model parameters in billions."""
+		return sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(prm))[0])
+
+	def get_layer_names(self, frozen_dict, prefix=""):
+		"""
+		Recursively retrieves layer names and their corresponding parameter arrays from a FrozenDict.
+
+		Args:
+				frozen_dict (FrozenDict): The FrozenDict containing the model parameters.
+				prefix (str, optional): A prefix to add to the layer names. Defaults to "".
+
+		Returns:
+				dict[str, jnp.ndarray]: A dictionary mapping layer names to their parameter arrays.
+		"""
+		return get_layer_names(frozen_dict, prefix)
+
+	def _should_skip_step(self, current_step):
+		"""Determine if current step should be skipped."""
+		return (
+			self.arguments.step_start_point is not None
+			and self.arguments.step_start_point > current_step
+		)
+
+	def _should_save_checkpoint(self, current_step):
+		"""Determine if checkpoint should be saved at current step."""
+		return (
+			self.arguments.save_steps is not None
+			and current_step > 0
+			and current_step % self.arguments.save_steps == 0
+		)
+
+	def _prepare_training_output(
+		self,
+		sharded_state: EasyDeLState,
+		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+		run_exception: Optional[Exception] = None,
+	):
+		if run_exception is not None:
+			if isinstance(run_exception, KeyboardInterrupt):
+				termcolor.cprint(
+					"KeyboardInterrupt: Training interrupted. Saving current state...",
+					color="yellow",
+					force_color=True,
+				)
+			elif isinstance(run_exception, EasyDeLTimerError):
+				termcolor.cprint(
+					"Training reached maximum time limit. Saving current state...",
+					color="yellow",
+					force_color=True,
+				)
+			else:
+				raise RuntimeError("EasyDeL Runtime dumped") from run_exception
+		checkpoint_path = "SAVING_SKIPPED"
+		filename = None
+		if self.arguments.merge_lora_rapture_parameters and self.rapture is not None:
+			print(
+				termcolor.colored("Info : ", color="red", force_color=True),
+				termcolor.colored("Merging LoRA Parameters.", color="white", force_color=True),
+			)
+			sharded_state = sharded_state.replace(
+				params=self.rapture.merge_parameters(sharded_state.params)
+			)
+		try:
+			if self.arguments.do_last_save:
+				filename = self._save_state(
+					state=sharded_state,
+					gather_fns=gather_fns,
+					milestone=False,
+					save_dir=self.arguments.save_dir,
+				)
+				if self.arguments.save_dir is not None:
+					checkpoint_path = os.path.join(self.arguments.save_dir, filename)
+		except Exception as e:
+			termcolor.cprint(
+				f"Failed to save checkpoint on interruption: {str(e)}",
+				color="red",
+				force_color=True,
+			)
+
+		return TrainerOutput(
+			state=sharded_state,
+			mesh=self.mesh,
+			shard_fns=shard_fns,
+			gather_fns=gather_fns,
+			checkpoint_manager=self.checkpoint_manager,
+			checkpoint_path=checkpoint_path,
+			last_save_file_name=filename,
+		)
+
+	def _handle_training_interruption(
+		self,
+		sharded_state: EasyDeLState,
+		exception: Exception,
+		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+	):
+		"""Handle training interruption gracefully."""
+		if isinstance(exception, KeyboardInterrupt):
+			termcolor.cprint(
+				"KeyboardInterrupt: Training interrupted. Saving current state...",
+				color="yellow",
+				force_color=True,
+			)
+		elif isinstance(exception, EasyDeLTimerError):
+			termcolor.cprint(
+				"Training reached maximum time limit. Saving current state...",
+				color="yellow",
+				force_color=True,
+			)
+		else:
+			raise RuntimeError("EasyDeL Runtime dumped") from exception
+		return self._prepare_training_output(
+			sharded_state=sharded_state,
+			checkpoint_manager=self.checkpoint_manager,
+			shard_fns=shard_fns,
+			gather_fns=gather_fns,
+			run_exception=None,
+		)
+
+	def _setup_initial_metrics(self, sharded_state):
+		"""Setup initial metrics logging."""
+		# Calculate and log model size
+		self.arguments.log_metrics(
+			{
+				"Number of Model Parameters (Billion)": self.count_model_parameters(
+					sharded_state.params
+				)
+			},
+			step=0,
+		)
+		self._flops_per_device = (
+			self.calculate_number_total_flops_per_device(params=sharded_state.params) / 1e12
+		)
+
+	def _get_next_batch(self, train_iter):
+		"""Get next batch from iterator, reinitializing if needed."""
+		try:
+			batch = next(train_iter)
+		except StopIteration:
+			train_iter = iter(self.dataloader_train)
+			batch = next(train_iter)
+
+		# Remove specified ids from batch if needed
+		for id_to_pop in self.arguments.ids_to_pop_from_dataset:
+			_ = batch.pop(id_to_pop, None)
+
+		return batch
+
+	def _log_metrics(
+		self,
+		metrics: Dict[str, float],
+		pbar: tqdm.tqdm,
+		step: int,
+		mode: str = "train",
+	):
+		"""Log metrics and update progress bar."""
+		# Update progress bar
+		pbar.set_postfix(
+			**{k.replace(f"{mode}/", ""): v for k, v in metrics.items() if len(k) < 30}
+		)
+		pbar.update()
+		# Log metrics if tracking is enabled
+		if not self.arguments.performance_mode:
+			self.arguments.log_metrics(
+				metrics=metrics,
+				step=step,
+			)
+
+
+class StepMetrics:
+	"""Handles calculation and tracking of training metrics."""
+
+	def __init__(self, arguments):
+		self.arguments = arguments
+		self.start_time = time.time()
+		self.step_start_time = time.time()
+
+	def start_step(self):
+		"""Mark the start of a training step."""
+		self.step_start_time = time.time()
+
+	def calculate(
+		self,
+		loss,
+		metrics,
+		current_step,
+		epoch,
+		flops_per_device,
+		batch_size,
+		seq_length,
+		mode: Optional[Literal["eval", "train"]] = None,
+		**extras,
+	) -> Dict[str, float]:
+		"""Calculate comprehensive metrics for the training step."""
+		step_time = time.time() - self.step_start_time
+		total_time = time.time() - self.start_time
+
+		visited_tokens = jnp.multiply(seq_length, jnp.multiply(current_step, batch_size))
+
+		flops = flops_per_device / step_time
+
+		basic_metrics = {
+			"loss": loss.tolist(),
+			"accuracy": metrics["accuracy"],
+			"learning_rate": self.arguments.learning_rate,
+			"step": current_step,
+			"step_time": step_time,
+			"perplexity": jnp.exp(loss).tolist(),
+			"visited_tokens": visited_tokens,
+			"epoch": epoch,
+			"TFLOPs": flops,
+			"total_time": total_time,
+			**extras,
+		}
+
+		if not self.arguments.performance_mode and (mode == "train" or mode is None):
+			detailed_metrics = self._calculate_detailed_metrics(metrics)
+			basic_metrics.update(detailed_metrics)
+		if mode is not None:
+			basic_metrics = {f"{mode}/{k}": v for k, v in basic_metrics.items()}
+		return basic_metrics
+
+	def _calculate_detailed_metrics(self, metrics):
+		"""Calculate additional detailed metrics."""
+		detailed_metrics = {}
+
+		if self.arguments.log_grad_norms:
+			detailed_metrics.update(
+				{
+					"train/max_grad_norm": metrics.get(
+						"max_grad_norm", np.asarray(None)
+					).tolist(),
+					"train/mean_grad_norm": metrics.get(
+						"mean_grad_norm", np.asarray(None)
+					).tolist(),
+				}
+			)
+
+			# Add per-layer gradient norms
+			detailed_metrics.update(
+				{
+					f"grad_norm/{layer_name}": grad_norm.tolist()
+					for layer_name, grad_norm in get_layer_names(metrics["grad_norms"]).items()
+				}
+			)
+
+		return detailed_metrics
+
+
+class MetricsTracker:
+	"""Tracks and aggregates training metrics over time."""
+
+	def __init__(self):
+		self.loss_sum = None
+		self.accuracy_sum = None
+		self.metrics_history = defaultdict(list)
+		self.step_offset = 0
+
+	def update(self, loss, accuracy, step):
+		"""Update tracked metrics with new values."""
+		with jax.spmd_mode("allow_all"):
+			self.loss_sum = loss if self.loss_sum is None else self.loss_sum + loss
+			self.accuracy_sum = (
+				accuracy if self.accuracy_sum is None else self.accuracy_sum + accuracy
+			)
+
+			mean_loss = self.loss_sum / (step + 1 - self.step_offset)
+			mean_accuracy = self.accuracy_sum / (step + 1 - self.step_offset)
+
+			return mean_loss, mean_accuracy
+
+	def reset(self, step):
+		"""Reset tracked metrics."""
+		self.loss_sum = None
+		self.accuracy_sum = None
+		self.step_offset = step

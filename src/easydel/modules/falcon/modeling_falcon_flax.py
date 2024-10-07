@@ -113,7 +113,7 @@ def dropout_add(
 
 
 class FlaxFalconRotaryEmbedding(nn.Module):
-	dtype: jnp.dtype = jnp.float32
+	dtype: jnp.dtype = jnp.bfloat16
 
 	def __call__(self, query, key, frequencies, position_ids):
 		sin, cos = frequencies
@@ -143,8 +143,8 @@ class FlaxFalconAttention(FlaxAttentionModule):
 	"""
 
 	config: FalconConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
+	dtype: jnp.dtype = jnp.bfloat16
+	param_dtype: jnp.dtype = jnp.bfloat16
 	precision: Optional[Union[jax.lax.Precision, str]] = None
 
 	def setup(self) -> None:
@@ -441,8 +441,8 @@ class FlaxFalconAttention(FlaxAttentionModule):
 
 class FlaxFalconMlp(nn.Module):
 	config: FalconConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
+	dtype: jnp.dtype = jnp.bfloat16
+	param_dtype: jnp.dtype = jnp.bfloat16
 	precision: Optional[Union[jax.lax.Precision, str]] = None
 
 	def setup(self) -> None:
@@ -489,8 +489,8 @@ class FlaxFalconMlp(nn.Module):
 
 class FlaxFalconBlock(nn.Module):
 	config: FalconConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
+	dtype: jnp.dtype = jnp.bfloat16
+	param_dtype: jnp.dtype = jnp.bfloat16
 	precision: Optional[Union[jax.lax.Precision, str]] = None
 
 	def setup(self) -> None:
@@ -664,8 +664,8 @@ class FlaxFalconCollection(nn.Module):
 	"""
 
 	config: FalconConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
+	dtype: jnp.dtype = jnp.bfloat16
+	param_dtype: jnp.dtype = jnp.bfloat16
 	precision: Optional[Union[jax.lax.Precision, str]] = None
 
 	def setup(self) -> None:
@@ -741,8 +741,8 @@ class FlaxFalconCollection(nn.Module):
 
 class FlaxFalconModule(nn.Module):
 	config: FalconConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
+	dtype: jnp.dtype = jnp.bfloat16
+	param_dtype: jnp.dtype = jnp.bfloat16
 	precision: Optional[Union[jax.lax.Precision, str]] = None
 
 	def setup(self) -> None:
@@ -873,8 +873,8 @@ class FlaxFalconPretrainedModel(EDPretrainedModel):
 		self,
 		config,
 		_do_init=False,
-		dtype: jnp.dtype = jnp.float32,
-		param_dtype: jnp.dtype = jnp.float32,
+		dtype: jnp.dtype = jnp.bfloat16,
+		param_dtype: jnp.dtype = jnp.bfloat16,
 		input_shape: Tuple = (1, 1),
 		precision: Optional[Union[str, jax.lax.Precision]] = None,
 	):
@@ -1099,8 +1099,8 @@ class FlaxFalconModel(FlaxFalconPretrainedModel):
 
 class FlaxFalconForCausalLMModule(nn.Module):
 	config: FalconConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
+	dtype: jnp.dtype = jnp.bfloat16
+	param_dtype: jnp.dtype = jnp.bfloat16
 	precision: Optional[Union[jax.lax.Precision, str]] = None
 
 	def setup(self) -> None:

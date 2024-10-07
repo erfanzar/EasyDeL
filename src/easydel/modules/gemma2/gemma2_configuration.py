@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -111,6 +110,7 @@ class Gemma2Config(EDPretrainedConfig):
 		gradient_checkpointing: str = "nothing_saveable",
 		bits: Optional[int] = None,
 		scan_layers: bool = False,
+		attn_logit_softcapping: Optional[bool] = None,
 		**kwargs,
 	):
 		"""The __init__ function is called when the class is instantiated.
@@ -151,6 +151,7 @@ class Gemma2Config(EDPretrainedConfig):
 		self.query_pre_attn_scalar = query_pre_attn_scalar
 		self.sliding_window = sliding_window
 		self.cache_implementation = "hybrid"
+		self.attn_logit_softcapping = attn_logit_softcapping
 
 	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
 		"""

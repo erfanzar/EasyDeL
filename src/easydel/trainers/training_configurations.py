@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -153,6 +152,8 @@ class TrainArguments:
 	    neftune_noise_alpha (Optional[float]): NEFTune noise alpha parameter.
 	    log_grad_norms (bool): Log gradient norms during training.
 	    loaded_model_config_kwargs (Optional[dict]): Keyword arguments from loaded model configuration.
+			num_classification_labels (Optional[int]): num classification labels for SequenceClassification Trainer
+			classification_problem_type (Literal["regression", "single_label_classification", "multi_label_classification"]): num classification labels for SequenceClassification Trainer
 
 	Methods:
 	    __post_init__(): Validates configuration and sets up distributed training, optimizer, logging, and XRapTure.
@@ -250,7 +251,7 @@ class TrainArguments:
 	rapture_config: Optional[LoraRaptureConfig] = None
 	pruning_module: AVAILABLE_PRUNING_TYPE = None
 	sparsify_module: bool = False
-	sparse_module_type:AVAILABLE_SPARSE_MODULE_TYPES = "bcoo"
+	sparse_module_type: AVAILABLE_SPARSE_MODULE_TYPES = "bcoo"
 	merge_lora_rapture_parameters: bool = True
 	state_apply_fn_kwarguments_to_model: Optional[dict] = None
 	remove_unused_columns: bool = True
@@ -259,6 +260,10 @@ class TrainArguments:
 	neftune_noise_alpha: Optional[float] = None
 	log_grad_norms: bool = True
 	loaded_model_config_kwargs: Optional[dict] = None
+	num_classification_labels: Optional[int] = None
+	classification_problem_type: Literal[
+		"regression", "single_label_classification", "multi_label_classification"
+	] = "regression"
 
 	def __post_init__(self):
 		"""

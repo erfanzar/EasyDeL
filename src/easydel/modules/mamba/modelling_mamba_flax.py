@@ -436,7 +436,7 @@ class FlaxMambaMixer(nn.Module):
 				jax.random.normal(
 					key=self.make_rng("params"),
 					shape=(self.config.intermediate_size,),
-					dtype=self.param_dtype,
+					dtype=jnp.float32,
 				)
 				* (jnp.log(self.config.time_step_max) - jnp.log(self.config.time_step_min))
 				+ jnp.log(self.config.time_step_min)

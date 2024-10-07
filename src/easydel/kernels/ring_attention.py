@@ -93,9 +93,7 @@ def ring_attention(
 				backend = ...
 
 	if backend == Ellipsis:
-		raise NotImplementedError(
-			f"there's no available backend for platform {platform}"
-		)
+		raise NotImplementedError(f"there's no available backend for platform {platform}")
 
 	if autocheck:
 		blocksize_q = min(blocksize_q, query.shape[1])
@@ -192,7 +190,7 @@ def ring_attention(
 
 def _test_forward():
 	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
-	B, H, QS, KS, D = 1, 32, 2048, 2048, 128
+	B, H, QS, KS, D = 1, 32, 64_000, 64_000, 128
 	blocksize_k = 512
 	blocksize_q = 512
 	dtype = jnp.float32
@@ -205,23 +203,23 @@ def _test_forward():
 			jnp.finfo(dtype).min,
 			0,
 		)
-		if True
+		if False
 		else None
 	)
 	print("QKV Allocated")
-	# try:
-	co = ring_attention(
-		query=q,
-		key=k,
-		value=v,
-		bias=b,
-		blocksize_k=blocksize_k,
-		blocksize_q=blocksize_q,
-	)
-	print(co[-1, -1, -1, :5])
-	# except Exception as er:
-	# 	print("ring OOM", er)
-	# 	co = None
+	try:
+		co = ring_attention(
+			query=q,
+			key=k,
+			value=v,
+			bias=b,
+			blocksize_k=blocksize_k,
+			blocksize_q=blocksize_q,
+		)
+		print(co[-1, -1, -1, :5])
+	except Exception as er:
+		print("ring OOM", er)
+		co = None
 	try:
 		import flax
 
@@ -231,9 +229,7 @@ def _test_forward():
 		print("Flax OOM", er)
 		fo = None
 	if fo is not None and co is not None:
-		print(
-			"Results are Close" if jnp.allclose(co, fo, 0, 0.125) else "Wrong results!"
-		)
+		print("Results are Close" if jnp.allclose(co, fo, 0, 0.125) else "Wrong results!")
 
 
 def _test_backward():
@@ -297,4 +293,4 @@ def _test_backward():
 
 if __name__ == "__main__":
 	_test_forward()
-	_test_backward()
+	# _test_backward()

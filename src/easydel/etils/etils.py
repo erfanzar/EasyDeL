@@ -35,6 +35,8 @@ from fjformer.jaxpruner import (
 	SteMagnitudePruning,
 	SteRandomPruning,
 )
+import jax
+import jax.extend
 
 
 @dataclass
@@ -138,7 +140,9 @@ AVAILABLE_ATTENTION_MECHANISMS = Literal[
 	"blockwise",
 ]
 
-DEFAULT_ATTENTION_MECHANISM = "sharded_vanilla"
+DEFAULT_ATTENTION_MECHANISM = (
+	"flash_attn2" if jax.extend.backend.get_backend().platform == "gpu" else "ring"
+)
 AVAILABLE_SPARSE_MODULE_TYPES = Literal["bcoo", "bcsr", "coo", "csr"]
 
 

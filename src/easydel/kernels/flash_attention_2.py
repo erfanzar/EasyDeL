@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from typing import Literal, Optional
 
 import chex
@@ -59,9 +60,7 @@ def flash_attention2(
 				backend = ...
 
 	if backend == Ellipsis:
-		raise NotImplementedError(
-			f"there's no available backend for platform {platform}"
-		)
+		raise NotImplementedError(f"there's no available backend for platform {platform}")
 	match platform:
 		case "gpu":
 			match backend:
@@ -192,7 +191,7 @@ def _test_backward():
 
 def _test_forward():
 	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
-	B, H, QS, KS, D = 1, 32, 2048, 2048, 128
+	B, H, QS, KS, D = 1, 32, 4096, 4096, 128
 	blocksize_k = 64
 	blocksize_q = 128
 	q = jax.nn.initializers.normal(2)(q_key, (B, QS, H, D), dtype=jnp.float16)
@@ -209,6 +208,7 @@ def _test_forward():
 	)
 	print("QKV Allocated")
 	try:
+		start = time.time()
 		co = flash_attention2(
 			q,
 			k,
@@ -220,6 +220,7 @@ def _test_forward():
 			platform="gpu",
 			backend="triton",
 		)
+		print("TOOK ", time.time() - start)
 		print(co[-1, -1, -1, :5])
 	except Exception as er:
 		print("Flash OOM", er)
