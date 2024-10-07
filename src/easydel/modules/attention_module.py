@@ -92,9 +92,7 @@ def combine_flash_masks(causal_mask, segment_ids):
 	causal_mask = causal_mask.astype(jnp.bool_)
 	if causal_mask.ndim == 2:
 		query_sequence_length, key_sequence_length = causal_mask.shape
-		causal_mask = causal_mask.reshape(
-			1, 1, query_sequence_length, key_sequence_length
-		)
+		causal_mask = causal_mask.reshape(1, 1, query_sequence_length, key_sequence_length)
 	elif causal_mask.ndim == 4:
 		*_, query_sequence_length, key_sequence_length = causal_mask.shape
 	else:
@@ -211,7 +209,7 @@ class FlexibleAttentionModule(object):
 		sm_scale: float,
 		num_attention_heads: int,
 		head_dims: int,
-		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = AttentionMechanisms.vanilla,
+		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = AttentionMechanisms.ring,
 		block_k: int = ...,
 		block_q: int = ...,
 		block_b: int = ...,
@@ -482,7 +480,7 @@ class FlexibleAttentionModule(object):
 		attention_mask: Optional[Array] = None,
 		segment_ids: Optional[Array] = None,
 		causal: bool = True,
-		deterministic: bool = False,
+		deterministic: bool = True,
 		dropout_rng: Optional[random.PRNGKey] = None,
 		uses_cache: bool = False,
 		causal_mask: Optional[Array] = None,
@@ -501,91 +499,92 @@ class FlexibleAttentionModule(object):
 					query_sequence_length=query_sequence_length,
 					key_value_sequence_length=key_value_sequence_length,
 				)
-			if self.attn_mechanism == AttentionMechanisms.flash_attn2:
-				return self.flash_attn2(
-					query_states=query_states,
-					key_states=key_states,
-					value_states=value_states,
-					bias=bias,
-				)
-			elif self.attn_mechanism == AttentionMechanisms.vanilla:
-				return self.vanilla_attention(
-					query_states=query_states,
-					key_states=key_states,
-					value_states=value_states,
-					bias=bias,
-					dropout_rng=dropout_rng,
-					deterministic=deterministic,
-					query_sequence_length=query_sequence_length,
-					key_value_sequence_length=key_value_sequence_length,
-				)
-			elif self.attn_mechanism == AttentionMechanisms.sharded_vanilla:
-				return self.sharded_vanilla_attention(
-					query_states=query_states,
-					key_states=key_states,
-					value_states=value_states,
-					bias=bias,
-					dropout_rng=dropout_rng,
-					deterministic=deterministic,
-					query_sequence_length=query_sequence_length,
-					key_value_sequence_length=key_value_sequence_length,
-				)
+			match self.attn_mechanism:
+				case AttentionMechanisms.flash_attn2:
+					return self.flash_attn2(
+						query_states=query_states,
+						key_states=key_states,
+						value_states=value_states,
+						bias=bias,
+					)
+				case AttentionMechanisms.vanilla:
+					return self.vanilla_attention(
+						query_states=query_states,
+						key_states=key_states,
+						value_states=value_states,
+						bias=bias,
+						dropout_rng=dropout_rng,
+						deterministic=deterministic,
+						query_sequence_length=query_sequence_length,
+						key_value_sequence_length=key_value_sequence_length,
+					)
+				case AttentionMechanisms.sharded_vanilla:
+					return self.sharded_vanilla_attention(
+						query_states=query_states,
+						key_states=key_states,
+						value_states=value_states,
+						bias=bias,
+						dropout_rng=dropout_rng,
+						deterministic=deterministic,
+						query_sequence_length=query_sequence_length,
+						key_value_sequence_length=key_value_sequence_length,
+					)
 			
-			elif self.attn_mechanism == AttentionMechanisms.ring:
-				return self.ring_attention(
-					query_states=query_states,
-					key_states=key_states,
-					value_states=value_states,
-					bias=bias,
-					dropout_rng=dropout_rng,
-					deterministic=deterministic,
-					segment_ids=segment_ids,
-					attention_mask=attention_mask,
-					query_sequence_length=query_sequence_length,
-					key_value_sequence_length=key_value_sequence_length,
-				)
-			elif self.attn_mechanism == AttentionMechanisms.splash:
-				if segment_ids is not None:
-					warnings.warn("Splash attention don't support `segment_ids` this argument will be ignored", UserWarning, stacklevel=1)
-				if self.attention_dropout != 0.0:
-					warnings.warn("Splash attention don't support `attention_dropout` this argument will be ignored", UserWarning, stacklevel=1)
-				if bias is not None:
-					warnings.warn("Splash attention don't support `bias` this argument will be ignored", UserWarning, stacklevel=1)
+				case AttentionMechanisms.ring:
+					return self.ring_attention(
+						query_states=query_states,
+						key_states=key_states,
+						value_states=value_states,
+						bias=bias,
+						dropout_rng=dropout_rng,
+						deterministic=deterministic,
+						segment_ids=segment_ids,
+						attention_mask=attention_mask,
+						query_sequence_length=query_sequence_length,
+						key_value_sequence_length=key_value_sequence_length,
+					)
+				case AttentionMechanisms.splash:
+					if segment_ids is not None:
+						warnings.warn("Splash attention don't support `segment_ids` this argument will be ignored", UserWarning, stacklevel=1)
+					if self.attention_dropout != 0.0:
+						warnings.warn("Splash attention don't support `attention_dropout` this argument will be ignored", UserWarning, stacklevel=1)
+					if bias is not None:
+						warnings.warn("Splash attention don't support `bias` this argument will be ignored", UserWarning, stacklevel=1)
 
-				return self.splash_attention(
-					query_states=query_states,
-					key_states=key_states,
-					value_states=value_states,
-					query_sequence_length=query_sequence_length,
-					key_value_sequence_length=key_value_sequence_length,
-					attention_mask=attention_mask,
-				)
-			elif self.attn_mechanism == AttentionMechanisms.blockwise:
-				if segment_ids is not None:
-					warnings.warn("BlockWise Attention don't support `segment_ids` this argument will be ignored", UserWarning, stacklevel=1)
-				return self.blockwise_attention(
-					query_states=query_states,
-					key_states=key_states,
-					value_states=value_states,
-					bias=bias,
-					deterministic=deterministic,
-					dropout_rng=dropout_rng,
-					query_sequence_length=query_sequence_length,
-					key_value_sequence_length=key_value_sequence_length,
-				)
-			elif self.attn_mechanism == AttentionMechanisms.cudnn:
-				return self.cuddn_flash_attention(
-					query_states=query_states,
-					key_states=key_states,
-					value_states=value_states,
-					bias=bias,
-					causal=causal,
-					deterministic=deterministic,
-					query_sequence_length=query_sequence_length,
-					key_value_sequence_length=key_value_sequence_length,
-				)
-			else:
-				raise ValueError(f"Unknown Attention mechanism of {self.attn_mechanism}")
+					return self.splash_attention(
+						query_states=query_states,
+						key_states=key_states,
+						value_states=value_states,
+						query_sequence_length=query_sequence_length,
+						key_value_sequence_length=key_value_sequence_length,
+						attention_mask=attention_mask,
+					)
+				case  AttentionMechanisms.blockwise:
+					if segment_ids is not None:
+						warnings.warn("BlockWise Attention don't support `segment_ids` this argument will be ignored", UserWarning, stacklevel=1)
+					return self.blockwise_attention(
+						query_states=query_states,
+						key_states=key_states,
+						value_states=value_states,
+						bias=bias,
+						deterministic=deterministic,
+						dropout_rng=dropout_rng,
+						query_sequence_length=query_sequence_length,
+						key_value_sequence_length=key_value_sequence_length,
+					)
+				case AttentionMechanisms.cudnn:
+					return self.cuddn_flash_attention(
+						query_states=query_states,
+						key_states=key_states,
+						value_states=value_states,
+						bias=bias,
+						causal=causal,
+						deterministic=deterministic,
+						query_sequence_length=query_sequence_length,
+						key_value_sequence_length=key_value_sequence_length,
+					)
+							
+		raise ValueError(f"Unknown Attention mechanism of {self.attn_mechanism}")
 		# fmt:on
 
 	def flash_attn2(
@@ -603,10 +602,10 @@ class FlexibleAttentionModule(object):
 			bias = jnp.repeat(bias, query_states.shape[2], 1)
 		with self.mesh:
 			attention_outputs = flash_attention2(
-				query=with_sharding_constraint(query_states, qps),
-				key=with_sharding_constraint(key_states, kps),
-				value=with_sharding_constraint(value_states, vps),
-				bias=with_sharding_constraint(bias, bps),
+				query=with_sharding_constraint(query_states, qps).astype(self.dtype),
+				key=with_sharding_constraint(key_states, kps).astype(self.dtype),
+				value=with_sharding_constraint(value_states, vps).astype(self.dtype),
+				bias=with_sharding_constraint(bias, bps).astype(self.dtype),
 				blocksize_q=self.block_q,
 				blocksize_k=self.block_k,
 				softmax_scale=self.sm_scale,
@@ -643,7 +642,6 @@ class FlexibleAttentionModule(object):
 				if jax.extend.backend.get_backend().platform == "gpu"
 				else True,
 				platform=self.platform,
-				backend=self.backend,
 				autocheck=True,
 				blocksize_c=None,
 				blocksize_k=self.block_k,
@@ -653,8 +651,8 @@ class FlexibleAttentionModule(object):
 				deterministic=deterministic,
 				dropout_rng=dropout_rng,
 			),
-			in_specs=[qps, kps, vps, bps],
-			out_specs=[aps],
+			in_specs=(qps, kps, vps, bps),
+			out_specs=aps,
 			mesh=self.mesh,
 			check_rep=False,
 		)(
@@ -778,14 +776,10 @@ class FlexibleAttentionModule(object):
 
 			if not deterministic and self.attention_dropout > 0.0:
 				keep_prob = 1.0 - self.attention_dropout
-				dropout_shape = (
-					tuple([1] * (key_states.ndim - 2)) + attention_weight.shape[-2:]
-				)
+				dropout_shape = tuple([1] * (key_states.ndim - 2)) + attention_weight.shape[-2:]
 				keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
 
-				multiplier = keep.astype(self.dtype) / jnp.asarray(
-					keep_prob, dtype=self.dtype
-				)
+				multiplier = keep.astype(self.dtype) / jnp.asarray(keep_prob, dtype=self.dtype)
 				attention_weight = attention_weight * multiplier
 
 			attention = jnp.einsum(
@@ -840,9 +834,7 @@ class FlexibleAttentionModule(object):
 			block_size = self.get_block_size_splash_attn(
 				query_sequence_length, key_value_sequence_length
 			)
-			masks = [
-				CausalMask(shape=(q.shape[2], k.shape[2])) for _ in range(q.shape[1])
-			]
+			masks = [CausalMask(shape=(q.shape[2], k.shape[2])) for _ in range(q.shape[1])]
 			multi_head_mask = MultiHeadMask(masks=masks)
 			splash_kernel = make_splash_mha(
 				mask=multi_head_mask,
@@ -939,9 +931,7 @@ class FlexibleAttentionModule(object):
 				),
 				bias=bias,
 				mask=(
-					jnp.zeros(
-						(batch, 1, query_sequence_length, key_value_sequence_length)
-					)
+					jnp.zeros((batch, 1, query_sequence_length, key_value_sequence_length))
 					if causal
 					else None
 				),
@@ -984,9 +974,7 @@ class FlexibleAttentionModule(object):
 		try:
 			import pandas
 		except (ModuleNotFoundError, ImportError):
-			warnings.warn(
-				"couldn't import pandas ... please install pandas", stacklevel=1
-			)
+			warnings.warn("couldn't import pandas ... please install pandas", stacklevel=1)
 			pandas = None
 		from fjformer import GenerateRNG
 
@@ -1005,9 +993,7 @@ class FlexibleAttentionModule(object):
 			def inner(*args, **kwargs):
 				return jnp.sum(fn(*args, **kwargs))
 
-			inner = (
-				jax.value_and_grad(inner, **kwargs) if calculate_gradients else inner
-			)
+			inner = jax.value_and_grad(inner, **kwargs) if calculate_gradients else inner
 
 			return inner
 
@@ -1063,9 +1049,7 @@ class FlexibleAttentionModule(object):
 				(batch_size, sequence_length, num_key_value_heads, head_dim),
 				dtype=dtype,
 			)
-			c = flax.linen.attention.make_causal_mask(
-				jnp.ones((batch_size, sequence_length))
-			)
+			c = flax.linen.attention.make_causal_mask(jnp.ones((batch_size, sequence_length)))
 			a = jnp.ones((batch_size, sequence_length))
 			a = a.at[:, sequence_length // 2 :].set(0)
 			b = jnp.where(
@@ -1086,9 +1070,7 @@ class FlexibleAttentionModule(object):
 			excepted_output = out
 			excepted_grads = 1
 
-		fns = {
-			k: partial(call_attention_module, attn_mechanism=k) for k in test_attentions
-		}
+		fns = {k: partial(call_attention_module, attn_mechanism=k) for k in test_attentions}
 		outs_and_grads = {}
 		for nm, fn in fns.items():
 			try:

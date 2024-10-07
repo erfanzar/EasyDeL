@@ -74,13 +74,9 @@ indent-style = "tab"
 docstring-code-format = true
 
 
-# [tool.ruff]
-# target-version = "py311"
-# line-length = 88
-# indent-width = 2 
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+indent-width = 2 
 
-[tool.autopep8]
-aggressive = 1
-ignore = "E501,E701,E731,W690,W503"
-max_line_length = 88
  

@@ -16,7 +16,7 @@ import copy
 import os
 import time
 import typing
-from typing import Any, Callable, Mapping, Optional, Tuple
+from typing import Any, Callable, Mapping, Optional, Tuple, List, Dict
 
 import flax
 import jax
@@ -36,350 +36,118 @@ from easydel.trainers.base_trainer import (
 	StepMetrics,
 	TrainerConfigureFunctionOutput,
 )
-from easydel.trainers.causal_language_model_trainer.fwd_bwd_functions import (
-	create_casual_language_model_evaluation_step,
-	create_casual_language_model_train_step,
+from easydel.trainers.sequence_classification_trainer.fwd_bwd_functions import (
+	create_sequence_classification_model_eval_step,
+	create_sequence_classification_model_train_step,
 )
-from easydel.trainers.causal_language_model_trainer.modeling_output import (
-	CausalLMTrainerOutput,
+from easydel.trainers.sequence_classification_trainer.modeling_output import (
+	SequenceClassificationTrainerOutput,
 )
 
 logger = get_logger(__name__)
 
 
-class CausalLanguageModelTrainer(BaseTrainer):
-	"""
-	Trainer for Causal Language Models (CLMs).
-
-	This trainer handles training, evaluation, and checkpointing of CLMs
-	using JAX and EasyDeL. It supports features like sharding, gradient
-	accumulation, mixed precision training, and LoRA.
-
-	Attributes:
-			(Inherited from BaseTrainer)
-
-	Methods:
-			create_collect_function(self, max_sequence_length: int, truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end") -> Callable:
-					Creates a function to collect and pad/truncate batches of data.
-			configure_functions(self) -> TrainerConfigureFunctionOutput:
-					Configures and JIT-compiles the training and evaluation step functions.
-			initialize_state(self, model_parameters: Optional[flax.core.FrozenDict] = None, state: Optional[EasyDeLState] = None) -> Tuple[EasyDeLState, Mapping[str, Callable], Mapping[str, Callable]]:
-					Initializes the training state, either from scratch, pretrained parameters, or a checkpoint.
-			train(self, model_parameters: Optional[flax.core.FrozenDict] = None, state: Optional[EasyDeLState] = None) -> CausalLMTrainerOutput:
-					Trains the CLM and returns the training output.
-			eval(self, model_state: EasyDeLState) -> typing.Iterator[dict]:
-					Evaluates the CLM and yields evaluation metrics.
-
-
-
-	>>> import jax.lax
-	>>> from easydel import (
-	...   TrainArguments,
-	...   CausalLanguageModelTrainer,
-	...   AutoEasyDeLModelForCausalLM,
-	...   EasyDeLOptimizers,
-	...   EasyDeLSchedulers,
-	...   EasyDeLGradientCheckPointers,
-	...   PartitionAxis,
-	... )
-	>>> from datasets import load_dataset
-	>>> import flax
-	>>> from jax import numpy as jnp
-	>>> from transformers import AutoTokenizer
-
-	>>> huggingface_repo_id_or_path = (
-	...   "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"
-	... )
-
-	>>> max_length = 4096
-	>>> dtype = jnp.bfloat16
-	>>> input_shape = (1, 1)
-	>>> partition_axis = PartitionAxis()
-	>>> sharding_axis_dims = (1, -1, 1, 1)  # Change to 1,1,1,-1 for Sequence Sharding
-	>>> model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
-	...   huggingface_repo_id_or_path,
-	...   dtype=dtype,
-	...   param_dtype=dtype,
-	...   precision=jax.lax.Precision("fastest"),
-	...   auto_shard_params=True,
-	...   sharding_axis_dims=sharding_axis_dims,
-	...   verbose_params=True,
-	...   config_kwargs=dict(use_scan_mlp=False, partition_axis=partition_axis),
-	...   partition_axis=partition_axis,
-	... )
-
-	>>> tokenizer = AutoTokenizer.from_pretrained(
-	...   huggingface_repo_id_or_path, trust_remote_code=True
-	... )
-
-	>>> tokenizer.pad_token = tokenizer.eos_token
-	>>> configs_to_initialize_model_class = {
-	...   "config": model.config,
-	...   "dtype": dtype,
-	...   "param_dtype": dtype,
-	...   "input_shape": input_shape,
-	... }
-
-	>>> train_arguments = TrainArguments(
-	...   model_class=type(model),
-	...   model_name="my_first_model_to_train_using_easydel",
-	...   num_train_epochs=3,
-	...   configs_to_initialize_model_class=configs_to_initialize_model_class,
-	...   learning_rate=5e-5,
-	...   learning_rate_end=1e-6,
-	...   optimizer=EasyDeLOptimizers.ADAMW,  # "adamw", "lion", "adafactor" are supported
-	...   scheduler=EasyDeLSchedulers.LINEAR,
-	...   # "linear","cosine", "none" ,"warm_up_cosine" and "warm_up_linear"  are supported
-	...   weight_decay=0.01,
-	...   total_batch_size=64,
-	...   max_training_steps=None,  # None to let trainer Decide
-	...   do_train=True,
-	...   do_eval=False,  # it's optional but supported
-	...   backend="tpu",  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
-	...   max_sequence_length=max_length,  # Note that you have to change this in the model config too
-	...   gradient_checkpointing=EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
-	...   sharding_array=sharding_axis_dims,
-	...   # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1, 1)
-	...   # everything training will be in sequence and model parallel automatic and share data between devices
-	...   remove_ckpt_after_load=True,
-	...   gradient_accumulation_steps=8,
-	...   loss_re_mat="",
-	...   dtype=dtype,
-	...   param_dtype=dtype,
-	...   init_input_shape=input_shape,
-	... )
-
-
-	>>> def ultra_chat_prompting_process(data_chunk):
-	...   user_part = [
-	...     chunk["content"]
-	...     for chunk in data_chunk["messages"]
-	...     if chunk["role"] == "user"
-	...   ]
-	...   assistant_part = [
-	...     chunk["content"]
-	...     for chunk in data_chunk["messages"]
-	...     if chunk["role"] == "assistant"
-	...   ]
-	...
-	...   prompt = ""
-	...
-	...   for uc, ac in zip(user_part, assistant_part):
-	...     prompt += f"<|user|>\n{uc}</s>\n<|assistant|>\n{ac}</s>\n"
-	...
-	...   return {"prompt": prompt}
-
-
-	>>> tokenization_process = lambda data_chunk: tokenizer(
-	...   data_chunk["prompt"],
-	...   add_special_tokens=False,
-	...   max_length=max_length,
-	...   padding="max_length",
-	... )
-
-	>>> dataset = load_dataset("HuggingFaceH4/ultrachat_200k")
-	>>> dataset_train = dataset["train_gen"].map(
-	...   ultra_chat_prompting_process, num_proc=12
-	... )
-	>>> dataset_train = dataset_train.map(
-	...   tokenization_process, num_proc=12, remove_columns=dataset_train.column_names
-	... )
-
-	>>> # you can do the same for evaluation process dataset
-
-	>>> trainer = CausalLanguageModelTrainer(
-	...   train_arguments, dataset_train, checkpoint_path=None
-	... )
-
-	>>> output = trainer.train(flax.core.FrozenDict({"params": params}))
-	>>> print(f"Hey ! , here's where your model saved {output.checkpoint_path}")
-
-
-	### With Using LoRA and XRapture
-
-
-
-	>>> from flax.core import FrozenDict
-	>>> from easydel import (
-	...   TrainArguments,
-	...   CausalLanguageModelTrainer,
-	...   AutoEasyDeLModelForCausalLM,
-	...   EasyDeLOptimizers,
-	...   EasyDeLSchedulers,
-	...   EasyDeLGradientCheckPointers,
-	...   LoraRaptureConfig,
-	... )
-	>>> from datasets import load_dataset
-	>>> import flax
-	>>> from jax import numpy as jnp
-	>>> from transformers import AutoTokenizer
-
-	>>> huggingface_repo_id_or_path = "mistralai/Mistral-7B-Instruct-v0.1"
-
-	>>> model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
-	...   huggingface_repo_id_or_path,
-	... )
-
-	>>> max_length = 8196
-	>>> model_parameters = FrozenDict({"params": params})
-
-	>>> dtype = jnp.bfloat16
-	>>> param_dtype = jnp.bfloat16  # you can change that if you want
-
-	>>> tokenizer = AutoTokenizer.from_pretrained(
-	...   huggingface_repo_id_or_path, trust_remote_code=True
-	... )
-
-	>>> model.config.add_basic_configurations(
-	...   attn_mechanism="flash",  # Using FlashAttention
-	...   block_b=1,
-	...   block_q=1024,
-	...   block_k=1024,
-	...   block_k_major=1024,
-	... )
-
-	>>> tokenizer.pad_token = tokenizer.eos_token
-	>>> configs_to_initialize_model_class = {
-	...   "config": model.config,
-	...   "dtype": dtype,
-	...   "param_dtype": param_dtype,
-	...   "input_shape": (1, 1),
-	... }
-
-	>>> rapture = LoraRaptureConfig(
-	...   parameters=model_parameters,
-	...   lora_dim=64,
-	...   fully_fine_tune_parameters=[
-	...     "embed_tokens"
-	...   ],  # Model layer to be fully fine tuned
-	...   lora_fine_tune_parameters=[
-	...     "q_proj",
-	...     "v_proj",
-	...     "k_proj",
-	...     "o_proj",
-	...   ],  # LoRA Layer Targets you can pass this to none
-	...   # For only Layer Tuning or transfer learning
-	...   verbose=True,
-	... )
-
-	>>> train_arguments = TrainArguments(
-	...   model_class=type(model),
-	...   model_name="EasyDeL-Lora-Example",
-	...   num_train_epochs=3,
-	...   configs_to_initialize_model_class=configs_to_initialize_model_class,
-	...   learning_rate=1e-4,  # Using higher learning rate is recommended
-	...   learning_rate_end=8e-5,
-	...   optimizer=EasyDeLOptimizers.ADAMW,  # "adamw", "lion", "adafactor" are supported
-	...   scheduler=EasyDeLSchedulers.LINEAR,
-	...   # "linear","cosine", "none" ,"warm_up_cosine" and "warm_up_linear"  are supported
-	...   weight_decay=0.01,
-	...   total_batch_size=512,
-	...   max_training_steps=None,  # None to let trainer Decide
-	...   do_train=True,
-	...   do_eval=False,  # it's optional but supported
-	...   backend="tpu",  # default backed is set to cpu, so you must define you want to use tpu cpu or gpu
-	...   max_sequence_length=max_length,  # Note that you have to change this in the model config too
-	...   gradient_checkpointing=EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
-	...   sharding_array=(
-	...     1,
-	...     -1,
-	...     1,
-	...     1,
-	...   ),  # the way to shard model across gpu,cpu or TPUs using sharding array (1, -1, 1, 1)
-	...   # everything training will be in sequence and model parallel automatic and share data between devices
-	...   remove_ckpt_after_load=True,
-	...   gradient_accumulation_steps=1,
-	...   loss_re_mat="",
-	...   dtype=dtype,
-	...   param_dtype=param_dtype,
-	...   rapture_config=rapture,
-	...   merge_lora_rapture_parameters=True,  # turning this off is still not supported and not recommended to do so
-	...   # What this does ? this will merge the lora parameters with the original model parameters and the end of training
-	... )
-
-
-	>>> def ultra_chat_prompting_process(data_chunk):
-	...   user_part = [
-	...     chunk["content"]
-	...     for chunk in data_chunk["messages"]
-	...     if chunk["role"] == "user"
-	...   ]
-	...   assistant_part = [
-	...     chunk["content"]
-	...     for chunk in data_chunk["messages"]
-	...     if chunk["role"] == "assistant"
-	...   ]
-	...
-	...   prompt = ""
-	...
-	...   for uc, ac in zip(user_part, assistant_part):
-	...     prompt += f"<|user|>\n{uc}</s>\n<|assistant|>\n{ac}</s>\n"
-	...
-	...   return {"prompt": prompt}
-
-
-	>>> tokenization_process = lambda data_chunk: tokenizer(
-	...   data_chunk["prompt"],
-	...   add_special_tokens=False,
-	...   max_length=max_length,
-	...   padding="max_length",
-	... )
-
-	>>> dataset = load_dataset("HuggingFaceH4/ultrachat_200k")
-	>>> dataset_train = dataset["train_gen"].map(
-	...   ultra_chat_prompting_process, num_proc=12
-	... )
-	>>> dataset_train = dataset_train.map(
-	...   tokenization_process, num_proc=12, remove_columns=dataset_train.column_names
-	... )
-
-	>>> # you can do the same for evaluation process dataset
-
-	>>> trainer = CausalLanguageModelTrainer(
-	...   train_arguments, dataset_train, checkpoint_path=None
-	... )
-
-	>>> output = (
-	...   trainer.train()
-	... )  # you should not pass the parameters in Trainer.train anymore when
-	>>> # you are using LoRA or transfer Learning
-	>>> print(f"Hey ! , here's where your model saved {output.checkpoint_path}")
-	"""
-
+class SequenceClassificationTrainer(BaseTrainer):
 	def create_collect_function(
 		self,
 		max_sequence_length: int,
+		padding_value: int = 0,
 		truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
+		label_pad_token_id: int = -100,
+		**kwargs,
 	) -> Callable:
 		"""
-		Creates a function to collect and process batches of data for training or evaluation.
+		Creates a function to collect and process batches of data for sequence classification.
 
 		This function handles padding or truncating sequences to the specified `max_sequence_length`
-		based on the chosen `truncation_mode`.
+		based on the chosen `truncation_mode`. For sequence classification, special handling is
+		provided for labels and attention masks.
 
 		Args:
-		    max_sequence_length (int): The maximum allowed sequence length.
-		    truncation_mode (typing.Literal["keep_end", "keep_start"], optional):
-		        The truncation mode. Defaults to "keep_end".
+		    max_sequence_length (int): The maximum allowed sequence length
+		    padding_value (int, optional): Value to use for padding. Defaults to 0
+		    truncation_mode (typing.Literal["keep_end", "keep_start"]): The truncation mode.
+		        Defaults to "keep_end"
+		    label_pad_token_id (int, optional): Padding token ID for labels. Defaults to -100
 
 		Returns:
-		    Callable: A function that takes a batch of data and returns a processed batch.
+		    Callable: A function that takes a batch of data and returns a processed batch
 		"""
 
-		def collate_fn(batch):
+		def pad_sequence(
+			sequence: jnp.ndarray,
+			max_length: int,
+			pad_value: int,
+			padding_side: str = "right",
+		) -> jnp.ndarray:
+			"""Pad a sequence to the specified length."""
+			sequence_length = sequence.shape[-1]
+			if sequence_length >= max_length:
+				return sequence
+
+			pad_length = max_length - sequence_length
+			if padding_side == "right":
+				padding = [(0, 0)] * (sequence.ndim - 1) + [(0, pad_length)]
+			else:
+				padding = [(0, 0)] * (sequence.ndim - 1) + [(pad_length, 0)]
+
+			return jnp.pad(sequence, padding, constant_values=pad_value)
+
+		def truncate_sequence(
+			sequence: jnp.ndarray, max_length: int, mode: str = "keep_end"
+		) -> jnp.ndarray:
+			"""Truncate a sequence to the specified length."""
+			if mode == "keep_end":
+				return sequence[..., -max_length:]
+			else:
+				return sequence[..., :max_length]
+
+		def collate_fn(batch: List[Dict]) -> Dict:
+			"""
+			Process a batch of sequences for sequence classification.
+
+			Args:
+			    batch: List of dictionaries containing input_ids, attention_mask, and labels
+
+			Returns:
+			    Dictionary containing processed batch data
+			"""
 			results = {}
+
+			# Process each key in the batch
 			for key in batch[0].keys():
-				if truncation_mode == "keep_end":
-					corrected_sequence = [
-						jnp.array(f[key])[..., -max_sequence_length:] for f in batch
-					]
-				else:
-					corrected_sequence = [
-						jnp.array(f[key])[..., :max_sequence_length] for f in batch
-					]
-				results[key] = jnp.stack(corrected_sequence).reshape(
-					-1, corrected_sequence[0].shape[-1]
+				if key == "labels":
+					# Handle labels separately - no padding needed for classification
+					sequences = [jnp.array(f[key]) for f in batch]
+					results[key] = jnp.stack(sequences)
+					continue
+
+				# Process input sequences
+				sequences = []
+				for f in batch:
+					seq = jnp.array(f[key])
+
+					# Truncate if necessary
+					if seq.shape[-1] > max_sequence_length:
+						seq = truncate_sequence(seq, max_sequence_length, truncation_mode)
+
+					# Pad if necessary
+					if seq.shape[-1] < max_sequence_length:
+						pad_value = padding_value if key == "input_ids" else 0
+						padding_side = "right" if truncation_mode == "keep_start" else "left"
+						seq = pad_sequence(seq, max_sequence_length, pad_value, padding_side)
+
+					sequences.append(seq)
+
+				# Stack sequences into a batch
+				results[key] = jnp.stack(sequences)
+
+			# Ensure attention mask is present
+			if "attention_mask" not in results and "input_ids" in results:
+				results["attention_mask"] = jnp.where(
+					results["input_ids"] != padding_value, 1, 0
 				)
+
 			return results
 
 		return collate_fn
@@ -516,11 +284,11 @@ class CausalLanguageModelTrainer(BaseTrainer):
 			donate_argnums=(0,),
 		)
 		sharded_train_step_function = jax.jit(
-			create_casual_language_model_train_step(
+			create_sequence_classification_model_train_step(
 				partition_spec=self.arguments.step_partition_spec,
-				label_smoothing_factor=self.arguments.label_smoothing_factor,
-				z_loss=self.arguments.z_loss,
 				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
+				num_labels=self.arguments.num_classification_labels,
+				problem_type=self.arguments.classification_problem_type,
 			),
 			in_shardings=(spec_named_sharding, empty_sharding),
 			out_shardings=(spec_named_sharding, empty_sharding, empty_sharding),
@@ -528,11 +296,13 @@ class CausalLanguageModelTrainer(BaseTrainer):
 		)
 
 		sharded_eval_step_function = jax.jit(
-			create_casual_language_model_evaluation_step(
+			create_sequence_classification_model_eval_step(
 				partition_spec=self.arguments.step_partition_spec,
+				num_labels=self.arguments.num_classification_labels,
+				problem_type=self.arguments.classification_problem_type,
 			),
 			in_shardings=(spec_named_sharding, empty_sharding),
-			out_shardings=(empty_sharding, empty_sharding, empty_sharding),
+			out_shardings=(empty_sharding),
 			donate_argnums=(0, 0),
 		)
 
@@ -640,11 +410,11 @@ class CausalLanguageModelTrainer(BaseTrainer):
 							spec=PartitionSpec(), mesh=self.arguments.get_mesh()
 						)
 						sharded_train_step_function = jax.jit(
-							create_casual_language_model_train_step(
+							create_sequence_classification_model_train_step(
 								partition_spec=self.arguments.step_partition_spec,
-								label_smoothing_factor=self.arguments.label_smoothing_factor,
-								z_loss=self.arguments.z_loss,
 								gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
+								num_labels=self.arguments.num_classification_labels,
+								problem_type=self.arguments.classification_problem_type,
 							),
 							in_shardings=(spec_named_sharding, empty_sharding),
 							out_shardings=(
@@ -656,15 +426,13 @@ class CausalLanguageModelTrainer(BaseTrainer):
 						)
 
 						sharded_eval_step_function = jax.jit(
-							create_casual_language_model_evaluation_step(
+							create_sequence_classification_model_eval_step(
 								partition_spec=self.arguments.step_partition_spec,
+								num_labels=self.arguments.num_classification_labels,
+								problem_type=self.arguments.classification_problem_type,
 							),
 							in_shardings=(spec_named_sharding, empty_sharding),
-							out_shardings=(
-								empty_sharding,
-								empty_sharding,
-								empty_sharding,
-							),
+							out_shardings=(empty_sharding),
 							donate_argnums=(0, 0),
 						)
 
@@ -698,14 +466,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
 			else:
 				sharded_state = self.initialize_state_function()
 			if self.arguments.sparsify_module:
-				...  # disabled at the moment to fix shardings..
-				# sharded_state = sharded_state.replace(
-				# 	params=apply_sparsity_to_params(
-				# 		params=sharded_state.params,
-				# 		sparsify_module=self.arguments.sparse_module_type,
-				# 		verbose=True,
-				# 	)
-				# )
+				...
 			self.sharded_state = sharded_state
 			return sharded_state, shard_fns, gather_fns
 
@@ -942,7 +703,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
 		self,
 		model_parameters: Optional[flax.core.FrozenDict] = None,
 		state: Optional[EasyDeLState] = None,
-	) -> CausalLMTrainerOutput:
+	) -> SequenceClassificationTrainerOutput:
 		start_time = time.time()
 
 		sharded_state, shard_fns, gather_fns = self.initialize_state(

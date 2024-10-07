@@ -16,8 +16,8 @@ from easydel import (
 	CausalLanguageModelTrainer,
 	EasyDeLOptimizers,
 	EasyDeLSchedulers,
-	FlaxMistralForCausalLM,
-	MistralConfig,
+	FlaxLlamaForCausalLM,
+	LlamaConfig,
 	TrainArguments,
 )
 import fjformer
@@ -37,37 +37,38 @@ rng = fjformer.GenerateRNG()
 
 
 def main(use_iterable_dataset: bool):
-	sequence_length = 128
+	sequence_length = 1024
 	max_training_steps = NUM_TRAIN_EXAMPLES // TOTAL_BATCH_SIZE * NUM_TRAIN_EPOCHS
 	max_evaluation_steps = NUM_EVAL_EXAMPLES // TOTAL_BATCH_SIZE
-	config = MistralConfig(
-		hidden_size=128,
-		head_dim=8,
+	config = LlamaConfig(
+		head_dim=128,
+		hidden_size=512,
 		num_attention_heads=8,
 		num_key_value_heads=4,
 		num_hidden_layers=4,
-		intermediate_size=256,
+		intermediate_size=1024,
 		max_position_embeddings=sequence_length,
-		attn_dtype=jnp.float32,
-		attn_mechanism=AttentionMechanisms.vanilla,
-		block_k=32,
-		block_q=32,
+		attn_dtype=jnp.float16,
+		attn_mechanism=AttentionMechanisms.flash_attn2,
+		block_k=64,
+		block_q=128,
 	)
 
 	dtype = jnp.bfloat16
-	model = FlaxMistralForCausalLM(
+	model = FlaxLlamaForCausalLM(
 		config=config,
 		_do_init=True,
 		dtype=dtype,
 		param_dtype=dtype,
 	)
 	params = model.shard_params(model.params)
+	new_rng = rng.rng
 
 	def data_generator(num_rows: int):
 		for _ in range(num_rows):
 			yield {
 				"attention_mask": jnp.ones((sequence_length,), dtype="i4"),
-				"input_ids": random.randint(rng.rng, (sequence_length,), 0, 32000, dtype="i4"),
+				"input_ids": random.randint(new_rng, (sequence_length,), 0, 32000, dtype="i4"),
 			}
 
 	if not use_iterable_dataset:
@@ -112,7 +113,6 @@ def main(use_iterable_dataset: bool):
 			use_wandb=True,
 			learning_rate=3e-4,
 			label_smoothing_factor=0.1,
-			# z_loss=0.0001,
 			train_on_inputs=True,
 			do_last_save=True,
 			training_time="80Min",
@@ -127,6 +127,7 @@ def main(use_iterable_dataset: bool):
 
 	output = trainer.train(model_parameters=flax.core.FrozenDict({"params": params}))
 	trainer.save_pretrained(output.state, to_torch=True)
+	exit(0)
 
 
 if __name__ == "__main__":

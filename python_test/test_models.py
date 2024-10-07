@@ -8,6 +8,7 @@ import jax
 
 # jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 
+import jax.extend
 import jax.random
 
 from fjformer import make_shard_and_gather_fns, match_partition_rules
@@ -75,7 +76,7 @@ class EasyModelsTest(unittest.TestCase):
 		self.rotary_dim = 32
 		self.dtype: jax.numpy.dtype = jnp.float16
 		self.precision = jax.lax.Precision("highest")
-		self.attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "ring" #"flash_attn2"
+		self.attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_ATTENTION_MECHANISM
 		self.block_k: int = 64
 		self.block_q: int = 128
 		self.sequence_length = 64
@@ -88,6 +89,9 @@ class EasyModelsTest(unittest.TestCase):
 		self.header_config = None
 		self.pad_token_id = None
 		self.rope_scaling = None
+		self.attn_dtype = (
+			jnp.float16 if jax.extend.backend.get_backend().platform == "gpu" else jnp.float32
+		)
 
 	def create_test_for_models(self, module_name: str, hf_module_class):
 		(module_config, module_class, transform_function) = ed.get_modules_by_type(
@@ -154,6 +158,7 @@ class EasyModelsTest(unittest.TestCase):
 				attn_mechanism=self.attn_mechanism,
 				block_k=self.block_k,
 				block_q=self.block_q,
+				attn_dtype=self.attn_dtype,
 			)
 			if module_name == "exaone":  # it's EXAONE Issue
 				flatten_params = flatten_dict(params, sep=".")
@@ -516,6 +521,7 @@ class EasyModelsTest(unittest.TestCase):
 				128 // 8,
 				use_scan_mlp=False,
 				axis_dims=(1, 1, 1, -1),
+				attn_dtype=self.attn_dtype,
 			),
 			seed=0,
 			_do_init=True,
@@ -699,32 +705,32 @@ if __name__ == "__main__":
 	# unittest.main()
 	test = EasyModelsTest()
 	test.setUp()
-	# test.test_mamba2()  # Passed v0.0.80 - P Runtime
-	# test.test_arctic()  # Passed v0.0.80 - P Runtime
-	# test.test_cohere()  # Passed v0.0.80 - P Runtime
-	# test.test_dbrx()  # Passed  v0.0.80 - P Runtime
-	# test.test_deepseek_v2()  # Passed v0.0.80 - P Runtime
-	# test.test_exaone()  # Passed v0.0.80 - P Runtime
-	# test.test_falcon()  # Passed v0.0.80 - P Runtime
-	# test.test_gemma()  # Passed v0.0.80 - P Runtime
-	# test.test_gemma2()  # Passed v0.0.80 - P Runtime
-	# test.test_gptj()  # Passed v0.0.80 - P Runtime
+	# test.test_mamba2()  # Passed v0.0.80 - P T Runtime
+	# test.test_arctic()  # Passed v0.0.80 - P T Runtime
+	# test.test_cohere()  # Passed v0.0.80 - P T Runtime
+	# test.test_dbrx()  # Passed  v0.0.80 - P T Runtime
+	# test.test_deepseek_v2()  # Passed v0.0.80 - P T Runtime
+	# test.test_exaone()  # Passed v0.0.80 - P T Runtime
+	# test.test_falcon()  # Passed v0.0.80 - P T Runtime
+	# test.test_gemma()  # Passed v0.0.80 - P T Runtime
+	# test.test_gemma2()  # Passed v0.0.80 - P T Runtime
+	# test.test_gptj()  # Passed v0.0.80 - P T Runtime
 	# test.test_gpt2()
 	# test.test_grok1() # should be impl
 	# test.test_internlm2()
-	test.test_llama()  # Passed v0.0.80 - P Runtime
-	# test.test_mamba()  # Passed v0.0.80 - P Runtime
-	# test.test_mistral()  # Passed v0.0.80 - P Runtime
-	# test.test_mixtral()  # Passed v0.0.80 - P Runtime
-	# test.test_mpt()  # Passed v0.0.80 - P Runtime
-	# test.test_olmo()  # Passed v0.0.80 - P Runtime
-	# test.test_openelm()  # Passed v0.0.80 - P Runtime
-	# test.test_phi()  # Passed v0.0.80 - P Runtime
-	# test.test_phi3()  # Passed v0.0.80 - P Runtime
-	# test.test_phimoe()  # Passed v0.0.80 - P Runtime
+	# test.test_llama()  # Passed v0.0.80 - P T Runtime
+	# test.test_mamba()  # Passed v0.0.80 - P T Runtime
+	# test.test_mistral()  # Passed v0.0.80 - P T Runtime
+	# test.test_mixtral()  # Passed v0.0.80 - P T Runtime
+	# test.test_mpt()  # Passed v0.0.80 - P T Runtime
+	# test.test_olmo()  # Passed v0.0.80 - P T Runtime
+	# test.test_openelm()  # Passed v0.0.80 - P T Runtime
+	# test.test_phi()  # Passed v0.0.80 - P T Runtime
+	# test.test_phi3()  # Passed v0.0.80 - P T Runtime
+	# test.test_phimoe()  # Passed v0.0.80 - P T Runtime
 	# test.test_qwen1()
-	# test.test_qwen2()  # Passed v0.0.80 - P Runtime
-	# test.test_qwen2_moe()  # Passed v0.0.80 - P Runtime
-	# test.test_stablelm()  # Passed v0.0.80 - P Runtime
+	# test.test_qwen2()  # Passed v0.0.80 - P T Runtime
+	# test.test_qwen2_moe()  # Passed v0.0.80 - P T Runtime
+	# test.test_stablelm()  # Passed v0.0.80 - P T Runtime
 	# test.test_xerxes()  # Passed v0.0.80 - P Runtime (Check)
 	# -----------------------------------------------

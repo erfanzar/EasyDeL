@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,7 +17,7 @@ from typing import Dict, Optional, Union
 from jax.sharding import PartitionSpec
 
 from easydel.modules.modeling_utils import EDPretrainedConfig
-
+ 
 
 class LlamaConfig(EDPretrainedConfig):
 	"""
@@ -45,6 +44,8 @@ class LlamaConfig(EDPretrainedConfig):
 	    max_position_embeddings (`int`, *optional*, defaults to 2048):
 	        The maximum sequence length that this model might ever be used with. Typically set this to something large
 	        just in case (e.g., 2048 or 4096).
+			head_dim (`int`, *optional*):
+					head_dim for attention qkv.
 	    rms_norm_eps (`float`, *optional*, defaults to 1e-6):
 	        The epsilon used by the rms normalization layers.
 	    initializer_range (`float`, *optional*, defaults to 0.02):
@@ -100,6 +101,7 @@ class LlamaConfig(EDPretrainedConfig):
 		num_hidden_layers: int = 32,
 		num_attention_heads: int = 32,
 		number_rep_kv: int = 1,
+		head_dim: Optional[int] = None,
 		num_key_value_heads: Optional[int] = None,
 		max_position_embeddings: int = 2048,
 		rms_norm_eps: float = 1e-6,
@@ -152,6 +154,9 @@ class LlamaConfig(EDPretrainedConfig):
 		self.rope_scaling = rope_scaling
 		self.bits = bits
 		self.scan_layers = scan_layers
+		self.head_dim = (
+			head_dim if head_dim is not None else hidden_size // num_attention_heads
+		)
 		super().__init__(
 			bos_token_id=bos_token_id,
 			eos_token_id=eos_token_id,

@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -75,7 +74,12 @@ def create_casual_language_model_train_step(
 				labels = batch["input_ids"][..., 1:]
 			else:
 				labels = labels[..., 1:]
-			model_outputs = state.apply_fn(params=params, **batch, return_dict=True)
+			model_outputs = state.apply_fn(
+				params=params,
+				**batch,
+				return_dict=True,
+				deterministic=False,
+			)
 			logits = model_outputs.logits
 			aux_loss = getattr(model_outputs, "aux_loss", None)
 			loss_normalizing_factor = SpecialLossNormalizingFactor.NUM_REAL_TARGET_TOKENS
