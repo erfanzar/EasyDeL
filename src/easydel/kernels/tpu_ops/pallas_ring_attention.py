@@ -190,7 +190,7 @@ def _ring_flash_attention_fwd_tpu(
 		init=(o, l, m, key, value),
 		xs=jnp.arange(0, axis_size),
 	)
-	print("SCAN O", o)
+	
 	output = rearrange(o.astype(value.dtype), "b h query d -> b query h d")
 	return output, (o, query, key, value, bias, segment_ids, cache_idx, l, m)
 
