@@ -29,10 +29,10 @@ from jax import numpy as jnp
 from jax import random
 
 TOTAL_BATCH_SIZE = 8
-UPPER = 300
+UPPER = 200
 NUM_TRAIN_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
 NUM_EVAL_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
-NUM_TRAIN_EPOCHS = 3
+NUM_TRAIN_EPOCHS = 1
 rng = fjformer.GenerateRNG()
 
 
@@ -54,7 +54,7 @@ def main(use_iterable_dataset: bool):
 		block_q=128,
 	)
 
-	dtype = jnp.bfloat16
+	dtype = jnp.float16
 	model = FlaxLlamaForCausalLM(
 		config=config,
 		_do_init=True,
@@ -126,7 +126,7 @@ def main(use_iterable_dataset: bool):
 	)
 
 	output = trainer.train(model_parameters=flax.core.FrozenDict({"params": params}))
-	trainer.save_pretrained(output.state, to_torch=True)
+	# trainer.save_pretrained(output.state, to_torch=True)
 	exit(0)
 
 

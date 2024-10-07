@@ -16,7 +16,7 @@ from jax import random as jrnd
 from triton import language as tl
 import numpy as np
 
-FLASH_ATTN_BWD_ = False
+FLASH_ATTN_BWD_ = True
 
 
 def _simp_attn(
@@ -403,9 +403,7 @@ def _fwd_attn_kernel_call(
 		seqlen_k,
 		kernel=_fwd_attn_kernel,
 		out_shape=[
-			jax.ShapeDtypeStruct(
-				query.shape, query.dtype, sharding=get_sharding(query)
-			),
+			jax.ShapeDtypeStruct(query.shape, query.dtype, sharding=get_sharding(query)),
 			jax.ShapeDtypeStruct((batch, nheads, seqlen_q), jnp.float32),
 		],
 		grid=lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch, nheads),
@@ -603,32 +601,79 @@ def _bwd_attn_kernel(
 		BLOCK_M: Block size for the query sequence dimension.
 		BLOCK_N: Block size for the key sequence dimension.
 	"""
-	# fmt:on
-	off_n, off_b, off_h = (
+
+	off_n, off_bh = (
 		tl.program_id(0),
-		tl.program_id(1),
 		tl.program_id(2),
 	)
+	off_h = off_bh % nheads
+	off_b = off_bh // nheads
 	offs_n = off_n * BLOCK_N + tl.arange(0, BLOCK_N)
 	offs_d = tl.arange(0, BLOCK_HEADDIM)
 	offs_m = tl.arange(0, BLOCK_M)
 
-	# fmt:off
-	q_ptrs = Q + (off_b * stride_qb + off_h * stride_qh + (offs_m[:, None] * stride_qm + offs_d[None, :]))
-	k_ptrs = K + (off_b * stride_kb + off_h * stride_kh + (offs_n[:, None] * stride_kn + offs_d[None, :]))
-	v_ptrs = V + (off_b * stride_vb + off_h * stride_vh + (offs_n[:, None] * stride_vn + offs_d[None, :]))
+	q_ptrs = Q + (
+		off_b * stride_qb
+		+ (offs_m[:, None] * stride_qm)
+		+ off_h * stride_qh
+		+ offs_d[None, :]
+	)
+	k_ptrs = K + (
+		off_b * stride_kb
+		+ (offs_n[:, None] * stride_kn)
+		+ off_h * stride_kh
+		+ offs_d[None, :]
+	)
+	v_ptrs = V + (
+		off_b * stride_vb
+		+ (offs_n[:, None] * stride_vn)
+		+ off_h * stride_vh
+		+ offs_d[None, :]
+	)
 	if HAVE_BIAS:
-			b_ptrs = B + (off_b * stride_bb + off_h * stride_bh + (offs_m[:, None] * stride_bm  + offs_n[None, :]))
-	dq_ptrs = Dq + (off_b * stride_dqb + off_h * stride_dqh + (offs_m[:, None] * stride_dqm + offs_d[None, :]))
-	dk_ptrs = Dk + (off_b * stride_dkb + off_h * stride_dkh + (offs_n[:, None] * stride_dkn + offs_d[None, :]))
-	dv_ptrs = Dv + (off_b * stride_dvb + off_h * stride_dvh + (offs_n[:, None] * stride_dvn + offs_d[None, :]))
-	do_ptrs = Do + (off_b * stride_dob + off_h * stride_doh + (offs_m[:, None] * stride_dom + offs_d[None, :]))
+		b_ptrs = B + (
+			off_b * stride_bb
+			+ off_h * stride_bh
+			+ (offs_m[:, None] * stride_bm)
+			+ offs_n[None, :]
+		)
+	dq_ptrs = Dq + (
+		off_b * stride_dqb
+		+ (offs_m[:, None] * stride_dqm)
+		+ off_h * stride_dqh
+		+ offs_d[None, :]
+	)
+	dk_ptrs = Dk + (
+		off_b * stride_dkb
+		+ (offs_n[:, None] * stride_dkn)
+		+ off_h * stride_dkh
+		+ offs_d[None, :]
+	)
+	dv_ptrs = Dv + (
+		off_b * stride_dvb
+		+ (offs_n[:, None] * stride_dvn)
+		+ off_h * stride_dvh
+		+ offs_d[None, :]
+	)
+	do_ptrs = Do + (
+		off_b * stride_dob
+		+ (offs_m[:, None] * stride_dom)
+		+ off_h * stride_doh
+		+ offs_d[None, :]
+	)
 	lse_ptrs = L + (off_b * stride_lb + off_h * stride_lh + offs_m)
 	del_ptrs = D + (off_b * stride_lb + off_h * stride_lh + offs_m)
 
-	k = tl.load(k_ptrs, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim), other=0.0,)
-	v = tl.load(v_ptrs, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim), other=0.0)
-	# fmt:on
+	k = tl.load(
+		k_ptrs,
+		mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
+		other=0.0,
+	)
+	v = tl.load(
+		v_ptrs,
+		mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
+		other=0.0,
+	)
 
 	dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
 	dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
@@ -636,15 +681,11 @@ def _bwd_attn_kernel(
 	for start_m in range(0, seqlen_q, BLOCK_M):
 		start_m = tl.multiple_of(start_m, BLOCK_M)
 		m_loop_offs = start_m + offs_m
-		# fmt:off
-		if EVEN_M & EVEN_HEADDIM:
-			q = tl.load(q_ptrs + start_m)
-		else:
-			if EVEN_HEADDIM:
-				q = tl.load(q_ptrs, mask=m_loop_offs[:, None] < seqlen_q, other=0.0)
-			else:
-				q = tl.load(q_ptrs + start_m, mask=(m_loop_offs[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0)
-		# fmt:on
+		q = tl.load(
+			q_ptrs + start_m,
+			mask=(m_loop_offs[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+			other=0.0,
+		)
 
 		qk = tl.dot(q, k.T)
 		if not EVEN_N:
@@ -652,24 +693,23 @@ def _bwd_attn_kernel(
 
 		l = tl.load(lse_ptrs + start_m, mask=m_loop_offs < seqlen_q, other=0.0)[:, None]
 
-		# fmt:off
 		if HAVE_BIAS:
-			if EVEN_N & EVEN_M:
-				b = tl.load(b_ptrs + start_m).to(tl.float32)
-			else:
-				b = tl.load(b_ptrs + start_m, mask=(m_loop_offs[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k), other=0.0).to(tl.float32)
+			b = tl.load(
+				b_ptrs + start_m,
+				mask=(m_loop_offs[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k),
+				other=0.0,
+			).to(tl.float32)
 			qk = qk * softmax_scale + b
 			p = tl.exp(qk - l)
 		else:
 			p = tl.exp(qk * softmax_scale - l)
-		# fmt:on
 
-		# fmt:off
-		if EVEN_N & EVEN_HEADDIM:
-			do = tl.load(do_ptrs + start_m)
-		else:
-			do = tl.load(do_ptrs + start_m, mask=(m_loop_offs[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0)
-		# fmt:on
+		do = tl.load(
+			do_ptrs + start_m,
+			mask=(m_loop_offs[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+			other=0.0,
+		)
+
 		dv = dv + tl.dot(p.to(do.dtype).T, do)
 		dp = tl.dot(do, v.T)
 		di = tl.load(del_ptrs + start_m, mask=m_loop_offs < seqlen_q, other=0.0)
@@ -677,17 +717,23 @@ def _bwd_attn_kernel(
 		foqi = tl.dot(ds.T, q).to(dk.dtype)
 		dk += foqi
 
-		# fmt:off
 		dq = tl.dot(ds, k)
-		pq = tl.load(dq_ptrs + start_m, mask=(m_loop_offs[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0, eviction_policy="evict_last")
+		pq = tl.load(
+			dq_ptrs + start_m,
+			mask=(m_loop_offs[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+			other=0.0,
+			eviction_policy="evict_last",
+		)
 		res = dq + pq
-		tl.store(dq_ptrs + start_m, value=res, mask=(m_loop_offs[:, None] < seqlen_q) & (offs_d[None, :] < headdim), eviction_policy="evict_last")
-		# fmt:on
+		tl.store(
+			dq_ptrs + start_m,
+			value=res,
+			mask=(m_loop_offs[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+			eviction_policy="evict_last",
+		)
 
-	# fmt:off
 	tl.store(dv_ptrs, dv, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim))
 	tl.store(dk_ptrs, dk, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim))
-	# fmt:on
 
 
 def _bwd_attn_kernel_call(
@@ -727,9 +773,7 @@ def _bwd_attn_kernel_call(
 	softmax_scale = softmax_scale or 1.0 / math.sqrt(headdim)
 	if FLASH_ATTN_BWD_:
 		assert headdim in {16, 32, 64, 128, 256}, "given headdim is not supported."
-		assert (
-			query.dtype == key.dtype == value.dtype
-		), "tensors must have the same dtype."
+		assert query.dtype == key.dtype == value.dtype, "tensors must have the same dtype."
 		assert query.dtype in [jnp.float16, jnp.bfloat16], "only support fp16 and bf16."
 		HAVE_BIAS = True if bias is not None else False
 		BLOCK_HEADDIM = max(triton.next_power_of_2(headdim), 16)
@@ -822,14 +866,12 @@ def _bwd_attn_kernel_call(
 			headdim,
 			nheads,
 			kernel=_bwd_attn_kernel,
-			grid=lambda META: (triton.cdiv(seqlen_k, META["BLOCK_N"]), batch, nheads),
+			grid=lambda META: (triton.cdiv(seqlen_k, META["BLOCK_N"]), 1, batch * nheads),
 			out_shape=[
 				jax.ShapeDtypeStruct(
 					shape=query.shape, dtype=query.dtype, sharding=query.sharding
 				),
-				jax.ShapeDtypeStruct(
-					shape=key.shape, dtype=key.dtype, sharding=key.sharding
-				),
+				jax.ShapeDtypeStruct(shape=key.shape, dtype=key.dtype, sharding=key.sharding),
 				jax.ShapeDtypeStruct(
 					shape=value.shape, dtype=value.dtype, sharding=value.sharding
 				),
@@ -960,17 +1002,15 @@ def _test_forward():
 		print("Flax OOM", er)
 		fo = None
 	if fo is not None and co is not None:
-		print(
-			"Results are Close" if jnp.allclose(co, fo, 0, 0.125) else "Wrong results!"
-		)
+		print("Results are Close" if jnp.allclose(co, fo, 0, 0.125) else "Wrong results!")
 
 
 def _test_backward():
 	"""Tests the backward pass of the attention mechanism."""
 	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
-	B, H, S, D = 1, 1, 3, 16
-	blocksize_k = 16
-	blocksize_q = 16
+	B, H, S, D = 1, 1, 64, 16
+	blocksize_k = 64
+	blocksize_q = 64
 	q = jax.nn.initializers.normal(2)(q_key, (B, S, H, D), dtype=jnp.float16)
 	k = jax.nn.initializers.normal(2)(k_key, (B, S, H, D), dtype=jnp.float16)
 	v = jax.nn.initializers.normal(2)(v_key, (B, S, H, D), dtype=jnp.float16)
@@ -986,9 +1026,9 @@ def _test_backward():
 	)
 
 	try:
-		co = jax.grad(
-			lambda *x: _flash_attn2(*x, None, blocksize_q, blocksize_k).sum()
-		)(q, k, v, b)
+		co = jax.grad(lambda *x: _flash_attn2(*x, None, blocksize_q, blocksize_k).sum())(
+			q, k, v, b
+		)
 		print("Custom op backward pass gradients:")
 		print(co[-1][-1, -1, :5])  # Print last 5 elements of last head of last batch
 	except Exception as er:
@@ -1017,5 +1057,5 @@ triton_flash_attn_2_gpu = _flash_attn2
 __all__ = ["triton_flash_attn_2_gpu"]
 
 if __name__ == "__main__":
-	_test_forward()
-	# _test_backward()
+	# _test_forward()
+	_test_backward()

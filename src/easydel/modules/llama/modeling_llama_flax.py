@@ -87,13 +87,17 @@ class FlaxLlamaAttention(FlaxAttentionModule):
 	def setup(self):
 		config = self.config
 		self.hidden_size = config.hidden_size
-		self.head_dim = config.head_dim
+		self.head_dim = getattr(
+			config,
+			"head_dim",
+			config.hidden_size // config.num_attention_heads,
+		)
 		self.num_key_value_groups = (
 			self.config.num_attention_heads // self.config.num_key_value_heads
 		)
 
 		if self.num_key_value_groups == 1:
-			assert self.config.num_attention_heads == self.config.num_key_value_heads
+			assert self.config.num_attention_heads == self.config.num_key_value_heads 
 		self.q_proj = Dense(
 			config.num_attention_heads * self.head_dim,
 			dtype=self.dtype,

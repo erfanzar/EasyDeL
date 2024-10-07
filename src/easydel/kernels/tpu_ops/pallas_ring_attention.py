@@ -406,8 +406,7 @@ class BlockSizes:
 				)
 			if major % minor != 0:
 				raise ValueError(
-					f"{prefix}{suffix}={minor} should divide"
-					f" {prefix}_major{suffix}={major}"
+					f"{prefix}{suffix}={minor} should divide" f" {prefix}_major{suffix}={major}"
 				)
 
 		verify_major_minor("blocksize_k", "", self.blocksize_k_major, self.blocksize_k)
@@ -542,8 +541,7 @@ def _flash_attention_bwd(
 	(query, key, value, ab, segment_ids, o, l, m) = residuals
 	if not blocksizes.has_backward_blocks:
 		raise ValueError(
-			"Program is being differentiated, but not all backward blocks are"
-			" specified"
+			"Program is being differentiated, but not all backward blocks are" " specified"
 		)
 
 	di = jnp.sum(
@@ -650,7 +648,6 @@ def _flash_attention_kernel_single_batch(
 	mask_value,
 	blocksize_q,
 ):
-	print("IN PROGRAM")
 	blocksize_k_major = k_tile_ref.shape[2]
 	blocksize_q = q_tile_ref.shape[2]
 	head_dim = q_tile_ref.shape[-1]
@@ -723,9 +720,7 @@ def _flash_attention_kernel_single_batch(
 			if q_segment_ids_tile_ref is not None:
 				repeats, rem = divmod(blocksize_k, NUM_LANES)
 				if rem:
-					raise NotImplementedError(
-						f"kv block size must be a multiple of {NUM_LANES}"
-					)
+					raise NotImplementedError(f"kv block size must be a multiple of {NUM_LANES}")
 				q_segment_ids = pltpu.repeat(
 					q_segment_ids_tile_ref[batch_idx[0]], repeats, axis=1
 				)  # [blocksize_q, blocksize_k].
@@ -741,14 +736,10 @@ def _flash_attention_kernel_single_batch(
 				row_ids += (q_seq_idx + q_chunk_idx_start) * blocksize_q
 				row_ids = jax.lax.div(row_ids, blocksize_c)
 				col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
-				col_ids += (
-					kv_seq_idx + k_chunk_idx_start
-				) * blocksize_k_major + start_k
+				col_ids += (kv_seq_idx + k_chunk_idx_start) * blocksize_k_major + start_k
 				col_ids = jax.lax.div(col_ids, blocksize_c)
 				causal_mask = col_ids <= row_ids
-				mask = (
-					causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
-				)
+				mask = causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
 
 			s = s if mask is None else s + jnp.where(mask, 0.0, mask_value)
 
@@ -766,7 +757,6 @@ def _flash_attention_kernel_single_batch(
 
 			l_corr = alpha * l_prev
 
-			print("CALU IN PROGRAM")
 			l_next = jnp.sum(p, axis=1)[:, None] + l_corr  # Shape [blocksize_q, 128]
 
 			head_dim_repeats, rem = divmod(head_dim, MIN_blocksize)
@@ -838,9 +828,7 @@ def _flash_attention_impl(
 		)
 	except TypeError:
 		...
-	_verify_block(
-		"blocksize_q", "q_seq_len", blocksize_q, q_seq_len, should_divide=False
-	)
+	_verify_block("blocksize_q", "q_seq_len", blocksize_q, q_seq_len, should_divide=False)
 	_verify_block("blocksize_k_major", "kv_seq_len", blocksize_k_major, kv_seq_len)
 	_verify_block("blocksize_k", "kv_seq_len", blocksize_k, kv_seq_len)
 	_verify_block("blocksize_b", "batch", blocksize_b, batch_size, should_divide=False)
@@ -926,9 +914,7 @@ def _flash_attention_impl(
 			pl.BlockSpec(lambda *_: (0, 0, 0, 0), acc_scratch.shape),
 		]
 	else:
-		raise NotImplementedError(
-			"blocksize_k != kv_seq_len not supported at the moment"
-		)
+		raise NotImplementedError("blocksize_k != kv_seq_len not supported at the moment")
 
 	if save_residuals:
 		out_specs = [
@@ -1026,9 +1012,7 @@ def _flash_attention_impl(
 		),
 		debug=debug,
 		compiler_params=dict(
-			mosaic=dict(
-				dimension_semantics=("parallel", "parallel", "parallel", "arbitrary")
-			)
+			mosaic=dict(dimension_semantics=("parallel", "parallel", "parallel", "arbitrary"))
 		),
 		interpret=_INTERPRET,
 	)(
@@ -1097,9 +1081,7 @@ def _flash_attention_dkv_kernel(
 		def k_body(i, _):
 			start_k = i * blocksize_k
 			key = pl.load(k_tile_ref, (0, 0, pl.ds(start_k, blocksize_k), slice(None)))
-			value = pl.load(
-				v_tile_ref, (0, 0, pl.ds(start_k, blocksize_k), slice(None))
-			)
+			value = pl.load(v_tile_ref, (0, 0, pl.ds(start_k, blocksize_k), slice(None)))
 			query = pl.load(
 				q_tile_ref, (0, 0, pl.ds(start_q, blocksize_q), slice(None))
 			)  # [blocksize_q, head_dim]
@@ -1155,19 +1137,13 @@ def _flash_attention_dkv_kernel(
 			if blocksize_c is not None:
 				mask_shape = (blocksize_q, blocksize_k)
 				row_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 0)
-				row_ids += (
-					q_seq_index + q_chunk_idx_start
-				) * blocksizeq_major + start_q
+				row_ids += (q_seq_index + q_chunk_idx_start) * blocksizeq_major + start_q
 				row_ids = jax.lax.div(row_ids, blocksize_c)
 				col_ids = jax.lax.broadcasted_iota(jnp.int32, mask_shape, 1)
-				col_ids += (
-					kv_seq_index + k_chunk_idx_start
-				) * blocksize_k_major + start_k
+				col_ids += (kv_seq_index + k_chunk_idx_start) * blocksize_k_major + start_k
 				col_ids = jax.lax.div(col_ids, blocksize_c)
 				causal_mask = col_ids <= row_ids
-				mask = (
-					causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
-				)
+				mask = causal_mask if mask is None else jnp.logical_and(mask, causal_mask)
 
 			capped_logits = (
 				capped_logits
@@ -1175,9 +1151,7 @@ def _flash_attention_dkv_kernel(
 				else capped_logits + jnp.where(mask, 0.0, mask_value)
 			)
 
-			p = jnp.exp(
-				capped_logits - pltpu.repeat(m, blocksize_k // MIN_blocksize, axis=1)
-			)
+			p = jnp.exp(capped_logits - pltpu.repeat(m, blocksize_k // MIN_blocksize, axis=1))
 			p = p * pltpu.repeat(
 				1 / l, blocksize_k // MIN_blocksize, axis=1
 			)  # [blocksizeq_major, blocksize_k_major]
@@ -1202,9 +1176,7 @@ def _flash_attention_dkv_kernel(
 
 			# ds: [blocksizeq_major, blocksize_k_major]
 			# query: [blocksizeq_major, head_dim]
-			dk = lax.dot(
-				ds.T.astype(do.dtype), query, preferred_element_type=jnp.float32
-			)
+			dk = lax.dot(ds.T.astype(do.dtype), query, preferred_element_type=jnp.float32)
 			pl.store(
 				dk_scratch_ref,
 				(pl.ds(start_k, blocksize_k), slice(None)),
@@ -1413,9 +1385,7 @@ def _flash_attention_bwd_dkv(
 
 	out_shapes = [
 		jax.ShapeDtypeStruct((batch_size, num_heads, kv_seq_len, head_dim), key.dtype),
-		jax.ShapeDtypeStruct(
-			(batch_size, num_heads, kv_seq_len, head_dim), value.dtype
-		),
+		jax.ShapeDtypeStruct((batch_size, num_heads, kv_seq_len, head_dim), value.dtype),
 		jax.ShapeDtypeStruct((blocksize_k_major, head_dim), jnp.float32),
 		jax.ShapeDtypeStruct((blocksize_k_major, head_dim), jnp.float32),
 	]
@@ -1553,9 +1523,7 @@ def _flash_attention_dq_kernel(
 		if q_segment_ids_tile_ref is not None:
 			repeats, rem = divmod(blocksize_k, NUM_LANES)
 			if rem:
-				raise NotImplementedError(
-					f"kv block size must be a multiple of {NUM_LANES}"
-				)
+				raise NotImplementedError(f"kv block size must be a multiple of {NUM_LANES}")
 			q_segment_ids = pltpu.repeat(
 				q_segment_ids_tile_ref[0], repeats, axis=1
 			)  # [blocksize_q, blocksize_k].
@@ -1582,9 +1550,7 @@ def _flash_attention_dq_kernel(
 			else capped_logits + jnp.where(mask, 0.0, mask_value)
 		)
 
-		p = jnp.exp(
-			capped_logits - pltpu.repeat(m, blocksize_k // MIN_blocksize, axis=1)
-		)
+		p = jnp.exp(capped_logits - pltpu.repeat(m, blocksize_k // MIN_blocksize, axis=1))
 		p = p * pltpu.repeat(
 			1 / l, blocksize_k // MIN_blocksize, axis=1
 		)  # [blocksizeq_major, blocksize_k]
@@ -1886,9 +1852,7 @@ def _verify_block(blocksizename, dim_name, block, dim, should_divide=True):
 			f"{blocksizename}={block} should be smaller or equal to {dim_name}={dim}"
 		)
 	if should_divide and dim % block != 0:
-		raise ValueError(
-			f"{dim_name}={dim} should be divisible by {blocksizename}={block}"
-		)
+		raise ValueError(f"{dim_name}={dim} should be divisible by {blocksizename}={block}")
 
 
 def below_or_on_diag(
