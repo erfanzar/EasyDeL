@@ -53,6 +53,7 @@ def main(use_iterable_dataset: bool):
 		attn_mechanism=AttentionMechanisms.ring,
 		block_k=512,
 		block_q=512,
+		platform="jax",
 	)
 
 	dtype = jnp.float16
@@ -63,6 +64,7 @@ def main(use_iterable_dataset: bool):
 		param_dtype=dtype,
 	)
 	params = model.shard_params(model.params)
+
 	new_rng = rng.rng
 
 	def data_generator(num_rows: int):

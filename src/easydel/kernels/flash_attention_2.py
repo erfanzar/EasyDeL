@@ -30,9 +30,9 @@ from jax.extend.backend import get_backend
 from easydel.kernels.cpu_ops import jax_flash_attn_2_mu
 from easydel.kernels.gpu_ops import pallas_flash_attn_2_gpu, triton_flash_attn_2_gpu
 
-AVAILABLE_FLASH_ATTENTION2_BACKENDS = Literal["triton", "pallas", "jax"]
-AVAILABLE_PLATFORMS = Literal["gpu", "tpu", "cpu"]
-PLATFORM = get_backend().platform
+AVAILABLE_FLASH_ATTENTION2_PLATFORMS = Literal["triton", "pallas", "jax"]
+AVAILABLE_BACKENDS = Literal["gpu", "tpu", "cpu"]
+BACKEND = get_backend().platform
 
 
 def flash_attention2(
@@ -43,27 +43,27 @@ def flash_attention2(
 	softmax_scale: Optional[float] = None,
 	blocksize_q: int = 128,
 	blocksize_k: int = 128,
-	backend: AVAILABLE_FLASH_ATTENTION2_BACKENDS = ...,
-	platform: AVAILABLE_PLATFORMS = ...,
+	backend: AVAILABLE_BACKENDS = ...,
+	platform: AVAILABLE_FLASH_ATTENTION2_PLATFORMS = ...,
 ):
 	if backend == Ellipsis:
-		platform = PLATFORM
-	if backend == Ellipsis:
-		match platform:
+		backend = BACKEND
+	if platform == Ellipsis:
+		match backend:
 			case "gpu":
-				backend = "triton"
+				platform = "triton"
 			case "cpu":
-				backend = "jax"
+				platform = "jax"
 			case "tpu":
-				backend = "pallas"
+				platform = "pallas"
 			case _:
-				backend = ...
+				platform = ...
 
-	if backend == Ellipsis:
-		raise NotImplementedError(f"there's no available backend for platform {platform}")
-	match platform:
+	if platform == Ellipsis:
+		raise NotImplementedError(f"there's no available platform for backend {backend}")
+	match backend:
 		case "gpu":
-			match backend:
+			match platform:
 				case "triton":
 					return triton_flash_attn_2_gpu(
 						query=query,
@@ -89,28 +89,31 @@ def flash_attention2(
 						query_state=query,
 						key_state=key,
 						value_state=value,
+						mask=None,
 						bias=bias,
 						q_block=blocksize_q,
 						k_block=blocksize_k,
 					)
 		case "cpu":
-			match backend:
+			match platform:
 				case "jax":
 					return jax_flash_attn_2_mu(
 						query_state=query,
 						key_state=key,
 						value_state=value,
+						mask=None,
 						bias=bias,
 						q_block=blocksize_q,
 						k_block=blocksize_k,
 					)
 		case "tpu":
-			match backend:
+			match platform:
 				case "jax":
 					return jax_flash_attn_2_mu(
 						query_state=query,
 						key_state=key,
 						value_state=value,
+						mask=None,
 						bias=bias,
 						q_block=blocksize_q,
 						k_block=blocksize_k,
@@ -191,7 +194,7 @@ def _test_backward():
 
 def _test_forward():
 	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
-	B, H, QS, KS, D = 1, 32, 4096, 4096, 128
+	B, H, QS, KS, D = 1, 32, 2048, 2048, 128
 	blocksize_k = 64
 	blocksize_q = 128
 	q = jax.nn.initializers.normal(2)(q_key, (B, QS, H, D), dtype=jnp.float16)
@@ -208,7 +211,6 @@ def _test_forward():
 	)
 	print("QKV Allocated")
 	try:
-		start = time.time()
 		co = flash_attention2(
 			q,
 			k,
@@ -217,10 +219,9 @@ def _test_forward():
 			None,
 			blocksize_q,
 			blocksize_k,
-			platform="gpu",
-			backend="triton",
+			backend="gpu",
+			platform="triton",
 		)
-		print("TOOK ", time.time() - start)
 		print(co[-1, -1, -1, :5])
 	except Exception as er:
 		print("Flash OOM", er)

@@ -134,18 +134,12 @@ class EDPretrainedConfig(PretrainedConfig):
 	    block_k (int): block size of key_states
 	    block_q (int): block size of query_states
 	    block_b (int): block size of bias
-	    block_q_major_dkv (int): block size of block_q_major_dkv
-	    block_k_major_dkv (int): block size of block_k_major_dkv
-	    block_k_dkv (int): block size of block_k_dkv
-	    block_q_dkv (int): block size of block_q_dkv
-	    block_k_major_dq (int): block size of block_k_major_dq
-	    block_k_dq (int): block size of block_k_dq
-	    block_q_dq (int): block size of block_q_dq
 	    partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
 	    shard_attention_computation (bool): whenever to shard qkv b for attention
 	    use_sharding_constraint (bool): whether to use sharding constraint for the arrays
 	    use_scan_mlp (bool): Determine whether to use scan_mlp or not
-	    backend (Optional[None]): Specify the backend to use
+	    backend (Optional[Literal["cpu", "gpu", "tpu"]]): Specify the backen
+	    platform (Optional[Literal["jax", "triton", "pallas"]]): Specify the platform to used to use
 	    flash_attention_backward_pass_impl (Literal["triton", "xla"]): Specify the backward pass kernel for flash attention
 	    attn_dtype (jnp.dtype): data type for computing attention.
 	    fcm_max_ratio (float): value for fcm mask - max ratio
@@ -166,19 +160,12 @@ class EDPretrainedConfig(PretrainedConfig):
 		block_k: int = 128,
 		block_q: int = 128,
 		block_b: int = 1,
-		block_k_major: int | None = None,
-		block_q_major_dkv: int | None = None,
-		block_k_major_dkv: int | None = None,
-		block_k_dkv: int | None = None,
-		block_q_dkv: int | None = None,
-		block_k_major_dq: int | None = None,
-		block_k_dq: int | None = None,
-		block_q_dq: int | None = None,
 		partition_axis: PartitionAxis = PartitionAxis(),  # noqa
 		shard_attention_computation: bool = True,
 		use_sharded_kv_caching: bool = True,
 		use_sharding_constraint: bool = False,
-		backend: Optional[None] = jax.default_backend(),
+		backend: Optional[Literal["cpu", "gpu", "tpu"]] = None,
+		platform: Optional[Literal["jax", "triton", "pallas"]] = None,
 		easy_method: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
 		bits: Optional[int] = None,
 		scan_ring_attention: bool = True,
@@ -210,7 +197,12 @@ class EDPretrainedConfig(PretrainedConfig):
 		self.backend = getattr(
 			self,
 			"backend",
-			backend if backend is not None else "",
+			backend if backend is not None else jax.default_backend(),
+		)
+		self.platform = getattr(
+			self,
+			"platform",
+			platform if platform is not None else "jax",
 		)
 		self.easy_method = getattr(
 			self,
@@ -236,46 +228,6 @@ class EDPretrainedConfig(PretrainedConfig):
 			self,
 			"block_q",
 			block_q,
-		)
-		self.block_k_major = getattr(
-			self,
-			"block_k_major",
-			block_k_major or block_k,
-		)
-		self.block_q_major_dkv = getattr(
-			self,
-			"block_q_major_dkv",
-			block_q_major_dkv or block_q,
-		)
-		self.block_k_major_dkv = getattr(
-			self,
-			"block_k_major_dkv",
-			block_k_major_dkv or block_k,
-		)
-		self.block_k_dkv = getattr(
-			self,
-			"block_k_dkv",
-			block_k_dkv or block_k,
-		)
-		self.block_q_dkv = getattr(
-			self,
-			"block_q_dkv",
-			block_q_dkv or block_q,
-		)
-		self.block_k_major_dq = getattr(
-			self,
-			"block_k_major_dq",
-			block_k_major_dq or block_k,
-		)
-		self.block_k_dq = getattr(
-			self,
-			"block_k_dq",
-			block_k_dq or block_k,
-		)
-		self.block_q_dq = getattr(
-			self,
-			"block_q_dq",
-			block_q_dq or block_q,
 		)
 		self.partition_axis = getattr(
 			self,
@@ -428,7 +380,7 @@ class EDPretrainedConfig(PretrainedConfig):
 	def mesh(self):
 		"""The mesh property is a helper property that creates a Mesh object from the
 		axis_dims and axis_names attributes of an object, which are assumed to be lists of integers and strings, respectively.
-		The backend attribute is also used if it exists.
+		The platform attribute is also used if it exists.
 
 		Args:
 		    self: Refer to the object itself
@@ -527,18 +479,11 @@ class EDPretrainedConfig(PretrainedConfig):
 		block_k: int = ...,
 		block_q: int = ...,
 		block_b: int = ...,
-		block_k_major: int = ...,
-		block_q_major_dkv: int | None = ...,
-		block_k_major_dkv: int | None = ...,
-		block_k_dkv: int | None = ...,
-		block_q_dkv: int | None = ...,
-		block_k_major_dq: int | None = ...,
-		block_k_dq: int | None = ...,
-		block_q_dq: int | None = ...,
 		partition_axis: PartitionAxis = ...,
 		shard_attention_computation: bool = ...,
 		use_sharded_kv_caching: bool = ...,
-		backend: Optional[None] = ...,
+		backend: Optional[Literal["cpu", "gpu", "tpu"]] = ...,
+		platform: Optional[Literal["jax", "triton", "pallas"]] = ...,
 		easy_method: Literal["train", "serve", "convert"] = ...,
 		bits: Optional[int] = ...,
 		scan_ring_attention: bool = ...,
@@ -565,18 +510,11 @@ class EDPretrainedConfig(PretrainedConfig):
 		    block_k (int): block size of key_states
 		    block_q (int): block size of query_states
 		    block_b (int): block size of bias
-		    block_k_major (int): block size if key major
-		    block_q_major_dkv (int): block size of block_q_major_dkv
-		    block_k_major_dkv (int): block size of block_k_major_dkv
-		    block_k_dkv (int): block size of block_k_dkv
-		    block_q_dkv (int): block size of block_q_dkv
-		    block_k_major_dq (int): block size of block_k_major_dq
-		    block_k_dq (int): block size of block_k_dq
-		    block_q_dq: int: block size of block_q_dq
 		    partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
 		    shard_attention_computation (bool): whenever to use shard_map for attention
 		    use_sharded_kv_caching (bool): whenever to use shard_map and sharding for key and value
-		    backend (Optional[None]): Specify the backend to use
+		    backend (Optional[Literal["cpu", "gpu", "tpu"]]): Specify the backend to use
+		platform (Optional[Literal["jax", "triton", "pallas"]]): Specify the platform to used to use
 		    easy_method (Literal["train", "serve", "convert"]): easydel Quantization Method to be applied for
 		    bits (Optional[int]): Model bits for quantization
 		    use_sharding_constraint (bool): whether to use sharding constraint for the arrays
@@ -608,19 +546,19 @@ class EDPretrainedConfig(PretrainedConfig):
 		set_attrs_smartly(
 			self,
 			"block_q",
-			1024,
+			512,
 			block_q,
 		)
 		set_attrs_smartly(
 			self,
 			"block_k",
-			1024,
+			512,
 			block_k,
 		)
 		set_attrs_smartly(
 			self,
 			"block_b",
-			1024,
+			1,
 			block_b,
 		)
 
@@ -630,7 +568,6 @@ class EDPretrainedConfig(PretrainedConfig):
 			PartitionAxis(),
 			partition_axis,
 		)
-
 		set_attrs_smartly(
 			self,
 			"use_sharding_constraint",
@@ -640,8 +577,14 @@ class EDPretrainedConfig(PretrainedConfig):
 		set_attrs_smartly(
 			self,
 			"backend",
-			jax.default_backend(),
+			None,
 			backend,
+		)
+		set_attrs_smartly(
+			self,
+			"platform",
+			"jax",
+			platform,
 		)
 		set_attrs_smartly(
 			self,
@@ -660,58 +603,6 @@ class EDPretrainedConfig(PretrainedConfig):
 			"attn_mechanism",
 			"jax_flash_attn2",
 			attn_mechanism,
-		)
-
-		set_attrs_smartly(
-			self,
-			"block_k_dkv",
-			block_k_dkv or self.block_k,
-			block_k_dkv,
-		)
-		set_attrs_smartly(
-			self,
-			"block_q_dkv",
-			block_q_dkv or self.block_q,
-			block_q_dkv,
-		)
-
-		set_attrs_smartly(
-			self,
-			"block_q_major_dkv",
-			block_q_major_dkv or self.block_q,
-			block_q_major_dkv,
-		)
-		set_attrs_smartly(
-			self,
-			"block_k_major_dkv",
-			block_k_major_dkv or self.block_k,
-			block_k_major_dkv,
-		)
-
-		set_attrs_smartly(
-			self,
-			"block_k_major",
-			block_k_major or self.block_k,
-			block_k_major,
-		)
-		set_attrs_smartly(
-			self,
-			"block_k_major_dq",
-			block_k_major_dq or self.block_k,
-			block_k_major_dq,
-		)
-
-		set_attrs_smartly(
-			self,
-			"block_k_dq",
-			block_k_dq or self.block_k,
-			block_k_dq,
-		)
-		set_attrs_smartly(
-			self,
-			"block_q_dq",
-			block_q_dq or self.block_q,
-			block_q_dq,
 		)
 
 		set_attrs_smartly(
@@ -1440,6 +1331,8 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 		config_kwargs: Optional[dict[str, Any]] = None,
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
 		quantization_method: Optional[Literal["nf4", "8bit"]] = None,
+		backend: Optional[Literal["cpu", "gpu", "tpu"]] = None,
+		platform: Optional[Literal["jax", "triton", "pallas"]] = "jax",
 		bit_targeted_params: Optional[List[str]] = None,
 		quantization_block_size: int = 4096,
 		shard_fns: dict[Callable] = None,
@@ -1511,6 +1404,8 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 			sharding_axis_names=sharding_axis_names,
 			partition_axis=partition_axis,
 			from_torch=False,
+			backend=backend,
+			platform=platform,
 		)
 
 		if config_kwargs is not None:

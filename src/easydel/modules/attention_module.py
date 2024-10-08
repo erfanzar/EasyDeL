@@ -14,6 +14,7 @@
 
 import math
 import time
+from turtle import back
 import warnings
 from functools import partial
 from typing import Any, Literal, Optional, Tuple
@@ -223,7 +224,8 @@ class FlexibleAttentionModule(object):
 		shard_attention_computation: bool = ...,
 		use_sharding_constraint: Optional[bool] = ...,
 		axis_name: str = ...,
-		backend: AVAILABLE_BACKENDS = ...,
+		platform: AVAILABLE_BACKENDS = ...,
+		backend: Optional[Literal["cpu", "gpu", "tpu"]] = ...,
 		backward_pass_impl: Literal["triton", "xla"] = "triton",
 		base_config: Optional[EDPretrainedConfig] = None,
 		_do_check: bool = True,
@@ -239,7 +241,9 @@ class FlexibleAttentionModule(object):
 		self.shard_attention_computation: bool = ...
 		self.use_sharding_constraint: Optional[bool] = ...
 		self.axis_name: str = ...
-		self.backend: str =...
+		self.backend: str = ...
+		self.platform: str = ...
+		
 		set_attrs_smartly_with_prp(self, "use_sharding_constraint", False, use_sharding_constraint, base_config)
 		set_attrs_smartly_with_prp(self, "block_q", DEFAULT_Q_BLOCK, block_q, base_config)
 		set_attrs_smartly_with_prp(self, "block_k", DEFAULT_K_BLOCK, block_k, base_config)
@@ -252,10 +256,11 @@ class FlexibleAttentionModule(object):
 		set_attrs_smartly_with_prp(self, "force_float32_tpu", True, force_float32_tpu)  # DON'T READ FROM CONFIG
 		set_attrs_smartly_with_prp(self, "axis_name", "sp", axis_name, base_config, "attention_axis_name")  # DON'T READ FROM CONFIG
 		set_attrs_smartly_with_prp(self, "axis_name", "sp", axis_name, base_config, "attention_axis_name")  # DON'T READ FROM CONFIG 
-		set_attrs_smartly_with_prp(self, "backend", ..., backend, base_config, "backend")  # DON'T READ FROM CONFIG
+		set_attrs_smartly_with_prp(self, "backend", ..., backend, base_config, "backend") 
+		set_attrs_smartly_with_prp(self, "platform", ..., platform, base_config, "platform") 
+
 		self.mesh = mesh
-		self.attn_mechanism = attn_mechanism
-		self.platform = jax.extend.backend.get_backend().platform
+		self.attn_mechanism = attn_mechanism 
 		self.sm_scale = sm_scale
 		self.num_attention_heads = num_attention_heads
 		self.head_dims = head_dims
@@ -609,6 +614,8 @@ class FlexibleAttentionModule(object):
 				blocksize_q=self.block_q,
 				blocksize_k=self.block_k,
 				softmax_scale=self.sm_scale,
+				platform=self.platform,
+				backend=self.backend,
 			)
 			return AttentionOutput(
 				attention_weights=None,
@@ -642,6 +649,7 @@ class FlexibleAttentionModule(object):
 				if jax.extend.backend.get_backend().platform == "gpu"
 				else True,
 				platform=self.platform,
+				backend=self.backend,
 				autocheck=True,
 				blocksize_c=None,
 				blocksize_k=self.block_k,
