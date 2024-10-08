@@ -46,9 +46,9 @@ def flash_attention2(
 	backend: AVAILABLE_BACKENDS = ...,
 	platform: AVAILABLE_FLASH_ATTENTION2_PLATFORMS = ...,
 ):
-	if backend == Ellipsis:
+	if backend == Ellipsis or backend is None:
 		backend = BACKEND
-	if platform == Ellipsis:
+	if platform == Ellipsis or platform is None:
 		match backend:
 			case "gpu":
 				platform = "triton"
