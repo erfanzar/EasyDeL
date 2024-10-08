@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +17,7 @@ from abc import ABC
 from typing import Callable, Dict, Optional, Union
 
 from easydel.etils.etils import get_logger
+from easydel.modules.modeling_utils import EDPretrainedModel
 from easydel.trainers.base_trainer import TrainerConfigureDataloaderOutput
 from easydel.trainers.causal_language_model_trainer import CausalLanguageModelTrainer
 from easydel.trainers.training_configurations import TrainArguments
@@ -130,10 +130,11 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
 	    ...   "param_dtype": dtype,
 	    ...   "input_shape": input_shape,
 	    ... }
+			>>> # or simply just pass model to trainer.
 
 	    >>> # Create TrainArguments
 	    >>> train_arguments = TrainArguments(
-	    ...   model_class=type(model),
+	    ...   model_class=type(model),  # not needed if ur passing model itself to trainer
 	    ...   model_name="SFT-EasyDeL",
 	    ...   num_train_epochs=3,
 	    ...   configs_to_initialize_model_class=configs_to_initialize_model_class,
@@ -190,6 +191,7 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
 		self,
 		arguments: TrainArguments,
 		tokenizer: "PreTrainedTokenizerBase",  # noqa # type:ignore
+		model: Optional[EDPretrainedModel] = None,
 		train_dataset: Optional["Dataset"] = None,  # noqa # type:ignore
 		eval_dataset: Optional[
 			Union["Dataset", Dict[str, "Dataset"]]  # noqa # type:ignore
@@ -221,7 +223,7 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
 			warnings.warn(
 				"You passed a `neftune_noise_alpha` argument to the SFTTrainer, the value you passed will override "
 				"the one in the `TrainArguments`.",
-				stacklevel=1
+				stacklevel=1,
 			)
 		elif not self._trainer_supports_neftune:
 			self.neftune_noise_alpha = neftune_noise_alpha
@@ -277,7 +279,7 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
 				"You passed a tokenizer with `padding_side` not equal to `right` to the SFTTrainer. This might lead "
 				"to some unexpected behaviour due to overflow issues when training a model in half-precision. "
 				"You might consider adding `tokenizer.padding_side = 'right'` to your code.",
-				stacklevel=1
+				stacklevel=1,
 			)
 
 		super().__init__(
@@ -286,6 +288,7 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
 			dataset_eval=eval_dataset,
 			finetune=True,
 			checkpoint_path=checkpoint_path,
+			model=model,
 			_do_init_fns=_do_init_fns,
 		)
 
@@ -485,7 +488,7 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
 				f"(in this case {extra_columns}), you can subclass `DataCollatorForLanguageModeling` in case you "
 				"used the default collator and create your own data collator in order to inspect the "
 				"unused dataset columns.",
-				stacklevel=1
+				stacklevel=1,
 			)
 
 		tokenized_dataset = dataset.map(

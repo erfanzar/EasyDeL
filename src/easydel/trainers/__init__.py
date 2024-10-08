@@ -33,6 +33,7 @@ from easydel.trainers.utils import (
 	create_constant_length_dataset,
 	get_formatting_func_from_dataset,
 	instructions_formatting_function,
+	create_prompt_creator,
 )
 from easydel.trainers.vision_causal_language_model_trainer import (
 	VisionCausalLanguageModelTrainer,

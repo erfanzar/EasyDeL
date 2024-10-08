@@ -244,7 +244,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
 	...   "dtype": dtype,
 	...   "param_dtype": param_dtype,
 	...   "input_shape": (1, 1),
-	... }
+	... }  # not needed if ur passing model to trainer
 
 	>>> rapture = LoraRaptureConfig(
 	...   parameters=model_parameters,
@@ -266,7 +266,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
 	...   model_class=type(model),
 	...   model_name="EasyDeL-Lora-Example",
 	...   num_train_epochs=3,
-	...   configs_to_initialize_model_class=configs_to_initialize_model_class,
+	...   configs_to_initialize_model_class=configs_to_initialize_model_class,  # not needed if ur passing model to trainer
 	...   learning_rate=1e-4,  # Using higher learning rate is recommended
 	...   learning_rate_end=8e-5,
 	...   optimizer=EasyDeLOptimizers.ADAMW,  # "adamw", "lion", "adafactor" are supported
@@ -789,19 +789,23 @@ class CausalLanguageModelTrainer(BaseTrainer):
 		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
 	):
 		"""Handles training for a single epoch."""
-		run_exception = None
-		for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
-			try:
-				batch = self._get_next_batch(train_iter)
 
+		for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
+			try:  # to make training loop safer if user wants to break that.
+				batch = self._get_next_batch(train_iter)
 				if self._should_skip_step(current_step):
 					pbar.update(1)
 					continue
 				step_metrics.start_step()
+			except (KeyboardInterrupt, EasyDeLTimerError) as exect:
+				return sharded_state, current_step, exect
 
-				# Execute training step
-				sharded_state, loss, metrics = self._execute_train_step(sharded_state, batch)
-				# Update and log metrics
+			# Execute training step
+			sharded_state, loss, metrics, run_exception = self._execute_train_step(
+				sharded_state, batch
+			)
+			# Update and log metrics
+			try:
 				mean_loss, mean_accuracy = metrics_tracker.update(
 					loss, metrics["accuracy"], current_step
 				)
@@ -836,9 +840,10 @@ class CausalLanguageModelTrainer(BaseTrainer):
 					)
 
 				current_step += 1
-
-			except (KeyboardInterrupt, EasyDeLTimerError) as run_exception:
+			except (KeyboardInterrupt, EasyDeLTimerError):
 				return sharded_state, current_step, run_exception
+			if run_exception is not None:
+				break
 		return sharded_state, current_step, run_exception
 
 	def _eval_epoch(
@@ -891,7 +896,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
 
 	def _execute_train_step(self, state, batch):
 		"""Execute a single training step."""
-		# Apply pre-forward updates (e.g., pruning)
 		if self.pruning_module is not None:
 			state = state.replace(
 				params=self.pruning_module.pre_forward_update(
@@ -901,25 +905,27 @@ class CausalLanguageModelTrainer(BaseTrainer):
 			)
 
 		# Forward and backward pass
-		state, loss, metrics = self.sharded_train_step_function(state, batch)
-
-		# Apply post-gradient updates
-		if self.pruning_module is not None:
-			state = state.replace(
-				params=self.pruning_module.post_gradient_update(
-					state.params,
-					state.opt_state,
+		try:
+			state, loss, metrics = self.sharded_train_step_function(state, batch)
+			# Apply post-gradient updates
+			if self.pruning_module is not None:
+				state = state.replace(
+					params=self.pruning_module.post_gradient_update(
+						state.params,
+						state.opt_state,
+					)
 				)
-			)
 
-		if self.arguments.log_grad_norms:
-			metrics.update(
-				{
-					"train/max_grad_norm": metrics["max_grad_norm"].tolist(),
-					"train/mean_grad_norm": metrics["mean_grad_norm"].tolist(),
-				}
-			)
-		return state, loss, metrics
+			if self.arguments.log_grad_norms:
+				metrics.update(
+					{
+						"train/max_grad_norm": metrics["max_grad_norm"].tolist(),
+						"train/mean_grad_norm": metrics["mean_grad_norm"].tolist(),
+					}
+				)
+			return state, loss, metrics, None
+		except (KeyboardInterrupt, EasyDeLTimerError) as run_exception:
+			return state, loss, metrics, run_exception
 
 	def _finalize_training(self, output, run_exception):
 		"""Finalize training and prepare output."""

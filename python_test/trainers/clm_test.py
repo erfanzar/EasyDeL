@@ -9,6 +9,7 @@ sys.path.append(
 		"../../src",
 	)
 )
+os.environ["ED_CUSTOM_OP"] = "false"
 # import jax
 
 from easydel import (
@@ -49,9 +50,9 @@ def main(use_iterable_dataset: bool):
 		intermediate_size=1024,
 		max_position_embeddings=sequence_length,
 		attn_dtype=jnp.float16,
-		attn_mechanism=AttentionMechanisms.flash_attn2,
-		block_k=64,
-		block_q=128,
+		attn_mechanism=AttentionMechanisms.ring,
+		block_k=512,
+		block_q=512,
 	)
 
 	dtype = jnp.float16
@@ -97,16 +98,9 @@ def main(use_iterable_dataset: bool):
 			gradient_accumulation_steps=2,
 			max_training_steps=max_training_steps,
 			max_evaluation_steps=max_evaluation_steps,
-			model_class=type(model),
 			do_train=True,
 			do_eval=True,
 			max_sequence_length=sequence_length,
-			configs_to_initialize_model_class={
-				"config": model.config,
-				"input_shape": (1, 1),
-				"dtype": dtype,
-				"param_dtype": dtype,
-			},
 			dtype=dtype,
 			param_dtype=dtype,
 			track_memory=True,
@@ -121,12 +115,13 @@ def main(use_iterable_dataset: bool):
 			clip_grad=1.0,
 			warmup_steps=5,
 		),
+		model=model,
 		dataset_train=example_train_data,
 		dataset_eval=example_eval_data,
 	)
 
 	output = trainer.train(model_parameters=flax.core.FrozenDict({"params": params}))
-	# trainer.save_pretrained(output.state, to_torch=True)
+	trainer.save_pretrained(output.state, to_torch=True)
 	exit(0)
 
 
