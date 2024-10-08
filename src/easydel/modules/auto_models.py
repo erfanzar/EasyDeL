@@ -389,7 +389,8 @@ class AutoEasyDeLModelForCausalLM:
 		shard_attention_computation: bool = True,
 		input_shape: Tuple[int, int] = (1, 1),
 		shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
-		backend: Optional[str] = None,
+		backend: Optional[Literal["cpu", "gpu", "tpu"]] = None,
+		platform: Optional[Literal["jax", "triton", "pallas"]] = None,
 		config_kwargs: Optional[Mapping[str, Any]] = None,
 		auto_shard_params: bool = False,
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]] = None,
@@ -416,7 +417,7 @@ class AutoEasyDeLModelForCausalLM:
 		    shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
 		    input_shape (Tuple[int, int], optional): Shape of the input to the model. Defaults to (1, 1).
 		    shard_fns (Optional[Mapping[tuple, Callable] | dict], optional): Sharding functions to use for the model. If None, auto-sharding is used if auto_shard_params is True. Defaults to None.
-		    backend (Optional[str], optional): Backend to use for the model. Defaults to None.
+		    backend (Optional[Literal["jax", "triton", "pallas"]], optional): Backend to use for the model. Defaults to None.
 		    config_kwargs (Optional[Mapping[str, Any]], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
 		    auto_shard_params (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
 		    partition_rules (Optional[Tuple[Tuple[str, PartitionSpec]]], optional): Custom partition rules for parameter sharding. If not None, shard_fns should also be provided. Defaults to None.
@@ -452,6 +453,7 @@ class AutoEasyDeLModelForCausalLM:
 				auto_shard_params=auto_shard_params,
 				precision=precision,
 				backend=backend,
+				platform=platform,
 				verbose_params=verbose_params,
 				partition_axis=partition_axis,
 				quantization_method=quantization_method,
@@ -479,6 +481,8 @@ class AutoEasyDeLModelForCausalLM:
 				partition_rules=partition_rules,
 				precision=precision,
 				dtype=dtype,
+				backend=backend,
+				platform=platform,
 				pretrained_model_name_or_path=pretrained_model_name_or_path,
 				quantization_method=quantization_method,
 				quantization_block_size=quantization_block_size,
@@ -500,7 +504,8 @@ class AutoEasyDeLModelForCausalLM:
 		shard_attention_computation: bool,
 		input_shape: Tuple[int, int],
 		shard_fns: Optional[Mapping[tuple, Callable] | dict],
-		backend: Optional[str],
+		backend: Optional[Literal["cpu", "gpu", "tpu"]],
+		platform: Optional[Literal["jax", "triton", "pallas"]],
 		config_kwargs: Optional[Mapping[str, Any]],
 		auto_shard_params: bool,
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]],
@@ -570,6 +575,7 @@ class AutoEasyDeLModelForCausalLM:
 			axis_names=sharding_axis_names,
 			partition_axis=partition_axis,
 			backend=backend,
+			platform=platform,
 			shard_attention_computation=shard_attention_computation,
 		)
 		if config_kwargs is not None:
@@ -620,6 +626,7 @@ class AutoEasyDeLModelForCausalLM:
 				partition_axis=partition_axis,
 				shard_attention_computation=shard_attention_computation,
 				backend=backend,
+				platform=platform,
 				input_shape=input_shape,  # type:ignore
 				config_kwargs=config_kwargs,
 				trust_remote_code=trust_remote_code,
@@ -678,6 +685,8 @@ class AutoEasyDeLModelForCausalLM:
 		input_shape: Tuple[int, int],
 		shard_fns: Optional[Mapping[tuple, Callable] | dict],
 		quantization_method: Optional[Literal["nf4", "8bit"]],
+		backend: Optional[Literal["cpu", "gpu", "tpu"]],
+		platform: Optional[Literal["jax", "triton", "pallas"]],
 		bit_targeted_params: Optional[List[str]],
 		quantization_block_size: int,
 		config_kwargs: Optional[Mapping[str, Any]],
@@ -699,6 +708,8 @@ class AutoEasyDeLModelForCausalLM:
 			shard_fns=shard_fns,
 			sharding_axis_dims=sharding_axis_dims,
 			sharding_axis_names=sharding_axis_names,
+			backend=backend,
+			platform=platform,
 			config_kwargs=config_kwargs,
 			partition_rules=partition_rules,
 			quantization_method=quantization_method,
@@ -794,7 +805,8 @@ class AutoEasyDeLConfig:
 		sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
 		partition_axis: Optional[PartitionAxis] = None,
 		shard_attention_computation: bool = True,
-		backend: Optional[str] = None,
+		backend: Optional[Literal["cpu", "gpu", "tpu"]] = None,
+		platform: Optional[Literal["jax", "triton", "pallas"]] = None,
 		from_torch: bool = False,
 		**kwargs,
 	) -> EDPretrainedConfig:
@@ -809,7 +821,7 @@ class AutoEasyDeLConfig:
 		    sharding_axis_names: Sequence[str]: Specify the order of sharding
 		    partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
 		    shard_attention_computation: bool: whenever to use shard_map for attention
-		    backend: Optional[str]: backend to use for model
+		    backend: Optional[Literal["cpu", "gpu", "tpu"]] : backend to use for model
 		    from_torch: should config be loaded from torch models or not.
 		    **kwargs: Pass additional arguments to the model and config classes
 		generation process
@@ -834,6 +846,7 @@ class AutoEasyDeLConfig:
 			axis_names=sharding_axis_names,
 			partition_axis=partition_axis,
 			backend=backend,
+			platform=platform,
 			shard_attention_computation=shard_attention_computation,
 		)
 
@@ -920,7 +933,8 @@ class AutoShardAndGatherFunctions:
 		sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
 		partition_axis: Optional[PartitionAxis] = None,
 		shard_attention_computation: bool = True,
-		backend: Optional[str] = None,
+		backend: Optional[Literal["cpu", "gpu", "tpu"]] = None,
+		platform: Optional[Literal["jax", "triton", "pallas"]] = None,
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
 		flatten: bool = True,
 		config_kwargs: Optional[Mapping[str, Any]] = None,
@@ -938,7 +952,7 @@ class AutoShardAndGatherFunctions:
 		    sharding_axis_names: The names of the sharding axes. Defaults to ("dp", "fsdp", "tp", "sp").
 		    partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
 		    shard_attention_computation: Whether to shard the attention computation. Defaults to True.
-		    backend: The backend to use for sharding. Defaults to None.
+		    backend: The backend to use for custom kernels. Defaults to None.
 		    partition_rules: A tuple of tuples containing partition rule names and `PartitionSpec` objects.
 		        If None, uses the default partition rules from the `config`.
 		    flatten: Whether to flatten the shard and gather functions. Defaults to True.
@@ -958,6 +972,7 @@ class AutoShardAndGatherFunctions:
 			partition_axis=partition_axis,
 			shard_attention_computation=shard_attention_computation,
 			backend=backend,
+			platform=platform,
 			from_torch=from_torch,
 			trust_remote_code=trust_remote_code,
 		)

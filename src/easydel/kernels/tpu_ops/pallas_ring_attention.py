@@ -1277,30 +1277,30 @@ def _flash_attention_bwd_dkv(
 		return (batch_index, head_index, next_q_index, 0)
 
 	qo_spec = pl.BlockSpec(qo_index_map, (1, 1, blocksizeq_major, head_dim))
-	assert qo_spec.blocksize_shape is not None
-	assert query.ndim == len(qo_spec.blocksize_shape)
+	assert qo_spec.block_shape is not None
+	assert query.ndim == len(qo_spec.block_shape)
 	do_spec = qo_spec
-	assert do.ndim == len(qo_spec.blocksize_shape)
+	assert do.ndim == len(qo_spec.block_shape)
 
 	def kv_index_map(batch_index, head_index, kv_seq_index, _, q_idx_ref, k_idx_ref):
 		return (batch_index, head_index, kv_seq_index, 0)
 
 	kv_spec = pl.BlockSpec(kv_index_map, (1, 1, blocksize_k_major, head_dim))
-	assert kv_spec.blocksize_shape is not None
-	assert key.ndim == len(kv_spec.blocksize_shape)
-	assert value.ndim == len(kv_spec.blocksize_shape)
+	assert kv_spec.block_shape is not None
+	assert key.ndim == len(kv_spec.block_shape)
+	assert value.ndim == len(kv_spec.block_shape)
 
 	def lm_index_map(batch_index, head_index, _, q_seq_index, q_idx_ref, k_idx_ref):
 		return (batch_index, head_index, q_seq_index, 0)
 
 	lm_spec = pl.BlockSpec(lm_index_map, (1, 1, blocksizeq_major, MIN_blocksize))
-	assert lm_spec.blocksize_shape is not None
-	assert l.ndim == len(lm_spec.blocksize_shape)
-	assert m.ndim == len(lm_spec.blocksize_shape)
+	assert lm_spec.block_shape is not None
+	assert l.ndim == len(lm_spec.block_shape)
+	assert m.ndim == len(lm_spec.block_shape)
 
 	di_spec = pl.BlockSpec(qo_index_map, (1, 1, blocksizeq_major, MIN_blocksize))
-	assert di_spec.blocksize_shape is not None
-	assert di.ndim == len(di_spec.blocksize_shape)
+	assert di_spec.block_shape is not None
+	assert di.ndim == len(di_spec.block_shape)
 
 	def ab_index_map(
 		batch_index, head_index, kv_seq_index, q_seq_index, q_idx_ref, k_idx_ref
@@ -1684,21 +1684,21 @@ def _flash_attention_bwd_dq(
 		return (batch_index, head_index, next_kv_index, 0)
 
 	kv_spec = pl.BlockSpec(kv_index_map, (1, 1, blocksize_k_major, head_dim))
-	assert kv_spec.blocksize_shape is not None
-	assert key.ndim == len(kv_spec.blocksize_shape)
-	assert value.ndim == len(kv_spec.blocksize_shape)
+	assert kv_spec.block_shape is not None
+	assert key.ndim == len(kv_spec.block_shape)
+	assert value.ndim == len(kv_spec.block_shape)
 
 	def lm_index_map(batch_index, head_index, q_seq_index, _, q_idx_ref, k_idx_ref):
 		return (batch_index, head_index, q_seq_index, 0)
 
 	lm_spec = pl.BlockSpec(lm_index_map, (1, 1, blocksizeq_major, MIN_blocksize))
-	assert lm_spec.blocksize_shape is not None
-	assert l.ndim == len(lm_spec.blocksize_shape)
-	assert m.ndim == len(lm_spec.blocksize_shape)
+	assert lm_spec.block_shape is not None
+	assert l.ndim == len(lm_spec.block_shape)
+	assert m.ndim == len(lm_spec.block_shape)
 
 	di_spec = pl.BlockSpec(qo_index_map, (1, 1, blocksizeq_major, MIN_blocksize))
-	assert di_spec.blocksize_shape is not None
-	assert di.ndim == len(di_spec.blocksize_shape)
+	assert di_spec.block_shape is not None
+	assert di.ndim == len(di_spec.block_shape)
 
 	def ab_index_map(
 		batch_index, head_index, q_seq_index, kv_seq_index, q_idx_ref, k_idx_ref

@@ -148,15 +148,15 @@ def _flash_attn2(
 	query_state: jax.Array,
 	key_state: jax.Array,
 	value_state: jax.Array,
-	mask: Optional[jax.Array],
-	bias: Optional[jax.Array],
-	dropout: float,
-	inference: bool,
-	key: Optional[jax.random.PRNGKey],
-	q_block: int,
-	k_block: int,
-	dtype: Optional[jnp.dtype],
-	precision: lax.PrecisionLike,
+	mask: Optional[jax.Array] = None,
+	bias: Optional[jax.Array] = None,
+	dropout: float = 0.0,
+	inference: bool = False,
+	key: Optional[jax.random.PRNGKey] = None,
+	q_block: int = 128,
+	k_block: int = 128,
+	dtype: Optional[jnp.dtype] = jnp.float32,
+	precision: lax.PrecisionLike = None,
 ) -> jax.Array:
 	"""Custom VJP-enabled wrapper for FlashAttention forward pass."""
 	return _fwd_flash_attn(
@@ -194,8 +194,8 @@ def _fwd_flash_attn(
 	b, h, _, d = query_state.shape
 	q_seq = query_state.shape[2]
 	k_seq = key_state.shape[2]
-	assert q_seq % q_block == 0
-	assert k_seq % k_block == 0
+	assert q_seq % q_block == 0, "Query sequence length is not visible by queryblock size"
+	assert k_seq % k_block == 0, "Key sequence length is not visible by keyblock size"
 	Tr = q_seq // q_block
 	Tc = k_seq // k_block
 	o_shape = jax.eval_shape(
@@ -248,9 +248,7 @@ def _fwd_flash_attn(
 				b_ij = jax.lax.dynamic_slice_in_dim(b_i, j * k_block, k_block, 3)
 				s_ij = s_ij + b_ij
 			if global_mask is not None:
-				ma_i = jax.lax.dynamic_slice_in_dim(
-					global_mask, i * q_block, q_block, 2
-				)
+				ma_i = jax.lax.dynamic_slice_in_dim(global_mask, i * q_block, q_block, 2)
 				ma_ij = jax.lax.dynamic_slice_in_dim(ma_i, j * k_block, k_block, 3)
 				s_ij = jnp.where(ma_ij, s_ij, -1e10)
 
@@ -395,9 +393,7 @@ def _bwd_flash_attn(
 				s_ij = s_ij + b_ij
 
 			if global_mask is not None:
-				ma_i = jax.lax.dynamic_slice_in_dim(
-					global_mask, i * q_block, q_block, 2
-				)
+				ma_i = jax.lax.dynamic_slice_in_dim(global_mask, i * q_block, q_block, 2)
 				ma_ij = jax.lax.dynamic_slice_in_dim(ma_i, j * k_block, k_block, 3)
 				s_ij = jnp.where(ma_ij, s_ij, -1e10)
 
@@ -411,17 +407,13 @@ def _bwd_flash_attn(
 				mask = jnp.broadcast_to(mask, p_ij.shape)
 				p_ij = lax.select(mask, p_ij / keep_prob, jnp.zeros_like(p_ij))
 
-			dV_j = dV_j + jnp.matmul(
-				p_ij.transpose(0, 1, 3, 2), dO_i, precision=precision
-			)
+			dV_j = dV_j + jnp.matmul(p_ij.transpose(0, 1, 3, 2), dO_i, precision=precision)
 
 			dP_ij = jnp.matmul(dO_i, v_j.transpose(0, 1, 3, 2), precision=precision)
 
 			dS_ij = p_ij * (dP_ij - D_i[..., None])
 			dQ_i = dQ_i + jnp.matmul(dS_ij, k_j, precision=precision)
-			dK_j = dK_j + jnp.matmul(
-				dS_ij.transpose(0, 1, 3, 2), q_i, precision=precision
-			)
+			dK_j = dK_j + jnp.matmul(dS_ij.transpose(0, 1, 3, 2), q_i, precision=precision)
 			dQ = jax.lax.dynamic_update_slice_in_dim(
 				dQ,
 				dQ_i.astype(dQ.dtype),
@@ -443,12 +435,8 @@ def _bwd_flash_attn(
 			(i_start, j, dQ, dK_j, dV_j),
 		)
 
-		dK = jax.lax.dynamic_update_slice_in_dim(
-			dK, dK_j.astype(dK.dtype), j * q_block, 2
-		)
-		dV = jax.lax.dynamic_update_slice_in_dim(
-			dV, dV_j.astype(dV.dtype), j * q_block, 2
-		)
+		dK = jax.lax.dynamic_update_slice_in_dim(dK, dK_j.astype(dK.dtype), j * q_block, 2)
+		dV = jax.lax.dynamic_update_slice_in_dim(dV, dV_j.astype(dV.dtype), j * q_block, 2)
 
 		return j + 1, dQ, dK, dV
 

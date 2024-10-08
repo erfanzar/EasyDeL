@@ -22,8 +22,8 @@ from easydel.kernels.cpu_ops import jax_ring_attention_mu
 from easydel.kernels.tpu_ops import pallas_ring_attention_tpu
 from jax import lax
 
-AVAILABLE_RING_ATTENTION_BACKENDS = Literal["pallas", "jax"]
-PLATFORM = get_backend().platform
+AVAILABLE_RING_ATTENTION_PLATFORM = Literal["pallas", "jax"]
+BACKEND = get_backend().platform
 
 
 def ring_attention(
@@ -46,8 +46,8 @@ def ring_attention(
 	precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
 	prevent_cse: bool = True,
 	cache_idx=None,
-	backend: AVAILABLE_RING_ATTENTION_BACKENDS = ...,
-	platform=...,
+	backend: Literal["cpu", "gpu", "tpu"] = ...,
+	platform: AVAILABLE_RING_ATTENTION_PLATFORM = ...,
 	autocheck: bool = True,
 ):
 	"""
@@ -72,37 +72,38 @@ def ring_attention(
 		policy: Checkpoint policy.
 		precision: Precision of the computation.
 		prevent_cse: Whether to prevent common subexpression elimination.
-		backend: Backend to be used for func (JAX, Pallas)
-		platform: requested platform for func (cpu, tpu, gpu)
+		platform: platform to be used for func (JAX, Pallas)
+		backend: requested backend for func (cpu, tpu, gpu)
 		autocheck: whenever to auto check blocksizes(q/k)
 
 	Returns:
 		Output array of shape (batch, q_len, num_heads, dim_per_head).
 	"""
 	if backend == Ellipsis:
-		platform = PLATFORM
-	if backend == Ellipsis:
-		match platform:
+		backend = BACKEND
+	if platform == Ellipsis:
+		match backend:
 			case "gpu":
-				backend = "jax"
+				platform = "jax"
 			case "cpu":
-				backend = "jax"
+				platform = "jax"
 			case "tpu":
-				backend = "pallas"
+				platform = "pallas"
 			case _:
-				backend = ...
+				platform = ...
 
-	if backend == Ellipsis:
-		raise NotImplementedError(f"there's no available backend for platform {platform}")
+	if platform == Ellipsis:
+		raise NotImplementedError(f"there's no available platform for backend {backend}")
 
 	if autocheck:
 		blocksize_q = min(blocksize_q, query.shape[1])
 		blocksize_k = min(blocksize_k, key.shape[1])
-		if platform == "gpu":
+		if backend == "gpu":
 			float32_logits = False
-	match platform:
+
+	match backend:
 		case "gpu":
-			match backend:
+			match platform:
 				case "jax":
 					return jax_ring_attention_mu(
 						query=query,
@@ -125,7 +126,7 @@ def ring_attention(
 						prevent_cse=prevent_cse,
 					)
 		case "cpu":
-			match backend:
+			match platform:
 				case "jax":
 					return jax_ring_attention_mu(
 						query=query,
@@ -148,7 +149,7 @@ def ring_attention(
 						prevent_cse=prevent_cse,
 					)
 		case "tpu":
-			match backend:
+			match platform:
 				case "jax":
 					return jax_ring_attention_mu(
 						query=query,
@@ -185,12 +186,14 @@ def ring_attention(
 						blocksize_k=blocksize_k,
 						blocksize_c=blocksize_c,
 					)
-	raise NotImplementedError(f"NotImplemented {platform}-{backend}")
+	raise NotImplementedError(
+		f"NotImplemented for platform {platform} and backend {backend}."
+	)
 
 
 def _test_forward():
 	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
-	B, H, QS, KS, D = 1, 32, 64_000, 64_000, 128
+	B, H, QS, KS, D = 1, 32, 2048, 2048, 128
 	blocksize_k = 512
 	blocksize_q = 512
 	dtype = jnp.float32
