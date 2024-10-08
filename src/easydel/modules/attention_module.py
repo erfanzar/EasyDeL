@@ -639,55 +639,55 @@ class FlexibleAttentionModule(object):
 		qps, kps, vps, bps, aps, _ = self.get_bshd_partition_specs(
 			query_states.shape[1], True
 		)
-		# attn_output = shard_map(
-		# 	partial(
-		# 		ring_attention,
-		# 		axis_name=self.axis_name,
-		# 		float32_logits=False
-		# 		if jax.extend.backend.get_backend().platform == "gpu"
-		# 		else True,
-		# 		platform=self.platform,
-		# 		backend=self.backend,
-		# 		autocheck=True,
-		# 		blocksize_c=None,
-		# 		blocksize_k=self.block_k,
-		# 		blocksize_q=self.block_q,
-		# 		dtype=self.dtype,
-		# 		softmax_scale=self.sm_scale,
-		# 		deterministic=deterministic,
-		# 		dropout_rng=dropout_rng,
-		# 	),
-		# 	in_specs=(qps, kps, vps, bps),
-		# 	out_specs=aps,
-		# 	mesh=self.mesh,
-		# 	check_rep=False,
-		# )(
-		# 	query_states.astype(self.dtype),
-		# 	key_states.astype(self.dtype),
-		# 	value_states.astype(self.dtype),
-		# 	bias.astype(self.dtype),
-		# )
-		attn_output = ring_attention(
-			query=query_states.astype(self.dtype),
-			key=key_states.astype(self.dtype),
-			value=value_states.astype(self.dtype),
-			bias=bias.astype(self.dtype),
-			# axis_name=self.axis_name,
-			axis_name=None,
-			float32_logits=False
-			if jax.extend.backend.get_backend().platform == "gpu"
-			else True,
-			platform=self.platform,
-			backend=self.backend,
-			autocheck=True,
-			blocksize_c=None,
-			blocksize_k=self.block_k,
-			blocksize_q=self.block_q,
-			dtype=self.dtype,
-			softmax_scale=self.sm_scale,
-			deterministic=deterministic,
-			dropout_rng=dropout_rng,
+		attn_output = shard_map(
+			partial(
+				ring_attention,
+				axis_name=self.axis_name,
+				float32_logits=False
+				if jax.extend.backend.get_backend().platform == "gpu"
+				else True,
+				platform=self.platform,
+				backend=self.backend,
+				autocheck=True,
+				blocksize_c=None,
+				blocksize_k=self.block_k,
+				blocksize_q=self.block_q,
+				dtype=self.dtype,
+				softmax_scale=self.sm_scale,
+				deterministic=deterministic,
+				dropout_rng=dropout_rng,
+			),
+			in_specs=(qps, kps, vps, bps),
+			out_specs=aps,
+			mesh=self.mesh,
+			check_rep=False,
+		)(
+			query_states.astype(self.dtype),
+			key_states.astype(self.dtype),
+			value_states.astype(self.dtype),
+			bias.astype(self.dtype),
 		)
+		# attn_output = ring_attention(
+		# 	query=query_states.astype(self.dtype),
+		# 	key=key_states.astype(self.dtype),
+		# 	value=value_states.astype(self.dtype),
+		# 	bias=bias.astype(self.dtype),
+		# 	# axis_name=self.axis_name,
+		# 	axis_name=None,
+		# 	float32_logits=False
+		# 	if jax.extend.backend.get_backend().platform == "gpu"
+		# 	else True,
+		# 	platform=self.platform,
+		# 	backend=self.backend,
+		# 	autocheck=True,
+		# 	blocksize_c=None,
+		# 	blocksize_k=self.block_k,
+		# 	blocksize_q=self.block_q,
+		# 	dtype=self.dtype,
+		# 	softmax_scale=self.sm_scale,
+		# 	deterministic=deterministic,
+		# 	dropout_rng=dropout_rng,
+		# )
 		return AttentionOutput(attention_weights=None, attention_outputs=attn_output)
 
 	def vanilla_attention(
