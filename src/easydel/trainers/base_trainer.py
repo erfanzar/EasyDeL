@@ -118,13 +118,15 @@ def get_layer_names(frozen_dict, prefix=""):
 class BaseTrainer(abc.ABC):
 	def __init__(
 		self,
-		arguments: TrainArguments,
-		dataset_train: "Dataset",  # noqa: F821 # type:ignore
+		arguments: Optional[TrainArguments] = None,
+		model: Optional[EDPretrainedModel] = None,
+		dataset_train: Optional["Dataset"] = None,  # noqa: F821 # type:ignore
 		dataset_eval: Optional["Dataset"] = None,  # noqa: F821 # type:ignore
 		finetune: bool = True,
 		checkpoint_path: Optional[Union[str, os.PathLike]] = None,
 		_do_init_fns: bool = True,
 	):
+		assert arguments is not None, "training argument must be passed to Trainers"
 		self.arguments = arguments
 		self.dataset_train = dataset_train
 		self.dataset_eval = dataset_eval
@@ -133,6 +135,7 @@ class BaseTrainer(abc.ABC):
 		self.dtype = arguments.dtype
 		self.param_dtype = arguments.param_dtype
 		self._initialize_attributes()
+		self._base_model = model
 
 		if _do_init_fns:
 			self.initialize_trainer_utils()
@@ -527,10 +530,11 @@ class BaseTrainer(abc.ABC):
 		    TrainerConfigureModelOutput: An object containing the configured model, optimizer, scheduler, and configuration.
 		"""
 		extra_configs = self.arguments.extra_configs or {}
-		assert self.arguments.model_class is not None, (
-			"`model_class` is a required field "
-			"please pass `model_class` to `TrainArguments`"
-		)
+		if self._base_model is None:
+			assert self.arguments.model_class is not None, (
+				"`model_class` is a required field "
+				"please pass `model_class` to `TrainArguments`"
+			)
 		model = self._configure_custom_model(extra_configs)
 
 		tx, scheduler = self.arguments.get_optimizer_and_scheduler(self.max_training_steps)
@@ -560,22 +564,28 @@ class BaseTrainer(abc.ABC):
 		Raises:
 		    AssertionError: If no custom rule is provided when initializing a custom model.
 		"""
-		if not hasattr(
-			self.arguments.configs_to_initialize_model_class["config"],
-			"get_partition_rules",
-		):
-			assert self.arguments.custom_rule is not None, (
-				"If you are using a custom model to initialize, you must "
-				"pass custom_rule for partition rules."
+		if self._base_model is None:
+			if not hasattr(
+				self.arguments.configs_to_initialize_model_class["config"],
+				"get_partition_rules",
+			):
+				assert self.arguments.custom_rule is not None, (
+					"If you are using a custom model to initialize, you must "
+					"pass custom_rule for partition rules."
+				)
+
+			self.arguments.configs_to_initialize_model_class[
+				"config"
+			].axis_dims = self.arguments.sharding_array
+
+			return self.arguments.model_class(
+				**self.arguments.configs_to_initialize_model_class, _do_init=False
 			)
-
-		self.arguments.configs_to_initialize_model_class[
-			"config"
-		].axis_dims = self.arguments.sharding_array
-
-		return self.arguments.model_class(
-			**self.arguments.configs_to_initialize_model_class, _do_init=False
-		)
+		else:
+			assert hasattr(self._base_model, "config")
+			assert hasattr(self._base_model.config, "get_partition_rules")
+			self._base_model.config.axis_dims = self.arguments.sharding_array
+			return self._base_model
 
 	def _save_state(
 		self,
@@ -662,11 +672,14 @@ class BaseTrainer(abc.ABC):
 		"""Abstract method for evaluating the model"""
 
 	def _get_information(self):
+		mdl = self.arguments.model_class if self.model is None else self.model
 		partition_rules = pprint.pformat(
-			self.arguments.custom_rule
-			if self.arguments.custom_rule is not None
-			else self.arguments.model_class.config_class.get_partition_rules(
-				self.arguments.fully_sharded_data_parallel
+			(
+				self.arguments.custom_rule
+				if self.arguments.custom_rule is not None
+				else mdl.config_class.get_partition_rules(
+					self.arguments.fully_sharded_data_parallel
+				)
 			)
 		)
 
@@ -674,7 +687,7 @@ class BaseTrainer(abc.ABC):
 ---
 tags:
 - EasyDeL
-- {self.arguments.model_class.config_class.model_type}
+- {mdl.config_class.model_type}
 ---
 # {self.arguments.model_name}
 
@@ -745,7 +758,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 
 ## Training Details
 
-- Model Architecture : {self.arguments.model_class.config_class.model_type}
+- Model Architecture : {mdl.config_class.model_type}
 - Platform : {jax.devices()[0].platform.upper()}
 - Number of Devices : {len(jax.devices())}
 - Learning Rate Start : {self.arguments.learning_rate}

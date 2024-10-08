@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,7 +15,18 @@
 import logging
 import random
 import warnings
-from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Tuple, Union
+from typing import (
+	Any,
+	Callable,
+	Dict,
+	Iterator,
+	List,
+	Literal,
+	Mapping,
+	Optional,
+	Tuple,
+	Union,
+)
 
 import jax
 import numpy as np
@@ -65,49 +75,96 @@ class JaxDistributedConfig(object):
 			)
 
 
+# fmt:off
+def create_prompt_creator(tokenizer):
+	def to_role_and_content(field):
+		return {
+			"conversation": [
+				{"role": "user", "content": field["conversation"][0]["input"]},
+				{"role": "assistant", "content": field["conversation"][0]["output"]},
+			]
+		}
+	def _pc(sample):
+		return conversations_formatting_function(tokenizer, messages_field="conversation")(to_role_and_content(sample))
+	return _pc
+# fmt:on
+
+
 def create_constant_length_dataset(
 	tokenizer,
 	dataset,
-	dataset_text_field=None,
-	formatting_func=None,
-	infinite=False,
-	seq_length=1024,
-	num_of_sequences=1024,
-	chars_per_token=3.6,
-	eos_token_id=0,
-	shuffle=True,
-	append_concat_token=True,
-	add_special_tokens=True,
-):
+	dataset_text_field: Optional[str] = None,
+	formatting_func: Optional[Callable] = None,
+	infinite: bool = False,
+	seq_length: int = 1024,
+	num_of_sequences: int = 1024,
+	chars_per_token: float = 3.6,
+	eos_token_id: int = 0,
+	shuffle: bool = True,
+	append_concat_token: bool = True,
+	add_special_tokens: bool = True,
+) -> Callable[[], Iterator[Dict[str, jnp.ndarray]]]:
+	"""
+	Creates a generator function that yields constant length chunks of tokens from a stream of text files.
+
+	Args:
+	    tokenizer: The processor used for processing the data.
+	    dataset: Dataset with text files.
+	    dataset_text_field: Name of the field in the dataset that contains the text.
+	    formatting_func: Function that formats the text before tokenization.
+	    infinite: If True the iterator is reset after dataset reaches end else stops.
+	    seq_length: Length of token sequences to return.
+	    num_of_sequences: Number of token sequences to keep in buffer.
+	    chars_per_token: Number of characters per token used to estimate number of tokens in text buffer.
+	    eos_token_id: Id of the end of sequence token if the passed tokenizer does not have an EOS token.
+	    shuffle: Shuffle the examples before they are returned.
+	    append_concat_token: If true, appends eos_token_id at the end of each sample being packed.
+	    add_special_tokens: If true, tokenizer adds special tokens to each sample being packed.
+
+	Returns:
+	    A generator function that yields dictionaries containing input_ids and attention_mask as jnp.arrays
+	"""
 	if tokenizer.eos_token_id is None:
 		warnings.warn(
-			"The passed tokenizer does not have an EOS token. We will use the passed eos_token_id instead which"
-			f" corresponds to {eos_token_id}. If this is not the correct EOS token, make sure to"
-			" pass the correct eos_token_id.",
+			"The passed tokenizer does not have an EOS token. We will use the passed eos_token_id instead which "
+			f"corresponds to {eos_token_id}. If this is not the correct EOS token, make sure to pass the correct eos_token_id.",
 			stacklevel=1,
 		)
 
 	concat_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id else eos_token_id
-	if formatting_func is None:
-		formatting_func = lambda x: x[dataset_text_field]  # noqa
-	else:
-		formatting_func = formatting_func
+	max_buffer_size = seq_length * chars_per_token * num_of_sequences
+
+	# Input validation and formatting function setup
+	if dataset_text_field is not None and formatting_func is not None:
+		warnings.warn(
+			"Only one of `dataset_text_field` and `formatting_func` should be provided. "
+			"Ignoring `dataset_text_field` and using `formatting_func`.",
+			stacklevel=1,
+		)
 
 	if formatting_func is not None:
 		if formatting_func.__code__.co_argcount > 1:
 			warnings.warn(
-				"The passed formatting_func has more than one argument. Usually that function should have a "
-				"single argument `example` which corresponds to the dictionary returned by each element of the "
-				"dataset. Make sure you know what you are doing.",
+				"The passed formatting_func has more than one argument. Usually that function should have a single argument "
+				"`example` which corresponds to the dictionary returned by each element of the dataset. Make sure you know "
+				"what you are doing.",
 				stacklevel=1,
 			)
-	max_buffer_size = seq_length * chars_per_token * num_of_sequences
+	elif dataset_text_field is not None:
+		formatting_func = lambda x: x[dataset_text_field]  # noqa
+	else:
+		raise ValueError(
+			"Either `dataset_text_field` or `formatting_func` should be provided."
+		)
 
-	def constant_dataset_collect_fn():
+	def constant_length_generator() -> Iterator[Dict[str, jnp.ndarray]]:
 		iterator = iter(dataset)
 		more_examples = True
+
 		while more_examples:
 			buffer, buffer_len = [], 0
+
+			# Fill the buffer
 			while True:
 				if buffer_len >= max_buffer_size:
 					break
@@ -127,22 +184,29 @@ def create_constant_length_dataset(
 					else:
 						more_examples = False
 						break
-			tokens = tokenizer(
-				buffer, add_special_tokens=add_special_tokens, truncation=False
-			)
 
+			if shuffle:
+				random.shuffle(buffer)
+
+			# Tokenize all texts in the buffer
+			tokens = tokenizer(
+				buffer,
+				add_special_tokens=add_special_tokens,
+				truncation=False,
+			)
 			tokenized_inputs = tokens["input_ids"]
 			attention_masks = tokens["attention_mask"]
-
+			# Concatenate all tokens and attention masks
 			all_token_ids = []
 			all_attention_masks = []
-			for tokenized_input, attention_mask in zip(tokenized_inputs, attention_masks):  # noqa
+			for tokenized_input, attention_mask in zip(tokenized_inputs, attention_masks):
 				if append_concat_token:
 					tokenized_input = tokenized_input + [concat_token_id]
 					attention_mask = attention_mask + [1]
 				all_token_ids.extend(tokenized_input)
 				all_attention_masks.extend(attention_mask)
 
+			# Create fixed-length examples
 			examples = []
 			examples_attention_masks = []
 			for i in range(0, len(all_token_ids), seq_length):
@@ -151,15 +215,21 @@ def create_constant_length_dataset(
 				if len(input_ids) == seq_length:
 					examples.append(input_ids)
 					examples_attention_masks.append(org_attention_masks)
+
 			if shuffle:
-				random.shuffle(examples)
-			for example, example_attention_mask in zip(examples, examples_attention_masks):  # noqa
+				# Shuffle examples while keeping pairs together
+				combined = list(zip(examples, examples_attention_masks))
+				random.shuffle(combined)
+				examples, examples_attention_masks = zip(*combined)
+
+			# Yield examples
+			for example, example_attention_mask in zip(examples, examples_attention_masks):
 				yield {
 					"input_ids": jnp.asarray(example, dtype="i4"),
 					"attention_mask": jnp.asarray(example_attention_mask, dtype="i4"),
 				}
 
-	return constant_dataset_collect_fn
+	return constant_length_generator
 
 
 def _collate_batch(examples, tokenizer, pad_to_multiple_of: Optional[int] = None):

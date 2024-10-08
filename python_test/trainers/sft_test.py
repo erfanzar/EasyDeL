@@ -9,70 +9,54 @@ sys.path.append(
 		"../../src",
 	)
 )
+os.environ["ED_CUSTOM_OP"] = "false"
 # import jax
 
 # jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 
-from easydel import (
-	FlaxMistralForCausalLM,
-	MistralConfig,
-	TrainArguments,
-	AttentionMechanisms,
-)
+import easydel as ed
 import flax.core
 from datasets import load_dataset
-from easydel.trainers import conversations_formatting_function
-from easydel.trainers.supervised_fine_tuning_trainer import SFTTrainer
+from easydel.trainers import create_prompt_creator
 from jax import numpy as jnp
 from transformers import AutoTokenizer
 
 
 def main():
 	sequence_length = 128
-	config = MistralConfig(
+	config = ed.MistralConfig(
 		hidden_size=128,
 		num_attention_heads=8,
 		num_key_value_heads=4,
 		num_hidden_layers=4,
 		intermediate_size=256,
-		gradient_checkpointing="",
+		gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
 		max_position_embeddings=sequence_length,
-		attn_dtype=jnp.float16,
-		attn_mechanism=AttentionMechanisms.vanilla,
-		block_k=32,
-		block_q=32,
+		attn_dtype=jnp.float32,
+		attn_mechanism=ed.AttentionMechanisms.ring,
+		block_k=512,
+		block_q=512,
+		hardware_abstraction=False,
 	)
 
 	tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
 
-	def prompter(sample):
-		return [
-			conversations_formatting_function(tokenizer, messages_field="messages")(sample)
-		]
+	train_dataset = load_dataset("LDJnr/Pure-Dove", split="train")
 
-	train_dataset = load_dataset("HuggingFaceH4/deita-10k-v0-sft", split="train_sft")
-
-	model = FlaxMistralForCausalLM(config=config, _do_init=True)
+	model = ed.FlaxMistralForCausalLM(config=config, _do_init=True)
 	params = model.shard_params(model.params)
-
+	prompter = create_prompt_creator(tokenizer)
 	dtype = jnp.float32
-	trainer = SFTTrainer(
-		arguments=TrainArguments(
+	trainer = ed.SFTTrainer(
+		arguments=ed.TrainArguments(
 			model_name="SFTTrainer_TEST",
 			num_train_epochs=3,
 			total_batch_size=2,
 			gradient_accumulation_steps=2,
 			use_wandb=False,
-			model_class=type(model),
 			do_train=True,
 			do_eval=False,
 			max_sequence_length=sequence_length,
-			configs_to_initialize_model_class={
-				"config": model.config,
-				"input_shape": (1, 1),
-				"dtype": dtype,
-				"param_dtype": dtype,
-			},
 			dtype=dtype,
 			param_dtype=dtype,
 			track_memory=False,
@@ -84,14 +68,13 @@ def main():
 			save_total_limit=1,
 			do_last_save=True,
 		),
+		model=model,
 		train_dataset=train_dataset,
-		eval_dataset=None,  # we don't have eval dataset rn :)
 		tokenizer=tokenizer,
-		dataset_text_field=None,
 		formatting_func=prompter,
 		packing=True,
-		num_of_sequences=1024,
-		chars_per_token=2.1,
+		num_of_sequences=sequence_length,
+		# chars_per_token=2.1,
 		dataset_num_proc=32,
 	)
 	return trainer.train(model_parameters=flax.core.FrozenDict({"params": params}))
