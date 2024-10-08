@@ -257,7 +257,7 @@ class FlexibleAttentionModule(object):
 		set_attrs_smartly_with_prp(self, "axis_name", "sp", axis_name, base_config, "attention_axis_name")  # DON'T READ FROM CONFIG
 		set_attrs_smartly_with_prp(self, "backend", ..., backend, base_config, "backend") 
 		set_attrs_smartly_with_prp(self, "platform", ..., platform, base_config, "platform") 
-		
+
 		self.mesh = mesh
 		self.attn_mechanism = attn_mechanism 
 		self.sm_scale = sm_scale
@@ -640,6 +640,7 @@ class FlexibleAttentionModule(object):
 		qps, kps, vps, bps, aps, _ = self.get_bshd_partition_specs(
 			query_states.shape[1], True
 		)
+
 		attn_output = shard_map(
 			partial(
 				ring_attention,
@@ -663,10 +664,10 @@ class FlexibleAttentionModule(object):
 			mesh=self.mesh,
 			check_rep=False,
 		)(
-			query_states,
-			key_states,
-			value_states,
-			bias,
+			query_states.astype(self.dtype),
+			key_states.astype(self.dtype),
+			value_states.astype(self.dtype),
+			bias.astype(self.dtype),
 		)
 		return AttentionOutput(attention_weights=None, attention_outputs=attn_output)
 
