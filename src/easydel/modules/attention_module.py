@@ -672,7 +672,8 @@ class FlexibleAttentionModule(object):
 			key=key_states.astype(self.dtype),
 			value=value_states.astype(self.dtype),
 			bias=bias.astype(self.dtype),
-			axis_name=self.axis_name,
+			# axis_name=self.axis_name,
+			axis_name=None,
 			float32_logits=False
 			if jax.extend.backend.get_backend().platform == "gpu"
 			else True,
