@@ -79,9 +79,9 @@ def ring_attention(
 	Returns:
 		Output array of shape (batch, q_len, num_heads, dim_per_head).
 	"""
-	if backend == Ellipsis:
+	if backend == Ellipsis or backend is None:
 		backend = BACKEND
-	if platform == Ellipsis:
+	if platform == Ellipsis or platform is None:
 		match backend:
 			case "gpu":
 				platform = "jax"

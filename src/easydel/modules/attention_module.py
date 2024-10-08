@@ -243,7 +243,7 @@ class FlexibleAttentionModule(object):
 		self.axis_name: str = ...
 		self.backend: str = ...
 		self.platform: str = ...
-		
+
 		set_attrs_smartly_with_prp(self, "use_sharding_constraint", False, use_sharding_constraint, base_config)
 		set_attrs_smartly_with_prp(self, "block_q", DEFAULT_Q_BLOCK, block_q, base_config)
 		set_attrs_smartly_with_prp(self, "block_k", DEFAULT_K_BLOCK, block_k, base_config)
@@ -255,10 +255,9 @@ class FlexibleAttentionModule(object):
 		set_attrs_smartly_with_prp(self, "precision", lax.Precision("fastest"), precision)  # DON'T READ FROM CONFIG
 		set_attrs_smartly_with_prp(self, "force_float32_tpu", True, force_float32_tpu)  # DON'T READ FROM CONFIG
 		set_attrs_smartly_with_prp(self, "axis_name", "sp", axis_name, base_config, "attention_axis_name")  # DON'T READ FROM CONFIG
-		set_attrs_smartly_with_prp(self, "axis_name", "sp", axis_name, base_config, "attention_axis_name")  # DON'T READ FROM CONFIG 
 		set_attrs_smartly_with_prp(self, "backend", ..., backend, base_config, "backend") 
 		set_attrs_smartly_with_prp(self, "platform", ..., platform, base_config, "platform") 
-
+		
 		self.mesh = mesh
 		self.attn_mechanism = attn_mechanism 
 		self.sm_scale = sm_scale
