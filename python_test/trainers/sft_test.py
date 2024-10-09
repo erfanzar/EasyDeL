@@ -9,7 +9,7 @@ sys.path.append(
 		"../../src",
 	)
 )
-os.environ["ED_CUSTOM_OP"] = "false"
+os.environ["EKERNEL_OPS"] = "false"
 # import jax
 
 # jax.config.update("jax_platform_name", "cpu")  # CPU Test !

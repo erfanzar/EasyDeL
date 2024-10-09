@@ -68,18 +68,18 @@ DEFAULT_PALLAS_N_BLOCK_SIZE = 128
 DEFAULT_HARDWARE_ABSTRACTION = False
 ED_DEFAULT_HARDWARE_ABSTRACTION = os.environ.get(
 	"ED_DEFAULT_HARDWARE_ABSTRACTION",
-	default="true",
+	default="false",
 ).lower() in ["true", "1", "yes"]
 
-ED_CUSTOM_OP = os.environ.get(
-	"ED_CUSTOM_OP",
-	default="true",
+EKERNEL_OPS = os.environ.get(
+	"EKERNEL_OPS",
+	default="false",
 ).lower() in ["true", "1", "yes"]
 
 if (
 	jax.extend.backend.get_backend().platform == "gpu" and ED_DEFAULT_HARDWARE_ABSTRACTION
 ):
-	DEFAULT_HARDWARE_ABSTRACTION = True  # TODO: Debug Vmap
+	DEFAULT_HARDWARE_ABSTRACTION = True
 
 
 if jax.extend.backend.get_backend().platform == "tpu":
@@ -89,15 +89,14 @@ if jax.extend.backend.get_backend().platform == "tpu":
 
 if DEFAULT_HARDWARE_ABSTRACTION:
 	logger.info("HARDWARE_ABSTRACTION is ON by default")
-	if jax.extend.backend.get_backend().platform == "gpu" and ED_CUSTOM_OP:
-		logger.info(
-			"ED_CUSTOM_OP is ON (GPU-only) and some operations will "
-			"automatically be replaced by EasyDeL, this behavior can be disabled by "
-			"setting os env `ED_CUSTOM_OP` to `false`."
-		)
-		from easydel.kernels.gemm import replace_dot_general_with_gemm
 
-		replace_dot_general_with_gemm()
+if EKERNEL_OPS:
+	logger.info(
+		"`EKERNEL_OPS` is ON and some operations will automatically be replaced by EasyDeL."
+	)
+	from easydel.kernels.gemm import replace_dot_general_with_gemm
+
+	replace_dot_general_with_gemm()
 
 
 def set_attrs_smartly(self, attr_name: str, default: Any, new_attr: Any):
