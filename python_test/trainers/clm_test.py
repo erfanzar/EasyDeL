@@ -9,9 +9,14 @@ sys.path.append(
 		"../../src",
 	)
 )
-os.environ["ED_CUSTOM_OP"] = "false"
+os.environ["EKERNEL_OPS"] = "false"
 # import jax
 
+import fjformer
+
+# jax.config.update("jax_platform_name", "cpu")  # CPU Test !
+import flax.core
+from datasets import Dataset, IterableDataset
 from easydel import (
 	AttentionMechanisms,
 	CausalLanguageModelTrainer,
@@ -21,11 +26,6 @@ from easydel import (
 	LlamaConfig,
 	TrainArguments,
 )
-import fjformer
-
-# jax.config.update("jax_platform_name", "cpu")  # CPU Test !
-import flax.core
-from datasets import Dataset, IterableDataset
 from jax import numpy as jnp
 from jax import random
 
