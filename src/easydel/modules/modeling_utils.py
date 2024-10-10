@@ -76,9 +76,7 @@ EKERNEL_OPS = os.environ.get(
 	default="false",
 ).lower() in ["true", "1", "yes"]
 
-if (
-	jax.extend.backend.get_backend().platform == "gpu" and ED_DEFAULT_HARDWARE_ABSTRACTION
-):
+if ED_DEFAULT_HARDWARE_ABSTRACTION:
 	DEFAULT_HARDWARE_ABSTRACTION = True
 
 
@@ -92,7 +90,8 @@ if DEFAULT_HARDWARE_ABSTRACTION:
 
 if EKERNEL_OPS:
 	logger.info(
-		"`EKERNEL_OPS` is ON and some operations will automatically be replaced by EasyDeL."
+		"`EKERNEL_OPS` is ON and some operations will "
+		"automatically be replaced by EasyDeL."
 	)
 	from easydel.kernels.gemm import replace_dot_general_with_gemm
 

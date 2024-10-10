@@ -16,9 +16,8 @@ __version__ = "0.0.80"
 
 import os
 
-if bool(
-	os.environ.get("EASYDEL_AUTO", "true")
-):  # Taking care of some optional GPU FLAGs
+if os.environ.get("EASYDEL_AUTO", "true") in ["true", "1", "on", "yes"]:
+	# Taking care of some optional GPU FLAGs
 	os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 	os.environ["XLA_FLAGS"] = (
 		os.environ.get("XLA_FLAGS", "") + " "

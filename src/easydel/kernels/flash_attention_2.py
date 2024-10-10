@@ -205,7 +205,7 @@ def _test_forward():
 			jnp.finfo(jnp.float16).min,
 			0,
 		)
-		if False
+		if True
 		else None
 	)
 	print("QKV Allocated")

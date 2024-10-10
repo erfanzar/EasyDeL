@@ -1,6 +1,7 @@
 # impl from attn 2 paper by @erfanzar, (inspired by org impl by @Dao-AILab)
 import functools
 import math
+import os
 from typing import Optional
 
 import chex
@@ -17,6 +18,7 @@ from triton import language as tl
 import numpy as np
 
 FLASH_ATTN_BWD_ = True
+FLASH_ATTN_WRAPS = int(os.environ.get("FLASH_ATTN_WRAPS", "0"))
 
 
 def _simp_attn(
@@ -316,6 +318,174 @@ def _fwd_attn_kernel(
 			tl.store(out_ptrs, acc_o, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim))
 
 # fmt:on
+@triton.jit
+def _fwd_attn_kernel_hu(
+	Q,
+	K,
+	V,
+	B,
+	softmax_scale: float,
+	stride_qb: int,
+	stride_qh: int,
+	stride_qm: int,
+	stride_kb: int,
+	stride_kh: int,
+	stride_kn: int,
+	stride_vb: int,
+	stride_vh: int,
+	stride_vn: int,
+	stride_bb: int,
+	stride_bh: int,
+	stride_bm: int,
+	stride_bn: int,
+	stride_ob: int,
+	stride_oh: int,
+	stride_om: int,
+	stride_lb: int,
+	stride_lh: int,
+	headdim: int,
+	seqlen_q: int,
+	seqlen_k: int,
+	O,
+	L,
+	HAVE_BIAS: tl.constexpr,
+	BLOCK_HEADDIM: tl.constexpr,
+	BLOCK_M: tl.constexpr,
+	BLOCK_N: tl.constexpr,
+):
+	"""Triton kernel for the forward pass of the attention mechanism.
+
+	Args:
+		Q: Query array.
+		K: Key array.
+		V: Value array.
+		B: Bias array.
+		softmax_scale: Scaling factor for the softmax function.
+		stride_qb: Stride for the query batch dimension.
+		stride_qh: Stride for the query head dimension.
+		stride_qm: Stride for the query sequence dimension.
+		stride_kb: Stride for the key batch dimension.
+		stride_kh: Stride for the key head dimension.
+		stride_kn: Stride for the key sequence dimension.
+		stride_vb: Stride for the value batch dimension.
+		stride_vh: Stride for the value head dimension.
+		stride_vn: Stride for the value sequence dimension.
+		stride_bb: Stride for the bias batch dimension.
+		stride_bh: Stride for the bias head dimension.
+		stride_bm: Stride for the bias query sequence dimension.
+		stride_bn: Stride for the bias key sequence dimension.
+		stride_ob: Stride for the output batch dimension.
+		stride_oh: Stride for the output head dimension.
+		stride_om: Stride for the output sequence dimension.
+		stride_lb: Stride for the log-sum-exp batch dimension.
+		stride_lh: Stride for the log-sum-exp head dimension.
+		headdim: Head dimension.
+		seqlen_q: Sequence length of the query.
+		seqlen_k: Sequence length of the key.
+		O: Output array.
+		L: Log-sum-exp array.
+		HAVE_BIAS: Whether bias is present.
+		BLOCK_HEADDIM: Block size for the head dimension.
+		EVEN_M: Whether the query sequence length is divisible by the block size.
+		EVEN_N: Whether the key sequence length is divisible by the block size.
+		EVEN_HEADDIM: Whether the head dimension is divisible by the block size.
+		BLOCK_M: Block size for the query sequence dimension.
+		BLOCK_N: Block size for the key sequence dimension.
+	"""
+	start_m, off_b, off_h = (
+		tl.program_id(0),
+		tl.program_id(1),
+		tl.program_id(2),
+	)  # this one was the bug the whole time ...
+	offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+	offs_d = tl.arange(0, BLOCK_HEADDIM)
+	offs_n = tl.arange(0, BLOCK_N)
+	q_ptrs = Q + (
+		off_b * stride_qb
+		+ off_h * stride_qh
+		+ (offs_m[:, None] * stride_qm + offs_d[None, :])
+	)
+
+	q = tl.load(
+		q_ptrs,
+		mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+		other=0.0,
+	)
+	k_ptrs = K + (
+		off_b * stride_kb
+		+ off_h * stride_kh
+		+ (offs_n[:, None] * stride_kn + offs_d[None, :])
+	)
+	v_ptrs = V + (
+		off_b * stride_vb
+		+ off_h * stride_vh
+		+ (offs_n[:, None] * stride_vn + offs_d[None, :])
+	)
+	softmax_scale = softmax_scale.to(tl.float32)
+
+	if HAVE_BIAS:
+		b_ptrs = B + (
+			off_b * stride_bb
+			+ off_h * stride_bh
+			+ (offs_m[:, None] * stride_bm + offs_n[None, :])
+		)
+
+	lse_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+	max_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+	acc_o = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
+
+	for j in range(0, seqlen_k, BLOCK_N):
+		j = tl.multiple_of(j, BLOCK_N)
+
+		k = tl.load(
+			k_ptrs + j * stride_kn,
+			mask=((j + offs_n)[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
+			other=0.0,
+		)
+		qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+		qk += tl.dot(q, k.T)
+		qk += tl.where((j + offs_n)[None, :] < seqlen_k, 0, float("-inf")).to(tl.float32)
+		if HAVE_BIAS:
+			b = tl.load(
+				b_ptrs + j,
+				mask=(offs_m[:, None] < seqlen_q) & (j + offs_n)[None, :] < seqlen_k,
+				other=0.0,
+			).to(tl.float32)
+			qk = (qk * softmax_scale) + b
+			max_ij = tl.maximum(tl.max(qk, 1), lse_i)
+			p = tl.exp(qk - max_ij[:, None])
+		else:
+			max_ij = tl.maximum(tl.max(qk, 1) * softmax_scale, lse_i)
+			p = tl.exp(qk * softmax_scale - max_ij[:, None])
+
+		l_ij = tl.sum(p, 1)
+		acc_o_scale = tl.exp(max_i - max_ij)
+		acc_o = acc_o * acc_o_scale[:, None]
+		v = tl.load(
+			v_ptrs + j * stride_vn,
+			mask=((j + offs_n)[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
+			other=0.0,
+		)
+
+		acc_o += tl.dot(p.to(v.dtype), v)
+		max_i = max_ij
+		lin = tl.exp(lse_i - max_ij) + l_ij
+		lse_i = max_ij + tl.log(lin)
+
+	o_scale = tl.exp(max_i - lse_i)
+	acc_o = acc_o * o_scale[:, None]
+	lse_ptrs = L + (off_b * stride_lb + off_h * stride_lh + offs_m)
+	tl.store(lse_ptrs, lse_i, mask=offs_m < seqlen_q)
+
+	out_ptrs = O + (
+		off_b * stride_ob
+		+ off_h * stride_oh
+		+ (offs_m[:, None] * stride_om + offs_d[None, :])
+	)
+
+	tl.store(
+		out_ptrs, acc_o, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim)
+	)
 
 
 def _fwd_attn_kernel_call(
@@ -373,7 +543,10 @@ def _fwd_attn_kernel_call(
 	stride_kb, stride_kn, stride_kh, stride_kd = get_strides(key.shape)
 	stride_vb, stride_vn, stride_vh, stride_vd = get_strides(value.shape)
 
-	num_warps = 4 if headdim <= 64 else 8
+	num_warps = (
+		(4 if headdim <= 64 else 8) if (FLASH_ATTN_WRAPS == 0) else FLASH_ATTN_WRAPS
+	)
+
 	return triton_call(
 		query,
 		key,

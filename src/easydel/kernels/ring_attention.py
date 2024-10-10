@@ -99,8 +99,7 @@ def ring_attention(
 		blocksize_q = min(blocksize_q, query.shape[1])
 		blocksize_k = min(blocksize_k, key.shape[1])
 		if backend == "gpu":
-			float32_logits = False
-
+			float32_logits = False 
 	match backend:
 		case "gpu":
 			match platform:
@@ -196,7 +195,7 @@ def _test_forward():
 	B, H, QS, KS, D = 1, 32, 2048, 2048, 128
 	blocksize_k = 512
 	blocksize_q = 512
-	dtype = jnp.float32
+	dtype = jnp.float16
 	q = jax.nn.initializers.normal(2)(q_key, (B, QS, H, D), dtype=dtype)
 	k = jax.nn.initializers.normal(2)(k_key, (B, KS, H, D), dtype=dtype)
 	v = jax.nn.initializers.normal(2)(v_key, (B, KS, H, D), dtype=dtype)
@@ -218,6 +217,7 @@ def _test_forward():
 			bias=b,
 			blocksize_k=blocksize_k,
 			blocksize_q=blocksize_q,
+			float32_logits=False,
 		)
 		print(co[-1, -1, -1, :5])
 	except Exception as er:
@@ -241,7 +241,7 @@ def _test_backward():
 	B, H, S, D = 1, 32, 2048, 16
 	blocksize_k = 512
 	blocksize_q = 512
-	dtype = jnp.float32
+	dtype = jnp.float16
 	q = jax.nn.initializers.normal(2)(q_key, (B, S, H, D), dtype=dtype)
 	k = jax.nn.initializers.normal(2)(k_key, (B, S, H, D), dtype=dtype)
 	v = jax.nn.initializers.normal(2)(v_key, (B, S, H, D), dtype=dtype)
@@ -256,23 +256,23 @@ def _test_backward():
 		else None
 	)
 
-	try:
-		co = jax.grad(
-			lambda *x: ring_attention(
-				*x,
-				None,
-				None,
-				None,
-				None,
-				blocksize_q,
-				blocksize_k,
-			).sum()
-		)(q, k, v, b)
-		print("Custom op backward pass gradients:")
-		print(co[-1][-1, -1, :5])  # Print last 5 elements of last head of last batch
-	except Exception as er:
-		print(f"Custom op backward pass failed: {er}")
-		co = None
+	# try:
+	co = jax.grad(
+		lambda *x: ring_attention(
+			*x,
+			None,
+			None,
+			None,
+			None,
+			blocksize_q,
+			blocksize_k,
+		).sum()
+	)(q, k, v, b)
+	print("Custom op backward pass gradients:")
+	print(co[-1][-1, -1, :5])  # Print last 5 elements of last head of last batch
+	# except Exception as er:
+	# 	print(f"Custom op backward pass failed: {er}")
+	# 	co = None
 
 	try:
 		import flax
@@ -296,4 +296,4 @@ def _test_backward():
 
 if __name__ == "__main__":
 	_test_forward()
-	# _test_backward()
+	_test_backward()
