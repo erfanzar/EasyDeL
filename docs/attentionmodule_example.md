@@ -41,15 +41,11 @@ switch between them and experiment with different configurations.
 FlexibleAttentionModule is a EasyDeL module that can perform attention operation with different strategies to help user achieve
 the best possible performance and numerical stability, here are some strategies supported right now.
 
-1. Flash Attention TPU known as "flash"
-2. Flash Attention GPU known as "cudnn"
-3. Ring Attention to Support higher context length such 1 Million or above known as "ring"
-4. Normal Attention which use flax.linen.attention with shard map known as "vanilla"
-5. Splash Attention on TPUs which is known as "splash"
-6. Local Ring attention via "local_ring"
-7. Wise Ring attention via "wise_ring"
-8. sharded Attention with shard map known as "sharded_vanilla"
-9. Other Attention modules might be added you can check source code for that..
+1. Flash Attention TPU/GPU/CPU known as "flash_attn2"
+2. Ring Attention to Support higher context length such 1 Million or above known as "ring"
+3. Normal Attention which use flax.linen.attention with shard map known as "vanilla"
+4. Splash Attention on TPUs which is known as "splash"
+5. Other Attention modules might be added you can check source code for that..
 
 ## Testing which Attention Module works best
 

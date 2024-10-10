@@ -47,7 +47,6 @@ from easydel.etils.partition_module import PartitionAxis
 from easydel.kernels.flash_attention_2 import flash_attention2
 from easydel.kernels.ring_attention import ring_attention
 from easydel.modules._blockwise_attention import blockwise_attn
-from easydel.modules._vanilla_attention import vanilla_attention
 from easydel.modules.modeling_utils import EDPretrainedConfig
 
 logger = get_logger(__name__)
@@ -84,7 +83,6 @@ class AttentionMechanisms:
 	vanilla: Literal["vanilla"] = "vanilla"
 	splash: Literal["splash"] = "splash"
 	cudnn: Literal["cudnn"] = "cudnn"
-	sharded_vanilla: Literal["sharded_vanilla"] = "sharded_vanilla"
 	blockwise: Literal["blockwise"] = "blockwise"
 
 
@@ -521,17 +519,7 @@ class FlexibleAttentionModule(object):
 						query_sequence_length=query_sequence_length,
 						key_value_sequence_length=key_value_sequence_length,
 					)
-				case AttentionMechanisms.sharded_vanilla:
-					return self.sharded_vanilla_attention(
-						query_states=query_states,
-						key_states=key_states,
-						value_states=value_states,
-						bias=bias,
-						dropout_rng=dropout_rng,
-						deterministic=deterministic,
-						query_sequence_length=query_sequence_length,
-						key_value_sequence_length=key_value_sequence_length,
-					)
+
 			
 				case AttentionMechanisms.ring:
 					return self.ring_attention(
@@ -603,7 +591,7 @@ class FlexibleAttentionModule(object):
 		assert bias.ndim == 4
 		if bias is not None and bias.shape[1] != query_states.shape[2]:
 			bias = jnp.repeat(bias, query_states.shape[2], 1)
-		with self.mesh:
+		with self.mesh: 
 			attention_outputs = flash_attention2(
 				query=with_sharding_constraint(query_states, qps).astype(self.dtype),
 				key=with_sharding_constraint(key_states, kps).astype(self.dtype),
@@ -703,78 +691,9 @@ class FlexibleAttentionModule(object):
 		key_value_sequence_length: int,
 	) -> AttentionOutput:
 		with self.mesh:
-			o, w = vanilla_attention(
-				query_states=query_states,
-				key_states=key_states,
-				value_states=value_states,
-				bias=bias,
-				deterministic=deterministic,
-				dtype=self.dtype,
-				dropout_rng=dropout_rng,
-				precision=self.precision,
-				attention_dropout=self.attention_dropout,
-				shard_attention_computation=self.shard_attention_computation,
+			qps, kps, vps, bps, aps, is_gen = self.get_bshd_partition_specs(
+				query_sequence_length
 			)
-			return AttentionOutput(attention_weights=w, attention_outputs=o)
-
-	def blockwise_attention(
-		self,
-		*,  # it's Kwarg Only
-		query_states: Array,
-		key_states: Array,
-		value_states: Array,
-		bias: Optional[Array] = None,
-		deterministic: bool = False,
-		dropout_rng: Optional[random.PRNGKey] = None,
-		query_sequence_length: int,
-		key_value_sequence_length: int,
-	) -> AttentionOutput:
-		qps, kps, vps, bps, aps, is_gen = self.get_bshd_partition_specs(
-			query_sequence_length
-		)
-		block_size = self.get_block_size_flash_attn(
-			query_sequence_length, key_value_sequence_length
-		)
-		with self.mesh:
-			query_states = with_sharding_constraint(query_states, qps)
-			key_states = with_sharding_constraint(key_states, kps)
-			value_states = with_sharding_constraint(value_states, vps)
-			bias = with_sharding_constraint(bias, bps)
-			o = blockwise_attn(
-				query=query_states,
-				key=key_states,
-				value=value_states,
-				bias=bias,
-				deterministic=deterministic,
-				dtype=self.dtype,
-				dropout_rng=dropout_rng,
-				precision=self.precision,
-				attn_pdrop=self.attention_dropout,
-				key_chunk_size=block_size.block_k,
-				query_chunk_size=block_size.block_q,
-				prevent_cse=not self.scan_attention_layers,
-				causal=True,
-				float32_logits=True,
-			)
-
-			o = with_sharding_constraint(o, aps)
-			return AttentionOutput(attention_weights=None, attention_outputs=o)
-
-	def sharded_vanilla_attention(
-		self,
-		*,  # it's Kwarg Only
-		query_states: Array,
-		key_states: Array,
-		value_states: Array,
-		bias: Optional[Array] = None,
-		deterministic: bool = False,
-		dropout_rng: Optional[random.PRNGKey] = None,
-		query_sequence_length: int,
-		key_value_sequence_length: int,
-	) -> AttentionOutput:
-		qps, kps, vps, bps, aps, is_gen = self.get_bshd_partition_specs(
-			query_sequence_length
-		)
 
 		with self.mesh:
 			query_states = fjformer.with_sharding_constraint(query_states, qps)
@@ -819,6 +738,49 @@ class FlexibleAttentionModule(object):
 			return AttentionOutput(
 				attention_weights=attention_weight, attention_outputs=attention
 			)
+
+	def blockwise_attention(
+		self,
+		*,  # it's Kwarg Only
+		query_states: Array,
+		key_states: Array,
+		value_states: Array,
+		bias: Optional[Array] = None,
+		deterministic: bool = False,
+		dropout_rng: Optional[random.PRNGKey] = None,
+		query_sequence_length: int,
+		key_value_sequence_length: int,
+	) -> AttentionOutput:
+		qps, kps, vps, bps, aps, is_gen = self.get_bshd_partition_specs(
+			query_sequence_length
+		)
+		block_size = self.get_block_size_flash_attn(
+			query_sequence_length, key_value_sequence_length
+		)
+		with self.mesh:
+			query_states = with_sharding_constraint(query_states, qps)
+			key_states = with_sharding_constraint(key_states, kps)
+			value_states = with_sharding_constraint(value_states, vps)
+			bias = with_sharding_constraint(bias, bps)
+			o = blockwise_attn(
+				query=query_states,
+				key=key_states,
+				value=value_states,
+				bias=bias,
+				deterministic=deterministic,
+				dtype=self.dtype,
+				dropout_rng=dropout_rng,
+				precision=self.precision,
+				attn_pdrop=self.attention_dropout,
+				key_chunk_size=block_size.block_k,
+				query_chunk_size=block_size.block_q,
+				prevent_cse=not self.scan_attention_layers,
+				causal=True,
+				float32_logits=True,
+			)
+
+			o = with_sharding_constraint(o, aps)
+			return AttentionOutput(attention_weights=None, attention_outputs=o)
 
 	def splash_attention(
 		self,
@@ -983,14 +945,10 @@ class FlexibleAttentionModule(object):
 		dtype=jnp.float16,
 		calculate_gradients: bool = True,
 		test_attentions=[  # noqa: B006
-			"local_ring",
 			"blockwise",
 			"vanilla",
-			"wise_ring",
 			"ring",
-			"sharded_vanilla",
-			"legacy_sharded_vanilla",
-			"flash",
+			"flash_attn2",
 			"splash",
 			"cudnn",
 		],

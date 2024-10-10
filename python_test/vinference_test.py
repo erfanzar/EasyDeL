@@ -2,15 +2,17 @@ import os
 import sys
 
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
+os.environ["ED_ENV_SAFE"] = "true"
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../src"))
 
+
+import easydel as ed
 
 import jax
 
 import os
 import time
 
-import easydel as ed
 from huggingface_hub import HfApi
 from jax import lax, sharding
 from jax import numpy as jnp
@@ -21,17 +23,16 @@ PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
 def main():
 	sharding_axis_dims = (1, 1, 1, -1)
-	max_length = 8192
+	max_length = 2048
 	num_devices = len(jax.devices())
 	input_shape = (num_devices, max_length)
-	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
+	pretrained_model_name_or_path = "meta-llama/Llama-3.2-3B-Instruct"
 
 	dtype = jnp.float16
 	partition_axis = ed.PartitionAxis()
 	model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		pretrained_model_name_or_path,
 		input_shape=input_shape,
-		device_map="auto",
 		auto_shard_params=True,
 		sharding_axis_dims=sharding_axis_dims,
 		config_kwargs=dict(
@@ -40,12 +41,12 @@ def main():
 			attn_dtype=jnp.float16,
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
-			q_block=64,
-			k_block=128,
+			block_q=64,
+			block_k=128,
 			attn_mechanism=ed.AttentionMechanisms.flash_attn2,
 			quantize_kv_cache=True,
 		),
-		platform="triton",
+		platform="pallas",
 		quantization_method="8bit",
 		partition_axis=partition_axis,
 		param_dtype=dtype,
@@ -88,7 +89,6 @@ def main():
 		)
 
 		start = time.time()
-
 		input_ids, attention_mask = ids["input_ids"], ids["attention_mask"]
 		pad_seq = input_ids.shape[-1]
 

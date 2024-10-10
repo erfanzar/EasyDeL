@@ -85,8 +85,8 @@ def _ring_attention_fwd(
 		query, key = query.astype(jnp.float32), key.astype(jnp.float32)
 	batch, q_len, num_heads, dim_per_head = query.shape
 	batch, kv_len, num_heads, dim_per_head = key.shape
-	numerator = jnp.zeros((batch, q_len, num_heads, dim_per_head)).astype(query.dtype)
-	denominator = jnp.zeros((batch, num_heads, q_len)).astype(query.dtype)
+	numerator = jnp.zeros((batch, q_len, num_heads, dim_per_head)).astype(jnp.float32)
+	denominator = jnp.zeros((batch, num_heads, q_len)).astype(jnp.float32)
 	axis_size = lax.psum(1, axis_name) if axis_name is not None else 1
 	q_block_size, kv_block_size = (q_len, kv_len)
 
@@ -128,7 +128,7 @@ def _ring_attention_fwd(
 		)
 		return (max_score, numerator, denominator, key, value), None
 
-	prev_max_score = jnp.full((batch, num_heads, q_len), -jnp.inf).astype(query.dtype)
+	prev_max_score = jnp.full((batch, num_heads, q_len), -jnp.inf).astype(jnp.float32)
 	(max_score, numerator, denominator, _, _), _ = lax.scan(
 		scan_kv_block,
 		init=(prev_max_score, numerator, denominator, key, value),
@@ -191,9 +191,9 @@ def _ring_attention_bwd(
 	_, q_len, _, _ = query.shape
 	_, kv_len, _, _ = key.shape
 	axis_size = lax.psum(1, axis_name) if axis_name is not None else 1
-	dq = jnp.zeros_like(query, dtype=query.dtype)
-	dk = jnp.zeros_like(key, dtype=key.dtype)
-	dv = jnp.zeros_like(value, dtype=key.dtype)
+	dq = jnp.zeros_like(query, dtype=jnp.float32)
+	dk = jnp.zeros_like(key, dtype=jnp.float32)
+	dv = jnp.zeros_like(value, dtype=jnp.float32)
 	q_block_size, kv_block_size = (
 		q_len,
 		kv_len,
@@ -388,9 +388,6 @@ def _blockwise_attention_fwd(
 	denominator = denominator.reshape((batch, num_heads, num_q, blocksize_q))
 	max_score = max_score.reshape((batch, num_heads, num_q, blocksize_q))
 
-	numerator_dtype = numerator.dtype
-	denominator_dtype = denominator.dtype
-	max_score_dtype = max_score.dtype
 	denominator, max_score = map(
 		lambda x: rearrange(x, "b h n c -> n b h c"), (denominator, max_score)
 	)
@@ -426,8 +423,7 @@ def _blockwise_attention_fwd(
 			numerator_chunk, denominator_chunk, prev_max_score_chunk = carry
 
 			attn_weights = (
-				jnp.einsum("bqhd,bkhd->bhqk", q_chunk, k_chunk, precision=precision)
-				/ scale
+				jnp.einsum("bqhd,bkhd->bhqk", q_chunk, k_chunk, precision=precision) / scale
 			)
 			bias_chunk = _chunk_bias_fn(
 				q_chunk_idx_start + q_chunk_idx, k_chunk_idx_start + k_chunk_idx
@@ -452,9 +448,9 @@ def _blockwise_attention_fwd(
 			) + exp_weights.sum(axis=-1)
 
 			return (
-				numerator_chunk.astype(numerator_dtype),
-				denominator_chunk.astype(denominator_dtype),
-				max_score_chunk.astype(max_score_dtype),
+				numerator_chunk,
+				denominator_chunk,
+				max_score_chunk,
 			), None
 
 		def skip_upper_half(carry, args):
@@ -558,15 +554,12 @@ def _blockwise_attention_bwd(
 	num_q = q_len // blocksize_q
 	num_kv = kv_len // blocksize_k
 	dq, dk, dv, output, denominator, max_score = carry
-
 	g = g.reshape((batch, num_q, blocksize_q, num_heads, dim_per_head))
 	dq = dq.reshape((batch, num_q, blocksize_q, num_heads, dim_per_head))
 	dk = dk.reshape((batch, num_kv, blocksize_k, num_heads, dim_per_head))
 	dv = dv.reshape((batch, num_kv, blocksize_k, num_heads, dim_per_head))
 	output = output.reshape((batch, num_q, blocksize_q, num_heads, dim_per_head))
-	g, dq, dk, dv, output = map(
-		lambda x: jnp.moveaxis(x, 1, 0), (g, dq, dk, dv, output)
-	)
+	g, dq, dk, dv, output = map(lambda x: jnp.moveaxis(x, 1, 0), (g, dq, dk, dv, output))
 
 	denominator = denominator.reshape((batch, num_heads, num_q, blocksize_q))
 	max_score = max_score.reshape((batch, num_heads, num_q, blocksize_q))
@@ -617,14 +610,8 @@ def _blockwise_attention_bwd(
 		def scan_kv_block(carry, scan):
 			k_chunk, value_chunk, k_chunk_idx = scan
 			dq_chunk = carry
-			k_chunk_dtype, value_chunk_dtype, dq_chunk_dtype = (
-				k_chunk.dtype,
-				value_chunk.dtype,
-				dq_chunk.dtype,
-			)
 			attn_weights = (
-				jnp.einsum("bqhd,bkhd->bhqk", q_chunk, k_chunk, precision=precision)
-				/ scale
+				jnp.einsum("bqhd,bkhd->bhqk", q_chunk, k_chunk, precision=precision) / scale
 			)
 			bias_chunk = _chunk_bias_fn(
 				q_chunk_idx_start + q_chunk_idx, k_chunk_idx_start + k_chunk_idx
@@ -641,9 +628,9 @@ def _blockwise_attention_bwd(
 			dk_chunk = jnp.einsum("bqhd,bhqk->bkhd", q_chunk, dl) / scale
 			dv_chunk = jnp.einsum("bhqk,bqhd->bkhd", exp_weights, g_chunk)
 
-			return dq_chunk.astype(dq_chunk_dtype), (
-				dk_chunk.astype(k_chunk_dtype),
-				dv_chunk.astype(value_chunk_dtype),
+			return dq_chunk, (
+				dk_chunk,
+				dv_chunk,
 			)
 
 		def skip_upper_half(carry, args):
@@ -665,11 +652,11 @@ def _blockwise_attention_bwd(
 					(
 						jnp.zeros(
 							(batch, blocksize_k, num_heads, dim_per_head),
-							dtype=dk.dtype,
+							dtype=jnp.float32,
 						),
 						jnp.zeros(
 							(batch, blocksize_k, num_heads, dim_per_head),
-							dtype=dk.dtype,
+							dtype=jnp.float32,
 						),
 					),
 				),
@@ -687,7 +674,15 @@ def _blockwise_attention_bwd(
 	(dk, dv), dq = lax.scan(
 		scan_attention,
 		init=(dk, dv),
-		xs=(query, dq, g, output, denominator, max_score, jnp.arange(0, num_q)),
+		xs=(
+			query,
+			dq,
+			g,
+			output,
+			denominator,
+			max_score,
+			jnp.arange(0, num_q),
+		),
 	)
 
 	dq, dk, dv = map(lambda x: jnp.moveaxis(x, 1, 0), (dq, dk, dv))
@@ -754,9 +749,7 @@ def _chunk_attention_bias(
 			start_indices=(0, key_offset),
 			slice_sizes=(segment_ids.shape[0], blocksize_k),
 		)
-		segment_ids_mask = ~jnp.equal(
-			q_segment_ids[:, :, None], k_segment_ids[:, None, :]
-		)
+		segment_ids_mask = ~jnp.equal(q_segment_ids[:, :, None], k_segment_ids[:, None, :])
 		segment_ids_mask = segment_ids_mask[:, None]  # B1QK
 		segment_ids_bias = segment_ids_mask * jnp.finfo(dtype).min
 		chunk_bias = jnp.minimum(chunk_bias, segment_ids_bias)
@@ -766,9 +759,7 @@ def _chunk_attention_bias(
 			dtype=jnp.int32, shape=(blocksize_q, 1), dimension=0
 		)
 		query_idx += query_offset
-		key_idx = lax.broadcasted_iota(
-			dtype=jnp.int32, shape=(1, blocksize_k), dimension=1
-		)
+		key_idx = lax.broadcasted_iota(dtype=jnp.int32, shape=(1, blocksize_k), dimension=1)
 		key_idx += key_offset
 		query_idx //= blocksize_c
 		key_idx //= blocksize_c
@@ -844,6 +835,7 @@ if __name__ == "__main__":
 			None,
 			blocksize_q=blocksize_q,
 			blocksize_k=blocksize_k,
+			float32_logits=False,
 		)
 		print(co[-1, -1, -1, :5])
 	except Exception as er:

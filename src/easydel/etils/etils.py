@@ -127,7 +127,6 @@ _AVAILABLE_ATTENTION_MECHANISMS = [
 	"splash",
 	"ring",
 	"cudnn",
-	"sharded_vanilla",
 	"blockwise",
 ]
 AVAILABLE_ATTENTION_MECHANISMS = Literal[
@@ -136,7 +135,6 @@ AVAILABLE_ATTENTION_MECHANISMS = Literal[
 	"splash",
 	"ring",
 	"cudnn",
-	"sharded_vanilla",
 	"blockwise",
 ]
 
