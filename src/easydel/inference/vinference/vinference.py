@@ -17,8 +17,9 @@
 import asyncio
 import time
 import warnings
+from datetime import datetime
 from functools import partial
-from typing import AsyncGenerator, Optional, Union, overload, List, Dict
+from typing import AsyncGenerator, Dict, List, Optional, Union, overload
 from uuid import uuid4
 
 import flax.core
@@ -30,7 +31,7 @@ from jax import numpy as jnp
 from jax import random as jrand
 from jax.sharding import NamedSharding, PartitionSpec
 from transformers import PreTrainedTokenizer
-from datetime import datetime
+
 from easydel.etils.etils import get_logger
 from easydel.inference.utils import (
 	SampleState,
@@ -370,8 +371,7 @@ class vInference:
 		"""
 		# fmt:off
 		self.model = model
-		self.params = self._validate_params(params)
-		num_params = sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(params))[0])
+		self.params = self._validate_params(params) 
 		self.tokenizer = tokenizer
 		self.generation_config = self._init_generation_config(generation_config, max_new_tokens)
 		self._rng_generator = GenerateRNG(seed)
@@ -381,31 +381,87 @@ class vInference:
 		self._precompiled_configs = set()
 		self._init_shardings()
 		self._validate_token_ids()
-		self._uuid4 = uuid4().hex
-		self._inference_name = inference_name or f"{model.config.model_type}-{(num_params/1e9):.2f}-{TIME}"
+		self._uuid4 = uuid4().hex 
 		# fmt:on
+		self._inference_name = inference_name or self._generate_inference_name(model)
+
+	def _generate_inference_name(self, model) -> str:
+		"""
+		Generate a standardized inference name combining model type, size, and timestamp.
+
+		Format: {model_type}-{size_in_B}B-{timestamp}
+		Example: llama-7.00B-20240311
+		"""
+		model_type = self._get_model_type(model)
+		model_size = self._calculate_model_size(model)
+		timestamp = datetime.now().strftime("%Y%m%d")
+
+		return f"{model_type}-{model_size}B-{timestamp}"
+
+	def _get_model_type(self, model) -> str:
+		"""Get the model type, with fallback to 'unknown' if not found."""
+		return getattr(model.config, "model_type", "unknown").lower()
+
+	def _calculate_model_size(self, model) -> str:
+		"""
+		Calculate model size in billions of parameters.
+		Returns formatted string with 2 decimal places.
+		"""
+		try:
+			num_params = sum(p.numel() for p in model.parameters())
+			size_in_billions = num_params / 1e9
+			return f"{size_in_billions:.2f}"
+		except Exception as e:
+			logger.warning(f"Failed to calculate model size: {e}")
+			return "unknown"
 
 	@property
 	def inference_name(self):
 		return self._inference_name
 
 	@property
-	def model_prefill_length(self):
-		max_length = getattr(
-			self.model.config,
+	def model_prefill_length(self) -> int:
+		"""
+		Calculate the maximum length available for input prefill by subtracting
+		the maximum new tokens from the model's maximum sequence length.
+
+		Returns:
+				int: The maximum length available for input prefill
+
+		Raises:
+				ValueError: If no maximum sequence length configuration is found
+		"""
+		possible_length_attributes = [
 			"granted_mask_max_position_embedding",
-			getattr(
-				self.model.config,
-				"max_position_embedding",
-				getattr(
-					self.model.config,
-					"max_sequence_length",
-					None,
-				),
-			),
-		)
-		assert max_length is not None, "model max length couldn't be find"
+			"max_position_embedding",
+			"max_sequence_length",
+		]
+
+		max_length = self._get_model_max_length(possible_length_attributes)
+
+		if max_length is None:
+			raise ValueError(
+				"Could not determine model's maximum sequence length. "
+				f"Looked for attributes: {', '.join(possible_length_attributes)}"
+			)
+
 		return max_length - self.generation_config.max_new_tokens
+
+	def _get_model_max_length(self, attributes: list[str]) -> Optional[int]:
+		"""
+		Find the first available maximum length configuration from a list of possible attributes.
+
+		Args:
+				attributes: List of attribute names to check in order of preference
+
+		Returns:
+				Optional[int]: The maximum length if found, None otherwise
+		"""
+		for attr in attributes:
+			max_length = getattr(self.model.config, attr, None)
+			if max_length is not None:
+				return max_length
+		return None
 
 	def _validate_params(
 		self, params: Union[flax.core.FrozenDict, dict]
