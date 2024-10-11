@@ -92,6 +92,7 @@ class EasyModelsTest(unittest.TestCase):
 		self.attn_dtype = (
 			jnp.float16 if jax.extend.backend.get_backend().platform == "gpu" else jnp.float32
 		)
+		self.platform = "triton"
 
 	def create_test_for_models(self, module_name: str, hf_module_class):
 		(module_config, module_class, transform_function) = ed.get_modules_by_type(
@@ -124,6 +125,7 @@ class EasyModelsTest(unittest.TestCase):
 				use_parallel_residual=self.use_parallel_residual,
 				qk_layernorm=self.qk_layernorm,
 				rope_scaling=self.rope_scaling,
+				platform=self.platform,
 			)
 		else:
 			config = self.header_config
@@ -718,7 +720,7 @@ if __name__ == "__main__":
 	# test.test_gpt2()
 	# test.test_grok1() # should be impl
 	# test.test_internlm2()
-	# test.test_llama()  # Passed v0.0.80 - P T Runtime
+	test.test_llama()  # Passed v0.0.80 - P T Runtime
 	# test.test_mamba()  # Passed v0.0.80 - P T Runtime
 	# test.test_mistral()  # Passed v0.0.80 - P T Runtime
 	# test.test_mixtral()  # Passed v0.0.80 - P T Runtime

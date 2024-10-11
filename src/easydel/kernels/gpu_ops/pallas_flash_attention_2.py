@@ -121,12 +121,8 @@ def _jax_bwd_flash_attn(
 			(0, j, dQ, dK_j, dV_j),
 		)
 
-		dK = jax.lax.dynamic_update_slice_in_dim(
-			dK, dK_j.astype(dK.dtype), j * qblock, 2
-		)
-		dV = jax.lax.dynamic_update_slice_in_dim(
-			dV, dV_j.astype(dV.dtype), j * qblock, 2
-		)
+		dK = jax.lax.dynamic_update_slice_in_dim(dK, dK_j.astype(dK.dtype), j * qblock, 2)
+		dV = jax.lax.dynamic_update_slice_in_dim(dV, dV_j.astype(dV.dtype), j * qblock, 2)
 
 		return j + 1, dQ, dK, dV
 
@@ -300,9 +296,7 @@ def _call_gpu_fwd_flash_attn(
 		out_specs=out_specs,
 		in_specs=in_specs,
 		out_shape=out_shape,
-		compiler_params=dict(
-			triton=dict(num_wraps=4 if dim <= 64 else 8, num_stages=1)
-		),
+		compiler_params=dict(triton=dict(num_wraps=4 if dim <= 64 else 8, num_stages=1)),
 		interpret=_INTERPRET,
 		debug=False,
 		name=f"gpu_fwd_flash_attn_{inference_mode}",
@@ -445,9 +439,7 @@ def _gpu_bwd_flash_attn_kernel(
 			p = jnp.exp(qk - lse_i)
 		else:
 			p = jnp.exp(qk * softmax_scale - lse_i)
-		dVj = dVj + jnp.dot(
-			p.astype(jnp.float32).transpose(1, 0), dOi.astype(jnp.float32)
-		)
+		dVj = dVj + jnp.dot(p.astype(jnp.float32).transpose(1, 0), dOi.astype(jnp.float32))
 		dP = jnp.dot(dOi.astype(jnp.float32), vj.transpose(1, 0).astype(jnp.float32))
 		delta = pl.load(delta_ref, idx=ld_idx, mask=q_seq_mask, other=0.0)[..., None]
 		dS = p * (dP - delta) * softmax_scale
@@ -543,9 +535,7 @@ def _call_gpu_bwd_flash_attn(
 			headdim=dim,
 		),
 		grid=(pl.cdiv(seqlen_q, qblock), batch_size * nheads),
-		compiler_params=dict(
-			triton=dict(num_wraps=4 if dim <= 64 else 8, num_stages=1)
-		),
+		compiler_params=dict(triton=dict(num_wraps=4 if dim <= 64 else 8, num_stages=1)),
 		in_specs=[
 			pl.BlockSpec(o.shape, lambda *_: (0,) * o.ndim),
 			pl.BlockSpec(dO.shape, lambda *_: (0,) * dO.ndim),
@@ -573,9 +563,7 @@ def _call_gpu_bwd_flash_attn(
 		out_shape=out_shape,
 		out_specs=out_specs,
 		in_specs=in_specs,
-		compiler_params=dict(
-			triton=dict(num_wraps=4 if dim <= 64 else 8, num_stages=1)
-		),
+		compiler_params=dict(triton=dict(num_wraps=4 if dim <= 64 else 8, num_stages=1)),
 		interpret=True,  # TODO: DEBUG THIS
 		input_output_aliases={6: 0},
 		debug=False,

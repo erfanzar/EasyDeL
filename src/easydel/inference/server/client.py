@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -176,7 +175,7 @@ def generate_gradio(
 	except ModuleNotFoundError:
 		raise ModuleNotFoundError(
 			"`gradio_client` no found consider running " "`pip install gradio_client gradio`"
-		)
+		) from None
 	job_arguments = {
 		"conversation": conversation,
 	}

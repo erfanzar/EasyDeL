@@ -44,8 +44,9 @@ class vInferenceConfig:
 	_loop_rows: Optional[int] = None
 
 	def __post_init__(self):
-		assert self.max_new_tokens % self.streaming_chunks == 0
-		self._loop_rows = self.max_new_tokens // self.streaming_chunks
+		if isinstance(self.max_new_tokens, int):
+			assert self.max_new_tokens % self.streaming_chunks == 0
+			self._loop_rows = self.max_new_tokens // self.streaming_chunks
 
 	def tree_flatten(self):
 		return (

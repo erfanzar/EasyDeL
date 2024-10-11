@@ -56,8 +56,8 @@ from easydel.inference.generation_pipeline import (
 	GenerationPipeline,
 	GenerationPipelineConfig,
 )
-from easydel.inference.serve_engine import ApiEngine, engine_client
-from easydel.inference.vinference.engine import vInference, vInferenceConfig
+from easydel.inference.server import ApiEngine, engine_client
+from easydel.inference.vinference.vinference import vInference, vInferenceConfig
 from easydel.modules.arctic import (
 	ArcticConfig,
 	FlaxArcticForCausalLM,

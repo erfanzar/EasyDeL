@@ -2,32 +2,32 @@ import os
 import sys
 
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
-os.environ["ED_ENV_SAFE"] = "true"
+os.environ["EASYDEL_AUTO"] = "true"
+# os.environ["EKERNEL_OPS"] = "true"
+
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../src"))
 
 
 import easydel as ed
-
 import jax
-
 import os
 import time
-
+import asyncio
 from huggingface_hub import HfApi
 from jax import lax, sharding
 from jax import numpy as jnp
 from transformers import AutoTokenizer
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
+MAX_INPUT_LENGTH = 2048
 
 
-def main():
+async def main():
 	sharding_axis_dims = (1, 1, 1, -1)
-	max_length = 2048
+	max_length = 6144
 	num_devices = len(jax.devices())
 	input_shape = (num_devices, max_length)
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-3B-Instruct"
-
 	dtype = jnp.float16
 	partition_axis = ed.PartitionAxis()
 	model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
@@ -41,13 +41,12 @@ def main():
 			attn_dtype=jnp.float16,
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
-			block_q=64,
+			block_q=16,
 			block_k=128,
 			attn_mechanism=ed.AttentionMechanisms.flash_attn2,
-			quantize_kv_cache=True,
 		),
-		platform="pallas",
-		quantization_method="8bit",
+		platform="triton",
+		# quantization_method="8bit",
 		partition_axis=partition_axis,
 		param_dtype=dtype,
 		dtype=dtype,
@@ -70,42 +69,50 @@ def main():
 			streaming_chunks=32,
 		),
 	)
-	ids = tokenizer.apply_chat_template(
-		[{"role": "user", "content": "COMP"}],
-		return_tensors="np",
-		return_dict=True,
-		max_length=1024,
-		padding="max_length",
-	)
-	infernece.precompile(*ids["input_ids"].shape)
+	print(infernece.inference_name)
+	_ = await infernece.precompile(1, MAX_INPUT_LENGTH)
+	conversation = []
 	while True:
+		conversation.append({"role": "user", "content": input("USER > ")})
 		ids = tokenizer.apply_chat_template(
-			[{"role": "user", "content": input("> ")}],
+			conversation,
 			return_tensors="np",
 			return_dict=True,
-			max_length=1024,
+			max_length=MAX_INPUT_LENGTH,
 			padding="max_length",
 			add_generation_prompt=True,
 		)
 
 		start = time.time()
 		input_ids, attention_mask = ids["input_ids"], ids["attention_mask"]
-		pad_seq = input_ids.shape[-1]
-
-		for response in infernece.generate(
-			input_ids=input_ids, attention_mask=attention_mask
+		start_length = MAX_INPUT_LENGTH
+		pad_seq = MAX_INPUT_LENGTH
+		print("ASSISTANT > ", end="")
+		async for response in infernece.generate(
+			input_ids=input_ids,
+			attention_mask=attention_mask,
 		):
 			next_slice = slice(
-				pad_seq, pad_seq + infernece.generation_config.streaming_chunks
+				pad_seq,
+				pad_seq + infernece.generation_config.streaming_chunks,
 			)
 			pad_seq += infernece.generation_config.streaming_chunks
 			print(
-				tokenizer.decode(response.sequences[0][next_slice], skip_special_tokens=True),
+				tokenizer.decode(
+					response.sequences[0][next_slice],
+					skip_special_tokens=True,
+				),
 				end="",
 			)
+
 		print()
 		end = time.time()
-
+		final_response = tokenizer.decode(
+			response.sequences[0][start_length:pad_seq],
+			skip_special_tokens=True,
+		)
+		conversation.append({"role": "user", "content": final_response})
+		print(await infernece.count_tokens(conversation))
 		print(
 			"TPS :",
 			sum(response.sequences[0][input_ids.shape[-1] :] != tokenizer.eos_token_id)
@@ -114,4 +121,4 @@ def main():
 
 
 if __name__ == "__main__":
-	main()
+	asyncio.run(main=main())
