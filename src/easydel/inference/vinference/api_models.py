@@ -54,6 +54,7 @@ class ChatCompletionResponse(BaseModel):
 
 class ChatCompletionStreamResponseChoice(BaseModel):
 	response: str
+	finish_reason: Optional[Literal["stop", "length", "function_call"]] = None
 
 
 class ChatCompletionStreamResponse(BaseModel):
