@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.inference.vinference.vinference import vInference
-from easydel.inference.vinference.vinference import vInferenceConfig
+from easydel.inference.vinference.api_server import vInferenceApiServer
+from easydel.inference.vinference.vinference import vInference, vInferenceConfig
 
-__all__ = ["vInference", "vInferenceConfig"]
+__all__ = ["vInference", "vInferenceConfig", "vInferenceApiServer"]

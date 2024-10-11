@@ -18,11 +18,13 @@ from easydel.inference.generation_pipeline import (
 	GenerationPipeline,
 	GenerationPipelineConfig,
 )
+from easydel.inference.vinference.api_server import vInferenceApiServer
 from easydel.inference.vinference.vinference import vInference, vInferenceConfig
 
 __all__ = [
 	"vInference",
 	"vInferenceConfig",
+	"vInferenceApiServer",
 	"ChatPipeline",
 	"GenerationPipeline",
 	"GenerationPipelineConfig",
