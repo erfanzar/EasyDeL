@@ -389,6 +389,24 @@ class vInference:
 	def inference_name(self):
 		return self._inference_name
 
+	@property
+	def model_prefill_length(self):
+		max_length = getattr(
+			self.model.config,
+			"granted_mask_max_position_embedding",
+			getattr(
+				self.model.config,
+				"max_position_embedding",
+				getattr(
+					self.model.config,
+					"max_sequence_length",
+					None,
+				),
+			),
+		)
+		assert max_length is not None, "model max length couldn't be find"
+		return max_length - self.generation_config.max_new_tokens
+
 	def _validate_params(
 		self, params: Union[flax.core.FrozenDict, dict]
 	) -> Union[flax.core.FrozenDict, dict]:
@@ -538,7 +556,11 @@ class vInference:
 		else:
 			yield state
 
-	async def precompile(self, batch_size: int, input_tokens_length: int):
+	async def precompile(
+		self,
+		batch_size: int,
+		input_tokens_length: Optional[int] = None,
+	):
 		"""
 		Precompiles the generation functions for a given batch size and input length.
 
@@ -553,6 +575,8 @@ class vInference:
 		Returns:
 			bool: True if precompilation was successful, False otherwise.
 		"""
+		if input_tokens_length is None:
+			input_tokens_length = self.model_prefill_length
 		config_key = (batch_size, input_tokens_length)
 
 		if config_key in self._precompiled_configs:
