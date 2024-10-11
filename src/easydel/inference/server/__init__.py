@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.inference.serve_engine import client as engine_client
-from easydel.inference.serve_engine.serve import ApiEngine
+from easydel.inference.server import client as engine_client
+from easydel.inference.server.serve import ApiEngine
 
 engine_client = engine_client  # Ide will find this one here

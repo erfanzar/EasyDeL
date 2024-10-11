@@ -17,3 +17,5 @@ from easydel.inference.generation_pipeline.pipeline import (
 	GenerationPipeline,
 	GenerationPipelineConfig,
 )
+
+__all__ = ["ChatPipeline", "GenerationPipeline", "GenerationPipelineConfig"]

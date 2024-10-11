@@ -1,6 +1,5 @@
 import os
 import sys
-
 dirname = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(dirname)
 sys.path.append(
@@ -10,11 +9,7 @@ sys.path.append(
 	)
 )
 os.environ["EKERNEL_OPS"] = "false"
-# import jax
-
 import fjformer
-
-# jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 import flax.core
 from datasets import Dataset, IterableDataset
 from easydel import (
