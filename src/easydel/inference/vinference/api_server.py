@@ -11,11 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+from __future__ import annotations
 import time
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import AsyncGenerator, Callable, Dict, Optional, TypeVar
+from typing import AsyncGenerator, Callable, Dict, Optional
 
 import uvicorn
 from fastapi import APIRouter, FastAPI
@@ -34,8 +34,6 @@ from easydel.inference.vinference.api_models import (
 
 TIMEOUT_KEEP_ALIVE = 5.0
 
-vInference = TypeVar("T")
-
 
 @dataclass
 class EndpointConfig:
@@ -51,7 +49,12 @@ def create_error_response(status_code: HTTPStatus, message: str) -> JSONResponse
 
 
 class vInferenceApiServer:
-	def __init__(self, inference_map: Dict[str, vInference] = None) -> None:
+	def __init__(
+		self,
+		inference_map: Dict[str, "vInference"] = None,  # noqa #type:ignore
+	) -> None:
+		from easydel.inference.vinference import vInference
+
 		assert inference_map is not None, "`inference_map` can not be None."
 		for inference in inference_map.values():
 			assert isinstance(
@@ -114,14 +117,14 @@ class vInferenceApiServer:
 		except Exception as e:
 			return create_error_response(HTTPStatus.EXPECTATION_FAILED, str(e))
 
-	def _get_inference_model(self, model_name: str) -> vInference:
+	def _get_inference_model(self, model_name: str) -> "vInference":  # noqa #type:ignore
 		"""Get and validate inference model."""
 		inference = self.inference_map.get(model_name)
 		if inference is None:
 			raise RuntimeError(f"Invalid model name: {model_name} is not available")
 		return inference
 
-	def _prepare_tokenized_input(self, messages, inference: vInference) -> dict:
+	def _prepare_tokenized_input(self, messages, inference: "vInference") -> dict:  # noqa #type:ignore
 		"""Prepare tokenized input for the model."""
 		return inference.tokenizer.apply_chat_template(
 			conversation=messages,
@@ -155,7 +158,10 @@ class vInferenceApiServer:
 		)
 
 	async def _handle_non_streaming_response(
-		self, request: ChatCompletionRequest, inference: vInference, ids: dict
+		self,
+		request: ChatCompletionRequest,
+		inference: "vInference",  # noqa #type:ignore
+		ids: dict,
 	) -> ChatCompletionResponse:
 		"""Handle non-streaming response generation."""
 		start = time.time()
@@ -197,12 +203,17 @@ class vInferenceApiServer:
 				)
 			],
 			usage=self._create_usage_info(
-				inference.model_prefill_length, non_padding_tokens, processing_time
+				inference.model_prefill_length,
+				non_padding_tokens,
+				processing_time,
 			),
 		)
 
 	async def _handle_streaming_response(
-		self, request: ChatCompletionRequest, inference: vInference, ids: dict
+		self,
+		request: ChatCompletionRequest,
+		inference: "vInference",  # noqa #type:ignore
+		ids: dict,
 	) -> StreamingResponse:
 		"""Handle streaming response generation."""
 
@@ -234,7 +245,8 @@ class vInferenceApiServer:
 							response=inference.tokenizer.decode(
 								response.sequences[0][next_slice],
 								skip_special_tokens=True,
-							)
+							),
+							finish_reason=None,
 						)
 					],
 					usage=self._create_usage_info(
@@ -243,6 +255,27 @@ class vInferenceApiServer:
 				)
 
 				yield ("data: " + stream_resp.model_dump_json() + "\n\n").encode("utf-8")
+			finish_reason = (
+				"length"
+				if non_padding_tokens == inference.generation_config.max_new_tokens
+				else "stop"
+			)
+			stream_resp = ChatCompletionStreamResponse(
+				model=request.model,
+				choices=[
+					ChatCompletionStreamResponseChoice(
+						response="",
+						finish_reason=finish_reason,
+					)
+				],
+				usage=self._create_usage_info(
+					inference.model_prefill_length,
+					non_padding_tokens,
+					processing_time,
+				),
+			)
+
+			yield ("data: " + stream_resp.model_dump_json() + "\n\n").encode("utf-8")
 
 		return StreamingResponse(stream_results(), media_type="text/event-stream")
 
