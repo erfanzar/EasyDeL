@@ -1,13 +1,8 @@
-from pydantic import BaseModel, Field
-from typing import Optional, Literal, List, Dict
-import uuid
 import time
+import uuid
+from typing import List, Literal, Optional, Union
 
-
-class ChatCompletionRequest(BaseModel):
-	model: str
-	messages: List[Dict[str, str]]
-	stream: Optional[bool] = False
+from pydantic import BaseModel, Field
 
 
 class ChatMessage(BaseModel):
@@ -19,11 +14,18 @@ class UsageInfo(BaseModel):
 	prompt_tokens: int = 0
 	completion_tokens: Optional[int] = 0
 	total_tokens: int = 0
+	tps: float = 0
+	processing_time: float = 0.0
+
+
+class ChatCompletionRequest(BaseModel):
+	model: str
+	messages: List[ChatMessage]
+	stream: Optional[bool] = False
 
 
 class ChatCompletionResponseChoice(BaseModel):
-	index: int
-	message: ChatMessage
+	response: str
 	finish_reason: Optional[Literal["stop", "length", "function_call"]] = None
 
 
@@ -36,15 +38,8 @@ class ChatCompletionResponse(BaseModel):
 	usage: UsageInfo
 
 
-class DeltaMessage(BaseModel):
-	role: Optional[str] = None
-	content: Optional[str] = None
-
-
 class ChatCompletionStreamResponseChoice(BaseModel):
-	index: int
-	delta: DeltaMessage
-	finish_reason: Optional[Literal["stop", "length"]] = None
+	response: str
 
 
 class ChatCompletionStreamResponse(BaseModel):
@@ -53,3 +48,9 @@ class ChatCompletionStreamResponse(BaseModel):
 	created: int = Field(default_factory=lambda: int(time.time()))
 	model: str
 	choices: List[ChatCompletionStreamResponseChoice]
+	usage: UsageInfo
+
+
+class CountTokenRequest(BaseModel):
+	model: str
+	conversation: Union[str, ChatMessage]

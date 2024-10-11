@@ -8,18 +8,18 @@ os.environ["EASYDEL_AUTO"] = "true"
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../src"))
 
 
-import easydel as ed
-import jax
+import asyncio
 import os
 import time
-import asyncio
+
+import easydel as ed
+import jax
 from huggingface_hub import HfApi
 from jax import lax, sharding
 from jax import numpy as jnp
 from transformers import AutoTokenizer
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
-MAX_INPUT_LENGTH = 2048
 
 
 async def main():
@@ -41,12 +41,11 @@ async def main():
 			attn_dtype=jnp.float16,
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
-			block_q=16,
+			block_q=32,
 			block_k=128,
 			attn_mechanism=ed.AttentionMechanisms.flash_attn2,
 		),
 		platform="triton",
-		# quantization_method="8bit",
 		partition_axis=partition_axis,
 		param_dtype=dtype,
 		dtype=dtype,
@@ -56,12 +55,12 @@ async def main():
 
 	tokenizer.padding_side = "left"
 	tokenizer.pad_token_id = tokenizer.eos_token_id
-	infernece = ed.vInference(
+	inference = ed.vInference(
 		model=model,
 		params=params,
 		tokenizer=tokenizer,
 		generation_config=ed.vInferenceConfig(
-			max_new_tokens=512,
+			max_new_tokens=1024,
 			temperature=model.generation_config.temperature,
 			top_p=model.generation_config.top_p,
 			top_k=model.generation_config.top_k,
@@ -69,8 +68,8 @@ async def main():
 			streaming_chunks=32,
 		),
 	)
-	print(infernece.inference_name)
-	_ = await infernece.precompile(1, MAX_INPUT_LENGTH)
+	await inference.precompile(1)
+	print(inference.inference_name)
 	conversation = []
 	while True:
 		conversation.append({"role": "user", "content": input("USER > ")})
@@ -78,25 +77,25 @@ async def main():
 			conversation,
 			return_tensors="np",
 			return_dict=True,
-			max_length=MAX_INPUT_LENGTH,
+			max_length=inference.model_prefill_length,
 			padding="max_length",
 			add_generation_prompt=True,
 		)
 
 		start = time.time()
 		input_ids, attention_mask = ids["input_ids"], ids["attention_mask"]
-		start_length = MAX_INPUT_LENGTH
-		pad_seq = MAX_INPUT_LENGTH
+		start_length = inference.model_prefill_length
+		pad_seq = inference.model_prefill_length
 		print("ASSISTANT > ", end="")
-		async for response in infernece.generate(
+		async for response in inference.generate(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 		):
 			next_slice = slice(
 				pad_seq,
-				pad_seq + infernece.generation_config.streaming_chunks,
+				pad_seq + inference.generation_config.streaming_chunks,
 			)
-			pad_seq += infernece.generation_config.streaming_chunks
+			pad_seq += inference.generation_config.streaming_chunks
 			print(
 				tokenizer.decode(
 					response.sequences[0][next_slice],
@@ -112,7 +111,7 @@ async def main():
 			skip_special_tokens=True,
 		)
 		conversation.append({"role": "user", "content": final_response})
-		print(await infernece.count_tokens(conversation))
+		print(await inference.count_tokens(conversation))
 		print(
 			"TPS :",
 			sum(response.sequences[0][input_ids.shape[-1] :] != tokenizer.eos_token_id)
