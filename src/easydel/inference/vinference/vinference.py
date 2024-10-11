@@ -382,8 +382,8 @@ class vInference:
 		self._init_shardings()
 		self._validate_token_ids()
 		self._uuid4 = uuid4().hex 
-		# fmt:on
 		self._inference_name = inference_name or self._generate_inference_name(model)
+		# fmt:on
 
 	def _generate_inference_name(self, model) -> str:
 		"""
@@ -393,7 +393,7 @@ class vInference:
 		Example: llama-7.00B-20240311
 		"""
 		model_type = self._get_model_type(model)
-		model_size = self._calculate_model_size(model)
+		model_size = self._calculate_model_size(self.params)
 		timestamp = datetime.now().strftime("%Y%m%d")
 
 		return f"{model_type}-{model_size}B-{timestamp}"
@@ -402,13 +402,15 @@ class vInference:
 		"""Get the model type, with fallback to 'unknown' if not found."""
 		return getattr(model.config, "model_type", "unknown").lower()
 
-	def _calculate_model_size(self, model) -> str:
+	def _calculate_model_size(self, params) -> str:
 		"""
 		Calculate model size in billions of parameters.
 		Returns formatted string with 2 decimal places.
 		"""
 		try:
-			num_params = sum(p.numel() for p in model.parameters())
+			num_params = sum(
+				n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(params))[0]
+			)
 			size_in_billions = num_params / 1e9
 			return f"{size_in_billions:.2f}"
 		except Exception as e:
