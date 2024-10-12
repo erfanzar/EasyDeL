@@ -12,7 +12,7 @@ from huggingface_hub import HfApi
 from jax import lax, sharding
 from jax import numpy as jnp
 from transformers import AutoTokenizer
-
+import torch
 import easydel as ed
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
@@ -20,7 +20,7 @@ PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
 async def main():
 	sharding_axis_dims = (1, 1, 1, -1)
-	max_length = 2048
+	max_length = 6144
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
 	dtype = jnp.float16
 	partition_axis = ed.PartitionAxis()
@@ -35,15 +35,17 @@ async def main():
 			attn_dtype=jnp.float16,
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
-			block_q=64,
+			block_q=32,
 			block_k=128,
 			attn_mechanism=ed.AttentionMechanisms.flash_attn2,
+			quantize_kv_cache=True,
 		),
 		quantization_method="8bit",
 		platform="triton",
 		partition_axis=partition_axis,
 		param_dtype=dtype,
 		dtype=dtype,
+		torch_dtype=torch.float16,
 		precision=lax.Precision("fastest"),
 	)
 	tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
@@ -58,7 +60,7 @@ async def main():
 			max_new_tokens=1024,
 			temperature=model.generation_config.temperature,
 			top_p=model.generation_config.top_p,
-			top_k=5,
+			top_k=model.generation_config.top_k,
 			eos_token_id=model.generation_config.eos_token_id,
 			streaming_chunks=64,
 		),
