@@ -22,6 +22,7 @@ dependencies = [
     "scipy==1.13.1",
     "websocket-client~=1.8.0",
     "websockets~=11.0.3",
+		"fastapi~=0.115.2"
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

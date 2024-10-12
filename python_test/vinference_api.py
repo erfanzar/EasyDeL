@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 
@@ -6,19 +7,20 @@ os.environ["EASYDEL_AUTO"] = "true"
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../src"))
 
-import easydel as ed
 import jax
 from huggingface_hub import HfApi
 from jax import lax, sharding
 from jax import numpy as jnp
 from transformers import AutoTokenizer
 
+import easydel as ed
+
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
 
-def main():
+async def main():
 	sharding_axis_dims = (1, 1, 1, -1)
-	max_length = 6144
+	max_length = 2048
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
 	dtype = jnp.float16
 	partition_axis = ed.PartitionAxis()
@@ -37,7 +39,6 @@ def main():
 			block_k=128,
 			attn_mechanism=ed.AttentionMechanisms.flash_attn2,
 		),
-		device_map="auto",
 		quantization_method="8bit",
 		platform="triton",
 		partition_axis=partition_axis,
@@ -57,19 +58,16 @@ def main():
 			max_new_tokens=1024,
 			temperature=model.generation_config.temperature,
 			top_p=model.generation_config.top_p,
-			top_k=model.generation_config.top_k,
+			top_k=5,
 			eos_token_id=model.generation_config.eos_token_id,
-			streaming_chunks=32,
+			streaming_chunks=64,
 		),
 	)
 
-	# print("Compiling")
-	# await inference.precompile(1)
-	# print("Compiled")
-
+	await inference.async_precompile(1)
 	print(inference.inference_name)
-	ed.vInferenceApiServer({inference.inference_name: inference}).fire()
+	await ed.vInferenceApiServer({inference.inference_name: inference}).async_fire()
 
 
 if __name__ == "__main__":
-	main()
+	asyncio.run(main())

@@ -181,6 +181,50 @@ class GenerationPipelineConfig:
 	__str__ = __repr__
 
 
+def lower_function(
+	func,
+	func_input_args,
+	func_input_kwargs,
+	mesh=None,
+	in_shardings=None,
+	out_shardings=None,
+	static_argnums=None,
+	donate_argnums=None,
+):
+	"""
+	lower a JAX function with optional sharding and mesh configuration.
+
+	Args:
+	    func: The JAX function to compile.
+	    func_input_args: Input arguments for the function.
+	    func_input_kwargs: Input keyword arguments for the function.
+	    mesh: Optional JAX mesh for distributed execution.
+	    in_shardings: Optional input sharding specifications.
+	    out_shardings: Optional output sharding specifications.
+	    static_argnums: Indices of static arguments.
+	    donate_argnums: Indices of arguments to donate.
+
+	Returns:
+	    lowered JAX function.
+	"""
+	if mesh is None:
+		return jax.jit(
+			func,
+			in_shardings=in_shardings,
+			out_shardings=out_shardings,
+			static_argnums=static_argnums,
+			donate_argnums=donate_argnums,
+		).lower(*func_input_args, **func_input_kwargs)
+	with mesh:
+		return jax.jit(
+			func,
+			in_shardings=in_shardings,
+			out_shardings=out_shardings,
+			static_argnums=static_argnums,
+			donate_argnums=donate_argnums,
+		).lower(*func_input_args, **func_input_kwargs)
+
+
 def compile_function(
 	func,
 	func_input_args,
@@ -207,30 +251,16 @@ def compile_function(
 	Returns:
 	    Compiled JAX function.
 	"""
-	if mesh is None:
-		return (
-			jax.jit(
-				func,
-				in_shardings=in_shardings,
-				out_shardings=out_shardings,
-				static_argnums=static_argnums,
-				donate_argnums=donate_argnums,
-			)
-			.lower(*func_input_args, **func_input_kwargs)
-			.compile()
-		)
-	with mesh:
-		return (
-			jax.jit(
-				func,
-				in_shardings=in_shardings,
-				out_shardings=out_shardings,
-				static_argnums=static_argnums,
-				donate_argnums=donate_argnums,
-			)
-			.lower(*func_input_args, **func_input_kwargs)
-			.compile()
-		)
+	return lower_function(
+		func,
+		func_input_args,
+		func_input_kwargs,
+		mesh=mesh,
+		in_shardings=in_shardings,
+		out_shardings=out_shardings,
+		static_argnums=static_argnums,
+		donate_argnums=donate_argnums,
+	).compile()
 
 
 @jax.tree_util.register_pytree_node_class
@@ -254,6 +284,9 @@ class SampleState:
 	is_sequence_finished: Union[jax.Array, sharding.NamedSharding]
 	prng_key: Union[random.PRNGKey, sharding.NamedSharding]
 	model_kwargs: Union[Dict[str, jax.Array], sharding.NamedSharding]
+	# vInference Ops
+	generate_func_flops: Optional[float] = float("-inf")
+	interval_func_flops: Optional[float] = float("-inf")
 
 	def tree_flatten(self):
 		return (
@@ -263,6 +296,8 @@ class SampleState:
 			self.is_sequence_finished,
 			self.prng_key,
 			self.model_kwargs,
+			self.generate_func_flops,
+			self.interval_func_flops,
 		), {}
 
 	@classmethod

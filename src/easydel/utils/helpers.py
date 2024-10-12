@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +15,9 @@
 import contextlib
 import time
 import warnings
+
+import os
+from pathlib import Path
 
 import flax.metrics.tensorboard
 
@@ -93,7 +95,8 @@ class Timers:
 			if self.use_wandb:
 				if wandb is None:
 					warnings.warn(
-						"`wandb` is not installed use `pip install wandb` (use_wandb=True will be ignored)"
+						"`wandb` is not installed use `pip install wandb` (use_wandb=True will be ignored)",
+						stacklevel=1,
 					)
 					self.use_wandb = False
 				else:
@@ -124,3 +127,21 @@ class Timers:
 					timer.elapsed_time(reset=reset) * 1000.0
 				)  # Convert to milliseconds
 				self._print_log(name, elapsed_time)
+
+
+def get_cache_dir() -> Path:
+	home_dir = Path.home()
+	app_name = "easydel"
+	if os.name == "nt":  # Windows
+		cache_dir = (
+			Path(os.getenv("LOCALAPPDATA", home_dir / "AppData" / "Local")) / app_name
+		)
+	elif os.name == "posix":  # Linux and macOS
+		if "darwin" in os.sys.platform:  # macOS
+			cache_dir = home_dir / "Library" / "Caches" / app_name
+		else:  # Linux
+			cache_dir = home_dir / ".cache" / app_name
+	else:
+		cache_dir = home_dir / ".cache" / app_name
+	cache_dir.mkdir(parents=True, exist_ok=True)
+	return cache_dir

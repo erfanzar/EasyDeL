@@ -15,6 +15,7 @@
 """Module for text generation pipeline using JAX/Flax."""
 
 import asyncio
+
 import time
 import warnings
 from datetime import datetime
@@ -39,9 +40,19 @@ from easydel.inference.utils import (
 	vInferenceConfig,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.utils.compiling_utils import smart_compile
 
 logger = get_logger(__name__)
 TIME = str(datetime.fromtimestamp(time.time())).split(" ")[0]
+
+
+def measure_flops(func, *args, **kwargs):
+	start_time = time.perf_counter()
+	flops = func.cost_analysis()[0]["flops"]
+	result = func(*args, **kwargs)
+	end_time = time.perf_counter()
+	elapsed_time = end_time - start_time
+	return result, flops, flops / elapsed_time
 
 
 @partial(jax.jit, static_argnames=["model", "generation_config"])
@@ -379,6 +390,7 @@ class vInference:
 		self.mesh = self.model.config.mesh
 		self._precompile_lock = asyncio.Lock()
 		self._precompiled_configs = set()
+		self._in_compiling_process = set()
 		self._init_shardings()
 		self._validate_token_ids()
 		self._uuid4 = uuid4().hex 
@@ -572,7 +584,7 @@ class vInference:
 		"""
 		input_ids = jnp.array(input_ids)
 		batch_size, seq_length = input_ids.shape
-		_ = await self.precompile(batch_size, seq_length)
+		_ = await self.async_precompile(batch_size, seq_length)
 		generate_func, interval_func = get_compiled_funcs(
 			batch_size=batch_size,
 			input_tokens_length=seq_length,
@@ -592,29 +604,132 @@ class vInference:
 		attention_mask = jnp.array(attention_mask)
 		start_length = input_ids.shape[-1]
 
-		state = generate_func(  # Assuming generate_func is async
+		state, flop, generate_func_flops = measure_flops(
+			generate_func,
 			params=self.params,
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			rng=self._rng_generator.rng,
 		)
-
+		state.generate_func_flops = generate_func_flops
 		if not state.is_sequence_finished and self.generation_config._loop_rows - 1 != 0:
+			all_interval_func_flops = []
 			for _ in range(self.generation_config._loop_rows - 1):
-				state = interval_func(  # Assuming interval_func is async
+				state, flop, interval_func_flops = measure_flops(
+					interval_func,
 					params=self.params,
 					state=state,
 					loop_max_tokens=self.generation_config.streaming_chunks,
 					start_length=start_length,
 				)
+
+				all_interval_func_flops.append(interval_func_flops)
+				interval_func_flops = sum(all_interval_func_flops) / len(
+					all_interval_func_flops
+				)
+				state.generate_func_flops = generate_func_flops
+				state.interval_func_flops = interval_func_flops
 				yield state
 				if state.is_sequence_finished:
 					break
 		else:
 			yield state
 
-	async def precompile(
+	def _compile_and_lower_funs(self, batch_size: int, input_tokens_length: int):
+		compiled_generate_func, compiled_interval_func = get_compiled_funcs(
+			batch_size=batch_size,
+			input_tokens_length=input_tokens_length,
+			id=self._uuid4,
+		)
+		do_compile = compiled_generate_func is None or compiled_interval_func is None
+		if do_compile:
+			input_ids = jnp.ones((batch_size, input_tokens_length), dtype="i4")
+			attention_mask = jnp.ones_like(input_ids)
+			position_ids = attention_mask.cumsum(axis=-1, dtype="i4") - 1
+
+			compiled_generate_func = smart_compile(
+				_compiled_generate.lower(
+					model=self.model,
+					params=self.params,
+					input_ids=input_ids,
+					attention_mask=attention_mask,
+					position_ids=position_ids,
+					generation_config=self.generation_config,
+					rng=self._rng_generator.rng,
+				),
+				tag="vinference",
+			)
+			state = compiled_generate_func(
+				params=self.params,
+				input_ids=input_ids,
+				attention_mask=attention_mask,
+				position_ids=position_ids,
+				rng=self._rng_generator.rng,
+			)
+			compiled_interval_func = smart_compile(
+				_compiled_interval_generate.lower(
+					model=self.model,
+					params=self.params,
+					state=state,
+					generation_config=self.generation_config,
+					loop_max_tokens=self.generation_config.streaming_chunks,
+					start_length=input_tokens_length,
+				),
+				tag="vinference",
+			)
+			del state
+			put_compiled_funcs(
+				compiled_generate_func=compiled_generate_func,
+				compiled_interval_func=compiled_interval_func,
+				batch_size=batch_size,
+				input_tokens_length=input_tokens_length,
+				id=self._uuid4,
+			)
+
+	async def async_precompile(
+		self,
+		batch_size: int,
+		input_tokens_length: Optional[int] = None,
+	):
+		"""
+		Precompiles the generation functions for a given batch size and input length.
+
+		This function checks if the generation functions have already been compiled for
+		the given configuration. If not, it compiles them asynchronously and stores them
+		in a cache.
+
+		Args:
+			batch_size: The batch size.
+			input_tokens_length: The length of the input tokens.
+
+		Returns:
+			bool: True if precompilation was successful, False otherwise.
+		"""
+		if input_tokens_length is None:
+			input_tokens_length = self.model_prefill_length
+		config_key = (batch_size, input_tokens_length)
+		if config_key in self._precompiled_configs:
+			return True
+		async with self._precompile_lock:
+			if config_key in self._precompiled_configs:
+				return True
+			if config_key in self._in_compiling_process:
+				await asyncio.sleep(5)
+				return await self.async_precompile(
+					batch_size=batch_size,
+					input_tokens_length=input_tokens_length,
+				)
+			else:
+				self._in_compiling_process.add(config_key)
+				self._compile_and_lower_funs(
+					batch_size=batch_size,
+					input_tokens_length=input_tokens_length,
+				)
+				self._precompiled_configs.add(config_key)
+			return True
+
+	def precompile(
 		self,
 		batch_size: int,
 		input_tokens_length: Optional[int] = None,
@@ -639,69 +754,20 @@ class vInference:
 
 		if config_key in self._precompiled_configs:
 			return True
-
-		async with self._precompile_lock:
-			# Check again in case another task completed compilation while we were waiting
-			if config_key in self._precompiled_configs:
-				return True
-
-			compiled_generate_func, compiled_interval_func = get_compiled_funcs(
+		if config_key in self._in_compiling_process:
+			time.sleep(5)
+			return self.precompile(
 				batch_size=batch_size,
 				input_tokens_length=input_tokens_length,
-				id=self._uuid4,
 			)
-
-			do_compile = compiled_generate_func is None or compiled_interval_func is None
-			if do_compile:
-				input_ids = jnp.ones((batch_size, input_tokens_length), dtype="i4")
-				attention_mask = jnp.ones_like(input_ids)
-				position_ids = attention_mask.cumsum(axis=-1, dtype="i4") - 1
-
-				# Run potentially expensive compilation in a thread pool
-				compiled_generate_func = await asyncio.to_thread(
-					lambda: _compiled_generate.lower(
-						model=self.model,
-						params=self.params,
-						input_ids=input_ids,
-						attention_mask=attention_mask,
-						position_ids=position_ids,
-						generation_config=self.generation_config,
-						rng=self._rng_generator.rng,
-					).compile()
-				)
-
-				state = compiled_generate_func(
-					params=self.params,
-					input_ids=input_ids,
-					attention_mask=attention_mask,
-					position_ids=position_ids,
-					rng=self._rng_generator.rng,
-				)
-
-				# Run second compilation in thread pool
-				compiled_interval_func = await asyncio.to_thread(
-					lambda: _compiled_interval_generate.lower(
-						model=self.model,
-						params=self.params,
-						state=state,
-						generation_config=self.generation_config,
-						loop_max_tokens=self.generation_config.streaming_chunks,
-						start_length=input_tokens_length,
-					).compile()
-				)
-				del state
-
-				put_compiled_funcs(
-					compiled_generate_func=compiled_generate_func,
-					compiled_interval_func=compiled_interval_func,
-					batch_size=batch_size,
-					input_tokens_length=input_tokens_length,
-					id=self._uuid4,
-				)
-
-			# Mark this configuration as precompiled
+		else:
+			self._in_compiling_process.add(config_key)
+			self._compile_and_lower_funs(
+				batch_size=batch_size,
+				input_tokens_length=input_tokens_length,
+			)
 			self._precompiled_configs.add(config_key)
-			return True
+		return True
 
 	@overload
 	async def count_tokens(self, messages: List[Dict[str, str]]): ...
