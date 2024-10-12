@@ -30,6 +30,8 @@ class UsageInfo(BaseModel):
 	total_tokens: int = 0
 	tps: float = 0
 	processing_time: float = 0.0
+	first_iter_flops: float = 0.0
+	iter_flops: float = 0.0
 
 
 class ChatCompletionRequest(BaseModel):

@@ -137,19 +137,26 @@ class vInferenceApiServer:
 		)
 
 	def _count_non_padding_tokens(
-		self, sequence, prefiled_length: int, eos_token_id
+		self, sequence, prefiled_length: int, pad_token_id
 	) -> int:
 		"""Count non-padding tokens in the sequence."""
 		relevant_sequence = sequence[prefiled_length:]
-		if isinstance(eos_token_id, (list, tuple)):
-			return sum(token not in eos_token_id for token in relevant_sequence)
-		return sum(token != eos_token_id for token in relevant_sequence)
+		if isinstance(pad_token_id, (list, tuple)):
+			return sum(token not in pad_token_id for token in relevant_sequence)
+		return sum(token != pad_token_id for token in relevant_sequence)
 
 	def _create_usage_info(
-		self, prefiled_length: int, non_padding_tokens: int, processing_time: float
+		self,
+		prefiled_length: int,
+		non_padding_tokens: int,
+		processing_time: float,
+		first_iter_flops: float,
+		iter_flops: float,
 	) -> UsageInfo:
 		"""Create usage information."""
 		return UsageInfo(
+			first_iter_flops=first_iter_flops,
+			iter_flops=iter_flops,
 			prompt_tokens=prefiled_length,
 			completion_tokens=non_padding_tokens,
 			total_tokens=non_padding_tokens + prefiled_length,
@@ -179,7 +186,7 @@ class vInferenceApiServer:
 		non_padding_tokens = self._count_non_padding_tokens(
 			response.sequences[0],
 			inference.model_prefill_length,
-			inference.generation_config.eos_token_id,
+			inference.generation_config.pad_token_id,
 		)
 
 		final_response = inference.tokenizer.decode(
@@ -206,6 +213,8 @@ class vInferenceApiServer:
 				inference.model_prefill_length,
 				non_padding_tokens,
 				processing_time,
+				response.generate_func_flops,
+				response.interval_func_flops,
 			),
 		)
 
@@ -235,7 +244,7 @@ class vInferenceApiServer:
 				non_padding_tokens = self._count_non_padding_tokens(
 					response.sequences[0],
 					inference.model_prefill_length,
-					inference.generation_config.eos_token_id,
+					inference.generation_config.pad_token_id,
 				)
 
 				stream_resp = ChatCompletionStreamResponse(
@@ -250,7 +259,11 @@ class vInferenceApiServer:
 						)
 					],
 					usage=self._create_usage_info(
-						inference.model_prefill_length, non_padding_tokens, processing_time
+						inference.model_prefill_length,
+						non_padding_tokens,
+						processing_time,
+						response.generate_func_flops,
+						response.interval_func_flops,
 					),
 				)
 
@@ -272,6 +285,8 @@ class vInferenceApiServer:
 					inference.model_prefill_length,
 					non_padding_tokens,
 					processing_time,
+					response.generate_func_flops,
+					response.interval_func_flops,
 				),
 			)
 
@@ -319,16 +334,24 @@ class vInferenceApiServer:
 				elif method == "POST":
 					self.app.post(**route_params)(endpoint.handler)
 
-	def fire(
-		self,
-		host="0.0.0.0",
-		port=7680,
-	):
+	def fire(self, host="0.0.0.0", port=7680, log_level="debug"):
 		uvicorn.run(
 			self.app,
 			host=host,
 			port=port,
-			log_level="debug",
+			log_level=log_level,
 			timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
 			loop="uvloop",
 		)
+
+	async def async_fire(self, host="0.0.0.0", port=7680, log_level="debug"):
+		config = uvicorn.Config(
+			self.app,
+			host=host,
+			port=port,
+			log_level=log_level,
+			timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+			loop="uvloop",
+		)
+		server = uvicorn.Server(config)
+		await server.serve()
