@@ -613,9 +613,9 @@ class vInference:
 			rng=self._rng_generator.rng,
 		)
 		state.generate_func_flops = generate_func_flops
-		if not state.is_sequence_finished and self.generation_config._loop_rows - 1 != 0:
+		if not state.is_sequence_finished:
 			all_interval_func_flops = []
-			for _ in range(self.generation_config._loop_rows - 1):
+			for _ in range(self.generation_config._loop_rows):
 				state, flop, interval_func_flops = measure_flops(
 					interval_func,
 					params=self.params,
