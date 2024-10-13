@@ -15,7 +15,6 @@
 """Module for text generation pipeline using JAX/Flax."""
 
 import asyncio
-
 import time
 import warnings
 from datetime import datetime
@@ -39,6 +38,7 @@ from easydel.inference.utils import (
 	inference_step_compiled,
 	vInferenceConfig,
 )
+from easydel.inference.vinference.metrics import vInferenceMetrics
 from easydel.modules.modeling_utils import EDPretrainedModel
 from easydel.utils.compiling_utils import smart_compile
 
@@ -52,7 +52,7 @@ def measure_flops(func, *args, **kwargs):
 	result = func(*args, **kwargs)
 	end_time = time.perf_counter()
 	elapsed_time = end_time - start_time
-	return result, flops, flops / elapsed_time
+	return result, flops, flops / elapsed_time, elapsed_time
 
 
 @partial(jax.jit, static_argnames=["model", "generation_config"])
@@ -131,6 +131,7 @@ def _compiled_generate(
 			max_length=max_length,
 			attention_mask=attention_mask,
 		),
+		generated_tokens=0,
 	)
 
 	def cond_fn(state):
@@ -196,6 +197,7 @@ def _compiled_generate(
 			is_sequence_finished=next_sequence_finished,
 			prng_key=jrand.split(state.prng_key, 2)[0],
 			model_kwargs=next_model_kwargs,
+			generated_tokens=state.generated_tokens + 1,
 		)
 
 	with mesh:
@@ -297,6 +299,7 @@ def _compiled_interval_generate(
 			is_sequence_finished=next_sequence_finished,
 			prng_key=jrand.split(state.prng_key, 2)[0],
 			model_kwargs=next_model_kwargs,
+			generated_tokens=state.generated_tokens + 1,
 		)
 
 	with mesh:
@@ -395,6 +398,7 @@ class vInference:
 		self._validate_token_ids()
 		self._uuid4 = uuid4().hex 
 		self._inference_name = inference_name or self._generate_inference_name(model)
+		self.metrics = vInferenceMetrics(self._inference_name)
 		# fmt:on
 
 	def _generate_inference_name(self, model) -> str:
@@ -582,59 +586,88 @@ class vInference:
 		Yields:
 			SampleState: The generated text in streaming chunks.
 		"""
-		input_ids = jnp.array(input_ids)
-		batch_size, seq_length = input_ids.shape
-		_ = await self.async_precompile(batch_size, seq_length)
-		generate_func, interval_func = get_compiled_funcs(
-			batch_size=batch_size,
-			input_tokens_length=seq_length,
-			id=self._uuid4,
-		)
-		if attention_mask is None:
-			warnings.warn(
-				"`attention_mask` is not provided, it's recommended to "
-				"pass an attention mask for better results.",
-				stacklevel=1,
-			)
-			attention_mask = jnp.ones_like(input_ids)
-
-		if position_ids is None:
-			position_ids = attention_mask.cumsum(axis=-1, dtype="i4") - 1
-
-		attention_mask = jnp.array(attention_mask)
-		start_length = input_ids.shape[-1]
-
-		state, flop, generate_func_flops = measure_flops(
-			generate_func,
-			params=self.params,
-			input_ids=input_ids,
-			attention_mask=attention_mask,
-			position_ids=position_ids,
-			rng=self._rng_generator.rng,
-		)
-		state.generate_func_flops = generate_func_flops
-		if not state.is_sequence_finished:
-			all_interval_func_flops = []
-			for _ in range(self.generation_config._loop_rows):
-				state, flop, interval_func_flops = measure_flops(
-					interval_func,
-					params=self.params,
-					state=state,
-					loop_max_tokens=self.generation_config.streaming_chunks,
-					start_length=start_length,
+		self.metrics.queue_size.labels(model_name=self.metrics.model_name).inc()
+		try:
+			with self.metrics.inference_latency.labels(
+				model_name=self.metrics.model_name,
+				stage="preprocessing",
+			).time():
+				input_ids = jnp.array(input_ids)
+				batch_size, seq_length = input_ids.shape
+				_ = await self.async_precompile(batch_size, seq_length)
+				generate_func, interval_func = get_compiled_funcs(
+					batch_size=batch_size,
+					input_tokens_length=seq_length,
+					id=self._uuid4,
 				)
+				if attention_mask is None:
+					warnings.warn(
+						"`attention_mask` is not provided, it's recommended to "
+						"pass an attention mask for better results.",
+						stacklevel=1,
+					)
+					attention_mask = jnp.ones_like(input_ids)
 
-				all_interval_func_flops.append(interval_func_flops)
-				interval_func_flops = sum(all_interval_func_flops) / len(
-					all_interval_func_flops
+				if position_ids is None:
+					position_ids = attention_mask.cumsum(axis=-1, dtype="i4") - 1
+
+				attention_mask = jnp.array(attention_mask)
+				start_length = input_ids.shape[-1]
+			with self.metrics.inference_latency.labels(
+				model_name=self.metrics.model_name,
+				stage="inference",
+			).time():
+				state, flop, generate_func_flops, generate_func_elapsed_time = measure_flops(
+					generate_func,
+					params=self.params,
+					input_ids=input_ids,
+					attention_mask=attention_mask,
+					position_ids=position_ids,
+					rng=self._rng_generator.rng,
 				)
 				state.generate_func_flops = generate_func_flops
-				state.interval_func_flops = interval_func_flops
-				yield state
-				if state.is_sequence_finished:
-					break
-		else:
-			yield state
+				if not state.is_sequence_finished:
+					all_interval_func_flops = []
+					for _ in range(self.generation_config._loop_rows):
+						state, flop, interval_func_flops, interval_func_elapsed_time = (
+							measure_flops(
+								interval_func,
+								params=self.params,
+								state=state,
+								loop_max_tokens=self.generation_config.streaming_chunks,
+								start_length=start_length,
+							)
+						)
+						all_interval_func_flops.append(interval_func_flops)
+						interval_func_flops = sum(all_interval_func_flops) / len(
+							all_interval_func_flops
+						)
+						state.generate_func_flops = generate_func_flops
+						state.interval_func_flops = interval_func_flops
+						yield state
+						if state.is_sequence_finished:
+							break
+				else:
+					yield state
+			self.metrics.inference_requests.labels(
+				model_name=self.metrics.model_name,
+				status="success",
+			).inc()
+		except Exception as e:
+			self.metrics.inference_requests.labels(
+				model_name=self.metrics.model_name,
+				status="error",
+			).inc()
+			raise e
+		finally:
+			self.metrics.queue_size.labels(model_name=self.metrics.model_name).dec()
+			self.metrics.token_throughput.labels(
+				model_name=self.metrics.model_name,
+				operation="output",
+			).inc(state.generated_tokens)
+			self.metrics.generation_length.labels(
+				model_name=self.metrics.model_name,
+			).observe(state.generated_tokens)
 
 	def _compile_and_lower_funs(self, batch_size: int, input_tokens_length: int):
 		compiled_generate_func, compiled_interval_func = get_compiled_funcs(
@@ -721,12 +754,16 @@ class vInference:
 					input_tokens_length=input_tokens_length,
 				)
 			else:
-				self._in_compiling_process.add(config_key)
-				self._compile_and_lower_funs(
-					batch_size=batch_size,
-					input_tokens_length=input_tokens_length,
-				)
-				self._precompiled_configs.add(config_key)
+				with self.metrics.compilation_time.labels(
+					model_name=self.metrics.model_name,
+					function_name="_compile_and_lower_funs",
+				).time():
+					self._in_compiling_process.add(config_key)
+					self._compile_and_lower_funs(
+						batch_size=batch_size,
+						input_tokens_length=input_tokens_length,
+					)
+					self._precompiled_configs.add(config_key)
 			return True
 
 	def precompile(
@@ -761,12 +798,16 @@ class vInference:
 				input_tokens_length=input_tokens_length,
 			)
 		else:
-			self._in_compiling_process.add(config_key)
-			self._compile_and_lower_funs(
-				batch_size=batch_size,
-				input_tokens_length=input_tokens_length,
-			)
-			self._precompiled_configs.add(config_key)
+			with self.metrics.compilation_time.labels(
+				model_name=self.metrics.model_name,
+				function_name="_compile_and_lower_funs",
+			).time():
+				self._in_compiling_process.add(config_key)
+				self._compile_and_lower_funs(
+					batch_size=batch_size,
+					input_tokens_length=input_tokens_length,
+				)
+				self._precompiled_configs.add(config_key)
 		return True
 
 	@overload

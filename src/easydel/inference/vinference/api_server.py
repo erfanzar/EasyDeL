@@ -136,19 +136,10 @@ class vInferenceApiServer:
 			padding="max_length",
 		)
 
-	def _count_non_padding_tokens(
-		self, sequence, prefiled_length: int, pad_token_id
-	) -> int:
-		"""Count non-padding tokens in the sequence."""
-		relevant_sequence = sequence[prefiled_length:]
-		if isinstance(pad_token_id, (list, tuple)):
-			return sum(token not in pad_token_id for token in relevant_sequence)
-		return sum(token != pad_token_id for token in relevant_sequence)
-
 	def _create_usage_info(
 		self,
 		prefiled_length: int,
-		non_padding_tokens: int,
+		ngenerated_tokens: int,
 		processing_time: float,
 		first_iter_flops: float,
 		iter_flops: float,
@@ -158,9 +149,9 @@ class vInferenceApiServer:
 			first_iter_flops=first_iter_flops,
 			iter_flops=iter_flops,
 			prompt_tokens=prefiled_length,
-			completion_tokens=non_padding_tokens,
-			total_tokens=non_padding_tokens + prefiled_length,
-			tps=non_padding_tokens / processing_time,
+			completion_tokens=ngenerated_tokens,
+			total_tokens=ngenerated_tokens + prefiled_length,
+			tps=ngenerated_tokens / processing_time,
 			processing_time=processing_time,
 		)
 
@@ -171,7 +162,7 @@ class vInferenceApiServer:
 		ids: dict,
 	) -> ChatCompletionResponse:
 		"""Handle non-streaming response generation."""
-		start = time.time()
+		start = time.perf_counter()
 
 		# Generate response
 		async for response in inference.generate(
@@ -180,14 +171,7 @@ class vInferenceApiServer:
 		):
 			pass  # Keep last response
 
-		processing_time = time.time() - start
-
-		# Process response
-		non_padding_tokens = self._count_non_padding_tokens(
-			response.sequences[0],
-			inference.model_prefill_length,
-			inference.generation_config.pad_token_id,
-		)
+		processing_time = time.perf_counter() - start
 
 		final_response = inference.tokenizer.decode(
 			response.sequences[0][inference.model_prefill_length :],
@@ -197,7 +181,7 @@ class vInferenceApiServer:
 		# Determine finish reason
 		finish_reason = (
 			"length"
-			if non_padding_tokens == inference.generation_config.max_new_tokens
+			if response.generated_tokens == inference.generation_config.max_new_tokens
 			else "stop"
 		)
 
@@ -211,7 +195,7 @@ class vInferenceApiServer:
 			],
 			usage=self._create_usage_info(
 				inference.model_prefill_length,
-				non_padding_tokens,
+				response.generated_tokens,
 				processing_time,
 				response.generate_func_flops,
 				response.interval_func_flops,
@@ -227,7 +211,7 @@ class vInferenceApiServer:
 		"""Handle streaming response generation."""
 
 		async def stream_results() -> AsyncGenerator[bytes, None]:
-			start = time.time()
+			start = time.perf_counter()
 			padded_sequence_length = inference.model_prefill_length
 
 			async for response in inference.generate(
@@ -240,12 +224,7 @@ class vInferenceApiServer:
 				)
 				padded_sequence_length += inference.generation_config.streaming_chunks
 
-				processing_time = time.time() - start
-				non_padding_tokens = self._count_non_padding_tokens(
-					response.sequences[0],
-					inference.model_prefill_length,
-					inference.generation_config.pad_token_id,
-				)
+				processing_time = time.perf_counter() - start
 
 				stream_resp = ChatCompletionStreamResponse(
 					model=request.model,
@@ -260,7 +239,7 @@ class vInferenceApiServer:
 					],
 					usage=self._create_usage_info(
 						inference.model_prefill_length,
-						non_padding_tokens,
+						response.generated_tokens,
 						processing_time,
 						response.generate_func_flops,
 						response.interval_func_flops,
@@ -270,7 +249,7 @@ class vInferenceApiServer:
 				yield ("data: " + stream_resp.model_dump_json() + "\n\n").encode("utf-8")
 			finish_reason = (
 				"length"
-				if non_padding_tokens == inference.generation_config.max_new_tokens
+				if response.generated_tokens == inference.generation_config.max_new_tokens
 				else "stop"
 			)
 			stream_resp = ChatCompletionStreamResponse(
@@ -283,7 +262,7 @@ class vInferenceApiServer:
 				],
 				usage=self._create_usage_info(
 					inference.model_prefill_length,
-					non_padding_tokens,
+					response.generated_tokens,
 					processing_time,
 					response.generate_func_flops,
 					response.interval_func_flops,

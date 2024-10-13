@@ -21,7 +21,7 @@ import jax
 import psutil
 
 try:
-	from prometheus_client import Counter, Gauge, Histogram, Info
+	from prometheus_client import Counter, Gauge, Histogram, Info, start_http_server
 except ModuleNotFoundError:
 	Counter, Gauge, Histogram, Info = [None] * 4
 
@@ -31,7 +31,7 @@ class ModelMetadata:
 	batch_size: int
 	sequence_length: int
 	dtype: str
-	device: str
+	platfrom: str
 
 
 class vInferenceMetrics:
@@ -45,17 +45,18 @@ class vInferenceMetrics:
 			["model_name", "status"],
 		)
 
-		# Latency metrics
 		self.inference_latency = Histogram(
-			"model_inference_latency_seconds",
-			"Time spent processing inference requests",
+			"model_inference_latency",
+			"Time spent processing inference request",
 			["model_name", "stage"],  # stages: preprocessing, inference, postprocessing
 			buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
 		)
 
 		# Queue metrics
 		self.queue_size = Gauge(
-			"model_queue_size", "Current number of requests in queue", ["model_name"]
+			"model_queue_size",
+			"Current number of requests in queue",
+			["model_name"],
 		)
 
 		# Memory metrics
@@ -75,14 +76,27 @@ class vInferenceMetrics:
 		self.token_throughput = Counter(
 			"model_token_throughput_total",
 			"Total number of tokens processed",
-			["model_name", "operation"],  # operation: input, output
+			["model_name", "operation"],
 		)
 
 		self.generation_length = Histogram(
 			"model_generation_length",
 			"Distribution of generation lengths",
 			["model_name"],
-			buckets=(10, 32, 64, 128, 256, 512, 1024),
+			buckets=(
+				16,
+				32,
+				64,
+				128,
+				256,
+				512,
+				1024,
+				2048,
+				4096,
+				8192,
+				16384,
+				32768,
+			),
 		)
 
 		# Compilation metrics
@@ -130,7 +144,7 @@ class vInferenceMetrics:
 				"batch_size": str(metadata.batch_size),
 				"sequence_length": str(metadata.sequence_length),
 				"dtype": metadata.dtype,
-				"device": metadata.device,
+				"platfrom": metadata.platfrom,
 			}
 		)
 
@@ -151,31 +165,25 @@ class vInferenceMetrics:
 
 		return decorator
 
-	async def measure_inference(self, func):
+	def measure_inference_first_step(self, func):
 		"""Decorator to measure inference metrics"""
 
-		async def wrapper(*args, **kwargs):
+		def wrapper(*args, **kwargs):
 			# Track queue size
 			self.queue_size.labels(model_name=self.model_name).inc()
 
 			try:
-				# Measure preprocessing time
-				with self.inference_latency.labels(
+				with self.first_step_inference_latency.labels(
 					model_name=self.model_name, stage="preprocessing"
 				).time():
-					# Your preprocessing logic here
 					pass
-
-				# Measure inference time
 				start_time = time.time()
-				result = await func(*args, **kwargs)
+				result = func(*args, **kwargs)
 				inference_time = time.time() - start_time
 
-				self.inference_latency.labels(
+				self.first_step_inference_latency.labels(
 					model_name=self.model_name, stage="inference"
 				).observe(inference_time)
-
-				# Record success
 				self.inference_requests.labels(
 					model_name=self.model_name, status="success"
 				).inc()
@@ -183,7 +191,6 @@ class vInferenceMetrics:
 				return result
 
 			except Exception as e:
-				# Record failure
 				self.inference_requests.labels(model_name=self.model_name, status="error").inc()
 				raise e
 
@@ -192,3 +199,38 @@ class vInferenceMetrics:
 				gc.collect()
 
 		return wrapper
+
+	def measure_inference_afterward(self, func):
+		"""Decorator to measure inference metrics"""
+
+		def wrapper(*args, **kwargs):
+			self.queue_size.labels(model_name=self.model_name).inc()
+			try:
+				with self.afterward_inference_latency.labels(
+					model_name=self.model_name, stage="preprocessing"
+				).time():
+					pass
+				start_time = time.time()
+				result = func(*args, **kwargs)
+				inference_time = time.time() - start_time
+				self.afterward_inference_latency.labels(
+					model_name=self.model_name, stage="inference"
+				).observe(inference_time)
+				return result
+			except Exception as e:
+				self.inference_requests.labels(model_name=self.model_name, status="error").inc()
+				raise e
+
+			finally:
+				self.queue_size.labels(model_name=self.model_name).dec()
+				gc.collect()
+
+		return wrapper
+
+
+if __name__ == "__main__":
+	metrics = vInferenceMetrics("test")
+	start_http_server(7860)
+	while True:
+		# Continuously update or collect metrics
+		pass

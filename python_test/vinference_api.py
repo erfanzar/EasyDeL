@@ -14,6 +14,7 @@ from jax import numpy as jnp
 from transformers import AutoTokenizer
 import torch
 import easydel as ed
+from prometheus_client import start_http_server
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
@@ -38,7 +39,6 @@ async def main():
 			block_q=32,
 			block_k=128,
 			attn_mechanism=ed.AttentionMechanisms.flash_attn2,
-			quantize_kv_cache=True,
 		),
 		quantization_method="8bit",
 		platform="triton",
@@ -68,6 +68,7 @@ async def main():
 
 	await inference.async_precompile(1)
 	print(inference.inference_name)
+	start_http_server(7681)
 	await ed.vInferenceApiServer({inference.inference_name: inference}).async_fire()
 
 
