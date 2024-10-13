@@ -287,6 +287,7 @@ class SampleState:
 	# vInference Ops
 	generate_func_flops: Optional[float] = float("-inf")
 	interval_func_flops: Optional[float] = float("-inf")
+	generated_tokens: Optional[int] = 0
 
 	def tree_flatten(self):
 		return (
@@ -298,6 +299,7 @@ class SampleState:
 			self.model_kwargs,
 			self.generate_func_flops,
 			self.interval_func_flops,
+			self.generated_tokens,
 		), {}
 
 	@classmethod
