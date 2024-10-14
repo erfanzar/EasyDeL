@@ -20,7 +20,7 @@ from typing import AsyncGenerator, Callable, Dict, Optional
 import uvicorn
 from fastapi import APIRouter, FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
-
+from prometheus_client import start_http_server
 from easydel.etils.etils import get_logger
 from easydel.inference.vinference.api_models import (
 	ChatCompletionRequest,
@@ -313,7 +313,14 @@ class vInferenceApiServer:
 				elif method == "POST":
 					self.app.post(**route_params)(endpoint.handler)
 
-	def fire(self, host="0.0.0.0", port=7680, log_level="debug"):
+	def fire(
+		self,
+		host="0.0.0.0",
+		port=7860,
+		metrics_port: int = 7861,
+		log_level="debug",
+	):
+		start_http_server(metrics_port)
 		uvicorn.run(
 			self.app,
 			host=host,
@@ -323,7 +330,14 @@ class vInferenceApiServer:
 			loop="uvloop",
 		)
 
-	async def async_fire(self, host="0.0.0.0", port=7680, log_level="debug"):
+	async def async_fire(
+		self,
+		host="0.0.0.0",
+		port=7860,
+		metrics_port: int = 7861,
+		log_level="debug",
+	):
+		start_http_server(metrics_port)
 		config = uvicorn.Config(
 			self.app,
 			host=host,
