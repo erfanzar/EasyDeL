@@ -1151,7 +1151,7 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 				path = [p for p in path[0].key]
 				for field in quantization_fields:
 					if field in path:
-						return Array8Bit.quantize(array, dtype=array.dtype)
+						return Array8Bit.quantize(array, qk=64)
 				return array
 
 			return unflatten_dict(
@@ -1329,6 +1329,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 		config_kwargs: Optional[dict[str, Any]] = None,
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
 		quantization_method: Optional[Literal["nf4", "8bit"]] = None,
+		quantization_platform: Optional[Literal["jax", "triton", "pallas"]] = "jax",
 		backend: Optional[Literal["cpu", "gpu", "tpu"]] = None,
 		platform: Optional[Literal["jax", "triton", "pallas"]] = "jax",
 		bit_targeted_params: Optional[List[str]] = None,
@@ -1637,6 +1638,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 			quantizer = EasyQuantizer(
 				quantization_method=quantization_method,
 				block_size=quantization_block_size,
+				quantization_platform=quantization_platform,
 			)
 			pbar = tqdm(list(state.keys()))
 			for key_tuple in pbar:
@@ -1647,7 +1649,8 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 				):
 					state[key_tuple] = quantizer(array=state[key_tuple])
 					pbar.set_description(
-						f"Quantizing {'.'.join(key_tuple)} ({quantization_method})"
+						f"Quantizing {state[key_tuple].shape} "
+						f"({quantization_method} | {quantization_platform})"
 					)
 		return model, unflatten_dict(state)
 

@@ -9,7 +9,7 @@ license = { text = "Apache-2.0" }
 dependencies = [
     "jax>=0.4.33",
     "jaxlib>=0.4.33",
-    "fjformer==0.0.82",
+    "fjformer==0.0.83",
     "transformers>=4.40.0",
     "optax~=0.2.2",
     "tensorflow~=2.17.0",

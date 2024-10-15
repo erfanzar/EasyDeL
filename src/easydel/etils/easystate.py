@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -765,7 +764,7 @@ class EasyDeLState(struct.PyTreeNode):
 				path = [p for p in path[0].key]
 				for field in quantization_fields:
 					if field in path:
-						return Array8Bit.quantize(array, dtype=array.dtype)
+						return Array8Bit.quantize(array, qk=64)
 				return array
 
 			return traverse_util.unflatten_dict(

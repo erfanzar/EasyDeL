@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -115,10 +114,9 @@ def process_tensor(
 	if uses_tie_word_embedding and lm_head_name:
 		if key_tuple[0] == lm_head_name:
 			return None
-
 	# Convert tensor to JAX array
 	if hasattr(tensor, "cpu"):  # Check if it's a PyTorch tensor
-		array = jnp.array(tensor.cpu().detach().numpy()).astype(dtype)
+		array = jnp.asarray(tensor.cpu().detach().numpy()).astype(dtype)
 	else:  # Assume it's already a numpy array
 		array = jnp.array(tensor).astype(dtype)
 
@@ -133,6 +131,7 @@ def torch_dict_to_easydel_params(
 	layer_norm_names: Optional[List[str]] = None,
 	shard_fns: Optional[Mapping[tuple, Callable]] = None,
 	quantization_method: Optional[Literal["nf4", "8bit"]] = None,
+	quantization_platform: Optional[Literal["jax", "triton", "pallas"]] = "jax",
 	block_size: int = 64,
 	params_pattern_selection: Optional[re.Pattern] = None,
 	dtype: jax.numpy.dtype = jax.numpy.float16,
@@ -156,7 +155,8 @@ def torch_dict_to_easydel_params(
 	    layer_norm_names: Replaces weight or kernel with (scale)
 	    shard_fns: Optional[Mapping[tuple, Callable]]: Sharding Function to be used to shard model
 	    quantization_method (Literal["nf4", "8bit"], optional): quantization_method to be used to quantize model weights. Defaults to None.
-	    block_size (int): blocksize for nf4 quantization.
+	    quantization_platform (Optional[Literal["jax", "triton", "pallas"]], optional): Platform to use for the weight quants. Defaults to None.
+			block_size (int): blocksize for nf4 quantization.
 	    params_pattern_selection: Optional[re.Pattern]: patter to use to find the parameters of the model which will
 	    dtype: jax.numpy.dtype: Specify the data type of the tensors
 	    rnn_based_or_rwkv: bool: rnn_based_or_rwkv is a conditioner  which decide whenever it finds a value in tree
@@ -189,6 +189,7 @@ def torch_dict_to_easydel_params(
 		quantizer = EasyQuantizer(
 			quantization_method=quantization_method,
 			block_size=block_size,
+			quantization_platform=quantization_platform,
 		)
 	device = device or jax.devices()[0]
 

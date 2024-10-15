@@ -599,12 +599,20 @@ class FlaxAttentionModule(nn.Module):
 			cached_key = self.variable(
 				"cache",
 				"cached_key",
-				lambda: Array8Bit.quantize(jnp.zeros(key.shape, dtype=key.dtype)),
+				lambda: Array8Bit.quantize(
+					jnp.zeros(key.shape, dtype=key.dtype),
+					qk=64,
+					platform="jax",
+				),
 			)
 			cached_value = self.variable(
 				"cache",
 				"cached_value",
-				lambda: Array8Bit.quantize(jnp.zeros(value.shape, dtype=value.dtype)),
+				lambda: Array8Bit.quantize(
+					jnp.zeros(value.shape, dtype=value.dtype),
+					qk=64,
+					platform="jax",
+				),
 			)
 			cache_index = self.variable(
 				"cache",
@@ -727,8 +735,8 @@ class FlaxAttentionModule(nn.Module):
 				)
 				attention_mask = combine_masks(pad_mask, attention_mask)
 			if do_quantize_kv_cache:
-				cached_key.value = Array8Bit.quantize(key)
-				cached_value.value = Array8Bit.quantize(value)
+				cached_key.value = Array8Bit.quantize(key, qk=64, platform="jax")
+				cached_value.value = Array8Bit.quantize(value, qk=64, platform="jax")
 			else:
 				cached_key.value = key
 				cached_value.value = value
