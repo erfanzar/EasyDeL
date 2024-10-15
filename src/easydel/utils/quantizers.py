@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Literal
+from typing import Literal,Optional
 
 import chex
-from fjformer.dtypes import Array8Bit, ArrayNF4
-from git import Optional
+from fjformer.dtypes import Array8Bit, ArrayNF4 
 
 DEFAULT_QUANTIZATION_PATTERN = (
 	"(wo|wq|wk|wv|q_proj|k_proj|v_proj|o_proj|w1|w2|w3|"
