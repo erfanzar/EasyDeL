@@ -21,7 +21,7 @@ PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
 async def main():
 	sharding_axis_dims = (1, 1, 1, -1)
-	max_length = 6144
+	max_length = 4096
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
 	dtype = jnp.float16
 	partition_axis = ed.PartitionAxis()
@@ -39,8 +39,10 @@ async def main():
 			block_q=32,
 			block_k=128,
 			attn_mechanism=ed.AttentionMechanisms.flash_attn2,
+			quantize_kv_cache=True,
 		),
 		quantization_method="8bit",
+		quantization_platform="jax",
 		platform="triton",
 		partition_axis=partition_axis,
 		param_dtype=dtype,
@@ -62,7 +64,7 @@ async def main():
 			top_p=model.generation_config.top_p,
 			top_k=model.generation_config.top_k,
 			eos_token_id=model.generation_config.eos_token_id,
-			streaming_chunks=64,
+			streaming_chunks=18,
 		),
 	)
 

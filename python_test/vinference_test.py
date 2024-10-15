@@ -1,14 +1,14 @@
+import asyncio
 import os
 import sys
 
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
-os.environ["EASYDEL_AUTO"] = "true"
+os.environ["EASYDEL_AUTO"] = "1"
 # os.environ["EKERNEL_OPS"] = "true"
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../src"))
 
 
-import asyncio
 import os
 import time
 
@@ -27,7 +27,7 @@ async def main():
 	max_length = 6144
 	num_devices = len(jax.devices())
 	input_shape = (num_devices, max_length)
-	pretrained_model_name_or_path = "meta-llama/Llama-3.2-3B-Instruct"
+	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
 	dtype = jnp.float16
 	partition_axis = ed.PartitionAxis()
 	model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
@@ -45,6 +45,8 @@ async def main():
 			block_k=128,
 			attn_mechanism=ed.AttentionMechanisms.flash_attn2,
 		),
+		# quantization_method="8bit",
+		quantization_platform="jax",
 		platform="triton",
 		partition_axis=partition_axis,
 		param_dtype=dtype,
@@ -68,7 +70,7 @@ async def main():
 			streaming_chunks=32,
 		),
 	)
-	await inference.precompile(1)
+	await inference.async_precompile(1)
 	print(inference.inference_name)
 	conversation = []
 	while True:
@@ -111,7 +113,7 @@ async def main():
 			skip_special_tokens=True,
 		)
 		conversation.append({"role": "user", "content": final_response})
-		print(await inference.count_tokens(conversation))
+		print(inference.count_tokens(conversation))
 		print(
 			"TPS :",
 			sum(response.sequences[0][input_ids.shape[-1] :] != tokenizer.eos_token_id)
@@ -120,4 +122,4 @@ async def main():
 
 
 if __name__ == "__main__":
-	asyncio.run(main=main())
+	asyncio.run(main())

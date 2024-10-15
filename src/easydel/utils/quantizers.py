@@ -16,6 +16,7 @@ from typing import Literal
 
 import chex
 from fjformer.dtypes import Array8Bit, ArrayNF4
+from git import Optional
 
 DEFAULT_QUANTIZATION_PATTERN = (
 	"(wo|wq|wk|wv|q_proj|k_proj|v_proj|o_proj|w1|w2|w3|"
@@ -28,15 +29,21 @@ class EasyQuantizer:
 	def __init__(
 		self,
 		quantization_method: Literal["nf4", "8bit"] = "nf4",
+		quantization_platform: Optional[Literal["jax", "triton", "pallas"]] = "jax",
 		**kwargs,
 	) -> None:
 		self.scalar_block_size = 32
 		self.block_size = 128
 		self.quantization_method = quantization_method
+		self.quantization_platform = quantization_platform
 
 	def __call__(self, array) -> chex.Array:
 		if self.quantization_method == "8bit":
-			return Array8Bit.quantize(array=array)
+			return Array8Bit.quantize(
+				array=array,
+				platform=self.quantization_platform,
+				q8=64,
+			)
 		elif self.quantization_method == "nf4":
 			should_be_quantized = True
 			if array.shape[0] % 128 != 0:

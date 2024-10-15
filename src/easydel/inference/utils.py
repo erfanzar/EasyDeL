@@ -17,6 +17,8 @@ from functools import partial
 from typing import Dict, Optional, Union, List
 
 import jax
+import jax.experimental
+import jax.experimental.pallas
 import jax.random
 from jax import numpy as jnp
 from jax import random, sharding
@@ -25,7 +27,7 @@ from easydel.generation.logits_process import (
 	FlaxTemperatureLogitsWarper,
 	FlaxTopKLogitsWarper,
 	FlaxTopPLogitsWarper,
-)
+) 
 
 
 @jax.tree_util.register_pytree_node_class
@@ -45,8 +47,9 @@ class vInferenceConfig:
 
 	def __post_init__(self):
 		if isinstance(self.max_new_tokens, int):
-			assert self.max_new_tokens % self.streaming_chunks == 0
-			self._loop_rows = self.max_new_tokens // self.streaming_chunks
+			self._loop_rows = (
+				self.max_new_tokens + self.streaming_chunks - 1
+			) // self.streaming_chunks
 
 	def tree_flatten(self):
 		return (
