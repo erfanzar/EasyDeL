@@ -1,7 +1,7 @@
-serve_engine.serve package
+vinference.metrics package
 ==========================
 
-.. automodule:: easydel.inference.serve_engine.serve
+.. automodule:: easydel.inference.vinference.metrics
     :members:
     :undoc-members:
     :show-inheritance:
