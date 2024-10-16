@@ -1,7 +1,7 @@
-serve_engine.client package
+tpu_ops.pallas_gemm package
 ===========================
 
-.. automodule:: easydel.inference.serve_engine.client
+.. automodule:: easydel.kernels.tpu_ops.pallas_gemm
     :members:
     :undoc-members:
     :show-inheritance:
