@@ -25,15 +25,19 @@ from easydel.trainers.odds_ratio_preference_optimization_trainer import (
 	ORPOTrainer,
 	ORPOTrainerOutput,
 )
+from easydel.trainers.sequence_classification_trainer import (
+	SequenceClassificationTrainer,
+	SequenceClassificationTrainerOutput,
+)
 from easydel.trainers.supervised_fine_tuning_trainer import SFTTrainer
 from easydel.trainers.training_configurations import LoraRaptureConfig, TrainArguments
 from easydel.trainers.utils import (
 	JaxDistributedConfig,
 	conversations_formatting_function,
 	create_constant_length_dataset,
+	create_prompt_creator,
 	get_formatting_func_from_dataset,
 	instructions_formatting_function,
-	create_prompt_creator,
 )
 from easydel.trainers.vision_causal_language_model_trainer import (
 	VisionCausalLanguageModelTrainer,

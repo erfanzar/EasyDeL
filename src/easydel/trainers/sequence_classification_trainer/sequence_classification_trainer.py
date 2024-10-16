@@ -119,7 +119,7 @@ class SequenceClassificationTrainer(BaseTrainer):
 				if key == "labels":
 					# Handle labels separately - no padding needed for classification
 					sequences = [jnp.array(f[key]) for f in batch]
-					results[key] = jnp.stack(sequences)
+					results[key] = jnp.stack(sequences).reshape(-1, 1)
 					continue
 
 				# Process input sequences
@@ -554,17 +554,20 @@ class SequenceClassificationTrainer(BaseTrainer):
 		for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
 			try:
 				batch = self._get_next_batch(train_iter)
-
 				if self._should_skip_step(current_step):
 					pbar.update(1)
 					continue
 				step_metrics.start_step()
-
-				# Execute training step
-				sharded_state, loss, metrics = self._execute_train_step(sharded_state, batch)
+			except (KeyboardInterrupt, EasyDeLTimerError) as exect:
+				return sharded_state, current_step, exect
+			# Execute training step
+			try:
+				sharded_state, loss, metrics, run_exception = self._execute_train_step(
+					sharded_state, batch
+				)
 				# Update and log metrics
 				mean_loss, mean_accuracy = metrics_tracker.update(
-					loss, metrics["accuracy"], current_step
+					loss, metrics.get("accuracy", None), current_step
 				)
 
 				train_metrics = step_metrics.calculate(
@@ -598,8 +601,10 @@ class SequenceClassificationTrainer(BaseTrainer):
 
 				current_step += 1
 
-			except (KeyboardInterrupt, EasyDeLTimerError) as run_exception:
-				return sharded_state, current_step, run_exception
+			except (KeyboardInterrupt, EasyDeLTimerError) as exect:
+				return sharded_state, current_step, exect
+			if run_exception is not None:
+				break
 		return sharded_state, current_step, run_exception
 
 	def _eval_epoch(
@@ -617,9 +622,10 @@ class SequenceClassificationTrainer(BaseTrainer):
 			try:
 				batch = self._get_next_batch(eval_iter)
 				step_metrics.start_step()
-				loss, metrics = self._execute_eval_step(sharded_state, batch)
+				metrics = self._execute_eval_step(sharded_state, batch)
+				loss = metrics.pop("loss", 1e9)
 				mean_loss, mean_accuracy = metrics_tracker.update(
-					loss, metrics["accuracy"], current_step
+					loss, metrics.get("accuracy", None), current_step
 				)
 				eval_metrics = step_metrics.calculate(
 					loss=loss,
@@ -647,40 +653,41 @@ class SequenceClassificationTrainer(BaseTrainer):
 
 	def _execute_eval_step(self, state, batch):
 		"""Execute a single eval step."""
-		loss, accuracy, aux_loss = self.sharded_eval_step_function(state, batch)
-		return loss, dict(loss=loss, accuracy=accuracy, aux_loss=aux_loss)
+		metrics = self.sharded_eval_step_function(state, batch)
+		return metrics
 
 	def _execute_train_step(self, state, batch):
 		"""Execute a single training step."""
 		# Apply pre-forward updates (e.g., pruning)
-		if self.pruning_module is not None:
-			state = state.replace(
-				params=self.pruning_module.pre_forward_update(
-					state.params,
-					state.opt_state,
+		try:
+			if self.pruning_module is not None:
+				state = state.replace(
+					params=self.pruning_module.pre_forward_update(
+						state.params,
+						state.opt_state,
+					)
 				)
-			)
 
-		# Forward and backward pass
-		state, loss, metrics = self.sharded_train_step_function(state, batch)
+			state, loss, metrics = self.sharded_train_step_function(state, batch)
 
-		# Apply post-gradient updates
-		if self.pruning_module is not None:
-			state = state.replace(
-				params=self.pruning_module.post_gradient_update(
-					state.params,
-					state.opt_state,
+			if self.pruning_module is not None:
+				state = state.replace(
+					params=self.pruning_module.post_gradient_update(
+						state.params,
+						state.opt_state,
+					)
 				)
-			)
+			if self.arguments.log_grad_norms:
+				metrics.update(
+					{
+						"train/max_grad_norm": metrics["max_grad_norm"].tolist(),
+						"train/mean_grad_norm": metrics["mean_grad_norm"].tolist(),
+					}
+				)
 
-		if self.arguments.log_grad_norms:
-			metrics.update(
-				{
-					"train/max_grad_norm": metrics["max_grad_norm"].tolist(),
-					"train/mean_grad_norm": metrics["mean_grad_norm"].tolist(),
-				}
-			)
-		return state, loss, metrics
+			return state, loss, metrics, None
+		except (KeyboardInterrupt, EasyDeLTimerError) as run_exception:
+			return state, loss, metrics, run_exception
 
 	def _finalize_training(self, output, run_exception):
 		"""Finalize training and prepare output."""

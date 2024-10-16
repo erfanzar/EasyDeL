@@ -1093,7 +1093,6 @@ class StepMetrics:
 
 		basic_metrics = {
 			"loss": loss.tolist(),
-			"accuracy": metrics["accuracy"],
 			"learning_rate": self.arguments.learning_rate,
 			"step": current_step,
 			"step_time": step_time,
@@ -1104,6 +1103,13 @@ class StepMetrics:
 			"total_time": total_time,
 			**extras,
 		}
+
+		basic_metrics.update({"accuracy": metrics.get("accuracy", 0.0)})
+
+		if metrics.get("mae", None) is not None:
+			basic_metrics.update({"mae": metrics.get("mae", 0.0)})
+		if metrics.get("mse", None) is not None:
+			basic_metrics.update({"mse": metrics.get("mse", 0.0)})
 
 		if not self.arguments.performance_mode and (mode == "train" or mode is None):
 			detailed_metrics = self._calculate_detailed_metrics(metrics)
@@ -1116,7 +1122,7 @@ class StepMetrics:
 		"""Calculate additional detailed metrics."""
 		detailed_metrics = {}
 
-		if self.arguments.log_grad_norms:
+		if self.arguments.log_grad_norms and metrics.get("grad_norms", None) is not None:
 			detailed_metrics.update(
 				{
 					"train/max_grad_norm": metrics.get(
@@ -1152,12 +1158,14 @@ class MetricsTracker:
 		"""Update tracked metrics with new values."""
 		with jax.spmd_mode("allow_all"):
 			self.loss_sum = loss if self.loss_sum is None else self.loss_sum + loss
+			if accuracy is None:
+				accuracy = 0.0
 			self.accuracy_sum = (
 				accuracy if self.accuracy_sum is None else self.accuracy_sum + accuracy
 			)
 
-			mean_loss = self.loss_sum / (step + 1 - self.step_offset)
-			mean_accuracy = self.accuracy_sum / (step + 1 - self.step_offset)
+			mean_loss = int(self.loss_sum) / (step + 1 - self.step_offset)
+			mean_accuracy = int(self.accuracy_sum) / (step + 1 - self.step_offset)
 
 			return mean_loss, mean_accuracy
 

@@ -97,7 +97,7 @@ class FlaxLlamaAttention(FlaxAttentionModule):
 		)
 
 		if self.num_key_value_groups == 1:
-			assert self.config.num_attention_heads == self.config.num_key_value_heads 
+			assert self.config.num_attention_heads == self.config.num_key_value_heads
 		self.q_proj = Dense(
 			config.num_attention_heads * self.head_dim,
 			dtype=self.dtype,
@@ -1226,7 +1226,7 @@ class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
 
 
 class FlaxLlamaForSequenceClassificationModule(nn.Module):
-	num_classes: int
+	num_labels: int
 	config: LlamaConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
@@ -1243,8 +1243,8 @@ class FlaxLlamaForSequenceClassificationModule(nn.Module):
 		    A tuple of the model and the classifier
 		"""
 		self.model = FlaxLlamaModule(self.config, dtype=self.dtype)
-		self.classifier = Dense(
-			self.num_classes,
+		self.score = Dense(
+			self.num_labels,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			use_bias=False,
@@ -1308,7 +1308,7 @@ class FlaxLlamaForSequenceClassificationModule(nn.Module):
 		)
 
 		hidden_states = outputs[0]
-		prediction = self.classifier(hidden_states)
+		prediction = self.score(hidden_states)
 		if return_dict:
 			return FlaxSequenceClassifierOutput(
 				logits=prediction,
