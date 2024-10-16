@@ -59,8 +59,8 @@ from easydel.inference.generation_pipeline import (
 from easydel.inference.server import ApiEngine, engine_client
 from easydel.inference.vinference import (
 	vInference,
-	vInferenceConfig,
 	vInferenceApiServer,
+	vInferenceConfig,
 )
 from easydel.modules.arctic import (
 	ArcticConfig,
@@ -341,6 +341,8 @@ from easydel.trainers import (
 	LoraRaptureConfig,
 	ORPOTrainer,
 	ORPOTrainerOutput,
+	SequenceClassificationTrainer,
+	SequenceClassificationTrainerOutput,
 	SFTTrainer,
 	TrainArguments,
 	VisionCausalLanguageModelTrainer,
