@@ -4,7 +4,13 @@ Inference
 .. toctree::
    :maxdepth: 2
 
-   inference.generation_pipeline.utils
+   inference.vinference.metrics
+   inference.vinference.api_server_test
+   inference.vinference.api_server
+   inference.vinference.vinference
+   inference.vinference.api_id_generator
+   inference.vinference.api_models
+   inference.utils
    inference.generation_pipeline.pipeline
-   inference.serve_engine.client
-   inference.serve_engine.serve
+   inference.server.serve
+   inference.server.client

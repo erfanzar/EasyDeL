@@ -1,7 +1,7 @@
-_ring_attention package
+mistral.kernels package
 =======================
 
-.. automodule:: easydel.modules._ring_attention
+.. automodule:: easydel.modules.mistral.kernels
     :members:
     :undoc-members:
     :show-inheritance:
