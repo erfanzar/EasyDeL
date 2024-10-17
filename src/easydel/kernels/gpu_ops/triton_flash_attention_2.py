@@ -1097,15 +1097,15 @@ def _test_backward():
 		else None
 	)
 
-	# try:
-	co = jax.grad(lambda *x: _flash_attn2(*x, None, blocksize_q, blocksize_k).sum())(
-		q, k, v, b
-	)
-	# print("Custom op backward pass gradients:")
-	print(co[-1][-1, -1, :5])  # Print last 5 elements of last head of last batch
-	# except Exception as er:
-	# 	print(f"Custom op backward pass failed: {er}")
-	# 	co = None
+	try:
+		co = jax.grad(lambda *x: _flash_attn2(*x, None, blocksize_q, blocksize_k).sum())(
+			q, k, v, b
+		)
+		# print("Custom op backward pass gradients:")
+		print(co[-1][-1, -1, :5])  # Print last 5 elements of last head of last batch
+	except Exception as er:
+		print(f"Custom op backward pass failed: {er}")
+		co = None
 
 	try:
 		fo = jax.grad(lambda *x: flax.linen.attention.dot_product_attention(*x).sum())(
