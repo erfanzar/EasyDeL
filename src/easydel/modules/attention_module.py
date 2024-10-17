@@ -252,7 +252,7 @@ class FlexibleAttentionModule(object):
 		set_attrs_smartly_with_prp(self, "precision", lax.Precision("fastest"), precision)  # DON'T READ FROM CONFIG
 		set_attrs_smartly_with_prp(self, "force_float32_tpu", True, force_float32_tpu)  # DON'T READ FROM CONFIG
 		set_attrs_smartly_with_prp(self, "axis_name", "sp", axis_name, base_config, "attention_axis_name")  # DON'T READ FROM CONFIG
-		set_attrs_smartly_with_prp(self, "backend", ..., backend, base_config, "backend") 
+		set_attrs_smartly_with_prp(self, "backend", jax.default_backend(), backend, base_config, "backend") 
 		set_attrs_smartly_with_prp(self, "platform", ..., platform, base_config, "platform") 
 
 		self.mesh = mesh
