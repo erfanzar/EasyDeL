@@ -1126,7 +1126,7 @@ def _test_backward():
 
 
 _configs = []
-for q_b in [64]:
+for q_b in [64, 128]:
 	for k_b in [64, 128]:
 		_configs.append(
 			triton.testing.Benchmark(
@@ -1136,12 +1136,12 @@ for q_b in [64]:
 				line_vals=["triton", "jax"],
 				line_names=["Triton", "Jax"],
 				styles=[("green", "-"), ("blue", "-.")],
-				ylabel="TFLOPS",
+				ylabel="MS",
 				plot_name=f"H32-B1-HD128-BT-QB{q_b}-kB{k_b}",
 				args={
-					"H": 16,
+					"H": 32,
 					"BATCH": 1,
-					"HEAD_DIM": 256,
+					"HEAD_DIM": 128,
 					"mode": "FWD",
 					"BIAS": True,
 					"blocksize_k": k_b,
@@ -1210,8 +1210,9 @@ def _fwd_benchmark(
 		flops += batch_size * num_heads * seq_length * seq_length * head_dim
 		return flops
 
-	total_flops = calculate_attention_flops(BATCH, seqlen, H, HEAD_DIM)
-	return (total_flops / 1e12) / ms
+	# total_flops = calculate_attention_flops(BATCH, seqlen, H, HEAD_DIM)
+	# return (total_flops / 1e12) / ms
+	return ms
 
 
 triton_flash_attn_2_gpu = _flash_attn2
@@ -1219,5 +1220,5 @@ __all__ = ["triton_flash_attn_2_gpu"]
 
 if __name__ == "__main__":
 	# _test_forward()
-	_test_backward()
-	# _fwd_benchmark.run(save_path=".", print_data=True)
+	# _test_backward()
+	_fwd_benchmark.run(save_path=".", print_data=True)
