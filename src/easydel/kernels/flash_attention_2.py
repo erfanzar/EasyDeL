@@ -85,37 +85,40 @@ def flash_attention2(
 					)
 				case "jax":
 					return jax_flash_attn_2_mu(
-						query_state=query,
-						key_state=key,
-						value_state=value,
+						query_state=query.transpose(0, 2, 1, 3),
+						key_state=key.transpose(0, 2, 1, 3),
+						value_state=value.transpose(0, 2, 1, 3),
 						mask=None,
 						bias=bias,
-						q_block=blocksize_q,
-						k_block=blocksize_k,
+						blocksize_q=blocksize_q,
+						blocksize_k=blocksize_k,
+						dtype=query.dtype,
 					)
 		case "cpu":
 			match platform:
 				case "jax":
 					return jax_flash_attn_2_mu(
-						query_state=query,
-						key_state=key,
-						value_state=value,
+						query_state=query.transpose(0, 2, 1, 3),
+						key_state=key.transpose(0, 2, 1, 3),
+						value_state=value.transpose(0, 2, 1, 3),
 						mask=None,
 						bias=bias,
-						q_block=blocksize_q,
-						k_block=blocksize_k,
+						blocksize_q=blocksize_q,
+						blocksize_k=blocksize_k,
+						dtype=query.dtype,
 					)
 		case "tpu":
 			match platform:
 				case "jax":
 					return jax_flash_attn_2_mu(
-						query_state=query,
-						key_state=key,
-						value_state=value,
+						query_state=query.transpose(0, 2, 1, 3),
+						key_state=key.transpose(0, 2, 1, 3),
+						value_state=value.transpose(0, 2, 1, 3),
 						mask=None,
 						bias=bias,
-						q_block=blocksize_q,
-						k_block=blocksize_k,
+						blocksize_q=blocksize_q,
+						blocksize_k=blocksize_k,
+						dtype=query.dtype,
 					)
 				case "pallas":
 					return pallas_flash_attention_tpu(

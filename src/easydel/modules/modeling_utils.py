@@ -200,7 +200,9 @@ class EDPretrainedConfig(PretrainedConfig):
 		self.platform = getattr(
 			self,
 			"platform",
-			platform if platform is not None else "jax",
+			platform
+			if platform is not None
+			else ("triton" if jax.default_backend() == "gpu" else "jax"),
 		)
 		self.easy_method = getattr(
 			self,
