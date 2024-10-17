@@ -175,7 +175,7 @@ def attention_production(
 	value_states: jax.Array,
 	attention_bias: jax.Array | None = None,
 	deterministic: bool = True,
-	dropout_rng: jax.random.PRNGKey = jax.random.PRNGKey(0),
+	dropout_rng: jax.random.PRNGKey = jax.random.PRNGKey(0),  # noqa
 	dropout_rate: float = 0.0,
 ):
 	batch, q_sequence_length, q_num_head, head_dim = query_states.shape
@@ -200,9 +200,7 @@ def attention_production(
 	attention_weights = jax.nn.softmax(attention_score).astype(query_states.dtype)
 	if not deterministic and dropout_rate > 0.0:
 		keep_prob = 1.0 - dropout_rate
-		dropout_shape = (
-			tuple([1] * (key_states.ndim - 2)) + attention_weights.shape[-2:]
-		)
+		dropout_shape = tuple([1] * (key_states.ndim - 2)) + attention_weights.shape[-2:]
 		keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
 		multiplier = keep.astype(query_states.dtype) / jnp.asarray(
 			keep_prob, dtype=query_states.dtype
@@ -221,7 +219,7 @@ def static_sharded_attention_production(
 	value_states: jax.Array,
 	attention_bias: jax.Array | None = None,
 	deterministic: bool = True,
-	dropout_rng: jax.random.PRNGKey = jax.random.PRNGKey(0),
+	dropout_rng: jax.random.PRNGKey = jax.random.PRNGKey(0),  # noqa
 	dropout_rate: float = 0.0,
 ):
 	assert (
@@ -274,9 +272,7 @@ def static_sharded_attention_production(
 	attention_weights = jax.nn.softmax(attention_score).astype(query_states.dtype)
 	if not deterministic and dropout_rate > 0.0:
 		keep_prob = 1.0 - dropout_rate
-		dropout_shape = (
-			tuple([1] * (key_states.ndim - 2)) + attention_weights.shape[-2:]
-		)
+		dropout_shape = tuple([1] * (key_states.ndim - 2)) + attention_weights.shape[-2:]
 		keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
 		multiplier = keep.astype(query_states.dtype) / jnp.asarray(
 			keep_prob, dtype=query_states.dtype
@@ -363,9 +359,7 @@ def static_sharded_dot_product_attention(
 	if not deterministic and dropout_rate > 0.0:
 		keep_prob = 1.0 - dropout_rate
 		if broadcast_dropout:
-			dropout_shape = (
-				tuple([1] * (key_states.ndim - 2)) + attention_weight.shape[-2:]
-			)
+			dropout_shape = tuple([1] * (key_states.ndim - 2)) + attention_weight.shape[-2:]
 			keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
 		else:
 			keep = random.bernoulli(dropout_rng, keep_prob, attention_weight.shape)  # type: ignore

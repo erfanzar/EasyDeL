@@ -9,16 +9,43 @@ import flax
 import flax.linen
 import flax.linen.attention
 import jax
+import numpy as np
 import triton
 from fjformer.jax_triton import triton_call
 from jax import custom_vjp
 from jax import numpy as jnp
 from jax import random as jrnd
 from triton import language as tl
-import numpy as np
 
-FLASH_ATTN_BWD_ = True
+FLASH_ATTN_BWD_ = False
 FLASH_ATTN_WRAPS = int(os.environ.get("FLASH_ATTN_WRAPS", "0"))
+
+
+def calculate_num_warps(
+	head_dim: int, q_block_size: int = 0, k_block_size: int = 0
+) -> int:
+	"""
+	Calculate the number of warps based on head dimension and block sizes.
+
+	Args:
+	head_dim (int): The dimension of the attention head.
+	q_block_size (int): The size of the query block. Default is 0.
+	k_block_size (int): The size of the key block. Default is 0.
+
+	Returns:
+	int: The number of warps.
+	"""
+	if 16 < head_dim < 64:
+		return 8
+	elif 64 < head_dim < 128:
+		return 4
+	else:
+		if q_block_size > 32 and k_block_size > 64:
+			return 1
+		elif q_block_size > 64 and k_block_size > 32:
+			return 1
+		else:
+			return 4
 
 
 def _simp_attn(
@@ -137,12 +164,9 @@ def check_shapes_and_dtypes(
 		raise AssertionError("Unsupported headdim value.")
 
 
-# fmt:off
 @triton.heuristics(
 	{
-		"EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
 		"EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
-		"EVEN_HEADDIM": lambda args: args["headdim"] == args["BLOCK_HEADDIM"],
 	}
 )
 @triton.jit
@@ -151,7 +175,7 @@ def _fwd_attn_kernel(
 	K,
 	V,
 	B,
-	softmax_scale: float,
+	softmax_scale: tl.constexpr,
 	stride_qb: int,
 	stride_qh: int,
 	stride_qm: int,
@@ -170,16 +194,15 @@ def _fwd_attn_kernel(
 	stride_om: int,
 	stride_lb: int,
 	stride_lh: int,
-	headdim: int,
+	headdim: tl.constexpr,
+	nheads: tl.constexpr,
 	seqlen_q: int,
 	seqlen_k: int,
 	O,
 	L,
 	HAVE_BIAS: tl.constexpr,
 	BLOCK_HEADDIM: tl.constexpr,
-	EVEN_M: tl.constexpr,
 	EVEN_N: tl.constexpr,
-	EVEN_HEADDIM: tl.constexpr,
 	BLOCK_M: tl.constexpr,
 	BLOCK_N: tl.constexpr,
 ):
@@ -222,270 +245,100 @@ def _fwd_attn_kernel(
 		BLOCK_M: Block size for the query sequence dimension.
 		BLOCK_N: Block size for the key sequence dimension.
 	"""
-	start_m, off_b, off_h = (
+	start_m, off_bh = (
 		tl.program_id(0),
 		tl.program_id(1),
-		tl.program_id(2),
-	) #this one was the bug the whole time ...
-	offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-	offs_d = tl.arange(0, BLOCK_HEADDIM)
-	offs_n = tl.arange(0, BLOCK_N)
-	q_ptrs = Q + (off_b * stride_qb + off_h * stride_qh + (offs_m[:, None] * stride_qm + offs_d[None, :]))
+	)
+	off_h = off_bh % nheads
+	off_b = off_bh // nheads
+	if not EVEN_N:
+		offs_n = tl.arange(0, BLOCK_N)
 
-	if EVEN_N & EVEN_M:
-		if EVEN_HEADDIM:
-			q = tl.load(q_ptrs)
-		else:
-			q = tl.load(q_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
-	else:
-		if EVEN_HEADDIM:
-			q = tl.load(q_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0)
-		else:
-			q = tl.load(q_ptrs, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim), other=0.0)
-	k_ptrs = K + (off_b * stride_kb + off_h * stride_kh + (offs_n[:, None] * stride_kn + offs_d[None, :]))
-	v_ptrs = V + (off_b * stride_vb + off_h * stride_vh + (offs_n[:, None] * stride_vn + offs_d[None, :]))
+	Q_Block_ptr = tl.make_block_ptr(
+		base=Q + (off_b * stride_qb + off_h * stride_qh),
+		shape=(seqlen_q, headdim),
+		block_shape=(BLOCK_M, BLOCK_HEADDIM),
+		strides=(stride_qm, 1),
+		offsets=(start_m * BLOCK_M, 0),
+		order=(0, 1),
+	)
+	O_Block_ptr = tl.make_block_ptr(
+		base=O + (off_b * stride_ob + off_h * stride_oh),
+		shape=(seqlen_q, headdim),
+		block_shape=(BLOCK_M, BLOCK_HEADDIM),
+		strides=(stride_om, 1),
+		offsets=(start_m * BLOCK_M, 0),
+		order=(0, 1),
+	)
+	L_Block_ptr = tl.make_block_ptr(
+		base=L + (off_b * stride_lb + off_h * stride_lh),
+		shape=(seqlen_q,),
+		strides=(1,),
+		offsets=(start_m * BLOCK_M,),
+		block_shape=(BLOCK_M,),
+		order=(0,),
+	)
+	kv_stride = off_b * stride_kb + off_h * stride_kh
+	K_Block_ptr = tl.make_block_ptr(
+		base=K + kv_stride,
+		shape=(headdim, seqlen_k),
+		block_shape=(BLOCK_HEADDIM, BLOCK_N),
+		strides=(1, stride_kn),
+		offsets=(0, 0),
+		order=(1, 0),
+	)
+	V_Block_ptr = tl.make_block_ptr(
+		base=V + kv_stride,
+		shape=(seqlen_k, headdim),
+		block_shape=(BLOCK_N, BLOCK_HEADDIM),
+		strides=(stride_vn, 1),
+		offsets=(0, 0),
+		order=(0, 1),
+	)
+	q = tl.load(Q_Block_ptr, boundary_check=(0, 1))
 	softmax_scale = softmax_scale.to(tl.float32)
-
 	if HAVE_BIAS:
-		b_ptrs = B + (off_b * stride_bb + off_h * stride_bh + (offs_m[:, None] * stride_bm + offs_n[None, :]))
-
+		B_Block_ptr = tl.make_block_ptr(
+			base=B + (off_b * stride_bb + off_h * stride_bh),
+			shape=(seqlen_q, seqlen_k),
+			block_shape=(BLOCK_M, BLOCK_N),
+			strides=(stride_bm, stride_bn),
+			offsets=(start_m * BLOCK_M, 0),
+			order=(0, 1),
+		)
 	lse_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 	max_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 	acc_o = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
-
 	for j in range(0, seqlen_k, BLOCK_N):
 		j = tl.multiple_of(j, BLOCK_N)
-		if EVEN_N:
-			if EVEN_HEADDIM:
-				k = tl.load(k_ptrs + j * stride_kn)
-			else:
-				k = tl.load(k_ptrs + j * stride_kn, mask=offs_d[None, :] < headdim, other=0.0)
-		else:
-			if EVEN_HEADDIM:
-				k = tl.load(k_ptrs + j * stride_kn, mask=(j + offs_n)[:, None] < seqlen_k, other=0.0)
-			else:
-				k = tl.load(k_ptrs + j * stride_kn, mask=((j + offs_n)[:, None] < seqlen_k) & (offs_d[None, :] < headdim), other=0.0)
+		k = tl.load(K_Block_ptr, boundary_check=(0, 1))
 		qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-		qk += tl.dot(q, k.T)
+		qk += tl.dot(q, k) * softmax_scale
 		if not EVEN_N:
 			qk += tl.where((j + offs_n)[None, :] < seqlen_k, 0, float("-inf")).to(tl.float32)
 		if HAVE_BIAS:
-			if EVEN_N & EVEN_M:
-				b = tl.load(b_ptrs + j).to(tl.float32)
-			else:
-				b = tl.load(b_ptrs + j, mask=(offs_m[:, None] < seqlen_q) & (j + offs_n)[None, :] < seqlen_k, other=0.0).to(tl.float32)
-			qk = (qk * softmax_scale) + b
+			b = tl.load(B_Block_ptr, boundary_check=(0, 1)).to(tl.float32)
+			B_Block_ptr = tl.advance(B_Block_ptr, (0, BLOCK_N))
+			qk = qk + b
 			max_ij = tl.maximum(tl.max(qk, 1), lse_i)
 			p = tl.exp(qk - max_ij[:, None])
 		else:
-			max_ij = tl.maximum(tl.max(qk, 1) * softmax_scale, lse_i)
-			p = tl.exp(qk * softmax_scale - max_ij[:, None])
-
-		l_ij = tl.sum(p, 1)
-		acc_o_scale = tl.exp(max_i - max_ij)
-		acc_o = acc_o * acc_o_scale[:, None]
-		if EVEN_N:
-			if EVEN_HEADDIM:
-				v = tl.load(v_ptrs + j * stride_vn)
-			else:
-				v = tl.load(v_ptrs + j * stride_vn, mask=offs_d[None, :] < headdim, other=0.0)
-		else:
-			if EVEN_HEADDIM:
-				v = tl.load(v_ptrs + j * stride_vn, mask=(j + offs_n)[:, None] < seqlen_k, other=0.0)
-			else:
-				v = tl.load(v_ptrs + j * stride_vn, mask=((j + offs_n)[:, None] < seqlen_k) & (offs_d[None, :] < headdim), other=0.0)
-
-		acc_o += tl.dot(p.to(v.dtype), v)
-		max_i = max_ij
-		lin = tl.exp(lse_i - max_ij) + l_ij
-		lse_i = max_ij + tl.log(lin)
-
-	o_scale = tl.exp(max_i - lse_i)
-	acc_o = acc_o * o_scale[:, None]
-	lse_ptrs = L + (off_b * stride_lb + off_h * stride_lh + offs_m)
-	tl.store(lse_ptrs, lse_i, mask=offs_m < seqlen_q)
-	
-	out_ptrs = O + (off_b * stride_ob + off_h * stride_oh + (offs_m[:, None] * stride_om + offs_d[None, :]))
-	if EVEN_M:
-		if EVEN_HEADDIM:
-			tl.store(out_ptrs, acc_o)
-		else:
-			tl.store(out_ptrs, acc_o, mask=offs_d[None, :] < headdim)
-	else:
-		if EVEN_HEADDIM:
-			tl.store(out_ptrs, acc_o, mask=offs_m[:, None] < seqlen_q)
-		else:
-			tl.store(out_ptrs, acc_o, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim))
-
-# fmt:on
-@triton.jit
-def _fwd_attn_kernel_hu(
-	Q,
-	K,
-	V,
-	B,
-	softmax_scale: float,
-	stride_qb: int,
-	stride_qh: int,
-	stride_qm: int,
-	stride_kb: int,
-	stride_kh: int,
-	stride_kn: int,
-	stride_vb: int,
-	stride_vh: int,
-	stride_vn: int,
-	stride_bb: int,
-	stride_bh: int,
-	stride_bm: int,
-	stride_bn: int,
-	stride_ob: int,
-	stride_oh: int,
-	stride_om: int,
-	stride_lb: int,
-	stride_lh: int,
-	headdim: int,
-	seqlen_q: int,
-	seqlen_k: int,
-	O,
-	L,
-	HAVE_BIAS: tl.constexpr,
-	BLOCK_HEADDIM: tl.constexpr,
-	BLOCK_M: tl.constexpr,
-	BLOCK_N: tl.constexpr,
-):
-	"""Triton kernel for the forward pass of the attention mechanism.
-
-	Args:
-		Q: Query array.
-		K: Key array.
-		V: Value array.
-		B: Bias array.
-		softmax_scale: Scaling factor for the softmax function.
-		stride_qb: Stride for the query batch dimension.
-		stride_qh: Stride for the query head dimension.
-		stride_qm: Stride for the query sequence dimension.
-		stride_kb: Stride for the key batch dimension.
-		stride_kh: Stride for the key head dimension.
-		stride_kn: Stride for the key sequence dimension.
-		stride_vb: Stride for the value batch dimension.
-		stride_vh: Stride for the value head dimension.
-		stride_vn: Stride for the value sequence dimension.
-		stride_bb: Stride for the bias batch dimension.
-		stride_bh: Stride for the bias head dimension.
-		stride_bm: Stride for the bias query sequence dimension.
-		stride_bn: Stride for the bias key sequence dimension.
-		stride_ob: Stride for the output batch dimension.
-		stride_oh: Stride for the output head dimension.
-		stride_om: Stride for the output sequence dimension.
-		stride_lb: Stride for the log-sum-exp batch dimension.
-		stride_lh: Stride for the log-sum-exp head dimension.
-		headdim: Head dimension.
-		seqlen_q: Sequence length of the query.
-		seqlen_k: Sequence length of the key.
-		O: Output array.
-		L: Log-sum-exp array.
-		HAVE_BIAS: Whether bias is present.
-		BLOCK_HEADDIM: Block size for the head dimension.
-		EVEN_M: Whether the query sequence length is divisible by the block size.
-		EVEN_N: Whether the key sequence length is divisible by the block size.
-		EVEN_HEADDIM: Whether the head dimension is divisible by the block size.
-		BLOCK_M: Block size for the query sequence dimension.
-		BLOCK_N: Block size for the key sequence dimension.
-	"""
-	start_m, off_b, off_h = (
-		tl.program_id(0),
-		tl.program_id(1),
-		tl.program_id(2),
-	)  # this one was the bug the whole time ...
-	offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-	offs_d = tl.arange(0, BLOCK_HEADDIM)
-	offs_n = tl.arange(0, BLOCK_N)
-	q_ptrs = Q + (
-		off_b * stride_qb
-		+ off_h * stride_qh
-		+ (offs_m[:, None] * stride_qm + offs_d[None, :])
-	)
-
-	q = tl.load(
-		q_ptrs,
-		mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
-		other=0.0,
-	)
-	k_ptrs = K + (
-		off_b * stride_kb
-		+ off_h * stride_kh
-		+ (offs_n[:, None] * stride_kn + offs_d[None, :])
-	)
-	v_ptrs = V + (
-		off_b * stride_vb
-		+ off_h * stride_vh
-		+ (offs_n[:, None] * stride_vn + offs_d[None, :])
-	)
-	softmax_scale = softmax_scale.to(tl.float32)
-
-	if HAVE_BIAS:
-		b_ptrs = B + (
-			off_b * stride_bb
-			+ off_h * stride_bh
-			+ (offs_m[:, None] * stride_bm + offs_n[None, :])
-		)
-
-	lse_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-	max_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-	acc_o = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
-
-	for j in range(0, seqlen_k, BLOCK_N):
-		j = tl.multiple_of(j, BLOCK_N)
-
-		k = tl.load(
-			k_ptrs + j * stride_kn,
-			mask=((j + offs_n)[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
-			other=0.0,
-		)
-		qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-		qk += tl.dot(q, k.T)
-		qk += tl.where((j + offs_n)[None, :] < seqlen_k, 0, float("-inf")).to(tl.float32)
-		if HAVE_BIAS:
-			b = tl.load(
-				b_ptrs + j,
-				mask=(offs_m[:, None] < seqlen_q) & (j + offs_n)[None, :] < seqlen_k,
-				other=0.0,
-			).to(tl.float32)
-			qk = (qk * softmax_scale) + b
 			max_ij = tl.maximum(tl.max(qk, 1), lse_i)
 			p = tl.exp(qk - max_ij[:, None])
-		else:
-			max_ij = tl.maximum(tl.max(qk, 1) * softmax_scale, lse_i)
-			p = tl.exp(qk * softmax_scale - max_ij[:, None])
-
 		l_ij = tl.sum(p, 1)
 		acc_o_scale = tl.exp(max_i - max_ij)
 		acc_o = acc_o * acc_o_scale[:, None]
-		v = tl.load(
-			v_ptrs + j * stride_vn,
-			mask=((j + offs_n)[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
-			other=0.0,
-		)
-
+		v = tl.load(V_Block_ptr, boundary_check=(0, 1))
 		acc_o += tl.dot(p.to(v.dtype), v)
 		max_i = max_ij
-		lin = tl.exp(lse_i - max_ij) + l_ij
-		lse_i = max_ij + tl.log(lin)
+		lse_i = max_ij + tl.log(tl.exp(lse_i - max_ij) + l_ij)
+		K_Block_ptr = tl.advance(K_Block_ptr, (0, BLOCK_N))
+		V_Block_ptr = tl.advance(V_Block_ptr, (BLOCK_N, 0))
 
 	o_scale = tl.exp(max_i - lse_i)
 	acc_o = acc_o * o_scale[:, None]
-	lse_ptrs = L + (off_b * stride_lb + off_h * stride_lh + offs_m)
-	tl.store(lse_ptrs, lse_i, mask=offs_m < seqlen_q)
-
-	out_ptrs = O + (
-		off_b * stride_ob
-		+ off_h * stride_oh
-		+ (offs_m[:, None] * stride_om + offs_d[None, :])
-	)
-
-	tl.store(
-		out_ptrs, acc_o, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim)
-	)
+	tl.store(L_Block_ptr, lse_i, boundary_check=(0,))
+	tl.store(O_Block_ptr, acc_o.to(q.dtype), boundary_check=(0, 1))
 
 
 def _fwd_attn_kernel_call(
@@ -542,11 +395,7 @@ def _fwd_attn_kernel_call(
 	stride_qb, stride_qm, stride_qh, stride_qd = get_strides(query.shape)
 	stride_kb, stride_kn, stride_kh, stride_kd = get_strides(key.shape)
 	stride_vb, stride_vn, stride_vh, stride_vd = get_strides(value.shape)
-
-	num_warps = (
-		(4 if headdim <= 64 else 8) if (FLASH_ATTN_WRAPS == 0) else FLASH_ATTN_WRAPS
-	)
-
+	num_warps = calculate_num_warps(headdim, blocksize_q, blocksize_k)
 	return triton_call(
 		query,
 		key,
@@ -572,6 +421,7 @@ def _fwd_attn_kernel_call(
 		stride_lb,
 		stride_lh,
 		headdim,
+		nheads,
 		seqlen_q,
 		seqlen_k,
 		kernel=_fwd_attn_kernel,
@@ -579,10 +429,10 @@ def _fwd_attn_kernel_call(
 			jax.ShapeDtypeStruct(query.shape, query.dtype, sharding=get_sharding(query)),
 			jax.ShapeDtypeStruct((batch, nheads, seqlen_q), jnp.float32),
 		],
-		grid=lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch, nheads),
-		num_warps=num_warps,
-		num_stages=1,
+		grid=lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch * nheads, 1),
 		name="triton::ops::_fwd_attn_kernel",
+		num_stages=1,
+		num_warps=num_warps,
 		**metaparams,
 	)
 
@@ -627,9 +477,9 @@ def _bwd_do_attn_kernel(
 		BLOCK_HEADDIM: Block size for the head dimension.
 	"""
 	off_q = tl.program_id(0)
-	off_hb = tl.program_id(1)
-	off_b = off_hb // nheads
-	off_h = off_hb % nheads
+	off_bh = tl.program_id(1)
+	off_b = off_bh // nheads
+	off_h = off_bh % nheads
 	offs_m = off_q * BLOCK_M + tl.arange(0, BLOCK_M)
 	offs_d = tl.arange(0, BLOCK_HEADDIM)
 	o_ptrs = (
@@ -664,6 +514,40 @@ def _bwd_do_attn_kernel(
 	)
 
 
+@triton.jit
+def _bwd_store_dk_dv(
+	dk_ptrs,
+	dv_ptrs,
+	dk,
+	dv,
+	offs_n,
+	offs_d,
+	seqlen_k,
+	headdim,
+	EVEN_M: tl.constexpr,
+	EVEN_N: tl.constexpr,
+	EVEN_HEADDIM: tl.constexpr,
+):
+	if EVEN_N & EVEN_M:
+		if EVEN_HEADDIM:
+			tl.store(dv_ptrs, dv)
+			tl.store(dk_ptrs, dk)
+		else:
+			tl.store(dv_ptrs, dv, mask=offs_d[None, :] < headdim)
+			tl.store(dk_ptrs, dk, mask=offs_d[None, :] < headdim)
+	else:
+		if EVEN_HEADDIM:
+			tl.store(dv_ptrs, dv, mask=offs_n[:, None] < seqlen_k)
+			tl.store(dk_ptrs, dk, mask=offs_n[:, None] < seqlen_k)
+		else:
+			tl.store(
+				dv_ptrs, dv, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim)
+			)
+			tl.store(
+				dk_ptrs, dk, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim)
+			)
+
+
 @triton.heuristics(
 	{
 		"EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
@@ -682,29 +566,29 @@ def _bwd_attn_kernel(
 	D,
 	softmax_scale: float,
 	stride_qb: int,
-	stride_qh: int,
 	stride_qm: int,
+	stride_qh: int,
 	stride_kb: int,
-	stride_kh: int,
 	stride_kn: int,
+	stride_kh: int,
 	stride_vb: int,
-	stride_vh: int,
 	stride_vn: int,
+	stride_vh: int,
 	stride_bb: int,
 	stride_bh: int,
 	stride_bm: int,
 	stride_dob: int,
-	stride_doh: int,
 	stride_dom: int,
+	stride_doh: int,
 	stride_dqb: int,
-	stride_dqh: int,
 	stride_dqm: int,
+	stride_dqh: int,
 	stride_dkb: int,
-	stride_dkh: int,
 	stride_dkn: int,
+	stride_dkh: int,
 	stride_dvb: int,
-	stride_dvh: int,
 	stride_dvn: int,
+	stride_dvh: int,
 	stride_lb: int,
 	stride_lh: int,
 	seqlen_q: int,
@@ -775,68 +659,53 @@ def _bwd_attn_kernel(
 		BLOCK_N: Block size for the key sequence dimension.
 	"""
 
-	off_n, off_bh = (
+	start_n, off_bh = (
 		tl.program_id(0),
 		tl.program_id(2),
 	)
+	softmax_scale = softmax_scale.to(tl.float32)
 	off_h = off_bh % nheads
 	off_b = off_bh // nheads
-	offs_n = off_n * BLOCK_N + tl.arange(0, BLOCK_N)
-	offs_d = tl.arange(0, BLOCK_HEADDIM)
+	D += off_bh * seqlen_q
+	L += off_bh * seqlen_q
+	offs_qm = tl.arange(0, BLOCK_M)
+	offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
 	offs_m = tl.arange(0, BLOCK_M)
+	offs_d = tl.arange(0, BLOCK_HEADDIM)
 
-	q_ptrs = Q + (
-		off_b * stride_qb
-		+ (offs_m[:, None] * stride_qm)
-		+ off_h * stride_qh
-		+ offs_d[None, :]
+	q_ptrs = (
+		Q
+		+ (off_b * stride_qb + off_h * stride_qh)
+		+ (offs_qm[:, None] * stride_qm + offs_d[None, :])
 	)
-	k_ptrs = K + (
-		off_b * stride_kb
-		+ (offs_n[:, None] * stride_kn)
-		+ off_h * stride_kh
-		+ offs_d[None, :]
+	k_ptrs = (
+		K
+		+ (off_b * stride_kb + off_h * stride_kh)
+		+ (offs_n[:, None] * stride_kn + offs_d[None, :])
 	)
-	v_ptrs = V + (
-		off_b * stride_vb
-		+ (offs_n[:, None] * stride_vn)
-		+ off_h * stride_vh
-		+ offs_d[None, :]
+	v_ptrs = (
+		V
+		+ (off_b * stride_vb + off_h * stride_vh)
+		+ (offs_n[:, None] * stride_vn + offs_d[None, :])
+	)
+	do_ptrs = (
+		Do
+		+ (off_b * stride_dob + off_h * stride_doh)
+		+ (offs_qm[:, None] * stride_dom + offs_d[None, :])
+	)
+	dq_ptrs = (
+		Dq
+		+ (off_b * stride_dqb + off_h * stride_dqh)
+		+ (offs_qm[:, None] * stride_dqm + offs_d[None, :])
 	)
 	if HAVE_BIAS:
-		b_ptrs = B + (
-			off_b * stride_bb
-			+ off_h * stride_bh
-			+ (offs_m[:, None] * stride_bm)
-			+ offs_n[None, :]
+		b_ptrs = (
+			B
+			+ (off_b * stride_bb + off_h * stride_bh)
+			+ (offs_qm[:, None] * stride_bm + offs_n[None, :])
 		)
-	dq_ptrs = Dq + (
-		off_b * stride_dqb
-		+ (offs_m[:, None] * stride_dqm)
-		+ off_h * stride_dqh
-		+ offs_d[None, :]
-	)
-	dk_ptrs = Dk + (
-		off_b * stride_dkb
-		+ (offs_n[:, None] * stride_dkn)
-		+ off_h * stride_dkh
-		+ offs_d[None, :]
-	)
-	dv_ptrs = Dv + (
-		off_b * stride_dvb
-		+ (offs_n[:, None] * stride_dvn)
-		+ off_h * stride_dvh
-		+ offs_d[None, :]
-	)
-	do_ptrs = Do + (
-		off_b * stride_dob
-		+ (offs_m[:, None] * stride_dom)
-		+ off_h * stride_doh
-		+ offs_d[None, :]
-	)
-	lse_ptrs = L + (off_b * stride_lb + off_h * stride_lh + offs_m)
-	del_ptrs = D + (off_b * stride_lb + off_h * stride_lh + offs_m)
-
+	dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
+	dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
 	k = tl.load(
 		k_ptrs,
 		mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
@@ -848,65 +717,76 @@ def _bwd_attn_kernel(
 		other=0.0,
 	)
 
-	dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
-	dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
-
-	for start_m in range(0, seqlen_q, BLOCK_M):
+	num_block_m = tl.cdiv(seqlen_q, BLOCK_M)
+	for start_m in range(0, num_block_m * BLOCK_M, BLOCK_M):
 		start_m = tl.multiple_of(start_m, BLOCK_M)
-		m_loop_offs = start_m + offs_m
+		offs_m_curr = start_m + offs_m
 		q = tl.load(
-			q_ptrs + start_m,
-			mask=(m_loop_offs[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+			q_ptrs,
+			mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
 			other=0.0,
 		)
-
-		qk = tl.dot(q, k.T)
+		qk = tl.dot(q, k.T) * softmax_scale
 		if not EVEN_N:
-			qk += tl.where(offs_n[None, :] < seqlen_k, 0, float("-inf"))
-
-		l = tl.load(lse_ptrs + start_m, mask=m_loop_offs < seqlen_q, other=0.0)[:, None]
+			qk = tl.where(offs_n[None, :] < seqlen_k, qk, float("-inf"))
 
 		if HAVE_BIAS:
-			b = tl.load(
-				b_ptrs + start_m,
-				mask=(m_loop_offs[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k),
+			bias = tl.load(
+				b_ptrs,
+				mask=(offs_m_curr[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k),
 				other=0.0,
 			).to(tl.float32)
-			qk = qk * softmax_scale + b
-			p = tl.exp(qk - l)
-		else:
-			p = tl.exp(qk * softmax_scale - l)
+			qk = qk + bias
+		lse_i = tl.load(L + offs_m_curr)
 
+		p = tl.exp(qk - lse_i[:, None])
 		do = tl.load(
-			do_ptrs + start_m,
-			mask=(m_loop_offs[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+			do_ptrs,
+			mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
 			other=0.0,
 		)
-
-		dv = dv + tl.dot(p.to(do.dtype).T, do)
+		dv += tl.dot(p.to(do.dtype).T, do)
 		dp = tl.dot(do, v.T)
-		di = tl.load(del_ptrs + start_m, mask=m_loop_offs < seqlen_q, other=0.0)
-		ds = (p * (dp - di[:, None]) * softmax_scale).to(q.dtype)
-		foqi = tl.dot(ds.T, q).to(dk.dtype)
-		dk += foqi
+
+		Di = tl.load(D + offs_m_curr, mask=offs_m_curr < seqlen_q, other=0.0)
+		ds = (p * (dp - Di[:, None]) * softmax_scale).to(q.dtype)
+		dk += tl.dot(ds.T, q)
 
 		dq = tl.dot(ds, k)
-		pq = tl.load(
-			dq_ptrs + start_m,
-			mask=(m_loop_offs[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
-			other=0.0,
-			eviction_policy="evict_last",
+		tl.atomic_add(
+			dq_ptrs,
+			dq,
+			mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
 		)
-		res = dq + pq
-		tl.store(
-			dq_ptrs + start_m,
-			value=res,
-			mask=(m_loop_offs[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
-			eviction_policy="evict_last",
-		)
-
-	tl.store(dv_ptrs, dv, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim))
-	tl.store(dk_ptrs, dk, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim))
+		# ADVANCE TO NEXT POINT
+		dq_ptrs += BLOCK_M * stride_dqm
+		q_ptrs += BLOCK_M * stride_qm
+		do_ptrs += BLOCK_M * stride_dom
+		if HAVE_BIAS:
+			b_ptrs += BLOCK_M * stride_bm
+	dv_ptrs = (
+		Dv
+		+ (off_b * stride_dvb + off_h * stride_dvh)
+		+ (offs_n[:, None] * stride_dvn + offs_d[None, :])
+	)
+	dk_ptrs = (
+		Dk
+		+ (off_b * stride_dkb + off_h * stride_dkh)
+		+ (offs_n[:, None] * stride_dkn + offs_d[None, :])
+	)
+	_bwd_store_dk_dv(
+		dk_ptrs,
+		dv_ptrs,
+		dk,
+		dv,
+		offs_n,
+		offs_d,
+		seqlen_k,
+		headdim,
+		EVEN_M=EVEN_M,
+		EVEN_N=EVEN_N,
+		EVEN_HEADDIM=EVEN_HEADDIM,
+	)
 
 
 def _bwd_attn_kernel_call(
@@ -950,15 +830,33 @@ def _bwd_attn_kernel_call(
 		assert query.dtype in [jnp.float16, jnp.bfloat16], "only support fp16 and bf16."
 		HAVE_BIAS = True if bias is not None else False
 		BLOCK_HEADDIM = max(triton.next_power_of_2(headdim), 16)
-
+		bwd_kernel_out_shapes = [
+			jax.ShapeDtypeStruct(
+				shape=query.shape, dtype=query.dtype, sharding=query.sharding
+			),
+			jax.ShapeDtypeStruct(shape=key.shape, dtype=key.dtype, sharding=key.sharding),
+			jax.ShapeDtypeStruct(
+				shape=value.shape, dtype=value.dtype, sharding=value.sharding
+			),
+		]
 		stride_bb, stride_bh, stride_bm = (
 			get_strides(bias.shape)[:-1] if HAVE_BIAS else (0, 0, 0)
 		)
-		stride_qb, stride_qm, stride_qh, stride_qd = get_strides(query.shape)
-		stride_kb, stride_kn, stride_kh, stride_kd = get_strides(key.shape)
-		stride_vb, stride_vn, stride_vh, stride_vd = get_strides(value.shape)
-		stride_lb, stride_lh, stride_lm = get_strides(l.shape)
-		stride_ob, stride_om, stride_oh, stride_od = get_strides(o.shape)
+
+		# BATCH  , SEQUENCE  , HEADS   , _
+		stride_qb, stride_qm, stride_qh, _ = get_strides(query.shape)
+		stride_kb, stride_kn, stride_kh, _ = get_strides(key.shape)
+		stride_vb, stride_vn, stride_vh, _ = get_strides(value.shape)
+
+		# BATCH  , HEADS    , _
+		stride_lb, stride_lh, _ = get_strides(l.shape)
+
+		# BATCH   , SEQUENCE  , HEADS     , _
+		stride_dqb, stride_dqm, stride_dqh, _ = get_strides(query.shape)
+		stride_dkb, stride_dkn, stride_dkh, _ = get_strides(key.shape)
+		stride_dvb, stride_dvn, stride_dvh, _ = get_strides(value.shape)
+		stride_dob, stride_dom, stride_doh, _ = get_strides(Do.shape)
+
 		delta = jnp.empty_like(l)
 		stride_db, stride_dh, stride_dm = get_strides(delta.shape)
 
@@ -971,7 +869,7 @@ def _bwd_attn_kernel_call(
 			num_warps=num_warps,
 			num_stages=1,
 		)
-		delta = triton_call(
+		(delta,) = triton_call(
 			o,
 			Do,
 			delta,
@@ -998,7 +896,7 @@ def _bwd_attn_kernel_call(
 			kernel=_bwd_do_attn_kernel,
 			name="triton::ops::_bwd_do_attn_kernel",
 			**metaparams,
-		)[0]
+		)
 		metaparams = dict(
 			BLOCK_M=blocksize_q,
 			BLOCK_N=blocksize_k,
@@ -1007,15 +905,7 @@ def _bwd_attn_kernel_call(
 			BLOCK_HEADDIM=BLOCK_HEADDIM,
 			HAVE_BIAS=HAVE_BIAS,
 		)
-		query_strides = (stride_qb, stride_qh, stride_qm)
-		key_strides = (stride_kb, stride_kh, stride_kn)
-		value_strides = (stride_vb, stride_vh, stride_vn)
-		bias_strides = (stride_bb, stride_bh, stride_bm)
-		d_output_strides = (stride_qb, stride_qh, stride_qm)
-		d_query_strides = (stride_qb, stride_qh, stride_qm)
-		d_key_strides = (stride_kb, stride_kh, stride_kn)
-		d_value_strides = (stride_vb, stride_vh, stride_vn)
-		lse_strides = (stride_lb, stride_lh)
+
 		Dq, Dk, Dv = triton_call(
 			query,
 			key,
@@ -1025,30 +915,39 @@ def _bwd_attn_kernel_call(
 			l,
 			delta,
 			softmax_scale,
-			*query_strides,
-			*key_strides,
-			*value_strides,
-			*bias_strides,
-			*d_output_strides,
-			*d_query_strides,
-			*d_key_strides,
-			*d_value_strides,
-			*lse_strides,
+			stride_qb,
+			stride_qm,
+			stride_qh,
+			stride_kb,
+			stride_kn,
+			stride_kh,
+			stride_vb,
+			stride_vn,
+			stride_vh,
+			stride_bb,
+			stride_bh,
+			stride_bm,
+			stride_dob,
+			stride_dom,
+			stride_doh,
+			stride_dqb,
+			stride_dqm,
+			stride_dqh,
+			stride_dkb,
+			stride_dkn,
+			stride_dkh,
+			stride_dvb,
+			stride_dvn,
+			stride_dvh,
+			stride_lb,
+			stride_lh,
 			seqlen_q,
 			seqlen_k,
 			headdim,
 			nheads,
 			kernel=_bwd_attn_kernel,
 			grid=lambda META: (triton.cdiv(seqlen_k, META["BLOCK_N"]), 1, batch * nheads),
-			out_shape=[
-				jax.ShapeDtypeStruct(
-					shape=query.shape, dtype=query.dtype, sharding=query.sharding
-				),
-				jax.ShapeDtypeStruct(shape=key.shape, dtype=key.dtype, sharding=key.sharding),
-				jax.ShapeDtypeStruct(
-					shape=value.shape, dtype=value.dtype, sharding=value.sharding
-				),
-			],
+			out_shape=bwd_kernel_out_shapes,
 			name="triton::ops::_bwd_attn_kernel",
 			**metaparams,
 		)
@@ -1144,9 +1043,9 @@ _flash_attn2.defvjp(
 def _test_forward():
 	"""Tests the forward pass of the attention mechanism."""
 	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
-	B, H, QS, KS, D = 1, 32, 1, 128_000, 128
-	blocksize_k = 64
-	blocksize_q = 128
+	B, H, QS, KS, D = 1, 32, 1, 2048, 256
+	blocksize_k = 128
+	blocksize_q = 64
 	q = jax.nn.initializers.normal(2)(q_key, (B, QS, H, D), dtype=jnp.float16)
 	k = jax.nn.initializers.normal(2)(k_key, (B, KS, H, D), dtype=jnp.float16)
 	v = jax.nn.initializers.normal(2)(v_key, (B, KS, H, D), dtype=jnp.float16)
@@ -1156,18 +1055,18 @@ def _test_forward():
 			jnp.finfo(jnp.float16).min,
 			0,
 		)
-		if False
+		if True
 		else None
 	)
 	print("QKV Allocated")
-	try:
-		co = _flash_attn2(
-			q, k, v, b, None, blocksize_k, blocksize_q
-		)  # passes 256K on 24G GPU 3090
-		print(co[-1, -1, -1, :5])
-	except Exception as er:
-		print("Flash OOM", er)
-		co = None
+	# try:
+	co = _flash_attn2(
+		q, k, v, b, None, blocksize_k, blocksize_q
+	)  # passes 256K on 24G GPU 3090
+	print(co[-1, -1, -1, :5])
+	# except Exception as er:
+	# 	print("Flash OOM", er)
+	# co = None
 	try:
 		fo = flax.linen.attention.dot_product_attention(q, k, v, b)
 		print(fo[-1, -1, -1, :5])
@@ -1181,9 +1080,9 @@ def _test_forward():
 def _test_backward():
 	"""Tests the backward pass of the attention mechanism."""
 	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
-	B, H, S, D = 1, 1, 64, 16
-	blocksize_k = 64
-	blocksize_q = 64
+	B, H, S, D = 2, 1, 16, 16  # TODO: NHEAD HAVE AN ISSUE.
+	blocksize_k = 16
+	blocksize_q = 16
 	q = jax.nn.initializers.normal(2)(q_key, (B, S, H, D), dtype=jnp.float16)
 	k = jax.nn.initializers.normal(2)(k_key, (B, S, H, D), dtype=jnp.float16)
 	v = jax.nn.initializers.normal(2)(v_key, (B, S, H, D), dtype=jnp.float16)
@@ -1198,21 +1097,21 @@ def _test_backward():
 		else None
 	)
 
-	try:
-		co = jax.grad(lambda *x: _flash_attn2(*x, None, blocksize_q, blocksize_k).sum())(
-			q, k, v, b
-		)
-		print("Custom op backward pass gradients:")
-		print(co[-1][-1, -1, :5])  # Print last 5 elements of last head of last batch
-	except Exception as er:
-		print(f"Custom op backward pass failed: {er}")
-		co = None
+	# try:
+	co = jax.grad(lambda *x: _flash_attn2(*x, None, blocksize_q, blocksize_k).sum())(
+		q, k, v, b
+	)
+	# print("Custom op backward pass gradients:")
+	print(co[-1][-1, -1, :5])  # Print last 5 elements of last head of last batch
+	# except Exception as er:
+	# 	print(f"Custom op backward pass failed: {er}")
+	# 	co = None
 
 	try:
 		fo = jax.grad(lambda *x: flax.linen.attention.dot_product_attention(*x).sum())(
 			q, k, v, b
 		)
-		print("Flax backward pass gradients:")
+
 		print(fo[-1][-1, -1, :5])  # Print last 5 elements of last head of last batch
 	except Exception as e:
 		print(f"Flax backward pass failed : {e}")
@@ -1226,9 +1125,99 @@ def _test_backward():
 			print("Backward pass results differ significantly!")
 
 
+_configs = []
+for q_b in [64]:
+	for k_b in [64, 128]:
+		_configs.append(
+			triton.testing.Benchmark(
+				x_names=["seqlen"],
+				x_vals=[1024, 2048, 4096, 6144, 8192],
+				line_arg="provider",
+				line_vals=["triton", "jax"],
+				line_names=["Triton", "Jax"],
+				styles=[("green", "-"), ("blue", "-.")],
+				ylabel="TFLOPS",
+				plot_name=f"H32-B1-HD128-BT-QB{q_b}-kB{k_b}",
+				args={
+					"H": 16,
+					"BATCH": 1,
+					"HEAD_DIM": 256,
+					"mode": "FWD",
+					"BIAS": True,
+					"blocksize_k": k_b,
+					"blocksize_q": q_b,
+				},
+			)
+		)
+
+
+@triton.testing.perf_report(_configs)
+def _fwd_benchmark(
+	seqlen,
+	H,
+	BATCH,
+	HEAD_DIM,
+	mode,
+	BIAS,
+	blocksize_k,
+	blocksize_q,
+	provider,
+):
+	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
+	query = jax.nn.initializers.normal(2)(
+		q_key,
+		(BATCH, seqlen, H, HEAD_DIM),
+		dtype=jnp.float16,
+	)
+	key = jax.nn.initializers.normal(2)(
+		k_key,
+		(BATCH, seqlen, H, HEAD_DIM),
+		dtype=jnp.float16,
+	)
+	value = jax.nn.initializers.normal(2)(
+		v_key,
+		(BATCH, seqlen, H, HEAD_DIM),
+		dtype=jnp.float16,
+	)
+	# print(seqlen, calculate_num_warps(HEAD_DIM, blocksize_q, blocksize_k))
+	bias = (
+		jnp.where(
+			jrnd.randint(v_key, (BATCH, H, seqlen, seqlen), 0, 4) > 2,
+			jnp.finfo(jnp.float16).min,
+			0,
+		)
+		if BIAS
+		else None
+	)
+
+	if provider == "triton":
+		fn = lambda: _flash_attn2(query, key, value, bias, None, blocksize_k, blocksize_q)
+	elif provider == "jax":
+		_fn = jax.jit(flax.linen.attention.dot_product_attention)
+		fn = lambda: _fn(query, key, value, bias).block_until_ready()
+
+	ms = triton.testing.do_bench(fn)
+
+	def calculate_attention_flops(
+		batch_size: int, seq_length: int, num_heads: int, head_dim: int
+	) -> int:
+		"""Calculate the number of floating point operations for an attention operation."""
+		# Computing attention scores
+		flops = batch_size * num_heads * seq_length * seq_length * head_dim
+		# Softmax
+		flops += batch_size * num_heads * seq_length * seq_length
+		# Applying attention to V
+		flops += batch_size * num_heads * seq_length * seq_length * head_dim
+		return flops
+
+	total_flops = calculate_attention_flops(BATCH, seqlen, H, HEAD_DIM)
+	return (total_flops / 1e12) / ms
+
+
 triton_flash_attn_2_gpu = _flash_attn2
 __all__ = ["triton_flash_attn_2_gpu"]
 
 if __name__ == "__main__":
 	# _test_forward()
 	_test_backward()
+	# _fwd_benchmark.run(save_path=".", print_data=True)

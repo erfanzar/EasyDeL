@@ -16,7 +16,7 @@ import math
 import time
 import warnings
 from functools import partial
-from typing import Any, Literal, Optional, Tuple
+from typing import Any, Literal, Optional, Tuple, List, Dict
 
 import fjformer
 import jax
@@ -40,7 +40,11 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec
 
-from easydel.etils.etils import AVAILABLE_ATTENTION_MECHANISMS, get_logger
+from easydel.etils.etils import (
+	_AVAILABLE_ATTENTION_MECHANISMS,
+	AVAILABLE_ATTENTION_MECHANISMS,
+	get_logger,
+)
 from easydel.etils.partition_module import PartitionAxis
 from easydel.kernels.flash_attention_2 import flash_attention2
 from easydel.kernels.ring_attention import ring_attention
@@ -732,9 +736,7 @@ class FlexibleAttentionModule(object):
 		qps, kps, vps, bps, aps, is_gen = self.get_bshd_partition_specs(
 			query_sequence_length
 		)
-		block_size = self.get_block_size_flash_attn(
-			query_sequence_length, key_value_sequence_length
-		)
+
 		with self.mesh:
 			query_states = with_sharding_constraint(query_states, qps)
 			key_states = with_sharding_constraint(key_states, kps)
@@ -750,8 +752,8 @@ class FlexibleAttentionModule(object):
 				dropout_rng=dropout_rng,
 				precision=self.precision,
 				attn_pdrop=self.attention_dropout,
-				key_chunk_size=block_size.block_k,
-				query_chunk_size=block_size.block_q,
+				key_chunk_size=min(self.block_k, key_value_sequence_length),
+				query_chunk_size=min(self.block_q, query_sequence_length),
 				prevent_cse=not self.scan_attention_layers,
 				causal=True,
 				float32_logits=True,
@@ -917,139 +919,142 @@ class FlexibleAttentionModule(object):
 
 	@staticmethod
 	def test_attentions(
-		batch_size=8,
-		sequence_length=128 * 8,
-		num_attention_heads=32,
-		num_key_value_heads=32,
-		chunk_size=128,
-		axis_dims=(1, -1, 1, 1),
-		head_dim=128,
-		dtype=jnp.float16,
+		batch_size: int = 8,
+		sequence_length: int = 128 * 8,
+		num_attention_heads: int = 32,
+		num_key_value_heads: int = 32,
+		blocksize_q: int = 128,
+		blocksize_k: int = 128,
+		axis_dims: Tuple[int, int, int, int] = (1, -1, 1, 1),
+		head_dim: int = 128,
+		dtype: jnp.dtype = jnp.float16,
 		calculate_gradients: bool = True,
-		test_attentions=[  # noqa: B006
-			"blockwise",
-			"vanilla",
-			"ring",
-			"flash_attn2",
-			"splash",
-			"cudnn",
-		],
-	):
-		"""creates a test for attention module to help you find the best attention mechanism you can use."""
-		import flax
+		test_attentions: List[str] = None,
+	) -> Dict:
+		"""
+		Test different attention mechanisms and compare their performance.
 
+		Args:
+		    batch_size (int): Size of the batch.
+		    sequence_length (int): Length of the sequence.
+		    num_attention_heads (int): Number of attention heads.
+		    num_key_value_heads (int): Number of key-value heads.
+		    blocksize (int): Size of the block for attention computation.
+		    axis_dims (Tuple[int, int, int, int]): Dimensions for axis configuration.
+		    head_dim (int): Dimension of each attention head.
+		    dtype (jnp.dtype): Data type for computations.
+		    calculate_gradients (bool): Whether to calculate gradients.
+		    test_attentions (List[str]): List of attention mechanisms to test.
+
+		Returns:
+		    Dict: Results of the attention tests.
+		"""
 		try:
-			import pandas
+			import pandas as pd
 		except (ModuleNotFoundError, ImportError):
-			warnings.warn("couldn't import pandas ... please install pandas", stacklevel=1)
-			pandas = None
+			warnings.warn("Couldn't import pandas. Please install pandas.", stacklevel=1)
+			pd = None
+		import flax
 		from fjformer import GenerateRNG
 
-		from easydel.modules.mistral import MistralConfig
+		from easydel.modules import MistralConfig
+
+		if test_attentions is None:
+			test_attentions = _AVAILABLE_ATTENTION_MECHANISMS
 
 		rng = GenerateRNG()
-
 		config = MistralConfig(
 			axis_dims=axis_dims,
-			block_q=chunk_size,
-			block_k=chunk_size,
+			block_q=blocksize_q,
+			block_k=blocksize_k,
 			attn_dtype=dtype,
 		)
 
-		def value_and_grad_wrapper(fn, **kwargs):
+		def value_and_grad_wrapper(fn):
 			def inner(*args, **kwargs):
 				return jnp.sum(fn(*args, **kwargs))
 
-			inner = jax.value_and_grad(inner, **kwargs) if calculate_gradients else inner
-
-			return inner
+			return jax.value_and_grad(inner) if calculate_gradients else inner
 
 		def diff(t1, t2):
 			return jnp.max(jnp.abs(t1 - t2))
 
 		@value_and_grad_wrapper
-		def call_dot_product(
-			q,
-			k,
-			v,
-			b,
-		):
-			attention_pred = flax.linen.dot_product_attention(
-				q,
-				k,
-				v,
-				b,
-			)
-			return attention_pred
+		def call_dot_product(query, key, value, bias):
+			return flax.linen.dot_product_attention(query, key, value, bias)
 
 		@value_and_grad_wrapper
-		def call_attention_module(q, k, v, b, a, attn_mechanism):
-			attention_pred = FlexibleAttentionModule(
+		def call_attention_module(query, key, value, bias, attention_mask, attn_mechanism):
+			attention_module = FlexibleAttentionModule(
 				attn_mechanism=attn_mechanism,
 				axis_name="sp",
 				dtype=dtype,
 				mesh=config.mesh,
-				head_dims=q.shape[-1],
-				sm_scale=1 / math.sqrt(q.shape[-1]),
-				num_attention_heads=q.shape[-2],
-				block_q=config.block_q,
-				block_k=config.block_k,
+				head_dims=query.shape[-1],
+				sm_scale=1 / math.sqrt(query.shape[-1]),
+				num_attention_heads=query.shape[-2],
+				block_q=blocksize_q,
+				block_k=blocksize_k,
 				base_config=config,
-			)(
-				query_states=q, key_states=k, value_states=v, bias=b, attention_mask=a
+			)
+			return attention_module(
+				query_states=query,
+				key_states=key,
+				value_states=value,
+				bias=bias,
+				attention_mask=attention_mask,
 			).attention_outputs
-			return attention_pred
 
 		def make_inputs():
-			q = jax.random.normal(
+			query = jax.nn.initializers.normal(2.0)(
 				rng.rng,
 				(batch_size, sequence_length, num_attention_heads, head_dim),
 				dtype=dtype,
 			)
-			k = jax.random.normal(
+			key = jax.nn.initializers.normal(2.0)(
 				rng.rng,
 				(batch_size, sequence_length, num_key_value_heads, head_dim),
 				dtype=dtype,
 			)
-			v = jax.random.normal(
+			value = jax.nn.initializers.normal(2.0)(
 				rng.rng,
 				(batch_size, sequence_length, num_key_value_heads, head_dim),
 				dtype=dtype,
 			)
-			c = flax.linen.attention.make_causal_mask(jnp.ones((batch_size, sequence_length)))
-			a = jnp.ones((batch_size, sequence_length))
-			a = a.at[:, sequence_length // 2 :].set(0)
-			b = jnp.where(
+			causal_mask = flax.linen.attention.make_causal_mask(
+				jnp.ones((batch_size, sequence_length))
+			)
+			attention_mask = jnp.ones((batch_size, sequence_length))
+			attention_mask = attention_mask.at[:, sequence_length // 2 :].set(0)
+			bias = jnp.where(
 				flax.linen.attention.combine_masks(
-					jnp.expand_dims(jnp.expand_dims(a, 1), 1), c
+					jnp.expand_dims(jnp.expand_dims(attention_mask, 1), 1),
+					causal_mask,
 				),
 				0,
 				-jnp.inf,
 			)
+			return query, key, value, bias, attention_mask
 
-			return q, k, v, b, a
-
-		q, k, v, b, a = make_inputs()
-		out = call_dot_product(q, k, v, b)
-		if calculate_gradients:
-			excepted_output, excepted_grads = out
-		else:
-			excepted_output = out
-			excepted_grads = 1
+		query, key, value, bias, attention_mask = make_inputs()
+		out = call_dot_product(query, key, value, bias)
+		excepted_output, excepted_grads = out if calculate_gradients else (out, 1)
 
 		fns = {k: partial(call_attention_module, attn_mechanism=k) for k in test_attentions}
 		outs_and_grads = {}
-		for nm, fn in fns.items():
+
+		for name, func in fns.items():
 			try:
 				start = time.time()
-				out = jax.block_until_ready(fn(q, k, v, b, a))
+				out = jax.block_until_ready(func(query, key, value, bias, attention_mask))
 				end = time.time() - start
 				if not calculate_gradients:
 					out = (out, 1)
-				outs_and_grads[nm] = out + (end,)
+				outs_and_grads[name] = out + (end,)
 			except Exception as e:
-				print(f"{nm} is Failed :\n\n{e}")
-				outs_and_grads[nm] = (None, None, None)
+				print(f"{name} failed:\n\n{e}")
+				outs_and_grads[name] = (None, None, None)
+
 		frame_out = {}
 		for key, (out, grad, time_took) in outs_and_grads.items():
 			if out is None and grad is None:
@@ -1061,24 +1066,20 @@ class FlexibleAttentionModule(object):
 				}
 			else:
 				output_diff = diff(excepted_output, out)
-				if calculate_gradients:
-					g_diff = [diff(*args) for args in zip(excepted_grads, grad)]
-					sum_g = sum(g_diff)
-				else:
-					sum_g = 0
-				# TODO : Fix this
-				# XlaRuntimeError: FAILED_PRECONDITION: The program continuator has halted unexpectedly.
-				# sum_g = jax.device_get(sum_g)
-				# output_diff = jax.device_get(output_diff)
+				sum_g = (
+					sum(diff(*args) for args in zip(excepted_grads, grad))
+					if calculate_gradients
+					else 0
+				)
 				frame_out[key.upper()] = {
 					"OUT DIFF": output_diff,
 					"GRADIENT DIFF SUM": sum_g,
 					"TEST PASSED": sum_g < 1 and output_diff < 1e-2,
 					"COMP TIME": time_took,
 				}
-		if pandas is not None:
-			result = pandas.DataFrame.from_dict(frame_out)
-			result = result.transpose()
+
+		if pd is not None:
+			result = pd.DataFrame.from_dict(frame_out).transpose()
 			return result
 		else:
 			return frame_out
@@ -1100,3 +1101,7 @@ class FlexibleAttentionModule(object):
 
 	def __str__(self):
 		return self.__repr__()
+
+
+if __name__ == "__main__":
+	FlexibleAttentionModule.test_attentions()
