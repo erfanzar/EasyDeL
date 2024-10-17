@@ -2,6 +2,15 @@
 import functools
 import math
 import os
+
+import jaxlib
+import jaxlib.xla_extension
+
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "1.0"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["JAX_TRACEBACK_FILTERING"] = "off"
+
 from typing import Optional
 
 import chex
@@ -170,7 +179,7 @@ def check_shapes_and_dtypes(
 	}
 )
 @triton.jit
-def _fwd_attn_kernel(
+def _fwd_attn_kernel_block_ptr(
 	Q,
 	K,
 	V,
@@ -341,6 +350,179 @@ def _fwd_attn_kernel(
 	tl.store(O_Block_ptr, acc_o.to(q.dtype), boundary_check=(0, 1))
 
 
+@triton.heuristics(
+	{
+		"EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
+	}
+)
+@triton.jit
+def _fwd_attn_kernel_ptr_block(
+	Q,
+	K,
+	V,
+	B,
+	softmax_scale: tl.constexpr,
+	stride_qb: int,
+	stride_qh: int,
+	stride_qm: int,
+	stride_kb: int,
+	stride_kh: int,
+	stride_kn: int,
+	stride_vb: int,
+	stride_vh: int,
+	stride_vn: int,
+	stride_bb: int,
+	stride_bh: int,
+	stride_bm: int,
+	stride_bn: int,
+	stride_ob: int,
+	stride_oh: int,
+	stride_om: int,
+	stride_lb: int,
+	stride_lh: int,
+	headdim: tl.constexpr,
+	nheads: tl.constexpr,
+	seqlen_q: int,
+	seqlen_k: int,
+	O,
+	L,
+	HAVE_BIAS: tl.constexpr,
+	BLOCK_HEADDIM: tl.constexpr,
+	EVEN_N: tl.constexpr,
+	BLOCK_M: tl.constexpr,
+	BLOCK_N: tl.constexpr,
+):
+	"""Triton kernel for the forward pass of the attention mechanism.
+
+	Args:
+		Q: Query array.
+		K: Key array.
+		V: Value array.
+		B: Bias array.
+		softmax_scale: Scaling factor for the softmax function.
+		stride_qb: Stride for the query batch dimension.
+		stride_qh: Stride for the query head dimension.
+		stride_qm: Stride for the query sequence dimension.
+		stride_kb: Stride for the key batch dimension.
+		stride_kh: Stride for the key head dimension.
+		stride_kn: Stride for the key sequence dimension.
+		stride_vb: Stride for the value batch dimension.
+		stride_vh: Stride for the value head dimension.
+		stride_vn: Stride for the value sequence dimension.
+		stride_bb: Stride for the bias batch dimension.
+		stride_bh: Stride for the bias head dimension.
+		stride_bm: Stride for the bias query sequence dimension.
+		stride_bn: Stride for the bias key sequence dimension.
+		stride_ob: Stride for the output batch dimension.
+		stride_oh: Stride for the output head dimension.
+		stride_om: Stride for the output sequence dimension.
+		stride_lb: Stride for the log-sum-exp batch dimension.
+		stride_lh: Stride for the log-sum-exp head dimension.
+		headdim: Head dimension.
+		seqlen_q: Sequence length of the query.
+		seqlen_k: Sequence length of the key.
+		O: Output array.
+		L: Log-sum-exp array.
+		HAVE_BIAS: Whether bias is present.
+		BLOCK_HEADDIM: Block size for the head dimension.
+		EVEN_M: Whether the query sequence length is divisible by the block size.
+		EVEN_N: Whether the key sequence length is divisible by the block size.
+		EVEN_HEADDIM: Whether the head dimension is divisible by the block size.
+		BLOCK_M: Block size for the query sequence dimension.
+		BLOCK_N: Block size for the key sequence dimension.
+	"""
+	start_m, off_bh = (
+		tl.program_id(0),
+		tl.program_id(1),
+	)
+	off_h = off_bh % nheads
+	off_b = off_bh // nheads
+	offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+	offs_n = tl.arange(0, BLOCK_N)
+	offs_d = tl.arange(0, BLOCK_HEADDIM)
+
+	q_ptrs = (
+		Q
+		+ (off_b * stride_qb + off_h * stride_qh)
+		+ (offs_m[:, None] * stride_qm + offs_d[None, :])
+	)
+	o_ptrs = (
+		O
+		+ (off_b * stride_ob + off_h * stride_oh)
+		+ (offs_m[:, None] * stride_om + offs_d[None, :])
+	)
+	l_ptrs = L + (off_b * stride_lb + off_h * stride_lh + offs_m)
+	k_ptrs = (
+		K
+		+ (off_b * stride_kb + off_h * stride_kh)
+		+ (offs_n[:, None] * stride_kn + offs_d[None, :])
+	)
+	v_ptrs = (
+		V
+		+ (off_b * stride_vb + off_h * stride_vh)
+		+ (offs_n[:, None] * stride_vn + offs_d[None, :])
+	)
+	q = tl.load(
+		q_ptrs,
+		mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+		other=0.0,
+	)
+	softmax_scale = softmax_scale.to(tl.float32)
+	if HAVE_BIAS:
+		b_ptrs = (
+			B
+			+ (off_b * stride_bb + off_h * stride_bh)
+			+ (offs_m[:, None] * stride_bm + offs_n[None, :] * stride_bn)
+		)
+	lse_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+	max_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+	acc_o = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
+	for j in range(0, seqlen_k, BLOCK_N):
+		j = tl.multiple_of(j, BLOCK_N)
+		current_k = offs_n + j
+		k = tl.load(
+			k_ptrs + j * stride_kn,
+			mask=(current_k[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
+			other=0.0,
+		)
+		qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+		qk += tl.dot(q, k.T) * softmax_scale
+		if not EVEN_N:
+			qk += tl.where((j + offs_n)[None, :] < seqlen_k, 0, float("-inf")).to(tl.float32)
+		if HAVE_BIAS:
+			b = tl.load(
+				b_ptrs + j,
+				mask=(offs_m[:, None] < seqlen_q) & (current_k[None, :] < seqlen_k),
+				other=0.0,
+			).to(tl.float32)
+			qk = qk + b
+			max_ij = tl.maximum(tl.max(qk, 1), lse_i)
+			p = tl.exp(qk - max_ij[:, None])
+		else:
+			max_ij = tl.maximum(tl.max(qk, 1), lse_i)
+			p = tl.exp(qk - max_ij[:, None])
+		l_ij = tl.sum(p, 1)
+		acc_o_scale = tl.exp(max_i - max_ij)
+		acc_o = acc_o * acc_o_scale[:, None]
+		v = tl.load(
+			v_ptrs + j * stride_vn,
+			mask=(current_k[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
+			other=0.0,
+		)
+		acc_o += tl.dot(p.to(v.dtype), v)
+		max_i = max_ij
+		lse_i = max_ij + tl.log(tl.exp(lse_i - max_ij) + l_ij)
+
+	o_scale = tl.exp(max_i - lse_i)
+	acc_o = acc_o * o_scale[:, None]
+	tl.store(l_ptrs, lse_i, mask=offs_m < seqlen_q)
+	tl.store(
+		o_ptrs,
+		acc_o.to(q.dtype),
+		mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
+	)
+
+
 def _fwd_attn_kernel_call(
 	query: Optional[chex.Array],
 	key: Optional[chex.Array],
@@ -364,7 +546,11 @@ def _fwd_attn_kernel_call(
 	Returns:
 		Tuple of the output array and the log-sum-exp array.
 	"""
-
+	kernel = (
+		_fwd_attn_kernel_block_ptr
+		if os.environ.get("FLASH_ATTN_BLOCK_PTR", "0") == "1"
+		else _fwd_attn_kernel_ptr_block
+	)
 	batch, seqlen_q, nheads, headdim = query.shape
 	_, seqlen_k, _, _ = key.shape
 	check_shapes_and_dtypes(
@@ -424,7 +610,7 @@ def _fwd_attn_kernel_call(
 		nheads,
 		seqlen_q,
 		seqlen_k,
-		kernel=_fwd_attn_kernel,
+		kernel=kernel,
 		out_shape=[
 			jax.ShapeDtypeStruct(query.shape, query.dtype, sharding=get_sharding(query)),
 			jax.ShapeDtypeStruct((batch, nheads, seqlen_q), jnp.float32),
@@ -1043,9 +1229,9 @@ _flash_attn2.defvjp(
 def _test_forward():
 	"""Tests the forward pass of the attention mechanism."""
 	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
-	B, H, QS, KS, D = 1, 32, 1, 2048, 256
-	blocksize_k = 128
-	blocksize_q = 64
+	B, H, QS, KS, D = 1, 32, 1024, 1024, 128
+	blocksize_k = 64
+	blocksize_q = 128
 	q = jax.nn.initializers.normal(2)(q_key, (B, QS, H, D), dtype=jnp.float16)
 	k = jax.nn.initializers.normal(2)(k_key, (B, KS, H, D), dtype=jnp.float16)
 	v = jax.nn.initializers.normal(2)(v_key, (B, KS, H, D), dtype=jnp.float16)
@@ -1215,10 +1401,91 @@ def _fwd_benchmark(
 	return ms
 
 
+_configs = []
+for q_b in [32, 64, 128]:
+	for k_b in [32, 64, 128]:
+		_configs.append(
+			triton.testing.Benchmark(
+				x_names=["seqlen"],
+				x_vals=[1024, 2048, 4096, 6144, 8192],
+				line_arg="provider",
+				line_vals=["triton-block-ptr", "triton-ptr-block", "jax"],
+				line_names=["Triton-BlockPtr", "Triton-PtrBlock", "Jax"],
+				styles=[("green", "-"), ("blue", "-."), ("blue", ":")],
+				ylabel="MS",
+				plot_name=f"H32-B1-HD128-BF-QB{q_b}-kB{k_b}",
+				args={
+					"H": 16,
+					"BATCH": 1,
+					"HEAD_DIM": 64,
+					"mode": "FWD",
+					"BIAS": False,
+					"blocksize_k": k_b,
+					"blocksize_q": q_b,
+				},
+			)
+		)
+
+
+@triton.testing.perf_report(_configs)
+def _fwd_ptr_non_ptr_benchmark(
+	seqlen,
+	H,
+	BATCH,
+	HEAD_DIM,
+	mode,
+	BIAS,
+	blocksize_k,
+	blocksize_q,
+	provider,
+):
+	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
+	query = jax.nn.initializers.normal(2)(
+		q_key,
+		(BATCH, seqlen, H, HEAD_DIM),
+		dtype=jnp.float16,
+	)
+	key = jax.nn.initializers.normal(2)(
+		k_key,
+		(BATCH, seqlen, H, HEAD_DIM),
+		dtype=jnp.float16,
+	)
+	value = jax.nn.initializers.normal(2)(
+		v_key,
+		(BATCH, seqlen, H, HEAD_DIM),
+		dtype=jnp.float16,
+	)
+	# print(seqlen, calculate_num_warps(HEAD_DIM, blocksize_q, blocksize_k))
+	bias = (
+		jnp.where(
+			jrnd.randint(v_key, (BATCH, H, seqlen, seqlen), 0, 4) > 2,
+			jnp.finfo(jnp.float16).min,
+			0,
+		)
+		if BIAS
+		else None
+	)
+	if provider == "triton-block-ptr":
+		os.environ["FLASH_ATTN_BLOCK_PTR"] = "1"
+		fn = lambda: _flash_attn2(query, key, value, bias, None, blocksize_k, blocksize_q)
+	elif provider == "triton-ptr-block":
+		os.environ["FLASH_ATTN_BLOCK_PTR"] = "0"
+		fn = lambda: _flash_attn2(query, key, value, bias, None, blocksize_k, blocksize_q)
+	elif provider == "jax":
+		_fn = jax.jit(flax.linen.attention.dot_product_attention)
+		fn = lambda: _fn(query, key, value, bias).block_until_ready()
+	try:
+		ms = triton.testing.do_bench(fn)
+	except jaxlib.xla_extension.XlaRuntimeError:
+		ms = 100.0000
+	return ms
+
+
 triton_flash_attn_2_gpu = _flash_attn2
 __all__ = ["triton_flash_attn_2_gpu"]
 
 if __name__ == "__main__":
 	# _test_forward()
 	# _test_backward()
-	_fwd_benchmark.run(save_path=".", print_data=True)
+	# _fwd_benchmark.run(save_path=".", print_data=True)
+	_fwd_ptr_non_ptr_benchmark.run(save_path=".", print_data=True)
