@@ -264,9 +264,9 @@ class FlexibleAttentionModule(object):
 		self.attention_dropout = attention_dropout
 		self.backward_pass_impl = backward_pass_impl
 		self._do_check = _do_check
-		if attn_mechanism == "splash" and self.platform != "tpu":
+		if attn_mechanism == "splash" and self.backend != "tpu":
 			raise OSError("splash attention is only supported on TPU.")
-		if attn_mechanism == "cudnn" and self.platform != "gpu":
+		if attn_mechanism == "cudnn" and self.backend != "gpu":
 			raise OSError("flash attention is only supported on GPU.")
 		if isinstance(self.dtype, str):
 			self.dtype = _get_jax_dtype_from_string(self.dtype)
