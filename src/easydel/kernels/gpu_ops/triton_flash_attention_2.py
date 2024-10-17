@@ -17,7 +17,7 @@ from jax import numpy as jnp
 from jax import random as jrnd
 from triton import language as tl
 
-FLASH_ATTN_BWD_ = False
+FLASH_ATTN_BWD_ = True
 FLASH_ATTN_WRAPS = int(os.environ.get("FLASH_ATTN_WRAPS", "0"))
 
 
@@ -666,13 +666,12 @@ def _bwd_attn_kernel(
 	softmax_scale = softmax_scale.to(tl.float32)
 	off_h = off_bh % nheads
 	off_b = off_bh // nheads
-	D += off_bh * seqlen_q
-	L += off_bh * seqlen_q
 	offs_qm = tl.arange(0, BLOCK_M)
 	offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
 	offs_m = tl.arange(0, BLOCK_M)
 	offs_d = tl.arange(0, BLOCK_HEADDIM)
-
+	l_ptrs = L + (off_b * stride_lb + off_h * stride_lh + offs_qm)
+	d_ptrs = D + (off_b * stride_lb + off_h * stride_lh + offs_qm)
 	q_ptrs = (
 		Q
 		+ (off_b * stride_qb + off_h * stride_qh)
@@ -737,7 +736,7 @@ def _bwd_attn_kernel(
 				other=0.0,
 			).to(tl.float32)
 			qk = qk + bias
-		lse_i = tl.load(L + offs_m_curr)
+		lse_i = tl.load(l_ptrs + start_m, mask=offs_m_curr < seqlen_q, other=0.0)
 
 		p = tl.exp(qk - lse_i[:, None])
 		do = tl.load(
@@ -748,7 +747,7 @@ def _bwd_attn_kernel(
 		dv += tl.dot(p.to(do.dtype).T, do)
 		dp = tl.dot(do, v.T)
 
-		Di = tl.load(D + offs_m_curr, mask=offs_m_curr < seqlen_q, other=0.0)
+		Di = tl.load(d_ptrs + start_m, mask=offs_m_curr < seqlen_q, other=0.0)
 		ds = (p * (dp - Di[:, None]) * softmax_scale).to(q.dtype)
 		dk += tl.dot(ds.T, q)
 
@@ -839,6 +838,8 @@ def _bwd_attn_kernel_call(
 				shape=value.shape, dtype=value.dtype, sharding=value.sharding
 			),
 		]
+
+		delta = jnp.empty_like(l)
 		stride_bb, stride_bh, stride_bm = (
 			get_strides(bias.shape)[:-1] if HAVE_BIAS else (0, 0, 0)
 		)
@@ -847,18 +848,17 @@ def _bwd_attn_kernel_call(
 		stride_qb, stride_qm, stride_qh, _ = get_strides(query.shape)
 		stride_kb, stride_kn, stride_kh, _ = get_strides(key.shape)
 		stride_vb, stride_vn, stride_vh, _ = get_strides(value.shape)
+		stride_ob, stride_om, stride_oh, _ = get_strides(o.shape)
 
 		# BATCH  , HEADS    , _
 		stride_lb, stride_lh, _ = get_strides(l.shape)
+		stride_deb, stride_deh, _ = get_strides(delta.shape)
 
 		# BATCH   , SEQUENCE  , HEADS     , _
 		stride_dqb, stride_dqm, stride_dqh, _ = get_strides(query.shape)
 		stride_dkb, stride_dkn, stride_dkh, _ = get_strides(key.shape)
 		stride_dvb, stride_dvn, stride_dvh, _ = get_strides(value.shape)
 		stride_dob, stride_dom, stride_doh, _ = get_strides(Do.shape)
-
-		delta = jnp.empty_like(l)
-		stride_db, stride_dh, stride_dm = get_strides(delta.shape)
 
 		num_warps = 4 if headdim <= 64 else 8
 
@@ -873,14 +873,14 @@ def _bwd_attn_kernel_call(
 			o,
 			Do,
 			delta,
-			stride_qb,
-			stride_qh,
-			stride_qm,
-			stride_qb,
-			stride_qh,
-			stride_qm,
-			stride_db,
-			stride_dh,
+			stride_ob,
+			stride_om,
+			stride_oh,
+			stride_dob,
+			stride_dom,
+			stride_doh,
+			stride_deb,
+			stride_deh,
 			nheads,
 			headdim,
 			seqlen_q,
@@ -892,7 +892,7 @@ def _bwd_attn_kernel_call(
 				)
 			],
 			input_output_aliases={2: 0},
-			grid=lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch, nheads),
+			grid=lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch * nheads, 1),
 			kernel=_bwd_do_attn_kernel,
 			name="triton::ops::_bwd_do_attn_kernel",
 			**metaparams,
@@ -1080,7 +1080,7 @@ def _test_forward():
 def _test_backward():
 	"""Tests the backward pass of the attention mechanism."""
 	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
-	B, H, S, D = 2, 1, 16, 16  # TODO: NHEAD HAVE AN ISSUE.
+	B, H, S, D = 1, 32, 1024, 128
 	blocksize_k = 16
 	blocksize_q = 16
 	q = jax.nn.initializers.normal(2)(q_key, (B, S, H, D), dtype=jnp.float16)
