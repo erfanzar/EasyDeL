@@ -31,13 +31,11 @@ from jax import numpy as jnp
 from jax.experimental.pallas.ops.tpu.splash_attention import (
 	BlockSizes as BlockSizesSplashAttn,
 )
-from jax.experimental.pallas.ops.tpu.splash_attention import CausalMask as CausalMask
 from jax.experimental.pallas.ops.tpu.splash_attention import (
-	MultiHeadMask as MultiHeadMask,
-)
-from jax.experimental.pallas.ops.tpu.splash_attention import SegmentIds as SegmentIds
-from jax.experimental.pallas.ops.tpu.splash_attention import (
-	make_splash_mha as make_splash_mha,
+	CausalMask,
+	MultiHeadMask,
+	SegmentIds,
+	make_splash_mha,
 )
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec
@@ -655,27 +653,7 @@ class FlexibleAttentionModule(object):
 			value_states.astype(self.dtype),
 			bias.astype(self.dtype),
 		)
-		# attn_output = ring_attention(
-		# 	query=query_states.astype(self.dtype),
-		# 	key=key_states.astype(self.dtype),
-		# 	value=value_states.astype(self.dtype),
-		# 	bias=bias.astype(self.dtype),
-		# 	# axis_name=self.axis_name,
-		# 	axis_name=None,
-		# 	float32_logits=False
-		# 	if jax.extend.backend.get_backend().platform == "gpu"
-		# 	else True,
-		# 	platform=self.platform,
-		# 	backend=self.backend,
-		# 	autocheck=True,
-		# 	blocksize_c=None,
-		# 	blocksize_k=self.block_k,
-		# 	blocksize_q=self.block_q,
-		# 	dtype=self.dtype,
-		# 	softmax_scale=self.sm_scale,
-		# 	deterministic=deterministic,
-		# 	dropout_rng=dropout_rng,
-		# )
+
 		return AttentionOutput(attention_weights=None, attention_outputs=attn_output)
 
 	def vanilla_attention(
@@ -795,12 +773,9 @@ class FlexibleAttentionModule(object):
 			query_sequence_length
 		)
 
-		query_states = query_states.transpose(0, 2, 1, 3)
-		key_states = key_states.transpose(0, 2, 1, 3)
-		value_states = value_states.transpose(0, 2, 1, 3)
-
 		query_states, key_states, value_states = map(
-			lambda s: s.astype(jnp.float32), (query_states, key_states, value_states)
+			lambda s: s.astype(jnp.float32).transpose(0, 2, 1, 3),
+			(query_states, key_states, value_states),
 		)
 		if attention_mask is not None:
 			if attention_mask.ndim == 4:
@@ -814,17 +789,23 @@ class FlexibleAttentionModule(object):
 
 		@partial(
 			shard_map,
-			in_specs=(qps, kps, vps, PartitionSpec(qps[0], qps[2])),  # make it easier
+			in_specs=(
+				qps,
+				kps,
+				vps,
+				PartitionSpec(qps[0], qps[2]),
+			),
 			out_specs=qps,
 			mesh=self.mesh,
 			check_rep=False,
 		)
-		def splash_attention_call(q, k, v, am):
+		def splash_attention_call(query, key, value, mask):
 			block_size = self.get_block_size_splash_attn(
-				query_sequence_length, key_value_sequence_length
+				query_sequence_length,
+				key_value_sequence_length,
 			)
-			masks = [CausalMask(shape=(q.shape[2], k.shape[2])) for _ in range(q.shape[1])]
-			multi_head_mask = MultiHeadMask(masks=masks)
+			masks = CausalMask(shape=(query.shape[2], query.shape[2]))
+			multi_head_mask = MultiHeadMask(masks=(masks,) * query.shape[1])
 			splash_kernel = make_splash_mha(
 				mask=multi_head_mask,
 				head_shards=1,
@@ -832,14 +813,15 @@ class FlexibleAttentionModule(object):
 				block_sizes=block_size,
 			)
 
-			return jax.vmap(splash_kernel)(q, k, v, segment_ids=am)
+			return jax.vmap(splash_kernel)(query, key, value, segment_ids=mask)
 
-		attention_o = splash_attention_call(
-			query_states, key_states, value_states, attention_mask
-		)
-
-		attention_o = attention_o.transpose(0, 2, 1, 3)
-		return AttentionOutput(attention_outputs=attention_o, attention_weights=None)
+		output = splash_attention_call(
+			query_states,
+			key_states,
+			value_states,
+			attention_mask,
+		).transpose(0, 2, 1, 3)
+		return AttentionOutput(attention_outputs=output, attention_weights=None)
 
 	def cuddn_flash_attention(
 		self,
