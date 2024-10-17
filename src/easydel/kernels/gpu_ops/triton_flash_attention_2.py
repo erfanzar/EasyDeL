@@ -161,8 +161,8 @@ def check_shapes_and_dtypes(
 	chex.assert_equal(
 		key.dtype, value.dtype, custom_message="Dtype mismatch between key and value."
 	)
-	if query.dtype not in [jnp.float16, jnp.bfloat16]:
-		raise AssertionError("Only fp16 and bf16 are supported.") from None
+	if query.dtype not in [jnp.float16]:
+		raise AssertionError("Only fp16 is supported.") from None
 	chex.assert_is_divisible(
 		blocksize_k, 16, custom_message="blocksize_k should be divisible by 16."
 	)
@@ -700,40 +700,6 @@ def _bwd_do_attn_kernel(
 	)
 
 
-@triton.jit
-def _bwd_store_dk_dv(
-	dk_ptrs,
-	dv_ptrs,
-	dk,
-	dv,
-	offs_n,
-	offs_d,
-	seqlen_k,
-	headdim,
-	EVEN_M: tl.constexpr,
-	EVEN_N: tl.constexpr,
-	EVEN_HEADDIM: tl.constexpr,
-):
-	if EVEN_N & EVEN_M:
-		if EVEN_HEADDIM:
-			tl.store(dv_ptrs, dv)
-			tl.store(dk_ptrs, dk)
-		else:
-			tl.store(dv_ptrs, dv, mask=offs_d[None, :] < headdim)
-			tl.store(dk_ptrs, dk, mask=offs_d[None, :] < headdim)
-	else:
-		if EVEN_HEADDIM:
-			tl.store(dv_ptrs, dv, mask=offs_n[:, None] < seqlen_k)
-			tl.store(dk_ptrs, dk, mask=offs_n[:, None] < seqlen_k)
-		else:
-			tl.store(
-				dv_ptrs, dv, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim)
-			)
-			tl.store(
-				dk_ptrs, dk, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim)
-			)
-
-
 @triton.heuristics(
 	{
 		"EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
@@ -959,19 +925,9 @@ def _bwd_attn_kernel(
 		+ (off_b * stride_dkb + off_h * stride_dkh)
 		+ (offs_n[:, None] * stride_dkn + offs_d[None, :])
 	)
-	_bwd_store_dk_dv(
-		dk_ptrs,
-		dv_ptrs,
-		dk,
-		dv,
-		offs_n,
-		offs_d,
-		seqlen_k,
-		headdim,
-		EVEN_M=EVEN_M,
-		EVEN_N=EVEN_N,
-		EVEN_HEADDIM=EVEN_HEADDIM,
-	)
+
+	tl.store(dv_ptrs, dv, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim))
+	tl.store(dk_ptrs, dk, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim))
 
 
 def _bwd_attn_kernel_call(
@@ -1012,16 +968,24 @@ def _bwd_attn_kernel_call(
 	if FLASH_ATTN_BWD_:
 		assert headdim in {16, 32, 64, 128, 256}, "given headdim is not supported."
 		assert query.dtype == key.dtype == value.dtype, "tensors must have the same dtype."
-		assert query.dtype in [jnp.float16, jnp.bfloat16], "only support fp16 and bf16."
+		assert query.dtype in [jnp.float16], "only support fp16."
 		HAVE_BIAS = True if bias is not None else False
 		BLOCK_HEADDIM = max(triton.next_power_of_2(headdim), 16)
 		bwd_kernel_out_shapes = [
 			jax.ShapeDtypeStruct(
-				shape=query.shape, dtype=query.dtype, sharding=query.sharding
+				shape=query.shape,
+				dtype=query.dtype,
+				sharding=get_sharding(query),
 			),
-			jax.ShapeDtypeStruct(shape=key.shape, dtype=key.dtype, sharding=key.sharding),
 			jax.ShapeDtypeStruct(
-				shape=value.shape, dtype=value.dtype, sharding=value.sharding
+				shape=key.shape,
+				dtype=key.dtype,
+				sharding=get_sharding(key),
+			),
+			jax.ShapeDtypeStruct(
+				shape=value.shape,
+				dtype=value.dtype,
+				sharding=get_sharding(value),
 			),
 		]
 
@@ -1074,7 +1038,7 @@ def _bwd_attn_kernel_call(
 				jax.ShapeDtypeStruct(
 					shape=delta.shape,
 					dtype=delta.dtype,
-					sharding=delta.sharding,
+					sharding=get_sharding(delta),
 				)
 			],
 			input_output_aliases={2: 0},
@@ -1139,7 +1103,7 @@ def _bwd_attn_kernel_call(
 		)
 
 		return Dq, Dk, Dv, None
-	else:  # Flash attn bwd have some issue at the moment
+	else:
 		_, f_vjp = jax.vjp(
 			functools.partial(_simp_attn, softmax_scale=softmax_scale),
 			query,
@@ -1245,14 +1209,14 @@ def _test_forward():
 		else None
 	)
 	print("QKV Allocated")
-	# try:
-	co = _flash_attn2(
-		q, k, v, b, None, blocksize_k, blocksize_q
-	)  # passes 256K on 24G GPU 3090
-	print(co[-1, -1, -1, :5])
-	# except Exception as er:
-	# 	print("Flash OOM", er)
-	# co = None
+	try:
+		co = _flash_attn2(
+			q, k, v, b, None, blocksize_k, blocksize_q
+		)  # passes 256K on 24G GPU 3090
+		print(co[-1, -1, -1, :5])
+	except Exception as er:
+		print("Flash OOM", er)
+		co = None
 	try:
 		fo = flax.linen.attention.dot_product_attention(q, k, v, b)
 		print(fo[-1, -1, -1, :5])
@@ -1287,7 +1251,7 @@ def _test_backward():
 		co = jax.grad(lambda *x: _flash_attn2(*x, None, blocksize_q, blocksize_k).sum())(
 			q, k, v, b
 		)
-		# print("Custom op backward pass gradients:")
+		print("Custom op backward pass gradients:")
 		print(co[-1][-1, -1, :5])  # Print last 5 elements of last head of last batch
 	except Exception as er:
 		print(f"Custom op backward pass failed: {er}")
@@ -1365,7 +1329,6 @@ def _fwd_benchmark(
 		(BATCH, seqlen, H, HEAD_DIM),
 		dtype=jnp.float16,
 	)
-	# print(seqlen, calculate_num_warps(HEAD_DIM, blocksize_q, blocksize_k))
 	bias = (
 		jnp.where(
 			jrnd.randint(v_key, (BATCH, H, seqlen, seqlen), 0, 4) > 2,
@@ -1382,53 +1345,38 @@ def _fwd_benchmark(
 		_fn = jax.jit(flax.linen.attention.dot_product_attention)
 		fn = lambda: _fn(query, key, value, bias).block_until_ready()
 
-	ms = triton.testing.do_bench(fn)
-
-	def calculate_attention_flops(
-		batch_size: int, seq_length: int, num_heads: int, head_dim: int
-	) -> int:
-		"""Calculate the number of floating point operations for an attention operation."""
-		# Computing attention scores
-		flops = batch_size * num_heads * seq_length * seq_length * head_dim
-		# Softmax
-		flops += batch_size * num_heads * seq_length * seq_length
-		# Applying attention to V
-		flops += batch_size * num_heads * seq_length * seq_length * head_dim
-		return flops
-
-	# total_flops = calculate_attention_flops(BATCH, seqlen, H, HEAD_DIM)
-	# return (total_flops / 1e12) / ms
-	return ms
+	return triton.testing.do_bench(fn)
 
 
 _configs = []
-for q_b in [32, 64, 128]:
-	for k_b in [32, 64, 128]:
-		_configs.append(
-			triton.testing.Benchmark(
-				x_names=["seqlen"],
-				x_vals=[1024, 2048, 4096, 6144, 8192],
-				line_arg="provider",
-				line_vals=["triton-block-ptr", "triton-ptr-block", "jax"],
-				line_names=["Triton-BlockPtr", "Triton-PtrBlock", "Jax"],
-				styles=[("green", "-"), ("blue", "-."), ("blue", ":")],
-				ylabel="MS",
-				plot_name=f"H32-B1-HD128-BF-QB{q_b}-kB{k_b}",
-				args={
-					"H": 16,
-					"BATCH": 1,
-					"HEAD_DIM": 64,
-					"mode": "FWD",
-					"BIAS": False,
-					"blocksize_k": k_b,
-					"blocksize_q": q_b,
-				},
+for mode in ["bwd", "fwd"]:
+	for q_b in [32, 64, 128]:
+		for k_b in [32, 64, 128]:
+			_configs.append(
+				triton.testing.Benchmark(
+					x_names=["seqlen"],
+					x_vals=[1024, 2048, 4096, 6144, 8192],
+					line_arg="provider",
+					line_vals=["triton-block-ptr", "triton-ptr-block", "jax"],
+					line_names=["Triton-BlockPtr", "Triton-PtrBlock", "Jax"],
+					styles=[("green", "-"), ("blue", "-."), ("blue", ":")],
+					ylabel="MS",
+					plot_name=f"H32-B1-HD128-BF-QB{q_b}-kB{k_b}-M{mode}",
+					args={
+						"H": 16,
+						"BATCH": 1,
+						"HEAD_DIM": 64,
+						"mode": mode,
+						"BIAS": False,
+						"blocksize_k": k_b,
+						"blocksize_q": q_b,
+					},
+				)
 			)
-		)
 
 
 @triton.testing.perf_report(_configs)
-def _fwd_ptr_non_ptr_benchmark(
+def _ptr_non_ptr_benchmark(
 	seqlen,
 	H,
 	BATCH,
@@ -1465,15 +1413,32 @@ def _fwd_ptr_non_ptr_benchmark(
 		if BIAS
 		else None
 	)
-	if provider == "triton-block-ptr":
-		os.environ["FLASH_ATTN_BLOCK_PTR"] = "1"
-		fn = lambda: _flash_attn2(query, key, value, bias, None, blocksize_k, blocksize_q)
-	elif provider == "triton-ptr-block":
-		os.environ["FLASH_ATTN_BLOCK_PTR"] = "0"
-		fn = lambda: _flash_attn2(query, key, value, bias, None, blocksize_k, blocksize_q)
-	elif provider == "jax":
-		_fn = jax.jit(flax.linen.attention.dot_product_attention)
-		fn = lambda: _fn(query, key, value, bias).block_until_ready()
+	if mode == "fwd":
+		if provider == "triton-block-ptr":
+			os.environ["FLASH_ATTN_BLOCK_PTR"] = "1"
+			fn = lambda: _flash_attn2(query, key, value, bias, None, blocksize_k, blocksize_q)
+		elif provider == "triton-ptr-block":
+			os.environ["FLASH_ATTN_BLOCK_PTR"] = "0"
+			fn = lambda: _flash_attn2(query, key, value, bias, None, blocksize_k, blocksize_q)
+		elif provider == "jax":
+			_fn = jax.jit(flax.linen.attention.dot_product_attention)
+			fn = lambda: _fn(query, key, value, bias).block_until_ready()
+	elif mode == "bwd":
+		if provider == "triton-block-ptr":
+			os.environ["FLASH_ATTN_BLOCK_PTR"] = "1"
+			fn = lambda: jax.grad(
+				lambda *x: _flash_attn2(*x, None, blocksize_k, blocksize_q).sum()
+			)(query, key, value, bias)
+		elif provider == "triton-ptr-block":
+			os.environ["FLASH_ATTN_BLOCK_PTR"] = "0"
+			fn = lambda: jax.grad(
+				lambda *x: _flash_attn2(*x, None, blocksize_k, blocksize_q).sum()
+			)(query, key, value, bias)
+		elif provider == "jax":
+			_fn = jax.jit(flax.linen.attention.dot_product_attention)
+			fn = lambda: jax.grad(lambda *x: _fn(*x).sum())(
+				query, key, value, bias
+			).block_until_ready()
 	try:
 		ms = triton.testing.do_bench(fn)
 	except jaxlib.xla_extension.XlaRuntimeError:
@@ -1488,4 +1453,4 @@ if __name__ == "__main__":
 	# _test_forward()
 	# _test_backward()
 	# _fwd_benchmark.run(save_path=".", print_data=True)
-	_fwd_ptr_non_ptr_benchmark.run(save_path=".", print_data=True)
+	_ptr_non_ptr_benchmark.run(save_path=".", print_data=True)

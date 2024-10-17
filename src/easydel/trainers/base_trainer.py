@@ -1164,8 +1164,8 @@ class MetricsTracker:
 				accuracy if self.accuracy_sum is None else self.accuracy_sum + accuracy
 			)
 
-			mean_loss = int(self.loss_sum) / (step + 1 - self.step_offset)
-			mean_accuracy = int(self.accuracy_sum) / (step + 1 - self.step_offset)
+			mean_loss = self.loss_sum / (step + 1 - self.step_offset)
+			mean_accuracy = self.accuracy_sum / (step + 1 - self.step_offset)
 
 			return mean_loss, mean_accuracy
 
