@@ -15,7 +15,7 @@ def main():
 	import easydel as ed
 
 	config = ed.LlamaConfig()  # noqa
-	arguments = ed.TrainArguments("", 1)  # noqa
+	arguments = ed.TrainingArguments("", 1)  # noqa
 
 	end = time.time()
 	print(f"time took for import {end - start}")

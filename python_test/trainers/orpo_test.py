@@ -16,17 +16,18 @@ jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 
 import jax.numpy
 from datasets import load_dataset
+from flax.core import FrozenDict
+from jax import numpy as jnp
+from transformers import AutoTokenizer
+
 from easydel import (
 	FlaxMistralForCausalLM,
 	MistralConfig,
-	TrainArguments,
+	TrainingArguments,
 )
 from easydel.trainers.odds_ratio_preference_optimization_trainer import (
 	ORPOTrainer,
 )
-from flax.core import FrozenDict
-from jax import numpy as jnp
-from transformers import AutoTokenizer
 
 SEQUENCE_LENGTH = 128
 NUM_TRAIN_EXAMPLES = 50
@@ -86,7 +87,7 @@ def orpo_main():
 		tokenizer=tokenizer,
 		dataset_num_proc=4,
 		apply_chat_template=True,
-		arguments=TrainArguments(
+		arguments=TrainingArguments(
 			model_name="ORPO_TEST",
 			num_train_epochs=NUM_TRAIN_EPOCHS,
 			total_batch_size=TOTAL_BATCH_SIZE,

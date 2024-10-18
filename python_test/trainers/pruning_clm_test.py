@@ -1,7 +1,6 @@
-import os
 import functools
+import os
 import sys
-
 
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 os.environ["XLA_FLAGS"] = (
@@ -23,22 +22,21 @@ import jax
 jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 import fjformer
 import fjformer.jaxpruner.sparsity_distributions
-
 import fjformer.jaxpruner.sparsity_schedules
-
 import flax.core
 from datasets import Dataset, IterableDataset
+from jax import numpy as jnp
+from jax import random
+
 from easydel import (
 	AttentionMechanisms,
 	CausalLanguageModelTrainer,
-	FlaxMistralForCausalLM,
-	MistralConfig,
-	TrainArguments,
 	EasyDeLOptimizers,
 	EasyDeLSchedulers,
+	FlaxMistralForCausalLM,
+	MistralConfig,
+	TrainingArguments,
 )
-
-from jax import numpy as jnp, random
 
 TOTAL_BATCH_SIZE = 32
 NUM_TRAIN_EXAMPLES = TOTAL_BATCH_SIZE * 15
@@ -96,7 +94,7 @@ def main(use_iterable_dataset: bool):
 		)
 	dtype = jnp.float16
 	trainer = CausalLanguageModelTrainer(
-		arguments=TrainArguments(
+		arguments=TrainingArguments(
 			model_name="CLM_TEST",
 			num_train_epochs=NUM_TRAIN_EPOCHS,
 			total_batch_size=TOTAL_BATCH_SIZE,

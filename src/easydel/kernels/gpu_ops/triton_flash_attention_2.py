@@ -1360,7 +1360,7 @@ for mode in ["bwd", "fwd"]:
 					line_vals=["triton-block-ptr", "triton-ptr-block", "jax"],
 					line_names=["Triton-BlockPtr", "Triton-PtrBlock", "Jax"],
 					styles=[("green", "-"), ("blue", "-."), ("blue", ":")],
-					ylabel="MS",
+					ylabel=f"MS - QB={q_b} KB={k_b} M={mode}",
 					plot_name=f"H32-B1-HD128-BF-QB{q_b}-kB{k_b}-M{mode}",
 					args={
 						"H": 16,

@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,7 +19,9 @@ from easydel.cli.train.clm import train_clm as train_clm
 from easydel.cli.train.dpo import train_dpo as train_dpo
 from easydel.cli.train.sft import train_sft as train_sft
 from easydel.cli.utils import get_parser_from_class as get_parser_from_class
-from easydel.trainers.training_configurations import TrainArguments as TrainArguments
+from easydel.trainers.training_configurations import (
+	TrainingArguments as TrainingArguments,
+)
 
 
 def main():
@@ -43,7 +44,7 @@ def main():
 	train_subparsers.add_parser("dpo", help="Direct Preference Optimization")
 	train_subparsers.add_parser("clm", help="Causal Language Model")
 
-	train_argument_parser = get_parser_from_class(TrainArguments)
+	train_argument_parser = get_parser_from_class(TrainingArguments)
 
 	args = parser.parse_args()
 	if args.command is None:

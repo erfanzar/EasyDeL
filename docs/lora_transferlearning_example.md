@@ -7,7 +7,7 @@ for LoRA fine-tuning section and use _EasyDeLXRapTure_ in for mistral models wit
 ```python
 from flax.core import FrozenDict
 from easydel import (
-    TrainArguments,
+    TrainingArguments,
     CausalLanguageModelTrainer,
     AutoEasyDeLModelForCausalLM,
     EasyDeLOptimizers,
@@ -60,7 +60,7 @@ rapture = LoraRaptureConfig(
     verbose=True
 )
 
-train_arguments = TrainArguments(
+train_arguments = TrainingArguments(
     model_class=type(model),
     model_name="EasyDeL-Lora-Example",
     num_train_epochs=3,

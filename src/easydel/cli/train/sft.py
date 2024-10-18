@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.trainers.base_trainer import TrainArguments
+from easydel.trainers.base_trainer import TrainingArguments
 
 
 def train_sft(train_argument_parser):
-	config = TrainArguments(**vars(train_argument_parser))
+	config = TrainingArguments(**vars(train_argument_parser))
 	print("Training SFT model with config:")
 	for key, value in vars(config).items():
 		print(f"  {key}: {value}")

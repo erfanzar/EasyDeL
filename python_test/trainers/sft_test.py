@@ -14,12 +14,13 @@ os.environ["EKERNEL_OPS"] = "false"
 
 # jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 
-import easydel as ed
 import flax.core
 from datasets import load_dataset
-from easydel.trainers import create_prompt_creator
 from jax import numpy as jnp
 from transformers import AutoTokenizer
+
+import easydel as ed
+from easydel.trainers import create_prompt_creator
 
 
 def main():
@@ -48,7 +49,7 @@ def main():
 	prompter = create_prompt_creator(tokenizer)
 	dtype = jnp.float32
 	trainer = ed.SFTTrainer(
-		arguments=ed.TrainArguments(
+		arguments=ed.TrainingArguments(
 			model_name="SFTTrainer_TEST",
 			num_train_epochs=3,
 			total_batch_size=2,

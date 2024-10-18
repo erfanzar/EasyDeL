@@ -20,12 +20,13 @@ jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 
 import flax.core
 from datasets import load_dataset
-from easydel import FlaxMistralForCausalLM, MistralConfig, TrainArguments
+from jax import numpy as jnp
+from jax.sharding import PartitionSpec
+from transformers import AutoTokenizer
+
+from easydel import FlaxMistralForCausalLM, MistralConfig, TrainingArguments
 from easydel.trainers import conversations_formatting_function
 from easydel.trainers.supervised_fine_tuning_trainer import SFTTrainer
-from jax import numpy as jnp
-from transformers import AutoTokenizer
-from jax.sharding import PartitionSpec
 
 
 def main():
@@ -73,7 +74,7 @@ def main():
 	model.config.get_partition_rules = _sh
 	dtype = jnp.float32
 	trainer = SFTTrainer(
-		arguments=TrainArguments(
+		arguments=TrainingArguments(
 			model_name="SFTTrainer_TEST",
 			num_train_epochs=3,
 			total_batch_size=2,

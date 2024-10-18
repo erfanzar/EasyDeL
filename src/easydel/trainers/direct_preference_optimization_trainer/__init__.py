@@ -15,4 +15,10 @@
 from easydel.trainers.direct_preference_optimization_trainer.dpo_trainer import (
 	DPOTrainer,
 	DPOTrainerOutput,
+  DPOConfig,
 )
+__all__ = [
+	"DPOTrainer",
+	"DPOTrainerOutput",
+	"DPOConfig",
+]

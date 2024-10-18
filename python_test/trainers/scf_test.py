@@ -9,21 +9,23 @@ sys.path.append(
 		"../../src",
 	)
 )
-from easydel import (
-	AttentionMechanisms,
-	SequenceClassificationTrainer,
-	EasyDeLOptimizers,
-	EasyDeLSchedulers,
-	FlaxLlamaForSequenceClassification,
-	LlamaConfig,
-	TrainArguments,
-)
+from typing import Literal
+
 import fjformer
 import flax.core
 from datasets import Dataset, IterableDataset
 from jax import numpy as jnp
 from jax import random
-from typing import Literal
+
+from easydel import (
+	AttentionMechanisms,
+	EasyDeLOptimizers,
+	EasyDeLSchedulers,
+	FlaxLlamaForSequenceClassification,
+	LlamaConfig,
+	SequenceClassificationTrainer,
+	TrainingArguments,
+)
 
 TOTAL_BATCH_SIZE = 8
 UPPER = 200
@@ -121,7 +123,7 @@ def main(use_iterable_dataset: bool):
 		num_labels=4,
 	)
 	trainer = SequenceClassificationTrainer(
-		arguments=TrainArguments(
+		arguments=TrainingArguments(
 			model_name="SC_TEST",
 			num_train_epochs=NUM_TRAIN_EPOCHS,
 			total_batch_size=TOTAL_BATCH_SIZE,

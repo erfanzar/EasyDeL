@@ -4,29 +4,30 @@ import sys
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 dirname = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(dirname)  
+sys.path.append(dirname)
 sys.path.append(
 	os.path.join(
 		dirname,
 		"../../src",
 	)
-)  
+)
 # jax.config.update("jax_platform_name", "cpu")  # CPU Test !
-from typing import Dict, Optional  
+from typing import Dict, Optional
+
+import jax  # noqa
+from datasets import Dataset, load_dataset
+from jax import numpy as jnp
+from transformers import AutoTokenizer
 
 import easydel as ed  # noqa
-import jax    # noqa
-from datasets import Dataset, load_dataset  
-from easydel import (  
+from easydel import (
+	AttentionMechanisms,
+	DPOConfig,
 	DPOTrainer,
 	EasyDeLState,
 	FlaxLlamaForCausalLM,
 	LlamaConfig,
-	TrainArguments,
 )
-from easydel.modules.flax_modeling_utils import quantize_params_8bit  # noqa
-from jax import numpy as jnp  
-from transformers import AutoTokenizer  
 
 
 def extract_anthropic_prompt(prompt_and_response):
@@ -80,7 +81,7 @@ def main():
 	sharding_axis_dims = (1, 1, 1, -1)
 
 	max_length = 512
-	max_target_length = 256
+	max_completion_length = 256
 	max_prompt_length = 256
 	input_shape = (num_devices, max_length)
 	dtype = jnp.bfloat16
@@ -97,10 +98,14 @@ def main():
 			max_position_embeddings=512,
 			use_scan_mlp=False,
 			attention_bias=False,
+			platform="jax",
+			attn_dtype=jnp.float32,
+			attn_mechanism=AttentionMechanisms.vanilla,
 		)
-		arguments = TrainArguments(
+		arguments = DPOConfig(
 			num_train_epochs=4,
 			model_name="DPO_TEST",
+			loss_type="ipo",
 			total_batch_size=8,
 			use_wandb=False,
 			learning_rate=7e-5,
@@ -121,6 +126,10 @@ def main():
 			training_time="7H",
 			force_batch_and_gradient_accumulation_steps_calculation=False,
 			track_memory=True,
+			max_length=max_length,
+			max_completion_length=max_completion_length,
+			max_prompt_length=max_prompt_length,
+			beta=0.1,
 		)
 
 		tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
@@ -158,24 +167,17 @@ def main():
 			module=ref_module,
 			apply_fn=ref_module.__call__,
 			params={
-				"params": quantize_params_8bit(
-					ref_module.shard_params(ref_module.params),
-				)
+				"params": ref_module.shard_params(ref_module.params),
 			},
 		)
 
 		dpo_trainer = DPOTrainer(
 			model_state=state,
 			ref_model_state=ref_state,
-			beta=0.1,
 			train_dataset=train_dataset,
 			eval_dataset=eval_dataset,
 			tokenizer=tokenizer,
 			arguments=arguments,
-			max_length=max_length,
-			max_target_length=max_target_length,
-			max_prompt_length=max_prompt_length,
-			dataset_map_arguments={"num_proc": 4},
 		)
 
 		dpo_trainer.train()

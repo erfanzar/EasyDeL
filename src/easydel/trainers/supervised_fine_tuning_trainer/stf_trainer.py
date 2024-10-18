@@ -20,7 +20,7 @@ from easydel.etils.etils import get_logger
 from easydel.modules.modeling_utils import EDPretrainedModel
 from easydel.trainers.base_trainer import TrainerConfigureDataloaderOutput
 from easydel.trainers.causal_language_model_trainer import CausalLanguageModelTrainer
-from easydel.trainers.training_configurations import TrainArguments
+from easydel.trainers.training_configurations import TrainingArguments
 from easydel.trainers.utils import (
 	create_constant_length_dataset,
 	get_formatting_func_from_dataset,
@@ -37,7 +37,7 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
 	specific to supervised fine-tuning tasks.
 
 	Args:
-	    arguments (TrainArguments): Training arguments for the trainer.
+	    arguments (TrainingArguments): Training arguments for the trainer.
 	    tokenizer (PreTrainedTokenizerBase): Tokenizer to use for encoding text.
 	    train_dataset (Optional[Dataset], optional): Training dataset. Defaults to None.
 	    eval_dataset (Optional[Union[Dataset, Dict[str, Dataset]]], optional):
@@ -84,7 +84,7 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
 
 	    >>> import jax.lax
 	    >>> from easydel import (
-	    ...   TrainArguments,
+	    ...   TrainingArguments,
 	    ...   AutoEasyDeLModelForCausalLM,
 	    ...   EasyDeLOptimizers,
 	    ...   EasyDeLSchedulers,
@@ -132,8 +132,8 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
 	    ... }
 			>>> # or simply just pass model to trainer.
 
-	    >>> # Create TrainArguments
-	    >>> train_arguments = TrainArguments(
+	    >>> # Create TrainingArguments
+	    >>> train_arguments = TrainingArguments(
 	    ...   model_class=type(model),  # not needed if ur passing model itself to trainer
 	    ...   model_name="SFT-EasyDeL",
 	    ...   num_train_epochs=3,
@@ -189,7 +189,7 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
 
 	def __init__(
 		self,
-		arguments: TrainArguments,
+		arguments: TrainingArguments,
 		tokenizer: "PreTrainedTokenizerBase",  # noqa # type:ignore
 		model: Optional[EDPretrainedModel] = None,
 		train_dataset: Optional["Dataset"] = None,  # noqa # type:ignore
@@ -222,7 +222,7 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
 			arguments.neftune_noise_alpha = neftune_noise_alpha
 			warnings.warn(
 				"You passed a `neftune_noise_alpha` argument to the SFTTrainer, the value you passed will override "
-				"the one in the `TrainArguments`.",
+				"the one in the `TrainingArguments`.",
 				stacklevel=1,
 			)
 		elif not self._trainer_supports_neftune:

@@ -607,18 +607,6 @@ def get_formatting_func_from_dataset(
 	dataset: Union["Dataset", "ConstantLengthDataset"],  # type: ignore # noqa
 	tokenizer: "AutoTokenizer",  # type:ignore #noqa
 ) -> Optional[Callable]:
-	r"""from TRL
-	Finds the correct formatting function based on the dataset structure. Currently supported datasets are:
-	- `ChatML` with [{"role": str, "content": str}]
-	- `instruction` with [{"prompt": str, "completion": str}]
-
-	Args:
-	    dataset (Dataset): User dataset
-	    tokenizer (AutoTokenizer): Tokenizer used for formatting
-
-	Returns:
-	    Callable: Formatting function if the dataset format is supported else None
-	"""
 	from datasets import Dataset, Value
 
 	FORMAT_MAPPING = {
@@ -648,3 +636,114 @@ def get_formatting_func_from_dataset(
 			return instructions_formatting_function(tokenizer)
 
 	return None
+
+
+def add_bos_token_if_needed(
+	bos_token_id: Optional[int],
+	prompt_len_input_ids: int,
+	prompt_tokens: Dict[str, List[int]],
+	chosen_prompt_len_input_ids: int,
+	chosen_tokens: Dict[str, List[int]],
+	rejected_prompt_len_input_ids: int,
+	rejected_tokens: Dict[str, List[int]],
+):
+	if bos_token_id is not None:
+		if (
+			prompt_len_input_ids == 0 or bos_token_id != prompt_tokens["prompt_input_ids"][0]
+		):
+			prompt_tokens["prompt_input_ids"] = [bos_token_id] + prompt_tokens[
+				"prompt_input_ids"
+			]
+			prompt_tokens["prompt_attention_mask"] = [1] + prompt_tokens[
+				"prompt_attention_mask"
+			]
+		if (
+			chosen_prompt_len_input_ids == 0
+			or bos_token_id != chosen_tokens["prompt_input_ids"][0]
+		):
+			chosen_tokens["prompt_input_ids"] = [bos_token_id] + chosen_tokens[
+				"prompt_input_ids"
+			]
+			chosen_tokens["prompt_attention_mask"] = [1] + chosen_tokens[
+				"prompt_attention_mask"
+			]
+		if (
+			rejected_prompt_len_input_ids == 0
+			or bos_token_id != rejected_tokens["prompt_input_ids"][0]
+		):
+			rejected_tokens["prompt_input_ids"] = [bos_token_id] + rejected_tokens[
+				"prompt_input_ids"
+			]
+			rejected_tokens["prompt_attention_mask"] = [1] + rejected_tokens[
+				"prompt_attention_mask"
+			]
+	return prompt_tokens, chosen_tokens, rejected_tokens
+
+
+def add_eos_token_if_needed(
+	eos_token_id: int,
+	chosen_tokens: Dict[str, List[int]],
+	rejected_tokens: Dict[str, List[int]],
+):
+	if (
+		len(chosen_tokens["input_ids"]) == 0
+		or eos_token_id != chosen_tokens["input_ids"][-1]
+	):
+		chosen_tokens["input_ids"].append(eos_token_id)
+		chosen_tokens["attention_mask"].append(1)
+	if (
+		len(rejected_tokens["input_ids"]) == 0
+		or eos_token_id != rejected_tokens["input_ids"][-1]
+	):
+		rejected_tokens["input_ids"].append(eos_token_id)
+		rejected_tokens["attention_mask"].append(1)
+	return chosen_tokens, rejected_tokens
+
+
+def first_true_indices(bools, dtype=jnp.int32):
+	"""
+	Takes an N-dimensional bool array and returns an (N-1)-dimensional array of integers giving
+	the position of the first True in each "row".
+
+	Returns the length of the rows (bools.shape[-1]) if no element is True in a given row.
+
+	Args:
+	    bools (jax.Array):
+	        An N-dimensional boolean array.
+	    dtype (jnp.dtype, optional):
+	        The desired data type of the output array. Defaults to `jnp.int32`.
+
+	Returns:
+	    jax.Array:
+	        An (N-1)-dimensional array of integers indicating the position of the first True
+	        in each row. If no True value is found in a row, returns the length of the row.
+	"""
+	row_len = bools.shape[-1]
+	zero_or_index = row_len * (~bools).astype(dtype) + jnp.arange(row_len, dtype=dtype)
+	return jnp.min(zero_or_index, axis=-1)
+
+
+def truncate_right(input_ids, stop_token_id, pad_token_id):
+	"""
+	Truncates the input array from the right side after the first occurrence of the stop token.
+
+	Args:
+	    input_ids (jax.Array):
+	        The array containing the responses to be truncated
+	    stop_token_id (int):
+	        The token ID representing the stop token where truncation occurs
+	    pad_token_id (int):
+	        The token ID representing the pad token used to fill the truncated responses
+
+	Returns:
+	    tuple:
+	        - output_ids (jax.Array):
+	            The truncated responses array with pad tokens filled after the stop token
+	        - mask (jax.Array):
+	            The mask array to indicate the padding tokens
+	"""
+	trunc_idxs = first_true_indices(input_ids == stop_token_id).reshape((-1, 1))
+	idxs = jnp.arange(input_ids.shape[1]).reshape((1, -1))
+	output_ids = jnp.where(idxs > trunc_idxs, pad_token_id, input_ids)
+	mask = jnp.where(idxs > trunc_idxs, 0, 1)
+	return output_ids, mask

@@ -163,7 +163,7 @@ This section allows for more fine-grained control over how model parameters are 
 **9.  Set up Training Arguments**
 
 ```python
-train_arguments = ed.TrainArguments(
+train_arguments = ed.TrainingArguments(
     model_class=ed.get_modules_by_type(config.model_type)[1],
     configs_to_initialize_model_class=configs_to_initialize_model_class,
     custom_rule=config.get_partition_rules(True), 
