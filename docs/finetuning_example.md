@@ -10,7 +10,7 @@ now it's time to finetune our model.
 ```python
 import jax.numpy
 from easydel import (
-    TrainArguments,
+    TrainingArguments,
     CausalLanguageModelTrainer,
     AutoEasyDeLModelForCausalLM,
     EasyDeLOptimizers,
@@ -49,7 +49,7 @@ configs_to_initialize_model_class = {
     "input_shape": (1, 1)
 }
 
-train_arguments = TrainArguments(
+train_arguments = TrainingArguments(
     model_class=type(model),
     model_name="my_first_model_to_train_using_easydel",
     num_train_epochs=3,

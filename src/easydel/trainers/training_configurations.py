@@ -79,7 +79,7 @@ AVAILABLE_BACKENDS: List[str] = ["cpu", "gpu", "tpu", None]
 
 
 @dataclass
-class TrainArguments:
+class TrainingArguments:
 	"""
 	Data class containing all the arguments for training a EasyDeL model.
 
@@ -185,8 +185,8 @@ class TrainArguments:
 	        Logs metrics to TensorBoard and/or WandB.
 	    to_dict(self) -> Dict[str, Any]:
 	        Returns the configuration as a dictionary.
-	    from_dict(cls, config: Dict[str, Any]) -> 'TrainArguments':
-	        Creates a TrainArguments instance from a dictionary.
+	    from_dict(cls, config: Dict[str, Any]) -> 'TrainingArguments':
+	        Creates a TrainingArguments instance from a dictionary.
 	    __str__(self): Returns a string representation of the configuration.
 	"""
 
@@ -625,23 +625,23 @@ class TrainArguments:
 
 	def to_dict(self) -> Dict[str, Any]:
 		"""
-		Converts the TrainArguments object into a dictionary.
+		Converts the TrainingArguments object into a dictionary.
 
 		Returns:
-		    Dict[str, Any]: A dictionary representation of the TrainArguments.
+		    Dict[str, Any]: A dictionary representation of the TrainingArguments.
 		"""
 		return {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
 
 	@classmethod
-	def from_dict(cls, config: Dict[str, Any]) -> "TrainArguments":
+	def from_dict(cls, config: Dict[str, Any]) -> "TrainingArguments":
 		"""
-		Creates a TrainArguments instance from a dictionary.
+		Creates a TrainingArguments instance from a dictionary.
 
 		Args:
 		    config (Dict[str, Any]): The configuration dictionary.
 
 		Returns:
-		    TrainArguments: A TrainArguments object initialized with values from the dictionary.
+		    TrainingArguments: A TrainingArguments object initialized with values from the dictionary.
 		"""
 		return cls(**config)
 
@@ -670,7 +670,7 @@ class TrainArguments:
 		for key, value in d.items():
 			result.append(" " * indent + str(key) + ":")
 			if isinstance(value, dict):
-				result.append(TrainArguments._pretty_print(value, indent + 2))
+				result.append(TrainingArguments._pretty_print(value, indent + 2))
 			else:
 				result.append(" " * (indent + 2) + str(value))
 		return "\n".join(result)

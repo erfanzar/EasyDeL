@@ -1,5 +1,6 @@
 import os
 import sys
+
 dirname = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(dirname)
 sys.path.append(
@@ -12,6 +13,9 @@ os.environ["EKERNEL_OPS"] = "false"
 import fjformer
 import flax.core
 from datasets import Dataset, IterableDataset
+from jax import numpy as jnp
+from jax import random
+
 from easydel import (
 	AttentionMechanisms,
 	CausalLanguageModelTrainer,
@@ -19,10 +23,8 @@ from easydel import (
 	EasyDeLSchedulers,
 	FlaxLlamaForCausalLM,
 	LlamaConfig,
-	TrainArguments,
+	TrainingArguments,
 )
-from jax import numpy as jnp
-from jax import random
 
 TOTAL_BATCH_SIZE = 8
 UPPER = 200
@@ -88,7 +90,7 @@ def main(use_iterable_dataset: bool):
 			gen_kwargs={"num_rows": NUM_EVAL_EXAMPLES},
 		)
 	trainer = CausalLanguageModelTrainer(
-		arguments=TrainArguments(
+		arguments=TrainingArguments(
 			model_name="CLM_TEST",
 			num_train_epochs=NUM_TRAIN_EPOCHS,
 			total_batch_size=TOTAL_BATCH_SIZE,

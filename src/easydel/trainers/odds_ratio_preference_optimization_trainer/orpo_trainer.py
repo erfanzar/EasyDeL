@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -52,7 +51,7 @@ from easydel.trainers.odds_ratio_preference_optimization_trainer.fwd_bwd_functio
 from easydel.trainers.odds_ratio_preference_optimization_trainer.modelling_output import (
 	ORPOTrainerOutput,
 )
-from easydel.trainers.training_configurations import TrainArguments
+from easydel.trainers.training_configurations import TrainingArguments
 
 logger = get_logger(__name__)
 
@@ -66,7 +65,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 	training, LoRA.
 
 	Attributes:
-	    arguments (TrainArguments): The training arguments.
+	    arguments (TrainingArguments): The training arguments.
 	    max_length (Optional[int]): The maximum sequence length.
 	    max_prompt_length (Optional[int]): The maximum prompt length.
 	    max_completion_length (Optional[int]): The maximum completion length.
@@ -106,7 +105,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 
 	def __init__(
 		self,
-		arguments: TrainArguments,
+		arguments: TrainingArguments,
 		max_length: Optional[int] = None,
 		max_prompt_length: Optional[int] = None,
 		max_completion_length: Optional[int] = None,
@@ -133,7 +132,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 		Initializes the ORPOTrainer.
 
 		Args:
-		    arguments (TrainArguments): The training arguments.
+		    arguments (TrainingArguments): The training arguments.
 		    max_length (Optional[int], optional): The maximum sequence length. Defaults to None.
 		    max_prompt_length (Optional[int], optional): The maximum prompt length. Defaults to None.
 		    max_completion_length (Optional[int], optional): The maximum completion length. Defaults to None.
@@ -153,7 +152,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 		    apply_chat_template (bool): Whether to apply chat template from tokenizer on `rejected` and `chosen` fields in dataset.
 
 		Raises:
-		    ValueError: If `arguments` is not provided or is not a `TrainArguments` instance, or if `tokenizer` is not provided.
+		    ValueError: If `arguments` is not provided or is not a `TrainingArguments` instance, or if `tokenizer` is not provided.
 		"""
 
 		assert arguments is not None, (
@@ -161,8 +160,8 @@ class ORPOTrainer(BaseTrainer, ABC):
 			"`arguments=None`"
 		)
 		assert isinstance(
-			arguments, TrainArguments
-		), f"arguments type must be `TrainArguments` but got {type(arguments)}"
+			arguments, TrainingArguments
+		), f"arguments type must be `TrainingArguments` but got {type(arguments)}"
 
 		if tokenizer is None:
 			raise ValueError("tokenizer must be specified to tokenize a ORPO dataset.")
@@ -208,7 +207,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 		data_collator = (
 			DPODataCollatorWithPadding(
 				max_prompt_length=self.max_prompt_length,
-				max_target_length=self.max_completion_length,
+				max_completion_length=self.max_completion_length,
 				pad_token_id=tokenizer.pad_token_id,
 				label_pad_token_id=label_pad_token_id,
 				is_encoder_decoder=False,

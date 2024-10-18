@@ -13,36 +13,38 @@
 # limitations under the License.
 
 import abc
-from collections import defaultdict
-from logging import warning
 import os
 import pprint
 import sys
 import threading
 import time
 from abc import abstractmethod
+from collections import defaultdict
 from dataclasses import dataclass
 from glob import glob
-from typing import Any, Callable, Iterator, Literal, Mapping, Optional, Union, Dict
+from logging import warning
+from typing import Any, Callable, Dict, Iterator, Literal, Mapping, Optional, Union
 
-import termcolor
-import tqdm
-
-from easydel.etils.easystate import EasyDeLState
-from easydel.etils.errors import EasyDeLTimerError
+import flax
 import flax.core
 import jax
 import numpy as np
+import termcolor
+import tqdm
 from fjformer.checkpoint import CheckpointManager
 from flax.core import unfreeze
 from jax.sharding import Mesh
 from optax import GradientTransformation, Schedule
-import flax
+
+from easydel.etils.easystate import EasyDeLState
+from easydel.etils.errors import EasyDeLTimerError
 
 try:
 	import wandb  # noqa: F821 # type:ignore
 except ImportError:
 	wandb = None
+
+from jax import numpy as jnp
 
 from easydel.etils.etils import get_logger
 from easydel.modules.modeling_utils import (
@@ -50,9 +52,8 @@ from easydel.modules.modeling_utils import (
 	EDPretrainedModel,
 )
 from easydel.smi import get_capacity_matrix, initialise_tracking
-from easydel.trainers.training_configurations import TrainArguments
+from easydel.trainers.training_configurations import TrainingArguments
 from easydel.utils import Timers
-from jax import numpy as jnp
 
 logger = get_logger(__name__)
 
@@ -118,7 +119,7 @@ def get_layer_names(frozen_dict, prefix=""):
 class BaseTrainer(abc.ABC):
 	def __init__(
 		self,
-		arguments: Optional[TrainArguments] = None,
+		arguments: Optional[TrainingArguments] = None,
 		model: Optional[EDPretrainedModel] = None,
 		dataset_train: Optional["Dataset"] = None,  # noqa: F821 # type:ignore
 		dataset_eval: Optional["Dataset"] = None,  # noqa: F821 # type:ignore
@@ -533,7 +534,7 @@ class BaseTrainer(abc.ABC):
 		if self._base_model is None:
 			assert self.arguments.model_class is not None, (
 				"`model_class` is a required field "
-				"please pass `model_class` to `TrainArguments`"
+				"please pass `model_class` to `TrainingArguments`"
 			)
 		model = self._configure_custom_model(extra_configs)
 

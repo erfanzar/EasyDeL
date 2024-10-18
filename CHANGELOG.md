@@ -2,7 +2,7 @@
 
 ## 0.0.69 TO Beta Version 0.0.70
 
-- `TrainArguments` Structure is changed and now it's a dataclass.
+- `TrainingArguments` Structure is changed and now it's a dataclass.
 - `BaseTrainer`: This improved version of the `BaseTrainer`
 > [!TIP]
 >

@@ -74,7 +74,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
 
 	>>> import jax.lax
 	>>> from easydel import (
-	...   TrainArguments,
+	...   TrainingArguments,
 	...   CausalLanguageModelTrainer,
 	...   AutoEasyDeLModelForCausalLM,
 	...   EasyDeLOptimizers,
@@ -120,7 +120,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
 	...   "input_shape": input_shape,
 	... }
 
-	>>> train_arguments = TrainArguments(
+	>>> train_arguments = TrainingArguments(
 	...   model_class=type(model),
 	...   model_name="my_first_model_to_train_using_easydel",
 	...   num_train_epochs=3,
@@ -201,7 +201,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
 
 	>>> from flax.core import FrozenDict
 	>>> from easydel import (
-	...   TrainArguments,
+	...   TrainingArguments,
 	...   CausalLanguageModelTrainer,
 	...   AutoEasyDeLModelForCausalLM,
 	...   EasyDeLOptimizers,
@@ -262,7 +262,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
 	...   verbose=True,
 	... )
 
-	>>> train_arguments = TrainArguments(
+	>>> train_arguments = TrainingArguments(
 	...   model_class=type(model),
 	...   model_name="EasyDeL-Lora-Example",
 	...   num_train_epochs=3,

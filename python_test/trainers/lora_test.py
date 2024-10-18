@@ -13,18 +13,19 @@ sys.path.append(
 import jax
 
 jax.config.update("jax_platform_name", "cpu")  # CPU Test !
-from datasets import Dataset, IterableDataset
 import flax.core
+from datasets import Dataset, IterableDataset
+from jax import numpy as jnp
+from jax import random
+
 from easydel import (
 	AttentionMechanisms,
 	CausalLanguageModelTrainer,
 	FlaxMistralForCausalLM,
-	MistralConfig,
-	TrainArguments,
 	LoraRaptureConfig,
+	MistralConfig,
+	TrainingArguments,
 )
-
-from jax import numpy as jnp, random
 
 NUM_TRAIN_EXAMPLES = 100
 NUM_EVAL_EXAMPLES = 12
@@ -78,7 +79,7 @@ def main(use_iterable_dataset: bool):
 		)
 	dtype = jnp.float16
 	trainer = CausalLanguageModelTrainer(
-		arguments=TrainArguments(
+		arguments=TrainingArguments(
 			model_name="LORA_CLM_TEST",
 			num_train_epochs=NUM_TRAIN_EPOCHS,
 			total_batch_size=TOTAL_BATCH_SIZE,

@@ -111,7 +111,7 @@ Here's an improved version of your latest updates:
    params = model.shard_params(params)
    params = model.gather_params(params)
    ```
-- Training Argument Change: `do_shard_params` has been removed from `TrainArguments`. To shard parameters, you must now do so manually before training.
+- Training Argument Change: `do_shard_params` has been removed from `TrainingArguments`. To shard parameters, you must now do so manually before training.
 -  DPOTrainer Improvement: Added support for int8 training for reference models.
 - Added `ApiEngine` and `engine_client`
 - Improved `SFT`, `DPO`, `ORPO`, `CLM` Trainers
@@ -168,7 +168,7 @@ state = EasyDeLState.from_pretrained(
 ### Supervised Fine-Tuning
 
 ```python
-from easydel import SFTTrainer, TrainArguments
+from easydel import SFTTrainer, TrainingArguments
 
 trainer = SFTTrainer(
     arguments=train_arguments,
@@ -197,7 +197,7 @@ dpo_trainer = DPOTrainer(
     tokenizer=tokenizer,
     arguments=arguments,
     max_length=max_length,
-    max_target_length=max_target_length,
+    max_completion_length=max_completion_length,
     max_prompt_length=max_prompt_length,
 )
 
