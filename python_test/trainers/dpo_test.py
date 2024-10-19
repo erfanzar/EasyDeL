@@ -61,7 +61,7 @@ def get_hh(
 		"Anthropic/hh-rlhf",
 		split=split,
 		cache_dir=cache_dir,
-	)
+	) 
 	if sanity_check:
 		dataset = dataset.select(range(min(len(dataset), 1000)))
 

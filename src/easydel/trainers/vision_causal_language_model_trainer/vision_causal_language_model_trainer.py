@@ -36,7 +36,7 @@ from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import get_logger
 from easydel.trainers.base_trainer import TrainerConfigureFunctionOutput
 from easydel.trainers.causal_language_model_trainer import CausalLanguageModelTrainer
-from easydel.trainers.vision_causal_language_model_trainer.fwd_bwd_functions import (
+from easydel.trainers.vision_causal_language_model_trainer.functions import (
 	VisionCausalLanguageModelStepOutput,
 	create_vision_casual_language_model_evaluation_step,
 	create_vision_casual_language_model_train_step,

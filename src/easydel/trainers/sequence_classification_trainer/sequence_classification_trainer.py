@@ -36,7 +36,7 @@ from easydel.trainers.base_trainer import (
 	StepMetrics,
 	TrainerConfigureFunctionOutput,
 )
-from easydel.trainers.sequence_classification_trainer.fwd_bwd_functions import (
+from easydel.trainers.sequence_classification_trainer.functions import (
 	create_sequence_classification_model_eval_step,
 	create_sequence_classification_model_train_step,
 )

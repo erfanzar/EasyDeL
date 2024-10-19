@@ -36,7 +36,7 @@ from easydel.trainers.base_trainer import (
 	StepMetrics,
 	TrainerConfigureFunctionOutput,
 )
-from easydel.trainers.causal_language_model_trainer.fwd_bwd_functions import (
+from easydel.trainers.causal_language_model_trainer.functions import (
 	create_casual_language_model_evaluation_step,
 	create_casual_language_model_train_step,
 )
@@ -709,7 +709,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
 			self.sharded_state = sharded_state
 			return sharded_state, shard_fns, gather_fns
 
-	def _run_training_loop(
+	def _run_training_loop( 
 		self,
 		sharded_state: EasyDeLState,
 		metrics_tracker: MetricsTracker,
