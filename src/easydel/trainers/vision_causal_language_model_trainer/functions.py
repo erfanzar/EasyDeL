@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from typing import List
 
 import chex
 import jax
@@ -34,7 +35,7 @@ class VisionCausalLanguageModelStepOutput:
 
 
 def create_vision_casual_language_model_train_step(
-	partition_spec=PartitionSpec(("dp", "fsdp"), "sp"),
+	partition_spec=PartitionSpec(("dp", "fsdp"), "sp"),  # noqa:B008
 ):
 	"""The create_vision_casual_language_model_train_step function is a training step function that takes in the current
 	 state of the model,and a batch of data. It then calculates the loss and accuracy for this batch, and returns
@@ -51,7 +52,7 @@ def create_vision_casual_language_model_train_step(
 
 	def vision_casual_language_model_train_step(
 		state, batch
-	) -> [EasyDeLState, chex.Array, VisionCausalLanguageModelStepOutput]:
+	) -> List[EasyDeLState, chex.Array, VisionCausalLanguageModelStepOutput]:
 		"""The vision_casual_language_model_train_step function is a training step function that takes in the current state
 		of the model and a batch of data. It then calculates the loss and accuracy for this batch,
 		and returns an updated state with new parameters based on these gradients.
@@ -110,7 +111,7 @@ def create_vision_casual_language_model_train_step(
 
 
 def create_vision_casual_language_model_evaluation_step(
-	partition_spec=PartitionSpec(("dp", "fsdp"), "sp"),
+	partition_spec=PartitionSpec(("dp", "fsdp"), "sp"),  # noqa:B008
 ):
 	"""The create_vision_casual_language_model_evaluation_step function is used to create a function that calculates the
 	 loss and accuracy of a model. It takes in a set of parameters, which are then passed into the state.apply_fn function
@@ -127,7 +128,7 @@ def create_vision_casual_language_model_evaluation_step(
 
 	def vision_casual_language_model_evaluation_step(
 		state, batch
-	) -> [EasyDeLState, chex.Array, VisionCausalLanguageModelStepOutput]:
+	) -> List[EasyDeLState, chex.Array, VisionCausalLanguageModelStepOutput]:
 		"""The vision_casual_language_model_train_step function is a training step function that takes in the current state
 		of the model and a batch of data. It then calculates the loss and accuracy for this batch,
 		and returns an updated state with new parameters based on these gradients.

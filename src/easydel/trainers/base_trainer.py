@@ -11,14 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
-import abc
 import os
 import pprint
 import sys
 import threading
 import time
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass
 from glob import glob
@@ -106,6 +106,7 @@ def get_layer_names(frozen_dict, prefix=""):
 	Returns:
 			dict[str, jnp.ndarray]: A dictionary mapping layer names to their parameter arrays.
 	"""
+
 	layer_names = {}
 	for key, value in frozen_dict.items():
 		if isinstance(value, flax.core.FrozenDict):
@@ -116,7 +117,7 @@ def get_layer_names(frozen_dict, prefix=""):
 	return layer_names
 
 
-class BaseTrainer(abc.ABC):
+class BaseTrainer(ABC):
 	def __init__(
 		self,
 		arguments: Optional[TrainingArguments] = None,
@@ -336,12 +337,12 @@ class BaseTrainer(abc.ABC):
 		based on the chosen `truncation_mode`.
 
 		Args:
-		    max_sequence_length (int): The maximum allowed sequence length.
-		    truncation_mode (typing.Literal["keep_end", "keep_start"], optional):
-		        The truncation mode. Defaults to "keep_end".
+				max_sequence_length (int): The maximum allowed sequence length.
+				truncation_mode (typing.Literal["keep_end", "keep_start"], optional):
+						The truncation mode. Defaults to "keep_end".
 
 		Returns:
-		    Callable: A function that takes a batch of data and returns a processed batch.
+				Callable: A function that takes a batch of data and returns a processed batch.
 		"""
 		raise NotImplementedError
 
@@ -351,12 +352,12 @@ class BaseTrainer(abc.ABC):
 		Configures and JIT-compiles the training and evaluation step functions.
 
 		This method sets up the necessary functions for training and evaluation, including:
-		    - Initialization of the model state.
-		    - Sharding of the model parameters and optimizer state.
-		    - JIT-compilation of the training and evaluation step functions.
+				- Initialization of the model state.
+				- Sharding of the model parameters and optimizer state.
+				- JIT-compilation of the training and evaluation step functions.
 
 		Returns:
-		    TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
+				TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
 		"""
 		raise NotImplementedError
 
@@ -369,8 +370,8 @@ class BaseTrainer(abc.ABC):
 		and evaluation steps based on the dataset sizes and training arguments.
 
 		Returns:
-		    TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
-		                                    maximum number of training and evaluation steps.
+				TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
+																				maximum number of training and evaluation steps.
 		"""
 
 		def create_tf_dataset(
@@ -381,11 +382,11 @@ class BaseTrainer(abc.ABC):
 			Creates a TensorFlow dataset from a Hugging Face Dataset.
 
 			Args:
-			    dataset (Dataset): The Hugging Face Dataset.
-			    is_train (bool): Whether the dataset is for training.
+					dataset (Dataset): The Hugging Face Dataset.
+					is_train (bool): Whether the dataset is for training.
 
 			Returns:
-			    Iterator[np.ndarray]: The TensorFlow dataset iterator.
+					Iterator[np.ndarray]: The TensorFlow dataset iterator.
 			"""
 			import tensorflow as tf
 
@@ -413,11 +414,11 @@ class BaseTrainer(abc.ABC):
 			Creates a TensorFlow dataset from an iterable Hugging Face Dataset.
 
 			Args:
-			    dataset (IterableDataset): The iterable Hugging Face Dataset.
-			    is_train (bool): Whether the dataset is for training.
+					dataset (IterableDataset): The iterable Hugging Face Dataset.
+					is_train (bool): Whether the dataset is for training.
 
 			Returns:
-			    Iterator[np.ndarray]: The TensorFlow dataset iterator.
+					Iterator[np.ndarray]: The TensorFlow dataset iterator.
 			"""
 			import tensorflow as tf
 
@@ -445,14 +446,14 @@ class BaseTrainer(abc.ABC):
 			Calculates the number of training or evaluation steps based on dataset length and arguments.
 
 			Args:
-			    dataset (Union[Dataset, IterableDataset]): The dataset to calculate steps for.
-			    is_train (bool): Whether the dataset is for training.
+					dataset (Union[Dataset, IterableDataset]): The dataset to calculate steps for.
+					is_train (bool): Whether the dataset is for training.
 
 			Returns:
-			    int: The number of steps.
+					int: The number of steps.
 
 			Raises:
-			    ValueError: If the dataset is a generator/streaming dataset and the number of steps is not specified.
+					ValueError: If the dataset is a generator/streaming dataset and the number of steps is not specified.
 			"""
 			if hasattr(dataset, "__len__"):
 				total_data_len = len(dataset)
@@ -492,11 +493,11 @@ class BaseTrainer(abc.ABC):
 			Converts a Hugging Face Dataset to a TensorFlow dataloader.
 
 			Args:
-			    dataset (Union[Dataset, IterableDataset]): The Hugging Face Dataset.
-			    is_train (bool): Whether the dataset is for training.
+					dataset (Union[Dataset, IterableDataset]): The Hugging Face Dataset.
+					is_train (bool): Whether the dataset is for training.
 
 			Returns:
-			    Iterator[np.ndarray]: The TensorFlow dataloader iterator.
+					Iterator[np.ndarray]: The TensorFlow dataloader iterator.
 			"""
 			if hasattr(dataset, "__len__"):
 				return create_tf_dataset(dataset, is_train)
@@ -528,7 +529,7 @@ class BaseTrainer(abc.ABC):
 		object containing the configured model, optimizer, scheduler, and configuration.
 
 		Returns:
-		    TrainerConfigureModelOutput: An object containing the configured model, optimizer, scheduler, and configuration.
+				TrainerConfigureModelOutput: An object containing the configured model, optimizer, scheduler, and configuration.
 		"""
 		extra_configs = self.arguments.extra_configs or {}
 		if self._base_model is None:
@@ -557,13 +558,13 @@ class BaseTrainer(abc.ABC):
 		configurations.
 
 		Args:
-		    extra_configs (dict): Additional configurations to apply to the model.
+				extra_configs (dict): Additional configurations to apply to the model.
 
 		Returns:
-		    EDPretrainedModel: The configured custom model.
+				EDPretrainedModel: The configured custom model.
 
 		Raises:
-		    AssertionError: If no custom rule is provided when initializing a custom model.
+				AssertionError: If no custom rule is provided when initializing a custom model.
 		"""
 		if self._base_model is None:
 			if not hasattr(
@@ -603,15 +604,15 @@ class BaseTrainer(abc.ABC):
 		information about the trained model.
 
 		Args:
-		    state (EasyDeLState): The EasyDeLState object containing the model state to save.
-		    gather_fns (Optional[Any | Mapping[str, Callable] | dict[Callable]], optional):
-		        Functions for gathering sharded parameters. Defaults to None.
-		    milestone (bool, optional): Whether this checkpoint is a milestone (e.g., end of epoch). Defaults to False.
-		    save_dir (Optional[str], optional): The directory to save the checkpoint to. If None, defaults to the
-		                                        directory specified in the training arguments. Defaults to None.
+				state (EasyDeLState): The EasyDeLState object containing the model state to save.
+				gather_fns (Optional[Any | Mapping[str, Callable] | dict[Callable]], optional):
+						Functions for gathering sharded parameters. Defaults to None.
+				milestone (bool, optional): Whether this checkpoint is a milestone (e.g., end of epoch). Defaults to False.
+				save_dir (Optional[str], optional): The directory to save the checkpoint to. If None, defaults to the
+																						directory specified in the training arguments. Defaults to None.
 
 		Returns:
-		    str: The filename of the saved checkpoint.
+				str: The filename of the saved checkpoint.
 		"""
 		step = self._get_current_step(state)
 		checkpoint_dir = self._get_checkpoint_dir(save_dir)
@@ -664,14 +665,6 @@ class BaseTrainer(abc.ABC):
 		with open(os.path.join(checkpoint_dir, "README.md"), "w") as f:
 			f.write(self._get_information())
 
-	@abstractmethod
-	def train(self):
-		"""Abstract method for training the model"""
-
-	@abstractmethod
-	def eval(self, state):
-		"""Abstract method for evaluating the model"""
-
 	def _get_information(self):
 		mdl = self.arguments.model_class if self.model is None else self.model
 		partition_rules = pprint.pformat(
@@ -707,19 +700,19 @@ from easydel import EasyDeLState, AutoShardAndGatherFunctions
 from jax import numpy as jnp, lax
 
 shard_fns, gather_fns = AutoShardAndGatherFunctions.from_pretrained(
-    "REPO_ID", # Pytorch State should be saved to in order to find shard gather fns with no effort, otherwise read docs.
-    backend="gpu",
-    depth_target=["params", "params"],
-    flatten=False
+		"REPO_ID", # Pytorch State should be saved to in order to find shard gather fns with no effort, otherwise read docs.
+		backend="gpu",
+		depth_target=["params", "params"],
+		flatten=False
 )
 
 state = EasyDeLState.load_state(
-    "REPO_ID/{self.arguments.model_name}.easy",
-    dtype=jnp.float16,
-    param_dtype=jnp.float16,
-    precision=lax.Precision("fastest"),
-    verbose=True,
-    state_shard_fns=shard_fns
+		"REPO_ID/{self.arguments.model_name}.easy",
+		dtype=jnp.float16,
+		param_dtype=jnp.float16,
+		precision=lax.Precision("fastest"),
+		verbose=True,
+		state_shard_fns=shard_fns
 )
 # State file Ready to use ...
 ```
@@ -731,11 +724,11 @@ from easydel import AutoEasyDeLModelForCausalLM
 from jax import numpy as jnp, lax
 
 model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
-    "REPO_ID/{self.arguments.model_name}",
-    dtype=jnp.float16,
-    param_dtype=jnp.float16,
-    precision=lax.Precision("fastest"),
-    auto_shard_params=True,
+		"REPO_ID/{self.arguments.model_name}",
+		dtype=jnp.float16,
+		param_dtype=jnp.float16,
+		precision=lax.Precision("fastest"),
+		auto_shard_params=True,
 )
 # Model and Parameters Ready to use ...
 ```
@@ -747,12 +740,12 @@ from easydel import AutoEasyDeLModelForCausalLM
 from jax import numpy as jnp, lax
 
 model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
-    "REPO_ID/{self.arguments.model_name}",
-    dtype=jnp.float16,
-    param_dtype=jnp.float16,
-    precision=lax.Precision("fastest"),
-    auto_shard_params=True,
-    from_torch=False
+		"REPO_ID/{self.arguments.model_name}",
+		dtype=jnp.float16,
+		param_dtype=jnp.float16,
+		precision=lax.Precision("fastest"),
+		auto_shard_params=True,
+		from_torch=False
 )
 # Model and Parameters Ready to use ...
 ```
@@ -787,7 +780,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 ```python
 partition_rules = {partition_rules}
 ```
-        """
+				"""
 		return info
 
 	def save_pretrained(
@@ -1059,6 +1052,87 @@ partition_rules = {partition_rules}
 				step=step,
 			)
 
+	@abstractmethod
+	def _run_training_loop(
+		self,
+		sharded_state: EasyDeLState,
+		metrics_tracker: MetricsTracker,
+		step_metrics: StepMetrics,
+		start_time: float,
+		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+	):
+		"""Core training loop implementation."""
+
+	@abstractmethod
+	def _run_evaluation(
+		self,
+		sharded_state: EasyDeLState,
+		metrics_tracker: MetricsTracker,
+		step_metrics: StepMetrics,
+		start_time: float,
+	):
+		"""Core evaluation implementation."""
+
+	@abstractmethod
+	def _train_epoch(
+		self,
+		sharded_state: EasyDeLState,
+		train_iter: int,
+		current_step: int,
+		metrics_tracker: MetricsTracker,
+		step_metrics: StepMetrics,
+		pbar: tqdm,
+		start_time: float,
+		epoch: int,
+		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+	):
+		"""Handles training for a single epoch."""
+
+	@abstractmethod
+	def _eval_epoch(
+		self,
+		sharded_state: EasyDeLState,
+		eval_iter: int,
+		current_step: int,
+		metrics_tracker: MetricsTracker,
+		step_metrics: StepMetrics,
+		pbar: tqdm,
+		start_time: float,
+	):
+		"""Handles training for a single epoch."""
+
+	@abstractmethod
+	def _execute_eval_step(self, state, batch):
+		"""Execute a single eval step."""
+
+	@abstractmethod
+	def _execute_train_step(self, state, batch):
+		"""Execute a single train step."""
+
+	@abstractmethod
+	def _finalize_training(self, output, run_exception):
+		"""Finalize training and prepare output."""
+
+	@abstractmethod
+	def train(
+		self,
+		model_parameters: Optional[flax.core.FrozenDict] = None,
+		state: Optional[EasyDeLState] = None,
+	) -> Any:
+		"""Train using the provided model state."""
+
+	@abstractmethod
+	def eval(self, model_state: EasyDeLState) -> Iterator[dict]:
+		"""
+		Evaluates using the provided model state.
+
+		This method iterates over the evaluation dataset, performs forward passes,
+		calculates evaluation metrics, logs the metrics, and yields the metrics for
+		each evaluation step.
+		"""
+
 
 class StepMetrics:
 	"""Handles calculation and tracking of training metrics."""
@@ -1159,16 +1233,17 @@ class MetricsTracker:
 		"""Update tracked metrics with new values."""
 		with jax.spmd_mode("allow_all"):
 			self.loss_sum = loss if self.loss_sum is None else self.loss_sum + loss
-			if accuracy is None:
-				accuracy = 0.0
-			self.accuracy_sum = (
-				accuracy if self.accuracy_sum is None else self.accuracy_sum + accuracy
-			)
-
 			mean_loss = self.loss_sum / (step + 1 - self.step_offset)
-			mean_accuracy = self.accuracy_sum / (step + 1 - self.step_offset)
+			if accuracy != float("inf"):
+				if accuracy is None:
+					accuracy = 0.0
+				self.accuracy_sum = (
+					accuracy if self.accuracy_sum is None else self.accuracy_sum + accuracy
+				)
+				mean_accuracy = self.accuracy_sum / (step + 1 - self.step_offset)
 
-			return mean_loss, mean_accuracy
+				return mean_loss, mean_accuracy
+			return mean_loss
 
 	def reset(self, step):
 		"""Reset tracked metrics."""

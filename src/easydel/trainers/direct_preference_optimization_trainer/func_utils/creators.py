@@ -21,13 +21,13 @@ import flax
 import jax
 
 from easydel.etils.easystate import EasyDeLState
-from easydel.trainers.direct_preference_optimization_trainer.jax_funcs.concatenators import (
+from easydel.trainers.direct_preference_optimization_trainer.func_utils.concatenators import (
 	concatenated_dpo_inputs,
 )
-from easydel.trainers.direct_preference_optimization_trainer.jax_funcs.log_probs import (
+from easydel.trainers.direct_preference_optimization_trainer.func_utils.log_probs import (
 	get_batch_log_probs,
 )
-from easydel.trainers.direct_preference_optimization_trainer.jax_funcs.loss_funcs import (
+from easydel.trainers.direct_preference_optimization_trainer.func_utils.loss_funcs import (
 	get_loss_function,
 )
 
