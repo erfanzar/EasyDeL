@@ -66,38 +66,42 @@ def flash_attention2(
 	beneficial for long sequences.
 
 	Args:
-	  query_state: Query, shape (`batch_size`, `num_heads`, `q_len`, `head_dim`).
-	  key_state: Key, shape (`batch_size`, `num_heads`, `kv_len`, `head_dim`).
-	  value_state: Value, shape (`batch_size`, `num_heads`, `kv_len`, `head_dim`).
-	  mask: Optional attention mask. This can be any of the following:
+		query_state: Query, shape (`batch_size`, `q_len`, `num_heads`, `head_dim`).
+		key_state: Key, shape (`batch_size`, `kv_len`, `num_heads`, `head_dim`).
+		value_state: Value, shape (`batch_size`, `kv_len`, `num_heads`, `head_dim`).
+		mask: Optional attention mask. This can be any of the following:
 
-	    - No mask (default):  All attention weights are computed.
-	    - Boolean mask (2D): shape (`batch_size`, `q_len`), with `True` for
-	      valid and `False` for masked positions.
-	    - Integer mask (2D): shape (`batch_size`, `q_len`), where the value at
-	      each position indicates the length of the sequence to attend to.
-	    - 3D mask: shape (`batch_size`, `q_len`, `kv_len`), with `True` for
-	      valid and `False` for masked positions.
+			- No mask (default):  All attention weights are computed.
+			- Boolean mask (2D): shape (`batch_size`, `q_len`), with `True` for
+				valid and `False` for masked positions.
+			- Integer mask (2D): shape (`batch_size`, `q_len`), where the value at
+				each position indicates the length of the sequence to attend to.
+			- 4D mask: shape (`batch_size`, `q_len`, `kv_len`), with `True` for
+				valid and `False` for masked positions.
 
-	  bias: Optional attention bias.
-	  dropout: Dropout rate.
-	  inference: Whether to run in inference mode.
-	  key: PRNG key for dropout.
-	  blocksize_q: Block size for query processing.
-	  blocksize_k: Block size for key/value processing.
-	  dtype: Optional dtype for the output.
-	  precision: Optional precision for matrix multiplication.
+		bias: Optional attention bias.
+		dropout: Dropout rate.
+		inference: Whether to run in inference mode.
+		key: PRNG key for dropout.
+		blocksize_q: Block size for query processing.
+		blocksize_k: Block size for key/value processing.
+		dtype: Optional dtype for the output.
+		precision: Optional precision for matrix multiplication.
 		head_dim: Optional head dim to be used at `query_state = query_state / math.sqrt(float(head_dim or query_state.shape[-1]))`.
 		softmax_scale Optional softmax_scale to be used for `query_state = query_state * softmax_scale`
 
 	Returns:
-	  Output of multi-head attention, with shape
-	  (`batch_size`, `num_heads`, `q_len`, `head_dim`).
+		Output of multi-head attention, with shape
+		(`batch_size`, `q_len`, `num_heads`, `head_dim`).
 
 	Raises:
-	  ValueError: If `dropout` is not in the range [0, 1], or if `key` is not
-	    provided during training when `dropout` > 0.
+		ValueError: If `dropout` is not in the range [0, 1], or if `key` is not
+			provided during training when `dropout` > 0.
 	"""
+	query_state, key_state, value_state = map(
+		lambda x: x.transpose(0, 2, 1, 3),
+		[query_state, key_state, value_state],
+	)
 	if not inference and dropout > 0 and key is None:
 		raise ValueError("key must be provided for training")
 	if dropout < 0 or dropout > 1:
@@ -129,7 +133,7 @@ def flash_attention2(
 		blocksize_k,
 		dtype,
 		precision,
-	)
+	).transpose(0, 2, 1, 3)
 
 
 @functools.partial(
@@ -193,8 +197,10 @@ def _fwd_flash_attn(
 	"""Forward pass of FlashAttention."""
 	b, h, _, d = query_state.shape
 	q_seq = query_state.shape[2]
-	k_seq = key_state.shape[2] 
-	assert q_seq % blocksize_q == 0, "Query sequence length is not visible by queryblock size"
+	k_seq = key_state.shape[2]
+	assert (
+		q_seq % blocksize_q == 0
+	), "Query sequence length is not visible by queryblock size"
 	assert k_seq % blocksize_k == 0, "Key sequence length is not visible by keyblock size"
 	Tr = q_seq // blocksize_q
 	Tc = k_seq // blocksize_k
@@ -248,7 +254,9 @@ def _fwd_flash_attn(
 				b_ij = jax.lax.dynamic_slice_in_dim(b_i, j * blocksize_k, blocksize_k, 3)
 				s_ij = s_ij + b_ij
 			if global_mask is not None:
-				ma_i = jax.lax.dynamic_slice_in_dim(global_mask, i * blocksize_q, blocksize_q, 2)
+				ma_i = jax.lax.dynamic_slice_in_dim(
+					global_mask, i * blocksize_q, blocksize_q, 2
+				)
 				ma_ij = jax.lax.dynamic_slice_in_dim(ma_i, j * blocksize_k, blocksize_k, 3)
 				s_ij = jnp.where(ma_ij, s_ij, -1e10)
 
@@ -393,7 +401,9 @@ def _bwd_flash_attn(
 				s_ij = s_ij + b_ij
 
 			if global_mask is not None:
-				ma_i = jax.lax.dynamic_slice_in_dim(global_mask, i * blocksize_q, blocksize_q, 2)
+				ma_i = jax.lax.dynamic_slice_in_dim(
+					global_mask, i * blocksize_q, blocksize_q, 2
+				)
 				ma_ij = jax.lax.dynamic_slice_in_dim(ma_i, j * blocksize_k, blocksize_k, 3)
 				s_ij = jnp.where(ma_ij, s_ij, -1e10)
 
@@ -435,8 +445,12 @@ def _bwd_flash_attn(
 			(i_start, j, dQ, dK_j, dV_j),
 		)
 
-		dK = jax.lax.dynamic_update_slice_in_dim(dK, dK_j.astype(dK.dtype), j * blocksize_q, 2)
-		dV = jax.lax.dynamic_update_slice_in_dim(dV, dV_j.astype(dV.dtype), j * blocksize_q, 2)
+		dK = jax.lax.dynamic_update_slice_in_dim(
+			dK, dK_j.astype(dK.dtype), j * blocksize_q, 2
+		)
+		dV = jax.lax.dynamic_update_slice_in_dim(
+			dV, dV_j.astype(dV.dtype), j * blocksize_q, 2
+		)
 
 		return j + 1, dQ, dK, dV
 
@@ -453,7 +467,7 @@ _flash_attn2.defvjp(_fwd_flash_attn, _bwd_flash_attn)
 
 
 def fwd_test():
-	b, h, qs, s, d = 1, 8, 32, 128, 128
+	b, h, qs, s, d = 1, 32, 2048, 2048, 128
 	dtype = jnp.float16
 
 	q = jrand.normal(rng.rng, shape=(b, qs, h, d), dtype=dtype)
@@ -464,7 +478,6 @@ def fwd_test():
 		0,
 		jnp.finfo(dtype).min,
 	)
-
 	excepted_result = flax.linen.attention.dot_product_attention(
 		query=q,
 		key=k,
@@ -472,14 +485,14 @@ def fwd_test():
 		bias=b,
 	)
 	result = flash_attention2(
-		query_state=q.transpose(0, 2, 1, 3),
-		key_state=k.transpose(0, 2, 1, 3),
-		value_state=v.transpose(0, 2, 1, 3),
+		query_state=q,
+		key_state=k,
+		value_state=v,
 		bias=b,
 		dtype=dtype,
 		blocksize_q=64,
 		blocksize_k=64,
-	).transpose(0, 2, 1, 3)
+	)
 
 	print(f"PRED : {result[0,0,0,:5]}")
 	print(f"ORGN : {excepted_result[0,0,0,:5]}")
@@ -511,11 +524,7 @@ def bwd_test():
 			blocksize_k=s,
 			precision=jax.lax.Precision("HIGHEST".lower()),
 		).sum()
-	)(
-		q.transpose(0, 2, 1, 3),
-		k.transpose(0, 2, 1, 3),
-		v.transpose(0, 2, 1, 3),
-	).transpose(0, 2, 1, 3)
+	)(q, k, v)
 
 	print(f"PRED BWD : {result[0,0,0,:5]}")
 	print(f"ORGN BWD : {excepted_result[0,0,0,:5]}")
@@ -523,10 +532,10 @@ def bwd_test():
 	print(jnp.allclose(excepted_result, result, atol=0.125, rtol=0))
 
 
-jax_flash_attn_2_mu = _flash_attn2
+jax_flash_attn_2_mu = flash_attention2
 
 __all__ = ["jax_flash_attn_2_mu"]
 
 if __name__ == "__main__":
-	fwd_test()
+	# fwd_test()
 	bwd_test()
