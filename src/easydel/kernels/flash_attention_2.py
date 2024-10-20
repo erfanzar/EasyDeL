@@ -60,6 +60,20 @@ def flash_attention2(
 
 	if platform == Ellipsis:
 		raise NotImplementedError(f"there's no available platform for backend {backend}")
+
+	def jax_flash_attn_submit():
+		return jax_flash_attn_2_mu(
+			query_state=query,
+			key_state=key,
+			value_state=value,
+			mask=None,
+			bias=bias,
+			blocksize_q=blocksize_q,
+			blocksize_k=blocksize_k,
+			dtype=query.dtype,
+			softmax_scale=softmax_scale,
+		)
+
 	match backend:
 		case "gpu":
 			match platform:
@@ -84,42 +98,15 @@ def flash_attention2(
 						softmax_scale=softmax_scale,
 					)
 				case "jax":
-					return jax_flash_attn_2_mu(
-						query_state=query.transpose(0, 2, 1, 3),
-						key_state=key.transpose(0, 2, 1, 3),
-						value_state=value.transpose(0, 2, 1, 3),
-						mask=None,
-						bias=bias,
-						blocksize_q=blocksize_q,
-						blocksize_k=blocksize_k,
-						dtype=query.dtype,
-					)
+					return jax_flash_attn_submit()
 		case "cpu":
 			match platform:
 				case "jax":
-					return jax_flash_attn_2_mu(
-						query_state=query.transpose(0, 2, 1, 3),
-						key_state=key.transpose(0, 2, 1, 3),
-						value_state=value.transpose(0, 2, 1, 3),
-						mask=None,
-						bias=bias,
-						blocksize_q=blocksize_q,
-						blocksize_k=blocksize_k,
-						dtype=query.dtype,
-					)
+					return jax_flash_attn_submit()
 		case "tpu":
 			match platform:
 				case "jax":
-					return jax_flash_attn_2_mu(
-						query_state=query.transpose(0, 2, 1, 3),
-						key_state=key.transpose(0, 2, 1, 3),
-						value_state=value.transpose(0, 2, 1, 3),
-						mask=None,
-						bias=bias,
-						blocksize_q=blocksize_q,
-						blocksize_k=blocksize_k,
-						dtype=query.dtype,
-					)
+					return jax_flash_attn_submit()
 				case "pallas":
 					return pallas_flash_attention_tpu(
 						q=query.transpose(0, 2, 1, 3),
@@ -146,52 +133,38 @@ def flash_attention2(
 
 def _test_backward():
 	"""Tests the backward pass of the attention mechanism."""
-	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
-	B, H, S, D = 1, 1, 3, 16
-	blocksize_k = 16
-	blocksize_q = 16
-	q = jax.nn.initializers.normal(2)(q_key, (B, S, H, D), dtype=jnp.float16)
-	k = jax.nn.initializers.normal(2)(k_key, (B, S, H, D), dtype=jnp.float16)
-	v = jax.nn.initializers.normal(2)(v_key, (B, S, H, D), dtype=jnp.float16)
+	from fjformer import GenerateRNG
+	import flax
 
-	b = (
-		jnp.where(
-			jrnd.randint(v_key, (B, H, S, S), 0, 4) > 2,
-			jnp.finfo(jnp.float16).min,
-			0,
-		)
-		if False  # Set to True to test with bias
-		else None
+	b, h, qs, s, d = 2, 32, 64, 64, 64
+	dtype = jnp.float16
+	rng = GenerateRNG()
+
+	q = jrnd.normal(rng.rng, shape=(b, qs, h, d), dtype=dtype)
+	k = jrnd.normal(rng.rng, shape=(b, s, h, d), dtype=dtype)
+	v = jrnd.normal(rng.rng, shape=(b, s, h, d), dtype=dtype)
+	b = jnp.where(
+		jrnd.randint(rng.rng, shape=(b, h, qs, s), minval=0, maxval=3) > 1,
+		0,
+		jnp.finfo(dtype).min,
 	)
 
-	try:
-		co = jax.grad(
-			lambda *x: flash_attention2(*x, None, blocksize_k, blocksize_q).sum()
-		)(q, k, v, b)
-		print("Custom op backward pass gradients:")
-		print(co[-1][-1, -1, :5])  # Print last 5 elements of last head of last batch
-	except Exception as er:
-		print(f"Custom op backward pass failed: {er}")
-		co = None
+	excepted_result = jax.grad(
+		lambda *x: flax.linen.attention.dot_product_attention(*x).sum()
+	)(q, k, v)
+	result = jax.grad(
+		lambda *x: flash_attention2(
+			*x,
+			blocksize_q=qs,
+			blocksize_k=s,
+			platform="jax",
+		).sum()
+	)(q, k, v)
 
-	try:
-		import flax
+	print(f"PRED BWD : {result[0,0,0,:5]}")
+	print(f"ORGN BWD : {excepted_result[0,0,0,:5]}")
 
-		fo = jax.grad(lambda *x: flax.linen.attention.dot_product_attention(*x).sum())(
-			q, k, v, b
-		)
-		print("Flax backward pass gradients:")
-		print(fo[-1][-1, -1, :5])  # Print last 5 elements of last head of last batch
-	except Exception as e:
-		print(f"Flax backward pass failed : {e}")
-		fo = None
-		exit()
-
-	if fo is not None and co is not None:
-		if jnp.allclose(co, fo, atol=0.125):
-			print("Backward pass results are close.")
-		else:
-			print("Backward pass results differ significantly!")
+	print(jnp.allclose(excepted_result, result, atol=0.125, rtol=0))
 
 
 def _test_forward():
@@ -214,15 +187,14 @@ def _test_forward():
 	print("QKV Allocated")
 	try:
 		co = flash_attention2(
-			q,
-			k,
-			v,
-			b,
-			None,
-			blocksize_q,
-			blocksize_k,
-			backend="gpu",
-			platform="triton",
+			query=q,
+			key=k,
+			value=v,
+			bias=b,
+			blocksize_q=blocksize_q,
+			blocksize_k=blocksize_k,
+			# backend="gpu",
+			platform="jax",
 		)
 		print(co[-1, -1, -1, :5])
 	except Exception as er:
@@ -241,5 +213,5 @@ def _test_forward():
 
 
 if __name__ == "__main__":
-	_test_forward()
-	# _test_backward()
+	# _test_forward()
+	_test_backward()
