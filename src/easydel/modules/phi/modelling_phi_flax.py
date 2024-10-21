@@ -189,7 +189,8 @@ class FlaxPhiAttention(FlaxAttentionModule):
 			)
 
 		self.attention_performer = FlexibleAttentionModule(
-			num_attention_heads=self.config.num_attention_heads,
+			num_q_heads=self.config.num_attention_heads,
+			num_kv_heads=self.config.num_key_value_heads,
 			attention_dropout=self.config.attention_dropout,
 			head_dims=self.head_dim,
 			shard_attention_computation=self.config.shard_attention_computation,
@@ -355,12 +356,7 @@ class FlaxPhiAttention(FlaxAttentionModule):
 				query_states,
 				attention_mask,
 			)
-
-		key_states, value_states = self.repeat_key_value(
-			key_states,
-			value_states,
-			self.num_key_value_groups,
-		)
+ 
 		attention_bias = lax.select(
 			attention_mask > 0,
 			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),

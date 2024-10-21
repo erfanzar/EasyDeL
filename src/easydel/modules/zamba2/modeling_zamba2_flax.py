@@ -126,7 +126,8 @@ class FlaxZamba2Attention(FlaxAttentionModule):
 
 		self.attention_performer = FlexibleAttentionModule(
 			attention_dropout=self.config.attention_dropout,
-			num_attention_heads=self.config.num_attention_heads,
+			num_q_heads=self.config.num_attention_heads,
+			num_kv_heads=self.config.num_key_value_heads,
 			head_dims=self.head_dim,
 			precision=self.precision,
 			force_float32_tpu=True,
@@ -272,12 +273,7 @@ class FlaxZamba2Attention(FlaxAttentionModule):
 				query_states,
 				attention_mask,
 			)
-
-		key_states, value_states = self.repeat_key_value(
-			key_states,
-			value_states,
-			self.num_key_value_groups,
-		)
+ 
 		attention_bias = lax.select(
 			attention_mask > 0,
 			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),

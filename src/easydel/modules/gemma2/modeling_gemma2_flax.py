@@ -171,7 +171,8 @@ class FlaxGemma2Attention(FlaxAttentionModule):
 		self.o_proj = dense_class(self.embed_dim)
 		self.sliding_window = config.sliding_window if (self.layer_idx % 2 == 0) else None
 		self.attention_performer = FlexibleAttentionModule(
-			num_attention_heads=self.config.num_attention_heads,
+			num_q_heads=self.config.num_attention_heads,
+			num_kv_heads=self.config.num_key_value_heads,
 			attention_dropout=self.config.attention_dropout,
 			head_dims=self.head_dim,
 			shard_attention_computation=self.config.shard_attention_computation,
@@ -322,11 +323,6 @@ class FlaxGemma2Attention(FlaxAttentionModule):
 				attention_mask,
 			)
 
-		key_states, value_states = self.repeat_key_value(
-			key_states,
-			value_states,
-			self.num_key_value_groups,
-		)
 
 		if bool((self.layer_idx % 2) == 0):
 			sliding_window_mask = jnp.tril(

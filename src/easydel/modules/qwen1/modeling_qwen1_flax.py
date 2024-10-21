@@ -241,7 +241,8 @@ class FlaxQwen1Attention(FlaxAttentionModule):
 		self.logn_tensor = logn_tensor
 		self.rotary = FlaxQwen1EmbeddingApplyer(self.dtype)
 		self.attention_performer = FlexibleAttentionModule(
-			num_attention_heads=self.config.num_attention_heads,
+			num_q_heads=self.config.num_attention_heads,
+			num_kv_heads=self.config.num_attention_heads,
 			attention_dropout=self.config.attn_dropout_prob,
 			head_dims=self.head_dim,
 			shard_attention_computation=self.config.shard_attention_computation,

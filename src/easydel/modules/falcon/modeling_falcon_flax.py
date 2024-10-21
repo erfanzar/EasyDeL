@@ -186,7 +186,8 @@ class FlaxFalconAttention(FlaxAttentionModule):
 		self.rotary = FlaxFalconRotaryEmbedding(self.dtype)
 		self.attention_performer = FlexibleAttentionModule(
 			attention_dropout=0.0,
-			num_attention_heads=config.num_attention_heads,
+			num_q_heads=self.config.num_attention_heads,
+			num_kv_heads=self.config.num_attention_heads,
 			head_dims=self.head_dim,
 			precision=self.precision,
 			force_float32_tpu=True,

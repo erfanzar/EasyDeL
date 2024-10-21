@@ -191,7 +191,8 @@ class FlaxGemmaAttention(FlaxAttentionModule):
 			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
 		)
 		self.attention_performer = FlexibleAttentionModule(
-			num_attention_heads=self.config.num_attention_heads,
+			num_q_heads=self.config.num_attention_heads,
+			num_kv_heads=self.config.num_key_value_heads,
 			attention_dropout=self.config.attention_dropout,
 			head_dims=self.head_dim,
 			precision=self.precision,
@@ -342,11 +343,6 @@ class FlaxGemmaAttention(FlaxAttentionModule):
 				attention_mask,
 			)
 
-		key_states, value_states = self.repeat_key_value(
-			key_states,
-			value_states,
-			self.num_key_value_groups,
-		)
 
 		attention_bias = lax.select(
 			attention_mask > 0,

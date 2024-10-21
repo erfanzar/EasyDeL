@@ -130,7 +130,8 @@ class FlaxDbrxAttention(FlaxAttentionModule):
 
 		self.rotary = FlaxDbrxEmbedding(self.dtype)
 		self.attention_performer = FlexibleAttentionModule(
-			num_attention_heads=self.num_attention_heads,
+			num_q_heads=self.num_attention_heads,
+			num_kv_heads=self.num_key_value_heads,
 			attention_dropout=self.config.attn_config.attn_pdrop,
 			head_dims=self.head_dim,
 			shard_attention_computation=self.config.shard_attention_computation,
@@ -284,21 +285,6 @@ class FlaxDbrxAttention(FlaxAttentionModule):
 				query_states,
 				attention_mask,
 			)
-
-		key_states, value_states = self.repeat_key_value(
-			key_states,
-			value_states,
-			self.num_key_value_groups,
-		)
-		assert_msg = (
-			"num_attention_heads repeat wont work likely\n"
-			f"INFO :\n\trepeat_key_values Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
-			f"NH : {self.num_attention_heads} KVH : {self.num_attention_heads}"
-		)
-
-		assert query_states.shape[-2] == self.num_attention_heads, assert_msg
-		assert key_states.shape[-2] == self.num_attention_heads, assert_msg
-		assert value_states.shape[-2] == self.num_attention_heads, assert_msg
 
 		attention_bias = lax.select(
 			attention_mask > 0,

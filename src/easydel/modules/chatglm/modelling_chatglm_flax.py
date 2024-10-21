@@ -258,7 +258,8 @@ class CoreAttention(nn.Module):
 		self.attention_dropout = nn.Dropout(config.attention_dropout)
 		self.attention_performer = FlexibleAttentionModule(
 			attention_dropout=self.config.attention_dropout,
-			num_attention_heads=self.config.num_attention_heads,
+			num_q_heads=self.config.num_attention_heads,
+			num_kv_heads=self.config.num_attention_heads,
 			head_dims=self.head_dim,
 			precision=self.precision,
 			force_float32_tpu=True,
@@ -563,18 +564,8 @@ class FlaxChatGLMAttention(FlaxAttentionModule):
 			key_layer, value_layer, attention_mask = self._concatenate_to_cache(
 				key_layer, value_layer, query_layer, attention_mask
 			)
-		key_layer, value_layer = self.repeat_key_value(
-			key_layer, value_layer, self.num_num_key_value_groupsreps
-		)
-		assert_msg = (
-			"num_attention_heads repeat wont work likely\n"
-			f"INFO :\n\trepeat_key_values Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
-			f"NH : {self.config.num_attention_heads} KVH : {self.config.num_attention_heads}"
-		)
 
-		assert query_layer.shape[-2] == self.config.num_attention_heads, assert_msg
-		assert key_layer.shape[-2] == self.config.num_attention_heads, assert_msg
-		assert value_layer.shape[-2] == self.config.num_attention_heads, assert_msg
+
 		attn_output = self.core_attention(
 			query_layer, key_layer, value_layer, attention_mask, causal_mask
 		)

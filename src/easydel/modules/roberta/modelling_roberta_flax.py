@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -117,7 +116,8 @@ class FlaxRobertaSelfAttention(FlaxAttentionModule):
 			)
 		self.attention_performer = FlexibleAttentionModule(
 			use_sharding_constraint=self.config.use_sharding_constraint,
-			num_attention_heads=self.config.num_attention_heads,
+			num_q_heads=self.config.num_attention_heads,
+			num_kv_heads=self.config.num_attention_heads,
 			attention_dropout=0.0,
 			head_dims=self.head_dim,
 			shard_attention_computation=self.config.shard_attention_computation,

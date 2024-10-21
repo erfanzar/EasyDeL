@@ -102,7 +102,8 @@ class FlaxXerxesAttention(FlaxAttentionModule):
 		self.v_proj = dense_class(self.num_key_value_heads * self.head_dim)
 		self.o_proj = dense_class(self.embed_dim)
 		self.attention_performer = FlexibleAttentionModule(
-			num_attention_heads=self.config.num_attention_heads,
+			num_q_heads=self.config.num_attention_heads,
+			num_kv_heads=self.config.num_key_value_heads,
 			head_dims=self.head_dim,
 			shard_attention_computation=self.config.shard_attention_computation,
 			precision=self.precision,
@@ -250,13 +251,7 @@ class FlaxXerxesAttention(FlaxAttentionModule):
 				value_states,
 				query_states,
 				attention_mask,
-			)
-
-		key_states, value_states = self.repeat_key_value(
-			key_states,
-			value_states,
-			self.num_key_value_groups,
-		)
+			) 
 
 		if bool((self.layer_idx % 2) == 0):
 			attention_mask = jnp.logical_and(

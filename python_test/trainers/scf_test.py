@@ -99,7 +99,7 @@ def main(use_iterable_dataset: bool):
 		intermediate_size=1024,
 		max_position_embeddings=sequence_length,
 		attn_dtype=jnp.float32,
-		attn_mechanism=AttentionMechanisms.flash_attn2,
+		attn_mechanism=AttentionMechanisms.vanilla,
 		block_k=64,
 		block_q=64,
 		platform="jax",

@@ -503,7 +503,8 @@ class FlaxDeepseekV2Attention(FlaxAttentionModule):
 				softmax_scale = self.softmax_scale * mscale * mscale
 
 		self.attention_performer = FlexibleAttentionModule(
-			num_attention_heads=self.config.num_attention_heads,
+			num_q_heads=self.config.num_attention_heads,
+			num_kv_heads=self.config.num_key_value_heads,
 			attention_dropout=self.config.attention_dropout,
 			head_dims=self.q_head_dim,
 			precision=self.precision,
