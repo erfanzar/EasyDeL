@@ -199,7 +199,8 @@ class FlaxCohereAttention(FlaxAttentionModule):
 
 		self.rotary = FlaxCohereEmbedding(self.dtype)
 		self.attention_performer = FlexibleAttentionModule(
-			num_attention_heads=self.config.num_attention_heads,
+			num_q_heads=self.config.num_attention_heads,
+			num_kv_heads=self.config.num_key_value_heads,
 			attention_dropout=self.config.attention_dropout,
 			head_dims=self.head_dim,
 			precision=self.precision,
@@ -346,21 +347,6 @@ class FlaxCohereAttention(FlaxAttentionModule):
 				query_states,
 				attention_mask,
 			)
-
-		key_states, value_states = self.repeat_key_value(
-			key_states,
-			value_states,
-			self.num_key_value_groups,
-		)
-		assert_msg = (
-			"num_attention_heads repeat wont work likely\n"
-			f"INFO :\n\trepeat_key_values Used with num_key_value_groups = {self.num_key_value_groups}\n\t"
-			f"NH : {self.config.num_attention_heads} KVH : {self.config.num_attention_heads}"
-		)
-
-		assert query_states.shape[-2] == self.config.num_attention_heads, assert_msg
-		assert key_states.shape[-2] == self.config.num_attention_heads, assert_msg
-		assert value_states.shape[-2] == self.config.num_attention_heads, assert_msg
 
 		attention_bias = lax.select(
 			attention_mask > 0,

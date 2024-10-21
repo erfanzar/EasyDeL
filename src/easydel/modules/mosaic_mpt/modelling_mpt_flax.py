@@ -138,7 +138,8 @@ class FlaxMptAttention(FlaxAttentionModule):
 
 		self.attention_performer = FlexibleAttentionModule(
 			attention_dropout=self.config.attn_config.attn_pdrop,
-			num_attention_heads=self.config.num_attention_heads,
+			num_q_heads=self.config.n_heads,
+			num_kv_heads=self.config.n_heads,
 			head_dims=self.head_dim,
 			precision=self.precision,
 			force_float32_tpu=True,

@@ -131,18 +131,8 @@ class FlaxGPTJAttention(FlaxAttentionModule):
 
 		self.attention_performer = FlexibleAttentionModule(
 			use_sharding_constraint=self.config.use_sharding_constraint,
-			block_k_major=self.config.block_k_major,
-			block_b=self.config.block_b,
-			block_q=self.config.block_q,
-			block_k=self.config.block_k,
-			block_q_major_dkv=self.config.block_q_major_dkv,
-			block_k_major_dkv=self.config.block_k_major_dkv,
-			block_k_major_dq=self.config.block_k_major_dq,
-			block_k_dkv=self.config.block_k_dkv,
-			block_q_dkv=self.config.block_q_dkv,
-			block_q_dq=self.config.block_q_dq,
-			block_k_dq=self.config.block_k_dq,
-			num_attention_heads=self.config.num_attention_heads,
+			num_q_heads=self.config.num_attention_heads,
+			num_kv_heads=self.config.num_attention_heads,
 			attention_dropout=self.config.attn_pdrop,
 			head_dims=self.head_dim,
 			shard_attention_computation=self.config.shard_attention_computation,
@@ -154,6 +144,7 @@ class FlaxGPTJAttention(FlaxAttentionModule):
 			scan_ring_attention=self.config.scan_ring_attention,
 			mesh=self.config.mesh,
 			sm_scale=1 / math.sqrt(self.head_dim),
+			base_config=self.config,
 		)
 
 	def _split_heads(self, hidden_states):

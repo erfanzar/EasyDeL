@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -149,7 +148,8 @@ class FlaxOpenELMMultiHeadCausalAttention(FlaxAttentionModule):
 		self.head_dim = head_dim
 		self.rotary = FlaxOpenELMRotaryEmbedding(self.dtype)
 		self.attention_performer = FlexibleAttentionModule(
-			num_attention_heads=q_heads,
+			num_q_heads=q_heads,
+			num_kv_heads=k_heads,
 			attention_dropout=0.0,
 			head_dims=head_dim,
 			shard_attention_computation=self.config.shard_attention_computation,
@@ -321,9 +321,6 @@ class FlaxOpenELMMultiHeadCausalAttention(FlaxAttentionModule):
 				attention_mask,
 			)
 
-		key_states, value_states = self.repeat_key_value(
-			key_states, value_states, self.num_groups
-		)
 		attention_bias = lax.select(
 			attention_mask > 0,
 			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -937,7 +934,6 @@ class FlaxOpenELMPretrainedModel(EDPretrainedModel):
 			return random_params
 
 	def init_cache(self, batch_size, max_length):
-
 		return super().init_cache(batch_size=batch_size, max_length=max_length)
 
 	def __call__(
@@ -1146,7 +1142,7 @@ class FlaxOpenELMForCausalLMModule(nn.Module):
 			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
-		
+
 		lm_logits = lm_logits[:, : self.config.vocab_size]
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]

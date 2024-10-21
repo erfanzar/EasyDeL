@@ -11,12 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import math
 import time
 import warnings
 from functools import partial
-from typing import Any, Literal, Optional, Tuple, List, Dict
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import fjformer
 import jax
@@ -40,6 +39,7 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec
 
+import einops
 from easydel.etils.etils import (
 	_AVAILABLE_ATTENTION_MECHANISMS,
 	AVAILABLE_ATTENTION_MECHANISMS,
@@ -160,17 +160,17 @@ class FlexibleAttentionModule(object):
 	Key Features:
 
 	* **Attention Mechanism Selection:** Supports a wide range of attention mechanisms,
-	  allowing users to choose the most suitable option based on performance and hardware constraints.
+		allowing users to choose the most suitable option based on performance and hardware constraints.
 	* **Sharding and Partitioning:** Integrates with JAX's sharding capabilities, enabling efficient
-	  distribution of computations and data across multiple devices.
+		distribution of computations and data across multiple devices.
 	* **Block-wise Computation:** Implements block-wise attention computations for optimized memory
-	  usage and speed, particularly beneficial for large models.
+		usage and speed, particularly beneficial for large models.
 	* **Performance Optimization:** Includes support for highly optimized implementations like
-	  FlashAttention, SplashAttention, and RingAttention for TPU and GPU acceleration.
+		FlashAttention, SplashAttention, and RingAttention for TPU and GPU acceleration.
 	* **Flexibility and Customization:** Offers fine-grained control over attention parameters,
-	  sharding specifications, and block sizes, providing flexibility for different use cases.
+		sharding specifications, and block sizes, providing flexibility for different use cases.
 	* **Testing and Evaluation:** Includes a `test_attentions` method to systematically evaluate
-	  different attention mechanisms and help users identify the best-performing option.
+		different attention mechanisms and help users identify the best-performing option.
 
 	Example Usage:
 
@@ -200,14 +200,15 @@ class FlexibleAttentionModule(object):
 	computations. It provides a user-friendly way to select and execute different attention mechanisms,
 	leveraging JAX's sharding capabilities and offering performance enhancements through specialized implementations
 	 like FlashAttention and SplashAttention. Its ability to handle block-wise computations and customization options
-	  makes it adaptable to a variety of model architectures and hardware configurations.
+		makes it adaptable to a variety of model architectures and hardware configurations.
 	"""
 
 	def __init__(
 		self,
 		mesh: Mesh,
 		sm_scale: float,
-		num_attention_heads: int,
+		num_kv_heads: int,
+		num_q_heads: int,
 		head_dims: int,
 		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = AttentionMechanisms.ring,
 		block_k: int = ...,
@@ -259,13 +260,16 @@ class FlexibleAttentionModule(object):
 
 		self.mesh = mesh
 		self.attn_mechanism = attn_mechanism 
-		self.sm_scale = sm_scale
-		self.num_attention_heads = num_attention_heads
+		self.sm_scale = sm_scale  
 		self.head_dims = head_dims
 		self.scan_attention_layers = scan_attention_layers
 		self.attention_dropout = attention_dropout
 		self.backward_pass_impl = backward_pass_impl
 		self._do_check = _do_check
+		self.num_kv_heads = num_kv_heads or num_q_heads
+		self.num_q_heads = num_q_heads
+		assert num_q_heads % num_kv_heads == 0 
+
 		if attn_mechanism == "splash" and self.backend != "tpu":
 			raise OSError("splash attention is only supported on TPU.")
 		if attn_mechanism == "cudnn" and self.backend != "gpu":
@@ -444,23 +448,23 @@ class FlexibleAttentionModule(object):
 		k_v_req_shape = (
 			batch_size,
 			key_value_sequence_length,
-			self.num_attention_heads,
+			self.num_kv_heads,
 			self.head_dims,
 		)
 		q_shape = (
 			batch_size,
 			query_sequence_length,
-			self.num_attention_heads,
+			self.num_q_heads,
 			self.head_dims,
 		)
 
 		assertion_mkv_err = f"""
-        query_states, key_states, value_states and bias shapes must be like
-        query_states Shape : [batch_size, q_seq_len , {self.num_attention_heads=}, {self.head_dims=}]
-        key_states   Shape : [batch_size, kv_seq_len, {self.num_attention_heads=}, {self.head_dims=}]
-        value_states Shape : [batch_size, kv_seq_len, {self.num_attention_heads=}, {self.head_dims=}]
-        bias         Shape : [batch_size, {self.num_attention_heads=}, q_seq_len , kv_seq_len]
-            """
+				query_states, key_states, value_states and bias shapes must be like
+				query_states Shape : [batch_size, q_seq_len , {self.head_dims=}, {self.head_dims=}]
+				key_states   Shape : [batch_size, kv_seq_len, {self.num_kv_heads=}, {self.head_dims=}]
+				value_states Shape : [batch_size, kv_seq_len, {self.num_kv_heads=}, {self.head_dims=}]
+				bias         Shape : [batch_size, {self.head_dims=}, q_seq_len , kv_seq_len]
+						"""
 
 		assert query_states.shape == q_shape, assertion_mkv_err + (
 			f"\nMiss Match {query_states.shape} and " f"required Shape {q_shape}"
@@ -521,8 +525,6 @@ class FlexibleAttentionModule(object):
 						query_sequence_length=query_sequence_length,
 						key_value_sequence_length=key_value_sequence_length,
 					)
-
-			
 				case AttentionMechanisms.ring:
 					return self.ring_attention(
 						query_states=query_states,
@@ -588,6 +590,11 @@ class FlexibleAttentionModule(object):
 		value_states: Array,
 		bias: Optional[Array] = None,
 	):
+		key_states, value_states = self.repeat_kv_heads(
+			key_states,
+			value_states,
+			self.num_q_heads // self.num_kv_heads,
+		)
 		# fmt:off
 		qps, kps, vps, bps, aps, _ = self.get_bshd_partition_specs(query_states.shape[1])
 		assert bias.ndim == 4
@@ -626,9 +633,19 @@ class FlexibleAttentionModule(object):
 		dropout_rng: Optional[random.PRNGKey] = None,
 		segment_ids: Optional[Array] = None,
 	):
-		qps, kps, vps, bps, aps, _ = self.get_bshd_partition_specs(
-			query_states.shape[1], True
+		key_states, value_states = self.repeat_kv_heads(
+			key_states,
+			value_states,
+			self.num_q_heads // self.num_kv_heads,
 		)
+		(
+			qps,
+			kps,
+			vps,
+			bps,
+			aps,
+			_,
+		) = self.get_bshd_partition_specs(query_states.shape[1], True)
 		attn_output = shard_map(
 			partial(
 				ring_attention,
@@ -673,15 +690,23 @@ class FlexibleAttentionModule(object):
 		key_value_sequence_length: int,
 	) -> AttentionOutput:
 		with self.mesh:
-			qps, kps, vps, bps, aps, is_gen = self.get_bshd_partition_specs(
-				query_sequence_length
-			)
-
+			(
+				qps,
+				kps,
+				vps,
+				bps,
+				aps,
+				_,
+			) = self.get_bshd_partition_specs(query_sequence_length)
+		b, qs, qh, d = query_states.shape
 		with self.mesh:
 			query_states = fjformer.with_sharding_constraint(query_states, qps)
 			key_states = fjformer.with_sharding_constraint(key_states, kps)
 			value_states = fjformer.with_sharding_constraint(value_states, vps)
-
+			query_states = jnp.reshape(
+				query_states,
+				(b, qs, self.num_kv_heads, qh // self.num_kv_heads, d),
+			)
 			query_states, key_states, value_states = promote_dtype(
 				query_states,
 				key_states,
@@ -691,14 +716,14 @@ class FlexibleAttentionModule(object):
 
 			query_states = query_states * self.sm_scale
 			attention_weight = jnp.einsum(
-				"...qhd,...khd->...hqk",
+				"...thHd,...Thd->...hHtT",
 				query_states,
 				key_states,
 				precision=self.precision,
 			)
 			if bias is not None:
 				bias = fjformer.with_sharding_constraint(bias, bps)
-				attention_weight = jnp.add(attention_weight, bias)
+				attention_weight = jnp.add(attention_weight, bias[:, :, None, :, :])
 
 			attention_weight = jax.nn.softmax(attention_weight).astype(self.dtype)
 
@@ -711,11 +736,11 @@ class FlexibleAttentionModule(object):
 				attention_weight = attention_weight * multiplier
 
 			attention = jnp.einsum(
-				"...hqk,...khd->...qhd",
+				"...hHtT,...Thd->...thHd",
 				attention_weight,
 				value_states,
 				precision=self.precision,
-			)
+			).reshape(b, qs, qh, d)
 			attention = fjformer.with_sharding_constraint(attention, aps)
 			return AttentionOutput(
 				attention_weights=attention_weight, attention_outputs=attention
@@ -733,9 +758,19 @@ class FlexibleAttentionModule(object):
 		query_sequence_length: int,
 		key_value_sequence_length: int,
 	) -> AttentionOutput:
-		qps, kps, vps, bps, aps, is_gen = self.get_bshd_partition_specs(
-			query_sequence_length
+		key_states, value_states = self.repeat_kv_heads(
+			key_states,
+			value_states,
+			self.num_q_heads // self.num_kv_heads,
 		)
+		(
+			qps,
+			kps,
+			vps,
+			bps,
+			aps,
+			_,
+		) = self.get_bshd_partition_specs(query_sequence_length)
 
 		with self.mesh:
 			query_states = with_sharding_constraint(query_states, qps)
@@ -771,9 +806,19 @@ class FlexibleAttentionModule(object):
 		key_value_sequence_length: int,
 		attention_mask: Array,
 	) -> AttentionOutput:
-		qps, kps, vps, bps, aps, is_gen = self.get_bhsd_partition_specs(
-			query_sequence_length
+		key_states, value_states = self.repeat_kv_heads(
+			key_states,
+			value_states,
+			self.num_q_heads // self.num_kv_heads,
 		)
+		(
+			qps,
+			kps,
+			vps,
+			_,
+			_,
+			_,
+		) = self.get_bhsd_partition_specs(query_sequence_length)
 
 		query_states, key_states, value_states = map(
 			lambda s: s.astype(jnp.float32).transpose(0, 2, 1, 3),
@@ -838,6 +883,11 @@ class FlexibleAttentionModule(object):
 		key_value_sequence_length: int,
 	) -> AttentionOutput:
 		"""CUDNN Flash Attention with Transformer Engine."""
+		key_states, value_states = self.repeat_kv_heads(
+			key_states,
+			value_states,
+			self.num_q_heads // self.num_kv_heads,
+		)
 		try:
 			import transformer_engine.jax.fused_attn as fused_attn  # noqa #type:ignore
 			from transformer_engine.jax.fused_attn import (  # noqa #type:ignore
@@ -918,6 +968,13 @@ class FlexibleAttentionModule(object):
 		)
 
 	@staticmethod
+	def repeat_kv_heads(key, value, num_reps: int):
+		return (
+			einops.repeat(key, "b s h d -> b s (h r) d", r=num_reps),
+			einops.repeat(value, "b s h d -> b s (h r) d", r=num_reps),
+		)
+
+	@staticmethod
 	def test_attentions(
 		batch_size: int = 8,
 		sequence_length: int = 128 * 8,
@@ -935,19 +992,19 @@ class FlexibleAttentionModule(object):
 		Test different attention mechanisms and compare their performance.
 
 		Args:
-		    batch_size (int): Size of the batch.
-		    sequence_length (int): Length of the sequence.
-		    num_attention_heads (int): Number of attention heads.
-		    num_key_value_heads (int): Number of key-value heads.
-		    blocksize (int): Size of the block for attention computation.
-		    axis_dims (Tuple[int, int, int, int]): Dimensions for axis configuration.
-		    head_dim (int): Dimension of each attention head.
-		    dtype (jnp.dtype): Data type for computations.
-		    calculate_gradients (bool): Whether to calculate gradients.
-		    test_attentions (List[str]): List of attention mechanisms to test.
+				batch_size (int): Size of the batch.
+				sequence_length (int): Length of the sequence.
+				num_attention_heads (int): Number of attention heads.
+				num_key_value_heads (int): Number of key-value heads.
+				blocksize (int): Size of the block for attention computation.
+				axis_dims (Tuple[int, int, int, int]): Dimensions for axis configuration.
+				head_dim (int): Dimension of each attention head.
+				dtype (jnp.dtype): Data type for computations.
+				calculate_gradients (bool): Whether to calculate gradients.
+				test_attentions (List[str]): List of attention mechanisms to test.
 
 		Returns:
-		    Dict: Results of the attention tests.
+				Dict: Results of the attention tests.
 		"""
 		try:
 			import pandas as pd
