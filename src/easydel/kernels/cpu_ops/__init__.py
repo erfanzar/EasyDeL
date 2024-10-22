@@ -12,5 +12,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.kernels.cpu_ops.jax_flash_attention_2 import jax_flash_attn_2_mu
+from easydel.kernels.cpu_ops.jax_mha_flash_attention_2 import jax_flash_attn_2_mu
 from easydel.kernels.cpu_ops.jax_ring_attention import jax_ring_attention_mu

@@ -16,6 +16,7 @@ io.py
 launch_test.py
 .gradio
 *.easy
+triton_gqa_flash_attention_2.py
 # Distribution / packaging
 *.json
 .Python
