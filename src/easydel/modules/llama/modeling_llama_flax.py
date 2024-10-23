@@ -266,7 +266,6 @@ class FlaxLlamaAttention(FlaxAttentionModule):
 			)
 		else:
 			causal_mask = causal_mask[:, :, :query_length, :key_length]
-
 		batch_size = hidden_states.shape[0]
 		causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
 		if attention_mask.ndim == 2:
@@ -292,7 +291,6 @@ class FlaxLlamaAttention(FlaxAttentionModule):
 			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
 			jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
 		)
-
 		query_length, key_length = query_states.shape[1], key_states.shape[1]
 
 		attentions = self.attention_performer(

@@ -1,7 +1,22 @@
+# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # impl GQA ATTN  by @erfanzar
 import functools
 import math
 import os
+
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "1.0"
@@ -49,38 +64,6 @@ def calculate_num_warps(
 			return 1
 		else:
 			return 4
-
-
-def _simp_attn(
-	query: chex.Array,
-	key: chex.Array,
-	value: chex.Array,
-	bias: Optional[chex.Array],
-	softmax_scale: float,
-) -> chex.Array:
-	"""Simplified attention function for testing and comparison.
-
-	Args:
-		query: Query array of shape (..., num_heads, seq_len_q, head_dim).
-		key: Key array of shape (..., num_heads, seq_len_k, head_dim).
-		value: Value array of shape (..., num_heads, seq_len_k, head_dim).
-		bias: Optional bias array of shape (..., num_heads, seq_len_q, seq_len_k).
-		softmax_scale: Scaling factor for the softmax function.
-
-	Returns:
-		Output array of shape (..., num_heads, seq_len_q, head_dim).
-	"""
-	dtype = query.dtype
-	assert query.ndim == key.ndim, "q, k must have same rank."
-	assert query.shape[:-3] == key.shape[:-3], "q, k batch dims must match."
-	assert query.shape[-2] == key.shape[-2], "q, k num_heads must match."
-	assert query.shape[-1] == key.shape[-1], "q, k depths must match."
-	query = query * softmax_scale
-	attn_weights = jnp.einsum("...qhd,...khd->...hqk", query, key)
-	if bias is not None:
-		attn_weights = attn_weights + bias
-	attn_weights = jax.nn.softmax(attn_weights).astype(dtype)
-	return jnp.einsum("...hqk,...khd->...qhd", attn_weights, value)
 
 
 def get_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
@@ -160,92 +143,61 @@ def check_shapes_and_dtypes(
 	}
 )
 @triton.jit
-def _fwd_attn_kernel_block_ptr(
+def _fwd_gqa_attn_kernel_block_ptr(
 	Q,
 	K,
 	V,
 	B,
 	softmax_scale: tl.constexpr,
-	stride_qb: int,
-	stride_qh: int,
-	stride_qm: int,
-	stride_kb: int,
-	stride_kh: int,
-	stride_kn: int,
-	stride_vb: int,
-	stride_vh: int,
-	stride_vn: int,
-	stride_bb: int,
-	stride_bh: int,
-	stride_bm: int,
-	stride_bn: int,
-	stride_ob: int,
-	stride_oh: int,
-	stride_om: int,
-	stride_lb: int,
-	stride_lh: int,
+	stride_qb,
+	stride_qh,
+	stride_qg,
+	stride_qm,
+	stride_kb,
+	stride_kh,
+	stride_kn,
+	stride_vb,
+	stride_vh,
+	stride_vn,
+	stride_bb,
+	stride_bh,
+	stride_bg,
+	stride_bm,
+	stride_bn,
+	stride_ob,
+	stride_oh,
+	stride_og,
+	stride_om,
+	stride_lb,
+	stride_lh,
+	stride_lg,
 	headdim: tl.constexpr,
-	nheads: tl.constexpr,
-	seqlen_q: int,
-	seqlen_k: int,
+	num_kv_heads: tl.constexpr,
+	num_groups: tl.constexpr,
+	seqlen_q,
+	seqlen_k,
 	O,
 	L,
 	HAVE_BIAS: tl.constexpr,
+	BIAS_SINGLE_HEAD: tl.constexpr,
 	BLOCK_HEADDIM: tl.constexpr,
 	EVEN_N: tl.constexpr,
 	BLOCK_M: tl.constexpr,
 	BLOCK_N: tl.constexpr,
 ):
-	"""Triton kernel for the forward pass of the attention mechanism.
-
-	Args:
-		Q: Query array.
-		K: Key array.
-		V: Value array.
-		B: Bias array.
-		softmax_scale: Scaling factor for the softmax function.
-		stride_qb: Stride for the query batch dimension.
-		stride_qh: Stride for the query head dimension.
-		stride_qm: Stride for the query sequence dimension.
-		stride_kb: Stride for the key batch dimension.
-		stride_kh: Stride for the key head dimension.
-		stride_kn: Stride for the key sequence dimension.
-		stride_vb: Stride for the value batch dimension.
-		stride_vh: Stride for the value head dimension.
-		stride_vn: Stride for the value sequence dimension.
-		stride_bb: Stride for the bias batch dimension.
-		stride_bh: Stride for the bias head dimension.
-		stride_bm: Stride for the bias query sequence dimension.
-		stride_bn: Stride for the bias key sequence dimension.
-		stride_ob: Stride for the output batch dimension.
-		stride_oh: Stride for the output head dimension.
-		stride_om: Stride for the output sequence dimension.
-		stride_lb: Stride for the log-sum-exp batch dimension.
-		stride_lh: Stride for the log-sum-exp head dimension.
-		headdim: Head dimension.
-		seqlen_q: Sequence length of the query.
-		seqlen_k: Sequence length of the key.
-		O: Output array.
-		L: Log-sum-exp array.
-		HAVE_BIAS: Whether bias is present.
-		BLOCK_HEADDIM: Block size for the head dimension.
-		EVEN_M: Whether the query sequence length is divisible by the block size.
-		EVEN_N: Whether the key sequence length is divisible by the block size.
-		EVEN_HEADDIM: Whether the head dimension is divisible by the block size.
-		BLOCK_M: Block size for the query sequence dimension.
-		BLOCK_N: Block size for the key sequence dimension.
-	"""
-	start_m, off_bh = (
+	start_m, off_bh, off_gp = (
 		tl.program_id(0),
 		tl.program_id(1),
+		tl.program_id(2),
 	)
-	off_h = off_bh % nheads
-	off_b = off_bh // nheads
+	off_h = off_bh % num_kv_heads
+	off_b = off_bh // num_kv_heads
+
 	if not EVEN_N:
 		offs_n = tl.arange(0, BLOCK_N)
 
 	Q_Block_ptr = tl.make_block_ptr(
-		base=Q + (off_b * stride_qb + off_h * stride_qh),
+		base=Q + (off_b * stride_qb + off_h * stride_qh + off_gp * stride_qg),
 		shape=(seqlen_q, headdim),
 		block_shape=(BLOCK_M, BLOCK_HEADDIM),
 		strides=(stride_qm, 1),
@@ -253,7 +205,7 @@ def _fwd_attn_kernel_block_ptr(
 		order=(0, 1),
 	)
 	O_Block_ptr = tl.make_block_ptr(
-		base=O + (off_b * stride_ob + off_h * stride_oh),
+		base=O + (off_b * stride_ob + off_h * stride_oh + off_gp * stride_og),
 		shape=(seqlen_q, headdim),
 		block_shape=(BLOCK_M, BLOCK_HEADDIM),
 		strides=(stride_om, 1),
@@ -261,7 +213,7 @@ def _fwd_attn_kernel_block_ptr(
 		order=(0, 1),
 	)
 	L_Block_ptr = tl.make_block_ptr(
-		base=L + (off_b * stride_lb + off_h * stride_lh),
+		base=L + (off_b * stride_lb + off_h * stride_lh + off_gp * stride_lg),
 		shape=(seqlen_q,),
 		strides=(1,),
 		offsets=(start_m * BLOCK_M,),
@@ -288,8 +240,11 @@ def _fwd_attn_kernel_block_ptr(
 	q = tl.load(Q_Block_ptr, boundary_check=(0, 1))
 	softmax_scale = softmax_scale.to(tl.float32)
 	if HAVE_BIAS:
+		bias_h_pos: tl.constexpr = (
+			0 if BIAS_SINGLE_HEAD else off_h * stride_bh + off_gp * stride_bg
+		)
 		B_Block_ptr = tl.make_block_ptr(
-			base=B + (off_b * stride_bb + off_h * stride_bh),
+			base=B + (off_b * stride_bb + bias_h_pos),
 			shape=(seqlen_q, seqlen_k),
 			block_shape=(BLOCK_M, BLOCK_N),
 			strides=(stride_bm, stride_bn),
@@ -373,6 +328,7 @@ def _fwd_gqa_attn_kernel_ptr_block(
 	O,
 	L,
 	HAVE_BIAS: tl.constexpr,
+	BIAS_SINGLE_HEAD: tl.constexpr,
 	BLOCK_HEADDIM: tl.constexpr,
 	EVEN_N: tl.constexpr,
 	BLOCK_M: tl.constexpr,
@@ -418,9 +374,12 @@ def _fwd_gqa_attn_kernel_ptr_block(
 	)
 	softmax_scale = softmax_scale.to(tl.float32)
 	if HAVE_BIAS:
+		bias_h_pos: tl.constexpr = (
+			0 if BIAS_SINGLE_HEAD else off_h * stride_bh + off_gp * stride_bg
+		)
 		b_ptrs = (
 			B
-			+ (off_b * stride_bb + off_h * stride_bh + off_gp * stride_bg)
+			+ (off_b * stride_bb + bias_h_pos)
 			+ (offs_m[:, None] * stride_bm + offs_n[None, :] * stride_bn)
 		)
 	lse_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
@@ -495,7 +454,11 @@ def _fwd_gqa_attn_kernel_call(
 	Returns:
 		Tuple of the output array and the log-sum-exp array.
 	"""
-	kernel = _fwd_gqa_attn_kernel_ptr_block
+	kernel = (
+		_fwd_gqa_attn_kernel_block_ptr
+		if os.environ.get("FLASH_ATTN_BLOCK_PTR", "1") == "1"
+		else _fwd_gqa_attn_kernel_ptr_block
+	)
 	batch, seqlen_q, num_q_heads, headdim = query.shape
 	_, seqlen_k, num_kv_heads, _ = key.shape
 	num_groups = num_q_heads // num_kv_heads
@@ -507,19 +470,29 @@ def _fwd_gqa_attn_kernel_call(
 		headdim,
 	)
 	if bias is not None:
-		bias = bias.reshape(
-			batch,
-			num_kv_heads,
-			num_groups,
-			seqlen_q,
-			seqlen_k,
-		)
+		if bias.shape[1] == 1:
+			bias = bias.reshape(
+				batch,
+				1,
+				1,
+				seqlen_q,
+				seqlen_k,
+			)
+		else:
+			bias = bias.reshape(
+				batch,
+				num_kv_heads,
+				num_groups,
+				seqlen_q,
+				seqlen_k,
+			)
 		HAVE_BIAS = True
 		stride_bb, stride_bh, stride_bg, stride_bm, stride_bn = get_strides(bias.shape)
 	else:
 		HAVE_BIAS = False
 		stride_bb, stride_bh, stride_bg, stride_bm, stride_bn = (0, 0, 0, 0, 0)
 
+	BIAS_SINGLE_HEAD = True if bias is None else (True if bias.shape[1] == 1 else False)
 	check_shapes_and_dtypes(
 		query=query,
 		key=key,
@@ -534,6 +507,7 @@ def _fwd_gqa_attn_kernel_call(
 		(batch, num_kv_heads, num_groups, seqlen_q)
 	)
 	metaparams = dict(
+		BIAS_SINGLE_HEAD=BIAS_SINGLE_HEAD,
 		HAVE_BIAS=HAVE_BIAS,
 		BLOCK_HEADDIM=BLOCK_HEADDIM,
 		BLOCK_M=blocksize_q,
@@ -716,6 +690,7 @@ def _bwd_attn_kernel(
 	Dk,
 	Dv,
 	HAVE_BIAS: tl.constexpr,
+	BIAS_SINGLE_HEAD: tl.constexpr,
 	BLOCK_HEADDIM: tl.constexpr,
 	EVEN_M: tl.constexpr,
 	EVEN_N: tl.constexpr,
@@ -763,9 +738,12 @@ def _bwd_attn_kernel(
 		+ (offs_qm[:, None] * stride_dqm + offs_d[None, :])
 	)
 	if HAVE_BIAS:
+		bias_h_pos: tl.constexpr = (
+			0 if BIAS_SINGLE_HEAD else off_h * stride_bh + off_gp * stride_bg
+		)
 		b_ptrs = (
 			B
-			+ (off_b * stride_bb + off_h * stride_bh + off_gp * stride_bg)
+			+ (off_b * stride_bb + bias_h_pos)
 			+ (offs_qm[:, None] * stride_bm + offs_n[None, :])
 		)
 	dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
@@ -867,6 +845,29 @@ def _bwd_attn_kernel_call(
 	batch, seqlen_q, num_q_heads, headdim = query.shape
 	_, seqlen_k, num_kv_heads, _ = key.shape
 	num_groups = num_q_heads // num_kv_heads
+	if num_groups > 2:
+		raise NotImplementedError(
+			"triton_gqa_flash_attn2 is not performing well for num groups over 2 please use FORCE_MHA"
+		)
+		# from easydel.kernels.gpu_ops.triton_mha_flash_attention_2 import (
+		# 	_bwd_attn_kernel_call,
+		# )
+
+		# Dq, Dk, Dv, _ = _bwd_attn_kernel_call(
+		# 	softmax_scale=softmax_scale,
+		# 	blocksize_q=blocksize_q,
+		# 	blocksize_k=blocksize_k,
+		# 	residual=(
+		# 		o,
+		# 		l.reshape(batch, num_q_heads, seqlen_q),
+		# 		query,
+		# 		einops.repeat(key, "b s h d -> b s (h r) d", r=num_groups),
+		# 		einops.repeat(value, "b s h d -> b s (h r) d", r=num_groups),
+		# 		bias,
+		# 	),
+		# 	Do=Do,
+		# )
+		# return Dq, Dk[:, :, -num_kv_heads:, :], Dv[:, :, -num_kv_heads:, :], None
 	if FLASH_ATTN_BWD_:
 		query = query.reshape(
 			batch,
@@ -890,19 +891,29 @@ def _bwd_attn_kernel_call(
 			headdim,
 		)
 	if bias is not None:
-		bias = bias.reshape(
-			batch,
-			num_kv_heads,
-			num_groups,
-			seqlen_q,
-			seqlen_k,
-		)
+		if bias.shape[1] == 1:
+			bias = bias.reshape(
+				batch,
+				1,
+				1,
+				seqlen_q,
+				seqlen_k,
+			)
+		else:
+			bias = bias.reshape(
+				batch,
+				num_kv_heads,
+				num_groups,
+				seqlen_q,
+				seqlen_k,
+			)
 		HAVE_BIAS = True
 		stride_bb, stride_bh, stride_bg, stride_bm, _ = get_strides(bias.shape)
 	else:
 		HAVE_BIAS = False
 		stride_bb, stride_bh, stride_bg, stride_bm, _ = (0, 0, 0, 0, 0)
 
+	BIAS_SINGLE_HEAD = True if bias is None else (True if bias.shape[1] == 1 else False)
 	softmax_scale = softmax_scale or 1.0 / math.sqrt(headdim)
 	if FLASH_ATTN_BWD_:
 		assert headdim <= 256, "given headdim is not supported."
@@ -990,7 +1001,6 @@ def _bwd_attn_kernel_call(
 			name="triton::ops::_bwd_do_attn_kernel",
 			**metaparams,
 		)
-		print(delta)
 		metaparams = dict(
 			BLOCK_M=blocksize_q,
 			BLOCK_N=blocksize_k,
@@ -998,6 +1008,7 @@ def _bwd_attn_kernel_call(
 			num_stages=1,
 			BLOCK_HEADDIM=BLOCK_HEADDIM,
 			HAVE_BIAS=HAVE_BIAS,
+			BIAS_SINGLE_HEAD=BIAS_SINGLE_HEAD,
 		)
 
 		Dq, Dk, Dv = triton_call(
@@ -1199,7 +1210,7 @@ def _test_forward():
 	v = jax.nn.initializers.normal(2)(v_key, (B, KS, KVH, D), dtype=jnp.float16)
 	b = (
 		jnp.where(
-			jrnd.randint(v_key, (B, QH, QS, KS), 0, 4) > 2,
+			jrnd.randint(v_key, (B, 1, QS, KS), 0, 4) > 2,
 			jnp.finfo(jnp.float16).min,
 			0,
 		)
@@ -1207,12 +1218,12 @@ def _test_forward():
 		else None
 	)
 	print("QKV Allocated")
-	try:
-		co = _flash_gqa_attn2(q, k, v, b, None, blocksize_k, blocksize_q)
-		print(co[-1, -1, -1, :5])
-	except Exception as er:
-		print("Flash OOM", er)
-		co = None
+	# try:
+	co = _flash_gqa_attn2(q, k, v, b, None, blocksize_k, blocksize_q)
+	print(co[-1, -1, -1, :5])
+	# except Exception as er:
+	# 	print("Flash OOM", er)
+	# 	co = None
 	try:
 		fo = _attn_refrence(q, k, v, b)
 		print(fo[-1, -1, -1, :5])
@@ -1234,7 +1245,7 @@ def _test_backward():
 	v = jax.nn.initializers.normal(2)(v_key, (B, KS, KVH, D), dtype=jnp.float16)
 	b = (
 		jnp.where(
-			jrnd.randint(v_key, (B, QH, QS, KS), 0, 4) > 2,
+			jrnd.randint(v_key, (B, 1, QS, KS), 0, 4) > 2,
 			jnp.finfo(jnp.float16).min,
 			0,
 		)
@@ -1270,5 +1281,5 @@ triton_flash_gqa_attn_2_gpu = _flash_gqa_attn2
 __all__ = ["triton_flash_gqa_attn_2_gpu"]
 
 if __name__ == "__main__":
-	# _test_forward()
-	_test_backward()
+	_test_forward()
+	# _test_backward()
