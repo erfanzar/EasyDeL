@@ -169,7 +169,7 @@ def check_shapes_and_dtypes(
 	chex.assert_is_divisible(
 		blocksize_q, 16, custom_message="blocksize_q should be divisible by 16."
 	)
-	if headdim not in [16, 32, 64, 128, 256]:
+	if headdim > 256:
 		raise AssertionError("Unsupported headdim value.")
 
 
@@ -185,75 +185,37 @@ def _fwd_attn_kernel_block_ptr(
 	V,
 	B,
 	softmax_scale: tl.constexpr,
-	stride_qb: int,
-	stride_qh: int,
-	stride_qm: int,
-	stride_kb: int,
-	stride_kh: int,
-	stride_kn: int,
-	stride_vb: int,
-	stride_vh: int,
-	stride_vn: int,
-	stride_bb: int,
-	stride_bh: int,
-	stride_bm: int,
-	stride_bn: int,
-	stride_ob: int,
-	stride_oh: int,
-	stride_om: int,
-	stride_lb: int,
-	stride_lh: int,
+	stride_qb,
+	stride_qh,
+	stride_qm,
+	stride_kb,
+	stride_kh,
+	stride_kn,
+	stride_vb,
+	stride_vh,
+	stride_vn,
+	stride_bb,
+	stride_bh,
+	stride_bm,
+	stride_bn,
+	stride_ob,
+	stride_oh,
+	stride_om,
+	stride_lb,
+	stride_lh,
 	headdim: tl.constexpr,
 	nheads: tl.constexpr,
-	seqlen_q: int,
-	seqlen_k: int,
+	seqlen_q,
+	seqlen_k,
 	O,
 	L,
 	HAVE_BIAS: tl.constexpr,
+	BIAS_SINGLE_HEAD: tl.constexpr,
 	BLOCK_HEADDIM: tl.constexpr,
 	EVEN_N: tl.constexpr,
 	BLOCK_M: tl.constexpr,
 	BLOCK_N: tl.constexpr,
 ):
-	"""Triton kernel for the forward pass of the attention mechanism.
-
-	Args:
-		Q: Query array.
-		K: Key array.
-		V: Value array.
-		B: Bias array.
-		softmax_scale: Scaling factor for the softmax function.
-		stride_qb: Stride for the query batch dimension.
-		stride_qh: Stride for the query head dimension.
-		stride_qm: Stride for the query sequence dimension.
-		stride_kb: Stride for the key batch dimension.
-		stride_kh: Stride for the key head dimension.
-		stride_kn: Stride for the key sequence dimension.
-		stride_vb: Stride for the value batch dimension.
-		stride_vh: Stride for the value head dimension.
-		stride_vn: Stride for the value sequence dimension.
-		stride_bb: Stride for the bias batch dimension.
-		stride_bh: Stride for the bias head dimension.
-		stride_bm: Stride for the bias query sequence dimension.
-		stride_bn: Stride for the bias key sequence dimension.
-		stride_ob: Stride for the output batch dimension.
-		stride_oh: Stride for the output head dimension.
-		stride_om: Stride for the output sequence dimension.
-		stride_lb: Stride for the log-sum-exp batch dimension.
-		stride_lh: Stride for the log-sum-exp head dimension.
-		headdim: Head dimension.
-		seqlen_q: Sequence length of the query.
-		seqlen_k: Sequence length of the key.
-		O: Output array.
-		L: Log-sum-exp array.
-		HAVE_BIAS: Whether bias is present.
-		BLOCK_HEADDIM: Block size for the head dimension.
-		EVEN_M: Whether the query sequence length is divisible by the block size.
-		EVEN_N: Whether the key sequence length is divisible by the block size.
-		EVEN_HEADDIM: Whether the head dimension is divisible by the block size.
-		BLOCK_M: Block size for the query sequence dimension.
-		BLOCK_N: Block size for the key sequence dimension.
-	"""
 	start_m, off_bh = (
 		tl.program_id(0),
 		tl.program_id(1),
@@ -307,8 +269,9 @@ def _fwd_attn_kernel_block_ptr(
 	q = tl.load(Q_Block_ptr, boundary_check=(0, 1))
 	softmax_scale = softmax_scale.to(tl.float32)
 	if HAVE_BIAS:
+		bias_h_pos: tl.constexpr = 0 if BIAS_SINGLE_HEAD else off_h
 		B_Block_ptr = tl.make_block_ptr(
-			base=B + (off_b * stride_bb + off_h * stride_bh),
+			base=B + (off_b * stride_bb + bias_h_pos * stride_bh),
 			shape=(seqlen_q, seqlen_k),
 			block_shape=(BLOCK_M, BLOCK_N),
 			strides=(stride_bm, stride_bn),
@@ -362,75 +325,37 @@ def _fwd_attn_kernel_ptr_block(
 	V,
 	B,
 	softmax_scale: tl.constexpr,
-	stride_qb: int,
-	stride_qh: int,
-	stride_qm: int,
-	stride_kb: int,
-	stride_kh: int,
-	stride_kn: int,
-	stride_vb: int,
-	stride_vh: int,
-	stride_vn: int,
-	stride_bb: int,
-	stride_bh: int,
-	stride_bm: int,
-	stride_bn: int,
-	stride_ob: int,
-	stride_oh: int,
-	stride_om: int,
-	stride_lb: int,
-	stride_lh: int,
+	stride_qb,
+	stride_qh,
+	stride_qm,
+	stride_kb,
+	stride_kh,
+	stride_kn,
+	stride_vb,
+	stride_vh,
+	stride_vn,
+	stride_bb,
+	stride_bh,
+	stride_bm,
+	stride_bn,
+	stride_ob,
+	stride_oh,
+	stride_om,
+	stride_lb,
+	stride_lh,
 	headdim: tl.constexpr,
 	nheads: tl.constexpr,
-	seqlen_q: int,
-	seqlen_k: int,
+	seqlen_q,
+	seqlen_k,
 	O,
 	L,
 	HAVE_BIAS: tl.constexpr,
+	BIAS_SINGLE_HEAD: tl.constexpr,
 	BLOCK_HEADDIM: tl.constexpr,
 	EVEN_N: tl.constexpr,
 	BLOCK_M: tl.constexpr,
 	BLOCK_N: tl.constexpr,
 ):
-	"""Triton kernel for the forward pass of the attention mechanism.
-
-	Args:
-		Q: Query array.
-		K: Key array.
-		V: Value array.
-		B: Bias array.
-		softmax_scale: Scaling factor for the softmax function.
-		stride_qb: Stride for the query batch dimension.
-		stride_qh: Stride for the query head dimension.
-		stride_qm: Stride for the query sequence dimension.
-		stride_kb: Stride for the key batch dimension.
-		stride_kh: Stride for the key head dimension.
-		stride_kn: Stride for the key sequence dimension.
-		stride_vb: Stride for the value batch dimension.
-		stride_vh: Stride for the value head dimension.
-		stride_vn: Stride for the value sequence dimension.
-		stride_bb: Stride for the bias batch dimension.
-		stride_bh: Stride for the bias head dimension.
-		stride_bm: Stride for the bias query sequence dimension.
-		stride_bn: Stride for the bias key sequence dimension.
-		stride_ob: Stride for the output batch dimension.
-		stride_oh: Stride for the output head dimension.
-		stride_om: Stride for the output sequence dimension.
-		stride_lb: Stride for the log-sum-exp batch dimension.
-		stride_lh: Stride for the log-sum-exp head dimension.
-		headdim: Head dimension.
-		seqlen_q: Sequence length of the query.
-		seqlen_k: Sequence length of the key.
-		O: Output array.
-		L: Log-sum-exp array.
-		HAVE_BIAS: Whether bias is present.
-		BLOCK_HEADDIM: Block size for the head dimension.
-		EVEN_M: Whether the query sequence length is divisible by the block size.
-		EVEN_N: Whether the key sequence length is divisible by the block size.
-		EVEN_HEADDIM: Whether the head dimension is divisible by the block size.
-		BLOCK_M: Block size for the query sequence dimension.
-		BLOCK_N: Block size for the key sequence dimension.
-	"""
 	start_m, off_bh = (
 		tl.program_id(0),
 		tl.program_id(1),
@@ -469,9 +394,10 @@ def _fwd_attn_kernel_ptr_block(
 	)
 	softmax_scale = softmax_scale.to(tl.float32)
 	if HAVE_BIAS:
+		bias_h_pos: tl.constexpr = 0 if BIAS_SINGLE_HEAD else off_h
 		b_ptrs = (
 			B
-			+ (off_b * stride_bb + off_h * stride_bh)
+			+ (off_b * stride_bb + bias_h_pos * stride_bh)
 			+ (offs_m[:, None] * stride_bm + offs_n[None, :] * stride_bn)
 		)
 	lse_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
@@ -566,6 +492,7 @@ def _fwd_attn_kernel_call(
 	)
 	softmax_scale = softmax_scale or 1.0 / math.sqrt(headdim)
 	HAVE_BIAS = True if bias is not None else False
+	BIAS_SINGLE_HEAD = True if bias is None else (True if bias.shape[1] == 1 else False)
 	BLOCK_HEADDIM = max(triton.next_power_of_2(headdim), 16)
 	stride_bb, stride_bh, stride_bm, stride_bn = (
 		get_strides(bias.shape) if HAVE_BIAS else (0, 0, 0, 0)
@@ -573,6 +500,7 @@ def _fwd_attn_kernel_call(
 	stride_lb, stride_lh, stride_lm = get_strides((batch, nheads, seqlen_q))
 	metaparams = dict(
 		HAVE_BIAS=HAVE_BIAS,
+		BIAS_SINGLE_HEAD=BIAS_SINGLE_HEAD,
 		BLOCK_HEADDIM=BLOCK_HEADDIM,
 		BLOCK_M=blocksize_q,
 		BLOCK_N=blocksize_k,
@@ -751,6 +679,7 @@ def _bwd_attn_kernel(
 	Dk: chex.Array,
 	Dv: chex.Array,
 	HAVE_BIAS: tl.constexpr,
+	BIAS_SINGLE_HEAD: tl.constexpr,
 	BLOCK_HEADDIM: tl.constexpr,
 	EVEN_M: tl.constexpr,
 	EVEN_N: tl.constexpr,
@@ -758,59 +687,6 @@ def _bwd_attn_kernel(
 	BLOCK_M: tl.constexpr,
 	BLOCK_N: tl.constexpr,
 ):
-	"""Triton kernel for the backward pass of the attention mechanism.
-
-	Args:
-		Q: Query array.
-		K: Key array.
-		V: Value array.
-		B: Bias array.
-		Do: Output gradient array.
-		L: Log-sum-exp array.
-		D: Delta array.
-		softmax_scale: Scaling factor for the softmax function.
-		stride_qb: Stride for the query batch dimension.
-		stride_qh: Stride for the query head dimension.
-		stride_qm: Stride for the query sequence dimension.
-		stride_kb: Stride for the key batch dimension.
-		stride_kh: Stride for the key head dimension.
-		stride_kn: Stride for the key sequence dimension.
-		stride_vb: Stride for the value batch dimension.
-		stride_vh: Stride for the value head dimension.
-		stride_vn: Stride for the value sequence dimension.
-		stride_bb: Stride for the bias batch dimension.
-		stride_bh: Stride for the bias head dimension.
-		stride_bm: Stride for the bias query sequence dimension.
-		stride_dob: Stride for the output gradient batch dimension.
-		stride_doh: Stride for the output gradient head dimension.
-		stride_dom: Stride for the output gradient sequence dimension.
-		stride_dqb: Stride for the query gradient batch dimension.
-		stride_dqh: Stride for the query gradient head dimension.
-		stride_dqm: Stride for the query gradient sequence dimension.
-		stride_dkb: Stride for the key gradient batch dimension.
-		stride_dkh: Stride for the key gradient head dimension.
-		stride_dkn: Stride for the key gradient sequence dimension.
-		stride_dvb: Stride for the value gradient batch dimension.
-		stride_dvh: Stride for the value gradient head dimension.
-		stride_dvn: Stride for the value gradient sequence dimension.
-		stride_lb: Stride for the log-sum-exp batch dimension.
-		stride_lh: Stride for the log-sum-exp head dimension.
-		seqlen_q: Sequence length of the query.
-		seqlen_k: Sequence length of the key.
-		headdim: Head dimension.
-		nheads: Number of heads.
-		Dq: Query gradient array.
-		Dk: Key gradient array.
-		Dv: Value gradient array.
-		HAVE_BIAS: Whether bias is present.
-		BLOCK_HEADDIM: Block size for the head dimension.
-		EVEN_M: Whether the query sequence length is divisible by the block size.
-		EVEN_N: Whether the key sequence length is divisible by the block size.
-		EVEN_HEADDIM: Whether the head dimension is divisible by the block size.
-		BLOCK_M: Block size for the query sequence dimension.
-		BLOCK_N: Block size for the key sequence dimension.
-	"""
-
 	start_n, off_bh = (
 		tl.program_id(0),
 		tl.program_id(2),
@@ -850,9 +726,10 @@ def _bwd_attn_kernel(
 		+ (offs_qm[:, None] * stride_dqm + offs_d[None, :])
 	)
 	if HAVE_BIAS:
+		bias_h_pos: tl.constexpr = 0 if BIAS_SINGLE_HEAD else off_h
 		b_ptrs = (
 			B
-			+ (off_b * stride_bb + off_h * stride_bh)
+			+ (off_b * stride_bb + bias_h_pos * stride_bh)
 			+ (offs_qm[:, None] * stride_bm + offs_n[None, :])
 		)
 	dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
@@ -966,10 +843,11 @@ def _bwd_attn_kernel_call(
 	), "shape missmatch between key, value."
 	softmax_scale = softmax_scale or 1.0 / math.sqrt(headdim)
 	if FLASH_ATTN_BWD_:
-		assert headdim in {16, 32, 64, 128, 256}, "given headdim is not supported."
+		assert headdim <= 256, "given headdim is not supported."
 		assert query.dtype == key.dtype == value.dtype, "tensors must have the same dtype."
 		assert query.dtype in [jnp.float16], "only support fp16."
 		HAVE_BIAS = True if bias is not None else False
+		BIAS_SINGLE_HEAD = True if bias is None else (True if bias.shape[1] == 1 else False)
 		BLOCK_HEADDIM = max(triton.next_power_of_2(headdim), 16)
 		bwd_kernel_out_shapes = [
 			jax.ShapeDtypeStruct(
@@ -1054,6 +932,7 @@ def _bwd_attn_kernel_call(
 			num_stages=1,
 			BLOCK_HEADDIM=BLOCK_HEADDIM,
 			HAVE_BIAS=HAVE_BIAS,
+			BIAS_SINGLE_HEAD=BIAS_SINGLE_HEAD,
 		)
 
 		Dq, Dk, Dv = triton_call(
@@ -1193,7 +1072,7 @@ _flash_attn2.defvjp(
 def _test_forward():
 	"""Tests the forward pass of the attention mechanism."""
 	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
-	B, H, QS, KS, D = 1, 32, 1024, 1024, 128
+	B, H, QS, KS, D = 1, 8, 4096, 4096, 128
 	blocksize_k = 64
 	blocksize_q = 128
 	q = jax.nn.initializers.normal(2)(q_key, (B, QS, H, D), dtype=jnp.float16)
@@ -1201,7 +1080,7 @@ def _test_forward():
 	v = jax.nn.initializers.normal(2)(v_key, (B, KS, H, D), dtype=jnp.float16)
 	b = (
 		jnp.where(
-			jrnd.randint(v_key, (B, H, QS, KS), 0, 4) > 2,
+			jrnd.randint(v_key, (B, 1, QS, KS), 0, 4) > 2,
 			jnp.finfo(jnp.float16).min,
 			0,
 		)
@@ -1239,11 +1118,11 @@ def _test_backward():
 
 	b = (
 		jnp.where(
-			jrnd.randint(v_key, (B, H, S, S), 0, 4) > 2,
+			jrnd.randint(v_key, (B, 1, S, S), 0, 4) > 2,
 			jnp.finfo(jnp.float16).min,
 			0,
 		)
-		if False  # Set to True to test with bias
+		if True  # Set to True to test with bias
 		else None
 	)
 
@@ -1446,11 +1325,11 @@ def _ptr_non_ptr_benchmark(
 	return ms
 
 
-triton_flash_attn_2_gpu = _flash_attn2
-__all__ = ["triton_flash_attn_2_gpu"]
+triton_flash_mha_attn_2_gpu = _flash_attn2
+__all__ = ["triton_flash_mha_attn_2_gpu"]
 
 if __name__ == "__main__":
 	# _test_forward()
-	# _test_backward()
+	_test_backward()
 	# _fwd_benchmark.run(save_path=".", print_data=True)
-	_ptr_non_ptr_benchmark.run(save_path=".", print_data=True)
+	# _ptr_non_ptr_benchmark.run(save_path=".", print_data=True)

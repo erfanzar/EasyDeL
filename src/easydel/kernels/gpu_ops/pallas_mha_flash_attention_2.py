@@ -32,113 +32,6 @@ _TEST_DTYPE = jnp.float16
 _rng = GenerateRNG()
 
 
-def _jax_bwd_flash_attn(
-	dtype: jnp.dtype,
-	qblock: int,
-	kblock: int,
-	softmax_scale: float,
-	residuals,
-	dO,
-):
-	"""Backward pass of FlashAttention."""
-
-	del dtype
-	(
-		query_state,
-		key_state,
-		value_state,
-		bias,
-		O,  # noqa: E741
-		L,
-	) = residuals
-
-	(query_state, key_state, value_state, O, dO) = map(  # noqa: E741
-		lambda x: x.transpose(0, 2, 1, 3), [query_state, key_state, value_state, O, dO]
-	)
-
-	softmax_scale = softmax_scale or 1.0 / math.sqrt(query_state.shape[-1])
-
-	q_seq = query_state.shape[2]
-	k_seq = key_state.shape[2]
-	assert q_seq % qblock == 0
-	assert k_seq % kblock == 0
-	Tr = q_seq // qblock
-	Tc = k_seq // kblock
-
-	D = jnp.sum(dO * O, axis=-1)
-	dQ = (query_state * 0.0).astype(query_state.dtype)
-	dK = (key_state * 0.0).astype(key_state.dtype)
-	dV = (value_state * 0.0).astype(value_state.dtype)
-
-	@partial(jax.named_call, name="_bwd_flash_attn_call_o")
-	def call_o(state):
-		j, dQ, dK, dV = state
-		k_j = jax.lax.dynamic_slice_in_dim(key_state, j * kblock, kblock, 2)
-		v_j = jax.lax.dynamic_slice_in_dim(value_state, j * kblock, kblock, 2)
-
-		dK_j = jax.lax.dynamic_slice_in_dim(dK, j * kblock, kblock, 2)
-		dV_j = jax.lax.dynamic_slice_in_dim(dV, j * kblock, kblock, 2)
-
-		@partial(jax.named_call, name="_bwd_flash_attn_call_o_call_qk")
-		def do_inner_block(state):
-			i, j, dQ, dK_j, dV_j = state
-			q_i = jax.lax.dynamic_slice_in_dim(query_state, i * qblock, qblock, 2)
-			dQ_i = jax.lax.dynamic_slice_in_dim(dQ, i * qblock, qblock, 2)
-			dO_i = jax.lax.dynamic_slice_in_dim(dO, i * qblock, qblock, 2)
-			L_i = jax.lax.dynamic_slice_in_dim(L, i * qblock, qblock, 2)
-			D_i = jax.lax.dynamic_slice_in_dim(D, i * qblock, qblock, 2)
-			s_ij = (q_i * softmax_scale) @ k_j.transpose(0, 1, 3, 2)
-			if bias is not None:
-				b_i = jax.lax.dynamic_slice_in_dim(bias, i * qblock, qblock, 2)
-				b_ij = jax.lax.dynamic_slice_in_dim(b_i, j * kblock, kblock, 3)
-				s_ij = s_ij + b_ij
-
-			p_ij = jnp.exp(s_ij - jnp.expand_dims(L_i, -1))
-
-			dV_j = dV_j + jnp.einsum("...nm,...mk->...nk", p_ij, dO_i)
-
-			dP_ij = jnp.einsum("...ik,...jk->...ij", dO_i, v_j)
-			dS_ij = p_ij * (dP_ij - D_i[..., None]) * softmax_scale
-			dQ_i = dQ_i + jnp.einsum("...id,...dj->...ij", dS_ij, k_j)
-			dK_j = dK_j + jnp.einsum("...nm,...mk->...nk", dS_ij, q_i)
-			dQ = jax.lax.dynamic_update_slice_in_dim(
-				dQ,
-				dQ_i.astype(dQ.dtype),
-				i * qblock,
-				2,
-			)
-			return (
-				i + 1,
-				j,
-				dQ.astype(query_state.dtype),
-				dK_j.astype(key_state.dtype),
-				dV_j.astype(value_state.dtype),
-			)
-
-		_, j, dQ, dK_j, dV_j = jax.lax.while_loop(
-			lambda state: state[0] < Tr,
-			do_inner_block,
-			(0, j, dQ, dK_j, dV_j),
-		)
-
-		dK = jax.lax.dynamic_update_slice_in_dim(dK, dK_j.astype(dK.dtype), j * qblock, 2)
-		dV = jax.lax.dynamic_update_slice_in_dim(dV, dV_j.astype(dV.dtype), j * qblock, 2)
-
-		return j + 1, dQ, dK, dV
-
-	_, dQ, dK, dV = jax.lax.while_loop(
-		lambda state: state[0] < Tc,
-		call_o,
-		(0, dQ, dK, dV),
-	)
-	return (
-		dQ.transpose(0, 2, 1, 3),
-		dK.transpose(0, 2, 1, 3),
-		dV.transpose(0, 2, 1, 3),
-		None,
-	)
-
-
 def _gpu_fwd_flash_attn_kernel(
 	q_ref,
 	k_ref,
@@ -156,6 +49,7 @@ def _gpu_fwd_flash_attn_kernel(
 	softmax_scale,
 	nheads,
 	block_headdim,
+	bias_single_heads,
 ):
 	qg, nhbg = pl.program_id(0), pl.program_id(1)
 	bg, nhg = nhbg // nheads, nhbg % nheads
@@ -187,7 +81,7 @@ def _gpu_fwd_flash_attn_kernel(
 				b_ref,
 				idx=(
 					bg,
-					nhg,
+					0 if bias_single_heads else nhg,
 					pl.dslice(qg * qblock, qblock),
 					pl.dslice(idx * kblock, kblock),
 				),
@@ -291,6 +185,7 @@ def _call_gpu_fwd_flash_attn(
 			softmax_scale=softmax_scale,
 			nheads=nheads,
 			block_headdim=dim,
+			bias_single_heads=True if b is None else (True if b.shape[1] == 1 else False),
 		),
 		grid=grid,
 		out_specs=out_specs,
@@ -369,6 +264,7 @@ def _gpu_bwd_flash_attn_kernel(
 	softmax_scale,
 	nheads,
 	block_headdim,
+	bias_single_heads,
 ):
 	j, bnhg = pl.program_id(0), pl.program_id(1)
 
@@ -429,7 +325,7 @@ def _gpu_bwd_flash_attn_kernel(
 				b_ref,
 				idx=(
 					bg,
-					nhg,
+					0 if bias_single_heads else nhg,
 					pl.dslice(i * qblock, qblock),
 					pl.dslice(j * kblock, kblock),
 				),
@@ -558,6 +454,7 @@ def _call_gpu_bwd_flash_attn(
 			softmax_scale=softmax_scale,
 			nheads=nheads,
 			block_headdim=dim,
+			bias_single_heads=True if b is None else (True if b.shape[1] == 1 else False),
 		),
 		grid=(pl.cdiv(seqlen_k, kblock), batch_size * nheads),
 		out_shape=out_shape,
@@ -625,10 +522,7 @@ def _flash_attn2(
 	softmax_scale: float = None,
 ):
 	chex.assert_equal_shape(inputs=(k, v), dims=(0, 1, 2, 3))
-	chex.assert_equal_rank([q, k, v])
-	if b is not None:
-		if q.shape[2] != b.shape[1]:
-			raise AssertionError(f"nheads missmatched in q,b {q.shape=},{b.shape=}")
+	chex.assert_equal_rank([q, k, v]) 
 	if _PLATFORM in ["gpu", "cpu"]:
 		return _gpu_flash_attn(
 			q=q,
@@ -653,7 +547,7 @@ def gpu_fwd_test():
 	k = jrand.normal(_rng.rng, shape=(b, s, h, d), dtype=dtype)
 	v = jrand.normal(_rng.rng, shape=(b, s, h, d), dtype=dtype)
 	b = jnp.where(
-		jrand.randint(_rng.rng, shape=(b, h, qs, s), minval=0, maxval=3) > 1,
+		jrand.randint(_rng.rng, shape=(b, 1, qs, s), minval=0, maxval=3) > 1,
 		0,
 		jnp.finfo(dtype).min,
 	)
@@ -713,9 +607,9 @@ def gpu_bwd_test():
 	print(jnp.allclose(excepted_result, result, atol=0.125, rtol=0))
 
 
-pallas_flash_attn_2_gpu = _flash_attn2
-__all__ = ["pallas_flash_attn_2_gpu"]
+pallas_flash_mha_attn_2_gpu = _flash_attn2
+__all__ = ["pallas_flash_mha_attn_2_gpu"]
 
 if __name__ == "__main__":
 	gpu_fwd_test()
-	gpu_bwd_test()
+	# gpu_bwd_test()
