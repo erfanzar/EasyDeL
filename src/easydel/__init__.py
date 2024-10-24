@@ -72,6 +72,7 @@ from easydel.modules.arctic import (
 from easydel.modules.attention_module import (
 	AttentionMechanisms,
 	FlexibleAttentionModule,
+	AttentionBenchmarker,
 )
 from easydel.modules.auto_models import (
 	AutoEasyDeLConfig,

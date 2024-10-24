@@ -16,7 +16,7 @@ switch between them and experiment with different configurations.
 * **Caching Support:** Facilitates the use of attention caching to speed up inference and generation tasks.
 * **Dropout and Determinism:** Allows for applying dropout to attention weights and controlling the deterministic
   behavior of the attention computation.
-* **Testing Utility:**  Provides a `test_attentions` method to compare different attention mechanisms in terms of
+* **Testing Utility:**  Provides a `run_attention_benchmarks` method to compare different attention mechanisms in terms of
   accuracy, gradient stability, and computation time.
 
 **How it Works:**
@@ -54,7 +54,7 @@ in order to test which attention module in what axis dims works best for you you
 from easydel import FlexibleAttentionModule
 
 print(
-    FlexibleAttentionModule.test_attentions(
+    FlexibleAttentionModule.run_attention_benchmarks(
         axis_dims=(1, 1, 1, -1),
         sequence_length=128 * 8,
         num_attention_heads=32,

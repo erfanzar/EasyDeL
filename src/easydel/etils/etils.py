@@ -14,7 +14,7 @@
 
 import argparse
 import logging
-from dataclasses import dataclass
+from enum import Enum
 from typing import (
 	Any,
 	Dict,
@@ -25,6 +25,8 @@ from typing import (
 	Union,
 )
 
+import jax
+import jax.extend
 from fjformer.jaxpruner import (
 	GlobalMagnitudePruning,
 	GlobalSaliencyPruning,
@@ -35,56 +37,43 @@ from fjformer.jaxpruner import (
 	SteMagnitudePruning,
 	SteRandomPruning,
 )
-import jax
-import jax.extend
 
 
-@dataclass
-class EasyDeLOptimizers:
+class EasyDeLOptimizers(str, Enum):
 	"""
-	The code snippet is defining a data class called `EasyDeLOptimizers` using the `@dataclass`
-	decorator. A data class is a class that is primarily used to store data, and it automatically
-	generates special methods such as `__init__`, `__repr__`, and `__eq__` based on the class
-	attributes.
+	Enum defining available optimizers for EasyDeL.
+	Each enum member represents a different optimization algorithm.
 	"""
 
-	ADAFACTOR: Literal["adafactor"] = "adafactor"
-	LION: Literal["lion"] = "lion"
-	ADAMW: Literal["adamw"] = "adamw"
-	RMSPROP: Literal["rmsprop"] = "rmsprop"
+	ADAFACTOR = "adafactor"
+	LION = "lion"
+	ADAMW = "adamw"
+	RMSPROP = "rmsprop"
 
 
-@dataclass
-class EasyDeLSchedulers:
+class EasyDeLSchedulers(str, Enum):
 	"""
-	The code snippet is defining a data class called `EasyDeLSchedulers` using the `@dataclass`
-	decorator. A data class is a class that is primarily used to store data, and it automatically
-	generates special methods such as `__init__`, `__repr__`, and `__eq__` based on the class
-	attributes.
+	Enum defining available schedulers for EasyDeL.
+	Each enum member represents a different learning rate schedule.
 	"""
 
-	LINEAR: Literal["linear"] = "linear"
-	COSINE: Literal["cosine"] = "cosine"
-	NONE: Literal["none"] = "none"
-	WARM_UP_COSINE: Literal["warm_up_cosine"] = "warm_up_cosine"
-	WARM_UP_LINEAR: Literal["warm_up_linear"] = "warm_up_linear"
+	LINEAR = "linear"
+	COSINE = "cosine"
+	NONE = "none"
+	WARM_UP_COSINE = "warm_up_cosine"
+	WARM_UP_LINEAR = "warm_up_linear"
 
 
-@dataclass
-class EasyDeLGradientCheckPointers:
+class EasyDeLGradientCheckPointers(str, Enum):
 	"""
-	The code snippet is defining a data class called `EasyDeLGradientCheckPointers` using the `@dataclass`
-	decorator. A data class is a class that is primarily used to store data, and it automatically
-	generates special methods such as `__init__`, `__repr__`, and `__eq__` based on the class
-	attributes.
+	Enum defining available gradient checkpointing strategies for EasyDeL.
+	Each enum member represents a different checkpointing approach.
 	"""
 
-	EVERYTHING_SAVEABLE: Literal["everything_saveable"] = "everything_saveable"
-	NOTHING_SAVEABLE: Literal["nothing_saveable"] = "nothing_saveable"
-	CHECKPOINT_DOTS: Literal["checkpoint_dots"] = "checkpoint_dots"
-	CHECKPOINT_DOTS_WITH_NO_BATCH_DMIS: Literal[
-		"checkpoint_dots_with_no_batch_dims"
-	] = "checkpoint_dots_with_no_batch_dims"
+	EVERYTHING_SAVEABLE = "everything_saveable"
+	NOTHING_SAVEABLE = "nothing_saveable"
+	CHECKPOINT_DOTS = "checkpoint_dots"
+	CHECKPOINT_DOTS_WITH_NO_BATCH_DMIS = "checkpoint_dots_with_no_batch_dims"
 
 
 AVAILABLE_GRADIENT_CHECKPOINTS = Literal[
@@ -128,6 +117,7 @@ _AVAILABLE_ATTENTION_MECHANISMS = [
 	"ring",
 	"cudnn",
 	"blockwise",
+	"sdpa",
 ]
 AVAILABLE_ATTENTION_MECHANISMS = Literal[
 	"vanilla",
@@ -136,6 +126,7 @@ AVAILABLE_ATTENTION_MECHANISMS = Literal[
 	"ring",
 	"cudnn",
 	"blockwise",
+	"sdpa",
 ]
 
 DEFAULT_ATTENTION_MECHANISM = (

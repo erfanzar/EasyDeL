@@ -47,7 +47,7 @@ def main(use_iterable_dataset: bool):
 		intermediate_size=1024,
 		max_position_embeddings=sequence_length,
 		attn_dtype=jnp.float16,
-		attn_mechanism=AttentionMechanisms.ring,
+		attn_mechanism=AttentionMechanisms.RING,
 		block_k=512,
 		block_q=512,
 		platform="jax",

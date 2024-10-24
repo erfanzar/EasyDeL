@@ -388,7 +388,7 @@ class FlaxFalconAttention(FlaxAttentionModule):
 				key_value_sequence_length=key_length,
 				uses_cache=self.has_variable("cache", "cached_key") or init_cache,
 				bias=attention_bias,
-				causal=False,
+				causal=True,
 			)
 			attention_outputs = attention.attention_outputs
 			attention_outputs = attention_outputs.reshape(

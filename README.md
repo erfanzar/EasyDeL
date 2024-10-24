@@ -86,7 +86,7 @@ pip install easydel
 
 ```python
 import easydel as ed
-ed.FlexibleAttentionModule.test_attentions()
+ed.FlexibleAttentionModule.run_attention_benchmarks()
 ```
 
 ## Documentation 💫

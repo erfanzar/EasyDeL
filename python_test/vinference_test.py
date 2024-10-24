@@ -43,7 +43,7 @@ async def main():
 			mask_max_position_embeddings=max_length,
 			block_q=32,
 			block_k=128,
-			attn_mechanism=ed.AttentionMechanisms.flash_attn2,
+			attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
 		),
 		# quantization_method="8bit",
 		quantization_platform="jax",
