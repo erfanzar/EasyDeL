@@ -6,18 +6,19 @@ os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 os.environ["EASYDEL_AUTO"] = "1"
 # os.environ["EKERNEL_OPS"] = "true"
 
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../src"))
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 
 import os
 import time
 
-import easydel as ed
 import jax
 from huggingface_hub import HfApi
 from jax import lax, sharding
 from jax import numpy as jnp
 from transformers import AutoTokenizer
+
+import easydel as ed
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
 

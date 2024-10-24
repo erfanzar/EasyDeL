@@ -6,7 +6,7 @@ sys.path.append(dirname)
 sys.path.append(
 	os.path.join(
 		dirname,
-		"../../src",
+		"../..",
 	)
 )
 os.environ["EKERNEL_OPS"] = "false"
@@ -33,8 +33,8 @@ def main():
 		intermediate_size=256,
 		gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
 		max_position_embeddings=sequence_length,
-		attn_dtype=jnp.float32,
-		attn_mechanism=ed.AttentionMechanisms.RING,
+		attn_dtype=jnp.float16,
+		attn_mechanism=ed.AttentionMechanisms.SDPA,
 		block_k=512,
 		block_q=512,
 		hardware_abstraction=False,
@@ -46,6 +46,7 @@ def main():
 
 	model = ed.FlaxMistralForCausalLM(config=config, _do_init=True)
 	params = model.shard_params(model.params)
+	
 	prompter = create_prompt_creator(tokenizer)
 	dtype = jnp.float32
 	trainer = ed.SFTTrainer(

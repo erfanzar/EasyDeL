@@ -7,12 +7,9 @@ sys.path.append(dirname)
 sys.path.append(
 	os.path.join(
 		dirname,
-		"../../src",
+		"../..",
 	)
 )
-import jax
-
-jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 import flax.core
 from datasets import Dataset, IterableDataset
 from jax import numpy as jnp
@@ -46,7 +43,7 @@ def main(use_iterable_dataset: bool):
 		gradient_checkpointing="",
 		max_position_embeddings=sequence_length,
 		attn_dtype=jnp.float16,
-		attn_mechanism=AttentionMechanisms.FLASH_ATTN2,
+		attn_mechanism=AttentionMechanisms.SDPA,
 		block_k=128,
 		block_q=128,
 	)
@@ -79,6 +76,7 @@ def main(use_iterable_dataset: bool):
 		)
 	dtype = jnp.float16
 	trainer = CausalLanguageModelTrainer(
+		model=model,
 		arguments=TrainingArguments(
 			model_name="LORA_CLM_TEST",
 			num_train_epochs=NUM_TRAIN_EPOCHS,
@@ -86,16 +84,9 @@ def main(use_iterable_dataset: bool):
 			gradient_accumulation_steps=2,
 			max_training_steps=max_training_steps,
 			max_evaluation_steps=max_evaluation_steps,
-			model_class=type(model),
 			do_train=True,
-			do_eval=True,
+			do_eval=False,
 			max_sequence_length=sequence_length,
-			configs_to_initialize_model_class={
-				"config": model.config,
-				"input_shape": (1, 1),
-				"dtype": dtype,
-				"param_dtype": dtype,
-			},
 			dtype=dtype,
 			param_dtype=dtype,
 			track_memory=False,

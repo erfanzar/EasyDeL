@@ -8,7 +8,7 @@ sys.path.append(dirname)
 sys.path.append(
 	os.path.join(
 		dirname,
-		"../src",
+		"..",
 	)
 )
 

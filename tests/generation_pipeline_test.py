@@ -2,10 +2,14 @@ import inspect
 import os
 import sys
 
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../src"))
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import time
 from typing import Callable, List
+
+from jax import lax
+from jax import numpy as jnp
+from transformers import AutoTokenizer
 
 from easydel import (
 	FlaxLlamaForCausalLM,
@@ -14,9 +18,6 @@ from easydel import (
 	LlamaConfig,
 )
 from easydel.modules.flax_modeling_utils import quantize_params
-from jax import lax
-from jax import numpy as jnp
-from transformers import AutoTokenizer
 
 
 def get_bool_inputs(func: Callable) -> List[str]:

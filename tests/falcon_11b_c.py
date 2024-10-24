@@ -1,6 +1,7 @@
-from transformers import AutoConfig, AutoModelForCausalLM
 import os
 import sys
+
+from transformers import AutoConfig, AutoModelForCausalLM
 
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 dirname = os.path.dirname(os.path.abspath(__file__))
@@ -8,7 +9,7 @@ sys.path.append(dirname)
 sys.path.append(
 	os.path.join(
 		dirname,
-		"../src",
+		"..",
 	)
 )
 import easydel as ed

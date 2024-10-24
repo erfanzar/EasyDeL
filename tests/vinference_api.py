@@ -5,16 +5,17 @@ import sys
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 os.environ["EASYDEL_AUTO"] = "true"
 
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../src"))
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import jax
+import torch
 from huggingface_hub import HfApi
 from jax import lax, sharding
 from jax import numpy as jnp
-from transformers import AutoTokenizer
-import torch
-import easydel as ed
 from prometheus_client import start_http_server
+from transformers import AutoTokenizer
+
+import easydel as ed
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
