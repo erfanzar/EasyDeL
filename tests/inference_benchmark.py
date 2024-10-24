@@ -3,14 +3,15 @@ import os
 import sys
 import time
 
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../src"))
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-import easydel as ed
 import jax
 import torch
 from jax import lax
 from jax import numpy as jnp
 from transformers import AutoTokenizer
+
+import easydel as ed
 
 MAX_INPUT_LENGTH = 1024
 

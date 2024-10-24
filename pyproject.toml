@@ -1,85 +1,72 @@
-[project]
+[tool.poetry]
 name = "easydel"
 version = "0.0.80"
-authors = [{ name = "Erfan Zare Chavoshi", email = "Erfanzare810@gmail.com" }]
-description = "An open-source library to make training faster and more optimized in Jax/Flax"
+description = "An open-source library to make training faster and more optimized in JAX"
+authors = ["Erfan Zare Chavoshi <Erfanzare810@gmail.com>"]
+license = "Apache-2.0"
 readme = "README.md"
-requires-python = ">=3.8"
-license = { text = "Apache-2.0" }
-dependencies = [
-    "jax>=0.4.33",
-    "jaxlib>=0.4.33",
-    "fjformer==0.0.83",
-		"uvicorn~=0.32.0",
-    "transformers>=4.40.0",
-    "optax~=0.2.2",
-    "tensorflow~=2.17.0",
-    "msgpack~=1.0.7",
-    "ipython~=8.17.2",
-    "tqdm~=4.64.1",
-    "datasets~=2.19.2",
-    "tensorboard~=2.17.0",
-    "tensorflow-datasets~=4.9.6",
-    "scipy==1.13.1",
-    "websocket-client~=1.8.0",
-    "websockets~=11.0.3",
-		"fastapi~=0.115.2",
-		"prometheus_client~=0.21.0",
-]
+homepage = "https://github.com/erfanzar/EasyDeL"
+repository = "https://github.com/erfanzar/EasyDeL"
+documentation = "https://erfanzar.github.io/EasyDeL"
+keywords = ["JAX", "CUDA", "Deep Learning", "Machine Learning", "XLA"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Intended Audience :: Developers",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
-    "License :: OSI Approved :: Apache Software License",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
+	"Development Status :: 3 - Alpha",
+	"Intended Audience :: Developers",
+	"Topic :: Scientific/Engineering :: Artificial Intelligence",
+	"License :: OSI Approved :: Apache Software License",
+	"Programming Language :: Python :: 3.10",
+	"Programming Language :: Python :: 3.11",
+	"Programming Language :: Python :: 3.12",
 ]
-keywords = ["JAX", "Torch", "Deep Learning", "Machine Learning", "Flax", "XLA"]
 
-[project.optional-dependencies]
-torch = ["torch", "torchvision", "torchaudio"]
-all = ["EasyDeL[torch]"]
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+jax = ">=0.4.33"
+jaxlib = ">=0.4.33"
+fjformer = "0.0.83"
+uvicorn = "^0.32.0"
+transformers = ">=4.40.0"
+optax = "^0.2.2"
+tensorflow = "^2.17.0"
+msgpack = "^1.0.7"
+ipython = "^8.17.2"
+tqdm = "^4.64.1"
+datasets = "^2.19.2"
+tensorboard = "^2.17.0"
+tensorflow-datasets = "^4.9.6"
+scipy = "1.13.1"
+websocket-client = "^1.8.0"
+websockets = "^11.0.3"
+fastapi = "^0.115.2"
+prometheus_client = "^0.21.0"
 
-[project.urls]
-Homepage = "https://github.com/erfanzar/EasyDeL"
-Issues = "https://github.com/erfanzar/EasyDeL/issues"
-Documentation = "https://erfanzar.github.io/EasyDeL"
+[tool.poetry.group.torch.dependencies]
+torch = "*"
+torchvision = "*"
+torchaudio = "*"
 
 [build-system]
-requires = ["flit_core >=3.2,<4"]
-build-backend = "flit_core.buildapi"
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
 
 [tool.ruff.lint]
-# 1. Enable flake8-bugbear (`B`) rules, in addition to the defaults.
 select = ["E4", "E7", "E9", "F", "B"]
-
-# 2. Avoid enforcing line-length violations and zip issue (`E501`, `B905`)
-ignore = ["E501","B905","B007"]
-
-# 3. Avoid trying to fix flake8-bugbear (`B`) violations.
+ignore = ["E501", "B905", "B007"]
 unfixable = ["B"]
 
-# 4. Ignore `E402` (import violations) in all `__init__.py` files, and in selected subdirectories.
 [tool.ruff.lint.per-file-ignores]
-"__init__.py" = ["E402","F401"]
+"__init__.py" = ["E402", "F401"]
 "**/{tests,docs,tools}/*" = ["E402"]
-"python_test/*"=["E402"]
-"triton_*"=["E741","ISC001","E501","E731"]
-"pallas_*"=["E741","ISC001","E501","E731"]
-  
-[tool.ruff.format] 
+"tests/*" = ["E402", "E731"]
+"triton_*" = ["E741", "ISC001", "E501", "E731"]
+"pallas_*" = ["E741", "ISC001", "E501", "E731"]
+
+[tool.ruff.format]
 quote-style = "double"
 indent-style = "tab"
 docstring-code-format = true
 
-
 [tool.ruff]
 target-version = "py311"
 line-length = 88
-indent-width = 2 
-
- 
+indent-width = 2

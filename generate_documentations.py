@@ -61,7 +61,7 @@ def get_files(path: str):
 
 
 def run(
-	project_locations="src/easydel/",
+	project_locations="easydel/",
 	start_head="easydel",
 ):
 	global cache

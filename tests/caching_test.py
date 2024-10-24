@@ -1,15 +1,16 @@
 import os
 import sys
 
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../src"))
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+
+from jax import lax
+from jax import numpy as jnp
 
 from easydel import (
 	FlaxLlamaForCausalLM,
 	LlamaConfig,
 )
-from jax import lax
-from jax import numpy as jnp
 
 
 def main():

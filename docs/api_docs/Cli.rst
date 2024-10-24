@@ -5,7 +5,7 @@ Cli
    :maxdepth: 2
 
    cli.cli
-   cli.utils
-   cli.train.sft
-   cli.train.dpo
    cli.train.clm
+   cli.train.dpo
+   cli.train.sft
+   cli.utils

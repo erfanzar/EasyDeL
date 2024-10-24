@@ -8,7 +8,7 @@ sys.path.append(dirname)
 sys.path.append(
 	os.path.join(
 		dirname,
-		"../../src",
+		"../..",
 	)
 )
 # jax.config.update("jax_platform_name", "cpu")  # CPU Test !
@@ -61,7 +61,7 @@ def get_hh(
 		"Anthropic/hh-rlhf",
 		split=split,
 		cache_dir=cache_dir,
-	) 
+	)
 	if sanity_check:
 		dataset = dataset.select(range(min(len(dataset), 1000)))
 
@@ -99,8 +99,8 @@ def main():
 			use_scan_mlp=False,
 			attention_bias=False,
 			platform="jax",
-			attn_dtype=jnp.float32,
-			attn_mechanism=AttentionMechanisms.VANILLA,
+			attn_dtype=jnp.float16,
+			attn_mechanism=AttentionMechanisms.SDPA,
 		)
 		arguments = DPOConfig(
 			num_train_epochs=4,
