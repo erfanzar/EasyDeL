@@ -38,7 +38,7 @@ async def main():
 			mask_max_position_embeddings=max_length,
 			block_q=64,
 			block_k=128,
-			attn_mechanism=ed.AttentionMechanisms.vanilla,
+			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 			quantize_kv_cache=True,
 		),
 		quantization_method="8bit",

@@ -46,7 +46,7 @@ def main(use_iterable_dataset: bool):
 		gradient_checkpointing="",
 		max_position_embeddings=sequence_length,
 		attn_dtype=jnp.float16,
-		attn_mechanism=AttentionMechanisms.pallas_flash,
+		attn_mechanism=AttentionMechanisms.FLASH_ATTN2,
 		block_k=128,
 		block_q=128,
 	)

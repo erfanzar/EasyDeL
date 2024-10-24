@@ -34,7 +34,7 @@ def main():
 		gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
 		max_position_embeddings=sequence_length,
 		attn_dtype=jnp.float32,
-		attn_mechanism=ed.AttentionMechanisms.ring,
+		attn_mechanism=ed.AttentionMechanisms.RING,
 		block_k=512,
 		block_q=512,
 		hardware_abstraction=False,

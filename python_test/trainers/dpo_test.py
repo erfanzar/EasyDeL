@@ -100,7 +100,7 @@ def main():
 			attention_bias=False,
 			platform="jax",
 			attn_dtype=jnp.float32,
-			attn_mechanism=AttentionMechanisms.vanilla,
+			attn_mechanism=AttentionMechanisms.VANILLA,
 		)
 		arguments = DPOConfig(
 			num_train_epochs=4,
