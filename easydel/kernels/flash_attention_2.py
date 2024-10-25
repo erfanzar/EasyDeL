@@ -16,6 +16,7 @@ import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Tuple, Union, Literal
+import flax.linen
 from jax import random as jrnd
 import chex
 import einops
@@ -344,12 +345,59 @@ def _attn_refrence(query_states, key_states, value_states, bias):
 def _test_backward():
 	"""Tests the backward pass of the attention mechanism."""
 	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
-	B, QH, KVH, QS, KS, D = 1, 16, 8, 2048, 2048, 128
+	B, QH, KVH, QS, KS, D = 1, 32, 32, 2048, 2048, 128
 	blocksize_k = 16
 	blocksize_q = 16
 	q = jax.nn.initializers.normal(2)(q_key, (B, QS, QH, D), dtype=jnp.float16)
 	k = jax.nn.initializers.normal(2)(k_key, (B, KS, KVH, D), dtype=jnp.float16)
 	v = jax.nn.initializers.normal(2)(v_key, (B, KS, KVH, D), dtype=jnp.float16)
+	b = (
+		jnp.where(
+			jrnd.randint(v_key, (B, QH, QS, KS), 0, 4) > 2,
+			jnp.finfo(jnp.float16).min,
+			0,
+		)
+		if True
+		else None
+	)
+	attention = create_flash_attention(
+		blocksize_k=blocksize_k,
+		blocksize_q=blocksize_q,
+	)
+	try:
+		co = jax.grad(lambda *x: attention(*x).sum())(q, k, v, b)
+		print("Custom op backward pass gradients:")
+		print(co[0, 0, 0, :5])  # Print last 5 elements of last head of last batch
+	except Exception as er:
+		print(f"Custom op backward pass failed: {er}")
+		co = None
+
+	try:
+		fo = jax.grad(lambda *x: flax.linen.attention.dot_product_attention(*x).sum())(
+			q, k, v, b
+		)
+
+		print(fo[0, 0, 0, :5])  # Print last 5 elements of last head of last batch
+	except Exception as e:
+		print(f"Flax backward pass failed : {e}")
+		fo = None
+		exit()
+
+	if fo is not None and co is not None:
+		if jnp.allclose(co, fo, atol=0.125):
+			print("Backward pass results are close.")
+		else:
+			print("Backward pass results differ significantly!")
+
+
+def _test_forward():
+	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
+	B, QH, KH, QS, KS, D = 1, 32, 32, 2048, 2048, 128
+	blocksize_k = 16
+	blocksize_q = 16
+	q = jax.nn.initializers.normal(2)(q_key, (B, QS, QH, D), dtype=jnp.float16)
+	k = jax.nn.initializers.normal(2)(k_key, (B, KS, KH, D), dtype=jnp.float16)
+	v = jax.nn.initializers.normal(2)(v_key, (B, KS, KH, D), dtype=jnp.float16)
 	b = (
 		jnp.where(
 			jrnd.randint(v_key, (B, 1, QS, KS), 0, 4) > 2,
@@ -360,43 +408,16 @@ def _test_backward():
 		else None
 	)
 	attention = create_flash_attention(blocksize_q=blocksize_q, blocksize_k=blocksize_k)
-	excepted_result = jax.grad(lambda *x: _attn_refrence(*x).sum())(q, k, v, b)
-	result = jax.grad(lambda *x: attention(*x).sum())(q, k, v, b)
-
-	print(f"PRED BWD : {result[0,0,0,:5]}")
-	print(f"ORGN BWD : {excepted_result[0,0,0,:5]}")
-
-	print(jnp.allclose(excepted_result, result, atol=0.125, rtol=0))
-
-
-def _test_forward():
-	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
-	B, QH, KH, QS, KS, D = 1, 32, 4, 2048, 2048, 128
-	blocksize_k = 64
-	blocksize_q = 128
-	q = jax.nn.initializers.normal(2)(q_key, (B, QS, QH, D), dtype=jnp.float16)
-	k = jax.nn.initializers.normal(2)(k_key, (B, KS, KH, D), dtype=jnp.float16)
-	v = jax.nn.initializers.normal(2)(v_key, (B, KS, KH, D), dtype=jnp.float16)
-	b = (
-		jnp.where(
-			jrnd.randint(v_key, (B, QH, QS, KS), 0, 4) > 2,
-			jnp.finfo(jnp.float16).min,
-			0,
-		)
-		if True
-		else None
-	)
-	attention = create_flash_attention(blocksize_q=blocksize_q, blocksize_k=blocksize_k)
 	print("QKV Allocated")
 	try:
 		co = attention(q, k, v, b)
-		print(co[-1, -1, -1, :5])
+		print(co[0, 0, 0, :5])
 	except Exception as er:
 		print("Flash OOM", er)
 		co = None
 	try:
 		fo = _attn_refrence(q, k, v, b)
-		print(fo[-1, -1, -1, :5])
+		print(fo[0, 0, 0, :5])
 	except Exception as er:
 		print("Flax OOM", er)
 		fo = None

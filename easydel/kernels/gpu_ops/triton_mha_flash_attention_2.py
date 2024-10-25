@@ -1068,6 +1068,9 @@ _flash_attn2.defvjp(
 	_bwd_attn_kernel_call,
 )
 
+triton_flash_mha_attn_2_gpu = _flash_attn2
+__all__ = ["triton_flash_mha_attn_2_gpu"]
+
 
 def _test_forward():
 	"""Tests the forward pass of the attention mechanism."""
@@ -1089,16 +1092,16 @@ def _test_forward():
 	)
 	print("QKV Allocated")
 	try:
-		co = _flash_attn2(
+		co = triton_flash_mha_attn_2_gpu(
 			q, k, v, b, None, blocksize_k, blocksize_q
 		)  # passes 256K on 24G GPU 3090
-		print(co[-1, -1, -1, :5])
+		print(co[0, 0, 0, :5])
 	except Exception as er:
 		print("Flash OOM", er)
 		co = None
 	try:
 		fo = flax.linen.attention.dot_product_attention(q, k, v, b)
-		print(fo[-1, -1, -1, :5])
+		print(fo[0, 0, 0, :5])
 	except Exception as er:
 		print("Flax OOM", er)
 		fo = None
@@ -1109,29 +1112,27 @@ def _test_forward():
 def _test_backward():
 	"""Tests the backward pass of the attention mechanism."""
 	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
-	B, H, S, D = 1, 32, 1024, 128
+	B, QH, KVH, QS, KS, D = 1, 32, 32, 2048, 2048, 128
 	blocksize_k = 16
 	blocksize_q = 16
-	q = jax.nn.initializers.normal(2)(q_key, (B, S, H, D), dtype=jnp.float16)
-	k = jax.nn.initializers.normal(2)(k_key, (B, S, H, D), dtype=jnp.float16)
-	v = jax.nn.initializers.normal(2)(v_key, (B, S, H, D), dtype=jnp.float16)
-
+	q = jax.nn.initializers.normal(2)(q_key, (B, QS, QH, D), dtype=jnp.float16)
+	k = jax.nn.initializers.normal(2)(k_key, (B, KS, KVH, D), dtype=jnp.float16)
+	v = jax.nn.initializers.normal(2)(v_key, (B, KS, KVH, D), dtype=jnp.float16)
 	b = (
 		jnp.where(
-			jrnd.randint(v_key, (B, 1, S, S), 0, 4) > 2,
+			jrnd.randint(v_key, (B, QH, QS, KS), 0, 4) > 2,
 			jnp.finfo(jnp.float16).min,
 			0,
 		)
-		if True  # Set to True to test with bias
+		if True
 		else None
 	)
-
 	try:
-		co = jax.grad(lambda *x: _flash_attn2(*x, None, blocksize_q, blocksize_k).sum())(
+		co = jax.grad(lambda *x: triton_flash_mha_attn_2_gpu(*x, None, blocksize_q, blocksize_k).sum())(
 			q, k, v, b
 		)
 		print("Custom op backward pass gradients:")
-		print(co[-1][-1, -1, :5])  # Print last 5 elements of last head of last batch
+		print(co[0, 0, 0, :5])  # Print last 5 elements of last head of last batch
 	except Exception as er:
 		print(f"Custom op backward pass failed: {er}")
 		co = None
@@ -1141,7 +1142,7 @@ def _test_backward():
 			q, k, v, b
 		)
 
-		print(fo[-1][-1, -1, :5])  # Print last 5 elements of last head of last batch
+		print(fo[0, 0, 0, :5])  # Print last 5 elements of last head of last batch
 	except Exception as e:
 		print(f"Flax backward pass failed : {e}")
 		fo = None
@@ -1219,7 +1220,7 @@ def _fwd_benchmark(
 	)
 
 	if provider == "triton":
-		fn = lambda: _flash_attn2(query, key, value, bias, None, blocksize_k, blocksize_q)
+		fn = lambda: triton_flash_mha_attn_2_gpu(query, key, value, bias, None, blocksize_k, blocksize_q)
 	elif provider == "jax":
 		_fn = jax.jit(flax.linen.attention.dot_product_attention)
 		fn = lambda: _fn(query, key, value, bias).block_until_ready()
@@ -1295,10 +1296,10 @@ def _ptr_non_ptr_benchmark(
 	if mode == "fwd":
 		if provider == "triton-block-ptr":
 			os.environ["FLASH_ATTN_BLOCK_PTR"] = "1"
-			fn = lambda: _flash_attn2(query, key, value, bias, None, blocksize_k, blocksize_q)
+			fn = lambda: triton_flash_mha_attn_2_gpu(query, key, value, bias, None, blocksize_k, blocksize_q)
 		elif provider == "triton-ptr-block":
 			os.environ["FLASH_ATTN_BLOCK_PTR"] = "0"
-			fn = lambda: _flash_attn2(query, key, value, bias, None, blocksize_k, blocksize_q)
+			fn = lambda: triton_flash_mha_attn_2_gpu(query, key, value, bias, None, blocksize_k, blocksize_q)
 		elif provider == "jax":
 			_fn = jax.jit(flax.linen.attention.dot_product_attention)
 			fn = lambda: _fn(query, key, value, bias).block_until_ready()
@@ -1306,12 +1307,12 @@ def _ptr_non_ptr_benchmark(
 		if provider == "triton-block-ptr":
 			os.environ["FLASH_ATTN_BLOCK_PTR"] = "1"
 			fn = lambda: jax.grad(
-				lambda *x: _flash_attn2(*x, None, blocksize_k, blocksize_q).sum()
+				lambda *x: triton_flash_mha_attn_2_gpu(*x, None, blocksize_k, blocksize_q).sum()
 			)(query, key, value, bias)
 		elif provider == "triton-ptr-block":
 			os.environ["FLASH_ATTN_BLOCK_PTR"] = "0"
 			fn = lambda: jax.grad(
-				lambda *x: _flash_attn2(*x, None, blocksize_k, blocksize_q).sum()
+				lambda *x: triton_flash_mha_attn_2_gpu(*x, None, blocksize_k, blocksize_q).sum()
 			)(query, key, value, bias)
 		elif provider == "jax":
 			_fn = jax.jit(flax.linen.attention.dot_product_attention)
@@ -1325,8 +1326,6 @@ def _ptr_non_ptr_benchmark(
 	return ms
 
 
-triton_flash_mha_attn_2_gpu = _flash_attn2
-__all__ = ["triton_flash_mha_attn_2_gpu"]
 
 if __name__ == "__main__":
 	# _test_forward()
