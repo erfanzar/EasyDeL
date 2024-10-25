@@ -60,6 +60,11 @@ from easydel.trainers.prompt_utils import (
 	maybe_extract_prompt,
 )
 
+# try:
+from datasets import Dataset
+# except:  # noqa
+# 	Dataset = None
+
 logger = get_logger(__name__)
 
 
@@ -121,8 +126,8 @@ class DPOTrainer(BaseTrainer, ABC):
 		model_state: EasyDeLState,
 		ref_model_state: Optional[EasyDeLState] = None,
 		tokenizer: Optional[PreTrainedTokenizerBase] = None,
-		train_dataset: Optional["Dataset"] = None,  # noqa # type:ignore
-		eval_dataset: Optional["Dataset"] = None,  # noqa # type:ignore
+		train_dataset: Optional[Dataset] = None,
+		eval_dataset: Optional[Dataset] = None,
 		data_collator: Optional[Callable] = None,
 		dataset_map_arguments: Optional[dict] = None,
 		low_mem_usage: bool = True,
@@ -172,25 +177,47 @@ class DPOTrainer(BaseTrainer, ABC):
 
 		processing_class = tokenizer
 
+		if train_dataset[-1].get("chosen", None) is None:
+			warnings.warn(
+				"couldn't find `chosen` column in dataset"
+				", this might make DPOTrainer break down if you haven't customize trainer.",
+				stacklevel=2,
+			)
+		if train_dataset[-1].get("rejected", None) is None:
+			warnings.warn(
+				"couldn't find `rejected` column in dataset"
+				", this might make DPOTrainer break down if you haven't customize trainer.",
+				stacklevel=2,
+			)
+		if train_dataset[-1].get("prompt", None) is None:
+			warnings.warn(
+				"couldn't find `prompt` column in dataset"
+				", this might make DPOTrainer break down if you haven't customize trainer.",
+				stacklevel=2,
+			)
 		train_dataset = train_dataset.map(
 			maybe_extract_prompt,
 			num_proc=arguments.dataset_num_proc,
+			desc="Extracting Prompts",
 		)
 		train_dataset = train_dataset.map(
 			maybe_apply_chat_template,
 			fn_kwargs={"tokenizer": processing_class},
 			num_proc=arguments.dataset_num_proc,
+			desc="Apply Chat Template",
 		)
 		if eval_dataset is not None:
 			eval_dataset = eval_dataset.map(
-				maybe_extract_prompt, num_proc=arguments.dataset_num_proc
+				maybe_extract_prompt,
+				num_proc=arguments.dataset_num_proc,
+				desc="Eval - Extracting Prompts",
 			)
 			eval_dataset = eval_dataset.map(
 				maybe_apply_chat_template,
 				fn_kwargs={"tokenizer": processing_class},
 				num_proc=arguments.dataset_num_proc,
+				desc="Eval - Apply Chat Template",
 			)
-
 		fn_kwargs = {
 			"tokenizer": self.tokenizer,
 			"processor": None,
