@@ -1,6 +1,5 @@
 import os
 import sys
-import warnings
 
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
@@ -13,7 +12,6 @@ sys.path.append(
 	)
 )
 # jax.config.update("jax_platform_name", "cpu")  # CPU Test !
-from typing import Dict, Optional
 
 import jax  # noqa
 import datasets
