@@ -1,5 +1,6 @@
 import os
 import sys
+import warnings
 
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
@@ -15,7 +16,7 @@ sys.path.append(
 from typing import Dict, Optional
 
 import jax  # noqa
-from datasets import Dataset, load_dataset
+import datasets
 from jax import numpy as jnp
 from transformers import AutoTokenizer
 
@@ -30,53 +31,22 @@ from easydel import (
 )
 
 
-def extract_anthropic_prompt(prompt_and_response):
-	"""Extract the anthropic prompt from a prompt and response pair."""
-	search_term = "\n\nAssistant:"
-	search_term_idx = prompt_and_response.rfind(search_term)
-	assert search_term_idx != -1, f"Prompt and response does not contain '{search_term}'"
-	return prompt_and_response[: search_term_idx + len(search_term)]
-
-
-def get_hh(
-	split: str,
-	sanity_check: bool = False,
-	silent: bool = False,
-	cache_dir: Optional[str] = None,
-) -> Dataset:
-	"""Load the Anthropic Helpful-Harmless dataset from Hugging Face and convert it to the necessary format.
-
-	The dataset is converted to a dictionary with the following structure:
-	{
-	    'prompt': List[str],
-	    'chosen': List[str],
-	    'rejected': List[str],
-	}
-
-	Prompts should be structured as follows:
-	  \n\nHuman: <prompt>\n\nAssistant:
-	Multiple turns are allowed, but the prompt should always start with \n\nHuman: and end with \n\nAssistant:.
-	"""
-	dataset = load_dataset(
-		"Anthropic/hh-rlhf",
-		split=split,
-		cache_dir=cache_dir,
-	)
-	if sanity_check:
-		dataset = dataset.select(range(min(len(dataset), 1000)))
-
-	def split_prompt_and_responses(sample) -> Dict[str, str]:
-		prompt = extract_anthropic_prompt(sample["chosen"])
-		return {
-			"prompt": prompt,
-			"chosen": sample["chosen"][len(prompt) :],
-			"rejected": sample["rejected"][len(prompt) :],
-		}
-
-	return dataset.map(split_prompt_and_responses)
-
-
 def main():
+	train_dataset: datasets.Dataset = (
+		datasets.concatenate_datasets(
+			[
+				datasets.load_dataset(
+					"argilla/ultrafeedback-binarized-preferences", split="train"
+				),
+			]
+		)
+		# .shuffle()
+		# .shuffle()
+	)
+	train_dataset = train_dataset.rename_column("chosen_response", "chosen")
+	train_dataset = train_dataset.rename_column("rejected_response", "rejected")
+	train_dataset = train_dataset.rename_column("instruction", "prompt")
+
 	num_devices = len(jax.devices())
 	sharding_axis_dims = (1, 1, 1, -1)
 
@@ -140,9 +110,6 @@ def main():
 		if tokenizer.pad_token_id is None:
 			tokenizer.pad_token_id = tokenizer.eos_token_id
 
-		train_dataset = get_hh("train[:17%]", sanity_check=True)
-		eval_dataset = get_hh("test[:10%]", sanity_check=True)
-
 		module = FlaxLlamaForCausalLM(
 			config=conf,
 			dtype=jnp.float32,
@@ -175,7 +142,7 @@ def main():
 			model_state=state,
 			ref_model_state=ref_state,
 			train_dataset=train_dataset,
-			eval_dataset=eval_dataset,
+			eval_dataset=None,
 			tokenizer=tokenizer,
 			arguments=arguments,
 		)
