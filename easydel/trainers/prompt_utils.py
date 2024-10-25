@@ -308,6 +308,7 @@ def extract_prompt(example: Dict[str, Sequence]) -> Dict[str, Sequence]:
 
 	For more details, see [`maybe_extract_prompt`].
 	"""
+	idx = 0
 	for idx in range(min(len(example["chosen"]), len(example["rejected"]))):
 		if example["chosen"][idx] != example["rejected"][idx]:
 			if example["chosen"][idx - 1] == " ":  # remove space before the prompt
