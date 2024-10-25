@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import functools
 import math
 import os
 import time
@@ -32,21 +33,21 @@ from flax.struct import dataclass
 from jax import lax, random
 from jax import numpy as jnp
 from jax.experimental.pallas.ops.tpu.splash_attention import (
-  BlockSizes as BlockSizesSplashAttn,
+	BlockSizes as BlockSizesSplashAttn,
 )
 from jax.experimental.pallas.ops.tpu.splash_attention import (
-  CausalMask,
-  MultiHeadMask,
-  SegmentIds,
-  make_splash_mha,
+	CausalMask,
+	MultiHeadMask,
+	SegmentIds,
+	make_splash_mha,
 )
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec
 
 from easydel.etils.etils import (
-  _AVAILABLE_ATTENTION_MECHANISMS,
-  AVAILABLE_ATTENTION_MECHANISMS,
-  get_logger,
+	_AVAILABLE_ATTENTION_MECHANISMS,
+	AVAILABLE_ATTENTION_MECHANISMS,
+	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
 from easydel.kernels.flash_attention_2 import create_flash_attention
@@ -64,1353 +65,1396 @@ DEFAULT_Q_BLOCK = 64
 
 @lru_cache
 def get_cached_flash_attention(
-  backend,
-  platform,
-  blocksize_q,
-  blocksize_k,
-  softmax_scale,
+	backend,
+	platform,
+	blocksize_q,
+	blocksize_k,
+	softmax_scale,
 ):
-  return create_flash_attention(
-    backend=backend,
-    platform=platform,
-    blocksize_q=blocksize_q,
-    blocksize_k=blocksize_k,
-    softmax_scale=softmax_scale,
-  )
+	return create_flash_attention(
+		backend=backend,
+		platform=platform,
+		blocksize_q=blocksize_q,
+		blocksize_k=blocksize_k,
+		softmax_scale=softmax_scale,
+	)
 
 
 def _get_jax_dtype_from_string(dtype_string):
-  dtype_mapping = {
-    "<class 'jax.numpy.float32'>": jnp.float32,
-    "<class 'jax.numpy.float64'>": jnp.float64,
-    "<class 'jax.numpy.int32'>": jnp.int32,
-    "<class 'jax.numpy.int64'>": jnp.int64,
-    "<class 'jax.numpy.bool_'>": jnp.bool_,
-    "<class 'jax.numpy.complex64'>": jnp.complex64,
-    "<class 'jax.numpy.complex128'>": jnp.complex128,
-  }
-  return dtype_mapping.get(dtype_string, None)
+	dtype_mapping = {
+		"<class 'jax.numpy.float32'>": jnp.float32,
+		"<class 'jax.numpy.float64'>": jnp.float64,
+		"<class 'jax.numpy.int32'>": jnp.int32,
+		"<class 'jax.numpy.int64'>": jnp.int64,
+		"<class 'jax.numpy.bool_'>": jnp.bool_,
+		"<class 'jax.numpy.complex64'>": jnp.complex64,
+		"<class 'jax.numpy.complex128'>": jnp.complex128,
+	}
+	return dtype_mapping.get(dtype_string, None)
 
 
 @dataclass
 class AttentionOutput:
-  attention_weights: Optional[Array] = None
-  attention_outputs: Optional[Array] = None
+	attention_weights: Optional[Array] = None
+	attention_outputs: Optional[Array] = None
 
 
 class AttentionMechanisms(str, Enum):
-  FLASH_ATTN2 = "flash_attn2"
-  RING = "ring"
-  VANILLA = "vanilla"
-  SPLASH = "splash"
-  CUDNN = "cudnn"
-  BLOCKWISE = "blockwise"
-  SDPA = "sdpa"
+	FLASH_ATTN2 = "flash_attn2"
+	RING = "ring"
+	VANILLA = "vanilla"
+	SPLASH = "splash"
+	CUDNN = "cudnn"
+	BLOCKWISE = "blockwise"
+	SDPA = "sdpa"
 
 
 def combine_flash_masks(causal_mask, segment_ids):
-  causal_mask = causal_mask.astype(jnp.bool_)
-  if causal_mask.ndim == 2:
-    query_sequence_length, key_sequence_length = causal_mask.shape
-    causal_mask = causal_mask.reshape(1, 1, query_sequence_length, key_sequence_length)
-  elif causal_mask.ndim == 4:
-    *_, query_sequence_length, key_sequence_length = causal_mask.shape
-  else:
-    raise ValueError("unexpected shape for `causal_mask`")
-  if segment_ids.ndim == 2:
-    b, seq_query_sequence_length = segment_ids.shape
-    seq_key_sequence_length = seq_query_sequence_length
-  elif segment_ids.ndim == 4:
-    b, _, _, seq_key_sequence_length = segment_ids.shape
-    seq_query_sequence_length = seq_key_sequence_length
-    segment_ids = segment_ids[:, 0, -1]  # taking final mask
-  else:
-    raise ValueError("unexpected shape for `segment_ids`")
+	causal_mask = causal_mask.astype(jnp.bool_)
+	if causal_mask.ndim == 2:
+		query_sequence_length, key_sequence_length = causal_mask.shape
+		causal_mask = causal_mask.reshape(1, 1, query_sequence_length, key_sequence_length)
+	elif causal_mask.ndim == 4:
+		*_, query_sequence_length, key_sequence_length = causal_mask.shape
+	else:
+		raise ValueError("unexpected shape for `causal_mask`")
+	if segment_ids.ndim == 2:
+		b, seq_query_sequence_length = segment_ids.shape
+		seq_key_sequence_length = seq_query_sequence_length
+	elif segment_ids.ndim == 4:
+		b, _, _, seq_key_sequence_length = segment_ids.shape
+		seq_query_sequence_length = seq_key_sequence_length
+		segment_ids = segment_ids[:, 0, -1]  # taking final mask
+	else:
+		raise ValueError("unexpected shape for `segment_ids`")
 
-  assert (
-    seq_query_sequence_length == query_sequence_length
-  ), "`segment_ids` and `causal_mask` don't have same query axis length"
-  assert (
-    seq_key_sequence_length == key_sequence_length
-  ), "`segment_ids` and `causal_mask` don't have same key/value axis length"
-  assert (
-    segment_ids.ndim == 2
-  ), f"`segment_ids` don't have excepted shape {segment_ids.shape}"
-  segment_ids = jnp.expand_dims(
-    ~jnp.equal(
-      jnp.expand_dims(segment_ids, axis=2), jnp.expand_dims(segment_ids, axis=1)
-    ).astype(jax.numpy.bool_),
-    1,
-  )
-  return jnp.logical_or(~causal_mask, segment_ids)
+	assert (
+		seq_query_sequence_length == query_sequence_length
+	), "`segment_ids` and `causal_mask` don't have same query axis length"
+	assert (
+		seq_key_sequence_length == key_sequence_length
+	), "`segment_ids` and `causal_mask` don't have same key/value axis length"
+	assert (
+		segment_ids.ndim == 2
+	), f"`segment_ids` don't have excepted shape {segment_ids.shape}"
+	segment_ids = jnp.expand_dims(
+		~jnp.equal(
+			jnp.expand_dims(segment_ids, axis=2), jnp.expand_dims(segment_ids, axis=1)
+		).astype(jax.numpy.bool_),
+		1,
+	)
+	return jnp.logical_or(~causal_mask, segment_ids)
 
 
 def set_attrs_smartly_with_prp(
-  self,
-  attr_name: str,
-  default: Any,
-  new_attr: Any,
-  prp: EDPretrainedConfig = None,
-  pickup_name=None,
+	self,
+	attr_name: str,
+	default: Any,
+	new_attr: Any,
+	prp: EDPretrainedConfig = None,
+	pickup_name=None,
 ):
-  if not hasattr(self, attr_name) or getattr(self, attr_name, ...) == Ellipsis:
-    setattr(
-      self,
-      attr_name,
-      (
-        default
-        if prp is None
-        else getattr(prp, (attr_name if pickup_name is None else pickup_name))
-      ),
-    )
-  if not new_attr == Ellipsis:
-    setattr(self, attr_name, new_attr)
+	if not hasattr(self, attr_name) or getattr(self, attr_name, ...) == Ellipsis:
+		setattr(
+			self,
+			attr_name,
+			(
+				default
+				if prp is None
+				else getattr(prp, (attr_name if pickup_name is None else pickup_name))
+			),
+		)
+	if not new_attr == Ellipsis:
+		setattr(self, attr_name, new_attr)
 
 
 class FlexibleAttentionModule(object):
-  """
-  Manages different attention mechanisms for efficient computation in EasyDeL models.
+	"""
+	Manages different attention mechanisms for efficient computation in EasyDeL models.
 
-  This class serves as a central hub for handling various attention mechanisms, including
-  optimized implementations like FlashAttention, SplashAttention, RingAttention, and more traditional
-  approaches like vanilla (dot-product) attention. It provides a unified interface to
-  select and execute the appropriate attention mechanism based on the model's configuration and
-  hardware platform.
+	This class serves as a central hub for handling various attention mechanisms, including
+	optimized implementations like FlashAttention, SplashAttention, RingAttention, and more traditional
+	approaches like vanilla (dot-product) attention. It provides a unified interface to
+	select and execute the appropriate attention mechanism based on the model's configuration and
+	hardware platform.
 
-  Key Features:
+	Key Features:
 
-  * **Attention Mechanism Selection:** Supports a wide range of attention mechanisms,
-    allowing users to choose the most suitable option based on performance and hardware constraints.
-  * **Sharding and Partitioning:** Integrates with JAX's sharding capabilities, enabling efficient
-    distribution of computations and data across multiple devices.
-  * **Block-wise Computation:** Implements block-wise attention computations for optimized memory
-    usage and speed, particularly beneficial for large models.
-  * **Performance Optimization:** Includes support for highly optimized implementations like
-    FlashAttention, SplashAttention, and RingAttention for TPU and GPU acceleration.
-  * **Flexibility and Customization:** Offers fine-grained control over attention parameters,
-    sharding specifications, and block sizes, providing flexibility for different use cases.
-  * **Testing and Evaluation:** Includes a `run_attention_benchmarks` method to systematically evaluate
-    different attention mechanisms and help users identify the best-performing option.
+	* **Attention Mechanism Selection:** Supports a wide range of attention mechanisms,
+		allowing users to choose the most suitable option based on performance and hardware constraints.
+	* **Sharding and Partitioning:** Integrates with JAX's sharding capabilities, enabling efficient
+		distribution of computations and data across multiple devices.
+	* **Block-wise Computation:** Implements block-wise attention computations for optimized memory
+		usage and speed, particularly beneficial for large models.
+	* **Performance Optimization:** Includes support for highly optimized implementations like
+		FlashAttention, SplashAttention, and RingAttention for TPU and GPU acceleration.
+	* **Flexibility and Customization:** Offers fine-grained control over attention parameters,
+		sharding specifications, and block sizes, providing flexibility for different use cases.
+	* **Testing and Evaluation:** Includes a `run_attention_benchmarks` method to systematically evaluate
+		different attention mechanisms and help users identify the best-performing option.
 
-  Example Usage:
+	Example Usage:
 
-  >>> # Initialize an FlexibleAttentionModule instance
-  >>> attention_module = FlexibleAttentionModule(
-  ...    mesh=mesh,
-  ...    attn_mechanism="ring",  # Select the desired attention mechanism
-  ...    sm_scale=1.0 / math.sqrt(head_dim),
-  ...    num_attention_heads=num_heads,
-  ...    head_dims=head_dim,
-  ...    # ... other configuration parameters ...
-  >>> )
+	>>> # Initialize an FlexibleAttentionModule instance
+	>>> attention_module = FlexibleAttentionModule(
+	...    mesh=mesh,
+	...    attn_mechanism="ring",  # Select the desired attention mechanism
+	...    sm_scale=1.0 / math.sqrt(head_dim),
+	...    num_attention_heads=num_heads,
+	...    head_dims=head_dim,
+	...    # ... other configuration parameters ...
+	>>> )
 
-  >>> # Compute attention outputs
-  >>> attention_output = attention_module(
-  ...    query_states=query_states,
-  ...    key_states=key_states,
-  ...    value_states=value_states,
-  ...     # ... other attention inputs ...
-  >>> )
+	>>> # Compute attention outputs
+	>>> attention_output = attention_module(
+	...    query_states=query_states,
+	...    key_states=key_states,
+	...    value_states=value_states,
+	...     # ... other attention inputs ...
+	>>> )
 
-  >>> # Access attention outputs
-  >>> attention_outputs = attention_output.attention_outputs
-  >>> attention_weights = attention_output.attention_weights
+	>>> # Access attention outputs
+	>>> attention_outputs = attention_output.attention_outputs
+	>>> attention_weights = attention_output.attention_weights
 
-  The FlexibleAttentionModule class is a crucial component within EasyDeL, responsible for managing and optimizing attention
-  computations. It provides a user-friendly way to select and execute different attention mechanisms,
-  leveraging JAX's sharding capabilities and offering performance enhancements through specialized implementations
-   like FlashAttention and SplashAttention. Its ability to handle block-wise computations and customization options
-    makes it adaptable to a variety of model architectures and hardware configurations.
-  """
+	The FlexibleAttentionModule class is a crucial component within EasyDeL, responsible for managing and optimizing attention
+	computations. It provides a user-friendly way to select and execute different attention mechanisms,
+	leveraging JAX's sharding capabilities and offering performance enhancements through specialized implementations
+	 like FlashAttention and SplashAttention. Its ability to handle block-wise computations and customization options
+		makes it adaptable to a variety of model architectures and hardware configurations.
+	"""
 
-  def __init__(
-    self,
-    mesh: Mesh,
-    sm_scale: float,
-    num_kv_heads: int,
-    num_q_heads: int,
-    head_dims: int,
-    attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = AttentionMechanisms.SDPA,
-    block_k: int = ...,
-    block_q: int = ...,
-    block_b: int = ...,
-    partition_axis: PartitionAxis = ...,
-    scan_ring_attention: bool = ...,
-    scan_attention_layers: bool = ...,
-    attention_dropout: float = 0.0,
-    dtype: jnp.dtype = ...,
-    precision: lax.Precision = ...,
-    force_float32_tpu: bool = ...,
-    shard_attention_computation: bool = ...,
-    use_sharding_constraint: Optional[bool] = ...,
-    axis_name: str = ...,
-    platform: AVAILABLE_BACKENDS = ...,
-    backend: Optional[Literal["cpu", "gpu", "tpu"]] = ...,
-    backward_pass_impl: Literal["triton", "xla"] = "triton",
-    base_config: Optional[EDPretrainedConfig] = None,
-    _do_check: bool = True,
-  ):
-    # fmt:off
-    self.block_k: int = ...
-    self.block_q: int = ...
-    self.block_b: int = ...
-    self.partition_axis: PartitionAxis = ...
-    self.scan_ring_attention: bool = ...
-    self.precision: lax.Precision = ...
-    self.force_float32_tpu: bool = ...
-    self.shard_attention_computation: bool = ...
-    self.use_sharding_constraint: Optional[bool] = ...
-    self.axis_name: str = ...
-    self.backend: str = ...
-    self.platform: str = ...
+	def __init__(
+		self,
+		mesh: Mesh,
+		sm_scale: float,
+		num_kv_heads: int,
+		num_q_heads: int,
+		head_dims: int,
+		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = AttentionMechanisms.SDPA,
+		block_k: int = ...,
+		block_q: int = ...,
+		block_b: int = ...,
+		partition_axis: PartitionAxis = ...,
+		scan_ring_attention: bool = ...,
+		scan_attention_layers: bool = ...,
+		attention_dropout: float = 0.0,
+		dtype: jnp.dtype = ...,
+		precision: lax.Precision = ...,
+		force_float32_tpu: bool = ...,
+		shard_attention_computation: bool = ...,
+		use_sharding_constraint: Optional[bool] = ...,
+		axis_name: str = ...,
+		platform: AVAILABLE_BACKENDS = ...,
+		backend: Optional[Literal["cpu", "gpu", "tpu"]] = ...,
+		backward_pass_impl: Literal["triton", "xla"] = "triton",
+		base_config: Optional[EDPretrainedConfig] = None,
+		_do_check: bool = True,
+	):
+		# fmt:off
+		self.block_k: int = ...
+		self.block_q: int = ...
+		self.block_b: int = ...
+		self.partition_axis: PartitionAxis = ...
+		self.scan_ring_attention: bool = ...
+		self.precision: lax.Precision = ...
+		self.force_float32_tpu: bool = ...
+		self.shard_attention_computation: bool = ...
+		self.use_sharding_constraint: Optional[bool] = ...
+		self.axis_name: str = ...
+		self.backend: str = ...
+		self.platform: str = ...
 
-    set_attrs_smartly_with_prp(self, "use_sharding_constraint", False, use_sharding_constraint, base_config)
-    set_attrs_smartly_with_prp(self, "block_q", DEFAULT_Q_BLOCK, block_q, base_config)
-    set_attrs_smartly_with_prp(self, "block_k", DEFAULT_K_BLOCK, block_k, base_config)
-    set_attrs_smartly_with_prp(self, "block_b", 1, block_b, base_config)
-    set_attrs_smartly_with_prp(self, "dtype", jnp.float32, dtype, base_config, "attn_dtype")
-    set_attrs_smartly_with_prp(self, "shard_attention_computation", True, shard_attention_computation, base_config)
-    set_attrs_smartly_with_prp(self, "scan_ring_attention", True, scan_ring_attention, base_config)
-    set_attrs_smartly_with_prp(self, "partition_axis", PartitionAxis(), partition_axis, base_config)
-    set_attrs_smartly_with_prp(self, "precision", lax.Precision("fastest"), precision)  # DON'T READ FROM CONFIG
-    set_attrs_smartly_with_prp(self, "force_float32_tpu", True, force_float32_tpu)  # DON'T READ FROM CONFIG
-    set_attrs_smartly_with_prp(self, "axis_name", "sp", axis_name, base_config, "attention_axis_name")  # DON'T READ FROM CONFIG
-    set_attrs_smartly_with_prp(self, "backend", jax.default_backend(), backend, base_config, "backend") 
-    set_attrs_smartly_with_prp(self, "platform", ..., platform, base_config, "platform") 
+		set_attrs_smartly_with_prp(self, "use_sharding_constraint", False, use_sharding_constraint, base_config)
+		set_attrs_smartly_with_prp(self, "block_q", DEFAULT_Q_BLOCK, block_q, base_config)
+		set_attrs_smartly_with_prp(self, "block_k", DEFAULT_K_BLOCK, block_k, base_config)
+		set_attrs_smartly_with_prp(self, "block_b", 1, block_b, base_config)
+		set_attrs_smartly_with_prp(self, "dtype", jnp.float32, dtype, base_config, "attn_dtype")
+		set_attrs_smartly_with_prp(self, "shard_attention_computation", True, shard_attention_computation, base_config)
+		set_attrs_smartly_with_prp(self, "scan_ring_attention", True, scan_ring_attention, base_config)
+		set_attrs_smartly_with_prp(self, "partition_axis", PartitionAxis(), partition_axis, base_config)
+		set_attrs_smartly_with_prp(self, "precision", lax.Precision("fastest"), precision)  # DON'T READ FROM CONFIG
+		set_attrs_smartly_with_prp(self, "force_float32_tpu", True, force_float32_tpu)  # DON'T READ FROM CONFIG
+		set_attrs_smartly_with_prp(self, "axis_name", "sp", axis_name, base_config, "attention_axis_name")  # DON'T READ FROM CONFIG
+		set_attrs_smartly_with_prp(self, "backend", jax.default_backend(), backend, base_config, "backend") 
+		set_attrs_smartly_with_prp(self, "platform", ..., platform, base_config, "platform") 
 
-    self.mesh = mesh
-    self.attn_mechanism = attn_mechanism 
-    self.sm_scale = sm_scale  
-    self.head_dims = head_dims
-    self.scan_attention_layers = scan_attention_layers
-    self.attention_dropout = attention_dropout
-    self.backward_pass_impl = backward_pass_impl
-    self._do_check = _do_check
-    self.num_kv_heads = num_kv_heads or num_q_heads
-    self.num_q_heads = num_q_heads
-    assert num_q_heads % num_kv_heads == 0 
+		self.mesh = mesh
+		self.attn_mechanism = attn_mechanism 
+		self.sm_scale = sm_scale  
+		self.head_dims = head_dims
+		self.scan_attention_layers = scan_attention_layers
+		self.attention_dropout = attention_dropout
+		self.backward_pass_impl = backward_pass_impl
+		self._do_check = _do_check
+		self.num_kv_heads = num_kv_heads or num_q_heads
+		self.num_q_heads = num_q_heads
+		assert num_q_heads % num_kv_heads == 0 
 
-    if attn_mechanism == "splash" and self.backend != "tpu":
-      raise OSError("splash attention is only supported on TPU.")
-    if attn_mechanism == "cudnn" and self.backend != "gpu":
-      raise OSError("flash attention is only supported on GPU.")
-    if isinstance(self.dtype, str):
-      self.dtype = _get_jax_dtype_from_string(self.dtype)
-      assert (
-        self.dtype is not None
-      ), "Please consider passing attn_dtype to config."
-    # fmt:on
+		if attn_mechanism == "splash" and self.backend != "tpu":
+			raise OSError("splash attention is only supported on TPU.")
+		if attn_mechanism == "cudnn" and self.backend != "gpu":
+			raise OSError("flash attention is only supported on GPU.")
+		if isinstance(self.dtype, str):
+			self.dtype = _get_jax_dtype_from_string(self.dtype)
+			assert (
+				self.dtype is not None
+			), "Please consider passing attn_dtype to config."
+		# fmt:on
 
-  def get_block_size_splash_attn(self, q_seq, k_seq):
-    return BlockSizesSplashAttn(
-      block_q=min(self.block_q, q_seq),
-      block_kv_compute=min(self.block_k, k_seq),
-      block_kv=min(self.block_k, k_seq),
-      block_q_dkv=min(self.block_q, q_seq),
-      block_kv_dkv=min(self.block_k, k_seq),
-      block_kv_dkv_compute=min(self.block_k, k_seq),
-      block_q_dq=min(self.block_q, q_seq),
-      block_kv_dq=min(self.block_k, k_seq),
-    )
+	def get_block_size_splash_attn(self, q_seq, k_seq):
+		return BlockSizesSplashAttn(
+			block_q=min(self.block_q, q_seq),
+			block_kv_compute=min(self.block_k, k_seq),
+			block_kv=min(self.block_k, k_seq),
+			block_q_dkv=min(self.block_q, q_seq),
+			block_kv_dkv=min(self.block_k, k_seq),
+			block_kv_dkv_compute=min(self.block_k, k_seq),
+			block_q_dq=min(self.block_q, q_seq),
+			block_kv_dq=min(self.block_k, k_seq),
+		)
 
-  def get_bshd_partition_specs(
-    self,
-    query_sequence_length,
-    bias_dim_eql=False,
-  ) -> Tuple[
-    PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, bool
-  ]:
-    is_generating = query_sequence_length == 1
-    if is_generating:
-      query_partition_spec = PartitionSpec(
-        self.partition_axis.batch_axis,
-        self.partition_axis.query_sequence_axis,
-        self.partition_axis.head_axis,
-        self.partition_axis.attention_dim_axis,
-      )
-      key_partition_spec = PartitionSpec(
-        self.partition_axis.batch_axis,
-        self.partition_axis.key_sequence_axis,
-        self.partition_axis.head_axis,
-        self.partition_axis.attention_dim_axis,
-      )
-      value_partition_spec = PartitionSpec(
-        self.partition_axis.batch_axis,
-        self.partition_axis.key_sequence_axis,
-        self.partition_axis.head_axis,
-        self.partition_axis.attention_dim_axis,
-      )
-      bias_partition_spec = PartitionSpec(
-        self.partition_axis.batch_axis,
-        self.partition_axis.bias_head_sequence_axis
-        if not bias_dim_eql
-        else self.partition_axis.head_axis,
-        self.partition_axis.query_sequence_axis,
-        self.partition_axis.bias_key_sequence_axis,
-      )
-      attention_partition_spec = query_partition_spec
-    else:
-      query_partition_spec = PartitionSpec(
-        self.partition_axis.batch_axis,
-        self.partition_axis.generation_query_sequence_axis,
-        self.partition_axis.head_axis,
-        self.partition_axis.attention_dim_axis,
-      )
-      key_partition_spec = PartitionSpec(
-        self.partition_axis.batch_axis,
-        self.partition_axis.generation_key_sequence_axis,
-        self.partition_axis.head_axis,
-        self.partition_axis.attention_dim_axis,
-      )
-      value_partition_spec = PartitionSpec(
-        self.partition_axis.batch_axis,
-        self.partition_axis.generation_key_sequence_axis,
-        self.partition_axis.head_axis,
-        self.partition_axis.attention_dim_axis,
-      )
-      bias_partition_spec = PartitionSpec(
-        self.partition_axis.batch_axis,
-        self.partition_axis.bias_head_sequence_axis
-        if not bias_dim_eql
-        else self.partition_axis.head_axis,
-        self.partition_axis.generation_query_sequence_axis,
-        self.partition_axis.bias_key_sequence_axis,
-      )
-      attention_partition_spec = query_partition_spec
-    return (
-      query_partition_spec,
-      key_partition_spec,
-      value_partition_spec,
-      bias_partition_spec,
-      attention_partition_spec,
-      is_generating,
-    )
+	def get_bshd_partition_specs(
+		self,
+		query_sequence_length,
+		bias_dim_eql=False,
+	) -> Tuple[
+		PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, bool
+	]:
+		in_generating_processerating = query_sequence_length == 1
+		if in_generating_processerating:
+			query_partition_spec = PartitionSpec(
+				self.partition_axis.batch_axis,
+				self.partition_axis.query_sequence_axis,
+				self.partition_axis.head_axis,
+				self.partition_axis.attention_dim_axis,
+			)
+			key_partition_spec = PartitionSpec(
+				self.partition_axis.batch_axis,
+				self.partition_axis.key_sequence_axis,
+				self.partition_axis.head_axis,
+				self.partition_axis.attention_dim_axis,
+			)
+			value_partition_spec = PartitionSpec(
+				self.partition_axis.batch_axis,
+				self.partition_axis.key_sequence_axis,
+				self.partition_axis.head_axis,
+				self.partition_axis.attention_dim_axis,
+			)
+			bias_partition_spec = PartitionSpec(
+				self.partition_axis.batch_axis,
+				self.partition_axis.bias_head_sequence_axis
+				if not bias_dim_eql
+				else self.partition_axis.head_axis,
+				self.partition_axis.query_sequence_axis,
+				self.partition_axis.bias_key_sequence_axis,
+			)
+			attention_partition_spec = query_partition_spec
+		else:
+			query_partition_spec = PartitionSpec(
+				self.partition_axis.batch_axis,
+				self.partition_axis.generation_query_sequence_axis,
+				self.partition_axis.head_axis,
+				self.partition_axis.attention_dim_axis,
+			)
+			key_partition_spec = PartitionSpec(
+				self.partition_axis.batch_axis,
+				self.partition_axis.generation_key_sequence_axis,
+				self.partition_axis.head_axis,
+				self.partition_axis.attention_dim_axis,
+			)
+			value_partition_spec = PartitionSpec(
+				self.partition_axis.batch_axis,
+				self.partition_axis.generation_key_sequence_axis,
+				self.partition_axis.head_axis,
+				self.partition_axis.attention_dim_axis,
+			)
+			bias_partition_spec = PartitionSpec(
+				self.partition_axis.batch_axis,
+				self.partition_axis.bias_head_sequence_axis
+				if not bias_dim_eql
+				else self.partition_axis.head_axis,
+				self.partition_axis.generation_query_sequence_axis,
+				self.partition_axis.bias_key_sequence_axis,
+			)
+			attention_partition_spec = query_partition_spec
+		return (
+			query_partition_spec,
+			key_partition_spec,
+			value_partition_spec,
+			bias_partition_spec,
+			attention_partition_spec,
+			in_generating_processerating,
+		)
 
-  def get_bhsd_partition_specs(
-    self, query_sequence_length
-  ) -> Tuple[
-    PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, bool
-  ]:
-    is_generating = query_sequence_length == 1
-    if is_generating:
-      query_partition_spec = PartitionSpec(
-        self.partition_axis.batch_axis,
-        self.partition_axis.head_axis,
-        self.partition_axis.query_sequence_axis,
-        self.partition_axis.attention_dim_axis,
-      )
-      key_partition_spec = PartitionSpec(
-        self.partition_axis.batch_axis,
-        self.partition_axis.head_axis,
-        self.partition_axis.key_sequence_axis,
-        self.partition_axis.attention_dim_axis,
-      )
-      value_partition_spec = PartitionSpec(
-        self.partition_axis.batch_axis,
-        self.partition_axis.head_axis,
-        self.partition_axis.key_sequence_axis,
-        self.partition_axis.attention_dim_axis,
-      )
-      bias_partition_spec = PartitionSpec(
-        self.partition_axis.batch_axis,
-        self.partition_axis.bias_head_sequence_axis,
-        self.partition_axis.query_sequence_axis,
-        self.partition_axis.bias_key_sequence_axis,
-      )
-      attention_partition_spec = query_partition_spec
-    else:
-      query_partition_spec = PartitionSpec(
-        self.partition_axis.batch_axis,
-        self.partition_axis.head_axis,
-        self.partition_axis.query_sequence_axis,
-        self.partition_axis.attention_dim_axis,
-      )
-      key_partition_spec = PartitionSpec(
-        self.partition_axis.batch_axis,
-        self.partition_axis.head_axis,
-        self.partition_axis.key_sequence_axis,
-        self.partition_axis.attention_dim_axis,
-      )
-      value_partition_spec = PartitionSpec(
-        self.partition_axis.batch_axis,
-        self.partition_axis.head_axis,
-        self.partition_axis.key_sequence_axis,
-        self.partition_axis.attention_dim_axis,
-      )
-      bias_partition_spec = PartitionSpec(
-        self.partition_axis.batch_axis,
-        self.partition_axis.bias_head_sequence_axis,
-        self.partition_axis.query_sequence_axis,
-        self.partition_axis.bias_key_sequence_axis,
-      )
-      attention_partition_spec = query_partition_spec
-    return (
-      query_partition_spec,
-      key_partition_spec,
-      value_partition_spec,
-      bias_partition_spec,
-      attention_partition_spec,
-      is_generating,
-    )
+	def get_bhsd_partition_specs(
+		self, query_sequence_length
+	) -> Tuple[
+		PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, bool
+	]:
+		in_generating_processerating = query_sequence_length == 1
+		if in_generating_processerating:
+			query_partition_spec = PartitionSpec(
+				self.partition_axis.batch_axis,
+				self.partition_axis.head_axis,
+				self.partition_axis.query_sequence_axis,
+				self.partition_axis.attention_dim_axis,
+			)
+			key_partition_spec = PartitionSpec(
+				self.partition_axis.batch_axis,
+				self.partition_axis.head_axis,
+				self.partition_axis.key_sequence_axis,
+				self.partition_axis.attention_dim_axis,
+			)
+			value_partition_spec = PartitionSpec(
+				self.partition_axis.batch_axis,
+				self.partition_axis.head_axis,
+				self.partition_axis.key_sequence_axis,
+				self.partition_axis.attention_dim_axis,
+			)
+			bias_partition_spec = PartitionSpec(
+				self.partition_axis.batch_axis,
+				self.partition_axis.bias_head_sequence_axis,
+				self.partition_axis.query_sequence_axis,
+				self.partition_axis.bias_key_sequence_axis,
+			)
+			attention_partition_spec = query_partition_spec
+		else:
+			query_partition_spec = PartitionSpec(
+				self.partition_axis.batch_axis,
+				self.partition_axis.head_axis,
+				self.partition_axis.query_sequence_axis,
+				self.partition_axis.attention_dim_axis,
+			)
+			key_partition_spec = PartitionSpec(
+				self.partition_axis.batch_axis,
+				self.partition_axis.head_axis,
+				self.partition_axis.key_sequence_axis,
+				self.partition_axis.attention_dim_axis,
+			)
+			value_partition_spec = PartitionSpec(
+				self.partition_axis.batch_axis,
+				self.partition_axis.head_axis,
+				self.partition_axis.key_sequence_axis,
+				self.partition_axis.attention_dim_axis,
+			)
+			bias_partition_spec = PartitionSpec(
+				self.partition_axis.batch_axis,
+				self.partition_axis.bias_head_sequence_axis,
+				self.partition_axis.query_sequence_axis,
+				self.partition_axis.bias_key_sequence_axis,
+			)
+			attention_partition_spec = query_partition_spec
+		return (
+			query_partition_spec,
+			key_partition_spec,
+			value_partition_spec,
+			bias_partition_spec,
+			attention_partition_spec,
+			in_generating_processerating,
+		)
 
-  def _check_states(
-    self,
-    query_states: Array,
-    key_states: Array,
-    value_states: Array,
-    query_sequence_length: int,
-    key_value_sequence_length: int,
-  ):
-    batch_size = query_states.shape[0]
-    assert (
-      batch_size == key_states.shape[0] == value_states.shape[0]
-    ), "Batch Size for q,k,v wont match"
-    k_v_req_shape = (
-      batch_size,
-      key_value_sequence_length,
-      self.num_kv_heads,
-      self.head_dims,
-    )
-    q_shape = (
-      batch_size,
-      query_sequence_length,
-      self.num_q_heads,
-      self.head_dims,
-    )
+	def _check_states(
+		self,
+		query_states: Array,
+		key_states: Array,
+		value_states: Array,
+		query_sequence_length: int,
+		key_value_sequence_length: int,
+	):
+		batch_size = query_states.shape[0]
+		assert (
+			batch_size == key_states.shape[0] == value_states.shape[0]
+		), "Batch Size for q,k,v wont match"
+		k_v_req_shape = (
+			batch_size,
+			key_value_sequence_length,
+			self.num_kv_heads,
+			self.head_dims,
+		)
+		q_shape = (
+			batch_size,
+			query_sequence_length,
+			self.num_q_heads,
+			self.head_dims,
+		)
 
-    assertion_mkv_err = f"""
-        query_states, key_states, value_states and bias shapes must be like
-        query_states Shape : [batch_size, q_seq_len , {self.head_dims=}, {self.head_dims=}]
-        key_states   Shape : [batch_size, kv_seq_len, {self.num_kv_heads=}, {self.head_dims=}]
-        value_states Shape : [batch_size, kv_seq_len, {self.num_kv_heads=}, {self.head_dims=}]
-        bias         Shape : [batch_size, {self.head_dims=}, q_seq_len , kv_seq_len]
-            """
+		assertion_mkv_err = f"""
+				query_states, key_states, value_states and bias shapes must be like
+				query_states Shape : [batch_size, q_seq_len , {self.head_dims=}, {self.head_dims=}]
+				key_states   Shape : [batch_size, kv_seq_len, {self.num_kv_heads=}, {self.head_dims=}]
+				value_states Shape : [batch_size, kv_seq_len, {self.num_kv_heads=}, {self.head_dims=}]
+				bias         Shape : [batch_size, {self.head_dims=}, q_seq_len , kv_seq_len]
+						"""
 
-    assert query_states.shape == q_shape, assertion_mkv_err + (
-      f"\nMiss Match {query_states.shape} and " f"required Shape {q_shape}"
-    )
-    assert key_states.shape == k_v_req_shape, assertion_mkv_err + (
-      f"\nMiss Match {key_states.shape} and " f"required Shape {k_v_req_shape}"
-    )
-    assert value_states.shape == k_v_req_shape, assertion_mkv_err + (
-      f"\nMiss Match {value_states.shape} and " f"required Shape {k_v_req_shape}"
-    )
+		assert query_states.shape == q_shape, assertion_mkv_err + (
+			f"\nMiss Match {query_states.shape} and " f"required Shape {q_shape}"
+		)
+		assert key_states.shape == k_v_req_shape, assertion_mkv_err + (
+			f"\nMiss Match {key_states.shape} and " f"required Shape {k_v_req_shape}"
+		)
+		assert value_states.shape == k_v_req_shape, assertion_mkv_err + (
+			f"\nMiss Match {value_states.shape} and " f"required Shape {k_v_req_shape}"
+		)
 
-  def __call__(
-    self,
-    query_states: Array,
-    key_states: Array,
-    value_states: Array,
-    query_sequence_length: Optional[int] = None,
-    key_value_sequence_length: Optional[int] = None,
-    bias: Optional[Array] = None,
-    attention_mask: Optional[Array] = None,
-    segment_ids: Optional[Array] = None,
-    causal: bool = True,
-    deterministic: bool = True,
-    dropout_rng: Optional[random.PRNGKey] = None,
-    uses_cache: bool = False,
-    causal_mask: Optional[Array] = None,
-  ):
-    # fmt:off
-    if query_sequence_length is None:
-      query_sequence_length = query_states.shape[1]
-    if key_value_sequence_length is None:
-      key_value_sequence_length = key_states.shape[1]
-    with self.mesh:
-      if self._do_check:
-        self._check_states(
-          query_states=query_states,
-          key_states=key_states,
-          value_states=value_states,
-          query_sequence_length=query_sequence_length,
-          key_value_sequence_length=key_value_sequence_length,
-        )
-      match self.attn_mechanism:
-        case AttentionMechanisms.FLASH_ATTN2:
-          return self.flash_attn2(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            bias=bias,
-          )
-        case AttentionMechanisms.SDPA:
-          return self.sdpa(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            bias=bias,
-            causal=causal,
-          )
-        case AttentionMechanisms.VANILLA:
-          return self.vanilla_attention(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            bias=bias,
-            dropout_rng=dropout_rng,
-            deterministic=deterministic,
-            query_sequence_length=query_sequence_length,
-            key_value_sequence_length=key_value_sequence_length,
-          )
-        case AttentionMechanisms.RING:
-          return self.ring_attention(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            bias=bias,
-            dropout_rng=dropout_rng,
-            deterministic=deterministic,
-            segment_ids=segment_ids,
-            attention_mask=attention_mask,
-            query_sequence_length=query_sequence_length,
-            key_value_sequence_length=key_value_sequence_length,
-          )
-        case AttentionMechanisms.SPLASH:
-          if segment_ids is not None:
-            warnings.warn("Splash attention don't support `segment_ids` this argument will be ignored", UserWarning, stacklevel=1)
-          if self.attention_dropout != 0.0:
-            warnings.warn("Splash attention don't support `attention_dropout` this argument will be ignored", UserWarning, stacklevel=1)
-          if bias is not None:
-            warnings.warn("Splash attention don't support `bias` this argument will be ignored", UserWarning, stacklevel=1)
+	def __call__(
+		self,
+		query_states: Array,
+		key_states: Array,
+		value_states: Array,
+		query_sequence_length: Optional[int] = None,
+		key_value_sequence_length: Optional[int] = None,
+		bias: Optional[Array] = None,
+		attention_mask: Optional[Array] = None,
+		segment_ids: Optional[Array] = None,
+		causal: bool = True,
+		deterministic: bool = True,
+		dropout_rng: Optional[random.PRNGKey] = None,
+		uses_cache: bool = False,
+		causal_mask: Optional[Array] = None,
+	):
+		# fmt:off
+		if query_sequence_length is None:
+			query_sequence_length = query_states.shape[1]
+		if key_value_sequence_length is None:
+			key_value_sequence_length = key_states.shape[1]
+		with self.mesh:
+			if self._do_check:
+				self._check_states(
+					query_states=query_states,
+					key_states=key_states,
+					value_states=value_states,
+					query_sequence_length=query_sequence_length,
+					key_value_sequence_length=key_value_sequence_length,
+				)
+			match self.attn_mechanism:
+				case AttentionMechanisms.FLASH_ATTN2:
+					return self.flash_attn2(
+						query_states=query_states,
+						key_states=key_states,
+						value_states=value_states,
+						bias=bias,
+					)
+				case AttentionMechanisms.SDPA:
+					return self.sdpa(
+						query_states=query_states,
+						key_states=key_states,
+						value_states=value_states,
+						bias=bias,
+						causal=causal,
+					)
+				case AttentionMechanisms.VANILLA:
+					return self.vanilla_attention(
+						query_states=query_states,
+						key_states=key_states,
+						value_states=value_states,
+						bias=bias,
+						dropout_rng=dropout_rng,
+						deterministic=deterministic,
+						query_sequence_length=query_sequence_length,
+						key_value_sequence_length=key_value_sequence_length,
+					)
+				case AttentionMechanisms.RING:
+					return self.ring_attention(
+						query_states=query_states,
+						key_states=key_states,
+						value_states=value_states,
+						bias=bias,
+						dropout_rng=dropout_rng,
+						deterministic=deterministic,
+						segment_ids=segment_ids,
+						attention_mask=attention_mask,
+						query_sequence_length=query_sequence_length,
+						key_value_sequence_length=key_value_sequence_length,
+					)
+				case AttentionMechanisms.SPLASH:
+					if segment_ids is not None:
+						warnings.warn("Splash attention don't support `segment_ids` this argument will be ignored", UserWarning, stacklevel=1)
+					if self.attention_dropout != 0.0:
+						warnings.warn("Splash attention don't support `attention_dropout` this argument will be ignored", UserWarning, stacklevel=1)
+					if bias is not None:
+						warnings.warn("Splash attention don't support `bias` this argument will be ignored", UserWarning, stacklevel=1)
 
-          return self.splash_attention(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            query_sequence_length=query_sequence_length,
-            key_value_sequence_length=key_value_sequence_length,
-            attention_mask=attention_mask,
-          )
-        case  AttentionMechanisms.BLOCKWISE:
-          if segment_ids is not None:
-            warnings.warn("BlockWise Attention don't support `segment_ids` this argument will be ignored", UserWarning, stacklevel=1)
-          return self.blockwise_attention(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            bias=bias,
-            deterministic=deterministic,
-            dropout_rng=dropout_rng,
-            query_sequence_length=query_sequence_length,
-            key_value_sequence_length=key_value_sequence_length,
-          )
-        case AttentionMechanisms.CUDNN:
-          return self.cuddn_flash_attention(
-            query_states=query_states,
-            key_states=key_states,
-            value_states=value_states,
-            bias=bias,
-            causal=causal,
-            deterministic=deterministic,
-            query_sequence_length=query_sequence_length,
-            key_value_sequence_length=key_value_sequence_length,
-          )
-              
-    raise ValueError(f"Unknown Attention mechanism of {self.attn_mechanism}")
-    # fmt:on
+					return self.splash_attention(
+						query_states=query_states,
+						key_states=key_states,
+						value_states=value_states,
+						query_sequence_length=query_sequence_length,
+						key_value_sequence_length=key_value_sequence_length,
+						attention_mask=attention_mask,
+					)
+				case  AttentionMechanisms.BLOCKWISE:
+					if segment_ids is not None:
+						warnings.warn("BlockWise Attention don't support `segment_ids` this argument will be ignored", UserWarning, stacklevel=1)
+					return self.blockwise_attention(
+						query_states=query_states,
+						key_states=key_states,
+						value_states=value_states,
+						bias=bias,
+						deterministic=deterministic,
+						dropout_rng=dropout_rng,
+						query_sequence_length=query_sequence_length,
+						key_value_sequence_length=key_value_sequence_length,
+					)
+				case AttentionMechanisms.CUDNN:
+					return self.cuddn_flash_attention(
+						query_states=query_states,
+						key_states=key_states,
+						value_states=value_states,
+						bias=bias,
+						causal=causal,
+						deterministic=deterministic,
+						query_sequence_length=query_sequence_length,
+						key_value_sequence_length=key_value_sequence_length,
+					)
+							
+		raise ValueError(f"Unknown Attention mechanism of {self.attn_mechanism}")
+		# fmt:on
 
-  def sdpa(
-    self,
-    *,
-    query_states: Array,
-    key_states: Array,
-    value_states: Array,
-    bias: Optional[Array] = None,
-    causal: bool = False,
-  ):
-    (
-      qps,
-      kps,
-      vps,
-      bps,
-      aps,
-      is_gen,
-    ) = self.get_bshd_partition_specs(query_states.shape[1])
-    with self.mesh:
-      attention_output = jax.nn.dot_product_attention(
-        query=with_sharding_constraint(query_states, qps).astype(self.dtype),
-        key=with_sharding_constraint(key_states, kps).astype(self.dtype),
-        value=with_sharding_constraint(value_states, vps).astype(self.dtype),
-        bias=with_sharding_constraint(bias, bps).astype(self.dtype),
-        implementation="cudnn" if jax.default_backend() == "gpu" else "xla",
-        scale=self.sm_scale,
-        is_causal=(causal if not is_gen else False)
-        if jax.default_backend() == "gpu"
-        else (causal if bias is None else False),
-      )
-      return AttentionOutput(
-        attention_weights=None,
-        attention_outputs=with_sharding_constraint(attention_output, aps),
-      )
+	def sdpa(
+		self,
+		*,
+		query_states: Array,
+		key_states: Array,
+		value_states: Array,
+		bias: Optional[Array] = None,
+		causal: bool = False,
+	):
+		(
+			query_partitionspec,
+			key_partitionspec,
+			value_partitionspec,
+			bias_partitionspec,
+			attention_partitionspec,
+			in_generating_process,
+		) = self.get_bshd_partition_specs(query_states.shape[1])
+		with self.mesh:
+			attention_output = shard_map(
+				functools.partial(
+					jax.nn.dot_product_attention,
+					implementation="cudnn" if jax.default_backend() == "gpu" else "xla",
+					scale=self.sm_scale,
+					is_causal=(causal if not in_generating_process else False)
+					if jax.default_backend() == "gpu"
+					else (causal if bias is None else False),
+				),
+				mesh=self.mesh,
+				in_specs=(
+					query_partitionspec,
+					key_partitionspec,
+					value_partitionspec,
+					bias_partitionspec,
+				),
+				out_specs=attention_partitionspec,
+				check_rep=False,
+			)(
+				query_states.astype(self.dtype),
+				key_states.astype(self.dtype),
+				value_states.astype(self.dtype),
+				bias.astype(self.dtype) if bias is not None else None,
+			)
+			return AttentionOutput(
+				attention_weights=None,
+				attention_outputs=with_sharding_constraint(
+					attention_output, attention_partitionspec
+				),
+			)
 
-  def flash_attn2(
-    self,
-    *,  # it's Kwarg Only
-    query_states: Array,
-    key_states: Array,
-    value_states: Array,
-    bias: Optional[Array] = None,
-  ):
-    # fmt:off
-    qps, kps, vps, bps, aps, is_gen = self.get_bshd_partition_specs(query_states.shape[1])
-    block_q = self.block_q
-    if is_gen:
-      block_q = int(os.environ.get("GENERATION_BLOCKSIZE_Q", "128" if self.backend == "tpu" else "16")) 
-    if bias is not None:
-      assert bias.ndim == 4 
-    with self.mesh: 
-      attention = get_cached_flash_attention(
-        backend=self.backend,
-        platform=self.platform,
-        blocksize_q=block_q,
-        blocksize_k=self.block_k,
-        softmax_scale=self.sm_scale,
-      ) 
-      attention_outputs = attention(
-          query=with_sharding_constraint(query_states, qps).astype(self.dtype),
-          key=with_sharding_constraint(key_states, kps).astype(self.dtype),
-          value=with_sharding_constraint(value_states, vps).astype(self.dtype),
-          bias=with_sharding_constraint(bias, bps).astype(self.dtype),
-      )
-      return AttentionOutput(
-        attention_weights=None,
-        attention_outputs=with_sharding_constraint(attention_outputs, aps),
-      )
+	def flash_attn2(
+		self,
+		*,  # it's Kwarg Only
+		query_states: Array,
+		key_states: Array,
+		value_states: Array,
+		bias: Optional[Array] = None,
+	):
+		(
+			query_partitionspec,
+			key_partitionspec,
+			value_partitionspec,
+			bias_partitionspec,
+			attention_partitionspec,
+			in_generating_process,
+		) = self.get_bshd_partition_specs(query_states.shape[1])
+		block_q = self.block_q
+		if in_generating_process:
+			block_q = int(
+				os.environ.get(
+					"GENERATION_BLOCKSIZE_Q", "128" if self.backend == "tpu" else "16"
+				)
+			)
+		if bias is not None:
+			assert bias.ndim == 4
+		with self.mesh:
+			attention = get_cached_flash_attention(
+				backend=self.backend,
+				platform=self.platform,
+				blocksize_q=block_q,
+				blocksize_k=self.block_k,
+				softmax_scale=self.sm_scale,
+			)
+			attention_outputs = shard_map(
+				attention,
+				mesh=self.mesh,
+				in_specs=(
+					query_partitionspec,
+					key_partitionspec,
+					value_partitionspec,
+					bias_partitionspec,
+				),
+				out_specs=attention_partitionspec,
+				check_rep=False,
+			)(
+				query_states.astype(self.dtype),
+				key_states.astype(self.dtype),
+				value_states.astype(self.dtype),
+				bias.astype(self.dtype) if bias is not None else None,
+			)
+			return AttentionOutput(
+				attention_weights=None,
+				attention_outputs=attention_outputs,
+			)
 
-    # fmt:on
+	def ring_attention(
+		self,
+		*,  # it's Kwarg Only
+		query_states: Array,
+		key_states: Array,
+		value_states: Array,
+		query_sequence_length: int,
+		key_value_sequence_length: int,
+		bias: Optional[Array] = None,
+		attention_mask: Optional[Array] = None,
+		deterministic: bool = False,
+		dropout_rng: Optional[random.PRNGKey] = None,
+		segment_ids: Optional[Array] = None,
+	):
+		key_states, value_states = self.repeat_kv_heads(
+			key_states,
+			value_states,
+			self.num_q_heads // self.num_kv_heads,
+		)
+		(
+			query_partitionspec,
+			key_partitionspec,
+			value_partitionspec,
+			bias_partitionspec,
+			attention_partitionspec,
+			_,
+		) = self.get_bshd_partition_specs(query_states.shape[1], True)
+		attn_output = shard_map(
+			partial(
+				ring_attention,
+				axis_name=self.axis_name,
+				float32_logits=False
+				if jax.extend.backend.get_backend().platform == "gpu"
+				else True,
+				platform=self.platform,
+				backend=self.backend,
+				autocheck=True,
+				blocksize_c=None,
+				blocksize_k=self.block_k,
+				blocksize_q=self.block_q,
+				dtype=self.dtype,
+				softmax_scale=self.sm_scale,
+				deterministic=deterministic,
+				dropout_rng=dropout_rng,
+			),
+			in_specs=(
+				query_partitionspec,
+				key_partitionspec,
+				value_partitionspec,
+				bias_partitionspec,
+			),
+			out_specs=attention_partitionspec,
+			mesh=self.mesh,
+			check_rep=False,
+		)(
+			query_states.astype(self.dtype),
+			key_states.astype(self.dtype),
+			value_states.astype(self.dtype),
+			bias.astype(self.dtype),
+		)
 
-  def ring_attention(
-    self,
-    *,  # it's Kwarg Only
-    query_states: Array,
-    key_states: Array,
-    value_states: Array,
-    query_sequence_length: int,
-    key_value_sequence_length: int,
-    bias: Optional[Array] = None,
-    attention_mask: Optional[Array] = None,
-    deterministic: bool = False,
-    dropout_rng: Optional[random.PRNGKey] = None,
-    segment_ids: Optional[Array] = None,
-  ):
-    key_states, value_states = self.repeat_kv_heads(
-      key_states,
-      value_states,
-      self.num_q_heads // self.num_kv_heads,
-    )
-    (
-      qps,
-      kps,
-      vps,
-      bps,
-      aps,
-      _,
-    ) = self.get_bshd_partition_specs(query_states.shape[1], True)
-    attn_output = shard_map(
-      partial(
-        ring_attention,
-        axis_name=self.axis_name,
-        float32_logits=False
-        if jax.extend.backend.get_backend().platform == "gpu"
-        else True,
-        platform=self.platform,
-        backend=self.backend,
-        autocheck=True,
-        blocksize_c=None,
-        blocksize_k=self.block_k,
-        blocksize_q=self.block_q,
-        dtype=self.dtype,
-        softmax_scale=self.sm_scale,
-        deterministic=deterministic,
-        dropout_rng=dropout_rng,
-      ),
-      in_specs=(qps, kps, vps, bps),
-      out_specs=aps,
-      mesh=self.mesh,
-      check_rep=False,
-    )(
-      query_states.astype(self.dtype),
-      key_states.astype(self.dtype),
-      value_states.astype(self.dtype),
-      bias.astype(self.dtype),
-    )
+		return AttentionOutput(attention_weights=None, attention_outputs=attn_output)
 
-    return AttentionOutput(attention_weights=None, attention_outputs=attn_output)
+	def vanilla_attention(
+		self,
+		*,  # it's Kwarg Only
+		query_states: Array,
+		key_states: Array,
+		value_states: Array,
+		bias: Optional[Array] = None,
+		deterministic: bool = False,
+		dropout_rng: Optional[random.PRNGKey] = None,
+		query_sequence_length: int,
+		key_value_sequence_length: int,
+	) -> AttentionOutput:
+		with self.mesh:
+			(
+				query_partitionspec,
+				key_partitionspec,
+				value_partitionspec,
+				bias_partitionspec,
+				attention_partitionspec,
+				_,
+			) = self.get_bshd_partition_specs(query_sequence_length)
+		b, qs, qh, d = query_states.shape
+		b, ks, kh, d = key_states.shape
+		with self.mesh:
+			query_states = fjformer.with_sharding_constraint(
+				query_states, query_partitionspec
+			)
+			key_states = fjformer.with_sharding_constraint(key_states, key_partitionspec)
+			value_states = fjformer.with_sharding_constraint(
+				value_states, value_partitionspec
+			)
+			query_states = jnp.reshape(
+				query_states,
+				(b, qs, self.num_kv_heads, qh // self.num_kv_heads, d),
+			)
+			query_states, key_states, value_states = promote_dtype(
+				query_states,
+				key_states,
+				value_states,
+				dtype=self.dtype,
+			)
 
-  def vanilla_attention(
-    self,
-    *,  # it's Kwarg Only
-    query_states: Array,
-    key_states: Array,
-    value_states: Array,
-    bias: Optional[Array] = None,
-    deterministic: bool = False,
-    dropout_rng: Optional[random.PRNGKey] = None,
-    query_sequence_length: int,
-    key_value_sequence_length: int,
-  ) -> AttentionOutput:
-    with self.mesh:
-      (
-        qps,
-        kps,
-        vps,
-        bps,
-        aps,
-        _,
-      ) = self.get_bshd_partition_specs(query_sequence_length)
-    b, qs, qh, d = query_states.shape
-    b, ks, kh, d = key_states.shape
-    with self.mesh:
-      query_states = fjformer.with_sharding_constraint(query_states, qps)
-      key_states = fjformer.with_sharding_constraint(key_states, kps)
-      value_states = fjformer.with_sharding_constraint(value_states, vps)
-      query_states = jnp.reshape(
-        query_states,
-        (b, qs, self.num_kv_heads, qh // self.num_kv_heads, d),
-      )
-      query_states, key_states, value_states = promote_dtype(
-        query_states,
-        key_states,
-        value_states,
-        dtype=self.dtype,
-      )
+			query_states = query_states * self.sm_scale
+			attention_weight = jnp.einsum(
+				"bskhd,bmkd->bkhsm",
+				query_states,
+				key_states,
+				precision=self.precision,
+			)
 
-      query_states = query_states * self.sm_scale
-      attention_weight = jnp.einsum(
-        "bskhd,bmkd->bkhsm",
-        query_states,
-        key_states,
-        precision=self.precision,
-      )
+		if bias is not None:
+			if bias.shape[1] == self.num_q_heads:
+				attention_weight = jnp.add(
+					attention_weight,
+					bias.reshape(
+						b, self.num_kv_heads, self.num_q_heads // self.num_kv_heads, qs, ks
+					),
+				)
+			elif bias.shape[1] == self.num_kv_heads:
+				attention_weight = jnp.add(
+					attention_weight,
+					bias.reshape(b, self.num_kv_heads, 1, qs, ks),
+				)
+			elif bias.shape[1] == 1:
+				attention_weight = jnp.add(
+					attention_weight,
+					bias.reshape(b, 1, 1, qs, ks),
+				)
+			else:
+				raise NotImplementedError("bias heads wont match!")
 
-    if bias is not None:
-      if bias.shape[1] == self.num_q_heads:
-        attention_weight = jnp.add(
-          attention_weight,
-          bias.reshape(
-            b, self.num_kv_heads, self.num_q_heads // self.num_kv_heads, qs, ks
-          ),
-        )
-      elif bias.shape[1] == self.num_kv_heads:
-        attention_weight = jnp.add(
-          attention_weight,
-          bias.reshape(b, self.num_kv_heads, 1, qs, ks),
-        )
-      elif bias.shape[1] == 1:
-        attention_weight = jnp.add(
-          attention_weight,
-          bias.reshape(b, 1, 1, qs, ks),
-        )
-      else:
-        raise NotImplementedError("bias heads wont match!")
+			attention_weight = jax.nn.softmax(attention_weight).astype(self.dtype)
 
-      attention_weight = jax.nn.softmax(attention_weight).astype(self.dtype)
+			if not deterministic and self.attention_dropout > 0.0:
+				keep_prob = 1.0 - self.attention_dropout
+				dropout_shape = tuple([1] * (key_states.ndim - 2)) + attention_weight.shape[-2:]
+				keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
 
-      if not deterministic and self.attention_dropout > 0.0:
-        keep_prob = 1.0 - self.attention_dropout
-        dropout_shape = tuple([1] * (key_states.ndim - 2)) + attention_weight.shape[-2:]
-        keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
+				multiplier = keep.astype(self.dtype) / jnp.asarray(keep_prob, dtype=self.dtype)
+				attention_weight = attention_weight * multiplier
 
-        multiplier = keep.astype(self.dtype) / jnp.asarray(keep_prob, dtype=self.dtype)
-        attention_weight = attention_weight * multiplier
+			attention = jnp.einsum(
+				"bkhsm,bmkd->bskhd",
+				attention_weight,
+				value_states,
+				precision=self.precision,
+			).reshape(b, qs, qh, d)
+			attention = fjformer.with_sharding_constraint(attention, attention_partitionspec)
+			return AttentionOutput(
+				attention_weights=attention_weight, attention_outputs=attention
+			)
 
-      attention = jnp.einsum(
-        "bkhsm,bmkd->bskhd",
-        attention_weight,
-        value_states,
-        precision=self.precision,
-      ).reshape(b, qs, qh, d)
-      attention = fjformer.with_sharding_constraint(attention, aps)
-      return AttentionOutput(
-        attention_weights=attention_weight, attention_outputs=attention
-      )
+	def blockwise_attention(
+		self,
+		*,  # it's Kwarg Only
+		query_states: Array,
+		key_states: Array,
+		value_states: Array,
+		bias: Optional[Array] = None,
+		deterministic: bool = False,
+		dropout_rng: Optional[random.PRNGKey] = None,
+		query_sequence_length: int,
+		key_value_sequence_length: int,
+	) -> AttentionOutput:
+		key_states, value_states = self.repeat_kv_heads(
+			key_states,
+			value_states,
+			self.num_q_heads // self.num_kv_heads,
+		)
+		(
+			query_partitionspec,
+			key_partitionspec,
+			value_partitionspec,
+			bias_partitionspec,
+			attention_partitionspec,
+			_,
+		) = self.get_bshd_partition_specs(query_sequence_length)
 
-  def blockwise_attention(
-    self,
-    *,  # it's Kwarg Only
-    query_states: Array,
-    key_states: Array,
-    value_states: Array,
-    bias: Optional[Array] = None,
-    deterministic: bool = False,
-    dropout_rng: Optional[random.PRNGKey] = None,
-    query_sequence_length: int,
-    key_value_sequence_length: int,
-  ) -> AttentionOutput:
-    key_states, value_states = self.repeat_kv_heads(
-      key_states,
-      value_states,
-      self.num_q_heads // self.num_kv_heads,
-    )
-    (
-      qps,
-      kps,
-      vps,
-      bps,
-      aps,
-      _,
-    ) = self.get_bshd_partition_specs(query_sequence_length)
+		with self.mesh:
+			query_states = with_sharding_constraint(query_states, query_partitionspec)
+			key_states = with_sharding_constraint(key_states, key_partitionspec)
+			value_states = with_sharding_constraint(value_states, value_partitionspec)
+			bias = with_sharding_constraint(bias, bias_partitionspec)
+			o = blockwise_attn(
+				query=query_states,
+				key=key_states,
+				value=value_states,
+				bias=bias,
+				deterministic=deterministic,
+				dtype=self.dtype,
+				dropout_rng=dropout_rng,
+				precision=self.precision,
+				attn_pdrop=self.attention_dropout,
+				key_chunk_size=min(self.block_k, key_value_sequence_length),
+				query_chunk_size=min(self.block_q, query_sequence_length),
+				prevent_cse=not self.scan_attention_layers,
+				causal=True,
+				float32_logits=True,
+			)
 
-    with self.mesh:
-      query_states = with_sharding_constraint(query_states, qps)
-      key_states = with_sharding_constraint(key_states, kps)
-      value_states = with_sharding_constraint(value_states, vps)
-      bias = with_sharding_constraint(bias, bps)
-      o = blockwise_attn(
-        query=query_states,
-        key=key_states,
-        value=value_states,
-        bias=bias,
-        deterministic=deterministic,
-        dtype=self.dtype,
-        dropout_rng=dropout_rng,
-        precision=self.precision,
-        attn_pdrop=self.attention_dropout,
-        key_chunk_size=min(self.block_k, key_value_sequence_length),
-        query_chunk_size=min(self.block_q, query_sequence_length),
-        prevent_cse=not self.scan_attention_layers,
-        causal=True,
-        float32_logits=True,
-      )
+			o = with_sharding_constraint(o, attention_partitionspec)
+			return AttentionOutput(attention_weights=None, attention_outputs=o)
 
-      o = with_sharding_constraint(o, aps)
-      return AttentionOutput(attention_weights=None, attention_outputs=o)
+	def splash_attention(
+		self,
+		query_states: Array,
+		key_states: Array,
+		value_states: Array,
+		query_sequence_length: int,
+		key_value_sequence_length: int,
+		attention_mask: Array,
+	) -> AttentionOutput:
+		key_states, value_states = self.repeat_kv_heads(
+			key_states,
+			value_states,
+			self.num_q_heads // self.num_kv_heads,
+		)
+		(
+			query_partitionspec,
+			key_partitionspec,
+			value_partitionspec,
+			_,
+			_,
+			_,
+		) = self.get_bhsd_partition_specs(query_sequence_length)
 
-  def splash_attention(
-    self,
-    query_states: Array,
-    key_states: Array,
-    value_states: Array,
-    query_sequence_length: int,
-    key_value_sequence_length: int,
-    attention_mask: Array,
-  ) -> AttentionOutput:
-    key_states, value_states = self.repeat_kv_heads(
-      key_states,
-      value_states,
-      self.num_q_heads // self.num_kv_heads,
-    )
-    (
-      qps,
-      kps,
-      vps,
-      _,
-      _,
-      _,
-    ) = self.get_bhsd_partition_specs(query_sequence_length)
+		query_states, key_states, value_states = map(
+			lambda s: s.astype(jnp.float32).transpose(0, 2, 1, 3),
+			(query_states, key_states, value_states),
+		)
+		if attention_mask is not None:
+			if attention_mask.ndim == 4:
+				attention_mask = attention_mask[:, 0, -1]
+			attention_mask = SegmentIds(attention_mask, attention_mask)
+		else:
+			warnings.warn(
+				"`attention_mask` is not passed to SplashAttention. (except miss computation problem)",
+				stacklevel=1,
+			)
 
-    query_states, key_states, value_states = map(
-      lambda s: s.astype(jnp.float32).transpose(0, 2, 1, 3),
-      (query_states, key_states, value_states),
-    )
-    if attention_mask is not None:
-      if attention_mask.ndim == 4:
-        attention_mask = attention_mask[:, 0, -1]
-      attention_mask = SegmentIds(attention_mask, attention_mask)
-    else:
-      warnings.warn(
-        "`attention_mask` is not passed to SplashAttention. (except miss computation problem)",
-        stacklevel=1,
-      )
+		@partial(
+			shard_map,
+			in_specs=(
+				query_partitionspec,
+				key_partitionspec,
+				value_partitionspec,
+				PartitionSpec(query_partitionspec[0], query_partitionspec[2]),
+			),
+			out_specs=query_partitionspec,
+			mesh=self.mesh,
+			check_rep=False,
+		)
+		def splash_attention_call(query, key, value, mask):
+			block_size = self.get_block_size_splash_attn(
+				query_sequence_length,
+				key_value_sequence_length,
+			)
+			masks = CausalMask(shape=(query.shape[2], query.shape[2]))
+			multi_head_mask = MultiHeadMask(masks=(masks,) * query.shape[1])
+			splash_kernel = make_splash_mha(
+				mask=multi_head_mask,
+				head_shards=1,
+				q_seq_shards=1,
+				block_sizes=block_size,
+			)
 
-    @partial(
-      shard_map,
-      in_specs=(
-        qps,
-        kps,
-        vps,
-        PartitionSpec(qps[0], qps[2]),
-      ),
-      out_specs=qps,
-      mesh=self.mesh,
-      check_rep=False,
-    )
-    def splash_attention_call(query, key, value, mask):
-      block_size = self.get_block_size_splash_attn(
-        query_sequence_length,
-        key_value_sequence_length,
-      )
-      masks = CausalMask(shape=(query.shape[2], query.shape[2]))
-      multi_head_mask = MultiHeadMask(masks=(masks,) * query.shape[1])
-      splash_kernel = make_splash_mha(
-        mask=multi_head_mask,
-        head_shards=1,
-        q_seq_shards=1,
-        block_sizes=block_size,
-      )
+			return jax.vmap(splash_kernel)(query, key, value, segment_ids=mask)
 
-      return jax.vmap(splash_kernel)(query, key, value, segment_ids=mask)
+		output = splash_attention_call(
+			query_states,
+			key_states,
+			value_states,
+			attention_mask,
+		).transpose(0, 2, 1, 3)
+		return AttentionOutput(attention_outputs=output, attention_weights=None)
 
-    output = splash_attention_call(
-      query_states,
-      key_states,
-      value_states,
-      attention_mask,
-    ).transpose(0, 2, 1, 3)
-    return AttentionOutput(attention_outputs=output, attention_weights=None)
+	def cuddn_flash_attention(
+		self,
+		*,  # it's Kwarg Only
+		query_states: Array,
+		key_states: Array,
+		value_states: Array,
+		bias: Optional[Array] = None,
+		causal: bool = False,
+		deterministic: bool = True,
+		query_sequence_length: int,
+		key_value_sequence_length: int,
+	) -> AttentionOutput:
+		"""CUDNN Flash Attention with Transformer Engine."""
+		key_states, value_states = self.repeat_kv_heads(
+			key_states,
+			value_states,
+			self.num_q_heads // self.num_kv_heads,
+		)
+		try:
+			import transformer_engine.jax.fused_attn as fused_attn  # noqa #type:ignore
+			from transformer_engine.jax.fused_attn import (  # noqa #type:ignore
+				AttnBiasType,
+				AttnMaskType,
+				QKVLayout,
+			)
+			from transformer_engine.jax.fused_attn import (  # noqa #type:ignore
+				is_fused_attn_kernel_available,
+			)
+		except (ModuleNotFoundError, ImportError) as err:
+			raise RuntimeError(
+				"Please install transformer_engine first. you can install that by running "
+				f"`pip install git+https://github.com/NVIDIA/TransformerEngine`"
+				f"\nhere's extra information on error\n{err}",
+			) from err
+		batch, query_sequence_length, num_attention_heads, head_dim = query_states.shape
 
-  def cuddn_flash_attention(
-    self,
-    *,  # it's Kwarg Only
-    query_states: Array,
-    key_states: Array,
-    value_states: Array,
-    bias: Optional[Array] = None,
-    causal: bool = False,
-    deterministic: bool = True,
-    query_sequence_length: int,
-    key_value_sequence_length: int,
-  ) -> AttentionOutput:
-    """CUDNN Flash Attention with Transformer Engine."""
-    key_states, value_states = self.repeat_kv_heads(
-      key_states,
-      value_states,
-      self.num_q_heads // self.num_kv_heads,
-    )
-    try:
-      import transformer_engine.jax.fused_attn as fused_attn  # noqa #type:ignore
-      from transformer_engine.jax.fused_attn import (  # noqa #type:ignore
-        AttnBiasType,
-        AttnMaskType,
-        QKVLayout,
-      )
-      from transformer_engine.jax.fused_attn import (  # noqa #type:ignore
-        is_fused_attn_kernel_available,
-      )
-    except (ModuleNotFoundError, ImportError) as err:
-      raise RuntimeError(
-        "Please install transformer_engine first. you can install that by running "
-        f"`pip install git+https://github.com/NVIDIA/TransformerEngine`"
-        f"\nhere's extra information on error\n{err}",
-      ) from err
-    batch, query_sequence_length, num_attention_heads, head_dim = query_states.shape
+		qkv_layout = QKVLayout.BS3HD
+		attn_mask_type = AttnMaskType.CAUSAL_MASK
+		attn_bias_type = AttnBiasType.NO_BIAS
 
-    qkv_layout = QKVLayout.BS3HD
-    attn_mask_type = AttnMaskType.CAUSAL_MASK
-    attn_bias_type = AttnBiasType.NO_BIAS
+		if self.sm_scale is None:
+			self.sm_scale = 1 / math.sqrt(head_dim)
+		has_fused_attn_kernel = is_fused_attn_kernel_available(
+			self.dtype,
+			self.dtype,
+			qkv_layout,
+			attn_bias_type,
+			attn_mask_type,
+			self.attention_dropout,
+			self.num_attention_heads,
+			key_states.shape[2],
+			query_sequence_length,
+			key_value_sequence_length,
+			head_dim,
+		)
 
-    if self.sm_scale is None:
-      self.sm_scale = 1 / math.sqrt(head_dim)
-    has_fused_attn_kernel = is_fused_attn_kernel_available(
-      self.dtype,
-      self.dtype,
-      qkv_layout,
-      attn_bias_type,
-      attn_mask_type,
-      self.attention_dropout,
-      self.num_attention_heads,
-      key_states.shape[2],
-      query_sequence_length,
-      key_value_sequence_length,
-      head_dim,
-    )
+		if not has_fused_attn_kernel:
+			raise ValueError(
+				"Flash attention kernel is not supported for current requested arrays"
+				" for details check this repo https://github.com/NVIDIA/TransformerEngine/"
+			)
 
-    if not has_fused_attn_kernel:
-      raise ValueError(
-        "Flash attention kernel is not supported for current requested arrays"
-        " for details check this repo https://github.com/NVIDIA/TransformerEngine/"
-      )
+		return AttentionOutput(
+			attention_weights=None,
+			attention_outputs=fused_attn.self_fused_attn(
+				qkv=jnp.concatenate(
+					(
+						jnp.reshape(
+							query_states,
+							(*query_states.shape[:2], 1, *query_states.shape[-2:]),
+						),
+						jnp.reshape(
+							key_states,
+							(*query_states.shape[:2], 1, *query_states.shape[-2:]),
+						),
+						jnp.reshape(
+							value_states,
+							(*query_states.shape[:2], 1, *query_states.shape[-2:]),
+						),
+					),
+					axis=2,
+				),
+				bias=bias,
+				mask=(
+					jnp.zeros((batch, 1, query_sequence_length, key_value_sequence_length))
+					if causal
+					else None
+				),
+				seed=None,
+				attn_bias_type=attn_bias_type,
+				attn_mask_type=attn_mask_type,
+				scaling_factor=self.sm_scale,
+				dropout_probability=self.attention_dropout,
+				is_training=deterministic,
+			),
+		)
 
-    return AttentionOutput(
-      attention_weights=None,
-      attention_outputs=fused_attn.self_fused_attn(
-        qkv=jnp.concatenate(
-          (
-            jnp.reshape(
-              query_states,
-              (*query_states.shape[:2], 1, *query_states.shape[-2:]),
-            ),
-            jnp.reshape(
-              key_states,
-              (*query_states.shape[:2], 1, *query_states.shape[-2:]),
-            ),
-            jnp.reshape(
-              value_states,
-              (*query_states.shape[:2], 1, *query_states.shape[-2:]),
-            ),
-          ),
-          axis=2,
-        ),
-        bias=bias,
-        mask=(
-          jnp.zeros((batch, 1, query_sequence_length, key_value_sequence_length))
-          if causal
-          else None
-        ),
-        seed=None,
-        attn_bias_type=attn_bias_type,
-        attn_mask_type=attn_mask_type,
-        scaling_factor=self.sm_scale,
-        dropout_probability=self.attention_dropout,
-        is_training=deterministic,
-      ),
-    )
+	@staticmethod
+	def repeat_kv_heads(key, value, num_reps: int):
+		return (
+			einops.repeat(key, "b s h d -> b s (h r) d", r=num_reps),
+			einops.repeat(value, "b s h d -> b s (h r) d", r=num_reps),
+		)
 
-  @staticmethod
-  def repeat_kv_heads(key, value, num_reps: int):
-    return (
-      einops.repeat(key, "b s h d -> b s (h r) d", r=num_reps),
-      einops.repeat(value, "b s h d -> b s (h r) d", r=num_reps),
-    )
+	@staticmethod
+	def run_attention_benchmarks(
+		batch_sizes=[1, 2, 4, 8],  # noqa
+		sequence_lengths=[512, 1024, 2048],  # noqa
+		attention_types=None,
+	) -> Dict[str, Union[Dict, "pd.DataFrame"]]:  # noqa #type:ignore
+		"""Run comprehensive benchmarks across different configurations."""
+		results = {}
 
-  @staticmethod
-  def run_attention_benchmarks(
-    batch_sizes=[1, 2, 4, 8],  # noqa
-    sequence_lengths=[512, 1024, 2048],  # noqa
-    attention_types=None,
-  ) -> Dict[str, Union[Dict, "pd.DataFrame"]]:  # noqa #type:ignore
-    """Run comprehensive benchmarks across different configurations."""
-    results = {}
+		for batch_size in batch_sizes:
+			for seq_len in sequence_lengths:
+				config = BenchmarkConfig(
+					batch_size=batch_size,
+					sequence_length=seq_len,
+					num_warmup_runs=2,
+					num_benchmark_runs=5,
+				)
 
-    for batch_size in batch_sizes:
-      for seq_len in sequence_lengths:
-        config = BenchmarkConfig(
-          batch_size=batch_size,
-          sequence_length=seq_len,
-          num_warmup_runs=2,
-          num_benchmark_runs=5,
-        )
+				benchmarker = AttentionBenchmarker(
+					config=config,
+					run_attention_benchmarks=attention_types,
+					calculate_gradients=True,
+				)
 
-        benchmarker = AttentionBenchmarker(
-          config=config,
-          run_attention_benchmarks=attention_types,
-          calculate_gradients=True,
-        )
+				results[f"b{batch_size}_s{seq_len}"] = benchmarker.run_benchmarks()
 
-        results[f"b{batch_size}_s{seq_len}"] = benchmarker.run_benchmarks()
+		return results
 
-    return results
+	def __repr__(self):
+		string = f"{self.__class__.__name__}(\n"
+		for k, v in self.__dict__.items():
+			if not k.startswith("_"):
+				try:
+					repr_src = f"  {k} : " + v.__str__().replace("\n", "\n  ") + "\n"
+					string += (
+						repr_src
+						if len(repr_src) < 500
+						else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
+					)
+				except TypeError:
+					pass
+		return string + ")"
 
-  def __repr__(self):
-    string = f"{self.__class__.__name__}(\n"
-    for k, v in self.__dict__.items():
-      if not k.startswith("_"):
-        try:
-          repr_src = f"  {k} : " + v.__str__().replace("\n", "\n  ") + "\n"
-          string += (
-            repr_src
-            if len(repr_src) < 500
-            else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
-          )
-        except TypeError:
-          pass
-    return string + ")"
-
-  def __str__(self):
-    return self.__repr__()
+	def __str__(self):
+		return self.__repr__()
 
 
 class BenchmarkMetrics(str, Enum):
-  LATENCY = "latency"
-  THROUGHPUT = "throughput"
-  MEMORY = "memory"
-  ACCURACY = "accuracy"
-  GRADIENT_DIFF = "gradient_diff"
+	LATENCY = "latency"
+	THROUGHPUT = "throughput"
+	MEMORY = "memory"
+	ACCURACY = "accuracy"
+	GRADIENT_DIFF = "gradient_diff"
 
 
 @dataclass
 class BenchmarkConfig:
-  batch_size: int = 8
-  sequence_length: int = 128 * 8
-  num_attention_heads: int = 32
-  num_key_value_heads: int = 32
-  blocksize_q: int = 64
-  blocksize_k: int = 64
-  axis_dims: Tuple[int, int, int, int] = (1, -1, 1, 1)
-  head_dim: int = 128
-  dtype: jnp.dtype = jnp.float16
-  num_warmup_runs: int = 3
-  num_benchmark_runs: int = 10
-  metrics: List[BenchmarkMetrics] = None
+	batch_size: int = 8
+	sequence_length: int = 128 * 8
+	num_attention_heads: int = 32
+	num_key_value_heads: int = 32
+	blocksize_q: int = 64
+	blocksize_k: int = 64
+	axis_dims: Tuple[int, int, int, int] = (1, -1, 1, 1)
+	head_dim: int = 128
+	dtype: jnp.dtype = jnp.float16
+	num_warmup_runs: int = 3
+	num_benchmark_runs: int = 10
+	metrics: List[BenchmarkMetrics] = None
 
 
 class AttentionBenchmarker:
-  _printed_errors = set()
+	_printed_errors = set()
 
-  def __init__(
-    self,
-    config: BenchmarkConfig,
-    run_attention_benchmarks: List[str] = None,
-    calculate_gradients: bool = True,
-  ):
-    from fjformer import GenerateRNG
+	def __init__(
+		self,
+		config: BenchmarkConfig,
+		run_attention_benchmarks: List[str] = None,
+		calculate_gradients: bool = True,
+	):
+		from fjformer import GenerateRNG
 
-    from easydel import MistralConfig
+		from easydel import MistralConfig
 
-    self.config = config
-    self.run_attention_benchmarks = (
-      run_attention_benchmarks or _AVAILABLE_ATTENTION_MECHANISMS
-    )
-    self.calculate_gradients = calculate_gradients
-    self.rng = GenerateRNG()
+		self.config = config
+		self.run_attention_benchmarks = (
+			run_attention_benchmarks or _AVAILABLE_ATTENTION_MECHANISMS
+		)
+		self.calculate_gradients = calculate_gradients
+		self.rng = GenerateRNG()
 
-    try:
-      import pandas as pd
+		try:
+			import pandas as pd
 
-      self.pd = pd
-    except (ModuleNotFoundError, ImportError):
-      warnings.warn(
-        "Couldn't import pandas. Results will be returned as dict.", stacklevel=1
-      )
-      self.pd = None
+			self.pd = pd
+		except (ModuleNotFoundError, ImportError):
+			warnings.warn(
+				"Couldn't import pandas. Results will be returned as dict.", stacklevel=1
+			)
+			self.pd = None
 
-    self.model_config = MistralConfig(
-      axis_dims=config.axis_dims,
-      block_q=config.blocksize_q,
-      block_k=config.blocksize_k,
-      attn_dtype=config.dtype,
-    )
+		self.model_config = MistralConfig(
+			axis_dims=config.axis_dims,
+			block_q=config.blocksize_q,
+			block_k=config.blocksize_k,
+			attn_dtype=config.dtype,
+		)
 
-  def _create_attention_inputs(self):
-    """Create random inputs for attention testing."""
-    query = jax.nn.initializers.normal(2.0)(
-      self.rng.rng,
-      (
-        self.config.batch_size,
-        self.config.sequence_length,
-        self.config.num_attention_heads,
-        self.config.head_dim,
-      ),
-      dtype=self.config.dtype,
-    )
-    key = jax.nn.initializers.normal(2.0)(
-      self.rng.rng,
-      (
-        self.config.batch_size,
-        self.config.sequence_length,
-        self.config.num_key_value_heads,
-        self.config.head_dim,
-      ),
-      dtype=self.config.dtype,
-    )
-    value = jax.nn.initializers.normal(2.0)(
-      self.rng.rng,
-      (
-        self.config.batch_size,
-        self.config.sequence_length,
-        self.config.num_key_value_heads,
-        self.config.head_dim,
-      ),
-      dtype=self.config.dtype,
-    )
+	def _create_attention_inputs(self):
+		"""Create random inputs for attention testing."""
+		query = jax.nn.initializers.normal(2.0)(
+			self.rng.rng,
+			(
+				self.config.batch_size,
+				self.config.sequence_length,
+				self.config.num_attention_heads,
+				self.config.head_dim,
+			),
+			dtype=self.config.dtype,
+		)
+		key = jax.nn.initializers.normal(2.0)(
+			self.rng.rng,
+			(
+				self.config.batch_size,
+				self.config.sequence_length,
+				self.config.num_key_value_heads,
+				self.config.head_dim,
+			),
+			dtype=self.config.dtype,
+		)
+		value = jax.nn.initializers.normal(2.0)(
+			self.rng.rng,
+			(
+				self.config.batch_size,
+				self.config.sequence_length,
+				self.config.num_key_value_heads,
+				self.config.head_dim,
+			),
+			dtype=self.config.dtype,
+		)
 
-    # Create attention masks
-    causal_mask = flax.linen.attention.make_causal_mask(
-      jnp.ones((self.config.batch_size, self.config.sequence_length))
-    )
-    attention_mask = jnp.ones((self.config.batch_size, self.config.sequence_length))
-    attention_mask = attention_mask.at[:, self.config.sequence_length // 2 :].set(0)
+		# Create attention masks
+		causal_mask = flax.linen.attention.make_causal_mask(
+			jnp.ones((self.config.batch_size, self.config.sequence_length))
+		)
+		attention_mask = jnp.ones((self.config.batch_size, self.config.sequence_length))
+		attention_mask = attention_mask.at[:, self.config.sequence_length // 2 :].set(0)
 
-    bias = jnp.where(
-      flax.linen.attention.combine_masks(
-        jnp.expand_dims(jnp.expand_dims(attention_mask, 1), 1),
-        causal_mask,
-      ),
-      0,
-      jnp.finfo(query.dtype).min,
-    )
+		bias = jnp.where(
+			flax.linen.attention.combine_masks(
+				jnp.expand_dims(jnp.expand_dims(attention_mask, 1), 1),
+				causal_mask,
+			),
+			0,
+			jnp.finfo(query.dtype).min,
+		)
 
-    return query, key, value, bias, attention_mask
+		return query, key, value, bias, attention_mask
 
-  def _measure_memory_usage(self, fn, *args, **kwargs):
-    """Measure peak memory usage of a function."""
-    try:
-      import psutil
+	def _measure_memory_usage(self, fn, *args, **kwargs):
+		"""Measure peak memory usage of a function."""
+		try:
+			import psutil
 
-      process = psutil.Process()
-      memory_before = process.memory_info().rss
-      result = fn(*args, **kwargs)
-      memory_after = process.memory_info().rss
-      return result, memory_after - memory_before
-    except ImportError:
-      warnings.warn(
-        "psutil not available. Memory usage won't be measured.", stacklevel=1
-      )
-      return fn(*args, **kwargs), None
+			process = psutil.Process()
+			memory_before = process.memory_info().rss
+			result = fn(*args, **kwargs)
+			memory_after = process.memory_info().rss
+			return result, memory_after - memory_before
+		except ImportError:
+			warnings.warn(
+				"psutil not available. Memory usage won't be measured.", stacklevel=1
+			)
+			return fn(*args, **kwargs), None
 
-  def _create_attention_fn(self, attention_type: str):
-    """Create attention function based on type."""
-    if attention_type == "dot_product":
-      return lambda q, k, v, b, _: flax.linen.dot_product_attention(q, k, v, b)
+	def _create_attention_fn(self, attention_type: str):
+		"""Create attention function based on type."""
+		if attention_type == "dot_product":
+			return lambda q, k, v, b, _: flax.linen.dot_product_attention(q, k, v, b)
 
-    return lambda q, k, v, b, mask: FlexibleAttentionModule(
-      attn_mechanism=attention_type,
-      axis_name="sp",
-      dtype=self.config.dtype,
-      mesh=self.model_config.mesh,
-      head_dims=q.shape[-1],
-      sm_scale=q.shape[-1] ** -0.5,
-      num_q_heads=q.shape[-2],
-      num_kv_heads=q.shape[-2],
-      block_q=self.config.blocksize_q,
-      block_k=self.config.blocksize_k,
-      base_config=self.model_config,
-    )(
-      query_states=q,
-      key_states=k,
-      value_states=v,
-      bias=b,
-      attention_mask=mask,
-    ).attention_outputs
+		return lambda q, k, v, b, mask: FlexibleAttentionModule(
+			attn_mechanism=attention_type,
+			axis_name="sp",
+			dtype=self.config.dtype,
+			mesh=self.model_config.mesh,
+			head_dims=q.shape[-1],
+			sm_scale=q.shape[-1] ** -0.5,
+			num_q_heads=q.shape[-2],
+			num_kv_heads=q.shape[-2],
+			block_q=self.config.blocksize_q,
+			block_k=self.config.blocksize_k,
+			base_config=self.model_config,
+		)(
+			query_states=q,
+			key_states=k,
+			value_states=v,
+			bias=b,
+			attention_mask=mask,
+		).attention_outputs
 
-  def _value_and_grad_wrapper(self, fn):
-    """Wrapper to compute both value and gradient."""
+	def _value_and_grad_wrapper(self, fn):
+		"""Wrapper to compute both value and gradient."""
 
-    def inner(*args, **kwargs):
-      return jnp.sum(fn(*args, **kwargs))
+		def inner(*args, **kwargs):
+			return jnp.sum(fn(*args, **kwargs))
 
-    return jax.value_and_grad(inner) if self.calculate_gradients else inner
+		return jax.value_and_grad(inner) if self.calculate_gradients else inner
 
-  def _compute_diff(self, t1, t2):
-    """Compute maximum absolute difference between tensors."""
-    return jnp.max(jnp.abs(t1 - t2))
+	def _compute_diff(self, t1, t2):
+		"""Compute maximum absolute difference between tensors."""
+		return jnp.max(jnp.abs(t1 - t2))
 
-  def _benchmark_single_attention(self, attention_fn, inputs):
-    """Benchmark a single attention mechanism with gradient computation."""
-    query, key, value, bias, attention_mask = inputs
-    metrics = {}
+	def _benchmark_single_attention(self, attention_fn, inputs):
+		"""Benchmark a single attention mechanism with gradient computation."""
+		query, key, value, bias, attention_mask = inputs
+		metrics = {}
 
-    # Wrap function to compute gradients
-    wrapped_fn = self._value_and_grad_wrapper(attention_fn)
+		# Wrap function to compute gradients
+		wrapped_fn = self._value_and_grad_wrapper(attention_fn)
 
-    # Warmup runs
-    for _ in range(self.config.num_warmup_runs):
-      if self.calculate_gradients:
-        _, _ = wrapped_fn(query, key, value, bias, attention_mask)
-      else:
-        _ = wrapped_fn(query, key, value, bias, attention_mask)
+		# Warmup runs
+		for _ in range(self.config.num_warmup_runs):
+			if self.calculate_gradients:
+				_, _ = wrapped_fn(query, key, value, bias, attention_mask)
+			else:
+				_ = wrapped_fn(query, key, value, bias, attention_mask)
 
-    # Benchmark runs
-    latencies = []
-    throughputs = []
-    memory_usage = []
-    outputs = []
-    gradients = []
+		# Benchmark runs
+		latencies = []
+		throughputs = []
+		memory_usage = []
+		outputs = []
+		gradients = []
 
-    for _ in range(self.config.num_benchmark_runs):
-      start_time = time.perf_counter()
-      if self.calculate_gradients:
-        (result, grad), mem = self._measure_memory_usage(
-          wrapped_fn, query, key, value, bias, attention_mask
-        )
-        gradients.append(grad)
-      else:
-        result, mem = self._measure_memory_usage(
-          wrapped_fn, query, key, value, bias, attention_mask
-        )
+		for _ in range(self.config.num_benchmark_runs):
+			start_time = time.perf_counter()
+			if self.calculate_gradients:
+				(result, grad), mem = self._measure_memory_usage(
+					wrapped_fn, query, key, value, bias, attention_mask
+				)
+				gradients.append(grad)
+			else:
+				result, mem = self._measure_memory_usage(
+					wrapped_fn, query, key, value, bias, attention_mask
+				)
 
-      end_time = time.perf_counter()
+			end_time = time.perf_counter()
 
-      outputs.append(result)
-      latency = end_time - start_time
-      throughput = (self.config.batch_size * self.config.sequence_length) / latency
+			outputs.append(result)
+			latency = end_time - start_time
+			throughput = (self.config.batch_size * self.config.sequence_length) / latency
 
-      latencies.append(latency)
-      throughputs.append(throughput)
-      if mem is not None:
-        memory_usage.append(mem)
+			latencies.append(latency)
+			throughputs.append(throughput)
+			if mem is not None:
+				memory_usage.append(mem)
 
-    metrics.update(
-      {
-        "mean_latency": jnp.mean(jnp.array(latencies)),
-        "std_latency": jnp.std(jnp.array(latencies)),
-        "mean_throughput": jnp.mean(jnp.array(throughputs)),
-        "peak_memory": max(memory_usage) if memory_usage else None,
-      }
-    )
+		metrics.update(
+			{
+				"mean_latency": jnp.mean(jnp.array(latencies)),
+				"std_latency": jnp.std(jnp.array(latencies)),
+				"mean_throughput": jnp.mean(jnp.array(throughputs)),
+				"peak_memory": max(memory_usage) if memory_usage else None,
+			}
+		)
 
-    # Average results across runs
-    avg_output = jnp.mean(jnp.stack(outputs), axis=0)
-    if self.calculate_gradients:
-      avg_gradient = jax.tree_util.tree_map(
-        lambda *x: jnp.mean(jnp.stack(x), axis=0), *gradients
-      )
-      return metrics, (avg_output, avg_gradient)
+		# Average results across runs
+		avg_output = jnp.mean(jnp.stack(outputs), axis=0)
+		if self.calculate_gradients:
+			avg_gradient = jax.tree_util.tree_map(
+				lambda *x: jnp.mean(jnp.stack(x), axis=0), *gradients
+			)
+			return metrics, (avg_output, avg_gradient)
 
-    return metrics, avg_output
+		return metrics, avg_output
 
-  def run_benchmarks(self) -> Union[Dict, "pd.DataFrame"]:
-    """Run benchmarks with gradient comparison."""
-    inputs = self._create_attention_inputs()
+	def run_benchmarks(self) -> Union[Dict, "pd.DataFrame"]:
+		"""Run benchmarks with gradient comparison."""
+		inputs = self._create_attention_inputs()
 
-    # Get baseline results
-    baseline_fn = self._create_attention_fn("dot_product")
-    baseline_metrics, baseline_results = self._benchmark_single_attention(
-      baseline_fn, inputs
-    )
-    if self.calculate_gradients:
-      baseline_output, baseline_grads = baseline_results
-    else:
-      baseline_output = baseline_results
+		# Get baseline results
+		baseline_fn = self._create_attention_fn("dot_product")
+		baseline_metrics, baseline_results = self._benchmark_single_attention(
+			baseline_fn, inputs
+		)
+		if self.calculate_gradients:
+			baseline_output, baseline_grads = baseline_results
+		else:
+			baseline_output = baseline_results
 
-    results = {}
-    for attn_name in self.run_attention_benchmarks:
-      try:
-        attention_fn = self._create_attention_fn(attn_name)
-        metrics, attn_results = self._benchmark_single_attention(attention_fn, inputs)
+		results = {}
+		for attn_name in self.run_attention_benchmarks:
+			try:
+				attention_fn = self._create_attention_fn(attn_name)
+				metrics, attn_results = self._benchmark_single_attention(attention_fn, inputs)
 
-        if self.calculate_gradients:
-          output, grads = attn_results
-          # Compare gradients
-          grad_diffs = jax.tree_util.tree_map(self._compute_diff, baseline_grads, grads)
-          grad_diff_sum = sum(
-            jnp.sum(diff) for diff in jax.tree_util.tree_leaves(grad_diffs)
-          )
+				if self.calculate_gradients:
+					output, grads = attn_results
+					# Compare gradients
+					grad_diffs = jax.tree_util.tree_map(self._compute_diff, baseline_grads, grads)
+					grad_diff_sum = sum(
+						jnp.sum(diff) for diff in jax.tree_util.tree_leaves(grad_diffs)
+					)
 
-          metrics.update(
-            {
-              "grad_diff_sum": float(grad_diff_sum),
-              "grad_check_passed": float(grad_diff_sum) < 1.0,
-            }
-          )
-        else:
-          output = attn_results
+					metrics.update(
+						{
+							"grad_diff_sum": float(grad_diff_sum),
+							"grad_check_passed": float(grad_diff_sum) < 1.0,
+						}
+					)
+				else:
+					output = attn_results
 
-        # Compare outputs
-        output_diff = self._compute_diff(baseline_output, output)
+				# Compare outputs
+				output_diff = self._compute_diff(baseline_output, output)
 
-        results[attn_name] = {
-          **metrics,
-          "output_diff": float(output_diff),
-          "output_check_passed": jnp.allclose(
-            baseline_output,
-            output,
-            atol=0.045,
-            rtol=0,
-          ),
-        }
+				results[attn_name] = {
+					**metrics,
+					"output_diff": float(output_diff),
+					"output_check_passed": jnp.allclose(
+						baseline_output,
+						output,
+						atol=0.045,
+						rtol=0,
+					),
+				}
 
-      except Exception as e:
-        error_key = f"{attn_name}:{str(e)}"
-        if error_key not in self._printed_errors:
-          print(f"Benchmark failed for {attn_name}: {str(e)}")
-          self._printed_errors.add(error_key)
+			except Exception as e:
+				error_key = f"{attn_name}:{str(e)}"
+				if error_key not in self._printed_errors:
+					print(f"Benchmark failed for {attn_name}: {str(e)}")
+					self._printed_errors.add(error_key)
 
-        results[attn_name] = {"error": str(e), "status": "failed"}
+				results[attn_name] = {"error": str(e), "status": "failed"}
 
-    if self.pd is not None:
-      df = self.pd.DataFrame.from_dict(results, orient="index")
-      # Reorder columns for better readability
-      cols = (["status", "error"] if "status" in df.columns else []) + [
-        "mean_latency",
-        "std_latency",
-        "mean_throughput",
-        "peak_memory",
-        "output_diff",
-        "output_check_passed",
-      ]
-      if self.calculate_gradients:
-        cols.extend(["grad_diff_sum", "grad_check_passed"])
+		if self.pd is not None:
+			df = self.pd.DataFrame.from_dict(results, orient="index")
+			# Reorder columns for better readability
+			cols = (["status", "error"] if "status" in df.columns else []) + [
+				"mean_latency",
+				"std_latency",
+				"mean_throughput",
+				"peak_memory",
+				"output_diff",
+				"output_check_passed",
+			]
+			if self.calculate_gradients:
+				cols.extend(["grad_diff_sum", "grad_check_passed"])
 
-      return df[cols]
+			return df[cols]
 
-    return results
+		return results
 
 
 if __name__ == "__main__":
-  import pandas as pd
+	import pandas as pd
 
-  FlexibleAttentionModule.run_attention_benchmarks(batch_sizes=[1])["b1_s2048"].to_csv(
-    "res.csv"
-  )
+	FlexibleAttentionModule.run_attention_benchmarks(batch_sizes=[1])["b1_s2048"].to_csv(
+		"res.csv"
+	)
