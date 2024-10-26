@@ -39,7 +39,7 @@ class SMPMemoryMonitor:
 		self.history = []
 		self._monitor_thread = None
 
-	def analyze_device(self, device_stats: Dict) -> Dict:
+	def analyze_device(self, device_stats: Dict, dev) -> Dict:
 		"""
 		Analyze memory stats for a single device.
 		"""
@@ -49,7 +49,7 @@ class SMPMemoryMonitor:
 
 		analysis = {
 			"timestamp": datetime.now(),
-			"device_id": str(jax.devices()[0]),
+			"device_id": str(dev),
 			"memory_used_gb": round(current_usage / 1e9, 2),
 			"memory_limit_gb": round(bytes_limit / 1e9, 2),
 			"utilization_pct": round((current_usage / bytes_limit) * 100, 2),
@@ -91,7 +91,7 @@ class SMPMemoryMonitor:
 		for device in jax.devices():
 			try:
 				stats = device.memory_stats()
-				analysis = self.analyze_device(stats)
+				analysis = self.analyze_device(stats, device)
 				self.history.append(analysis)
 				results.append(analysis)
 
