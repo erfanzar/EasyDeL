@@ -22,7 +22,7 @@ PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
 async def main():
 	sharding_axis_dims = (1, 1, 1, -1)
-	max_length = 4096
+	max_length = 8192
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
 	dtype = jnp.float16
 	partition_axis = ed.PartitionAxis()
@@ -39,7 +39,7 @@ async def main():
 			mask_max_position_embeddings=max_length,
 			block_q=64,
 			block_k=128,
-			attn_mechanism=ed.AttentionMechanisms.VANILLA,
+			attn_mechanism=ed.AttentionMechanisms.SDPA,
 			quantize_kv_cache=True,
 		),
 		quantization_method="8bit",
@@ -70,7 +70,6 @@ async def main():
 
 	await inference.async_precompile(1)
 	print(inference.inference_name)
-	start_http_server(7681)
 	await ed.vInferenceApiServer({inference.inference_name: inference}).async_fire()
 
 
