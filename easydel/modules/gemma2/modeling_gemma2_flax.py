@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -322,7 +321,6 @@ class FlaxGemma2Attention(FlaxAttentionModule):
 				query_states,
 				attention_mask,
 			)
-
 
 		if bool((self.layer_idx % 2) == 0):
 			sliding_window_mask = jnp.tril(
@@ -1059,6 +1057,14 @@ class FlaxGemma2ForCausalLMModule(nn.Module):
 		)
 
 		hidden_states = outputs[0]
+		hidden_states = with_sharding_constraint(
+			hidden_states,
+			PartitionSpec(
+				self.config.partition_axis.batch_axis,
+				self.config.partition_axis.sequence_axis,
+				None,
+			),
+		)
 		if self.config.tie_word_embeddings:
 			shared_kernel = self.model.variables["params"]["embed_tokens"][
 				"embedding"
@@ -1074,7 +1080,7 @@ class FlaxGemma2ForCausalLMModule(nn.Module):
 			lm_logits = lm_logits / self.config.final_logit_softcapping
 			lm_logits = jax.nn.tanh(lm_logits)
 			lm_logits = lm_logits * self.config.final_logit_softcapping
-		
+
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
 
