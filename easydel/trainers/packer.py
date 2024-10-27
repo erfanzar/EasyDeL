@@ -1,4 +1,13 @@
-def pack_sequences(dataset, max_length=512, pad_token_id=0, reset_position_ids=True):
+import datasets
+
+
+def pack_sequences(
+	dataset: datasets.Dataset,
+	max_length=512,
+	pad_token_id=0,
+	reset_position_ids=True,
+	num_proc=None,
+):
 	"""
 	Pack sequences together with their attention masks and position IDs
 
@@ -127,6 +136,7 @@ def pack_sequences(dataset, max_length=512, pad_token_id=0, reset_position_ids=T
 		batched=True,
 		remove_columns=dataset.column_names,
 		desc="Packing sequences",
+		num_proc=num_proc,
 	)
 
 	return packed_dataset

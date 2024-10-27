@@ -26,6 +26,7 @@ from easydel.trainers.odds_ratio_preference_optimization_trainer import (
 	ORPOTrainer,
 	ORPOTrainerOutput,
 )
+from easydel.trainers.packer import pack_sequences
 from easydel.trainers.sequence_classification_trainer import (
 	SequenceClassificationTrainer,
 	SequenceClassificationTrainerOutput,
@@ -47,7 +48,6 @@ from easydel.trainers.vision_causal_language_model_trainer import (
 	VisionCausalLanguageModelTrainer,
 	VisionCausalLMTrainerOutput,
 )
-from easydel.trainers.packer import SequencePacker
 
 __all__ = [
 	"BaseTrainer",
@@ -71,5 +71,5 @@ __all__ = [
 	"instructions_formatting_function",
 	"VisionCausalLanguageModelTrainer",
 	"VisionCausalLMTrainerOutput",
-	"SequencePacker",
+	"pack_sequences",
 ]
