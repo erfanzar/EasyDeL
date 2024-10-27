@@ -1155,6 +1155,7 @@ class StepMetrics:
 		flops_per_device,
 		batch_size,
 		seq_length,
+		learning_rate,
 		mode: Optional[Literal["eval", "train"]] = None,
 		**extras,
 	) -> Dict[str, float]:
@@ -1168,7 +1169,7 @@ class StepMetrics:
 
 		basic_metrics = {
 			"loss": loss.tolist(),
-			"learning_rate": self.arguments.learning_rate,
+			"learning_rate": learning_rate,
 			"step": current_step,
 			"step_time": step_time,
 			"perplexity": jnp.exp(loss).tolist(),

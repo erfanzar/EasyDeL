@@ -34,7 +34,7 @@ def main():
 		gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
 		max_position_embeddings=sequence_length,
 		attn_dtype=jnp.float16,
-		attn_mechanism=ed.AttentionMechanisms.SDPA,
+		attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		block_k=512,
 		block_q=512,
 		hardware_abstraction=False,
@@ -46,7 +46,7 @@ def main():
 
 	model = ed.FlaxMistralForCausalLM(config=config, _do_init=True)
 	params = model.shard_params(model.params)
-	
+
 	prompter = create_prompt_creator(tokenizer)
 	dtype = jnp.float32
 	trainer = ed.SFTTrainer(
@@ -54,6 +54,8 @@ def main():
 			model_name="SFTTrainer_TEST",
 			num_train_epochs=3,
 			total_batch_size=2,
+			optimizer=ed.EasyDeLOptimizers.ADAMW,
+			scheduler=ed.EasyDeLSchedulers.COSINE,
 			gradient_accumulation_steps=2,
 			use_wandb=False,
 			do_train=True,
