@@ -47,6 +47,7 @@ from easydel.trainers.vision_causal_language_model_trainer import (
 	VisionCausalLanguageModelTrainer,
 	VisionCausalLMTrainerOutput,
 )
+from easydel.trainers.packer import SequencePacker
 
 __all__ = [
 	"BaseTrainer",
@@ -70,4 +71,5 @@ __all__ = [
 	"instructions_formatting_function",
 	"VisionCausalLanguageModelTrainer",
 	"VisionCausalLMTrainerOutput",
+	"SequencePacker",
 ]

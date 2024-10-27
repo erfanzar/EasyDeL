@@ -70,9 +70,9 @@ from easydel.modules.arctic import (
 	FlaxArcticModule,
 )
 from easydel.modules.attention_module import (
+	AttentionBenchmarker,
 	AttentionMechanisms,
 	FlexibleAttentionModule,
-	AttentionBenchmarker,
 )
 from easydel.modules.auto_models import (
 	AutoEasyDeLConfig,
@@ -345,6 +345,7 @@ from easydel.trainers import (
 	ORPOTrainerOutput,
 	SequenceClassificationTrainer,
 	SequenceClassificationTrainerOutput,
+	SequencePacker,
 	SFTTrainer,
 	TrainingArguments,
 	VisionCausalLanguageModelTrainer,
