@@ -345,7 +345,6 @@ from easydel.trainers import (
 	ORPOTrainerOutput,
 	SequenceClassificationTrainer,
 	SequenceClassificationTrainerOutput,
-	SequencePacker,
 	SFTTrainer,
 	TrainingArguments,
 	VisionCausalLanguageModelTrainer,
@@ -354,6 +353,7 @@ from easydel.trainers import (
 	create_constant_length_dataset,
 	get_formatting_func_from_dataset,
 	instructions_formatting_function,
+	pack_sequences,
 )
 from easydel.transform import (
 	easystate_to_huggingface_model,
