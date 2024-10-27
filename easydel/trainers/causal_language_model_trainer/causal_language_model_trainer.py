@@ -709,7 +709,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
 			self.sharded_state = sharded_state
 			return sharded_state, shard_fns, gather_fns
 
-	def _run_training_loop( 
+	def _run_training_loop(
 		self,
 		sharded_state: EasyDeLState,
 		metrics_tracker: MetricsTracker,
@@ -814,6 +814,9 @@ class CausalLanguageModelTrainer(BaseTrainer):
 					loss=loss,
 					metrics=metrics,
 					current_step=current_step,
+					learning_rate=self.scheduler(current_step)
+					if self.scheduler is not None
+					else self.arguments.learning_rate,
 					epoch=epoch,
 					flops_per_device=getattr(self, "_flops_per_device", 0),
 					batch_size=self.arguments.total_batch_size,
@@ -869,6 +872,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
 					loss=loss,
 					metrics=metrics,
 					current_step=current_step,
+					learning_rate=0.000,
 					epoch=0,
 					flops_per_device=getattr(self, "_flops_per_device", 0),
 					batch_size=self.arguments.total_batch_size,
