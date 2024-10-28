@@ -474,7 +474,7 @@ def _fwd_attn_kernel_call(
 	"""
 	kernel = (
 		_fwd_attn_kernel_block_ptr
-		if os.environ.get("FLASH_ATTN_BLOCK_PTR", "0") == "1"
+		if os.environ.get("FLASH_ATTN_BLOCK_PTR", "1") == "1"
 		else _fwd_attn_kernel_ptr_block
 	)
 	batch, seqlen_q, nheads, headdim = query.shape
