@@ -1013,7 +1013,7 @@ class DPOTrainer(BaseTrainer, ABC):
 					pbar.update(1)
 					continue
 				step_metrics.start_step()
-			except (KeyboardInterrupt, EasyDeLTimerError) as exect:
+			except (KeyboardInterrupt, EasyDeLTimerError, StopIteration) as exect:
 				return self.model_state, current_step, exect
 
 			# Execute training step

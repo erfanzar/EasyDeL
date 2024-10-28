@@ -934,6 +934,8 @@ partition_rules = {partition_rules}
 					color="yellow",
 					force_color=True,
 				)
+			elif isinstance(run_exception, StopIteration):
+				...  # simply just pass
 			else:
 				raise RuntimeError("EasyDeL Runtime dumped") from run_exception
 		checkpoint_path = "SAVING_SKIPPED"
