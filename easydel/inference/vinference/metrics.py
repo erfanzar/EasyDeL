@@ -23,7 +23,7 @@ import psutil
 try:
 	from prometheus_client import Counter, Gauge, Histogram, Info, start_http_server
 except ModuleNotFoundError:
-	Counter, Gauge, Histogram, Info = [None] * 4
+	Counter, Gauge, Histogram, Info, start_http_server = [None] * 5
 
 
 @dataclass
