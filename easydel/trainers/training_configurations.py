@@ -497,7 +497,14 @@ class TrainingArguments:
 		        A dictionary where keys are metric names and values are metric values.
 		    step (int): The current training step or iteration.
 		"""
+
+		def restructure_metric_name(metric_name):
+			if metric_name.startswith("train/grad_norm/"):
+				return metric_name.replace("train/grad_norm/", "grad_norm/")
+			return metric_name
+
 		with jax.spmd_mode("allow_all"):
+			metrics = {restructure_metric_name(k): v for k, v in metrics.items()}
 			self._log_to_wandb(metrics, step)
 			self._log_to_tensorboard(metrics, step)
 
