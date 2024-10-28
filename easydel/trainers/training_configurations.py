@@ -460,6 +460,10 @@ class TrainingArguments:
 		    Optional[wandb.sdk.wandb_run.Run]: The WandB run object if initialized, else None.
 		"""
 		if not self.use_wandb or wandb is None:
+			warnings.warn(
+				"you have used `use_wandb=True` but you haven't install wandb.",
+				stacklevel=1,
+			)
 			return None
 
 		if not self.log_all_workers and jax.process_index() != 0:
@@ -513,7 +517,7 @@ class TrainingArguments:
 		    - Other types of values are logged as-is.
 		    - Any exceptions during logging are caught and warned about, allowing the process to continue.
 		"""
-		if self.use_wandb and wandb is not None and wandb.run is not None:
+		if self.use_wandb and wandb is not None:
 
 			class Tensor: ...
 
@@ -539,7 +543,7 @@ class TrainingArguments:
 					else:
 						wandb_metrics[key] = value
 				except Exception as e:
-					logger.warn(f"Failed to log metric {key} to wandb: {e}")
+					warnings.warn(f"Failed to log metric {key} to wandb: {e}", stacklevel=3)
 
 			wandb.log(wandb_metrics, step=step)
 

@@ -18,6 +18,7 @@ import pprint
 import sys
 import threading
 import time
+import warnings
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass
@@ -142,9 +143,10 @@ class BaseTrainer(ABC):
 		if _do_init_fns:
 			self.initialize_trainer_utils()
 		else:
-			logger.warn(
+			warnings.warn(
 				"You have set `_do_init_fns = False`. Functions will not be initialized automatically. "
 				"Call `trainer.initialize_trainer_utils()` manually.",
+				stacklevel=2,
 			)
 
 		if self.arguments.track_memory:
