@@ -5,7 +5,7 @@ def pack_sequences(
 	dataset: datasets.Dataset,
 	max_length=512,
 	pad_token_id=0,
-	reset_position_ids=True,
+	reset_position_ids=False,
 	num_proc=None,
 ):
 	"""
