@@ -40,6 +40,7 @@ websockets = "^11.0.3"
 fastapi = "^0.115.2"
 prometheus_client = "^0.21.0"
 wandb = "^0.18.5"
+uvloop = "^0.21.0"
 
 [tool.poetry.group.torch.dependencies]
 torch = "*"

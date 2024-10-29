@@ -40,13 +40,13 @@ class vInferenceMetrics:
 
 		# Basic request metrics
 		self.inference_requests = Counter(
-			"model_inference_requests_total",
+			f"{model_name}_model_inference_requests_total",
 			"Total number of inference requests",
 			["model_name", "status"],
 		)
 
 		self.inference_latency = Histogram(
-			"model_inference_latency",
+			f"{model_name}_model_inference_latency",
 			"Time spent processing inference request",
 			["model_name", "stage"],  # stages: preprocessing, inference, postprocessing
 			buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
@@ -54,33 +54,33 @@ class vInferenceMetrics:
 
 		# Queue metrics
 		self.queue_size = Gauge(
-			"model_queue_size",
+			f"{model_name}_model_queue_size",
 			"Current number of requests in queue",
 			["model_name"],
 		)
 
 		# Memory metrics
 		self.jax_memory_used = Gauge(
-			"jax_memory_used_bytes",
+			f"{model_name}_jax_memory_used_bytes",
 			"Current JAX memory usage",
 			["device_id", "memory_type"],  # memory_type: used, peak
 		)
 
 		self.host_memory_used = Gauge(
-			"host_memory_used_bytes",
+			f"{model_name}_host_memory_used_bytes",
 			"Host memory usage",
 			["type"],  # type: total, available, used
 		)
 
 		# Model-specific metrics
 		self.token_throughput = Counter(
-			"model_token_throughput_total",
+			f"{model_name}_model_token_throughput_total",
 			"Total number of tokens processed",
 			["model_name", "operation"],
 		)
 
 		self.generation_length = Histogram(
-			"model_generation_length",
+			f"{model_name}_model_generation_length",
 			"Distribution of generation lengths",
 			["model_name"],
 			buckets=(
@@ -101,13 +101,16 @@ class vInferenceMetrics:
 
 		# Compilation metrics
 		self.compilation_time = Histogram(
-			"model_compilation_time_seconds",
+			f"{model_name}_model_compilation_time_seconds",
 			"Time spent on JAX compilation",
 			["model_name", "function_name"],
 		)
 
 		# Model metadata
-		self.model_info = Info("model_metadata", "Model configuration information")
+		self.model_info = Info(
+			f"{model_name}_model_metadata",
+			"Model configuration information",
+		)
 
 		# Start monitoring threads
 		self._start_memory_monitoring()
