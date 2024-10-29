@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from glob import glob
 from logging import warning
 from typing import Any, Callable, Dict, Iterator, Literal, Mapping, Optional, Union
-
+from pathlib import Path
 import flax
 import flax.core
 import jax
@@ -55,6 +55,7 @@ from easydel.modules.modeling_utils import (
 from easydel.smi import get_capacity_matrix, initialise_tracking
 from easydel.trainers.training_configurations import TrainingArguments
 from easydel.utils import Timers
+from easydel import __version__
 
 logger = get_logger(__name__)
 
@@ -667,123 +668,154 @@ class BaseTrainer(ABC):
 		with open(os.path.join(checkpoint_dir, "README.md"), "w") as f:
 			f.write(self._get_information())
 
-	def _get_information(self):
-		mdl = self.arguments.model_class if self.model is None else self.model
-		partition_rules = pprint.pformat(
-			(
+	def _format_partition_rules(self) -> str:
+		"""Format partition rules with proper indentation and formatting."""
+		try:
+			mdl = self.arguments.model_class if self.model is None else self.model
+			rules = (
 				self.arguments.custom_rule
 				if self.arguments.custom_rule is not None
 				else mdl.config_class.get_partition_rules(
 					self.arguments.fully_sharded_data_parallel
 				)
 			)
-		)
+			return pprint.pformat(rules, indent=2, width=80)
+		except Exception as e:
+			logger.error(f"Error formatting partition rules: {str(e)}")
+			return "Error retrieving partition rules"
 
-		info = f"""
----
-tags:
-- EasyDeL
-- {mdl.config_class.model_type}
----
+	def _get_device_info(self) -> dict:
+		"""Get information about available devices."""
+		try:
+			devices = jax.devices()
+			return {"platform": devices[0].platform.upper(), "device_count": len(devices)}
+		except Exception as e:
+			logger.error(f"Error getting device info: {str(e)}")
+			return {"platform": "UNKNOWN", "device_count": 0}
+
+	def _get_information(self) -> str:
+		"""
+		Generate formatted information about the model and training setup.
+
+		Returns:
+				str: Formatted markdown string containing model and training information
+		"""
+		device_info = self._get_device_info()
+		mdl = self.arguments.model_class if self.model is None else self.model
+		partition_rules = self._format_partition_rules()
+
+		return f"""
 # {self.arguments.model_name}
 
-## Trained With [EasyDeL](https://github.com/erfanzar/EasyDeL)
+## 🚀 Trained With [EasyDeL](https://github.com/erfanzar/EasyDeL)
 
 EasyDeL is an open-source framework designed to enhance and streamline the training process of machine learning
 models. With a primary focus on Jax, EasyDeL aims to provide convenient and effective solutions for 
-training Flax/Jax models on TPU/GPU for both serving and training purposes.
+training Flax/Jax models on TPU/GPU, for both serving and training purposes.
 
-## Using Example
+## 📦 Installation & Usage
 
-### Using From EasyDeLState (_*.easy_ files)
+### Method 1: Using EasyDeLState (_*.easy_ files)
 
 ```python
 from easydel import EasyDeLState, AutoShardAndGatherFunctions
 from jax import numpy as jnp, lax
 
+# Initialize shard and gather functions
 shard_fns, gather_fns = AutoShardAndGatherFunctions.from_pretrained(
-		"REPO_ID", # Pytorch State should be saved to in order to find shard gather fns with no effort, otherwise read docs.
-		backend="gpu",
-		depth_target=["params", "params"],
-		flatten=False
+    "REPO_ID",  # Repository ID for finding shard/gather functions
+    backend="gpu",
+    depth_target=["params", "params"],
+    flatten=False
 )
 
+# Load the state
 state = EasyDeLState.load_state(
-		"REPO_ID/{self.arguments.model_name}.easy",
-		dtype=jnp.float16,
-		param_dtype=jnp.float16,
-		precision=lax.Precision("fastest"),
-		verbose=True,
-		state_shard_fns=shard_fns
+    f"REPO_ID/{self.arguments.model_name}.easy",
+    dtype=jnp.float16,
+    param_dtype=jnp.float16,
+    precision=lax.Precision("fastest"),
+    verbose=True,
+    state_shard_fns=shard_fns
 )
-# State file Ready to use ...
 ```
 
-### Using From AutoEasyDeLModelForCausalLM (_from PyTorch_)
+### Method 2: Using AutoEasyDeLModelForCausalLM 
 
 ```python
 from easydel import AutoEasyDeLModelForCausalLM
 from jax import numpy as jnp, lax
 
 model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
-		"REPO_ID/{self.arguments.model_name}",
-		dtype=jnp.float16,
-		param_dtype=jnp.float16,
-		precision=lax.Precision("fastest"),
-		auto_shard_params=True,
+    f"REPO_ID/{self.arguments.model_name}",
+    dtype=jnp.float16,
+    param_dtype=jnp.float16,
+    precision=lax.Precision("fastest"),
+    auto_shard_params=True,
 )
-# Model and Parameters Ready to use ...
 ```
 
-### Using From AutoEasyDeLModelForCausalLM (_from EasyDeL_)
+## 🔧 Training Configuration
 
+### Model Details
+- **Architecture**: {mdl.config_class.model_type}
+- **Platform**: {device_info['platform']}
+- **Number of Devices**: {device_info['device_count']}
+
+### Training Parameters
+- **Learning Rate**: {self.arguments.learning_rate} → {self.arguments.learning_rate_end}
+- **Optimizer**: {self.arguments.optimizer}
+- **Scheduler**: {self.arguments.scheduler}
+- **Warmup Steps**: {self.arguments.warmup_steps}
+- **Weight Decay**: {self.arguments.weight_decay}
+- **Z Loss**: {self.arguments.z_loss}
+
+### Training Setup
+- **Epochs**: {self.arguments.num_train_epochs}
+- **Batch Size**: {self.arguments.total_batch_size}
+- **Sequence Length**: {self.arguments.max_sequence_length}
+- **Input Shape**: {self.arguments.init_input_shape}
+- **Dtype**: {self.arguments.dtype}
+- **Params Dtype**: {self.arguments.param_dtype}
+
+### Advanced Configuration
+- **Gradient Checkpointing**: {self.arguments.gradient_checkpointing}
+- **Fully Sharded Data Parallel**: {self.arguments.fully_sharded_data_parallel}
+- **Force Batch Gradient Accumulation**: {self.arguments.force_batch_and_gradient_accumulation_steps_calculation}
+- **Gradient Accumulation Steps**: {self.arguments.gradient_accumulation_steps}
+- **Max Training Steps**: {self.arguments.max_training_steps}
+- **Max Evaluation Steps**: {self.arguments.max_evaluation_steps}
+- **Training Duration**: {self.arguments.training_time}
+
+### Sharding Configuration
 ```python
-from easydel import AutoEasyDeLModelForCausalLM
-from jax import numpy as jnp, lax
-
-model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
-		"REPO_ID/{self.arguments.model_name}",
-		dtype=jnp.float16,
-		param_dtype=jnp.float16,
-		precision=lax.Precision("fastest"),
-		auto_shard_params=True,
-		from_torch=False
-)
-# Model and Parameters Ready to use ...
+# Partition Rules
+{partition_rules}
 ```
 
-## Training Details
+---
+*Generated with EasyDeL v{__version__}*
+"""
 
-- Model Architecture : {mdl.config_class.model_type}
-- Platform : {jax.devices()[0].platform.upper()}
-- Number of Devices : {len(jax.devices())}
-- Learning Rate Start : {self.arguments.learning_rate}
-- Learning Rate End : {self.arguments.learning_rate_end}
-- Optimizer : {self.arguments.optimizer}
-- Scheduler : {self.arguments.scheduler}
-- Warmup Steps : {self.arguments.warmup_steps}
-- Weight Decay : {self.arguments.weight_decay}
-- Z Loss : {self.arguments.z_loss}
-- Epoch : {self.arguments.num_train_epochs}
-- Batch size : {self.arguments.total_batch_size}
-- Sequence Length : {self.arguments.max_sequence_length}
-- EasyDeL init InputShape : {self.arguments.init_input_shape}
-- Dtype : {self.arguments.dtype}
-- Params Dtype : {self.arguments.param_dtype}
-- Gradient checkpointing : {self.arguments.gradient_checkpointing}
-- Fully Sharded Data Parallel : {self.arguments.fully_sharded_data_parallel}
-- Force batch GradientAccumulation : {self.arguments.force_batch_and_gradient_accumulation_steps_calculation}
-- Gradient Accumulation Steps : {self.arguments.gradient_accumulation_steps}
-- Max Training Steps : {self.arguments.max_training_steps}
-- Max Evaluation Steps : {self.arguments.max_evaluation_steps}
-- Training Time : {self.arguments.training_time}
+	def save_information(self, output_path: Union[str, Path]) -> None:
+		"""
+		Save the generated information to a markdown file.
 
-#### Sharding Partition Rules
-```python
-partition_rules = {partition_rules}
-```
-				"""
-		return info
+		Args:
+				output_path: Path where the markdown file should be saved
+		"""
+		try:
+			output_path = Path(output_path)
+			output_path.parent.mkdir(parents=True, exist_ok=True)
+
+			info = self._get_information()
+			with open(output_path, "w", encoding="utf-8") as f:
+				f.write(info)
+
+			logger.info(f"Information saved successfully to {output_path}")
+		except Exception as e:
+			logger.error(f"Error saving information: {str(e)}")
+			raise
 
 	def save_pretrained(
 		self,

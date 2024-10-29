@@ -48,7 +48,7 @@ from jax.sharding import Mesh, PartitionSpec
 from tqdm.auto import tqdm
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_flax_utils import FlaxPreTrainedModel
-
+from transformers.utils.generic import working_or_temp_dir
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.etils import (
 	AVAILABLE_ATTENTION_MECHANISMS,
@@ -1165,81 +1165,19 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 
 		return quantize_params(params)
 
-	def _md_info(self):
-		md = f"""
----
-tags:
-- EasyDeL
-- {self.config.model_type}
----
-## [EasyDeL](https://github.com/erfanzar/EasyDeL) model 
+	def _model_card(self, name, repo_id):
+		from easydel.utils.readme_generator import ReadmeGenerator, ModelInfo
+		from easydel import __version__
 
-EasyDeL is an open-source framework designed to enhance and streamline the training process of machine learning
-models. With a primary focus on Jax, EasyDeL aims to provide convenient and effective solutions for 
-training Flax/Jax models on TPU/GPU for both serving and training purposes.
-
-## Using Example
-
-### Using From EasyDeLState (_*.easy_ files)
-
-```python
-from easydel import EasyDeLState, AutoShardAndGatherFunctions
-from jax import numpy as jnp, lax
-
-shard_fns, gather_fns = AutoShardAndGatherFunctions.from_pretrained(
-    "REPO_ID", # Pytorch State should be saved to in order to find shard gather fns with no effort, otherwise read docs.
-    backend="gpu",
-    depth_target=["params", "params"],
-    flatten=False
-)
-
-state = EasyDeLState.load_state(
-    "*.easy",
-    dtype=jnp.float16,
-    param_dtype=jnp.float16,
-    precision=lax.Precision("fastest"),
-    verbose=True,
-    state_shard_fns=shard_fns
-)
-# State file Ready to use ...
-```
-
-### Using From AutoEasyDeLModelForCausalLM (_from PyTorch_)
-
-```python
-from easydel import AutoEasyDeLModelForCausalLM
-from jax import numpy as jnp, lax
-
-
-model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
-    "REPO_ID",
-    dtype=jnp.float16,
-    param_dtype=jnp.float16,
-    precision=lax.Precision("fastest"),
-    auto_shard_params=True,
-)
-# Model and Parameters Ready to use ...
-```
-
-### Using From AutoEasyDeLModelForCausalLM (_from EasyDeL_)
-
-```python
-from easydel import AutoEasyDeLModelForCausalLM
-from jax import numpy as jnp, lax
-
-
-model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
-    "REPO_ID/",
-    dtype=jnp.float16,
-    param_dtype=jnp.float16,
-    precision=lax.Precision("fastest"),
-    auto_shard_params=True,
-    from_torch=False
-)
-# Model and Parameters Ready to use ...
-```
-        """
-		return md
+		return ReadmeGenerator().generate_readme(
+			ModelInfo(
+				name=name,
+				type=self.__class__.__name__,
+				repo_id=repo_id,
+				model_class=self.config_class.model_type,
+				version=__version__,
+			)
+		)
 
 	def save_pretrained(  # noqa
 		self,
@@ -1262,9 +1200,9 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 			)
 			return
 		os.makedirs(save_directory, exist_ok=True)
+		repo_id = kwargs.pop("repo_id", save_directory.split(os.path.sep)[-1])
 		if push_to_hub:
 			commit_message = kwargs.pop("commit_message", None)
-			repo_id = kwargs.pop("repo_id", save_directory.split(os.path.sep)[-1])
 			repo_id = self._create_repo(repo_id, **kwargs)
 			files_timestamps = self._get_files_timestamps(save_directory)
 		save_directory = os.path.abspath(save_directory)
@@ -1275,8 +1213,9 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 		if self.can_generate():
 			self.generation_config.save_pretrained(save_directory)
 		output_model_file = os.path.join(save_directory, "easydel-model.parameters")
-		if not os.path.exists(os.path.join(save_directory, "README.md")):
-			open(os.path.join(save_directory, "README.md"), "w").write(self._md_info())
+		readme_path = os.path.join(save_directory, "README.md")
+		if not os.path.exists(readme_path):
+			open(readme_path, "w").write(self._model_card(repo_id, repo_id))
 		func = (
 			CheckpointManager.save_checkpoint_safe
 			if (safe)
@@ -1300,6 +1239,65 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 				files_timestamps,
 				commit_message=commit_message,
 				token=token,
+			)
+
+	def push_to_hub(
+		self,
+		repo_id: str,
+		params,
+		use_temp_dir: Optional[bool] = None,
+		commit_message: Optional[str] = None,
+		private: Optional[bool] = None,
+		token: Optional[Union[bool, str]] = None,
+		create_pr: bool = False,
+		safe_serialization: bool = True,
+		gather_fns: dict[Callable] = None,
+		float_dtype=None,
+		verbose: bool = True,
+		mismatch_allowed: bool = True,
+		revision: str = None,
+		commit_description: str = None,
+		tags: Optional[List[str]] = None,
+	) -> str:
+		working_dir = repo_id.split("/")[-1]
+
+		repo_id = self._create_repo(
+			repo_id,
+			private=private,
+			token=token,
+			repo_url=None,
+			organization=None,
+		)
+
+		if use_temp_dir is None:
+			use_temp_dir = not os.path.isdir(working_dir)
+
+		with working_or_temp_dir(
+			working_dir=working_dir, use_temp_dir=use_temp_dir
+		) as work_dir:
+			files_timestamps = self._get_files_timestamps(work_dir)
+
+			# Save all files.
+			self.save_pretrained(
+				work_dir,
+				params=params,
+				mismatch_allowed=mismatch_allowed,
+				safe=safe_serialization,
+				gather_fns=gather_fns,
+				float_dtype=float_dtype,
+				verbose=verbose,
+				repo_id=repo_id,
+			)
+
+			return self._upload_modified_files(
+				work_dir,
+				repo_id,
+				files_timestamps,
+				commit_message=commit_message,
+				token=token,
+				create_pr=create_pr,
+				revision=revision,
+				commit_description=commit_description,
 			)
 
 	@classmethod
