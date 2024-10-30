@@ -124,9 +124,10 @@ class FlashAttention:
 		if bias is None:
 			return None
 
-		if bias.shape[1] == num_q_heads:
+		if bias.shape[1] == num_q_heads or bias.shape[1] == 1:
 			return bias
-		elif bias.shape[1] in (num_kv_heads, 1):
+		
+		elif bias.shape[1] in (num_kv_heads):
 			return einops.repeat(
 				bias, "b h q k -> b (h r) q k", r=num_q_heads // bias.shape[1]
 			)
