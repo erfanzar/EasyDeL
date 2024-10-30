@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -47,6 +46,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.factory import register_module
 
 
 def built_bloom_alibi(attention_mask, num_attention_heads):
@@ -1056,7 +1056,6 @@ class FlaxFalconPretrainedModel(EDPretrainedModel):
 		return outputs
 
 	def init_cache(self, batch_size, max_length):
-
 		return super().init_cache(batch_size=batch_size, max_length=max_length)
 
 	def prepare_inputs_for_generation(
@@ -1088,6 +1087,19 @@ class FlaxFalconPretrainedModel(EDPretrainedModel):
 		return model_kwargs
 
 
+@register_module(
+	"base-module",
+	config=FalconConfig,
+	model_type="falcon",
+	embedding_layer_names=["word_embeddings"],
+	layernorm_names=[
+		"input_layernorm",
+		"ln_f",
+		"ln_attn",
+		"ln_mlp",
+		"post_attention_layernorm",
+	],
+)
 class FlaxFalconModel(FlaxFalconPretrainedModel):
 	module_class = FlaxFalconModule
 
@@ -1179,6 +1191,19 @@ class FlaxFalconForCausalLMModule(nn.Module):
 			return (output, transformer_output[1]) if output_attentions else (output,)
 
 
+@register_module(
+	"causal-language-model",
+	config=FalconConfig,
+	model_type="falcon",
+	embedding_layer_names=["word_embeddings"],
+	layernorm_names=[
+		"input_layernorm",
+		"ln_f",
+		"ln_attn",
+		"ln_mlp",
+		"post_attention_layernorm",
+	],
+)
 class FlaxFalconForCausalLM(FlaxFalconPretrainedModel):
 	module_class = FlaxFalconForCausalLMModule
 

@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,9 +16,11 @@ from typing import Dict, Optional, Union
 
 from jax.sharding import PartitionSpec
 
+from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
+@register_config("mistral")
 class MistralConfig(EDPretrainedConfig):
 	"""
 	Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read

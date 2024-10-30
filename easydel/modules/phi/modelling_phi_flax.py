@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,6 +30,7 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 from easydel.modules.attention_module import FlexibleAttentionModule
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
 	FlaxAttentionModule,
@@ -101,7 +101,8 @@ class FlaxPhiMLP(nn.Module):
 	def __call__(self, hidden_states: Array, e: bool = False) -> Array:  # Ignored
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
 		if (
-			self.config.hardware_abstraction and self.fc1.variables.get("params", None) is not None
+			self.config.hardware_abstraction
+			and self.fc1.variables.get("params", None) is not None
 		):
 			return jax.vmap(
 				functools.partial(
@@ -356,7 +357,7 @@ class FlaxPhiAttention(FlaxAttentionModule):
 				query_states,
 				attention_mask,
 			)
- 
+
 		attention_bias = lax.select(
 			attention_mask > 0,
 			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -862,8 +863,6 @@ class FlaxPhiForCausalLMModule(nn.Module):
 		else:
 			lm_logits = self.lm_head(res.last_hidden_state)
 
-		
-
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
 
@@ -1093,9 +1092,23 @@ class FlaxPhiPreTrainedModel(EDPretrainedModel):
 		return outputs
 
 
+@register_module(
+	"base-module",
+	config=PhiConfig,
+	model_type="phi",
+	embedding_layer_names=["embed_tokens"],
+	layernorm_names=["input_layernorm", "final_layernorm", "q_layernorm", "k_layernorm"],
+)
 class FlaxPhiModel(FlaxPhiPreTrainedModel):
 	module_class = FlaxPhiModule
 
 
+@register_module(
+	"causal-language-model",
+	config=PhiConfig,
+	model_type="phi",
+	embedding_layer_names=["embed_tokens"],
+	layernorm_names=["input_layernorm", "final_layernorm", "q_layernorm", "k_layernorm"],
+)
 class FlaxPhiForCausalLM(FlaxPhiPreTrainedModel):
 	module_class = FlaxPhiForCausalLMModule

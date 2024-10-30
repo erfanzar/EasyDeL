@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -47,6 +46,7 @@ from easydel.modules.mixtral.kernels import mixtral_mlp_pallas
 from easydel.modules.mixtral.mixtral_configuration import MixtralConfig as MixtralConfig
 from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.factory import register_module
 
 re_mat = nn_partitioning.remat
 
@@ -263,7 +263,7 @@ class FlaxMixtralAttention(FlaxAttentionModule):
 				query_states,
 				attention_mask,
 			)
- 
+
 		attention_bias = lax.select(
 			attention_mask > 0,
 			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -334,7 +334,10 @@ class FlaxMixtralBLockSparseTop2MLP(nn.Module):
 
 	def __call__(self, x: chex.Array):
 		x = control_mlp_sharding(x, self.config.partition_axis)
-		if self.config.hardware_abstraction and self.w2.variables.get("params", None) is not None:
+		if (
+			self.config.hardware_abstraction
+			and self.w2.variables.get("params", None) is not None
+		):
 			return jax.vmap(
 				functools.partial(
 					mixtral_mlp_pallas,
@@ -830,7 +833,6 @@ class MixtralPreTrainedModel(EDPretrainedModel):
 			return random_params
 
 	def init_cache(self, batch_size, max_length):
-
 		return super().init_cache(batch_size=batch_size, max_length=max_length)
 
 	def __call__(
@@ -1098,6 +1100,12 @@ class FlaxMixtralModule(nn.Module):
 		)
 
 
+@register_module(
+	"base-module",
+	config=MixtralConfig,
+	model_type="mixtral",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxMixtralModel(MixtralPreTrainedModel):
 	module_class = FlaxMixtralModule
 
@@ -1218,6 +1226,12 @@ class FlaxMixtralForCausalLMModule(nn.Module):
 		)
 
 
+@register_module(
+	"causal-language-model",
+	config=MixtralConfig,
+	model_type="mixtral",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxMixtralForCausalLM(MixtralPreTrainedModel):
 	module_class = FlaxMixtralForCausalLMModule
 

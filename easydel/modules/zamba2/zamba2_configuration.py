@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
+@register_config("zamba2")
 class Zamba2Config(EDPretrainedConfig):
 	r"""
 	This is the configuration class to store the configuration of a [`Zamba2Model`]. It is used to instantiate a

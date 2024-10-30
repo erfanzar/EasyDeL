@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,8 +17,10 @@ from typing import Optional
 from jax.sharding import PartitionSpec
 
 from easydel.modules.modeling_utils import EDPretrainedConfig
+from easydel.modules.factory import register_config
 
 
+@register_config("cohere")
 class CohereConfig(EDPretrainedConfig):
 	"""
 	Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read

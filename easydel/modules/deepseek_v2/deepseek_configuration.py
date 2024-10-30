@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,9 +17,11 @@ from typing import Dict, Optional, Union
 
 from jax.sharding import PartitionSpec
 
+from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
+@register_config("deepseek_v2")
 class DeepseekV2Config(EDPretrainedConfig):
 	"""
 	Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read
@@ -171,7 +172,7 @@ class DeepseekV2Config(EDPretrainedConfig):
 		rope_scaling: Dict[str, Union[str, float]] = None,
 		**kwargs,
 	):
-		warnings.warn("`DeepseekV2` is still in beta mode.", UserWarning)
+		warnings.warn("`DeepseekV2` is still in beta mode.", UserWarning, stacklevel=1)
 		self.vocab_size = vocab_size
 		self.max_position_embeddings = max_position_embeddings
 		self.hidden_size = hidden_size

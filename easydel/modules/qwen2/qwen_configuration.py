@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,9 +16,11 @@ from typing import Mapping, Optional
 
 from jax.sharding import PartitionSpec
 
+from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
+@register_config("qwen2")
 class Qwen2Config(EDPretrainedConfig):
 	"""
 	Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read
@@ -155,6 +156,9 @@ class Qwen2Config(EDPretrainedConfig):
 		self.use_scan_mlp = use_scan_mlp
 		self.scan_mlp_chunk_size = scan_mlp_chunk_size
 		self.bits = bits
+
+		if self.rope_scaling is not None and "type" in self.rope_scaling:
+			self.rope_scaling["rope_type"] = self.rope_scaling["type"]
 		super().__init__(
 			tie_word_embeddings=tie_word_embeddings,
 			use_scan_mlp=use_scan_mlp,

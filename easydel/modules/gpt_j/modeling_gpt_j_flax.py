@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -47,6 +46,8 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.factory import register_module
+
 
 logger = get_logger(__name__)
 
@@ -516,7 +517,6 @@ class FlaxGPTJPreTrainedModel(EDPretrainedModel):
 			return params
 
 	def init_cache(self, batch_size, max_length):
-
 		return super().init_cache(batch_size=batch_size, max_length=max_length)
 
 	def __call__(
@@ -729,6 +729,13 @@ class FlaxGPTJModule(nn.Module):
 		)
 
 
+@register_module(
+	"base-module",
+	config=GPTJConfig,
+	model_type="gptj",
+	embedding_layer_names=["wte"],
+	layernorm_names=["ln_1", "ln_2", "ln_f"],
+)
 class FlaxGPTJModel(FlaxGPTJPreTrainedModel):
 	module_class = FlaxGPTJModule
 
@@ -814,6 +821,13 @@ class FlaxGPTJForCausalLMModule(nn.Module):
 		)
 
 
+@register_module(
+	"causal-language-model",
+	config=GPTJConfig,
+	model_type="gptj",
+	embedding_layer_names=["wte"],
+	layernorm_names=["ln_1", "ln_2", "ln_f"],
+)
 class FlaxGPTJForCausalLM(FlaxGPTJPreTrainedModel):
 	module_class = FlaxGPTJForCausalLMModule
 

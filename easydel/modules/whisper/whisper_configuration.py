@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,9 +14,11 @@
 
 from typing import Optional
 
+from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
+@register_config("whisper")
 class WhisperConfig(EDPretrainedConfig):
 	"""
 	Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read
@@ -133,7 +134,7 @@ class WhisperConfig(EDPretrainedConfig):
 		bos_token_id=50256,
 		eos_token_id=50256,
 		suppress_tokens=None,
-		begin_suppress_tokens=[220, 50256],
+		begin_suppress_tokens=[220, 50256],  # noqa: B006
 		use_weighted_layer_sum=False,
 		classifier_proj_size=256,
 		apply_spec_augment=False,

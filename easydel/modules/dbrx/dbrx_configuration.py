@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +18,8 @@ import warnings
 from typing import Any, Optional
 
 from easydel.modules.modeling_utils import EDPretrainedConfig
+
+from easydel.modules.factory import register_config
 
 DBRX_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 
@@ -76,7 +77,8 @@ class DbrxAttentionConfig(EDPretrainedConfig):
 		):
 			warnings.warn(
 				f"You are using a model of type {config_dict['model_type']} to instantiate a model of type "
-				f"{cls.model_type}. This is not supported for all configurations of models and can yield errors."
+				f"{cls.model_type}. This is not supported for all configurations of models and can yield errors.",
+				stacklevel=1,
 			)
 
 		return cls.from_dict(config_dict, **kwargs)
@@ -153,12 +155,14 @@ class DbrxFFNConfig(EDPretrainedConfig):
 		):
 			warnings.warn(
 				f"You are using a model of type {config_dict['model_type']} to instantiate a model of type "
-				f"{cls.model_type}. This is not supported for all configurations of models and can yield errors."
+				f"{cls.model_type}. This is not supported for all configurations of models and can yield errors.",
+				stacklevel=1,
 			)
 
 		return cls.from_dict(config_dict, **kwargs)
 
 
+@register_config("dbrx")
 class DbrxConfig(EDPretrainedConfig):
 	"""
 	Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read

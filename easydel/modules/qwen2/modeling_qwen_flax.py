@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,6 +32,7 @@ from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.common import RMSNorm as RMSNorm
 
 # easydel.modules
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	FlaxAttentionModule,
 	apply_rotary_pos_emb,
@@ -371,7 +371,7 @@ class FlaxQwen2Attention(FlaxAttentionModule):
 				query_states,
 				attention_mask,
 			)
- 
+
 		attention_bias = lax.select(
 			attention_mask > 0,
 			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -1012,6 +1012,12 @@ class FlaxQwen2Module(nn.Module):
 		)
 
 
+@register_module(
+	"base-module",
+	config=Qwen2Config,
+	model_type="qwen2",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxQwen2Model(FlaxQwen2PreTrainedModel):
 	module_class = FlaxQwen2Module
 
@@ -1124,8 +1130,6 @@ class FlaxQwen2ForCausalLMModule(nn.Module):
 		else:
 			lm_logits = self.lm_head(hidden_states)
 
-		
-
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
 
@@ -1136,6 +1140,12 @@ class FlaxQwen2ForCausalLMModule(nn.Module):
 		)
 
 
+@register_module(
+	"causal-language-model",
+	config=Qwen2Config,
+	model_type="qwen2",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxQwen2ForCausalLM(FlaxQwen2PreTrainedModel):
 	module_class = FlaxQwen2ForCausalLMModule
 
@@ -1294,5 +1304,11 @@ class FlaxQwen2ForSequenceClassificationModule(nn.Module):
 			return (prediction,)
 
 
+@register_module(
+	"sequence-classification",
+	config=Qwen2Config,
+	model_type="qwen2",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxQwen2ForSequenceClassification(FlaxQwen2PreTrainedModel):
 	module_class = FlaxQwen2ForSequenceClassificationModule

@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,6 +33,7 @@ from transformers.generation.flax_utils import (
 )
 
 from easydel.etils.etils import get_logger
+from easydel.modules.factory import register_module
 from easydel.modules.llama.modeling_llama_flax import (
 	FlaxLlamaBlockCollection,
 	RMSNorm,
@@ -472,6 +472,12 @@ class FlaxVisionLlamaForCausalLMModule(nn.Module):
 			raise ValueError(f"Invalid sample_mode: {self.config.sample_mode}")
 
 
+@register_module(
+	"vision-language-model",
+	config=VisionLlamaConfig,
+	model_type="llama",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
 	module_class = FlaxVisionLlamaForCausalLMModule
 

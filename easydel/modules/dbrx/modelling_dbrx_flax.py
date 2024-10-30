@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -52,6 +51,7 @@ from easydel.modules.flax_modeling_utils import (
 )
 from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.factory import register_module
 
 
 @flax.struct.dataclass
@@ -459,19 +459,19 @@ class FlaxDbrxExpertGLU(nn.Module):
 				expert_w2,
 			)
 		else:
-			x1 = jax.lax.batch_matmul(
+			x1 = jnp.matmul(
 				x,
 				jnp.expand_dims(expert_w1.T, 0),
 				precision=self.precision,
 			)
-			x2 = jax.lax.batch_matmul(
+			x2 = jnp.matmul(
 				x,
 				jnp.expand_dims(expert_v1.T, 0),
 				precision=self.precision,
 			)
 			x1 = self.activation_fn(x1)
 			x1 = x1 * x2
-			x1 = jax.lax.batch_matmul(
+			x1 = jnp.matmul(
 				x1,
 				jnp.expand_dims(expert_w2, 0),
 				precision=self.precision,
@@ -1184,6 +1184,13 @@ class FlaxDbrxModule(nn.Module):
 		)
 
 
+@register_module(
+	"base-module",
+	config=DbrxConfig,
+	model_type="dbrx",
+	embedding_layer_names=["wte"],
+	layernorm_names=["norm_1", "norm_2", "norm_f"],
+)
 class FlaxDbrxModel(DbrxPreTrainedModel):
 	module_class = FlaxDbrxModule
 
@@ -1307,6 +1314,13 @@ class FlaxDbrxForCausalLMModule(nn.Module):
 		)
 
 
+@register_module(
+	"causal-language-model",
+	config=DbrxConfig,
+	model_type="dbrx",
+	embedding_layer_names=["wte"],
+	layernorm_names=["norm_1", "norm_2", "norm_f"],
+)
 class FlaxDbrxForCausalLM(DbrxPreTrainedModel):
 	module_class = FlaxDbrxForCausalLMModule
 

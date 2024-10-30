@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,6 +25,7 @@ from flax.core import FrozenDict
 from jax import numpy as np
 
 from easydel.modules.common import RMSNorm
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import get_gradient_checkpoint_policy
 from easydel.modules.modeling_flax_outputs import FlaxCausalLMOutput
 from easydel.modules.modeling_utils import EDPretrainedModel
@@ -319,6 +319,12 @@ class FlaxPalmModule(nn.Module):
 			return hidden_state, atn
 
 
+@register_module(
+	"base-module",
+	config=PalmConfig,
+	model_type="palm",
+	embedding_layer_names=["wte"],
+)
 class FlaxPalmModel(PalmPretrainedModel):
 	module_class = FlaxPalmModule
 
@@ -380,6 +386,12 @@ class FlaxPalmForCausalLMModule(nn.Module):
 			)
 
 
+@register_module(
+	"causal-language-model",
+	config=PalmConfig,
+	model_type="palm",
+	embedding_layer_names=["wte"],
+)
 class FlaxPalmForCausalLM(PalmPretrainedModel):
 	module_class = FlaxPalmForCausalLMModule
 

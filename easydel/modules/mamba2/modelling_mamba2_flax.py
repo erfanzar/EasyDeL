@@ -45,6 +45,7 @@ from easydel.modules.common import (
 from easydel.modules.common import (
 	RMSNorm as FlaxMamba2RMSNorm,
 )
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
 	get_gradient_checkpoint_policy,
@@ -1266,10 +1267,22 @@ class FlaxMambaPretrainedModel(EDPretrainedModel):
 		)
 
 
+@register_module(
+	"base-module",
+	config=Mamba2Config,
+	model_type="mamba2",
+	embedding_layer_names=["embeddings"],
+)
 class FlaxMamba2Model(FlaxMambaPretrainedModel):
 	module_class = FlaxMamba2Module
 
 
+@register_module(
+	"causal-language-model",
+	config=Mamba2Config,
+	model_type="mamba2",
+	embedding_layer_names=["embeddings"],
+)
 class FlaxMamba2ForCausalLM(FlaxMambaPretrainedModel):
 	module_class = FlaxMamba2ForCausalLMModule
 

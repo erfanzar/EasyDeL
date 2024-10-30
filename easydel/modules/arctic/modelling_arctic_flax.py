@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,6 +32,7 @@ from jax.sharding import PartitionSpec
 from easydel.modules.arctic.arctic_configuration import ArcticConfig
 from easydel.modules.arctic.kernels import arctic_mlp_pallas
 from easydel.modules.attention_module import FlexibleAttentionModule
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
 	FlaxAttentionModule,
@@ -152,6 +152,7 @@ class FlaxArcticAttention(FlaxAttentionModule):
 			sm_scale=1 / math.sqrt(self.head_dim),
 			backward_pass_impl=self.config.flash_attention_backward_pass_impl,
 			base_config=self.config,
+			mesh=self.config.mesh,
 		)
 
 	def apply_rotary(self, query, key, frequencies, position_ids):
@@ -390,6 +391,7 @@ class ArcticMLP(nn.Module):
 		    chex.Array: Output tensor after applying dense layers and activation functions.
 		"""
 		x = control_mlp_sharding(x, self.config.partition_axis)
+
 		if (
 			self.config.hardware_abstraction
 			and self.w1.variables.get("params", None) is not None
@@ -411,7 +413,10 @@ class ArcticMLP(nn.Module):
 				self.w2.variables["params"]["kernel"],
 				self.w3.variables["params"]["kernel"],
 			)
-		return self.w2(self.act_fn(self.w1(x)) * self.w3(x))
+ 
+		w1 = self.act_fn(self.w1(x))
+		w3 = self.w3(x) 
+		return self.w2(w1 * w3)
 
 
 class FlaxArcticBlocKSparesMLPCollection(nn.Module):
@@ -556,32 +561,35 @@ class FlaxArcticMoE(nn.Module):
 		Returns:
 		    Tuple[chex.Array, chex.Array]: The processed output and an auxiliary loss.
 		"""
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-		batch_size, sequence_length, hidden_dim = hidden_states.shape
+		if self.is_moe_layer:
+			hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
+			batch_size, sequence_length, hidden_dim = hidden_states.shape
 
-		router_logits = self.gate(hidden_states).astype(  # no reshaping is needed
-			jnp.promote_types(self.dtype, jnp.float32)
-		)
-		routing_weights, selected_experts = jax.lax.top_k(
-			router_logits, k=self.config.num_experts_per_tok
-		)
-		routing_weights = jax.nn.softmax(
-			routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=-1
-		)
+			router_logits = self.gate(hidden_states).astype(  # no reshaping is needed
+				jnp.promote_types(self.dtype, jnp.float32)
+			)
+			routing_weights, selected_experts = jax.lax.top_k(
+				router_logits, k=self.config.num_experts_per_tok
+			)
+			routing_weights = jax.nn.softmax(
+				routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=-1
+			)
 
-		return self.experts(
-			selected_experts=selected_experts,
-			batch_size=batch_size,
-			sequence_length=sequence_length,
-			hidden_dim=hidden_dim,
-			hidden_states=hidden_states,
-			routing_weights=routing_weights,
-		), auxiliary_load_balancing_loss_func(
-			(router_logits,),  # type:ignore
-			self.num_experts,
-			self.top_k,
-			None,
-		)
+			return self.experts(
+				selected_experts=selected_experts,
+				batch_size=batch_size,
+				sequence_length=sequence_length,
+				hidden_dim=hidden_dim,
+				hidden_states=hidden_states,
+				routing_weights=routing_weights,
+			), auxiliary_load_balancing_loss_func(
+				(router_logits,),  # type:ignore
+				self.num_experts,
+				self.top_k,
+				None,
+			)
+		else:
+			return self.mlp(hidden_states), jnp.array([0], hidden_states.dtype)
 
 	def __call__(self, hidden_states: chex.Array, e: bool = False):  # Ignored
 		"""
@@ -611,26 +619,36 @@ class FlaxArcticSparseMoeBlock(nn.Module):
 	"""
 
 	config: ArcticConfig
+	layer_index: int
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
 	precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision("fastest")
 
 	def setup(self) -> None:
-		self.gate = Dense(
-			self.config.num_local_experts,
-			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-			kernel_init=nn.initializers.normal(),
-		)
+		self.is_moe = (self.layer_index + 1) % self.config.moe_layer_frequency == 0
+		if self.is_moe:
+			self.gate = Dense(
+				self.config.num_local_experts,
+				use_bias=False,
+				dtype=self.dtype,
+				param_dtype=self.param_dtype,
+				precision=self.precision,
+				kernel_init=nn.initializers.normal(),
+			)
 
-		self.experts = FlaxArcticBlocKSparesMLPCollection(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-		)
+			self.experts = FlaxArcticBlocKSparesMLPCollection(
+				config=self.config,
+				dtype=self.dtype,
+				param_dtype=self.param_dtype,
+				precision=self.precision,
+			)
+		else:
+			self.mlp = ArcticMLP(
+				config=self.config,
+				dtype=self.dtype,
+				param_dtype=self.param_dtype,
+				precision=self.precision,
+			)
 
 	def __call__(
 		self,
@@ -638,29 +656,33 @@ class FlaxArcticSparseMoeBlock(nn.Module):
 		e: bool = False,  # Ignored
 	) -> Tuple[chex.Array, chex.Array]:
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
+
 		batch_size, sequence_length, hidden_dim = hidden_states.shape
 
-		router_logits = self.gate(hidden_states).astype(  # no reshaping is needed
-			jnp.promote_types(self.dtype, jnp.float32)
-		)
-		routing_weights, selected_experts = jax.lax.top_k(
-			router_logits, k=self.config.num_experts_per_tok
-		)
-		routing_weights = jax.nn.softmax(
-			routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=-1
-		)
+		if self.is_moe:
+			router_logits = self.gate(hidden_states).astype(  # no reshaping is needed
+				jnp.promote_types(self.dtype, jnp.float32)
+			)
+			routing_weights, selected_experts = jax.lax.top_k(
+				router_logits, k=self.config.num_experts_per_tok
+			)
+			routing_weights = jax.nn.softmax(
+				routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=-1
+			)
 
-		return (
-			self.experts(
-				selected_experts=selected_experts,
-				batch_size=batch_size,
-				sequence_length=sequence_length,
-				hidden_dim=hidden_dim,
-				hidden_states=hidden_states,
-				routing_weights=routing_weights,
-			),
-			router_logits,
-		)
+			return (
+				self.experts(
+					selected_experts=selected_experts,
+					batch_size=batch_size,
+					sequence_length=sequence_length,
+					hidden_dim=hidden_dim,
+					hidden_states=hidden_states,
+					routing_weights=routing_weights,
+				),
+				router_logits,
+			)
+		else:
+			return self.mlp(hidden_states), jnp.asarray([0], hidden_states.dtype)
 
 
 class FlaxArcticDecoderLayer(nn.Module):
@@ -708,6 +730,7 @@ class FlaxArcticDecoderLayer(nn.Module):
 		self.block_sparse_moe = mlp_block(
 			config=self.config,
 			dtype=self.dtype,
+			layer_index=self.layer_index,
 			param_dtype=self.param_dtype,
 			precision=self.precision,
 		)
@@ -1301,6 +1324,12 @@ class FlaxArcticModule(nn.Module):
 		)
 
 
+@register_module(
+	"base-module",
+	config=ArcticConfig,
+	model_type="arctic",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxArcticModel(ArcticPreTrainedModel):
 	"""
 	Wrapper class for the Arctic model, handling the setup and interaction with the core module.
@@ -1419,6 +1448,12 @@ class FlaxArcticForCausalLMModule(nn.Module):
 		)
 
 
+@register_module(
+	"causal-language-model",
+	config=ArcticConfig,
+	model_type="arctic",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxArcticForCausalLM(ArcticPreTrainedModel):
 	module_class = FlaxArcticForCausalLMModule
 

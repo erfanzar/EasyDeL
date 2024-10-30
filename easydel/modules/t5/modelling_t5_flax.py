@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -51,6 +50,7 @@ from transformers.modeling_flax_utils import (
 	ACT2FN,
 )
 
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	FlaxAttentionModule,
 	control_mlp_sharding,
@@ -126,7 +126,10 @@ class FlaxT5DenseActDense(nn.Module):
 		self.act = ACT2FN[self.config.dense_act_fn]
 
 	def __call__(self, hidden_states, deterministic=True):
-		if self.config.hardware_abstraction and self.wi.variables.get("params", None) is not None:
+		if (
+			self.config.hardware_abstraction
+			and self.wi.variables.get("params", None) is not None
+		):
 			return jax.vmap(
 				functools.partial(
 					t5_mlp_pallas,
@@ -1250,6 +1253,12 @@ class FlaxT5Module(nn.Module):
 		)
 
 
+@register_module(
+	"base-module",
+	config=T5Config,
+	model_type="t5",
+	embedding_layer_names=["shared", "relative_attention_bias"],
+)
 class FlaxT5Model(FlaxT5PreTrainedModel):
 	module_class = FlaxT5Module
 
@@ -1300,6 +1309,12 @@ class FlaxT5EncoderModule(nn.Module):
 		return encoder_outputs
 
 
+@register_module(
+	"base-module",
+	config=T5Config,
+	model_type="enc-t5",
+	embedding_layer_names=["shared", "relative_attention_bias"],
+)
 class FlaxT5EncoderModel(FlaxT5PreTrainedModel):
 	module_class = FlaxT5EncoderModule
 
@@ -1467,6 +1482,12 @@ class FlaxT5ForConditionalGenerationModule(nn.Module):
 		)
 
 
+@register_module(
+	"conditional-generation",
+	config=T5Config,
+	model_type="t5",
+	embedding_layer_names=["shared", "relative_attention_bias"],
+)
 class FlaxT5ForConditionalGeneration(FlaxT5PreTrainedModel):
 	module_class = FlaxT5ForConditionalGenerationModule
 

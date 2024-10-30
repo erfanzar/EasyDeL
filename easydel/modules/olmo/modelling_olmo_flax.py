@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,6 +32,7 @@ from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.common import LayerNormRaw
 
 # easydel.modules
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
 	FlaxAttentionModule,
@@ -336,7 +336,6 @@ class FlaxOlmoAttention(FlaxAttentionModule):
 				attention_mask,
 			)
 
- 
 		attention_bias = lax.select(
 			attention_mask > 0,
 			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -970,6 +969,12 @@ class FlaxOlmoModule(nn.Module):
 		)
 
 
+@register_module(
+	"base-module",
+	config=OlmoConfig,
+	model_type="olmo",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxOlmoModel(FlaxOlmoPretrainedModel):
 	module_class = FlaxOlmoModule
 
@@ -1070,7 +1075,7 @@ class FlaxOlmoForCausalLMModule(nn.Module):
 			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
-		
+
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
 
@@ -1081,6 +1086,12 @@ class FlaxOlmoForCausalLMModule(nn.Module):
 		)
 
 
+@register_module(
+	"causal-language-model",
+	config=OlmoConfig,
+	model_type="olmo",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxOlmoForCausalLM(FlaxOlmoPretrainedModel):
 	module_class = FlaxOlmoForCausalLMModule
 

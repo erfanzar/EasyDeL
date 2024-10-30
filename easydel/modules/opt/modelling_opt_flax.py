@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -48,6 +47,7 @@ from jax.sharding import PartitionSpec
 from transformers import logging
 from transformers.modeling_flax_utils import ACT2FN
 
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	FlaxAttentionModule,
 	control_mlp_sharding,
@@ -662,6 +662,13 @@ class FlaxOPTModule(nn.Module):
 		)
 
 
+@register_module(
+	"base-module",
+	config=OPTConfig,
+	model_type="opt",
+	embedding_layer_names=["embed_tokens"],
+	layernorm_names=["self_attn_layer_norm", "final_layer_norm"],
+)
 class FlaxOPTModel(FlaxOPTPreTrainedModel):
 	module_class = FlaxOPTModule
 
@@ -730,6 +737,13 @@ class FlaxOPTForCausalLMModule(nn.Module):
 		)
 
 
+@register_module(
+	"causal-language-model",
+	config=OPTConfig,
+	model_type="opt",
+	embedding_layer_names=["embed_tokens"],
+	layernorm_names=["self_attn_layer_norm", "final_layer_norm"],
+)
 class FlaxOPTForCausalLM(FlaxOPTPreTrainedModel):
 	module_class = FlaxOPTForCausalLMModule
 

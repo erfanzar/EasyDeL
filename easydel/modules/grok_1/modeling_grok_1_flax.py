@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -48,6 +47,7 @@ from easydel.modules.grok_1.grok_1_configuration import Grok1Config as Grok1Conf
 from easydel.modules.grok_1.kernels import grok1_mlp_pallas
 from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.factory import register_module
 
 re_mat = flax.linen.partitioning.remat
 
@@ -283,7 +283,6 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 				query_states,
 				attention_mask,
 			)
-
 
 		attention_bias = lax.select(
 			attention_mask > 0,
@@ -902,7 +901,6 @@ class Grok1PreTrainedModel(EDPretrainedModel):
 		    dict: Initialized cache.
 		"""
 
-
 		return super().init_cache(batch_size=batch_size, max_length=max_length)
 
 	def __call__(
@@ -1170,6 +1168,12 @@ class FlaxGrok1Module(nn.Module):
 		)
 
 
+@register_module(
+	"base-module",
+	config=Grok1Config,
+	model_type="grok-1",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxGrok1Model(Grok1PreTrainedModel):
 	module_class = FlaxGrok1Module
 
@@ -1296,6 +1300,12 @@ class FlaxGrok1ForCausalLMModule(nn.Module):
 		)
 
 
+@register_module(
+	"causal-language-model",
+	config=Grok1Config,
+	model_type="grok-1",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxGrok1ForCausalLM(Grok1PreTrainedModel):
 	module_class = FlaxGrok1ForCausalLMModule
 

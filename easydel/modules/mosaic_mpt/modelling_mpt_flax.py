@@ -28,6 +28,7 @@ from jax import lax
 from jax import numpy as jnp
 
 from easydel.modules.attention_module import FlexibleAttentionModule
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	FlaxAttentionModule,
 	control_mlp_sharding,
@@ -756,6 +757,13 @@ class FlaxMptPretrainedModel(EDPretrainedModel):
 		return predict
 
 
+@register_module(
+	"base-module",
+	config=MptConfig,
+	model_type="mpt",
+	embedding_layer_names=["wte"],
+	layernorm_names=["norm_1", "norm_2", "norm_f"],
+)
 class FlaxMptModel(FlaxMptPretrainedModel):
 	module_class = FlaxMptModule
 
@@ -848,6 +856,13 @@ class FlaxMptForCausalLMModule(nn.Module):
 		return logits, predict.hidden_states if output_hidden_states else (logits,)
 
 
+@register_module(
+	"causal-language-model",
+	config=MptConfig,
+	model_type="mpt",
+	embedding_layer_names=["wte"],
+	layernorm_names=["norm_1", "norm_2", "norm_f"],
+)
 class FlaxMptForCausalLM(FlaxMptPretrainedModel):
 	module_class = FlaxMptForCausalLMModule
 
