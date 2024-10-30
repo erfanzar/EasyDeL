@@ -27,14 +27,14 @@ from easydel.generation.logits_process import (
 	FlaxTemperatureLogitsWarper,
 	FlaxTopKLogitsWarper,
 	FlaxTopPLogitsWarper,
-) 
+)
 
 
 @jax.tree_util.register_pytree_node_class
 @dataclasses.dataclass
 class vInferenceConfig:
 	max_new_tokens: int = 64
-	streaming_chunks: int = 1
+	streaming_chunks: int = 16
 	temperature: float = 0.0
 	top_p: float = 0.95
 	top_k: int = 50

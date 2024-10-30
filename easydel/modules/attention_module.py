@@ -43,6 +43,7 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 )
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec
+import numpy
 
 from easydel.etils.etils import (
 	_AVAILABLE_ATTENTION_MECHANISMS,
@@ -78,6 +79,26 @@ def get_cached_flash_attention(
 		blocksize_k=blocksize_k,
 		softmax_scale=softmax_scale,
 	)
+
+
+def create_target_only_spec(original_spec, target="fsdp"):
+	"""
+	Creates a new partition spec that only includes Single sharding.
+	"""
+	if original_spec is None:
+		return None
+
+	new_spec = []
+	for axis in original_spec:
+		if isinstance(axis, str):
+			if axis == target:
+				new_spec.append(axis)
+			else:
+				new_spec.append(None)
+		else:
+			new_spec.append(None)
+
+	return PartitionSpec(*new_spec)
 
 
 def _get_jax_dtype_from_string(dtype_string):
@@ -319,7 +340,12 @@ class FlexibleAttentionModule(object):
 		query_sequence_length,
 		bias_dim_eql=False,
 	) -> Tuple[
-		PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, bool
+		PartitionSpec,
+		PartitionSpec,
+		PartitionSpec,
+		PartitionSpec,
+		PartitionSpec,
+		bool,
 	]:
 		in_generating_processerating = query_sequence_length == 1
 		if in_generating_processerating:
@@ -676,6 +702,7 @@ class FlexibleAttentionModule(object):
 			attention_partitionspec,
 			in_generating_process,
 		) = self.get_bshd_partition_specs(query_states.shape[1])
+
 		block_q = self.block_q
 		if in_generating_process:
 			block_q = int(
@@ -693,23 +720,122 @@ class FlexibleAttentionModule(object):
 				blocksize_k=self.block_k,
 				softmax_scale=self.sm_scale,
 			)
-			attention_outputs = shard_map(
-				attention,
-				mesh=self.mesh,
-				in_specs=(
-					query_partitionspec,
-					key_partitionspec,
-					value_partitionspec,
-					bias_partitionspec,
-				),
-				out_specs=attention_partitionspec,
-				check_rep=False,
-			)(
-				query_states.astype(self.dtype),
-				key_states.astype(self.dtype),
-				value_states.astype(self.dtype),
-				bias.astype(self.dtype) if bias is not None else None,
+
+			# Helper function to get axis size
+			def get_axis_size(axis_name):
+				if isinstance(axis_name, tuple):
+					return numpy.prod([self.mesh.shape[name] for name in axis_name])
+				return self.mesh.shape[axis_name]
+
+			# Get sharding dimensions
+
+			fsdp_size = get_axis_size(query_partitionspec[0])
+			sp_size = get_axis_size(query_partitionspec[2])
+
+			attention = get_cached_flash_attention(
+				backend=self.backend,
+				platform=self.platform,
+				blocksize_q=self.block_q,
+				blocksize_k=self.block_k,
+				softmax_scale=self.sm_scale,
 			)
+
+			with self.mesh:
+				# Case 1: All FSDP sharding and SP = 1
+				if fsdp_size > 1 and sp_size == 1:
+					attention_outputs = shard_map(
+						attention,
+						mesh=self.mesh,
+						in_specs=(
+							query_partitionspec,
+							key_partitionspec,
+							value_partitionspec,
+							bias_partitionspec,
+						),
+						out_specs=attention_partitionspec,
+						check_rep=False,
+					)(
+						query_states.astype(self.dtype),
+						key_states.astype(self.dtype),
+						value_states.astype(self.dtype),
+						bias.astype(self.dtype) if bias is not None else None,
+					)
+
+				# Case 2: FSDP = 1 and SP > 1
+				elif fsdp_size == 1 and sp_size > 1:
+					attention_outputs = attention(
+						with_sharding_constraint(
+							query_states.astype(self.dtype),
+							query_partitionspec,
+						),
+						with_sharding_constraint(
+							key_states.astype(self.dtype),
+							key_partitionspec,
+						),
+						with_sharding_constraint(
+							value_states.astype(self.dtype),
+							value_partitionspec,
+						),
+						with_sharding_constraint(
+							bias.astype(self.dtype),
+							bias_partitionspec,
+						)
+						if bias is not None
+						else None,
+					)
+
+				# Case 3: Both FSDP and SP > 1
+				elif fsdp_size > 1 and sp_size > 1:
+					# Use shard_map with FSDP sharding, ignore SP
+					fsdp_only_query_spec = create_target_only_spec(
+						query_partitionspec,
+						query_partitionspec[0],
+					)
+					fsdp_only_key_spec = create_target_only_spec(
+						key_partitionspec,
+						key_partitionspec[0],
+					)
+					fsdp_only_value_spec = create_target_only_spec(
+						value_partitionspec,
+						value_partitionspec[0],
+					)
+					fsdp_only_bias_spec = (
+						create_target_only_spec(
+							bias_partitionspec,
+							bias_partitionspec[0],
+						)
+						if bias_partitionspec is not None
+						else None
+					)
+					fsdp_only_attention_spec = create_target_only_spec(
+						attention_partitionspec,
+						attention_partitionspec[0],
+					)
+
+					attention_outputs = shard_map(
+						attention,
+						mesh=self.mesh,
+						in_specs=(
+							fsdp_only_query_spec,
+							fsdp_only_key_spec,
+							fsdp_only_value_spec,
+							fsdp_only_bias_spec,
+						),
+						out_specs=fsdp_only_attention_spec,
+						check_rep=False,
+					)(
+						query_states.astype(self.dtype),
+						key_states.astype(self.dtype),
+						value_states.astype(self.dtype),
+						bias.astype(self.dtype) if bias is not None else None,
+					)
+				else:
+					attention_outputs = attention(
+						query_states.astype(self.dtype),
+						key_states.astype(self.dtype),
+						value_states.astype(self.dtype),
+						bias.astype(self.dtype) if bias is not None else None,
+					)
 			return AttentionOutput(
 				attention_weights=None,
 				attention_outputs=attention_outputs,
@@ -1115,6 +1241,8 @@ class FlexibleAttentionModule(object):
 					sequence_length=seq_len,
 					num_warmup_runs=2,
 					num_benchmark_runs=5,
+					blocksize_k=64,
+					blocksize_q=32,
 				)
 
 				benchmarker = AttentionBenchmarker(
@@ -1426,7 +1554,7 @@ class AttentionBenchmarker:
 					),
 				}
 
-			except Exception as e:
+			except Exception as e: 
 				error_key = f"{attn_name}:{str(e)}"
 				if error_key not in self._printed_errors:
 					print(f"Benchmark failed for {attn_name}: {str(e)}")
@@ -1456,6 +1584,6 @@ class AttentionBenchmarker:
 if __name__ == "__main__":
 	import pandas as pd
 
-	FlexibleAttentionModule.run_attention_benchmarks(batch_sizes=[1])["b1_s2048"].to_csv(
-		"res.csv"
-	)
+	FlexibleAttentionModule.run_attention_benchmarks(
+		batch_sizes=[1],
+	)["b1_s2048"].to_csv("res.csv")
