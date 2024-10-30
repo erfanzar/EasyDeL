@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -58,6 +57,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.factory import register_module
 
 re_mat = nn_partitioning.remat
 logger = get_logger(__name__)
@@ -384,7 +384,6 @@ class FlaxMistralAttention(FlaxAttentionModule):
 				attention_mask,
 			)
 
- 
 		attention_bias = lax.select(
 			attention_mask > 0,
 			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -1025,6 +1024,12 @@ class FlaxMistralModule(nn.Module):
 		)
 
 
+@register_module(
+	"base-module",
+	config=MistralConfig,
+	model_type="mistral",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxMistralModel(FlaxMistralPretrainedModel):
 	module_class = FlaxMistralModule
 
@@ -1137,8 +1142,6 @@ class FlaxMistralForCausalLMModule(nn.Module):
 		else:
 			lm_logits = self.lm_head(hidden_states)
 
-		
-
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
 
@@ -1149,6 +1152,12 @@ class FlaxMistralForCausalLMModule(nn.Module):
 		)
 
 
+@register_module(
+	"causal-language-model",
+	config=MistralConfig,
+	model_type="mistral",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxMistralForCausalLM(FlaxMistralPretrainedModel):
 	module_class = FlaxMistralForCausalLMModule
 
@@ -1513,7 +1522,7 @@ class FlaxVisionMistralForCausalLMModule(nn.Module):
 	precision: Optional[Union[jax.lax.Precision, str]] = None
 
 	def setup(self):
-		self.model = FlaxVisionMistralForCausalLMModule(
+		self.model = FlaxVisionMistralModule(
 			self.config,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
@@ -1627,6 +1636,12 @@ class FlaxVisionMistralForCausalLMModule(nn.Module):
 			raise ValueError(f"Invalid sample_mode: {self.config.sample_mode}")
 
 
+@register_module(
+	"vision-language-model",
+	config=VisionMistralConfig,
+	model_type="mistral",
+	embedding_layer_names=["embed_vision", "embed_tokens"],
+)
 class FlaxVisionMistralForCausalLM(FlaxVisionMistralPreTrainedModel):
 	module_class = FlaxVisionMistralForCausalLMModule
 

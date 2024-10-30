@@ -30,6 +30,7 @@ from jax.sharding import PartitionSpec
 
 from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.common import RMSNorm
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
 	FlaxAttentionModule,
@@ -1045,7 +1046,12 @@ class FlaxOpenELMPretrainedModel(EDPretrainedModel):
 
 		return outputs
 
-
+@register_module(
+	"base-module",
+	config=OpenELMConfig,
+	model_type="openelm",
+	embedding_layer_names=["token_embeddings"],
+)
 class FlaxOpenELMModel(FlaxOpenELMPretrainedModel):
 	config_class = OpenELMConfig
 	module_class = FlaxOpenELMModule
@@ -1154,6 +1160,12 @@ class FlaxOpenELMForCausalLMModule(nn.Module):
 		)
 
 
+@register_module(
+	"causal-language-model",
+	config=OpenELMConfig,
+	model_type="openelm",
+	embedding_layer_names=["token_embeddings"],
+)
 class FlaxOpenELMForCausalLM(FlaxOpenELMPretrainedModel):
 	module_class = FlaxOpenELMForCausalLMModule
 

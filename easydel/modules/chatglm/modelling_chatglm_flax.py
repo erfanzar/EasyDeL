@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -44,6 +43,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.factory import register_module
 
 
 def flatten_axes(a: Array, start: int = 0, end: int = -1) -> Array:
@@ -564,7 +564,6 @@ class FlaxChatGLMAttention(FlaxAttentionModule):
 			key_layer, value_layer, attention_mask = self._concatenate_to_cache(
 				key_layer, value_layer, query_layer, attention_mask
 			)
-
 
 		attn_output = self.core_attention(
 			query_layer, key_layer, value_layer, attention_mask, causal_mask
@@ -1236,6 +1235,12 @@ class FlaxChatGLMTransformer(nn.Module):
 		return hidden_states, all_hidden_states, all_self_attentions
 
 
+@register_module(
+	"base-module",
+	config=ChatGLMConfig,
+	model_type="glm",
+	embedding_layer_names=["embedding"],
+)
 class FlaxChatGLMModel(nn.Module):
 	config: ChatGLMConfig
 	dtype: jnp.dtype = jnp.float32

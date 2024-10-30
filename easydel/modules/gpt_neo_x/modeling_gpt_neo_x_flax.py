@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -39,6 +38,7 @@ from easydel.modules.gpt_neo_x.gpt_neo_x_configuration import (
 from easydel.modules.gpt_neo_x.kernels import gptneox_mlp_pallas
 from easydel.modules.modeling_flax_outputs import FlaxBaseModelOutput
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.factory import register_module
 
 
 def precompute_freqs_cis(
@@ -372,6 +372,12 @@ class FlaxGPTNeoXPretrainedModel(EDPretrainedModel):
 		return model_kwargs
 
 
+@register_module(
+	"base-module",
+	config=GPTNeoXConfig,
+	model_type="gpt_neox",
+	embedding_layer_names=["wte"],
+)
 class FlaxGPTNeoXModel(FlaxGPTNeoXPretrainedModel):
 	module_class = FlaxGPTNeoXModule
 
@@ -404,6 +410,12 @@ class FlaxGPTNeoXForCausalLMModule(nn.Module):
 		return self.lm_head(pred)
 
 
+@register_module(
+	"causal-language-model",
+	config=GPTNeoXConfig,
+	model_type="gpt_neox",
+	embedding_layer_names=["wte"],
+)
 class FlaxGPTNeoXForCausalLM(FlaxGPTNeoXPretrainedModel):
 	module_class = FlaxGPTNeoXForCausalLMModule
 

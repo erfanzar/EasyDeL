@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,7 +29,7 @@ from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import get_logger
 from easydel.modules.attention_module import FlexibleAttentionModule
-from easydel.modules.common import RMSNorm
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	FlaxAttentionModule,
 	apply_rotary_pos_emb,
@@ -49,6 +48,33 @@ from easydel.modules.xerxes.kernels import xerxes_mlp_pallas
 from easydel.modules.xerxes.xerxes_configuration import XerxesConfig as XerxesConfig
 
 logger = get_logger(__name__)
+
+
+class RMSNorm(nn.Module):
+	dim: int
+	eps: float = 1e-6
+	dtype: jnp.dtype = jnp.float32
+	param_dtype: jnp.dtype = jnp.float32
+
+	def setup(self) -> None:
+		self.weight = self.param(
+			"kernel",
+			nn.initializers.ones,
+			(self.dim,),
+			self.param_dtype,
+		)
+
+	def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
+		return x / lax.sqrt(
+			jnp.square(x.astype(jnp.float32)).mean(-1, keepdims=True) + self.eps
+		)
+
+	def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+		x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
+		output = self._norm(x).astype(self.dtype)
+
+		weight = self.weight.astype(self.dtype)
+		return weight * output
 
 
 class FlaxXerxesRotaryEmbedding(nn.Module):
@@ -110,7 +136,7 @@ class FlaxXerxesAttention(FlaxAttentionModule):
 			force_float32_tpu=True,
 			attn_mechanism=self.config.attn_mechanism,
 			mesh=self.config.mesh,
-			sm_scale=1 / self.config.softmax_scale,
+			sm_scale=self.head_dim**-0.5,
 			base_config=self.config,
 		)
 
@@ -251,7 +277,7 @@ class FlaxXerxesAttention(FlaxAttentionModule):
 				value_states,
 				query_states,
 				attention_mask,
-			) 
+			)
 
 		if bool((self.layer_idx % 2) == 0):
 			attention_mask = jnp.logical_and(
@@ -902,6 +928,12 @@ class FlaxXerxesModule(nn.Module):
 		)
 
 
+@register_module(
+	"base-module",
+	config=XerxesConfig,
+	model_type="xerxes",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxXerxesModel(FlaxXerxesPreTrainedModel):
 	module_class = FlaxXerxesModule
 
@@ -997,7 +1029,7 @@ class FlaxXerxesForCausalLMModule(nn.Module):
 			lm_logits = self.lm_head(hidden_states)
 
 		lm_logits = jax.nn.tanh(lm_logits / 30.0) * 30.0
-		
+
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
 
@@ -1008,6 +1040,12 @@ class FlaxXerxesForCausalLMModule(nn.Module):
 		)
 
 
+@register_module(
+	"causal-language-model",
+	config=XerxesConfig,
+	model_type="xerxes",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxXerxesForCausalLM(FlaxXerxesPreTrainedModel):
 	module_class = FlaxXerxesForCausalLMModule
 

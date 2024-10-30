@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,6 +31,7 @@ from jax.sharding import PartitionSpec
 
 from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.common import RMSNorm as RMSNorm
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
 	FlaxAttentionModule,
@@ -98,7 +98,10 @@ class FlaxPhiMoEBlockSparseTop2MLP(nn.Module):
 		hidden_states: Array,
 		deterministic: bool = False,  # noqa
 	) -> Array:
-		if self.config.hardware_abstraction and self.w1.variables.get("params", None) is not None:
+		if (
+			self.config.hardware_abstraction
+			and self.w1.variables.get("params", None) is not None
+		):
 			return jax.vmap(
 				functools.partial(
 					phimoe_mlp_pallas,
@@ -317,7 +320,7 @@ class FlaxPhiMoEAttention(FlaxAttentionModule):
 				query_states,
 				attention_mask,
 			)
- 
+
 		attention_bias = lax.select(
 			attention_mask > 0,
 			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -969,8 +972,6 @@ class FlaxPhiMoeForCausalLMModule(nn.Module):
 		else:
 			lm_logits = self.lm_head(outputs.last_hidden_state)
 
-		
-
 		if not return_dict:
 			return (lm_logits,) + outputs[0:]
 
@@ -1193,9 +1194,23 @@ class FlaxPhiPreTrainedModel(EDPretrainedModel):
 		return outputs
 
 
+@register_module(
+	"base-module",
+	config=PhiMoeConfig,
+	model_type="phimoe",
+	embedding_layer_names=["embed_tokens"],
+	layernorm_names=["norm", "input_layernorm", "post_attention_layernorm"],
+)
 class FlaxPhiMoeModel(FlaxPhiPreTrainedModel):
 	module_class = FlaxPhiMoeModule
 
 
+@register_module(
+	"causal-language-model",
+	config=PhiMoeConfig,
+	model_type="phimoe",
+	embedding_layer_names=["embed_tokens"],
+	layernorm_names=["norm", "input_layernorm", "post_attention_layernorm"],
+)
 class FlaxPhiMoeForCausalLM(FlaxPhiPreTrainedModel):
 	module_class = FlaxPhiMoeForCausalLMModule

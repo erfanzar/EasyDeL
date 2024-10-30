@@ -20,7 +20,6 @@ import warnings
 from typing import (
 	Any,
 	Callable,
-	Dict,
 	List,
 	Literal,
 	Mapping,
@@ -38,7 +37,6 @@ from flax.traverse_util import unflatten_dict
 from jax.sharding import PartitionSpec
 
 from easydel.etils.easystate import EasyDeLState
-from easydel.etils.errors import EasyDeLRuntimeError
 from easydel.etils.etils import get_logger
 from easydel.etils.partition_module import PartitionAxis
 from easydel.modules.modeling_utils import (
@@ -47,255 +45,14 @@ from easydel.modules.modeling_utils import (
 )
 from easydel.transform.parameters_transformation import torch_dict_to_easydel_params
 from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN
+from easydel.modules.factory import registry
 
 logger = get_logger(name=__name__)
 
-CAUSAL_LANGUAGE_MODELS_CONFIG: Dict[str, Tuple[str, str, str, Dict[str, Any]]] = {
-	"llama": (
-		"easydel.modules.llama",
-		"LlamaConfig",
-		"FlaxLlamaForCausalLM",
-		{"embedding_layer_names": ["embed_tokens"]},
-	),
-	"gemma": (
-		"easydel.modules.gemma",
-		"GemmaConfig",
-		"FlaxGemmaForCausalLM",
-		{"embedding_layer_names": ["embed_tokens"]},
-	),
-	"gemma2": (
-		"easydel.modules.gemma2",
-		"Gemma2Config",
-		"FlaxGemma2ForCausalLM",
-		{"embedding_layer_names": ["embed_tokens"]},
-	),
-	"falcon": (
-		"easydel.modules.falcon",
-		"FalconConfig",
-		"FlaxFalconForCausalLM",
-		{
-			"embedding_layer_names": ["word_embeddings"],
-			"layer_norm_names": [
-				"input_layernorm",
-				"ln_f",
-				"ln_attn",
-				"ln_mlp",
-				"post_attention_layernorm",
-			],
-		},
-	),
-	"mpt": (
-		"easydel.modules.mosaic_mpt",
-		"MptConfig",
-		"FlaxMptForCausalLM",
-		{
-			"embedding_layer_names": ["wte"],
-			"layer_norm_names": ["norm_1", "norm_2", "norm_f"],
-		},
-	),
-	"mistral": (
-		"easydel.modules.mistral",
-		"MistralConfig",
-		"FlaxMistralForCausalLM",
-		{"embedding_layer_names": ["embed_tokens"]},
-	),
-	"exaone": (
-		"easydel.modules.exaone",
-		"ExaoneConfig",
-		"FlaxExaoneForCausalLM",
-		{"embedding_layer_names": ["wte"]},
-	),
-	"gptj": (
-		"easydel.modules.gpt_j",
-		"GPTJConfig",
-		"FlaxGPTJForCausalLM",
-		{"embedding_layer_names": "wte", "layer_norm_names": ["ln_1", "ln_2", "ln_f"]},
-	),
-	"gpt_neox": (
-		"easydel.modules.gpt_neo_x",
-		"GPTNeoXConfig",
-		"FlaxGPTNeoXForCausalLM",
-		{"embedding_layer_names": "wte"},
-	),
-	"palm": (
-		"easydel.modules.palm",
-		"PalmConfig",
-		"FlaxPalmForCausalLM",
-		{"embedding_layer_names": "wte"},
-	),
-	"lt": (
-		"easydel.modules.lucid_transformer",
-		"FlaxLTConfig",
-		"FlaxLTForCausalLM",
-		{"embedding_layer_names": "wte"},
-	),
-	"gpt2": (
-		"easydel.modules.gpt2",
-		"GPT2Config",
-		"FlaxGPT2LMHeadModel",
-		{
-			"embedding_layer_names": ["wte", "wpe"],
-			"layer_norm_names": ["ln_1", "ln_2", "ln_f"],
-		},
-	),
-	"mixtral": (
-		"easydel.modules.mixtral",
-		"MixtralConfig",
-		"FlaxMixtralForCausalLM",
-		{"embedding_layer_names": ["embed_tokens"]},
-	),
-	"phi": (
-		"easydel.modules.phi",
-		"PhiConfig",
-		"FlaxPhiForCausalLM",
-		{
-			"embedding_layer_names": ["embed_tokens"],
-			"layer_norm_names": [
-				"input_layernorm",
-				"final_layernorm",
-				"q_layernorm",
-				"k_layernorm",
-			],
-		},
-	),
-	"qwen": (
-		"easydel.modules.qwen1",
-		"Qwen1Config",
-		"FlaxQwen1ForCausalLM",
-		{"embedding_layer_names": ["wte"]},
-	),
-	"qwen2": (
-		"easydel.modules.qwen2",
-		"Qwen2Config",
-		"FlaxQwen2ForCausalLM",
-		{"embedding_layer_names": ["embed_tokens"]},
-	),
-	"stablelm": (
-		"easydel.modules.stablelm",
-		"StableLmConfig",
-		"FlaxStableLmForCausalLM",
-		{
-			"embedding_layer_names": ["embed_tokens"],
-			"layer_norm_names": [
-				"input_layernorm",
-				"post_attention_layernorm",
-				"norm",
-				"norms",
-			],
-		},
-	),
-	"rwkv": (
-		"easydel.modules.rwkv",
-		"RwkvConfig",
-		"FlaxRwkvForCausalLM",
-		{
-			"embedding_layer_names": ["embeddings"],
-			"layer_norm_names": ["ln_out", "ln2", "ln1", "pre_ln"],
-			"rnn_based_or_rwkv": True,
-			"lm_head_name": "head",
-		},
-	),
-	"mamba": (
-		"easydel.modules.mamba",
-		"MambaConfig",
-		"FlaxMambaForCausalLM",
-		{"embedding_layer_names": ["embeddings"]},
-	),
-	"mamba2": (
-		"easydel.modules.mamba2",
-		"Mamba2Config",
-		"FlaxMamba2ForCausalLM",
-		{"embedding_layer_names": ["embeddings"]},
-	),
-	"grok-1": (
-		"easydel.modules.grok_1",
-		"Grok1Config",
-		"FlaxGrok1ForCausalLM",
-		{"embedding_layer_names": ["embed_tokens"]},
-	),
-	"internlm2": (
-		"easydel.modules.internlm2",
-		"InternLM2Config",
-		"FlaxInternLM2ForCausalLM",
-		{"embedding_layer_names": ["tok_embeddings"]},
-	),
-	"qwen2_moe": (
-		"easydel.modules.qwen2_moe",
-		"Qwen2MoeConfig",
-		"FlaxQwen2MoeForCausalLM",
-		{"embedding_layer_names": ["embed_tokens"]},
-	),
-	"cohere": (
-		"easydel.modules.cohere",
-		"CohereConfig",
-		"FlaxCohereForCausalLM",
-		{"embedding_layer_names": ["embed_tokens"]},
-	),
-	"dbrx": (
-		"easydel.modules.dbrx",
-		"DbrxConfig",
-		"FlaxDbrxForCausalLM",
-		{
-			"embedding_layer_names": ["wte"],
-			"layer_norm_names": ["norm_1", "norm_2", "norm_f"],
-		},
-	),
-	"phi3": (
-		"easydel.modules.phi3",
-		"Phi3Config",
-		"FlaxPhi3ForCausalLM",
-		{"embedding_layer_names": ["embed_tokens"]},
-	),
-	"phimoe": (
-		"easydel.modules.phimoe",
-		"PhiMoeConfig",
-		"FlaxPhiMoeForCausalLM",
-		{
-			"embedding_layer_names": ["embed_tokens"],
-			"layer_norm_names": [
-				"norm",
-				"input_layernorm",
-				"post_attention_layernorm",
-			],
-		},
-	),
-	"arctic": (
-		"easydel.modules.arctic",
-		"ArcticConfig",
-		"FlaxArcticForCausalLM",
-		{"embedding_layer_names": ["embed_tokens"]},
-	),
-	"openelm": (
-		"easydel.modules.openelm",
-		"OpenELMConfig",
-		"FlaxOpenELMForCausalLM",
-		{"embedding_layer_names": ["token_embeddings"]},
-	),
-	"deepseek_v2": (
-		"easydel.modules.deepseek_v2",
-		"DeepseekV2Config",
-		"FlaxDeepseekV2ForCausalLM",
-		{"embedding_layer_names": ["embed_tokens"]},
-	),
-	"olmo": (
-		"easydel.modules.olmo",
-		"OlmoConfig",
-		"FlaxOlmoForCausalLM",
-		{"embedding_layer_names": ["embed_tokens"]},
-	),
-	"xerxes": (
-		"easydel.modules.xerxes",
-		"XerxesConfig",
-		"FlaxXerxesForCausalLM",
-		{"embedding_layer_names": ["embed_tokens"]},
-	),
-}
-
-AUTO_ARC_MAP = {"causal-language-model": CAUSAL_LANGUAGE_MODELS_CONFIG}
-
 
 def get_modules_by_type(
-	model_type: str, arc_type: str = "causal-language-model"
+	model_type: str,
+	task_type: str = "causal-language-model",
 ) -> Tuple[
 	Type[EDPretrainedConfig],
 	Type[EDPretrainedModel] | Any,
@@ -307,24 +64,18 @@ def get_modules_by_type(
 	    2. The Flax Model class for the model type specified (e.g., FlaxLlamaForCausalLM, FlaxFalconForCausalLM)
 	    3. A function to convert a HuggingFace pretrained checkpoint into an easydel checkpoint
 	"""
-	arc_config = AUTO_ARC_MAP[arc_type]
-	if model_type not in arc_config:
-		raise EasyDeLRuntimeError(
-			f"Model Type ({model_type}) is not supported or is not found"
-		)
-
-	module_path, config_class_name, model_class_name, partial_kwargs = arc_config[
-		model_type
-	]
-
-	module = __import__(module_path, fromlist=[config_class_name, model_class_name])
-	config_class = getattr(module, config_class_name)
-	model_class = getattr(module, model_class_name)
-
+	registred_module = registry.get_module_registration(
+		task_type=task_type, model_type=model_type
+	)
 	return (
-		config_class,
-		model_class,
-		functools.partial(torch_dict_to_easydel_params, **partial_kwargs),
+		registred_module.config,
+		registred_module.module,
+		functools.partial(
+			torch_dict_to_easydel_params,
+			embedding_layer_names=registred_module.embedding_layer_names,
+			layernorm_names=registred_module.layernorm_names,
+			rnn_based_or_rwkv=registred_module.rnn_based_or_rwkv,
+		),
 	)
 
 
@@ -554,7 +305,7 @@ class AutoEasyDeLModelForCausalLM:
 		)
 		model_type: str = config.model_type
 
-		cfg, module, trf = get_modules_by_type(model_type)
+		config_class, module, transform_function = get_modules_by_type(model_type)
 
 		logger.debug(f"Downloading model weights from {pretrained_model_name_or_path}")
 		model = AutoModelForCausalLM.from_pretrained(
@@ -566,7 +317,7 @@ class AutoEasyDeLModelForCausalLM:
 			print(
 				f"PyTorch - HF Model contains {sum(p.numel() for p in model.parameters()) / 1e9} Billion Parameters"
 			)
-		cfg = cfg.from_pretrained(pretrained_model_name_or_path)
+		config_class = config_class.from_pretrained(pretrained_model_name_or_path)
 		state_dict = model.state_dict()
 
 		# Clear and collect memory after deleting the model
@@ -574,9 +325,9 @@ class AutoEasyDeLModelForCausalLM:
 		_clear()
 
 		logger.debug("adding model basic EasyDeL configurations.")
-		if hasattr(cfg, "add_jax_args"):
-			cfg.add_jax_args()
-		cfg.add_basic_configurations(
+		if hasattr(config_class, "add_jax_args"):
+			config_class.add_jax_args()
+		config_class.add_basic_configurations(
 			axis_dims=sharding_axis_dims,
 			axis_names=sharding_axis_names,
 			partition_axis=partition_axis,
@@ -586,10 +337,10 @@ class AutoEasyDeLModelForCausalLM:
 		)
 		if config_kwargs is not None:
 			for k, v in config_kwargs.items():
-				setattr(cfg, k, v)
+				setattr(config_class, k, v)
 		logger.debug("creating easydel model")
 		ed_model = module(
-			config=cfg,
+			config=config_class,
 			_do_init=False,
 			dtype=dtype,
 			param_dtype=param_dtype,
@@ -650,7 +401,7 @@ class AutoEasyDeLModelForCausalLM:
 				stacklevel=1,
 			)
 		uses_tie_word_embedding = getattr(config, "tie_word_embeddings", False)
-		params = trf(
+		params = transform_function(
 			state_dict,
 			config=config,
 			device=device,
@@ -846,11 +597,11 @@ class AutoEasyDeLConfig:
 		config = cls_main.from_pretrained(pretrained_model_name_or_path)
 		model_type: str = config.model_type
 
-		cfg, module, trf = get_modules_by_type(model_type)
-		cfg = cfg.from_pretrained(pretrained_model_name_or_path)
-		if hasattr(cfg, "add_jax_args"):
-			cfg.add_jax_args()
-		cfg.add_basic_configurations(
+		config_class, module, transform_function = get_modules_by_type(model_type)
+		config = config_class.from_pretrained(pretrained_model_name_or_path)
+		if hasattr(config, "add_jax_args"):
+			config.add_jax_args()
+		config.add_basic_configurations(
 			axis_dims=sharding_axis_dims,
 			axis_names=sharding_axis_names,
 			partition_axis=partition_axis,
@@ -858,8 +609,10 @@ class AutoEasyDeLConfig:
 			platform=platform,
 			shard_attention_computation=shard_attention_computation,
 		)
+		for k, v in kwargs.items():
+			setattr(config, k, v)
 
-		return cfg
+		return config
 
 
 class AutoShardAndGatherFunctions:

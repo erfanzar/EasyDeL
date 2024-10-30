@@ -50,6 +50,7 @@ from easydel.modules.flax_modeling_utils import (
 from easydel.modules.mamba.mamba_configuration import MambaConfig as MambaConfig
 from easydel.modules.modeling_flax_outputs import FlaxBaseModelOutput
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.factory import register_module
 
 
 def init_to_value(x, dtype):
@@ -985,10 +986,22 @@ class FlaxMambaPretrainedModel(EDPretrainedModel):
 		)
 
 
+@register_module(
+	"base-module",
+	config=MambaConfig,
+	model_type="mamba",
+	embedding_layer_names=["embeddings"],
+)
 class FlaxMambaModel(FlaxMambaPretrainedModel):
 	module_class = FlaxMambaModule
 
 
+@register_module(
+	"causal-language-model",
+	config=MambaConfig,
+	model_type="mamba",
+	embedding_layer_names=["embeddings"],
+)
 class FlaxMambaForCausalLM(FlaxMambaPretrainedModel):
 	module_class = FlaxMambaForCausalLMModule
 
@@ -1000,4 +1013,3 @@ class FlaxMambaForCausalLM(FlaxMambaPretrainedModel):
 
 	def prepare_inputs_for_generation(self, input_ids, max_length, **kwargs):
 		return {"cache_params": kwargs.get("cache_params", None)}
- 

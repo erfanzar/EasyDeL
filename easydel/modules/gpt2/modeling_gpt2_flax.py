@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -56,6 +55,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutputWithCrossAttentions,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.factory import register_module
 
 
 class FlaxConv1D(nn.Module):
@@ -790,6 +790,13 @@ class FlaxGPT2Module(nn.Module):
 		)
 
 
+@register_module(
+	"base-module",
+	config=GPT2Config,
+	model_type="gpt2",
+	embedding_layer_names=["wte", "wpe"],
+	layernorm_names=["ln_1", "ln_2", "ln_f"],
+)
 class FlaxGPT2Model(FlaxGPT2PreTrainedModel):
 	module_class = FlaxGPT2Module
 
@@ -873,6 +880,13 @@ class FlaxGPT2LMHeadModule(nn.Module):
 		)
 
 
+@register_module(
+	"causal-language-model",
+	config=GPT2Config,
+	model_type="gpt2",
+	embedding_layer_names=["wte", "wpe"],
+	layernorm_names=["ln_1", "ln_2", "ln_f"],
+)
 class FlaxGPT2LMHeadModel(FlaxGPT2PreTrainedModel):
 	module_class = FlaxGPT2LMHeadModule
 

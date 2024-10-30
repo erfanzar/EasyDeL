@@ -33,6 +33,7 @@ from transformers import FlaxWhisperTimeStampLogitsProcessor
 from easydel.modules.attention_module import FlexibleAttentionModule
 
 # easydel.modules
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
 	FlaxAttentionModule,
@@ -1184,6 +1185,18 @@ class FlaxWhisperPreTrainedModel(EDPretrainedModel):
 		)
 
 
+@register_module(
+	"base-module",
+	config=WhisperConfig,
+	model_type="whisper",
+	embedding_layer_names=["embed_positions", "embed_tokens"],
+	layernorm_names=[
+		"self_attn_layer_norm",
+		"final_layer_norm",
+		"encoder_attn_layer_norm",
+		"layer_norm",
+	],
+)
 class FlaxWhisperModel(FlaxWhisperPreTrainedModel):
 	config: WhisperConfig
 	dtype: jnp.dtype = jnp.float32
@@ -1273,6 +1286,18 @@ class FlaxWhisperForConditionalGenerationModule(nn.Module):
 		)
 
 
+@register_module(
+	"conditional-generation",
+	config=WhisperConfig,
+	model_type="whisper",
+	embedding_layer_names=["embed_positions", "embed_tokens"],
+	layernorm_names=[
+		"self_attn_layer_norm",
+		"final_layer_norm",
+		"encoder_attn_layer_norm",
+		"layer_norm",
+	],
+)
 class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
 	module_class = FlaxWhisperForConditionalGenerationModule
 	dtype: jnp.dtype = jnp.float32
@@ -1613,7 +1638,18 @@ class FlaxWhisperForAudioClassificationModule(nn.Module):
 			attentions=encoder_outputs.attentions,
 		)
 
-
+@register_module(
+	"audio-classification",
+	config=WhisperConfig,
+	model_type="whisper",
+	embedding_layer_names=["embed_positions", "embed_tokens"],
+	layernorm_names=[
+		"self_attn_layer_norm",
+		"final_layer_norm",
+		"encoder_attn_layer_norm",
+		"layer_norm",
+	],
+)
 class FlaxWhisperForAudioClassification(FlaxWhisperPreTrainedModel):
 	module_class = FlaxWhisperForAudioClassificationModule
 	dtype: jnp.dtype = jnp.float32

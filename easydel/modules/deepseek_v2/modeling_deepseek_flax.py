@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +16,7 @@ import functools
 import math
 import typing
 from typing import Optional, Tuple, Union
+import warnings
 
 import chex
 import flax
@@ -51,6 +51,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxMaskedLMOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.factory import register_module
 
 re_mat = nn_partitioning.remat
 
@@ -189,14 +190,16 @@ def rotate_half(x):
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+	print("J", sin.shape, cos.shape)
 	cos = jnp.expand_dims(cos[position_ids], unsqueeze_dim)
 	sin = jnp.expand_dims(sin[position_ids], unsqueeze_dim)
+	print("J", sin.shape, cos.shape)
 
 	b, h, s, d = q.shape
-	q = q.view(b, h, s, d // 2, 2).transpose(0, 1, 2, 4, 3).reshape(b, h, s, d)
+	q = q.reshape(b, h, s, d // 2, 2).transpose(0, 1, 2, 4, 3).reshape(b, h, s, d)
 
 	b, h, s, d = k.shape
-	k = k.view(b, h, s, d // 2, 2).transpose(0, 1, 2, 4, 3).reshape(b, h, s, d)
+	k = k.reshape(b, h, s, d // 2, 2).transpose(0, 1, 2, 4, 3).reshape(b, h, s, d)
 
 	q_embed = (q * cos) + (rotate_half(q) * sin)
 	k_embed = (k * cos) + (rotate_half(k) * sin)
@@ -494,26 +497,26 @@ class FlaxDeepseekV2Attention(FlaxAttentionModule):
 
 		self.o_proj = dense_class(self.hidden_size, use_bias=config.attention_bias)
 
-		softmax_scale = self.q_head_dim ** (-0.5)
+		softmax_scale = self.q_head_dim**-0.5
 		if self.config.rope_scaling is not None:
 			mscale_all_dim = self.config.rope_scaling.get("mscale_all_dim", 0)
 			scaling_factor = self.config.rope_scaling["factor"]
 			if mscale_all_dim:
 				mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
 				softmax_scale = self.softmax_scale * mscale * mscale
-
 		self.attention_performer = FlexibleAttentionModule(
 			num_q_heads=self.config.num_attention_heads,
-			num_kv_heads=self.config.num_key_value_heads,
+			num_kv_heads=self.config.num_attention_heads,
 			attention_dropout=self.config.attention_dropout,
 			head_dims=self.q_head_dim,
 			precision=self.precision,
 			force_float32_tpu=True,
-			attn_mechanism=self.config.attn_mechanism,
+			attn_mechanism="vanilla",
 			mesh=self.config.mesh,
 			sm_scale=softmax_scale,
 			axis_name=self.config.attention_axis_name,
 			base_config=self.config,
+			_do_check=False,
 		)
 
 	def __call__(
@@ -549,46 +552,15 @@ class FlaxDeepseekV2Attention(FlaxAttentionModule):
 		bsz, q_len, _ = hidden_states.shape
 
 		q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-		q = q.view(
-			bsz,
-			q_len,
-			self.num_heads,
-			self.q_head_dim,
-		).transpose(0, 2, 1, 3)
-		q_nope = q[
-			:,
-			:,
-			:,
-			: self.qk_nope_head_dim,
-		]
-		q_pe = q[
-			:,
-			:,
-			:,
-			self.qk_nope_head_dim :,
-		]
-
+		q = q.reshape(bsz, q_len, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
+		# Split into nope and pe parts
+		q_nope, q_pe = q[..., : self.qk_nope_head_dim], q[..., self.qk_nope_head_dim :]
+		# Key and Value projections with MQA (Multi-Query Attention) considerations
 		compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+		k_pe = compressed_kv[..., self.kv_lora_rank :]
+		compressed_kv = compressed_kv[..., : self.kv_lora_rank]
 
-		k_pe = compressed_kv[
-			:,
-			:,
-			:,
-			self.kv_lora_rank : self.kv_lora_rank + self.qk_rope_head_dim,
-		]
-		compressed_kv = compressed_kv[
-			:,
-			:,
-			:,
-			: self.kv_lora_rank,
-		]
-
-		k_pe = k_pe.reshape(
-			bsz,
-			q_len,
-			1,
-			self.qk_rope_head_dim,
-		).transpose(0, 2, 1, 3)
+		k_pe = k_pe.reshape(bsz, q_len, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
 		kv = (
 			self.kv_b_proj(
 				self.kv_a_layernorm(compressed_kv),
@@ -597,60 +569,28 @@ class FlaxDeepseekV2Attention(FlaxAttentionModule):
 			.transpose(0, 2, 1, 3)
 		)
 
-		k_nope = kv[
-			:,
-			:,
-			:,
-			: self.qk_nope_head_dim,
-		]
+		k_nope = kv[..., : self.qk_nope_head_dim]
 		value_states = kv[
-			:,
-			:,
-			:,
-			self.qk_nope_head_dim : self.qk_nope_head_dim + self.v_head_dim,
+			..., self.qk_nope_head_dim : self.qk_nope_head_dim + self.v_head_dim
 		]
 
 		sin, cos = frequencies
 
-		q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
-
-		query_states = k_pe.new_empty(
-			bsz,
-			self.num_heads,
-			q_len,
-			self.q_head_dim,
+		q_pe, k_pe = apply_rotary_pos_emb(
+			q=q_pe,
+			k=k_pe,
+			cos=cos,
+			sin=sin,
+			position_ids=position_ids,
 		)
-		query_states[
-			:,
-			:,
-			:,
-			: self.qk_nope_head_dim,
-		] = q_nope
-		query_states[
-			:,
-			:,
-			:,
-			self.qk_nope_head_dim :,
-		] = q_pe
 
-		key_states = k_pe.new_empty(
-			bsz,
-			self.num_heads,
-			q_len,
-			self.q_head_dim,
-		)
-		key_states[
-			:,
-			:,
-			:,
-			: self.qk_nope_head_dim,
-		] = k_nope
-		key_states[
-			:,
-			:,
-			:,
-			self.qk_nope_head_dim :,
-		] = k_pe
+		query_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), q_pe.dtype)
+		query_states.at[..., : self.qk_nope_head_dim].set(q_nope)
+		query_states.at[..., self.qk_nope_head_dim :].set(q_pe)
+
+		key_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), k_pe.dtype)
+		key_states.at[..., : self.qk_nope_head_dim].set(k_nope)
+		key_states.at[..., self.qk_nope_head_dim :].set(k_pe)
 
 		query_states = query_states.transpose(0, 2, 1, 3)
 		key_states = key_states.transpose(0, 2, 1, 3)
@@ -712,7 +652,9 @@ class FlaxDeepseekV2Attention(FlaxAttentionModule):
 			causal_mask=causal_mask,
 		)
 
-		attn_output = self._merge_heads(attentions.attention_outputs)
+		attn_output = attentions.attention_outputs.reshape(
+			bsz, q_len, self.num_heads * self.v_head_dim
+		)
 		if self.config.shard_attention_computation:
 			attn_output = with_sharding_constraint(
 				attn_output,
@@ -895,6 +837,8 @@ class FlaxDeepseekV2DecoratorCollection(nn.Module):
 	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self) -> None:
+		if self.config.attn_mechanism != "vanilla":
+			warnings.warn("Deepseek2 only support vanilla attention", stacklevel=3)
 		self.layers = [
 			FlaxDeepseekV2DecoderLayer(
 				config=self.config,
@@ -1038,7 +982,7 @@ class FlaxDeepseekV2Module(nn.Module):
 				}
 				initial_rope_kwargs["scaling_factor"] = self.config.rope_scaling["factor"]
 		self.frequencies = init_deepseek_rotary_embedding(
-			dim=self.config.hidden_size // self.config.num_attention_heads,
+			dim=self.config.qk_rope_head_dim,
 			max_position_embeddings=self.config.granted_freq_max_position_embedding,
 			base=self.config.rope_theta,
 			method=method,  # type:ignore
@@ -1221,7 +1165,6 @@ class DeepseekV2PreTrainedModel(EDPretrainedModel):
 			return random_params
 
 	def init_cache(self, batch_size, max_length):
-
 		return super().init_cache(batch_size=batch_size, max_length=max_length)
 
 	def __call__(
@@ -1422,8 +1365,6 @@ class FlaxDeepseekV2ForCausalLMModule(nn.Module):
 		else:
 			lm_logits = self.lm_head(hidden_states)
 
-		
-
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
 
@@ -1434,10 +1375,22 @@ class FlaxDeepseekV2ForCausalLMModule(nn.Module):
 		)
 
 
+@register_module(
+	"base-module",
+	DeepseekV2Config,
+	model_type="deepseek_v2",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxDeepseekV2Model(DeepseekV2PreTrainedModel):
 	module_class = FlaxDeepseekV2Module
 
 
+@register_module(
+	"causal-language-model",
+	DeepseekV2Config,
+	model_type="deepseek_v2",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxDeepseekV2ForCausalLM(DeepseekV2PreTrainedModel):
 	module_class = FlaxDeepseekV2ForCausalLMModule
 

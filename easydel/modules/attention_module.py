@@ -481,10 +481,10 @@ class FlexibleAttentionModule(object):
 
 		assertion_mkv_err = f"""
 				query_states, key_states, value_states and bias shapes must be like
-				query_states Shape : [batch_size, q_seq_len , {self.head_dims=}, {self.head_dims=}]
+				query_states Shape : [batch_size, q_seq_len , {self.num_q_heads=}, {self.head_dims=}]
 				key_states   Shape : [batch_size, kv_seq_len, {self.num_kv_heads=}, {self.head_dims=}]
 				value_states Shape : [batch_size, kv_seq_len, {self.num_kv_heads=}, {self.head_dims=}]
-				bias         Shape : [batch_size, {self.head_dims=}, q_seq_len , kv_seq_len]
+				bias         Shape : [batch_size, {self.num_q_heads=}, q_seq_len , kv_seq_len]
 						"""
 
 		assert query_states.shape == q_shape, assertion_mkv_err + (
@@ -801,6 +801,7 @@ class FlexibleAttentionModule(object):
 			) = self.get_bshd_partition_specs(query_sequence_length)
 		b, qs, qh, d = query_states.shape
 		b, ks, kh, d = key_states.shape
+		*_, vd = value_states.shape
 		with self.mesh:
 			query_states = fjformer.with_sharding_constraint(
 				query_states, query_partitionspec
@@ -864,7 +865,7 @@ class FlexibleAttentionModule(object):
 				attention_weight,
 				value_states,
 				precision=self.precision,
-			).reshape(b, qs, qh, d)
+			).reshape(b, qs, qh, vd)
 			attention = fjformer.with_sharding_constraint(attention, attention_partitionspec)
 			return AttentionOutput(
 				attention_weights=attention_weight, attention_outputs=attention

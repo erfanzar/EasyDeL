@@ -30,6 +30,7 @@ from jax.sharding import PartitionSpec
 from easydel.modules.attention_module import FlexibleAttentionModule
 
 # easydel.modules
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
 	FlaxAttentionModule,
@@ -1222,9 +1223,33 @@ class FlaxStableLmForCausalLMModule(nn.Module):
 		)
 
 
+@register_module(
+	"base-module",
+	config=StableLmConfig,
+	model_type="stablelm",
+	embedding_layer_names=["embed_tokens"],
+	layernorm_names=[
+		"input_layernorm",
+		"post_attention_layernorm",
+		"norm",
+		"norms",
+	],
+)
 class FlaxStableLmModel(FlaxStableLmPreTrainedModel):
 	module_class = FlaxStableLmModule
 
 
+@register_module(
+	"causal-language-model",
+	config=StableLmConfig,
+	model_type="stablelm",
+	embedding_layer_names=["embed_tokens"],
+	layernorm_names=[
+		"input_layernorm",
+		"post_attention_layernorm",
+		"norm",
+		"norms",
+	],
+)
 class FlaxStableLmForCausalLM(FlaxStableLmPreTrainedModel):
 	module_class = FlaxStableLmForCausalLMModule

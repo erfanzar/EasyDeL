@@ -48,6 +48,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.factory import register_module
 
 re_mat = flax.linen.partitioning.remat
 
@@ -721,7 +722,6 @@ class FlaxCoherePreTrainedModel(EDPretrainedModel):
 		"""
 		return super().init_cache(batch_size=batch_size, max_length=max_length)
 
-
 	def __call__(
 		self,
 		input_ids: chex.Array,
@@ -1079,6 +1079,12 @@ class FlaxCohereModule(nn.Module):
 		)
 
 
+@register_module(
+	"base-module",
+	config=CohereConfig,
+	model_type="cohere",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxCohereModel(FlaxCoherePreTrainedModel):
 	module_class = FlaxCohereModule
 
@@ -1198,6 +1204,12 @@ class FlaxCohereForCausalLMModule(nn.Module):
 		)
 
 
+@register_module(
+	"causal-language-model",
+	config=CohereConfig,
+	model_type="cohere",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxCohereForCausalLM(FlaxCoherePreTrainedModel):
 	module_class = FlaxCohereForCausalLMModule
 

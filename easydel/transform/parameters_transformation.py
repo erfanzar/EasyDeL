@@ -90,7 +90,7 @@ def process_tensor(
 	key: str,
 	tensor,
 	embedding_layer_names: set,
-	layer_norm_names: set,
+	layernorm_names: set,
 	rnn_based_or_rwkv: bool,
 	lm_head_name: Optional[str],
 	uses_tie_word_embedding: bool,
@@ -102,7 +102,7 @@ def process_tensor(
 		new_key = key[: -len(".weight")] + ".embedding"
 	elif rnn_based_or_rwkv and ("time_mix_" in key or "time_" in key):
 		tensor = tensor.reshape(-1)
-	elif any(layer_norm in key for layer_norm in layer_norm_names):
+	elif any(layer_norm in key for layer_norm in layernorm_names):
 		new_key = key.replace(".weight", ".scale")
 	elif "weight" in key:
 		if len(tensor.shape) == 2:
@@ -116,6 +116,8 @@ def process_tensor(
 			return None
 	# Convert tensor to JAX array
 	if hasattr(tensor, "cpu"):  # Check if it's a PyTorch tensor
+		if str(tensor.dtype) == "torch.bfloat16":
+			tensor = tensor.float()
 		array = jnp.asarray(tensor.cpu().detach().numpy()).astype(dtype)
 	else:  # Assume it's already a numpy array
 		array = jnp.array(tensor).astype(dtype)
@@ -128,14 +130,14 @@ def torch_dict_to_easydel_params(
 	*,
 	device: Optional[jax.Device] = None,
 	embedding_layer_names: Optional[List[str]] = None,
-	layer_norm_names: Optional[List[str]] = None,
+	layernorm_names: Optional[List[str]] = None,
+	rnn_based_or_rwkv: bool = False,
 	shard_fns: Optional[Mapping[tuple, Callable]] = None,
 	quantization_method: Optional[Literal["nf4", "8bit"]] = None,
 	quantization_platform: Optional[Literal["jax", "triton", "pallas"]] = "jax",
 	block_size: int = 64,
 	params_pattern_selection: Optional[re.Pattern] = None,
 	dtype: jax.numpy.dtype = jax.numpy.float16,
-	rnn_based_or_rwkv: bool = False,
 	verbose: bool = True,
 	remove_state_dict: bool = False,
 	lm_head_name: Optional[str] = None,
@@ -152,7 +154,7 @@ def torch_dict_to_easydel_params(
 	    state_dict: Load the weights from a huggingface model
 	    embedding_layer_names: List[str]: Identify the embedding layer in the huggingface model
 	    device: Determine which device the model will be loaded on
-	    layer_norm_names: Replaces weight or kernel with (scale)
+	    layernorm_names: Replaces weight or kernel with (scale)
 	    shard_fns: Optional[Mapping[tuple, Callable]]: Sharding Function to be used to shard model
 	    quantization_method (Literal["nf4", "8bit"], optional): quantization_method to be used to quantize model weights. Defaults to None.
 	    quantization_platform (Optional[Literal["jax", "triton", "pallas"]], optional): Platform to use for the weight quants. Defaults to None.
@@ -177,7 +179,7 @@ def torch_dict_to_easydel_params(
 		_clear = gc.collect
 
 	embedding_layer_names = set(embedding_layer_names or [])
-	layer_norm_names = set(layer_norm_names or [])
+	layernorm_names = set(layernorm_names or [])
 	quantizer = None
 	if quantization_method is not None:
 		if params_pattern_selection is None:
@@ -204,7 +206,7 @@ def torch_dict_to_easydel_params(
 				key,
 				tensor,
 				embedding_layer_names,
-				layer_norm_names,
+				layernorm_names,
 				rnn_based_or_rwkv,
 				lm_head_name,
 				uses_tie_word_embedding,

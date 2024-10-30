@@ -33,6 +33,7 @@ from jax import lax
 from jax import numpy as jnp
 
 from easydel.modules.attention_module import FlexibleAttentionModule
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
 	FlaxAttentionModule,
@@ -1048,6 +1049,13 @@ class FlaxRobertaModule(nn.Module):
 		)
 
 
+@register_module(
+	"base-module",
+	config=RobertaConfig,
+	model_type="roberta",
+	embedding_layer_names=["embed_tokens"],
+	layernorm_names=["layer_norm", "LayerNorm"],
+)
 class FlaxRobertaModel(FlaxRobertaPreTrainedModel):
 	module_class = FlaxRobertaModule
 
@@ -1178,6 +1186,13 @@ class FlaxRobertaForSequenceClassificationModule(nn.Module):
 		)
 
 
+@register_module(
+	"sequence-classification",
+	config=RobertaConfig,
+	model_type="roberta",
+	embedding_layer_names=["embed_tokens"],
+	layernorm_names=["layer_norm", "LayerNorm"],
+)
 class FlaxRobertaForSequenceClassification(FlaxRobertaPreTrainedModel):
 	module_class = FlaxRobertaForSequenceClassificationModule
 
@@ -1483,6 +1498,13 @@ class FlaxRobertaForCausalLMModule(nn.Module):
 		)
 
 
+@register_module(
+	"causal-language-model",
+	config=RobertaConfig,
+	model_type="roberta",
+	embedding_layer_names=["embed_tokens"],
+	layernorm_names=["layer_norm", "LayerNorm"],
+)
 class FlaxRobertaForCausalLM(FlaxRobertaPreTrainedModel):
 	module_class = FlaxRobertaForCausalLMModule
 

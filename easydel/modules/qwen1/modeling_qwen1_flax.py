@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,6 +31,7 @@ from jax.sharding import PartitionSpec
 
 from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.common import RMSNorm as RMSNorm
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	FlaxAttentionModule,
 	block_wise_ffn,
@@ -164,7 +164,10 @@ class FlaxQwen1MLP(nn.Module):
 
 		x = control_mlp_sharding(x, self.config.partition_axis)
 
-		if self.config.hardware_abstraction and self.w2.variables.get("params", None) is not None:
+		if (
+			self.config.hardware_abstraction
+			and self.w2.variables.get("params", None) is not None
+		):
 			x = jax.vmap(
 				functools.partial(
 					qwen1_mlp_pallas,
@@ -1071,6 +1074,12 @@ class FlaxQwen1Module(nn.Module):
 		)
 
 
+@register_module(
+	"base-module",
+	config=Qwen1Config,
+	model_type="qwen",
+	embedding_layer_names=["wte"],
+)
 class FlaxQwen1Model(FlaxQwen1PreTrainedModel):
 	module_class = FlaxQwen1Module
 
@@ -1173,8 +1182,6 @@ class FlaxQwen1ForCausalLMModule(nn.Module):
 		else:
 			lm_logits = self.lm_head(hidden_states)
 
-		
-
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
 
@@ -1185,6 +1192,12 @@ class FlaxQwen1ForCausalLMModule(nn.Module):
 		)
 
 
+@register_module(
+	"causal-language-model",
+	config=Qwen1Config,
+	model_type="qwen",
+	embedding_layer_names=["wte"],
+)
 class FlaxQwen1ForCausalLM(FlaxQwen1PreTrainedModel):
 	module_class = FlaxQwen1ForCausalLMModule
 
@@ -1302,5 +1315,11 @@ class FlaxQwen1ForSequenceClassificationModule(nn.Module):
 		return (prediction,)
 
 
+@register_module(
+	"sequence-classification",
+	config=Qwen1Config,
+	model_type="qwen",
+	embedding_layer_names=["wte"],
+)
 class FlaxQwen1ForSequenceClassification(FlaxQwen1PreTrainedModel):
 	module_class = FlaxQwen1ForSequenceClassificationModule

@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +24,7 @@ from flax.struct import dataclass
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import numpy as jnp
 
+from easydel.modules.factory import register_module
 from easydel.modules.modeling_flax_outputs import ModelOutput
 from easydel.modules.modeling_utils import EDPretrainedModel
 from easydel.modules.rwkv.rwkv_configuration import RwkvConfig as RwkvConfig
@@ -749,7 +749,7 @@ class FlaxRwkvPretrainedModel(EDPretrainedModel):
 					"doesn't have that attribute, try another generation strategy instead. For the available "
 					"generation strategies, check this doc:"
 					" https://huggingface.co/docs/transformers/en/generation_strategies#decoding-strategies"
-				)
+				) from None
 			else:
 				raise exc
 		return gen_output
@@ -768,9 +768,25 @@ class FlaxRwkvPretrainedModel(EDPretrainedModel):
 		return model_inputs
 
 
+@register_module(
+	"base-module",
+	config=RwkvConfig,
+	model_type="rwkv",
+	embedding_layer_names=["embed_tokens"],
+	layernorm_names=["ln_out", "ln2", "ln1", "pre_ln"],
+	rnn_based_or_rwkv=True,
+)
 class FlaxRwkvModel(FlaxRwkvPretrainedModel):
 	module_class = FlaxRwkvModule
 
 
+@register_module(
+	"causal-language-model",
+	config=RwkvConfig,
+	model_type="rwkv",
+	embedding_layer_names=["embed_tokens"],
+	layernorm_names=["ln_out", "ln2", "ln1", "pre_ln"],
+	rnn_based_or_rwkv=True,
+)
 class FlaxRwkvForCausalLM(FlaxRwkvPretrainedModel):
 	module_class = FlaxRwkvForCausalLMModule

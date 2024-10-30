@@ -47,6 +47,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.factory import register_module
 
 logger = get_logger(__name__)
 
@@ -974,6 +975,12 @@ class FlaxGemma2Module(nn.Module):
 		)
 
 
+@register_module(
+	"base-module",
+	config=Gemma2Config,
+	model_type="gemma2",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxGemma2Model(FlaxGemma2PreTrainedModel):
 	module_class = FlaxGemma2Module
 
@@ -1091,6 +1098,12 @@ class FlaxGemma2ForCausalLMModule(nn.Module):
 		)
 
 
+@register_module(
+	"causal-language-model",
+	config=Gemma2Config,
+	model_type="gemma2",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxGemma2ForCausalLM(FlaxGemma2PreTrainedModel):
 	module_class = FlaxGemma2ForCausalLMModule
 

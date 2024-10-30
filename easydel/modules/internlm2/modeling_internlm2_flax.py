@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -54,6 +53,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxSequenceClassifierOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.factory import register_module
 
 
 class FlaxInternLM2Embedding(nn.Module):
@@ -251,7 +251,6 @@ class FlaxInternLM2Attention(FlaxAttentionModule):
 				query_states,
 				attention_mask,
 			)
-			 
 
 		attention_bias = lax.select(
 			attention_mask > 0,
@@ -337,7 +336,10 @@ class FlaxInternLM2MLP(nn.Module):
 
 		x = control_mlp_sharding(x, self.config.partition_axis)
 
-		if self.config.hardware_abstraction and self.w2.variables.get("params", None) is not None:
+		if (
+			self.config.hardware_abstraction
+			and self.w2.variables.get("params", None) is not None
+		):
 			return jax.vmap(
 				functools.partial(
 					internlm2_mlp_pallas,
@@ -970,6 +972,12 @@ class FlaxInternLM2Module(nn.Module):
 		)
 
 
+@register_module(
+	"base-module",
+	config=InternLM2Config,
+	model_type="internlm2",
+	embedding_layer_names=["tok_embeddings"],
+)
 class FlaxInternLM2Model(FlaxInternLM2PreTrainedModel):
 	module_class = FlaxInternLM2Module
 
@@ -1072,8 +1080,6 @@ class FlaxInternLM2ForCausalLMModule(nn.Module):
 		else:
 			lm_logits = self.output(hidden_states)
 
-		
-
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
 
@@ -1084,6 +1090,12 @@ class FlaxInternLM2ForCausalLMModule(nn.Module):
 		)
 
 
+@register_module(
+	"causal-language-model",
+	config=InternLM2Config,
+	model_type="internlm2",
+	embedding_layer_names=["tok_embeddings"],
+)
 class FlaxInternLM2ForCausalLM(FlaxInternLM2PreTrainedModel):
 	module_class = FlaxInternLM2ForCausalLMModule
 
@@ -1240,5 +1252,11 @@ class FlaxInternLM2ForSequenceClassificationModule(nn.Module):
 			return (prediction,)
 
 
+@register_module(
+	"sequence-classification",
+	config=InternLM2Config,
+	model_type="internlm2",
+	embedding_layer_names=["tok_embeddings"],
+)
 class FlaxInternLM2ForSequenceClassification(FlaxInternLM2PreTrainedModel):
 	module_class = FlaxInternLM2ForSequenceClassificationModule

@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -48,6 +47,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.factory import register_module
 
 logger = get_logger(__name__)
 
@@ -342,7 +342,6 @@ class FlaxGemmaAttention(FlaxAttentionModule):
 				query_states,
 				attention_mask,
 			)
-
 
 		attention_bias = lax.select(
 			attention_mask > 0,
@@ -1005,6 +1004,12 @@ class FlaxGemmaModule(nn.Module):
 		)
 
 
+@register_module(
+	"base-module",
+	config=GemmaConfig,
+	model_type="gemma",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxGemmaModel(FlaxGemmaPreTrainedModel):
 	module_class = FlaxGemmaModule
 
@@ -1098,7 +1103,6 @@ class FlaxGemmaForCausalLMModule(nn.Module):
 			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
-		
 
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
@@ -1110,6 +1114,12 @@ class FlaxGemmaForCausalLMModule(nn.Module):
 		)
 
 
+@register_module(
+	"causal-language-model",
+	config=GemmaConfig,
+	model_type="gemma",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxGemmaForCausalLM(FlaxGemmaPreTrainedModel):
 	module_class = FlaxGemmaForCausalLMModule
 

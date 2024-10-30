@@ -15,9 +15,10 @@
 
 import math
 
+from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EDPretrainedConfig
 
-
+@register_config("mamba")
 class MambaConfig(EDPretrainedConfig):
 	"""
 	Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read

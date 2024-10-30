@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +18,7 @@ from typing import Dict, List, Optional, Union
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
+from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
@@ -65,6 +65,7 @@ def compute_heads(model_dim: int, head_dim: int) -> int:
 		)
 
 
+@register_config("openelm")
 class OpenELMConfig(EDPretrainedConfig):
 	"""
 	Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read

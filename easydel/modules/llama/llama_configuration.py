@@ -16,9 +16,11 @@ from typing import Dict, Optional, Union
 
 from jax.sharding import PartitionSpec
 
+from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EDPretrainedConfig
- 
 
+
+@register_config("llama")
 class LlamaConfig(EDPretrainedConfig):
 	"""
 	Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read

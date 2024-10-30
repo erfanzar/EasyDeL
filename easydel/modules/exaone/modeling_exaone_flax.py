@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -49,6 +48,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.factory import register_module
 
 re_mat = nn_partitioning.remat
 logger = get_logger(__name__)
@@ -331,7 +331,6 @@ class FlaxExaoneAttention(FlaxAttentionModule):
 				query_states,
 				attention_mask,
 			)
-
 
 		attention_bias = lax.select(
 			attention_mask > 0,
@@ -1007,6 +1006,12 @@ class FlaxExaoneModule(nn.Module):
 		)
 
 
+@register_module(
+	"base-module",
+	ExaoneConfig,
+	model_type="exaone",
+	embedding_layer_names=["wte"],
+)
 class FlaxExaoneModel(FlaxExaonePretrainedModel):
 	module_class = FlaxExaoneModule
 
@@ -1119,8 +1124,6 @@ class FlaxExaoneForCausalLMModule(nn.Module):
 		else:
 			lm_logits = self.lm_head(hidden_states)
 
-		
-
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
 
@@ -1131,6 +1134,12 @@ class FlaxExaoneForCausalLMModule(nn.Module):
 		)
 
 
+@register_module(
+	"causal-language-model",
+	ExaoneConfig,
+	model_type="exaone",
+	embedding_layer_names=["wte"],
+)
 class FlaxExaoneForCausalLM(FlaxExaonePretrainedModel):
 	module_class = FlaxExaoneForCausalLMModule
 

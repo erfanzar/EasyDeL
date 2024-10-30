@@ -17,9 +17,10 @@ from typing import Optional
 
 from jax.sharding import PartitionSpec
 
+from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EDPretrainedConfig
 
-
+@register_config("phimoe")
 class PhiMoeConfig(EDPretrainedConfig):
 	"""
 	Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read

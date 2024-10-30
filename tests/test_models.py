@@ -134,7 +134,7 @@ class EasyModelsTest(unittest.TestCase):
 		config.pad_token_id = 0
 		hf_model = hf_module_class(config=copy.deepcopy(config))
 		hf_model.eval()
-
+		hf_model = hf_model.float()
 		params = {
 			"params": transform_function(
 				state_dict=hf_model.state_dict(),
@@ -365,8 +365,16 @@ class EasyModelsTest(unittest.TestCase):
 		self.assertTrue(res, f"GPT2 model Failed [ERROR {err}]")
 
 	def test_gptj(self):
-		self.header_config = None
+		self.header_config = ed.GPTJConfig(
+			vocab_size=self.vocab_size,
+			n_positions=self.max_position_embeddings,
+			n_embd=self.hidden_size,
+			n_layer=self.num_hidden_layers,
+			n_head=self.num_attention_heads,
+			rotary_dim=self.hidden_size // self.num_attention_heads,
+		)
 		res, err = self.create_test_for_models("gptj", transformers.GPTJForCausalLM)
+		self.header_config = None
 		self.assertTrue(res, f"GPT-J model Failed [ERROR {err}]")
 
 	def test_qwen2(self):
@@ -707,29 +715,29 @@ if __name__ == "__main__":
 	# unittest.main()
 	test = EasyModelsTest()
 	test.setUp()
-	test.test_mamba2()  # Passed v0.0.80 - P T Runtime
+	# test.test_mamba2()  # Passed v0.0.80 - P T Runtime
 	# test.test_arctic()  # Passed v0.0.80 - P T Runtime
-	test.test_cohere()  # Passed v0.0.80 - P T Runtime
+	# test.test_cohere()  # Passed v0.0.80 - P T Runtime
 	# test.test_dbrx()  # Passed  v0.0.80 - P T Runtime
 	# test.test_deepseek_v2()  # Passed v0.0.80 - P T Runtime
-	test.test_exaone()  # Passed v0.0.80 - P T Runtime
-	test.test_falcon()  # Passed v0.0.80 - P T Runtime
-	test.test_gemma()  # Passed v0.0.80 - P T Runtime
-	test.test_gemma2()  # Passed v0.0.80 - P T Runtime
+	# test.test_exaone()  # Passed v0.0.80 - P T Runtime
+	# test.test_falcon()  # Passed v0.0.80 - P T Runtime
+	# test.test_gemma()  # Passed v0.0.80 - P T Runtime
+	# test.test_gemma2()  # Passed v0.0.80 - P T Runtime
 	# test.test_gptj()  # Passed v0.0.80 - P T Runtime
-	# test.test_gpt2()
+	# test.test_gpt2()  # Passed v0.0.80 - P T Runtime
 	# test.test_grok1() # should be impl
 	# test.test_internlm2()
-	test.test_llama()  # Passed v0.0.80 - P T Runtime
-	test.test_mamba()  # Passed v0.0.80 - P T Runtime
-	test.test_mistral()  # Passed v0.0.80 - P T Runtime
-	test.test_mixtral()  # Passed v0.0.80 - P T Runtime
-	test.test_mpt()  # Passed v0.0.80 - P T Runtime
-	test.test_olmo()  # Passed v0.0.80 - P T Runtime
-	test.test_openelm()  # Passed v0.0.80 - P T Runtime
-	test.test_phi()  # Passed v0.0.80 - P T Runtime
-	test.test_phi3()  # Passed v0.0.80 - P T Runtime
-	# test.test_phimoe()  # Passed v0.0.80 - P T Runtime
+	# test.test_llama()  # Passed v0.0.80 - P T Runtime
+	# test.test_mamba()  # Passed v0.0.80 - P T Runtime
+	# test.test_mistral()  # Passed v0.0.80 - P T Runtime
+	# test.test_mixtral()  # Passed v0.0.80 - P T Runtime
+	# test.test_mpt()  # Passed v0.0.80 - P T Runtime
+	# test.test_olmo()  # Passed v0.0.80 - P T Runtime
+	# test.test_openelm()  # Passed v0.0.80 - P T Runtime
+	# test.test_phi()  # Passed v0.0.80 - P T Runtime
+	# test.test_phi3()  # Passed v0.0.80 - P T Runtime
+	# test.test_phimoe()  # Failed v0.0.80 - P T Runtime
 	# test.test_qwen1()
 	test.test_qwen2()  # Passed v0.0.80 - P T Runtime
 	test.test_qwen2_moe()  # Passed v0.0.80 - P T Runtime

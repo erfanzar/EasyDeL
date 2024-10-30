@@ -51,6 +51,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxSequenceClassifierOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.factory import register_module
 
 
 class FlaxLlamaEmbedding(nn.Module):
@@ -1032,6 +1033,12 @@ class FlaxLlamaModule(nn.Module):
 		)
 
 
+@register_module(
+	"base-module",
+	config=LlamaConfig,
+	model_type="llama",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxLlamaModel(FlaxLlamaPreTrainedModel):
 	module_class = FlaxLlamaModule
 
@@ -1144,6 +1151,12 @@ class FlaxLlamaForCausalLMModule(nn.Module):
 		)
 
 
+@register_module(
+	"causal-language-model",
+	config=LlamaConfig,
+	model_type="llama",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxLlamaForCausalLM(FlaxLlamaPreTrainedModel):
 	module_class = FlaxLlamaForCausalLMModule
 
@@ -1303,5 +1316,11 @@ class FlaxLlamaForSequenceClassificationModule(nn.Module):
 			return (prediction,)
 
 
+@register_module(
+	"sequence-classification",
+	config=LlamaConfig,
+	model_type="llama",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxLlamaForSequenceClassification(FlaxLlamaPreTrainedModel):
 	module_class = FlaxLlamaForSequenceClassificationModule

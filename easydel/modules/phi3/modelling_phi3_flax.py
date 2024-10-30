@@ -32,6 +32,7 @@ from jax.sharding import PartitionSpec
 
 from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.common import RMSNorm as RMSNorm
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
 	FlaxAttentionModule,
@@ -1079,9 +1080,21 @@ class FlaxPhiPreTrainedModel(EDPretrainedModel):
 		return outputs
 
 
+@register_module(
+	"base-module",
+	config=Phi3Config,
+	model_type="phi3",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxPhi3Model(FlaxPhiPreTrainedModel):
 	module_class = FlaxPhi3Module
 
 
+@register_module(
+	"causal-language-model",
+	config=Phi3Config,
+	model_type="phi3",
+	embedding_layer_names=["embed_tokens"],
+)
 class FlaxPhi3ForCausalLM(FlaxPhiPreTrainedModel):
 	module_class = FlaxPhi3ForCausalLMModule
