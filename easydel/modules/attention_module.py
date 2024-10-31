@@ -663,8 +663,6 @@ class FlexibleAttentionModule(object):
 
 			# Get sharding dimensions
 
-			fsdp_size = get_axis_size(query_partitionspec[0])
-			sp_size = get_axis_size(query_partitionspec[2])
 			func = functools.partial(
 				jax.nn.dot_product_attention,
 				implementation="cudnn" if jax.default_backend() == "gpu" else "xla",
@@ -673,76 +671,25 @@ class FlexibleAttentionModule(object):
 				if jax.default_backend() == "gpu"
 				else (causal if bias is None else False),
 			)
-			if fsdp_size > 1 and sp_size == 1:
-				attention_output = shard_map(
-					func,
-					mesh=self.mesh,
-					in_specs=(
-						query_partitionspec,
-						key_partitionspec,
-						value_partitionspec,
-						bias_partitionspec,
-					),
-					out_specs=attention_partitionspec,
-					check_rep=False,
-				)(
-					query_states.astype(self.dtype),
-					key_states.astype(self.dtype),
-					value_states.astype(self.dtype),
-					bias.astype(self.dtype) if bias is not None else None,
-				)
-
-			elif fsdp_size > 1 and sp_size > 1:
-				# Use shard_map with FSDP sharding, ignore SP
-				fsdp_only_query_spec = create_target_only_spec(
-					query_partitionspec,
-					query_partitionspec[0],
-				)
-				fsdp_only_key_spec = create_target_only_spec(
-					key_partitionspec,
-					key_partitionspec[0],
-				)
-				fsdp_only_value_spec = create_target_only_spec(
-					value_partitionspec,
-					value_partitionspec[0],
-				)
-				fsdp_only_bias_spec = (
-					create_target_only_spec(
-						bias_partitionspec,
-						bias_partitionspec[0],
-					)
-					if bias_partitionspec is not None
-					else None
-				)
-				fsdp_only_attention_spec = create_target_only_spec(
-					attention_partitionspec,
-					attention_partitionspec[0],
-				)
-
-				attention_output = shard_map(
-					func,
-					mesh=self.mesh,
-					in_specs=(
-						fsdp_only_query_spec,
-						fsdp_only_key_spec,
-						fsdp_only_value_spec,
-						fsdp_only_bias_spec,
-					),
-					out_specs=fsdp_only_attention_spec,
-					check_rep=False,
-				)(
-					query_states.astype(self.dtype),
-					key_states.astype(self.dtype),
-					value_states.astype(self.dtype),
-					bias.astype(self.dtype) if bias is not None else None,
-				)
-			else:
-				attention_output = func(
-					query_states.astype(self.dtype),
-					key_states.astype(self.dtype),
-					value_states.astype(self.dtype),
-					bias.astype(self.dtype) if bias is not None else None,
-				)
+			attention_output = shard_map(
+				func,
+				mesh=self.mesh,
+				in_specs=(
+					PartitionSpec(query_partitionspec[0], None, query_partitionspec[2], None),
+					PartitionSpec(key_partitionspec[0], None, key_partitionspec[2], None),
+					PartitionSpec(value_partitionspec[0], None, value_partitionspec[2], None),
+					PartitionSpec(bias_partitionspec[0], bias_partitionspec[1], None, None)
+					if bias is not None
+					else PartitionSpec(None),
+				),
+				out_specs=attention_partitionspec,
+				check_rep=False,
+			)(
+				query_states.astype(self.dtype),
+				key_states.astype(self.dtype),
+				value_states.astype(self.dtype),
+				bias.astype(self.dtype) if bias is not None else None,
+			)
 			return AttentionOutput(
 				attention_weights=None,
 				attention_outputs=with_sharding_constraint(
