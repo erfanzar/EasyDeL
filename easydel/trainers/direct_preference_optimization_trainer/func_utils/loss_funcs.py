@@ -56,7 +56,7 @@ def get_loss_function(
 		policy_rejected_log_probs: chex.Array,  # IGNORED
 		reference_rejected_log_probs: chex.Array,  # IGNORED
 	):
-		return jax.relu(1 - beta * logits)
+		return jax.nn.relu(1 - beta * logits)
 
 	def _ipo_dpo_loss(
 		logits: chex.Array,
