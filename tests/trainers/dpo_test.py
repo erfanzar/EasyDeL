@@ -38,9 +38,9 @@ def main():
 				),
 			]
 		)
-		# .shuffle()
-		# .shuffle()
-	)
+		.shuffle()
+		.shuffle()
+	).select(range(5000))
 	train_dataset = train_dataset.rename_column("chosen_response", "chosen")
 	train_dataset = train_dataset.rename_column("rejected_response", "rejected")
 	train_dataset = train_dataset.rename_column("instruction", "prompt")
