@@ -73,7 +73,7 @@ def main():
 		arguments = DPOConfig(
 			num_train_epochs=4,
 			model_name="DPO_TEST",
-			loss_type="ipo",
+			loss_type="kto",
 			total_batch_size=8,
 			use_wandb=False,
 			learning_rate=7e-5,
