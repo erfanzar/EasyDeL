@@ -74,15 +74,17 @@ def get_loss_function(
 		policy_rejected_log_probs: chex.Array,
 		reference_rejected_log_probs: chex.Array,
 	):
+		x = jnp.mean(policy_chosen_log_probs - reference_chosen_log_probs)
 		chosen_kl = jax.lax.clamp(
-			min=0,
-			x=jnp.mean(policy_chosen_log_probs - reference_chosen_log_probs),
-			max=1e9,
+			min=jnp.array(0, dtype=x.dtype),
+			x=x,
+			max=jnp.array(1e9, dtype=x.dtype),
 		)
+		x = jnp.mean(policy_rejected_log_probs - reference_rejected_log_probs)
 		rejected_kl = jax.lax.clamp(
-			min=0,
-			x=jnp.mean(policy_rejected_log_probs - reference_rejected_log_probs),
-			max=1e9,
+			min=jnp.array(0, dtype=x.dtype),
+			x=x,
+			max=jnp.array(1e9, dtype=x.dtype),
 		)
 
 		chosen_log_ratios = policy_chosen_log_probs - reference_chosen_log_probs
