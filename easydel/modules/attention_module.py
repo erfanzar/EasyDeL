@@ -655,30 +655,118 @@ class FlexibleAttentionModule(object):
 			in_generating_process,
 		) = self.get_bshd_partition_specs(query_states.shape[1])
 		with self.mesh:
-			attention_output = shard_map(
-				functools.partial(
-					jax.nn.dot_product_attention,
-					implementation="cudnn" if jax.default_backend() == "gpu" else "xla",
-					scale=self.sm_scale,
-					is_causal=(causal if not in_generating_process else False)
-					if jax.default_backend() == "gpu"
-					else (causal if bias is None else False),
-				),
-				mesh=self.mesh,
-				in_specs=(
-					query_partitionspec,
-					key_partitionspec,
-					value_partitionspec,
-					bias_partitionspec,
-				),
-				out_specs=attention_partitionspec,
-				check_rep=False,
-			)(
-				query_states.astype(self.dtype),
-				key_states.astype(self.dtype),
-				value_states.astype(self.dtype),
-				bias.astype(self.dtype) if bias is not None else None,
+			# Helper function to get axis size
+			def get_axis_size(axis_name):
+				if isinstance(axis_name, tuple):
+					return numpy.prod([self.mesh.shape[name] for name in axis_name])
+				return self.mesh.shape[axis_name]
+
+			# Get sharding dimensions
+
+			fsdp_size = get_axis_size(query_partitionspec[0])
+			sp_size = get_axis_size(query_partitionspec[2])
+			func = functools.partial(
+				jax.nn.dot_product_attention,
+				implementation="cudnn" if jax.default_backend() == "gpu" else "xla",
+				scale=self.sm_scale,
+				is_causal=(causal if not in_generating_process else False)
+				if jax.default_backend() == "gpu"
+				else (causal if bias is None else False),
 			)
+			if fsdp_size > 1 and sp_size == 1:
+				attention_output = shard_map(
+					func,
+					mesh=self.mesh,
+					in_specs=(
+						query_partitionspec,
+						key_partitionspec,
+						value_partitionspec,
+						bias_partitionspec,
+					),
+					out_specs=attention_partitionspec,
+					check_rep=False,
+				)(
+					query_states.astype(self.dtype),
+					key_states.astype(self.dtype),
+					value_states.astype(self.dtype),
+					bias.astype(self.dtype) if bias is not None else None,
+				)
+
+				# Case 2: FSDP = 1 and SP > 1
+			elif fsdp_size == 1 and sp_size > 1:
+				attention_output = func(
+					with_sharding_constraint(
+						query_states.astype(self.dtype),
+						query_partitionspec,
+					),
+					with_sharding_constraint(
+						key_states.astype(self.dtype),
+						key_partitionspec,
+					),
+					with_sharding_constraint(
+						value_states.astype(self.dtype),
+						value_partitionspec,
+					),
+					with_sharding_constraint(
+						bias.astype(self.dtype),
+						bias_partitionspec,
+					)
+					if bias is not None
+					else None,
+				)
+
+			# Case 3: Both FSDP and SP > 1
+			elif fsdp_size > 1 and sp_size > 1:
+				# Use shard_map with FSDP sharding, ignore SP
+				fsdp_only_query_spec = create_target_only_spec(
+					query_partitionspec,
+					query_partitionspec[0],
+				)
+				fsdp_only_key_spec = create_target_only_spec(
+					key_partitionspec,
+					key_partitionspec[0],
+				)
+				fsdp_only_value_spec = create_target_only_spec(
+					value_partitionspec,
+					value_partitionspec[0],
+				)
+				fsdp_only_bias_spec = (
+					create_target_only_spec(
+						bias_partitionspec,
+						bias_partitionspec[0],
+					)
+					if bias_partitionspec is not None
+					else None
+				)
+				fsdp_only_attention_spec = create_target_only_spec(
+					attention_partitionspec,
+					attention_partitionspec[0],
+				)
+
+				attention_output = shard_map(
+					func,
+					mesh=self.mesh,
+					in_specs=(
+						fsdp_only_query_spec,
+						fsdp_only_key_spec,
+						fsdp_only_value_spec,
+						fsdp_only_bias_spec,
+					),
+					out_specs=fsdp_only_attention_spec,
+					check_rep=False,
+				)(
+					query_states.astype(self.dtype),
+					key_states.astype(self.dtype),
+					value_states.astype(self.dtype),
+					bias.astype(self.dtype) if bias is not None else None,
+				)
+			else:
+				attention_output = func(
+					query_states.astype(self.dtype),
+					key_states.astype(self.dtype),
+					value_states.astype(self.dtype),
+					bias.astype(self.dtype) if bias is not None else None,
+				)
 			return AttentionOutput(
 				attention_weights=None,
 				attention_outputs=with_sharding_constraint(
@@ -1554,7 +1642,7 @@ class AttentionBenchmarker:
 					),
 				}
 
-			except Exception as e: 
+			except Exception as e:
 				error_key = f"{attn_name}:{str(e)}"
 				if error_key not in self._printed_errors:
 					print(f"Benchmark failed for {attn_name}: {str(e)}")
