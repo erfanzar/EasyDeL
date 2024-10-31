@@ -226,6 +226,10 @@ class DPOTrainer(BaseTrainer, ABC):
 			model=model_state if arguments.is_encoder_decoder else None,
 			args=arguments,
 		)
+
+		def to_jax_arrays(x):
+			return {k: jnp.array(v) for k, v in x.items()}
+
 		train_dataset = train_dataset.map(
 			_tokenize,
 			fn_kwargs=fn_kwargs,
@@ -1109,6 +1113,7 @@ class DPOTrainer(BaseTrainer, ABC):
 
 	def _execute_eval_step(self, state, batch):
 		"""Execute a single eval step."""
+		batch = {key: jnp.asarray(value) for key, value in batch.items()}
 		dpo_out = self.sharded_eval_step_function(state, batch)
 		loss = dpo_out.loss
 		metrics = dict(
@@ -1130,6 +1135,8 @@ class DPOTrainer(BaseTrainer, ABC):
 
 		# Forward and backward pass
 		try:
+			batch = {key: jnp.asarray(value) for key, value in batch.items()}
+
 			self.model_state, dpo_out = self.sharded_train_step_function(
 				self.model_state, batch
 			)

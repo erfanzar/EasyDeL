@@ -134,8 +134,7 @@ class DPODataCollatorWithPadding:
 			padded_batch["prompt_attention_mask"] = padded_batch["prompt_attention_mask"][
 				..., : self.max_prompt_length
 			]
-
-		return padded_batch
+		return {k: jnp.array(v) for k, v in padded_batch.items()}
 
 
 def pad_to_length(
