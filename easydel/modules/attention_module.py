@@ -692,30 +692,6 @@ class FlexibleAttentionModule(object):
 					bias.astype(self.dtype) if bias is not None else None,
 				)
 
-				# Case 2: FSDP = 1 and SP > 1
-			elif fsdp_size == 1 and sp_size > 1:
-				attention_output = func(
-					with_sharding_constraint(
-						query_states.astype(self.dtype),
-						query_partitionspec,
-					),
-					with_sharding_constraint(
-						key_states.astype(self.dtype),
-						key_partitionspec,
-					),
-					with_sharding_constraint(
-						value_states.astype(self.dtype),
-						value_partitionspec,
-					),
-					with_sharding_constraint(
-						bias.astype(self.dtype),
-						bias_partitionspec,
-					)
-					if bias is not None
-					else None,
-				)
-
-			# Case 3: Both FSDP and SP > 1
 			elif fsdp_size > 1 and sp_size > 1:
 				# Use shard_map with FSDP sharding, ignore SP
 				fsdp_only_query_spec = create_target_only_spec(
