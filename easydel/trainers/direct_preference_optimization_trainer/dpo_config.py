@@ -11,16 +11,17 @@ class DPOConfig(TrainingArguments):
 	beta: float = 0.1
 	label_smoothing: float = 0.0
 	loss_type: Literal[
-		"sigmoid",
-		"hinge",
 		"ipo",
-		"exo_pair",
-		"nca_pair",
+		"kto",
+		"hinge",
+		"sigmoid",
 		"robust",
+		"exo_pair",
 		"bco_pair",
 		"sppo_hard",
-		"aot",
+		"nca_pair",
 		"aot_pair",
+		"aot",
 		"apo_zero",
 		"apo_down",
 	] = "sigmoid"
