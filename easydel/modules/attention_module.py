@@ -671,24 +671,39 @@ class FlexibleAttentionModule(object):
 				if jax.default_backend() == "gpu"
 				else (causal if bias is None else False),
 			)
+
+			query_partitionspec = PartitionSpec(
+				query_partitionspec[0], None, query_partitionspec[2], None
+			)
+			key_partitionspec = PartitionSpec(
+				key_partitionspec[0], None, key_partitionspec[2], None
+			)
+			value_partitionspec = PartitionSpec(
+				value_partitionspec[0], None, value_partitionspec[2], None
+			)
+			bias_partitionspec = (
+				PartitionSpec(bias_partitionspec[0], bias_partitionspec[1], None, None)
+				if bias is not None
+				else PartitionSpec(None)
+			)
 			attention_output = shard_map(
 				func,
 				mesh=self.mesh,
 				in_specs=(
-					PartitionSpec(query_partitionspec[0], None, query_partitionspec[2], None),
-					PartitionSpec(key_partitionspec[0], None, key_partitionspec[2], None),
-					PartitionSpec(value_partitionspec[0], None, value_partitionspec[2], None),
-					PartitionSpec(bias_partitionspec[0], bias_partitionspec[1], None, None)
-					if bias is not None
-					else PartitionSpec(None),
+					query_partitionspec,
+					key_partitionspec,
+					value_partitionspec,
+					bias_partitionspec,
 				),
 				out_specs=attention_partitionspec,
 				check_rep=False,
 			)(
-				query_states.astype(self.dtype),
-				key_states.astype(self.dtype),
-				value_states.astype(self.dtype),
-				bias.astype(self.dtype) if bias is not None else None,
+				with_sharding_constraint(query_states.astype(self.dtype), query_partitionspec),
+				with_sharding_constraint(key_states.astype(self.dtype), key_partitionspec),
+				with_sharding_constraint(value_states.astype(self.dtype), value_partitionspec),
+				with_sharding_constraint(bias.astype(self.dtype), bias_partitionspec)
+				if bias is not None
+				else None,
 			)
 			return AttentionOutput(
 				attention_weights=None,
