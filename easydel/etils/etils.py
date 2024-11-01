@@ -130,7 +130,7 @@ AVAILABLE_ATTENTION_MECHANISMS = Literal[
 ]
 
 DEFAULT_ATTENTION_MECHANISM = (
-	"flash_attn2" if jax.extend.backend.get_backend().platform == "gpu" else "ring"
+	"sdpa" if jax.extend.backend.get_backend().platform == "gpu" else "vanilla"
 )
 AVAILABLE_SPARSE_MODULE_TYPES = Literal["bcoo", "bcsr", "coo", "csr"]
 
