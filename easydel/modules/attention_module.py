@@ -167,6 +167,11 @@ def combine_flash_masks(causal_mask, segment_ids):
 	return jnp.logical_or(~causal_mask, segment_ids)
 
 
+DEFAULT_ATTENTION_MECHANISM = (
+	"sdpa" if jax.extend.backend.get_backend().platform == "gpu" else "vanilla"
+)
+
+
 def set_attrs_smartly_with_prp(
 	self,
 	attr_name: str,
@@ -252,7 +257,7 @@ class FlexibleAttentionModule(object):
 		num_kv_heads: int,
 		num_q_heads: int,
 		head_dims: int,
-		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = AttentionMechanisms.SDPA,
+		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_ATTENTION_MECHANISM,
 		block_k: int = ...,
 		block_q: int = ...,
 		block_b: int = ...,
@@ -731,11 +736,7 @@ class FlexibleAttentionModule(object):
 
 		block_q = self.block_q
 		if in_generating_process:
-			block_q = int(
-				os.environ.get(
-					"GENERATION_BLOCKSIZE_Q", "128" if self.backend == "tpu" else "16"
-				)
-			)
+			block_q = int(os.environ.get("GENERATION_BLOCKSIZE_Q", self.block_q))
 		if bias is not None:
 			assert bias.ndim == 4
 		with self.mesh:

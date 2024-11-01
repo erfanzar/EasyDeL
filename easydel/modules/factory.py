@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Dict, List, Optional, Type, TypeVar
+from typing import Dict, List, Literal, Optional, Type, TypeVar
 from dataclasses import dataclass
 
 from easydel.modules.modeling_utils import EDPretrainedConfig, EDPretrainedModel
@@ -23,8 +23,8 @@ class TaskType(str, Enum):
 
 @dataclass
 class ModuleRegistration:
-	module: EDPretrainedModel
-	config: EDPretrainedConfig
+	module: type[EDPretrainedModel]
+	config: type[EDPretrainedConfig]
 	embedding_layer_names: Optional[List[str]] = None
 	layernorm_names: Optional[List[str]] = None
 	rnn_based_or_rwkv: bool = False
@@ -95,13 +95,26 @@ class Registry:
 		return wrapper
 
 	def get_config(
-		self, config_type: str, config_field: ConfigType = ConfigType.MODULE_CONFIG
+		self,
+		config_type: str,
+		config_field: ConfigType = ConfigType.MODULE_CONFIG,
 	) -> Type:
 		"""Get registered configuration class."""
 		return self._config_registry[config_field][config_type]
 
 	def get_module_registration(
-		self, task_type: TaskType, model_type: str
+		self,
+		task_type: TaskType
+		| Literal[
+			"causal-language-model",
+			"sequence-classification",
+			"vision-language-model",
+			"conditional-generation",
+			"audio-classification",
+			"base-module",
+			"seq-to-seq",
+		],
+		model_type: str,
 	) -> ModuleRegistration:
 		"""Get registered module information."""
 		return self._task_registry[task_type][model_type]

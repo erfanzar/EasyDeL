@@ -8,7 +8,7 @@ __pycache__/
 *.so
 env.ipynb
 env.py
-gui.py
+sharding_test.py
 exprimental.py
 pallas_env.py
 test_EasyDeLState.py
