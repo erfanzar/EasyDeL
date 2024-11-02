@@ -809,6 +809,7 @@ class FlexibleAttentionModule(object):
 						)
 						if bias is not None
 						else None,
+						adjust_sharindgs=True,
 					)
 
 				# Case 3: Both FSDP and SP > 1

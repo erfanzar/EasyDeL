@@ -42,6 +42,39 @@ AVAILABLE_BACKENDS = Literal["gpu", "tpu", "cpu"]
 BACKEND = get_backend().platform
 
 
+def get_device_memory_usage(device: jax.Device) -> float:
+	"""
+	Get the memory usage for a specific JAX device using local_devices stats.
+
+	Args:
+	    device: JAX device to check
+	Returns:
+	    float: Memory usage in bytes
+	"""
+	try:
+		memory_stats = device.memory_stats()
+		return memory_stats["bytes_in_use"] if memory_stats else float("inf")
+	except:  # noqa
+		return float("inf")
+
+
+def free_gpu_in_process() -> int:
+	"""
+	Returns the index of the GPU with the most available memory using JAX local_devices.
+
+	Returns:
+	    int: Index of the GPU with most free memory
+	"""
+	devices = jax.local_devices()
+	gpu_devices = [d for d in devices if d.platform == "gpu"]
+
+	if not gpu_devices:
+		return 0
+
+	memory_usage = [get_device_memory_usage(device) for device in gpu_devices]
+	return memory_usage.index(min(memory_usage))
+
+
 class Backend(str, Enum):
 	"""Supported compute backends."""
 
@@ -145,18 +178,20 @@ class FlashAttention:
 		key: chex.Array,
 		value: chex.Array,
 		bias: Optional[chex.Array] = None,
+		adjust_sharindgs: bool = False,
 	) -> chex.Array:
 		"""
 		Computes flash attention using the configured backend and platform.
 
 		Args:
-				query: Query tensor of shape [batch, seq_len, num_heads, dim]
-				key: Key tensor of shape [batch, seq_len, num_kv_heads, dim]
-				value: Value tensor of shape [batch, seq_len, num_kv_heads, dim]
-				bias: Optional attention bias tensor
-
+		    query: Query tensor of shape [batch, seq_len, num_heads, dim]
+		    key: Key tensor of shape [batch, seq_len, num_kv_heads, dim]
+		    value: Value tensor of shape [batch, seq_len, num_kv_heads, dim]
+		    bias: Optional attention bias tensor
+        adjust_sharindgs: whenever to change shardings for best fit in triton kernel
+				
 		Returns:
-				Output tensor of shape [batch, seq_len, num_heads, dim]
+		    Output tensor of shape [batch, seq_len, num_heads, dim]
 		"""
 		num_q_heads = query.shape[2]
 		num_kv_heads = key.shape[2]
@@ -170,7 +205,7 @@ class FlashAttention:
 		bias = self._handle_bias(bias, num_q_heads, num_kv_heads)
 
 		if self.config.platform == Platform.TRITON:
-			return self._compute_triton(query, key, value, bias)
+			return self._compute_triton(query, key, value, bias, adjust_sharindgs)
 		elif self.config.platform == Platform.PALLAS:
 			return self._compute_pallas(query, key, value, bias)
 		else:  # Platform.JAX
@@ -182,28 +217,43 @@ class FlashAttention:
 		key: chex.Array,
 		value: chex.Array,
 		bias: Optional[chex.Array],
+		adjust_sharindgs: bool = False,
 	) -> chex.Array:
 		"""Computes attention using Triton backend."""
-		if query.shape[2] == key.shape[2] or os.environ.get("FORCE_MHA", "false") in [
-			"true",
-			"1",
-			"on",
-		]:
+		if adjust_sharindgs:
+			query_sharding = query.sharding if hasattr(query, "sharding") else None
+			target_gpu_idx = int(os.environ.get("GPU_IDX_FLASH_ATTN", free_gpu_in_process()))
+			devices = jax.local_devices(process_index=jax.process_index(), backend="gpu")
+			target_device = devices[target_gpu_idx]
+			query = jax.device_put(query, target_device)
+			key = jax.device_put(key, target_device)
+			value = jax.device_put(value, target_device)
+			if bias is not None:
+				bias = jax.device_put(bias, target_device)
+
+		if query.shape[2] == key.shape[2] or os.environ.get(
+			"FORCE_MHA",
+			"false",
+		) in ["true", "1", "on"]:
 			key, value = self.repeat_kv_heads(key, value, query.shape[2] // key.shape[2])
-			return triton_gqa_flash_attention2_gpu(
+			attn = triton_gqa_flash_attention2_gpu(
 				query=query,
 				key=key,
 				value=value,
 				bias=bias,
 				softmax_scale=self.config.softmax_scale,
 			)
-		return triton_gqa_flash_attention2_gpu(
-			query=query,
-			key=key,
-			value=value,
-			bias=bias,
-			softmax_scale=self.config.softmax_scale,
-		)
+		else:
+			attn = triton_gqa_flash_attention2_gpu(
+				query=query,
+				key=key,
+				value=value,
+				bias=bias,
+				softmax_scale=self.config.softmax_scale,
+			)
+		if adjust_sharindgs and query_sharding is not None:
+			attn = jax.device_put(attn, query_sharding)
+		return attn
 
 	def _compute_pallas(
 		self,
@@ -281,12 +331,12 @@ def create_flash_attention(
 	Factory function to create a FlashAttention instance with the specified configuration.
 
 	Args:
-			backend: Compute backend to use (GPU, TPU, or CPU)
-			platform: Platform to use (Triton, Pallas, or JAX)
-			**kwargs: Additional configuration parameters for AttentionConfig
+	    backend: Compute backend to use (GPU, TPU, or CPU)
+	    platform: Platform to use (Triton, Pallas, or JAX)
+	    **kwargs: Additional configuration parameters for AttentionConfig
 
 	Returns:
-			Configured FlashAttention instance
+	    Configured FlashAttention instance
 	"""
 	if isinstance(backend, str):
 		backend = Backend(backend)
