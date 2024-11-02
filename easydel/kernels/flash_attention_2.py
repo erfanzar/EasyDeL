@@ -15,24 +15,26 @@
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Tuple, Union, Literal
-import flax.linen
-from jax import random as jrnd
+from typing import Literal, Optional, Tuple, Union
+
 import chex
 import einops
+import flax.linen
 import jax
 import jax.numpy as jnp
-from jax.extend.backend import get_backend
+from jax import random as jrnd
 from jax.experimental.pallas.ops.tpu.flash_attention import (
 	BlockSizes as TPUBlockSizes,
+)
+from jax.experimental.pallas.ops.tpu.flash_attention import (
 	flash_attention as pallas_flash_attention_tpu,
 )
+from jax.extend.backend import get_backend
 
 from easydel.kernels.cpu_ops import jax_flash_attn_2_mu
 from easydel.kernels.gpu_ops import (
 	pallas_flash_mha_attn_2_gpu,
-	triton_flash_gqa_attn_2_gpu,
-	triton_flash_mha_attn_2_gpu,
+	triton_gqa_flash_attention2_gpu,
 )
 
 AVAILABLE_FLASH_ATTENTION2_PLATFORMS = Literal["triton", "pallas", "jax"]
@@ -126,8 +128,8 @@ class FlashAttention:
 
 		if bias.shape[1] == num_q_heads or bias.shape[1] == 1:
 			return bias
-		
-		elif bias.shape[1] in (num_kv_heads):
+
+		elif bias.shape[1] == num_kv_heads:
 			return einops.repeat(
 				bias, "b h q k -> b (h r) q k", r=num_q_heads // bias.shape[1]
 			)
@@ -188,23 +190,19 @@ class FlashAttention:
 			"on",
 		]:
 			key, value = self.repeat_kv_heads(key, value, query.shape[2] // key.shape[2])
-			return triton_flash_mha_attn_2_gpu(
+			return triton_gqa_flash_attention2_gpu(
 				query=query,
 				key=key,
 				value=value,
 				bias=bias,
 				softmax_scale=self.config.softmax_scale,
-				blocksize_k=self.config.blocksize_k,
-				blocksize_q=self.config.blocksize_q,
 			)
-		return triton_flash_gqa_attn_2_gpu(
+		return triton_gqa_flash_attention2_gpu(
 			query=query,
 			key=key,
 			value=value,
 			bias=bias,
 			softmax_scale=self.config.softmax_scale,
-			blocksize_k=self.config.blocksize_k,
-			blocksize_q=self.config.blocksize_q,
 		)
 
 	def _compute_pallas(

@@ -287,9 +287,11 @@ class SampleState:
 	is_sequence_finished: Union[jax.Array, sharding.NamedSharding]
 	prng_key: Union[random.PRNGKey, sharding.NamedSharding]
 	model_kwargs: Union[Dict[str, jax.Array], sharding.NamedSharding]
+	
 	# vInference Ops
 	generate_func_flops: Optional[float] = float("-inf")
 	interval_func_flops: Optional[float] = float("-inf")
+	tokens_pre_second: Optional[float] = float("-inf")
 	generated_tokens: Optional[int] = 0
 
 	def tree_flatten(self):
@@ -302,6 +304,7 @@ class SampleState:
 			self.model_kwargs,
 			self.generate_func_flops,
 			self.interval_func_flops,
+			self.tokens_pre_second,
 			self.generated_tokens,
 		), {}
 

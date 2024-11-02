@@ -1496,11 +1496,11 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 					) from None
 
 			if is_local:
-				logger.info(f"loading weights file {archive_file}")
+				logger.debug(f"loading weights file {archive_file}")
 				resolved_archive_file = archive_file
 				filename = resolved_archive_file.split(os.path.sep)[-1]
 			else:
-				logger.info(
+				logger.debug(
 					f"loading weights file {filename} from cache at {resolved_archive_file}"
 				)
 		else:

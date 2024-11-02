@@ -15,6 +15,7 @@
 import argparse
 import logging
 from enum import Enum
+import os
 from typing import (
 	Any,
 	Dict,
@@ -134,8 +135,22 @@ DEFAULT_ATTENTION_MECHANISM = (
 )
 AVAILABLE_SPARSE_MODULE_TYPES = Literal["bcoo", "bcsr", "coo", "csr"]
 
+_LOGGING_LEVELS = dict(
+	CRITICAL=50,
+	FATAL=50,
+	ERROR=40,
+	WARNING=30,
+	WARN=30,
+	INFO=20,
+	DEBUG=10,
+	NOTSET=0,
+)
 
-def get_logger(name, level: int = logging.INFO) -> logging.Logger:
+
+def get_logger(
+	name,
+	level: int = _LOGGING_LEVELS[os.environ.get("LOGGING_LEVEL_ED", "INFO")],
+) -> logging.Logger:
 	"""
 	Function to create and configure a logger.
 	Args:

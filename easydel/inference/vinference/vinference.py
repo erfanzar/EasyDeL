@@ -625,6 +625,7 @@ class vInference:
 					position_ids=position_ids,
 					rng=self._rng_generator.rng,
 				)
+				generation_time_start = time.perf_counter()
 				state.generate_func_flops = generate_func_flops
 				if not state.is_sequence_finished:
 					all_interval_func_flops = []
@@ -638,12 +639,17 @@ class vInference:
 								start_length=start_length,
 							)
 						)
+						interval_time = time.perf_counter() - generation_time_start
+
 						all_interval_func_flops.append(interval_func_flops)
-						interval_func_flops = sum(all_interval_func_flops) / len(
-							all_interval_func_flops
+						interval_func_flops = sum(
+							all_interval_func_flops,
+						) / len(
+							all_interval_func_flops,
 						)
 						state.generate_func_flops = generate_func_flops
 						state.interval_func_flops = interval_func_flops
+						state.tokens_pre_second = state.generated_tokens / interval_time
 						yield state
 						if state.is_sequence_finished:
 							break
@@ -680,6 +686,7 @@ class vInference:
 			input_ids = jnp.ones((batch_size, input_tokens_length), dtype="i4")
 			attention_mask = jnp.ones_like(input_ids)
 			position_ids = attention_mask.cumsum(axis=-1, dtype="i4") - 1
+			logger.debug(f"Smart Compiling `state_generate_compile` - {self.inference_name}")
 
 			compiled_generate_func = smart_compile(
 				_compiled_generate.lower(
@@ -699,6 +706,9 @@ class vInference:
 				attention_mask=attention_mask,
 				position_ids=position_ids,
 				rng=self._rng_generator.rng,
+			)
+			logger.debug(
+				f"Smart Compiling `interval_generate_compile` - {self.inference_name}"
 			)
 			compiled_interval_func = smart_compile(
 				_compiled_interval_generate.lower(

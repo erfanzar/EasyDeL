@@ -37,7 +37,7 @@ class ModelMetadata:
 class vInferenceMetrics:
 	def __init__(self, model_name: str):
 		model_name = model_name.replace("-", "_").replace(".", "_")
-		self.model_name = model_name 
+		self.model_name = model_name
 
 		# Basic request metrics
 		self.inference_requests = Counter(

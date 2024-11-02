@@ -143,6 +143,7 @@ class vInferenceApiServer:
 		processing_time: float,
 		first_iter_flops: float,
 		iter_flops: float,
+		tokens_pre_second: float,
 	) -> UsageInfo:
 		"""Create usage information."""
 		return UsageInfo(
@@ -151,7 +152,7 @@ class vInferenceApiServer:
 			prompt_tokens=prefiled_length,
 			completion_tokens=ngenerated_tokens,
 			total_tokens=ngenerated_tokens + prefiled_length,
-			tps=ngenerated_tokens / processing_time,
+			tps=tokens_pre_second,
 			processing_time=processing_time,
 		)
 
@@ -199,6 +200,7 @@ class vInferenceApiServer:
 				processing_time,
 				response.generate_func_flops,
 				response.interval_func_flops,
+				response.tokens_pre_second,
 			),
 		)
 
@@ -243,6 +245,7 @@ class vInferenceApiServer:
 						processing_time,
 						response.generate_func_flops,
 						response.interval_func_flops,
+						response.tokens_pre_second,
 					),
 				)
 
@@ -266,6 +269,7 @@ class vInferenceApiServer:
 					processing_time,
 					response.generate_func_flops,
 					response.interval_func_flops,
+					response.tokens_pre_second,
 				),
 			)
 
