@@ -755,10 +755,10 @@ class FlexibleAttentionModule(object):
 				return self.mesh.shape[axis_name]
 
 			# Get sharding dimensions
-
-			fsdp_size = get_axis_size(query_partitionspec[0])
-			sp_size = get_axis_size(query_partitionspec[2])
-
+			fsdp_size = get_axis_size(
+				key_partitionspec[0]
+			)  # use key since q might be in generation process
+			sp_size = get_axis_size(key_partitionspec[1])
 			attention = get_cached_flash_attention(
 				backend=self.backend,
 				platform=self.platform,
