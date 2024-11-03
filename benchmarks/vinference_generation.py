@@ -2,16 +2,7 @@ import asyncio
 import os
 import sys
 
-os.environ["JAX_TRACEBACK_FILTERING"] = "off"
-os.environ["EASYDEL_AUTO"] = "1"
-# os.environ["EKERNEL_OPS"] = "true"
-
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-
-
-import os
-import time
-
 import jax
 from huggingface_hub import HfApi
 from jax import lax, sharding
@@ -70,23 +61,20 @@ async def main():
 	)
 	await inference.async_precompile(1)
 	print(inference.inference_name)
-	conversation = []
-	while True:
-		conversation.append({"role": "user", "content": input("USER > ")})
-		ids = tokenizer.apply_chat_template(
-			conversation,
-			return_tensors="np",
-			return_dict=True,
-			max_length=inference.model_prefill_length,
-			padding="max_length",
-			add_generation_prompt=True,
-		)
 
-		start = time.time()
-		input_ids, attention_mask = ids["input_ids"], ids["attention_mask"]
-		start_length = inference.model_prefill_length
-		pad_seq = inference.model_prefill_length
-		print("ASSISTANT > ", end="")
+	ids = tokenizer.apply_chat_template(
+		[{"role": "user", "content": "Generate a long random story"}],
+		return_tensors="np",
+		return_dict=True,
+		max_length=inference.model_prefill_length,
+		padding="max_length",
+		add_generation_prompt=True,
+	)
+
+	input_ids, attention_mask = ids["input_ids"], ids["attention_mask"]
+	pad_seq = inference.model_prefill_length
+	with jax.profiler.trace("/tmp/tensorboard"):
+		print("FIRST ATTEMPT 1")
 		async for response in inference.generate(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
@@ -97,26 +85,28 @@ async def main():
 			)
 			pad_seq += inference.generation_config.streaming_chunks
 			print(
-				tokenizer.decode(
-					response.sequences[0][next_slice],
-					skip_special_tokens=True,
-				),
+				tokenizer.decode(response.sequences[0][next_slice], skip_special_tokens=True),
 				end="",
 			)
 
-		print()
-		end = time.time()
-		final_response = tokenizer.decode(
-			response.sequences[0][start_length:pad_seq],
-			skip_special_tokens=True,
-		)
-		conversation.append({"role": "user", "content": final_response})
-		print(inference.count_tokens(conversation))
-		print(
-			"TPS :",
-			sum(response.sequences[0][input_ids.shape[-1] :] != tokenizer.eos_token_id)
-			/ (end - start),
-		)
+		print(f"\nTPS : {response.tokens_pre_second}")
+
+		print("FIRST ATTEMPT 2")
+		async for response in inference.generate(
+			input_ids=input_ids,
+			attention_mask=attention_mask,
+		):
+			next_slice = slice(
+				pad_seq,
+				pad_seq + inference.generation_config.streaming_chunks,
+			)
+			pad_seq += inference.generation_config.streaming_chunks
+			print(
+				tokenizer.decode(response.sequences[0][next_slice], skip_special_tokens=True),
+				end="",
+			)
+
+		print(f"\nTPS : {response.tokens_pre_second}")
 
 
 if __name__ == "__main__":

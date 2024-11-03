@@ -39,7 +39,7 @@ async def main():
 			mask_max_position_embeddings=max_length,
 			block_q=64,
 			block_k=128,
-			attn_mechanism=ed.AttentionMechanisms.SDPA,
+			attn_mechanism=ed.AttentionMechanisms.CUDA_FLASH_ATTN2,
 			quantize_kv_cache=True,
 		),
 		quantization_method="8bit",

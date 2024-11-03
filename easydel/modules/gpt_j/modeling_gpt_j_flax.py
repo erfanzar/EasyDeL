@@ -23,8 +23,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from fjformer import with_sharding_constraint
-from fjformer.bit_quantization import config as q_config
-from fjformer.bit_quantization import q_flax
 from flax import linen as nn
 from flax.core.frozen_dict import FrozenDict, unfreeze
 from flax.linen import Dense, combine_masks, make_causal_mask
@@ -38,6 +36,7 @@ from easydel.modules.flax_modeling_utils import (
 	FlaxAttentionModule,
 	block_wise_ffn,
 	get_gradient_checkpoint_policy,
+	get_dot_general_by_bits,
 )
 from easydel.modules.gpt_j.gpt_j_configuration import GPTJConfig as GPTJConfig
 from easydel.modules.gpt_j.kernels import gptj_mlp_pallas
@@ -97,23 +96,15 @@ class FlaxGPTJAttention(FlaxAttentionModule):
 		self.head_dim = self.embed_dim // self.num_heads
 
 		self.rotary_dim = config.rotary_dim
-		if self.config.bits is not None:
-			_dot_general_cls = q_config.fully_quantized(
-				fwd_bits=self.config.bits, bwd_bits=self.config.bits
-			)
-		else:
-			_dot_general_cls = None
-
-		dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
 		dense = partial(
 			Dense,
 			self.embed_dim,
 			use_bias=False,
 			dtype=self.dtype,
 			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-			dot_general=dot_general_cls,
 			param_dtype=self.dtype,
 			precision=self.precision,
+			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
 		)
 
 		self.q_proj, self.k_proj, self.v_proj = dense(), dense(), dense()
@@ -301,21 +292,13 @@ class FlaxGPTJMLP(nn.Module):
 	def setup(self):
 		embed_dim = self.config.hidden_size
 		kernel_init = jax.nn.initializers.normal(self.config.initializer_range)
-		if self.config.bits is not None:
-			_dot_general_cls = q_config.fully_quantized(
-				fwd_bits=self.config.bits, bwd_bits=self.config.bits
-			)
-		else:
-			_dot_general_cls = None
-
-		dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
 		self.fc_in = Dense(
 			self.intermediate_size,
 			dtype=self.dtype,
 			param_dtype=self.dtype,
 			precision=self.precision,
 			kernel_init=kernel_init,
-			dot_general=dot_general_cls,
+			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
 		)
 		self.fc_out = Dense(
 			embed_dim,
@@ -323,7 +306,7 @@ class FlaxGPTJMLP(nn.Module):
 			param_dtype=self.dtype,
 			precision=self.precision,
 			kernel_init=kernel_init,
-			dot_general=dot_general_cls,
+			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
 		)
 
 		self.act = ACT2FN[self.config.activation_function]
@@ -753,14 +736,6 @@ class FlaxGPTJForCausalLMModule(nn.Module):
 	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
-		if self.config.bits is not None:
-			_dot_general_cls = q_config.fully_quantized(
-				fwd_bits=self.config.bits, bwd_bits=self.config.bits
-			)
-		else:
-			_dot_general_cls = None
-
-		dot_general_cls = q_flax.QDotGeneral(_dot_general_cls)
 		self.transformer = FlaxGPTJModule(
 			self.config,
 			dtype=self.dtype,
@@ -771,9 +746,9 @@ class FlaxGPTJForCausalLMModule(nn.Module):
 			self.config.vocab_size,
 			dtype=self.dtype,
 			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-			dot_general=dot_general_cls,
 			param_dtype=self.dtype,
 			precision=self.precision,
+			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
 		)
 
 	def __call__(
