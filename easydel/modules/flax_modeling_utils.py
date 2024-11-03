@@ -28,8 +28,8 @@ import jax
 import jax.experimental
 import jax.tree_util
 from einops import rearrange
-from fjformer.bit_quantization import config as q_config
-from fjformer.bit_quantization import q_flax
+from aqt.jax.v2 import config as q_config
+from aqt.jax.v2.flax import aqt_flax as q_flax
 from fjformer.dtypes import Array8Bit
 from flax import linen as nn
 from flax.linen import combine_masks
@@ -549,8 +549,8 @@ def get_dot_general_by_bits(
 	if bits is not None:
 		return {
 			"dot_general_cls": functools.partial(
-				q_flax.QDotGeneral,
-				q_config.fully_quantized(fwd_bits=bits, bwd_bits=bits),
+				q_flax.AqtDotGeneral,
+				cfg=q_config.fully_quantized(fwd_bits=bits, bwd_bits=bits),
 				rhs_quant_mode=rhs_quant_mode,
 			)
 		}

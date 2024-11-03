@@ -45,7 +45,7 @@ if os.environ.get("EASYDEL_AUTO", "true") in ["true", "1", "on", "yes"]:
 
 
 # EasyDel Imports
-from packaging.version import Version
+from packaging.version import Version as _Version
 
 from easydel import etils, modules
 from easydel.etils.easystate import EasyDeLState
@@ -367,13 +367,16 @@ from easydel.transform import (
 	torch_dict_to_easydel_params,
 )
 
-_targeted_versions = ["0.0.83"]
+_targeted_versions = ["0.0.84"]
 
-from fjformer import __version__ as _fjv
+from fjformer import __version__ as _fjformer_version
 
-assert Version(_fjv) in [
-	Version(_targeted_version) for _targeted_version in _targeted_versions
+assert _Version(_fjformer_version) in [
+	_Version(_targeted_version) for _targeted_version in _targeted_versions
 ], (
 	f"this version of EasyDeL is only compatible with fjformer {', '.join(_targeted_versions)},"
-	f" but found fjformer {_fjv}"
+	f" but found fjformer {_fjformer_version}"
 )
+
+del _Version
+del _fjformer_version

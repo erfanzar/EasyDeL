@@ -19,7 +19,6 @@ import warnings
 from enum import Enum
 from functools import lru_cache, partial
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
-
 import einops
 import fjformer
 import flax
@@ -56,12 +55,67 @@ from easydel.kernels.ring_attention import ring_attention
 from easydel.modules._blockwise_attention import blockwise_attn
 from easydel.modules.modeling_utils import EDPretrainedConfig
 
+try:
+	from flash_attn_jax import flash_mha as cuda_flash_attn2_mha
+	from flash_attn_jax.flash_hlo import (
+		dtypes,
+		ShapedArray,
+		_flash_mha_fwd_hlo_p,
+		_flash_mha_bwd_hlo_p,
+	)
+	from flash_attn_jax.flash import _flash_mha_fwd_p, _flash_mha_bwd_p
+
+	def _flash_mha_fwd_abstract(
+		q,
+		k,
+		v,
+		softmax_scale=None,
+		is_causal=None,
+		window_size=None,
+	):
+		q_dtype = dtypes.canonicalize_dtype(q.dtype)
+		k_dtype = dtypes.canonicalize_dtype(k.dtype)
+		v_dtype = dtypes.canonicalize_dtype(v.dtype)
+		[n, s, h, d] = q.shape
+		assert q_dtype == k_dtype and q_dtype == v_dtype
+		assert q_dtype in [jnp.bfloat16, jnp.float16]
+		return (
+			ShapedArray(q.shape, q_dtype, sharding=getattr(q, "sharding", None)),
+			ShapedArray([n, h, s], jnp.float32),
+		)
+
+	def _flash_mha_bwd_abstract(
+		dout, q, k, v, out, lse, softmax_scale=None, is_causal=None, window_size=None
+	):
+		dout_dtype = dtypes.canonicalize_dtype(dout.dtype)
+		q_dtype = dtypes.canonicalize_dtype(q.dtype)
+		k_dtype = dtypes.canonicalize_dtype(k.dtype)
+		v_dtype = dtypes.canonicalize_dtype(v.dtype)
+		out_dtype = dtypes.canonicalize_dtype(out.dtype)
+		[n, lq, hq, d] = q.shape
+		assert len(set([dout_dtype, q_dtype, k_dtype, v_dtype, out_dtype])) == 1
+		assert q_dtype in [jnp.bfloat16, jnp.float16]
+		return (
+			ShapedArray(q.shape, q_dtype, sharding=getattr(q, "sharding", None)),
+			ShapedArray(k.shape, k_dtype, sharding=getattr(k, "sharding", None)),
+			ShapedArray(v.shape, v_dtype, sharding=getattr(v, "sharding", None)),
+		)
+
+	_flash_mha_bwd_hlo_p.def_abstract_eval(_flash_mha_bwd_abstract)
+	_flash_mha_fwd_hlo_p.def_abstract_eval(_flash_mha_fwd_abstract)
+	_flash_mha_fwd_p.def_abstract_eval(_flash_mha_fwd_abstract)
+	_flash_mha_bwd_p.def_abstract_eval(_flash_mha_bwd_abstract)
+
+except:  # noqa
+	cuda_flash_attn2_mha = None
 logger = get_logger(__name__)
 
 AVAILABLE_BACKENDS = Literal["triton", "pallas", "jax"]
 AVAILABLE_PLATFORMS = Literal["gpu", "tpu", "cpu"]
 DEFAULT_K_BLOCK = 128
 DEFAULT_Q_BLOCK = 64
+
+PRINT_COMMON = False
 
 
 @lru_cache
@@ -128,6 +182,7 @@ class AttentionMechanisms(str, Enum):
 	CUDNN = "cudnn"
 	BLOCKWISE = "blockwise"
 	SDPA = "sdpa"
+	CUDA_FLASH_ATTN2 = "cuda_flash_attn2"
 
 
 def combine_flash_masks(causal_mask, segment_ids):
@@ -207,17 +262,17 @@ class FlexibleAttentionModule(object):
 	Key Features:
 
 	* **Attention Mechanism Selection:** Supports a wide range of attention mechanisms,
-		allowing users to choose the most suitable option based on performance and hardware constraints.
+	  allowing users to choose the most suitable option based on performance and hardware constraints.
 	* **Sharding and Partitioning:** Integrates with JAX's sharding capabilities, enabling efficient
-		distribution of computations and data across multiple devices.
+	  distribution of computations and data across multiple devices.
 	* **Block-wise Computation:** Implements block-wise attention computations for optimized memory
-		usage and speed, particularly beneficial for large models.
+	  usage and speed, particularly beneficial for large models.
 	* **Performance Optimization:** Includes support for highly optimized implementations like
-		FlashAttention, SplashAttention, and RingAttention for TPU and GPU acceleration.
+	  FlashAttention, SplashAttention, and RingAttention for TPU and GPU acceleration.
 	* **Flexibility and Customization:** Offers fine-grained control over attention parameters,
-		sharding specifications, and block sizes, providing flexibility for different use cases.
+	  sharding specifications, and block sizes, providing flexibility for different use cases.
 	* **Testing and Evaluation:** Includes a `run_attention_benchmarks` method to systematically evaluate
-		different attention mechanisms and help users identify the best-performing option.
+	  different attention mechanisms and help users identify the best-performing option.
 
 	Example Usage:
 
@@ -247,7 +302,7 @@ class FlexibleAttentionModule(object):
 	computations. It provides a user-friendly way to select and execute different attention mechanisms,
 	leveraging JAX's sharding capabilities and offering performance enhancements through specialized implementations
 	 like FlashAttention and SplashAttention. Its ability to handle block-wise computations and customization options
-		makes it adaptable to a variety of model architectures and hardware configurations.
+	  makes it adaptable to a variety of model architectures and hardware configurations.
 	"""
 
 	def __init__(
@@ -277,7 +332,6 @@ class FlexibleAttentionModule(object):
 		base_config: Optional[EDPretrainedConfig] = None,
 		_do_check: bool = True,
 	):
-		# fmt:off
 		self.block_k: int = ...
 		self.block_q: int = ...
 		self.block_b: int = ...
@@ -291,6 +345,7 @@ class FlexibleAttentionModule(object):
 		self.backend: str = ...
 		self.platform: str = ...
 
+		# fmt:off
 		set_attrs_smartly_with_prp(self, "use_sharding_constraint", False, use_sharding_constraint, base_config)
 		set_attrs_smartly_with_prp(self, "block_q", DEFAULT_Q_BLOCK, block_q, base_config)
 		set_attrs_smartly_with_prp(self, "block_k", DEFAULT_K_BLOCK, block_k, base_config)
@@ -304,10 +359,11 @@ class FlexibleAttentionModule(object):
 		set_attrs_smartly_with_prp(self, "axis_name", "sp", axis_name, base_config, "attention_axis_name")  # DON'T READ FROM CONFIG
 		set_attrs_smartly_with_prp(self, "backend", jax.default_backend(), backend, base_config, "backend") 
 		set_attrs_smartly_with_prp(self, "platform", ..., platform, base_config, "platform") 
+		# fmt:on
 
 		self.mesh = mesh
-		self.attn_mechanism = attn_mechanism 
-		self.sm_scale = sm_scale  
+		self.attn_mechanism = attn_mechanism
+		self.sm_scale = sm_scale
 		self.head_dims = head_dims
 		self.scan_attention_layers = scan_attention_layers
 		self.attention_dropout = attention_dropout
@@ -315,7 +371,7 @@ class FlexibleAttentionModule(object):
 		self._do_check = _do_check
 		self.num_kv_heads = num_kv_heads or num_q_heads
 		self.num_q_heads = num_q_heads
-		assert num_q_heads % num_kv_heads == 0 
+		assert num_q_heads % num_kv_heads == 0
 
 		if attn_mechanism == "splash" and self.backend != "tpu":
 			raise OSError("splash attention is only supported on TPU.")
@@ -323,10 +379,7 @@ class FlexibleAttentionModule(object):
 			raise OSError("flash attention is only supported on GPU.")
 		if isinstance(self.dtype, str):
 			self.dtype = _get_jax_dtype_from_string(self.dtype)
-			assert (
-				self.dtype is not None
-			), "Please consider passing attn_dtype to config."
-		# fmt:on
+			assert self.dtype is not None, "Please consider passing attn_dtype to config."
 
 	def get_block_size_splash_attn(self, q_seq, k_seq):
 		return BlockSizesSplashAttn(
@@ -511,12 +564,12 @@ class FlexibleAttentionModule(object):
 		)
 
 		assertion_mkv_err = f"""
-				query_states, key_states, value_states and bias shapes must be like
-				query_states Shape : [batch_size, q_seq_len , {self.num_q_heads=}, {self.head_dims=}]
-				key_states   Shape : [batch_size, kv_seq_len, {self.num_kv_heads=}, {self.head_dims=}]
-				value_states Shape : [batch_size, kv_seq_len, {self.num_kv_heads=}, {self.head_dims=}]
-				bias         Shape : [batch_size, {self.num_q_heads=}, q_seq_len , kv_seq_len]
-						"""
+        query_states, key_states, value_states and bias shapes must be like
+        query_states Shape : [batch_size, q_seq_len , {self.num_q_heads=}, {self.head_dims=}]
+        key_states   Shape : [batch_size, kv_seq_len, {self.num_kv_heads=}, {self.head_dims=}]
+        value_states Shape : [batch_size, kv_seq_len, {self.num_kv_heads=}, {self.head_dims=}]
+        bias         Shape : [batch_size, {self.num_q_heads=}, q_seq_len , kv_seq_len]
+            """
 
 		assert query_states.shape == q_shape, assertion_mkv_err + (
 			f"\nMiss Match {query_states.shape} and " f"required Shape {q_shape}"
@@ -528,6 +581,7 @@ class FlexibleAttentionModule(object):
 			f"\nMiss Match {value_states.shape} and " f"required Shape {k_v_req_shape}"
 		)
 
+	# @functools.partial(jax.jit, static_argnames=["self"])
 	def __call__(
 		self,
 		query_states: Array,
@@ -544,20 +598,20 @@ class FlexibleAttentionModule(object):
 		uses_cache: bool = False,
 		causal_mask: Optional[Array] = None,
 	):
-		# fmt:off
+		global PRINT_COMMON
 		if query_sequence_length is None:
 			query_sequence_length = query_states.shape[1]
 		if key_value_sequence_length is None:
 			key_value_sequence_length = key_states.shape[1]
 		with self.mesh:
-			if self._do_check:
-				self._check_states(
-					query_states=query_states,
-					key_states=key_states,
-					value_states=value_states,
-					query_sequence_length=query_sequence_length,
-					key_value_sequence_length=key_value_sequence_length,
-				)
+			# if self._do_check:
+			# 	self._check_states(
+			# 		query_states=query_states,
+			# 		key_states=key_states,
+			# 		value_states=value_states,
+			# 		query_sequence_length=query_sequence_length,
+			# 		key_value_sequence_length=key_value_sequence_length,
+			# 	)
 			match self.attn_mechanism:
 				case AttentionMechanisms.FLASH_ATTN2:
 					return self.flash_attn2(
@@ -599,13 +653,26 @@ class FlexibleAttentionModule(object):
 						key_value_sequence_length=key_value_sequence_length,
 					)
 				case AttentionMechanisms.SPLASH:
-					if segment_ids is not None:
-						warnings.warn("Splash attention don't support `segment_ids` this argument will be ignored", UserWarning, stacklevel=1)
-					if self.attention_dropout != 0.0:
-						warnings.warn("Splash attention don't support `attention_dropout` this argument will be ignored", UserWarning, stacklevel=1)
-					if bias is not None:
-						warnings.warn("Splash attention don't support `bias` this argument will be ignored", UserWarning, stacklevel=1)
-
+					if PRINT_COMMON:
+						if segment_ids is not None:
+							warnings.warn(
+								"Splash attention don't support `segment_ids` this argument will be ignored",
+								UserWarning,
+								stacklevel=1,
+							)
+						if self.attention_dropout != 0.0:
+							warnings.warn(
+								"Splash attention don't support `attention_dropout` this argument will be ignored",
+								UserWarning,
+								stacklevel=1,
+							)
+						if bias is not None:
+							warnings.warn(
+								"Splash attention don't support `bias` this argument will be ignored",
+								UserWarning,
+								stacklevel=1,
+							)
+						PRINT_COMMON = False
 					return self.splash_attention(
 						query_states=query_states,
 						key_states=key_states,
@@ -614,9 +681,14 @@ class FlexibleAttentionModule(object):
 						key_value_sequence_length=key_value_sequence_length,
 						attention_mask=attention_mask,
 					)
-				case  AttentionMechanisms.BLOCKWISE:
-					if segment_ids is not None:
-						warnings.warn("BlockWise Attention don't support `segment_ids` this argument will be ignored", UserWarning, stacklevel=1)
+				case AttentionMechanisms.BLOCKWISE:
+					if segment_ids is not None and PRINT_COMMON:
+						warnings.warn(
+							"BlockWise Attention don't support `segment_ids` this argument will be ignored",
+							UserWarning,
+							stacklevel=1,
+						)
+						PRINT_COMMON = False
 					return self.blockwise_attention(
 						query_states=query_states,
 						key_states=key_states,
@@ -638,9 +710,23 @@ class FlexibleAttentionModule(object):
 						query_sequence_length=query_sequence_length,
 						key_value_sequence_length=key_value_sequence_length,
 					)
-							
+				case AttentionMechanisms.CUDA_FLASH_ATTN2:
+					if bias is not None and PRINT_COMMON:
+						warnings.warn(
+							"`CUDA_FLASH_ATTN2` doesn't support bias and attention mask and "
+							f"causal will only be used which is passed as {causal}, please check outputs to make sure this is what you want.",
+							stacklevel=1,
+						)
+						PRINT_COMMON = False
+					return self.cuda_flash_attn2(
+						query_states=query_states,
+						key_states=key_states,
+						value_states=value_states,
+						causal=causal,
+						attention_mask=attention_mask,
+					)
+
 		raise ValueError(f"Unknown Attention mechanism of {self.attn_mechanism}")
-		# fmt:on
 
 	def sdpa(
 		self,
@@ -867,6 +953,52 @@ class FlexibleAttentionModule(object):
 				attention_weights=None,
 				attention_outputs=attention_outputs,
 			)
+
+	def cuda_flash_attn2(
+		self,
+		*,  # it's Kwarg Only
+		query_states: Array,
+		key_states: Array,
+		value_states: Array,
+		causal: bool = True,
+		attention_mask=None,
+	):
+		if cuda_flash_attn2_mha is not None:
+			key_states, value_states = self.repeat_kv_heads(
+				key_states,
+				value_states,
+				self.num_q_heads // self.num_kv_heads,
+			)
+			(
+				query_partitionspec,
+				key_partitionspec,
+				value_partitionspec,
+				_,
+				attention_partitionspec,
+				in_generating_process,
+			) = self.get_bshd_partition_specs(query_states.shape[1], True)
+
+			output = cuda_flash_attn2_mha(
+				q=with_sharding_constraint(
+					query_states.astype(self.dtype), query_partitionspec
+				),
+				k=with_sharding_constraint(key_states.astype(self.dtype), key_partitionspec),
+				v=with_sharding_constraint(
+					value_states.astype(self.dtype), value_partitionspec
+				),
+				softmax_scale=self.sm_scale,
+				is_causal=False if in_generating_process else causal,
+				window_size=(-1, -1),
+			)
+			return AttentionOutput(
+				attention_weights=None,
+				attention_outputs=with_sharding_constraint(
+					output,
+					attention_partitionspec,
+				),
+			)
+		else:
+			raise ModuleNotFoundError("please install flash_attn_jax==0.2.2")
 
 	def ring_attention(
 		self,
