@@ -4,7 +4,9 @@ import sys
 from typing import Literal
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from easydel.kernels.flash_attention_2 import create_flash_attention
+from easydel.kernels.gpu_ops.triton_gqa_flash_attention_2 import (
+	triton_gqa_flash_attention2_gpu,
+)
 import jax
 import jaxlib
 import triton
@@ -89,45 +91,45 @@ def mha_attention_benchmark(
 	BIAS,
 	provider,
 ):
+	# try:
+	query, key, value, bias = _get_inputs(B, H, H, S, S, D, provider, BIAS)
+	if mode == "fwd":
+		if provider == "triton":
+			fn = lambda: triton_gqa_flash_attention2_gpu(query, key, value, bias)
+		elif provider == "cudnn_sdpa":
+			_fn = jax.jit(
+				functools.partial(
+					nn.dot_product_attention,
+					implementation="cudnn",
+				)
+			)
+			fn = lambda: _fn(query, key, value, bias).block_until_ready()
+	elif mode == "bwd":
+		if provider == "triton":
+			fn = lambda: jax.grad(lambda *x: triton_gqa_flash_attention2_gpu(*x).sum())(
+				query, key, value, bias
+			)
+		elif provider == "cudnn_sdpa":
+			_fn = jax.jit(
+				functools.partial(
+					nn.dot_product_attention,
+					implementation="cudnn",
+				)
+			)
+			fn = lambda: jax.grad(lambda *x: _fn(*x).sum())(
+				query, key, value, bias
+			).block_until_ready()
 	try:
-		query, key, value, bias = _get_inputs(B, H, H, S, S, D, provider, BIAS)
-		if mode == "fwd":
-			if provider == "triton":
-				flash_attn = create_flash_attention(backend="gpu", platform="triton")
-				fn = lambda: flash_attn(query, key, value, bias)
-			elif provider == "cudnn_sdpa":
-				_fn = jax.jit(
-					functools.partial(
-						nn.dot_product_attention,
-						implementation="cudnn",
-					)
-				)
-				fn = lambda: _fn(query, key, value, bias).block_until_ready()
-		elif mode == "bwd":
-			if provider == "triton":
-				flash_attn = create_flash_attention(backend="gpu", platform="triton")
-				fn = lambda: jax.grad(lambda *x: flash_attn(*x).sum())(query, key, value, bias)
-			elif provider == "cudnn_sdpa":
-				_fn = jax.jit(
-					functools.partial(
-						nn.dot_product_attention,
-						implementation="cudnn",
-					)
-				)
-				fn = lambda: jax.grad(lambda *x: _fn(*x).sum())(
-					query, key, value, bias
-				).block_until_ready()
-		try:
-			ms = triton.testing.do_bench(fn)
-		except jaxlib.xla_extension.XlaRuntimeError:
-			ms = 1000.0000
-		return ms
-	except:  # noqa
-		return 500.0000
+		ms = triton.testing.do_bench(fn)
+	except jaxlib.xla_extension.XlaRuntimeError:
+		ms = 1000.0000
+	return ms
+	# except:  # noqa
+	# 	return 500.0000
 
 
 if __name__ == "__main__":
 	mha_attention_benchmark.run(
 		print_data=True,
-		save_path=".",
+		save_path="/home/erfan/PycharmProjects/bench/",
 	)
