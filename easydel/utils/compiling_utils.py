@@ -1,8 +1,9 @@
 from __future__ import annotations
+import functools
 import os
 import hashlib
 import pickle
-from typing import Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import jax
 from jax._src.stages import Compiled, Lowered
 from jax.experimental.serialize_executable import deserialize_and_load, serialize
@@ -13,6 +14,21 @@ RECOMPILE_FORCE = os.environ.get("RECOMPILE_FORCE", "false") in ["true", "1", "o
 CACHE_DIR = get_cache_dir()
 COMPILE_FUNC_DIR = CACHE_DIR / "compiled_funcs"
 COMPILE_FUNC_DIR.mkdir(parents=True, exist_ok=True)
+
+COMPILED_CACHE: Dict[Tuple, Any] = {}
+
+
+def get_signature(args, kwargs) -> Tuple:
+	"""Get a hashable signature of args/kwargs shapes and dtypes."""
+
+	def get_array_signature(x):
+		if hasattr(x, "shape") and hasattr(x, "dtype"):
+			return (tuple(x.shape), str(x.dtype))
+		return str(type(x))
+
+	args_sig = tuple(get_array_signature(arg) for arg in args)
+	kwargs_sig = tuple((k, get_array_signature(v)) for k, v in sorted(kwargs.items()))
+	return (args_sig, kwargs_sig)
 
 
 def get_hash_of_lowering(lowered_func: Lowered):
@@ -41,6 +57,75 @@ def smart_compile(lowered_func: Lowered, tag: Optional[str] = None):
 		func_dir.mkdir(parents=True, exist_ok=True)
 		pickle.dump((serialized, in_tree, out_tree), open(filepath, "wb"))
 		return compiled_func
+
+
+def cache_compiles(
+	tag: Optional[str] = None,
+	static_argnames: Optional[List[str]] = None,
+):
+	static_argnames = static_argnames or []
+
+	def create_wrapper(func: Callable, tag: Optional[str] = None) -> Callable:
+		original_func = getattr(func, "_fun", func)
+		func_id = str(
+			hashlib.sha256(
+				original_func.__code__.co_code,
+			)
+			.hexdigest()
+			.encode("utf-8")
+		)
+
+		@functools.wraps(func)
+		def wrapper(*args, **kwargs):
+			signature = (func_id, get_signature(args, kwargs))
+			if signature in COMPILED_CACHE:
+				for static_key in static_argnames:
+					kwargs.pop(static_key)
+				return COMPILED_CACHE[signature](*args, **kwargs)
+			if hasattr(func, "lower"):
+				lowered = func.lower(*args, **kwargs)
+				for static_key in static_argnames:
+					kwargs.pop(static_key)
+				func_hash = get_hash_of_lowering(lowered)
+				sig_hash = hashlib.sha256(str(signature).encode()).hexdigest()[:8]
+				foldername = (
+					f"{tag}-{func_hash}-{sig_hash}" if tag else f"{func_hash}-{sig_hash}"
+				)
+				func_dir = COMPILE_FUNC_DIR / foldername
+				filepath = func_dir / "compiled.func"
+
+				if filepath.exists() and not RECOMPILE_FORCE:
+					with open(filepath, "rb") as f:
+						serialized, in_tree, out_tree = pickle.load(f)
+					compiled_func = deserialize_and_load(
+						serialized=serialized,
+						in_tree=in_tree,
+						out_tree=out_tree,
+					)
+					COMPILED_CACHE[signature] = compiled_func
+					return compiled_func(*args, **kwargs)
+
+				compiled_func = lowered.compile()
+				COMPILED_CACHE[signature] = compiled_func
+
+				try:
+					serialized, in_tree, out_tree = serialize(compiled_func)
+					func_dir.mkdir(parents=True, exist_ok=True)
+					with open(filepath, "wb") as f:
+						pickle.dump((serialized, in_tree, out_tree), f)
+				except Exception as e:
+					print(f"Failed to cache compilation: {e}")
+
+				return compiled_func(*args, **kwargs)
+			return func(*args, **kwargs)
+
+		wrapper._COMPILED_CACHE = COMPILED_CACHE
+		return wrapper
+
+	def decorator(func: Callable) -> Callable:
+		return create_wrapper(func, tag)
+
+	return decorator
 
 
 def lower_function(
