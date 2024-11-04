@@ -56,14 +56,14 @@ from easydel.modules._blockwise_attention import blockwise_attn
 from easydel.modules.modeling_utils import EDPretrainedConfig
 
 try:
-	from flash_attn_jax import flash_mha as cuda_flash_attn2_mha
-	from flash_attn_jax.flash_hlo import (
+	from flash_attn_jax import flash_mha as cuda_flash_attn2_mha  # noqa #type:ignore
+	from flash_attn_jax.flash_hlo import (  # noqa #type:ignore
 		dtypes,
 		ShapedArray,
 		_flash_mha_fwd_hlo_p,
 		_flash_mha_bwd_hlo_p,
 	)
-	from flash_attn_jax.flash import _flash_mha_fwd_p, _flash_mha_bwd_p
+	from flash_attn_jax.flash import _flash_mha_fwd_p, _flash_mha_bwd_p  # noqa #type:ignore
 
 	def _flash_mha_fwd_abstract(
 		q,
@@ -895,7 +895,6 @@ class FlexibleAttentionModule(object):
 						)
 						if bias is not None
 						else None,
-						adjust_sharindgs=True,
 					)
 
 				# Case 3: Both FSDP and SP > 1

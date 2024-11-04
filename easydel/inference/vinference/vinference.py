@@ -655,6 +655,14 @@ class vInference:
 							break
 				else:
 					yield state
+
+			self.metrics.token_throughput.labels(
+				model_name=self.metrics.model_name,
+				operation="output",
+			).inc(state.generated_tokens)
+			self.metrics.generation_length.labels(
+				model_name=self.metrics.model_name,
+			).observe(state.generated_tokens)
 			self.metrics.inference_requests.labels(
 				model_name=self.metrics.model_name,
 				status="success",
@@ -667,13 +675,6 @@ class vInference:
 			raise e
 		finally:
 			self.metrics.queue_size.labels(model_name=self.metrics.model_name).dec()
-			self.metrics.token_throughput.labels(
-				model_name=self.metrics.model_name,
-				operation="output",
-			).inc(state.generated_tokens)
-			self.metrics.generation_length.labels(
-				model_name=self.metrics.model_name,
-			).observe(state.generated_tokens)
 
 	def _compile_and_lower_funs(self, batch_size: int, input_tokens_length: int):
 		compiled_generate_func, compiled_interval_func = get_compiled_funcs(
