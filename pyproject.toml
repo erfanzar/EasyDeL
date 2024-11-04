@@ -60,7 +60,6 @@ unfixable = ["B"]
 "__init__.py" = ["E402", "F401"]
 "**/{tests,docs,tools}/*" = ["E402"]
 "tests/*" = ["E402", "E731"]
-"benchmarks/*" = ["E402", "E731"]
 "triton_*" = ["E741", "ISC001", "E501", "E731"]
 "pallas_*" = ["E741", "ISC001", "E501", "E731"]
 
