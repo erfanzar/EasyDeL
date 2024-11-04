@@ -18,7 +18,9 @@ import os
 
 if os.environ.get("EASYDEL_AUTO", "true") in ["true", "1", "on", "yes"]:
 	# Taking care of some optional GPU FLAGs
+	os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 	os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+	os.environ["CACHE_TRITON_KERNELS"] = "1"
 	os.environ["XLA_FLAGS"] = (
 		os.environ.get("XLA_FLAGS", "") + " "
 		"--xla_gpu_triton_gemm_any=True \ "
@@ -367,7 +369,7 @@ from easydel.transform import (
 	torch_dict_to_easydel_params,
 )
 
-_targeted_versions = ["0.0.84"]
+_targeted_versions = ["0.0.85"]
 
 from fjformer import __version__ as _fjformer_version
 

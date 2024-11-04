@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# impl GQA ATTN  by @erfanzar
+# impl GQA ATTN by @erfanzar
+
 import functools
 import math
 import os
@@ -28,20 +29,16 @@ import chex
 import jax
 import numpy as np
 import triton
-from fjformer.jax_triton import triton_call
-from jax import custom_vjp
+from jax import custom_vjp, random as jrnd
 from jax import numpy as jnp
-from jax import random as jrnd
 from triton import language as tl
+from fjformer.jax_triton import triton_call
 
 FLASH_ATTN_BWD_ = True
-FLASH_ATTN_WRAPS = int(os.environ.get("FLASH_ATTN_WRAPS", "0"))
 
 
 def calculate_num_warps(
-	head_dim: int,
-	q_block_size: int = 0,
-	k_block_size: int = 0,
+	head_dim: int, q_block_size: int = 0, k_block_size: int = 0
 ) -> int:
 	"""
 	Calculate the number of warps based on head dimension and block sizes.
@@ -112,8 +109,6 @@ def check_shapes_and_dtypes(
 		seqlen_k: Sequence length of the key.
 		nheads: Number of heads.
 		headdim: Head dimension.
-		blocksize_k: Block size for the key.
-		blocksize_q: Block size for the query.
 
 	Raises:
 		AssertionError: If the shapes or dtypes are not valid.
@@ -126,6 +121,7 @@ def check_shapes_and_dtypes(
 	)
 	if query.dtype not in [jnp.float16]:
 		raise AssertionError("Only fp16 is supported.") from None
+
 	if headdim > 256:
 		raise AssertionError("Unsupported headdim value.")
 
@@ -139,9 +135,9 @@ def is_hip():
 
 fwd_configs = [
 	triton.Config({"BLOCK_M": BM, "BLOCK_N": BN}, num_stages=s, num_warps=w)
-	for BM in [32, 64, 128]
-	for BN in [32, 64, 128]
-	for s in ([1] if is_hip() else [3, 4, 7])
+	for BM in [16, 32, 64, 128]
+	for BN in [16, 32, 64, 128]
+	for s in ([1] if is_hip() else [1, 3, 4, 7])
 	for w in [2, 4, 8]
 ]
 
@@ -165,6 +161,7 @@ def _fwd_attention_kernel(
 	K,
 	V,
 	B,
+	softmax_scale: tl.constexpr,
 	stride_qb,
 	stride_qh,
 	stride_qg,
@@ -172,23 +169,30 @@ def _fwd_attention_kernel(
 	stride_kb,
 	stride_kh,
 	stride_kn,
+	stride_vb,
+	stride_vh,
+	stride_vn,
 	stride_bb,
 	stride_bh,
 	stride_bg,
 	stride_bm,
+	stride_bn,
+	stride_ob,
+	stride_oh,
+	stride_og,
+	stride_om,
 	stride_lb,
 	stride_lh,
 	stride_lg,
-	headdim,
-	num_kv_heads,
+	headdim: tl.constexpr,
+	num_kv_heads: tl.constexpr,
+	num_groups: tl.constexpr,
+	CQL: tl.constexpr,
+	CKL: tl.constexpr,
 	seqlen_q,
 	seqlen_k,
 	O,
 	L,
-	softmax_scale: tl.constexpr,
-	num_groups: tl.constexpr,
-	CQL: tl.constexpr,
-	CKL: tl.constexpr,
 	HAVE_BIAS: tl.constexpr,
 	BIAS_SINGLE_HEAD: tl.constexpr,
 	BLOCK_HEADDIM: tl.constexpr,
@@ -216,10 +220,10 @@ def _fwd_attention_kernel(
 		order=(0, 1),
 	)
 	O_Block_ptr = tl.make_block_ptr(
-		base=O + (off_b * stride_qb + off_h * stride_qh + off_gp * stride_qg),
+		base=O + (off_b * stride_ob + off_h * stride_oh + off_gp * stride_og),
 		shape=(seqlen_q, headdim),
 		block_shape=(BLOCK_M, BLOCK_HEADDIM),
-		strides=(stride_qm, 1),
+		strides=(stride_om, 1),
 		offsets=(start_m * BLOCK_M, 0),
 		order=(0, 1),
 	)
@@ -244,11 +248,12 @@ def _fwd_attention_kernel(
 		base=V + kv_stride,
 		shape=(seqlen_k, headdim),
 		block_shape=(BLOCK_N, BLOCK_HEADDIM),
-		strides=(stride_kn, 1),
+		strides=(stride_vn, 1),
 		offsets=(0, 0),
 		order=(0, 1),
 	)
 	q = tl.load(Q_Block_ptr, boundary_check=(0, 1))
+	softmax_scale = softmax_scale.to(tl.float32)
 	if HAVE_BIAS:
 		bias_h_pos: tl.constexpr = (
 			0 if BIAS_SINGLE_HEAD else off_h * stride_bh + off_gp * stride_bg
@@ -257,7 +262,7 @@ def _fwd_attention_kernel(
 			base=B + (off_b * stride_bb + bias_h_pos),
 			shape=(seqlen_q, seqlen_k),
 			block_shape=(BLOCK_M, BLOCK_N),
-			strides=(stride_bm, 1),
+			strides=(stride_bm, stride_bn),
 			offsets=(start_m * BLOCK_M, 0),
 			order=(0, 1),
 		)
@@ -311,8 +316,6 @@ def _fwd_attention_kernel_call(
 		value: Value array.
 		bias: Bias array.
 		softmax_scale: Scaling factor for the softmax function.
-		blocksize_q: Block size for the query sequence dimension.
-		blocksize_k: Block size for the key sequence dimension.
 
 	Returns:
 		Tuple of the output array and the log-sum-exp array.
@@ -320,17 +323,35 @@ def _fwd_attention_kernel_call(
 	batch, seqlen_q, num_q_heads, headdim = query.shape
 	_, seqlen_k, num_kv_heads, _ = key.shape
 	num_groups = num_q_heads // num_kv_heads
-	query = query.reshape(batch, seqlen_q, num_kv_heads, num_groups, headdim)
+	query = query.reshape(
+		batch,
+		seqlen_q,
+		num_kv_heads,
+		num_groups,
+		headdim,
+	)
 	if bias is not None:
 		if bias.shape[1] == 1:
-			bias = bias.reshape(batch, 1, 1, seqlen_q, seqlen_k)
+			bias = bias.reshape(
+				batch,
+				1,
+				1,
+				seqlen_q,
+				seqlen_k,
+			)
 		else:
-			bias = bias.reshape(batch, num_kv_heads, num_groups, seqlen_q, seqlen_k)
+			bias = bias.reshape(
+				batch,
+				num_kv_heads,
+				num_groups,
+				seqlen_q,
+				seqlen_k,
+			)
 		HAVE_BIAS = True
-		stride_bb, stride_bh, stride_bg, stride_bm, _ = get_strides(bias.shape)
+		stride_bb, stride_bh, stride_bg, stride_bm, stride_bn = get_strides(bias.shape)
 	else:
 		HAVE_BIAS = False
-		stride_bb, stride_bh, stride_bg, stride_bm, _ = (0, 0, 0, 0, 0)
+		stride_bb, stride_bh, stride_bg, stride_bm, stride_bn = (0, 0, 0, 0, 0)
 
 	BIAS_SINGLE_HEAD = True if bias is None else (True if bias.shape[1] == 1 else False)
 	check_shapes_and_dtypes(
@@ -341,28 +362,28 @@ def _fwd_attention_kernel_call(
 	)
 	softmax_scale = softmax_scale or 1.0 / math.sqrt(headdim)
 	BLOCK_HEADDIM = max(triton.next_power_of_2(headdim), 16)
-	stride_lb, stride_lh, stride_lg, _ = get_strides(
+	stride_lb, stride_lh, stride_lg, stride_lm = get_strides(
 		(batch, num_kv_heads, num_groups, seqlen_q)
 	)
-
-	stride_qb, stride_qm, stride_qh, stride_qg, _ = get_strides(query.shape)
-	stride_kb, stride_kn, stride_kh, _ = get_strides(key.shape)
-
 	metaparams = dict(
-		softmax_scale=softmax_scale,
-		num_groups=num_groups,
-		CQL=seqlen_q // 64,
-		CKL=seqlen_k // 64,
-		HAVE_BIAS=HAVE_BIAS,
 		BIAS_SINGLE_HEAD=BIAS_SINGLE_HEAD,
+		HAVE_BIAS=HAVE_BIAS,
 		BLOCK_HEADDIM=BLOCK_HEADDIM,
+		BLOCK_M=64,
+		BLOCK_N=64,
+		num_stages=1,
+		num_warps=8,
 	)
 
+	stride_qb, stride_qm, stride_qh, stride_qg, stride_qd = get_strides(query.shape)
+	stride_kb, stride_kn, stride_kh, stride_kd = get_strides(key.shape)
+	stride_vb, stride_vn, stride_vh, stride_vd = get_strides(value.shape)
 	out, lse = triton_call(
 		query,
 		key,
 		value,
 		bias if bias is not None else jnp.zeros((1,), jnp.float16),
+		softmax_scale,
 		stride_qb,
 		stride_qh,
 		stride_qg,
@@ -370,45 +391,49 @@ def _fwd_attention_kernel_call(
 		stride_kb,
 		stride_kh,
 		stride_kn,
+		stride_vb,
+		stride_vh,
+		stride_vn,
 		stride_bb,
 		stride_bh,
 		stride_bg,
 		stride_bm,
+		stride_bn,
+		stride_qb,
+		stride_qh,
+		stride_qg,
+		stride_qm,
 		stride_lb,
 		stride_lh,
 		stride_lg,
 		headdim,
 		num_kv_heads,
+		num_groups,
+		seqlen_q // 64,
+		seqlen_k // 64,
 		seqlen_q,
 		seqlen_k,
 		kernel=_fwd_attention_kernel,
 		out_shape=[
-			jax.ShapeDtypeStruct(
-				query.shape,
-				query.dtype,
-				sharding=get_sharding(query),
-			),
-			jax.ShapeDtypeStruct(
-				(batch, num_kv_heads, num_groups, seqlen_q),
-				jnp.float32,
-			),
+			jax.ShapeDtypeStruct(query.shape, query.dtype, sharding=get_sharding(query)),
+			jax.ShapeDtypeStruct((batch, num_kv_heads, num_groups, seqlen_q), jnp.float32),
 		],
 		grid=lambda META: (
 			triton.cdiv(seqlen_q, META["BLOCK_M"]),
 			batch * num_kv_heads,
 			num_groups,
 		),
-		name="triton::ops::_fwd_attention_kernel",
+		name="triton::ops::_fwd_attn_kernel",
 		**metaparams,
 	)
-	out = out.reshape(batch, seqlen_q, num_q_heads, headdim)
-	return out, (out, lse, query, key, value, bias)
+	return out.reshape(batch, seqlen_q, num_q_heads, headdim), lse
 
 
 @triton.jit
 def _bwd_do_attention_kernel(
 	O,
 	Do,
+	De,
 	stride_ob,
 	stride_om,
 	stride_oh,
@@ -424,7 +449,6 @@ def _bwd_do_attention_kernel(
 	num_groups,
 	headdim,
 	seqlen_q,
-	De,
 	BLOCK_M: tl.constexpr,
 	BLOCK_HEADDIM: tl.constexpr,
 ):
@@ -471,7 +495,9 @@ def _bwd_do_attention_kernel(
 
 @triton.heuristics(
 	{
+		"EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
 		"EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0,
+		"EVEN_HEADDIM": lambda args: args["headdim"] == args["BLOCK_HEADDIM"],
 	}
 )
 @triton.jit
@@ -483,6 +509,7 @@ def _bwd_attention_kernel(
 	Do,
 	L,
 	D,
+	softmax_scale: tl.constexpr,
 	stride_qb,
 	stride_qm,
 	stride_qh,
@@ -518,17 +545,16 @@ def _bwd_attention_kernel(
 	seqlen_k,
 	headdim,
 	num_kv_heads,
+	num_groups,
 	Dq,
 	Dk,
 	Dv,
-	num_groups: tl.constexpr,
-	CQL: tl.constexpr,
-	CKL: tl.constexpr,
-	softmax_scale: tl.constexpr,
 	HAVE_BIAS: tl.constexpr,
 	BIAS_SINGLE_HEAD: tl.constexpr,
 	BLOCK_HEADDIM: tl.constexpr,
+	EVEN_M: tl.constexpr,
 	EVEN_N: tl.constexpr,
+	EVEN_HEADDIM: tl.constexpr,
 	BLOCK_M: tl.constexpr,
 	BLOCK_N: tl.constexpr,
 ):
@@ -537,6 +563,7 @@ def _bwd_attention_kernel(
 		tl.program_id(1),
 		tl.program_id(2),
 	)
+	softmax_scale = softmax_scale.to(tl.float32)
 	off_h = off_bh % num_kv_heads
 	off_b = off_bh // num_kv_heads
 	offs_qm = tl.arange(0, BLOCK_M)
@@ -663,8 +690,6 @@ def _bwd_attention_kernel_call(
 
 	Args:
 		softmax_scale: Scaling factor for the softmax function.
-		blocksize_q: Block size for the query sequence dimension.
-		blocksize_k: Block size for the key sequence dimension.
 		residual: Residual from the forward pass.
 		Do: Output gradient array.
 
@@ -673,28 +698,18 @@ def _bwd_attention_kernel_call(
 	"""
 	(o, l, query, key, value, bias) = residual
 
-	batch, seqlen_q, num_kv_heads, num_groups, headdim = query.shape
+	batch, seqlen_q, num_q_heads, headdim = query.shape
 	_, seqlen_k, num_kv_heads, _ = key.shape
+	num_groups = num_q_heads // num_kv_heads
 	if num_groups > 2:
 		raise NotImplementedError(
-			"triton_gqa_flash_attn2 is not performing well for "
-			"num groups over 2 please use FORCE_MHA"
+			"triton_gqa_flash_attn2 is not performing well for num groups over 2 please use FORCE_MHA"
 		)
+
 	if FLASH_ATTN_BWD_:
-		o = o.reshape(
-			batch,
-			seqlen_q,
-			num_kv_heads,
-			num_groups,
-			headdim,
-		)
-		Do = Do.reshape(
-			batch,
-			seqlen_q,
-			num_kv_heads,
-			num_groups,
-			headdim,
-		)
+		query = query.reshape(batch, seqlen_q, num_kv_heads, num_groups, headdim)
+		o = o.reshape(batch, seqlen_q, num_kv_heads, num_groups, headdim)
+		Do = Do.reshape(batch, seqlen_q, num_kv_heads, num_groups, headdim)
 	if bias is not None:
 		if bias.shape[1] == 1:
 			bias = bias.reshape(
@@ -719,7 +734,7 @@ def _bwd_attention_kernel_call(
 		stride_bb, stride_bh, stride_bg, stride_bm, _ = (0, 0, 0, 0, 0)
 
 	BIAS_SINGLE_HEAD = True if bias is None else (True if bias.shape[1] == 1 else False)
-	softmax_scale = softmax_scale or headdim**-0.5
+	softmax_scale = softmax_scale or 1.0 / math.sqrt(headdim)
 	if FLASH_ATTN_BWD_:
 		assert headdim <= 256, "given headdim is not supported."
 		assert query.dtype == key.dtype == value.dtype, "tensors must have the same dtype."
@@ -744,6 +759,7 @@ def _bwd_attention_kernel_call(
 			),
 		]
 
+		delta = jnp.empty_like(l)
 		# BATCH  , SEQUENCE  , HEADS   , _
 		stride_qb, stride_qm, stride_qh, stride_qg, _ = get_strides(query.shape)
 		stride_kb, stride_kn, stride_kh, _ = get_strides(key.shape)
@@ -752,7 +768,7 @@ def _bwd_attention_kernel_call(
 
 		# BATCH  , HEADS    , _
 		stride_lb, stride_lh, stride_lg, _ = get_strides(l.shape)
-		stride_deb, stride_deh, stride_deg, _ = get_strides(l.shape)
+		stride_deb, stride_deh, stride_deg, _ = get_strides(delta.shape)
 
 		# BATCH   , SEQUENCE  , HEADS     , _
 		stride_dqb, stride_dqm, stride_dqh, stride_dqg, _ = get_strides(query.shape)
@@ -760,9 +776,19 @@ def _bwd_attention_kernel_call(
 		stride_dvb, stride_dvn, stride_dvh, _ = get_strides(value.shape)
 		stride_dob, stride_dom, stride_doh, stride_dog, _ = get_strides(Do.shape)
 
+		num_warps = 4 if headdim <= 64 else 8
+
+		# kernel kwargs
+		metaparams = dict(
+			BLOCK_M=128,
+			BLOCK_HEADDIM=BLOCK_HEADDIM,
+			num_warps=num_warps,
+			num_stages=1,
+		)
 		(delta,) = triton_call(
 			o,
 			Do,
+			delta,
 			stride_ob,
 			stride_om,
 			stride_oh,
@@ -780,11 +806,12 @@ def _bwd_attention_kernel_call(
 			seqlen_q,
 			out_shape=[
 				jax.ShapeDtypeStruct(
-					shape=l.shape,
-					dtype=l.dtype,
-					sharding=get_sharding(l),
+					shape=delta.shape,
+					dtype=delta.dtype,
+					sharding=get_sharding(delta),
 				)
 			],
+			input_output_aliases={2: 0},
 			grid=lambda META: (
 				triton.cdiv(seqlen_q, META["BLOCK_M"]),
 				batch * num_kv_heads,
@@ -792,13 +819,18 @@ def _bwd_attention_kernel_call(
 			),
 			kernel=_bwd_do_attention_kernel,
 			name="triton::ops::_bwd_do_attention_kernel",
-			BLOCK_M=128,
+			**metaparams,
+		)
+		metaparams = dict(
+			BLOCK_M=int(os.environ.get("BLOCKSIZE_M_FLASH_ATTN", 64)),
+			BLOCK_N=int(os.environ.get("BLOCKSIZE_N_FLASH_ATTN", 64)),
+			num_warps=num_warps,
+			num_stages=1,
 			BLOCK_HEADDIM=BLOCK_HEADDIM,
-			num_warps=4,
-			num_stages=5,
+			HAVE_BIAS=HAVE_BIAS,
+			BIAS_SINGLE_HEAD=BIAS_SINGLE_HEAD,
 		)
 
-		# NOTE: AutoTune causes this kernel to breake
 		Dq, Dk, Dv = triton_call(
 			query,
 			key,
@@ -807,6 +839,7 @@ def _bwd_attention_kernel_call(
 			Do,
 			l,
 			delta,
+			softmax_scale,
 			stride_qb,
 			stride_qm,
 			stride_qh,
@@ -842,6 +875,7 @@ def _bwd_attention_kernel_call(
 			seqlen_k,
 			headdim,
 			num_kv_heads,
+			num_groups,
 			kernel=_bwd_attention_kernel,
 			grid=lambda META: (
 				triton.cdiv(seqlen_k, META["BLOCK_N"]),
@@ -850,20 +884,10 @@ def _bwd_attention_kernel_call(
 			),
 			out_shape=bwd_kernel_out_shapes,
 			name="triton::ops::_bwd_attention_kernel",
-			num_groups=num_groups,
-			CQL=seqlen_q // 64,
-			CKL=seqlen_k // 64,
-			BLOCK_HEADDIM=BLOCK_HEADDIM,
-			HAVE_BIAS=HAVE_BIAS,
-			BIAS_SINGLE_HEAD=BIAS_SINGLE_HEAD,
-			BLOCK_M=int(os.environ.get("FLASH_ATTN_BWD_BLOCK_M", 64)),
-			BLOCK_N=int(os.environ.get("FLASH_ATTN_BWD_BLOCK_N", 64)),
-			softmax_scale=softmax_scale,
-			num_warps=4 if headdim > 64 else 8,
-			num_stages=1,
+			**metaparams,
 		)
 
-		return Dq.reshape(batch, seqlen_q, num_kv_heads * num_groups, headdim), Dk, Dv, None
+		return Dq.reshape(batch, seqlen_q, num_q_heads, headdim), Dk, Dv, None
 	else:
 		_, f_vjp = jax.vjp(
 			functools.partial(_attn_refrence, softmax_scale=softmax_scale),
@@ -875,7 +899,37 @@ def _bwd_attention_kernel_call(
 		return f_vjp(Do)
 
 
+def _fwd_attention_kernel_call_with_residual(
+	query: Optional[chex.Array],
+	key: Optional[chex.Array],
+	value: Optional[chex.Array],
+	bias: Optional[chex.Array] = None,
+	softmax_scale: Optional[float] = None,
+):
+	"""Calls the Triton kernel for the forward pass of the attention mechanism and returns the residual.
+
+	Args:
+		query: Query array.
+		key: Key array.
+		value: Value array.
+		bias: Bias array.
+		softmax_scale: Scaling factor for the softmax function.
+
+	Returns:
+		Tuple of the output array and the residual.
+	"""
+	o, l = _fwd_attention_kernel_call(
+		query=query,
+		key=key,
+		value=value,
+		bias=bias,
+		softmax_scale=softmax_scale,
+	)
+	return o, (o, l, query, key, value, bias)
+
+
 @functools.partial(custom_vjp, nondiff_argnums=[4])
+@functools.partial(jax.jit, static_argnums=[4])
 def _flash_attn2_gqa(
 	query: chex.Array,
 	key: chex.Array,
@@ -905,26 +959,9 @@ def _flash_attn2_gqa(
 
 
 _flash_attn2_gqa.defvjp(
-	_fwd_attention_kernel_call,
+	_fwd_attention_kernel_call_with_residual,
 	_bwd_attention_kernel_call,
 )
-
-
-def _get_inputs(B, QH, KVH, QS, KS, D, USE_BIAS=True):
-	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
-	q = jax.nn.initializers.normal(2)(q_key, (B, QS, QH, D), dtype=jnp.float16)
-	k = jax.nn.initializers.normal(2)(k_key, (B, KS, KVH, D), dtype=jnp.float16)
-	v = jax.nn.initializers.normal(2)(v_key, (B, KS, KVH, D), dtype=jnp.float16)
-	b = (
-		jnp.where(
-			jrnd.randint(v_key, (B, 1, QS, KS), 0, 4) > 2,
-			jnp.finfo(jnp.float16).min,
-			0,
-		)
-		if USE_BIAS
-		else None
-	)
-	return q, k, v, b
 
 
 def _attn_refrence(query_states, key_states, value_states, bias):
@@ -971,49 +1008,75 @@ def _attn_refrence(query_states, key_states, value_states, bias):
 	).reshape(b, qs, num_q_heads, d)
 
 
+triton_gqa_flash_attention2_gpu = _flash_attn2_gqa
+__all__ = ["triton_gqa_flash_attention2_gpu"]
+
+
 def _test_forward():
 	"""Tests the forward pass of the attention mechanism."""
-	q, k, v, b = _get_inputs(1, 32, 16, 2048, 2048, 128)
+	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
+	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
+	B, QH, KVH, QS, KS, D = 1, 32, 8, 1024, 1024, 128
+	q = jax.nn.initializers.normal(2)(q_key, (B, QS, QH, D), dtype=jnp.float16)
+	k = jax.nn.initializers.normal(2)(k_key, (B, KS, KVH, D), dtype=jnp.float16)
+	v = jax.nn.initializers.normal(2)(v_key, (B, KS, KVH, D), dtype=jnp.float16)
+	b = (
+		jnp.where(
+			jrnd.randint(v_key, (B, 1, QS, KS), 0, 4) > 2,
+			jnp.finfo(jnp.float16).min,
+			0,
+		)
+		if True
+		else None
+	)
 	print("QKV Allocated")
-	co = _flash_attn2_gqa(q, k, v, b)
+	co = triton_gqa_flash_attention2_gpu(q, k, v, b)
 	print(co[-1, -1, -1, :5])
-	try:
-		fo = _attn_refrence(q, k, v, b)
-		print(fo[-1, -1, -1, :5])
-	except Exception as er:
-		print("Flax OOM", er)
-		fo = None
-	if fo is not None and co is not None:
-		print("Results are Close" if jnp.allclose(co, fo, 0, 0.125) else "Wrong results!")
+	fo = _attn_refrence(q, k, v, b)
+	print(fo[-1, -1, -1, :5])
+	print("Results are Close" if jnp.allclose(co, fo, 0, 0.125) else "Wrong results!")
 
 
 def _test_backward():
 	"""Tests the backward pass of the attention mechanism."""
-	q, k, v, b = _get_inputs(1, 32, 16, 2048, 2048, 128)
-	print("QKV Allocated")
-	co = jax.grad(
-		lambda *x: _flash_attn2_gqa(*x).sum(),
-	)(q, k, v, b)
-	print(co[-1, -1, -1, :5])
+	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
+	B, QH, KVH, QS, KS, D = 1, 32, 16, 1024, 1024, 128
+	q = jax.nn.initializers.normal(2)(q_key, (B, QS, QH, D), dtype=jnp.float16)
+	k = jax.nn.initializers.normal(2)(k_key, (B, KS, KVH, D), dtype=jnp.float16)
+	v = jax.nn.initializers.normal(2)(v_key, (B, KS, KVH, D), dtype=jnp.float16)
+	b = (
+		jnp.where(
+			jrnd.randint(v_key, (B, 1, QS, KS), 0, 4) > 2,
+			jnp.finfo(jnp.float16).min,
+			0,
+		)
+		if True
+		else None
+	)
+
 	try:
-		fo = jax.grad(
-			lambda *x: _attn_refrence(*x).sum(),
-		)(q, k, v, b)
-		print(fo[-1, -1, -1, :5])
+		co = jax.grad(lambda *x: triton_gqa_flash_attention2_gpu(*x).sum())(q, k, v, b)
+		print("Custom op backward pass gradients:")
+		print(co[-1][-1, -1, :5])  # Print last 5 elements of last head of last batch
 	except Exception as er:
-		raise er
-		print("Flax backward pass failed (OOM)")
+		print(f"Custom op backward pass failed: {er}")
+		co = None
+
+	try:
+		fo = jax.grad(lambda *x: _attn_refrence(*x).sum())(q, k, v, b)
+
+		print(fo[-1, -1, -1, :5])  # Print last 5 elements of last head of last batch
+	except Exception as e:
+		print(f"Flax backward pass failed : {e}")
 		fo = None
 		exit()
+
 	if fo is not None and co is not None:
 		if jnp.allclose(co, fo, atol=0.125):
 			print("Backward pass results are close.")
 		else:
 			print("Backward pass results differ significantly!")
 
-
-triton_gqa_flash_attention2_gpu = _flash_attn2_gqa
-__all__ = ["triton_gqa_flash_attention2_gpu"]
 
 if __name__ == "__main__":
 	_test_forward()
