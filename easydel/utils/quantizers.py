@@ -15,6 +15,7 @@
 from typing import Literal, Optional
 
 import chex
+import jax
 from fjformer.dtypes import Array8Bit, ArrayNF4, A8Q, A4Q
 
 DEFAULT_QUANTIZATION_PATTERN = (
@@ -45,7 +46,7 @@ class EasyQuantizer:
 					q8=64,
 				)
 			case "a8q":
-				return A8Q.quantize(array=array, q8=128)
+				return A8Q.quantize(array=array, q8=32)
 			case "a4q":
 				return A4Q.quantize(array=array, q8=64)
 			case "nf4":
@@ -53,7 +54,7 @@ class EasyQuantizer:
 				if array.shape[0] % 128 != 0:
 					should_be_quantized = False
 				if array.ndim <= 2 and should_be_quantized:
-					return ArrayNF4.quantize(array=array)
+					return ArrayNF4.quantize(array=array.astype(jax.numpy.float32))
 				return array
 			case _:
 				raise ValueError(f"unknown quantization_method {self.quantization_method}.")
