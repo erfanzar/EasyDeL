@@ -41,9 +41,11 @@ if os.environ.get("EASYDEL_AUTO", "true") in ["true", "1", "on", "yes"]:
 		"--xla_gpu_enable_command_buffer= \ "
 	)
 	os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-	os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "1.0"
+	if os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION", None) is None:
+		os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "1.0"
 	os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-	os.environ["JAX_TRACEBACK_FILTERING"] = "off"
+	if os.environ.get("JAX_TRACEBACK_FILTERING", None) is None:
+		os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
 
 # EasyDel Imports
@@ -369,7 +371,7 @@ from easydel.transform import (
 	torch_dict_to_easydel_params,
 )
 
-_targeted_versions = ["0.0.85"]
+_targeted_versions = ["0.0.86"]
 
 from fjformer import __version__ as _fjformer_version
 

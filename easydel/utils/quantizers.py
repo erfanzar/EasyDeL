@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Literal,Optional
+from typing import Literal, Optional
 
 import chex
-from fjformer.dtypes import Array8Bit, ArrayNF4 
+from fjformer.dtypes import Array8Bit, ArrayNF4, A8Q, A4Q
 
 DEFAULT_QUANTIZATION_PATTERN = (
 	"(wo|wq|wk|wv|q_proj|k_proj|v_proj|o_proj|w1|w2|w3|"
@@ -27,7 +27,7 @@ DEFAULT_QUANTIZATION_PATTERN = (
 class EasyQuantizer:
 	def __init__(
 		self,
-		quantization_method: Literal["nf4", "8bit"] = "nf4",
+		quantization_method: Literal["nf4", "8bit", "a8q", "a4q"] = "nf4",
 		quantization_platform: Optional[Literal["jax", "triton", "pallas"]] = "jax",
 		**kwargs,
 	) -> None:
@@ -37,18 +37,23 @@ class EasyQuantizer:
 		self.quantization_platform = quantization_platform
 
 	def __call__(self, array) -> chex.Array:
-		if self.quantization_method == "8bit":
-			return Array8Bit.quantize(
-				array=array,
-				platform=self.quantization_platform,
-				q8=64,
-			)
-		elif self.quantization_method == "nf4":
-			should_be_quantized = True
-			if array.shape[0] % 128 != 0:
-				should_be_quantized = False
-			if array.ndim <= 2 and should_be_quantized:
-				return ArrayNF4.quantize(array=array)
-			return array
-		else:
-			raise ValueError(f"unknown quantization_method {self.quantization_method}.")
+		match self.quantization_method:
+			case "8bit":
+				return Array8Bit.quantize(
+					array=array,
+					platform=self.quantization_platform,
+					q8=64,
+				)
+			case "a8q":
+				return A8Q.quantize(array=array, q8=128)
+			case "a4q":
+				return A4Q.quantize(array=array, q8=64)
+			case "nf4":
+				should_be_quantized = True
+				if array.shape[0] % 128 != 0:
+					should_be_quantized = False
+				if array.ndim <= 2 and should_be_quantized:
+					return ArrayNF4.quantize(array=array)
+				return array
+			case _:
+				raise ValueError(f"unknown quantization_method {self.quantization_method}.")

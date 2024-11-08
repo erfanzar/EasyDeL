@@ -27,9 +27,9 @@ import flax.core
 import jax
 import jax.experimental
 import jax.tree_util
-from einops import rearrange
 from aqt.jax.v2 import config as q_config
 from aqt.jax.v2.flax import aqt_flax as q_flax
+from einops import rearrange
 from fjformer.dtypes import Array8Bit
 from flax import linen as nn
 from flax.linen import combine_masks
@@ -958,7 +958,7 @@ def is_flatten(pytree: dict):
 
 def quantize_params(
 	params: Union[Dict[str, Any], Any],
-	method: Literal["nf4", "8bit"] = "nf4",
+	method: Literal["nf4", "8bit", "a8q", "a4q"] = "nf4",
 	embedding_layer_name: Optional[str] = None,
 	quantization_pattern: str = DEFAULT_QUANTIZATION_PATTERN,
 	verbose: bool = True,

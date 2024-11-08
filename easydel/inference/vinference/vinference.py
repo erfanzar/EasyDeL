@@ -15,6 +15,9 @@
 """Module for text generation pipeline using JAX/Flax."""
 
 import asyncio
+import os
+import pathlib
+import pickle
 import time
 import warnings
 from datetime import datetime
@@ -40,7 +43,12 @@ from easydel.inference.utils import (
 )
 from easydel.inference.vinference.metrics import vInferenceMetrics
 from easydel.modules.modeling_utils import EDPretrainedModel
-from easydel.utils.compiling_utils import smart_compile
+from easydel.utils.compiling_utils import (
+	smart_compile,
+	load_compiled_fn,
+	save_compiled_fn,
+)
+from pydantic import BaseModel
 
 logger = get_logger(__name__)
 TIME = str(datetime.fromtimestamp(time.time())).split(" ")[0]
@@ -350,6 +358,16 @@ def put_compiled_funcs(
 	"""
 	search_key = f"Bx{batch_size}-Sx{input_tokens_length}-UUID{id}"
 	COMPILED_FUNCS[search_key] = (compiled_generate_func, compiled_interval_func)
+
+
+class vInferenceMetaData(BaseModel):
+	inference_name: str
+	generation_config: vInferenceConfig
+	precompiled_configs: set
+	in_compiling_process: set
+	input_partition_spec: jax.sharding.PartitionSpec
+	uuid4: str
+	model_config = dict(arbitrary_types_allowed=True)
 
 
 class vInference:
@@ -838,3 +856,73 @@ class vInference:
 		else:
 			tokens = self.tokenizer.encode(conv)
 			return len(tokens)
+
+	def save_inference(self, path: Union[os.PathLike, str]):
+		path = pathlib.Path(path)
+		path.mkdir(exist_ok=True, parents=True)
+		metadata = vInferenceMetaData(
+			inference_name=self.inference_name,
+			generation_config=self.generation_config,
+			precompiled_configs=self._precompiled_configs,
+			in_compiling_process=self._in_compiling_process,
+			input_partition_spec=self.input_partition_spec,
+			uuid4=self._uuid4,
+		)
+		for config_key in self._precompiled_configs:
+			batch_size, input_tokens_length = config_key
+			compiled_generation_fn, compiled_interval_fn = get_compiled_funcs(
+				batch_size=batch_size,
+				input_tokens_length=input_tokens_length,
+				id=metadata.uuid4,
+			)
+			save_compiled_fn(
+				path=path,
+				fn=compiled_generation_fn,
+				prefix=f"cgf-{metadata.uuid4}-{batch_size}-{input_tokens_length}",
+			)
+			save_compiled_fn(
+				path=path,
+				fn=compiled_interval_fn,
+				prefix=f"cif-{metadata.uuid4}-{batch_size}-{input_tokens_length}",
+			)
+
+		metadata = pickle.dump(metadata, open(path / "config", "wb"))
+
+	@classmethod
+	def load_inference(
+		cls,
+		path: Union[os.PathLike, str],
+		model: EDPretrainedModel,
+		params: Union[flax.core.FrozenDict, dict],
+		tokenizer: PreTrainedTokenizer,
+	):
+		path = pathlib.Path(path)
+		assert path.exists(), "provided path to vInference doesn't exists."
+		metadata = pickle.load(open(path / "config", "rb"))
+		for config_key in metadata.precompiled_configs:
+			batch_size, input_tokens_length = config_key
+			compiled_generation_fn = load_compiled_fn(
+				path=path,
+				prefix=f"cgf-{metadata.uuid4}-{batch_size}-{input_tokens_length}",
+			)
+			compiled_interval_fn = load_compiled_fn(
+				path=path,
+				prefix=f"cif-{metadata.uuid4}-{batch_size}-{input_tokens_length}",
+			)
+			put_compiled_funcs(
+				compiled_generate_func=compiled_generation_fn,
+				compiled_interval_func=compiled_interval_fn,
+				batch_size=batch_size,
+				input_tokens_length=input_tokens_length,
+				id=metadata.uuid4,
+			)
+		self = cls(
+			model=model,
+			params=params,
+			tokenizer=tokenizer,
+			generation_config=metadata.generation_config,
+			input_partition_spec=metadata.input_partition_spec,
+			inference_name=metadata.inference_name,
+		)
+		self._uuid4 = metadata.uuid4
+		return self
