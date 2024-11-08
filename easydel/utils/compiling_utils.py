@@ -3,7 +3,7 @@ import functools
 import os
 import hashlib
 import pickle
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import jax
 from jax._src.stages import Compiled, Lowered
 from jax.experimental.serialize_executable import deserialize_and_load, serialize
@@ -14,6 +14,7 @@ RECOMPILE_FORCE = os.environ.get("RECOMPILE_FORCE", "false") in ["true", "1", "o
 CACHE_DIR = get_cache_dir()
 COMPILE_FUNC_DIR = CACHE_DIR / "compiled_funcs"
 COMPILE_FUNC_DIR.mkdir(parents=True, exist_ok=True)
+COMPILED_FILE_NAME = "compiled.func"
 
 COMPILED_CACHE: Dict[Tuple, Any] = {}
 
@@ -42,7 +43,7 @@ def smart_compile(lowered_func: Lowered, tag: Optional[str] = None):
 	func_hash = get_hash_of_lowering(lowered_func)
 	foldername = str(func_hash) if tag is None else f"{tag}-{func_hash}"
 	func_dir = COMPILE_FUNC_DIR / foldername
-	filepath = func_dir / "compiled.func"
+	filepath = func_dir / COMPILED_FILE_NAME
 	if filepath.exists() and not RECOMPILE_FORCE:
 		(serialized, in_tree, out_tree) = pickle.load(open(filepath, "rb"))
 		compiled_func = deserialize_and_load(
@@ -57,6 +58,32 @@ def smart_compile(lowered_func: Lowered, tag: Optional[str] = None):
 		func_dir.mkdir(parents=True, exist_ok=True)
 		pickle.dump((serialized, in_tree, out_tree), open(filepath, "wb"))
 		return compiled_func
+
+
+def save_compiled_fn(
+	path: Union[str, os.PathLike],
+	fn: Compiled,
+	prefix: Optional[str] = None,
+):
+	path.mkdir(parents=True, exist_ok=True)
+	prefix = prefix or ""
+	filename = path / (prefix + "-" + COMPILED_FILE_NAME)
+	serialized, in_tree, out_tree = serialize(fn)
+	pickle.dump((serialized, in_tree, out_tree), open(filename, "wb"))
+
+
+def load_compiled_fn(
+	path: Union[str, os.PathLike],
+	prefix: Optional[str] = None,
+):
+	prefix = prefix or ""
+	filename = path / (prefix + "-" + COMPILED_FILE_NAME)
+	(serialized, in_tree, out_tree) = pickle.load(open(filename, "rb"))
+	return deserialize_and_load(
+		serialized=serialized,
+		in_tree=in_tree,
+		out_tree=out_tree,
+	)
 
 
 def cache_compiles(

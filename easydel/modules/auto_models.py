@@ -39,13 +39,13 @@ from jax.sharding import PartitionSpec
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.etils import get_logger
 from easydel.etils.partition_module import PartitionAxis
+from easydel.modules.factory import registry
 from easydel.modules.modeling_utils import (
 	EDPretrainedConfig,
 	EDPretrainedModel,
 )
 from easydel.transform.parameters_transformation import torch_dict_to_easydel_params
 from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN
-from easydel.modules.factory import registry
 
 logger = get_logger(name=__name__)
 
@@ -145,7 +145,7 @@ class AutoEasyDeLModelForCausalLM:
 		config_kwargs: Optional[Mapping[str, Any]] = None,
 		auto_shard_params: bool = False,
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]] = None,
-		quantization_method: Optional[Literal["nf4", "8bit"]] = None,
+		quantization_method: Optional[Literal["nf4", "8bit", "a8q", "a4q"]] = None,
 		quantization_platform: Optional[Literal["jax", "triton", "pallas"]] = "jax",
 		quantization_block_size: int = 256,
 		bit_targeted_params: Optional[List[str]] = None,
@@ -174,7 +174,7 @@ class AutoEasyDeLModelForCausalLM:
 		    config_kwargs (Optional[Mapping[str, Any]], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
 		    auto_shard_params (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
 		    partition_rules (Optional[Tuple[Tuple[str, PartitionSpec]]], optional): Custom partition rules for parameter sharding. If not None, shard_fns should also be provided. Defaults to None.
-		    quantization_method (Literal["nf4", "8bit"], optional): quantization_method to be used to quantize model weights. Defaults to None.
+		    quantization_method (Literal["nf4", "8bit", "a8q", "a4q"], optional): quantization_method to be used to quantize model weights. Defaults to None.
 		    quantization_platform (Optional[Literal["jax", "triton", "pallas"]], optional): Platform to use for the weight quants. Defaults to None.
 				quantization_block_size (int): block size to be used for quantizing arrays (only for NF4).
 		    bit_targeted_params (Optional[List[str]], optional): List of parameter names to convert to 8-bit precision. If  None and 8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
@@ -265,7 +265,7 @@ class AutoEasyDeLModelForCausalLM:
 		config_kwargs: Optional[Mapping[str, Any]],
 		auto_shard_params: bool,
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]],
-		quantization_method: Optional[Literal["nf4", "8bit"]],
+		quantization_method: Optional[Literal["nf4", "8bit", "a8q", "a4q"]],
 		quantization_platform: Optional[Literal["jax", "triton", "pallas"]],
 		quantization_block_size: int,
 		bit_targeted_params: Optional[List[str]],
@@ -401,6 +401,7 @@ class AutoEasyDeLModelForCausalLM:
 				stacklevel=1,
 			)
 		uses_tie_word_embedding = getattr(config, "tie_word_embeddings", False)
+
 		params = transform_function(
 			state_dict,
 			config=config,
@@ -442,7 +443,7 @@ class AutoEasyDeLModelForCausalLM:
 		partition_axis: PartitionAxis,
 		input_shape: Tuple[int, int],
 		shard_fns: Optional[Mapping[tuple, Callable] | dict],
-		quantization_method: Optional[Literal["nf4", "8bit"]],
+		quantization_method: Optional[Literal["nf4", "8bit", "a8q", "a4q"]],
 		quantization_platform: Optional[Literal["jax", "triton", "pallas"]],
 		backend: Optional[Literal["cpu", "gpu", "tpu"]],
 		platform: Optional[Literal["jax", "triton", "pallas"]],
@@ -796,7 +797,7 @@ class AutoStateForCausalLM:
 		    config_kwargs (Optional[Mapping[str, Any]], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
 		    auto_shard_params (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
 		    partition_rules (Optional[Tuple[Tuple[str, PartitionSpec]]], optional): Custom partition rules for parameter sharding. If not None, shard_fns should also be provided. Defaults to None.
-		    quantization_method (Literal["nf4", "8bit"], optional): quantization_method to be used to quantize model weights. Defaults to None.
+		    quantization_method (Literal["nf4", "8bit", "a8q", "a4q"], optional): quantization_method to be used to quantize model weights. Defaults to None.
 		    bit_targeted_params (Optional[List[str]], optional): List of parameter names to convert to 8-bit precision. If  None and 8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
 		    verbose_params (bool): whenever to log number of parameters in converting state.
 		    safe (bool): whenever to use safetensors to load engine or parameters (requires engine or parameters to be saved with safe=True while saving them)

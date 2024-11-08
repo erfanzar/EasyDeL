@@ -45,10 +45,10 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import numpy as jnp
 from jax.experimental.mesh_utils import create_device_mesh
 from jax.sharding import Mesh, PartitionSpec
-from tqdm.auto import tqdm
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_flax_utils import FlaxPreTrainedModel
 from transformers.utils.generic import working_or_temp_dir
+
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.etils import (
 	AVAILABLE_ATTENTION_MECHANISMS,
@@ -1166,8 +1166,8 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 		return quantize_params(params)
 
 	def _model_card(self, name, repo_id):
-		from easydel.utils.readme_generator import ReadmeGenerator, ModelInfo
 		from easydel import __version__
+		from easydel.utils.readme_generator import ModelInfo, ReadmeGenerator
 
 		return ReadmeGenerator().generate_readme(
 			ModelInfo(
@@ -1221,6 +1221,7 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 			if (safe)
 			else CheckpointManager.save_state_to_file
 		)
+
 		func(
 			path=output_model_file,
 			gather_fns=gather_fns,
@@ -1328,7 +1329,7 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 		input_shape: Optional[Tuple[int, int]] = None,
 		config_kwargs: Optional[dict[str, Any]] = None,
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
-		quantization_method: Optional[Literal["nf4", "8bit"]] = None,
+		quantization_method: Optional[Literal["nf4", "8bit", "a8q", "a4q"]] = None,
 		quantization_platform: Optional[Literal["jax", "triton", "pallas"]] = "jax",
 		backend: Optional[Literal["cpu", "gpu", "tpu"]] = None,
 		platform: Optional[Literal["jax", "triton", "pallas"]] = "jax",
@@ -1518,12 +1519,36 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 			precision=precision,
 			_do_init=False,
 		)
+		if bit_targeted_params is None:
+			params_pattern_selection = re.compile(DEFAULT_QUANTIZATION_PATTERN)
+		else:
+			params_pattern_selection = bit_targeted_params
+		if quantization_method is not None:
+			quantizer = EasyQuantizer(
+				quantization_method=quantization_method,
+				block_size=quantization_block_size,
+				quantization_platform=quantization_platform,
+			)
+
+		def maybe_quantize(tensor, key):
+			if isinstance(key, str):
+				key = key.split(".")
+			if quantization_method is not None:
+				if (
+					quantizer is not None
+					and key[-1] != "embedding"
+					and params_pattern_selection.search("/".join(key))
+				):
+					tensor = quantizer(array=tensor)
+			return tensor
+
 		if safe:
 			state, _ = CheckpointManager.load_checkpoint_safe(
 				path=resolved_archive_file,
 				mismatch_allowed=mismatch_allowed,
 				verbose=verbose,
 				shard_fns=shard_fns,
+				callback=maybe_quantize,
 			)
 		else:
 			state = CheckpointManager.load_checkpoint(
@@ -1532,6 +1557,7 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 				verbose=verbose,
 				shard_fns=shard_fns,
 				remove_dict_prefix=remove_dict_prefix,
+				callback=maybe_quantize,
 			)
 
 		params = state.get("params", None)
@@ -1629,29 +1655,6 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 					"Generation config file not found, using a generation config created from the model config."
 				)
 				pass
-
-		if bit_targeted_params is None:
-			params_pattern_selection = re.compile(DEFAULT_QUANTIZATION_PATTERN)
-		else:
-			params_pattern_selection = bit_targeted_params
-		if quantization_method is not None:
-			quantizer = EasyQuantizer(
-				quantization_method=quantization_method,
-				block_size=quantization_block_size,
-				quantization_platform=quantization_platform,
-			)
-			pbar = tqdm(list(state.keys()))
-			for key_tuple in pbar:
-				if (
-					quantizer is not None
-					and key_tuple[-1] != "embedding"
-					and params_pattern_selection.search("/".join(key_tuple))
-				):
-					state[key_tuple] = quantizer(array=state[key_tuple])
-					pbar.set_description(
-						f"Quantizing {state[key_tuple].shape} "
-						f"({quantization_method} | {quantization_platform})"
-					)
 		return model, unflatten_dict(state)
 
 	def shard_params(
