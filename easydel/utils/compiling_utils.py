@@ -4,6 +4,7 @@ import os
 import hashlib
 import pickle
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+import warnings
 import jax
 from jax._src.stages import Compiled, Lowered
 from jax.experimental.serialize_executable import deserialize_and_load, serialize
@@ -46,12 +47,21 @@ def smart_compile(lowered_func: Lowered, tag: Optional[str] = None):
 	filepath = func_dir / COMPILED_FILE_NAME
 	if filepath.exists() and not RECOMPILE_FORCE:
 		(serialized, in_tree, out_tree) = pickle.load(open(filepath, "rb"))
-		compiled_func = deserialize_and_load(
-			serialized=serialized,
-			in_tree=in_tree,
-			out_tree=out_tree,
-		)
-		return compiled_func
+		try:
+			compiled_func = deserialize_and_load(
+				serialized=serialized,
+				in_tree=in_tree,
+				out_tree=out_tree,
+			)
+			return compiled_func
+		except Exception as e:
+			warnings.warn(f"couldn't load compiled function due to {e}", stacklevel=4)
+			compiled_func: Compiled = lowered_func.compile()
+			serialized, in_tree, out_tree = serialize(compiled_func)
+			func_dir.mkdir(parents=True, exist_ok=True)
+			pickle.dump((serialized, in_tree, out_tree), open(filepath, "wb"))
+			return compiled_func
+
 	else:
 		compiled_func: Compiled = lowered_func.compile()
 		serialized, in_tree, out_tree = serialize(compiled_func)

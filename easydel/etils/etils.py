@@ -75,6 +75,7 @@ class EasyDeLGradientCheckPointers(str, Enum):
 	NOTHING_SAVEABLE = "nothing_saveable"
 	CHECKPOINT_DOTS = "checkpoint_dots"
 	CHECKPOINT_DOTS_WITH_NO_BATCH_DMIS = "checkpoint_dots_with_no_batch_dims"
+	NONE = ""
 
 
 AVAILABLE_GRADIENT_CHECKPOINTS = Literal[
