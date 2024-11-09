@@ -225,53 +225,28 @@ class DeepseekV2Config(EDPretrainedConfig):
 			**kwargs,
 		)
 
-	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+	def get_partition_rules(self, *args, **kwargs):
 		"""
 		Get the partition rules for the model.
-
-		Args:
-		    fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
-		        Whether to use fully sharded data parallelism.
-
 		Returns:
 		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
+			("model/embed_tokens/embedding", PartitionSpec("tp", ("sp", "fsdp"))),
 			(
-				("model/embed_tokens/embedding", PartitionSpec("sp", "fsdp")),
-				(
-					"self_attn/(q_proj|k_proj|v_proj)/kernel",
-					PartitionSpec(("fsdp", "sp"), "tp"),
-				),
-				("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
-				("w1/kernel", PartitionSpec(("fsdp", "sp"))),
-				("w2/kernel", PartitionSpec(("fsdp", "sp"))),
-				("w3/kernel", PartitionSpec(("fsdp", "sp"))),
-				("gate/kernel", PartitionSpec(("fsdp", "sp"))),
-				("input_layernorm/kernel", PartitionSpec(None)),
-				("post_attention_layernorm/kernel", PartitionSpec(None)),
-				("model/norm/kernel", PartitionSpec(None)),
-				("lm_head/kernel", PartitionSpec("fsdp", "sp")),
-				(".*", PartitionSpec(None)),
-			)
-			if not fully_sharded_data_parallel
-			else (
-				("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
-				(
-					"self_attn/(q_proj|k_proj|v_proj)/kernel",
-					PartitionSpec(("fsdp", "sp"), "tp"),
-				),
-				("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
-				("w1/kernel", PartitionSpec(("fsdp", "sp"))),
-				("w2/kernel", PartitionSpec(("fsdp", "sp"))),
-				("w3/kernel", PartitionSpec(("fsdp", "sp"))),
-				("gate/kernel", PartitionSpec(("fsdp", "sp"))),
-				("input_layernorm/kernel", PartitionSpec(None)),
-				("post_attention_layernorm/kernel", PartitionSpec(None)),
-				("model/norm/kernel", PartitionSpec(None)),
-				("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-				(".*", PartitionSpec(("fsdp", "sp"))),
-			)
+				"self_attn/(q_proj|k_proj|v_proj)/kernel",
+				PartitionSpec(("fsdp", "sp"), "tp"),
+			),
+			("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
+			("gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("gate/kernel", PartitionSpec(("fsdp", "sp"))),
+			("input_layernorm/kernel", PartitionSpec(None)),
+			("post_attention_layernorm/kernel", PartitionSpec(None)),
+			("model/norm/kernel", PartitionSpec(None)),
+			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			(".*", PartitionSpec(None)),
 		)
 
 	def add_jax_args(

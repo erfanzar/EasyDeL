@@ -168,65 +168,34 @@ class FalconConfig(EDPretrainedConfig):
 	def rotary(self):
 		return not self.alibi
 
-	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+	def get_partition_rules(self, *args, **kwargs):
 		"""
 		Get the partition rules for the model.
-
-		Args:
-		    fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
-		        Whether to use fully sharded data parallelism.
-
 		Returns:
 		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
+			("word_embeddings/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
 			(
-				("word_embeddings/embedding", PartitionSpec("dp", ("fsdp", "sp"))),
-				(
-					"self_attention/query_key_value/(kernel)",
-					PartitionSpec("dp", ("fsdp", "sp")),
-				),
-				("self_attention/dense/(kernel)", PartitionSpec("dp", ("fsdp", "sp"))),
-				("mlp/dense_4h_to_h/(kernel)", PartitionSpec("dp", ("fsdp", "sp"))),
-				("mlp/dense_h_to_4h/(kernel)", PartitionSpec("dp", ("fsdp", "sp"))),
-				("lm_head/kernel", PartitionSpec("dp", ("fsdp", "sp"))),
-				("transformer/ln_f/bias", PartitionSpec(("fsdp", "sp"))),
-				("transformer/ln_f/scale", PartitionSpec(("fsdp", "sp"))),
-				(
-					"transformer/post_attention_layernorm/scale",
-					PartitionSpec(("fsdp", "sp")),
-				),
-				(
-					"transformer/post_attention_layernorm/bias",
-					PartitionSpec(("fsdp", "sp")),
-				),
-				("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-				(".*", PartitionSpec(("fsdp", "sp"))),
-			)
-			if not fully_sharded_data_parallel
-			else (
-				("word_embeddings/embedding", PartitionSpec(("fsdp", "sp"))),
-				(
-					"self_attention/query_key_value/(kernel|bias)",
-					PartitionSpec(("fsdp", "sp")),
-				),
-				("self_attention/dense/(kernel|bias)", PartitionSpec(("fsdp", "sp"))),
-				("mlp/dense_4h_to_h/(kernel|bias)", PartitionSpec(("fsdp", "sp"))),
-				("mlp/dense_h_to_4h/(kernel|bias)", PartitionSpec(("fsdp", "sp"))),
-				("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-				("transformer/ln_f/bias", PartitionSpec(("fsdp", "sp"))),
-				("transformer/ln_f/scale", PartitionSpec(("fsdp", "sp"))),
-				(
-					"transformer/post_attention_layernorm/scale",
-					PartitionSpec(("fsdp", "sp")),
-				),
-				(
-					"transformer/post_attention_layernorm/bias",
-					PartitionSpec(("fsdp", "sp")),
-				),
-				("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-				(".*", PartitionSpec(("fsdp", "sp"))),
-			)
+				"self_attention/query_key_value/(kernel)",
+				PartitionSpec("tp", ("fsdp", "sp")),
+			),
+			("self_attention/dense/(kernel)", PartitionSpec("tp", ("fsdp", "sp"))),
+			("mlp/dense_4h_to_h/(kernel)", PartitionSpec("tp", ("fsdp", "sp"))),
+			("mlp/dense_h_to_4h/(kernel)", PartitionSpec("tp", ("fsdp", "sp"))),
+			("lm_head/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("transformer/ln_f/bias", PartitionSpec(("fsdp", "sp"))),
+			("transformer/ln_f/scale", PartitionSpec(("fsdp", "sp"))),
+			(
+				"transformer/post_attention_layernorm/scale",
+				PartitionSpec(("fsdp", "sp")),
+			),
+			(
+				"transformer/post_attention_layernorm/bias",
+				PartitionSpec(("fsdp", "sp")),
+			),
+			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			(".*", PartitionSpec(None)),
 		)
 
 	@staticmethod

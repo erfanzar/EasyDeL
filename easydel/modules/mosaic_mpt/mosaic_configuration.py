@@ -236,43 +236,23 @@ class MptConfig(EDPretrainedConfig):
 				config[k] = v
 		return config
 
-	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+	def get_partition_rules(self, *args, **kwargs):
 		"""
 		Get the partition rules for the model.
-
-		Args:
-		    fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
-		        Whether to use fully sharded data parallelism.
-
 		Returns:
 		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
-			(
-				("transformer/wte/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-				("attn/Wqkv/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("attn/out_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-				("ffn/down_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("ffn/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("transformer/norm_1/scale", PartitionSpec(None)),
-				("transformer/norm_2/scale", PartitionSpec(None)),
-				("transformer/norm_f/scale", PartitionSpec(None)),
-				("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				(".*", PartitionSpec(None)),
-			)
-			if not fully_sharded_data_parallel
-			else (
-				("transformer/wte/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-				("attn/Wqkv/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("attn/out_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("ffn/down_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("ffn/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("transformer/norm_1/scale", PartitionSpec(("fsdp", "sp"))),
-				("transformer/norm_2/scale", PartitionSpec(("fsdp", "sp"))),
-				("transformer/norm_f/scale", PartitionSpec(("fsdp", "sp"))),
-				("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				(".*", PartitionSpec(("fsdp", "sp"))),
-			)
+			("transformer/wte/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+			("attn/Wqkv/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("attn/out_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("ffn/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("ffn/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("transformer/norm_1/scale", PartitionSpec(None)),
+			("transformer/norm_2/scale", PartitionSpec(None)),
+			("transformer/norm_f/scale", PartitionSpec(None)),
+			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			(".*", PartitionSpec(None)),
 		)
 
 	def add_jax_args(
