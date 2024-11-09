@@ -203,7 +203,7 @@ class Qwen2Config(EDPretrainedConfig):
 					PartitionSpec(("fsdp", "sp"), "tp"),
 				),
 				("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
-				("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+				("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 				("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"))),
 				("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"))),
 				("input_layernorm/kernel", PartitionSpec(None)),

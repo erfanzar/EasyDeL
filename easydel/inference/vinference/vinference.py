@@ -24,7 +24,7 @@ from datetime import datetime
 from functools import partial
 from typing import AsyncGenerator, Dict, List, Optional, Union, overload
 from uuid import uuid4
-
+import numpy as np
 import flax.core
 import jax
 from fjformer import GenerateRNG, with_sharding_constraint
@@ -55,9 +55,12 @@ TIME = str(datetime.fromtimestamp(time.time())).split(" ")[0]
 
 
 def measure_flops(func, *args, **kwargs):
+	try:
+		flops = func.cost_analysis()[0]["flops"]
+	except:  # noqa
+		flops = 1
 	start_time = time.perf_counter()
-	flops = func.cost_analysis()[0]["flops"]
-	result = func(*args, **kwargs)
+	result = jax.block_until_ready(func(*args, **kwargs))
 	end_time = time.perf_counter()
 	elapsed_time = end_time - start_time
 	return result, flops, flops / elapsed_time, elapsed_time
@@ -643,7 +646,7 @@ class vInference:
 					position_ids=position_ids,
 					rng=self._rng_generator.rng,
 				)
-				generation_time_start = time.perf_counter()
+				interval_time = 0
 				state.generate_func_flops = generate_func_flops
 				if not state.is_sequence_finished:
 					all_interval_func_flops = []
@@ -657,14 +660,10 @@ class vInference:
 								start_length=start_length,
 							)
 						)
-						interval_time = time.perf_counter() - generation_time_start
+						interval_time += interval_func_elapsed_time
 
 						all_interval_func_flops.append(interval_func_flops)
-						interval_func_flops = sum(
-							all_interval_func_flops,
-						) / len(
-							all_interval_func_flops,
-						)
+						interval_func_flops = np.mean(all_interval_func_flops)
 						state.generate_func_flops = generate_func_flops
 						state.interval_func_flops = interval_func_flops
 						state.tokens_pre_second = state.generated_tokens / interval_time

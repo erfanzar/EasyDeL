@@ -12,6 +12,8 @@ from jax.experimental.serialize_executable import deserialize_and_load, serializ
 from easydel.utils.helpers import get_cache_dir
 
 RECOMPILE_FORCE = os.environ.get("RECOMPILE_FORCE", "false") in ["true", "1", "on"]
+ECACHE_COMPILES = os.environ.get("ECACHE_COMPILES", "true") in ["true", "1", "on"]
+
 CACHE_DIR = get_cache_dir()
 COMPILE_FUNC_DIR = CACHE_DIR / "compiled_funcs"
 COMPILE_FUNC_DIR.mkdir(parents=True, exist_ok=True)
@@ -57,16 +59,18 @@ def smart_compile(lowered_func: Lowered, tag: Optional[str] = None):
 		except Exception as e:
 			warnings.warn(f"couldn't load compiled function due to {e}", stacklevel=4)
 			compiled_func: Compiled = lowered_func.compile()
-			serialized, in_tree, out_tree = serialize(compiled_func)
-			func_dir.mkdir(parents=True, exist_ok=True)
-			pickle.dump((serialized, in_tree, out_tree), open(filepath, "wb"))
+			if ECACHE_COMPILES:
+				serialized, in_tree, out_tree = serialize(compiled_func)
+				func_dir.mkdir(parents=True, exist_ok=True)
+				pickle.dump((serialized, in_tree, out_tree), open(filepath, "wb"))
 			return compiled_func
 
 	else:
 		compiled_func: Compiled = lowered_func.compile()
-		serialized, in_tree, out_tree = serialize(compiled_func)
-		func_dir.mkdir(parents=True, exist_ok=True)
-		pickle.dump((serialized, in_tree, out_tree), open(filepath, "wb"))
+		if ECACHE_COMPILES:
+			serialized, in_tree, out_tree = serialize(compiled_func)
+			func_dir.mkdir(parents=True, exist_ok=True)
+			pickle.dump((serialized, in_tree, out_tree), open(filepath, "wb"))
 		return compiled_func
 
 

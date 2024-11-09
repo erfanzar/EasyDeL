@@ -410,28 +410,13 @@ class EDPretrainedConfig(PretrainedConfig):
 		warnings.warn("`jax_mesh` is deprecated use `get_mesh` or `mesh`", stacklevel=1)
 		return self.get_mesh()
 
-	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+	def get_partition_rules(self, *args, **kwargs):
 		"""
 		Get the partition rules for the model.
-
-		Args:
-		    fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
-		        Whether to use fully sharded data parallelism.
-
 		Returns:
 		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
-		if not fully_sharded_data_parallel:
-			raise NotImplementedError()
-		else:
-			return (
-				(
-					".*",
-					PartitionSpec(
-						("fsdp", "sp"),
-					),
-				),
-			)
+		return ((".*", PartitionSpec(("fsdp", "sp"))),)
 
 	def get_axis_dims(self) -> Sequence[int]:
 		"""The get_axis_dims function returns a sequence of integers representing the dimensions of each axis.

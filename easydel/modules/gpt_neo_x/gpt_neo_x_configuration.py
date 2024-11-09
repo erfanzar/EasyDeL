@@ -111,46 +111,27 @@ class GPTNeoXConfig(EDPretrainedConfig):
 		self.from_pt = False
 		super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 
-	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+	def get_partition_rules(self, *args, **kwargs):
 		"""
 		Get the partition rules for the model.
-
-		Args:
-		    fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
-		        Whether to use fully sharded data parallelism.
-
 		Returns:
 		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
-			(
-				("wte/embedding", PartitionSpec("fsdp", "dp")),
-				("attention/w_qkv/(kernel|bias)", PartitionSpec("fsdp", "dp")),
-				("attention/wo/(kernel|bias)", PartitionSpec("fsdp", "dp")),
-				("mlp/dense_h_to_4h/(kernel|bias)", PartitionSpec("fsdp", "dp")),
-				("mlp/dense_4h_to_h/(kernel|bias)", PartitionSpec("dp", "fsdp")),
-				("post_attention_layernorm/(bias|scale)", PartitionSpec("fsdp", "dp")),
-				("input_layernorm/(bias|scale)", PartitionSpec("fsdp", "dp")),
-				(
-					"transformer/final_layer_norm/(scale|bias)",
-					PartitionSpec("dp", "fsdp"),
-				),
-				("lm_head/kernel", PartitionSpec("dp", "fsdp")),
-				(".*", PartitionSpec(None)),
-			)
-			if not fully_sharded_data_parallel
-			else (
-				("embed_in/embedding", PartitionSpec("fsdp")),
-				("attention/w_qkv/(kernel|bias)", PartitionSpec("fsdp")),
-				("attention/wo/(kernel|bias)", PartitionSpec("fsdp")),
-				("mlp/dense_h_to_4h/(kernel|bias)", PartitionSpec("fsdp")),
-				("mlp/dense_4h_to_h/(kernel|bias)", PartitionSpec("fsdp")),
-				("post_attention_layernorm/(bias|scale)", PartitionSpec("fsdp")),
-				("input_layernorm/(bias|scale)", PartitionSpec("fsdp")),
-				("transformer/final_layer_norm/(scale|bias)", PartitionSpec("fsdp")),
-				("lm_head/kernel", PartitionSpec("fsdp")),
-				(".*", PartitionSpec(("fsdp", "sp"))),
-			)
+			("wte/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+			("attention/w_qkv/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("attention/w_qkv/bias", PartitionSpec(("fsdp", "sp"))),  # 1D for bias
+			("attention/wo/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("attention/wo/bias", PartitionSpec(("fsdp", "sp"))),  # 1D for bias
+			("mlp/dense_h_to_4h/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("mlp/dense_h_to_4h/bias", PartitionSpec(("fsdp", "sp"))),  # 1D for bias
+			("mlp/dense_4h_to_h/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("mlp/dense_4h_to_h/bias", PartitionSpec(("fsdp", "sp"))),  # 1D for bias
+			("post_attention_layernorm/(bias|scale)", PartitionSpec(None)),
+			("input_layernorm/(bias|scale)", PartitionSpec(None)),
+			("transformer/final_layer_norm/(scale|bias)", PartitionSpec(None)),
+			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			(".*", PartitionSpec(None)),
 		)
 
 	@staticmethod

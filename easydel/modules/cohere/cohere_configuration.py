@@ -136,54 +136,30 @@ class CohereConfig(EDPretrainedConfig):
 			**kwargs,
 		)
 
-	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+	def get_partition_rules(self, *args, **kwargs):
 		"""
 		Get the partition rules for the model.
-
-		Args:
-		    fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
-		        Whether to use fully sharded data parallelism.
-
 		Returns:
 		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
+			("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
 			(
-				("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-				(
-					"attn/(q_proj|k_proj|v_proj)/kernel",
-					PartitionSpec(("fsdp", "sp"), "tp"),
-				),
-				("attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-				("linear/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("linear_1/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-				("linear_v/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("gate/kernel", PartitionSpec(("fsdp", "sp"))),
-				("post_attn_norm/kernel", PartitionSpec(None)),
-				("pre_attn_norm/kernel", PartitionSpec(None)),
-				("pre_moe_norm/kernel", PartitionSpec(None)),
-				("post_moe_norm/kernel", PartitionSpec(None)),
-				("model/norm/kernel", PartitionSpec(None)),
-				("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				(".*", PartitionSpec(None)),
-			)
-			if not fully_sharded_data_parallel
-			else (
-				("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
-				("attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"))),
-				("attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-				("linear/kernel", PartitionSpec(("fsdp", "sp"))),
-				("linear_1/kernel", PartitionSpec(("fsdp", "sp"))),
-				("linear_v/kernel", PartitionSpec(("fsdp", "sp"))),
-				("gate/kernel", PartitionSpec(("fsdp", "sp"))),
-				("post_attn_norm/kernel", PartitionSpec(("fsdp", "sp"))),
-				("pre_attn_norm/kernel", PartitionSpec(("fsdp", "sp"))),
-				("pre_moe_norm/kernel", PartitionSpec(("fsdp", "sp"))),
-				("post_moe_norm/kernel", PartitionSpec(("fsdp", "sp"))),
-				("model/norm/kernel", PartitionSpec(("fsdp", "sp"))),
-				("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-				(".*", PartitionSpec(("fsdp", "sp"))),
-			)
+				"attn/(q_proj|k_proj|v_proj)/kernel",
+				PartitionSpec(("fsdp", "sp"), "tp"),
+			),
+			("attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("linear/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("linear_1/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("linear_v/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("gate/kernel", PartitionSpec("tp")),
+			("post_attn_norm/kernel", PartitionSpec(None)),
+			("pre_attn_norm/kernel", PartitionSpec(None)),
+			("pre_moe_norm/kernel", PartitionSpec(None)),
+			("post_moe_norm/kernel", PartitionSpec(None)),
+			("model/norm/kernel", PartitionSpec(None)),
+			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			(".*", PartitionSpec(None)),
 		)
 
 	def add_jax_args(

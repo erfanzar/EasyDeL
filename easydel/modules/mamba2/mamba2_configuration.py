@@ -150,20 +150,13 @@ class Mamba2Config(EDPretrainedConfig):
 		self.intermediate_size = int(expand * hidden_size)
 		super().__init__(**kwargs)
 
-	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+	def get_partition_rules(self, *args, **kwargs):
 		"""
 		Get the partition rules for the model.
-
-		Args:
-		    fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
-		        Whether to use fully sharded data parallelism.
-
 		Returns:
 		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
-		return super().get_partition_rules(
-			fully_sharded_data_parallel=fully_sharded_data_parallel
-		)
+		return super().get_partition_rules()
 
 	def add_jax_args(self, gradient_checkpointing: str = "nothing_saveable"):
 		self.gradient_checkpointing = gradient_checkpointing
