@@ -183,7 +183,6 @@ def _get_autotune_config():
 		return _get_cuda_autotune_config()
 
 
-@triton.autotune(configs=_get_autotune_config(), key=["M", "N", "K"])
 @triton.jit
 def _triton_gemm(
 	a_ptr,
@@ -232,7 +231,14 @@ def _triton_gemm(
 	tl.store(c_ptrs, acc, mask=c_mask)
 
 
-@triton.autotune(configs=_get_autotune_config(), key=["M", "N", "K"])
+try:
+	_triton_gemm = triton.autotune(configs=_get_autotune_config(), key=["M", "N", "K"])(
+		_triton_gemm
+	)
+except ModuleNotFoundError:
+	...
+
+
 @triton.jit
 def _gemm_activation_kernel(
 	a_ptr,

@@ -22,6 +22,8 @@ from pathlib import Path
 import flax.metrics.tensorboard
 
 from easydel.etils.etils import get_logger
+import sys
+from contextlib import contextmanager
 
 try:
 	import wandb  # type: ignore
@@ -145,3 +147,45 @@ def get_cache_dir() -> Path:
 		cache_dir = home_dir / ".cache" / app_name
 	cache_dir.mkdir(parents=True, exist_ok=True)
 	return cache_dir
+
+
+class DummyStream:
+	"""A null device-like stream that discards all writes."""
+
+	def write(self, *args, **kwargs):
+		pass
+
+	def flush(self, *args, **kwargs):
+		pass
+
+
+@contextmanager
+def quiet(suppress_stdout=True, suppress_stderr=True):
+	"""
+	Context manager to temporarily suppress stdout and/or stderr output.
+	Args:
+	  suppress_stdout (bool): Whether to suppress stdout
+	  suppress_stderr (bool): Whether to suppress stderr
+	Usage:
+	  with suppress_output():
+	    # Code that generates unwanted output
+	    print("This won't be displayed")
+	Note:
+	  This will suppress ALL output to the specified streams within the context,
+	  including output from C extensions and system calls.
+	"""
+	original_stdout = sys.stdout
+	original_stderr = sys.stderr
+
+	try:
+		if suppress_stdout:
+			sys.stdout = DummyStream()
+		if suppress_stderr:
+			sys.stderr = DummyStream()
+		yield
+
+	finally:
+		if suppress_stdout:
+			sys.stdout = original_stdout
+		if suppress_stderr:
+			sys.stderr = original_stderr
