@@ -130,18 +130,19 @@ def _compiled_generate(
 	assert (
 		position_ids.shape == attention_mask.shape
 	), "`position_ids` and `attention_mask` must have the same shape."
-
+ 
+	model_kwargs = model.prepare_inputs_for_generation(
+		input_ids=input_ids,
+		max_length=max_length,
+		attention_mask=attention_mask,
+	) 
 	state = SampleState(
 		current_length=current_length,
 		sequences=sequences,
 		running_token=input_ids,
 		is_sequence_finished=is_sequence_finished,
 		prng_key=rng,
-		model_kwargs=model.prepare_inputs_for_generation(
-			input_ids=input_ids,
-			max_length=max_length,
-			attention_mask=attention_mask,
-		),
+		model_kwargs=model_kwargs,
 		generated_tokens=0,
 	)
 

@@ -957,7 +957,10 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 			)
 			return init_variables["cache"]
 
-		return jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), jax.eval_shape(init_fn))
+		return jax.tree_map(
+			lambda x: jnp.zeros(x.shape, x.dtype, device=getattr(x, "sharding", None)),
+			jax.eval_shape(init_fn),
+		)
 
 	def prepare_inputs_for_generation(
 		self,
@@ -979,7 +982,6 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 		    position ids
 		"""
 		batch_size, seq_length = input_ids.shape
-
 		past_key_values = self.init_cache(batch_size, max_length)
 		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
 		if attention_mask is not None:

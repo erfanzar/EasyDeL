@@ -593,6 +593,7 @@ class FlaxAttentionModule(nn.Module):
 		Returns:
 		    The key, value and attention_mask
 		"""
+		paxs: PartitionAxis = self.config.partition_axis
 		do_quantize_kv_cache = self.config.quantize_kv_cache
 		is_initialized = self.has_variable("cache", "cached_key")
 		if do_quantize_kv_cache:
@@ -600,8 +601,17 @@ class FlaxAttentionModule(nn.Module):
 				"cache",
 				"cached_key",
 				lambda: Array8Bit.quantize(
-					jnp.zeros(key.shape, dtype=key.dtype),
-					qk=64,
+					jnp.zeros(
+						key.shape,
+						dtype=key.dtype,
+						device=PartitionSpec(
+							paxs.batch_axis,
+							paxs.key_sequence_axis,
+							paxs.head_axis,
+							paxs.attention_dim_axis,
+						),
+					),
+					qk=32,
 					platform="jax",
 				),
 			)
@@ -609,8 +619,17 @@ class FlaxAttentionModule(nn.Module):
 				"cache",
 				"cached_value",
 				lambda: Array8Bit.quantize(
-					jnp.zeros(value.shape, dtype=value.dtype),
-					qk=64,
+					jnp.zeros(
+						value.shape,
+						dtype=value.dtype,
+						device=PartitionSpec(
+							paxs.batch_axis,
+							paxs.key_sequence_axis,
+							paxs.head_axis,
+							paxs.attention_dim_axis,
+						),
+					),
+					qk=32,
 					platform="jax",
 				),
 			)
@@ -626,6 +645,12 @@ class FlaxAttentionModule(nn.Module):
 				jnp.zeros,
 				key.shape,
 				key.dtype,
+				PartitionSpec(
+					paxs.batch_axis,
+					paxs.key_sequence_axis,
+					paxs.head_axis,
+					paxs.attention_dim_axis,
+				),
 			)
 			cached_value = self.variable(
 				"cache",
@@ -633,13 +658,18 @@ class FlaxAttentionModule(nn.Module):
 				jnp.zeros,
 				value.shape,
 				value.dtype,
+				PartitionSpec(
+					paxs.batch_axis,
+					paxs.key_sequence_axis,
+					paxs.head_axis,
+					paxs.attention_dim_axis,
+				),
 			)
 			cache_index = self.variable(
 				"cache",
 				"cache_index",
 				lambda: jnp.array(0, dtype=jnp.int32),
 			)
-		paxs: PartitionAxis = self.config.partition_axis
 		if is_initialized:
 			*batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
 			cur_index = cache_index.value
