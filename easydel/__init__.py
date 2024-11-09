@@ -14,15 +14,18 @@
 
 __version__ = "0.0.80"
 
-import os
+import os as _os
 
-if os.environ.get("EASYDEL_AUTO", "true") in ["true", "1", "on", "yes"]:
+if _os.environ.get("EASYDEL_AUTO", "true") in ["true", "1", "on", "yes"]:
 	# Taking care of some optional GPU FLAGs
-	os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-	os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-	os.environ["CACHE_TRITON_KERNELS"] = "1"
-	os.environ["XLA_FLAGS"] = (
-		os.environ.get("XLA_FLAGS", "") + " "
+	_os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+	_os.environ["KMP_AFFINITY"] = "noverbose"
+	_os.environ["GRPC_VERBOSITY"] = "3"
+	_os.environ["GLOG_minloglevel"] = "3"
+	_os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+	_os.environ["CACHE_TRITON_KERNELS"] = "1"
+	_os.environ["XLA_FLAGS"] = (
+		_os.environ.get("XLA_FLAGS", "") + " "
 		"--xla_gpu_triton_gemm_any=True \ "
 		"--xla_gpu_enable_while_loop_double_buffering=true \ "
 		"--xla_gpu_enable_pipelined_all_gather=true \ "
@@ -40,13 +43,12 @@ if os.environ.get("EASYDEL_AUTO", "true") in ["true", "1", "on", "yes"]:
 		"--xla_gpu_enable_latency_hiding_scheduler=true \ "
 		"--xla_gpu_enable_command_buffer= \ "
 	)
-	os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-	if os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION", None) is None:
-		os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "1.0"
-	os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-	if os.environ.get("JAX_TRACEBACK_FILTERING", None) is None:
-		os.environ["JAX_TRACEBACK_FILTERING"] = "off"
-
+	_os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+	if _os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION", None) is None:
+		_os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "1.0"
+	if _os.environ.get("JAX_TRACEBACK_FILTERING", None) is None:
+		_os.environ["JAX_TRACEBACK_FILTERING"] = "off"
+del _os
 
 # EasyDel Imports
 from packaging.version import Version as _Version
@@ -124,6 +126,7 @@ from easydel.modules.exaone import (
 	FlaxExaoneModel,
 	FlaxExaoneModule,
 )
+from easydel.modules.factory import registry as module_registry
 from easydel.modules.falcon import (
 	FalconConfig,
 	FlaxFalconForCausalLM,
@@ -340,7 +343,6 @@ from easydel.modules.xerxes import (
 	FlaxXerxesModule,
 	XerxesConfig,
 )
-from easydel.modules.factory import registry as module_registry
 from easydel.smi import get_mem, initialise_tracking, run
 from easydel.trainers import (
 	BaseTrainer,
@@ -381,6 +383,18 @@ assert _Version(_fjformer_version) in [
 	f"this version of EasyDeL is only compatible with fjformer {', '.join(_targeted_versions)},"
 	f" but found fjformer {_fjformer_version}"
 )
+import jax as _jax
 
+if _jax.default_backend() == "gpu":
+	try:
+		import torch  # noqa #type:ignore
+
+		del torch
+	except ModuleNotFoundError:
+		print(
+			"UserWarning: please install `torch-cpu` since `easydel` "
+			"uses `triton` and `triton` uses `torch` for autotuning.",
+		)
+del _jax
 del _Version
 del _fjformer_version

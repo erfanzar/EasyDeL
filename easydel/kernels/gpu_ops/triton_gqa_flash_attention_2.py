@@ -150,10 +150,6 @@ def fwd_keep(conf):
 	return True
 
 
-@triton.autotune(
-	list(filter(fwd_keep, fwd_configs)),
-	key=["CQL", "CKL", "HAVE_BIAS", "BIAS_SINGLE_HEAD", "BLOCK_HEADDIM"],
-)
 @triton.heuristics({"EVEN_N": lambda args: args["seqlen_k"] % args["BLOCK_N"] == 0})
 @triton.jit
 def _fwd_attention_kernel(
@@ -299,6 +295,15 @@ def _fwd_attention_kernel(
 	acc_o = acc_o * o_scale[:, None]
 	tl.store(L_Block_ptr, lse_i, boundary_check=(0,))
 	tl.store(O_Block_ptr, acc_o.to(q.dtype), boundary_check=(0, 1))
+
+
+try:
+	_fwd_attention_kernel = triton.autotune(
+		list(filter(fwd_keep, fwd_configs)),
+		key=["CQL", "CKL", "HAVE_BIAS", "BIAS_SINGLE_HEAD", "BLOCK_HEADDIM"],
+	)(_fwd_attention_kernel)
+except ModuleNotFoundError:
+	...
 
 
 def _fwd_attention_kernel_call(
