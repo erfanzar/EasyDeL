@@ -951,7 +951,7 @@ class FlexibleAttentionModule(object):
 			bias_partitionspec,
 			attention_partitionspec,
 			_,
-		) = self.get_bshd_partition_specs(query_states.shape[1], True)
+		) = self.get_bshd_partition_specs(query_states.shape[1], True) 
 		attn_output = shard_map(
 			partial(
 				ring_attention,

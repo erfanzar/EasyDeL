@@ -61,7 +61,7 @@ from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN, EasyQuantizer
 logger = get_logger(__name__)
 
 FLAX_WEIGHTS_NAME = "easydel-model.parameters"
-
+AVAILALBE_DEVICES = jax.device_count()
 DEFAULT_PALLAS_M_BLOCK_SIZE = 128
 DEFAULT_PALLAS_K_BLOCK_SIZE = 128
 DEFAULT_PALLAS_N_BLOCK_SIZE = 128
@@ -834,7 +834,7 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 		self,
 		config: Optional[PretrainedConfig] = None,
 		module: Optional[flax.linen.Module] = None,
-		input_shape: Tuple = (1, 1),
+		input_shape: Tuple = (AVAILALBE_DEVICES, AVAILALBE_DEVICES),
 		seed: int = 0,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,  # Ignored
@@ -1504,6 +1504,7 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			input_shape=input_shape,
 			_do_init=False,
 		)
 		if bit_targeted_params is None:
