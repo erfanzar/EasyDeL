@@ -433,20 +433,20 @@ class FlexibleAttentionModule(object):
 			query_partition_spec = PartitionSpec(
 				self.partition_axis.batch_axis,
 				self.partition_axis.generation_query_sequence_axis,
-				self.partition_axis.head_axis,
-				self.partition_axis.attention_dim_axis,
+				self.partition_axis.generation_head_axis,
+				self.partition_axis.generation_attention_dim_axis,
 			)
 			key_partition_spec = PartitionSpec(
 				self.partition_axis.batch_axis,
 				self.partition_axis.generation_key_sequence_axis,
-				self.partition_axis.head_axis,
-				self.partition_axis.attention_dim_axis,
+				self.partition_axis.generation_head_axis,
+				self.partition_axis.generation_attention_dim_axis,
 			)
 			value_partition_spec = PartitionSpec(
 				self.partition_axis.batch_axis,
 				self.partition_axis.generation_key_sequence_axis,
-				self.partition_axis.head_axis,
-				self.partition_axis.attention_dim_axis,
+				self.partition_axis.generation_head_axis,
+				self.partition_axis.generation_attention_dim_axis,
 			)
 			bias_partition_spec = PartitionSpec(
 				self.partition_axis.batch_axis,
@@ -467,7 +467,9 @@ class FlexibleAttentionModule(object):
 		)
 
 	def get_bhsd_partition_specs(
-		self, query_sequence_length
+		self,
+		query_sequence_length,
+		bias_dim_eql=False,
 	) -> Tuple[
 		PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, bool
 	]:
@@ -501,26 +503,28 @@ class FlexibleAttentionModule(object):
 		else:
 			query_partition_spec = PartitionSpec(
 				self.partition_axis.batch_axis,
-				self.partition_axis.head_axis,
-				self.partition_axis.query_sequence_axis,
-				self.partition_axis.attention_dim_axis,
+				self.partition_axis.generation_head_axis,
+				self.partition_axis.generation_query_sequence_axis,
+				self.partition_axis.generation_attention_dim_axis,
 			)
 			key_partition_spec = PartitionSpec(
 				self.partition_axis.batch_axis,
-				self.partition_axis.head_axis,
-				self.partition_axis.key_sequence_axis,
-				self.partition_axis.attention_dim_axis,
+				self.partition_axis.generation_head_axis,
+				self.partition_axis.generation_key_sequence_axis,
+				self.partition_axis.generation_attention_dim_axis,
 			)
 			value_partition_spec = PartitionSpec(
 				self.partition_axis.batch_axis,
-				self.partition_axis.head_axis,
-				self.partition_axis.key_sequence_axis,
-				self.partition_axis.attention_dim_axis,
+				self.partition_axis.generation_head_axis,
+				self.partition_axis.generation_key_sequence_axis,
+				self.partition_axis.generation_attention_dim_axis,
 			)
 			bias_partition_spec = PartitionSpec(
 				self.partition_axis.batch_axis,
-				self.partition_axis.bias_head_sequence_axis,
-				self.partition_axis.query_sequence_axis,
+				self.partition_axis.bias_head_sequence_axis
+				if not bias_dim_eql
+				else self.partition_axis.head_axis,
+				self.partition_axis.generation_query_sequence_axis,
 				self.partition_axis.bias_key_sequence_axis,
 			)
 			attention_partition_spec = query_partition_spec
