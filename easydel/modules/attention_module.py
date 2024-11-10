@@ -401,7 +401,7 @@ class FlexibleAttentionModule(object):
 		bool,
 	]:
 		in_generating_processerating = query_sequence_length == 1
-		if in_generating_processerating:
+		if not in_generating_processerating:
 			query_partition_spec = PartitionSpec(
 				self.partition_axis.batch_axis,
 				self.partition_axis.query_sequence_axis,
@@ -472,7 +472,7 @@ class FlexibleAttentionModule(object):
 		PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, bool
 	]:
 		in_generating_processerating = query_sequence_length == 1
-		if in_generating_processerating:
+		if not in_generating_processerating:
 			query_partition_spec = PartitionSpec(
 				self.partition_axis.batch_axis,
 				self.partition_axis.head_axis,
@@ -950,8 +950,8 @@ class FlexibleAttentionModule(object):
 			value_partitionspec,
 			bias_partitionspec,
 			attention_partitionspec,
-			_,
-		) = self.get_bshd_partition_specs(query_states.shape[1], True) 
+			gen,
+		) = self.get_bshd_partition_specs(query_states.shape[1], True)
 		attn_output = shard_map(
 			partial(
 				ring_attention,
