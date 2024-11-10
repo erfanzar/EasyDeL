@@ -11,11 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 from __future__ import annotations
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import time
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import AsyncGenerator, Callable, Dict, Optional
+from typing import Any, AsyncGenerator, Callable, Dict, Optional
 
 import uvicorn
 from fastapi import APIRouter, FastAPI
@@ -52,6 +55,7 @@ class vInferenceApiServer:
 	def __init__(
 		self,
 		inference_map: Dict[str, "vInference"] = None,  # noqa #type:ignore
+		max_workers: int = 10,
 	) -> None:
 		from easydel.inference.vinference import vInference
 
@@ -61,6 +65,7 @@ class vInferenceApiServer:
 				inference, vInference
 			), "values and inferences in inference_map must be `vInference`"
 
+		self.thread_pool = ThreadPoolExecutor(max_workers=max_workers)
 		self.inference_map = inference_map
 		self.router = APIRouter()
 		self._endpoints = [
@@ -107,10 +112,12 @@ class vInferenceApiServer:
 
 	async def chat_completions(self, request: ChatCompletionRequest):
 		try:
+			# Get model and tokenize input asynchronously
 			inference = self._get_inference_model(request.model)
 			ids = self._prepare_tokenized_input(request.messages, inference)
+
 			if not request.stream:
-				return await self._handle_non_streaming_response(request, inference, ids)
+				return await self._handle_non_streaming_response_async(request, inference, ids)
 			else:
 				return await self._handle_streaming_response(request, inference, ids)
 
@@ -156,7 +163,7 @@ class vInferenceApiServer:
 			processing_time=processing_time,
 		)
 
-	async def _handle_non_streaming_response(
+	def _handle_non_streaming_response(
 		self,
 		request: ChatCompletionRequest,
 		inference: "vInference",  # noqa #type:ignore
@@ -166,7 +173,7 @@ class vInferenceApiServer:
 		start = time.perf_counter()
 
 		# Generate response
-		async for response in inference.generate(
+		for response in inference.generate(
 			input_ids=ids["input_ids"],
 			attention_mask=ids["attention_mask"],
 		):
@@ -204,22 +211,35 @@ class vInferenceApiServer:
 			),
 		)
 
+	async def _handle_non_streaming_response_async(self, request, inference, ids):
+		response = await asyncio.get_event_loop().run_in_executor(
+			self.thread_pool, self._handle_non_streaming_response, request, inference, ids
+		)
+		return response
+
 	async def _handle_streaming_response(
 		self,
 		request: ChatCompletionRequest,
 		inference: "vInference",  # noqa #type:ignore
 		ids: dict,
 	) -> StreamingResponse:
-		"""Handle streaming response generation."""
+		"""Handle streaming response generation asynchronously."""
 
-		async def stream_results() -> AsyncGenerator[bytes, None]:
+		async def stream_results() -> AsyncGenerator[bytes, Any]:
 			start = time.perf_counter()
 			padded_sequence_length = inference.model_prefill_length
 
-			async for response in inference.generate(
-				input_ids=ids["input_ids"],
-				attention_mask=ids["attention_mask"],
-			):
+			# Create generator in thread pool to not block the event loop
+			async def generate_tokens():
+				return await asyncio.get_event_loop().run_in_executor(
+					None,  # Use default thread pool
+					inference.generate,
+					ids["input_ids"],
+					ids["attention_mask"],
+				)
+
+			async for response in self._aiter_generator(await generate_tokens()):
+				# Process each chunk asynchronously
 				next_slice = slice(
 					padded_sequence_length,
 					padded_sequence_length + inference.generation_config.streaming_chunks,
@@ -228,18 +248,23 @@ class vInferenceApiServer:
 
 				processing_time = time.perf_counter() - start
 
+				# Decode tokens in thread pool to avoid blocking
+				decoded_response = await asyncio.get_event_loop().run_in_executor(
+					None,
+					inference.tokenizer.decode,
+					response.sequences[0][next_slice],
+					True,  # skip_special_tokens
+				)
+
 				stream_resp = ChatCompletionStreamResponse(
 					model=request.model,
 					choices=[
 						ChatCompletionStreamResponseChoice(
-							response=inference.tokenizer.decode(
-								response.sequences[0][next_slice],
-								skip_special_tokens=True,
-							),
+							response=decoded_response,
 							finish_reason=None,
 						)
 					],
-					usage=self._create_usage_info(
+					usage=await self._create_usage_info_async(
 						inference.model_prefill_length,
 						response.generated_tokens,
 						processing_time,
@@ -248,13 +273,18 @@ class vInferenceApiServer:
 						response.tokens_pre_second,
 					),
 				)
-
 				yield ("data: " + stream_resp.model_dump_json() + "\n\n").encode("utf-8")
+
+				# Add a small delay to prevent overwhelming the event loop
+				await asyncio.sleep(0)
+
+			# Final response with finish reason
 			finish_reason = (
 				"length"
 				if response.generated_tokens == inference.generation_config.max_new_tokens
 				else "stop"
 			)
+
 			stream_resp = ChatCompletionStreamResponse(
 				model=request.model,
 				choices=[
@@ -263,7 +293,7 @@ class vInferenceApiServer:
 						finish_reason=finish_reason,
 					)
 				],
-				usage=self._create_usage_info(
+				usage=await self._create_usage_info_async(
 					inference.model_prefill_length,
 					response.generated_tokens,
 					processing_time,
@@ -277,6 +307,35 @@ class vInferenceApiServer:
 
 		return StreamingResponse(stream_results(), media_type="text/event-stream")
 
+	async def _aiter_generator(self, generator):
+		"""Convert a regular generator to an async generator."""
+		for item in generator:
+			yield item
+			# Give other coroutines a chance to run
+			await asyncio.sleep(0)
+
+	async def _create_usage_info_async(
+		self,
+		prefill_length: int,
+		generated_tokens: int,
+		processing_time: float,
+		generate_flops: int,
+		interval_flops: int,
+		tokens_per_second: float,
+	) -> dict:
+		"""Async version of create_usage_info."""
+		# If usage info calculation is CPU intensive, run it in thread pool
+		return await asyncio.get_event_loop().run_in_executor(
+			None,
+			self._create_usage_info,
+			prefill_length,
+			generated_tokens,
+			processing_time,
+			generate_flops,
+			interval_flops,
+			tokens_per_second,
+		)
+
 	def liveness(self):
 		return JSONResponse({"status": "ok"}, status_code=200)
 
@@ -289,12 +348,12 @@ class vInferenceApiServer:
 			status_code=200,
 		)
 
-	async def count_tokens(self, request: CountTokenRequest):
+	def count_tokens(self, request: CountTokenRequest):
 		try:
 			conv = request.conversation
 			model = request.model
 			return JSONResponse(
-				{"ntokens": await self.inference_map[model].count_tokens(conv)},
+				{"ntokens": self.inference_map[model].count_tokens(conv)},
 				status_code=200,
 			)
 		except Exception as e:
@@ -320,10 +379,11 @@ class vInferenceApiServer:
 	def fire(
 		self,
 		host="0.0.0.0",
-		port=7860,
-		metrics_port: int = 7861,
+		port=11556,
+		metrics_port: Optional[int] = None,
 		log_level="debug",
 	):
+		metrics_port = metrics_port or (port + 1)
 		start_http_server(metrics_port)
 		uvicorn.run(
 			self.app,
@@ -333,22 +393,3 @@ class vInferenceApiServer:
 			timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
 			loop="uvloop",
 		)
-
-	async def async_fire(
-		self,
-		host="0.0.0.0",
-		port=7860,
-		metrics_port: int = 7861,
-		log_level="debug",
-	):
-		start_http_server(metrics_port)
-		config = uvicorn.Config(
-			self.app,
-			host=host,
-			port=port,
-			log_level=log_level,
-			timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
-			loop="uvloop",
-		)
-		server = uvicorn.Server(config)
-		await server.serve()

@@ -1,4 +1,3 @@
-import asyncio
 import os
 import sys
 
@@ -7,20 +6,19 @@ os.environ["EASYDEL_AUTO"] = "true"
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+import easydel as ed
 import jax
 import torch
 from huggingface_hub import HfApi
 from jax import lax, sharding
 from jax import numpy as jnp
-from prometheus_client import start_http_server
 from transformers import AutoTokenizer
 
-import easydel as ed
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
 
-async def main():
+def main():
 	sharding_axis_dims = (1, 1, 1, -1)
 	max_length = 8192
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
@@ -68,10 +66,10 @@ async def main():
 		),
 	)
 
-	await inference.async_precompile(1)
+	inference.precompile(1)
 	print(inference.inference_name)
-	await ed.vInferenceApiServer({inference.inference_name: inference}).async_fire()
+	ed.vInferenceApiServer({inference.inference_name: inference}).fire()
 
 
 if __name__ == "__main__":
-	asyncio.run(main())
+	main()

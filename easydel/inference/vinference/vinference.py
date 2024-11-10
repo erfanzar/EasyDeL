@@ -22,7 +22,7 @@ import time
 import warnings
 from datetime import datetime
 from functools import partial
-from typing import AsyncGenerator, Dict, List, Optional, Union, overload
+from typing import Any, Dict, Generator, List, Optional, Union, overload
 from uuid import uuid4
 import numpy as np
 import flax.core
@@ -130,12 +130,12 @@ def _compiled_generate(
 	assert (
 		position_ids.shape == attention_mask.shape
 	), "`position_ids` and `attention_mask` must have the same shape."
- 
+
 	model_kwargs = model.prepare_inputs_for_generation(
 		input_ids=input_ids,
 		max_length=max_length,
 		attention_mask=attention_mask,
-	) 
+	)
 	state = SampleState(
 		current_length=current_length,
 		sequences=sequences,
@@ -587,12 +587,12 @@ class vInference:
 			self.generation_config.eos_token_id is not None
 		), "`eos_token_id` cannot be None."
 
-	async def generate(
+	def generate(
 		self,
 		input_ids: jax.Array,
 		attention_mask: Optional[jax.Array] = None,
 		position_ids: Optional[jax.Array] = None,
-	) -> AsyncGenerator[SampleState, None]:
+	) -> Generator[SampleState, Any, Any]:
 		"""
 		Generates text in streaming chunks.
 
@@ -616,7 +616,7 @@ class vInference:
 			).time():
 				input_ids = jnp.array(input_ids)
 				batch_size, seq_length = input_ids.shape
-				_ = await self.async_precompile(batch_size, seq_length)
+				_ = self.precompile(batch_size, seq_length)
 				generate_func, interval_func = get_compiled_funcs(
 					batch_size=batch_size,
 					input_tokens_length=seq_length,
@@ -749,55 +749,9 @@ class vInference:
 				id=self._uuid4,
 			)
 
-	async def async_precompile(
-		self,
-		batch_size: int,
-		input_tokens_length: Optional[int] = None,
-	):
-		"""
-		Precompiles the generation functions for a given batch size and input length.
-
-		This function checks if the generation functions have already been compiled for
-		the given configuration. If not, it compiles them asynchronously and stores them
-		in a cache.
-
-		Args:
-			batch_size: The batch size.
-			input_tokens_length: The length of the input tokens.
-
-		Returns:
-			bool: True if precompilation was successful, False otherwise.
-		"""
-		if input_tokens_length is None:
-			input_tokens_length = self.model_prefill_length
-		config_key = (batch_size, input_tokens_length)
-		if config_key in self._precompiled_configs:
-			return True
-		async with self._precompile_lock:
-			if config_key in self._precompiled_configs:
-				return True
-			if config_key in self._in_compiling_process:
-				await asyncio.sleep(5)
-				return await self.async_precompile(
-					batch_size=batch_size,
-					input_tokens_length=input_tokens_length,
-				)
-			else:
-				with self.metrics.compilation_time.labels(
-					model_name=self.metrics.model_name,
-					function_name="_compile_and_lower_funs",
-				).time():
-					self._in_compiling_process.add(config_key)
-					self._compile_and_lower_funs(
-						batch_size=batch_size,
-						input_tokens_length=input_tokens_length,
-					)
-					self._precompiled_configs.add(config_key)
-			return True
-
 	def precompile(
 		self,
-		batch_size: int,
+		batch_size: int = 1,
 		input_tokens_length: Optional[int] = None,
 	):
 		"""
@@ -840,11 +794,11 @@ class vInference:
 		return True
 
 	@overload
-	async def count_tokens(self, messages: List[Dict[str, str]]): ...
+	def count_tokens(self, messages: List[Dict[str, str]]): ...
 	@overload
-	async def count_tokens(self, text: str): ...
+	def count_tokens(self, text: str): ...
 
-	async def count_tokens(self, conv: Union[str, List[Dict[str, str]]]) -> int:
+	def count_tokens(self, conv: Union[str, List[Dict[str, str]]]) -> int:
 		if isinstance(conv, list) and all(isinstance(item, dict) for item in conv):
 			# Handle chat messages using chat template
 			tokens = self.tokenizer.apply_chat_template(
