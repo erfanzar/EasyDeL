@@ -642,27 +642,29 @@ class FlaxAttentionModule(nn.Module):
 			cached_key = self.variable(
 				"cache",
 				"cached_key",
-				jnp.zeros,
-				key.shape,
-				key.dtype,
-				PartitionSpec(
-					paxs.batch_axis,
-					paxs.key_sequence_axis,
-					paxs.head_axis,
-					paxs.attention_dim_axis,
+				lambda: jnp.zeros(
+					shape=key.shape,
+					dtype=key.dtype,
+					device=PartitionSpec(
+						paxs.batch_axis,
+						paxs.key_sequence_axis,
+						paxs.head_axis,
+						paxs.attention_dim_axis,
+					),
 				),
 			)
 			cached_value = self.variable(
 				"cache",
 				"cached_value",
-				jnp.zeros,
-				value.shape,
-				value.dtype,
-				PartitionSpec(
-					paxs.batch_axis,
-					paxs.key_sequence_axis,
-					paxs.head_axis,
-					paxs.attention_dim_axis,
+				lambda: jnp.zeros(
+					shape=key.shape,
+					dtype=key.dtype,
+					device=PartitionSpec(
+						paxs.batch_axis,
+						paxs.key_sequence_axis,
+						paxs.head_axis,
+						paxs.attention_dim_axis,
+					),
 				),
 			)
 			cache_index = self.variable(
