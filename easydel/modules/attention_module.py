@@ -47,6 +47,8 @@ import numpy
 from easydel.etils.etils import (
 	_AVAILABLE_ATTENTION_MECHANISMS,
 	AVAILABLE_ATTENTION_MECHANISMS,
+	EasyDeLBackends,
+	EasyDeLPlatforms,
 	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
@@ -110,8 +112,6 @@ except:  # noqa
 	cuda_flash_attn2_mha = None
 logger = get_logger(__name__)
 
-AVAILABLE_BACKENDS = Literal["triton", "pallas", "jax"]
-AVAILABLE_PLATFORMS = Literal["gpu", "tpu", "cpu"]
 DEFAULT_K_BLOCK = 128
 DEFAULT_Q_BLOCK = 64
 
@@ -321,8 +321,8 @@ class FlexibleAttentionModule(object):
 		shard_attention_computation: bool = ...,
 		use_sharding_constraint: Optional[bool] = ...,
 		axis_name: str = ...,
-		platform: AVAILABLE_BACKENDS = ...,
-		backend: Optional[Literal["cpu", "gpu", "tpu"]] = ...,
+		platform: EasyDeLPlatforms = ...,
+		backend: Optional[EasyDeLBackends] = ...,
 		backward_pass_impl: Literal["triton", "xla"] = "triton",
 		base_config: Optional[EDPretrainedConfig] = None,
 		_do_check: bool = True,

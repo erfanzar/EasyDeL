@@ -30,7 +30,7 @@ import jax.tree_util
 from aqt.jax.v2 import config as q_config
 from aqt.jax.v2.flax import aqt_flax as q_flax
 from einops import rearrange
-from fjformer.dtypes import Array8Bit
+from fjformer.dtypes import Array8Bit, ArrayNF4
 from flax import linen as nn
 from flax.linen import combine_masks
 from flax.traverse_util import flatten_dict, unflatten_dict
@@ -43,7 +43,11 @@ from jax.sharding import PartitionSpec
 from tqdm.auto import tqdm
 
 from easydel.etils.errors import EasyDeLBlockWiseFFNError
-from easydel.etils.etils import AVAILABLE_SPARSE_MODULE_TYPES, get_logger
+from easydel.etils.etils import (
+	AVAILABLE_SPARSE_MODULE_TYPES,
+	EasyDeLQuantizationMethods,
+	get_logger,
+)
 from easydel.etils.partition_module import PartitionAxis
 from easydel.modules.modeling_utils import EasyMethod
 from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN, EasyQuantizer
@@ -595,49 +599,85 @@ class FlaxAttentionModule(nn.Module):
 		"""
 		paxs: PartitionAxis = self.config.partition_axis
 		do_quantize_kv_cache = self.config.quantize_kv_cache
+		quantization_method = self.config.kv_cache_quantization_method
+
 		is_initialized = self.has_variable("cache", "cached_key")
 		if do_quantize_kv_cache:
-			cached_key = self.variable(
-				"cache",
-				"cached_key",
-				lambda: Array8Bit.quantize(
-					jnp.zeros(
-						key.shape,
-						dtype=key.dtype,
-						device=PartitionSpec(
-							paxs.batch_axis,
-							paxs.key_sequence_axis,
-							paxs.head_axis,
-							paxs.attention_dim_axis,
+			match quantization_method:
+				case "8bit":
+					cached_key = self.variable(
+						"cache",
+						"cached_key",
+						lambda: Array8Bit.quantize(
+							jnp.zeros(
+								key.shape,
+								dtype=key.dtype,
+								device=PartitionSpec(
+									paxs.batch_axis,
+									paxs.key_sequence_axis,
+									paxs.head_axis,
+									paxs.attention_dim_axis,
+								),
+							),
+							qk=64,
+							platform="jax",
 						),
-					),
-					qk=32,
-					platform="jax",
-				),
-			)
-			cached_value = self.variable(
-				"cache",
-				"cached_value",
-				lambda: Array8Bit.quantize(
-					jnp.zeros(
-						value.shape,
-						dtype=value.dtype,
-						device=PartitionSpec(
-							paxs.batch_axis,
-							paxs.key_sequence_axis,
-							paxs.head_axis,
-							paxs.attention_dim_axis,
+					)
+					cached_value = self.variable(
+						"cache",
+						"cached_value",
+						lambda: Array8Bit.quantize(
+							jnp.zeros(
+								value.shape,
+								dtype=value.dtype,
+								device=PartitionSpec(
+									paxs.batch_axis,
+									paxs.key_sequence_axis,
+									paxs.head_axis,
+									paxs.attention_dim_axis,
+								),
+							),
+							qk=64,
+							platform="jax",
 						),
-					),
-					qk=32,
-					platform="jax",
-				),
-			)
-			cache_index = self.variable(
-				"cache",
-				"cache_index",
-				lambda: jnp.array(0, dtype=jnp.int32),
-			)
+					)
+				case "nf4":
+					cached_key = self.variable(
+						"cache",
+						"cached_key",
+						lambda: ArrayNF4.quantize(
+							jnp.zeros(
+								key.shape,
+								dtype=key.dtype,
+								device=PartitionSpec(
+									paxs.batch_axis,
+									paxs.key_sequence_axis,
+									paxs.head_axis,
+									paxs.attention_dim_axis,
+								),
+							),
+							256,
+						),
+					)
+					cached_value = self.variable(
+						"cache",
+						"cached_value",
+						lambda: ArrayNF4.quantize(
+							jnp.zeros(
+								value.shape,
+								dtype=value.dtype,
+								device=PartitionSpec(
+									paxs.batch_axis,
+									paxs.key_sequence_axis,
+									paxs.head_axis,
+									paxs.attention_dim_axis,
+								),
+							),
+							256,
+						),
+					)
+				case _:
+					raise NotImplementedError("unsupported kv cache quantization method.")
 		else:
 			cached_key = self.variable(
 				"cache",
@@ -667,11 +707,11 @@ class FlaxAttentionModule(nn.Module):
 					),
 				),
 			)
-			cache_index = self.variable(
-				"cache",
-				"cache_index",
-				lambda: jnp.array(0, dtype=jnp.int32),
-			)
+		cache_index = self.variable(
+			"cache",
+			"cache_index",
+			lambda: jnp.array(0, dtype=jnp.int32),
+		)
 		if is_initialized:
 			*batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
 			cur_index = cache_index.value
@@ -767,8 +807,15 @@ class FlaxAttentionModule(nn.Module):
 				)
 				attention_mask = combine_masks(pad_mask, attention_mask)
 			if do_quantize_kv_cache:
-				cached_key.value = Array8Bit.quantize(key, qk=64, platform="jax")
-				cached_value.value = Array8Bit.quantize(value, qk=64, platform="jax")
+				match quantization_method:
+					case "8bit":
+						cached_key.value = Array8Bit.quantize(key, qk=64, platform="jax")
+						cached_value.value = Array8Bit.quantize(value, qk=64, platform="jax")
+					case "nf4":
+						cached_key.value = ArrayNF4.quantize(key, 256)
+						cached_value.value = ArrayNF4.quantize(value, 256)
+					case _:
+						raise NotImplementedError("unsupported kv cache quantization method.")
 			else:
 				cached_key.value = key
 				cached_value.value = value
@@ -990,8 +1037,9 @@ def is_flatten(pytree: dict):
 
 def quantize_params(
 	params: Union[Dict[str, Any], Any],
-	method: Literal["nf4", "8bit", "a8q", "a4q"] = "nf4",
+	method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.NF4,
 	embedding_layer_name: Optional[str] = None,
+	block_size: int = 256,
 	quantization_pattern: str = DEFAULT_QUANTIZATION_PATTERN,
 	verbose: bool = True,
 ) -> Union[Dict[str, Any], Any]:
@@ -1000,7 +1048,8 @@ def quantize_params(
 
 	Args:
 	    params: The parameters to quantize. Can be a nested dictionary or a flat structure.
-	    embedding_layer_name: Name of the embedding layer to ignore during quantization.
+			method (EasyDeLQuantizationMethods): quantization method for params.
+	    embedding_layer_name (str): Name of the embedding layer to ignore during quantization.
 	    quantization_pattern (str): re pattern for layers to be quantized.
 	    verbose (bool): whenever to use tqdm for logging stuff.
 
@@ -1014,7 +1063,7 @@ def quantize_params(
 	flatten = is_flatten(params)
 	if not flatten:
 		params = flatten_dict(params)
-	quantizer = EasyQuantizer(quantization_method=method)
+	quantizer = EasyQuantizer(quantization_method=method, block_size=block_size)
 
 	def quantize(path, array):
 		layer_name = ".".join(path[0].key)

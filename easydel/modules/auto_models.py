@@ -21,7 +21,6 @@ from typing import (
 	Any,
 	Callable,
 	List,
-	Literal,
 	Mapping,
 	Optional,
 	Sequence,
@@ -37,7 +36,12 @@ from flax.traverse_util import unflatten_dict
 from jax.sharding import PartitionSpec
 
 from easydel.etils.easystate import EasyDeLState
-from easydel.etils.etils import get_logger
+from easydel.etils.etils import (
+	EasyDeLBackends,
+	EasyDeLPlatforms,
+	EasyDeLQuantizationMethods,
+	get_logger,
+)
 from easydel.etils.partition_module import PartitionAxis
 from easydel.modules.factory import registry
 from easydel.modules.modeling_utils import (
@@ -140,13 +144,13 @@ class AutoEasyDeLModelForCausalLM:
 		shard_attention_computation: bool = True,
 		input_shape: Tuple[int, int] = (1, 1),
 		shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
-		backend: Optional[Literal["cpu", "gpu", "tpu"]] = None,
-		platform: Optional[Literal["jax", "triton", "pallas"]] = None,
+		backend: Optional[EasyDeLBackends] = None,
+		platform: Optional[EasyDeLPlatforms] = None,
 		config_kwargs: Optional[Mapping[str, Any]] = None,
 		auto_shard_params: bool = False,
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]] = None,
-		quantization_method: Optional[Literal["nf4", "8bit", "a8q", "a4q"]] = None,
-		quantization_platform: Optional[Literal["jax", "triton", "pallas"]] = "jax",
+		quantization_method: Optional[EasyDeLQuantizationMethods] = None,
+		quantization_platform: Optional[EasyDeLPlatforms] = EasyDeLPlatforms.JAX,
 		quantization_block_size: int = 256,
 		bit_targeted_params: Optional[List[str]] = None,
 		verbose_params: bool = False,
@@ -169,13 +173,13 @@ class AutoEasyDeLModelForCausalLM:
 		    shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
 		    input_shape (Tuple[int, int], optional): Shape of the input to the model. Defaults to (1, 1).
 		    shard_fns (Optional[Mapping[tuple, Callable] | dict], optional): Sharding functions to use for the model. If None, auto-sharding is used if auto_shard_params is True. Defaults to None.
-		    platform (Optional[Literal["jax", "triton", "pallas"]], optional): platform to use for the model. Defaults to None.
-				backend (Optional[Literal["cpu", "gpu", "tpu"]], optional): backend to use for the model. Defaults to None.
+		    platform (Optional[EasyDeLPlatforms], optional): platform to use for the model. Defaults to None.
+				backend (Optional[EasyDeLBackends], optional): backend to use for the model. Defaults to None.
 		    config_kwargs (Optional[Mapping[str, Any]], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
 		    auto_shard_params (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
 		    partition_rules (Optional[Tuple[Tuple[str, PartitionSpec]]], optional): Custom partition rules for parameter sharding. If not None, shard_fns should also be provided. Defaults to None.
-		    quantization_method (Literal["nf4", "8bit", "a8q", "a4q"], optional): quantization_method to be used to quantize model weights. Defaults to None.
-		    quantization_platform (Optional[Literal["jax", "triton", "pallas"]], optional): Platform to use for the weight quants. Defaults to None.
+		    quantization_method (EasyDeLQuantizationMethods, optional): quantization_method to be used to quantize model weights. Defaults to None.
+		    quantization_platform (Optional[EasyDeLPlatforms], optional): Platform to use for the weight quants. Defaults to None.
 				quantization_block_size (int): block size to be used for quantizing arrays (only for NF4).
 		    bit_targeted_params (Optional[List[str]], optional): List of parameter names to convert to 8-bit precision. If  None and 8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
 		    verbose_params (bool): whenever to log number of parameters in converting state.
@@ -260,13 +264,13 @@ class AutoEasyDeLModelForCausalLM:
 		shard_attention_computation: bool,
 		input_shape: Tuple[int, int],
 		shard_fns: Optional[Mapping[tuple, Callable] | dict],
-		backend: Optional[Literal["cpu", "gpu", "tpu"]],
-		platform: Optional[Literal["jax", "triton", "pallas"]],
+		backend: Optional[EasyDeLBackends],
+		platform: Optional[EasyDeLPlatforms],
 		config_kwargs: Optional[Mapping[str, Any]],
 		auto_shard_params: bool,
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]],
-		quantization_method: Optional[Literal["nf4", "8bit", "a8q", "a4q"]],
-		quantization_platform: Optional[Literal["jax", "triton", "pallas"]],
+		quantization_method: Optional[EasyDeLQuantizationMethods],
+		quantization_platform: Optional[EasyDeLPlatforms],
 		quantization_block_size: int,
 		bit_targeted_params: Optional[List[str]],
 		verbose_params: bool,
@@ -443,10 +447,10 @@ class AutoEasyDeLModelForCausalLM:
 		partition_axis: PartitionAxis,
 		input_shape: Tuple[int, int],
 		shard_fns: Optional[Mapping[tuple, Callable] | dict],
-		quantization_method: Optional[Literal["nf4", "8bit", "a8q", "a4q"]],
-		quantization_platform: Optional[Literal["jax", "triton", "pallas"]],
-		backend: Optional[Literal["cpu", "gpu", "tpu"]],
-		platform: Optional[Literal["jax", "triton", "pallas"]],
+		quantization_method: Optional[EasyDeLQuantizationMethods],
+		quantization_platform: Optional[EasyDeLPlatforms],
+		backend: Optional[EasyDeLBackends],
+		platform: Optional[EasyDeLPlatforms],
 		bit_targeted_params: Optional[List[str]],
 		quantization_block_size: int,
 		config_kwargs: Optional[Mapping[str, Any]],
@@ -566,8 +570,8 @@ class AutoEasyDeLConfig:
 		sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
 		partition_axis: Optional[PartitionAxis] = None,
 		shard_attention_computation: bool = True,
-		backend: Optional[Literal["cpu", "gpu", "tpu"]] = None,
-		platform: Optional[Literal["jax", "triton", "pallas"]] = None,
+		backend: Optional[EasyDeLBackends] = None,
+		platform: Optional[EasyDeLPlatforms] = None,
 		from_torch: bool = False,
 		**kwargs,
 	) -> EDPretrainedConfig:
@@ -582,7 +586,7 @@ class AutoEasyDeLConfig:
 		    sharding_axis_names: Sequence[str]: Specify the order of sharding
 		    partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
 		    shard_attention_computation: bool: whenever to use shard_map for attention
-		    backend: Optional[Literal["cpu", "gpu", "tpu"]] : backend to use for model
+		    backend: Optional[EasyDeLBackends] : backend to use for model
 		    from_torch: should config be loaded from torch models or not.
 		    **kwargs: Pass additional arguments to the model and config classes
 		generation process
@@ -696,8 +700,8 @@ class AutoShardAndGatherFunctions:
 		sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
 		partition_axis: Optional[PartitionAxis] = None,
 		shard_attention_computation: bool = True,
-		backend: Optional[Literal["cpu", "gpu", "tpu"]] = None,
-		platform: Optional[Literal["jax", "triton", "pallas"]] = None,
+		backend: Optional[EasyDeLBackends] = None,
+		platform: Optional[EasyDeLPlatforms] = None,
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
 		flatten: bool = True,
 		config_kwargs: Optional[Mapping[str, Any]] = None,
@@ -797,7 +801,7 @@ class AutoStateForCausalLM:
 		    config_kwargs (Optional[Mapping[str, Any]], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
 		    auto_shard_params (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
 		    partition_rules (Optional[Tuple[Tuple[str, PartitionSpec]]], optional): Custom partition rules for parameter sharding. If not None, shard_fns should also be provided. Defaults to None.
-		    quantization_method (Literal["nf4", "8bit", "a8q", "a4q"], optional): quantization_method to be used to quantize model weights. Defaults to None.
+		    quantization_method (EasyDeLQuantizationMethods, optional): quantization_method to be used to quantize model weights. Defaults to None.
 		    bit_targeted_params (Optional[List[str]], optional): List of parameter names to convert to 8-bit precision. If  None and 8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
 		    verbose_params (bool): whenever to log number of parameters in converting state.
 		    safe (bool): whenever to use safetensors to load engine or parameters (requires engine or parameters to be saved with safe=True while saving them)

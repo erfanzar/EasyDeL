@@ -14,7 +14,7 @@
 
 import gc
 import re
-from typing import Callable, List, Literal, Mapping, Optional, Tuple
+from typing import Callable, List, Mapping, Optional, Tuple
 
 import jax
 import transformers
@@ -24,7 +24,7 @@ from flax.traverse_util import flatten_dict
 from jax import numpy as jnp
 from tqdm.autonotebook import tqdm
 
-from easydel.etils.etils import get_logger
+from easydel.etils.etils import EasyDeLPlatforms, EasyDeLQuantizationMethods, get_logger
 from easydel.transform.utils import jax2pt
 from easydel.utils.quantizers import EasyQuantizer
 
@@ -133,9 +133,9 @@ def torch_dict_to_easydel_params(
 	layernorm_names: Optional[List[str]] = None,
 	rnn_based_or_rwkv: bool = False,
 	shard_fns: Optional[Mapping[tuple, Callable]] = None,
-	quantization_method: Optional[Literal["nf4", "8bit", "a8q", "a4q"]] = None,
-	quantization_platform: Optional[Literal["jax", "triton", "pallas"]] = "jax",
-	block_size: int = 64,
+	quantization_method: Optional[EasyDeLQuantizationMethods] = None,
+	quantization_platform: Optional[EasyDeLPlatforms] = EasyDeLPlatforms.JAX,
+	block_size: int = 256,
 	params_pattern_selection: Optional[re.Pattern] = None,
 	dtype: jax.numpy.dtype = jax.numpy.float16,
 	verbose: bool = True,
@@ -156,8 +156,8 @@ def torch_dict_to_easydel_params(
 	    device: Determine which device the model will be loaded on
 	    layernorm_names: Replaces weight or kernel with (scale)
 	    shard_fns: Optional[Mapping[tuple, Callable]]: Sharding Function to be used to shard model
-	    quantization_method (Literal["nf4", "8bit", "a8q", "a4q"], optional): quantization_method to be used to quantize model weights. Defaults to None.
-	    quantization_platform (Optional[Literal["jax", "triton", "pallas"]], optional): Platform to use for the weight quants. Defaults to None.
+	    quantization_method (EasyDeLQuantizationMethods, optional): quantization_method to be used to quantize model weights. Defaults to None.
+	    quantization_platform (Optional[EasyDeLQuantizationMethods], optional): Platform to use for the weight quants. Defaults to None.
 			block_size (int): blocksize for nf4 quantization.
 	    params_pattern_selection: Optional[re.Pattern]: patter to use to find the parameters of the model which will
 	    dtype: jax.numpy.dtype: Specify the data type of the tensors

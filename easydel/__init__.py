@@ -64,6 +64,9 @@ from easydel.etils.etils import (
 	EasyDeLGradientCheckPointers,
 	EasyDeLOptimizers,
 	EasyDeLSchedulers,
+	EasyDeLPlatforms,
+	EasyDeLQuantizationMethods,
+	EasyDeLBackends,
 )
 from easydel.etils.partition_module import PartitionAxis
 from easydel.inference.generation_pipeline import (
@@ -373,7 +376,7 @@ from easydel.transform import (
 	torch_dict_to_easydel_params,
 )
 
-_targeted_versions = ["0.0.86"]
+_targeted_versions = ["0.0.90"]
 
 from fjformer import __version__ as _fjformer_version
 

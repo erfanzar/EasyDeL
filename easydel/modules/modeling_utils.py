@@ -53,6 +53,9 @@ from easydel.etils.easystate import EasyDeLState
 from easydel.etils.etils import (
 	AVAILABLE_ATTENTION_MECHANISMS,
 	DEFAULT_ATTENTION_MECHANISM,
+	EasyDeLBackends,
+	EasyDeLPlatforms,
+	EasyDeLQuantizationMethods,
 	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
@@ -136,8 +139,8 @@ class EDPretrainedConfig(PretrainedConfig):
 	    shard_attention_computation (bool): whenever to shard qkv b for attention
 	    use_sharding_constraint (bool): whether to use sharding constraint for the arrays
 	    use_scan_mlp (bool): Determine whether to use scan_mlp or not
-	    backend (Optional[Literal["cpu", "gpu", "tpu"]]): Specify the backen
-	    platform (Optional[Literal["jax", "triton", "pallas"]]): Specify the platform to used to use
+	    backend (Optional[EasyDeLBackends]): Specify the backen
+	    platform (Optional[EasyDeLPlatforms]): Specify the platform to used to use
 	    flash_attention_backward_pass_impl (Literal["triton", "xla"]): Specify the backward pass kernel for flash attention
 	    attn_dtype (jnp.dtype): data type for computing attention.
 	    fcm_max_ratio (float): value for fcm mask - max ratio
@@ -162,8 +165,8 @@ class EDPretrainedConfig(PretrainedConfig):
 		shard_attention_computation: bool = True,
 		use_sharded_kv_caching: bool = True,
 		use_sharding_constraint: bool = False,
-		backend: Optional[Literal["cpu", "gpu", "tpu"]] = None,
-		platform: Optional[Literal["jax", "triton", "pallas"]] = None,
+		backend: Optional[EasyDeLBackends] = None,
+		platform: Optional[EasyDeLPlatforms] = None,
 		easy_method: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
 		bits: Optional[int] = None,
 		scan_ring_attention: bool = True,
@@ -172,6 +175,7 @@ class EDPretrainedConfig(PretrainedConfig):
 		scan_mlp_chunk_size: int = 1024,
 		attention_axis_name: str = "sp",
 		quantize_kv_cache: bool = False,
+		kv_cache_quantization_method: Literal["nf4", "8bit"] = "8bit",
 		flash_attention_backward_pass_impl: Literal["triton", "xla"] = "triton",
 		attn_dtype: jnp.dtype = jnp.float32,
 		fcm_max_ratio: float = 0.0,
@@ -284,6 +288,12 @@ class EDPretrainedConfig(PretrainedConfig):
 			"quantize_kv_cache",
 			quantize_kv_cache,
 		)
+
+		self.kv_cache_quantization_method = getattr(
+			self,
+			"kv_cache_quantization_method",
+			kv_cache_quantization_method,
+		)
 		self.flash_attention_backward_pass_impl = getattr(
 			self,
 			"flash_attention_backward_pass_impl",
@@ -331,9 +341,10 @@ class EDPretrainedConfig(PretrainedConfig):
 		if self.quantize_kv_cache and self.use_sharded_kv_caching:
 			quantize_kv_cache = self.quantize_kv_cache
 			use_sharded_kv_caching = self.use_sharded_kv_caching
-			logger.warn(
+			warnings.warn(
 				f"`{quantize_kv_cache=}` and `{use_sharded_kv_caching=}`"
-				" can't be used together at the moment."
+				" can't be used together at the moment.",
+				stacklevel=1,
 			)
 		super().__init__(**kwargs)
 
@@ -467,8 +478,8 @@ class EDPretrainedConfig(PretrainedConfig):
 		partition_axis: PartitionAxis = ...,
 		shard_attention_computation: bool = ...,
 		use_sharded_kv_caching: bool = ...,
-		backend: Optional[Literal["cpu", "gpu", "tpu"]] = ...,
-		platform: Optional[Literal["jax", "triton", "pallas"]] = ...,
+		backend: Optional[EasyDeLBackends] = ...,
+		platform: Optional[EasyDeLPlatforms] = ...,
 		easy_method: Literal["train", "serve", "convert"] = ...,
 		bits: Optional[int] = ...,
 		scan_ring_attention: bool = ...,
@@ -478,6 +489,7 @@ class EDPretrainedConfig(PretrainedConfig):
 		scan_mlp_chunk_size: int = ...,
 		attention_axis_name: str = ...,
 		quantize_kv_cache: bool = ...,
+		kv_cache_quantization_method: Literal["nf4", "8bit"] = ...,
 		flash_attention_backward_pass_impl: Literal["triton", "xla"] = ...,
 		attn_dtype: jnp.dtype = ...,
 		hardware_abstraction: bool = ...,
@@ -498,8 +510,8 @@ class EDPretrainedConfig(PretrainedConfig):
 		    partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
 		    shard_attention_computation (bool): whenever to use shard_map for attention
 		    use_sharded_kv_caching (bool): whenever to use shard_map and sharding for key and value
-		    backend (Optional[Literal["cpu", "gpu", "tpu"]]): Specify the backend to use
-		platform (Optional[Literal["jax", "triton", "pallas"]]): Specify the platform to used to use
+		    backend (Optional[EasyDeLBackends]): Specify the backend to use
+		platform (Optional[EasyDeLPlatforms]): Specify the platform to used to use
 		    easy_method (Literal["train", "serve", "convert"]): easydel Quantization Method to be applied for
 		    bits (Optional[int]): Model bits for quantization
 		    use_sharding_constraint (bool): whether to use sharding constraint for the arrays
@@ -509,6 +521,7 @@ class EDPretrainedConfig(PretrainedConfig):
 		    scan_mlp_chunk_size (int): Size of chunks in scan MLP.
 		    attention_axis_name (str): Name of the attention axis name
 		    quantize_kv_cache (bool): Whether to quantize Key/Value in attention for generation process.
+				kv_cache_quantization_method (Literal["nf4", "8bit"]): key and value quantization type in case of passing quantize_kv_cache as True.
 		    flash_attention_backward_pass_impl (Literal["triton", "xla"]): Specify the backward pass kernel for flash attention
 				hardware_abstraction (bool): whenever to switch to custom pallas kernels instead of JAX.
 				pallas_m_block_size (int): block size m dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`.
@@ -638,6 +651,13 @@ class EDPretrainedConfig(PretrainedConfig):
 			False,
 			quantize_kv_cache,
 		)
+		set_attrs_smartly(
+			self,
+			"kv_cache_quantization_method",
+			"nf4",
+			kv_cache_quantization_method,
+		)
+
 		set_attrs_smartly(
 			self,
 			"flash_attention_backward_pass_impl",
@@ -1316,10 +1336,10 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 		input_shape: Optional[Tuple[int, int]] = None,
 		config_kwargs: Optional[dict[str, Any]] = None,
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
-		quantization_method: Optional[Literal["nf4", "8bit", "a8q", "a4q"]] = None,
-		quantization_platform: Optional[Literal["jax", "triton", "pallas"]] = "jax",
-		backend: Optional[Literal["cpu", "gpu", "tpu"]] = None,
-		platform: Optional[Literal["jax", "triton", "pallas"]] = "jax",
+		quantization_method: Optional[EasyDeLQuantizationMethods] = None,
+		quantization_platform: Optional[EasyDeLPlatforms] = "jax",
+		backend: Optional[EasyDeLBackends] = None,
+		platform: Optional[EasyDeLPlatforms] = "jax",
 		bit_targeted_params: Optional[List[str]] = None,
 		quantization_block_size: int = 4096,
 		shard_fns: dict[Callable] = None,
