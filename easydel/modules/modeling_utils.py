@@ -654,7 +654,7 @@ class EDPretrainedConfig(PretrainedConfig):
 		set_attrs_smartly(
 			self,
 			"kv_cache_quantization_method",
-			"nf4",
+			"8bit",
 			kv_cache_quantization_method,
 		)
 

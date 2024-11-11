@@ -619,7 +619,7 @@ class FlaxAttentionModule(nn.Module):
 									paxs.attention_dim_axis,
 								),
 							),
-							qk=64,
+							qk=32,
 							platform="jax",
 						),
 					)
@@ -637,7 +637,7 @@ class FlaxAttentionModule(nn.Module):
 									paxs.attention_dim_axis,
 								),
 							),
-							qk=64,
+							qk=32,
 							platform="jax",
 						),
 					)
@@ -809,8 +809,8 @@ class FlaxAttentionModule(nn.Module):
 			if do_quantize_kv_cache:
 				match quantization_method:
 					case "8bit":
-						cached_key.value = Array8Bit.quantize(key, qk=64, platform="jax")
-						cached_value.value = Array8Bit.quantize(value, qk=64, platform="jax")
+						cached_key.value = Array8Bit.quantize(key, qk=32, platform="jax")
+						cached_value.value = Array8Bit.quantize(value, qk=32, platform="jax")
 					case "nf4":
 						cached_key.value = ArrayNF4.quantize(key, 256)
 						cached_value.value = ArrayNF4.quantize(value, 256)
