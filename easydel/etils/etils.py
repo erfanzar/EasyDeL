@@ -78,11 +78,47 @@ class EasyDeLGradientCheckPointers(str, Enum):
 	NONE = ""
 
 
+class EasyDeLQuantizationMethods(str, Enum):
+	"""
+	Enum defining available quantization strategies for EasyDeL.
+	Each enum member represents a different quantization approach.
+	"""
+
+	NONE = None
+	NF4 = "nf4"
+	A8Q = "a8q"
+	A4Q = "a4q"
+	A8BIT = "8bit"
+
+
+class EasyDeLPlatforms(str, Enum):
+	"""
+	Enum defining available platforms for EasyDeL.
+	Each enum member represents a different kernel usage approach.
+	"""
+
+	JAX = "jax"
+	TRITON = "triton"
+	PALLAS = "pallas"
+
+
+class EasyDeLBackends(str, Enum):
+	"""
+	Enum defining available backends for EasyDeL.
+	Each enum member represents a different kernel usage approach.
+	"""
+
+	CPU = "cpu"
+	GPU = "gpu"
+	TPU = "tpu"
+
+
 AVAILABLE_GRADIENT_CHECKPOINTS = Literal[
 	"everything_saveable",
 	"nothing_saveable",
 	"checkpoint_dots",
 	"checkpoint_dots_with_no_batch_dims",
+	"",
 ]
 
 AVAILABLE_SCHEDULERS = Literal[

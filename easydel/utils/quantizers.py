@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Literal, Optional
+from typing import Optional
 
 import chex
-import jax
 from fjformer.dtypes import Array8Bit, ArrayNF4, A8Q, A4Q
+
+from easydel.etils.etils import EasyDeLPlatforms, EasyDeLQuantizationMethods
 
 DEFAULT_QUANTIZATION_PATTERN = (
 	"(wo|wq|wk|wv|q_proj|k_proj|v_proj|o_proj|w1|w2|w3|"
@@ -28,33 +29,33 @@ DEFAULT_QUANTIZATION_PATTERN = (
 class EasyQuantizer:
 	def __init__(
 		self,
-		quantization_method: Literal["nf4", "8bit", "a8q", "a4q"] = "nf4",
-		quantization_platform: Optional[Literal["jax", "triton", "pallas"]] = "jax",
+		quantization_method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.NF4,
+		quantization_platform: Optional[EasyDeLPlatforms] = EasyDeLPlatforms.JAX,
+		block_size: int = 256,
 		**kwargs,
 	) -> None:
-		self.scalar_block_size = 32
-		self.block_size = 128
+		self.block_size = block_size
 		self.quantization_method = quantization_method
 		self.quantization_platform = quantization_platform
 
 	def __call__(self, array) -> chex.Array:
 		match self.quantization_method:
-			case "8bit":
+			case EasyDeLQuantizationMethods.A8BIT:
 				return Array8Bit.quantize(
 					array=array,
 					platform=self.quantization_platform,
 					q8=64,
 				)
-			case "a8q":
+			case EasyDeLQuantizationMethods.A8Q:
 				return A8Q.quantize(array=array, q8=32)
-			case "a4q":
-				return A4Q.quantize(array=array, q8=64)
-			case "nf4":
+			case EasyDeLQuantizationMethods.A4Q:
+				return A4Q.quantize(array=array, q4=64)
+			case EasyDeLQuantizationMethods.NF4:
 				should_be_quantized = True
-				if array.shape[0] % 128 != 0:
+				if array.size % self.block_size != 0:
 					should_be_quantized = False
-				if array.ndim <= 2 and should_be_quantized:
-					return ArrayNF4.quantize(array=array.astype(jax.numpy.float32))
+				if should_be_quantized:
+					return ArrayNF4.quantize(array=array, bs=self.block_size)
 				return array
 			case _:
 				raise ValueError(f"unknown quantization_method {self.quantization_method}.")
