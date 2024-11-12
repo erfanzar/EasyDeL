@@ -1,58 +1,59 @@
-import asyncio
 import os
 import sys
 
-os.environ["JAX_TRACEBACK_FILTERING"] = "off"
-os.environ["EASYDEL_AUTO"] = "1"
-# os.environ["EKERNEL_OPS"] = "true"
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 
-import os
-import time
-
+import easydel as ed
+from easydel.utils.analyze_memory import SMPMemoryMonitor
 import jax
 from huggingface_hub import HfApi
-from jax import lax, sharding
+from jax import sharding
 from jax import numpy as jnp
 from transformers import AutoTokenizer
-
-import easydel as ed
+import torch
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
 
-async def main():
+def main():
 	sharding_axis_dims = (1, 1, 1, -1)
-	max_length = 6144
+	max_length = 4096
 	num_devices = len(jax.devices())
 	input_shape = (num_devices, max_length)
+
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
 	dtype = jnp.float16
 	partition_axis = ed.PartitionAxis()
+
+	dtype = jnp.bfloat16
+	monitor = SMPMemoryMonitor(5)
+	monitor.print_current_status()
+
 	model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		pretrained_model_name_or_path,
 		input_shape=input_shape,
 		auto_shard_params=True,
 		sharding_axis_dims=sharding_axis_dims,
 		config_kwargs=dict(
-			use_scan_mlp=False,
-			partition_axis=partition_axis,
-			attn_dtype=jnp.float16,
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
-			attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
+			quantize_kv_cache=True,
+			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
+			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		),
-		quantization_method="8bit",
-		platform="triton",
-		partition_axis=partition_axis,
+		platform=ed.EasyDeLPlatforms.JAX,
+		quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
 		param_dtype=dtype,
 		dtype=dtype,
-		precision=lax.Precision("fastest"),
+		torch_dtype=torch.float16,
+		partition_axis=partition_axis,
+		precision=jax.lax.Precision("fastest"),
 	)
+	monitor.print_current_status()
+	# Initialize the tokenizer
 	tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
-
 	tokenizer.padding_side = "left"
 	tokenizer.pad_token_id = tokenizer.eos_token_id
 	inference = ed.vInference(
@@ -68,56 +69,47 @@ async def main():
 			streaming_chunks=64,
 		),
 	)
-	await inference.async_precompile(1)
-	print(inference.inference_name)
-	conversation = []
-	while True:
-		conversation.append({"role": "user", "content": input("USER > ")})
-		ids = tokenizer.apply_chat_template(
-			conversation,
-			return_tensors="np",
-			return_dict=True,
-			max_length=inference.model_prefill_length,
-			padding="max_length",
-			add_generation_prompt=True,
-		)
 
-		start = time.time()
-		input_ids, attention_mask = ids["input_ids"], ids["attention_mask"]
-		start_length = inference.model_prefill_length
-		pad_seq = inference.model_prefill_length
-		print("ASSISTANT > ", end="")
-		async for response in inference.generate(
-			input_ids=input_ids,
-			attention_mask=attention_mask,
-		):
-			next_slice = slice(
-				pad_seq,
-				pad_seq + inference.generation_config.streaming_chunks,
-			)
-			pad_seq += inference.generation_config.streaming_chunks
-			print(
-				tokenizer.decode(
-					response.sequences[0][next_slice],
-					skip_special_tokens=True,
-				),
-				end="",
-			)
+	inference.precompile()
+	prompt = "Find the value of $x$ that satisfies the equation $4x+5 = 6x+7$."
 
-		print()
-		end = time.time()
-		final_response = tokenizer.decode(
-			response.sequences[0][start_length:pad_seq],
-			skip_special_tokens=True,
+	messages = [
+		{
+			"role": "system",
+			"content": "Please reason step by step, and put your final answer within \\boxed{}.",
+		},
+		{"role": "user", "content": prompt},
+	]
+
+	ids = tokenizer.apply_chat_template(
+		messages,
+		return_tensors="np",
+		return_dict=True,
+		max_length=inference.model_prefill_length,
+		padding="max_length",
+		add_generation_prompt=True,
+	)
+
+	input_ids, attention_mask = ids["input_ids"], ids["attention_mask"]
+
+	pad_seq = inference.model_prefill_length
+	for response in inference.generate(
+		input_ids=input_ids,
+		attention_mask=attention_mask,
+	):
+		next_slice = slice(
+			pad_seq,
+			pad_seq + inference.generation_config.streaming_chunks,
 		)
-		conversation.append({"role": "user", "content": final_response})
-		print(inference.count_tokens(conversation))
+		pad_seq += inference.generation_config.streaming_chunks
 		print(
-			"TPS :",
-			sum(response.sequences[0][input_ids.shape[-1] :] != tokenizer.eos_token_id)
-			/ (end - start),
+			tokenizer.decode(response.sequences[0][next_slice], skip_special_tokens=True),
+			end="",
 		)
+
+	print()
+	print("TPS :", response.tokens_pre_second)
 
 
 if __name__ == "__main__":
-	asyncio.run(main())
+	main()

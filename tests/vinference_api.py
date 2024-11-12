@@ -7,6 +7,7 @@ os.environ["EASYDEL_AUTO"] = "true"
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import easydel as ed
+from easydel.utils.analyze_memory import SMPMemoryMonitor
 import jax
 import torch
 from huggingface_hub import HfApi
@@ -14,13 +15,14 @@ from jax import lax, sharding
 from jax import numpy as jnp
 from transformers import AutoTokenizer
 
-
+monitor = SMPMemoryMonitor(5)
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
 
 def main():
+	monitor.print_current_status()
 	sharding_axis_dims = (1, 1, 1, -1)
-	max_length = 8192
+	max_length = 4096
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
 	dtype = jnp.float16
 	partition_axis = ed.PartitionAxis()
@@ -35,21 +37,19 @@ def main():
 			attn_dtype=jnp.float16,
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
-			block_q=64,
-			block_k=128,
-			attn_mechanism=ed.AttentionMechanisms.CUDA_FLASH_ATTN2,
+			attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
 			quantize_kv_cache=True,
 		),
-		quantization_method="8bit",
-		platform="triton",
+		quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
+		platform=ed.EasyDeLPlatforms.TRITON,
 		partition_axis=partition_axis,
 		param_dtype=dtype,
 		dtype=dtype,
 		torch_dtype=torch.float16,
 		precision=lax.Precision("fastest"),
 	)
+	monitor.print_current_status()
 	tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
-
 	tokenizer.padding_side = "left"
 	tokenizer.pad_token_id = tokenizer.eos_token_id
 	inference = ed.vInference(
@@ -57,16 +57,18 @@ def main():
 		params=params,
 		tokenizer=tokenizer,
 		generation_config=ed.vInferenceConfig(
-			max_new_tokens=1024,
+			max_new_tokens=256,
 			temperature=model.generation_config.temperature,
 			top_p=model.generation_config.top_p,
 			top_k=model.generation_config.top_k,
 			eos_token_id=model.generation_config.eos_token_id,
 			streaming_chunks=32,
 		),
+		inference_name="llama3-1B",
 	)
 
-	inference.precompile(1)
+	inference.precompile()
+	monitor.print_current_status()
 	print(inference.inference_name)
 	ed.vInferenceApiServer({inference.inference_name: inference}).fire()
 
