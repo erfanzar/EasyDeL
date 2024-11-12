@@ -599,8 +599,8 @@ class FlaxAttentionModule(nn.Module):
 		"""
 		paxs: PartitionAxis = self.config.partition_axis
 		do_quantize_kv_cache = self.config.quantize_kv_cache
-		quantization_method = self.config.kv_cache_quantization_method
-
+		quantization_method = self.config.kv_cache_quantization_method 
+		
 		is_initialized = self.has_variable("cache", "cached_key")
 		if do_quantize_kv_cache:
 			match quantization_method:
