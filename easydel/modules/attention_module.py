@@ -819,14 +819,6 @@ class FlexibleAttentionModule(object):
 		if bias is not None:
 			assert bias.ndim == 4
 		with self.mesh:
-			attention = get_cached_flash_attention(
-				backend=self.backend,
-				platform=self.platform,
-				blocksize_q=block_q,
-				blocksize_k=self.block_k,
-				softmax_scale=self.sm_scale,
-			)
-
 			# Helper function to get axis size
 			def get_axis_size(axis_name):
 				if isinstance(axis_name, tuple):
@@ -836,7 +828,7 @@ class FlexibleAttentionModule(object):
 			attention = get_cached_flash_attention(
 				backend=self.backend,
 				platform=self.platform,
-				blocksize_q=self.block_q,
+				blocksize_q=block_q,
 				blocksize_k=self.block_k,
 				softmax_scale=self.sm_scale,
 			)
