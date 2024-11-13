@@ -6,7 +6,6 @@ sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 
 import easydel as ed
-from easydel.utils.analyze_memory import SMPMemoryMonitor
 import jax
 from huggingface_hub import HfApi
 from jax import sharding
@@ -28,8 +27,8 @@ def main():
 	partition_axis = ed.PartitionAxis()
 
 	dtype = jnp.bfloat16
-	monitor = SMPMemoryMonitor(5)
-	monitor.print_current_status()
+	# monitor = SMPMemoryMonitor(5)
+	# monitor.print_current_status()
 
 	model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		pretrained_model_name_or_path,
@@ -51,7 +50,7 @@ def main():
 		partition_axis=partition_axis,
 		precision=jax.lax.Precision("fastest"),
 	)
-	monitor.print_current_status()
+	# monitor.print_current_status()
 	# Initialize the tokenizer
 	tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
 	tokenizer.padding_side = "left"
@@ -69,8 +68,10 @@ def main():
 			streaming_chunks=64,
 		),
 	)
-
+	print("Compiling")
 	inference.precompile()
+	print("Done Compiling")
+
 	prompt = "Find the value of $x$ that satisfies the equation $4x+5 = 6x+7$."
 
 	messages = [
@@ -90,13 +91,11 @@ def main():
 		add_generation_prompt=True,
 	)
 
-	input_ids, attention_mask = ids["input_ids"], ids["attention_mask"]
-
 	pad_seq = inference.model_prefill_length
-	for response in inference.generate(
-		input_ids=input_ids,
-		attention_mask=attention_mask,
-	):
+
+	print("Start Generation Process.")
+
+	for response in inference.generate(**ids):
 		next_slice = slice(
 			pad_seq,
 			pad_seq + inference.generation_config.streaming_chunks,

@@ -72,6 +72,18 @@ ACT2FN = {
 	"softmax": nn.softmax,
 }
 
+ROPE_TYPES = Optional[
+	Literal[
+		"none",
+		"linear",
+		"dynamic",
+		"yarn",
+		"su",
+		"llama3",
+		"longrope",
+	]
+]
+
 
 def canonicalize_dtype(
 	*args,
@@ -320,9 +332,7 @@ def precompute_frequencies(
 	max_position_embeddings: int = 2048,
 	base: float = 10000,
 	scaling_factor: float = 1.0,
-	rope_type: Optional[
-		Literal["none", "linear", "dynamic", "yarn", "su", "llama3", "longrope"]
-	] = None,
+	rope_type: ROPE_TYPES = None,
 	time_dtype: jnp.dtype = jnp.int32,
 	original_max_position_embeddings: Optional[int] = None,
 	long_factor: Optional[List[float]] = None,
@@ -331,31 +341,56 @@ def precompute_frequencies(
 	short_mscale: Optional[List[float]] = None,
 	low_freq_factor: Optional[float] = None,
 	high_freq_factor: Optional[float] = None,
-):
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+	"""
+	Precompute frequency encodings for various RoPE (Rotary Position Embedding) implementations.
+
+	Args:
+	    dim: Model dimension for embeddings
+	    max_position_embeddings: Maximum sequence length supported
+	    base: Base for frequency computation (default: 10000)
+	    scaling_factor: Scale factor for frequencies
+	    rope_type: Type of RoPE implementation to use
+	    time_dtype: Data type for position indices
+	    original_max_position_embeddings: Original maximum sequence length (for extrapolation)
+	    long_factor: Scaling factors for long sequences
+	    short_factor: Scaling factors for short sequences
+	    long_mscale: Scale multipliers for long sequences
+	    short_mscale: Scale multipliers for short sequences
+	    low_freq_factor: Lower frequency scaling (LLaMA-3)
+	    high_freq_factor: Higher frequency scaling (LLaMA-3)
+
+	Returns:
+	    Tuple of (sin_encoding, cos_encoding) arrays for rotary embeddings
+	"""
+	# Enable 64-bit precision if needed
 	if time_dtype == jnp.int64:
 		jax.config.update("jax_enable_x64", True)
 
+	# Generate position IDs and base frequencies
 	position_ids = jnp.arange(max_position_embeddings, dtype=time_dtype)
 	inverse_frequencies = 1.0 / (base ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
 
+	# Compute frequencies based on RoPE type
 	if rope_type is None or rope_type == "none":
 		frequencies = compute_standard_frequencies(position_ids, inverse_frequencies)
+
 	elif rope_type == "linear":
 		frequencies = compute_linear_frequencies(
 			position_ids, inverse_frequencies, scaling_factor
 		)
+
 	elif rope_type == "dynamic":
 		frequencies = compute_dynamic_frequencies(position_ids, base, dim, scaling_factor)
+
 	elif rope_type in ["su", "yarn"]:
-		assert (
-			original_max_position_embeddings is not None
-		), "No original max position embeddings provided"
+		if original_max_position_embeddings is None:
+			raise ValueError("No original max position embeddings provided")
+
 		ext_factors = jnp.array(
-			(
-				long_factor
-				if max_position_embeddings > original_max_position_embeddings
-				else short_factor
-			),
+			long_factor
+			if max_position_embeddings > original_max_position_embeddings
+			else short_factor,
 			dtype=jnp.float32,
 		)
 		frequencies, scaling_factor = compute_su_yarn_frequencies(
@@ -367,15 +402,16 @@ def precompute_frequencies(
 			ext_factors,
 			time_dtype,
 		)
+
 	elif rope_type == "llama3":
-		assert all(
-			x is not None
-			for x in [
-				original_max_position_embeddings,
-				low_freq_factor,
-				high_freq_factor,
-			]
-		), "Missing parameters for llama3 RoPE"
+		required_params = [
+			original_max_position_embeddings,
+			low_freq_factor,
+			high_freq_factor,
+		]
+		if any(param is None for param in required_params):
+			raise ValueError("Missing parameters for llama3 RoPE")
+
 		frequencies = compute_llama3_frequencies(
 			position_ids,
 			inverse_frequencies,
@@ -384,20 +420,21 @@ def precompute_frequencies(
 			high_freq_factor,
 			scaling_factor,
 		)
+
 	elif rope_type == "longrope":
-		assert all(
-			x is not None
-			for x in [
-				long_factor,
-				long_mscale,
-				max_position_embeddings,
-				original_max_position_embeddings,
-				base,
-				short_factor,
-				short_mscale,
-			]
-		), "Missing parameters for longrope"
-		sin_encoding, cos_encoding = compute_long_rope_scaled(
+		required_params = [
+			long_factor,
+			long_mscale,
+			max_position_embeddings,
+			original_max_position_embeddings,
+			base,
+			short_factor,
+			short_mscale,
+		]
+		if any(param is None for param in required_params):
+			raise ValueError("Missing parameters for longrope")
+
+		return compute_long_rope_scaled(
 			dim=dim,
 			dtype=jnp.float32,
 			long_factor=long_factor,
@@ -408,18 +445,18 @@ def precompute_frequencies(
 			short_factor=short_factor,
 			short_mscale=short_mscale,
 		)
-		return sin_encoding, cos_encoding
+
 	else:
 		raise ValueError(f"Invalid rope_type: {rope_type}")
 
+	# Generate final encodings
 	rotational_angles = jnp.concatenate((frequencies, frequencies), axis=-1)
 	sin_encoding, cos_encoding = jnp.sin(rotational_angles), jnp.cos(rotational_angles)
 
+	# Apply scaling for SU/YARN variants
 	if rope_type in ["su", "yarn"]:
-		sin_encoding, cos_encoding = (
-			sin_encoding[0] * scaling_factor,
-			cos_encoding[0] * scaling_factor,
-		)
+		sin_encoding = sin_encoding[0] * scaling_factor
+		cos_encoding = cos_encoding[0] * scaling_factor
 
 	return sin_encoding, cos_encoding
 
@@ -599,8 +636,8 @@ class FlaxAttentionModule(nn.Module):
 		"""
 		paxs: PartitionAxis = self.config.partition_axis
 		do_quantize_kv_cache = self.config.quantize_kv_cache
-		quantization_method = self.config.kv_cache_quantization_method 
-		
+		quantization_method = self.config.kv_cache_quantization_method
+
 		is_initialized = self.has_variable("cache", "cached_key")
 		if do_quantize_kv_cache:
 			match quantization_method:
