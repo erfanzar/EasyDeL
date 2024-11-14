@@ -26,7 +26,7 @@ def main():
 	dtype = jnp.float16
 	partition_axis = ed.PartitionAxis()
 
-	dtype = jnp.bfloat16
+	dtype = jnp.float16
 	# monitor = SMPMemoryMonitor(5)
 	# monitor.print_current_status()
 
@@ -39,10 +39,11 @@ def main():
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
 			quantize_kv_cache=True,
+			attn_dtype=jnp.float16,
 			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
-			attn_mechanism=ed.AttentionMechanisms.VANILLA,
+			attn_mechanism=ed.AttentionMechanisms.SDPA,
 		),
-		platform=ed.EasyDeLPlatforms.JAX,
+		# platform=ed.EasyDeLPlatforms.JAX,
 		quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
 		param_dtype=dtype,
 		dtype=dtype,
@@ -69,7 +70,7 @@ def main():
 		),
 	)
 	print("Compiling")
-	inference.precompile()
+	inference.precompile(1, inference.model_prefill_length)
 	print("Done Compiling")
 
 	prompt = "Find the value of $x$ that satisfies the equation $4x+5 = 6x+7$."
@@ -84,7 +85,7 @@ def main():
 
 	ids = tokenizer.apply_chat_template(
 		messages,
-		return_tensors="np",
+		return_tensors="jax",
 		return_dict=True,
 		max_length=inference.model_prefill_length,
 		padding="max_length",

@@ -17,9 +17,8 @@
 import warnings
 from typing import Any, Optional
 
-from easydel.modules.modeling_utils import EDPretrainedConfig
-
 from easydel.modules.factory import register_config
+from easydel.modules.modeling_utils import EDPretrainedConfig
 
 DBRX_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 
@@ -223,7 +222,7 @@ class DbrxConfig(EDPretrainedConfig):
 		initializer_range: float = 0.02,
 		output_router_logits: bool = False,
 		router_aux_loss_coef: float = 0.05,
-		gradient_checkpointing: str = "nothing_saveable",
+		gradient_checkpointing: str = "",
 		**kwargs: Any,
 	):
 		if attn_config is None:
