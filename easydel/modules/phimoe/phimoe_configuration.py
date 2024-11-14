@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +18,7 @@ from jax.sharding import PartitionSpec
 
 from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EDPretrainedConfig
+
 
 @register_config("phimoe")
 class PhiMoeConfig(EDPretrainedConfig):
@@ -129,7 +129,7 @@ class PhiMoeConfig(EDPretrainedConfig):
 		embd_pdrop: float = 0.0,
 		lm_head_bias=False,
 		bits: Optional[int] = None,
-		gradient_checkpointing: str = "nothing_saveable",
+		gradient_checkpointing: str = "",
 		**kwargs,
 	) -> None:
 		self.vocab_size = vocab_size
@@ -177,7 +177,7 @@ class PhiMoeConfig(EDPretrainedConfig):
 		self,
 		bits: Optional[int] = None,
 		embd_pdrop: float = 0.0,
-		gradient_checkpointing: str = "nothing_saveable",
+		gradient_checkpointing: str = "",
 		**kwargs,
 	):
 		self.bits = bits

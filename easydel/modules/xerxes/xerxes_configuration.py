@@ -94,8 +94,7 @@ class XerxesConfig(EDPretrainedConfig):
 		bos_token_id=2,
 		tie_word_embeddings=True,
 		rope_theta=10000.0,
-		softmax_scale: float = 14.9666295471,
-		gradient_checkpointing: str = "nothing_saveable",
+		gradient_checkpointing: str = "",
 		bits: Optional[int] = None,
 		scan_layers: bool = False,
 		**kwargs,
@@ -121,7 +120,6 @@ class XerxesConfig(EDPretrainedConfig):
 		self.rms_norm_eps = rms_norm_eps
 		self.use_cache = use_cache
 		self.rope_theta = rope_theta
-		self.softmax_scale = softmax_scale
 		super().__init__(
 			bos_token_id=bos_token_id,
 			eos_token_id=eos_token_id,
@@ -132,7 +130,7 @@ class XerxesConfig(EDPretrainedConfig):
 		)
 		self.cache_implementation = "hybrid"
 
-	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+	def get_partition_rules(self, *args, **kwargs):
 		"""
 		Get the partition rules for the model.
 
@@ -144,44 +142,25 @@ class XerxesConfig(EDPretrainedConfig):
 		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
+			("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
 			(
-				("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-				(
-					"self_attn/(q_proj|k_proj|v_proj)/kernel",
-					PartitionSpec(("fsdp", "sp"), "tp"),
-				),
-				("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-				("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-				("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("input_layernorm/kernel", PartitionSpec(None)),
-				("post_attention_layernorm/kernel", PartitionSpec(None)),
-				("model/norm/kernel", PartitionSpec(None)),
-				("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				(".*", PartitionSpec(None)),
-			)
-			if not fully_sharded_data_parallel
-			else (
-				("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"))),
-				(
-					"self_attn/(q_proj|k_proj|v_proj)/kernel",
-					PartitionSpec(("fsdp", "sp")),
-				),
-				("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-				("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-				("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-				("input_layernorm/kernel", PartitionSpec(None)),
-				("post_attention_layernorm/kernel", PartitionSpec(None)),
-				("model/norm/kernel", PartitionSpec(None)),
-				("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
-				(".*", PartitionSpec(("fsdp", "sp"))),
-			)
+				"self_attn/(q_proj|k_proj|v_proj)/kernel",
+				PartitionSpec(("fsdp", "sp"), "tp"),
+			),
+			("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("input_layernorm/kernel", PartitionSpec(None)),
+			("post_attention_layernorm/kernel", PartitionSpec(None)),
+			("model/norm/kernel", PartitionSpec(None)),
+			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			(".*", PartitionSpec(None)),
 		)
 
 	def add_jax_args(
 		self,
-		gradient_checkpointing: str = "nothing_saveable",
+		gradient_checkpointing: str = "",
 		bits: Optional[int] = None,
 		**kwargs,
 	):

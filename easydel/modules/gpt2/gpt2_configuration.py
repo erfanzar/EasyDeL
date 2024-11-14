@@ -121,7 +121,7 @@ class GPT2Config(EDPretrainedConfig):
 		eos_token_id=50256,
 		scale_attn_by_inverse_layer_idx=False,
 		reorder_and_upcast_attn=False,
-		gradient_checkpointing: str = "nothing_saveable",
+		gradient_checkpointing: str = "",
 		tie_word_embeddings: bool = False,
 		bits: Optional[int] = None,
 		**kwargs,
@@ -162,7 +162,7 @@ class GPT2Config(EDPretrainedConfig):
 
 	def add_jax_args(
 		self,
-		gradient_checkpointing: str = "nothing_saveable",
+		gradient_checkpointing: str = "",
 		bits: Optional[int] = None,
 		**kwargs,
 	):

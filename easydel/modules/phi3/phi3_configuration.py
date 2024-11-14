@@ -110,7 +110,7 @@ class Phi3Config(EDPretrainedConfig):
 		pad_token_id=32000,
 		sliding_window=None,
 		bits: Optional[int] = None,
-		gradient_checkpointing: str = "nothing_saveable",
+		gradient_checkpointing: str = "",
 		**kwargs,
 	) -> None:
 		self.vocab_size = vocab_size
@@ -151,7 +151,7 @@ class Phi3Config(EDPretrainedConfig):
 	def add_jax_args(
 		self,
 		bits: Optional[int] = None,
-		gradient_checkpointing: str = "nothing_saveable",
+		gradient_checkpointing: str = "",
 		**kwargs,
 	):
 		self.bits = bits

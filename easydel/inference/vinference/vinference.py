@@ -647,6 +647,7 @@ class vInference:
 					position_ids=position_ids,
 					rng=self._rng_generator.rng,
 				)
+				
 				interval_time = 0
 				state.generate_func_flops = generate_func_flops
 				if not state.is_sequence_finished:

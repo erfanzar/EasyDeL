@@ -16,8 +16,8 @@ from typing import Optional
 
 from jax.sharding import PartitionSpec
 
-from easydel.modules.modeling_utils import EDPretrainedConfig
 from easydel.modules.factory import register_config
+from easydel.modules.modeling_utils import EDPretrainedConfig
 
 
 @register_config("cohere")
@@ -102,7 +102,7 @@ class CohereConfig(EDPretrainedConfig):
 		attention_bias=False,
 		attention_dropout=0.0,
 		use_qk_norm: bool = False,
-		gradient_checkpointing: str = "nothing_saveable",
+		gradient_checkpointing: str = "",
 		bits: Optional[int] = None,
 		**kwargs,
 	):
@@ -164,7 +164,7 @@ class CohereConfig(EDPretrainedConfig):
 
 	def add_jax_args(
 		self,
-		gradient_checkpointing: str = "nothing_saveable",
+		gradient_checkpointing: str = "",
 		bits: Optional[int] = None,
 		**kwargs,
 	):
