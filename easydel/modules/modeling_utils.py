@@ -1362,7 +1362,7 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 		"""
 
 		from transformers import GenerationConfig
-		from huggingface_hub import hf_hub_download as _hf_hub_download
+		from transformers.utils import cached_file as _cached_file
 		from transformers.utils import download_url as _download_url
 		from transformers.utils import is_offline_mode as _is_offline_mode
 		from transformers.utils import is_remote_url as _is_remote_url
@@ -1485,7 +1485,7 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 						"_raise_exceptions_for_missing_entries": False,
 						"_commit_hash": commit_hash,
 					}
-					resolved_archive_file = _hf_hub_download(
+					resolved_archive_file = _cached_file(
 						pretrained_model_name_or_path,
 						filename,
 						**cached_file_kwargs,
