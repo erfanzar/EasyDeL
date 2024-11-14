@@ -376,7 +376,7 @@ from easydel.transform import (
 	torch_dict_to_easydel_params,
 )
 
-_targeted_versions = ["0.0.90"]
+_targeted_versions = ["0.0.91"]
 
 from fjformer import __version__ as _fjformer_version
 

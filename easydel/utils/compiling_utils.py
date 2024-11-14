@@ -48,8 +48,8 @@ def smart_compile(lowered_func: Lowered, tag: Optional[str] = None):
 	func_dir = COMPILE_FUNC_DIR / foldername
 	filepath = func_dir / COMPILED_FILE_NAME
 	if filepath.exists() and not RECOMPILE_FORCE:
-		(serialized, in_tree, out_tree) = pickle.load(open(filepath, "rb"))
 		try:
+			(serialized, in_tree, out_tree) = pickle.load(open(filepath, "rb"))
 			compiled_func = deserialize_and_load(
 				serialized=serialized,
 				in_tree=in_tree,
@@ -89,7 +89,10 @@ def save_compiled_fn(
 	prefix = prefix or ""
 	filename = path / (prefix + "-" + COMPILED_FILE_NAME)
 	serialized, in_tree, out_tree = serialize(fn)
-	pickle.dump((serialized, in_tree, out_tree), open(filename, "wb"))
+	try:
+		pickle.dump((serialized, in_tree, out_tree), open(filename, "wb"))
+	except Exception as e:  # noqa
+		warnings.warn(f"couldn't save compiled function due to {e}", stacklevel=4)
 
 
 def load_compiled_fn(

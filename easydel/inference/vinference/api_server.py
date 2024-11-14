@@ -114,7 +114,7 @@ class vInferenceApiServer:
 		try:
 			# Get model and tokenize input asynchronously
 			inference = self._get_inference_model(request.model)
-			ids = self._prepare_tokenized_input(request.messages, inference)
+			ids = self._prepare_tokenized_input(request=request, inference=inference)
 
 			if not request.stream:
 				return await self._handle_non_streaming_response_async(request, inference, ids)
@@ -131,10 +131,15 @@ class vInferenceApiServer:
 			raise RuntimeError(f"Invalid model name: {model_name} is not available")
 		return inference
 
-	def _prepare_tokenized_input(self, messages, inference: "vInference") -> dict:  # noqa #type:ignore
+	def _prepare_tokenized_input(
+		self,
+		request: ChatCompletionRequest,
+		inference: "vInference",  # noqa #type:ignore
+	) -> dict:
 		"""Prepare tokenized input for the model."""
+
 		return inference.tokenizer.apply_chat_template(
-			conversation=messages,
+			conversation=request.messages,
 			return_dict=True,
 			tokenize=True,
 			return_tensors="np",
