@@ -151,7 +151,7 @@ class AutoEasyDeLModelForCausalLM:
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]] = None,
 		quantization_method: Optional[EasyDeLQuantizationMethods] = None,
 		quantization_platform: Optional[EasyDeLPlatforms] = EasyDeLPlatforms.JAX,
-		quantization_block_size: int = 256,
+		quantization_block_size: int = 128,
 		bit_targeted_params: Optional[List[str]] = None,
 		verbose_params: bool = False,
 		safe: bool = True,

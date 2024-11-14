@@ -21,9 +21,9 @@ classifiers = [
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.13"
-jax = ">=0.4.35"
-jaxlib = ">=0.4.35"
-fjformer = "0.0.90"
+jax = ">=0.4.34"
+jaxlib = ">=0.4.34"
+fjformer = "0.0.91"
 uvicorn = "^0.32.0"
 transformers = ">=4.46.0"
 optax = "^0.2.2"
