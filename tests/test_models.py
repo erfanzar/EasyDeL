@@ -63,7 +63,7 @@ class EasyModelsTest(unittest.TestCase):
 		self.rope_theta: float = 10000.0
 		self.attention_bias: bool = False
 		self.tie_word_embeddings: bool = False
-		self.gradient_checkpointing: str = ""
+		self.gradient_checkpointing: str = "nothing_saveable"
 		self.fcm_min_ratio: float = -1
 		self.fcm_max_ratio: float = -1
 		self.rope_scaling: Optional[Dict[str, Union[str, float]]] = None

@@ -119,7 +119,7 @@ class FalconConfig(EDPretrainedConfig):
 		ffn_hidden_size=None,
 		ff_factor=None,
 		activation="gelu",
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		bits: Optional[int] = None,
 		**kwargs,
 	):
@@ -204,7 +204,7 @@ class FalconConfig(EDPretrainedConfig):
 
 	def add_jax_args(
 		self,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		bits: Optional[int] = None,
 		**kwargs,
 	):

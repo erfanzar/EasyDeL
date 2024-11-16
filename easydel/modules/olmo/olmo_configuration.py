@@ -103,7 +103,7 @@ class OlmoConfig(EDPretrainedConfig):
 		attention_bias=False,
 		attention_dropout=0.0,
 		clip_qkv=None,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
 		bits: Optional[int] = None,
@@ -143,7 +143,7 @@ class OlmoConfig(EDPretrainedConfig):
 
 	def add_jax_args(
 		self,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
 		bits: Optional[int] = None,

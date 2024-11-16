@@ -112,7 +112,7 @@ class PhiConfig(EDPretrainedConfig):
 		bos_token_id=1,
 		eos_token_id=2,
 		bits: Optional[int] = None,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		**kwargs,
 	) -> None:
 		self.vocab_size = vocab_size
@@ -150,7 +150,7 @@ class PhiConfig(EDPretrainedConfig):
 	def add_jax_args(
 		self,
 		bits: Optional[int] = None,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		**kwargs,
 	):
 		self.bits = bits

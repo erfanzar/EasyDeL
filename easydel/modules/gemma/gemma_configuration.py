@@ -102,7 +102,7 @@ class GemmaConfig(EDPretrainedConfig):
 		rope_theta=10000.0,
 		attention_bias=False,
 		attention_dropout=0.0,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		bits: Optional[int] = None,
 		scan_layers: bool = False,
 		hidden_activation="gelu_pytorch_tanh",
@@ -161,7 +161,7 @@ class GemmaConfig(EDPretrainedConfig):
 
 	def add_jax_args(
 		self,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		bits: Optional[int] = None,
 		**kwargs,
 	):

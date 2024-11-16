@@ -155,7 +155,7 @@ class OpenELMConfig(EDPretrainedConfig):
 		bos_token_id: int = 1,
 		eos_token_id: int = 2,
 		rope_scaling: Dict[str, Union[str, float]] = None,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
 		bits: Optional[int] = None,
@@ -282,7 +282,7 @@ class OpenELMConfig(EDPretrainedConfig):
 
 	def add_jax_args(
 		self,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
 		bits: Optional[int] = None,

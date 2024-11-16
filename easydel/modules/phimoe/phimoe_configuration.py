@@ -129,7 +129,7 @@ class PhiMoeConfig(EDPretrainedConfig):
 		embd_pdrop: float = 0.0,
 		lm_head_bias=False,
 		bits: Optional[int] = None,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		**kwargs,
 	) -> None:
 		self.vocab_size = vocab_size
@@ -177,7 +177,7 @@ class PhiMoeConfig(EDPretrainedConfig):
 		self,
 		bits: Optional[int] = None,
 		embd_pdrop: float = 0.0,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		**kwargs,
 	):
 		self.bits = bits

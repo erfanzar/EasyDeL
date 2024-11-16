@@ -116,7 +116,7 @@ class ChatGLMConfig(EDPretrainedConfig):
 		apply_query_key_layer_scaling=True,
 		attention_softmax_in_fp32=True,
 		fp32_residual_connection=False,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		rope_scaling: Dict[str, Union[str, float]] = None,
 		scan_mlp_chunk_size: int = 1024,
 		bits: Optional[int] = None,
@@ -186,7 +186,7 @@ class ChatGLMConfig(EDPretrainedConfig):
 
 	def add_jax_args(
 		self,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		bits: Optional[int] = None,
 		scan_layers: bool = False,
 		**kwargs,

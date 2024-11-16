@@ -98,7 +98,7 @@ class GPTJConfig(EDPretrainedConfig):
 		bos_token_id: int = 50256,
 		eos_token_id: int = 50256,
 		tie_word_embeddings: bool = False,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		bits: Optional[int] = None,
 		**kwargs,
 	):
@@ -175,7 +175,7 @@ class GPTJConfig(EDPretrainedConfig):
 		eos_token_id: int = 50256,
 		tie_word_embeddings: bool = False,
 		bits: Optional[int] = None,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		**kwargs,
 	):
 		basics = dict(
