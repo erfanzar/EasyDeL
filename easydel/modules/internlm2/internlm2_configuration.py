@@ -110,7 +110,7 @@ class InternLM2Config(EDPretrainedConfig):
 		bias=True,
 		rope_theta=10000,
 		rope_scaling=None,
-		gradient_checkpointing: str = "nothing_saveable",
+		gradient_checkpointing: str = "",
 		fcm_min_ratio: float = -1,
 		fcm_max_ratio: float = -1,
 		scan_mlp_chunk_size: int = 1024,
@@ -177,7 +177,7 @@ class InternLM2Config(EDPretrainedConfig):
 	def add_jax_args(
 		self,
 		tie_word_embeddings: bool = False,
-		gradient_checkpointing: str = "nothing_saveable",
+		gradient_checkpointing: str = "",
 		fcm_min_ratio: float = 0.0,
 		fcm_max_ratio: float = 0.0,
 		bits: Optional[int] = None,

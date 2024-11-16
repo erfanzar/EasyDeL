@@ -79,7 +79,7 @@ class RwkvConfig(EDPretrainedConfig):
 		tie_word_embeddings=False,
 		use_cache=True,
 		bits: Optional[int] = None,
-		gradient_checkpointing: str = "nothing_saveable",
+		gradient_checkpointing: str = "",
 		**kwargs,
 	) -> None:
 		self.bits = bits
@@ -112,7 +112,7 @@ class RwkvConfig(EDPretrainedConfig):
 	def add_jax_args(
 		self,
 		bits: Optional[int] = None,
-		gradient_checkpointing: str = "nothing_saveable",
+		gradient_checkpointing: str = "",
 		**kwargs,
 	):
 		self.bits = bits
