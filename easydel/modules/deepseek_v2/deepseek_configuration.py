@@ -165,7 +165,7 @@ class DeepseekV2Config(EDPretrainedConfig):
 		rope_theta=10000.0,
 		attention_bias=False,
 		attention_dropout=0.0,
-		gradient_checkpointing: str = "nothing_saveable",
+		gradient_checkpointing: str = "",
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
 		bits: Optional[int] = None,
@@ -251,7 +251,7 @@ class DeepseekV2Config(EDPretrainedConfig):
 
 	def add_jax_args(
 		self,
-		gradient_checkpointing: str = "nothing_saveable",
+		gradient_checkpointing: str = "",
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
 		bits: Optional[int] = None,

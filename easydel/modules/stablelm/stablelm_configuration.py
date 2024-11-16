@@ -105,7 +105,7 @@ class StableLmConfig(EDPretrainedConfig):
 		bos_token_id=0,
 		eos_token_id=0,
 		bits: Optional[int] = None,
-		gradient_checkpointing: str = "nothing_saveable",
+		gradient_checkpointing: str = "",
 		**kwargs,
 	) -> None:
 		self.vocab_size = vocab_size
@@ -143,7 +143,7 @@ class StableLmConfig(EDPretrainedConfig):
 	def add_jax_args(
 		self,
 		bits: Optional[int] = None,
-		gradient_checkpointing: str = "nothing_saveable",
+		gradient_checkpointing: str = "",
 		**kwargs,
 	):
 		self.bits = bits

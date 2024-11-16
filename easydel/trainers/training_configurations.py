@@ -207,7 +207,7 @@ class TrainingArguments:
 	label_smoothing_factor: float = 0.0
 	z_loss: float = 0.0
 	gradient_checkpointing: AVAILABLE_GRADIENT_CHECKPOINTS = (
-		EasyDeLGradientCheckPointers.NOTHING_SAVEABLE
+		EasyDeLGradientCheckPointers.NONE
 	)
 	max_sequence_length: Optional[int] = 4096
 	sharding_array: Union[tuple, int] = (1, -1, 1, 1)
@@ -277,6 +277,12 @@ class TrainingArguments:
 		self._setup_logging()
 		self._setup_rapture()
 		self._ensure_variables()
+		if self.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
+			warnings.warn(
+				"Passing `gradient_checkpointing` in training arguments is deprecated, "
+				"please pass `gradient_checkpointing` to model config_kwargs while loading or creating model",
+				stacklevel=1,
+			)
 
 	def _validate_config(self):
 		"""

@@ -109,7 +109,7 @@ class Gemma2Config(EDPretrainedConfig):
 		final_logit_softcapping=30.0,
 		query_pre_attn_scalar=224,
 		sliding_window=4096,
-		gradient_checkpointing: str = "nothing_saveable",
+		gradient_checkpointing: str = "",
 		bits: Optional[int] = None,
 		scan_layers: bool = False,
 		attn_logit_softcapping: Optional[bool] = None,
@@ -180,7 +180,7 @@ class Gemma2Config(EDPretrainedConfig):
 
 	def add_jax_args(
 		self,
-		gradient_checkpointing: str = "nothing_saveable",
+		gradient_checkpointing: str = "",
 		bits: Optional[int] = None,
 		**kwargs,
 	):
