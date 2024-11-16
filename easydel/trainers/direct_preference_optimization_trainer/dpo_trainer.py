@@ -945,11 +945,9 @@ class DPOTrainer(BaseTrainer, ABC):
 		current_step = int(jax.device_get(self.model_state.step))
 		run_exception = None
 		with self.mesh:
-			train_iter = iter(self.dataloader_train)
-
 			for epoch in range(self.arguments.num_train_epochs):
 				current_step, run_exception = self._train_epoch(
-					train_iter,
+					self.dataloader_train,
 					current_step,
 					metrics_tracker,
 					step_metrics,
@@ -983,11 +981,9 @@ class DPOTrainer(BaseTrainer, ABC):
 		pbar.set_description("evaluation process")
 		current_step = int(jax.device_get(sharded_state.step))
 		with self.mesh:
-			eval_iter = iter(self.dataloader_eval)
-
 			for eval_metrics in self._eval_epoch(
 				sharded_state,
-				eval_iter,
+				self.dataloader_eval,
 				current_step,
 				metrics_tracker,
 				step_metrics,
@@ -998,7 +994,7 @@ class DPOTrainer(BaseTrainer, ABC):
 
 	def _train_epoch(
 		self,
-		train_iter: int,
+		train_dataset,
 		current_step: int,
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
@@ -1009,7 +1005,7 @@ class DPOTrainer(BaseTrainer, ABC):
 		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
 	):
 		"""Handles training for a single epoch."""
-
+		train_iter = iter(train_dataset)
 		for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
 			try:  # to make training loop safer if user wants to break that.
 				batch = self._get_next_batch(train_iter)
@@ -1068,7 +1064,7 @@ class DPOTrainer(BaseTrainer, ABC):
 	def _eval_epoch(
 		self,
 		sharded_state: EasyDeLState,
-		eval_iter: int,
+		eval_dataset,
 		current_step: int,
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
@@ -1076,6 +1072,7 @@ class DPOTrainer(BaseTrainer, ABC):
 		start_time: float,
 	):
 		"""Handles training for a single epoch."""
+		eval_iter = iter(eval_dataset)
 		for _ in range(self.max_evaluation_steps):
 			try:
 				batch = self._get_next_batch(eval_iter)

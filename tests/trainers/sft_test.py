@@ -42,7 +42,7 @@ def main():
 
 	tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
 
-	train_dataset = load_dataset("LDJnr/Pure-Dove", split="train")
+	train_dataset = load_dataset("LDJnr/Pure-Dove", split="train[:5%]")
 
 	model = ed.FlaxMistralForCausalLM(config=config, _do_init=True)
 	params = model.shard_params(model.params)
