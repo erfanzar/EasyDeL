@@ -102,7 +102,7 @@ class CohereConfig(EDPretrainedConfig):
 		attention_bias=False,
 		attention_dropout=0.0,
 		use_qk_norm: bool = False,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		bits: Optional[int] = None,
 		**kwargs,
 	):
@@ -164,7 +164,7 @@ class CohereConfig(EDPretrainedConfig):
 
 	def add_jax_args(
 		self,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		bits: Optional[int] = None,
 		**kwargs,
 	):

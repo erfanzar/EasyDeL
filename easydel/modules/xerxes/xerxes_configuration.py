@@ -94,7 +94,7 @@ class XerxesConfig(EDPretrainedConfig):
 		bos_token_id=2,
 		tie_word_embeddings=True,
 		rope_theta=10000.0,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		bits: Optional[int] = None,
 		scan_layers: bool = False,
 		**kwargs,
@@ -160,7 +160,7 @@ class XerxesConfig(EDPretrainedConfig):
 
 	def add_jax_args(
 		self,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		bits: Optional[int] = None,
 		**kwargs,
 	):

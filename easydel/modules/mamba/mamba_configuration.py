@@ -106,7 +106,7 @@ class MambaConfig(EDPretrainedConfig):
 		time_step_floor=1e-4,
 		rescale_prenorm_residual=False,
 		use_cache=True,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		use_mambapy: bool = False,
 		**kwargs,
 	):
@@ -148,5 +148,5 @@ class MambaConfig(EDPretrainedConfig):
 		"""
 		return super().get_partition_rules()
 
-	def add_jax_args(self, gradient_checkpointing: str = ""):
+	def add_jax_args(self, gradient_checkpointing: str = "nothing_saveable"):
 		self.gradient_checkpointing = gradient_checkpointing

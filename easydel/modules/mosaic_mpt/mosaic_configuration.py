@@ -189,7 +189,7 @@ class MptConfig(EDPretrainedConfig):
 		qk_ln: bool = False,
 		use_lm_head: bool = False,
 		use_norm_bias: bool = False,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		bits: Optional[int] = None,
 		**kwargs,
 	):
@@ -257,7 +257,7 @@ class MptConfig(EDPretrainedConfig):
 
 	def add_jax_args(
 		self,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: str = "nothing_saveable",
 		bits: Optional[int] = None,
 		**kwargs,
 	):
