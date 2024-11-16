@@ -30,12 +30,12 @@ TOTAL_BATCH_SIZE = 8
 UPPER = 200
 NUM_TRAIN_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
 NUM_EVAL_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
-NUM_TRAIN_EPOCHS = 1
+NUM_TRAIN_EPOCHS = 2
 rng = fjformer.GenerateRNG()
 
 
 def main(use_iterable_dataset: bool):
-	sequence_length = 1024
+	sequence_length = 128
 	max_training_steps = NUM_TRAIN_EXAMPLES // TOTAL_BATCH_SIZE * NUM_TRAIN_EPOCHS
 	max_evaluation_steps = NUM_EVAL_EXAMPLES // TOTAL_BATCH_SIZE
 	config = LlamaConfig(
@@ -47,7 +47,7 @@ def main(use_iterable_dataset: bool):
 		intermediate_size=1024,
 		max_position_embeddings=sequence_length,
 		attn_dtype=jnp.float16,
-		attn_mechanism=AttentionMechanisms.SDPA,
+		attn_mechanism=AttentionMechanisms.VANILLA,
 		block_k=64,
 		block_q=64,
 	)

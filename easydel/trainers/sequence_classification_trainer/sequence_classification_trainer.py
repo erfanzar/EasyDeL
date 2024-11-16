@@ -484,12 +484,10 @@ class SequenceClassificationTrainer(BaseTrainer):
 		current_step = int(jax.device_get(sharded_state.step))
 		run_exception = None
 		with self.mesh:
-			train_iter = iter(self.dataloader_train)
-
 			for epoch in range(self.arguments.num_train_epochs):
 				sharded_state, current_step, run_exception = self._train_epoch(
 					sharded_state,
-					train_iter,
+					self.dataloader_train,
 					current_step,
 					metrics_tracker,
 					step_metrics,
@@ -523,11 +521,11 @@ class SequenceClassificationTrainer(BaseTrainer):
 		pbar.set_description("evaluation process")
 		current_step = int(jax.device_get(sharded_state.step))
 		with self.mesh:
-			eval_iter = iter(self.dataloader_eval)
+			
 
 			for eval_metrics in self._eval_epoch(
 				sharded_state,
-				eval_iter,
+				self.dataloader_eval,
 				current_step,
 				metrics_tracker,
 				step_metrics,
@@ -539,7 +537,7 @@ class SequenceClassificationTrainer(BaseTrainer):
 	def _train_epoch(
 		self,
 		sharded_state: EasyDeLState,
-		train_iter: int,
+		train_dataset,
 		current_step: int,
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
@@ -551,6 +549,7 @@ class SequenceClassificationTrainer(BaseTrainer):
 	):
 		"""Handles training for a single epoch."""
 		run_exception = None
+		train_iter = iter(train_dataset)
 		for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
 			try:
 				batch = self._get_next_batch(train_iter)
@@ -613,7 +612,7 @@ class SequenceClassificationTrainer(BaseTrainer):
 	def _eval_epoch(
 		self,
 		sharded_state: EasyDeLState,
-		eval_iter: int,
+		eval_dataset,
 		current_step: int,
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
@@ -621,6 +620,7 @@ class SequenceClassificationTrainer(BaseTrainer):
 		start_time: float,
 	):
 		"""Handles training for a single epoch."""
+		eval_iter = iter(eval_dataset)
 		for _ in range(self.max_evaluation_steps):
 			try:
 				batch = self._get_next_batch(eval_iter)
