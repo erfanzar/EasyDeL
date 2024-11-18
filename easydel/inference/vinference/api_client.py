@@ -44,6 +44,7 @@ class vInferenceChatCompletionClient:
 	def create_chat_completion(
 		self,
 		request: ChatCompletionRequest,
+		extra_headers: Optional[dict] = None,
 	) -> Generator[
 		Union[ChatCompletionStreamResponse, ChatCompletionResponse],
 		None,
@@ -63,12 +64,12 @@ class vInferenceChatCompletionClient:
 		    requests.RequestException: For network-related errors
 		"""
 		url = f"{self.base_url}/v1/chat/completions"
-
+		extra_headers = extra_headers or {}
 		headers = {
 			"bypass-tunnel-reminder": "true",
 			"Content-Type": "application/json",
 			"Accept": "application/json",
-		}
+		}.update(extra_headers)
 		out = ChatCompletionStreamResponse if request.stream else ChatCompletionResponse
 		try:
 			with self.session.post(

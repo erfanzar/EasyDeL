@@ -32,6 +32,7 @@ from easydel.inference.vinference.api_models import (
 	ChatCompletionStreamResponse,
 	ChatCompletionStreamResponseChoice,
 	CountTokenRequest,
+	DeltaMessage,
 	UsageInfo,
 )
 
@@ -178,6 +179,7 @@ class vInferenceApiServer:
 		start = time.perf_counter()
 
 		# Generate response
+
 		for response in inference.generate(
 			input_ids=ids["input_ids"],
 			attention_mask=ids["attention_mask"],
@@ -202,6 +204,7 @@ class vInferenceApiServer:
 			model=request.model,
 			choices=[
 				ChatCompletionResponseChoice(
+					index=response.generated_tokens,
 					response=final_response,
 					finish_reason=finish_reason,
 				)
@@ -243,6 +246,7 @@ class vInferenceApiServer:
 					ids["attention_mask"],
 				)
 
+			index = 0
 			async for response in self._aiter_generator(await generate_tokens()):
 				# Process each chunk asynchronously
 				next_slice = slice(
@@ -265,7 +269,8 @@ class vInferenceApiServer:
 					model=request.model,
 					choices=[
 						ChatCompletionStreamResponseChoice(
-							response=decoded_response,
+							index=0,
+							delta=DeltaMessage(role="assistant", content=decoded_response),
 							finish_reason=None,
 						)
 					],
@@ -278,6 +283,7 @@ class vInferenceApiServer:
 						response.tokens_pre_second,
 					),
 				)
+				index += 1
 				yield ("data: " + stream_resp.model_dump_json() + "\n\n").encode("utf-8")
 
 				# Add a small delay to prevent overwhelming the event loop
@@ -294,7 +300,8 @@ class vInferenceApiServer:
 				model=request.model,
 				choices=[
 					ChatCompletionStreamResponseChoice(
-						response="",
+						index=index,
+						delta=DeltaMessage(role="assistant", content=""),
 						finish_reason=finish_reason,
 					)
 				],

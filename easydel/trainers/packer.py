@@ -1,8 +1,8 @@
-import datasets
+from __future__ import annotations
 
 
 def pack_sequences(
-	dataset: datasets.Dataset,
+	dataset: "datasets.Dataset",  # noqa #type:ignore
 	max_length=512,
 	pad_token_id=0,
 	reset_position_ids=False,

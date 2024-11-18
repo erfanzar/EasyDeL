@@ -14,7 +14,7 @@
 
 import time
 import uuid
-from typing import List, Literal, Optional, Union
+from typing import List, Literal, Optional, Union, Dict
 
 from pydantic import BaseModel, Field
 
@@ -24,24 +24,41 @@ class ChatMessage(BaseModel):
 	content: str
 
 
+class DeltaMessage(BaseModel):
+	role: Optional[str] = None
+	content: Optional[str] = None
+
+
 class UsageInfo(BaseModel):
 	prompt_tokens: int = 0
 	completion_tokens: Optional[int] = 0
 	total_tokens: int = 0
-	tps: float = 0
+	tokens_pre_second: float = 0
 	processing_time: float = 0.0
 	first_iter_flops: float = 0.0
 	iter_flops: float = 0.0
 
 
 class ChatCompletionRequest(BaseModel):
+	# The openai api native parameters
 	model: str
 	messages: List[ChatMessage]
+	function_call: Optional[str] = "none"  # Ignored by EasyDeL
+	temperature: Optional[float] = 1  # Ignored by EasyDeL
+	top_p: Optional[float] = 1.0  # Ignored by EasyDeL
+	n: Optional[int] = 1  # Ignored by EasyDeL
 	stream: Optional[bool] = False
+	stop: Optional[Union[str, List[str]]] = None  # Ignored by EasyDeL
+	max_tokens: Optional[int] = 16
+	presence_penalty: Optional[float] = 0.0  # Ignored by EasyDeL
+	frequency_penalty: Optional[float] = 0.0  # Ignored by EasyDeL
+	logit_bias: Optional[Dict[str, float]] = None  # Ignored by EasyDeL
+	user: Optional[str] = None  # Ignored by EasyDeL
 
 
 class ChatCompletionResponseChoice(BaseModel):
-	response: str
+	index: int
+	message: ChatMessage
 	finish_reason: Optional[Literal["stop", "length", "function_call"]] = None
 
 
@@ -55,7 +72,8 @@ class ChatCompletionResponse(BaseModel):
 
 
 class ChatCompletionStreamResponseChoice(BaseModel):
-	response: str
+	index: int
+	delta: DeltaMessage
 	finish_reason: Optional[Literal["stop", "length", "function_call"]] = None
 
 
