@@ -16,10 +16,9 @@
 
 from typing import Any, Dict, List, Optional, Sequence, TypeVar
 
-from datasets import Dataset, DatasetDict
 from transformers import PreTrainedTokenizer
 
-DatasetType = TypeVar("DatasetType", Dataset, DatasetDict)
+DatasetType = TypeVar("DatasetType")
 
 
 def is_conversational(example: Dict[str, Any]) -> bool:
@@ -291,6 +290,8 @@ def maybe_unpair_preference_dataset(
 	{'prompt': 'The sky is', 'completion': ' blue.', 'label': True}
 	```
 	"""
+	from datasets import DatasetDict
+
 	if isinstance(dataset, DatasetDict):
 		column_names = dataset[list(dataset.keys())[0]].column_names
 	else:

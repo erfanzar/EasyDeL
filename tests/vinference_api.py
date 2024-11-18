@@ -22,7 +22,7 @@ PartitionSpec, api = sharding.PartitionSpec, HfApi()
 def main():
 	monitor.print_current_status()
 	sharding_axis_dims = (1, 1, 1, -1)
-	max_length = 4096
+	max_length = 2048
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
 	dtype = jnp.float16
 	partition_axis = ed.PartitionAxis()
@@ -37,10 +37,10 @@ def main():
 			attn_dtype=jnp.float16,
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
-			attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
+			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 			quantize_kv_cache=True,
 		),
-		quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
+		quantization_method=ed.EasyDeLQuantizationMethods.NF4,
 		platform=ed.EasyDeLPlatforms.TRITON,
 		partition_axis=partition_axis,
 		param_dtype=dtype,

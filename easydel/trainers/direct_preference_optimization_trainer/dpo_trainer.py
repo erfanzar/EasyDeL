@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
 import copy
 import os
 import time
@@ -21,7 +22,6 @@ from abc import ABC
 from collections import defaultdict
 from functools import partial  # noqa
 from typing import Any, Callable, Dict, Mapping, Optional
-
 import flax.core
 import jax
 import termcolor
@@ -60,10 +60,6 @@ from easydel.trainers.prompt_utils import (
 	maybe_extract_prompt,
 )
 
-# try:
-from datasets import Dataset
-# except:  # noqa
-# 	Dataset = None
 
 logger = get_logger(__name__)
 
@@ -126,8 +122,8 @@ class DPOTrainer(BaseTrainer, ABC):
 		model_state: EasyDeLState,
 		ref_model_state: Optional[EasyDeLState] = None,
 		tokenizer: Optional[PreTrainedTokenizerBase] = None,
-		train_dataset: Optional[Dataset] = None,
-		eval_dataset: Optional[Dataset] = None,
+		train_dataset: Optional["datasets.Dataset"] = None,  # type:ignore #noqa
+		eval_dataset: Optional["datasets.Dataset"] = None,  # type:ignore #noqa
 		data_collator: Optional[Callable] = None,
 		dataset_map_arguments: Optional[dict] = None,
 		low_mem_usage: bool = True,
