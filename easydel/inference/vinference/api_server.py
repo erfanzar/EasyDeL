@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, AsyncGenerator, Callable, Dict, Optional
 
+from calute import ChatMessage
 import uvicorn
 from fastapi import APIRouter, FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -165,7 +166,7 @@ class vInferenceApiServer:
 			prompt_tokens=prefiled_length,
 			completion_tokens=ngenerated_tokens,
 			total_tokens=ngenerated_tokens + prefiled_length,
-			tps=tokens_pre_second,
+			tokens_pre_second=tokens_pre_second,
 			processing_time=processing_time,
 		)
 
@@ -199,13 +200,13 @@ class vInferenceApiServer:
 			if response.generated_tokens == inference.generation_config.max_new_tokens
 			else "stop"
 		)
-
+		
 		return ChatCompletionResponse(
 			model=request.model,
 			choices=[
 				ChatCompletionResponseChoice(
 					index=response.generated_tokens,
-					response=final_response,
+					message=ChatMessage(role="assistant", content=final_response).model_dump(),
 					finish_reason=finish_reason,
 				)
 			],

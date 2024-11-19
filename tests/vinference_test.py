@@ -18,7 +18,7 @@ PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
 def main():
 	sharding_axis_dims = (1, 1, 1, -1)
-	max_length = 4096
+	max_length = 2048
 	num_devices = len(jax.devices())
 	input_shape = (num_devices, max_length)
 
@@ -27,8 +27,6 @@ def main():
 	partition_axis = ed.PartitionAxis()
 
 	dtype = jnp.float16
-	# monitor = SMPMemoryMonitor(5)
-	# monitor.print_current_status()
 
 	model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		pretrained_model_name_or_path,
@@ -41,9 +39,8 @@ def main():
 			quantize_kv_cache=True,
 			attn_dtype=jnp.float16,
 			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
-			attn_mechanism=ed.AttentionMechanisms.SDPA,
+			attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
 		),
-		# platform=ed.EasyDeLPlatforms.JAX,
 		quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
 		param_dtype=dtype,
 		dtype=dtype,
@@ -51,8 +48,6 @@ def main():
 		partition_axis=partition_axis,
 		precision=jax.lax.Precision("fastest"),
 	)
-	# monitor.print_current_status()
-	# Initialize the tokenizer
 	tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
 	tokenizer.padding_side = "left"
 	tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -66,7 +61,7 @@ def main():
 			top_p=model.generation_config.top_p,
 			top_k=model.generation_config.top_k,
 			eos_token_id=model.generation_config.eos_token_id,
-			streaming_chunks=64,
+			streaming_chunks=8,
 		),
 	)
 	print("Compiling")

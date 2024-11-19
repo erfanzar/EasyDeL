@@ -60,7 +60,7 @@ def measure_flops(func, *args, **kwargs):
 	except:  # noqa
 		flops = 1
 	start_time = time.perf_counter()
-	result = jax.block_until_ready(func(*args, **kwargs))
+	result = func(*args, **kwargs)
 	end_time = time.perf_counter()
 	elapsed_time = end_time - start_time
 	return result, flops, flops / elapsed_time, elapsed_time
@@ -647,7 +647,7 @@ class vInference:
 					position_ids=position_ids,
 					rng=self._rng_generator.rng,
 				)
-				
+
 				interval_time = 0
 				state.generate_func_flops = generate_func_flops
 				if not state.is_sequence_finished:
