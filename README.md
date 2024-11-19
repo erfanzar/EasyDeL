@@ -155,7 +155,7 @@ inference = ed.vInference(
 )
 ```
 
-### vInferenceApiServer
+### vInferenceApiServer 
 
 `vInferenceApiServer` is a Serve API Engine for production or research purposes, providing a stable, efficient, and OpenAI API like API.
 

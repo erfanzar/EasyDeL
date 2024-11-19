@@ -453,7 +453,7 @@ vinference_step_compiled = jax.jit(
 
 def create_sampling_step(
 	model,
-	max_new_tokens: int,
+	max_new_tokens: int, 
 	repetition_penalty: float,
 	length_penalty: float,
 	top_k: int,

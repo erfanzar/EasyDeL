@@ -109,7 +109,7 @@ def _compiled_generate(
 	generation_spec = PartitionSpec(
 		partition_axes.batch_axis,
 		partition_axes.key_sequence_axis,
-	)
+	) 
 
 	batch_size, current_length = input_ids.shape
 	max_length = current_length + max_new_tokens
