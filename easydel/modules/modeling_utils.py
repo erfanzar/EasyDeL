@@ -1362,10 +1362,12 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 		"""
 
 		from transformers import GenerationConfig
-		from transformers.utils import cached_file as _cached_file
+		from huggingface_hub import HfApi
 		from transformers.utils import download_url as _download_url
 		from transformers.utils import is_offline_mode as _is_offline_mode
 		from transformers.utils import is_remote_url as _is_remote_url
+
+		api = HfApi(token=token)
 
 		proxies = kwargs.pop("proxies", None)
 		trust_remote_code = kwargs.pop("trust_remote_code", None)
@@ -1382,14 +1384,6 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 				"The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is"
 				" ignored."
 			)
-
-		user_agent = {
-			"file_type": "model",
-			"framework": "flax",
-			"from_auto_class": from_auto_class,
-		}
-		if from_pipeline is not None:
-			user_agent["using_pipeline"] = from_pipeline
 
 		if _is_offline_mode() and not local_files_only:
 			logger.info("Offline mode: forcing local_files_only=True")
@@ -1472,23 +1466,16 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 			else:
 				filename = FLAX_WEIGHTS_NAME
 				try:
-					cached_file_kwargs = {
-						"cache_dir": cache_dir,
-						"force_download": force_download,
-						"proxies": proxies,
-						"local_files_only": local_files_only,
-						"token": token,
-						"user_agent": user_agent,
-						"revision": revision,
-						"subfolder": subfolder,
-						"_raise_exceptions_for_gated_repo": False,
-						"_raise_exceptions_for_missing_entries": False,
-						"_commit_hash": commit_hash,
-					}
-					resolved_archive_file = _cached_file(
-						pretrained_model_name_or_path,
-						filename,
-						**cached_file_kwargs,
+					resolved_archive_file = api.hf_hub_download(
+						repo_id=pretrained_model_name_or_path,
+						filename=filename,
+						subfolder=subfolder,
+						revision=revision,
+						cache_dir=cache_dir,
+						force_download=force_download,
+						proxies=proxies,
+						token=token,
+						local_files_only=local_files_only,
 					)
 
 					if resolved_archive_file is None:

@@ -31,6 +31,7 @@ from aqt.jax.v2 import config as q_config
 from aqt.jax.v2.flax import aqt_flax as q_flax
 from einops import rearrange
 from fjformer.dtypes import Array8Bit, ArrayNF4
+from fjformer import with_sharding_constraint
 from flax import linen as nn
 from flax.linen import combine_masks
 from flax.traverse_util import flatten_dict, unflatten_dict
@@ -161,9 +162,6 @@ def names_in_mesh(*names):
 	    A boolean indicating whether all the given
 	"""
 	return set(names) <= set(pxla.thread_resources.env.physical_mesh.axis_names)
-
-
-with_sharding_constraint = fjformer.with_sharding_constraint
 
 
 def get_gradient_checkpoint_policy(name):
@@ -854,8 +852,24 @@ class FlaxAttentionModule(nn.Module):
 					case _:
 						raise NotImplementedError("unsupported kv cache quantization method.")
 			else:
-				cached_key.value = key
-				cached_value.value = value
+				cached_key.value = with_sharding_constraint(
+					key,
+					PartitionSpec(
+						paxs.batch_axis,
+						paxs.key_sequence_axis,
+						paxs.head_axis,
+						paxs.attention_dim_axis,
+					),
+				)
+				cached_value.value = with_sharding_constraint(
+					value,
+					PartitionSpec(
+						paxs.batch_axis,
+						paxs.key_sequence_axis,
+						paxs.head_axis,
+						paxs.attention_dim_axis,
+					),
+				)
 
 			num_updated_cache_vectors = query_states.shape[1]
 			cache_index.value = cache_index.value + num_updated_cache_vectors
