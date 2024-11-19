@@ -16,18 +16,13 @@ import dataclasses
 from functools import partial
 from typing import Dict, Optional, Union, List
 
+import fjformer
 import jax
 import jax.experimental
 import jax.experimental.pallas
 import jax.random
 from jax import numpy as jnp
 from jax import random, sharding
-
-from easydel.generation.logits_process import (
-	FlaxTemperatureLogitsWarper,
-	FlaxTopKLogitsWarper,
-	FlaxTopPLogitsWarper,
-)
 
 
 @jax.tree_util.register_pytree_node_class
@@ -69,82 +64,6 @@ class vInferenceConfig:
 	@classmethod
 	def tree_unflatten(cls, aux, children):
 		return cls(*children)
-
-	def __hash__(self) -> int:
-		int_hash = int(
-			(
-				"---".join(
-					str(cu) for cu in self.__dict__.values() if isinstance(cu, (float, int))
-				)
-			)
-			.replace("---", "")
-			.replace(".", "")
-		)
-
-		return int_hash
-
-	def __repr__(self):
-		"""
-		Args:
-		    self: Refer to the instance of the class
-
-		Returns:
-		    A string representation of the object
-		"""
-		string = f"{self.__class__.__name__}(\n"
-		for k, v in self.__dict__.items():
-			if not k.startswith("_"):
-				try:
-					repr_src = f"  {k} : " + v.__str__().replace("\n", "\n  ") + "\n"
-					string += (
-						repr_src
-						if len(repr_src) < 500
-						else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
-					)
-				except TypeError:
-					pass
-		return string.strip() + "\n)"
-
-	__str__ = __repr__
-
-
-class GenerationPipelineConfig:
-	"""
-	Configuration class for the text generation pipeline.
-
-	Attributes:
-	    max_new_tokens: Maximum number of tokens to generate.
-	    temperature: Temperature parameter for sampling.
-	    top_p: Top-p (nucleus) sampling threshold.
-	    top_k: Top-k sampling parameter.
-	    repetition_penalty: Penalty for repeating tokens.
-	    length_penalty: Penalty for generating longer sequences.
-	    pad_token_id: ID of the padding token.
-	    bos_token_id: ID of the beginning-of-sequence token.
-	    eos_token_id: ID of the end-of-sequence token.
-	"""
-
-	def __init__(
-		self,
-		max_new_tokens: int = 64,
-		temperature: float = 0.0,
-		top_p: float = 0.95,
-		top_k: int = 50,
-		repetition_penalty: float = 1.0,
-		length_penalty: float = 1.0,
-		pad_token_id: Optional[int] = None,
-		bos_token_id: Optional[int] = None,
-		eos_token_id: Optional[int] = None,
-	):
-		self.max_new_tokens = max_new_tokens
-		self.temperature = temperature
-		self.top_p = top_p
-		self.top_k = top_k
-		self.repetition_penalty = repetition_penalty
-		self.length_penalty = length_penalty
-		self.pad_token_id = pad_token_id
-		self.bos_token_id = bos_token_id
-		self.eos_token_id = eos_token_id
 
 	def __hash__(self) -> int:
 		int_hash = int(
@@ -287,7 +206,7 @@ class SampleState:
 	is_sequence_finished: Union[jax.Array, sharding.NamedSharding]
 	prng_key: Union[random.PRNGKey, sharding.NamedSharding]
 	model_kwargs: Union[Dict[str, jax.Array], sharding.NamedSharding]
-	
+
 	# vInference Ops
 	generate_func_flops: Optional[float] = float("-inf")
 	interval_func_flops: Optional[float] = float("-inf")
@@ -361,7 +280,7 @@ def apply_repetition_penalty(logits, tokens, penalty):
 	return logits
 
 
-def apply_length_penalty(logits, current_length, max_len, length_penalty):
+def apply_length_penalty(logits, current_length, max_new_tokens, length_penalty):
 	"""
 	Applies length penalty to the logits.
 
@@ -382,72 +301,49 @@ def apply_length_penalty(logits, current_length, max_len, length_penalty):
 	return logits / penalty_factor
 
 
-@partial(jax.jit, static_argnames=["top_k"])
-def apply_top_k_sampling(logits, top_k):
-	"""
-	Applies top-k sampling to the logits.
+@partial(jax.jit, static_argnames=["k"])
+def cal_top_k(x, k):
+	def scan(x, unused):
+		indice = jnp.argmax(x, axis=1)
+		return (
+			jax.vmap(lambda x, y: x.at[y].set(-jnp.inf))(x, indice),
+			(
+				jax.vmap(lambda x, y: x[y])(x, indice),
+				indice,
+			),
+		)
 
-	Args:
-	    logits: Logits tensor.
-	    top_k: Number of top logits to consider.
-
-	Returns:
-	    Logits tensor with top-k sampling applied.
-	"""
-	batch_size, vocab_size = logits.shape
-	next_logits_flat = jnp.full(batch_size * vocab_size, -float("Inf"))
-
-	topk = min(top_k, logits.shape[-1])  # Safety check
-	topk_logits, topk_indices = jax.lax.top_k(logits, topk)
-	shift = jnp.broadcast_to(
-		(jnp.arange(batch_size) * vocab_size)[:, None], (batch_size, topk)
-	).flatten()
-	topk_logits_flat = topk_logits.flatten()
-	topk_indices_flat = topk_indices.flatten() + shift
-
-	next_logits_flat = next_logits_flat.at[topk_indices_flat].set(topk_logits_flat)
-	next_logits = next_logits_flat.reshape(batch_size, vocab_size)
-	return next_logits
+	x, (values, indices) = jax.lax.scan(scan, x, (), k)
+	return values.T, indices.T
 
 
-def apply_top_p_sampling(logits, top_p):
-	"""
-	Applies top-p (nucleus) sampling to the logits.
-
-	Args:
-	    logits: Logits tensor.
-	    top_p: Top-p sampling threshold.
-
-	Returns:
-	    Logits tensor with top-p sampling applied.
-	"""
-	topk_logits, topk_indices = jax.lax.top_k(logits, logits.shape[-1])
-
-	mask_logits = jnp.full_like(logits, -float("Inf"))
-	cumulative_probs = jax.nn.softmax(topk_logits, axis=-1).cumsum(axis=-1)
+@partial(jax.jit, static_argnames=["top_p"])
+def calculate_top_p(logits, top_p):
+	
+	topk_scores, topk_indices = jax.lax.top_k(logits, k=logits.shape[-1])
+	mask_scores = jnp.full_like(logits, -float("inf"))
+	cumulative_probs = jax.nn.softmax(topk_scores, axis=-1).cumsum(axis=-1)
 	score_mask = cumulative_probs < top_p
 	score_mask = jnp.roll(score_mask, 1)
 	score_mask |= score_mask.at[:, 0].set(True)
 	score_mask = score_mask.at[:, :1].set(True)
-
-	topk_next_logits = jnp.where(score_mask, topk_logits, mask_logits)
-	next_logits = jax.lax.sort_key_val(topk_indices, topk_next_logits)[-1]
-
-	return next_logits
+	topk_next_scores = jnp.where(score_mask, topk_scores, mask_scores)
+	return jax.lax.sort_key_val(topk_indices, topk_next_scores)[-1]
 
 
-def sampling(sampling_logits, key):
-	"""
-	Samples from the logits using categorical distribution.
-
-	Args:
-	    sampling_logits: Logits tensor.
-	    key: JAX PRNG key.
-
-	Returns:
-	    Sampled token IDs.
-	"""
-	return jax.random.categorical(key, sampling_logits).reshape(-1)
+@partial(jax.jit, static_argnames=["top_k"])
+def calculate_top_k(logits, top_k):
+	batch_size, vocab_size = logits.shape
+	next_scores_flat = jnp.full(batch_size * vocab_size, -float("inf"))
+	topk_scores, topk_indices = jax.lax.top_k(logits, k=top_k)
+	shift = jnp.broadcast_to(
+		(jnp.arange(batch_size) * vocab_size)[:, None],
+		(batch_size, top_k),
+	).flatten()
+	topk_scores_flat = topk_scores.flatten()
+	topk_indices_flat = topk_indices.flatten() + shift
+	next_scores_flat = next_scores_flat.at[topk_indices_flat].set(topk_scores_flat)
+	return next_scores_flat.reshape(batch_size, vocab_size)
 
 
 def temperature_branch(logits, prng_key, top_k, temperature, top_p):
@@ -464,15 +360,15 @@ def temperature_branch(logits, prng_key, top_k, temperature, top_p):
 	Returns:
 	    Sampled token IDs.
 	"""
-	logits = FlaxTemperatureLogitsWarper(temperature=temperature)(None, logits, None)
+	logits = logits / temperature
 	if top_k > 1:
-		logits = FlaxTopKLogitsWarper(top_k=top_k)(None, logits, None)
+		logits = calculate_top_k(logits, top_k)
 	if 0 < top_p < 1.0:
-		logits = FlaxTopPLogitsWarper(top_p=top_p)(None, logits, None)
+		logits = calculate_top_p(logits, top_p)
 	return jax.random.categorical(key=prng_key, logits=logits)
 
 
-def gready_branch(logits):
+def vgready_branch(logits, prng_key, top_k, temperature, top_p):
 	"""
 	Performs greedy decoding on the logits.
 
@@ -485,33 +381,26 @@ def gready_branch(logits):
 	return jnp.argmax(logits, axis=-1).reshape(-1)
 
 
-def inference_step(
-	logits,
-	tokens,
-	prng_key,
-	config,
-	current_length,
-	max_length,
+def vinference_step(
+	logits: jax.Array,
+	tokens: jax.Array,
+	prng_key: jax.random.PRNGKey,
+	current_length: int,
+	max_new_tokens: int,
+	repetition_penalty: float,
+	length_penalty: float,
+	top_k: int,
+	top_p: float,
+	temperature: float,
 ):
 	"""
 	Performs a single inference step in the text generation process.
 
 	This function applies repetition and length penalties to the logits,
 	and then performs either temperature-based sampling or greedy decoding.
-
-	Args:
-	    logits: Model's logits for the current step.
-	    tokens: Previously generated tokens.
-	    prng_key: JAX PRNG key for random sampling.
-	    config: GenerationPipelineConfig object.
-	    current_length: Current length of the generated sequence.
-	    max_length: Maximum allowed length for the generated sequence.
-
 	Returns:
 	    jax.Array: An array of generated token IDs.
 	"""
-	length_penalty = config.length_penalty
-	repetition_penalty = config.repetition_penalty
 	# Apply repetition penalty
 	logits = jax.lax.cond(
 		repetition_penalty != 1.0,
@@ -529,22 +418,111 @@ def inference_step(
 		lambda x, *u: x,
 		logits,
 		current_length,
-		max_length,
+		max_new_tokens,
 		length_penalty,
 	)
-
-	if config.temperature > 0.0:
+	if temperature > 0.0:
 		return temperature_branch(
 			logits=logits,
 			prng_key=prng_key,
-			top_k=config.top_k,
-			top_p=config.top_p,
-			temperature=config.temperature,
+			top_k=top_k,
+			top_p=top_p,
+			temperature=temperature,
 		)
-	return gready_branch(logits=logits)
+	return vgready_branch(
+		logits=logits,
+		prng_key=prng_key,
+		top_k=top_k,
+		top_p=top_p,
+		temperature=temperature,
+	)
 
 
-inference_step_compiled = jax.jit(
-	inference_step,
-	static_argnames=["max_length", "config"],
+vinference_step_compiled = jax.jit(
+	vinference_step,
+	static_argnames=[
+		"max_new_tokens",
+		"repetition_penalty",
+		"length_penalty",
+		"top_k",
+		"top_p",
+		"temperature",
+	],
 )
+
+
+def create_sampling_step(
+	model,
+	max_new_tokens: int,
+	repetition_penalty: float,
+	length_penalty: float,
+	top_k: int,
+	top_p: float,
+	temperature: float,
+	eos_token_id: jax.Array,
+	pad_token_id: jax.Array,
+	current_length: int,
+):
+	@fjformer.core.implicit_compact
+	def sampling_step(params, state: SampleState):
+		"""
+		Performs a single sampling step for text generation.
+
+		Args:
+				params: Model parameters.
+				state (inference_utils.SampleState): The current generation state.
+
+		Returns:
+				inference_utils.SampleState: The updated generation state.
+		"""
+		model_outputs = model(
+			input_ids=state.running_token,
+			params=params,
+			add_params_field=True,
+			return_dict=True,
+			**state.model_kwargs,
+		)
+		next_token = vinference_step_compiled(
+			model_outputs.logits[:, -1],
+			state.sequences,
+			state.prng_key,
+			current_length,
+			max_new_tokens,
+			repetition_penalty,
+			length_penalty,
+			top_k,
+			top_p,
+			temperature,
+		)
+
+		next_token = (
+			next_token * ~state.is_sequence_finished
+			+ pad_token_id * state.is_sequence_finished
+		)
+
+		next_sequence_finished = state.is_sequence_finished | jnp.isin(
+			next_token,
+			eos_token_id,
+		)
+		next_token = next_token[:, None]
+		next_sequences = jax.lax.dynamic_update_slice(
+			state.sequences,
+			next_token,
+			(0, state.current_length),
+		)
+		next_model_kwargs = model.update_inputs_for_generation(
+			model_outputs,
+			state.model_kwargs,
+		)
+
+		return SampleState(
+			current_length=state.current_length + 1,
+			sequences=next_sequences,
+			running_token=next_token,
+			is_sequence_finished=next_sequence_finished,
+			prng_key=jax.random.split(state.prng_key, 2)[0],
+			model_kwargs=next_model_kwargs,
+			generated_tokens=state.generated_tokens + 1,
+		)
+
+	return sampling_step

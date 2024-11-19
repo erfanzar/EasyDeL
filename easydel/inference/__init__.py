@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.inference import generation_pipeline, server
-from easydel.inference.generation_pipeline import (
-	ChatPipeline,
-	GenerationPipeline,
-	GenerationPipelineConfig,
-)
+
 from easydel.inference.vinference.api_server import vInferenceApiServer
 from easydel.inference.vinference.vinference import vInference, vInferenceConfig
 
@@ -25,9 +20,4 @@ __all__ = [
 	"vInference",
 	"vInferenceConfig",
 	"vInferenceApiServer",
-	"ChatPipeline",
-	"GenerationPipeline",
-	"GenerationPipelineConfig",
-	"generation_pipeline",
-	"server",
 ]

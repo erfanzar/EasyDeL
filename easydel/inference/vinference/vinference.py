@@ -28,7 +28,6 @@ import numpy as np
 import flax.core
 import jax
 from fjformer import GenerateRNG, with_sharding_constraint
-from fjformer.core import implicit_compact
 from jax import lax
 from jax import numpy as jnp
 from jax import random as jrand
@@ -38,8 +37,8 @@ from transformers import PreTrainedTokenizer
 from easydel.etils.etils import get_logger
 from easydel.inference.utils import (
 	SampleState,
-	inference_step_compiled,
 	vInferenceConfig,
+	create_sampling_step,
 )
 from easydel.inference.vinference.metrics import vInferenceMetrics
 from easydel.modules.modeling_utils import EDPretrainedModel
@@ -66,14 +65,32 @@ def measure_flops(func, *args, **kwargs):
 	return result, flops, flops / elapsed_time, elapsed_time
 
 
-@partial(jax.jit, static_argnames=["model", "generation_config"])
+@partial(
+	jax.jit,
+	static_argnames=[
+		"model",
+		"max_new_tokens",
+		"repetition_penalty",
+		"length_penalty",
+		"top_k",
+		"top_p",
+		"temperature",
+	],
+)
 def _compiled_generate(
 	model: EDPretrainedModel,
 	params: dict,
 	input_ids: jax.Array,
 	attention_mask: jax.Array,
 	position_ids: jax.Array,
-	generation_config: vInferenceConfig,
+	eos_token_id: jax.Array,
+	pad_token_id: jax.Array,
+	max_new_tokens: int,
+	repetition_penalty: float,
+	length_penalty: float,
+	top_k: int,
+	top_p: float,
+	temperature: float,
 	rng: jrand.PRNGKey,
 ) -> SampleState:
 	"""
@@ -83,23 +100,11 @@ def _compiled_generate(
 	generation configuration, and a random number generator key as input. It initializes
 	the generation state and performs the first sampling step.
 
-	Args:
-		model: The pre-trained language model.
-		params: The model parameters.
-		input_ids: The input token IDs.
-		attention_mask: The attention mask.
-		position_ids: The position IDs.
-		generation_config: The generation configuration.
-		rng: The random number generator key.
-
 	Returns:
 		SampleState: The initial generation state after the first sampling step.
 	"""
 	partition_axes = model.config.partition_axis
 	mesh = model.config.mesh
-
-	eos_token_id = jnp.array(generation_config.eos_token_id, dtype=jnp.int32)
-	pad_token_id = jnp.array(generation_config.pad_token_id, dtype=jnp.int32)
 
 	generation_spec = PartitionSpec(
 		partition_axes.batch_axis,
@@ -107,7 +112,7 @@ def _compiled_generate(
 	)
 
 	batch_size, current_length = input_ids.shape
-	max_length = current_length + generation_config.max_new_tokens
+	max_length = current_length + max_new_tokens
 	current_length = jnp.array(current_length)
 	sequences = jnp.full((batch_size, max_length), pad_token_id, dtype=jnp.int32)
 	sequences = lax.dynamic_update_slice(sequences, input_ids, (0, 0))
@@ -146,71 +151,18 @@ def _compiled_generate(
 		generated_tokens=0,
 	)
 
-	def cond_fn(state):
-		"""state termination condition fn."""
-		all_sequence_finished = jnp.all(state.is_sequence_finished)
-		return ~jnp.logical_or(
-			all_sequence_finished,
-			state.current_length >= (current_length + generation_config.streaming_chunks),
-		)
-
-	@implicit_compact
-	def sampling_step(params, state: SampleState):
-		"""
-		Performs a single sampling step for text generation.
-
-		Args:
-				params: Model parameters.
-				state (inference_utils.SampleState): The current generation state.
-
-		Returns:
-				inference_utils.SampleState: The updated generation state.
-		"""
-		model_outputs = model(
-			input_ids=state.running_token,
-			params=params,
-			add_params_field=True,
-			return_dict=True,
-			**state.model_kwargs,
-		)
-		next_token = inference_step_compiled(
-			model_outputs.logits[:, -1],
-			state.sequences,
-			state.prng_key,
-			generation_config,
-			current_length,
-			generation_config.max_new_tokens,
-		)
-
-		next_token = (
-			next_token * ~state.is_sequence_finished
-			+ pad_token_id * state.is_sequence_finished
-		)
-
-		next_sequence_finished = state.is_sequence_finished | jnp.isin(
-			next_token,
-			eos_token_id,
-		)
-		next_token = next_token[:, None]
-		next_sequences = lax.dynamic_update_slice(
-			state.sequences,
-			next_token,
-			(0, state.current_length),
-		)
-		next_model_kwargs = model.update_inputs_for_generation(
-			model_outputs,
-			state.model_kwargs,
-		)
-
-		return SampleState(
-			current_length=state.current_length + 1,
-			sequences=next_sequences,
-			running_token=next_token,
-			is_sequence_finished=next_sequence_finished,
-			prng_key=jrand.split(state.prng_key, 2)[0],
-			model_kwargs=next_model_kwargs,
-			generated_tokens=state.generated_tokens + 1,
-		)
+	sampling_step = create_sampling_step(
+		model=model,
+		max_new_tokens=max_new_tokens,
+		repetition_penalty=repetition_penalty,
+		length_penalty=length_penalty,
+		top_k=top_k,
+		top_p=top_p,
+		temperature=temperature,
+		eos_token_id=eos_token_id,
+		pad_token_id=pad_token_id,
+		current_length=current_length,
+	)
 
 	with mesh:
 		if input_ids.shape[-1] > 1:
@@ -218,12 +170,30 @@ def _compiled_generate(
 	return state
 
 
-@partial(jax.jit, static_argnames=["model", "generation_config"])
+@partial(
+	jax.jit,
+	static_argnames=[
+		"model",
+		"max_new_tokens",
+		"repetition_penalty",
+		"length_penalty",
+		"top_k",
+		"top_p",
+		"temperature",
+	],
+)
 def _compiled_interval_generate(
 	model: EDPretrainedModel,
 	params: dict,
 	state: SampleState,
-	generation_config: vInferenceConfig,
+	eos_token_id: jax.Array,
+	pad_token_id: jax.Array,
+	max_new_tokens: int,
+	repetition_penalty: float,
+	length_penalty: float,
+	top_k: int,
+	top_p: float,
+	temperature: float,
 	loop_max_tokens: int,
 	start_length: int,
 ) -> SampleState:
@@ -234,21 +204,11 @@ def _compiled_interval_generate(
 	configuration, maximum number of tokens for the loop, and the starting length as input.
 	It continues the generation process until the termination condition is met.
 
-	Args:
-		model: The pre-trained language model.
-		params: The model parameters.
-		state: The current generation state.
-		generation_config: The generation configuration.
-		loop_max_tokens: The maximum number of tokens to generate in the loop.
-		start_length: The starting length of the input sequence.
-
 	Returns:
 		SampleState: The updated generation state after the interval generation steps.
 	"""
 	mesh = model.config.mesh
 
-	eos_token_id = jnp.array(generation_config.eos_token_id, dtype=jnp.int32)
-	pad_token_id = jnp.array(generation_config.pad_token_id, dtype=jnp.int32)
 	tlen = state.current_length + loop_max_tokens
 
 	def cond_fn(state):
@@ -256,64 +216,18 @@ def _compiled_interval_generate(
 		all_sequence_finished = jnp.all(state.is_sequence_finished)
 		return ~jnp.logical_or(all_sequence_finished, state.current_length >= tlen)
 
-	@implicit_compact
-	def sampling_step(params, state: SampleState):
-		"""
-		Performs a single sampling step for text generation.
-
-		Args:
-				params: Model parameters.
-				state (inference_utils.SampleState): The current generation state.
-
-		Returns:
-				inference_utils.SampleState: The updated generation state.
-		"""
-		model_outputs = model(
-			input_ids=state.running_token,
-			params=params,
-			add_params_field=True,
-			return_dict=True,
-			**state.model_kwargs,
-		)
-		next_token = inference_step_compiled(
-			model_outputs.logits[:, -1],
-			state.sequences,
-			state.prng_key,
-			generation_config,
-			start_length,
-			generation_config.max_new_tokens,
-		)
-
-		next_token = (
-			next_token * ~state.is_sequence_finished
-			+ pad_token_id * state.is_sequence_finished
-		)
-
-		next_sequence_finished = state.is_sequence_finished | jnp.isin(
-			next_token,
-			eos_token_id,
-		)
-		next_token = next_token[:, None]
-		next_sequences = lax.dynamic_update_slice(
-			state.sequences,
-			next_token,
-			(0, state.current_length),
-		)
-		next_model_kwargs = model.update_inputs_for_generation(
-			model_outputs,
-			state.model_kwargs,
-		)
-
-		return SampleState(
-			current_length=state.current_length + 1,
-			sequences=next_sequences,
-			running_token=next_token,
-			is_sequence_finished=next_sequence_finished,
-			prng_key=jrand.split(state.prng_key, 2)[0],
-			model_kwargs=next_model_kwargs,
-			generated_tokens=state.generated_tokens + 1,
-		)
-
+	sampling_step = create_sampling_step(
+		model=model,
+		max_new_tokens=max_new_tokens,
+		repetition_penalty=repetition_penalty,
+		length_penalty=length_penalty,
+		top_k=top_k,
+		top_p=top_p,
+		temperature=temperature,
+		eos_token_id=eos_token_id,
+		pad_token_id=pad_token_id,
+		current_length=start_length,
+	)
 	with mesh:
 
 		def interval_sample(state):
@@ -617,6 +531,8 @@ class vInference:
 				input_ids = jnp.array(input_ids)
 				batch_size, seq_length = input_ids.shape
 				_ = self.precompile(batch_size, seq_length)
+				eos_token_id = jnp.array(self.generation_config.eos_token_id, dtype=jnp.int32)
+				pad_token_id = jnp.array(self.generation_config.pad_token_id, dtype=jnp.int32)
 				generate_func, interval_func = get_compiled_funcs(
 					batch_size=batch_size,
 					input_tokens_length=seq_length,
@@ -645,6 +561,8 @@ class vInference:
 					input_ids=input_ids,
 					attention_mask=attention_mask,
 					position_ids=position_ids,
+					pad_token_id=pad_token_id,
+					eos_token_id=eos_token_id,
 					rng=self._rng_generator.rng,
 				)
 
@@ -658,6 +576,8 @@ class vInference:
 								interval_func,
 								params=self.params,
 								state=state,
+								pad_token_id=pad_token_id,
+								eos_token_id=eos_token_id,
 								loop_max_tokens=self.generation_config.streaming_chunks,
 								start_length=start_length,
 							)
@@ -707,7 +627,8 @@ class vInference:
 			attention_mask = jnp.ones_like(input_ids)
 			position_ids = attention_mask.cumsum(axis=-1, dtype="i4") - 1
 			logger.debug(f"Smart Compiling `state_generate_compile` - {self.inference_name}")
-
+			eos_token_id = jnp.array(self.generation_config.eos_token_id, dtype=jnp.int32)
+			pad_token_id = jnp.array(self.generation_config.pad_token_id, dtype=jnp.int32)
 			compiled_generate_func = smart_compile(
 				_compiled_generate.lower(
 					model=self.model,
@@ -715,7 +636,14 @@ class vInference:
 					input_ids=input_ids,
 					attention_mask=attention_mask,
 					position_ids=position_ids,
-					generation_config=self.generation_config,
+					eos_token_id=eos_token_id,
+					pad_token_id=pad_token_id,
+					max_new_tokens=self.generation_config.max_new_tokens,
+					repetition_penalty=self.generation_config.repetition_penalty,
+					length_penalty=self.generation_config.length_penalty,
+					top_k=self.generation_config.top_k,
+					top_p=self.generation_config.top_p,
+					temperature=self.generation_config.temperature,
 					rng=self._rng_generator.rng,
 				),
 				tag="vinference",
@@ -725,6 +653,8 @@ class vInference:
 				input_ids=input_ids,
 				attention_mask=attention_mask,
 				position_ids=position_ids,
+				eos_token_id=eos_token_id,
+				pad_token_id=pad_token_id,
 				rng=self._rng_generator.rng,
 			)
 			logger.debug(
@@ -735,7 +665,14 @@ class vInference:
 					model=self.model,
 					params=self.params,
 					state=state,
-					generation_config=self.generation_config,
+					eos_token_id=eos_token_id,
+					pad_token_id=pad_token_id,
+					max_new_tokens=self.generation_config.max_new_tokens,
+					repetition_penalty=self.generation_config.repetition_penalty,
+					length_penalty=self.generation_config.length_penalty,
+					top_k=self.generation_config.top_k,
+					top_p=self.generation_config.top_p,
+					temperature=self.generation_config.temperature,
 					loop_max_tokens=self.generation_config.streaming_chunks,
 					start_length=input_tokens_length,
 				),
