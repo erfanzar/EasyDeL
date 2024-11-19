@@ -390,6 +390,103 @@ class FlaxXerxesMLP(nn.Module):
 		)
 
 
+class FlaxXerxesBlocKSparesMLPCollection(nn.Module):
+	config: XerxesConfig
+	dtype: jnp.dtype = jnp.bfloat16
+	param_dtype: jnp.dtype = jnp.bfloat16
+	precision: Optional[jax.lax.Precision] = None
+
+	def setup(self) -> None:
+		self.layers = [
+			FlaxXerxesMLP(
+				config=self.config,
+				dtype=self.dtype,
+				param_dtype=self.param_dtype,
+				precision=self.precision,
+				name=str(i),
+			)
+			for i in range(self.config.num_local_experts)
+		]
+
+	def __call__(
+		self,
+		selected_experts: chex.Array,
+		hidden_states: chex.Array,
+		routing_weights: chex.Array,
+	) -> chex.Array:
+		final_hidden_state = jnp.zeros_like(hidden_states)
+		for index in range(self.config.num_local_experts):
+			expert_layer_output = (
+				block_wise_ffn(
+					self.layers[index],
+					hidden_states,
+					self.config.scan_mlp_chunk_size,
+					False,
+				)
+				if self.config.use_scan_mlp
+				else self.layers[index](hidden_states)
+			)
+			expert_layer_output_exp = (
+				jnp.sum(jnp.multiply(selected_experts == index, routing_weights), axis=-1)[
+					:, :, None
+				]
+				* expert_layer_output
+			)
+			final_hidden_state += expert_layer_output_exp
+
+		return final_hidden_state
+
+
+class FlaxXerxesSparseMoeBlock(nn.Module):
+	config: XerxesConfig
+	dtype: jnp.dtype = jnp.float32
+	param_dtype: jnp.dtype = jnp.float32
+	precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision("fastest")
+
+	def setup(self) -> None:
+		self.gate = Dense(
+			self.config.num_local_experts,
+			use_bias=False,
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+			precision=self.precision,
+			kernel_init=nn.initializers.normal(),
+		)
+
+		self.experts = FlaxXerxesBlocKSparesMLPCollection(
+			config=self.config,
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+			precision=self.precision,
+		)
+
+	def __call__(
+		self,
+		hidden_states: chex.Array,
+		e: bool = False,  # Ignored
+	) -> Tuple[chex.Array, chex.Array]:
+		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
+
+		router_logits = self.gate(hidden_states).astype(
+			jnp.promote_types(self.dtype, jnp.float32)
+		)
+		routing_weights, selected_experts = jax.lax.top_k(
+			router_logits, k=self.config.num_experts_per_tok
+		)
+		routing_weights = jax.nn.softmax(
+			routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=-1
+		)
+
+		return (
+			self.experts(
+				selected_experts=selected_experts,
+				hidden_states=hidden_states,
+				routing_weights=routing_weights,
+			),
+			router_logits,
+		)
+
+
 class FlaxXerxesDecoderLayer(nn.Module):
 	config: XerxesConfig
 	layer_idx: int
@@ -398,7 +495,7 @@ class FlaxXerxesDecoderLayer(nn.Module):
 	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
-		mlp_block = FlaxXerxesMLP
+		mlp_block = FlaxXerxesSparseMoeBlock if self.config.xe_moe else FlaxXerxesMLP
 		attn_block = FlaxXerxesAttention
 
 		if self.config.gradient_checkpointing != "":
@@ -488,7 +585,7 @@ class FlaxXerxesDecoderLayer(nn.Module):
 
 		residual = hidden_states
 		hidden_states = self.pre_feedforward_layernorm(hidden_states)
-		if self.config.use_scan_mlp:
+		if self.config.use_scan_mlp and not self.config.xe_moe:
 			hidden_states = block_wise_ffn(
 				self.mlp, hidden_states, self.config.scan_mlp_chunk_size, deterministic
 			)

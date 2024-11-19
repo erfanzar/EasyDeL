@@ -82,32 +82,30 @@ class XerxesConfig(EDPretrainedConfig):
 		hidden_size=4096,
 		intermediate_size=16384,
 		num_hidden_layers=32,
-		num_attention_heads=16,
-		num_key_value_heads=16,
-		head_dim=256,
-		max_position_embeddings=6144,
+		num_attention_heads=32,
+		num_key_value_heads=8,
+		head_dim=144,
+		max_position_embeddings=16384,
 		initializer_range=0.02,
 		rms_norm_eps=1e-6,
 		use_cache=True,
 		pad_token_id=0,
 		eos_token_id=1,
 		bos_token_id=2,
-		tie_word_embeddings=True,
+		num_local_experts: int = 4,
+		xe_moe: bool = True,
+		num_experts_per_tok: int = 2,
+		tie_word_embeddings=False,
 		rope_theta=10000.0,
 		gradient_checkpointing: str = "",
 		bits: Optional[int] = None,
 		scan_layers: bool = False,
 		**kwargs,
 	):
-		"""The __init__ function is called when the class is instantiated.
-		It sets up the attributes of an object, which are sometimes called fields or properties.
-		The __init__ function can accept arguments, but self must be the first one.
-		"""
-
+		
 		self.gradient_checkpointing = gradient_checkpointing
 		self.bits = bits
 		self.scan_layers = scan_layers
-
 		self.vocab_size = vocab_size
 		self.max_position_embeddings = max_position_embeddings
 		self.hidden_size = hidden_size
@@ -120,6 +118,9 @@ class XerxesConfig(EDPretrainedConfig):
 		self.rms_norm_eps = rms_norm_eps
 		self.use_cache = use_cache
 		self.rope_theta = rope_theta
+		self.num_local_experts = num_local_experts
+		self.num_experts_per_tok = num_experts_per_tok
+		self.xe_moe = xe_moe
 		super().__init__(
 			bos_token_id=bos_token_id,
 			eos_token_id=eos_token_id,
