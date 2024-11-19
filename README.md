@@ -102,8 +102,14 @@ Here's an improved version of your latest updates:
 - Optimized KeyValueCache:
    - Improved performance for `inference`
    - Added support for `8bit_cache`
-- GenerationPipeline Enhancements:
-    - Now supports `int8` and `nf4` for generation tasks.
+- GenerationPipeline Is Removed.
+- vInference Added and supports:
+    - Fast NF4 Operations (CPU GPU).
+    - Fast A8BIT Operations (CPU GPU TPU).
+    - OpenAI Compatible server.
+    - Multi-User handeling and Muti-Threaded.
+    - Multi-vInference launching.
+    - Metrics Recording.
 - Enhanced Trainers: Both `DPO` and `ORPO` trainers have been upgraded.
 - Simplified Parameter Sharding: You can now shard parameters directly with the model using:
    ```python
@@ -121,9 +127,9 @@ Here's an improved version of your latest updates:
 
 ## Key Components
 
-### GenerationPipeline
+### vInference
 
-The `GenerationPipeline` class provides a streamlined interface for text generation using pre-trained language models within the JAX framework.
+The `vInference` class provides a streamlined interface for text generation using pre-trained language models within JAX.
 
 ```python
 import easydel as ed
@@ -132,19 +138,34 @@ from transformers import AutoTokenizer
 model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(...)
 tokenizer = AutoTokenizer.from_pretrained(...)
 
-pipeline = ed.GenerationPipeline(model=model, params=params, tokenizer=tokenizer)
+inference = ed.vInference(
+	model=model,
+	params=params,
+	tokenizer=tokenizer,
+	generation_config=ed.vInferenceConfig(
+		temperature=model.generation_config.temperature,
+		top_k=model.generation_config.top_k,
+		top_p=model.generation_config.top_p,
+		bos_token_id=model.generation_config.bos_token_id,
+		eos_token_id=model.generation_config.eos_token_id,
+		pad_token_id=model.generation_config.pad_token_id,
+		streaming_chunks=32,
+		max_new_tokens=1024,
+	),
+)
 ```
 
-### ApiEngine
+### vInferenceApiServer
 
-`ApiEngine` is a Serve API Engine for production purposes, providing a stable and efficient API.
+`vInferenceApiServer` is a Serve API Engine for production or research purposes, providing a stable, efficient, and OpenAI API like API.
 
 ```python
 import easydel as ed
 
-pipeline = ed.ChatPipeline(...)
-engine = ed.ApiEngine(pipeline=pipeline, hostname="0.0.0.0", port=11550)
-engine.fire()
+api_inference = ed.vInferenceApiServer(
+	{inference.inference_name: inference}
+)  # you can load multi inferences together
+api_inference.fire()
 ```
 
 ### EasyDeLState

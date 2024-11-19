@@ -69,12 +69,7 @@ from easydel.etils.etils import (
 	EasyDeLBackends,
 )
 from easydel.etils.partition_module import PartitionAxis
-from easydel.inference.generation_pipeline import (
-	ChatPipeline,
-	GenerationPipeline,
-	GenerationPipelineConfig,
-)
-from easydel.inference.server import ApiEngine, engine_client
+
 from easydel.inference.vinference import (
 	vInference,
 	vInferenceApiServer,
