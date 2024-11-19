@@ -7,23 +7,19 @@ os.environ["EASYDEL_AUTO"] = "true"
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import easydel as ed
-from easydel.utils.analyze_memory import SMPMemoryMonitor
 import jax
-import torch
 from huggingface_hub import HfApi
-from jax import lax, sharding
+from jax import sharding
 from jax import numpy as jnp
 from transformers import AutoTokenizer
 
-monitor = SMPMemoryMonitor(5)
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
 
 def main():
-	monitor.print_current_status()
 	sharding_axis_dims = (1, 1, 1, -1)
 	max_length = 2048
-	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
+	pretrained_model_name_or_path = "EasyDeL/EasyDeL-Llama-3.2-1B-Instruct"
 	dtype = jnp.float16
 	partition_axis = ed.PartitionAxis()
 	model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
@@ -40,15 +36,12 @@ def main():
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 			quantize_kv_cache=True,
 		),
-		quantization_method=ed.EasyDeLQuantizationMethods.NF4,
+		quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
 		platform=ed.EasyDeLPlatforms.TRITON,
 		partition_axis=partition_axis,
 		param_dtype=dtype,
 		dtype=dtype,
-		torch_dtype=torch.float16,
-		precision=lax.Precision("fastest"),
 	)
-	monitor.print_current_status()
 	tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
 	tokenizer.padding_side = "left"
 	tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -68,7 +61,6 @@ def main():
 	)
 
 	inference.precompile()
-	monitor.print_current_status()
 	print(inference.inference_name)
 	ed.vInferenceApiServer({inference.inference_name: inference}).fire()
 
