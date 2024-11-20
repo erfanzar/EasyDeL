@@ -391,7 +391,7 @@ if _jax.default_backend() == "gpu":
 		print(
 			"UserWarning: please install `torch-cpu` since `easydel` "
 			"uses `triton` and `triton` uses `torch` for autotuning.",
-		)
+		) 
 del _jax
 del _Version
 del _fjformer_version
