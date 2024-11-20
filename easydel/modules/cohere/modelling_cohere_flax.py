@@ -28,13 +28,13 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
 
-from easydel.modules.attention_module import FlexibleAttentionModule
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.modules.cohere.cohere_configuration import CohereConfig as CohereConfig
 
 # easydel.modules
 from easydel.modules.cohere.kernels import cohere_mlp_pallas
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
-	FlaxAttentionModule,
 	apply_rotary_pos_emb,
 	block_wise_ffn,
 	control_mlp_sharding,
@@ -48,7 +48,6 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
-from easydel.modules.factory import register_module
 
 re_mat = flax.linen.partitioning.remat
 

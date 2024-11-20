@@ -61,19 +61,23 @@ from easydel.etils.errors import (
 	EasyDeLTimerError,
 )
 from easydel.etils.etils import (
+	EasyDeLBackends,
 	EasyDeLGradientCheckPointers,
 	EasyDeLOptimizers,
-	EasyDeLSchedulers,
 	EasyDeLPlatforms,
 	EasyDeLQuantizationMethods,
-	EasyDeLBackends,
+	EasyDeLSchedulers,
 )
 from easydel.etils.partition_module import PartitionAxis
-
 from easydel.inference.vinference import (
 	vInference,
 	vInferenceApiServer,
 	vInferenceConfig,
+)
+from easydel.layers.attention import (
+	AttentionBenchmarker,
+	AttentionMechanisms,
+	FlexibleAttentionModule,
 )
 from easydel.modules.arctic import (
 	ArcticConfig,
@@ -81,11 +85,6 @@ from easydel.modules.arctic import (
 	FlaxArcticForCausalLMModule,
 	FlaxArcticModel,
 	FlaxArcticModule,
-)
-from easydel.modules.attention_module import (
-	AttentionBenchmarker,
-	AttentionMechanisms,
-	FlexibleAttentionModule,
 )
 from easydel.modules.auto_models import (
 	AutoEasyDeLConfig,

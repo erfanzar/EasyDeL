@@ -27,10 +27,9 @@ from flax.linen.partitioning import remat
 from jax import lax
 from jax import numpy as jnp
 
-from easydel.modules.attention_module import FlexibleAttentionModule
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
-	FlaxAttentionModule,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,

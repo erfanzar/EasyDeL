@@ -29,13 +29,12 @@ from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.modules.arctic.arctic_configuration import ArcticConfig
 from easydel.modules.arctic.kernels import arctic_mlp_pallas
-from easydel.modules.attention_module import FlexibleAttentionModule
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
-	FlaxAttentionModule,
 	apply_rotary_pos_emb,
 	block_wise_ffn,
 	control_mlp_sharding,
@@ -413,9 +412,9 @@ class ArcticMLP(nn.Module):
 				self.w2.variables["params"]["kernel"],
 				self.w3.variables["params"]["kernel"],
 			)
- 
+
 		w1 = self.act_fn(self.w1(x))
-		w3 = self.w3(x) 
+		w3 = self.w3(x)
 		return self.w2(w1 * w3)
 
 

@@ -41,9 +41,9 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
 
+from easydel.layers.attention import FlaxAttentionModule
 from easydel.modules.flax_modeling_utils import (
-	ACT2FN,
-	FlaxAttentionModule,
+	ACT2FN, 
 	block_wise_ffn,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,

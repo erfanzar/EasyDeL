@@ -30,13 +30,12 @@ from jax.random import PRNGKey
 from jax.sharding import PartitionSpec
 from transformers import FlaxWhisperTimeStampLogitsProcessor
 
-from easydel.modules.attention_module import FlexibleAttentionModule
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 
 # easydel.modules
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
-	FlaxAttentionModule,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
 	with_sharding_constraint,
@@ -1637,6 +1636,7 @@ class FlaxWhisperForAudioClassificationModule(nn.Module):
 			hidden_states=encoder_outputs.hidden_states,
 			attentions=encoder_outputs.attentions,
 		)
+
 
 @register_module(
 	"audio-classification",

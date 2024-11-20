@@ -29,13 +29,12 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
 
-from easydel.modules.attention_module import FlexibleAttentionModule
-from easydel.modules.common import RMSNorm as RMSNorm
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.norms import RMSNorm as RMSNorm
 
 # easydel.modules
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
-	FlaxAttentionModule,
 	apply_rotary_pos_emb,
 	block_wise_ffn,
 	control_mlp_sharding,

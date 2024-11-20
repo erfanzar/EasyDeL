@@ -30,13 +30,13 @@ from jax import lax
 from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import get_logger
-from easydel.modules.attention_module import FlexibleAttentionModule
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
-	FlaxAttentionModule,
 	block_wise_ffn,
-	get_gradient_checkpoint_policy,
 	get_dot_general_by_bits,
+	get_gradient_checkpoint_policy,
 )
 from easydel.modules.gpt_j.gpt_j_configuration import GPTJConfig as GPTJConfig
 from easydel.modules.gpt_j.kernels import gptj_mlp_pallas
@@ -45,8 +45,6 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
-from easydel.modules.factory import register_module
-
 
 logger = get_logger(__name__)
 

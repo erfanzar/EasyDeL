@@ -24,7 +24,7 @@ from flax import linen as nn
 from flax.core import FrozenDict
 from jax import numpy as np
 
-from easydel.modules.common import RMSNorm
+from easydel.layers.norms import RMSNorm
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import get_gradient_checkpoint_policy
 from easydel.modules.modeling_flax_outputs import FlaxCausalLMOutput

@@ -15,8 +15,8 @@
 import functools
 import math
 import typing
-from typing import Optional, Tuple, Union
 import warnings
+from typing import Optional, Tuple, Union
 
 import chex
 import flax
@@ -30,15 +30,15 @@ from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
-from easydel.modules.attention_module import FlexibleAttentionModule
-from easydel.modules.common import RMSNorm
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.norms import RMSNorm
 from easydel.modules.deepseek_v2.deepseek_configuration import (
 	DeepseekV2Config as DeepseekV2Config,
 )
 from easydel.modules.deepseek_v2.kernels import deepseekv2_mlp_pallas
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
-	FlaxAttentionModule,
 	block_wise_ffn,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
@@ -51,7 +51,6 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxMaskedLMOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
-from easydel.modules.factory import register_module
 
 re_mat = nn_partitioning.remat
 

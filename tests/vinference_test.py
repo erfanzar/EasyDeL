@@ -61,7 +61,7 @@ def main():
 			top_p=model.generation_config.top_p,
 			top_k=model.generation_config.top_k,
 			eos_token_id=model.generation_config.eos_token_id,
-			streaming_chunks=8,
+			streaming_chunks=16,
 		),
 	)
 	print("Compiling")

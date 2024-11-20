@@ -12,17 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from easydel.layers.attention import (
+	AttentionBenchmarker,
+	AttentionMechanisms,
+	FlexibleAttentionModule,
+)
 from easydel.modules.arctic import (
 	ArcticConfig,
 	FlaxArcticForCausalLM,
 	FlaxArcticForCausalLMModule,
 	FlaxArcticModel,
 	FlaxArcticModule,
-)
-from easydel.modules.attention_module import (
-	AttentionMechanisms,
-	FlexibleAttentionModule,
-	AttentionBenchmarker,
 )
 from easydel.modules.auto_models import (
 	AutoEasyDeLConfig,
@@ -130,7 +130,6 @@ from easydel.modules.llama import (
 	LlamaConfig,
 	VisionLlamaConfig,
 )
- 
 from easydel.modules.mamba import (
 	FlaxMambaCache,
 	FlaxMambaForCausalLM,

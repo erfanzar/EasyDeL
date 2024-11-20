@@ -51,8 +51,8 @@ from transformers.modeling_flax_utils import (
 )
 
 from easydel.modules.factory import register_module
+from easydel.layers.attention import FlaxAttentionModule
 from easydel.modules.flax_modeling_utils import (
-	FlaxAttentionModule,
 	control_mlp_sharding,
 	get_gradient_checkpoint_policy,
 	with_sharding_constraint,

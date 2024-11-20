@@ -728,7 +728,7 @@ if __name__ == "__main__":
 	# test.test_gpt2()  # Passed v0.0.80 - P T Runtime
 	# test.test_grok1() # should be impl
 	# test.test_internlm2()
-	# test.test_llama()  # Passed v0.0.80 - P T Runtime
+	test.test_llama()  # Passed v0.0.80 - P T Runtime
 	# test.test_mamba()  # Passed v0.0.80 - P T Runtime
 	# test.test_mistral()  # Passed v0.0.80 - P T Runtime
 	# test.test_mixtral()  # Passed v0.0.80 - P T Runtime
@@ -739,8 +739,8 @@ if __name__ == "__main__":
 	# test.test_phi3()  # Passed v0.0.80 - P T Runtime
 	# test.test_phimoe()  # Failed v0.0.80 - P T Runtime
 	# test.test_qwen1()
-	test.test_qwen2()  # Passed v0.0.80 - P T Runtime
-	test.test_qwen2_moe()  # Passed v0.0.80 - P T Runtime
-	test.test_stablelm()  # Passed v0.0.80 - P T Runtime
+	# test.test_qwen2()  # Passed v0.0.80 - P T Runtime
+	# test.test_qwen2_moe()  # Passed v0.0.80 - P T Runtime
+	# test.test_stablelm()  # Passed v0.0.80 - P T Runtime
 	# test.test_xerxes()  # Passed v0.0.80 - P Runtime (Check)
 	# -----------------------------------------------

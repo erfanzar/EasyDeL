@@ -28,11 +28,11 @@ from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
-from easydel.modules.attention_module import FlexibleAttentionModule
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.modules.factory import register_module
 from easydel.modules.falcon.falcon_configuration import FalconConfig as FalconConfig
 from easydel.modules.falcon.kernels import falcon_mlp_pallas
 from easydel.modules.flax_modeling_utils import (
-	FlaxAttentionModule,
 	apply_rotary_pos_emb,
 	block_wise_ffn,
 	control_mlp_sharding,
@@ -46,7 +46,6 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
-from easydel.modules.factory import register_module
 
 
 def built_bloom_alibi(attention_mask, num_attention_heads):

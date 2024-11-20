@@ -28,9 +28,10 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import Array, lax
 from jax.sharding import PartitionSpec
 
-from easydel.modules.attention_module import FlexibleAttentionModule
+from easydel.layers.attention import FlexibleAttentionModule
+from easydel.layers.norms import RMSNorm
 from easydel.modules.chatglm.chatglm_configuration import ChatGLMConfig as ChatGLMConfig
-from easydel.modules.common import RMSNorm
+from easydel.modules.factory import register_module
 
 # easydel.modules
 from easydel.modules.flax_modeling_utils import (
@@ -43,7 +44,6 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
-from easydel.modules.factory import register_module
 
 
 def flatten_axes(a: Array, start: int = 0, end: int = -1) -> Array:

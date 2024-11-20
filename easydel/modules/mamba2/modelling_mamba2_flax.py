@@ -39,12 +39,8 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import eval_shape, lax
 from jax.core import ShapedArray
 
-from easydel.modules.common import (
-	Conv1D,
-)
-from easydel.modules.common import (
-	RMSNorm as FlaxMamba2RMSNorm,
-)
+from easydel.layers.common import Conv1D
+from easydel.layers.norms import RMSNorm as FlaxMamba2RMSNorm
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,

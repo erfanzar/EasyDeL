@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+from __future__ import annotations
 import argparse
 import logging
 from enum import Enum
@@ -38,6 +38,87 @@ from fjformer.jaxpruner import (
 	SteMagnitudePruning,
 	SteRandomPruning,
 )
+
+
+def set_loggers_level(level: int = logging.WARNING):
+	"""Function to set the logging level of all loggers to the specified level.
+
+	Args:
+	    level: int: The logging level to set. Defaults to
+	        logging.WARNING.
+	"""
+	logging.root.setLevel(level)
+	for handler in logging.root.handlers:
+		handler.setLevel(level)
+
+
+def define_flags_with_default(
+	_required_fields: List = None, **kwargs
+) -> Tuple[argparse.Namespace, Dict[str, Any]]:
+	"""Defines flags with default values using argparse.
+
+	Args:
+	    _required_fields: A dictionary with required flag names
+	    **kwargs: Keyword arguments representing flag names and default values.
+
+	Returns:
+	    A tuple containing:
+	        - An argparse.Namespace object containing parsed arguments.
+	        - A dictionary mapping flag names to default values.
+	"""
+	_required_fields = _required_fields if _required_fields is not None else []
+	parser = argparse.ArgumentParser()
+
+	default_values = {}
+
+	for name, value in kwargs.items():
+		default_values[name] = value
+
+		# Custom type handling:
+		if isinstance(value, tuple):
+			# For tuples, use a custom action to convert the string to a tuple of ints
+			parser.add_argument(
+				f"--{name}",
+				type=str,  # Read as string
+				default=str(value),  # Store default as string
+				help=f"Value for {name} (comma-separated integers)",
+				action=StoreTupleAction,
+			)
+		else:
+			# For other types, infer type from default value
+			parser.add_argument(
+				f"--{name}", type=type(value), default=value, help=f"Value for {name}"
+			)
+
+	args = parser.parse_args()
+	for key in _required_fields:
+		if getattr(args, key) == "":
+			raise ValueError(f"Required field {key} for argument parser.")
+	return args, default_values
+
+
+class StoreTupleAction(argparse.Action):
+	"""Custom action to store a comma-separated string as a tuple of ints."""
+
+	def __call__(self, parser, namespace, values, option_string=None):
+		try:
+			setattr(namespace, self.dest, tuple(int(v) for v in values.split(",")))
+		except ValueError:
+			raise argparse.ArgumentTypeError(
+				f"Invalid value for {option_string}: {values} "
+				f"(should be comma-separated integers)"
+			) from None
+
+
+def check_compute_capability(capability):
+	from jax._src import xla_bridge
+
+	if not "cuda" in xla_bridge.get_backend().platform_version:
+		return False
+	d, *_ = jax.local_devices(backend="gpu")
+	target = tuple(int(x) for x in capability.split("."))
+	current = tuple(int(x) for x in d.compute_capability.split("."))
+	return current >= target
 
 
 class EasyDeLOptimizers(str, Enum):
@@ -170,6 +251,9 @@ AVAILABLE_ATTENTION_MECHANISMS = Literal[
 DEFAULT_ATTENTION_MECHANISM = (
 	"sdpa" if jax.extend.backend.get_backend().platform == "gpu" else "vanilla"
 )
+if DEFAULT_ATTENTION_MECHANISM == "sdpa":
+	if not check_compute_capability("8.0"):
+		DEFAULT_ATTENTION_MECHANISM = "vanilla"
 AVAILABLE_SPARSE_MODULE_TYPES = Literal["bcoo", "bcsr", "coo", "csr"]
 
 _LOGGING_LEVELS = dict(
@@ -210,73 +294,3 @@ def get_logger(
 	console_handler.setFormatter(formatter)
 	logger.addHandler(console_handler)
 	return logger
-
-
-def set_loggers_level(level: int = logging.WARNING):
-	"""Function to set the logging level of all loggers to the specified level.
-
-	Args:
-	    level: int: The logging level to set. Defaults to
-	        logging.WARNING.
-	"""
-	logging.root.setLevel(level)
-	for handler in logging.root.handlers:
-		handler.setLevel(level)
-
-
-def define_flags_with_default(
-	_required_fields: List = None, **kwargs
-) -> Tuple[argparse.Namespace, Dict[str, Any]]:
-	"""Defines flags with default values using argparse.
-
-	Args:
-	    _required_fields: A dictionary with required flag names
-	    **kwargs: Keyword arguments representing flag names and default values.
-
-	Returns:
-	    A tuple containing:
-	        - An argparse.Namespace object containing parsed arguments.
-	        - A dictionary mapping flag names to default values.
-	"""
-	_required_fields = _required_fields if _required_fields is not None else []
-	parser = argparse.ArgumentParser()
-
-	default_values = {}
-
-	for name, value in kwargs.items():
-		default_values[name] = value
-
-		# Custom type handling:
-		if isinstance(value, tuple):
-			# For tuples, use a custom action to convert the string to a tuple of ints
-			parser.add_argument(
-				f"--{name}",
-				type=str,  # Read as string
-				default=str(value),  # Store default as string
-				help=f"Value for {name} (comma-separated integers)",
-				action=StoreTupleAction,
-			)
-		else:
-			# For other types, infer type from default value
-			parser.add_argument(
-				f"--{name}", type=type(value), default=value, help=f"Value for {name}"
-			)
-
-	args = parser.parse_args()
-	for key in _required_fields:
-		if getattr(args, key) == "":
-			raise ValueError(f"Required field {key} for argument parser.")
-	return args, default_values
-
-
-class StoreTupleAction(argparse.Action):
-	"""Custom action to store a comma-separated string as a tuple of ints."""
-
-	def __call__(self, parser, namespace, values, option_string=None):
-		try:
-			setattr(namespace, self.dest, tuple(int(v) for v in values.split(",")))
-		except ValueError:
-			raise argparse.ArgumentTypeError(
-				f"Invalid value for {option_string}: {values} "
-				f"(should be comma-separated integers)"
-			) from None

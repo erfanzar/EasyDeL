@@ -25,9 +25,9 @@ from flax.linen import Dense
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
+from easydel.layers.attention import FlaxAttentionModule
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
-	FlaxAttentionModule,
 	control_mlp_sharding,
 	get_gradient_checkpoint_policy,
 	with_sharding_constraint,

@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,14 +26,13 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import get_logger
-from easydel.modules.attention_module import FlexibleAttentionModule
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.modules.flax_modeling_utils import (
-	FlaxAttentionModule,
 	apply_rotary_pos_emb,
 	get_dot_general_by_bits,
 	with_sharding_constraint,
 )
-from src.easydel.modules.zamba2.zamba2_configuration import Zamba2Config
+from easydel.modules.zamba2.zamba2_configuration import Zamba2Config
 
 re_mat = nn_partitioning.remat
 logger = get_logger(__name__)
@@ -273,7 +271,7 @@ class FlaxZamba2Attention(FlaxAttentionModule):
 				query_states,
 				attention_mask,
 			)
- 
+
 		attention_bias = lax.select(
 			attention_mask > 0,
 			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -320,4 +318,3 @@ class FlaxZamba2Attention(FlaxAttentionModule):
 			else (attn_output,)
 		)
 		return outputs
-

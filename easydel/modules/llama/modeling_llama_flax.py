@@ -27,18 +27,16 @@ from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
-
-from easydel.modules.attention_module import FlexibleAttentionModule
-from easydel.modules.common import RMSNorm
+from easydel.layers.rotary_embedding import get_rope
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.norms import RMSNorm
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
-	FlaxAttentionModule,
-	apply_rotary_pos_emb,
 	block_wise_ffn,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
-	precompute_frequencies,
 	with_sharding_constraint,
 )
 
@@ -51,22 +49,6 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxSequenceClassifierOutput,
 )
 from easydel.modules.modeling_utils import EDPretrainedModel
-from easydel.modules.factory import register_module
-
-
-class FlaxLlamaEmbedding(nn.Module):
-	dtype: jnp.dtype = jnp.float32
-
-	def __call__(self, query, key, frequencies, position_ids):
-		sin, cos = frequencies
-
-		sin = sin[position_ids][:, None, :, :]
-		cos = cos[position_ids][:, None, :, :]
-
-		key = apply_rotary_pos_emb(key, sin, cos)
-		query = apply_rotary_pos_emb(query, sin, cos)
-
-		return query.astype(self.dtype), key.astype(self.dtype)
 
 
 class FlaxLlamaAttention(FlaxAttentionModule):
@@ -135,8 +117,28 @@ class FlaxLlamaAttention(FlaxAttentionModule):
 			precision=self.precision,
 			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
 		)
+		rope_scaling = None
+		if config.rope_scaling is not None:
+			original_max_position_embeddings = config.rope_scaling.get(
+				"original_max_position_embeddings", None
+			)
+			rope_scaling = dict(
+				rope_type=config.rope_scaling.get("type", config.rope_scaling.get("rope_type")),
+				factor=config.rope_scaling.get("factor"),
+				low_freq_factor=config.rope_scaling.get("low_freq_factor", None),
+				high_freq_factor=config.rope_scaling.get("high_freq_factor", None),
+				original_max_position_embeddings=original_max_position_embeddings,
+			)
 
-		self.rotary = FlaxLlamaEmbedding(self.dtype)
+		head_dim = config.hidden_size // config.num_attention_heads
+		self.rotary = get_rope(
+			head_size=getattr(config, "head_dim", head_dim),
+			rotary_dim=getattr(config, "head_dim", head_dim),
+			base=self.config.rope_theta,
+			max_position=self.config.granted_freq_max_position_embedding,
+			is_neox_style=True,
+			rope_scaling=rope_scaling,
+		)
 
 		self.attention_performer = FlexibleAttentionModule(
 			attention_dropout=self.config.attention_dropout,
@@ -166,36 +168,9 @@ class FlaxLlamaAttention(FlaxAttentionModule):
 		"""
 		return hidden_states.reshape(hidden_states.shape[:2] + (-1,))
 
-	def apply_rotary(self, query, key, frequencies, position_ids):
-		"""
-		Applies rotary positional embeddings to the query and key tensors.
-
-		Args:
-		    query (chex.Array): Query tensor.
-		    key (chex.Array): Key tensor.
-		    frequencies (Tuple[chex.Array, chex.Array]): Tuple containing cosine and sine components for rotary embeddings.
-		    position_ids (chex.Array): Position indices for the tokens.
-
-		Returns:
-		    Tuple[chex.Array, chex.Array]: The modified query and key tensors after applying rotary embeddings.
-		"""
-
-		query, key = self._transpose_sequence_head(
-			query,
-			key,
-		)
-		query, key = self.rotary(
-			position_ids=position_ids,
-			query=query,
-			key=key,
-			frequencies=frequencies,
-		)
-		return self._transpose_sequence_head(query, key)
-
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		frequencies: Tuple[chex.Array, chex.Array],
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
@@ -210,7 +185,6 @@ class FlaxLlamaAttention(FlaxAttentionModule):
 
 		Args:
 		    hidden_states (chex.Array): Input hidden states.
-		    frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
 		    attention_mask (chex.Array): Mask to apply on the attention scores.
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
@@ -248,11 +222,10 @@ class FlaxLlamaAttention(FlaxAttentionModule):
 			self.head_dim,
 		)
 
-		query_states, key_states = self.apply_rotary(
+		query_states, key_states = self.rotary(
+			positions=position_ids,
 			query=query_states,
 			key=key_states,
-			position_ids=position_ids,
-			frequencies=frequencies,
 		)
 
 		query_length, key_length = query_states.shape[1], key_states.shape[1]
@@ -429,7 +402,7 @@ class FlaxLlamaBlock(nn.Module):
 		if self.config.gradient_checkpointing != "":
 			attn_block = nn_partitioning.remat(
 				FlaxLlamaAttention,
-				static_argnums=(1, 3, 4, 6, 7, 8),
+				static_argnums=(1, 2, 3, 5, 6, 7),
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 			)
 
@@ -470,7 +443,6 @@ class FlaxLlamaBlock(nn.Module):
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		frequencies: Tuple[chex.Array, chex.Array],
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
@@ -485,7 +457,6 @@ class FlaxLlamaBlock(nn.Module):
 
 		Args:
 		    hidden_states (chex.Array): Input hidden states.
-		    frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
 		    attention_mask (chex.Array): Mask to apply on the attention scores.
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
@@ -499,7 +470,6 @@ class FlaxLlamaBlock(nn.Module):
 		"""
 		attn_outputs = self.self_attn(
 			self.input_layernorm(hidden_states),
-			frequencies,
 			attention_mask,
 			position_ids,
 			causal_mask,
@@ -804,7 +774,6 @@ class FlaxLlamaBlockCollection(nn.Module):
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		frequencies: Tuple[chex.Array, chex.Array],
 		attention_mask: chex.Array,
 		causal_mask: chex.Array,
 		position_ids: chex.Array,
@@ -819,7 +788,6 @@ class FlaxLlamaBlockCollection(nn.Module):
 
 		Args:
 		    hidden_states (chex.Array): Input tensor containing the hidden states.
-		    frequencies (Tuple[chex.Array, chex.Array]): Frequency positional encodings.
 		    attention_mask (chex.Array): Mask to apply during attention.
 		    causal_mask (chex.Array): Causal mask for autoregressive decoding.
 		    position_ids (chex.Array): Positional indices for the sequence.
@@ -865,7 +833,6 @@ class FlaxLlamaBlockCollection(nn.Module):
 
 			layer_outputs = block(
 				hidden_states=hidden_states,
-				frequencies=frequencies,
 				attention_mask=attention_mask,
 				position_ids=position_ids,
 				causal_mask=causal_mask,
@@ -912,48 +879,12 @@ class FlaxLlamaModule(nn.Module):
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 		)
-		config = self.config
 		self.causal_mask = nn.make_causal_mask(
 			jnp.ones(
 				shape=(1, self.config.granted_mask_max_position_embedding),
 				dtype="bool",
 			),
 			dtype="bool",
-		)
-
-		initial_rope_kwargs = dict(rope_type="none")
-		if config.rope_scaling is not None:
-			scaling_type = config.rope_scaling.get(
-				"type",
-				config.rope_scaling.get("rope_type"),
-			)
-			scaling_factor = config.rope_scaling.get("factor")
-
-			low_freq_factor = config.rope_scaling.get(
-				"low_freq_factor",
-				None,
-			)
-			high_freq_factor = config.rope_scaling.get(
-				"high_freq_factor",
-				None,
-			)
-			original_max_position_embeddings = config.rope_scaling.get(
-				"original_max_position_embeddings",
-				None,
-			)
-			initial_rope_kwargs = dict(
-				scaling_factor=scaling_factor,
-				rope_type=scaling_type,
-				low_freq_factor=low_freq_factor,
-				high_freq_factor=high_freq_factor,
-				original_max_position_embeddings=original_max_position_embeddings,
-			)
-
-		self.frequencies = precompute_frequencies(
-			max_position_embeddings=self.config.granted_freq_max_position_embedding,
-			dim=getattr(config, "head_dim", config.hidden_size // config.num_attention_heads),
-			base=config.rope_theta,
-			**initial_rope_kwargs,
 		)
 
 	def __call__(
@@ -1003,7 +934,6 @@ class FlaxLlamaModule(nn.Module):
 
 		outputs = self.layers(
 			hidden_states=input_embeds,
-			frequencies=self.frequencies,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			causal_mask=self.causal_mask,
