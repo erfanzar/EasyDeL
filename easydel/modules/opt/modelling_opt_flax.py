@@ -47,8 +47,8 @@ from jax.sharding import PartitionSpec
 from transformers import logging
 from transformers.modeling_flax_utils import ACT2FN
 
-from easydel.modules.factory import register_module
 from easydel.layers.attention import FlaxAttentionModule
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	control_mlp_sharding,
 	get_gradient_checkpoint_policy,
@@ -58,7 +58,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxMaskedLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.opt.opt_configuration import OPTConfig as OPTConfig
 
 logger = logging.get_logger(__name__)
@@ -477,7 +477,7 @@ class FlaxOPTDecoder(nn.Module):
 		)
 
 
-class FlaxOPTPreTrainedModel(EDPretrainedModel):
+class FlaxOPTPreTrainedModel(EasyDeLBaseModule):
 	config_class = OPTConfig
 	base_model_prefix: str = "model"
 	module_class: nn.Module = None

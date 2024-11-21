@@ -46,7 +46,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.phimoe.kernels import phimoe_mlp_pallas
 from easydel.modules.phimoe.phimoe_configuration import PhiMoeConfig as PhiMoeConfig
 
@@ -981,7 +981,7 @@ class FlaxPhiMoeForCausalLMModule(nn.Module):
 		)
 
 
-class FlaxPhiPreTrainedModel(EDPretrainedModel):
+class FlaxPhiPreTrainedModel(EasyDeLBaseModule):
 	"""Phi pre-trained model."""
 
 	module_class = None

@@ -44,7 +44,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 logger = get_logger(__name__)
 
@@ -433,7 +433,7 @@ class FlaxGPTJBlock(nn.Module):
 		return (hidden_states,) + attn_outputs[1:]
 
 
-class FlaxGPTJPreTrainedModel(EDPretrainedModel):
+class FlaxGPTJPreTrainedModel(EasyDeLBaseModule):
 	config_class = GPTJConfig
 	base_model_prefix = "transformer"
 	module_class: nn.Module = None

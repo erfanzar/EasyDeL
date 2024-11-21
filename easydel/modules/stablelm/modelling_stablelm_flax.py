@@ -45,7 +45,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.stablelm.kernels import stablelm_mlp_pallas
 from easydel.modules.stablelm.stablelm_configuration import (
 	StableLmConfig as StableLmConfig,
@@ -626,7 +626,7 @@ class FlaxStableLmDecoderLayer(nn.Module):
 		return outputs
 
 
-class FlaxStableLmPreTrainedModel(EDPretrainedModel):
+class FlaxStableLmPreTrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for StableLm models providing initialization and configuration.
 

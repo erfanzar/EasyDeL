@@ -17,7 +17,7 @@ from abc import ABC
 from typing import Callable, Dict, Optional, Union
 
 from easydel.etils.etils import get_logger
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.trainers.base_trainer import TrainerConfigureDataloaderOutput
 from easydel.trainers.causal_language_model_trainer import CausalLanguageModelTrainer
 from easydel.trainers.training_configurations import TrainingArguments
@@ -191,7 +191,7 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
 		self,
 		arguments: TrainingArguments,
 		tokenizer: "PreTrainedTokenizerBase",  # noqa # type:ignore
-		model: Optional[EDPretrainedModel] = None,
+		model: Optional[EasyDeLBaseModule] = None,
 		train_dataset: Optional["Dataset"] = None,  # noqa # type:ignore
 		eval_dataset: Optional[
 			Union["Dataset", Dict[str, "Dataset"]]  # noqa # type:ignore

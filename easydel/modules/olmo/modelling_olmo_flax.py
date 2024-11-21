@@ -47,7 +47,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.olmo.kernels import olmo_mlp_pallas
 from easydel.modules.olmo.olmo_configuration import OlmoConfig
 
@@ -490,7 +490,7 @@ class FlaxOlmoDecoderLayer(nn.Module):
 		return outputs
 
 
-class FlaxOlmoPretrainedModel(EDPretrainedModel):
+class FlaxOlmoPretrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for Olmo models providing initialization and configuration.
 

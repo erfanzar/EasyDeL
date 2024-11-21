@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from dataclasses import dataclass
 import functools
 import math
 import os
@@ -21,14 +22,12 @@ from functools import lru_cache, partial
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 import einops
 import fjformer
-import flax
+import flax.nnx as nn
 import jax
 import jax.extend
 import jax.lib
 from chex import Array
 from fjformer import with_sharding_constraint
-from flax.linen.dtypes import promote_dtype
-from flax.struct import dataclass
 from jax import lax, random
 from jax import numpy as jnp
 from jax.experimental.pallas.ops.tpu.splash_attention import (
@@ -55,14 +54,12 @@ from easydel.etils.partition_module import PartitionAxis
 from easydel.kernels.flash_attention_2 import create_flash_attention
 from easydel.kernels.ring_attention import ring_attention
 from easydel.layers._blockwise_attention import blockwise_attn
-from easydel.modules.modeling_utils import EDPretrainedConfig
+from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
 import jax
 import jax.experimental
 import jax.tree_util
-from fjformer.dtypes import Array8Bit, ArrayNF4
-from flax import linen as nn
-from flax.linen import combine_masks
+from flax.nnx.nn.dtypes import promote_dtype
 
 try:
 	from flash_attn_jax import flash_mha as cuda_flash_attn2_mha  # noqa #type:ignore
@@ -123,198 +120,6 @@ DEFAULT_K_BLOCK = 128
 DEFAULT_Q_BLOCK = 64
 
 PRINT_COMMON = False
-
-
-class FlaxAttentionModule(nn.Module):
-	config: "EDPretrainedConfig"  # type: ignore  # noqa
-
-	@staticmethod
-	def _transpose_sequence_head(*args):
-		"""The _transpose_sequence_head function transposes the query, key and value matrices.
-
-		Args:
-		    *args: arrays to transpose
-
-		Returns:
-		    The transpose of the query, key and value matrices
-		"""
-		return map(lambda x: jnp.transpose(x, (0, 2, 1, 3)), args)
-
-	@nn.compact
-	def _concatenate_to_cache(self, key, value, query_states, attention_mask):
-		"""The _concatenate_to_cache function is used to concatenate the key and value vectors
-		of a query_states with those of previous queries. This allows for the attention mechanism to
-		look at all previous queries when computing its output. The function takes in three
-		arguments: key, value, and query_states. It also uses two variables that are stored in the cache:
-		cached_key and cached_value.
-
-		Args:
-		    self: Access the variables stored in the cache
-		    key: Store the keys of the encoder-decoder attention
-		    value: Initialize the cached_value variable
-		    query_states: Determine the number of cache vectors to update
-		    attention_mask: Mask out the padded vectors in the cache
-
-		Returns:
-		    The key, value and attention_mask
-		"""
-		paxs: PartitionAxis = self.config.partition_axis
-		do_quantize_kv_cache = self.config.quantize_kv_cache
-		quantization_method = self.config.kv_cache_quantization_method
-		kv_partition = PartitionSpec(
-			paxs.batch_axis,
-			paxs.key_sequence_axis,
-			paxs.head_axis,
-			paxs.attention_dim_axis,
-		)
-		generation_kv_partition = PartitionSpec(
-			paxs.batch_axis,
-			None,
-			paxs.head_axis,
-			paxs.attention_dim_axis,
-		)
-		is_initialized = self.has_variable("cache", "cached_key")
-		if do_quantize_kv_cache:
-			match quantization_method:
-				case "8bit":
-					cached_key = self.variable(
-						"cache",
-						"cached_key",
-						lambda: Array8Bit.quantize(
-							jnp.zeros(key.shape, dtype=key.dtype, device=kv_partition),
-							qk=32,
-							platform="jax",
-						),
-					)
-					cached_value = self.variable(
-						"cache",
-						"cached_value",
-						lambda: Array8Bit.quantize(
-							jnp.zeros(value.shape, dtype=value.dtype, device=kv_partition),
-							qk=32,
-							platform="jax",
-						),
-					)
-				case "nf4":
-					cached_key = self.variable(
-						"cache",
-						"cached_key",
-						lambda: ArrayNF4.quantize(
-							jnp.zeros(key.shape, dtype=key.dtype, device=kv_partition),
-							128,
-						),
-					)
-					cached_value = self.variable(
-						"cache",
-						"cached_value",
-						lambda: ArrayNF4.quantize(
-							jnp.zeros(value.shape, dtype=value.dtype, device=kv_partition),
-							128,
-						),
-					)
-				case _:
-					raise NotImplementedError("unsupported kv cache quantization method.")
-		else:
-			cached_key = self.variable(
-				"cache",
-				"cached_key",
-				lambda: jnp.zeros(shape=key.shape, dtype=key.dtype, device=kv_partition),
-			)
-			cached_value = self.variable(
-				"cache",
-				"cached_value",
-				lambda: jnp.zeros(shape=key.shape, dtype=key.dtype, device=kv_partition),
-			)
-		cache_index = self.variable(
-			"cache",
-			"cache_index",
-			lambda: jnp.array(0, dtype=jnp.int32),
-		)
-		if is_initialized:
-			*batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
-			cur_index = cache_index.value
-			if (
-				query_states.shape[1] == 1
-				and self.config.use_sharded_kv_caching
-				and not do_quantize_kv_cache
-			):
-				mesh = self.config.mesh
-
-				def fn(_cached_key, _cached_value, _key, _value, _cur_index):
-					assert _key.shape[1] == 1 and _value.shape[1] == 1, (
-						_key.shape,
-						_value.shape,
-					)
-					sp_size = max_length // mesh.shape["sp"]
-					axis_index = jax.lax.axis_index("sp")
-					_cur_index = _cur_index - axis_index * sp_size
-					_key, _value = jax.lax.cond(
-						jnp.logical_and(_cur_index >= 0, _cur_index < sp_size),
-						lambda: (
-							_cached_key.at[:, _cur_index].set(_key[:, -1]),
-							_cached_value.at[:, _cur_index].set(_value[:, -1]),
-						),
-						lambda: (_cached_key, _cached_value),
-					)
-					return _key, _value
-
-				fn = shard_map(
-					fn,
-					mesh=mesh,
-					in_specs=(
-						kv_partition,
-						kv_partition,
-						generation_kv_partition,
-						generation_kv_partition,
-						PartitionSpec(),
-					),
-					out_specs=(kv_partition, kv_partition),
-					check_rep=False,
-				)
-				key, value = fn(cached_key.value, cached_value.value, key, value, cur_index)
-			else:
-				*batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
-				cur_index = cache_index.value
-				indices = (0,) * len(batch_dims) + (cur_index, 0, 0)  # type:ignore
-				key_val = cached_key.value
-				value_val = cached_value.value
-				if hasattr(key_val, "materialize"):
-					key_val = key_val.materialize()
-				if hasattr(value_val, "materialize"):
-					value_val = value_val.materialize()
-
-				key = lax.dynamic_update_slice(key_val, key, indices)
-				value = lax.dynamic_update_slice(value_val, value, indices)
-				num_updated_cache_vectors = query_states.shape[1]
-				pad_mask = jnp.broadcast_to(
-					jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
-					tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
-				)
-				attention_mask = combine_masks(pad_mask, attention_mask)
-			if do_quantize_kv_cache:
-				match quantization_method:
-					case "8bit":
-						cached_key.value = Array8Bit.quantize(key, qk=32, platform="jax")
-						cached_value.value = Array8Bit.quantize(value, qk=32, platform="jax")
-					case "nf4":
-						cached_key.value = ArrayNF4.quantize(key, 128)
-						cached_value.value = ArrayNF4.quantize(value, 128)
-					case _:
-						raise NotImplementedError("unsupported kv cache quantization method.")
-			else:
-				cached_key.value = with_sharding_constraint(key, kv_partition)
-				cached_value.value = with_sharding_constraint(value, kv_partition)
-
-			num_updated_cache_vectors = query_states.shape[1]
-			cache_index.value = cache_index.value + num_updated_cache_vectors
-		return key, value, attention_mask
-
-	@staticmethod
-	def repeat_key_value(key, value, num_reps: int):
-		return (
-			einops.repeat(key, "b s h d -> b s (h r) d", r=num_reps),
-			einops.repeat(value, "b s h d -> b s (h r) d", r=num_reps),
-		)
 
 
 @lru_cache
@@ -426,7 +231,7 @@ def set_attrs_smartly_with_prp(
 	attr_name: str,
 	default: Any,
 	new_attr: Any,
-	prp: EDPretrainedConfig = None,
+	prp: EasyDeLBaseConfig = None,
 	pickup_name=None,
 ):
 	if not hasattr(self, attr_name) or getattr(self, attr_name, ...) == Ellipsis:
@@ -523,7 +328,7 @@ class FlexibleAttentionModule(object):
 		platform: EasyDeLPlatforms = ...,
 		backend: Optional[EasyDeLBackends] = ...,
 		backward_pass_impl: Literal["triton", "xla"] = "triton",
-		base_config: Optional[EDPretrainedConfig] = None,
+		base_config: Optional[EasyDeLBaseConfig] = None,
 		_do_check: bool = True,
 	):
 		self.block_k: int = ...
@@ -1648,14 +1453,14 @@ class AttentionBenchmarker:
 		)
 
 		# Create attention masks
-		causal_mask = flax.linen.attention.make_causal_mask(
+		causal_mask = nn.make_causal_mask(
 			jnp.ones((self.config.batch_size, self.config.sequence_length))
 		)
 		attention_mask = jnp.ones((self.config.batch_size, self.config.sequence_length))
 		attention_mask = attention_mask.at[:, self.config.sequence_length // 2 :].set(0)
 
 		bias = jnp.where(
-			flax.linen.attention.combine_masks(
+			nn.combine_masks(
 				jnp.expand_dims(jnp.expand_dims(attention_mask, 1), 1),
 				causal_mask,
 			),
@@ -1684,7 +1489,7 @@ class AttentionBenchmarker:
 	def _create_attention_fn(self, attention_type: str):
 		"""Create attention function based on type."""
 		if attention_type == "dot_product":
-			return lambda q, k, v, b, _: flax.linen.dot_product_attention(q, k, v, b)
+			return lambda q, k, v, b, _: nn.dot_product_attention(q, k, v, b)
 
 		return lambda q, k, v, b, mask: FlexibleAttentionModule(
 			attn_mechanism=attention_type,

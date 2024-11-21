@@ -26,7 +26,7 @@ from jax import numpy as jnp
 
 from easydel.modules.factory import register_module
 from easydel.modules.modeling_flax_outputs import ModelOutput
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.rwkv.rwkv_configuration import RwkvConfig as RwkvConfig
 
 
@@ -625,7 +625,7 @@ class FlaxRwkvForCausalLMModule(nn.Module):
 		)
 
 
-class FlaxRwkvPretrainedModel(EDPretrainedModel):
+class FlaxRwkvPretrainedModel(EasyDeLBaseModule):
 	module_class: nn.Module
 	config_class = RwkvConfig
 

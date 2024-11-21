@@ -47,7 +47,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxMaskedLMOutput,
 	FlaxSequenceClassifierOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.qwen2_moe.configuration_qwen2_moe import (
 	Qwen2MoeConfig as Qwen2MoeConfig,
 )
@@ -705,7 +705,7 @@ class FlaxQwen2MoeBlock(nn.Module):
 		return (hidden_states,) + attn_outputs[1:] + (router_logits,)
 
 
-class FlaxQwen2MoePreTrainedModel(EDPretrainedModel):
+class FlaxQwen2MoePreTrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for Qwen2Moe models providing initialization and configuration.
 

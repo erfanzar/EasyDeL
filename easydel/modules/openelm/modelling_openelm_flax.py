@@ -45,7 +45,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.openelm.kernels import openelm_mlp_pallas
 from easydel.modules.openelm.openelm_configuration import (
 	OpenELMConfig as OpenELMConfig,
@@ -845,7 +845,7 @@ class FlaxOpenELMModule(nn.Module):
 		)
 
 
-class FlaxOpenELMPretrainedModel(EDPretrainedModel):
+class FlaxOpenELMPretrainedModel(EasyDeLBaseModule):
 	config_class = OpenELMConfig
 	base_model_prefix = "openelm"
 	module_class: nn.Module = None

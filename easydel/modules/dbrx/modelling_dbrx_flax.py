@@ -50,7 +50,7 @@ from easydel.modules.flax_modeling_utils import (
 	with_sharding_constraint,
 )
 from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 
 @flax.struct.dataclass
@@ -790,7 +790,7 @@ class FlaxDbrxBlockCollection(nn.Module):
 		)
 
 
-class DbrxPreTrainedModel(EDPretrainedModel):
+class DbrxPreTrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for DBrX models providing initialization and configuration.
 

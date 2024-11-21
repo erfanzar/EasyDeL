@@ -41,21 +41,19 @@ class EasyQuantizer:
 	def __call__(self, array) -> chex.Array:
 		match self.quantization_method:
 			case EasyDeLQuantizationMethods.A8BIT:
-				return Array8Bit.quantize(
-					array=array,
-					platform=self.quantization_platform,
-					q8=64,
-				)
+				return Array8Bit.quantize(array=array, q8=self.block_size)
 			case EasyDeLQuantizationMethods.A8Q:
-				return A8Q.quantize(array=array, q8=32)
+				return A8Q.quantize(array=array, q8=self.block_size)
 			case EasyDeLQuantizationMethods.A4Q:
-				return A4Q.quantize(array=array, q4=64)
+				return A4Q.quantize(array=array, q4=self.block_size)
 			case EasyDeLQuantizationMethods.NF4:
 				should_be_quantized = True
 				if array.size % self.block_size != 0:
 					should_be_quantized = False
 				if should_be_quantized:
 					return ArrayNF4.quantize(array=array, bs=self.block_size)
+				return array
+			case EasyDeLQuantizationMethods.NONE:
 				return array
 			case _:
 				raise ValueError(f"unknown quantization_method {self.quantization_method}.")

@@ -50,7 +50,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 	FlaxMaskedLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 re_mat = nn_partitioning.remat
 
@@ -1070,7 +1070,7 @@ class FlaxDeepseekV2Module(nn.Module):
 		)
 
 
-class DeepseekV2PreTrainedModel(EDPretrainedModel):
+class DeepseekV2PreTrainedModel(EasyDeLBaseModule):
 	config_class: DeepseekV2Config = DeepseekV2Config
 	module_class: nn.Module = None
 	base_model_prefix = "model"

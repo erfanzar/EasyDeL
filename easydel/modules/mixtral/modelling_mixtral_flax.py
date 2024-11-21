@@ -45,7 +45,7 @@ from easydel.modules.flax_modeling_utils import (
 from easydel.modules.mixtral.kernels import mixtral_mlp_pallas
 from easydel.modules.mixtral.mixtral_configuration import MixtralConfig as MixtralConfig
 from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 re_mat = nn_partitioning.remat
 
@@ -714,7 +714,7 @@ class FlaxMixtralDecoderLayerCollection(nn.Module):
 		return outputs
 
 
-class MixtralPreTrainedModel(EDPretrainedModel):
+class MixtralPreTrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for Mixtral models providing initialization and configuration.
 

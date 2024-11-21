@@ -50,8 +50,8 @@ from transformers.modeling_flax_utils import (
 	ACT2FN,
 )
 
-from easydel.modules.factory import register_module
 from easydel.layers.attention import FlaxAttentionModule
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	control_mlp_sharding,
 	get_gradient_checkpoint_policy,
@@ -63,7 +63,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxSeq2SeqLMOutput,
 	FlaxSeq2SeqModelOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.t5.kernels import t5_mlp_pallas
 from easydel.modules.t5.t5_configuration import T5Config as T5Config
 
@@ -887,7 +887,7 @@ class FlaxT5Stack(nn.Module):
 		)
 
 
-class FlaxT5PreTrainedModel(EDPretrainedModel):
+class FlaxT5PreTrainedModel(EasyDeLBaseModule):
 	config_class = T5Config
 	base_model_prefix = "transformer"
 	module_class: nn.Module = None

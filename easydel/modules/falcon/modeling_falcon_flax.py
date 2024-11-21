@@ -45,7 +45,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 
 def built_bloom_alibi(attention_mask, num_attention_heads):
@@ -865,7 +865,7 @@ class FlaxFalconModule(nn.Module):
 			)
 
 
-class FlaxFalconPretrainedModel(EDPretrainedModel):
+class FlaxFalconPretrainedModel(EasyDeLBaseModule):
 	module_class: nn.Module = None
 	config_class = FalconConfig
 

@@ -47,7 +47,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 re_mat = nn_partitioning.remat
 logger = get_logger(__name__)
@@ -494,7 +494,7 @@ class FlaxExaoneDecoderLayer(nn.Module):
 		return outputs
 
 
-class FlaxExaonePretrainedModel(EDPretrainedModel):
+class FlaxExaonePretrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for Exaone models providing initialization and configuration.
 

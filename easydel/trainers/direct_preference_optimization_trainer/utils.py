@@ -23,7 +23,7 @@ import jax
 from jax import numpy as jnp
 from transformers import PreTrainedTokenizerBase
 
-from easydel.modules import EDPretrainedModel
+from easydel.modules import EasyDeLBaseModule
 from easydel.trainers.direct_preference_optimization_trainer.dpo_config import DPOConfig
 from easydel.trainers.utils import add_bos_token_if_needed, add_eos_token_if_needed
 
@@ -205,7 +205,7 @@ def leave_alone_context_manager():
 
 
 def build_tokenize(
-	model: Optional[EDPretrainedModel] = None,
+	model: Optional[EasyDeLBaseModule] = None,
 	args: Optional[DPOConfig] = None,
 ):
 	def _tokenize(

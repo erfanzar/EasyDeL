@@ -38,7 +38,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.mosaic_mpt.kernels import mpt_mlp_pallas
 from easydel.modules.mosaic_mpt.mosaic_configuration import (
 	MptConfig as MptConfig,
@@ -582,7 +582,7 @@ class FlaxMptModule(nn.Module):
 		return (hidden_states, all_hidden_states, all_attentions)
 
 
-class FlaxMptPretrainedModel(EDPretrainedModel):
+class FlaxMptPretrainedModel(EasyDeLBaseModule):
 	module_class: nn.Module = None
 	config_class: MptConfig = MptConfig
 

@@ -46,7 +46,7 @@ from easydel.modules.flax_modeling_utils import (
 from easydel.modules.grok_1.grok_1_configuration import Grok1Config as Grok1Config
 from easydel.modules.grok_1.kernels import grok1_mlp_pallas
 from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 re_mat = flax.linen.partitioning.remat
 
@@ -766,7 +766,7 @@ class FlaxGrok1DecoderLayerCollection(nn.Module):
 		return outputs
 
 
-class Grok1PreTrainedModel(EDPretrainedModel):
+class Grok1PreTrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for Grok1 models providing initialization and configuration.
 

@@ -33,7 +33,7 @@ import chex
 import fjformer
 import fjformer.sharding
 import flax
-import flax.linen
+import flax.nnx as nn
 import jax
 import jax.extend
 import jax.tree_util
@@ -46,8 +46,8 @@ from jax import numpy as jnp
 from jax.experimental.mesh_utils import create_device_mesh
 from jax.sharding import Mesh, PartitionSpec
 from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_flax_utils import FlaxPreTrainedModel
 from transformers.utils.generic import working_or_temp_dir
+from transformers.utils.hub import PushToHubMixin
 
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.etils import (
@@ -125,7 +125,7 @@ warnings.filterwarnings(
 warnings.filterwarnings("ignore", message="You are using a model of type")
 
 
-class EDPretrainedConfig(PretrainedConfig):
+class EasyDeLBaseConfig(PretrainedConfig):
 	"""It initializes all the attributes of an object, and it's called when you create a new instance of that class.
 
 	Args:
@@ -849,28 +849,13 @@ class EDPretrainedConfig(PretrainedConfig):
 		return cls.from_dict(config_dict, **kwargs)
 
 
-class EDPretrainedModel(FlaxPreTrainedModel):
+class EasyDeLBaseModule(PushToHubMixin, nn.Module):
 	def __init__(
 		self,
-		config: Optional[PretrainedConfig] = None,
-		module: Optional[flax.linen.Module] = None,
-		input_shape: Tuple = (AVAILALBE_DEVICES, AVAILALBE_DEVICES),
-		seed: int = 0,
-		dtype: jnp.dtype = jnp.float32,
-		param_dtype: jnp.dtype = jnp.float32,  # Ignored
-		precision: Optional[Union[jax.lax.Precision, str]] = None,  # Ignored
-		_do_init: bool = True,
+		config: PretrainedConfig,
 	):
-		assert config is not None, "`config` must be provided.`"
-		assert module is not None, "`module` must be provided.`"
-		super().__init__(
-			config=config,
-			module=module,
-			input_shape=input_shape,
-			seed=seed,
-			dtype=dtype,
-			_do_init=_do_init,
-		)
+		self.config = config
+		super().__init__()
 
 	@property
 	def mesh(self):
@@ -1083,7 +1068,7 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 		return self.__repr__()
 
 	@property
-	def config(self) -> EDPretrainedConfig:
+	def config(self) -> EasyDeLBaseConfig:
 		return self._config  # type:ignore
 
 	def to_easydel_state(
@@ -1348,7 +1333,7 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 		verbose: bool = True,
 		mismatch_allowed: bool = True,
 		*model_args,
-		config: Optional[Union[EDPretrainedConfig, str, os.PathLike]] = None,
+		config: Optional[Union[EasyDeLBaseConfig, str, os.PathLike]] = None,
 		cache_dir: Optional[Union[str, os.PathLike]] = None,
 		ignore_mismatched_sizes: bool = False,
 		force_download: bool = False,
@@ -1361,8 +1346,8 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 		loads EasyDeL Models
 		"""
 
-		from transformers import GenerationConfig
 		from huggingface_hub import HfApi
+		from transformers import GenerationConfig
 		from transformers.utils import download_url as _download_url
 		from transformers.utils import is_offline_mode as _is_offline_mode
 		from transformers.utils import is_remote_url as _is_remote_url
@@ -1412,7 +1397,7 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 		if config_kwargs is not None:
 			for k, v in config_kwargs.items():
 				setattr(config, k, v)
-		_, model_kwargs = EDPretrainedConfig.from_pretrained(
+		_, model_kwargs = EasyDeLBaseConfig.from_pretrained(
 			config_path,
 			cache_dir=cache_dir,
 			return_unused_kwargs=True,
@@ -1501,8 +1486,8 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 		else:
 			resolved_archive_file = None
 
-		if cls.__name__ == "EDPretrainedModel":
-			# if they are using EDPretrainedModel.from_pretrained
+		if cls.__name__ == "EasyDeLBaseModule":
+			# if they are using EasyDeLBaseModule.from_pretrained
 			# they will get error AssertionError: `module` must be provided.` so we autoset this to make sure user don't
 			# experience this error.
 			_, cls, _ = get_modules_by_type(config.model_type)

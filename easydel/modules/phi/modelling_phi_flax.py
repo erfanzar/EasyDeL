@@ -45,7 +45,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.phi.kernels import phi_mlp_pallas
 from easydel.modules.phi.phi_configuration import PhiConfig as PhiConfig
 
@@ -872,7 +872,7 @@ class FlaxPhiForCausalLMModule(nn.Module):
 		)
 
 
-class FlaxPhiPreTrainedModel(EDPretrainedModel):
+class FlaxPhiPreTrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for Phi models providing initialization and configuration.
 

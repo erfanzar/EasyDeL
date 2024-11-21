@@ -54,7 +54,7 @@ class AutoEasyDeLModelForCausalLM:
         verbose_params: bool = False,            # Print the number of parameters in the loaded models
         from_torch: bool = True,                 # Load the model from PyTorch weights (Hugging Face)
         **kwargs,                                 # Additional keyword arguments passed to the model's initialization 
-    ) -> Tuple[EDPretrainedModel, dict]:
+    ) -> Tuple[EasyDeLBaseModule, dict]:
         # ... (rest of the method implementation)
 ```
 
@@ -124,7 +124,7 @@ class AutoEasyDeLModelForCausalLM:
 
 12. **`from_torch`:**
    - **Purpose:** Indicates that you are loading a model from PyTorch weights (the common case when using pre-trained models from the Hugging Face Hub).
-   - **Note:** EasyDeL also supports loading models from its own saved parameters (`EDPretrainedModel.from_pretrained`). In that case, set `from_torch=False`. 
+   - **Note:** EasyDeL also supports loading models from its own saved parameters (`EasyDeLBaseModule.from_pretrained`). In that case, set `from_torch=False`. 
 
 13. **`**kwargs`:**
    - **Purpose:** Catches any additional keyword arguments that might be passed to the model's configuration during initialization.

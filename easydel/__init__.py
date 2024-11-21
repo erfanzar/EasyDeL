@@ -226,8 +226,8 @@ from easydel.modules.mixtral import (
 	MixtralConfig,
 )
 from easydel.modules.modeling_utils import (
-	EDPretrainedConfig,
-	EDPretrainedModel,
+	EasyDeLBaseConfig,
+	EasyDeLBaseModule,
 )
 from easydel.modules.mosaic_mpt import (
 	FlaxMptForCausalLM,
@@ -391,7 +391,7 @@ if _jax.default_backend() == "gpu":
 		print(
 			"UserWarning: please install `torch-cpu` since `easydel` "
 			"uses `triton` and `triton` uses `torch` for autotuning.",
-		) 
+		)
 del _jax
 del _Version
 del _fjformer_version

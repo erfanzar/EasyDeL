@@ -44,7 +44,7 @@ from easydel.modules.flax_modeling_utils import (
 	with_sharding_constraint,
 )
 from easydel.modules.modeling_flax_outputs import MoeCausalLMOutput, MoeModelOutput
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 re_mat = nn_partitioning.remat
 
@@ -929,7 +929,7 @@ class FlaxArcticDecoderLayerCollection(nn.Module):
 		return outputs
 
 
-class ArcticPreTrainedModel(EDPretrainedModel):
+class ArcticPreTrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for Arctic models providing initialization and configuration.
 

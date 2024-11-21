@@ -26,6 +26,7 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 from easydel.layers.attention import FlaxAttentionModule
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
 	control_mlp_sharding,
@@ -37,8 +38,7 @@ from easydel.modules.gpt_neo_x.gpt_neo_x_configuration import (
 )
 from easydel.modules.gpt_neo_x.kernels import gptneox_mlp_pallas
 from easydel.modules.modeling_flax_outputs import FlaxBaseModelOutput
-from easydel.modules.modeling_utils import EDPretrainedModel
-from easydel.modules.factory import register_module
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 
 def precompute_freqs_cis(
@@ -305,7 +305,7 @@ class FlaxGPTNeoXModule(nn.Module):
 			return (hidden_state,)
 
 
-class FlaxGPTNeoXPretrainedModel(EDPretrainedModel):
+class FlaxGPTNeoXPretrainedModel(EasyDeLBaseModule):
 	module_class: nn.Module = None
 	config_class = GPTNeoXConfig
 

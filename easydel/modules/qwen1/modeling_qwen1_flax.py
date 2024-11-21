@@ -45,7 +45,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 	FlaxSequenceClassifierOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.qwen1.kernels import qwen1_mlp_pallas
 from easydel.modules.qwen1.qwen1_configuration import Qwen1Config as Qwen1Config
 
@@ -550,7 +550,7 @@ class FlaxQwen1Block(nn.Module):
 		return (hidden_states,) + attn_outputs[1:]
 
 
-class FlaxQwen1PreTrainedModel(EDPretrainedModel):
+class FlaxQwen1PreTrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for Qwen1 models providing initialization and configuration.
 

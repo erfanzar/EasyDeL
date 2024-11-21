@@ -46,7 +46,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 logger = get_logger(__name__)
 
@@ -579,7 +579,7 @@ class FlaxGemmaDecoderLayer(nn.Module):
 		return (hidden_states,) + outputs[1:]
 
 
-class FlaxGemmaPreTrainedModel(EDPretrainedModel):
+class FlaxGemmaPreTrainedModel(EasyDeLBaseModule):
 	"""An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
 	models.
 	"""

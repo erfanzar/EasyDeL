@@ -47,7 +47,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 re_mat = flax.linen.partitioning.remat
 
@@ -595,7 +595,7 @@ class FlaxCohereBlock(nn.Module):
 		return (hidden_states,) + attn_outputs[1:]
 
 
-class FlaxCoherePreTrainedModel(EDPretrainedModel):
+class FlaxCoherePreTrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for Cohere models providing initialization and configuration.
 

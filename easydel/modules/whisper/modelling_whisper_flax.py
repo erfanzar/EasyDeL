@@ -48,7 +48,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxSeq2SeqModelOutput,
 	FlaxSequenceClassifierOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.whisper.whisper_configuration import WhisperConfig as WhisperConfig
 
 remat = nn_partitioning.remat
@@ -860,7 +860,7 @@ class FlaxWhisperModule(nn.Module):
 		return self.decoder
 
 
-class FlaxWhisperPreTrainedModel(EDPretrainedModel):
+class FlaxWhisperPreTrainedModel(EasyDeLBaseModule):
 	config_class = WhisperConfig
 	base_model_prefix: str = "model"
 	main_input_name = "input_features"

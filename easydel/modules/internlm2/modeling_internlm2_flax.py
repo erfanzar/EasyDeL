@@ -52,7 +52,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 	FlaxSequenceClassifierOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 
 class FlaxInternLM2Embedding(nn.Module):
@@ -471,7 +471,7 @@ class FlaxInternLM2Block(nn.Module):
 		return (hidden_states,) + attn_outputs[1:]
 
 
-class FlaxInternLM2PreTrainedModel(EDPretrainedModel):
+class FlaxInternLM2PreTrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for InternLM2 models providing initialization and configuration.
 

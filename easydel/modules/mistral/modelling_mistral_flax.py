@@ -56,7 +56,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 re_mat = nn_partitioning.remat
 logger = get_logger(__name__)
@@ -544,7 +544,7 @@ class FlaxMistralDecoderLayer(nn.Module):
 		return outputs
 
 
-class FlaxMistralPretrainedModel(EDPretrainedModel):
+class FlaxMistralPretrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for Mistral models providing initialization and configuration.
 
@@ -1210,7 +1210,7 @@ class FlaxMistralForCausalLM(FlaxMistralPretrainedModel):
 		return model_kwargs
 
 
-class FlaxVisionMistralPreTrainedModel(EDPretrainedModel):
+class FlaxVisionMistralPreTrainedModel(EasyDeLBaseModule):
 	config_class = VisionMistralConfig
 	base_model_prefix = "model"
 	module_class: nn.Module = None
