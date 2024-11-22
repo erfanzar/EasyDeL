@@ -41,9 +41,15 @@ def test_rotary_embedding():
 
 
 def test_linear_scaling_rotary_embedding():
-	scaling_factor = 2.0
+	scaling_factor = [2.0]
 	rotary_emb = LinearScalingRotaryEmbedding(
-		head_size, rotary_dim, max_position, base, is_neox_style, scaling_factor, dtype
+		head_size=head_size,
+		rotary_dim=rotary_dim,
+		max_position_embeddings=max_position,
+		base=base,
+		is_neox_style=is_neox_style,
+		scaling_factors=scaling_factor,
+		dtype=dtype,
 	)
 	positions = jnp.arange(run_seq_len).reshape(1, -1).repeat(run_batch_size, 0)
 	query = jnp.ones((run_batch_size, run_seq_len, run_nheads, head_size))
@@ -57,7 +63,13 @@ def test_linear_scaling_rotary_embedding():
 def test_dynamic_ntk_scaling_rotary_embedding():
 	scaling_factor = 2.0
 	rotary_emb = DynamicNTKScalingRotaryEmbedding(
-		head_size, rotary_dim, max_position, base, is_neox_style, scaling_factor, dtype
+		head_size=head_size,
+		rotary_dim=rotary_dim,
+		max_position_embeddings=max_position,
+		base=base,
+		is_neox_style=is_neox_style,
+		scaling_factor=scaling_factor,
+		dtype=dtype,
 	)
 	positions = jnp.arange(run_seq_len).reshape(1, -1).repeat(run_batch_size, 0)
 	query = jnp.ones((run_batch_size, run_seq_len, run_nheads, head_size))
@@ -70,7 +82,6 @@ def test_dynamic_ntk_scaling_rotary_embedding():
 
 def test_yarn_scaling_rotary_embedding():
 	scaling_factor = 2.0
-	original_max_position = 1024
 	rope_scaling = {
 		"extrapolation_factor": 1.0,
 		"attn_factor": 1.0,
@@ -78,13 +89,13 @@ def test_yarn_scaling_rotary_embedding():
 		"beta_slow": 1,
 	}
 	rotary_emb = YaRNScalingRotaryEmbedding(
-		head_size,
-		rotary_dim,
-		original_max_position,
-		base,
-		is_neox_style,
-		scaling_factor,
-		dtype,
+		scaling_factor=scaling_factor,
+		head_size=head_size,
+		rotary_dim=rotary_dim,
+		base=base,
+		is_neox_style=is_neox_style,
+		dtype=dtype,
+		max_position_embeddings=max_position,
 		**rope_scaling,
 	)
 	positions = jnp.arange(run_seq_len).reshape(1, -1).repeat(run_batch_size, 0)
@@ -210,11 +221,11 @@ def test_get_rope():
 
 
 if __name__ == "__main__":
-	test_rotary_embedding()
-	test_linear_scaling_rotary_embedding()
-	test_dynamic_ntk_scaling_rotary_embedding()
-	test_yarn_scaling_rotary_embedding()
+	# test_rotary_embedding()
+	# test_linear_scaling_rotary_embedding()
+	# test_dynamic_ntk_scaling_rotary_embedding()
+	# test_yarn_scaling_rotary_embedding()
 	# test_llama3_rotary_embedding()
-	# test_deepseek_yarn_scaling_rotary_embedding() 
-	# test_phi3_long_rope_scaled_rotary_embedding()
+	# test_deepseek_yarn_scaling_rotary_embedding()
+	test_phi3_long_rope_scaled_rotary_embedding()
 	# test_get_rope()
