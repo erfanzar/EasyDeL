@@ -137,6 +137,8 @@ def test_deepseek_yarn_scaling_rotary_embedding():
 	key = jnp.ones((run_batch_size, run_seq_len, run_nheads, head_size))
 
 	query_rot, key_rot = rotary_emb(positions, query, key)
+	assert query.shape == query_rot.shape
+	assert key_rot.shape == key_rot.shape
 	print(f"Pass {rotary_emb._type}")
 
 
@@ -221,11 +223,11 @@ def test_get_rope():
 
 
 if __name__ == "__main__":
-	# test_rotary_embedding()
-	# test_linear_scaling_rotary_embedding()
-	# test_dynamic_ntk_scaling_rotary_embedding()
-	# test_yarn_scaling_rotary_embedding()
-	# test_llama3_rotary_embedding()
-	# test_deepseek_yarn_scaling_rotary_embedding()
+	test_rotary_embedding()
+	test_linear_scaling_rotary_embedding()
+	test_dynamic_ntk_scaling_rotary_embedding()
+	test_yarn_scaling_rotary_embedding()
+	test_llama3_rotary_embedding()
+	test_deepseek_yarn_scaling_rotary_embedding()
 	test_phi3_long_rope_scaled_rotary_embedding()
-	# test_get_rope()
+	test_get_rope()
