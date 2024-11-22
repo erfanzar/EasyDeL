@@ -3,6 +3,8 @@ from __future__ import annotations
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import flax
+import flax.linen
 import jax.numpy as jnp
 from jax import jit, vmap
 
@@ -52,34 +54,6 @@ def _apply_rotary_emb(
 		return jnp.stack((o1, o2), axis=-1).reshape(x.shape)
 
 
-@partial(jit, static_argnums=(4, 5, 6, 7))
-def _rotary_embedding_call(
-	positions: jnp.ndarray,
-	query: jnp.ndarray,
-	key: jnp.ndarray,
-	base: float,
-	max_position_embeddings: int,
-	rotary_dim: int,
-	is_neox_style: bool,
-	offsets: Optional[jnp.ndarray] = None,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-	if offsets is not None:
-		positions = positions + offsets
-	inv = 1.0 / (base ** (jnp.arange(0, rotary_dim, 2, dtype=jnp.float32) / rotary_dim))
-	freqs = jnp.einsum(
-		"i,j -> ij",
-		jnp.arange(max_position_embeddings, dtype=jnp.float32),
-		inv,
-	)[positions]
-	cos = jnp.cos(freqs)
-	sin = jnp.sin(freqs)
-	query_rot = _apply_rotary_emb(query[..., :rotary_dim], cos, sin, is_neox_style)
-	query = jnp.concatenate((query_rot, query[..., rotary_dim:]), axis=-1)
-	key_rot = _apply_rotary_emb(key[..., :rotary_dim], cos, sin, is_neox_style)
-	key = jnp.concatenate((key_rot, key[..., rotary_dim:]), axis=-1)
-	return query, key
-
-
 @partial(
 	vmap,
 	in_axes=(0, 0, 0, None, None, None, 0),
@@ -116,52 +90,6 @@ def _phi3_rope_call(
 	return query.reshape(iniq_shape), key.reshape(inik_shape)
 
 
-@partial(
-	vmap,
-	in_axes=(0, 0, 0, None, None, None, None, 0),
-	out_axes=(0, 0),
-)
-@partial(jit, static_argnums=(4, 5, 6))
-def _deepseek_rope_call(
-	positions: jnp.ndarray,
-	query: jnp.ndarray,
-	key: jnp.ndarray,
-	cos_sin_cache: jnp.ndarray,
-	rotary_dim: int,
-	head_size: int,
-	is_neox_style: bool,
-	offsets: Optional[jnp.ndarray] = None,
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
-	query_rot = query[..., :rotary_dim]
-	key_rot = key[..., :rotary_dim]
-
-	if rotary_dim < head_size:
-		query_pass = query[..., rotary_dim:]
-		key_pass = key[..., rotary_dim:]
-
-	cos_sin = cos_sin_cache[
-		jnp.add(positions, offsets) if offsets is not None else positions
-	]
-	cos, sin = jnp.split(cos_sin, 2, axis=-1)
-	if is_neox_style:
-		cos = cos.repeat(2, axis=1).reshape(-1, 1, cos.shape[-1] * 2)
-		sin = sin.repeat(2, axis=1).reshape(-1, 1, sin.shape[-1] * 2)
-	else:
-		cos = cos.repeat_interleave(2, axis=1).reshape(-1, 1, cos.shape[-1] * 2)
-		sin = sin.repeat_interleave(2, axis=1).reshape(-1, 1, sin.shape[-1] * 2)
-	rotate_fn = _rotate_neox if is_neox_style else _rotate_gptj
-	query_rot = query_rot * cos + rotate_fn(query_rot) * sin
-	key_rot = key_rot * cos + rotate_fn(key_rot) * sin
-
-	if rotary_dim < head_size:
-		query = jnp.concatenate((query_rot, query_pass), axis=-1)
-		key = jnp.concatenate((key_rot, key_pass), axis=-1)
-	else:
-		query = query_rot
-		key = key_rot
-	return query, key
-
-
 AVAILABLE_ROPE_TYPES = {}
 
 
@@ -194,23 +122,29 @@ def _default_compute_cos_sin_cache(
 
 
 @rope_wraper("default")
-class RotaryEmbedding:
-	def __init__(
-		self,
-		head_size: int,
-		rotary_dim: int,
-		max_position_embeddings: int,
-		base: int,
-		is_neox_style: bool,
-		dtype: jnp.dtype,
-	):
-		self.head_size = head_size
-		self.rotary_dim = rotary_dim
-		self.max_position_embeddings = max_position_embeddings
-		self.base = base
-		self.is_neox_style = is_neox_style
-		self.dtype = dtype
+class RotaryEmbedding(flax.linen.Module):
+	head_size: int
+	rotary_dim: int
+	max_position_embeddings: int
+	base: int
+	is_neox_style: bool
+	dtype: jnp.dtype
 
+	def _compute_inv_freq(self, base):
+		return 1.0 / (
+			base ** (jnp.arange(0, self.rotary_dim, 2, dtype=jnp.float32) / self.rotary_dim)
+		)
+
+	def _compute_cos_sin_cache(self):
+		inv = self._compute_inv_freq(self.base)
+		freqs = jnp.einsum(
+			"i,j -> ij",
+			jnp.arange(self.max_position_embeddings, dtype=jnp.float32),
+			inv,
+		)
+		return jnp.cos(freqs), jnp.sin(freqs)
+
+	@flax.linen.jit
 	def __call__(
 		self,
 		positions: jnp.ndarray,
@@ -219,48 +153,45 @@ class RotaryEmbedding:
 		offsets: Optional[jnp.ndarray] = None,
 	) -> Tuple[jnp.ndarray, jnp.ndarray]:
 		"""__call__ pass for the rotary embedding."""
-		query, key = _rotary_embedding_call(
-			positions,
-			query,
-			key,
-			self.base,
-			self.max_position_embeddings,
-			self.rotary_dim,
+		if offsets is not None:
+			positions = positions + offsets
+		cos, sin = self._compute_cos_sin_cache()
+		cos = cos[positions]
+		sin = sin[positions]
+		query_rot = _apply_rotary_emb(
+			query[..., : self.rotary_dim],
+			cos,
+			sin,
 			self.is_neox_style,
-			offsets,
 		)
+		query = jnp.concatenate(
+			(query_rot, query[..., self.rotary_dim :]),
+			axis=-1,
+		)
+		key_rot = _apply_rotary_emb(
+			key[..., : self.rotary_dim],
+			cos,
+			sin,
+			self.is_neox_style,
+		)
+		key = jnp.concatenate(
+			(key_rot, key[..., self.rotary_dim :]),
+			axis=-1,
+		)
+
 		return query.astype(self.dtype), key.astype(self.dtype)
 
 
 @rope_wraper("linear")
 class LinearScalingRotaryEmbedding(RotaryEmbedding):
-	def __init__(
-		self,
-		head_size: int,
-		rotary_dim: int,
-		max_position_embeddings: int,
-		base: int,
-		is_neox_style: bool,
-		scaling_factors: Union[List[float], float],
-		dtype: jnp.dtype,
-	):
-		if isinstance(scaling_factors, float):
-			scaling_factors = [scaling_factors]
-		self.scaling_factors: List[float] = scaling_factors
-		super().__init__(
-			head_size=head_size,
-			rotary_dim=rotary_dim,
-			max_position_embeddings=max_position_embeddings,
-			base=base,
-			is_neox_style=is_neox_style,
-			dtype=dtype,
-		)
-		self._scaling_factor_to_offset: Dict[float, int] = {}
+	scaling_factors: Union[List[float], float]
+	scaling_factor_to_offset: Dict[float, int]
 
-	def _compute_cos_sin_cache(self) -> jnp.ndarray:
+	def _compute_cos_sin_cache(self) -> Tuple[jnp.ndarray, jnp.ndarray]:
 		inv_freq = self._compute_inv_freq(self.base)
 		cache_list: List[jnp.ndarray] = []
 		offsets: List[int] = []
+
 		for scaling_factor in self.scaling_factors:
 			max_len = self.max_position_embeddings * scaling_factor
 			t = jnp.arange(max_len, dtype=jnp.float32)
@@ -281,38 +212,16 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
 			for i, scaling_factor in enumerate(self.scaling_factors)
 		}
 		assert len(self.scaling_factors) == len(offsets)
-		return jnp.concatenate(cache_list, axis=0)
-
-	@property
-	def scaling_factor_to_offset(self) -> Dict[float, int]:
-		return self._scaling_factor_to_offset
+		return jnp.split(jnp.concatenate(cache_list, axis=0), 2, -1)
 
 
 @rope_wraper("dynamic")
 class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
 	"""RotaryEmbedding extended with Dynamic NTK scaling."""
 
-	def __init__(
-		self,
-		head_size: int,
-		rotary_dim: int,
-		max_position_embeddings: int,
-		base: int,
-		is_neox_style: bool,
-		scaling_factor: float,
-		dtype: jnp.dtype,
-	):
-		self.scaling_factor = scaling_factor
-		super().__init__(
-			head_size=head_size,
-			rotary_dim=rotary_dim,
-			max_position_embeddings=max_position_embeddings,
-			base=base,
-			is_neox_style=is_neox_style,
-			dtype=dtype,
-		)
+	scaling_factor: float
 
-	def _compute_cos_sin_cache(self) -> jnp.ndarray:
+	def _compute_cos_sin_cache(self) -> Tuple[jnp.ndarray, jnp.ndarray]:
 		max_len = self.max_position_embeddings * self.scaling_factor
 		base = self.base * (
 			(self.scaling_factor * max_len / self.max_position_embeddings)
@@ -320,12 +229,8 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
 		) ** (self.rotary_dim / (self.rotary_dim - 2))
 		inv_freq = self._compute_inv_freq(base)
 		t = jnp.arange(max_len, dtype=jnp.float32)
-
 		freqs = jnp.einsum("i,j -> ij", t, inv_freq)
-		cos = jnp.cos(freqs)
-		sin = jnp.sin(freqs)
-		cache = jnp.concatenate([cos, sin], axis=-1)
-		return cache
+		return jnp.cos(freqs), jnp.sin(freqs)
 
 
 def _yarn_find_correction_dim(
@@ -593,49 +498,35 @@ def _yarn_linear_ramp_mask(
 class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
 	"""RotaryEmbedding extended with YaRN method."""
 
-	def __init__(
-		self,
-		head_size: int,
-		rotary_dim: int,
-		max_position_embeddings: int,
-		base: int,
-		is_neox_style: bool,
-		scaling_factor: float,
-		dtype: jnp.dtype,
-		*,
-		extrapolation_factor: float = 1,
-		attn_factor: float = 1,
-		beta_fast: int = 32,
-		beta_slow: int = 1,
-		mscale: float = 1,
-		mscale_all_dim: float = 0,
-	):
-		self.scaling_factor = scaling_factor
-		self.extrapolation_factor = extrapolation_factor
-		self.attn_factor = attn_factor
-		self.beta_fast = beta_fast
-		self.beta_slow = beta_slow
-		self.mscale = float(
-			yarn_get_mscale(self.scaling_factor, float(mscale))
-			/ yarn_get_mscale(self.scaling_factor, float(mscale_all_dim))
-			* attn_factor
-		)
-		super().__init__(
-			head_size=head_size,
-			rotary_dim=rotary_dim,
-			max_position_embeddings=max_position_embeddings,
-			base=base,
-			is_neox_style=is_neox_style,
-			dtype=dtype,
-		)
+	scaling_factor: float
+	extrapolation_factor: float = 1
+	attn_factor: float = 1
+	beta_fast: int = 32
+	beta_slow: int = 1
+	mscale: float = 1
+	mscale_all_dim: float = 0
 
-	def _compute_inv_freq(self, scaling_factor: float) -> jnp.ndarray:
+	@flax.linen.jit
+	def __call__(
+		self,
+		positions: jnp.ndarray,
+		query: jnp.ndarray,
+		key: jnp.ndarray,
+		offsets: Optional[jnp.ndarray] = None,
+	) -> Tuple[jnp.ndarray, jnp.ndarray]:
+		if offsets is not None:
+			positions += offsets
+		query_rot = query[..., : self.rotary_dim]
+		key_rot = key[..., : self.rotary_dim]
+
+		if self.rotary_dim < self.head_size:
+			query_pass = query[..., self.rotary_dim :]
+			key_pass = key[..., self.rotary_dim :]
 		pos_freqs = self.base ** (
 			jnp.arange(0, self.rotary_dim, 2, dtype=jnp.float32) / self.rotary_dim
 		)
 		inv_freq_extrapolation = 1.0 / pos_freqs
-		inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
-
+		inv_freq_interpolation = 1.0 / (self.scaling_factor * pos_freqs)
 		low, high = _yarn_find_correction_range(
 			self.beta_fast,
 			self.beta_slow,
@@ -650,65 +541,44 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
 			inv_freq_interpolation * (1 - inv_freq_mask)
 			+ inv_freq_extrapolation * inv_freq_mask
 		)
-		return inv_freq
-
-	def _compute_cos_sin_cache(self) -> jnp.ndarray:
-		inv_freq = self._compute_inv_freq(self.scaling_factor)
 		t = jnp.arange(
-			self.max_position_embeddings * self.scaling_factor, dtype=jnp.float32
+			self.max_position_embeddings * self.scaling_factor,
+			dtype=jnp.float32,
 		)
 		freqs = jnp.einsum("i,j -> ij", t, inv_freq)
-		cos = jnp.cos(freqs) * self.mscale
-		sin = jnp.sin(freqs) * self.mscale
-		cache = jnp.concatenate([cos, sin], axis=-1)
-		return cache
-
-	def __call__(
-		self,
-		positions: jnp.ndarray,
-		query: jnp.ndarray,
-		key: jnp.ndarray,
-		offsets: Optional[jnp.ndarray] = None,
-	) -> Tuple[jnp.ndarray, jnp.ndarray]:
-		return _deepseek_rope_call(
-			positions,
-			query,
-			key,
-			self.cos_sin_cache,
-			self.rotary_dim,
-			self.head_size,
-			self.is_neox_style,
-			offsets,
+		mscale = float(
+			yarn_get_mscale(self.scaling_factor, float(self.mscale))
+			/ yarn_get_mscale(self.scaling_factor, float(self.mscale_all_dim))
+			* self.attn_factor
 		)
+		cos = jnp.cos(freqs)[positions] * mscale
+		sin = jnp.sin(freqs)[positions] * mscale
+		target_sc_shape = (query.shape[0], -1, 1, self.rotary_dim)
+		if self.is_neox_style:
+			cos = cos.repeat(2, axis=1).reshape(target_sc_shape)
+			sin = sin.repeat(2, axis=1).reshape(target_sc_shape)
+		else:
+			cos = cos.repeat_interleave(2, axis=1).reshape(target_sc_shape)
+			sin = sin.repeat_interleave(2, axis=1).reshape(target_sc_shape)
+		rotate_fn = _rotate_neox if self.is_neox_style else _rotate_gptj
+		query_rot = query_rot * cos + rotate_fn(query_rot) * sin
+		key_rot = key_rot * cos + rotate_fn(key_rot) * sin
+
+		if self.rotary_dim < self.head_size:
+			query = jnp.concatenate((query_rot, query_pass), axis=-1)
+			key = jnp.concatenate((key_rot, key_pass), axis=-1)
+		else:
+			query = query_rot
+			key = key_rot
+		return query, key
 
 
 @rope_wraper("llama3")
 class Llama3RotaryEmbedding(RotaryEmbedding):
-	def __init__(
-		self,
-		head_size: int,
-		rotary_dim: int,
-		max_position_embeddings: int,
-		base: int,
-		is_neox_style: bool,
-		dtype: jnp.dtype,
-		scaling_factor: float,
-		low_freq_factor: float,
-		high_freq_factor: float,
-		orig_max_position: int,
-	):
-		self.scaling_factor = scaling_factor
-		self.low_freq_factor = low_freq_factor
-		self.high_freq_factor = high_freq_factor
-		self.orig_max_position = orig_max_position
-		super().__init__(
-			head_size=head_size,
-			rotary_dim=rotary_dim,
-			max_position_embeddings=max_position_embeddings,
-			base=base,
-			is_neox_style=is_neox_style,
-			dtype=dtype,
-		)
+	scaling_factor: float
+	low_freq_factor: float
+	high_freq_factor: float
+	orig_max_position: int
 
 	def _compute_inv_freq(self, base: Union[int, float]) -> jnp.ndarray:
 		inv_freqs = super()._compute_inv_freq(base)

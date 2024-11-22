@@ -211,10 +211,10 @@ def test_get_rope():
 
 if __name__ == "__main__":
 	test_rotary_embedding()
-	# test_linear_scaling_rotary_embedding()
-	# test_dynamic_ntk_scaling_rotary_embedding()
-	# test_yarn_scaling_rotary_embedding()
+	test_linear_scaling_rotary_embedding()
+	test_dynamic_ntk_scaling_rotary_embedding()
+	test_yarn_scaling_rotary_embedding()
 	# test_llama3_rotary_embedding()
-	# test_deepseek_yarn_scaling_rotary_embedding()
+	# test_deepseek_yarn_scaling_rotary_embedding() 
 	# test_phi3_long_rope_scaled_rotary_embedding()
 	# test_get_rope()
