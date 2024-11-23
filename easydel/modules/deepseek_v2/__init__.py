@@ -15,7 +15,5 @@
 from easydel.modules.deepseek_v2.deepseek_configuration import DeepseekV2Config
 from easydel.modules.deepseek_v2.modeling_deepseek_flax import (
 	FlaxDeepseekV2ForCausalLM,
-	FlaxDeepseekV2ForCausalLMModule,
 	FlaxDeepseekV2Model,
-	FlaxDeepseekV2Module,
 )

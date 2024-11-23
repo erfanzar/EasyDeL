@@ -1879,6 +1879,7 @@ def wrap_easydel_module(
 			"config_class": config_class,
 			"base_model_prefix": base_model_prefix,
 			"module_class": mdl,
+			"flax_module": mdl,
 			"__annotations__": {
 				"config_class": Type[EasyDeLBaseConfig],
 				"base_model_prefix": str,

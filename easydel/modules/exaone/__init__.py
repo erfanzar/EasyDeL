@@ -15,7 +15,5 @@
 from easydel.modules.exaone.exaone_configuration import ExaoneConfig
 from easydel.modules.exaone.modeling_exaone_flax import (
 	FlaxExaoneForCausalLM,
-	FlaxExaoneForCausalLMModule,
 	FlaxExaoneModel,
-	FlaxExaoneModule,
 )

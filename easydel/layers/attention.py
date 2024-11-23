@@ -1883,10 +1883,10 @@ class FlaxAttentionModule(nn.Module):
 
 		if self.has_variable("cache", "cached_key") or init_cache:
 			key, value, attention_mask = self._concatenate_to_cache(
-				key,
-				value,
-				query,
-				attention_mask,
+				query=query,
+				key=key,
+				value=value,
+				attention_mask=attention_mask,
 			)
 
 		attention_bias = lax.select(

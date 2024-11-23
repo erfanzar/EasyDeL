@@ -4,6 +4,7 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 
+import easydel as ed
 import jax
 import torch
 from huggingface_hub import HfApi
@@ -11,7 +12,6 @@ from jax import numpy as jnp
 from jax import sharding
 from transformers import AutoTokenizer
 
-import easydel as ed
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
@@ -22,7 +22,7 @@ def main():
 	num_devices = len(jax.devices())
 	input_shape = (num_devices, max_length)
 
-	pretrained_model_name_or_path = "EasyDeL/EasyDeL-Llama-3.2-1B-Instruct"
+	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
 	dtype = jnp.float16
 	partition_axis = ed.PartitionAxis()
 
@@ -89,17 +89,17 @@ def main():
 	pad_seq = inference.model_prefill_length
 
 	print("Start Generation Process.")
-
-	for response in inference.generate(**ids):
-		next_slice = slice(
-			pad_seq,
-			pad_seq + inference.generation_config.streaming_chunks,
-		)
-		pad_seq += inference.generation_config.streaming_chunks
-		print(
-			tokenizer.decode(response.sequences[0][next_slice], skip_special_tokens=True),
-			end="",
-		)
+	with jax.profiler.trace("/tmp/board"):
+		for response in inference.generate(**ids):
+			next_slice = slice(
+				pad_seq,
+				pad_seq + inference.generation_config.streaming_chunks,
+			)
+			pad_seq += inference.generation_config.streaming_chunks
+			print(
+				tokenizer.decode(response.sequences[0][next_slice], skip_special_tokens=True),
+				end="",
+			)
 
 	print()
 	print("TPS :", response.tokens_pre_second)

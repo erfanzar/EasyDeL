@@ -625,7 +625,7 @@ class FlaxLlamaForCausalLM(nn.Module):
 	precision: Optional[Union[jax.lax.Precision, str]] = None
 
 	def setup(self):
-		self.model = FlaxLlamaModel.flax_module(
+		self.model = FlaxLlamaModel.module_class(
 			config=self.config,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,

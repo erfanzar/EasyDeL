@@ -5,7 +5,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import flax
 import flax.linen
-from flax.linen import jit as fjit
 import jax
 import jax.numpy as jnp
 
@@ -70,7 +69,6 @@ def rope_wraper(type):
 	return w
 
 
-@partial(fjit, static_argnums=(0, 1, 2))
 def _default_compute_cos_sin_cache(
 	base,
 	rotary_dim,
@@ -95,13 +93,11 @@ class RotaryEmbedding(flax.linen.Module):
 	is_neox_style: bool
 	dtype: jnp.dtype
 
-	@partial(fjit, static_argnames=["base"])
 	def _compute_inv_freq(self, base):
 		return 1.0 / (
 			base ** (jnp.arange(0, self.rotary_dim, 2, dtype=jnp.float32) / self.rotary_dim)
 		)
 
-	@fjit
 	def _compute_cos_sin_cache(self):
 		inv = self._compute_inv_freq(self.base)
 		freqs = jnp.einsum(
@@ -111,7 +107,6 @@ class RotaryEmbedding(flax.linen.Module):
 		)
 		return jnp.cos(freqs), jnp.sin(freqs)
 
-	@fjit
 	def __call__(
 		self,
 		positions: jnp.ndarray,
@@ -161,7 +156,6 @@ class RotaryEmbedding(flax.linen.Module):
 class LinearScalingRotaryEmbedding(RotaryEmbedding):
 	scaling_factors: Union[List[float], float]
 
-	@fjit
 	def _compute_cos_sin_cache(self) -> Tuple[jnp.ndarray, jnp.ndarray]:
 		inv_freq = self._compute_inv_freq(self.base)
 		cache_list: List[jnp.ndarray] = []
@@ -193,7 +187,6 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
 
 	scaling_factor: Union[float, int]
 
-	@fjit
 	def _compute_cos_sin_cache(self) -> Tuple[jnp.ndarray, jnp.ndarray]:
 		scaling_factor = self.scaling_factor
 		max_len = self.max_position_embeddings * scaling_factor
@@ -346,7 +339,6 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
 	beta_fast: int = 32
 	beta_slow: int = 1
 
-	@partial(fjit, static_argnames=["scaling_factor"])
 	def _compute_inv_freq(self, scaling_factor: float) -> jnp.ndarray:
 		pos_freqs = self.base ** (
 			jnp.arange(0, self.rotary_dim, 2, dtype=jnp.float32) / self.rotary_dim
@@ -370,7 +362,6 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
 		)
 		return inv_freq
 
-	@fjit
 	def _compute_cos_sin_cache(self) -> jnp.ndarray:
 		inv_freq = self._compute_inv_freq(self.scaling_factor)
 		t = jnp.arange(
@@ -627,7 +618,7 @@ def get_rope(
 				scaling_factor=scaling_factor,
 				low_freq_factor=low_freq_factor,
 				high_freq_factor=high_freq_factor,
-				original_max_position_embeddings=original_max_position,
+				orig_max_position=original_max_position,
 			)
 		elif scaling_type == "default":
 			rotary_emb = RotaryEmbedding(

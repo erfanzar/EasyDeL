@@ -20,9 +20,7 @@ from easydel.layers.attention import (
 from easydel.modules.arctic import (
 	ArcticConfig,
 	FlaxArcticForCausalLM,
-	FlaxArcticForCausalLMModule,
 	FlaxArcticModel,
-	FlaxArcticModule,
 )
 from easydel.modules.auto_models import (
 	AutoEasyDeLConfig,
@@ -34,52 +32,40 @@ from easydel.modules.auto_models import (
 from easydel.modules.cohere import (
 	CohereConfig,
 	FlaxCohereForCausalLM,
-	FlaxCohereForCausalLMModule,
 	FlaxCohereModel,
-	FlaxCohereModule,
 )
 from easydel.modules.dbrx import (
 	DbrxAttentionConfig,
 	DbrxConfig,
 	DbrxFFNConfig,
 	FlaxDbrxForCausalLM,
-	FlaxDbrxForCausalLMModule,
 	FlaxDbrxModel,
-	FlaxDbrxModule,
 )
 from easydel.modules.deepseek_v2 import (
 	DeepseekV2Config,
 	FlaxDeepseekV2ForCausalLM,
-	FlaxDeepseekV2ForCausalLMModule,
 	FlaxDeepseekV2Model,
-	FlaxDeepseekV2Module,
 )
 from easydel.modules.exaone import (
 	ExaoneConfig,
 	FlaxExaoneForCausalLM,
-	FlaxExaoneForCausalLMModule,
 	FlaxExaoneModel,
-	FlaxExaoneModule,
 )
 from easydel.modules.falcon import (
 	FalconConfig,
 	FlaxFalconForCausalLM,
-	FlaxFalconForCausalLMModule,
 	FlaxFalconModel,
 	FlaxFalconModule,
 )
 from easydel.modules.gemma import (
 	FlaxGemmaForCausalLM,
-	FlaxGemmaForCausalLMModule,
 	FlaxGemmaModel,
 	FlaxGemmaModule,
 	GemmaConfig,
 )
 from easydel.modules.gemma2 import (
 	FlaxGemma2ForCausalLM,
-	FlaxGemma2ForCausalLMModule,
 	FlaxGemma2Model,
-	FlaxGemma2Module,
 	Gemma2Config,
 )
 from easydel.modules.gpt2 import (

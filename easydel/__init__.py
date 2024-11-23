@@ -81,9 +81,7 @@ from easydel.layers.attention import (
 from easydel.modules.arctic import (
 	ArcticConfig,
 	FlaxArcticForCausalLM,
-	FlaxArcticForCausalLMModule,
 	FlaxArcticModel,
-	FlaxArcticModule,
 )
 from easydel.modules.auto_models import (
 	AutoEasyDeLConfig,
@@ -95,90 +93,65 @@ from easydel.modules.auto_models import (
 from easydel.modules.cohere import (
 	CohereConfig,
 	FlaxCohereForCausalLM,
-	FlaxCohereForCausalLMModule,
 	FlaxCohereModel,
-	FlaxCohereModule,
 )
 from easydel.modules.dbrx import (
 	DbrxAttentionConfig,
 	DbrxConfig,
 	DbrxFFNConfig,
 	FlaxDbrxForCausalLM,
-	FlaxDbrxForCausalLMModule,
 	FlaxDbrxModel,
-	FlaxDbrxModule,
 )
 from easydel.modules.deepseek_v2 import (
 	DeepseekV2Config,
 	FlaxDeepseekV2ForCausalLM,
-	FlaxDeepseekV2ForCausalLMModule,
 	FlaxDeepseekV2Model,
-	FlaxDeepseekV2Module,
 )
 from easydel.modules.exaone import (
 	ExaoneConfig,
 	FlaxExaoneForCausalLM,
-	FlaxExaoneForCausalLMModule,
 	FlaxExaoneModel,
-	FlaxExaoneModule,
 )
 from easydel.modules.factory import registry as module_registry
 from easydel.modules.falcon import (
 	FalconConfig,
 	FlaxFalconForCausalLM,
-	FlaxFalconForCausalLMModule,
 	FlaxFalconModel,
-	FlaxFalconModule,
 )
 from easydel.modules.gemma import (
 	FlaxGemmaForCausalLM,
-	FlaxGemmaForCausalLMModule,
 	FlaxGemmaModel,
-	FlaxGemmaModule,
 	GemmaConfig,
 )
 from easydel.modules.gemma2 import (
 	FlaxGemma2ForCausalLM,
-	FlaxGemma2ForCausalLMModule,
 	FlaxGemma2Model,
-	FlaxGemma2Module,
 	Gemma2Config,
 )
 from easydel.modules.gpt2 import (
 	FlaxGPT2LMHeadModel,
-	FlaxGPT2LMHeadModule,
 	FlaxGPT2Model,
-	FlaxGPT2Module,
 	GPT2Config,
 )
 from easydel.modules.gpt_j import (
 	FlaxGPTJForCausalLM,
-	FlaxGPTJForCausalLMModule,
 	FlaxGPTJModel,
-	FlaxGPTJModule,
 	GPTJConfig,
 )
 from easydel.modules.gpt_neo_x import (
 	FlaxGPTNeoXForCausalLM,
-	FlaxGPTNeoXForCausalLMModule,
 	FlaxGPTNeoXModel,
-	FlaxGPTNeoXModule,
 	GPTNeoXConfig,
 )
 from easydel.modules.grok_1 import (
 	FlaxGrok1ForCausalLM,
-	FlaxGrok1ForCausalLMModule,
 	FlaxGrok1Model,
-	FlaxGrok1Module,
 	Grok1Config,
 )
 from easydel.modules.internlm2.modeling_internlm2_flax import (
 	FlaxInternLM2ForCausalLM,
-	FlaxInternLM2ForCausalLMModule,
 	FlaxInternLM2ForSequenceClassification,
-	FlaxInternLM2ForSequenceClassificationModule,
 	FlaxInternLM2Model,
-	FlaxInternLM2Module,
 	InternLM2Config,
 )
 from easydel.modules.llama import (
