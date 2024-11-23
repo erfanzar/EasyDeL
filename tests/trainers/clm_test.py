@@ -21,8 +21,8 @@ from easydel import (
 	CausalLanguageModelTrainer,
 	EasyDeLOptimizers,
 	EasyDeLSchedulers,
-	FlaxMistralForCausalLM,
-	MistralConfig,
+	FlaxLlamaForCausalLM,
+	LlamaConfig,
 	TrainingArguments,
 )
 
@@ -38,7 +38,7 @@ def main(use_iterable_dataset: bool):
 	sequence_length = 128
 	max_training_steps = NUM_TRAIN_EXAMPLES // TOTAL_BATCH_SIZE * NUM_TRAIN_EPOCHS
 	max_evaluation_steps = NUM_EVAL_EXAMPLES // TOTAL_BATCH_SIZE
-	config = MistralConfig(
+	config = LlamaConfig(
 		head_dim=128,
 		hidden_size=512,
 		num_attention_heads=8,
@@ -51,7 +51,7 @@ def main(use_iterable_dataset: bool):
 	)
 
 	dtype = jnp.float16
-	model = FlaxMistralForCausalLM(
+	model = FlaxLlamaForCausalLM(
 		config=config,
 		_do_init=True,
 		dtype=dtype,

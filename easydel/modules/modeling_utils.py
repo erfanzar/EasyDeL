@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import os
 import re
 import warnings
@@ -20,12 +21,15 @@ from dataclasses import dataclass
 from typing import (
 	Any,
 	Callable,
+	Dict,
 	List,
 	Literal,
 	Mapping,
 	Optional,
 	Sequence,
 	Tuple,
+	Type,
+	TypeVar,
 	Union,
 )
 
@@ -33,6 +37,7 @@ import chex
 import fjformer
 import fjformer.sharding
 import flax
+import flax.linen
 import jax
 import jax.extend
 import jax.tree_util
@@ -105,6 +110,9 @@ def set_attrs_smartly(self, attr_name: str, default: Any, new_attr: Any):
 		setattr(self, attr_name, default)
 	if not new_attr == Ellipsis:
 		setattr(self, attr_name, new_attr)
+
+
+M = TypeVar("M", bound=flax.linen.Module)
 
 
 @dataclass
@@ -720,20 +728,42 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
 
 class EasyDeLBaseModule(FlaxPreTrainedModel):
+	config_class: EasyDeLBaseConfig
+	base_model_prefix: str
+	flax_module: Type[M]
+	module_class: Union[flax.linen.Module, Type[M]] = None
+
 	def __init__(
 		self,
-		config: Optional[PretrainedConfig] = None,
-		module: Optional[flax.linen.Module] = None,
-		input_shape: Tuple = (AVAILALBE_DEVICES, AVAILALBE_DEVICES),
-		seed: int = 0,
+		config: EasyDeLBaseConfig,
 		dtype: jnp.dtype = jnp.float32,
-		param_dtype: jnp.dtype = jnp.float32,  # Ignored #noqa
-		precision: Optional[Union[jax.lax.Precision, str]] = None,  # Ignored #noqa
-		_do_init: bool = True,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[jax.lax.Precision] = None,
+		input_shape: Tuple[int, int] = (AVAILALBE_DEVICES, AVAILALBE_DEVICES),
+		seed: int = 0,
+		_do_init: bool = False,
+		**kwargs,
 	):
-		assert config is not None, "`config` must be provided.`"
-		assert module is not None, "`module` must be provided.`"
+		"""
+		Initializes the pre-trained model with the given configuration.
 
+		Args:
+		    config (LlamaConfig): Configuration for the model.
+		    dtype (jnp.dtype): Data type for computations.
+		    param_dtype (jnp.dtype): Data type for model parameters.
+		    precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
+		    input_shape (Tuple[int, int]): Shape of the input tensor.
+		    seed (int): Seed for random number generation.
+		    _do_init (bool): If True, initialize model weights.
+		    **kwargs: Additional keyword arguments.
+		"""
+		module = self.module_class(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			**kwargs,
+		)
 		self.param_dtype = param_dtype
 		self.precision = precision
 
@@ -856,6 +886,66 @@ class EasyDeLBaseModule(FlaxPreTrainedModel):
 			jax.eval_shape(init_fn),
 		)
 
+	def init_weights(
+		self,
+		rng: jax.random.PRNGKey,
+		input_shape: Optional[Tuple] = None,
+		params: FrozenDict = None,
+	) -> FrozenDict:
+		"""
+		Initializes the model weights.
+
+		Args:
+		    rng (jax.random.PRNGKey): Random number generator key.
+		    input_shape (Tuple): Shape of the input tensor for initializing weights.
+		    params (FrozenDict, optional): Existing parameters to initialize with.
+
+		Returns:
+		    FrozenDict: Initialized model parameters.
+		"""
+		if input_shape is None:
+			input_shape = (jax.device_count(), jax.device_count())
+		input_ids = jnp.zeros(input_shape, dtype="i4")
+		attention_mask = jnp.ones_like(input_ids)
+		position_ids = jnp.broadcast_to(
+			jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape
+		)
+		params_rng, dropout_rng = jax.random.split(rng)
+		rngs = {"params": params_rng, "dropout": dropout_rng}
+
+		if self.config.add_cross_attention:
+			encoder_hidden_states = jnp.zeros(input_shape + (self.config.hidden_size,))
+			encoder_attention_mask = attention_mask
+			module_init_outputs = self.module.init(
+				rngs,
+				input_ids=input_ids,
+				attention_mask=attention_mask,
+				position_ids=position_ids,
+				encoder_hidden_states=encoder_hidden_states,
+				encoder_attention_mask=encoder_attention_mask,
+				return_dict=False,
+			)
+		else:
+			module_init_outputs = self.module.init(
+				rngs,
+				input_ids=input_ids,
+				attention_mask=attention_mask,
+				position_ids=position_ids,
+				return_dict=False,
+			)
+
+		random_params = module_init_outputs["params"]
+
+		if params is not None:
+			random_params = flatten_dict(unfreeze(random_params))
+			params = flatten_dict(unfreeze(params))
+			for missing_key in self._missing_keys:
+				params[missing_key] = random_params[missing_key]
+			self._missing_keys = set()
+			return flax.core.freeze(unflatten_dict(params))
+		else:
+			return random_params
+
 	def prepare_inputs_for_generation(
 		self,
 		input_ids,
@@ -899,11 +989,81 @@ class EasyDeLBaseModule(FlaxPreTrainedModel):
 		model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
 		return model_kwargs
 
+	def _validate_signature(
+		self,
+		method,
+		args: tuple,
+		kwargs: Dict[str, Any],
+	) -> Dict[str, Any]:
+		"""
+		Validates and filters arguments based on the method's signature.
+
+		Args:
+				method: The method to check signature against
+				args: Positional arguments
+				kwargs: Keyword arguments
+
+		Returns:
+				Dict[str, Any]: Filtered kwargs containing only valid parameters
+		"""
+		# Get the signature of the child class's __call__ method
+		sig = inspect.signature(method)
+		valid_params = sig.parameters
+
+		# Convert args to kwargs based on parameter names
+		args_as_kwargs = {}
+		positional_params = [
+			param
+			for param in valid_params.values()
+			if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD)
+		]
+
+		for i, arg in enumerate(args):
+			if i < len(positional_params):
+				args_as_kwargs[positional_params[i].name] = arg
+
+		# Combine converted args and original kwargs
+		all_kwargs = {**args_as_kwargs, **kwargs}
+
+		# Filter out invalid kwargs
+		filtered_kwargs = {}
+		for name, value in all_kwargs.items():
+			if name in valid_params:
+				# Check if the parameter accepts the value's type
+				param = valid_params[name]
+				if param.annotation != inspect.Parameter.empty:
+					try:
+						# Handle Optional types
+						if (
+							getattr(param.annotation, "__origin__", None) is Optional
+							and value is not None
+						):
+							expected_type = param.annotation.__args__[0]
+							if not isinstance(value, expected_type):
+								print(
+									f"Warning: Parameter '{name}' expected type {expected_type}, "
+									f"got {type(value)}. Skipping parameter."
+								)
+								continue
+					except Exception:
+						# If type checking fails, still include the parameter
+						pass
+				filtered_kwargs[name] = value
+			else:
+				warnings.warn(
+					f"  Parameter '{name}' not found in child class signature. Skipping.",
+					stacklevel=1,
+				)
+
+		return filtered_kwargs
+
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
+		segment_ids: Optional[chex.Array] = None,
 		params: dict = None,
 		past_key_values: Optional[dict] = None,
 		dropout_rng: jax.random.PRNGKey = None,
@@ -911,12 +1071,103 @@ class EasyDeLBaseModule(FlaxPreTrainedModel):
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		return_dict: Optional[bool] = None,
-		extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
 		add_params_field: bool = False,
-		vision_mask: Optional[chex.Array] = None,
 		**kwargs,
 	):
-		raise NotImplementedError("Not Implemented Yet")
+		"""
+		Forward pass through the model.
+
+		Args:
+		    input_ids (chex.Array): Input tensor containing token IDs.
+		    input_embeds (Optional[chex.Array]): embedding inputs to be used instead of input_ids.
+		    attention_mask (Optional[chex.Array]): Mask for attention.
+		    position_ids (Optional[chex.Array]): Positional indices.
+		    segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
+		    params (dict, optional): Parameters for the model.
+		    past_key_values (dict, optional): Past key and value states for caching.
+		    dropout_rng (jax.random.PRNGKey, optional): RNG key for dropout.
+		    train (bool): If True, the model is in training mode.
+		    output_attentions (Optional[bool]): If True, output attention weights.
+		    output_hidden_states (Optional[bool]): If True, output hidden states.
+		    return_dict (Optional[bool]): If True, return a dictionary of outputs.
+		    add_params_field (bool): If True, include the parameters in the input dictionary.
+		    **kwargs: Additional arguments.
+
+		Returns:
+		    Output type depends on the model configuration.
+		"""
+		output_attentions = (
+			output_attentions
+			if output_attentions is not None
+			else self.config.output_attentions
+		)
+		output_hidden_states = (
+			output_hidden_states
+			if output_hidden_states is not None
+			else self.config.output_hidden_states
+		)
+		return_dict = return_dict if return_dict is not None else self.config.return_dict
+		batch_size, sequence_length = (
+			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
+		)
+
+		if position_ids is None:
+			if past_key_values is not None:
+				raise ValueError(
+					"Make sure to provide `position_ids` when passing `past_key_values`."
+				)
+
+			position_ids = jnp.broadcast_to(
+				jnp.arange(sequence_length)[None, :], (batch_size, sequence_length)
+			)
+
+		if attention_mask is None:
+			attention_mask = jnp.ones((batch_size, sequence_length))
+
+		rngs = {}
+		if dropout_rng is not None:
+			rngs["dropout"] = dropout_rng
+
+		if self.config.bits is not None:
+			rngs["params"] = jax.random.key(0)
+
+		inputs = (
+			{"params": params or self.params} if add_params_field else params or self.params
+		)
+
+		if past_key_values is not None:
+			inputs["cache"] = past_key_values
+			mutable = ["cache"]
+		else:
+			mutable = False
+		kwargs.pop("deterministic", None)
+		kwargs.pop("init_cache", None)
+		child_call_args = dict(
+			input_ids=jnp.array(input_ids, dtype="i4"),
+			attention_mask=jnp.array(attention_mask, dtype="i4"),
+			position_ids=jnp.array(position_ids, dtype="i4"),
+			deterministic=not train,
+			init_cache=False,
+			output_attentions=output_attentions,
+			output_hidden_states=output_hidden_states,
+			return_dict=return_dict,
+			input_embeds=input_embeds,
+			segment_ids=segment_ids,
+			**kwargs,
+		)
+		all_kwargs = {k: v for k, v in child_call_args.items()}
+		filtered_kwargs = self._validate_signature(self.module.__call__, (), all_kwargs)
+		outputs = self.module.apply(inputs, rngs=rngs, mutable=mutable, **filtered_kwargs)
+
+		if past_key_values is not None and return_dict:
+			outputs, past_key_values = outputs
+			outputs["past_key_values"] = unfreeze(past_key_values["cache"])
+			return outputs
+		elif past_key_values is not None and not return_dict:
+			outputs, past_key_values = outputs
+			outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
+
+		return outputs
 
 	def __repr__(self):
 		"""The __repr__ function is used to generate a string representation of an object.
@@ -1617,3 +1868,34 @@ class EasyDeLBaseModule(FlaxPreTrainedModel):
 			params,
 		)
 		return params
+
+
+def wrap_easydel_module(
+	config_class: Type[EasyDeLBaseConfig],
+	base_model_prefix: str = "model",
+):
+	def wrapper(mdl: Type[M]) -> Type[EasyDeLBaseModule]:
+		class_dict = {
+			"config_class": config_class,
+			"base_model_prefix": base_model_prefix,
+			"module_class": mdl,
+			"__annotations__": {
+				"config_class": Type[EasyDeLBaseConfig],
+				"base_model_prefix": str,
+				"flax_module": Type[M],
+				"module_class": Union[flax.linen.Module, Type[M]],
+			},
+		}
+
+		for name, attr in mdl.__dict__.items():
+			if not name.startswith("__"):
+				class_dict[name] = attr
+
+		WrappedModule = type(mdl.__name__, (EasyDeLBaseModule,), class_dict)
+		WrappedModule.__module__ = mdl.__module__
+		WrappedModule.__qualname__ = mdl.__qualname__
+		WrappedModule.__doc__ = mdl.__doc__
+
+		return WrappedModule
+
+	return wrapper

@@ -22,7 +22,7 @@ def main():
 	num_devices = len(jax.devices())
 	input_shape = (num_devices, max_length)
 
-	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
+	pretrained_model_name_or_path = "EasyDeL/EasyDeL-Llama-3.2-1B-Instruct"
 	dtype = jnp.float16
 	partition_axis = ed.PartitionAxis()
 
@@ -35,10 +35,10 @@ def main():
 		sharding_axis_dims=sharding_axis_dims,
 		config_kwargs=dict(
 			freq_max_position_embeddings=max_length,
-			mask_max_position_embeddings=max_length, 
+			mask_max_position_embeddings=max_length,
 			attn_dtype=jnp.float16,
 			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
-			attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
+			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		),
 		quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
 		param_dtype=dtype,

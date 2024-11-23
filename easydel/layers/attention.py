@@ -1685,18 +1685,18 @@ class FlaxAttentionModule(nn.Module):
 		)
 
 	@nn.compact
-	def _concatenate_to_cache(self, key, value, query_states, attention_mask):
+	def _concatenate_to_cache(self, query, key, value, attention_mask):
 		"""The _concatenate_to_cache function is used to concatenate the key and value vectors
-		of a query_states with those of previous queries. This allows for the attention mechanism to
+		of a query  with those of previous queries. This allows for the attention mechanism to
 		look at all previous queries when computing its output. The function takes in three
-		arguments: key, value, and query_states. It also uses two variables that are stored in the cache:
+		arguments: key, value, and query . It also uses two variables that are stored in the cache:
 		cached_key and cached_value.
 
 		Args:
 		    self: Access the variables stored in the cache
 		    key: Store the keys of the encoder-decoder attention
 		    value: Initialize the cached_value variable
-		    query_states: Determine the number of cache vectors to update
+		    query : Determine the number of cache vectors to update
 		    attention_mask: Mask out the padded vectors in the cache
 
 		Returns:
@@ -1764,7 +1764,7 @@ class FlaxAttentionModule(nn.Module):
 			*batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
 			cur_index = cache_index.value
 			if (
-				query_states.shape[1] == 1
+				query.shape[1] == 1
 				and self.config.use_sharded_kv_caching
 				and quantization_method == EasyDeLQuantizationMethods.NONE
 			):
@@ -1822,7 +1822,7 @@ class FlaxAttentionModule(nn.Module):
 					...
 				key = lax.dynamic_update_slice(key_val, key, indices)
 				value = lax.dynamic_update_slice(value_val, value, indices)
-				num_updated_cache_vectors = query_states.shape[1]
+				num_updated_cache_vectors = query.shape[1]
 				pad_mask = jnp.broadcast_to(
 					jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
 					tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
@@ -1830,9 +1830,106 @@ class FlaxAttentionModule(nn.Module):
 				attention_mask = jnp.logical_and(pad_mask, attention_mask)
 			cached_key.value = quantizer(with_sharding_constraint(key, kv_spec))
 			cached_value.value = quantizer(with_sharding_constraint(value, kv_spec))
-			num_updated_cache_vectors = query_states.shape[1]
+			num_updated_cache_vectors = query.shape[1]
 			cache_index.value = cache_index.value + num_updated_cache_vectors
 		return key, value, attention_mask
+
+	def concatenate_to_cache(
+		self,
+		*,
+		init_cache: bool,
+		query: jax.Array,
+		key: jax.Array,
+		value: jax.Array,
+		attention_mask: jax.Array,
+		causal_mask: Optional[jax.Array],
+		fcm_mask: Optional[jax.Array],
+	) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+		"""
+		takes in qkv with additional masks and concatenate them to cache for generation
+
+		Args:
+				init_cache (bool): whenever to init cache or not.
+				query (jax.Array): query states from model proj.
+				key (jax.Array): key states from model proj.
+				value (jax.Array): value states from model proj.
+				attention_mask (jax.Array): attention mask.
+				causal_mask (Optional[jax.Array])): causal_mask if provided.
+				fcm_mask (Optional[jax.Array]): fcm mask if provided.
+
+		Returns:
+				Tuple[jax.Array, jax.Array, jax.Array, jax.Array,jax.Array]: returns query, key, value, attention_bias, attention_mask
+		"""
+		query_length = query.shape[1]
+		key_length = key.shape[1]
+		if causal_mask is not None:
+			if self.has_variable("cache", "cached_key"):
+				causal_mask = lax.dynamic_slice(
+					causal_mask,
+					(0, 0, self.variables["cache"]["cache_index"], 0),
+					(1, 1, query_length, self.variables["cache"]["cached_key"].shape[1]),
+				)
+			else:
+				causal_mask = causal_mask[:, :, :query_length, :key_length]
+			causal_mask = jnp.broadcast_to(
+				causal_mask, (query.shape[0],) + causal_mask.shape[1:]
+			)
+			if attention_mask.ndim == 2:
+				attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+			attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
+			attention_mask = nn.combine_masks(attention_mask, causal_mask, fcm_mask)
+		else:
+			attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+
+		if self.has_variable("cache", "cached_key") or init_cache:
+			key, value, attention_mask = self._concatenate_to_cache(
+				key,
+				value,
+				query,
+				attention_mask,
+			)
+
+		attention_bias = lax.select(
+			attention_mask > 0,
+			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+			jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+		)
+		return query, key, value, attention_bias, attention_mask
+
+	def shard_attention_prod(self, attn_output: jax.Array) -> jax.Array:
+		"""
+		shards attention output before passing that to output_proj
+
+		Args:
+				attn_output (jax.Array): merged output of dot product attention with 3 dims, (batch, seqlen, hidden_size).
+
+		Returns:
+				jax.Array: sharded version of `attn_output`
+		"""
+		return with_sharding_constraint(
+			attn_output,
+			PartitionSpec(
+				self.config.partition_axis.batch_axis,
+				(
+					self.config.partition_axis.sequence_axis
+					if attn_output.shape[1] != 1
+					else None
+				),
+				self.config.partition_axis.hidden_state_axis,
+			),
+		)
+
+	def _merge_heads(self, hidden_states: jax.Array) -> jax.Array:
+		"""
+		Merges the attention heads into a single hidden state tensor.
+
+		Args:
+		    hidden_states (jax.Array): The hidden states with separate head dimensions.
+
+		Returns:
+		    jax.Array: The hidden states with merged head dimensions.
+		"""
+		return hidden_states.reshape(hidden_states.shape[:2] + (-1,))
 
 	@staticmethod
 	def repeat_key_value(key, value, num_reps: int):

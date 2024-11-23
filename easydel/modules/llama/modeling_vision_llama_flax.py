@@ -38,7 +38,6 @@ from easydel.modules.llama.llama_configuration import VisionLlamaConfig
 from easydel.modules.llama.modeling_llama_flax import (
 	FlaxLlamaBlockCollection,
 	RMSNorm,
-	precompute_frequencies,
 )
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
@@ -267,24 +266,6 @@ class FlaxVisionLlamaModule(nn.Module):
 				dtype="bool",
 			),
 			dtype="bool",
-		)
-
-		initial_rope_kwargs = dict(rope_type="none")
-		if config.rope_scaling is not None:
-			scaling_type = config.rope_scaling["type"]
-			scaling_factor = config.rope_scaling["factor"]
-			initial_rope_kwargs = dict(scaling_factor=scaling_factor, rope_type=scaling_type)
-		self.frequencies = precompute_frequencies(
-			max_position_embeddings=(
-				getattr(
-					self.config,
-					"freq_max_position_embeddings",
-					self.config.max_position_embeddings,
-				)
-			),
-			dim=config.hidden_size // config.num_attention_heads,
-			base=config.rope_theta,
-			**initial_rope_kwargs,
 		)
 
 	def __call__(
