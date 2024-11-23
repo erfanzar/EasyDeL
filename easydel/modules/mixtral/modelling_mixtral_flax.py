@@ -42,7 +42,6 @@ from easydel.modules.flax_modeling_utils import (
 	precompute_frequencies,
 	with_sharding_constraint,
 )
-from easydel.modules.mixtral.kernels import mixtral_mlp_pallas
 from easydel.modules.mixtral.mixtral_configuration import MixtralConfig as MixtralConfig
 from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
 from easydel.modules.modeling_utils import EasyDeLBaseModule
@@ -333,27 +332,6 @@ class FlaxMixtralBLockSparseTop2MLP(nn.Module):
 
 	def __call__(self, x: chex.Array):
 		x = control_mlp_sharding(x, self.config.partition_axis)
-		if (
-			self.config.hardware_abstraction
-			and self.w2.variables.get("params", None) is not None
-		):
-			return jax.vmap(
-				functools.partial(
-					mixtral_mlp_pallas,
-					act_fn=self.act_fn,
-					blocksize_k=self.config.pallas_k_block_size,
-					blocksize_m=self.config.pallas_m_block_size,
-					blocksize_n=self.config.pallas_n_block_size,
-					prod_dtype=self.dtype,
-					precision=self.precision,
-				),
-				in_axes=(0, None, None, None),
-			)(
-				x,
-				self.w1.variables["params"]["kernel"],
-				self.w2.variables["params"]["kernel"],
-				self.w3.variables["params"]["kernel"],
-			)
 
 		return self.w2(self.act_fn(self.w1(x)) * self.w3(x))
 

@@ -33,7 +33,6 @@ import chex
 import fjformer
 import fjformer.sharding
 import flax
-import flax.nnx as nn
 import jax
 import jax.extend
 import jax.tree_util
@@ -45,9 +44,9 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import numpy as jnp
 from jax.experimental.mesh_utils import create_device_mesh
 from jax.sharding import Mesh, PartitionSpec
+from transformers import FlaxPreTrainedModel
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils.generic import working_or_temp_dir
-from transformers.utils.hub import PushToHubMixin
 
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.etils import (
@@ -132,9 +131,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 	    axis_dims (Sequence[int]): Specify the number of dimensions for each axis
 	    axis_names (Sequence[str]): Set the names of the axes
 	    attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS): attention mechanism to use
-	    block_k (int): block size of key_states
-	    block_q (int): block size of query_states
-	    block_b (int): block size of bias
+	    blocksize_k (int): block size of key_states
+	    blocksize_q (int): block size of query_states
+	    blocksize_b (int): block size of bias
 	    partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
 	    shard_attention_computation (bool): whenever to shard qkv b for attention
 	    use_sharding_constraint (bool): whether to use sharding constraint for the arrays
@@ -158,9 +157,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		axis_dims: Sequence[int] = (1, -1, 1, 1),
 		axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
 		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_ATTENTION_MECHANISM,
-		block_k: int = 128,
-		block_q: int = 128,
-		block_b: int = 1,
+		blocksize_k: int = 128,
+		blocksize_q: int = 128,
+		blocksize_b: int = 1,
 		partition_axis: PartitionAxis = PartitionAxis(),  # noqa
 		shard_attention_computation: bool = True,
 		use_sharded_kv_caching: bool = True,
@@ -174,8 +173,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
 		attention_axis_name: str = "sp",
-		quantize_kv_cache: bool = False,
-		kv_cache_quantization_method: Literal["nf4", "8bit"] = "8bit",
+		kv_cache_quantization_method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.NONE,
+		kv_cache_quantization_blocksize: int = 64,
+		kv_cache_sharding_sequence_axis_name: Union[str, Tuple[str, ...]] = "sp",
 		flash_attention_backward_pass_impl: Literal["triton", "xla"] = "triton",
 		attn_dtype: jnp.dtype = jnp.float32,
 		fcm_max_ratio: float = 0.0,
@@ -186,16 +186,43 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		pallas_n_block_size: int = DEFAULT_PALLAS_N_BLOCK_SIZE,
 		**kwargs,
 	):
-		self.axis_dims = getattr(
-			self,
-			"axis_dims",
-			axis_dims,
-		)
-		self.axis_names = getattr(
-			self,
-			"axis_names",
-			axis_names,
-		)
+		"""
+		Initialize the EasyDeLBaseConfig class with configuration parameters.
+
+		Args:
+		    axis_dims (Sequence[int], optional): Specify the number of dimensions for each axis. Defaults to (1, -1, 1, 1).
+		    axis_names (Sequence[str], optional): Set the names of the axes. Defaults to ("dp", "fsdp", "tp", "sp").
+		    attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS, optional): attention mechanism to use. Defaults to DEFAULT_ATTENTION_MECHANISM.
+		    blocksize_k (int, optional): block size of key_states. Defaults to 128.
+		    blocksize_q (int, optional): block size of query_states. Defaults to 128.
+		    blocksize_b (int, optional): block size of bias. Defaults to 1.
+		    partition_axis (PartitionAxis, optional): PartitionAxis is new module used for partitioning arrays in easydel. Defaults to PartitionAxis().
+		    shard_attention_computation (bool, optional): whenever to use shard_map for attention. Defaults to True.
+		    use_sharded_kv_caching (bool, optional): whenever to use shard_map and sharding for key and value. Defaults to True.
+		    backend (Optional[EasyDeLBackends], optional): Specify the backend to use. Defaults to None.
+		    platform (Optional[EasyDeLPlatforms], optional): Specify the platform to used to use. Defaults to None.
+		    easy_method (Literal["train", "serve", "convert"], optional): easydel Quantization Method to be applied for. Defaults to EasyMethod.TRAIN.
+		    bits (Optional[int], optional): Model bits for quantization. Defaults to None.
+		    scan_ring_attention (bool, optional): Whether to use can for ring attention. Defaults to True.
+		    scan_attention_layers (bool, optional): Whether to use can for attention layers. Defaults to False.
+		    use_sharding_constraint (bool, optional): whether to use sharding constraint for the arrays. Defaults to False.
+		    use_scan_mlp (bool, optional): Determine whether to use scan_mlp or not. Defaults to False.
+		    scan_mlp_chunk_size (int, optional): Size of chunks in scan MLP. Defaults to 1024.
+		    attention_axis_name (str, optional): Name of the attention axis name. Defaults to "sp".
+		    kv_cache_quantization_method (EasyDeLQuantizationMethods, optional): key and value quantization type. Defaults to EasyDeLQuantizationMethods.NONE.
+		    kv_cache_quantization_blocksize (int, optional): size of kv cache quantization. Defaults to 64.
+		    kv_cache_sharding_sequence_axis_name (Union[str, Tuple[str, ...]], optional): axis name to target for sharding sequences. Defaults to "sp".
+		    flash_attention_backward_pass_impl (Literal["triton", "xla"], optional): Specify the backward pass kernel for flash attention. Defaults to "triton".
+		    attn_dtype (jnp.dtype, optional): Data type for attention computations. Defaults to jnp.float32.
+		    fcm_max_ratio (float, optional): Maximum ratio for flash cross attention. Defaults to 0.0.
+		    fcm_min_ratio (float, optional): Minimum ratio for flash cross attention. Defaults to 0.0.
+		    hardware_abstraction (bool, optional): whenever to switch to custom pallas kernels instead of JAX. Defaults to DEFAULT_HARDWARE_ABSTRACTION.
+		    pallas_m_block_size (int, optional): block size m dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`. Defaults to DEFAULT_PALLAS_M_BLOCK_SIZE.
+		    pallas_k_block_size (int, optional): block size k dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`. Defaults to DEFAULT_PALLAS_K_BLOCK_SIZE.
+		    pallas_n_block_size (int, optional): block size n dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`. Defaults to DEFAULT_PALLAS_N_BLOCK_SIZE.
+		"""
+		self.axis_dims = getattr(self, "axis_dims", axis_dims)
+		self.axis_names = getattr(self, "axis_names", axis_names)
 		self.backend = getattr(
 			self,
 			"backend",
@@ -208,141 +235,62 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			if platform is not None
 			else ("triton" if jax.default_backend() == "gpu" else "jax"),
 		)
-		self.easy_method = getattr(
-			self,
-			"easy_method",
-			easy_method,
-		)
-		self.attn_mechanism = getattr(
-			self,
-			"attn_mechanism",
-			attn_mechanism,
-		)
-		self.block_b = getattr(
-			self,
-			"block_b",
-			block_b,
-		)
-		self.block_k = getattr(
-			self,
-			"block_k",
-			block_k,
-		)
-		self.block_q = getattr(
-			self,
-			"block_q",
-			block_q,
-		)
-		self.partition_axis = getattr(
-			self,
-			"partition_axis",
-			partition_axis,
-		)
+		self.easy_method = getattr(self, "easy_method", easy_method)
+		self.attn_mechanism = getattr(self, "attn_mechanism", attn_mechanism)
+		self.blocksize_b = getattr(self, "blocksize_b", blocksize_b)
+		self.blocksize_k = getattr(self, "blocksize_k", blocksize_k)
+		self.blocksize_q = getattr(self, "blocksize_q", blocksize_q)
+		self.partition_axis = getattr(self, "partition_axis", partition_axis)
 		self.shard_attention_computation = getattr(
-			self,
-			"shard_attention_computation",
-			shard_attention_computation,
+			self, "shard_attention_computation", shard_attention_computation
 		)
-		self.bits = getattr(
-			self,
-			"bits",
-			bits,
-		)
+		self.bits = getattr(self, "bits", bits)
 		self.scan_attention_layers = getattr(
-			self,
-			"scan_attention_layers",
-			scan_attention_layers,
+			self, "scan_attention_layers", scan_attention_layers
 		)
-		self.scan_ring_attention = getattr(
-			self,
-			"scan_ring_attention",
-			scan_ring_attention,
-		)
+		self.scan_ring_attention = getattr(self, "scan_ring_attention", scan_ring_attention)
 		self.use_sharded_kv_caching = getattr(
-			self,
-			"use_sharded_kv_caching",
-			use_sharded_kv_caching,
+			self, "use_sharded_kv_caching", use_sharded_kv_caching
 		)
-		self.use_scan_mlp = getattr(
-			self,
-			"use_scan_mlp",
-			use_scan_mlp,
-		)
-		self.scan_mlp_chunk_size = getattr(
-			self,
-			"scan_mlp_chunk_size",
-			scan_mlp_chunk_size,
-		)
+		self.use_scan_mlp = getattr(self, "use_scan_mlp", use_scan_mlp)
+		self.scan_mlp_chunk_size = getattr(self, "scan_mlp_chunk_size", scan_mlp_chunk_size)
 		self.use_sharding_constraint = getattr(
-			self,
-			"use_sharding_constraint",
-			use_sharding_constraint,
+			self, "use_sharding_constraint", use_sharding_constraint
 		)
-		self.attention_axis_name = getattr(
-			self,
-			"attention_axis_name",
-			attention_axis_name,
-		)
-		self.quantize_kv_cache = getattr(
-			self,
-			"quantize_kv_cache",
-			quantize_kv_cache,
-		)
+		self.attention_axis_name = getattr(self, "attention_axis_name", attention_axis_name)
 
+		self.kv_cache_quantization_blocksize = getattr(
+			self, "kv_cache_quantization_blocksize", kv_cache_quantization_blocksize
+		)
+		self.kv_cache_sharding_sequence_axis_name = getattr(
+			self, "kv_cache_sharding_sequence_axis_name", kv_cache_sharding_sequence_axis_name
+		)
 		self.kv_cache_quantization_method = getattr(
-			self,
-			"kv_cache_quantization_method",
-			kv_cache_quantization_method,
+			self, "kv_cache_quantization_method", kv_cache_quantization_method
 		)
 		self.flash_attention_backward_pass_impl = getattr(
-			self,
-			"flash_attention_backward_pass_impl",
-			flash_attention_backward_pass_impl,
+			self, "flash_attention_backward_pass_impl", flash_attention_backward_pass_impl
 		)
-		self.attn_dtype = getattr(
-			self,
-			"attn_dtype",
-			attn_dtype,
-		)
+		self.attn_dtype = getattr(self, "attn_dtype", attn_dtype)
 
-		self.fcm_max_ratio = getattr(
-			self,
-			"fcm_max_ratio",
-			fcm_max_ratio,
-		)
-		self.fcm_min_ratio = getattr(
-			self,
-			"fcm_min_ratio",
-			fcm_min_ratio,
-		)
+		self.fcm_max_ratio = getattr(self, "fcm_max_ratio", fcm_max_ratio)
+		self.fcm_min_ratio = getattr(self, "fcm_min_ratio", fcm_min_ratio)
 
 		self.hardware_abstraction = getattr(
-			self,
-			"hardware_abstraction",
-			hardware_abstraction,
+			self, "hardware_abstraction", hardware_abstraction
 		)
-		self.pallas_m_block_size = getattr(
-			self,
-			"pallas_m_block_size",
-			pallas_m_block_size,
-		)
-		self.pallas_k_block_size = getattr(
-			self,
-			"pallas_k_block_size",
-			pallas_k_block_size,
-		)
-		self.pallas_n_block_size = getattr(
-			self,
-			"pallas_n_block_size",
-			pallas_n_block_size,
-		)
+		self.pallas_m_block_size = getattr(self, "pallas_m_block_size", pallas_m_block_size)
+		self.pallas_k_block_size = getattr(self, "pallas_k_block_size", pallas_k_block_size)
+		self.pallas_n_block_size = getattr(self, "pallas_n_block_size", pallas_n_block_size)
 
 		self.pretraining_tp = 1  # it's for pytorch models.
-		if self.quantize_kv_cache and self.use_sharded_kv_caching:
-			quantize_kv_cache = self.quantize_kv_cache
+		if (
+			self.kv_cache_quantization_method != EasyDeLQuantizationMethods.NONE
+			and self.use_sharded_kv_caching
+		):
 			use_sharded_kv_caching = self.use_sharded_kv_caching
 			warnings.warn(
-				f"`{quantize_kv_cache=}` and `{use_sharded_kv_caching=}`"
+				f"`{self.kv_cache_quantization_method=}` and `{use_sharded_kv_caching=}`"
 				" can't be used together at the moment.",
 				stacklevel=1,
 			)
@@ -472,9 +420,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		axis_dims: Sequence[int] = ...,
 		axis_names: Sequence[str] = ...,
 		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = ...,
-		block_k: int = ...,
-		block_q: int = ...,
-		block_b: int = ...,
+		blocksize_k: int = ...,
+		blocksize_q: int = ...,
+		blocksize_b: int = ...,
 		partition_axis: PartitionAxis = ...,
 		shard_attention_computation: bool = ...,
 		use_sharded_kv_caching: bool = ...,
@@ -488,8 +436,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		use_scan_mlp: bool = ...,
 		scan_mlp_chunk_size: int = ...,
 		attention_axis_name: str = ...,
-		quantize_kv_cache: bool = ...,
-		kv_cache_quantization_method: Literal["nf4", "8bit"] = ...,
+		kv_cache_quantization_method: EasyDeLQuantizationMethods = ...,
+		kv_cache_quantization_blocksize: int = ...,
+		kv_cache_sharding_sequence_axis_name: Union[str, Tuple[str, ...]] = ...,
 		flash_attention_backward_pass_impl: Literal["triton", "xla"] = ...,
 		attn_dtype: jnp.dtype = ...,
 		hardware_abstraction: bool = ...,
@@ -501,144 +450,59 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		It initializes all the attributes of an object, and it's called when you create a new instance of that class.
 
 		Args:
-		    axis_dims (Sequence[int]): Specify the number of dimensions for each axis
-		    axis_names (Sequence[str]): Set the names of the axes
-		    attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS): attention mechanism to use
-		    block_k (int): block size of key_states
-		    block_q (int): block size of query_states
-		    block_b (int): block size of bias
-		    partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
-		    shard_attention_computation (bool): whenever to use shard_map for attention
-		    use_sharded_kv_caching (bool): whenever to use shard_map and sharding for key and value
-		    backend (Optional[EasyDeLBackends]): Specify the backend to use
-		platform (Optional[EasyDeLPlatforms]): Specify the platform to used to use
-		    easy_method (Literal["train", "serve", "convert"]): easydel Quantization Method to be applied for
-		    bits (Optional[int]): Model bits for quantization
-		    use_sharding_constraint (bool): whether to use sharding constraint for the arrays
-		    scan_ring_attention (bool): Whether to use can for ring attention
-		    scan_attention_layers (bool): Whether to use can for attention layers
-		    use_scan_mlp (bool): Determine whether to use scan_mlp or not
-		    scan_mlp_chunk_size (int): Size of chunks in scan MLP.
-		    attention_axis_name (str): Name of the attention axis name
-		    quantize_kv_cache (bool): Whether to quantize Key/Value in attention for generation process.
-				kv_cache_quantization_method (Literal["nf4", "8bit"]): key and value quantization type in case of passing quantize_kv_cache as True.
-		    flash_attention_backward_pass_impl (Literal["triton", "xla"]): Specify the backward pass kernel for flash attention
-				hardware_abstraction (bool): whenever to switch to custom pallas kernels instead of JAX.
-				pallas_m_block_size (int): block size m dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`.
-				pallas_k_block_size (int): block size k dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`.
-				pallas_n_block_size (int): block size n dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`.
+		    axis_dims (Sequence[int], optional): Specify the number of dimensions for each axis. Defaults to ....
+		    axis_names (Sequence[str], optional): Set the names of the axes. Defaults to ....
+		    attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS, optional): attention mechanism to use. Defaults to ....
+		    blocksize_k (int, optional): block size of key_states. Defaults to ....
+		    blocksize_q (int, optional): block size of query_states. Defaults to ....
+		    blocksize_b (int, optional): block size of bias. Defaults to ....
+		    partition_axis (PartitionAxis, optional): PartitionAxis is new module used for partitioning arrays in easydel. Defaults to ....
+		    shard_attention_computation (bool, optional): whenever to use shard_map for attention. Defaults to ....
+		    use_sharded_kv_caching (bool, optional): whenever to use shard_map and sharding for key and value. Defaults to ....
+		    backend (Optional[EasyDeLBackends], optional): Specify the backend to use. Defaults to ....
+		    platform (Optional[EasyDeLPlatforms], optional): Specify the platform to used to use. Defaults to ....
+		    easy_method (Literal["train", "serve", "convert"], optional): easydel Quantization Method to be applied for. Defaults to ....
+		    bits (Optional[int], optional): Model bits for quantization. Defaults to ....
+		    scan_ring_attention (bool, optional): Whether to use can for ring attention. Defaults to ....
+		    scan_attention_layers (bool, optional): Whether to use can for attention layers. Defaults to ....
+		    use_sharding_constraint (bool, optional): whether to use sharding constraint for the arrays. Defaults to ....
+		    use_scan_mlp (bool, optional): Determine whether to use scan_mlp or not. Defaults to ....
+		    scan_mlp_chunk_size (int, optional): Size of chunks in scan MLP. Defaults to ....
+		    attention_axis_name (str, optional): Name of the attention axis name. Defaults to ....
+		    kv_cache_quantization_method (EasyDeLQuantizationMethods, optional): key and value quantization type. Defaults to ....
+		    kv_cache_quantization_blocksize (int, optional): size of kv cache quantization. Defaults to ....
+		    kv_cache_sharding_sequence_axis_name (Union[str, Tuple[str, ...]], optional): axis name to target for sharding sequences. Defaults to ....
+		    flash_attention_backward_pass_impl (Literal["triton", "xla"], optional): Specify the backward pass kernel for flash attention. Defaults to ....
+		    attn_dtype (jnp.dtype, optional): _description_. Defaults to ....
+		    hardware_abstraction (bool, optional): whenever to switch to custom pallas kernels instead of JAX. Defaults to ....
+		    pallas_m_block_size (int, optional): block size m dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`. Defaults to ....
+		    pallas_k_block_size (int, optional): block size k dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`. Defaults to ....
+		    pallas_n_block_size (int, optional): block size n dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`. Defaults to ....
+
 		"""
-		set_attrs_smartly(
-			self,
-			"axis_dims",
-			(1, -1, 1, 1),
-			axis_dims,
-		)
-		set_attrs_smartly(
-			self,
-			"axis_names",
-			("dp", "fsdp", "tp", "sp"),
-			axis_names,
-		)
+		set_attrs_smartly(self, "axis_dims", (1, -1, 1, 1), axis_dims)
+		set_attrs_smartly(self, "axis_names", ("dp", "fsdp", "tp", "sp"), axis_names)
 
-		set_attrs_smartly(
-			self,
-			"block_q",
-			512,
-			block_q,
-		)
-		set_attrs_smartly(
-			self,
-			"block_k",
-			512,
-			block_k,
-		)
-		set_attrs_smartly(
-			self,
-			"block_b",
-			1,
-			block_b,
-		)
+		set_attrs_smartly(self, "blocksize_q", 512, blocksize_q)
+		set_attrs_smartly(self, "blocksize_k", 512, blocksize_k)
+		set_attrs_smartly(self, "blocksize_b", 1, blocksize_b)
 
+		set_attrs_smartly(self, "partition_axis", PartitionAxis(), partition_axis)
+		set_attrs_smartly(self, "use_sharding_constraint", False, use_sharding_constraint)
+		set_attrs_smartly(self, "backend", None, backend)
+		set_attrs_smartly(self, "platform", "jax", platform)
 		set_attrs_smartly(
-			self,
-			"partition_axis",
-			PartitionAxis(),
-			partition_axis,
+			self, "shard_attention_computation", True, shard_attention_computation
 		)
-		set_attrs_smartly(
-			self,
-			"use_sharding_constraint",
-			False,
-			use_sharding_constraint,
-		)
-		set_attrs_smartly(
-			self,
-			"backend",
-			None,
-			backend,
-		)
-		set_attrs_smartly(
-			self,
-			"platform",
-			"jax",
-			platform,
-		)
-		set_attrs_smartly(
-			self,
-			"shard_attention_computation",
-			True,
-			shard_attention_computation,
-		)
-		set_attrs_smartly(
-			self,
-			"use_sharded_kv_caching",
-			True,
-			use_sharded_kv_caching,
-		)
-		set_attrs_smartly(
-			self,
-			"attn_mechanism",
-			"jax_flash_attn2",
-			attn_mechanism,
-		)
+		set_attrs_smartly(self, "use_sharded_kv_caching", True, use_sharded_kv_caching)
+		set_attrs_smartly(self, "attn_mechanism", "jax_flash_attn2", attn_mechanism)
 
-		set_attrs_smartly(
-			self,
-			"easy_method",
-			EasyMethod.TRAIN,
-			easy_method,
-		)
-		set_attrs_smartly(
-			self,
-			"bits",
-			None,
-			bits,
-		)
-		set_attrs_smartly(
-			self,
-			"scan_attention_layers",
-			True,
-			scan_attention_layers,
-		)
-		set_attrs_smartly(
-			self,
-			"scan_ring_attention",
-			True,
-			scan_ring_attention,
-		)
-		set_attrs_smartly(
-			self,
-			"use_scan_mlp",
-			False,
-			use_scan_mlp,
-		)
-		set_attrs_smartly(
-			self,
-			"scan_mlp_chunk_size",
-			1024,
-			scan_mlp_chunk_size,
-		)
+		set_attrs_smartly(self, "easy_method", EasyMethod.TRAIN, easy_method)
+		set_attrs_smartly(self, "bits", None, bits)
+		set_attrs_smartly(self, "scan_attention_layers", True, scan_attention_layers)
+		set_attrs_smartly(self, "scan_ring_attention", True, scan_ring_attention)
+		set_attrs_smartly(self, "use_scan_mlp", False, use_scan_mlp)
+		set_attrs_smartly(self, "scan_mlp_chunk_size", 1024, scan_mlp_chunk_size)
 		set_attrs_smartly(
 			self,
 			"attention_axis_name",
@@ -647,14 +511,20 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		)
 		set_attrs_smartly(
 			self,
-			"quantize_kv_cache",
-			False,
-			quantize_kv_cache,
+			"kv_cache_quantization_blocksize",
+			128,
+			kv_cache_quantization_blocksize,
+		)
+		set_attrs_smartly(
+			self,
+			"kv_cache_sharding_sequence_axis_name",
+			"sp",
+			kv_cache_sharding_sequence_axis_name,
 		)
 		set_attrs_smartly(
 			self,
 			"kv_cache_quantization_method",
-			"8bit",
+			EasyDeLQuantizationMethods.NONE,
 			kv_cache_quantization_method,
 		)
 
@@ -849,13 +719,32 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		return cls.from_dict(config_dict, **kwargs)
 
 
-class EasyDeLBaseModule(PushToHubMixin, nn.Module):
+class EasyDeLBaseModule(FlaxPreTrainedModel):
 	def __init__(
 		self,
-		config: PretrainedConfig,
+		config: Optional[PretrainedConfig] = None,
+		module: Optional[flax.linen.Module] = None,
+		input_shape: Tuple = (AVAILALBE_DEVICES, AVAILALBE_DEVICES),
+		seed: int = 0,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,  # Ignored #noqa
+		precision: Optional[Union[jax.lax.Precision, str]] = None,  # Ignored #noqa
+		_do_init: bool = True,
 	):
-		self.config = config
-		super().__init__()
+		assert config is not None, "`config` must be provided.`"
+		assert module is not None, "`module` must be provided.`"
+
+		self.param_dtype = param_dtype
+		self.precision = precision
+
+		super().__init__(
+			config=config,
+			module=module,
+			input_shape=input_shape,
+			seed=seed,
+			dtype=dtype,
+			_do_init=_do_init,
+		)
 
 	@property
 	def mesh(self):

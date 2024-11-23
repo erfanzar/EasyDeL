@@ -1,7 +1,7 @@
-t5.kernels package
+cache_view package
 ==================
 
-.. automodule:: easydel.modules.t5.kernels
+.. automodule:: easydel.layers.cache_view
     :members:
     :undoc-members:
     :show-inheritance:

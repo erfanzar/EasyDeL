@@ -47,10 +47,9 @@ from easydel.modules.flax_modeling_utils import (
 	precompute_frequencies,
 	with_sharding_constraint,
 )
-from easydel.modules.mistral.kernels import mistral_mlp_pallas
-from easydel.modules.mistral.mistral_configuration import MistralConfig as MistralConfig
-from easydel.modules.mistral.vision_mistral_configuration import (
-	VisionMistralConfig as VisionMistralConfig,
+from easydel.modules.mistral.mistral_configuration import (
+	MistralConfig,
+	VisionMistralConfig,
 )
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
@@ -146,27 +145,6 @@ class FlaxMistralMLP(nn.Module):
 		    chex.Array: Output tensor after applying dense layers and activation functions.
 		"""
 		x = control_mlp_sharding(x, self.config.partition_axis)
-		if (
-			self.config.hardware_abstraction
-			and self.gate_proj.variables.get("params", None) is not None
-		):
-			return jax.vmap(
-				functools.partial(
-					mistral_mlp_pallas,
-					act_fn=self.act_fn,
-					blocksize_k=self.config.pallas_k_block_size,
-					blocksize_m=self.config.pallas_m_block_size,
-					blocksize_n=self.config.pallas_n_block_size,
-					prod_dtype=self.dtype,
-					precision=self.precision,
-				),
-				in_axes=(0, None, None, None),
-			)(
-				x,
-				self.gate_proj.variables["params"]["kernel"],
-				self.down_proj.variables["params"]["kernel"],
-				self.up_proj.variables["params"]["kernel"],
-			)
 		return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 

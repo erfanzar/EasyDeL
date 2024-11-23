@@ -100,8 +100,8 @@ def main(use_iterable_dataset: bool):
 		max_position_embeddings=sequence_length,
 		attn_dtype=jnp.float32,
 		attn_mechanism=AttentionMechanisms.VANILLA,
-		block_k=64,
-		block_q=64,
+		blocksize_k=64,
+		blocksize_q=64,
 		platform="jax",
 	)
 

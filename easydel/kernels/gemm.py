@@ -225,7 +225,7 @@ def _analyze_matmul(
 	n: int,
 	block_m,
 	block_n,
-	block_k,
+	blocksize_k,
 	dtype: jnp.dtype,
 	mm_func,
 ):
@@ -239,11 +239,11 @@ def _analyze_matmul(
 		time = 1e6
 		if "RESOURCE_EXHAUSTED" in str(e):
 			logging.warning(
-				f"OOM error for configuration: block_m={block_m}, block_n={block_n}, block_k={block_k}"
+				f"OOM error for configuration: block_m={block_m}, block_n={block_n}, blocksize_k={blocksize_k}"
 			)
 		else:
 			logging.error(
-				f"Unexpected error for configuration: block_m={block_m}, block_n={block_n}, block_k={block_k}: {str(e)}"
+				f"Unexpected error for configuration: block_m={block_m}, block_n={block_n}, blocksize_k={blocksize_k}: {str(e)}"
 			)
 
 	try:
@@ -254,7 +254,7 @@ def _analyze_matmul(
 			logging.warning("OOM error for native matmul")
 		else:
 			logging.error(
-				f"Unexpected error for configuration: block_m={block_m}, block_n={block_n}, block_k={block_k}: {str(e)}"
+				f"Unexpected error for configuration: block_m={block_m}, block_n={block_n}, blocksize_k={blocksize_k}: {str(e)}"
 			)
 	mm_flops = _matmul_flops(m, k, n) / time
 	mm_flops_org = _matmul_flops(m, k, n) / time_org
@@ -276,7 +276,7 @@ def _analyze_matmul(
 class _MatMulConfig:
 	block_m: int
 	block_n: int
-	block_k: int
+	blocksize_k: int
 	time: float
 	flops: float
 
@@ -288,7 +288,7 @@ def matmul_benchmark(unused_args=None):
 	)
 
 	def log_configuration(config: _MatMulConfig, is_time_best: bool, is_flops_best: bool):
-		log_message = f"Configuration: block_m={config.block_m}, block_n={config.block_n}, block_k={config.block_k}"
+		log_message = f"Configuration: block_m={config.block_m}, block_n={config.block_n}, blocksize_k={config.blocksize_k}"
 		if is_time_best:
 			logging.info(f"New best time {log_message} - Time: {config.time:.6f} seconds")
 		if is_flops_best:
@@ -302,11 +302,11 @@ def matmul_benchmark(unused_args=None):
 
 		for block_m in BLOCK_SIZES:
 			for block_n in BLOCK_SIZES:
-				for block_k in BLOCK_SIZES:
+				for blocksize_k in BLOCK_SIZES:
 					time, flops = _analyze_matmul(
 						block_m=block_m,
 						m=m,
-						block_k=block_k,
+						blocksize_k=blocksize_k,
 						k=k,
 						block_n=block_n,
 						n=n,
@@ -315,12 +315,12 @@ def matmul_benchmark(unused_args=None):
 							gemm,
 							blocksize_m=block_m,
 							blocksize_n=block_n,
-							blocksize_k=block_k,
+							blocksize_k=blocksize_k,
 							prod_dtype=dtype,
 							precision=None,
 						),
 					)
-					current_config = _MatMulConfig(block_m, block_n, block_k, time, flops)
+					current_config = _MatMulConfig(block_m, block_n, blocksize_k, time, flops)
 
 					is_time_best = best_time_config is None or time < best_time_config.time
 					is_flops_best = best_flops_config is None or flops > best_flops_config.flops
@@ -335,7 +335,7 @@ def matmul_benchmark(unused_args=None):
 		return (
 			best_time_config.block_m,
 			best_time_config.block_n,
-			best_time_config.block_k,
+			best_time_config.blocksize_k,
 		), best_time_config.time
 
 	logging.basicConfig(
@@ -365,7 +365,7 @@ def matmul_benchmark(unused_args=None):
 		if PLATFORM != "gpu":
 			logging.info(
 				f"Best configuration ({m}x{k}x{n}): block_m={best_config[0]}, "
-				f"block_n={best_config[1]}, block_k={best_config[2]}"
+				f"block_n={best_config[1]}, blocksize_k={best_config[2]}"
 			)
 			best_configs[f"{m}x{k}x{n}"] = best_config
 			logging.info(f"Best time: {best_time:.6f} seconds")

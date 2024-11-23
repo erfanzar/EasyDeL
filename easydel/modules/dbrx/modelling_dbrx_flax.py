@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
 import math
 from typing import Optional, Tuple, Union
 
@@ -38,7 +37,6 @@ from easydel.modules.dbrx.dbrx_configuration import DbrxConfig as DbrxConfig
 from easydel.modules.dbrx.dbrx_configuration import DbrxFFNConfig as DbrxFFNConfig
 
 # easydel.modules
-from easydel.modules.dbrx.kernels import dbrx_mlp_pallas
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
@@ -439,43 +437,25 @@ class FlaxDbrxExpertGLU(nn.Module):
 		expert_w1 = self.w1.reshape(expert_shape)[expert_idx]
 		expert_v1 = self.v1.reshape(expert_shape)[expert_idx]
 		expert_w2 = self.w2.reshape(expert_shape)[expert_idx]
-		if self.config.hardware_abstraction:
-			return jax.vmap(
-				functools.partial(
-					dbrx_mlp_pallas,
-					act_fn=self.activation_fn,
-					blocksize_k=self.config.pallas_k_block_size,
-					blocksize_m=self.config.pallas_m_block_size,
-					blocksize_n=self.config.pallas_n_block_size,
-					prod_dtype=self.dtype,
-					precision=self.precision,
-				),
-				in_axes=(0, None, None, None),
-			)(
-				x,
-				expert_w1,
-				expert_v1,
-				expert_w2,
-			)
-		else:
-			x1 = jnp.matmul(
-				x,
-				jnp.expand_dims(expert_w1.T, 0),
-				precision=self.precision,
-			)
-			x2 = jnp.matmul(
-				x,
-				jnp.expand_dims(expert_v1.T, 0),
-				precision=self.precision,
-			)
-			x1 = self.activation_fn(x1)
-			x1 = x1 * x2
-			x1 = jnp.matmul(
-				x1,
-				jnp.expand_dims(expert_w2, 0),
-				precision=self.precision,
-			)
-			return x1
+
+		x1 = jnp.matmul(
+			x,
+			jnp.expand_dims(expert_w1.T, 0),
+			precision=self.precision,
+		)
+		x2 = jnp.matmul(
+			x,
+			jnp.expand_dims(expert_v1.T, 0),
+			precision=self.precision,
+		)
+		x1 = self.activation_fn(x1)
+		x1 = x1 * x2
+		x1 = jnp.matmul(
+			x1,
+			jnp.expand_dims(expert_w2, 0),
+			precision=self.precision,
+		)
+		return x1
 
 
 class FlaxDbrxExperts(nn.Module):

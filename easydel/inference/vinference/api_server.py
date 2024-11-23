@@ -13,18 +13,20 @@
 # limitations under the License.
 
 from __future__ import annotations
+
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, AsyncGenerator, Callable, Dict, Optional
 
-from calute import ChatMessage
 import uvicorn
+from calute import ChatMessage
 from fastapi import APIRouter, FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 from prometheus_client import start_http_server
+
 from easydel.etils.etils import get_logger
 from easydel.inference.vinference.api_models import (
 	ChatCompletionRequest,
@@ -200,7 +202,7 @@ class vInferenceApiServer:
 			if response.generated_tokens == inference.generation_config.max_new_tokens
 			else "stop"
 		)
-		
+
 		return ChatCompletionResponse(
 			model=request.model,
 			choices=[

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
 import math
 from typing import Optional, Tuple, Union
 
@@ -32,7 +31,6 @@ from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModul
 from easydel.modules.cohere.cohere_configuration import CohereConfig as CohereConfig
 
 # easydel.modules
-from easydel.modules.cohere.kernels import cohere_mlp_pallas
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	apply_rotary_pos_emb,
@@ -461,27 +459,6 @@ class FlaxCohereMLP(nn.Module):
 		"""
 
 		x = control_mlp_sharding(x, self.config.partition_axis)
-		if (
-			self.config.hardware_abstraction
-			and self.gate_proj.variables.get("params", None) is not None
-		):
-			return jax.vmap(
-				functools.partial(
-					cohere_mlp_pallas,
-					act_fn=jax.nn.silu,
-					blocksize_k=self.config.pallas_k_block_size,
-					blocksize_m=self.config.pallas_m_block_size,
-					blocksize_n=self.config.pallas_n_block_size,
-					prod_dtype=self.dtype,
-					precision=self.precision,
-				),
-				in_axes=(0, None, None, None),
-			)(
-				x,
-				self.gate_proj.variables["params"]["kernel"],
-				self.down_proj.variables["params"]["kernel"],
-				self.up_proj.variables["params"]["kernel"],
-			)
 		x = self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
 		return x
 

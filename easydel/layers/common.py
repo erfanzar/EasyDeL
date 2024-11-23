@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional, Union
+
 from flax import linen as nn
 from jax import lax
 from jax import numpy as jnp
-from typing import Optional, Union
 
 
 class Conv1D(nn.Module):

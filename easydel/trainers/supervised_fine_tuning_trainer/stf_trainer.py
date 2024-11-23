@@ -338,8 +338,8 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
 			)
 			max_evaluation_steps = (
 				len(dataloader_eval)
-				if self.arguments.max_training_steps is None
-				else self.arguments.max_training_steps
+				if self.arguments.max_evaluation_steps is None
+				else self.arguments.max_evaluation_steps
 			)
 		else:
 			dataloader_eval, max_evaluation_steps = None, 0

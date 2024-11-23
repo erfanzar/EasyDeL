@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.llama.llama_configuration import LlamaConfig
+from easydel.modules.llama.llama_configuration import LlamaConfig, VisionLlamaConfig
 from easydel.modules.llama.modeling_llama_flax import (
 	FlaxLlamaForCausalLM,
 	FlaxLlamaForCausalLMModule,
@@ -22,4 +22,3 @@ from easydel.modules.llama.modeling_llama_flax import (
 	FlaxLlamaModule,
 )
 from easydel.modules.llama.modeling_vision_llama_flax import FlaxVisionLlamaForCausalLM
-from easydel.modules.llama.vision_llama_configuration import VisionLlamaConfig

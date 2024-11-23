@@ -31,7 +31,6 @@ from easydel.etils.etils import get_logger
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import RMSNorm
 from easydel.modules.exaone.exaone_configuration import ExaoneConfig as ExaoneConfig
-from easydel.modules.exaone.kernels import exaone_mlp_pallas
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
@@ -113,27 +112,6 @@ class FlaxExaoneGatedMLP(nn.Module):
 		    chex.Array: Output tensor after applying dense layers and activation functions.
 		"""
 		x = control_mlp_sharding(x, self.config.partition_axis)
-		if (
-			self.config.hardware_abstraction
-			and self.c_fc_1.variables.get("params", None) is not None
-		):
-			return jax.vmap(
-				functools.partial(
-					exaone_mlp_pallas,
-					act_fn=self.act_fn,
-					blocksize_k=self.config.pallas_k_block_size,
-					blocksize_m=self.config.pallas_m_block_size,
-					blocksize_n=self.config.pallas_n_block_size,
-					prod_dtype=self.dtype,
-					precision=self.precision,
-				),
-				in_axes=(0, None, None, None),
-			)(
-				x,
-				self.c_fc_0.variables["params"]["kernel"],
-				self.c_proj.variables["params"]["kernel"],
-				self.c_fc_1.variables["params"]["kernel"],
-			)
 		return self.c_proj(self.act_fn(self.c_fc_0(x)) * self.c_fc_1(x))
 
 

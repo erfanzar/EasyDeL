@@ -81,8 +81,8 @@ rng_gen = GenerateRNG(seed=42)
 config = EasyDeLBaseConfig(
     axis_dims=(1, -1, 1, 1),
     axis_names=("dp", "fsdp", "tp", "sp"),
-    block_q=512,
-    block_k=512
+    blocksize_q=512,
+    blocksize_k=512
 )
 
 BATCH_SIZE = len(jax.devices())
@@ -129,16 +129,9 @@ q, k, v, attention_mask, causal_mask, attention_bias = make_fake_input_data(
 flash_attention = FlexibleAttentionModule(
 
     block_k_major=config.block_k_major,
-    block_b=config.block_b,
-    block_q=config.block_q,
-    block_k=config.block_k,
-    block_q_major_dkv=config.block_q_major_dkv,
-    block_k_major_dkv=config.block_k_major_dkv,
-    block_k_major_dq=config.block_k_major_dq,
-    block_k_dkv=config.block_k_dkv,
-    block_q_dkv=config.block_q_dkv,
-    block_q_dq=config.block_q_dq,
-    block_k_dq=config.block_k_dq,
+    blocksize_b=config.blocksize_b,
+    blocksize_q=config.blocksize_q,
+    blocksize_k=config.blocksize_k,
     num_attention_heads=NUM_ATTN_HEADS,
     attention_dropout=0.0,
     head_dims=HEAD_DIM,
@@ -162,9 +155,9 @@ flash_attention = FlexibleAttentionModule(
 normal_attention = FlexibleAttentionModule(
 
     block_k_major=config.block_k_major,
-    block_b=config.block_b,
-    block_q=config.block_q,
-    block_k=config.block_k,
+    blocksize_b=config.blocksize_b,
+    blocksize_q=config.blocksize_q,
+    blocksize_k=config.blocksize_k,
     block_q_major_dkv=config.block_q_major_dkv,
     block_k_major_dkv=config.block_k_major_dkv,
     block_k_major_dq=config.block_k_major_dq,

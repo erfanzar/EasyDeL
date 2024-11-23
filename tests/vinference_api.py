@@ -6,12 +6,13 @@ os.environ["EASYDEL_AUTO"] = "true"
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-import easydel as ed
 import jax
 from huggingface_hub import HfApi
-from jax import sharding
 from jax import numpy as jnp
+from jax import sharding
 from transformers import AutoTokenizer
+
+import easydel as ed
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
@@ -34,7 +35,7 @@ def main():
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
-			quantize_kv_cache=True,
+			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
 		),
 		quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
 		platform=ed.EasyDeLPlatforms.TRITON,

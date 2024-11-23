@@ -1,8 +1,9 @@
 """Utility functions for managing and manipulating nnx module states."""
 
+from typing import Type, TypeVar
+
 import jax
 from flax import nnx
-from typing import TypeVar, Type
 
 M = TypeVar("M", nnx.Module)
 

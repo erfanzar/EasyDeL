@@ -23,6 +23,7 @@ from easydel.trainers.direct_preference_optimization_trainer import (
 	DPOTrainerOutput,
 )
 from easydel.trainers.odds_ratio_preference_optimization_trainer import (
+	ORPOConfig,
 	ORPOTrainer,
 	ORPOTrainerOutput,
 )

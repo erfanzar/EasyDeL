@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
 import math
 from typing import Optional, Tuple, Union
 
@@ -44,7 +43,6 @@ from easydel.modules.flax_modeling_utils import (
 	with_sharding_constraint,
 )
 from easydel.modules.grok_1.grok_1_configuration import Grok1Config as Grok1Config
-from easydel.modules.grok_1.kernels import grok1_mlp_pallas
 from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
 from easydel.modules.modeling_utils import EasyDeLBaseModule
 
@@ -386,27 +384,6 @@ class FlaxGrok1BLockSparseMLP(nn.Module):
 		"""
 
 		x = control_mlp_sharding(x, self.config.partition_axis)
-
-		if (
-			self.config.hardware_abstraction
-			and self.linear.variables.get("params", None) is not None
-		):
-			return jax.vmap(
-				functools.partial(
-					grok1_mlp_pallas,
-					blocksize_k=self.config.pallas_k_block_size,
-					blocksize_m=self.config.pallas_m_block_size,
-					blocksize_n=self.config.pallas_n_block_size,
-					prod_dtype=self.dtype,
-					precision=self.precision,
-				),
-				in_axes=(0, None, None, None),
-			)(
-				x,
-				self.linear.variables["params"]["kernel"],
-				self.linear_1.variables["params"]["kernel"],
-				self.linear_v.variables["params"]["kernel"],
-			)
 		return self.linear_1(nn.gelu(self.linear(x)) * self.linear_v(x))
 
 

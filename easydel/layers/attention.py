@@ -11,23 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from dataclasses import dataclass
 import functools
 import math
 import os
 import time
 import warnings
+from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache, partial
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+
 import einops
 import fjformer
-import flax.nnx as nn
+import flax.linen as nn
 import jax
+import jax.experimental
 import jax.extend
 import jax.lib
+import jax.tree_util
+import numpy
 from chex import Array
 from fjformer import with_sharding_constraint
+from flax.linen.dtypes import promote_dtype
 from jax import lax, random
 from jax import numpy as jnp
 from jax.experimental.pallas.ops.tpu.splash_attention import (
@@ -41,13 +46,13 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 )
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec
-import numpy
 
 from easydel.etils.etils import (
 	_AVAILABLE_ATTENTION_MECHANISMS,
 	AVAILABLE_ATTENTION_MECHANISMS,
 	EasyDeLBackends,
 	EasyDeLPlatforms,
+	EasyDeLQuantizationMethods,
 	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
@@ -55,11 +60,7 @@ from easydel.kernels.flash_attention_2 import create_flash_attention
 from easydel.kernels.ring_attention import ring_attention
 from easydel.layers._blockwise_attention import blockwise_attn
 from easydel.modules.modeling_utils import EasyDeLBaseConfig
-
-import jax
-import jax.experimental
-import jax.tree_util
-from flax.nnx.nn.dtypes import promote_dtype
+from easydel.utils.quantizers import EasyQuantizer
 
 try:
 	from flash_attn_jax import flash_mha as cuda_flash_attn2_mha  # noqa #type:ignore
@@ -312,9 +313,9 @@ class FlexibleAttentionModule(object):
 		num_q_heads: int,
 		head_dims: int,
 		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_ATTENTION_MECHANISM,
-		block_k: int = ...,
-		block_q: int = ...,
-		block_b: int = ...,
+		blocksize_k: int = ...,
+		blocksize_q: int = ...,
+		blocksize_b: int = ...,
 		partition_axis: PartitionAxis = ...,
 		scan_ring_attention: bool = ...,
 		scan_attention_layers: bool = ...,
@@ -331,9 +332,9 @@ class FlexibleAttentionModule(object):
 		base_config: Optional[EasyDeLBaseConfig] = None,
 		_do_check: bool = True,
 	):
-		self.block_k: int = ...
-		self.block_q: int = ...
-		self.block_b: int = ...
+		self.blocksize_k: int = ...
+		self.blocksize_q: int = ...
+		self.blocksize_b: int = ...
 		self.partition_axis: PartitionAxis = ...
 		self.scan_ring_attention: bool = ...
 		self.precision: lax.Precision = ...
@@ -346,9 +347,9 @@ class FlexibleAttentionModule(object):
 
 		# fmt:off
 		set_attrs_smartly_with_prp(self, "use_sharding_constraint", False, use_sharding_constraint, base_config)
-		set_attrs_smartly_with_prp(self, "block_q", DEFAULT_Q_BLOCK, block_q, base_config)
-		set_attrs_smartly_with_prp(self, "block_k", DEFAULT_K_BLOCK, block_k, base_config)
-		set_attrs_smartly_with_prp(self, "block_b", 1, block_b, base_config)
+		set_attrs_smartly_with_prp(self, "blocksize_q", DEFAULT_Q_BLOCK, blocksize_q, base_config)
+		set_attrs_smartly_with_prp(self, "blocksize_k", DEFAULT_K_BLOCK, blocksize_k, base_config)
+		set_attrs_smartly_with_prp(self, "blocksize_b", 1, blocksize_b, base_config)
 		set_attrs_smartly_with_prp(self, "dtype", jnp.float32, dtype, base_config, "attn_dtype")
 		set_attrs_smartly_with_prp(self, "shard_attention_computation", True, shard_attention_computation, base_config)
 		set_attrs_smartly_with_prp(self, "scan_ring_attention", True, scan_ring_attention, base_config)
@@ -382,14 +383,14 @@ class FlexibleAttentionModule(object):
 
 	def get_block_size_splash_attn(self, q_seq, k_seq):
 		return BlockSizesSplashAttn(
-			block_q=min(self.block_q, q_seq),
-			block_kv_compute=min(self.block_k, k_seq),
-			block_kv=min(self.block_k, k_seq),
-			block_q_dkv=min(self.block_q, q_seq),
-			block_kv_dkv=min(self.block_k, k_seq),
-			block_kv_dkv_compute=min(self.block_k, k_seq),
-			block_q_dq=min(self.block_q, q_seq),
-			block_kv_dq=min(self.block_k, k_seq),
+			block_q=min(self.blocksize_q, q_seq),
+			block_kv_compute=min(self.blocksize_k, k_seq),
+			block_kv=min(self.blocksize_k, k_seq),
+			block_q_dkv=min(self.blocksize_q, q_seq),
+			block_kv_dkv=min(self.blocksize_k, k_seq),
+			block_kv_dkv_compute=min(self.blocksize_k, k_seq),
+			block_q_dq=min(self.blocksize_q, q_seq),
+			block_kv_dq=min(self.blocksize_k, k_seq),
 		)
 
 	def get_bshd_partition_specs(
@@ -817,9 +818,9 @@ class FlexibleAttentionModule(object):
 			in_generating_process,
 		) = self.get_bshd_partition_specs(query_states.shape[1])
 
-		block_q = self.block_q
+		blocksize_q = self.blocksize_q
 		if in_generating_process:
-			block_q = int(os.environ.get("GENERATION_BLOCKSIZE_Q", self.block_q))
+			blocksize_q = int(os.environ.get("GENERATION_BLOCKSIZE_Q", self.blocksize_q))
 		if bias is not None:
 			assert bias.ndim == 4
 		with self.mesh:
@@ -832,8 +833,8 @@ class FlexibleAttentionModule(object):
 			attention = get_cached_flash_attention(
 				backend=self.backend,
 				platform=self.platform,
-				blocksize_q=block_q,
-				blocksize_k=self.block_k,
+				blocksize_q=blocksize_q,
+				blocksize_k=self.blocksize_k,
 				softmax_scale=self.sm_scale,
 			)
 
@@ -963,8 +964,8 @@ class FlexibleAttentionModule(object):
 				backend=self.backend,
 				autocheck=True,
 				blocksize_c=None,
-				blocksize_k=self.block_k,
-				blocksize_q=self.block_q,
+				blocksize_k=self.blocksize_k,
+				blocksize_q=self.blocksize_q,
 				dtype=self.dtype,
 				softmax_scale=self.sm_scale,
 				deterministic=deterministic,
@@ -1122,8 +1123,8 @@ class FlexibleAttentionModule(object):
 				dropout_rng=dropout_rng,
 				precision=self.precision,
 				attn_pdrop=self.attention_dropout,
-				key_chunk_size=min(self.block_k, key_value_sequence_length),
-				query_chunk_size=min(self.block_q, query_sequence_length),
+				key_chunk_size=min(self.blocksize_k, key_value_sequence_length),
+				query_chunk_size=min(self.blocksize_q, query_sequence_length),
 				prevent_cse=not self.scan_attention_layers,
 				causal=True,
 				float32_logits=True,
@@ -1414,8 +1415,8 @@ class AttentionBenchmarker:
 
 		self.model_config = MistralConfig(
 			axis_dims=config.axis_dims,
-			block_q=config.blocksize_q,
-			block_k=config.blocksize_k,
+			blocksize_q=config.blocksize_q,
+			blocksize_k=config.blocksize_k,
 			attn_dtype=config.dtype,
 		)
 
@@ -1500,8 +1501,8 @@ class AttentionBenchmarker:
 			sm_scale=q.shape[-1] ** -0.5,
 			num_q_heads=q.shape[-2],
 			num_kv_heads=q.shape[-2],
-			block_q=self.config.blocksize_q,
-			block_k=self.config.blocksize_k,
+			blocksize_q=self.config.blocksize_q,
+			blocksize_k=self.config.blocksize_k,
 			base_config=self.model_config,
 		)(
 			query_states=q,
@@ -1663,6 +1664,189 @@ class AttentionBenchmarker:
 			return df[cols]
 
 		return results
+
+
+class FlaxAttentionModule(nn.Module):
+	config: "EDPretrainedConfig"  # type: ignore  # noqa
+
+	@staticmethod
+	def _transpose_sequence_head(*args):
+		"""The _transpose_sequence_head function transposes the query, key and value matrices.
+
+		Args:
+		    *args: arrays to transpose
+
+		Returns:
+		    The transpose of the query, key and value matrices
+		"""
+		return map(
+			lambda x: jnp.transpose(x, (0, 2, 1, 3)),
+			args,
+		)
+
+	@nn.compact
+	def _concatenate_to_cache(self, key, value, query_states, attention_mask):
+		"""The _concatenate_to_cache function is used to concatenate the key and value vectors
+		of a query_states with those of previous queries. This allows for the attention mechanism to
+		look at all previous queries when computing its output. The function takes in three
+		arguments: key, value, and query_states. It also uses two variables that are stored in the cache:
+		cached_key and cached_value.
+
+		Args:
+		    self: Access the variables stored in the cache
+		    key: Store the keys of the encoder-decoder attention
+		    value: Initialize the cached_value variable
+		    query_states: Determine the number of cache vectors to update
+		    attention_mask: Mask out the padded vectors in the cache
+
+		Returns:
+		    The key, value and attention_mask
+		"""
+		paxs: PartitionAxis = self.config.partition_axis
+		quantization_method = self.config.kv_cache_quantization_method
+		kv_cache_quantization_blocksize = self.config.kv_cache_quantization_blocksize
+
+		quantizer = EasyQuantizer(
+			quantization_method=quantization_method,
+			block_size=kv_cache_quantization_blocksize,
+		)
+		is_initialized = self.has_variable("cache", "cached_key")
+		gen_kv_spec = PartitionSpec(
+			paxs.batch_axis,
+			None,
+			paxs.head_axis,
+			paxs.attention_dim_axis,
+		)
+		kv_spec = PartitionSpec(
+			paxs.batch_axis,
+			paxs.key_sequence_axis,
+			paxs.head_axis,
+			paxs.attention_dim_axis,
+		)
+		cached_key = self.variable(
+			"cache",
+			"cached_key",
+			lambda: quantizer(
+				jnp.zeros(
+					shape=key.shape,
+					dtype=key.dtype,
+					device=PartitionSpec(
+						paxs.batch_axis,
+						paxs.key_sequence_axis,
+						paxs.head_axis,
+						paxs.attention_dim_axis,
+					),
+				),
+			),
+		)
+		cached_value = self.variable(
+			"cache",
+			"cached_value",
+			lambda: quantizer(
+				jnp.zeros(
+					shape=key.shape,
+					dtype=key.dtype,
+					device=PartitionSpec(
+						paxs.batch_axis,
+						paxs.key_sequence_axis,
+						paxs.head_axis,
+						paxs.attention_dim_axis,
+					),
+				),
+			),
+		)
+		cache_index = self.variable(
+			"cache",
+			"cache_index",
+			lambda: jnp.array(0, dtype=jnp.int32),
+		)
+		if is_initialized:
+			*batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
+			cur_index = cache_index.value
+			if (
+				query_states.shape[1] == 1
+				and self.config.use_sharded_kv_caching
+				and quantization_method == EasyDeLQuantizationMethods.NONE
+			):
+				mesh = self.config.mesh
+
+				@partial(
+					shard_map,
+					mesh=mesh,
+					in_specs=(
+						kv_spec,
+						kv_spec,
+						gen_kv_spec,
+						gen_kv_spec,
+						PartitionSpec(),
+					),
+					out_specs=(
+						kv_spec,
+						kv_spec,
+					),
+					check_rep=False,
+				)
+				def fn(_cached_key, _cached_value, _key, _value, _cur_index):
+					assert _key.shape[1] == 1 and _value.shape[1] == 1, (
+						_key.shape,
+						_value.shape,
+					)
+					sp_size = (
+						max_length // mesh.shape[self.config.kv_cache_sharding_sequence_axis_name]
+					)
+					axis_index = jax.lax.axis_index(
+						self.config.kv_cache_sharding_sequence_axis_name
+					)
+					_cur_index = _cur_index - axis_index * sp_size
+					_key, _value = jax.lax.cond(
+						jnp.logical_and(_cur_index >= 0, _cur_index < sp_size),
+						lambda: (
+							_cached_key.at[:, _cur_index].set(_key[:, -1]),
+							_cached_value.at[:, _cur_index].set(_value[:, -1]),
+						),
+						lambda: (_cached_key, _cached_value),
+					)
+					return _key, _value
+
+				key, value = fn(cached_key.value, cached_value.value, key, value, cur_index)
+			else:
+				*batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
+				cur_index = cache_index.value
+				indices = (0,) * len(batch_dims) + (cur_index, 0, 0)  # type:ignore
+				key_val = cached_key.value
+				value_val = cached_value.value
+				try:
+					key_val = key_val.materialize()
+					value_val = value_val.materialize()
+				except Exception:
+					...
+				key = lax.dynamic_update_slice(key_val, key, indices)
+				value = lax.dynamic_update_slice(value_val, value, indices)
+				num_updated_cache_vectors = query_states.shape[1]
+				pad_mask = jnp.broadcast_to(
+					jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
+					tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
+				)
+				attention_mask = jnp.logical_and(pad_mask, attention_mask)
+			cached_key.value = quantizer(with_sharding_constraint(key, kv_spec))
+			cached_value.value = quantizer(with_sharding_constraint(value, kv_spec))
+			num_updated_cache_vectors = query_states.shape[1]
+			cache_index.value = cache_index.value + num_updated_cache_vectors
+		return key, value, attention_mask
+
+	@staticmethod
+	def repeat_key_value(key, value, num_reps: int):
+		key = einops.repeat(
+			key,
+			"b s h d -> b s (h r) d",
+			r=num_reps,
+		)
+		value = einops.repeat(
+			value,
+			"b s h d -> b s (h r) d",
+			r=num_reps,
+		)
+		return key, value
 
 
 if __name__ == "__main__":

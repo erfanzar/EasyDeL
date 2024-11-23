@@ -16,7 +16,6 @@ import copy
 import os
 import time
 import typing
-import warnings
 from abc import ABC
 from collections import defaultdict
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Union
@@ -26,7 +25,6 @@ import jax
 import numpy as np
 import termcolor
 from fjformer.sharding import make_shard_and_gather_fns, match_partition_rules
-from flax.core import FrozenDict
 from jax import jit
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
@@ -35,23 +33,28 @@ from tqdm.autonotebook import tqdm
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import get_logger
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.trainers.base_trainer import (
 	BaseTrainer,
+	MetricsTracker,
+	StepMetrics,
 	TrainerConfigureDataloaderOutput,
 	TrainerConfigureFunctionOutput,
 )
 from easydel.trainers.direct_preference_optimization_trainer.utils import (
 	DPODataCollatorWithPadding,
-	leave_alone_context_manager,
 )
 from easydel.trainers.odds_ratio_preference_optimization_trainer.fwd_bwd_functions import (
+	ORPOStepOut,
 	create_orpo_concatenated_forward,
 	create_orpo_step_function,
 )
 from easydel.trainers.odds_ratio_preference_optimization_trainer.modelling_output import (
 	ORPOTrainerOutput,
 )
-from easydel.trainers.training_configurations import TrainingArguments
+from easydel.trainers.odds_ratio_preference_optimization_trainer.orpo_config import (
+	ORPOConfig,
+)
 
 logger = get_logger(__name__)
 
@@ -65,15 +68,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 	training, LoRA.
 
 	Attributes:
-	    arguments (TrainingArguments): The training arguments.
-	    max_length (Optional[int]): The maximum sequence length.
-	    max_prompt_length (Optional[int]): The maximum prompt length.
-	    max_completion_length (Optional[int]): The maximum completion length.
-	    beta (float): The strength of the regularization term in the ORPO loss.
-	    disable_dropout (bool): Whether to disable dropout during training.
-	    label_pad_token_id (int): The ID of the padding token for labels.
-	    is_encoder_decoder (bool): Whether the model is an encoder-decoder architecture.
-	    padding_value (int): The padding value for input sequences.
+	    arguments (ORPOConfig): The training arguments.
 	    data_collator (Optional[DPODataCollatorWithPadding]): The data collator used for batching.
 	    train_dataset (Optional[Dataset]): The training dataset.
 	    eval_dataset (Optional[Union[Dataset, Dict[str, Dataset]]]): The evaluation dataset.
@@ -105,15 +100,8 @@ class ORPOTrainer(BaseTrainer, ABC):
 
 	def __init__(
 		self,
-		arguments: TrainingArguments,
-		max_length: Optional[int] = None,
-		max_prompt_length: Optional[int] = None,
-		max_completion_length: Optional[int] = None,
-		beta: float = 0.1,
-		disable_dropout: bool = True,
-		label_pad_token_id: int = -100,
-		is_encoder_decoder: bool = False,
-		padding_value: int = None,
+		arguments: ORPOConfig,
+		model: Optional[EasyDeLBaseModule] = None,
 		data_collator: Optional[DPODataCollatorWithPadding] = None,
 		train_dataset: Optional["Dataset"] = None,  # noqa #type:ignore
 		eval_dataset: Optional[
@@ -126,21 +114,12 @@ class ORPOTrainer(BaseTrainer, ABC):
 		_do_init_fns: bool = True,
 		dataset_map_arguments: Optional[Dict[str, Any]] = None,
 		low_mem_usage: bool = False,
-		apply_chat_template: bool = False,
 	):
 		"""
 		Initializes the ORPOTrainer.
 
 		Args:
-		    arguments (TrainingArguments): The training arguments.
-		    max_length (Optional[int], optional): The maximum sequence length. Defaults to None.
-		    max_prompt_length (Optional[int], optional): The maximum prompt length. Defaults to None.
-		    max_completion_length (Optional[int], optional): The maximum completion length. Defaults to None.
-		    beta (float, optional): The strength of the regularization term in the ORPO loss. Defaults to 0.1.
-		    disable_dropout (bool, optional): Whether to disable dropout during training. Defaults to True.
-		    label_pad_token_id (int, optional): The ID of the padding token for labels. Defaults to -100.
-		    is_encoder_decoder (bool, optional): Whether the model is an encoder-decoder architecture. Defaults to False.
-		    padding_value (int, optional): The padding value for input sequences. Defaults to None.
+		    arguments (ORPOConfig): The training arguments.
 		    data_collator (Optional[DPODataCollatorWithPadding], optional): The data collator used for batching. Defaults to None.
 		    train_dataset (Optional[Dataset], optional): The training dataset. Defaults to None.
 		    eval_dataset (Optional[Union[Dataset, Dict[str, Dataset]]], optional): The evaluation dataset. Defaults to None.
@@ -149,7 +128,6 @@ class ORPOTrainer(BaseTrainer, ABC):
 		    _do_init_fns (bool, optional): Whether to automatically initialize trainer functions. Defaults to True.
 		    dataset_map_arguments (Optional[Dict[str, Any]], optional): Arguments to pass to the dataset `map` function for tokenization. Defaults to None.
 		    low_mem_usage (bool, optional): Whether to prioritize low memory usage during training. Defaults to False.
-		    apply_chat_template (bool): Whether to apply chat template from tokenizer on `rejected` and `chosen` fields in dataset.
 
 		Raises:
 		    ValueError: If `arguments` is not provided or is not a `TrainingArguments` instance, or if `tokenizer` is not provided.
@@ -160,56 +138,27 @@ class ORPOTrainer(BaseTrainer, ABC):
 			"`arguments=None`"
 		)
 		assert isinstance(
-			arguments, TrainingArguments
+			arguments, ORPOConfig
 		), f"arguments type must be `TrainingArguments` but got {type(arguments)}"
 
 		if tokenizer is None:
 			raise ValueError("tokenizer must be specified to tokenize a ORPO dataset.")
-		if max_length is None:
-			warnings.warn(
-				"`max_length` is not set in the ORPOTrainer's init"
-				" it will default to `512` by default, but you should do it yourself in the future.",
-				UserWarning,
-			)
-			max_length = 512
-		if max_prompt_length is None:
-			warnings.warn(
-				"`max_prompt_length` is not set in the ORPOTrainer's init"
-				" it will default to `128` by default, but you should do it yourself in the future.",
-				UserWarning,
-			)
-			max_prompt_length = 128
 
-		if max_completion_length is None:
-			warnings.warn(
-				"When using an encoder decoder architecture, you should set `max_completion_length` in the "
-				"ORPOTrainer's init it will default to `128` by default, but you should do it yourself in the future.",
-				UserWarning,
-			)
-			max_completion_length = 128
-
-		padding_value = (
-			padding_value if padding_value is not None else tokenizer.pad_token_id
+		arguments.padding_value = (
+			arguments.padding_value
+			if arguments.padding_value is not None
+			else tokenizer.pad_token_id
 		)
-		self.max_length = max_length
-		self.label_pad_token_id = label_pad_token_id
-		self.padding_value = padding_value
-		self.max_prompt_length = max_prompt_length
-		self.truncation_mode = arguments.truncation_mode
-		self.disable_dropout = disable_dropout
-		self.max_completion_length = max_completion_length
+		self.arguments = arguments
 		self.tokenizer = tokenizer
-		self.is_encoder_decoder = is_encoder_decoder
 		self.low_mem_usage = low_mem_usage
-		self.beta = beta
 		self.dataset_num_proc = dataset_num_proc
-		self.apply_chat_template = apply_chat_template
 		data_collator = (
 			DPODataCollatorWithPadding(
-				max_prompt_length=self.max_prompt_length,
-				max_completion_length=self.max_completion_length,
+				max_prompt_length=arguments.max_prompt_length,
+				max_completion_length=arguments.max_completion_length,
 				pad_token_id=tokenizer.pad_token_id,
-				label_pad_token_id=label_pad_token_id,
+				label_pad_token_id=arguments.label_pad_token_id,
 				is_encoder_decoder=False,
 			)
 			if data_collator is None
@@ -218,7 +167,12 @@ class ORPOTrainer(BaseTrainer, ABC):
 		self._stored_metrics = defaultdict(lambda: defaultdict(list))
 		if dataset_map_arguments is None:
 			dataset_map_arguments = {}
-		with jax.default_device(jax.devices("cpu")[0]):
+
+		with jax.default_device(arguments.offload_device):
+			off_div = (
+				arguments.offload_device
+			)  # avoids TypeError: cannot pickle 'jaxlib.xla_extension.Device' object
+			arguments.offload_device = None
 			train_dataset = train_dataset.map(
 				self.tokenize_row,
 				num_proc=dataset_num_proc,
@@ -230,8 +184,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 					num_proc=dataset_num_proc,
 					**dataset_map_arguments,
 				)
-
-		self.arguments = arguments
+			arguments.offload_device = off_div
 		self.hp_name = None
 		self.deepspeed = None
 		self.is_in_train = False
@@ -243,13 +196,13 @@ class ORPOTrainer(BaseTrainer, ABC):
 		self._loggers_initialized = False
 		self.mesh = self.arguments.get_mesh()
 		assert (
-			padding_value is not None
+			arguments.padding_value is not None
 		), "`padding_value` can not be set as `None` it must be an integer."
 
 		self.concatenated_forward = create_orpo_concatenated_forward(
-			is_encoder_decoder=self.is_encoder_decoder,
-			padding_value=padding_value,
-			label_pad_token_id=label_pad_token_id,
+			is_encoder_decoder=arguments.is_encoder_decoder,
+			padding_value=arguments.padding_value,
+			label_pad_token_id=arguments.label_pad_token_id,
 		)
 
 		self._cached_p_l_s = None
@@ -258,6 +211,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 
 		super().__init__(
 			arguments=arguments,
+			model=model,
 			dataset_train=train_dataset,
 			dataset_eval=eval_dataset,
 			finetune=True,
@@ -360,7 +314,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 	def _validate_input(self, feature: Dict[str, str], key: str) -> str:
 		"""Validates input and returns the corresponding value."""
 		value = feature[key]
-		if self.apply_chat_template and key in ["chosen", "rejected"]:
+		if self.arguments.apply_chat_template and key in ["chosen", "rejected"]:
 			value = self.tokenizer.apply_chat_template(value, tokenize=False)
 		if not isinstance(value, str):
 			raise ValueError(f"{key} should be a string but got {type(value)}")
@@ -433,7 +387,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 	def _create_labels(self, input_ids: np.ndarray, prompt_length: int) -> np.ndarray:
 		"""Creates labels for the sequence, masking the prompt part."""
 		labels = input_ids.copy()
-		labels[:, :prompt_length] = self.label_pad_token_id
+		labels[:, :prompt_length] = self.arguments.label_pad_token_id
 		return labels
 
 	def _prepare_final_batch(
@@ -453,9 +407,13 @@ class ORPOTrainer(BaseTrainer, ABC):
 				if key == "token_type_ids":
 					continue
 				max_length = (
-					self.max_prompt_length if prefix == "" else self.max_completion_length
+					self.arguments.max_prompt_length
+					if prefix == ""
+					else self.arguments.max_completion_length
 				)
-				pad_value = self.padding_value if key in ["input_ids", "labels"] else 0
+				pad_value = (
+					self.arguments.padding_value if key in ["input_ids", "labels"] else 0
+				)
 				batch[f"{prefix}{key}"] = self._pad_and_truncate(value, max_length, pad_value)
 		return batch
 
@@ -593,7 +551,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 		sharded_train_step_function = jit(
 			create_orpo_step_function(
 				mode="train",
-				beta=self.beta,
+				beta=self.arguments.beta,
 				concatenated_forward=self.concatenated_forward,
 				batch_partition_spec=self.arguments.step_partition_spec,
 			),
@@ -607,7 +565,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 		sharded_eval_step_function = jit(
 			create_orpo_step_function(
 				mode="eval",
-				beta=self.beta,
+				beta=self.arguments.beta,
 				concatenated_forward=self.concatenated_forward,
 				batch_partition_spec=self.arguments.step_partition_spec,
 			),
@@ -693,7 +651,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 						sharded_train_step_function = jit(
 							create_orpo_step_function(
 								mode="train",
-								beta=self.beta,
+								beta=self.arguments.beta,
 								concatenated_forward=self.concatenated_forward,
 								batch_partition_spec=self.arguments.step_partition_spec,
 							),
@@ -707,7 +665,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 						sharded_eval_step_function = jit(
 							create_orpo_step_function(
 								mode="eval",
-								beta=self.beta,
+								beta=self.arguments.beta,
 								concatenated_forward=self.concatenated_forward,
 								batch_partition_spec=self.arguments.step_partition_spec,
 							),
@@ -856,8 +814,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 		and evaluation steps based on the dataset sizes and training arguments.
 
 		Returns:
-		    TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
-		                                    maximum number of training and evaluation steps.
+		    TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the maximum number of training and evaluation steps.
 		"""
 		dataloader_train = self.get_train_dataloader()
 		max_evaluation_steps = None
@@ -975,6 +932,243 @@ class ORPOTrainer(BaseTrainer, ABC):
 		eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
 		return self._get_eval_dataloader(eval_dataset=eval_dataset)
 
+	def _run_training_loop(
+		self,
+		metrics_tracker: MetricsTracker,
+		step_metrics: StepMetrics,
+		start_time: float,
+		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+	):
+		"""Core training loop implementation."""
+		pbar = tqdm(total=self.max_training_steps)
+		current_step = int(jax.device_get(self.model_state.step))
+		run_exception = None
+		with self.mesh:
+			for epoch in range(self.arguments.num_train_epochs):
+				current_step, run_exception = self._train_epoch(
+					self.dataloader_train,
+					current_step,
+					metrics_tracker,
+					step_metrics,
+					pbar,
+					start_time,
+					epoch,
+					shard_fns,
+					gather_fns,
+				)
+
+				if current_step >= self.max_training_steps:
+					break
+				if run_exception is not None:
+					break
+		return self._prepare_training_output(
+			sharded_state=self.model_state,
+			shard_fns=shard_fns,
+			gather_fns=gather_fns,
+			run_exception=run_exception,
+		), run_exception
+
+	def _run_evaluation(
+		self,
+		sharded_state: EasyDeLState,
+		metrics_tracker: MetricsTracker,
+		step_metrics: StepMetrics,
+		start_time: float,
+	):
+		"""Core evaluation loop implementation."""
+		pbar = tqdm(total=self.max_evaluation_steps)
+		pbar.set_description("evaluation process")
+		current_step = int(jax.device_get(sharded_state.step))
+		with self.mesh:
+			for eval_metrics in self._eval_epoch(
+				sharded_state,
+				self.dataloader_eval,
+				current_step,
+				metrics_tracker,
+				step_metrics,
+				pbar,
+				start_time,
+			):
+				yield eval_metrics
+
+	def _train_epoch(
+		self,
+		train_dataset,
+		current_step: int,
+		metrics_tracker: MetricsTracker,
+		step_metrics: StepMetrics,
+		pbar: tqdm,
+		start_time: float,
+		epoch: int,
+		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+	):
+		"""Handles training for a single epoch."""
+		train_iter = iter(train_dataset)
+		for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
+			try:  # to make training loop safer if user wants to break that.
+				batch = self._get_next_batch(train_iter)
+				if self._should_skip_step(current_step):
+					pbar.update(1)
+					continue
+				step_metrics.start_step()
+			except (KeyboardInterrupt, EasyDeLTimerError, StopIteration) as exect:
+				return self.model_state, current_step, exect
+
+			# Execute training step
+			loss, metrics, run_exception = self._execute_train_step(batch)
+			# Update and log metrics
+			try:
+				mean_loss = metrics_tracker.update(loss, float("inf"), current_step)
+
+				train_metrics = step_metrics.calculate(
+					loss=loss,
+					metrics=metrics,
+					current_step=current_step,
+					learning_rate=self.scheduler(current_step)
+					if self.scheduler is not None
+					else self.arguments.learning_rate,
+					epoch=epoch,
+					flops_per_device=getattr(self, "_flops_per_device", 0),
+					batch_size=self.arguments.total_batch_size,
+					seq_length=self.arguments.max_prompt_length
+					+ self.arguments.max_completion_length * 2,
+					mean_loss=mean_loss,
+					mode="train",
+				)
+
+				self._log_metrics(
+					metrics=train_metrics,
+					pbar=pbar,
+					step=current_step,
+					mode="train",
+				)
+
+				# Save checkpoint if needed
+				if self._should_save_checkpoint(current_step):
+					_ = self._save_state(
+						state=self.model_state,
+						gather_fns=gather_fns,
+						milestone=True,
+						save_dir=self.arguments.save_dir,
+					)
+
+				current_step += 1
+			except (KeyboardInterrupt, EasyDeLTimerError):
+				return current_step, run_exception
+			if run_exception is not None:
+				break
+		return current_step, run_exception
+
+	def _eval_epoch(
+		self,
+		sharded_state: EasyDeLState,
+		eval_dataset,
+		current_step: int,
+		metrics_tracker: MetricsTracker,
+		step_metrics: StepMetrics,
+		pbar: tqdm,
+		start_time: float,
+	):
+		"""Handles training for a single epoch."""
+		eval_iter = iter(eval_dataset)
+		for _ in range(self.max_evaluation_steps):
+			try:
+				batch = self._get_next_batch(eval_iter)
+				step_metrics.start_step()
+				loss, metrics = self._execute_eval_step(sharded_state, batch)
+				mean_loss = metrics_tracker.update(
+					loss,
+					float("inf"),
+					current_step,  # Disable accuracy
+				)
+				eval_metrics = step_metrics.calculate(
+					loss=loss,
+					metrics=metrics,
+					current_step=current_step,
+					learning_rate=0.000,
+					epoch=0,
+					flops_per_device=getattr(self, "_flops_per_device", 0),
+					batch_size=self.arguments.total_batch_size,
+					seq_length=self.arguments.max_prompt_length
+					+ self.arguments.max_completion_length * 2,
+					mean_loss=mean_loss,
+					mode="eval",
+				)
+				self._log_metrics(
+					metrics=eval_metrics,
+					pbar=pbar,
+					step=current_step,
+					mode="eval",
+				)
+				current_step += 1
+
+				yield eval_metrics
+			except (KeyboardInterrupt, EasyDeLTimerError) as _:
+				break
+
+	def _execute_eval_step(self, state, batch):
+		"""Execute a single eval step."""
+		batch = {key: jnp.asarray(value) for key, value in batch.items()}
+		orpo_out = self.sharded_eval_step_function(state, batch)
+		loss = orpo_out.loss
+		metrics = dict(
+			loss=loss,
+			chosen_rewards=orpo_out.chosen_rewards,
+			rejected_rewards=orpo_out.rejected_rewards,
+		)
+		return loss, metrics
+
+	def _execute_train_step(self, batch):
+		"""Execute a single training step."""
+		if self.pruning_module is not None:
+			self.model_state = self.model_state.replace(
+				params=self.pruning_module.pre_forward_update(
+					self.model_state.params,
+					self.model_state.opt_state,
+				)
+			)
+
+		# Forward and backward pass
+		try:
+			batch = {key: jnp.asarray(value) for key, value in batch.items()}
+
+			self.model_state, orpo_out = self.sharded_train_step_function(
+				self.model_state, batch
+			)
+			# Apply post-gradient updates
+			orpo_out: ORPOStepOut = orpo_out
+			metrics = dict(loss=orpo_out.loss, metrics=orpo_out.metrics)
+			if self.pruning_module is not None:
+				self.model_state = self.model_state.replace(
+					params=self.pruning_module.post_gradient_update(
+						self.model_state.params,
+						self.model_state.opt_state,
+					)
+				)
+
+			return orpo_out.loss, metrics, None
+		except (KeyboardInterrupt, EasyDeLTimerError) as run_exception:
+			return orpo_out.loss, metrics, run_exception
+
+	def _finalize_training(self, output, run_exception):
+		"""Finalize training and prepare output."""
+		if run_exception is None:
+			if self.arguments.merge_lora_rapture_parameters and self.rapture:
+				termcolor.cprint("Merging LoRA Parameters.", color="cyan", force_color=True)
+				output.state = output.state.replace(
+					params=self.rapture.merge_parameters(output.state.params)
+				)
+
+		if self.arguments.do_eval:
+			for _ in self.eval(output.state):
+				...
+
+		self.finish()
+
+		return output
+
 	def train(
 		self,
 		model_parameters: Optional[flax.core.FrozenDict] = None,
@@ -988,298 +1182,59 @@ class ORPOTrainer(BaseTrainer, ABC):
 		interrupts and timeouts, and optionally evaluating the model.
 
 		Args:
-		    model_parameters (Optional[flax.core.FrozenDict], optional):
-		        Pretrained model parameters for initialization. Defaults to None.
-		    state (Optional[EasyDeLState], optional):
-		        An existing EasyDeLState to resume training from. Defaults to None.
+				model_parameters (Optional[flax.core.FrozenDict], optional):
+						Pretrained model parameters for initialization. Defaults to None.
+				state (Optional[EasyDeLState], optional):
+						An existing EasyDeLState to resume training from. Defaults to None.
 
 		Returns:
-		    ORPOTrainerOutput: An object containing the trained model state and other training information.
+				ORPOTrainerOutput: An object containing the trained model state and other training information.
 		"""
-
-		def get_layer_names(frozen_dict, prefix=""):
-			layer_names = {}
-			for key, value in frozen_dict.items():
-				if isinstance(value, FrozenDict):
-					layer_names.update(get_layer_names(value, prefix=f"{prefix}_{key}"))
-				else:
-					layer_name = f"{prefix}_{key}".lstrip("/")
-					layer_names[layer_name] = value
-			return layer_names
-
-		def count_model_parameters(_p):
-			termcolor.cprint(
-				f"Model Contain {sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(_p))[0]) / 1e9} "
-				f"Billion Parameters",
-				color="red",
-				force_color=True,
-			)
-
-		checkpoint_path = "SAVING_SKIPPED"
-		if self.arguments.performance_mode:
-			termcolor.cprint(
-				"Performance Mode is ON, we will ignore the Memory Tracking, WANDB Logging, and extra information "
-				"Process.",
-				color="red",
-				force_color=True,
-			)
-		sharded_state, shard_fns, gather_fns = self.initialize_state(
-			model_parameters=model_parameters, state=state
+		start_time = time.time()
+		self.model_state, shard_fns, gather_fns = self.initialize_state(
+			model_parameters=model_parameters,
+			state=state,
 		)
-		self.model_state = sharded_state
-		count_model_parameters(sharded_state.params)
-		flops_per_device = (
-			self.calculate_number_total_flops_per_device(params=sharded_state.params) / 1e12
+		metrics_tracker = MetricsTracker()
+		step_metrics = StepMetrics(self.arguments)
+		# Setup initial metrics and logging
+		self._setup_initial_metrics(self.model_state)
+		output, run_exception = self._run_training_loop(
+			metrics_tracker=metrics_tracker,
+			step_metrics=step_metrics,
+			start_time=start_time,
+			shard_fns=shard_fns,
+			gather_fns=gather_fns,
 		)
-		with self.mesh:
-			with (
-				jax.default_device(jax.devices("cpu")[0])
-				if self.low_mem_usage
-				else leave_alone_context_manager()
-			):
-				checkpoint_path = "SAVING_SKIPPED"
-
-				pbar = tqdm(total=self.max_training_steps)
-				pbar.set_description("Training")
-				current_step = (
-					self.model_state.step.tolist()
-					if isinstance(self.model_state.step, jax.Array)
-					else self.model_state.step
-				)
-
-				loss_sum = None
-				filename = None
-
-				try:
-					for epoch_index in range(self.arguments.num_train_epochs):
-						for batch in self.dataloader_train:
-							if self.arguments.step_start_point > current_step:
-								...
-							elif current_step < self.max_training_steps:
-								time_start = time.time()
-								# for k, v in batch.items():
-								#     print(k, v.shape)
-								#     try:
-								#         print(self.tokenizer.decode(v[0]))
-								#     except:
-								#         ...
-								# # print()
-								self.model_state, outputs = self.sharded_train_step_function(
-									self.model_state, batch
-								)
-								total_time = time.time() - time_start
-								flops = flops_per_device / total_time
-								(loss, metrics) = outputs.loss, outputs.metrics
-								loss.block_until_ready()
-								loss_sum = loss.tolist() if loss_sum is None else loss_sum + loss
-
-								train_metrics = {
-									"train/loss": loss.tolist(),
-									"train/mean_loss": loss_sum
-									/ ((current_step + 1) - self.arguments.step_start_point),
-									"train/learning_rate": self.scheduler(
-										jax.device_get(self.model_state.step)
-									).tolist(),
-									"train/step": current_step,
-									"train/step_time": total_time,
-									"train/perplexity": jnp.exp(loss).tolist(),
-									"train/epoch": epoch_index,
-									"train/TFLOPs": flops,
-								}
-								train_metrics.update(metrics)
-								log_metrics = copy.deepcopy(train_metrics)
-								train_metrics.update(self.arguments._captured_memory)
-								self.arguments.log_metrics(
-									metrics=train_metrics,
-									step=current_step,
-								)
-								pbar.update(1)
-								pbar.set_postfix(
-									**{k.replace("train/", ""): v for k, v in log_metrics.items()}
-								)
-							else:
-								break
-
-							current_step += 1
-				except KeyboardInterrupt:
-					termcolor.cprint(
-						"KeyboardInterrupt At training model Will return Current State of the Model with Parameters.",
-						color="cyan",
-						force_color=True,
-					)
-
-				except EasyDeLTimerError:
-					termcolor.cprint(
-						"Training reached out maximum training Time Killing training Process "
-						"and Will return Current State of the Model with Parameters.",
-						color="cyan",
-						force_color=True,
-					)
-
-				if self.arguments.merge_lora_rapture_parameters and self.rapture is not None:
-					print(
-						termcolor.colored("Info : ", color="red", force_color=True),
-						termcolor.colored(
-							"Merging LoRA Parameters.", color="white", force_color=True
-						),
-					)
-					self.model_state = self.model_state.replace(
-						params=self.rapture.merge_parameters(self.model_state.params)
-					)
-
-				shard_fns, gather_fns = make_shard_and_gather_fns(
-					partition_specs=match_partition_rules(
-						rules=self.model_state.module_config.get_partition_rules(
-							self.arguments.fully_sharded_data_parallel
-						),
-						params=jax.eval_shape(lambda: self.model_state),
-					),
-					mesh=self.mesh,
-				)
-				output = ORPOTrainerOutput(
-					state=self.model_state,
-					mesh=self.mesh,
-					shard_fns=shard_fns,
-					gather_fns=gather_fns,
-					checkpoint_manager=self.checkpoint_manager,
-				)
-				if self.arguments.save_steps is None and self.arguments.do_last_save:
-					shard_fns, gather_fns = make_shard_and_gather_fns(
-						match_partition_rules(
-							(
-								self.config.get_partition_rules(
-									fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
-								)
-								if self.arguments.custom_rule is None
-								else self.arguments.custom_rule
-							),
-							jax.eval_shape(lambda: self.model_state),
-						),
-						mesh=self.mesh,
-					)  # You have to re-init the new shard and gather functions in order to be able to skip LoRA weight
-					# crashing errors and saving errors
-					filename = self._save_state(state=self.model_state, gather_fns=gather_fns)
-					checkpoint_path = f"{str(self.arguments.get_path())}/{filename}"
-
-				if self.arguments.do_eval:
-					for _ in self.eval(self.model_state):
-						...
-
-				output.checkpoint_path = checkpoint_path
-				output.last_save_file_name = filename
-				self.finish()
-
-		return output
+		return self._finalize_training(output, run_exception)
 
 	def eval(self, model_state: EasyDeLState) -> typing.Iterator[dict]:
 		"""
-		Evaluates the ORPO model using the provided model state.
+		Evaluates the DPO using the provided model state.
 
-		This method iterates over the evaluation dataset, performs evaluation steps,
-		calculates metrics, logs metrics, and yields a dictionary of metrics for each step.
+		This method iterates over the evaluation dataset, performs forward passes,
+		calculates evaluation metrics, logs the metrics, and yields the metrics for
+		each evaluation step.
 
 		Args:
-		    model_state (EasyDeLState): The EasyDeLState object containing the model parameters
-		                                and other relevant information.
+				model_state (EasyDeLState): The EasyDeLState object containing the model parameters
+																		and other relevant information.
 
 		Yields:
-		    Iterator[dict]: An iterator that yields a dictionary of evaluation metrics for each step.
+				Iterator[dict]: An iterator yielding a dictionary of evaluation metrics for each step.
 
 		Raises:
-		    AssertionError: If the evaluation dataset is not set.
+				AssertionError: If `self.dataloader_eval` is not set (meaning the evaluation dataloader is missing).
 		"""
-		assert (
-			self.eval_dataset is not None
-		), "`dataloader_eval` is required by evaluator function."
-		with self.mesh:
-			pbar = tqdm(total=self.max_evaluation_steps)
-			pbar.set_description("Evaluating")
-			current_step = 0
-			flops_per_device = (
-				self.calculate_number_total_flops_per_device(params=model_state.params) / 1e12
-			)
-			loss_sum = None
-			try:
-				for batch in self.dataloader_eval:
-					time_start = time.time()
-					for key in self.arguments.ids_to_pop_from_dataset:
-						_ = batch.pop(key, None)
-					for key in list(batch.keys()):
-						if not (
-							key.endswith("_input_ids")
-							or key.endswith("_attention_mask")
-							or key.endswith("_labels")
-						):
-							_ = batch.pop(key, None)
+		start_time = time.time()
 
-					_, outputs = self.sharded_eval_step_function(model_state, batch)
-					total_time = time.time() - time_start
-					flops = flops_per_device / total_time
-					loss, metrics = outputs.loss, outputs.metrics
-					loss_sum = loss.tolist() if loss_sum is None else loss_sum + loss
-					eval_metrics = {
-						"eval/loss": loss.tolist(),
-						"eval/mean_loss": loss_sum
-						/ ((current_step + 1) - self.arguments.step_start_point),
-						"eval/step": current_step,
-						"eval/step_time": total_time,
-						"eval/perplexity": jnp.exp(loss).tolist(),
-						"eval/TFLOPs": flops,
-					}
-					eval_metrics.update(metrics)
-					log_metrics = copy.deepcopy(eval_metrics)
-					eval_metrics.update(self.arguments._captured_memory)
-					self.arguments.log_metrics(metrics=eval_metrics, step=current_step)
+		metrics_tracker = MetricsTracker()
+		step_metrics = StepMetrics(self.arguments)
 
-					pbar.update(1)
-					pbar.set_postfix(
-						**{k.replace("eval/", ""): v for k, v in log_metrics.items()}
-					)
-					yield eval_metrics
-					current_step += 1
-			except KeyboardInterrupt:
-				termcolor.cprint(
-					"KeyboardInterrupt At Evaluation model Will return Nothing and just pass.",
-					color="cyan",
-					force_color=True,
-				)
-
-	def __repr__(self):
-		"""
-		The __repr__ function is used to generate a string representation of an object.
-		This function should return a string that can be parsed by the Python interpreter
-		to recreate the object. The __repr__ function is called when you use print() on an
-		object, or when you type its name in the REPL.
-
-		:param self: Refer to the instance of the class
-		:return: A string representation of the object
-		"""
-		string = f"{self.__class__.__name__}(\n"
-		for k, v in self.__dict__.items():
-			if not k.startswith("_"):
-				try:
-					repr_src = f"  {k} : " + v.__str__().replace("\n", "\n  ") + "\n"
-					string += (
-						repr_src
-						if len(repr_src) < 350
-						else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
-					)
-				except TypeError:
-					repr_src = f"\t{k} : " + "EasyDeLReadingError" + "\n"
-					string += (
-						repr_src
-						if len(repr_src) < 350
-						else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
-					)
-
-		return string + ")"
-
-	def __str__(self):
-		"""
-		The __str__ function is called when you use the print function or when str() is used.
-		It should return a string representation of the object.
-
-		:param self: Refer to the instance of the class
-		:return: The object's string representation
-		"""
-		return self.__repr__()
+		for metrics in self._run_evaluation(
+			sharded_state=model_state,
+			metrics_tracker=metrics_tracker,
+			step_metrics=step_metrics,
+			start_time=start_time,
+		):
+			yield metrics

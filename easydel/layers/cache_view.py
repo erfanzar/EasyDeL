@@ -11,24 +11,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from dataclasses import dataclass
 from functools import partial
+
 import einops
-from git import Optional
 import jax
+import jax.experimental
 import jax.extend
 import jax.lib
+import jax.tree_util
 from fjformer import with_sharding_constraint
+from git import Optional
 from jax import lax
 from jax import numpy as jnp
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec
+
 from easydel.etils.etils import EasyDeLQuantizationMethods
 from easydel.etils.partition_module import PartitionAxis
-
-import jax
-import jax.experimental
-import jax.tree_util
-from dataclasses import dataclass
 from easydel.utils.quantizers import EasyQuantizer
 
 

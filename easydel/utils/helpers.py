@@ -13,17 +13,14 @@
 # limitations under the License.
 
 import contextlib
+import os
+import sys
 import time
 import warnings
-
-import os
+from contextlib import contextmanager
 from pathlib import Path
 
-import flax.metrics.tensorboard
-
 from easydel.etils.etils import get_logger
-import sys
-from contextlib import contextmanager
 
 try:
 	import wandb  # type: ignore
@@ -75,7 +72,9 @@ class Timer:
 
 class Timers:
 	def __init__(
-		self, use_wandb, tensorboard_writer: flax.metrics.tensorboard.SummaryWriter
+		self,
+		use_wandb,
+		tensorboard_writer: "flax.metrics.tensorboard.SummaryWriter",  # noqa #type:ignore
 	):
 		self.timers = {}
 		self.use_wandb = use_wandb

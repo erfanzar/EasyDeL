@@ -31,7 +31,6 @@ from jax.sharding import PartitionSpec
 
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.modules.arctic.arctic_configuration import ArcticConfig
-from easydel.modules.arctic.kernels import arctic_mlp_pallas
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
@@ -390,29 +389,6 @@ class ArcticMLP(nn.Module):
 		    chex.Array: Output tensor after applying dense layers and activation functions.
 		"""
 		x = control_mlp_sharding(x, self.config.partition_axis)
-
-		if (
-			self.config.hardware_abstraction
-			and self.w1.variables.get("params", None) is not None
-		):
-			return jax.vmap(
-				functools.partial(
-					arctic_mlp_pallas,
-					act_fn=self.act_fn,
-					blocksize_k=self.config.pallas_k_block_size,
-					blocksize_m=self.config.pallas_m_block_size,
-					blocksize_n=self.config.pallas_n_block_size,
-					prod_dtype=self.dtype,
-					precision=self.precision,
-				),
-				in_axes=(0, None, None, None),
-			)(
-				x,
-				self.w1.variables["params"]["kernel"],
-				self.w2.variables["params"]["kernel"],
-				self.w3.variables["params"]["kernel"],
-			)
-
 		w1 = self.act_fn(self.w1(x))
 		w3 = self.w3(x)
 		return self.w2(w1 * w3)

@@ -15,7 +15,7 @@
 from typing import Optional
 
 import chex
-from fjformer.dtypes import Array8Bit, ArrayNF4, A8Q, A4Q
+from fjformer.dtypes import A4Q, A8Q, Array8Bit, ArrayNF4
 
 from easydel.etils.etils import EasyDeLPlatforms, EasyDeLQuantizationMethods
 

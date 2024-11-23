@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
 from functools import partial
 from typing import Optional, Tuple, Union
 
@@ -41,7 +40,6 @@ from easydel.modules.flax_modeling_utils import (
 	precompute_frequencies,
 )
 from easydel.modules.gemma2.gemma2_configuration import Gemma2Config as Gemma2Config
-from easydel.modules.gemma2.kernels import gemma2_mlp_pallas
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
@@ -404,27 +402,7 @@ class FlaxGemma2MLP(nn.Module):
 
 	def __call__(self, hidden_states, deterministic=False):
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-		if (
-			self.config.hardware_abstraction
-			and self.up_proj.variables.get("params", None) is not None
-		):
-			return jax.vmap(
-				functools.partial(
-					gemma2_mlp_pallas,
-					act_fn=self.act,
-					blocksize_k=self.config.pallas_k_block_size,
-					blocksize_m=self.config.pallas_m_block_size,
-					blocksize_n=self.config.pallas_n_block_size,
-					prod_dtype=self.dtype,
-					precision=self.precision,
-				),
-				in_axes=(0, None, None, None),
-			)(
-				hidden_states,
-				self.gate_proj.variables["params"]["kernel"],
-				self.down_proj.variables["params"]["kernel"],
-				self.up_proj.variables["params"]["kernel"],
-			)
+
 		hidden_states = self.down_proj(
 			self.act(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
 		)

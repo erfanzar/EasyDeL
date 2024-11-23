@@ -1,13 +1,13 @@
 import jax.numpy as jnp
 
 from easydel.layers.rotary_embedding import (
-	RotaryEmbedding,
-	LinearScalingRotaryEmbedding,
-	DynamicNTKScalingRotaryEmbedding,
-	YaRNScalingRotaryEmbedding,
 	DeepseekScalingRotaryEmbedding,
+	DynamicNTKScalingRotaryEmbedding,
+	LinearScalingRotaryEmbedding,
 	Llama3RotaryEmbedding,
 	Phi3LongRoPEScaledRotaryEmbedding,
+	RotaryEmbedding,
+	YaRNScalingRotaryEmbedding,
 	get_rope,
 )
 

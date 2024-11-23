@@ -35,7 +35,6 @@ from easydel.layers.norms import RMSNorm
 from easydel.modules.deepseek_v2.deepseek_configuration import (
 	DeepseekV2Config as DeepseekV2Config,
 )
-from easydel.modules.deepseek_v2.kernels import deepseekv2_mlp_pallas
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
@@ -234,27 +233,6 @@ class FlaxDeepseekV2MLP(nn.Module):
 		e: bool = False,  # Ignored
 	):
 		x = control_mlp_sharding(x, self.config.partition_axis)
-		if (
-			self.config.hardware_abstraction
-			and self.up_proj.variables.get("params", None) is not None
-		):
-			return jax.vmap(
-				functools.partial(
-					deepseekv2_mlp_pallas,
-					act_fn=self.act_fn,
-					blocksize_k=self.config.pallas_k_block_size,
-					blocksize_m=self.config.pallas_m_block_size,
-					blocksize_n=self.config.pallas_n_block_size,
-					prod_dtype=self.dtype,
-					precision=self.precision,
-				),
-				in_axes=(0, None, None, None),
-			)(
-				x,
-				self.gate_proj.variables["params"]["kernel"],
-				self.down_proj.variables["params"]["kernel"],
-				self.up_proj.variables["params"]["kernel"],
-			)
 		return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 

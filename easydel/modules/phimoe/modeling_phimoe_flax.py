@@ -47,7 +47,6 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 )
 from easydel.modules.modeling_utils import EasyDeLBaseModule
-from easydel.modules.phimoe.kernels import phimoe_mlp_pallas
 from easydel.modules.phimoe.phimoe_configuration import PhiMoeConfig as PhiMoeConfig
 
 re_mat = nn_partitioning.remat
@@ -97,27 +96,6 @@ class FlaxPhiMoEBlockSparseTop2MLP(nn.Module):
 		hidden_states: Array,
 		deterministic: bool = False,  # noqa
 	) -> Array:
-		if (
-			self.config.hardware_abstraction
-			and self.w1.variables.get("params", None) is not None
-		):
-			return jax.vmap(
-				functools.partial(
-					phimoe_mlp_pallas,
-					act_fn=self.act_fn,
-					blocksize_k=self.config.pallas_k_block_size,
-					blocksize_m=self.config.pallas_m_block_size,
-					blocksize_n=self.config.pallas_n_block_size,
-					prod_dtype=self.dtype,
-					precision=self.precision,
-				),
-				in_axes=(0, None, None, None),
-			)(
-				hidden_states,
-				self.w1.variables["params"]["kernel"],
-				self.w2.variables["params"]["kernel"],
-				self.w3.variables["params"]["kernel"],
-			)
 		return self.w2(self.act_fn(self.w1(hidden_states)) * self.w3(hidden_states))
 
 

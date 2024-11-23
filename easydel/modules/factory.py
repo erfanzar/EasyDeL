@@ -90,9 +90,9 @@ class Registry:
 				layernorm_names=layernorm_names,
 				rnn_based_or_rwkv=rnn_based_or_rwkv,
 			)
-			module.can_generate = False
-			if task_type in [TaskType.CAUSAL_LM]:
-				module.can_generate = True
+			module.can_generate = lambda *_: True
+			# if task_type in [TaskType.CAUSAL_LM]:
+			# 	module.can_generate = lambda: True
 			return module
 
 		return wrapper
