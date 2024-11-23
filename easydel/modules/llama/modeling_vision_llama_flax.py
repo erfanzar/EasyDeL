@@ -34,21 +34,21 @@ from transformers.generation.flax_utils import (
 
 from easydel.etils.etils import get_logger
 from easydel.modules.factory import register_module
+from easydel.modules.llama.llama_configuration import VisionLlamaConfig
 from easydel.modules.llama.modeling_llama_flax import (
 	FlaxLlamaBlockCollection,
 	RMSNorm,
 )
-from easydel.modules.llama.vision_llama_configuration import VisionLlamaConfig
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 logger = get_logger(__name__)
 
 
-class FlaxVisionLlamaPreTrainedModel(EDPretrainedModel):
+class FlaxVisionLlamaPreTrainedModel(EasyDeLBaseModule):
 	config_class = VisionLlamaConfig
 	base_model_prefix = "model"
 	module_class: nn.Module = None
@@ -311,6 +311,7 @@ class FlaxVisionLlamaModule(nn.Module):
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,
 			causal_mask=self.causal_mask,
+			frequencies=self.frequencies,
 		)
 
 		hidden_states = outputs[0]
@@ -652,7 +653,8 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
 						" deprecated strategy to control generation and will be removed soon, in a future version."
 						" Please use and modify the model generation configuration (see"
 						" https://huggingface.co/docs/transformers/generation_strategies#d"
-						"efault-text-generation-configuration )"
+						"efault-text-generation-configuration )",
+						stacklevel=1,
 					)
 					self.generation_config = new_generation_config
 			generation_config = self.generation_config
@@ -678,13 +680,15 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
 			if model_kwargs.get("attention_mask") is None:
 				warnings.warn(
 					"The attention mask and the pad token id were not set. As a consequence, you may observe "
-					"unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results."
+					"unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.",
+					stacklevel=1,
 				)
 			eos_token_id = generation_config.eos_token_id
 			if isinstance(eos_token_id, list):
 				eos_token_id = eos_token_id[0]
 			warnings.warn(
-				f"Setting `pad_token_id` to `eos_token_id`:{eos_token_id} for open-end generation."
+				f"Setting `pad_token_id` to `eos_token_id`:{eos_token_id} for open-end generation.",
+				stacklevel=1,
 			)
 			generation_config.pad_token_id = eos_token_id
 
@@ -704,7 +708,8 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
 			):
 				warnings.warn(
 					"A decoder-only architecture is being used, but right-padding was detected! For correct "
-					"generation results, please set `padding_side='left'` when initializing the tokenizer."
+					"generation results, please set `padding_side='left'` when initializing the tokenizer.",
+					stacklevel=1,
 				)
 
 		batch_size = input_ids.shape[0]
@@ -739,6 +744,7 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
 				"to control the generation length.  recommend setting `max_new_tokens` to control "
 				"the maximum length of the generation.",
 				UserWarning,
+				stacklevel=1,
 			)
 		elif generation_config.max_new_tokens is not None:
 			if not has_default_max_length and generation_config.max_length is not None:
@@ -746,7 +752,8 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
 					f"Both `max_new_tokens` (={generation_config.max_new_tokens}) and `max_length`(="
 					f"{generation_config.max_length}) seem to have been set. `max_new_tokens` will take precedence. "
 					"Please refer to the documentation for more information. "
-					"(https://huggingface.co/docs/transformers/main/en/main_classes/text_generation)"
+					"(https://huggingface.co/docs/transformers/main/en/main_classes/text_generation)",
+					stacklevel=1,
 				)
 			generation_config.max_length = (
 				generation_config.max_new_tokens + input_ids_seq_length
@@ -767,7 +774,8 @@ class FlaxVisionLlamaForCausalLM(FlaxVisionLlamaPreTrainedModel):
 			warnings.warn(
 				f"Input length of {input_ids_string} is {input_ids_seq_length}, but `max_length` is set to"
 				f" {generation_config.max_length}. This can lead to unexpected behavior. You should consider"
-				" increasing`max_new_tokens`."
+				" increasing`max_new_tokens`.",
+				stacklevel=1,
 			)
 
 		logits_processor = self._get_logits_processor(

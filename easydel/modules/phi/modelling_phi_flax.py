@@ -45,8 +45,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
-from easydel.modules.phi.kernels import phi_mlp_pallas
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.phi.phi_configuration import PhiConfig as PhiConfig
 
 re_mat = nn_partitioning.remat
@@ -99,26 +98,7 @@ class FlaxPhiMLP(nn.Module):
 
 	def __call__(self, hidden_states: Array, e: bool = False) -> Array:  # Ignored
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-		if (
-			self.config.hardware_abstraction
-			and self.fc1.variables.get("params", None) is not None
-		):
-			return jax.vmap(
-				functools.partial(
-					phi_mlp_pallas,
-					act_fn=self.act,
-					blocksize_k=self.config.pallas_k_block_size,
-					blocksize_m=self.config.pallas_m_block_size,
-					blocksize_n=self.config.pallas_n_block_size,
-					prod_dtype=self.dtype,
-					precision=self.precision,
-				),
-				in_axes=(0, None, None),
-			)(
-				hidden_states,
-				self.fc1.variables["params"]["kernel"],
-				self.fc2.variables["params"]["kernel"],
-			)
+
 		return self.fc2(self.act(self.fc1(hidden_states)))
 
 
@@ -872,7 +852,7 @@ class FlaxPhiForCausalLMModule(nn.Module):
 		)
 
 
-class FlaxPhiPreTrainedModel(EDPretrainedModel):
+class FlaxPhiPreTrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for Phi models providing initialization and configuration.
 

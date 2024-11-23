@@ -22,7 +22,6 @@ def main():
 			max_position_embeddings=512,
 			use_scan_mlp=False,
 			axis_dims=(1, -1, 1, 1),
-			quantize_kv_cache=True,
 			q_block=32,
 			k_block=32,
 			hardware_abstraction=True,

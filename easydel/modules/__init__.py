@@ -121,11 +121,8 @@ from easydel.modules.internlm2.modeling_internlm2_flax import (
 )
 from easydel.modules.llama import (
 	FlaxLlamaForCausalLM,
-	FlaxLlamaForCausalLMModule,
 	FlaxLlamaForSequenceClassification,
-	FlaxLlamaForSequenceClassificationModule,
 	FlaxLlamaModel,
-	FlaxLlamaModule,
 	FlaxVisionLlamaForCausalLM,
 	LlamaConfig,
 	VisionLlamaConfig,
@@ -162,7 +159,7 @@ from easydel.modules.mixtral import (
 	FlaxMixtralModule,
 	MixtralConfig,
 )
-from easydel.modules.modeling_utils import EDPretrainedConfig, EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseConfig, EasyDeLBaseModule
 from easydel.modules.mosaic_mpt import (
 	FlaxMptForCausalLM,
 	FlaxMptForCausalLMModule,

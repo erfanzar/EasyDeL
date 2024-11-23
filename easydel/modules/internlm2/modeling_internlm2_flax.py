@@ -46,13 +46,12 @@ from easydel.modules.flax_modeling_utils import (
 from easydel.modules.internlm2.internlm2_configuration import (
 	InternLM2Config as InternLM2Config,
 )
-from easydel.modules.internlm2.kernels import internlm2_mlp_pallas
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 	FlaxSequenceClassifierOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 
 class FlaxInternLM2Embedding(nn.Module):
@@ -334,28 +333,6 @@ class FlaxInternLM2MLP(nn.Module):
 		"""
 
 		x = control_mlp_sharding(x, self.config.partition_axis)
-
-		if (
-			self.config.hardware_abstraction
-			and self.w2.variables.get("params", None) is not None
-		):
-			return jax.vmap(
-				functools.partial(
-					internlm2_mlp_pallas,
-					act_fn=self.act_fn,
-					blocksize_k=self.config.pallas_k_block_size,
-					blocksize_m=self.config.pallas_m_block_size,
-					blocksize_n=self.config.pallas_n_block_size,
-					prod_dtype=self.dtype,
-					precision=self.precision,
-				),
-				in_axes=(0, None, None, None),
-			)(
-				x,
-				self.w1.variables["params"]["kernel"],
-				self.w2.variables["params"]["kernel"],
-				self.w3.variables["params"]["kernel"],
-			)
 		return self.w2(self.act_fn(self.w1(x)) * self.w3(x))
 
 
@@ -471,7 +448,7 @@ class FlaxInternLM2Block(nn.Module):
 		return (hidden_states,) + attn_outputs[1:]
 
 
-class FlaxInternLM2PreTrainedModel(EDPretrainedModel):
+class FlaxInternLM2PreTrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for InternLM2 models providing initialization and configuration.
 

@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from __future__ import annotations
+
 import argparse
 import logging
-from enum import Enum
 import os
+from enum import Enum
 from typing import (
 	Any,
 	Dict,
@@ -113,7 +114,7 @@ class StoreTupleAction(argparse.Action):
 def check_compute_capability(capability):
 	from jax._src import xla_bridge
 
-	if not "cuda" in xla_bridge.get_backend().platform_version:
+	if "cuda" not in xla_bridge.get_backend().platform_version:
 		return False
 	d, *_ = jax.local_devices(backend="gpu")
 	target = tuple(int(x) for x in capability.split("."))

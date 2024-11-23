@@ -35,8 +35,8 @@ def main():
 		max_position_embeddings=sequence_length,
 		attn_dtype=jnp.float16,
 		attn_mechanism=ed.AttentionMechanisms.VANILLA,
-		block_k=512,
-		block_q=512,
+		blocksize_k=512,
+		blocksize_q=512,
 		hardware_abstraction=False,
 	)
 

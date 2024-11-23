@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +14,7 @@
 
 import typing
 import warnings
-from typing import Callable, Dict, List, Literal, Mapping, Tuple, Union
+from typing import Callable, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 import chex
 import jax
@@ -320,7 +319,8 @@ def concatenated_inputs(
 			concatenated_batch[k] = val.reshape(val.shape[0], -1)
 	if is_encoder_decoder:
 		warnings.warn(
-			"`concatenated_input_ids` will be repeated (encoder decoder model detected)"
+			"`concatenated_input_ids` will be repeated (encoder decoder model detected)",
+			stacklevel=1,
 		)
 		concatenated_batch["concatenated_input_ids"] = batch["prompt_input_ids"].repeat(
 			2, 1
@@ -361,7 +361,7 @@ def create_orpo_step_function(
 	concatenated_forward: Callable,
 	beta: float = 0.1,
 	mode: Literal["train", "eval"] = "train",
-	batch_partition_spec: PartitionSpec = PartitionSpec(("fsdp", "dp"), "sp"),
+	batch_partition_spec: Optional[PartitionSpec] = None,
 ):
 	"""The create_orpo_step_function function is a helper function that creates the ORPO training step.
 
@@ -375,6 +375,8 @@ def create_orpo_step_function(
 	Returns:
 	    A function that takes in a state and a batch
 	"""
+	if batch_partition_spec is None:
+		batch_partition_spec = PartitionSpec(("fsdp", "dp"), "sp")
 
 	def orpo_step(state: EasyDeLState, batch: dict) -> tuple[EasyDeLState, ORPOStepOut]:
 		"""The orpo_step function is the core of ORPO. It takes a state and a batch,

@@ -49,7 +49,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxSequenceClassifierOutput,
 	FlaxTokenClassifierOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.roberta.roberta_configuration import RobertaConfig as RobertaConfig
 
 
@@ -735,7 +735,7 @@ class FlaxRobertaClassificationHead(nn.Module):
 		return hidden_states
 
 
-class FlaxRobertaPreTrainedModel(EDPretrainedModel):
+class FlaxRobertaPreTrainedModel(EasyDeLBaseModule):
 	config_class = RobertaConfig
 	base_model_prefix = "roberta"
 

@@ -43,7 +43,7 @@ from easydel.modules.flax_modeling_utils import (
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 
 def flatten_axes(a: Array, start: int = 0, end: int = -1) -> Array:
@@ -847,7 +847,7 @@ class FlaxChatGLMBlock(nn.Module):
 		return output
 
 
-class FlaxChatGLMPreTrainedModel(EDPretrainedModel):
+class FlaxChatGLMPreTrainedModel(EasyDeLBaseModule):
 	config_class = ChatGLMConfig
 	base_model_prefix = "model"
 	module_class: nn.Module = None

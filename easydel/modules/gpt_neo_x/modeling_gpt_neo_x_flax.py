@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
 from typing import Dict, Optional, Tuple, Union
 
 import chex
@@ -26,6 +25,7 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 from easydel.layers.attention import FlaxAttentionModule
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
 	control_mlp_sharding,
@@ -35,10 +35,8 @@ from easydel.modules.flax_modeling_utils import (
 from easydel.modules.gpt_neo_x.gpt_neo_x_configuration import (
 	GPTNeoXConfig as GPTNeoXConfig,
 )
-from easydel.modules.gpt_neo_x.kernels import gptneox_mlp_pallas
 from easydel.modules.modeling_flax_outputs import FlaxBaseModelOutput
-from easydel.modules.modeling_utils import EDPretrainedModel
-from easydel.modules.factory import register_module
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 
 def precompute_freqs_cis(
@@ -164,27 +162,6 @@ class FlaxGPTNeoXMlp(nn.Module):
 
 	def __call__(self, x):
 		x = control_mlp_sharding(x, self.config.partition_axis)
-		if (
-			self.config.hardware_abstraction
-			and self.dense_4h_to_h.variables.get("params", None) is not None
-		):
-			return jax.vmap(
-				functools.partial(
-					gptneox_mlp_pallas,
-					act_fn=self.act,
-					blocksize_k=self.config.pallas_k_block_size,
-					blocksize_m=self.config.pallas_m_block_size,
-					blocksize_n=self.config.pallas_n_block_size,
-					prod_dtype=self.dtype,
-					precision=self.precision,
-				),
-				in_axes=(0, None, None),
-			)(
-				x,
-				self.dense_h_to_4h.variables["params"]["kernel"],
-				self.dense_4h_to_h.variables["params"]["kernel"],
-			)
-
 		return self.dense_4h_to_h(self.act(self.dense_h_to_4h(x)))
 
 
@@ -305,7 +282,7 @@ class FlaxGPTNeoXModule(nn.Module):
 			return (hidden_state,)
 
 
-class FlaxGPTNeoXPretrainedModel(EDPretrainedModel):
+class FlaxGPTNeoXPretrainedModel(EasyDeLBaseModule):
 	module_class: nn.Module = None
 	config_class = GPTNeoXConfig
 

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
 import math
 from typing import Optional, Tuple, Union
 
@@ -31,7 +30,6 @@ from jax.sharding import PartitionSpec
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.modules.factory import register_module
 from easydel.modules.falcon.falcon_configuration import FalconConfig as FalconConfig
-from easydel.modules.falcon.kernels import falcon_mlp_pallas
 from easydel.modules.flax_modeling_utils import (
 	apply_rotary_pos_emb,
 	block_wise_ffn,
@@ -45,7 +43,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 
 def built_bloom_alibi(attention_mask, num_attention_heads):
@@ -465,25 +463,7 @@ class FlaxFalconMlp(nn.Module):
 
 	def __call__(self, x: chex.Array, deterministic: bool = True):
 		x = control_mlp_sharding(x, self.config.partition_axis)
-		if (
-			self.config.hardware_abstraction
-			and self.dense_4h_to_h.variables.get("params", None) is not None
-		):
-			return jax.vmap(
-				functools.partial(
-					falcon_mlp_pallas,
-					blocksize_k=self.config.pallas_k_block_size,
-					blocksize_m=self.config.pallas_m_block_size,
-					blocksize_n=self.config.pallas_n_block_size,
-					prod_dtype=self.dtype,
-					precision=self.precision,
-				),
-				in_axes=(0, None, None),
-			)(
-				x,
-				self.dense_h_to_4h.variables["params"]["kernel"],
-				self.dense_4h_to_h.variables["params"]["kernel"],
-			)
+
 		return self.dense_4h_to_h(nn.gelu(self.dense_h_to_4h(x), approximate=False))
 
 
@@ -865,7 +845,7 @@ class FlaxFalconModule(nn.Module):
 			)
 
 
-class FlaxFalconPretrainedModel(EDPretrainedModel):
+class FlaxFalconPretrainedModel(EasyDeLBaseModule):
 	module_class: nn.Module = None
 	config_class = FalconConfig
 

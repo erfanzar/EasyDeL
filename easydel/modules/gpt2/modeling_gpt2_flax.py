@@ -42,8 +42,9 @@ from jax import lax
 from jax.sharding import PartitionSpec
 
 from easydel.layers.attention import FlaxAttentionModule
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
-	ACT2FN, 
+	ACT2FN,
 	block_wise_ffn,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
@@ -54,8 +55,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutputWithPastAndCrossAttentions,
 	FlaxCausalLMOutputWithCrossAttentions,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
-from easydel.modules.factory import register_module
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 
 class FlaxConv1D(nn.Module):
@@ -444,7 +444,7 @@ class FlaxGPT2Block(nn.Module):
 		return outputs
 
 
-class FlaxGPT2PreTrainedModel(EDPretrainedModel):
+class FlaxGPT2PreTrainedModel(EasyDeLBaseModule):
 	config_class = GPT2Config
 	base_model_prefix = "transformer"
 	module_class: nn.Module = None

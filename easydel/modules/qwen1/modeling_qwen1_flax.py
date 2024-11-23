@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
 import math
 from typing import Optional, Tuple, Union
 
@@ -45,8 +44,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 	FlaxSequenceClassifierOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
-from easydel.modules.qwen1.kernels import qwen1_mlp_pallas
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.qwen1.qwen1_configuration import Qwen1Config as Qwen1Config
 
 
@@ -162,30 +160,7 @@ class FlaxQwen1MLP(nn.Module):
 		"""
 
 		x = control_mlp_sharding(x, self.config.partition_axis)
-
-		if (
-			self.config.hardware_abstraction
-			and self.w2.variables.get("params", None) is not None
-		):
-			x = jax.vmap(
-				functools.partial(
-					qwen1_mlp_pallas,
-					act_fn=jax.nn.silu,
-					blocksize_k=self.config.pallas_k_block_size,
-					blocksize_m=self.config.pallas_m_block_size,
-					blocksize_n=self.config.pallas_n_block_size,
-					prod_dtype=self.dtype,
-					precision=self.precision,
-				),
-				in_axes=(0, None, None, None),
-			)(
-				x,
-				self.w2.variables["params"]["kernel"],
-				self.c_proj.variables["params"]["kernel"],
-				self.w1.variables["params"]["kernel"],
-			)
-		else:
-			x = self.c_proj(jax.nn.silu(self.w2(x)) * self.w1(x))
+		x = self.c_proj(jax.nn.silu(self.w2(x)) * self.w1(x))
 		return x
 
 
@@ -550,7 +525,7 @@ class FlaxQwen1Block(nn.Module):
 		return (hidden_states,) + attn_outputs[1:]
 
 
-class FlaxQwen1PreTrainedModel(EDPretrainedModel):
+class FlaxQwen1PreTrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for Qwen1 models providing initialization and configuration.
 

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
 import math
 from typing import Optional, Tuple, Union
 
@@ -47,11 +46,10 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxMaskedLMOutput,
 	FlaxSequenceClassifierOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.qwen2_moe.configuration_qwen2_moe import (
 	Qwen2MoeConfig as Qwen2MoeConfig,
 )
-from easydel.modules.qwen2_moe.kernels import qwen2moe_mlp_pallas
 
 
 @flax.struct.dataclass
@@ -151,29 +149,8 @@ class FlaxQwen2MoeMLP(nn.Module):
 		"""
 
 		x = control_mlp_sharding(x, self.config.partition_axis)
-		if (
-			self.config.hardware_abstraction
-			and self.gate_proj.variables.get("params", None) is not None
-		):
-			x = jax.vmap(
-				functools.partial(
-					qwen2moe_mlp_pallas,
-					act_fn=jax.nn.silu,
-					blocksize_k=self.config.pallas_k_block_size,
-					blocksize_m=self.config.pallas_m_block_size,
-					blocksize_n=self.config.pallas_n_block_size,
-					prod_dtype=self.dtype,
-					precision=self.precision,
-				),
-				in_axes=(0, None, None, None),
-			)(
-				x,
-				self.gate_proj.variables["params"]["kernel"],
-				self.down_proj.variables["params"]["kernel"],
-				self.up_proj.variables["params"]["kernel"],
-			)
-		else:
-			x = self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
+		x = self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
 		return x
 
 
@@ -705,7 +682,7 @@ class FlaxQwen2MoeBlock(nn.Module):
 		return (hidden_states,) + attn_outputs[1:] + (router_logits,)
 
 
-class FlaxQwen2MoePreTrainedModel(EDPretrainedModel):
+class FlaxQwen2MoePreTrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for Qwen2Moe models providing initialization and configuration.
 

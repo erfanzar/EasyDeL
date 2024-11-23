@@ -36,9 +36,9 @@ tokenizer.pad_token = tokenizer.eos_token
 model.config.add_basic_configurations(
     attn_mechanism="flash",  # Change to 'normal' if the model you are using
     # don't support flash attention, or you don't want to apply flash attention for the model
-    block_b=1,
-    block_q=1024,
-    block_k=1024,
+    blocksize_b=1,
+    blocksize_q=1024,
+    blocksize_k=1024,
     block_k_major=1024,
 )
 

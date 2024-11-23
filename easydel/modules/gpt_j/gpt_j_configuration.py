@@ -17,14 +17,14 @@ from typing import Optional
 from jax.sharding import PartitionSpec
 
 from easydel.modules.factory import register_config
-from easydel.modules.modeling_utils import EDPretrainedConfig
+from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
 
 @register_config("gptj")
-class GPTJConfig(EDPretrainedConfig):
+class GPTJConfig(EasyDeLBaseConfig):
 	"""
-	Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read
-	the documentation from [`EDPretrainedConfig`] for more information.
+	Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read
+	the documentation from [`EasyDeLBaseConfig`] for more information.
 
 	Args:
 	    vocab_size (`int`, *optional*, defaults to 50400):
@@ -136,18 +136,18 @@ class GPTJConfig(EDPretrainedConfig):
 		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
-			("model/wte/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+			("model/wte/embedding", PartitionSpec(("fsdp", "sp"))),
 			(
 				"attn/(k_proj|v_proj|q_proj)/kernel",
-				PartitionSpec(("fsdp", "sp"), "tp"),
+				PartitionSpec(("fsdp", "sp")),
 			),
-			("attn/out_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("mlp/fc_out/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("attn/out_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+			("mlp/fc_out/kernel", PartitionSpec(("fsdp", "sp"))),
 			("mlp/fc_out/bias", PartitionSpec(("fsdp", "sp"))),
-			("mlp/fc_in/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("mlp/fc_in/kernel", PartitionSpec(("fsdp", "sp"))),
 			("mlp/fc_in/bias", PartitionSpec(("fsdp", "sp"))),
-			("lm_head/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("lm_head/bias", PartitionSpec("tp", ("fsdp", "sp"))),
+			("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
+			("lm_head/bias", PartitionSpec(("fsdp", "sp"))),
 			(".*", PartitionSpec(("fsdp", "sp"))),
 		)
 

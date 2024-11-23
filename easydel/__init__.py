@@ -26,22 +26,22 @@ if _os.environ.get("EASYDEL_AUTO", "true") in ["true", "1", "on", "yes"]:
 	_os.environ["CACHE_TRITON_KERNELS"] = "1"
 	_os.environ["XLA_FLAGS"] = (
 		_os.environ.get("XLA_FLAGS", "") + " "
-		"--xla_gpu_triton_gemm_any=True \ "
-		"--xla_gpu_enable_while_loop_double_buffering=true \ "
-		"--xla_gpu_enable_pipelined_all_gather=true \ "
-		"--xla_gpu_enable_pipelined_reduce_scatter=true \ "
-		"--xla_gpu_enable_pipelined_all_reduce=true \ "
-		"--xla_gpu_enable_pipelined_collectives=false  \ "
-		"--xla_gpu_enable_reduce_scatter_combine_by_dim=false \ "
-		"--xla_gpu_enable_all_gather_combine_by_dim=false \ "
-		"--xla_gpu_enable_reduce_scatter_combine_by_dim=false \ "
-		"--xla_gpu_all_gather_combine_threshold_bytes=8589934592 \ "
-		"--xla_gpu_reduce_scatter_combine_threshold_bytes=8589934592 \ "
-		"--xla_gpu_all_reduce_combine_threshold_bytes=8589934592 \ "
-		"--xla_gpu_multi_streamed_windowed_einsum=true \ "
-		"--xla_gpu_threshold_for_windowed_einsum_mib=0 \ "
-		"--xla_gpu_enable_latency_hiding_scheduler=true \ "
-		"--xla_gpu_enable_command_buffer= \ "
+		"--xla_gpu_triton_gemm_any=True "
+		"--xla_gpu_enable_while_loop_double_buffering=true "
+		"--xla_gpu_enable_pipelined_all_gather=true "
+		"--xla_gpu_enable_pipelined_reduce_scatter=true "
+		"--xla_gpu_enable_pipelined_all_reduce=true "
+		"--xla_gpu_enable_pipelined_collectives=false  "
+		"--xla_gpu_enable_reduce_scatter_combine_by_dim=false "
+		"--xla_gpu_enable_all_gather_combine_by_dim=false "
+		"--xla_gpu_enable_reduce_scatter_combine_by_dim=false "
+		"--xla_gpu_all_gather_combine_threshold_bytes=8589934592 "
+		"--xla_gpu_reduce_scatter_combine_threshold_bytes=8589934592 "
+		"--xla_gpu_all_reduce_combine_threshold_bytes=8589934592 "
+		"--xla_gpu_multi_streamed_windowed_einsum=true "
+		"--xla_gpu_threshold_for_windowed_einsum_mib=0 "
+		"--xla_gpu_enable_latency_hiding_scheduler=true "
+		"--xla_gpu_enable_command_buffer= "
 	)
 	_os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 	if _os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION", None) is None:
@@ -53,7 +53,6 @@ del _os
 # EasyDel Imports
 from packaging.version import Version as _Version
 
-from easydel import etils, modules
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import (
 	EasyDeLRuntimeError,
@@ -184,11 +183,8 @@ from easydel.modules.internlm2.modeling_internlm2_flax import (
 )
 from easydel.modules.llama import (
 	FlaxLlamaForCausalLM,
-	FlaxLlamaForCausalLMModule,
 	FlaxLlamaForSequenceClassification,
-	FlaxLlamaForSequenceClassificationModule,
 	FlaxLlamaModel,
-	FlaxLlamaModule,
 	FlaxVisionLlamaForCausalLM,
 	LlamaConfig,
 	VisionLlamaConfig,
@@ -226,8 +222,8 @@ from easydel.modules.mixtral import (
 	MixtralConfig,
 )
 from easydel.modules.modeling_utils import (
-	EDPretrainedConfig,
-	EDPretrainedModel,
+	EasyDeLBaseConfig,
+	EasyDeLBaseModule,
 )
 from easydel.modules.mosaic_mpt import (
 	FlaxMptForCausalLM,
@@ -350,6 +346,7 @@ from easydel.trainers import (
 	DPOTrainerOutput,
 	JaxDistributedConfig,
 	LoraRaptureConfig,
+	ORPOConfig,
 	ORPOTrainer,
 	ORPOTrainerOutput,
 	SequenceClassificationTrainer,

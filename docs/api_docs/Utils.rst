@@ -4,9 +4,10 @@ Utils
 .. toctree::
    :maxdepth: 2
 
-   utils.compiling_utils
-   utils.quantizers
    utils.analyze_memory
    utils.readme_generator
-   utils.lazy_import
+   utils.compiling_utils
+   utils.traversal
+   utils.quantizers
    utils.helpers
+   utils.lazy_import

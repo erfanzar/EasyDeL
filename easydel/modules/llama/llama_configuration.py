@@ -17,14 +17,14 @@ from typing import Dict, Optional, Union
 from jax.sharding import PartitionSpec
 
 from easydel.modules.factory import register_config
-from easydel.modules.modeling_utils import EDPretrainedConfig
+from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
 
 @register_config("llama")
-class LlamaConfig(EDPretrainedConfig):
+class LlamaConfig(EasyDeLBaseConfig):
 	"""
-	Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read
-	the documentation from [`EDPretrainedConfig`] for more information.
+	Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read
+	the documentation from [`EasyDeLBaseConfig`] for more information.
 
 	Args:
 	    vocab_size (`int`, *optional*, defaults to 32000):
@@ -257,6 +257,61 @@ class LlamaConfig(EDPretrainedConfig):
 	@staticmethod
 	def rng_keys():
 		return "params", "dropout", "fcm"
+
+	@property
+	def granted_freq_max_position_embedding(self) -> int:
+		return getattr(
+			self,
+			"freq_max_position_embeddings",
+			self.max_position_embeddings,
+		)
+
+	@property
+	def granted_mask_max_position_embedding(self) -> int:
+		return getattr(
+			self,
+			"mask_max_position_embeddings",
+			self.max_position_embeddings,
+		)
+
+
+class VisionLlamaConfig(LlamaConfig):
+	def __init__(
+		self,
+		vision_vocab_size=8448,
+		tie_vision_embeddings=False,
+		sample_mode="all",
+		**kwargs,
+	):
+		super().__init__(**kwargs)
+		self.vision_vocab_size = vision_vocab_size
+		self.tie_vision_embeddings = tie_vision_embeddings
+		self.sample_mode = sample_mode
+
+	def get_partition_rules(self, *args, **kwargs):
+		"""
+		Get the partition rules for the model.
+		Returns:
+		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		"""
+		return (
+			("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+			("model/embed_vision/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+			(
+				"self_attn/(q_proj|k_proj|v_proj)/kernel",
+				PartitionSpec(("fsdp", "sp"), "tp"),
+			),
+			("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("input_layernorm/kernel", PartitionSpec(None)),
+			("post_attention_layernorm/kernel", PartitionSpec(None)),
+			("model/norm/kernel", PartitionSpec(None)),
+			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("vision_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			(".*", PartitionSpec(None)),
+		)
 
 	@property
 	def granted_freq_max_position_embedding(self) -> int:

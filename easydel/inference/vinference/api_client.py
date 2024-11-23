@@ -1,7 +1,9 @@
-import urllib.parse
 import json
-from typing import Generator, Union, Optional
+import urllib.parse
+from typing import Generator, Optional, Union
+
 import requests
+
 from easydel.inference.vinference.api_models import (
 	ChatCompletionRequest,
 	ChatCompletionResponse,

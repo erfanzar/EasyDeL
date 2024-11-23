@@ -23,7 +23,7 @@ from transformers import AutoTokenizer
 from easydel import (
 	FlaxMistralForCausalLM,
 	MistralConfig,
-	TrainingArguments,
+	ORPOConfig,
 )
 from easydel.trainers.odds_ratio_preference_optimization_trainer import (
 	ORPOTrainer,
@@ -80,26 +80,16 @@ def orpo_main():
 	################
 	dtype = jnp.float32
 	trainer = ORPOTrainer(
-		max_prompt_length=SEQUENCE_LENGTH,
-		max_length=SEQUENCE_LENGTH * 2,
-		max_completion_length=SEQUENCE_LENGTH * 2,
 		train_dataset=train_dataset,
 		tokenizer=tokenizer,
 		dataset_num_proc=4,
-		apply_chat_template=True,
-		arguments=TrainingArguments(
+		model=model,
+		arguments=ORPOConfig(
 			model_name="ORPO_TEST",
 			num_train_epochs=NUM_TRAIN_EPOCHS,
 			total_batch_size=TOTAL_BATCH_SIZE,
 			gradient_accumulation_steps=2,
-			model_class=type(model),
 			do_train=True,
-			configs_to_initialize_model_class={
-				"config": model.config,
-				"input_shape": (8, 8),
-				"dtype": dtype,
-				"param_dtype": dtype,
-			},
 			dtype=dtype,
 			param_dtype=dtype,
 			track_memory=False,
@@ -108,6 +98,10 @@ def orpo_main():
 			do_last_save=True,
 			init_input_shape=(8, 8),
 			# max_training_steps=1
+			max_prompt_length=SEQUENCE_LENGTH,
+			max_length=SEQUENCE_LENGTH * 2,
+			max_completion_length=SEQUENCE_LENGTH * 2,
+			apply_chat_template=True,
 		),
 	)
 

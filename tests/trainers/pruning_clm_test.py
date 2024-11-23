@@ -58,8 +58,8 @@ def main(use_iterable_dataset: bool):
 		max_position_embeddings=sequence_length,
 		attn_dtype=jnp.float16,
 		attn_mechanism=AttentionMechanisms.FLASH_ATTN2,
-		block_k=128,
-		block_q=128,
+		blocksize_k=128,
+		blocksize_q=128,
 	)
 
 	model = FlaxMistralForCausalLM(config=config, _do_init=True)

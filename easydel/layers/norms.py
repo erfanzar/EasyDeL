@@ -61,4 +61,3 @@ class LayerNormRaw(nn.Module):
 			epsilon=self.eps, use_bias=False, use_scale=False
 		)(hidden_states)
 		return jnp.asarray(normalized_hidden_states, orig_dtype)
-

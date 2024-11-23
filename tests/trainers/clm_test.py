@@ -46,10 +46,8 @@ def main(use_iterable_dataset: bool):
 		num_hidden_layers=4,
 		intermediate_size=1024,
 		max_position_embeddings=sequence_length,
-		attn_dtype=jnp.float16,
+		attn_dtype=jnp.float32,
 		attn_mechanism=AttentionMechanisms.VANILLA,
-		block_k=64,
-		block_q=64,
 	)
 
 	dtype = jnp.float16
@@ -67,7 +65,7 @@ def main(use_iterable_dataset: bool):
 		for _ in range(num_rows):
 			yield {
 				"attention_mask": jnp.ones((sequence_length,), dtype="i4"),
-				"input_ids": random.randint(new_rng, (sequence_length,), 0, 32000, dtype="i4"),
+				"input_ids": random.randint(new_rng, (sequence_length,), 3, 32000, dtype="i4"),
 			}
 
 	if not use_iterable_dataset:

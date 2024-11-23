@@ -38,8 +38,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
-from easydel.modules.mosaic_mpt.kernels import mpt_mlp_pallas
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.mosaic_mpt.mosaic_configuration import (
 	MptConfig as MptConfig,
 )
@@ -72,31 +71,9 @@ class FlaxMptMLP(nn.Module):
 		deterministic: bool = False,
 	):
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-		if (
-			self.config.hardware_abstraction
-			and self.up_proj.variables.get("params", None) is not None
-		):
-			hidden_states = jax.vmap(
-				partial(
-					mpt_mlp_pallas,
-					act_fn=jax.nn.gelu,
-					blocksize_k=self.config.pallas_k_block_size,
-					blocksize_m=self.config.pallas_m_block_size,
-					blocksize_n=self.config.pallas_n_block_size,
-					prod_dtype=self.dtype,
-					precision=self.precision,
-				),
-				in_axes=(0, None, None),
-			)(
-				hidden_states,
-				self.up_proj.variables["params"]["kernel"],
-				self.down_proj.variables["params"]["kernel"],
-			)
-		else:
-			hidden_states = self.down_proj(
-				jax.nn.gelu(self.up_proj(hidden_states), approximate=False)
-			)
-
+		hidden_states = self.down_proj(
+			jax.nn.gelu(self.up_proj(hidden_states), approximate=False)
+		)
 		return self.hidden_dropout(hidden_states, deterministic=deterministic) + residual
 
 
@@ -582,7 +559,7 @@ class FlaxMptModule(nn.Module):
 		return (hidden_states, all_hidden_states, all_attentions)
 
 
-class FlaxMptPretrainedModel(EDPretrainedModel):
+class FlaxMptPretrainedModel(EasyDeLBaseModule):
 	module_class: nn.Module = None
 	config_class: MptConfig = MptConfig
 
