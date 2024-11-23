@@ -13,11 +13,11 @@
 # limitations under the License.
 
 from easydel.modules.factory import register_config
-from easydel.modules.modeling_utils import EDPretrainedConfig
+from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
 
 @register_config("zamba2")
-class Zamba2Config(EDPretrainedConfig):
+class Zamba2Config(EasyDeLBaseConfig):
 	r"""
 	This is the configuration class to store the configuration of a [`Zamba2Model`]. It is used to instantiate a
 	Zamba2 model according to the specified arguments, defining the model architecture. Instantiating a configuration

@@ -37,19 +37,19 @@ from easydel.modules.factory import register_module
 from easydel.modules.llama.modeling_llama_flax import (
 	FlaxLlamaBlockCollection,
 	RMSNorm,
-	precompute_frequencies,
+	# precompute_frequencies,
 )
-from easydel.modules.llama.vision_llama_configuration import VisionLlamaConfig
+from easydel.modules.llama.llama_configuration import VisionLlamaConfig
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 logger = get_logger(__name__)
 
 
-class FlaxVisionLlamaPreTrainedModel(EDPretrainedModel):
+class FlaxVisionLlamaPreTrainedModel(EasyDeLBaseModule):
 	config_class = VisionLlamaConfig
 	base_model_prefix = "model"
 	module_class: nn.Module = None
@@ -269,23 +269,23 @@ class FlaxVisionLlamaModule(nn.Module):
 			dtype="bool",
 		)
 
-		initial_rope_kwargs = dict(rope_type="none")
-		if config.rope_scaling is not None:
-			scaling_type = config.rope_scaling["type"]
-			scaling_factor = config.rope_scaling["factor"]
-			initial_rope_kwargs = dict(scaling_factor=scaling_factor, rope_type=scaling_type)
-		self.frequencies = precompute_frequencies(
-			max_position_embeddings=(
-				getattr(
-					self.config,
-					"freq_max_position_embeddings",
-					self.config.max_position_embeddings,
-				)
-			),
-			dim=config.hidden_size // config.num_attention_heads,
-			base=config.rope_theta,
-			**initial_rope_kwargs,
-		)
+		# initial_rope_kwargs = dict(rope_type="none")
+		# if config.rope_scaling is not None:
+		# 	scaling_type = config.rope_scaling["type"]
+		# 	scaling_factor = config.rope_scaling["factor"]
+		# 	initial_rope_kwargs = dict(scaling_factor=scaling_factor, rope_type=scaling_type)
+		# self.frequencies = precompute_frequencies(
+		# 	max_position_embeddings=(
+		# 		getattr(
+		# 			self.config,
+		# 			"freq_max_position_embeddings",
+		# 			self.config.max_position_embeddings,
+		# 		)
+		# 	),
+		# 	dim=config.hidden_size // config.num_attention_heads,
+		# 	base=config.rope_theta,
+		# 	**initial_rope_kwargs,
+		# )
 
 	def __call__(
 		self,
@@ -330,7 +330,7 @@ class FlaxVisionLlamaModule(nn.Module):
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,
 			causal_mask=self.causal_mask,
-			frequencies=self.frequencies,
+			# frequencies=self.frequencies,
 		)
 
 		hidden_states = outputs[0]

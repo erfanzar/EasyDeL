@@ -25,6 +25,7 @@ from easydel.trainers.direct_preference_optimization_trainer import (
 from easydel.trainers.odds_ratio_preference_optimization_trainer import (
 	ORPOTrainer,
 	ORPOTrainerOutput,
+	ORPOConfig,
 )
 from easydel.trainers.packer import pack_sequences
 from easydel.trainers.sequence_classification_trainer import (

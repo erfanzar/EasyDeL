@@ -29,10 +29,10 @@ from jax import lax
 from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import get_logger
-from easydel.modules.attention_module import FlexibleAttentionModule
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
-	FlaxAttentionModule,
 	apply_rotary_pos_emb,
 	block_wise_ffn,
 	control_mlp_sharding,
@@ -46,8 +46,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
-from easydel.modules.factory import register_module
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 logger = get_logger(__name__)
 
@@ -580,7 +579,7 @@ class FlaxGemmaDecoderLayer(nn.Module):
 		return (hidden_states,) + outputs[1:]
 
 
-class FlaxGemmaPreTrainedModel(EDPretrainedModel):
+class FlaxGemmaPreTrainedModel(EasyDeLBaseModule):
 	"""An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
 	models.
 	"""

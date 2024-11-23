@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,12 +29,11 @@ from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
-from easydel.modules.attention_module import FlexibleAttentionModule
-from easydel.modules.common import RMSNorm as RMSNorm
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.norms import RMSNorm as RMSNorm
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
-	FlaxAttentionModule,
 	apply_rotary_pos_emb,
 	block_wise_ffn,
 	control_mlp_sharding,
@@ -48,7 +46,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.phi3.kernels import phi3_mlp_pallas
 from easydel.modules.phi3.phi3_configuration import Phi3Config as Phi3Config
 
@@ -329,7 +327,7 @@ class FlaxPhi3Attention(FlaxAttentionModule):
 				query_states,
 				attention_mask,
 			)
- 
+
 		attention_bias = lax.select(
 			attention_mask > 0,
 			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
@@ -856,8 +854,6 @@ class FlaxPhi3ForCausalLMModule(nn.Module):
 		else:
 			lm_logits = self.lm_head(outputs.last_hidden_state)
 
-		
-
 		if not return_dict:
 			return (lm_logits,) + outputs[0:]
 
@@ -868,7 +864,7 @@ class FlaxPhi3ForCausalLMModule(nn.Module):
 		)
 
 
-class FlaxPhiPreTrainedModel(EDPretrainedModel):
+class FlaxPhiPreTrainedModel(EasyDeLBaseModule):
 	"""Phi pre-trained model."""
 
 	module_class = None

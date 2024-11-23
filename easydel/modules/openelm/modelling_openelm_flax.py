@@ -28,12 +28,11 @@ from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
-from easydel.modules.attention_module import FlexibleAttentionModule
-from easydel.modules.common import RMSNorm
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.norms import RMSNorm
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
-	FlaxAttentionModule,
 	apply_rotary_pos_emb,
 	block_wise_ffn,
 	control_mlp_sharding,
@@ -46,7 +45,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.openelm.kernels import openelm_mlp_pallas
 from easydel.modules.openelm.openelm_configuration import (
 	OpenELMConfig as OpenELMConfig,
@@ -846,7 +845,7 @@ class FlaxOpenELMModule(nn.Module):
 		)
 
 
-class FlaxOpenELMPretrainedModel(EDPretrainedModel):
+class FlaxOpenELMPretrainedModel(EasyDeLBaseModule):
 	config_class = OpenELMConfig
 	base_model_prefix = "openelm"
 	module_class: nn.Module = None
@@ -1045,6 +1044,7 @@ class FlaxOpenELMPretrainedModel(EDPretrainedModel):
 			outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
 
 		return outputs
+
 
 @register_module(
 	"base-module",

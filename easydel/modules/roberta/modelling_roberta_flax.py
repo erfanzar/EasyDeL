@@ -32,11 +32,10 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax import numpy as jnp
 
-from easydel.modules.attention_module import FlexibleAttentionModule
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
-	FlaxAttentionModule,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
 )
@@ -50,7 +49,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxSequenceClassifierOutput,
 	FlaxTokenClassifierOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.roberta.roberta_configuration import RobertaConfig as RobertaConfig
 
 
@@ -736,7 +735,7 @@ class FlaxRobertaClassificationHead(nn.Module):
 		return hidden_states
 
 
-class FlaxRobertaPreTrainedModel(EDPretrainedModel):
+class FlaxRobertaPreTrainedModel(EasyDeLBaseModule):
 	config_class = RobertaConfig
 	base_model_prefix = "roberta"
 

@@ -30,8 +30,8 @@ import jax.tree_util
 from aqt.jax.v2 import config as q_config
 from aqt.jax.v2.flax import aqt_flax as q_flax
 from einops import rearrange
-from fjformer.dtypes import Array8Bit, ArrayNF4
 from fjformer import with_sharding_constraint
+from fjformer.dtypes import Array8Bit, ArrayNF4
 from flax import linen as nn
 from flax.linen import combine_masks
 from flax.traverse_util import flatten_dict, unflatten_dict
@@ -597,7 +597,7 @@ def get_dot_general_by_bits(
 
 
 class FlaxAttentionModule(nn.Module):
-	config: "EDPretrainedConfig"  # type: ignore  # noqa
+	config: "EasyDeLBaseConfig"  # type: ignore  # noqa
 
 	@staticmethod
 	def _transpose_sequence_head(*args):

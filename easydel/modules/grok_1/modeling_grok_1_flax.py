@@ -29,12 +29,12 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
 
-from easydel.modules.attention_module import FlexibleAttentionModule
-from easydel.modules.common import RMSNorm as FlaxGrok1RMSNorm
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.norms import RMSNorm as FlaxGrok1RMSNorm
+from easydel.modules.factory import register_module
 
 # easydel.modules
 from easydel.modules.flax_modeling_utils import (
-	FlaxAttentionModule,
 	apply_rotary_pos_emb,
 	block_wise_ffn,
 	control_mlp_sharding,
@@ -46,8 +46,7 @@ from easydel.modules.flax_modeling_utils import (
 from easydel.modules.grok_1.grok_1_configuration import Grok1Config as Grok1Config
 from easydel.modules.grok_1.kernels import grok1_mlp_pallas
 from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
-from easydel.modules.modeling_utils import EDPretrainedModel
-from easydel.modules.factory import register_module
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 re_mat = flax.linen.partitioning.remat
 
@@ -767,7 +766,7 @@ class FlaxGrok1DecoderLayerCollection(nn.Module):
 		return outputs
 
 
-class Grok1PreTrainedModel(EDPretrainedModel):
+class Grok1PreTrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for Grok1 models providing initialization and configuration.
 

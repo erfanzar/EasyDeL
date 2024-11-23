@@ -19,11 +19,6 @@ from easydel.modules.arctic import (
 	FlaxArcticModel,
 	FlaxArcticModule,
 )
-from easydel.modules.attention_module import (
-	AttentionMechanisms,
-	FlexibleAttentionModule,
-	AttentionBenchmarker,
-)
 from easydel.modules.auto_models import (
 	AutoEasyDeLConfig,
 	AutoEasyDeLModelForCausalLM,
@@ -121,16 +116,12 @@ from easydel.modules.internlm2.modeling_internlm2_flax import (
 )
 from easydel.modules.llama import (
 	FlaxLlamaForCausalLM,
-	FlaxLlamaForCausalLMModule,
 	FlaxLlamaForSequenceClassification,
-	FlaxLlamaForSequenceClassificationModule,
 	FlaxLlamaModel,
-	FlaxLlamaModule,
 	FlaxVisionLlamaForCausalLM,
 	LlamaConfig,
 	VisionLlamaConfig,
 )
- 
 from easydel.modules.mamba import (
 	FlaxMambaCache,
 	FlaxMambaForCausalLM,
@@ -163,7 +154,7 @@ from easydel.modules.mixtral import (
 	FlaxMixtralModule,
 	MixtralConfig,
 )
-from easydel.modules.modeling_utils import EDPretrainedConfig, EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseConfig, EasyDeLBaseModule
 from easydel.modules.mosaic_mpt import (
 	FlaxMptForCausalLM,
 	FlaxMptForCausalLMModule,

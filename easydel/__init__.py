@@ -53,7 +53,6 @@ del _os
 # EasyDel Imports
 from packaging.version import Version as _Version
 
-from easydel import etils, modules
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import (
 	EasyDeLRuntimeError,
@@ -61,19 +60,23 @@ from easydel.etils.errors import (
 	EasyDeLTimerError,
 )
 from easydel.etils.etils import (
+	EasyDeLBackends,
 	EasyDeLGradientCheckPointers,
 	EasyDeLOptimizers,
-	EasyDeLSchedulers,
 	EasyDeLPlatforms,
 	EasyDeLQuantizationMethods,
-	EasyDeLBackends,
+	EasyDeLSchedulers,
 )
 from easydel.etils.partition_module import PartitionAxis
-
 from easydel.inference.vinference import (
 	vInference,
 	vInferenceApiServer,
 	vInferenceConfig,
+)
+from easydel.layers.attention import (
+	AttentionBenchmarker,
+	AttentionMechanisms,
+	FlexibleAttentionModule,
 )
 from easydel.modules.arctic import (
 	ArcticConfig,
@@ -81,11 +84,6 @@ from easydel.modules.arctic import (
 	FlaxArcticForCausalLMModule,
 	FlaxArcticModel,
 	FlaxArcticModule,
-)
-from easydel.modules.attention_module import (
-	AttentionBenchmarker,
-	AttentionMechanisms,
-	FlexibleAttentionModule,
 )
 from easydel.modules.auto_models import (
 	AutoEasyDeLConfig,
@@ -185,11 +183,11 @@ from easydel.modules.internlm2.modeling_internlm2_flax import (
 )
 from easydel.modules.llama import (
 	FlaxLlamaForCausalLM,
-	FlaxLlamaForCausalLMModule,
+	# FlaxLlamaForCausalLMModule,
 	FlaxLlamaForSequenceClassification,
-	FlaxLlamaForSequenceClassificationModule,
+	# FlaxLlamaForSequenceClassificationModule,
 	FlaxLlamaModel,
-	FlaxLlamaModule,
+	# FlaxLlamaModule,
 	FlaxVisionLlamaForCausalLM,
 	LlamaConfig,
 	VisionLlamaConfig,
@@ -227,8 +225,8 @@ from easydel.modules.mixtral import (
 	MixtralConfig,
 )
 from easydel.modules.modeling_utils import (
-	EDPretrainedConfig,
-	EDPretrainedModel,
+	EasyDeLBaseConfig,
+	EasyDeLBaseModule,
 )
 from easydel.modules.mosaic_mpt import (
 	FlaxMptForCausalLM,
@@ -351,6 +349,7 @@ from easydel.trainers import (
 	DPOTrainerOutput,
 	JaxDistributedConfig,
 	LoraRaptureConfig,
+	ORPOConfig,
 	ORPOTrainer,
 	ORPOTrainerOutput,
 	SequenceClassificationTrainer,

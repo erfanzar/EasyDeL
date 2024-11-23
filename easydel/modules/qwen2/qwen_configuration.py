@@ -17,11 +17,11 @@ from typing import Mapping, Optional
 from jax.sharding import PartitionSpec
 
 from easydel.modules.factory import register_config
-from easydel.modules.modeling_utils import EDPretrainedConfig
+from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
 
 @register_config("qwen2")
-class Qwen2Config(EDPretrainedConfig):
+class Qwen2Config(EasyDeLBaseConfig):
 	"""
 	Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read
 	the documentation from [`PretrainedConfig`] for more information.

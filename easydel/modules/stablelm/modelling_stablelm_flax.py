@@ -27,13 +27,12 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
 
-from easydel.modules.attention_module import FlexibleAttentionModule
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 
 # easydel.modules
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
-	FlaxAttentionModule,
 	apply_rotary_pos_emb,
 	block_wise_ffn,
 	control_mlp_sharding,
@@ -46,7 +45,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.stablelm.kernels import stablelm_mlp_pallas
 from easydel.modules.stablelm.stablelm_configuration import (
 	StableLmConfig as StableLmConfig,
@@ -627,7 +626,7 @@ class FlaxStableLmDecoderLayer(nn.Module):
 		return outputs
 
 
-class FlaxStableLmPreTrainedModel(EDPretrainedModel):
+class FlaxStableLmPreTrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for StableLm models providing initialization and configuration.
 

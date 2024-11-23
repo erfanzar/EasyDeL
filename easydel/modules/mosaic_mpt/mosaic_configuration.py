@@ -17,10 +17,10 @@ from typing import Optional, Union
 from jax.sharding import PartitionSpec
 
 from easydel.modules.factory import register_config
-from easydel.modules.modeling_utils import EDPretrainedConfig
+from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
 
-class MptAttentionConfig(EDPretrainedConfig):
+class MptAttentionConfig(EasyDeLBaseConfig):
 	"""
 	This is the configuration class to store the attention related configuration of a [`MptModel`].
 
@@ -81,7 +81,7 @@ class MptAttentionConfig(EDPretrainedConfig):
 	@classmethod
 	def from_pretrained(
 		cls, pretrained_model_name_or_path, **kwargs
-	) -> "EDPretrainedConfig":
+	) -> "EasyDeLBaseConfig":
 		cls._set_token_in_kwargs(kwargs)
 		config_dict, kwargs = cls.get_config_dict(pretrained_model_name_or_path, **kwargs)
 		if config_dict.get("model_type") == "mpt":
@@ -90,10 +90,10 @@ class MptAttentionConfig(EDPretrainedConfig):
 
 
 @register_config("mpt")
-class MptConfig(EDPretrainedConfig):
+class MptConfig(EasyDeLBaseConfig):
 	"""
-	Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read
-	the documentation from [`EDPretrainedConfig`] for more information.
+	Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read
+	the documentation from [`EasyDeLBaseConfig`] for more information.
 
 	Args:
 	    d_model (`int`, *optional*, defaults to 2048):

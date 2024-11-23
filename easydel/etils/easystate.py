@@ -128,8 +128,8 @@ class EasyDeLState(struct.PyTreeNode):
 
 	Attributes:
 	    step (int): Current training step.
-	    module (Optional[EDPretrainedModel]): An instance of an EasyDeL model.
-	    module_config (Optional[EDPretrainedConfig]): Configuration of the EasyDeL model.
+	    module (Optional[EasyDeLBaseModule]): An instance of an EasyDeL model.
+	    module_config (Optional[EasyDeLBaseConfig]): Configuration of the EasyDeL model.
 	    module_config_args (Optional[dict]): Dictionary of arguments used to initialize the model configuration.
 	    apply_fn (Callable): Function to apply the model to input data.
 	    params (core.FrozenDict[str, Any]): Model parameters, stored as a frozen dictionary.
@@ -154,10 +154,10 @@ class EasyDeLState(struct.PyTreeNode):
 
 	step: int
 	module: Optional[
-		"easydel.modules.modeling_utils.EDPretrainedModel"  # type:ignore # noqa
+		"easydel.modules.modeling_utils.EasyDeLBaseModule"  # type:ignore # noqa
 	] = struct.field(pytree_node=False)
 	module_config: Optional[
-		"easydel.modules.modeling_utils.EDPretrainedConfig"  # type:ignore # noqa
+		"easydel.modules.modeling_utils.EasyDeLBaseConfig"  # type:ignore # noqa
 	] = struct.field(pytree_node=False)
 	module_config_args: Optional[dict] = struct.field(pytree_node=True)
 	apply_fn: Callable = struct.field(pytree_node=False)
@@ -214,8 +214,8 @@ class EasyDeLState(struct.PyTreeNode):
 		tx: Optional[optax.GradientTransformation] = None,
 		tx_init: Optional[dict] = None,
 		hyperparameters: Optional[dict] = None,
-		module: Optional["EDPretrainedModel"] = None,  # type:ignore #noqa
-		module_config: Optional["EDPretrainedConfig"] = None,  # type:ignore #noqa
+		module: Optional["EasyDeLBaseModule"] = None,  # type:ignore #noqa
+		module_config: Optional["EasyDeLBaseConfig"] = None,  # type:ignore #noqa
 		module_config_args: Optional[dict] = None,
 		**kwargs,
 	):
@@ -230,8 +230,8 @@ class EasyDeLState(struct.PyTreeNode):
 		    tx (optax.GradientTransformation): An optax optimizer.
 		    tx_init (Optional[dict]): A dictionary of optimizer initialization parameters.
 		    hyperparameters (Optional[dict]): A dictionary of additional hyperparameters.
-		    module (Optional[EDPretrainedModel]): An instance of an EasyDeL model.
-		    module_config (Optional[EDPretrainedConfig]): An instance of an EasyDeL model configuration.
+		    module (Optional[EasyDeLBaseModule]): An instance of an EasyDeL model.
+		    module_config (Optional[EasyDeLBaseConfig]): An instance of an EasyDeL model configuration.
 		    module_config_args (Optional[dict]): A dictionary of arguments used to initialize the model configuration.
 		    **kwargs: Additional keyword arguments.
 
@@ -279,8 +279,8 @@ class EasyDeLState(struct.PyTreeNode):
 		opt_state: Optional[optax.OptState] = None,
 		tx_init: Optional[dict] = None,
 		hyperparameters: Optional[dict] = None,
-		module: Optional["EDPretrainedModel"] = None,  # type:ignore #noqa
-		module_config: Optional["EDPretrainedConfig"] = None,  # type:ignore #noqa
+		module: Optional["EasyDeLBaseModule"] = None,  # type:ignore #noqa
+		module_config: Optional["EasyDeLBaseConfig"] = None,  # type:ignore #noqa
 		module_config_args: Optional[dict] = None,
 		**kwargs,
 	):
@@ -296,8 +296,8 @@ class EasyDeLState(struct.PyTreeNode):
 		    opt_state (Optional[optax.OptState], optional): The optimizer state to load. Defaults to None.
 		    tx_init (Optional[dict], optional): A dictionary of optimizer initialization parameters. Defaults to None.
 		    hyperparameters (Optional[dict], optional): A dictionary of additional hyperparameters. Defaults to None.
-		    module (Optional[EDPretrainedModel], optional): An instance of an EasyDeL model. Defaults to None.
-		    module_config (Optional[EDPretrainedConfig], optional): An instance of an EasyDeL model configuration. Defaults to None.
+		    module (Optional[EasyDeLBaseModule], optional): An instance of an EasyDeL model. Defaults to None.
+		    module_config (Optional[EasyDeLBaseConfig], optional): An instance of an EasyDeL model configuration. Defaults to None.
 		    module_config_args (Optional[dict], optional): A dictionary of arguments used to initialize the model configuration. Defaults to None.
 		    **kwargs: Additional keyword arguments.
 
@@ -379,7 +379,7 @@ class EasyDeLState(struct.PyTreeNode):
 		config_kwargs: Optional[dict] = None,
 		sharding_axes_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
 		sharding_axes_dims: Sequence[int] = (1, -1, 1, 1),
-		module_config: Optional["EDPretrainedConfig"] = None,  # type:ignore #noqa
+		module_config: Optional["EasyDeLBaseConfig"] = None,  # type:ignore #noqa
 		safe: bool = False,
 		auto_shard_state: bool = False,
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
@@ -402,7 +402,7 @@ class EasyDeLState(struct.PyTreeNode):
 		    config_kwargs (Optional[dict], optional): Keyword arguments to pass to the model configuration. Defaults to None.
 		    sharding_axes_names (Sequence[str], optional): Names of the axes for sharding. Defaults to ("dp", "fsdp", "tp", "sp").
 		    sharding_axes_dims (Sequence[int], optional): Dimensions of the axes for sharding. Defaults to (1, -1, 1, 1).
-		    module_config (Optional[EDPretrainedConfig], optional): An instance of an EasyDeL model configuration. Defaults to None.
+		    module_config (Optional[EasyDeLBaseConfig], optional): An instance of an EasyDeL model configuration. Defaults to None.
 		    auto_shard_state (bool, optional): Whether to automatically shard the model state. Defaults to False.
 		    partition_rules (Optional[Tuple[Tuple[str, PartitionSpec]]], optional): Rules for partitioning the model parameters. Defaults to None.
 		    depth_target (Optional[List[str]], optional): Target depth for partitioning. Defaults to None.

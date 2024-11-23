@@ -41,7 +41,8 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import eval_shape, lax
 from jax.core import ShapedArray
 
-from easydel.modules.common import RMSNorm as MambaRMSNorm
+from easydel.layers.norms import RMSNorm as MambaRMSNorm
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
 	get_dot_general_by_bits,
@@ -49,8 +50,7 @@ from easydel.modules.flax_modeling_utils import (
 )
 from easydel.modules.mamba.mamba_configuration import MambaConfig as MambaConfig
 from easydel.modules.modeling_flax_outputs import FlaxBaseModelOutput
-from easydel.modules.modeling_utils import EDPretrainedModel
-from easydel.modules.factory import register_module
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 
 def init_to_value(x, dtype):
@@ -802,7 +802,7 @@ class FlaxMambaForCausalLMModule(nn.Module):
 		)
 
 
-class FlaxMambaPretrainedModel(EDPretrainedModel):
+class FlaxMambaPretrainedModel(EasyDeLBaseModule):
 	config_class = MambaConfig
 	base_model_prefix = "backbone"
 	module_class: nn.Module = None

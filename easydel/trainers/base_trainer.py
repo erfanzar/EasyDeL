@@ -24,8 +24,9 @@ from collections import defaultdict
 from dataclasses import dataclass
 from glob import glob
 from logging import warning
-from typing import Any, Callable, Dict, Iterator, Literal, Mapping, Optional, Union
 from pathlib import Path
+from typing import Any, Callable, Dict, Iterator, Literal, Mapping, Optional, Union
+
 import flax
 import flax.core
 import jax
@@ -47,15 +48,15 @@ except ImportError:
 
 from jax import numpy as jnp
 
+from easydel import __version__
 from easydel.etils.etils import get_logger
 from easydel.modules.modeling_utils import (
-	EDPretrainedConfig,
-	EDPretrainedModel,
+	EasyDeLBaseConfig,
+	EasyDeLBaseModule,
 )
 from easydel.smi import get_capacity_matrix, initialise_tracking
 from easydel.trainers.training_configurations import TrainingArguments
 from easydel.utils import Timers
-from easydel import __version__
 
 logger = get_logger(__name__)
 
@@ -70,10 +71,10 @@ class TrainerConfigureDataloaderOutput:
 
 @dataclass
 class TrainerConfigureModelOutput:
-	model: EDPretrainedModel
+	model: EasyDeLBaseModule
 	tx: GradientTransformation
 	scheduler: Schedule
-	config: Optional[EDPretrainedConfig] = None
+	config: Optional[EasyDeLBaseConfig] = None
 
 
 @dataclass
@@ -123,7 +124,7 @@ class BaseTrainer(ABC):
 	def __init__(
 		self,
 		arguments: Optional[TrainingArguments] = None,
-		model: Optional[EDPretrainedModel] = None,
+		model: Optional[EasyDeLBaseModule] = None,
 		dataset_train: Optional["Dataset"] = None,  # noqa: F821 # type:ignore
 		dataset_eval: Optional["Dataset"] = None,  # noqa: F821 # type:ignore
 		finetune: bool = True,
@@ -564,7 +565,7 @@ class BaseTrainer(ABC):
 				extra_configs (dict): Additional configurations to apply to the model.
 
 		Returns:
-				EDPretrainedModel: The configured custom model.
+				EasyDeLBaseModule: The configured custom model.
 
 		Raises:
 				AssertionError: If no custom rule is provided when initializing a custom model.
