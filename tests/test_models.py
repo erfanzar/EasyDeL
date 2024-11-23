@@ -3,6 +3,7 @@ import os
 
 # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 import sys
+import time
 import unittest
 
 import jax
@@ -173,12 +174,13 @@ class EasyModelsTest(unittest.TestCase):
 				self.vocab_size,
 				(self.batch_size, self.sequence_length + 1),
 			)
+			torch_time = time.time()
 			hf_output = hf_model(
 				input_ids=torch_input_ids[:, :-1],
 				labels=torch_input_ids[:, 1:],
 				past_key_values=None,
 			)
-
+			torch_time = time.time() - torch_time
 			ed_model = module_class(
 				config=config,
 				dtype=self.dtype,
@@ -196,6 +198,16 @@ class EasyModelsTest(unittest.TestCase):
 				train=False,
 				determinstic=True,
 			)
+			easy_time = time.time()
+			ed_output = ed_model(
+				input_ids=jax_input_ids[:, :-1],
+				params=params,
+				return_dict=True,
+				add_params_field=False,
+				train=False,
+				determinstic=True,
+			)
+			easy_time = time.time() - easy_time
 			loss, _ = cross_entropy_loss_and_accuracy(
 				ed_output.logits,
 				jax_input_ids[:, 1:],
@@ -204,7 +216,14 @@ class EasyModelsTest(unittest.TestCase):
 			del params
 			del hf_model
 			gc.collect()
-			return self.compare_torch_to_jax(module_name, hf_output, ed_output, loss)
+			return self.compare_torch_to_jax(
+				module_name,
+				hf_output,
+				ed_output,
+				loss,
+				easy_time=easy_time,
+				torch_time=torch_time,
+			)
 
 	def create_moe_test_for_models(self, module_name: str, hf_module_class):
 		module_config, module_class, transform_function = ed.get_modules_by_type(
@@ -634,6 +653,8 @@ class EasyModelsTest(unittest.TestCase):
 		ed_loss,
 		atol: float = 0.125,
 		rtol: float = 0,
+		easy_time: float = None,
+		torch_time: float = None,
 	):
 		to, jo = hf_out.logits.cpu().detach().numpy(), ed_out.logits
 		err = jnp.mean(to) - jnp.mean(jo)
@@ -655,16 +676,9 @@ class EasyModelsTest(unittest.TestCase):
 
 		table = tabulate(
 			[
-				[
-					"Last 5 elements",
-					str(to[0, -1, -5:]),
-					str(jo[0, -1, -5:]),
-				],
-				[
-					"Loss",
-					str(hf_loss),
-					str(ed_loss),
-				],
+				["Last 5 elements", str(to[0, -1, -5:]), str(jo[0, -1, -5:])],
+				["Loss", str(hf_loss), str(ed_loss)],
+				["Took", str(torch_time), str(easy_time)],
 			],
 			headers=["Metric", "HuggingFace", "EasyDeL"],
 			tablefmt="grid",
