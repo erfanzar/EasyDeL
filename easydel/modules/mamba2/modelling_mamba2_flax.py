@@ -13,8 +13,9 @@
 # limitations under the License.
 
 import itertools
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar, Union
 from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar, Union
+
 import chex
 import flax.struct
 import jax
@@ -39,12 +40,8 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import eval_shape, lax
 from jax.core import ShapedArray
 
-from easydel.modules.common import (
-	Conv1D,
-)
-from easydel.modules.common import (
-	RMSNorm as FlaxMamba2RMSNorm,
-)
+from easydel.layers.common import Conv1D
+from easydel.layers.norms import RMSNorm as FlaxMamba2RMSNorm
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
@@ -52,7 +49,7 @@ from easydel.modules.flax_modeling_utils import (
 )
 from easydel.modules.mamba2.mamba2_configuration import Mamba2Config as Mamba2Config
 from easydel.modules.modeling_flax_outputs import FlaxBaseModelOutput
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 
 def init_to_value(x, dtype):
@@ -1094,7 +1091,7 @@ class FlaxMamba2ForCausalLMModule(nn.Module):
 		)
 
 
-class FlaxMambaPretrainedModel(EDPretrainedModel):
+class FlaxMambaPretrainedModel(EasyDeLBaseModule):
 	config_class = Mamba2Config
 	base_model_prefix = "backbone"
 	module_class: nn.Module = None

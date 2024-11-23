@@ -30,7 +30,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
 
-from easydel.modules.attention_module import FlexibleAttentionModule
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.modules.dbrx.dbrx_configuration import (
 	DbrxAttentionConfig as DbrxAttentionConfig,
 )
@@ -39,9 +39,9 @@ from easydel.modules.dbrx.dbrx_configuration import DbrxFFNConfig as DbrxFFNConf
 
 # easydel.modules
 from easydel.modules.dbrx.kernels import dbrx_mlp_pallas
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
-	FlaxAttentionModule,
 	apply_rotary_pos_emb,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
@@ -50,8 +50,7 @@ from easydel.modules.flax_modeling_utils import (
 	with_sharding_constraint,
 )
 from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
-from easydel.modules.modeling_utils import EDPretrainedModel
-from easydel.modules.factory import register_module
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 
 @flax.struct.dataclass
@@ -791,7 +790,7 @@ class FlaxDbrxBlockCollection(nn.Module):
 		)
 
 
-class DbrxPreTrainedModel(EDPretrainedModel):
+class DbrxPreTrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for DBrX models providing initialization and configuration.
 

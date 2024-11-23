@@ -1,8 +1,8 @@
+from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Literal, Optional, Type, TypeVar
-from dataclasses import dataclass
 
-from easydel.modules.modeling_utils import EDPretrainedConfig, EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseConfig, EasyDeLBaseModule
 
 T = TypeVar("T")
 
@@ -23,8 +23,8 @@ class TaskType(str, Enum):
 
 @dataclass
 class ModuleRegistration:
-	module: type[EDPretrainedModel]
-	config: type[EDPretrainedConfig]
+	module: type[EasyDeLBaseModule]
+	config: type[EasyDeLBaseConfig]
 	embedding_layer_names: Optional[List[str]] = None
 	layernorm_names: Optional[List[str]] = None
 	rnn_based_or_rwkv: bool = False
@@ -61,7 +61,7 @@ class Registry:
 	def register_module(
 		self,
 		task_type: TaskType,
-		config: EDPretrainedConfig,
+		config: EasyDeLBaseConfig,
 		model_type: str,
 		embedding_layer_names: Optional[List[str]] = None,
 		layernorm_names: Optional[List[str]] = None,

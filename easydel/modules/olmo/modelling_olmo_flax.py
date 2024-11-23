@@ -28,14 +28,13 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
 
-from easydel.modules.attention_module import FlexibleAttentionModule
-from easydel.modules.common import LayerNormRaw
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.norms import LayerNormRaw
 
 # easydel.modules
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
-	FlaxAttentionModule,
 	apply_rotary_pos_emb,
 	block_wise_ffn,
 	control_mlp_sharding,
@@ -48,7 +47,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.olmo.kernels import olmo_mlp_pallas
 from easydel.modules.olmo.olmo_configuration import OlmoConfig
 
@@ -491,7 +490,7 @@ class FlaxOlmoDecoderLayer(nn.Module):
 		return outputs
 
 
-class FlaxOlmoPretrainedModel(EDPretrainedModel):
+class FlaxOlmoPretrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for Olmo models providing initialization and configuration.
 

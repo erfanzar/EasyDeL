@@ -24,30 +24,31 @@ from datetime import datetime
 from functools import partial
 from typing import Any, Dict, Generator, List, Optional, Union, overload
 from uuid import uuid4
-import numpy as np
+
 import flax.core
 import jax
+import numpy as np
 from fjformer import GenerateRNG, with_sharding_constraint
 from jax import lax
 from jax import numpy as jnp
 from jax import random as jrand
 from jax.sharding import NamedSharding, PartitionSpec
+from pydantic import BaseModel
 from transformers import PreTrainedTokenizer
 
 from easydel.etils.etils import get_logger
 from easydel.inference.utils import (
 	SampleState,
-	vInferenceConfig,
 	create_sampling_step,
+	vInferenceConfig,
 )
 from easydel.inference.vinference.metrics import vInferenceMetrics
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.utils.compiling_utils import (
-	smart_compile,
 	load_compiled_fn,
 	save_compiled_fn,
+	smart_compile,
 )
-from pydantic import BaseModel
 
 logger = get_logger(__name__)
 TIME = str(datetime.fromtimestamp(time.time())).split(" ")[0]
@@ -78,7 +79,7 @@ def measure_flops(func, *args, **kwargs):
 	],
 )
 def _compiled_generate(
-	model: EDPretrainedModel,
+	model: EasyDeLBaseModule,
 	params: dict,
 	input_ids: jax.Array,
 	attention_mask: jax.Array,
@@ -109,7 +110,7 @@ def _compiled_generate(
 	generation_spec = PartitionSpec(
 		partition_axes.batch_axis,
 		partition_axes.key_sequence_axis,
-	) 
+	)
 
 	batch_size, current_length = input_ids.shape
 	max_length = current_length + max_new_tokens
@@ -183,7 +184,7 @@ def _compiled_generate(
 	],
 )
 def _compiled_interval_generate(
-	model: EDPretrainedModel,
+	model: EasyDeLBaseModule,
 	params: dict,
 	state: SampleState,
 	eos_token_id: jax.Array,
@@ -298,7 +299,7 @@ class vInference:
 
 	def __init__(
 		self,
-		model: EDPretrainedModel,
+		model: EasyDeLBaseModule,
 		params: Union[flax.core.FrozenDict, dict],
 		tokenizer: PreTrainedTokenizer,
 		generation_config: Optional[vInferenceConfig] = None,
@@ -784,7 +785,7 @@ class vInference:
 	def load_inference(
 		cls,
 		path: Union[os.PathLike, str],
-		model: EDPretrainedModel,
+		model: EasyDeLBaseModule,
 		params: Union[flax.core.FrozenDict, dict],
 		tokenizer: PreTrainedTokenizer,
 	):

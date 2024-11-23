@@ -28,13 +28,13 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import get_logger
-from easydel.modules.attention_module import FlexibleAttentionModule
-from easydel.modules.common import RMSNorm
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.norms import RMSNorm
 from easydel.modules.exaone.exaone_configuration import ExaoneConfig as ExaoneConfig
 from easydel.modules.exaone.kernels import exaone_mlp_pallas
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
-	FlaxAttentionModule,
 	apply_rotary_pos_emb,
 	block_wise_ffn,
 	control_mlp_sharding,
@@ -47,8 +47,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
-from easydel.modules.factory import register_module
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 re_mat = nn_partitioning.remat
 logger = get_logger(__name__)
@@ -495,7 +494,7 @@ class FlaxExaoneDecoderLayer(nn.Module):
 		return outputs
 
 
-class FlaxExaonePretrainedModel(EDPretrainedModel):
+class FlaxExaonePretrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for Exaone models providing initialization and configuration.
 

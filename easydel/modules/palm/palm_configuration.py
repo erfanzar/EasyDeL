@@ -17,11 +17,11 @@ from typing import Optional
 from jax.sharding import PartitionSpec
 
 from easydel.modules.factory import register_config
-from easydel.modules.modeling_utils import EDPretrainedConfig
+from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
 
 @register_config("palm")
-class PalmConfig(EDPretrainedConfig):
+class PalmConfig(EasyDeLBaseConfig):
 	def __init__(
 		self,
 		vocab_size: Optional[int] = 32000,

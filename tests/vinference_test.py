@@ -39,7 +39,7 @@ def main():
 			quantize_kv_cache=True,
 			attn_dtype=jnp.float16,
 			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
-			attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
+			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		),
 		quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
 		param_dtype=dtype,

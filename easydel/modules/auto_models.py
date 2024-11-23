@@ -45,8 +45,8 @@ from easydel.etils.etils import (
 from easydel.etils.partition_module import PartitionAxis
 from easydel.modules.factory import registry
 from easydel.modules.modeling_utils import (
-	EDPretrainedConfig,
-	EDPretrainedModel,
+	EasyDeLBaseConfig,
+	EasyDeLBaseModule,
 )
 from easydel.transform.parameters_transformation import torch_dict_to_easydel_params
 from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN
@@ -58,8 +58,8 @@ def get_modules_by_type(
 	model_type: str,
 	task_type: str = "causal-language-model",
 ) -> Tuple[
-	Type[EDPretrainedConfig],
-	Type[EDPretrainedModel] | Any,
+	Type[EasyDeLBaseConfig],
+	Type[EasyDeLBaseModule] | Any,
 	functools.partial | Any,
 ]:
 	"""
@@ -103,7 +103,7 @@ class AutoEasyDeLModelForCausalLM:
 	and convert them into EasyDeL compatible models. It utilizes the EasyDeL library for distributed training and inference
 	with JAX.
 
-	This class inherits from the `EDPretrainedModel` class, providing functionalities for model loading,
+	This class inherits from the `EasyDeLBaseModule` class, providing functionalities for model loading,
 	parameter sharding, and interaction with the EasyDeL framework.
 
 	Attributes:
@@ -157,7 +157,7 @@ class AutoEasyDeLModelForCausalLM:
 		safe: bool = True,
 		from_torch: Optional[bool] = None,
 		**kwargs,
-	) -> Tuple[EDPretrainedModel, dict]:
+	) -> Tuple[EasyDeLBaseModule, dict]:
 		"""Loads and shards a pretrained causal language model from the Hugging Face Hub and converts it into an
 		EasyDeL compatible model.
 
@@ -188,7 +188,7 @@ class AutoEasyDeLModelForCausalLM:
 		    **kwargs: Additional keyword arguments to pass to the model and config classes.
 
 		Returns:
-		    Tuple[EDPretrainedModel, dict]: A tuple containing the EasyDeL model and the loaded and sharded
+		    Tuple[EasyDeLBaseModule, dict]: A tuple containing the EasyDeL model and the loaded and sharded
 		        model parameters.
 		"""
 		if device is None:
@@ -459,9 +459,9 @@ class AutoEasyDeLModelForCausalLM:
 		safe: bool,
 		**kwargs,
 	):
-		from easydel.modules.modeling_utils import EDPretrainedModel
+		from easydel.modules.modeling_utils import EasyDeLBaseModule
 
-		return EDPretrainedModel.from_pretrained(
+		return EasyDeLBaseModule.from_pretrained(
 			pretrained_model_name_or_path=pretrained_model_name_or_path,
 			input_shape=input_shape,
 			dtype=dtype,
@@ -574,7 +574,7 @@ class AutoEasyDeLConfig:
 		platform: Optional[EasyDeLPlatforms] = None,
 		from_torch: bool = False,
 		**kwargs,
-	) -> EDPretrainedConfig:
+	) -> EasyDeLBaseConfig:
 		"""The from_pretrained function is a helper function that allows you to instantiate a model from the pretrained
 		model repository. It takes as input the name of the model (e.g., 'bert-base-uncased') and returns an instance of
 		the class corresponding to your model, with all weights loaded from disk.
@@ -598,7 +598,7 @@ class AutoEasyDeLConfig:
 			partition_axis = PartitionAxis()
 		from transformers import AutoConfig
 
-		cls_main = AutoConfig if from_torch else EDPretrainedConfig
+		cls_main = AutoConfig if from_torch else EasyDeLBaseConfig
 		config = cls_main.from_pretrained(pretrained_model_name_or_path)
 		model_type: str = config.model_type
 
@@ -626,31 +626,31 @@ class AutoShardAndGatherFunctions:
 
 	This class provides two methods to generate shard and gather functions:
 
-	- `from_config`: Generates functions based on a provided `EDPretrainedConfig` object.
+	- `from_config`: Generates functions based on a provided `EasyDeLBaseConfig` object.
 	- `from_pretrained`: Generates functions based on a pretrained model name or path.
 
 	Attributes:
 	    None
 
 	Methods:
-	    from_config: Generates shard and gather functions based on a provided `EDPretrainedConfig` object.
+	    from_config: Generates shard and gather functions based on a provided `EasyDeLBaseConfig` object.
 	    from_pretrained: Generates functions based on a pretrained model name or path.
 	"""
 
 	@classmethod
 	def from_config(
 		cls,
-		config: EDPretrainedConfig,
+		config: EasyDeLBaseConfig,
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
 		flatten: bool = True,
 		input_shape: Tuple[int, int] = (1, 1),
 		depth_target: Optional[List[str]] = None,
 	):
 		"""
-		Generates shard and gather functions based on a provided `EDPretrainedConfig` object.
+		Generates shard and gather functions based on a provided `EasyDeLBaseConfig` object.
 
 		Args:
-		    config: An `EDPretrainedConfig` object containing the model configuration.
+		    config: An `EasyDeLBaseConfig` object containing the model configuration.
 		    partition_rules: A tuple of tuples containing partition rule names and `PartitionSpec` objects.
 		        If None, uses the default partition rules from the `config`.
 		    flatten: Whether to flatten the shard and gather functions. Defaults to True.

@@ -29,11 +29,11 @@ from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
-from easydel.modules.attention_module import FlexibleAttentionModule
-from easydel.modules.common import RMSNorm
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.norms import RMSNorm
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
-	FlaxAttentionModule,
 	apply_rotary_pos_emb,
 	block_wise_ffn,
 	control_mlp_sharding,
@@ -45,8 +45,7 @@ from easydel.modules.flax_modeling_utils import (
 from easydel.modules.mixtral.kernels import mixtral_mlp_pallas
 from easydel.modules.mixtral.mixtral_configuration import MixtralConfig as MixtralConfig
 from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
-from easydel.modules.modeling_utils import EDPretrainedModel
-from easydel.modules.factory import register_module
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 re_mat = nn_partitioning.remat
 
@@ -715,7 +714,7 @@ class FlaxMixtralDecoderLayerCollection(nn.Module):
 		return outputs
 
 
-class MixtralPreTrainedModel(EDPretrainedModel):
+class MixtralPreTrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for Mixtral models providing initialization and configuration.
 

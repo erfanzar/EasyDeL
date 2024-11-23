@@ -29,11 +29,10 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.sharding import PartitionSpec
 
-from easydel.modules.attention_module import FlexibleAttentionModule
-from easydel.modules.common import RMSNorm as RMSNorm
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.norms import RMSNorm as RMSNorm
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
-	FlaxAttentionModule,
 	block_wise_ffn,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
@@ -46,7 +45,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 	FlaxSequenceClassifierOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.qwen1.kernels import qwen1_mlp_pallas
 from easydel.modules.qwen1.qwen1_configuration import Qwen1Config as Qwen1Config
 
@@ -551,7 +550,7 @@ class FlaxQwen1Block(nn.Module):
 		return (hidden_states,) + attn_outputs[1:]
 
 
-class FlaxQwen1PreTrainedModel(EDPretrainedModel):
+class FlaxQwen1PreTrainedModel(EasyDeLBaseModule):
 	"""
 	Base class for Qwen1 models providing initialization and configuration.
 

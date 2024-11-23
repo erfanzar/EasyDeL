@@ -24,11 +24,11 @@ from flax import linen as nn
 from flax.core import FrozenDict
 from jax import numpy as np
 
-from easydel.modules.common import RMSNorm
+from easydel.layers.norms import RMSNorm
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import get_gradient_checkpoint_policy
 from easydel.modules.modeling_flax_outputs import FlaxCausalLMOutput
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.palm.palm_configuration import PalmConfig as PalmConfig
 
 
@@ -183,7 +183,7 @@ class ParallelCollection(nn.Module):
 		return hidden_state, saves
 
 
-class PalmPretrainedModel(EDPretrainedModel):
+class PalmPretrainedModel(EasyDeLBaseModule):
 	module_class: nn.Module
 	config_class = PalmConfig
 	dtype: jnp.dtype = jnp.bfloat16
