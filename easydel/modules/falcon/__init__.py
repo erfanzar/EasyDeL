@@ -14,8 +14,7 @@
 
 from easydel.modules.falcon.falcon_configuration import FalconConfig
 from easydel.modules.falcon.modeling_falcon_flax import (
-	FlaxFalconForCausalLM,
-	FlaxFalconForCausalLMModule,
-	FlaxFalconModel,
-	FlaxFalconModule,
+	FlaxFalconForCausalLM, 
+	FlaxFalconModel, 
 )
+__all__ = "FlaxFalconForCausalLM", "FlaxFalconModel", "FalconConfig"

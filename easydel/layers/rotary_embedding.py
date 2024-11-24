@@ -115,41 +115,34 @@ class RotaryEmbedding(flax.linen.Module):
 		offsets: Optional[jnp.ndarray] = None,
 	) -> Tuple[jnp.ndarray, jnp.ndarray]:
 		"""__call__ pass for the rotary embedding."""
-		if offsets is not None:
-			positions = positions + offsets
-		inv = 1.0 / (
-			self.base
-			** (jnp.arange(0, self.rotary_dim, 2, dtype=jnp.float32) / self.rotary_dim)
-		)
-		freqs = jnp.einsum(
-			"i,j -> ij",
-			jnp.arange(self.max_position_embeddings, dtype=jnp.float32),
-			inv,
-		)
-		cos = jnp.cos(freqs)[positions]
-		sin = jnp.sin(freqs)[positions]
-		query_rot = _apply_rotary_emb(
-			query[..., : self.rotary_dim],
-			cos,
-			sin,
-			self.is_neox_style,
-		)
-		query = jnp.concatenate(
-			(query_rot, query[..., self.rotary_dim :]),
-			axis=-1,
-		)
-		key_rot = _apply_rotary_emb(
-			key[..., : self.rotary_dim],
-			cos,
-			sin,
-			self.is_neox_style,
-		)
-		key = jnp.concatenate(
-			(key_rot, key[..., self.rotary_dim :]),
-			axis=-1,
-		)
+		with jax.ensure_compile_time_eval():
+			if offsets is not None:
+				positions = positions + offsets
+			cos, sin = self._compute_cos_sin_cache()
+			cos = cos[positions]
+			sin = sin[positions]
+			query_rot = _apply_rotary_emb(
+				query[..., : self.rotary_dim],
+				cos,
+				sin,
+				self.is_neox_style,
+			)
+			query = jnp.concatenate(
+				(query_rot, query[..., self.rotary_dim :]),
+				axis=-1,
+			)
+			key_rot = _apply_rotary_emb(
+				key[..., : self.rotary_dim],
+				cos,
+				sin,
+				self.is_neox_style,
+			)
+			key = jnp.concatenate(
+				(key_rot, key[..., self.rotary_dim :]),
+				axis=-1,
+			)
 
-		return query.astype(self.dtype), key.astype(self.dtype)
+			return query.astype(self.dtype), key.astype(self.dtype)
 
 
 @rope_wraper("linear")
@@ -551,7 +544,7 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
 	high_freq_factor: float
 	orig_max_position: int
 
-	def _compute_inv_freq(self, base: Union[int, float]) -> jnp.ndarray:
+	def _compute_inv_freq(self, base) -> jnp.ndarray:
 		inv_freqs = super()._compute_inv_freq(base)
 		low_freq_wavelen = self.orig_max_position / self.low_freq_factor
 		high_freq_wavelen = self.orig_max_position / self.high_freq_factor

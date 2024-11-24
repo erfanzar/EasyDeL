@@ -15,7 +15,7 @@
 from easydel.modules.gemma2.gemma2_configuration import Gemma2Config
 from easydel.modules.gemma2.modeling_gemma2_flax import (
 	FlaxGemma2ForCausalLM,
-	FlaxGemma2ForCausalLMModule,
 	FlaxGemma2Model,
-	FlaxGemma2Module,
 )
+
+__all__ = "FlaxGemma2ForCausalLM", "FlaxGemma2Model", "Gemma2Config"
