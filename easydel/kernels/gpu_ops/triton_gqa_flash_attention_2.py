@@ -38,7 +38,9 @@ FLASH_ATTN_BWD_ = True
 
 
 def calculate_num_warps(
-	head_dim: int, q_block_size: int = 0, k_block_size: int = 0
+	head_dim: int,
+	q_block_size: int = 0,
+	k_block_size: int = 0,
 ) -> int:
 	"""
 	Calculate the number of warps based on head dimension and block sizes.

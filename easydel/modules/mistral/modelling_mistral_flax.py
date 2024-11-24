@@ -14,26 +14,18 @@
 
 import functools
 import math
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import chex
 import jax
-import transformers
 from flax import linen as nn
-from flax.core import FrozenDict, freeze, unfreeze
 from flax.linen import Dense, combine_masks
 from flax.linen import partitioning as nn_partitioning
-from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import get_logger
-from easydel.generation.flax_utils import (
-	FlaxLogitsProcessorList,
-	FlaxSampleOutput,
-	SampleState,
-)
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import RMSNorm
 from easydel.modules.factory import register_module
@@ -47,16 +39,19 @@ from easydel.modules.flax_modeling_utils import (
 	precompute_frequencies,
 	with_sharding_constraint,
 )
-from easydel.modules.mistral.kernels import mistral_mlp_pallas
-from easydel.modules.mistral.mistral_configuration import MistralConfig as MistralConfig
-from easydel.modules.mistral.vision_mistral_configuration import (
-	VisionMistralConfig as VisionMistralConfig,
+from easydel.modules.mistral.mistral_configuration import (
+	MistralConfig,
+	VisionMistralConfig,
 )
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EasyDeLBaseModule
+from easydel.modules.modeling_utils import (
+	EasyDeLBaseVisionModule,
+	wrap_custom_easydel_module,
+	wrap_easydel_module,
+)
 
 re_mat = nn_partitioning.remat
 logger = get_logger(__name__)
@@ -146,27 +141,6 @@ class FlaxMistralMLP(nn.Module):
 		    chex.Array: Output tensor after applying dense layers and activation functions.
 		"""
 		x = control_mlp_sharding(x, self.config.partition_axis)
-		if (
-			self.config.hardware_abstraction
-			and self.gate_proj.variables.get("params", None) is not None
-		):
-			return jax.vmap(
-				functools.partial(
-					mistral_mlp_pallas,
-					act_fn=self.act_fn,
-					blocksize_k=self.config.pallas_k_block_size,
-					blocksize_m=self.config.pallas_m_block_size,
-					blocksize_n=self.config.pallas_n_block_size,
-					prod_dtype=self.dtype,
-					precision=self.precision,
-				),
-				in_axes=(0, None, None, None),
-			)(
-				x,
-				self.gate_proj.variables["params"]["kernel"],
-				self.down_proj.variables["params"]["kernel"],
-				self.up_proj.variables["params"]["kernel"],
-			)
 		return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -377,9 +351,9 @@ class FlaxMistralAttention(FlaxAttentionModule):
 			dropout_rng = self.make_rng("dropout")
 		if self.has_variable("cache", "cached_key") or init_cache:
 			key_states, value_states, attention_mask = self._concatenate_to_cache(
+				query_states,
 				key_states,
 				value_states,
-				query_states,
 				attention_mask,
 			)
 
@@ -544,242 +518,6 @@ class FlaxMistralDecoderLayer(nn.Module):
 		return outputs
 
 
-class FlaxMistralPretrainedModel(EasyDeLBaseModule):
-	"""
-	Base class for Mistral models providing initialization and configuration.
-
-	Attributes:
-	    config_class (MistralConfig): The configuration class for the model.
-	    module_class (nn.Module): The class representing the model's architecture.
-	    base_model_prefix (str): The prefix for the base model parameters.
-	"""
-
-	config_class = MistralConfig
-	base_model_prefix = "model"
-	module_class: nn.Module = None
-
-	def __init__(
-		self,
-		config: MistralConfig,
-		dtype: jnp.dtype = jnp.bfloat16,
-		param_dtype: jnp.dtype = jnp.bfloat16,
-		precision: Optional[jax.lax.Precision] = None,  # noqa: B008
-		input_shape: Tuple[int, int] = (1, 1),
-		seed: int = 0,
-		_do_init: bool = False,
-		**kwargs,
-	):
-		"""
-		Initializes the pre-trained model with the given configuration.
-
-		Args:
-		    config (MistralConfig): Configuration for the model.
-		    dtype (jnp.dtype): Data type for computations.
-		    param_dtype (jnp.dtype): Data type for model parameters.
-		    precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
-		    input_shape (Tuple[int, int]): Shape of the input tensor.
-		    seed (int): Seed for random number generation.
-		    _do_init (bool): If True, initialize model weights.
-		    **kwargs: Additional keyword arguments.
-		"""
-		module = self.module_class(
-			config=config,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			precision=precision,
-			**kwargs,
-		)
-		super().__init__(
-			dtype=dtype,
-			_do_init=_do_init,
-			module=module,
-			config=config,
-			input_shape=input_shape,
-			seed=seed,
-		)
-
-	def init_weights(
-		self,
-		rng: jax.random.PRNGKey,
-		input_shape: Tuple,
-		params: FrozenDict = None,
-	) -> FrozenDict:
-		"""
-		Initializes the model weights.
-
-		Args:
-		    rng (jax.random.PRNGKey): Random number generator key.
-		    input_shape (Tuple): Shape of the input tensor for initializing weights.
-		    params (FrozenDict, optional): Existing parameters to initialize with.
-
-		Returns:
-		    FrozenDict: Initialized model parameters.
-		"""
-		input_ids = jnp.zeros(input_shape, dtype="i4")
-		attention_mask = jnp.ones_like(input_ids)
-		position_ids = jnp.broadcast_to(
-			jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape
-		)
-		params_rng, dropout_rng = jax.random.split(rng)
-		rng_s = {"params": params_rng, "dropout": dropout_rng}
-
-		if self.config.add_cross_attention:
-			encoder_hidden_states = jnp.zeros(input_shape + (self.config.hidden_size,))
-			encoder_attention_mask = attention_mask
-			module_init_outputs = self.module.init(
-				rng_s,
-				input_ids,
-				attention_mask,
-				position_ids,
-				encoder_hidden_states,
-				encoder_attention_mask,
-				return_dict=False,
-			)
-		else:
-			module_init_outputs = self.module.init(
-				rng_s,
-				input_ids=input_ids,
-				attention_mask=attention_mask,
-				position_ids=position_ids,
-				return_dict=False,
-			)
-
-		random_params = module_init_outputs["params"]
-
-		if params is not None:
-			random_params = flatten_dict(unfreeze(random_params))
-			params = flatten_dict(unfreeze(params))
-			for missing_key in self._missing_keys:
-				params[missing_key] = random_params[missing_key]
-			self._missing_keys = set()
-			return freeze(unflatten_dict(params))
-		else:
-			return random_params
-
-	def init_cache(self, batch_size, max_length):
-		"""
-		Initializes the cache for autoregressive generation.
-
-		Args:
-		    batch_size (int): Batch size for the cache.
-		    max_length (int): Maximum length for the cache.
-
-		Returns:
-		    dict: Initialized cache.
-		"""
-
-		return super().init_cache(batch_size=batch_size, max_length=max_length)
-
-	def __call__(
-		self,
-		input_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		params: dict = None,
-		past_key_values: Optional[dict] = None,
-		dropout_rng: jax.random.PRNGKey = None,
-		train: bool = False,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		return_dict: Optional[bool] = None,
-		add_params_field: bool = False,
-		**kwargs,
-	):
-		"""
-		Forward pass through the model.
-
-		Args:
-		    input_ids (chex.Array): Input tensor containing token IDs.
-		    input_embeds (Optional[chex.Array]): embedding inputs to be used instead of input_ids.
-		    attention_mask (Optional[chex.Array]): Mask for attention.
-		    position_ids (Optional[chex.Array]): Positional indices.
-		    segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
-		    params (dict, optional): Parameters for the model.
-		    past_key_values (dict, optional): Past key and value states for caching.
-		    dropout_rng (jax.random.PRNGKey, optional): RNG key for dropout.
-		    train (bool): If True, the model is in training mode.
-		    output_attentions (Optional[bool]): If True, output attention weights.
-		    output_hidden_states (Optional[bool]): If True, output hidden states.
-		    return_dict (Optional[bool]): If True, return a dictionary of outputs.
-		    add_params_field (bool): If True, include the parameters in the input dictionary.
-		    **kwargs: Additional arguments.
-
-		Returns:
-		    Output type depends on the model configuration.
-		"""
-		output_attentions = (
-			output_attentions
-			if output_attentions is not None
-			else self.config.output_attentions
-		)
-		output_hidden_states = (
-			output_hidden_states
-			if output_hidden_states is not None
-			else self.config.output_hidden_states
-		)
-		return_dict = return_dict if return_dict is not None else self.config.return_dict
-		batch_size, sequence_length = (
-			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
-		)
-
-		if position_ids is None:
-			if past_key_values is not None:
-				raise ValueError(
-					"Make sure to provide `position_ids` when passing `past_key_values`."
-				)
-
-			position_ids = jnp.broadcast_to(
-				jnp.arange(sequence_length)[None, :], (batch_size, sequence_length)
-			)
-
-		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, sequence_length))
-
-		rng_s = {}
-		if dropout_rng is not None:
-			rng_s["dropout"] = dropout_rng
-
-		inputs = (
-			{"params": params or self.params} if add_params_field else params or self.params
-		)
-
-		if self.config.bits is not None:
-			rng_s["params"] = jax.random.key(0)
-		if past_key_values is not None:
-			inputs["cache"] = past_key_values
-			mutable = ["cache"]
-		else:
-			mutable = False
-
-		outputs = self.module.apply(
-			inputs,
-			input_ids=jnp.array(input_ids, dtype="i4"),
-			input_embeds=input_embeds,
-			attention_mask=jnp.array(attention_mask, dtype="i4"),
-			position_ids=jnp.array(position_ids, dtype="i4"),
-			deterministic=not train,
-			init_cache=False,
-			output_attentions=output_attentions,
-			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
-			segment_ids=segment_ids,
-			rngs=rng_s,
-			mutable=mutable,
-		)
-
-		if past_key_values is not None and return_dict:
-			outputs, past_key_values = outputs
-			outputs["past_key_values"] = unfreeze(past_key_values["cache"])
-			return outputs
-		elif past_key_values is not None and not return_dict:
-			outputs, past_key_values = outputs
-			outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
-
-		return outputs
-
-
 class FlaxMistralDecoratorCollection(nn.Module):
 	"""
 	FlaxMistralDecoratorCollection represents a single layer in a Transformer-like model,
@@ -889,7 +627,14 @@ class FlaxMistralDecoratorCollection(nn.Module):
 		return hidden_states, all_hidden_states, all_attentions
 
 
-class FlaxMistralModule(nn.Module):
+@register_module(
+	"base-module",
+	config=MistralConfig,
+	model_type="mistral",
+	embedding_layer_names=["embed_tokens"],
+)
+@wrap_easydel_module(config_class=MistralConfig, base_model_prefix="model")
+class FlaxMistralModel(nn.Module):
 	"""
 	Core module of the Mistral model, including embedding, decoder layers, and normalization.
 
@@ -1024,22 +769,13 @@ class FlaxMistralModule(nn.Module):
 
 
 @register_module(
-	"base-module",
+	"causal-language-model",
 	config=MistralConfig,
 	model_type="mistral",
 	embedding_layer_names=["embed_tokens"],
 )
-class FlaxMistralModel(FlaxMistralPretrainedModel):
-	module_class = FlaxMistralModule
-
-	def set_input_embeddings(self, value):
-		self.module.embed_tokens = value
-
-	def get_input_embeddings(self):
-		return self.module.embed_tokens
-
-
-class FlaxMistralForCausalLMModule(nn.Module):
+@wrap_easydel_module(config_class=MistralConfig, base_model_prefix="model")
+class FlaxMistralForCausalLM(nn.Module):
 	"""
 	Mistral model for causal language modeling, including the language model head.
 
@@ -1056,7 +792,7 @@ class FlaxMistralForCausalLMModule(nn.Module):
 	precision: Optional[Union[jax.lax.Precision, str]] = None
 
 	def setup(self):
-		self.model: FlaxMistralModule = FlaxMistralModule(
+		self.model = FlaxMistralModel.flax_module(
 			self.config,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
@@ -1152,234 +888,17 @@ class FlaxMistralForCausalLMModule(nn.Module):
 
 
 @register_module(
-	"causal-language-model",
-	config=MistralConfig,
+	"vision-module",
+	config=VisionMistralConfig,
 	model_type="mistral",
 	embedding_layer_names=["embed_tokens"],
 )
-class FlaxMistralForCausalLM(FlaxMistralPretrainedModel):
-	module_class = FlaxMistralForCausalLMModule
-
-	def set_input_embeddings(self, value):
-		self.module.model.embed_tokens = value
-
-	def get_input_embeddings(self):
-		return self.module.model.embed_tokens
-
-	def set_decoder(self, decoder):
-		self.module.model = decoder
-
-	def get_decoder(self):
-		return self.module.model
-
-	def get_output_embeddings(self):
-		return self.module.lm_head
-
-	def set_output_embeddings(self, new_embeddings):
-		self.module.lm_head = new_embeddings
-
-	def prepare_inputs_for_generation(
-		self,
-		input_ids,
-		max_length,
-		attention_mask: Optional[chex.Array] = None,
-	):
-		batch_size, seq_length = input_ids.shape
-
-		past_key_values = self.init_cache(batch_size, max_length)
-		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
-		if attention_mask is not None:
-			position_ids = attention_mask.cumsum(axis=-1) - 1
-			extended_attention_mask = jax.lax.dynamic_update_slice(
-				extended_attention_mask, attention_mask, (0, 0)
-			)
-		else:
-			position_ids = jnp.broadcast_to(
-				jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length)
-			)
-
-		return {
-			"past_key_values": past_key_values,
-			"attention_mask": extended_attention_mask,
-			"position_ids": position_ids,
-		}
-
-	def update_inputs_for_generation(self, model_outputs, model_kwargs):
-		model_kwargs["past_key_values"] = model_outputs.past_key_values
-		model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
-		return model_kwargs
-
-
-class FlaxVisionMistralPreTrainedModel(EasyDeLBaseModule):
-	config_class = VisionMistralConfig
-	base_model_prefix = "model"
-	module_class: nn.Module = None
-
-	def __init__(
-		self,
-		config: VisionMistralConfig,
-		input_shape: Tuple = (4, 1),
-		seed: int = 0,
-		dtype: jnp.dtype = jnp.float32,
-		_do_init: bool = True,
-		**kwargs,
-	):
-		module = self.module_class(config=config, dtype=dtype, **kwargs)
-		super().__init__(
-			config,
-			module,
-			input_shape=input_shape,
-			seed=seed,
-			dtype=dtype,
-			_do_init=_do_init,
-		)
-
-	def init_cache(self, batch_size, max_length):
-		input_ids = jnp.ones((batch_size, max_length))
-		attention_mask = jnp.ones_like(input_ids)
-		position_ids = jnp.broadcast_to(
-			jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape
-		)
-		vision_mask = jnp.ones((batch_size, max_length), dtype=bool)
-
-		init_variables = self.module.init(
-			jax.random.PRNGKey(0),
-			input_ids,
-			vision_mask,
-			attention_mask,
-			position_ids,
-			return_dict=False,
-			init_cache=True,
-		)
-		return init_variables["cache"]
-
-	def init_weights(
-		self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
-	) -> FrozenDict:
-		"""The init_weights function is used to initialize the weights of a model.
-
-		Args:
-		    self: Access variables that belong to the class
-		    rng: jax.random.PRNGKey: Initialize the weights of the model
-		    input_shape: Tuple: Specify the shape of the input tensor
-		    params: FrozenDict: Pass in the parameters of a pre-trained
-		        model
-
-		Returns:
-		    A frozendict of parameters
-		"""
-		input_ids = jnp.zeros(input_shape, dtype="i4")
-		attention_mask = jnp.ones_like(input_ids)
-		vision_mask = jnp.ones(input_ids.shape, dtype=bool)
-		position_ids = jnp.broadcast_to(
-			jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape
-		)
-		params_rng, dropout_rng = jax.random.split(rng)
-
-		random_params = self.module.init(
-			{"params": params_rng, "dropout": dropout_rng},
-			input_ids,
-			vision_mask,
-			attention_mask,
-			position_ids,
-			return_dict=False,
-		)["params"]
-
-		if params is not None:
-			random_params = flatten_dict(unfreeze(random_params))
-			params = flatten_dict(unfreeze(params))
-			for missing_key in self._missing_keys:
-				params[missing_key] = random_params[missing_key]
-			self._missing_keys = set()
-			return freeze(unflatten_dict(params))
-		else:
-			return random_params
-
-	def __call__(
-		self,
-		input_ids: chex.Array,
-		vision_mask: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		params: dict = None,
-		past_key_values: Optional[dict] = None,
-		dropout_rng: jax.random.PRNGKey = None,
-		train: bool = False,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		return_dict: Optional[bool] = None,
-		extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
-		add_params_field: bool = False,
-		**kwargs,
-	):
-		output_attentions = (
-			output_attentions
-			if output_attentions is not None
-			else self.config.output_attentions
-		)
-		output_hidden_states = (
-			output_hidden_states
-			if output_hidden_states is not None
-			else self.config.output_hidden_states
-		)
-		return_dict = return_dict if return_dict is not None else self.config.return_dict
-
-		batch_size, sequence_length = input_ids.shape
-
-		if position_ids is None:
-			if past_key_values is not None:
-				raise ValueError(
-					"Make sure to provide `position_ids` when passing `past_key_values`."
-				)
-
-			position_ids = jnp.broadcast_to(
-				jnp.arange(sequence_length)[None, :], (batch_size, sequence_length)
-			)
-
-		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, sequence_length))
-
-		# Handle any PRNG if needed
-		rngs = {}
-		if dropout_rng is not None:
-			rngs["dropout"] = dropout_rng
-
-		inputs = {"params": params or self.params}
-
-		if past_key_values is not None:
-			inputs["cache"] = past_key_values
-			mutable = ["cache"]
-		else:
-			mutable = False
-
-		outputs = self.module.apply(
-			inputs,
-			jnp.array(input_ids, dtype="i4"),
-			jnp.array(vision_mask, dtype="f4"),
-			jnp.array(attention_mask, dtype="i4"),
-			jnp.array(position_ids, dtype="i4"),
-			not train,
-			False,
-			output_attentions,
-			output_hidden_states,
-			return_dict,
-			rngs=rngs,
-			mutable=mutable,
-		)
-
-		# add updated cache to model output
-		if past_key_values is not None and return_dict:
-			outputs, past_key_values = outputs
-			outputs["past_key_values"] = unfreeze(past_key_values["cache"])
-			return outputs
-		elif past_key_values is not None and not return_dict:
-			outputs, past_key_values = outputs
-			outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
-
-		return outputs
-
-
-class FlaxVisionMistralModule(nn.Module):
+@wrap_custom_easydel_module(
+	base=EasyDeLBaseVisionModule,
+	config_class=VisionMistralConfig,
+	base_model_prefix="model",
+)
+class FlaxVisionMistralModel(nn.Module):
 	config: VisionMistralConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
@@ -1514,14 +1033,25 @@ class FlaxVisionMistralModule(nn.Module):
 		)
 
 
-class FlaxVisionMistralForCausalLMModule(nn.Module):
+@register_module(
+	"vision-language-model",
+	config=VisionMistralConfig,
+	model_type="mistral",
+	embedding_layer_names=["embed_vision", "embed_tokens"],
+)
+@wrap_custom_easydel_module(
+	base=EasyDeLBaseVisionModule,
+	config_class=VisionMistralConfig,
+	base_model_prefix="model",
+)
+class FlaxVisionMistralForCausalLM(nn.Module):
 	config: VisionMistralConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
 	precision: Optional[Union[jax.lax.Precision, str]] = None
 
 	def setup(self):
-		self.model = FlaxVisionMistralModule(
+		self.model = FlaxVisionMistralModel.flax_module(
 			self.config,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
@@ -1546,10 +1076,10 @@ class FlaxVisionMistralForCausalLMModule(nn.Module):
 
 	def __call__(
 		self,
-		input_ids,
-		vision_mask,
-		attention_mask=None,
-		position_ids=None,
+		input_ids: jax.Array,
+		vision_mask: jax.Array,
+		attention_mask: Optional[jax.Array] = None,
+		position_ids: Optional[jax.Array] = None,
 		deterministic: bool = True,
 		init_cache: bool = False,
 		output_attentions: bool = False,
@@ -1633,346 +1163,3 @@ class FlaxVisionMistralForCausalLMModule(nn.Module):
 			)
 		else:
 			raise ValueError(f"Invalid sample_mode: {self.config.sample_mode}")
-
-
-@register_module(
-	"vision-language-model",
-	config=VisionMistralConfig,
-	model_type="mistral",
-	embedding_layer_names=["embed_vision", "embed_tokens"],
-)
-class FlaxVisionMistralForCausalLM(FlaxVisionMistralPreTrainedModel):
-	module_class = FlaxVisionMistralForCausalLMModule
-
-	def prepare_inputs_for_generation(
-		self,
-		input_ids,
-		max_length,
-		attention_mask: Optional[jax.Array] = None,
-		vision_mask=None,
-	):
-		# initializing the cache
-		batch_size, seq_length = input_ids.shape
-
-		past_key_values = self.init_cache(batch_size, max_length)
-		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
-		if attention_mask is not None:
-			position_ids = attention_mask.cumsum(axis=-1) - 1
-			extended_attention_mask = lax.dynamic_update_slice(
-				extended_attention_mask, attention_mask, (0, 0)
-			)
-		else:
-			position_ids = jnp.broadcast_to(
-				jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length)
-			)
-
-		return {
-			"past_key_values": past_key_values,
-			"attention_mask": extended_attention_mask,
-			"position_ids": position_ids,
-			"vision_mask": vision_mask,
-		}
-
-	def update_inputs_for_generation(self, model_outputs, model_kwargs):
-		return {
-			"past_key_values": model_outputs.past_key_values,
-			"position_ids": model_kwargs["position_ids"][:, -1:] + 1,
-			"attention_mask": model_kwargs["attention_mask"],
-			"vision_mask": model_kwargs["vision_mask"],
-		}
-
-	def _sample_vision(
-		self,
-		input_ids: None,
-		max_length: Optional[int] = None,
-		pad_token_id: Optional[int] = None,
-		eos_token_id: Optional[int] = None,
-		prng_key: Optional[jnp.ndarray] = None,
-		logits_processor: Optional[FlaxLogitsProcessorList] = None,
-		logits_warper: Optional[FlaxLogitsProcessorList] = None,
-		cfg_scales: jnp.ndarray = 1.0,
-		trace: bool = True,
-		params: Optional[Dict[str, jnp.ndarray]] = None,
-		model_kwargs: Optional[Dict[str, jnp.ndarray]] = None,
-	):
-		# init values
-		max_length = (
-			max_length if max_length is not None else self.generation_config.max_length
-		)
-		pad_token_id = (
-			pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
-		)
-		eos_token_id = (
-			eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
-		)
-		prng_key = prng_key if prng_key is not None else jax.random.PRNGKey(0)
-
-		batch_size, cur_len = input_ids.shape
-		initial_len = cur_len
-
-		eos_token_id = jnp.array(
-			eos_token_id, dtype=jnp.int32 if eos_token_id is not None else None
-		)
-		pad_token_id = jnp.array(pad_token_id, dtype=jnp.int32)
-		cur_len = jnp.array(cur_len)
-
-		# per batch-item holding current token in loop.
-		sequences = jnp.full((batch_size, max_length), pad_token_id, dtype=jnp.int32)
-		sequences = lax.dynamic_update_slice(sequences, input_ids, (0, 0))
-
-		# per batch-item state bit indicating if sentence has finished.
-		is_sent_finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
-
-		# For Seq2Seq generation, we only need to use the decoder instead of the whole model in generation loop
-		# and pass it the `encoder_outputs`, which are part of the `model_kwargs`.
-		model = self.decode if self.config.is_encoder_decoder else self
-
-		# initialize model specific kwargs
-		model_kwargs = self.prepare_inputs_for_generation(
-			input_ids, max_length, **model_kwargs
-		)
-
-		# initialize state
-		state = SampleState(
-			cur_len=cur_len,
-			sequences=sequences,
-			running_token=input_ids,
-			is_sent_finished=is_sent_finished,
-			prng_key=prng_key,
-			model_kwargs=model_kwargs,
-		)
-
-		def sample_search_cond_fn(state):
-			"""state termination condition fn."""
-			has_reached_max_length = state.cur_len == max_length
-			all_sequence_finished = jnp.all(state.is_sent_finished)
-			finish_generation = jnp.logical_or(has_reached_max_length, all_sequence_finished)
-			return ~finish_generation
-
-		def sample_search_body_fn(state):
-			"""state update fn."""
-			prng_key, prng_key_next = jax.random.split(state.prng_key)
-			model_outputs = model(state.running_token, params=params, **state.model_kwargs)
-
-			logits = model_outputs.logits[:, -1]
-			cond_logits, uncond_logits = jnp.split(logits, 2, axis=0)
-			logits = uncond_logits + cfg_scales[:, None] * (cond_logits - uncond_logits)
-
-			# apply min_length, ...
-			logits = logits_processor(state.sequences, logits, state.cur_len)
-			# apply top_p, top_k, temperature
-			logits = logits_warper(logits, logits, state.cur_len)
-
-			next_token = jax.random.categorical(prng_key, logits, axis=-1)
-			next_token = jax.lax.cond(
-				(state.cur_len - initial_len + 1) % 257 == 0,
-				lambda: jnp.full_like(next_token, 8192),
-				lambda: next_token,
-			)
-			next_token = jnp.concatenate([next_token, next_token], axis=0)
-
-			# next_token = next_token * ~state.is_sent_finished + pad_token_id * state.is_sent_finished
-			next_is_sent_finished = state.is_sent_finished | (next_token == eos_token_id)
-			next_token = next_token[:, None]
-
-			next_sequences = lax.dynamic_update_slice(
-				state.sequences, next_token, (0, state.cur_len)
-			)
-			next_model_kwargs = self.update_inputs_for_generation(
-				model_outputs, state.model_kwargs
-			)
-
-			return SampleState(
-				cur_len=state.cur_len + 1,
-				sequences=next_sequences,
-				running_token=next_token,
-				is_sent_finished=next_is_sent_finished,
-				model_kwargs=next_model_kwargs,
-				prng_key=prng_key_next,
-			)
-
-		if input_ids.shape[1] > 1:
-			state = sample_search_body_fn(state)
-
-		if not trace:
-			state = self._run_loop_in_debug(
-				sample_search_cond_fn, sample_search_body_fn, state
-			)
-		else:
-			state = lax.while_loop(sample_search_cond_fn, sample_search_body_fn, state)
-
-		return FlaxSampleOutput(sequences=state.sequences)
-
-	def generate_vision(
-		self,
-		input_ids: jnp.ndarray,
-		cfg_scales: jnp.ndarray,
-		generation_config: Optional["transformers.GenerationConfig"] = None,  # noqa :type:ignore
-		prng_key: Optional[jnp.ndarray] = None,
-		trace: bool = True,
-		params: Optional[Dict[str, jnp.ndarray]] = None,
-		logits_processor: Optional[FlaxLogitsProcessorList] = None,
-		**kwargs,
-	):
-		self._validate_model_class()
-
-		if generation_config is None:
-			if (
-				self.generation_config._from_model_config
-				and self.generation_config._original_object_hash == hash(self.generation_config)
-			):
-				from transformers import GenerationConfig
-
-				new_generation_config = GenerationConfig.from_model_config(self.config)
-				if new_generation_config != self.generation_config:
-					logger.warn(
-						"You have modified the pretrained model configuration to control generation. This is a"
-						" deprecated strategy to control generation and will be removed soon, in a future version."
-						" Please use and modify the model generation configuration (see"
-						" https://huggingface.co/docs/transformers/generation_strategies#"
-						"default-text-generation-configuration )"
-					)
-					self.generation_config = new_generation_config
-			generation_config = self.generation_config
-		import copy
-
-		generation_config = copy.deepcopy(generation_config)
-		model_kwargs = generation_config.update(
-			**kwargs
-		)  # All unused kwargs must be model kwargs
-		generation_config.validate()
-		self._validate_model_kwargs(model_kwargs.copy())
-
-		logits_processor = (
-			logits_processor if logits_processor is not None else FlaxLogitsProcessorList()
-		)
-
-		# set init values
-		prng_key = prng_key if prng_key is not None else jax.random.PRNGKey(0)
-
-		if (
-			generation_config.pad_token_id is None
-			and generation_config.eos_token_id is not None
-		):
-			if model_kwargs.get("attention_mask") is None:
-				logger.warn(
-					"The attention mask and the pad token id were not set. As a consequence, you may observe "
-					"unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results."
-				)
-			eos_token_id = generation_config.eos_token_id
-			if isinstance(eos_token_id, list):
-				eos_token_id = eos_token_id[0]
-			logger.warn(
-				f"Setting `pad_token_id` to `eos_token_id`:{eos_token_id} for open-end generation."
-			)
-			generation_config.pad_token_id = eos_token_id
-
-		if (
-			generation_config.decoder_start_token_id is None
-			and self.config.is_encoder_decoder
-		):
-			raise ValueError(
-				"`decoder_start_token_id` has to be defined for encoder-decoder generation."
-			)
-
-		# decoder-only models should use left-padding for generation (can't be checked with `trace=True`)
-		if not self.config.is_encoder_decoder and not trace:
-			if (
-				generation_config.pad_token_id is not None
-				and jnp.sum(input_ids[:, -1] == generation_config.pad_token_id) > 0
-			):
-				logger.warn(
-					"A decoder-only architecture is being used, but right-padding was detected! For correct "
-					"generation results, please set `padding_side='left'` when initializing the tokenizer."
-				)
-
-		batch_size = input_ids.shape[0]
-
-		if self.config.is_encoder_decoder:
-			# add encoder_outputs to model_kwargs
-			if model_kwargs.get("encoder_outputs") is None:
-				model_kwargs = self._prepare_encoder_decoder_kwargs_for_generation(
-					input_ids, params, model_kwargs
-				)
-			# prepare decoder_input_ids for generation
-			input_ids = self._prepare_decoder_input_ids_for_generation(
-				batch_size,
-				decoder_start_token_id=generation_config.decoder_start_token_id,
-				bos_token_id=generation_config.bos_token_id,
-				model_kwargs=model_kwargs,
-			)
-
-		# Prepare `max_length` depending on other stopping criteria.
-		input_ids_seq_length = input_ids.shape[-1]
-		has_default_max_length = (
-			kwargs.get("max_length") is None and generation_config.max_length is not None
-		)
-		if (
-			has_default_max_length
-			and generation_config.max_new_tokens is None
-			and generation_config.max_length == 20
-		):
-			# 20 is the default max_length of the generation config
-			logger.warn(
-				f"Using the model-agnostic default `max_length` (={generation_config.max_length}) "
-				"to control the generation length.  recommend setting `max_new_tokens` to control"
-				" the maximum length of the generation.",
-				UserWarning,
-			)
-		elif generation_config.max_new_tokens is not None:
-			if not has_default_max_length and generation_config.max_length is not None:
-				logger.warn(
-					f"Both `max_new_tokens` (={generation_config.max_new_tokens}) and `max_length`(="
-					f"{generation_config.max_length}) seem to have been set. `max_new_tokens` will take precedence. "
-					"Please refer to the documentation for more information. "
-					"(https://huggingface.co/docs/transformers/main/en/main_classes/text_generation)"
-				)
-			generation_config.max_length = (
-				generation_config.max_new_tokens + input_ids_seq_length
-			)
-
-		if (
-			generation_config.min_length is not None
-			and generation_config.min_length > generation_config.max_length
-		):
-			raise ValueError(
-				f"Unfeasable length constraints: the minimum length ({generation_config.min_length}) is larger than"
-				f" the maximum length ({generation_config.max_length})"
-			)
-		if input_ids_seq_length >= generation_config.max_length:
-			input_ids_string = (
-				"decoder_input_ids" if self.config.is_encoder_decoder else "input_ids"
-			)
-			logger.warn(
-				f"Input length of {input_ids_string} is {input_ids_seq_length}, but `max_length` is set to"
-				f" {generation_config.max_length}. This can lead to unexpected behavior. You should consider"
-				" increasing`max_new_tokens`."
-			)
-
-		logits_processor = self._get_logits_processor(
-			generation_config=generation_config,
-			input_ids_seq_length=input_ids_seq_length,
-			logits_processor=logits_processor,
-		)
-
-		if not generation_config.do_sample and generation_config.num_beams == 1:
-			raise NotImplementedError
-		elif generation_config.do_sample and generation_config.num_beams == 1:
-			logits_warper = self._get_logits_warper(generation_config=generation_config)
-			return self._sample_vision(
-				input_ids,
-				generation_config.max_length,
-				generation_config.pad_token_id,
-				generation_config.eos_token_id,
-				prng_key,
-				logits_warper=logits_warper,
-				logits_processor=logits_processor,
-				cfg_scales=cfg_scales,
-				trace=trace,
-				params=params,
-				model_kwargs=model_kwargs,
-			)
-		elif not generation_config.do_sample and generation_config.num_beams > 1:
-			raise NotImplementedError
-		else:
-			raise NotImplementedError("`Beam sampling is currently not implemented.")
