@@ -20,3 +20,12 @@ from easydel.modules.mamba.modelling_mamba_flax import (
 	FlaxMambaModel,
 	FlaxMambaModule,
 )
+
+__all__ = (
+	"FlaxMambaCache",
+	"FlaxMambaForCausalLM",
+	"FlaxMambaForCausalLMModule",
+	"FlaxMambaModel",
+	"FlaxMambaModule",
+	"MambaConfig",
+)

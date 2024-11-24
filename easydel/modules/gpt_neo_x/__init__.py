@@ -15,7 +15,7 @@
 from easydel.modules.gpt_neo_x.gpt_neo_x_configuration import GPTNeoXConfig
 from easydel.modules.gpt_neo_x.modeling_gpt_neo_x_flax import (
 	FlaxGPTNeoXForCausalLM,
-	FlaxGPTNeoXForCausalLMModule,
 	FlaxGPTNeoXModel,
-	FlaxGPTNeoXModule,
 )
+
+__all__ = "FlaxGPTNeoXForCausalLM", "FlaxGPTNeoXModel", "GPTNeoXConfig"

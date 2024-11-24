@@ -57,5 +57,7 @@ class EasyQuantizer:
 				if should_be_quantized:
 					return ArrayNF4.quantize(array=array, bs=self.block_size)
 				return array
+			case EasyDeLQuantizationMethods.NONE:
+				return array
 			case _:
 				raise ValueError(f"unknown quantization_method {self.quantization_method}.")

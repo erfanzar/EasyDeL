@@ -38,13 +38,20 @@ from easydel.modules.flax_modeling_utils import (
 )
 
 # easydel.modules
-from easydel.modules.llama.llama_configuration import LlamaConfig as LlamaConfig
+from easydel.modules.llama.llama_configuration import (
+	LlamaConfig as LlamaConfig,
+	VisionLlamaConfig,
+)
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 	FlaxSequenceClassifierOutput,
 )
-from easydel.modules.modeling_utils import wrap_easydel_module
+from easydel.modules.modeling_utils import (
+	EasyDeLBaseVisionModule,
+	wrap_custom_easydel_module,
+	wrap_easydel_module,
+)
 
 
 class FlaxLlamaAttention(FlaxAttentionModule):
@@ -823,3 +830,256 @@ class FlaxLlamaForSequenceClassification(nn.Module):
 			)
 		else:
 			return (prediction,)
+
+
+@register_module(
+	"vision-module",
+	config=VisionLlamaConfig,
+	model_type="llama",
+	embedding_layer_names=["embed_tokens"],
+)
+@wrap_custom_easydel_module(
+	base=EasyDeLBaseVisionModule,
+	config_class=VisionLlamaConfig,
+	base_model_prefix="model",
+)
+class FlaxVisionLlamaModel(nn.Module):
+	config: VisionLlamaConfig
+	dtype: jnp.dtype = jnp.float32
+	param_dtype: jnp.dtype = jnp.float32
+	precision: Optional[Union[jax.lax.Precision, str]] = None
+
+	def setup(self):
+		config = self.config
+		self.embed_dim = config.hidden_size
+
+		self.embed_vision = nn.Embed(
+			config.vision_vocab_size,
+			config.hidden_size,
+			embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+		)
+
+		self.embed_tokens = nn.Embed(
+			config.vocab_size,
+			config.hidden_size,
+			embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+		)
+		self.dropout = nn.Dropout(rate=config.embd_pdrop)
+		self.layers = FlaxLlamaBlockCollection(
+			self.config,
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+			precision=self.precision,
+		)
+		self.norm = RMSNorm(
+			self.config.hidden_size,
+			eps=self.config.rms_norm_eps,
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+		)
+
+		self.causal_mask = nn.make_causal_mask(
+			jnp.ones(
+				shape=(1, self.config.granted_mask_max_position_embedding),
+				dtype="bool",
+			),
+			dtype="bool",
+		)
+
+	def __call__(
+		self,
+		input_ids: jax.Array,
+		vision_mask: jax.Array,
+		attention_mask: Optional[jax.Array] = None,
+		position_ids: Optional[jax.Array] = None,
+		deterministic=True,
+		init_cache: bool = False,
+		output_attentions: bool = False,
+		output_hidden_states: bool = False,
+		return_dict: bool = True,
+	):
+		input_ids = input_ids.astype("i4")
+
+		if input_ids.shape[1] == 1:
+			if self.config.sample_mode == "text":
+				input_embeds = self.embed_tokens(input_ids)
+			elif self.config.sample_mode == "vision":
+				input_embeds = self.embed_vision(input_ids)
+			elif self.config.sample_mode == "all":
+				raise NotImplementedError
+			else:
+				raise ValueError(f"Invalid sample_mode: {self.config.sample_mode}")
+		else:
+			input_text_embeds = self.embed_tokens(jnp.where(vision_mask, 0, input_ids))
+			input_vision_embeds = self.embed_vision(jnp.where(vision_mask, input_ids, 0))
+			vision_mask = vision_mask[..., None].astype("f4")
+			input_embeds = (
+				input_text_embeds * (1 - vision_mask) + input_vision_embeds * vision_mask
+			)
+
+		hidden_states = self.dropout(input_embeds, deterministic=deterministic)
+
+		outputs = self.layers(
+			hidden_states=hidden_states,
+			attention_mask=attention_mask,
+			position_ids=position_ids,
+			deterministic=deterministic,
+			init_cache=init_cache,
+			output_attentions=output_attentions,
+			output_hidden_states=output_hidden_states,
+			return_dict=return_dict,
+			causal_mask=self.causal_mask,
+		)
+
+		hidden_states = outputs[0]
+		hidden_states = self.norm(hidden_states)
+
+		if output_hidden_states:
+			all_hidden_states = outputs[1] + (hidden_states,)
+			outputs = (hidden_states, all_hidden_states) + outputs[2:]
+		else:
+			outputs = (hidden_states,) + outputs[1:]
+
+		if not return_dict:
+			return tuple(v for v in outputs if v is not None)
+
+		return FlaxBaseModelOutput(
+			last_hidden_state=hidden_states,
+			hidden_states=outputs[1],
+			attentions=outputs[-1],
+		)
+
+
+@register_module(
+	"vision-language-model",
+	config=VisionLlamaConfig,
+	model_type="llama",
+	embedding_layer_names=["embed_tokens"],
+)
+@wrap_custom_easydel_module(
+	base=EasyDeLBaseVisionModule,
+	config_class=VisionLlamaConfig,
+	base_model_prefix="model",
+)
+class FlaxVisionLlamaForCausalLM(nn.Module):
+	config: VisionLlamaConfig
+	dtype: jnp.dtype = jnp.float32
+	param_dtype: jnp.dtype = jnp.float32
+	precision: Optional[Union[jax.lax.Precision, str]] = None
+
+	def setup(self):
+		self.model = FlaxVisionLlamaModel.flax_module(
+			self.config,
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+			precision=self.precision,
+		)
+		self.vision_head = Dense(
+			self.config.vision_vocab_size,
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+			use_bias=False,
+			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+			precision=self.precision,
+		)
+		self.lm_head = Dense(
+			self.config.vocab_size,
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+			use_bias=False,
+			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+			precision=self.precision,
+		)
+
+	def __call__(
+		self,
+		input_ids: jax.Array,
+		vision_mask: jax.Array,
+		attention_mask: Optional[jax.Array] = None,
+		position_ids: Optional[jax.Array] = None,
+		deterministic=True,
+		init_cache: bool = False,
+		output_attentions: bool = False,
+		output_hidden_states: bool = False,
+		return_dict: bool = True,
+	):
+		batch_size, seq_length = input_ids.shape
+		if attention_mask is None:
+			attention_mask = jnp.ones_like(input_ids)
+		if position_ids is None:
+			position_ids = jnp.broadcast_to(
+				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+				(batch_size, seq_length),
+			)
+
+		outputs = self.transformer(
+			input_ids,
+			vision_mask,
+			attention_mask,
+			position_ids,
+			deterministic=deterministic,
+			init_cache=init_cache,
+			output_attentions=output_attentions,
+			output_hidden_states=output_hidden_states,
+			return_dict=return_dict,
+		)
+
+		hidden_states = outputs[0]
+
+		if self.config.tie_vision_embeddings:
+			shared_kernel = self.transformer.variables["params"]["embed_vision"][
+				"embedding"
+			].T
+			vision_logits = self.vision_head.apply(
+				{"params": {"kernel": shared_kernel}}, hidden_states
+			)
+		else:
+			vision_logits = self.vision_head(hidden_states)
+
+		if self.config.tie_word_embeddings:
+			shared_kernel = self.transformer.variables["params"]["embed_tokens"][
+				"embedding"
+			].T.astype(self.param_dtype)
+			lm_logits = self.lm_head.apply(
+				{"params": {"kernel": shared_kernel}},
+				hidden_states,
+			)
+		else:
+			lm_logits = self.lm_head(hidden_states)
+
+		if self.config.sample_mode == "all":
+			if not return_dict:
+				return (
+					vision_logits,
+					lm_logits,
+				) + outputs[1:]
+
+			return FlaxCausalLMOutput(
+				logits=(vision_logits, lm_logits),
+				hidden_states=outputs.hidden_states,
+				attentions=outputs.attentions,
+			)
+		elif self.config.sample_mode == "vision":
+			if not return_dict:
+				return (vision_logits,) + outputs[1:]
+
+			return FlaxCausalLMOutput(
+				logits=vision_logits,
+				hidden_states=outputs.hidden_states,
+				attentions=outputs.attentions,
+			)
+		elif self.config.sample_mode == "text":
+			if not return_dict:
+				return (lm_logits,) + outputs[1:]
+
+			return FlaxCausalLMOutput(
+				logits=lm_logits,
+				hidden_states=outputs.hidden_states,
+				attentions=outputs.attentions,
+			)
+		else:
+			raise ValueError(f"Invalid sample_mode: {self.config.sample_mode}")

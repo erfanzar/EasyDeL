@@ -365,9 +365,9 @@ class FlaxQwen2Attention(FlaxAttentionModule):
 
 		if self.has_variable("cache", "cached_key") or init_cache:
 			key_states, value_states, attention_mask = self._concatenate_to_cache(
+				query_states,
 				key_states,
 				value_states,
-				query_states,
 				attention_mask,
 			)
 

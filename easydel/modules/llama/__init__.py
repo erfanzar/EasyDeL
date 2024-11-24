@@ -17,5 +17,6 @@ from easydel.modules.llama.modeling_llama_flax import (
 	FlaxLlamaForCausalLM,
 	FlaxLlamaForSequenceClassification,
 	FlaxLlamaModel,
+	FlaxVisionLlamaForCausalLM,
+	FlaxVisionLlamaModel,
 )
-from easydel.modules.llama.modeling_vision_llama_flax import FlaxVisionLlamaForCausalLM

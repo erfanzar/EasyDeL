@@ -24,7 +24,6 @@ from flax.linen import partitioning as nn_partitioning
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-from easydel.modules.zamba2.zamba2_configuration import Zamba2Config
 
 from easydel.etils.etils import get_logger
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
@@ -33,6 +32,7 @@ from easydel.modules.flax_modeling_utils import (
 	get_dot_general_by_bits,
 	with_sharding_constraint,
 )
+from easydel.modules.zamba2.zamba2_configuration import Zamba2Config
 
 re_mat = nn_partitioning.remat
 logger = get_logger(__name__)
@@ -266,9 +266,9 @@ class FlaxZamba2Attention(FlaxAttentionModule):
 			dropout_rng = self.make_rng("dropout")
 		if self.has_variable("cache", "cached_key") or init_cache:
 			key_states, value_states, attention_mask = self._concatenate_to_cache(
+				query_states,
 				key_states,
 				value_states,
-				query_states,
 				attention_mask,
 			)
 

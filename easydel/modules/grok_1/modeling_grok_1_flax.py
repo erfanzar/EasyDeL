@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
 import math
 from typing import Optional, Tuple, Union
 
@@ -23,14 +22,11 @@ import jax
 import jax.numpy as jnp
 from fjformer.functions import auxiliary_load_balancing_loss_func
 from flax import linen as nn
-from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
-from flax.linen import Dense, combine_masks
-from flax.traverse_util import flatten_dict, unflatten_dict
-from jax import lax
-from jax.sharding import PartitionSpec
+from flax.linen import Dense
 
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import RMSNorm as FlaxGrok1RMSNorm
+from easydel.layers.rotary_embedding import get_rope
 from easydel.modules.factory import register_module
 
 # easydel.modules
@@ -41,12 +37,10 @@ from easydel.modules.flax_modeling_utils import (
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
 	precompute_frequencies,
-	with_sharding_constraint,
 )
 from easydel.modules.grok_1.grok_1_configuration import Grok1Config as Grok1Config
-from easydel.modules.grok_1.kernels import grok1_mlp_pallas
 from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
-from easydel.modules.modeling_utils import EasyDeLBaseModule
+from easydel.modules.modeling_utils import wrap_easydel_module
 
 re_mat = flax.linen.partitioning.remat
 
@@ -148,6 +142,19 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 			base_config=self.config,
 		)
 		self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
+		initial_rope_kwargs = dict(rope_type="default")
+		if getattr(config, "rope_scaling", None) is not None:
+			scaling_type = config.rope_scaling["type"]
+			scaling_factor = config.rope_scaling["factor"]
+			initial_rope_kwargs = dict(scaling_factor=scaling_factor, rope_type=scaling_type)
+
+		self.rotary = get_rope(
+			head_size=self.head_dim,
+			rotary_dim=self.head_dim,
+			max_position=self.config.granted_freq_max_position_embedding,
+			base=config.rope_theta,
+			rope_scaling=initial_rope_kwargs,
+		)
 
 	def _merge_heads(self, hidden_states):
 		"""
@@ -161,36 +168,9 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 		"""
 		return hidden_states.reshape(hidden_states.shape[:2] + (self.hidden_size,))
 
-	def apply_rotary(self, query, key, frequencies, position_ids):
-		"""
-		Applies rotary positional embeddings to the query and key tensors.
-
-		Args:
-		    query (chex.Array): Query tensor.
-		    key (chex.Array): Key tensor.
-		    frequencies (Tuple[chex.Array, chex.Array]): Tuple containing cosine and sine components for rotary embeddings.
-		    position_ids (chex.Array): Position indices for the tokens.
-
-		Returns:
-		    Tuple[chex.Array, chex.Array]: The modified query and key tensors after applying rotary embeddings.
-		"""
-
-		query, key = self._transpose_sequence_head(
-			query,
-			key,
-		)
-		query, key = self.rotary(
-			position_ids=position_ids,
-			query=query,
-			key=key,
-			frequencies=frequencies,
-		)
-		return self._transpose_sequence_head(query, key)
-
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		frequencies: Tuple[chex.Array, chex.Array],
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
@@ -205,7 +185,6 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 
 		Args:
 		    hidden_states (chex.Array): Input hidden states.
-		    frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
 		    attention_mask (chex.Array): Mask to apply on the attention scores.
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
@@ -243,51 +222,32 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 			self.head_dim,
 		)
 
-		query_states, key_states = self.apply_rotary(
+		query_states, key_states = self.rotary(
 			query=query_states,
 			key=key_states,
-			position_ids=position_ids,
-			frequencies=frequencies,
+			positions=position_ids,
 		)
 
-		query_length, key_length = query_states.shape[1], key_states.shape[1]
-
-		if self.has_variable("cache", "cached_key"):
-			mask_shift = self.variables["cache"]["cache_index"]
-			max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
-			causal_mask = lax.dynamic_slice(
-				causal_mask,
-				(0, 0, mask_shift, 0),
-				(1, 1, query_length, max_decoder_length),
-			)
-		else:
-			causal_mask = causal_mask[:, :, :query_length, :key_length]
-
-		batch_size = hidden_states.shape[0]
-		causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
-		if attention_mask.ndim == 2:
-			attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-		attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
-		attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
+		(
+			query_states,
+			key_states,
+			value_states,
+			attention_mask,
+			attention_bias,
+		) = self.concatenate_to_cache(
+			init_cache=init_cache,
+			query=query_states,
+			key=key_states,
+			value=value_states,
+			attention_mask=attention_mask,
+			causal_mask=causal_mask,
+			fcm_mask=fcm_mask,
+		)
 
 		dropout_rng = None
 
 		if not deterministic and self.config.attention_dropout > 0.0:
 			dropout_rng = self.make_rng("dropout")
-
-		if self.has_variable("cache", "cached_key") or init_cache:
-			key_states, value_states, attention_mask = self._concatenate_to_cache(
-				key_states,
-				value_states,
-				query_states,
-				attention_mask,
-			)
-
-		attention_bias = lax.select(
-			attention_mask > 0,
-			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-			jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-		)
 
 		query_length, key_length = query_states.shape[1], key_states.shape[1]
 
@@ -307,20 +267,9 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 			causal_mask=causal_mask,
 		)
 
-		attn_output = self._merge_heads(attentions.attention_outputs)
-		if self.config.shard_attention_computation:
-			attn_output = with_sharding_constraint(
-				attn_output,
-				PartitionSpec(
-					self.config.partition_axis.batch_axis,
-					(
-						self.config.partition_axis.sequence_axis
-						if attn_output.shape[1] != 1
-						else None
-					),
-					self.config.partition_axis.hidden_state_axis,
-				),
-			)
+		attn_output = self.shard_attention_prod(
+			self._merge_heads(attentions.attention_outputs)
+		)
 		attn_output = self.o_proj(attn_output)
 
 		attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
@@ -387,26 +336,6 @@ class FlaxGrok1BLockSparseMLP(nn.Module):
 
 		x = control_mlp_sharding(x, self.config.partition_axis)
 
-		if (
-			self.config.hardware_abstraction
-			and self.linear.variables.get("params", None) is not None
-		):
-			return jax.vmap(
-				functools.partial(
-					grok1_mlp_pallas,
-					blocksize_k=self.config.pallas_k_block_size,
-					blocksize_m=self.config.pallas_m_block_size,
-					blocksize_n=self.config.pallas_n_block_size,
-					prod_dtype=self.dtype,
-					precision=self.precision,
-				),
-				in_axes=(0, None, None, None),
-			)(
-				x,
-				self.linear.variables["params"]["kernel"],
-				self.linear_1.variables["params"]["kernel"],
-				self.linear_v.variables["params"]["kernel"],
-			)
 		return self.linear_1(nn.gelu(self.linear(x)) * self.linear_v(x))
 
 
@@ -533,7 +462,6 @@ class FlaxGrok1DecoderLayer(nn.Module):
 
 	def setup(self) -> None:
 		# hidden_states: chex.Array
-		# frequencies: Tuple[chex.Array, chex.Array],
 		# attention_mask: chex.Array
 		# causal_mask: chex.Array
 		# position_ids: chex.Array
@@ -547,7 +475,7 @@ class FlaxGrok1DecoderLayer(nn.Module):
 			attn_block = re_mat(
 				attn_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-				static_argnums=(1, 3, 4, 6, 7, 8),
+				static_argnums=(4, 5, 6),
 			)
 			mlp_block = re_mat(
 				mlp_block,
@@ -766,256 +694,14 @@ class FlaxGrok1DecoderLayerCollection(nn.Module):
 		return outputs
 
 
-class Grok1PreTrainedModel(EasyDeLBaseModule):
-	"""
-	Base class for Grok1 models providing initialization and configuration.
-
-	Attributes:
-	    config_class (Grok1Config): The configuration class for the model.
-	    module_class (nn.Module): The class representing the model's architecture.
-	    base_model_prefix (str): The prefix for the base model parameters.
-	"""
-
-	config_class: Grok1Config = Grok1Config
-	module_class: nn.Module = None
-	base_model_prefix = "model"
-
-	# main_input_name = "input_ids"
-
-	def __init__(
-		self,
-		config: Grok1Config,
-		dtype: jnp.dtype = jnp.bfloat16,
-		param_dtype: jnp.dtype = jnp.bfloat16,
-		precision: Optional[jax.lax.Precision] = None,
-		input_shape: Tuple[int, int] = (1, 1),
-		seed: int = 0,
-		_do_init: bool = False,
-		**kwargs,
-	):
-		"""
-		Initializes the pre-trained model with the given configuration.
-
-		Args:
-		    config (Grok1Config): Configuration for the model.
-		    dtype (jnp.dtype): Data type for computations.
-		    param_dtype (jnp.dtype): Data type for model parameters.
-		    precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
-		    input_shape (Tuple[int, int]): Shape of the input tensor.
-		    seed (int): Seed for random number generation.
-		    _do_init (bool): If True, initialize model weights.
-		    **kwargs: Additional keyword arguments.
-		"""
-		module = self.module_class(
-			config=config,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			precision=precision,
-			**kwargs,
-		)
-
-		super().__init__(
-			dtype=dtype,
-			_do_init=_do_init,
-			module=module,
-			config=config,
-			input_shape=input_shape,
-			seed=seed,
-		)
-
-	def init_weights(
-		self,
-		rng: jax.random.PRNGKey,
-		input_shape: Tuple,
-		params: Optional[FrozenDict] = None,
-	) -> FrozenDict:
-		"""The init_weights function is used to initialize the weights of a model.
-		It takes in a rng, which is a random number generator key that can be used to generate random numbers.
-		The input_shape parameter specifies the shape of the inputs that will be fed into this model.
-		The params parameter allows you to pass in pre-trained weights for your model, if you have them available.
-
-		Args:
-		    self: Access variables that belong to the class
-		    rng: jax.random.PRNGKey: Initialize the weights of the model
-		    input_shape: Tuple: Initialize the input_ids, attention_mask
-		        and position_ids
-		    params: flax.core.FrozenDict: Pass in the parameters of a
-		        pre-trained model
-
-		Returns:
-		    A frozendict of parameters
-		"""
-
-		self.config.initialization_of_moe = True
-		input_ids = jnp.zeros(input_shape, dtype="i4")
-		attention_mask = jnp.ones_like(input_ids, dtype="i4")
-		position_ids = jnp.broadcast_to(
-			jnp.arange(jnp.atleast_2d(input_ids).shape[-1], dtype="i4"),
-			input_shape,
-		)
-		params_rng, dropout_rng = jax.random.split(rng)
-		rngs = {"params": params_rng, "dropout": dropout_rng}
-		if self.config.add_cross_attention:
-			encoder_hidden_states = jnp.zeros(input_shape + (self.config.hidden_size,))
-			encoder_attention_mask = attention_mask
-			module_init_outputs = self.module.init(
-				rngs,
-				input_ids,
-				attention_mask,
-				position_ids,
-				encoder_hidden_states,
-				encoder_attention_mask,
-				return_dict=False,
-			)
-		else:
-			module_init_outputs = self.module.init(
-				rngs,
-				input_ids=input_ids,
-				attention_mask=attention_mask,
-				position_ids=position_ids,
-				return_dict=False,
-			)
-		random_params = module_init_outputs["params"]
-
-		self.config.initialization_of_moe = False
-		if params is not None:
-			random_params = flatten_dict(unfreeze(random_params))
-			params = flatten_dict(unfreeze(params))
-			for missing_key in self._missing_keys:
-				params[missing_key] = random_params[missing_key]
-			self._missing_keys = set()
-			return freeze(unflatten_dict(params))
-		else:
-			return random_params
-
-	def init_cache(self, batch_size, max_length):
-		"""
-		Initializes the cache for autoregressive generation.
-
-		Args:
-		    batch_size (int): Batch size for the cache.
-		    max_length (int): Maximum length for the cache.
-
-		Returns:
-		    dict: Initialized cache.
-		"""
-
-		return super().init_cache(batch_size=batch_size, max_length=max_length)
-
-	def __call__(
-		self,
-		input_ids: chex.Array,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
-		params: dict = None,
-		past_key_values: Optional[dict] = None,
-		dropout_rng: jax.random.PRNGKey = None,
-		train: bool = False,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		output_router_logits: Optional[bool] = None,
-		return_dict: Optional[bool] = None,
-		add_params_field: bool = False,
-		**kwargs,
-	):
-		"""
-		Forward pass through the model.
-
-		Args:
-		    input_ids (chex.Array): Input tensor containing token IDs.
-		    attention_mask (Optional[chex.Array]): Mask for attention.
-		    position_ids (Optional[chex.Array]): Positional indices.
-		    segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
-		    input_embeds (Optional[chex.Array]): embedding inputs to be used instead of input_ids.
-		    params (dict, optional): Parameters for the model.
-		    past_key_values (dict, optional): Past key and value states for caching.
-		    dropout_rng (jax.random.PRNGKey, optional): RNG key for dropout.
-		    train (bool): If True, the model is in training mode.
-		    output_attentions (Optional[bool]): If True, output attention weights.
-		    output_hidden_states (Optional[bool]): If True, output hidden states.
-		    output_router_logits (Optional[bool]): If True, output router logits.
-		    return_dict (Optional[bool]): If True, return a dictionary of outputs.
-		    add_params_field (bool): If True, include the parameters in the input dictionary.
-		    **kwargs: Additional arguments.
-
-		Returns:
-		    Output type depends on the model configuration.
-		"""
-
-		output_attentions = (
-			output_attentions
-			if output_attentions is not None
-			else self.config.output_attentions
-		)
-		output_hidden_states = (
-			output_hidden_states
-			if output_hidden_states is not None
-			else self.config.output_hidden_states
-		)
-		return_dict = return_dict if return_dict is not None else self.config.return_dict
-
-		batch_size, sequence_length = input_ids.shape
-
-		if position_ids is None:
-			if past_key_values is not None:
-				raise ValueError(
-					"Make sure to provide `position_ids` when passing `past_key_values`."
-				)
-
-			position_ids = jnp.broadcast_to(
-				jnp.arange(sequence_length)[None, :], (batch_size, sequence_length)
-			)
-
-		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, sequence_length))
-
-		rng_s = {}
-		if dropout_rng is not None:
-			rng_s["dropout"] = dropout_rng
-
-		inputs = (
-			{"params": params or self.params} if add_params_field else params or self.params
-		)
-
-		if self.config.bits is not None:
-			rng_s["params"] = jax.random.key(0)
-		if past_key_values is not None:
-			inputs["cache"] = past_key_values
-			mutable = ["cache"]
-		else:
-			mutable = False
-
-		outputs = self.module.apply(
-			inputs,
-			input_ids=jnp.array(input_ids, dtype="i4"),
-			attention_mask=jnp.array(attention_mask, dtype="i4"),
-			position_ids=jnp.array(position_ids, dtype="i4"),
-			segment_ids=segment_ids,
-			input_embeds=input_embeds,
-			output_attentions=output_attentions,
-			output_hidden_states=output_hidden_states,
-			output_router_logits=output_router_logits,
-			init_cache=False,
-			deterministic=not train,
-			return_dict=return_dict,
-			rngs=rng_s,
-			mutable=mutable,
-		)
-
-		if past_key_values is not None and return_dict:
-			outputs, past_key_values = outputs
-			outputs["past_key_values"] = unfreeze(past_key_values["cache"])
-			return outputs
-		elif past_key_values is not None and not return_dict:
-			outputs, past_key_values = outputs
-			outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
-
-		return outputs
-
-
-class FlaxGrok1Module(nn.Module):
+@register_module(
+	"base-module",
+	config=Grok1Config,
+	model_type="grok-1",
+	embedding_layer_names=["embed_tokens"],
+)
+@wrap_easydel_module(config_class=Grok1Config, base_model_prefix="model")
+class FlaxGrok1Model(nn.Module):
 	config: Grok1Config
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
@@ -1168,16 +854,13 @@ class FlaxGrok1Module(nn.Module):
 
 
 @register_module(
-	"base-module",
+	"causal-language-model",
 	config=Grok1Config,
 	model_type="grok-1",
 	embedding_layer_names=["embed_tokens"],
 )
-class FlaxGrok1Model(Grok1PreTrainedModel):
-	module_class = FlaxGrok1Module
-
-
-class FlaxGrok1ForCausalLMModule(nn.Module):
+@wrap_easydel_module(config_class=Grok1Config, base_model_prefix="model")
+class FlaxGrok1ForCausalLM(nn.Module):
 	"""
 	Grok1 model for causal language modeling, including the language model head.
 
@@ -1194,7 +877,7 @@ class FlaxGrok1ForCausalLMModule(nn.Module):
 	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
-		self.model = FlaxGrok1Module(
+		self.model = FlaxGrok1Model.flax_module(
 			config=self.config,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
@@ -1297,59 +980,3 @@ class FlaxGrok1ForCausalLMModule(nn.Module):
 			attentions=outputs.attentions,
 			router_logits=outputs.router_logits,
 		)
-
-
-@register_module(
-	"causal-language-model",
-	config=Grok1Config,
-	model_type="grok-1",
-	embedding_layer_names=["embed_tokens"],
-)
-class FlaxGrok1ForCausalLM(Grok1PreTrainedModel):
-	module_class = FlaxGrok1ForCausalLMModule
-
-	def prepare_inputs_for_generation(
-		self,
-		input_ids,
-		max_length,
-		attention_mask: Optional[chex.Array] = None,
-	):
-		"""The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
-
-		Args:
-		    self: Access variables that belong to the class
-		    input_ids: Pass in the input tokens
-		    max_length: Set the length of the sequence to be generated
-		    attention_mask: Optional[chex.Array]: Mask the attention
-		        weights
-
-		Returns:
-		    A dictionary of the past_key_values, attention_mask and
-		    position ids
-		"""
-		batch_size, seq_length = input_ids.shape
-
-		past_key_values = self.init_cache(batch_size, max_length)
-		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
-		if attention_mask is not None:
-			position_ids = attention_mask.cumsum(axis=-1) - 1
-			extended_attention_mask = lax.dynamic_update_slice(
-				extended_attention_mask,
-				attention_mask,
-				(0, 0),
-			)
-		else:
-			position_ids = jnp.broadcast_to(
-				jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length)
-			)
-
-		return {
-			"past_key_values": past_key_values,
-			"attention_mask": extended_attention_mask,
-			"position_ids": position_ids,
-		}
-
-	def update_inputs_for_generation(self, model_outputs, model_kwargs):
-		model_kwargs["past_key_values"] = model_outputs.past_key_values
-		model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
-		return model_kwargs

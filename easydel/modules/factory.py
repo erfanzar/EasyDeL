@@ -18,6 +18,7 @@ class TaskType(str, Enum):
 	COND_GEN = "conditional-generation"
 	AUDIO_CLASS = "audio-classification"
 	BASE_MODULE = "base-module"
+	BASE_VISION = "vision-module"
 	SEQ_TO_SEQ = "seq-to-seq"
 
 

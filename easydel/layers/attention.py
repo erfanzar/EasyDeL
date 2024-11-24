@@ -1858,7 +1858,7 @@ class FlaxAttentionModule(nn.Module):
 				fcm_mask (Optional[jax.Array]): fcm mask if provided.
 
 		Returns:
-				Tuple[jax.Array, jax.Array, jax.Array, jax.Array,jax.Array]: returns query, key, value, attention_bias, attention_mask
+				Tuple[jax.Array, jax.Array, jax.Array, jax.Array,jax.Array]: returns query, key, value, attention_mask, attention_bias
 		"""
 		query_length = query.shape[1]
 		key_length = key.shape[1]

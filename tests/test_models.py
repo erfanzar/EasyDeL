@@ -729,22 +729,22 @@ if __name__ == "__main__":
 	# unittest.main()
 	test = EasyModelsTest()
 	test.setUp()
-	# test.test_mamba2()  # Passed v0.0.80 - P T Runtime
-	# test.test_arctic()  # Passed v0.0.80 - P T Runtime
-	# test.test_cohere()  # Passed v0.0.80 - N Runtime
-	# test.test_dbrx()  # Passed  v0.0.80 - N Runtime
-	# test.test_deepseek_v2()  # Passed v0.0.80 - X Runtime
-	# test.test_exaone()  # Passed v0.0.80 - N Runtime
-	# test.test_falcon()  # Passed v0.0.80 - N Runtime
-	# test.test_gemma()  # Passed v0.0.80 - N Runtime
-	# test.test_gemma2()  # Passed v0.0.80 - N Runtime
-	# test.test_gptj()  # Passed v0.0.80 - P T Runtime
-	# test.test_gpt2()  # Passed v0.0.80 - P T Runtime
+	# test.test_mamba2() # Passed v0.0.80 - P T Runtime
+	# test.test_arctic() # Passed v0.0.80 - P T Runtime
+	# test.test_cohere() # Passed v0.0.80 - N Runtime
+	# test.test_dbrx() # Passed  v0.0.80 - N Runtime
+	# test.test_deepseek_v2() # Passed v0.0.80 - X Runtime
+	# test.test_exaone() # Passed v0.0.80 - N Runtime
+	# test.test_falcon() # Passed v0.0.80 - N Runtime
+	# test.test_gemma() # Passed v0.0.80 - N Runtime
+	# test.test_gemma2() # Passed v0.0.80 - N Runtime
+	# test.test_gptj() # Passed v0.0.80 - N Runtime
+	# test.test_gpt2() # Passed v0.0.80 - N Runtime
 	# test.test_grok1() # should be impl
-	# test.test_internlm2()
+	# test.test_internlm2() # Passed v0.0.80 - N Runtime
 	# test.test_llama()  # Passed v0.0.80 - N Runtime
-	# test.test_mamba()  # Passed v0.0.80 - P T Runtime
-	# test.test_mistral()  # Passed v0.0.80 - P T Runtime
+	# test.test_mamba()  # Passed v0.0.80 - N Runtime
+	test.test_mistral()  # Passed v0.0.80 - N Runtime
 	# test.test_mixtral()  # Passed v0.0.80 - P T Runtime
 	# test.test_mpt()  # Passed v0.0.80 - P T Runtime
 	# test.test_olmo()  # Passed v0.0.80 - P T Runtime
