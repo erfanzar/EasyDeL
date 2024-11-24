@@ -72,7 +72,6 @@ def run(
 				and not os.path.isdir(current_file)
 				and current_file.endswith(".py")
 			):
-				# print(current_file)
 				doted = start_head.replace(os.path.sep, ".").replace("/", ".") + "."
 				name = (
 					current_file.replace(".py", "").replace(os.path.sep, ".").replace("/", ".")
@@ -143,7 +142,25 @@ def generate_api_docs(structure, output_dir):
 		create_rst(root_name.replace(" ", "_"), children, output_dir)
 
 
+def loopi_format(inner):
+	try:
+		for file in get_inner(inner):
+			if (
+				not file.endswith("__init__.py")
+				and not os.path.isdir(file)
+				and file.endswith(".py")
+			):
+				os.system(f"ruff format {file} --config pyproject.toml -q")
+				os.system(f"ruff  check --fix {file} --config pyproject.toml -q --select I")
+				os.system(f"ruff  check --fix {file} --config pyproject.toml -q")
+			else:
+				loopi_format(file)
+	except NotADirectoryError:
+		...
+
+
 def main():
+	loopi_format("easydel")
 	global cache
 
 	for current_file in get_inner("docs/api_docs/"):

@@ -15,7 +15,7 @@
 from easydel.modules.cohere.cohere_configuration import CohereConfig
 from easydel.modules.cohere.modelling_cohere_flax import (
 	FlaxCohereForCausalLM,
-	FlaxCohereForCausalLMModule,
 	FlaxCohereModel,
-	FlaxCohereModule,
 )
+
+__all__ = "FlaxCohereForCausalLM", "FlaxCohereModel", "CohereConfig"
