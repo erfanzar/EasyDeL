@@ -1,7 +1,7 @@
-stablelm.kernels package
+rotary_embedding package
 ========================
 
-.. automodule:: easydel.modules.stablelm.kernels
+.. automodule:: easydel.layers.rotary_embedding
     :members:
     :undoc-members:
     :show-inheritance:

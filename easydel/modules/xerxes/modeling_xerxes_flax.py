@@ -411,7 +411,7 @@ class FlaxXerxesDecoderLayer(nn.Module):
 	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
-		mlp_block = FlaxXerxesSparseMoeBlock if self.config.xe_moe else FlaxXerxesMLP 
+		mlp_block = FlaxXerxesSparseMoeBlock if self.config.xe_moe else FlaxXerxesMLP
 		attn_block = FlaxXerxesAttention
 
 		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:

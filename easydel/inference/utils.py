@@ -14,7 +14,7 @@
 
 import dataclasses
 from functools import partial
-from typing import Dict, Optional, Union, List
+from typing import Dict, List, Optional, Union
 
 import fjformer
 import jax
@@ -319,7 +319,6 @@ def cal_top_k(x, k):
 
 @partial(jax.jit, static_argnames=["top_p"])
 def calculate_top_p(logits, top_p):
-	
 	topk_scores, topk_indices = jax.lax.top_k(logits, k=logits.shape[-1])
 	mask_scores = jnp.full_like(logits, -float("inf"))
 	cumulative_probs = jax.nn.softmax(topk_scores, axis=-1).cumsum(axis=-1)
@@ -453,7 +452,7 @@ vinference_step_compiled = jax.jit(
 
 def create_sampling_step(
 	model,
-	max_new_tokens: int, 
+	max_new_tokens: int,
 	repetition_penalty: float,
 	length_penalty: float,
 	top_k: int,

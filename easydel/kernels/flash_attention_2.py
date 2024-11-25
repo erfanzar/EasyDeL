@@ -181,17 +181,17 @@ class FlashAttention:
 		adjust_sharindgs: bool = False,
 	) -> chex.Array:
 		"""
-		Computes flash attention using the configured backend and platform.
+		        Computes flash attention using the configured backend and platform.
 
-		Args:
-		    query: Query tensor of shape [batch, seq_len, num_heads, dim]
-		    key: Key tensor of shape [batch, seq_len, num_kv_heads, dim]
-		    value: Value tensor of shape [batch, seq_len, num_kv_heads, dim]
-		    bias: Optional attention bias tensor
-        adjust_sharindgs: whenever to change shardings for best fit in triton kernel
-				
-		Returns:
-		    Output tensor of shape [batch, seq_len, num_heads, dim]
+		        Args:
+		            query: Query tensor of shape [batch, seq_len, num_heads, dim]
+		            key: Key tensor of shape [batch, seq_len, num_kv_heads, dim]
+		            value: Value tensor of shape [batch, seq_len, num_kv_heads, dim]
+		            bias: Optional attention bias tensor
+		adjust_sharindgs: whenever to change shardings for best fit in triton kernel
+
+		        Returns:
+		            Output tensor of shape [batch, seq_len, num_heads, dim]
 		"""
 		num_q_heads = query.shape[2]
 		num_kv_heads = key.shape[2]

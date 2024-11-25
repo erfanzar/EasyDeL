@@ -44,8 +44,9 @@ import jax.tree_util
 from fjformer.checkpoint import CheckpointManager
 from fjformer.dtypes import Array8Bit
 from fjformer.sharding import match_partition_rules
-from flax.core import FrozenDict, unfreeze, freeze
+from flax.core import FrozenDict, freeze, unfreeze
 from flax.traverse_util import flatten_dict, unflatten_dict
+from jax import lax
 from jax import numpy as jnp
 from jax.experimental.mesh_utils import create_device_mesh
 from jax.sharding import Mesh, PartitionSpec
@@ -63,15 +64,10 @@ from easydel.etils.etils import (
 	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
-from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN, EasyQuantizer
-
-import jax
-import jax.tree_util
-from jax import lax
-
 from easydel.generation.flax_utils import FlaxSampleOutput
 from easydel.generation.logits_process import FlaxLogitsProcessorList
 from easydel.inference.utils import SampleState
+from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN, EasyQuantizer
 
 logger = get_logger(__name__)
 

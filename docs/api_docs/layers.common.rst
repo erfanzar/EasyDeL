@@ -1,7 +1,7 @@
 common package
 ==============
 
-.. automodule:: easydel.modules.common
+.. automodule:: easydel.layers.common
     :members:
     :undoc-members:
     :show-inheritance:

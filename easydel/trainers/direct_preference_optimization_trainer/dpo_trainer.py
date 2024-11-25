@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from __future__ import annotations
+
 import copy
 import os
 import time
@@ -22,6 +23,7 @@ from abc import ABC
 from collections import defaultdict
 from functools import partial  # noqa
 from typing import Any, Callable, Dict, Mapping, Optional
+
 import flax.core
 import jax
 import termcolor
@@ -59,7 +61,6 @@ from easydel.trainers.prompt_utils import (
 	maybe_apply_chat_template,
 	maybe_extract_prompt,
 )
-
 
 logger = get_logger(__name__)
 

@@ -1,4 +1,3 @@
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -39,6 +38,4 @@ def qwen2_mlp_pallas(
 		prod_dtype=prod_dtype,
 		precision=precision,
 	)
-	return gemm(
-		(act_fn(gemm(x, w1, **args)) * gemm(x, w3, **args)), w2, **args
-	)
+	return gemm((act_fn(gemm(x, w1, **args)) * gemm(x, w3, **args)), w2, **args)
