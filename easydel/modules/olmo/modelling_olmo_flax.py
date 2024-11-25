@@ -154,7 +154,7 @@ class FlaxOlmoAttention(FlaxAttentionModule):
 			axis_name=self.config.attention_axis_name,
 			base_config=self.config,
 		)
-		initial_rope_kwargs = dict(rope_type="none")
+		initial_rope_kwargs = dict(rope_type="default")
 		if self.config.rope_scaling is not None:
 			scaling_type = self.config.rope_scaling["type"]
 			scaling_factor = self.config.rope_scaling["factor"]
@@ -174,7 +174,6 @@ class FlaxOlmoAttention(FlaxAttentionModule):
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		frequencies: Tuple[chex.Array, chex.Array],
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
@@ -189,7 +188,6 @@ class FlaxOlmoAttention(FlaxAttentionModule):
 
 		Args:
 		    hidden_states (chex.Array): Input hidden states.
-		    frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
 		    attention_mask (chex.Array): Mask to apply on the attention scores.
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
@@ -343,7 +341,6 @@ class FlaxOlmoDecoderLayer(nn.Module):
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		frequencies: Tuple[chex.Array, chex.Array],
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
@@ -358,7 +355,6 @@ class FlaxOlmoDecoderLayer(nn.Module):
 
 		Args:
 		    hidden_states (chex.Array): Input hidden states.
-		    frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
 		    attention_mask (chex.Array): Mask to apply on the attention scores.
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
@@ -374,7 +370,6 @@ class FlaxOlmoDecoderLayer(nn.Module):
 		residual = hidden_states
 		attention_output = self.self_attn(
 			self.input_layernorm(hidden_states),
-			frequencies,
 			attention_mask,
 			position_ids,
 			causal_mask,
@@ -439,7 +434,6 @@ class FlaxOlmoDecoratorCollection(nn.Module):
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		frequencies: Tuple[chex.Array, chex.Array],
 		attention_mask: chex.Array,
 		causal_mask: chex.Array,
 		position_ids: chex.Array,
@@ -454,7 +448,6 @@ class FlaxOlmoDecoratorCollection(nn.Module):
 
 		Args:
 		    hidden_states (chex.Array): Input tensor containing the hidden states.
-		    frequencies (Tuple[chex.Array, chex.Array]): Frequency positional encodings.
 		    attention_mask (chex.Array): Mask to apply during attention.
 		    causal_mask (chex.Array): Causal mask for autoregressive decoding.
 		    position_ids (chex.Array): Positional indices for the sequence.
@@ -498,7 +491,6 @@ class FlaxOlmoDecoratorCollection(nn.Module):
 
 			output = layer(
 				hidden_states=hidden_states,
-				frequencies=frequencies,
 				attention_mask=attention_mask,
 				position_ids=position_ids,
 				causal_mask=causal_mask,

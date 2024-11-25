@@ -165,7 +165,6 @@ class FlaxArcticAttention(FlaxAttentionModule):
 
 		Args:
 		    hidden_states (chex.Array): Input hidden states.
-		    frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
 		    attention_mask (chex.Array): Mask to apply on the attention scores.
 		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
 		    position_ids (chex.Array): Position indices for the tokens.
@@ -927,7 +926,6 @@ class FlaxArcticModel(nn.Module):
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			causal_mask=self.causal_mask,
-			frequencies=self.frequencies,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			init_cache=init_cache,

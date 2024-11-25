@@ -139,14 +139,14 @@ class FlaxOpenELMMultiHeadCausalAttention(FlaxAttentionModule):
 		self.transformer_dim = config.model_dim
 		self.num_groups = self.num_q_heads // self.num_k_heads
 
-		initial_rope_kwargs = dict(rope_type="none")
+		initial_rope_kwargs = dict(rope_type="default")
 		if self.config.rope_scaling is not None:
 			scaling_type = self.config.rope_scaling["type"]
 			scaling_factor = self.config.rope_scaling["factor"]
 			initial_rope_kwargs = dict(scaling_factor=scaling_factor, rope_type=scaling_type)
 
 		self.rotary = get_rope(
-			max_position_=self.config.granted_freq_max_position_embedding,
+			max_position=self.config.granted_freq_max_position_embedding,
 			head_size=self.config.head_dim,
 			rotary_dim=self.config.head_dim,
 			base=self.config.rope_freq_constant,

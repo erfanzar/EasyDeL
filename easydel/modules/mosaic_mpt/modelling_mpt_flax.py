@@ -614,6 +614,7 @@ class FlaxMptForCausalLM(nn.Module):
 		init_cache: bool = False,
 		deterministic: bool = True,
 		return_dict: bool = True,
+		**kwargs,
 	) -> Union[FlaxBaseModelOutput, Tuple]:
 		"""
 		Forward pass through the MPT module.
