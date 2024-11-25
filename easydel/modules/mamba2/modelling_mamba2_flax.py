@@ -1131,20 +1131,16 @@ class FlaxMambaPretrainedModel(EasyDeLBaseModule):
 		Returns:
 		    The super() of the class
 		"""
-		module = self.module_class(
+
+		super().__init__(
 			config=config,
-			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
-			**kwargs,
-		)
-		super().__init__(
-			config,
-			module,
 			input_shape=(input_shape[0], 1),
 			seed=seed,
 			dtype=dtype,
 			_do_init=_do_init,
+			**kwargs,
 		)
 
 	def init_weights(
