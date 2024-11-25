@@ -752,6 +752,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		head_size,
 		rotary_dim=None,
 		is_neox_style=True,
+		base=None,
 	):
 		from easydel.layers.rotary_embedding import get_rope
 
@@ -759,58 +760,84 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			rotary_dim = head_size
 		initial_rope_kwargs = dict(rope_type="default")
 		if getattr(self, "rope_scaling", None) is not None:
-			scaling_type = self.rope_scaling.get("rope_type")
+			scaling_type = self.rope_scaling.get("rope_type", None)
 			scaling_type = self.rope_scaling.get("type", scaling_type)
-			scaling_factor = self.rope_scaling.get("factor")
+			scaling_factor = self.rope_scaling.get("factor", None)
 			low_freq_factor = self.rope_scaling.get("low_freq_factor", None)
 			high_freq_factor = self.rope_scaling.get("high_freq_factor", None)
 			original_max_position_embeddings = self.rope_scaling.get(
 				"original_max_position_embeddings", None
 			)
+			long_factor = self.rope_scaling.get("long_factor", None)
+			short_factor = self.rope_scaling.get("short_factor", None)
+			long_mscale = self.rope_scaling.get("long_mscale", None)
+			short_mscale = self.rope_scaling.get("short_mscale", None)
 			initial_rope_kwargs = dict(
 				rope_type=scaling_type,
 				factor=scaling_factor,
 				low_freq_factor=low_freq_factor,
 				high_freq_factor=high_freq_factor,
 				original_max_position_embeddings=original_max_position_embeddings,
+				long_factor=long_factor,
+				short_factor=short_factor,
+				long_mscale=long_mscale,
+				short_mscale=short_mscale,
 			)
 
 		return get_rope(
 			head_size=head_size,
 			rotary_dim=rotary_dim,
 			max_position=self.granted_freq_max_position_embedding,
-			base=self.rope_theta,
+			base=base or self.rope_theta,
 			dtype=dtype,
 			is_neox_style=is_neox_style,
 			rope_scaling=initial_rope_kwargs,
 		)
 
-	def get_basic_frequencies(self):
+	def get_basic_frequencies(
+		self,
+		head_size=None,
+		rotary_dim=None,
+		base=None,
+	):
 		from easydel.layers.rotary_embedding import get_frequencies
 
+		if head_size is None:
+			head_size = self.head_dim  # last point
+		if rotary_dim is None:
+			rotary_dim = head_size
+		initial_rope_kwargs = dict(rope_type="default")
 		initial_rope_kwargs = dict(rope_type="default")
 		if getattr(self, "rope_scaling", None) is not None:
-			scaling_type = self.rope_scaling.get("rope_type")
+			scaling_type = self.rope_scaling.get("rope_type", None)
 			scaling_type = self.rope_scaling.get("type", scaling_type)
-			scaling_factor = self.rope_scaling.get("factor")
+			scaling_factor = self.rope_scaling.get("factor", None)
 			low_freq_factor = self.rope_scaling.get("low_freq_factor", None)
 			high_freq_factor = self.rope_scaling.get("high_freq_factor", None)
 			original_max_position_embeddings = self.rope_scaling.get(
 				"original_max_position_embeddings", None
 			)
+			long_factor = self.rope_scaling.get("long_factor", None)
+			short_factor = self.rope_scaling.get("short_factor", None)
+			long_mscale = self.rope_scaling.get("long_mscale", None)
+			short_mscale = self.rope_scaling.get("short_mscale", None)
 			initial_rope_kwargs = dict(
 				rope_type=scaling_type,
 				factor=scaling_factor,
 				low_freq_factor=low_freq_factor,
 				high_freq_factor=high_freq_factor,
 				original_max_position_embeddings=original_max_position_embeddings,
+				long_factor=long_factor,
+				short_factor=short_factor,
+				long_mscale=long_mscale,
+				short_mscale=short_mscale,
 			)
 
 		return get_frequencies(
-			head_size=self.head_dim,
-			rotary_dim=self.head_dim,
+			head_size=head_size,
+			rotary_dim=rotary_dim,
 			max_position=self.granted_freq_max_position_embedding,
-			base=self.rope_theta,
+			base=base or self.rope_theta,
 			rope_scaling=initial_rope_kwargs,
 		)
 

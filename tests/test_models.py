@@ -678,8 +678,8 @@ if __name__ == "__main__":
 	test.setUp()
 	# test.test_mamba2()  # Passed v0.0.80 - N Runtime
 	test.test_arctic()  # Passed v0.0.80 - N Runtime
-	# test.test_cohere()  # Passed v0.0.80 - N Runtime
-	# test.test_dbrx()  # Passed  v0.0.80 - N Runtime
+	test.test_cohere()  # Passed v0.0.80 - N Runtime
+	test.test_dbrx()  # Passed  v0.0.80 - N Runtime
 	# test.test_deepseek_v2()  # Passed v0.0.80 - X Runtime
 	# test.test_exaone()  # Passed v0.0.80 - N Runtime
 	# test.test_falcon()  # Passed v0.0.80 - N Runtime
