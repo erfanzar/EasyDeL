@@ -20,7 +20,6 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, AsyncGenerator, Callable, Dict, Optional
 
-from calute import ChatMessage
 import uvicorn
 from fastapi import APIRouter, FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -33,6 +32,7 @@ from easydel.inference.vinference.api_models import (
 	ChatCompletionStreamResponse,
 	ChatCompletionStreamResponseChoice,
 	CountTokenRequest,
+	ChatMessage,
 	DeltaMessage,
 	UsageInfo,
 )
@@ -200,7 +200,7 @@ class vInferenceApiServer:
 			if response.generated_tokens == inference.generation_config.max_new_tokens
 			else "stop"
 		)
-		
+
 		return ChatCompletionResponse(
 			model=request.model,
 			choices=[
