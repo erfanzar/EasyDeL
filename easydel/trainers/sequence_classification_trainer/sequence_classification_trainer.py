@@ -16,7 +16,7 @@ import copy
 import os
 import time
 import typing
-from typing import Any, Callable, Mapping, Optional, Tuple, List, Dict
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import flax
 import jax
@@ -521,8 +521,6 @@ class SequenceClassificationTrainer(BaseTrainer):
 		pbar.set_description("evaluation process")
 		current_step = int(jax.device_get(sharded_state.step))
 		with self.mesh:
-			
-
 			for eval_metrics in self._eval_epoch(
 				sharded_state,
 				self.dataloader_eval,

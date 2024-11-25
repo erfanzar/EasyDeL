@@ -12,14 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import jax
-from typing import Literal, Dict, Any
+from typing import Any, Dict, Literal
 
+import jax
+import jax.tree_util as jtu
 from fjformer.sharding import with_sharding_constraint
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-
-import jax.tree_util as jtu
 
 
 def create_sequence_classification_model_train_step(

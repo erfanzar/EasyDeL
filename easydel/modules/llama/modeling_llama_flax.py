@@ -40,6 +40,8 @@ from easydel.modules.flax_modeling_utils import (
 # easydel.modules
 from easydel.modules.llama.llama_configuration import (
 	LlamaConfig as LlamaConfig,
+)
+from easydel.modules.llama.llama_configuration import (
 	VisionLlamaConfig,
 )
 from easydel.modules.modeling_flax_outputs import (
