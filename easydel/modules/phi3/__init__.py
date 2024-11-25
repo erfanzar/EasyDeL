@@ -14,8 +14,8 @@
 
 from easydel.modules.phi3.modelling_phi3_flax import (
 	FlaxPhi3ForCausalLM,
-	FlaxPhi3ForCausalLMModule,
 	FlaxPhi3Model,
-	FlaxPhi3Module,
 )
 from easydel.modules.phi3.phi3_configuration import Phi3Config
+
+__all__ = "FlaxPhi3ForCausalLM", "FlaxPhi3Model", "Phi3Config"

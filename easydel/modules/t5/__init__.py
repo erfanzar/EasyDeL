@@ -14,8 +14,8 @@
 
 from easydel.modules.t5.modelling_t5_flax import (
 	FlaxT5ForConditionalGeneration,
-	FlaxT5ForConditionalGenerationModule,
 	FlaxT5Model,
-	FlaxT5Module,
 )
 from easydel.modules.t5.t5_configuration import T5Config
+
+__all__ = "FlaxT5ForConditionalGeneration", "FlaxT5Model", "T5Config"

@@ -14,11 +14,16 @@
 
 from easydel.modules.mosaic_mpt.modelling_mpt_flax import (
 	FlaxMptForCausalLM,
-	FlaxMptForCausalLMModule,
 	FlaxMptModel,
-	FlaxMptModule,
 )
 from easydel.modules.mosaic_mpt.mosaic_configuration import (
 	MptAttentionConfig,
 	MptConfig,
+)
+
+__all__ = (
+	"FlaxMptForCausalLM",
+	"FlaxMptModel",
+	"MptAttentionConfig",
+	"MptConfig",
 )

@@ -14,8 +14,8 @@
 
 from easydel.modules.phimoe.modeling_phimoe_flax import (
 	FlaxPhiMoeForCausalLM,
-	FlaxPhiMoeForCausalLMModule,
 	FlaxPhiMoeModel,
-	FlaxPhiMoeModule,
 )
 from easydel.modules.phimoe.phimoe_configuration import PhiMoeConfig
+
+__all__ = "FlaxPhiMoeForCausalLM", "FlaxPhiMoeModel", "PhiMoeConfig"

@@ -14,10 +14,18 @@
 
 from easydel.modules.roberta.modelling_roberta_flax import (
 	FlaxRobertaForCausalLM,
-	FlaxRobertaForMaskedLMModule,
 	FlaxRobertaForMultipleChoice,
 	FlaxRobertaForQuestionAnswering,
 	FlaxRobertaForSequenceClassification,
 	FlaxRobertaForTokenClassification,
 )
 from easydel.modules.roberta.roberta_configuration import RobertaConfig
+
+__all__ = (
+	"FlaxRobertaForCausalLM",
+	"FlaxRobertaForMultipleChoice",
+	"FlaxRobertaForQuestionAnswering",
+	"FlaxRobertaForSequenceClassification",
+	"FlaxRobertaForTokenClassification",
+	"RobertaConfig",
+)

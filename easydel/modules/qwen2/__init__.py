@@ -13,11 +13,8 @@
 # limitations under the License.
 
 from easydel.modules.qwen2.modeling_qwen_flax import (
-	FlaxQwen2ForCausalLM,
-	FlaxQwen2ForCausalLMModule,
-	FlaxQwen2ForSequenceClassification,
-	FlaxQwen2ForSequenceClassificationModule,
-	FlaxQwen2Model,
-	FlaxQwen2Module,
+	FlaxQwen2ForCausalLM, 
+	FlaxQwen2ForSequenceClassification, 
+	FlaxQwen2Model, 
 )
 from easydel.modules.qwen2.qwen_configuration import Qwen2Config

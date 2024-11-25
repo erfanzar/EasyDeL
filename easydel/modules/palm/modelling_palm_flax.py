@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Mapping, Optional, Tuple, Union
+from typing import Optional, Union
 
 import chex
 import jax
@@ -21,14 +21,13 @@ import numpy as onp
 import transformers.modeling_flax_outputs
 from einops import rearrange
 from flax import linen as nn
-from flax.core import FrozenDict
 from jax import numpy as np
 
 from easydel.layers.norms import RMSNorm
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import get_gradient_checkpoint_policy
 from easydel.modules.modeling_flax_outputs import FlaxCausalLMOutput
-from easydel.modules.modeling_utils import EasyDeLBaseModule
+from easydel.modules.modeling_utils import wrap_easydel_module
 from easydel.modules.palm.palm_configuration import PalmConfig as PalmConfig
 
 
@@ -183,73 +182,14 @@ class ParallelCollection(nn.Module):
 		return hidden_state, saves
 
 
-class PalmPretrainedModel(EasyDeLBaseModule):
-	module_class: nn.Module
-	config_class = PalmConfig
-	dtype: jnp.dtype = jnp.bfloat16
-	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def __init__(self, config: PalmConfig, input_shape=(1, 1), _do_init=False):
-		module = self.module_class(
-			config=config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-		)
-		super().__init__(
-			config=config, input_shape=input_shape, _do_init=_do_init, module=module
-		)
-
-	def init_weights(
-		self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
-	) -> Union[Mapping[str, Any], FrozenDict]:
-		if params is None:
-			return self.module.init(
-				rngs=rng,
-				input_ids=jnp.ones(input_shape, dtype="i4"),
-				attention_mask=jnp.ones(input_shape, dtype="i4"),
-			)["params"]
-		else:
-			return params
-
-	def __call__(
-		self,
-		input_ids,
-		attention_mask=None,
-		params=None,
-		add_params_field: bool = False,
-		return_dict: bool = True,
-		output_attention: bool = False,
-	):
-		params = (
-			{"params": params or self.params} if add_params_field else params or self.params
-		)
-		predict = self.module.apply(
-			params,
-			input_ids=jnp.asarray(input_ids, dtype="i4"),
-			attention_mask=(
-				jnp.asarray(attention_mask, dtype="i4")
-				if attention_mask is not None
-				else attention_mask
-			),
-			return_dict=return_dict,
-			output_attention=output_attention,
-		)
-		return predict
-
-	def prepare_inputs_for_generation(
-		self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
-	):
-		return {
-			"attention_mask": attention_mask,
-		}
-
-	def update_inputs_for_generation(self, model_outputs, model_kwargs):
-		return model_kwargs
-
-
-class FlaxPalmModule(nn.Module):
+@register_module(
+	"base-module",
+	config=PalmConfig,
+	model_type="palm",
+	embedding_layer_names=["wte"],
+)
+@wrap_easydel_module(config_class=PalmConfig, base_model_prefix="path_way")
+class FlaxPalmModel(nn.Module):
 	config: PalmConfig
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
@@ -320,29 +260,20 @@ class FlaxPalmModule(nn.Module):
 
 
 @register_module(
-	"base-module",
+	"causal-language-model",
 	config=PalmConfig,
 	model_type="palm",
 	embedding_layer_names=["wte"],
 )
-class FlaxPalmModel(PalmPretrainedModel):
-	module_class = FlaxPalmModule
-
-	def get_input_embeddings(self):
-		return self.module.wte
-
-	def set_input_embeddings(self, value):
-		self.module.wte = value
-
-
-class FlaxPalmForCausalLMModule(nn.Module):
+@wrap_easydel_module(config_class=PalmConfig, base_model_prefix="path_way")
+class FlaxPalmForCausalLM(nn.Module):
 	config: PalmConfig
 	dtype: jnp.dtype = jnp.bfloat16
 	param_dtype: jnp.dtype = jnp.bfloat16
 	precision: Optional[Union[jax.lax.Precision, str]] = None
 
 	def setup(self) -> None:
-		self.path_way = FlaxPalmModule(
+		self.path_way = FlaxPalmModel.flax_module(
 			config=self.config,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
@@ -384,31 +315,3 @@ class FlaxPalmForCausalLMModule(nn.Module):
 				last_state,
 				out.hidden_states if output_attention else last_state,
 			)
-
-
-@register_module(
-	"causal-language-model",
-	config=PalmConfig,
-	model_type="palm",
-	embedding_layer_names=["wte"],
-)
-class FlaxPalmForCausalLM(PalmPretrainedModel):
-	module_class = FlaxPalmForCausalLMModule
-
-	def get_input_embeddings(self):
-		return self.module.path_way.wte
-
-	def get_decoder(self):
-		return self.module.path_way
-
-	def set_input_embeddings(self, value):
-		self.module.path_way.wte = value
-
-	def set_decoder(self, decoder):
-		self.module.path_way = decoder
-
-	def set_output_embeddings(self, new_embeddings):
-		self.module.lm_head = new_embeddings
-
-	def get_output_embeddings(self):
-		return self.module.lm_head

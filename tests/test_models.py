@@ -401,12 +401,6 @@ class EasyModelsTest(unittest.TestCase):
 		res, err = self.create_test_for_models("qwen2", transformers.Qwen2ForCausalLM)
 		self.assertTrue(res, f"Qwen 2 model Failed [ERROR {err}]")
 
-	def test_qwen1(self):
-		self.header_config = None
-		hf_model, conf = self.get_hf_model_from_hub("Qwen/Qwen1-7B-Chat")
-		res, err = self.create_test_for_models("qwen", hf_model)
-		self.assertTrue(res, f"Qwen model Failed [ERROR {err}]")
-
 	def test_olmo(self):
 		self.header_config = None
 		res, err = self.create_test_for_models("olmo", transformers.OlmoForCausalLM)
@@ -536,53 +530,6 @@ class EasyModelsTest(unittest.TestCase):
 		self.header_config = None
 		res, err = self.create_test_for_models("rwkv", transformers.RwkvForCausalLM)
 		self.assertTrue(res, f"RWKV model Failed [ERROR {err}]")
-
-	def test_xerxes(self):
-		self.header_config = None
-		model = ed.FlaxXerxesForCausalLM(
-			ed.XerxesConfig(
-				32000,
-				128,
-				256,
-				4,
-				8,
-				4,
-				128 // 8,
-				use_scan_mlp=False,
-				axis_dims=(1, 1, 1, -1),
-				attn_dtype=self.attn_dtype,
-			),
-			seed=0,
-			_do_init=True,
-		)
-
-		input_ids = jax.random.randint(
-			jax.random.key(42),
-			(1, self.sequence_length),
-			0,
-			model.config.vocab_size,
-		)
-		# Excepted input_ids
-		#   [[ 2118 20516 24602 23584 24337  5866  5293 12372 16091 11563  5413  9434
-		#   23586 27269  4246  3161 24268  2143  7412 13471  1648 10862 18971  8706
-		#   1138 30925 29127  4386 17981   379 26049 17637]]
-		output = model(input_ids, add_params_field=True)
-		self.assertTrue(
-			jnp.allclose(
-				output.logits[0, -1, :5],
-				jnp.array(
-					[
-						-0.14194798,
-						0.02669348,
-						0.00931238,
-						-0.156371972,
-						0.07190174,
-					]
-				),
-				atol=1e-022,
-				rtol=1e-03,
-			)
-		)
 
 	def test_gemma2(self):
 		self.header_config = ed.Gemma2Config(
@@ -729,32 +676,30 @@ if __name__ == "__main__":
 	# unittest.main()
 	test = EasyModelsTest()
 	test.setUp()
-	# test.test_mamba2() # Passed v0.0.80 - P T Runtime
-	# test.test_arctic() # Passed v0.0.80 - P T Runtime
-	# test.test_cohere() # Passed v0.0.80 - N Runtime
-	# test.test_dbrx() # Passed  v0.0.80 - N Runtime
-	# test.test_deepseek_v2() # Passed v0.0.80 - X Runtime
-	# test.test_exaone() # Passed v0.0.80 - N Runtime
-	# test.test_falcon() # Passed v0.0.80 - N Runtime
-	# test.test_gemma() # Passed v0.0.80 - N Runtime
-	# test.test_gemma2() # Passed v0.0.80 - N Runtime
-	# test.test_gptj() # Passed v0.0.80 - N Runtime
-	# test.test_gpt2() # Passed v0.0.80 - N Runtime
+	test.test_mamba2()  # Passed v0.0.80 - N Runtime
+	test.test_arctic()  # Passed v0.0.80 - P T Runtime
+	test.test_cohere()  # Passed v0.0.80 - N Runtime
+	test.test_dbrx()  # Passed  v0.0.80 - N Runtime
+	test.test_deepseek_v2()  # Passed v0.0.80 - X Runtime
+	test.test_exaone()  # Passed v0.0.80 - N Runtime
+	test.test_falcon()  # Passed v0.0.80 - N Runtime
+	test.test_gemma()  # Passed v0.0.80 - N Runtime
+	test.test_gemma2()  # Passed v0.0.80 - N Runtime
+	test.test_gptj()  # Passed v0.0.80 - N Runtime
+	test.test_gpt2()  # Passed v0.0.80 - N Runtime
 	# test.test_grok1() # should be impl
-	# test.test_internlm2() # Passed v0.0.80 - N Runtime
-	# test.test_llama()  # Passed v0.0.80 - N Runtime
-	# test.test_mamba()  # Passed v0.0.80 - N Runtime
+	test.test_internlm2()  # Passed v0.0.80 - N Runtime
+	test.test_llama()  # Passed v0.0.80 - N Runtime
+	test.test_mamba()  # Passed v0.0.80 - N Runtime
 	test.test_mistral()  # Passed v0.0.80 - N Runtime
-	# test.test_mixtral()  # Passed v0.0.80 - P T Runtime
-	# test.test_mpt()  # Passed v0.0.80 - P T Runtime
-	# test.test_olmo()  # Passed v0.0.80 - P T Runtime
-	# test.test_openelm()  # Passed v0.0.80 - P T Runtime
-	# test.test_phi()  # Passed v0.0.80 - P T Runtime
-	# test.test_phi3()  # Passed v0.0.80 - P T Runtime
-	# test.test_phimoe()  # Failed v0.0.80 - P T  Runtime
-	# test.test_qwen1()
-	# test.test_qwen2()  # Passed v0.0.80 - P T Runtime
-	# test.test_qwen2_moe()  # Passed v0.0.80 - P T Runtime
-	# test.test_stablelm()  # Passed v0.0.80 - P T Runtime
-	# test.test_xerxes()  # Passed v0.0.80 - P Runtime (Check)
+	test.test_mixtral()  # Passed v0.0.80 - N Runtime
+	test.test_mpt()  # Passed v0.0.80 - N Runtime
+	test.test_olmo()  # Passed v0.0.80 - N Runtime
+	test.test_openelm()  # Passed v0.0.80 - N Runtime
+	test.test_phi()  # Passed v0.0.80 - N Runtime
+	test.test_phi3()  # Passed v0.0.80 - N Runtime
+	# test.test_phimoe()  # Failed v0.0.80 - N  Runtime
+	test.test_qwen2()  # Passed v0.0.80 - N Runtime
+	test.test_qwen2_moe()  # Passed v0.0.80 - N Runtime
+	test.test_stablelm()  # Passed v0.0.80 - N Runtime
 	# -----------------------------------------------

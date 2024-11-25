@@ -394,7 +394,7 @@ class Phi3LongRoPEScaledRotaryEmbedding(flax.linen.Module):
 				f"`Phi3LongRoPEScaledRotaryEmbedding` does not support "
 				f"rotary_dim != head_size ({self.rotary_dim}!={self.head_size})."
 			)
-		if not is_neox_style:
+		if not self.is_neox_style:
 			raise ValueError("`Phi3LongRoPEScaledRotaryEmbedding` only supports neox_style.")
 
 		scale = self.max_position_embeddings / self.original_max_position_embeddings
@@ -406,12 +406,9 @@ class Phi3LongRoPEScaledRotaryEmbedding(flax.linen.Module):
 			)
 
 		if self.short_mscale is None:
-			short_mscale = scaling_factor
+			self.short_mscale = scaling_factor
 		if self.long_mscale is None:
-			long_mscale = scaling_factor
-
-		self.short_mscale = short_mscale
-		self.long_mscale = long_mscale
+			self.long_mscale = scaling_factor
 
 	def _compute_cos_sin_cache(
 		self,

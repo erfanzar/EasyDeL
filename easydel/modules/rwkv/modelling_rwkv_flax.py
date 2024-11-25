@@ -26,7 +26,7 @@ from jax import numpy as jnp
 
 from easydel.modules.factory import register_module
 from easydel.modules.modeling_flax_outputs import ModelOutput
-from easydel.modules.modeling_utils import EasyDeLBaseModule
+from easydel.modules.modeling_utils import EasyDeLBaseModule, wrap_custom_easydel_module
 from easydel.modules.rwkv.rwkv_configuration import RwkvConfig as RwkvConfig
 
 
@@ -447,184 +447,6 @@ class FlaxRwkvBlockCollection(nn.Module):
 		return hidden_states, all_hidden_states, all_self_attentions
 
 
-class FlaxRwkvModule(nn.Module):
-	config: RwkvConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = None
-
-	def setup(self):
-		config = self.config
-		self.embeddings = nn.Embed(
-			config.vocab_size,
-			config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-		)
-		self.blocks = FlaxRwkvBlockCollection(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-		)
-
-		self.ln_out = nn.LayerNorm(
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-		)
-
-	def __call__(
-		self,
-		input_ids: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
-		state: Optional[List[chex.Array]] = None,
-		deterministic: bool = True,
-		use_cache: Optional[bool] = None,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		return_dict: Optional[bool] = None,
-	) -> Union[Tuple, RwkvOutput]:
-		output_attentions = (
-			output_attentions
-			if output_attentions is not None
-			else self.config.output_attentions
-		)
-		output_hidden_states = (
-			output_hidden_states
-			if output_hidden_states is not None
-			else self.config.output_hidden_states
-		)
-		use_cache = (
-			use_cache
-			if use_cache is not None
-			else (self.config.use_cache if not deterministic else False)
-		)
-		return_dict = (
-			return_dict if return_dict is not None else self.config.use_return_dict
-		)
-
-		if input_ids is not None and input_embeds is not None:
-			raise ValueError(
-				"You cannot specify both input_ids and input_embeds at the same time"
-			)
-		elif input_ids is None and input_embeds is None:
-			raise ValueError("You have to specify either input_ids or input_embeds")
-
-		if input_embeds is None:
-			input_embeds = self.embeddings(input_ids)
-
-		if use_cache and state is None:
-			shape = (
-				input_embeds.shape[0],
-				self.config.hidden_size,
-				self.config.num_hidden_layers,
-			)
-			state = [
-				jnp.zeros(
-					*shape,
-					dtype=input_embeds.dtype if i <= 1 else jnp.float32,
-				)
-				for i in range(5)
-			]
-			state[4] -= 1e30
-
-		hidden_states = input_embeds
-
-		hidden_states, all_hidden_states, all_self_attentions = self.blocks(
-			hidden_states,
-			attention_mask,
-			state,
-			use_cache,
-			deterministic,
-			output_attentions,
-			output_hidden_states,
-			return_dict,
-		)
-
-		hidden_states = self.ln_out(hidden_states)
-
-		if output_hidden_states:
-			all_hidden_states = all_hidden_states + (hidden_states,)
-
-		if not return_dict:
-			return tuple(
-				x
-				for x in [hidden_states, state, all_hidden_states, all_self_attentions]
-				if x is not None
-			)
-
-		return RwkvOutput(
-			last_hidden_state=hidden_states,
-			state=state,
-			hidden_states=all_hidden_states,
-			attentions=all_self_attentions,
-		)
-
-
-class FlaxRwkvForCausalLMModule(nn.Module):
-	config: RwkvConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = None
-
-	def setup(self):
-		config = self.config
-		self.rwkv = FlaxRwkvModule(
-			config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-		)
-		self.head = Dense(
-			config.vocab_size,
-			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-		)
-
-	def __call__(
-		self,
-		input_ids: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
-		state: Optional[List[chex.Array]] = None,
-		deterministic: bool = True,
-		use_cache: Optional[bool] = None,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		return_dict: Optional[bool] = None,
-	) -> Union[Tuple, RwkvCausalLMOutput]:
-		return_dict = (
-			return_dict if return_dict is not None else self.config.use_return_dict
-		)
-
-		rwkv_outputs = self.rwkv(
-			input_ids,
-			input_embeds=input_embeds,
-			state=state,
-			use_cache=use_cache,
-			output_attentions=output_attentions,
-			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
-			deterministic=deterministic,
-		)
-		hidden_states = rwkv_outputs[0]
-
-		logits = self.head(hidden_states)
-
-		if not return_dict:
-			return (logits,) + rwkv_outputs[1:]
-
-		return RwkvCausalLMOutput(
-			logits=logits,
-			state=rwkv_outputs.state,
-			hidden_states=rwkv_outputs.hidden_states,
-			attentions=rwkv_outputs.attentions,
-		)
-
-
 class FlaxRwkvPretrainedModel(EasyDeLBaseModule):
 	module_class: nn.Module
 	config_class = RwkvConfig
@@ -776,8 +598,124 @@ class FlaxRwkvPretrainedModel(EasyDeLBaseModule):
 	layernorm_names=["ln_out", "ln2", "ln1", "pre_ln"],
 	rnn_based_or_rwkv=True,
 )
-class FlaxRwkvModel(FlaxRwkvPretrainedModel):
-	module_class = FlaxRwkvModule
+@wrap_custom_easydel_module(
+	base=FlaxRwkvPretrainedModel,
+	config_class=RwkvConfig,
+	base_model_prefix="rwkv",
+)
+class FlaxRwkvModel(nn.Module):
+	config: RwkvConfig
+	dtype: jnp.dtype = jnp.float32
+	param_dtype: jnp.dtype = jnp.float32
+	precision: Optional[Union[str, jax.lax.Precision]] = None
+
+	def setup(self):
+		config = self.config
+		self.embeddings = nn.Embed(
+			config.vocab_size,
+			config.hidden_size,
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+		)
+		self.blocks = FlaxRwkvBlockCollection(
+			config=self.config,
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+			precision=self.precision,
+		)
+
+		self.ln_out = nn.LayerNorm(
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+		)
+
+	def __call__(
+		self,
+		input_ids: Optional[chex.Array] = None,
+		attention_mask: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
+		state: Optional[List[chex.Array]] = None,
+		deterministic: bool = True,
+		use_cache: Optional[bool] = None,
+		output_attentions: Optional[bool] = None,
+		output_hidden_states: Optional[bool] = None,
+		return_dict: Optional[bool] = None,
+	) -> Union[Tuple, RwkvOutput]:
+		output_attentions = (
+			output_attentions
+			if output_attentions is not None
+			else self.config.output_attentions
+		)
+		output_hidden_states = (
+			output_hidden_states
+			if output_hidden_states is not None
+			else self.config.output_hidden_states
+		)
+		use_cache = (
+			use_cache
+			if use_cache is not None
+			else (self.config.use_cache if not deterministic else False)
+		)
+		return_dict = (
+			return_dict if return_dict is not None else self.config.use_return_dict
+		)
+
+		if input_ids is not None and input_embeds is not None:
+			raise ValueError(
+				"You cannot specify both input_ids and input_embeds at the same time"
+			)
+		elif input_ids is None and input_embeds is None:
+			raise ValueError("You have to specify either input_ids or input_embeds")
+
+		if input_embeds is None:
+			input_embeds = self.embeddings(input_ids)
+
+		if use_cache and state is None:
+			shape = (
+				input_embeds.shape[0],
+				self.config.hidden_size,
+				self.config.num_hidden_layers,
+			)
+			state = [
+				jnp.zeros(
+					*shape,
+					dtype=input_embeds.dtype if i <= 1 else jnp.float32,
+				)
+				for i in range(5)
+			]
+			state[4] -= 1e30
+
+		hidden_states = input_embeds
+
+		hidden_states, all_hidden_states, all_self_attentions = self.blocks(
+			hidden_states,
+			attention_mask,
+			state,
+			use_cache,
+			deterministic,
+			output_attentions,
+			output_hidden_states,
+			return_dict,
+		)
+
+		hidden_states = self.ln_out(hidden_states)
+
+		if output_hidden_states:
+			all_hidden_states = all_hidden_states + (hidden_states,)
+
+		if not return_dict:
+			return tuple(
+				x
+				for x in [hidden_states, state, all_hidden_states, all_self_attentions]
+				if x is not None
+			)
+
+		return RwkvOutput(
+			last_hidden_state=hidden_states,
+			state=state,
+			hidden_states=all_hidden_states,
+			attentions=all_self_attentions,
+		)
 
 
 @register_module(
@@ -788,5 +726,69 @@ class FlaxRwkvModel(FlaxRwkvPretrainedModel):
 	layernorm_names=["ln_out", "ln2", "ln1", "pre_ln"],
 	rnn_based_or_rwkv=True,
 )
-class FlaxRwkvForCausalLM(FlaxRwkvPretrainedModel):
-	module_class = FlaxRwkvForCausalLMModule
+@wrap_custom_easydel_module(
+	base=FlaxRwkvPretrainedModel,
+	config_class=RwkvConfig,
+	base_model_prefix="rwkv",
+)
+class FlaxRwkvForCausalLM(nn.Module):
+	config: RwkvConfig
+	dtype: jnp.dtype = jnp.float32
+	param_dtype: jnp.dtype = jnp.float32
+	precision: Optional[Union[str, jax.lax.Precision]] = None
+
+	def setup(self):
+		config = self.config
+		self.rwkv = FlaxRwkvModel.flax_module(
+			config,
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+			precision=self.precision,
+		)
+		self.head = Dense(
+			config.vocab_size,
+			use_bias=False,
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+			precision=self.precision,
+		)
+
+	def __call__(
+		self,
+		input_ids: Optional[chex.Array] = None,
+		attention_mask: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
+		state: Optional[List[chex.Array]] = None,
+		deterministic: bool = True,
+		use_cache: Optional[bool] = None,
+		output_attentions: Optional[bool] = None,
+		output_hidden_states: Optional[bool] = None,
+		return_dict: Optional[bool] = None,
+	) -> Union[Tuple, RwkvCausalLMOutput]:
+		return_dict = (
+			return_dict if return_dict is not None else self.config.use_return_dict
+		)
+
+		rwkv_outputs = self.rwkv(
+			input_ids,
+			input_embeds=input_embeds,
+			state=state,
+			use_cache=use_cache,
+			output_attentions=output_attentions,
+			output_hidden_states=output_hidden_states,
+			return_dict=return_dict,
+			deterministic=deterministic,
+		)
+		hidden_states = rwkv_outputs[0]
+
+		logits = self.head(hidden_states)
+
+		if not return_dict:
+			return (logits,) + rwkv_outputs[1:]
+
+		return RwkvCausalLMOutput(
+			logits=logits,
+			state=rwkv_outputs.state,
+			hidden_states=rwkv_outputs.hidden_states,
+			attentions=rwkv_outputs.attentions,
+		)

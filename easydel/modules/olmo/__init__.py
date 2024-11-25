@@ -14,8 +14,8 @@
 
 from easydel.modules.olmo.modelling_olmo_flax import (
 	FlaxOlmoForCausalLM,
-	FlaxOlmoForCausalLMModule,
 	FlaxOlmoModel,
-	FlaxOlmoModule,
 )
 from easydel.modules.olmo.olmo_configuration import OlmoConfig
+
+__all__ = "FlaxOlmoForCausalLM", "FlaxOlmoModel", "OlmoConfig"
