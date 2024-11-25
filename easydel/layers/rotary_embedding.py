@@ -107,6 +107,7 @@ class RotaryEmbedding(flax.linen.Module):
 		)
 		return jnp.cos(freqs), jnp.sin(freqs)
 
+	@flax.linen.jit
 	def __call__(
 		self,
 		positions: jnp.ndarray,
@@ -363,9 +364,8 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
 		freqs = jnp.einsum("i,j -> ij", t, inv_freq)
 		mscale = _yarn_get_mscale(self.scaling_factor) * self.attn_factor
 		cos = jnp.cos(freqs) * mscale
-		sin = jnp.sin(freqs) * mscale
-		cache = jnp.concatenate([cos, sin], axis=-1)
-		return cache
+		sin = jnp.sin(freqs) * mscale 
+		return cos, sin
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -432,6 +432,7 @@ class Phi3LongRoPEScaledRotaryEmbedding(flax.linen.Module):
 		cache = jnp.concatenate([cos, sin], axis=-1)
 		return cache
 
+	@flax.linen.jit
 	def __call__(
 		self,
 		positions: jnp.ndarray,
@@ -484,7 +485,7 @@ class DeepseekScalingRotaryEmbedding(flax.linen.Module):
 	mscale: float = 1
 	mscale_all_dim: float = 0
 
-	# @fjit
+	@flax.linen.jit
 	def __call__(
 		self,
 		positions: jnp.ndarray,
