@@ -19,24 +19,22 @@ from typing import Optional, Tuple, Union
 import chex
 import jax
 from flax import linen as nn
-from flax.linen import Dense, combine_masks
+from flax.linen import Dense
 from flax.linen import partitioning as nn_partitioning
-from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import get_logger
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import RMSNorm
+from easydel.layers.rotary_embedding import get_rope
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
-	apply_rotary_pos_emb,
 	block_wise_ffn,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
-	precompute_frequencies,
 	with_sharding_constraint,
 )
 from easydel.modules.mistral.mistral_configuration import (
@@ -79,21 +77,6 @@ def _make_sliding_window_causal_mask(
 			[jnp.zeros((tgt_len, past_key_values_length), dtype=dtype), mask], axis=-1
 		)
 	return mask[None, None, :, :].repeat(bsz, 0)
-
-
-class FlaxMistralRotaryEmbedding(nn.Module):
-	dtype: jnp.dtype = jnp.float32
-
-	def __call__(self, key, query, frequencies, position_ids):
-		sin, cos = frequencies
-
-		sin = sin[position_ids][:, None, :, :]
-		cos = cos[position_ids][:, None, :, :]
-
-		key = apply_rotary_pos_emb(key, sin, cos)
-		query = apply_rotary_pos_emb(query, sin, cos)
-
-		return query.astype(self.dtype), key.astype(self.dtype)
 
 
 class FlaxMistralMLP(nn.Module):
@@ -208,7 +191,6 @@ class FlaxMistralAttention(FlaxAttentionModule):
 			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
 		)
 
-		self.rotary = FlaxMistralRotaryEmbedding(self.dtype)
 		self.attention_performer = FlexibleAttentionModule(
 			attention_dropout=self.config.attention_dropout,
 			num_q_heads=self.config.num_attention_heads,
@@ -223,49 +205,23 @@ class FlaxMistralAttention(FlaxAttentionModule):
 			axis_name=self.config.attention_axis_name,
 			base_config=self.config,
 		)
+		initial_rope_kwargs = dict(rope_type="default")
+		if self.config.rope_scaling is not None:
+			scaling_type = self.config.rope_scaling["type"]
+			scaling_factor = self.config.rope_scaling["factor"]
+			initial_rope_kwargs = dict(scaling_factor=scaling_factor, rope_type=scaling_type)
 
-	def _merge_heads(self, hidden_states):
-		"""
-		Merges the attention heads into a single hidden state tensor.
-
-		Args:
-		    hidden_states (chex.Array): The hidden states with separate head dimensions.
-
-		Returns:
-		    chex.Array: The hidden states with merged head dimensions.
-		"""
-		return hidden_states.reshape(hidden_states.shape[:2] + (-1,))
-
-	def apply_rotary(self, query, key, frequencies, position_ids):
-		"""
-		Applies rotary positional embeddings to the query and key tensors.
-
-		Args:
-		    query (chex.Array): Query tensor.
-		    key (chex.Array): Key tensor.
-		    frequencies (Tuple[chex.Array, chex.Array]): Tuple containing cosine and sine components for rotary embeddings.
-		    position_ids (chex.Array): Position indices for the tokens.
-
-		Returns:
-		    Tuple[chex.Array, chex.Array]: The modified query and key tensors after applying rotary embeddings.
-		"""
-
-		query, key = self._transpose_sequence_head(
-			query,
-			key,
+		self.rotary = get_rope(
+			max_position=self.config.granted_freq_max_position_embedding,
+			rotary_dim=self.config.head_dim,
+			head_size=self.config.head_dim,
+			base=config.rope_theta,
+			rope_scaling=initial_rope_kwargs,
 		)
-		query, key = self.rotary(
-			position_ids=position_ids,
-			query=query,
-			key=key,
-			frequencies=frequencies,
-		)
-		return self._transpose_sequence_head(query, key)
 
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		frequencies: Tuple[chex.Array, chex.Array],
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
@@ -280,7 +236,6 @@ class FlaxMistralAttention(FlaxAttentionModule):
 
 		Args:
 		    hidden_states (chex.Array): Input hidden states.
-		    frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
 		    attention_mask (chex.Array): Mask to apply on the attention scores.
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
@@ -318,51 +273,32 @@ class FlaxMistralAttention(FlaxAttentionModule):
 			self.head_dim,
 		)
 
-		query_states, key_states = self.apply_rotary(
+		query_states, key_states = self.rotary(
 			query=query_states,
 			key=key_states,
-			position_ids=position_ids,
-			frequencies=frequencies,
+			positions=position_ids,
 		)
-
-		query_length, key_length = query_states.shape[1], key_states.shape[1]
-
-		if self.has_variable("cache", "cached_key"):
-			mask_shift = self.variables["cache"]["cache_index"]
-			max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
-			causal_mask = lax.dynamic_slice(
-				causal_mask,
-				(0, 0, mask_shift, 0),
-				(1, 1, query_length, max_decoder_length),
-			)
-		else:
-			causal_mask = causal_mask[:, :, :query_length, :key_length]
-
-		batch_size = hidden_states.shape[0]
-		causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
-		if attention_mask.ndim == 2:
-			attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-		attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
-		attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
 
 		dropout_rng = None
 
 		if not deterministic and self.config.attention_dropout > 0.0:
 			dropout_rng = self.make_rng("dropout")
-		if self.has_variable("cache", "cached_key") or init_cache:
-			key_states, value_states, attention_mask = self._concatenate_to_cache(
-				query_states,
-				key_states,
-				value_states,
-				attention_mask,
-			)
 
-		attention_bias = lax.select(
-			attention_mask > 0,
-			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-			jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+		(
+			query_states,
+			key_states,
+			value_states,
+			attention_mask,
+			attention_bias,
+		) = self.concatenate_to_cache(
+			init_cache=init_cache,
+			query=query_states,
+			key=key_states,
+			value=value_states,
+			attention_mask=attention_mask,
+			causal_mask=causal_mask,
+			fcm_mask=fcm_mask,
 		)
-
 		query_length, key_length = query_states.shape[1], key_states.shape[1]
 
 		attentions = self.attention_performer(
@@ -454,7 +390,6 @@ class FlaxMistralDecoderLayer(nn.Module):
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		frequencies: Tuple[chex.Array, chex.Array],
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
@@ -469,7 +404,6 @@ class FlaxMistralDecoderLayer(nn.Module):
 
 		Args:
 		    hidden_states (chex.Array): Input hidden states.
-		    frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
 		    attention_mask (chex.Array): Mask to apply on the attention scores.
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
@@ -485,7 +419,6 @@ class FlaxMistralDecoderLayer(nn.Module):
 		residual = hidden_states
 		attention_output = self.self_attn(
 			self.input_layernorm(hidden_states),
-			frequencies,
 			attention_mask,
 			position_ids,
 			causal_mask,
@@ -550,7 +483,6 @@ class FlaxMistralDecoratorCollection(nn.Module):
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		frequencies: Tuple[chex.Array, chex.Array],
 		attention_mask: chex.Array,
 		causal_mask: chex.Array,
 		position_ids: chex.Array,
@@ -565,7 +497,6 @@ class FlaxMistralDecoratorCollection(nn.Module):
 
 		Args:
 		    hidden_states (chex.Array): Input tensor containing the hidden states.
-		    frequencies (Tuple[chex.Array, chex.Array]): Frequency positional encodings.
 		    attention_mask (chex.Array): Mask to apply during attention.
 		    causal_mask (chex.Array): Causal mask for autoregressive decoding.
 		    position_ids (chex.Array): Positional indices for the sequence.
@@ -609,7 +540,6 @@ class FlaxMistralDecoratorCollection(nn.Module):
 
 			output = layer(
 				hidden_states=hidden_states,
-				frequencies=frequencies,
 				attention_mask=attention_mask,
 				position_ids=position_ids,
 				causal_mask=causal_mask,
@@ -672,19 +602,6 @@ class FlaxMistralModel(nn.Module):
 			param_dtype=self.param_dtype,
 		)
 
-		initial_rope_kwargs = dict(rope_type="none")
-		if self.config.rope_scaling is not None:
-			scaling_type = self.config.rope_scaling["type"]
-			scaling_factor = self.config.rope_scaling["factor"]
-			initial_rope_kwargs = dict(scaling_factor=scaling_factor, rope_type=scaling_type)
-		config = self.config
-
-		self.frequencies = precompute_frequencies(
-			max_position_embeddings=self.config.granted_freq_max_position_embedding,
-			dim=self.config.head_dim,
-			base=config.rope_theta,
-			**initial_rope_kwargs,
-		)
 		self.causal_mask = nn.make_causal_mask(
 			jnp.ones(
 				shape=(1, self.config.granted_mask_max_position_embedding),
@@ -738,7 +655,6 @@ class FlaxMistralModel(nn.Module):
 
 		outputs = self.layers(
 			hidden_states=input_embeds,
-			frequencies=self.frequencies,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			causal_mask=self.causal_mask,
@@ -951,25 +867,6 @@ class FlaxVisionMistralModel(nn.Module):
 			dtype="bool",
 		)
 
-		initial_rope_kwargs = dict(rope_type="none")
-		if config.rope_scaling is not None:
-			scaling_type = config.rope_scaling["type"]
-			scaling_factor = config.rope_scaling["factor"]
-			initial_rope_kwargs = dict(scaling_factor=scaling_factor, rope_type=scaling_type)
-
-		self.frequencies = precompute_frequencies(
-			max_position_embeddings=(
-				getattr(
-					config,
-					"freq_max_position_embeddings",
-					config.max_position_embeddings,
-				)
-			),
-			dim=self.config.head_dim,
-			base=config.rope_theta,
-			**initial_rope_kwargs,
-		)
-
 	def __call__(
 		self,
 		input_ids,
@@ -1012,7 +909,6 @@ class FlaxVisionMistralModel(nn.Module):
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			causal_mask=self.causal_mask,
-			frequencies=self.frequencies,
 		)
 
 		hidden_states = self.norm(hidden_states)

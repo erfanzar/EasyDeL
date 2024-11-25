@@ -22,49 +22,30 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
-from flax.linen import Dense, combine_masks, make_causal_mask
+from flax.linen import Dense, make_causal_mask
 from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
-from jax import lax
-from jax.sharding import PartitionSpec
 
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import RMSNorm as RMSNorm
 
 # easydel.modules
+from easydel.layers.rotary_embedding import get_rope
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
-	apply_rotary_pos_emb,
 	block_wise_ffn,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
-	precompute_frequencies,
-	with_sharding_constraint,
 )
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 	FlaxSequenceClassifierOutput,
 )
-from easydel.modules.modeling_utils import EasyDeLBaseModule
+from easydel.modules.modeling_utils import EasyDeLBaseModule, wrap_easydel_module
 from easydel.modules.qwen2.kernels import qwen2_mlp_pallas
 from easydel.modules.qwen2.qwen_configuration import Qwen2Config as Qwen2Config
-
-
-class FlaxQwen2Embedding(nn.Module):
-	dtype: jnp.dtype = jnp.float32
-
-	def __call__(self, query, key, frequencies, position_ids):
-		sin, cos = frequencies
-
-		sin = sin[position_ids][:, None, :, :]
-		cos = cos[position_ids][:, None, :, :]
-
-		key = apply_rotary_pos_emb(key, sin, cos)
-		query = apply_rotary_pos_emb(query, sin, cos)
-
-		return query.astype(self.dtype), key.astype(self.dtype)
 
 
 class FlaxQwen2MLP(nn.Module):
@@ -219,7 +200,6 @@ class FlaxQwen2Attention(FlaxAttentionModule):
 			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
 		)
 
-		self.rotary = FlaxQwen2Embedding(self.dtype)
 		self.attention_performer = FlexibleAttentionModule(
 			num_q_heads=self.config.num_attention_heads,
 			num_kv_heads=self.config.num_key_value_heads,
@@ -236,49 +216,23 @@ class FlaxQwen2Attention(FlaxAttentionModule):
 			base_config=self.config,
 		)
 		self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
-
-	def _merge_heads(self, hidden_states):
-		"""
-		Merges the attention heads into a single hidden state tensor.
-
-		Args:
-		    hidden_states (chex.Array): The hidden states with separate head dimensions.
-
-		Returns:
-		    chex.Array: The hidden states with merged head dimensions.
-		"""
-		return hidden_states.reshape(hidden_states.shape[:2] + (-1,))
-
-	def apply_rotary(self, query, key, frequencies, position_ids):
-		"""
-		Applies rotary positional embeddings to the query and key tensors.
-
-		Args:
-		    query (chex.Array): Query tensor.
-		    key (chex.Array): Key tensor.
-		    frequencies (Tuple[chex.Array, chex.Array]): Tuple containing cosine and sine components for rotary embeddings.
-		    position_ids (chex.Array): Position indices for the tokens.
-
-		Returns:
-		    Tuple[chex.Array, chex.Array]: The modified query and key tensors after applying rotary embeddings.
-		"""
-
-		query, key = self._transpose_sequence_head(
-			query,
-			key,
+		initial_rope_kwargs = dict(rope_type="default")
+		if config.rope_scaling is not None:
+			scaling_type = config.rope_scaling["type"]
+			scaling_factor = config.rope_scaling["factor"]
+			initial_rope_kwargs = dict(scaling_factor=scaling_factor, rope_type=scaling_type)
+		self.rotary = get_rope(
+			max_position=self.config.granted_freq_max_position_embedding,
+			head_size=config.hidden_size // config.num_attention_heads,
+			rotary_dim=config.hidden_size // config.num_attention_heads,
+			base=config.rope_theta,
+			rope_scaling=initial_rope_kwargs,
+			dtype=self.dtype,
 		)
-		query, key = self.rotary(
-			position_ids=position_ids,
-			query=query,
-			key=key,
-			frequencies=frequencies,
-		)
-		return self._transpose_sequence_head(query, key)
 
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		frequencies: Tuple[chex.Array, chex.Array],
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
@@ -293,7 +247,6 @@ class FlaxQwen2Attention(FlaxAttentionModule):
 
 		Args:
 		    hidden_states (chex.Array): Input hidden states.
-		    frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
 		    attention_mask (chex.Array): Mask to apply on the attention scores.
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
@@ -331,50 +284,30 @@ class FlaxQwen2Attention(FlaxAttentionModule):
 			self.head_dim,
 		)
 
-		query_states, key_states = self.apply_rotary(
+		query_states, key_states = self.rotary(
 			query=query_states,
 			key=key_states,
-			position_ids=position_ids,
-			frequencies=frequencies,
+			positions=position_ids,
 		)
-
-		query_length, key_length = query_states.shape[1], key_states.shape[1]
-
-		if self.has_variable("cache", "cached_key"):
-			mask_shift = self.variables["cache"]["cache_index"]
-			max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
-			causal_mask = lax.dynamic_slice(
-				causal_mask,
-				(0, 0, mask_shift, 0),
-				(1, 1, query_length, max_decoder_length),
-			)
-		else:
-			causal_mask = causal_mask[:, :, :query_length, :key_length]
-
-		batch_size = hidden_states.shape[0]
-		if attention_mask.ndim == 2:
-			attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-		causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
-		attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
-		attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
-
 		dropout_rng = None
 
 		if not deterministic and self.config.attention_dropout > 0.0:
 			dropout_rng = self.make_rng("dropout")
 
-		if self.has_variable("cache", "cached_key") or init_cache:
-			key_states, value_states, attention_mask = self._concatenate_to_cache(
-				query_states,
-				key_states,
-				value_states,
-				attention_mask,
-			)
-
-		attention_bias = lax.select(
-			attention_mask > 0,
-			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-			jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+		(
+			query_states,
+			key_states,
+			value_states,
+			attention_mask,
+			attention_bias,
+		) = self.concatenate_to_cache(
+			init_cache=init_cache,
+			query=query_states,
+			key=key_states,
+			value=value_states,
+			attention_mask=attention_mask,
+			causal_mask=causal_mask,
+			fcm_mask=fcm_mask,
 		)
 		query_length, key_length = query_states.shape[1], key_states.shape[1]
 
@@ -394,20 +327,9 @@ class FlaxQwen2Attention(FlaxAttentionModule):
 			causal_mask=causal_mask,
 		)
 
-		attn_output = self._merge_heads(attentions.attention_outputs)
-		if self.config.shard_attention_computation:
-			attn_output = with_sharding_constraint(
-				attn_output,
-				PartitionSpec(
-					self.config.partition_axis.batch_axis,
-					(
-						self.config.partition_axis.sequence_axis
-						if attn_output.shape[1] != 1
-						else None
-					),
-					self.config.partition_axis.hidden_state_axis,
-				),
-			)
+		attn_output = self.shard_attention_prod(
+			self._merge_heads(attentions.attention_outputs)
+		)
 		attn_output = self.o_proj(attn_output)
 
 		attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
@@ -471,7 +393,6 @@ class FlaxQwen2Block(nn.Module):
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		frequencies: Tuple[chex.Array, chex.Array],
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
@@ -486,7 +407,6 @@ class FlaxQwen2Block(nn.Module):
 
 		Args:
 		    hidden_states (chex.Array): Input hidden states.
-		    frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
 		    attention_mask (chex.Array): Mask to apply on the attention scores.
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
@@ -500,7 +420,6 @@ class FlaxQwen2Block(nn.Module):
 		"""
 		attn_outputs = self.self_attn(
 			self.input_layernorm(hidden_states),
-			frequencies,
 			attention_mask,
 			position_ids,
 			causal_mask,
@@ -801,7 +720,6 @@ class FlaxQwen2BlockCollection(nn.Module):
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		frequencies: Tuple[chex.Array, chex.Array],
 		attention_mask: chex.Array,
 		causal_mask: chex.Array,
 		position_ids: chex.Array,
@@ -816,7 +734,6 @@ class FlaxQwen2BlockCollection(nn.Module):
 
 		Args:
 		    hidden_states (chex.Array): Input tensor containing the hidden states.
-		    frequencies (Tuple[chex.Array, chex.Array]): Frequency positional encodings.
 		    attention_mask (chex.Array): Mask to apply during attention.
 		    causal_mask (chex.Array): Causal mask for autoregressive decoding.
 		    position_ids (chex.Array): Positional indices for the sequence.
@@ -860,7 +777,6 @@ class FlaxQwen2BlockCollection(nn.Module):
 
 			output = layer(
 				hidden_states=hidden_states,
-				frequencies=frequencies,
 				attention_mask=attention_mask,
 				position_ids=position_ids,
 				causal_mask=causal_mask,
@@ -878,7 +794,14 @@ class FlaxQwen2BlockCollection(nn.Module):
 		return hidden_states, all_hidden_states, all_attentions
 
 
-class FlaxQwen2Module(nn.Module):
+@register_module(
+	"base-module",
+	config=Qwen2Config,
+	model_type="qwen2",
+	embedding_layer_names=["embed_tokens"],
+)
+@wrap_easydel_module(config_class=Qwen2Config, base_model_prefix="model")
+class FlaxQwen2Model(nn.Module):
 	"""
 	Core module of the Qwen2 model, including embedding, decoder layers, and normalization.
 
@@ -915,25 +838,12 @@ class FlaxQwen2Module(nn.Module):
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 		)
-		config = self.config
 		self.causal_mask = make_causal_mask(
 			jnp.ones(
 				shape=(1, self.config.granted_mask_max_position_embedding),
 				dtype="bool",
 			),
 			dtype="bool",
-		)
-
-		initial_rope_kwargs = dict(rope_type="none")
-		if config.rope_scaling is not None:
-			scaling_type = config.rope_scaling["type"]
-			scaling_factor = config.rope_scaling["factor"]
-			initial_rope_kwargs = dict(scaling_factor=scaling_factor, rope_type=scaling_type)
-		self.frequencies = precompute_frequencies(
-			max_position_embeddings=self.config.granted_freq_max_position_embedding,
-			dim=config.hidden_size // config.num_attention_heads,
-			base=config.rope_theta,
-			**initial_rope_kwargs,
 		)
 
 	def __call__(
@@ -981,7 +891,6 @@ class FlaxQwen2Module(nn.Module):
 
 		outputs = self.layers(
 			hidden_states=self.dropout(input_embeds, deterministic=deterministic),
-			frequencies=self.frequencies,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			causal_mask=self.causal_mask,
@@ -1012,22 +921,13 @@ class FlaxQwen2Module(nn.Module):
 
 
 @register_module(
-	"base-module",
+	"causal-language-model",
 	config=Qwen2Config,
 	model_type="qwen2",
 	embedding_layer_names=["embed_tokens"],
 )
-class FlaxQwen2Model(FlaxQwen2PreTrainedModel):
-	module_class = FlaxQwen2Module
-
-	def set_input_embeddings(self, value):
-		self.module.embed_tokens = value
-
-	def get_input_embeddings(self):
-		return self.module.embed_tokens
-
-
-class FlaxQwen2ForCausalLMModule(nn.Module):
+@wrap_easydel_module(config_class=Qwen2Config, base_model_prefix="model")
+class FlaxQwen2ForCausalLM(nn.Module):
 	"""
 	Qwen2 model for causal language modeling, including the language model head.
 
@@ -1044,7 +944,7 @@ class FlaxQwen2ForCausalLMModule(nn.Module):
 	precision: Optional[Union[jax.lax.Precision, str]] = None
 
 	def setup(self):
-		self.model = FlaxQwen2Module(
+		self.model = FlaxQwen2Model.flax_module(
 			self.config,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
@@ -1140,77 +1040,13 @@ class FlaxQwen2ForCausalLMModule(nn.Module):
 
 
 @register_module(
-	"causal-language-model",
+	"sequence-classification",
 	config=Qwen2Config,
 	model_type="qwen2",
 	embedding_layer_names=["embed_tokens"],
 )
-class FlaxQwen2ForCausalLM(FlaxQwen2PreTrainedModel):
-	module_class = FlaxQwen2ForCausalLMModule
-
-	def set_input_embeddings(self, value):
-		self.module.model.embed_tokens = value
-
-	def get_input_embeddings(self):
-		return self.module.model.embed_tokens
-
-	def set_decoder(self, decoder):
-		self.module.model = decoder
-
-	def get_decoder(self):
-		return self.module.model
-
-	def get_output_embeddings(self):
-		return self.module.lm_head
-
-	def set_output_embeddings(self, new_embeddings):
-		self.module.lm_head = new_embeddings
-
-	def prepare_inputs_for_generation(
-		self,
-		input_ids,
-		max_length,
-		attention_mask: Optional[chex.Array] = None,
-	):
-		"""
-		The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
-
-		Args:
-		    self: Access variables that belong to the class
-		    input_ids: Pass in the input tokens
-		    max_length: Set the length of the sequence to be generated
-		    attention_mask: Optional[chex.Array]: Mask the attention weights
-
-		Returns:
-		    A dictionary of the past_key_values, attention_mask and position ids
-		"""
-		batch_size, seq_length = input_ids.shape
-
-		past_key_values = self.init_cache(batch_size, max_length)
-		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
-		if attention_mask is not None:
-			position_ids = attention_mask.cumsum(axis=-1) - 1
-			extended_attention_mask = lax.dynamic_update_slice(
-				extended_attention_mask, attention_mask, (0, 0)
-			)
-		else:
-			position_ids = jnp.broadcast_to(
-				jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length)
-			)
-
-		return {
-			"past_key_values": past_key_values,
-			"attention_mask": extended_attention_mask,
-			"position_ids": position_ids,
-		}
-
-	def update_inputs_for_generation(self, model_outputs, model_kwargs):
-		model_kwargs["past_key_values"] = model_outputs.past_key_values
-		model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
-		return model_kwargs
-
-
-class FlaxQwen2ForSequenceClassificationModule(nn.Module):
+@wrap_easydel_module(config_class=Qwen2Config, base_model_prefix="model")
+class FlaxQwen2ForSequenceClassification(nn.Module):
 	num_classes: int
 	config: Qwen2Config
 	dtype: jnp.dtype = jnp.float32
@@ -1227,7 +1063,12 @@ class FlaxQwen2ForSequenceClassificationModule(nn.Module):
 		Returns:
 		    A tuple of the model and the classifier
 		"""
-		self.model = FlaxQwen2Module(self.config, dtype=self.dtype)
+		self.model = FlaxQwen2Model.flax_module(
+			self.config,
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+			precision=self.precision,
+		)
 		self.classifier = Dense(
 			self.num_classes,
 			dtype=self.dtype,
@@ -1301,13 +1142,3 @@ class FlaxQwen2ForSequenceClassificationModule(nn.Module):
 			)
 		else:
 			return (prediction,)
-
-
-@register_module(
-	"sequence-classification",
-	config=Qwen2Config,
-	model_type="qwen2",
-	embedding_layer_names=["embed_tokens"],
-)
-class FlaxQwen2ForSequenceClassification(FlaxQwen2PreTrainedModel):
-	module_class = FlaxQwen2ForSequenceClassificationModule

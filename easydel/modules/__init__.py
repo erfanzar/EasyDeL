@@ -161,12 +161,6 @@ from easydel.modules.phimoe import (
 	FlaxPhiMoeModel,
 	PhiMoeConfig,
 )
-from easydel.modules.qwen1 import (
-	FlaxQwen1ForCausalLM,
-	FlaxQwen1ForSequenceClassification,
-	FlaxQwen1Model,
-	Qwen1Config,
-)
 from easydel.modules.qwen2 import (
 	FlaxQwen2ForCausalLM,
 	FlaxQwen2ForSequenceClassification,

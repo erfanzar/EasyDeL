@@ -17,11 +17,9 @@ from functools import partial
 from typing import Optional, Tuple, Union
 
 import chex
-import flax
 import jax
 from einops import rearrange
 from flax import linen as nn
-from flax.core import FrozenDict
 from flax.linen import Dense, combine_masks
 from flax.linen.partitioning import remat
 from jax import lax
@@ -38,8 +36,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import EasyDeLBaseModule
-from easydel.modules.mosaic_mpt.kernels import mpt_mlp_pallas
+from easydel.modules.modeling_utils import wrap_easydel_module
 from easydel.modules.mosaic_mpt.mosaic_configuration import (
 	MptConfig as MptConfig,
 )
@@ -72,30 +69,10 @@ class FlaxMptMLP(nn.Module):
 		deterministic: bool = False,
 	):
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-		if (
-			self.config.hardware_abstraction
-			and self.up_proj.variables.get("params", None) is not None
-		):
-			hidden_states = jax.vmap(
-				partial(
-					mpt_mlp_pallas,
-					act_fn=jax.nn.gelu,
-					blocksize_k=self.config.pallas_k_block_size,
-					blocksize_m=self.config.pallas_m_block_size,
-					blocksize_n=self.config.pallas_n_block_size,
-					prod_dtype=self.dtype,
-					precision=self.precision,
-				),
-				in_axes=(0, None, None),
-			)(
-				hidden_states,
-				self.up_proj.variables["params"]["kernel"],
-				self.down_proj.variables["params"]["kernel"],
-			)
-		else:
-			hidden_states = self.down_proj(
-				jax.nn.gelu(self.up_proj(hidden_states), approximate=False)
-			)
+
+		hidden_states = self.down_proj(
+			jax.nn.gelu(self.up_proj(hidden_states), approximate=False)
+		)
 
 		return self.hidden_dropout(hidden_states, deterministic=deterministic) + residual
 
@@ -261,7 +238,11 @@ class FlaxMptAttention(FlaxAttentionModule):
 			causal=False,
 		)
 
-		attn_output = self.out_proj(attention.attention_outputs.reshape(inp_shape))
+		attn_output = self.out_proj(
+			self.shard_attention_prod(
+				attention.attention_outputs.reshape(inp_shape),
+			)
+		)
 
 		return (
 			(attn_output, attention.attention_weights)
@@ -494,7 +475,15 @@ def build_mpt_alibi_tensor(num_heads, sequence_length, alibi_bias_max=8):
 	return alibi
 
 
-class FlaxMptModule(nn.Module):
+@register_module(
+	"base-module",
+	config=MptConfig,
+	model_type="mpt",
+	embedding_layer_names=["wte"],
+	layernorm_names=["norm_1", "norm_2", "norm_f"],
+)
+@wrap_easydel_module(config_class=MptConfig, base_model_prefix="transformer")
+class FlaxMptModel(nn.Module):
 	config: MptConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
@@ -582,205 +571,22 @@ class FlaxMptModule(nn.Module):
 		return (hidden_states, all_hidden_states, all_attentions)
 
 
-class FlaxMptPretrainedModel(EasyDeLBaseModule):
-	module_class: nn.Module = None
-	config_class: MptConfig = MptConfig
-
-	def __init__(
-		self,
-		config: MptConfig,
-		dtype: jnp.dtype = jnp.bfloat16,
-		param_dtype: jnp.dtype = jnp.bfloat16,
-		precision: Optional[jax.lax.Precision] = None,
-		input_shape: Tuple[int, int] = (1, 1),
-		seed: int = 0,
-		_do_init: bool = False,
-		**kwargs,
-	):
-		"""
-		Initializes the pre-trained model with the given configuration.
-
-		Args:
-		    config (MptConfig): Configuration for the model.
-		    dtype (jnp.dtype): Data type for computations.
-		    param_dtype (jnp.dtype): Data type for model parameters.
-		    precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
-		    input_shape (Tuple[int, int]): Shape of the input tensor.
-		    seed (int): Seed for random number generation.
-		    _do_init (bool): If True, initialize model weights.
-		    **kwargs: Additional keyword arguments.
-		"""
-		module = self.module_class(
-			config=config,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			precision=precision,
-			**kwargs,
-		)
-		super().__init__(
-			dtype=dtype,
-			_do_init=_do_init,
-			module=module,
-			config=config,
-			input_shape=input_shape,
-			seed=seed,
-		)
-
-	def init_cache(self, batch_size, max_length):
-		def init_fn():
-			input_ids = jnp.ones((batch_size, max_length), dtype=jnp.int32)
-			attention_mask = jnp.ones_like(input_ids)
-
-			init_variables = self.module.init(
-				jax.random.PRNGKey(0),
-				input_ids=input_ids,
-				attention_mask=attention_mask,
-				return_dict=False,
-				init_cache=True,
-			)
-			return init_variables["cache"]
-
-		return jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), jax.eval_shape(init_fn))
-
-	def init_weights(
-		self,
-		rng: jax.random.PRNGKey,
-		input_shape: Tuple,
-		params: Optional[FrozenDict] = None,
-	) -> FrozenDict:
-		input_ids = jnp.ones(input_shape, dtype="i4")
-		if params is None:
-			return self.module.init(
-				rngs=rng,
-				input_ids=input_ids,
-				attention_mask=jnp.ones(input_shape, dtype="i4"),
-				init_cache=False,
-			)["params"]
-		else:
-			return params
-
-	def __call__(
-		self,
-		input_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		params: dict = None,
-		past_key_values: Optional[dict] = None,
-		dropout_rng: jax.random.PRNGKey = None,
-		train: bool = False,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		return_dict: Optional[bool] = None,
-		add_params_field: bool = False,
-		**kwargs,
-	):
-		"""
-		Forward pass through the model.
-
-		Args:
-		    input_ids (chex.Array): Input tensor containing token IDs.
-		    input_embeds (Optional[chex.Array]): embedding inputs to be used instead of input_ids.
-		    attention_mask (Optional[chex.Array]): Mask for attention.
-		    segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
-		    params (dict, optional): Parameters for the model.
-		    past_key_values (dict, optional): Past key and value states for caching.
-		    dropout_rng (jax.random.PRNGKey, optional): RNG key for dropout.
-		    train (bool): If True, the model is in training mode.
-		    output_attentions (Optional[bool]): If True, output attention weights.
-		    output_hidden_states (Optional[bool]): If True, output hidden states.
-		    return_dict (Optional[bool]): If True, return a dictionary of outputs.
-		    add_params_field (bool): If True, include the parameters in the input dictionary.
-		    **kwargs: Additional arguments.
-
-		Returns:
-		    Output type depends on the model configuration.
-		"""
-		output_attentions = (
-			output_attentions
-			if output_attentions is not None
-			else self.config.output_attentions
-		)
-		output_hidden_states = (
-			output_hidden_states
-			if output_hidden_states is not None
-			else self.config.output_hidden_states
-		)
-		return_dict = return_dict if return_dict is not None else self.config.return_dict
-		batch_size, sequence_length = (
-			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
-		)
-
-		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, sequence_length))
-
-		rng_s = {}
-		if dropout_rng is not None:
-			rng_s["dropout"] = dropout_rng
-
-		inputs = (
-			{"params": params or self.params} if add_params_field else params or self.params
-		)
-
-		if self.config.bits is not None:
-			rng_s["params"] = jax.random.key(0)
-		if past_key_values is not None:
-			inputs["cache"] = past_key_values
-			mutable = ["cache"]
-		else:
-			mutable = False
-
-		predict = self.module.apply(
-			params,
-			input_ids=input_ids,
-			attention_mask=attention_mask,
-			input_embeds=input_embeds,
-			init_cache=False,
-			deterministic=not train,
-			output_attentions=output_attentions,
-			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
-			segment_ids=segment_ids,
-			mutable=mutable,
-			rngs=rng_s,
-		)
-		if past_key_values is not None and return_dict:
-			predict, past_key_values = predict
-			predict["past_key_values"] = flax.core.unfreeze(past_key_values["cache"])
-			return predict
-		elif past_key_values is not None and not return_dict:
-			predict, past_key_values = predict
-			predict = (
-				predict[:1] + (flax.core.unfreeze(past_key_values["cache"]),) + predict[1:]
-			)
-		return predict
-
-
 @register_module(
-	"base-module",
+	"causal-language-model",
 	config=MptConfig,
 	model_type="mpt",
 	embedding_layer_names=["wte"],
 	layernorm_names=["norm_1", "norm_2", "norm_f"],
 )
-class FlaxMptModel(FlaxMptPretrainedModel):
-	module_class = FlaxMptModule
-
-	def get_input_embeddings(self):
-		return self.module.wte
-
-	def set_input_embeddings(self, value):
-		self.module.wte = value
-
-
-class FlaxMptForCausalLMModule(nn.Module):
+@wrap_easydel_module(config_class=MptConfig, base_model_prefix="transformer")
+class FlaxMptForCausalLM(nn.Module):
 	config: MptConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
 	precision: Optional[Union[jax.lax.Precision, str]] = None
 
 	def setup(self) -> None:
-		self.transformer = FlaxMptModule(
+		self.transformer = FlaxMptModel.flax_module(
 			config=self.config,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
@@ -853,52 +659,3 @@ class FlaxMptForCausalLMModule(nn.Module):
 		if return_dict:
 			return FlaxCausalLMOutput(logits=logits, hidden_states=predict.hidden_states)
 		return logits, predict.hidden_states if output_hidden_states else (logits,)
-
-
-@register_module(
-	"causal-language-model",
-	config=MptConfig,
-	model_type="mpt",
-	embedding_layer_names=["wte"],
-	layernorm_names=["norm_1", "norm_2", "norm_f"],
-)
-class FlaxMptForCausalLM(FlaxMptPretrainedModel):
-	module_class = FlaxMptForCausalLMModule
-
-	def get_input_embeddings(self):
-		return self.module.transformer.wte
-
-	def get_decoder(self):
-		return self.module.transformer
-
-	def set_input_embeddings(self, value):
-		self.module.transformer.wte = value
-
-	def set_decoder(self, decoder):
-		self.module.transformer = decoder
-
-	def set_output_embeddings(self, new_embeddings):
-		self.module.lm_head = new_embeddings
-
-	def get_output_embeddings(self):
-		return self.module.lm_head
-
-	def prepare_inputs_for_generation(
-		self, input_ids, max_length, attention_mask: Optional[chex.Array] = None
-	):
-		batch_size, seq_length = input_ids.shape
-		past_key_values = self.init_cache(batch_size, max_length)
-		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
-		if attention_mask is not None:
-			extended_attention_mask = jax.lax.dynamic_update_slice(
-				extended_attention_mask, attention_mask, (0, 0)
-			)
-
-		return {
-			"past_key_values": past_key_values,
-			"attention_mask": extended_attention_mask,
-		}
-
-	def update_inputs_for_generation(self, model_outputs, model_kwargs):
-		model_kwargs["past_key_values"] = model_outputs.past_key_values
-		return model_kwargs

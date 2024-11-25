@@ -14,8 +14,8 @@
 
 from easydel.modules.openelm.modelling_openelm_flax import (
 	FlaxOpenELMForCausalLM,
-	FlaxOpenELMForCausalLMModule,
 	FlaxOpenELMModel,
-	FlaxOpenELMModule,
 )
 from easydel.modules.openelm.openelm_configuration import OpenELMConfig
+
+__all__ = "FlaxOpenELMForCausalLM", "FlaxOpenELMModel", "OpenELMConfig"

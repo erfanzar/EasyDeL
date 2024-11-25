@@ -14,8 +14,8 @@
 
 from easydel.modules.stablelm.modelling_stablelm_flax import (
 	FlaxStableLmForCausalLM,
-	FlaxStableLmForCausalLMModule,
 	FlaxStableLmModel,
-	FlaxStableLmModule,
 )
 from easydel.modules.stablelm.stablelm_configuration import StableLmConfig
+
+__all__ = "FlaxStableLmForCausalLM", "FlaxStableLmModel", "StableLmConfig"
