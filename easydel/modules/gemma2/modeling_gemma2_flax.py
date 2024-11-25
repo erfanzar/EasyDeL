@@ -27,7 +27,6 @@ from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers, get_logger
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.rotary_embedding import get_rope
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
@@ -162,18 +161,11 @@ class FlaxGemma2Attention(FlaxAttentionModule):
 			base_config=self.config,
 		)
 
-		initial_rope_kwargs = dict(rope_type="default")
-		if getattr(config, "rope_scaling", None) is not None:
-			scaling_type = config.rope_scaling["type"]
-			scaling_factor = config.rope_scaling["factor"]
-			initial_rope_kwargs = dict(scaling_factor=scaling_factor, rope_type=scaling_type)
-
-		self.rotary = get_rope(
-			head_size=self.head_dim,
-			rotary_dim=self.head_dim,
-			max_position=self.config.granted_freq_max_position_embedding,
-			base=config.rope_theta,
-			rope_scaling=initial_rope_kwargs,
+		self.rotary = self.config.get_basic_rope(
+			self.dtype,
+			self.head_dim,
+			self.head_dim,
+			True,
 		)
 
 	def _merge_heads(self, hidden_states):
@@ -204,6 +196,7 @@ class FlaxGemma2Attention(FlaxAttentionModule):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the attention module.
@@ -251,6 +244,7 @@ class FlaxGemma2Attention(FlaxAttentionModule):
 			query=query_states,
 			key=key_states,
 			positions=position_ids,
+			frequencies=frequencies,
 		)
 
 		dropout_rng = None
@@ -382,7 +376,7 @@ class FlaxGemma2DecoderLayer(nn.Module):
 			attn_block = flax.linen.partitioning.remat(
 				attn_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-				static_argnums=(3, 5, 6, 7),
+				static_argnums=(3, 5, 6, 7, 9),
 			)
 		self.is_sliding = bool(self.layer_idx % 2)
 		self.self_attn = attn_block(
@@ -427,6 +421,7 @@ class FlaxGemma2DecoderLayer(nn.Module):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the module block.
@@ -457,6 +452,7 @@ class FlaxGemma2DecoderLayer(nn.Module):
 			init_cache,
 			output_attentions,
 			fcm_mask,
+			frequencies,
 		)
 
 		hidden_states = self.post_attention_layernorm(hidden_states)
@@ -494,6 +490,8 @@ class FlaxGemma2LayerCollection(nn.Module):
 			)
 			for i in range(self.config.num_hidden_layers)
 		]
+
+		self._frequencies = self.config.get_basic_frequencies()
 
 	def __call__(
 		self,
@@ -562,6 +560,7 @@ class FlaxGemma2LayerCollection(nn.Module):
 				output_attentions=output_attentions,
 				fcm_mask=fcm_mask,
 				segment_ids=segment_ids,
+				frequencies=self._frequencies,
 			)
 			hidden_states = layer_outputs[0]
 

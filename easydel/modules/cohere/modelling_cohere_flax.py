@@ -25,13 +25,11 @@ from flax import linen as nn
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.rotary_embedding import get_rope
 from easydel.modules.cohere.cohere_configuration import CohereConfig as CohereConfig
 
 # easydel.modules
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
-	apply_rotary_pos_emb,
 	block_wise_ffn,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
@@ -44,21 +42,6 @@ from easydel.modules.modeling_flax_outputs import (
 from easydel.modules.modeling_utils import wrap_easydel_module
 
 re_mat = flax.linen.partitioning.remat
-
-
-class FlaxCohereEmbedding(nn.Module):
-	dtype: jnp.dtype = jnp.float32
-
-	def __call__(self, query, key, frequencies, position_ids):
-		sin, cos = frequencies
-
-		sin = sin[position_ids][:, None, :, :]
-		cos = cos[position_ids][:, None, :, :]
-
-		key = apply_rotary_pos_emb(key, sin, cos)
-		query = apply_rotary_pos_emb(query, sin, cos)
-
-		return query.astype(self.dtype), key.astype(self.dtype)
 
 
 def repeat_kv(x: chex.Array, n_rep: int) -> chex.Array:
@@ -168,18 +151,11 @@ class FlaxCohereAttention(FlaxAttentionModule):
 		self.v_proj = dense_class(config.num_key_value_heads * self.head_dim)
 		self.o_proj = dense_class(config.hidden_size)
 
-		initial_rope_kwargs = dict(rope_type="default")
-		if getattr(config, "rope_scaling", None) is not None:
-			scaling_type = config.rope_scaling["type"]
-			scaling_factor = config.rope_scaling["factor"]
-			initial_rope_kwargs = dict(scaling_factor=scaling_factor, rope_type=scaling_type)
-
-		self.rotary = get_rope(
-			head_size=config.hidden_size // config.num_attention_heads,
-			rotary_dim=config.hidden_size // config.num_attention_heads,
-			max_position=self.config.granted_freq_max_position_embedding,
-			base=config.rope_theta,
-			rope_scaling=initial_rope_kwargs,
+		self.rotary = self.config.get_basic_rope(
+			self.dtype,
+			self.head_dim,
+			self.head_dim,
+			True,
 		)
 		self.attention_performer = FlexibleAttentionModule(
 			num_q_heads=self.config.num_attention_heads,
@@ -207,6 +183,7 @@ class FlaxCohereAttention(FlaxAttentionModule):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the attention module.
@@ -257,22 +234,27 @@ class FlaxCohereAttention(FlaxAttentionModule):
 			query=query_states,
 			key=key_states,
 			positions=position_ids,
+			frequencies=frequencies,
 		)
 
 		dropout_rng = None
 
 		if not deterministic and self.config.attention_dropout > 0.0:
 			dropout_rng = self.make_rng("dropout")
-		query_states, key_states, value_states, attention_mask, attention_bias = (
-			self.concatenate_to_cache(
-				init_cache=init_cache,
-				query=query_states,
-				key=key_states,
-				value=value_states,
-				attention_mask=attention_mask,
-				causal_mask=causal_mask,
-				fcm_mask=fcm_mask,
-			)
+		(
+			query_states,
+			key_states,
+			value_states,
+			attention_mask,
+			attention_bias,
+		) = self.concatenate_to_cache(
+			init_cache=init_cache,
+			query=query_states,
+			key=key_states,
+			value=value_states,
+			attention_mask=attention_mask,
+			causal_mask=causal_mask,
+			fcm_mask=fcm_mask,
 		)
 		query_length, key_length = query_states.shape[1], key_states.shape[1]
 
@@ -371,7 +353,7 @@ class FlaxCohereBlock(nn.Module):
 		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			attn_block = re_mat(
 				FlaxCohereAttention,
-				static_argnums=(3, 5, 6, 7),
+				static_argnums=(3, 5, 6, 7, 9),
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 			)
 
@@ -411,6 +393,7 @@ class FlaxCohereBlock(nn.Module):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the module block.
@@ -440,6 +423,7 @@ class FlaxCohereBlock(nn.Module):
 			init_cache,
 			output_attentions,
 			fcm_mask,
+			frequencies,
 		)
 		attn_output = attn_outputs[0]
 
@@ -491,6 +475,7 @@ class FlaxCohereBlockCollection(nn.Module):
 			)
 			for i in range(self.config.num_hidden_layers)
 		]
+		self._frequencies = self.config.get_basic_frequencies()
 
 	def __call__(
 		self,
@@ -562,6 +547,7 @@ class FlaxCohereBlockCollection(nn.Module):
 				output_attentions=output_attentions,
 				fcm_mask=fcm_mask,
 				segment_ids=segment_ids,
+				frequencies=self._frequencies,
 			)
 			hidden_states = layer_outputs[0]
 

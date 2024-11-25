@@ -27,7 +27,6 @@ from flax.linen import partitioning as nn_partitioning
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import RMSNorm
-from easydel.layers.rotary_embedding import get_rope
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
@@ -97,32 +96,12 @@ class FlaxLlamaAttention(FlaxAttentionModule):
 		self.k_proj = dense_class(config.num_key_value_heads * self.head_dim)
 		self.v_proj = dense_class(config.num_key_value_heads * self.head_dim)
 		self.o_proj = dense_class(config.hidden_size)
-		initial_rope_kwargs = dict(rope_type="default")
-		if config.rope_scaling is not None:
-			scaling_type = config.rope_scaling.get("rope_type")
-			scaling_type = config.rope_scaling.get("type", scaling_type)
-			scaling_factor = config.rope_scaling.get("factor")
-			low_freq_factor = config.rope_scaling.get("low_freq_factor", None)
-			high_freq_factor = config.rope_scaling.get("high_freq_factor", None)
-			original_max_position_embeddings = config.rope_scaling.get(
-				"original_max_position_embeddings", None
-			)
-			initial_rope_kwargs = dict(
-				rope_type=scaling_type,
-				factor=scaling_factor,
-				low_freq_factor=low_freq_factor,
-				high_freq_factor=high_freq_factor,
-				original_max_position_embeddings=original_max_position_embeddings,
-			)
 
-		self.rotary = get_rope(
-			head_size=self.head_dim,
-			rotary_dim=self.head_dim,
-			max_position=self.config.granted_freq_max_position_embedding,
-			base=config.rope_theta,
-			dtype=self.dtype,
-			is_neox_style=True,
-			rope_scaling=initial_rope_kwargs,
+		self.rotary = self.config.get_basic_rope(
+			self.dtype,
+			self.head_dim,
+			self.head_dim,
+			True,
 		)
 
 		self.attention_performer = FlexibleAttentionModule(
@@ -152,6 +131,7 @@ class FlaxLlamaAttention(FlaxAttentionModule):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
+		frequencies: Optional[chex.Array] = None,
 	) -> Tuple[chex.Array, chex.Array]:
 		"""
 		Forward pass of the attention module.
@@ -191,23 +171,32 @@ class FlaxLlamaAttention(FlaxAttentionModule):
 		key_states = key_states.reshape(kv_shape)
 		value_states = value_states.reshape(kv_shape)
 
-		query_states, key_states = self.rotary(position_ids, query_states, key_states)
+		query_states, key_states = self.rotary(
+			positions=position_ids,
+			query=query_states,
+			key=key_states,
+			frequencies=frequencies,
+		)
 
 		dropout_rng = None
 
 		if not deterministic and self.config.attention_dropout > 0.0:
 			dropout_rng = self.make_rng("dropout")
 
-		query_states, key_states, value_states, attention_mask, attention_bias = (
-			self.concatenate_to_cache(
-				init_cache=init_cache,
-				query=query_states,
-				key=key_states,
-				value=value_states,
-				attention_mask=attention_mask,
-				causal_mask=causal_mask,
-				fcm_mask=fcm_mask,
-			)
+		(
+			query_states,
+			key_states,
+			value_states,
+			attention_mask,
+			attention_bias,
+		) = self.concatenate_to_cache(
+			init_cache=init_cache,
+			query=query_states,
+			key=key_states,
+			value=value_states,
+			attention_mask=attention_mask,
+			causal_mask=causal_mask,
+			fcm_mask=fcm_mask,
 		)
 
 		attentions = self.attention_performer(
@@ -297,7 +286,7 @@ class FlaxLlamaBlock(nn.Module):
 		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			attn_block = nn_partitioning.remat(
 				attn_block,
-				static_argnums=(1, 2, 3, 4, 6, 7),
+				static_argnums=(3, 5, 6, 7, 9),
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 			)
 
@@ -344,6 +333,7 @@ class FlaxLlamaBlock(nn.Module):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the module block.
@@ -371,6 +361,7 @@ class FlaxLlamaBlock(nn.Module):
 			init_cache,
 			output_attentions,
 			fcm_mask,
+			frequencies,
 		)
 		attn_output = attn_outputs[0]
 		hidden_states = hidden_states + attn_output
@@ -420,6 +411,7 @@ class FlaxLlamaBlockCollection(nn.Module):
 			)
 			for i in range(self.config.num_hidden_layers)
 		]
+		self._frequencies = self.config.get_basic_frequencies()
 
 	def __call__(
 		self,
@@ -491,6 +483,7 @@ class FlaxLlamaBlockCollection(nn.Module):
 				output_attentions=output_attentions,
 				fcm_mask=fcm_mask,
 				segment_ids=segment_ids,
+				frequencies=self._frequencies,
 			)
 			hidden_states = layer_outputs[0]
 

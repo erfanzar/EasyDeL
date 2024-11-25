@@ -730,6 +730,90 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
 		return cls.from_dict(config_dict, **kwargs)
 
+	@property
+	def granted_freq_max_position_embedding(self) -> int:
+		return getattr(
+			self,
+			"freq_max_position_embeddings",
+			self.max_position_embeddings,
+		)
+
+	@property
+	def granted_mask_max_position_embedding(self) -> int:
+		return getattr(
+			self,
+			"mask_max_position_embeddings",
+			self.max_position_embeddings,
+		)
+
+	def get_basic_rope(
+		self,
+		dtype,
+		head_size,
+		rotary_dim=None,
+		is_neox_style=True,
+	):
+		from easydel.layers.rotary_embedding import get_rope
+
+		if rotary_dim is None:
+			rotary_dim = head_size
+		initial_rope_kwargs = dict(rope_type="default")
+		if getattr(self, "rope_scaling", None) is not None:
+			scaling_type = self.rope_scaling.get("rope_type")
+			scaling_type = self.rope_scaling.get("type", scaling_type)
+			scaling_factor = self.rope_scaling.get("factor")
+			low_freq_factor = self.rope_scaling.get("low_freq_factor", None)
+			high_freq_factor = self.rope_scaling.get("high_freq_factor", None)
+			original_max_position_embeddings = self.rope_scaling.get(
+				"original_max_position_embeddings", None
+			)
+			initial_rope_kwargs = dict(
+				rope_type=scaling_type,
+				factor=scaling_factor,
+				low_freq_factor=low_freq_factor,
+				high_freq_factor=high_freq_factor,
+				original_max_position_embeddings=original_max_position_embeddings,
+			)
+
+		return get_rope(
+			head_size=head_size,
+			rotary_dim=rotary_dim,
+			max_position=self.granted_freq_max_position_embedding,
+			base=self.rope_theta,
+			dtype=dtype,
+			is_neox_style=is_neox_style,
+			rope_scaling=initial_rope_kwargs,
+		)
+
+	def get_basic_frequencies(self):
+		from easydel.layers.rotary_embedding import get_frequencies
+
+		initial_rope_kwargs = dict(rope_type="default")
+		if getattr(self, "rope_scaling", None) is not None:
+			scaling_type = self.rope_scaling.get("rope_type")
+			scaling_type = self.rope_scaling.get("type", scaling_type)
+			scaling_factor = self.rope_scaling.get("factor")
+			low_freq_factor = self.rope_scaling.get("low_freq_factor", None)
+			high_freq_factor = self.rope_scaling.get("high_freq_factor", None)
+			original_max_position_embeddings = self.rope_scaling.get(
+				"original_max_position_embeddings", None
+			)
+			initial_rope_kwargs = dict(
+				rope_type=scaling_type,
+				factor=scaling_factor,
+				low_freq_factor=low_freq_factor,
+				high_freq_factor=high_freq_factor,
+				original_max_position_embeddings=original_max_position_embeddings,
+			)
+
+		return get_frequencies(
+			head_size=self.head_dim,
+			rotary_dim=self.head_dim,
+			max_position=self.granted_freq_max_position_embedding,
+			base=self.rope_theta,
+			rope_scaling=initial_rope_kwargs,
+		)
+
 
 class EasyDeLBaseModule(FlaxPreTrainedModel):
 	config_class: EasyDeLBaseConfig

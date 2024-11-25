@@ -27,7 +27,6 @@ from jax import numpy as jnp
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.rotary_embedding import get_rope
 from easydel.modules.arctic.arctic_configuration import ArcticConfig
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
@@ -120,21 +119,11 @@ class FlaxArcticAttention(FlaxAttentionModule):
 		self.v_proj = dense(self.num_key_value_heads * self.head_dim)
 		self.o_proj = dense(self.num_heads * self.head_dim)
 
-		initial_rope_kwargs = dict(rope_type="default")
-		if self.config.rope_scaling is not None:
-			initial_rope_kwargs = dict(
-				factor=self.config.rope_scaling["factor"],
-				rope_type=self.config.rope_scaling["type"],
-			)
-
-		self.rotary = get_rope(
-			max_position=self.config.granted_freq_max_position_embedding,
-			rotary_dim=self.config.hidden_size // self.config.num_attention_heads,
-			head_size=self.config.hidden_size // self.config.num_attention_heads,
-			base=self.config.rope_theta,
-			is_neox_style=True,
-			dtype=self.dtype,
-			rope_scaling=initial_rope_kwargs,
+		self.rotary = self.config.get_basic_rope(
+			self.dtype,
+			self.head_dim,
+			self.head_dim,
+			True,
 		)
 		self.attention_performer = FlexibleAttentionModule(
 			num_q_heads=self.config.num_attention_heads,
@@ -159,6 +148,7 @@ class FlaxArcticAttention(FlaxAttentionModule):
 		deterministic: bool = True,
 		init_cache: bool = False,
 		output_attentions: bool = True,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the attention module.
@@ -201,22 +191,30 @@ class FlaxArcticAttention(FlaxAttentionModule):
 			self.config.num_key_value_heads,
 			self.head_dim,
 		)
-
+		query_states, key_states = self.rotary(
+			positions=position_ids,
+			query=query_states,
+			key=key_states,
+			frequencies=frequencies,
+		)
 		dropout_rng = None
-
 		if not deterministic and self.config.attn_config.attn_pdrop > 0.0:
 			dropout_rng = self.make_rng("dropout")
-		query_states, key_states = self.rotary(position_ids, query_states, key_states)
-		query_states, key_states, value_states, attention_mask, attention_bias = (
-			self.concatenate_to_cache(
-				init_cache=init_cache,
-				query=query_states,
-				key=key_states,
-				value=value_states,
-				attention_mask=attention_mask,
-				causal_mask=causal_mask,
-				fcm_mask=None,
-			)
+
+		(
+			query_states,
+			key_states,
+			value_states,
+			attention_mask,
+			attention_bias,
+		) = self.concatenate_to_cache(
+			init_cache=init_cache,
+			query=query_states,
+			key=key_states,
+			value=value_states,
+			attention_mask=attention_mask,
+			causal_mask=causal_mask,
+			fcm_mask=None,
 		)
 		query_length, key_length = query_states.shape[1], key_states.shape[1]
 
@@ -606,7 +604,7 @@ class FlaxArcticDecoderLayer(nn.Module):
 			attn_block = re_mat(
 				attn_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-				static_argnums=(2, 5, 6, 7),
+				static_argnums=(2, 5, 6, 7, 8),
 			)
 			mlp_block = re_mat(
 				mlp_block,
@@ -667,6 +665,7 @@ class FlaxArcticDecoderLayer(nn.Module):
 		deterministic: bool = True,
 		init_cache: bool = False,
 		output_attentions: bool = True,
+		frequencies: Optional[chex.Array] = None,
 	) -> Tuple[chex.Array, Optional[chex.Array], chex.Array]:
 		"""
 		Forward pass for the decoder layer, applying self-attention and MoE transformations.
@@ -698,6 +697,7 @@ class FlaxArcticDecoderLayer(nn.Module):
 			deterministic,
 			init_cache,
 			output_attentions,
+			frequencies,
 		)
 		hidden_states, self_attn_weights = (
 			attn_out if output_attentions else (attn_out[0], None)
@@ -754,6 +754,7 @@ class FlaxArcticDecoderLayerCollection(nn.Module):
 			)
 			for layer_index in range(self.config.num_hidden_layers)
 		]
+		self._frequencies = self.config.get_basic_frequencies()
 
 	def __call__(
 		self,
@@ -799,6 +800,7 @@ class FlaxArcticDecoderLayerCollection(nn.Module):
 				causal_mask=causal_mask,
 				deterministic=deterministic,
 				segment_ids=segment_ids,
+				frequencies=self._frequencies,
 			)
 
 			hidden_states = layer_outputs[0]

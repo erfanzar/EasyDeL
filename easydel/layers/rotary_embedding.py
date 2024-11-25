@@ -441,6 +441,65 @@ def compute_llama3_frequencies(
 	return freqs
 
 
+# @partial(
+# 	jax.jit,
+# 	static_argnames=[
+# 		"base",
+# 		"rotary_dim",
+# 		"scaling_factor",
+# 		"extrapolation_factor",
+# 		"beta_fast",
+# 		"beta_slow",
+# 		"max_position_embeddings",
+# 		"mscale",
+# 		"mscale_all_dim",
+# 		"attn_factor",
+# 	],
+# )
+def compute_deepseek_frequencies(
+	base,
+	rotary_dim,
+	scaling_factor,
+	extrapolation_factor,
+	beta_fast,
+	beta_slow,
+	max_position_embeddings,
+	mscale,
+	mscale_all_dim,
+	attn_factor,
+) -> jnp.ndarray:
+	pos_freqs = base ** (jnp.arange(0, rotary_dim, 2, dtype=jnp.float32) / rotary_dim)
+	inv_freq_extrapolation = 1.0 / pos_freqs
+	inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
+	low, high = _yarn_find_correction_range(
+		beta_fast,
+		beta_slow,
+		rotary_dim,
+		base,
+		max_position_embeddings,
+	)
+	inv_freq_mask = (
+		1 - _yarn_linear_ramp_mask(low, high, rotary_dim // 2, dtype=jnp.float32)
+	) * extrapolation_factor
+	inv_freq = (
+		inv_freq_interpolation * (1 - inv_freq_mask)
+		+ inv_freq_extrapolation * inv_freq_mask
+	)
+
+	t = jnp.arange(
+		max_position_embeddings * scaling_factor,
+		dtype=jnp.float32,
+	)
+	freqs = jnp.einsum("i,j -> ij", t, inv_freq)
+	mscale = (
+		yarn_get_mscale(scaling_factor, mscale)
+		/ yarn_get_mscale(scaling_factor, mscale_all_dim)
+		* attn_factor
+	)
+
+	return jnp.concatenate([jnp.cos(freqs) * mscale, jnp.sin(freqs) * mscale], axis=-1)
+
+
 # @partial(jax.jit, static_argnames=["rotary_dim", "is_neox_style", "dtype"])
 def apply_basic_rope(
 	query: jax.Array,
@@ -747,65 +806,6 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
 			)
 
 
-# @partial(
-# 	jax.jit,
-# 	static_argnames=[
-# 		"base",
-# 		"rotary_dim",
-# 		"scaling_factor",
-# 		"extrapolation_factor",
-# 		"beta_fast",
-# 		"beta_slow",
-# 		"max_position_embeddings",
-# 		"mscale",
-# 		"mscale_all_dim",
-# 		"attn_factor",
-# 	],
-# )
-def deepseek_yarn_sincos_compute(
-	base,
-	rotary_dim,
-	scaling_factor,
-	extrapolation_factor,
-	beta_fast,
-	beta_slow,
-	max_position_embeddings,
-	mscale,
-	mscale_all_dim,
-	attn_factor,
-) -> jnp.ndarray:
-	pos_freqs = base ** (jnp.arange(0, rotary_dim, 2, dtype=jnp.float32) / rotary_dim)
-	inv_freq_extrapolation = 1.0 / pos_freqs
-	inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
-	low, high = _yarn_find_correction_range(
-		beta_fast,
-		beta_slow,
-		rotary_dim,
-		base,
-		max_position_embeddings,
-	)
-	inv_freq_mask = (
-		1 - _yarn_linear_ramp_mask(low, high, rotary_dim // 2, dtype=jnp.float32)
-	) * extrapolation_factor
-	inv_freq = (
-		inv_freq_interpolation * (1 - inv_freq_mask)
-		+ inv_freq_extrapolation * inv_freq_mask
-	)
-
-	t = jnp.arange(
-		max_position_embeddings * scaling_factor,
-		dtype=jnp.float32,
-	)
-	freqs = jnp.einsum("i,j -> ij", t, inv_freq)
-	mscale = (
-		yarn_get_mscale(scaling_factor, mscale)
-		/ yarn_get_mscale(scaling_factor, mscale_all_dim)
-		* attn_factor
-	)
-
-	return jnp.cos(freqs) * mscale, jnp.sin(freqs) * mscale
-
-
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
 	if scale <= 1:
 		return 1.0
@@ -837,7 +837,22 @@ class DeepseekScalingRotaryEmbedding(flax.linen.Module):
 		query: jnp.ndarray,
 		key: jnp.ndarray,
 		offsets: Optional[jnp.ndarray] = None,
+		frequencies: Optional[jnp.ndarray] = None,
 	) -> Tuple[jnp.ndarray, jnp.ndarray]:
+		if frequencies is None:
+			frequencies = compute_deepseek_frequencies(
+				self.base,
+				self.rotary_dim,
+				self.scaling_factor,
+				self.extrapolation_factor,
+				self.beta_fast,
+				self.beta_slow,
+				self.max_position_embeddings,
+				self.mscale,
+				self.mscale_all_dim,
+				self.attn_factor,
+			)
+		cos, sin = jnp.split(frequencies[positions], 2, -1)
 		if offsets is not None:
 			positions += offsets
 		query_rot = query[..., : self.rotary_dim]
@@ -847,26 +862,13 @@ class DeepseekScalingRotaryEmbedding(flax.linen.Module):
 			query_pass = query[..., self.rotary_dim :]
 			key_pass = key[..., self.rotary_dim :]
 
-		cos, sin = deepseek_yarn_sincos_compute(
-			self.base,
-			self.rotary_dim,
-			self.scaling_factor,
-			self.extrapolation_factor,
-			self.beta_fast,
-			self.beta_slow,
-			self.max_position_embeddings,
-			self.mscale,
-			self.mscale_all_dim,
-			self.attn_factor,
-		)
-
 		target_sc_shape = (query.shape[0], -1, 1, self.rotary_dim)
 		if self.is_neox_style:
-			cos = cos[positions].repeat(2, axis=1).reshape(target_sc_shape)
-			sin = sin[positions].repeat(2, axis=1).reshape(target_sc_shape)
+			cos = cos.repeat(2, axis=1).reshape(target_sc_shape)
+			sin = sin.repeat(2, axis=1).reshape(target_sc_shape)
 		else:
-			cos = cos[positions].repeat_interleave(2, axis=1).reshape(target_sc_shape)
-			sin = sin[positions].repeat_interleave(2, axis=1).reshape(target_sc_shape)
+			cos = cos.repeat_interleave(2, axis=1).reshape(target_sc_shape)
+			sin = sin.repeat_interleave(2, axis=1).reshape(target_sc_shape)
 		rotate_fn = _rotate_neox if self.is_neox_style else _rotate_gptj
 		query_rot = query_rot * cos + rotate_fn(query_rot) * sin
 		key_rot = key_rot * cos + rotate_fn(key_rot) * sin
@@ -1025,6 +1027,135 @@ def get_rope(
 	return rotary_emb
 
 
+def get_frequencies(
+	head_size: int,
+	rotary_dim: int,
+	max_position: int,
+	base: int, 
+	rope_scaling: Optional[Dict[str, Any]] = None, 
+	partial_rotary_factor: float = 1.0,
+) -> jax.Array: 
+
+	if partial_rotary_factor < 1.0:
+		rotary_dim = int(rotary_dim * partial_rotary_factor)
+
+	if rope_scaling is None:
+		frequencies = compute_basic_frequencies(
+			base=base,
+			rotary_dim=rotary_dim,
+			max_position_embeddings=max_position,
+		)
+	else:
+		scaling_type = rope_scaling["rope_type"]
+
+		if scaling_type == "llama3":
+			scaling_factor = rope_scaling["factor"]
+			low_freq_factor = rope_scaling["low_freq_factor"]
+			high_freq_factor = rope_scaling["high_freq_factor"]
+			original_max_position = rope_scaling["original_max_position_embeddings"]
+			frequencies = compute_llama3_frequencies(
+				base=base,
+				rotary_dim=rotary_dim,
+				low_freq_factor=low_freq_factor,
+				high_freq_factor=high_freq_factor,
+				scaling_factor=scaling_factor,
+				max_position_embeddings=original_max_position,
+			)
+
+		elif scaling_type == "default":
+			frequencies = compute_basic_frequencies(
+				base=base,
+				rotary_dim=rotary_dim,
+				max_position_embeddings=max_position,
+			)
+		elif scaling_type == "linear":
+			scaling_factors = rope_scaling["factor"]
+			frequencies = compute_linear_frequencies(
+				base=base,
+				rotary_dim=rotary_dim,
+				max_position_embeddings=max_position,
+				scaling_factors=scaling_factors,
+			)
+		elif scaling_type == "dynamic":
+			scaling_factor = rope_scaling["factor"]
+			frequencies = compute_dynamic_frequencies(
+				rotary_dim=rotary_dim,
+				max_position_embeddings=max_position,
+				base=base,
+				scaling_factor=scaling_factor,
+			)
+		elif scaling_type == "yarn":
+			scaling_factor = rope_scaling["factor"]
+			original_max_position = rope_scaling["original_max_position_embeddings"]
+			extra_kwargs = {
+				k: v
+				for k, v in rope_scaling.items()
+				if k in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow")
+			}
+
+			frequencies = compute_yarn_frequencies(
+				base=base,
+				rotary_dim=rotary_dim,
+				beta_fast=extra_kwargs["beta_fast"],
+				beta_slow=extra_kwargs["beta_slow"],
+				max_position_embeddings=original_max_position,
+				scaling_factor=scaling_factor,
+				extrapolation_factor=extra_kwargs["extrapolation_factor"],
+				attn_factor=extra_kwargs["attn_factor"],
+			)
+		elif scaling_type == "deepseek_yarn":
+			scaling_factor = rope_scaling["factor"]
+			original_max_position = rope_scaling["original_max_position_embeddings"]
+			extra_kwargs = {
+				k: v
+				for k, v in rope_scaling.items()
+				if k
+				in (
+					"extrapolation_factor",
+					"attn_factor",
+					"beta_fast",
+					"beta_slow",
+					"mscale",
+					"mscale_all_dim",
+				)
+			}
+			frequencies = compute_deepseek_frequencies(
+				base,
+				rotary_dim,
+				scaling_factor,
+				extra_kwargs["extrapolation_factor"],
+				extra_kwargs["beta_fast"],
+				extra_kwargs["beta_slow"],
+				original_max_position,
+				extra_kwargs["mscale"],
+				extra_kwargs["mscale_all_dim"],
+				extra_kwargs["attn_factor"],
+			)
+		elif scaling_type == "longrope":
+			short_factor = rope_scaling["short_factor"]
+			long_factor = rope_scaling["long_factor"]
+			original_max_position = rope_scaling["original_max_position_embeddings"]
+			extra_kwargs = {
+				k: v for k, v in rope_scaling.items() if k in ("short_mscale", "long_mscale")
+			}
+
+			frequencies = compute_phi3_frequencies(
+				base=base,
+				head_size=head_size,
+				rotary_dim=rotary_dim,
+				max_position_embeddings=max_position,
+				original_max_position_embeddings=original_max_position,
+				short_factor=short_factor,
+				long_factor=long_factor,
+				short_mscale=extra_kwargs["short_mscale"],
+				long_mscale=extra_kwargs["long_mscale"],
+			)
+		else:
+			raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+
+	return frequencies
+
+
 # Example usage
 if __name__ == "__main__":
 	head_size = 64
@@ -1053,4 +1184,10 @@ if __name__ == "__main__":
 		rope_scaling,
 		dtype,
 	)
-	print(rope)
+	freq = get_frequencies(
+		head_size,
+		rotary_dim,
+		max_position,
+		base, 
+		rope_scaling, 
+	)
