@@ -16,6 +16,7 @@ import functools
 from typing import Optional, Tuple, Union
 
 import chex
+import flax.linen
 import flax.linen.partitioning
 import jax
 import jax.numpy as jnp
