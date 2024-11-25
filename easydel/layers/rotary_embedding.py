@@ -794,6 +794,7 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
 					scaling_factor=self.scaling_factor,
 					max_position_embeddings=self.orig_max_position,
 				)
+
 			return apply_basic_rope(
 				query=query,
 				key=key,
@@ -909,7 +910,6 @@ def get_rope(
 		)
 	else:
 		scaling_type = rope_scaling["rope_type"]
-
 		if scaling_type == "llama3":
 			scaling_factor = rope_scaling["factor"]
 			low_freq_factor = rope_scaling["low_freq_factor"]
@@ -1031,11 +1031,10 @@ def get_frequencies(
 	head_size: int,
 	rotary_dim: int,
 	max_position: int,
-	base: int, 
-	rope_scaling: Optional[Dict[str, Any]] = None, 
+	base: int,
+	rope_scaling: Optional[Dict[str, Any]] = None,
 	partial_rotary_factor: float = 1.0,
-) -> jax.Array: 
-
+) -> jax.Array:
 	if partial_rotary_factor < 1.0:
 		rotary_dim = int(rotary_dim * partial_rotary_factor)
 
@@ -1188,6 +1187,6 @@ if __name__ == "__main__":
 		head_size,
 		rotary_dim,
 		max_position,
-		base, 
-		rope_scaling, 
+		base,
+		rope_scaling,
 	)
