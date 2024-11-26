@@ -14,8 +14,8 @@
 
 from easydel.modules.rwkv.modelling_rwkv_flax import (
 	FlaxRwkvForCausalLM,
-	FlaxRwkvForCausalLMModule,
 	FlaxRwkvModel,
-	FlaxRwkvModule,
 )
 from easydel.modules.rwkv.rwkv_configuration import RwkvConfig
+
+__all__ = "FlaxRwkvForCausalLM", "FlaxRwkvModel", "RwkvConfig"

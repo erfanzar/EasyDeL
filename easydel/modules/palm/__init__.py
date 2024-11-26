@@ -14,8 +14,8 @@
 
 from easydel.modules.palm.modelling_palm_flax import (
 	FlaxPalmForCausalLM,
-	FlaxPalmForCausalLMModule,
 	FlaxPalmModel,
-	FlaxPalmModule,
 )
 from easydel.modules.palm.palm_configuration import PalmConfig
+
+__all__ = "FlaxPalmForCausalLM", "FlaxPalmModel", "PalmConfig"

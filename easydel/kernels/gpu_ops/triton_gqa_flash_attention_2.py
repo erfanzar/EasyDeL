@@ -29,16 +29,19 @@ import chex
 import jax
 import numpy as np
 import triton
-from jax import custom_vjp, random as jrnd
-from jax import numpy as jnp
-from triton import language as tl
 from fjformer.jax_triton import triton_call
+from jax import custom_vjp
+from jax import numpy as jnp
+from jax import random as jrnd
+from triton import language as tl
 
 FLASH_ATTN_BWD_ = True
 
 
 def calculate_num_warps(
-	head_dim: int, q_block_size: int = 0, k_block_size: int = 0
+	head_dim: int,
+	q_block_size: int = 0,
+	k_block_size: int = 0,
 ) -> int:
 	"""
 	Calculate the number of warps based on head dimension and block sizes.

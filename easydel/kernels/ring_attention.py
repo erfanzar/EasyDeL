@@ -13,14 +13,16 @@
 # limitations under the License.
 
 from typing import Literal, Optional
-from jax import numpy as jnp, random as jrnd
-import jax
+
 import chex
+import jax
+from jax import lax
+from jax import numpy as jnp
+from jax import random as jrnd
 from jax.extend.backend import get_backend
 
 from easydel.kernels.cpu_ops import jax_ring_attention_mu
 from easydel.kernels.tpu_ops import pallas_ring_attention_tpu
-from jax import lax
 
 AVAILABLE_RING_ATTENTION_PLATFORM = Literal["pallas", "jax"]
 BACKEND = get_backend().platform
@@ -99,7 +101,7 @@ def ring_attention(
 		blocksize_q = min(blocksize_q, query.shape[1])
 		blocksize_k = min(blocksize_k, key.shape[1])
 		if backend == "gpu":
-			float32_logits = False 
+			float32_logits = False
 	match backend:
 		case "gpu":
 			match platform:

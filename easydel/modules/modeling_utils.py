@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import os
 import re
 import warnings
@@ -20,12 +21,15 @@ from dataclasses import dataclass
 from typing import (
 	Any,
 	Callable,
+	Dict,
 	List,
 	Literal,
 	Mapping,
 	Optional,
 	Sequence,
 	Tuple,
+	Type,
+	TypeVar,
 	Union,
 )
 
@@ -40,13 +44,14 @@ import jax.tree_util
 from fjformer.checkpoint import CheckpointManager
 from fjformer.dtypes import Array8Bit
 from fjformer.sharding import match_partition_rules
-from flax.core import FrozenDict, unfreeze
+from flax.core import FrozenDict, freeze, unfreeze
 from flax.traverse_util import flatten_dict, unflatten_dict
+from jax import lax
 from jax import numpy as jnp
 from jax.experimental.mesh_utils import create_device_mesh
 from jax.sharding import Mesh, PartitionSpec
+from transformers import FlaxPreTrainedModel
 from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_flax_utils import FlaxPreTrainedModel
 from transformers.utils.generic import working_or_temp_dir
 
 from easydel.etils.easystate import EasyDeLState
@@ -59,6 +64,9 @@ from easydel.etils.etils import (
 	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
+from easydel.generation.flax_utils import FlaxSampleOutput
+from easydel.generation.logits_process import FlaxLogitsProcessorList
+from easydel.inference.utils import SampleState
 from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN, EasyQuantizer
 
 logger = get_logger(__name__)
@@ -108,6 +116,9 @@ def set_attrs_smartly(self, attr_name: str, default: Any, new_attr: Any):
 		setattr(self, attr_name, new_attr)
 
 
+M = TypeVar("M", bound=flax.linen.Module)
+
+
 @dataclass
 class EasyMethod:
 	TRAIN: str = "train"
@@ -125,16 +136,16 @@ warnings.filterwarnings(
 warnings.filterwarnings("ignore", message="You are using a model of type")
 
 
-class EDPretrainedConfig(PretrainedConfig):
+class EasyDeLBaseConfig(PretrainedConfig):
 	"""It initializes all the attributes of an object, and it's called when you create a new instance of that class.
 
 	Args:
 	    axis_dims (Sequence[int]): Specify the number of dimensions for each axis
 	    axis_names (Sequence[str]): Set the names of the axes
 	    attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS): attention mechanism to use
-	    block_k (int): block size of key_states
-	    block_q (int): block size of query_states
-	    block_b (int): block size of bias
+	    blocksize_k (int): block size of key_states
+	    blocksize_q (int): block size of query_states
+	    blocksize_b (int): block size of bias
 	    partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
 	    shard_attention_computation (bool): whenever to shard qkv b for attention
 	    use_sharding_constraint (bool): whether to use sharding constraint for the arrays
@@ -158,9 +169,9 @@ class EDPretrainedConfig(PretrainedConfig):
 		axis_dims: Sequence[int] = (1, -1, 1, 1),
 		axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
 		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_ATTENTION_MECHANISM,
-		block_k: int = 128,
-		block_q: int = 128,
-		block_b: int = 1,
+		blocksize_k: int = 128,
+		blocksize_q: int = 128,
+		blocksize_b: int = 1,
 		partition_axis: PartitionAxis = PartitionAxis(),  # noqa
 		shard_attention_computation: bool = True,
 		use_sharded_kv_caching: bool = True,
@@ -174,8 +185,9 @@ class EDPretrainedConfig(PretrainedConfig):
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
 		attention_axis_name: str = "sp",
-		quantize_kv_cache: bool = False,
-		kv_cache_quantization_method: Literal["nf4", "8bit"] = "8bit",
+		kv_cache_quantization_method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.NONE,
+		kv_cache_quantization_blocksize: int = 64,
+		kv_cache_sharding_sequence_axis_name: Union[str, Tuple[str, ...]] = "sp",
 		flash_attention_backward_pass_impl: Literal["triton", "xla"] = "triton",
 		attn_dtype: jnp.dtype = jnp.float32,
 		fcm_max_ratio: float = 0.0,
@@ -186,16 +198,43 @@ class EDPretrainedConfig(PretrainedConfig):
 		pallas_n_block_size: int = DEFAULT_PALLAS_N_BLOCK_SIZE,
 		**kwargs,
 	):
-		self.axis_dims = getattr(
-			self,
-			"axis_dims",
-			axis_dims,
-		)
-		self.axis_names = getattr(
-			self,
-			"axis_names",
-			axis_names,
-		)
+		"""
+		Initialize the EasyDeLBaseConfig class with configuration parameters.
+
+		Args:
+		    axis_dims (Sequence[int], optional): Specify the number of dimensions for each axis. Defaults to (1, -1, 1, 1).
+		    axis_names (Sequence[str], optional): Set the names of the axes. Defaults to ("dp", "fsdp", "tp", "sp").
+		    attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS, optional): attention mechanism to use. Defaults to DEFAULT_ATTENTION_MECHANISM.
+		    blocksize_k (int, optional): block size of key_states. Defaults to 128.
+		    blocksize_q (int, optional): block size of query_states. Defaults to 128.
+		    blocksize_b (int, optional): block size of bias. Defaults to 1.
+		    partition_axis (PartitionAxis, optional): PartitionAxis is new module used for partitioning arrays in easydel. Defaults to PartitionAxis().
+		    shard_attention_computation (bool, optional): whenever to use shard_map for attention. Defaults to True.
+		    use_sharded_kv_caching (bool, optional): whenever to use shard_map and sharding for key and value. Defaults to True.
+		    backend (Optional[EasyDeLBackends], optional): Specify the backend to use. Defaults to None.
+		    platform (Optional[EasyDeLPlatforms], optional): Specify the platform to used to use. Defaults to None.
+		    easy_method (Literal["train", "serve", "convert"], optional): easydel Quantization Method to be applied for. Defaults to EasyMethod.TRAIN.
+		    bits (Optional[int], optional): Model bits for quantization. Defaults to None.
+		    scan_ring_attention (bool, optional): Whether to use can for ring attention. Defaults to True.
+		    scan_attention_layers (bool, optional): Whether to use can for attention layers. Defaults to False.
+		    use_sharding_constraint (bool, optional): whether to use sharding constraint for the arrays. Defaults to False.
+		    use_scan_mlp (bool, optional): Determine whether to use scan_mlp or not. Defaults to False.
+		    scan_mlp_chunk_size (int, optional): Size of chunks in scan MLP. Defaults to 1024.
+		    attention_axis_name (str, optional): Name of the attention axis name. Defaults to "sp".
+		    kv_cache_quantization_method (EasyDeLQuantizationMethods, optional): key and value quantization type. Defaults to EasyDeLQuantizationMethods.NONE.
+		    kv_cache_quantization_blocksize (int, optional): size of kv cache quantization. Defaults to 64.
+		    kv_cache_sharding_sequence_axis_name (Union[str, Tuple[str, ...]], optional): axis name to target for sharding sequences. Defaults to "sp".
+		    flash_attention_backward_pass_impl (Literal["triton", "xla"], optional): Specify the backward pass kernel for flash attention. Defaults to "triton".
+		    attn_dtype (jnp.dtype, optional): Data type for attention computations. Defaults to jnp.float32.
+		    fcm_max_ratio (float, optional): Maximum ratio for flash cross attention. Defaults to 0.0.
+		    fcm_min_ratio (float, optional): Minimum ratio for flash cross attention. Defaults to 0.0.
+		    hardware_abstraction (bool, optional): whenever to switch to custom pallas kernels instead of JAX. Defaults to DEFAULT_HARDWARE_ABSTRACTION.
+		    pallas_m_block_size (int, optional): block size m dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`. Defaults to DEFAULT_PALLAS_M_BLOCK_SIZE.
+		    pallas_k_block_size (int, optional): block size k dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`. Defaults to DEFAULT_PALLAS_K_BLOCK_SIZE.
+		    pallas_n_block_size (int, optional): block size n dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`. Defaults to DEFAULT_PALLAS_N_BLOCK_SIZE.
+		"""
+		self.axis_dims = getattr(self, "axis_dims", axis_dims)
+		self.axis_names = getattr(self, "axis_names", axis_names)
 		self.backend = getattr(
 			self,
 			"backend",
@@ -208,141 +247,62 @@ class EDPretrainedConfig(PretrainedConfig):
 			if platform is not None
 			else ("triton" if jax.default_backend() == "gpu" else "jax"),
 		)
-		self.easy_method = getattr(
-			self,
-			"easy_method",
-			easy_method,
-		)
-		self.attn_mechanism = getattr(
-			self,
-			"attn_mechanism",
-			attn_mechanism,
-		)
-		self.block_b = getattr(
-			self,
-			"block_b",
-			block_b,
-		)
-		self.block_k = getattr(
-			self,
-			"block_k",
-			block_k,
-		)
-		self.block_q = getattr(
-			self,
-			"block_q",
-			block_q,
-		)
-		self.partition_axis = getattr(
-			self,
-			"partition_axis",
-			partition_axis,
-		)
+		self.easy_method = getattr(self, "easy_method", easy_method)
+		self.attn_mechanism = getattr(self, "attn_mechanism", attn_mechanism)
+		self.blocksize_b = getattr(self, "blocksize_b", blocksize_b)
+		self.blocksize_k = getattr(self, "blocksize_k", blocksize_k)
+		self.blocksize_q = getattr(self, "blocksize_q", blocksize_q)
+		self.partition_axis = getattr(self, "partition_axis", partition_axis)
 		self.shard_attention_computation = getattr(
-			self,
-			"shard_attention_computation",
-			shard_attention_computation,
+			self, "shard_attention_computation", shard_attention_computation
 		)
-		self.bits = getattr(
-			self,
-			"bits",
-			bits,
-		)
+		self.bits = getattr(self, "bits", bits)
 		self.scan_attention_layers = getattr(
-			self,
-			"scan_attention_layers",
-			scan_attention_layers,
+			self, "scan_attention_layers", scan_attention_layers
 		)
-		self.scan_ring_attention = getattr(
-			self,
-			"scan_ring_attention",
-			scan_ring_attention,
-		)
+		self.scan_ring_attention = getattr(self, "scan_ring_attention", scan_ring_attention)
 		self.use_sharded_kv_caching = getattr(
-			self,
-			"use_sharded_kv_caching",
-			use_sharded_kv_caching,
+			self, "use_sharded_kv_caching", use_sharded_kv_caching
 		)
-		self.use_scan_mlp = getattr(
-			self,
-			"use_scan_mlp",
-			use_scan_mlp,
-		)
-		self.scan_mlp_chunk_size = getattr(
-			self,
-			"scan_mlp_chunk_size",
-			scan_mlp_chunk_size,
-		)
+		self.use_scan_mlp = getattr(self, "use_scan_mlp", use_scan_mlp)
+		self.scan_mlp_chunk_size = getattr(self, "scan_mlp_chunk_size", scan_mlp_chunk_size)
 		self.use_sharding_constraint = getattr(
-			self,
-			"use_sharding_constraint",
-			use_sharding_constraint,
+			self, "use_sharding_constraint", use_sharding_constraint
 		)
-		self.attention_axis_name = getattr(
-			self,
-			"attention_axis_name",
-			attention_axis_name,
-		)
-		self.quantize_kv_cache = getattr(
-			self,
-			"quantize_kv_cache",
-			quantize_kv_cache,
-		)
+		self.attention_axis_name = getattr(self, "attention_axis_name", attention_axis_name)
 
+		self.kv_cache_quantization_blocksize = getattr(
+			self, "kv_cache_quantization_blocksize", kv_cache_quantization_blocksize
+		)
+		self.kv_cache_sharding_sequence_axis_name = getattr(
+			self, "kv_cache_sharding_sequence_axis_name", kv_cache_sharding_sequence_axis_name
+		)
 		self.kv_cache_quantization_method = getattr(
-			self,
-			"kv_cache_quantization_method",
-			kv_cache_quantization_method,
+			self, "kv_cache_quantization_method", kv_cache_quantization_method
 		)
 		self.flash_attention_backward_pass_impl = getattr(
-			self,
-			"flash_attention_backward_pass_impl",
-			flash_attention_backward_pass_impl,
+			self, "flash_attention_backward_pass_impl", flash_attention_backward_pass_impl
 		)
-		self.attn_dtype = getattr(
-			self,
-			"attn_dtype",
-			attn_dtype,
-		)
+		self.attn_dtype = getattr(self, "attn_dtype", attn_dtype)
 
-		self.fcm_max_ratio = getattr(
-			self,
-			"fcm_max_ratio",
-			fcm_max_ratio,
-		)
-		self.fcm_min_ratio = getattr(
-			self,
-			"fcm_min_ratio",
-			fcm_min_ratio,
-		)
+		self.fcm_max_ratio = getattr(self, "fcm_max_ratio", fcm_max_ratio)
+		self.fcm_min_ratio = getattr(self, "fcm_min_ratio", fcm_min_ratio)
 
 		self.hardware_abstraction = getattr(
-			self,
-			"hardware_abstraction",
-			hardware_abstraction,
+			self, "hardware_abstraction", hardware_abstraction
 		)
-		self.pallas_m_block_size = getattr(
-			self,
-			"pallas_m_block_size",
-			pallas_m_block_size,
-		)
-		self.pallas_k_block_size = getattr(
-			self,
-			"pallas_k_block_size",
-			pallas_k_block_size,
-		)
-		self.pallas_n_block_size = getattr(
-			self,
-			"pallas_n_block_size",
-			pallas_n_block_size,
-		)
+		self.pallas_m_block_size = getattr(self, "pallas_m_block_size", pallas_m_block_size)
+		self.pallas_k_block_size = getattr(self, "pallas_k_block_size", pallas_k_block_size)
+		self.pallas_n_block_size = getattr(self, "pallas_n_block_size", pallas_n_block_size)
 
 		self.pretraining_tp = 1  # it's for pytorch models.
-		if self.quantize_kv_cache and self.use_sharded_kv_caching:
-			quantize_kv_cache = self.quantize_kv_cache
+		if (
+			self.kv_cache_quantization_method != EasyDeLQuantizationMethods.NONE
+			and self.use_sharded_kv_caching
+		):
 			use_sharded_kv_caching = self.use_sharded_kv_caching
 			warnings.warn(
-				f"`{quantize_kv_cache=}` and `{use_sharded_kv_caching=}`"
+				f"`{self.kv_cache_quantization_method=}` and `{use_sharded_kv_caching=}`"
 				" can't be used together at the moment.",
 				stacklevel=1,
 			)
@@ -472,9 +432,9 @@ class EDPretrainedConfig(PretrainedConfig):
 		axis_dims: Sequence[int] = ...,
 		axis_names: Sequence[str] = ...,
 		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = ...,
-		block_k: int = ...,
-		block_q: int = ...,
-		block_b: int = ...,
+		blocksize_k: int = ...,
+		blocksize_q: int = ...,
+		blocksize_b: int = ...,
 		partition_axis: PartitionAxis = ...,
 		shard_attention_computation: bool = ...,
 		use_sharded_kv_caching: bool = ...,
@@ -488,8 +448,9 @@ class EDPretrainedConfig(PretrainedConfig):
 		use_scan_mlp: bool = ...,
 		scan_mlp_chunk_size: int = ...,
 		attention_axis_name: str = ...,
-		quantize_kv_cache: bool = ...,
-		kv_cache_quantization_method: Literal["nf4", "8bit"] = ...,
+		kv_cache_quantization_method: EasyDeLQuantizationMethods = ...,
+		kv_cache_quantization_blocksize: int = ...,
+		kv_cache_sharding_sequence_axis_name: Union[str, Tuple[str, ...]] = ...,
 		flash_attention_backward_pass_impl: Literal["triton", "xla"] = ...,
 		attn_dtype: jnp.dtype = ...,
 		hardware_abstraction: bool = ...,
@@ -501,144 +462,59 @@ class EDPretrainedConfig(PretrainedConfig):
 		It initializes all the attributes of an object, and it's called when you create a new instance of that class.
 
 		Args:
-		    axis_dims (Sequence[int]): Specify the number of dimensions for each axis
-		    axis_names (Sequence[str]): Set the names of the axes
-		    attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS): attention mechanism to use
-		    block_k (int): block size of key_states
-		    block_q (int): block size of query_states
-		    block_b (int): block size of bias
-		    partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
-		    shard_attention_computation (bool): whenever to use shard_map for attention
-		    use_sharded_kv_caching (bool): whenever to use shard_map and sharding for key and value
-		    backend (Optional[EasyDeLBackends]): Specify the backend to use
-		platform (Optional[EasyDeLPlatforms]): Specify the platform to used to use
-		    easy_method (Literal["train", "serve", "convert"]): easydel Quantization Method to be applied for
-		    bits (Optional[int]): Model bits for quantization
-		    use_sharding_constraint (bool): whether to use sharding constraint for the arrays
-		    scan_ring_attention (bool): Whether to use can for ring attention
-		    scan_attention_layers (bool): Whether to use can for attention layers
-		    use_scan_mlp (bool): Determine whether to use scan_mlp or not
-		    scan_mlp_chunk_size (int): Size of chunks in scan MLP.
-		    attention_axis_name (str): Name of the attention axis name
-		    quantize_kv_cache (bool): Whether to quantize Key/Value in attention for generation process.
-				kv_cache_quantization_method (Literal["nf4", "8bit"]): key and value quantization type in case of passing quantize_kv_cache as True.
-		    flash_attention_backward_pass_impl (Literal["triton", "xla"]): Specify the backward pass kernel for flash attention
-				hardware_abstraction (bool): whenever to switch to custom pallas kernels instead of JAX.
-				pallas_m_block_size (int): block size m dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`.
-				pallas_k_block_size (int): block size k dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`.
-				pallas_n_block_size (int): block size n dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`.
+		    axis_dims (Sequence[int], optional): Specify the number of dimensions for each axis. Defaults to ....
+		    axis_names (Sequence[str], optional): Set the names of the axes. Defaults to ....
+		    attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS, optional): attention mechanism to use. Defaults to ....
+		    blocksize_k (int, optional): block size of key_states. Defaults to ....
+		    blocksize_q (int, optional): block size of query_states. Defaults to ....
+		    blocksize_b (int, optional): block size of bias. Defaults to ....
+		    partition_axis (PartitionAxis, optional): PartitionAxis is new module used for partitioning arrays in easydel. Defaults to ....
+		    shard_attention_computation (bool, optional): whenever to use shard_map for attention. Defaults to ....
+		    use_sharded_kv_caching (bool, optional): whenever to use shard_map and sharding for key and value. Defaults to ....
+		    backend (Optional[EasyDeLBackends], optional): Specify the backend to use. Defaults to ....
+		    platform (Optional[EasyDeLPlatforms], optional): Specify the platform to used to use. Defaults to ....
+		    easy_method (Literal["train", "serve", "convert"], optional): easydel Quantization Method to be applied for. Defaults to ....
+		    bits (Optional[int], optional): Model bits for quantization. Defaults to ....
+		    scan_ring_attention (bool, optional): Whether to use can for ring attention. Defaults to ....
+		    scan_attention_layers (bool, optional): Whether to use can for attention layers. Defaults to ....
+		    use_sharding_constraint (bool, optional): whether to use sharding constraint for the arrays. Defaults to ....
+		    use_scan_mlp (bool, optional): Determine whether to use scan_mlp or not. Defaults to ....
+		    scan_mlp_chunk_size (int, optional): Size of chunks in scan MLP. Defaults to ....
+		    attention_axis_name (str, optional): Name of the attention axis name. Defaults to ....
+		    kv_cache_quantization_method (EasyDeLQuantizationMethods, optional): key and value quantization type. Defaults to ....
+		    kv_cache_quantization_blocksize (int, optional): size of kv cache quantization. Defaults to ....
+		    kv_cache_sharding_sequence_axis_name (Union[str, Tuple[str, ...]], optional): axis name to target for sharding sequences. Defaults to ....
+		    flash_attention_backward_pass_impl (Literal["triton", "xla"], optional): Specify the backward pass kernel for flash attention. Defaults to ....
+		    attn_dtype (jnp.dtype, optional): _description_. Defaults to ....
+		    hardware_abstraction (bool, optional): whenever to switch to custom pallas kernels instead of JAX. Defaults to ....
+		    pallas_m_block_size (int, optional): block size m dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`. Defaults to ....
+		    pallas_k_block_size (int, optional): block size k dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`. Defaults to ....
+		    pallas_n_block_size (int, optional): block size n dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`. Defaults to ....
+
 		"""
-		set_attrs_smartly(
-			self,
-			"axis_dims",
-			(1, -1, 1, 1),
-			axis_dims,
-		)
-		set_attrs_smartly(
-			self,
-			"axis_names",
-			("dp", "fsdp", "tp", "sp"),
-			axis_names,
-		)
+		set_attrs_smartly(self, "axis_dims", (1, -1, 1, 1), axis_dims)
+		set_attrs_smartly(self, "axis_names", ("dp", "fsdp", "tp", "sp"), axis_names)
 
-		set_attrs_smartly(
-			self,
-			"block_q",
-			512,
-			block_q,
-		)
-		set_attrs_smartly(
-			self,
-			"block_k",
-			512,
-			block_k,
-		)
-		set_attrs_smartly(
-			self,
-			"block_b",
-			1,
-			block_b,
-		)
+		set_attrs_smartly(self, "blocksize_q", 512, blocksize_q)
+		set_attrs_smartly(self, "blocksize_k", 512, blocksize_k)
+		set_attrs_smartly(self, "blocksize_b", 1, blocksize_b)
 
+		set_attrs_smartly(self, "partition_axis", PartitionAxis(), partition_axis)
+		set_attrs_smartly(self, "use_sharding_constraint", False, use_sharding_constraint)
+		set_attrs_smartly(self, "backend", None, backend)
+		set_attrs_smartly(self, "platform", "jax", platform)
 		set_attrs_smartly(
-			self,
-			"partition_axis",
-			PartitionAxis(),
-			partition_axis,
+			self, "shard_attention_computation", True, shard_attention_computation
 		)
-		set_attrs_smartly(
-			self,
-			"use_sharding_constraint",
-			False,
-			use_sharding_constraint,
-		)
-		set_attrs_smartly(
-			self,
-			"backend",
-			None,
-			backend,
-		)
-		set_attrs_smartly(
-			self,
-			"platform",
-			"jax",
-			platform,
-		)
-		set_attrs_smartly(
-			self,
-			"shard_attention_computation",
-			True,
-			shard_attention_computation,
-		)
-		set_attrs_smartly(
-			self,
-			"use_sharded_kv_caching",
-			True,
-			use_sharded_kv_caching,
-		)
-		set_attrs_smartly(
-			self,
-			"attn_mechanism",
-			"jax_flash_attn2",
-			attn_mechanism,
-		)
+		set_attrs_smartly(self, "use_sharded_kv_caching", True, use_sharded_kv_caching)
+		set_attrs_smartly(self, "attn_mechanism", "jax_flash_attn2", attn_mechanism)
 
-		set_attrs_smartly(
-			self,
-			"easy_method",
-			EasyMethod.TRAIN,
-			easy_method,
-		)
-		set_attrs_smartly(
-			self,
-			"bits",
-			None,
-			bits,
-		)
-		set_attrs_smartly(
-			self,
-			"scan_attention_layers",
-			True,
-			scan_attention_layers,
-		)
-		set_attrs_smartly(
-			self,
-			"scan_ring_attention",
-			True,
-			scan_ring_attention,
-		)
-		set_attrs_smartly(
-			self,
-			"use_scan_mlp",
-			False,
-			use_scan_mlp,
-		)
-		set_attrs_smartly(
-			self,
-			"scan_mlp_chunk_size",
-			1024,
-			scan_mlp_chunk_size,
-		)
+		set_attrs_smartly(self, "easy_method", EasyMethod.TRAIN, easy_method)
+		set_attrs_smartly(self, "bits", None, bits)
+		set_attrs_smartly(self, "scan_attention_layers", True, scan_attention_layers)
+		set_attrs_smartly(self, "scan_ring_attention", True, scan_ring_attention)
+		set_attrs_smartly(self, "use_scan_mlp", False, use_scan_mlp)
+		set_attrs_smartly(self, "scan_mlp_chunk_size", 1024, scan_mlp_chunk_size)
 		set_attrs_smartly(
 			self,
 			"attention_axis_name",
@@ -647,14 +523,20 @@ class EDPretrainedConfig(PretrainedConfig):
 		)
 		set_attrs_smartly(
 			self,
-			"quantize_kv_cache",
-			False,
-			quantize_kv_cache,
+			"kv_cache_quantization_blocksize",
+			128,
+			kv_cache_quantization_blocksize,
+		)
+		set_attrs_smartly(
+			self,
+			"kv_cache_sharding_sequence_axis_name",
+			"sp",
+			kv_cache_sharding_sequence_axis_name,
 		)
 		set_attrs_smartly(
 			self,
 			"kv_cache_quantization_method",
-			"8bit",
+			EasyDeLQuantizationMethods.NONE,
 			kv_cache_quantization_method,
 		)
 
@@ -848,21 +730,158 @@ class EDPretrainedConfig(PretrainedConfig):
 
 		return cls.from_dict(config_dict, **kwargs)
 
+	@property
+	def granted_freq_max_position_embedding(self) -> int:
+		return getattr(
+			self,
+			"freq_max_position_embeddings",
+			self.max_position_embeddings,
+		)
 
-class EDPretrainedModel(FlaxPreTrainedModel):
+	@property
+	def granted_mask_max_position_embedding(self) -> int:
+		return getattr(
+			self,
+			"mask_max_position_embeddings",
+			self.max_position_embeddings,
+		)
+
+	def get_basic_rope(
+		self,
+		dtype,
+		head_size,
+		rotary_dim=None,
+		is_neox_style=True,
+		base=None,
+	):
+		from easydel.layers.rotary_embedding import get_rope
+
+		if rotary_dim is None:
+			rotary_dim = head_size
+		initial_rope_kwargs = dict(rope_type="default")
+		if getattr(self, "rope_scaling", None) is not None:
+			scaling_type = self.rope_scaling.get("rope_type", None)
+			scaling_type = self.rope_scaling.get("type", scaling_type)
+			scaling_factor = self.rope_scaling.get("factor", None)
+			low_freq_factor = self.rope_scaling.get("low_freq_factor", None)
+			high_freq_factor = self.rope_scaling.get("high_freq_factor", None)
+			original_max_position_embeddings = self.rope_scaling.get(
+				"original_max_position_embeddings", None
+			)
+			long_factor = self.rope_scaling.get("long_factor", None)
+			short_factor = self.rope_scaling.get("short_factor", None)
+			long_mscale = self.rope_scaling.get("long_mscale", None)
+			short_mscale = self.rope_scaling.get("short_mscale", None)
+			initial_rope_kwargs = dict(
+				rope_type=scaling_type,
+				factor=scaling_factor,
+				low_freq_factor=low_freq_factor,
+				high_freq_factor=high_freq_factor,
+				original_max_position_embeddings=original_max_position_embeddings,
+				long_factor=long_factor,
+				short_factor=short_factor,
+				long_mscale=long_mscale,
+				short_mscale=short_mscale,
+			)
+
+		return get_rope(
+			head_size=head_size,
+			rotary_dim=rotary_dim,
+			max_position=self.granted_freq_max_position_embedding,
+			base=base or self.rope_theta,
+			dtype=dtype,
+			is_neox_style=is_neox_style,
+			rope_scaling=initial_rope_kwargs,
+		)
+
+	def get_basic_frequencies(
+		self,
+		head_size=None,
+		rotary_dim=None,
+		base=None,
+	):
+		from easydel.layers.rotary_embedding import get_frequencies
+
+		if head_size is None:
+			head_size = self.head_dim  # last point
+		if rotary_dim is None:
+			rotary_dim = head_size
+		initial_rope_kwargs = dict(rope_type="default")
+		initial_rope_kwargs = dict(rope_type="default")
+		if getattr(self, "rope_scaling", None) is not None:
+			scaling_type = self.rope_scaling.get("rope_type", None)
+			scaling_type = self.rope_scaling.get("type", scaling_type)
+			scaling_factor = self.rope_scaling.get("factor", None)
+			low_freq_factor = self.rope_scaling.get("low_freq_factor", None)
+			high_freq_factor = self.rope_scaling.get("high_freq_factor", None)
+			original_max_position_embeddings = self.rope_scaling.get(
+				"original_max_position_embeddings", None
+			)
+			long_factor = self.rope_scaling.get("long_factor", None)
+			short_factor = self.rope_scaling.get("short_factor", None)
+			long_mscale = self.rope_scaling.get("long_mscale", None)
+			short_mscale = self.rope_scaling.get("short_mscale", None)
+			initial_rope_kwargs = dict(
+				rope_type=scaling_type,
+				factor=scaling_factor,
+				low_freq_factor=low_freq_factor,
+				high_freq_factor=high_freq_factor,
+				original_max_position_embeddings=original_max_position_embeddings,
+				long_factor=long_factor,
+				short_factor=short_factor,
+				long_mscale=long_mscale,
+				short_mscale=short_mscale,
+			)
+
+		return get_frequencies(
+			head_size=head_size,
+			rotary_dim=rotary_dim,
+			max_position=self.granted_freq_max_position_embedding,
+			base=base or self.rope_theta,
+			rope_scaling=initial_rope_kwargs,
+		)
+
+
+class EasyDeLBaseModule(FlaxPreTrainedModel):
+	config_class: EasyDeLBaseConfig
+	base_model_prefix: str
+	flax_module: Type[M]
+	module_class: Union[flax.linen.Module, Type[M]] = None
+
 	def __init__(
 		self,
-		config: Optional[PretrainedConfig] = None,
-		module: Optional[flax.linen.Module] = None,
-		input_shape: Tuple = (AVAILALBE_DEVICES, AVAILALBE_DEVICES),
-		seed: int = 0,
+		config: EasyDeLBaseConfig,
 		dtype: jnp.dtype = jnp.float32,
-		param_dtype: jnp.dtype = jnp.float32,  # Ignored
-		precision: Optional[Union[jax.lax.Precision, str]] = None,  # Ignored
-		_do_init: bool = True,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[jax.lax.Precision] = None,
+		input_shape: Tuple[int, int] = (AVAILALBE_DEVICES, AVAILALBE_DEVICES),
+		seed: int = 0,
+		_do_init: bool = False,
+		**kwargs,
 	):
-		assert config is not None, "`config` must be provided.`"
-		assert module is not None, "`module` must be provided.`"
+		"""
+		Initializes the pre-trained model with the given configuration.
+
+		Args:
+		    config (LlamaConfig): Configuration for the model.
+		    dtype (jnp.dtype): Data type for computations.
+		    param_dtype (jnp.dtype): Data type for model parameters.
+		    precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
+		    input_shape (Tuple[int, int]): Shape of the input tensor.
+		    seed (int): Seed for random number generation.
+		    _do_init (bool): If True, initialize model weights.
+		    **kwargs: Additional keyword arguments.
+		"""
+		module = self.module_class(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			**kwargs,
+		)
+		self.param_dtype = param_dtype
+		self.precision = precision
+
 		super().__init__(
 			config=config,
 			module=module,
@@ -982,6 +1001,66 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 			jax.eval_shape(init_fn),
 		)
 
+	def init_weights(
+		self,
+		rng: jax.random.PRNGKey,
+		input_shape: Optional[Tuple] = None,
+		params: FrozenDict = None,
+	) -> FrozenDict:
+		"""
+		Initializes the model weights.
+
+		Args:
+		    rng (jax.random.PRNGKey): Random number generator key.
+		    input_shape (Tuple): Shape of the input tensor for initializing weights.
+		    params (FrozenDict, optional): Existing parameters to initialize with.
+
+		Returns:
+		    FrozenDict: Initialized model parameters.
+		"""
+		if input_shape is None:
+			input_shape = (jax.device_count(), jax.device_count())
+		input_ids = jnp.zeros(input_shape, dtype="i4")
+		attention_mask = jnp.ones_like(input_ids)
+		position_ids = jnp.broadcast_to(
+			jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape
+		)
+		params_rng, dropout_rng = jax.random.split(rng)
+		rngs = {"params": params_rng, "dropout": dropout_rng}
+
+		if self.config.add_cross_attention:
+			encoder_hidden_states = jnp.zeros(input_shape + (self.config.hidden_size,))
+			encoder_attention_mask = attention_mask
+			module_init_outputs = self.module.init(
+				rngs,
+				input_ids=input_ids,
+				attention_mask=attention_mask,
+				position_ids=position_ids,
+				encoder_hidden_states=encoder_hidden_states,
+				encoder_attention_mask=encoder_attention_mask,
+				return_dict=False,
+			)
+		else:
+			module_init_outputs = self.module.init(
+				rngs,
+				input_ids=input_ids,
+				attention_mask=attention_mask,
+				position_ids=position_ids,
+				return_dict=False,
+			)
+
+		random_params = module_init_outputs["params"]
+
+		if params is not None:
+			random_params = flatten_dict(unfreeze(random_params))
+			params = flatten_dict(unfreeze(params))
+			for missing_key in self._missing_keys:
+				params[missing_key] = random_params[missing_key]
+			self._missing_keys = set()
+			return flax.core.freeze(unflatten_dict(params))
+		else:
+			return random_params
+
 	def prepare_inputs_for_generation(
 		self,
 		input_ids,
@@ -1025,11 +1104,81 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 		model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
 		return model_kwargs
 
+	def _validate_signature(
+		self,
+		method,
+		args: tuple,
+		kwargs: Dict[str, Any],
+	) -> Dict[str, Any]:
+		"""
+		Validates and filters arguments based on the method's signature.
+
+		Args:
+				method: The method to check signature against
+				args: Positional arguments
+				kwargs: Keyword arguments
+
+		Returns:
+				Dict[str, Any]: Filtered kwargs containing only valid parameters
+		"""
+		# Get the signature of the child class's __call__ method
+		sig = inspect.signature(method)
+		valid_params = sig.parameters
+
+		# Convert args to kwargs based on parameter names
+		args_as_kwargs = {}
+		positional_params = [
+			param
+			for param in valid_params.values()
+			if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD)
+		]
+
+		for i, arg in enumerate(args):
+			if i < len(positional_params):
+				args_as_kwargs[positional_params[i].name] = arg
+
+		# Combine converted args and original kwargs
+		all_kwargs = {**args_as_kwargs, **kwargs}
+
+		# Filter out invalid kwargs
+		filtered_kwargs = {}
+		for name, value in all_kwargs.items():
+			if name in valid_params:
+				# Check if the parameter accepts the value's type
+				param = valid_params[name]
+				if param.annotation != inspect.Parameter.empty:
+					try:
+						# Handle Optional types
+						if (
+							getattr(param.annotation, "__origin__", None) is Optional
+							and value is not None
+						):
+							expected_type = param.annotation.__args__[0]
+							if not isinstance(value, expected_type):
+								print(
+									f"Warning: Parameter '{name}' expected type {expected_type}, "
+									f"got {type(value)}. Skipping parameter."
+								)
+								continue
+					except Exception:
+						# If type checking fails, still include the parameter
+						pass
+				filtered_kwargs[name] = value
+			else:
+				warnings.warn(
+					f"  Parameter '{name}' not found in child class signature. Skipping.",
+					stacklevel=1,
+				)
+
+		return filtered_kwargs
+
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
+		segment_ids: Optional[chex.Array] = None,
 		params: dict = None,
 		past_key_values: Optional[dict] = None,
 		dropout_rng: jax.random.PRNGKey = None,
@@ -1037,12 +1186,103 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		return_dict: Optional[bool] = None,
-		extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
 		add_params_field: bool = False,
-		vision_mask: Optional[chex.Array] = None,
 		**kwargs,
 	):
-		raise NotImplementedError("Not Implemented Yet")
+		"""
+		Forward pass through the model.
+
+		Args:
+		    input_ids (chex.Array): Input tensor containing token IDs.
+		    input_embeds (Optional[chex.Array]): embedding inputs to be used instead of input_ids.
+		    attention_mask (Optional[chex.Array]): Mask for attention.
+		    position_ids (Optional[chex.Array]): Positional indices.
+		    segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
+		    params (dict, optional): Parameters for the model.
+		    past_key_values (dict, optional): Past key and value states for caching.
+		    dropout_rng (jax.random.PRNGKey, optional): RNG key for dropout.
+		    train (bool): If True, the model is in training mode.
+		    output_attentions (Optional[bool]): If True, output attention weights.
+		    output_hidden_states (Optional[bool]): If True, output hidden states.
+		    return_dict (Optional[bool]): If True, return a dictionary of outputs.
+		    add_params_field (bool): If True, include the parameters in the input dictionary.
+		    **kwargs: Additional arguments.
+
+		Returns:
+		    Output type depends on the model configuration.
+		"""
+		output_attentions = (
+			output_attentions
+			if output_attentions is not None
+			else self.config.output_attentions
+		)
+		output_hidden_states = (
+			output_hidden_states
+			if output_hidden_states is not None
+			else self.config.output_hidden_states
+		)
+		return_dict = return_dict if return_dict is not None else self.config.return_dict
+		batch_size, sequence_length = (
+			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
+		)
+
+		if position_ids is None:
+			if past_key_values is not None:
+				raise ValueError(
+					"Make sure to provide `position_ids` when passing `past_key_values`."
+				)
+
+			position_ids = jnp.broadcast_to(
+				jnp.arange(sequence_length)[None, :], (batch_size, sequence_length)
+			)
+
+		if attention_mask is None:
+			attention_mask = jnp.ones((batch_size, sequence_length))
+
+		rngs = {}
+		if dropout_rng is not None:
+			rngs["dropout"] = dropout_rng
+
+		if self.config.bits is not None:
+			rngs["params"] = jax.random.key(0)
+
+		inputs = (
+			{"params": params or self.params} if add_params_field else params or self.params
+		)
+
+		if past_key_values is not None:
+			inputs["cache"] = past_key_values
+			mutable = ["cache"]
+		else:
+			mutable = False
+		kwargs.pop("deterministic", None)
+		kwargs.pop("init_cache", None)
+		child_call_args = dict(
+			input_ids=jnp.array(input_ids, dtype="i4"),
+			attention_mask=jnp.array(attention_mask, dtype="i4"),
+			position_ids=jnp.array(position_ids, dtype="i4"),
+			deterministic=not train,
+			init_cache=False,
+			output_attentions=output_attentions,
+			output_hidden_states=output_hidden_states,
+			return_dict=return_dict,
+			input_embeds=input_embeds,
+			segment_ids=segment_ids,
+			**kwargs,
+		)
+		all_kwargs = {k: v for k, v in child_call_args.items()}
+		filtered_kwargs = self._validate_signature(self.module.__call__, (), all_kwargs)
+		outputs = self.module.apply(inputs, rngs=rngs, mutable=mutable, **filtered_kwargs)
+
+		if past_key_values is not None and return_dict:
+			outputs, past_key_values = outputs
+			outputs["past_key_values"] = unfreeze(past_key_values["cache"])
+			return outputs
+		elif past_key_values is not None and not return_dict:
+			outputs, past_key_values = outputs
+			outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
+
+		return outputs
 
 	def __repr__(self):
 		"""The __repr__ function is used to generate a string representation of an object.
@@ -1083,7 +1323,7 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 		return self.__repr__()
 
 	@property
-	def config(self) -> EDPretrainedConfig:
+	def config(self) -> EasyDeLBaseConfig:
 		return self._config  # type:ignore
 
 	def to_easydel_state(
@@ -1348,7 +1588,7 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 		verbose: bool = True,
 		mismatch_allowed: bool = True,
 		*model_args,
-		config: Optional[Union[EDPretrainedConfig, str, os.PathLike]] = None,
+		config: Optional[Union[EasyDeLBaseConfig, str, os.PathLike]] = None,
 		cache_dir: Optional[Union[str, os.PathLike]] = None,
 		ignore_mismatched_sizes: bool = False,
 		force_download: bool = False,
@@ -1361,8 +1601,8 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 		loads EasyDeL Models
 		"""
 
-		from transformers import GenerationConfig
 		from huggingface_hub import HfApi
+		from transformers import GenerationConfig
 		from transformers.utils import download_url as _download_url
 		from transformers.utils import is_offline_mode as _is_offline_mode
 		from transformers.utils import is_remote_url as _is_remote_url
@@ -1412,7 +1652,7 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 		if config_kwargs is not None:
 			for k, v in config_kwargs.items():
 				setattr(config, k, v)
-		_, model_kwargs = EDPretrainedConfig.from_pretrained(
+		_, model_kwargs = EasyDeLBaseConfig.from_pretrained(
 			config_path,
 			cache_dir=cache_dir,
 			return_unused_kwargs=True,
@@ -1501,8 +1741,8 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 		else:
 			resolved_archive_file = None
 
-		if cls.__name__ == "EDPretrainedModel":
-			# if they are using EDPretrainedModel.from_pretrained
+		if cls.__name__ == "EasyDeLBaseModule":
+			# if they are using EasyDeLBaseModule.from_pretrained
 			# they will get error AssertionError: `module` must be provided.` so we autoset this to make sure user don't
 			# experience this error.
 			_, cls, _ = get_modules_by_type(config.model_type)
@@ -1743,3 +1983,555 @@ class EDPretrainedModel(FlaxPreTrainedModel):
 			params,
 		)
 		return params
+
+
+class EasyDeLBaseVisionModule(EasyDeLBaseModule):
+	def init_cache(self, batch_size, max_length):
+		input_ids = jnp.ones((batch_size, max_length))
+		attention_mask = jnp.ones_like(input_ids)
+		position_ids = jnp.broadcast_to(
+			jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape
+		)
+		vision_mask = jnp.ones((batch_size, max_length), dtype=bool)
+
+		init_variables = self.module.init(
+			jax.random.PRNGKey(0),
+			input_ids=input_ids,
+			vision_mask=vision_mask,
+			attention_mask=attention_mask,
+			position_ids=position_ids,
+			return_dict=False,
+			init_cache=True,
+		)
+		return init_variables["cache"]
+
+	def init_weights(
+		self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+	) -> FrozenDict:
+		"""The init_weights function is used to initialize the weights of a model.
+
+		Args:
+		    self: Access variables that belong to the class
+		    rng: jax.random.PRNGKey: Initialize the weights of the model
+		    input_shape: Tuple: Specify the shape of the input tensor
+		    params: FrozenDict: Pass in the parameters of a pre-trained
+		        model
+
+		Returns:
+		    A frozendict of parameters
+		"""
+		input_ids = jnp.zeros(input_shape, dtype="i4")
+		attention_mask = jnp.ones_like(input_ids)
+		vision_mask = jnp.ones(input_ids.shape, dtype=bool)
+		position_ids = jnp.broadcast_to(
+			jnp.arange(jnp.atleast_2d(input_ids).shape[-1]),
+			input_shape,
+		)
+		params_rng, dropout_rng = jax.random.split(rng)
+
+		random_params = self.module.init(
+			{"params": params_rng, "dropout": dropout_rng},
+			input_ids=input_ids,
+			vision_mask=vision_mask,
+			attention_mask=attention_mask,
+			position_ids=position_ids,
+			return_dict=False,
+		)["params"]
+
+		if params is not None:
+			random_params = flatten_dict(unfreeze(random_params))
+			params = flatten_dict(unfreeze(params))
+			for missing_key in self._missing_keys:
+				params[missing_key] = random_params[missing_key]
+			self._missing_keys = set()
+			return freeze(unflatten_dict(params))
+		else:
+			return random_params
+
+	def __call__(
+		self,
+		input_ids: chex.Array,
+		vision_mask: Optional[chex.Array] = None,
+		attention_mask: Optional[chex.Array] = None,
+		position_ids: Optional[chex.Array] = None,
+		params: dict = None,
+		past_key_values: Optional[dict] = None,
+		dropout_rng: jax.random.PRNGKey = None,
+		train: bool = False,
+		output_attentions: Optional[bool] = None,
+		output_hidden_states: Optional[bool] = None,
+		return_dict: Optional[bool] = None,
+		extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+		add_params_field: bool = False,
+		**kwargs,
+	):
+		output_attentions = (
+			output_attentions
+			if output_attentions is not None
+			else self.config.output_attentions
+		)
+		output_hidden_states = (
+			output_hidden_states
+			if output_hidden_states is not None
+			else self.config.output_hidden_states
+		)
+		return_dict = return_dict if return_dict is not None else self.config.return_dict
+
+		batch_size, sequence_length = input_ids.shape
+
+		if position_ids is None:
+			if past_key_values is not None:
+				raise ValueError(
+					"Make sure to provide `position_ids` when passing `past_key_values`."
+				)
+
+			position_ids = jnp.broadcast_to(
+				jnp.arange(sequence_length)[None, :], (batch_size, sequence_length)
+			)
+
+		if attention_mask is None:
+			attention_mask = jnp.ones((batch_size, sequence_length))
+
+		rngs = {}
+		if dropout_rng is not None:
+			rngs["dropout"] = dropout_rng
+
+		inputs = (
+			{
+				"params": params or self.params,
+			}
+			if add_params_field
+			else params or self.params
+		)
+
+		if past_key_values is not None:
+			inputs["cache"] = past_key_values
+			mutable = ["cache"]
+		else:
+			mutable = False
+		kwargs.pop("deterministic", None)
+		kwargs.pop("init_cache", None)
+		child_call_args = dict(
+			input_ids=jnp.array(input_ids, dtype="i4"),
+			vision_mask=jnp.array(vision_mask, dtype="f4"),
+			attention_mask=jnp.array(attention_mask, dtype="i4"),
+			position_ids=jnp.array(position_ids, dtype="i4"),
+			deterministic=not train,
+			init_cache=False,
+			output_attentions=output_attentions,
+			output_hidden_states=output_hidden_states,
+			return_dict=return_dict,
+			extra_embedding=extra_embedding,
+			**kwargs,
+		)
+		all_kwargs = {k: v for k, v in child_call_args.items()}
+		filtered_kwargs = self._validate_signature(self.module.__call__, (), all_kwargs)
+		outputs = self.module.apply(inputs, rngs=rngs, mutable=mutable, **filtered_kwargs)
+
+		if past_key_values is not None and return_dict:
+			outputs, past_key_values = outputs
+			outputs["past_key_values"] = unfreeze(past_key_values["cache"])
+			return outputs
+		elif past_key_values is not None and not return_dict:
+			outputs, past_key_values = outputs
+			outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
+
+		return outputs
+
+	def prepare_inputs_for_generation(
+		self,
+		input_ids: jax.Array,
+		max_length: int,
+		attention_mask: Optional[jax.Array] = None,
+		vision_mask: Optional[jax.Array] = None,
+	):
+		# initializing the cache
+		batch_size, seq_length = input_ids.shape
+
+		past_key_values = self.init_cache(batch_size, max_length)
+		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
+		if attention_mask is not None:
+			position_ids = attention_mask.cumsum(axis=-1) - 1
+			extended_attention_mask = lax.dynamic_update_slice(
+				extended_attention_mask, attention_mask, (0, 0)
+			)
+		else:
+			position_ids = jnp.broadcast_to(
+				jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length)
+			)
+
+		return {
+			"past_key_values": past_key_values,
+			"attention_mask": extended_attention_mask,
+			"position_ids": position_ids,
+			"vision_mask": vision_mask,
+		}
+
+	def update_inputs_for_generation(self, model_outputs, model_kwargs):
+		return {
+			"past_key_values": model_outputs.past_key_values,
+			"position_ids": model_kwargs["position_ids"][:, -1:] + 1,
+			"attention_mask": model_kwargs["attention_mask"],
+			"vision_mask": model_kwargs["vision_mask"],
+		}
+
+	def _sample_vision(
+		self,
+		input_ids: None,
+		max_length: Optional[int] = None,
+		pad_token_id: Optional[int] = None,
+		eos_token_id: Optional[int] = None,
+		prng_key: Optional[jnp.ndarray] = None,
+		logits_processor: Optional[FlaxLogitsProcessorList] = None,
+		logits_warper: Optional[FlaxLogitsProcessorList] = None,
+		cfg_scales: jnp.ndarray = 1.0,
+		trace: bool = True,
+		params: Optional[Dict[str, jnp.ndarray]] = None,
+		model_kwargs: Optional[Dict[str, jnp.ndarray]] = None,
+	):
+		# init values
+		max_length = (
+			max_length if max_length is not None else self.generation_config.max_length
+		)
+		pad_token_id = (
+			pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
+		)
+		eos_token_id = (
+			eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
+		)
+		prng_key = prng_key if prng_key is not None else jax.random.PRNGKey(0)
+
+		batch_size, cur_len = input_ids.shape
+		initial_len = cur_len
+
+		eos_token_id = jnp.array(
+			eos_token_id, dtype=jnp.int32 if eos_token_id is not None else None
+		)
+		pad_token_id = jnp.array(pad_token_id, dtype=jnp.int32)
+		cur_len = jnp.array(cur_len)
+
+		# per batch-item holding current token in loop.
+		sequences = jnp.full((batch_size, max_length), pad_token_id, dtype=jnp.int32)
+		sequences = lax.dynamic_update_slice(sequences, input_ids, (0, 0))
+
+		# per batch-item state bit indicating if sentence has finished.
+		is_sent_finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
+
+		# For Seq2Seq generation, we only need to use the decoder instead of the whole model in generation loop
+		# and pass it the `encoder_outputs`, which are part of the `model_kwargs`.
+		model = self.decode if self.config.is_encoder_decoder else self
+
+		# initialize model specific kwargs
+		model_kwargs = self.prepare_inputs_for_generation(
+			input_ids, max_length, **model_kwargs
+		)
+
+		# initialize state
+		state = SampleState(
+			cur_len=cur_len,
+			sequences=sequences,
+			running_token=input_ids,
+			is_sent_finished=is_sent_finished,
+			prng_key=prng_key,
+			model_kwargs=model_kwargs,
+		)
+
+		def sample_search_cond_fn(state):
+			"""state termination condition fn."""
+			has_reached_max_length = state.cur_len == max_length
+			all_sequence_finished = jnp.all(state.is_sent_finished)
+			finish_generation = jnp.logical_or(has_reached_max_length, all_sequence_finished)
+			return ~finish_generation
+
+		def sample_search_body_fn(state):
+			"""state update fn."""
+			prng_key, prng_key_next = jax.random.split(state.prng_key)
+			model_outputs = model(state.running_token, params=params, **state.model_kwargs)
+
+			logits = model_outputs.logits[:, -1]
+			cond_logits, uncond_logits = jnp.split(logits, 2, axis=0)
+			logits = uncond_logits + cfg_scales[:, None] * (cond_logits - uncond_logits)
+
+			# apply min_length, ...
+			logits = logits_processor(state.sequences, logits, state.cur_len)
+			# apply top_p, top_k, temperature
+			logits = logits_warper(logits, logits, state.cur_len)
+
+			next_token = jax.random.categorical(prng_key, logits, axis=-1)
+			next_token = jax.lax.cond(
+				(state.cur_len - initial_len + 1) % 257 == 0,
+				lambda: jnp.full_like(next_token, 8192),
+				lambda: next_token,
+			)
+			next_token = jnp.concatenate([next_token, next_token], axis=0)
+
+			# next_token = next_token * ~state.is_sent_finished + pad_token_id * state.is_sent_finished
+			next_is_sent_finished = state.is_sent_finished | (next_token == eos_token_id)
+			next_token = next_token[:, None]
+
+			next_sequences = lax.dynamic_update_slice(
+				state.sequences, next_token, (0, state.cur_len)
+			)
+			next_model_kwargs = self.update_inputs_for_generation(
+				model_outputs, state.model_kwargs
+			)
+
+			return SampleState(
+				cur_len=state.cur_len + 1,
+				sequences=next_sequences,
+				running_token=next_token,
+				is_sent_finished=next_is_sent_finished,
+				model_kwargs=next_model_kwargs,
+				prng_key=prng_key_next,
+			)
+
+		if input_ids.shape[1] > 1:
+			state = sample_search_body_fn(state)
+
+		if not trace:
+			state = self._run_loop_in_debug(
+				sample_search_cond_fn, sample_search_body_fn, state
+			)
+		else:
+			state = lax.while_loop(sample_search_cond_fn, sample_search_body_fn, state)
+
+		return FlaxSampleOutput(sequences=state.sequences)
+
+	def generate_vision(
+		self,
+		input_ids: jnp.ndarray,
+		cfg_scales: jnp.ndarray,
+		generation_config: Optional["transformers.GenerationConfig"] = None,  # noqa #type:ignore
+		prng_key: Optional[jnp.ndarray] = None,
+		trace: bool = True,
+		params: Optional[Dict[str, jnp.ndarray]] = None,
+		logits_processor: Optional[FlaxLogitsProcessorList] = None,
+		**kwargs,
+	):
+		self._validate_model_class()
+
+		if generation_config is None:
+			if (
+				self.generation_config._from_model_config
+				and self.generation_config._original_object_hash == hash(self.generation_config)
+			):
+				from transformers import GenerationConfig
+
+				new_generation_config = GenerationConfig.from_model_config(self.config)
+				if new_generation_config != self.generation_config:
+					logger.warn(
+						"You have modified the pretrained model configuration to control generation. This is a"
+						" deprecated strategy to control generation and will be removed soon, in a future version."
+						" Please use and modify the model generation configuration (see"
+						" https://huggingface.co/docs/transformers/generation_strategies#"
+						"default-text-generation-configuration )"
+					)
+					self.generation_config = new_generation_config
+			generation_config = self.generation_config
+		import copy
+
+		generation_config = copy.deepcopy(generation_config)
+		model_kwargs = generation_config.update(
+			**kwargs
+		)  # All unused kwargs must be model kwargs
+		generation_config.validate()
+		self._validate_model_kwargs(model_kwargs.copy())
+
+		logits_processor = (
+			logits_processor if logits_processor is not None else FlaxLogitsProcessorList()
+		)
+
+		# set init values
+		prng_key = prng_key if prng_key is not None else jax.random.PRNGKey(0)
+
+		if (
+			generation_config.pad_token_id is None
+			and generation_config.eos_token_id is not None
+		):
+			if model_kwargs.get("attention_mask") is None:
+				logger.warn(
+					"The attention mask and the pad token id were not set. As a consequence, you may observe "
+					"unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results."
+				)
+			eos_token_id = generation_config.eos_token_id
+			if isinstance(eos_token_id, list):
+				eos_token_id = eos_token_id[0]
+			logger.warn(
+				f"Setting `pad_token_id` to `eos_token_id`:{eos_token_id} for open-end generation."
+			)
+			generation_config.pad_token_id = eos_token_id
+
+		if (
+			generation_config.decoder_start_token_id is None
+			and self.config.is_encoder_decoder
+		):
+			raise ValueError(
+				"`decoder_start_token_id` has to be defined for encoder-decoder generation."
+			)
+
+		# decoder-only models should use left-padding for generation (can't be checked with `trace=True`)
+		if not self.config.is_encoder_decoder and not trace:
+			if (
+				generation_config.pad_token_id is not None
+				and jnp.sum(input_ids[:, -1] == generation_config.pad_token_id) > 0
+			):
+				logger.warn(
+					"A decoder-only architecture is being used, but right-padding was detected! For correct "
+					"generation results, please set `padding_side='left'` when initializing the tokenizer."
+				)
+
+		batch_size = input_ids.shape[0]
+
+		if self.config.is_encoder_decoder:
+			# add encoder_outputs to model_kwargs
+			if model_kwargs.get("encoder_outputs") is None:
+				model_kwargs = self._prepare_encoder_decoder_kwargs_for_generation(
+					input_ids, params, model_kwargs
+				)
+			# prepare decoder_input_ids for generation
+			input_ids = self._prepare_decoder_input_ids_for_generation(
+				batch_size,
+				decoder_start_token_id=generation_config.decoder_start_token_id,
+				bos_token_id=generation_config.bos_token_id,
+				model_kwargs=model_kwargs,
+			)
+
+		# Prepare `max_length` depending on other stopping criteria.
+		input_ids_seq_length = input_ids.shape[-1]
+		has_default_max_length = (
+			kwargs.get("max_length") is None and generation_config.max_length is not None
+		)
+		if (
+			has_default_max_length
+			and generation_config.max_new_tokens is None
+			and generation_config.max_length == 20
+		):
+			# 20 is the default max_length of the generation config
+			logger.warn(
+				f"Using the model-agnostic default `max_length` (={generation_config.max_length}) "
+				"to control the generation length.  recommend setting `max_new_tokens` to control"
+				" the maximum length of the generation.",
+				UserWarning,
+			)
+		elif generation_config.max_new_tokens is not None:
+			if not has_default_max_length and generation_config.max_length is not None:
+				logger.warn(
+					f"Both `max_new_tokens` (={generation_config.max_new_tokens}) and `max_length`(="
+					f"{generation_config.max_length}) seem to have been set. `max_new_tokens` will take precedence. "
+					"Please refer to the documentation for more information. "
+					"(https://huggingface.co/docs/transformers/main/en/main_classes/text_generation)"
+				)
+			generation_config.max_length = (
+				generation_config.max_new_tokens + input_ids_seq_length
+			)
+
+		if (
+			generation_config.min_length is not None
+			and generation_config.min_length > generation_config.max_length
+		):
+			raise ValueError(
+				f"Unfeasable length constraints: the minimum length ({generation_config.min_length}) is larger than"
+				f" the maximum length ({generation_config.max_length})"
+			)
+		if input_ids_seq_length >= generation_config.max_length:
+			input_ids_string = (
+				"decoder_input_ids" if self.config.is_encoder_decoder else "input_ids"
+			)
+			logger.warn(
+				f"Input length of {input_ids_string} is {input_ids_seq_length}, but `max_length` is set to"
+				f" {generation_config.max_length}. This can lead to unexpected behavior. You should consider"
+				" increasing`max_new_tokens`."
+			)
+
+		logits_processor = self._get_logits_processor(
+			generation_config=generation_config,
+			input_ids_seq_length=input_ids_seq_length,
+			logits_processor=logits_processor,
+		)
+
+		if not generation_config.do_sample and generation_config.num_beams == 1:
+			raise NotImplementedError
+		elif generation_config.do_sample and generation_config.num_beams == 1:
+			logits_warper = self._get_logits_warper(generation_config=generation_config)
+			return self._sample_vision(
+				input_ids,
+				generation_config.max_length,
+				generation_config.pad_token_id,
+				generation_config.eos_token_id,
+				prng_key,
+				logits_warper=logits_warper,
+				logits_processor=logits_processor,
+				cfg_scales=cfg_scales,
+				trace=trace,
+				params=params,
+				model_kwargs=model_kwargs,
+			)
+		elif not generation_config.do_sample and generation_config.num_beams > 1:
+			raise NotImplementedError
+		else:
+			raise NotImplementedError("`Beam sampling is currently not implemented.")
+
+
+def wrap_easydel_module(
+	config_class: Type[EasyDeLBaseConfig],
+	base_model_prefix: str = "model",
+):
+	def wrapper(mdl: Type[M]) -> Type[EasyDeLBaseModule]:
+		class_dict = {
+			"config_class": config_class,
+			"base_model_prefix": base_model_prefix,
+			"module_class": mdl,
+			"flax_module": mdl,
+			"__annotations__": {
+				"config_class": Type[EasyDeLBaseConfig],
+				"base_model_prefix": str,
+				"flax_module": Type[M],
+				"module_class": Union[flax.linen.Module, Type[M]],
+			},
+		}
+
+		for name, attr in mdl.__dict__.items():
+			if not name.startswith("__"):
+				class_dict[name] = attr
+
+		WrappedModule = type(mdl.__name__, (EasyDeLBaseModule,), class_dict)
+		WrappedModule.__module__ = mdl.__module__
+		WrappedModule.__qualname__ = mdl.__qualname__
+		WrappedModule.__doc__ = mdl.__doc__
+
+		return WrappedModule
+
+	return wrapper
+
+
+def wrap_custom_easydel_module(
+	base,
+	config_class: Type[EasyDeLBaseConfig],
+	base_model_prefix: str = "model",
+):
+	def wrapper(mdl: Type[M]) -> Type[EasyDeLBaseModule]:
+		class_dict = {
+			"config_class": config_class,
+			"base_model_prefix": base_model_prefix,
+			"module_class": mdl,
+			"flax_module": mdl,
+			"__annotations__": {
+				"config_class": Type[EasyDeLBaseConfig],
+				"base_model_prefix": str,
+				"flax_module": Type[M],
+				"module_class": Union[flax.linen.Module, Type[M]],
+			},
+		}
+
+		for name, attr in mdl.__dict__.items():
+			if not name.startswith("__"):
+				class_dict[name] = attr
+
+		WrappedModule = type(mdl.__name__, (base,), class_dict)
+		WrappedModule.__module__ = mdl.__module__
+		WrappedModule.__qualname__ = mdl.__qualname__
+		WrappedModule.__doc__ = mdl.__doc__
+
+		return WrappedModule
+
+	return wrapper

@@ -6,114 +6,78 @@ Modules
 
    modules.dbrx.dbrx_configuration
    modules.dbrx.modelling_dbrx_flax
-   modules.dbrx.kernels
-   modules.qwen1.qwen1_configuration
-   modules.qwen1.kernels
-   modules.qwen1.modeling_qwen1_flax
    modules.phi.modelling_phi_flax
    modules.phi.phi_configuration
-   modules.phi.kernels
    modules.chatglm.chatglm_configuration
    modules.chatglm.modelling_chatglm_flax
-   modules.llama.modeling_vision_llama_flax
    modules.llama.llama_configuration
-   modules.llama.kernels
    modules.llama.modeling_llama_flax
-   modules.llama.vision_llama_configuration
    modules.whisper.modelling_whisper_flax
    modules.whisper.whisper_configuration
    modules.phi3.phi3_configuration
-   modules.phi3.kernels
    modules.phi3.modelling_phi3_flax
    modules.auto_models
    modules.zamba2.zamba2_configuration
    modules.zamba2.modeling_zamba2_flax
-   modules.phimoe.kernels
    modules.phimoe.modeling_phimoe_flax
    modules.phimoe.phimoe_configuration
    modules.falcon.falcon_configuration
    modules.falcon.modeling_falcon_flax
-   modules.falcon.kernels
    modules.gpt2.gpt2_configuration
    modules.gpt2.modeling_gpt2_flax
    modules.openelm.openelm_configuration
-   modules.openelm.kernels
    modules.openelm.modelling_openelm_flax
    modules.opt.opt_configuration
    modules.opt.modelling_opt_flax
    modules.mosaic_mpt.modelling_mpt_flax
    modules.mosaic_mpt.mosaic_configuration
-   modules.mosaic_mpt.kernels
    modules.qwen2.qwen_configuration
    modules.qwen2.modeling_qwen_flax
-   modules.qwen2.kernels
    modules.modeling_utils
    modules.mixtral.modelling_mixtral_flax
    modules.mixtral.mixtral_configuration
-   modules.mixtral.kernels
    modules.internlm2.internlm2_configuration
    modules.internlm2.modeling_internlm2_flax
-   modules.internlm2.kernels
-   modules.mistral.vision_mistral_configuration
    modules.mistral.modelling_mistral_flax
-   modules.mistral.kernels
    modules.mistral.mistral_configuration
    modules.xerxes.xerxes_configuration
    modules.xerxes.modeling_xerxes_flax
-   modules.xerxes.kernels
    modules.grok_1.grok_1_configuration
-   modules.grok_1.kernels
    modules.grok_1.modeling_grok_1_flax
    modules.gpt_j.gpt_j_configuration
    modules.gpt_j.modeling_gpt_j_flax
-   modules.gpt_j.kernels
    modules.qwen2_moe.configuration_qwen2_moe
-   modules.qwen2_moe.kernels
    modules.qwen2_moe.modeling_qwen2_moe_flax
    modules.roberta.roberta_configuration
    modules.roberta.modelling_roberta_flax
    modules.factory
    modules.deepseek_v2.deepseek_configuration
    modules.deepseek_v2.modeling_deepseek_flax
-   modules.deepseek_v2.kernels
-   modules.common
    modules.olmo.modelling_olmo_flax
    modules.olmo.olmo_configuration
-   modules.olmo.kernels
    modules.modeling_flax_outputs
    modules.flax_modeling_utils
    modules.exaone.exaone_configuration
    modules.exaone.modeling_exaone_flax
-   modules.exaone.kernels
    modules.gemma.modeling_gemma_flax
    modules.gemma.gemma_configuration
-   modules.gemma.kernels
    modules.gemma2.gemma2_configuration
    modules.gemma2.modeling_gemma2_flax
-   modules.gemma2.kernels
    modules.rwkv.modelling_rwkv_flax
    modules.rwkv.rwkv_configuration
    modules.t5.t5_configuration
-   modules.t5.kernels
    modules.t5.modelling_t5_flax
-   modules._blockwise_attention
    modules.mamba.mamba_configuration
    modules.mamba.modelling_mamba_flax
    modules.stablelm.modelling_stablelm_flax
    modules.stablelm.stablelm_configuration
-   modules.stablelm.kernels
-   modules.attention_module
-   modules._vanilla_attention
    modules.arctic.arctic_configuration
-   modules.arctic.kernels
    modules.arctic.modelling_arctic_flax
    modules.mamba2.mamba2_configuration
    modules.mamba2.modelling_mamba2_flax
    modules.palm.palm_configuration
    modules.palm.modelling_palm_flax
    modules.gpt_neo_x.modeling_gpt_neo_x_flax
-   modules.gpt_neo_x.kernels
    modules.gpt_neo_x.gpt_neo_x_configuration
    modules.cohere.modelling_cohere_flax
-   modules.cohere.kernels
    modules.cohere.cohere_configuration

@@ -38,10 +38,10 @@ def main():
 			mask_max_position_embeddings=max_length,
 			quantize_kv_cache=True,
 			attn_dtype=jnp.float16,
-			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
-			attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
+			# kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
+			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		),
-		quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
+		# quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
 		param_dtype=dtype,
 		dtype=dtype,
 		torch_dtype=torch.float16,
@@ -61,7 +61,7 @@ def main():
 			top_p=model.generation_config.top_p,
 			top_k=model.generation_config.top_k,
 			eos_token_id=model.generation_config.eos_token_id,
-			streaming_chunks=8,
+			streaming_chunks=16,
 		),
 	)
 	print("Compiling")

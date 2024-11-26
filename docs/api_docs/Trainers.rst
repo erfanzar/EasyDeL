@@ -8,6 +8,7 @@ Trainers
    trainers.utils
    trainers.prompt_utils
    trainers.odds_ratio_preference_optimization_trainer.orpo_trainer
+   trainers.odds_ratio_preference_optimization_trainer.orpo_config
    trainers.odds_ratio_preference_optimization_trainer.modelling_output
    trainers.odds_ratio_preference_optimization_trainer.fwd_bwd_functions
    trainers.causal_language_model_trainer.functions

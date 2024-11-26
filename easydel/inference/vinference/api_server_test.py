@@ -1,7 +1,8 @@
-import aiohttp
 import asyncio
 import json
-from typing import List, Dict, Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Dict, List
+
+import aiohttp
 
 
 class ChatCompletionClient:

@@ -14,8 +14,8 @@
 
 from easydel.modules.xerxes.modeling_xerxes_flax import (
 	FlaxXerxesForCausalLM,
-	FlaxXerxesForCausalLMModule,
 	FlaxXerxesModel,
-	FlaxXerxesModule,
 )
 from easydel.modules.xerxes.xerxes_configuration import XerxesConfig
+
+__all__ = "FlaxXerxesForCausalLM", "FlaxXerxesModel", "XerxesConfig"

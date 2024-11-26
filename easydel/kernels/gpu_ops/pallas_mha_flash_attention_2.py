@@ -522,7 +522,7 @@ def _flash_attn2(
 	softmax_scale: float = None,
 ):
 	chex.assert_equal_shape(inputs=(k, v), dims=(0, 1, 2, 3))
-	chex.assert_equal_rank([q, k, v]) 
+	chex.assert_equal_rank([q, k, v])
 	if _PLATFORM in ["gpu", "cpu"]:
 		return _gpu_flash_attn(
 			q=q,
