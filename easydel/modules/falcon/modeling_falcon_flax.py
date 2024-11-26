@@ -23,11 +23,9 @@ import jax
 from flax import linen as nn
 from flax.linen import Dense
 from jax import numpy as jnp
-from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.rotary_embedding import get_rope
 from easydel.modules.factory import register_module
 from easydel.modules.falcon.falcon_configuration import FalconConfig as FalconConfig
 from easydel.modules.flax_modeling_utils import (
@@ -35,7 +33,6 @@ from easydel.modules.flax_modeling_utils import (
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
-	with_sharding_constraint,
 )
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
@@ -165,21 +162,12 @@ class FlaxFalconAttention(FlaxAttentionModule):
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		if not self.config.alibi:
-			initial_rope_kwargs = dict(rope_type="default")
-			if self.config.rope_scaling is not None:
-				initial_rope_kwargs = dict(
-					factor=self.config.rope_scaling["factor"],
-					rope_type=self.config.rope_scaling["type"],
-				)
-
-			self.rotary = get_rope(
-				max_position=self.config.granted_freq_max_position_embedding,
+			self.rotary = self.config.get_basic_rope(
 				rotary_dim=self.config.hidden_size // self.config.num_attention_heads,
 				head_size=self.config.hidden_size // self.config.num_attention_heads,
 				base=self.config.rope_theta,
 				is_neox_style=True,
 				dtype=self.dtype,
-				rope_scaling=initial_rope_kwargs,
 			)
 		self.attention_performer = FlexibleAttentionModule(
 			attention_dropout=0.0,
@@ -273,6 +261,7 @@ class FlaxFalconAttention(FlaxAttentionModule):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		deterministic: bool = False,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the attention module.
@@ -321,20 +310,25 @@ class FlaxFalconAttention(FlaxAttentionModule):
 		)
 		if alibi is None:
 			query_layer, key_layer = self.rotary(
-				position_ids,
-				query_layer,
-				key_layer,
-			)
-		query_layer, key_layer, value_layer, attention_mask, attention_bias = (
-			self.concatenate_to_cache(
-				init_cache=init_cache,
+				positions=position_ids,
 				query=query_layer,
 				key=key_layer,
-				value=value_layer,
-				attention_mask=attention_mask,
-				causal_mask=causal_mask,
-				fcm_mask=None,
+				frequencies=frequencies,
 			)
+		(
+			query_layer,
+			key_layer,
+			value_layer,
+			attention_mask,
+			attention_bias,
+		) = self.concatenate_to_cache(
+			init_cache=init_cache,
+			query=query_layer,
+			key=key_layer,
+			value=value_layer,
+			attention_mask=attention_mask,
+			causal_mask=causal_mask,
+			fcm_mask=None,
 		)
 
 		if alibi is None:
@@ -384,16 +378,7 @@ class FlaxFalconAttention(FlaxAttentionModule):
 			attn_output = attn_output.reshape(
 				(attn_output.shape[1] * attn_output.shape[0],) + attn_output.shape[2:]
 			)
-			attn_output = self._merge_heads(attn_output)
-			if self.config.shard_attention_computation:
-				attn_output = with_sharding_constraint(
-					attn_output,
-					PartitionSpec(
-						("dp", "fsdp"),
-						"sp" if attn_output.shape[1] != 1 else None,
-						"tp",
-					),
-				)
+			attn_output = self.shard_attention_prod(self._merge_heads(attn_output))
 
 			output_tensor = self.dense(attn_output)
 
@@ -465,7 +450,7 @@ class FlaxFalconBlock(nn.Module):
 			attn_block = flax.linen.partitioning.remat(
 				attn_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-				static_argnums=(3, 6, 7, 8),
+				static_argnums=(3, 6, 7, 8, 9),
 			)
 
 			mlp_block = flax.linen.partitioning.remat(
@@ -501,6 +486,7 @@ class FlaxFalconBlock(nn.Module):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		deterministic: bool = False,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the FalconBlock module.
@@ -537,6 +523,7 @@ class FlaxFalconBlock(nn.Module):
 			init_cache,
 			output_attentions,
 			deterministic,
+			frequencies,
 		)
 
 		if self.config.num_ln_in_parallel_attn == 1:
@@ -597,6 +584,12 @@ class FlaxFalconCollection(nn.Module):
 			for i in range(self.config.num_hidden_layers)
 		]
 
+		self._frequencies = self.config.get_basic_frequencies(
+			rotary_dim=self.config.hidden_size // self.config.num_attention_heads,
+			head_size=self.config.hidden_size // self.config.num_attention_heads,
+			base=self.config.rope_theta,
+		)
+
 	def __call__(
 		self,
 		hidden_states: chex.Array,
@@ -644,6 +637,7 @@ class FlaxFalconCollection(nn.Module):
 				output_attentions=output_attentions,
 				deterministic=deterministic,
 				segment_ids=segment_ids,
+				frequencies=self._frequencies,
 			)
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)

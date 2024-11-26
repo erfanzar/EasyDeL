@@ -25,7 +25,6 @@ from flax.linen import Dense, make_causal_mask
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers, get_logger
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.rotary_embedding import get_rope
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
@@ -78,8 +77,8 @@ class FlaxGPTJAttention(FlaxAttentionModule):
 			jnp.ones((1, config.max_position_embeddings), dtype="bool"), dtype="bool"
 		)
 
-		self.rotary = get_rope(
-			max_position=config.max_position_embeddings,
+		self.rotary = self.config.get_basic_rope(
+			self.dtype,
 			head_size=self.embed_dim,
 			rotary_dim=self.rotary_dim,
 			base=10000,
@@ -118,6 +117,7 @@ class FlaxGPTJAttention(FlaxAttentionModule):
 		deterministic: bool = True,
 		init_cache: bool = False,
 		output_attentions: bool = False,
+		frequencies: Optional[chex.Array] = None,
 	):
 		query = self.q_proj(hidden_states)
 		key = self.k_proj(hidden_states)
@@ -127,13 +127,24 @@ class FlaxGPTJAttention(FlaxAttentionModule):
 		key = self._split_heads(key)
 		value = self._split_heads(value)
 
-		query, key = self.rotary(position_ids, query, key)
+		query, key = self.rotary(
+			positions=position_ids,
+			query=query,
+			key=key,
+			frequencies=frequencies,
+		)
 		query_length, key_length = query.shape[1], key.shape[1]
 
 		dropout_rng = None
 		if not deterministic and self.config.attn_pdrop > 0.0:
 			dropout_rng = self.make_rng("dropout")
-		query, key, value, attention_mask, attention_bias = self.concatenate_to_cache(
+		(
+			query,
+			key,
+			value,
+			attention_mask,
+			attention_bias,
+		) = self.concatenate_to_cache(
 			init_cache=init_cache,
 			query=query,
 			key=key,
@@ -232,7 +243,7 @@ class FlaxGPTJBlock(nn.Module):
 			attn_block = flax.linen.partitioning.remat(
 				attn_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-				static_argnums=(4, 5, 6),
+				static_argnums=(3, 4, 5, 6),
 			)
 
 			mlp_block = flax.linen.partitioning.remat(
@@ -263,6 +274,7 @@ class FlaxGPTJBlock(nn.Module):
 		deterministic: bool = True,
 		init_cache: bool = False,
 		output_attentions: bool = False,
+		frequencies: Optional[chex.Array] = None,
 	):
 		residual = hidden_states
 		hidden_states = self.ln_1(hidden_states)
@@ -280,6 +292,7 @@ class FlaxGPTJBlock(nn.Module):
 			deterministic,
 			init_cache,
 			output_attentions,
+			frequencies,
 		)
 		attn_output = attn_outputs[0]
 		if self.config.use_scan_mlp:
@@ -311,6 +324,11 @@ class FlaxGPTJBlockCollection(nn.Module):
 			)
 			for i in range(self.config.num_hidden_layers)
 		]
+		self._frequencies = self.config.get_basic_frequencies(
+			head_size=self.config.hidden_size,
+			rotary_dim=self.config.rotary_dim,
+			base=10000,
+		)
 
 	def __call__(
 		self,
@@ -331,12 +349,13 @@ class FlaxGPTJBlockCollection(nn.Module):
 				all_hidden_states += (hidden_states,)
 
 			layer_outputs = block(
-				hidden_states,
-				attention_mask,
+				hidden_states=hidden_states,
+				attention_mask=attention_mask,
 				position_ids=position_ids,
 				deterministic=deterministic,
 				init_cache=init_cache,
 				output_attentions=output_attentions,
+				frequencies=self._frequencies,
 			)
 			hidden_states = layer_outputs[0]
 

@@ -26,7 +26,6 @@ from jax import lax
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers, get_logger
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.rotary_embedding import get_rope
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	block_wise_ffn,
@@ -118,19 +117,11 @@ class FlaxXerxesAttention(FlaxAttentionModule):
 			base_config=self.config,
 		)
 
-		initial_rope_kwargs = dict(rope_type="default")
-		if getattr(config, "rope_scaling", None) is not None:
-			scaling_type = config.rope_scaling["type"]
-			scaling_factor = config.rope_scaling["factor"]
-			initial_rope_kwargs = dict(scaling_factor=scaling_factor, rope_type=scaling_type)
-
-		self.rotary = get_rope(
-			head_size=self.head_dim,
-			rotary_dim=self.head_dim,
-			max_position=self.config.granted_freq_max_position_embedding,
-			base=config.rope_theta,
-			rope_scaling=initial_rope_kwargs,
-			dtype=self.dtype,
+		self.rotary = self.config.get_basic_rope(
+			self.dtype,
+			self.head_dim,
+			self.head_dim,
+			True,
 		)
 
 	def _split_heads(self, hidden_states, num_heads):
@@ -147,6 +138,7 @@ class FlaxXerxesAttention(FlaxAttentionModule):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the attention module.
@@ -193,6 +185,7 @@ class FlaxXerxesAttention(FlaxAttentionModule):
 			positions=position_ids,
 			query=query_states,
 			key=key_states,
+			frequencies=frequencies,
 		)
 
 		query_length, key_length = query_states.shape[1], key_states.shape[1]
@@ -424,7 +417,7 @@ class FlaxXerxesDecoderLayer(nn.Module):
 			attn_block = flax.linen.partitioning.remat(
 				attn_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-				static_argnums=(3, 5, 6, 7, 8),
+				static_argnums=(3, 5, 6, 7, 9),
 			)
 		self.self_attn = attn_block(
 			self.config,
@@ -462,6 +455,7 @@ class FlaxXerxesDecoderLayer(nn.Module):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the module block.
@@ -492,6 +486,7 @@ class FlaxXerxesDecoderLayer(nn.Module):
 			init_cache,
 			output_attentions,
 			fcm_mask,
+			frequencies,
 		)
 
 		hidden_states = self.post_attention_layernorm(hidden_states)
@@ -529,6 +524,10 @@ class FlaxXerxesLayerCollection(nn.Module):
 			)
 			for i in range(self.config.num_hidden_layers)
 		]
+		self._frequencies = self.config.get_basic_frequencies(
+			self.head_dim,
+			self.head_dim,
+		)
 
 	def __call__(
 		self,
@@ -597,6 +596,7 @@ class FlaxXerxesLayerCollection(nn.Module):
 				output_attentions=output_attentions,
 				fcm_mask=fcm_mask,
 				segment_ids=segment_ids,
+				frequencies=self._frequencies,
 			)
 			hidden_states = layer_outputs[0]
 

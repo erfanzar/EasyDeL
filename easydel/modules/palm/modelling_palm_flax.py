@@ -23,6 +23,7 @@ from einops import rearrange
 from flax import linen as nn
 from jax import numpy as np
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.norms import RMSNorm
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import get_gradient_checkpoint_policy
@@ -150,7 +151,7 @@ class ParallelCollection(nn.Module):
 
 	def setup(self) -> None:
 		block = ParallelPalmBlock
-		if self.config.gradient_checkpointing != "":
+		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			block = nn.remat(
 				block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),

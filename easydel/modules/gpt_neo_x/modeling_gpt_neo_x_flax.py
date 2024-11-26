@@ -26,7 +26,6 @@ from jax import numpy as jnp
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.rotary_embedding import get_rope
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
@@ -49,11 +48,10 @@ class FlaxGPTNeoXAttention(FlaxAttentionModule):
 
 	def setup(self) -> None:
 		self.head_size = self.config.hidden_size // self.config.num_attention_heads
-		self.rotary = get_rope(
+		self.rotary = self.config.get_basic_rope(
 			dtype=self.dtype,
 			head_size=self.head_size,
 			rotary_dim=self.head_size,
-			max_position=self.config.max_position_embeddings,
 			base=10000,
 		)
 		dense_class = functools.partial(
@@ -93,6 +91,7 @@ class FlaxGPTNeoXAttention(FlaxAttentionModule):
 		deterministic: bool = True,
 		init_cache: bool = False,
 		output_attentions: bool = False,
+		frequencies: Optional[chex.Array] = None,
 	):
 		b, s, d = hidden_states.shape
 		query, key, value = jnp.split(
@@ -104,13 +103,24 @@ class FlaxGPTNeoXAttention(FlaxAttentionModule):
 		key = rearrange(key, "b s (h d) -> b s h d", h=self.config.num_attention_heads)
 		value = rearrange(value, "b s (h d) -> b s h d", h=self.config.num_attention_heads)
 
-		query, key = self.rotary(position_ids, query, key)
+		query, key = self.rotary(
+			positions=position_ids,
+			query=query,
+			key=key,
+			frequencies=frequencies,
+		)
 		query_length, key_length = query.shape[1], key.shape[1]
 
 		dropout_rng = None
 		if not deterministic and self.config.attn_pdrop > 0.0:
 			dropout_rng = self.make_rng("dropout")
-		query, key, value, attention_mask, attention_bias = self.concatenate_to_cache(
+		(
+			query,
+			key,
+			value,
+			attention_mask,
+			attention_bias,
+		) = self.concatenate_to_cache(
 			init_cache=init_cache,
 			query=query,
 			key=key,
@@ -194,7 +204,7 @@ class FlaxGPTNeoXBlock(nn.Module):
 			attn_block = flax.linen.partitioning.remat(
 				attn_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-				static_argnums=(4, 5, 6),
+				static_argnums=(4, 5, 6, 7),
 			)
 
 			mlp_block = flax.linen.partitioning.remat(
@@ -224,6 +234,7 @@ class FlaxGPTNeoXBlock(nn.Module):
 		deterministic: bool = True,
 		init_cache: bool = False,
 		output_attentions: bool = False,
+		frequencies: Optional[chex.Array] = None,
 	):
 		attn_out = self.attention(
 			self.input_layernorm(hidden_states),
@@ -233,6 +244,7 @@ class FlaxGPTNeoXBlock(nn.Module):
 			deterministic,
 			init_cache,
 			output_attentions,
+			frequencies,
 		)
 		attn = attn_out[0]
 		if self.use_parallel_residual:
@@ -263,6 +275,11 @@ class FlaxGPTNeoXCollection(nn.Module):
 			)
 			for i in range(self.config.num_hidden_layers)
 		]
+		self._frequencies = self.config.get_basic_frequencies(
+			head_size=self.head_size,
+			rotary_dim=self.head_size,
+			base=10000,
+		)
 
 	def __call__(
 		self,
@@ -283,6 +300,7 @@ class FlaxGPTNeoXCollection(nn.Module):
 				deterministic=deterministic,
 				init_cache=init_cache,
 				output_attentions=False,  # TODO Fix this one
+				frequencies=self._frequencies,
 			)
 			hidden_states = hidden_out[0]
 		return hidden_states

@@ -26,9 +26,9 @@ from flax.linen import partitioning as nn_partitioning
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import RMSNorm as RMSNorm
-from easydel.layers.rotary_embedding import get_rope
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
@@ -145,25 +145,11 @@ class FlaxPhiMoEAttention(FlaxAttentionModule):
 			sm_scale=1 / math.sqrt(self.head_dim),
 			base_config=self.config,
 		)
-		initial_rope_kwargs = dict(rope_type="default")
-		if hasattr(config, "rope_scaling"):
-			if config.rope_scaling is not None:
-				initial_rope_kwargs = dict(
-					long_factor=config.rope_scaling.get("long_factor", None),
-					short_factor=config.rope_scaling.get("short_factor", None),
-					rope_type=config.rope_scaling.get("type", None),
-					original_max_position_embeddings=config.rope_scaling.get(
-						"original_max_position_embeddings", None
-					),
-					long_mscale=config.rope_scaling.get("long_mscale", None),
-					short_mscale=config.rope_scaling.get("short_mscale", None),
-				)
-		self.rotary = get_rope(
-			max_position=self.config.granted_freq_max_position_embedding,
+
+		self.rotary = self.config.get_basic_rope(
+			self.dtype,
 			head_size=config.hidden_size // config.num_attention_heads,
 			rotary_dim=config.hidden_size // config.num_attention_heads,
-			base=config.rope_theta,
-			rope_scaling=initial_rope_kwargs,
 			is_neox_style=True,
 		)
 
@@ -178,6 +164,7 @@ class FlaxPhiMoEAttention(FlaxAttentionModule):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the attention module.
@@ -225,6 +212,7 @@ class FlaxPhiMoEAttention(FlaxAttentionModule):
 			query=query_states,
 			key=key_states,
 			positions=position_ids,
+			frequencies=frequencies,
 		)
 
 		dropout_rng = None
@@ -431,11 +419,11 @@ class FlaxPhiMoeDecoderLayer(nn.Module):
 	def setup(self):
 		attn_block = FlaxPhiMoEAttention
 		mlp_block = FlaxPhiMoeSparseMoeBlock
-		if self.config.gradient_checkpointing != "":
+		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			attn_block = re_mat(
 				attn_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-				static_argnums=(1, 3, 4, 6, 7, 8),
+				static_argnums=(3, 4, 6, 7, 9),
 			)
 			mlp_block = re_mat(
 				mlp_block,
@@ -482,6 +470,7 @@ class FlaxPhiMoeDecoderLayer(nn.Module):
 		output_attentions: bool = False,
 		output_router_logits: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the module block.
@@ -514,6 +503,7 @@ class FlaxPhiMoeDecoderLayer(nn.Module):
 			init_cache,
 			output_attentions,
 			fcm_mask,
+			frequencies,
 		)
 		hidden_states, self_attn_weights = (
 			(attn_out[0], attn_out[1]) if len(attn_out) == 2 else (attn_out[0], None)
@@ -566,6 +556,10 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
 			)
 			for idx in range(self.config.num_hidden_layers)
 		]
+		self._frequencies = self.config.get_basic_frequencies(
+			head_size=self.config.hidden_size // self.config.num_attention_heads,
+			rotary_dim=self.config.hidden_size // self.config.num_attention_heads,
+		)
 
 	def __call__(
 		self,
@@ -636,6 +630,7 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
 				output_attentions=output_attentions,
 				fcm_mask=fcm_mask,
 				segment_ids=segment_ids,
+				frequencies=self._frequencies,
 			)
 
 			hidden_states = layer_outputs[0]
