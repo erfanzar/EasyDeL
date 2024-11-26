@@ -24,10 +24,9 @@ from flax.linen import partitioning as nn_partitioning
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
-from easydel.etils.etils import get_logger
+from easydel.etils.etils import EasyDeLGradientCheckPointers, get_logger
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import RMSNorm
-from easydel.layers.rotary_embedding import get_rope
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
@@ -205,19 +204,8 @@ class FlaxMistralAttention(FlaxAttentionModule):
 			axis_name=self.config.attention_axis_name,
 			base_config=self.config,
 		)
-		initial_rope_kwargs = dict(rope_type="default")
-		if self.config.rope_scaling is not None:
-			scaling_type = self.config.rope_scaling["type"]
-			scaling_factor = self.config.rope_scaling["factor"]
-			initial_rope_kwargs = dict(scaling_factor=scaling_factor, rope_type=scaling_type)
 
-		self.rotary = get_rope(
-			max_position=self.config.granted_freq_max_position_embedding,
-			rotary_dim=self.config.head_dim,
-			head_size=self.config.head_dim,
-			base=config.rope_theta,
-			rope_scaling=initial_rope_kwargs,
-		)
+		self.rotary = self.config.get_basic_rope(self.dtype, self.head_dim)
 
 	def __call__(
 		self,
@@ -230,6 +218,7 @@ class FlaxMistralAttention(FlaxAttentionModule):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the attention module.
@@ -277,6 +266,7 @@ class FlaxMistralAttention(FlaxAttentionModule):
 			query=query_states,
 			key=key_states,
 			positions=position_ids,
+			frequencies=frequencies,
 		)
 
 		dropout_rng = None
@@ -351,11 +341,11 @@ class FlaxMistralDecoderLayer(nn.Module):
 		attn_block = FlaxMistralAttention
 		mlp_block = FlaxMistralMLP
 
-		if self.config.gradient_checkpointing != "":
+		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			attn_block = re_mat(
 				attn_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-				static_argnums=(1, 3, 4, 6, 7, 8),
+				static_argnums=(1, 3, 4, 6, 7, 9),
 			)
 			mlp_block = re_mat(
 				mlp_block,
@@ -398,6 +388,7 @@ class FlaxMistralDecoderLayer(nn.Module):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the module block.
@@ -427,6 +418,7 @@ class FlaxMistralDecoderLayer(nn.Module):
 			init_cache,
 			output_attentions,
 			fcm_mask,
+			frequencies,
 		)
 
 		hidden_states = attention_output[0] + residual
@@ -479,6 +471,7 @@ class FlaxMistralDecoratorCollection(nn.Module):
 			)
 			for i in range(self.config.num_hidden_layers)
 		]
+		self._frequencies = self.config.get_basic_frequencies()
 
 	def __call__(
 		self,
@@ -548,6 +541,7 @@ class FlaxMistralDecoratorCollection(nn.Module):
 				output_attentions=output_attentions,
 				fcm_mask=fcm_mask,
 				segment_ids=segment_ids,
+				frequencies=self._frequencies,
 			)
 			hidden_states = output[0]
 

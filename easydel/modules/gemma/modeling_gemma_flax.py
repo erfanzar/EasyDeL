@@ -23,9 +23,8 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.linen import Dense, make_causal_mask
 
-from easydel.etils.etils import get_logger
+from easydel.etils.etils import EasyDeLGradientCheckPointers, get_logger
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.rotary_embedding import get_rope
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
@@ -113,32 +112,11 @@ class FlaxGemmaAttention(FlaxAttentionModule):
 			mesh=self.config.mesh,
 		)
 
-		initial_rope_kwargs = dict(rope_type="default")
-		if getattr(config, "rope_scaling", None) is not None:
-			scaling_type = config.rope_scaling["type"]
-			scaling_factor = config.rope_scaling["factor"]
-			initial_rope_kwargs = dict(scaling_factor=scaling_factor, rope_type=scaling_type)
-
-		self.rotary = get_rope(
+		self.rotary = self.config.get_basic_rope(
+			dtype=self.dtype,
 			head_size=self.head_dim,
 			rotary_dim=self.head_dim,
-			max_position=self.config.granted_freq_max_position_embedding,
 			base=config.rope_theta,
-			rope_scaling=initial_rope_kwargs,
-		)
-
-	def _merge_heads(self, hidden_states):
-		"""
-		Merges the attention heads into a single hidden state tensor.
-
-		Args:
-		    hidden_states (chex.Array): The hidden states with separate head dimensions.
-
-		Returns:
-		    chex.Array: The hidden states with merged head dimensions.
-		"""
-		return hidden_states.reshape(
-			hidden_states.shape[:2] + (self.num_heads * self.head_dim,)
 		)
 
 	def _split_heads(self, hidden_states, num_heads):
@@ -155,6 +133,7 @@ class FlaxGemmaAttention(FlaxAttentionModule):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the attention module.
@@ -202,22 +181,27 @@ class FlaxGemmaAttention(FlaxAttentionModule):
 			query=query_states,
 			key=key_states,
 			positions=position_ids,
+			frequencies=frequencies,
 		)
 
 		dropout_rng = None
 
 		if not deterministic and self.config.attention_dropout > 0.0:
 			dropout_rng = self.make_rng("dropout")
-		query_states, key_states, value_states, attention_mask, attention_bias = (
-			self.concatenate_to_cache(
-				init_cache=init_cache,
-				query=query_states,
-				key=key_states,
-				value=value_states,
-				attention_mask=attention_mask,
-				causal_mask=causal_mask,
-				fcm_mask=fcm_mask,
-			)
+		(
+			query_states,
+			key_states,
+			value_states,
+			attention_mask,
+			attention_bias,
+		) = self.concatenate_to_cache(
+			init_cache=init_cache,
+			query=query_states,
+			key=key_states,
+			value=value_states,
+			attention_mask=attention_mask,
+			causal_mask=causal_mask,
+			fcm_mask=fcm_mask,
 		)
 		query_length, key_length = query_states.shape[1], key_states.shape[1]
 
@@ -305,7 +289,7 @@ class FlaxGemmaDecoderLayer(nn.Module):
 		mlp_block = FlaxGemmaMLP
 		attn_block = FlaxGemmaAttention
 
-		if self.config.gradient_checkpointing != "":
+		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			mlp_block = flax.linen.partitioning.remat(
 				mlp_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
@@ -314,7 +298,7 @@ class FlaxGemmaDecoderLayer(nn.Module):
 			attn_block = flax.linen.partitioning.remat(
 				attn_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-				static_argnums=(3, 5, 6, 7),
+				static_argnums=(3, 5, 6, 7, 9),
 			)
 		self.input_layernorm = FlaxGemmaRMSNorm(self.config, dtype=self.dtype)
 		self.post_attention_layernorm = FlaxGemmaRMSNorm(self.config, dtype=self.dtype)
@@ -342,6 +326,7 @@ class FlaxGemmaDecoderLayer(nn.Module):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the module block.
@@ -372,6 +357,7 @@ class FlaxGemmaDecoderLayer(nn.Module):
 			init_cache,
 			output_attentions,
 			fcm_mask,
+			frequencies,
 		)
 
 		attn_output = outputs[0]
@@ -415,6 +401,11 @@ class FlaxGemmaLayerCollection(nn.Module):
 			)
 			for i in range(self.config.num_hidden_layers)
 		]
+
+		self._frequencies = self.config.get_basic_frequencies(
+			head_size=self.config.head_dim,
+			rotary_dim=self.config.head_dim,
+		)
 
 	def __call__(
 		self,
@@ -483,6 +474,7 @@ class FlaxGemmaLayerCollection(nn.Module):
 				output_attentions=output_attentions,
 				fcm_mask=fcm_mask,
 				segment_ids=segment_ids,
+				frequencies=self._frequencies,
 			)
 			hidden_states = layer_outputs[0]
 

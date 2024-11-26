@@ -22,13 +22,12 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.linen import Dense
 from flax.linen.partitioning import remat
-from jax.sharding import PartitionSpec
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import LayerNormRaw
 
 # easydel.modules
-from easydel.layers.rotary_embedding import get_rope
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
@@ -36,7 +35,6 @@ from easydel.modules.flax_modeling_utils import (
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
-	with_sharding_constraint,
 )
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
@@ -154,21 +152,12 @@ class FlaxOlmoAttention(FlaxAttentionModule):
 			axis_name=self.config.attention_axis_name,
 			base_config=self.config,
 		)
-		initial_rope_kwargs = dict(rope_type="default")
-		if self.config.rope_scaling is not None:
-			scaling_type = self.config.rope_scaling["type"]
-			scaling_factor = self.config.rope_scaling["factor"]
-			initial_rope_kwargs = dict(
-				scaling_factor=scaling_factor,
-				rope_type=scaling_type,
-			)
 
-		self.rotary = get_rope(
-			max_position=self.config.granted_freq_max_position_embedding,
+		self.rotary = self.config.get_basic_rope(
+			self.dtype,
 			head_size=self.config.hidden_size // self.config.num_attention_heads,
 			rotary_dim=self.config.hidden_size // self.config.num_attention_heads,
 			base=self.config.rope_theta,
-			rope_scaling=initial_rope_kwargs,
 		)
 
 	def __call__(
@@ -182,6 +171,7 @@ class FlaxOlmoAttention(FlaxAttentionModule):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the attention module.
@@ -235,6 +225,7 @@ class FlaxOlmoAttention(FlaxAttentionModule):
 			query=query_states,
 			key=key_states,
 			positions=position_ids,
+			frequencies=frequencies,
 		)
 
 		dropout_rng = None
@@ -274,20 +265,9 @@ class FlaxOlmoAttention(FlaxAttentionModule):
 			causal_mask=causal_mask,
 		)
 
-		attn_output = self._merge_heads(attentions.attention_outputs)
-		if self.config.shard_attention_computation:
-			attn_output = with_sharding_constraint(
-				attn_output,
-				PartitionSpec(
-					self.config.partition_axis.batch_axis,
-					(
-						self.config.partition_axis.sequence_axis
-						if attn_output.shape[1] != 1
-						else None
-					),
-					self.config.partition_axis.hidden_state_axis,
-				),
-			)
+		attn_output = self.shard_attention_prod(
+			self._merge_heads(attentions.attention_outputs)
+		)
 		attn_output = self.o_proj(attn_output)
 
 		outputs = (
@@ -308,11 +288,11 @@ class FlaxOlmoDecoderLayer(nn.Module):
 		attn_block = FlaxOlmoAttention
 		mlp_block = FlaxOlmoMLP
 
-		if self.config.gradient_checkpointing != "":
+		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			attn_block = re_mat(
 				attn_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-				static_argnums=(1, 3, 4, 6, 7, 8),
+				static_argnums=(1, 3, 4, 6, 7, 9),
 			)
 			mlp_block = re_mat(
 				mlp_block,
@@ -349,6 +329,7 @@ class FlaxOlmoDecoderLayer(nn.Module):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the module block.
@@ -378,6 +359,7 @@ class FlaxOlmoDecoderLayer(nn.Module):
 			init_cache,
 			output_attentions,
 			fcm_mask,
+			frequencies,
 		)
 
 		hidden_states = attention_output[0] + residual
@@ -430,6 +412,11 @@ class FlaxOlmoDecoratorCollection(nn.Module):
 			)
 			for i in range(self.config.num_hidden_layers)
 		]
+		self._frequencies = self.config.get_basic_frequencies(
+			head_size=self.config.hidden_size // self.config.num_attention_heads,
+			rotary_dim=self.config.hidden_size // self.config.num_attention_heads,
+			base=self.config.rope_theta,
+		)
 
 	def __call__(
 		self,
@@ -499,6 +486,7 @@ class FlaxOlmoDecoratorCollection(nn.Module):
 				output_attentions=output_attentions,
 				fcm_mask=fcm_mask,
 				segment_ids=segment_ids,
+				frequencies=self._frequencies,
 			)
 			hidden_states = output[0]
 

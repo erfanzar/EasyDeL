@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
 import math
 from typing import Optional, Tuple, Union
 
@@ -21,16 +20,14 @@ import flax.linen
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import Dense, make_causal_mask
 from flax.linen import partitioning as nn_partitioning
-from flax.traverse_util import flatten_dict, unflatten_dict
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import RMSNorm as RMSNorm
 
 # easydel.modules
-from easydel.layers.rotary_embedding import get_rope
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	block_wise_ffn,
@@ -43,8 +40,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 	FlaxSequenceClassifierOutput,
 )
-from easydel.modules.modeling_utils import EasyDeLBaseModule, wrap_easydel_module
-from easydel.modules.qwen2.kernels import qwen2_mlp_pallas
+from easydel.modules.modeling_utils import wrap_easydel_module
 from easydel.modules.qwen2.qwen_configuration import Qwen2Config as Qwen2Config
 
 
@@ -110,29 +106,8 @@ class FlaxQwen2MLP(nn.Module):
 		    chex.Array: Output tensor after applying dense layers and activation functions.
 		"""
 		x = control_mlp_sharding(x, self.config.partition_axis)
-		if (
-			self.config.hardware_abstraction
-			and self.gate_proj.variables.get("params", None) is not None
-		):
-			x = jax.vmap(
-				functools.partial(
-					qwen2_mlp_pallas,
-					act_fn=jax.nn.silu,
-					blocksize_k=self.config.pallas_k_block_size,
-					blocksize_m=self.config.pallas_m_block_size,
-					blocksize_n=self.config.pallas_n_block_size,
-					prod_dtype=self.dtype,
-					precision=self.precision,
-				),
-				in_axes=(0, None, None, None),
-			)(
-				x,
-				self.gate_proj.variables["params"]["kernel"],
-				self.down_proj.variables["params"]["kernel"],
-				self.up_proj.variables["params"]["kernel"],
-			)
-		else:
-			x = self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
+		x = self.down_proj(jax.nn.silu(self.gate_proj(x)) * self.up_proj(x))
 		x = self.dropout(x, deterministic=deterministic)
 		return x
 
@@ -216,17 +191,10 @@ class FlaxQwen2Attention(FlaxAttentionModule):
 			base_config=self.config,
 		)
 		self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
-		initial_rope_kwargs = dict(rope_type="default")
-		if config.rope_scaling is not None:
-			scaling_type = config.rope_scaling["type"]
-			scaling_factor = config.rope_scaling["factor"]
-			initial_rope_kwargs = dict(scaling_factor=scaling_factor, rope_type=scaling_type)
-		self.rotary = get_rope(
-			max_position=self.config.granted_freq_max_position_embedding,
+		self.rotary = self.config.get_basic_rope(
 			head_size=config.hidden_size // config.num_attention_heads,
 			rotary_dim=config.hidden_size // config.num_attention_heads,
 			base=config.rope_theta,
-			rope_scaling=initial_rope_kwargs,
 			dtype=self.dtype,
 		)
 
@@ -241,6 +209,7 @@ class FlaxQwen2Attention(FlaxAttentionModule):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the attention module.
@@ -288,6 +257,7 @@ class FlaxQwen2Attention(FlaxAttentionModule):
 			query=query_states,
 			key=key_states,
 			positions=position_ids,
+			frequencies=frequencies,
 		)
 		dropout_rng = None
 
@@ -349,10 +319,16 @@ class FlaxQwen2Block(nn.Module):
 
 	def setup(self) -> None:
 		attn_block = FlaxQwen2Attention
-		if self.config.gradient_checkpointing != "":
+		mlp_block = FlaxQwen2MLP
+		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			attn_block = nn_partitioning.remat(
 				FlaxQwen2Attention,
-				static_argnums=(1, 3, 4, 6, 7, 8),
+				static_argnums=(3, 4, 6, 7, 9),
+				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+			)
+			mlp_block = nn_partitioning.remat(
+				FlaxQwen2MLP,
+				static_argnums=(1,),
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 			)
 
@@ -362,14 +338,6 @@ class FlaxQwen2Block(nn.Module):
 			param_dtype=self.param_dtype,
 			precision=self.precision,
 		)
-		mlp_block = FlaxQwen2MLP
-
-		if self.config.gradient_checkpointing != "":
-			mlp_block = nn_partitioning.remat(
-				FlaxQwen2MLP,
-				static_argnums=(1,),
-				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-			)
 
 		self.mlp = mlp_block(
 			self.config,
@@ -401,6 +369,7 @@ class FlaxQwen2Block(nn.Module):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the module block.
@@ -428,6 +397,7 @@ class FlaxQwen2Block(nn.Module):
 			init_cache,
 			output_attentions,
 			fcm_mask,
+			frequencies,
 		)
 		attn_output = attn_outputs[0]
 		hidden_states = hidden_states + attn_output
@@ -450,242 +420,6 @@ class FlaxQwen2Block(nn.Module):
 		hidden_states = hidden_states + feed_forward_hidden_states
 
 		return (hidden_states,) + attn_outputs[1:]
-
-
-class FlaxQwen2PreTrainedModel(EasyDeLBaseModule):
-	"""
-	Base class for Qwen2 models providing initialization and configuration.
-
-	Attributes:
-	    config_class (Qwen2Config): The configuration class for the model.
-	    module_class (nn.Module): The class representing the model's architecture.
-	    base_model_prefix (str): The prefix for the base model parameters.
-	"""
-
-	config_class = Qwen2Config
-	base_model_prefix = "model"
-	module_class: nn.Module = None
-
-	def __init__(
-		self,
-		config: Qwen2Config,
-		dtype: jnp.dtype = jnp.bfloat16,
-		param_dtype: jnp.dtype = jnp.bfloat16,
-		precision: Optional[jax.lax.Precision] = None,
-		input_shape: Tuple[int, int] = (1, 1),
-		seed: int = 0,
-		_do_init: bool = False,
-		**kwargs,
-	):
-		"""
-		Initializes the pre-trained model with the given configuration.
-
-		Args:
-		    config (Qwen2Config): Configuration for the model.
-		    dtype (jnp.dtype): Data type for computations.
-		    param_dtype (jnp.dtype): Data type for model parameters.
-		    precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
-		    input_shape (Tuple[int, int]): Shape of the input tensor.
-		    seed (int): Seed for random number generation.
-		    _do_init (bool): If True, initialize model weights.
-		    **kwargs: Additional keyword arguments.
-		"""
-		module = self.module_class(
-			config=config,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			precision=precision,
-			**kwargs,
-		)
-		super().__init__(
-			dtype=dtype,
-			_do_init=_do_init,
-			module=module,
-			config=config,
-			input_shape=input_shape,
-			seed=seed,
-		)
-
-	def init_weights(
-		self,
-		rng: jax.random.PRNGKey,
-		input_shape: Tuple,
-		params: FrozenDict = None,
-	) -> FrozenDict:
-		"""The init_weights function is used to initialize the weights of a model.
-
-		Args:
-		    self: Access variables that belong to the class
-		    rng: jax.random.PRNGKey: Initialize the weights of the model
-		    input_shape: Tuple: Specify the shape of the input tensor
-		    params: FrozenDict: Pass in the parameters of a pre-trained
-		        model
-
-		Returns:
-		    A frozendict of parameters
-		"""
-		input_ids = jnp.zeros(input_shape, dtype="i4")
-		attention_mask = jnp.ones_like(input_ids)
-		position_ids = jnp.broadcast_to(
-			jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape
-		)
-		params_rng, dropout_rng = jax.random.split(rng)
-		rngs = {"params": params_rng, "dropout": dropout_rng}
-
-		if self.config.add_cross_attention:
-			encoder_hidden_states = jnp.zeros(input_shape + (self.config.hidden_size,))
-			encoder_attention_mask = attention_mask
-			module_init_outputs = self.module.init(
-				rngs,
-				input_ids,
-				attention_mask,
-				position_ids,
-				encoder_hidden_states,
-				encoder_attention_mask,
-				return_dict=False,
-			)
-		else:
-			module_init_outputs = self.module.init(
-				rngs, input_ids, attention_mask, position_ids, return_dict=False
-			)
-
-		random_params = module_init_outputs["params"]
-
-		if params is not None:
-			random_params = flatten_dict(unfreeze(random_params))
-			params = flatten_dict(unfreeze(params))
-			for missing_key in self._missing_keys:
-				params[missing_key] = random_params[missing_key]
-			self._missing_keys = set()
-			return freeze(unflatten_dict(params))
-		else:
-			return random_params
-
-	def init_cache(self, batch_size, max_length):
-		"""The init_cache function is used to initialize the cache for a given batch size and sequence length.
-		The cache is a dictionary that contains all the intermediate states from each layer in the model.
-		This allows us to run inference on multiple batches without having to re-run forward passes through every layer in
-		the model, which would be very slow.
-
-		Args:
-		    self: Access the module
-		    batch_size: Define the batch size of the input tensors
-		    max_length: Set the length of the input sequence
-
-		Returns:
-		    A dictionary with the following keys:
-		"""
-
-		return super().init_cache(batch_size=batch_size, max_length=max_length)
-
-	def __call__(
-		self,
-		input_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		params: dict = None,
-		past_key_values: Optional[dict] = None,
-		dropout_rng: jax.random.PRNGKey = None,
-		train: bool = False,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		return_dict: Optional[bool] = None,
-		add_params_field: bool = False,
-		**kwargs,
-	):
-		"""
-		Forward pass through the model.
-
-		Args:
-		    input_ids (chex.Array): Input tensor containing token IDs.
-		    input_embeds (Optional[chex.Array]): embedding inputs to be used instead of input_ids.
-		    attention_mask (Optional[chex.Array]): Mask for attention.
-		    position_ids (Optional[chex.Array]): Positional indices.
-		    segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
-		    params (dict, optional): Parameters for the model.
-		    past_key_values (dict, optional): Past key and value states for caching.
-		    dropout_rng (jax.random.PRNGKey, optional): RNG key for dropout.
-		    train (bool): If True, the model is in training mode.
-		    output_attentions (Optional[bool]): If True, output attention weights.
-		    output_hidden_states (Optional[bool]): If True, output hidden states.
-		    return_dict (Optional[bool]): If True, return a dictionary of outputs.
-		    add_params_field (bool): If True, include the parameters in the input dictionary.
-		    **kwargs: Additional arguments.
-
-		Returns:
-		    Output type depends on the model configuration.
-		"""
-		output_attentions = (
-			output_attentions
-			if output_attentions is not None
-			else self.config.output_attentions
-		)
-		output_hidden_states = (
-			output_hidden_states
-			if output_hidden_states is not None
-			else self.config.output_hidden_states
-		)
-		return_dict = return_dict if return_dict is not None else self.config.return_dict
-		batch_size, sequence_length = (
-			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
-		)
-
-		if position_ids is None:
-			if past_key_values is not None:
-				raise ValueError(
-					"Make sure to provide `position_ids` when passing `past_key_values`."
-				)
-
-			position_ids = jnp.broadcast_to(
-				jnp.arange(sequence_length)[None, :], (batch_size, sequence_length)
-			)
-
-		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, sequence_length))
-
-		rng_s = {}
-		if dropout_rng is not None:
-			rng_s["dropout"] = dropout_rng
-
-		inputs = (
-			{"params": params or self.params} if add_params_field else params or self.params
-		)
-
-		if self.config.bits is not None:
-			rng_s["params"] = jax.random.key(0)
-		if past_key_values is not None:
-			inputs["cache"] = past_key_values
-			mutable = ["cache"]
-		else:
-			mutable = False
-
-		outputs = self.module.apply(
-			inputs,
-			input_ids=jnp.array(input_ids, dtype="i4"),
-			input_embeds=input_embeds,
-			attention_mask=jnp.array(attention_mask, dtype="i4"),
-			position_ids=jnp.array(position_ids, dtype="i4"),
-			deterministic=not train,
-			init_cache=False,
-			output_attentions=output_attentions,
-			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
-			segment_ids=segment_ids,
-			rngs=rng_s,
-			mutable=mutable,
-		)
-
-		if past_key_values is not None and return_dict:
-			outputs, past_key_values = outputs
-			outputs["past_key_values"] = unfreeze(past_key_values["cache"])
-			return outputs
-		elif past_key_values is not None and not return_dict:
-			outputs, past_key_values = outputs
-			outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
-
-		return outputs
 
 
 class FlaxQwen2BlockCollection(nn.Module):
@@ -716,6 +450,11 @@ class FlaxQwen2BlockCollection(nn.Module):
 			)
 			for i in range(self.config.num_hidden_layers)
 		]
+		self._frequencies = self.config.get_basic_frequencies(
+			head_size=self.config.hidden_size // self.config.num_attention_heads,
+			rotary_dim=self.config.hidden_size // self.config.num_attention_heads,
+			base=self.config.rope_theta,
+		)
 
 	def __call__(
 		self,
@@ -785,6 +524,7 @@ class FlaxQwen2BlockCollection(nn.Module):
 				output_attentions=output_attentions,
 				fcm_mask=fcm_mask,
 				segment_ids=segment_ids,
+				frequencies=self._frequencies,
 			)
 			hidden_states = output[0]
 

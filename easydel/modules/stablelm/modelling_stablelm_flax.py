@@ -26,7 +26,6 @@ from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 
 # easydel.modules
-from easydel.layers.rotary_embedding import get_rope
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
@@ -266,23 +265,14 @@ class FlaxStableLmAttention(FlaxAttentionModule):
 				param_dtype=self.param_dtype,
 			)
 
-		initial_rope_kwargs = dict(rope_type="default")
-		if hasattr(config, "rope_scaling"):
-			if config.rope_scaling is not None:
-				scaling_type = config.rope_scaling["type"]
-				scaling_factor = config.rope_scaling["factor"]
-				initial_rope_kwargs = dict(
-					scaling_factor=scaling_factor, rope_type=scaling_type
-				)
-		self.rotary = get_rope(
-			max_position=self.config.granted_freq_max_position_embedding,
+		self.rotary = self.config.get_basic_rope(
+			self.dtype,
 			head_size=int(
 				config.partial_rotary_factor
 				* (config.hidden_size // config.num_attention_heads)
 			),
 			rotary_dim=self.rotary_emb_dim,
 			base=config.rope_theta,
-			rope_scaling=initial_rope_kwargs,
 		)
 
 	def __call__(
@@ -296,6 +286,7 @@ class FlaxStableLmAttention(FlaxAttentionModule):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the attention module.
@@ -351,6 +342,7 @@ class FlaxStableLmAttention(FlaxAttentionModule):
 			positions=position_ids,
 			query=query_states,
 			key=key_states,
+			frequencies=frequencies,
 		)
 
 		dropout_rng = None
@@ -422,7 +414,7 @@ class FlaxStableLmDecoderLayer(nn.Module):
 
 			attn_block = flax.linen.partitioning.remat(
 				attn_block,
-				static_argnums=(3, 5, 6, 7),
+				static_argnums=(3, 5, 6, 7, 9),
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 			)
 		self.self_attn = attn_block(
@@ -461,6 +453,7 @@ class FlaxStableLmDecoderLayer(nn.Module):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the module block.
@@ -490,6 +483,7 @@ class FlaxStableLmDecoderLayer(nn.Module):
 			init_cache,
 			output_attentions,
 			fcm_mask,
+			frequencies,
 		)
 		attn_out, self_attn_weights = (
 			(attn_out[0], attn_out[1]) if len(attn_out) == 2 else (attn_out[0], None)
@@ -563,6 +557,14 @@ class FlaxStableLmDecoderLayerCollection(nn.Module):
 			)
 			for idx in range(self.config.num_hidden_layers)
 		]
+		rotary_emb_dim = int(
+			self.config.partial_rotary_factor
+			* (self.config.hidden_size // self.config.num_attention_heads)
+		)
+		self._frequencies = self.config.get_basic_frequencies(
+			head_size=rotary_emb_dim,
+			rotary_dim=rotary_emb_dim,
+		)
 
 	def __call__(
 		self,
@@ -632,6 +634,7 @@ class FlaxStableLmDecoderLayerCollection(nn.Module):
 				output_attentions=output_attentions,
 				fcm_mask=fcm_mask,
 				segment_ids=segment_ids,
+				frequencies=self._frequencies,
 			)
 
 			hidden_states = layer_outputs[0]
