@@ -13,17 +13,16 @@
 # limitations under the License.
 
 import contextlib
+import os
+import sys
 import time
 import warnings
-
-import os
+from contextlib import contextmanager
 from pathlib import Path
 
 import flax.metrics.tensorboard
 
 from easydel.etils.etils import get_logger
-import sys
-from contextlib import contextmanager
 
 try:
 	import wandb  # type: ignore

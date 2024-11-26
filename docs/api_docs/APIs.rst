@@ -9,6 +9,7 @@ EasyDeL APIs 🔮
    Generation
    Inference
    Kernels
+   Layers
    Modules
    Smi
    Trainers

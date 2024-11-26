@@ -1,6 +1,6 @@
-# EDPretrainedModel
+# EasyDeLBaseModule
 
-The `EDPretrainedModel` class serves as the base class for all pre-trained models in EasyDeL that are implemented using Flax (JAX's neural network library). providing EasyDeL-specific functionalities for handling sharding, model conversion, some of performance optimization configs, and more.
+The `EasyDeLBaseModule` class serves as the base class for all pre-trained models in EasyDeL that are implemented using Flax (JAX's neural network library). providing EasyDeL-specific functionalities for handling sharding, model conversion, some of performance optimization configs, and more.
 
 
 
@@ -9,7 +9,7 @@ The `EDPretrainedModel` class serves as the base class for all pre-trained model
 1. **`__init__(...)`:**
    - **Purpose:** Initializes the model with its configuration, Flax module, input shape, and other relevant settings.
    - **Key Arguments:**
-      - `config` (`EDPretrainedConfig`): The model's configuration object, holding hyperparameters and architectural details.
+      - `config` (`EasyDeLBaseConfig`): The model's configuration object, holding hyperparameters and architectural details.
       - `module` (`flax.linen.Module`): The underlying Flax module defining the model's structure and operations. 
       - `input_shape` (`tuple`): The expected shape of input data to the model.
       - `seed` (`int`):  A random seed for reproducibility.
@@ -48,6 +48,6 @@ The `EDPretrainedModel` class serves as the base class for all pre-trained model
 
 **In Summary:**
 
-`EDPretrainedModel` provides a foundational structure for working with pre-trained models in EasyDeL using the Flax library.  It handles common tasks like sharding, conversion between frameworks, saving/loading, and provides a blueprint for model-specific implementations to extend. 
+`EasyDeLBaseModule` provides a foundational structure for working with pre-trained models in EasyDeL using the Flax library.  It handles common tasks like sharding, conversion between frameworks, saving/loading, and provides a blueprint for model-specific implementations to extend. 
 
 

@@ -14,8 +14,8 @@
 
 from easydel.modules.opt.modelling_opt_flax import (
 	FlaxOPTForCausalLM,
-	FlaxOPTForCausalLMModule,
 	FlaxOPTModel,
-	FlaxOPTModule,
 )
 from easydel.modules.opt.opt_configuration import OPTConfig
+
+__all__ = "FlaxOPTForCausalLM", "FlaxOPTModel", "OPTConfig"

@@ -19,7 +19,7 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 from easydel.modules.factory import register_config
-from easydel.modules.modeling_utils import EDPretrainedConfig
+from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
 
 def make_divisible(
@@ -66,10 +66,10 @@ def compute_heads(model_dim: int, head_dim: int) -> int:
 
 
 @register_config("openelm")
-class OpenELMConfig(EDPretrainedConfig):
+class OpenELMConfig(EasyDeLBaseConfig):
 	"""
-	Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read
-	the documentation from [`EDPretrainedConfig`] for more information.
+	Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read
+	the documentation from [`EasyDeLBaseConfig`] for more information.
 
 	Args:
 	    vocab_size (`int`, *optional*, defaults to 32000):

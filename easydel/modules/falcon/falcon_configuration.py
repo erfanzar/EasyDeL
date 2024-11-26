@@ -17,15 +17,15 @@ from typing import Optional
 from jax.sharding import PartitionSpec
 
 from easydel.modules.factory import register_config
-from easydel.modules.modeling_utils import EDPretrainedConfig
+from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
 
 @register_config("falcon")
-class FalconConfig(EDPretrainedConfig):
+class FalconConfig(EasyDeLBaseConfig):
 	"""
 
-	Configuration objects inherit from [`EDPretrainedConfig`] and can be used to control the model outputs. Read
-	the documentation from [`EDPretrainedConfig`] for more information.
+	Configuration objects inherit from [`EasyDeLBaseConfig`] and can be used to control the model outputs. Read
+	the documentation from [`EasyDeLBaseConfig`] for more information.
 
 	Args:
 	    vocab_size (`int`, *optional*, defaults to 65024):

@@ -15,7 +15,7 @@
 from typing import Optional
 
 import chex
-from fjformer.dtypes import Array8Bit, ArrayNF4, A8Q, A4Q
+from fjformer.dtypes import A4Q, A8Q, Array8Bit, ArrayNF4
 
 from easydel.etils.etils import EasyDeLPlatforms, EasyDeLQuantizationMethods
 
@@ -56,6 +56,8 @@ class EasyQuantizer:
 					should_be_quantized = False
 				if should_be_quantized:
 					return ArrayNF4.quantize(array=array, bs=self.block_size)
+				return array
+			case EasyDeLQuantizationMethods.NONE:
 				return array
 			case _:
 				raise ValueError(f"unknown quantization_method {self.quantization_method}.")

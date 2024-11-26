@@ -25,8 +25,8 @@ import jax
 import jax.numpy as jnp
 import jax.random as jrand
 import jax.sharding
-from fjformer.sharding import with_sharding_constraint
 from fjformer import GenerateRNG
+from fjformer.sharding import with_sharding_constraint
 from jax import lax
 
 rng = GenerateRNG()

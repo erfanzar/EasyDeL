@@ -86,7 +86,7 @@ class TrainingArguments:
 	Attributes:
 	    model_name (Optional[str]): Name of the model.
 	    num_train_epochs (Optional[int]): Number of training epochs.
-	    model_class (Optional[EDPretrainedModel]): The EasyDeL Flax Pretrained Model class to use.
+	    model_class (Optional[EasyDeLBaseModule]): The EasyDeL Flax Pretrained Model class to use.
 	    total_batch_size (int): Total batch size for training.
 	    eval_batch_size (int): Total batch size for evaluation of model.
 	    max_training_steps (Optional[int]): Maximum number of training steps.
@@ -192,7 +192,7 @@ class TrainingArguments:
 
 	model_name: str = "Model"
 	num_train_epochs: int = 10
-	model_class: Optional[EDPretrainedModel] = None
+	model_class: Optional[EasyDeLBaseModule] = None
 	total_batch_size: int = 32
 	eval_batch_size: int = 64
 	max_training_steps: Optional[int] = None
@@ -693,5 +693,5 @@ class TrainingArguments:
 		return "\n".join(result)
 
 
-class EDPretrainedModel:
+class EasyDeLBaseModule:
 	pass

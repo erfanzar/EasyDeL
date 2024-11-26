@@ -30,13 +30,12 @@ from jax.random import PRNGKey
 from jax.sharding import PartitionSpec
 from transformers import FlaxWhisperTimeStampLogitsProcessor
 
-from easydel.modules.attention_module import FlexibleAttentionModule
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 
 # easydel.modules
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
-	FlaxAttentionModule,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
 	with_sharding_constraint,
@@ -49,7 +48,7 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxSeq2SeqModelOutput,
 	FlaxSequenceClassifierOutput,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.whisper.whisper_configuration import WhisperConfig as WhisperConfig
 
 remat = nn_partitioning.remat
@@ -178,9 +177,9 @@ class FlaxWhisperAttention(FlaxAttentionModule):
 
 		if self.causal and (self.has_variable("cache", "cached_key") or init_cache):
 			key_states, value_states, attention_mask = self._concatenate_to_cache(
+				query_states,
 				key_states,
 				value_states,
-				query_states,
 				attention_mask,
 			)
 
@@ -861,7 +860,7 @@ class FlaxWhisperModule(nn.Module):
 		return self.decoder
 
 
-class FlaxWhisperPreTrainedModel(EDPretrainedModel):
+class FlaxWhisperPreTrainedModel(EasyDeLBaseModule):
 	config_class = WhisperConfig
 	base_model_prefix: str = "model"
 	main_input_name = "input_features"
@@ -1637,6 +1636,7 @@ class FlaxWhisperForAudioClassificationModule(nn.Module):
 			hidden_states=encoder_outputs.hidden_states,
 			attentions=encoder_outputs.attentions,
 		)
+
 
 @register_module(
 	"audio-classification",

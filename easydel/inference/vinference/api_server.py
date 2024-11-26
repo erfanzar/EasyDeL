@@ -13,9 +13,10 @@
 # limitations under the License.
 
 from __future__ import annotations
+
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, AsyncGenerator, Callable, Dict, Optional
@@ -24,6 +25,7 @@ import uvicorn
 from fastapi import APIRouter, FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 from prometheus_client import start_http_server
+
 from easydel.etils.etils import get_logger
 from easydel.inference.vinference.api_models import (
 	ChatCompletionRequest,
@@ -31,6 +33,7 @@ from easydel.inference.vinference.api_models import (
 	ChatCompletionResponseChoice,
 	ChatCompletionStreamResponse,
 	ChatCompletionStreamResponseChoice,
+	ChatMessage,
 	CountTokenRequest,
 	ChatMessage,
 	DeltaMessage,

@@ -15,7 +15,7 @@
 from easydel.modules.grok_1.grok_1_configuration import Grok1Config
 from easydel.modules.grok_1.modeling_grok_1_flax import (
 	FlaxGrok1ForCausalLM,
-	FlaxGrok1ForCausalLMModule,
 	FlaxGrok1Model,
-	FlaxGrok1Module,
 )
+
+__all__ = "FlaxGrok1ForCausalLM", "FlaxGrok1Model", "Grok1Config"

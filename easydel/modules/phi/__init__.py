@@ -14,8 +14,8 @@
 
 from easydel.modules.phi.modelling_phi_flax import (
 	FlaxPhiForCausalLM,
-	FlaxPhiForCausalLMModule,
 	FlaxPhiModel,
-	FlaxPhiModule,
 )
 from easydel.modules.phi.phi_configuration import PhiConfig
+
+__all__ = "FlaxPhiForCausalLM", "FlaxPhiModel", "PhiConfig"

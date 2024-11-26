@@ -27,35 +27,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional, Tuple
+import math
+from typing import Any, Optional
 
 import flax.linen
 import flax.linen.partitioning
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import Dense, combine_masks, make_causal_mask
-from flax.linen.attention import dot_product_attention_weights
-from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
-from jax.sharding import PartitionSpec
 
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
-	FlaxAttentionModule,
 	block_wise_ffn,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
-	with_sharding_constraint,
 )
 from easydel.modules.gpt2.gpt2_configuration import GPT2Config as GPT2Config
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutputWithPastAndCrossAttentions,
 	FlaxCausalLMOutputWithCrossAttentions,
 )
-from easydel.modules.modeling_utils import EDPretrainedModel
-from easydel.modules.factory import register_module
+from easydel.modules.modeling_utils import wrap_easydel_module
 
 
 class FlaxConv1D(nn.Module):
@@ -138,7 +134,23 @@ class FlaxGPT2Attention(FlaxAttentionModule):
 			precision=self.precision,
 			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
 		)
-
+		self.attention_performer = FlexibleAttentionModule(
+			use_sharding_constraint=self.config.use_sharding_constraint,
+			num_q_heads=self.config.num_attention_heads,
+			num_kv_heads=self.config.num_attention_heads,
+			attention_dropout=self.config.attn_pdrop,
+			head_dims=self.head_dim,
+			shard_attention_computation=self.config.shard_attention_computation,
+			precision=self.precision,
+			force_float32_tpu=True,
+			attn_mechanism=self.config.attn_mechanism,
+			dtype=self.config.attn_dtype,
+			partition_axis=self.config.partition_axis,
+			scan_ring_attention=self.config.scan_ring_attention,
+			mesh=self.config.mesh,
+			sm_scale=1 / math.sqrt(self.head_dim),
+			base_config=self.config,
+		)
 		self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
 
 	def _split_heads(self, hidden_states):
@@ -168,8 +180,6 @@ class FlaxGPT2Attention(FlaxAttentionModule):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 	):
-		# if key_value_states are provided this layer is used as a cross-attention layer
-		# for the decoder
 		is_cross_attention = key_value_states is not None
 		batch_size = hidden_states.shape[0]
 		if not is_cross_attention:
@@ -214,20 +224,11 @@ class FlaxGPT2Attention(FlaxAttentionModule):
 		if not deterministic and self.config.attn_pdrop > 0.0:
 			dropout_rng = self.make_rng("dropout")
 
-		# During fast autoregressive decoding, we feed one position at a time,
-		# and cache the keys and values step by step.
 		if self.causal and (self.has_variable("cache", "cached_key") or init_cache):
 			key, value, attention_mask = self._concatenate_to_cache(
-				key, value, query, attention_mask
+				query, key, value, attention_mask
 			)
 
-		# if self.config.use_sharding_constraint:
-		#     query = with_sharding_constraint(
-		#         query, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp" if query.shape[1] != 1 else None, "tp", None)
-		#     )
-		#     key = with_sharding_constraint(key, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
-		#     value = with_sharding_constraint(value, jax.sharding.PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
-		# transform boolean mask into float mask
 		if attention_mask is not None:
 			attention_bias = lax.select(
 				attention_mask > 0,
@@ -237,36 +238,28 @@ class FlaxGPT2Attention(FlaxAttentionModule):
 		else:
 			attention_bias = None
 
-		# usual dot product attention
-		attn_weights = dot_product_attention_weights(
-			query,
-			key,
+		attn = self.attention_performer(
+			query_states=query,
+			key_states=key,
+			value_states=value,
 			bias=attention_bias,
+			attention_mask=attention_mask,
+			causal=self.causal,
 			dropout_rng=dropout_rng,
-			dropout_rate=self.config.attn_pdrop,
 			deterministic=deterministic,
-			dtype=self.dtype,
-			precision=None,
+			query_sequence_length=query_length,
+			key_value_sequence_length=key_length,
+			uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+			segment_ids=None,
+			causal_mask=causal_mask,
 		)
-		attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value)
-		attn_output = self._merge_heads(attn_output)
-		if self.config.shard_attention_computation:
-			attn_output = with_sharding_constraint(
-				attn_output,
-				PartitionSpec(
-					self.config.partition_axis.batch_axis,
-					(
-						self.config.partition_axis.sequence_axis
-						if attn_output.shape[1] != 1
-						else None
-					),
-					self.config.partition_axis.hidden_state_axis,
-				),
-			)
+		attn_output = self.shard_attention_prod(self._merge_heads(attn.attention_outputs))
 		attn_output = self.c_proj(attn_output)
 		attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
 
-		outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
+		outputs = (
+			(attn_output, attn.attention_weights) if output_attentions else (attn_output,)
+		)
 		return outputs
 
 
@@ -330,13 +323,6 @@ class FlaxGPT2Block(nn.Module):
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 				static_argnums=(1,),
 			)
-		# hidden_states,
-		# key_value_states: Optional[jnp.ndarray] = None,
-		# attention_mask = None,
-		# casual_mask = None,
-		# deterministic: bool = True,
-		# init_cache: bool = False,
-		# output_attentions: bool = False,
 
 		self.attn = attn_block(
 			self.config,
@@ -372,15 +358,6 @@ class FlaxGPT2Block(nn.Module):
 	):
 		residual = hidden_states
 		hidden_states = self.ln_1(hidden_states)
-
-		# hidden_states
-		# key_value_states: Optional[jnp.ndarray] = None
-		# attention_mask = None
-		# casual_mask = None
-		# deterministic: bool = True
-		# init_cache: bool = False
-		# output_attentions: bool = False
-
 		attn_outputs = self.attn(
 			hidden_states,
 			None,
@@ -440,187 +417,6 @@ class FlaxGPT2Block(nn.Module):
 		hidden_states = residual + feed_forward_hidden_states
 
 		outputs = (hidden_states,) + outputs
-
-		return outputs
-
-
-class FlaxGPT2PreTrainedModel(EDPretrainedModel):
-	config_class = GPT2Config
-	base_model_prefix = "transformer"
-	module_class: nn.Module = None
-
-	def __init__(
-		self,
-		config: GPT2Config,
-		input_shape: Tuple = (1, 1),
-		seed: int = 0,
-		dtype: jnp.dtype = jnp.float32,
-		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[jax.lax.Precision] = None,
-		_do_init: bool = True,
-		**kwargs,
-	):
-		module = self.module_class(
-			config=config,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			precision=precision,
-			**kwargs,
-		)
-		super().__init__(
-			config,
-			module,
-			input_shape=input_shape,
-			seed=seed,
-			dtype=dtype,
-			_do_init=_do_init,
-		)
-
-	def init_weights(
-		self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
-	) -> FrozenDict:
-		input_ids = jnp.zeros(input_shape, dtype="i4")
-		attention_mask = jnp.ones_like(input_ids)
-		position_ids = jnp.broadcast_to(
-			jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape
-		)
-		params_rng, dropout_rng = jax.random.split(rng)
-		rngs = {"params": params_rng, "dropout": dropout_rng}
-		tie_word_embeddings = self.module.config.tie_word_embeddings
-		self.module.config.tie_word_embeddings = False
-		if self.config.add_cross_attention:
-			encoder_hidden_states = jnp.zeros(input_shape + (self.config.n_embd,))
-			encoder_attention_mask = attention_mask
-			module_init_outputs = self.module.init(
-				rngs,
-				input_ids,
-				attention_mask,
-				position_ids,
-				encoder_hidden_states,
-				encoder_attention_mask,
-				return_dict=False,
-			)
-		else:
-			module_init_outputs = self.module.init(
-				rngs, input_ids, attention_mask, position_ids, return_dict=False
-			)
-		self.module.config.tie_word_embeddings = tie_word_embeddings
-		random_params = module_init_outputs["params"]
-
-		if params is not None:
-			random_params = flatten_dict(unfreeze(random_params))
-			params = flatten_dict(unfreeze(params))
-			for missing_key in self._missing_keys:
-				params[missing_key] = random_params[missing_key]
-			self._missing_keys = set()
-			return freeze(unflatten_dict(params))
-		else:
-			return random_params
-
-	def init_cache(self, batch_size, max_length):
-		# init input variables to retrieve cache
-		input_ids = jnp.ones((batch_size, max_length))
-		attention_mask = jnp.ones_like(input_ids)
-		position_ids = jnp.broadcast_to(
-			jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape
-		)
-
-		init_variables = self.module.init(
-			jax.random.PRNGKey(0),
-			input_ids,
-			attention_mask,
-			position_ids,
-			return_dict=False,
-			init_cache=True,
-		)
-		return unfreeze(init_variables["cache"])
-
-	def __call__(
-		self,
-		input_ids,
-		attention_mask=None,
-		position_ids=None,
-		encoder_hidden_states: Optional[jnp.ndarray] = None,
-		encoder_attention_mask: Optional[jnp.ndarray] = None,
-		params: dict = None,
-		past_key_values: Optional[dict] = None,
-		dropout_rng: jax.random.PRNGKey = None,
-		train: bool = False,
-		add_params_field: bool = False,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		return_dict: Optional[bool] = None,
-		**kwargs,
-	):
-		output_attentions = (
-			output_attentions
-			if output_attentions is not None
-			else self.config.output_attentions
-		)
-		output_hidden_states = (
-			output_hidden_states
-			if output_hidden_states is not None
-			else self.config.output_hidden_states
-		)
-		return_dict = return_dict if return_dict is not None else self.config.return_dict
-
-		if encoder_hidden_states is not None and encoder_attention_mask is None:
-			batch_size, sequence_length = encoder_hidden_states.shape[:2]
-			encoder_attention_mask = jnp.ones((batch_size, sequence_length))
-
-		batch_size, sequence_length = input_ids.shape
-
-		if position_ids is None:
-			if past_key_values is not None:
-				raise ValueError(
-					"Make sure to provide `position_ids` when passing `past_key_values`."
-				)
-
-			position_ids = jnp.broadcast_to(
-				jnp.arange(sequence_length)[None, :], (batch_size, sequence_length)
-			)
-
-		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, sequence_length))
-
-		rngs = {}
-		if dropout_rng is not None:
-			rngs["dropout"] = dropout_rng
-		inputs = (
-			{"params": params or self.params}
-			if add_params_field is True
-			else params or self.params
-		)
-
-		if past_key_values is not None:
-			inputs["cache"] = past_key_values
-			mutable = ["cache"]
-		else:
-			mutable = False
-
-		outputs = self.module.apply(
-			inputs,
-			jnp.array(input_ids, dtype="i4"),
-			jnp.array(attention_mask, dtype="i4"),
-			jnp.array(position_ids, dtype="i4"),
-			encoder_hidden_states,
-			encoder_attention_mask,
-			not train,
-			False,
-			output_attentions,
-			output_hidden_states,
-			return_dict,
-			rngs=rngs,
-			mutable=mutable,
-		)
-
-		if past_key_values is not None and return_dict:
-			outputs, past_key_values = outputs
-			outputs["past_key_values"] = unfreeze(past_key_values["cache"])
-			return outputs
-		elif past_key_values is not None and not return_dict:
-			outputs, past_key_values = outputs
-			outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
 
 		return outputs
 
@@ -694,7 +490,15 @@ class FlaxGPT2BlockCollection(nn.Module):
 		return outputs
 
 
-class FlaxGPT2Module(nn.Module):
+@register_module(
+	"base-module",
+	config=GPT2Config,
+	model_type="gpt2",
+	embedding_layer_names=["wte", "wpe"],
+	layernorm_names=["ln_1", "ln_2", "ln_f"],
+)
+@wrap_easydel_module(config_class=GPT2Config, base_model_prefix="transformer")
+class FlaxGPT2Model(nn.Module):
 	config: GPT2Config
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
@@ -791,30 +595,21 @@ class FlaxGPT2Module(nn.Module):
 
 
 @register_module(
-	"base-module",
+	"causal-language-model",
 	config=GPT2Config,
 	model_type="gpt2",
 	embedding_layer_names=["wte", "wpe"],
 	layernorm_names=["ln_1", "ln_2", "ln_f"],
 )
-class FlaxGPT2Model(FlaxGPT2PreTrainedModel):
-	module_class = FlaxGPT2Module
-
-	def get_input_embeddings(self):
-		return self.module.wte
-
-	def set_input_embeddings(self, value):
-		self.module.wte = value
-
-
-class FlaxGPT2LMHeadModule(nn.Module):
+@wrap_easydel_module(config_class=GPT2Config, base_model_prefix="transformer")
+class FlaxGPT2LMHeadModel(nn.Module):
 	config: GPT2Config
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
 	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self):
-		self.transformer = FlaxGPT2Module(
+		self.transformer = FlaxGPT2Model.flax_module(
 			self.config,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
@@ -878,60 +673,3 @@ class FlaxGPT2LMHeadModule(nn.Module):
 			attentions=outputs.attentions,
 			cross_attentions=outputs.cross_attentions,
 		)
-
-
-@register_module(
-	"causal-language-model",
-	config=GPT2Config,
-	model_type="gpt2",
-	embedding_layer_names=["wte", "wpe"],
-	layernorm_names=["ln_1", "ln_2", "ln_f"],
-)
-class FlaxGPT2LMHeadModel(FlaxGPT2PreTrainedModel):
-	module_class = FlaxGPT2LMHeadModule
-
-	def get_output_embeddings(self):
-		return self.module.lm_head
-
-	def get_decoder(self):
-		return self.module.transformer
-
-	def get_input_embeddings(self):
-		return self.module.transformer.wte
-
-	def set_output_embeddings(self, new_embeddings):
-		self.module.lm_head = new_embeddings
-
-	def set_decoder(self, decoder):
-		self.module.transformer = decoder
-
-	def set_input_embeddings(self, value):
-		self.module.transformer.wte = value
-
-	def prepare_inputs_for_generation(
-		self, input_ids, max_length, attention_mask: Optional[jax.Array] = None
-	):
-		batch_size, seq_length = input_ids.shape
-
-		past_key_values = self.init_cache(batch_size, max_length)
-		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
-		if attention_mask is not None:
-			position_ids = attention_mask.cumsum(axis=-1) - 1
-			extended_attention_mask = lax.dynamic_update_slice(
-				extended_attention_mask, attention_mask.astype("i4"), (0, 0)
-			)
-		else:
-			position_ids = jnp.broadcast_to(
-				jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length)
-			)
-
-		return {
-			"past_key_values": past_key_values,
-			"attention_mask": extended_attention_mask,
-			"position_ids": position_ids,
-		}
-
-	def update_inputs_for_generation(self, model_outputs, model_kwargs):
-		model_kwargs["past_key_values"] = model_outputs.past_key_values
-		model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
-		return model_kwargs

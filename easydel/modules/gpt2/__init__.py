@@ -15,7 +15,7 @@
 from easydel.modules.gpt2.gpt2_configuration import GPT2Config
 from easydel.modules.gpt2.modeling_gpt2_flax import (
 	FlaxGPT2LMHeadModel,
-	FlaxGPT2LMHeadModule,
 	FlaxGPT2Model,
-	FlaxGPT2Module,
 )
+
+__all__ = "FlaxGPT2LMHeadModel", "FlaxGPT2Model", "GPT2Config"
