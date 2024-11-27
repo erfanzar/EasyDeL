@@ -373,9 +373,9 @@ class FlexibleAttentionModule(object):
 		self.num_q_heads = num_q_heads
 		assert num_q_heads % num_kv_heads == 0
 
-		if attn_mechanism == "splash" and self.backend != "tpu":
+		if attn_mechanism == "splash" and jax.default_backend() != "tpu":
 			raise OSError("splash attention is only supported on TPU.")
-		if attn_mechanism == "cudnn" and self.backend != "gpu":
+		if attn_mechanism == "cudnn" and jax.default_backend() != "gpu":
 			raise OSError("flash attention is only supported on GPU.")
 		if isinstance(self.dtype, str):
 			self.dtype = _get_jax_dtype_from_string(self.dtype)
@@ -1225,13 +1225,13 @@ class FlexibleAttentionModule(object):
 			self.num_q_heads // self.num_kv_heads,
 		)
 		try:
-			import transformer_engine.jax.fused_attn as fused_attn  # noqa #type:ignore
-			from transformer_engine.jax.fused_attn import (  # noqa #type:ignore
+			import transformer_engine.jax.attention as attention  # noqa #type:ignore
+			from transformer_engine.jax.attention import (  # noqa #type:ignore
 				AttnBiasType,
 				AttnMaskType,
 				QKVLayout,
 			)
-			from transformer_engine.jax.fused_attn import (  # noqa #type:ignore
+			from transformer_engine.jax.attention import (  # noqa #type:ignore
 				is_fused_attn_kernel_available,
 			)
 		except (ModuleNotFoundError, ImportError) as err:
@@ -1249,17 +1249,17 @@ class FlexibleAttentionModule(object):
 		if self.sm_scale is None:
 			self.sm_scale = 1 / math.sqrt(head_dim)
 		has_fused_attn_kernel = is_fused_attn_kernel_available(
-			self.dtype,
-			self.dtype,
-			qkv_layout,
-			attn_bias_type,
-			attn_mask_type,
-			self.attention_dropout,
-			self.num_attention_heads,
-			key_states.shape[2],
-			query_sequence_length,
-			key_value_sequence_length,
-			head_dim,
+			q_dtype=self.dtype,
+			kv_dtype=self.dtype,
+			qkv_layout=qkv_layout,
+			attn_bias_type=attn_bias_type,
+			attn_mask_type=attn_mask_type,
+			dropout_probability=self.attention_dropout,
+			q_num_heads=self.num_q_heads,
+			kv_num_heads=self.num_q_heads,
+			q_max_seqlen=query_sequence_length,
+			kv_max_seqlen=key_value_sequence_length,
+			head_dim=head_dim,
 		)
 
 		if not has_fused_attn_kernel:
@@ -1270,7 +1270,7 @@ class FlexibleAttentionModule(object):
 
 		return AttentionOutput(
 			attention_weights=None,
-			attention_outputs=fused_attn.self_fused_attn(
+			attention_outputs=attention.fused_attn(
 				qkv=jnp.concatenate(
 					(
 						jnp.reshape(
@@ -1289,11 +1289,11 @@ class FlexibleAttentionModule(object):
 					axis=2,
 				),
 				bias=bias,
-				mask=(
-					jnp.zeros((batch, 1, query_sequence_length, key_value_sequence_length))
-					if causal
-					else None
-				),
+				# mask=(
+				# 	jnp.zeros((batch, 1, query_sequence_length, key_value_sequence_length))
+				# 	if causal
+				# 	else None
+				# ),
 				seed=None,
 				attn_bias_type=attn_bias_type,
 				attn_mask_type=attn_mask_type,
@@ -1588,7 +1588,7 @@ class AttentionBenchmarker:
 
 		return metrics, avg_output
 
-	def run_benchmarks(self) -> Union[Dict, "pd.DataFrame"]:
+	def run_benchmarks(self) -> Union[Dict, "pd.DataFrame"]:  # noqa #type:ignore
 		"""Run benchmarks with gradient comparison."""
 		inputs = self._create_attention_inputs()
 

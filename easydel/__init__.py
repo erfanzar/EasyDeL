@@ -188,7 +188,12 @@ from easydel.modules.mixtral import (
 	FlaxMixtralModel,
 	MixtralConfig,
 )
-from easydel.modules.modeling_utils import EasyDeLBaseConfig, EasyDeLBaseModule
+from easydel.modules.modeling_utils import (
+	EasyDeLBaseConfig,
+	EasyDeLBaseModule,
+	EasyDeLBaseVisionModule,
+	EasyDeLBaseConfigDict,
+)
 from easydel.modules.mosaic_mpt import (
 	FlaxMptForCausalLM,
 	FlaxMptModel,
