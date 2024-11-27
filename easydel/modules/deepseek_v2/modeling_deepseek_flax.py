@@ -26,6 +26,7 @@ from flax.linen import partitioning as nn_partitioning
 from jax import lax
 from jax import numpy as jnp
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import RMSNorm
 from easydel.modules.deepseek_v2.deepseek_configuration import (
@@ -625,7 +626,7 @@ class FlaxDeepseekV2DecoderLayer(nn.Module):
 		mlp_block = FlaxDeepseekV2MLP
 		mlp_moe_block = FlaxDeepseekV2MoE
 
-		if self.config.gradient_checkpointing != "":
+		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			attn_block = re_mat(
 				attn_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),

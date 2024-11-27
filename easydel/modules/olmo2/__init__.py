@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.olmo.modeling_olmo_flax import (
-	FlaxOlmoForCausalLM,
-	FlaxOlmoModel,
+from easydel.modules.olmo2.modeling_olmo2_flax import (
+	FlaxOlmo2ForCausalLM,
+	FlaxOlmo2Model,
 )
-from easydel.modules.olmo.olmo_configuration import OlmoConfig
+from easydel.modules.olmo2.olmo2_configuration import Olmo2Config
 
-__all__ = "FlaxOlmoForCausalLM", "FlaxOlmoModel", "OlmoConfig"
+__all__ = "FlaxOlmo2ForCausalLM", "FlaxOlmo2Model", "Olmo2Config"
