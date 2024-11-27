@@ -33,8 +33,9 @@ from jax.extend.backend import get_backend
 
 from easydel.kernels.cpu_ops import jax_flash_attn_2_mu
 from easydel.kernels.gpu_ops import (
-	pallas_flash_mha_attn_2_gpu,
+	pallas_mha_flash_attention2_gpu,
 	triton_gqa_flash_attention2_gpu,
+	pallas_gqa_flash_attention2_gpu,
 )
 
 AVAILABLE_FLASH_ATTENTION2_PLATFORMS = Literal["triton", "pallas", "jax"]
@@ -263,19 +264,34 @@ class FlashAttention:
 		bias: Optional[chex.Array],
 	) -> chex.Array:
 		"""Computes attention using Pallas backend."""
-		key, value = self.repeat_kv_heads(key, value, query.shape[2] // key.shape[2])
 
 		if self.config.backend == Backend.GPU:
-			return pallas_flash_mha_attn_2_gpu(
-				q=query,
-				k=key,
-				v=value,
-				b=bias,
-				qblock=self.config.blocksize_q,
-				kblock=self.config.blocksize_k,
-				softmax_scale=self.config.softmax_scale,
-			)
+			if query.shape[2] == key.shape[2] or os.environ.get(
+				"FORCE_MHA",
+				"false",
+			) in ["true", "1", "on"]:
+				key, value = self.repeat_kv_heads(key, value, query.shape[2] // key.shape[2])
+				return pallas_mha_flash_attention2_gpu(
+					q=query,
+					k=key,
+					v=value,
+					b=bias,
+					qblock=self.config.blocksize_q,
+					kblock=self.config.blocksize_k,
+					softmax_scale=self.config.softmax_scale,
+				)
+			else:
+				return pallas_gqa_flash_attention2_gpu(
+					query=query,
+					key=key,
+					value=value,
+					bias=bias,
+					BLOCK_M=self.config.blocksize_q,
+					BLOCK_N=self.config.blocksize_k,
+					softmax_scale=self.config.softmax_scale,
+				)
 
+		key, value = self.repeat_kv_heads(key, value, query.shape[2] // key.shape[2])
 		# TPU implementation
 		block_sizes = TPUBlockSizes(
 			block_q=self.config.blocksize_q,
@@ -409,10 +425,7 @@ def _test_backward():
 		if True
 		else None
 	)
-	attention = create_flash_attention(
-		blocksize_k=blocksize_k,
-		blocksize_q=blocksize_q,
-	)
+	attention = create_flash_attention(blocksize_k=blocksize_k, blocksize_q=blocksize_q)
 	try:
 		co = jax.grad(lambda *x: attention(*x).sum())(q, k, v, b)
 		print("Custom op backward pass gradients:")
@@ -441,7 +454,7 @@ def _test_backward():
 
 def _test_forward():
 	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
-	B, QH, KH, QS, KS, D = 1, 32, 32, 2048, 2048, 128
+	B, QH, KH, QS, KS, D = 1, 32, 8, 2048, 2048, 128
 	blocksize_k = 16
 	blocksize_q = 16
 	q = jax.nn.initializers.normal(2)(q_key, (B, QS, QH, D), dtype=jnp.float16)
@@ -456,7 +469,11 @@ def _test_forward():
 		if True
 		else None
 	)
-	attention = create_flash_attention(blocksize_q=blocksize_q, blocksize_k=blocksize_k)
+	attention = create_flash_attention(
+		blocksize_q=blocksize_q,
+		blocksize_k=blocksize_k,
+		platform="pallas",
+	)
 	print("QKV Allocated")
 	try:
 		co = attention(q, k, v, b)

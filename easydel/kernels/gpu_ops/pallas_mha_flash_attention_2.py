@@ -391,6 +391,7 @@ def _call_gpu_bwd_flash_attn(
 	res,
 	dO,
 ):
+	raise NotImplementedError("Under Development! (use triton or sdpa)")
 	(q, k, v, b, o, lse) = res
 	batch_size, seqlen_q, nheads, dim = q.shape
 	seqlen_k = k.shape[1]
@@ -506,7 +507,6 @@ def _gpu_flash_attn(
 _gpu_flash_attn.defvjp(
 	_call_gpu_fwd_flash_attn,
 	_call_gpu_bwd_flash_attn,
-	# _jax_bwd_flash_attn,
 )
 
 
@@ -607,9 +607,9 @@ def gpu_bwd_test():
 	print(jnp.allclose(excepted_result, result, atol=0.125, rtol=0))
 
 
-pallas_flash_mha_attn_2_gpu = _flash_attn2
-__all__ = ["pallas_flash_mha_attn_2_gpu"]
+pallas_mha_flash_attention2_gpu = _flash_attn2
+__all__ = ["pallas_mha_flash_attention2_gpu"]
 
 if __name__ == "__main__":
 	gpu_fwd_test()
-	# gpu_bwd_test()
+	gpu_bwd_test()
