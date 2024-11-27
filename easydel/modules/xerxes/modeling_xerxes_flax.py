@@ -524,10 +524,7 @@ class FlaxXerxesLayerCollection(nn.Module):
 			)
 			for i in range(self.config.num_hidden_layers)
 		]
-		self._frequencies = self.config.get_basic_frequencies(
-			self.head_dim,
-			self.head_dim,
-		)
+		self._frequencies = self.config.get_basic_frequencies()
 
 	def __call__(
 		self,

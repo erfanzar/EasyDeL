@@ -28,6 +28,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import Array, lax
 from jax.sharding import PartitionSpec
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import RMSNorm
 from easydel.modules.chatglm.chatglm_configuration import ChatGLMConfig as ChatGLMConfig
@@ -709,10 +710,10 @@ class FlaxChatGLMBlock(nn.Module):
 		)
 		attn_block = FlaxChatGLMAttention
 		mlp_block = MLP
-		if self.config.gradient_checkpointing != "":
+		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			attn_block = nn_partitioning.remat(
 				attn_block,
-				static_argnums=(1, 3, 4, 6, 7, 8),
+				static_argnums=(3, 4, 6, 7, 8),
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 			)
 

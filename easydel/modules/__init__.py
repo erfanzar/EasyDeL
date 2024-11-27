@@ -131,6 +131,12 @@ from easydel.modules.olmo import (
 	FlaxOlmoModel,
 	OlmoConfig,
 )
+from easydel.modules.olmo2 import (
+	FlaxOlmo2ForCausalLM,
+	FlaxOlmo2Model,
+	Olmo2Config,
+)
+
 from easydel.modules.openelm import (
 	FlaxOpenELMForCausalLM,
 	FlaxOpenELMModel,

@@ -406,6 +406,11 @@ class EasyModelsTest(unittest.TestCase):
 		res, err = self.create_test_for_models("olmo", transformers.OlmoForCausalLM)
 		self.assertTrue(res, f"OLMo model Failed [ERROR {err}]")
 
+	def test_olmo2(self):
+		self.header_config = None
+		res, err = self.create_test_for_models("olmo2", transformers.Olmo2ForCausalLM)
+		self.assertTrue(res, f"OLMo model Failed [ERROR {err}]")
+
 	def test_phi(self):
 		self.header_config = ed.PhiConfig(
 			vocab_size=51200,
@@ -695,6 +700,7 @@ if __name__ == "__main__":
 	test.test_mixtral()  # Passed v0.0.80 - N Runtime
 	test.test_mpt()  # Passed v0.0.80 - N Runtime
 	test.test_olmo()  # Passed v0.0.80 - N Runtime
+	test.test_olmo2()  # Passed v0.0.80 - N Runtime
 	test.test_openelm()  # Passed v0.0.80 - N Runtime
 	test.test_phi()  # Passed v0.0.80 - N Runtime
 	test.test_phi3()  # Passed v0.0.80 - N Runtime
