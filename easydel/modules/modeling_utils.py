@@ -30,6 +30,7 @@ from typing import (
 	Tuple,
 	Type,
 	TypeVar,
+	TypedDict,
 	Union,
 )
 
@@ -134,6 +135,39 @@ warnings.filterwarnings(
 
 
 warnings.filterwarnings("ignore", message="You are using a model of type")
+
+
+class EasyDeLBaseConfigDict(TypedDict, total=False):
+	axis_dims: Sequence[int]
+	axis_names: Sequence[str]
+	attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS
+	blocksize_k: int
+	blocksize_q: int
+	blocksize_b: int
+	partition_axis: PartitionAxis
+	shard_attention_computation: bool
+	use_sharded_kv_caching: bool
+	use_sharding_constraint: bool
+	backend: Optional[EasyDeLBackends]
+	platform: Optional[EasyDeLPlatforms]
+	easy_method: Literal["train", "serve", "convert"]
+	bits: Optional[int]
+	scan_ring_attention: bool
+	scan_attention_layers: bool
+	use_scan_mlp: bool
+	scan_mlp_chunk_size: int
+	attention_axis_name: str
+	kv_cache_quantization_method: EasyDeLQuantizationMethods
+	kv_cache_quantization_blocksize: int
+	kv_cache_sharding_sequence_axis_name: Union[str, Tuple[str, ...]]
+	flash_attention_backward_pass_impl: Literal["triton", "xla"]
+	attn_dtype: jnp.dtype
+	fcm_max_ratio: float
+	fcm_min_ratio: float
+	hardware_abstraction: bool
+	pallas_m_block_size: int
+	pallas_k_block_size: int
+	pallas_n_block_size: int
 
 
 class EasyDeLBaseConfig(PretrainedConfig):
@@ -840,6 +874,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			base=base or self.rope_theta,
 			rope_scaling=initial_rope_kwargs,
 		)
+
+
+EasyDeLBaseConfigDict.__doc__ = EasyDeLBaseConfig.__init__.__doc__
+EasyDeLBaseConfigDict.__annotations__ = EasyDeLBaseConfig.__annotations__
 
 
 class EasyDeLBaseModule(FlaxPreTrainedModel):
@@ -1651,6 +1689,7 @@ class EasyDeLBaseModule(FlaxPreTrainedModel):
 
 		if config_kwargs is not None:
 			for k, v in config_kwargs.items():
+				
 				setattr(config, k, v)
 		_, model_kwargs = EasyDeLBaseConfig.from_pretrained(
 			config_path,

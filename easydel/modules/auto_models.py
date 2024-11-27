@@ -46,6 +46,7 @@ from easydel.etils.partition_module import PartitionAxis
 from easydel.modules.factory import registry
 from easydel.modules.modeling_utils import (
 	EasyDeLBaseConfig,
+	EasyDeLBaseConfigDict,
 	EasyDeLBaseModule,
 )
 from easydel.transform.parameters_transformation import torch_dict_to_easydel_params
@@ -146,7 +147,7 @@ class AutoEasyDeLModelForCausalLM:
 		shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
 		backend: Optional[EasyDeLBackends] = None,
 		platform: Optional[EasyDeLPlatforms] = None,
-		config_kwargs: Optional[Mapping[str, Any]] = None,
+		config_kwargs: Optional[EasyDeLBaseConfigDict] = None,
 		auto_shard_params: bool = False,
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]] = None,
 		quantization_method: Optional[EasyDeLQuantizationMethods] = None,
@@ -175,7 +176,7 @@ class AutoEasyDeLModelForCausalLM:
 		    shard_fns (Optional[Mapping[tuple, Callable] | dict], optional): Sharding functions to use for the model. If None, auto-sharding is used if auto_shard_params is True. Defaults to None.
 		    platform (Optional[EasyDeLPlatforms], optional): platform to use for the model. Defaults to None.
 				backend (Optional[EasyDeLBackends], optional): backend to use for the model. Defaults to None.
-		    config_kwargs (Optional[Mapping[str, Any]], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
+		    config_kwargs (Optional[Mapping[str, Any] | EasyDeLBaseConfigDict], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
 		    auto_shard_params (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
 		    partition_rules (Optional[Tuple[Tuple[str, PartitionSpec]]], optional): Custom partition rules for parameter sharding. If not None, shard_fns should also be provided. Defaults to None.
 		    quantization_method (EasyDeLQuantizationMethods, optional): quantization_method to be used to quantize model weights. Defaults to None.
