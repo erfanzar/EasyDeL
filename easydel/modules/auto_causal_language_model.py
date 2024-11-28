@@ -38,11 +38,6 @@ from easydel.etils.etils import (
 	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
-from easydel.modules.modeling_utils import (
-	EasyDeLBaseConfigDict,
-	EasyDeLBaseModule,
-)
-from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN
 from easydel.modules.auto_configuration import (
 	AutoShardAndGatherFunctions,
 	get_modules_by_type,
@@ -50,6 +45,11 @@ from easydel.modules.auto_configuration import (
 )
 from easydel.modules.auto_modeling import BaseAutoEasyModel
 from easydel.modules.factory import TaskType
+from easydel.modules.modeling_utils import (
+	EasyDeLBaseConfigDict,
+	EasyDeLBaseModule,
+)
+from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN
 
 logger = get_logger(name=__name__)
 

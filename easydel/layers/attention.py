@@ -1061,26 +1061,26 @@ class FlexibleAttentionModule(object):
 			else:
 				raise NotImplementedError("bias heads wont match!")
 
-			attention_weight = jax.nn.softmax(attention_weight).astype(self.dtype)
+		attention_weight = jax.nn.softmax(attention_weight).astype(self.dtype)
 
-			if not deterministic and self.attention_dropout > 0.0:
-				keep_prob = 1.0 - self.attention_dropout
-				dropout_shape = tuple([1] * (key_states.ndim - 2)) + attention_weight.shape[-2:]
-				keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
+		if not deterministic and self.attention_dropout > 0.0:
+			keep_prob = 1.0 - self.attention_dropout
+			dropout_shape = tuple([1] * (key_states.ndim - 2)) + attention_weight.shape[-2:]
+			keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
 
-				multiplier = keep.astype(self.dtype) / jnp.asarray(keep_prob, dtype=self.dtype)
-				attention_weight = attention_weight * multiplier
+			multiplier = keep.astype(self.dtype) / jnp.asarray(keep_prob, dtype=self.dtype)
+			attention_weight = attention_weight * multiplier
 
-			attention = jnp.einsum(
-				"bkhsm,bmkd->bskhd",
-				attention_weight,
-				value_states,
-				precision=self.precision,
-			).reshape(b, qs, qh, vd)
-			attention = fjformer.with_sharding_constraint(attention, attention_partitionspec)
-			return AttentionOutput(
-				attention_weights=attention_weight, attention_outputs=attention
-			)
+		attention = jnp.einsum(
+			"bkhsm,bmkd->bskhd",
+			attention_weight,
+			value_states,
+			precision=self.precision,
+		).reshape(b, qs, qh, vd)
+		attention = fjformer.with_sharding_constraint(attention, attention_partitionspec)
+		return AttentionOutput(
+			attention_weights=attention_weight, attention_outputs=attention
+		)
 
 	def blockwise_attention(
 		self,

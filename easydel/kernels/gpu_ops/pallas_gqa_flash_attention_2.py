@@ -101,7 +101,7 @@ def forward_flash_attention(
 	dtype = dtype or query.dtype
 	BLOCK_HDIM = pl.next_power_of_2(dim)
 
-	lse_shape = (batch, kv_heads* groups, query_length)
+	lse_shape = (batch, kv_heads * groups, query_length)
 	in_specs = [
 		pl.BlockSpec(query.shape, lambda *_: (0,) * query.ndim),
 		pl.BlockSpec(key.shape, lambda *_: (0,) * key.ndim),
@@ -220,7 +220,7 @@ def forward_flash_attention(
 			pl.store(
 				lref,
 				val=lse_i,
-				idx=(bg, nhg* off_g, pl.dslice(off_qs * BLOCK_M, BLOCK_M)),
+				idx=(bg, nhg * off_g, pl.dslice(off_qs * BLOCK_M, BLOCK_M)),
 				mask=M_SEQUENCE_MASK,
 			)
 

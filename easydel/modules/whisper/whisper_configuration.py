@@ -211,5 +211,5 @@ class WhisperConfig(EasyDeLBaseConfig):
 			if not hasattr(self, k):
 				setattr(self, k, v)
 
-	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
-		return super().get_partition_rules(fully_sharded_data_parallel)
+	def get_partition_rules(self, *args, **kwargs):
+		return super().get_partition_rules()

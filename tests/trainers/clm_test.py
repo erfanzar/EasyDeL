@@ -102,7 +102,7 @@ def main(use_iterable_dataset: bool):
 			dtype=dtype,
 			param_dtype=dtype,
 			track_memory=True,
-			use_wandb=True,
+			use_wandb=False,
 			learning_rate=3e-4,
 			label_smoothing_factor=0.1,
 			train_on_inputs=True,

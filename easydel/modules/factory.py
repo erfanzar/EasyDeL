@@ -1,6 +1,6 @@
+import inspect
 from dataclasses import dataclass
 from enum import Enum
-import inspect
 from typing import Dict, List, Literal, Optional, Type, TypeVar
 
 from easydel.modules.modeling_utils import EasyDeLBaseConfig, EasyDeLBaseModule
@@ -15,7 +15,7 @@ class ConfigType(str, Enum):
 class TaskType(str, Enum):
 	CAUSAL_LM = "causal-language-model"
 	SEQ_CLASS = "sequence-classification"
-	VISION_LM = "vision-language-model" 
+	VISION_LM = "vision-language-model"
 	AUDIO_CLASS = "audio-classification"
 	BASE_MODULE = "base-module"
 	BASE_VISION = "vision-module"
@@ -53,7 +53,7 @@ class Registry:
 		    Decorator function
 		"""
 
-		def wrapper(obj: T) -> T: 
+		def wrapper(obj: T) -> T:
 			def _str(self):
 				_stre = f"{obj.__name__}(\n"
 				for key in list(inspect.signature(obj.__init__).parameters.keys()):
@@ -119,14 +119,13 @@ class Registry:
 		| Literal[
 			"causal-language-model",
 			"sequence-classification",
-			"vision-language-model", 
+			"vision-language-model",
 			"audio-classification",
 			"base-module",
 			"seq-to-seq",
 		],
 		model_type: str,
 	) -> ModuleRegistration:
-		"""Get registered module information."""
 		return self._task_registry[task_type][model_type]
 
 	@property

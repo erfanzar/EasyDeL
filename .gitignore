@@ -15,6 +15,7 @@ test_EasyDeLState.py
 memory_log_dir/
 wandb
 io.py
+.ruff_cache/*
 launch_test.py
 .gradio
 *.easy
