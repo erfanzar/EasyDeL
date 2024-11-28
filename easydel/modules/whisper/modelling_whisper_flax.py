@@ -27,9 +27,9 @@ from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.random import PRNGKey
-from jax.sharding import PartitionSpec
 from transformers import FlaxWhisperTimeStampLogitsProcessor
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 
 # easydel.modules
@@ -38,7 +38,6 @@ from easydel.modules.flax_modeling_utils import (
 	ACT2FN,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
-	with_sharding_constraint,
 )
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
@@ -215,20 +214,9 @@ class FlaxWhisperAttention(FlaxAttentionModule):
 			causal_mask=causal_mask,
 		)
 
-		attn_output = self._merge_heads(attentions.attention_outputs)
-		if self.config.shard_attention_computation:
-			attn_output = with_sharding_constraint(
-				attn_output,
-				PartitionSpec(
-					self.config.partition_axis.batch_axis,
-					(
-						self.config.partition_axis.sequence_axis
-						if attn_output.shape[1] != 1
-						else None
-					),
-					self.config.partition_axis.hidden_state_axis,
-				),
-			)
+		attn_output = self.shard_attention_prod(
+			self._merge_heads(attentions.attention_outputs)
+		)
 		attn_output = self.out_proj(attn_output)
 
 		return attn_output, attentions.attention_outputs
@@ -250,6 +238,7 @@ class FlaxWhisperEncoderLayer(nn.Module):
 
 	def setup(self) -> None:
 		self.embed_dim = self.config.d_model
+
 		self.self_attn = FlaxWhisperAttention(
 			config=self.config,
 			embed_dim=self.embed_dim,
@@ -259,29 +248,31 @@ class FlaxWhisperEncoderLayer(nn.Module):
 			param_dtype=self.param_dtype,
 			precision=self.precision,
 		)
-		self.self_attn_layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
+		dense_class = partial(
+			Dense,
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+			precision=self.precision,
+			kernel_init=jax.nn.initializers.normal(self.config.init_std),
+			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+		)
+		self.self_attn_layer_norm = nn.LayerNorm(
+			param_dtype=self.param_dtype,
+			dtype=self.dtype,
+			epsilon=1e-05,
+		)
 		self.dropout_layer = flax.linen.Dropout(rate=self.config.dropout)
 		self.activation_fn = ACT2FN[self.config.activation_function]
 		self.activation_dropout_layer = flax.linen.Dropout(
 			rate=self.config.activation_dropout
 		)
-		self.fc1 = Dense(
-			self.config.encoder_ffn_dim,
-			dtype=self.dtype,
+		self.fc1 = dense_class(self.config.encoder_ffn_dim)
+		self.fc2 = dense_class(self.embed_dim)
+		self.final_layer_norm = nn.LayerNorm(
 			param_dtype=self.param_dtype,
-			precision=self.precision,
-			kernel_init=jax.nn.initializers.normal(self.config.init_std),
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
-		)
-		self.fc2 = Dense(
-			self.embed_dim,
 			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-			kernel_init=jax.nn.initializers.normal(self.config.init_std),
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			epsilon=1e-05,
 		)
-		self.final_layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
 
 	def __call__(
 		self,
@@ -327,14 +318,20 @@ class FlaxWhisperEncoderLayerCollection(nn.Module):
 
 	def setup(self):
 		block = FlaxWhisperEncoderLayer
-		if self.config.gradient_checkpointing != "":
+		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			block = remat(
 				block,
 				static_argnums=(2, 3, 4),
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 			)
 		self.layers = [
-			block(self.config, name=str(i), dtype=self.dtype)
+			block(
+				self.config,
+				name=str(i),
+				dtype=self.dtype,
+				param_dtype=self.param_dtype,
+				precision=self.precision,
+			)
 			for i in range(self.config.encoder_layers)
 		]
 		self.layerdrop = self.config.encoder_layerdrop
@@ -409,7 +406,11 @@ class FlaxWhisperDecoderLayer(nn.Module):
 			rate=self.config.activation_dropout
 		)
 
-		self.self_attn_layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
+		self.self_attn_layer_norm = nn.LayerNorm(
+			param_dtype=self.param_dtype,
+			dtype=self.dtype,
+			epsilon=1e-05,
+		)
 		self.encoder_attn = FlaxWhisperAttention(
 			config=self.config,
 			embed_dim=self.embed_dim,
@@ -419,24 +420,26 @@ class FlaxWhisperDecoderLayer(nn.Module):
 			param_dtype=self.param_dtype,
 			precision=self.precision,
 		)
-		self.encoder_attn_layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
-		self.fc1 = Dense(
-			self.config.decoder_ffn_dim,
-			dtype=self.dtype,
+		self.encoder_attn_layer_norm = nn.LayerNorm(
 			param_dtype=self.param_dtype,
-			precision=self.precision,
-			kernel_init=jax.nn.initializers.normal(self.config.init_std),
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			dtype=self.dtype,
+			epsilon=1e-05,
 		)
-		self.fc2 = Dense(
-			self.embed_dim,
+		dense_class = partial(
+			Dense,
 			param_dtype=self.param_dtype,
 			precision=self.precision,
 			dtype=self.dtype,
 			kernel_init=jax.nn.initializers.normal(self.config.init_std),
 			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
 		)
-		self.final_layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
+		self.fc1 = dense_class(self.config.decoder_ffn_dim)
+		self.fc2 = dense_class(self.embed_dim)
+		self.final_layer_norm = nn.LayerNorm(
+			param_dtype=self.param_dtype,
+			dtype=self.dtype,
+			epsilon=1e-05,
+		)
 
 	def __call__(
 		self,
@@ -504,14 +507,20 @@ class FlaxWhisperDecoderLayerCollection(nn.Module):
 
 	def setup(self):
 		block = FlaxWhisperDecoderLayer
-		if self.config.gradient_checkpointing != "":
+		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			block = remat(
 				block,
-				static_argnums=(4, 5, 6, 7),
+				static_argnums=(2, 5, 6, 7),
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 			)
 		self.layers = [
-			block(self.config, name=str(i), dtype=self.dtype)
+			block(
+				self.config,
+				name=str(i),
+				dtype=self.dtype,
+				param_dtype=self.param_dtype,
+				precision=self.precision,
+			)
 			for i in range(self.config.decoder_layers)
 		]
 
@@ -629,7 +638,11 @@ class FlaxWhisperEncoder(nn.Module):
 			param_dtype=self.param_dtype,
 		)
 
-		self.layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
+		self.layer_norm = nn.LayerNorm(
+			param_dtype=self.param_dtype,
+			dtype=self.dtype,
+			epsilon=1e-05,
+		)
 
 	def __call__(
 		self,
@@ -722,7 +735,11 @@ class FlaxWhisperDecoder(nn.Module):
 
 		self.dropout_layer = flax.linen.Dropout(rate=self.config.dropout)
 
-		self.layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-5)
+		self.layer_norm = nn.LayerNorm(
+			param_dtype=self.param_dtype,
+			dtype=self.dtype,
+			epsilon=1e-05,
+		)
 
 	def __call__(
 		self,
@@ -801,12 +818,18 @@ class FlaxWhisperModule(nn.Module):
 			jnp.ones(
 				(
 					1,
-					max(self.config.max_source_positions, self.config.target_positions),
+					max(self.config.max_source_positions, self.config.max_target_positions),
 				),
 				dtype="bool",
 			),
 			dtype="bool",
 		)
+
+	def _get_decoder_module(self):
+		return self.decoder
+
+	def _get_encoder_module(self):
+		return self.encoder
 
 	def __call__(
 		self,
@@ -869,41 +892,49 @@ class FlaxWhisperPreTrainedModel(EasyDeLBaseModule):
 	def __init__(
 		self,
 		config: WhisperConfig,
-		input_shape: Tuple[int] = None,
-		seed: int = 0,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, lax.Precision]] = None,
-		_do_init: bool = True,
+		precision: Optional[jax.lax.Precision] = None,
+		input_shape: Optional[Tuple[int, int, int]] = None,
+		seed: int = 0,
+		_do_init: bool = False,
 		**kwargs,
 	):
-		module = self.module_class(
+		"""
+		Initializes the pre-trained model with the given configuration.
+
+		Args:
+		    config (LlamaConfig): Configuration for the model.
+		    dtype (jnp.dtype): Data type for computations.
+		    param_dtype (jnp.dtype): Data type for model parameters.
+		    precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
+		    input_shape (Tuple[int, int]): Shape of the input tensor.
+		    seed (int): Seed for random number generation.
+		    _do_init (bool): If True, initialize model weights.
+		    **kwargs: Additional keyword arguments.
+		"""
+		if input_shape is None:
+			input_shape = (
+				1,
+				config.num_mel_bins,
+				config.max_source_positions * 2,
+			)
+		super().__init__(
 			config=config,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
-			**kwargs,
-		)
-		if input_shape is None:
-			input_shape = (1, config.num_mel_bins, 2 * config.max_source_positions)
-		super().__init__(
-			config,
-			module,
 			input_shape=input_shape,
 			seed=seed,
-			dtype=dtype,
 			_do_init=_do_init,
-		)
-
-	def enable_gradient_checkpointing(self):
-		self._module = self.module_class(
-			config=self.config,
-			dtype=self.dtype,
-			gradient_checkpointing=True,
+			**kwargs,
 		)
 
 	def init_weights(
-		self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+		self,
+		rng: jax.random.PRNGKey,
+		input_shape: Tuple,
+		params: FrozenDict = None,
 	) -> FrozenDict:
 		# init input tensors
 		input_features = jnp.zeros(input_shape, dtype="f4")
@@ -1198,9 +1229,6 @@ class FlaxWhisperPreTrainedModel(EasyDeLBaseModule):
 )
 class FlaxWhisperModel(FlaxWhisperPreTrainedModel):
 	config: WhisperConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, lax.Precision]] = None
 	module_class = FlaxWhisperModule
 
 
@@ -1217,7 +1245,7 @@ class FlaxWhisperForConditionalGenerationModule(nn.Module):
 			param_dtype=self.param_dtype,
 			precision=self.precision,
 		)
-		self.lm_head = Dense(
+		self.proj_out = Dense(
 			self.config.vocab_size,
 			use_bias=False,
 			dtype=self.dtype,
@@ -1263,12 +1291,12 @@ class FlaxWhisperForConditionalGenerationModule(nn.Module):
 			shared_embedding = self.model.decoder.embed_tokens.variables["params"][
 				"embedding"
 			].T.astype(self.param_dtype)
-			lm_logits = self.lm_head.apply(
+			lm_logits = self.proj_out.apply(
 				{"params": {"kernel": shared_embedding}},
 				hidden_states,
 			)
 		else:
-			lm_logits = self.lm_head(hidden_states)
+			lm_logits = self.proj_out(hidden_states)
 
 		if not return_dict:
 			output = (lm_logits,) + outputs[1:]
@@ -1286,7 +1314,7 @@ class FlaxWhisperForConditionalGenerationModule(nn.Module):
 
 
 @register_module(
-	"conditional-generation",
+	"seq-to-seq",
 	config=WhisperConfig,
 	model_type="whisper",
 	embedding_layer_names=["embed_positions", "embed_tokens"],
@@ -1299,9 +1327,6 @@ class FlaxWhisperForConditionalGenerationModule(nn.Module):
 )
 class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
 	module_class = FlaxWhisperForConditionalGenerationModule
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, lax.Precision]] = None
 
 	def decode(
 		self,
@@ -1386,12 +1411,12 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
 				shared_embedding = module.model.decoder.embed_tokens.variables["params"][
 					"embedding"
 				].T.astype(self.param_dtype)
-				lm_logits = module.lm_head.apply(
+				lm_logits = module.proj_out.apply(
 					{"params": {"kernel": shared_embedding}},
 					hidden_states,
 				)
 			else:
-				lm_logits = module.lm_head(hidden_states)
+				lm_logits = module.proj_out(hidden_states)
 
 			return lm_logits, outputs
 
@@ -1652,25 +1677,19 @@ class FlaxWhisperForAudioClassificationModule(nn.Module):
 )
 class FlaxWhisperForAudioClassification(FlaxWhisperPreTrainedModel):
 	module_class = FlaxWhisperForAudioClassificationModule
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, lax.Precision]] = None
 
 	def init_weights(
-		self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
+		self,
+		rng: jax.random.PRNGKey,
+		input_shape: Tuple,
+		params: FrozenDict = None,
 	) -> FrozenDict:
 		# init input tensors
 		input_features = jnp.zeros(input_shape, dtype="f4")
 		input_features = input_features.at[(..., -1)].set(self.config.eos_token_id)
-
 		params_rng, dropout_rng = jax.random.split(rng)
 		rngs = {"params": params_rng, "dropout": dropout_rng}
-
-		random_params = self.module.init(
-			rngs,
-			input_features=input_features,
-		)["params"]
-
+		random_params = self.module.init(rngs, input_features=input_features)["params"]
 		if params is not None:
 			random_params = flatten_dict(unfreeze(random_params))
 			params = flatten_dict(unfreeze(params))

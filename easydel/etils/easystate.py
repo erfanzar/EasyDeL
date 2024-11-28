@@ -414,7 +414,7 @@ class EasyDeLState(struct.PyTreeNode):
 			depth_target = ["params", "params"]
 		from fjformer.sharding import create_mesh
 
-		from easydel.modules.auto_models import (
+		from easydel.modules.auto_causal_language_model import (
 			AutoShardAndGatherFunctions,
 			get_modules_by_type,
 		)
@@ -685,7 +685,7 @@ class EasyDeLState(struct.PyTreeNode):
 			)
 
 		if filename is None:
-			from easydel.modules.auto_models import AutoEasyDeLModelForCausalLM
+			from easydel.modules.auto_causal_language_model import AutoEasyDeLModelForCausalLM
 
 			model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 				pretrained_model_name_or_path,

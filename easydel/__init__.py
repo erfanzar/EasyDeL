@@ -78,15 +78,19 @@ from easydel.layers.attention import (
 	AttentionMechanisms,
 	FlexibleAttentionModule,
 )
-
-from easydel.modules.auto_models import (
-	AutoEasyDeLConfig,
+from easydel.modules.auto_causal_language_model import (
 	AutoEasyDeLModelForCausalLM,
-	AutoShardAndGatherFunctions,
 	AutoStateForCausalLM,
+)
+from easydel.modules.auto_speech_seq2seq_model import (
+	AutoEasyDeLModelForSpeechSeq2Seq,
+	AutoStateForSpeechSeq2Seq,
+)
+from easydel.modules.auto_configuration import (
+	AutoEasyDeLConfig,
+	AutoShardAndGatherFunctions,
 	get_modules_by_type,
 )
-
 
 from easydel.modules.arctic import (
 	ArcticConfig,

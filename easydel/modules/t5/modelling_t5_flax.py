@@ -1306,7 +1306,7 @@ class FlaxT5Encoder(nn.Module):
 
 
 @register_module(
-	"conditional-generation",
+	"seq-to-seq",
 	config=T5Config,
 	model_type="t5",
 	embedding_layer_names=["shared", "relative_attention_bias"],
