@@ -29,8 +29,8 @@ from typing import (
 	Sequence,
 	Tuple,
 	Type,
-	TypeVar,
 	TypedDict,
+	TypeVar,
 	Union,
 )
 
@@ -1689,7 +1689,6 @@ class EasyDeLBaseModule(FlaxPreTrainedModel):
 
 		if config_kwargs is not None:
 			for k, v in config_kwargs.items():
-				
 				setattr(config, k, v)
 		_, model_kwargs = EasyDeLBaseConfig.from_pretrained(
 			config_path,

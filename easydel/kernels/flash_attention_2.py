@@ -33,9 +33,9 @@ from jax.extend.backend import get_backend
 
 from easydel.kernels.cpu_ops import jax_flash_attn_2_mu
 from easydel.kernels.gpu_ops import (
+	pallas_gqa_flash_attention2_gpu,
 	pallas_mha_flash_attention2_gpu,
 	triton_gqa_flash_attention2_gpu,
-	pallas_gqa_flash_attention2_gpu,
 )
 
 AVAILABLE_FLASH_ATTENTION2_PLATFORMS = Literal["triton", "pallas", "jax"]

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional
+
 import jax
 from fjformer.functions.loss_functions import (
 	SpecialLossNormalizingFactor,
@@ -25,7 +27,7 @@ from jax.sharding import PartitionSpec
 
 
 def create_casual_language_model_train_step(
-	partition_spec=PartitionSpec(("dp", "fsdp"), "sp"),  # noqa:B008
+	partition_spec: Optional[PartitionSpec] = None,
 	label_smoothing_factor=0.0,
 	z_loss=0.0,
 	gradient_accumulation_steps: int = 1,
@@ -35,19 +37,18 @@ def create_casual_language_model_train_step(
 	an updated state with new parameters based on these gradients.
 
 	Args:
-	    partition_spec: Specify which devices the model will be split
-	        across
-	    label_smoothing_factor: A float in [0, 1] specifying the amount
-	        of label smoothing to apply, where 0 means no smoothing.
-	    z_loss: A regularization term that adds a penalty for large
-	        weights, where 0 means no regularization.
-	    gradient_accumulation_steps: int : gradient accumulation step
-	        size from arguments
+	    partition_spec (PartitionSpec): Specify which devices the model will be split across
+	    label_smoothing_factor (float): A float in [0, 1] specifying the amount of label smoothing to apply, where 0 means no smoothing.
+	    z_loss (float): A regularization term that adds a penalty for large weights, where 0 means no regularization.
+	    gradient_accumulation_steps (int) : gradient accumulation step size from arguments
 
 	Returns:
 	    A casual_language_model_train_step function that takes in the
 	    current state of the model,
 	"""
+
+	if partition_spec is None:
+		partition_spec = PartitionSpec(("dp", "fsdp"), "sp")
 	assert (
 		gradient_accumulation_steps > 0
 	), "gradient_accumulation_steps must be greater than 0"  # Ignore
@@ -59,12 +60,10 @@ def create_casual_language_model_train_step(
 
 		Args:
 		    state: Store the model parameters
-		    batch: Pass the data to the model, dict with input_ids(bs,
-		        seq_len), labels(bs, seq_len-1), attention_mask(bs,
-		        seq_len)
+		    batch: Pass the data to the model.
 
 		Returns:
-		    A tuple of (state, loss, accuracy)
+		    A tuple of (state, loss, metrics)
 		"""
 		batch = with_sharding_constraint(batch, partition_spec)
 
@@ -135,7 +134,7 @@ def create_casual_language_model_train_step(
 
 
 def create_casual_language_model_evaluation_step(
-	partition_spec=PartitionSpec(("dp", "fsdp"), "sp"),  # noqa:B008
+	partition_spec: Optional[PartitionSpec] = None,
 ):
 	"""The create_casual_language_model_evaluation_step function is used to create a function that calculates the loss
 	 and accuracy of a model. It takes in a set of parameters, which are then passed into the state.apply_fn function
@@ -143,12 +142,14 @@ def create_casual_language_model_evaluation_step(
 	logits.
 
 	Args:
-	    partition_spec: Specify the partitioning of the model parameters
-
+	    partition_spec (PartitionSpec): Specify the partitioning of the model parameters
 	Returns:
 	    A function that can be used to calculate the loss and accuracy
 	    of a model
 	"""
+
+	if partition_spec is None:
+		partition_spec = PartitionSpec(("dp", "fsdp"), "sp")
 
 	def casual_language_model_evaluation_step(state, batch_eval):
 		"""The casual_language_model_evaluation_step function is used to calculate the loss and accuracy of a model.
@@ -157,8 +158,7 @@ def create_casual_language_model_evaluation_step(
 		these logits.
 
 		Args:
-		    state: Store the model parameters and other information
-		        about the training process
+		    state: Store the model parameters and other information about the training process
 		    batch_eval: Pass the batch of data to the function
 
 		Returns:
@@ -172,10 +172,6 @@ def create_casual_language_model_evaluation_step(
 			It takes in a set of parameters, which are then passed into the state.apply_fn function
 			to generate logits for each token in the batch. The cross entropy loss and accuracy are then calculated
 			from these logits.
-
-			:param params: Pass the model parameters to the function
-			:return: The loss and the accuracy
-
 			"""
 			labels = batch_eval.get("labels", None)
 			if labels is None:

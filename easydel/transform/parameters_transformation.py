@@ -107,6 +107,8 @@ def process_tensor(
 	elif "weight" in key:
 		if len(tensor.shape) == 2:
 			tensor = tensor.transpose(0, 1)
+		elif len(tensor.shape) == 3:
+			tensor = tensor.transpose(0, 2)
 		new_key = key.replace(".weight", ".kernel")
 
 	key_tuple = tuple(new_key.split("."))

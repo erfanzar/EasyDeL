@@ -23,14 +23,18 @@ from easydel.trainers.direct_preference_optimization_trainer import (
 	DPOTrainerOutput,
 )
 from easydel.trainers.odds_ratio_preference_optimization_trainer import (
+	ORPOConfig,
 	ORPOTrainer,
 	ORPOTrainerOutput,
-	ORPOConfig,
 )
 from easydel.trainers.packer import pack_sequences
 from easydel.trainers.sequence_classification_trainer import (
 	SequenceClassificationTrainer,
 	SequenceClassificationTrainerOutput,
+)
+from easydel.trainers.sequence_to_sequence_trainer import (
+	DataCollatorSpeechSeq2SeqWithPadding,
+	Seq2SeqTrainer,
 )
 from easydel.trainers.supervised_fine_tuning_trainer import SFTTrainer
 from easydel.trainers.training_configurations import (
@@ -54,6 +58,8 @@ __all__ = [
 	"BaseTrainer",
 	"CausalLanguageModelTrainer",
 	"CausalLMTrainerOutput",
+	"Seq2SeqTrainer",
+	"DataCollatorSpeechSeq2SeqWithPadding",
 	"DPOConfig",
 	"DPOTrainer",
 	"DPOTrainerOutput",

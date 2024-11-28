@@ -198,7 +198,7 @@ class FlaxWhisperAttention(FlaxAttentionModule):
 		if not deterministic and self.dropout > 0.0:
 			dropout_rng = self.make_rng("dropout")
 
-		attentions = self.attention_performer(
+		attentions = self.attention_performer.__call__(
 			query_states=query_states,
 			key_states=key_states,
 			value_states=value_states,
@@ -1169,6 +1169,7 @@ class FlaxWhisperPreTrainedModel(EasyDeLBaseModule):
 		dropout_rng: PRNGKey = None,
 		extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
 		add_params_field: bool = False,
+		**kwargs,
 	):
 		output_attentions = (
 			output_attentions

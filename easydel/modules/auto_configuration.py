@@ -34,13 +34,12 @@ from easydel.etils.etils import (
 	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
-from easydel.modules.factory import registry
+from easydel.modules.factory import TaskType, registry
 from easydel.modules.modeling_utils import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseModule,
 )
 from easydel.transform.parameters_transformation import torch_dict_to_easydel_params
-from easydel.modules.factory import TaskType
 
 logger = get_logger(name=__name__)
 
@@ -100,6 +99,7 @@ class AutoEasyDeLConfig:
 		shard_attention_computation: bool = True,
 		backend: Optional[EasyDeLBackends] = None,
 		platform: Optional[EasyDeLPlatforms] = None,
+		model_task: TaskType = TaskType.CAUSAL_LM,
 		from_torch: bool = False,
 		**kwargs,
 	) -> EasyDeLBaseConfig:
@@ -108,15 +108,14 @@ class AutoEasyDeLConfig:
 		the class corresponding to your model, with all weights loaded from disk.
 
 		Args:
-		    cls: Create an instance of the class that called this function
-		    pretrained_model_name_or_path: str: Identify the model in the huggingface model hub
-		    sharding_axis_dims: Sequence[int]: Specify the dimension of each axis in the sharded model
-		    sharding_axis_names: Sequence[str]: Specify the order of sharding
-		    partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
-		    shard_attention_computation: bool: whenever to use shard_map for attention
-		    backend: Optional[EasyDeLBackends] : backend to use for model
+		    cls: Create an instance of the class that called this function.
+		    pretrained_model_name_or_path: str: Identify the model in the huggingface model hub.
+		    sharding_axis_dims: Sequence[int]: Specify the dimension of each axis in the sharded model_tasking arrays in easydel.
+		    shard_attention_computation: bool: whenever to use shard_map for attention.
+		    backend: Optional[EasyDeLBackends] : backend to use for model.
+				model_task (TaskType): Task type of model load and find.
 		    from_torch: should config be loaded from torch models or not.
-		    **kwargs: Pass additional arguments to the model and config classes
+		    **kwargs: Pass additional arguments to the model and config classes.
 		generation process
 
 		Returns:
@@ -130,7 +129,10 @@ class AutoEasyDeLConfig:
 		config = cls_main.from_pretrained(pretrained_model_name_or_path)
 		model_type: str = config.model_type
 
-		config_class, module, transform_function = get_modules_by_type(model_type)
+		config_class, module, transform_function = get_modules_by_type(
+			model_type,
+			model_task,
+		)
 		config = config_class.from_pretrained(pretrained_model_name_or_path)
 		if hasattr(config, "add_jax_args"):
 			config.add_jax_args()
@@ -171,6 +173,7 @@ class AutoShardAndGatherFunctions:
 		config: EasyDeLBaseConfig,
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
 		flatten: bool = True,
+		model_task: TaskType = TaskType.CAUSAL_LM,
 		input_shape: Tuple[int, int] = (1, 1),
 		depth_target: Optional[List[str]] = None,
 	):
@@ -180,9 +183,10 @@ class AutoShardAndGatherFunctions:
 		Args:
 		    config: An `EasyDeLBaseConfig` object containing the model configuration.
 		    partition_rules: A tuple of tuples containing partition rule names and `PartitionSpec` objects.
-		        If None, uses the default partition rules from the `config`.
+		      If None, uses the default partition rules from the `config`.
 		    flatten: Whether to flatten the shard and gather functions. Defaults to True.
-		    input_shape: The input shape of the model. Defaults to (1, 1).
+				model_task (TaskType): Task type of model load and find.
+				input_shape: The input shape of the model. Defaults to (1, 1).
 		    depth_target: Pad the sharding to depth, for example make {params:tensor} with depth_target = ["row"] to {row:{params:tensor}}. Defaults to None.
 
 		Returns:
@@ -190,7 +194,7 @@ class AutoShardAndGatherFunctions:
 		"""
 		if partition_rules is None:
 			partition_rules = config.get_partition_rules(True)
-		_, module, _ = get_modules_by_type(config.model_type)
+		_, module, _ = get_modules_by_type(config.model_type, model_task)
 		model = module(config=config, _do_init=False, input_shape=input_shape)
 
 		partition_specs = match_partition_rules(partition_rules, model.params_shape_tree)
@@ -233,6 +237,7 @@ class AutoShardAndGatherFunctions:
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
 		flatten: bool = True,
 		config_kwargs: Optional[Mapping[str, Any]] = None,
+		model_task: TaskType = TaskType.CAUSAL_LM,
 		depth_target: Optional[List[str]] = None,
 		from_torch: bool = False,
 		trust_remote_code: bool = False,
@@ -252,6 +257,7 @@ class AutoShardAndGatherFunctions:
 		        If None, uses the default partition rules from the `config`.
 		    flatten: Whether to flatten the shard and gather functions. Defaults to True.
 		    config_kwargs: Additional keyword arguments to pass to the `AutoEasyDeLConfig` constructor. Defaults to None.
+				model_task (TaskType): Task type of model load and find.
 		    depth_target: Pad the sharding to depth, for example make {params:tensor} with depth_target = ["row"] to {row:{params:tensor}}. Defaults to None.
 		    from_torch: should config be loaded from torch models or not.
 		    trust_remote_code (bool): whenever to trust remote code loaded from HF.
@@ -270,6 +276,7 @@ class AutoShardAndGatherFunctions:
 			platform=platform,
 			from_torch=from_torch,
 			trust_remote_code=trust_remote_code,
+			model_task=model_task,
 		)
 		if config_kwargs is not None:
 			for k, v in config_kwargs.items():
@@ -280,4 +287,5 @@ class AutoShardAndGatherFunctions:
 			flatten=flatten,
 			input_shape=input_shape,
 			depth_target=depth_target,
+			model_task=model_task,
 		)

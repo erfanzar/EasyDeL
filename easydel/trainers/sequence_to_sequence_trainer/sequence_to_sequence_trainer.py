@@ -16,7 +16,8 @@ import copy
 import os
 import time
 import typing
-from typing import Any, Callable, Mapping, Optional, Tuple
+import warnings
+from typing import Any, Callable, Mapping, Optional, Tuple, Union
 
 import flax
 import jax
@@ -30,6 +31,7 @@ from tqdm.autonotebook import tqdm
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import get_logger
+from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.trainers.base_trainer import (
 	BaseTrainer,
 	MetricsTracker,
@@ -37,17 +39,18 @@ from easydel.trainers.base_trainer import (
 	TrainerConfigureFunctionOutput,
 )
 from easydel.trainers.sequence_to_sequence_trainer.functions import (
-	create_casual_language_model_evaluation_step,
-	create_casual_language_model_train_step,
+	create_seq2seq_model_evaluation_step,
+	create_seq2seq_model_train_step,
 )
 from easydel.trainers.sequence_to_sequence_trainer.modeling_output import (
 	Seq2SeqTrainerOutput,
 )
+from easydel.trainers.training_configurations import TrainingArguments
 
 logger = get_logger(__name__)
 
 
-class CausalLanguageModelTrainer(BaseTrainer):
+class Seq2SeqTrainer(BaseTrainer):
 	"""
 	Trainer for SequenceToSequence Models (Seq2Seq).
 
@@ -65,46 +68,62 @@ class CausalLanguageModelTrainer(BaseTrainer):
 			initialize_state(self, model_parameters: Optional[flax.core.FrozenDict] = None, state: Optional[EasyDeLState] = None) -> Tuple[EasyDeLState, Mapping[str, Callable], Mapping[str, Callable]]:
 					Initializes the training state, either from scratch, pretrained parameters, or a checkpoint.
 			train(self, model_parameters: Optional[flax.core.FrozenDict] = None, state: Optional[EasyDeLState] = None) -> CausalLMTrainerOutput:
-					Trains the CLM and returns the training output.
+					Trains the Seq2Seq and returns the training output.
 			eval(self, model_state: EasyDeLState) -> typing.Iterator[dict]:
-					Evaluates the CLM and yields evaluation metrics.
+					Evaluates the Seq2Seq and yields evaluation metrics.
 	"""
 
-	def create_collect_function(
+	def __init__(
 		self,
-		max_sequence_length: int,
-		truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
-	) -> Callable:
+		arguments: Optional[TrainingArguments] = None,
+		model: Optional[EasyDeLBaseModule] = None,
+		data_collator=None,
+		dataset_train: Optional["Dataset"] = None,  # noqa: F821 # type:ignore
+		dataset_eval: Optional["Dataset"] = None,  # noqa: F821 # type:ignore
+		finetune: bool = True,
+		checkpoint_path: Optional[Union[str, os.PathLike]] = None,
+		_do_init_fns: bool = True,
+	):
+		assert dataset_train is not None, "`dataset_train` must be provided."
+		assert data_collator is not None, "`data_collator` must be provided."
+		self.data_collator = data_collator
+		if arguments.init_input_shape is None:
+			if model is not None:
+				arguments.init_input_shape = (
+					jax.device_count(),
+					model.config.num_mel_bins,
+					model.config.max_source_positions * 2,
+				)
+			else:
+				config = arguments.configs_to_initialize_model_class.get("config", None)
+				if config is None:
+					raise NotImplementedError(
+						"please provide `init_input_shape` in `TrainingArguments`"
+					)
+				arguments.init_input_shape = (
+					jax.device_count(),
+					config.num_mel_bins,
+					config.max_source_positions * 2,
+				)
+		super().__init__(
+			arguments=arguments,
+			checkpoint_path=checkpoint_path,
+			dataset_eval=dataset_eval,
+			dataset_train=dataset_train,
+			finetune=finetune,
+			model=model,
+			_do_init_fns=_do_init_fns,
+		)
+
+	def create_collect_function(self, *args, **kwargs) -> Callable:
 		"""
 		Creates a function to collect and process batches of data for training or evaluation.
-
-		This function handles padding or truncating sequences to the specified `max_sequence_length`
-		based on the chosen `truncation_mode`.
-
-		Args:
-		    max_sequence_length (int): The maximum allowed sequence length.
-		    truncation_mode (typing.Literal["keep_end", "keep_start"], optional):
-		        The truncation mode. Defaults to "keep_end".
-
 		Returns:
 		    Callable: A function that takes a batch of data and returns a processed batch.
 		"""
 
 		def collate_fn(batch):
-			results = {}
-			for key in batch[0].keys():
-				if truncation_mode == "keep_end":
-					corrected_sequence = [
-						jnp.array(f[key])[..., -max_sequence_length:] for f in batch
-					]
-				else:
-					corrected_sequence = [
-						jnp.array(f[key])[..., :max_sequence_length] for f in batch
-					]
-				results[key] = jnp.stack(corrected_sequence).reshape(
-					-1, corrected_sequence[0].shape[-1]
-				)
-			return results
+			return self.data_collator(batch)
 
 		return collate_fn
 
@@ -125,18 +144,16 @@ class CausalLanguageModelTrainer(BaseTrainer):
 
 		def initialize_state_function():
 			initialized_parameters = self.model.init_weights(
-				jax.random.PRNGKey(0), self.arguments.init_input_shape
+				jax.random.PRNGKey(0),
+				self.arguments.init_input_shape,
 			)
-
 			if self.arguments.dtype == jnp.bfloat16:
 				initialized_parameters = self.model.to_bf16(initialized_parameters)
 			elif self.arguments.dtype == jnp.float16:
 				initialized_parameters = self.model.to_fp16(initialized_parameters)
-
 			tx = self.tx
 			parameters = flax.core.freeze({"params": initialized_parameters})
 			tx_init = copy.deepcopy(self.arguments.optimizer_kwargs)
-
 			if self.rapture is not None:
 				lora_parameters = self.lora_parameters
 				if self.arguments.dtype == jnp.bfloat16:
@@ -240,10 +257,8 @@ class CausalLanguageModelTrainer(BaseTrainer):
 			donate_argnums=(0,),
 		)
 		sharded_train_step_function = jax.jit(
-			create_casual_language_model_train_step(
+			create_seq2seq_model_train_step(
 				partition_spec=self.arguments.step_partition_spec,
-				label_smoothing_factor=self.arguments.label_smoothing_factor,
-				z_loss=self.arguments.z_loss,
 				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
 			),
 			in_shardings=(spec_named_sharding, empty_sharding),
@@ -252,8 +267,8 @@ class CausalLanguageModelTrainer(BaseTrainer):
 		)
 
 		sharded_eval_step_function = jax.jit(
-			create_casual_language_model_evaluation_step(
-				partition_spec=self.arguments.step_partition_spec,
+			create_seq2seq_model_evaluation_step(
+				partition_spec=self.arguments.step_partition_spec
 			),
 			in_shardings=(spec_named_sharding, empty_sharding),
 			out_shardings=(empty_sharding, empty_sharding, empty_sharding),
@@ -364,10 +379,8 @@ class CausalLanguageModelTrainer(BaseTrainer):
 							spec=PartitionSpec(), mesh=self.arguments.get_mesh()
 						)
 						sharded_train_step_function = jax.jit(
-							create_casual_language_model_train_step(
+							create_seq2seq_model_train_step(
 								partition_spec=self.arguments.step_partition_spec,
-								label_smoothing_factor=self.arguments.label_smoothing_factor,
-								z_loss=self.arguments.z_loss,
 								gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
 							),
 							in_shardings=(spec_named_sharding, empty_sharding),
@@ -380,7 +393,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
 						)
 
 						sharded_eval_step_function = jax.jit(
-							create_casual_language_model_evaluation_step(
+							create_seq2seq_model_evaluation_step(
 								partition_spec=self.arguments.step_partition_spec,
 							),
 							in_shardings=(spec_named_sharding, empty_sharding),
@@ -402,10 +415,11 @@ class CausalLanguageModelTrainer(BaseTrainer):
 						os.remove(self.checkpoint_path)
 				elif model_parameters is not None and self.checkpoint_path is None:
 					if not isinstance(model_parameters, flax.core.FrozenDict):
-						logger.warn(
-							"Model Parameters should be like FrozenDict({'params': params}) make sure to "
-							"pass as type FrozenDict in case of not getting UnExcepted Errors ",
+						warnings.warn(
+							"Model Parameters should be like FrozenDict({'params': params}). (auto correct)",
+							stacklevel=1,
 						)
+						model_parameters = flax.core.FrozenDict(model_parameters)
 
 					model_parameters = model_parameters
 					sharded_state = self.create_sharded_state_from_params_function(
@@ -698,7 +712,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
 
 	def eval(self, model_state: EasyDeLState) -> typing.Iterator[dict]:
 		"""
-		Evaluates the Causal Language Model (CLM) using the provided model state.
+		Evaluates the Seq2Seq (Seq2Seq) using the provided model state.
 
 		This method iterates over the evaluation dataset, performs forward passes,
 		calculates evaluation metrics, logs the metrics, and yields the metrics for
