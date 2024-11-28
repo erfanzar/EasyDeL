@@ -1671,7 +1671,7 @@ class EasyDeLBaseModule(FlaxPreTrainedModel):
 			cl_di = len(jax.devices())
 			input_shape = (cl_di, cl_di)  # safest way to perform loading ...
 		config_path = config if config is not None else pretrained_model_name_or_path
-		from easydel.modules.auto_models import (
+		from easydel.modules.auto_causal_language_model import (
 			AutoEasyDeLConfig,
 			AutoShardAndGatherFunctions,
 			get_modules_by_type,

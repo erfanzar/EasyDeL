@@ -35,7 +35,6 @@ from easydel.inference.vinference.api_models import (
 	ChatCompletionStreamResponseChoice,
 	ChatMessage,
 	CountTokenRequest,
-	ChatMessage,
 	DeltaMessage,
 	UsageInfo,
 )
@@ -155,7 +154,7 @@ class vInferenceApiServer:
 
 	def _create_usage_info(
 		self,
-		prefiled_length: int,
+		prompt_tokens: int,
 		ngenerated_tokens: int,
 		processing_time: float,
 		first_iter_flops: float,
@@ -166,9 +165,9 @@ class vInferenceApiServer:
 		return UsageInfo(
 			first_iter_flops=first_iter_flops,
 			iter_flops=iter_flops,
-			prompt_tokens=prefiled_length,
+			prompt_tokens=prompt_tokens,
 			completion_tokens=ngenerated_tokens,
-			total_tokens=ngenerated_tokens + prefiled_length,
+			total_tokens=ngenerated_tokens + prompt_tokens,
 			tokens_pre_second=tokens_pre_second,
 			processing_time=processing_time,
 		)
@@ -181,7 +180,7 @@ class vInferenceApiServer:
 	) -> ChatCompletionResponse:
 		"""Handle non-streaming response generation."""
 		start = time.perf_counter()
-
+		prompt_tokens = inference.count_tokens(request.model_dump()["messages"])
 		# Generate response
 
 		for response in inference.generate(
@@ -214,7 +213,7 @@ class vInferenceApiServer:
 				)
 			],
 			usage=self._create_usage_info(
-				inference.model_prefill_length,
+				prompt_tokens,
 				response.generated_tokens,
 				processing_time,
 				response.generate_func_flops,
@@ -238,6 +237,7 @@ class vInferenceApiServer:
 		"""Handle streaming response generation asynchronously."""
 
 		async def stream_results() -> AsyncGenerator[bytes, Any]:
+			prompt_tokens = inference.count_tokens(request.model_dump()["messages"])
 			start = time.perf_counter()
 			padded_sequence_length = inference.model_prefill_length
 
@@ -279,7 +279,7 @@ class vInferenceApiServer:
 						)
 					],
 					usage=await self._create_usage_info_async(
-						inference.model_prefill_length,
+						prompt_tokens,
 						response.generated_tokens,
 						processing_time,
 						response.generate_func_flops,
@@ -310,7 +310,7 @@ class vInferenceApiServer:
 					)
 				],
 				usage=await self._create_usage_info_async(
-					inference.model_prefill_length,
+					prompt_tokens,
 					response.generated_tokens,
 					processing_time,
 					response.generate_func_flops,
@@ -332,7 +332,7 @@ class vInferenceApiServer:
 
 	async def _create_usage_info_async(
 		self,
-		prefill_length: int,
+		prompt_tokens: int,
 		generated_tokens: int,
 		processing_time: float,
 		generate_flops: int,
@@ -344,7 +344,7 @@ class vInferenceApiServer:
 		return await asyncio.get_event_loop().run_in_executor(
 			None,
 			self._create_usage_info,
-			prefill_length,
+			prompt_tokens,
 			generated_tokens,
 			processing_time,
 			generate_flops,

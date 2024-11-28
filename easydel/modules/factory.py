@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum
+import inspect
 from typing import Dict, List, Literal, Optional, Type, TypeVar
 
 from easydel.modules.modeling_utils import EasyDeLBaseConfig, EasyDeLBaseModule
@@ -14,8 +15,7 @@ class ConfigType(str, Enum):
 class TaskType(str, Enum):
 	CAUSAL_LM = "causal-language-model"
 	SEQ_CLASS = "sequence-classification"
-	VISION_LM = "vision-language-model"
-	COND_GEN = "conditional-generation"
+	VISION_LM = "vision-language-model" 
 	AUDIO_CLASS = "audio-classification"
 	BASE_MODULE = "base-module"
 	BASE_VISION = "vision-module"
@@ -53,7 +53,17 @@ class Registry:
 		    Decorator function
 		"""
 
-		def wrapper(obj: T) -> T:
+		def wrapper(obj: T) -> T: 
+			def _str(self):
+				_stre = f"{obj.__name__}(\n"
+				for key in list(inspect.signature(obj.__init__).parameters.keys()):
+					attrb = getattr(self, key, "EMT_ATTR_EPLkey")
+					if attrb != "EMT_ATTR_EPLkey":
+						_stre += f"  {key}={repr(attrb)},\n"
+				return _stre + ")"
+
+			obj.__str__ = _str
+			obj.__repr__ = lambda self: repr(_str(self))
 			self._config_registry[config_field][config_type] = obj
 			return obj
 
@@ -109,8 +119,7 @@ class Registry:
 		| Literal[
 			"causal-language-model",
 			"sequence-classification",
-			"vision-language-model",
-			"conditional-generation",
+			"vision-language-model", 
 			"audio-classification",
 			"base-module",
 			"seq-to-seq",
