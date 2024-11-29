@@ -1619,7 +1619,8 @@ class EasyDeLBaseModule(FlaxPreTrainedModel):
 		backend: Optional[EasyDeLBackends] = None,
 		platform: Optional[EasyDeLPlatforms] = "jax",
 		bit_targeted_params: Optional[List[str]] = None,
-		quantization_block_size: int = 4096,
+		model_task: str = "base-module",
+		quantization_block_size: int = 128,
 		shard_fns: dict[Callable] = None,
 		auto_shard_params: bool = False,
 		remove_dict_prefix=None,
@@ -1690,21 +1691,7 @@ class EasyDeLBaseModule(FlaxPreTrainedModel):
 		if config_kwargs is not None:
 			for k, v in config_kwargs.items():
 				setattr(config, k, v)
-		_, model_kwargs = EasyDeLBaseConfig.from_pretrained(
-			config_path,
-			cache_dir=cache_dir,
-			return_unused_kwargs=True,
-			force_download=force_download,
-			proxies=proxies,
-			local_files_only=local_files_only,
-			token=token,
-			revision=revision,
-			subfolder=subfolder,
-			_from_auto=from_auto_class,
-			_from_pipeline=from_pipeline,
-			_commit_hash=commit_hash,
-			**kwargs,
-		)
+
 		if commit_hash is None:
 			commit_hash = getattr(config, "_commit_hash", None)
 		if auto_shard_params and shard_fns is None:
@@ -1783,7 +1770,7 @@ class EasyDeLBaseModule(FlaxPreTrainedModel):
 			# if they are using EasyDeLBaseModule.from_pretrained
 			# they will get error AssertionError: `module` must be provided.` so we autoset this to make sure user don't
 			# experience this error.
-			_, cls, _ = get_modules_by_type(config.model_type)
+			_, cls, _ = get_modules_by_type(config.model_type, model_task)
 		model = cls(
 			config=config,
 			dtype=dtype,
