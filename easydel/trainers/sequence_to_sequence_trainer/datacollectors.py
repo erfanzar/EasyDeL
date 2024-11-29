@@ -6,6 +6,7 @@ from jax import numpy as jnp
 
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
+	max_length: int
 	processor: Any
 	decoder_start_token_id: int
 
@@ -21,12 +22,16 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 		batch = self.processor.feature_extractor.pad(
 			input_features,
 			return_tensors="np",
+			max_length=self.max_length,
+			padding="max_length",
 		)
 
 		label_features = [{"input_ids": feature["labels"]} for feature in features]
 		labels_batch = self.processor.tokenizer.pad(
 			label_features,
 			return_tensors="np",
+			max_length=self.max_length,
+			padding="max_length",
 		)
 		labels = jnp.where(
 			jnp.not_equal(labels_batch.attention_mask, 1),
