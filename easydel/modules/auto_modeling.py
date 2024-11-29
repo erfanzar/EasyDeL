@@ -33,14 +33,18 @@ from easydel.etils.etils import (
 	EasyDeLQuantizationMethods,
 )
 from easydel.etils.partition_module import PartitionAxis
+from easydel.modules.factory import TaskType
 from easydel.modules.modeling_utils import (
 	EasyDeLBaseModule,
 )
 
 
 class BaseAutoEasyModel:
-	@staticmethod
+	model_task: TaskType
+
+	@classmethod
 	def _from_easydel_params(
+		cls,
 		pretrained_model_name_or_path,
 		dtype: jax.numpy.dtype,
 		param_dtype: jax.numpy.dtype,
@@ -82,6 +86,7 @@ class BaseAutoEasyModel:
 			bit_targeted_params=bit_targeted_params,
 			quantization_block_size=quantization_block_size,
 			safe=safe,
+			model_task=cls.model_task,
 			**kwargs,
 		)
 

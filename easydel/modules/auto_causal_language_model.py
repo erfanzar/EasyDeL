@@ -86,6 +86,8 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 	    ```
 	"""
 
+	model_task: TaskType = TaskType.CAUSAL_LM  # Static
+
 	@classmethod
 	def from_pretrained(
 		cls,
