@@ -250,7 +250,9 @@ class BaseTrainer(ABC):
 			self.wandb_runtime = self.arguments.get_wandb_init()
 
 	def _initialize_timer(self):
-		self.timer = Timers(use_wandb=False, tensorboard_writer=self.arguments.get_board())
+		self.timer = Timers(
+			use_wandb=False, tensorboard_writer=self.arguments.get_tensorboard
+		)
 
 	def _configure_dataloaders(self):
 		"""

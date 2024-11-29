@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import functools
 import pathlib
 import re
 import warnings
@@ -177,7 +178,7 @@ class TrainingArguments:
 	        Returns the configured optimizer and scheduler.
 	    get_streaming_checkpointer(self):
 	        Returns the checkpoint manager for saving checkpoints.
-	    get_board(self):
+	    get_tensorboard(self):
 	        Returns the TensorBoard SummaryWriter for logging.
 	    get_wandb_init(self):
 	        Initializes WandB if enabled.
@@ -449,14 +450,19 @@ class TrainingArguments:
 			verbose=self.verbose,
 		)
 
-	def get_board(self):
+	@functools.cached_property
+	def _tensorboard(self):
+		return flax.metrics.tensorboard.SummaryWriter(log_dir=str(self.get_path()))
+
+	def get_tensorboard(self):
 		"""
 		Returns the TensorBoard SummaryWriter, used for logging metrics.
 
 		Returns:
 		    flax.metrics.tensorboard.SummaryWriter: The TensorBoard SummaryWriter.
 		"""
-		return flax.metrics.tensorboard.SummaryWriter(log_dir=str(self.get_path()))
+
+		return self._tensorboard
 
 	def get_wandb_init(self):
 		"""
@@ -584,7 +590,7 @@ class TrainingArguments:
 			from torch import Tensor
 		except ModuleNotFoundError:
 			...
-		summary_writer = self.get_board()
+		summary_writer = self.get_tensorboard()
 		for key, value in metrics.items():
 			try:
 				if isinstance(value, (float, int)):
