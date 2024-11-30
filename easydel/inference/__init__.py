@@ -15,9 +15,15 @@
 
 from easydel.inference.vinference.api_server import vInferenceApiServer
 from easydel.inference.vinference.vinference import vInference, vInferenceConfig
+from easydel.inference.whisper_inference import (
+	vWhisperInference,
+	vWhisperInferenceConfig,
+)
 
 __all__ = [
 	"vInference",
 	"vInferenceConfig",
 	"vInferenceApiServer",
+	"vWhisperInference",
+	"vWhisperInferenceConfig",
 ]

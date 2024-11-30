@@ -6,7 +6,6 @@ EasyDeL APIs 🔮
    
    Cli
    Etils
-   Generation
    Inference
    Kernels
    Layers
