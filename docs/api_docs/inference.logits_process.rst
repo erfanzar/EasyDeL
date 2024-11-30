@@ -1,7 +1,7 @@
 logits_process package
 ======================
 
-.. automodule:: easydel.generation.logits_process
+.. automodule:: easydel.inference.logits_process
     :members:
     :undoc-members:
     :show-inheritance:

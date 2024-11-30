@@ -64,7 +64,7 @@ def main():
 			streaming_chunks=16,
 		),
 	)
-	
+
 	print(model.model_task)
 	print(model.model_type)
 	print("Compiling")

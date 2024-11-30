@@ -53,8 +53,9 @@ from jax.experimental.mesh_utils import create_device_mesh
 from jax.sharding import Mesh, PartitionSpec
 from transformers import FlaxPreTrainedModel
 from transformers.configuration_utils import PretrainedConfig
-from transformers.utils.generic import working_or_temp_dir
 from transformers.generation.flax_utils import FlaxSampleOutput
+from transformers.utils.generic import working_or_temp_dir
+
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.etils import (
 	AVAILABLE_ATTENTION_MECHANISMS,

@@ -517,6 +517,49 @@ class FlaxWhisperTimeStampLogitsProcessor(FlaxLogitsProcessor):
 		return scores
 
 
+class FlaxStaticForceTokensLogitsProcessor(FlaxLogitsProcessor):
+	r"""
+	[`FlaxLogitsProcessor`] that takes a list of pairs of integers which indicates a mapping from generation indices to
+	token indices that will be forced before sampling. The processor will set their log probs to 0 and all other tokens
+	to `-inf` so that they are sampled at their corresponding index. This is a static version of the `transformers` logit
+	processor [`FlaxForceTokensLogitsProcessor`] that is compatible with sharded forced tokens.
+
+	Args:
+	    force_token_map (`list`):
+	        Map giving token ids and indices where they will be forced to be sampled.
+	"""
+
+	def __init__(self, force_token_map):
+		force_token_map = jnp.array(force_token_map)
+		force_token_array = jnp.ones(3, dtype=jnp.int32) * -1
+		for index, token in force_token_map:
+			force_token_array = force_token_array.at[index].set(token)
+		self.force_token_array = jnp.int32(force_token_array)
+
+	def __call__(
+		self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int
+	) -> jnp.ndarray:
+		def _force_token(generation_idx):
+			batch_size = scores.shape[0]
+			current_token = self.force_token_array[generation_idx]
+
+			new_scores = jnp.ones_like(scores, dtype=scores.dtype) * -float("inf")
+			updates = jnp.zeros((batch_size, 1), dtype=scores.dtype)
+			new_scores = lax.dynamic_update_slice(new_scores, updates, (0, current_token))
+			return new_scores
+
+		scores = lax.cond(
+			cur_len >= self.force_token_array.shape[0],
+			lambda: scores,
+			lambda: lax.cond(
+				self.force_token_array[cur_len] >= 0,
+				lambda: _force_token(cur_len),
+				lambda: scores,
+			),
+		)
+		return scores
+
+
 class FlaxNoRepeatNGramLogitsProcessor(FlaxLogitsProcessor):
 	r"""
 	[`FlaxLogitsProcessor`] that enforces no repetition of n-grams. See

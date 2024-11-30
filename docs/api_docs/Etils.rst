@@ -5,7 +5,7 @@ Etils
    :maxdepth: 2
 
    etils.etils
-   etils.errors
    etils.partition_module
-   etils.easystate
    etils.auto_tx
+   etils.easystate
+   etils.errors

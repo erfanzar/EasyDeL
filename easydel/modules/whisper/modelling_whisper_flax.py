@@ -20,6 +20,7 @@ from typing import Any, Optional, Tuple, Union
 import flax.linen
 import jax
 import jax.numpy as jnp
+import transformers
 from flax import linen as nn
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import Dense, combine_masks, make_causal_mask
@@ -27,9 +28,13 @@ from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.random import PRNGKey
-from transformers import FlaxWhisperTimeStampLogitsProcessor
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
+from easydel.inference.logits_process import (
+	FlaxLogitsProcessorList,
+	FlaxStaticForceTokensLogitsProcessor,
+	FlaxWhisperTimeStampLogitsProcessor,
+)
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 
 # easydel.modules
@@ -643,11 +648,23 @@ class FlaxWhisperEncoder(nn.Module):
 			dtype=self.dtype,
 			epsilon=1e-05,
 		)
+		self.causal_mask = make_causal_mask(
+			jnp.ones(
+				(
+					1,
+					max(
+						self.config.max_source_positions,
+						self.config.max_target_positions,
+					),
+				),
+				dtype="bool",
+			),
+			dtype="bool",
+		)
 
 	def __call__(
 		self,
 		input_features: jnp.ndarray,
-		causal_mask: Optional[jnp.ndarray] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
@@ -676,7 +693,7 @@ class FlaxWhisperEncoder(nn.Module):
 
 		outputs = self.layers(
 			hidden_states,
-			causal_mask=causal_mask,
+			causal_mask=self.causal_mask,
 			attention_mask=None,
 			deterministic=deterministic,
 			output_attentions=output_attentions,
@@ -740,13 +757,25 @@ class FlaxWhisperDecoder(nn.Module):
 			dtype=self.dtype,
 			epsilon=1e-05,
 		)
+		self.causal_mask = make_causal_mask(
+			jnp.ones(
+				(
+					1,
+					max(
+						self.config.max_source_positions,
+						self.config.max_target_positions,
+					),
+				),
+				dtype="bool",
+			),
+			dtype="bool",
+		)
 
 	def __call__(
 		self,
 		input_ids: jnp.ndarray,
 		attention_mask: jnp.ndarray,
 		position_ids: jnp.ndarray,
-		causal_mask: Optional[jnp.ndarray] = None,
 		encoder_hidden_states: Optional[jnp.ndarray] = None,
 		init_cache: bool = False,
 		output_attentions: bool = False,
@@ -763,7 +792,7 @@ class FlaxWhisperDecoder(nn.Module):
 		outputs = self.layers(
 			hidden_states,
 			attention_mask=attention_mask,
-			causal_mask=causal_mask,
+			causal_mask=self.causal_mask,
 			encoder_hidden_states=encoder_hidden_states,
 			deterministic=deterministic,
 			init_cache=init_cache,
@@ -814,17 +843,6 @@ class FlaxWhisperModule(nn.Module):
 			precision=self.precision,
 		)
 
-		self.causal_mask = make_causal_mask(
-			jnp.ones(
-				(
-					1,
-					max(self.config.max_source_positions, self.config.max_target_positions),
-				),
-				dtype="bool",
-			),
-			dtype="bool",
-		)
-
 	def _get_decoder_module(self):
 		return self.decoder
 
@@ -844,7 +862,6 @@ class FlaxWhisperModule(nn.Module):
 	):
 		encoder_outputs = self.encoder(
 			input_features,
-			causal_mask=self.causal_mask,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,
@@ -853,7 +870,6 @@ class FlaxWhisperModule(nn.Module):
 
 		decoder_outputs = self.decoder(
 			input_ids=decoder_input_ids,
-			causal_mask=self.causal_mask,
 			attention_mask=decoder_attention_mask,
 			position_ids=decoder_position_ids,
 			encoder_hidden_states=encoder_outputs[0],
@@ -1537,6 +1553,32 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
 			logits_processor=logits_processor,
 			**kwargs,
 		)
+
+	def _force_generate(
+		self,
+		input_features: jax.Array,
+		forced_decoder_ids: jax.Array,
+		params: dict,
+		return_timestamps: bool = False,
+		generation_config: Optional[transformers.GenerationConfig] = None,
+		**kwargs,
+	):
+		# fmt:off
+		if generation_config is None:
+			generation_config = self.generation_config
+		generation_config.forced_decoder_ids = None
+		logits_processor = FlaxLogitsProcessorList()
+		logits_processor.append(FlaxStaticForceTokensLogitsProcessor(forced_decoder_ids))
+		if return_timestamps:
+			logits_processor.append(FlaxWhisperTimeStampLogitsProcessor(generation_config, self.config, 1))
+		return super().generate(
+			input_features,
+			generation_config,
+			logits_processor=logits_processor,
+			params=params,
+			**kwargs,
+		)
+		# fmt:on
 
 	def prepare_inputs_for_generation(
 		self,

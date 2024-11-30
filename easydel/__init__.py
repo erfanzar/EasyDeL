@@ -73,6 +73,10 @@ from easydel.inference.vinference import (
 	vInferenceApiServer,
 	vInferenceConfig,
 )
+from easydel.inference.whisper_inference import (
+	vWhisperInference,
+	vWhisperInferenceConfig,
+)
 from easydel.layers.attention import (
 	AttentionBenchmarker,
 	AttentionMechanisms,
