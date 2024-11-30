@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Union
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
@@ -155,7 +156,7 @@ class OpenELMConfig(EasyDeLBaseConfig):
 		bos_token_id: int = 1,
 		eos_token_id: int = 2,
 		rope_scaling: Dict[str, Union[str, float]] = None,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
 		bits: Optional[int] = None,
@@ -282,7 +283,7 @@ class OpenELMConfig(EasyDeLBaseConfig):
 
 	def add_jax_args(
 		self,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
 		bits: Optional[int] = None,

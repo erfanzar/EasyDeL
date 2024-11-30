@@ -16,6 +16,7 @@ from typing import Optional
 
 from jax.sharding import PartitionSpec
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
@@ -110,7 +111,7 @@ class InternLM2Config(EasyDeLBaseConfig):
 		bias=True,
 		rope_theta=10000,
 		rope_scaling=None,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		fcm_min_ratio: float = -1,
 		fcm_max_ratio: float = -1,
 		scan_mlp_chunk_size: int = 1024,
@@ -177,7 +178,7 @@ class InternLM2Config(EasyDeLBaseConfig):
 	def add_jax_args(
 		self,
 		tie_word_embeddings: bool = False,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		fcm_min_ratio: float = 0.0,
 		fcm_max_ratio: float = 0.0,
 		bits: Optional[int] = None,

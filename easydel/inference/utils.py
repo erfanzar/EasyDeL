@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import dataclasses
-from functools import partial
 from typing import Dict, List, Optional, Union
 
 import fjformer
@@ -23,22 +22,60 @@ import jax.experimental.pallas
 import jax.random
 from jax import numpy as jnp
 from jax import random, sharding
+from easydel.inference.logits_process import (
+	FlaxForcedBOSTokenLogitsProcessor,
+	FlaxForcedEOSTokenLogitsProcessor,
+	FlaxLogitsProcessorList,
+	FlaxMinLengthLogitsProcessor,
+	FlaxNoRepeatNGramLogitsProcessor,
+	FlaxSuppressTokensLogitsProcessor,
+	FlaxTemperatureLogitsWarper,
+	FlaxTopKLogitsWarper,
+	FlaxTopPLogitsWarper,
+	hash_fn,
+)
 
 
 @jax.tree_util.register_pytree_node_class
 @dataclasses.dataclass
 class vInferenceConfig:
 	max_new_tokens: int = 64
+	min_length: Optional[int] = None
 	streaming_chunks: int = 16
 	temperature: float = 0.0
 	top_p: float = 0.95
 	top_k: int = 50
-	repetition_penalty: float = 1.0
-	length_penalty: float = 1.0
+	do_sample: bool = True
+	no_repeat_ngram_size: Optional[int] = None
+	suppress_tokens: Optional[list] = None
+	forced_bos_token_id: Optional[int] = None
+	forced_eos_token_id: Optional[int] = None
 	pad_token_id: Optional[int] = None
 	bos_token_id: Optional[int] = None
 	eos_token_id: Optional[Union[int, List[int]]] = None
 	_loop_rows: Optional[int] = None
+
+	def tree_flatten(self):
+		return (
+			self.max_new_tokens,
+			self.min_length,
+			self.streaming_chunks,
+			self.temperature,
+			self.top_p,
+			self.top_k,
+			self.do_sample,
+			self.no_repeat_ngram_size,
+			self.suppress_tokens,
+			self.forced_bos_token_id,
+			self.forced_eos_token_id,
+			self.pad_token_id,
+			self.bos_token_id,
+			self.eos_token_id,
+			self._loop_rows,
+		), {}
+
+	def tree_unflatten(cls, aux, children):
+		return cls(*children)
 
 	def __post_init__(self):
 		if isinstance(self.max_new_tokens, int):
@@ -46,61 +83,58 @@ class vInferenceConfig:
 				self.max_new_tokens + self.streaming_chunks - 1
 			) // self.streaming_chunks
 
-	def tree_flatten(self):
-		return (
-			self.max_new_tokens,
-			self.streaming_chunks,
-			self.temperature,
-			self.top_p,
-			self.top_k,
-			self.repetition_penalty,
-			self.length_penalty,
-			self.pad_token_id,
-			self.bos_token_id,
-			self.eos_token_id,
-			self._loop_rows,
-		), {}
-
-	@classmethod
-	def tree_unflatten(cls, aux, children):
-		return cls(*children)
-
-	def __hash__(self) -> int:
-		int_hash = int(
-			(
-				"---".join(
-					str(cu) for cu in self.__dict__.values() if isinstance(cu, (float, int))
-				)
-			)
-			.replace("---", "")
-			.replace(".", "")
-		)
-
-		return int_hash
-
 	def __repr__(self):
-		"""
-		Args:
-		    self: Refer to the instance of the class
-
-		Returns:
-		    A string representation of the object
-		"""
+		# fmt:off
 		string = f"{self.__class__.__name__}(\n"
 		for k, v in self.__dict__.items():
 			if not k.startswith("_"):
 				try:
 					repr_src = f"  {k} : " + v.__str__().replace("\n", "\n  ") + "\n"
-					string += (
-						repr_src
-						if len(repr_src) < 500
-						else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
-					)
-				except TypeError:
-					pass
+					string += repr_src if len(repr_src) < 500 else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
+				except TypeError: pass #noqa
 		return string.strip() + "\n)"
+		# fmt:on
 
 	__str__ = __repr__
+	__hash__ = hash_fn
+
+	def get_logits_warper(self):
+		warpers = FlaxLogitsProcessorList()
+		if self.temperature is not None and self.temperature != 1.0:
+			warpers.append(FlaxTemperatureLogitsWarper(self.temperature))
+		if self.top_k is not None and self.top_k != 0:
+			warpers.append(FlaxTopKLogitsWarper(top_k=self.top_k, min_tokens_to_keep=1))
+		if self.top_p is not None and self.top_p < 1.0:
+			warpers.append(FlaxTopPLogitsWarper(top_p=self.top_p, min_tokens_to_keep=1))
+		print(hash(warpers))
+		if len(warpers) == 0:
+			return None
+
+		return warpers
+
+	def get_logits_processor(self):
+		processors = FlaxLogitsProcessorList()
+		eos_id = (
+			self.eos_token_id[0] if isinstance(self.eos_token_id, list) else self.eos_token_id
+		)
+		if (
+			self.min_length is not None
+			and self.eos_token_id is not None
+			and self.min_length > -1
+		):
+			processors.append(FlaxMinLengthLogitsProcessor(self.min_length, eos_id))
+		if self.forced_bos_token_id is not None:
+			processors.append(FlaxForcedBOSTokenLogitsProcessor(self.forced_bos_token_id))
+		if self.forced_eos_token_id is not None:
+			fet = FlaxForcedEOSTokenLogitsProcessor(self.max_length, self.forced_eos_token_id)
+			processors.append(fet)
+		if self.suppress_tokens is not None:
+			processors.append(FlaxSuppressTokensLogitsProcessor(self.suppress_tokens))
+		if self.no_repeat_ngram_size is not None and self.no_repeat_ngram_size > 0:
+			processors.append(FlaxNoRepeatNGramLogitsProcessor(self.no_repeat_ngram_size))
+		if len(processors) == 0:
+			return None
+		return processors
 
 
 def lower_function(
@@ -256,211 +290,13 @@ class SampleState:
 	__str__ = __repr__
 
 
-def apply_repetition_penalty(logits, tokens, penalty):
-	"""
-	Applies repetition penalty to the logits.
-
-	Args:
-	    logits: Logits tensor.
-	    tokens: Previously generated tokens.
-	    penalty: Repetition penalty factor.
-
-	Returns:
-	    Logits tensor with repetition penalty applied.
-	"""
-
-	# Create a mask for the tokens that appear in the input
-	vocab_size = logits.shape[-1]
-	token_mask = jnp.zeros(vocab_size, dtype=jnp.bool_)
-	token_mask = token_mask.at[tokens].set(True)
-
-	# Apply the penalty
-	logits = jnp.where(token_mask, logits / penalty, logits * penalty)
-
-	return logits
-
-
-def apply_length_penalty(logits, current_length, max_new_tokens, length_penalty):
-	"""
-	Applies length penalty to the logits.
-
-	Args:
-	    logits: Logits tensor.
-	    current_length: Current length of the generated sequence.
-	    max_len: Maximum length of the sequence.
-	    length_penalty: Length penalty factor.
-
-	Returns:
-	    Logits tensor with length penalty applied.
-	"""
-
-	# Calculate the penalty factor
-	penalty_factor = ((5 + current_length) / 6) ** length_penalty
-
-	# Apply the penalty
-	return logits / penalty_factor
-
-
-@partial(jax.jit, static_argnames=["k"])
-def cal_top_k(x, k):
-	def scan(x, unused):
-		indice = jnp.argmax(x, axis=1)
-		return (
-			jax.vmap(lambda x, y: x.at[y].set(-jnp.inf))(x, indice),
-			(
-				jax.vmap(lambda x, y: x[y])(x, indice),
-				indice,
-			),
-		)
-
-	x, (values, indices) = jax.lax.scan(scan, x, (), k)
-	return values.T, indices.T
-
-
-@partial(jax.jit, static_argnames=["top_p"])
-def calculate_top_p(logits, top_p):
-	topk_scores, topk_indices = jax.lax.top_k(logits, k=logits.shape[-1])
-	mask_scores = jnp.full_like(logits, -float("inf"))
-	cumulative_probs = jax.nn.softmax(topk_scores, axis=-1).cumsum(axis=-1)
-	score_mask = cumulative_probs < top_p
-	score_mask = jnp.roll(score_mask, 1)
-	score_mask |= score_mask.at[:, 0].set(True)
-	score_mask = score_mask.at[:, :1].set(True)
-	topk_next_scores = jnp.where(score_mask, topk_scores, mask_scores)
-	return jax.lax.sort_key_val(topk_indices, topk_next_scores)[-1]
-
-
-@partial(jax.jit, static_argnames=["top_k"])
-def calculate_top_k(logits, top_k):
-	batch_size, vocab_size = logits.shape
-	next_scores_flat = jnp.full(batch_size * vocab_size, -float("inf"))
-	topk_scores, topk_indices = jax.lax.top_k(logits, k=top_k)
-	shift = jnp.broadcast_to(
-		(jnp.arange(batch_size) * vocab_size)[:, None],
-		(batch_size, top_k),
-	).flatten()
-	topk_scores_flat = topk_scores.flatten()
-	topk_indices_flat = topk_indices.flatten() + shift
-	next_scores_flat = next_scores_flat.at[topk_indices_flat].set(topk_scores_flat)
-	return next_scores_flat.reshape(batch_size, vocab_size)
-
-
-def temperature_branch(logits, prng_key, top_k, temperature, top_p):
-	"""
-	Applies temperature scaling, top-k and top-p sampling to the logits.
-
-	Args:
-	    logits: Logits tensor.
-	    prng_key: JAX PRNG key.
-	    top_k: Number of top logits to consider.
-	    temperature: Temperature scaling factor.
-	    top_p: Top-p sampling threshold.
-
-	Returns:
-	    Sampled token IDs.
-	"""
-	logits = logits / temperature
-	if top_k > 1:
-		logits = calculate_top_k(logits, top_k)
-	if 0 < top_p < 1.0:
-		logits = calculate_top_p(logits, top_p)
-	return jax.random.categorical(key=prng_key, logits=logits)
-
-
-def vgready_branch(logits, prng_key, top_k, temperature, top_p):
-	"""
-	Performs greedy decoding on the logits.
-
-	Args:
-	    logits: Logits tensor.
-
-	Returns:
-	    Token IDs with the highest logits.
-	"""
-	return jnp.argmax(logits, axis=-1).reshape(-1)
-
-
-def vinference_step(
-	logits: jax.Array,
-	tokens: jax.Array,
-	prng_key: jax.random.PRNGKey,
-	current_length: int,
-	max_new_tokens: int,
-	repetition_penalty: float,
-	length_penalty: float,
-	top_k: int,
-	top_p: float,
-	temperature: float,
-):
-	"""
-	Performs a single inference step in the text generation process.
-
-	This function applies repetition and length penalties to the logits,
-	and then performs either temperature-based sampling or greedy decoding.
-	Returns:
-	    jax.Array: An array of generated token IDs.
-	"""
-	# Apply repetition penalty
-	logits = jax.lax.cond(
-		repetition_penalty != 1.0,
-		apply_repetition_penalty,
-		lambda x, *u: x,
-		logits,
-		tokens,
-		repetition_penalty,
-	)
-
-	# Apply length penalty
-	logits = jax.lax.cond(
-		length_penalty != 1.0,
-		apply_length_penalty,
-		lambda x, *u: x,
-		logits,
-		current_length,
-		max_new_tokens,
-		length_penalty,
-	)
-	if temperature > 0.0:
-		return temperature_branch(
-			logits=logits,
-			prng_key=prng_key,
-			top_k=top_k,
-			top_p=top_p,
-			temperature=temperature,
-		)
-	return vgready_branch(
-		logits=logits,
-		prng_key=prng_key,
-		top_k=top_k,
-		top_p=top_p,
-		temperature=temperature,
-	)
-
-
-vinference_step_compiled = jax.jit(
-	vinference_step,
-	static_argnames=[
-		"max_new_tokens",
-		"repetition_penalty",
-		"length_penalty",
-		"top_k",
-		"top_p",
-		"temperature",
-	],
-)
-
-
 def create_sampling_step(
 	model,
-	max_new_tokens: int,
-	repetition_penalty: float,
-	length_penalty: float,
-	top_k: int,
-	top_p: float,
-	temperature: float,
+	logits_processor: FlaxLogitsProcessorList,
+	logits_warper: FlaxLogitsProcessorList,
 	eos_token_id: jax.Array,
 	pad_token_id: jax.Array,
-	current_length: int,
+	do_sample: bool = True,
 ):
 	@fjformer.core.implicit_compact
 	def sampling_step(params, state: SampleState):
@@ -481,24 +317,22 @@ def create_sampling_step(
 			return_dict=True,
 			**state.model_kwargs,
 		)
-		next_token = vinference_step_compiled(
-			model_outputs.logits[:, -1],
-			state.sequences,
-			state.prng_key,
-			current_length,
-			max_new_tokens,
-			repetition_penalty,
-			length_penalty,
-			top_k,
-			top_p,
-			temperature,
-		)
+
+		logits = model_outputs.logits[:, -1]
+		if logits_processor is not None:
+			logits = logits_processor(state.sequences, logits, state.current_length)
+
+		if do_sample:
+			if logits_warper is not None:
+				logits = logits_warper(logits, logits, state.current_length)
+			next_token = jax.random.categorical(state.prng_key, logits, axis=-1)
+		else:
+			next_token = jnp.argmax(logits, axis=-1)
 
 		next_token = (
 			next_token * ~state.is_sequence_finished
 			+ pad_token_id * state.is_sequence_finished
 		)
-
 		next_sequence_finished = state.is_sequence_finished | jnp.isin(
 			next_token,
 			eos_token_id,

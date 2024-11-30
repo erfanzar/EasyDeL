@@ -16,6 +16,7 @@ from typing import Mapping, Optional
 
 from jax.sharding import PartitionSpec
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
@@ -112,7 +113,7 @@ class Qwen2Config(EasyDeLBaseConfig):
 		attention_dropout=0.0,
 		resid_pdrop: float = 0.0,
 		embd_pdrop: float = 0.0,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		fcm_min_ratio: float = 0.0,
 		fcm_max_ratio: float = 0.0,
 		use_scan_mlp: bool = False,
@@ -201,7 +202,7 @@ class Qwen2Config(EasyDeLBaseConfig):
 		embd_pdrop: float = 0.0,
 		attention_dropout: float = 0.0,
 		tie_word_embeddings: bool = False,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		fcm_min_ratio: float = 0.0,
 		fcm_max_ratio: float = 0.0,
 		use_scan_mlp: bool = False,

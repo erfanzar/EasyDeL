@@ -17,6 +17,7 @@
 import warnings
 from typing import Any, Optional
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
@@ -222,7 +223,7 @@ class DbrxConfig(EasyDeLBaseConfig):
 		initializer_range: float = 0.02,
 		output_router_logits: bool = False,
 		router_aux_loss_coef: float = 0.05,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs: Any,
 	):
 		if attn_config is None:

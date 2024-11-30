@@ -38,6 +38,7 @@ from flax import linen as nn
 from flax.linen import Dense, combine_masks, make_causal_mask
 from jax import lax
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
@@ -311,7 +312,7 @@ class FlaxGPT2Block(nn.Module):
 
 		attn_block = FlaxGPT2Attention
 		mlp_block = FlaxGPT2MLP
-		if self.config.gradient_checkpointing != "":
+		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			attn_block = flax.linen.partitioning.remat(
 				attn_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),

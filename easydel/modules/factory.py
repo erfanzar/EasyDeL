@@ -94,6 +94,8 @@ class Registry:
 		"""
 
 		def wrapper(module: T) -> T:
+			module._model_task = task_type
+			module._model_type = model_type
 			self._task_registry[task_type][model_type] = ModuleRegistration(
 				module=module,
 				config=config,

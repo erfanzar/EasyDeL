@@ -14,6 +14,7 @@
 
 import math
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
@@ -110,7 +111,7 @@ class Mamba2Config(EasyDeLBaseConfig):
 		rms_norm=True,
 		chunk_size=256,
 		tie_word_embeddings=False,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	):
 		self.vocab_size = vocab_size
@@ -158,5 +159,8 @@ class Mamba2Config(EasyDeLBaseConfig):
 		"""
 		return super().get_partition_rules()
 
-	def add_jax_args(self, gradient_checkpointing: str = ""):
+	def add_jax_args(
+		self,
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
+	):
 		self.gradient_checkpointing = gradient_checkpointing

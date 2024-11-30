@@ -16,6 +16,7 @@ from typing import Optional
 
 from jax.sharding import PartitionSpec
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
@@ -112,7 +113,7 @@ class PhiConfig(EasyDeLBaseConfig):
 		bos_token_id=1,
 		eos_token_id=2,
 		bits: Optional[int] = None,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	) -> None:
 		self.vocab_size = vocab_size
@@ -150,7 +151,7 @@ class PhiConfig(EasyDeLBaseConfig):
 	def add_jax_args(
 		self,
 		bits: Optional[int] = None,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	):
 		self.bits = bits

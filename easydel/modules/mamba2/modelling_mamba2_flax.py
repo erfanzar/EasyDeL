@@ -40,6 +40,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import eval_shape, lax
 from jax.core import ShapedArray
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.common import Conv1D
 from easydel.layers.norms import RMSNorm as FlaxMamba2RMSNorm
 from easydel.modules.factory import register_module
@@ -861,7 +862,7 @@ class FlaxMamba2Block(nn.Module):
 			param_dtype=self.param_dtype,
 		)
 		block = FlaxMamba2Mixer
-		if self.config.gradient_checkpointing != "":
+		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			block = nn_partitioning.remat(
 				block,
 				static_argnums=(1,),

@@ -16,6 +16,7 @@ from typing import Optional
 
 from jax.sharding import PartitionSpec
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
@@ -119,7 +120,7 @@ class FalconConfig(EasyDeLBaseConfig):
 		ffn_hidden_size=None,
 		ff_factor=None,
 		activation="gelu",
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		bits: Optional[int] = None,
 		**kwargs,
 	):
@@ -204,7 +205,7 @@ class FalconConfig(EasyDeLBaseConfig):
 
 	def add_jax_args(
 		self,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		bits: Optional[int] = None,
 		**kwargs,
 	):

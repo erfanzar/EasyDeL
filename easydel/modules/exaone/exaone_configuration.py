@@ -16,6 +16,7 @@ from typing import Dict, Optional, Union
 
 from jax.sharding import PartitionSpec
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
@@ -103,7 +104,7 @@ class ExaoneConfig(EasyDeLBaseConfig):
 		tie_word_embeddings=False,
 		rope_theta=10000.0,
 		rope_scaling: Dict[str, Union[str, float]] = None,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		attention_dropout: float = 0.0,
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
@@ -174,7 +175,7 @@ class ExaoneConfig(EasyDeLBaseConfig):
 
 	def add_jax_args(
 		self,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
 		bits: Optional[int] = None,

@@ -18,7 +18,7 @@ PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
 def main():
 	sharding_axis_dims = (1, 1, 1, -1)
-	max_length = 2048
+	max_length = 6144
 	num_devices = len(jax.devices())
 	input_shape = (num_devices, max_length)
 
@@ -33,11 +33,11 @@ def main():
 		input_shape=input_shape,
 		auto_shard_params=True,
 		sharding_axis_dims=sharding_axis_dims,
-		config_kwargs=dict(
+		config_kwargs=ed.EasyDeLBaseConfigDict(
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
-			quantize_kv_cache=True,
 			attn_dtype=jnp.float16,
+			gradient_checkpointing=ed.EasyDeLGradientCheckPointers.EVERYTHING_SAVEABLE,
 			# kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		),
@@ -57,13 +57,16 @@ def main():
 		tokenizer=tokenizer,
 		generation_config=ed.vInferenceConfig(
 			max_new_tokens=1024,
-			temperature=model.generation_config.temperature,
+			temperature=0.1,
 			top_p=model.generation_config.top_p,
 			top_k=model.generation_config.top_k,
 			eos_token_id=model.generation_config.eos_token_id,
 			streaming_chunks=16,
 		),
 	)
+	
+	print(model.model_task)
+	print(model.model_type)
 	print("Compiling")
 	inference.precompile(1, inference.model_prefill_length)
 	print("Done Compiling")

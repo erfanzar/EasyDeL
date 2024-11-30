@@ -6,6 +6,7 @@ import jax.numpy as jnp
 from jax.experimental import sparse
 
 from easydel.etils.etils import get_logger
+from easydel.utils.compiling_utils import get_safe_hash_int, hash_fn
 
 
 def add_start_docstrings(*docstr):
@@ -50,6 +51,8 @@ class FlaxLogitsProcessor:
 			f"{self.__class__} is an abstract class. Only classes inheriting this class can be called."
 		)
 
+	__hash__ = hash_fn
+
 
 class FlaxLogitsWarper:
 	"""Abstract base class for all logit warpers that can be applied during generation with multinomial sampling."""
@@ -60,6 +63,8 @@ class FlaxLogitsWarper:
 		raise NotImplementedError(
 			f"{self.__class__} is an abstract class. Only classes inheriting this class can be called."
 		)
+
+	__hash__ = hash_fn
 
 
 class FlaxLogitsProcessorList(list):
@@ -85,6 +90,16 @@ class FlaxLogitsProcessorList(list):
 			else:
 				scores = processor(input_ids, scores, cur_len)
 		return scores
+
+	def __hash__(self):
+		shu = ""
+		for processor in self:
+			shu += "".join(
+				str(cu)
+				for cu in processor.__dict__.values()
+				if isinstance(cu, (float, int, list, bool, dict))
+			)
+		return get_safe_hash_int(shu)
 
 
 class FlaxTemperatureLogitsWarper(FlaxLogitsWarper):

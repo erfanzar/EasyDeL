@@ -14,6 +14,7 @@
 
 from typing import Optional
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
@@ -146,7 +147,7 @@ class WhisperConfig(EasyDeLBaseConfig):
 		mask_feature_min_masks=0,
 		median_filter_width=7,
 		bits: Optional[int] = None,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	):
 		self.vocab_size = vocab_size
@@ -202,7 +203,7 @@ class WhisperConfig(EasyDeLBaseConfig):
 	def add_jax_args(
 		self,
 		bits: Optional[int] = None,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	):
 		self.bits = bits

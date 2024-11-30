@@ -35,6 +35,7 @@ import easydel as ed
 from easydel.etils.etils import (
 	AVAILABLE_ATTENTION_MECHANISMS,
 	DEFAULT_ATTENTION_MECHANISM,
+	EasyDeLGradientCheckPointers,
 )
 
 torch.manual_seed(42)
@@ -64,7 +65,7 @@ class EasyModelsTest(unittest.TestCase):
 		self.rope_theta: float = 10000.0
 		self.attention_bias: bool = False
 		self.tie_word_embeddings: bool = False
-		self.gradient_checkpointing: str = ""
+		self.gradient_checkpointing = EasyDeLGradientCheckPointers.NONE
 		self.fcm_min_ratio: float = -1
 		self.fcm_max_ratio: float = -1
 		self.rope_scaling: Optional[Dict[str, Union[str, float]]] = None
