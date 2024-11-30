@@ -16,6 +16,7 @@ from typing import Optional
 
 from jax.sharding import PartitionSpec
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
@@ -98,7 +99,7 @@ class GPTJConfig(EasyDeLBaseConfig):
 		bos_token_id: int = 50256,
 		eos_token_id: int = 50256,
 		tie_word_embeddings: bool = False,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		bits: Optional[int] = None,
 		**kwargs,
 	):
@@ -175,7 +176,7 @@ class GPTJConfig(EasyDeLBaseConfig):
 		eos_token_id: int = 50256,
 		tie_word_embeddings: bool = False,
 		bits: Optional[int] = None,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	):
 		basics = dict(

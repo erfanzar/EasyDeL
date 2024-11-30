@@ -18,10 +18,11 @@ import asyncio
 import os
 import pathlib
 import pickle
+import random
 import time
 import warnings
 from datetime import datetime
-from functools import partial
+from functools import cached_property, partial
 from typing import Any, Dict, Generator, List, Optional, Union, overload
 from uuid import uuid4
 
@@ -70,12 +71,7 @@ def measure_flops(func, *args, **kwargs):
 	jax.jit,
 	static_argnames=[
 		"model",
-		"max_new_tokens",
-		"repetition_penalty",
-		"length_penalty",
-		"top_k",
-		"top_p",
-		"temperature",
+		"generation_config",
 	],
 )
 def _compiled_generate(
@@ -84,14 +80,7 @@ def _compiled_generate(
 	input_ids: jax.Array,
 	attention_mask: jax.Array,
 	position_ids: jax.Array,
-	eos_token_id: jax.Array,
-	pad_token_id: jax.Array,
-	max_new_tokens: int,
-	repetition_penalty: float,
-	length_penalty: float,
-	top_k: int,
-	top_p: float,
-	temperature: float,
+	generation_config: vInferenceConfig,
 	rng: jrand.PRNGKey,
 ) -> SampleState:
 	"""
@@ -112,8 +101,11 @@ def _compiled_generate(
 		partition_axes.key_sequence_axis,
 	)
 
+	eos_token_id = jnp.array(generation_config.eos_token_id, dtype=jnp.int32)
+	pad_token_id = jnp.array(generation_config.pad_token_id, dtype=jnp.int32)
+
 	batch_size, current_length = input_ids.shape
-	max_length = current_length + max_new_tokens
+	max_length = current_length + generation_config.max_new_tokens
 	current_length = jnp.array(current_length)
 	sequences = jnp.full((batch_size, max_length), pad_token_id, dtype=jnp.int32)
 	sequences = lax.dynamic_update_slice(sequences, input_ids, (0, 0))
@@ -152,22 +144,16 @@ def _compiled_generate(
 		generated_tokens=0,
 	)
 
-	sampling_step = create_sampling_step(
-		model=model,
-		max_new_tokens=max_new_tokens,
-		repetition_penalty=repetition_penalty,
-		length_penalty=length_penalty,
-		top_k=top_k,
-		top_p=top_p,
-		temperature=temperature,
-		eos_token_id=eos_token_id,
-		pad_token_id=pad_token_id,
-		current_length=current_length,
-	)
-
 	with mesh:
 		if input_ids.shape[-1] > 1:
-			state = sampling_step(params=params, state=state)
+			state = create_sampling_step(
+				model=model,
+				eos_token_id=eos_token_id,
+				pad_token_id=pad_token_id,
+				logits_processor=generation_config.get_logits_processor(),
+				logits_warper=generation_config.get_logits_processor(),
+				do_sample=generation_config.do_sample,
+			)(params=params, state=state)
 	return state
 
 
@@ -175,28 +161,15 @@ def _compiled_generate(
 	jax.jit,
 	static_argnames=[
 		"model",
-		"max_new_tokens",
-		"repetition_penalty",
-		"length_penalty",
-		"top_k",
-		"top_p",
-		"temperature",
+		"generation_config",
 	],
 )
 def _compiled_interval_generate(
 	model: EasyDeLBaseModule,
 	params: dict,
 	state: SampleState,
-	eos_token_id: jax.Array,
-	pad_token_id: jax.Array,
-	max_new_tokens: int,
-	repetition_penalty: float,
-	length_penalty: float,
-	top_k: int,
-	top_p: float,
-	temperature: float,
+	generation_config: vInferenceConfig,
 	loop_max_tokens: int,
-	start_length: int,
 ) -> SampleState:
 	"""
 	Compiled function for performing interval generation steps.
@@ -209,8 +182,10 @@ def _compiled_interval_generate(
 		SampleState: The updated generation state after the interval generation steps.
 	"""
 	mesh = model.config.mesh
-
 	tlen = state.current_length + loop_max_tokens
+
+	eos_token_id = jnp.array(generation_config.eos_token_id, dtype=jnp.int32)
+	pad_token_id = jnp.array(generation_config.pad_token_id, dtype=jnp.int32)
 
 	def cond_fn(state):
 		"""state termination condition fn."""
@@ -219,15 +194,11 @@ def _compiled_interval_generate(
 
 	sampling_step = create_sampling_step(
 		model=model,
-		max_new_tokens=max_new_tokens,
-		repetition_penalty=repetition_penalty,
-		length_penalty=length_penalty,
-		top_k=top_k,
-		top_p=top_p,
-		temperature=temperature,
 		eos_token_id=eos_token_id,
 		pad_token_id=pad_token_id,
-		current_length=start_length,
+		logits_processor=generation_config.get_logits_processor(),
+		logits_warper=generation_config.get_logits_processor(),
+		do_sample=generation_config.do_sample,
 	)
 	with mesh:
 
@@ -241,7 +212,7 @@ def _compiled_interval_generate(
 COMPILED_FUNCS = {}
 
 
-def get_compiled_funcs(batch_size, input_tokens_length, id):
+def get_compiled_funcs(batch_size, input_tokens_length, id, safe=True):
 	"""
 	Retrieves compiled generation functions from a cache.
 
@@ -255,7 +226,13 @@ def get_compiled_funcs(batch_size, input_tokens_length, id):
 			interval generate functions, or (None, None) if not found in the cache.
 	"""
 	search_key = f"Bx{batch_size}-Sx{input_tokens_length}-UUID{id}"
-	return COMPILED_FUNCS.get(search_key, (None, None))
+	f1, f2 = COMPILED_FUNCS.get(search_key, (None, None))
+	if (f1 is None or f2 is None) and safe:
+		raise RuntimeError(
+			"wasn't able to find requested functions please `precompile`"
+			" inference before using `generate` function."
+		)
+	return f1, f2
 
 
 def put_compiled_funcs(
@@ -303,7 +280,7 @@ class vInference:
 		params: Union[flax.core.FrozenDict, dict],
 		tokenizer: PreTrainedTokenizer,
 		generation_config: Optional[vInferenceConfig] = None,
-		seed: Optional[int] = 42,
+		seed: Optional[int] = None,
 		input_partition_spec: Optional[PartitionSpec] = None,
 		max_new_tokens: int = 512,
 		inference_name: Optional[str] = None,
@@ -325,6 +302,8 @@ class vInference:
 		self.params = self._validate_params(params) 
 		self.tokenizer = tokenizer
 		self.generation_config = self._init_generation_config(generation_config, max_new_tokens)
+		if seed is None:
+			seed = random.randint(0, 1e6)
 		self._rng_generator = GenerateRNG(seed)
 		self.input_partition_spec = input_partition_spec or PartitionSpec(("dp", "fsdp"))
 		self.mesh = self.model.config.mesh
@@ -337,6 +316,14 @@ class vInference:
 		self._inference_name = inference_name or self._generate_inference_name(model)
 		self.metrics = vInferenceMetrics(self._inference_name)
 		# fmt:on
+
+	@cached_property
+	def _logits_warper(self):
+		return self.generation_config.get_logits_warper()
+
+	@cached_property
+	def _logits_processor(self):
+		return self.generation_config.get_logits_processor()
 
 	def _generate_inference_name(self, model) -> str:
 		"""
@@ -531,9 +518,7 @@ class vInference:
 			).time():
 				input_ids = jnp.array(input_ids)
 				batch_size, seq_length = input_ids.shape
-				_ = self.precompile(batch_size, seq_length)
-				eos_token_id = jnp.array(self.generation_config.eos_token_id, dtype=jnp.int32)
-				pad_token_id = jnp.array(self.generation_config.pad_token_id, dtype=jnp.int32)
+
 				generate_func, interval_func = get_compiled_funcs(
 					batch_size=batch_size,
 					input_tokens_length=seq_length,
@@ -551,7 +536,6 @@ class vInference:
 					position_ids = attention_mask.cumsum(axis=-1, dtype="i4") - 1
 
 				attention_mask = jnp.array(attention_mask)
-				start_length = input_ids.shape[-1]
 			with self.metrics.inference_latency.labels(
 				model_name=self.metrics.model_name,
 				stage="inference",
@@ -562,8 +546,6 @@ class vInference:
 					input_ids=input_ids,
 					attention_mask=attention_mask,
 					position_ids=position_ids,
-					pad_token_id=pad_token_id,
-					eos_token_id=eos_token_id,
 					rng=self._rng_generator.rng,
 				)
 
@@ -577,10 +559,7 @@ class vInference:
 								interval_func,
 								params=self.params,
 								state=state,
-								pad_token_id=pad_token_id,
-								eos_token_id=eos_token_id,
 								loop_max_tokens=self.generation_config.streaming_chunks,
-								start_length=start_length,
 							)
 						)
 						interval_time += interval_func_elapsed_time
@@ -621,6 +600,7 @@ class vInference:
 			batch_size=batch_size,
 			input_tokens_length=input_tokens_length,
 			id=self._uuid4,
+			safe=False,
 		)
 		do_compile = compiled_generate_func is None or compiled_interval_func is None
 		if do_compile:
@@ -628,8 +608,7 @@ class vInference:
 			attention_mask = jnp.ones_like(input_ids)
 			position_ids = attention_mask.cumsum(axis=-1, dtype="i4") - 1
 			logger.debug(f"Smart Compiling `state_generate_compile` - {self.inference_name}")
-			eos_token_id = jnp.array(self.generation_config.eos_token_id, dtype=jnp.int32)
-			pad_token_id = jnp.array(self.generation_config.pad_token_id, dtype=jnp.int32)
+
 			compiled_generate_func = smart_compile(
 				_compiled_generate.lower(
 					model=self.model,
@@ -637,14 +616,7 @@ class vInference:
 					input_ids=input_ids,
 					attention_mask=attention_mask,
 					position_ids=position_ids,
-					eos_token_id=eos_token_id,
-					pad_token_id=pad_token_id,
-					max_new_tokens=self.generation_config.max_new_tokens,
-					repetition_penalty=self.generation_config.repetition_penalty,
-					length_penalty=self.generation_config.length_penalty,
-					top_k=self.generation_config.top_k,
-					top_p=self.generation_config.top_p,
-					temperature=self.generation_config.temperature,
+					generation_config=self.generation_config,
 					rng=self._rng_generator.rng,
 				),
 				tag="vinference",
@@ -654,8 +626,6 @@ class vInference:
 				input_ids=input_ids,
 				attention_mask=attention_mask,
 				position_ids=position_ids,
-				eos_token_id=eos_token_id,
-				pad_token_id=pad_token_id,
 				rng=self._rng_generator.rng,
 			)
 			logger.debug(
@@ -666,16 +636,8 @@ class vInference:
 					model=self.model,
 					params=self.params,
 					state=state,
-					eos_token_id=eos_token_id,
-					pad_token_id=pad_token_id,
-					max_new_tokens=self.generation_config.max_new_tokens,
-					repetition_penalty=self.generation_config.repetition_penalty,
-					length_penalty=self.generation_config.length_penalty,
-					top_k=self.generation_config.top_k,
-					top_p=self.generation_config.top_p,
-					temperature=self.generation_config.temperature,
+					generation_config=self.generation_config,
 					loop_max_tokens=self.generation_config.streaming_chunks,
-					start_length=input_tokens_length,
 				),
 				tag="vinference",
 			)

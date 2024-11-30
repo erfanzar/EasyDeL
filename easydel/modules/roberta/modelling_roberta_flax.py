@@ -29,6 +29,7 @@ from flax.linen.partitioning import remat
 from jax import lax
 from jax import numpy as jnp
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
@@ -498,7 +499,7 @@ class FlaxRobertaLayerCollection(nn.Module):
 
 	def setup(self):
 		block = FlaxRobertaLayer
-		if self.config.gradient_checkpointing != "":
+		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			block = remat(
 				block,
 				static_argnums=(5, 6, 7),

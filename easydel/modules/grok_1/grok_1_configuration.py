@@ -16,6 +16,7 @@ from typing import Optional
 
 from jax.sharding import PartitionSpec
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
@@ -103,7 +104,7 @@ class Grok1Config(EasyDeLBaseConfig):
 		num_experts=8,
 		output_router_logits=False,
 		router_aux_loss_coef=0.001,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		bits: Optional[int] = None,
 		**kwargs,
 	):
@@ -169,7 +170,7 @@ class Grok1Config(EasyDeLBaseConfig):
 	def add_jax_args(
 		self,
 		tie_word_embeddings: bool = False,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		bits: Optional[int] = None,
 		**kwargs,
 	):

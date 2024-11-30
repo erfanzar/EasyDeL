@@ -24,6 +24,7 @@ from fjformer.functions import auxiliary_load_balancing_loss_func
 from flax import linen as nn
 from flax.linen import Dense
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import RMSNorm as FlaxGrok1RMSNorm
 from easydel.layers.rotary_embedding import get_rope
@@ -471,7 +472,7 @@ class FlaxGrok1DecoderLayer(nn.Module):
 
 		attn_block = FlaxGrok1Attention
 		mlp_block = FlaxGrok1SparseMoeBlock
-		if self.config.gradient_checkpointing != "":
+		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			attn_block = re_mat(
 				attn_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),

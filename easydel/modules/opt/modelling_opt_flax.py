@@ -42,6 +42,7 @@ from jax import lax
 from transformers import logging
 from transformers.modeling_flax_utils import ACT2FN
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
@@ -308,7 +309,7 @@ class FlaxOPTDecoderLayerCollection(nn.Module):
 
 	def setup(self):
 		block = FlaxOPTDecoderLayer
-		if self.config.gradient_checkpointing != "":
+		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			block = nn.remat(
 				block,
 				static_argnums=(3, 4),

@@ -24,6 +24,27 @@ COMPILED_FILE_NAME = "compiled.func"
 COMPILED_CACHE: Dict[Tuple, Any] = {}
 
 
+def hash_fn(self) -> int:
+	shu = "".join(
+		str(cu)
+		for cu in self.__dict__.values()
+		if isinstance(cu, (float, int, float, bool, dict, list))
+	)
+	return get_safe_hash_int(shu)
+
+
+# @functools.lru_cache(maxsize=2048)
+def get_safe_hash_int(text, algorithm="md5"):
+	try:
+		text_str = str(text)
+		hash_object = getattr(hashlib, algorithm)(text_str.encode())
+		return int.from_bytes(hash_object.digest(), byteorder="big")
+	except AttributeError as e:
+		raise ValueError(f"Unsupported hash algorithm: {algorithm}") from e
+	except Exception as e:
+		raise Exception(f"Error generating hash: {str(e)}") from e
+
+
 def get_signature(args, kwargs) -> Tuple:
 	"""Get a hashable signature of args/kwargs shapes and dtypes."""
 

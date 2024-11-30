@@ -14,6 +14,7 @@
 
 import math
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
@@ -106,7 +107,7 @@ class MambaConfig(EasyDeLBaseConfig):
 		time_step_floor=1e-4,
 		rescale_prenorm_residual=False,
 		use_cache=True,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		use_mambapy: bool = False,
 		**kwargs,
 	):
@@ -148,5 +149,8 @@ class MambaConfig(EasyDeLBaseConfig):
 		"""
 		return super().get_partition_rules()
 
-	def add_jax_args(self, gradient_checkpointing: str = ""):
+	def add_jax_args(
+		self,
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
+	):
 		self.gradient_checkpointing = gradient_checkpointing

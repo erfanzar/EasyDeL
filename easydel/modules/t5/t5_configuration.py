@@ -14,6 +14,7 @@
 
 from jax.sharding import PartitionSpec
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
@@ -89,7 +90,7 @@ class T5Config(EasyDeLBaseConfig):
 		use_cache=True,
 		pad_token_id=0,
 		eos_token_id=1,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	):
 		self.vocab_size = vocab_size

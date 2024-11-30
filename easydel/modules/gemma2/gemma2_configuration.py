@@ -16,6 +16,7 @@ from typing import Optional
 
 from jax.sharding import PartitionSpec
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
@@ -109,7 +110,7 @@ class Gemma2Config(EasyDeLBaseConfig):
 		final_logit_softcapping=30.0,
 		query_pre_attn_scalar=224,
 		sliding_window=4096,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		bits: Optional[int] = None,
 		scan_layers: bool = False,
 		attn_logit_softcapping: Optional[bool] = None,
@@ -180,7 +181,7 @@ class Gemma2Config(EasyDeLBaseConfig):
 
 	def add_jax_args(
 		self,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		bits: Optional[int] = None,
 		**kwargs,
 	):

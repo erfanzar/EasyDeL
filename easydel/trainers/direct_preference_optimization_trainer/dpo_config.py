@@ -1,9 +1,9 @@
 import warnings
 from dataclasses import dataclass
-from hashlib import sha256
 from typing import Literal, Optional
 
 from easydel.trainers.training_configurations import TrainingArguments
+from easydel.utils.compiling_utils import hash_fn
 
 
 @dataclass
@@ -65,6 +65,4 @@ class DPOConfig(TrainingArguments):
 			self.max_prompt_length = 128
 		return super().__post_init__()
 
-	def __hash__(self):
-		strn = str(self)
-		return sha256(strn).hexdigest()
+	__hash__ = hash_fn

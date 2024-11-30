@@ -16,6 +16,7 @@ from typing import Dict, Optional, Union
 
 from jax.sharding import PartitionSpec
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.modules.factory import register_config
 from easydel.modules.modeling_utils import EasyDeLBaseConfig
 
@@ -117,7 +118,7 @@ class LlamaConfig(EasyDeLBaseConfig):
 		rope_theta: float = 10000.0,
 		attention_bias: bool = False,
 		tie_word_embeddings: bool = False,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		fcm_min_ratio: float = -1,
 		fcm_max_ratio: float = -1,
 		rope_scaling: Dict[str, Union[str, float]] = None,
@@ -197,7 +198,7 @@ class LlamaConfig(EasyDeLBaseConfig):
 		embd_pdrop: float = 0.0,
 		attention_dropout: float = 0.0,
 		tie_word_embeddings: bool = False,
-		gradient_checkpointing: str = "",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		fcm_min_ratio: float = 0.0,
 		fcm_max_ratio: float = 0.0,
 		number_rep_kv: int = 1,

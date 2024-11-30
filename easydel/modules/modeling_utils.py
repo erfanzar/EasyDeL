@@ -54,19 +54,19 @@ from jax.sharding import Mesh, PartitionSpec
 from transformers import FlaxPreTrainedModel
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils.generic import working_or_temp_dir
-
+from transformers.generation.flax_utils import FlaxSampleOutput
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.etils import (
 	AVAILABLE_ATTENTION_MECHANISMS,
 	DEFAULT_ATTENTION_MECHANISM,
 	EasyDeLBackends,
+	EasyDeLGradientCheckPointers,
 	EasyDeLPlatforms,
 	EasyDeLQuantizationMethods,
 	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
-from easydel.generation.flax_utils import FlaxSampleOutput
-from easydel.generation.logits_process import FlaxLogitsProcessorList
+from easydel.inference.logits_process import FlaxLogitsProcessorList
 from easydel.inference.utils import SampleState
 from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN, EasyQuantizer
 
@@ -157,6 +157,7 @@ class EasyDeLBaseConfigDict(TypedDict, total=False):
 	use_scan_mlp: bool
 	scan_mlp_chunk_size: int
 	attention_axis_name: str
+	gradient_checkpointing: EasyDeLGradientCheckPointers
 	kv_cache_quantization_method: EasyDeLQuantizationMethods
 	kv_cache_quantization_blocksize: int
 	kv_cache_sharding_sequence_axis_name: Union[str, Tuple[str, ...]]
@@ -219,6 +220,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
 		attention_axis_name: str = "sp",
+		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		kv_cache_quantization_method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.NONE,
 		kv_cache_quantization_blocksize: int = 64,
 		kv_cache_sharding_sequence_axis_name: Union[str, Tuple[str, ...]] = "sp",
@@ -255,6 +257,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		    use_scan_mlp (bool, optional): Determine whether to use scan_mlp or not. Defaults to False.
 		    scan_mlp_chunk_size (int, optional): Size of chunks in scan MLP. Defaults to 1024.
 		    attention_axis_name (str, optional): Name of the attention axis name. Defaults to "sp".
+				gradient_checkpointing (EasyDeLQuantizationMethods, optional): Gradient Checkpointing method for created or loaded module (applied on mlp and attn layers most of the times).
 		    kv_cache_quantization_method (EasyDeLQuantizationMethods, optional): key and value quantization type. Defaults to EasyDeLQuantizationMethods.NONE.
 		    kv_cache_quantization_blocksize (int, optional): size of kv cache quantization. Defaults to 64.
 		    kv_cache_sharding_sequence_axis_name (Union[str, Tuple[str, ...]], optional): axis name to target for sharding sequences. Defaults to "sp".
@@ -310,6 +313,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		)
 		self.kv_cache_sharding_sequence_axis_name = getattr(
 			self, "kv_cache_sharding_sequence_axis_name", kv_cache_sharding_sequence_axis_name
+		)
+		self.gradient_checkpointing = getattr(
+			self, "gradient_checkpointing", gradient_checkpointing
 		)
 		self.kv_cache_quantization_method = getattr(
 			self, "kv_cache_quantization_method", kv_cache_quantization_method
@@ -482,6 +488,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		use_scan_mlp: bool = ...,
 		scan_mlp_chunk_size: int = ...,
 		attention_axis_name: str = ...,
+		gradient_checkpointing: EasyDeLGradientCheckPointers = ...,
 		kv_cache_quantization_method: EasyDeLQuantizationMethods = ...,
 		kv_cache_quantization_blocksize: int = ...,
 		kv_cache_sharding_sequence_axis_name: Union[str, Tuple[str, ...]] = ...,
@@ -515,6 +522,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		    use_scan_mlp (bool, optional): Determine whether to use scan_mlp or not. Defaults to ....
 		    scan_mlp_chunk_size (int, optional): Size of chunks in scan MLP. Defaults to ....
 		    attention_axis_name (str, optional): Name of the attention axis name. Defaults to ....
+				gradient_checkpointing (EasyDeLQuantizationMethods, optional): Gradient Checkpointing method for created or loaded module (applied on mlp and attn layers most of the times). Defaults to ....
 		    kv_cache_quantization_method (EasyDeLQuantizationMethods, optional): key and value quantization type. Defaults to ....
 		    kv_cache_quantization_blocksize (int, optional): size of kv cache quantization. Defaults to ....
 		    kv_cache_sharding_sequence_axis_name (Union[str, Tuple[str, ...]], optional): axis name to target for sharding sequences. Defaults to ....
@@ -567,6 +575,13 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			"sp",
 			kv_cache_sharding_sequence_axis_name,
 		)
+		set_attrs_smartly(
+			self,
+			"gradient_checkpointing",
+			EasyDeLGradientCheckPointers.NONE,
+			gradient_checkpointing,
+		)
+
 		set_attrs_smartly(
 			self,
 			"kv_cache_quantization_method",
@@ -885,6 +900,8 @@ class EasyDeLBaseModule(FlaxPreTrainedModel):
 	base_model_prefix: str
 	flax_module: Type[M]
 	module_class: Union[flax.linen.Module, Type[M]] = None
+	_model_task: Optional[str] = None
+	_model_type: Optional[str] = None
 
 	def __init__(
 		self,
@@ -932,6 +949,14 @@ class EasyDeLBaseModule(FlaxPreTrainedModel):
 	@property
 	def mesh(self):
 		return self.config.mesh
+
+	@property
+	def model_task(self):
+		return self._model_task
+
+	@property
+	def model_type(self):
+		return self._model_type
 
 	def get_named_sharding(self, partition_rules=None, partition_specs=None):
 		if partition_rules is None:

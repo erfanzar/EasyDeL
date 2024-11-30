@@ -49,6 +49,7 @@ from transformers.modeling_flax_utils import (
 	ACT2FN,
 )
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
@@ -680,7 +681,7 @@ class FlaxT5LayerCollection(nn.Module):
 
 	def setup(self):
 		block = FlaxT5Block
-		if self.config.gradient_checkpointing != "":
+		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			block = remat(
 				block,
 				static_argnums=(5, 6, 7, 8, 9),
@@ -725,7 +726,7 @@ class FlaxT5BlockCollection(nn.Module):
 	def setup(self):
 		self.causal = self.config.causal
 		block = FlaxT5LayerCollection
-		if self.config.gradient_checkpointing != "":
+		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			block = remat(
 				block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
