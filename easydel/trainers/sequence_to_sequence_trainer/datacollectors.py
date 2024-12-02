@@ -63,6 +63,7 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
 		batch["labels"] = labels
 		batch["decoder_input_ids"] = decoder_input_ids
+		batch["decoder_attention_mask"] = labels_batch.attention_mask
 		# print(
 		# 	"|".join(f"{k} - {v.shape}" for k, v in batch.items())
 		# 	+ str(self.max_target_length)
