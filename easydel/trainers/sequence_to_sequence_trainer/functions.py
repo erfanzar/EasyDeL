@@ -71,7 +71,7 @@ def create_seq2seq_model_train_step(
 			loss, accuracy = cross_entropy_loss_and_accuracy(
 				logits,
 				labels,
-				batch.get("attention_mask", None),
+				batch.get("decoder_attention_mask", None),
 			)
 			if aux_loss is not None:
 				loss += aux_loss
@@ -155,7 +155,7 @@ def create_seq2seq_model_evaluation_step(
 			loss, accuracy = cross_entropy_loss_and_accuracy(
 				logits,
 				labels,
-				batch_eval.get("attention_mask", None),
+				batch_eval.get("decoder_attention_mask", None),
 			)
 			if aux_loss is not None:
 				loss += aux_loss
