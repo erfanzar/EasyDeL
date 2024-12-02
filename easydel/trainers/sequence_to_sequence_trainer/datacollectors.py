@@ -23,8 +23,6 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 	target_padding: Union[bool, str] = "max_length"
 	max_input_length: Optional[float] = None
 	max_target_length: Optional[int] = None
-	pad_input_to_multiple_of: Optional[int] = None
-	pad_target_to_multiple_of: Optional[int] = None
 
 	def __call__(
 		self, features: List[Dict[str, Union[List[int], np.ndarray]]]
@@ -40,7 +38,6 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 			input_features,
 			max_length=self.max_input_length,
 			padding=self.input_padding,
-			pad_to_multiple_of=self.pad_input_to_multiple_of,
 			return_tensors="np",
 		)
 
@@ -48,11 +45,13 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 			label_features,
 			max_length=self.max_target_length,
 			padding=self.target_padding,
-			pad_to_multiple_of=self.pad_target_to_multiple_of,
 			return_tensors="np",
 		)
 
-		labels = labels_batch["input_ids"]
+		labels = labels_batch["input_ids"][:, : self.max_target_length]
+		labels_batch.attention_mask = labels_batch.attention_mask[
+			:, : self.max_target_length
+		]
 		if (labels[:, 0] == self.decoder_start_token_id).all().item():
 			labels = labels[:, 1:]
 			labels_batch.attention_mask = labels_batch.attention_mask[:, 1:]
@@ -64,5 +63,9 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
 		batch["labels"] = labels
 		batch["decoder_input_ids"] = decoder_input_ids
+		# print(
+		# 	"|".join(f"{k} - {v.shape}" for k, v in batch.items())
+		# 	+ str(self.max_target_length)
+		# )
 
 		return batch
