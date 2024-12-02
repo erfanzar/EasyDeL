@@ -503,7 +503,7 @@ class vWhisperInference:
 		return_timestamps = (
 			return_timestamps
 			if return_timestamps is not None
-			else self.return_timestamps.task
+			else self.inference_config.return_timestamps
 		)
 
 		dataloader = self._process_model_inputs(

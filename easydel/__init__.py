@@ -279,6 +279,12 @@ from easydel.modules.xerxes import (
 	FlaxXerxesModel,
 	XerxesConfig,
 )
+from easydel.modules.factory import (
+	register_config,
+	register_module,
+	ConfigType,
+	TaskType,
+)
 from easydel.smi import get_mem, initialise_tracking, run
 from easydel.trainers import (
 	BaseTrainer,

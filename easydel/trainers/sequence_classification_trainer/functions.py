@@ -123,7 +123,12 @@ def create_sequence_classification_model_train_step(
 			batch_copy = dict(batch)  # Create a copy to avoid modifying the original
 
 			# Forward pass
-			model_outputs = state.apply_fn(params=params, **batch_copy, return_dict=True)
+			model_outputs = state.apply_fn(
+				params=params,
+				**batch_copy,
+				return_dict=True,
+				train=True,
+			)
 			logits = model_outputs.logits[:, -1, :]
 
 			# Calculate primary loss
@@ -225,7 +230,7 @@ def create_sequence_classification_model_eval_step(
 				params=params,
 				**batch_eval,
 				return_dict=True,
-				deterministic=True,  # Ensure dropout and other training-specific features are disabled
+				train=False,  # Ensure dropout and other training-specific features are disabled
 			)
 			logits = model_outputs.logits[:, -1, :]
 
