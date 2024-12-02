@@ -78,6 +78,7 @@ def create_casual_language_model_train_step(
 				**batch,
 				return_dict=True,
 				deterministic=False,
+				train=True,
 			)
 			logits = model_outputs.logits
 			aux_loss = getattr(model_outputs, "aux_loss", None)
@@ -178,7 +179,12 @@ def create_casual_language_model_evaluation_step(
 				labels = batch_eval["input_ids"][..., 1:]
 			else:
 				labels = labels[..., 1:]
-			model_outputs = state.apply_fn(params=params, **batch_eval, return_dict=True)
+			model_outputs = state.apply_fn(
+				params=params,
+				**batch_eval,
+				return_dict=True,
+				train=False,
+			)
 			logits = model_outputs.logits
 			aux_loss = getattr(model_outputs, "aux_loss", None)
 			valid = jnp.where(

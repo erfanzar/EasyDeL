@@ -63,22 +63,15 @@ def create_seq2seq_model_train_step(
 				**batch,
 				return_dict=True,
 				deterministic=False,
+				train=True,
 			)
 			logits = model_outputs.logits
 			aux_loss = getattr(model_outputs, "aux_loss", None)
-			attn_mask = batch.get("attention_mask", None)
-			if attn_mask is not None:
-				valid = jnp.where(
-					(attn_mask[:, 1:].astype(jnp.float32) != 0) & (labels > 0),
-					1.0,
-					0.0,
-				)
-			else:
-				valid = None
+
 			loss, accuracy = cross_entropy_loss_and_accuracy(
 				logits,
 				labels,
-				valid,
+				batch.get("attention_mask", None),
 			)
 			if aux_loss is not None:
 				loss += aux_loss
@@ -150,22 +143,19 @@ def create_seq2seq_model_evaluation_step(
 			from these logits.
 			"""
 			labels = batch_eval.pop("labels", None)
-			model_outputs = state.apply_fn(params=params, **batch_eval, return_dict=True)
+			model_outputs = state.apply_fn(
+				params=params,
+				**batch_eval,
+				return_dict=True,
+				train=False,
+			)
 			logits = model_outputs.logits
 			aux_loss = getattr(model_outputs, "aux_loss", None)
-			attn_mask = batch_eval.get("attention_mask", None)
-			if attn_mask is not None:
-				valid = jnp.where(
-					(attn_mask[:, 1:].astype(jnp.float32) != 0) & (labels > 0),
-					1.0,
-					0.0,
-				)
-			else:
-				valid = None
+
 			loss, accuracy = cross_entropy_loss_and_accuracy(
 				logits,
 				labels,
-				valid,
+				batch_eval.get("attention_mask", None),
 			)
 			if aux_loss is not None:
 				loss += aux_loss

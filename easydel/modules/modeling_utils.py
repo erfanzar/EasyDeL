@@ -131,7 +131,7 @@ class EasyMethod:
 
 warnings.filterwarnings(
 	"ignore",
-	message="Passing `gradient_checkpointing` to a config initialization is deprecated",  # EasyDeL handle will this
+	message="Passing `gradient_checkpointing` to a config initialization is deprecated",  # EasyDeL will handle this
 )
 
 

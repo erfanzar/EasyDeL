@@ -75,7 +75,12 @@ def create_vision_casual_language_model_train_step(
 				labels = labels[..., 1:]
 			label_vision_mask = batch.pop("label_vision_mask")
 
-			model_outputs = state.apply_fn(params=params, **batch, return_dict=True)
+			model_outputs = state.apply_fn(
+				params=params,
+				**batch,
+				return_dict=True,
+				train=True,
+			)
 			logits = model_outputs.logits
 			aux_loss = getattr(model_outputs, "aux_loss", None)
 
@@ -150,7 +155,12 @@ def create_vision_casual_language_model_evaluation_step(
 			else:
 				labels = labels[..., 1:]
 			label_vision_mask = batch.pop("label_vision_mask")
-			model_outputs = state.apply_fn(params=params, **batch, return_dict=True)
+			model_outputs = state.apply_fn(
+				params=params,
+				**batch,
+				return_dict=True,
+				train=False,
+			)
 			logits = model_outputs.logits
 			aux_loss = getattr(model_outputs, "aux_loss", None)
 
