@@ -127,18 +127,6 @@ q, k, v, attention_mask, causal_mask, attention_bias = make_fake_input_data(
 )
 
 flash_attention = FlexibleAttentionModule(
-
-    block_k_major=config.block_k_major,
-    block_b=config.block_b,
-    block_q=config.block_q,
-    block_k=config.block_k,
-    block_q_major_dkv=config.block_q_major_dkv,
-    block_k_major_dkv=config.block_k_major_dkv,
-    block_k_major_dq=config.block_k_major_dq,
-    block_k_dkv=config.block_k_dkv,
-    block_q_dkv=config.block_q_dkv,
-    block_q_dq=config.block_q_dq,
-    block_k_dq=config.block_k_dq,
     num_attention_heads=NUM_ATTN_HEADS,
     attention_dropout=0.0,
     head_dims=HEAD_DIM,
@@ -152,7 +140,7 @@ flash_attention = FlexibleAttentionModule(
     shard_attention_computation=config.shard_attention_computation,
     precision=lax.Precision("fastest"),
     force_float32_tpu=True,
-    attn_mechanism="flash",
+    attn_mechanism=..., # check from source
     dtype=jnp.float32,
     scan_ring_attention=config.scan_ring_attention,
     mesh=config.mesh,
@@ -161,17 +149,6 @@ flash_attention = FlexibleAttentionModule(
 
 normal_attention = FlexibleAttentionModule(
 
-    block_k_major=config.block_k_major,
-    block_b=config.block_b,
-    block_q=config.block_q,
-    block_k=config.block_k,
-    block_q_major_dkv=config.block_q_major_dkv,
-    block_k_major_dkv=config.block_k_major_dkv,
-    block_k_major_dq=config.block_k_major_dq,
-    block_k_dkv=config.block_k_dkv,
-    block_q_dkv=config.block_q_dkv,
-    block_q_dq=config.block_q_dq,
-    block_k_dq=config.block_k_dq,
     num_attention_heads=NUM_ATTN_HEADS,
     attention_dropout=0.0,
     head_dims=HEAD_DIM,
@@ -185,7 +162,7 @@ normal_attention = FlexibleAttentionModule(
     shard_attention_computation=config.shard_attention_computation,
     precision=lax.Precision("fastest"),
     force_float32_tpu=True,
-    attn_mechanism="jax_flash_attn2",
+    attn_mechanism="vanilla",
     dtype=jnp.float32,
     scan_ring_attention=config.scan_ring_attention,
     mesh=config.mesh,

@@ -13,15 +13,15 @@ or install from head
 pip install git+https://github.com/erfanzar/EasyDeL.git -U -q
 ```
 
-### Tensorflow Issues for EasyDeL>=0.0.69
+### Tensorflow Issues for EasyDeL>=0.0.80
 EasyDeL uses tensorflow for dataloaders and streamers so they are not in main process 
-and latest tensorflow version and `jax>=0.4.29` which is recommended for easydel, they have package conflicts 
+and latest tensorflow version and `jax>=0.4.34` which is recommended for easydel, they have package conflicts 
 and here's how you should install easydel in case that your facing this issue.
 
 ```shell
 pip uninstall easydel -y
 pip install git+https://github.com/erfanzar/EasyDeL.git -q -U
-pip install jax[tpu]==0.4.29 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q -U
+pip install jax[tpu]==0.4.35 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q -U
 python -c 'import easydel;print(True)' 
 ```
 
@@ -33,14 +33,14 @@ python -c 'import easydel;print(True)'
 JAX uses XLA to compile and run your NumPy programs on GPUs and TPUs. Compilation happens under the hood by default,
 with library calls getting just-in-time compiled and executed. But JAX also lets you just-in-time compile your own
 Python functions into XLA-optimized kernels using a one-function API, jit.
-you can install other version too but easydel required at least version of 0.4.16
+you can install other version too but easydel required at least version of 0.4.29
 
 ### TPU
 
 inorder to install jax on TPU Devices use following command
 
 ```shell
-!pip install jax[tpu]==0.4.29 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
+!pip install jax[tpu]==0.4.35 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
 ```
 
 ### GPU
