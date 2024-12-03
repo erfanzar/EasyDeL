@@ -30,7 +30,7 @@ def setup_inference():
 		input_shape=input_shape,
 		auto_shard_params=True,
 		sharding_axis_dims=sharding_axis_dims,
-		config_kwargs=dict(
+		config_kwargs=ed.EasyDeLBaseConfigDict(
 			use_scan_mlp=False,
 			partition_axis=partition_axis,
 			attn_dtype=jnp.float16,

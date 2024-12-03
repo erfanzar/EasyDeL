@@ -12,7 +12,7 @@ EasyDeL is an open-source framework designed to enhance and streamline the train
 ## Key Features
 
 - **Diverse Architecture Support**: Seamlessly work with various model architectures including Transformers, Mamba, RWKV, and more.
-- **Diverse Model Support**: Implements a wide range of models in JAX, including Falcon, Qwen2, Phi2, Mixtral, Qwen2Moe, Cohere, Dbrx, Phi3, and MPT.
+- **Diverse Model Support**: Implements a wide range of models that never been implement before in JAX.
 - **Advanced Trainers**: Offers specialized trainers like DPOTrainer, ORPOTrainer, SFTTrainer, and VideoCLM Trainer.
 - **Serving and API Engines**: Provides engines for efficiently serving large language models (LLMs) in JAX.
 - **Quantization and Bit Operations**: Supports various quantization methods and 8, 6, and 4-bit operations for optimized inference and training.
@@ -94,36 +94,18 @@ Comprehensive documentation and examples are available at [EasyDeL Documentation
 
 Here's an improved version of your latest updates:
 
-## Latest Updates 🔥
-- `jax_flash_attn2` is added and Default attention is now set to `jax_flash_attn2` in CPU/GPU/TPU.
-- NF4 Arrays are now supported.
-- EXAONE and InternLM2 is added.
-- all of the Models have Architecture improvements.
-- Optimized KeyValueCache:
-   - Improved performance for `inference`
-   - Added support for `8bit_cache`
-- GenerationPipeline Is Removed.
-- vInference Added and supports:
-    - Fast NF4 Operations (CPU GPU).
-    - Fast A8BIT Operations (CPU GPU TPU).
-    - OpenAI Compatible server.
-    - Multi-User handeling and Muti-Threaded.
-    - Multi-vInference launching.
-    - Metrics Recording.
-- Enhanced Trainers: Both `DPO` and `ORPO` trainers have been upgraded.
-- Simplified Parameter Sharding: You can now shard parameters directly with the model using:
-   ```python
-   params = model.shard_params(params)
-   params = model.gather_params(params)
-   ```
-- Training Argument Change: `do_shard_params` has been removed from `TrainingArguments`. To shard parameters, you must now do so manually before training.
--  DPOTrainer Improvement: Added support for int8 training for reference models.
-- Added `ApiEngine` and `engine_client`
-- Improved `SFT`, `DPO`, `ORPO`, `CLM` Trainers
-- Added support for Gemma2, OLMo models
-- Fixed GPU Flash Attention bugs
-- Improved KV cache quantization accuracy
-- Enhanced memory efficiency for multi-GPU setups
+### Latest Updates 🔥
+
+- **Platform and Backend Flexibility**: You can now specify the platform (e.g., TRITON) and backend (e.g., GPU) to optimize your workflows.  
+- **Expanded Model Support**: Added support for new models such as `olmo2`, `qwen2_moe`, `mamba2`, and others.  
+- **Enhanced Trainers**: Trainers are now more customizable and hackable, enabling greater flexibility in your projects.  
+- **New Trainer Types**:  
+  - **Sequence-to-Sequence Trainers**  
+  - **Sequence Classification Trainers**  
+- **`vInference` Engine**: Introduced as a robust inference engine for LLMs, with Long-Term Support (LTS).  
+- **`vInferenceApiServer`**: Added as a backend for the inference engine, fully compatible with OpenAI APIs.  
+- **Optimized GPU Integration**: EasyDeL now leverages custom, direct TRITON calls for improved GPU performance.  
+- **Dynamic Quantization Support**: Added support for quantization types like NF4, A8BIT, A8Q, and A4Q for efficiency and scalability.  
 
 ## Key Components
 

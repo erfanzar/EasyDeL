@@ -81,15 +81,15 @@ def _normalize(
 	x: Array,
 	mean: Array,
 	var: Array,
-	reduction_axes: nn.Axes,
-	feature_axes: nn.Axes,
-	dtype: Optional[nn.Dtype],
-	param_dtype: nn.Dtype,
-	epsilon: float,
-	use_bias: bool,
-	use_scale: bool,
-	bias_init: nn.Initializer,
-	scale_init: nn.Initializer,
+	reduction_axes,
+	feature_axes,
+	dtype,
+	param_dtype,
+	epsilon,
+	use_bias,
+	use_scale,
+	bias_init,
+	scale_init,
 ):
 	reduction_axes = nn._canonicalize_axes(x.ndim, reduction_axes)
 	feature_axes = nn._canonicalize_axes(x.ndim, feature_axes)
@@ -121,20 +121,20 @@ def _normalize(
 		)
 		y += bias
 		args.append(bias)
-	dtype = nn.dtypes.canonicalize_dtype(*args, dtype=dtype)
+	dtype = jnp.dtypes.canonicalize_dtype(*args, dtype=dtype)
 	return jnp.asarray(y, dtype)
 
 
 class LayerNorm(nn.Module):
 	eps: float = 1e-6
-	dtype: Optional[nn.Dtype] = None
-	param_dtype: nn.Dtype = jnp.float32
+	dtype: Optional[jnp.dtype] = None
+	param_dtype: jnp.dtype = jnp.float32
 	use_bias: bool = True
 	use_scale: bool = True
-	bias_init: nn.Initializer = initializers.zeros
-	scale_init: nn.Initializer = initializers.ones
-	reduction_axes: nn.Axes = -1
-	feature_axes: nn.Axes = -1
+	bias_init: callable = initializers.zeros
+	scale_init: callable = initializers.ones
+	reduction_axes = -1
+	feature_axes = -1
 	axis_name: Optional[str] = None
 	axis_index_groups: Any = None
 	use_fast_variance: bool = True

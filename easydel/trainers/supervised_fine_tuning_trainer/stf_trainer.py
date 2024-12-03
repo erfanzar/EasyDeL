@@ -114,7 +114,9 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
 	    ...   auto_shard_params=True,
 	    ...   sharding_axis_dims=sharding_axis_dims,
 	    ...   verbose_params=True,
-	    ...   config_kwargs=dict(use_scan_mlp=False, partition_axis=partition_axis),
+	    ...   config_kwargs=ed.EasyDeLBaseConfigDict(
+	    ...     use_scan_mlp=False, partition_axis=partition_axis
+	    ...   ),
 	    ...   partition_axis=partition_axis,
 	    ... )
 

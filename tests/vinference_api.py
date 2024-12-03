@@ -6,12 +6,13 @@ os.environ["EASYDEL_AUTO"] = "true"
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-import easydel as ed
 import jax
 from huggingface_hub import HfApi
-from jax import sharding
 from jax import numpy as jnp
+from jax import sharding
 from transformers import AutoTokenizer
+
+import easydel as ed
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
@@ -27,7 +28,7 @@ def main():
 		input_shape=(len(jax.devices()), max_length),
 		auto_shard_params=True,
 		sharding_axis_dims=sharding_axis_dims,
-		config_kwargs=dict(
+		config_kwargs=ed.EasyDeLBaseConfigDict(
 			use_scan_mlp=False,
 			partition_axis=partition_axis,
 			attn_dtype=jnp.float16,

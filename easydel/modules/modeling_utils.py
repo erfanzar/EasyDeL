@@ -746,28 +746,29 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
 		Examples:
 
-		```python
-		# We can't instantiate directly the base class *PretrainedConfig* so let's show the examples on a
-		# derived class: BertConfig
-		config = BertConfig.from_pretrained(
-		  "google-bert/bert-base-uncased"
-		)  # Download configuration from huggingface.co and cache.
-		config = BertConfig.from_pretrained(
-		  "./test/saved_model/"
-		)  # E.g. config (or model) was saved using *save_pretrained('./test/saved_model/')*
-		config = BertConfig.from_pretrained("./test/saved_model/my_configuration.json")
-		config = BertConfig.from_pretrained(
-		  "google-bert/bert-base-uncased", output_attentions=True, foo=False
-		)
-		assert config.output_attentions == True
-		config, unused_kwargs = BertConfig.from_pretrained(
-		  "google-bert/bert-base-uncased",
-		  output_attentions=True,
-		  foo=False,
-		  return_unused_kwargs=True,
-		)
-		assert config.output_attentions == True
-		assert unused_kwargs == {"foo": False}
+
+		>>> # We can't instantiate directly the base class *PretrainedConfig* so let's show the examples on a
+		>>> # derived class: BertConfig
+		>>> config = BertConfig.from_pretrained(
+		...   "google-bert/bert-base-uncased"
+		>>> )  # Download configuration from huggingface.co and cache.
+		>>> config = BertConfig.from_pretrained(
+		...   "./test/saved_model/"
+		>>> )  # E.g. config (or model) was saved using *save_pretrained('./test/saved_model/')*
+		>>> config = BertConfig.from_pretrained("./test/saved_model/my_configuration.json")
+		>>> config = BertConfig.from_pretrained(
+		...  "google-bert/bert-base-uncased", output_attentions=True, foo=False
+		>>> )
+		>>> assert config.output_attentions == True
+		>>> config, unused_kwargs = BertConfig.from_pretrained(
+		...  "google-bert/bert-base-uncased",
+		...  output_attentions=True,
+		...  foo=False,
+		...  return_unused_kwargs=True,
+		>>> )
+		>>> assert config.output_attentions == True
+		>>> assert unused_kwargs == {"foo": False}
+
 		```"""
 		kwargs["cache_dir"] = cache_dir
 		kwargs["force_download"] = force_download
