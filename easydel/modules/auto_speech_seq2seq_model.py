@@ -66,24 +66,24 @@ class AutoEasyDeLModelForSpeechSeq2Seq(BaseAutoEasyModel):
 	    None
 
 	Examples:
-	    ```python
-	    import jax
-	    from easydel import AutoEasyDeLModelForSpeechSeq2Seq
 
-	    # Load a openai/whisper-large-v3-turbo sharded
-	    model, params = AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
-	      "openai/whisper-large-v3-turbo",
-	      auto_shard_params=True,
-	    )
+	    >>> import jax
+	    >>> from easydel import AutoEasyDeLModelForSpeechSeq2Seq
 
-	    # Load a openai/whisper-large-v3-turbo model sharded across 8 GPUs with data parallelism (DP) and fully sharded data parallelism (FSDP)
-	    model, params = AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
-	      "openai/whisper-large-v3-turbo",
-	      sharding_axis_dims=(1, 8, 1, 1),
-	      sharding_axis_names=("dp", "fsdp", "tp", "sp"),
-	      device=jax.devices("cpu")[0],  # offload to CPU [OPTIONAL]
-	      from_torch=True,
-	    )
+	    >>> # Load a openai/whisper-large-v3-turbo sharded
+	    >>> model, params = AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
+	    ...  "openai/whisper-large-v3-turbo",
+	    ...  auto_shard_params=True,
+	    >>> )
+
+	    >>> # Load a openai/whisper-large-v3-turbo model sharded across 8 GPUs with data parallelism (DP) and fully sharded data parallelism (FSDP)
+	    >>> model, params = AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
+	    ...  "openai/whisper-large-v3-turbo",
+	    ...  sharding_axis_dims=(1, 8, 1, 1),
+	    ...  sharding_axis_names=("dp", "fsdp", "tp", "sp"),
+	    ...  device=jax.devices("cpu")[0],  # offload to CPU [OPTIONAL]
+	    ...  from_torch=True,
+	    >>> )
 	    ```
 	"""
 

@@ -55,7 +55,7 @@ max_length = None # can be set to use lower memory for caching
 # Load model and parameters
 model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
     "{{ model.repo_id }}",
-    config_kwargs=dict(
+    config_kwargs=ed.EasyDeLBaseConfigDict(
         use_scan_mlp=False,
         attn_dtype=jnp.float16,
         freq_max_position_embeddings=max_length,

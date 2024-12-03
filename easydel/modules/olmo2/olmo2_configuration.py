@@ -86,7 +86,7 @@ class Olmo2Config(EasyDeLBaseConfig):
 			rms_norm_eps (`float`, *optional*, defaults to 1e-05):
 					The epsilon used by the rms normalization layers.
 
-	```python
+
 	>>> from transformers import Olmo2Model, Olmo2Config
 
 	>>> # Initializing a Olmo2 7B style configuration
@@ -97,7 +97,7 @@ class Olmo2Config(EasyDeLBaseConfig):
 
 	>>> # Accessing the model configuration
 	>>> configuration = model.config
-	```
+
 	"""
 
 	model_type = "olmo2"

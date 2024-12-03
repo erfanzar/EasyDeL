@@ -140,16 +140,16 @@ class EasyDeLState(struct.PyTreeNode):
 
 	Example Usage::
 
-	```python
-	>> # Initialize an EasyDeLState object
-	>> state = EasyDeLState.create(
-	>>     apply_fn=model.__call__,
-	>>     params=model.params,
-	>>     tx=optax.adam(learning_rate=1e-3),
-	>>     module=model,
-	>>     module_config=model.config
-	>> )
-	```
+
+	>>> # Initialize an EasyDeLState object
+	>>> state = EasyDeLState.create(
+	...    apply_fn=model.__call__,
+	...    params=model.params,
+	...    tx=optax.adam(learning_rate=1e-3),
+	...     module=model,
+	...     module_config=model.config
+	>>> )
+
 	"""
 
 	step: int

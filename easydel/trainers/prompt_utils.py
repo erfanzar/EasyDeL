@@ -35,13 +35,12 @@ def is_conversational(example: Dict[str, Any]) -> bool:
 
 	Examples:
 
-	```python
 	>>> example = {"prompt": [{"role": "user", "content": "What color is the sky?"}]}
 	>>> is_conversational(example)
-	True
+	... True
 	>>> example = {"prompt": "The sky is"})
 	>>> is_conversational(example)
-	False
+	... False
 	```
 	"""
 	supported_keys = ["prompt", "chosen", "rejected", "completion", "messages"]
@@ -183,16 +182,15 @@ def maybe_apply_chat_template(
 
 	Example:
 
-	```python
 	>>> from transformers import AutoTokenizer
 	>>> tokenizer = AutoTokenizer.from_pretrained("microsoft/Phi-3-mini-128k-instruct")
 	>>> example = {
-	...     "prompt": [{"role": "user", "content": "What color is the sky?"}],
-	...     "completion": [{"role": "assistant", "content": "It is blue."}]
+	...   "prompt": [{"role": "user", "content": "What color is the sky?"}],
+	...   "completion": [{"role": "assistant", "content": "It is blue."}],
 	... }
 	>>> apply_chat_template(example, tokenizer)
 	{'prompt': '<|user|>\nWhat color is the sky?<|end|>\n<|assistant|>\n', 'completion': 'It is blue.<|end|>\n<|endoftext|>'}
-	```
+
 	"""
 	if is_conversational(example):
 		return apply_chat_template(example, tokenizer)
@@ -231,7 +229,6 @@ def unpair_preference_dataset(
 
 	Example:
 
-	```python
 	>>> from datasets import Dataset
 	>>> dataset_dict = {
 	...     "prompt": ["The sky is", "The sun is"]
@@ -247,7 +244,7 @@ def unpair_preference_dataset(
 	})
 	>>> dataset[0]
 	{'prompt': 'The sky is', 'completion': ' blue.', 'label': True}
-	```
+
 	"""
 	return dataset.map(
 		_unpair_row, batched=True, remove_columns=["chosen", "rejected"], num_proc=num_proc
@@ -272,7 +269,6 @@ def maybe_unpair_preference_dataset(
 
 	Example:
 
-	```python
 	>>> from datasets import Dataset
 	>>> dataset_dict = {
 	...     "prompt": ["The sky is", "The sun is"]
@@ -288,7 +284,7 @@ def maybe_unpair_preference_dataset(
 	})
 	>>> dataset[0]
 	{'prompt': 'The sky is', 'completion': ' blue.', 'label': True}
-	```
+
 	"""
 	from datasets import DatasetDict
 
@@ -345,49 +341,46 @@ def maybe_extract_prompt(example: Dict[str, List]) -> Dict[str, List]:
 
 	Examples:
 
-	```python
 	>>> example = {
-	...     "chosen": [
-	...         {"role": "user", "content": "What color is the sky?"},
-	...         {"role": "assistant", "content": "It is blue."}
-	...     ],
-	...     "rejected": [
-	...         {"role": "user", "content": "What color is the sky?"},
-	...         {"role": "assistant", "content": "It is green."}
-	...     ]
+	...   "chosen": [
+	...     {"role": "user", "content": "What color is the sky?"},
+	...     {"role": "assistant", "content": "It is blue."},
+	...   ],
+	...   "rejected": [
+	...     {"role": "user", "content": "What color is the sky?"},
+	...     {"role": "assistant", "content": "It is green."},
+	...   ],
 	... }
 	>>> extract_prompt(example)
 	{'prompt': [{'role': 'user', 'content': 'What color is the sky?'}],
 	 'chosen': [{'role': 'assistant', 'content': 'It is blue.'}],
 	 'rejected': [{'role': 'assistant', 'content': 'It is green.'}]}
-	```
 
 	Or, with the `map` method of `datasets.Dataset`:
 
-	```python
 	>>> from trl import extract_prompt
 	>>> from datasets import Dataset
 	>>> dataset_dict = {
-	...     "chosen": [
-	...         [
-	...             {"role": "user", "content": "What color is the sky?"},
-	...             {"role": "assistant", "content": "It is blue."},
-	...         ],
-	...         [
-	...             {"role": "user", "content": "Where is the sun?"},
-	...             {"role": "assistant", "content": "In the sky."},
-	...         ],
+	...   "chosen": [
+	...     [
+	...       {"role": "user", "content": "What color is the sky?"},
+	...       {"role": "assistant", "content": "It is blue."},
 	...     ],
-	...     "rejected": [
-	...         [
-	...             {"role": "user", "content": "What color is the sky?"},
-	...             {"role": "assistant", "content": "It is green."},
-	...         ],
-	...         [
-	...             {"role": "user", "content": "Where is the sun?"},
-	...             {"role": "assistant", "content": "In the sea."},
-	...         ],
+	...     [
+	...       {"role": "user", "content": "Where is the sun?"},
+	...       {"role": "assistant", "content": "In the sky."},
 	...     ],
+	...   ],
+	...   "rejected": [
+	...     [
+	...       {"role": "user", "content": "What color is the sky?"},
+	...       {"role": "assistant", "content": "It is green."},
+	...     ],
+	...     [
+	...       {"role": "user", "content": "Where is the sun?"},
+	...       {"role": "assistant", "content": "In the sea."},
+	...     ],
+	...   ],
 	... }
 	>>> dataset = Dataset.from_dict(dataset_dict)
 	>>> dataset = dataset.map(extract_prompt)
@@ -395,7 +388,7 @@ def maybe_extract_prompt(example: Dict[str, List]) -> Dict[str, List]:
 	{'prompt': [{'role': 'user', 'content': 'What color is the sky?'}],
 	 'chosen': [{'role': 'assistant', 'content': 'It is blue.'}],
 	 'rejected': [{'role': 'assistant', 'content': 'It is green.'}]}
-	```
+
 	"""
 	# Some dataset add a `"prompt"` column, even though the prompt is implicit and included in the "chosen" and
 	# "rejected" completions. E.g.:

@@ -60,10 +60,7 @@ def get_files(path: str):
 	]
 
 
-def run(
-	project_locations="easydel/",
-	start_head="easydel",
-):
+def run(project_locations="easydel/", start_head="easydel"):
 	global cache
 	try:
 		for current_file in get_inner(project_locations):
@@ -76,12 +73,9 @@ def run(
 				name = (
 					current_file.replace(".py", "").replace(os.path.sep, ".").replace("/", ".")
 				).replace("src.", "")
-				# markdown_documentation = f"{name.replace(doted, '')}\n========\n.. automodule:: {name}" + static_joins
+
 				categorical_name = name.replace(doted, "")
 				markdown_filename = name.replace(doted, "") + ".rst"
-
-				# with open(docs_file + markdown_filename, "w") as buffer:
-				#     buffer.write(markdown_documentation)
 				category_tuple = tuple(categorical_name.split("."))
 				edited_category_tuple = ()
 
@@ -89,7 +83,7 @@ def run(
 					key = key.split("_")
 					capitalized_words = [word.capitalize() for word in key if word != ""]
 					edited_category_tuple += (" ".join(capitalized_words),)
-				#
+
 				cache[edited_category_tuple] = (
 					start_head.replace("/", ".") + "." + markdown_filename.replace(".py", "")
 				)
@@ -166,11 +160,10 @@ def main():
 	for current_file in get_inner("docs/api_docs/"):
 		if current_file.startswith("docs/api_docs/"):
 			os.remove(current_file)
-			# print("Removed Past generated file: " + current_file)
 	run()
 
 	cache = {("APIs",) + k: v for k, v in cache.items()}
-	# print(cache)
+
 	pages = unflatten_dict(cache)
 	base_dir = "docs/api_docs/"
 	generate_api_docs(
