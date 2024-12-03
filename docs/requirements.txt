@@ -1,4 +1,4 @@
-git+https://github.com/erfanzar/EasyDeL.git
+# git+https://github.com/erfanzar/EasyDeL.git
 torch
 numpy
 sentencepiece

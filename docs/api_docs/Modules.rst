@@ -36,8 +36,6 @@ Modules
    modules.qwen2.qwen_configuration
    modules.qwen2.modeling_qwen_flax
    modules.modeling_utils
-   modules.hymba.modeling_hymba_flax
-   modules.hymba.hymba_configuration
    modules.mixtral.modelling_mixtral_flax
    modules.mixtral.mixtral_configuration
    modules.internlm2.internlm2_configuration
