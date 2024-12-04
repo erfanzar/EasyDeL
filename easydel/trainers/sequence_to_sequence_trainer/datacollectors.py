@@ -19,7 +19,7 @@ def shift_tokens_right(label_ids: np.array, decoder_start_token_id: int) -> np.n
 class DataCollatorSpeechSeq2SeqWithPadding:
 	processor: Any
 	decoder_start_token_id: int
-	input_padding: Union[bool, str] = "max_length"
+	input_padding: Union[bool, str] = "do_not_pad"
 	target_padding: Union[bool, str] = "max_length"
 	max_input_length: Optional[float] = None
 	max_target_length: Optional[int] = None
