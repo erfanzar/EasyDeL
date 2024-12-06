@@ -1,23 +1,14 @@
 from __future__ import annotations
 
 # from functools import partial
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import flax
-import flax.linen
+from flax import nnx as nn
 import jax
 import jax.numpy as jnp
 
 
-# @partial(
-# 	jax.jit,
-# 	static_argnames=[
-# 		"num_rotations",
-# 		"dim",
-# 		"base",
-# 		"max_position_embeddings",
-# 	],
-# )
 def _yarn_find_correction_dim(
 	num_rotations: int,
 	dim: int,
@@ -136,23 +127,10 @@ def rope_wraper(type):
 	return w
 
 
-# @partial(jax.jit, static_argnames=["base", "rotary_dim"])
 def compute_basic_inv_frequencies(base: int, rotary_dim: int):
 	return 1.0 / (base ** (jnp.arange(0, rotary_dim, 2, dtype=jnp.float32) / rotary_dim))
 
 
-# @partial(
-# 	jax.jit,
-# 	static_argnames=[
-# 		"base",
-# 		"rotary_dim",
-# 		"beta_fast",
-# 		"beta_slow",
-# 		"max_position_embeddings",
-# 		"scaling_factor",
-# 		"extrapolation_factor",
-# 	],
-# )
 def compute_yarn_inv_frequencies(
 	base: float,
 	rotary_dim: int,
@@ -182,17 +160,6 @@ def compute_yarn_inv_frequencies(
 	return inv_frequencies
 
 
-# @partial(
-# 	jax.jit,
-# 	static_argnames=[
-# 		"base",
-# 		"rotary_dim",
-# 		"low_freq_factor",
-# 		"high_freq_factor",
-# 		"orig_max_position",
-# 		"scaling_factor",
-# 	],
-# )
 def compute_llama3_inv_frequencies(
 	base,
 	rotary_dim,
@@ -273,15 +240,6 @@ def compute_linear_frequencies(
 	return jnp.concatenate(cache_list, axis=0)
 
 
-# @partial(
-# 	jax.jit,
-# 	static_argnames=[
-# 		"base",
-# 		"rotary_dim",
-# 		"max_position_embeddings",
-# 		"scaling_factor",
-# 	],
-# )
 def compute_dynamic_frequencies(
 	base: int,
 	rotary_dim: int,
@@ -298,19 +256,6 @@ def compute_dynamic_frequencies(
 	return jnp.concatenate([jnp.cos(frequencies), jnp.sin(frequencies)], -1)
 
 
-# @partial(
-# 	jax.jit,
-# 	static_argnames=[
-# 		"base",
-# 		"rotary_dim",
-# 		"beta_fast",
-# 		"beta_slow",
-# 		"max_position_embeddings",
-# 		"scaling_factor",
-# 		"extrapolation_factor",
-# 		"attn_factor",
-# 	],
-# )
 def compute_yarn_frequencies(
 	base: float,
 	rotary_dim: int,
@@ -405,17 +350,6 @@ def compute_phi3_frequencies(
 	)
 
 
-# @partial(
-# 	jax.jit,
-# 	static_argnames=[
-# 		"base",
-# 		"rotary_dim",
-# 		"low_freq_factor",
-# 		"high_freq_factor",
-# 		"scaling_factor",
-# 		"max_position_embeddings",
-# 	],
-# )
 def compute_llama3_frequencies(
 	base,
 	rotary_dim,
@@ -441,21 +375,6 @@ def compute_llama3_frequencies(
 	return freqs
 
 
-# @partial(
-# 	jax.jit,
-# 	static_argnames=[
-# 		"base",
-# 		"rotary_dim",
-# 		"scaling_factor",
-# 		"extrapolation_factor",
-# 		"beta_fast",
-# 		"beta_slow",
-# 		"max_position_embeddings",
-# 		"mscale",
-# 		"mscale_all_dim",
-# 		"attn_factor",
-# 	],
-# )
 def compute_deepseek_frequencies(
 	base,
 	rotary_dim,
@@ -565,15 +484,23 @@ def apply_phi3_rope(
 
 
 @rope_wraper("default")
-class RotaryEmbedding(flax.linen.Module):
-	head_size: int
-	rotary_dim: int
-	max_position_embeddings: int
-	base: int
-	is_neox_style: bool
-	dtype: jnp.dtype
+class RotaryEmbedding(nn.Module):
+	def __init__(
+		self,
+		head_size: int,
+		rotary_dim: int,
+		max_position_embeddings: int,
+		base: int,
+		is_neox_style: bool,
+		dtype: jnp.dtype,
+	):
+		self.head_size = head_size
+		self.rotary_dim = rotary_dim
+		self.max_position_embeddings = max_position_embeddings
+		self.base = base
+		self.is_neox_style = is_neox_style
+		self.dtype = dtype
 
-	# @flax.linen.jit
 	def __call__(
 		self,
 		positions: jnp.ndarray,
@@ -604,7 +531,25 @@ class RotaryEmbedding(flax.linen.Module):
 
 @rope_wraper("linear")
 class LinearScalingRotaryEmbedding(RotaryEmbedding):
-	scaling_factors: Union[List[float], float]
+	def __init__(
+		self,
+		scaling_factors: Union[List[float], float],
+		head_size: int,
+		rotary_dim: int,
+		max_position_embeddings: int,
+		base: int,
+		is_neox_style: bool,
+		dtype: jnp.dtype,
+	):
+		super().__init__(
+			head_size=head_size,
+			rotary_dim=rotary_dim,
+			max_position_embeddings=max_position_embeddings,
+			base=base,
+			is_neox_style=is_neox_style,
+			dtype=dtype,
+		)
+		self.scaling_factors = scaling_factors
 
 	# @flax.linen.jit
 	def __call__(
@@ -640,7 +585,25 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
 class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
 	"""RotaryEmbedding extended with Dynamic NTK scaling."""
 
-	scaling_factor: Union[float, int]
+	def __init__(
+		self,
+		scaling_factor: Union[List[float], float],
+		head_size: int,
+		rotary_dim: int,
+		max_position_embeddings: int,
+		base: int,
+		is_neox_style: bool,
+		dtype: jnp.dtype,
+	):
+		super().__init__(
+			head_size=head_size,
+			rotary_dim=rotary_dim,
+			max_position_embeddings=max_position_embeddings,
+			base=base,
+			is_neox_style=is_neox_style,
+			dtype=dtype,
+		)
+		self.scaling_factor = scaling_factor
 
 	# @flax.linen.jit
 	def __call__(
@@ -679,11 +642,34 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
 	Credits to Peng et al. github.com/jquesnelle/yarn
 	"""
 
-	scaling_factor: Union[float, int] = 1.0
-	extrapolation_factor: float = 1.0
-	attn_factor: float = 1.0
-	beta_fast: int = 32
-	beta_slow: int = 1
+	def __init__(
+		self,
+		head_size: int,
+		rotary_dim: int,
+		max_position_embeddings: int,
+		base: int,
+		is_neox_style: bool,
+		dtype: jnp.dtype,
+		scaling_factor: Union[float, int] = 1.0,
+		extrapolation_factor: float = 1.0,
+		attn_factor: float = 1.0,
+		beta_fast: int = 32,
+		beta_slow: int = 1,
+	):
+		super().__init__(
+			head_size=head_size,
+			rotary_dim=rotary_dim,
+			max_position_embeddings=max_position_embeddings,
+			base=base,
+			is_neox_style=is_neox_style,
+			dtype=dtype,
+		)
+
+		self.scaling_factor = scaling_factor
+		self.extrapolation_factor = extrapolation_factor
+		self.attn_factor = attn_factor
+		self.beta_fast = beta_fast
+		self.beta_slow = beta_slow
 
 	# @flax.linen.jit
 	def __call__(
@@ -720,20 +706,35 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
 
 
 @rope_wraper("longrope")
-class Phi3LongRoPEScaledRotaryEmbedding(flax.linen.Module):
-	head_size: int
-	rotary_dim: int
-	max_position_embeddings: int
-	original_max_position_embeddings: int
-	base: int
-	is_neox_style: bool
-	dtype: jnp.dtype
-	short_factor: List[float]
-	long_factor: List[float]
-	short_mscale: Optional[float] = None
-	long_mscale: Optional[float] = None
+class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
+	def __init__(
+		self,
+		head_size: int,
+		rotary_dim: int,
+		max_position_embeddings: int,
+		original_max_position_embeddings: int,
+		base: int,
+		is_neox_style: bool,
+		dtype: jnp.dtype,
+		short_factor: List[float],
+		long_factor: List[float],
+		short_mscale: Optional[float] = None,
+		long_mscale: Optional[float] = None,
+	):
+		super().__init__()
 
-	# @flax.linen.jit
+		self.head_size = head_size
+		self.rotary_dim = rotary_dim
+		self.max_position_embeddings = max_position_embeddings
+		self.original_max_position_embeddings = original_max_position_embeddings
+		self.base = base
+		self.is_neox_style = is_neox_style
+		self.dtype = dtype
+		self.short_factor = short_factor
+		self.long_factor = long_factor
+		self.short_mscale = short_mscale
+		self.long_mscale = long_mscale
+
 	def __call__(
 		self,
 		positions: jnp.ndarray,
@@ -769,12 +770,33 @@ class Phi3LongRoPEScaledRotaryEmbedding(flax.linen.Module):
 
 @rope_wraper("llama3")
 class Llama3RotaryEmbedding(RotaryEmbedding):
-	scaling_factor: float
-	low_freq_factor: float
-	high_freq_factor: float
-	orig_max_position: int
+	def __init__(
+		self,
+		head_size: int,
+		rotary_dim: int,
+		max_position_embeddings: int,
+		base: int,
+		is_neox_style: bool,
+		dtype: jnp.dtype,
+		scaling_factor: float,
+		low_freq_factor: float,
+		high_freq_factor: float,
+		orig_max_position: int,
+	):
+		super().__init__(
+			head_size=head_size,
+			rotary_dim=rotary_dim,
+			max_position_embeddings=max_position_embeddings,
+			base=base,
+			is_neox_style=is_neox_style,
+			dtype=dtype,
+		)
 
-	# @flax.linen.jit
+		self.scaling_factor = scaling_factor
+		self.low_freq_factor = low_freq_factor
+		self.high_freq_factor = high_freq_factor
+		self.orig_max_position = orig_max_position
+
 	def __call__(
 		self,
 		positions: jnp.ndarray,
@@ -814,24 +836,39 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
 
 
 @rope_wraper("deepseek_yarn")
-class DeepseekScalingRotaryEmbedding(flax.linen.Module):
+class DeepseekScalingRotaryEmbedding(nn.Module):
 	"""RotaryEmbedding extended with YaRN method."""
 
-	head_size: int
-	rotary_dim: int
-	max_position_embeddings: int
-	base: int
-	is_neox_style: bool
-	dtype: jnp.dtype
-	scaling_factor: float
-	extrapolation_factor: float = 1
-	attn_factor: float = 1
-	beta_fast: int = 32
-	beta_slow: int = 1
-	mscale: float = 1
-	mscale_all_dim: float = 0
+	def __init__(
+		self,
+		head_size: int,
+		rotary_dim: int,
+		max_position_embeddings: int,
+		base: int,
+		is_neox_style: bool,
+		dtype: jnp.dtype,
+		scaling_factor: float,
+		extrapolation_factor: float = 1,
+		attn_factor: float = 1,
+		beta_fast: int = 32,
+		beta_slow: int = 1,
+		mscale: float = 1,
+		mscale_all_dim: float = 0,
+	):
+		self.head_size = head_size
+		self.rotary_dim = rotary_dim
+		self.max_position_embeddings = max_position_embeddings
+		self.base = base
+		self.is_neox_style = is_neox_style
+		self.dtype = dtype
+		self.scaling_factor = scaling_factor
+		self.extrapolation_factor = extrapolation_factor
+		self.attn_factor = attn_factor
+		self.beta_fast = beta_fast
+		self.beta_slow = beta_slow
+		self.mscale = mscale
+		self.mscale_all_dim = mscale_all_dim
 
-	# @flax.linen.jit
 	def __call__(
 		self,
 		positions: jnp.ndarray,
@@ -1027,6 +1064,17 @@ def get_rope(
 	return rotary_emb
 
 
+@partial(
+	jax.jit,
+	static_argnames=[
+		"head_size",
+		"rotary_dim",
+		"max_position",
+		"base", 
+		"rope_scaling", 
+		"partial_rotary_factor",
+	],
+)
 def get_frequencies(
 	head_size: int,
 	rotary_dim: int,

@@ -28,7 +28,7 @@ def main():
 
 	dtype = jnp.float16
 
-	model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		pretrained_model_name_or_path,
 		input_shape=input_shape,
 		auto_shard_params=True,
@@ -52,8 +52,7 @@ def main():
 	tokenizer.padding_side = "left"
 	tokenizer.pad_token_id = tokenizer.eos_token_id
 	inference = ed.vInference(
-		model=model,
-		params=params,
+		model=model, 
 		tokenizer=tokenizer,
 		generation_config=ed.vInferenceConfig(
 			max_new_tokens=1024,

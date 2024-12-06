@@ -291,8 +291,7 @@ class SampleState:
 	__str__ = __repr__
 
 
-def create_sampling_step(
-	model,
+def create_sampling_step( 
 	logits_processor: FlaxLogitsProcessorList,
 	logits_warper: FlaxLogitsProcessorList,
 	eos_token_id: jax.Array,
@@ -300,7 +299,7 @@ def create_sampling_step(
 	do_sample: bool = True,
 ):
 	@fjformer.core.implicit_compact
-	def sampling_step(params, state: SampleState):
+	def sampling_step(model, state: SampleState):
 		"""
 		Performs a single sampling step for text generation.
 
