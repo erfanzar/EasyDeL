@@ -24,6 +24,7 @@ from typing import (
 	Type,
 )
 
+import flax.nnx
 import flax.traverse_util
 from fjformer import make_shard_and_gather_fns, match_partition_rules
 from jax.sharding import PartitionSpec
@@ -174,7 +175,6 @@ class AutoShardAndGatherFunctions:
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
 		flatten: bool = True,
 		model_task: TaskType = TaskType.CAUSAL_LM,
-		input_shape: Tuple[int, int] = (1, 1),
 		depth_target: Optional[List[str]] = None,
 	):
 		"""
@@ -186,7 +186,6 @@ class AutoShardAndGatherFunctions:
 		      If None, uses the default partition rules from the `config`.
 		    flatten: Whether to flatten the shard and gather functions. Defaults to True.
 				model_task (TaskType): Task type of model load and find.
-				input_shape: The input shape of the model. Defaults to (1, 1).
 		    depth_target: Pad the sharding to depth, for example make {params:tensor} with depth_target = ["row"] to {row:{params:tensor}}. Defaults to None.
 
 		Returns:
@@ -195,7 +194,7 @@ class AutoShardAndGatherFunctions:
 		if partition_rules is None:
 			partition_rules = config.get_partition_rules(True)
 		_, module, _ = get_modules_by_type(config.model_type, model_task)
-		model = module(config=config, _do_init=False, input_shape=input_shape)
+		model = flax.nnx.eval_shape(lambda: module(config=config, rngs=flax.nnx.Rngs(0)))
 
 		partition_specs = match_partition_rules(partition_rules, model.params_shape_tree)
 		shard_fns, gather_fns = make_shard_and_gather_fns(
@@ -227,7 +226,6 @@ class AutoShardAndGatherFunctions:
 	def from_pretrained(
 		cls,
 		pretrained_model_name_or_path: str,
-		input_shape: Tuple[int, int] = (1, 1),
 		sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
 		sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
 		partition_axis: Optional[PartitionAxis] = None,
@@ -247,7 +245,6 @@ class AutoShardAndGatherFunctions:
 
 		Args:
 		    pretrained_model_name_or_path: The name or path of the pretrained model.
-		    input_shape: The input shape of the model. Defaults to (1, 1).
 		    sharding_axis_dims: The dimensions of the sharding axes. Defaults to (1, -1, 1, 1).
 		    sharding_axis_names: The names of the sharding axes. Defaults to ("dp", "fsdp", "tp", "sp").
 		    partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
@@ -285,7 +282,6 @@ class AutoShardAndGatherFunctions:
 			config=config,
 			partition_rules=partition_rules,
 			flatten=flatten,
-			input_shape=input_shape,
 			depth_target=depth_target,
 			model_task=model_task,
 		)

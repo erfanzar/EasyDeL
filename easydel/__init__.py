@@ -164,10 +164,9 @@ from easydel.modules.internlm2.modeling_internlm2_flax import (
 	InternLM2Config,
 )
 from easydel.modules.llama import (
-	FlaxLlamaForCausalLM,
-	FlaxLlamaForSequenceClassification,
-	FlaxLlamaModel,
-	FlaxVisionLlamaForCausalLM,
+	LlamaForCausalLM,
+	# LlamaForSequenceClassification,
+	LlamaModel,
 	LlamaConfig,
 	VisionLlamaConfig,
 )

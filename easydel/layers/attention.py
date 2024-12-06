@@ -23,7 +23,8 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import einops
 import fjformer
-import flax.linen as nn
+import flax.nnx as nn
+from flax.nnx.nn.dtypes import promote_dtype
 import jax
 import jax.experimental
 import jax.extend
@@ -32,7 +33,7 @@ import jax.tree_util
 import numpy
 from chex import Array
 from fjformer import with_sharding_constraint
-from flax.linen.dtypes import promote_dtype
+
 from jax import lax, random
 from jax import numpy as jnp
 from jax.experimental.pallas.ops.tpu.splash_attention import (
@@ -1026,9 +1027,7 @@ class FlexibleAttentionModule(object):
 				(b, qs, self.num_kv_heads, qh // self.num_kv_heads, d),
 			)
 			query_states, key_states, value_states = promote_dtype(
-				query_states,
-				key_states,
-				value_states,
+				(query_states, key_states, value_states),
 				dtype=self.dtype,
 			)
 
@@ -1684,7 +1683,6 @@ class FlaxAttentionModule(nn.Module):
 			args,
 		)
 
-	@nn.compact
 	def _concatenate_to_cache(self, query, key, value, attention_mask):
 		"""The _concatenate_to_cache function is used to concatenate the key and value vectors
 		of a query  with those of previous queries. This allows for the attention mechanism to
@@ -1862,33 +1860,41 @@ class FlaxAttentionModule(nn.Module):
 		"""
 		query_length = query.shape[1]
 		key_length = key.shape[1]
-		if causal_mask is not None:
-			if self.has_variable("cache", "cached_key"):
-				causal_mask = lax.dynamic_slice(
-					causal_mask,
-					(0, 0, self.variables["cache"]["cache_index"], 0),
-					(1, 1, query_length, self.variables["cache"]["cached_key"].shape[1]),
-				)
-			else:
-				causal_mask = causal_mask[:, :, :query_length, :key_length]
-			causal_mask = jnp.broadcast_to(
-				causal_mask, (query.shape[0],) + causal_mask.shape[1:]
-			)
-			if attention_mask.ndim == 2:
-				attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-			attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
-			attention_mask = nn.combine_masks(attention_mask, causal_mask, fcm_mask)
-		else:
+		# if causal_mask is not None:
+		# 	if self.has_variable("cache", "cached_key"):
+		# 		causal_mask = lax.dynamic_slice(
+		# 			causal_mask,
+		# 			(0, 0, self.variables["cache"]["cache_index"], 0),
+		# 			(1, 1, query_length, self.variables["cache"]["cached_key"].shape[1]),
+		# 		)
+		# 	else:
+		# 		causal_mask = causal_mask[:, :, :query_length, :key_length]
+		# 	causal_mask = jnp.broadcast_to(
+		# 		causal_mask, (query.shape[0],) + causal_mask.shape[1:]
+		# 	)
+		# 	if attention_mask.ndim == 2:
+		# 		attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+		# 	attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
+		# 	attention_mask = nn.combine_masks(attention_mask, causal_mask, fcm_mask)
+		# else:
+		# 	attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+
+		# if self.has_variable("cache", "cached_key") or init_cache:
+		# 	key, value, attention_mask = self._concatenate_to_cache(
+		# 		query=query,
+		# 		key=key,
+		# 		value=value,
+		# 		attention_mask=attention_mask,
+		# 	)
+
+		causal_mask = causal_mask[:, :, :query_length, :key_length]
+		causal_mask = jnp.broadcast_to(
+			causal_mask, (query.shape[0],) + causal_mask.shape[1:]
+		)
+		if attention_mask.ndim == 2:
 			attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-
-		if self.has_variable("cache", "cached_key") or init_cache:
-			key, value, attention_mask = self._concatenate_to_cache(
-				query=query,
-				key=key,
-				value=value,
-				attention_mask=attention_mask,
-			)
-
+		attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
+		attention_mask = nn.combine_masks(attention_mask, causal_mask, fcm_mask)
 		attention_bias = lax.select(
 			attention_mask > 0,
 			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
