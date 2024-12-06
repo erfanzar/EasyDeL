@@ -318,9 +318,7 @@ def recreate_meta_values(values: dict) -> dict:
 			values[key].value = _state_rngs
 			_state_rngs = jax.random.split(_state_rngs)[0]
 		else:
-			print(value)
-			print(hasattr(value, "recreator"))
-			print(hasattr(value.type, "recreator"))
+			
 			raise AttributeError(
 				f"Unexcepted type({value.type}) found which cannot be redefined."
 			)

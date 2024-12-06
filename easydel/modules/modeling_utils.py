@@ -34,7 +34,7 @@ from typing import (
 	TypeVar,
 	Union,
 )
-
+from easydel.utils.compiling_utils import hash_fn
 import chex
 import fjformer
 import fjformer.sharding
@@ -53,6 +53,7 @@ from jax.sharding import Mesh, PartitionSpec
 from transformers.configuration_utils import PretrainedConfig
 from transformers.generation.flax_utils import FlaxSampleOutput
 from transformers.utils.generic import working_or_temp_dir
+from jax.extend import linear_util as lu
 from flax import nnx as nn
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.etils import (
@@ -809,7 +810,11 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
 		if rotary_dim is None:
 			rotary_dim = head_size
-		initial_rope_kwargs = dict(rope_type="default")
+
+		class rope_scaling(dict):
+			__hash__ = hash_fn
+
+		initial_rope_kwargs = rope_scaling(rope_type="default")
 		if getattr(self, "rope_scaling", None) is not None:
 			scaling_type = self.rope_scaling.get("rope_type", None)
 			scaling_type = self.rope_scaling.get("type", scaling_type)
@@ -823,7 +828,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			short_factor = self.rope_scaling.get("short_factor", None)
 			long_mscale = self.rope_scaling.get("long_mscale", None)
 			short_mscale = self.rope_scaling.get("short_mscale", None)
-			initial_rope_kwargs = dict(
+			initial_rope_kwargs = rope_scaling(
 				rope_type=scaling_type,
 				factor=scaling_factor,
 				low_freq_factor=low_freq_factor,
@@ -857,8 +862,12 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			head_size = self.head_dim  # last point
 		if rotary_dim is None:
 			rotary_dim = head_size
-		initial_rope_kwargs = dict(rope_type="default")
-		initial_rope_kwargs = dict(rope_type="default")
+
+		class rope_scaling(dict):
+			__hash__ = hash_fn
+
+		initial_rope_kwargs = rope_scaling(rope_type="default")
+		
 		if getattr(self, "rope_scaling", None) is not None:
 			scaling_type = self.rope_scaling.get("rope_type", None)
 			scaling_type = self.rope_scaling.get("type", scaling_type)
@@ -872,7 +881,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			short_factor = self.rope_scaling.get("short_factor", None)
 			long_mscale = self.rope_scaling.get("long_mscale", None)
 			short_mscale = self.rope_scaling.get("short_mscale", None)
-			initial_rope_kwargs = dict(
+			initial_rope_kwargs = rope_scaling(
 				rope_type=scaling_type,
 				factor=scaling_factor,
 				low_freq_factor=low_freq_factor,
@@ -1011,19 +1020,15 @@ class EasyDeLBaseModule(nn.Module):
 		def init_fn():
 			input_ids = jnp.ones((batch_size, max_length), dtype=jnp.int32)
 			attention_mask = jnp.ones_like(input_ids)
-			position_ids = jnp.broadcast_to(
-				jnp.arange(jnp.atleast_2d(input_ids).shape[-1]),
-				input_ids.shape,
-			)
-			init_variables = self.module.init(
-				jax.random.PRNGKey(0),
-				input_ids,
-				attention_mask,
-				position_ids,
+			position_ids = attention_mask.cumsum(-1)
+			self(
+				input_ids=input_ids,
+				attention_mask=attention_mask,
+				position_ids=position_ids,
 				return_dict=False,
 				init_cache=True,
 			)
-			return init_variables["cache"]
+			return nn.split(self, nn.Cache, ...)[1]
 
 		return jax.tree_map(
 			lambda x: jnp.zeros(x.shape, x.dtype, device=getattr(x, "sharding", None)),
@@ -1051,6 +1056,7 @@ class EasyDeLBaseModule(nn.Module):
 		"""
 		batch_size, seq_length = input_ids.shape
 		past_key_values = self.init_cache(batch_size, max_length)
+		print(past_key_values)
 		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
 		if attention_mask is not None:
 			position_ids = attention_mask.cumsum(axis=-1) - 1

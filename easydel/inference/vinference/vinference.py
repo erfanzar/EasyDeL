@@ -36,7 +36,7 @@ from jax import random as jrand
 from jax.sharding import NamedSharding, PartitionSpec
 from pydantic import BaseModel
 from transformers import PreTrainedTokenizer
-
+from flax import nnx as nn
 from easydel.etils.etils import get_logger
 from easydel.inference.utils import (
 	SampleState,
@@ -46,7 +46,6 @@ from easydel.inference.utils import (
 from easydel.inference.vinference.metrics import vInferenceMetrics
 from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.utils.compiling_utils import (
-	load_compiled_fn,
 	save_compiled_fn,
 	smart_compile,
 )
@@ -70,13 +69,13 @@ def measure_flops(func, *args, **kwargs):
 @partial(
 	jax.jit,
 	static_argnames=[
-		"model",
+		"graphdef",
 		"generation_config",
 	],
 )
 def _compiled_generate(
-	model: EasyDeLBaseModule,
-	params: dict,
+	graphdef: EasyDeLBaseModule,
+	graphstate: dict,
 	input_ids: jax.Array,
 	attention_mask: jax.Array,
 	position_ids: jax.Array,
@@ -86,15 +85,16 @@ def _compiled_generate(
 	"""
 	Compiled function for performing the initial generation step.
 
-	This function takes the model, parameters, input IDs, attention mask, position IDs,
+	This function takes the graphdef, parameters, input IDs, attention mask, position IDs,
 	generation configuration, and a random number generator key as input. It initializes
 	the generation state and performs the first sampling step.
 
 	Returns:
 		SampleState: The initial generation state after the first sampling step.
 	"""
-	partition_axes = model.config.partition_axis
-	mesh = model.config.mesh
+	model = nn.merge(graphdef, graphstate)
+	partition_axes = graphdef.config.partition_axis
+	mesh = graphdef.config.mesh
 
 	generation_spec = PartitionSpec(
 		partition_axes.batch_axis,
@@ -147,26 +147,25 @@ def _compiled_generate(
 	with mesh:
 		if input_ids.shape[-1] > 1:
 			state = create_sampling_step(
-				model=model,
 				eos_token_id=eos_token_id,
 				pad_token_id=pad_token_id,
 				logits_processor=generation_config.get_logits_processor(),
 				logits_warper=generation_config.get_logits_processor(),
 				do_sample=generation_config.do_sample,
-			)(params=params, state=state)
+			)(model, state)
 	return state
 
 
 @partial(
 	jax.jit,
 	static_argnames=[
-		"model",
+		"graphdef",
 		"generation_config",
 	],
 )
 def _compiled_interval_generate(
-	model: EasyDeLBaseModule,
-	params: dict,
+	graphdef: EasyDeLBaseModule,
+	graphstate: dict,
 	state: SampleState,
 	generation_config: vInferenceConfig,
 	loop_max_tokens: int,
@@ -174,13 +173,15 @@ def _compiled_interval_generate(
 	"""
 	Compiled function for performing interval generation steps.
 
-	This function takes the model, parameters, current generation state, generation
+	This function takes the graphdef, parameters, current generation state, generation
 	configuration, maximum number of tokens for the loop, and the starting length as input.
 	It continues the generation process until the termination condition is met.
 
 	Returns:
 		SampleState: The updated generation state after the interval generation steps.
 	"""
+
+	model = nn.merge(graphdef, graphstate)
 	mesh = model.config.mesh
 	tlen = state.current_length + loop_max_tokens
 
@@ -193,7 +194,6 @@ def _compiled_interval_generate(
 		return ~jnp.logical_or(all_sequence_finished, state.current_length >= tlen)
 
 	sampling_step = create_sampling_step(
-		model=model,
 		eos_token_id=eos_token_id,
 		pad_token_id=pad_token_id,
 		logits_processor=generation_config.get_logits_processor(),
@@ -203,7 +203,7 @@ def _compiled_interval_generate(
 	with mesh:
 
 		def interval_sample(state):
-			return sampling_step(params=params, state=state)
+			return sampling_step(model=model, state=state)
 
 		state = jax.lax.while_loop(cond_fn, body_fun=interval_sample, init_val=state)
 	return state
@@ -268,7 +268,7 @@ class vInferenceMetaData(BaseModel):
 
 class vInference:
 	"""
-	Class for performing text generation using a pre-trained language model in EasyDeL.
+	Class for performing text generation using a pre-trained language graphdef in EasyDeL.
 
 	This class handles the generation process, including initialization, precompilation,
 	and generating text in streaming chunks.
@@ -277,7 +277,6 @@ class vInference:
 	def __init__(
 		self,
 		model: EasyDeLBaseModule,
-		params: Union[flax.core.FrozenDict, dict],
 		tokenizer: PreTrainedTokenizer,
 		generation_config: Optional[vInferenceConfig] = None,
 		seed: Optional[int] = None,
@@ -290,7 +289,6 @@ class vInference:
 
 		Args:
 			model: The pre-trained language model.
-			params: The model parameters.
 			tokenizer: The tokenizer for the model.
 			generation_config: The generation configuration.
 			seed: The random seed for generation.
@@ -298,22 +296,23 @@ class vInference:
 			max_new_tokens: The maximum number of new tokens to generate.
 		"""
 		# fmt:off
-		self.model = model
-		self.params = self._validate_params(params) 
+		graphdef, graphstate = nn.split(model)
+		self.graphdef = graphdef 
+		self.graphstate = graphstate 
 		self.tokenizer = tokenizer
 		self.generation_config = self._init_generation_config(generation_config, max_new_tokens)
 		if seed is None:
 			seed = random.randint(0, 1e6)
 		self._rng_generator = GenerateRNG(seed)
 		self.input_partition_spec = input_partition_spec or PartitionSpec(("dp", "fsdp"))
-		self.mesh = self.model.config.mesh
+		self.mesh = self.graphdef.config.mesh
 		self._precompile_lock = asyncio.Lock()
 		self._precompiled_configs = set()
 		self._in_compiling_process = set()
 		self._init_shardings()
 		self._validate_token_ids()
 		self._uuid4 = uuid4().hex 
-		self._inference_name = inference_name or self._generate_inference_name(model)
+		self._inference_name = inference_name or self._generate_inference_name(graphdef)
 		self.metrics = vInferenceMetrics(self._inference_name)
 		# fmt:on
 
@@ -325,36 +324,36 @@ class vInference:
 	def _logits_processor(self):
 		return self.generation_config.get_logits_processor()
 
-	def _generate_inference_name(self, model) -> str:
+	def _generate_inference_name(self, graphdef) -> str:
 		"""
-		Generate a standardized inference name combining model type, size, and timestamp.
+		Generate a standardized inference name combining graphdef type, size, and timestamp.
 
 		Format: {model_type}-{size_in_B}B-{timestamp}
 		Example: llama-7.00B-20240311
 		"""
-		model_type = self._get_model_type(model)
-		model_size = self._calculate_model_size(self.params)
+		model_type = self._get_model_type(graphdef)
+		model_size = "NaN"
 		timestamp = datetime.now().strftime("%Y%m%d")
 
 		return f"{model_type}-{model_size}B-{timestamp}"
 
-	def _get_model_type(self, model) -> str:
-		"""Get the model type, with fallback to 'unknown' if not found."""
-		return getattr(model.config, "model_type", "unknown").lower()
+	def _get_model_type(self, graphdef) -> str:
+		"""Get the graphdef type, with fallback to 'unknown' if not found."""
+		return getattr(graphdef.config, "model_type", "unknown").lower()
 
-	def _calculate_model_size(self, params) -> str:
+	def _calculate_model_size(self, graphstate) -> str:
 		"""
-		Calculate model size in billions of parameters.
+		Calculate graphdef size in billions of parameters.
 		Returns formatted string with 2 decimal places.
 		"""
 		try:
 			num_params = sum(
-				n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(params))[0]
+				n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(graphstate))[0]
 			)
 			size_in_billions = num_params / 1e9
 			return f"{size_in_billions:.2f}"
 		except Exception as e:
-			logger.warning(f"Failed to calculate model size: {e}")
+			logger.warning(f"Failed to calculate graphdef size: {e}")
 			return "unknown"
 
 	@property
@@ -365,7 +364,7 @@ class vInference:
 	def model_prefill_length(self) -> int:
 		"""
 		Calculate the maximum length available for input prefill by subtracting
-		the maximum new tokens from the model's maximum sequence length.
+		the maximum new tokens from the graphdef's maximum sequence length.
 
 		Returns:
 				int: The maximum length available for input prefill
@@ -383,7 +382,7 @@ class vInference:
 
 		if max_length is None:
 			raise ValueError(
-				"Could not determine model's maximum sequence length. "
+				"Could not determine graphdef's maximum sequence length. "
 				f"Looked for attributes: {', '.join(possible_length_attributes)}"
 			)
 
@@ -400,31 +399,10 @@ class vInference:
 				Optional[int]: The maximum length if found, None otherwise
 		"""
 		for attr in attributes:
-			max_length = getattr(self.model.config, attr, None)
+			max_length = getattr(self.graphdef.config, attr, None)
 			if max_length is not None:
 				return max_length
 		return None
-
-	def _validate_params(
-		self, params: Union[flax.core.FrozenDict, dict]
-	) -> Union[flax.core.FrozenDict, dict]:
-		"""
-		Validates the format of the model parameters.
-
-		Args:
-			params: The model parameters.
-
-		Returns:
-			Union[flax.core.FrozenDict, dict]: The validated model parameters.
-		"""
-		if "params" in params:
-			warnings.warn(
-				"`params` field should be like {k:v} not {'params':{k:v}}",
-				DeprecationWarning,
-				stacklevel=2,
-			)
-			return params["params"]
-		return params
 
 	def _init_generation_config(
 		self, generation_config: Optional[vInferenceConfig], max_new_tokens: int
@@ -440,15 +418,16 @@ class vInference:
 			vInferenceConfig: The initialized generation configuration.
 		"""
 		if generation_config is None:
-			if self.model.generation_config is not None:
+			if self.graphdef.generation_config is not None:
 				return vInferenceConfig(
-					bos_token_id=self.model.generation_config.bos_token_id,
-					eos_token_id=self.model.generation_config.eos_token_id,
-					pad_token_id=self.model.generation_config.pad_token_id,
-					top_k=self.model.generation_config.top_k,
-					top_p=self.model.generation_config.top_p,
-					temperature=self.model.generation_config.temperature,
-					max_new_tokens=self.model.generation_config.max_new_tokens or max_new_tokens,
+					bos_token_id=self.graphdef.generation_config.bos_token_id,
+					eos_token_id=self.graphdef.generation_config.eos_token_id,
+					pad_token_id=self.graphdef.generation_config.pad_token_id,
+					top_k=self.graphdef.generation_config.top_k,
+					top_p=self.graphdef.generation_config.top_p,
+					temperature=self.graphdef.generation_config.temperature,
+					max_new_tokens=self.graphdef.generation_config.max_new_tokens
+					or max_new_tokens,
 				)
 			return vInferenceConfig(max_new_tokens=max_new_tokens)
 		return generation_config
@@ -459,15 +438,15 @@ class vInference:
 		"""
 		self.input_sharding = NamedSharding(
 			spec=self.input_partition_spec,
-			mesh=self.model.mesh,
+			mesh=self.graphdef.mesh,
 		)
 		self.empty_sharding = NamedSharding(
 			spec=PartitionSpec(),
-			mesh=self.model.mesh,
+			mesh=self.graphdef.mesh,
 		)
 		self.gen_input_sharding = NamedSharding(
 			spec=PartitionSpec(self.input_partition_spec[0], None),
-			mesh=self.model.mesh,
+			mesh=self.graphdef.mesh,
 		)
 
 	def _validate_token_ids(self):
@@ -542,7 +521,7 @@ class vInference:
 			).time():
 				state, flop, generate_func_flops, generate_func_elapsed_time = measure_flops(
 					generate_func,
-					params=self.params,
+					graphstate=self.graphstate,
 					input_ids=input_ids,
 					attention_mask=attention_mask,
 					position_ids=position_ids,
@@ -557,7 +536,7 @@ class vInference:
 						state, flop, interval_func_flops, interval_func_elapsed_time = (
 							measure_flops(
 								interval_func,
-								params=self.params,
+								graphstate=self.graphstate,
 								state=state,
 								loop_max_tokens=self.generation_config.streaming_chunks,
 							)
@@ -611,8 +590,8 @@ class vInference:
 
 			compiled_generate_func = smart_compile(
 				_compiled_generate.lower(
-					model=self.model,
-					params=self.params,
+					graphdef=self.graphdef,
+					graphstate=self.graphstate,
 					input_ids=input_ids,
 					attention_mask=attention_mask,
 					position_ids=position_ids,
@@ -622,7 +601,7 @@ class vInference:
 				tag="vinference",
 			)
 			state = compiled_generate_func(
-				params=self.params,
+				graphstate=self.graphstate,
 				input_ids=input_ids,
 				attention_mask=attention_mask,
 				position_ids=position_ids,
@@ -633,8 +612,8 @@ class vInference:
 			)
 			compiled_interval_func = smart_compile(
 				_compiled_interval_generate.lower(
-					model=self.model,
-					params=self.params,
+					graphdef=self.graphdef,
+					graphstate=self.graphstate,
 					state=state,
 					generation_config=self.generation_config,
 					loop_max_tokens=self.generation_config.streaming_chunks,
@@ -743,41 +722,41 @@ class vInference:
 
 		metadata = pickle.dump(metadata, open(path / "config", "wb"))
 
-	@classmethod
-	def load_inference(
-		cls,
-		path: Union[os.PathLike, str],
-		model: EasyDeLBaseModule,
-		params: Union[flax.core.FrozenDict, dict],
-		tokenizer: PreTrainedTokenizer,
-	):
-		path = pathlib.Path(path)
-		assert path.exists(), "provided path to vInference doesn't exists."
-		metadata = pickle.load(open(path / "config", "rb"))
-		for config_key in metadata.precompiled_configs:
-			batch_size, input_tokens_length = config_key
-			compiled_generation_fn = load_compiled_fn(
-				path=path,
-				prefix=f"cgf-{metadata.uuid4}-{batch_size}-{input_tokens_length}",
-			)
-			compiled_interval_fn = load_compiled_fn(
-				path=path,
-				prefix=f"cif-{metadata.uuid4}-{batch_size}-{input_tokens_length}",
-			)
-			put_compiled_funcs(
-				compiled_generate_func=compiled_generation_fn,
-				compiled_interval_func=compiled_interval_fn,
-				batch_size=batch_size,
-				input_tokens_length=input_tokens_length,
-				id=metadata.uuid4,
-			)
-		self = cls(
-			model=model,
-			params=params,
-			tokenizer=tokenizer,
-			generation_config=metadata.generation_config,
-			input_partition_spec=metadata.input_partition_spec,
-			inference_name=metadata.inference_name,
-		)
-		self._uuid4 = metadata.uuid4
-		return self
+	# @classmethod
+	# def load_inference(
+	# 	cls,
+	# 	path: Union[os.PathLike, str],
+	# 	model: EasyDeLBaseModule,
+	# 	params: Union[flax.core.FrozenDict, dict],
+	# 	tokenizer: PreTrainedTokenizer,
+	# ):
+	# 	path = pathlib.Path(path)
+	# 	assert path.exists(), "provided path to vInference doesn't exists."
+	# 	metadata = pickle.load(open(path / "config", "rb"))
+	# 	for config_key in metadata.precompiled_configs:
+	# 		batch_size, input_tokens_length = config_key
+	# 		compiled_generation_fn = load_compiled_fn(
+	# 			path=path,
+	# 			prefix=f"cgf-{metadata.uuid4}-{batch_size}-{input_tokens_length}",
+	# 		)
+	# 		compiled_interval_fn = load_compiled_fn(
+	# 			path=path,
+	# 			prefix=f"cif-{metadata.uuid4}-{batch_size}-{input_tokens_length}",
+	# 		)
+	# 		put_compiled_funcs(
+	# 			compiled_generate_func=compiled_generation_fn,
+	# 			compiled_interval_func=compiled_interval_fn,
+	# 			batch_size=batch_size,
+	# 			input_tokens_length=input_tokens_length,
+	# 			id=metadata.uuid4,
+	# 		)
+	# 	self = cls(
+	# 		model=model,
+	# 		params=params,
+	# 		tokenizer=tokenizer,
+	# 		generation_config=metadata.generation_config,
+	# 		input_partition_spec=metadata.input_partition_spec,
+	# 		inference_name=metadata.inference_name,
+	# 	)
+	# 	self._uuid4 = metadata.uuid4
+	# 	return self

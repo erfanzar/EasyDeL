@@ -117,7 +117,7 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 		safe: bool = True,
 		from_torch: Optional[bool] = None,
 		**kwargs,
-	) -> Tuple[EasyDeLBaseModule, dict]:
+	) -> EasyDeLBaseModule:
 		"""Loads and shards a pretrained causal language model from the Hugging Face Hub and converts it into an
 		EasyDeL compatible model.
 
@@ -373,7 +373,7 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 				f"{sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(params))[0]) / 1e9}"
 				f" Billion Parameters"
 			)
-			
+
 		return traversals.attech_tree_to_nnx_model(model=ed_model, tree=params)
 
 

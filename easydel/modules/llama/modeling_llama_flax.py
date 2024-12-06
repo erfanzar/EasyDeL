@@ -65,6 +65,7 @@ class LlamaAttention(FlaxAttentionModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		super().__init__(config=config)
 		self.config = config
 		self.dtype = dtype
 		self.param_dtype = param_dtype
@@ -511,9 +512,6 @@ class LlamaModel(EasyDeLBaseModule):
 
 	@cached_property
 	def causal_mask(self):
-		# print(self.config.granted_mask_max_position_embedding)
-		# print(self.config.mask_max_position_embeddings)
-		# print(self.config.max_position_embeddings)
 		return self.config.get_basic_causal_mask()
 
 	@cached_property
@@ -575,12 +573,12 @@ class LlamaModel(EasyDeLBaseModule):
 				hidden_states=hidden_states,
 				attention_mask=attention_mask,
 				position_ids=position_ids,
-				causal_mask=self.causal_mask,
+				causal_mask=self.config.get_basic_causal_mask(),
 				deterministic=deterministic,
 				init_cache=init_cache,
 				output_attentions=output_attentions,
 				segment_ids=segment_ids,
-				frequencies=self.frequencies,
+				frequencies=self.config.get_basic_frequencies(),
 			)
 			hidden_states = layer_outputs[0]
 
