@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import cached_property
 import inspect
 import os
 import re
@@ -37,25 +38,22 @@ from typing import (
 import chex
 import fjformer
 import fjformer.sharding
-import flax
-import flax.linen
 import jax
 import jax.extend
 import jax.tree_util
 from fjformer.checkpoint import CheckpointManager
 from fjformer.dtypes import Array8Bit
 from fjformer.sharding import match_partition_rules
-from flax.core import FrozenDict, freeze, unfreeze
+from flax.core import FrozenDict, unfreeze
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax import numpy as jnp
 from jax.experimental.mesh_utils import create_device_mesh
 from jax.sharding import Mesh, PartitionSpec
-from transformers import FlaxPreTrainedModel
 from transformers.configuration_utils import PretrainedConfig
 from transformers.generation.flax_utils import FlaxSampleOutput
 from transformers.utils.generic import working_or_temp_dir
-
+from flax import nnx as nn
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.etils import (
 	AVAILABLE_ATTENTION_MECHANISMS,
@@ -118,7 +116,7 @@ def set_attrs_smartly(self, attr_name: str, default: Any, new_attr: Any):
 		setattr(self, attr_name, new_attr)
 
 
-M = TypeVar("M", bound=flax.linen.Module)
+M = TypeVar("M", bound=nn.Module)
 
 
 @dataclass
@@ -170,6 +168,8 @@ class EasyDeLBaseConfigDict(TypedDict, total=False):
 	pallas_m_block_size: int
 	pallas_k_block_size: int
 	pallas_n_block_size: int
+	mask_max_position_embeddings: int
+	freq_max_position_embeddings: int
 
 
 class EasyDeLBaseConfig(PretrainedConfig):
@@ -892,63 +892,27 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			rope_scaling=initial_rope_kwargs,
 		)
 
+	def get_basic_causal_mask(self, dtype="bool"):
+		return nn.make_causal_mask(
+			jnp.ones(
+				shape=(1, self.granted_mask_max_position_embedding),
+				dtype=dtype,
+			),
+			dtype=dtype,
+		)
+
 
 EasyDeLBaseConfigDict.__doc__ = EasyDeLBaseConfig.__init__.__doc__
 EasyDeLBaseConfigDict.__annotations__ = EasyDeLBaseConfig.__annotations__
 
 
-class EasyDeLBaseModule(FlaxPreTrainedModel):
+class EasyDeLBaseModule(nn.Module):
 	config_class: EasyDeLBaseConfig
 	base_model_prefix: str
-	flax_module: Type[M]
-	module_class: Union[flax.linen.Module, Type[M]] = None
 	_model_task: Optional[str] = None
 	_model_type: Optional[str] = None
 
-	def __init__(
-		self,
-		config: EasyDeLBaseConfig,
-		dtype: jnp.dtype = jnp.float32,
-		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[jax.lax.Precision] = None,
-		input_shape: Tuple[int, int] = (AVAILALBE_DEVICES, AVAILALBE_DEVICES),
-		seed: int = 0,
-		_do_init: bool = False,
-		**kwargs,
-	):
-		"""
-		Initializes the pre-trained model with the given configuration.
-
-		Args:
-		    config (LlamaConfig): Configuration for the model.
-		    dtype (jnp.dtype): Data type for computations.
-		    param_dtype (jnp.dtype): Data type for model parameters.
-		    precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
-		    input_shape (Tuple[int, int]): Shape of the input tensor.
-		    seed (int): Seed for random number generation.
-		    _do_init (bool): If True, initialize model weights.
-		    **kwargs: Additional keyword arguments.
-		"""
-		module = self.module_class(
-			config=config,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			precision=precision,
-			**kwargs,
-		)
-		self.param_dtype = param_dtype
-		self.precision = precision
-
-		super().__init__(
-			config=config,
-			module=module,
-			input_shape=input_shape,
-			seed=seed,
-			dtype=dtype,
-			_do_init=_do_init,
-		)
-
-	@property
+	@cached_property
 	def mesh(self):
 		return self.config.mesh
 
@@ -1065,66 +1029,6 @@ class EasyDeLBaseModule(FlaxPreTrainedModel):
 			lambda x: jnp.zeros(x.shape, x.dtype, device=getattr(x, "sharding", None)),
 			jax.eval_shape(init_fn),
 		)
-
-	def init_weights(
-		self,
-		rng: jax.random.PRNGKey,
-		input_shape: Optional[Tuple] = None,
-		params: FrozenDict = None,
-	) -> FrozenDict:
-		"""
-		Initializes the model weights.
-
-		Args:
-		    rng (jax.random.PRNGKey): Random number generator key.
-		    input_shape (Tuple): Shape of the input tensor for initializing weights.
-		    params (FrozenDict, optional): Existing parameters to initialize with.
-
-		Returns:
-		    FrozenDict: Initialized model parameters.
-		"""
-		if input_shape is None:
-			input_shape = (jax.device_count(), jax.device_count())
-		input_ids = jnp.zeros(input_shape, dtype="i4")
-		attention_mask = jnp.ones_like(input_ids)
-		position_ids = jnp.broadcast_to(
-			jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_shape
-		)
-		params_rng, dropout_rng = jax.random.split(rng)
-		rngs = {"params": params_rng, "dropout": dropout_rng}
-
-		if self.config.add_cross_attention:
-			encoder_hidden_states = jnp.zeros(input_shape + (self.config.hidden_size,))
-			encoder_attention_mask = attention_mask
-			module_init_outputs = self.module.init(
-				rngs,
-				input_ids=input_ids,
-				attention_mask=attention_mask,
-				position_ids=position_ids,
-				encoder_hidden_states=encoder_hidden_states,
-				encoder_attention_mask=encoder_attention_mask,
-				return_dict=False,
-			)
-		else:
-			module_init_outputs = self.module.init(
-				rngs,
-				input_ids=input_ids,
-				attention_mask=attention_mask,
-				position_ids=position_ids,
-				return_dict=False,
-			)
-
-		random_params = module_init_outputs["params"]
-
-		if params is not None:
-			random_params = flatten_dict(unfreeze(random_params))
-			params = flatten_dict(unfreeze(params))
-			for missing_key in self._missing_keys:
-				params[missing_key] = random_params[missing_key]
-			self._missing_keys = set()
-			return flax.core.freeze(unflatten_dict(params))
-		else:
-			return random_params
 
 	def prepare_inputs_for_generation(
 		self,
@@ -1387,13 +1291,9 @@ class EasyDeLBaseModule(FlaxPreTrainedModel):
 		"""
 		return self.__repr__()
 
-	@property
-	def config(self) -> EasyDeLBaseConfig:
-		return self._config  # type:ignore
-
 	def to_easydel_state(
 		self,
-		params: flax.core.FrozenDict,
+		params: FrozenDict,
 		auto_check_params: bool = True,
 	):
 		"""
@@ -1401,9 +1301,7 @@ class EasyDeLBaseModule(FlaxPreTrainedModel):
 		"""
 		if auto_check_params:
 			gp = params.get("params", None)
-			params = flax.core.FrozenDict(
-				{"params": params} if gp is None else {"params": gp}
-			)
+			params = FrozenDict({"params": params} if gp is None else {"params": gp})
 		return EasyDeLState.load(
 			apply_fn=self.__call__,
 			params=params,
@@ -1638,7 +1536,6 @@ class EasyDeLBaseModule(FlaxPreTrainedModel):
 		param_dtype: jnp.dtype = jnp.float32,
 		safe: bool = True,
 		precision: jax.lax.PrecisionLike = jax.lax.Precision("fastest"),  # noqa
-		input_shape: Optional[Tuple[int, int]] = None,
 		config_kwargs: Optional[dict[str, Any]] = None,
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
 		quantization_method: Optional[EasyDeLQuantizationMethods] = None,
@@ -1695,9 +1592,6 @@ class EasyDeLBaseModule(FlaxPreTrainedModel):
 			logger.info("Offline mode: forcing local_files_only=True")
 			local_files_only = True
 
-		if input_shape is None:
-			cl_di = len(jax.devices())
-			input_shape = (cl_di, cl_di)  # safest way to perform loading ...
 		config_path = config if config is not None else pretrained_model_name_or_path
 		from easydel.modules.auto_configuration import (
 			AutoEasyDeLConfig,
@@ -1724,7 +1618,6 @@ class EasyDeLBaseModule(FlaxPreTrainedModel):
 		if auto_shard_params and shard_fns is None:
 			shard_fns, _ = AutoShardAndGatherFunctions.from_config(
 				config=config,
-				input_shape=input_shape,
 				flatten=False,
 				partition_rules=partition_rules,
 			)
@@ -1803,8 +1696,7 @@ class EasyDeLBaseModule(FlaxPreTrainedModel):
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
-			input_shape=input_shape,
-			_do_init=False,
+			rngs=nn.Rngs(0),
 		)
 		if bit_targeted_params is None:
 			params_pattern_selection = re.compile(DEFAULT_QUANTIZATION_PATTERN)
@@ -2056,49 +1948,6 @@ class EasyDeLBaseVisionModule(EasyDeLBaseModule):
 			init_cache=True,
 		)
 		return init_variables["cache"]
-
-	def init_weights(
-		self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
-	) -> FrozenDict:
-		"""The init_weights function is used to initialize the weights of a model.
-
-		Args:
-		    self: Access variables that belong to the class
-		    rng: jax.random.PRNGKey: Initialize the weights of the model
-		    input_shape: Tuple: Specify the shape of the input tensor
-		    params: FrozenDict: Pass in the parameters of a pre-trained
-		        model
-
-		Returns:
-		    A frozendict of parameters
-		"""
-		input_ids = jnp.zeros(input_shape, dtype="i4")
-		attention_mask = jnp.ones_like(input_ids)
-		vision_mask = jnp.ones(input_ids.shape, dtype=bool)
-		position_ids = jnp.broadcast_to(
-			jnp.arange(jnp.atleast_2d(input_ids).shape[-1]),
-			input_shape,
-		)
-		params_rng, dropout_rng = jax.random.split(rng)
-
-		random_params = self.module.init(
-			{"params": params_rng, "dropout": dropout_rng},
-			input_ids=input_ids,
-			vision_mask=vision_mask,
-			attention_mask=attention_mask,
-			position_ids=position_ids,
-			return_dict=False,
-		)["params"]
-
-		if params is not None:
-			random_params = flatten_dict(unfreeze(random_params))
-			params = flatten_dict(unfreeze(params))
-			for missing_key in self._missing_keys:
-				params[missing_key] = random_params[missing_key]
-			self._missing_keys = set()
-			return freeze(unflatten_dict(params))
-		else:
-			return random_params
 
 	def __call__(
 		self,
@@ -2532,13 +2381,11 @@ def wrap_easydel_module(
 		class_dict = {
 			"config_class": config_class,
 			"base_model_prefix": base_model_prefix,
-			"module_class": mdl,
-			"flax_module": mdl,
 			"__annotations__": {
 				"config_class": Type[EasyDeLBaseConfig],
 				"base_model_prefix": str,
 				"flax_module": Type[M],
-				"module_class": Union[flax.linen.Module, Type[M]],
+				"module_class": Union[nn.Module, Type[M]],
 			},
 		}
 
@@ -2571,7 +2418,7 @@ def wrap_custom_easydel_module(
 				"config_class": Type[EasyDeLBaseConfig],
 				"base_model_prefix": str,
 				"flax_module": Type[M],
-				"module_class": Union[flax.linen.Module, Type[M]],
+				"module_class": Union[nn.Module, Type[M]],
 			},
 		}
 

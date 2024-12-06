@@ -27,7 +27,9 @@ from tqdm.autonotebook import tqdm
 from easydel.etils.etils import EasyDeLPlatforms, EasyDeLQuantizationMethods, get_logger
 from easydel.transform.utils import jax2pt
 from easydel.utils.quantizers import EasyQuantizer
+from easydel.utils.analyze_memory import SMPMemoryMonitor
 
+mem_ops = SMPMemoryMonitor(5)
 logger = get_logger(__name__)
 
 
@@ -111,7 +113,7 @@ def process_tensor(
 			tensor = tensor.transpose(0, 2)
 		new_key = key.replace(".weight", ".kernel")
 
-	key_tuple = tuple(new_key.split("."))
+	key_tuple = tuple((int(n) if n.isdigit() else n) for n in tuple(new_key.split(".")))
 
 	if uses_tie_word_embedding and lm_head_name:
 		if key_tuple[0] == lm_head_name:
@@ -224,6 +226,7 @@ def torch_dict_to_easydel_params(
 					and params_pattern_selection.search("/".join(key_tuple))
 				):
 					jax_array = quantizer(array=jax_array)
+
 				flax_dict[key_tuple] = jax_array
 			pbar.update(1)
 
@@ -281,7 +284,6 @@ def easystate_to_torch(
 		)
 
 		torch_state_dict[key] = jax2pt(tensor)
-
 	return torch_state_dict
 
 

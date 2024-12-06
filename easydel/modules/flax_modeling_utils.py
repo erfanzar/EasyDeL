@@ -42,7 +42,7 @@ from jax.experimental.shard_map import shard_map
 from jax.interpreters import pxla
 from jax.sharding import PartitionSpec
 from tqdm.auto import tqdm
-
+from flax import nnx
 from easydel.etils.errors import EasyDeLBlockWiseFFNError
 from easydel.etils.etils import (
 	AVAILABLE_SPARSE_MODULE_TYPES,
@@ -84,6 +84,12 @@ ROPE_TYPES = Optional[
 		"longrope",
 	]
 ]
+
+
+class MaskVariable(nnx.Variable): ...
+
+
+class FrequenciesVariable(nnx.Variable): ...
 
 
 def canonicalize_dtype(

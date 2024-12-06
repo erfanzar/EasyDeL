@@ -25,6 +25,8 @@ from typing import (
 	Tuple,
 )
 
+from flax import nnx
+import flax.traverse_util
 import flax.traverse_util
 import jax.numpy
 from flax.traverse_util import unflatten_dict
@@ -50,6 +52,7 @@ from easydel.modules.modeling_utils import (
 	EasyDeLBaseModule,
 )
 from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN
+from easydel.utils import traversals
 
 logger = get_logger(name=__name__)
 
@@ -100,7 +103,6 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 		sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
 		partition_axis: Optional[PartitionAxis] = None,
 		shard_attention_computation: bool = True,
-		input_shape: Tuple[int, int] = (1, 1),
 		shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
 		backend: Optional[EasyDeLBackends] = None,
 		platform: Optional[EasyDeLPlatforms] = None,
@@ -129,7 +131,6 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 		    sharding_axis_names (Sequence[str], optional): Names of the sharding axes. Defaults to ("dp", "fsdp", "tp", "sp").
 		    partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
 		    shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
-		    input_shape (Tuple[int, int], optional): Shape of the input to the model. Defaults to (1, 1).
 		    shard_fns (Optional[Mapping[tuple, Callable] | dict], optional): Sharding functions to use for the model. If None, auto-sharding is used if auto_shard_params is True. Defaults to None.
 		    platform (Optional[EasyDeLPlatforms], optional): platform to use for the model. Defaults to None.
 				backend (Optional[EasyDeLBackends], optional): backend to use for the model. Defaults to None.
@@ -179,7 +180,6 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 				bit_targeted_params=bit_targeted_params,
 				sharding_axis_names=sharding_axis_names,
 				sharding_axis_dims=sharding_axis_dims,
-				input_shape=input_shape,
 				config_kwargs=config_kwargs,
 				device=device,
 				shard_attention_computation=shard_attention_computation,
@@ -188,7 +188,6 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 		with jax.default_device(device):
 			return cls._from_easydel_params(
 				auto_shard_params=auto_shard_params,
-				input_shape=input_shape,
 				partition_axis=partition_axis,
 				sharding_axis_dims=sharding_axis_dims,
 				sharding_axis_names=sharding_axis_names,
@@ -220,7 +219,6 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 		sharding_axis_names: Sequence[str],
 		partition_axis: PartitionAxis,
 		shard_attention_computation: bool,
-		input_shape: Tuple[int, int],
 		shard_fns: Optional[Mapping[tuple, Callable] | dict],
 		backend: Optional[EasyDeLBackends],
 		platform: Optional[EasyDeLPlatforms],
@@ -303,30 +301,18 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 		if config_kwargs is not None:
 			for k, v in config_kwargs.items():
 				setattr(config_class, k, v)
+
 		logger.debug("creating easydel model")
-		ed_model = module(
-			config=config_class,
-			_do_init=False,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			precision=precision,
-			input_shape=input_shape,
+		ed_model = nnx.eval_shape(
+			lambda: module(
+				config=config_class,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
+				rngs=nnx.Rngs(0),
+			)
 		)
 		ed_model.generation_config = generation_config
-		needs = [
-			s.replace(".kernel", ".weight")
-			.replace(".scale", ".weight")
-			.replace(".embedding", ".weight")
-			for s in list(
-				flax.traverse_util.flatten_dict(ed_model.params_shape_tree, sep=".").keys()
-			)
-		]
-		for k in list(state_dict.keys()):
-			if k not in needs:
-				tensor = state_dict.pop(k)
-				del tensor
-				_clear()
-				logger.debug(f"removing {k} from weights as it was not needed by flax model")
 
 		_clear()
 
@@ -349,7 +335,6 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 				shard_attention_computation=shard_attention_computation,
 				backend=backend,
 				platform=platform,
-				input_shape=input_shape,  # type:ignore
 				config_kwargs=config_kwargs,
 				trust_remote_code=trust_remote_code,
 			)
@@ -388,7 +373,8 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 				f"{sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(params))[0]) / 1e9}"
 				f" Billion Parameters"
 			)
-		return ed_model, params
+			
+		return traversals.attech_tree_to_nnx_model(model=ed_model, tree=params)
 
 
 class AutoStateForCausalLM:
@@ -404,7 +390,6 @@ class AutoStateForCausalLM:
 		sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
 		partition_axis: Optional[PartitionAxis] = None,
 		shard_attention_computation: bool = True,
-		input_shape: Tuple[int, int] = (1, 1),
 		shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
 		backend: Optional[str] = None,
 		config_kwargs: Optional[Mapping[str, Any]] = None,
@@ -431,7 +416,6 @@ class AutoStateForCausalLM:
 		    sharding_axis_names (Sequence[str], optional): Names of the sharding axes. Defaults to ("dp", "fsdp", "tp", "sp").
 		    partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
 		    shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
-		    input_shape (Tuple[int, int], optional): Shape of the input to the model. Defaults to (1, 1).
 		    shard_fns (Optional[Mapping[tuple, Callable] | dict], optional): Sharding functions to use for the model. If None, auto-sharding is used if auto_shard_params is True. Defaults to None.
 		    backend (Optional[str], optional): Backend to use for the model. Defaults to None.
 		    config_kwargs (Optional[Mapping[str, Any]], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
@@ -457,7 +441,6 @@ class AutoStateForCausalLM:
 			sharding_axis_names=sharding_axis_names,
 			partition_axis=partition_axis,
 			shard_attention_computation=shard_attention_computation,
-			input_shape=input_shape,
 			shard_fns=shard_fns,
 			backend=backend,
 			config_kwargs=config_kwargs,

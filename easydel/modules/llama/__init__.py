@@ -14,9 +14,9 @@
 
 from easydel.modules.llama.llama_configuration import LlamaConfig, VisionLlamaConfig
 from easydel.modules.llama.modeling_llama_flax import (
-	FlaxLlamaForCausalLM,
-	FlaxLlamaForSequenceClassification,
-	FlaxLlamaModel,
-	FlaxVisionLlamaForCausalLM,
-	FlaxVisionLlamaModel,
+	LlamaForCausalLM,
+	# LlamaForSequenceClassification,
+	LlamaModel,
+	# FlaxVisionLlamaForCausalLM,
+	# FlaxVisionLlamaModel,
 )
