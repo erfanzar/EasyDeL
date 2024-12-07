@@ -1798,22 +1798,20 @@ class FlaxAttentionModule(nn.Module):
 			self.cache_index.value = self.cache_index.value + num_updated_cache_vectors
 		return key, value, attention_mask
 
-	def concatenate_to_cache(
+	def update_masks(
 		self,
 		*,
-		init_cache: bool,
 		query: jax.Array,
 		key: jax.Array,
-		value: jax.Array,
 		attention_mask: jax.Array,
 		causal_mask: Optional[jax.Array],
 		fcm_mask: Optional[jax.Array],
-	) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+	) -> Tuple[jax.Array, jax.Array]:
 		"""
-		takes in qkv with additional masks and concatenate them to cache for generation
+		handles masking
 
 		Args:
-		    init_cache (bool): whenever to init cache or not.
+
 		    query (jax.Array): query states from model proj.
 		    key (jax.Array): key states from model proj.
 		    value (jax.Array): value states from model proj.
@@ -1822,19 +1820,12 @@ class FlaxAttentionModule(nn.Module):
 		    fcm_mask (Optional[jax.Array]): fcm mask if provided.
 
 		Returns:
-		    Tuple[jax.Array, jax.Array, jax.Array, jax.Array,jax.Array]: returns query, key, value, attention_mask, attention_bias
+		    Tuple[jax.Array,jax.Array]: returns attention_mask and attention_bias
 		"""
 		query_length = query.shape[1]
 		key_length = key.shape[1]
 		if causal_mask is not None:
-			if self.cache_initialized:
-				causal_mask = lax.dynamic_slice(
-					causal_mask,
-					(0, 0, self.cache_index, 0),
-					(1, 1, query_length, self.cached_key.shape[1]),
-				)
-			else:
-				causal_mask = causal_mask[:, :, :query_length, :key_length]
+			causal_mask = causal_mask[:, :, :query_length, :key_length]
 			causal_mask = jnp.broadcast_to(
 				causal_mask, (query.shape[0],) + causal_mask.shape[1:]
 			)
@@ -1845,20 +1836,12 @@ class FlaxAttentionModule(nn.Module):
 		else:
 			attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
 
-		if self.cache_initialized or init_cache:
-			key, value, attention_mask = self._concatenate_to_cache(
-				query=query,
-				key=key,
-				value=value,
-				attention_mask=attention_mask,
-			)
-
 		attention_bias = lax.select(
 			attention_mask > 0,
 			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
 			jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
 		)
-		return query, key, value, attention_mask, attention_bias
+		return attention_mask, attention_bias
 
 	def shard_attention_prod(self, attn_output: jax.Array) -> jax.Array:
 		"""
