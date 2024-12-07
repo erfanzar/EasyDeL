@@ -1056,7 +1056,7 @@ class EasyDeLBaseModule(nn.Module):
 		"""
 		batch_size, seq_length = input_ids.shape
 		past_key_values = self.init_cache(batch_size, max_length)
-		print(past_key_values)
+		
 		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
 		if attention_mask is not None:
 			position_ids = attention_mask.cumsum(axis=-1) - 1
