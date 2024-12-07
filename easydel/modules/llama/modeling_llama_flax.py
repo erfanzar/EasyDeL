@@ -30,6 +30,7 @@ from easydel.modules.flax_modeling_utils import (
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
+	get_static_param_indices,
 )
 
 # easydel.modules
@@ -70,7 +71,7 @@ class LlamaAttention(FlaxAttentionModule):
 		self.dtype = dtype
 		self.param_dtype = param_dtype
 		self.precision = precision
-
+		self.rngs = rngs
 		self.hidden_size = config.hidden_size
 		head_dim = config.hidden_size // config.num_attention_heads
 		self.head_dim = getattr(config, "head_dim", head_dim)
@@ -144,28 +145,11 @@ class LlamaAttention(FlaxAttentionModule):
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
 		segment_ids: Optional[chex.Array] = None,
-		deterministic: bool = True,
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
 		frequencies: Optional[chex.Array] = None,
 	) -> Tuple[chex.Array, chex.Array]:
-		"""
-		Forward pass of the attention module.
-
-		Args:
-		    hidden_states (chex.Array): Input hidden states.
-		    attention_mask (chex.Array): Mask to apply on the attention scores.
-		    position_ids (chex.Array): Position indices for the tokens.
-		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-		    segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-		    deterministic (bool): If True, disables dropout for deterministic behavior.
-		    init_cache (bool): If True, initializes cache for caching keys and values.
-		    output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-		    fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
-		Returns:
-		    Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
-		"""
 		batch_size, sequence_length = hidden_states.shape[:2]
 		query_states, key_states, value_states = (
 			self.q_proj(hidden_states),
@@ -195,11 +179,6 @@ class LlamaAttention(FlaxAttentionModule):
 			frequencies=frequencies,
 		)
 
-		dropout_rng = None
-
-		if not deterministic and self.config.attention_dropout > 0.0:
-			dropout_rng = self.make_rng("dropout")
-
 		(
 			query_states,
 			key_states,
@@ -223,8 +202,8 @@ class LlamaAttention(FlaxAttentionModule):
 			bias=attention_bias,
 			attention_mask=attention_mask,
 			causal=True,
-			dropout_rng=dropout_rng,
-			deterministic=deterministic,
+			dropout_rng=self.rngs.params(),
+			deterministic=True,
 			query_sequence_length=query_states.shape[1],
 			key_value_sequence_length=key_states.shape[1],
 			uses_cache=init_cache,
@@ -237,7 +216,6 @@ class LlamaAttention(FlaxAttentionModule):
 					attn_output=self._merge_heads(attentions.attention_outputs)
 				)
 			),
-			deterministic=deterministic,
 		)
 		outputs = (
 			(attn_output, attentions.attention_weights)
@@ -297,7 +275,7 @@ class LlamaMLP(nn.Module):
 		self.dropout = nn.Dropout(rate=self.config.resid_pdrop, rngs=rngs)
 		self.act_fn = ACT2FN[self.config.hidden_act]
 
-	def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
+	def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
 		"""The __call__ function is the main function of a class.
 		It is called when an instance of the class (an object) is invoked as a function, i.e., obj(arguments).
 		The __call__ method enables instances of a class to be called like standard Python functions.
@@ -305,7 +283,6 @@ class LlamaMLP(nn.Module):
 		Args:
 		    self: Represent the instance of the class
 		    x: jnp.ndarray: Pass in the input to the layer
-		    deterministic: bool: Determine whether to use dropout
 
 		Returns:
 		    A tensor that is the result of applying a dropout function
@@ -314,7 +291,7 @@ class LlamaMLP(nn.Module):
 
 		x = control_mlp_sharding(x, self.config.partition_axis)
 		x = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-		x = self.dropout(x, deterministic=deterministic)
+		x = self.dropout(x)
 		return x
 
 
@@ -343,15 +320,15 @@ class LlamaBlock(nn.Module):
 		attn_block = LlamaAttention
 		mlp_block = LlamaMLP
 		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
-			attn_block = nn.remat(
-				attn_block,
-				static_argnums=(3, 5, 6, 7, 9),
+			attn_block.__call__ = nn.remat(
+				attn_block.__call__,
+				static_argnums=get_static_param_indices(attn_block.__call__),
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 			)
 
-			mlp_block = nn.remat(
-				mlp_block,
-				static_argnums=(1,),
+			mlp_block.__call__ = nn.remat(
+				mlp_block.__call__,
+				static_argnums=get_static_param_indices(mlp_block.__call__),
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 			)
 
@@ -392,7 +369,6 @@ class LlamaBlock(nn.Module):
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
 		segment_ids: Optional[chex.Array] = None,
-		deterministic: bool = True,
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
@@ -407,7 +383,6 @@ class LlamaBlock(nn.Module):
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
 		    segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-		    deterministic (bool): If True, disables dropout for deterministic behavior.
 		    init_cache (bool): If True, initializes cache for caching keys and values.
 		    output_attentions (bool): If True, outputs attention weights alongside the hidden states.
 		    fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
@@ -420,7 +395,6 @@ class LlamaBlock(nn.Module):
 			position_ids,
 			causal_mask,
 			segment_ids,
-			deterministic,
 			init_cache,
 			output_attentions,
 			fcm_mask,
@@ -436,10 +410,9 @@ class LlamaBlock(nn.Module):
 				self.mlp,
 				feed_forward_input,
 				self.config.scan_mlp_chunk_size,
-				deterministic,
 			)
 		else:
-			feed_forward_hidden_states = self.mlp(feed_forward_input, deterministic)
+			feed_forward_hidden_states = self.mlp(feed_forward_input)
 
 		hidden_states = hidden_states + feed_forward_hidden_states
 
@@ -528,7 +501,6 @@ class LlamaModel(EasyDeLBaseModule):
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		init_cache: bool = False,
-		deterministic: bool = True,
 		return_dict: bool = True,
 	) -> Union[FlaxBaseModelOutput, Tuple]:
 		"""
@@ -543,7 +515,6 @@ class LlamaModel(EasyDeLBaseModule):
 		    output_attentions (Optional[bool]): If True, output attention weights.
 		    output_hidden_states (Optional[bool]): If True, output hidden states.
 		    init_cache (bool): If True, initialize cache for decoding.
-		    deterministic (bool): If True, disable dropout.
 		    return_dict (bool): If True, return a dictionary of outputs.
 
 		Returns:
@@ -563,7 +534,7 @@ class LlamaModel(EasyDeLBaseModule):
 		if attention_mask.ndim == 2:
 			attention_mask = jnp.expand_dims(attention_mask, (1, 2))
 
-		hidden_states = self.dropout(input_embeds, deterministic=deterministic)
+		hidden_states = self.dropout(input_embeds)
 
 		for block in self.layers:
 			if output_hidden_states:
@@ -574,7 +545,6 @@ class LlamaModel(EasyDeLBaseModule):
 				attention_mask=attention_mask,
 				position_ids=position_ids,
 				causal_mask=self.config.get_basic_causal_mask(),
-				deterministic=deterministic,
 				init_cache=init_cache,
 				output_attentions=output_attentions,
 				segment_ids=segment_ids,
@@ -661,7 +631,6 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		init_cache: bool = False,
-		deterministic: bool = True,
 		return_dict: bool = True,
 	) -> Union[FlaxCausalLMOutput, Tuple]:
 		"""
@@ -676,7 +645,6 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 		    output_attentions (Optional[bool]): If True, output attention weights.
 		    output_hidden_states (Optional[bool]): If True, output hidden states.
 		    init_cache (bool): If True, initialize cache for decoding.
-		    deterministic (bool): If True, disable dropout.
 		    return_dict (bool): If True, return a dictionary of outputs.
 
 		Returns:
@@ -697,7 +665,6 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
-			deterministic=deterministic,
 			init_cache=init_cache,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,

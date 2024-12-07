@@ -867,7 +867,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			__hash__ = hash_fn
 
 		initial_rope_kwargs = rope_scaling(rope_type="default")
-		
+
 		if getattr(self, "rope_scaling", None) is not None:
 			scaling_type = self.rope_scaling.get("rope_type", None)
 			scaling_type = self.rope_scaling.get("type", scaling_type)
@@ -1056,7 +1056,7 @@ class EasyDeLBaseModule(nn.Module):
 		"""
 		batch_size, seq_length = input_ids.shape
 		past_key_values = self.init_cache(batch_size, max_length)
-		print(past_key_values)
+
 		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
 		if attention_mask is not None:
 			position_ids = attention_mask.cumsum(axis=-1) - 1

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import inspect
 import math
 import re
 import warnings
@@ -990,6 +991,52 @@ def control_mlp_sharding(x: jax.Array, partition_axis: PartitionAxis):
 	#     )
 	#     x = with_sharding_constraint(x, partition_spec)
 	return x
+
+
+def get_static_param_indices(
+	func,
+	static_param_names: Optional[List[str]] = None,
+) -> Tuple[int, ...]:
+	"""
+	Gets indices of parameters that match the provided static parameter names,
+	ignoring 'self' and 'cls' parameters.
+
+	Args:
+	    func: Function to inspect
+	    static_param_names: List of parameter names that should be static
+
+	Returns:
+	    Tuple of indices corresponding to static parameters
+
+	Raises:
+	    ValueError: If strict=True and a parameter name is not found
+	"""
+	# Get function signature
+	sig = inspect.signature(func)
+	params = list(sig.parameters.keys())
+
+	# Remove 'self' and 'cls' from parameters if present
+	if params and params[0] in ("self", "cls"):
+		params = params[1:]
+	if static_param_names is None:
+		static_param_names = [
+			"causal_mask",
+			"output_attentions",
+			"frequencies",
+			"init_cache",
+		]
+	# Find indices of static parameters
+	static_indices = []
+	not_found = []
+
+	for name in static_param_names:
+		try:
+			idx = params.index(name)
+			static_indices.append(idx)
+		except ValueError:
+			not_found.append(name)
+
+	return tuple(sorted(static_indices))
 
 
 @partial(jax.jit, static_argnames=["reformat"])
