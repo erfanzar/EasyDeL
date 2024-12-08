@@ -15,6 +15,7 @@
 import dataclasses
 from typing import Dict, List, Optional, Union
 
+import chex
 import fjformer
 import jax
 import jax.experimental
@@ -220,8 +221,7 @@ def compile_function(
 	).compile()
 
 
-@jax.tree_util.register_pytree_node_class
-@dataclasses.dataclass
+@chex.dataclass
 class SampleState:
 	"""
 	Data class representing the state of the sampling process.
@@ -247,24 +247,6 @@ class SampleState:
 	interval_func_flops: Optional[float] = float("-inf")
 	tokens_pre_second: Optional[float] = float("-inf")
 	generated_tokens: Optional[int] = 0
-
-	def tree_flatten(self):
-		return (
-			self.current_length,
-			self.sequences,
-			self.running_token,
-			self.is_sequence_finished,
-			self.prng_key,
-			self.model_kwargs,
-			self.generate_func_flops,
-			self.interval_func_flops,
-			self.tokens_pre_second,
-			self.generated_tokens,
-		), {}
-
-	@classmethod
-	def tree_unflatten(cls, aux, children):
-		return cls(*children)
 
 	def __repr__(self):
 		"""

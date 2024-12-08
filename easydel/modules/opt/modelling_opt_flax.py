@@ -40,7 +40,7 @@ from flax.linen import Dense, combine_masks
 from flax.linen.attention import dot_product_attention_weights
 from jax import lax
 from transformers import logging
-from transformers.modeling_flax_utils import ACT2FN
+
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule
@@ -48,6 +48,7 @@ from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import (
 	control_mlp_sharding,
 	get_gradient_checkpoint_policy,
+	ACT2FN,
 )
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,

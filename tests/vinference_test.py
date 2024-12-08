@@ -36,25 +36,16 @@ def main():
 			mask_max_position_embeddings=max_length,
 			attn_dtype=jnp.float16,
 			gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
-			# kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
+			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		),
-		# quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
+		quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
 		param_dtype=dtype,
 		dtype=dtype,
 		torch_dtype=torch.float16,
 		partition_axis=partition_axis,
 		precision=jax.lax.Precision("fastest"),
 	)
-	# print(model)
-	# ids = jnp.ones((1, 64), "i4")
-	# args = model.prepare_inputs_for_generation(ids, 128)
-	# # print(args)
-	# # out = model(ids)
-	# # print(out)
-
-	# out = model(ids, **args)
-	# print(out)
 	tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
 	tokenizer.padding_side = "left"
 	tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -67,7 +58,7 @@ def main():
 			top_p=model.generation_config.top_p,
 			top_k=model.generation_config.top_k,
 			eos_token_id=model.generation_config.eos_token_id,
-			streaming_chunks=16,
+			streaming_chunks=1024,
 		),
 	)
 
@@ -82,7 +73,7 @@ def main():
 	messages = [
 		{
 			"role": "system",
-			"content": "Please reason step by step, and put your final answer within \\boxed{}.",
+			"content": "Please reason step by step, and put your final answer within \\boxed{}. and give 3 different responses",
 		},
 		{"role": "user", "content": prompt},
 	]
@@ -99,20 +90,21 @@ def main():
 	pad_seq = inference.model_prefill_length
 
 	print("Start Generation Process.")
+	with jax.profiler.trace("tmp-files/vinference"):
+		for response in inference.generate(**ids):
+			next_slice = slice(
+				pad_seq,
+				pad_seq + inference.generation_config.streaming_chunks,
+			)
+			pad_seq += inference.generation_config.streaming_chunks
+			print(
+				tokenizer.decode(response.sequences[0][next_slice], skip_special_tokens=True),
+				end="",
+			)
 
-	for response in inference.generate(**ids):
-		next_slice = slice(
-			pad_seq,
-			pad_seq + inference.generation_config.streaming_chunks,
-		)
-		pad_seq += inference.generation_config.streaming_chunks
-		print(
-			tokenizer.decode(response.sequences[0][next_slice], skip_special_tokens=True),
-			end="",
-		)
-
-	print()
-	print("TPS :", response.tokens_pre_second)
+		print()
+		print(response.generated_tokens)
+		print("TPS :", response.tokens_pre_second)
 
 
 if __name__ == "__main__":

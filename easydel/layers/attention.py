@@ -53,7 +53,6 @@ from easydel.etils.etils import (
 	AVAILABLE_ATTENTION_MECHANISMS,
 	EasyDeLBackends,
 	EasyDeLPlatforms,
-	EasyDeLQuantizationMethods,
 	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
@@ -1014,7 +1013,7 @@ class FlexibleAttentionModule(object):
 			) = self.get_bshd_partition_specs(query_sequence_length)
 		b, qs, qh, d = query_states.shape
 		b, ks, kh, d = key_states.shape
-		
+
 		*_, vd = value_states.shape
 		with self.mesh:
 			query_states = fjformer.with_sharding_constraint(
@@ -1769,10 +1768,11 @@ class FlaxAttentionModule(nn.Module):
 		slice_indices = (0, end_index % cache_view.value.shape[1], 0, 0)
 		value_cache = cache_view.value
 		key_cache = cache_view.key
-		if self.config.kv_cache_quantization_method != EasyDeLQuantizationMethods.NONE:
+		try:
 			key_cache = key_cache.materialize()
 			value_cache = value_cache.materialize()
-
+		except Exception:
+			...
 		value_cache = lax.dynamic_update_slice(value_cache, value, slice_indices)
 		key_cache = lax.dynamic_update_slice(key_cache, key, slice_indices)
 		pad_mask = jnp.broadcast_to(
@@ -1817,7 +1817,6 @@ class FlaxAttentionModule(nn.Module):
 			else:
 				attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
 		else:
-			
 			key, value, attention_mask = self._concatenate_to_cache(
 				query=query,
 				key=key,
@@ -1826,7 +1825,7 @@ class FlaxAttentionModule(nn.Module):
 				attention_mask=attention_mask,
 				causal_mask=causal_mask,
 			)
-			
+
 		attention_bias = lax.select(
 			attention_mask > 0,
 			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),

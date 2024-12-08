@@ -19,6 +19,7 @@ io.py
 launch_test.py
 .gradio
 *.easy
+tmp-files
 # triton_gqa_flash_attention_2.py
 # Distribution / packaging
 *.json

@@ -22,17 +22,16 @@ import random
 import time
 import warnings
 from datetime import datetime
-from functools import cached_property, partial
+from functools import cached_property
 from typing import Any, Dict, Generator, List, Optional, Union, overload
 from uuid import uuid4
 
-import flax.core
+from chex import PRNGKey
 import jax
 import numpy as np
-from fjformer import GenerateRNG, with_sharding_constraint
+from fjformer import GenerateRNG
 from jax import lax
 from jax import numpy as jnp
-from jax import random as jrand
 from jax.sharding import NamedSharding, PartitionSpec
 from pydantic import BaseModel
 from transformers import PreTrainedTokenizer
@@ -40,220 +39,25 @@ from flax import nnx as nn
 from easydel.etils.etils import get_logger
 from easydel.inference.utils import (
 	SampleState,
-	create_sampling_step,
 	vInferenceConfig,
 )
 from easydel.inference.vinference.metrics import vInferenceMetrics
 from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.utils.compiling_utils import (
+	load_compiled_fn,
 	save_compiled_fn,
 	smart_compile,
+)
+from easydel.inference.vinference._fn import (
+	causal_lm_first_iter_fn,
+	causal_lm_iter_fn,
+	get_compiled_funcs,
+	put_compiled_funcs,
+	measure_flops,
 )
 
 logger = get_logger(__name__)
 TIME = str(datetime.fromtimestamp(time.time())).split(" ")[0]
-
-
-def measure_flops(func, *args, **kwargs):
-	try:
-		flops = func.cost_analysis()[0]["flops"]
-	except:  # noqa
-		flops = 1
-	start_time = time.perf_counter()
-	result = func(*args, **kwargs)
-	end_time = time.perf_counter()
-	elapsed_time = end_time - start_time
-	return result, flops, flops / elapsed_time, elapsed_time
-
-
-@partial(
-	jax.jit,
-	static_argnames=[
-		"graphdef",
-		"generation_config",
-	],
-)
-def _compiled_generate(
-	graphdef: EasyDeLBaseModule,
-	graphstate: dict,
-	input_ids: jax.Array,
-	attention_mask: jax.Array,
-	position_ids: jax.Array,
-	generation_config: vInferenceConfig,
-	rng: jrand.PRNGKey,
-) -> SampleState:
-	"""
-	Compiled function for performing the initial generation step.
-
-	This function takes the graphdef, parameters, input IDs, attention mask, position IDs,
-	generation configuration, and a random number generator key as input. It initializes
-	the generation state and performs the first sampling step.
-
-	Returns:
-		SampleState: The initial generation state after the first sampling step.
-	"""
-	model = nn.merge(graphdef, graphstate)
-	partition_axes = model.config.partition_axis
-	mesh = model.config.mesh
-
-	generation_spec = PartitionSpec(
-		partition_axes.batch_axis,
-		partition_axes.key_sequence_axis,
-	)
-
-	eos_token_id = jnp.array(generation_config.eos_token_id, dtype=jnp.int32)
-	pad_token_id = jnp.array(generation_config.pad_token_id, dtype=jnp.int32)
-
-	batch_size, current_length = input_ids.shape
-	max_length = current_length + generation_config.max_new_tokens
-	current_length = jnp.array(current_length)
-	sequences = jnp.full((batch_size, max_length), pad_token_id, dtype=jnp.int32)
-	sequences = lax.dynamic_update_slice(sequences, input_ids, (0, 0))
-	is_sequence_finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
-
-	if attention_mask is None:
-		warnings.warn(
-			"`attention_mask` is not provided, it's recommended to "
-			"pass an attention mask for better results.",
-			stacklevel=1,
-		)
-		attention_mask = jnp.ones_like(input_ids)
-
-	if position_ids is None:
-		position_ids = attention_mask.cumsum(axis=-1, dtype="i4") - 1
-	with mesh:
-		input_ids = with_sharding_constraint(input_ids, generation_spec)
-		attention_mask = with_sharding_constraint(attention_mask, generation_spec)
-		position_ids = with_sharding_constraint(position_ids, generation_spec)
-	assert (
-		position_ids.shape == attention_mask.shape
-	), "`position_ids` and `attention_mask` must have the same shape."
-
-	model_kwargs = model.prepare_inputs_for_generation(
-		input_ids=input_ids,
-		max_length=max_length,
-		attention_mask=attention_mask,
-	)
-	state = SampleState(
-		current_length=current_length,
-		sequences=sequences,
-		running_token=input_ids,
-		is_sequence_finished=is_sequence_finished,
-		prng_key=rng,
-		model_kwargs=model_kwargs,
-		generated_tokens=0,
-	)
-
-	with mesh:
-		if input_ids.shape[-1] > 1:
-			state = create_sampling_step(
-				eos_token_id=eos_token_id,
-				pad_token_id=pad_token_id,
-				logits_processor=generation_config.get_logits_processor(),
-				logits_warper=generation_config.get_logits_processor(),
-				do_sample=generation_config.do_sample,
-			)(model, state)
-	return state
-
-
-@partial(
-	jax.jit,
-	static_argnames=[
-		"graphdef",
-		"generation_config",
-	],
-)
-def _compiled_interval_generate(
-	graphdef: EasyDeLBaseModule,
-	graphstate: dict,
-	state: SampleState,
-	generation_config: vInferenceConfig,
-	loop_max_tokens: int,
-) -> SampleState:
-	"""
-	Compiled function for performing interval generation steps.
-
-	This function takes the graphdef, parameters, current generation state, generation
-	configuration, maximum number of tokens for the loop, and the starting length as input.
-	It continues the generation process until the termination condition is met.
-
-	Returns:
-		SampleState: The updated generation state after the interval generation steps.
-	"""
-
-	model = nn.merge(graphdef, graphstate)
-	mesh = model.config.mesh
-	tlen = state.current_length + loop_max_tokens
-
-	eos_token_id = jnp.array(generation_config.eos_token_id, dtype=jnp.int32)
-	pad_token_id = jnp.array(generation_config.pad_token_id, dtype=jnp.int32)
-
-	def cond_fn(state):
-		"""state termination condition fn."""
-		all_sequence_finished = jnp.all(state.is_sequence_finished)
-		return ~jnp.logical_or(all_sequence_finished, state.current_length >= tlen)
-
-	sampling_step = create_sampling_step(
-		eos_token_id=eos_token_id,
-		pad_token_id=pad_token_id,
-		logits_processor=generation_config.get_logits_processor(),
-		logits_warper=generation_config.get_logits_processor(),
-		do_sample=generation_config.do_sample,
-	)
-	with mesh:
-
-		def interval_sample(state):
-			return sampling_step(model=model, state=state)
-
-		state = jax.lax.while_loop(cond_fn, body_fun=interval_sample, init_val=state)
-	return state
-
-
-COMPILED_FUNCS = {}
-
-
-def get_compiled_funcs(batch_size, input_tokens_length, id, safe=True):
-	"""
-	Retrieves compiled generation functions from a cache.
-
-	Args:
-		batch_size: The batch size.
-		input_tokens_length: The length of the input tokens.
-		id: A unique identifier for the compilation.
-
-	Returns:
-		Tuple[Callable, Callable]: A tuple containing the compiled generate and
-			interval generate functions, or (None, None) if not found in the cache.
-	"""
-	search_key = f"Bx{batch_size}-Sx{input_tokens_length}-UUID{id}"
-	f1, f2 = COMPILED_FUNCS.get(search_key, (None, None))
-	if (f1 is None or f2 is None) and safe:
-		raise RuntimeError(
-			"wasn't able to find requested functions please `precompile`"
-			" inference before using `generate` function."
-		)
-	return f1, f2
-
-
-def put_compiled_funcs(
-	compiled_generate_func,
-	compiled_interval_func,
-	batch_size,
-	input_tokens_length,
-	id,
-):
-	"""
-	Stores compiled generation functions in a cache.
-
-	Args:
-		compiled_generate_func: The compiled generate function.
-		compiled_interval_func: The compiled interval generate function.
-		batch_size: The batch size.
-		input_tokens_length: The length of the input tokens.
-		id: A unique identifier for the compilation.
-	"""
-	search_key = f"Bx{batch_size}-Sx{input_tokens_length}-UUID{id}"
-	COMPILED_FUNCS[search_key] = (compiled_generate_func, compiled_interval_func)
 
 
 class vInferenceMetaData(BaseModel):
@@ -333,7 +137,7 @@ class vInference:
 		Example: llama-7.00B-20240311
 		"""
 		model_type = self._get_model_type(model)
-		model_size = "NaN"
+		model_size = self._calculate_model_size(self.graphstate)
 		timestamp = datetime.now().strftime("%Y%m%d")
 
 		return f"{model_type}-{model_size}B-{timestamp}"
@@ -348,9 +152,7 @@ class vInference:
 		Returns formatted string with 2 decimal places.
 		"""
 		try:
-			num_params = sum(
-				n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(graphstate))[0]
-			)
+			num_params = sum(n.size for n in jax.tree_util.tree_flatten(graphstate)[0])
 			size_in_billions = num_params / 1e9
 			return f"{size_in_billions:.2f}"
 		except Exception as e:
@@ -427,8 +229,7 @@ class vInference:
 					top_k=self.model.generation_config.top_k,
 					top_p=self.model.generation_config.top_p,
 					temperature=self.model.generation_config.temperature,
-					max_new_tokens=self.model.generation_config.max_new_tokens
-					or max_new_tokens,
+					max_new_tokens=self.model.generation_config.max_new_tokens or max_new_tokens,
 				)
 			return vInferenceConfig(max_new_tokens=max_new_tokens)
 		return generation_config
@@ -448,6 +249,35 @@ class vInference:
 		self.gen_input_sharding = NamedSharding(
 			spec=PartitionSpec(self.input_partition_spec[0], None),
 			mesh=self.model.mesh,
+		)
+
+	def _init_state(
+		self,
+		input_ids: jax.Array,
+		attention_mask: jax.Array,
+		rng: Optional[PRNGKey] = None,
+	):
+		if rng is None:
+			rng = self._rng_generator.rng
+		pad_token_id = jnp.array(self.generation_config.pad_token_id, dtype=jnp.int32)
+		batch_size, current_length = input_ids.shape
+		max_length = current_length + self.generation_config.max_new_tokens
+		current_length = jnp.array(current_length)
+		sequences = jnp.full((batch_size, max_length), pad_token_id, dtype=jnp.int32)
+		sequences = lax.dynamic_update_slice(sequences, input_ids, (0, 0))
+		is_sequence_finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
+		return SampleState(
+			current_length=current_length,
+			sequences=sequences,
+			running_token=input_ids,
+			is_sequence_finished=is_sequence_finished,
+			prng_key=rng,
+			model_kwargs=self.model.prepare_inputs_for_generation(
+				input_ids=input_ids,
+				max_length=max_length,
+				attention_mask=attention_mask,
+			),
+			generated_tokens=0,
 		)
 
 	def _validate_token_ids(self):
@@ -473,8 +303,7 @@ class vInference:
 		self,
 		input_ids: jax.Array,
 		attention_mask: Optional[jax.Array] = None,
-		position_ids: Optional[jax.Array] = None,
-	) -> Generator[SampleState, Any, Any]:
+	) -> Union[Generator[SampleState, Any, Any], SampleState]:
 		"""
 		Generates text in streaming chunks.
 
@@ -485,7 +314,6 @@ class vInference:
 		Args:
 			input_ids: The input token IDs.
 			attention_mask: The attention mask.
-			position_ids: The position IDs.
 
 		Yields:
 			SampleState: The generated text in streaming chunks.
@@ -512,35 +340,37 @@ class vInference:
 					)
 					attention_mask = jnp.ones_like(input_ids)
 
-				if position_ids is None:
-					position_ids = attention_mask.cumsum(axis=-1, dtype="i4") - 1
-
 				attention_mask = jnp.array(attention_mask)
+				state = self._init_state(input_ids=input_ids, attention_mask=attention_mask)
 			with self.metrics.inference_latency.labels(
 				model_name=self.metrics.model_name,
 				stage="inference",
 			).time():
-				state, flop, generate_func_flops, generate_func_elapsed_time = measure_flops(
+				(
+					state,
+					flop,
+					generate_func_flops,
+					generate_func_elapsed_time,
+				) = measure_flops(
 					generate_func,
 					graphstate=self.graphstate,
-					input_ids=input_ids,
-					attention_mask=attention_mask,
-					position_ids=position_ids,
-					rng=self._rng_generator.rng,
+					state=state,
 				)
-
 				interval_time = 0
 				state.generate_func_flops = generate_func_flops
 				if not state.is_sequence_finished:
 					all_interval_func_flops = []
 					for _ in range(self.generation_config._loop_rows):
-						state, flop, interval_func_flops, interval_func_elapsed_time = (
-							measure_flops(
-								interval_func,
-								graphstate=self.graphstate,
-								state=state,
-								loop_max_tokens=self.generation_config.streaming_chunks,
-							)
+						(
+							state,
+							flop,
+							interval_func_flops,
+							interval_func_elapsed_time,
+						) = measure_flops(
+							interval_func,
+							graphstate=self.graphstate,
+							state=state,
+							loop_max_tokens=self.generation_config.streaming_chunks,
 						)
 						interval_time += interval_func_elapsed_time
 
@@ -584,43 +414,33 @@ class vInference:
 		)
 		do_compile = compiled_generate_func is None or compiled_interval_func is None
 		if do_compile:
-			input_ids = jnp.ones((batch_size, input_tokens_length), dtype="i4")
-			attention_mask = jnp.ones_like(input_ids)
-			position_ids = attention_mask.cumsum(axis=-1, dtype="i4") - 1
-			logger.debug(f"Smart Compiling `state_generate_compile` - {self.inference_name}")
-
+			state = self._init_state(
+				input_ids=jnp.ones((batch_size, input_tokens_length), dtype="i4"),
+				attention_mask=jnp.ones((batch_size, input_tokens_length), dtype="i4"),
+			)
 			compiled_generate_func = smart_compile(
-				_compiled_generate.lower(
-					graphdef=self.graphdef,
-					graphstate=self.graphstate,
-					input_ids=input_ids,
-					attention_mask=attention_mask,
-					position_ids=position_ids,
-					generation_config=self.generation_config,
-					rng=self._rng_generator.rng,
-				),
-				tag="vinference",
-			)
-			state = compiled_generate_func(
-				graphstate=self.graphstate,
-				input_ids=input_ids,
-				attention_mask=attention_mask,
-				position_ids=position_ids,
-				rng=self._rng_generator.rng,
-			)
-			logger.debug(
-				f"Smart Compiling `interval_generate_compile` - {self.inference_name}"
-			)
-			compiled_interval_func = smart_compile(
-				_compiled_interval_generate.lower(
+				causal_lm_first_iter_fn.lower(
 					graphdef=self.graphdef,
 					graphstate=self.graphstate,
 					state=state,
+					generation_config=self.generation_config,
+				),
+				tag="vinference",
+			)
+			compiled_interval_func = smart_compile(
+				causal_lm_iter_fn.lower(
+					graphdef=self.graphdef,
+					graphstate=self.graphstate,
+					state=compiled_generate_func(
+						graphstate=self.graphstate,
+						state=state,
+					),
 					generation_config=self.generation_config,
 					loop_max_tokens=self.generation_config.streaming_chunks,
 				),
 				tag="vinference",
 			)
+
 			del state
 			put_compiled_funcs(
 				compiled_generate_func=compiled_generate_func,
@@ -681,7 +501,6 @@ class vInference:
 
 	def count_tokens(self, conv: Union[str, List[Dict[str, str]]]) -> int:
 		if isinstance(conv, list) and all(isinstance(item, dict) for item in conv):
-			# Handle chat messages using chat template
 			tokens = self.tokenizer.apply_chat_template(
 				conv,
 				tokenize=True,
@@ -705,59 +524,45 @@ class vInference:
 		)
 		for config_key in self._precompiled_configs:
 			batch_size, input_tokens_length = config_key
+			metafile = f"{metadata.uuid4}-{batch_size}-{input_tokens_length}"
 			compiled_generation_fn, compiled_interval_fn = get_compiled_funcs(
 				batch_size=batch_size,
 				input_tokens_length=input_tokens_length,
 				id=metadata.uuid4,
 			)
-			save_compiled_fn(
-				path=path,
-				fn=compiled_generation_fn,
-				prefix=f"cgf-{metadata.uuid4}-{batch_size}-{input_tokens_length}",
-			)
-			save_compiled_fn(
-				path=path,
-				fn=compiled_interval_fn,
-				prefix=f"cif-{metadata.uuid4}-{batch_size}-{input_tokens_length}",
-			)
+			save_compiled_fn(path=path, fn=compiled_generation_fn, prefix=f"cgf-{metafile}")
+			save_compiled_fn(path=path, fn=compiled_interval_fn, prefix=f"cif-{metafile}")
 
 		metadata = pickle.dump(metadata, open(path / "config", "wb"))
 
-	# @classmethod
-	# def load_inference(
-	# 	cls,
-	# 	path: Union[os.PathLike, str],
-	# 	model: EasyDeLBaseModule,
-	# 	params: Union[flax.core.FrozenDict, dict],
-	# 	tokenizer: PreTrainedTokenizer,
-	# ):
-	# 	path = pathlib.Path(path)
-	# 	assert path.exists(), "provided path to vInference doesn't exists."
-	# 	metadata = pickle.load(open(path / "config", "rb"))
-	# 	for config_key in metadata.precompiled_configs:
-	# 		batch_size, input_tokens_length = config_key
-	# 		compiled_generation_fn = load_compiled_fn(
-	# 			path=path,
-	# 			prefix=f"cgf-{metadata.uuid4}-{batch_size}-{input_tokens_length}",
-	# 		)
-	# 		compiled_interval_fn = load_compiled_fn(
-	# 			path=path,
-	# 			prefix=f"cif-{metadata.uuid4}-{batch_size}-{input_tokens_length}",
-	# 		)
-	# 		put_compiled_funcs(
-	# 			compiled_generate_func=compiled_generation_fn,
-	# 			compiled_interval_func=compiled_interval_fn,
-	# 			batch_size=batch_size,
-	# 			input_tokens_length=input_tokens_length,
-	# 			id=metadata.uuid4,
-	# 		)
-	# 	self = cls(
-	# 		model=model,
-	# 		params=params,
-	# 		tokenizer=tokenizer,
-	# 		generation_config=metadata.generation_config,
-	# 		input_partition_spec=metadata.input_partition_spec,
-	# 		inference_name=metadata.inference_name,
-	# 	)
-	# 	self._uuid4 = metadata.uuid4
-	# 	return self
+	@classmethod
+	def load_inference(
+		cls,
+		path: Union[os.PathLike, str],
+		model: EasyDeLBaseModule,
+		tokenizer: PreTrainedTokenizer,
+	):
+		path = pathlib.Path(path)
+		assert path.exists(), "provided path to vInference doesn't exists."
+		metadata = pickle.load(open(path / "config", "rb"))
+		for config_key in metadata.precompiled_configs:
+			batch_size, input_tokens_length = config_key
+			metafile = f"{metadata.uuid4}-{batch_size}-{input_tokens_length}"
+			compiled_generation_fn = load_compiled_fn(path=path, prefix=f"cgf-{metafile}")
+			compiled_interval_fn = load_compiled_fn(path=path, prefix=f"cif-{metafile}")
+			put_compiled_funcs(
+				compiled_generate_func=compiled_generation_fn,
+				compiled_interval_func=compiled_interval_fn,
+				batch_size=batch_size,
+				input_tokens_length=input_tokens_length,
+				id=metadata.uuid4,
+			)
+		self = cls(
+			model=model,
+			tokenizer=tokenizer,
+			generation_config=metadata.generation_config,
+			input_partition_spec=metadata.input_partition_spec,
+			inference_name=metadata.inference_name,
+		)
+		self._uuid4 = metadata.uuid4
+		return self

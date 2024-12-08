@@ -18,7 +18,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import numpy as onp
-import transformers.modeling_flax_outputs
+
 from einops import rearrange
 from flax import linen as nn
 from jax import numpy as np
@@ -27,7 +27,10 @@ from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.norms import RMSNorm
 from easydel.modules.factory import register_module
 from easydel.modules.flax_modeling_utils import get_gradient_checkpoint_policy
-from easydel.modules.modeling_flax_outputs import FlaxCausalLMOutput
+from easydel.modules.modeling_flax_outputs import (
+	FlaxBaseModelOutput,
+	FlaxCausalLMOutput,
+)
 from easydel.modules.modeling_utils import wrap_easydel_module
 from easydel.modules.palm.palm_configuration import PalmConfig as PalmConfig
 
@@ -253,9 +256,7 @@ class FlaxPalmModel(nn.Module):
 		hidden_state = self.ln_f(hidden_state)
 
 		if return_dict:
-			return transformers.modeling_flax_outputs.FlaxBaseModelOutput(
-				last_hidden_state=hidden_state, hidden_states=atn
-			)
+			return FlaxBaseModelOutput(last_hidden_state=hidden_state, hidden_states=atn)
 		else:
 			return hidden_state, atn
 
