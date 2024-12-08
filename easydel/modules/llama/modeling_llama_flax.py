@@ -44,6 +44,7 @@ from easydel.modules.modeling_flax_outputs import (
 )
 from easydel.modules.modeling_utils import EasyDeLBaseModule
 from flax import nnx as nn
+from easydel.layers.nn import Linear
 
 
 class LlamaAttention(FlaxAttentionModule):
@@ -84,7 +85,7 @@ class LlamaAttention(FlaxAttentionModule):
 			assert self.config.num_attention_heads == self.config.num_key_value_heads
 
 		linear_class = partial(
-			nn.Linear,
+			Linear,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			use_bias=self.config.attention_bias,
@@ -247,7 +248,7 @@ class LlamaMLP(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		linear_class = partial(
-			nn.Linear,
+			Linear,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			use_bias=self.config.mlp_bias,
@@ -578,7 +579,7 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 
-		self.lm_head = nn.Linear(
+		self.lm_head = Linear(
 			self.config.hidden_size,
 			self.config.vocab_size,
 			dtype=self.dtype,

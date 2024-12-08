@@ -20,7 +20,8 @@ from typing import Any, Optional, Tuple, Union
 import flax.linen
 import jax
 import jax.numpy as jnp
-import transformers
+
+# import transformers
 from flax import linen as nn
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import Dense, combine_masks, make_causal_mask
@@ -1555,7 +1556,7 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
 		forced_decoder_ids: jax.Array,
 		params: dict,
 		return_timestamps: bool = False,
-		generation_config: Optional[transformers.GenerationConfig] = None,
+		generation_config: Optional["transformers.GenerationConfig"] = None,  # noqa #type:ignore
 		**kwargs,
 	):
 		# fmt:off

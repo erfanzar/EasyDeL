@@ -17,7 +17,6 @@ import re
 from typing import Callable, List, Mapping, Optional, Tuple
 
 import jax
-import transformers
 from fjformer.checkpoint import get_dtype
 from flax import traverse_util
 from flax.traverse_util import flatten_dict
@@ -223,7 +222,7 @@ def torch_dict_to_easydel_params(
 				if (
 					quantizer is not None
 					and key_tuple[-1] != "embedding"
-					and params_pattern_selection.search("/".join(key_tuple))
+					and params_pattern_selection.search("/".join((str(k) for k in key_tuple)))
 				):
 					jax_array = quantizer(array=jax_array)
 
@@ -290,7 +289,7 @@ def easystate_to_torch(
 def easystate_to_huggingface_model(
 	state,
 	config,
-	base_huggingface_module: transformers.PreTrainedModel,
+	base_huggingface_module: "transformers.PreTrainedModel",  # noqa #type:ignore
 	base_huggingface_module_kwarguments=None,
 	dtype=jnp.float16,
 	transpose_needed=None,
@@ -301,6 +300,8 @@ def easystate_to_huggingface_model(
 	use_meta_torch: bool = True,
 ):
 	if not rnn_based_or_rwkv and auto_correct:
+		import transformers
+
 		if isinstance(base_huggingface_module, transformers.RwkvForCausalLM) or isinstance(
 			base_huggingface_module, transformers.RwkvModel
 		):

@@ -1,11 +1,8 @@
-from dataclasses import dataclass
-from flax import struct
 import typing as tp
 import chex as cx
 from jax import numpy as jnp
 from fjformer.core import ImplicitArray
 from fjformer import with_sharding_constraint
-import jax
 from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import EasyDeLQuantizationMethods
@@ -13,7 +10,7 @@ from easydel.etils.partition_module import PartitionAxis
 from easydel.utils.quantizers import EasyQuantizer
 
 
-@struct.dataclass
+@cx.dataclass
 class TransformerCacheMetaData:
 	"""Metadata for transformer cache configuration."""
 
@@ -107,21 +104,13 @@ class TransformerCacheMetaData:
 		)
 
 
-@jax.tree_util.register_pytree_node_class
-@dataclass
+@cx.dataclass
 class TransformerCacheView:
 	key: tp.Union[cx.Array, ImplicitArray]
 	value: tp.Union[cx.Array, ImplicitArray]
 	index: tp.Union[cx.Array, ImplicitArray]
 	metadata: TransformerCacheMetaData
 	layer_index: tp.Optional[int] = None
-
-	def tree_flatten(self):
-		return (self.key, self.value, self.index, self.metadata, self.layer_index), {}
-
-	@classmethod
-	def tree_unflatten(cls, aux, children):
-		return cls(*children)
 
 	@classmethod
 	def init(
@@ -175,7 +164,7 @@ class TransformerCacheView:
 	__str__ = __repr__
 
 
-@struct.dataclass
+@cx.dataclass
 class TransformerCache:
 	views: tp.List[tp.Optional[TransformerCacheView]]
 
