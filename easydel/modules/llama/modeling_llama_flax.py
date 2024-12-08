@@ -41,22 +41,13 @@ from easydel.modules.llama.llama_configuration import (
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
+	FlaxSequenceClassifierOutput,
 )
 from easydel.modules.modeling_utils import EasyDeLBaseModule
 from flax import nnx as nn
-from easydel.layers.nn import Linear
 
 
 class LlamaAttention(FlaxAttentionModule):
-	"""
-	FlaxLlamaAttention implements an attention mechanism with rotary embeddings.
-
-	Attributes:
-		config (LlamaConfig): Configuration for the attention module.
-		dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
-		param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
-		precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
-	"""
 
 	def __init__(
 		self,
@@ -85,7 +76,7 @@ class LlamaAttention(FlaxAttentionModule):
 			assert self.config.num_attention_heads == self.config.num_key_value_heads
 
 		linear_class = partial(
-			Linear,
+			nn.Linear,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			use_bias=self.config.attention_bias,
@@ -226,14 +217,6 @@ class LlamaAttention(FlaxAttentionModule):
 
 
 class LlamaMLP(nn.Module):
-	"""
-	Attributes:
-		config (LlamaConfig): Configuration for the attention module.
-		dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
-		param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
-		precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
-	"""
-
 	def __init__(
 		self,
 		config: LlamaConfig,
@@ -248,7 +231,7 @@ class LlamaMLP(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		linear_class = partial(
-			Linear,
+			nn.Linear,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			use_bias=self.config.mlp_bias,
@@ -276,20 +259,6 @@ class LlamaMLP(nn.Module):
 		self.act_fn = ACT2FN[self.config.hidden_act]
 
 	def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-		"""The __call__ function is the main function of a class.
-		It is called when an instance of the class (an object) is invoked as a function, i.e., obj(arguments).
-		The __call__ method enables instances of a class to be called like standard Python functions.
-
-		Args:
-		    self: Represent the instance of the class
-		    x: jnp.ndarray: Pass in the input to the layer
-		    deterministic: bool: Determine whether to use dropout
-
-		Returns:
-		    A tensor that is the result of applying a dropout function
-		    to x
-		"""
-
 		x = control_mlp_sharding(x, self.config.partition_axis)
 		x = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 		x = self.dropout(x, deterministic=deterministic)
@@ -297,14 +266,6 @@ class LlamaMLP(nn.Module):
 
 
 class LlamaBlock(nn.Module):
-	"""
-	Attributes:
-		config (LlamaConfig): Configuration for the attention module.
-		dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
-		param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
-		precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
-	"""
-
 	def __init__(
 		self,
 		config: LlamaConfig,
@@ -429,10 +390,13 @@ class LlamaModel(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
-		self.config = config
-		self.dtype = dtype
-		self.param_dtype = param_dtype
-		self.precision = precision
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
 
 		self.embed_tokens = nn.Embed(
 			num_embeddings=self.config.vocab_size,
@@ -567,10 +531,13 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
-		self.config = config
-		self.dtype = dtype
-		self.param_dtype = param_dtype
-		self.precision = precision
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
 		self.model = LlamaModel(
 			config=self.config,
 			dtype=self.dtype,
@@ -579,7 +546,7 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 
-		self.lm_head = Linear(
+		self.lm_head = nn.Linear(
 			self.config.hidden_size,
 			self.config.vocab_size,
 			dtype=self.dtype,
@@ -668,359 +635,86 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 		)
 
 
-# @register_module(
-# 	"sequence-classification",
-# 	config=LlamaConfig,
-# 	model_type="llama",
-# 	embedding_layer_names=["embed_tokens"],
-# )
-# @wrap_easydel_module(LlamaConfig, base_model_prefix="model")
-# class FlaxLlamaForSequenceClassification(nn.Module):
-# 	num_labels: int
-# 	config: LlamaConfig
-# 	dtype: jnp.dtype = jnp.float32
-# 	param_dtype: jnp.dtype = jnp.float32
-# 	precision: Optional[Union[jax.lax.Precision, str]] = None
+@register_module(
+	"sequence-classification",
+	config=LlamaConfig,
+	model_type="llama",
+	embedding_layer_names=["embed_tokens"],
+)
+class FlaxLlamaForSequenceClassification(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: LlamaConfig,
+		num_labels: int,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+		self.num_labels = num_labels
+		self.model = LlamaModel(
+			config=self.config,
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+			precision=self.precision,
+			rngs=rngs,
+		)
+		self.score = nn.Linear(
+			self.config.hidden_size,
+			self.num_labels,
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+			use_bias=False,
+			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+			precision=self.precision,
+		)
 
-# 	def setup(self):
-# 		"""The setup function is called once at the beginning of training.
-# 		It initializes the model and optimizer, and sets up any other state that needs to be initialized.
+	def __call__(
+		self,
+		input_ids: Optional[chex.Array] = None,
+		attention_mask: Optional[chex.Array] = None,
+		position_ids: Optional[chex.Array] = None,
+		segment_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
+		output_attentions: Optional[bool] = None,
+		output_hidden_states: Optional[bool] = None,
+		return_dict: bool = True,
+	) -> Union[FlaxSequenceClassifierOutput, Tuple]:
+		batch_size, seq_length = (
+			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
+		)
+		if attention_mask is None:
+			attention_mask = jnp.ones_like(input_ids)
+		if position_ids is None:
+			position_ids = jnp.broadcast_to(
+				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+				(batch_size, seq_length),
+			)
+		outputs = self.model(
+			input_ids=input_ids,
+			attention_mask=attention_mask,
+			position_ids=position_ids,
+			output_attentions=output_attentions,
+			output_hidden_states=output_hidden_states,
+			return_dict=return_dict,
+			input_embeds=input_embeds,
+			segment_ids=segment_ids,
+		)
 
-# 		Args:
-# 		    self: Access variables that belong to the class
-
-# 		Returns:
-# 		    A tuple of the model and the classifier
-# 		"""
-# 		self.model = FlaxLlamaModel.flax_module(
-# 			config=self.config,
-# 			dtype=self.dtype,
-# 			param_dtype=self.param_dtype,
-# 			precision=self.precision,
-# 		)
-# 		self.score = Dense(
-# 			self.num_labels,
-# 			dtype=self.dtype,
-# 			param_dtype=self.param_dtype,
-# 			use_bias=False,
-# 			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-# 			precision=self.precision,
-# 		)
-
-# 	def __call__(
-# 		self,
-# 		input_ids: Optional[chex.Array] = None,
-# 		attention_mask: Optional[chex.Array] = None,
-# 		position_ids: Optional[chex.Array] = None,
-# 		segment_ids: Optional[chex.Array] = None,
-# 		input_embeds: Optional[chex.Array] = None,
-# 		output_attentions: Optional[bool] = None,
-# 		output_hidden_states: Optional[bool] = None,
-# 		init_cache: bool = False,
-# 		deterministic: bool = True,
-# 		return_dict: bool = True,
-# 	) -> Union[FlaxSequenceClassifierOutput, Tuple]:
-# 		"""
-# 		Forward pass through the Llama module.
-
-# 		Args:
-# 		    input_ids (Optional[chex.Array]): Input tensor containing token IDs.
-# 		    attention_mask (Optional[chex.Array]): Mask for attention.
-# 		    position_ids (Optional[chex.Array]): Positional indices.
-# 		    segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-# 		    input_embeds (Optional[chex.Array]): Embedded input tensor.
-# 		    output_attentions (Optional[bool]): If True, output attention weights.
-# 		    output_hidden_states (Optional[bool]): If True, output hidden states.
-# 		    init_cache (bool): If True, initialize cache for decoding.
-# 		    deterministic (bool): If True, disable dropout.
-# 		    return_dict (bool): If True, return a dictionary of outputs.
-
-# 		Returns:
-# 		    FlaxSequenceClassifierOutput | Tuple: Model output, either as a named tuple or a standard tuple.
-# 		"""
-
-# 		batch_size, seq_length = (
-# 			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
-# 		)
-# 		if attention_mask is None:
-# 			attention_mask = jnp.ones_like(input_ids)
-# 		if position_ids is None:
-# 			position_ids = jnp.broadcast_to(
-# 				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-# 				(batch_size, seq_length),
-# 			)
-# 		outputs = self.model(
-# 			input_ids=input_ids,
-# 			attention_mask=attention_mask,
-# 			position_ids=position_ids,
-# 			deterministic=deterministic,
-# 			init_cache=init_cache,
-# 			output_attentions=output_attentions,
-# 			output_hidden_states=output_hidden_states,
-# 			return_dict=return_dict,
-# 			input_embeds=input_embeds,
-# 			segment_ids=segment_ids,
-# 		)
-
-# 		hidden_states = outputs[0]
-# 		prediction = self.score(hidden_states)
-# 		if return_dict:
-# 			return FlaxSequenceClassifierOutput(
-# 				logits=prediction,
-# 				hidden_states=hidden_states,
-# 			)
-# 		else:
-# 			return (prediction,)
-
-
-# @register_module(
-# 	"vision-module",
-# 	config=VisionLlamaConfig,
-# 	model_type="llama",
-# 	embedding_layer_names=["embed_tokens"],
-# )
-# @wrap_custom_easydel_module(
-# 	base=EasyDeLBaseVisionModule,
-# 	config_class=VisionLlamaConfig,
-# 	base_model_prefix="model",
-# )
-# class FlaxVisionLlamaModel(nn.Module):
-# 	config: VisionLlamaConfig
-# 	dtype: jnp.dtype = jnp.float32
-# 	param_dtype: jnp.dtype = jnp.float32
-# 	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-# 	def setup(self):
-# 		config = self.config
-# 		self.embed_dim = config.hidden_size
-
-# 		self.embed_vision = nn.Embed(
-# 			config.vision_vocab_size,
-# 			config.hidden_size,
-# 			embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-# 			dtype=self.dtype,
-# 			param_dtype=self.param_dtype,
-# 		)
-
-# 		self.embed_tokens = nn.Embed(
-# 			config.vocab_size,
-# 			config.hidden_size,
-# 			embedding_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-# 			dtype=self.dtype,
-# 			param_dtype=self.param_dtype,
-# 		)
-# 		self.dropout = nn.Dropout(rate=config.embd_pdrop)
-# 		self.layers = FlaxLlamaBlockCollection(
-# 			self.config,
-# 			dtype=self.dtype,
-# 			param_dtype=self.param_dtype,
-# 			precision=self.precision,
-# 		)
-# 		self.norm = RMSNorm(
-# 			self.config.hidden_size,
-# 			eps=self.config.rms_norm_eps,
-# 			dtype=self.dtype,
-# 			param_dtype=self.param_dtype,
-# 		)
-
-# 		self.causal_mask = nn.make_causal_mask(
-# 			jnp.ones(
-# 				shape=(1, self.config.granted_mask_max_position_embedding),
-# 				dtype="bool",
-# 			),
-# 			dtype="bool",
-# 		)
-
-# 	def __call__(
-# 		self,
-# 		input_ids: jax.Array,
-# 		vision_mask: jax.Array,
-# 		attention_mask: Optional[jax.Array] = None,
-# 		position_ids: Optional[jax.Array] = None,
-# 		deterministic=True,
-# 		init_cache: bool = False,
-# 		output_attentions: bool = False,
-# 		output_hidden_states: bool = False,
-# 		return_dict: bool = True,
-# 	):
-# 		input_ids = input_ids.astype("i4")
-
-# 		if input_ids.shape[1] == 1:
-# 			if self.config.sample_mode == "text":
-# 				input_embeds = self.embed_tokens(input_ids)
-# 			elif self.config.sample_mode == "vision":
-# 				input_embeds = self.embed_vision(input_ids)
-# 			elif self.config.sample_mode == "all":
-# 				raise NotImplementedError
-# 			else:
-# 				raise ValueError(f"Invalid sample_mode: {self.config.sample_mode}")
-# 		else:
-# 			input_text_embeds = self.embed_tokens(jnp.where(vision_mask, 0, input_ids))
-# 			input_vision_embeds = self.embed_vision(jnp.where(vision_mask, input_ids, 0))
-# 			vision_mask = vision_mask[..., None].astype("f4")
-# 			input_embeds = (
-# 				input_text_embeds * (1 - vision_mask) + input_vision_embeds * vision_mask
-# 			)
-
-# 		hidden_states = self.dropout(input_embeds, deterministic=deterministic)
-
-# 		outputs = self.layers(
-# 			hidden_states=hidden_states,
-# 			attention_mask=attention_mask,
-# 			position_ids=position_ids,
-# 			deterministic=deterministic,
-# 			init_cache=init_cache,
-# 			output_attentions=output_attentions,
-# 			output_hidden_states=output_hidden_states,
-# 			return_dict=return_dict,
-# 			causal_mask=self.causal_mask,
-# 		)
-
-# 		hidden_states = outputs[0]
-# 		hidden_states = self.norm(hidden_states)
-
-# 		if output_hidden_states:
-# 			all_hidden_states = outputs[1] + (hidden_states,)
-# 			outputs = (hidden_states, all_hidden_states) + outputs[2:]
-# 		else:
-# 			outputs = (hidden_states,) + outputs[1:]
-
-# 		if not return_dict:
-# 			return tuple(v for v in outputs if v is not None)
-
-# 		return FlaxBaseModelOutput(
-# 			last_hidden_state=hidden_states,
-# 			hidden_states=outputs[1],
-# 			attentions=outputs[-1],
-# 		)
-
-
-# @register_module(
-# 	"vision-language-model",
-# 	config=VisionLlamaConfig,
-# 	model_type="llama",
-# 	embedding_layer_names=["embed_tokens"],
-# )
-# @wrap_custom_easydel_module(
-# 	base=EasyDeLBaseVisionModule,
-# 	config_class=VisionLlamaConfig,
-# 	base_model_prefix="model",
-# )
-# class FlaxVisionLlamaForCausalLM(nn.Module):
-# 	config: VisionLlamaConfig
-# 	dtype: jnp.dtype = jnp.float32
-# 	param_dtype: jnp.dtype = jnp.float32
-# 	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-# 	def setup(self):
-# 		self.model = FlaxVisionLlamaModel.flax_module(
-# 			self.config,
-# 			dtype=self.dtype,
-# 			param_dtype=self.param_dtype,
-# 			precision=self.precision,
-# 		)
-# 		self.vision_head = Dense(
-# 			self.config.vision_vocab_size,
-# 			dtype=self.dtype,
-# 			param_dtype=self.param_dtype,
-# 			use_bias=False,
-# 			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-# 			precision=self.precision,
-# 		)
-# 		self.lm_head = Dense(
-# 			self.config.vocab_size,
-# 			dtype=self.dtype,
-# 			param_dtype=self.param_dtype,
-# 			use_bias=False,
-# 			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-# 			precision=self.precision,
-# 		)
-
-# 	def __call__(
-# 		self,
-# 		input_ids: jax.Array,
-# 		vision_mask: jax.Array,
-# 		attention_mask: Optional[jax.Array] = None,
-# 		position_ids: Optional[jax.Array] = None,
-# 		deterministic=True,
-# 		init_cache: bool = False,
-# 		output_attentions: bool = False,
-# 		output_hidden_states: bool = False,
-# 		return_dict: bool = True,
-# 	):
-# 		batch_size, seq_length = input_ids.shape
-# 		if attention_mask is None:
-# 			attention_mask = jnp.ones_like(input_ids)
-# 		if position_ids is None:
-# 			position_ids = jnp.broadcast_to(
-# 				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-# 				(batch_size, seq_length),
-# 			)
-
-# 		outputs = self.transformer(
-# 			input_ids,
-# 			vision_mask,
-# 			attention_mask,
-# 			position_ids,
-# 			deterministic=deterministic,
-# 			init_cache=init_cache,
-# 			output_attentions=output_attentions,
-# 			output_hidden_states=output_hidden_states,
-# 			return_dict=return_dict,
-# 		)
-
-# 		hidden_states = outputs[0]
-
-# 		if self.config.tie_vision_embeddings:
-# 			shared_kernel = self.transformer.variables["params"]["embed_vision"][
-# 				"embedding"
-# 			].T
-# 			vision_logits = self.vision_head.apply(
-# 				{"params": {"kernel": shared_kernel}}, hidden_states
-# 			)
-# 		else:
-# 			vision_logits = self.vision_head(hidden_states)
-
-# 		if self.config.tie_word_embeddings:
-# 			shared_kernel = self.transformer.variables["params"]["embed_tokens"][
-# 				"embedding"
-# 			].T.astype(self.param_dtype)
-# 			lm_logits = self.lm_head.apply(
-# 				{"params": {"kernel": shared_kernel}},
-# 				hidden_states,
-# 			)
-# 		else:
-# 			lm_logits = self.lm_head(hidden_states)
-
-# 		if self.config.sample_mode == "all":
-# 			if not return_dict:
-# 				return (
-# 					vision_logits,
-# 					lm_logits,
-# 				) + outputs[1:]
-
-# 			return FlaxCausalLMOutput(
-# 				logits=(vision_logits, lm_logits),
-# 				hidden_states=outputs.hidden_states,
-# 				attentions=outputs.attentions,
-# 			)
-# 		elif self.config.sample_mode == "vision":
-# 			if not return_dict:
-# 				return (vision_logits,) + outputs[1:]
-
-# 			return FlaxCausalLMOutput(
-# 				logits=vision_logits,
-# 				hidden_states=outputs.hidden_states,
-# 				attentions=outputs.attentions,
-# 			)
-# 		elif self.config.sample_mode == "text":
-# 			if not return_dict:
-# 				return (lm_logits,) + outputs[1:]
-
-# 			return FlaxCausalLMOutput(
-# 				logits=lm_logits,
-# 				hidden_states=outputs.hidden_states,
-# 				attentions=outputs.attentions,
-# 			)
-# 		else:
-# 			raise ValueError(f"Invalid sample_mode: {self.config.sample_mode}")
+		hidden_states = outputs[0]
+		prediction = self.score(hidden_states)
+		if return_dict:
+			return FlaxSequenceClassifierOutput(
+				logits=prediction,
+				hidden_states=hidden_states,
+			)
+		else:
+			return (prediction,)

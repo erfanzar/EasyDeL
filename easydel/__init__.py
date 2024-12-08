@@ -311,6 +311,7 @@ from easydel.transform import (
 	easystate_to_torch,
 	torch_dict_to_easydel_params,
 )
+from easydel import utils
 
 _targeted_versions = ["0.0.91"]
 

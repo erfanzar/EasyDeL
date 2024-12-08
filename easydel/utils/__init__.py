@@ -15,3 +15,4 @@
 from easydel.utils.helpers import Timer
 from easydel.utils.helpers import Timers
 from easydel.utils.quantizers import EasyQuantizer
+from easydel.utils import graph_utils, analyze_memory, compiling_utils, traversals

@@ -14,6 +14,7 @@
 
 import gc
 import re
+from tabnanny import verbose
 import warnings
 from typing import (
 	Any,
@@ -26,7 +27,6 @@ from typing import (
 )
 
 from flax import nnx
-import flax.traverse_util
 import flax.traverse_util
 import jax.numpy
 from flax.traverse_util import unflatten_dict
@@ -51,6 +51,7 @@ from easydel.modules.modeling_utils import (
 	EasyDeLBaseConfigDict,
 	EasyDeLBaseModule,
 )
+from easydel.modules.flax_modeling_utils import quantize_linear_layers
 from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN
 from easydel.utils import traversals
 
@@ -270,24 +271,24 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 			task_type=TaskType.CAUSAL_LM,
 		)
 
-		logger.debug(f"Downloading model weights from {pretrained_model_name_or_path}")
-		model = AutoModelForCausalLM.from_pretrained(
+		logger.debug(f"Downloading hf_model weights from {pretrained_model_name_or_path}")
+		hf_model = AutoModelForCausalLM.from_pretrained(
 			pretrained_model_name_or_path,
 			**kwargs,
 		)
-		generation_config = getattr(model, "generation_config", None)
+		generation_config = getattr(hf_model, "generation_config", None)
 		if verbose_params:
 			print(
-				f"PyTorch - HF Model contains {sum(p.numel() for p in model.parameters()) / 1e9} Billion Parameters"
+				f"PyTorch - HF Model contains {sum(p.numel() for p in hf_model.parameters()) / 1e9} Billion Parameters"
 			)
 		config_class = config_class.from_pretrained(pretrained_model_name_or_path)
-		state_dict = model.state_dict()
+		state_dict = hf_model.state_dict()
 
-		# Clear and collect memory after deleting the model
-		del model
+		# Clear and collect memory after deleting the hf_model
+		del hf_model
 		_clear()
 
-		logger.debug("adding model basic EasyDeL configurations.")
+		logger.debug("adding hf_model basic EasyDeL configurations.")
 		if hasattr(config_class, "add_jax_args"):
 			config_class.add_jax_args()
 		config_class.add_basic_configurations(
@@ -303,7 +304,7 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 				setattr(config_class, k, v)
 
 		logger.debug("creating easydel model")
-		ed_model = nnx.eval_shape(
+		model = nnx.eval_shape(
 			lambda: module(
 				config=config_class,
 				dtype=dtype,
@@ -312,7 +313,7 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 				rngs=nnx.Rngs(0),
 			)
 		)
-		ed_model.generation_config = generation_config
+		model.generation_config = generation_config
 
 		_clear()
 
@@ -350,8 +351,8 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 			config=config,
 			device=device,
 			shard_fns=shard_fns,
-			quantization_method=quantization_method,
-			quantization_platform=quantization_platform,
+			# quantization_method=quantization_method,
+			# quantization_platform=quantization_platform,
 			params_pattern_selection=params_pattern_selection,
 			remove_state_dict=True,
 			uses_tie_word_embedding=uses_tie_word_embedding,
@@ -367,14 +368,14 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 			logger.info("converted parameters are flatten making them unflatten ")
 			params = unflatten_dict(params)
 
-		if verbose_params:
-			print(
-				f"JAX - EasyDeL Model contains "
-				f"{sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(params))[0]) / 1e9}"
-				f" Billion Parameters"
-			)
-
-		return traversals.attech_tree_to_nnx_model(model=ed_model, tree=params)
+		model = traversals.attech_tree_to_nnx_model(model=model, tree=params)
+		model = quantize_linear_layers(
+			model=model,
+			method=quantization_method,
+			block_size=quantization_block_size,
+			verbose=verbose,
+		)
+		return model
 
 
 class AutoStateForCausalLM:
