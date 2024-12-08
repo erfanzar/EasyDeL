@@ -93,8 +93,8 @@ def _compiled_generate(
 		SampleState: The initial generation state after the first sampling step.
 	"""
 	model = nn.merge(graphdef, graphstate)
-	partition_axes = graphdef.config.partition_axis
-	mesh = graphdef.config.mesh
+	partition_axes = model.config.partition_axis
+	mesh = model.config.mesh
 
 	generation_spec = PartitionSpec(
 		partition_axes.batch_axis,
@@ -298,21 +298,22 @@ class vInference:
 		# fmt:off
 		graphdef, graphstate = nn.split(model)
 		self.graphdef = graphdef 
-		self.graphstate = graphstate 
+		self.graphstate = graphstate
+		self.model=model 
 		self.tokenizer = tokenizer
 		self.generation_config = self._init_generation_config(generation_config, max_new_tokens)
 		if seed is None:
 			seed = random.randint(0, 1e6)
 		self._rng_generator = GenerateRNG(seed)
 		self.input_partition_spec = input_partition_spec or PartitionSpec(("dp", "fsdp"))
-		self.mesh = self.graphdef.config.mesh
+		self.mesh = self.model.config.mesh
 		self._precompile_lock = asyncio.Lock()
 		self._precompiled_configs = set()
 		self._in_compiling_process = set()
 		self._init_shardings()
 		self._validate_token_ids()
 		self._uuid4 = uuid4().hex 
-		self._inference_name = inference_name or self._generate_inference_name(graphdef)
+		self._inference_name = inference_name or self._generate_inference_name(model)
 		self.metrics = vInferenceMetrics(self._inference_name)
 		# fmt:on
 
@@ -324,26 +325,26 @@ class vInference:
 	def _logits_processor(self):
 		return self.generation_config.get_logits_processor()
 
-	def _generate_inference_name(self, graphdef) -> str:
+	def _generate_inference_name(self, model) -> str:
 		"""
-		Generate a standardized inference name combining graphdef type, size, and timestamp.
+		Generate a standardized inference name combining model type, size, and timestamp.
 
 		Format: {model_type}-{size_in_B}B-{timestamp}
 		Example: llama-7.00B-20240311
 		"""
-		model_type = self._get_model_type(graphdef)
+		model_type = self._get_model_type(model)
 		model_size = "NaN"
 		timestamp = datetime.now().strftime("%Y%m%d")
 
 		return f"{model_type}-{model_size}B-{timestamp}"
 
-	def _get_model_type(self, graphdef) -> str:
-		"""Get the graphdef type, with fallback to 'unknown' if not found."""
-		return getattr(graphdef.config, "model_type", "unknown").lower()
+	def _get_model_type(self, model) -> str:
+		"""Get the model type, with fallback to 'unknown' if not found."""
+		return getattr(model.config, "model_type", "unknown").lower()
 
 	def _calculate_model_size(self, graphstate) -> str:
 		"""
-		Calculate graphdef size in billions of parameters.
+		Calculate model size in billions of parameters.
 		Returns formatted string with 2 decimal places.
 		"""
 		try:
@@ -353,7 +354,7 @@ class vInference:
 			size_in_billions = num_params / 1e9
 			return f"{size_in_billions:.2f}"
 		except Exception as e:
-			logger.warning(f"Failed to calculate graphdef size: {e}")
+			logger.warning(f"Failed to calculate model size: {e}")
 			return "unknown"
 
 	@property
@@ -364,7 +365,7 @@ class vInference:
 	def model_prefill_length(self) -> int:
 		"""
 		Calculate the maximum length available for input prefill by subtracting
-		the maximum new tokens from the graphdef's maximum sequence length.
+		the maximum new tokens from the model's maximum sequence length.
 
 		Returns:
 				int: The maximum length available for input prefill
@@ -382,7 +383,7 @@ class vInference:
 
 		if max_length is None:
 			raise ValueError(
-				"Could not determine graphdef's maximum sequence length. "
+				"Could not determine model's maximum sequence length. "
 				f"Looked for attributes: {', '.join(possible_length_attributes)}"
 			)
 
@@ -399,7 +400,7 @@ class vInference:
 				Optional[int]: The maximum length if found, None otherwise
 		"""
 		for attr in attributes:
-			max_length = getattr(self.graphdef.config, attr, None)
+			max_length = getattr(self.model.config, attr, None)
 			if max_length is not None:
 				return max_length
 		return None
@@ -418,15 +419,15 @@ class vInference:
 			vInferenceConfig: The initialized generation configuration.
 		"""
 		if generation_config is None:
-			if self.graphdef.generation_config is not None:
+			if self.model.generation_config is not None:
 				return vInferenceConfig(
-					bos_token_id=self.graphdef.generation_config.bos_token_id,
-					eos_token_id=self.graphdef.generation_config.eos_token_id,
-					pad_token_id=self.graphdef.generation_config.pad_token_id,
-					top_k=self.graphdef.generation_config.top_k,
-					top_p=self.graphdef.generation_config.top_p,
-					temperature=self.graphdef.generation_config.temperature,
-					max_new_tokens=self.graphdef.generation_config.max_new_tokens
+					bos_token_id=self.model.generation_config.bos_token_id,
+					eos_token_id=self.model.generation_config.eos_token_id,
+					pad_token_id=self.model.generation_config.pad_token_id,
+					top_k=self.model.generation_config.top_k,
+					top_p=self.model.generation_config.top_p,
+					temperature=self.model.generation_config.temperature,
+					max_new_tokens=self.model.generation_config.max_new_tokens
 					or max_new_tokens,
 				)
 			return vInferenceConfig(max_new_tokens=max_new_tokens)
@@ -438,15 +439,15 @@ class vInference:
 		"""
 		self.input_sharding = NamedSharding(
 			spec=self.input_partition_spec,
-			mesh=self.graphdef.mesh,
+			mesh=self.model.mesh,
 		)
 		self.empty_sharding = NamedSharding(
 			spec=PartitionSpec(),
-			mesh=self.graphdef.mesh,
+			mesh=self.model.mesh,
 		)
 		self.gen_input_sharding = NamedSharding(
 			spec=PartitionSpec(self.input_partition_spec[0], None),
-			mesh=self.graphdef.mesh,
+			mesh=self.model.mesh,
 		)
 
 	def _validate_token_ids(self):
