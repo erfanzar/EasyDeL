@@ -19,6 +19,8 @@ import flax
 import jax.numpy as jnp
 from jax.core import Tracer
 
+from easydel.layers.caching import TransformerCache
+
 
 def _is_array(array):
 	if isinstance(array, Tracer):
@@ -515,6 +517,7 @@ class FlaxMaskedLMOutput(ModelOutput):
 	logits: jnp.ndarray = None
 	hidden_states: Optional[Tuple[jnp.ndarray]] = None
 	attentions: Optional[Tuple[jnp.ndarray]] = None
+	past_key_values: Optional[TransformerCache] = None
 
 
 FlaxCausalLMOutput = FlaxMaskedLMOutput

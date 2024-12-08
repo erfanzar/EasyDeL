@@ -291,7 +291,7 @@ class SampleState:
 	__str__ = __repr__
 
 
-def create_sampling_step( 
+def create_sampling_step(
 	logits_processor: FlaxLogitsProcessorList,
 	logits_warper: FlaxLogitsProcessorList,
 	eos_token_id: jax.Array,
@@ -312,8 +312,6 @@ def create_sampling_step(
 		"""
 		model_outputs = model(
 			input_ids=state.running_token,
-			params=params,
-			add_params_field=True,
 			return_dict=True,
 			**state.model_kwargs,
 		)

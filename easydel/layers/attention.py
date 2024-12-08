@@ -53,12 +53,14 @@ from easydel.etils.etils import (
 	AVAILABLE_ATTENTION_MECHANISMS,
 	EasyDeLBackends,
 	EasyDeLPlatforms,
+	EasyDeLQuantizationMethods,
 	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
 from easydel.kernels.flash_attention_2 import create_flash_attention
 from easydel.kernels.ring_attention import ring_attention
 from easydel.layers._blockwise_attention import blockwise_attn
+from easydel.layers.caching import TransformerCacheView
 from easydel.modules.modeling_utils import EasyDeLBaseConfig
 from easydel.utils.quantizers import EasyQuantizer
 
@@ -1012,6 +1014,7 @@ class FlexibleAttentionModule(object):
 			) = self.get_bshd_partition_specs(query_sequence_length)
 		b, qs, qh, d = query_states.shape
 		b, ks, kh, d = key_states.shape
+		
 		*_, vd = value_states.shape
 		with self.mesh:
 			query_states = fjformer.with_sharding_constraint(
@@ -1043,7 +1046,11 @@ class FlexibleAttentionModule(object):
 				attention_weight = jnp.add(
 					attention_weight,
 					bias.reshape(
-						b, self.num_kv_heads, self.num_q_heads // self.num_kv_heads, qs, ks
+						b,
+						self.num_kv_heads,
+						self.num_q_heads // self.num_kv_heads,
+						qs,
+						ks,
 					),
 				)
 			elif bias.shape[1] == self.num_kv_heads:
@@ -1704,144 +1711,128 @@ class FlaxAttentionModule(nn.Module):
 			self.cache_index is None and self.cached_key is None and self.cached_value is None
 		)
 
-	def _concatenate_to_cache(self, query, key, value, attention_mask):
-		"""The _concatenate_to_cache function is used to concatenate the key and value vectors
-		of a query  with those of previous queries. This allows for the attention mechanism to
-		look at all previous queries when computing its output. The function takes in three
-		arguments: key, value, and query . It also uses two variables that are stored in the cache:
-		cached_key and cached_value.
+	# def _concatenate_to_cache(self, query, key, value, attention_mask):
+	# 	"""The _concatenate_to_cache function is used to concatenate the key and value vectors
+	# 	of a query  with those of previous queries. This allows for the attention mechanism to
+	# 	look at all previous queries when computing its output. The function takes in three
+	# 	arguments: key, value, and query . It also uses two variables that are stored in the cache:
+	# 	cached_key and cached_value.
 
-		Args:
-		    self: Access the variables stored in the cache
-		    key: Store the keys of the encoder-decoder attention
-		    value: Initialize the cached_value variable
-		    query : Determine the number of cache vectors to update
-		    attention_mask: Mask out the padded vectors in the cache
+	# 	Args:
+	# 	    self: Access the variables stored in the cache
+	# 	    key: Store the keys of the encoder-decoder attention
+	# 	    value: Initialize the cached_value variable
+	# 	    query : Determine the number of cache vectors to update
+	# 	    attention_mask: Mask out the padded vectors in the cache
 
-		Returns:
-		    The key, value and attention_mask
-		"""
-		paxs: PartitionAxis = self.config.partition_axis
+	# 	Returns:
+	# 	    The key, value and attention_mask
+	# 	"""
 
-		# gen_kv_spec = PartitionSpec(
-		# 	paxs.batch_axis,
-		# 	None,
-		# 	paxs.head_axis,
-		# 	paxs.attention_dim_axis,
-		# )
-		kv_spec = PartitionSpec(
-			paxs.batch_axis,
-			paxs.key_sequence_axis,
-			paxs.head_axis,
-			paxs.attention_dim_axis,
-		)
-		cache_initialized = self.cache_initialized
-		if not cache_initialized:
-			self.cached_key = nn.Cache(
-				self.quantizer(
-					jnp.zeros(
-						shape=key.shape,
-						dtype=key.dtype,
-						device=PartitionSpec(
-							paxs.batch_axis,
-							paxs.key_sequence_axis,
-							paxs.head_axis,
-							paxs.attention_dim_axis,
-						),
-					),
-				),
-			)
-			self.cached_value = nn.Cache(
-				self.quantizer(
-					jnp.zeros(
-						shape=key.shape,
-						dtype=key.dtype,
-						device=PartitionSpec(
-							paxs.batch_axis,
-							paxs.key_sequence_axis,
-							paxs.head_axis,
-							paxs.attention_dim_axis,
-						),
-					),
-				)
-			)
-			self.cache_index = nn.Cache(jnp.array((0,), dtype=jnp.int32))
-		if cache_initialized:
-			(
-				*batch_dims,
-				max_length,
-				num_heads,
-				depth_per_head,
-			) = self.cached_key.value.shape
-
-			cur_index = self.cache_index.value
-			zero = jnp.array(0, dtype=lax.dtype(cur_index.dtype))
-			indices = (zero,) * len(batch_dims) + (cur_index, zero, zero)
-			key_val = self.cached_key.value
-			value_val = self.cached_value.value
-			try:
-				key_val = key_val.materialize()
-				value_val = value_val.materialize()
-			except Exception:
-				...
-			key = lax.dynamic_update_slice(key_val, key, indices)
-			value = lax.dynamic_update_slice(value_val, value, indices)
-			num_updated_cache_vectors = query.shape[1]
-			pad_mask = jnp.broadcast_to(
-				jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
-				tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
-			)
-			attention_mask = jnp.logical_and(pad_mask, attention_mask)
-			self.cached_key.value = self.quantizer(with_sharding_constraint(key, kv_spec))
-			self.cached_value.value = self.quantizer(with_sharding_constraint(value, kv_spec))
-			num_updated_cache_vectors = query.shape[1]
-			self.cache_index.value = self.cache_index.value + num_updated_cache_vectors
-		return key, value, attention_mask
-
-	def update_masks(
+	def _concatenate_to_cache(
 		self,
-		*,
-		query: jax.Array,
-		key: jax.Array,
-		attention_mask: jax.Array,
-		causal_mask: Optional[jax.Array],
-		fcm_mask: Optional[jax.Array],
-	) -> Tuple[jax.Array, jax.Array]:
-		"""
-		handles masking
+		query: Array,
+		key: Array,
+		value: Array,
+		cache_view: TransformerCacheView,
+		attention_mask: Array,
+		causal_mask: Optional[Array] = None,
+	) -> Tuple[Array, Array, Array]:
+		num_updated_cache_vectors = query.shape[1]
+		end_index = cache_view.index[0]
 
-		Args:
+		key_value_specs = PartitionSpec(
+			self.config.partition_axis.batch_axis,
+			self.config.partition_axis.key_sequence_axis,
+			self.config.partition_axis.head_axis,
+			self.config.partition_axis.attention_dim_axis,
+		)
 
-		    query (jax.Array): query states from model proj.
-		    key (jax.Array): key states from model proj.
-		    value (jax.Array): value states from model proj.
-		    attention_mask (jax.Array): attention mask.
-		    causal_mask (Optional[jax.Array])): causal_mask if provided.
-		    fcm_mask (Optional[jax.Array]): fcm mask if provided.
+		*batch_dims, max_length, num_heads, depth_per_head = cache_view.value.shape
 
-		Returns:
-		    Tuple[jax.Array,jax.Array]: returns attention_mask and attention_bias
-		"""
-		query_length = query.shape[1]
-		key_length = key.shape[1]
-		if causal_mask is not None:
-			causal_mask = causal_mask[:, :, :query_length, :key_length]
-			causal_mask = jnp.broadcast_to(
-				causal_mask, (query.shape[0],) + causal_mask.shape[1:]
-			)
-			if attention_mask.ndim == 2:
-				attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-			attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
-			attention_mask = nn.combine_masks(attention_mask, causal_mask, fcm_mask)
-		else:
+		if attention_mask.ndim == 2:
 			attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
 
+		if causal_mask is not None:
+			causal_mask = lax.dynamic_slice(
+				causal_mask,
+				(0, 0, end_index, 0),
+				(1, 1, num_updated_cache_vectors, max_length),
+			)
+			causal_mask = jnp.broadcast_to(
+				causal_mask,
+				(query.shape[0],) + causal_mask.shape[1:],
+			)
+			attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
+			attention_mask = jnp.logical_and(attention_mask, causal_mask)
+
+		slice_indices = (0, end_index % cache_view.value.shape[1], 0, 0)
+		value_cache = cache_view.value
+		key_cache = cache_view.key
+		if self.config.kv_cache_quantization_method != EasyDeLQuantizationMethods.NONE:
+			key_cache = key_cache.materialize()
+			value_cache = value_cache.materialize()
+
+		value_cache = lax.dynamic_update_slice(value_cache, value, slice_indices)
+		key_cache = lax.dynamic_update_slice(key_cache, key, slice_indices)
+		pad_mask = jnp.broadcast_to(
+			jnp.arange(max_length) < end_index + num_updated_cache_vectors,
+			tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
+		)
+		attention_mask = jnp.logical_and(pad_mask, attention_mask)
+
+		cache_view.key = self.quantizer(
+			with_sharding_constraint(key_cache, key_value_specs)
+		)
+		cache_view.value = self.quantizer(
+			with_sharding_constraint(value_cache, key_value_specs)
+		)
+		cache_view.index = cache_view.index + num_updated_cache_vectors
+
+		return key_cache, value_cache, attention_mask
+
+	def concatenate(
+		self,
+		*,
+		query: Array,
+		key: Array,
+		value: Array,
+		attention_mask: Array,
+		cache_view: Optional[TransformerCacheView],
+		causal_mask: Optional[Array],
+		fcm_mask: Optional[Array],
+	) -> Tuple[Array, Array, Array, Array]:
+		if cache_view is None:
+			query_length = query.shape[1]
+			key_length = key.shape[1]
+			if causal_mask is not None:
+				causal_mask = causal_mask[:, :, :query_length, :key_length]
+				causal_mask = jnp.broadcast_to(
+					causal_mask, (query.shape[0],) + causal_mask.shape[1:]
+				)
+				if attention_mask.ndim == 2:
+					attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+				attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
+				attention_mask = nn.combine_masks(attention_mask, causal_mask, fcm_mask)
+			else:
+				attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+		else:
+			
+			key, value, attention_mask = self._concatenate_to_cache(
+				query=query,
+				key=key,
+				value=value,
+				cache_view=cache_view,
+				attention_mask=attention_mask,
+				causal_mask=causal_mask,
+			)
+			
 		attention_bias = lax.select(
 			attention_mask > 0,
 			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
 			jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
 		)
-		return attention_mask, attention_bias
+		return key, value, attention_mask, attention_bias
 
 	def shard_attention_prod(self, attn_output: jax.Array) -> jax.Array:
 		"""

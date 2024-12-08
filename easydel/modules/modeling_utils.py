@@ -34,6 +34,10 @@ from typing import (
 	TypeVar,
 	Union,
 )
+from easydel.layers.caching import (
+	TransformerCache,
+	TransformerCacheMetaData,
+)
 from easydel.utils.compiling_utils import hash_fn
 import chex
 import fjformer
@@ -53,7 +57,6 @@ from jax.sharding import Mesh, PartitionSpec
 from transformers.configuration_utils import PretrainedConfig
 from transformers.generation.flax_utils import FlaxSampleOutput
 from transformers.utils.generic import working_or_temp_dir
-from jax.extend import linear_util as lu
 from flax import nnx as nn
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.etils import (
@@ -867,7 +870,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			__hash__ = hash_fn
 
 		initial_rope_kwargs = rope_scaling(rope_type="default")
-		
+
 		if getattr(self, "rope_scaling", None) is not None:
 			scaling_type = self.rope_scaling.get("rope_type", None)
 			scaling_type = self.rope_scaling.get("type", scaling_type)
@@ -910,6 +913,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			dtype=dtype,
 		)
 
+	__hash__ = hash_fn
+
 
 EasyDeLBaseConfigDict.__doc__ = EasyDeLBaseConfig.__init__.__doc__
 EasyDeLBaseConfigDict.__annotations__ = EasyDeLBaseConfig.__annotations__
@@ -920,6 +925,18 @@ class EasyDeLBaseModule(nn.Module):
 	base_model_prefix: str
 	_model_task: Optional[str] = None
 	_model_type: Optional[str] = None
+
+	def __init__(
+		self,
+		config: EasyDeLBaseConfig,
+		dtype: jnp.dtype,
+		param_dtype: jnp.dtype,
+		rngs: nn.Rngs,
+	):
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.rngs = rngs
 
 	@cached_property
 	def mesh(self):
@@ -1017,22 +1034,43 @@ class EasyDeLBaseModule(nn.Module):
 		raise NotImplementedError()
 
 	def init_cache(self, batch_size: int, max_length: int):
-		def init_fn():
-			input_ids = jnp.ones((batch_size, max_length), dtype=jnp.int32)
-			attention_mask = jnp.ones_like(input_ids)
-			position_ids = attention_mask.cumsum(-1)
-			self(
-				input_ids=input_ids,
-				attention_mask=attention_mask,
-				position_ids=position_ids,
-				return_dict=False,
-				init_cache=True,
-			)
-			return nn.split(self, nn.Cache, ...)[1]
+		# def init_fn():
+		# 	input_ids = jnp.ones((batch_size, max_length), dtype=jnp.int32)
+		# 	attention_mask = jnp.ones_like(input_ids)
+		# 	position_ids = attention_mask.cumsum(-1)
+		# 	self(
+		# 		input_ids=input_ids,
+		# 		attention_mask=attention_mask,
+		# 		position_ids=position_ids,
+		# 		return_dict=False,
+		# 		init_cache=True,
+		# 	)
+		# 	return nn.split(self, nn.Cache, ...)[1]
 
-		return jax.tree_map(
-			lambda x: jnp.zeros(x.shape, x.dtype, device=getattr(x, "sharding", None)),
-			jax.eval_shape(init_fn),
+		# return jax.tree_map(
+		# 	lambda x: jnp.zeros(x.shape, x.dtype, device=getattr(x, "sharding", None)),
+		# 	jax.eval_shape(init_fn),
+		# )
+		return TransformerCache.init_layers_cache(
+			num_hidden_layers=self.config.num_hidden_layers,
+			dtype=self.dtype,
+			key_values_partition_specs=PartitionSpec(
+				self.config.partition_axis.batch_axis,
+				self.config.partition_axis.key_sequence_axis,
+				self.config.partition_axis.head_axis,
+				self.config.partition_axis.attention_dim_axis,
+			),
+			metadata=TransformerCacheMetaData.create(
+				batch_size=batch_size,
+				sequence_length=max_length,
+				num_heads=self.config.num_key_value_heads,
+				head_dim=self.config.head_dim,
+			),
+			quantizer=EasyQuantizer(
+				quantization_method=self.config.kv_cache_quantization_method,
+				block_size=self.config.kv_cache_quantization_blocksize,
+				quantization_platform=self.config.platform,
+			),
 		)
 
 	def prepare_inputs_for_generation(
@@ -1056,7 +1094,7 @@ class EasyDeLBaseModule(nn.Module):
 		"""
 		batch_size, seq_length = input_ids.shape
 		past_key_values = self.init_cache(batch_size, max_length)
-		
+
 		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
 		if attention_mask is not None:
 			position_ids = attention_mask.cumsum(axis=-1) - 1
@@ -1146,156 +1184,6 @@ class EasyDeLBaseModule(nn.Module):
 				)
 
 		return filtered_kwargs
-
-	def __call__(
-		self,
-		input_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		params: dict = None,
-		past_key_values: Optional[dict] = None,
-		dropout_rng: jax.random.PRNGKey = None,
-		train: bool = False,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		return_dict: Optional[bool] = None,
-		add_params_field: bool = False,
-		**kwargs,
-	):
-		"""
-		Forward pass through the model.
-
-		Args:
-		    input_ids (chex.Array): Input tensor containing token IDs.
-		    input_embeds (Optional[chex.Array]): embedding inputs to be used instead of input_ids.
-		    attention_mask (Optional[chex.Array]): Mask for attention.
-		    position_ids (Optional[chex.Array]): Positional indices.
-		    segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
-		    params (dict, optional): Parameters for the model.
-		    past_key_values (dict, optional): Past key and value states for caching.
-		    dropout_rng (jax.random.PRNGKey, optional): RNG key for dropout.
-		    train (bool): If True, the model is in training mode.
-		    output_attentions (Optional[bool]): If True, output attention weights.
-		    output_hidden_states (Optional[bool]): If True, output hidden states.
-		    return_dict (Optional[bool]): If True, return a dictionary of outputs.
-		    add_params_field (bool): If True, include the parameters in the input dictionary.
-		    **kwargs: Additional arguments.
-
-		Returns:
-		    Output type depends on the model configuration.
-		"""
-		output_attentions = (
-			output_attentions
-			if output_attentions is not None
-			else self.config.output_attentions
-		)
-		output_hidden_states = (
-			output_hidden_states
-			if output_hidden_states is not None
-			else self.config.output_hidden_states
-		)
-		return_dict = return_dict if return_dict is not None else self.config.return_dict
-		batch_size, sequence_length = (
-			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
-		)
-
-		if position_ids is None:
-			if past_key_values is not None:
-				raise ValueError(
-					"Make sure to provide `position_ids` when passing `past_key_values`."
-				)
-
-			position_ids = jnp.broadcast_to(
-				jnp.arange(sequence_length)[None, :], (batch_size, sequence_length)
-			)
-
-		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, sequence_length))
-
-		rngs = {}
-		if dropout_rng is not None:
-			rngs["dropout"] = dropout_rng
-
-		if self.config.bits is not None:
-			rngs["params"] = jax.random.key(0)
-
-		inputs = (
-			{"params": params or self.params} if add_params_field else params or self.params
-		)
-
-		if past_key_values is not None:
-			inputs["cache"] = past_key_values
-			mutable = ["cache"]
-		else:
-			mutable = False
-		kwargs.pop("deterministic", None)
-		kwargs.pop("init_cache", None)
-		child_call_args = dict(
-			input_ids=jnp.array(input_ids, dtype="i4"),
-			attention_mask=jnp.array(attention_mask, dtype="i4"),
-			position_ids=jnp.array(position_ids, dtype="i4"),
-			deterministic=not train,
-			init_cache=False,
-			output_attentions=output_attentions,
-			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
-			input_embeds=input_embeds,
-			segment_ids=segment_ids,
-			**kwargs,
-		)
-		all_kwargs = {k: v for k, v in child_call_args.items()}
-		filtered_kwargs = self._validate_signature(self.module.__call__, (), all_kwargs)
-		outputs = self.module.apply(inputs, rngs=rngs, mutable=mutable, **filtered_kwargs)
-
-		if past_key_values is not None and return_dict:
-			outputs, past_key_values = outputs
-			outputs["past_key_values"] = unfreeze(past_key_values["cache"])
-			return outputs
-		elif past_key_values is not None and not return_dict:
-			outputs, past_key_values = outputs
-			outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
-
-		return outputs
-
-	def __repr__(self):
-		"""The __repr__ function is used to generate a string representation of an object.
-		This function should return a string that can be parsed by the Python interpreter
-		to recreate the object. The __repr__ function is called when you use print() on an
-		object, or when you type its name in the REPL.
-
-		Args:
-		    self: Refer to the instance of the class
-
-		Returns:
-		    A string representation of the object
-		"""
-		string = f"{self.__class__.__name__}(\n"
-		for k, v in self.__dict__.items():
-			if not k.startswith("_"):
-				try:
-					repr_src = f"  {k} : " + v.__str__().replace("\n", "\n  ") + "\n"
-					string += (
-						repr_src
-						if len(repr_src) < 500
-						else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
-					)
-				except TypeError:
-					pass
-		return string.strip() + "\n)"
-
-	def __str__(self):
-		"""The __str__ function is called when you use the print function or when str() is used.
-		It should return a string representation of the object.
-
-		Args:
-		    self: Refer to the instance of the class
-
-		Returns:
-		    The object's string representation
-		"""
-		return self.__repr__()
 
 	def to_easydel_state(
 		self,
