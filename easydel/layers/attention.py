@@ -1830,7 +1830,7 @@ class FlaxAttentionModule(nn.Module):
 			if self.cache_initialized:
 				causal_mask = lax.dynamic_slice(
 					causal_mask,
-					(0, 0, self.cache_index, 0),
+					(0, 0, self.cache_index.value, 0),
 					(1, 1, query_length, self.cached_key.shape[1]),
 				)
 			else:
