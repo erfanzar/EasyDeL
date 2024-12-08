@@ -27,17 +27,14 @@ from flax.linen import Dense
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import RMSNorm as FlaxGrok1RMSNorm
-from easydel.layers.rotary_embedding import get_rope
 from easydel.modules.factory import register_module
 
 # easydel.modules
 from easydel.modules.flax_modeling_utils import (
-	apply_rotary_pos_emb,
 	block_wise_ffn,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
-	precompute_frequencies,
 )
 from easydel.modules.grok_1.grok_1_configuration import Grok1Config as Grok1Config
 from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
@@ -58,21 +55,6 @@ class MoeModelOutput:
 class MoeCausalLMOutput(FlaxMaskedLMOutput):
 	aux_loss: Optional[chex.Array] = None
 	router_logits: Optional[Tuple[chex.Array]] = None
-
-
-class FlaxGrok1Embedding(nn.Module):
-	dtype: jnp.dtype = jnp.float32
-
-	def __call__(self, query, key, frequencies, position_ids):
-		sin, cos = frequencies
-
-		sin = sin[position_ids][:, None, :, :]
-		cos = cos[position_ids][:, None, :, :]
-
-		key = apply_rotary_pos_emb(key, sin, cos)
-		query = apply_rotary_pos_emb(query, sin, cos)
-
-		return query.astype(self.dtype), key.astype(self.dtype)
 
 
 class FlaxGrok1Attention(FlaxAttentionModule):
@@ -128,7 +110,12 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
 		)
 
-		self.rotary = FlaxGrok1Embedding(self.dtype)
+		self.rotary = self.config.get_basic_rope(
+			self.dtype,
+			self.head_dim,
+			self.head_dim,
+			True,
+		)
 		self.attention_performer = FlexibleAttentionModule(
 			num_q_heads=self.config.num_attention_heads,
 			num_kv_heads=self.config.num_key_value_heads,
@@ -143,19 +130,6 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 			base_config=self.config,
 		)
 		self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
-		initial_rope_kwargs = dict(rope_type="default")
-		if getattr(config, "rope_scaling", None) is not None:
-			scaling_type = config.rope_scaling["type"]
-			scaling_factor = config.rope_scaling["factor"]
-			initial_rope_kwargs = dict(scaling_factor=scaling_factor, rope_type=scaling_type)
-
-		self.rotary = get_rope(
-			head_size=self.head_dim,
-			rotary_dim=self.head_dim,
-			max_position=self.config.granted_freq_max_position_embedding,
-			base=config.rope_theta,
-			rope_scaling=initial_rope_kwargs,
-		)
 
 	def _merge_heads(self, hidden_states):
 		"""
@@ -180,6 +154,7 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
+		frequencies: Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the attention module.
@@ -227,6 +202,7 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 			query=query_states,
 			key=key_states,
 			positions=position_ids,
+			frequencies=frequencies,
 		)
 
 		(
@@ -730,16 +706,9 @@ class FlaxGrok1Model(nn.Module):
 			param_dtype=self.param_dtype,
 		)
 
-		initial_rope_kwargs = dict(rope_type="none")
-		if self.config.rope_scaling is not None:
-			scaling_type = self.config.rope_scaling["type"]
-			scaling_factor = self.config.rope_scaling["factor"]
-			initial_rope_kwargs = dict(scaling_factor=scaling_factor, rope_type=scaling_type)
-		self.frequencies = precompute_frequencies(
-			max_position_embeddings=self.config.granted_freq_max_position_embedding,
-			dim=self.config.hidden_size // self.config.num_attention_heads,
+		self.frequencies = self.config.get_basic_frequencies(
+			head_size=self.config.hidden_size // self.config.num_attention_heads,
 			base=self.config.rope_theta,
-			**initial_rope_kwargs,
 		)
 		self.causal_mask = flax.linen.make_causal_mask(
 			jnp.ones(

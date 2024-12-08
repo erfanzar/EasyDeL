@@ -31,8 +31,7 @@ from easydel.layers.norms import RMSNorm as RMSNorm
 
 # easydel.modules
 from easydel.modules.factory import register_module
-from easydel.modules.flax_modeling_utils import (
-	apply_rotary_pos_emb,
+from easydel.modules.flax_modeling_utils import ( 
 	block_wise_ffn,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
@@ -61,20 +60,6 @@ class MoeCausalLMOutput(FlaxMaskedLMOutput):
 	aux_loss: Optional[chex.Array] = None
 	router_logits: Optional[Tuple[chex.Array]] = None
 
-
-class FlaxQwen2MoeEmbedding(nn.Module):
-	dtype: jnp.dtype = jnp.float32
-
-	def __call__(self, query, key, frequencies, position_ids):
-		sin, cos = frequencies
-
-		sin = sin[position_ids][:, None, :, :]
-		cos = cos[position_ids][:, None, :, :]
-
-		key = apply_rotary_pos_emb(key, sin, cos)
-		query = apply_rotary_pos_emb(query, sin, cos)
-
-		return query.astype(self.dtype), key.astype(self.dtype)
 
 
 class FlaxQwen2MoeMLP(nn.Module):

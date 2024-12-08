@@ -28,7 +28,6 @@ from jax.sharding import PartitionSpec
 from easydel.etils.etils import get_logger
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.modules.flax_modeling_utils import (
-	apply_rotary_pos_emb,
 	get_dot_general_by_bits,
 	with_sharding_constraint,
 )
@@ -36,21 +35,6 @@ from easydel.modules.zamba2.zamba2_configuration import Zamba2Config
 
 re_mat = nn_partitioning.remat
 logger = get_logger(__name__)
-
-
-class FlaxZamba2RotaryEmbedding(nn.Module):
-	dtype: jnp.dtype = jnp.float32
-
-	def __call__(self, key, query, frequencies, position_ids):
-		sin, cos = frequencies
-
-		sin = sin[position_ids][:, None, :, :]
-		cos = cos[position_ids][:, None, :, :]
-
-		key = apply_rotary_pos_emb(key, sin, cos)
-		query = apply_rotary_pos_emb(query, sin, cos)
-
-		return query.astype(self.dtype), key.astype(self.dtype)
 
 
 def count_mem_blocks_in_config(config):
@@ -137,7 +121,7 @@ class FlaxZamba2Attention(FlaxAttentionModule):
 			base_config=self.config,
 		)
 		if config.use_mem_rope:
-			self.rotary = FlaxZamba2RotaryEmbedding(self.dtype)
+			self.rotary = self.config.get_basic_rope(self.dtype, head_size=self.head_dim)
 
 	def _merge_heads(self, hidden_states):
 		"""
@@ -150,32 +134,6 @@ class FlaxZamba2Attention(FlaxAttentionModule):
 		    chex.Array: The hidden states with merged head dimensions.
 		"""
 		return hidden_states.reshape(hidden_states.shape[:2] + (-1,))
-
-	def apply_rotary(self, query, key, frequencies, position_ids):
-		"""
-		Applies rotary positional embeddings to the query and key tensors.
-
-		Args:
-		    query (chex.Array): Query tensor.
-		    key (chex.Array): Key tensor.
-		    frequencies (Tuple[chex.Array, chex.Array]): Tuple containing cosine and sine components for rotary embeddings.
-		    position_ids (chex.Array): Position indices for the tokens.
-
-		Returns:
-		    Tuple[chex.Array, chex.Array]: The modified query and key tensors after applying rotary embeddings.
-		"""
-
-		query, key = self._transpose_sequence_head(
-			query,
-			key,
-		)
-		query, key = self.rotary(
-			position_ids=position_ids,
-			query=query,
-			key=key,
-			frequencies=frequencies,
-		)
-		return self._transpose_sequence_head(query, key)
 
 	def __call__(
 		self,
@@ -233,10 +191,10 @@ class FlaxZamba2Attention(FlaxAttentionModule):
 			self.head_dim,
 		)
 		if self.config.use_mem_rope:
-			query_states, key_states = self.apply_rotary(
+			query_states, key_states = self.rotary(
 				query=query_states,
 				key=key_states,
-				position_ids=position_ids,
+				positions=position_ids,
 				frequencies=frequencies,
 			)
 

@@ -931,11 +931,13 @@ class EasyDeLBaseModule(nn.Module):
 		config: EasyDeLBaseConfig,
 		dtype: jnp.dtype,
 		param_dtype: jnp.dtype,
+		precision: lax.PrecisionLike,
 		rngs: nn.Rngs,
 	):
 		self.config = config
 		self.dtype = dtype
 		self.param_dtype = param_dtype
+		self.precision = precision
 		self.rngs = rngs
 
 	@cached_property
