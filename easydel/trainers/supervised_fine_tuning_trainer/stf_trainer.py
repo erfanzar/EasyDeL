@@ -17,7 +17,7 @@ from abc import ABC
 from typing import Callable, Dict, Optional, Union
 
 from easydel.etils.etils import get_logger
-from easydel.modules.modeling_utils import EasyDeLBaseModule
+from easydel.modules.base_modules.base_module import EasyDeLBaseModule
 from easydel.trainers.base_trainer import TrainerConfigureDataloaderOutput
 from easydel.trainers.causal_language_model_trainer import CausalLanguageModelTrainer
 from easydel.trainers.training_configurations import TrainingArguments
@@ -111,7 +111,7 @@ class SFTTrainer(CausalLanguageModelTrainer, ABC):
 	    ...   dtype=dtype,
 	    ...   param_dtype=dtype,
 	    ...   precision=jax.lax.Precision("fastest"),
-	    ...   auto_shard_params=True,
+	    ...   auto_shard_model=True,
 	    ...   sharding_axis_dims=sharding_axis_dims,
 	    ...   verbose_params=True,
 	    ...   config_kwargs=ed.EasyDeLBaseConfigDict(

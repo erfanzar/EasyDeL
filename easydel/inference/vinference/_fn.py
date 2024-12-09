@@ -18,14 +18,15 @@ import time
 from functools import partial
 
 import jax
-from jax import numpy as jnp
 from flax import nnx as nn
+from jax import numpy as jnp
+
 from easydel.inference.utils import (
 	SampleState,
 	create_sampling_step,
 	vInferenceConfig,
 )
-from easydel.modules.modeling_utils import EasyDeLBaseModule
+from easydel.modules.base_modules import EasyDeLBaseModule
 
 
 def measure_flops(func, *args, **kwargs):

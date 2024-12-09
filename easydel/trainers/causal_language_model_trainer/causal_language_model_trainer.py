@@ -101,7 +101,7 @@ class CausalLanguageModelTrainer(BaseTrainer):
 	...   dtype=dtype,
 	...   param_dtype=dtype,
 	...   precision=jax.lax.Precision("fastest"),
-	...   auto_shard_params=True,
+	...   auto_shard_model=True,
 	...   sharding_axis_dims=sharding_axis_dims,
 	...   verbose_params=True,
 	...   config_kwargs=ed.EasyDeLBaseConfigDict(

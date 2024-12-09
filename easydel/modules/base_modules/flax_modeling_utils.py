@@ -28,12 +28,13 @@ import jax.tree_util
 from aqt.jax.v2 import config as q_config
 from aqt.jax.v2.flax import aqt_flax as q_flax
 from einops import rearrange
+from flax import nnx
 from flax import nnx as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.experimental.mesh_utils import create_device_mesh
 from jax.interpreters import pxla
 from tqdm.auto import tqdm
-from flax import nnx
+
 from easydel.etils.errors import EasyDeLBlockWiseFFNError
 from easydel.etils.etils import (
 	AVAILABLE_SPARSE_MODULE_TYPES,
@@ -41,7 +42,7 @@ from easydel.etils.etils import (
 	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
-from easydel.modules.modeling_utils import EasyMethod
+from easydel.modules.base_modules.base_config import EasyMethod
 from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN
 
 warnings.filterwarnings(
@@ -422,11 +423,11 @@ def quantize_linear_layers(
 	"""
 	if method == EasyDeLQuantizationMethods.NONE:
 		return model
-	from easydel.layers.quantization import LinearNF4, Linear8bit
+	from easydel.layers.quantization import Linear8bit, LinearNF4
 	from easydel.utils.graph_utils import (
 		get_module_from_path,
-		set_module_from_path,
 		iter_module_search,
+		set_module_from_path,
 	)
 
 	quantizer: Linear8bit = {

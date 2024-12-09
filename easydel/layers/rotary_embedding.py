@@ -4,9 +4,9 @@ from __future__ import annotations
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from flax import nnx as nn
 import jax
 import jax.numpy as jnp
+from flax import nnx as nn
 
 
 def _yarn_find_correction_dim(
@@ -1070,8 +1070,8 @@ def get_rope(
 		"head_size",
 		"rotary_dim",
 		"max_position",
-		"base", 
-		"rope_scaling", 
+		"base",
+		"rope_scaling",
 		"partial_rotary_factor",
 	],
 )

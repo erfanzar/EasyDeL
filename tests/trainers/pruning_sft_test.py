@@ -51,7 +51,7 @@ def main():
 	train_dataset = load_dataset("HuggingFaceH4/deita-10k-v0-sft", split="train_sft")
 
 	model = FlaxMistralForCausalLM(config=config, _do_init=True)
-	params = model.shard_params(model.params)
+	params = model.shard_model(model.params)
 
 	def _sh(*a, **kw):
 		return (

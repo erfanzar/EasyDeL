@@ -1,7 +1,7 @@
-modeling_utils package
+vinference._fn package
 ======================
 
-.. automodule:: easydel.modules.modeling_utils
+.. automodule:: easydel.inference.vinference._fn
     :members:
     :undoc-members:
     :show-inheritance:

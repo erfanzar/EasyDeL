@@ -50,7 +50,7 @@ model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 	device_map="auto",
 	# device_map help to load first pytorch model in case that you are facing heavy loads!, we don't need that
 	# if your loading from a easystate, or an easydel model which was saved using `ed_model.save_pretraiend``.
-	auto_shard_params=True,
+	auto_shard_model=True,
 	sharding_axis_dims=sharding_axis_dims,
 	sharding_axis_names=sharding_axis_names,
 	config_kwargs=ed.EasyDeLBaseConfigDict(

@@ -113,7 +113,7 @@ def main(use_iterable_dataset: bool):
 		dtype=dtype,
 		param_dtype=dtype,
 	)
-	params = model.shard_params(model.params)
+	params = model.shard_model(model.params)
 
 	dataset_train, dataset_eval = create_sequence_classification_data_generator(
 		sequence_length=sequence_length,

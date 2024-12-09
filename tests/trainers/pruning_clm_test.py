@@ -63,7 +63,7 @@ def main(use_iterable_dataset: bool):
 	)
 
 	model = FlaxMistralForCausalLM(config=config, _do_init=True)
-	params = model.shard_params(model.params)
+	params = model.shard_model(model.params)
 
 	def data_generator(num_rows: int):
 		for _ in range(num_rows):

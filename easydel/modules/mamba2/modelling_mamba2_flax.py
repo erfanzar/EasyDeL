@@ -43,14 +43,14 @@ from jax.core import ShapedArray
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.common import Conv1D
 from easydel.layers.norms import RMSNorm as FlaxMamba2RMSNorm
-from easydel.modules.factory import register_module
-from easydel.modules.flax_modeling_utils import (
+from easydel.modules.base_modules.base_module import EasyDeLBaseModule
+from easydel.modules.base_modules.factory import register_module
+from easydel.modules.base_modules.flax_modeling_utils import (
 	ACT2FN,
 	get_gradient_checkpoint_policy,
 )
 from easydel.modules.mamba2.mamba2_configuration import Mamba2Config as Mamba2Config
 from easydel.modules.modeling_flax_outputs import FlaxBaseModelOutput
-from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 
 def init_to_value(x, dtype):

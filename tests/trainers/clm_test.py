@@ -59,7 +59,7 @@ def main(use_iterable_dataset: bool):
 		dtype=dtype,
 		param_dtype=dtype,
 	)
-	params = model.shard_params(model.params)
+	params = model.shard_model(model.params)
 
 	new_rng = rng.rng
 

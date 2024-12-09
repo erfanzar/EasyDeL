@@ -26,34 +26,35 @@ from functools import cached_property
 from typing import Any, Dict, Generator, List, Optional, Union, overload
 from uuid import uuid4
 
-from chex import PRNGKey
 import jax
 import numpy as np
+from chex import PRNGKey
 from fjformer import GenerateRNG
+from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
 from pydantic import BaseModel
 from transformers import PreTrainedTokenizer
-from flax import nnx as nn
+
 from easydel.etils.etils import get_logger
 from easydel.inference.utils import (
 	SampleState,
 	vInferenceConfig,
 )
-from easydel.inference.vinference.metrics import vInferenceMetrics
-from easydel.modules.modeling_utils import EasyDeLBaseModule
-from easydel.utils.compiling_utils import (
-	load_compiled_fn,
-	save_compiled_fn,
-	smart_compile,
-)
 from easydel.inference.vinference._fn import (
 	causal_lm_first_iter_fn,
 	causal_lm_iter_fn,
 	get_compiled_funcs,
-	put_compiled_funcs,
 	measure_flops,
+	put_compiled_funcs,
+)
+from easydel.inference.vinference.metrics import vInferenceMetrics
+from easydel.modules.base_modules import EasyDeLBaseModule
+from easydel.utils.compiling_utils import (
+	load_compiled_fn,
+	save_compiled_fn,
+	smart_compile,
 )
 
 logger = get_logger(__name__)
@@ -109,12 +110,12 @@ class vInference:
 		if seed is None:
 			seed = random.randint(0, 1e6)
 		self._rng_generator = GenerateRNG(seed)
-		self.input_partition_spec = input_partition_spec or PartitionSpec(("dp", "fsdp"))
+		self.input_partition_spec = input_partition_spec or PartitionSpec(("dp", "fsdp"), "sp")
 		self.mesh = self.model.config.mesh
 		self._precompile_lock = asyncio.Lock()
 		self._precompiled_configs = set()
 		self._in_compiling_process = set()
-		self._init_shardings()
+		self._init_variables()
 		self._validate_token_ids()
 		self._uuid4 = uuid4().hex 
 		self._inference_name = inference_name or self._generate_inference_name(model)
@@ -234,7 +235,7 @@ class vInference:
 			return vInferenceConfig(max_new_tokens=max_new_tokens)
 		return generation_config
 
-	def _init_shardings(self):
+	def _init_variables(self):
 		"""
 		Initializes the shardings for input data.
 		"""
@@ -250,8 +251,9 @@ class vInference:
 			spec=PartitionSpec(self.input_partition_spec[0], None),
 			mesh=self.model.mesh,
 		)
+		self._init_state = jax.jit(self._init_state_non_jit)
 
-	def _init_state(
+	def _init_state_non_jit(
 		self,
 		input_ids: jax.Array,
 		attention_mask: jax.Array,
@@ -324,7 +326,7 @@ class vInference:
 				model_name=self.metrics.model_name,
 				stage="preprocessing",
 			).time():
-				input_ids = jnp.array(input_ids)
+				input_ids = jnp.array(input_ids, dtype="i4", device=self.input_sharding)
 				batch_size, seq_length = input_ids.shape
 
 				generate_func, interval_func = get_compiled_funcs(
@@ -340,7 +342,11 @@ class vInference:
 					)
 					attention_mask = jnp.ones_like(input_ids)
 
-				attention_mask = jnp.array(attention_mask)
+				attention_mask = jnp.array(
+					attention_mask,
+					dtype="i4",
+					device=self.input_sharding,
+				)
 				state = self._init_state(input_ids=input_ids, attention_mask=attention_mask)
 			with self.metrics.inference_latency.labels(
 				model_name=self.metrics.model_name,

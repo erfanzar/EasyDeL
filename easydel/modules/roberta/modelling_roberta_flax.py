@@ -31,8 +31,9 @@ from jax import numpy as jnp
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.modules.factory import register_module
-from easydel.modules.flax_modeling_utils import (
+from easydel.modules.base_modules.base_module import wrap_easydel_module
+from easydel.modules.base_modules.factory import register_module
+from easydel.modules.base_modules.flax_modeling_utils import (
 	ACT2FN,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
@@ -47,7 +48,6 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxSequenceClassifierOutput,
 	FlaxTokenClassifierOutput,
 )
-from easydel.modules.modeling_utils import wrap_easydel_module
 from easydel.modules.roberta.roberta_configuration import RobertaConfig as RobertaConfig
 
 

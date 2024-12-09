@@ -1,8 +1,9 @@
 import typing as tp
+
 import chex as cx
-from jax import numpy as jnp
-from fjformer.core import ImplicitArray
 from fjformer import with_sharding_constraint
+from fjformer.core import ImplicitArray
+from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import EasyDeLQuantizationMethods

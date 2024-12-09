@@ -3,7 +3,10 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Literal, Optional, Type, TypeVar
 
-from easydel.modules.modeling_utils import EasyDeLBaseConfig, EasyDeLBaseModule
+from easydel.modules.base_modules.base_module import (
+	EasyDeLBaseConfig,
+	EasyDeLBaseModule,
+)
 
 T = TypeVar("T")
 

@@ -1,11 +1,43 @@
 """Utility functions for managing and manipulating nnx module states."""
 
+import typing as tp
 import warnings
+
+import chex
 import jax
-from flax import nnx
+import jax.numpy as jnp
+from flax import nnx, struct
 from flax.nnx import traversals
-from typing import TypeVar, Type
-from flax import struct
+
+
+class MetaValueRecreator:
+	"""Helper class for recreating meta values with state tracking"""
+
+	def __init__(self, seed: int = 42):
+		self._count = 0
+		self._rng = jax.random.PRNGKey(seed)
+
+	def get_count(self) -> jnp.ndarray:
+		count = self._count
+		self._count += 1
+		return jnp.array(count, dtype=jnp.uint32)
+
+	def get_rng(self) -> jax.random.PRNGKey:
+		key, self._rng = jax.random.split(self._rng)
+		return key
+
+
+class TreePath:
+	"""Helper class for managing nested dictionary paths"""
+
+	def __init__(self, parts: tuple, separator: tp.Optional[str] = None):
+		self.parts = parts
+		self.separator = separator
+
+	def __str__(self) -> str:
+		if self.separator is None:
+			return self.parts
+		return self.separator.join(self.parts)
 
 
 @struct.dataclass
@@ -13,8 +45,15 @@ class _EmptyNode:
 	pass
 
 
+@chex.dataclass
+class StateValidationResult:
+	is_valid: bool
+	missing_keys: set
+	invalid_types: tp.Dict[str, type]
+
+
 empty_node = _EmptyNode()
-M = TypeVar("M")
+M = tp.TypeVar("M")
 
 
 def _dict_flatten_dict(xs, keep_empty_nodes=False, is_leaf=None, sep=None):
@@ -60,20 +99,55 @@ def _dict_unflatten_dict(xs, sep=None):
 	return result
 
 
-def flatten_dict(xs, keep_empty_nodes=False, is_leaf=None, sep=None):
-	if isinstance(xs, dict):
-		return _dict_flatten_dict(
-			xs=xs,
-			keep_empty_nodes=keep_empty_nodes,
-			is_leaf=is_leaf,
-			sep=sep,
-		)
-	return traversals.flatten_mapping(
-		xs,
-		keep_empty_nodes=keep_empty_nodes,
-		is_leaf=is_leaf,
-		sep=sep,
-	)
+def flatten_dict(
+	xs: tp.Union[dict, tp.Mapping],
+	keep_empty_nodes: bool = False,
+	is_leaf: tp.Optional[tp.Callable[[tuple, tp.Any], bool]] = None,
+	sep: tp.Optional[str] = None,
+	_prefix: tuple = (),
+) -> tp.Dict[tp.Union[tuple, str], tp.Any]:
+	"""
+	Enhanced dictionary flattening with better type handling and validation.
+
+	Args:
+	    xs: Dictionary or mapping to flatten
+	    keep_empty_nodes: Whether to keep empty dictionary nodes
+	    is_leaf: Optional function to determine leaf nodes
+	    sep: Optional separator for string keys
+	    _prefix: Internal use for recursion
+
+	Returns:
+	    Flattened dictionary
+
+	Raises:
+	    TypeError: If input is not a dictionary or mapping
+	"""
+	if not isinstance(xs, (dict, tp.Mapping)):
+		raise TypeError(f"Expected dict or Mapping, got {type(xs)}")
+
+	result = {}
+
+	def add_item(path: tuple, value: tp.Any):
+		key = TreePath(path, sep).__str__()
+		result[key] = value
+
+	def should_flatten(path: tuple, value: tp.Any) -> bool:
+		if is_leaf and is_leaf(path, value):
+			return False
+		return isinstance(value, (dict, tp.Mapping))
+
+	for key, value in xs.items():
+		path = _prefix + (key,)
+		if should_flatten(path, value):
+			nested = flatten_dict(
+				value, keep_empty_nodes=keep_empty_nodes, is_leaf=is_leaf, sep=sep, _prefix=path
+			)
+			if nested or keep_empty_nodes:
+				result.update(nested)
+		else:
+			add_item(path, value)
+
+	return result
 
 
 def unflatten_dict(xs, sep=None):
@@ -89,7 +163,7 @@ def unflatten_dict(xs, sep=None):
 
 
 def nnx_init(
-	module: Type[M],
+	module: tp.Type[M],
 	_add_rngs: bool = True,
 	_rng_key: str = "rngs",
 	_seed: int = 0,
@@ -201,29 +275,58 @@ def init_garphstate(
 	)[1]
 
 
-def diffrentiate_state(state: dict, init_state: dict) -> dict:
-	"""Differentiates two state dictionaries and returns the differences.
+def validate_state(
+	state: tp.Dict[str, tp.Any], init_state: tp.Dict[str, tp.Any]
+) -> StateValidationResult:
+	"""Validates state against init_state before differentiation."""
+	missing_keys = set(init_state.keys()) - set(state.keys())
+	invalid_types = {
+		k: type(v)
+		for k, v in state.items()
+		if k in init_state and not isinstance(v, type(init_state[k]))
+	}
+	return StateValidationResult(
+		is_valid=len(missing_keys) == 0 and len(invalid_types) == 0,
+		missing_keys=missing_keys,
+		invalid_types=invalid_types,
+	)
 
-	This function compares two state dictionaries, `state` and `init_state`,
-	and returns a new dictionary containing only the keys and values that are
-	present in `init_state` but not in `state`. Only `nnx.VariableState` types
-	are considered for restoration.
+
+def diffrentiate_state(
+	state: tp.Dict[str, tp.Any],
+	init_state: tp.Dict[str, tp.Any],
+	validate: bool = True,
+) -> tp.Dict[str, nnx.VariableState]:
+	"""
+	Enhanced state differentiation with validation and error handling.
 
 	Args:
-	    state: The current state dictionary.
-	    init_state: The initial state dictionary.
+	    state: Current state dictionary
+	    init_state: Initial state dictionary
+	    validate: Whether to perform validation
 
 	Returns:
-	    dict: A dictionary containing the missing attributes from `init_state`.
+	    Dictionary of missing attributes
+
+	Raises:
+	    ValueError: If validation fails and validate=True
 	"""
+	if validate:
+		validation = validate_state(state, init_state)
+		if not validation.is_valid:
+			raise ValueError(
+				f"State validation failed:\n"
+				f"Missing keys: {validation.missing_keys}\n"
+				f"Invalid types: {validation.invalid_types}"
+			)
+
 	missing_attributes = {}
-	restored_keys = list(state.keys())
-	for key in init_state.keys():
-		if key not in restored_keys:
-			assert isinstance(
-				init_state[key], nnx.VariableState
-			), "only VariableState types are restoreable"
-			missing_attributes[key] = init_state[key]
+	for key, value in init_state.items():
+		if key not in state:
+			if not isinstance(value, nnx.VariableState):
+				raise TypeError(f"Value for key {key} must be VariableState, got {type(value)}")
+			missing_attributes[key] = value
+
 	return missing_attributes
 
 
@@ -286,45 +389,44 @@ def is_flatten(tree: dict) -> bool:
 	return True in set(isinstance(k, tuple) for k in tree.keys())
 
 
-def recreate_meta_values(values: dict) -> dict:
-	"""Recreates meta values in a dictionary.
-
-	This function iterates over the input dictionary and recreates the values
-	for specific types: `nnx.RngCount` and `nnx.RngKey`. For `nnx.RngCount`,
-	it assigns a unique integer count. For `nnx.RngKey`, it generates a new
-	random key.
+def recreate_meta_values(
+	values: tp.Dict[str, tp.Any], seed: tp.Optional[int] = None
+) -> tp.Dict[str, tp.Any]:
+	"""
+	Enhanced meta value recreation with better state management.
 
 	Args:
-	    values: The dictionary containing the values to recreate.
+	    values: Dictionary of values to recreate
+	    seed: Optional seed for random number generation
 
 	Returns:
-	    dict: The dictionary with recreated meta values.
+	    Dictionary with recreated meta values
 
 	Raises:
-	    AttributeError: If an unexpected type is encountered in the input
-	        dictionary.
+	    TypeError: For unexpected value types
 	"""
-	input_is_flatten = True
-	if not is_flatten(values):
-		input_is_flatten = False
-		values = traversals.flatten_mapping(values)
-	_miss_count: int = 0
-	_state_rngs: jax.random.PRNGKey = jax.random.PRNGKey(42)
-	for key, value in values.items():
-		if isinstance(value.type, nnx.RngCount) or issubclass(value.type, nnx.RngCount):
-			values[key].value = jax.numpy.array(_miss_count, dtype=jax.numpy.uint32)
-			_miss_count += 1
-		elif isinstance(value.type, nnx.RngKey) or issubclass(value.type, nnx.RngKey):
-			values[key].value = _state_rngs
-			_state_rngs = jax.random.split(_state_rngs)[0]
-		else:
-			
-			raise AttributeError(
-				f"Unexcepted type({value.type}) found which cannot be redefined."
-			)
+	recreator = MetaValueRecreator(seed or 42)
+	input_is_flatten = is_flatten(values)
+
 	if not input_is_flatten:
-		values = traversals.unflatten_mapping(values)
-	return values
+		values = traversals.flatten_mapping(values)
+
+	try:
+		for key, value in values.items():
+			if isinstance(value.type, (nnx.RngCount, type)) and issubclass(
+				value.type, nnx.RngCount
+			):
+				values[key].value = recreator.get_count()
+			elif isinstance(value.type, (nnx.RngKey, type)) and issubclass(
+				value.type, nnx.RngKey
+			):
+				values[key].value = recreator.get_rng()
+			else:
+				raise TypeError(f"Unexpected type {value.type} for key {key}")
+	except Exception as e:
+		raise ValueError(f"Failed to recreate meta values: {str(e)}") from e
+
+	return traversals.unflatten_mapping(values) if not input_is_flatten else values
 
 
 def refine_graphs(*graphs: dict) -> nnx.State:
@@ -352,7 +454,7 @@ def refine_graphs(*graphs: dict) -> nnx.State:
 	return nnx.State.merge(*_state_creators)
 
 
-def attach_tree_to_nnx_state(tree: dict, state: nnx.State) -> nnx.State:
+def merge_state_and_tree(tree: dict, state: nnx.State) -> nnx.State:
 	"""
 	Attaches a parameter tree to an nnx state.
 
@@ -396,7 +498,7 @@ def attach_tree_to_nnx_state(tree: dict, state: nnx.State) -> nnx.State:
 	return state
 
 
-def attech_tree_to_nnx_model(model: M, tree: dict) -> M:
+def merge_model_and_tree(model: M, tree: dict) -> M:
 	graphdef, graphstate = nnx.split(model)
-	graphstate = attach_tree_to_nnx_state(tree=tree, state=graphstate)
+	graphstate = merge_state_and_tree(tree=tree, state=graphstate)
 	return nnx.merge(graphdef, graphstate)

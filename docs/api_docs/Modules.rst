@@ -37,7 +37,6 @@ Modules
    modules.falcon.modeling_falcon_flax
    modules.phimoe.phimoe_configuration
    modules.phimoe.modeling_phimoe_flax
-   modules.modeling_utils
    modules.qwen2_moe.configuration_qwen2_moe
    modules.qwen2_moe.modeling_qwen2_moe_flax
    modules.t5.modelling_t5_flax
@@ -52,7 +51,6 @@ Modules
    modules.phi3.modelling_phi3_flax
    modules.phi3.phi3_configuration
    modules.auto_speech_seq2seq_model
-   modules.factory
    modules.exaone.modeling_exaone_flax
    modules.exaone.exaone_configuration
    modules.gpt2.gpt2_configuration
@@ -68,11 +66,14 @@ Modules
    modules.phi.phi_configuration
    modules.whisper.whisper_configuration
    modules.whisper.modelling_whisper_flax
-   modules.flax_modeling_utils
    modules.gemma2.modeling_gemma2_flax
    modules.gemma2.gemma2_configuration
    modules.olmo.modeling_olmo_flax
    modules.olmo.olmo_configuration
+   modules.base_modules.base_module
+   modules.base_modules.base_config
+   modules.base_modules.factory
+   modules.base_modules.flax_modeling_utils
    modules.auto_causal_language_model
    modules.cohere.cohere_configuration
    modules.cohere.modelling_cohere_flax

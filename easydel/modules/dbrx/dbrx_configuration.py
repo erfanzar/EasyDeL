@@ -18,8 +18,8 @@ import warnings
 from typing import Any, Optional
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
-from easydel.modules.factory import register_config
-from easydel.modules.modeling_utils import EasyDeLBaseConfig
+from easydel.modules.base_modules.base_module import EasyDeLBaseConfig
+from easydel.modules.base_modules.factory import register_config
 
 DBRX_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 

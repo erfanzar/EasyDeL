@@ -26,7 +26,7 @@ def main():
 	model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		pretrained_model_name_or_path,
 		input_shape=(len(jax.devices()), max_length),
-		auto_shard_params=True,
+		auto_shard_model=True,
 		sharding_axis_dims=sharding_axis_dims,
 		config_kwargs=ed.EasyDeLBaseConfigDict(
 			use_scan_mlp=False,

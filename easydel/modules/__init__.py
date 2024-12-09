@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from easydel.modules.base_modules.base_module import (
+	EasyDeLBaseModule,
+	EasyDeLBaseVisionModule,
+)
+from easydel.modules.base_modules.base_config import (
+	EasyDeLBaseConfig,
+	EasyDeLBaseConfigDict,
+)
 from easydel.modules.arctic import (
 	ArcticConfig,
 	FlaxArcticForCausalLM,
@@ -21,14 +29,14 @@ from easydel.modules.auto_causal_language_model import (
 	AutoEasyDeLModelForCausalLM,
 	AutoStateForCausalLM,
 )
-from easydel.modules.auto_speech_seq2seq_model import (
-	AutoEasyDeLModelForSpeechSeq2Seq,
-	AutoStateForSpeechSeq2Seq,
-)
 from easydel.modules.auto_configuration import (
 	AutoEasyDeLConfig,
 	AutoShardAndGatherFunctions,
 	get_modules_by_type,
+)
+from easydel.modules.auto_speech_seq2seq_model import (
+	AutoEasyDeLModelForSpeechSeq2Seq,
+	AutoStateForSpeechSeq2Seq,
 )
 from easydel.modules.cohere import (
 	CohereConfig,
@@ -94,10 +102,10 @@ from easydel.modules.internlm2.modeling_internlm2_flax import (
 	InternLM2Config,
 )
 from easydel.modules.llama import (
+	LlamaConfig,
 	LlamaForCausalLM,
 	# LlamaForSequenceClassification,
 	LlamaModel,
-	LlamaConfig,
 	VisionLlamaConfig,
 )
 from easydel.modules.mamba import (
@@ -124,12 +132,6 @@ from easydel.modules.mixtral import (
 	FlaxMixtralModel,
 	MixtralConfig,
 )
-from easydel.modules.modeling_utils import (
-	EasyDeLBaseConfig,
-	EasyDeLBaseModule,
-	EasyDeLBaseVisionModule,
-	EasyDeLBaseConfigDict,
-)
 from easydel.modules.mosaic_mpt import (
 	FlaxMptForCausalLM,
 	FlaxMptModel,
@@ -146,7 +148,6 @@ from easydel.modules.olmo2 import (
 	FlaxOlmo2Model,
 	Olmo2Config,
 )
-
 from easydel.modules.openelm import (
 	FlaxOpenELMForCausalLM,
 	FlaxOpenELMModel,

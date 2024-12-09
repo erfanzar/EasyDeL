@@ -37,10 +37,11 @@ from easydel.inference.logits_process import (
 	FlaxWhisperTimeStampLogitsProcessor,
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.modules.base_modules.base_module import EasyDeLBaseModule
 
 # easydel.modules
-from easydel.modules.factory import register_module
-from easydel.modules.flax_modeling_utils import (
+from easydel.modules.base_modules.factory import register_module
+from easydel.modules.base_modules.flax_modeling_utils import (
 	ACT2FN,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
@@ -53,7 +54,6 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxSeq2SeqModelOutput,
 	FlaxSequenceClassifierOutput,
 )
-from easydel.modules.modeling_utils import EasyDeLBaseModule
 from easydel.modules.whisper.whisper_configuration import WhisperConfig as WhisperConfig
 
 remat = nn_partitioning.remat

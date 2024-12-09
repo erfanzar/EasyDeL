@@ -126,13 +126,13 @@ def main():
 		state = EasyDeLState.load(
 			module=module,
 			apply_fn=module.__call__,
-			params={"params": module.shard_params(module.params)},
+			params={"params": module.shard_model(module.params)},
 		)
 		ref_state = EasyDeLState.load(
 			module=ref_module,
 			apply_fn=ref_module.__call__,
 			params={
-				"params": ref_module.shard_params(ref_module.params),
+				"params": ref_module.shard_model(ref_module.params),
 			},
 		)
 

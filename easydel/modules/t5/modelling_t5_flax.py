@@ -46,25 +46,24 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.random import PRNGKey
 from jax.sharding import PartitionSpec
 
-
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule
-from easydel.modules.factory import register_module
-from easydel.modules.flax_modeling_utils import (
+from easydel.modules.base_modules.base_module import (
+	EasyDeLBaseModule,
+	wrap_custom_easydel_module,
+)
+from easydel.modules.base_modules.factory import register_module
+from easydel.modules.base_modules.flax_modeling_utils import (
+	ACT2FN,
 	control_mlp_sharding,
 	get_gradient_checkpoint_policy,
 	with_sharding_constraint,
-	ACT2FN,
 )
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutputWithPastAndCrossAttentions,
 	FlaxCausalLMOutputWithCrossAttentions,
 	FlaxSeq2SeqLMOutput,
 	FlaxSeq2SeqModelOutput,
-)
-from easydel.modules.modeling_utils import (
-	EasyDeLBaseModule,
-	wrap_custom_easydel_module,
 )
 from easydel.modules.t5.t5_configuration import T5Config as T5Config
 
