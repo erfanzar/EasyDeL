@@ -490,7 +490,7 @@ def merge_state_and_tree(tree: dict, state: nnx.State) -> nnx.State:
 		else:
 			if key[-1] == "kernel":
 				warnings.warn(
-					"A Params/Kernel Might be missing, please double check.",
+					f"A Params/Kernel Might be missing, please double check ({key}).",
 					stacklevel=1,
 				)
 	others = recreate_meta_values(others)
