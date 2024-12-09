@@ -24,9 +24,12 @@ from flax.struct import dataclass
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import numpy as jnp
 
-from easydel.modules.factory import register_module
+from easydel.modules.base_modules.base_module import (
+	EasyDeLBaseModule,
+	wrap_custom_easydel_module,
+)
+from easydel.modules.base_modules.factory import register_module
 from easydel.modules.modeling_flax_outputs import ModelOutput
-from easydel.modules.modeling_utils import EasyDeLBaseModule, wrap_custom_easydel_module
 from easydel.modules.rwkv.rwkv_configuration import RwkvConfig as RwkvConfig
 
 

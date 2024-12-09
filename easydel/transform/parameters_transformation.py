@@ -13,20 +13,18 @@
 # limitations under the License.
 
 import gc
-import re
-from typing import Callable, List, Mapping, Optional, Tuple
+import typing as tp
+from contextlib import contextmanager
 
 import jax
 from fjformer.checkpoint import get_dtype
-from flax import traverse_util
-from flax.traverse_util import flatten_dict
 from jax import numpy as jnp
 from tqdm.autonotebook import tqdm
 
-from easydel.etils.etils import EasyDeLPlatforms, EasyDeLQuantizationMethods, get_logger
+from easydel.etils.etils import get_logger
 from easydel.transform.utils import jax2pt
-from easydel.utils.quantizers import EasyQuantizer
 from easydel.utils.analyze_memory import SMPMemoryMonitor
+from easydel.utils.traversals import flatten_dict, unflatten_dict
 
 mem_ops = SMPMemoryMonitor(5)
 logger = get_logger(__name__)
@@ -35,10 +33,6 @@ logger = get_logger(__name__)
 def float_tensor_to_dtype(tensor, dtype):
 	"""
 	The float_tensor_to_dtype function is used to convert a tensor's dtype to the specified dtype.
-
-	:param tensor: Convert the tensor to a float dtype
-	:param dtype: Convert the tensor to a specific dtype
-	:return: A tensor with the specified dtype
 
 	"""
 	if dtype is None or dtype == "":
@@ -54,6 +48,12 @@ def float_tensor_to_dtype(tensor, dtype):
 	if getattr(tensor, "dtype", None) in float_dtypes:
 		tensor = tensor.astype(dtype)
 	return tensor
+
+
+def convert_pytorch_tensor_to_jax(tensor, dtype):
+	if "bfloat16" in str(tensor.dtype):
+		tensor = tensor.float()
+	return jnp.asarray(tensor.cpu().detach().numpy(), dtype=dtype)
 
 
 def match_keywords(string, ts, ns):
@@ -79,32 +79,40 @@ def match_keywords(string, ts, ns):
 	return True
 
 
-class _DummyContextManager:
-	def __enter__(self):
-		pass
-
-	def __exit__(self, exc_type, exc_value, traceback):
-		pass
+@contextmanager
+def _dummy_context_manager():
+	yield
 
 
 def process_tensor(
-	key: str,
-	tensor,
-	embedding_layer_names: set,
-	layernorm_names: set,
-	rnn_based_or_rwkv: bool,
-	lm_head_name: Optional[str],
-	uses_tie_word_embedding: bool,
-	dtype: jax.numpy.dtype,
-) -> Optional[Tuple[tuple, jax.numpy.ndarray]]:
+	key: str, tensor: tp.Any, config: tp.Dict[str, tp.Any]
+) -> tp.Optional[tp.Tuple[tuple, jax.numpy.ndarray]]:
+	"""
+	Process a single tensor and return its processed key and value.
+
+	Args:
+	    key: The parameter key
+	    tensor: The tensor to process
+	    config: Dictionary containing processing configuration
+
+	Returns:
+	    tp.Tuple of processed key tuple and JAX array, or None if tensor should be skipped
+	"""
 	new_key = key
 
-	if any(layer_name in key for layer_name in embedding_layer_names):
-		new_key = key[: -len(".weight")] + ".embedding"
-	elif rnn_based_or_rwkv and ("time_mix_" in key or "time_" in key):
+	# Handle embedding layers
+	if any(layer_name in key for layer_name in config["embedding_layer_names"]):
+		new_key = f"{key[:-len('.weight')]}.embedding"
+
+	# Handle RNN/RWKV specific tensors
+	elif config["rnn_based_or_rwkv"] and any(x in key for x in ["time_mix_", "time_"]):
 		tensor = tensor.reshape(-1)
-	elif any(layer_norm in key for layer_norm in layernorm_names):
+
+	# Handle layer normalization
+	elif any(layer_norm in key for layer_norm in config["layernorm_names"]):
 		new_key = key.replace(".weight", ".scale")
+
+	# Handle regular weights
 	elif "weight" in key:
 		if len(tensor.shape) == 2:
 			tensor = tensor.transpose(0, 1)
@@ -112,67 +120,56 @@ def process_tensor(
 			tensor = tensor.transpose(0, 2)
 		new_key = key.replace(".weight", ".kernel")
 
-	key_tuple = tuple((int(n) if n.isdigit() else n) for n in tuple(new_key.split(".")))
+	# Convert key string to tuple
+	key_tuple = tuple(int(n) if n.isdigit() else n for n in new_key.split("."))
 
-	if uses_tie_word_embedding and lm_head_name:
-		if key_tuple[0] == lm_head_name:
+	# Skip if using tied embeddings and this is the language model head
+	if config["uses_tie_word_embedding"] and config["lm_head_name"]:
+		if key_tuple[0] == config["lm_head_name"]:
 			return None
+
 	# Convert tensor to JAX array
-	if hasattr(tensor, "cpu"):  # Check if it's a PyTorch tensor
-		if str(tensor.dtype) == "torch.bfloat16":
-			tensor = tensor.float()
-		array = jnp.asarray(tensor.cpu().detach().numpy()).astype(dtype)
-	else:  # Assume it's already a numpy array
-		array = jnp.array(tensor).astype(dtype)
+	array = convert_pytorch_tensor_to_jax(tensor, config["dtype"])
 
 	return key_tuple, array
 
 
 def torch_dict_to_easydel_params(
-	state_dict: dict,
+	state_dict: tp.Dict[str, tp.Any],
 	*,
-	device: Optional[jax.Device] = None,
-	embedding_layer_names: Optional[List[str]] = None,
-	layernorm_names: Optional[List[str]] = None,
+	device: tp.Optional[jax.Device] = None,
+	embedding_layer_names: tp.Optional[tp.List[str]] = None,
+	layernorm_names: tp.Optional[tp.List[str]] = None,
 	rnn_based_or_rwkv: bool = False,
-	shard_fns: Optional[Mapping[tuple, Callable]] = None,
-	quantization_method: Optional[EasyDeLQuantizationMethods] = None,
-	quantization_platform: Optional[EasyDeLPlatforms] = EasyDeLPlatforms.JAX,
-	block_size: int = 256,
-	params_pattern_selection: Optional[re.Pattern] = None,
-	dtype: jax.numpy.dtype = jax.numpy.float16,
+	shard_fns: tp.Optional[tp.Mapping[tuple, tp.Callable]] = None,
+	dtype: jax.numpy.dtype = jnp.float16,
 	verbose: bool = True,
 	remove_state_dict: bool = False,
-	lm_head_name: Optional[str] = None,
+	lm_head_name: tp.Optional[str] = None,
 	uses_tie_word_embedding: bool = False,
 	**kwargs,
-) -> dict:
+) -> tp.Dict[str, tp.Any]:
 	"""
-	The torch_dict_to_easydel_params function takes a torch model's state_dict and converts it to an easydel
-	model's params. The function is designed to be used in conjunction with the load_huggingface function, which
-	loads a huggingface model from disk. The embedding layer name must be specified as well as the device on which
-	the conversion will take place.
+	Convert PyTorch state dict to EasyDel parameter format.
 
 	Args:
-	    state_dict: Load the weights from a huggingface model
-	    embedding_layer_names: List[str]: Identify the embedding layer in the huggingface model
-	    device: Determine which device the model will be loaded on
-	    layernorm_names: Replaces weight or kernel with (scale)
-	    shard_fns: Optional[Mapping[tuple, Callable]]: Sharding Function to be used to shard model
-	    quantization_method (EasyDeLQuantizationMethods, optional): quantization_method to be used to quantize model weights. Defaults to None.
-	    quantization_platform (Optional[EasyDeLQuantizationMethods], optional): Platform to use for the weight quants. Defaults to None.
-			block_size (int): blocksize for nf4 quantization.
-	    params_pattern_selection: Optional[re.Pattern]: patter to use to find the parameters of the model which will
-	    dtype: jax.numpy.dtype: Specify the data type of the tensors
-	    rnn_based_or_rwkv: bool: rnn_based_or_rwkv is a conditioner  which decide whenever it finds a value in tree
-	    verbose: bool: whenever to log sharding or converting process
-	    remove_state_dict: bool : whether to remove state dict during  the transforming process
-	be converted to 8bit format.
-	that start with time_mix_ it will automatically reshape that for easydel use case
+	    state_dict: PyTorch state dictionary
+	    device: JAX device to use
+	    embedding_layer_names: Names of embedding layers
+	    layernorm_names: Names of layer normalization layers
+	    rnn_based_or_rwkv: Whether model is RNN-based or RWKV
+	    shard_fns: tp.Mapping of parameter names to sharding functions
+	    block_size: Size of processing blocks
+	    params_pattern_selection: Regex pattern for parameter selection
+	    dtype: Target dtype for parameters
+	    verbose: Whether to show progress bar
+	    remove_state_dict: Whether to delete state_dict after conversion
+	    lm_head_name: Name of language model head
+	    uses_tie_word_embedding: Whether model uses tied embeddings
+	    **kwargs: Additional arguments
 
 	Returns:
-	    A dictionary of the weights and biases in a format that can be
-	    used by flax (it's an UnFlattenDict)
+	    Dictionary of converted parameters in EasyDel format
 	"""
 	try:
 		import torch
@@ -181,61 +178,41 @@ def torch_dict_to_easydel_params(
 	except ModuleNotFoundError:
 		_clear = gc.collect
 
-	embedding_layer_names = set(embedding_layer_names or [])
-	layernorm_names = set(layernorm_names or [])
-	quantizer = None
-	if quantization_method is not None:
-		if params_pattern_selection is None:
-			raise ValueError(
-				"In case of quantizing parameters you should pass "
-				"`params_pattern_selection` too, to tell the quantizer"
-				" which parameters should be quantized."
-			)
-		quantizer = EasyQuantizer(
-			quantization_method=quantization_method,
-			block_size=block_size,
-			quantization_platform=quantization_platform,
-		)
+	# Configuration dictionary
+	config = {
+		"embedding_layer_names": set(embedding_layer_names or []),
+		"layernorm_names": set(layernorm_names or []),
+		"rnn_based_or_rwkv": rnn_based_or_rwkv,
+		"lm_head_name": lm_head_name,
+		"uses_tie_word_embedding": uses_tie_word_embedding,
+		"dtype": dtype,
+	}
+
 	device = device or jax.devices()[0]
+	ctx_m = jax.default_device(device) if shard_fns is None else _dummy_context_manager()
 
-	ctx_m = jax.default_device(device) if shard_fns is None else _DummyContextManager()
 	with ctx_m:
-		total_items = len(state_dict)
-		pbar = tqdm(total=total_items, disable=not verbose, desc="Converting Model")
-
 		flax_dict = {}
-		for key, tensor in state_dict.items():
-			result = process_tensor(
-				key,
-				tensor,
-				embedding_layer_names,
-				layernorm_names,
-				rnn_based_or_rwkv,
-				lm_head_name,
-				uses_tie_word_embedding,
-				dtype,
-			)
-			if result is not None:
-				key_tuple, jax_array = result
-				if shard_fns and key_tuple in shard_fns:
-					jax_array = shard_fns[key_tuple](jax_array)
-				if (
-					quantizer is not None
-					and key_tuple[-1] != "embedding"
-					and params_pattern_selection.search("/".join((str(k) for k in key_tuple)))
-				):
-					jax_array = quantizer(array=jax_array)
-
-				flax_dict[key_tuple] = jax_array
-			pbar.update(1)
-
-		pbar.close()
+		with tqdm(
+			total=len(state_dict), disable=not verbose, desc="Converting Model"
+		) as pbar:
+			for key, tensor in state_dict.items():
+				try:
+					result = process_tensor(key, tensor, config)
+					if result is not None:
+						key_tuple, jax_array = result
+						if shard_fns and key_tuple in shard_fns:
+							jax_array = shard_fns[key_tuple](jax_array)
+						flax_dict[key_tuple] = jax_array
+				except Exception as e:
+					print(f"Error processing key {key}: {str(e)}")
+				pbar.update(1)
 
 		if remove_state_dict:
 			del state_dict
 			_clear()
 
-		return traverse_util.unflatten_dict(flax_dict)
+		return unflatten_dict(flax_dict)
 
 
 def easystate_to_torch(

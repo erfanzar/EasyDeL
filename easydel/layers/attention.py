@@ -24,7 +24,6 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 import einops
 import fjformer
 import flax.nnx as nn
-from flax.nnx.nn.dtypes import promote_dtype
 import jax
 import jax.experimental
 import jax.extend
@@ -33,7 +32,7 @@ import jax.tree_util
 import numpy
 from chex import Array
 from fjformer import with_sharding_constraint
-
+from flax.nnx.nn.dtypes import promote_dtype
 from jax import lax, random
 from jax import numpy as jnp
 from jax.experimental.pallas.ops.tpu.splash_attention import (
@@ -60,7 +59,7 @@ from easydel.kernels.flash_attention_2 import create_flash_attention
 from easydel.kernels.ring_attention import ring_attention
 from easydel.layers._blockwise_attention import blockwise_attn
 from easydel.layers.caching import TransformerCacheView
-from easydel.modules.modeling_utils import EasyDeLBaseConfig
+from easydel.modules.base_modules.base_module import EasyDeLBaseConfig
 from easydel.utils.quantizers import EasyQuantizer
 
 try:

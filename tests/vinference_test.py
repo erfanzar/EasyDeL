@@ -3,16 +3,16 @@ import sys
 
 import transformers
 
-
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 
-import easydel as ed
 import jax
-from huggingface_hub import HfApi
-from jax import sharding
-from jax import numpy as jnp
 import torch
+from huggingface_hub import HfApi
+from jax import numpy as jnp
+from jax import sharding
+
+import easydel as ed
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
@@ -29,17 +29,17 @@ def main():
 
 	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		pretrained_model_name_or_path,
-		# auto_shard_params=True,
+		auto_shard_model=False,
 		sharding_axis_dims=sharding_axis_dims,
 		config_kwargs=ed.EasyDeLBaseConfigDict(
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
 			attn_dtype=jnp.float16,
 			gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
-			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
+			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		),
-		quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
+		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 		param_dtype=dtype,
 		dtype=dtype,
 		torch_dtype=torch.float16,
@@ -49,6 +49,8 @@ def main():
 	tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
 	tokenizer.padding_side = "left"
 	tokenizer.pad_token_id = tokenizer.eos_token_id
+	model.eval()
+	model = model.shard_model()
 	inference = ed.vInference(
 		model=model,
 		tokenizer=tokenizer,
@@ -58,7 +60,7 @@ def main():
 			top_p=model.generation_config.top_p,
 			top_k=model.generation_config.top_k,
 			eos_token_id=model.generation_config.eos_token_id,
-			streaming_chunks=1024,
+			streaming_chunks=16,
 		),
 	)
 

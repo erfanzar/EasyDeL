@@ -14,9 +14,7 @@
 
 import os
 from typing import (
-	Any,
 	Callable,
-	List,
 	Mapping,
 	Optional,
 	Sequence,
@@ -33,10 +31,10 @@ from easydel.etils.etils import (
 	EasyDeLQuantizationMethods,
 )
 from easydel.etils.partition_module import PartitionAxis
-from easydel.modules.factory import TaskType
-from easydel.modules.modeling_utils import (
+from easydel.modules.base_modules.base_module import (
 	EasyDeLBaseModule,
 )
+from easydel.modules.base_modules.factory import TaskType
 
 
 class BaseAutoEasyModel:
@@ -45,35 +43,32 @@ class BaseAutoEasyModel:
 	@classmethod
 	def _from_easydel_params(
 		cls,
-		pretrained_model_name_or_path,
-		dtype: jax.numpy.dtype,
-		param_dtype: jax.numpy.dtype,
-		precision: Optional[jax.lax.Precision],
-		sharding_axis_dims: Sequence[int],
-		sharding_axis_names: Sequence[str],
-		partition_axis: PartitionAxis,
-		input_shape: Tuple[int, int],
-		shard_fns: Optional[Mapping[tuple, Callable] | dict],
-		quantization_method: Optional[EasyDeLQuantizationMethods],
-		quantization_platform: Optional[EasyDeLPlatforms],
-		backend: Optional[EasyDeLBackends],
-		platform: Optional[EasyDeLPlatforms],
-		bit_targeted_params: Optional[List[str]],
-		quantization_block_size: int,
-		config_kwargs: Optional[Mapping[str, Any]],
-		auto_shard_params: bool,
-		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]],
-		safe: bool,
+		pretrained_model_name_or_path: str,
+		dtype: jax.numpy.dtype = jax.numpy.float32,
+		param_dtype: jax.numpy.dtype = jax.numpy.float32,
+		precision: Optional[jax.lax.Precision] = None,
+		sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
+		sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+		partition_axis: Optional[PartitionAxis] = None,
+		shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
+		backend: Optional[EasyDeLBackends] = None,
+		platform: Optional[EasyDeLPlatforms] = None,
+		config_kwargs: Optional[dict] = None,
+		auto_shard_model: bool = False,
+		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]] = None,
+		quantization_method: Optional[EasyDeLQuantizationMethods] = None,
+		quantization_platform: Optional[EasyDeLPlatforms] = EasyDeLPlatforms.JAX,
+		quantization_block_size: int = 128,
+		safe: bool = True,
 		**kwargs,
 	):
 		return EasyDeLBaseModule.from_pretrained(
 			pretrained_model_name_or_path=pretrained_model_name_or_path,
-			input_shape=input_shape,
 			dtype=dtype,
 			precision=precision,
 			param_dtype=param_dtype,
 			partition_axis=partition_axis,
-			auto_shard_params=auto_shard_params,
+			auto_shard_model=auto_shard_model,
 			shard_fns=shard_fns,
 			sharding_axis_dims=sharding_axis_dims,
 			sharding_axis_names=sharding_axis_names,
@@ -83,7 +78,6 @@ class BaseAutoEasyModel:
 			partition_rules=partition_rules,
 			quantization_method=quantization_method,
 			quantization_platform=quantization_platform,
-			bit_targeted_params=bit_targeted_params,
 			quantization_block_size=quantization_block_size,
 			safe=safe,
 			model_task=cls.model_task,

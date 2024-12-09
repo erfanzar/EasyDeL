@@ -28,8 +28,9 @@ from jax import numpy as jnp
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import RMSNorm as RMSNorm
-from easydel.modules.factory import register_module
-from easydel.modules.flax_modeling_utils import (
+from easydel.modules.base_modules.base_module import wrap_easydel_module
+from easydel.modules.base_modules.factory import register_module
+from easydel.modules.base_modules.flax_modeling_utils import (
 	ACT2FN,
 	block_wise_ffn,
 	control_mlp_sharding,
@@ -40,7 +41,6 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import wrap_easydel_module
 from easydel.modules.phi3.phi3_configuration import Phi3Config as Phi3Config
 
 re_mat = nn_partitioning.remat

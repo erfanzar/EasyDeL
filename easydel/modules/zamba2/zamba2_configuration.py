@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.factory import register_config
-from easydel.modules.modeling_utils import EasyDeLBaseConfig
+from easydel.modules.base_modules.base_module import EasyDeLBaseConfig
+from easydel.modules.base_modules.factory import register_config
 
 
 @register_config("zamba2")

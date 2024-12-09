@@ -53,6 +53,7 @@ del _os
 # EasyDel Imports
 from packaging.version import Version as _Version
 
+from easydel import utils
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import (
 	EasyDeLRuntimeError,
@@ -81,6 +82,18 @@ from easydel.layers.attention import (
 	AttentionBenchmarker,
 	AttentionMechanisms,
 	FlexibleAttentionModule,
+)
+from easydel.modules.base_modules.factory import (
+	ConfigType,
+	TaskType,
+	register_config,
+	register_module,
+)
+from easydel.modules.base_modules import (
+	EasyDeLBaseConfig,
+	EasyDeLBaseConfigDict,
+	EasyDeLBaseModule,
+	EasyDeLBaseVisionModule,
 )
 from easydel.modules.arctic import (
 	ArcticConfig,
@@ -164,10 +177,10 @@ from easydel.modules.internlm2.modeling_internlm2_flax import (
 	InternLM2Config,
 )
 from easydel.modules.llama import (
+	LlamaConfig,
 	LlamaForCausalLM,
 	# LlamaForSequenceClassification,
 	LlamaModel,
-	LlamaConfig,
 	VisionLlamaConfig,
 )
 from easydel.modules.mamba import (
@@ -193,12 +206,6 @@ from easydel.modules.mixtral import (
 	FlaxMixtralForCausalLM,
 	FlaxMixtralModel,
 	MixtralConfig,
-)
-from easydel.modules.modeling_utils import (
-	EasyDeLBaseConfig,
-	EasyDeLBaseConfigDict,
-	EasyDeLBaseModule,
-	EasyDeLBaseVisionModule,
 )
 from easydel.modules.mosaic_mpt import (
 	FlaxMptForCausalLM,
@@ -278,12 +285,6 @@ from easydel.modules.xerxes import (
 	FlaxXerxesModel,
 	XerxesConfig,
 )
-from easydel.modules.factory import (
-	register_config,
-	register_module,
-	ConfigType,
-	TaskType,
-)
 from easydel.smi import get_mem, initialise_tracking, run
 from easydel.trainers import (
 	BaseTrainer,
@@ -311,7 +312,6 @@ from easydel.transform import (
 	easystate_to_torch,
 	torch_dict_to_easydel_params,
 )
-from easydel import utils
 
 _targeted_versions = ["0.0.91"]
 

@@ -4,18 +4,17 @@ import typing as tp
 
 import jax
 import jax.numpy as jnp
-from jax import lax
-
 from flax import nnx
 from flax.nnx import rnglib
 from flax.nnx.module import Module
 from flax.nnx.nn import dtypes, initializers
 from flax.typing import (
+	DotGeneralT,
 	Dtype,
 	Initializer,
 	PrecisionLike,
-	DotGeneralT,
 )
+from jax import lax
 
 Array = jax.Array
 Axis = int

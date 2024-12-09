@@ -27,10 +27,11 @@ from flax.linen import Dense
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import RMSNorm as FlaxGrok1RMSNorm
-from easydel.modules.factory import register_module
+from easydel.modules.base_modules.base_module import wrap_easydel_module
+from easydel.modules.base_modules.factory import register_module
 
 # easydel.modules
-from easydel.modules.flax_modeling_utils import (
+from easydel.modules.base_modules.flax_modeling_utils import (
 	block_wise_ffn,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
@@ -38,7 +39,6 @@ from easydel.modules.flax_modeling_utils import (
 )
 from easydel.modules.grok_1.grok_1_configuration import Grok1Config as Grok1Config
 from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
-from easydel.modules.modeling_utils import wrap_easydel_module
 
 re_mat = flax.linen.partitioning.remat
 

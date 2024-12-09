@@ -19,13 +19,15 @@ from typing import Optional, Tuple, Union
 import chex
 import jax
 import jax.numpy as jnp
+from flax import nnx as nn
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
 from easydel.layers.norms import RMSNorm
-from easydel.modules.factory import register_module
-from easydel.modules.flax_modeling_utils import (
+from easydel.modules.base_modules.base_module import EasyDeLBaseModule
+from easydel.modules.base_modules.factory import register_module
+from easydel.modules.base_modules.flax_modeling_utils import (
 	ACT2FN,
 	block_wise_ffn,
 	control_mlp_sharding,
@@ -36,6 +38,8 @@ from easydel.modules.flax_modeling_utils import (
 # easydel.modules
 from easydel.modules.llama.llama_configuration import (
 	LlamaConfig as LlamaConfig,
+)
+from easydel.modules.llama.llama_configuration import (
 	VisionLlamaConfig as VisionLlamaConfig,
 )
 from easydel.modules.modeling_flax_outputs import (
@@ -43,12 +47,9 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 	FlaxSequenceClassifierOutput,
 )
-from easydel.modules.modeling_utils import EasyDeLBaseModule
-from flax import nnx as nn
 
 
 class LlamaAttention(FlaxAttentionModule):
-
 	def __init__(
 		self,
 		config: LlamaConfig,

@@ -18,7 +18,6 @@ from typing import Optional, Tuple, Union
 
 import chex
 import jax
-from flax import linen as nn
 from flax.linen import Dense, combine_masks
 from flax.linen import partitioning as nn_partitioning
 from jax import lax
@@ -27,7 +26,7 @@ from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import get_logger
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.modules.flax_modeling_utils import (
+from easydel.modules.base_modules.flax_modeling_utils import (
 	get_dot_general_by_bits,
 	with_sharding_constraint,
 )

@@ -1,7 +1,7 @@
-factory package
+caching package
 ===============
 
-.. automodule:: easydel.modules.factory
+.. automodule:: easydel.layers.caching
     :members:
     :undoc-members:
     :show-inheritance:

@@ -111,7 +111,7 @@ def orpo_main():
 	out = trainer.train(  # noqa
 		model_parameters=FrozenDict(
 			{
-				"params": model.shard_params(
+				"params": model.shard_model(
 					model.params,
 				),
 			},

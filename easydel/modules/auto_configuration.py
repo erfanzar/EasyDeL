@@ -25,7 +25,6 @@ from typing import (
 )
 
 import flax.nnx
-import flax.traverse_util
 from fjformer import make_shard_and_gather_fns, match_partition_rules
 from jax.sharding import PartitionSpec
 
@@ -35,12 +34,13 @@ from easydel.etils.etils import (
 	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
-from easydel.modules.factory import TaskType, registry
-from easydel.modules.modeling_utils import (
+from easydel.modules.base_modules.base_module import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseModule,
 )
+from easydel.modules.base_modules.factory import TaskType, registry
 from easydel.transform.parameters_transformation import torch_dict_to_easydel_params
+from easydel.utils.traversals import flatten_dict, unflatten_dict
 
 logger = get_logger(name=__name__)
 
@@ -195,22 +195,20 @@ class AutoShardAndGatherFunctions:
 			partition_rules = config.get_partition_rules(True)
 		_, module, _ = get_modules_by_type(config.model_type, model_task)
 		model = flax.nnx.eval_shape(lambda: module(config=config, rngs=flax.nnx.Rngs(0)))
+		partition_specs = match_partition_rules(
+			partition_rules, model.graphtree_params_shape
+		)
 
-		partition_specs = match_partition_rules(partition_rules, model.params_shape_tree)
 		shard_fns, gather_fns = make_shard_and_gather_fns(
 			partition_specs=partition_specs,
 			mesh=config.mesh,
 		)
-		if depth_target is not None:
-			for dp in depth_target[::-1]:
-				gather_fns = {dp: gather_fns}
-				shard_fns = {dp: shard_fns}
 		if flatten and not is_flatten(shard_fns):
-			gather_fns = flax.traverse_util.flatten_dict(gather_fns)
-			shard_fns = flax.traverse_util.flatten_dict(shard_fns)
+			gather_fns = flatten_dict(gather_fns)
+			shard_fns = flatten_dict(shard_fns)
 		elif not flatten and is_flatten(shard_fns):
-			gather_fns = flax.traverse_util.unflatten_dict(gather_fns)
-			shard_fns = flax.traverse_util.unflatten_dict(shard_fns)
+			gather_fns = unflatten_dict(gather_fns)
+			shard_fns = unflatten_dict(shard_fns)
 
 		return shard_fns, gather_fns
 
@@ -236,7 +234,6 @@ class AutoShardAndGatherFunctions:
 		flatten: bool = True,
 		config_kwargs: Optional[Mapping[str, Any]] = None,
 		model_task: TaskType = TaskType.CAUSAL_LM,
-		depth_target: Optional[List[str]] = None,
 		from_torch: bool = False,
 		trust_remote_code: bool = False,
 	) -> Tuple[Mapping[str, Callable], Mapping[str, Callable]]:
@@ -255,8 +252,7 @@ class AutoShardAndGatherFunctions:
 		    flatten: Whether to flatten the shard and gather functions. Defaults to True.
 		    config_kwargs: Additional keyword arguments to pass to the `AutoEasyDeLConfig` constructor. Defaults to None.
 				model_task (TaskType): Task type of model load and find.
-		    depth_target: Pad the sharding to depth, for example make {params:tensor} with depth_target = ["row"] to {row:{params:tensor}}. Defaults to None.
-		    from_torch: should config be loaded from torch models or not.
+				from_torch: should config be loaded from torch models or not.
 		    trust_remote_code (bool): whenever to trust remote code loaded from HF.
 		Returns:
 		    A tuple containing the shard and gather functions.
@@ -282,6 +278,5 @@ class AutoShardAndGatherFunctions:
 			config=config,
 			partition_rules=partition_rules,
 			flatten=flatten,
-			depth_target=depth_target,
 			model_task=model_task,
 		)

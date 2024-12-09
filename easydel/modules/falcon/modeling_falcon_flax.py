@@ -26,19 +26,19 @@ from jax import numpy as jnp
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.modules.factory import register_module
-from easydel.modules.falcon.falcon_configuration import FalconConfig as FalconConfig
-from easydel.modules.flax_modeling_utils import (
+from easydel.modules.base_modules.base_module import wrap_easydel_module
+from easydel.modules.base_modules.factory import register_module
+from easydel.modules.base_modules.flax_modeling_utils import (
 	block_wise_ffn,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
 )
+from easydel.modules.falcon.falcon_configuration import FalconConfig as FalconConfig
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 )
-from easydel.modules.modeling_utils import wrap_easydel_module
 
 
 def built_bloom_alibi(attention_mask, num_attention_heads):

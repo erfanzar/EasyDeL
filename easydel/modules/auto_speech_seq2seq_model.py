@@ -44,11 +44,9 @@ from easydel.modules.auto_configuration import (
 	is_flatten,
 )
 from easydel.modules.auto_modeling import BaseAutoEasyModel
-from easydel.modules.factory import TaskType
-from easydel.modules.modeling_utils import (
-	EasyDeLBaseConfigDict,
-	EasyDeLBaseModule,
-)
+from easydel.modules.base_modules.base_config import EasyDeLBaseConfigDict
+from easydel.modules.base_modules.base_module import EasyDeLBaseModule
+from easydel.modules.base_modules.factory import TaskType
 from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN
 
 logger = get_logger(name=__name__)
@@ -73,7 +71,7 @@ class AutoEasyDeLModelForSpeechSeq2Seq(BaseAutoEasyModel):
 	    >>> # Load a openai/whisper-large-v3-turbo sharded
 	    >>> model, params = AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
 	    ...  "openai/whisper-large-v3-turbo",
-	    ...  auto_shard_params=True,
+	    ...  auto_shard_model=True,
 	    >>> )
 
 	    >>> # Load a openai/whisper-large-v3-turbo model sharded across 8 GPUs with data parallelism (DP) and fully sharded data parallelism (FSDP)
@@ -106,7 +104,7 @@ class AutoEasyDeLModelForSpeechSeq2Seq(BaseAutoEasyModel):
 		backend: Optional[EasyDeLBackends] = None,
 		platform: Optional[EasyDeLPlatforms] = None,
 		config_kwargs: Optional[EasyDeLBaseConfigDict] = None,
-		auto_shard_params: bool = False,
+		auto_shard_model: bool = False,
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]] = None,
 		quantization_method: Optional[EasyDeLQuantizationMethods] = None,
 		quantization_platform: Optional[EasyDeLPlatforms] = EasyDeLPlatforms.JAX,
@@ -131,11 +129,11 @@ class AutoEasyDeLModelForSpeechSeq2Seq(BaseAutoEasyModel):
 		    partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
 		    shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
 		    input_shape (Tuple[int, int, int], optional): Shape of the input to the model. Defaults to (1, 1).
-		    shard_fns (Optional[Mapping[tuple, Callable] | dict], optional): Sharding functions to use for the model. If None, auto-sharding is used if auto_shard_params is True. Defaults to None.
+		    shard_fns (Optional[Mapping[tuple, Callable] | dict], optional): Sharding functions to use for the model. If None, auto-sharding is used if auto_shard_model is True. Defaults to None.
 		    platform (Optional[EasyDeLPlatforms], optional): platform to use for the model. Defaults to None.
 				backend (Optional[EasyDeLBackends], optional): backend to use for the model. Defaults to None.
 		    config_kwargs (Optional[Mapping[str, Any] | EasyDeLBaseConfigDict], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
-		    auto_shard_params (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
+		    auto_shard_model (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
 		    partition_rules (Optional[Tuple[Tuple[str, PartitionSpec]]], optional): Custom partition rules for parameter sharding. If not None, shard_fns should also be provided. Defaults to None.
 		    quantization_method (EasyDeLQuantizationMethods, optional): quantization_method to be used to quantize model weights. Defaults to None.
 		    quantization_platform (Optional[EasyDeLPlatforms], optional): Platform to use for the weight quants. Defaults to None.
@@ -167,7 +165,7 @@ class AutoEasyDeLModelForSpeechSeq2Seq(BaseAutoEasyModel):
 				param_dtype=param_dtype,
 				dtype=dtype,
 				shard_fns=shard_fns,
-				auto_shard_params=auto_shard_params,
+				auto_shard_model=auto_shard_model,
 				precision=precision,
 				backend=backend,
 				platform=platform,
@@ -188,7 +186,7 @@ class AutoEasyDeLModelForSpeechSeq2Seq(BaseAutoEasyModel):
 			)
 		with jax.default_device(device):
 			return cls._from_easydel_params(
-				auto_shard_params=auto_shard_params,
+				auto_shard_model=auto_shard_model,
 				input_shape=input_shape,
 				partition_axis=partition_axis,
 				sharding_axis_dims=sharding_axis_dims,
@@ -226,7 +224,7 @@ class AutoEasyDeLModelForSpeechSeq2Seq(BaseAutoEasyModel):
 		backend: Optional[EasyDeLBackends],
 		platform: Optional[EasyDeLPlatforms],
 		config_kwargs: Optional[Mapping[str, Any]],
-		auto_shard_params: bool,
+		auto_shard_model: bool,
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]],
 		quantization_method: Optional[EasyDeLQuantizationMethods],
 		quantization_platform: Optional[EasyDeLPlatforms],
@@ -332,15 +330,15 @@ class AutoEasyDeLModelForSpeechSeq2Seq(BaseAutoEasyModel):
 		_clear()
 
 		if shard_fns is not None:
-			if auto_shard_params:
+			if auto_shard_model:
 				warnings.warn(
-					"`auto_shard_params` will be ignored since you are passing custom sharding functions",
+					"`auto_shard_model` will be ignored since you are passing custom sharding functions",
 					stacklevel=1,
 				)
 			logger.debug("sharding model parameters based on the given shard_fns.")
 			if not is_flatten(shard_fns):
 				shard_fns = flax.traverse_util.flatten_dict(shard_fns)
-		elif auto_shard_params:
+		elif auto_shard_model:
 			shard_fns, _ = AutoShardAndGatherFunctions.from_pretrained(
 				pretrained_model_name_or_path=pretrained_model_name_or_path,
 				partition_rules=partition_rules,
@@ -409,7 +407,7 @@ class AutoStateForSpeechSeq2Seq:
 		shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
 		backend: Optional[str] = None,
 		config_kwargs: Optional[Mapping[str, Any]] = None,
-		auto_shard_params: bool = False,
+		auto_shard_model: bool = False,
 		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]] = None,
 		load_in_8bit: bool = False,
 		bit_targeted_params: Optional[List[str]] = None,
@@ -433,10 +431,10 @@ class AutoStateForSpeechSeq2Seq:
 		    partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
 		    shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
 		    input_shape (Tuple[int, int], optional): Shape of the input to the model. Defaults to (1, 1).
-		    shard_fns (Optional[Mapping[tuple, Callable] | dict], optional): Sharding functions to use for the model. If None, auto-sharding is used if auto_shard_params is True. Defaults to None.
+		    shard_fns (Optional[Mapping[tuple, Callable] | dict], optional): Sharding functions to use for the model. If None, auto-sharding is used if auto_shard_model is True. Defaults to None.
 		    backend (Optional[str], optional): Backend to use for the model. Defaults to None.
 		    config_kwargs (Optional[Mapping[str, Any]], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
-		    auto_shard_params (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
+		    auto_shard_model (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
 		    partition_rules (Optional[Tuple[Tuple[str, PartitionSpec]]], optional): Custom partition rules for parameter sharding. If not None, shard_fns should also be provided. Defaults to None.
 		    quantization_method (EasyDeLQuantizationMethods, optional): quantization_method to be used to quantize model weights. Defaults to None.
 		    bit_targeted_params (Optional[List[str]], optional): List of parameter names to convert to 8-bit precision. If  None and 8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
@@ -462,7 +460,7 @@ class AutoStateForSpeechSeq2Seq:
 			shard_fns=shard_fns,
 			backend=backend,
 			config_kwargs=config_kwargs,
-			auto_shard_params=auto_shard_params,
+			auto_shard_model=auto_shard_model,
 			partition_rules=partition_rules,
 			load_in_8bit=load_in_8bit,
 			bit_targeted_params=bit_targeted_params,

@@ -27,22 +27,22 @@ from flax.linen.partitioning import remat
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.modules.dbrx.dbrx_configuration import (
-	DbrxAttentionConfig as DbrxAttentionConfig,
-)
-from easydel.modules.dbrx.dbrx_configuration import DbrxConfig as DbrxConfig
-from easydel.modules.dbrx.dbrx_configuration import DbrxFFNConfig as DbrxFFNConfig
+from easydel.modules.base_modules.base_module import wrap_easydel_module
 
 # easydel.modules
-from easydel.modules.factory import register_module
-from easydel.modules.flax_modeling_utils import (
+from easydel.modules.base_modules.factory import register_module
+from easydel.modules.base_modules.flax_modeling_utils import (
 	ACT2FN,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
 )
+from easydel.modules.dbrx.dbrx_configuration import (
+	DbrxAttentionConfig as DbrxAttentionConfig,
+)
+from easydel.modules.dbrx.dbrx_configuration import DbrxConfig as DbrxConfig
+from easydel.modules.dbrx.dbrx_configuration import DbrxFFNConfig as DbrxFFNConfig
 from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
-from easydel.modules.modeling_utils import wrap_easydel_module
 
 
 @flax.struct.dataclass

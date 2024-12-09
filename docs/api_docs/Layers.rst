@@ -9,4 +9,7 @@ Layers
    layers.norms
    layers.attention
    layers._blockwise_attention
+   layers.quantization.linear_8bit
+   layers.quantization.linear_nf4
    layers.common
+   layers.caching

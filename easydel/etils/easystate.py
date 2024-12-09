@@ -113,7 +113,7 @@ class EasyDeLState(struct.PyTreeNode):
 	  state.
 	* **Optimizer Management (`apply_gradients`, `free_opt_state`, `init_opt_state`)**: Provides methods for updating the
 	  model's parameters using gradients, releasing optimizer memory, and re-initializing the optimizer if needed.
-	* **Sharding (`shard_params`)**:  Helps you distribute your model's parameters efficiently across multiple devices (
+	* **Sharding (`shard_model`)**:  Helps you distribute your model's parameters efficiently across multiple devices (
 	  important for training large models).
 	* **PyTorch Conversion (`to_pytorch`)**:  Gives you a way to convert your EasyDeL model to its PyTorch equivalent.
 
@@ -628,7 +628,7 @@ class EasyDeLState(struct.PyTreeNode):
 		sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
 		partition_axis: Optional[PartitionAxis] = None,
 		shard_attention_computation: bool = True,
-		auto_shard_params: bool = False,
+		auto_shard_model: bool = False,
 		input_shape: Sequence[int] = (1, 1),
 		backend: Optional[str] = None,
 		init_optimizer_state: bool = False,
@@ -657,7 +657,7 @@ class EasyDeLState(struct.PyTreeNode):
 		    sharding_axis_names (Sequence[str], optional): The names of the axes for sharding. Defaults to ("dp", "fsdp", "tp", "sp").
 		    partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
 		    shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
-		    auto_shard_params (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
+		    auto_shard_model (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
 		    input_shape (Sequence[int], optional): The shape of the input data. Defaults to (1, 1).
 		    backend (Optional[str], optional): The backend to use for computations. Defaults to None.
 		    init_optimizer_state (bool, optional): Whether to initialize the optimizer state. Defaults to False.
@@ -700,7 +700,7 @@ class EasyDeLState(struct.PyTreeNode):
 				input_shape=input_shape,  # type:ignore
 				backend=backend,
 				config_kwargs=config_kwargs,
-				auto_shard_params=auto_shard_params,
+				auto_shard_model=auto_shard_model,
 				**kwargs,
 			)
 			if tx_init is None:
@@ -777,7 +777,7 @@ class EasyDeLState(struct.PyTreeNode):
 		self = self.replace(params=quantize_params(self.params))  # type:ignore #noqa
 		return self
 
-	def shard_params(
+	def shard_model(
 		self,
 		fully_sharded_data_parallel: bool = True,
 		shard_fns: Optional[Mapping[str, Callable]] = None,

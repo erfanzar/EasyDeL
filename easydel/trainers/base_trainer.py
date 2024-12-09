@@ -50,7 +50,7 @@ from jax import numpy as jnp
 
 from easydel import __version__
 from easydel.etils.etils import get_logger
-from easydel.modules.modeling_utils import (
+from easydel.modules.base_modules.base_module import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseModule,
 )
@@ -754,7 +754,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
     dtype=jnp.float16,
     param_dtype=jnp.float16,
     precision=lax.Precision("fastest"),
-    auto_shard_params=True,
+    auto_shard_model=True,
 )
 ```
 

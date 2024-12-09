@@ -31,19 +31,19 @@ from jax.sharding import PartitionSpec
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.norms import RMSNorm
-from easydel.modules.chatglm.chatglm_configuration import ChatGLMConfig as ChatGLMConfig
-from easydel.modules.factory import register_module
+from easydel.modules.base_modules.base_module import EasyDeLBaseModule
+from easydel.modules.base_modules.factory import register_module
 
 # easydel.modules
-from easydel.modules.flax_modeling_utils import (
+from easydel.modules.base_modules.flax_modeling_utils import (
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
 	with_sharding_constraint,
 )
+from easydel.modules.chatglm.chatglm_configuration import ChatGLMConfig as ChatGLMConfig
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 )
-from easydel.modules.modeling_utils import EasyDeLBaseModule
 
 
 def flatten_axes(a: Array, start: int = 0, end: int = -1) -> Array:
