@@ -27,7 +27,7 @@ import numpy as np
 import torch
 import transformers
 from fjformer.functions import cross_entropy_loss_and_accuracy
-from flax.traverse_util import flatten_dict, unflatten_dict  # noqa
+from flax import nnx as nn
 from jax import numpy as jnp
 from tabulate import tabulate
 
@@ -96,10 +96,12 @@ class EasyModelsTest(unittest.TestCase):
 		)
 		self.platform = "triton"
 
-	def create_test_for_models(self, module_name: str, hf_module_class):
-		(module_config, module_class, transform_function) = ed.get_modules_by_type(
-			module_name
-		)
+	def create_test_for_models(self, module_name: str, hf_module_class, task):
+		(
+			module_config,
+			module_class,
+			transform_function,
+		) = ed.get_modules_by_type(module_name, task)
 		if self.header_config is None:
 			config = module_config(
 				num_experts_per_tok=self.num_experts_per_tok,
@@ -137,13 +139,11 @@ class EasyModelsTest(unittest.TestCase):
 		hf_model = hf_module_class(config=copy.deepcopy(config))
 		hf_model.eval()
 		hf_model = hf_model.float()
-		params = {
-			"params": transform_function(
-				state_dict=hf_model.state_dict(),
-				device=jax.devices("cpu")[0],
-				remove_state_dict=True,
-			)
-		}
+		params = transform_function(
+			state_dict=hf_model.state_dict(),
+			device=jax.devices("cpu")[0],
+			remove_state_dict=True,
+		)
 
 		config.add_jax_args()
 		config.add_basic_configurations(
@@ -154,10 +154,6 @@ class EasyModelsTest(unittest.TestCase):
 		mesh = config.mesh
 
 		with mesh:
-			partition_specs = match_partition_rules(config.get_partition_rules(True), params)
-			shard, _ = make_shard_and_gather_fns(partition_specs, mesh)
-
-			params = jax.tree_util.tree_map(lambda p, f: f(p), params, shard)
 			config.add_basic_configurations(
 				attn_mechanism=self.attn_mechanism,
 				blocksize_k=self.blocksize_k,
@@ -165,12 +161,11 @@ class EasyModelsTest(unittest.TestCase):
 				attn_dtype=self.attn_dtype,
 			)
 			if module_name == "exaone":  # it's EXAONE Issue
-				flatten_params = flatten_dict(params, sep=".")
+				flatten_params = ed.traversals.flatten_dict(params, sep=".")
 				params = {}
 				for k in list(flatten_params.keys()):
 					params[k.replace("attn.attention", "attn")] = flatten_params[k]
-				params = unflatten_dict(params, sep=".")
-
+				params = ed.traversals.unflatten_dict(params, sep=".")
 			torch_input_ids, jax_input_ids = self.make_input_id(
 				self.vocab_size,
 				(self.batch_size, self.sequence_length + 1),
@@ -187,27 +182,22 @@ class EasyModelsTest(unittest.TestCase):
 				dtype=self.dtype,
 				param_dtype=self.dtype,
 				precision=self.precision,
-				_do_init=False,
-				input_shape=(self.batch_size, self.sequence_length),
+				rngs=nn.Rngs(0),
 			)
+			ed_model = ed.traversals.merge_model_and_tree(ed_model, params)
+			ed_model.eval()
+			ed_model = ed_model.shard_model()
 
-			ed_output = ed_model(
-				input_ids=jax_input_ids[:, :-1],
-				params=params,
-				return_dict=True,
-				add_params_field=False,
-				train=False,
-				deterministic=True,
-			)
+			@jax.jit
+			def jited(ids):
+				return ed_model(
+					input_ids=ids[:, :-1],
+					return_dict=True,
+				)
+
+			ed_output = jited(jax_input_ids)
 			easy_time = time.time()
-			ed_output = ed_model(
-				input_ids=jax_input_ids[:, :-1],
-				params=params,
-				return_dict=True,
-				add_params_field=False,
-				train=False,
-				deterministic=True,
-			)
+			ed_output = jited(jax_input_ids)
 			easy_time = time.time() - easy_time
 			loss, _ = cross_entropy_loss_and_accuracy(
 				ed_output.logits,
@@ -279,14 +269,12 @@ class EasyModelsTest(unittest.TestCase):
 				blocksize_k=self.blocksize_k,
 				blocksize_q=self.blocksize_q,
 			)
-			# prm = flax.traverse_util.flatten_dict(params, sep=".")
+
 			ed_model = module_class(
 				config=config,
 				dtype=self.dtype,
 				param_dtype=self.dtype,
 				precision=self.precision,
-				_do_init=False,
-				input_shape=(self.batch_size, self.sequence_length),
 			)
 
 			torch_input_ids, jax_input_ids = self.make_input_id(
@@ -302,8 +290,6 @@ class EasyModelsTest(unittest.TestCase):
 				input_ids=jax_input_ids[:, :-1],
 				params=params,
 				return_dict=True,
-				add_params_field=False,
-				train=False,
 				output_router_logits=True,
 			)
 			loss, _ = cross_entropy_loss_and_accuracy(
@@ -331,7 +317,11 @@ class EasyModelsTest(unittest.TestCase):
 			"original_max_position_embeddings": 8192,
 			"rope_type": "llama3",
 		}
-		res, err = self.create_test_for_models("llama", transformers.LlamaForCausalLM)
+		res, err = self.create_test_for_models(
+			"llama",
+			transformers.LlamaForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"Llama model Failed [ERROR {err}]")
 		self.rope_scaling = None
 
@@ -529,7 +519,7 @@ class EasyModelsTest(unittest.TestCase):
 	def test_arctic(self):
 		self.header_config = None
 		hf_model, conf = self.get_hf_model_from_hub("Snowflake/snowflake-arctic-instruct")
-		res, err = self.create_test_for_models("arctic", hf_model)
+		res, err = self.create_test_for_models("arctic", hf_model, ed.TaskType.CAUSAL_LM)
 		self.assertTrue(res, f"ARCTIC model Failed [ERROR {err}]")
 
 	def test_rwkv(self):
@@ -682,31 +672,31 @@ if __name__ == "__main__":
 	# unittest.main()
 	test = EasyModelsTest()
 	test.setUp()
-	test.test_arctic()  # Passed v0.0.80 - N Runtime
-	test.test_cohere()  # Passed v0.0.80 - N Runtime
-	test.test_dbrx()  # Passed  v0.0.80 - N Runtime
-	test.test_deepseek_v2()  # Passed v0.0.80 - X Runtime
-	test.test_exaone()  # Passed v0.0.80 - N Runtime
-	test.test_falcon()  # Passed v0.0.80 - N Runtime
-	test.test_gemma()  # Passed v0.0.80 - N Runtime
-	test.test_gemma2()  # Passed v0.0.80 - N Runtime
-	test.test_gptj()  # Passed v0.0.80 - N Runtime
-	test.test_gpt2()  # Passed v0.0.80 - N Runtime
+	test.test_arctic()
+	# test.test_cohere()
+	# test.test_dbrx()
+	# test.test_deepseek_v2()
+	# test.test_exaone()
+	# test.test_falcon()
+	# test.test_gemma()
+	# test.test_gemma2()
+	# test.test_gptj()
+	# test.test_gpt2()
 	# test.test_grok1() # should be impl
-	test.test_internlm2()  # Passed v0.0.80 - N Runtime
-	test.test_llama()  # Passed v0.0.80 - N Runtime
-	test.test_mamba()  # Passed v0.0.80 - N Runtime
-	test.test_mamba2()  # Passed v0.0.80 - N Runtime
-	test.test_mistral()  # Passed v0.0.80 - N Runtime
-	test.test_mixtral()  # Passed v0.0.80 - N Runtime
-	test.test_mpt()  # Passed v0.0.80 - N Runtime
-	test.test_olmo()  # Passed v0.0.80 - N Runtime
-	test.test_olmo2()  # Passed v0.0.80 - N Runtime
-	test.test_openelm()  # Passed v0.0.80 - N Runtime
-	test.test_phi()  # Passed v0.0.80 - N Runtime
-	test.test_phi3()  # Passed v0.0.80 - N Runtime
+	# test.test_internlm2()
+	# test.test_llama() # Pass
+	# test.test_mamba()
+	# test.test_mamba2()
+	# test.test_mistral()
+	# test.test_mixtral()
+	# test.test_mpt()
+	# test.test_olmo()
+	# test.test_olmo2()
+	# test.test_openelm()
+	# test.test_phi()
+	# test.test_phi3()
 	# test.test_phimoe()  # Failed v0.0.80 - N  Runtime
-	test.test_qwen2()  # Passed v0.0.80 - N Runtime
-	test.test_qwen2_moe()  # Passed v0.0.80 - N Runtime
-	test.test_stablelm()  # Passed v0.0.80 - N Runtime
+	# test.test_qwen2()
+	# test.test_qwen2_moe()
+	# test.test_stablelm()
 	# -----------------------------------------------

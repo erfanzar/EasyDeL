@@ -38,10 +38,9 @@ from easydel.modules.base_modules.flax_modeling_utils import (
 # easydel.modules
 from easydel.modules.llama.llama_configuration import (
 	LlamaConfig as LlamaConfig,
-)
-from easydel.modules.llama.llama_configuration import (
 	VisionLlamaConfig as VisionLlamaConfig,
 )
+
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
@@ -425,14 +424,6 @@ class LlamaModel(EasyDeLBaseModule):
 			param_dtype=self.param_dtype,
 			rngs=rngs,
 		)
-		# self.causal_mask = RecreatorVariable(
-		# 	self.config.get_basic_causal_mask(),
-		# 	recreator=lambda: self.config.get_basic_causal_mask(),
-		# )
-		# self.frequencies = RecreatorVariable(
-		# 	self.config.get_basic_frequencies(),
-		# 	recreator=lambda: self.config.get_basic_frequencies(),
-		# )
 
 	@cached_property
 	def causal_mask(self):
@@ -465,8 +456,13 @@ class LlamaModel(EasyDeLBaseModule):
 		assert (
 			sequence_length <= self.config.max_position_embeddings
 		), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
-		if attention_mask.ndim == 2:
-			attention_mask = jnp.expand_dims(attention_mask, (1, 2))
+		if attention_mask is None:
+			attention_mask = jnp.ones_like(input_ids)
+		if position_ids is None:
+			position_ids = jnp.broadcast_to(
+				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+				(batch_size, sequence_length),
+			).astype(jnp.int32)
 
 		hidden_states = self.dropout(input_embeds)
 		if past_key_values is None:
@@ -571,25 +567,6 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 		output_hidden_states: Optional[bool] = None,
 		return_dict: bool = True,
 	) -> Union[FlaxCausalLMOutput, Tuple]:
-		"""
-		Forward pass through the Llama module.
-
-		Args:
-		    input_ids (Optional[chex.Array]): Input tensor containing token IDs.
-		    attention_mask (Optional[chex.Array]): Mask for attention.
-		    position_ids (Optional[chex.Array]): Positional indices.
-		    segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-		    input_embeds (Optional[chex.Array]): Embedded input tensor.
-		    output_attentions (Optional[bool]): If True, output attention weights.
-		    output_hidden_states (Optional[bool]): If True, output hidden states.
-		    init_cache (bool): If True, initialize cache for decoding.
-		    deterministic (bool): If True, disable dropout.
-		    return_dict (bool): If True, return a dictionary of outputs.
-
-		Returns:
-		    FlaxCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
-		"""
-
 		batch_size, seq_length = (
 			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
 		)
@@ -615,13 +592,8 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 		hidden_states = outputs[0]
 
 		if self.config.tie_word_embeddings:
-			shared_kernel = self.model.variables["params"]["embed_tokens"][
-				"embedding"
-			].T.astype(self.param_dtype)
-			lm_logits = self.lm_head.apply(
-				{"params": {"kernel": shared_kernel}},
-				hidden_states,
-			)
+			self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
+			lm_logits = self.lm_head(hidden_states)
 		else:
 			lm_logits = self.lm_head(hidden_states)
 

@@ -83,22 +83,10 @@ from easydel.layers.attention import (
 	AttentionMechanisms,
 	FlexibleAttentionModule,
 )
-from easydel.modules.base_modules.factory import (
-	ConfigType,
-	TaskType,
-	register_config,
-	register_module,
-)
-from easydel.modules.base_modules import (
-	EasyDeLBaseConfig,
-	EasyDeLBaseConfigDict,
-	EasyDeLBaseModule,
-	EasyDeLBaseVisionModule,
-)
 from easydel.modules.arctic import (
 	ArcticConfig,
-	FlaxArcticForCausalLM,
-	FlaxArcticModel,
+	ArcticForCausalLM,
+	ArcticModel,
 )
 from easydel.modules.auto_causal_language_model import (
 	AutoEasyDeLModelForCausalLM,
@@ -112,6 +100,18 @@ from easydel.modules.auto_configuration import (
 from easydel.modules.auto_speech_seq2seq_model import (
 	AutoEasyDeLModelForSpeechSeq2Seq,
 	AutoStateForSpeechSeq2Seq,
+)
+from easydel.modules.base_modules import (
+	EasyDeLBaseConfig,
+	EasyDeLBaseConfigDict,
+	EasyDeLBaseModule,
+	EasyDeLBaseVisionModule,
+)
+from easydel.modules.base_modules.factory import (
+	ConfigType,
+	TaskType,
+	register_config,
+	register_module,
 )
 from easydel.modules.cohere import (
 	CohereConfig,
@@ -312,6 +312,7 @@ from easydel.transform import (
 	easystate_to_torch,
 	torch_dict_to_easydel_params,
 )
+from easydel.utils import traversals
 
 _targeted_versions = ["0.0.91"]
 

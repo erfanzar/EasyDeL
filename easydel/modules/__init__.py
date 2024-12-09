@@ -12,18 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.base_modules.base_module import (
-	EasyDeLBaseModule,
-	EasyDeLBaseVisionModule,
-)
-from easydel.modules.base_modules.base_config import (
-	EasyDeLBaseConfig,
-	EasyDeLBaseConfigDict,
-)
 from easydel.modules.arctic import (
 	ArcticConfig,
-	FlaxArcticForCausalLM,
-	FlaxArcticModel,
+	ArcticForCausalLM,
+	ArcticModel,
 )
 from easydel.modules.auto_causal_language_model import (
 	AutoEasyDeLModelForCausalLM,
@@ -37,6 +29,14 @@ from easydel.modules.auto_configuration import (
 from easydel.modules.auto_speech_seq2seq_model import (
 	AutoEasyDeLModelForSpeechSeq2Seq,
 	AutoStateForSpeechSeq2Seq,
+)
+from easydel.modules.base_modules.base_config import (
+	EasyDeLBaseConfig,
+	EasyDeLBaseConfigDict,
+)
+from easydel.modules.base_modules.base_module import (
+	EasyDeLBaseModule,
+	EasyDeLBaseVisionModule,
 )
 from easydel.modules.cohere import (
 	CohereConfig,
