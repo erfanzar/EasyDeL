@@ -27,9 +27,9 @@ from jax import numpy as jnp
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.modules.base_modules.base_module import wrap_easydel_module
-from easydel.modules.base_modules.factory import register_module
-from easydel.modules.base_modules.flax_modeling_utils import (
+from easydel.modules._base.base_module import wrap_easydel_module
+from easydel.modules._base.factory import register_module
+from easydel.modules._base.flax_modeling_utils import (
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
@@ -75,7 +75,7 @@ class FlaxMptMLP(nn.Module):
 			jax.nn.gelu(self.up_proj(hidden_states), approximate=False)
 		)
 
-		return self.hidden_dropout(hidden_states, deterministic=deterministic) + residual
+		return self.hidden_dropout(hidden_states) + residual
 
 
 class FlaxMptAttention(FlaxAttentionModule):
@@ -177,7 +177,6 @@ class FlaxMptAttention(FlaxAttentionModule):
 			"b s (h d) -> b s h d",
 			h=self.config.n_heads,
 		)
-		query_length, key_length = query_states.shape[1], key_states.shape[1]
 
 		if self.has_variable("cache", "cached_key"):
 			mask_shift = self.variables["cache"]["cache_index"]
@@ -343,9 +342,7 @@ class FlaxMptBlock(nn.Module):
 			fcm_mask,
 		)
 		attn_outputs, attn_weights = attn_out if output_attentions else (attn_out[0], None)
-		hidden_states = (
-			self.resid_attn_dropout(attn_outputs, deterministic=deterministic) + hidden_states
-		)
+		hidden_states = self.resid_attn_dropout(attn_outputs) + hidden_states
 		output = self.ffn(self.norm_2(hidden_states), hidden_states)
 		outputs = (output,)
 		if output_attentions:

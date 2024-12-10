@@ -34,11 +34,11 @@ from easydel.etils.etils import (
 	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
-from easydel.modules.base_modules.base_module import (
+from easydel.modules._base.base_module import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseModule,
 )
-from easydel.modules.base_modules.factory import TaskType, registry
+from easydel.modules._base.factory import TaskType, registry
 from easydel.transform.parameters_transformation import torch_dict_to_easydel_params
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
@@ -56,7 +56,7 @@ def get_modules_by_type(
 	"""
 	The get_modules_by_type function is a helper function that returns the following:
 	    1. The config class for the model type specified (e.g., LlamaConfig, FalconConfig)
-	    2. The Flax Model class for the model type specified (e.g., FlaxLlamaForCausalLM, FlaxFalconForCausalLM)
+	    2. The Flax Model class for the model type specified (e.g., FlaxLlamaForCausalLM, FalconForCausalLM)
 	    3. A function to convert a HuggingFace pretrained checkpoint into an easydel checkpoint
 	"""
 	registred_module = registry.get_module_registration(

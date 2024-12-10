@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Literal, Optional, Type, TypeVar
 
-from easydel.modules.base_modules.base_module import (
+from easydel.modules._base.base_module import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseModule,
 )

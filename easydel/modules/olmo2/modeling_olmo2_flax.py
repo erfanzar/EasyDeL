@@ -25,12 +25,13 @@ from flax.linen.partitioning import remat
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import TransformerCache, TransformerCacheView
 from easydel.layers.norms import RMSNorm
-from easydel.modules.base_modules.base_module import wrap_easydel_module
+from easydel.modules._base.base_module import wrap_easydel_module
 
 # easydel.modules
-from easydel.modules.base_modules.factory import register_module
-from easydel.modules.base_modules.flax_modeling_utils import (
+from easydel.modules._base.factory import register_module
+from easydel.modules._base.flax_modeling_utils import (
 	ACT2FN,
 	block_wise_ffn,
 	control_mlp_sharding,
@@ -152,9 +153,8 @@ class FlaxOlmo2Attention(FlaxAttentionModule):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
+		cache_view: Optional[TransformerCacheView] = None,
 		segment_ids: Optional[chex.Array] = None,
-		deterministic: bool = True,
-		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
 		frequencies: Optional[chex.Array] = None,
@@ -213,21 +213,19 @@ class FlaxOlmo2Attention(FlaxAttentionModule):
 		if not deterministic and self.config.attention_dropout > 0.0:
 			dropout_rng = self.make_rng("dropout")
 		(
-			query_states,
 			key_states,
 			value_states,
 			attention_mask,
 			attention_bias,
-		) = self.concatenate_to_cache(
-			init_cache=init_cache,
+		) = self.concatenate(
 			query=query_states,
 			key=key_states,
+			cache_view=cache_view,
 			value=value_states,
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,
 			fcm_mask=fcm_mask,
 		)
-		query_length, key_length = query_states.shape[1], key_states.shape[1]
 
 		attentions = self.attention_performer(
 			query_states=query_states,
@@ -236,11 +234,10 @@ class FlaxOlmo2Attention(FlaxAttentionModule):
 			bias=attention_bias,
 			attention_mask=attention_mask,
 			causal=True,
-			dropout_rng=dropout_rng,
-			deterministic=deterministic,
-			query_sequence_length=query_length,
-			key_value_sequence_length=key_length,
-			uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+			dropout_rng=self.rngs.params(),
+			query_sequence_length=query_states.shape[1],
+			key_value_sequence_length=key_states.shape[1],
+			uses_cache=cache_view is not None,
 			segment_ids=segment_ids,
 			causal_mask=causal_mask,
 		)
@@ -311,9 +308,8 @@ class FlaxOlmo2DecoderLayer(nn.Module):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
+		cache_view: Optional[TransformerCacheView] = None,
 		segment_ids: Optional[chex.Array] = None,
-		deterministic: bool = True,
-		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
 		frequencies: Optional[chex.Array] = None,
@@ -341,9 +337,8 @@ class FlaxOlmo2DecoderLayer(nn.Module):
 			attention_mask,
 			position_ids,
 			causal_mask,
+			cache_view,
 			segment_ids,
-			deterministic,
-			init_cache,
 			output_attentions,
 			fcm_mask,
 			frequencies,
@@ -359,7 +354,7 @@ class FlaxOlmo2DecoderLayer(nn.Module):
 				self.mlp, hidden_states, self.config.scan_mlp_chunk_size, deterministic
 			)
 		else:
-			hidden_states = self.mlp(hidden_states, deterministic)
+			hidden_states = self.mlp(hidden_states)
 
 		hidden_states = self.post_feedforward_layernorm(hidden_states)
 		hidden_states = residual + hidden_states
@@ -465,13 +460,11 @@ class FlaxOlmo2DecoratorCollection(nn.Module):
 				hidden_states=hidden_states,
 				attention_mask=attention_mask,
 				position_ids=position_ids,
-				causal_mask=causal_mask,
-				deterministic=deterministic,
-				init_cache=init_cache,
+				causal_mask=self.causal_mask,
+				cache_view=past_key_values.views[idx],
 				output_attentions=output_attentions,
-				fcm_mask=fcm_mask,
 				segment_ids=segment_ids,
-				frequencies=self._frequencies,
+				frequencies=self.frequencies,
 			)
 			hidden_states = output[0]
 
@@ -543,8 +536,7 @@ class FlaxOlmo2Model(nn.Module):
 		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
-		init_cache: bool = False,
-		deterministic: bool = True,
+		past_key_values: Optional[TransformerCache] = None,
 		return_dict: bool = True,
 	) -> Union[FlaxBaseModelOutput, Tuple]:
 		"""
@@ -571,9 +563,18 @@ class FlaxOlmo2Model(nn.Module):
 			raise ValueError("you should specify input_embeds or input_ids one of them")
 		batch_size, sequence_length, _ = input_embeds.shape
 
+		all_attentions = () if output_attentions else None
+		all_hidden_states = () if output_hidden_states else None
 		assert (
 			sequence_length <= self.config.max_position_embeddings
 		), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+		if attention_mask is None:
+			attention_mask = jnp.ones_like(input_ids)
+		if position_ids is None:
+			position_ids = jnp.broadcast_to(
+				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+				(batch_size, sequence_length),
+			).astype(jnp.int32)
 		if attention_mask.ndim == 2:
 			attention_mask = jnp.expand_dims(attention_mask, (1, 2))
 
@@ -641,15 +642,14 @@ class FlaxOlmo2ForCausalLM(nn.Module):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
+		input_ids: chex.Array,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
 		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
-		init_cache: bool = False,
-		deterministic: bool = True,
+		past_key_values: Optional[TransformerCache] = None,
 		return_dict: bool = True,
 	) -> Union[FlaxCausalLMOutput, Tuple]:
 		"""

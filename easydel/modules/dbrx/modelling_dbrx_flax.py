@@ -13,25 +13,24 @@
 # limitations under the License.
 
 import math
+from functools import cached_property
 from typing import Optional, Tuple, Union
 
 import chex
-import flax.linen
 import flax.struct
 import jax
 import jax.numpy as jnp
 from fjformer.functions import auxiliary_load_balancing_loss_func
-from flax import linen as nn
-from flax.linen import Dense
-from flax.linen.partitioning import remat
+from flax import nnx as nn
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.modules.base_modules.base_module import wrap_easydel_module
+from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.modules._base.base_module import EasyDeLBaseModule
 
 # easydel.modules
-from easydel.modules.base_modules.factory import register_module
-from easydel.modules.base_modules.flax_modeling_utils import (
+from easydel.modules._base.factory import register_module
+from easydel.modules._base.flax_modeling_utils import (
 	ACT2FN,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
@@ -59,23 +58,23 @@ class MoeCausalLMOutput(FlaxMaskedLMOutput):
 	router_logits: Optional[Tuple[chex.Array]] = None
 
 
-class FlaxDbrxAttention(FlaxAttentionModule):
-	"""
-	FlaxDbrxAttention implements an attention mechanism with rotary embeddings.
+class DbrxAttention(FlaxAttentionModule):
+	def __init__(
+		self,
+		config: DbrxConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(config=config)
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
 
-	Attributes:
-	    config (DbrxConfig): Configuration for the attention module.
-	    dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
-	    param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
-	    precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
-	"""
-
-	config: DbrxConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self):
 		self.num_attention_heads = self.config.n_heads
 		self.num_key_value_heads = self.config.attn_config.kv_n_heads
 		config = self.config
@@ -85,22 +84,26 @@ class FlaxDbrxAttention(FlaxAttentionModule):
 
 		if self.num_key_value_groups == 1:
 			assert self.num_attention_heads == self.config.attn_config.kv_n_heads
-		self.Wqkv = Dense(
+		self.Wqkv = nn.Linear(
+			config.hidden_size,
 			self.hidden_size + 2 * self.num_key_value_heads * self.head_dim,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			use_bias=False,
 			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
 			precision=self.precision,
+			rngs=rngs,
 			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
 		)
-		self.out_proj = Dense(
+		self.out_proj = nn.Linear(
+			config.hidden_size,
 			config.hidden_size,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			use_bias=False,
 			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
 			precision=self.precision,
+			rngs=rngs,
 			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
 		)
 
@@ -125,7 +128,7 @@ class FlaxDbrxAttention(FlaxAttentionModule):
 			axis_name=self.config.attention_axis_name,
 			base_config=self.config,
 		)
-		self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
+		self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
 
 	def __call__(
 		self,
@@ -133,9 +136,8 @@ class FlaxDbrxAttention(FlaxAttentionModule):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
+		cache_view: Optional[TransformerCacheView] = None,
 		segment_ids: Optional[chex.Array] = None,
-		deterministic: bool = True,
-		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
 		frequencies: Optional[chex.Array] = None,
@@ -187,10 +189,7 @@ class FlaxDbrxAttention(FlaxAttentionModule):
 			self.num_key_value_heads,
 			self.head_dim,
 		)
-		dropout_rng = None
 
-		if not deterministic and self.config.attn_config.attn_pdrop > 0.0:
-			dropout_rng = self.make_rng("dropout")
 		query_states, key_states = self.rotary(
 			position_ids,
 			query=query_states,
@@ -198,21 +197,19 @@ class FlaxDbrxAttention(FlaxAttentionModule):
 			frequencies=frequencies,
 		)
 		(
-			query_states,
 			key_states,
 			value_states,
 			attention_mask,
 			attention_bias,
-		) = self.concatenate_to_cache(
-			init_cache=init_cache,
+		) = self.concatenate(
 			query=query_states,
 			key=key_states,
+			cache_view=cache_view,
 			value=value_states,
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,
 			fcm_mask=fcm_mask,
 		)
-		query_length, key_length = query_states.shape[1], key_states.shape[1]
 
 		attentions = self.attention_performer(
 			query_states=query_states,
@@ -221,11 +218,10 @@ class FlaxDbrxAttention(FlaxAttentionModule):
 			bias=attention_bias,
 			attention_mask=attention_mask,
 			causal=True,
-			dropout_rng=dropout_rng,
-			deterministic=deterministic,
-			query_sequence_length=query_length,
-			key_value_sequence_length=key_length,
-			uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+			dropout_rng=self.rngs.params(),
+			query_sequence_length=query_states.shape[1],
+			key_value_sequence_length=key_states.shape[1],
+			uses_cache=cache_view is not None,
 			segment_ids=segment_ids,
 			causal_mask=causal_mask,
 		)
@@ -235,38 +231,55 @@ class FlaxDbrxAttention(FlaxAttentionModule):
 		)
 		attn_output = self.out_proj(attn_output)
 
-		attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
+		attn_output = self.resid_dropout(attn_output)
 		outputs = (attn_output,)
 		if output_attentions:
 			outputs += (output_attentions,)
 		return outputs
 
 
-class FlaxDbrxNormAttentionNorm(nn.Module):
-	config: DbrxConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
+class DbrxNormAttentionNorm(nn.Module):
+	def __init__(
+		self,
+		config: DbrxConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__()
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
 		self.norm_1 = nn.LayerNorm(
+			self.config.hidden_size,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			use_bias=False,
+			rngs=rngs,
 		)
-		self.attn = FlaxDbrxAttention(  # statics 3,5,6,7
+		self.attn = DbrxAttention(  # statics 3,5,6,7
 			config=self.config,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			precision=self.precision,
+			rngs=rngs,
 		)
 		self.norm_2 = nn.LayerNorm(
+			self.config.hidden_size,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			use_bias=False,
+			rngs=rngs,
 		)
 
-		self.dropout = flax.linen.Dropout(self.config.resid_pdrop)
+		self.dropout = nn.Dropout(
+			self.config.resid_pdrop,
+			rngs=rngs,
+		)
 
 	def __call__(
 		self,
@@ -274,9 +287,8 @@ class FlaxDbrxNormAttentionNorm(nn.Module):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
+		cache_view: Optional[TransformerCacheView] = None,
 		segment_ids: Optional[chex.Array] = None,
-		deterministic: bool = True,
-		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
 		frequencies: Optional[chex.Array] = None,
@@ -307,13 +319,12 @@ class FlaxDbrxNormAttentionNorm(nn.Module):
 			output_attentions=output_attentions,
 			causal_mask=causal_mask,
 			segment_ids=segment_ids,
-			init_cache=init_cache,
-			deterministic=deterministic,
 			fcm_mask=fcm_mask,
 			frequencies=frequencies,
+			cache_view=cache_view,
 		)
 		hidden_states, attn_weights = attn_out if output_attentions else (attn_out[0], None)
-		hidden_states = self.dropout(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout(hidden_states)
 		hidden_states = hidden_states + residual_states
 
 		residual_states = hidden_states
@@ -322,21 +333,30 @@ class FlaxDbrxNormAttentionNorm(nn.Module):
 		return residual_states, hidden_states, attn_weights
 
 
-class FlaxDbrxExpertGLU(nn.Module):
-	config: DbrxConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
+class DbrxExpertGLU(nn.Module):
+	def __init__(
+		self,
+		config: DbrxConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__()
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
 		shape = (
 			self.config.ffn_config.moe_num_experts * self.config.ffn_config.ffn_hidden_size,
 			self.config.d_model,
 		)
 		init_fn = nn.initializers.normal(dtype=self.dtype)
-		self.w1 = self.param("w1", init_fn, shape, self.param_dtype)
-		self.v1 = self.param("v1", init_fn, shape, self.param_dtype)
-		self.w2 = self.param("w2", init_fn, shape, self.param_dtype)
+		self.w1 = nn.Param(init_fn(rngs.params(), shape, self.param_dtype))
+		self.v1 = nn.Param(init_fn(rngs.params(), shape, self.param_dtype))
+		self.w2 = nn.Param(init_fn(rngs.params(), shape, self.param_dtype))
 		self.activation_fn = ACT2FN[self.config.ffn_config.ffn_act_fn["name"]]
 
 	def __call__(self, x: chex.Array, expert_idx: int) -> chex.Array:
@@ -345,9 +365,9 @@ class FlaxDbrxExpertGLU(nn.Module):
 			self.config.ffn_config.ffn_hidden_size,
 			self.config.d_model,
 		)
-		expert_w1 = self.w1.reshape(expert_shape)[expert_idx]
-		expert_v1 = self.v1.reshape(expert_shape)[expert_idx]
-		expert_w2 = self.w2.reshape(expert_shape)[expert_idx]
+		expert_w1 = self.w1.value.reshape(expert_shape)[expert_idx]
+		expert_v1 = self.v1.value.reshape(expert_shape)[expert_idx]
+		expert_w2 = self.w2.value.reshape(expert_shape)[expert_idx]
 
 		x1 = jnp.matmul(
 			x,
@@ -369,18 +389,28 @@ class FlaxDbrxExpertGLU(nn.Module):
 		return x1
 
 
-class FlaxDbrxExperts(nn.Module):
-	config: DbrxConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
-		self.mlp = FlaxDbrxExpertGLU(
+class DbrxExperts(nn.Module):
+	def __init__(
+		self,
+		config: DbrxConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__()
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
+		self.mlp = DbrxExpertGLU(
 			config=self.config,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			precision=self.precision,
+			rngs=rngs,
 		)
 
 	def __call__(
@@ -400,13 +430,22 @@ class FlaxDbrxExperts(nn.Module):
 		return final_hidden_state
 
 
-class FlaxDbrxRouter(nn.Module):
-	config: DbrxConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
+class DbrxRouter(nn.Module):
+	def __init__(
+		self,
+		config: DbrxConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__()
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
 		self.hidden_size = self.config.d_model
 		self.moe_num_experts = self.config.ffn_config.moe_num_experts
 		self.moe_top_k = self.config.ffn_config.moe_top_k
@@ -416,12 +455,14 @@ class FlaxDbrxRouter(nn.Module):
 		)
 		self.uniform_expert_assignment = self.config.ffn_config.uniform_expert_assignment
 
-		self.layer = Dense(
+		self.layer = nn.Linear(
+			config.hidden_size,
 			self.moe_num_experts,
 			use_bias=False,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			precision=self.precision,
+			rngs=rngs,
 		)
 
 	def jitter(self, x: chex.Array) -> chex.Array:
@@ -470,54 +511,72 @@ class FlaxDbrxRouter(nn.Module):
 		return weights, top_weights, top_experts
 
 
-class FlaxDbrxFFN(nn.Module):
-	config: DbrxConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
-		self.router = FlaxDbrxRouter(
+class DbrxFFN(nn.Module):
+	def __init__(
+		self,
+		config: DbrxConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__()
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
+		self.router = DbrxRouter(
 			config=self.config,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			precision=self.precision,
+			rngs=rngs,
 		)
 
-		self.experts = FlaxDbrxExperts(
+		self.experts = DbrxExperts(
 			config=self.config,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			precision=self.precision,
+			rngs=rngs,
 		)
 
-	def __call__(
-		self, x: chex.Array, deterministic: bool = False
-	) -> Tuple[chex.Array, chex.Array]:
+	def __call__(self, x: chex.Array) -> Tuple[chex.Array, chex.Array]:
 		x = control_mlp_sharding(x, self.config.partition_axis)
-		weights, top_weights, top_experts = self.router(x, deterministic=deterministic)
+		weights, top_weights, top_experts = self.router(x)
 		out = self.experts(x, weights, top_weights, top_experts)
 		return out, weights
 
 
-class FlaxDbrxBlock(nn.Module):
-	config: DbrxConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
+class DbrxBlock(nn.Module):
+	def __init__(
+		self,
+		config: DbrxConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__()
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
 		self.hidden_size = self.config.d_model
 		self.resid_pdrop = self.config.resid_pdrop
-		attn_block = FlaxDbrxNormAttentionNorm
-		ffn_block = FlaxDbrxFFN
+		attn_block = DbrxNormAttentionNorm
+		ffn_block = DbrxFFN
 		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
-			attn_block = remat(
+			attn_block = nn.remat(
 				attn_block,
 				static_argnums=(3, 5, 6, 7, 9),
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 			)
-			ffn_block = remat(
+			ffn_block = nn.remat(
 				ffn_block,
 				static_argnums=(1,),
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
@@ -527,12 +586,14 @@ class FlaxDbrxBlock(nn.Module):
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			precision=self.precision,
+			rngs=rngs,
 		)
 		self.ffn = ffn_block(
 			config=self.config,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			precision=self.precision,
+			rngs=rngs,
 		)
 
 	def __call__(
@@ -542,8 +603,7 @@ class FlaxDbrxBlock(nn.Module):
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
 		segment_ids: Optional[chex.Array] = None,
-		deterministic: bool = True,
-		init_cache: bool = False,
+		cache_view: Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
 		output_router_logits: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
@@ -572,15 +632,14 @@ class FlaxDbrxBlock(nn.Module):
 			attention_mask,
 			position_ids,
 			causal_mask,
+			cache_view,
 			segment_ids,
-			deterministic,
-			init_cache,
 			output_attentions,
 			fcm_mask,
 			frequencies,
 		)
 
-		hidden_states, router_logits = self.ffn(hidden_states, deterministic)
+		hidden_states, router_logits = self.ffn(hidden_states)
 		hidden_states = resid_states + hidden_states
 
 		outputs = (hidden_states,)
@@ -594,95 +653,6 @@ class FlaxDbrxBlock(nn.Module):
 		return outputs
 
 
-class FlaxDbrxBlockCollection(nn.Module):
-	config: DbrxConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
-		self.blocks = [
-			FlaxDbrxBlock(
-				config=self.config,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
-				name=f"{i}",
-			)
-			for i in range(self.config.n_layers)
-		]
-
-		self._frequencies = self.config.get_basic_frequencies(
-			rotary_dim=self.config.hidden_size // self.config.num_attention_heads,
-			head_size=self.config.hidden_size // self.config.num_attention_heads,
-			base=self.config.attn_config.rope_theta,
-		)
-
-	def __call__(
-		self,
-		hidden_states: chex.Array,
-		attention_mask: chex.Array,
-		position_ids: chex.Array,
-		causal_mask: chex.Array,
-		segment_ids: Optional[chex.Array] = None,
-		deterministic: bool = True,
-		init_cache: bool = False,
-		output_attentions: bool = False,
-		output_router_logits: bool = False,
-		output_hidden_states: bool = False,
-		fcm_mask: Optional[chex.Array] = None,
-	) -> Tuple[chex.Array, chex.Array, Optional[chex.Array]]:
-		"""
-		Forward pass of the attentionNrom module.
-
-		Args:
-		    hidden_states (chex.Array): Input hidden states.
-		    attention_mask (chex.Array): Mask to apply on the attention scores.
-		    position_ids (chex.Array): Position indices for the tokens.
-		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-		    segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-		    deterministic (bool): If True, disables dropout for deterministic behavior.
-		    init_cache (bool): If True, initializes cache for caching keys and values.
-		    output_attentions (bool): If True, outputs attention weights.
-		    output_router_logits (bool): If True, outputs router logits.
-		    output_hidden_states (bool): If True, outputs all of hidden states.
-		    fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
-		Returns:
-		    Tuple[chex.Array, Optional[chex.Array], Optional[chex.Array], Optional[chex.Array]]:
-		        A tuple containing the hidden_states, all_attentions, all_hidden_states, all_router_logits.
-		"""
-		all_hidden_states = ()
-		all_router_logits = ()
-		all_attentions = ()
-		for block in self.blocks:
-			if output_hidden_states:
-				all_hidden_states += (hidden_states,)
-			outputs = block(
-				hidden_states=hidden_states,
-				attention_mask=attention_mask,
-				position_ids=position_ids,
-				causal_mask=causal_mask,
-				segment_ids=segment_ids,
-				deterministic=deterministic,
-				init_cache=init_cache,
-				output_attentions=output_attentions,
-				output_router_logits=output_router_logits,
-				fcm_mask=fcm_mask,
-				frequencies=self._frequencies,
-			)
-			hidden_states = outputs[0]
-			if output_attentions:
-				all_attentions += (outputs[1],)
-			if output_router_logits:
-				all_router_logits += (outputs[-1],)
-		return (
-			hidden_states,
-			all_attentions,
-			all_hidden_states,
-			all_router_logits,
-		)
-
-
 @register_module(
 	"base-module",
 	config=DbrxConfig,
@@ -690,14 +660,23 @@ class FlaxDbrxBlockCollection(nn.Module):
 	embedding_layer_names=["wte"],
 	layernorm_names=["norm_1", "norm_2", "norm_f"],
 )
-@wrap_easydel_module(config_class=DbrxConfig, base_model_prefix="transformer")
-class FlaxDbrxModel(nn.Module):
-	config: DbrxConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self):
+class DbrxModel(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: DbrxConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
 		self.padding_idx = self.config.pad_token_id
 		self.vocab_size = self.config.vocab_size
 		self.emb_pdrop = self.config.emb_pdrop
@@ -707,58 +686,47 @@ class FlaxDbrxModel(nn.Module):
 			self.config.d_model,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
+			rngs=rngs,
 		)
-		self.blocks = FlaxDbrxBlockCollection(
-			config=self.config,
+		self.blocks = [
+			DbrxBlock(
+				config=self.config,
+				dtype=self.dtype,
+				param_dtype=self.param_dtype,
+				precision=self.precision,
+				rngs=rngs,
+			)
+			for i in range(self.config.n_layers)
+		]
+		self.norm_f = nn.LayerNorm(
+			self.config.hidden_size,
+			use_bias=False,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
-			precision=self.precision,
-		)
-		self.norm_f = nn.LayerNorm(
-			use_bias=False, dtype=self.dtype, param_dtype=self.param_dtype
+			rngs=rngs,
 		)
 
-		self.causal_mask = flax.linen.make_causal_mask(
-			jnp.ones(
-				(1, self.config.granted_mask_max_position_embedding),
-				dtype="bool",
-			),
-			dtype="bool",
+	@cached_property
+	def frequencies(self):
+		return self.config.get_basic_frequencies(
+			rotary_dim=self.config.hidden_size // self.config.num_attention_heads,
+			head_size=self.config.hidden_size // self.config.num_attention_heads,
+			base=self.config.attn_config.rope_theta,
 		)
 
 	def __call__(
 		self,
 		input_ids: chex.Array,
-		attention_mask: chex.Array,
-		position_ids: chex.Array,
+		attention_mask: Optional[chex.Array] = None,
+		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
 		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		output_router_logits: Optional[bool] = None,
-		init_cache: bool = False,
-		deterministic: bool = True,
+		past_key_values: Optional[TransformerCache] = None,
 		return_dict: bool = True,
 	) -> MoeModelOutput | Tuple:
-		"""
-		Forward pass through the Dbrx module.
-
-		Args:
-		    input_ids (chex.Array): Input tensor containing token IDs.
-		    attention_mask (chex.Array): Mask for attention.
-		    position_ids (chex.Array): Positional indices.
-		    segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-		    input_embeds (Optional[chex.Array]): Embedded input tensor.
-		    output_attentions (Optional[bool]): If True, output attention weights.
-		    output_hidden_states (Optional[bool]): If True, output hidden states.
-		    output_router_logits (Optional[bool]): If True, output router logits.
-		    init_cache (bool): If True, initialize cache for decoding.
-		    deterministic (bool): If True, disable dropout.
-		    return_dict (bool): If True, return a dictionary of outputs.
-
-		Returns:
-		    MoeModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
-		"""
 		if output_router_logits is None:
 			output_router_logits = self.config.output_router_logits
 		if input_ids is not None and input_embeds is not None:
@@ -770,6 +738,15 @@ class FlaxDbrxModel(nn.Module):
 			input_embeds = self.wte(input_ids.astype("i4"))
 		else:
 			raise ValueError("you should specify input_embeds or input_ids one of them")
+		batch_size, sequence_length = input_embeds.shape[:2]
+		if attention_mask is None:
+			attention_mask = jnp.ones_like(input_ids)
+		if position_ids is None:
+			position_ids = jnp.broadcast_to(
+				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+				(batch_size, sequence_length),
+			).astype(jnp.int32)
+
 		output_attentions = (
 			output_attentions
 			if output_attentions is not None
@@ -785,28 +762,32 @@ class FlaxDbrxModel(nn.Module):
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
 		)
-		collection_outputs = self.blocks(
-			hidden_states=input_embeds,
-			attention_mask=attention_mask,
-			position_ids=position_ids,
-			causal_mask=self.causal_mask,
-			output_attentions=output_attentions,
-			output_router_logits=output_router_logits,
-			output_hidden_states=output_hidden_states,
-			init_cache=init_cache,
-			deterministic=deterministic,
-			segment_ids=segment_ids,
-		)
-		all_self_attns = None
-		all_hidden_states = None
-		all_router_logits = None
-		hidden_states = collection_outputs[0]
-		if output_attentions:
-			all_self_attns = collection_outputs[1]
-		if output_hidden_states:
-			all_hidden_states = collection_outputs[2 if output_attentions else 1]
-		if output_router_logits:
-			all_router_logits = collection_outputs[-1]
+		hidden_states = input_embeds
+		all_hidden_states = ()
+		all_router_logits = ()
+		all_attentions = ()
+		if past_key_values is None:
+			past_key_values = TransformerCache.init_empty(len(self.blocks))
+		for idx, block in enumerate(self.blocks):
+			if output_hidden_states:
+				all_hidden_states += (hidden_states,)
+			outputs = block(
+				hidden_states=hidden_states,
+				attention_mask=attention_mask,
+				position_ids=position_ids,
+				causal_mask=self.causal_mask,
+				segment_ids=segment_ids,
+				cache_view=past_key_values.views[idx],
+				output_attentions=output_attentions,
+				output_router_logits=output_router_logits,
+				frequencies=self.frequencies,
+			)
+			hidden_states = outputs[0]
+			if output_attentions:
+				all_attentions += (outputs[1],)
+			if output_router_logits:
+				all_router_logits += (outputs[-1],)
+
 		hidden_states = self.norm_f(hidden_states)
 
 		if output_hidden_states:
@@ -817,7 +798,7 @@ class FlaxDbrxModel(nn.Module):
 				for v in [
 					hidden_states,
 					all_hidden_states,
-					all_self_attns,
+					all_attentions,
 					all_router_logits,
 				]
 				if v is not None
@@ -825,7 +806,7 @@ class FlaxDbrxModel(nn.Module):
 		return MoeModelOutput(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
-			attentions=all_self_attns,
+			attentions=all_attentions,
 			router_logits=all_router_logits,
 		)
 
@@ -837,36 +818,38 @@ class FlaxDbrxModel(nn.Module):
 	embedding_layer_names=["wte"],
 	layernorm_names=["norm_1", "norm_2", "norm_f"],
 )
-@wrap_easydel_module(config_class=DbrxConfig, base_model_prefix="transformer")
-class FlaxDbrxForCausalLM(nn.Module):
-	"""
-	Dbrx model for causal language modeling, including the language model head.
-
-	Attributes:
-	    config (DbrxConfig): Configuration object with model hyperparameters.
-	    dtype (jnp.dtype): Data type for the computations.
-	    param_dtype (jnp.dtype): Data type for the model parameters.
-	    precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
-	"""
-
-	config: DbrxConfig
-	dtype: jnp.dtype = jnp.bfloat16
-	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[jax.lax.Precision] = None
-
-	def setup(self) -> None:
-		self.transformer = FlaxDbrxModel.flax_module(
+class DbrxForCausalLM(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: DbrxConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+		self.transformer = DbrxModel(
 			config=self.config,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			precision=self.precision,
+			rngs=rngs,
 		)
-		self.lm_head = Dense(
+		self.lm_head = nn.Linear(
+			self.config.hidden_size,
 			self.config.vocab_size,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			precision=self.precision,
 			use_bias=False,
+			rngs=rngs,
 			kernel_init=nn.initializers.normal(self.config.initializer_range),
 			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
 		)
@@ -874,36 +857,16 @@ class FlaxDbrxForCausalLM(nn.Module):
 	def __call__(
 		self,
 		input_ids: chex.Array,
-		attention_mask: chex.Array,
-		position_ids: chex.Array,
+		attention_mask: Optional[chex.Array] = None,
+		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
 		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		output_router_logits: Optional[bool] = None,
-		init_cache: bool = False,
-		deterministic: bool = True,
+		past_key_values: Optional[TransformerCache] = None,
 		return_dict: bool = True,
 	) -> MoeCausalLMOutput | Tuple:
-		"""
-		Forward pass through the Dbrx module.
-
-		Args:
-		    input_ids (chex.Array): Input tensor containing token IDs.
-		    attention_mask (chex.Array): Mask for attention.
-		    position_ids (chex.Array): Positional indices.
-		    segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-		    input_embeds (Optional[chex.Array]): Embedded input tensor.
-		    output_attentions (Optional[bool]): If True, output attention weights.
-		    output_hidden_states (Optional[bool]): If True, output hidden states.
-		    output_router_logits (Optional[bool]): If True, output router logits.
-		    init_cache (bool): If True, initialize cache for decoding.
-		    deterministic (bool): If True, disable dropout.
-		    return_dict (bool): If True, return a dictionary of outputs.
-
-		Returns:
-		    MoeCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
-		"""
 		if output_router_logits is None:
 			output_router_logits = self.config.output_router_logits
 		outputs = self.transformer(
@@ -914,8 +877,7 @@ class FlaxDbrxForCausalLM(nn.Module):
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			output_router_logits=output_router_logits,
-			init_cache=init_cache,
-			deterministic=deterministic,
+			past_key_values=past_key_values,
 			return_dict=True,
 			segment_ids=segment_ids,
 		)

@@ -43,9 +43,9 @@ from transformers import logging
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule
-from easydel.modules.base_modules.base_module import wrap_easydel_module
-from easydel.modules.base_modules.factory import register_module
-from easydel.modules.base_modules.flax_modeling_utils import (
+from easydel.modules._base.base_module import wrap_easydel_module
+from easydel.modules._base.factory import register_module
+from easydel.modules._base.flax_modeling_utils import (
 	ACT2FN,
 	control_mlp_sharding,
 	get_gradient_checkpoint_policy,
@@ -153,7 +153,6 @@ class FlaxOPTAttention(FlaxAttentionModule):
 		#     key_states = with_sharding_constraint(key_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
 		#     value_states = with_sharding_constraint(value_states, PartitionSpec(("dp", "fsdp"), "sp", "tp", None))
 		if self.causal:
-			query_length, key_length = query_states.shape[1], key_states.shape[1]
 			if self.has_variable("cache", "cached_key"):
 				mask_shift = self.variables["cache"]["cache_index"]
 				max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
@@ -267,7 +266,7 @@ class FlaxOPTDecoderLayer(nn.Module):
 			init_cache=init_cache,
 			deterministic=deterministic,
 		)
-		hidden_states = self.dropout_layer(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout_layer(hidden_states)
 		hidden_states = residual + hidden_states
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
 		# 350m applies layer norm AFTER attention
@@ -287,7 +286,7 @@ class FlaxOPTDecoderLayer(nn.Module):
 		hidden_states = self.activation_fn(hidden_states)
 
 		hidden_states = self.fc2(hidden_states)
-		hidden_states = self.dropout_layer(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout_layer(hidden_states)
 
 		hidden_states = (residual + hidden_states).reshape(hidden_states_shape)
 

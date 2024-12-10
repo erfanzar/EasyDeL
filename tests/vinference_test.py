@@ -40,6 +40,7 @@ def main():
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		),
 		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+		platform=ed.EasyDeLPlatforms.TRITON,
 		param_dtype=dtype,
 		dtype=dtype,
 		torch_dtype=torch.float16,

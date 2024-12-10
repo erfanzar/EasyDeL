@@ -18,13 +18,13 @@ from easydel.modules.dbrx.dbrx_configuration import (
 	DbrxFFNConfig,
 )
 from easydel.modules.dbrx.modelling_dbrx_flax import (
-	FlaxDbrxForCausalLM,
-	FlaxDbrxModel,
+	DbrxForCausalLM,
+	DbrxModel,
 )
 
 __all__ = (
-	"FlaxDbrxForCausalLM",
-	"FlaxDbrxModel",
+	"DbrxForCausalLM",
+	"DbrxModel",
 	"DbrxAttentionConfig",
 	"DbrxConfig",
 	"DbrxFFNConfig",

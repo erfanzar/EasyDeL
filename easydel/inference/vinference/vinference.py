@@ -50,7 +50,7 @@ from easydel.inference.vinference._fn import (
 	put_compiled_funcs,
 )
 from easydel.inference.vinference.metrics import vInferenceMetrics
-from easydel.modules.base_modules import EasyDeLBaseModule
+from easydel.modules._base import EasyDeLBaseModule
 from easydel.utils.compiling_utils import (
 	load_compiled_fn,
 	save_compiled_fn,

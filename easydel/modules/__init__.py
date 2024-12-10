@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from easydel.modules._base.base_config import (
+	EasyDeLBaseConfig,
+	EasyDeLBaseConfigDict,
+)
+from easydel.modules._base.base_module import (
+	EasyDeLBaseModule,
+	EasyDeLBaseVisionModule,
+)
 from easydel.modules.arctic import (
 	ArcticConfig,
 	ArcticForCausalLM,
@@ -30,25 +38,17 @@ from easydel.modules.auto_speech_seq2seq_model import (
 	AutoEasyDeLModelForSpeechSeq2Seq,
 	AutoStateForSpeechSeq2Seq,
 )
-from easydel.modules.base_modules.base_config import (
-	EasyDeLBaseConfig,
-	EasyDeLBaseConfigDict,
-)
-from easydel.modules.base_modules.base_module import (
-	EasyDeLBaseModule,
-	EasyDeLBaseVisionModule,
-)
 from easydel.modules.cohere import (
 	CohereConfig,
-	FlaxCohereForCausalLM,
-	FlaxCohereModel,
+	CohereForCausalLM,
+	CohereModel,
 )
 from easydel.modules.dbrx import (
 	DbrxAttentionConfig,
 	DbrxConfig,
 	DbrxFFNConfig,
-	FlaxDbrxForCausalLM,
-	FlaxDbrxModel,
+	DbrxForCausalLM,
+	DbrxModel,
 )
 from easydel.modules.deepseek_v2 import (
 	DeepseekV2Config,
@@ -57,13 +57,13 @@ from easydel.modules.deepseek_v2 import (
 )
 from easydel.modules.exaone import (
 	ExaoneConfig,
-	FlaxExaoneForCausalLM,
-	FlaxExaoneModel,
+	ExaoneForCausalLM,
+	ExaoneModel,
 )
 from easydel.modules.falcon import (
 	FalconConfig,
-	FlaxFalconForCausalLM,
-	FlaxFalconModel,
+	FalconForCausalLM,
+	FalconModel,
 )
 from easydel.modules.gemma import (
 	FlaxGemmaForCausalLM,

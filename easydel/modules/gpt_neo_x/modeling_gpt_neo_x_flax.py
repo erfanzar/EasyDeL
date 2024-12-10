@@ -26,9 +26,9 @@ from jax import numpy as jnp
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.modules.base_modules.base_module import wrap_easydel_module
-from easydel.modules.base_modules.factory import register_module
-from easydel.modules.base_modules.flax_modeling_utils import (
+from easydel.modules._base.base_module import wrap_easydel_module
+from easydel.modules._base.factory import register_module
+from easydel.modules._base.flax_modeling_utils import (
 	ACT2FN,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
@@ -136,11 +136,10 @@ class FlaxGPTNeoXAttention(FlaxAttentionModule):
 			bias=attention_bias,
 			attention_mask=attention_mask,
 			causal=True,
-			dropout_rng=dropout_rng,
-			deterministic=deterministic,
-			query_sequence_length=query_length,
-			key_value_sequence_length=key_length,
-			uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+			dropout_rng=self.rngs.params(),
+			query_sequence_length=query_states.shape[1],
+			key_value_sequence_length=key_states.shape[1],
+			uses_cache=cache_view is not None,
 			segment_ids=segment_ids,
 			causal_mask=self.causal_mask,
 		)

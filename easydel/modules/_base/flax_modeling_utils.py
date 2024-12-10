@@ -42,7 +42,7 @@ from easydel.etils.etils import (
 	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
-from easydel.modules.base_modules.base_config import EasyMethod
+from easydel.modules._base.base_config import EasyMethod
 from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN
 
 warnings.filterwarnings(
@@ -295,12 +295,12 @@ def block_wise_ffn(remat_ffn, inputs, chunk_size: int, deterministic: bool):
 	generating = inputs.shape[1] == 1
 	try:
 		if generating:
-			return remat_ffn(inputs, deterministic)
+			return remat_ffn(inputs)
 		else:
 			inputs = rearrange(inputs, "b (c n) d -> b c n d", c=chunk_size)
 
 			def scan_ffn(remat_ffn_, carry, hidden_states):
-				outputs = remat_ffn_(hidden_states, deterministic)
+				outputs = remat_ffn_(hidden_states)
 				return carry, outputs
 
 			scan_axis = inputs.ndim - 2

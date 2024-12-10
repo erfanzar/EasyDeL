@@ -26,7 +26,7 @@ from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import get_logger
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.modules.base_modules.flax_modeling_utils import (
+from easydel.modules._base.flax_modeling_utils import (
 	get_dot_general_by_bits,
 	with_sharding_constraint,
 )
@@ -142,8 +142,7 @@ class FlaxZamba2Attention(FlaxAttentionModule):
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
 		segment_ids: Optional[chex.Array] = None,
-		deterministic: bool = True,
-		init_cache: bool = False,
+		cache_view: Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
 	):
@@ -197,8 +196,6 @@ class FlaxZamba2Attention(FlaxAttentionModule):
 				frequencies=frequencies,
 			)
 
-		query_length, key_length = query_states.shape[1], key_states.shape[1]
-
 		if self.has_variable("cache", "cached_key"):
 			mask_shift = self.variables["cache"]["cache_index"]
 			max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
@@ -235,8 +232,6 @@ class FlaxZamba2Attention(FlaxAttentionModule):
 			jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
 		)
 
-		query_length, key_length = query_states.shape[1], key_states.shape[1]
-
 		attentions = self.attention_performer(
 			query_states=query_states,
 			key_states=key_states,
@@ -244,11 +239,10 @@ class FlaxZamba2Attention(FlaxAttentionModule):
 			bias=attention_bias,
 			attention_mask=attention_mask,
 			causal=True,
-			dropout_rng=dropout_rng,
-			deterministic=deterministic,
-			query_sequence_length=query_length,
-			key_value_sequence_length=key_length,
-			uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+			dropout_rng=self.rngs.params(),
+			query_sequence_length=query_states.shape[1],
+			key_value_sequence_length=key_states.shape[1],
+			uses_cache=cache_view is not None,
 			segment_ids=segment_ids,
 			causal_mask=causal_mask,
 		)

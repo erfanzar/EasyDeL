@@ -31,9 +31,9 @@ from jax import numpy as jnp
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.modules.base_modules.base_module import wrap_easydel_module
-from easydel.modules.base_modules.factory import register_module
-from easydel.modules.base_modules.flax_modeling_utils import (
+from easydel.modules._base.base_module import wrap_easydel_module
+from easydel.modules._base.factory import register_module
+from easydel.modules._base.flax_modeling_utils import (
 	ACT2FN,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
@@ -94,7 +94,7 @@ class FlaxRobertaEmbeddings(nn.Module):
 		hidden_states = input_embeds + token_type_embeddings + position_embeds
 
 		hidden_states = self.LayerNorm(hidden_states)
-		hidden_states = self.dropout(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout(hidden_states)
 		return hidden_states
 
 
@@ -213,7 +213,6 @@ class FlaxRobertaSelfAttention(FlaxAttentionModule):
 		value_states = self._split_heads(value_states)
 
 		if self.causal:
-			query_length, key_length = query_states.shape[1], key_states.shape[1]
 			if self.has_variable("cache", "cached_key"):
 				mask_shift = self.variables["cache"]["cache_index"]
 				max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
@@ -318,7 +317,7 @@ class FlaxRobertaSelfOutput(nn.Module):
 
 	def __call__(self, hidden_states, input_tensor, deterministic: bool = True):
 		hidden_states = self.dense(hidden_states)
-		hidden_states = self.dropout(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout(hidden_states)
 		hidden_states = self.LayerNorm(hidden_states + input_tensor)
 		return hidden_states
 
@@ -360,7 +359,7 @@ class FlaxRobertaAttention(nn.Module):
 			output_attentions=output_attentions,
 		)
 		attn_output = attn_outputs[0]
-		hidden_states = self.output(attn_output, hidden_states, deterministic=deterministic)
+		hidden_states = self.output(attn_output, hidden_states)
 
 		outputs = (hidden_states,)
 
@@ -413,7 +412,7 @@ class FlaxRobertaOutput(nn.Module):
 
 	def __call__(self, hidden_states, attention_output, deterministic: bool = True):
 		hidden_states = self.dense(hidden_states)
-		hidden_states = self.dropout(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout(hidden_states)
 		hidden_states = self.LayerNorm(hidden_states + attention_output)
 		return hidden_states
 
@@ -727,10 +726,10 @@ class FlaxRobertaClassificationHead(nn.Module):
 
 	def __call__(self, hidden_states, deterministic=True):
 		hidden_states = hidden_states[:, 0, :]
-		hidden_states = self.dropout(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout(hidden_states)
 		hidden_states = self.dense(hidden_states)
 		hidden_states = nn.tanh(hidden_states)
-		hidden_states = self.dropout(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout(hidden_states)
 		hidden_states = self.out_proj(hidden_states)
 		return hidden_states
 
@@ -955,7 +954,7 @@ class FlaxRobertaForSequenceClassification(nn.Module):
 		)
 
 		sequence_output = outputs[0]
-		logits = self.classifier(sequence_output, deterministic=deterministic)
+		logits = self.classifier(sequence_output)
 
 		if not return_dict:
 			return (logits,) + outputs[1:]
@@ -1036,7 +1035,7 @@ class FlaxRobertaForMultipleChoice(nn.Module):
 		)
 
 		pooled_output = outputs[1]
-		pooled_output = self.dropout(pooled_output, deterministic=deterministic)
+		pooled_output = self.dropout(pooled_output)
 		logits = self.classifier(pooled_output)
 
 		reshaped_logits = logits.reshape(-1, num_choices)
@@ -1106,7 +1105,7 @@ class FlaxRobertaForTokenClassification(nn.Module):
 		)
 
 		hidden_states = outputs[0]
-		hidden_states = self.dropout(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout(hidden_states)
 		logits = self.classifier(hidden_states)
 
 		if not return_dict:

@@ -17,18 +17,16 @@ import math
 from typing import Optional, Tuple, Union
 
 import chex
-import flax.linen
-import flax.linen.partitioning
 import jax
-from flax import linen as nn
-from flax.linen import Dense
+from flax import nnx as nn
 from jax import numpy as jnp
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.modules.base_modules.base_module import wrap_easydel_module
-from easydel.modules.base_modules.factory import register_module
-from easydel.modules.base_modules.flax_modeling_utils import (
+from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.modules._base.base_module import EasyDeLBaseModule
+from easydel.modules._base.factory import register_module
+from easydel.modules._base.flax_modeling_utils import (
 	block_wise_ffn,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
@@ -77,10 +75,9 @@ def built_bloom_alibi(attention_mask, num_attention_heads):
 
 
 def dropout_add(
-	linen_drop: flax.linen.Dropout,
+	linen_drop: nn.Dropout,
 	x: chex.Array,
 	residual: chex.Array,
-	deterministic: bool,
 ) -> chex.Array:
 	"""The dropout_add function is a helper function that adds the residual to the output of
 	the dropout layer. This is necessary because we want to use deterministic=True when
@@ -99,34 +96,26 @@ def dropout_add(
 	Returns:
 	    A tensor that is the sum of the residual and a dropout layer
 	"""
-	out = linen_drop(inputs=x, deterministic=deterministic)
+	out = linen_drop(inputs=x)
 	out = residual + out
 	return out
 
 
-class FlaxFalconAttention(FlaxAttentionModule):
-	"""
-	Implements the attention mechanism for the Falcon model.
-
-	This attention mechanism supports multiple variants depending on the configuration:
-	- Multi-Query Attention: Uses a single head for keys and values and multiple heads for queries.
-	- New Decoder Architecture: Uses a different arrangement of heads for queries, keys, and values.
-
-	Attributes:
-	    config (FalconConfig): Configuration for the attention module.
-	    dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-	    param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-	    precision (Optional[Union[jax.lax.Precision, str]]): Precision setting for JAX operations.
-
-	"""
-
-	config: FalconConfig
-	dtype: jnp.dtype = jnp.bfloat16
-	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
-		config = self.config
+class FalconAttention(FlaxAttentionModule):
+	def __init__(
+		self,
+		config: FalconConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(config=config)
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
 		head_dim = config.hidden_size // config.num_attention_heads
 		if config.new_decoder_architecture:
 			qkv_out_dim = (config.num_kv_heads * 2 + config.num_attention_heads) * head_dim
@@ -144,8 +133,10 @@ class FlaxFalconAttention(FlaxAttentionModule):
 		)
 		self.new_decoder_architecture = config.new_decoder_architecture
 		self.num_heads = config.num_attention_heads
-		self.query_key_value = Dense(
-			features=qkv_out_dim,
+		self.query_key_value = nn.Linear(
+			config.hidden_size,
+			qkv_out_dim,
+			rngs=rngs,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			precision=self.precision,
@@ -153,8 +144,10 @@ class FlaxFalconAttention(FlaxAttentionModule):
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.inv_norm_factor = 1 / math.sqrt(head_dim)
-		self.dense = Dense(
-			features=config.hidden_size,
+		self.dense = nn.Linear(
+			qkv_out_dim,
+			config.hidden_size,
+			rngs=rngs,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			use_bias=config.bias,
@@ -258,31 +251,11 @@ class FlaxFalconAttention(FlaxAttentionModule):
 		causal_mask: chex.Array = None,
 		segment_ids: Optional[chex.Array] = None,
 		alibi: Optional[chex.Array] = None,
-		init_cache: bool = False,
+		cache_view: Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
-		deterministic: bool = False,
 		frequencies: Optional[chex.Array] = None,
 	):
-		"""
-		Forward pass of the attention module.
-
-		Args:
-		    hidden_states (chex.Array): Input hidden states.
-		    attention_mask (chex.Array): Mask to apply on the attention scores.
-		    position_ids (chex.Array): Position indices for the tokens.
-		    causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior.
-		    segment_ids (Optional[chex.Array], optional): Segment IDs for segment-based attention.
-		    alibi (Optional[chex.Array], optional): Alibi tensor for adding positional bias.
-		    init_cache (bool, optional): If True, initializes cache for caching keys and values.
-		    output_attentions (bool, optional): If True, outputs attention weights alongside the hidden states.
-		    deterministic (bool, optional): If True, disables dropout for deterministic behavior.
-
-		Returns:
-		    Union[chex.Array, Tuple[chex.Array, chex.Array]]: The output tensor and optionally the attention weights.
-		"""
-		fused_qkv = self.query_key_value(
-			hidden_states
-		)  # [batch_size, seq_length, 3 x hidden_size]
+		fused_qkv = self.query_key_value(hidden_states)
 		num_kv_heads = (
 			self.num_heads if self.new_decoder_architecture else self.num_kv_heads
 		)
@@ -316,16 +289,15 @@ class FlaxFalconAttention(FlaxAttentionModule):
 				frequencies=frequencies,
 			)
 		(
-			query_layer,
 			key_layer,
 			value_layer,
 			attention_mask,
 			attention_bias,
-		) = self.concatenate_to_cache(
-			init_cache=init_cache,
+		) = self.concatenate(
 			query=query_layer,
 			key=key_layer,
 			value=value_layer,
+			cache_view=cache_view,
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,
 			fcm_mask=None,
@@ -338,11 +310,11 @@ class FlaxFalconAttention(FlaxAttentionModule):
 				value_states=value_layer,
 				causal_mask=causal_mask,
 				attention_mask=attention_mask,
-				deterministic=deterministic,
+				dropout_rng=self.rngs.params(),
 				segment_ids=segment_ids,
 				query_sequence_length=query_length,
 				key_value_sequence_length=key_length,
-				uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+				uses_cache=cache_view is not None,
 				bias=attention_bias,
 				causal=True,
 			)
@@ -387,73 +359,104 @@ class FlaxFalconAttention(FlaxAttentionModule):
 			return output_tensor, None
 
 
-class FlaxFalconMlp(nn.Module):
-	config: FalconConfig
-	dtype: jnp.dtype = jnp.bfloat16
-	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
-		dense_class = functools.partial(
-			Dense,
+class FalconMlp(nn.Module):
+	def __init__(
+		self,
+		config: FalconConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__()
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
+		linear = functools.partial(
+			nn.Linear,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			precision=self.precision,
 			use_bias=self.config.bias,
 			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
 		)
-		self.dense_h_to_4h = dense_class(
+		self.dense_h_to_4h = linear(
+			self.config.hidden_size,
 			self.config.ff_factor * self.config.hidden_size,
+			rngs=rngs,
 		)
-		self.dense_4h_to_h = dense_class(self.config.hidden_size)
+		self.dense_4h_to_h = linear(
+			self.config.ff_factor * self.config.hidden_size,
+			self.config.hidden_size,
+			rngs=rngs,
+		)
 
 	def __call__(self, x: chex.Array, deterministic: bool = True):
 		x = control_mlp_sharding(x, self.config.partition_axis)
 		return self.dense_4h_to_h(nn.gelu(self.dense_h_to_4h(x), approximate=False))
 
 
-class FlaxFalconBlock(nn.Module):
-	config: FalconConfig
-	dtype: jnp.dtype = jnp.bfloat16
-	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
-		config = self.config
+class FalconBlock(nn.Module):
+	def __init__(
+		self,
+		config: FalconConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__()
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
 
 		if config.new_decoder_architecture and config.num_ln_in_parallel_attn == 2:
 			self.ln_attn = nn.LayerNorm(
+				self.config.hidden_size,
 				epsilon=config.layer_norm_epsilon,
 				dtype=self.dtype,
 				param_dtype=self.param_dtype,
+				rngs=rngs,
 			)
 			self.ln_mlp = nn.LayerNorm(
+				self.config.hidden_size,
 				epsilon=config.layer_norm_epsilon,
 				dtype=self.dtype,
 				param_dtype=self.param_dtype,
+				rngs=rngs,
 			)
 		else:
 			self.input_layernorm = nn.LayerNorm(
+				self.config.hidden_size,
 				epsilon=config.layer_norm_epsilon,
 				dtype=self.dtype,
 				param_dtype=self.param_dtype,
+				rngs=rngs,
 			)
 			if not config.parallel_attn:
 				self.post_attention_layernorm = nn.LayerNorm(
+					self.config.hidden_size,
 					epsilon=config.layer_norm_epsilon,
 					dtype=self.dtype,
 					param_dtype=self.param_dtype,
+					rngs=rngs,
 				)
-		attn_block = FlaxFalconAttention
-		mlp_block = FlaxFalconMlp
+		attn_block = FalconAttention
+		mlp_block = FalconMlp
 		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
-			attn_block = flax.linen.partitioning.remat(
+			attn_block = nn.remat(
 				attn_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 				static_argnums=(3, 6, 7, 8, 9),
 			)
 
-			mlp_block = flax.linen.partitioning.remat(
+			mlp_block = nn.remat(
 				mlp_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 				static_argnums=(1,),
@@ -464,16 +467,18 @@ class FlaxFalconBlock(nn.Module):
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			precision=self.precision,
+			rngs=rngs,
 		)
 		self.self_attention = attn_block(
 			config=config,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			precision=self.precision,
+			rngs=rngs,
 		)
 
-		self.dropout = flax.linen.Dropout(self.config.attention_dropout)
-		self.dropout_mlp = flax.linen.Dropout(self.config.hidden_dropout)
+		self.dropout = nn.Dropout(self.config.attention_dropout)
+		self.dropout_mlp = nn.Dropout(self.config.hidden_dropout)
 
 	def __call__(
 		self,
@@ -483,9 +488,8 @@ class FlaxFalconBlock(nn.Module):
 		causal_mask: chex.Array = None,
 		segment_ids: Optional[chex.Array] = None,
 		alibi: Optional[chex.Array] = None,
-		init_cache: bool = False,
+		cache_view: Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
-		deterministic: bool = False,
 		frequencies: Optional[chex.Array] = None,
 	):
 		"""
@@ -520,9 +524,8 @@ class FlaxFalconBlock(nn.Module):
 			causal_mask,
 			segment_ids,
 			alibi,
-			init_cache,
+			cache_view,
 			output_attentions,
-			deterministic,
 			frequencies,
 		)
 
@@ -530,7 +533,7 @@ class FlaxFalconBlock(nn.Module):
 			if self.config.parallel_attn:
 				mlp_layernorm_out = attention_layernorm_out
 			else:
-				residual = dropout_add(self.dropout, attention_output, residual, deterministic)
+				residual = dropout_add(self.dropout, attention_output, residual)
 				mlp_layernorm_out = self.post_attention_layernorm(residual)
 
 		if self.config.use_scan_mlp:
@@ -538,113 +541,15 @@ class FlaxFalconBlock(nn.Module):
 				self.mlp,
 				mlp_layernorm_out,
 				self.config.scan_mlp_chunk_size,
-				deterministic,
 			)
 		else:
-			mlp_output = self.mlp(
-				mlp_layernorm_out,
-				deterministic,
-			)
+			mlp_output = self.mlp(mlp_layernorm_out)
 
 		if self.config.new_decoder_architecture or self.config.parallel_attn:
 			mlp_output += attention_output
 
-		output = dropout_add(self.dropout_mlp, mlp_output, residual, deterministic)
+		output = dropout_add(self.dropout_mlp, mlp_output, residual)
 		return output, attn_score
-
-
-class FlaxFalconCollection(nn.Module):
-	"""
-	Represents a collection of FlaxFalconBlock modules, forming the main body of the Falcon model.
-
-	This module stacks multiple FlaxFalconBlock layers and handles the forward pass through them,
-	optionally collecting hidden states and attention scores.
-
-	Attributes:
-	    config (FalconConfig): Configuration for the Falcon model.
-	    dtype (jnp.dtype): Data type for computations (default: jnp.float32).
-	    param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
-	    precision (Optional[Union[jax.lax.Precision, str]]): Precision setting for JAX operations.
-	"""
-
-	config: FalconConfig
-	dtype: jnp.dtype = jnp.bfloat16
-	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
-		self.layers = [
-			FlaxFalconBlock(
-				config=self.config,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
-				name=str(i),
-			)
-			for i in range(self.config.num_hidden_layers)
-		]
-
-		self._frequencies = self.config.get_basic_frequencies(
-			rotary_dim=self.config.hidden_size // self.config.num_attention_heads,
-			head_size=self.config.hidden_size // self.config.num_attention_heads,
-			base=self.config.rope_theta,
-		)
-
-	def __call__(
-		self,
-		hidden_states: chex.Array,
-		attention_mask: chex.Array,
-		position_ids: chex.Array,
-		causal_mask: chex.Array,
-		alibi: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		output_attentions: bool = False,
-		output_hidden_states: bool = False,
-		init_cache: bool = False,
-		deterministic: bool = True,
-	):
-		"""
-		Forward pass through the collection of FlaxFalconBlock layers.
-
-		Args:
-		    hidden_states (chex.Array): Input hidden states.
-		    attention_mask (chex.Array): Mask to apply on the attention scores.
-		    position_ids (chex.Array): Position indices for the tokens.
-		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-		    alibi (Optional[chex.Array], optional): Alibi tensor for adding positional bias.
-		    segment_ids (Optional[chex.Array], optional): Segment IDs for segment-based attention.
-		    output_attentions (bool, optional): If True, returns attention scores from each layer.
-		    output_hidden_states (bool, optional): If True, returns hidden states from each layer.
-		    init_cache (bool, optional): If True, initializes cache for caching keys and values.
-		    deterministic (bool, optional): If True, disables dropout for deterministic behavior.
-
-		Returns:
-		    Tuple[chex.Array, Tuple[chex.Array], Tuple[chex.Array]]: A tuple containing:
-		        - The final hidden states.
-		        - A tuple of hidden states from all layers (if output_hidden_states is True).
-		        - A tuple of attention scores from all layers (if output_attentions is True).
-		"""
-		all_hidden_states = () if output_hidden_states else None
-		all_attentions = () if output_attentions else None
-		for layer in self.layers:
-			hidden_states, score = layer(
-				hidden_states=hidden_states,
-				alibi=alibi,
-				attention_mask=attention_mask,
-				position_ids=position_ids,
-				causal_mask=causal_mask,
-				init_cache=init_cache,
-				output_attentions=output_attentions,
-				deterministic=deterministic,
-				segment_ids=segment_ids,
-				frequencies=self._frequencies,
-			)
-			if output_hidden_states:
-				all_hidden_states += (hidden_states,)
-			if output_attentions:
-				all_attentions += (score,)
-
-		return hidden_states, all_hidden_states, all_attentions
 
 
 @register_module(
@@ -660,51 +565,58 @@ class FlaxFalconCollection(nn.Module):
 		"post_attention_layernorm",
 	],
 )
-@wrap_easydel_module(config_class=FalconConfig, base_model_prefix="transformer")
-class FlaxFalconModel(nn.Module):
-	config: FalconConfig
-	dtype: jnp.dtype = jnp.bfloat16
-	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
-		config = self.config
+class FalconModel(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: FalconConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
 		self.word_embeddings = nn.Embed(
 			num_embeddings=config.vocab_size,
 			features=config.hidden_size,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
+			rngs=rngs,
 		)
-		self.h = FlaxFalconCollection(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-		)
+		self.h = [
+			FalconBlock(
+				config=self.config,
+				dtype=self.dtype,
+				param_dtype=self.param_dtype,
+				precision=self.precision,
+				rngs=rngs,
+			)
+			for i in range(self.config.num_hidden_layers)
+		]
 		self.ln_f = nn.LayerNorm(
+			self.config.hidden_size,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			epsilon=config.layer_norm_epsilon,
-		)
-		self.causal_mask = flax.linen.make_causal_mask(
-			jnp.ones(
-				shape=(1, self.config.granted_mask_max_position_embedding),
-				dtype="bool",
-			),
-			dtype="bool",
+			rngs=rngs,
 		)
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
+		input_ids: chex.Array,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
 		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
-		init_cache: bool = False,
-		deterministic: bool = True,
+		past_key_values: Optional[TransformerCache] = None,
 		return_dict: bool = True,
 	) -> Union[FlaxBaseModelOutput, Tuple]:
 		"""
@@ -725,12 +637,16 @@ class FlaxFalconModel(nn.Module):
 		Returns:
 		    FlaxBaseModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
+		all_hidden_states = () if output_hidden_states else None
+		all_attentions = () if output_attentions else None
 		if input_embeds is None and input_ids is not None:
 			input_embeds = self.word_embeddings(input_ids.astype("i4"))
 		else:
 			raise ValueError("you should specify input_embeds or input_ids one of them")
 		batch_size, sequence_length, _ = input_embeds.shape
 
+		if attention_mask is None:
+			attention_mask = jnp.ones((batch_size, sequence_length), dtype="i4")
 		alibi = None
 		if self.config.alibi:
 			alibi = built_bloom_alibi(
@@ -738,24 +654,31 @@ class FlaxFalconModel(nn.Module):
 				self.config.num_attention_heads,
 			).astype(input_embeds.dtype)
 		elif position_ids is None:
-			position_ids = jnp.arange(0, sequence_length).reshape(1, -1)
-		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, sequence_length), dtype="i4")
+			position_ids = jnp.broadcast_to(
+				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+				(batch_size, sequence_length),
+			).astype(jnp.int32)
 		if attention_mask.ndim == 2:
 			attention_mask = jnp.expand_dims(attention_mask, (-3, -2))
-
-		hidden_states, all_hidden_states, all_attentions = self.h(
-			hidden_states=input_embeds,
-			attention_mask=attention_mask,
-			position_ids=position_ids,
-			alibi=alibi,
-			causal_mask=self.causal_mask,
-			output_attentions=output_attentions,
-			deterministic=deterministic,
-			output_hidden_states=output_hidden_states,
-			init_cache=init_cache,
-			segment_ids=segment_ids,
-		)
+		if past_key_values is None:
+			past_key_values = TransformerCache.init_empty(len(self.h))
+		hidden_states = input_embeds
+		for idx, layer in enumerate(self.h):
+			hidden_states, score = layer(
+				hidden_states=hidden_states,
+				alibi=alibi,
+				attention_mask=attention_mask,
+				position_ids=position_ids,
+				causal_mask=self.causal_mask,
+				cache_view=past_key_values.views[idx],
+				output_attentions=output_attentions,
+				segment_ids=segment_ids,
+				frequencies=self.frequencies,
+			)
+			if output_hidden_states:
+				all_hidden_states += (hidden_states,)
+			if output_attentions:
+				all_attentions += (score,)
 		hidden_states = self.ln_f(hidden_states)
 		if all_hidden_states is not None:
 			all_hidden_states += hidden_states
@@ -784,38 +707,52 @@ class FlaxFalconModel(nn.Module):
 		"post_attention_layernorm",
 	],
 )
-@wrap_easydel_module(config_class=FalconConfig, base_model_prefix="transformer")
-class FlaxFalconForCausalLM(nn.Module):
-	config: FalconConfig
-	dtype: jnp.dtype = jnp.bfloat16
-	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
-		self.transformer = FlaxFalconModel.flax_module(
+class FalconForCausalLM(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: FalconConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+		self.transformer = FalconModel(
 			config=self.config,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			precision=self.precision,
+			rngs=rngs,
 		)
 
-		self.lm_head = Dense(
+		self.lm_head = nn.Linear(
+			self.config.hidden_size,
 			self.config.vocab_size,
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+			precision=self.precision,
+			rngs=rngs,
 			use_bias=False,
 			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
 		)
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
+		input_ids: chex.Array,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
 		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
-		init_cache: bool = False,
-		deterministic: bool = True,
+		past_key_values: Optional[TransformerCache] = None,
 		return_dict: bool = True,
 	) -> Union[FlaxCausalLMOutput, Tuple]:
 		"""
@@ -841,10 +778,9 @@ class FlaxFalconForCausalLM(nn.Module):
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			output_attentions=output_attentions,
-			init_cache=init_cache,
+			past_key_values=past_key_values,
 			return_dict=return_dict,
 			input_embeds=input_embeds,
-			deterministic=deterministic,
 			output_hidden_states=output_hidden_states,
 			segment_ids=segment_ids,
 		)

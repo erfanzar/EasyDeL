@@ -140,7 +140,11 @@ def flatten_dict(
 		path = _prefix + (key,)
 		if should_flatten(path, value):
 			nested = flatten_dict(
-				value, keep_empty_nodes=keep_empty_nodes, is_leaf=is_leaf, sep=sep, _prefix=path
+				value,
+				keep_empty_nodes=keep_empty_nodes,
+				is_leaf=is_leaf,
+				sep=sep,
+				_prefix=path,
 			)
 			if nested or keep_empty_nodes:
 				result.update(nested)
@@ -483,6 +487,8 @@ def merge_state_and_tree(tree: dict, state: nnx.State) -> nnx.State:
 		params = flatten_dict(params)
 	if not is_flatten(tree):
 		tree = flatten_dict(tree)
+	# for k, v in tree.items():
+	# 	print(k)
 	for key in list(params.keys()):
 		tree_value = tree.get(key, None)
 		if tree_value is not None:
