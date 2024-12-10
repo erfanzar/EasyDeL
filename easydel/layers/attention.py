@@ -1834,7 +1834,7 @@ class FlaxAttentionModule(nn.Module):
 			attention_mask = jnp.logical_and(window_mask, attention_mask)
 			if attention_mask.shape[-1] <= 1:
 				attention_mask = attention_mask[:, :, :, -sliding_windows:]
-				
+
 		attention_bias = lax.select(
 			attention_mask > 0,
 			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),

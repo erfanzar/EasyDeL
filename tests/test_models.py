@@ -379,7 +379,11 @@ class EasyModelsTest(unittest.TestCase):
 			n_head=self.num_attention_heads,
 			rotary_dim=self.hidden_size // self.num_attention_heads,
 		)
-		res, err = self.create_test_for_models("gptj", transformers.GPTJForCausalLM)
+		res, err = self.create_test_for_models(
+			"gptj",
+			transformers.GPTJForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.header_config = None
 		self.assertTrue(res, f"GPT-J model Failed [ERROR {err}]")
 
@@ -692,7 +696,7 @@ if __name__ == "__main__":
 	# test.test_falcon()  # Passed
 	# test.test_gemma()  # Passed
 	# test.test_gemma2()  # Passed
-	# test.test_gptj()
+	test.test_gptj()
 	# test.test_gpt2()
 	# test.test_grok1() # should be impl
 	# test.test_internlm2()

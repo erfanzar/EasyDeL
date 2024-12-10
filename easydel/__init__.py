@@ -156,9 +156,9 @@ from easydel.modules.gpt2 import (
 	GPT2Config,
 )
 from easydel.modules.gpt_j import (
-	FlaxGPTJForCausalLM,
-	FlaxGPTJModel,
 	GPTJConfig,
+	GPTJForCausalLM,
+	GPTJModel,
 )
 from easydel.modules.gpt_neo_x import (
 	FlaxGPTNeoXForCausalLM,

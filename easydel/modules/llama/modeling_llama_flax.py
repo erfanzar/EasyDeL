@@ -567,16 +567,6 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 		output_hidden_states: Optional[bool] = None,
 		return_dict: bool = True,
 	) -> Union[FlaxCausalLMOutput, Tuple]:
-		batch_size, seq_length = (
-			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
-		)
-		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, seq_length), dtype="i4")
-		if position_ids is None:
-			position_ids = jnp.broadcast_to(
-				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-				(batch_size, seq_length),
-			).astype(jnp.int32)
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,

@@ -14,8 +14,8 @@
 
 from easydel.modules.gpt_j.gpt_j_configuration import GPTJConfig
 from easydel.modules.gpt_j.modeling_gpt_j_flax import (
-	FlaxGPTJForCausalLM,
-	FlaxGPTJModel,
+	GPTJForCausalLM,
+	GPTJModel,
 )
 
-__all__ = "FlaxGPTJForCausalLM", "FlaxGPTJModel", "GPTJConfig"
+__all__ = "GPTJForCausalLM", "GPTJModel", "GPTJConfig"
