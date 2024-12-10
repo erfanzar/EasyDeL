@@ -160,12 +160,7 @@ class EasyModelsTest(unittest.TestCase):
 				blocksize_q=self.blocksize_q,
 				attn_dtype=self.attn_dtype,
 			)
-			if module_name == "exaone":  # it's EXAONE Issue
-				flatten_params = ed.traversals.flatten_dict(params, sep=".")
-				params = {}
-				for k in list(flatten_params.keys()):
-					params[k.replace("attn.attention", "attn")] = flatten_params[k]
-				params = ed.traversals.unflatten_dict(params, sep=".")
+
 			torch_input_ids, jax_input_ids = self.make_input_id(
 				self.vocab_size,
 				(self.batch_size, self.sequence_length + 1),
@@ -343,6 +338,7 @@ class EasyModelsTest(unittest.TestCase):
 		res, err = self.create_test_for_models(
 			"falcon",
 			transformers.FalconForCausalLM,
+			ed.TaskType.CAUSAL_LM,
 		)
 		self.header_config = None
 		self.assertTrue(res, f"Falcon model Failed [ERROR {err}]")
@@ -355,7 +351,7 @@ class EasyModelsTest(unittest.TestCase):
 	def test_exaone(self):
 		self.header_config = None
 		hf_model, conf = self.get_hf_model_from_hub("LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct")
-		res, err = self.create_test_for_models("exaone", hf_model)
+		res, err = self.create_test_for_models("exaone", hf_model, ed.TaskType.CAUSAL_LM)
 		self.assertTrue(res, f"EXAONE model Failed [ERROR {err}]")
 
 	def test_internlm2(self):
@@ -451,7 +447,11 @@ class EasyModelsTest(unittest.TestCase):
 			attn_config=ed.DbrxAttentionConfig(),
 		)
 
-		res, err = self.create_test_for_models("dbrx", transformers.DbrxForCausalLM)
+		res, err = self.create_test_for_models(
+			"dbrx",
+			transformers.DbrxForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"DBRX model Failed [ERROR {err}]")
 
 	def test_stablelm(self):
@@ -501,7 +501,9 @@ class EasyModelsTest(unittest.TestCase):
 	def test_deepseek_v2(self):
 		self.header_config = None
 		hf_model, conf = self.get_hf_model_from_hub("deepseek-ai/DeepSeek-V2")
-		res, err = self.create_test_for_models("deepseek_v2", hf_model)
+		res, err = self.create_test_for_models(
+			"deepseek_v2", hf_model, ed.TaskType.CAUSAL_LM
+		)
 
 		self.assertTrue(res, f"DeepSeekv2 model Failed [ERROR {err}]")
 
@@ -551,7 +553,9 @@ class EasyModelsTest(unittest.TestCase):
 
 	def test_cohere(self):
 		self.header_config = None
-		res, err = self.create_test_for_models("cohere", transformers.CohereForCausalLM)
+		res, err = self.create_test_for_models(
+			"cohere", transformers.CohereForCausalLM, ed.TaskType.CAUSAL_LM
+		)
 
 		self.assertTrue(res, f"CoHERE model Failed [ERROR {err}]")
 
@@ -672,12 +676,12 @@ if __name__ == "__main__":
 	# unittest.main()
 	test = EasyModelsTest()
 	test.setUp()
-	test.test_arctic()
-	# test.test_cohere()
-	# test.test_dbrx()
-	# test.test_deepseek_v2()
-	# test.test_exaone()
-	# test.test_falcon()
+	# test.test_arctic() # Passed
+	# test.test_cohere()  # Passed
+	# test.test_dbrx()  # Passed
+	# test.test_deepseek_v2() # Passed
+	# test.test_exaone()  # Passed
+	# test.test_falcon()  # Passed
 	# test.test_gemma()
 	# test.test_gemma2()
 	# test.test_gptj()

@@ -25,9 +25,9 @@ from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
 from easydel.layers.norms import RMSNorm
-from easydel.modules.base_modules.base_module import EasyDeLBaseModule
-from easydel.modules.base_modules.factory import register_module
-from easydel.modules.base_modules.flax_modeling_utils import (
+from easydel.modules._base.base_module import EasyDeLBaseModule
+from easydel.modules._base.factory import register_module
+from easydel.modules._base.flax_modeling_utils import (
 	ACT2FN,
 	block_wise_ffn,
 	control_mlp_sharding,
@@ -38,9 +38,10 @@ from easydel.modules.base_modules.flax_modeling_utils import (
 # easydel.modules
 from easydel.modules.llama.llama_configuration import (
 	LlamaConfig as LlamaConfig,
+)
+from easydel.modules.llama.llama_configuration import (
 	VisionLlamaConfig as VisionLlamaConfig,
 )
-
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
@@ -59,7 +60,6 @@ class LlamaAttention(FlaxAttentionModule):
 		rngs: nn.Rngs,
 	):
 		super().__init__(config=config)
-		self.config = config
 		self.dtype = dtype
 		self.param_dtype = param_dtype
 		self.precision = precision
@@ -261,7 +261,7 @@ class LlamaMLP(nn.Module):
 	def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
 		x = control_mlp_sharding(x, self.config.partition_axis)
 		x = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-		x = self.dropout(x, deterministic=deterministic)
+		x = self.dropout(x)
 		return x
 
 
@@ -571,7 +571,7 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
 		)
 		if attention_mask is None:
-			attention_mask = jnp.ones_like(input_ids)
+			attention_mask = jnp.ones((batch_size, seq_length), dtype="i4")
 		if position_ids is None:
 			position_ids = jnp.broadcast_to(
 				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),

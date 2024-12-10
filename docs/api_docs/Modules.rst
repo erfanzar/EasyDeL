@@ -55,13 +55,15 @@ Modules
    modules.exaone.exaone_configuration
    modules.gpt2.gpt2_configuration
    modules.gpt2.modeling_gpt2_flax
+   modules._base.base_module
+   modules._base.base_config
+   modules._base.factory
+   modules._base.flax_modeling_utils
    modules.auto_configuration
    modules.grok_1.grok_1_configuration
    modules.grok_1.modeling_grok_1_flax
    modules.qwen2.modeling_qwen_flax
    modules.qwen2.qwen_configuration
-   modules.chatglm.chatglm_configuration
-   modules.chatglm.modelling_chatglm_flax
    modules.phi.modelling_phi_flax
    modules.phi.phi_configuration
    modules.whisper.whisper_configuration
@@ -70,10 +72,6 @@ Modules
    modules.gemma2.gemma2_configuration
    modules.olmo.modeling_olmo_flax
    modules.olmo.olmo_configuration
-   modules.base_modules.base_module
-   modules.base_modules.base_config
-   modules.base_modules.factory
-   modules.base_modules.flax_modeling_utils
    modules.auto_causal_language_model
    modules.cohere.cohere_configuration
    modules.cohere.modelling_cohere_flax

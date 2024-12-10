@@ -51,7 +51,7 @@ from easydel.layers.caching import (
 	TransformerCache,
 	TransformerCacheMetaData,
 )
-from easydel.modules.base_modules.base_config import EasyDeLBaseConfig
+from easydel.modules._base.base_config import EasyDeLBaseConfig
 from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN, EasyQuantizer
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
@@ -104,6 +104,14 @@ class EasyDeLBaseModule(nn.Module):
 	@property
 	def model_type(self):
 		return self._model_type
+
+	@cached_property
+	def causal_mask(self):
+		return self.config.get_basic_causal_mask()
+
+	@cached_property
+	def frequencies(self):
+		return self.config.get_basic_frequencies()
 
 	def get_named_sharding(self, partition_rules=None, partition_specs=None):
 		if partition_rules is None:

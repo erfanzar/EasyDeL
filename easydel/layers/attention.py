@@ -59,7 +59,7 @@ from easydel.kernels.flash_attention_2 import create_flash_attention
 from easydel.kernels.ring_attention import ring_attention
 from easydel.layers._blockwise_attention import blockwise_attn
 from easydel.layers.caching import TransformerCacheView
-from easydel.modules.base_modules.base_module import EasyDeLBaseConfig
+from easydel.modules._base.base_module import EasyDeLBaseConfig
 from easydel.utils.quantizers import EasyQuantizer
 
 try:

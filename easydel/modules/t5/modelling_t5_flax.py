@@ -48,12 +48,12 @@ from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule
-from easydel.modules.base_modules.base_module import (
+from easydel.modules._base.base_module import (
 	EasyDeLBaseModule,
 	wrap_custom_easydel_module,
 )
-from easydel.modules.base_modules.factory import register_module
-from easydel.modules.base_modules.flax_modeling_utils import (
+from easydel.modules._base.factory import register_module
+from easydel.modules._base.flax_modeling_utils import (
 	ACT2FN,
 	control_mlp_sharding,
 	get_gradient_checkpoint_policy,
@@ -128,7 +128,7 @@ class FlaxT5DenseActDense(nn.Module):
 	def __call__(self, hidden_states, deterministic=True):
 		hidden_states = self.wi(hidden_states)
 		hidden_states = self.act(hidden_states)
-		hidden_states = self.dropout(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout(hidden_states)
 		hidden_states = self.wo(hidden_states)
 		return hidden_states
 
@@ -162,11 +162,11 @@ class FlaxT5DenseGatedActDense(nn.Module):
 		self.dropout = flax.linen.Dropout(self.config.dropout_rate)
 		self.act = ACT2FN[self.config.dense_act_fn]
 
-	def __call__(self, hidden_states, deterministic):
+	def __call__(self, hidden_states):
 		hidden_gelu = self.act(self.wi_0(hidden_states))
 		hidden_linear = self.wi_1(hidden_states)
 		hidden_states = hidden_gelu * hidden_linear
-		hidden_states = self.dropout(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout(hidden_states)
 		hidden_states = self.wo(hidden_states)
 		return hidden_states
 
@@ -661,7 +661,7 @@ class FlaxT5Block(nn.Module):
 			attention_outputs = attention_outputs + cross_attention_outputs[1:]
 
 		# Apply Feed Forward layer
-		hidden_states = self.layer[-1](hidden_states, deterministic=deterministic)
+		hidden_states = self.layer[-1](hidden_states)
 
 		outputs = (hidden_states,)
 
@@ -826,7 +826,7 @@ class FlaxT5Stack(nn.Module):
 		init_cache: bool = False,
 	):
 		hidden_states = self.embed_tokens(input_ids)
-		hidden_states = self.dropout(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout(hidden_states)
 
 		outputs = self.block(
 			hidden_states,
@@ -842,7 +842,7 @@ class FlaxT5Stack(nn.Module):
 		hidden_states = outputs[0]
 
 		hidden_states = self.final_layer_norm(hidden_states)
-		hidden_states = self.dropout(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout(hidden_states)
 
 		# Add last layer
 		all_hidden_states = None

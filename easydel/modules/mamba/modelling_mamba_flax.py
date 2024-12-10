@@ -43,9 +43,9 @@ from jax.core import ShapedArray
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.norms import RMSNorm as MambaRMSNorm
-from easydel.modules.base_modules.base_module import EasyDeLBaseModule
-from easydel.modules.base_modules.factory import register_module
-from easydel.modules.base_modules.flax_modeling_utils import (
+from easydel.modules._base.base_module import EasyDeLBaseModule
+from easydel.modules._base.factory import register_module
+from easydel.modules._base.flax_modeling_utils import (
 	ACT2FN,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,

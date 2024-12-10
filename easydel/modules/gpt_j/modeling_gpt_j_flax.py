@@ -25,9 +25,9 @@ from flax.linen import Dense, make_causal_mask
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers, get_logger
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.modules.base_modules.base_module import wrap_easydel_module
-from easydel.modules.base_modules.factory import register_module
-from easydel.modules.base_modules.flax_modeling_utils import (
+from easydel.modules._base.base_module import wrap_easydel_module
+from easydel.modules._base.factory import register_module
+from easydel.modules._base.flax_modeling_utils import (
 	ACT2FN,
 	block_wise_ffn,
 	get_dot_general_by_bits,
@@ -160,11 +160,10 @@ class FlaxGPTJAttention(FlaxAttentionModule):
 			bias=attention_bias,
 			attention_mask=attention_mask,
 			causal=True,
-			dropout_rng=dropout_rng,
-			deterministic=deterministic,
-			query_sequence_length=query_length,
-			key_value_sequence_length=key_length,
-			uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+			dropout_rng=self.rngs.params(),
+			query_sequence_length=query_states.shape[1],
+			key_value_sequence_length=key_states.shape[1],
+			uses_cache=cache_view is not None,
 			segment_ids=segment_ids,
 			causal_mask=self.causal_mask,
 		)
@@ -172,7 +171,7 @@ class FlaxGPTJAttention(FlaxAttentionModule):
 			self._merge_heads(attentions.attention_outputs)
 		)
 		attn_output = self.out_proj(attn_output)
-		attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
+		attn_output = self.resid_dropout(attn_output)
 
 		outputs = (
 			(attn_output, attentions.attention_weights)
@@ -214,7 +213,7 @@ class FlaxGPTJMLP(nn.Module):
 
 	def __call__(self, hidden_states, deterministic: bool = True):
 		hidden_states = self.fc_out(self.act(self.fc_in(hidden_states)))
-		hidden_states = self.dropout(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout(hidden_states)
 		return hidden_states
 
 
@@ -300,7 +299,7 @@ class FlaxGPTJBlock(nn.Module):
 				self.mlp, hidden_states, self.config.scan_mlp_chunk_size, deterministic
 			)
 		else:
-			feed_forward_hidden_states = self.mlp(hidden_states, deterministic)
+			feed_forward_hidden_states = self.mlp(hidden_states)
 		# residual connection
 		hidden_states = attn_output + feed_forward_hidden_states + residual
 
@@ -416,7 +415,7 @@ class FlaxGPTJModel(nn.Module):
 	):
 		input_embeds = self.wte(input_ids.astype("i4"))
 
-		hidden_states = self.dropout(input_embeds, deterministic=deterministic)
+		hidden_states = self.dropout(input_embeds)
 
 		outputs = self.h(
 			hidden_states,

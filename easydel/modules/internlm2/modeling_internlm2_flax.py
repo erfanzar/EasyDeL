@@ -27,12 +27,13 @@ from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import TransformerCache, TransformerCacheView
 from easydel.layers.norms import RMSNorm
-from easydel.modules.base_modules.base_module import wrap_easydel_module
-from easydel.modules.base_modules.factory import register_module
+from easydel.modules._base.base_module import wrap_easydel_module
+from easydel.modules._base.factory import register_module
 
 # easydel.modules
-from easydel.modules.base_modules.flax_modeling_utils import (
+from easydel.modules._base.flax_modeling_utils import (
 	ACT2FN,
 	block_wise_ffn,
 	control_mlp_sharding,
@@ -125,9 +126,8 @@ class FlaxInternLM2Attention(FlaxAttentionModule):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
+		cache_view: Optional[TransformerCacheView] = None,
 		segment_ids: Optional[chex.Array] = None,
-		deterministic: bool = True,
-		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
 		frequencies: Optional[chex.Array] = None,
@@ -166,30 +166,25 @@ class FlaxInternLM2Attention(FlaxAttentionModule):
 			frequencies=frequencies,
 		)
 
-		query_length, key_length = query_states.shape[1], key_states.shape[1]
-
 		dropout_rng = None
 
 		if not deterministic and self.config.attention_dropout > 0.0:
 			dropout_rng = self.make_rng("dropout")
 
 		(
-			query_states,
 			key_states,
 			value_states,
 			attention_mask,
 			attention_bias,
-		) = self.concatenate_to_cache(
-			init_cache=init_cache,
+		) = self.concatenate(
 			query=query_states,
 			key=key_states,
+			cache_view=cache_view,
 			value=value_states,
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,
 			fcm_mask=fcm_mask,
 		)
-
-		query_length, key_length = query_states.shape[1], key_states.shape[1]
 
 		attentions = self.attention_performer(
 			query_states=query_states,
@@ -198,11 +193,10 @@ class FlaxInternLM2Attention(FlaxAttentionModule):
 			bias=attention_bias,
 			attention_mask=attention_mask,
 			causal=True,
-			dropout_rng=dropout_rng,
-			deterministic=deterministic,
-			query_sequence_length=query_length,
-			key_value_sequence_length=key_length,
-			uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+			dropout_rng=self.rngs.params(),
+			query_sequence_length=query_states.shape[1],
+			key_value_sequence_length=key_states.shape[1],
+			uses_cache=cache_view is not None,
 			segment_ids=segment_ids,
 			causal_mask=causal_mask,
 		)
@@ -321,9 +315,8 @@ class FlaxInternLM2Block(nn.Module):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
+		cache_view: Optional[TransformerCacheView] = None,
 		segment_ids: Optional[chex.Array] = None,
-		deterministic: bool = True,
-		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
 		frequencies: Optional[chex.Array] = None,
@@ -349,9 +342,8 @@ class FlaxInternLM2Block(nn.Module):
 			attention_mask,
 			position_ids,
 			causal_mask,
+			cache_view,
 			segment_ids,
-			deterministic,
-			init_cache,
 			output_attentions,
 			fcm_mask,
 			frequencies,
@@ -476,13 +468,11 @@ class FlaxInternLM2BlockCollection(nn.Module):
 				hidden_states=hidden_states,
 				attention_mask=attention_mask,
 				position_ids=position_ids,
-				causal_mask=causal_mask,
-				deterministic=deterministic,
-				init_cache=init_cache,
+				causal_mask=self.causal_mask,
+				cache_view=past_key_values.views[idx],
 				output_attentions=output_attentions,
-				fcm_mask=fcm_mask,
 				segment_ids=segment_ids,
-				frequencies=self._frequencies,
+				frequencies=self.frequencies,
 			)
 			hidden_states = layer_outputs[0]
 
@@ -544,8 +534,7 @@ class FlaxInternLM2Model(nn.Module):
 		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
-		init_cache: bool = False,
-		deterministic: bool = True,
+		past_key_values: Optional[TransformerCache] = None,
 		return_dict: bool = True,
 	) -> Union[FlaxBaseModelOutput, Tuple]:
 		"""
@@ -580,17 +569,26 @@ class FlaxInternLM2Model(nn.Module):
 
 		hidden_states = input_embeds
 
-		outputs = self.layers(
-			hidden_states=input_embeds,
-			attention_mask=attention_mask,
-			position_ids=position_ids,
-			causal_mask=self.causal_mask,
-			deterministic=deterministic,
-			init_cache=init_cache,
-			output_attentions=output_attentions,
-			output_hidden_states=output_hidden_states,
-			segment_ids=segment_ids,
-		)
+		if past_key_values is None:
+			past_key_values = TransformerCache.init_empty(len(self.layers))
+		for idx, block in enumerate(self.layers):
+			if output_hidden_states:
+				all_hidden_states += (hidden_states,)
+
+			layer_outputs = block(
+				hidden_states=hidden_states,
+				attention_mask=attention_mask,
+				position_ids=position_ids,
+				cache_view=past_key_values.views[idx],
+				causal_mask=self.config.get_basic_causal_mask(),
+				output_attentions=output_attentions,
+				segment_ids=segment_ids,
+				frequencies=self.config.get_basic_frequencies(),
+			)
+			hidden_states = layer_outputs[0]
+
+			if output_attentions:
+				all_attentions += (layer_outputs[1],)
 
 		hidden_states = outputs[0]
 		hidden_states = self.norm(hidden_states)
@@ -644,15 +642,14 @@ class FlaxInternLM2ForCausalLM(nn.Module):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
+		input_ids: chex.Array,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
 		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
-		init_cache: bool = False,
-		deterministic: bool = True,
+		past_key_values: Optional[TransformerCache] = None,
 		return_dict: bool = True,
 	) -> Union[FlaxCausalLMOutput, Tuple]:
 		"""
@@ -688,10 +685,9 @@ class FlaxInternLM2ForCausalLM(nn.Module):
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
-			deterministic=deterministic,
-			init_cache=init_cache,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
+			past_key_values=past_key_values,
 			return_dict=return_dict,
 			input_embeds=input_embeds,
 			segment_ids=segment_ids,
@@ -761,15 +757,14 @@ class FlaxInternLM2ForSequenceClassification(nn.Module):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
+		input_ids: chex.Array,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
 		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
-		init_cache: bool = False,
-		deterministic: bool = True,
+		past_key_values: Optional[TransformerCache] = None,
 		return_dict: bool = True,
 	) -> Union[FlaxSequenceClassifierOutput, Tuple]:
 		"""
@@ -805,10 +800,9 @@ class FlaxInternLM2ForSequenceClassification(nn.Module):
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
-			deterministic=deterministic,
-			init_cache=init_cache,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
+			past_key_values=past_key_values,
 			return_dict=return_dict,
 			input_embeds=input_embeds,
 			segment_ids=segment_ids,

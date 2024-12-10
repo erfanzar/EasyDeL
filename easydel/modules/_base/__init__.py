@@ -1,8 +1,8 @@
-from easydel.modules.base_modules.base_module import (
+from easydel.modules._base.base_module import (
 	EasyDeLBaseModule,
 	EasyDeLBaseVisionModule,
 )
-from easydel.modules.base_modules.base_config import (
+from easydel.modules._base.base_config import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseConfigDict,
 )

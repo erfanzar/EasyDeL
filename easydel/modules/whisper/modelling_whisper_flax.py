@@ -37,11 +37,11 @@ from easydel.inference.logits_process import (
 	FlaxWhisperTimeStampLogitsProcessor,
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.modules.base_modules.base_module import EasyDeLBaseModule
+from easydel.modules._base.base_module import EasyDeLBaseModule
 
 # easydel.modules
-from easydel.modules.base_modules.factory import register_module
-from easydel.modules.base_modules.flax_modeling_utils import (
+from easydel.modules._base.factory import register_module
+from easydel.modules._base.flax_modeling_utils import (
 	ACT2FN,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
@@ -153,7 +153,7 @@ class FlaxWhisperAttention(FlaxAttentionModule):
 
 		if self.causal:
 			assert causal_mask is not None, "seems like you forgot to pass causal_mask"
-			query_length, key_length = query_states.shape[1], key_states.shape[1]
+
 			if self.has_variable("cache", "cached_key"):
 				mask_shift = self.variables["cache"]["cache_index"]
 				max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
@@ -188,7 +188,6 @@ class FlaxWhisperAttention(FlaxAttentionModule):
 				attention_mask,
 			)
 
-		query_length, key_length = query_states.shape[1], key_states.shape[1]
 		# Convert the boolean attention mask to an attention bias.
 		if attention_mask is not None:
 			# attention mask in the form of attention bias
@@ -211,11 +210,10 @@ class FlaxWhisperAttention(FlaxAttentionModule):
 			bias=attention_bias,
 			attention_mask=attention_mask,
 			causal=False,
-			dropout_rng=dropout_rng,
-			deterministic=deterministic,
-			query_sequence_length=query_length,
-			key_value_sequence_length=key_length,
-			uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+			dropout_rng=self.rngs.params(),
+			query_sequence_length=query_states.shape[1],
+			key_value_sequence_length=key_states.shape[1],
+			uses_cache=cache_view is not None,
 			segment_ids=None,
 			causal_mask=causal_mask,
 		)
@@ -295,7 +293,7 @@ class FlaxWhisperEncoderLayer(nn.Module):
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,
 		)
-		hidden_states = self.dropout_layer(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout_layer(hidden_states)
 		hidden_states = residual + hidden_states
 
 		residual = hidden_states
@@ -305,7 +303,7 @@ class FlaxWhisperEncoderLayer(nn.Module):
 			hidden_states, deterministic=deterministic
 		)
 		hidden_states = self.fc2(hidden_states)
-		hidden_states = self.dropout_layer(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout_layer(hidden_states)
 		hidden_states = residual + hidden_states
 
 		outputs = (hidden_states,)
@@ -468,7 +466,7 @@ class FlaxWhisperDecoderLayer(nn.Module):
 			causal_mask=causal_mask,
 			init_cache=init_cache,
 		)
-		hidden_states = self.dropout_layer(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout_layer(hidden_states)
 		hidden_states = residual + hidden_states
 
 		# Cross-Attention Block
@@ -483,7 +481,7 @@ class FlaxWhisperDecoderLayer(nn.Module):
 				key_value_states=encoder_hidden_states,
 				attention_mask=encoder_attention_mask,
 			)
-			hidden_states = self.dropout_layer(hidden_states, deterministic=deterministic)
+			hidden_states = self.dropout_layer(hidden_states)
 			hidden_states = residual + hidden_states
 
 		# Fully Connected
@@ -494,7 +492,7 @@ class FlaxWhisperDecoderLayer(nn.Module):
 			hidden_states, deterministic=deterministic
 		)
 		hidden_states = self.fc2(hidden_states)
-		hidden_states = self.dropout_layer(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout_layer(hidden_states)
 		hidden_states = residual + hidden_states
 
 		outputs = (hidden_states,)
@@ -690,7 +688,7 @@ class FlaxWhisperEncoder(nn.Module):
 		embed_positions = jax.lax.stop_gradient(embed_positions)
 		hidden_states = hidden_states + embed_positions
 
-		hidden_states = self.dropout_layer(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout_layer(hidden_states)
 
 		outputs = self.layers(
 			hidden_states,
@@ -788,7 +786,7 @@ class FlaxWhisperDecoder(nn.Module):
 		position_embeds = self.embed_positions(position_ids)
 
 		hidden_states = input_embeds + position_embeds
-		hidden_states = self.dropout_layer(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout_layer(hidden_states)
 
 		outputs = self.layers(
 			hidden_states,

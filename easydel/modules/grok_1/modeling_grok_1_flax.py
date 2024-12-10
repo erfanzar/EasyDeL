@@ -26,12 +26,13 @@ from flax.linen import Dense
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import TransformerCache, TransformerCacheView
 from easydel.layers.norms import RMSNorm as FlaxGrok1RMSNorm
-from easydel.modules.base_modules.base_module import wrap_easydel_module
-from easydel.modules.base_modules.factory import register_module
+from easydel.modules._base.base_module import wrap_easydel_module
+from easydel.modules._base.factory import register_module
 
 # easydel.modules
-from easydel.modules.base_modules.flax_modeling_utils import (
+from easydel.modules._base.flax_modeling_utils import (
 	block_wise_ffn,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
@@ -149,9 +150,8 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
+		cache_view: Optional[TransformerCacheView] = None,
 		segment_ids: Optional[chex.Array] = None,
-		deterministic: bool = True,
-		init_cache: bool = False,
 		output_attentions: bool = False,
 		fcm_mask: Optional[chex.Array] = None,
 		frequencies: Optional[chex.Array] = None,
@@ -206,15 +206,14 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 		)
 
 		(
-			query_states,
 			key_states,
 			value_states,
 			attention_mask,
 			attention_bias,
-		) = self.concatenate_to_cache(
-			init_cache=init_cache,
+		) = self.concatenate(
 			query=query_states,
 			key=key_states,
+			cache_view=cache_view,
 			value=value_states,
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,
@@ -226,8 +225,6 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 		if not deterministic and self.config.attention_dropout > 0.0:
 			dropout_rng = self.make_rng("dropout")
 
-		query_length, key_length = query_states.shape[1], key_states.shape[1]
-
 		attentions = self.attention_performer(
 			query_states=query_states,
 			key_states=key_states,
@@ -235,11 +232,10 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 			bias=attention_bias,
 			attention_mask=attention_mask,
 			causal=True,
-			dropout_rng=dropout_rng,
-			deterministic=deterministic,
-			query_sequence_length=query_length,
-			key_value_sequence_length=key_length,
-			uses_cache=self.has_variable("cache", "cached_key") or init_cache,
+			dropout_rng=self.rngs.params(),
+			query_sequence_length=query_states.shape[1],
+			key_value_sequence_length=key_states.shape[1],
+			uses_cache=cache_view is not None,
 			segment_ids=segment_ids,
 			causal_mask=causal_mask,
 		)
@@ -249,7 +245,7 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 		)
 		attn_output = self.o_proj(attn_output)
 
-		attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
+		attn_output = self.resid_dropout(attn_output)
 		outputs = (
 			(attn_output, attentions.attention_weights)
 			if output_attentions
@@ -538,8 +534,7 @@ class FlaxGrok1DecoderLayer(nn.Module):
 			position_ids,
 			causal_mask,
 			segment_ids,
-			deterministic,
-			init_cache,
+			cache_view,
 			output_attentions,
 			fcm_mask,
 		)
@@ -728,8 +723,7 @@ class FlaxGrok1Model(nn.Module):
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		output_router_logits: Optional[bool] = None,
-		init_cache: bool = False,
-		deterministic: bool = True,
+		past_key_values: Optional[TransformerCache] = None,
 		return_dict: bool = True,
 	) -> MoeModelOutput | Tuple:
 		"""
@@ -875,8 +869,7 @@ class FlaxGrok1ForCausalLM(nn.Module):
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		output_router_logits: Optional[bool] = None,
-		init_cache: bool = False,
-		deterministic: bool = True,
+		past_key_values: Optional[TransformerCache] = None,
 		return_dict: bool = True,
 	) -> MoeCausalLMOutput | Tuple:
 		"""
@@ -908,8 +901,7 @@ class FlaxGrok1ForCausalLM(nn.Module):
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			output_router_logits=output_router_logits,
-			init_cache=init_cache,
-			deterministic=deterministic,
+			past_key_values=past_key_values,
 			return_dict=True,
 			segment_ids=segment_ids,
 		)

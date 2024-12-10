@@ -883,6 +883,28 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			dtype=dtype,
 		)
 
+	def get_fcm_mask(self, batch_size, seq_length, deterministic: bool):
+		if not deterministic and self.fcm_max_ratio > 0:
+			# Apply forgetful causal mask
+
+			fcm_ratio = jax.random.uniform(
+				self.make_rng("fcm"),
+				shape=(batch_size, 1, 1, 1),
+				minval=self.fcm_min_ratio,
+				maxval=self.fcm_max_ratio,
+			)
+			fcm_mask = (
+				jax.random.uniform(
+					self.make_rng("fcm"), shape=(batch_size, 1, seq_length, seq_length)
+				)
+				> fcm_ratio
+			)
+			fcm_mask = fcm_mask.at[:, :, :, 0].set(True)
+			fcm_mask = fcm_mask.astype("bool")
+		else:
+			fcm_mask = None
+		return fcm_mask
+
 	__hash__ = hash_fn
 
 

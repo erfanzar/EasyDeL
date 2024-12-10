@@ -14,8 +14,8 @@
 
 from jax.sharding import PartitionSpec
 
-from easydel.modules.base_modules.base_module import EasyDeLBaseConfig
-from easydel.modules.base_modules.factory import register_config
+from easydel.modules._base.base_module import EasyDeLBaseConfig
+from easydel.modules._base.factory import register_config
 
 
 @register_config("roberta")
