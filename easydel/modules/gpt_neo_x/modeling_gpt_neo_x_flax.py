@@ -19,56 +19,71 @@ from typing import Optional, Union
 import chex
 import flax
 import jax
-from einops import rearrange
-from flax import linen as nn
-from flax.linen import Dense
+from flax import nnx as nn
 from jax import numpy as jnp
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.modules._base.base_module import wrap_easydel_module
+from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.modules._base.base_module import EasyDeLBaseModule
 from easydel.modules._base.factory import register_module
 from easydel.modules._base.flax_modeling_utils import (
 	ACT2FN,
 	control_mlp_sharding,
-	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
 )
 from easydel.modules.gpt_neo_x.gpt_neo_x_configuration import (
 	GPTNeoXConfig as GPTNeoXConfig,
 )
-from easydel.modules.modeling_flax_outputs import FlaxBaseModelOutput
+from easydel.modules.modeling_flax_outputs import (
+	FlaxBaseModelOutput,
+	FlaxCausalLMOutput,
+)
 
 
-class FlaxGPTNeoXAttention(FlaxAttentionModule):
-	config: GPTNeoXConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
-		self.head_size = self.config.hidden_size // self.config.num_attention_heads
+class GPTNeoXAttention(FlaxAttentionModule):
+	def __init__(
+		self,
+		config: GPTNeoXConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	) -> None:
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
+		self.head_dim = self.config.hidden_size // self.config.num_attention_heads
 		self.rotary = self.config.get_basic_rope(
-			dtype=self.dtype,
-			head_size=self.head_size,
-			rotary_dim=self.head_size,
-			base=10000,
+			dtype=dtype,
+			head_size=self.head_dim,
+			rotary_dim=int(self.head_dim * self.config.rotary_pct),
+			base=self.config.rotary_emb_base,
 		)
-		dense_class = functools.partial(
-			Dense,
-			dtype=self.dtype,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-			param_dtype=self.dtype,
-			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+		self.query_key_value = nn.Linear(
+			config.hidden_size,
+			3 * config.hidden_size,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
-		self.w_qkv = dense_class(3 * self.config.hidden_size)
-		self.w_o = dense_class(self.config.hidden_size)
+		self.dense = nn.Linear(
+			config.hidden_size,
+			config.hidden_size,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
 		self.attention_performer = FlexibleAttentionModule(
 			use_sharding_constraint=self.config.use_sharding_constraint,
 			num_q_heads=self.config.num_attention_heads,
 			num_kv_heads=self.config.num_attention_heads,
-			attention_dropout=self.config.attn_pdrop,
+			attention_dropout=self.config.attention_dropout,
 			head_dims=self.head_dim,
 			shard_attention_computation=self.config.shard_attention_computation,
 			precision=self.precision,
@@ -78,31 +93,35 @@ class FlaxGPTNeoXAttention(FlaxAttentionModule):
 			partition_axis=self.config.partition_axis,
 			scan_ring_attention=self.config.scan_ring_attention,
 			mesh=self.config.mesh,
-			sm_scale=1 / math.sqrt(self.head_dim),
+			sm_scale=self.head_dim**-0.5,
 			base_config=self.config,
+		)
+
+	def _split_heads(self, hidden_states):
+		return hidden_states.reshape(
+			hidden_states.shape[:2] + (self.config.num_attention_heads, self.head_dim)
 		)
 
 	def __call__(
 		self,
-		hidden_states,
-		attention_mask,
-		position_ids,
+		hidden_states: chex.Array,
+		attention_mask: chex.Array,
+		position_ids: chex.Array,
+		causal_mask: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		deterministic: bool = True,
-		init_cache: bool = False,
+		cache_view: Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
 		frequencies: Optional[chex.Array] = None,
 	):
-		b, s, d = hidden_states.shape
 		query, key, value = jnp.split(
-			self.w_qkv(hidden_states),
+			self.query_key_value(hidden_states),
 			indices_or_sections=3,
 			axis=-1,
 		)
-		query = rearrange(query, "b s (h d) -> b s h d", h=self.config.num_attention_heads)
-		key = rearrange(key, "b s (h d) -> b s h d", h=self.config.num_attention_heads)
-		value = rearrange(value, "b s (h d) -> b s h d", h=self.config.num_attention_heads)
 
+		query = self._split_heads(query)
+		key = self._split_heads(key)
+		value = self._split_heads(value)
 		query, key = self.rotary(
 			positions=position_ids,
 			query=query,
@@ -132,16 +151,16 @@ class FlaxGPTNeoXAttention(FlaxAttentionModule):
 			attention_mask=attention_mask,
 			causal=True,
 			dropout_rng=self.rngs.params(),
-			query_sequence_length=query_states.shape[1],
-			key_value_sequence_length=key_states.shape[1],
+			query_sequence_length=query.shape[1],
+			key_value_sequence_length=key.shape[1],
 			uses_cache=cache_view is not None,
 			segment_ids=segment_ids,
-			causal_mask=self.causal_mask,
+			causal_mask=causal_mask,
 		)
 		attn_output = self.shard_attention_prod(
 			self._merge_heads(attentions.attention_outputs)
 		)
-		attn_output = self.w_o(attn_output.reshape(b, s, d))
+		attn_output = self.dense(attn_output)
 		outputs = (
 			(attn_output, attentions.attention_weights)
 			if output_attentions
@@ -150,49 +169,65 @@ class FlaxGPTNeoXAttention(FlaxAttentionModule):
 		return outputs
 
 
-class FlaxGPTNeoXMlp(nn.Module):
-	config: GPTNeoXConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
-		dense_class = functools.partial(
-			Dense,
-			dtype=self.dtype,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-			param_dtype=self.dtype,
-			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+class GPTNeoXMlp(nn.Module):
+	def __init__(
+		self,
+		config: GPTNeoXConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	) -> None:
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.dense_h_to_4h = nn.Linear(
+			self.config.hidden_size,
+			self.config.intermediate_size,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
-		self.dense_h_to_4h = dense_class(self.config.intermediate_size)
-		self.dense_4h_to_h = dense_class(self.config.hidden_size)
+		self.dense_4h_to_h = nn.Linear(
+			self.config.intermediate_size,
+			self.config.hidden_size,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
 		self.act = ACT2FN[self.config.hidden_act]
 
-	def __call__(self, x):
-		x = control_mlp_sharding(x, self.config.partition_axis)
-		return self.dense_4h_to_h(self.act(self.dense_h_to_4h(x)))
-
-
-class FlaxGPTNeoXBlock(nn.Module):
-	config: GPTNeoXConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
-		self.use_parallel_residual = self.config.use_parallel_residual
-		self.input_layernorm = nn.LayerNorm(
-			epsilon=self.config.layer_norm_eps,
-			dtype=self.dtype,
+	def __call__(self, hidden_states):
+		hidden_states = control_mlp_sharding(
+			hidden_states,
+			self.config.partition_axis,
 		)
-		self.post_attention_layernorm = nn.LayerNorm(
-			epsilon=self.config.layer_norm_eps,
-			dtype=self.dtype,
-		)
+		return self.dense_4h_to_h(self.act(self.dense_h_to_4h(hidden_states)))
 
-		attn_block = FlaxGPTNeoXAttention
-		mlp_block = FlaxGPTNeoXMlp
+
+class GPTNeoXBlock(nn.Module):
+	def __init__(
+		self,
+		config: GPTNeoXConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	) -> None:
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
+		self.use_parallel_residual = config.use_parallel_residual
+
+		attn_block = GPTNeoXAttention
+		mlp_block = GPTNeoXMlp
 
 		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			attn_block = flax.linen.partitioning.remat(
@@ -206,27 +241,43 @@ class FlaxGPTNeoXBlock(nn.Module):
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 				static_argnums=(1,),
 			)
-		self.attention = attn_block(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+		self.input_layernorm = nn.LayerNorm(
+			config.hidden_size,
+			epsilon=config.layer_norm_eps,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			rngs=rngs,
 		)
-		self.mlp = mlp_block(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+		self.post_attention_layernorm = nn.LayerNorm(
+			config.hidden_size,
+			epsilon=config.layer_norm_eps,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			rngs=rngs,
+		)
+		self.attention = GPTNeoXAttention(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+		self.mlp = GPTNeoXMlp(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
 
 	def __call__(
 		self,
-		hidden_states,
-		attention_mask,
-		position_ids,
+		hidden_states: chex.Array,
+		attention_mask: chex.Array,
+		position_ids: chex.Array,
+		causal_mask: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		deterministic: bool = True,
-		init_cache: bool = False,
+		cache_view: Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
 		frequencies: Optional[chex.Array] = None,
 	):
@@ -234,9 +285,9 @@ class FlaxGPTNeoXBlock(nn.Module):
 			self.input_layernorm(hidden_states),
 			attention_mask,
 			position_ids,
+			causal_mask,
 			segment_ids,
-			deterministic,
-			init_cache,
+			cache_view,
 			output_attentions,
 			frequencies,
 		)
@@ -252,105 +303,139 @@ class FlaxGPTNeoXBlock(nn.Module):
 		return (hidden_states,) + attn_out[1:]
 
 
-class FlaxGPTNeoXCollection(nn.Module):
-	config: GPTNeoXConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
-		self.blocks = [
-			FlaxGPTNeoXBlock(
-				config=self.config,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
-				name=str(i),
-			)
-			for i in range(self.config.num_hidden_layers)
-		]
-		self._frequencies = self.config.get_basic_frequencies(
-			head_size=self.head_size,
-			rotary_dim=self.head_size,
-			base=10000,
-		)
-
-	def __call__(
-		self,
-		hidden_states,
-		attention_mask,
-		position_ids,
-		segment_ids: Optional[chex.Array] = None,
-		deterministic: bool = True,
-		init_cache: bool = False,
-		output_attentions: bool = False,
-	):
-		for idx, block in enumerate(self.blocks):
-			hidden_out = block(
-				hidden_states=hidden_states,
-				attention_mask=attention_mask,
-				position_ids=position_ids,
-				segment_ids=segment_ids,
-				deterministic=deterministic,
-				init_cache=init_cache,
-				output_attentions=False,  # TODO Fix this one
-				frequencies=self._frequencies,
-			)
-			hidden_states = hidden_out[0]
-		return hidden_states
-
-
 @register_module(
 	"base-module",
 	config=GPTNeoXConfig,
 	model_type="gpt_neox",
 	embedding_layer_names=["wte"],
 )
-@wrap_easydel_module(config_class=GPTNeoXConfig, base_model_prefix="transformer")
-class FlaxGPTNeoXModel(nn.Module):
-	config: GPTNeoXConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
-		self.embed_in = nn.Embed(self.config.vocab_size, self.config.hidden_size)
-		self.layers = FlaxGPTNeoXCollection(
-			config=self.config,
-			param_dtype=self.param_dtype,
-			dtype=self.dtype,
-			precision=self.precision,
+class GPTNeoXModel(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: GPTNeoXConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
+		self.embed_in = nn.Embed(
+			self.config.vocab_size,
+			self.config.hidden_size,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			rngs=rngs,
+		)
+		self.emb_dropout = nn.Dropout(config.hidden_dropout, rngs=rngs)
+		self.layers = [
+			GPTNeoXBlock(
+				config=config,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
+				rngs=rngs,
+			)
+			for i in range(config.num_hidden_layers)
+		]
 		self.final_layer_norm = nn.LayerNorm(
-			epsilon=self.config.layer_norm_eps, dtype=self.dtype
+			config.hidden_size,
+			epsilon=self.config.layer_norm_eps,
+			dtype=self.dtype,
+			param_dtype=param_dtype,
+			rngs=rngs,
+		)
+
+	@functools.cached_property
+	def frequencies(self):
+		head_dim = self.config.hidden_size // self.config.num_attention_heads
+		return self.config.get_basic_frequencies(
+			head_size=head_dim,
+			rotary_dim=int(head_dim * self.config.rotary_pct),
+			base=self.config.rotary_emb_base,
 		)
 
 	def __call__(
 		self,
-		input_ids,
-		attention_mask,
-		position_ids,
-		deterministic=True,
-		init_cache: bool = False,
+		input_ids: Optional[chex.Array] = None,
+		attention_mask: Optional[chex.Array] = None,
+		position_ids: Optional[chex.Array] = None,
+		past_key_values: Optional[TransformerCache] = None,
+		input_embeds: Optional[chex.Array] = None,
+		segment_ids: Optional[chex.Array] = None,
+		extra_embedding: Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
 	):
-		hidden_state = self.embed_in(inputs=input_ids)
-		hidden_state = self.final_layer_norm(
-			self.layers(
-				hidden_state=hidden_state,
+		all_attentions = () if output_attentions else None
+		all_hidden_states = () if output_hidden_states else None
+		if input_ids is not None and input_embeds is not None:
+			raise ValueError(
+				"You cannot specify both decoder_input_ids and decoder_input_embeds at the same time"
+			)
+		if input_embeds is None and input_ids is not None:
+			input_embeds = self.embed_in(input_ids.astype("i4"))
+		else:
+			raise ValueError("you should specify input_embeds or input_ids one of them")
+		batch_size, sequence_length, _ = input_embeds.shape
+		if attention_mask is None:
+			attention_mask = jnp.ones_like(input_ids)
+		if position_ids is None:
+			position_ids = jnp.broadcast_to(
+				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+				(batch_size, sequence_length),
+			).astype(jnp.int32)
+
+		assert (
+			sequence_length <= self.config.max_position_embeddings
+		), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+
+		hidden_states = self.emb_dropout(
+			input_embeds + extra_embedding if extra_embedding is not None else input_embeds
+		)
+
+		if past_key_values is None:
+			past_key_values = TransformerCache.init_empty(len(self.layers))
+
+		for idx, block in enumerate(self.layers):
+			if output_hidden_states:
+				all_hidden_states += (hidden_states,)
+			hidden_states, attn_weight = block(
+				hidden_states=hidden_states,
 				attention_mask=attention_mask,
 				position_ids=position_ids,
-				deterministic=deterministic,
-				init_cache=init_cache,
+				cache_view=past_key_values.views[idx],
+				segment_ids=segment_ids,
+				causal_mask=self.causal_mask,
+				frequencies=self.frequencies,
 				output_attentions=output_attentions,
 			)
+			if output_attentions:
+				all_attentions += (attn_weight,)
+		hidden_states = self.final_layer_norm(hidden_states)
+		if output_hidden_states:
+			all_hidden_states += (hidden_states,)
+
+		outputs = (
+			hidden_states,
+			all_hidden_states,
+			all_attentions,
 		)
 		if return_dict:
-			return FlaxBaseModelOutput(last_hidden_state=hidden_state)
-		else:
-			return (hidden_state,)
+			return FlaxBaseModelOutput(
+				last_hidden_state=hidden_states,
+				hidden_states=outputs[1],
+				attentions=outputs[2],
+			)
+
+		return tuple([v for v in outputs if v is not None])
 
 
 @register_module(
@@ -359,24 +444,79 @@ class FlaxGPTNeoXModel(nn.Module):
 	model_type="gpt_neox",
 	embedding_layer_names=["wte"],
 )
-@wrap_easydel_module(config_class=GPTNeoXConfig, base_model_prefix="transformer")
-class FlaxGPTNeoXForCausalLM(nn.Module):
-	config: GPTNeoXConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
-		self.transformer = FlaxGPTNeoXModel.flax_module(
+class GPTNeoXForCausalLM(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: GPTNeoXConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+		self.gpt_neox = GPTNeoXModel(
 			config=self.config,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			precision=self.precision,
+			rngs=rngs,
 		)
-		self.lm_head = Dense(self.config.vocab_size, use_bias=False)
+		self.lm_head = nn.Linear(
+			config.hidden_size,
+			config.vocab_size,
+			use_bias=False,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			rngs=rngs,
+		)
 
-	def __call__(self, input_ids, attention_mask, return_dict: bool = False):
-		pred = self.transformer(
-			input_ids=input_ids, attention_mask=attention_mask, return_dict=True
-		).last_hidden_state
-		return self.lm_head(pred)
+	def __call__(
+		self,
+		input_ids,
+		attention_mask: Optional[chex.Array] = None,
+		position_ids: Optional[chex.Array] = None,
+		past_key_values: Optional[TransformerCache] = None,
+		input_embeds: Optional[chex.Array] = None,
+		segment_ids: Optional[chex.Array] = None,
+		extra_embedding: Optional[chex.Array] = None,
+		output_attentions: bool = False,
+		output_hidden_states: bool = False,
+		return_dict: bool = True,
+	):
+		outputs = self.gpt_neox(
+			input_ids=input_ids,
+			attention_mask=attention_mask,
+			position_ids=position_ids,
+			past_key_values=past_key_values,
+			input_embeds=input_embeds,
+			segment_ids=segment_ids,
+			extra_embedding=extra_embedding,
+			output_attentions=output_attentions,
+			output_hidden_states=output_hidden_states,
+			return_dict=return_dict,
+		)
+		hidden_states = outputs[0]
+
+		if self.config.tie_word_embeddings:
+			self.lm_head.kernel.value = self.gpt_neox.embed_in.embedding.value.T
+			lm_logits = self.lm_head(hidden_states)
+		else:
+			lm_logits = self.lm_head(hidden_states)
+
+		lm_logits = lm_logits.astype(jnp.float32)
+
+		if not return_dict:
+			return (lm_logits,) + outputs[1:]
+
+		return FlaxCausalLMOutput(
+			logits=lm_logits,
+			hidden_states=outputs.hidden_states,
+			attentions=outputs.attentions,
+		)

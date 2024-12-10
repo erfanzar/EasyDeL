@@ -86,9 +86,9 @@ from easydel.modules.gpt_j import (
 	GPTJModel,
 )
 from easydel.modules.gpt_neo_x import (
-	FlaxGPTNeoXForCausalLM,
-	FlaxGPTNeoXModel,
 	GPTNeoXConfig,
+	GPTNeoXForCausalLM,
+	GPTNeoXModel,
 )
 from easydel.modules.grok_1 import (
 	FlaxGrok1ForCausalLM,

@@ -1703,29 +1703,6 @@ class FlaxAttentionModule(nn.Module):
 			args,
 		)
 
-	@property
-	def cache_initialized(self):
-		return not (
-			self.cache_index is None and self.cached_key is None and self.cached_value is None
-		)
-
-	# def _concatenate_to_cache(self, query, key, value, attention_mask):
-	# 	"""The _concatenate_to_cache function is used to concatenate the key and value vectors
-	# 	of a query  with those of previous queries. This allows for the attention mechanism to
-	# 	look at all previous queries when computing its output. The function takes in three
-	# 	arguments: key, value, and query . It also uses two variables that are stored in the cache:
-	# 	cached_key and cached_value.
-
-	# 	Args:
-	# 	    self: Access the variables stored in the cache
-	# 	    key: Store the keys of the encoder-decoder attention
-	# 	    value: Initialize the cached_value variable
-	# 	    query : Determine the number of cache vectors to update
-	# 	    attention_mask: Mask out the padded vectors in the cache
-
-	# 	Returns:
-	# 	    The key, value and attention_mask
-	# 	"""
 
 	def _concatenate_to_cache(
 		self,
