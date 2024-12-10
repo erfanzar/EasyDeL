@@ -438,9 +438,10 @@ class GPTJModel(EasyDeLBaseModule):
 			input_embeds + extra_embedding if extra_embedding is not None else input_embeds
 		)
 
-		hidden_states = self.dropout(input_embeds)
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.h))
+			
+		hidden_states = self.dropout(input_embeds)
 		for idx, block in enumerate(self.h):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)

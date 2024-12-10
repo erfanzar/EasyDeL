@@ -387,6 +387,24 @@ class EasyModelsTest(unittest.TestCase):
 		self.header_config = None
 		self.assertTrue(res, f"GPT-J model Failed [ERROR {err}]")
 
+	def test_gpt_noex(self):
+		self.header_config = ed.GPTNeoXConfig(
+			vocab_size=self.vocab_size,
+			max_position_embeddings=self.max_position_embeddings,
+			hidden_size=self.hidden_size,
+			num_hidden_layers=self.num_hidden_layers,
+			num_attention_heads=self.num_attention_heads,
+			rotary_pct=1,
+			rope_scaling=None,
+		)
+		res, err = self.create_test_for_models(
+			"gpt_neox",
+			transformers.GPTNeoXForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
+		self.header_config = None
+		self.assertTrue(res, f"GPT-NoeX model Failed [ERROR {err}]")
+
 	def test_qwen2(self):
 		self.header_config = None
 		res, err = self.create_test_for_models("qwen2", transformers.Qwen2ForCausalLM)
@@ -696,8 +714,9 @@ if __name__ == "__main__":
 	# test.test_falcon()  # Passed
 	# test.test_gemma()  # Passed
 	# test.test_gemma2()  # Passed
-	test.test_gptj()
-	# test.test_gpt2()
+	# test.test_gptj()  # Passed
+	# test.test_gpt_noex()  # Failed
+	test.test_gpt2()
 	# test.test_grok1() # should be impl
 	# test.test_internlm2()
 	# test.test_llama() # Pass

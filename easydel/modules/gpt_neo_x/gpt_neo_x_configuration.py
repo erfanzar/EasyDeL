@@ -14,6 +14,7 @@
 
 from jax.sharding import PartitionSpec
 
+from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.modules._base.base_module import EasyDeLBaseConfig
 from easydel.modules._base.factory import register_config
 
@@ -79,6 +80,8 @@ class GPTNeoXConfig(EasyDeLBaseConfig):
 		hidden_act="gelu",
 		rotary_pct=0.25,
 		rotary_emb_base=10000,
+		attention_dropout=0.0,
+		hidden_dropout=0.0,
 		classifier_dropout=0.1,
 		max_position_embeddings=2048,
 		initializer_range=0.02,
@@ -87,8 +90,10 @@ class GPTNeoXConfig(EasyDeLBaseConfig):
 		bos_token_id=0,
 		eos_token_id=2,
 		tie_word_embeddings=False,
-		gradient_checkpointing="everything_saveable",
 		use_parallel_residual=True,
+		rope_scaling=None,
+		attention_bias=True,
+		gradient_checkpointing=EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	):
 		self.vocab_size = vocab_size
@@ -100,14 +105,18 @@ class GPTNeoXConfig(EasyDeLBaseConfig):
 		self.hidden_act = hidden_act
 		self.rotary_pct = rotary_pct
 		self.rotary_emb_base = rotary_emb_base
+		self.rope_theta = rotary_emb_base
 		self.classifier_dropout = classifier_dropout
 		self.initializer_range = initializer_range
 		self.layer_norm_eps = layer_norm_eps
 		self.use_cache = use_cache
 		self.tie_word_embeddings = tie_word_embeddings
+		self.hidden_dropout = hidden_dropout
 		self.gradient_checkpointing = gradient_checkpointing
-
+		self.attention_dropout = attention_dropout
 		self.use_parallel_residual = use_parallel_residual
+		self.rope_scaling = rope_scaling
+		self.attention_bias = attention_bias
 		self.from_pt = False
 		super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 
