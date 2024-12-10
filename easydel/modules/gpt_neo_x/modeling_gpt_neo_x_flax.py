@@ -109,24 +109,19 @@ class FlaxGPTNeoXAttention(FlaxAttentionModule):
 			key=key,
 			frequencies=frequencies,
 		)
-		query_length, key_length = query.shape[1], key.shape[1]
 
-		dropout_rng = None
-		if not deterministic and self.config.attn_pdrop > 0.0:
-			dropout_rng = self.make_rng("dropout")
 		(
-			query,
 			key,
 			value,
 			attention_mask,
 			attention_bias,
-		) = self.concatenate_to_cache(
-			init_cache=init_cache,
+		) = self.concatenate(
 			query=query,
 			key=key,
+			cache_view=cache_view,
 			value=value,
 			attention_mask=attention_mask,
-			causal_mask=self.causal_mask,
+			causal_mask=causal_mask,
 			fcm_mask=None,
 		)
 		attentions = self.attention_performer(

@@ -195,7 +195,6 @@ class FlaxGPT2Attention(FlaxAttentionModule):
 		query = self._split_heads(query)
 		key = self._split_heads(key)
 		value = self._split_heads(value)
-		query_length, key_length = query.shape[1], key.shape[1]
 
 		if self.causal:
 			if self.has_variable("cache", "cached_key"):
@@ -220,10 +219,6 @@ class FlaxGPT2Attention(FlaxAttentionModule):
 			attention_mask = causal_mask
 		elif attention_mask is not None:
 			attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-
-		dropout_rng = None
-		if not deterministic and self.config.attn_pdrop > 0.0:
-			dropout_rng = self.make_rng("dropout")
 
 		if self.causal and (self.has_variable("cache", "cached_key") or init_cache):
 			key, value, attention_mask = self._concatenate_to_cache(
