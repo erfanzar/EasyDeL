@@ -420,7 +420,7 @@ class FlaxMptDecoratorCollection(nn.Module):
 			fcm_mask = fcm_mask.astype("bool")
 		else:
 			fcm_mask = None
-		for block in self.blocks:
+		for idx, block in enumerate(self.blocks):
 			output = block(
 				hidden_states=hidden_states,
 				deterministic=deterministic,

@@ -922,7 +922,7 @@ class FlaxMamba2LayerCollection(nn.Module):
 		output_hidden_states: bool = False,
 	) -> Tuple[chex.Array, Union[None, Tuple[chex.Array, ...]]]:
 		all_hidden_states = () if output_hidden_states else None
-		for block in self.blocks:
+		for idx, block in enumerate(self.blocks):
 			hidden_states = block(
 				hidden_states=hidden_states,
 				cache_params=cache_params,

@@ -290,7 +290,7 @@ class FlaxGPTNeoXCollection(nn.Module):
 		init_cache: bool = False,
 		output_attentions: bool = False,
 	):
-		for block in self.blocks:
+		for idx, block in enumerate(self.blocks):
 			hidden_out = block(
 				hidden_states=hidden_states,
 				attention_mask=attention_mask,

@@ -537,7 +537,11 @@ class EasyModelsTest(unittest.TestCase):
 		self.header_config = ed.Gemma2Config(
 			32000, 128, 256, 4, 8, 4, 128 // 8, use_scan_mlp=False
 		)
-		res, err = self.create_test_for_models("gemma2", transformers.Gemma2ForCausalLM)
+		res, err = self.create_test_for_models(
+			"gemma2",
+			transformers.Gemma2ForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"Gemma2 model Failed [ERROR {err}]")
 
 	def test_mamba(self):
@@ -686,8 +690,8 @@ if __name__ == "__main__":
 	# test.test_deepseek_v2() # Passed
 	# test.test_exaone()  # Passed
 	# test.test_falcon()  # Passed
-	test.test_gemma()
-	# test.test_gemma2()
+	# test.test_gemma()  # Passed
+	# test.test_gemma2()  # Passed
 	# test.test_gptj()
 	# test.test_gpt2()
 	# test.test_grok1() # should be impl
