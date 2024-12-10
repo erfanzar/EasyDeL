@@ -173,7 +173,7 @@ class ParallelCollection(nn.Module):
 
 	def __call__(self, hidden_state, frequencies, causal_mask, output_attention=False):
 		saves = []
-		for block in self.blocks:
+		for idx, block in enumerate(self.blocks):
 			hidden_state = (
 				block(
 					hidden_state=hidden_state,

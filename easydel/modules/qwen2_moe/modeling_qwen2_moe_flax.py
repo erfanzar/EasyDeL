@@ -651,7 +651,7 @@ class FlaxQwen2MoeBlockCollection(nn.Module):
 		else:
 			fcm_mask = None
 
-		for block in self.blocks:
+		for idx, block in enumerate(self.blocks):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
 

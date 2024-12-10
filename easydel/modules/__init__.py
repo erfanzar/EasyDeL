@@ -71,9 +71,9 @@ from easydel.modules.gemma import (
 	GemmaModel,
 )
 from easydel.modules.gemma2 import (
-	FlaxGemma2ForCausalLM,
-	FlaxGemma2Model,
 	Gemma2Config,
+	Gemma2ForCausalLM,
+	Gemma2Model,
 )
 from easydel.modules.gpt2 import (
 	FlaxGPT2LMHeadModel,

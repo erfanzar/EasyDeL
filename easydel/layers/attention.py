@@ -1797,9 +1797,10 @@ class FlaxAttentionModule(nn.Module):
 		key: Array,
 		value: Array,
 		attention_mask: Array,
-		cache_view: Optional[TransformerCacheView],
-		causal_mask: Optional[Array],
-		fcm_mask: Optional[Array],
+		cache_view: Optional[TransformerCacheView] = None,
+		causal_mask: Optional[Array] = None,
+		fcm_mask: Optional[Array] = None,
+		sliding_windows: Optional[int] = None,
 	) -> Tuple[Array, Array, Array, Array]:
 		if cache_view is None:
 			query_length = query.shape[1]
@@ -1824,7 +1825,16 @@ class FlaxAttentionModule(nn.Module):
 				attention_mask=attention_mask,
 				causal_mask=causal_mask,
 			)
-
+		if sliding_windows is not None:
+			sliding_window_mask = jnp.tril(
+				jnp.ones_like(attention_mask, dtype=jnp.bool),
+				k=-sliding_windows,
+			)
+			window_mask = jnp.where(sliding_window_mask, 0, 1)
+			attention_mask = jnp.logical_and(window_mask, attention_mask)
+			if attention_mask.shape[-1] <= 1:
+				attention_mask = attention_mask[:, :, :, -sliding_windows:]
+				
 		attention_bias = lax.select(
 			attention_mask > 0,
 			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),

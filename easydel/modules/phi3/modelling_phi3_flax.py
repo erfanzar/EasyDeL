@@ -627,10 +627,8 @@ class FlaxPhi3Model(nn.Module):
 		hidden_states = self.norm(hidden_states)
 
 		if output_hidden_states:
-			all_hidden_states = outputs[1] + (hidden_states,)
-			outputs = (hidden_states, all_hidden_states) + outputs[2:]
-		else:
-			outputs = (hidden_states,) + outputs[1:]
+			all_hidden_states += (hidden_states,)
+		outputs = (hidden_states, all_hidden_states, all_attentions)
 
 		if return_dict:
 			return FlaxBaseModelOutput(

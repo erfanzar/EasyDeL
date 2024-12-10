@@ -458,7 +458,7 @@ class FlaxGPT2BlockCollection(nn.Module):
 			() if (output_attentions and encoder_hidden_states is not None) else None
 		)
 
-		for block in self.blocks:
+		for idx, block in enumerate(self.blocks):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
 
@@ -578,10 +578,8 @@ class FlaxGPT2Model(nn.Module):
 		hidden_states = self.ln_f(hidden_states)
 
 		if output_hidden_states:
-			all_hidden_states = outputs[1] + (hidden_states,)
-			outputs = (hidden_states, all_hidden_states) + outputs[2:]
-		else:
-			outputs = (hidden_states,) + outputs[1:]
+			all_hidden_states += (hidden_states,)
+		outputs = (hidden_states, all_hidden_states, all_attentions)
 
 		if not return_dict:
 			return tuple(v for v in outputs if v is not None)
