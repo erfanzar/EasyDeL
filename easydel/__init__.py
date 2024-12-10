@@ -151,9 +151,9 @@ from easydel.modules.gemma2 import (
 	Gemma2Model,
 )
 from easydel.modules.gpt2 import (
-	FlaxGPT2LMHeadModel,
-	FlaxGPT2Model,
 	GPT2Config,
+	GPT2LMHeadModel,
+	GPT2Model,
 )
 from easydel.modules.gpt_j import (
 	GPTJConfig,

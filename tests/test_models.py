@@ -367,7 +367,11 @@ class EasyModelsTest(unittest.TestCase):
 
 	def test_gpt2(self):
 		self.header_config = None
-		res, err = self.create_test_for_models("gpt2", transformers.GPT2LMHeadModel)
+		res, err = self.create_test_for_models(
+			"gpt2",
+			transformers.GPT2LMHeadModel,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"GPT2 model Failed [ERROR {err}]")
 
 	def test_gptj(self):
