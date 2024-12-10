@@ -265,10 +265,6 @@ class FlaxQwen2MoeAttention(FlaxAttentionModule):
 			positions=position_ids,
 			frequencies=frequencies,
 		)
-		dropout_rng = None
-
-		if not deterministic and self.config.attention_dropout > 0.0:
-			dropout_rng = self.make_rng("dropout")
 
 		(
 			key_states,

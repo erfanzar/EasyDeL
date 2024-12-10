@@ -141,9 +141,9 @@ from easydel.modules.falcon import (
 	FalconModel,
 )
 from easydel.modules.gemma import (
-	FlaxGemmaForCausalLM,
-	FlaxGemmaModel,
 	GemmaConfig,
+	GemmaForCausalLM,
+	GemmaModel,
 )
 from easydel.modules.gemma2 import (
 	FlaxGemma2ForCausalLM,

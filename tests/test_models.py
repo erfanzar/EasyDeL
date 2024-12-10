@@ -430,7 +430,11 @@ class EasyModelsTest(unittest.TestCase):
 		self.header_config = None
 		org = self.tie_word_embeddings
 		self.tie_word_embeddings = True
-		res, err = self.create_test_for_models("gemma", transformers.GemmaForCausalLM)
+		res, err = self.create_test_for_models(
+			"gemma",
+			transformers.GemmaForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.tie_word_embeddings = org
 		self.assertTrue(res, f"Gemma model Failed [ERROR {err}]")
 
@@ -682,7 +686,7 @@ if __name__ == "__main__":
 	# test.test_deepseek_v2() # Passed
 	# test.test_exaone()  # Passed
 	# test.test_falcon()  # Passed
-	# test.test_gemma()
+	test.test_gemma()
 	# test.test_gemma2()
 	# test.test_gptj()
 	# test.test_gpt2()

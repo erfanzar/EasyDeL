@@ -345,11 +345,6 @@ class FlaxStableLmAttention(FlaxAttentionModule):
 			frequencies=frequencies,
 		)
 
-		dropout_rng = None
-
-		if not deterministic and self.config.attention_dropout > 0.0:
-			dropout_rng = self.make_rng("dropout")
-
 		(
 			key_states,
 			value_states,
