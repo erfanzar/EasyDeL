@@ -28,19 +28,18 @@
 # limitations under the License.
 
 import math
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
-import flax.linen
-import flax.linen.partitioning
+import chex
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
-from flax.linen import Dense, combine_masks, make_causal_mask
+from flax import nnx as nn
 from jax import lax
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.modules._base.base_module import wrap_easydel_module
+from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.modules._base.base_module import EasyDeLBaseModule
 from easydel.modules._base.factory import register_module
 from easydel.modules._base.flax_modeling_utils import (
 	ACT2FN,
@@ -55,24 +54,42 @@ from easydel.modules.modeling_flax_outputs import (
 )
 
 
-class FlaxConv1D(nn.Module):
-	features: int
-	use_bias: bool = True
-	dtype: Any = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
-	dot_general: Optional[None] = None
-
-	@nn.compact
-	def __call__(self, inputs):
-		inputs = jnp.asarray(inputs, self.dtype)
-		kernel = self.param(
-			"kernel",
-			jax.nn.initializers.normal(stddev=0.02),
-			(self.features, inputs.shape[-1]),
+class Conv1D(nn.Module):
+	def __init__(
+		self,
+		in_features: int,
+		out_features: int,
+		use_bias: bool = True,
+		dtype: Any = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		dot_general: Optional[None] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		self.kernel = nn.Param(
+			nn.initializers.normal(stddev=0.02)(rngs.params(), (out_features, in_features)),
 		)
 
-		kernel = kernel.astype(self.dtype).transpose()
+		self.bias = nn.Param(
+			nn.initializers.zeros(
+				rngs.params(),
+				(in_features,),
+			)
+			if use_bias
+			else None
+		)
+
+		self.use_bias = use_bias
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.dot_general = dot_general
+
+	def __call__(self, inputs):
+		inputs = jnp.asarray(inputs, self.dtype)
+		bias = self.bias.value
+		kernel = self.kernel.value.transpose().astype(self.dtype)
 		if self.dot_general is not None:
 			dot_general = self.dot_general
 		else:
@@ -84,57 +101,69 @@ class FlaxConv1D(nn.Module):
 			(((inputs.ndim - 1,), (0,)), ((), ())),
 			precision=self.precision,
 		)
-		if self.use_bias:
-			bias = self.param("bias", jax.nn.initializers.zeros, (self.features,))
-			bias = jnp.asarray(bias, self.dtype)
-			y = y + bias
+		if bias is not None:
+			y = y + bias.astype(self.dtype)
 		return y
 
 
-class FlaxGPT2Attention(FlaxAttentionModule):
-	config: GPT2Config
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
-	causal: bool = True
-	is_cross_attention: bool = False
-
-	def setup(self):
-		config = self.config
+class GPT2Attention(FlaxAttentionModule):
+	def __init__(
+		self,
+		config: GPT2Config,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		causal: bool = True,
+		is_cross_attention: bool = False,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(config=config)
+		self.precision = precision
+		self.dtype = dtype
+		self.rngs = rngs
+		self.is_cross_attention = is_cross_attention
+		self.causal = causal
 		self.embed_dim = config.hidden_size
 		self.num_heads = config.num_attention_heads
 		self.head_dim = self.embed_dim // self.num_heads
 
 		if self.is_cross_attention:
-			self.c_attn = FlaxConv1D(
-				2 * self.embed_dim,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
-				**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
-			)
-			self.q_attn = FlaxConv1D(
+			self.c_attn = Conv1D(
 				self.embed_dim,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
-				**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+				2 * self.embed_dim,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
+				rngs=rngs,
+			)
+			self.q_attn = Conv1D(
+				self.embed_dim,
+				self.embed_dim,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
+				rngs=rngs,
 			)
 		else:
-			self.c_attn = FlaxConv1D(
+			self.c_attn = Conv1D(
+				self.embed_dim,
 				3 * self.embed_dim,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
-				**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
+				rngs=rngs,
 			)
-		self.c_proj = FlaxConv1D(
+		self.c_proj = Conv1D(
 			self.embed_dim,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			self.embed_dim,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
+
+		self.resid_dropout = nn.Dropout(rate=config.resid_pdrop, rngs=rngs)
 		self.attention_performer = FlexibleAttentionModule(
 			use_sharding_constraint=self.config.use_sharding_constraint,
 			num_q_heads=self.config.num_attention_heads,
@@ -152,7 +181,6 @@ class FlaxGPT2Attention(FlaxAttentionModule):
 			sm_scale=1 / math.sqrt(self.head_dim),
 			base_config=self.config,
 		)
-		self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
 
 	def _split_heads(self, hidden_states):
 		return hidden_states.reshape(
@@ -173,16 +201,15 @@ class FlaxGPT2Attention(FlaxAttentionModule):
 
 	def __call__(
 		self,
-		hidden_states,
-		key_value_states: Optional[jnp.ndarray] = None,
-		attention_mask=None,
-		casual_mask=None,
-		deterministic: bool = True,
-		init_cache: bool = False,
+		hidden_states: chex.Array,
+		key_value_states: chex.Array,
+		attention_mask: chex.Array,
+		causal_mask: Optional[chex.Array] = None,
+		cache_view: Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
 	):
 		is_cross_attention = key_value_states is not None
-		batch_size = hidden_states.shape[0]
+
 		if not is_cross_attention:
 			qkv_out = self.c_attn(hidden_states)
 			query, key, value = jnp.split(qkv_out, 3, axis=2)
@@ -196,43 +223,22 @@ class FlaxGPT2Attention(FlaxAttentionModule):
 		key = self._split_heads(key)
 		value = self._split_heads(value)
 
+		attention_bias = None
 		if self.causal:
-			if self.has_variable("cache", "cached_key"):
-				mask_shift = self.variables["cache"]["cache_index"]
-				max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
-				causal_mask = lax.dynamic_slice(
-					casual_mask,
-					(0, 0, mask_shift, 0),
-					(1, 1, query_length, max_decoder_length),
-				)
-			else:
-				causal_mask = casual_mask[:, :, :query_length, :key_length]
-			causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
-
-		# combine masks if needed
-		if attention_mask is not None and self.causal:
-			attention_mask = jnp.broadcast_to(
-				jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape
+			(
+				key,
+				value,
+				attention_mask,
+				attention_bias,
+			) = self.concatenate(
+				query=query,
+				key=key,
+				cache_view=cache_view,
+				value=value,
+				attention_mask=attention_mask,
+				causal_mask=causal_mask,
+				fcm_mask=None,
 			)
-			attention_mask = combine_masks(attention_mask, causal_mask)
-		elif self.causal:
-			attention_mask = causal_mask
-		elif attention_mask is not None:
-			attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-
-		if self.causal and (self.has_variable("cache", "cached_key") or init_cache):
-			key, value, attention_mask = self._concatenate_to_cache(
-				query, key, value, attention_mask
-			)
-
-		if attention_mask is not None:
-			attention_bias = lax.select(
-				attention_mask > 0,
-				jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-				jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-			)
-		else:
-			attention_bias = None
 
 		attn = self.attention_performer(
 			query_states=query,
@@ -242,8 +248,8 @@ class FlaxGPT2Attention(FlaxAttentionModule):
 			attention_mask=attention_mask,
 			causal=self.causal,
 			dropout_rng=self.rngs.params(),
-			query_sequence_length=query_states.shape[1],
-			key_value_sequence_length=key_states.shape[1],
+			query_sequence_length=query.shape[1],
+			key_value_sequence_length=key.shape[1],
 			uses_cache=cache_view is not None,
 			segment_ids=None,
 			causal_mask=causal_mask,
@@ -258,97 +264,139 @@ class FlaxGPT2Attention(FlaxAttentionModule):
 		return outputs
 
 
-class FlaxGPT2MLP(nn.Module):
-	config: GPT2Config
-	intermediate_size: int
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
-
-	def setup(self):
-		embed_dim = self.config.hidden_size
-		self.c_fc = FlaxConv1D(
-			self.intermediate_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
-		)
-		self.c_proj = FlaxConv1D(
+class GPT2MLP(nn.Module):
+	def __init__(
+		self,
+		config: GPT2Config,
+		intermediate_size: int,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__()
+		self.config = config
+		self.precision = precision
+		self.dtype = dtype
+		self.rngs = rngs
+		embed_dim = config.hidden_size
+		self.c_fc = Conv1D(
 			embed_dim,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			intermediate_size,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
-		self.act = ACT2FN[self.config.activation_function]
-		self.dropout = flax.linen.Dropout(rate=self.config.resid_pdrop)
+		self.c_proj = Conv1D(
+			intermediate_size,
+			embed_dim,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+		self.act = ACT2FN[config.activation_function]
+		self.dropout = nn.Dropout(
+			rate=config.resid_pdrop,
+			rngs=rngs,
+		)
 
-	def __call__(self, hidden_states, deterministic: bool = True):
-		hidden_states = self.c_proj(self.act(self.c_fc(hidden_states)))
-		hidden_states = self.dropout(hidden_states)
-		return hidden_states
+	def __call__(self, hidden_states):
+		return self.dropout(self.c_proj(self.act(self.c_fc(hidden_states))))
 
 
-class FlaxGPT2Block(nn.Module):
-	config: GPT2Config
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
-
-	def setup(self):
+class GPT2Block(nn.Module):
+	def __init__(
+		self,
+		config: GPT2Config,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[jax.lax.Precision] = jax.lax.Precision("fastest"),
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__()
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
 		hidden_size = self.config.hidden_size
 		inner_dim = (
 			self.config.n_inner if self.config.n_inner is not None else 4 * hidden_size
 		)
 
-		self.ln_1 = nn.LayerNorm(epsilon=self.config.layer_norm_epsilon, dtype=self.dtype)
+		self.ln_1 = nn.LayerNorm(
+			config.hidden_size,
+			epsilon=config.layer_norm_epsilon,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			rngs=rngs,
+		)
 
-		attn_block = FlaxGPT2Attention
-		mlp_block = FlaxGPT2MLP
+		attn_block = GPT2Attention
+		mlp_block = GPT2MLP
 		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
-			attn_block = flax.linen.partitioning.remat(
+			attn_block = nn.remat(
 				attn_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 				static_argnums=(3, 4, 5, 6),
 			)
 
-			mlp_block = flax.linen.partitioning.remat(
+			mlp_block = nn.remat(
 				mlp_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 				static_argnums=(1,),
 			)
 
 		self.attn = attn_block(
-			self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
-		self.ln_2 = nn.LayerNorm(epsilon=self.config.layer_norm_epsilon, dtype=self.dtype)
+		self.ln_2 = nn.LayerNorm(
+			config.hidden_size,
+			epsilon=config.layer_norm_epsilon,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			rngs=rngs,
+		)
 
-		if self.config.add_cross_attention:
+		if config.add_cross_attention:
 			self.crossattention = attn_block(
-				config=self.config,
-				dtype=self.dtype,
+				config=config,
+				dtype=dtype,
 				causal=True,
 				is_cross_attention=True,
 			)
 			self.ln_cross_attn = nn.LayerNorm(
-				epsilon=self.config.layer_norm_epsilon, dtype=self.dtype
+				config.hidden_size,
+				epsilon=config.layer_norm_epsilon,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				rngs=rngs,
 			)
 
-		self.mlp = mlp_block(self.config, inner_dim, dtype=self.dtype)
+		self.mlp = mlp_block(
+			config=config,
+			intermediate_size=inner_dim,
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
 
 	def __call__(
 		self,
 		hidden_states,
 		attention_mask=None,
-		casual_mask=None,
-		encoder_hidden_states: Optional[jnp.ndarray] = None,
-		encoder_attention_mask: Optional[jnp.ndarray] = None,
-		deterministic: bool = True,
-		init_cache: bool = False,
+		causal_mask=None,
+		encoder_hidden_states: Optional[chex.Array] = None,
+		encoder_attention_mask: Optional[chex.Array] = None,
+		cache_view: Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
 	):
 		residual = hidden_states
@@ -357,9 +405,8 @@ class FlaxGPT2Block(nn.Module):
 			hidden_states,
 			None,
 			attention_mask,
-			casual_mask,
-			deterministic,
-			init_cache,
+			causal_mask,
+			cache_view,
 			output_attentions,
 		)
 		attn_output = attn_outputs[0]
@@ -373,42 +420,29 @@ class FlaxGPT2Block(nn.Module):
 				)
 			residual = hidden_states
 			hidden_states = self.ln_cross_attn(hidden_states)
-			# hidden_states
-			# key_value_states: Optional[jnp.ndarray] = None
-			# attention_mask = None
-			# casual_mask = None
-			# deterministic: bool = True
-			# init_cache: bool = False
-			# output_attentions: bool = False
 
 			cross_attn_outputs = self.crossattention(
 				hidden_states,
 				encoder_hidden_states,
 				encoder_attention_mask,
-				casual_mask,
-				deterministic,
-				False,
+				causal_mask,
+				None,
 				output_attentions,
 			)
 			attn_output = cross_attn_outputs[0]
-			# residual connection
 			hidden_states = residual + attn_output
-			outputs = (
-				outputs + cross_attn_outputs[1:]
-			)  # add cross attentions if we output attention weights
+			outputs = outputs + cross_attn_outputs[1:]
 
 		residual = hidden_states
 		hidden_states = self.ln_2(hidden_states)
 		if self.config.use_scan_mlp:
 			feed_forward_hidden_states = block_wise_ffn(
-				self.mlp, hidden_states, self.config.scan_mlp_chunk_size, deterministic
+				self.mlp,
+				hidden_states,
+				self.config.scan_mlp_chunk_size,
 			)
 		else:
-			feed_forward_hidden_states = self.mlp(
-				hidden_states,
-				deterministic,
-			)
-		# residual connection
+			feed_forward_hidden_states = self.mlp(hidden_states)
 		hidden_states = residual + feed_forward_hidden_states
 
 		outputs = (hidden_states,) + outputs
@@ -416,55 +450,113 @@ class FlaxGPT2Block(nn.Module):
 		return outputs
 
 
-class FlaxGPT2BlockCollection(nn.Module):
-	config: GPT2Config
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
+@register_module(
+	"base-module",
+	config=GPT2Config,
+	model_type="gpt2",
+	embedding_layer_names=["wte", "wpe"],
+	layernorm_names=["ln_1", "ln_2", "ln_f"],
+)
+class GPT2Model(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: GPT2Config,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+		self.embed_dim = self.config.hidden_size
 
-	def setup(self):
-		self.blocks = [
-			FlaxGPT2Block(
+		self.wte = nn.Embed(
+			self.config.vocab_size,
+			self.embed_dim,
+			embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+			dtype=self.dtype,
+			rngs=rngs,
+			param_dtype=param_dtype,
+		)
+		self.wpe = nn.Embed(
+			self.config.max_position_embeddings,
+			self.embed_dim,
+			embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+			dtype=self.dtype,
+			param_dtype=param_dtype,
+			rngs=rngs,
+		)
+
+		self.dropout = nn.Dropout(rate=self.config.embd_pdrop, rngs=rngs)
+		self.h = [
+			GPT2Block(
 				self.config,
-				name=str(i),
 				dtype=self.dtype,
 				param_dtype=self.param_dtype,
 				precision=self.precision,
+				rngs=rngs,
 			)
 			for i in range(self.config.num_hidden_layers)
 		]
+		self.ln_f = nn.LayerNorm(
+			self.config.hidden_size,
+			epsilon=self.config.layer_norm_epsilon,
+			dtype=self.dtype,
+			param_dtype=param_dtype,
+			rngs=rngs,
+		)
 
 	def __call__(
 		self,
-		hidden_states,
-		attention_mask=None,
-		casual_mask=None,
-		encoder_hidden_states: Optional[jnp.ndarray] = None,
-		encoder_attention_mask: Optional[jnp.ndarray] = None,
-		deterministic: bool = True,
-		init_cache: bool = False,
+		input_ids,
+		attention_mask: Optional[chex.Array] = None,
+		position_ids: Optional[chex.Array] = None,
+		encoder_hidden_states: Optional[chex.Array] = None,
+		encoder_attention_mask: Optional[chex.Array] = None,
+		past_key_values: Optional[TransformerCache] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
 	):
+		batch_size, sequence_length = input_ids.shape
+		if attention_mask is None:
+			attention_mask = jnp.ones_like(input_ids)
+		if position_ids is None:
+			position_ids = jnp.broadcast_to(
+				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+				(batch_size, sequence_length),
+			).astype(jnp.int32)
+
+		input_embeds = self.wte(input_ids.astype("i4"))
+		position_embeds = self.wpe(position_ids.astype("i4"))
+
+		hidden_states = input_embeds + position_embeds
+		hidden_states = self.dropout(hidden_states)
+
 		all_attentions = () if output_attentions else None
 		all_hidden_states = () if output_hidden_states else None
 		all_cross_attentions = (
 			() if (output_attentions and encoder_hidden_states is not None) else None
 		)
-
-		for idx, block in enumerate(self.blocks):
+		if past_key_values is None:
+			past_key_values = TransformerCache.init_empty(len(self.h))
+		for idx, block in enumerate(self.h):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
 
 			layer_outputs = block(
-				hidden_states,
-				attention_mask,
-				casual_mask=casual_mask,
+				hidden_states=hidden_states,
+				attention_mask=attention_mask,
+				causal_mask=self.causal_mask,
 				encoder_hidden_states=encoder_hidden_states,
 				encoder_attention_mask=encoder_attention_mask,
-				deterministic=deterministic,
-				init_cache=init_cache,
+				cache_view=past_key_values.views[idx],
 				output_attentions=output_attentions,
 			)
 			hidden_states = layer_outputs[0]
@@ -482,99 +574,12 @@ class FlaxGPT2BlockCollection(nn.Module):
 			all_cross_attentions,
 		)
 
-		return outputs
-
-
-@register_module(
-	"base-module",
-	config=GPT2Config,
-	model_type="gpt2",
-	embedding_layer_names=["wte", "wpe"],
-	layernorm_names=["ln_1", "ln_2", "ln_f"],
-)
-@wrap_easydel_module(config_class=GPT2Config, base_model_prefix="transformer")
-class FlaxGPT2Model(nn.Module):
-	config: GPT2Config
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
-
-	def setup(self):
-		self.embed_dim = self.config.hidden_size
-
-		self.wte = nn.Embed(
-			self.config.vocab_size,
-			self.embed_dim,
-			embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-			dtype=self.dtype,
-		)
-		self.wpe = nn.Embed(
-			self.config.max_position_embeddings,
-			self.embed_dim,
-			embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-			dtype=self.dtype,
-		)
-		self.casual_mask = make_causal_mask(
-			jnp.ones(
-				(
-					1,
-					getattr(
-						self.config,
-						"mask_max_position_embeddings",
-						self.config.max_position_embeddings,
-					),
-				),
-				dtype="bool",
-			),
-			dtype="bool",
-		)
-		self.dropout = flax.linen.Dropout(rate=self.config.embd_pdrop)
-		self.h = FlaxGPT2BlockCollection(
-			self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-		)
-		self.ln_f = nn.LayerNorm(epsilon=self.config.layer_norm_epsilon, dtype=self.dtype)
-
-	def __call__(
-		self,
-		input_ids,
-		attention_mask,
-		position_ids,
-		encoder_hidden_states: Optional[jnp.ndarray] = None,
-		encoder_attention_mask: Optional[jnp.ndarray] = None,
-		deterministic=True,
-		init_cache: bool = False,
-		output_attentions: bool = False,
-		output_hidden_states: bool = False,
-		return_dict: bool = True,
-	):
-		input_embeds = self.wte(input_ids.astype("i4"))
-		position_embeds = self.wpe(position_ids.astype("i4"))
-
-		hidden_states = input_embeds + position_embeds
-		hidden_states = self.dropout(hidden_states)
-
-		outputs = self.h(
-			hidden_states=hidden_states,
-			attention_mask=attention_mask,
-			casual_mask=self.casual_mask,
-			encoder_hidden_states=encoder_hidden_states,
-			encoder_attention_mask=encoder_attention_mask,
-			deterministic=deterministic,
-			init_cache=init_cache,
-			output_attentions=output_attentions,
-			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
-		)
-
 		hidden_states = outputs[0]
 		hidden_states = self.ln_f(hidden_states)
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-		outputs = (hidden_states, all_hidden_states, all_attentions)
+		outputs = (hidden_states, all_hidden_states, all_attentions, all_cross_attentions)
 
 		if not return_dict:
 			return tuple(v for v in outputs if v is not None)
@@ -594,26 +599,38 @@ class FlaxGPT2Model(nn.Module):
 	embedding_layer_names=["wte", "wpe"],
 	layernorm_names=["ln_1", "ln_2", "ln_f"],
 )
-@wrap_easydel_module(config_class=GPT2Config, base_model_prefix="transformer")
-class FlaxGPT2LMHeadModel(nn.Module):
-	config: GPT2Config
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
-
-	def setup(self):
-		self.transformer = FlaxGPT2Model.flax_module(
+class GPT2LMHeadModel(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: GPT2Config,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+		self.transformer = GPT2Model(
 			self.config,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			precision=self.precision,
+			rngs=rngs,
 		)
-		self.lm_head = Dense(
+		self.lm_head = nn.Linear(
+			self.config.hidden_size,
 			self.config.vocab_size,
 			use_bias=False,
 			dtype=self.dtype,
 			param_dtype=self.param_dtype,
 			precision=self.precision,
+			rngs=rngs,
 			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
 			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
 		)
@@ -621,24 +638,22 @@ class FlaxGPT2LMHeadModel(nn.Module):
 	def __call__(
 		self,
 		input_ids,
-		attention_mask,
-		position_ids,
-		encoder_hidden_states: Optional[jnp.ndarray] = None,
-		encoder_attention_mask: Optional[jnp.ndarray] = None,
-		deterministic: bool = True,
-		init_cache: bool = False,
+		attention_mask: Optional[chex.Array] = None,
+		position_ids: Optional[chex.Array] = None,
+		encoder_hidden_states: Optional[chex.Array] = None,
+		encoder_attention_mask: Optional[chex.Array] = None,
+		past_key_values: Optional[TransformerCache] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
 	):
 		outputs = self.transformer(
-			input_ids,
-			attention_mask,
-			position_ids,
-			encoder_hidden_states,
-			encoder_attention_mask,
-			deterministic=deterministic,
-			init_cache=init_cache,
+			input_ids=input_ids,
+			attention_mask=attention_mask,
+			position_ids=position_ids,
+			past_key_values=past_key_values,
+			encoder_hidden_states=encoder_hidden_states,
+			encoder_attention_mask=encoder_attention_mask,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,
@@ -647,13 +662,8 @@ class FlaxGPT2LMHeadModel(nn.Module):
 		hidden_states = outputs[0]
 
 		if self.config.tie_word_embeddings:
-			shared_kernel = self.transformer.variables["params"]["wte"]["embedding"].T.astype(
-				self.param_dtype
-			)
-			lm_logits = self.lm_head.apply(
-				{"params": {"kernel": shared_kernel}},
-				hidden_states,
-			)
+			self.lm_head.kernel.value = self.transformer.wte.embedding.value.T
+			lm_logits = self.lm_head(hidden_states)
 		else:
 			lm_logits = self.lm_head(hidden_states)
 
