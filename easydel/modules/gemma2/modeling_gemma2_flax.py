@@ -247,11 +247,6 @@ class FlaxGemma2Attention(FlaxAttentionModule):
 			frequencies=frequencies,
 		)
 
-		dropout_rng = None
-
-		if not deterministic and self.config.attention_dropout > 0.0:
-			dropout_rng = self.make_rng("dropout")
-
 		if self.has_variable("cache", "cached_key"):
 			mask_shift = self.variables["cache"]["cache_index"]
 			max_decoder_length = self.variables["cache"]["cached_key"].shape[1]

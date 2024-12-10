@@ -214,10 +214,6 @@ class FlaxZamba2Attention(FlaxAttentionModule):
 		attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
 		attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
 
-		dropout_rng = None
-
-		if not deterministic and self.config.attention_dropout > 0.0:
-			dropout_rng = self.make_rng("dropout")
 		if self.has_variable("cache", "cached_key") or init_cache:
 			key_states, value_states, attention_mask = self._concatenate_to_cache(
 				query_states,

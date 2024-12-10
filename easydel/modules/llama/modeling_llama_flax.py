@@ -258,7 +258,7 @@ class LlamaMLP(nn.Module):
 		self.dropout = nn.Dropout(rate=self.config.resid_pdrop, rngs=rngs)
 		self.act_fn = ACT2FN[self.config.hidden_act]
 
-	def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
+	def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
 		x = control_mlp_sharding(x, self.config.partition_axis)
 		x = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 		x = self.dropout(x)

@@ -220,11 +220,6 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 			fcm_mask=fcm_mask,
 		)
 
-		dropout_rng = None
-
-		if not deterministic and self.config.attention_dropout > 0.0:
-			dropout_rng = self.make_rng("dropout")
-
 		attentions = self.attention_performer(
 			query_states=query_states,
 			key_states=key_states,
