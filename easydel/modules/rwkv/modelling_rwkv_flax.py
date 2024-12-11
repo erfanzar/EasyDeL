@@ -484,7 +484,7 @@ class FlaxRwkvPretrainedModel(EasyDeLBaseModule):
 		self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
 	) -> FrozenDict[Any, Any] | Mapping[str, Any] | Any:
 		input_ids = jnp.zeros(input_shape, dtype="i4")
-		attention_mask = jnp.ones_like(input_ids)
+		attention_mask = jnp.ones((batch_size, sequence_length), "i4")
 		params_rng, dropout_rng = jax.random.split(rng)
 		rng_s = {"params": params_rng, "dropout": dropout_rng}
 		module_init_outputs = self.module.init(

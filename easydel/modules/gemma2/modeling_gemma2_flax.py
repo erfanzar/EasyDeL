@@ -518,7 +518,7 @@ class Gemma2Model(EasyDeLBaseModule):
 		batch_size, sequence_length, _ = input_embeds.shape
 
 		if attention_mask is None:
-			attention_mask = jnp.ones_like(input_ids)
+			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
 		if position_ids is None:
 			position_ids = jnp.broadcast_to(
 				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),

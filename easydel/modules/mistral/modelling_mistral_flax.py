@@ -634,7 +634,7 @@ class FlaxMistralModel(nn.Module):
 			sequence_length <= self.config.max_position_embeddings
 		), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 		if attention_mask is None:
-			attention_mask = jnp.ones_like(input_ids)
+			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
 		if position_ids is None:
 			position_ids = jnp.broadcast_to(
 				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
@@ -642,7 +642,7 @@ class FlaxMistralModel(nn.Module):
 			).astype(jnp.int32)
 		if attention_mask.ndim == 2:
 			attention_mask = jnp.expand_dims(attention_mask, (1, 2))
-
+		hidden_states = input_embeds
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
 		for idx, block in enumerate(self.layers):
@@ -664,7 +664,6 @@ class FlaxMistralModel(nn.Module):
 			if output_attentions:
 				all_attentions += (layer_outputs[1],)
 
-		hidden_states = outputs[0]
 		hidden_states = self.norm(hidden_states)
 
 		if output_hidden_states:
@@ -753,16 +752,6 @@ class FlaxMistralForCausalLM(nn.Module):
 		    FlaxCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
 
-		batch_size, seq_length = (
-			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
-		)
-		if attention_mask is None:
-			attention_mask = jnp.ones_like(input_ids)
-		if position_ids is None:
-			position_ids = jnp.broadcast_to(
-				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-				(batch_size, seq_length),
-			)
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
@@ -972,15 +961,6 @@ class FlaxVisionMistralForCausalLM(nn.Module):
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
 	):
-		batch_size, seq_length = input_ids.shape
-		if attention_mask is None:
-			attention_mask = jnp.ones_like(input_ids)
-		if position_ids is None:
-			position_ids = jnp.broadcast_to(
-				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-				(batch_size, seq_length),
-			)
-
 		outputs = self.transformer(
 			input_ids,
 			vision_mask,

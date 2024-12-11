@@ -340,7 +340,7 @@ class vInference:
 						"pass an attention mask for better results.",
 						stacklevel=1,
 					)
-					attention_mask = jnp.ones_like(input_ids)
+					attention_mask = jnp.ones((batch_size, sequence_length), "i4")
 
 				attention_mask = jnp.array(
 					attention_mask,

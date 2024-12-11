@@ -246,7 +246,11 @@ class LinearNF4(Module):
 
 	def _dequantize_kernel(self):
 		"""Dequantize the kernel weights from NF4."""
-		return dequantize_nf4(self.packed_kernel.value, self.scales.value, self.block_size)
+		return dequantize_nf4(
+			self.packed_kernel.value,
+			self.scales.value,
+			self.block_size,
+		).reshape(self.in_features, self.out_features)
 
 	def __call__(self, inputs: Array) -> Array:
 		"""Applies a quantized linear transformation to the inputs along the last dimension."""
