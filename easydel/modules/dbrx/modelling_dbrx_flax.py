@@ -87,24 +87,24 @@ class DbrxAttention(FlaxAttentionModule):
 		self.Wqkv = nn.Linear(
 			config.hidden_size,
 			self.hidden_size + 2 * self.num_key_value_heads * self.head_dim,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
 			rngs=rngs,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.out_proj = nn.Linear(
 			config.hidden_size,
 			config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
 			rngs=rngs,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 		self.rotary = self.config.get_basic_rope(
@@ -256,22 +256,22 @@ class DbrxNormAttentionNorm(nn.Module):
 		self.rngs = rngs
 		self.norm_1 = nn.LayerNorm(
 			self.config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
 			rngs=rngs,
 		)
 		self.attn = DbrxAttention(  # statics 3,5,6,7
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 		self.norm_2 = nn.LayerNorm(
 			self.config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
 			rngs=rngs,
 		)
@@ -406,10 +406,10 @@ class DbrxExperts(nn.Module):
 		self.precision = precision
 		self.rngs = rngs
 		self.mlp = DbrxExpertGLU(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 
@@ -459,9 +459,9 @@ class DbrxRouter(nn.Module):
 			config.hidden_size,
 			self.moe_num_experts,
 			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 
@@ -528,18 +528,18 @@ class DbrxFFN(nn.Module):
 		self.precision = precision
 		self.rngs = rngs
 		self.router = DbrxRouter(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 
 		self.experts = DbrxExperts(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 
@@ -582,17 +582,17 @@ class DbrxBlock(nn.Module):
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 			)
 		self.norm_attn_norm = attn_block(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 		self.ffn = ffn_block(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 
@@ -684,16 +684,16 @@ class DbrxModel(EasyDeLBaseModule):
 		self.wte = nn.Embed(
 			self.config.vocab_size,
 			self.config.d_model,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 		self.blocks = [
 			DbrxBlock(
-				config=self.config,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				config=config,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 				rngs=rngs,
 			)
 			for i in range(self.config.n_layers)
@@ -701,8 +701,8 @@ class DbrxModel(EasyDeLBaseModule):
 		self.norm_f = nn.LayerNorm(
 			self.config.hidden_size,
 			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 
@@ -836,22 +836,22 @@ class DbrxForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 		self.transformer = DbrxModel(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 		self.lm_head = nn.Linear(
-			self.config.hidden_size,
-			self.config.vocab_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config.hidden_size,
+			config.vocab_size,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			use_bias=False,
 			rngs=rngs,
-			kernel_init=nn.initializers.normal(self.config.initializer_range),
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			kernel_init=nn.initializers.normal(config.initializer_range),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 	def __call__(

@@ -17,17 +17,15 @@ import math
 from typing import Optional, Tuple, Union
 
 import chex
-import flax.linen.partitioning
 import jax.lax
 from chex import Array
-from flax import linen as nn
-from flax.linen import Dense
+from flax import nnx as nn
 from jax import numpy as jnp
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.modules._base.base_module import wrap_easydel_module
+from easydel.modules._base.base_module import EasyDeLBaseModule
 from easydel.modules._base.factory import register_module
 from easydel.modules._base.flax_modeling_utils import (
 	ACT2FN,
@@ -43,61 +41,68 @@ from easydel.modules.modeling_flax_outputs import (
 from easydel.modules.phi.phi_configuration import PhiConfig as PhiConfig
 
 
-class FlaxPhiMLP(nn.Module):
-	config: PhiConfig
-	layer_idx: Optional[int] = None
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
+class PhiMLP(nn.Module):
+	def __init__(
+		self,
+		config: PhiConfig,
+		layer_idx: Optional[int] = None,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[jax.lax.Precision] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		self.config = config
+		self.layer_idx = layer_idx
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
 
-	"""Multi-Layer Perceptron.
-    Reference:
-        Attention Is All You Need.
-        https://arxiv.org/pdf/1706.03762.pdf.
-    """
-
-	def setup(self) -> None:
-		self.fc1 = Dense(
-			self.config.intermediate_size,
-			kernel_init=nn.initializers.normal(self.config.initializer_range),
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+		self.fc1 = nn.Linear(
+			config.n_embd,
+			config.intermediate_size,
+			kernel_init=nn.initializers.normal(config.initializer_range),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
-		self.fc2 = Dense(
-			self.config.n_embd,
-			kernel_init=nn.initializers.normal(self.config.initializer_range),
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+		self.fc2 = nn.Linear(
+			config.intermediate_size,
+			config.n_embd,
+			kernel_init=nn.initializers.normal(config.initializer_range),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
 		self.act = ACT2FN[self.config.hidden_act]
 
-	def __call__(self, hidden_states: Array, e: bool = False) -> Array:  # Ignored
+	def __call__(self, hidden_states: Array) -> Array:
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-
 		return self.fc2(self.act(self.fc1(hidden_states)))
 
 
-class FlaxPhiAttention(FlaxAttentionModule):
-	"""
-	Phi model for causal language modeling, including the language model head.
+class PhiAttention(FlaxAttentionModule):
+	def __init__(
+		self,
+		config: PhiConfig,
+		layer_idx: Optional[int] = None,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[jax.lax.Precision] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(config=config)
 
-	Attributes:
-	    config (PhiConfig): Configuration object with model hyperparameters.
-	    dtype (jnp.dtype): Data type for the computations.
-	    param_dtype (jnp.dtype): Data type for the model parameters.
-	    precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
-	"""
+		self.layer_idx = layer_idx
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
 
-	config: PhiConfig
-	layer_idx: Optional[int] = None
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
-
-	def setup(self):
-		config = self.config
 		self.attention_dropout = config.attention_dropout
 		self.hidden_size = config.hidden_size
 		self.num_heads = config.num_attention_heads
@@ -115,33 +120,53 @@ class FlaxPhiAttention(FlaxAttentionModule):
 				f" and `num_heads`: {self.num_heads})."
 			)
 
-		dense_class = functools.partial(
-			Dense,
+		linear_class = functools.partial(
+			nn.Linear,
 			use_bias=True,
-			precision=self.precision,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-			**get_dot_general_by_bits(self.config.bits),
+			precision=precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
-		self.q_proj = dense_class(self.num_heads * self.head_dim)
-		self.k_proj = dense_class(self.num_key_value_heads * self.head_dim)
-		self.v_proj = dense_class(self.num_key_value_heads * self.head_dim)
-		self.dense = dense_class(self.hidden_size)
+		self.q_proj = linear_class(
+			self.hidden_size,
+			self.num_heads * self.head_dim,
+			rngs=rngs,
+		)
+		self.k_proj = linear_class(
+			self.hidden_size,
+			self.num_key_value_heads * self.head_dim,
+			rngs=rngs,
+		)
+		self.v_proj = linear_class(
+			self.hidden_size,
+			self.num_key_value_heads * self.head_dim,
+			rngs=rngs,
+		)
+		self.dense = linear_class(
+			self.num_heads * self.head_dim,
+			self.hidden_size,
+			rngs=rngs,
+		)
 		self.rotary_emb_dim = int(self.config.partial_rotary_factor * self.head_dim)
 		self.qk_layernorm = config.qk_layernorm
 		if self.qk_layernorm:
 			self.q_layernorm = nn.LayerNorm(
+				config.hidden_size,
 				epsilon=config.layer_norm_eps,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				rngs=rngs,
 				use_bias=True,
 			)
 			self.k_layernorm = nn.LayerNorm(
+				config.hidden_size,
 				epsilon=config.layer_norm_eps,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				rngs=rngs,
 				use_bias=True,
 			)
 
@@ -285,15 +310,25 @@ class FlaxPhiAttention(FlaxAttentionModule):
 
 
 class FlaxPhiDecoderLayer(nn.Module):
-	config: PhiConfig
-	layer_idx: int
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
+	def __init__(
+		self,
+		config: PhiConfig,
+		layer_idx: Optional[int] = None,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[jax.lax.Precision] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		self.config = config
+		self.layer_idx = layer_idx
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
 
-	def setup(self):
-		attn_block = FlaxPhiAttention
-		mlp_block = FlaxPhiMLP
+		attn_block = PhiAttention
+		mlp_block = PhiMLP
 		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			attn_block = nn.remat(
 				attn_block,
@@ -306,25 +341,29 @@ class FlaxPhiDecoderLayer(nn.Module):
 				static_argnums=(1,),
 			)
 		self.self_attn = attn_block(
-			config=self.config,
-			layer_idx=self.layer_idx,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			layer_idx=layer_idx,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
 		self.mlp = mlp_block(
-			config=self.config,
-			layer_idx=self.layer_idx,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			layer_idx=layer_idx,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
 		self.input_layernorm = nn.LayerNorm(
-			epsilon=self.config.layer_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			config.hidden_size,
+			epsilon=config.layer_norm_eps,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			rngs=rngs,
 		)
-		self.resid_dropout = flax.linen.Dropout(self.config.resid_pdrop)
+		self.resid_dropout = nn.Dropout(self.config.resid_pdrop)
 
 	def __call__(
 		self,
@@ -381,12 +420,8 @@ class FlaxPhiDecoderLayer(nn.Module):
 				self.config.scan_mlp_chunk_size,
 			)
 		else:
-			feed_forward_hidden_states = self.mlp(
-				hidden_states,
-			)
-		feed_forward_hidden_states = self.resid_dropout(
-			feed_forward_hidden_states, deterministic=deterministic
-		)
+			feed_forward_hidden_states = self.mlp(hidden_states)
+		feed_forward_hidden_states = self.resid_dropout(feed_forward_hidden_states)
 		hidden_states = attn_outputs + feed_forward_hidden_states + residual
 		outputs = (hidden_states,)
 
@@ -396,25 +431,63 @@ class FlaxPhiDecoderLayer(nn.Module):
 		return outputs
 
 
-class FlaxPhiDecoderLayerCollection(nn.Module):
-	config: PhiConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
+@register_module(
+	"base-module",
+	config=PhiConfig,
+	model_type="phi",
+	embedding_layer_names=["embed_tokens"],
+	layernorm_names=["input_layernorm", "final_layernorm", "q_layernorm", "k_layernorm"],
+)
+class PhiModel(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: PhiConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+		self.padding_idx = config.pad_token_id
+		self.vocab_size = config.vocab_size
 
-	def setup(self) -> None:
+		self.embed_tokens = nn.Embed(
+			config.vocab_size,
+			config.hidden_size,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			rngs=rngs,
+		)
+		self.embed_dropout = nn.Dropout(config.embd_pdrop, rngs=rngs)
 		self.layers = [
 			FlaxPhiDecoderLayer(
-				config=self.config,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
-				name=str(idx),
+				config=config,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 				layer_idx=idx,
+				rngs=rngs,
 			)
 			for idx in range(self.config.num_hidden_layers)
 		]
-		self._frequencies = self.config.get_basic_frequencies(
+		self.final_layernorm = nn.LayerNorm(
+			config.hidden_size,
+			epsilon=config.layer_norm_eps,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			rngs=rngs,
+		)
+
+	@functools.cached_property
+	def frequencies(self):
+		return self.config.get_basic_frequencies(
 			head_size=int(
 				self.config.partial_rotary_factor
 				* (self.config.hidden_size // self.config.num_attention_heads)
@@ -427,167 +500,16 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
 
 	def __call__(
 		self,
-		hidden_states: chex.Array,
-		attention_mask: chex.Array,
-		causal_mask: chex.Array,
-		position_ids: chex.Array,
-		segment_ids: Optional[chex.Array] = None,
-		deterministic: bool = True,
-		init_cache: bool = False,
-		output_attentions: bool = False,
-		output_hidden_states: bool = False,
-	) -> Tuple[chex.Array, Optional[chex.Array], chex.Array]:
-		"""
-		Forward pass through the collection of decoder layers.
-
-		Args:
-		    hidden_states (chex.Array): Input tensor containing the hidden states.
-		    attention_mask (chex.Array): Mask to apply during attention.
-		    causal_mask (chex.Array): Causal mask for autoregressive decoding.
-		    position_ids (chex.Array): Positional indices for the sequence.
-		    segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
-		    deterministic (bool): If True, disables dropout.
-		    init_cache (bool): If True, initializes caching mechanism for fast decoding.
-		    output_attentions (bool): If True, returns attention weights.
-		    output_hidden_states (bool): If True, returns hidden states.
-
-		Returns:
-		    Tuple[chex.Array, Optional[chex.Array], chex.Array]:
-		        - hidden_states: The output tensor after layer processing.
-		        - all_hidden_states: all of Hidden states (if `output_hidden_states` is True).
-		        - self_attn_weights: Attention weights (if `output_attentions` is True).
-
-		"""
-		all_hidden_states = () if output_hidden_states else None
-		all_self_attns = () if output_attentions else None
-		if not deterministic and self.config.fcm_max_ratio > 0:
-			# Apply forgetful causal mask
-			batch_size, seq_length = hidden_states.shape[0], hidden_states.shape[1]
-			fcm_ratio = jax.random.uniform(
-				self.make_rng("fcm"),
-				shape=(batch_size, 1, 1, 1),
-				minval=self.config.fcm_min_ratio,
-				maxval=self.config.fcm_max_ratio,
-			)
-			fcm_mask = (
-				jax.random.uniform(
-					self.make_rng("fcm"), shape=(batch_size, 1, seq_length, seq_length)
-				)
-				> fcm_ratio
-			)
-			fcm_mask = fcm_mask.at[:, :, :, 0].set(True)
-			fcm_mask = fcm_mask.astype("bool")
-		else:
-			fcm_mask = None
-		for decoder_layer in self.layers:
-			if output_hidden_states:
-				all_hidden_states += (hidden_states,)
-
-			layer_outputs = decoder_layer(
-				hidden_states=hidden_states,
-				attention_mask=attention_mask,
-				position_ids=position_ids,
-				causal_mask=self.causal_mask,
-				cache_view=past_key_values.views[idx],
-				output_attentions=output_attentions,
-				segment_ids=segment_ids,
-				frequencies=self.frequencies,
-			)
-
-			hidden_states = layer_outputs[0]
-
-			if output_attentions:
-				all_self_attns += (layer_outputs[1],)
-
-		return hidden_states, all_hidden_states, all_self_attns
-
-
-@register_module(
-	"base-module",
-	config=PhiConfig,
-	model_type="phi",
-	embedding_layer_names=["embed_tokens"],
-	layernorm_names=["input_layernorm", "final_layernorm", "q_layernorm", "k_layernorm"],
-)
-@wrap_easydel_module(config_class=PhiConfig, base_model_prefix="mode")
-class FlaxPhiModel(nn.Module):
-	"""
-	Core module of the Phi model, including embedding, decoder layers, and normalization.
-
-	Attributes:
-	    config (PhiConfig): Configuration object with model hyperparameters.
-	    dtype (jnp.dtype): Data type for the computations.
-	    param_dtype (jnp.dtype): Data type for the model parameters.
-	    precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
-	"""
-
-	config: PhiConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
-
-	def setup(self) -> None:
-		config = self.config
-		self.padding_idx = config.pad_token_id
-		self.vocab_size = config.vocab_size
-
-		self.embed_tokens = nn.Embed(
-			config.vocab_size,
-			config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-		)
-		self.embed_dropout = flax.linen.Dropout(config.embd_pdrop)
-		self.layers = FlaxPhiDecoderLayerCollection(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-		)
-		self.final_layernorm = nn.LayerNorm(
-			epsilon=config.layer_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-		)
-
-		self.causal_mask = nn.make_causal_mask(
-			jnp.ones(
-				shape=(1, self.config.granted_mask_max_position_embedding),
-				dtype="bool",
-			),
-			dtype="bool",
-		)
-
-	def __call__(
-		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		past_key_values: Optional[TransformerCache] = None,
 		return_dict: bool = True,
 	) -> Union[FlaxBaseModelOutput, Tuple]:
-		"""
-		Forward pass through the Phi module.
-
-		Args:
-		    input_ids (chex.Array): Input tensor containing token IDs.
-		    attention_mask (chex.Array): Mask for attention.
-		    position_ids (chex.Array): Positional indices.
-		    segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-		    input_embeds (Optional[chex.Array]): Embedded input tensor.
-		    output_attentions (Optional[bool]): If True, output attention weights.
-		    output_hidden_states (Optional[bool]): If True, output hidden states.
-		    init_cache (bool): If True, initialize cache for decoding.
-		    deterministic (bool): If True, disable dropout.
-		    return_dict (bool): If True, return a dictionary of outputs.
-
-		Returns:
-		    FlaxBaseModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
-		"""
 		if input_embeds is None and input_ids is not None:
 			input_embeds = self.embed_tokens(input_ids.astype("i4"))
 		else:
@@ -608,7 +530,7 @@ class FlaxPhiModel(nn.Module):
 			).astype(jnp.int32)
 		if attention_mask.ndim == 2:
 			attention_mask = jnp.expand_dims(attention_mask, (1, 2))
-
+		hidden_states = input_embeds
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
 		for idx, block in enumerate(self.layers):
@@ -620,17 +542,16 @@ class FlaxPhiModel(nn.Module):
 				attention_mask=attention_mask,
 				position_ids=position_ids,
 				cache_view=past_key_values.views[idx],
-				causal_mask=self.config.get_basic_causal_mask(),
+				causal_mask=self.causal_mask,
 				output_attentions=output_attentions,
 				segment_ids=segment_ids,
-				frequencies=self.config.get_basic_frequencies(),
+				frequencies=self.frequencies,
 			)
 			hidden_states = layer_outputs[0]
 
 			if output_attentions:
 				all_attentions += (layer_outputs[1],)
 
-		hidden_states = outputs[0]
 		hidden_states = self.final_layernorm(hidden_states)
 
 		if output_hidden_states:
@@ -654,47 +575,49 @@ class FlaxPhiModel(nn.Module):
 	embedding_layer_names=["embed_tokens"],
 	layernorm_names=["input_layernorm", "final_layernorm", "q_layernorm", "k_layernorm"],
 )
-@wrap_easydel_module(config_class=PhiConfig, base_model_prefix="mode")
-class FlaxPhiForCausalLM(nn.Module):
-	"""
-	Phi model for causal language modeling, including the language model head.
-
-	Attributes:
-	    config (PhiConfig): Configuration object with model hyperparameters.
-	    dtype (jnp.dtype): Data type for the computations.
-	    param_dtype (jnp.dtype): Data type for the model parameters.
-	    precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
-	"""
-
-	config: PhiConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
-
-	def setup(self) -> None:
-		self.model = FlaxPhiModel.flax_module(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+class PhiForCausalLM(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: PhiConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+		self.model = PhiModel(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
 		self.vocab_size = self.config.vocab_size
-		self.lm_head = Dense(
-			self.config.vocab_size,
+		self.lm_head = nn.Linear(
+			config.hidden_size,
+			config.vocab_size,
 			use_bias=True,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
 
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		past_key_values: Optional[TransformerCache] = None,
@@ -719,22 +642,11 @@ class FlaxPhiForCausalLM(nn.Module):
 		    FlaxCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
 
-		batch_size, sequence_length = (
-			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
-		)
-		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
-		if position_ids is None:
-			position_ids = jnp.broadcast_to(
-				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-				(batch_size, sequence_length),
-			)
 		res = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
-			deterministic=deterministic,
-			init_cache=init_cache,
+			past_key_values=past_key_values,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			input_embeds=input_embeds,
@@ -742,14 +654,10 @@ class FlaxPhiForCausalLM(nn.Module):
 			return_dict=True,
 		)
 		outputs = (res.last_hidden_state, res.hidden_states, res.attentions)
+
 		if self.config.tie_word_embeddings:
-			shared_kernel = self.model.variables["params"]["embed_tokens"][
-				"embedding"
-			].T.astype(self.param_dtype)
-			lm_logits = self.lm_head.apply(
-				{"params": {"kernel": shared_kernel}},
-				res.last_hidden_state,
-			)
+			self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
+			lm_logits = self.lm_head(res.last_hidden_state)
 		else:
 			lm_logits = self.lm_head(res.last_hidden_state)
 

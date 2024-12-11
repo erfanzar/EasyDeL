@@ -90,30 +90,30 @@ class FlaxQwen2MoeMLP(nn.Module):
 		)
 		self.gate_proj = Dense(
 			intermediate_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.down_proj = Dense(
 			config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.up_proj = Dense(
 			intermediate_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 	def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
@@ -162,24 +162,24 @@ class FlaxQwen2MoeAttention(FlaxAttentionModule):
 			assert self.config.num_attention_heads == self.config.num_key_value_heads
 		dense_class = partial(
 			Dense,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=True,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.q_proj = dense_class(config.num_attention_heads * self.head_dim)
 		self.k_proj = dense_class(config.num_key_value_heads * self.head_dim)
 		self.v_proj = dense_class(config.num_key_value_heads * self.head_dim)
 		self.o_proj = Dense(
 			config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.attention_performer = FlexibleAttentionModule(
 			num_q_heads=self.config.num_attention_heads,
@@ -197,7 +197,7 @@ class FlaxQwen2MoeAttention(FlaxAttentionModule):
 			sm_scale=1 / math.sqrt(self.head_dim),
 			base_config=self.config,
 		)
-		self.resid_dropout = flax.linen.Dropout(rate=config.attention_dropout)
+		self.resid_dropout = nn.Dropout(rate=config.attention_dropout)
 		self.rotary = self.config.get_basic_rope(
 			head_size=config.hidden_size // config.num_attention_heads,
 			rotary_dim=config.hidden_size // config.num_attention_heads,
@@ -319,12 +319,11 @@ class FlaxQwen2MoeBlocKSparesTop2MLPCollection(nn.Module):
 	def setup(self) -> None:
 		self.layers = [
 			FlaxQwen2MoeMLP(
-				config=self.config,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				config=config,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 				intermediate_size=self.config.moe_intermediate_size,
-				name=str(i),
 			)
 			for i in range(self.config.num_experts)
 		]
@@ -382,32 +381,32 @@ class FlaxQwen2MoeSparseMoeBlock(nn.Module):
 		self.gate = Dense(
 			self.config.num_experts,
 			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			kernel_init=nn.initializers.normal(),
 		)
 
 		self.experts = FlaxQwen2MoeBlocKSparesTop2MLPCollection(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 		self.shared_expert = FlaxQwen2MoeMLP(
 			config=self.config,
 			intermediate_size=self.config.shared_expert_intermediate_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.shared_expert_gate = Dense(
 			1,
 			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 	def __call__(
@@ -482,29 +481,29 @@ class FlaxQwen2MoeBlock(nn.Module):
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 			)
 		self.self_attn = attn_block(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 		self.mlp = mlp_block(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.input_layernorm = RMSNorm(
 			dim=self.config.hidden_size,
 			eps=self.config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 		self.post_attention_layernorm = RMSNorm(
 			dim=self.config.hidden_size,
 			eps=self.config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 
 	def __call__(
@@ -580,11 +579,10 @@ class FlaxQwen2MoeBlockCollection(nn.Module):
 		self.blocks = [
 			FlaxQwen2MoeBlock(
 				self.config,
-				name=str(i),
 				layer_idx=i,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 			)
 			for i in range(self.config.num_hidden_layers)
 		]
@@ -701,20 +699,20 @@ class FlaxQwen2MoeModel(nn.Module):
 			self.config.vocab_size,
 			self.config.hidden_size,
 			embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 		self.layers = FlaxQwen2MoeBlockCollection(
-			self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.norm = RMSNorm(
 			self.config.hidden_size,
 			eps=self.config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 		self.causal_mask = make_causal_mask(
 			jnp.ones(
@@ -853,21 +851,21 @@ class FlaxQwen2MoeForCausalLM(nn.Module):
 	precision: Optional[Union[jax.lax.Precision, str]] = None
 
 	def setup(self):
-		self.model = FlaxQwen2MoeModel.flax_module(
-			self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+		self.model = FlaxQwen2MoeModel(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 		self.lm_head = Dense(
 			self.config.vocab_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
 			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 	def __call__(
@@ -993,19 +991,19 @@ class FlaxQwen2MoeForSequenceClassification(nn.Module):
 		Returns:
 		    A tuple of the model and the classifier
 		"""
-		self.model = FlaxQwen2MoeModel.flax_module(
-			self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+		self.model = FlaxQwen2MoeModel(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 		self.classifier = Dense(
 			self.num_classes,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
 			precision=self.precision,
 		)
 

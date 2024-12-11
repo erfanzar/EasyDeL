@@ -148,15 +148,15 @@ class Olmo2Attention(FlaxAttentionModule):
 		self.q_norm = RMSNorm(
 			self.num_heads * self.head_dim,
 			eps=config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 		self.k_norm = RMSNorm(
 			self.config.num_key_value_heads * self.head_dim,
 			eps=config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 		self.attention_performer = FlexibleAttentionModule(

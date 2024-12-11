@@ -75,7 +75,7 @@ class GPTJAttention(FlaxAttentionModule):
 			kernel_init=nn.initializers.normal(config.initializer_range),
 			param_dtype=param_dtype,
 			precision=precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 		self.q_proj, self.k_proj, self.v_proj = (
@@ -214,7 +214,7 @@ class GPTJMLP(nn.Module):
 			precision=precision,
 			kernel_init=kernel_init,
 			rngs=rngs,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.fc_out = nn.Linear(
 			intermediate_size,
@@ -224,7 +224,7 @@ class GPTJMLP(nn.Module):
 			precision=precision,
 			kernel_init=kernel_init,
 			rngs=rngs,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 		self.act = ACT2FN[config.activation_function]
@@ -380,8 +380,8 @@ class GPTJModel(EasyDeLBaseModule):
 		self.ln_f = nn.LayerNorm(
 			self.config.hidden_size,
 			epsilon=self.config.layer_norm_epsilon,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 
@@ -506,14 +506,14 @@ class GPTJForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 		self.lm_head = nn.Linear(
-			self.config.hidden_size,
-			self.config.vocab_size,
+			config.hidden_size,
+			config.vocab_size,
 			rngs=rngs,
 			dtype=self.dtype,
-			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
 			param_dtype=self.dtype,
 			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 	def __call__(

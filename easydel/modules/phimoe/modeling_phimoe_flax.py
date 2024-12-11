@@ -17,7 +17,6 @@ import math
 from typing import Optional, Tuple, Union
 
 import chex
-import flax.linen.partitioning
 import jax.lax
 from chex import Array
 from flax import linen as nn
@@ -56,10 +55,10 @@ class FlaxPhiMoEBlockSparseTop2MLP(nn.Module):
 	def setup(self) -> None:
 		dense_class = functools.partial(
 			nn.Dense,
-			kernel_init=nn.initializers.normal(self.config.initializer_range),
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			kernel_init=nn.initializers.normal(config.initializer_range),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			use_bias=False,
 		)
 		self.ffn_dim = self.config.intermediate_size
@@ -120,11 +119,11 @@ class FlaxPhiMoEAttention(FlaxAttentionModule):
 		dense_class = functools.partial(
 			Dense,
 			use_bias=config.attention_bias,
-			precision=self.precision,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-			**get_dot_general_by_bits(self.config.bits),
+			precision=precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 		self.q_proj = dense_class(self.num_heads * self.head_dim)
@@ -277,10 +276,9 @@ class FlaxPhiMoeBlocKSparesTop2MLPCollection(nn.Module):
 		self.layers = [
 			FlaxPhiMoEBlockSparseTop2MLP(
 				config=config,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
-				name=str(i),
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 			)
 			for i in range(self.config.num_local_experts)
 		]
@@ -353,17 +351,17 @@ class FlaxPhiMoeSparseMoeBlock(nn.Module):
 		self.gate = Dense(
 			self.config.num_local_experts,
 			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			kernel_init=nn.initializers.normal(),
 		)
 
 		self.experts = FlaxPhiMoeBlocKSparesTop2MLPCollection(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 	def __call__(
@@ -420,30 +418,32 @@ class FlaxPhiMoeDecoderLayer(nn.Module):
 				static_argnums=(1,),
 			)
 		self.self_attn = attn_block(
-			config=self.config,
-			layer_idx=self.layer_idx,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			layer_idx=layer_idx,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
 		self.block_sparse_moe = mlp_block(
-			config=self.config,
-			layer_idx=self.layer_idx,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			layer_idx=layer_idx,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
 		self.input_layernorm = nn.LayerNorm(
 			epsilon=self.config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=True,
 		)
 
 		self.post_attention_layernorm = nn.LayerNorm(
 			epsilon=self.config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=True,
 		)
 
@@ -534,10 +534,10 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
 	def setup(self) -> None:
 		self.layers = [
 			FlaxPhiMoeDecoderLayer(
-				config=self.config,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				config=config,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 				name=str(idx),
 				layer_idx=idx,
 			)
@@ -658,21 +658,21 @@ class FlaxPhiMoeModel(nn.Module):
 		self.embed_tokens = nn.Embed(
 			config.vocab_size,
 			config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 
-		self.embed_dropout = flax.linen.Dropout(config.embd_pdrop)
+		self.embed_dropout = nn.Dropout(config.embd_pdrop)
 		self.layers = FlaxPhiDecoderLayerCollection(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.norm = nn.LayerNorm(
 			epsilon=config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=True,
 		)
 		self.causal_mask = nn.make_causal_mask(
@@ -685,11 +685,11 @@ class FlaxPhiMoeModel(nn.Module):
 
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		past_key_values: Optional[TransformerCache] = None,
@@ -744,10 +744,10 @@ class FlaxPhiMoeModel(nn.Module):
 				attention_mask=attention_mask,
 				position_ids=position_ids,
 				cache_view=past_key_values.views[idx],
-				causal_mask=self.config.get_basic_causal_mask(),
+				causal_mask=self.causal_mask,
 				output_attentions=output_attentions,
 				segment_ids=segment_ids,
-				frequencies=self.config.get_basic_frequencies(),
+				frequencies=self.frequencies,
 			)
 			hidden_states = layer_outputs[0]
 
@@ -796,29 +796,29 @@ class FlaxPhiMoeForCausalLM(nn.Module):
 	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
-		self.model = FlaxPhiMoeModel.flax_module(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+		self.model = FlaxPhiMoeModel(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.vocab_size = self.config.vocab_size
 		self.lm_head = Dense(
 			self.config.vocab_size,
 			use_bias=self.config.lm_head_bias,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		past_key_values: Optional[TransformerCache] = None,

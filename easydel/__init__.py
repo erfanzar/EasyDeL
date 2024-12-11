@@ -222,24 +222,19 @@ from easydel.modules.olmo2 import (
 	Olmo2Model,
 )
 from easydel.modules.openelm import (
-	FlaxOpenELMForCausalLM,
-	FlaxOpenELMModel,
 	OpenELMConfig,
+	OpenELMForCausalLM,
+	OpenELMModel,
 )
 from easydel.modules.opt import (
-	FlaxOPTForCausalLM,
-	FlaxOPTModel,
 	OPTConfig,
-)
-from easydel.modules.palm import (
-	FlaxPalmForCausalLM,
-	FlaxPalmModel,
-	PalmConfig,
+	OPTForCausalLM,
+	OPTModel,
 )
 from easydel.modules.phi import (
-	FlaxPhiForCausalLM,
-	FlaxPhiModel,
 	PhiConfig,
+	PhiForCausalLM,
+	PhiModel,
 )
 from easydel.modules.phi3 import (
 	FlaxPhi3ForCausalLM,

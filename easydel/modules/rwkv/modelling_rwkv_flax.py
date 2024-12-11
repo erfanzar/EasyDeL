@@ -165,30 +165,30 @@ class FlaxRwkvSelfAttention(nn.Module):
 		self.key = Dense(
 			attention_hidden_size,
 			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.value = Dense(
 			attention_hidden_size,
 			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.receptance = Dense(
 			attention_hidden_size,
 			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.output = Dense(
 			hidden_size,
 			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 	def __call__(
@@ -280,23 +280,23 @@ class FlaxRwkvFeedForward(nn.Module):
 		self.key = Dense(
 			intermediate_size,
 			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.receptance = Dense(
 			hidden_size,
 			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.value = Dense(
 			hidden_size,
 			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 	def __call__(self, hidden, state):
@@ -332,28 +332,28 @@ class SingleStandFlaxRwkvBlock(nn.Module):
 
 		self.ln1 = nn.LayerNorm(
 			epsilon=config.layer_norm_epsilon,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 		self.ln2 = nn.LayerNorm(
 			epsilon=config.layer_norm_epsilon,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 
 		self.attention = FlaxRwkvSelfAttention(
 			config=config,
 			layer_id=layer_id,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.feed_forward = FlaxRwkvFeedForward(
 			config=config,
 			layer_id=layer_id,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 	def __call__(self, hidden, state=None, output_attentions: bool = False):
@@ -400,10 +400,10 @@ class FlaxRwkvBlockCollection(nn.Module):
 	def setup(self) -> None:
 		self.blocks = [
 			FlaxRwkvBlock(
-				config=self.config,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				config=config,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 				layer_id=idx,
 				name=str(idx),
 			)
@@ -617,19 +617,19 @@ class FlaxRwkvModel(nn.Module):
 		self.embeddings = nn.Embed(
 			config.vocab_size,
 			config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 		self.blocks = FlaxRwkvBlockCollection(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 		self.ln_out = nn.LayerNorm(
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 
 	def __call__(
@@ -742,18 +742,18 @@ class FlaxRwkvForCausalLM(nn.Module):
 
 	def setup(self):
 		config = self.config
-		self.rwkv = FlaxRwkvModel.flax_module(
+		self.rwkv = FlaxRwkvModel(
 			config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.head = Dense(
 			config.vocab_size,
 			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 	def __call__(

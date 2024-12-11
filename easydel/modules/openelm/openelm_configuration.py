@@ -131,7 +131,7 @@ class OpenELMConfig(EasyDeLBaseConfig):
 	"""
 
 	model_type: str = "openelm"
-
+	attribute_map = {"tie_word_embedding": "share_input_output_layers"}
 	def __init__(
 		self,
 		vocab_size: int = 32000,

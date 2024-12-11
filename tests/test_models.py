@@ -476,7 +476,11 @@ class EasyModelsTest(unittest.TestCase):
 			bos_token_id=1,
 			eos_token_id=2,
 		)
-		res, err = self.create_test_for_models("phi", transformers.PhiForCausalLM)
+		res, err = self.create_test_for_models(
+			"phi",
+			transformers.PhiForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.header_config = None
 		self.assertTrue(res, f"PHI 2 model Failed [ERROR {err}]")
 
@@ -572,7 +576,11 @@ class EasyModelsTest(unittest.TestCase):
 		for k, v in conf.__dict__.items():
 			setattr(conf_f, k, v)
 		self.header_config = conf_f
-		res, err = self.create_test_for_models("openelm", hf_model)
+		res, err = self.create_test_for_models(
+			"openelm",
+			hf_model,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.header_config = None
 		self.assertTrue(res, f"OpenELM model Failed [ERROR {err}]")
 
@@ -766,9 +774,9 @@ if __name__ == "__main__":
 	# test.test_mixtral()  # Passed
 	# test.test_mpt()  # Passed
 	# test.test_olmo()  # Passed
-	test.test_olmo2()  # Passed
-	# test.test_openelm()
-	# test.test_phi()
+	# test.test_olmo2()  # Passed
+	# test.test_openelm()  # Passed
+	test.test_phi()  # Passed
 	# test.test_phi3()
 	# test.test_phimoe()  # Failed v0.0.80 - N  Runtime
 	# test.test_qwen2()

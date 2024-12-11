@@ -86,7 +86,7 @@ def dropout_add(
 	The path without dropout (residual) allows us to backpropagate gradients through both paths at once.
 
 	Args:
-	    linen_drop: flax.linen.Dropout: Specify the dropout layer
+	    linen_drop: nn.Dropout: Specify the dropout layer
 	    x: chex.Array: Pass in the input to the dropout layer
 	    residual: chex.Array: Add the residual to the output of
 	        dropout_add
@@ -137,9 +137,9 @@ class FalconAttention(FlaxAttentionModule):
 			config.hidden_size,
 			qkv_out_dim,
 			rngs=rngs,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			use_bias=config.bias,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
@@ -148,8 +148,8 @@ class FalconAttention(FlaxAttentionModule):
 			qkv_out_dim,
 			config.hidden_size,
 			rngs=rngs,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=config.bias,
 			precision=self.precision,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
@@ -377,11 +377,11 @@ class FalconMlp(nn.Module):
 		self.rngs = rngs
 		linear = functools.partial(
 			nn.Linear,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			use_bias=self.config.bias,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.dense_h_to_4h = linear(
 			self.config.hidden_size,
@@ -464,16 +464,16 @@ class FalconBlock(nn.Module):
 
 		self.mlp = mlp_block(
 			config=config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 		self.self_attention = attn_block(
 			config=config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 
@@ -585,35 +585,35 @@ class FalconModel(EasyDeLBaseModule):
 		self.word_embeddings = nn.Embed(
 			num_embeddings=config.vocab_size,
 			features=config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 		self.h = [
 			FalconBlock(
-				config=self.config,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				config=config,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 				rngs=rngs,
 			)
 			for i in range(self.config.num_hidden_layers)
 		]
 		self.ln_f = nn.LayerNorm(
 			self.config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			epsilon=config.layer_norm_epsilon,
 			rngs=rngs,
 		)
 
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		past_key_values: Optional[TransformerCache] = None,
@@ -725,31 +725,31 @@ class FalconForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 		self.transformer = FalconModel(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 
 		self.lm_head = nn.Linear(
-			self.config.hidden_size,
-			self.config.vocab_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config.hidden_size,
+			config.vocab_size,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 			use_bias=False,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		past_key_values: Optional[TransformerCache] = None,

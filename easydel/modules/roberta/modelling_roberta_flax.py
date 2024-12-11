@@ -16,7 +16,6 @@ import math
 from typing import Optional
 
 import chex
-import flax.linen
 import jax
 from flax import linen as nn
 from flax.linen import Dense
@@ -77,7 +76,7 @@ class FlaxRobertaEmbeddings(nn.Module):
 			dtype=self.dtype,
 		)
 		self.LayerNorm = nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=self.dtype)
-		self.dropout = flax.linen.Dropout(rate=self.config.hidden_dropout_prob)
+		self.dropout = nn.Dropout(rate=self.config.hidden_dropout_prob)
 
 	def __call__(
 		self,
@@ -133,23 +132,23 @@ class FlaxRobertaSelfAttention(FlaxAttentionModule):
 		)
 		self.query = Dense(
 			self.config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
 		)
 		self.key = Dense(
 			self.config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
 		)
 		self.value = Dense(
 			self.config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
 		)
 
@@ -306,14 +305,14 @@ class FlaxRobertaSelfOutput(nn.Module):
 	def setup(self):
 		self.dense = Dense(
 			self.config.hidden_size,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
 		)
 		self.LayerNorm = nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=self.dtype)
-		self.dropout = flax.linen.Dropout(rate=self.config.hidden_dropout_prob)
+		self.dropout = nn.Dropout(rate=self.config.hidden_dropout_prob)
 
 	def __call__(self, hidden_states, input_tensor, deterministic: bool = True):
 		hidden_states = self.dense(hidden_states)
@@ -333,9 +332,9 @@ class FlaxRobertaAttention(nn.Module):
 		self.self = FlaxRobertaSelfAttention(
 			self.config,
 			causal=self.causal,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.output = FlaxRobertaSelfOutput(self.config, dtype=self.dtype)
 
@@ -378,10 +377,10 @@ class FlaxRobertaIntermediate(nn.Module):
 	def setup(self):
 		self.dense = Dense(
 			self.config.intermediate_size,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
 		)
 		self.activation = ACT2FN[self.config.hidden_act]
@@ -401,13 +400,13 @@ class FlaxRobertaOutput(nn.Module):
 	def setup(self):
 		self.dense = Dense(
 			self.config.hidden_size,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			dtype=self.dtype,
 			precision=self.precision,
 			param_dtype=self.param_dtype,
 			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
 		)
-		self.dropout = flax.linen.Dropout(rate=self.config.hidden_dropout_prob)
+		self.dropout = nn.Dropout(rate=self.config.hidden_dropout_prob)
 		self.LayerNorm = nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=self.dtype)
 
 	def __call__(self, hidden_states, attention_output, deterministic: bool = True):
@@ -427,9 +426,9 @@ class FlaxRobertaLayer(nn.Module):
 		self.attention = FlaxRobertaAttention(
 			self.config,
 			causal=self.config.is_decoder,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.intermediate = FlaxRobertaIntermediate(self.config, dtype=self.dtype)
 		self.output = FlaxRobertaOutput(self.config, dtype=self.dtype)
@@ -437,9 +436,9 @@ class FlaxRobertaLayer(nn.Module):
 			self.crossattention = FlaxRobertaAttention(
 				self.config,
 				causal=True,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 			)
 
 	def __call__(
@@ -508,10 +507,9 @@ class FlaxRobertaLayerCollection(nn.Module):
 		self.layers = [
 			block(
 				self.config,
-				name=str(i),
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 			)
 			for i in range(self.config.num_hidden_layers)
 		]
@@ -595,10 +593,10 @@ class FlaxRobertaEncoder(nn.Module):
 
 	def setup(self):
 		self.layer = FlaxRobertaLayerCollection(
-			self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 	def __call__(
@@ -637,10 +635,10 @@ class FlaxRobertaPooler(nn.Module):
 	def setup(self):
 		self.dense = Dense(
 			self.config.hidden_size,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
 		)
 
@@ -659,10 +657,10 @@ class FlaxRobertaLMHead(nn.Module):
 	def setup(self):
 		self.dense = Dense(
 			self.config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
 		)
 		self.layer_norm = nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=self.dtype)
@@ -672,7 +670,7 @@ class FlaxRobertaLMHead(nn.Module):
 			use_bias=False,
 			param_dtype=self.param_dtype,
 			precision=self.precision,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
 		)
 		self.bias = self.param("bias", jax.nn.initializers.zeros, (self.config.vocab_size,))
@@ -704,7 +702,7 @@ class FlaxRobertaClassificationHead(nn.Module):
 		self.dense = Dense(
 			self.config.hidden_size,
 			dtype=self.dtype,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			param_dtype=self.param_dtype,
 			precision=self.precision,
 			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
@@ -714,13 +712,13 @@ class FlaxRobertaClassificationHead(nn.Module):
 			if self.config.classifier_dropout is not None
 			else self.config.hidden_dropout_prob
 		)
-		self.dropout = flax.linen.Dropout(rate=classifier_dropout)
+		self.dropout = nn.Dropout(rate=classifier_dropout)
 		self.out_proj = Dense(
 			self.config.num_labels,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
 		)
 
@@ -751,22 +749,22 @@ class FlaxRobertaModel(nn.Module):
 
 	def setup(self):
 		self.embeddings = FlaxRobertaEmbeddings(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.encoder = FlaxRobertaEncoder(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.pooler = FlaxRobertaPooler(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 	def __call__(
@@ -839,18 +837,18 @@ class FlaxRobertaForMaskedLM(nn.Module):
 	precision: Optional[lax.Precision] = None
 
 	def setup(self):
-		self.roberta = FlaxRobertaModel.flax_module(
+		self.roberta = FlaxRobertaModel(
 			config=self.config,
 			add_pooling_layer=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.lm_head = FlaxRobertaLMHead(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 	def __call__(
@@ -914,7 +912,7 @@ class FlaxRobertaForSequenceClassification(nn.Module):
 	precision: Optional[lax.Precision] = None
 
 	def setup(self):
-		self.roberta = FlaxRobertaModel.flax_module(
+		self.roberta = FlaxRobertaModel(
 			config=self.config,
 			dtype=self.dtype,
 			add_pooling_layer=False,
@@ -922,10 +920,10 @@ class FlaxRobertaForSequenceClassification(nn.Module):
 			precision=self.precision,
 		)
 		self.classifier = FlaxRobertaClassificationHead(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 	def __call__(
@@ -974,18 +972,18 @@ class FlaxRobertaForMultipleChoice(nn.Module):
 	precision: Optional[lax.Precision] = None
 
 	def setup(self):
-		self.roberta = FlaxRobertaModel.flax_module(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+		self.roberta = FlaxRobertaModel(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
-		self.dropout = flax.linen.Dropout(rate=self.config.hidden_dropout_prob)
+		self.dropout = nn.Dropout(rate=self.config.hidden_dropout_prob)
 		self.classifier = Dense(
 			1,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
 		)
 
@@ -1058,7 +1056,7 @@ class FlaxRobertaForTokenClassification(nn.Module):
 	precision: Optional[lax.Precision] = None
 
 	def setup(self):
-		self.roberta = FlaxRobertaModel.flax_module(
+		self.roberta = FlaxRobertaModel(
 			config=self.config,
 			dtype=self.dtype,
 			add_pooling_layer=False,
@@ -1070,12 +1068,12 @@ class FlaxRobertaForTokenClassification(nn.Module):
 			if self.config.classifier_dropout is not None
 			else self.config.hidden_dropout_prob
 		)
-		self.dropout = flax.linen.Dropout(rate=classifier_dropout)
+		self.dropout = nn.Dropout(rate=classifier_dropout)
 		self.classifier = Dense(
 			self.config.num_labels,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
 		)
 
@@ -1126,7 +1124,7 @@ class FlaxRobertaForQuestionAnswering(nn.Module):
 	precision: Optional[lax.Precision] = None
 
 	def setup(self):
-		self.roberta = FlaxRobertaModel.flax_module(
+		self.roberta = FlaxRobertaModel(
 			config=self.config,
 			dtype=self.dtype,
 			add_pooling_layer=False,
@@ -1135,9 +1133,9 @@ class FlaxRobertaForQuestionAnswering(nn.Module):
 		)
 		self.qa_outputs = Dense(
 			self.config.num_labels,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
 		)
 
@@ -1199,18 +1197,18 @@ class FlaxRobertaForCausalLM(nn.Module):
 	precision: Optional[lax.Precision] = None
 
 	def setup(self):
-		self.roberta = FlaxRobertaModel.flax_module(
+		self.roberta = FlaxRobertaModel(
 			config=self.config,
 			add_pooling_layer=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.lm_head = FlaxRobertaLMHead(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 	def __call__(
