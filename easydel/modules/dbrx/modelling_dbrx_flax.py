@@ -740,7 +740,7 @@ class DbrxModel(EasyDeLBaseModule):
 			raise ValueError("you should specify input_embeds or input_ids one of them")
 		batch_size, sequence_length = input_embeds.shape[:2]
 		if attention_mask is None:
-			attention_mask = jnp.ones_like(input_ids)
+			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
 		if position_ids is None:
 			position_ids = jnp.broadcast_to(
 				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),

@@ -913,7 +913,7 @@ class FlaxT5PreTrainedModel(EasyDeLBaseModule):
 		# init input tensors
 		input_ids = jnp.zeros(input_shape, dtype="i4")
 
-		attention_mask = jnp.ones_like(input_ids)
+		attention_mask = jnp.ones((batch_size, sequence_length), "i4")
 		args = [input_ids, attention_mask]
 		if self.module_class not in [FlaxT5Encoder.flax_module]:
 			decoder_input_ids = jnp.ones_like(input_ids)
@@ -971,7 +971,7 @@ class FlaxT5PreTrainedModel(EasyDeLBaseModule):
 
 		# prepare encoder inputs
 		if attention_mask is None:
-			attention_mask = jnp.ones_like(input_ids)
+			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
 
 		# prepare decoder inputs
 		if decoder_attention_mask is None:
@@ -1039,7 +1039,7 @@ class FlaxT5PreTrainedModel(EasyDeLBaseModule):
 		return_dict = return_dict if return_dict is not None else self.config.return_dict
 
 		if attention_mask is None:
-			attention_mask = jnp.ones_like(input_ids)
+			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
 
 		# Handle any PRNG if needed
 		rngs = {}

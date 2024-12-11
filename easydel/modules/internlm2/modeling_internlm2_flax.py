@@ -668,7 +668,7 @@ class FlaxInternLM2ForCausalLM(nn.Module):
 			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
 		)
 		if attention_mask is None:
-			attention_mask = jnp.ones_like(input_ids)
+			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
 		if position_ids is None:
 			position_ids = jnp.broadcast_to(
 				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
@@ -783,7 +783,7 @@ class FlaxInternLM2ForSequenceClassification(nn.Module):
 			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
 		)
 		if attention_mask is None:
-			attention_mask = jnp.ones_like(input_ids)
+			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
 		if position_ids is None:
 			position_ids = jnp.broadcast_to(
 				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),

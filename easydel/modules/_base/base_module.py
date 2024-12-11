@@ -967,7 +967,7 @@ class EasyDeLBaseModule(nn.Module):
 class EasyDeLBaseVisionModule(EasyDeLBaseModule):
 	def init_cache(self, batch_size, max_length):
 		input_ids = jnp.ones((batch_size, max_length))
-		attention_mask = jnp.ones_like(input_ids)
+		attention_mask = jnp.ones((batch_size, sequence_length), "i4")
 		position_ids = jnp.broadcast_to(
 			jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape
 		)

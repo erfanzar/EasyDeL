@@ -39,7 +39,7 @@ def main():
 			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		),
-		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+		quantization_method=ed.EasyDeLQuantizationMethods.NF4,
 		platform=ed.EasyDeLPlatforms.TRITON,
 		param_dtype=dtype,
 		dtype=dtype,
