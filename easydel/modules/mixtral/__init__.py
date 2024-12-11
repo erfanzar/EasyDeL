@@ -14,8 +14,8 @@
 
 from easydel.modules.mixtral.mixtral_configuration import MixtralConfig
 from easydel.modules.mixtral.modelling_mixtral_flax import (
-	FlaxMixtralForCausalLM,
-	FlaxMixtralModel,
+	MixtralForCausalLM,
+	MixtralModel,
 )
 
-__all__ = "FlaxMixtralForCausalLM", "FlaxMixtralModel", "MixtralConfig"
+__all__ = "MixtralForCausalLM", "MixtralModel", "MixtralConfig"

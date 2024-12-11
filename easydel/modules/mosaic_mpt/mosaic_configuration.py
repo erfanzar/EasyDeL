@@ -161,6 +161,8 @@ class MptConfig(EasyDeLBaseConfig):
 		"num_attention_heads": "n_heads",
 		"hidden_size": "d_model",
 		"num_hidden_layers": "n_layers",
+		"max_position_embeddings": "max_seq_len",
+		"tie_word_embeddings": "use_lm_head",
 	}
 
 	def __init__(
@@ -176,7 +178,7 @@ class MptConfig(EasyDeLBaseConfig):
 		emb_prob_drop: float = 0.0,
 		learned_pos_emb: bool = True,
 		attn_config: Optional[MptAttentionConfig] = None,
-		init_device: str = "cpu",
+		init_device: str = "cpu",  # Ignored by EasyDeL.
 		logit_scale: Optional[Union[float, str]] = None,
 		no_bias: bool = True,
 		verbose: int = 0,

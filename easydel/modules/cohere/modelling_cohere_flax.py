@@ -634,7 +634,7 @@ class CohereForCausalLM(EasyDeLBaseModule):
 		if position_ids is None:
 			position_ids = jnp.broadcast_to(
 				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-				(batch_size, seq_length),
+				(batch_size, sequence_length),
 			)
 		outputs = self.model(
 			input_ids=input_ids,

@@ -21,8 +21,8 @@ from jax import numpy as jnp
 from transformers import AutoTokenizer
 
 from easydel import (
-	FlaxMistralForCausalLM,
 	MistralConfig,
+	MistralForCausalLM,
 	ORPOConfig,
 	ORPOTrainer,
 )
@@ -52,7 +52,7 @@ def orpo_main():
 			max_position_embeddings=SEQUENCE_LENGTH * 4,
 		)
 
-		model = FlaxMistralForCausalLM(
+		model = MistralForCausalLM(
 			config=conf,
 			dtype=jnp.float32,
 			param_dtype=jnp.float32,

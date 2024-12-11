@@ -21,7 +21,7 @@ def main():
 	sharding_axis_dims = (1, 1, 1, -1)
 	max_length = 6144
 
-	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
+	pretrained_model_name_or_path = "meta-llama/Llama-3.1-8B-Instruct"
 	dtype = jnp.float16
 	partition_axis = ed.PartitionAxis()
 
@@ -39,7 +39,7 @@ def main():
 			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		),
-		quantization_method=ed.EasyDeLQuantizationMethods.NF4,
+		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 		platform=ed.EasyDeLPlatforms.TRITON,
 		param_dtype=dtype,
 		dtype=dtype,
@@ -47,6 +47,7 @@ def main():
 		partition_axis=partition_axis,
 		precision=jax.lax.Precision("fastest"),
 	)
+
 	tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
 	tokenizer.padding_side = "left"
 	tokenizer.pad_token_id = tokenizer.eos_token_id

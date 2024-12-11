@@ -24,7 +24,7 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from transformers import AutoTokenizer
 
-from easydel import FlaxMistralForCausalLM, MistralConfig, TrainingArguments
+from easydel import MistralConfig, MistralForCausalLM, TrainingArguments
 from easydel.trainers import conversations_formatting_function
 from easydel.trainers.supervised_fine_tuning_trainer import SFTTrainer
 
@@ -50,7 +50,7 @@ def main():
 
 	train_dataset = load_dataset("HuggingFaceH4/deita-10k-v0-sft", split="train_sft")
 
-	model = FlaxMistralForCausalLM(config=config, _do_init=True)
+	model = MistralForCausalLM(config=config, _do_init=True)
 	params = model.shard_model(model.params)
 
 	def _sh(*a, **kw):

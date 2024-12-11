@@ -13,9 +13,9 @@
 # limitations under the License.
 
 from easydel.modules.olmo.modeling_olmo_flax import (
-	FlaxOlmoForCausalLM,
-	FlaxOlmoModel,
+	OlmoForCausalLM,
+	OlmoModel,
 )
 from easydel.modules.olmo.olmo_configuration import OlmoConfig
 
-__all__ = "FlaxOlmoForCausalLM", "FlaxOlmoModel", "OlmoConfig"
+__all__ = "OlmoForCausalLM", "OlmoModel", "OlmoConfig"

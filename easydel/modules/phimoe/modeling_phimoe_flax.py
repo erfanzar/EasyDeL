@@ -22,7 +22,6 @@ import jax.lax
 from chex import Array
 from flax import linen as nn
 from flax.linen import Dense
-from flax.linen import partitioning as nn_partitioning
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
@@ -45,8 +44,6 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 )
 from easydel.modules.phimoe.phimoe_configuration import PhiMoeConfig as PhiMoeConfig
-
-re_mat = nn_partitioning.remat
 
 
 class FlaxPhiMoEBlockSparseTop2MLP(nn.Module):
@@ -412,12 +409,12 @@ class FlaxPhiMoeDecoderLayer(nn.Module):
 		attn_block = FlaxPhiMoEAttention
 		mlp_block = FlaxPhiMoeSparseMoeBlock
 		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
-			attn_block = re_mat(
+			attn_block = nn.remat(
 				attn_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 				static_argnums=(3, 4, 6, 7, 9),
 			)
-			mlp_block = re_mat(
+			mlp_block = nn.remat(
 				mlp_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 				static_argnums=(1,),
@@ -845,7 +842,7 @@ class FlaxPhiMoeForCausalLM(nn.Module):
 		Returns:
 		    FlaxCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
-		batch_size, seq_length = (
+		batch_size, sequence_length = (
 			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
 		)
 		if attention_mask is None:
@@ -853,7 +850,7 @@ class FlaxPhiMoeForCausalLM(nn.Module):
 		if position_ids is None:
 			position_ids = jnp.broadcast_to(
 				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-				(batch_size, seq_length),
+				(batch_size, sequence_length),
 			)
 		outputs = self.model(
 			input_ids=input_ids,

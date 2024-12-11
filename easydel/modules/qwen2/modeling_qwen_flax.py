@@ -716,7 +716,7 @@ class FlaxQwen2ForCausalLM(nn.Module):
 		    FlaxCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
 
-		batch_size, seq_length = (
+		batch_size, sequence_length = (
 			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
 		)
 		if attention_mask is None:
@@ -724,7 +724,7 @@ class FlaxQwen2ForCausalLM(nn.Module):
 		if position_ids is None:
 			position_ids = jnp.broadcast_to(
 				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-				(batch_size, seq_length),
+				(batch_size, sequence_length),
 			)
 		outputs = self.model(
 			input_ids=input_ids,
@@ -826,7 +826,7 @@ class FlaxQwen2ForSequenceClassification(nn.Module):
 		    FlaxCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
 
-		batch_size, seq_length = (
+		batch_size, sequence_length = (
 			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
 		)
 		if attention_mask is None:
@@ -834,7 +834,7 @@ class FlaxQwen2ForSequenceClassification(nn.Module):
 		if position_ids is None:
 			position_ids = jnp.broadcast_to(
 				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-				(batch_size, seq_length),
+				(batch_size, sequence_length),
 			)
 		outputs = self.model(
 			input_ids=input_ids,
