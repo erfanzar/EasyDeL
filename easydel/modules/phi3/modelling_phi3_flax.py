@@ -22,7 +22,6 @@ import jax.lax
 from chex import Array
 from flax import linen as nn
 from flax.linen import Dense
-from flax.linen import partitioning as nn_partitioning
 from jax import numpy as jnp
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
@@ -43,8 +42,6 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxCausalLMOutput,
 )
 from easydel.modules.phi3.phi3_configuration import Phi3Config as Phi3Config
-
-re_mat = nn_partitioning.remat
 
 
 class FlaxPhi3MLP(nn.Module):
@@ -275,12 +272,12 @@ class FlaxPhi3DecoderLayer(nn.Module):
 		attn_block = FlaxPhi3Attention
 		mlp_block = FlaxPhi3MLP
 		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
-			attn_block = re_mat(
+			attn_block = nn.remat(
 				attn_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 				static_argnums=(3, 4, 6, 7, 9),
 			)
-			mlp_block = re_mat(
+			mlp_block = nn.remat(
 				mlp_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 				static_argnums=(1,),
@@ -710,7 +707,7 @@ class FlaxPhi3ForCausalLM(nn.Module):
 		Returns:
 		    FlaxCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
-		batch_size, seq_length = (
+		batch_size, sequence_length = (
 			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
 		)
 		if attention_mask is None:
@@ -718,7 +715,7 @@ class FlaxPhi3ForCausalLM(nn.Module):
 		if position_ids is None:
 			position_ids = jnp.broadcast_to(
 				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-				(batch_size, seq_length),
+				(batch_size, sequence_length),
 			)
 		outputs = self.model(
 			input_ids=input_ids,

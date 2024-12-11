@@ -18,9 +18,9 @@ from jax import random
 from easydel import (
 	AttentionMechanisms,
 	CausalLanguageModelTrainer,
-	FlaxMistralForCausalLM,
 	LoraRaptureConfig,
 	MistralConfig,
+	MistralForCausalLM,
 	TrainingArguments,
 )
 
@@ -48,7 +48,7 @@ def main(use_iterable_dataset: bool):
 		block_q=128,
 	)
 
-	model = FlaxMistralForCausalLM(config=config, _do_init=True)
+	model = MistralForCausalLM(config=config, _do_init=True)
 	params = model.params
 
 	def data_generator(num_rows: int):

@@ -44,7 +44,7 @@ def main():
 
 	train_dataset = load_dataset("LDJnr/Pure-Dove", split="train[:5%]")
 
-	model = ed.FlaxMistralForCausalLM(config=config, _do_init=True)
+	model = ed.MistralForCausalLM(config=config, _do_init=True)
 	params = model.shard_model(model.params)
 
 	prompter = create_prompt_creator(tokenizer)

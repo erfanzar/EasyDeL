@@ -14,18 +14,14 @@
 
 from easydel.modules.mistral.mistral_configuration import (
 	MistralConfig,
-	VisionMistralConfig,
 )
 from easydel.modules.mistral.modelling_mistral_flax import (
-	FlaxMistralForCausalLM,
-	FlaxMistralModel,
-	FlaxVisionMistralForCausalLM,
+	MistralForCausalLM,
+	MistralModel,
 )
 
 __all__ = (
-	"FlaxMistralForCausalLM",
-	"FlaxMistralModel",
-	"FlaxVisionMistralForCausalLM",
+	"MistralForCausalLM",
+	"MistralModel",
 	"MistralConfig",
-	"VisionMistralConfig",
 )

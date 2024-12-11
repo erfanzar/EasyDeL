@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import math
-from functools import cached_property, partial
+from functools import partial
 from typing import Optional, Tuple, Union
 
 import chex
@@ -49,6 +49,57 @@ from easydel.modules.modeling_flax_outputs import (
 )
 
 
+class LlamaMLP(nn.Module):
+	def __init__(
+		self,
+		config: LlamaConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		linear_class = partial(
+			nn.Linear,
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+			use_bias=self.config.mlp_bias,
+			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			precision=self.precision,
+			rngs=rngs,
+			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+		)
+		self.gate_proj = linear_class(
+			config.hidden_size,
+			config.intermediate_size,
+			rngs=rngs,
+		)
+		self.down_proj = linear_class(
+			config.intermediate_size,
+			config.hidden_size,
+			rngs=rngs,
+		)
+		self.up_proj = linear_class(
+			config.hidden_size,
+			config.intermediate_size,
+			rngs=rngs,
+		)
+		self.dropout = nn.Dropout(rate=self.config.resid_pdrop, rngs=rngs)
+		self.act_fn = ACT2FN[self.config.hidden_act]
+
+	def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
+		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
+		hidden_states = self.down_proj(
+			self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+		)
+		hidden_states = self.dropout(hidden_states)
+		return hidden_states
+
+
 class LlamaAttention(FlaxAttentionModule):
 	def __init__(
 		self,
@@ -77,12 +128,12 @@ class LlamaAttention(FlaxAttentionModule):
 
 		linear_class = partial(
 			nn.Linear,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			use_bias=self.config.attention_bias,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			use_bias=config.attention_bias,
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
+			precision=precision,
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.q_proj = linear_class(
 			config.hidden_size,
@@ -216,56 +267,7 @@ class LlamaAttention(FlaxAttentionModule):
 		return outputs
 
 
-class LlamaMLP(nn.Module):
-	def __init__(
-		self,
-		config: LlamaConfig,
-		dtype: jnp.dtype = jnp.float32,
-		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
-		*,
-		rngs: nn.Rngs,
-	):
-		self.config = config
-		self.dtype = dtype
-		self.param_dtype = param_dtype
-		self.precision = precision
-		linear_class = partial(
-			nn.Linear,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			use_bias=self.config.mlp_bias,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-			precision=self.precision,
-			rngs=rngs,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
-		)
-		self.gate_proj = linear_class(
-			config.hidden_size,
-			config.intermediate_size,
-			rngs=rngs,
-		)
-		self.down_proj = linear_class(
-			config.intermediate_size,
-			config.hidden_size,
-			rngs=rngs,
-		)
-		self.up_proj = linear_class(
-			config.hidden_size,
-			config.intermediate_size,
-			rngs=rngs,
-		)
-		self.dropout = nn.Dropout(rate=self.config.resid_pdrop, rngs=rngs)
-		self.act_fn = ACT2FN[self.config.hidden_act]
-
-	def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-		x = control_mlp_sharding(x, self.config.partition_axis)
-		x = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-		x = self.dropout(x)
-		return x
-
-
-class LlamaBlock(nn.Module):
+class LlamaDecoderLayer(nn.Module):
 	def __init__(
 		self,
 		config: LlamaConfig,
@@ -295,32 +297,32 @@ class LlamaBlock(nn.Module):
 			)
 
 		self.self_attn = attn_block(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 
 		self.mlp = mlp_block(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 		self.input_layernorm = RMSNorm(
-			dim=self.config.hidden_size,
-			eps=self.config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dim=config.hidden_size,
+			eps=config.rms_norm_eps,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 		self.post_attention_layernorm = RMSNorm(
-			dim=self.config.hidden_size,
-			eps=self.config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dim=config.hidden_size,
+			eps=config.rms_norm_eps,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 
@@ -373,14 +375,6 @@ class LlamaBlock(nn.Module):
 	embedding_layer_names=["embed_tokens"],
 )
 class LlamaModel(EasyDeLBaseModule):
-	"""
-	Attributes:
-		config (LlamaConfig): Configuration for the attention module.
-		dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
-		param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
-		precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
-	"""
-
 	def __init__(
 		self,
 		config: LlamaConfig,
@@ -408,7 +402,7 @@ class LlamaModel(EasyDeLBaseModule):
 		)
 		self.dropout = nn.Dropout(rate=self.config.embd_pdrop, rngs=rngs)
 		self.layers = [
-			LlamaBlock(
+			LlamaDecoderLayer(
 				config=self.config,
 				dtype=self.dtype,
 				param_dtype=self.param_dtype,
@@ -425,24 +419,16 @@ class LlamaModel(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 
-	@cached_property
-	def causal_mask(self):
-		return self.config.get_basic_causal_mask()
-
-	@cached_property
-	def frequencies(self):
-		return self.config.get_basic_frequencies()
-
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
+		past_key_values: Optional[TransformerCache] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
-		past_key_values: Optional[TransformerCache] = None,
 		return_dict: bool = True,
 	) -> Union[FlaxBaseModelOutput, Tuple]:
 		if input_embeds is None and input_ids is not None:
@@ -558,11 +544,11 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
 		past_key_values: Optional[TransformerCache] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		return_dict: bool = True,
@@ -643,10 +629,10 @@ class FlaxLlamaForSequenceClassification(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
+		segment_ids: Optional[chex.Array] = None, 
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		return_dict: bool = True,

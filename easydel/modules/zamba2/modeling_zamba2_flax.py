@@ -19,7 +19,6 @@ from typing import Optional, Tuple, Union
 import chex
 import jax
 from flax.linen import Dense, combine_masks
-from flax.linen import partitioning as nn_partitioning
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
@@ -32,7 +31,6 @@ from easydel.modules._base.flax_modeling_utils import (
 )
 from easydel.modules.zamba2.zamba2_configuration import Zamba2Config
 
-re_mat = nn_partitioning.remat
 logger = get_logger(__name__)
 
 

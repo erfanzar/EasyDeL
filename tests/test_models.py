@@ -324,11 +324,15 @@ class EasyModelsTest(unittest.TestCase):
 		self.header_config = ed.MptConfig(
 			d_model=self.hidden_size,
 			n_heads=self.num_attention_heads,
-			n_layers=1,
+			n_layers=4,
 			attn_config=ed.MptAttentionConfig(),
 			axis_dims=(1, 1, 1, -1),
 		)
-		res, err = self.create_test_for_models("mpt", transformers.MptForCausalLM)
+		res, err = self.create_test_for_models(
+			"mpt",
+			transformers.MptForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.header_config = None
 		self.assertTrue(res, f"MPT model Failed [ERROR {err}]")
 
@@ -345,24 +349,40 @@ class EasyModelsTest(unittest.TestCase):
 
 	def test_mistral(self):
 		self.header_config = None
-		res, err = self.create_test_for_models("mistral", transformers.MistralForCausalLM)
+		res, err = self.create_test_for_models(
+			"mistral",
+			transformers.MistralForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"Mistral model Failed [ERROR {err}]")
 
 	def test_exaone(self):
 		self.header_config = None
 		hf_model, conf = self.get_hf_model_from_hub("LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct")
-		res, err = self.create_test_for_models("exaone", hf_model, ed.TaskType.CAUSAL_LM)
+		res, err = self.create_test_for_models(
+			"exaone",
+			hf_model,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"EXAONE model Failed [ERROR {err}]")
 
 	def test_internlm2(self):
 		self.header_config = None
 		hf_model, conf = self.get_hf_model_from_hub("internlm/internlm2_5-7b-chat")
-		res, err = self.create_test_for_models("internlm2", hf_model)
+		res, err = self.create_test_for_models(
+			"internlm2",
+			hf_model,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"INTERNLM2 model Failed [ERROR {err}]")
 
 	def test_mixtral(self):
 		self.header_config = None
-		res, err = self.create_test_for_models("mixtral", transformers.MixtralForCausalLM)
+		res, err = self.create_test_for_models(
+			"mixtral",
+			transformers.MixtralForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"Mixtral model Failed [ERROR {err}]")
 
 	def test_gpt2(self):
@@ -416,13 +436,21 @@ class EasyModelsTest(unittest.TestCase):
 
 	def test_olmo(self):
 		self.header_config = None
-		res, err = self.create_test_for_models("olmo", transformers.OlmoForCausalLM)
+		res, err = self.create_test_for_models(
+			"olmo",
+			transformers.OlmoForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"OLMo model Failed [ERROR {err}]")
 
 	def test_olmo2(self):
 		self.header_config = None
-		res, err = self.create_test_for_models("olmo2", transformers.Olmo2ForCausalLM)
-		self.assertTrue(res, f"OLMo model Failed [ERROR {err}]")
+		res, err = self.create_test_for_models(
+			"olmo2",
+			transformers.Olmo2ForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
+		self.assertTrue(res, f"OLMo2 model Failed [ERROR {err}]")
 
 	def test_phi(self):
 		self.header_config = ed.PhiConfig(
@@ -551,7 +579,11 @@ class EasyModelsTest(unittest.TestCase):
 	def test_arctic(self):
 		self.header_config = None
 		hf_model, conf = self.get_hf_model_from_hub("Snowflake/snowflake-arctic-instruct")
-		res, err = self.create_test_for_models("arctic", hf_model, ed.TaskType.CAUSAL_LM)
+		res, err = self.create_test_for_models(
+			"arctic",
+			hf_model,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"ARCTIC model Failed [ERROR {err}]")
 
 	def test_rwkv(self):
@@ -602,7 +634,11 @@ class EasyModelsTest(unittest.TestCase):
 
 	def test_moe_mixtral(self):
 		self.header_config = None
-		res = self.create_moe_test_for_models("mixtral", transformers.MixtralForCausalLM)
+		res = self.create_moe_test_for_models(
+			"mixtral",
+			transformers.MixtralForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res)
 
 	def test_moe_qwen2_moe(self):
@@ -720,17 +756,17 @@ if __name__ == "__main__":
 	# test.test_gemma2()  # Passed
 	# test.test_gptj()  # Passed
 	# test.test_gpt_noex()  # Failed
-	test.test_gpt2()
-	# test.test_grok1() # should be impl
-	# test.test_internlm2()
-	# test.test_llama() # Pass
+	# test.test_gpt2()  # Passed
+	# test.test_grok1() # Not Tested Yet!
+	# test.test_internlm2()  # Passed
+	# test.test_llama() # Passed
 	# test.test_mamba()
 	# test.test_mamba2()
-	# test.test_mistral()
-	# test.test_mixtral()
-	# test.test_mpt()
-	# test.test_olmo()
-	# test.test_olmo2()
+	# test.test_mistral()  # Passed
+	# test.test_mixtral()  # Passed
+	# test.test_mpt()  # Passed
+	# test.test_olmo()  # Passed
+	test.test_olmo2()  # Passed
 	# test.test_openelm()
 	# test.test_phi()
 	# test.test_phi3()

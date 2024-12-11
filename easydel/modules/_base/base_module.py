@@ -54,6 +54,11 @@ from easydel.layers.caching import (
 from easydel.modules._base.base_config import EasyDeLBaseConfig
 from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN, EasyQuantizer
 from easydel.utils.traversals import flatten_dict, unflatten_dict
+from easydel.modules.modeling_flax_outputs import (
+	FlaxBaseModelOutput,
+	FlaxCausalLMOutput,
+	FlaxSequenceClassifierOutput,
+)
 
 logger = get_logger(__name__)
 
@@ -963,11 +968,37 @@ class EasyDeLBaseModule(nn.Module):
 		self = nn.merge(gdef, state, other)
 		return self
 
+	@tp.overload
+	def __call__(
+		self,
+		input_ids: tp.Optional[chex.Array] = None,
+		input_embeds: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		return_dict: bool = True,
+	) -> tp.Union[FlaxCausalLMOutput, tp.Tuple]: ...
+	@tp.overload
+	def __call__(
+		self,
+		input_ids: tp.Optional[chex.Array] = None,
+		input_embeds: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		return_dict: bool = True,
+	) -> tp.Union[FlaxSequenceClassifierOutput, tp.Tuple]: ...
+
 
 class EasyDeLBaseVisionModule(EasyDeLBaseModule):
 	def init_cache(self, batch_size, max_length):
 		input_ids = jnp.ones((batch_size, max_length))
-		attention_mask = jnp.ones((batch_size, sequence_length), "i4")
+		attention_mask = jnp.ones((batch_size, max_length), "i4")
 		position_ids = jnp.broadcast_to(
 			jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape
 		)

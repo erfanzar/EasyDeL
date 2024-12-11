@@ -96,10 +96,10 @@ from easydel.modules.grok_1 import (
 	Grok1Config,
 )
 from easydel.modules.internlm2.modeling_internlm2_flax import (
-	FlaxInternLM2ForCausalLM,
-	FlaxInternLM2ForSequenceClassification,
-	FlaxInternLM2Model,
 	InternLM2Config,
+	InternLM2ForCausalLM,
+	InternLM2ForSequenceClassification,
+	InternLM2Model,
 )
 from easydel.modules.llama import (
 	LlamaConfig,
@@ -121,32 +121,30 @@ from easydel.modules.mamba2 import (
 	Mamba2Config,
 )
 from easydel.modules.mistral import (
-	FlaxMistralForCausalLM,
-	FlaxMistralModel,
-	FlaxVisionMistralForCausalLM,
 	MistralConfig,
-	VisionMistralConfig,
+	MistralForCausalLM,
+	MistralModel,
 )
 from easydel.modules.mixtral import (
-	FlaxMixtralForCausalLM,
-	FlaxMixtralModel,
 	MixtralConfig,
+	MixtralForCausalLM,
+	MixtralModel,
 )
 from easydel.modules.mosaic_mpt import (
-	FlaxMptForCausalLM,
-	FlaxMptModel,
 	MptAttentionConfig,
 	MptConfig,
+	MptForCausalLM,
+	MptModel,
 )
 from easydel.modules.olmo import (
-	FlaxOlmoForCausalLM,
-	FlaxOlmoModel,
 	OlmoConfig,
+	OlmoForCausalLM,
+	OlmoModel,
 )
 from easydel.modules.olmo2 import (
-	FlaxOlmo2ForCausalLM,
-	FlaxOlmo2Model,
 	Olmo2Config,
+	Olmo2ForCausalLM,
+	Olmo2Model,
 )
 from easydel.modules.openelm import (
 	FlaxOpenELMForCausalLM,

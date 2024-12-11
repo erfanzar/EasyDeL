@@ -33,8 +33,8 @@ from easydel import (
 	CausalLanguageModelTrainer,
 	EasyDeLOptimizers,
 	EasyDeLSchedulers,
-	FlaxMistralForCausalLM,
 	MistralConfig,
+	MistralForCausalLM,
 	TrainingArguments,
 )
 
@@ -62,7 +62,7 @@ def main(use_iterable_dataset: bool):
 		block_q=128,
 	)
 
-	model = FlaxMistralForCausalLM(config=config, _do_init=True)
+	model = MistralForCausalLM(config=config, _do_init=True)
 	params = model.shard_model(model.params)
 
 	def data_generator(num_rows: int):
