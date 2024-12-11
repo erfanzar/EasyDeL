@@ -65,13 +65,13 @@ class LlamaMLP(nn.Module):
 		self.precision = precision
 		linear_class = partial(
 			nn.Linear,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=self.config.mlp_bias,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
 			rngs=rngs,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.gate_proj = linear_class(
 			config.hidden_size,
@@ -395,18 +395,18 @@ class LlamaModel(EasyDeLBaseModule):
 		self.embed_tokens = nn.Embed(
 			num_embeddings=self.config.vocab_size,
 			features=self.config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
 			rngs=rngs,
 		)
 		self.dropout = nn.Dropout(rate=self.config.embd_pdrop, rngs=rngs)
 		self.layers = [
 			LlamaDecoderLayer(
-				config=self.config,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				config=config,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 				rngs=rngs,
 			)
 			for _ in range(self.config.num_hidden_layers)
@@ -414,8 +414,8 @@ class LlamaModel(EasyDeLBaseModule):
 		self.norm = RMSNorm(
 			self.config.hidden_size,
 			eps=self.config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 
@@ -462,10 +462,10 @@ class LlamaModel(EasyDeLBaseModule):
 				attention_mask=attention_mask,
 				position_ids=position_ids,
 				cache_view=past_key_values.views[idx],
-				causal_mask=self.config.get_basic_causal_mask(),
+				causal_mask=self.causal_mask,
 				output_attentions=output_attentions,
 				segment_ids=segment_ids,
-				frequencies=self.config.get_basic_frequencies(),
+				frequencies=self.frequencies,
 			)
 			hidden_states = layer_outputs[0]
 
@@ -522,23 +522,23 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 		self.model = LlamaModel(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 
 		self.lm_head = nn.Linear(
-			self.config.hidden_size,
-			self.config.vocab_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			config.hidden_size,
+			config.vocab_size,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
 			precision=self.precision,
 			rngs=rngs,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 	def __call__(
@@ -610,19 +610,19 @@ class FlaxLlamaForSequenceClassification(EasyDeLBaseModule):
 		)
 		self.num_labels = num_labels
 		self.model = LlamaModel(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 		self.score = nn.Linear(
 			self.config.hidden_size,
 			self.num_labels,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
 			precision=self.precision,
 		)
 
@@ -632,7 +632,7 @@ class FlaxLlamaForSequenceClassification(EasyDeLBaseModule):
 		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None, 
+		segment_ids: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		return_dict: bool = True,

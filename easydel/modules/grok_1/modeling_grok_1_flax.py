@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import cached_property
 import math
+from functools import cached_property
 from typing import Optional, Tuple, Union
 
 import chex
@@ -83,46 +83,46 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 		self.q_proj = nn.Linear(
 			config.hidden_size,
 			config.num_attention_heads * self.head_dim,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
 			rngs=rngs,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.k_proj = nn.Linear(
 			config.hidden_size,
 			config.num_key_value_heads * self.head_dim,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
 			rngs=rngs,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.v_proj = nn.Linear(
 			config.hidden_size,
 			config.num_key_value_heads * self.head_dim,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
 			rngs=rngs,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.o_proj = nn.Linear(
 			config.num_attention_heads * self.head_dim,
 			config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
 			rngs=rngs,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 		self.rotary = self.config.get_basic_rope(
@@ -144,7 +144,7 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 			sm_scale=1 / math.sqrt(self.head_dim),
 			base_config=self.config,
 		)
-		self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
+		self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
 
 	def _merge_heads(self, hidden_states):
 		"""
@@ -283,35 +283,35 @@ class FlaxGrok1BLockSparseMLP(nn.Module):
 		self.linear = nn.Linear(
 			config.hidden_size,
 			config.intermediate_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
 			rngs=rngs,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.linear_1 = nn.Linear(
 			config.intermediate_size,
 			config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
 			rngs=rngs,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.linear_v = nn.Linear(
 			config.hidden_size,
 			config.intermediate_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
 			rngs=rngs,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 	def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
@@ -341,18 +341,18 @@ class FlaxGrok1SparseMoeBlock(nn.Module):
 			self.config.hidden_size,
 			self.config.num_experts,
 			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			kernel_init=nn.initializers.normal(),
 		)
 
 		self.experts = [
 			FlaxGrok1BLockSparseMLP(
-				config=self.config,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				config=config,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 				rngs=rngs,
 			)
 			for i in range(self.config.num_experts)
@@ -425,44 +425,44 @@ class FlaxGrok1DecoderLayer(nn.Module):
 		self.attn = attn_block(
 			config=self.config,
 			layer_index=self.layer_index,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 		self.moe_block = mlp_block(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 		self.pre_attn_norm = FlaxGrok1RMSNorm(
 			dim=self.config.hidden_size,
 			eps=self.config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 		self.post_attn_norm = FlaxGrok1RMSNorm(
 			dim=self.config.hidden_size,
 			eps=self.config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 		self.pre_moe_norm = FlaxGrok1RMSNorm(
 			dim=self.config.hidden_size,
 			eps=self.config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 		self.post_moe_norm = FlaxGrok1RMSNorm(
 			dim=self.config.hidden_size,
 			eps=self.config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 
@@ -554,18 +554,18 @@ class FlaxGrok1Model(EasyDeLBaseModule):
 		self.embed_tokens = nn.Embed(
 			self.config.vocab_size,
 			self.config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 
 		self.layers = [
 			FlaxGrok1DecoderLayer(
 				layer_index=layer_index,
-				config=self.config,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				config=config,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 				rngs=rngs,
 			)
 			for layer_index in range(self.config.num_hidden_layers)
@@ -574,8 +574,8 @@ class FlaxGrok1Model(EasyDeLBaseModule):
 		self.norm = FlaxGrok1RMSNorm(
 			self.config.hidden_size,
 			eps=self.config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 
@@ -730,22 +730,22 @@ class FlaxGrok1ForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 		self.model = FlaxGrok1Model(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 		self.lm_head = nn.Linear(
-			self.config.hidden_size,
-			self.config.vocab_size,
+			config.hidden_size,
+			config.vocab_size,
 			dtype=self.dtype,
 			rngs=rngs,
 			param_dtype=self.param_dtype,
 			precision=self.precision,
 			use_bias=False,
-			kernel_init=nn.initializers.normal(self.config.initializer_range),
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			kernel_init=nn.initializers.normal(config.initializer_range),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 		self.output_multiplier_scale = self.config.output_multiplier_scale

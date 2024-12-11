@@ -84,7 +84,7 @@ class MixtralAttention(FlaxAttentionModule):
 			param_dtype=param_dtype,
 			precision=precision,
 			kernel_init=nn.initializers.normal(),
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 		self.q_proj = linear(

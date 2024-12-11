@@ -405,9 +405,9 @@ class FlaxMambaMixer(nn.Module):
 			stride=1,
 			padding=config.conv_kernel - 1,
 			use_bias=config.use_conv_bias,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 		self.activation = config.hidden_act
@@ -449,10 +449,10 @@ class FlaxMambaMixer(nn.Module):
 
 		dense_class = functools.partial(
 			Dense,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.in_proj = dense_class(intermediate_size * 2, use_bias=config.use_bias)
 		self.x_proj = dense_class(time_step_rank + ssm_state_size * 2, use_bias=False)
@@ -584,8 +584,8 @@ class FlaxMambaBlock(nn.Module):
 		self.norm = MambaRMSNorm(
 			config.hidden_size,
 			eps=config.layer_norm_epsilon,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 		block = FlaxMambaMixer
 		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
@@ -621,9 +621,9 @@ class FlaxMambaLayerCollection(nn.Module):
 			FlaxMambaBlock(
 				config=self.config,
 				layer_idx=layer_idx,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 				name=str(layer_idx),
 			)
 			for layer_idx in range(self.config.num_hidden_layers)
@@ -656,21 +656,21 @@ class FlaxMambaModule(nn.Module):
 		self.embeddings = nn.Embed(
 			config.vocab_size,
 			config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 		self.layers = FlaxMambaLayerCollection(
 			config=config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 		self.norm_f = MambaRMSNorm(
 			config.hidden_size,
 			eps=config.layer_norm_epsilon,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 
 	def __call__(
@@ -752,9 +752,9 @@ class FlaxMambaForCausalLMModule(nn.Module):
 		self.lm_head = Dense(
 			self.config.vocab_size,
 			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 	def __call__(

@@ -135,12 +135,12 @@ class CohereAttention(FlaxAttentionModule):
 			)
 		linear_class = partial(
 			nn.Linear,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.q_proj = linear_class(
 			config.hidden_size,
@@ -291,13 +291,13 @@ class CohereMLP(nn.Module):
 		self.precision = precision
 		linear_class = partial(
 			nn.Linear,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
 			rngs=rngs,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.gate_proj = linear_class(
 			config.hidden_size,
@@ -372,8 +372,8 @@ class CohereBlock(nn.Module):
 		self.input_layernorm = RMSNorm(
 			self.config.hidden_size,
 			eps=self.config.layer_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 
@@ -482,17 +482,17 @@ class CohereModel(EasyDeLBaseModule):
 		self.norm = RMSNorm(
 			self.config.hidden_size,
 			eps=self.config.layer_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		past_key_values: Optional[TransformerCache] = None,
@@ -528,10 +528,10 @@ class CohereModel(EasyDeLBaseModule):
 				attention_mask=attention_mask,
 				position_ids=position_ids,
 				cache_view=past_key_values.views[idx],
-				causal_mask=self.config.get_basic_causal_mask(),
+				causal_mask=self.causal_mask,
 				output_attentions=output_attentions,
 				segment_ids=segment_ids,
-				frequencies=self.config.get_basic_frequencies(),
+				frequencies=self.frequencies,
 			)
 			hidden_states = layer_outputs[0]
 
@@ -578,10 +578,10 @@ class CohereForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 		self.model = CohereModel(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 
@@ -594,17 +594,17 @@ class CohereForCausalLM(EasyDeLBaseModule):
 			kernel_init=nn.initializers.normal(stddev=config.initializer_range),
 			precision=precision,
 			rngs=rngs,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.logit_scale = self.config.logit_scale
 
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		past_key_values: Optional[TransformerCache] = None,
@@ -628,7 +628,7 @@ class CohereForCausalLM(EasyDeLBaseModule):
 		Returns:
 		    FlaxCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
-		batch_size, seq_length = input_ids.shape
+		batch_size, sequence_length = input_ids.shape
 		if attention_mask is None:
 			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
 		if position_ids is None:

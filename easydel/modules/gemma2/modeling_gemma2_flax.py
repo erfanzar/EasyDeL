@@ -90,16 +90,16 @@ class Gemma2Attention(FlaxAttentionModule):
 		self.num_key_value_heads = config.num_key_value_heads
 		self.num_key_value_groups = self.num_heads // self.num_key_value_heads
 
-		kernel = jax.nn.initializers.normal(self.config.initializer_range)
+		kernel = jax.nn.initializers.normal(config.initializer_range)
 
 		linear = partial(
 			nn.Linear,
 			use_bias=config.attention_bias,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			kernel_init=kernel,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.q_proj = linear(
 			self.embed_dim,
@@ -284,19 +284,19 @@ class Gemma2MLP(nn.Module):
 			if self.config.intermediate_size is not None
 			else 4 * embed_dim
 		)
-		kernel_init = jax.nn.initializers.normal(self.config.initializer_range)
+		kernel_init = jax.nn.initializers.normal(config.initializer_range)
 
 		self.act = ACT2FN[self.config.hidden_activation]
 
 		linear_class = partial(
 			nn.Linear,
 			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			kernel_init=kernel_init,
 			rngs=rngs,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.gate_proj = linear_class(
 			embed_dim,
@@ -356,16 +356,16 @@ class Gemma2DecoderLayer(nn.Module):
 		self.self_attn = attn_block(
 			self.config,
 			layer_idx=self.layer_idx,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 		self.mlp = mlp_block(
-			self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 
@@ -464,17 +464,17 @@ class Gemma2Model(EasyDeLBaseModule):
 			self.config.vocab_size,
 			self.hidden_size,
 			embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 		self.layers = [
 			Gemma2DecoderLayer(
 				self.config,
 				layer_idx=i,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 				rngs=rngs,
 			)
 			for i in range(self.config.num_hidden_layers)
@@ -483,11 +483,11 @@ class Gemma2Model(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		past_key_values: Optional[TransformerCache] = None,
@@ -594,31 +594,31 @@ class Gemma2ForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 		self.model = Gemma2Model(
-			self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 		self.lm_head = nn.Linear(
-			self.config.hidden_size,
-			self.config.vocab_size,
+			config.hidden_size,
+			config.vocab_size,
 			use_bias=False,
 			rngs=rngs,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		past_key_values: Optional[TransformerCache] = None,

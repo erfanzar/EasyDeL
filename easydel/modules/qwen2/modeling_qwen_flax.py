@@ -16,7 +16,6 @@ import math
 from typing import Optional, Tuple, Union
 
 import chex
-import flax.linen
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
@@ -68,32 +67,32 @@ class FlaxQwen2MLP(nn.Module):
 
 		self.gate_proj = Dense(
 			config.intermediate_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.down_proj = Dense(
 			config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.up_proj = Dense(
 			config.intermediate_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
-		self.dropout = flax.linen.Dropout(rate=self.config.resid_pdrop)
+		self.dropout = nn.Dropout(rate=self.config.resid_pdrop)
 
 	def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
 		"""
@@ -141,39 +140,39 @@ class FlaxQwen2Attention(FlaxAttentionModule):
 			assert self.config.num_attention_heads == self.config.num_key_value_heads
 		self.q_proj = Dense(
 			config.num_attention_heads * self.head_dim,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=True,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.k_proj = Dense(
 			config.num_key_value_heads * self.head_dim,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=True,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.v_proj = Dense(
 			config.num_key_value_heads * self.head_dim,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=True,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.o_proj = Dense(
 			config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 		self.attention_performer = FlexibleAttentionModule(
@@ -191,7 +190,7 @@ class FlaxQwen2Attention(FlaxAttentionModule):
 			axis_name=self.config.attention_axis_name,
 			base_config=self.config,
 		)
-		self.resid_dropout = flax.linen.Dropout(rate=config.resid_pdrop)
+		self.resid_dropout = nn.Dropout(rate=config.resid_pdrop)
 		self.rotary = self.config.get_basic_rope(
 			head_size=config.hidden_size // config.num_attention_heads,
 			rotary_dim=config.hidden_size // config.num_attention_heads,
@@ -326,29 +325,29 @@ class FlaxQwen2Block(nn.Module):
 			)
 
 		self.self_attn = attn_block(
-			self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 		self.mlp = mlp_block(
-			self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.input_layernorm = RMSNorm(
 			self.config.hidden_size,
 			eps=self.config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 		self.post_attention_layernorm = RMSNorm(
 			self.config.hidden_size,
 			eps=self.config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 
 	def __call__(
@@ -432,10 +431,9 @@ class FlaxQwen2BlockCollection(nn.Module):
 		self.layers = [
 			FlaxQwen2Block(
 				self.config,
-				name=str(i),
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 			)
 			for i in range(self.config.num_hidden_layers)
 		]
@@ -499,7 +497,7 @@ class FlaxQwen2BlockCollection(nn.Module):
 			fcm_mask = fcm_mask.astype("bool")
 		else:
 			fcm_mask = None
-		for layer in self.layers:
+		for idx, layer in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
 
@@ -549,21 +547,21 @@ class FlaxQwen2Model(nn.Module):
 			self.config.vocab_size,
 			self.config.hidden_size,
 			embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
-		self.dropout = flax.linen.Dropout(rate=self.config.embd_pdrop)
+		self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
 		self.layers = FlaxQwen2BlockCollection(
-			self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.norm = RMSNorm(
 			self.config.hidden_size,
 			eps=self.config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 		self.causal_mask = make_causal_mask(
 			jnp.ones(
@@ -575,11 +573,11 @@ class FlaxQwen2Model(nn.Module):
 
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		past_key_values: Optional[TransformerCache] = None,
@@ -668,30 +666,30 @@ class FlaxQwen2ForCausalLM(nn.Module):
 	precision: Optional[Union[jax.lax.Precision, str]] = None
 
 	def setup(self):
-		self.model = FlaxQwen2Model.flax_module(
-			self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+		self.model = FlaxQwen2Model(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 		self.lm_head = Dense(
 			self.config.vocab_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
 			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		past_key_values: Optional[TransformerCache] = None,
@@ -780,28 +778,28 @@ class FlaxQwen2ForSequenceClassification(nn.Module):
 		Returns:
 		    A tuple of the model and the classifier
 		"""
-		self.model = FlaxQwen2Model.flax_module(
-			self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+		self.model = FlaxQwen2Model(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.classifier = Dense(
 			self.num_classes,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
 			precision=self.precision,
 		)
 
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		past_key_values: Optional[TransformerCache] = None,

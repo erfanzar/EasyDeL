@@ -461,10 +461,10 @@ class GPTNeoXForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 		self.gpt_neox = GPTNeoXModel(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 		self.lm_head = nn.Linear(

@@ -91,12 +91,12 @@ class FlaxZamba2Attention(FlaxAttentionModule):
 			)
 		dense_class = functools.partial(
 			Dense,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.q_proj = dense_class(self.num_heads * self.head_dim)
 		self.k_proj = dense_class(self.num_key_value_heads * self.head_dim)

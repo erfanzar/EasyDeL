@@ -17,7 +17,6 @@ import random
 from functools import partial
 from typing import Any, Optional, Tuple, Union
 
-import flax.linen
 import jax
 import jax.numpy as jnp
 
@@ -95,11 +94,11 @@ class FlaxWhisperAttention(FlaxAttentionModule):
 		dense = partial(
 			Dense,
 			self.embed_dim,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			kernel_init=jax.nn.initializers.normal(self.config.init_std),
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 		self.q_proj = dense(use_bias=self.bias)
@@ -248,28 +247,26 @@ class FlaxWhisperEncoderLayer(nn.Module):
 			embed_dim=self.embed_dim,
 			num_heads=self.config.encoder_attention_heads,
 			dropout=self.config.attention_dropout,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		dense_class = partial(
 			Dense,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			kernel_init=jax.nn.initializers.normal(self.config.init_std),
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.self_attn_layer_norm = nn.LayerNorm(
 			param_dtype=self.param_dtype,
 			dtype=self.dtype,
 			epsilon=1e-05,
 		)
-		self.dropout_layer = flax.linen.Dropout(rate=self.config.dropout)
+		self.dropout_layer = nn.Dropout(rate=self.config.dropout)
 		self.activation_fn = ACT2FN[self.config.activation_function]
-		self.activation_dropout_layer = flax.linen.Dropout(
-			rate=self.config.activation_dropout
-		)
+		self.activation_dropout_layer = nn.Dropout(rate=self.config.activation_dropout)
 		self.fc1 = dense_class(self.config.encoder_ffn_dim)
 		self.fc2 = dense_class(self.embed_dim)
 		self.final_layer_norm = nn.LayerNorm(
@@ -331,10 +328,9 @@ class FlaxWhisperEncoderLayerCollection(nn.Module):
 		self.layers = [
 			block(
 				self.config,
-				name=str(i),
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 			)
 			for i in range(self.config.encoder_layers)
 		]
@@ -400,15 +396,13 @@ class FlaxWhisperDecoderLayer(nn.Module):
 			num_heads=self.config.decoder_attention_heads,
 			dropout=self.config.attention_dropout,
 			causal=True,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
-		self.dropout_layer = flax.linen.Dropout(rate=self.config.dropout)
+		self.dropout_layer = nn.Dropout(rate=self.config.dropout)
 		self.activation_fn = ACT2FN[self.config.activation_function]
-		self.activation_dropout_layer = flax.linen.Dropout(
-			rate=self.config.activation_dropout
-		)
+		self.activation_dropout_layer = nn.Dropout(rate=self.config.activation_dropout)
 
 		self.self_attn_layer_norm = nn.LayerNorm(
 			param_dtype=self.param_dtype,
@@ -420,9 +414,9 @@ class FlaxWhisperDecoderLayer(nn.Module):
 			embed_dim=self.embed_dim,
 			num_heads=self.config.decoder_attention_heads,
 			dropout=self.config.attention_dropout,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.encoder_attn_layer_norm = nn.LayerNorm(
 			param_dtype=self.param_dtype,
@@ -435,7 +429,7 @@ class FlaxWhisperDecoderLayer(nn.Module):
 			precision=self.precision,
 			dtype=self.dtype,
 			kernel_init=jax.nn.initializers.normal(self.config.init_std),
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.fc1 = dense_class(self.config.decoder_ffn_dim)
 		self.fc2 = dense_class(self.embed_dim)
@@ -520,10 +514,9 @@ class FlaxWhisperDecoderLayerCollection(nn.Module):
 		self.layers = [
 			block(
 				self.config,
-				name=str(i),
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 			)
 			for i in range(self.config.decoder_layers)
 		]
@@ -610,9 +603,9 @@ class FlaxWhisperEncoder(nn.Module):
 			kernel_size=(3,),
 			padding=1,
 			kernel_init=jax.nn.initializers.normal(self.config.init_std),
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.conv2 = nn.Conv(
 			self.config.d_model,
@@ -620,18 +613,18 @@ class FlaxWhisperEncoder(nn.Module):
 			strides=2,
 			padding=1,
 			kernel_init=jax.nn.initializers.normal(self.config.init_std),
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
-		self.dropout_layer = flax.linen.Dropout(rate=self.config.dropout)
+		self.dropout_layer = nn.Dropout(rate=self.config.dropout)
 
 		self.layers = FlaxWhisperEncoderLayerCollection(
-			self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 		self.embed_positions = nn.Embed(
@@ -732,24 +725,24 @@ class FlaxWhisperDecoder(nn.Module):
 		self.embed_tokens = nn.Embed(
 			self.config.vocab_size,
 			self.config.d_model,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 		self.embed_positions = nn.Embed(
 			self.config.max_target_positions,
 			self.config.d_model,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 
 		self.layers = FlaxWhisperDecoderLayerCollection(
-			self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
-		self.dropout_layer = flax.linen.Dropout(rate=self.config.dropout)
+		self.dropout_layer = nn.Dropout(rate=self.config.dropout)
 
 		self.layer_norm = nn.LayerNorm(
 			param_dtype=self.param_dtype,
@@ -830,16 +823,16 @@ class FlaxWhisperModule(nn.Module):
 
 	def setup(self) -> None:
 		self.encoder = FlaxWhisperEncoder(
-			self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.decoder = FlaxWhisperDecoder(
-			self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 	def _get_decoder_module(self):
@@ -1253,19 +1246,19 @@ class FlaxWhisperForConditionalGenerationModule(nn.Module):
 
 	def setup(self) -> None:
 		self.model = FlaxWhisperModule(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.proj_out = Dense(
 			self.config.vocab_size,
 			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			kernel_init=jax.nn.initializers.normal(self.config.init_std),
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 	def _get_encoder_module(self):
@@ -1622,10 +1615,10 @@ class FlaxWhisperForAudioClassificationModule(nn.Module):
 
 	def setup(self) -> None:
 		self.encoder = FlaxWhisperEncoder(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.config.is_encoder_decoder = False
 		num_layers = self.config.num_hidden_layers + 1
@@ -1633,17 +1626,17 @@ class FlaxWhisperForAudioClassificationModule(nn.Module):
 			self.layer_weights = jnp.repeat(1 / num_layers, num_layers)
 		self.projector = Dense(
 			self.config.classifier_proj_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.classifier = Dense(
 			self.config.num_labels,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 	def __call__(

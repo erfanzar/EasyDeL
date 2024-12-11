@@ -17,7 +17,6 @@ import math
 from typing import Optional, Tuple, Union
 
 import chex
-import flax.linen.partitioning
 import jax.lax
 from chex import Array
 from flax import linen as nn
@@ -60,18 +59,18 @@ class FlaxPhi3MLP(nn.Module):
 	def setup(self) -> None:
 		self.gate_up_proj = Dense(
 			2 * self.config.intermediate_size,
-			kernel_init=nn.initializers.normal(self.config.initializer_range),
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			kernel_init=nn.initializers.normal(config.initializer_range),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			use_bias=False,
 		)
 		self.down_proj = Dense(
 			self.config.hidden_size,
-			kernel_init=nn.initializers.normal(self.config.initializer_range),
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			kernel_init=nn.initializers.normal(config.initializer_range),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			use_bias=False,
 		)
 		self.activation_fn = ACT2FN[self.config.hidden_act]
@@ -125,11 +124,11 @@ class FlaxPhi3Attention(FlaxAttentionModule):
 		dense_class = functools.partial(
 			Dense,
 			use_bias=False,
-			precision=self.precision,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-			**get_dot_general_by_bits(self.config.bits),
+			precision=precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 		op_size = self.num_heads * self.head_dim + 2 * (
@@ -283,24 +282,26 @@ class FlaxPhi3DecoderLayer(nn.Module):
 				static_argnums=(1,),
 			)
 		self.self_attn = attn_block(
-			config=self.config,
-			layer_idx=self.layer_idx,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			layer_idx=layer_idx,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
 		self.mlp = mlp_block(
-			config=self.config,
-			layer_idx=self.layer_idx,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			layer_idx=layer_idx,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
 		self.input_layernorm = RMSNorm(
 			dim=self.config.hidden_size,
 			eps=self.config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 
 		self.resid_attn_dropout = nn.Dropout(self.config.resid_pdrop)
@@ -308,8 +309,8 @@ class FlaxPhi3DecoderLayer(nn.Module):
 		self.post_attention_layernorm = RMSNorm(
 			dim=self.config.hidden_size,
 			eps=self.config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 
 	def __call__(
@@ -402,10 +403,10 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
 	def setup(self) -> None:
 		self.layers = [
 			FlaxPhi3DecoderLayer(
-				config=self.config,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				config=config,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 				name=str(idx),
 				layer_idx=idx,
 			)
@@ -524,22 +525,22 @@ class FlaxPhi3Model(nn.Module):
 		self.embed_tokens = nn.Embed(
 			config.vocab_size,
 			config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 
-		self.embed_dropout = flax.linen.Dropout(config.embd_pdrop)
+		self.embed_dropout = nn.Dropout(config.embd_pdrop)
 		self.layers = FlaxPhiDecoderLayerCollection(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.norm = RMSNorm(
 			config.hidden_size,
 			eps=config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 		self.causal_mask = nn.make_causal_mask(
 			jnp.ones(
@@ -551,11 +552,11 @@ class FlaxPhi3Model(nn.Module):
 
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		past_key_values: Optional[TransformerCache] = None,
@@ -610,10 +611,10 @@ class FlaxPhi3Model(nn.Module):
 				attention_mask=attention_mask,
 				position_ids=position_ids,
 				cache_view=past_key_values.views[idx],
-				causal_mask=self.config.get_basic_causal_mask(),
+				causal_mask=self.causal_mask,
 				output_attentions=output_attentions,
 				segment_ids=segment_ids,
-				frequencies=self.config.get_basic_frequencies(),
+				frequencies=self.frequencies,
 			)
 			hidden_states = layer_outputs[0]
 
@@ -661,29 +662,29 @@ class FlaxPhi3ForCausalLM(nn.Module):
 	precision: Optional[jax.lax.Precision] = None
 
 	def setup(self) -> None:
-		self.model = FlaxPhi3Model.flax_module(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+		self.model = FlaxPhi3Model(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.vocab_size = self.config.vocab_size
 		self.lm_head = Dense(
 			self.config.vocab_size,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		past_key_values: Optional[TransformerCache] = None,

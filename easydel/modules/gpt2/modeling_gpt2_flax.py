@@ -383,8 +383,8 @@ class GPT2Block(nn.Module):
 		self.mlp = mlp_block(
 			config=config,
 			intermediate_size=inner_dim,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			precision=precision,
 			rngs=rngs,
 		)
@@ -497,9 +497,9 @@ class GPT2Model(EasyDeLBaseModule):
 		self.h = [
 			GPT2Block(
 				self.config,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 				rngs=rngs,
 			)
 			for i in range(self.config.num_hidden_layers)
@@ -617,22 +617,22 @@ class GPT2LMHeadModel(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 		self.transformer = GPT2Model(
-			self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 		self.lm_head = nn.Linear(
-			self.config.hidden_size,
-			self.config.vocab_size,
+			config.hidden_size,
+			config.vocab_size,
 			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
-			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 	def __call__(

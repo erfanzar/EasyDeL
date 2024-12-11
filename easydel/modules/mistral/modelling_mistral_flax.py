@@ -63,13 +63,13 @@ class MistralMLP(nn.Module):
 		self.precision = precision
 		linear_class = functools.partial(
 			nn.Linear,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
 			rngs=rngs,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.gate_proj = linear_class(
 			config.hidden_size,

@@ -13,19 +13,19 @@
 # limitations under the License.
 
 import math
+from functools import cached_property
 from typing import Optional, Tuple, Union
 
 import chex
-import flax.core
 import jax
-from flax import linen as nn
+from flax import nnx as nn
 from jax import numpy as jnp
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
 from easydel.layers.norms import RMSNorm
-from easydel.modules._base.base_module import wrap_easydel_module
+from easydel.modules._base.base_module import EasyDeLBaseModule
 from easydel.modules._base.factory import register_module
 from easydel.modules._base.flax_modeling_utils import (
 	ACT2FN,
@@ -46,46 +46,38 @@ from easydel.modules.openelm.openelm_configuration import (
 )
 
 
-class FlaxOpenELMMLP(nn.Module):
-	config: OpenELMConfig
-	dtype: jnp.dtype = jnp.bfloat16
-	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[str, jax.lax.Precision]] = None
-
-
-class FlaxOpenELMMultiHeadCausalAttention(FlaxAttentionModule):
-	"""
-	FlaxOpenELMAttention implements an attention mechanism with rotary embeddings.
-
-	Attributes:
-	    config (OpenELMConfig): Configuration for the attention module.
-	    dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
-	    param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
-	    precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
-	"""
-
-	config: OpenELMConfig
-	layer_idx: int
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self):
-		config = self.config
-		layer_idx = self.layer_idx
+class OpenELMMultiHeadCausalAttention(FlaxAttentionModule):
+	def __init__(
+		self,
+		config: OpenELMConfig,
+		layer_idx: int,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(config=config)
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
+		self.layer_idx = layer_idx
 		head_dim = config.head_dim
 		q_heads = config.num_query_heads[layer_idx]
 		k_heads = config.num_kv_heads[layer_idx]
 		v_heads = config.num_kv_heads[layer_idx]
 
-		self.qkv_proj = nn.Dense(
+		self.qkv_proj = nn.Linear(
+			config.model_dim,
 			(q_heads + k_heads + v_heads) * head_dim,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
+			precision=precision,
+			rngs=rngs,
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		if config.normalize_qk_projections:
 			self.q_norm = RMSNorm(
@@ -93,25 +85,29 @@ class FlaxOpenELMMultiHeadCausalAttention(FlaxAttentionModule):
 				dtype=self.dtype,
 				param_dtype=self.param_dtype,
 				eps=1e-6,
+				rngs=rngs,
 			)
 			self.k_norm = RMSNorm(
 				dim=config.head_dim,
 				dtype=self.dtype,
 				param_dtype=self.param_dtype,
 				eps=1e-6,
+				rngs=rngs,
 			)
 		else:
 			self.q_norm = None
 			self.k_norm = None
 
-		self.out_proj = nn.Dense(
+		self.out_proj = nn.Linear(
+			q_heads * head_dim,
 			config.model_dim,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			precision=self.precision,
-			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			precision=precision,
+			rngs=rngs,
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.head_dim = head_dim
 
@@ -266,10 +262,9 @@ class FlaxOpenELMMultiHeadCausalAttention(FlaxAttentionModule):
 			causal_mask=causal_mask,
 		)
 
-		attn_output = self.shard_attention_prod(
-			self._merge_heads(attentions.attention_outputs)
+		attn_output = self.out_proj(
+			self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
 		)
-		attn_output = self.out_proj(attn_output)
 
 		outputs = (
 			(attn_output, attentions.attention_weights)
@@ -279,16 +274,24 @@ class FlaxOpenELMMultiHeadCausalAttention(FlaxAttentionModule):
 		return outputs
 
 
-class FlaxOpenELMFeedForwardNetwork(nn.Module):
-	config: OpenELMConfig
-	layer_idx: int
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
-		config = self.config
-		layer_idx = self.layer_idx
+class OpenELMFeedForwardNetwork(nn.Module):
+	def __init__(
+		self,
+		config: OpenELMConfig,
+		layer_idx: int,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__()
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
+		self.layer_idx = layer_idx
 		ffn_multiplier = config.ffn_multipliers[layer_idx]
 		intermediate_dim = int(
 			make_divisible(
@@ -298,69 +301,87 @@ class FlaxOpenELMFeedForwardNetwork(nn.Module):
 		)
 		if config.ffn_with_glu:
 			# FFN with Gated linear unit, as described in https://arxiv.org/abs/2002.05202v1.
-			self.proj_1 = nn.Dense(
+			self.proj_1 = nn.Linear(
+				config.model_dim,
 				2 * intermediate_dim,
 				use_bias=False,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
-				kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-				**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
+				rngs=rngs,
+				kernel_init=jax.nn.initializers.normal(config.initializer_range),
+				**get_dot_general_by_bits(config.bits, config.easy_method),
 			)
-			self.proj_2 = nn.Dense(
+			self.proj_2 = nn.Linear(
+				intermediate_dim,
 				config.model_dim,
 				use_bias=False,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
-				kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-				**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
+				rngs=rngs,
+				kernel_init=jax.nn.initializers.normal(config.initializer_range),
+				**get_dot_general_by_bits(config.bits, config.easy_method),
 			)
 			self.ffn_with_glu = True
 		else:
-			self.proj_1 = nn.Dense(
+			self.proj_1 = nn.Linear(
+				config.model_dim,
 				intermediate_dim,
 				use_bias=False,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
-				kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-				**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
+				rngs=rngs,
+				kernel_init=jax.nn.initializers.normal(config.initializer_range),
+				**get_dot_general_by_bits(config.bits, config.easy_method),
 			)
-			self.proj_2 = nn.Dense(
+			self.proj_2 = nn.Linear(
+				intermediate_dim,
 				config.model_dim,
 				use_bias=False,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
-				kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
-				**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
+				rngs=rngs,
+				kernel_init=jax.nn.initializers.normal(config.initializer_range),
+				**get_dot_general_by_bits(config.bits, config.easy_method),
 			)
 			self.ffn_with_glu = False
 
 		self.act = ACT2FN[config.activation_fn_name]
 
-	def __call__(self, x: chex.Array, e: bool = False) -> chex.Array:
-		x = control_mlp_sharding(x, self.config.partition_axis)
+	def __call__(self, hidden_states: chex.Array) -> chex.Array:
+		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
 
 		if self.ffn_with_glu:
-			y_12 = self.proj_1(x)
+			y_12 = self.proj_1(hidden_states)
 			y_1, y_2 = jnp.split(y_12, 2, axis=-1)
 			return self.proj_2(self.act(y_1) * y_2)
 		else:
-			return self.proj_2(self.act(self.proj_1(x)))
+			return self.proj_2(self.act(self.proj_1(hidden_states)))
 
 
-class FlaxOpenELMDecoderLayer(nn.Module):
-	config: OpenELMConfig
-	layer_idx: int
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
-		attn_block = FlaxOpenELMMultiHeadCausalAttention
-		mlp_block = FlaxOpenELMFeedForwardNetwork
+class OpenELMDecoderLayer(nn.Module):
+	def __init__(
+		self,
+		config: OpenELMConfig,
+		layer_idx: int,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__()
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
+		self.layer_idx = layer_idx
+		attn_block = OpenELMMultiHeadCausalAttention
+		mlp_block = OpenELMFeedForwardNetwork
 		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			attn_block = nn.remat(
 				attn_block,
@@ -374,30 +395,34 @@ class FlaxOpenELMDecoderLayer(nn.Module):
 			)
 
 		self.attn = attn_block(
-			config=self.config,
-			layer_idx=self.layer_idx,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			layer_idx=layer_idx,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
 		self.ffn = mlp_block(
-			config=self.config,
-			layer_idx=self.layer_idx,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			layer_idx=layer_idx,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
 		self.ffn_norm = RMSNorm(
 			self.config.model_dim,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			eps=1e-6,
+			rngs=rngs,
 		)
 		self.attn_norm = RMSNorm(
 			self.config.model_dim,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			eps=1e-6,
+			rngs=rngs,
 		)
 
 	def __call__(
@@ -452,13 +477,9 @@ class FlaxOpenELMDecoderLayer(nn.Module):
 				self.ffn,
 				hidden_states,
 				self.config.scan_mlp_chunk_size,
-				deterministic,
 			)
 		else:
-			feed_forward_hidden_states = self.ffn(
-				hidden_states,
-				deterministic,
-			)
+			feed_forward_hidden_states = self.ffn(hidden_states)
 		hidden_states = residual + feed_forward_hidden_states
 
 		outputs = (hidden_states,)
@@ -469,25 +490,72 @@ class FlaxOpenELMDecoderLayer(nn.Module):
 		return outputs  # type:ignore
 
 
-class FlaxOpenELMDecoderLayerCollection(nn.Module):
-	config: OpenELMConfig
-	dtype: jnp.dtype = jnp.bfloat16
-	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[str, jax.lax.Precision]] = None
+@register_module(
+	"base-module",
+	config=OpenELMConfig,
+	model_type="openelm",
+	embedding_layer_names=["token_embeddings"],
+)
+class OpenELMModel(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: OpenELMConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+		self.token_embeddings = nn.Embed(
+			config.vocab_size,
+			config.model_dim,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			rngs=rngs,
+		)
 
-	def setup(self) -> None:
 		self.layers = [
-			FlaxOpenELMDecoderLayer(
-				config=self.config,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+			OpenELMDecoderLayer(
+				config=config,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 				layer_idx=i,
-				name=str(i),
+				rngs=rngs,
 			)
 			for i in range(self.config.num_transformer_layers)
 		]
-		self._frequencies = self.config.get_basic_frequencies(
+		self.norm = RMSNorm(
+			config.model_dim,
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+			eps=1e-6,
+			rngs=rngs,
+		)
+		if config.share_input_output_layers:
+			self.classifier = None
+		else:
+			self.classifier = nn.Linear(
+				config.model_dim,
+				config.vocab_size,
+				use_bias=False,
+				rngs=rngs,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
+			)
+		self.num_transformer_layers = config.num_transformer_layers
+
+	@cached_property
+	def frequencies(self):
+		return self.config.get_basic_frequencies(
 			head_size=self.config.head_dim,
 			rotary_dim=self.config.head_dim,
 			base=self.config.rope_freq_constant,
@@ -495,174 +563,19 @@ class FlaxOpenELMDecoderLayerCollection(nn.Module):
 
 	def __call__(
 		self,
-		hidden_states: chex.Array,
-		attention_mask: chex.Array,
-		causal_mask: chex.Array,
-		position_ids: chex.Array,
-		segment_ids: Optional[chex.Array] = None,
-		deterministic: bool = True,
-		init_cache: bool = False,
-		output_attentions: bool = False,
-		output_hidden_states: bool = False,
-	) -> Tuple[chex.Array, Optional[chex.Array], chex.Array]:
-		"""
-		Forward pass through the collection of decoder layers.
-
-		Args:
-		    hidden_states (chex.Array): Input tensor containing the hidden states.
-		    attention_mask (chex.Array): Mask to apply during attention.
-		    causal_mask (chex.Array): Causal mask for autoregressive decoding.
-		    position_ids (chex.Array): Positional indices for the sequence.
-		    segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
-		    deterministic (bool): If True, disables dropout.
-		    init_cache (bool): If True, initializes caching mechanism for fast decoding.
-		    output_attentions (bool): If True, returns attention weights.
-		    output_hidden_states (bool): If True, returns hidden states.
-
-		Returns:
-		    Tuple[chex.Array, Optional[chex.Array], chex.Array]:
-		        - hidden_states: The output tensor after layer processing.
-		        - all_hidden_states: all of Hidden states (if `output_hidden_states` is True).
-		        - self_attn_weights: Attention weights (if `output_attentions` is True).
-
-		"""
-		all_attentions = () if output_attentions else None
-		all_hidden_states = () if output_hidden_states else None
-		if not deterministic and self.config.fcm_max_ratio > 0:
-			# Apply forgetful causal mask
-			batch_size, seq_length = hidden_states.shape[0], hidden_states.shape[1]
-			fcm_ratio = jax.random.uniform(
-				self.make_rng("fcm"),
-				shape=(batch_size, 1, 1, 1),
-				minval=self.config.fcm_min_ratio,
-				maxval=self.config.fcm_max_ratio,
-			)
-			fcm_mask = (
-				jax.random.uniform(
-					self.make_rng("fcm"),
-					shape=(batch_size, 1, seq_length, seq_length),
-				)
-				> fcm_ratio
-			)
-			fcm_mask = fcm_mask.at[:, :, :, 0].set(True)
-			fcm_mask = fcm_mask.astype("bool")
-		else:
-			fcm_mask = None
-		for layer in self.layers:
-			if output_hidden_states:
-				all_hidden_states += (hidden_states,)
-
-			output = layer(
-				hidden_states=hidden_states,
-				attention_mask=attention_mask,
-				causal_mask=causal_mask,
-				output_attentions=output_attentions,
-				init_cache=init_cache,
-				segment_ids=segment_ids,
-				deterministic=deterministic,
-				position_ids=position_ids,
-				fcm_mask=fcm_mask,
-				frequencies=self._frequencies,
-			)
-			hidden_states = output[0]
-
-			if output_attentions:
-				output_attentions += (output[1],)
-
-		return hidden_states, all_hidden_states, all_attentions
-
-
-@register_module(
-	"base-module",
-	config=OpenELMConfig,
-	model_type="openelm",
-	embedding_layer_names=["token_embeddings"],
-)
-@wrap_easydel_module(config_class=OpenELMConfig, base_model_prefix="transformer")
-class FlaxOpenELMModel(nn.Module):
-	"""
-	Core module of the OpenELM model, including embedding, decoder layers, and normalization.
-
-	Attributes:
-	    config (OpenELMConfig): Configuration object with model hyperparameters.
-	    dtype (jnp.dtype): Data type for the computations.
-	    param_dtype (jnp.dtype): Data type for the model parameters.
-	    precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
-	"""
-
-	config: OpenELMConfig
-	dtype: jnp.dtype = jnp.bfloat16
-	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[str, jax.lax.Precision]] = None
-
-	def setup(self) -> None:
-		config = self.config
-		self.token_embeddings = nn.Embed(
-			config.vocab_size,
-			config.model_dim,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-		)
-
-		self.layers = FlaxOpenELMDecoderLayerCollection(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-		)
-		self.norm = RMSNorm(
-			config.model_dim, dtype=self.dtype, param_dtype=self.param_dtype, eps=1e-6
-		)
-		if config.share_input_output_layers:
-			self.classifier = None
-		else:
-			self.classifier = nn.Dense(
-				config.vocab_size,
-				use_bias=False,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
-			)
-		self.num_transformer_layers = config.num_transformer_layers
-
-		self.causal_mask = flax.linen.make_causal_mask(
-			jnp.ones(
-				(1, self.config.granted_mask_max_position_embedding),
-				dtype="bool",
-			),
-			dtype="bool",
-		)
-
-	def __call__(
-		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		past_key_values: Optional[TransformerCache] = None,
 		return_dict: bool = True,
 	) -> Union[FlaxBaseModelOutput, Tuple]:
-		"""
-		Forward pass through the OpenELM module.
+		all_attentions = () if output_attentions else None
+		all_hidden_states = () if output_hidden_states else None
 
-		Args:
-		    input_ids (chex.Array): Input tensor containing token IDs.
-		    attention_mask (chex.Array): Mask for attention.
-		    position_ids (chex.Array): Positional indices.
-		    segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-		    input_embeds (Optional[chex.Array]): Embedded input tensor.
-		    output_attentions (Optional[bool]): If True, output attention weights.
-		    output_hidden_states (Optional[bool]): If True, output hidden states.
-		    init_cache (bool): If True, initialize cache for decoding.
-		    deterministic (bool): If True, disable dropout.
-		    return_dict (bool): If True, return a dictionary of outputs.
-
-		Returns:
-		    FlaxBaseModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
-		"""
 		if input_embeds is None and input_ids is not None:
 			input_embeds = self.token_embeddings(input_ids.astype("i4"))
 		else:
@@ -672,22 +585,39 @@ class FlaxOpenELMModel(nn.Module):
 		assert (
 			sequence_length <= self.config.max_context_length
 		), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_context_length} got {sequence_length})"
+		if attention_mask is None:
+			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
+
+		if position_ids is None:
+			position_ids = jnp.broadcast_to(
+				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+				(batch_size, sequence_length),
+			).astype(jnp.int32)
+
 		if attention_mask.ndim == 2:
 			attention_mask = jnp.expand_dims(attention_mask, (1, 2))
+		if past_key_values is None:
+			past_key_values = TransformerCache.init_empty(len(self.layers))
+		hidden_states = input_embeds
 
-		outputs = self.layers(
-			hidden_states=input_embeds,
-			attention_mask=attention_mask,
-			position_ids=position_ids,
-			init_cache=init_cache,
-			output_attentions=output_attentions,
-			deterministic=deterministic,
-			causal_mask=self.causal_mask,
-			output_hidden_states=output_hidden_states,
-			segment_ids=segment_ids,
-		)
+		for idx, layer in enumerate(self.layers):
+			if output_hidden_states:
+				all_hidden_states += (hidden_states,)
+			output = layer(
+				hidden_states=hidden_states,
+				attention_mask=attention_mask,
+				cache_view=past_key_values.views[idx],
+				output_attentions=output_attentions,
+				segment_ids=segment_ids,
+				position_ids=position_ids,
+				causal_mask=self.causal_mask,
+				frequencies=self.frequencies,
+			)
+			hidden_states = output[0]
 
-		hidden_states = outputs[0]
+			if output_attentions:
+				output_attentions += (output[1],)
+
 		hidden_states = self.norm(hidden_states)
 
 		if output_hidden_states:
@@ -710,79 +640,61 @@ class FlaxOpenELMModel(nn.Module):
 	model_type="openelm",
 	embedding_layer_names=["token_embeddings"],
 )
-@wrap_easydel_module(config_class=OpenELMConfig, base_model_prefix="transformer")
-class FlaxOpenELMForCausalLM(nn.Module):
-	config: OpenELMConfig
-	dtype: jnp.dtype = jnp.bfloat16
-	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self):
-		self.transformer = FlaxOpenELMModel.flax_module(
-			self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+class OpenELMForCausalLM(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: OpenELMConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+		self.transformer = OpenELMModel(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
 
-		self.lm_head = nn.Dense(
-			self.config.vocab_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+		self.lm_head = nn.Linear(
+			config.model_dim,
+			config.vocab_size,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-			precision=self.precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			rngs=rngs,
+			kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+			precision=precision,
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		past_key_values: Optional[TransformerCache] = None,
 		return_dict: bool = True,
 	) -> Union[FlaxCausalLMOutput, Tuple]:
-		"""
-		Forward pass through the OpenELM module.
-
-		Args:
-		    input_ids (Optional[chex.Array]): Input tensor containing token IDs.
-		    attention_mask (Optional[chex.Array]): Mask for attention.
-		    position_ids (Optional[chex.Array]): Positional indices.
-		    segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-		    input_embeds (Optional[chex.Array]): Embedded input tensor.
-		    output_attentions (Optional[bool]): If True, output attention weights.
-		    output_hidden_states (Optional[bool]): If True, output hidden states.
-		    init_cache (bool): If True, initialize cache for decoding.
-		    deterministic (bool): If True, disable dropout.
-		    return_dict (bool): If True, return a dictionary of outputs.
-
-		Returns:
-		    FlaxCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
-		"""
-
-		batch_size, sequence_length = (
-			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
-		)
-		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
-		if position_ids is None:
-			position_ids = jnp.broadcast_to(
-				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-				(batch_size, sequence_length),
-			)
 		outputs = self.transformer(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
-			deterministic=deterministic,
 			input_embeds=input_embeds,
-			init_cache=init_cache,
+			past_key_values=past_key_values,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,
@@ -790,19 +702,12 @@ class FlaxOpenELMForCausalLM(nn.Module):
 		)
 
 		hidden_states = outputs[0]
-
 		if self.config.share_input_output_layers:
-			shared_kernel = self.transformer.variables["params"]["token_embeddings"][
-				"embedding"
-			].T.astype(self.param_dtype)
-			lm_logits = self.lm_head.apply(
-				{"params": {"kernel": shared_kernel}},
-				hidden_states,
-			)
+			self.lm_head.kernel.value = self.transformer.token_embeddings.embedding.value.T
+			lm_logits = self.lm_head(hidden_states)
 		else:
 			lm_logits = self.lm_head(hidden_states)
 
-		lm_logits = lm_logits[:, : self.config.vocab_size]
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
 

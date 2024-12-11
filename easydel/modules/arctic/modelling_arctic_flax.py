@@ -64,11 +64,11 @@ class ArcticAttention(FlaxAttentionModule):
 		linear = partial(
 			nn.Linear,
 			use_bias=getattr(self.config, "attention_bias", False),
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			kernel_init=nn.initializers.normal(),
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 		self.q_proj = linear(
@@ -220,11 +220,11 @@ class ArcticMLP(nn.Module):
 		linear_class = partial(
 			nn.Linear,
 			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			kernel_init=nn.initializers.normal(),
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.w1 = linear_class(self.hidden_dim, self.ffn_dim, rngs=rngs)
 		self.w3 = linear_class(self.hidden_dim, self.ffn_dim, rngs=rngs)
@@ -495,8 +495,8 @@ class ArcticModel(EasyDeLBaseModule):
 		self.embed_tokens = nn.Embed(
 			self.config.vocab_size,
 			self.config.hidden_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 
@@ -515,8 +515,8 @@ class ArcticModel(EasyDeLBaseModule):
 		self.norm = RMSNorm(
 			self.config.hidden_size,
 			eps=self.config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 
@@ -530,11 +530,11 @@ class ArcticModel(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		past_key_values: Optional[TransformerCache] = None,
@@ -586,10 +586,10 @@ class ArcticModel(EasyDeLBaseModule):
 				attention_mask=attention_mask,
 				position_ids=position_ids,
 				cache_view=past_key_values.views[idx],
-				causal_mask=self.config.get_basic_causal_mask(),
+				causal_mask=self.causal_mask,
 				output_attentions=output_attentions,
 				segment_ids=segment_ids,
-				frequencies=self.config.get_basic_frequencies(),
+				frequencies=self.frequencies,
 			)
 			hidden_states = outputs[0]
 			if output_attentions:
@@ -643,23 +643,23 @@ class ArcticForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 		self.model = ArcticModel(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 
 		self.lm_head = nn.Linear(
-			self.config.hidden_size,
-			self.config.vocab_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config.hidden_size,
+			config.vocab_size,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			use_bias=False,
-			kernel_init=nn.initializers.normal(self.config.initializer_range),
+			kernel_init=nn.initializers.normal(config.initializer_range),
 			rngs=rngs,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 	def __call__(

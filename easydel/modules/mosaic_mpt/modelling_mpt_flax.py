@@ -121,7 +121,7 @@ class MptAttention(FlaxAttentionModule):
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.dropout = nn.Dropout(
 			self.config.attn_config.attn_pdrop,

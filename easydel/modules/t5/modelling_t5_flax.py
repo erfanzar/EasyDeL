@@ -33,7 +33,6 @@ import copy
 from typing import Callable, Optional, Tuple
 
 import chex
-import flax.linen
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -122,7 +121,7 @@ class FlaxT5DenseActDense(nn.Module):
 			kernel_init=jax.nn.initializers.normal(wo_init_std),
 			dtype=self.dtype,
 		)
-		self.dropout = flax.linen.Dropout(self.config.dropout_rate)
+		self.dropout = nn.Dropout(self.config.dropout_rate)
 		self.act = ACT2FN[self.config.dense_act_fn]
 
 	def __call__(self, hidden_states, deterministic=True):
@@ -159,7 +158,7 @@ class FlaxT5DenseGatedActDense(nn.Module):
 			kernel_init=jax.nn.initializers.normal(wo_init_std),
 			dtype=self.dtype,
 		)
-		self.dropout = flax.linen.Dropout(self.config.dropout_rate)
+		self.dropout = nn.Dropout(self.config.dropout_rate)
 		self.act = ACT2FN[self.config.dense_act_fn]
 
 	def __call__(self, hidden_states):
@@ -184,7 +183,7 @@ class FlaxT5LayerFF(nn.Module):
 		self.layer_norm = FlaxT5LayerNorm(
 			self.config.d_model, eps=self.config.layer_norm_epsilon, dtype=self.dtype
 		)
-		self.dropout = flax.linen.Dropout(self.config.dropout_rate)
+		self.dropout = nn.Dropout(self.config.dropout_rate)
 
 	def __call__(self, hidden_states, deterministic=True):
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
@@ -522,7 +521,7 @@ class FlaxT5LayerSelfAttention(FlaxAttentionModule):
 		self.layer_norm = FlaxT5LayerNorm(
 			self.config.d_model, eps=self.config.layer_norm_epsilon, dtype=self.dtype
 		)
-		self.dropout = flax.linen.Dropout(self.config.dropout_rate)
+		self.dropout = nn.Dropout(self.config.dropout_rate)
 
 	def __call__(
 		self,
@@ -565,7 +564,7 @@ class FlaxT5LayerCrossAttention(FlaxAttentionModule):
 		self.layer_norm = FlaxT5LayerNorm(
 			self.config.d_model, eps=self.config.layer_norm_epsilon, dtype=self.dtype
 		)
-		self.dropout = flax.linen.Dropout(self.config.dropout_rate)
+		self.dropout = nn.Dropout(self.config.dropout_rate)
 
 	def __call__(
 		self,
@@ -735,7 +734,6 @@ class FlaxT5BlockCollection(nn.Module):
 				self.config,
 				has_relative_attention_bias=(i == 0),
 				dtype=self.dtype,
-				name=str(i),
 			)
 			for i in range(self.config.num_layers)
 		]
@@ -811,7 +809,7 @@ class FlaxT5Stack(nn.Module):
 		self.final_layer_norm = FlaxT5LayerNorm(
 			self.config.d_model, eps=self.config.layer_norm_epsilon, dtype=self.dtype
 		)
-		self.dropout = flax.linen.Dropout(self.config.dropout_rate)
+		self.dropout = nn.Dropout(self.config.dropout_rate)
 
 	def __call__(
 		self,

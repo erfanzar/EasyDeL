@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
@@ -25,8 +26,10 @@ class RMSNorm(nn.Module):
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
 		*,
-		rngs: nn.Rngs,
+		rngs: Optional[nn.Rngs] = None,
 	) -> None:
+		if rngs is None:
+			rngs = nn.Rngs(0)
 		self.dim = dim
 		self.eps = eps
 		self.dtype = dtype
@@ -47,6 +50,3 @@ class RMSNorm(nn.Module):
 		output = self._norm(x).astype(self.dtype)
 		weight = self.kernel.astype(self.dtype)
 		return weight * output
-
-
- 

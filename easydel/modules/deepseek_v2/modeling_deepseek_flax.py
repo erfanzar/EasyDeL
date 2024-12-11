@@ -368,10 +368,10 @@ class FlaxDeepseekV2MoE(nn.Module):
 		self.ep_rank = 0
 		self.experts = self.experts = [
 			FlaxDeepseekV2MLP(
-				config=self.config,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				config=config,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 				intermediate_size=self.config.moe_intermediate_size,
 				rngs=rngs,
 			)
@@ -379,18 +379,18 @@ class FlaxDeepseekV2MoE(nn.Module):
 		]
 		self.gate = FlaxMoEGate(
 			config=config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 		if config.n_shared_experts is not None:
 			intermediate_size = config.moe_intermediate_size * config.n_shared_experts
 			self.shared_experts = FlaxDeepseekV2MoE(
-				config=self.config,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				config=config,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 				intermediate_size=intermediate_size,
 				rngs=rngs,
 			)
@@ -449,9 +449,9 @@ class FlaxDeepseekV2Attention(FlaxAttentionModule):
 
 		linear = functools.partial(
 			nn.Linear,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		if self.config.q_lora_rank is None:
 			self.q_proj = nn.Linear(
@@ -696,18 +696,18 @@ class FlaxDeepseekV2DecoderLayer(nn.Module):
 
 		self.self_attn = attn_block(
 			config=config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 
 		self.mlp = (
 			mlp_moe_block(
 				config=config,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 				rngs=rngs,
 			)
 			if (
@@ -717,24 +717,24 @@ class FlaxDeepseekV2DecoderLayer(nn.Module):
 			)
 			else mlp_block(
 				config=config,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 				rngs=rngs,
 			)
 		)
 		self.input_layernorm = RMSNorm(
 			config.hidden_size,
 			eps=config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 		self.post_attention_layernorm = RMSNorm(
 			config.hidden_size,
 			eps=config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 
@@ -839,17 +839,17 @@ class FlaxDeepseekV2Model(EasyDeLBaseModule):
 			self.config.vocab_size,
 			self.config.hidden_size,
 			embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 
 		self.layers = [
 			FlaxDeepseekV2DecoderLayer(
-				config=self.config,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
+				config=config,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 				layer_idx=i,
 				rngs=rngs,
 			)
@@ -858,8 +858,8 @@ class FlaxDeepseekV2Model(EasyDeLBaseModule):
 		self.norm = RMSNorm(
 			self.config.hidden_size,
 			eps=self.config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 			rngs=rngs,
 		)
 
@@ -895,11 +895,11 @@ class FlaxDeepseekV2Model(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		past_key_values: Optional[TransformerCache] = None,
@@ -1005,31 +1005,31 @@ class FlaxDeepseekV2ForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 		self.model = FlaxDeepseekV2Model(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			rngs=rngs,
 		)
 		self.lm_head = nn.Linear(
-			self.config.hidden_size,
-			self.config.vocab_size,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config.hidden_size,
+			config.vocab_size,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			use_bias=False,
-			kernel_init=nn.initializers.normal(self.config.initializer_range),
+			kernel_init=nn.initializers.normal(config.initializer_range),
 			rngs=rngs,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		past_key_values: Optional[TransformerCache] = None,

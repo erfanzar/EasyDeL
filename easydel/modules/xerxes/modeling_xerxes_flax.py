@@ -90,16 +90,16 @@ class FlaxXerxesAttention(FlaxAttentionModule):
 		self.num_key_value_heads = config.num_key_value_heads
 		self.num_key_value_groups = self.num_heads // self.num_key_value_heads
 
-		kernel = jax.nn.initializers.normal(self.config.initializer_range)
+		kernel = jax.nn.initializers.normal(config.initializer_range)
 
 		dense_class = functools.partial(
 			Dense,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			use_bias=False,
 			kernel_init=kernel,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.q_proj = dense_class(self.num_heads * self.head_dim)
 		self.k_proj = dense_class(self.num_key_value_heads * self.head_dim)
@@ -271,17 +271,17 @@ class FlaxXerxesMLP(nn.Module):
 	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
-		kernel_init = jax.nn.initializers.normal(self.config.initializer_range)
+		kernel_init = jax.nn.initializers.normal(config.initializer_range)
 
 		self.act = functools.partial(nn.gelu, approximate=True)
 		dense_class = functools.partial(
 			Dense,
 			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 			kernel_init=kernel_init,
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.gate_proj = dense_class(self.config.intermediate_size)
 		self.up_proj = dense_class(self.config.intermediate_size)
@@ -304,11 +304,10 @@ class FlaxXerxesBlocKSparesMLPCollection(nn.Module):
 	def setup(self) -> None:
 		self.layers = [
 			FlaxXerxesMLP(
-				config=self.config,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
-				name=str(i),
+				config=config,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 			)
 			for i in range(self.config.num_local_experts)
 		]
@@ -352,17 +351,17 @@ class FlaxXerxesSparseMoeBlock(nn.Module):
 		self.gate = Dense(
 			self.config.num_local_experts,
 			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-			kernel_init=nn.initializers.normal(self.config.initializer_range),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			kernel_init=nn.initializers.normal(config.initializer_range),
 		)
 
 		self.experts = FlaxXerxesBlocKSparesMLPCollection(
-			config=self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 
 	def __call__(
@@ -417,22 +416,22 @@ class FlaxXerxesDecoderLayer(nn.Module):
 		self.self_attn = attn_block(
 			self.config,
 			layer_idx=self.layer_idx,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.mlp = mlp_block(
-			self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		rms = functools.partial(
 			RMSNorm,
 			dim=self.config.hidden_size,
 			eps=self.config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 		self.input_layernorm = rms()
 		self.post_attention_layernorm = rms()
@@ -510,10 +509,9 @@ class FlaxXerxesLayerCollection(nn.Module):
 			FlaxXerxesDecoderLayer(
 				self.config,
 				layer_idx=i,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				precision=self.precision,
-				name=str(i),
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 			)
 			for i in range(self.config.num_hidden_layers)
 		]
@@ -615,20 +613,20 @@ class FlaxXerxesModel(nn.Module):
 			self.config.vocab_size,
 			self.hidden_size,
 			embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 		self.layers = FlaxXerxesLayerCollection(
-			self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.norm = RMSNorm(
 			dim=self.config.hidden_size,
 			eps=self.config.rms_norm_eps,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
+			dtype=dtype,
+			param_dtype=param_dtype,
 		)
 
 		self.causal_mask = make_causal_mask(
@@ -642,11 +640,11 @@ class FlaxXerxesModel(nn.Module):
 	# Ignore copy
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		past_key_values: Optional[TransformerCache] = None,
@@ -694,10 +692,10 @@ class FlaxXerxesModel(nn.Module):
 				attention_mask=attention_mask,
 				position_ids=position_ids,
 				cache_view=past_key_values.views[idx],
-				causal_mask=self.config.get_basic_causal_mask(),
+				causal_mask=self.causal_mask,
 				output_attentions=output_attentions,
 				segment_ids=segment_ids,
-				frequencies=self.config.get_basic_frequencies(),
+				frequencies=self.frequencies,
 			)
 			hidden_states = layer_outputs[0]
 
@@ -735,29 +733,29 @@ class FlaxXerxesForCausalLM(nn.Module):
 	precision: Optional[Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
-		self.model = FlaxXerxesModel.flax_module(
-			self.config,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
+		self.model = FlaxXerxesModel(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
 		)
 		self.lm_head = Dense(
 			self.config.vocab_size,
 			use_bias=False,
-			dtype=self.dtype,
-			param_dtype=self.param_dtype,
-			precision=self.precision,
-			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
-			**get_dot_general_by_bits(self.config.bits, self.config.easy_method),
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
 	def __call__(
 		self,
-		input_ids: chex.Array,
+		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		past_key_values: Optional[TransformerCache] = None,
