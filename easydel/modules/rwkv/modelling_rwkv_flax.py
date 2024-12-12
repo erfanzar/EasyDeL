@@ -19,7 +19,6 @@ import chex
 import jax.lax
 from flax import linen as nn
 from flax.core import FrozenDict, freeze, unfreeze
-from flax.linen import Dense
 from flax.struct import dataclass
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import numpy as jnp
@@ -625,6 +624,7 @@ class FlaxRwkvModel(nn.Module):
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
 
 		self.ln_out = nn.LayerNorm(

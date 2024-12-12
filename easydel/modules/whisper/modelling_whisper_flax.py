@@ -23,8 +23,6 @@ import jax.numpy as jnp
 # import transformers
 from flax import linen as nn
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
-from flax.linen import Dense, combine_masks, make_causal_mask
-from flax.linen import partitioning as nn_partitioning
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
 from jax.random import PRNGKey
@@ -55,7 +53,7 @@ from easydel.modules.modeling_flax_outputs import (
 )
 from easydel.modules.whisper.whisper_configuration import WhisperConfig as WhisperConfig
 
-remat = nn_partitioning.remat
+remat = nn.remat
 
 
 def sinusoidal_embedding_init(key, shape, dtype=jnp.float_) -> jax.Array:
@@ -327,10 +325,11 @@ class FlaxWhisperEncoderLayerCollection(nn.Module):
 			)
 		self.layers = [
 			block(
-				self.config,
+				config=config,
 				dtype=dtype,
 				param_dtype=param_dtype,
 				precision=precision,
+				rngs=rngs,
 			)
 			for i in range(self.config.encoder_layers)
 		]
@@ -370,7 +369,7 @@ class FlaxWhisperEncoderLayerCollection(nn.Module):
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
 
-		outputs = (hidden_states, all_hidden_states, all_attentions)
+		outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
 
 		if not return_dict:
 			return tuple(v for v in outputs if v is not None)
@@ -513,10 +512,11 @@ class FlaxWhisperDecoderLayerCollection(nn.Module):
 			)
 		self.layers = [
 			block(
-				self.config,
+				config=config,
 				dtype=dtype,
 				param_dtype=param_dtype,
 				precision=precision,
+				rngs=rngs,
 			)
 			for i in range(self.config.decoder_layers)
 		]
@@ -625,6 +625,7 @@ class FlaxWhisperEncoder(nn.Module):
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
 
 		self.embed_positions = nn.Embed(
@@ -740,6 +741,7 @@ class FlaxWhisperDecoder(nn.Module):
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
 
 		self.dropout_layer = nn.Dropout(rate=self.config.dropout)
@@ -827,12 +829,14 @@ class FlaxWhisperModule(nn.Module):
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
 		self.decoder = FlaxWhisperDecoder(
 			config=config,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
 
 	def _get_decoder_module(self):
@@ -1250,6 +1254,7 @@ class FlaxWhisperForConditionalGenerationModule(nn.Module):
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
 		self.proj_out = Dense(
 			self.config.vocab_size,
@@ -1619,6 +1624,7 @@ class FlaxWhisperForAudioClassificationModule(nn.Module):
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
 		self.config.is_encoder_decoder = False
 		num_layers = self.config.num_hidden_layers + 1

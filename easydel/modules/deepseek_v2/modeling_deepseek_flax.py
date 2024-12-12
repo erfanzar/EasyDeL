@@ -18,7 +18,6 @@ import typing
 from typing import Optional, Tuple, Union
 
 import chex
-import flax
 import jax
 from flax import nnx as nn
 from jax import lax
@@ -43,22 +42,7 @@ from easydel.modules.deepseek_v2.deepseek_configuration import (
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
-	FlaxMaskedLMOutput,
 )
-
-
-@flax.struct.dataclass
-class MoeModelOutput:
-	last_hidden_state: chex.Array = None
-	hidden_states: Optional[Tuple[chex.Array]] = None
-	attentions: Optional[Tuple[chex.Array]] = None
-	router_logits: Optional[Tuple[chex.Array]] = None
-
-
-@flax.struct.dataclass
-class MoeCausalLMOutput(FlaxMaskedLMOutput):
-	aux_loss: Optional[chex.Array] = None
-	router_logits: Optional[Tuple[chex.Array]] = None
 
 
 def yarn_find_correction_dim(
@@ -969,15 +953,16 @@ class FlaxDeepseekV2Model(EasyDeLBaseModule):
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-		outputs = (hidden_states, all_hidden_states, all_attentions)
+		outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
 
 		if not return_dict:
 			return tuple(value for value in outputs if value is not None)
 
 		return FlaxBaseModelOutput(
 			last_hidden_state=hidden_states,
-			hidden_states=outputs[1],
-			attentions=outputs[-1],
+			hidden_states=all_hidden_states,
+			attentions=all_attentions,
+			past_key_values=past_key_values,
 		)
 
 
@@ -1062,4 +1047,5 @@ class FlaxDeepseekV2ForCausalLM(EasyDeLBaseModule):
 			logits=lm_logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
+			past_key_values=outputs.past_key_values,
 		)

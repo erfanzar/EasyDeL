@@ -213,14 +213,3 @@ class TransformerCache:
 		)
 
 	__str__ = __repr__
-
-
-if __name__ == "__main__":
-	metadata = TransformerCacheMetaData.create(
-		batch_size=1,
-		sequence_length=2048,
-		num_heads=4,
-		head_dim=64,
-	)
-	past_key_values = TransformerCache.init_layers_cache(4, metadata=metadata)
-	print(past_key_values)

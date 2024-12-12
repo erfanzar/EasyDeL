@@ -16,7 +16,6 @@ import functools
 from typing import Optional, Union
 
 import chex
-import flax
 import jax
 from flax import nnx as nn
 from jax import numpy as jnp
@@ -229,13 +228,13 @@ class GPTNeoXBlock(nn.Module):
 		mlp_block = GPTNeoXMlp
 
 		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
-			attn_block = flax.linen.partitioning.remat(
+			attn_block = nn.remat(
 				attn_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 				static_argnums=(4, 5, 6, 7),
 			)
 
-			mlp_block = flax.linen.partitioning.remat(
+			mlp_block = nn.remat(
 				mlp_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 				static_argnums=(1,),
@@ -518,4 +517,5 @@ class GPTNeoXForCausalLM(EasyDeLBaseModule):
 			logits=lm_logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
+			past_key_values=outputs.past_key_values,
 		)

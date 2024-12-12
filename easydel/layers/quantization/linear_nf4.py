@@ -152,11 +152,11 @@ class LinearNF4(Module):
 		if do_init:
 			kernel_key = rngs.params()
 			kernel = kernel_init(kernel_key, (in_features, out_features), param_dtype)
-			packed_kernel, scales = self._quantize_kernel(kernel)
+			kernel, scales = self._quantize_kernel(kernel)
 		else:
-			packed_kernel, scales = None, None
+			kernel, scales = None, None
 
-		self.packed_kernel = nnx.Param(packed_kernel)
+		self.kernel = nnx.Param(kernel)
 		self.scales = nnx.Param(scales)
 
 		if use_bias and do_init:
@@ -203,8 +203,8 @@ class LinearNF4(Module):
 			)
 		)
 
-		packed_kernel, scales = cls._quantize_kernel(linear.kernel.value, block_size)
-		instance.packed_kernel = nnx.Param(packed_kernel)
+		kernel, scales = cls._quantize_kernel(linear.kernel.value, block_size)
+		instance.kernel = nnx.Param(kernel)
 		instance.scales = nnx.Param(scales)
 
 		if linear.use_bias:
@@ -221,9 +221,9 @@ class LinearNF4(Module):
 				in_features=self.in_features,
 				out_features=self.out_features,
 				use_bias=self.use_bias,
-				dtype=dtype,
-				param_dtype=param_dtype,
-				precision=precision,
+				dtype=self.dtype,
+				param_dtype=self.param_dtype,
+				precision=self.precision,
 				kernel_init=self.kernel_init,
 				bias_init=self.bias_init,
 				dot_general=self.dot_general,
@@ -242,12 +242,22 @@ class LinearNF4(Module):
 	@staticmethod
 	def _quantize_kernel(kernel, block_size):
 		"""Quantize the kernel weights using NF4."""
+		if kernel is None:
+			return None, None
 		return quantize_and_pack_nf4(kernel, block_size)
 
-	def _dequantize_kernel(self):
+	def _dequantize_kernel(self):  # in case someone's using tie word embedding.
 		"""Dequantize the kernel weights from NF4."""
+		if (
+			self.kernel.value is None
+			and self.scales.value is None
+			and self.block_size is None
+		):
+			return None
+		elif self.scales.value is None and self.block_size is None:
+			return self.kernel
 		return dequantize_nf4(
-			self.packed_kernel.value,
+			self.kernel.value,
 			self.scales.value,
 			self.block_size,
 		).reshape(self.in_features, self.out_features)
@@ -255,6 +265,11 @@ class LinearNF4(Module):
 	def __call__(self, inputs: Array) -> Array:
 		"""Applies a quantized linear transformation to the inputs along the last dimension."""
 		kernel = self._dequantize_kernel()
+
+		assert (
+			kernel is not None
+		), "loaded and dequantized kernel is None, which means it have been loaded from another None Kernel Linear"
+
 		bias = self.bias.value
 
 		inputs, kernel, bias = dtypes.promote_dtype(
@@ -279,4 +294,4 @@ class LinearNF4(Module):
 
 	def get_quantized_kernel(self):
 		"""Get the quantized kernel weights and scales."""
-		return self.packed_kernel.value, self.scales.value
+		return self.kernel.value, self.scales.value

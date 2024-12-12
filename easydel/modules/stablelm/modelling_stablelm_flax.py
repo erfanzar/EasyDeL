@@ -13,19 +13,18 @@
 # limitations under the License.
 
 import math
+from functools import cached_property, partial
 from typing import Optional, Tuple, Union
 
 import chex
-import flax.linen.partitioning
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
-from flax.linen import Dense
+from flax import nnx as nn
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.modules._base.base_module import wrap_easydel_module
+from easydel.modules._base.base_module import EasyDeLBaseModule
 
 # easydel.modules
 from easydel.modules._base.factory import register_module
@@ -45,98 +44,80 @@ from easydel.modules.stablelm.stablelm_configuration import (
 )
 
 
-class FlaxStableLmMLP(nn.Module):
-	"""
-	FlaxStableLmMLP is a multi-layer perceptron (MLP) module for neural network models,
-	configured with specific settings.
-
-	Attributes:
-	    config (StableLmConfig): Configuration object containing model parameters.
-	    dtype (jnp.dtype): Data type for computation (default is jnp.bfloat16).
-	    param_dtype (jnp.dtype): Data type for model parameters (default is jnp.bfloat16).
-	    precision (Optional[jax.lax.Precision]): Precision setting for JAX operations (default is "fastest").
-
-	"""
-
-	config: StableLmConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
-		config = self.config
-
-		self.gate_proj = Dense(
-			config.intermediate_size,
+class StableLmMLP(nn.Module):
+	def __init__(
+		self,
+		config: StableLmConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		linear_class = partial(
+			nn.Linear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
 			kernel_init=jax.nn.initializers.normal(config.initializer_range),
-			precision=self.precision,
+			precision=precision,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
-		self.down_proj = Dense(
+
+		self.gate_proj = linear_class(
 			config.hidden_size,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(config.initializer_range),
-			precision=self.precision,
-			**get_dot_general_by_bits(config.bits, config.easy_method),
-		)
-		self.up_proj = Dense(
 			config.intermediate_size,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(config.initializer_range),
-			precision=self.precision,
-			**get_dot_general_by_bits(config.bits, config.easy_method),
+			rngs=rngs,
+		)
+		self.down_proj = linear_class(
+			config.intermediate_size,
+			config.hidden_size,
+			rngs=rngs,
+		)
+		self.up_proj = linear_class(
+			config.hidden_size,
+			config.intermediate_size,
+			rngs=rngs,
 		)
 		self.act_fn = ACT2FN[config.hidden_act]
 
-	def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-		"""
-		Forward pass of the MLP module.
+	def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
+		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
 
-		Args:
-		    self: Represent the instance of the class
-		    x: jnp.ndarray: Pass in the input to the layer
-		    deterministic: bool: Determine whether to use dropout #
-		        Ignored
-
-		Returns:
-		    A tensor that is the result of function to x
-		"""
-
-		x = control_mlp_sharding(x, self.config.partition_axis)
-
-		return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+		return self.down_proj(
+			self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+		)
 
 
-class StableLmLayerNormPerHeadStack(nn.Module):
-	num_heads: int
-	eps: float = 1e-5
-	bias: bool = False
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self):
+class StableLmLayerNormPerHead(nn.Module):
+	def __init__(
+		self,
+		head_dim: int,
+		num_heads: int,
+		eps: float = 1e-5,
+		bias: bool = False,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		*,
+		rngs: nn.Rngs,
+	):
 		self.norms = [
 			nn.LayerNorm(
-				epsilon=self.eps,
-				use_bias=self.bias,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
-				name=str(idx),
+				head_dim,
+				epsilon=eps,
+				use_bias=bias,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				rngs=rngs,
 			)
-			for idx in range(self.num_heads)
+			for idx in range(num_heads)
 		]
 
 	def __call__(self, hidden_states):
-		# Split along the num_heads axis to get per-head inputs
-		# [batch_size, num_heads, seq_len, head_dim] -> [batch_size, 1, seq_len, head_dim] * num_heads
 		states_per_heads = jnp.split(hidden_states, 1, axis=1)
 		# Normalize and merge the heads back together
 		return jnp.concatenate(
@@ -147,46 +128,21 @@ class StableLmLayerNormPerHeadStack(nn.Module):
 		)
 
 
-class StableLmLayerNormPerHead(nn.Module):
-	num_heads: int
-	eps: float = 1e-5
-	bias: bool = False
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self):
-		self.norms = StableLmLayerNormPerHeadStack(
-			self.num_heads,
-			self.eps,
-			self.bias,
-			self.dtype,
-			self.param_dtype,
-			self.precision,
-		)
-
-	def __call__(self, hidden_states):
-		return self.norms(hidden_states)
-
-
-class FlaxStableLmAttention(FlaxAttentionModule):
-	"""
-	FlaxStableLmAttention implements an attention mechanism with rotary embeddings.
-
-	Attributes:
-	    config (StableLmConfig): Configuration for the attention module.
-	    dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
-	    param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
-	    precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
-	"""
-
-	config: StableLmConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self):
-		config: StableLmConfig = self.config
+class StableLmAttention(FlaxAttentionModule):
+	def __init__(
+		self,
+		config: StableLmConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(config=config)
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
 		self.hidden_size = config.hidden_size
 		self.num_heads = config.num_attention_heads
 		self.head_dim = self.hidden_size // self.num_heads
@@ -198,41 +154,38 @@ class FlaxStableLmAttention(FlaxAttentionModule):
 
 		if self.num_key_value_groups == 1:
 			assert self.config.num_attention_heads == self.config.num_key_value_heads
-		self.q_proj = Dense(
-			config.num_attention_heads * self.head_dim,
+
+		linear_class = partial(
+			nn.Linear,
 			dtype=dtype,
 			param_dtype=param_dtype,
-			use_bias=self.config.use_qkv_bias,
 			kernel_init=jax.nn.initializers.normal(config.initializer_range),
-			precision=self.precision,
+			precision=precision,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
-		self.k_proj = Dense(
-			config.num_key_value_heads * self.head_dim,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			use_bias=self.config.use_qkv_bias,
-			kernel_init=jax.nn.initializers.normal(config.initializer_range),
-			precision=self.precision,
-			**get_dot_general_by_bits(config.bits, config.easy_method),
-		)
-		self.v_proj = Dense(
-			config.num_key_value_heads * self.head_dim,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			use_bias=self.config.use_qkv_bias,
-			kernel_init=jax.nn.initializers.normal(config.initializer_range),
-			precision=self.precision,
-			**get_dot_general_by_bits(config.bits, config.easy_method),
-		)
-		self.o_proj = Dense(
+		self.q_proj = linear_class(
 			config.hidden_size,
-			dtype=dtype,
-			param_dtype=param_dtype,
+			config.num_attention_heads * self.head_dim,
+			use_bias=self.config.use_qkv_bias,
+			rngs=rngs,
+		)
+		self.k_proj = linear_class(
+			config.hidden_size,
+			config.num_key_value_heads * self.head_dim,
+			use_bias=self.config.use_qkv_bias,
+			rngs=rngs,
+		)
+		self.v_proj = linear_class(
+			config.hidden_size,
+			config.num_key_value_heads * self.head_dim,
+			use_bias=self.config.use_qkv_bias,
+			rngs=rngs,
+		)
+		self.o_proj = linear_class(
+			config.num_attention_heads * self.head_dim,
+			config.hidden_size,
 			use_bias=False,
-			kernel_init=jax.nn.initializers.normal(config.initializer_range),
-			precision=self.precision,
-			**get_dot_general_by_bits(config.bits, config.easy_method),
+			rngs=rngs,
 		)
 
 		self.rotary_emb_dim = int(self.config.partial_rotary_factor * self.head_dim)
@@ -254,16 +207,20 @@ class FlaxStableLmAttention(FlaxAttentionModule):
 		self.qk_layernorm = config.qk_layernorm
 		if self.qk_layernorm:
 			self.q_layernorm = StableLmLayerNormPerHead(
-				self.num_heads,
+				head_dim=self.head_dim,
+				num_heads=config.num_attention_heads,
 				eps=config.layer_norm_eps,
 				dtype=self.dtype,
 				param_dtype=self.param_dtype,
+				rngs=rngs,
 			)
 			self.k_layernorm = StableLmLayerNormPerHead(
-				self.num_key_value_heads,
+				head_dim=self.head_dim,
+				num_heads=config.num_key_value_heads,
 				eps=config.layer_norm_eps,
 				dtype=self.dtype,
 				param_dtype=self.param_dtype,
+				rngs=rngs,
 			)
 
 		self.rotary = self.config.get_basic_rope(
@@ -288,22 +245,6 @@ class FlaxStableLmAttention(FlaxAttentionModule):
 		fcm_mask: Optional[chex.Array] = None,
 		frequencies: Optional[chex.Array] = None,
 	):
-		"""
-		Forward pass of the attention module.
-
-		Args:
-		    hidden_states (chex.Array): Input hidden states.
-		    attention_mask (chex.Array): Mask to apply on the attention scores.
-		    position_ids (chex.Array): Position indices for the tokens.
-		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-		    segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-		    deterministic (bool): If True, disables dropout for deterministic behavior.
-		    init_cache (bool): If True, initializes cache for caching keys and values.
-		    output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-		    fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
-		Returns:
-		    Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
-		"""
 		batch_size, sequence_length = hidden_states.shape[:2]
 		query_states, key_states, value_states = (
 			self.q_proj(hidden_states),
@@ -387,24 +328,31 @@ class FlaxStableLmAttention(FlaxAttentionModule):
 		return outputs
 
 
-class FlaxStableLmDecoderLayer(nn.Module):
-	config: StableLmConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
-
-	def setup(self):
-		attn_block = FlaxStableLmAttention
-		mlp_block = FlaxStableLmMLP
+class StableLmDecoderLayer(nn.Module):
+	def __init__(
+		self,
+		config: StableLmConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		attn_block = StableLmAttention
+		mlp_block = StableLmMLP
 		self.use_parallel_residual = self.config.use_parallel_residual
 		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
-			mlp_block = flax.linen.partitioning.remat(
+			mlp_block = nn.remat(
 				mlp_block,
 				static_argnums=(1,),
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 			)
 
-			attn_block = flax.linen.partitioning.remat(
+			attn_block = nn.remat(
 				attn_block,
 				static_argnums=(3, 5, 6, 7, 9),
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
@@ -414,25 +362,31 @@ class FlaxStableLmDecoderLayer(nn.Module):
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
 		self.mlp = mlp_block(
 			config=config,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
 		self.input_layernorm = nn.LayerNorm(
-			epsilon=self.config.layer_norm_eps,
+			config.hidden_size,
+			epsilon=config.layer_norm_eps,
 			dtype=dtype,
 			param_dtype=param_dtype,
+			rngs=rngs,
 		)
 		if not self.use_parallel_residual:
 			self.post_attention_layernorm = nn.LayerNorm(
-				epsilon=self.config.layer_norm_eps,
-				dtype=self.dtype,
-				param_dtype=self.param_dtype,
+				config.hidden_size,
+				epsilon=config.layer_norm_eps,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				rngs=rngs,
 			)
-		self.dropout = nn.Dropout(self.config.hidden_dropout)
+		self.dropout = nn.Dropout(self.config.hidden_dropout, rngs=rngs)
 
 	def __call__(
 		self,
@@ -446,22 +400,6 @@ class FlaxStableLmDecoderLayer(nn.Module):
 		fcm_mask: Optional[chex.Array] = None,
 		frequencies: Optional[chex.Array] = None,
 	):
-		"""
-		Forward pass of the module block.
-
-		Args:
-		    hidden_states (chex.Array): Input hidden states.
-		    attention_mask (chex.Array): Mask to apply on the attention scores.
-		    position_ids (chex.Array): Position indices for the tokens.
-		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-		    segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-		    deterministic (bool): If True, disables dropout for deterministic behavior.
-		    init_cache (bool): If True, initializes cache for caching keys and values.
-		    output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-		    fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
-		Returns:
-		    Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
-		"""
 		residual = hidden_states
 		hidden_states = self.input_layernorm(hidden_states)
 		attn_out = self.self_attn(
@@ -482,16 +420,10 @@ class FlaxStableLmDecoderLayer(nn.Module):
 		if self.use_parallel_residual:
 			if self.config.use_scan_mlp:
 				hidden_states = block_wise_ffn(
-					self.mlp,
-					hidden_states,
-					self.config.scan_mlp_chunk_size,
-					deterministic,
+					self.mlp, hidden_states, self.config.scan_mlp_chunk_size
 				)
 			else:
-				hidden_states = self.mlp(
-					hidden_states,
-					deterministic,
-				)
+				hidden_states = self.mlp(hidden_states)
 
 			hidden_states = self.dropout(hidden_states)
 			hidden_states = hidden_states + residual + attn_out
@@ -502,13 +434,9 @@ class FlaxStableLmDecoderLayer(nn.Module):
 					self.mlp,
 					self.post_attention_layernorm(residual),
 					self.config.scan_mlp_chunk_size,
-					deterministic,
 				)
 			else:
-				hidden_states = self.mlp(
-					self.post_attention_layernorm(residual),
-					deterministic,
-				)
+				hidden_states = self.mlp(self.post_attention_layernorm(residual))
 			hidden_states = self.dropout(hidden_states)
 			hidden_states = hidden_states + residual
 		outputs = (hidden_states,)
@@ -517,120 +445,6 @@ class FlaxStableLmDecoderLayer(nn.Module):
 			outputs += (self_attn_weights,)
 
 		return outputs
-
-
-class FlaxStableLmDecoderLayerCollection(nn.Module):
-	"""
-	FlaxStableLmDecoratorCollection represents a single layer in a Transformer-like model,
-	incorporating self-attention and MLP.
-
-	Attributes:
-	    config (StableLmConfig): Configuration object containing model parameters.
-	    dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
-	    param_dtype (jnp.dtype): Data type for model parameters (default is jnp.bfloat16).
-	    precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
-	"""
-
-	config: StableLmConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
-
-	def setup(self) -> None:
-		self.layers = [
-			FlaxStableLmDecoderLayer(
-				config=config,
-				dtype=dtype,
-				param_dtype=param_dtype,
-				precision=precision,
-				name=str(idx),
-			)
-			for idx in range(self.config.num_hidden_layers)
-		]
-		rotary_emb_dim = int(
-			self.config.partial_rotary_factor
-			* (self.config.hidden_size // self.config.num_attention_heads)
-		)
-		self._frequencies = self.config.get_basic_frequencies(
-			head_size=rotary_emb_dim,
-			rotary_dim=rotary_emb_dim,
-		)
-
-	def __call__(
-		self,
-		hidden_states: chex.Array,
-		attention_mask: chex.Array,
-		causal_mask: chex.Array,
-		position_ids: chex.Array,
-		segment_ids: Optional[chex.Array] = None,
-		deterministic: bool = True,
-		init_cache: bool = False,
-		output_attentions: bool = False,
-		output_hidden_states: bool = False,
-	) -> Tuple[chex.Array, Optional[chex.Array], chex.Array]:
-		"""
-		Forward pass through the collection of decoder layers.
-
-		Args:
-		    hidden_states (chex.Array): Input tensor containing the hidden states.
-		    attention_mask (chex.Array): Mask to apply during attention.
-		    causal_mask (chex.Array): Causal mask for autoregressive decoding.
-		    position_ids (chex.Array): Positional indices for the sequence.
-		    segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
-		    deterministic (bool): If True, disables dropout.
-		    init_cache (bool): If True, initializes caching mechanism for fast decoding.
-		    output_attentions (bool): If True, returns attention weights.
-		    output_hidden_states (bool): If True, returns hidden states.
-
-		Returns:
-		    Tuple[chex.Array, Optional[chex.Array], chex.Array]:
-		        - hidden_states: The output tensor after layer processing.
-		        - all_hidden_states: all of Hidden states (if `output_hidden_states` is True).
-		        - self_attn_weights: Attention weights (if `output_attentions` is True).
-
-		"""
-		all_attentions = () if output_attentions else None
-		all_hidden_states = () if output_hidden_states else None
-		if not deterministic and self.config.fcm_max_ratio > 0:
-			# Apply forgetful causal mask
-			batch_size, seq_length = hidden_states.shape[0], hidden_states.shape[1]
-			fcm_ratio = jax.random.uniform(
-				self.make_rng("fcm"),
-				shape=(batch_size, 1, 1, 1),
-				minval=self.config.fcm_min_ratio,
-				maxval=self.config.fcm_max_ratio,
-			)
-			fcm_mask = (
-				jax.random.uniform(
-					self.make_rng("fcm"), shape=(batch_size, 1, seq_length, seq_length)
-				)
-				> fcm_ratio
-			)
-			fcm_mask = fcm_mask.at[:, :, :, 0].set(True)
-			fcm_mask = fcm_mask.astype("bool")
-		else:
-			fcm_mask = None
-		for decoder_layer in self.layers:
-			if output_hidden_states:
-				all_hidden_states += (hidden_states,)
-
-			layer_outputs = decoder_layer(
-				hidden_states=hidden_states,
-				attention_mask=attention_mask,
-				position_ids=position_ids,
-				causal_mask=self.causal_mask,
-				cache_view=past_key_values.views[idx],
-				output_attentions=output_attentions,
-				segment_ids=segment_ids,
-				frequencies=self.frequencies,
-			)
-
-			hidden_states = layer_outputs[0]
-
-			if output_attentions:
-				output_attentions += (layer_outputs[1],)
-
-		return hidden_states, all_hidden_states, all_attentions
 
 
 @register_module(
@@ -645,25 +459,24 @@ class FlaxStableLmDecoderLayerCollection(nn.Module):
 		"norms",
 	],
 )
-@wrap_easydel_module(config_class=StableLmConfig, base_model_prefix="model")
-class FlaxStableLmModel(nn.Module):
-	"""
-	Core module of the StableLm model, including embedding, decoder layers, and normalization.
+class StableLmModel(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: StableLmConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
 
-	Attributes:
-	    config (StableLmConfig): Configuration object with model hyperparameters.
-	    dtype (jnp.dtype): Data type for the computations.
-	    param_dtype (jnp.dtype): Data type for the model parameters.
-	    precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
-	"""
-
-	config: StableLmConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
-
-	def setup(self) -> None:
-		config = self.config
 		self.padding_idx = config.pad_token_id
 		self.vocab_size = config.vocab_size
 
@@ -672,17 +485,36 @@ class FlaxStableLmModel(nn.Module):
 			config.hidden_size,
 			dtype=dtype,
 			param_dtype=param_dtype,
+			rngs=rngs,
 		)
-		self.layers = FlaxStableLmDecoderLayerCollection(
-			config=config,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			precision=precision,
-		)
+		self.layers = [
+			StableLmDecoderLayer(
+				config=config,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
+				rngs=rngs,
+			)
+			for idx in range(config.num_hidden_layers)
+		]
+
 		self.norm = nn.LayerNorm(
+			config.hidden_size,
 			epsilon=config.layer_norm_eps,
 			dtype=dtype,
 			param_dtype=param_dtype,
+			rngs=rngs,
+		)
+
+	@cached_property
+	def frequencies(self):
+		rotary_emb_dim = int(
+			self.config.partial_rotary_factor
+			* (self.config.hidden_size // self.config.num_attention_heads)
+		)
+		self._frequencies = self.config.get_basic_frequencies(
+			head_size=rotary_emb_dim,
+			rotary_dim=rotary_emb_dim,
 		)
 
 	def __call__(
@@ -735,6 +567,7 @@ class FlaxStableLmModel(nn.Module):
 			).astype(jnp.int32)
 		if attention_mask.ndim == 2:
 			attention_mask = jnp.expand_dims(attention_mask, (1, 2))
+		hidden_states = input_embeds
 
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
@@ -757,20 +590,20 @@ class FlaxStableLmModel(nn.Module):
 			if output_attentions:
 				all_attentions += (layer_outputs[1],)
 
-		hidden_states = outputs[0]
 		hidden_states = self.norm(hidden_states)
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-		outputs = (hidden_states, all_hidden_states, all_attentions)
+		outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
 
 		if not return_dict:
 			return tuple(value for value in outputs if value is not None)
 
 		return FlaxBaseModelOutput(
 			last_hidden_state=hidden_states,
-			hidden_states=outputs[1],
-			attentions=outputs[-1],
+			hidden_states=all_hidden_states,
+			attentions=all_attentions,
+			past_key_values=past_key_values,
 		)
 
 
@@ -786,38 +619,40 @@ class FlaxStableLmModel(nn.Module):
 		"norms",
 	],
 )
-@wrap_easydel_module(config_class=StableLmConfig, base_model_prefix="model")
-class FlaxStableLmForCausalLM(nn.Module):
-	"""
-	StableLm model for causal language modeling, including the language model head.
-
-	Attributes:
-	    config (StableLmConfig): Configuration object with model hyperparameters.
-	    dtype (jnp.dtype): Data type for the computations.
-	    param_dtype (jnp.dtype): Data type for the model parameters.
-	    precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
-	"""
-
-	config: StableLmConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
-
-	def setup(self) -> None:
-		self.model = FlaxStableLmModel(
+class StableLmForCausalLM(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: StableLmConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
 			config=config,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
+		)
+		self.model = StableLmModel(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
 		self.vocab_size = self.config.vocab_size
-		self.lm_head = Dense(
-			self.config.vocab_size,
+		self.lm_head = nn.Linear(
+			config.hidden_size,
+			config.vocab_size,
 			use_bias=False,
 			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
 
 	def __call__(
@@ -832,35 +667,6 @@ class FlaxStableLmForCausalLM(nn.Module):
 		past_key_values: Optional[TransformerCache] = None,
 		return_dict: bool = True,
 	) -> Union[FlaxCausalLMOutput, Tuple]:
-		"""
-		Forward pass through the StableLm module.
-
-		Args:
-		    input_ids (Optional[chex.Array]): Input tensor containing token IDs.
-		    attention_mask (Optional[chex.Array]): Mask for attention.
-		    position_ids (Optional[chex.Array]): Positional indices.
-		    segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-		    input_embeds (Optional[chex.Array]): Embedded input tensor.
-		    output_attentions (Optional[bool]): If True, output attention weights.
-		    output_hidden_states (Optional[bool]): If True, output hidden states.
-		    init_cache (bool): If True, initialize cache for decoding.
-		    deterministic (bool): If True, disable dropout.
-		    return_dict (bool): If True, return a dictionary of outputs.
-
-		Returns:
-		    FlaxCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
-		"""
-
-		batch_size, sequence_length = (
-			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
-		)
-		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
-		if position_ids is None:
-			position_ids = jnp.broadcast_to(
-				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-				(batch_size, sequence_length),
-			)
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
@@ -887,4 +693,5 @@ class FlaxStableLmForCausalLM(nn.Module):
 			logits=lm_logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
+			past_key_values=outputs.past_key_values,
 		)

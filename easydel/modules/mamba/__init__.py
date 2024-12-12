@@ -14,18 +14,12 @@
 
 from easydel.modules.mamba.mamba_configuration import MambaConfig
 from easydel.modules.mamba.modelling_mamba_flax import (
-	FlaxMambaCache,
-	FlaxMambaForCausalLM,
-	FlaxMambaForCausalLMModule,
-	FlaxMambaModel,
-	FlaxMambaModule,
+	MambaForCausalLM,
+	MambaModel,
 )
 
 __all__ = (
-	"FlaxMambaCache",
-	"FlaxMambaForCausalLM",
-	"FlaxMambaForCausalLMModule",
-	"FlaxMambaModel",
-	"FlaxMambaModule",
+	"MambaForCausalLM",
+	"MambaModel",
 	"MambaConfig",
 )

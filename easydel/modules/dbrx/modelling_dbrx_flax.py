@@ -17,7 +17,6 @@ from functools import cached_property
 from typing import Optional, Tuple, Union
 
 import chex
-import flax.struct
 import jax
 import jax.numpy as jnp
 from fjformer.functions import auxiliary_load_balancing_loss_func
@@ -41,21 +40,7 @@ from easydel.modules.dbrx.dbrx_configuration import (
 )
 from easydel.modules.dbrx.dbrx_configuration import DbrxConfig as DbrxConfig
 from easydel.modules.dbrx.dbrx_configuration import DbrxFFNConfig as DbrxFFNConfig
-from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
-
-
-@flax.struct.dataclass
-class MoeModelOutput:
-	last_hidden_state: chex.Array = None
-	hidden_states: Optional[Tuple[chex.Array]] = None
-	attentions: Optional[Tuple[chex.Array]] = None
-	router_logits: Optional[Tuple[chex.Array]] = None
-
-
-@flax.struct.dataclass
-class MoeCausalLMOutput(FlaxMaskedLMOutput):
-	aux_loss: Optional[chex.Array] = None
-	router_logits: Optional[Tuple[chex.Array]] = None
+from easydel.modules.modeling_flax_outputs import MoeCausalLMOutput, MoeModelOutput
 
 
 class DbrxAttention(FlaxAttentionModule):

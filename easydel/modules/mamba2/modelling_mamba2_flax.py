@@ -25,7 +25,6 @@ from chex import Array, PRNGKey, Shape
 from einops import einsum
 from flax import linen as nn
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
-from flax.linen import partitioning as nn_partitioning
 from flax.linen.dtypes import promote_dtype
 from flax.linen.linear import (
 	ConvGeneralDilatedT,
@@ -863,7 +862,7 @@ class FlaxMamba2Block(nn.Module):
 		)
 		block = FlaxMamba2Mixer
 		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
-			block = nn_partitioning.remat(
+			block = nn.remat(
 				block,
 				static_argnums=(1,),
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
@@ -954,6 +953,7 @@ class FlaxMamba2Module(nn.Module):
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
 
 		self.norm_f = FlaxMamba2RMSNorm(

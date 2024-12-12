@@ -27,19 +27,6 @@ class MetaValueRecreator:
 		return key
 
 
-class TreePath:
-	"""Helper class for managing nested dictionary paths"""
-
-	def __init__(self, parts: tuple, separator: tp.Optional[str] = None):
-		self.parts = parts
-		self.separator = separator
-
-	def __str__(self) -> str:
-		if self.separator is None:
-			return self.parts
-		return self.separator.join(self.parts)
-
-
 @struct.dataclass
 class _EmptyNode:
 	pass
@@ -54,6 +41,33 @@ class StateValidationResult:
 
 empty_node = _EmptyNode()
 M = tp.TypeVar("M")
+
+
+def int_key_to_string(xs):
+	flatten = False
+	if not is_flatten(xs):
+		flatten = True
+		xs = flatten_dict(xs)
+	for key in list(xs.keys()):
+		if not isinstance(key, str):
+			xs[tuple([str(k) for k in key])] = xs.pop(key)
+	if flatten:
+		xs = unflatten_dict(xs)
+	return xs
+
+
+def string_key_to_int(xs):
+	flatten = False
+	if not is_flatten(xs):
+		flatten = True
+		xs = flatten_dict(xs)
+	for key in list(xs.keys()):
+		if not isinstance(key, str):
+			new_key = tuple((int(k) if str(k).isdigit() else k) for k in key)
+			xs[new_key] = xs.pop(key)
+	if flatten:
+		xs = unflatten_dict(xs)
+	return xs
 
 
 def _dict_flatten_dict(xs, keep_empty_nodes=False, is_leaf=None, sep=None):
@@ -104,7 +118,6 @@ def flatten_dict(
 	keep_empty_nodes: bool = False,
 	is_leaf: tp.Optional[tp.Callable[[tuple, tp.Any], bool]] = None,
 	sep: tp.Optional[str] = None,
-	_prefix: tuple = (),
 ) -> tp.Dict[tp.Union[tuple, str], tp.Any]:
 	"""
 	Enhanced dictionary flattening with better type handling and validation.
@@ -114,7 +127,6 @@ def flatten_dict(
 	    keep_empty_nodes: Whether to keep empty dictionary nodes
 	    is_leaf: Optional function to determine leaf nodes
 	    sep: Optional separator for string keys
-	    _prefix: Internal use for recursion
 
 	Returns:
 	    Flattened dictionary
@@ -122,48 +134,28 @@ def flatten_dict(
 	Raises:
 	    TypeError: If input is not a dictionary or mapping
 	"""
-	if not isinstance(xs, (dict, tp.Mapping)):
-		raise TypeError(f"Expected dict or Mapping, got {type(xs)}")
 
-	result = {}
-
-	def add_item(path: tuple, value: tp.Any):
-		key = TreePath(path, sep).__str__()
-		result[key] = value
-
-	def should_flatten(path: tuple, value: tp.Any) -> bool:
-		if is_leaf and is_leaf(path, value):
-			return False
-		return isinstance(value, (dict, tp.Mapping))
-
-	for key, value in xs.items():
-		path = _prefix + (key,)
-		if should_flatten(path, value):
-			nested = flatten_dict(
-				value,
-				keep_empty_nodes=keep_empty_nodes,
-				is_leaf=is_leaf,
-				sep=sep,
-				_prefix=path,
-			)
-			if nested or keep_empty_nodes:
-				result.update(nested)
-		else:
-			add_item(path, value)
-
-	return result
+	if isinstance(xs, dict):
+		if sep is not None:
+			xs = int_key_to_string(xs)
+		return _dict_flatten_dict(
+			xs=xs,
+			keep_empty_nodes=keep_empty_nodes,
+			is_leaf=is_leaf,
+			sep=sep,
+		)
+	return traversals.flatten_mapping(
+		xs,
+		keep_empty_nodes=keep_empty_nodes,
+		is_leaf=is_leaf,
+		sep=sep,
+	)
 
 
 def unflatten_dict(xs, sep=None):
 	if isinstance(xs, dict):
-		return _dict_unflatten_dict(
-			xs=xs,
-			sep=sep,
-		)
-	return traversals.unflatten_mapping(
-		xs,
-		sep=sep,
-	)
+		return _dict_unflatten_dict(xs=xs, sep=sep)
+	return traversals.unflatten_mapping(xs, sep=sep)
 
 
 def nnx_init(
@@ -487,18 +479,22 @@ def merge_state_and_tree(tree: dict, state: nnx.State) -> nnx.State:
 		params = flatten_dict(params)
 	if not is_flatten(tree):
 		tree = flatten_dict(tree)
-	# for k, v in tree.items():
-	# 	print(k)
-	for key in list(params.keys()):
-		tree_value = tree.get(key, None)
-		if tree_value is not None:
-			params[key].value = tree_value
+	tree = string_key_to_int(tree)
+
+	for keys in list(params.keys()):
+		tree_values = tree.get(keys, None)
+
+		if tree_values is not None:
+			params[keys].value = tree_values
 		else:
-			if key[-1] == "kernel":
+			if keys[-1] == "kernel":
 				warnings.warn(
-					f"A Params/Kernel Might be missing, please double check ({key}).",
+					f"a parameter's missing at {keys}, please double check.",
 					stacklevel=1,
 				)
+			params[
+				keys
+			].value = None  # Avoid type '<class 'jax._src.api.ShapeDtypeStruct'>' is not a valid JAX type
 	others = recreate_meta_values(others)
 	state = refine_graphs(others, params)
 	return state

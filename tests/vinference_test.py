@@ -1,20 +1,32 @@
+# fmt:off
 import os
 import sys
-
-import transformers
+import threading
+import time
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-
+import easydel as ed
+# fmt:on
 import jax
 import torch
 from huggingface_hub import HfApi
 from jax import numpy as jnp
 from jax import sharding
 
-import easydel as ed
+import transformers
+
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
+
+
+def log_mem():
+	while True:
+		ed.utils.analyze_memory.SMPMemoryMonitor(5).print_current_status()
+		time.sleep(5)
+
+
+threading.Thread(target=log_mem)  # .start()
 
 
 def main():
@@ -29,7 +41,7 @@ def main():
 
 	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		pretrained_model_name_or_path,
-		auto_shard_model=False,
+		auto_shard_model=True,
 		sharding_axis_dims=sharding_axis_dims,
 		config_kwargs=ed.EasyDeLBaseConfigDict(
 			freq_max_position_embeddings=max_length,
@@ -52,7 +64,7 @@ def main():
 	tokenizer.padding_side = "left"
 	tokenizer.pad_token_id = tokenizer.eos_token_id
 	model.eval()
-	model = model.shard_model()
+	# model = model.shard_model()
 	inference = ed.vInference(
 		model=model,
 		tokenizer=tokenizer,

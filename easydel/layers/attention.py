@@ -249,7 +249,7 @@ def set_attrs_smartly_with_prp(
 		setattr(self, attr_name, new_attr)
 
 
-class FlexibleAttentionModule(object):
+class FlexibleAttentionModule(nn.Module):
 	"""
 	Manages different attention mechanisms for efficient computation in EasyDeL models.
 
@@ -1702,7 +1702,6 @@ class FlaxAttentionModule(nn.Module):
 			lambda x: jnp.transpose(x, (0, 2, 1, 3)),
 			args,
 		)
-
 
 	def _concatenate_to_cache(
 		self,

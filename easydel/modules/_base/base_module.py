@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import inspect
 import os
-import re
 import typing as tp
 import warnings
 from copy import deepcopy
@@ -27,18 +26,16 @@ import fjformer.sharding
 import jax
 import jax.extend
 import jax.tree_util
-from fjformer.checkpoint import CheckpointManager
-from fjformer.dtypes import Array8Bit
+
 from fjformer.sharding import match_partition_rules
 from flax import nnx as nn
-from flax.core import FrozenDict, unfreeze
+
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from transformers.generation.flax_utils import FlaxSampleOutput
 from transformers.utils.generic import working_or_temp_dir
 
-from easydel.etils.easystate import EasyDeLState
 from easydel.etils.etils import (
 	EasyDeLBackends,
 	EasyDeLPlatforms,
@@ -51,13 +48,21 @@ from easydel.layers.caching import (
 	TransformerCache,
 	TransformerCacheMetaData,
 )
+from easydel.modules._base.flax_modeling_utils import quantize_linear_layers
+from easydel.utils.checkpoint_managers import CheckpointManager
 from easydel.modules._base.base_config import EasyDeLBaseConfig
-from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN, EasyQuantizer
-from easydel.utils.traversals import flatten_dict, unflatten_dict
+from easydel.utils.quantizers import EasyQuantizer
+from easydel.utils.traversals import (
+	flatten_dict,
+	string_key_to_int,
+	unflatten_dict,
+	merge_model_and_tree,
+)
 from easydel.modules.modeling_flax_outputs import (
-	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 	FlaxSequenceClassifierOutput,
+	MoeCausalLMOutput,
+	MoeModelOutput,
 )
 
 logger = get_logger(__name__)
@@ -68,6 +73,8 @@ PartitionLike = tp.Optional[
 	tp.Union[tp.Mapping[str, tp.Callable], tp.Mapping[tuple, tp.Callable]]
 ]
 
+_CP = tp.TypeVar("CP")
+
 
 class EasyDeLBaseModule(nn.Module):
 	config_class: EasyDeLBaseConfig
@@ -77,13 +84,13 @@ class EasyDeLBaseModule(nn.Module):
 
 	def __init__(
 		self,
-		config: EasyDeLBaseConfig,
+		config: tp.Union[EasyDeLBaseConfig, _CP],
 		dtype: jnp.dtype,
 		param_dtype: jnp.dtype,
 		precision: lax.PrecisionLike,
 		rngs: nn.Rngs,
 	):
-		self.config = config
+		self.config: tp.Union[EasyDeLBaseConfig, _CP] = config
 		self.dtype = dtype
 		self.param_dtype = param_dtype
 		self.precision = precision
@@ -336,103 +343,52 @@ class EasyDeLBaseModule(nn.Module):
 
 		return filtered_kwargs
 
-	def to_easydel_state(
-		self,
-		params: FrozenDict,
-		auto_check_params: bool = True,
-	):
+	def to_easydel_state(self):
 		"""
 		Convert the Model to EasyDeLState
 		"""
-		if auto_check_params:
-			gp = params.get("params", None)
-			params = FrozenDict({"params": params} if gp is None else {"params": gp})
-		return EasyDeLState.load(
-			apply_fn=self.__call__,
-			params=params,
-			opt_state=None,
-			module_config=self.config,
-			module=self,
-			step=0,
-		)
+		# TODO: new arch
+		# return EasyDeLState.load(
+		# 	apply_fn=self.__call__,
+		# 	params=params,
+		# 	opt_state=None,
+		# 	module_config=self.config,
+		# 	module=self,
+		# 	step=0,
+		# )
 
 	def to_pytorch(
 		self,
-		params: FrozenDict,
 		base_hf_auto_class=None,
 		easystate_to_huggingface_model_kwargs: tp.Optional[dict] = None,
 	):
 		"""
 		Return the Huggingface / Pytorch implementation of the model with same weights  (if model is available in HF)
 		"""
-		if base_hf_auto_class is None:
-			from transformers import AutoModelForCausalLM as base_hf_auto_class
-		from easydel.transform.parameters_transformation import (
-			easystate_to_huggingface_model,
-		)
 
-		state = self.to_easydel_state(params=params)
-		if easystate_to_huggingface_model_kwargs is None:
-			easystate_to_huggingface_model_kwargs = {}
+		# TODO: new arch
+		# if base_hf_auto_class is None:
+		# 	from transformers import AutoModelForCausalLM as base_hf_auto_class
+		# from easydel.transform.parameters_transformation import (
+		# 	easystate_to_huggingface_model,
+		# )
 
-		model_config = state.module_config
-		if model_config is None:
-			model_config = state.module.config_class
-		# model_type = model_config.model_type
-		model_class = base_hf_auto_class._model_mapping[type(model_config)]  # noqa
-		hf_model = easystate_to_huggingface_model(
-			state=state,
-			base_huggingface_module=model_class,
-			config=model_config,
-			**easystate_to_huggingface_model_kwargs,
-		)
-		return hf_model
+		# state = self.to_easydel_state(params=params)
+		# if easystate_to_huggingface_model_kwargs is None:
+		# 	easystate_to_huggingface_model_kwargs = {}
 
-	@staticmethod
-	def to_8bit(params, quantization_fields=None):
-		if quantization_fields is None:
-			quantization_fields = ["kernel", "embedding"]
-
-		def quantize_params(params: dict) -> dict:
-			"""Quantizes model parameters using Array8Bit.
-
-			Args:
-			    params: A dictionary of model parameters.
-
-			Returns:
-			    A dictionary of quantized model parameters.
-			"""
-
-			def q(path: str, array: tp.Any) -> Array8Bit:
-				"""Quantizes a single parameter array."""
-				path = [p for p in path[0].key]
-				for field in quantization_fields:
-					if field in path:
-						return Array8Bit.quantize(array, qk=64)
-				return array
-
-			return unflatten_dict(
-				jax.tree_util.tree_map_with_path(
-					q,
-					flatten_dict(params),
-				)
-			)
-
-		return quantize_params(params)
-
-	def _model_card(self, name, repo_id):
-		from easydel import __version__
-		from easydel.utils.readme_generator import ModelInfo, ReadmeGenerator
-
-		return ReadmeGenerator().generate_readme(
-			ModelInfo(
-				name=name,
-				type=self.__class__.__name__,
-				repo_id=repo_id,
-				model_class=self.config_class.model_type,
-				version=__version__,
-			)
-		)
+		# model_config = state.module_config
+		# if model_config is None:
+		# 	model_config = state.module.config_class
+		# # model_type = model_config.model_type
+		# model_class = base_hf_auto_class._model_mapping[type(model_config)]  # noqa
+		# hf_model = easystate_to_huggingface_model(
+		# 	state=state,
+		# 	base_huggingface_module=model_class,
+		# 	config=model_config,
+		# 	**easystate_to_huggingface_model_kwargs,
+		# )
+		# return hf_model
 
 	def save_pretrained(  # noqa
 		self,
@@ -471,13 +427,8 @@ class EasyDeLBaseModule(nn.Module):
 		readme_path = os.path.join(save_directory, "README.md")
 		if not os.path.exists(readme_path):
 			open(readme_path, "w").write(self._model_card(repo_id, repo_id))
-		func = (
-			CheckpointManager.save_checkpoint_safe
-			if (safe)
-			else CheckpointManager.save_state_to_file
-		)
 
-		func(
+		CheckpointManager.save_checkpoint(
 			path=output_model_file,
 			gather_fns=gather_fns,
 			mismatch_allowed=mismatch_allowed,
@@ -513,7 +464,6 @@ class EasyDeLBaseModule(nn.Module):
 		mismatch_allowed: bool = True,
 		revision: str = None,
 		commit_description: str = None,
-		tags: tp.Optional[tp.List[str]] = None,
 	) -> str:
 		working_dir = repo_id.split("/")[-1]
 
@@ -533,7 +483,6 @@ class EasyDeLBaseModule(nn.Module):
 		) as work_dir:
 			files_timestamps = self._get_files_timestamps(work_dir)
 
-			# Save all files.
 			self.save_pretrained(
 				work_dir,
 				params=params,
@@ -579,20 +528,14 @@ class EasyDeLBaseModule(nn.Module):
 		partition_axis: PartitionAxis = PartitionAxis(),  # noqa
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		safe: bool = True,
 		precision: jax.lax.PrecisionLike = jax.lax.Precision("fastest"),  # noqa
 		config_kwargs: tp.Optional[dict[str, tp.Any]] = None,
 		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec]]] = None,
-		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
-		quantization_platform: tp.Optional[EasyDeLPlatforms] = "jax",
 		backend: tp.Optional[EasyDeLBackends] = None,
 		platform: tp.Optional[EasyDeLPlatforms] = "jax",
-		bit_targeted_params: tp.Optional[tp.List[str]] = None,
 		model_task: str = "base-module",
-		quantization_block_size: int = 128,
 		shard_fns: dict[tp.Callable] = None,
 		auto_shard_model: bool = False,
-		remove_dict_prefix=None,
 		verbose: bool = True,
 		mismatch_allowed: bool = True,
 		*model_args,
@@ -669,6 +612,7 @@ class EasyDeLBaseModule(nn.Module):
 			fns = {"params": shard_fns}
 			fns.update(shard_fns)
 			shard_fns = fns
+
 		elif auto_shard_model and shard_fns is not None:
 			logger.warning(
 				"`auto_shard_model` will be ignored since `shard_fns` is provided."
@@ -736,75 +680,31 @@ class EasyDeLBaseModule(nn.Module):
 			# they will get error AssertionError: `module` must be provided.` so we autoset this to make sure user don't
 			# experience this error.
 			_, cls, _ = get_modules_by_type(config.model_type, model_task)
-		model = cls(
-			config=config,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			precision=precision,
-			rngs=nn.Rngs(0),
+		model = nn.eval_shape(
+			lambda: cls(
+				config=config,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
+				rngs=nn.Rngs(0),
+			)
 		)
-		if bit_targeted_params is None:
-			params_pattern_selection = re.compile(DEFAULT_QUANTIZATION_PATTERN)
-		else:
-			params_pattern_selection = bit_targeted_params
-		if quantization_method is not None:
-			quantizer = EasyQuantizer(
-				quantization_method=quantization_method,
-				block_size=quantization_block_size,
-				quantization_platform=quantization_platform,
-			)
 
-		def maybe_quantize(tensor, key):
-			if isinstance(key, str):
-				key = key.split(".")
-			if quantization_method is not None:
-				if (
-					quantizer is not None
-					and key[-1] != "embedding"
-					and params_pattern_selection.search("/".join(key))
-				):
-					tensor = quantizer(array=tensor)
-			return tensor
-
-		if safe:
-			state, _ = CheckpointManager.load_checkpoint_safe(
-				path=resolved_archive_file,
-				mismatch_allowed=mismatch_allowed,
-				verbose=verbose,
-				shard_fns=shard_fns,
-				callback=maybe_quantize,
-			)
-		else:
-			state = CheckpointManager.load_checkpoint(
-				path=resolved_archive_file,
-				mismatch_allowed=mismatch_allowed,
-				verbose=verbose,
-				shard_fns=shard_fns,
-				remove_dict_prefix=remove_dict_prefix,
-				callback=maybe_quantize,
-			)
-
+		state, _ = CheckpointManager.load_checkpoint(
+			path=resolved_archive_file,
+			mismatch_allowed=mismatch_allowed,
+			verbose=verbose,
+			shard_fns=shard_fns,
+			callback=None,
+		)
 		params = state.get("params", None)
 		if params is not None:
 			state = params
-
 		state = flatten_dict(state)
-		random_state = flatten_dict(unfreeze(model.params_shape_tree))
-
-		missing_keys = model.required_params - set(state.keys())
-		unexpected_keys = set(state.keys()) - model.required_params
-
-		# Disabling warning when porting pytorch weights to flax, flax does not uses num_batches_tracked
-		for unexpected_key in unexpected_keys.copy():
-			if "num_batches_tracked" in unexpected_key[-1]:
-				unexpected_keys.remove(unexpected_key)
-
-		if missing_keys:
-			logger.warning(
-				f"The checkpoint {pretrained_model_name_or_path} is missing required keys: {missing_keys}. "
-				"Make sure to call model.init_weights to initialize the missing weights."
-			)
-			cls._missing_keys = missing_keys
+		state = string_key_to_int(state)
+		random_state = flatten_dict(model.graphtree_params_shape)
+		required_params = set(flatten_dict(model.graphtree_params_shape))
+		unexpected_keys = set(state.keys()) - required_params
 
 		mismatched_keys = []
 		for key in state.keys():
@@ -819,10 +719,6 @@ class EasyDeLBaseModule(nn.Module):
 						"Using `ignore_mismatched_sizes=True` if you really want to load this checkpoint inside this "
 						"model."
 					)
-
-		if missing_keys:
-			for missing_key in missing_keys:
-				state[missing_key] = random_state[missing_key]
 
 		# remove unexpected keys to not be saved again
 		for unexpected_key in unexpected_keys:
@@ -839,12 +735,6 @@ class EasyDeLBaseModule(nn.Module):
 				" (initializing a BertForSequenceClassification model from a BertForSequenceClassification model)."
 			)
 
-		if len(missing_keys) > 0:
-			logger.warning(
-				f"Some weights of {model.__class__.__name__} were not initialized from the model checkpoint at"
-				f" {pretrained_model_name_or_path} and are newly initialized: {missing_keys}\nYou should probably"
-				" TRAIN this model on a down-stream task to be able to use it for predictions and inference."
-			)
 		if len(mismatched_keys) > 0:
 			mismatched_warning = "\n".join(
 				[
@@ -879,7 +769,7 @@ class EasyDeLBaseModule(nn.Module):
 					"Generation config file not found, using a generation config created from the model config."
 				)
 				pass
-		return model, unflatten_dict(state)
+		return merge_model_and_tree(model=model, tree=unflatten_dict(state))
 
 	def shard_model(
 		self,
@@ -968,6 +858,20 @@ class EasyDeLBaseModule(nn.Module):
 		self = nn.merge(gdef, state, other)
 		return self
 
+	def quantize(
+		self,
+		method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.A8BIT,
+		block_size: int = 128,
+		quantization_pattern: tp.Optional[str] = None,
+	):
+		self = quantize_linear_layers(
+			self,
+			method=method,
+			block_size=block_size,
+			quantization_pattern=quantization_pattern,
+		)
+		return self
+
 	@tp.overload
 	def __call__(
 		self,
@@ -981,6 +885,7 @@ class EasyDeLBaseModule(nn.Module):
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
 	) -> tp.Union[FlaxCausalLMOutput, tp.Tuple]: ...
+
 	@tp.overload
 	def __call__(
 		self,
@@ -993,6 +898,36 @@ class EasyDeLBaseModule(nn.Module):
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
 	) -> tp.Union[FlaxSequenceClassifierOutput, tp.Tuple]: ...
+
+	@tp.overload
+	def __call__(
+		self,
+		input_ids: tp.Optional[chex.Array] = None,
+		input_embeds: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		output_router_logits: tp.Optional[bool] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
+		return_dict: bool = True,
+	) -> tp.Union[MoeModelOutput, tp.Tuple]: ...
+
+	@tp.overload
+	def __call__(
+		self,
+		input_ids: tp.Optional[chex.Array] = None,
+		input_embeds: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		output_router_logits: tp.Optional[bool] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
+		return_dict: bool = True,
+	) -> tp.Union[MoeCausalLMOutput, tp.Tuple]: ...
 
 
 class EasyDeLBaseVisionModule(EasyDeLBaseModule):
@@ -1097,11 +1032,11 @@ class EasyDeLBaseVisionModule(EasyDeLBaseModule):
 
 		if past_key_values is not None and return_dict:
 			outputs, past_key_values = outputs
-			outputs["past_key_values"] = unfreeze(past_key_values["cache"])
+			outputs["past_key_values"] = past_key_values["cache"]
 			return outputs
 		elif past_key_values is not None and not return_dict:
 			outputs, past_key_values = outputs
-			outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
+			outputs = outputs[:1] + (past_key_values["cache"],) + outputs[1:]
 
 		return outputs
 
