@@ -89,7 +89,7 @@ class Linear8bit(Module):
 			quantized_kernel, scales = None, None
 		# Quantize the kernel
 
-		self.kernel_q = nnx.Param(quantized_kernel)
+		self.kernel = nnx.Param(quantized_kernel)
 		self.scales = nnx.Param(scales)
 
 		if use_bias and do_init:
@@ -147,7 +147,7 @@ class Linear8bit(Module):
 		quantized_kernel, scales = cls._quantize_kernel(linear.kernel.value)
 
 		# Update the parameters
-		instance.kernel_q = nnx.Param(quantized_kernel)
+		instance.kernel = nnx.Param(quantized_kernel)
 		instance.scales = nnx.Param(scales)
 
 		# Copy the bias if it exists
@@ -174,9 +174,9 @@ class Linear8bit(Module):
 				in_features=self.in_features,
 				out_features=self.out_features,
 				use_bias=self.use_bias,
-				dtype=dtype,
-				param_dtype=param_dtype,
-				precision=precision,
+				dtype=self.dtype,
+				param_dtype=self.param_dtype,
+				precision=self.precision,
 				kernel_init=self.kernel_init,
 				bias_init=self.bias_init,
 				dot_general=self.dot_general,
@@ -197,17 +197,26 @@ class Linear8bit(Module):
 	@staticmethod
 	def _quantize_kernel(kernel):
 		"""Quantize the kernel weights."""
+		if kernel is None:
+			return None, None
 		quantized, scales = _mu_quantize_row_q8_0(kernel)
 		return quantized, scales
 
-	def _dequantize_kernel(self):
+	def _dequantize_kernel(self):  # in case somebody using tie word embedding.
 		"""Dequantize the kernel weights."""
-		return _mu_dequantize_row_q8_0(self.kernel_q.value, self.scales.value)
+		if self.kernel.value is None and self.scales.value is None:
+			return None
+		elif self.scales.value is None:
+			return self.kernel
+		return _mu_dequantize_row_q8_0(self.kernel.value, self.scales.value)
 
 	def __call__(self, inputs: Array) -> Array:
 		"""Applies a quantized linear transformation to the inputs along the last dimension."""
 		# Dequantize the kernel for computation
 		kernel = self._dequantize_kernel()
+		assert (
+			kernel is not None
+		), "loaded and dequantized kernel is None, which means it have been loaded from another None Kernel Linear"
 		bias = self.bias.value
 
 		inputs, kernel, bias = dtypes.promote_dtype(
@@ -232,4 +241,4 @@ class Linear8bit(Module):
 
 	def get_quantized_kernel(self):
 		"""Get the quantized kernel weights and scales."""
-		return self.kernel_q.value, self.scales.value
+		return self.kernel.value, self.scales.value

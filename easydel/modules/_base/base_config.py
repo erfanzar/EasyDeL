@@ -184,7 +184,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		blocksize_b: int = 1,
 		partition_axis: PartitionAxis = PartitionAxis(),  # noqa
 		shard_attention_computation: bool = True,
-		use_sharded_kv_caching: bool = True,
+		use_sharded_kv_caching: bool = False,
 		use_sharding_constraint: bool = False,
 		backend: Optional[EasyDeLBackends] = None,
 		platform: Optional[EasyDeLPlatforms] = None,
@@ -523,7 +523,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		set_attrs_smartly(
 			self, "shard_attention_computation", True, shard_attention_computation
 		)
-		set_attrs_smartly(self, "use_sharded_kv_caching", True, use_sharded_kv_caching)
+		set_attrs_smartly(self, "use_sharded_kv_caching", False, use_sharded_kv_caching)
 		set_attrs_smartly(self, "attn_mechanism", "jax_flash_attn2", attn_mechanism)
 
 		set_attrs_smartly(self, "easy_method", EasyMethod.TRAIN, easy_method)

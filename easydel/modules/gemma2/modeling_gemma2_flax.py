@@ -117,8 +117,8 @@ class Gemma2Attention(FlaxAttentionModule):
 			rngs=rngs,
 		)
 		self.o_proj = linear(
-			self.embed_dim,
 			self.num_heads * self.head_dim,
+			self.embed_dim,
 			rngs=rngs,
 		)
 		self.sliding_window = config.sliding_window if (self.layer_idx % 2 == 0) else None
@@ -219,8 +219,7 @@ class Gemma2Attention(FlaxAttentionModule):
 			key=key_states,
 			positions=position_ids,
 			frequencies=frequencies,
-		)
-
+		) 
 		(
 			key_states,
 			value_states,
@@ -558,15 +557,16 @@ class Gemma2Model(EasyDeLBaseModule):
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-		outputs = (hidden_states, all_hidden_states, all_attentions)
+		outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
 
 		if not return_dict:
 			return tuple(v for v in outputs if v is not None)
 
 		return FlaxBaseModelOutput(
 			last_hidden_state=hidden_states,
-			hidden_states=outputs[1],
-			attentions=outputs[-1],
+			hidden_states=all_hidden_states,
+			attentions=all_attentions,
+			past_key_values=past_key_values,
 		)
 
 
@@ -682,4 +682,5 @@ class Gemma2ForCausalLM(EasyDeLBaseModule):
 			logits=lm_logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
+			past_key_values=outputs.past_key_values,
 		)

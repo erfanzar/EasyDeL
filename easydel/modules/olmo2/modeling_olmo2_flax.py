@@ -482,7 +482,7 @@ class Olmo2Model(EasyDeLBaseModule):
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-			outputs = (hidden_states, all_hidden_states, all_attentions)
+			outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
 		else:
 			outputs = (hidden_states, all_attentions)
 
@@ -491,8 +491,9 @@ class Olmo2Model(EasyDeLBaseModule):
 
 		return FlaxBaseModelOutput(
 			last_hidden_state=hidden_states,
-			hidden_states=outputs[1],
-			attentions=outputs[-1],
+			hidden_states=all_hidden_states,
+			attentions=all_attentions,
+			past_key_values=past_key_values,
 		)
 
 
@@ -576,4 +577,5 @@ class Olmo2ForCausalLM(EasyDeLBaseModule):
 			logits=lm_logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
+			past_key_values=outputs.past_key_values,
 		)

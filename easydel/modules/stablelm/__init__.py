@@ -13,9 +13,9 @@
 # limitations under the License.
 
 from easydel.modules.stablelm.modelling_stablelm_flax import (
-	FlaxStableLmForCausalLM,
-	FlaxStableLmModel,
+	StableLmForCausalLM,
+	StableLmModel,
 )
 from easydel.modules.stablelm.stablelm_configuration import StableLmConfig
 
-__all__ = "FlaxStableLmForCausalLM", "FlaxStableLmModel", "StableLmConfig"
+__all__ = "StableLmForCausalLM", "StableLmModel", "StableLmConfig"

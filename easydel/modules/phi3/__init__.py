@@ -13,9 +13,9 @@
 # limitations under the License.
 
 from easydel.modules.phi3.modelling_phi3_flax import (
-	FlaxPhi3ForCausalLM,
-	FlaxPhi3Model,
+	Phi3ForCausalLM,
+	Phi3Model,
 )
 from easydel.modules.phi3.phi3_configuration import Phi3Config
 
-__all__ = "FlaxPhi3ForCausalLM", "FlaxPhi3Model", "Phi3Config"
+__all__ = "Phi3ForCausalLM", "Phi3Model", "Phi3Config"

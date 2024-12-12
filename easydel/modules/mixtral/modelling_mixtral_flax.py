@@ -17,7 +17,6 @@ import math
 from typing import Optional, Tuple, Union
 
 import chex
-import flax
 import jax
 from fjformer.functions import auxiliary_load_balancing_loss_func
 from flax import nnx as nn
@@ -37,21 +36,11 @@ from easydel.modules._base.flax_modeling_utils import (
 	get_gradient_checkpoint_policy,
 )
 from easydel.modules.mixtral.mixtral_configuration import MixtralConfig as MixtralConfig
-from easydel.modules.modeling_flax_outputs import FlaxMaskedLMOutput
 
-
-@flax.struct.dataclass
-class MoeModelOutput:
-	last_hidden_state: chex.Array = None
-	hidden_states: Optional[Tuple[chex.Array]] = None
-	attentions: Optional[Tuple[chex.Array]] = None
-	router_logits: Optional[Tuple[chex.Array]] = None
-
-
-@flax.struct.dataclass
-class MoeCausalLMOutput(FlaxMaskedLMOutput):
-	aux_loss: Optional[chex.Array] = None
-	router_logits: Optional[Tuple[chex.Array]] = None
+from easydel.modules.modeling_flax_outputs import (
+	MoeModelOutput,
+	MoeCausalLMOutput,
+)
 
 
 class MixtralAttention(FlaxAttentionModule):
@@ -512,10 +501,10 @@ class MixtralModel(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		output_router_logits: Optional[bool] = None,
@@ -665,10 +654,10 @@ class MixtralForCausalLM(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: Optional[chex.Array] = None,
+		input_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		output_router_logits: Optional[bool] = None,

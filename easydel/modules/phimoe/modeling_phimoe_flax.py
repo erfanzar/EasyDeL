@@ -19,8 +19,7 @@ from typing import Optional, Tuple, Union
 import chex
 import jax.lax
 from chex import Array
-from flax import linen as nn
-from flax.linen import Dense
+from flax import nnx as nn
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
@@ -28,7 +27,7 @@ from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
 from easydel.layers.norms import RMSNorm as RMSNorm
-from easydel.modules._base.base_module import wrap_easydel_module
+from easydel.modules._base.base_module import EasyDeLBaseModule
 from easydel.modules._base.factory import register_module
 from easydel.modules._base.flax_modeling_utils import (
 	ACT2FN,
@@ -45,57 +44,59 @@ from easydel.modules.modeling_flax_outputs import (
 from easydel.modules.phimoe.phimoe_configuration import PhiMoeConfig as PhiMoeConfig
 
 
-class FlaxPhiMoEBlockSparseTop2MLP(nn.Module):
-	config: PhiMoeConfig
-	layer_idx: Optional[int] = None
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
-
-	def setup(self) -> None:
-		dense_class = functools.partial(
-			nn.Dense,
-			kernel_init=nn.initializers.normal(config.initializer_range),
+class PhiMoEBlockSparseTop2MLP(nn.Module):
+	def __init__(
+		self,
+		config: PhiMoeConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		linear_class = functools.partial(
+			nn.Linear,
 			dtype=dtype,
 			param_dtype=param_dtype,
-			precision=precision,
 			use_bias=False,
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
+			precision=precision,
+			rngs=rngs,
+			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
-		self.ffn_dim = self.config.intermediate_size
-		self.hidden_dim = self.config.hidden_size
+		ffn_dim = config.intermediate_size
+		hidden_dim = config.hidden_size
 
-		self.w1 = dense_class(self.ffn_dim)
-		self.w2 = dense_class(self.hidden_dim)
-		self.w3 = dense_class(self.ffn_dim)
+		self.w1 = linear_class(hidden_dim, ffn_dim, rngs=rngs)
+		self.w2 = linear_class(ffn_dim, hidden_dim, rngs=rngs)
+		self.w3 = linear_class(hidden_dim, ffn_dim, rngs=rngs)
 		self.act_fn = ACT2FN[self.config.hidden_act]
 
-	def __call__(
-		self,
-		hidden_states: Array,
-		deterministic: bool = False,  # noqa
-	) -> Array:
+	def __call__(self, hidden_states: Array) -> Array:
 		return self.w2(self.act_fn(self.w1(hidden_states)) * self.w3(hidden_states))
 
 
-class FlaxPhiMoEAttention(FlaxAttentionModule):
-	"""
-	FlaxPhiMoEAttention implements an attention mechanism with rotary embeddings.
-
-	Attributes:
-	    config (PhiMoeConfig): Configuration for the attention module.
-	    dtype (jnp.dtype): Data type for computations (default is jnp.float32).
-	    param_dtype (jnp.dtype): Data type for parameters (default is jnp.float32).
-	    precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
-	"""
-
-	config: PhiMoeConfig
-	layer_idx: Optional[int] = None
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
-
-	def setup(self):
-		config = self.config
+class PhiMoEAttention(FlaxAttentionModule):
+	def __init__(
+		self,
+		config: PhiMoeConfig,
+		layer_idx: int,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(config=config)
+		self.layer_idx = layer_idx
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
 		self.attention_dropout = config.attention_dropout
 		self.hidden_size = config.hidden_size
 		self.num_heads = config.num_attention_heads
@@ -116,20 +117,37 @@ class FlaxPhiMoEAttention(FlaxAttentionModule):
 				f" and `num_heads`: {self.num_heads})."
 			)
 
-		dense_class = functools.partial(
-			Dense,
-			use_bias=config.attention_bias,
-			precision=precision,
+		linear_class = functools.partial(
+			nn.Linear,
 			dtype=dtype,
 			param_dtype=param_dtype,
+			use_bias=config.attention_bias,
 			kernel_init=jax.nn.initializers.normal(config.initializer_range),
+			precision=precision,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
-		self.q_proj = dense_class(self.num_heads * self.head_dim)
-		self.k_proj = dense_class(self.num_key_value_heads * self.head_dim)
-		self.v_proj = dense_class(self.num_key_value_heads * self.head_dim)
-		self.o_proj = dense_class(self.hidden_size)
+		self.q_proj = linear_class(
+			config.hidden_size,
+			config.num_attention_heads * self.head_dim,
+			rngs=rngs,
+		)
+		self.k_proj = linear_class(
+			config.hidden_size,
+			config.num_key_value_heads * self.head_dim,
+			rngs=rngs,
+		)
+		self.v_proj = linear_class(
+			config.hidden_size,
+			config.num_key_value_heads * self.head_dim,
+			rngs=rngs,
+		)
+		self.o_proj = linear_class(
+			config.num_attention_heads * self.head_dim,
+			config.hidden_size,
+			rngs=rngs,
+		)
+
 		self.attention_performer = FlexibleAttentionModule(
 			num_q_heads=self.config.num_attention_heads,
 			num_kv_heads=self.config.num_key_value_heads,
@@ -162,22 +180,6 @@ class FlaxPhiMoEAttention(FlaxAttentionModule):
 		fcm_mask: Optional[chex.Array] = None,
 		frequencies: Optional[chex.Array] = None,
 	):
-		"""
-		Forward pass of the attention module.
-
-		Args:
-		    hidden_states (chex.Array): Input hidden states.
-		    attention_mask (chex.Array): Mask to apply on the attention scores.
-		    position_ids (chex.Array): Position indices for the tokens.
-		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-		    segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-		    deterministic (bool): If True, disables dropout for deterministic behavior.
-		    init_cache (bool): If True, initializes cache for caching keys and values.
-		    output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-		    fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
-		Returns:
-		    Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
-		"""
 		batch_size, sequence_length = hidden_states.shape[:2]
 		(query_states, key_states, value_states) = (
 			self.q_proj(hidden_states),
@@ -265,104 +267,49 @@ class FlaxPhiMoEAttention(FlaxAttentionModule):
 		return outputs
 
 
-class FlaxPhiMoeBlocKSparesTop2MLPCollection(nn.Module):
-	config: PhiMoeConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
-
-	def setup(self) -> None:
-		config = self.config
-		self.layers = [
-			FlaxPhiMoEBlockSparseTop2MLP(
-				config=config,
-				dtype=dtype,
-				param_dtype=param_dtype,
-				precision=precision,
-			)
-			for i in range(self.config.num_local_experts)
-		]
-
-		self.router_jitter_noise = config.router_jitter_noise
-		self.input_jitter_noise = config.input_jitter_noise
-
-	def __call__(
+class PhiMoeSparseMoeBlock(nn.Module):
+	def __init__(
 		self,
-		selected_experts: chex.Array,
-		hidden_states: chex.Array,
-		routing_weights: chex.Array,
-		batch_size: int,
-		sequence_length: int,
-		hidden_dim: int,
-		deterministic: bool,
-	) -> chex.Array:
-		if not deterministic and self.input_jitter_noise > 0:
-			final_hidden_state = jax.nn.initializers.uniform(
-				1.0 - self.input_jitter_noise,
-				1.0 + self.input_jitter_noise,
-			)(self.make_rng(), hidden_states.shape, hidden_states.dtype)
-		else:
-			final_hidden_state = jnp.zeros_like(hidden_states)
-		for index in range(self.config.num_local_experts):
-			expert_layer_output = (
-				block_wise_ffn(
-					self.layers[index],
-					hidden_states,
-					self.config.scan_mlp_chunk_size,
-					deterministic,
-				)
-				if self.config.use_scan_mlp
-				else self.layers[index](hidden_states)
-			)
-			expert_layer_output_exp = (
-				jnp.sum(jnp.multiply(selected_experts == index, routing_weights), axis=-1)[
-					:, :, None
-				]
-				* expert_layer_output
-			)
-			final_hidden_state += expert_layer_output_exp
-
-		return final_hidden_state
-
-
-class FlaxPhiMoeSparseMoeBlock(nn.Module):
-	"""This implementation is
-	strictly equivalent to standard MoE with full capacity (no
-	dropped tokens). It's faster since it formulates MoE operations
-	in terms of block-sparse operations to accomodate imbalanced
-	assignments of tokens to experts, whereas standard MoE either
-	(1) drop tokens at the cost of reduced performance or (2) set
-	capacity factor to number of experts and thus waste computation
-	and memory on padding.
-	"""
-
-	config: PhiMoeConfig
-	layer_idx: int
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision("fastest")
-
-	def setup(self) -> None:
-		config = self.config
+		config: PhiMoeConfig,
+		layer_idx: int,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		self.config = config
+		self.layer_idx = layer_idx
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
 		self.hidden_dim = config.hidden_size
 		self.ffn_dim = config.intermediate_size
 		self.num_experts = config.num_local_experts
 		self.top_k = config.num_experts_per_tok
-		self.gate = Dense(
+		self.router_jitter_noise = config.router_jitter_noise
+		self.input_jitter_noise = config.input_jitter_noise
+		self.gate = nn.Linear(
+			self.config.hidden_size,
 			self.config.num_local_experts,
 			use_bias=False,
+			rngs=rngs,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
 			kernel_init=nn.initializers.normal(),
 		)
 
-		self.experts = FlaxPhiMoeBlocKSparesTop2MLPCollection(
-			config=config,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			precision=precision,
-		)
+		self.experts = [
+			PhiMoEBlockSparseTop2MLP(
+				config=config,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
+				rngs=rngs,
+			)
+			for i in range(self.config.num_local_experts)
+		]
 
 	def __call__(
 		self,
@@ -370,7 +317,6 @@ class FlaxPhiMoeSparseMoeBlock(nn.Module):
 		deterministic: bool = False,
 	) -> Tuple[chex.Array, chex.Array]:
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-		batch_size, sequence_length, hidden_dim = hidden_states.shape
 
 		router_logits = self.gate(hidden_states).astype(  # no reshaping is needed
 			jnp.promote_types(self.dtype, jnp.float32)
@@ -381,31 +327,54 @@ class FlaxPhiMoeSparseMoeBlock(nn.Module):
 		routing_weights = jax.nn.softmax(
 			routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=-1
 		)
-
+		if not deterministic and self.input_jitter_noise > 0:
+			final_hidden_state = jax.nn.initializers.uniform(
+				1.0 - self.input_jitter_noise,
+				1.0 + self.input_jitter_noise,
+			)(self.make_rng(), hidden_states.shape, hidden_states.dtype)
+		else:
+			final_hidden_state = jnp.zeros_like(hidden_states)
+		for index in range(self.config.num_local_experts):
+			expert_layer_output = (
+				block_wise_ffn(
+					self.experts[index],
+					hidden_states,
+					self.config.scan_mlp_chunk_size,
+					deterministic,
+				)
+				if self.config.use_scan_mlp
+				else self.experts[index](hidden_states)
+			)
+			expert_layer_output_exp = (
+				jnp.sum(jnp.multiply(selected_experts == index, routing_weights), axis=-1)[
+					:, :, None
+				]
+				* expert_layer_output
+			)
+			final_hidden_state += expert_layer_output_exp
 		return (
-			self.experts(
-				selected_experts=selected_experts,
-				batch_size=batch_size,
-				sequence_length=sequence_length,
-				hidden_dim=hidden_dim,
-				hidden_states=hidden_states,
-				routing_weights=routing_weights,
-				deterministic=deterministic,
-			),
+			final_hidden_state,
 			router_logits,
 		)
 
 
 class FlaxPhiMoeDecoderLayer(nn.Module):
-	config: PhiMoeConfig
-	layer_idx: int
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
-
-	def setup(self):
-		attn_block = FlaxPhiMoEAttention
-		mlp_block = FlaxPhiMoeSparseMoeBlock
+	def __init__(
+		self,
+		config: PhiMoeConfig,
+		layer_idx: int,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		attn_block = PhiMoEAttention
+		mlp_block = PhiMoeSparseMoeBlock
 		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			attn_block = nn.remat(
 				attn_block,
@@ -434,17 +403,21 @@ class FlaxPhiMoeDecoderLayer(nn.Module):
 			rngs=rngs,
 		)
 		self.input_layernorm = nn.LayerNorm(
-			epsilon=self.config.rms_norm_eps,
+			config.hidden_size,
+			epsilon=config.rms_norm_eps,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=True,
+			rngs=rngs,
 		)
 
 		self.post_attention_layernorm = nn.LayerNorm(
-			epsilon=self.config.rms_norm_eps,
+			config.hidden_size,
+			epsilon=config.rms_norm_eps,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=True,
+			rngs=rngs,
 		)
 
 	def __call__(
@@ -460,23 +433,6 @@ class FlaxPhiMoeDecoderLayer(nn.Module):
 		fcm_mask: Optional[chex.Array] = None,
 		frequencies: Optional[chex.Array] = None,
 	):
-		"""
-		Forward pass of the module block.
-
-		Args:
-		    hidden_states (chex.Array): Input hidden states.
-		    attention_mask (chex.Array): Mask to apply on the attention scores.
-		    position_ids (chex.Array): Position indices for the tokens.
-		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-		    segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-		    deterministic (bool): If True, disables dropout for deterministic behavior.
-		    init_cache (bool): If True, initializes cache for caching keys and values.
-		    output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-		    output_router_logits (bool): If True, outputs router logits.
-		    fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
-		Returns:
-		    Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
-		"""
 		residual = hidden_states
 
 		hidden_states = self.input_layernorm(hidden_states)
@@ -514,118 +470,6 @@ class FlaxPhiMoeDecoderLayer(nn.Module):
 		return outputs
 
 
-class FlaxPhiDecoderLayerCollection(nn.Module):
-	"""
-	FlaxPhiMoeDecoratorCollection represents a single layer in a Transformer-like model,
-	incorporating self-attention and MLP.
-
-	Attributes:
-	    config (PhiMoeConfig): Configuration object containing model parameters.
-	    dtype (jnp.dtype): Data type for computations (default is jnp.float32).
-	    param_dtype (jnp.dtype): Data type for model parameters (default is jnp.float32).
-	    precision (Optional[Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
-	"""
-
-	config: PhiMoeConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
-
-	def setup(self) -> None:
-		self.layers = [
-			FlaxPhiMoeDecoderLayer(
-				config=config,
-				dtype=dtype,
-				param_dtype=param_dtype,
-				precision=precision,
-				name=str(idx),
-				layer_idx=idx,
-			)
-			for idx in range(self.config.num_hidden_layers)
-		]
-		self._frequencies = self.config.get_basic_frequencies(
-			head_size=self.config.hidden_size // self.config.num_attention_heads,
-			rotary_dim=self.config.hidden_size // self.config.num_attention_heads,
-		)
-
-	def __call__(
-		self,
-		hidden_states: chex.Array,
-		attention_mask: chex.Array,
-		causal_mask: chex.Array,
-		position_ids: chex.Array,
-		segment_ids: Optional[chex.Array] = None,
-		deterministic: bool = True,
-		init_cache: bool = False,
-		output_attentions: bool = False,
-		output_hidden_states: bool = False,
-	) -> Tuple[chex.Array, Optional[chex.Array], chex.Array]:
-		"""
-		Forward pass through the collection of decoder layers.
-
-		Args:
-		    hidden_states (chex.Array): Input tensor containing the hidden states.
-		    frequencies (Tuple[chex.Array, chex.Array]): Frequency positional encodings.
-		    attention_mask (chex.Array): Mask to apply during attention.
-		    causal_mask (chex.Array): Causal mask for autoregressive decoding.
-		    position_ids (chex.Array): Positional indices for the sequence.
-		    segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
-		    deterministic (bool): If True, disables dropout.
-		    init_cache (bool): If True, initializes caching mechanism for fast decoding.
-		    output_attentions (bool): If True, returns attention weights.
-		    output_hidden_states (bool): If True, returns hidden states.
-
-		Returns:
-		    Tuple[chex.Array, Optional[chex.Array], chex.Array]:
-		        - hidden_states: The output tensor after layer processing.
-		        - all_hidden_states: all of Hidden states (if `output_hidden_states` is True).
-		        - self_attn_weights: Attention weights (if `output_attentions` is True).
-
-		"""
-		all_hidden_states = () if output_hidden_states else None
-		all_self_attns = () if output_attentions else None
-		if not deterministic and self.config.fcm_max_ratio > 0:
-			# Apply forgetful causal mask
-			batch_size, seq_length = hidden_states.shape[0], hidden_states.shape[1]
-			fcm_ratio = jax.random.uniform(
-				self.make_rng("fcm"),
-				shape=(batch_size, 1, 1, 1),
-				minval=self.config.fcm_min_ratio,
-				maxval=self.config.fcm_max_ratio,
-			)
-			fcm_mask = (
-				jax.random.uniform(
-					self.make_rng("fcm"), shape=(batch_size, 1, seq_length, seq_length)
-				)
-				> fcm_ratio
-			)
-			fcm_mask = fcm_mask.at[:, :, :, 0].set(True)
-			fcm_mask = fcm_mask.astype("bool")
-		else:
-			fcm_mask = None
-		for decoder_layer in self.layers:
-			if output_hidden_states:
-				all_hidden_states += (hidden_states,)
-
-			layer_outputs = decoder_layer(
-				hidden_states=hidden_states,
-				attention_mask=attention_mask,
-				position_ids=position_ids,
-				causal_mask=self.causal_mask,
-				cache_view=past_key_values.views[idx],
-				output_attentions=output_attentions,
-				segment_ids=segment_ids,
-				frequencies=self.frequencies,
-			)
-
-			hidden_states = layer_outputs[0]
-
-			if output_attentions:
-				all_self_attns += (layer_outputs[1],)
-
-		return hidden_states, all_hidden_states, all_self_attns
-
-
 @register_module(
 	"base-module",
 	config=PhiMoeConfig,
@@ -633,25 +477,23 @@ class FlaxPhiDecoderLayerCollection(nn.Module):
 	embedding_layer_names=["embed_tokens"],
 	layernorm_names=["norm", "input_layernorm", "post_attention_layernorm"],
 )
-@wrap_easydel_module(config_class=PhiMoeConfig, base_model_prefix="model")
-class FlaxPhiMoeModel(nn.Module):
-	"""
-	Core module of the PhiMoe model, including embedding, decoder layers, and normalization.
-
-	Attributes:
-	    config (PhiMoeConfig): Configuration object with model hyperparameters.
-	    dtype (jnp.dtype): Data type for the computations.
-	    param_dtype (jnp.dtype): Data type for the model parameters.
-	    precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
-	"""
-
-	config: PhiMoeConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[jax.lax.Precision, str]] = None
-
-	def setup(self) -> None:
-		config = self.config
+class FlaxPhiMoeModel(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: PhiMoeConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
 		self.padding_idx = config.pad_token_id
 		self.vocab_size = config.vocab_size
 
@@ -660,27 +502,28 @@ class FlaxPhiMoeModel(nn.Module):
 			config.hidden_size,
 			dtype=dtype,
 			param_dtype=param_dtype,
+			rngs=rngs,
 		)
 
 		self.embed_dropout = nn.Dropout(config.embd_pdrop)
-		self.layers = FlaxPhiDecoderLayerCollection(
-			config=config,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			precision=precision,
-		)
+		self.layers = [
+			FlaxPhiMoeDecoderLayer(
+				config=config,
+				layer_idx=idx,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
+				rngs=rngs,
+			)
+			for idx in range(self.config.num_hidden_layers)
+		]
 		self.norm = nn.LayerNorm(
+			config.hidden_size,
 			epsilon=config.rms_norm_eps,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=True,
-		)
-		self.causal_mask = nn.make_causal_mask(
-			jnp.ones(
-				shape=(1, self.config.granted_mask_max_position_embedding),
-				dtype="bool",
-			),
-			dtype="bool",
+			rngs=rngs,
 		)
 
 	def __call__(
@@ -695,24 +538,6 @@ class FlaxPhiMoeModel(nn.Module):
 		past_key_values: Optional[TransformerCache] = None,
 		return_dict: bool = True,
 	) -> Union[FlaxBaseModelOutput, Tuple]:
-		"""
-		Forward pass through the PhiMoe module.
-
-		Args:
-		    input_ids (chex.Array): Input tensor containing token IDs.
-		    attention_mask (chex.Array): Mask for attention.
-		    position_ids (chex.Array): Positional indices.
-		    segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-		    input_embeds (Optional[chex.Array]): Embedded input tensor.
-		    output_attentions (Optional[bool]): If True, output attention weights.
-		    output_hidden_states (Optional[bool]): If True, output hidden states.
-		    init_cache (bool): If True, initialize cache for decoding.
-		    deterministic (bool): If True, disable dropout.
-		    return_dict (bool): If True, return a dictionary of outputs.
-
-		Returns:
-		    FlaxBaseModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
-		"""
 		if input_embeds is None and input_ids is not None:
 			input_embeds = self.embed_tokens(input_ids.astype("i4"))
 		else:
@@ -735,6 +560,8 @@ class FlaxPhiMoeModel(nn.Module):
 			attention_mask = jnp.expand_dims(attention_mask, (1, 2))
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
+
+		hidden_states = input_embeds
 		for idx, block in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
@@ -754,12 +581,11 @@ class FlaxPhiMoeModel(nn.Module):
 			if output_attentions:
 				all_attentions += (layer_outputs[1],)
 
-		hidden_states = outputs[0]
 		hidden_states = self.norm(hidden_states)
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-		outputs = (hidden_states, all_hidden_states, all_attentions)
+		outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
 
 		if return_dict:
 			return FlaxBaseModelOutput(
@@ -778,38 +604,40 @@ class FlaxPhiMoeModel(nn.Module):
 	embedding_layer_names=["embed_tokens"],
 	layernorm_names=["norm", "input_layernorm", "post_attention_layernorm"],
 )
-@wrap_easydel_module(config_class=PhiMoeConfig, base_model_prefix="model")
-class FlaxPhiMoeForCausalLM(nn.Module):
-	"""
-	PhiMoe model for causal language modeling, including the language model head.
-
-	Attributes:
-	    config (PhiMoeConfig): Configuration object with model hyperparameters.
-	    dtype (jnp.dtype): Data type for the computations.
-	    param_dtype (jnp.dtype): Data type for the model parameters.
-	    precision (Optional[jax.lax.Precision]): Precision setting for JAX operations.
-	"""
-
-	config: PhiMoeConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[jax.lax.Precision] = None
-
-	def setup(self) -> None:
+class FlaxPhiMoeForCausalLM(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: PhiMoeConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
 		self.model = FlaxPhiMoeModel(
 			config=config,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
 		self.vocab_size = self.config.vocab_size
-		self.lm_head = Dense(
-			self.config.vocab_size,
-			use_bias=self.config.lm_head_bias,
+		self.lm_head = nn.Linear(
+			config.hidden_size,
+			config.vocab_size,
+			use_bias=config.lm_head_bias,
 			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
 
 	def __call__(
@@ -842,40 +670,24 @@ class FlaxPhiMoeForCausalLM(nn.Module):
 		Returns:
 		    FlaxCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
-		batch_size, sequence_length = (
-			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
-		)
-		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
-		if position_ids is None:
-			position_ids = jnp.broadcast_to(
-				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-				(batch_size, sequence_length),
-			)
+
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
-			deterministic=deterministic,
-			init_cache=init_cache,
+			past_key_values=past_key_values,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=True,
 			input_embeds=input_embeds,
 			segment_ids=segment_ids,
 		)
-
+		hidden_states = outputs.last_hidden_state
 		if self.config.tie_word_embeddings:
-			shared_kernel = self.model.variables["params"]["embed_tokens"][
-				"embedding"
-			].T.astype(self.param_dtype)
-			lm_logits = self.lm_head.apply(
-				{"params": {"kernel": shared_kernel}},
-				outputs.last_hidden_state,
-			)
+			self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
+			lm_logits = self.lm_head(hidden_states)
 		else:
-			lm_logits = self.lm_head(outputs.last_hidden_state)
-
+			lm_logits = self.lm_head(hidden_states)
 		if not return_dict:
 			return (lm_logits,) + outputs[0:]
 
@@ -883,4 +695,5 @@ class FlaxPhiMoeForCausalLM(nn.Module):
 			logits=lm_logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
+			past_key_values=outputs.past_key_values,
 		)

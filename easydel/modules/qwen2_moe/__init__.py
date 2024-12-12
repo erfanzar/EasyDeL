@@ -14,8 +14,8 @@
 
 from easydel.modules.qwen2_moe.configuration_qwen2_moe import Qwen2MoeConfig
 from easydel.modules.qwen2_moe.modeling_qwen2_moe_flax import (
-	FlaxQwen2MoeForCausalLM,
-	FlaxQwen2MoeModel,
+	Qwen2MoeForCausalLM,
+	Qwen2MoeModel,
 )
 
-__all__ = "FlaxQwen2MoeForCausalLM", "FlaxQwen2MoeModel", "Qwen2MoeConfig"
+__all__ = "Qwen2MoeForCausalLM", "Qwen2MoeModel", "Qwen2MoeConfig"

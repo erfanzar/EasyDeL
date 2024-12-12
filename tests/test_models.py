@@ -431,7 +431,11 @@ class EasyModelsTest(unittest.TestCase):
 
 	def test_qwen2(self):
 		self.header_config = None
-		res, err = self.create_test_for_models("qwen2", transformers.Qwen2ForCausalLM)
+		res, err = self.create_test_for_models(
+			"qwen2",
+			transformers.Qwen2ForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"Qwen 2 model Failed [ERROR {err}]")
 
 	def test_olmo(self):
@@ -518,14 +522,22 @@ class EasyModelsTest(unittest.TestCase):
 
 	def test_stablelm(self):
 		self.header_config = None
-		res, err = self.create_test_for_models("stablelm", transformers.StableLmForCausalLM)
+		res, err = self.create_test_for_models(
+			"stablelm",
+			transformers.StableLmForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 
 		self.assertTrue(res, f"StableLM model Failed [ERROR {err}]")
 
 	def test_phi3(self):
 		self.header_config = None
 		hf_model, conf = self.get_hf_model_from_hub("microsoft/Phi-3-mini-128k-instruct")
-		res, err = self.create_test_for_models("phi3", hf_model)
+		res, err = self.create_test_for_models(
+			"phi3",
+			hf_model,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"PHI3 model Failed [ERROR {err}]")
 
 	def test_phimoe(self):
@@ -557,7 +569,11 @@ class EasyModelsTest(unittest.TestCase):
 			"short_mscale": 1.243163121016122,
 			"type": "longrope",
 		}
-		res, err = self.create_test_for_models("phimoe", hf_model)
+		res, err = self.create_test_for_models(
+			"phimoe",
+			hf_model,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"PHIMOE model Failed [ERROR {err}]")
 
 	def test_deepseek_v2(self):
@@ -636,7 +652,9 @@ class EasyModelsTest(unittest.TestCase):
 	def test_qwen2_moe(self):
 		self.header_config = None
 		res, err = self.create_test_for_models(
-			"qwen2_moe", transformers.Qwen2MoeForCausalLM
+			"qwen2_moe",
+			transformers.Qwen2MoeForCausalLM,
+			ed.TaskType.CAUSAL_LM,
 		)
 		self.assertTrue(res, f"Qwen2Moe model Failed [ERROR {err}]")
 
@@ -754,32 +772,32 @@ if __name__ == "__main__":
 	# unittest.main()
 	test = EasyModelsTest()
 	test.setUp()
-	# test.test_arctic() # Passed
-	# test.test_cohere()  # Passed
-	# test.test_dbrx()  # Passed
-	# test.test_deepseek_v2() # Passed
-	# test.test_exaone()  # Passed
-	# test.test_falcon()  # Passed
-	# test.test_gemma()  # Passed
-	# test.test_gemma2()  # Passed
-	# test.test_gptj()  # Passed
+	test.test_arctic()  # Passed
+	test.test_cohere()  # Passed
+	test.test_dbrx()  # Passed
+	test.test_deepseek_v2()  # Passed
+	test.test_exaone()  # Passed
+	test.test_falcon()  # Passed
+	test.test_gemma()  # Passed
+	test.test_gemma2()  # Passed
+	test.test_gptj()  # Passed
 	# test.test_gpt_noex()  # Failed
-	# test.test_gpt2()  # Passed
+	test.test_gpt2()  # Passed
 	# test.test_grok1() # Not Tested Yet!
-	# test.test_internlm2()  # Passed
-	# test.test_llama() # Passed
+	test.test_internlm2()  # Passed
+	test.test_llama()  # Passed
 	# test.test_mamba()
 	# test.test_mamba2()
-	# test.test_mistral()  # Passed
-	# test.test_mixtral()  # Passed
-	# test.test_mpt()  # Passed
-	# test.test_olmo()  # Passed
-	# test.test_olmo2()  # Passed
-	# test.test_openelm()  # Passed
+	test.test_mistral()  # Passed
+	test.test_mixtral()  # Passed
+	test.test_mpt()  # Passed
+	test.test_olmo()  # Passed
+	test.test_olmo2()  # Passed
+	test.test_openelm()  # Passed
 	test.test_phi()  # Passed
-	# test.test_phi3()
+	test.test_phi3()  # Passed
 	# test.test_phimoe()  # Failed v0.0.80 - N  Runtime
-	# test.test_qwen2()
-	# test.test_qwen2_moe()
-	# test.test_stablelm()
+	test.test_qwen2()  # Passed
+	test.test_qwen2_moe()  # Passed
+	test.test_stablelm()  # Passed
 	# -----------------------------------------------

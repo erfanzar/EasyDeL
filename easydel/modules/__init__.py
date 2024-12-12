@@ -104,15 +104,13 @@ from easydel.modules.internlm2.modeling_internlm2_flax import (
 from easydel.modules.llama import (
 	LlamaConfig,
 	LlamaForCausalLM,
-	# LlamaForSequenceClassification,
 	LlamaModel,
-	VisionLlamaConfig,
+	LlamaForSequenceClassification,
 )
 from easydel.modules.mamba import (
-	FlaxMambaCache,
-	FlaxMambaForCausalLM,
-	FlaxMambaModel,
 	MambaConfig,
+	MambaModel,
+	MambaForCausalLM,
 )
 from easydel.modules.mamba2 import (
 	FlaxMamba2Cache,
@@ -162,9 +160,9 @@ from easydel.modules.phi import (
 	PhiModel,
 )
 from easydel.modules.phi3 import (
-	FlaxPhi3ForCausalLM,
-	FlaxPhi3Model,
 	Phi3Config,
+	Phi3ForCausalLM,
+	Phi3Model,
 )
 from easydel.modules.phimoe import (
 	FlaxPhiMoeForCausalLM,
@@ -172,25 +170,20 @@ from easydel.modules.phimoe import (
 	PhiMoeConfig,
 )
 from easydel.modules.qwen2 import (
-	FlaxQwen2ForCausalLM,
-	FlaxQwen2ForSequenceClassification,
-	FlaxQwen2Model,
 	Qwen2Config,
+	Qwen2ForCausalLM,
+	Qwen2ForSequenceClassification,
+	Qwen2Model,
 )
 from easydel.modules.qwen2_moe import (
-	FlaxQwen2MoeForCausalLM,
-	FlaxQwen2MoeModel,
 	Qwen2MoeConfig,
+	Qwen2MoeForCausalLM,
+	Qwen2MoeModel,
 )
 from easydel.modules.stablelm import (
-	FlaxStableLmForCausalLM,
-	FlaxStableLmModel,
 	StableLmConfig,
-)
-from easydel.modules.t5 import (
-	FlaxT5ForConditionalGeneration,
-	FlaxT5Model,
-	T5Config,
+	StableLmForCausalLM,
+	StableLmModel,
 )
 from easydel.modules.whisper import (
 	FlaxWhisperForAudioClassification,
@@ -199,7 +192,7 @@ from easydel.modules.whisper import (
 	WhisperConfig,
 )
 from easydel.modules.xerxes import (
-	FlaxXerxesForCausalLM,
-	FlaxXerxesModel,
 	XerxesConfig,
+	XerxesForCausalLM,
+	XerxesModel,
 )

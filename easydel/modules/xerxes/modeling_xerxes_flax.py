@@ -16,18 +16,15 @@ import functools
 from typing import Optional, Tuple, Union
 
 import chex
-import flax.linen
-import flax.linen.partitioning
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
-from flax.linen import Dense, combine_masks, make_causal_mask
+from flax import nnx as nn
 from jax import lax
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers, get_logger
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.modules._base.base_module import wrap_easydel_module
+from easydel.modules._base.base_module import EasyDeLBaseModule
 from easydel.modules._base.factory import register_module
 from easydel.modules._base.flax_modeling_utils import (
 	block_wise_ffn,
@@ -45,18 +42,18 @@ logger = get_logger(__name__)
 
 
 class RMSNorm(nn.Module):
-	dim: int
-	eps: float = 1e-6
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-
-	def setup(self) -> None:
-		self.weight = self.param(
-			"kernel",
-			nn.initializers.ones,
-			(self.dim,),
-			self.param_dtype,
-		)
+	def __init__(
+		self,
+		dim: int,
+		eps: float = 1e-6,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+	):
+		self.dim = dim
+		self.eps = eps
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.weight = nn.Param(jnp.ones(self.dim, dtype=param_dtype))
 
 	def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
 		return x / lax.sqrt(
@@ -66,45 +63,72 @@ class RMSNorm(nn.Module):
 	def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
 		x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
 		output = self._norm(x).astype(self.dtype)
-
-		weight = self.weight.astype(self.dtype)
-		return weight * output
+		return (self.weight.value.astype(self.dtype)) * output
 
 
-class FlaxXerxesAttention(FlaxAttentionModule):
-	config: XerxesConfig
-	layer_idx: int
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = None
-	causal: bool = True
-	is_cross_attention: bool = False
+class XerxesAttention(FlaxAttentionModule):
+	def __init__(
+		self,
+		config: XerxesConfig,
+		layer_idx: int,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		causal: bool = True,
+		is_cross_attention: bool = False,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(config)
+		self.config = config
+		self.layer_idx = layer_idx
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.causal = causal
+		self.is_cross_attention = is_cross_attention
+		self.rngs = rngs
 
-	def setup(self):
-		config = self.config
 		self.embed_dim = config.hidden_size
 		self.num_heads = config.num_attention_heads
 		self.head_dim = config.head_dim
 		self.attention_softmax_in_fp32 = self.dtype is not jnp.float32
-
 		self.num_key_value_heads = config.num_key_value_heads
 		self.num_key_value_groups = self.num_heads // self.num_key_value_heads
 
 		kernel = jax.nn.initializers.normal(config.initializer_range)
 
-		dense_class = functools.partial(
-			Dense,
+		linear_class = functools.partial(
+			nn.Linear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
 			use_bias=False,
 			kernel_init=kernel,
+			rngs=rngs,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
-		self.q_proj = dense_class(self.num_heads * self.head_dim)
-		self.k_proj = dense_class(self.num_key_value_heads * self.head_dim)
-		self.v_proj = dense_class(self.num_key_value_heads * self.head_dim)
-		self.o_proj = dense_class(self.embed_dim)
+
+		self.q_proj = linear_class(
+			self.embed_dim,
+			self.num_heads * self.head_dim,
+			rngs=rngs,
+		)
+		self.k_proj = linear_class(
+			self.embed_dim,
+			self.num_key_value_heads * self.head_dim,
+			rngs=rngs,
+		)
+		self.v_proj = linear_class(
+			self.embed_dim,
+			self.num_key_value_heads * self.head_dim,
+			rngs=rngs,
+		)
+		self.o_proj = linear_class(
+			self.num_heads * self.head_dim,
+			self.embed_dim,
+			rngs=rngs,
+		)
 		self.attention_performer = FlexibleAttentionModule(
 			num_q_heads=self.config.num_attention_heads,
 			num_kv_heads=self.config.num_key_value_heads,
@@ -123,6 +147,20 @@ class FlaxXerxesAttention(FlaxAttentionModule):
 			self.head_dim,
 			self.head_dim,
 			True,
+		)
+
+	def _merge_heads(self, hidden_states):
+		"""
+		Merges the attention heads into a single hidden state tensor.
+
+		Args:
+		    hidden_states (chex.Array): The hidden states with separate head dimensions.
+
+		Returns:
+		    chex.Array: The hidden states with merged head dimensions.
+		"""
+		return hidden_states.reshape(
+			hidden_states.shape[:2] + (self.num_heads * self.head_dim,)
 		)
 
 	def _split_heads(self, hidden_states, num_heads):
@@ -187,57 +225,21 @@ class FlaxXerxesAttention(FlaxAttentionModule):
 			key=key_states,
 			frequencies=frequencies,
 		)
-
-		if self.has_variable("cache", "cached_key"):
-			mask_shift = self.variables["cache"]["cache_index"]
-			max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
-			causal_mask = lax.dynamic_slice(
-				causal_mask,
-				(0, 0, mask_shift, 0),
-				(1, 1, query_length, max_decoder_length),
-			)
-		else:
-			causal_mask = causal_mask[:, :, :query_length, :key_length]
-
-		batch_size = hidden_states.shape[0]
-		causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
-		if attention_mask.ndim == 2:
-			attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-		attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
-		attention_mask = combine_masks(attention_mask, causal_mask, fcm_mask)
-
-		dropout_rng = None
-		if not deterministic and self.config.attention_dropout > 0.0:
-			dropout_rng = self.make_rng("dropout")
-
-		if self.has_variable("cache", "cached_key") or init_cache:
-			key_states, value_states, attention_mask = self._concatenate_to_cache(
-				query_states,
-				key_states,
-				value_states,
-				attention_mask,
-			)
-
-		if bool((self.layer_idx % 2) == 0):
-			attention_mask = jnp.logical_and(
-				jnp.where(
-					jnp.tril(
-						jnp.ones_like(attention_mask, dtype=jnp.bool),
-						k=-4096,
-					),
-					0,
-					1,
-				),
-				attention_mask,
-			)
-		attention_bias = lax.select(
-			attention_mask > 0,
-			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-			jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+		(
+			key_states,
+			value_states,
+			attention_mask,
+			attention_bias,
+		) = self.concatenate(
+			query=query_states,
+			key=key_states,
+			cache_view=cache_view,
+			value=value_states,
+			attention_mask=attention_mask,
+			causal_mask=causal_mask,
+			fcm_mask=fcm_mask,
+			sliding_windows=4096 if bool((self.layer_idx % 2) == 0) else None,
 		)
-		if bool((self.layer_idx % 2) == 0):
-			if attention_bias.shape[-1] <= 1:
-				attention_bias = attention_bias[:, :, :, -4096:]
 
 		attentions = self.attention_performer(
 			query_states=query_states,
@@ -253,6 +255,7 @@ class FlaxXerxesAttention(FlaxAttentionModule):
 			segment_ids=segment_ids,
 			causal_mask=causal_mask,
 		)
+
 		attn_output = self.shard_attention_prod(
 			self._merge_heads(attentions.attention_outputs)
 		)
@@ -264,60 +267,99 @@ class FlaxXerxesAttention(FlaxAttentionModule):
 		)
 
 
-class FlaxXerxesMLP(nn.Module):
-	config: XerxesConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = None
-
-	def setup(self):
+class XerxesMLP(nn.Module):
+	def __init__(
+		self,
+		config: XerxesConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
 		kernel_init = jax.nn.initializers.normal(config.initializer_range)
 
 		self.act = functools.partial(nn.gelu, approximate=True)
-		dense_class = functools.partial(
-			Dense,
+		linear_class = functools.partial(
+			nn.Linear,
 			use_bias=False,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
 			kernel_init=kernel_init,
+			rngs=rngs,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
-		self.gate_proj = dense_class(self.config.intermediate_size)
-		self.up_proj = dense_class(self.config.intermediate_size)
-		self.down_proj = dense_class(self.config.hidden_size)
+		self.gate_proj = linear_class(
+			self.config.hidden_size, self.config.intermediate_size, rngs=rngs
+		)
+		self.up_proj = linear_class(
+			self.config.hidden_size, self.config.intermediate_size, rngs=rngs
+		)
+		self.down_proj = linear_class(
+			self.config.intermediate_size, self.config.hidden_size, rngs=rngs
+		)
 
-	def __call__(self, hidden_states, deterministic=False):
+	def __call__(self, hidden_states):
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-
 		return self.down_proj(
 			self.act(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
 		)
 
 
-class FlaxXerxesBlocKSparesMLPCollection(nn.Module):
-	config: XerxesConfig
-	dtype: jnp.dtype = jnp.bfloat16
-	param_dtype: jnp.dtype = jnp.bfloat16
-	precision: Optional[jax.lax.Precision] = None
-
-	def setup(self) -> None:
-		self.layers = [
-			FlaxXerxesMLP(
+class XerxesSparseMoeBlock(nn.Module):
+	def __init__(
+		self,
+		config: XerxesConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[None, jax.lax.Precision]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
+		self.gate = nn.Linear(
+			self.config.hidden_size,
+			self.config.num_local_experts,
+			use_bias=False,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			kernel_init=nn.initializers.normal(config.initializer_range),
+			rngs=rngs,
+		)
+		self.experts = [
+			XerxesMLP(
 				config=config,
 				dtype=dtype,
 				param_dtype=param_dtype,
 				precision=precision,
+				rngs=rngs,
 			)
-			for i in range(self.config.num_local_experts)
+			for _ in range(self.config.num_local_experts)
 		]
 
-	def __call__(
-		self,
-		selected_experts: chex.Array,
-		hidden_states: chex.Array,
-		routing_weights: chex.Array,
-	) -> chex.Array:
+	def __call__(self, hidden_states: chex.Array) -> Tuple[chex.Array, chex.Array]:
+		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
+		router_logits = self.gate(hidden_states).astype(
+			jnp.promote_types(self.dtype, jnp.float32)
+		)
+		routing_weights, selected_experts = jax.lax.top_k(
+			router_logits, k=self.config.num_experts_per_tok
+		)
+		routing_weights = jax.nn.softmax(
+			routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=-1
+		)
+
 		final_hidden_state = jnp.zeros_like(hidden_states)
 		for index in range(self.config.num_local_experts):
 			expert_layer_output = (
@@ -325,7 +367,6 @@ class FlaxXerxesBlocKSparesMLPCollection(nn.Module):
 					self.layers[index],
 					hidden_states,
 					self.config.scan_mlp_chunk_size,
-					False,
 				)
 				if self.config.use_scan_mlp
 				else self.layers[index](hidden_states)
@@ -337,78 +378,40 @@ class FlaxXerxesBlocKSparesMLPCollection(nn.Module):
 				* expert_layer_output
 			)
 			final_hidden_state += expert_layer_output_exp
-
-		return final_hidden_state
-
-
-class FlaxXerxesSparseMoeBlock(nn.Module):
-	config: XerxesConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[None, jax.lax.Precision]] = jax.lax.Precision("fastest")
-
-	def setup(self) -> None:
-		self.gate = Dense(
-			self.config.num_local_experts,
-			use_bias=False,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			precision=precision,
-			kernel_init=nn.initializers.normal(config.initializer_range),
-		)
-
-		self.experts = FlaxXerxesBlocKSparesMLPCollection(
-			config=config,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			precision=precision,
-		)
-
-	def __call__(
-		self,
-		hidden_states: chex.Array,
-		e: bool = False,  # Ignored
-	) -> Tuple[chex.Array, chex.Array]:
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-
-		router_logits = self.gate(hidden_states).astype(
-			jnp.promote_types(self.dtype, jnp.float32)
-		)
-		routing_weights, selected_experts = jax.lax.top_k(
-			router_logits, k=self.config.num_experts_per_tok
-		)
-		routing_weights = jax.nn.softmax(
-			routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=-1
-		)
-
 		return (
-			self.experts(
-				selected_experts=selected_experts,
-				hidden_states=hidden_states,
-				routing_weights=routing_weights,
-			),
+			final_hidden_state,
 			router_logits,
 		)
 
 
-class FlaxXerxesDecoderLayer(nn.Module):
-	config: XerxesConfig
-	layer_idx: int
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = None
+class XerxesDecoderLayer(nn.Module):
+	def __init__(
+		self,
+		config: XerxesConfig,
+		layer_idx: int,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		self.config = config
+		self.layer_idx = layer_idx
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
 
-	def setup(self):
-		mlp_block = FlaxXerxesSparseMoeBlock if self.config.xe_moe else FlaxXerxesMLP
-		attn_block = FlaxXerxesAttention
+		mlp_block = XerxesSparseMoeBlock if self.config.xe_moe else XerxesMLP
+		attn_block = XerxesAttention
 
 		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
-			mlp_block = flax.linen.partitioning.remat(
+			mlp_block = nn.remat(
 				mlp_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 				static_argnums=(1,),
 			)
-			attn_block = flax.linen.partitioning.remat(
+			attn_block = nn.remat(
 				attn_block,
 				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
 				static_argnums=(3, 5, 6, 7, 9),
@@ -419,12 +422,14 @@ class FlaxXerxesDecoderLayer(nn.Module):
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
 		self.mlp = mlp_block(
 			config=config,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
 		rms = functools.partial(
 			RMSNorm,
@@ -480,7 +485,6 @@ class FlaxXerxesDecoderLayer(nn.Module):
 			fcm_mask,
 			frequencies,
 		)
-
 		hidden_states = self.post_attention_layernorm(hidden_states)
 		hidden_states = residual + hidden_states
 
@@ -488,110 +492,13 @@ class FlaxXerxesDecoderLayer(nn.Module):
 		hidden_states = self.pre_feedforward_layernorm(hidden_states)
 		if self.config.use_scan_mlp and not self.config.xe_moe:
 			hidden_states = block_wise_ffn(
-				self.mlp, hidden_states, self.config.scan_mlp_chunk_size, deterministic
+				self.mlp, hidden_states, self.config.scan_mlp_chunk_size
 			)
 		else:
 			hidden_states = self.mlp(hidden_states)
-
 		hidden_states = self.post_feedforward_layernorm(hidden_states)
 		hidden_states = residual + hidden_states
 		return hidden_states, attn_weight
-
-
-class FlaxXerxesLayerCollection(nn.Module):
-	config: XerxesConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = None
-
-	def setup(self):
-		self.blocks = [
-			FlaxXerxesDecoderLayer(
-				self.config,
-				layer_idx=i,
-				dtype=dtype,
-				param_dtype=param_dtype,
-				precision=precision,
-			)
-			for i in range(self.config.num_hidden_layers)
-		]
-		self._frequencies = self.config.get_basic_frequencies()
-
-	def __call__(
-		self,
-		hidden_states: chex.Array,
-		attention_mask: chex.Array,
-		causal_mask: chex.Array,
-		position_ids: chex.Array,
-		segment_ids: Optional[chex.Array] = None,
-		deterministic: bool = True,
-		init_cache: bool = False,
-		output_attentions: bool = False,
-		output_hidden_states: bool = False,
-	) -> Tuple[chex.Array, Optional[chex.Array], chex.Array]:
-		"""
-		Forward pass through the collection of decoder layers.
-
-		Args:
-		    hidden_states (chex.Array): Input tensor containing the hidden states.
-		    attention_mask (chex.Array): Mask to apply during attention.
-		    causal_mask (chex.Array): Causal mask for autoregressive decoding.
-		    position_ids (chex.Array): Positional indices for the sequence.
-		    segment_ids (Optional[chex.Array]): Segment IDs for distinguishing different parts of the input.
-		    deterministic (bool): If True, disables dropout.
-		    init_cache (bool): If True, initializes caching mechanism for fast decoding.
-		    output_attentions (bool): If True, returns attention weights.
-		    output_hidden_states (bool): If True, returns hidden states.
-
-		Returns:
-		    Tuple[chex.Array, Optional[chex.Array], chex.Array]:
-		        - hidden_states: The output tensor after layer processing.
-		        - all_hidden_states: all of Hidden states (if `output_hidden_states` is True).
-		        - self_attn_weights: Attention weights (if `output_attentions` is True).
-
-		"""
-		all_attentions = () if output_attentions else None
-		all_hidden_states = () if output_hidden_states else None
-		if not deterministic and self.config.fcm_max_ratio > 0:
-			# Apply forgetful causal mask
-			batch_size, seq_length = hidden_states.shape[0], hidden_states.shape[1]
-			fcm_ratio = jax.random.uniform(
-				self.make_rng("fcm"),
-				shape=(batch_size, 1, 1, 1),
-				minval=self.config.fcm_min_ratio,
-				maxval=self.config.fcm_max_ratio,
-			)
-			fcm_mask = (
-				jax.random.uniform(
-					self.make_rng("fcm"), shape=(batch_size, 1, seq_length, seq_length)
-				)
-				> fcm_ratio
-			)
-			fcm_mask = fcm_mask.at[:, :, :, 0].set(True)
-			fcm_mask = fcm_mask.astype("bool")
-		else:
-			fcm_mask = None
-		for idx, block in enumerate(self.blocks):
-			if output_hidden_states:
-				all_hidden_states += (hidden_states,)
-			layer_outputs = block(
-				hidden_states=hidden_states,
-				attention_mask=attention_mask,
-				position_ids=position_ids,
-				causal_mask=self.causal_mask,
-				cache_view=past_key_values.views[idx],
-				output_attentions=output_attentions,
-				segment_ids=segment_ids,
-				frequencies=self.frequencies,
-			)
-			hidden_states = layer_outputs[0]
-
-			if output_attentions:
-				all_attentions += (layer_outputs[1],)
-
-		outputs = (hidden_states, all_hidden_states, all_attentions)
-
-		return outputs
 
 
 @register_module(
@@ -600,14 +507,23 @@ class FlaxXerxesLayerCollection(nn.Module):
 	model_type="xerxes",
 	embedding_layer_names=["embed_tokens"],
 )
-@wrap_easydel_module(config_class=XerxesConfig, base_model_prefix="model")
-class FlaxXerxesModel(nn.Module):
-	config: XerxesConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = None
-
-	def setup(self):
+class XerxesModel(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: XerxesConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
 		self.hidden_size = self.config.hidden_size
 		self.embed_tokens = nn.Embed(
 			self.config.vocab_size,
@@ -615,13 +531,19 @@ class FlaxXerxesModel(nn.Module):
 			embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
 			dtype=dtype,
 			param_dtype=param_dtype,
+			rngs=rngs,
 		)
-		self.layers = FlaxXerxesLayerCollection(
-			config=config,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			precision=precision,
-		)
+		self.layers = [
+			XerxesDecoderLayer(
+				self.config,
+				layer_idx=i,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
+				rngs=rngs,
+			)
+			for i in range(self.config.num_hidden_layers)
+		]
 		self.norm = RMSNorm(
 			dim=self.config.hidden_size,
 			eps=self.config.rms_norm_eps,
@@ -629,15 +551,6 @@ class FlaxXerxesModel(nn.Module):
 			param_dtype=param_dtype,
 		)
 
-		self.causal_mask = make_causal_mask(
-			jnp.ones(
-				shape=(1, self.config.granted_mask_max_position_embedding),
-				dtype="bool",
-			),
-			dtype="bool",
-		)
-
-	# Ignore copy
 	def __call__(
 		self,
 		input_ids: Optional[chex.Array] = None,
@@ -668,6 +581,8 @@ class FlaxXerxesModel(nn.Module):
 		Returns:
 		    FlaxBaseModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
+		all_attentions = () if output_attentions else None
+		all_hidden_states = () if output_hidden_states else None
 		if input_embeds is None and input_ids is not None:
 			input_embeds = self.embed_tokens(input_ids.astype("i4"))
 		else:
@@ -678,16 +593,26 @@ class FlaxXerxesModel(nn.Module):
 		assert (
 			sequence_length <= self.config.max_position_embeddings
 		), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+
+		if attention_mask is None:
+			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
+
+		if position_ids is None:
+			position_ids = jnp.broadcast_to(
+				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+				(batch_size, sequence_length),
+			)
 		if attention_mask.ndim == 2:
 			attention_mask = jnp.expand_dims(attention_mask, (1, 2))
 
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
+		hidden_states = input_embeds
 		for idx, block in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
 
-			layer_outputs = block(
+			outputs = block(
 				hidden_states=hidden_states,
 				attention_mask=attention_mask,
 				position_ids=position_ids,
@@ -697,25 +622,25 @@ class FlaxXerxesModel(nn.Module):
 				segment_ids=segment_ids,
 				frequencies=self.frequencies,
 			)
-			hidden_states = layer_outputs[0]
+			hidden_states = outputs[0]
 
 			if output_attentions:
-				all_attentions += (layer_outputs[1],)
+				all_attentions += (outputs[1],)
 
-		hidden_states = outputs[0]
 		hidden_states = self.norm(hidden_states)
-
 		if output_hidden_states:
-			all_hidden_states += (hidden_states,)
-		outputs = (hidden_states, all_hidden_states, all_attentions)
+			all_hidden_states = outputs[1] + (hidden_states,)
+			outputs = (hidden_states, all_hidden_states) + outputs[2:]
+		else:
+			outputs = (hidden_states,) + outputs[1:]
 
 		if not return_dict:
 			return tuple(v for v in outputs if v is not None)
-
 		return FlaxBaseModelOutput(
 			last_hidden_state=hidden_states,
-			hidden_states=outputs[1],
-			attentions=outputs[-1],
+			hidden_states=all_hidden_states,
+			attentions=all_attentions,
+			past_key_values=past_key_values,
 		)
 
 
@@ -725,27 +650,39 @@ class FlaxXerxesModel(nn.Module):
 	model_type="xerxes",
 	embedding_layer_names=["embed_tokens"],
 )
-@wrap_easydel_module(config_class=XerxesConfig, base_model_prefix="model")
-class FlaxXerxesForCausalLM(nn.Module):
-	config: XerxesConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = None
-
-	def setup(self):
-		self.model = FlaxXerxesModel(
+class XerxesForCausalLM(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: XerxesConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
 			config=config,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
-		self.lm_head = Dense(
+		self.model = XerxesModel(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+		self.lm_head = nn.Linear(
+			self.config.hidden_size,
 			self.config.vocab_size,
 			use_bias=False,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
-			kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+			kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+			rngs=rngs,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
@@ -780,16 +717,6 @@ class FlaxXerxesForCausalLM(nn.Module):
 		    FlaxCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
 
-		batch_size, sequence_length = (
-			input_ids.shape if input_ids is not None else input_embeds.shape[:2]
-		)
-		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
-		if position_ids is None:
-			position_ids = jnp.broadcast_to(
-				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-				(batch_size, sequence_length),
-			)
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
@@ -801,7 +728,6 @@ class FlaxXerxesForCausalLM(nn.Module):
 			input_embeds=input_embeds,
 			segment_ids=segment_ids,
 		)
-
 		hidden_states = outputs[0]
 		if self.config.tie_word_embeddings:
 			self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
@@ -818,4 +744,5 @@ class FlaxXerxesForCausalLM(nn.Module):
 			logits=lm_logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
+			past_key_values=outputs.past_key_values,
 		)

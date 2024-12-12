@@ -8,6 +8,7 @@ __pycache__/
 *.so
 env.ipynb
 env.py
+exp.py
 sharding_test.py
 exprimental.py
 pallas_env.py

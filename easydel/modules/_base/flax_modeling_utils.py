@@ -43,7 +43,6 @@ from easydel.etils.etils import (
 )
 from easydel.etils.partition_module import PartitionAxis
 from easydel.modules._base.base_config import EasyMethod
-from easydel.utils.quantizers import DEFAULT_QUANTIZATION_PATTERN
 
 warnings.filterwarnings(
 	"ignore",
@@ -406,9 +405,9 @@ def quantize_linear_layers(
 	model: nn.Module,
 	method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.A8BIT,
 	block_size: int = 256,
-	quantization_pattern: str = DEFAULT_QUANTIZATION_PATTERN,
+	quantization_pattern: Optional[str] = None,
 	verbose: bool = True,
-) -> Union[Dict[str, Any], Any]:
+) -> nn.Module:
 	"""
 	Quantize parameters to 8-bit or nf4 precision, excluding specified layers.
 
@@ -436,12 +435,12 @@ def quantize_linear_layers(
 	}.get(method, None)
 	if quantizer is None:
 		raise NotImplementedError("Requested Quantizer is not Supported")
-
+	if quantization_pattern is None:
+		quantization_pattern = ".*"
 	pattern = re.compile(quantization_pattern)
 
-	total_params = len(jax.tree_util.tree_leaves(model._graph_node_flatten()[0]))
 	with tqdm(
-		total=total_params,
+		total=len([p[0] for p in iter_module_search(model, nn.Linear)]),
 		desc=f"Quantizing to {method}",
 		disable=not verbose,
 	) as pbar:

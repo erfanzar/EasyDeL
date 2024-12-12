@@ -175,6 +175,7 @@ class FlaxBaseModelOutput(ModelOutput):
 	last_hidden_state: jnp.ndarray = None
 	hidden_states: Optional[Tuple[jnp.ndarray]] = None
 	attentions: Optional[Tuple[jnp.ndarray]] = None
+	past_key_values: Optional[Dict[str, jnp.ndarray]] = None
 
 
 @flax.struct.dataclass
