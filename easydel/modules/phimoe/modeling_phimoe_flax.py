@@ -585,16 +585,18 @@ class FlaxPhiMoeModel(EasyDeLBaseModule):
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
+
 		outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
 
-		if return_dict:
-			return FlaxBaseModelOutput(
-				last_hidden_state=hidden_states,
-				hidden_states=outputs[1] if output_hidden_states else None,
-				attentions=outputs[-1] if output_attentions else None,
-			)
+		if not return_dict:
+			return tuple(v for v in outputs if v is not None)
 
-		return tuple(v for v in outputs if v is not None)
+		return FlaxBaseModelOutput(
+			last_hidden_state=hidden_states,
+			hidden_states=all_hidden_states,
+			attentions=all_attentions,
+			past_key_values=past_key_values,
+		)
 
 
 @register_module(

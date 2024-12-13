@@ -682,16 +682,17 @@ class FalconModel(EasyDeLBaseModule):
 		hidden_states = self.ln_f(hidden_states)
 		if all_hidden_states is not None:
 			all_hidden_states += hidden_states
-		if return_dict:
-			return FlaxBaseModelOutput(
-				last_hidden_state=hidden_states,
-				attentions=all_attentions,
-				hidden_states=all_hidden_states,
-			)
-		else:
-			return tuple(
-				[s for s in [hidden_states, all_attentions, all_attentions] if s is not None]
-			)
+		outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
+
+		if not return_dict:
+			return tuple(value for value in outputs if value is not None)
+
+		return FlaxBaseModelOutput(
+			last_hidden_state=hidden_states,
+			hidden_states=all_hidden_states,
+			attentions=all_attentions,
+			past_key_values=past_key_values,
+		)
 
 
 @register_module(
@@ -773,7 +774,7 @@ class FalconForCausalLM(EasyDeLBaseModule):
 		Returns:
 		    FlaxCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
-		transformer_output = self.transformer(
+		outputs = self.transformer(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
@@ -785,18 +786,17 @@ class FalconForCausalLM(EasyDeLBaseModule):
 			segment_ids=segment_ids,
 		)
 		if return_dict:
-			hidden_state = transformer_output.last_hidden_state
+			hidden_state = outputs.last_hidden_state
 		else:
-			hidden_state = transformer_output[0]
-		output = self.lm_head(hidden_state)
-		if return_dict:
-			if output_attentions:
-				return FlaxCausalLMOutput(
-					logits=output, attentions=transformer_output.attentions
-				)
-			else:
-				return FlaxCausalLMOutput(
-					logits=output,
-				)
-		else:
-			return (output, transformer_output[1]) if output_attentions else (output,)
+			hidden_state = outputs[0]
+
+		logits = self.lm_head(hidden_state)
+		if not return_dict:
+			return (logits,) + outputs[1:]
+
+		return FlaxCausalLMOutput(
+			logits=logits,
+			hidden_states=outputs.hidden_states,
+			attentions=outputs.attentions,
+			past_key_values=outputs.past_key_values,
+		)

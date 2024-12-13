@@ -480,14 +480,18 @@ class MptModel(EasyDeLBaseModule):
 		hidden_states = self.norm_f(hidden_states)
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-		if return_dict:
-			return FlaxBaseModelOutput(
-				last_hidden_state=hidden_states,
-				hidden_states=all_hidden_states,
-				attentions=all_attentions,
-			)
 
-		return (hidden_states, all_hidden_states, all_attentions)
+		outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
+
+		if not return_dict:
+			return tuple(value for value in outputs if value is not None)
+
+		return FlaxBaseModelOutput(
+			last_hidden_state=hidden_states,
+			hidden_states=all_hidden_states,
+			attentions=all_attentions,
+			past_key_values=past_key_values,
+		)
 
 
 @register_module(
@@ -546,7 +550,7 @@ class MptForCausalLM(EasyDeLBaseModule):
 		return_dict: bool = True,
 		**kwargs,
 	) -> Union[FlaxBaseModelOutput, Tuple]:
-		predict: FlaxBaseModelOutput = self.transformer(
+		outputs: FlaxBaseModelOutput = self.transformer(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			segment_ids=segment_ids,
@@ -556,7 +560,7 @@ class MptForCausalLM(EasyDeLBaseModule):
 			output_attentions=output_attentions,
 			return_dict=True,
 		)
-		last_hidden_state = predict.last_hidden_state
+		last_hidden_state = outputs.last_hidden_state
 
 		if self.config.use_lm_head:
 			self.lm_head.kernel.value = self.transformer.wte.embedding.value.T
@@ -564,6 +568,12 @@ class MptForCausalLM(EasyDeLBaseModule):
 		else:
 			logits = self.lm_head(last_hidden_state)
 
-		if return_dict:
-			return FlaxCausalLMOutput(logits=logits, hidden_states=predict.hidden_states)
-		return logits, predict.hidden_states if output_hidden_states else (logits,)
+		if not return_dict:
+			return (logits,) + outputs[1:]
+
+		return FlaxCausalLMOutput(
+			logits=logits,
+			hidden_states=outputs.hidden_states,
+			attentions=outputs.attentions,
+			past_key_values=outputs.past_key_values,
+		)

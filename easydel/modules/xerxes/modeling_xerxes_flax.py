@@ -636,6 +636,7 @@ class XerxesModel(EasyDeLBaseModule):
 
 		if not return_dict:
 			return tuple(v for v in outputs if v is not None)
+		
 		return FlaxBaseModelOutput(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,

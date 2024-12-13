@@ -563,8 +563,9 @@ class PhiModel(EasyDeLBaseModule):
 
 		return FlaxBaseModelOutput(
 			last_hidden_state=hidden_states,
-			hidden_states=outputs[1] if output_hidden_states else None,
-			attentions=outputs[-1] if output_attentions else None,
+			hidden_states=all_hidden_states,
+			attentions=all_attentions,
+			past_key_values=past_key_values,
 		)
 
 
@@ -642,7 +643,7 @@ class PhiForCausalLM(EasyDeLBaseModule):
 		    FlaxCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
 
-		res = self.model(
+		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
@@ -653,19 +654,19 @@ class PhiForCausalLM(EasyDeLBaseModule):
 			segment_ids=segment_ids,
 			return_dict=True,
 		)
-		outputs = (res.last_hidden_state, res.hidden_states, res.attentions)
 
 		if self.config.tie_word_embeddings:
 			self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
-			lm_logits = self.lm_head(res.last_hidden_state)
+			lm_logits = self.lm_head(outputs.last_hidden_state)
 		else:
-			lm_logits = self.lm_head(res.last_hidden_state)
+			lm_logits = self.lm_head(outputs.last_hidden_state)
 
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
 
 		return FlaxCausalLMOutput(
 			logits=lm_logits,
-			hidden_states=res.hidden_states,
-			attentions=res.attentions,
+			hidden_states=outputs.hidden_states,
+			attentions=outputs.attentions,
+			past_key_values=outputs.past_key_values,
 		)
