@@ -20,12 +20,13 @@ import chex
 import flax.struct
 import jax
 import jax.numpy as jnp
-from einops import rearrange, repeat, einsum
+from einops import repeat, einsum
 from jax import lax
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.layers.caching import MambaCache
 from easydel.layers.caching.mamba_cache import MambaCacheMetaData, MambaCacheView
+
 from easydel.layers.norms import RMSNorm as MambaRMSNorm
 from easydel.modules._base.base_module import EasyDeLBaseModule
 from easydel.modules._base.factory import register_module
@@ -46,14 +47,14 @@ def init_to_value(x, dtype):
 @flax.struct.dataclass
 class MambaOutput(FlaxBaseModelOutput):
 	last_hidden_state: chex.Array = None
-	cache_params: Optional[List[chex.Array]] = None
+	cache: Optional[List[chex.Array]] = None
 	hidden_states: Optional[Tuple[chex.Array]] = None
 
 
 @flax.struct.dataclass
 class MambaCausalLMOutput(FlaxBaseModelOutput):
 	logits: chex.Array = None
-	cache_params: Optional[List[chex.Array]] = None
+	cache: Optional[List[chex.Array]] = None
 	hidden_states: Optional[Tuple[chex.Array]] = None
 
 
@@ -81,32 +82,51 @@ class Lambda(nn.Module):
 
 
 class MambaConv1D(nn.Module):
-	features: int
-	kernel_size: int = 1
-	stride: int = 1
-	padding: int = 0
-	dilation: int = 1
-	groups: int = 1
-	use_bias: bool = True
-	num_spatial_dims: int = 1
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, lax.Precision]] = None
-
-	def setup(self):
-		kernel_shape = (self.features, 1, self.kernel_size)
+	def __init__(
+		self,
+		features: int,
+		kernel_size: int = 1,
+		stride: int = 1,
+		padding: int = 0,
+		dilation: int = 1,
+		groups: int = 1,
+		use_bias: bool = True,
+		num_spatial_dims: int = 1,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[str, lax.Precision]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		kernel_shape = (features, 1, kernel_size)
 		self.kernel = nn.Param(
-			init_fn=nn.initializers.lecun_normal(dtype=self.param_dtype),
-			shape=kernel_shape,
-			name="kernel",
+			nn.initializers.lecun_normal(dtype=param_dtype)(
+				rngs.params(),
+				kernel_shape,
+				param_dtype,
+			),
 		)
 
-		if self.use_bias:
+		if use_bias:
 			self.bias = nn.Param(
-				init_fn=nn.initializers.zeros,
-				shape=(self.features,),
-				name="bias",
+				nn.initializers.zeros(
+					rngs.params(),
+					shape=(features,),
+					dtype=param_dtype,
+				)
 			)
+
+		self.features = features
+		self.kernel_size = kernel_size
+		self.stride = stride
+		self.padding = padding
+		self.dilation = dilation
+		self.groups = groups
+		self.use_bias = use_bias
+		self.num_spatial_dims = num_spatial_dims
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
 
 	def __call__(self, x):
 		unbatched_rank = self.num_spatial_dims + 2
@@ -200,16 +220,14 @@ class MambaMixer(nn.Module):
 		time_step_rank = config.time_step_rank
 		conv_kernel_size = config.conv_kernel
 
-		self.conv1d = MambaConv1D(
-			features=intermediate_size,
-			kernel_size=conv_kernel_size,
-			groups=intermediate_size,
-			stride=1,
-			padding=conv_kernel_size - 1,
+		self.conv1d = nn.Conv(
+			in_features=intermediate_size,
+			out_features=intermediate_size,
 			use_bias=config.use_conv_bias,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			precision=precision,
+			kernel_size=config.conv_kernel,
+			feature_group_count=intermediate_size,
+			padding=config.conv_kernel - 1,
+			rngs=rngs,
 		)
 
 		self.activation = config.hidden_act
@@ -235,7 +253,7 @@ class MambaMixer(nn.Module):
 			config.time_step_floor,
 			jnp.exp(
 				jax.random.normal(
-					key=rngs.params,
+					key=rngs.params(),
 					shape=(intermediate_size,),
 					dtype=jnp.float32,
 				)
@@ -281,17 +299,8 @@ class MambaMixer(nn.Module):
 		)
 		A = repeat(jnp.arange(1, ssm_state_size + 1), "n -> d n", d=intermediate_size)
 
-		self.A_log = nn.Param(
-			init_fn=init_to_value(jnp.log(A), dtype),
-			shape=(intermediate_size, ssm_state_size),
-			name="A_log",
-		)
-
-		self.D = nn.Param(
-			init_fn=init_to_value(jnp.ones(intermediate_size), dtype),
-			shape=(intermediate_size,),
-			name="D",
-		)
+		self.A_log = nn.Param(jnp.log(A))
+		self.D = nn.Param(jnp.ones(intermediate_size))
 
 		self.ssm_state_size = ssm_state_size
 		self.intermediate_size = intermediate_size
@@ -300,103 +309,112 @@ class MambaMixer(nn.Module):
 
 	def __call__(
 		self,
-		input_states,
+		input_states: chex.Array,
 		cache: Optional[MambaCacheView] = None,
-		inference: Optional[bool] = True,
+		position_ids: Optional[chex.Array] = None,
+		attention_mask: Optional[chex.Array] = None,
 	):
 		batch_size, seq_len, _ = input_states.shape
 		dtype = input_states.dtype
-		projected_states = self.in_proj(input_states).transpose(0, 2, 1)
+
+		# 1. Gated MLP's linear projection
+		projected_states = self.in_proj(input_states)
+		projected_states = jnp.transpose(
+			projected_states, (0, 2, 1)
+		)  # [batch, 2 * intermediate_size, seq_len]
 		hidden_states, gate = jnp.split(projected_states, 2, axis=1)
 
+		if attention_mask is not None:
+			hidden_states = hidden_states * jnp.expand_dims(attention_mask, 1)
+
 		# 2. Convolution sequence transformation
-		if inference:
-			ssm_state = cache.ssm_states
-			if cache.seqlen_offset > 0:
-				conv_state = cache.conv_states
-				conv_state = jax.lax.dynamic_update_slice(conv_state, hidden_states, (0, 0, 0))
-				hidden_states = jnp.sum(
-					conv_state * rearrange(self.conv1d.kernel.value, "d 1 w -> 1 d w"),
-					axis=-1,
-				)
-				if self.config.use_conv_bias:
-					hidden_states += self.conv1d.bias.value
-				hidden_states = jnp.expand_dims(self.act(hidden_states).astype(dtype), -1)
-				# [batch, intermediate_size, 1] : decoding
-			else:
-				padding_amount = self.conv_kernel_size - hidden_states.shape[-1]
+		if cache is not None:
+			ssm_state = jnp.array(cache.ssm_states)
+
+			if position_ids.shape[0] == self.conv_kernel_size:
 				conv_state = jnp.pad(
-					hidden_states, ((0, 0), (0, 0), (padding_amount, 0)), mode="constant"
+					hidden_states,
+					((0, 0), (0, 0), (self.conv_kernel_size - hidden_states.shape[-1], 0)),
 				)
+
+				cache.update_conv_state(conv_state, position_ids)
 				hidden_states = self.act(
-					self.conv1d(hidden_states.transpose(0, 2, 1)).transpose(0, 2, 1)
-				)
-				cache.update_conv_state(conv_state)
+					self.conv1d(hidden_states)[..., :seq_len]
+				)  # [batch, intermediate_size, seq_len]
+			else:
+				conv_state = cache.update_conv_state(hidden_states, position_ids)
+				hidden_states = jnp.sum(conv_state * self.conv1d.weight[:, 0, :], axis=-1)
+				if self.use_conv_bias:
+					hidden_states = hidden_states + self.conv1d.bias
+				hidden_states = jnp.expand_dims(
+					self.act(hidden_states).astype(dtype), -1
+				)  # [batch, intermediate_size, 1]
 		else:
 			ssm_state = jnp.zeros(
 				(batch_size, self.intermediate_size, self.ssm_state_size), dtype=dtype
 			)
-			hidden_states = self.act(
-				self.conv1d(hidden_states.transpose(0, 2, 1)).transpose(0, 2, 1)
-			)
+			hidden_states = self.act(self.conv1d(hidden_states)[..., :seq_len])
+			# [batch, intermediate_size, seq_len]
 
-		ssm_parameters = self.x_proj(hidden_states)
+		if attention_mask is not None:
+			hidden_states = hidden_states * jnp.expand_dims(attention_mask, 1)
+
+		# 3. State Space Model sequence transformation
+		# 3.a. Selection
+		ssm_parameters = self.x_proj(jnp.transpose(hidden_states, (0, 2, 1)))
 		time_step, B, C = jnp.split(
 			ssm_parameters,
-			indices_or_sections=[
-				self.time_step_rank,
-				self.time_step_rank + self.ssm_state_size,
-			],
+			[self.time_step_rank, self.ssm_state_size, self.ssm_state_size],
 			axis=-1,
 		)
-		discrete_time_step = self.dt_proj(time_step)
-		# [batch, seq_len, intermediate_size]
-		discrete_time_step = jax.nn.softplus(discrete_time_step)
-		# [batch, intermediate_size, seq_len]
-		A = -jnp.exp(self.A_log.value.astype(jnp.float32))
-		# [intermediate_size, ssm_state_size]
-		modified_a = jnp.expand_dims(A, axis=0)
-		modified_time_step = jnp.expand_dims(discrete_time_step, axis=-1)
-		discrete_A = jnp.exp(modified_a * modified_time_step)
-		# [batch, intermediate_size, seq_len, ssm_state_size]
+		discrete_time_step = self.dt_proj(time_step)  # [batch, seq_len, intermediate_size]
+		discrete_time_step = jnp.transpose(
+			jax.nn.softplus(discrete_time_step), (0, 2, 1)
+		)  # [batch, intermediate_size, seq_len]
 
-		discrete_B = jnp.expand_dims(
-			rearrange(B, "b l d -> b d l"),
-			axis=2,
-		).astype(jnp.float32)
-
-		# [batch, intermediate_size, 1, ssm_state_size]
-
-		deltaB_u = discrete_B * jnp.expand_dims(hidden_states, axis=-1).astype(jnp.float32)
-
-		# 3.c perform the recurrence y ← SSM(A, B, C)(x)
-		scan_outputs = []
-		for i in range(seq_len):
-			ssm_state = discrete_A[:, :, i, :] * ssm_state + deltaB_u[:, :, i, :]
-			# [batch, intermediate_size, ssm_state]
-
-			scan_output = jax.lax.batch_matmul(
-				ssm_state.astype(dtype),
-				jnp.expand_dims(rearrange(C[:, i, :], "b d -> b d 1"), -1).astype(dtype),
-			)
-			# [batch, intermediate_size, 1]
-
-			scan_outputs.append(scan_output[:, :, 0])
-
-		scan_output = jnp.stack(scan_outputs, axis=1)
-		# [batch, seq_len, intermediate_size]
-		scan_output = scan_output + (
-			hidden_states * self.D.value[jnp.newaxis, jnp.newaxis, :]
+		# 3.b. Discretization
+		A = -jnp.exp(self.A_log.astype(jnp.float32))  # [intermediate_size, ssm_state_size]
+		discrete_A = jnp.exp(A[None, :, None, :] * discrete_time_step[:, :, :, None])
+		discrete_B = discrete_time_step[:, :, :, None] * B[:, None, :, :].astype(
+			jnp.float32
 		)
+		deltaB_u = discrete_B * hidden_states[:, :, :, None].astype(jnp.float32)
+
+		# 3.c perform the recurrence
+		def scan_fn(carry, x):
+			ssm_state = carry
+			discrete_A_t, deltaB_u_t = x
+			new_state = discrete_A_t * ssm_state + deltaB_u_t
+			return new_state, new_state
+
+		if cache is not None:
+			# Explicit loop for inference or when using cache
+			scan_outputs = []
+			for i in range(seq_len):
+				ssm_state = discrete_A[:, :, i, :] * ssm_state + deltaB_u[:, :, i, :]
+				scan_output = jnp.matmul(
+					ssm_state.astype(dtype), jnp.expand_dims(C[:, i, :], -1)
+				)
+				scan_outputs.append(scan_output[:, :, 0])
+			scan_output = jnp.stack(scan_outputs, axis=-1)
+		else:
+			# Use scan for training
+			_, scan_output = jax.lax.scan(
+				scan_fn,
+				ssm_state,
+				(jnp.moveaxis(discrete_A, 2, 0), jnp.moveaxis(deltaB_u, 2, 0)),
+			)
+			scan_output = jnp.matmul(scan_output, jnp.expand_dims(C, -1)).squeeze(-1)
+			scan_output = jnp.moveaxis(scan_output, 0, 2)
+
+		scan_output = scan_output + (hidden_states * self.D[None, :, None])
 		scan_output = scan_output * self.act(gate)
 
-		if inference:
-			cache.update_ssm_state(ssm_state)
-			cache.positions += 1
+		if cache is not None:
+			cache.ssm_states = ssm_state
 
 		# 4. Final linear projection
-		contextualized_states = self.out_proj(scan_output)
-		# [batch, seq_len, hidden_size]
+		contextualized_states = self.out_proj(jnp.transpose(scan_output, (0, 2, 1)))
 		return contextualized_states
 
 
@@ -443,7 +461,8 @@ class MambaBlock(nn.Module):
 		self,
 		hidden_states: chex.Array,
 		cache: Optional[MambaCacheView] = None,
-		inference: Optional[bool] = True,
+		position_ids: Optional[chex.Array] = None,
+		attention_mask: Optional[chex.Array] = None,
 	) -> chex.Array:
 		residual = hidden_states
 		hidden_states = self.norm(hidden_states)
@@ -451,8 +470,9 @@ class MambaBlock(nn.Module):
 			residual = residual.astype(jnp.float32)
 		hidden_states = self.mixer(
 			hidden_states,
-			cache=cache,
-			inference=inference,
+			cache,
+			position_ids,
+			attention_mask,
 		)
 		hidden_states = residual + hidden_states
 		return hidden_states
@@ -511,9 +531,10 @@ class MambaModel(EasyDeLBaseModule):
 		input_ids: Optional[chex.Array] = None,
 		input_embeds: Optional[chex.Array] = None,
 		cache: Optional[MambaCache] = None,
+		position_ids: Optional[chex.Array] = None,
+		attention_mask: Optional[chex.Array] = None,
 		output_hidden_states: Optional[bool] = None,
 		return_dict: Optional[bool] = None,
-		inference: Optional[bool] = True,
 		**kwargs,
 	) -> Union[Tuple, MambaOutput]:
 		output_hidden_states = (
@@ -533,16 +554,25 @@ class MambaModel(EasyDeLBaseModule):
 		if input_embeds is None:
 			input_embeds = self.embeddings(input_ids)
 
-		if inference and cache is None:
-			cache = MambaCache.init_empty(len(self.layers.blocks))
+		batch_size, sequence_length = input_embeds.shape[:2]
+		if attention_mask is None:
+			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
+		if position_ids is None:
+			position_ids = jnp.broadcast_to(
+				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+				(batch_size, sequence_length),
+			).astype(jnp.int32)
+		if cache is None:
+			cache = MambaCache.init_empty(len(self.layers))
 
 		hidden_states = input_embeds
 		all_hidden_states = () if output_hidden_states else None
-		for idx, block in enumerate(self.blocks):
+		for idx, block in enumerate(self.layers):
 			hidden_states = block(
-				hidden_states,
+				hidden_states=hidden_states,
 				cache=cache.views[idx],
-				inference=inference,
+				attention_mask=attention_mask,
+				position_ids=position_ids,
 			)
 
 			if output_hidden_states:
@@ -558,15 +588,15 @@ class MambaModel(EasyDeLBaseModule):
 				v
 				for v in [
 					hidden_states,
-					cache if inference else None,
 					all_hidden_states,
+					cache,
 				]
 				if v is not None
 			)
 
 		return MambaOutput(
 			last_hidden_state=hidden_states,
-			cache_params=cache if inference else None,
+			cache=cache,
 			hidden_states=all_hidden_states,
 		)
 
@@ -634,9 +664,10 @@ class MambaForCausalLM(EasyDeLBaseModule):
 		input_ids: Optional[chex.Array] = None,
 		input_embeds: Optional[chex.Array] = None,
 		cache: Optional[MambaCache] = None,
+		position_ids: Optional[chex.Array] = None,
+		attention_mask: Optional[chex.Array] = None,
 		output_hidden_states: Optional[bool] = None,
 		return_dict: Optional[bool] = None,
-		inference: Optional[bool] = True,
 		**kwargs,
 	) -> Union[Tuple, MambaCausalLMOutput]:
 		return_dict = (
@@ -646,10 +677,11 @@ class MambaForCausalLM(EasyDeLBaseModule):
 		mamba_outputs = self.backbone(
 			input_ids=input_ids,
 			input_embeds=input_embeds,
+			attention_mask=attention_mask,
+			position_ids=position_ids,
 			cache=cache,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,
-			inference=inference,
 		)
 		hidden_states = mamba_outputs[0]
 
@@ -661,7 +693,7 @@ class MambaForCausalLM(EasyDeLBaseModule):
 
 		return MambaCausalLMOutput(
 			logits=logits,
-			cache_params=mamba_outputs.cache_params,
+			cache=mamba_outputs.cache,
 			hidden_states=mamba_outputs.hidden_states,
 		)
 
@@ -671,7 +703,7 @@ class MambaForCausalLM(EasyDeLBaseModule):
 		model_kwargs: Dict[str, Any],
 		**kwargs,
 	) -> Dict[str, Any]:
-		model_kwargs["cache"] = outputs.get("cache_params", None)
+		model_kwargs["cache"] = outputs.get("cache", None)
 		return model_kwargs
 
 	def prepare_inputs_for_generation(self, input_ids, max_length, **kwargs):

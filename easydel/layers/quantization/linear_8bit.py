@@ -1,3 +1,16 @@
+# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import typing as tp
@@ -6,7 +19,6 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from flax.nnx import rnglib
-from flax.nnx.module import Module
 from flax.nnx.nn import dtypes, initializers
 from flax.typing import (
 	DotGeneralT,
@@ -15,6 +27,7 @@ from flax.typing import (
 	PrecisionLike,
 )
 from jax import lax
+from easydel.layers.quantization.base_quant import QauntModule
 
 Array = jax.Array
 Axis = int
@@ -26,43 +39,32 @@ default_bias_init = initializers.zeros_init()
 
 
 @jax.jit
-def _mu_quantize_row_q8_0(x):
+def quantize_8bit(x):
 	"""
 	Quantize a row of float32 values to 8-bit integers with blockwise scaling.
-	Args:
-	x: input array
-	Returns:
-	tuple of (scales, quantized_values)
-	- scales: float16 array of shape (nb,)
-	- quantized_values: int8 array of shape (k,)
 	"""
-	amax = jnp.max(jnp.abs(x), axis=-1, keepdims=True)
-	d = amax / 127.0
-	ids = jnp.where(d > 0, 1.0 / d, 0.0)
-	x_scaled = x * ids
-	quantized = jnp.round(x_scaled)
-	quantized = quantized.astype(jnp.int8)
-	return quantized, d.astype(jnp.float16)
+	max_val = jnp.amax(jnp.abs(x.astype(jnp.float32)), axis=-1, keepdims=True)
+	max_val = jnp.clip(max_val, min=1e-5)
+	qscale = max_val / 127
+	qweight = jnp.clip(
+		jnp.round(x * (1.0 / qscale)),
+		min=-128,
+		max=127,
+	).astype(jnp.int8)
+	qscale = qscale.astype(x.dtype)
+	return qweight, qscale
 
 
 @jax.jit
-def _mu_dequantize_row_q8_0(quants, scales):
+def dequantize_8bit(quants, scales):
 	"""
-	Dequantize 8-bit integers back to float32 values using blockwise scaling.
-
-
-	Args:
-			quants: int8 array of shape (k,) containing quantized values
-			scales: float16 array of shape (nb,) containing scaling factors
-	Returns:
-			float32 array of shape (k,) containing dequantized values
+	Dequantize 8-bit integers back to values using blockwise scaling.
 	"""
-	scales = scales.astype(jnp.float32)
 	dequantized = quants * scales
 	return dequantized
 
 
-class Linear8bit(Module):
+class Linear8bit(QauntModule):
 	"""An 8-bit quantized version of the linear transformation applied over the last dimension of the input."""
 
 	def __init__(
@@ -80,7 +82,11 @@ class Linear8bit(Module):
 		dot_general: DotGeneralT = lax.dot_general,
 		rngs: rnglib.Rngs,
 	):
-		# Initialize the kernel
+		super().__init__(
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+		)
 		if do_init:
 			kernel_key = rngs.params()
 			kernel = kernel_init(kernel_key, (in_features, out_features), param_dtype)
@@ -199,7 +205,7 @@ class Linear8bit(Module):
 		"""Quantize the kernel weights."""
 		if kernel is None:
 			return None, None
-		quantized, scales = _mu_quantize_row_q8_0(kernel)
+		quantized, scales = quantize_8bit(kernel)
 		return quantized, scales
 
 	def _dequantize_kernel(self):  # in case somebody using tie word embedding.
@@ -208,7 +214,10 @@ class Linear8bit(Module):
 			return None
 		elif self.scales.value is None:
 			return self.kernel
-		return _mu_dequantize_row_q8_0(self.kernel.value, self.scales.value)
+		return dequantize_8bit(
+			self.kernel.value,
+			self.scales.value,
+		).astype(self.param_dtype)
 
 	def __call__(self, inputs: Array) -> Array:
 		"""Applies a quantized linear transformation to the inputs along the last dimension."""
@@ -242,3 +251,11 @@ class Linear8bit(Module):
 	def get_quantized_kernel(self):
 		"""Get the quantized kernel weights and scales."""
 		return self.kernel.value, self.scales.value
+
+	@staticmethod
+	def metadata():
+		return {"quant_mode": "8bit"}
+
+	@staticmethod
+	def quantization_mapping():
+		return {"kernel": ["kernel", "scales"]}

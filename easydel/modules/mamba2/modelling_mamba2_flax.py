@@ -40,7 +40,6 @@ from jax import eval_shape, lax
 from jax.core import ShapedArray
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
-from easydel.layers.common import Conv1D
 from easydel.layers.norms import RMSNorm as FlaxMamba2RMSNorm
 from easydel.modules._base.base_module import EasyDeLBaseModule
 from easydel.modules._base.factory import register_module
