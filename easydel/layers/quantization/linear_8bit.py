@@ -203,7 +203,7 @@ class Linear8bit(QauntModule):
 	@staticmethod
 	def _quantize_kernel(kernel):
 		"""Quantize the kernel weights."""
-		if kernel is None:
+		if kernel is None or isinstance(kernel, jax.ShapeDtypeStruct):
 			return None, None
 		quantized, scales = quantize_8bit(kernel)
 		return quantized, scales

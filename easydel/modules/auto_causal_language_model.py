@@ -338,7 +338,7 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 		model = traversals.merge_model_and_tree(model=model, tree=params)
 
 		model = quantize_linear_layers(
-			model=model,
+			model,
 			method=quantization_method,
 			block_size=quantization_block_size,
 			verbose=verbose,

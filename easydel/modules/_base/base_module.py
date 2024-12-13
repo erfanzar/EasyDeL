@@ -390,17 +390,39 @@ class EasyDeLBaseModule(nn.Module):
 		# )
 		# return hf_model
 
-	def save_pretrained(  # noqa
+	def _model_card(self, name: str, repo_id: str) -> str:
+		"""generates a model card for given model
+
+		Args:
+				name (str): model name
+				repo_id (str): repo id
+
+		Returns:
+				str: generated README
+		"""
+		from easydel import __version__
+		from easydel.utils.readme_generator import ModelInfo, ReadmeGenerator
+
+		return ReadmeGenerator().generate_readme(
+			ModelInfo(
+				name=name,
+				type=self.__class__.__name__,
+				repo_id=repo_id,
+				model_type=self._model_type,
+				model_task=self._model_task,
+				version=__version__,
+			)
+		)
+
+	def save_pretrained(
 		self,
 		save_directory: tp.Union[str, os.PathLike],
-		params,
 		push_to_hub=False,
 		token: tp.Optional[tp.Union[str, bool]] = None,
 		gather_fns: dict[tp.Callable] = None,
 		float_dtype=None,
 		verbose: bool = True,
 		mismatch_allowed: bool = True,
-		safe=True,
 		**kwargs,
 	):
 		if token is not None:
@@ -427,12 +449,13 @@ class EasyDeLBaseModule(nn.Module):
 		readme_path = os.path.join(save_directory, "README.md")
 		if not os.path.exists(readme_path):
 			open(readme_path, "w").write(self._model_card(repo_id, repo_id))
+		state = nn.split(self)[1]
 
 		CheckpointManager.save_checkpoint(
+			state=state.to_pure_dict(),
 			path=output_model_file,
 			gather_fns=gather_fns,
 			mismatch_allowed=mismatch_allowed,
-			state=params,
 			float_dtype=float_dtype,
 			verbose=verbose,
 		)
@@ -690,6 +713,13 @@ class EasyDeLBaseModule(nn.Module):
 			)
 		)
 
+		model = quantize_linear_layers(
+			model,
+			method=config.quantization_method,
+			block_size=config.quantization_blocksize,
+			quantization_pattern=config.quantization_pattern,
+		)
+
 		state, _ = CheckpointManager.load_checkpoint(
 			path=resolved_archive_file,
 			mismatch_allowed=mismatch_allowed,
@@ -702,52 +732,13 @@ class EasyDeLBaseModule(nn.Module):
 			state = params
 		state = flatten_dict(state)
 		state = string_key_to_int(state)
-		random_state = flatten_dict(model.graphtree_params_shape)
+
 		required_params = set(flatten_dict(model.graphtree_params_shape))
 		unexpected_keys = set(state.keys()) - required_params
-
-		mismatched_keys = []
-		for key in state.keys():
-			if key in random_state and state[key].shape != random_state[key].shape:
-				if ignore_mismatched_sizes:
-					mismatched_keys.append((key, state[key].shape, random_state[key].shape))
-					state[key] = random_state[key]
-				else:
-					raise ValueError(
-						f"Trying to load the pretrained weight for {key} failed: checkpoint has shape "
-						f"{state[key].shape} which is incompatible with the model shape {random_state[key].shape}. "
-						"Using `ignore_mismatched_sizes=True` if you really want to load this checkpoint inside this "
-						"model."
-					)
 
 		# remove unexpected keys to not be saved again
 		for unexpected_key in unexpected_keys:
 			del state[unexpected_key]
-
-		if len(unexpected_keys) > 0:
-			logger.warning(
-				f"Some weights of the model checkpoint at {pretrained_model_name_or_path} were not used when"
-				f" initializing {model.__class__.__name__}: {unexpected_keys}\n- This IS expected if you are"
-				f" initializing {model.__class__.__name__} from the checkpoint of a model trained on another task or"
-				" with another architecture (e.g. initializing a BertForSequenceClassification model from a"
-				" BertForPreTraining model).\n- This IS NOT expected if you are initializing"
-				f" {model.__class__.__name__} from the checkpoint of a model that you expect to be exactly identical"
-				" (initializing a BertForSequenceClassification model from a BertForSequenceClassification model)."
-			)
-
-		if len(mismatched_keys) > 0:
-			mismatched_warning = "\n".join(
-				[
-					f"- {key}: found shape {shape1} in the checkpoint and {shape2} in the model instantiated"
-					for key, shape1, shape2 in mismatched_keys
-				]
-			)
-			logger.warning(
-				f"Some weights of {model.__class__.__name__} were not initialized from the model checkpoint at"
-				f" {pretrained_model_name_or_path} and are newly initialized because the shapes did not"
-				f" match:\n{mismatched_warning}\nYou should probably TRAIN this model on a down-stream task to be able"
-				" to use it for predictions and inference."
-			)
 
 		if model.can_generate():
 			try:

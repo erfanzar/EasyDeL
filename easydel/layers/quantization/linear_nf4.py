@@ -260,7 +260,7 @@ class LinearNF4(QauntModule):
 	@staticmethod
 	def _quantize_kernel(kernel, block_size):
 		"""Quantize the kernel weights using NF4."""
-		if kernel is None:
+		if kernel is None or isinstance(kernel, jax.ShapeDtypeStruct):
 			return None, None
 		return quantize_and_pack_nf4(kernel, block_size)
 
