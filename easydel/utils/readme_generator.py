@@ -19,7 +19,8 @@ class ModelInfo:
 	type: str
 	repo_id: str
 	description: Optional[str] = None
-	model_class: Optional[str] = None
+	model_type: Optional[str] = None
+	model_task: Optional[str] = None
 	features: Optional[list] = None
 	supported_tasks: Optional[list] = None
 	limitations: Optional[list] = None

@@ -192,10 +192,11 @@ class CheckpointManager:
 			metadata: Additional metadata to store in the checkpoint.
 		"""
 		state = to_state_dict(state)
+
 		gather_mismatch_count = 0
 
 		if not is_flatten(state):
-			state = flatten_dict(state)
+			state = flatten_dict(state, sep=".")
 
 		if gather_fns:
 			if not is_flatten(gather_fns):
@@ -231,7 +232,9 @@ class CheckpointManager:
 				float_dtype,
 			)
 			for key, value in state.items()
+			if value is not None
 		}
+
 		safetensors.flax.save_file(tensors=state, filename=path, metadata=metadata)
 
 	@staticmethod

@@ -403,6 +403,8 @@ def is_flatten(pytree: dict):
 
 def quantize_linear_layers(
 	model: nn.Module,
+	/,
+	*,
 	method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.A8BIT,
 	block_size: int = 256,
 	quantization_pattern: Optional[str] = None,
@@ -422,6 +424,7 @@ def quantize_linear_layers(
 	"""
 	if method == EasyDeLQuantizationMethods.NONE:
 		return model
+
 	from easydel.layers.quantization import Linear8bit, LinearNF4
 	from easydel.utils.graph_utils import (
 		get_module_from_path,
@@ -432,11 +435,19 @@ def quantize_linear_layers(
 	quantizer: Linear8bit = {
 		EasyDeLQuantizationMethods.NF4: LinearNF4,
 		EasyDeLQuantizationMethods.A8BIT: Linear8bit,
+		EasyDeLQuantizationMethods.A4Q: LinearNF4,
+		EasyDeLQuantizationMethods.A8Q: Linear8bit,
 	}.get(method, None)
 	if quantizer is None:
 		raise NotImplementedError("Requested Quantizer is not Supported")
 	if quantization_pattern is None:
 		quantization_pattern = ".*"
+
+	if hasattr(model, "config"):
+		model.config.quantization_method = method
+		model.config.quantization_block_size = block_size
+		model.config.quantization_pattern = quantization_pattern
+
 	pattern = re.compile(quantization_pattern)
 
 	with tqdm(
