@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.whisper.modelling_whisper_flax import (
-	WhisperForAudioClassification,
-	WhisperForConditionalGeneration,
-	WhisperTimeStampLogitsProcessor,
-)
-from easydel.modules.whisper.whisper_configuration import WhisperConfig
+from easydel.modules._base.mixin.bridge import EasyBridgeMixin
+from easydel.modules._base.mixin.generation_utils import EasyGenerationMixin
+from easydel.modules._base.mixin.protocol import BaseModuleProtocol
+
+__all__ = "BaseModuleProtocol", "EasyGenerationMixin", "EasyBridgeMixin"

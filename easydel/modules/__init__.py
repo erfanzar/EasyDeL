@@ -104,13 +104,13 @@ from easydel.modules.internlm2.modeling_internlm2_flax import (
 from easydel.modules.llama import (
 	LlamaConfig,
 	LlamaForCausalLM,
-	LlamaModel,
 	LlamaForSequenceClassification,
+	LlamaModel,
 )
 from easydel.modules.mamba import (
 	MambaConfig,
-	MambaModel,
 	MambaForCausalLM,
+	MambaModel,
 )
 from easydel.modules.mamba2 import (
 	FlaxMamba2Cache,
@@ -186,10 +186,10 @@ from easydel.modules.stablelm import (
 	StableLmModel,
 )
 from easydel.modules.whisper import (
-	FlaxWhisperForAudioClassification,
-	FlaxWhisperForConditionalGeneration,
-	FlaxWhisperTimeStampLogitsProcessor,
 	WhisperConfig,
+	WhisperForAudioClassification,
+	WhisperForConditionalGeneration,
+	WhisperTimeStampLogitsProcessor,
 )
 from easydel.modules.xerxes import (
 	XerxesConfig,
