@@ -22,16 +22,12 @@ import jax.numpy as jnp
 
 # import transformers
 from flax import nnx as nn
-from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
-from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
-from jax.random import PRNGKey
 
-from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.inference.logits_process import (
 	FlaxLogitsProcessorList,
 	FlaxStaticForceTokensLogitsProcessor,
-	FlaxWhisperTimeStampLogitsProcessor,
+	WhisperTimeStampLogitsProcessor,
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching.transformer_cache import (
@@ -45,12 +41,10 @@ from easydel.modules._base.factory import register_module
 from easydel.modules._base.flax_modeling_utils import (
 	ACT2FN,
 	get_dot_general_by_bits,
-	get_gradient_checkpoint_policy,
 )
 from easydel.modules.modeling_flax_outputs import (
 	FlaxBaseModelOutput,
 	FlaxBaseModelOutputWithPastAndCrossAttentions,
-	FlaxCausalLMOutputWithCrossAttentions,
 	FlaxSeq2SeqLMOutput,
 	FlaxSeq2SeqModelOutput,
 	FlaxSequenceClassifierOutput,
@@ -776,8 +770,8 @@ class FlaxWhisperModel(EasyDeLBaseModule):
 		self,
 		input_features: jnp.ndarray,
 		decoder_input_ids: jnp.ndarray,
-		decoder_attention_mask: jnp.ndarray,
-		decoder_position_ids: jnp.ndarray,
+		decoder_attention_mask: Optional[jnp.ndarray] = None,
+		decoder_position_ids: Optional[jnp.ndarray] = None,
 		past_key_values: Optional[TransformerCache] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
@@ -845,84 +839,101 @@ class FlaxWhisperModel(EasyDeLBaseModule):
 			encoder_attentions=encoder_outputs.attentions,
 		)
 
-
-class FlaxWhisperForConditionalGenerationModule(nn.Module):
-	config: WhisperConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, lax.Precision]] = None
-
-	def setup(self) -> None:
-		self.model = FlaxWhisperModule(
-			config=config,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			precision=precision,
-			rngs=rngs,
-		)
-		self.proj_out = Dense(
-			self.config.vocab_size,
-			use_bias=False,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			precision=precision,
-			kernel_init=jax.nn.initializers.normal(self.config.init_std),
-			**get_dot_general_by_bits(config.bits, config.easy_method),
-		)
-
-	def _get_encoder_module(self):
-		return self.model.encoder
-
-	def _get_decoder_module(self):
-		return self.model.decoder
-
-	def __call__(
+	def decode(
 		self,
-		input_features,
-		decoder_input_ids,
-		decoder_attention_mask: jnp.ndarray = None,
-		decoder_position_ids: jnp.ndarray = None,
+		encoder_hidden_states: jnp.ndarray,
+		decoder_input_ids: jnp.ndarray,
+		decoder_attention_mask: Optional[jnp.ndarray] = None,
+		decoder_position_ids: Optional[jnp.ndarray] = None,
+		past_key_values: Optional[TransformerCache] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
-		deterministic: bool = True,
 	):
-		outputs = self.model(
-			input_features=input_features,
-			decoder_input_ids=decoder_input_ids,
-			decoder_attention_mask=decoder_attention_mask,
-			decoder_position_ids=decoder_position_ids,
+		output_attentions = (
+			output_attentions
+			if output_attentions is not None
+			else self.config.output_attentions
+		)
+		output_hidden_states = (
+			output_hidden_states
+			if output_hidden_states is not None
+			else self.config.output_hidden_states
+		)
+		return_dict = return_dict if return_dict is not None else self.config.return_dict
+		batch_size, sequence_length = decoder_input_ids.shape
+
+		if decoder_attention_mask is None:
+			decoder_attention_mask = jnp.ones((batch_size, sequence_length))
+		if decoder_position_ids is None:
+			if past_key_values is not None:
+				raise ValueError(
+					"Make sure to provide `decoder_position_ids` when passing `past_key_values`."
+				)
+
+			if decoder_attention_mask is not None:
+				decoder_position_ids = (
+					decoder_attention_mask.cumsum(-1) * decoder_attention_mask
+				) - 1
+			else:
+				decoder_position_ids = jnp.broadcast_to(
+					jnp.arange(sequence_length)[None, :],
+					(batch_size, sequence_length),
+				)
+
+		decoder_outputs = self.decoder(
+			input_ids=decoder_input_ids,
+			attention_mask=decoder_attention_mask,
+			position_ids=decoder_position_ids,
+			past_key_values=past_key_values,
+			encoder_hidden_states=encoder_hidden_states,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,
-			deterministic=deterministic,
 		)
 
-		hidden_states = outputs[0]
-
-		if self.config.tie_word_embeddings:
-			shared_embedding = self.model.decoder.embed_tokens.variables["params"][
-				"embedding"
-			].T.astype(self.param_dtype)
-			lm_logits = self.proj_out.apply(
-				{"params": {"kernel": shared_embedding}},
-				hidden_states,
-			)
-		else:
-			lm_logits = self.proj_out(hidden_states)
-
 		if not return_dict:
-			output = (lm_logits,) + outputs[1:]
-			return output
+			return decoder_outputs
 
-		return FlaxSeq2SeqLMOutput(
-			logits=lm_logits,
-			decoder_hidden_states=outputs.decoder_hidden_states,
-			decoder_attentions=outputs.decoder_attentions,
-			cross_attentions=outputs.cross_attentions,
-			encoder_last_hidden_state=outputs.encoder_last_hidden_state,
-			encoder_hidden_states=outputs.encoder_hidden_states,
-			encoder_attentions=outputs.encoder_attentions,
+		return FlaxSeq2SeqModelOutput(
+			last_hidden_state=decoder_outputs.last_hidden_state,
+			decoder_hidden_states=decoder_outputs.hidden_states,
+			decoder_attentions=decoder_outputs.attentions,
+			cross_attentions=decoder_outputs.cross_attentions,
+		)
+
+	def encode(
+		self,
+		input_features: jnp.ndarray,
+		output_attentions: bool = False,
+		output_hidden_states: bool = False,
+		return_dict: bool = True,
+	):
+		output_attentions = (
+			output_attentions
+			if output_attentions is not None
+			else self.config.output_attentions
+		)
+		output_hidden_states = (
+			output_hidden_states
+			if output_hidden_states is not None
+			else self.config.output_hidden_states
+		)
+		return_dict = return_dict if return_dict is not None else self.config.return_dict
+
+		encoder_outputs = self.encoder(
+			input_features=input_features,
+			output_attentions=output_attentions,
+			output_hidden_states=output_hidden_states,
+			return_dict=return_dict,
+		)
+		if not return_dict:
+			return encoder_outputs
+
+		return FlaxSeq2SeqModelOutput(
+			encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+			encoder_hidden_states=encoder_outputs.hidden_states,
+			encoder_attentions=encoder_outputs.attentions,
 		)
 
 
@@ -938,8 +949,91 @@ class FlaxWhisperForConditionalGenerationModule(nn.Module):
 		"layer_norm",
 	],
 )
-class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
-	module_class = FlaxWhisperForConditionalGenerationModule
+class WhisperForConditionalGeneration(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: WhisperConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[str, lax.Precision]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+		self.model = FlaxWhisperModel(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+		self.proj_out = nn.Linear(
+			config.d_model,
+			config.vocab_size,
+			use_bias=False,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			kernel_init=jax.nn.initializers.normal(config.init_std),
+			**get_dot_general_by_bits(config.bits, config.easy_method),
+		)
+
+	def _get_encoder_module(self):
+		return self.model.encoder
+
+	def _get_decoder_module(self):
+		return self.model.decoder
+
+	def __call__(
+		self,
+		input_features,
+		decoder_input_ids,
+		decoder_attention_mask: Optional[jnp.ndarray] = None,
+		decoder_position_ids: Optional[jnp.ndarray] = None,
+		past_key_values: Optional[TransformerCache] = None,
+		output_attentions: bool = False,
+		output_hidden_states: bool = False,
+		return_dict: bool = True,
+	):
+		outputs = self.model(
+			input_features=input_features,
+			decoder_input_ids=decoder_input_ids,
+			decoder_attention_mask=decoder_attention_mask,
+			decoder_position_ids=decoder_position_ids,
+			output_attentions=output_attentions,
+			output_hidden_states=output_hidden_states,
+			return_dict=return_dict,
+			past_key_values=past_key_values,
+		)
+
+		hidden_states = outputs[0]
+
+		if self.config.tie_word_embeddings:
+			self.proj_out.kernel.value = (
+				self.model.decoder.embed_tokens.embedding.value.T.astype(self.param_dtype)
+			)
+
+		lm_logits = self.proj_out(hidden_states)
+
+		if not return_dict:
+			output = (lm_logits,) + outputs[1:]
+			return output
+
+		return FlaxSeq2SeqLMOutput(
+			logits=lm_logits,
+			decoder_hidden_states=outputs.decoder_hidden_states,
+			decoder_attentions=outputs.decoder_attentions,
+			cross_attentions=outputs.cross_attentions,
+			encoder_last_hidden_state=outputs.encoder_last_hidden_state,
+			encoder_hidden_states=outputs.encoder_hidden_states,
+			encoder_attentions=outputs.encoder_attentions,
+		)
 
 	def decode(
 		self,
@@ -952,10 +1046,6 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		return_dict: Optional[bool] = None,
-		train: bool = False,
-		params: dict = None,
-		dropout_rng: PRNGKey = None,
-		add_params_field: Optional[bool] = False,
 	):
 		output_attentions = (
 			output_attentions
@@ -970,107 +1060,16 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
 		return_dict = return_dict if return_dict is not None else self.config.return_dict
 
 		encoder_hidden_states = encoder_outputs[0]
-
-		batch_size, sequence_length = decoder_input_ids.shape
-		if decoder_position_ids is None:
-			if past_key_values is not None:
-				raise ValueError(
-					"Make sure to provide `decoder_position_ids` when passing `past_key_values`."
-				)
-
-			if decoder_attention_mask is not None:
-				decoder_position_ids = (
-					decoder_attention_mask.cumsum(-1) * decoder_attention_mask
-				) - 1
-			else:
-				decoder_position_ids = jnp.broadcast_to(
-					jnp.arange(sequence_length)[None, :], (batch_size, sequence_length)
-				)
-		if decoder_attention_mask is None:
-			decoder_attention_mask = jnp.ones((batch_size, sequence_length), dtype="i4")
-
-		# Handle any PRNG if needed
-		rngs = {}
-		if dropout_rng is not None:
-			rngs["dropout"] = dropout_rng
-
-		inputs = (
-			{"params": params or self.params} if add_params_field else params or self.params
-		)
-
-		if past_key_values is not None:
-			inputs["cache"] = past_key_values
-			mutable = ["cache"]
-		else:
-			mutable = False
-
-		def _decoder_forward(
-			module,
-			decoder_input_ids,
-			decoder_attention_mask,
-			decoder_position_ids,
-			**kwargs,
-		):
-			decoder_module = module._get_decoder_module()
-			outputs = decoder_module(
-				input_ids=decoder_input_ids,
-				attention_mask=decoder_attention_mask,
-				position_ids=decoder_position_ids,
-				**kwargs,
-			)
-			hidden_states = outputs[0]
-
-			if self.config.tie_word_embeddings:
-				shared_embedding = module.model.decoder.embed_tokens.variables["params"][
-					"embedding"
-				].T.astype(self.param_dtype)
-				lm_logits = module.proj_out.apply(
-					{"params": {"kernel": shared_embedding}},
-					hidden_states,
-				)
-			else:
-				lm_logits = module.proj_out(hidden_states)
-
-			return lm_logits, outputs
-
-		outputs = self.module.apply(
-			inputs,
-			decoder_input_ids=jnp.array(decoder_input_ids, dtype="i4"),
-			decoder_attention_mask=jnp.array(decoder_attention_mask, dtype="i4"),
-			decoder_position_ids=jnp.array(decoder_position_ids, dtype="i4"),
+		return self.model.decode(
 			encoder_hidden_states=encoder_hidden_states,
+			decoder_attention_mask=decoder_attention_mask,
+			decoder_input_ids=decoder_input_ids,
+			decoder_position_ids=decoder_position_ids,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
+			past_key_values=past_key_values,
 			return_dict=return_dict,
-			deterministic=not train,
-			rngs=rngs,
-			mutable=mutable,
-			method=_decoder_forward,
 		)
-
-		if past_key_values is None:
-			lm_logits, decoder_outputs = outputs
-		else:
-			(lm_logits, decoder_outputs), past = outputs
-
-		if return_dict:
-			outputs = FlaxCausalLMOutputWithCrossAttentions(
-				logits=lm_logits,
-				hidden_states=decoder_outputs.hidden_states,
-				attentions=decoder_outputs.attentions,
-				cross_attentions=decoder_outputs.cross_attentions,
-			)
-		else:
-			outputs = (lm_logits,) + decoder_outputs[1:]
-
-		# add updated cache to model output
-		if past_key_values is not None and return_dict:
-			outputs["past_key_values"] = unfreeze(past["cache"])
-			return outputs
-		elif past_key_values is not None and not return_dict:
-			outputs = outputs[:1] + (unfreeze(past["cache"]),) + outputs[1:]
-
-		return outputs
 
 	def generate(
 		self,
@@ -1128,7 +1127,7 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
 			and generation_config.return_timestamps
 		) or return_timestamps:
 			logits_processor = [
-				FlaxWhisperTimeStampLogitsProcessor(
+				WhisperTimeStampLogitsProcessor(
 					generation_config, self.config, decoder_input_length
 				)
 			]
@@ -1159,22 +1158,22 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
 		generation_config: Optional["transformers.GenerationConfig"] = None,  # noqa #type:ignore
 		**kwargs,
 	):
-		# fmt:off
 		if generation_config is None:
-		  generation_config = self.generation_config
+			generation_config = self.generation_config
 		generation_config.forced_decoder_ids = None
 		logits_processor = FlaxLogitsProcessorList()
 		logits_processor.append(FlaxStaticForceTokensLogitsProcessor(forced_decoder_ids))
 		if return_timestamps:
-		  logits_processor.append(FlaxWhisperTimeStampLogitsProcessor(generation_config, self.config, 1))
+			logits_processor.append(
+				WhisperTimeStampLogitsProcessor(generation_config, self.config, 1)
+			)
 		return super().generate(
-      input_features,
-      generation_config,
-      logits_processor=logits_processor,
-      params=params,
-      **kwargs,
-    )
-		# fmt:on
+			input_features,
+			generation_config,
+			logits_processor=logits_processor,
+			params=params,
+			**kwargs,
+		)
 
 	def prepare_inputs_for_generation(
 		self,
@@ -1216,13 +1215,35 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
 		return model_kwargs
 
 
-class FlaxWhisperForAudioClassificationModule(nn.Module):
-	config: WhisperConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, lax.Precision]] = None
-
-	def setup(self) -> None:
+@register_module(
+	"audio-classification",
+	config=WhisperConfig,
+	model_type="whisper",
+	embedding_layer_names=["embed_positions", "embed_tokens"],
+	layernorm_names=[
+		"self_attn_layer_norm",
+		"final_layer_norm",
+		"encoder_attn_layer_norm",
+		"layer_norm",
+	],
+)
+class WhisperForAudioClassification(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: WhisperConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: Optional[Union[str, lax.Precision]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
 		self.encoder = FlaxWhisperEncoder(
 			config=config,
 			dtype=dtype,
@@ -1230,22 +1251,26 @@ class FlaxWhisperForAudioClassificationModule(nn.Module):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.config.is_encoder_decoder = False
-		num_layers = self.config.num_hidden_layers + 1
-		if self.config.use_weighted_layer_sum:
+		config.is_encoder_decoder = False
+		num_layers = config.num_hidden_layers + 1
+		if config.use_weighted_layer_sum:
 			self.layer_weights = jnp.repeat(1 / num_layers, num_layers)
-		self.projector = Dense(
-			self.config.classifier_proj_size,
+		self.projector = nn.Linear(
+			config.d_model,
+			config.classifier_proj_size,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
-		self.classifier = Dense(
-			self.config.num_labels,
+		self.classifier = nn.Linear(
+			config.classifier_proj_size,
+			config.num_labels,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 
@@ -1300,83 +1325,4 @@ class FlaxWhisperForAudioClassificationModule(nn.Module):
 			logits=logits,
 			hidden_states=encoder_outputs.hidden_states,
 			attentions=encoder_outputs.attentions,
-		)
-
-
-@register_module(
-	"audio-classification",
-	config=WhisperConfig,
-	model_type="whisper",
-	embedding_layer_names=["embed_positions", "embed_tokens"],
-	layernorm_names=[
-		"self_attn_layer_norm",
-		"final_layer_norm",
-		"encoder_attn_layer_norm",
-		"layer_norm",
-	],
-)
-class FlaxWhisperForAudioClassification(FlaxWhisperPreTrainedModel):
-	module_class = FlaxWhisperForAudioClassificationModule
-
-	def init_weights(
-		self,
-		rng: jax.random.PRNGKey,
-		input_shape: Tuple,
-		params: FrozenDict = None,
-	) -> FrozenDict:
-		# init input tensors
-		input_features = jnp.zeros(input_shape, dtype="f4")
-		input_features = input_features.at[(..., -1)].set(self.config.eos_token_id)
-		params_rng, dropout_rng = jax.random.split(rng)
-		rngs = {"params": params_rng, "dropout": dropout_rng}
-		random_params = self.module.init(rngs, input_features=input_features)["params"]
-		if params is not None:
-			random_params = flatten_dict(unfreeze(random_params))
-			params = flatten_dict(unfreeze(params))
-			for missing_key in self._missing_keys:
-				params[missing_key] = random_params[missing_key]
-			self._missing_keys = set()
-			return freeze(unflatten_dict(params))
-		else:
-			return random_params
-
-	def __call__(
-		self,
-		input_features: jnp.ndarray,
-		attention_mask: Optional[jnp.ndarray] = None,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		return_dict: Optional[bool] = None,
-		train: bool = False,
-		params: dict = None,
-		dropout_rng: PRNGKey = None,
-		add_params_field: Optional[bool] = False,
-		**kwargs,
-	):
-		output_attentions = (
-			output_attentions
-			if output_attentions is not None
-			else self.config.output_attentions
-		)
-		output_hidden_states = (
-			output_hidden_states
-			if output_hidden_states is not None
-			else self.config.output_hidden_states
-		)
-		return_dict = return_dict if return_dict is not None else self.config.return_dict
-
-		# Handle any PRNG if needed
-		rngs = {}
-		if dropout_rng is not None:
-			rngs["dropout"] = dropout_rng
-
-		return self.module.apply(
-			(
-				{"params": params or self.params} if add_params_field else params or self.params
-			),
-			input_features=jnp.array(input_features, dtype="f4"),
-			output_attentions=output_attentions,
-			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
-			rngs=rngs,
 		)

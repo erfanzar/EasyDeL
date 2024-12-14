@@ -26,7 +26,7 @@ from transformers import GenerationConfig, WhisperProcessor, WhisperTokenizer
 from transformers.models.whisper.tokenization_whisper import TO_LANGUAGE_CODE
 from transformers.pipelines.audio_utils import ffmpeg_read
 
-from easydel.modules.whisper import FlaxWhisperForConditionalGeneration
+from easydel.modules.whisper import WhisperForConditionalGeneration
 from easydel.utils.compiling_utils import get_safe_hash_int
 
 
@@ -109,7 +109,7 @@ class vWhisperInference:
 	Whisper inference pipeline for performing speech-to-text transcription or translation.
 
 	Args:
-	    model (`FlaxWhisperForConditionalGeneration`):
+	    model (`WhisperForConditionalGeneration`):
 	        The fine-tuned Whisper model to use for inference.
 	    params (`Dict[str, Any]`):
 	        Model parameters.
@@ -166,7 +166,7 @@ class vWhisperInference:
 
 	def __init__(
 		self,
-		model: FlaxWhisperForConditionalGeneration,
+		model: WhisperForConditionalGeneration,
 		params: Dict[str, Any],
 		tokenizer: WhisperTokenizer,
 		processor: WhisperProcessor,
