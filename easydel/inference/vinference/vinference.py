@@ -108,7 +108,7 @@ class vInference:
 		self.tokenizer = tokenizer
 		self.generation_config = self._init_generation_config(generation_config, max_new_tokens)
 		if seed is None:
-			seed = random.randint(0, 1e6)
+			seed = random.randint(0, int(1e6))
 		self._rng_generator = GenerateRNG(seed)
 		self.input_partition_spec = input_partition_spec or PartitionSpec(("dp", "fsdp"), "sp")
 		self.mesh = self.model.config.mesh
