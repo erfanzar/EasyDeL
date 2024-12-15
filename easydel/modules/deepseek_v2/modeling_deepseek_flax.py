@@ -802,7 +802,7 @@ class FlaxDeepseekV2DecoderLayer(nn.Module):
 	model_type="deepseek_v2",
 	embedding_layer_names=["embed_tokens"],
 )
-class FlaxDeepseekV2Model(EasyDeLBaseModule):
+class DeepseekV2Model(EasyDeLBaseModule):
 	def __init__(
 		self,
 		config: DeepseekV2Config,
@@ -972,7 +972,7 @@ class FlaxDeepseekV2Model(EasyDeLBaseModule):
 	model_type="deepseek_v2",
 	embedding_layer_names=["embed_tokens"],
 )
-class FlaxDeepseekV2ForCausalLM(EasyDeLBaseModule):
+class DeepseekV2ForCausalLM(EasyDeLBaseModule):
 	def __init__(
 		self,
 		config: DeepseekV2Config,
@@ -989,7 +989,7 @@ class FlaxDeepseekV2ForCausalLM(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.model = FlaxDeepseekV2Model(
+		self.model = DeepseekV2Model(
 			config=config,
 			dtype=dtype,
 			param_dtype=param_dtype,

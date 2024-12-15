@@ -13,9 +13,9 @@
 # limitations under the License.
 
 from easydel.modules.phimoe.modeling_phimoe_flax import (
-	FlaxPhiMoeForCausalLM,
-	FlaxPhiMoeModel,
+	PhiMoeForCausalLM,
+	PhiMoeModel,
 )
 from easydel.modules.phimoe.phimoe_configuration import PhiMoeConfig
 
-__all__ = "FlaxPhiMoeForCausalLM", "FlaxPhiMoeModel", "PhiMoeConfig"
+__all__ = "PhiMoeForCausalLM", "PhiMoeModel", "PhiMoeConfig"

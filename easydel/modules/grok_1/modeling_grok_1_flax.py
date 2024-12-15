@@ -520,7 +520,7 @@ class FlaxGrok1DecoderLayer(nn.Module):
 	model_type="grok-1",
 	embedding_layer_names=["embed_tokens"],
 )
-class FlaxGrok1Model(EasyDeLBaseModule):
+class Grok1Model(EasyDeLBaseModule):
 	def __init__(
 		self,
 		config: Grok1Config,
@@ -698,7 +698,7 @@ class FlaxGrok1Model(EasyDeLBaseModule):
 	model_type="grok-1",
 	embedding_layer_names=["embed_tokens"],
 )
-class FlaxGrok1ForCausalLM(EasyDeLBaseModule):
+class Grok1ForCausalLM(EasyDeLBaseModule):
 	def __init__(
 		self,
 		config: Grok1Config,
@@ -715,7 +715,7 @@ class FlaxGrok1ForCausalLM(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.model = FlaxGrok1Model(
+		self.model = Grok1Model(
 			config=config,
 			dtype=dtype,
 			param_dtype=param_dtype,

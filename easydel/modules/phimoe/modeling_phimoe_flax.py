@@ -477,7 +477,7 @@ class FlaxPhiMoeDecoderLayer(nn.Module):
 	embedding_layer_names=["embed_tokens"],
 	layernorm_names=["norm", "input_layernorm", "post_attention_layernorm"],
 )
-class FlaxPhiMoeModel(EasyDeLBaseModule):
+class PhiMoeModel(EasyDeLBaseModule):
 	def __init__(
 		self,
 		config: PhiMoeConfig,
@@ -606,7 +606,7 @@ class FlaxPhiMoeModel(EasyDeLBaseModule):
 	embedding_layer_names=["embed_tokens"],
 	layernorm_names=["norm", "input_layernorm", "post_attention_layernorm"],
 )
-class FlaxPhiMoeForCausalLM(EasyDeLBaseModule):
+class PhiMoeForCausalLM(EasyDeLBaseModule):
 	def __init__(
 		self,
 		config: PhiMoeConfig,
@@ -623,7 +623,7 @@ class FlaxPhiMoeForCausalLM(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.model = FlaxPhiMoeModel(
+		self.model = PhiMoeModel(
 			config=config,
 			dtype=dtype,
 			param_dtype=param_dtype,
