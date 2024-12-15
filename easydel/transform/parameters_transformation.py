@@ -114,10 +114,14 @@ def process_tensor(
 
 	# Handle regular weights
 	elif "weight" in key:
-		if len(tensor.shape) == 2:
-			tensor = tensor.transpose(0, 1)
-		elif len(tensor.shape) == 3:
-			tensor = tensor.transpose(0, 2)
+		ndim = len(tensor.shape)
+		match ndim:
+			case 2:
+				tensor = tensor.transpose(0, 1) # linear layers
+			case 3:
+				tensor = tensor.transpose(0, 2) # 1d conv layers
+			case _:
+				...
 		new_key = key.replace(".weight", ".kernel")
 
 	# Convert key string to tuple

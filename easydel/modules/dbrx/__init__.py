@@ -17,7 +17,7 @@ from easydel.modules.dbrx.dbrx_configuration import (
 	DbrxConfig,
 	DbrxFFNConfig,
 )
-from easydel.modules.dbrx.modelling_dbrx_flax import (
+from easydel.modules.dbrx.modeling_dbrx_flax import (
 	DbrxForCausalLM,
 	DbrxModel,
 )

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.mosaic_mpt.modelling_mpt_flax import (
+from easydel.modules.mosaic_mpt.modeling_mpt_flax import (
 	MptForCausalLM,
 	MptModel,
 )

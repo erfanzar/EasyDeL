@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.stablelm.modelling_stablelm_flax import (
+from easydel.modules.stablelm.modeling_stablelm_flax import (
 	StableLmForCausalLM,
 	StableLmModel,
 )

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.opt.modelling_opt_flax import (
+from easydel.modules.opt.modeling_opt_flax import (
 	OPTForCausalLM,
 	OPTModel,
 )

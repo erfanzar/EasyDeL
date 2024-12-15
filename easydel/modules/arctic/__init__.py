@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from easydel.modules.arctic.arctic_configuration import ArcticConfig
-from easydel.modules.arctic.modelling_arctic_flax import (
+from easydel.modules.arctic.modeling_arctic_flax import (
 	ArcticForCausalLM,
 	ArcticModel,
 )

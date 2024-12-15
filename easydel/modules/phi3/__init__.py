@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.phi3.modelling_phi3_flax import (
+from easydel.modules.phi3.modeling_phi3_flax import (
 	Phi3ForCausalLM,
 	Phi3Model,
 )

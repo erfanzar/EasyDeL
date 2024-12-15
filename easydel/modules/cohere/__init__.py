@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from easydel.modules.cohere.cohere_configuration import CohereConfig
-from easydel.modules.cohere.modelling_cohere_flax import (
+from easydel.modules.cohere.modeling_cohere_flax import (
 	CohereForCausalLM,
 	CohereModel,
 )

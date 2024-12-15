@@ -20,7 +20,7 @@ import chex
 import flax.struct
 import jax
 import jax.numpy as jnp
-from einops import einsum, repeat
+from einops import repeat
 from flax import nnx as nn
 from jax import lax
 
@@ -137,7 +137,7 @@ class MambaConv1D(nn.Module):
 
 		x = lax.conv_general_dilated(
 			lhs=x,
-			rhs=jnp.asarray(self.kernel.value, dtype=self.dtype),
+			rhs=jnp.asarray(jnp.swapaxes(self.kernel.value, 0, 2), dtype=self.dtype),
 			window_strides=(self.stride,),
 			padding=((self.padding, self.padding),),
 			rhs_dilation=(self.dilation,),
@@ -148,52 +148,6 @@ class MambaConv1D(nn.Module):
 			x = x + jnp.asarray(self.bias.value.reshape(1, -1, 1), dtype=self.dtype)
 
 		return x
-
-
-def mamba_ssm(
-	u: jax.Array,
-	delta: jax.Array,
-	A: jax.Array,
-	B: jax.Array,
-	C: jax.Array,
-	D: Optional[jax.Array] = None,
-	delta_bias: Optional[jax.Array] = None,
-	delta_softplus: bool = False,
-	associative_scan: bool = True,
-) -> jax.Array:
-	if delta_bias is not None:
-		raise NotImplementedError("delta_bias not implemented yet.")
-
-	_, d_in = u.shape
-	n = A.shape[1]
-
-	delta = jnp.asarray(delta, dtype=jnp.float32)
-
-	if delta_softplus:
-		delta = jax.nn.softplus(delta)
-
-	delta_A = jnp.exp(einsum(delta, A, "l d_in, d_in n -> l d_in n"))
-	delta_B_u = einsum(delta, B, u, "l d_in, l n, l d_in -> l d_in n")
-
-	x = jnp.zeros((d_in, n))
-
-	def _scan_fn(x, params):
-		d_A, d_Bu, C = params
-
-		x = d_A * x + d_Bu
-		return x, einsum(x, C, "d_in n, n -> d_in")
-
-	def _associative_scan_fn(s, c):
-		return tuple((c[0] * s[0], c[0] * s[1] + c[1]))
-
-	if associative_scan:
-		_, y = jax.lax.associative_scan(_associative_scan_fn, (delta_A, delta_B_u))
-		y = einsum(y, C, "L d_in n, L n -> L d_in")
-	else:
-		_, y = jax.lax.scan(_scan_fn, init=x, xs=[delta_A, delta_B_u, C])
-
-	y = y + u * D
-	return y
 
 
 class MambaMixer(nn.Module):
@@ -219,12 +173,11 @@ class MambaMixer(nn.Module):
 		time_step_rank = config.time_step_rank
 		conv_kernel_size = config.conv_kernel
 
-		self.conv1d = nn.Conv(
-			in_features=intermediate_size,
-			out_features=intermediate_size,
+		self.conv1d = MambaConv1D(
+			features=intermediate_size,
 			use_bias=config.use_conv_bias,
 			kernel_size=config.conv_kernel,
-			feature_group_count=intermediate_size,
+			groups=intermediate_size,
 			padding=config.conv_kernel - 1,
 			rngs=rngs,
 		)
@@ -318,9 +271,8 @@ class MambaMixer(nn.Module):
 
 		# 1. Gated MLP's linear projection
 		projected_states = self.in_proj(input_states)
-		projected_states = jnp.transpose(
-			projected_states, (0, 2, 1)
-		)  # [batch, 2 * intermediate_size, seq_len]
+		projected_states = jnp.swapaxes(projected_states, 2, 1)
+		# [batch, 2 * intermediate_size, seq_len]
 		hidden_states, gate = jnp.split(projected_states, 2, axis=1)
 
 		if attention_mask is not None:
@@ -333,7 +285,11 @@ class MambaMixer(nn.Module):
 			if position_ids.shape[0] == self.conv_kernel_size:
 				conv_state = jnp.pad(
 					hidden_states,
-					((0, 0), (0, 0), (self.conv_kernel_size - hidden_states.shape[-1], 0)),
+					(
+						(0, 0),
+						(0, 0),
+						(self.conv_kernel_size - hidden_states.shape[-1], 0),
+					),
 				)
 
 				cache.update_conv_state(conv_state, position_ids)
@@ -360,51 +316,49 @@ class MambaMixer(nn.Module):
 
 		# 3. State Space Model sequence transformation
 		# 3.a. Selection
-		ssm_parameters = self.x_proj(jnp.transpose(hidden_states, (0, 2, 1)))
+		ssm_parameters = self.x_proj(jnp.swapaxes(hidden_states, 2, 1))
 		time_step, B, C = jnp.split(
 			ssm_parameters,
-			[self.time_step_rank, self.ssm_state_size, self.ssm_state_size],
+			[
+				self.time_step_rank,
+				self.ssm_state_size + self.time_step_rank,
+			],
 			axis=-1,
 		)
-		discrete_time_step = self.dt_proj(time_step)  # [batch, seq_len, intermediate_size]
-		discrete_time_step = jnp.transpose(
-			jax.nn.softplus(discrete_time_step), (0, 2, 1)
-		)  # [batch, intermediate_size, seq_len]
+		discrete_time_step = self.dt_proj(time_step)
+		# [batch, seq_len, intermediate_size]
+		discrete_time_step = jnp.swapaxes(jax.nn.softplus(discrete_time_step), 2, 1)
+		# [batch, intermediate_size, seq_len]
 
 		# 3.b. Discretization
-		A = -jnp.exp(self.A_log.astype(jnp.float32))  # [intermediate_size, ssm_state_size]
-		discrete_A = jnp.exp(A[None, :, None, :] * discrete_time_step[:, :, :, None])
-		discrete_B = discrete_time_step[:, :, :, None] * B[:, None, :, :].astype(
-			jnp.float32
-		)
-		deltaB_u = discrete_B * hidden_states[:, :, :, None].astype(jnp.float32)
+		A = -jnp.exp(self.A_log.value.astype(jnp.float32))
+		# [intermediate_size, ssm_state_size]
 
-		# 3.c perform the recurrence
-		def scan_fn(carry, x):
-			ssm_state = carry
-			discrete_A_t, deltaB_u_t = x
-			new_state = discrete_A_t * ssm_state + deltaB_u_t
-			return new_state, new_state
+		modified_a = jnp.expand_dims(jnp.expand_dims(A, axis=0), axis=2)
+		modified_time_step = jnp.expand_dims(discrete_time_step, axis=-1)
 
-		if cache is not None:
-			# Explicit loop for inference or when using cache
-			scan_outputs = []
-			for i in range(seq_len):
-				ssm_state = discrete_A[:, :, i, :] * ssm_state + deltaB_u[:, :, i, :]
-				scan_output = jnp.matmul(
-					ssm_state.astype(dtype), jnp.expand_dims(C[:, i, :], -1)
-				)
-				scan_outputs.append(scan_output[:, :, 0])
-			scan_output = jnp.stack(scan_outputs, axis=-1)
-		else:
-			# Use scan for training
-			_, scan_output = jax.lax.scan(
-				scan_fn,
-				ssm_state,
-				(jnp.moveaxis(discrete_A, 2, 0), jnp.moveaxis(deltaB_u, 2, 0)),
+		discrete_A = jnp.exp(modified_a * modified_time_step)
+		discrete_B = modified_time_step * B[:, jnp.newaxis, :, :].astype(jnp.float32)
+
+		# [batch, intermediate_size, seq_len, ssm_state_size]
+
+		deltaB_u = discrete_B * hidden_states[:, :, :, jnp.newaxis].astype(jnp.float32)
+		scan_outputs = []
+
+		for i in range(seq_len):
+			ssm_state = discrete_A[:, :, i, :] * ssm_state + deltaB_u[:, :, i, :]
+			# [batch, intermediate_size, 1, ssm_state]
+
+			scan_output = jax.lax.batch_matmul(
+				ssm_state.astype(dtype),
+				jnp.expand_dims(C[:, i, :], -1),
 			)
-			scan_output = jnp.matmul(scan_output, jnp.expand_dims(C, -1)).squeeze(-1)
-			scan_output = jnp.moveaxis(scan_output, 0, 2)
+
+			# [batch, intermediate_size, 1]
+
+			scan_outputs.append(scan_output[:, :, 0])
+
+		scan_output = jnp.stack(scan_outputs, axis=-1)
 
 		scan_output = scan_output + (hidden_states * self.D[None, :, None])
 		scan_output = scan_output * self.act(gate)
@@ -413,7 +367,7 @@ class MambaMixer(nn.Module):
 			cache.ssm_states = ssm_state
 
 		# 4. Final linear projection
-		contextualized_states = self.out_proj(jnp.transpose(scan_output, (0, 2, 1)))
+		contextualized_states = self.out_proj(jnp.swapaxes(scan_output, 2, 1))
 		return contextualized_states
 
 
