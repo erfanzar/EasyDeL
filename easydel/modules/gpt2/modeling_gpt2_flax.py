@@ -533,10 +533,10 @@ class GPT2Model(EasyDeLBaseModule):
 				(batch_size, sequence_length),
 			).astype(jnp.int32)
 
-		input_embeds = self.wte(input_ids.astype("i4"))
+		inputs_embeds = self.wte(input_ids.astype("i4"))
 		position_embeds = self.wpe(position_ids.astype("i4"))
 
-		hidden_states = input_embeds + position_embeds
+		hidden_states = inputs_embeds + position_embeds
 		hidden_states = self.dropout(hidden_states)
 
 		all_attentions = () if output_attentions else None

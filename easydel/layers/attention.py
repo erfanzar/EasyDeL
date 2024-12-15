@@ -1790,8 +1790,10 @@ class FlaxAttentionModule(nn.Module):
 					attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
 				attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
 				attention_mask = nn.combine_masks(attention_mask, causal_mask, fcm_mask)
+
 			else:
 				attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+				attention_mask = jnp.repeat(attention_mask, query.shape[1], -2)
 		else:
 			key, value, attention_mask = self._concatenate_to_cache(
 				query=query,

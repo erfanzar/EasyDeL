@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import warnings
 from typing import Dict, Optional, Union
 
 from jax.sharding import PartitionSpec
@@ -173,7 +172,6 @@ class DeepseekV2Config(EasyDeLBaseConfig):
 		rope_scaling: Dict[str, Union[str, float]] = None,
 		**kwargs,
 	):
-		warnings.warn("`DeepseekV2` is still in beta mode.", UserWarning, stacklevel=1)
 		self.vocab_size = vocab_size
 		self.max_position_embeddings = max_position_embeddings
 		self.hidden_size = hidden_size

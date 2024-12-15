@@ -387,7 +387,7 @@ class InternLM2Model(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
+		inputs_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
@@ -404,7 +404,7 @@ class InternLM2Model(EasyDeLBaseModule):
 		    attention_mask (chex.Array): Mask for attention.
 		    position_ids (chex.Array): Positional indices.
 		    segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-		    input_embeds (Optional[chex.Array]): Embedded input tensor.
+		    inputs_embeds (Optional[chex.Array]): Embedded input tensor.
 		    output_attentions (Optional[bool]): If True, output attention weights.
 		    output_hidden_states (Optional[bool]): If True, output hidden states.
 		    init_cache (bool): If True, initialize cache for decoding.
@@ -414,11 +414,11 @@ class InternLM2Model(EasyDeLBaseModule):
 		Returns:
 		    FlaxBaseModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
-		if input_embeds is None and input_ids is not None:
-			input_embeds = self.tok_embeddings(input_ids.astype("i4"))
+		if inputs_embeds is None and input_ids is not None:
+			inputs_embeds = self.tok_embeddings(input_ids.astype("i4"))
 		else:
-			raise ValueError("you should specify input_embeds or input_ids one of them")
-		batch_size, sequence_length = input_embeds.shape[:2]
+			raise ValueError("you should specify inputs_embeds or input_ids one of them")
+		batch_size, sequence_length = inputs_embeds.shape[:2]
 
 		if attention_mask is None:
 			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
@@ -434,7 +434,7 @@ class InternLM2Model(EasyDeLBaseModule):
 		if attention_mask.ndim == 2:
 			attention_mask = jnp.expand_dims(attention_mask, (1, 2))
 
-		hidden_states = input_embeds
+		hidden_states = inputs_embeds
 
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
@@ -524,7 +524,7 @@ class InternLM2ForCausalLM(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
+		inputs_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
@@ -541,7 +541,7 @@ class InternLM2ForCausalLM(EasyDeLBaseModule):
 		    attention_mask (Optional[chex.Array]): Mask for attention.
 		    position_ids (Optional[chex.Array]): Positional indices.
 		    segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-		    input_embeds (Optional[chex.Array]): Embedded input tensor.
+		    inputs_embeds (Optional[chex.Array]): Embedded input tensor.
 		    output_attentions (Optional[bool]): If True, output attention weights.
 		    output_hidden_states (Optional[bool]): If True, output hidden states.
 		    init_cache (bool): If True, initialize cache for decoding.
@@ -560,7 +560,7 @@ class InternLM2ForCausalLM(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
 			return_dict=return_dict,
-			input_embeds=input_embeds,
+			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
 
@@ -629,7 +629,7 @@ class InternLM2ForSequenceClassification(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
+		inputs_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
@@ -646,7 +646,7 @@ class InternLM2ForSequenceClassification(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
 			return_dict=return_dict,
-			input_embeds=input_embeds,
+			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
 

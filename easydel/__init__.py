@@ -254,6 +254,14 @@ from easydel.modules.qwen2_moe import (
 	Qwen2MoeForCausalLM,
 	Qwen2MoeModel,
 )
+from easydel.modules.roberta import (
+	RobertaForCausalLM,
+	RobertaForMultipleChoice,
+	RobertaForQuestionAnswering,
+	RobertaForSequenceClassification,
+	RobertaForTokenClassification,
+	RobertaConfig,
+)
 from easydel.modules.stablelm import (
 	StableLmConfig,
 	StableLmForCausalLM,

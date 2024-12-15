@@ -452,13 +452,13 @@ class OPTDecoder(EasyDeLBaseModule):
 		all_hidden_states = () if output_hidden_states else None
 		all_self_attns = () if output_attentions else None
 
-		input_embeds = self.embed_tokens(input_ids)
+		inputs_embeds = self.embed_tokens(input_ids)
 		if self.project_in is not None:
-			input_embeds = self.project_in(input_embeds)
+			inputs_embeds = self.project_in(inputs_embeds)
 
 		positions = self.embed_positions(position_ids)
-		batch_size, sequence_length = input_embeds.shape[:2]
-		hidden_states = input_embeds + positions
+		batch_size, sequence_length = inputs_embeds.shape[:2]
+		hidden_states = inputs_embeds + positions
 		if attention_mask is None:
 			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
 

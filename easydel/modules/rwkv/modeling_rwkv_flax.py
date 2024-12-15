@@ -506,7 +506,7 @@ class FlaxRwkvPretrainedModel(EasyDeLBaseModule):
 		self,
 		input_ids: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
+		inputs_embeds: Optional[chex.Array] = None,
 		state: Optional[List[chex.Array]] = None,
 		use_cache: Optional[bool] = None,
 		output_attentions: Optional[bool] = None,
@@ -552,7 +552,7 @@ class FlaxRwkvPretrainedModel(EasyDeLBaseModule):
 			inputs,
 			input_ids,
 			attention_mask,
-			input_embeds,
+			inputs_embeds,
 			state,
 			use_cache,
 			train,
@@ -579,12 +579,12 @@ class FlaxRwkvPretrainedModel(EasyDeLBaseModule):
 		return gen_output
 
 	def prepare_inputs_for_generation(
-		self, input_ids, state=None, input_embeds=None, **kwargs
+		self, input_ids, state=None, inputs_embeds=None, **kwargs
 	):
 		if state is not None:
 			input_ids = input_ids[:, -1].unsqueeze(-1)
-		if input_embeds is not None and state is None:
-			model_inputs = {"input_embeds": input_embeds}
+		if inputs_embeds is not None and state is None:
+			model_inputs = {"inputs_embeds": inputs_embeds}
 		else:
 			model_inputs = {"input_ids": input_ids}
 
@@ -636,7 +636,7 @@ class FlaxRwkvModel(nn.Module):
 		self,
 		input_ids: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
+		inputs_embeds: Optional[chex.Array] = None,
 		state: Optional[List[chex.Array]] = None,
 		deterministic: bool = True,
 		use_cache: Optional[bool] = None,
@@ -663,32 +663,30 @@ class FlaxRwkvModel(nn.Module):
 			return_dict if return_dict is not None else self.config.use_return_dict
 		)
 
-		if input_ids is not None and input_embeds is not None:
+		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
-				"You cannot specify both input_ids and input_embeds at the same time"
+				"You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
 			)
-		elif input_ids is None and input_embeds is None:
-			raise ValueError("You have to specify either input_ids or input_embeds")
 
-		if input_embeds is None:
-			input_embeds = self.embeddings(input_ids)
+		if inputs_embeds is None:
+			inputs_embeds = self.embeddings(input_ids)
 
 		if use_cache and state is None:
 			shape = (
-				input_embeds.shape[0],
+				inputs_embeds.shape[0],
 				self.config.hidden_size,
 				self.config.num_hidden_layers,
 			)
 			state = [
 				jnp.zeros(
 					*shape,
-					dtype=input_embeds.dtype if i <= 1 else jnp.float32,
+					dtype=inputs_embeds.dtype if i <= 1 else jnp.float32,
 				)
 				for i in range(5)
 			]
 			state[4] -= 1e30
 
-		hidden_states = input_embeds
+		hidden_states = inputs_embeds
 
 		hidden_states, all_hidden_states, all_self_attentions = self.blocks(
 			hidden_states,
@@ -760,7 +758,7 @@ class FlaxRwkvForCausalLM(nn.Module):
 		self,
 		input_ids: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
+		inputs_embeds: Optional[chex.Array] = None,
 		state: Optional[List[chex.Array]] = None,
 		deterministic: bool = True,
 		use_cache: Optional[bool] = None,
@@ -774,7 +772,7 @@ class FlaxRwkvForCausalLM(nn.Module):
 
 		rwkv_outputs = self.rwkv(
 			input_ids,
-			input_embeds=input_embeds,
+			inputs_embeds=inputs_embeds,
 			state=state,
 			use_cache=use_cache,
 			output_attentions=output_attentions,

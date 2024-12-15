@@ -365,7 +365,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		past_key_values: Optional[TransformerCache] = None,
-		input_embeds: Optional[chex.Array] = None,
+		inputs_embeds: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
 		extra_embedding: Optional[chex.Array] = None,
 		output_attentions: bool = False,
@@ -374,15 +374,14 @@ class GPTNeoXModel(EasyDeLBaseModule):
 	):
 		all_attentions = () if output_attentions else None
 		all_hidden_states = () if output_hidden_states else None
-		if input_ids is not None and input_embeds is not None:
+		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
-				"You cannot specify both decoder_input_ids and decoder_input_embeds at the same time"
+				"You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
 			)
-		if input_embeds is None and input_ids is not None:
-			input_embeds = self.embed_in(input_ids.astype("i4"))
-		else:
-			raise ValueError("you should specify input_embeds or input_ids one of them")
-		batch_size, sequence_length, _ = input_embeds.shape
+		if inputs_embeds is None:
+			inputs_embeds = self.embed_in(input_ids.astype("i4"))
+
+		batch_size, sequence_length, _ = inputs_embeds.shape
 		if attention_mask is None:
 			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
 		if position_ids is None:
@@ -396,7 +395,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
 		), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 
 		hidden_states = self.emb_dropout(
-			input_embeds + extra_embedding if extra_embedding is not None else input_embeds
+			inputs_embeds + extra_embedding if extra_embedding is not None else inputs_embeds
 		)
 
 		if past_key_values is None:
@@ -481,7 +480,7 @@ class GPTNeoXForCausalLM(EasyDeLBaseModule):
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		past_key_values: Optional[TransformerCache] = None,
-		input_embeds: Optional[chex.Array] = None,
+		inputs_embeds: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
 		extra_embedding: Optional[chex.Array] = None,
 		output_attentions: bool = False,
@@ -493,7 +492,7 @@ class GPTNeoXForCausalLM(EasyDeLBaseModule):
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			past_key_values=past_key_values,
-			input_embeds=input_embeds,
+			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 			extra_embedding=extra_embedding,
 			output_attentions=output_attentions,

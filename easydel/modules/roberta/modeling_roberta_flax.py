@@ -22,14 +22,12 @@ from flax.linen.attention import dot_product_attention_weights
 from jax import lax
 from jax import numpy as jnp
 
-from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import register_module
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutputWithPastAndCrossAttentions,
 	FlaxBaseModelOutputWithPoolingAndCrossAttentions,
 	FlaxCausalLMOutputWithCrossAttentions,
-	FlaxMaskedLMOutput,
 	FlaxMultipleChoiceModelOutput,
 	FlaxQuestionAnsweringModelOutput,
 	FlaxSequenceClassifierOutput,
@@ -38,10 +36,10 @@ from easydel.infra.modeling_outputs import (
 from easydel.infra.utils import (
 	ACT2FN,
 	get_dot_general_by_bits,
-	get_gradient_checkpoint_policy,
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCacheView
+from easydel.layers.caching.transformer_cache import TransformerCache
 from easydel.modules.roberta.roberta_configuration import RobertaConfig as RobertaConfig
 
 
@@ -86,6 +84,7 @@ class RobertaEmbeddings(nn.Module):
 		self.LayerNorm = nn.LayerNorm(
 			self.config.hidden_size,
 			epsilon=self.config.layer_norm_eps,
+			param_dtype=param_dtype,
 			dtype=dtype,
 			rngs=rngs,
 		)
@@ -100,16 +99,15 @@ class RobertaEmbeddings(nn.Module):
 		token_type_ids,
 		position_ids,
 		attention_mask,
-		deterministic: bool = True,
 	):
-		input_embeds = self.word_embeddings(input_ids.astype("i4"))
+		inputs_embeds = self.word_embeddings(input_ids.astype("i4"))
 		position_embeds = self.position_embeddings(position_ids.astype("i4"))
 		token_type_embeddings = self.token_type_embeddings(token_type_ids.astype("i4"))
 
-		hidden_states = input_embeds + token_type_embeddings + position_embeds
+		hidden_states = inputs_embeds + token_type_embeddings + position_embeds
 
 		hidden_states = self.LayerNorm(hidden_states)
-		hidden_states = self.dropout(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout(hidden_states)
 		return hidden_states
 
 
@@ -161,7 +159,7 @@ class RobertaSelfAttention(FlaxAttentionModule):
 			param_dtype=param_dtype,
 			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
 			rngs=rngs,
-			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
+			**get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
 		)
 		self.key = nn.Linear(
 			self.config.hidden_size,
@@ -170,7 +168,7 @@ class RobertaSelfAttention(FlaxAttentionModule):
 			param_dtype=param_dtype,
 			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
 			rngs=rngs,
-			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
+			**get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
 		)
 		self.value = nn.Linear(
 			self.config.hidden_size,
@@ -179,7 +177,7 @@ class RobertaSelfAttention(FlaxAttentionModule):
 			param_dtype=param_dtype,
 			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
 			rngs=rngs,
-			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
+			**get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
 		)
 
 	def _split_heads(self, hidden_states):
@@ -204,6 +202,7 @@ class RobertaSelfAttention(FlaxAttentionModule):
 		hidden_states,
 		attention_mask,
 		layer_head_mask,
+		causal_mask: Optional[chex.Array] = None,
 		cache_view: Optional[TransformerCacheView] = None,
 		segment_ids: Optional[chex.Array] = None,
 		key_value_states: Optional[jnp.array] = None,
@@ -222,7 +221,6 @@ class RobertaSelfAttention(FlaxAttentionModule):
 		query_states = self._split_heads(query_states)
 		key_states = self._split_heads(key_states)
 		value_states = self._split_heads(value_states)
-
 		(
 			key_states,
 			value_states,
@@ -234,17 +232,16 @@ class RobertaSelfAttention(FlaxAttentionModule):
 			cache_view=cache_view,
 			value=value_states,
 			attention_mask=attention_mask,
-			causal_mask=None,
+			causal_mask=causal_mask if self.causal else None,
 			fcm_mask=None,
 			sliding_windows=None,
 		)
 
 		if layer_head_mask is None:
-			out = self.attention_performer.__call__(
+			out = self.attention_performer(
 				query_states=query_states,
 				key_states=key_states,
 				value_states=value_states,
-				deterministic=True,
 				causal=True,
 				bias=attention_bias,
 				attention_mask=attention_mask,
@@ -263,7 +260,6 @@ class RobertaSelfAttention(FlaxAttentionModule):
 				bias=attention_bias,
 				dropout_rate=self.config.attention_probs_dropout_prob,
 				broadcast_dropout=True,
-				deterministic=True,
 				dtype=self.dtype,
 				precision=None,
 			)
@@ -301,7 +297,7 @@ class RobertaSelfOutput(nn.Module):
 			param_dtype=param_dtype,
 			precision=precision,
 			rngs=rngs,
-			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
+			**get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
 		)
 		self.LayerNorm = nn.LayerNorm(
 			self.config.hidden_size,
@@ -312,9 +308,9 @@ class RobertaSelfOutput(nn.Module):
 		)
 		self.dropout = nn.Dropout(rate=self.config.hidden_dropout_prob, rngs=rngs)
 
-	def __call__(self, hidden_states, input_tensor, deterministic: bool = True):
+	def __call__(self, hidden_states, input_tensor):
 		hidden_states = self.dense(hidden_states)
-		hidden_states = self.dropout(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout(hidden_states)
 		hidden_states = self.LayerNorm(hidden_states + input_tensor)
 		return hidden_states
 
@@ -356,20 +352,22 @@ class RobertaAttention(nn.Module):
 		hidden_states,
 		attention_mask,
 		layer_head_mask,
+		causal_mask: Optional[chex.Array] = None,
 		cache_view: Optional[TransformerCacheView] = None,
 		key_value_states=None,
 		output_attentions: bool = False,
 	):
 		attn_outputs = self.self(
-			hidden_states,
-			attention_mask,
+			hidden_states=hidden_states,
+			attention_mask=attention_mask,
+			causal_mask=causal_mask if self.causal else None,
 			layer_head_mask=layer_head_mask,
 			cache_view=cache_view,
 			key_value_states=key_value_states,
 			output_attentions=output_attentions,
 		)
 		attn_output = attn_outputs[0]
-		hidden_states = self.output(attn_output, hidden_states, deterministic=True)
+		hidden_states = self.output(attn_output, hidden_states)
 
 		outputs = (hidden_states,)
 
@@ -401,7 +399,7 @@ class RobertaIntermediate(nn.Module):
 			param_dtype=param_dtype,
 			precision=precision,
 			rngs=rngs,
-			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
+			**get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
 		)
 		self.activation = ACT2FN[self.config.hidden_act]
 
@@ -433,7 +431,7 @@ class RobertaOutput(nn.Module):
 			precision=precision,
 			param_dtype=param_dtype,
 			rngs=rngs,
-			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
+			**get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
 		)
 		self.dropout = nn.Dropout(
 			rate=self.config.hidden_dropout_prob,
@@ -447,9 +445,9 @@ class RobertaOutput(nn.Module):
 			rngs=rngs,
 		)
 
-	def __call__(self, hidden_states, attention_output, deterministic: bool = True):
+	def __call__(self, hidden_states, attention_output):
 		hidden_states = self.dense(hidden_states)
-		hidden_states = self.dropout(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout(hidden_states)
 		hidden_states = self.LayerNorm(hidden_states + attention_output)
 		return hidden_states
 
@@ -505,15 +503,17 @@ class RobertaLayer(nn.Module):
 		hidden_states,
 		attention_mask,
 		layer_head_mask,
+		causal_mask: Optional[chex.Array] = None,
 		cache_view: Optional[TransformerCacheView] = None,
-		encoder_hidden_states: Optional[jnp.ndarray] = None,
-		encoder_attention_mask: Optional[jnp.ndarray] = None,
+		encoder_hidden_states: Optional[chex.Array] = None,
+		encoder_attention_mask: Optional[chex.Array] = None,
 		output_attentions: bool = False,
 	):
 		# Self Attention
 		attention_outputs = self.attention(
-			hidden_states,
-			attention_mask,
+			hidden_states=hidden_states,
+			attention_mask=attention_mask,
+			causal_mask=causal_mask,
 			layer_head_mask=layer_head_mask,
 			cache_view=cache_view,
 			output_attentions=output_attentions,
@@ -523,17 +523,18 @@ class RobertaLayer(nn.Module):
 		# Cross-Attention Block
 		if encoder_hidden_states is not None:
 			cross_attention_outputs = self.crossattention(
-				attention_output,
+				hidden_states=attention_output,
 				attention_mask=encoder_attention_mask,
 				layer_head_mask=layer_head_mask,
 				cache_view=cache_view,
 				key_value_states=encoder_hidden_states,
 				output_attentions=output_attentions,
+				causal_mask=causal_mask,
 			)
 			attention_output = cross_attention_outputs[0]
 
 		hidden_states = self.intermediate(attention_output)
-		hidden_states = self.output(hidden_states, attention_output, deterministic=True)
+		hidden_states = self.output(hidden_states, attention_output)
 
 		outputs = (hidden_states,)
 
@@ -559,22 +560,22 @@ class RobertaEncoder(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		block = RobertaLayer
-		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
-			block = nn.remat(
-				block,
-				static_argnums=(5, 6, 7),
-				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-			)
+		# if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
+		# 	block = nn.remat(
+		# 		block,
+		# 		static_argnums=(5, 6, 7),
+		# 		policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
+		# 	)
 
-		self.layers = [
+		self.layer = [
 			block(
-				self.config,
+				config=config,
 				dtype=dtype,
 				param_dtype=param_dtype,
 				precision=precision,
 				rngs=rngs,
 			)
-			for _ in range(self.config.num_hidden_layers)
+			for _ in range(config.num_hidden_layers)
 		]
 
 	def __call__(
@@ -582,8 +583,9 @@ class RobertaEncoder(nn.Module):
 		hidden_states,
 		attention_mask,
 		head_mask,
-		encoder_hidden_states: Optional[jnp.ndarray] = None,
-		encoder_attention_mask: Optional[jnp.ndarray] = None,
+		causal_mask: Optional[chex.Array] = None,
+		encoder_hidden_states: Optional[chex.Array] = None,
+		encoder_attention_mask: Optional[chex.Array] = None,
 		past_key_values: Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
@@ -597,25 +599,26 @@ class RobertaEncoder(nn.Module):
 
 		# Check if head_mask has a correct number of layers specified if desired
 		if head_mask is not None:
-			if head_mask.shape[0] != (len(self.layers)):
+			if head_mask.shape[0] != (len(self.layer)):
 				raise ValueError(
-					f"The head_mask should be specified for {len(self.layers)} layers, but it is for                  "
+					f"The head_mask should be specified for {len(self.layer)} layer, but it is for                  "
 					f"       {head_mask.shape[0]}."
 				)
 		if past_key_values is None:
-			past_key_values = TransformerCacheView.init_empty(len(self.layers))
-		for i, (layer, cache_view) in enumerate(zip(self.layers, past_key_values.views)):
+			past_key_values = TransformerCache.init_empty(len(self.layer))
+		for i, (layer, cache_view) in enumerate(zip(self.layer, past_key_values.views)):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
 
 			layer_outputs = layer(
-				hidden_states,
-				attention_mask,
-				head_mask[i] if head_mask is not None else None,
-				cache_view,
-				encoder_hidden_states,
-				encoder_attention_mask,
-				output_attentions,
+				hidden_states=hidden_states,
+				attention_mask=attention_mask,
+				layer_head_mask=head_mask[i] if head_mask is not None else None,
+				cache_view=cache_view,
+				causal_mask=causal_mask,
+				encoder_hidden_states=encoder_hidden_states,
+				encoder_attention_mask=encoder_attention_mask,
+				output_attentions=output_attentions,
 			)
 
 			hidden_states = layer_outputs[0]
@@ -669,7 +672,7 @@ class RobertaPooler(nn.Module):
 			param_dtype=param_dtype,
 			precision=precision,
 			rngs=rngs,
-			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
+			**get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
 		)
 
 	def __call__(self, hidden_states):
@@ -700,9 +703,15 @@ class RobertaLMHead(nn.Module):
 			precision=precision,
 			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
 			rngs=rngs,
-			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
+			**get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
 		)
-		self.layer_norm = nn.LayerNorm(epsilon=self.config.layer_norm_eps, dtype=dtype)
+		self.layer_norm = nn.LayerNorm(
+			self.config.hidden_size,
+			epsilon=self.config.layer_norm_eps,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			rngs=rngs,
+		)
 		self.decoder = nn.Linear(
 			self.config.vocab_size,
 			self.config.hidden_size,
@@ -712,11 +721,13 @@ class RobertaLMHead(nn.Module):
 			precision=precision,
 			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
 			rngs=rngs,
-			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
+			**get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
 		)
 		self.bias = nn.Param(
 			jax.nn.initializers.zeros(
-				(self.config.vocab_size,),
+				key=rngs.params(),
+				shape=(self.config.vocab_size,),
+				dtype=self.param_dtype,
 			)
 		)
 
@@ -726,7 +737,8 @@ class RobertaLMHead(nn.Module):
 		hidden_states = self.layer_norm(hidden_states)
 
 		if shared_embedding is not None:
-			self.decoder.kernel = shared_embedding.T
+			self.decoder.kernel.value = shared_embedding.T
+			self.decoder.bias.value = None
 			hidden_states = self.decoder(hidden_states)
 		else:
 			hidden_states = self.decoder(hidden_states)
@@ -758,7 +770,7 @@ class RobertaClassificationHead(nn.Module):
 			param_dtype=param_dtype,
 			precision=precision,
 			rngs=rngs,
-			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
+			**get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
 		)
 		classifier_dropout = (
 			self.config.classifier_dropout
@@ -777,15 +789,15 @@ class RobertaClassificationHead(nn.Module):
 			precision=precision,
 			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
 			rngs=rngs,
-			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
+			**get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
 		)
 
-	def __call__(self, hidden_states, deterministic=True):
+	def __call__(self, hidden_states):
 		hidden_states = hidden_states[:, 0, :]
-		hidden_states = self.dropout(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout(hidden_states)
 		hidden_states = self.dense(hidden_states)
 		hidden_states = nn.tanh(hidden_states)
-		hidden_states = self.dropout(hidden_states, deterministic=deterministic)
+		hidden_states = self.dropout(hidden_states)
 		hidden_states = self.out_proj(hidden_states)
 		return hidden_states
 
@@ -794,7 +806,11 @@ class RobertaClassificationHead(nn.Module):
 	"base-module",
 	config=RobertaConfig,
 	model_type="roberta",
-	embedding_layer_names=["embed_tokens"],
+	embedding_layer_names=[
+		"word_embeddings",
+		"position_embeddings",
+		"token_type_embeddings",
+	],
 	layernorm_names=["layer_norm", "LayerNorm"],
 )
 class RobertaModel(EasyDeLBaseModule):
@@ -829,12 +845,16 @@ class RobertaModel(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.pooler = RobertaPooler(
-			config=config,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			precision=precision,
-			rngs=rngs,
+		self.pooler = (
+			RobertaPooler(
+				config=config,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
+				rngs=rngs,
+			)
+			if add_pooling_layer
+			else None
 		)
 		self.add_pooling_layer = add_pooling_layer
 
@@ -842,11 +862,11 @@ class RobertaModel(EasyDeLBaseModule):
 		self,
 		input_ids,
 		attention_mask,
-		token_type_ids: Optional[jnp.ndarray] = None,
-		position_ids: Optional[jnp.ndarray] = None,
-		head_mask: Optional[jnp.ndarray] = None,
-		encoder_hidden_states: Optional[jnp.ndarray] = None,
-		encoder_attention_mask: Optional[jnp.ndarray] = None,
+		token_type_ids: Optional[chex.Array] = None,
+		position_ids: Optional[chex.Array] = None,
+		head_mask: Optional[chex.Array] = None,
+		encoder_hidden_states: Optional[chex.Array] = None,
+		encoder_attention_mask: Optional[chex.Array] = None,
 		past_key_values: Optional[Tuple[Tuple[chex.Array, chex.Array]]] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
@@ -857,22 +877,24 @@ class RobertaModel(EasyDeLBaseModule):
 			token_type_ids = jnp.zeros_like(input_ids)
 
 		# make sure `position_ids` is correctly initialized when not passed
+		if attention_mask is None:
+			attention_mask = jnp.ones_like(input_ids)
 		if position_ids is None:
 			position_ids = jnp.broadcast_to(
 				jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape
 			)
 
 		hidden_states = self.embeddings(
-			input_ids,
-			token_type_ids,
-			position_ids,
-			attention_mask,
-			deterministic=True,
+			input_ids=input_ids,
+			token_type_ids=token_type_ids,
+			position_ids=position_ids,
+			attention_mask=attention_mask,
 		)
 		outputs = self.encoder(
-			hidden_states,
-			attention_mask,
+			hidden_states=hidden_states,
+			attention_mask=attention_mask,
 			head_mask=head_mask,
+			causal_mask=self.causal_mask,
 			encoder_hidden_states=encoder_hidden_states,
 			encoder_attention_mask=encoder_attention_mask,
 			past_key_values=past_key_values,
@@ -898,87 +920,15 @@ class RobertaModel(EasyDeLBaseModule):
 		)
 
 
-class RobertaForMaskedLM(EasyDeLBaseModule):
-	def __init__(
-		self,
-		config: RobertaConfig,
-		dtype: jnp.dtype = jnp.float32,  # the dtype of the computation
-		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[lax.Precision] = None,
-		*,
-		rngs: nn.Rngs,
-	):
-		super().__init__(
-			config=config,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			precision=precision,
-			rngs=rngs,
-		)
-		self.roberta = RobertaModel(
-			config=config,
-			add_pooling_layer=False,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			precision=precision,
-			rngs=rngs,
-		)
-		self.lm_head = RobertaLMHead(
-			config=config,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			precision=precision,
-			rngs=rngs,
-		)
-
-	def __call__(
-		self,
-		input_ids,
-		attention_mask,
-		token_type_ids,
-		position_ids,
-		head_mask,
-		output_attentions: bool = False,
-		output_hidden_states: bool = False,
-		return_dict: bool = True,
-	):
-		# Model
-		outputs = self.roberta(
-			input_ids,
-			attention_mask,
-			token_type_ids,
-			position_ids,
-			head_mask,
-			deterministic=True,
-			output_attentions=output_attentions,
-			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
-		)
-
-		hidden_states = outputs[0]
-		if self.config.tie_word_embeddings:
-			shared_embedding = self.roberta.embeddings.word_embeddings.embedding
-		else:
-			shared_embedding = None
-
-		# Compute the prediction scores
-		logits = self.lm_head(hidden_states, shared_embedding=shared_embedding)
-
-		if not return_dict:
-			return (logits,) + outputs[1:]
-
-		return FlaxMaskedLMOutput(
-			logits=logits,
-			hidden_states=outputs.hidden_states,
-			attentions=outputs.attentions,
-		)
-
-
 @register_module(
 	"sequence-classification",
 	config=RobertaConfig,
 	model_type="roberta",
-	embedding_layer_names=["embed_tokens"],
+	embedding_layer_names=[
+		"word_embeddings",
+		"position_embeddings",
+		"token_type_embeddings",
+	],
 	layernorm_names=["layer_norm", "LayerNorm"],
 )
 class RobertaForSequenceClassification(EasyDeLBaseModule):
@@ -1027,19 +977,18 @@ class RobertaForSequenceClassification(EasyDeLBaseModule):
 	):
 		# Model
 		outputs = self.roberta(
-			input_ids,
-			attention_mask,
-			token_type_ids,
-			position_ids,
-			head_mask,
-			deterministic=True,
+			input_ids=input_ids,
+			attention_mask=attention_mask,
+			token_type_ids=token_type_ids,
+			position_ids=position_ids,
+			head_mask=head_mask,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,
 		)
 
 		sequence_output = outputs[0]
-		logits = self.classifier(sequence_output, deterministic=True)
+		logits = self.classifier(sequence_output)
 
 		if not return_dict:
 			return (logits,) + outputs[1:]
@@ -1086,7 +1035,7 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
 			param_dtype=param_dtype,
 			precision=precision,
 			rngs=rngs,
-			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
+			**get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
 		)
 
 	def __call__(
@@ -1122,19 +1071,18 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
 
 		# Model
 		outputs = self.roberta(
-			input_ids,
-			attention_mask,
-			token_type_ids,
-			position_ids,
-			head_mask,
-			deterministic=True,
+			input_ids=input_ids,
+			attention_mask=attention_mask,
+			token_type_ids=token_type_ids,
+			position_ids=position_ids,
+			head_mask=head_mask,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,
 		)
 
 		pooled_output = outputs[1]
-		pooled_output = self.dropout(pooled_output, deterministic=True)
+		pooled_output = self.dropout(pooled_output)
 		logits = self.classifier(pooled_output)
 
 		reshaped_logits = logits.reshape(-1, num_choices)
@@ -1190,7 +1138,7 @@ class RobertaForTokenClassification(EasyDeLBaseModule):
 			param_dtype=param_dtype,
 			precision=precision,
 			rngs=rngs,
-			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
+			**get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
 		)
 
 	def __call__(
@@ -1206,19 +1154,18 @@ class RobertaForTokenClassification(EasyDeLBaseModule):
 	):
 		# Model
 		outputs = self.roberta(
-			input_ids,
-			attention_mask,
-			token_type_ids,
-			position_ids,
-			head_mask,
-			deterministic=True,
+			input_ids=input_ids,
+			attention_mask=attention_mask,
+			token_type_ids=token_type_ids,
+			position_ids=position_ids,
+			head_mask=head_mask,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,
 		)
 
 		hidden_states = outputs[0]
-		hidden_states = self.dropout(hidden_states, deterministic=True)
+		hidden_states = self.dropout(hidden_states)
 		logits = self.classifier(hidden_states)
 
 		if not return_dict:
@@ -1263,7 +1210,7 @@ class RobertaForQuestionAnswering(EasyDeLBaseModule):
 			param_dtype=param_dtype,
 			precision=precision,
 			rngs=rngs,
-			**get_dot_general_by_bits(bits=self.config.bits, mode=self.config.easy_method),
+			**get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
 		)
 
 	def __call__(
@@ -1279,12 +1226,11 @@ class RobertaForQuestionAnswering(EasyDeLBaseModule):
 	):
 		# Model
 		outputs = self.roberta(
-			input_ids,
-			attention_mask,
-			token_type_ids,
-			position_ids,
-			head_mask,
-			deterministic=True,
+			input_ids=input_ids,
+			attention_mask=attention_mask,
+			token_type_ids=token_type_ids,
+			position_ids=position_ids,
+			head_mask=head_mask,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,
@@ -1312,7 +1258,11 @@ class RobertaForQuestionAnswering(EasyDeLBaseModule):
 	"causal-language-model",
 	config=RobertaConfig,
 	model_type="roberta",
-	embedding_layer_names=["embed_tokens"],
+	embedding_layer_names=[
+		"word_embeddings",
+		"position_embeddings",
+		"token_type_embeddings",
+	],
 	layernorm_names=["layer_norm", "LayerNorm"],
 )
 class RobertaForCausalLM(EasyDeLBaseModule):
@@ -1350,13 +1300,13 @@ class RobertaForCausalLM(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids,
-		attention_mask,
-		position_ids,
-		token_type_ids: Optional[jnp.ndarray] = None,
-		head_mask: Optional[jnp.ndarray] = None,
-		encoder_hidden_states: Optional[jnp.ndarray] = None,
-		encoder_attention_mask: Optional[jnp.ndarray] = None,
+		input_ids: chex.Array,
+		attention_mask: Optional[chex.Array] = None,
+		position_ids: Optional[chex.Array] = None,
+		token_type_ids: Optional[chex.Array] = None,
+		head_mask: Optional[chex.Array] = None,
+		encoder_hidden_states: Optional[chex.Array] = None,
+		encoder_attention_mask: Optional[chex.Array] = None,
 		past_key_values: Optional[Tuple[Tuple[chex.Array, chex.Array]]] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
@@ -1364,11 +1314,11 @@ class RobertaForCausalLM(EasyDeLBaseModule):
 	):
 		# Model
 		outputs = self.roberta(
-			input_ids,
-			attention_mask,
-			token_type_ids,
-			position_ids,
-			head_mask,
+			input_ids=input_ids,
+			attention_mask=attention_mask,
+			token_type_ids=token_type_ids,
+			position_ids=position_ids,
+			head_mask=head_mask,
 			encoder_hidden_states=encoder_hidden_states,
 			encoder_attention_mask=encoder_attention_mask,
 			past_key_values=past_key_values,
@@ -1379,7 +1329,7 @@ class RobertaForCausalLM(EasyDeLBaseModule):
 
 		hidden_states = outputs[0]
 		if self.config.tie_word_embeddings:
-			shared_embedding = self.roberta.embeddings.word_embeddings.embedding
+			shared_embedding = self.roberta.embeddings.word_embeddings.embedding.value
 		else:
 			shared_embedding = None
 

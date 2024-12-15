@@ -610,7 +610,7 @@ class FalconModel(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
+		inputs_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
@@ -627,7 +627,7 @@ class FalconModel(EasyDeLBaseModule):
 		    attention_mask (chex.Array): Mask for attention.
 		    position_ids (chex.Array): Positional indices.
 		    segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-		    input_embeds (Optional[chex.Array]): Embedded input tensor.
+		    inputs_embeds (Optional[chex.Array]): Embedded input tensor.
 		    output_attentions (Optional[bool]): If True, output attention weights.
 		    output_hidden_states (Optional[bool]): If True, output hidden states.
 		    init_cache (bool): If True, initialize cache for decoding.
@@ -639,11 +639,14 @@ class FalconModel(EasyDeLBaseModule):
 		"""
 		all_hidden_states = () if output_hidden_states else None
 		all_attentions = () if output_attentions else None
-		if input_embeds is None and input_ids is not None:
-			input_embeds = self.word_embeddings(input_ids.astype("i4"))
-		else:
-			raise ValueError("you should specify input_embeds or input_ids one of them")
-		batch_size, sequence_length, _ = input_embeds.shape
+		if (input_ids is None) ^ (inputs_embeds is not None):
+			raise ValueError(
+				"You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+			)
+		if inputs_embeds is None:
+			inputs_embeds = self.word_embeddings(input_ids.astype("i4"))
+
+		batch_size, sequence_length, _ = inputs_embeds.shape
 
 		if attention_mask is None:
 			attention_mask = jnp.ones((batch_size, sequence_length), dtype="i4")
@@ -652,7 +655,7 @@ class FalconModel(EasyDeLBaseModule):
 			alibi = built_bloom_alibi(
 				attention_mask,
 				self.config.num_attention_heads,
-			).astype(input_embeds.dtype)
+			).astype(inputs_embeds.dtype)
 		elif position_ids is None:
 			position_ids = jnp.broadcast_to(
 				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
@@ -662,7 +665,7 @@ class FalconModel(EasyDeLBaseModule):
 			attention_mask = jnp.expand_dims(attention_mask, (-3, -2))
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.h))
-		hidden_states = input_embeds
+		hidden_states = inputs_embeds
 		for idx, layer in enumerate(self.h):
 			hidden_states, score = layer(
 				hidden_states=hidden_states,
@@ -747,7 +750,7 @@ class FalconForCausalLM(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
+		inputs_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
@@ -764,7 +767,7 @@ class FalconForCausalLM(EasyDeLBaseModule):
 		    attention_mask (Optional[chex.Array]): Mask for attention.
 		    position_ids (Optional[chex.Array]): Positional indices.
 		    segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-		    input_embeds (Optional[chex.Array]): Embedded input tensor.
+		    inputs_embeds (Optional[chex.Array]): Embedded input tensor.
 		    output_attentions (Optional[bool]): If True, output attention weights.
 		    output_hidden_states (Optional[bool]): If True, output hidden states.
 		    init_cache (bool): If True, initialize cache for decoding.
@@ -781,7 +784,7 @@ class FalconForCausalLM(EasyDeLBaseModule):
 			output_attentions=output_attentions,
 			past_key_values=past_key_values,
 			return_dict=return_dict,
-			input_embeds=input_embeds,
+			inputs_embeds=inputs_embeds,
 			output_hidden_states=output_hidden_states,
 			segment_ids=segment_ids,
 		)

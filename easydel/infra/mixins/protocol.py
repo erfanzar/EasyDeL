@@ -62,7 +62,7 @@ class BaseModuleProtocol:
 	def __call__(
 		self,
 		input_ids: tp.Optional[chex.Array] = None,
-		input_embeds: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
@@ -76,7 +76,7 @@ class BaseModuleProtocol:
 	def __call__(
 		self,
 		input_ids: tp.Optional[chex.Array] = None,
-		input_embeds: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
@@ -89,7 +89,7 @@ class BaseModuleProtocol:
 	def __call__(
 		self,
 		input_ids: tp.Optional[chex.Array] = None,
-		input_embeds: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
@@ -104,7 +104,7 @@ class BaseModuleProtocol:
 	def __call__(
 		self,
 		input_ids: tp.Optional[chex.Array] = None,
-		input_embeds: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
