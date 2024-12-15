@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from easydel.modules.mamba2.mamba2_configuration import Mamba2Config
-from easydel.modules.mamba2.modelling_mamba2_flax import (
+from easydel.modules.mamba2.modeling_mamba2_flax import (
 	FlaxMamba2Cache,
 	FlaxMamba2ForCausalLM,
 	FlaxMamba2ForCausalLMModule,

@@ -15,7 +15,7 @@
 from easydel.modules.mistral.mistral_configuration import (
 	MistralConfig,
 )
-from easydel.modules.mistral.modelling_mistral_flax import (
+from easydel.modules.mistral.modeling_mistral_flax import (
 	MistralForCausalLM,
 	MistralModel,
 )

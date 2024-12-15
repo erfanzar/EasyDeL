@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.whisper.modelling_whisper_flax import (
+from easydel.modules.whisper.modeling_whisper_flax import (
 	WhisperForAudioClassification,
 	WhisperForConditionalGeneration,
 	WhisperTimeStampLogitsProcessor,

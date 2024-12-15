@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from easydel.modules.mixtral.mixtral_configuration import MixtralConfig
-from easydel.modules.mixtral.modelling_mixtral_flax import (
+from easydel.modules.mixtral.modeling_mixtral_flax import (
 	MixtralForCausalLM,
 	MixtralModel,
 )

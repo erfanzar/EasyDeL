@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.openelm.modelling_openelm_flax import (
+from easydel.modules.openelm.modeling_openelm_flax import (
 	OpenELMForCausalLM,
 	OpenELMModel,
 )

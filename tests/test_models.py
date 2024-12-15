@@ -627,7 +627,7 @@ class EasyModelsTest(unittest.TestCase):
 		self.assertTrue(res, f"Gemma2 model Failed [ERROR {err}]")
 
 	def test_mamba(self):
-		self.header_config = ed.MambaConfig(num_hidden_layers=4)
+		self.header_config = None
 		res, err = self.create_test_for_models(
 			"mamba",
 			transformers.MambaForCausalLM,
@@ -780,7 +780,7 @@ if __name__ == "__main__":
 	# unittest.main()
 	test = EasyModelsTest()
 	test.setUp()
-	test.test_arctic()  # Passed
+	# test.test_arctic()  # Passed
 	# test.test_cohere()  # Passed
 	# test.test_dbrx()  # Passed
 	# test.test_deepseek_v2()  # Passed
@@ -794,7 +794,7 @@ if __name__ == "__main__":
 	# test.test_grok1() # Not Tested Yet!
 	# test.test_internlm2()  # Passed
 	# test.test_llama()  # Passed
-	# test.test_mamba()
+	test.test_mamba()  # Passed
 	# test.test_mamba2()
 	# test.test_mistral()  # Passed
 	# test.test_mixtral()  # Passed

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.roberta.modelling_roberta_flax import (
+from easydel.modules.roberta.modeling_roberta_flax import (
 	RobertaForCausalLM,
 	RobertaForMultipleChoice,
 	RobertaForQuestionAnswering,
