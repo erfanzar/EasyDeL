@@ -794,8 +794,8 @@ if __name__ == "__main__":
 	# test.test_grok1() # Not Tested Yet!
 	# test.test_internlm2()  # Passed
 	# test.test_llama()  # Passed
-	test.test_mamba()  # Passed
-	# test.test_mamba2()
+	# test.test_mamba()  # Passed
+	test.test_mamba2()
 	# test.test_mistral()  # Passed
 	# test.test_mixtral()  # Passed
 	# test.test_mpt()  # Passed

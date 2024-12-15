@@ -127,8 +127,8 @@ from easydel.modules.dbrx import (
 )
 from easydel.modules.deepseek_v2 import (
 	DeepseekV2Config,
-	FlaxDeepseekV2ForCausalLM,
-	FlaxDeepseekV2Model,
+	DeepseekV2ForCausalLM,
+	DeepseekV2Model,
 )
 from easydel.modules.exaone import (
 	ExaoneConfig,
@@ -166,11 +166,11 @@ from easydel.modules.gpt_neo_x import (
 	GPTNeoXModel,
 )
 from easydel.modules.grok_1 import (
-	FlaxGrok1ForCausalLM,
-	FlaxGrok1Model,
 	Grok1Config,
+	Grok1ForCausalLM,
+	Grok1Model,
 )
-from easydel.modules.internlm2.modeling_internlm2_flax import (
+from easydel.modules.internlm2 import (
 	InternLM2Config,
 	InternLM2ForCausalLM,
 	InternLM2ForSequenceClassification,
@@ -188,10 +188,9 @@ from easydel.modules.mamba import (
 	MambaModel,
 )
 from easydel.modules.mamba2 import (
-	FlaxMamba2Cache,
-	FlaxMamba2ForCausalLM,
-	FlaxMamba2Model,
 	Mamba2Config,
+	Mamba2ForCausalLM,
+	Mamba2Model,
 )
 from easydel.modules.mistral import (
 	MistralConfig,
@@ -240,9 +239,9 @@ from easydel.modules.phi3 import (
 	Phi3Model,
 )
 from easydel.modules.phimoe import (
-	FlaxPhiMoeForCausalLM,
-	FlaxPhiMoeModel,
 	PhiMoeConfig,
+	PhiMoeForCausalLM,
+	PhiMoeModel,
 )
 from easydel.modules.qwen2 import (
 	Qwen2Config,
