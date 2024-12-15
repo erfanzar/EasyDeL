@@ -7,6 +7,7 @@ EasyDeL APIs 🔮
    Cli
    Etils
    Inference
+   Infra
    Kernels
    Layers
    Modules

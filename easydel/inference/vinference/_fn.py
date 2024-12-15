@@ -26,7 +26,7 @@ from easydel.inference.utils import (
 	create_sampling_step,
 	vInferenceConfig,
 )
-from easydel.modules._base import EasyDeLBaseModule
+from easydel.infra import EasyDeLBaseModule
 
 
 def measure_flops(func, *args, **kwargs):

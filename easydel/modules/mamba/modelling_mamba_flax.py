@@ -14,30 +14,29 @@
 
 import functools
 import itertools
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar, Union
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, TypeVar, Union
 
 import chex
 import flax.struct
 import jax
 import jax.numpy as jnp
-from einops import repeat, einsum
+from einops import einsum, repeat
+from flax import nnx as nn
 from jax import lax
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
-from easydel.layers.caching import MambaCache
-from easydel.layers.caching.mamba_cache import MambaCacheMetaData, MambaCacheView
-
-from easydel.layers.norms import RMSNorm as MambaRMSNorm
-from easydel.modules._base.base_module import EasyDeLBaseModule
-from easydel.modules._base.factory import register_module
-from easydel.modules._base.flax_modeling_utils import (
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import register_module
+from easydel.infra.modeling_outputs import FlaxBaseModelOutput
+from easydel.infra.utils import (
 	ACT2FN,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
 )
+from easydel.layers.caching import MambaCache
+from easydel.layers.caching.mamba_cache import MambaCacheMetaData, MambaCacheView
+from easydel.layers.norms import RMSNorm as MambaRMSNorm
 from easydel.modules.mamba.mamba_configuration import MambaConfig as MambaConfig
-from easydel.modules.modeling_flax_outputs import FlaxBaseModelOutput
-from flax import nnx as nn
 
 
 def init_to_value(x, dtype):
@@ -47,14 +46,14 @@ def init_to_value(x, dtype):
 @flax.struct.dataclass
 class MambaOutput(FlaxBaseModelOutput):
 	last_hidden_state: chex.Array = None
-	cache: Optional[List[chex.Array]] = None
+	cache: Optional[MambaCache] = None
 	hidden_states: Optional[Tuple[chex.Array]] = None
 
 
 @flax.struct.dataclass
 class MambaCausalLMOutput(FlaxBaseModelOutput):
 	logits: chex.Array = None
-	cache: Optional[List[chex.Array]] = None
+	cache: Optional[MambaCache] = None
 	hidden_states: Optional[Tuple[chex.Array]] = None
 
 

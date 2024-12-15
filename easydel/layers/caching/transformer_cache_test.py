@@ -1,15 +1,14 @@
 import pytest
-from easydel.layers.caching.transformer_cache import (
-	TransformerCache,
-	TransformerCacheMetaData,
-	TransformerCacheView,
-)
-
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import EasyDeLQuantizationMethods
 from easydel.etils.partition_module import PartitionAxis
+from easydel.layers.caching.transformer_cache import (
+	TransformerCache,
+	TransformerCacheMetaData,
+	TransformerCacheView,
+)
 from easydel.utils.quantizers import EasyQuantizer
 
 

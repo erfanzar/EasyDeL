@@ -78,22 +78,22 @@ from easydel.inference.whisper_inference import (
 	vWhisperInference,
 	vWhisperInferenceConfig,
 )
-from easydel.layers.attention import (
-	AttentionBenchmarker,
-	AttentionMechanisms,
-	FlexibleAttentionModule,
-)
-from easydel.modules._base import (
+from easydel.infra import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseConfigDict,
 	EasyDeLBaseModule,
 	EasyDeLBaseVisionModule,
 )
-from easydel.modules._base.factory import (
+from easydel.infra.factory import (
 	ConfigType,
 	TaskType,
 	register_config,
 	register_module,
+)
+from easydel.layers.attention import (
+	AttentionBenchmarker,
+	AttentionMechanisms,
+	FlexibleAttentionModule,
 )
 from easydel.modules.arctic import (
 	ArcticConfig,

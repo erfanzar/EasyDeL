@@ -22,30 +22,28 @@ import jax.numpy as jnp
 from flax import nnx as nn
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.layers.norms import RMSNorm
-from easydel.modules._base.base_module import EasyDeLBaseModule
-from easydel.modules._base.factory import register_module
-from easydel.modules._base.flax_modeling_utils import (
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import register_module
+from easydel.infra.modeling_outputs import (
+	FlaxBaseModelOutput,
+	FlaxCausalLMOutput,
+	FlaxSequenceClassifierOutput,
+)
+from easydel.infra.utils import (
 	ACT2FN,
 	block_wise_ffn,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
 )
-
-# easydel.modules
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.norms import RMSNorm
 from easydel.modules.llama.llama_configuration import (
 	LlamaConfig as LlamaConfig,
 )
 from easydel.modules.llama.llama_configuration import (
 	VisionLlamaConfig as VisionLlamaConfig,
-)
-from easydel.modules.modeling_flax_outputs import (
-	FlaxBaseModelOutput,
-	FlaxCausalLMOutput,
-	FlaxSequenceClassifierOutput,
 )
 
 

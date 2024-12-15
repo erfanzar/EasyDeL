@@ -28,6 +28,7 @@ from flax.typing import (
 	PrecisionLike,
 )
 from jax import lax
+
 from easydel.layers.quantization.base_quant import QauntModule
 
 Array = jax.Array

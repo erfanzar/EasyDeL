@@ -31,7 +31,7 @@ threading.Thread(target=log_mem)  # .start()
 
 def main():
 	sharding_axis_dims = (1, 1, 1, -1)
-	max_length = 6144
+	max_length = 4096
 
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
 	dtype = jnp.float16
@@ -64,24 +64,24 @@ def main():
 	tokenizer.padding_side = "left"
 	tokenizer.pad_token_id = tokenizer.eos_token_id
 	model.eval()
-	model = model.quantize(
-		method=ed.EasyDeLQuantizationMethods.A8BIT,
-		block_size=128,
-		quantization_pattern=".*(gate_proj|up_proj).*",
-	)
+	# model = model.quantize(
+	# 	method=ed.EasyDeLQuantizationMethods.A8BIT,
+	# 	block_size=128,
+	# 	quantization_pattern=".*(gate_proj|up_proj).*",
+	# )
 
 	inference = ed.vInference(
 		model=model,
 		tokenizer=tokenizer,
 		generation_config=ed.vInferenceConfig(
 			max_new_tokens=1024,
-			temperature=0.1,
-			top_p=model.generation_config.top_p,
-			top_k=model.generation_config.top_k,
+			temperature=0.4,
+			top_p=0.95,
+			top_k=10,
 			eos_token_id=model.generation_config.eos_token_id,
 			streaming_chunks=16,
 		),
-	)
+	) 
 
 	print(model.model_task)
 	print(model.model_type)

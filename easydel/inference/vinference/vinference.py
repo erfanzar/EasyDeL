@@ -50,7 +50,7 @@ from easydel.inference.vinference._fn import (
 	put_compiled_funcs,
 )
 from easydel.inference.vinference.metrics import vInferenceMetrics
-from easydel.modules._base import EasyDeLBaseModule
+from easydel.infra import EasyDeLBaseModule
 from easydel.utils.compiling_utils import (
 	load_compiled_fn,
 	save_compiled_fn,
@@ -327,11 +327,11 @@ class vInference:
 				stage="preprocessing",
 			).time():
 				input_ids = jnp.array(input_ids, dtype="i4", device=self.input_sharding)
-				batch_size, seq_length = input_ids.shape
+				batch_size, sequence_length = input_ids.shape
 
 				generate_func, interval_func = get_compiled_funcs(
 					batch_size=batch_size,
-					input_tokens_length=seq_length,
+					input_tokens_length=sequence_length,
 					id=self._uuid4,
 				)
 				if attention_mask is None:

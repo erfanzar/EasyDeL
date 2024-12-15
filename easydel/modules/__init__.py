@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules._base.base_config import (
+from easydel.infra.base_config import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseConfigDict,
 )
-from easydel.modules._base.base_module import (
+from easydel.infra.base_module import (
 	EasyDeLBaseModule,
 	EasyDeLBaseVisionModule,
 )

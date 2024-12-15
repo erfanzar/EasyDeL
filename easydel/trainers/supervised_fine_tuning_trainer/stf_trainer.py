@@ -17,7 +17,7 @@ from abc import ABC
 from typing import Callable, Dict, Optional, Union
 
 from easydel.etils.etils import get_logger
-from easydel.modules._base.base_module import EasyDeLBaseModule
+from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.trainers.base_trainer import TrainerConfigureDataloaderOutput
 from easydel.trainers.causal_language_model_trainer import CausalLanguageModelTrainer
 from easydel.trainers.training_configurations import TrainingArguments

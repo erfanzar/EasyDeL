@@ -23,24 +23,22 @@ from fjformer.functions import auxiliary_load_balancing_loss_func
 from flax import nnx as nn
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.layers.norms import RMSNorm as RMSNorm
-from easydel.modules._base.base_module import EasyDeLBaseModule
-
-# easydel.modules
-from easydel.modules._base.factory import register_module
-from easydel.modules._base.flax_modeling_utils import (
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import register_module
+from easydel.infra.modeling_outputs import (
+	FlaxSequenceClassifierOutput,
+	MoeCausalLMOutput,
+	MoeModelOutput,
+)
+from easydel.infra.utils import (
 	block_wise_ffn,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
 )
-from easydel.modules.modeling_flax_outputs import (
-	MoeModelOutput,
-	MoeCausalLMOutput,
-	FlaxSequenceClassifierOutput,
-)
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.norms import RMSNorm as RMSNorm
 from easydel.modules.qwen2_moe.configuration_qwen2_moe import (
 	Qwen2MoeConfig as Qwen2MoeConfig,
 )
@@ -602,7 +600,7 @@ class Qwen2MoeModel(EasyDeLBaseModule):
 				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
 				(batch_size, sequence_length),
 			).astype(jnp.int32)
- 
+
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
 

@@ -17,8 +17,8 @@ from typing import Dict, Optional, Union
 from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
-from easydel.modules._base.base_module import EasyDeLBaseConfig
-from easydel.modules._base.factory import register_config
+from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.infra.factory import register_config
 
 
 @register_config("mistral")

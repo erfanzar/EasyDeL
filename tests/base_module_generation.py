@@ -1,4 +1,5 @@
 # fmt:off
+from functools import partial
 import os
 import sys
 import threading
@@ -13,8 +14,8 @@ import torch
 from huggingface_hub import HfApi
 from jax import numpy as jnp
 from jax import sharding
-
-import transformers
+from flax import nnx as nn
+from transformers import AutoTokenizer
 
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
@@ -31,7 +32,7 @@ threading.Thread(target=log_mem)  # .start()
 
 def main():
 	sharding_axis_dims = (1, 1, 1, -1)
-	max_length = 6144
+	max_length = 4096
 
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
 	dtype = jnp.float16
@@ -60,15 +61,15 @@ def main():
 		precision=jax.lax.Precision("fastest"),
 	)
 
-	tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
+	tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
 	tokenizer.padding_side = "left"
 	tokenizer.pad_token_id = tokenizer.eos_token_id
 	model.eval()
-	model = model.quantize(
-		method=ed.EasyDeLQuantizationMethods.A8BIT,
-		block_size=128,
-		quantization_pattern=".*(gate_proj|up_proj).*",
-	)
+	# model = model.quantize(
+	# 	method=ed.EasyDeLQuantizationMethods.A8BIT,
+	# 	block_size=128,
+	# 	quantization_pattern=".*",
+	# )
 
 	prompt = "Find the value of $x$ that satisfies the equation $4x+5 = 6x+7$."
 
@@ -89,8 +90,37 @@ def main():
 		add_generation_prompt=True,
 	)
 	model.generation_config.max_new_tokens = 1024
-	output = model.generate(**ids, generation_config=model.generation_config)
-	print(output)
+	model.generation_config.temperature = 0.4
+	model.generation_config.top_k = 10
+	model.generation_config.top_p = 0.95
+
+	@partial(ed.utils.cjit, static_argnames=["gdef"])
+	@partial(jax.jit, static_argnames=["gdef"])
+	def generate(gdef, gtree, input_ids, attention_mask):
+		apply = nn.merge(gdef, gtree)
+		return apply.generate(
+			input_ids=input_ids,
+			attention_mask=attention_mask,
+			generation_config=model.generation_config,
+		)
+
+	gdef, gtree = nn.split(model)
+	print(
+		tokenizer.decode(
+			generate(gdef=gdef, gtree=gtree, **ids).sequences[0],
+			skip_special_tokens=True,
+		)
+	)
+	time_spent = time.time()
+	output = generate(gdef=gdef, gtree=gtree, **ids)
+	time_spent = time.time() - time_spent
+	tokens = jnp.sum(output.sequences[0][max_length - 1024 :] != 128001)
+	print(tokens / time_spent)  # vinference is faster btw.
+	print(tokens)
+	# print(generate._fun)
+	# print(generate.lower)
+	# print(generate.eval_shape)
+	# print(generate.trace)
 
 
 if __name__ == "__main__":

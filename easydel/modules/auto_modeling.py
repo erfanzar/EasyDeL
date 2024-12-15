@@ -31,10 +31,10 @@ from easydel.etils.etils import (
 	EasyDeLQuantizationMethods,
 )
 from easydel.etils.partition_module import PartitionAxis
-from easydel.modules._base.base_module import (
+from easydel.infra.base_module import (
 	EasyDeLBaseModule,
 )
-from easydel.modules._base.factory import TaskType
+from easydel.infra.factory import TaskType
 
 
 class BaseAutoEasyModel:

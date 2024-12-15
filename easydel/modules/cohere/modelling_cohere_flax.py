@@ -22,23 +22,21 @@ import jax.numpy as jnp
 from flax import nnx as nn
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.modules._base.base_module import EasyDeLBaseModule
-
-# easydel.modules
-from easydel.modules._base.factory import register_module
-from easydel.modules._base.flax_modeling_utils import (
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import register_module
+from easydel.infra.modeling_outputs import (
+	FlaxBaseModelOutput,
+	FlaxCausalLMOutput,
+)
+from easydel.infra.utils import (
 	block_wise_ffn,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
 )
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import TransformerCache, TransformerCacheView
 from easydel.modules.cohere.cohere_configuration import CohereConfig as CohereConfig
-from easydel.modules.modeling_flax_outputs import (
-	FlaxBaseModelOutput,
-	FlaxCausalLMOutput,
-)
 
 
 def repeat_kv(x: chex.Array, n_rep: int) -> chex.Array:
