@@ -23,24 +23,22 @@ from fjformer.functions import auxiliary_load_balancing_loss_func
 from flax import nnx as nn
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.layers.norms import RMSNorm as FlaxGrok1RMSNorm
-from easydel.modules._base.base_module import EasyDeLBaseModule
-from easydel.modules._base.factory import register_module
-
-# easydel.modules
-from easydel.modules._base.flax_modeling_utils import (
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import register_module
+from easydel.infra.modeling_outputs import (
+	MoeCausalLMOutput,
+	MoeModelOutput,
+)
+from easydel.infra.utils import (
 	block_wise_ffn,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
 )
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.norms import RMSNorm as FlaxGrok1RMSNorm
 from easydel.modules.grok_1.grok_1_configuration import Grok1Config as Grok1Config
-from easydel.modules.modeling_flax_outputs import (
-	MoeModelOutput,
-	MoeCausalLMOutput,
-)
 
 
 class FlaxGrok1Attention(FlaxAttentionModule):

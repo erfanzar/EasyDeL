@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from typing import Optional
+
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp

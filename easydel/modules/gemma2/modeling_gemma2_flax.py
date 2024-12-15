@@ -23,22 +23,22 @@ from flax import nnx as nn
 from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers, get_logger
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.modules._base.base_module import EasyDeLBaseModule
-from easydel.modules._base.factory import register_module
-from easydel.modules._base.flax_modeling_utils import (
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import register_module
+from easydel.infra.modeling_outputs import (
+	FlaxBaseModelOutput,
+	FlaxCausalLMOutput,
+)
+from easydel.infra.utils import (
 	ACT2FN,
 	block_wise_ffn,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 	get_gradient_checkpoint_policy,
 )
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import TransformerCache, TransformerCacheView
 from easydel.modules.gemma2.gemma2_configuration import Gemma2Config as Gemma2Config
-from easydel.modules.modeling_flax_outputs import (
-	FlaxBaseModelOutput,
-	FlaxCausalLMOutput,
-)
 
 logger = get_logger(__name__)
 
@@ -219,7 +219,7 @@ class Gemma2Attention(FlaxAttentionModule):
 			key=key_states,
 			positions=position_ids,
 			frequencies=frequencies,
-		) 
+		)
 		(
 			key_states,
 			value_states,

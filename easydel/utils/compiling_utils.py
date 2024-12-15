@@ -1,3 +1,17 @@
+# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import functools
@@ -22,6 +36,42 @@ COMPILE_FUNC_DIR.mkdir(parents=True, exist_ok=True)
 COMPILED_FILE_NAME = "compiled.func"
 
 COMPILED_CACHE: Dict[Tuple, Any] = {}
+
+
+def is_jit_wrapped(fn):
+	return all(
+		[
+			hasattr(fn, "_fun"),
+			hasattr(fn, "lower"),
+			hasattr(fn, "eval_shape"),
+			hasattr(fn, "trace"),
+		]
+	)
+
+
+def cjit(fn, static_argnames=None):
+	assert is_jit_wrapped(fn=fn), "function should be jit wrapped already"
+
+	@functools.wraps(fn)
+	def wrapped(**kwargs):  # kwargs only !
+		signature = get_signature((), kwargs)
+		cache_key = (fn, signature)
+		if cache_key in COMPILED_CACHE:
+			if static_argnames is not None:
+				for key in static_argnames:
+					kwargs.pop(key)
+			return COMPILED_CACHE[cache_key](**kwargs)
+
+		lowered_func: Lowered = fn.lower(**kwargs)
+		compiled_func = smart_compile(lowered_func, "cjit")
+		COMPILED_CACHE[cache_key] = compiled_func
+
+		if static_argnames is not None:
+			for key in static_argnames:
+				kwargs.pop(key)
+		return compiled_func(**kwargs)
+
+	return wrapped
 
 
 def hash_fn(self) -> int:
@@ -90,7 +140,6 @@ def smart_compile(lowered_func: Lowered, tag: Optional[str] = None):
 				except Exception as e:  # noqa
 					warnings.warn(f"couldn't save compiled function due to {e}", stacklevel=4)
 			return compiled_func
-
 	else:
 		compiled_func: Compiled = lowered_func.compile()
 		if ECACHE_COMPILES:
@@ -281,3 +330,23 @@ def compile_function(
 		static_argnums=static_argnums,
 		donate_argnums=donate_argnums,
 	).compile()
+
+
+if __name__ == "__main__":
+	jnp = jax.numpy
+
+	@cjit
+	@jax.jit
+	def my_function(x, y):
+		return x * y + x
+
+	a = jnp.array([1, 2, 3], dtype=jnp.float32)
+	b = jnp.array([4, 5, 6], dtype=jnp.float32)
+
+	result1 = my_function(a, b)  # Compiles and caches on first call
+	result2 = my_function(a, b)  # Returns cached result
+
+	c = jnp.array([1, 2, 3], dtype=jnp.float32)
+	d = jnp.array([1, 1, 1], dtype=jnp.float32)
+	result3 = my_function(c, d)
+	print(result1, result2, result3)

@@ -37,10 +37,10 @@ from easydel.etils.etils import (
 	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
-from easydel.modules._base.base_config import EasyDeLBaseConfigDict
-from easydel.modules._base.base_module import EasyDeLBaseModule
-from easydel.modules._base.factory import TaskType
-from easydel.modules._base.flax_modeling_utils import quantize_linear_layers
+from easydel.infra.base_config import EasyDeLBaseConfigDict
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType
+from easydel.infra.utils import quantize_linear_layers
 from easydel.modules.auto_configuration import (
 	AutoShardAndGatherFunctions,
 	get_modules_by_type,

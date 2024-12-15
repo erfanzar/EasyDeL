@@ -34,11 +34,11 @@ from easydel.etils.etils import (
 	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
-from easydel.modules._base.base_module import (
+from easydel.infra.base_module import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseModule,
 )
-from easydel.modules._base.factory import TaskType, registry
+from easydel.infra.factory import TaskType, registry
 from easydel.transform.parameters_transformation import torch_dict_to_easydel_params
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 

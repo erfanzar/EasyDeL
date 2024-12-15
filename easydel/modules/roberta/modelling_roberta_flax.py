@@ -17,21 +17,15 @@ from typing import Optional, Tuple
 
 import chex
 import jax
+from flax import nnx as nn
 from flax.linen.attention import dot_product_attention_weights
 from jax import lax
 from jax import numpy as jnp
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import TransformerCacheView
-from easydel.modules._base.base_module import EasyDeLBaseModule
-from easydel.modules._base.factory import register_module
-from easydel.modules._base.flax_modeling_utils import (
-	ACT2FN,
-	get_dot_general_by_bits,
-	get_gradient_checkpoint_policy,
-)
-from easydel.modules.modeling_flax_outputs import (
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import register_module
+from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutputWithPastAndCrossAttentions,
 	FlaxBaseModelOutputWithPoolingAndCrossAttentions,
 	FlaxCausalLMOutputWithCrossAttentions,
@@ -41,8 +35,14 @@ from easydel.modules.modeling_flax_outputs import (
 	FlaxSequenceClassifierOutput,
 	FlaxTokenClassifierOutput,
 )
+from easydel.infra.utils import (
+	ACT2FN,
+	get_dot_general_by_bits,
+	get_gradient_checkpoint_policy,
+)
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import TransformerCacheView
 from easydel.modules.roberta.roberta_configuration import RobertaConfig as RobertaConfig
-from flax import nnx as nn
 
 
 class RobertaEmbeddings(nn.Module):

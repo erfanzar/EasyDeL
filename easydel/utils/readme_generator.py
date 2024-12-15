@@ -10,6 +10,102 @@ from easydel.etils.etils import get_logger
 
 logger = get_logger(__name__)
 
+JINJA_TEMPLATE = """
+---
+tags:
+- EasyDeL
+- {{model.type}}
+- safetensors
+- TPU
+- GPU
+- XLA
+- Flax
+---
+# {{ model.name }}
+
+[![EasyDeL](https://img.shields.io/badge/🤗_EasyDeL-{{ model.version }}-blue.svg)](https://github.com/erfanzar/EasyDeL)
+[![Model Type](https://img.shields.io/badge/Model_Type-{{ model.type }}-green.svg)](https://github.com/erfanzar/EasyDeL)
+
+{{ model.description if model.description else "A model implemented using the EasyDeL framework, designed to deliver optimal performance for large-scale natural language processing tasks." }}
+
+## Overview
+
+{{ model.overview if model.overview else "EasyDeL provides an efficient, highly-optimized, and customizable machine learning model compatible with both GPU and TPU environments. Built with JAX, this model supports advanced features such as sharded model parallelism, making it suitable for distributed training and inference and customized kernels." }}
+
+## Features
+
+{% if model.features %}
+{% for feature in model.features %}
+- {{ feature }}
+{% endfor %}
+{% else %}
+- **Efficient Implementation**: Built with JAX/Flax for high-performance computation.
+- **Multi-Device Support**: Optimized to run on TPU, GPU, and CPU environments for sharding model over 2^(1-1000+) of devices.
+- **Sharded Model Parallelism**: Supports model parallelism across multiple devices for scalability.
+- **Customizable Precision**: Allows specification of floating-point precision for performance optimization.
+{% endif %}
+
+## Installation
+
+To install EasyDeL, simply run:
+
+```bash
+pip install easydel
+```
+
+## Usage
+
+### Loading the Pre-trained Model
+
+To load a pre-trained version of the model with EasyDeL:
+
+```python
+from easydel import AutoEasyDeLModelForCausalLM
+from jax import numpy as jnp, lax
+
+max_length = None # can be set to use lower memory for caching
+
+# Load model and parameters
+model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
+    "{{ model.repo_id }}",
+    config_kwargs=ed.EasyDeLBaseConfigDict(
+        use_scan_mlp=False,
+        attn_dtype=jnp.float16,
+        freq_max_position_embeddings=max_length,
+        mask_max_position_embeddings=max_length,
+        attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2
+    ), 
+    dtype=jnp.float16,
+    param_dtype=jnp.float16,
+    precision=lax.Precision("fastest"),
+    auto_shard_model=True, 
+)
+```
+
+## Supported Tasks
+
+{% if model.supported_tasks %}
+This model is well-suited for the following tasks:
+{% for task in model.supported_tasks %}
+- **{{ task }}**
+{% endfor %}
+{% else %}
+[Need more information]
+{% endif %}
+ 
+## Limitations
+
+{% if model.limitations %}
+{% for limitation in model.limitations %}
+- {{ limitation }}
+{% endfor %}
+{% else %}
+- **Hardware Dependency**: Performance can vary significantly based on the hardware used.
+- **JAX/Flax Setup Required**: The environment must support JAX/Flax for optimal use.
+- **Experimental Features**: Some features (like custom kernel usage or ed-ops) may require additional configuration and tuning.
+{% endif %}
+"""
+
 
 @dataclass
 class ModelInfo:
@@ -51,12 +147,6 @@ class ReadmeGenerator:
 				autoescape=select_autoescape(["html", "xml"]),
 			)
 
-	@property
-	def template_path(self):
-		return os.path.join(
-			os.path.dirname(os.path.abspath(__file__)), "readme_template.jinja"
-		)
-
 	def generate_readme(
 		self,
 		model_info: ModelInfo,
@@ -74,7 +164,7 @@ class ReadmeGenerator:
 		    Generated README content
 		"""
 		try:
-			template = self.env.get_template("readme_template.jinja")
+			template = self.env.from_string(JINJA_TEMPLATE)
 			content = template.render(model=model_info)
 
 			if output_path:
@@ -100,4 +190,4 @@ if __name__ == "__main__":
 	)
 
 	generator = ReadmeGenerator()
-	readme = generator.generate_readme(model_info, "rdm.md")
+	readme = generator.generate_readme(model_info, "tmp-files/readme.md")

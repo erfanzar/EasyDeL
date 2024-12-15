@@ -29,25 +29,23 @@ from easydel.inference.logits_process import (
 	FlaxStaticForceTokensLogitsProcessor,
 	WhisperTimeStampLogitsProcessor,
 )
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching.transformer_cache import (
-	TransformerCache,
-	TransformerCacheView,
-)
-from easydel.modules._base.base_module import EasyDeLBaseModule
-
-# easydel.modules
-from easydel.modules._base.factory import register_module
-from easydel.modules._base.flax_modeling_utils import (
-	ACT2FN,
-	get_dot_general_by_bits,
-)
-from easydel.modules.modeling_flax_outputs import (
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import register_module
+from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
 	FlaxBaseModelOutputWithPastAndCrossAttentions,
 	FlaxSeq2SeqLMOutput,
 	FlaxSeq2SeqModelOutput,
 	FlaxSequenceClassifierOutput,
+)
+from easydel.infra.utils import (
+	ACT2FN,
+	get_dot_general_by_bits,
+)
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.caching.transformer_cache import (
+	TransformerCache,
+	TransformerCacheView,
 )
 from easydel.modules.whisper.whisper_configuration import WhisperConfig as WhisperConfig
 

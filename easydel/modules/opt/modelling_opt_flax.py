@@ -39,17 +39,16 @@ import jax.numpy as jnp
 from flax import nnx as nn
 from jax import lax
 
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.modules._base.factory import register_module
-
-from easydel.modules._base.flax_modeling_utils import ACT2FN, control_mlp_sharding
-from easydel.modules.modeling_flax_outputs import (
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import register_module
+from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
 	FlaxMaskedLMOutput,
 )
+from easydel.infra.utils import ACT2FN, control_mlp_sharding
+from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import TransformerCache, TransformerCacheView
 from easydel.modules.opt.opt_configuration import OPTConfig as OPTConfig
-from easydel.modules._base.base_module import EasyDeLBaseModule
 
 
 class OPTAttention(FlaxAttentionModule):

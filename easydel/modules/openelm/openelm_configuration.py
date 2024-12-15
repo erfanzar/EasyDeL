@@ -19,8 +19,8 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
-from easydel.modules._base.base_module import EasyDeLBaseConfig
-from easydel.modules._base.factory import register_config
+from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.infra.factory import register_config
 
 
 def make_divisible(
@@ -132,6 +132,7 @@ class OpenELMConfig(EasyDeLBaseConfig):
 
 	model_type: str = "openelm"
 	attribute_map = {"tie_word_embedding": "share_input_output_layers"}
+
 	def __init__(
 		self,
 		vocab_size: int = 32000,

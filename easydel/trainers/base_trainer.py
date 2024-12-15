@@ -50,7 +50,7 @@ from jax import numpy as jnp
 
 from easydel import __version__
 from easydel.etils.etils import get_logger
-from easydel.modules._base.base_module import (
+from easydel.infra.base_module import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseModule,
 )
