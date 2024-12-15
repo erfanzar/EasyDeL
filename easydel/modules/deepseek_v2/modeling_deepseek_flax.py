@@ -880,7 +880,7 @@ class DeepseekV2Model(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
+		inputs_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
@@ -897,7 +897,7 @@ class DeepseekV2Model(EasyDeLBaseModule):
 		    attention_mask (chex.Array): Mask for attention.
 		    position_ids (chex.Array): Positional indices.
 		    segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-		    input_embeds (Optional[chex.Array]): Embedded input tensor.
+		    inputs_embeds (Optional[chex.Array]): Embedded input tensor.
 		    output_attentions (Optional[bool]): If True, output attention weights.
 		    output_hidden_states (Optional[bool]): If True, output hidden states.
 		    init_cache (bool): If True, initialize cache for decoding.
@@ -907,11 +907,13 @@ class DeepseekV2Model(EasyDeLBaseModule):
 		Returns:
 		    FlaxBaseModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
-		if input_embeds is None and input_ids is not None:
-			input_embeds = self.embed_tokens(input_ids.astype("i4"))
-		else:
-			raise ValueError("you should specify input_embeds or input_ids one of them")
-		batch_size, sequence_length, _ = input_embeds.shape
+		if (input_ids is None) ^ (inputs_embeds is not None):
+			raise ValueError(
+				"You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+			)
+		if inputs_embeds is None:
+			inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+		batch_size, sequence_length, _ = inputs_embeds.shape
 
 		all_attentions = () if output_attentions else None
 		all_hidden_states = () if output_hidden_states else None
@@ -927,7 +929,7 @@ class DeepseekV2Model(EasyDeLBaseModule):
 			).astype(jnp.int32)
 		if attention_mask.ndim == 2:
 			attention_mask = jnp.expand_dims(attention_mask, (1, 2))
-		hidden_states = input_embeds
+		hidden_states = inputs_embeds
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
 		for idx, layer in enumerate(self.layers):
@@ -1011,7 +1013,7 @@ class DeepseekV2ForCausalLM(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
+		inputs_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
@@ -1024,7 +1026,7 @@ class DeepseekV2ForCausalLM(EasyDeLBaseModule):
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
-			input_embeds=input_embeds,
+			inputs_embeds=inputs_embeds,
 			past_key_values=past_key_values,
 			segment_ids=segment_ids,
 			output_attentions=output_attentions,

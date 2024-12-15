@@ -564,7 +564,7 @@ class OpenELMModel(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
+		inputs_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
@@ -576,11 +576,11 @@ class OpenELMModel(EasyDeLBaseModule):
 		all_attentions = () if output_attentions else None
 		all_hidden_states = () if output_hidden_states else None
 
-		if input_embeds is None and input_ids is not None:
-			input_embeds = self.token_embeddings(input_ids.astype("i4"))
+		if inputs_embeds is None and input_ids is not None:
+			inputs_embeds = self.token_embeddings(input_ids.astype("i4"))
 		else:
-			raise ValueError("you should specify input_embeds or input_ids one of them")
-		batch_size, sequence_length, _ = input_embeds.shape
+			raise ValueError("you should specify inputs_embeds or input_ids one of them")
+		batch_size, sequence_length, _ = inputs_embeds.shape
 
 		assert (
 			sequence_length <= self.config.max_context_length
@@ -598,7 +598,7 @@ class OpenELMModel(EasyDeLBaseModule):
 			attention_mask = jnp.expand_dims(attention_mask, (1, 2))
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
-		hidden_states = input_embeds
+		hidden_states = inputs_embeds
 
 		for idx, layer in enumerate(self.layers):
 			if output_hidden_states:
@@ -681,7 +681,7 @@ class OpenELMForCausalLM(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
+		inputs_embeds: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
@@ -694,7 +694,7 @@ class OpenELMForCausalLM(EasyDeLBaseModule):
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
-			input_embeds=input_embeds,
+			inputs_embeds=inputs_embeds,
 			past_key_values=past_key_values,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,

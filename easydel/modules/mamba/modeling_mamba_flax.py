@@ -482,7 +482,7 @@ class MambaModel(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
+		inputs_embeds: Optional[chex.Array] = None,
 		cache: Optional[MambaCache] = None,
 		position_ids: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
@@ -499,15 +499,15 @@ class MambaModel(EasyDeLBaseModule):
 			return_dict if return_dict is not None else self.config.use_return_dict
 		)
 
-		if (input_ids is None) ^ (input_embeds is not None):
+		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
-				"You cannot specify both input_ids and input_embeds at the same time, and must specify either one"
+				"You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
 			)
 
-		if input_embeds is None:
-			input_embeds = self.embeddings(input_ids)
+		if inputs_embeds is None:
+			inputs_embeds = self.embeddings(input_ids)
 
-		batch_size, sequence_length = input_embeds.shape[:2]
+		batch_size, sequence_length = inputs_embeds.shape[:2]
 		if attention_mask is None:
 			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
 		if position_ids is None:
@@ -518,7 +518,7 @@ class MambaModel(EasyDeLBaseModule):
 		if cache is None:
 			cache = MambaCache.init_empty(len(self.layers))
 
-		hidden_states = input_embeds
+		hidden_states = inputs_embeds
 		all_hidden_states = () if output_hidden_states else None
 		for idx, block in enumerate(self.layers):
 			hidden_states = block(
@@ -615,7 +615,7 @@ class MambaForCausalLM(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
+		inputs_embeds: Optional[chex.Array] = None,
 		cache: Optional[MambaCache] = None,
 		position_ids: Optional[chex.Array] = None,
 		attention_mask: Optional[chex.Array] = None,
@@ -629,7 +629,7 @@ class MambaForCausalLM(EasyDeLBaseModule):
 
 		mamba_outputs = self.backbone(
 			input_ids=input_ids,
-			input_embeds=input_embeds,
+			inputs_embeds=inputs_embeds,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			cache=cache,

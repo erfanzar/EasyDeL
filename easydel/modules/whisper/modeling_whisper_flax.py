@@ -648,10 +648,10 @@ class FlaxWhisperDecoder(EasyDeLBaseModule):
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
 	) -> tuple[Any, ...] | FlaxBaseModelOutputWithPastAndCrossAttentions:
-		input_embeds = self.embed_tokens(input_ids)
+		inputs_embeds = self.embed_tokens(input_ids)
 		position_embeds = self.embed_positions(position_ids)
 
-		hidden_states = input_embeds + position_embeds
+		hidden_states = inputs_embeds + position_embeds
 		hidden_states = self.dropout_layer(hidden_states)
 
 		all_hidden_states = () if output_hidden_states else None

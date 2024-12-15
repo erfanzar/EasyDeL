@@ -30,10 +30,9 @@ from easydel.infra.utils import (
 	ACT2FN,
 	get_gradient_checkpoint_policy,
 )
+from easydel.layers.caching.mamba2_cache import Mamba2Cache, Mamba2CacheView
 from easydel.layers.norms import RMSNorm as FlaxMamba2RMSNorm
 from easydel.modules.mamba2.mamba2_configuration import Mamba2Config as Mamba2Config
-
-FlaxMamba2Cache = tp.Any  # w
 
 
 def init_to_value(x, dtype):
@@ -43,14 +42,14 @@ def init_to_value(x, dtype):
 @flax.struct.dataclass
 class Mamba2Output(FlaxBaseModelOutput):
 	last_hidden_state: chex.Array = None
-	cache_params: tp.Optional[tp.List[chex.Array]] = None
+	cache_params: tp.Optional[Mamba2Cache] = None
 	hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
 
 
 @flax.struct.dataclass
 class Mamba2CausalLMOutput(FlaxBaseModelOutput):
 	logits: chex.Array = None
-	cache_params: tp.Optional[tp.List[chex.Array]] = None
+	cache_params: tp.Optional[Mamba2Cache] = None
 	hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
 
 
@@ -329,7 +328,8 @@ class Mamba2Mixer(nn.Module):
 	def __call__(
 		self,
 		input_states: chex.Array,
-		cache_params: tp.Optional[FlaxMamba2Cache] = None,
+		cache_params: tp.Optional[Mamba2CacheView] = None,
+		cache_position: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 	):
 		dtype = input_states.dtype
@@ -364,30 +364,25 @@ class Mamba2Mixer(nn.Module):
 		if cache_params is not None:
 			ssm_state = cache_params.ssm_states[self.layer_idx].copy()
 			if cache_params.seqlen_offset > 0:
-				conv_state = cache_params.conv_states[
-					self.layer_idx
-				]  # [batch, intermediate_size, conv_kernel_size]
+				conv_state = cache_params.conv_states
+				# [batch, intermediate_size, conv_kernel_size]
 				conv_state = jnp.roll(conv_state, shifts=-1, axis=-1)
 				# handle batched generation - states are copied through
 				conv_state[:, :, -1] = (
 					hidden_states[:, 0, :] if hidden_states.ndim == 3 else hidden_states
 				)
-				cache_params.conv_states[self.layer_idx] = jax.lax.dynamic_update_slice(
-					cache_params.conv_states[self.layer_idx],
+				cache_params.conv_states = jax.lax.dynamic_update_slice(
+					cache_params.conv_states,
 					conv_state,
 					(0, 0, 0, 0),
 				)
-				hidden_states = jnp.sum(
-					conv_state * self.conv1d.variables["params"]["kernel"][:, 0, :],
-					dim=-1,
-				)
+				hidden_states = jnp.sum(conv_state * self.conv1d.kernel.value[:, 0, :], dim=-1)
 				if self.use_conv_bias:
-					hidden_states += self.conv1d.variables["params"]["bias"]
-				hidden_states = self.act(hidden_states).astype(dtype)[
-					:, None, ...
-				]  # [batch, 1, intermediate_size] : decoding
+					hidden_states += self.conv1d.bias.value
+				hidden_states = self.act(hidden_states).astype(dtype)[:, None, ...]
+			# [batch, 1, intermediate_size] : decoding
 			else:
-				hidden_states = jnp.transpose(hidden_states, (0, 2, 1))
+				hidden_states = jnp.swapaxes(hidden_states, 2, 1)
 
 				pad_width = [
 					(0, 0),
@@ -396,15 +391,15 @@ class Mamba2Mixer(nn.Module):
 				]
 				conv_state = jnp.pad(hidden_states, pad_width)
 
-				cache_params.conv_states[self.layer_idx] = jax.lax.dynamic_update_slice(
-					cache_params.conv_states[self.layer_idx],
+				cache_params.conv_states = jax.lax.dynamic_update_slice(
+					cache_params.conv_states,
 					conv_state,
 					(0, 0, 0, 0),
 				)
 
 				# Apply convolution and activation
 				hidden_states = self.conv1d(hidden_states)
-				hidden_states = jnp.transpose(hidden_states, (0, 2, 1))
+				hidden_states = jnp.swapaxes(hidden_states, 2, 1)
 				hidden_states = self.act(hidden_states)
 				hidden_states = hidden_states[:, :seq_len, :]
 
@@ -432,7 +427,17 @@ class Mamba2Mixer(nn.Module):
 				dtype=dtype,
 			)
 			hidden_states = self.act(
-				self.conv1d(hidden_states.transpose(0, 2, 1))[..., :seq_len].transpose(0, 2, 1)
+				jnp.swapaxes(
+					self.conv1d(
+						jnp.swapaxes(
+							hidden_states,
+							2,
+							1,
+						)
+					)[..., :seq_len],
+					2,
+					1,
+				)
 			)
 			hidden_states, B, C = jnp.split(
 				hidden_states,
@@ -442,17 +447,14 @@ class Mamba2Mixer(nn.Module):
 				],
 				axis=-1,
 			)
-			A = -jnp.exp(self.A_log.astype("float32"))  # [num_heads]
+			A = -jnp.exp(self.A_log.value.astype("float32"))  # [num_heads]
 			if cache_params is not None and cache_params.seqlen_offset > 0:
-				# Note: there is no need to pad parameter matrices here, as there is just one new token
-				# for batched generation
 				dt = dt[:, None, ...] if dt.ndim == 2 else dt[:, 0, :][:, None, ...]
 				dt = dt.transpose(1, 2).expand(batch_size, dt.shape[-1], self.head_dim)
-				# [num_heads] -> [num_heads, head_dim]
 				dt_bias = self.dt_bias[..., None].expand(self.dt_bias.shape[0], self.head_dim)
 
 				dt = jax.nn.softplus(dt + dt_bias.astype(dt.dtype))
-				dt = jnp.clip(dt, min=self.time_step_min)  # , self.time_step_max)
+				dt = jnp.clip(dt, min=self.time_step_min)
 				A = (
 					A[..., None, None]
 					.expand(self.num_heads, self.head_dim, self.ssm_state_size)
@@ -646,7 +648,8 @@ class Mamba2Block(nn.Module):
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		cache_params: tp.Optional[FlaxMamba2Cache] = None,
+		cache_params: tp.Optional[Mamba2CacheView] = None,
+		cache_position: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 	) -> chex.Array:
 		residual = hidden_states
@@ -656,6 +659,7 @@ class Mamba2Block(nn.Module):
 		hidden_states = self.mixer(
 			hidden_states,
 			cache_params,
+			cache_position,
 			attention_mask,
 		)
 		hidden_states = residual + hidden_states
@@ -715,13 +719,12 @@ class Mamba2Model(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: tp.Optional[chex.Array] = None,
-		input_embeds: tp.Optional[chex.Array] = None,
-		attention_mask: tp.Optional[chex.Array] = None,
-		cache_params: tp.Optional[chex.Array] = None,
-		deterministic: bool = True,
-		use_cache: tp.Optional[bool] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		cache_params: tp.Optional[Mamba2Cache] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: tp.Optional[bool] = None,
+		cache_position: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
 		**kwargs,
 	) -> tp.Union[tp.Tuple, Mamba2Output]:
 		output_hidden_states = (
@@ -730,39 +733,33 @@ class Mamba2Model(EasyDeLBaseModule):
 			else self.config.output_hidden_states
 		)
 		all_hidden_states = () if output_hidden_states else None
-		use_cache = (
-			use_cache
-			if use_cache is not None
-			else (self.config.use_cache if not deterministic else False)
-		)
 		return_dict = (
 			return_dict if return_dict is not None else self.config.use_return_dict
 		)
 
-		if (input_ids is None) ^ (input_embeds is not None):
+		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
-				"You cannot specify both input_ids and input_embeds at the same time, and must specify either one"
+				"You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
 			)
 
-		if input_embeds is None:
-			input_embeds = self.embeddings(input_ids)
-
-		if deterministic and use_cache:
-			use_cache = False
-
-		hidden_states = input_embeds
+		if inputs_embeds is None:
+			inputs_embeds = self.embeddings(input_ids)
+		if cache_params is None:
+			cache_params = Mamba2Cache.init_empty(len(self.layers))
+		hidden_states = inputs_embeds
 		for idx, block in enumerate(self.layers):
 			hidden_states = block(
 				hidden_states=hidden_states,
-				cache_params=cache_params,
+				cache_params=cache_params.views[idx],
+				cache_position=cache_position,
 				attention_mask=attention_mask,
 			)
 
 			if output_hidden_states:
 				all_hidden_states = all_hidden_states + (hidden_states,)
 
-		if use_cache:
-			cache_params.seqlen_offset += input_embeds.shape[1]
+		# if use_cache:
+		# 	cache_params.seqlen_offset += inputs_embeds.shape[1]
 
 		hidden_states = self.norm_f(hidden_states)
 
@@ -776,7 +773,7 @@ class Mamba2Model(EasyDeLBaseModule):
 
 		return Mamba2Output(
 			last_hidden_state=hidden_states,
-			cache_params=cache_params if use_cache else None,
+			cache_params=cache_params,
 			hidden_states=all_hidden_states,
 		)
 
@@ -824,13 +821,12 @@ class Mamba2ForCausalLM(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: tp.Optional[chex.Array] = None,
-		input_embeds: tp.Optional[chex.Array] = None,
-		attention_mask: tp.Optional[chex.Array] = None,
-		cache_params: tp.Optional[chex.Array] = None,
-		deterministic: bool = True,
-		use_cache: tp.Optional[bool] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		cache_params: tp.Optional[Mamba2Cache] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: tp.Optional[bool] = None,
+		cache_position: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
 		**kwargs,
 	) -> tp.Union[tp.Tuple, Mamba2CausalLMOutput]:
 		return_dict = (
@@ -838,11 +834,10 @@ class Mamba2ForCausalLM(EasyDeLBaseModule):
 		)
 		mamba_outputs = self.backbone(
 			input_ids=input_ids,
-			input_embeds=input_embeds,
+			inputs_embeds=inputs_embeds,
 			attention_mask=attention_mask,
-			deterministic=deterministic,
 			cache_params=cache_params,
-			use_cache=use_cache,
+			cache_position=cache_position,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,
 		)

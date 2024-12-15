@@ -703,7 +703,7 @@ class DbrxModel(EasyDeLBaseModule):
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
+		inputs_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		output_router_logits: Optional[bool] = None,
@@ -712,16 +712,15 @@ class DbrxModel(EasyDeLBaseModule):
 	) -> MoeModelOutput | Tuple:
 		if output_router_logits is None:
 			output_router_logits = self.config.output_router_logits
-		if input_ids is not None and input_embeds is not None:
-			raise ValueError(
-				"You cannot specify both decoder_input_ids and decoder_input_embeds at the same time"
-			)
 
-		if input_embeds is None and input_ids is not None:
-			input_embeds = self.wte(input_ids.astype("i4"))
-		else:
-			raise ValueError("you should specify input_embeds or input_ids one of them")
-		batch_size, sequence_length = input_embeds.shape[:2]
+		if (input_ids is None) ^ (inputs_embeds is not None):
+			raise ValueError(
+				"You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+			)
+		if inputs_embeds is None:
+			inputs_embeds = self.wte(input_ids.astype("i4"))
+
+		batch_size, sequence_length = inputs_embeds.shape[:2]
 		if attention_mask is None:
 			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
 		if position_ids is None:
@@ -745,7 +744,7 @@ class DbrxModel(EasyDeLBaseModule):
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
 		)
-		hidden_states = input_embeds
+		hidden_states = inputs_embeds
 		all_hidden_states = ()
 		all_router_logits = ()
 		all_attentions = ()
@@ -843,7 +842,7 @@ class DbrxForCausalLM(EasyDeLBaseModule):
 		attention_mask: Optional[chex.Array] = None,
 		position_ids: Optional[chex.Array] = None,
 		segment_ids: Optional[chex.Array] = None,
-		input_embeds: Optional[chex.Array] = None,
+		inputs_embeds: Optional[chex.Array] = None,
 		output_attentions: Optional[bool] = None,
 		output_hidden_states: Optional[bool] = None,
 		output_router_logits: Optional[bool] = None,
@@ -856,7 +855,7 @@ class DbrxForCausalLM(EasyDeLBaseModule):
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
-			input_embeds=input_embeds,
+			inputs_embeds=inputs_embeds,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			output_router_logits=output_router_logits,

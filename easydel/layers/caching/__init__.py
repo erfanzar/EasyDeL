@@ -9,6 +9,11 @@ from easydel.layers.caching.mamba_cache import (
 	MambaCacheView,
 )
 
+from easydel.layers.caching.mamba2_cache import (
+	Mamba2Cache,
+	Mamba2CacheMetaData,
+	Mamba2CacheView,
+)
 __all__ = (
 	"TransformerCache",
 	"TransformerCacheMetaData",
@@ -16,4 +21,7 @@ __all__ = (
 	"MambaCache",
 	"MambaCacheMetaData",
 	"MambaCacheView",
+	"Mamba2Cache",
+	"Mamba2CacheMetaData",
+	"Mamba2CacheView",
 )

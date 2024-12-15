@@ -15,13 +15,16 @@
 """Utility functions for managing and manipulating nnx module states."""
 
 import typing as tp
-import warnings
 
 import chex
 import jax
 import jax.numpy as jnp
 from flax import nnx, struct
 from flax.nnx import traversals
+
+from easydel.etils.etils import get_logger
+
+logger = get_logger(__name__)
 
 
 class MetaValueRecreator:
@@ -493,22 +496,19 @@ def merge_state_and_tree(tree: dict, state: nnx.State) -> nnx.State:
 		params = flatten_dict(params)
 	if not is_flatten(tree):
 		tree = flatten_dict(tree)
-	tree = string_key_to_int(tree)
+	tree = string_key_to_int(tree) 
 
 	for keys in list(params.keys()):
 		tree_values = tree.get(keys, None)
-
 		if tree_values is not None:
 			params[keys].value = tree_values
 		else:
 			if keys[-1] == "kernel":
-				warnings.warn(
-					f"a parameter's missing at {keys}, please double check.",
-					stacklevel=1,
-				)
-			params[
-				keys
-			].value = None  # Avoid type '<class 'jax._src.api.ShapeDtypeStruct'>' is not a valid JAX type
+				_path = ".".join([str(k) for k in keys])
+				logger.info(f"a parameter's missing at {_path}, please double check.")
+
+			# Avoid type '<class 'jax._src.api.ShapeDtypeStruct'>' is not a valid JAX type
+			params[keys].value = None
 	others = recreate_meta_values(others)
 	state = refine_graphs(others, params)
 	return state

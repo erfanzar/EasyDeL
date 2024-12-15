@@ -666,6 +666,20 @@ class EasyModelsTest(unittest.TestCase):
 		)
 		self.assertTrue(res, f"Qwen2Moe model Failed [ERROR {err}]")
 
+	def test_roberta(self):
+		self.header_config = ed.RobertaConfig(
+			hidden_size=256,
+			intermediate_size=512,
+			num_hidden_layers=4,
+			num_attention_heads=8,
+		)
+		res, err = self.create_test_for_models(
+			"roberta",
+			transformers.RobertaForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
+		self.assertTrue(res, f"ROBERTA model Failed [ERROR {err}]")
+
 	def test_moe_mixtral(self):
 		self.header_config = None
 		res = self.create_moe_test_for_models(
@@ -780,32 +794,32 @@ if __name__ == "__main__":
 	# unittest.main()
 	test = EasyModelsTest()
 	test.setUp()
-	# test.test_arctic()  # Passed
-	# test.test_cohere()  # Passed
-	# test.test_dbrx()  # Passed
-	# test.test_deepseek_v2()  # Passed
-	# test.test_exaone()  # Passed
-	# test.test_falcon()  # Passed
-	# test.test_gemma()  # Passed
-	# test.test_gemma2()  # Passed
-	# test.test_gptj()  # Passed
+	test.test_arctic()  # Passed
+	test.test_cohere()  # Passed
+	test.test_dbrx()  # Passed
+	test.test_deepseek_v2()  # Passed
+	test.test_exaone()  # Passed
+	test.test_falcon()  # Passed
+	test.test_gemma()  # Passed
+	test.test_gemma2()  # Passed
+	test.test_gptj()  # Passed
 	# test.test_gpt_noex()  # Failed
-	# test.test_gpt2()  # Passed
+	test.test_gpt2()  # Passed
 	# test.test_grok1() # Not Tested Yet!
-	# test.test_internlm2()  # Passed
-	# test.test_llama()  # Passed
-	# test.test_mamba()  # Passed
-	test.test_mamba2()
-	# test.test_mistral()  # Passed
-	# test.test_mixtral()  # Passed
-	# test.test_mpt()  # Passed
-	# test.test_olmo()  # Passed
-	# test.test_olmo2()  # Passed
+	test.test_internlm2()  # Passed
+	test.test_llama()  # Passed
+	test.test_mamba()  # Passed
+	test.test_mamba2()  # Passed
+	test.test_mistral()  # Passed
+	test.test_mixtral()  # Passed
+	test.test_mpt()  # Passed
+	test.test_olmo()  # Passed
+	test.test_olmo2()  # Passed
 	# test.test_openelm()  # Passed
-	# test.test_phi()  # Passed
-	# test.test_phi3()  # Passed
+	test.test_phi()  # Passed
+	test.test_phi3()  # Passed
 	# test.test_phimoe()  # Failed v0.0.80 - N  Runtime
-	# test.test_qwen2()  # Passed
-	# test.test_qwen2_moe()  # Passed
-	# test.test_stablelm()  # Passed
+	test.test_qwen2()  # Passed
+	test.test_qwen2_moe()  # Passed
+	test.test_stablelm()  # Passed
 	# -----------------------------------------------
