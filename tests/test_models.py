@@ -185,14 +185,11 @@ class EasyModelsTest(unittest.TestCase):
 
 			@jax.jit
 			def jited(ids):
-				return ed_model.compute_loss(
-					input_ids=ids,
-					labels=ids,
-				)
+				return ed_model.compute_loss(input_ids=ids)
 
 			ed_output = jited(jax_input_ids)
 			easy_time = time.time()
-			ed_output = jited(jax_input_ids)
+			ed_output, metrics = jited(jax_input_ids)
 			easy_time = time.time() - easy_time
 
 			del params

@@ -32,9 +32,7 @@ from typing import (
 import jax
 import jax.numpy as jnp
 import numpy as np
-from fjformer.lora import LoraRapture, RaptureConfig
 from jax.sharding import PartitionSpec
-from jax.tree_util import PyTreeDef
 
 from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import (
@@ -59,20 +57,6 @@ except ImportError:
 import flax.metrics.tensorboard
 
 logger = get_logger(__name__)
-
-
-class LoraRaptureConfig(RaptureConfig):  # Don't Make user involved with FJFormer
-	"""
-	Configuration class for EasyDeL specific XRapTure settings.
-	Inherits from FJFormer's RaptureConfig.
-
-	Attributes:
-	    parameters (PyTreeDef | dict): Model parameters for XRapTure.
-	"""
-
-	def __init__(self, parameters: PyTreeDef | dict, **kwargs):
-		self.parameters = parameters
-		super().__init__(**kwargs)
 
 
 # Constants
@@ -103,7 +87,6 @@ class TrainingArguments:
 	    gradient_checkpointing (AVAILABLE_GRADIENT_CHECKPOINTS): Gradient checkpointing strategy to use.
 	    clip_grad (Optional[float]): If provided, gradients will be clipped to this maximum norm.
 	    max_sequence_length (Optional[int]): Maximum sequence length for model input.
-	    sharding_array (Union[tuple, int]): Sharding configuration for model parameters.
 	    is_fine_tuning (bool): Whether the model is being fine-tuned.
 	    do_train (bool): Whether to run training.
 	    do_eval  (bool): Whether to run evaluation.
@@ -113,12 +96,7 @@ class TrainingArguments:
 	    save_steps (Optional[int]): Save checkpoints every specified number of steps.
 	    save_dir (str): Directory to save checkpoints.
 	    save_total_limit (Optional[int]): Total number of checkpoints to keep.
-	    dtype (jnp.dtype): Data type for model computations.
-	    param_dtype (jnp.dtype): Data type for model parameters.
-	    fully_sharded_data_parallel (bool): Whether to use fully sharded data parallelism.
 	    use_wandb (bool): Whether to use Weights & Biases for logging.
-	    custom_rule (Optional[Dict[str, PartitionSpec]]):  Custom sharding rules for specific parameters.
-	    extra_configs (Optional[dict]): Extra configurations passed as a dictionary.
 	    ids_to_pop_from_dataset (Optional[list]): List of IDs to remove from the dataset.
 	    remove_ckpt_after_load (bool): Remove checkpoint files after loading the model.
 	    configs_to_initialize_model_class (Optional[dict]): Configurations used to initialize the model class.
@@ -129,7 +107,6 @@ class TrainingArguments:
 	    loss_chunk (int): Chunk size for loss computation.
 	    truncation_mode (Literal["keep_end", "keep_start"]): Truncation mode for handling long sequences.
 	    warmup_steps (int): Number of warm-up steps for the scheduler.
-	    init_input_shape (Tuple[int, int]): Initial input shape for model initialization.
 	    step_partition_spec (PartitionSpec): Partition specification for stepping the optimizer.
 	    training_time (Optional[str]): Maximum training time in the format "50min" or "23h".
 	    dataloader_num_workers (Optional[int]): Number of workers for the dataloader.
@@ -141,11 +118,9 @@ class TrainingArguments:
 	    step_start_point (Optional[int]): Starting step for training (resuming from checkpoint).
 	    verbose (bool): Print verbose logs during training.
 	    offload_device (jax.Device): Device to offload computations to.
-	    rapture_config (Optional[LoraRaptureConfig]): Configuration for XRapTure (LoRA).
 			pruning_module (Optional[AVAILABLE_PRUNING_TYPE]): Configuration Pruning Module.
 			sparse_module_type (AVAILABLE_SPARSE_MODULE_TYPES): sparse model type to be used to prune the params.
 			sparsify_module (bool): whenever to use sparse apply method for faster and better training.
-	    merge_lora_rapture_parameters (bool): Merge LoRA parameters with model parameters.
 	    state_apply_fn_kwarguments_to_model (Optional[dict]): Keyword arguments for the model's apply function.
 	    remove_unused_columns (bool): Remove unused columns from the dataset.
 	    force_batch_and_gradient_accumulation_steps_calculation (bool): Force calculation of batch and gradient accumulation steps.
@@ -211,7 +186,6 @@ class TrainingArguments:
 		EasyDeLGradientCheckPointers.NONE
 	)
 	max_sequence_length: Optional[int] = 4096
-	sharding_array: Union[tuple, int] = (1, -1, 1, 1)
 	is_fine_tuning: bool = True
 	do_train: bool = True
 	do_eval: bool = False
@@ -221,12 +195,7 @@ class TrainingArguments:
 	save_steps: Optional[int] = None
 	save_dir: str = "EasyDeL-Checkpoints"
 	save_total_limit: Optional[int] = None
-	dtype: jnp.dtype = jnp.bfloat16
-	param_dtype: jnp.dtype = jnp.bfloat16
-	fully_sharded_data_parallel: bool = True
 	use_wandb: bool = True
-	custom_rule: Optional[Dict[str, PartitionSpec]] = None
-	extra_configs: Optional[dict] = None
 	ids_to_pop_from_dataset: Optional[list] = field(default_factory=list)
 	remove_ckpt_after_load: bool = False
 	configs_to_initialize_model_class: Optional[dict] = None
@@ -237,7 +206,6 @@ class TrainingArguments:
 	loss_chunk: int = 1024
 	truncation_mode: Literal["keep_end", "keep_start"] = "keep_end"
 	warmup_steps: int = 500
-	init_input_shape: Tuple[int, int] = (1, 1)
 	step_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp")
 	training_time: Optional[str] = None
 	dataloader_num_workers: Optional[int] = 0
@@ -249,11 +217,9 @@ class TrainingArguments:
 	step_start_point: Optional[int] = None
 	verbose: bool = True
 	offload_device: jax.Device = jax.devices("cpu")[0]
-	rapture_config: Optional[LoraRaptureConfig] = None
 	pruning_module: AVAILABLE_PRUNING_TYPE = None
 	sparsify_module: bool = False
 	sparse_module_type: AVAILABLE_SPARSE_MODULE_TYPES = "bcoo"
-	merge_lora_rapture_parameters: bool = True
 	state_apply_fn_kwarguments_to_model: Optional[dict] = None
 	remove_unused_columns: bool = True
 	force_batch_and_gradient_accumulation_steps_calculation: bool = False
@@ -304,9 +270,7 @@ class TrainingArguments:
 		Determines the number of available devices and sets up the device mesh.
 		"""
 		self.available_backends = len(jax.devices(self.backend))
-		self.array_devices_shape = (
-			jnp.ones((self.available_backends, 1)).reshape(self.sharding_array).shape
-		)
+
 		JaxDistributedConfig.initialize(self.jax_distributed_config)
 
 	def _setup_optimizer(self):
@@ -340,19 +304,6 @@ class TrainingArguments:
 
 		self._stop_capturing_memory = False
 		self._captured_memory = {}
-
-	def _setup_rapture(self):
-		"""
-		Sets up XRapTure (LoRA) if enabled in the configuration.
-		Initializes the XRapTure instance with the provided configuration.
-		"""
-		if self.rapture_config is not None:
-			if self.log_grad_norms:
-				warnings.warn("Gradient norm logging disabled when using LoRA", stacklevel=1)
-				self.log_grad_norms = False
-			self.rapture = LoraRapture(config=self.rapture_config)
-		else:
-			self.rapture = None
 
 	def _ensure_variables(self):
 		"""
@@ -395,28 +346,6 @@ class TrainingArguments:
 		path = self.get_path()
 		path.mkdir(parents=True, exist_ok=True)
 
-	def get_mesh(self):
-		"""
-		Returns the JAX device mesh, used for distributed training.
-
-		Returns:
-		    jax.sharding.Mesh: The JAX device mesh.
-		"""
-		from jax.experimental.mesh_utils import create_device_mesh
-		from jax.sharding import Mesh
-
-		return Mesh(create_device_mesh(self.array_devices_shape), self.get_mesh_names())
-
-	@staticmethod
-	def get_mesh_names():
-		"""
-		Returns the names of the mesh dimensions.
-
-		Returns:
-		    tuple: A tuple containing the names of the mesh dimensions.
-		"""
-		return "dp", "fsdp", "tp", "sp"
-
 	def get_optimizer_and_scheduler(self, steps: Optional[int] = None):
 		"""
 		Returns the configured optimizer and learning rate scheduler.
@@ -442,10 +371,10 @@ class TrainingArguments:
 		"""
 		import os.path
 
-		from fjformer.checkpoint import CheckpointManager
+		from easydel.utils.checkpoint_managers import CheckpointManager
 
 		return CheckpointManager(
-			os.path.join(self.save_dir, self.model_name),
+			checkpoint_dir=os.path.join(self.save_dir, self.model_name),
 			save_optimizer_state=self.save_optimizer_state,
 			verbose=self.verbose,
 		)
@@ -484,7 +413,7 @@ class TrainingArguments:
 		return wandb.init(
 			project=f"EasyDeL-{self.model_name}",
 			config=self.to_dict(),
-			tags=["EasyDeL", "FJFormer", "OST-OpenSourceTransformers", "Jax/Flax"],
+			tags=["EasyDeL", "Jax/Flax"],
 			entity=self.wandb_entity,
 		)
 
@@ -497,7 +426,15 @@ class TrainingArguments:
 	def log_metrics(
 		self,
 		metrics: Dict[
-			str, Union[float, List, Tuple, np.ndarray, "jnp.ndarray", "torch.Tensor"]  # type: ignore # noqa: F821
+			str,
+			Union[
+				float,
+				List,
+				Tuple,
+				np.ndarray,
+				"jnp.ndarray",
+				"torch.Tensor",  # type: ignore # noqa: F821
+			],
 		],
 		step: int,
 	):
