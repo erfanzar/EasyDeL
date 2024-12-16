@@ -163,12 +163,12 @@ class EasyModelsTest(unittest.TestCase):
 
 			torch_input_ids, jax_input_ids = self.make_input_id(
 				self.vocab_size,
-				(self.batch_size, self.sequence_length + 1),
+				(self.batch_size, self.sequence_length),
 			)
 			torch_time = time.time()
 			hf_output = hf_model(
-				input_ids=torch_input_ids[:, :-1],
-				labels=torch_input_ids[:, 1:],
+				input_ids=torch_input_ids,
+				labels=torch_input_ids,
 				past_key_values=None,
 			)
 			torch_time = time.time() - torch_time
@@ -185,19 +185,15 @@ class EasyModelsTest(unittest.TestCase):
 
 			@jax.jit
 			def jited(ids):
-				return ed_model(
-					input_ids=ids[:, :-1],
-					return_dict=True,
+				return ed_model.compute_loss(
+					input_ids=ids,
+					labels=ids,
 				)
 
 			ed_output = jited(jax_input_ids)
 			easy_time = time.time()
 			ed_output = jited(jax_input_ids)
 			easy_time = time.time() - easy_time
-			loss, _ = cross_entropy_loss_and_accuracy(
-				ed_output.logits,
-				jax_input_ids[:, 1:],
-			)
 
 			del params
 			del hf_model
@@ -206,7 +202,6 @@ class EasyModelsTest(unittest.TestCase):
 				module_name,
 				hf_output,
 				ed_output,
-				loss,
 				easy_time=easy_time,
 				torch_time=torch_time,
 			)
@@ -715,7 +710,6 @@ class EasyModelsTest(unittest.TestCase):
 		name,
 		hf_out,
 		ed_out,
-		ed_loss,
 		atol: float = 0.125,
 		rtol: float = 0,
 		easy_time: float = None,
@@ -723,6 +717,7 @@ class EasyModelsTest(unittest.TestCase):
 	):
 		to, jo = hf_out.logits.cpu().detach().numpy(), ed_out.logits
 		err = jnp.mean(to) - jnp.mean(jo)
+		ed_loss = ed_out.loss
 		hf_loss = hf_out.loss.cpu().detach().numpy()
 		all_close = jnp.allclose(to, jo, atol=atol, rtol=rtol)
 		all_close_loss = jnp.allclose(hf_loss, ed_loss, atol=0.125, rtol=0)

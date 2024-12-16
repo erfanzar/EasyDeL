@@ -13,9 +13,12 @@
 # limitations under the License.
 from __future__ import annotations
 
+import re
 import typing as tp
 from functools import cached_property
+import warnings
 
+import chex
 import jax
 import jax.extend
 import jax.tree_util
@@ -24,6 +27,7 @@ from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import Mesh
+from numpy import float32
 from transformers.generation.flax_utils import FlaxSampleOutput
 
 from easydel.etils.etils import (
@@ -32,6 +36,7 @@ from easydel.etils.etils import (
 )
 from easydel.inference.logits_process import FlaxLogitsProcessorList
 from easydel.infra.base_config import EasyDeLBaseConfig
+from easydel.infra.loss_utils import LOSS_MAPPING, LossConfig, LossFnOutput
 from easydel.infra.mixins import (
 	BaseModuleProtocol,
 	EasyBridgeMixin,
@@ -44,7 +49,10 @@ from easydel.utils.traversals import (
 )
 
 PartitionLike = tp.Optional[
-	tp.Union[tp.Mapping[str, tp.Callable], tp.Mapping[tuple, tp.Callable]]
+	tp.Union[
+		tp.Mapping[str, tp.Callable],
+		tp.Mapping[tuple, tp.Callable],
+	]
 ]
 
 
@@ -55,7 +63,6 @@ _CP = tp.TypeVar("CP")
 
 
 class EasyDeLBaseModule(
-	nn.Module,
 	BaseModuleProtocol,
 	EasyBridgeMixin,
 	EasyGenerationMixin,
@@ -126,6 +133,37 @@ class EasyDeLBaseModule(
 	def frequencies(self) -> jnp.ndarray:
 		"""Returns frequency values from the config."""
 		return self.config.get_basic_frequencies()
+
+	@property
+	def module_dtype(self) -> jnp.dtype:
+		params_state = nn.split(self, nn.Param, ...)[1].flat_state()
+		return jax.tree_util.tree_leaves(params_state)[0].dtype
+
+	def half(self) -> EasyDeLBaseModule:
+		return self._reformat_dtype(jnp.float16)
+
+	def float(self) -> EasyDeLBaseModule:
+		return self._reformat_dtype(jnp.float32)
+
+	def _reformat_dtype(self, dtype) -> EasyDeLBaseModule:
+		gdef, gtree, others = nn.split(self, nn.Param, ...)
+
+		def _map(array):
+			if array.dtype in [
+				jnp.bfloat16,
+				jnp.float16,
+				jnp.float32,
+				jnp.float64,
+				jnp.float_,
+			]:
+				array = array.astype(dtype)
+			return array
+
+		gtree = jax.tree_util.tree_map(_map, gtree)
+		self = nn.merge(gdef, gtree, others)
+		self.dtype = dtype
+		self.param_dtype = dtype
+		return self
 
 	def _get_mesh(self, mesh: tp.Optional[Mesh] = None) -> Mesh:
 		"""Retrieves the mesh, either from the provided argument or the config."""
@@ -244,19 +282,56 @@ class EasyDeLBaseModule(
 			quantization_pattern=quantization_pattern,
 		)
 
-	# def __repr__(self):
-	#   """Provides a human-readable string representation of the module."""
-	#   return (
-	#     f"{self.__class__.__name__}(\n"
-	#     f"  model_type={self.model_type},\n"
-	#     f"  model_task={self.model_task},\n"
-	#     f"  config={self.config},\n"
-	#     f"  dtype={self.dtype},\n"
-	#     f"  param_dtype={self.param_dtype}\n"
-	#     f")"
-	#   )
+	@cached_property
+	def loss_function(self):
+		if getattr(self.config, "loss_type", None) is not None:
+			loss_type = self.config.loss_type
+		else:
+			loss_type = self.__class__.__name__
+			if loss_type not in LOSS_MAPPING:
+				loss_groups = f"({'|'.join(LOSS_MAPPING)})"
+				loss_type = re.findall(loss_groups, self.__class__.__name__)
+				if len(loss_type) > 0:
+					loss_type = loss_type[0]
+				else:
+					loss_type = None
+		if (
+			loss_type is None
+			or loss_type not in LOSS_MAPPING
+			and getattr(self.config, "loss_type", None) is not None
+		):
+			warnings.warn(
+				f"`loss_type={loss_type}` was set in the config but it is unrecognised."
+				f"Using the default loss: `ForCausalLMLoss`.",
+				stacklevel=1,
+			)
+			loss_type = "ForCausalLM"
+		return LOSS_MAPPING[loss_type]
 
-	# __str__ = __repr__
+	def compute_loss(
+		self,
+		labels: tp.Optional[chex.Array] = None,
+		loss_config: tp.Optional[LossConfig] = None,
+		loss_kwargs: tp.Optional[tp.Dict] = None,
+		**batch,
+	):
+		if labels is None and self._model_task == "causal-language-model":
+			labels = batch.get("input_ids", None)
+		assert labels is not None, "`labels` can not be `None` for computing loss."
+		loss_kwargs = loss_kwargs or {}
+		batch.pop("return_dict", None)
+		outputs = self(**batch, return_dict=True)
+		loss_output: LossFnOutput = self.loss_function(
+			logits=outputs.logits,
+			labels=labels,
+			loss_config=loss_config,
+			**loss_kwargs,
+		)
+		if hasattr(outputs, "aux_loss"):
+			if outputs.aux_loss is not None:
+				loss_output.loss = loss_output.loss + outputs.aux_loss
+		outputs = outputs.replace(loss=loss_output.loss)
+		return outputs
 
 
 class EasyDeLBaseVisionModule(EasyDeLBaseModule):
@@ -443,7 +518,7 @@ class EasyDeLBaseVisionModule(EasyDeLBaseModule):
 
 				new_generation_config = GenerationConfig.from_model_config(self.config)
 				if new_generation_config != self.generation_config:
-					logger.warn(
+					warnings.warn(
 						"You have modified the pretrained model configuration to control generation. This is a"
 						" deprecated strategy to control generation and will be removed soon, in a future version."
 						" Please use and modify the model generation configuration (see"
@@ -473,14 +548,14 @@ class EasyDeLBaseVisionModule(EasyDeLBaseModule):
 			and generation_config.eos_token_id is not None
 		):
 			if model_kwargs.get("attention_mask") is None:
-				logger.warn(
+				warnings.warn(
 					"The attention mask and the pad token id were not set. As a consequence, you may observe "
 					"unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results."
 				)
 			eos_token_id = generation_config.eos_token_id
 			if isinstance(eos_token_id, list):
 				eos_token_id = eos_token_id[0]
-			logger.warn(
+			warnings.warn(
 				f"Setting `pad_token_id` to `eos_token_id`:{eos_token_id} for open-end generation."
 			)
 			generation_config.pad_token_id = eos_token_id
@@ -499,7 +574,7 @@ class EasyDeLBaseVisionModule(EasyDeLBaseModule):
 				generation_config.pad_token_id is not None
 				and jnp.sum(input_ids[:, -1] == generation_config.pad_token_id) > 0
 			):
-				logger.warn(
+				warnings.warn(
 					"A decoder-only architecture is being used, but right-padding was detected! For correct "
 					"generation results, please set `padding_side='left'` when initializing the tokenizer."
 				)
@@ -531,7 +606,7 @@ class EasyDeLBaseVisionModule(EasyDeLBaseModule):
 			and generation_config.max_length == 20
 		):
 			# 20 is the default max_length of the generation config
-			logger.warn(
+			warnings.warn(
 				f"Using the model-agnostic default `max_length` (={generation_config.max_length}) "
 				"to control the generation length.  recommend setting `max_new_tokens` to control"
 				" the maximum length of the generation.",
@@ -539,7 +614,7 @@ class EasyDeLBaseVisionModule(EasyDeLBaseModule):
 			)
 		elif generation_config.max_new_tokens is not None:
 			if not has_default_max_length and generation_config.max_length is not None:
-				logger.warn(
+				warnings.warn(
 					f"Both `max_new_tokens` (={generation_config.max_new_tokens}) and `max_length`(="
 					f"{generation_config.max_length}) seem to have been set. `max_new_tokens` will take precedence. "
 					"Please refer to the documentation for more information. "
@@ -561,7 +636,7 @@ class EasyDeLBaseVisionModule(EasyDeLBaseModule):
 			input_ids_string = (
 				"decoder_input_ids" if self.config.is_encoder_decoder else "input_ids"
 			)
-			logger.warn(
+			warnings.warn(
 				f"Input length of {input_ids_string} is {input_ids_seq_length}, but `max_length` is set to"
 				f" {generation_config.max_length}. This can lead to unexpected behavior. You should consider"
 				" increasing`max_new_tokens`."
@@ -594,69 +669,3 @@ class EasyDeLBaseVisionModule(EasyDeLBaseModule):
 			raise NotImplementedError
 		else:
 			raise NotImplementedError("`Beam sampling is currently not implemented.")
-
-
-M = tp.TypeVar("M", bound=nn.Module)
-
-
-def wrap_easydel_module(
-	config_class: tp.Type[EasyDeLBaseConfig],
-	base_model_prefix: str = "model",
-):
-	def wrapper(mdl: tp.Type[M]) -> tp.Type[EasyDeLBaseModule]:
-		class_dict = {
-			"config_class": config_class,
-			"base_model_prefix": base_model_prefix,
-			"__annotations__": {
-				"config_class": tp.Type[EasyDeLBaseConfig],
-				"base_model_prefix": str,
-				"flax_module": tp.Type[M],
-				"module_class": tp.Union[nn.Module, tp.Type[M]],
-			},
-		}
-
-		for name, attr in mdl.__dict__.items():
-			if not name.startswith("__"):
-				class_dict[name] = attr
-
-		WrappedModule = type(mdl.__name__, (EasyDeLBaseModule,), class_dict)
-		WrappedModule.__module__ = mdl.__module__
-		WrappedModule.__qualname__ = mdl.__qualname__
-		WrappedModule.__doc__ = mdl.__doc__
-
-		return WrappedModule
-
-	return wrapper
-
-
-def wrap_custom_easydel_module(
-	base,
-	config_class: tp.Type[EasyDeLBaseConfig],
-	base_model_prefix: str = "model",
-):
-	def wrapper(mdl: tp.Type[M]) -> tp.Type[EasyDeLBaseModule]:
-		class_dict = {
-			"config_class": config_class,
-			"base_model_prefix": base_model_prefix,
-			"module_class": mdl,
-			"flax_module": mdl,
-			"__annotations__": {
-				"config_class": tp.Type[EasyDeLBaseConfig],
-				"base_model_prefix": str,
-				"flax_module": tp.Type[M],
-				"module_class": tp.Union[nn.Module, tp.Type[M]],
-			},
-		}
-
-		for name, attr in mdl.__dict__.items():
-			if not name.startswith("__"):
-				class_dict[name] = attr
-
-		WrappedModule = type(mdl.__name__, (base,), class_dict)
-		WrappedModule.__module__ = mdl.__module__
-		WrappedModule.__qualname__ = mdl.__qualname__
-		WrappedModule.__doc__ = mdl.__doc__
-
-		return WrappedModule
-
-	return wrapper
