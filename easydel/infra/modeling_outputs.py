@@ -185,6 +185,7 @@ class FlaxBaseModelOutput(ModelOutput):
 	hidden_states: Optional[Tuple[chex.Array]] = None
 	attentions: Optional[Tuple[chex.Array]] = None
 	past_key_values: Optional[Dict[str, chex.Array]] = None
+	loss: Optional[chex.Array] = None
 
 
 @dataclass
@@ -203,6 +204,7 @@ class FlaxBaseModelOutputWithNoAttention(ModelOutput):
 
 	last_hidden_state: chex.Array = None
 	hidden_states: Optional[Tuple[chex.Array]] = None
+	loss: Optional[chex.Array] = None
 
 
 @dataclass
@@ -224,6 +226,7 @@ class FlaxBaseModelOutputWithPoolingAndNoAttention(ModelOutput):
 	last_hidden_state: chex.Array = None
 	pooler_output: chex.Array = None
 	hidden_states: Optional[Tuple[chex.Array]] = None
+	loss: Optional[chex.Array] = None
 
 
 @dataclass
@@ -243,6 +246,7 @@ class FlaxImageClassifierOutputWithNoAttention(ModelOutput):
 
 	logits: chex.Array = None
 	hidden_states: Optional[Tuple[chex.Array]] = None
+	loss: Optional[chex.Array] = None
 
 
 @dataclass
@@ -273,6 +277,7 @@ class FlaxBaseModelOutputWithPast(ModelOutput):
 	past_key_values: Optional[Dict[str, chex.Array]] = None
 	hidden_states: Optional[Tuple[chex.Array]] = None
 	attentions: Optional[Tuple[chex.Array]] = None
+	loss: Optional[chex.Array] = None
 
 
 @dataclass
@@ -304,6 +309,7 @@ class FlaxBaseModelOutputWithPooling(ModelOutput):
 	pooler_output: chex.Array = None
 	hidden_states: Optional[Tuple[chex.Array]] = None
 	attentions: Optional[Tuple[chex.Array]] = None
+	loss: Optional[chex.Array] = None
 
 
 @dataclass
@@ -353,6 +359,7 @@ class FlaxBaseModelOutputWithPoolingAndCrossAttentions(ModelOutput):
 	past_key_values: Optional[Tuple[Tuple[chex.Array]]] = None
 	attentions: Optional[Tuple[chex.Array]] = None
 	cross_attentions: Optional[Tuple[chex.Array]] = None
+	loss: Optional[chex.Array] = None
 
 
 @dataclass
@@ -399,6 +406,7 @@ class FlaxBaseModelOutputWithPastAndCrossAttentions(ModelOutput):
 	hidden_states: Optional[Tuple[chex.Array]] = None
 	attentions: Optional[Tuple[chex.Array]] = None
 	cross_attentions: Optional[Tuple[chex.Array]] = None
+	loss: Optional[chex.Array] = None
 
 
 @dataclass
@@ -460,6 +468,7 @@ class FlaxSeq2SeqModelOutput(ModelOutput):
 	encoder_last_hidden_state: Optional[chex.Array] = None
 	encoder_hidden_states: Optional[Tuple[chex.Array]] = None
 	encoder_attentions: Optional[Tuple[chex.Array]] = None
+	loss: Optional[chex.Array] = None
 
 
 @dataclass
@@ -501,6 +510,7 @@ class FlaxCausalLMOutputWithCrossAttentions(ModelOutput):
 	hidden_states: Optional[Tuple[chex.Array]] = None
 	attentions: Optional[Tuple[chex.Array]] = None
 	cross_attentions: Optional[Tuple[chex.Array]] = None
+	loss: Optional[chex.Array] = None
 
 
 @dataclass
@@ -528,6 +538,7 @@ class FlaxMaskedLMOutput(ModelOutput):
 	hidden_states: Optional[Tuple[chex.Array]] = None
 	attentions: Optional[Tuple[chex.Array]] = None
 	past_key_values: Optional[TransformerCache] = None
+	loss: Optional[chex.Array] = None
 
 
 FlaxCausalLMOutput = FlaxMaskedLMOutput
@@ -588,6 +599,7 @@ class FlaxSeq2SeqLMOutput(ModelOutput):
 	encoder_last_hidden_state: Optional[chex.Array] = None
 	encoder_hidden_states: Optional[Tuple[chex.Array]] = None
 	encoder_attentions: Optional[Tuple[chex.Array]] = None
+	loss: Optional[chex.Array] = None
 
 
 @dataclass
@@ -615,6 +627,7 @@ class FlaxNextSentencePredictorOutput(ModelOutput):
 	logits: chex.Array = None
 	hidden_states: Optional[Tuple[chex.Array]] = None
 	attentions: Optional[Tuple[chex.Array]] = None
+	loss: Optional[chex.Array] = None
 
 
 @dataclass
@@ -641,6 +654,7 @@ class FlaxSequenceClassifierOutput(ModelOutput):
 	logits: chex.Array = None
 	hidden_states: Optional[Tuple[chex.Array]] = None
 	attentions: Optional[Tuple[chex.Array]] = None
+	loss: Optional[chex.Array] = None
 
 
 @dataclass
@@ -698,6 +712,7 @@ class FlaxSeq2SeqSequenceClassifierOutput(ModelOutput):
 	encoder_last_hidden_state: Optional[chex.Array] = None
 	encoder_hidden_states: Optional[Tuple[chex.Array]] = None
 	encoder_attentions: Optional[Tuple[chex.Array]] = None
+	loss: Optional[chex.Array] = None
 
 
 @dataclass
@@ -726,6 +741,7 @@ class FlaxMultipleChoiceModelOutput(ModelOutput):
 	logits: chex.Array = None
 	hidden_states: Optional[Tuple[chex.Array]] = None
 	attentions: Optional[Tuple[chex.Array]] = None
+	loss: Optional[chex.Array] = None
 
 
 @dataclass
@@ -752,6 +768,7 @@ class FlaxTokenClassifierOutput(ModelOutput):
 	logits: chex.Array = None
 	hidden_states: Optional[Tuple[chex.Array]] = None
 	attentions: Optional[Tuple[chex.Array]] = None
+	loss: Optional[chex.Array] = None
 
 
 @dataclass
@@ -781,6 +798,7 @@ class FlaxQuestionAnsweringModelOutput(ModelOutput):
 	end_logits: chex.Array = None
 	hidden_states: Optional[Tuple[chex.Array]] = None
 	attentions: Optional[Tuple[chex.Array]] = None
+	loss: Optional[chex.Array] = None
 
 
 @dataclass
@@ -841,6 +859,7 @@ class FlaxSeq2SeqQuestionAnsweringModelOutput(ModelOutput):
 	encoder_last_hidden_state: Optional[chex.Array] = None
 	encoder_hidden_states: Optional[Tuple[chex.Array]] = None
 	encoder_attentions: Optional[Tuple[chex.Array]] = None
+	loss: Optional[chex.Array] = None
 
 
 @dataclass
@@ -873,6 +892,7 @@ class MoeModelOutput(FlaxMaskedLMOutput):
 	attentions: Optional[Tuple[chex.Array]] = None
 	router_logits: Optional[Tuple[chex.Array]] = None
 	all_router_losses: Optional[Tuple[chex.Array]] = None
+	loss: Optional[chex.Array] = None
 
 
 @dataclass
@@ -885,13 +905,13 @@ class MoeCausalLMOutput(FlaxMaskedLMOutput):
 	        Auxiliary loss used for training MoE models.
 	    router_logits (`tuple(chex.Array)`, *optional*):
 	        Tuple of `chex.Array` (one for each layer) of shape `(batch_size, sequence_length, num_experts)`.
-
 	        The logits output of the router network, which are used to compute the mixture of experts.
 	"""
 
 	aux_loss: Optional[chex.Array] = None
 	router_logits: Optional[Tuple[chex.Array]] = None
 	all_router_losses: Optional[Tuple[chex.Array]] = None
+	loss: Optional[chex.Array] = None
 
 
 @dataclass
@@ -899,6 +919,7 @@ class MambaOutput(FlaxBaseModelOutput):
 	last_hidden_state: chex.Array = None
 	cache_params: Optional[List[chex.Array]] = None
 	hidden_states: Optional[Tuple[chex.Array]] = None
+	loss: Optional[chex.Array] = None
 
 
 @dataclass
@@ -906,6 +927,7 @@ class MambaCausalLMOutput(FlaxBaseModelOutput):
 	logits: chex.Array = None
 	cache_params: Optional[List[chex.Array]] = None
 	hidden_states: Optional[Tuple[chex.Array]] = None
+	loss: Optional[chex.Array] = None
 
 
 @dataclass

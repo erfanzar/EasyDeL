@@ -23,10 +23,7 @@ from flax.struct import dataclass
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import numpy as jnp
 
-from easydel.infra.base_module import (
-	EasyDeLBaseModule,
-	wrap_custom_easydel_module,
-)
+from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import register_module
 from easydel.infra.modeling_outputs import ModelOutput
 from easydel.modules.rwkv.rwkv_configuration import RwkvConfig as RwkvConfig
@@ -600,11 +597,6 @@ class FlaxRwkvPretrainedModel(EasyDeLBaseModule):
 	layernorm_names=["ln_out", "ln2", "ln1", "pre_ln"],
 	rnn_based_or_rwkv=True,
 )
-@wrap_custom_easydel_module(
-	base=FlaxRwkvPretrainedModel,
-	config_class=RwkvConfig,
-	base_model_prefix="rwkv",
-)
 class FlaxRwkvModel(nn.Module):
 	config: RwkvConfig
 	dtype: jnp.dtype = jnp.float32
@@ -726,11 +718,6 @@ class FlaxRwkvModel(nn.Module):
 	embedding_layer_names=["embed_tokens"],
 	layernorm_names=["ln_out", "ln2", "ln1", "pre_ln"],
 	rnn_based_or_rwkv=True,
-)
-@wrap_custom_easydel_module(
-	base=FlaxRwkvPretrainedModel,
-	config_class=RwkvConfig,
-	base_model_prefix="rwkv",
 )
 class FlaxRwkvForCausalLM(nn.Module):
 	config: RwkvConfig

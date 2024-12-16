@@ -1788,6 +1788,7 @@ class FlaxAttentionModule(nn.Module):
 				)
 				if attention_mask.ndim == 2:
 					attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+
 				attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
 				attention_mask = nn.combine_masks(attention_mask, causal_mask, fcm_mask)
 

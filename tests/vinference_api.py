@@ -19,13 +19,12 @@ PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
 def main():
 	sharding_axis_dims = (1, 1, 1, -1)
-	max_length = 2048
-	pretrained_model_name_or_path = "EasyDeL/EasyDeL-Llama-3.2-1B-Instruct"
+	max_length = 6144
+	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
 	dtype = jnp.float16
 	partition_axis = ed.PartitionAxis()
-	model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		pretrained_model_name_or_path,
-		input_shape=(len(jax.devices()), max_length),
 		auto_shard_model=True,
 		sharding_axis_dims=sharding_axis_dims,
 		config_kwargs=ed.EasyDeLBaseConfigDict(
@@ -35,9 +34,8 @@ def main():
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
-			quantize_kv_cache=True,
 		),
-		quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
+		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 		platform=ed.EasyDeLPlatforms.TRITON,
 		partition_axis=partition_axis,
 		param_dtype=dtype,
@@ -48,10 +46,9 @@ def main():
 	tokenizer.pad_token_id = tokenizer.eos_token_id
 	inference = ed.vInference(
 		model=model,
-		params=params,
 		tokenizer=tokenizer,
 		generation_config=ed.vInferenceConfig(
-			max_new_tokens=256,
+			max_new_tokens=2048,
 			temperature=model.generation_config.temperature,
 			top_p=model.generation_config.top_p,
 			top_k=model.generation_config.top_k,

@@ -16,7 +16,7 @@ import functools
 import re
 import warnings
 from functools import partial
-from typing import Any, Dict, Literal, Optional, Sequence, Union
+from typing import Any, Dict, Literal, Optional, Union
 
 import chex
 import fjformer
@@ -28,11 +28,8 @@ import jax.tree_util
 from aqt.jax.v2 import config as q_config
 from aqt.jax.v2.flax import aqt_flax as q_flax
 from einops import rearrange
-from flax import nnx
 from flax import nnx as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
-from jax.experimental.mesh_utils import create_device_mesh
-from jax.interpreters import pxla
 from tqdm.auto import tqdm
 
 from easydel.etils.errors import EasyDeLBlockWiseFFNError
@@ -76,20 +73,16 @@ ROPE_TYPES = Optional[
 	]
 ]
 
+
+
 with_sharding_constraint = fjformer.with_sharding_constraint
-
-
-class MaskVariable(nnx.Variable): ...
-
-
-class FrequenciesVariable(nnx.Variable): ...
 
 
 def canonicalize_dtype(
 	*args,
-	dtype: Optional[chex.ArrayDType] = None,  # type:ignore
+	dtype: Optional[jax.numpy.dtype] = None,
 	inexact: bool = True,
-) -> chex.ArrayDType:  # type:ignore
+) -> jax.numpy.dtype:
 	"""Canonicalize an optional dtype to the definitive dtype.
 
 	If the ``dtype`` is None this function will infer the dtype. If it is not
@@ -119,58 +112,10 @@ def canonicalize_dtype(
 	return dtype
 
 
-def get_names_from_partition_spec(partition_specs):
-	"""The get_names_from_partition_spec function takes a partition_specs argument, which is either a dictionary or list.
-	If it's a dictionary, the function converts it to a list of values. Then for each item in the partition_specs list:
-	    If the item is None, continue (do nothing) and move on to next iteration of loop.
-	    If the item is an instance of str (i.e., if it's just one string), add that string to names set and move
-	    on to next iteration of loop.
-	    Otherwise, (if not None or str), call get_names_from_partition_spec recurs
-
-	Args:
-	    partition_specs: Define the partitioning of a table
-
-	Returns:
-	    A list of the names of all partitions
-	"""
-	names = set()
-	if isinstance(partition_specs, dict):
-		partition_specs = partition_specs.values()
-	for item in partition_specs:
-		if item is None:
-			continue
-		elif isinstance(item, str):
-			names.add(item)
-		else:
-			names.update(get_names_from_partition_spec(item))
-
-	return list(names)
-
-
-def names_in_mesh(*names):
-	"""The names_in_mesh function is a decorator that can be used to check whether
-	the names of the axes passed into a function are valid.  It will raise an
-	exception if any of the axis names are not in the physical mesh.  For example,
-	if you have a function that takes two axes as arguments, and you want to make sure they're both in your mesh:
-
-	Args:
-	    *names: Collect all the names passed to the function into a
-	        tuple
-
-	Returns:
-	    A boolean indicating whether all the given
-	"""
-	return set(names) <= set(pxla.thread_resources.env.physical_mesh.axis_names)
-
-
 def get_gradient_checkpoint_policy(name):
 	"""
 	The get_gradient_checkpoint_policy function is a helper function that returns the gradient checkpoint policy
-	    specified by the name parameter.
-
-	:param name: Select the checkpoint policy from the dictionary
-	:return: A function that is used in the jax
-
+	specified by the name parameter.
 	"""
 	gradients = dict(
 		everything_saveable=jax.checkpoint_policies.everything_saveable,
@@ -185,54 +130,6 @@ def get_gradient_checkpoint_policy(name):
 		save_from_both_policies=jax.checkpoint_policies.save_from_both_policies,
 	)
 	return gradients[name]
-
-
-def get_ranks_and_size(mesh):
-	"""The get_ranks_and_size function is used to determine the number of MPI processes
-	(``mp_node_size``) and the number of devices per process (``dp_node_size``).
-	The ``mesh.shape[mp]`` determines how many MPI processes are needed,
-	and then we divide that by the local device count to get ``mp_node_size = max( 1, mp / jax.local )`.
-	This means that if there are more than enough devices for all MPI ranks on a node, each rank will only use one device; otherwise it will use
-
-	Args:
-	    mesh: Get the shape of the mesh
-
-	Returns:
-	    A dictionary with the following keys:
-	"""
-	out = dict(mesh=mesh)
-	total_process_size = mesh.shape["tp"] * mesh.shape["sp"]
-	mp_node_size = max(1, total_process_size // jax.local_device_count())
-	dp_node_size = jax.process_count() // mp_node_size
-	out.update(mp_node_size=mp_node_size, dp_node_size=dp_node_size)
-
-	dp_node_rank = jax.process_index() // mp_node_size
-	mp_node_rank = jax.process_index() % mp_node_size
-	out.update(dp_node_rank=dp_node_rank, mp_node_rank=mp_node_rank)
-	return out
-
-
-def create_mesh(
-	axis_dims: Sequence[int] = (1, -1, 1, 1),
-	axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-	backend="",
-):
-	"""The create_mesh function creates a mesh object that can be used to shard arrays.
-
-	Args:
-	    axis_dims: Sequence[int]: Specify the dimensions of the mesh
-	    axis_names: Sequence[str]: Name the axes of the mesh
-	    backend: Specify the backend to use
-
-	Returns:
-	    A mesh object
-	"""
-	array_devices = jax.numpy.ones(
-		(len(jax.devices() if backend == "" else jax.devices(backend)), 1)
-	)
-	resh = array_devices.reshape(axis_dims).shape
-
-	return jax.sharding.Mesh(create_device_mesh(resh), axis_names)
 
 
 def add_start_docstrings(*docstr):
@@ -319,48 +216,6 @@ def block_wise_ffn(remat_ffn, inputs, chunk_size: int, deterministic: bool):
 			"model config or in config_kwargs in AutoEasyDeLModelForCausalLM or change `scan_mlp_chunk_size` "
 			f"in configs for more information read Docs.\nOriginal Error\n{e}"
 		) from e
-
-
-def read_depth(params: dict, path: str | None = None, state: dict | None = None):
-	if state is None:
-		state = {}
-	for key, value in params.items():
-		if isinstance(value, dict):
-			accureated_path = path + "/" + key if path is not None else key
-			state = read_depth(
-				params[key], path=key if path is None else accureated_path, state=state
-			)
-		else:
-			value_string = type(value).__name__ + f"(shape={value.shape})"
-			state[path] = value_string
-	return state
-
-
-def get_maximum_depths(dictionary: dict):
-	maximums = {}
-	minimums = {}
-	for k, _ in dictionary.items():
-		splits = k.split("/")
-		for index, split in enumerate(splits):
-			try:
-				split = int(split)
-				if str(index) in maximums.keys():
-					current = maximums[str(index)]
-					if current < split:
-						maximums[str(index)] = split
-				else:
-					maximums[str(index)] = split
-				if str(index) in minimums.keys():
-					split = int(split)
-					if str(index) in minimums.keys():
-						current = minimums[str(index)]
-						if current > split:
-							minimums[str(index)] = split
-				else:
-					minimums[str(index)] = split
-			except ValueError:
-				...
-	return maximums, minimums
 
 
 def control_mlp_sharding(x: jax.Array, partition_axis: PartitionAxis):
@@ -501,7 +356,6 @@ def apply_sparsity_to_params(
 
 	def filter_params(path, array):
 		layer_name = ".".join(path[0].key)
-		# print(layer_name)
 		if layer_name.endswith("kernel") and 4 > array.ndim > 1:
 			array = sparser.fromdense(array)
 		return array
