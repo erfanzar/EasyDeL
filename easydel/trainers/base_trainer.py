@@ -19,9 +19,7 @@ import sys
 import threading
 import time
 import warnings
-from abc import ABC, abstractmethod
-from collections import defaultdict
-from dataclasses import dataclass
+from abc import abstractmethod
 from glob import glob
 from logging import warning
 from pathlib import Path
@@ -33,10 +31,7 @@ import jax
 import numpy as np
 import termcolor
 import tqdm
-from fjformer.checkpoint import CheckpointManager
 from flax.core import unfreeze
-from jax.sharding import Mesh
-from optax import GradientTransformation, Schedule
 
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLTimerError
@@ -46,81 +41,29 @@ try:
 except ImportError:
 	wandb = None
 
-from jax import numpy as jnp
 
 from easydel import __version__
 from easydel.etils.etils import get_logger
 from easydel.infra.base_module import (
-	EasyDeLBaseConfig,
 	EasyDeLBaseModule,
 )
 from easydel.smi import get_capacity_matrix, initialise_tracking
 from easydel.trainers.training_configurations import TrainingArguments
 from easydel.utils import Timers
+from easydel.trainers.trainer_protocol import (
+	BaseTrainerProtocol,
+	EasyDeLBaseModule,
+	EasyDeLState,
+	TrainerConfigureDataloaderOutput,
+	TrainerConfigureModelOutput,
+	TrainerConfigureFunctionOutput,
+	TrainerOutput,
+)
 
 logger = get_logger(__name__)
 
 
-@dataclass
-class TrainerConfigureDataloaderOutput:
-	dataloader_train: Iterator[np.ndarray]
-	max_training_steps: int
-	dataloader_eval: Optional[Iterator[np.ndarray]] = None
-	max_evaluation_steps: Optional[int] = None
-
-
-@dataclass
-class TrainerConfigureModelOutput:
-	model: EasyDeLBaseModule
-	tx: GradientTransformation
-	scheduler: Schedule
-	config: Optional[EasyDeLBaseConfig] = None
-
-
-@dataclass
-class TrainerConfigureFunctionOutput:
-	create_sharded_state_from_params_function: Callable
-	sharded_train_step_function: Callable
-	mesh: Mesh
-	checkpoint_manager: CheckpointManager
-	initialize_state_function: Callable
-	sharded_eval_step_function: Optional[Callable] = None
-
-
-@dataclass
-class TrainerOutput:
-	state: EasyDeLState
-	mesh: Optional[jax.sharding.Mesh]
-	checkpoint_manager: Any
-	gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None
-	shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None
-	last_save_file_name: Optional[str] = None
-	checkpoint_path: Optional[str] = None
-
-
-def get_layer_names(frozen_dict, prefix=""):
-	"""
-	Recursively retrieves layer names and their corresponding parameter arrays from a FrozenDict.
-
-	Args:
-			frozen_dict (FrozenDict): The FrozenDict containing the model parameters.
-			prefix (str, optional): A prefix to add to the layer names. Defaults to "".
-
-	Returns:
-			dict[str, jnp.ndarray]: A dictionary mapping layer names to their parameter arrays.
-	"""
-
-	layer_names = {}
-	for key, value in frozen_dict.items():
-		if isinstance(value, flax.core.FrozenDict):
-			layer_names.update(get_layer_names(value, prefix=f"{prefix}_{key}"))
-		else:
-			layer_name = f"{prefix}_{key}".lstrip("/")
-			layer_names[layer_name] = value
-	return layer_names
-
-
-class BaseTrainer(ABC):
+class BaseTrainer(BaseTrainerProtocol):
 	def __init__(
 		self,
 		arguments: Optional[TrainingArguments] = None,
@@ -131,7 +74,8 @@ class BaseTrainer(ABC):
 		checkpoint_path: Optional[Union[str, os.PathLike]] = None,
 		_do_init_fns: bool = True,
 	):
-		assert arguments is not None, "training argument must be passed to Trainers"
+		assert arguments is not None, "training argument must be passed to Trainers."
+		assert model is not None, "Model can not be None and it must be passed to Trainers."
 		self.arguments = arguments
 		self.dataset_train = dataset_train
 		self.dataset_eval = dataset_eval
@@ -251,7 +195,8 @@ class BaseTrainer(ABC):
 
 	def _initialize_timer(self):
 		self.timer = Timers(
-			use_wandb=False, tensorboard_writer=self.arguments.get_tensorboard
+			use_wandb=False,
+			tensorboard_writer=self.arguments.get_tensorboard,
 		)
 
 	def _configure_dataloaders(self):
@@ -284,27 +229,8 @@ class BaseTrainer(ABC):
 			self.tx = model_configurations.tx
 			self.scheduler = model_configurations.scheduler
 			self.config = model_configurations.config
-			self._configure_lora()
+
 		self.timer.log("configure Model, Optimizer, Scheduler and Config")
-
-	def _configure_lora(self):
-		"""
-		Configures LoRA (Low-Rank Adaptation) if enabled in the training arguments.
-
-		This method applies LoRA to the model, sets up the LoRA parameters, apply function,
-		optimizer state, model, and optimizer, and logs the time taken for this configuration.
-		"""
-		if self.rapture is not None:
-			lora_modules = self.rapture.apply_lora(
-				module=self.model,
-				parameters=self.arguments.rapture_config.parameters,
-				tx=self.tx,
-			)
-			self.lora_parameters = lora_modules.lora_parameters
-			self.lora_apply_fn = lora_modules.lora_module.__call__
-			self.lora_opt_state = lora_modules.lora_opt_state
-			self.lora_model = lora_modules.lora_module
-			self.lora_tx = lora_modules.lora_tx
 
 	def _configure_functions(self):
 		"""
@@ -923,19 +849,6 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 		"""Prints the number of model parameters in billions."""
 		return sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(prm))[0])
 
-	def get_layer_names(self, frozen_dict, prefix=""):
-		"""
-		Recursively retrieves layer names and their corresponding parameter arrays from a FrozenDict.
-
-		Args:
-				frozen_dict (FrozenDict): The FrozenDict containing the model parameters.
-				prefix (str, optional): A prefix to add to the layer names. Defaults to "".
-
-		Returns:
-				dict[str, jnp.ndarray]: A dictionary mapping layer names to their parameter arrays.
-		"""
-		return get_layer_names(frozen_dict, prefix)
-
 	def _should_skip_step(self, current_step):
 		"""Determine if current step should be skipped."""
 		return (
@@ -1090,203 +1003,3 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 				metrics=metrics,
 				step=step,
 			)
-
-	@abstractmethod
-	def _run_training_loop(
-		self,
-		sharded_state: EasyDeLState,
-		metrics_tracker: MetricsTracker,
-		step_metrics: StepMetrics,
-		start_time: float,
-		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-	):
-		"""Core training loop implementation."""
-
-	@abstractmethod
-	def _run_evaluation(
-		self,
-		sharded_state: EasyDeLState,
-		metrics_tracker: MetricsTracker,
-		step_metrics: StepMetrics,
-		start_time: float,
-	):
-		"""Core evaluation implementation."""
-
-	@abstractmethod
-	def _train_epoch(
-		self,
-		sharded_state: EasyDeLState,
-		train_iter: int,
-		current_step: int,
-		metrics_tracker: MetricsTracker,
-		step_metrics: StepMetrics,
-		pbar: tqdm,
-		start_time: float,
-		epoch: int,
-		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-	):
-		"""Handles training for a single epoch."""
-
-	@abstractmethod
-	def _eval_epoch(
-		self,
-		sharded_state: EasyDeLState,
-		eval_iter: int,
-		current_step: int,
-		metrics_tracker: MetricsTracker,
-		step_metrics: StepMetrics,
-		pbar: tqdm,
-		start_time: float,
-	):
-		"""Handles training for a single epoch."""
-
-	@abstractmethod
-	def _execute_eval_step(self, state, batch):
-		"""Execute a single eval step."""
-
-	@abstractmethod
-	def _execute_train_step(self, state, batch):
-		"""Execute a single train step."""
-
-	@abstractmethod
-	def _finalize_training(self, output, run_exception):
-		"""Finalize training and prepare output."""
-
-	@abstractmethod
-	def train(
-		self,
-		model_parameters: Optional[flax.core.FrozenDict] = None,
-		state: Optional[EasyDeLState] = None,
-	) -> Any:
-		"""Train using the provided model state."""
-
-	@abstractmethod
-	def eval(self, model_state: EasyDeLState) -> Iterator[dict]:
-		"""
-		Evaluates using the provided model state.
-
-		This method iterates over the evaluation dataset, performs forward passes,
-		calculates evaluation metrics, logs the metrics, and yields the metrics for
-		each evaluation step.
-		"""
-
-
-class StepMetrics:
-	"""Handles calculation and tracking of training metrics."""
-
-	def __init__(self, arguments):
-		self.arguments = arguments
-		self.start_time = time.time()
-		self.step_start_time = time.time()
-
-	def start_step(self):
-		"""Mark the start of a training step."""
-		self.step_start_time = time.time()
-
-	def calculate(
-		self,
-		loss,
-		metrics,
-		current_step,
-		epoch,
-		flops_per_device,
-		batch_size,
-		seq_length,
-		learning_rate,
-		mode: Optional[Literal["eval", "train"]] = None,
-		**extras,
-	) -> Dict[str, float]:
-		"""Calculate comprehensive metrics for the training step."""
-		step_time = time.time() - self.step_start_time
-		total_time = time.time() - self.start_time
-
-		visited_tokens = jnp.multiply(seq_length, jnp.multiply(current_step, batch_size))
-
-		flops = flops_per_device / step_time
-
-		basic_metrics = {
-			"loss": loss.tolist(),
-			"learning_rate": learning_rate,
-			"step": current_step,
-			"step_time": step_time,
-			"perplexity": jnp.exp(loss).tolist(),
-			"visited_tokens": visited_tokens,
-			"epoch": epoch,
-			"TFLOPs": flops,
-			"total_time": total_time,
-			**extras,
-		}
-
-		basic_metrics.update({"accuracy": metrics.get("accuracy", 0.0)})
-
-		if metrics.get("mae", None) is not None:
-			basic_metrics.update({"mae": metrics.get("mae", 0.0)})
-		if metrics.get("mse", None) is not None:
-			basic_metrics.update({"mse": metrics.get("mse", 0.0)})
-
-		if not self.arguments.performance_mode and (mode == "train" or mode is None):
-			detailed_metrics = self._calculate_detailed_metrics(metrics)
-			basic_metrics.update(detailed_metrics)
-		if mode is not None:
-			basic_metrics = {f"{mode}/{k}": v for k, v in basic_metrics.items()}
-		return basic_metrics
-
-	def _calculate_detailed_metrics(self, metrics):
-		"""Calculate additional detailed metrics."""
-		detailed_metrics = {}
-
-		if self.arguments.log_grad_norms and metrics.get("grad_norms", None) is not None:
-			detailed_metrics.update(
-				{
-					"train/max_grad_norm": metrics.get(
-						"max_grad_norm", np.asarray(None)
-					).tolist(),
-					"train/mean_grad_norm": metrics.get(
-						"mean_grad_norm", np.asarray(None)
-					).tolist(),
-				}
-			)
-
-			# Add per-layer gradient norms
-			detailed_metrics.update(
-				{
-					f"grad_norm/{layer_name}": grad_norm.tolist()
-					for layer_name, grad_norm in get_layer_names(metrics["grad_norms"]).items()
-				}
-			)
-
-		return detailed_metrics
-
-
-class MetricsTracker:
-	"""Tracks and aggregates training metrics over time."""
-
-	def __init__(self):
-		self.loss_sum = None
-		self.accuracy_sum = None
-		self.metrics_history = defaultdict(list)
-		self.step_offset = 0
-
-	def update(self, loss, accuracy, step):
-		"""Update tracked metrics with new values."""
-		with jax.spmd_mode("allow_all"):
-			self.loss_sum = loss if self.loss_sum is None else self.loss_sum + loss
-			mean_loss = self.loss_sum / (step + 1 - self.step_offset)
-			if accuracy != float("inf"):
-				if accuracy is None:
-					accuracy = 0.0
-				self.accuracy_sum = (
-					accuracy if self.accuracy_sum is None else self.accuracy_sum + accuracy
-				)
-				mean_accuracy = self.accuracy_sum / (step + 1 - self.step_offset)
-
-				return mean_loss, mean_accuracy
-			return mean_loss
-
-	def reset(self, step):
-		"""Reset tracked metrics."""
-		self.loss_sum = None
-		self.accuracy_sum = None
-		self.step_offset = step

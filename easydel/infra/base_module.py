@@ -331,7 +331,7 @@ class EasyDeLBaseModule(
 			if outputs.aux_loss is not None:
 				loss_output.loss = loss_output.loss + outputs.aux_loss
 		outputs = outputs.replace(loss=loss_output.loss)
-		return outputs
+		return outputs, loss_output
 
 
 class EasyDeLBaseVisionModule(EasyDeLBaseModule):

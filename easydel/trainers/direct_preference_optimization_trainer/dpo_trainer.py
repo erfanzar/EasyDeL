@@ -102,7 +102,7 @@ class DPOTrainer(BaseTrainer, ABC):
 			configure_dataloaders(self) -> TrainerConfigureDataloaderOutput: Configures the dataloaders for training and evaluation.
 			configure_model(self) -> TrainerConfigureModelOutput: Configures the model, optimizer, scheduler, and configuration.
 			configure_functions(self) -> TrainerConfigureFunctionOutput: Configures and JIT-compiles the training and evaluation step functions.
-			_configure_lora(self): Configures LoRA if enabled.
+
 			shard_states(self, state: EasyDeLState, rules: Any) -> EasyDeLState: Shards the provided state according to the given rules.
 			create_collect_function(self, max_sequence_length: int, truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end") -> Callable:
 					Creates a data collection function for batching.
@@ -325,7 +325,7 @@ class DPOTrainer(BaseTrainer, ABC):
 			self.tx = model_configurations.tx
 			self.scheduler = model_configurations.scheduler
 			self.config = model_configurations.config
-			self._configure_lora()
+
 		self.timer.log("configure Model, Optimizer, Scheduler and Config")
 
 	def _configure_functions(self):
@@ -349,25 +349,6 @@ class DPOTrainer(BaseTrainer, ABC):
 			self.checkpoint_manager = functions.checkpoint_manager
 			self.initialize_state_function = functions.initialize_state_function
 		self.timer.log(operation_name)
-
-	def _configure_lora(self):
-		"""
-		Configures LoRA (Low-Rank Adaptation) if enabled in the training arguments.
-
-		This method applies LoRA to the model, sets up the LoRA parameters, apply function,
-		optimizer state, model, and optimizer, and logs the time taken for this configuration.
-		"""
-		if self.rapture is not None:
-			lora_modules = self.rapture.apply_lora(
-				module=self.model,
-				parameters=self.arguments.rapture_config.parameters,
-				tx=self.tx,
-			)
-			self.lora_parameters = lora_modules.lora_parameters
-			self.lora_apply_fn = lora_modules.lora_module.__call__
-			self.lora_opt_state = lora_modules.lora_opt_state
-			self.lora_model = lora_modules.lora_module
-			self.lora_tx = lora_modules.lora_tx
 
 	def configure_dataloaders(self) -> TrainerConfigureDataloaderOutput:
 		"""

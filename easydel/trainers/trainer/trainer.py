@@ -46,7 +46,7 @@ from easydel.trainers.causal_language_model_trainer.modeling_output import (
 logger = get_logger(__name__)
 
 
-class CausalLanguageModelTrainer(BaseTrainer):
+class Trainer(BaseTrainer):
 	def create_collect_function(
 		self,
 		max_sequence_length: int,
@@ -144,7 +144,6 @@ class CausalLanguageModelTrainer(BaseTrainer):
 					module_config_args=None,
 				)
 
-		state_shape = jax.eval_shape(initialize_state_function)
 		state_partition_spec = match_partition_rules(
 			(
 				self.config.get_partition_rules(
