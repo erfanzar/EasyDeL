@@ -22,7 +22,7 @@ from fjformer import with_sharding_constraint
 from flax import nnx as nn
 from jax.sharding import PartitionSpec
 
-from easydel.etils.etils import EasyDeLGradientCheckPointers, get_logger
+from easydel.etils.etils import get_logger
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import register_module
 from easydel.infra.modeling_outputs import (
@@ -31,10 +31,10 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import (
 	ACT2FN,
+	auto_remat,
 	block_wise_ffn,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
-	get_gradient_checkpoint_policy,
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
@@ -340,17 +340,11 @@ class Gemma2DecoderLayer(nn.Module):
 		mlp_block = Gemma2MLP
 		attn_block = Gemma2Attention
 
-		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
-			mlp_block = nn.remat(
-				mlp_block,
-				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-				static_argnums=(1,),
-			)
-			attn_block = nn.remat(
-				attn_block,
-				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-				static_argnums=(3, 5, 6, 7, 9),
-			)
+		attn_block, mlp_block = auto_remat(
+			attn_block,
+			mlp_block,
+			policy=config.gradient_checkpointing,
+		)
 		self.is_sliding = bool(self.layer_idx % 2)
 		self.self_attn = attn_block(
 			self.config,

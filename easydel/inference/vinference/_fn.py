@@ -26,6 +26,7 @@ from easydel.inference.utils import (
 	create_sampling_step,
 	vInferenceConfig,
 )
+
 from easydel.infra import EasyDeLBaseModule
 
 

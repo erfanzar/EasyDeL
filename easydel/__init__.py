@@ -82,7 +82,7 @@ from easydel.infra import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseConfigDict,
 	EasyDeLBaseModule,
-	EasyDeLBaseVisionModule,
+	LossConfig,
 )
 from easydel.infra.factory import (
 	ConfigType,
@@ -281,24 +281,19 @@ from easydel.modules.xerxes import (
 from easydel.smi import get_mem, initialise_tracking, run
 from easydel.trainers import (
 	BaseTrainer,
-	CausalLanguageModelTrainer,
-	CausalLMTrainerOutput,
 	DPOConfig,
 	DPOTrainer,
 	DPOTrainerOutput,
 	JaxDistributedConfig,
-	LoraRaptureConfig,
 	ORPOConfig,
 	ORPOTrainer,
 	ORPOTrainerOutput,
-	Seq2SeqTrainer,
-	SequenceClassificationTrainer,
-	SequenceClassificationTrainerOutput,
 	SFTTrainer,
 	TrainingArguments,
 	VisionCausalLanguageModelTrainer,
 	VisionCausalLMTrainerOutput,
 	pack_sequences,
+	Trainer,
 )
 from easydel.transform import (
 	easystate_to_huggingface_model,

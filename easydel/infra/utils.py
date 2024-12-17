@@ -13,12 +13,13 @@
 # limitations under the License.
 
 import functools
+import inspect
 import re
+import types
 import warnings
 from functools import partial
-from typing import Any, Dict, Literal, Optional, Union
+import typing as tp
 
-import chex
 import fjformer
 import flax
 import flax.core
@@ -29,17 +30,19 @@ from aqt.jax.v2 import config as q_config
 from aqt.jax.v2.flax import aqt_flax as q_flax
 from einops import rearrange
 from flax import nnx as nn
-from flax.traverse_util import flatten_dict, unflatten_dict
+
 from tqdm.auto import tqdm
 
 from easydel.etils.errors import EasyDeLBlockWiseFFNError
 from easydel.etils.etils import (
 	AVAILABLE_SPARSE_MODULE_TYPES,
+	EasyDeLGradientCheckPointers,
 	EasyDeLQuantizationMethods,
 	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
 from easydel.infra.base_config import EasyMethod
+from easydel.utils.traversals import flatten_dict, unflatten_dict
 
 warnings.filterwarnings(
 	"ignore",
@@ -61,8 +64,8 @@ ACT2FN = {
 	"softmax": nn.softmax,
 }
 
-ROPE_TYPES = Optional[
-	Literal[
+ROPE_TYPES = tp.Optional[
+	tp.Literal[
 		"none",
 		"linear",
 		"dynamic",
@@ -74,13 +77,12 @@ ROPE_TYPES = Optional[
 ]
 
 
-
 with_sharding_constraint = fjformer.with_sharding_constraint
 
 
 def canonicalize_dtype(
 	*args,
-	dtype: Optional[jax.numpy.dtype] = None,
+	dtype: tp.Optional[jax.numpy.dtype] = None,
 	inexact: bool = True,
 ) -> jax.numpy.dtype:
 	"""Canonicalize an optional dtype to the definitive dtype.
@@ -93,7 +95,7 @@ def canonicalize_dtype(
 	Args:
 	  *args: JAX array compatible values. None values
 	    are ignored.
-	  dtype: Optional dtype override. If specified the arguments are cast to
+	  dtype: tp.Optional dtype override. If specified the arguments are cast to
 	    the specified dtype instead and dtype inference is disabled.
 	  inexact: When True, the output dtype must be a subdtype
 	  of `jnp.inexact`. Inexact dtypes are real or complex floating points. This
@@ -153,15 +155,15 @@ def add_start_docstrings(*docstr):
 
 
 def get_dot_general_by_bits(
-	bits: Optional[int] = None,
-	mode: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
+	bits: tp.Optional[int] = None,
+	mode: tp.Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
 ) -> dict:
 	"""The get_general_dot function is a helper function that returns a q_flax.QDotGeneral object
 	with the specified number of bits for forward and backward passes. If no bits are specified,
 	the function returns None.
 
 	Args:
-	    bits: Optional[int]: Specify the number of bits for quantization
+	    bits: tp.Optional[int]: Specify the number of bits for quantization
 	    mode: EasyMethod: Specify the use of model to init the QDot
 	        Method for (e.q TRAIN,SERVE,...)
 
@@ -262,7 +264,7 @@ def quantize_linear_layers(
 	*,
 	method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.A8BIT,
 	block_size: int = 256,
-	quantization_pattern: Optional[str] = None,
+	quantization_pattern: tp.Optional[str] = None,
 	verbose: bool = True,
 ) -> nn.Module:
 	"""
@@ -270,7 +272,7 @@ def quantize_linear_layers(
 
 	Args:
 	    model: The model to quantize.
-			method (EasyDeLQuantizationMethods): quantization method for params.
+	    method (EasyDeLQuantizationMethods): quantization method for params.
 	    quantization_pattern (str): re pattern for layers to be quantized.
 	    verbose (bool): whenever to use tqdm for logging stuff.
 
@@ -336,10 +338,10 @@ def print_pytree(pytree):
 
 
 def apply_sparsity_to_params(
-	params: Union[Dict[str, Any], Any],
+	params: tp.Union[tp.Dict[str, tp.Any], tp.Any],
 	sparsify_module: AVAILABLE_SPARSE_MODULE_TYPES = "bcoo",
 	verbose: bool = True,
-) -> Union[Dict[str, Any], Any]:
+) -> tp.Union[tp.Dict[str, tp.Any], tp.Any]:
 	its_frozen = isinstance(params, flax.core.FrozenDict)
 	flatten = is_flatten(params)
 	if not flatten:
@@ -380,3 +382,59 @@ def apply_sparsity_to_params(
 	if its_frozen:
 		return flax.core.FrozenDict(params)
 	return params
+
+
+def extract_static_parameters(module):
+	"""
+	Extract static_argnums for specified parameters across functions in a module.
+
+	Args:
+	    module (types.ModuleType): The module to inspect
+
+	Returns:
+	    dict: A dictionary mapping function names to their static parameter indices
+	"""
+
+	# Predefined list of parameters to check for static status
+	target_params = [
+		"causal_mask",
+		"frequencies",
+		"output_attentions",
+		"output_hidden_states",
+		"output_router_logits",
+	]
+	obj = getattr(module, "__call__", None)  # noqa
+	if isinstance(obj, (types.FunctionType, types.MethodType)):
+		static_args = ()
+		signature = inspect.signature(obj)
+		for idx, (param_name, param) in enumerate(signature.parameters.items()):
+			if param_name in target_params:
+				static_args += (idx,)
+		return static_args
+	return None
+
+
+def auto_remat(
+	*modules,
+	policy: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
+	prevent_cse: bool = True,
+):
+	if policy == EasyDeLGradientCheckPointers.NONE:
+		return modules
+	if isinstance(policy, str):
+		policy = get_gradient_checkpoint_policy(policy)
+	outs = ()
+	for module in modules:
+		assert issubclass(module, nn.Module)
+		static_argnums = extract_static_parameters(module=module)
+		if static_argnums is None:
+			static_argnums = ()
+
+		module.__call__ = nn.remat(
+			f=module.__call__,
+			prevent_cse=prevent_cse,
+			static_argnums=static_argnums,
+			policy=policy,
+		)
+		outs += (module,)
+	return outs

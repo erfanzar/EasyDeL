@@ -4,6 +4,8 @@ from operator import mul
 import typing as tp
 
 import chex
+import flax
+import flax.struct
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -37,14 +39,26 @@ class LossConfig:
 	num_labels: tp.Optional[str] = None
 	problem_type: tp.Optional[str] = None
 	divide_weight_sum: bool = False
+	num_classification_labels: tp.Optional[int] = None
+	classification_problem_type: tp.Optional[
+		tp.Literal[
+			"regression",
+			"single_label_classification",
+			"multi_label_classification",
+		]
+	] = None
 
 
 @chex.dataclass
-class LossFnOutput:
+class LossMetrics:
 	loss: tp.Union[float, chex.Array]
-	z_loss: tp.Union[float, chex.Array] = None
-	weight_sum: tp.Union[float, chex.Array] = None
-	accuracy: tp.Union[float, chex.Array] = None
+	z_loss: tp.Optional[tp.Union[float, chex.Array]] = None
+	weight_sum: tp.Optional[tp.Union[float, chex.Array]] = None
+	accuracy: tp.Optional[tp.Union[float, chex.Array]] = None
+	learning_rate: tp.Optional[tp.Union[float, chex.Array]] = None
+	max_grad_norm: tp.Optional[flax.struct.PyTreeNode] = None
+	mean_grad_norm: tp.Optional[flax.struct.PyTreeNode] = None
+	grad_norms: tp.Optional[flax.struct.PyTreeNode] = None
 
 
 def sigmoid_cross_entropy_with_logits(
@@ -513,7 +527,7 @@ def fixed_cross_entropy(
 	num_items_in_batch: tp.Optional[int] = None,
 	batch: tp.Optional[tp.Mapping[str, chex.Array]] = None,
 	**kwargs: tp.Any,
-) -> LossFnOutput:
+) -> LossMetrics:
 	"""
 	Jax implementation of fixed cross-entropy loss with z-loss, label smoothing, masking.
 
@@ -526,7 +540,7 @@ def fixed_cross_entropy(
 	    **kwargs: Additional keyword arguments.
 
 	Returns:
-	    The computed cross-entropy loss in LossFnOutput.
+	    The computed cross-entropy loss in LossMetrics.
 	"""
 	if config is None:
 		config = LossConfig()
@@ -571,7 +585,7 @@ def fixed_cross_entropy(
 	elif config.divide_weight_sum:
 		loss = total_loss / weight_sum
 
-	return LossFnOutput(
+	return LossMetrics(
 		loss=loss,
 		z_loss=total_z_loss,
 		weight_sum=weight_sum,
@@ -587,7 +601,7 @@ def ForCausalLMLoss(
 	num_items_in_batch: tp.Optional[int] = None,
 	batch: tp.Optional[tp.Mapping[str, chex.Array]] = None,
 	**kwargs: tp.Any,
-) -> LossFnOutput:
+) -> LossMetrics:
 	"""
 	Jax implementation of loss function for causal language models.
 
@@ -626,7 +640,7 @@ def ForSequenceClassificationLoss(
 	config: tp.Optional[LossConfig] = None,
 	batch: tp.Optional[tp.Mapping[str, chex.Array]] = None,
 	**kwargs: tp.Any,
-) -> LossFnOutput:
+) -> LossMetrics:
 	"""
 	Jax implementation of loss function for sequence classification.
 
@@ -675,7 +689,7 @@ def ForSequenceClassificationLoss(
 		)
 	else:
 		raise ValueError(f"Invalid problem_type: {config.problem_type}")
-	return LossFnOutput(total_loss=loss)
+	return LossMetrics(total_loss=loss)
 
 
 def ForQuestionAnsweringLoss(
@@ -686,7 +700,7 @@ def ForQuestionAnsweringLoss(
 	config: tp.Optional[LossConfig] = None,
 	batch: tp.Optional[tp.Mapping[str, chex.Array]] = None,
 	**kwargs: tp.Any,
-) -> LossFnOutput:
+) -> LossMetrics:
 	"""
 	Jax implementation of loss function for question answering.
 
@@ -731,7 +745,7 @@ def ForQuestionAnsweringLoss(
 	accuracy = (start_loss.accuracy + end_loss.accuracy) / 2
 	z_loss = (start_loss.z_loss + end_loss.z_loss) / 2
 	weight_sum = (start_loss.weight_sum + end_loss.weight_sum) / 2
-	return LossFnOutput(
+	return LossMetrics(
 		loss=loss,
 		accuracy=accuracy,
 		z_loss=z_loss,
@@ -745,7 +759,7 @@ def ForTokenClassification(
 	config: tp.Optional[LossConfig] = None,
 	batch: tp.Optional[tp.Mapping[str, chex.Array]] = None,
 	**kwargs: tp.Any,
-) -> LossFnOutput:
+) -> LossMetrics:
 	"""
 	Jax implementation of loss function for token classification.
 

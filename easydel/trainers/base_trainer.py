@@ -48,17 +48,15 @@ from easydel.infra.base_module import (
 	EasyDeLBaseModule,
 )
 from easydel.smi import get_capacity_matrix, initialise_tracking
-from easydel.trainers.training_configurations import TrainingArguments
-from easydel.utils import Timers
 from easydel.trainers.trainer_protocol import (
 	BaseTrainerProtocol,
-	EasyDeLBaseModule,
-	EasyDeLState,
 	TrainerConfigureDataloaderOutput,
-	TrainerConfigureModelOutput,
 	TrainerConfigureFunctionOutput,
+	TrainerConfigureModelOutput,
 	TrainerOutput,
 )
+from easydel.trainers.training_configurations import TrainingArguments
+from easydel.utils import Timers
 
 logger = get_logger(__name__)
 
@@ -84,7 +82,7 @@ class BaseTrainer(BaseTrainerProtocol):
 		self.dtype = arguments.dtype
 		self.param_dtype = arguments.param_dtype
 		self._initialize_attributes()
-		self._base_model = model
+		self.model = model
 
 		if _do_init_fns:
 			self.initialize_trainer_utils()
@@ -111,26 +109,20 @@ class BaseTrainer(BaseTrainerProtocol):
 		self.scheduler = getattr(self, "scheduler", None)
 		self.tx = getattr(self, "tx", None)
 		self.model_state = getattr(self, "model_state", None)
-		self.rapture = self.arguments.rapture
-		self.lora_parameters = getattr(self, "lora_parameters", None)
-		self.lora_model = getattr(self, "lora_model", None)
-		self.lora_tx = getattr(self, "lora_tx", None)
-		self.lora_opt_state = getattr(self, "lora_opt_state", None)
-		self.lora_apply_fn = getattr(self, "lora_apply_fn", None)
-		self.create_sharded_state_from_params_function = getattr(
-			self, "create_sharded_state_from_params_function", None
+		self.create_state_sharded = getattr(self, "create_state_sharded", None)
+		self.sharded_training_step_function = getattr(
+			self, "sharded_training_step_function", None
 		)
-		self.sharded_train_step_function = getattr(
-			self, "sharded_train_step_function", None
+		self.sharded_evaluation_step_function = getattr(
+			self, "sharded_evaluation_step_function", None
 		)
-		self.sharded_eval_step_function = getattr(self, "sharded_eval_step_function", None)
 		self.initialize_state_function = getattr(self, "initialize_state_function", None)
 		self.mesh = getattr(self, "mesh", None)
 		self.checkpoint_manager = getattr(self, "checkpoint_manager", None)
 		self.state_shape = getattr(self, "state_shape", None)
 		self.state_partition_spec = getattr(self, "state_partition_spec", None)
 		self.state_named_sharding = getattr(self, "state_named_sharding", None)
-		self.sharded_state = getattr(self, "sharded_state", None)
+		self.state = getattr(self, "state", None)
 		self.pruning_module = getattr(self.arguments, "pruning_module", None)
 
 	def _initialize_memory_tracking(self):
@@ -188,6 +180,7 @@ class BaseTrainer(BaseTrainerProtocol):
 		self._configure_dataloaders()
 		self._configure_model()
 		self._configure_functions()
+		self._configure_state()
 
 	def _initialize_wandb(self):
 		if self.arguments.use_wandb:
@@ -242,19 +235,23 @@ class BaseTrainer(BaseTrainerProtocol):
 		"""
 		with self.timer("configure functions and sharding them"):
 			function_configurations = self.configure_functions()
-			self.create_sharded_state_from_params_function = (
-				function_configurations.create_sharded_state_from_params_function
+			self.create_state_sharded = function_configurations.create_state_sharded
+			self.sharded_training_step_function = (
+				function_configurations.sharded_training_step_function
 			)
-			self.sharded_train_step_function = (
-				function_configurations.sharded_train_step_function
-			)
-			self.sharded_eval_step_function = (
-				function_configurations.sharded_eval_step_function
+			self.sharded_evaluation_step_function = (
+				function_configurations.sharded_evaluation_step_function
 			)
 			self.mesh = function_configurations.mesh
 			self.checkpoint_manager = function_configurations.checkpoint_manager
 			self.initialize_state_function = function_configurations.initialize_state_function
 		self.timer.log("configure functions and sharding them")
+
+	def _configure_state(self):
+		"""Configures and JIT-compiles the sharded state"""
+		with self.timer("configure sharded state"):
+			self.state = self.create_state_sharded()
+		self.timer.log("configure sharded state")
 
 	@abstractmethod
 	def create_collect_function(
@@ -463,63 +460,16 @@ class BaseTrainer(BaseTrainerProtocol):
 		Returns:
 				TrainerConfigureModelOutput: An object containing the configured model, optimizer, scheduler, and configuration.
 		"""
-		extra_configs = self.arguments.extra_configs or {}
-		if self._base_model is None:
-			assert self.arguments.model_class is not None, (
-				"`model_class` is a required field "
-				"please pass `model_class` to `TrainingArguments`"
-			)
-		model = self._configure_custom_model(extra_configs)
 
 		tx, scheduler = self.arguments.get_optimizer_and_scheduler(self.max_training_steps)
 		if self.pruning_module is not None:
 			tx = self.pruning_module.wrap_optax(tx)
 		return TrainerConfigureModelOutput(
-			model=model,
+			model=self.model,
 			tx=tx,
 			scheduler=scheduler,
-			config=getattr(model, "config", None),
+			config=self.model.config,
 		)
-
-	def _configure_custom_model(self, extra_configs):
-		"""
-		Configures a custom model provided by the user.
-
-		This method checks if a custom rule for partitioning is provided, sets the axis dimensions
-		for the model configuration, and initializes the custom model class with the provided
-		configurations.
-
-		Args:
-				extra_configs (dict): Additional configurations to apply to the model.
-
-		Returns:
-				EasyDeLBaseModule: The configured custom model.
-
-		Raises:
-				AssertionError: If no custom rule is provided when initializing a custom model.
-		"""
-		if self._base_model is None:
-			if not hasattr(
-				self.arguments.configs_to_initialize_model_class["config"],
-				"get_partition_rules",
-			):
-				assert self.arguments.custom_rule is not None, (
-					"If you are using a custom model to initialize, you must "
-					"pass custom_rule for partition rules."
-				)
-
-			self.arguments.configs_to_initialize_model_class[
-				"config"
-			].axis_dims = self.arguments.sharding_array
-
-			return self.arguments.model_class(
-				**self.arguments.configs_to_initialize_model_class, _do_init=False
-			)
-		else:
-			assert hasattr(self._base_model, "config")
-			assert hasattr(self._base_model.config, "get_partition_rules")
-			self._base_model.config.axis_dims = self.arguments.sharding_array
-			return self._base_model
 
 	def _save_state(
 		self,
@@ -866,7 +816,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 
 	def _prepare_training_output(
 		self,
-		sharded_state: EasyDeLState,
+		state: EasyDeLState,
 		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
 		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
 		run_exception: Optional[Exception] = None,
@@ -890,18 +840,12 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 				raise RuntimeError("EasyDeL Runtime dumped") from run_exception
 		checkpoint_path = "SAVING_SKIPPED"
 		filename = None
-		if self.arguments.merge_lora_rapture_parameters and self.rapture is not None:
-			print(
-				termcolor.colored("Info : ", color="red", force_color=True),
-				termcolor.colored("Merging LoRA Parameters.", color="white", force_color=True),
-			)
-			sharded_state = sharded_state.replace(
-				params=self.rapture.merge_parameters(sharded_state.params)
-			)
+
+		# TODO: LoRA be added.
 		try:
 			if self.arguments.do_last_save:
 				filename = self._save_state(
-					state=sharded_state,
+					state=state,
 					gather_fns=gather_fns,
 					milestone=False,
 					save_dir=self.arguments.save_dir,
@@ -916,7 +860,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 			)
 
 		return TrainerOutput(
-			state=sharded_state,
+			state=state,
 			mesh=self.mesh,
 			shard_fns=shard_fns,
 			gather_fns=gather_fns,
@@ -927,7 +871,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 
 	def _handle_training_interruption(
 		self,
-		sharded_state: EasyDeLState,
+		state: EasyDeLState,
 		exception: Exception,
 		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
 		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
@@ -948,26 +892,26 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 		else:
 			raise RuntimeError("EasyDeL Runtime dumped") from exception
 		return self._prepare_training_output(
-			sharded_state=sharded_state,
+			state=state,
 			checkpoint_manager=self.checkpoint_manager,
 			shard_fns=shard_fns,
 			gather_fns=gather_fns,
 			run_exception=None,
 		)
 
-	def _setup_initial_metrics(self, sharded_state):
+	def _setup_initial_metrics(self, state):
 		"""Setup initial metrics logging."""
 		# Calculate and log model size
 		self.arguments.log_metrics(
 			{
 				"Number of Model Parameters (Billion)": self.count_model_parameters(
-					sharded_state.params
+					state.graphstate
 				)
 			},
 			step=0,
 		)
 		self._flops_per_device = (
-			self.calculate_number_total_flops_per_device(params=sharded_state.params) / 1e12
+			self.calculate_number_total_flops_per_device(params=state.graphstate) / 1e12
 		)
 
 	def _get_next_batch(self, train_iter):

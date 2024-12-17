@@ -18,7 +18,6 @@ from easydel.infra.base_config import (
 )
 from easydel.infra.base_module import (
 	EasyDeLBaseModule,
-	EasyDeLBaseVisionModule,
 )
 from easydel.modules.arctic import (
 	ArcticConfig,

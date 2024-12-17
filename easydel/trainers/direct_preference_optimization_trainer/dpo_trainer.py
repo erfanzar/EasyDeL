@@ -38,8 +38,6 @@ from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import get_logger
 from easydel.trainers.base_trainer import (
 	BaseTrainer,
-	MetricsTracker,
-	StepMetrics,
 	TrainerConfigureDataloaderOutput,
 	TrainerConfigureFunctionOutput,
 	TrainerConfigureModelOutput,
@@ -61,6 +59,7 @@ from easydel.trainers.prompt_utils import (
 	maybe_apply_chat_template,
 	maybe_extract_prompt,
 )
+from easydel.trainers.trainer_protocol import MetricsTracker, StepMetrics
 
 logger = get_logger(__name__)
 
@@ -340,11 +339,9 @@ class DPOTrainer(BaseTrainer, ABC):
 		with self.timer(operation_name):
 			functions = self.configure_functions()
 
-			self.create_sharded_state_from_params_function = (
-				functions.create_sharded_state_from_params_function
-			)
-			self.sharded_train_step_function = functions.sharded_train_step_function
-			self.sharded_eval_step_function = functions.sharded_eval_step_function
+			self.create_state_sharded = functions.create_state_sharded
+			self.sharded_training_step_function = functions.sharded_training_step_function
+			self.sharded_evaluation_step_function = functions.sharded_evaluation_step_function
 			self.mesh = functions.mesh
 			self.checkpoint_manager = functions.checkpoint_manager
 			self.initialize_state_function = functions.initialize_state_function
@@ -528,7 +525,7 @@ class DPOTrainer(BaseTrainer, ABC):
 			spec=PartitionSpec(),
 			mesh=self.arguments.get_mesh(),
 		)
-		create_sharded_state_from_params_function = jax.jit(
+		create_state_sharded = jax.jit(
 			create_state_from_params_function,
 			in_shardings=(spec_named_sharding.params,),
 			out_shardings=spec_named_sharding,
@@ -542,7 +539,7 @@ class DPOTrainer(BaseTrainer, ABC):
 			label_smoothing=self.arguments.label_smoothing,
 			beta=self.arguments.beta,
 		)
-		sharded_train_step_function = jax.jit(
+		sharded_training_step_function = jax.jit(
 			train_function,
 			in_shardings=(
 				spec_named_sharding,
@@ -563,7 +560,7 @@ class DPOTrainer(BaseTrainer, ABC):
 			beta=self.arguments.beta,
 		)
 
-		sharded_eval_step_function = jax.jit(
+		sharded_evaluation_step_function = jax.jit(
 			eval_function,
 			in_shardings=(
 				spec_named_sharding,
@@ -582,9 +579,9 @@ class DPOTrainer(BaseTrainer, ABC):
 		checkpoint_manager = self.arguments.get_streaming_checkpointer()
 		mesh = self.arguments.get_mesh()
 		return TrainerConfigureFunctionOutput(
-			create_sharded_state_from_params_function=create_sharded_state_from_params_function,
-			sharded_train_step_function=sharded_train_step_function,
-			sharded_eval_step_function=sharded_eval_step_function,
+			create_state_sharded=create_state_sharded,
+			sharded_training_step_function=sharded_training_step_function,
+			sharded_evaluation_step_function=sharded_evaluation_step_function,
 			mesh=mesh,
 			checkpoint_manager=checkpoint_manager,
 			initialize_state_function=initialize_state_function,
@@ -1089,7 +1086,7 @@ class DPOTrainer(BaseTrainer, ABC):
 	def _execute_eval_step(self, state, batch):
 		"""Execute a single eval step."""
 		batch = {key: jnp.asarray(value) for key, value in batch.items()}
-		dpo_out = self.sharded_eval_step_function(state, batch)
+		dpo_out = self.sharded_evaluation_step_function(state, batch)
 		loss = dpo_out.loss
 		metrics = dict(
 			loss=loss,
@@ -1112,7 +1109,7 @@ class DPOTrainer(BaseTrainer, ABC):
 		try:
 			batch = {key: jnp.asarray(value) for key, value in batch.items()}
 
-			self.model_state, dpo_out = self.sharded_train_step_function(
+			self.model_state, dpo_out = self.sharded_training_step_function(
 				self.model_state, batch
 			)
 			# Apply post-gradient updates

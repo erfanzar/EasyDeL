@@ -24,14 +24,13 @@ from einops import repeat
 from flax import nnx as nn
 from jax import lax
 
-from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import register_module
 from easydel.infra.modeling_outputs import FlaxBaseModelOutput
 from easydel.infra.utils import (
 	ACT2FN,
+	auto_remat,
 	get_dot_general_by_bits,
-	get_gradient_checkpoint_policy,
 )
 from easydel.layers.caching import MambaCache
 from easydel.layers.caching.mamba_cache import MambaCacheMetaData, MambaCacheView
@@ -395,12 +394,10 @@ class MambaBlock(nn.Module):
 			param_dtype=param_dtype,
 		)
 		block = MambaMixer
-		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
-			block = nn.remat(
-				block,
-				static_argnums=(1,),
-				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-			)
+		block = auto_remat(
+			block,
+			policy=config.gradient_checkpointing,
+		)
 		self.mixer = block(
 			config=config,
 			layer_idx=layer_idx,
