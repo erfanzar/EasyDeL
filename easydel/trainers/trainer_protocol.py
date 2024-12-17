@@ -25,6 +25,7 @@ import flax
 import flax.core
 import jax
 import numpy as np
+import optax
 import tqdm
 from fjformer.checkpoint import CheckpointManager
 from jax.sharding import Mesh
@@ -81,9 +82,6 @@ class TrainerConfigureFunctionOutput:
 class TrainerOutput:
 	state: EasyDeLState
 	mesh: Optional[jax.sharding.Mesh]
-	checkpoint_manager: Any
-	gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None
-	shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None
 	last_save_file_name: Optional[str] = None
 	checkpoint_path: Optional[str] = None
 
@@ -91,8 +89,8 @@ class TrainerOutput:
 class BaseTrainerProtocol(ABC):
 	# Required attributes for all trainers
 	arguments: TrainingArguments
-	dataset_train: Optional["Dataset"]  # type: ignore
-	dataset_eval: Optional["Dataset"]  # type: ignore
+	dataset_train: Optional["Dataset"]  # type: ignore #noqa
+	dataset_eval: Optional["Dataset"]  # type: ignore #noqa
 	finetune: bool
 	checkpoint_path: Optional[Union[str, os.PathLike]]
 	dtype: Any  # jax.numpy.dtype
@@ -104,15 +102,16 @@ class BaseTrainerProtocol(ABC):
 	dataloader_eval: Optional[Iterator[np.ndarray]]
 	max_training_steps: int
 	max_evaluation_steps: int
-	model: Any
-	config: Any
-	scheduler: Any
-	tx: Any  # optax
+	model: EasyDeLBaseModule
+	config: EasyDeLBaseConfig
+	scheduler: optax.Schedule
+	tx: optax.GradientTransformation  # optax
 	model_state: Any  # flax.core.FrozenDict
 	create_state_sharded: Callable
+
 	sharded_training_step_function: Callable
 	sharded_evaluation_step_function: Callable
-	initialize_state_function: Callable
+
 	mesh: Any
 	checkpoint_manager: Any
 	state_shape: Any
@@ -123,12 +122,13 @@ class BaseTrainerProtocol(ABC):
 
 	_base_model: Any
 
+	@abstractmethod
 	def __init__(
 		self,
 		arguments: TrainingArguments,
 		model: Any,
-		dataset_train: Optional["Dataset"] = None,  # type:ignore
-		dataset_eval: Optional["Dataset"] = None,  # type:ignore
+		dataset_train: Optional["Dataset"] = None,  # type:ignore #noqa
+		dataset_eval: Optional["Dataset"] = None,  # type:ignore #noqa
 		finetune: bool = True,
 		checkpoint_path: Optional[Union[str, os.PathLike]] = None,
 		_do_init_fns: bool = True,
@@ -252,7 +252,7 @@ class BaseTrainerProtocol(ABC):
 		...
 
 	@abstractmethod
-	def _get_checkpoint_dir(self, save_dir):
+	def _get_save_directory(self, save_dir):
 		"""
 		Get the checkpoint directory.
 		"""
@@ -266,7 +266,7 @@ class BaseTrainerProtocol(ABC):
 		...
 
 	@abstractmethod
-	def _generate_checkpoint_filename(self, step, milestone):
+	def _generate_checkpoint_directory_name(self, step, milestone):
 		"""
 		Generates a checkpoint filename.
 		"""
@@ -565,20 +565,21 @@ class StepMetrics:
 	def _calculate_detailed_metrics(self, metrics):
 		"""Calculate additional detailed metrics."""
 		detailed_metrics = {}
-
+		getattr_in = lambda x: x if not hasattr(x, "value") else x.value  # noqa
 		if self.arguments.log_grad_norms:
 			detailed_metrics.update(
 				{
-					"train/max_grad_norm": metrics.max_grad_norm.tolist(),
-					"train/mean_grad_norm": metrics.mean_grad_norm.tolist(),
+					"train/max_grad_norm": getattr_in(metrics.max_grad_norm).tolist(),
+					"train/mean_grad_norm": getattr_in(metrics.mean_grad_norm).tolist(),
 				}
 			)
 
 			# Add per-layer gradient norms
 			detailed_metrics.update(
 				{
-					f"grad_norm/{layer_name}": grad_norm.tolist()
+					f"grad_norm/{layer_name}": getattr_in(grad_norm).tolist()
 					for layer_name, grad_norm in flatten_dict(metrics.grad_norms).items()
+					if getattr_in(grad_norm) is not None
 				}
 			)
 

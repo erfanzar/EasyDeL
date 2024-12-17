@@ -130,14 +130,13 @@ class TrainingArguments:
 	def __post_init__(self):
 		"""
 		Validates the configuration, sets up distributed training,
-		initializes the optimizer, configures logging, and sets up XRapTure.
+		initializes the optimizer, configures logging.
 		This method is automatically called after the object is initialized.
 		"""
 		self._validate_config()
 		self._setup_distributed()
 		self._setup_optimizer()
 		self._setup_logging()
-		self._setup_rapture()
 		self._ensure_variables()
 		if self.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
 			warnings.warn(

@@ -79,8 +79,6 @@ class BaseTrainer(BaseTrainerProtocol):
 		self.dataset_eval = dataset_eval
 		self.finetune = finetune
 		self.checkpoint_path = checkpoint_path
-		self.dtype = arguments.dtype
-		self.param_dtype = arguments.param_dtype
 		self._initialize_attributes()
 		self.model = model
 
@@ -116,7 +114,6 @@ class BaseTrainer(BaseTrainerProtocol):
 		self.sharded_evaluation_step_function = getattr(
 			self, "sharded_evaluation_step_function", None
 		)
-		self.initialize_state_function = getattr(self, "initialize_state_function", None)
 		self.mesh = getattr(self, "mesh", None)
 		self.checkpoint_manager = getattr(self, "checkpoint_manager", None)
 		self.state_shape = getattr(self, "state_shape", None)
@@ -244,7 +241,6 @@ class BaseTrainer(BaseTrainerProtocol):
 			)
 			self.mesh = function_configurations.mesh
 			self.checkpoint_manager = function_configurations.checkpoint_manager
-			self.initialize_state_function = function_configurations.initialize_state_function
 		self.timer.log("configure functions and sharding them")
 
 	def _configure_state(self):
@@ -474,7 +470,6 @@ class BaseTrainer(BaseTrainerProtocol):
 	def _save_state(
 		self,
 		state: "EasyDeLState",  # noqa: F821 # type:ignore
-		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None,
 		milestone: bool = False,
 		save_dir: Optional[str] = None,
 	) -> str:
@@ -497,23 +492,22 @@ class BaseTrainer(BaseTrainerProtocol):
 				str: The filename of the saved checkpoint.
 		"""
 		step = self._get_current_step(state)
-		checkpoint_dir = self._get_checkpoint_dir(save_dir)
-		self._manage_checkpoint_limit(checkpoint_dir)
+		save_directory = self._get_save_directory(save_dir)
+		self._manage_checkpoint_limit(save_directory)
 
-		filename = self._generate_checkpoint_filename(step, milestone)
-		logger.info(f"saving state {filename}.")
-
+		directory_name = self._generate_checkpoint_directory_name(step, milestone)
+		logger.info(f"saving state {directory_name}.")
+		save_directory = Path(save_directory) / directory_name
+		save_directory.mkdir(exist_ok=True, parents=True)
 		state.save_state(
-			filename=filename,
-			checkpoint_dir=checkpoint_dir,
-			gather_fns=gather_fns,
-			float_dtype=self.dtype,
+			save_directory=save_directory,
+			float_dtype=self.model.dtype,
 			verbose=self.arguments.verbose,
 			save_optimizer=self.arguments.save_optimizer_state,
 		)
 
-		self._save_readme(checkpoint_dir)
-		return filename
+		self._save_readme(save_directory)
+		return str(save_directory)
 
 	def _get_current_step(self, state):
 		step = int(jax.device_get(state.step))
@@ -521,16 +515,16 @@ class BaseTrainer(BaseTrainerProtocol):
 			step += self.arguments.step_start_point
 		return step
 
-	def _get_checkpoint_dir(self, save_dir):
+	def _get_save_directory(self, save_dir):
 		return (
 			os.path.join(self.arguments.save_dir, self.arguments.model_name)
 			if save_dir is None
 			else save_dir
 		)
 
-	def _manage_checkpoint_limit(self, checkpoint_dir):
+	def _manage_checkpoint_limit(self, save_directory):
 		if self.arguments.save_total_limit:
-			checkpoint_files = glob(os.path.join(checkpoint_dir, "*.easy"))
+			checkpoint_files = glob(os.path.join(save_directory, "run-*"))
 			checkpoint_files.sort(key=os.path.getmtime)
 			for old_checkpoint in checkpoint_files[: -self.arguments.save_total_limit]:
 				os.remove(old_checkpoint)
@@ -538,27 +532,19 @@ class BaseTrainer(BaseTrainerProtocol):
 					f"Removed old checkpoint: {old_checkpoint}",
 				)
 
-	def _generate_checkpoint_filename(self, step, milestone):
+	def _generate_checkpoint_directory_name(self, step, milestone):
 		checkpoint_name = f"{self.arguments.model_name}-S{step}"
-		filename = f"{checkpoint_name}_{step}" if milestone else checkpoint_name
-		return f"{filename}.easy"
+		filename = f"run-{checkpoint_name}-{step}" if milestone else checkpoint_name
+		return filename
 
-	def _save_readme(self, checkpoint_dir):
-		with open(os.path.join(checkpoint_dir, "README.md"), "w") as f:
+	def _save_readme(self, save_directory):
+		with open(os.path.join(save_directory, "README.md"), "w") as f:
 			f.write(self._get_information())
 
 	def _format_partition_rules(self) -> str:
 		"""Format partition rules with proper indentation and formatting."""
 		try:
-			mdl = self.arguments.model_class if self.model is None else self.model
-			rules = (
-				self.arguments.custom_rule
-				if self.arguments.custom_rule is not None
-				else mdl.config_class.get_partition_rules(
-					self.arguments.fully_sharded_data_parallel
-				)
-			)
-			return pprint.pformat(rules, indent=2, width=80)
+			return pprint.pformat(self.model.config.get_partition_rules(), indent=2, width=80)
 		except Exception as e:
 			logger.error(f"Error formatting partition rules: {str(e)}")
 			return "Error retrieving partition rules"
@@ -580,7 +566,6 @@ class BaseTrainer(BaseTrainerProtocol):
 				str: Formatted markdown string containing model and training information
 		"""
 		device_info = self._get_device_info()
-		mdl = self.arguments.model_class if self.model is None else self.model
 		partition_rules = self._format_partition_rules()
 
 		return f"""
@@ -593,42 +578,15 @@ models. With a primary focus on Jax, EasyDeL aims to provide convenient and effe
 training Flax/Jax models on TPU/GPU, for both serving and training purposes.
 
 ## 📦 Installation & Usage
-
-### Method 1: Using EasyDeLState (_*.easy_ files)
-
-```python
-from easydel import EasyDeLState, AutoShardAndGatherFunctions
-from jax import numpy as jnp, lax
-
-# Initialize shard and gather functions
-shard_fns, gather_fns = AutoShardAndGatherFunctions.from_pretrained(
-    "REPO_ID",  # Repository ID for finding shard/gather functions
-    backend="gpu",
-    depth_target=["params", "params"],
-    flatten=False
-)
-
-# Load the state
-state = EasyDeLState.load_state(
-    f"REPO_ID/{self.arguments.model_name}.easy",
-    dtype=jnp.float16,
-    param_dtype=jnp.float16,
-    precision=lax.Precision("fastest"),
-    verbose=True,
-    state_shard_fns=shard_fns
-)
-```
-
-### Method 2: Using AutoEasyDeLModelForCausalLM 
-
+ 
 ```python
 from easydel import AutoEasyDeLModelForCausalLM
 from jax import numpy as jnp, lax
 
 model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
     f"REPO_ID/{self.arguments.model_name}",
-    dtype=jnp.float16,
-    param_dtype=jnp.float16,
+    dtype=...,
+    param_dtype=...,
     precision=lax.Precision("fastest"),
     auto_shard_model=True,
 )
@@ -637,7 +595,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 ## 🔧 Training Configuration
 
 ### Model Details
-- **Architecture**: {mdl.config_class.model_type}
+- **Architecture**: {self.config.model_type}
 - **Platform**: {device_info['platform']}
 - **Number of Devices**: {device_info['device_count']}
 
@@ -647,19 +605,17 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 - **Scheduler**: {self.arguments.scheduler}
 - **Warmup Steps**: {self.arguments.warmup_steps}
 - **Weight Decay**: {self.arguments.weight_decay}
-- **Z Loss**: {self.arguments.z_loss}
+- **Loss Config**: {self.arguments.loss_config}
 
 ### Training Setup
 - **Epochs**: {self.arguments.num_train_epochs}
 - **Batch Size**: {self.arguments.total_batch_size}
-- **Sequence Length**: {self.arguments.max_sequence_length}
-- **Input Shape**: {self.arguments.init_input_shape}
-- **Dtype**: {self.arguments.dtype}
-- **Params Dtype**: {self.arguments.param_dtype}
+- **Sequence Length**: {self.arguments.max_sequence_length} 
+- **Dtype**: {self.model.dtype}
+- **Params Dtype**: {self.model.param_dtype}
 
 ### Advanced Configuration
-- **Gradient Checkpointing**: {self.arguments.gradient_checkpointing}
-- **Fully Sharded Data Parallel**: {self.arguments.fully_sharded_data_parallel}
+- **Gradient Checkpointing**: {self.model.config.gradient_checkpointing} 
 - **Force Batch Gradient Accumulation**: {self.arguments.force_batch_and_gradient_accumulation_steps_calculation}
 - **Gradient Accumulation Steps**: {self.arguments.gradient_accumulation_steps}
 - **Max Training Steps**: {self.arguments.max_training_steps}
@@ -781,7 +737,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 		return hf_model_config
 
 	def specs_to_name_sharding(self, tree, mesh=None):
-		mesh = mesh or self.mesh or self.arguments.get_mesh()
+		mesh = mesh or self.mesh or self.model.mesh
 		return jax.tree_util.tree_map(
 			lambda spec: jax.sharding.NamedSharding(spec=spec, mesh=mesh),
 			tree,
@@ -817,8 +773,6 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 	def _prepare_training_output(
 		self,
 		state: EasyDeLState,
-		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
 		run_exception: Optional[Exception] = None,
 	):
 		if run_exception is not None:
@@ -842,29 +796,25 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 		filename = None
 
 		# TODO: LoRA be added.
-		try:
-			if self.arguments.do_last_save:
-				filename = self._save_state(
-					state=state,
-					gather_fns=gather_fns,
-					milestone=False,
-					save_dir=self.arguments.save_dir,
-				)
-				if self.arguments.save_dir is not None:
-					checkpoint_path = os.path.join(self.arguments.save_dir, filename)
-		except Exception as e:
-			termcolor.cprint(
-				f"Failed to save checkpoint on interruption: {str(e)}",
-				color="red",
-				force_color=True,
+		# try:
+		if self.arguments.do_last_save:
+			filename = self._save_state(
+				state=state,
+				milestone=False,
+				save_dir=self.arguments.save_dir,
 			)
+			if self.arguments.save_dir is not None:
+				checkpoint_path = os.path.join(self.arguments.save_dir, filename)
+		# except Exception as e:
+		# 	termcolor.cprint(
+		# 		f"Failed to save checkpoint on interruption: {str(e)}",
+		# 		color="red",
+		# 		force_color=True,
+		# 	)
 
 		return TrainerOutput(
 			state=state,
 			mesh=self.mesh,
-			shard_fns=shard_fns,
-			gather_fns=gather_fns,
-			checkpoint_manager=self.checkpoint_manager,
 			checkpoint_path=checkpoint_path,
 			last_save_file_name=filename,
 		)

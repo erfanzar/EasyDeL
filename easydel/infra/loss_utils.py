@@ -1,6 +1,7 @@
 import enum
 from functools import reduce
 from operator import mul
+import pprint
 import typing as tp
 
 import chex
@@ -47,6 +48,21 @@ class LossConfig:
 			"multi_label_classification",
 		]
 	] = None
+
+	def __repr__(self):
+		return pprint.pformat(
+			{
+				"ignore_index": self.ignore_index,
+				"label_smoothing": self.label_smoothing,
+				"z_loss": self.z_loss,
+				"loss_normalizing_factor": self.loss_normalizing_factor,
+				"num_labels": self.num_labels,
+				"problem_type": self.problem_type,
+				"divide_weight_sum": self.divide_weight_sum,
+				"num_classification_labels": self.num_classification_labels,
+				"classification_problem_type": self.classification_problem_type,
+			}
+		)
 
 
 @chex.dataclass

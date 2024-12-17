@@ -103,6 +103,12 @@ class EasyDeLBaseModule(
 		self.precision: lax.PrecisionLike = precision
 		self.rngs: nn.Rngs = rngs
 
+		# these useless call's are just here to init values in graphdef
+		_ = self.graphtree_params_shape
+		_ = self.mesh
+		_ = self.model_task
+		_ = self.model_type
+
 	@cached_property
 	def graphtree_params_shape(self) -> tp.Dict:
 		"""Evaluates the shape of the model's parameters and returns a dictionary."""
@@ -261,6 +267,24 @@ class EasyDeLBaseModule(
 		)[0]
 
 		return self._apply_sharding_fns(shard_fns)
+
+	@property
+	def _shard_fns(self):
+		mesh = self._get_mesh(None)
+		partition_specs = match_partition_rules(
+			rules=self._get_partition_rules(None),
+			params=self.graphtree_params_shape,
+		)
+		return make_shard_and_gather_fns(partition_specs=partition_specs, mesh=mesh)[0]
+
+	@property
+	def _gather_fns(self):
+		mesh = self._get_mesh(None)
+		partition_specs = match_partition_rules(
+			rules=self._get_partition_rules(None),
+			params=self.graphtree_params_shape,
+		)
+		return make_shard_and_gather_fns(partition_specs=partition_specs, mesh=mesh)[1]
 
 	def gather_model(
 		self,

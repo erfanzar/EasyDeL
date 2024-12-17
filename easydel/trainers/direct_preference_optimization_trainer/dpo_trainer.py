@@ -344,7 +344,6 @@ class DPOTrainer(BaseTrainer, ABC):
 			self.sharded_evaluation_step_function = functions.sharded_evaluation_step_function
 			self.mesh = functions.mesh
 			self.checkpoint_manager = functions.checkpoint_manager
-			self.initialize_state_function = functions.initialize_state_function
 		self.timer.log(operation_name)
 
 	def configure_dataloaders(self) -> TrainerConfigureDataloaderOutput:

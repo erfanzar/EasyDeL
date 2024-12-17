@@ -33,6 +33,24 @@ from easydel.utils.traversals import (
 
 logger = get_logger(__name__)
 
+ALLOWED_DATA_TYPES = [
+	jnp.int4,
+	jnp.int8,
+	jnp.int16,
+	jnp.int32,
+	jnp.int64,
+	jnp.uint4,
+	jnp.uint8,
+	jnp.uint16,
+	jnp.uint32,
+	jnp.uint64,
+	jnp.float16,
+	jnp.float32,
+	jnp.float64,
+	jnp.bfloat16,
+	jnp.float_,
+]
+
 
 def get_dtype(
 	array: jax.Array,
@@ -246,7 +264,7 @@ class CheckpointManager:
 				float_dtype,
 			)
 			for key, value in state.items()
-			if value is not None
+			if value is not None and value.dtype in ALLOWED_DATA_TYPES
 		}
 
 		safetensors.flax.save_file(tensors=state, filename=path, metadata=metadata)

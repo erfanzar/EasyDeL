@@ -1,6 +1,9 @@
 import os
 import sys
 
+import flax
+import flax.nnx
+
 dirname = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(dirname)
 sys.path.append(
@@ -11,23 +14,22 @@ sys.path.append(
 )
 os.environ["EKERNEL_OPS"] = "false"
 import fjformer
-import flax.core
 from datasets import Dataset, IterableDataset
 from jax import numpy as jnp
-from jax import random
+
 
 from easydel import (
 	AttentionMechanisms,
-	CausalLanguageModelTrainer,
+	Trainer,
 	EasyDeLOptimizers,
 	EasyDeLSchedulers,
-	FlaxLlamaForCausalLM,
+	LlamaForCausalLM,
 	LlamaConfig,
 	TrainingArguments,
 )
 
-TOTAL_BATCH_SIZE = 8
-UPPER = 200
+TOTAL_BATCH_SIZE = 1
+UPPER = 5
 NUM_TRAIN_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
 NUM_EVAL_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
 NUM_TRAIN_EPOCHS = 2
@@ -39,29 +41,25 @@ def main(use_iterable_dataset: bool):
 	max_training_steps = NUM_TRAIN_EXAMPLES // TOTAL_BATCH_SIZE * NUM_TRAIN_EPOCHS
 	max_evaluation_steps = NUM_EVAL_EXAMPLES // TOTAL_BATCH_SIZE
 	config = LlamaConfig(
-		head_dim=128,
-		hidden_size=512,
+		head_dim=16,
+		hidden_size=64,
 		num_attention_heads=8,
 		num_key_value_heads=4,
-		num_hidden_layers=4,
-		intermediate_size=1024,
+		num_hidden_layers=1,
+		intermediate_size=128,
 		max_position_embeddings=sequence_length,
-		attn_dtype=jnp.float16,
+		attn_dtype=jnp.float32,
 		attn_mechanism=AttentionMechanisms.VANILLA,
-		block_k=64,
-		block_q=64,
 	)
 
-	dtype = jnp.float16
-	model = FlaxLlamaForCausalLM(
+	dtype = jnp.float32
+	model = LlamaForCausalLM(
 		config=config,
-		_do_init=True,
 		dtype=dtype,
 		param_dtype=dtype,
+		rngs=flax.nnx.Rngs(0),
 	)
-	params = model.shard_model(model.params)
-
-	new_rng = rng.rng
+	model = model.shard_model()
 
 	def data_generator(num_rows: int):
 		ones = jnp.ones((sequence_length,), dtype="i4")
@@ -91,7 +89,8 @@ def main(use_iterable_dataset: bool):
 			data_generator,
 			gen_kwargs={"num_rows": NUM_EVAL_EXAMPLES},
 		)
-	trainer = CausalLanguageModelTrainer(
+
+	trainer = Trainer(
 		arguments=TrainingArguments(
 			model_name="CLM_TEST",
 			num_train_epochs=NUM_TRAIN_EPOCHS,
@@ -100,14 +99,11 @@ def main(use_iterable_dataset: bool):
 			max_training_steps=max_training_steps,
 			max_evaluation_steps=max_evaluation_steps,
 			do_train=True,
-			do_eval=True,
+			do_eval=False,
 			max_sequence_length=sequence_length,
-			
 			track_memory=True,
 			use_wandb=False,
 			learning_rate=3e-4,
-			label_smoothing_factor=0.1,
-			train_on_inputs=True,
 			do_last_save=True,
 			training_time="80Min",
 			optimizer=EasyDeLOptimizers.ADAMW,
@@ -119,9 +115,8 @@ def main(use_iterable_dataset: bool):
 		dataset_train=example_train_data,
 		dataset_eval=example_eval_data,
 	)
-
-	output = trainer.train(model_parameters=flax.core.FrozenDict({"params": params}))
-	trainer.save_pretrained(output.state, to_torch=True)
+	trainer.train()
+	# trainer.save_pretrained(output.state, to_torch=True)
 	exit(0)
 
 
