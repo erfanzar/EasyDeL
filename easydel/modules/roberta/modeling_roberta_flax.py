@@ -35,6 +35,7 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import (
 	ACT2FN,
+	auto_remat,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
@@ -560,13 +561,10 @@ class RobertaEncoder(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		block = RobertaLayer
-		# if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
-		# 	block = nn.remat(
-		# 		block,
-		# 		static_argnums=(5, 6, 7),
-		# 		policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-		# 	)
-
+		block = auto_remat(
+			block,
+			policy=config.gradient_checkpointing,
+		)
 		self.layer = [
 			block(
 				config=config,

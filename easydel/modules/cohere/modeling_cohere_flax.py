@@ -21,7 +21,6 @@ import jax
 import jax.numpy as jnp
 from flax import nnx as nn
 
-from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import register_module
 from easydel.infra.modeling_outputs import (
@@ -29,10 +28,10 @@ from easydel.infra.modeling_outputs import (
 	FlaxCausalLMOutput,
 )
 from easydel.infra.utils import (
+	auto_remat,
 	block_wise_ffn,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
-	get_gradient_checkpoint_policy,
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
@@ -340,18 +339,11 @@ class CohereBlock(nn.Module):
 		attn_block = CohereAttention
 		mlp_block = CohereMLP
 
-		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
-			attn_block = nn.remat(
-				CohereAttention,
-				static_argnums=(3, 5, 6, 7, 9),
-				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-			)
-
-			mlp_block = nn.remat(
-				CohereMLP,
-				static_argnums=(1,),
-				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-			)
+		attn_block, mlp_block = auto_remat(
+			attn_block,
+			mlp_block,
+			policy=config.gradient_checkpointing,
+		)
 		self.self_attn = attn_block(
 			config,
 			dtype=dtype,

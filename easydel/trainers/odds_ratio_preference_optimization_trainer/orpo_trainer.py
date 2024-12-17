@@ -36,8 +36,6 @@ from easydel.etils.etils import get_logger
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.trainers.base_trainer import (
 	BaseTrainer,
-	MetricsTracker,
-	StepMetrics,
 	TrainerConfigureDataloaderOutput,
 	TrainerConfigureFunctionOutput,
 )
@@ -55,6 +53,7 @@ from easydel.trainers.odds_ratio_preference_optimization_trainer.modelling_outpu
 from easydel.trainers.odds_ratio_preference_optimization_trainer.orpo_config import (
 	ORPOConfig,
 )
+from easydel.trainers.trainer_protocol import MetricsTracker, StepMetrics
 
 logger = get_logger(__name__)
 
@@ -542,13 +541,13 @@ class ORPOTrainer(BaseTrainer, ABC):
 
 		spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
 		empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=mesh)
-		create_sharded_state_from_params_function = jit(
+		create_state_sharded = jit(
 			create_state_from_params_function,
 			in_shardings=(spec_named_sharding.params,),
 			out_shardings=spec_named_sharding,
 			donate_argnums=(0,),
 		)
-		sharded_train_step_function = jit(
+		sharded_training_step_function = jit(
 			create_orpo_step_function(
 				mode="train",
 				beta=self.arguments.beta,
@@ -562,7 +561,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 			),
 		)
 
-		sharded_eval_step_function = jit(
+		sharded_evaluation_step_function = jit(
 			create_orpo_step_function(
 				mode="eval",
 				beta=self.arguments.beta,
@@ -583,9 +582,9 @@ class ORPOTrainer(BaseTrainer, ABC):
 		self.state_shape = state_shape
 
 		return TrainerConfigureFunctionOutput(
-			create_sharded_state_from_params_function=create_sharded_state_from_params_function,
-			sharded_train_step_function=sharded_train_step_function,
-			sharded_eval_step_function=sharded_eval_step_function,
+			create_state_sharded=create_state_sharded,
+			sharded_training_step_function=sharded_training_step_function,
+			sharded_evaluation_step_function=sharded_evaluation_step_function,
 			mesh=mesh,
 			checkpoint_manager=checkpoint_manager,
 			initialize_state_function=initialize_state_function,
@@ -648,7 +647,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 						empty_sharding = jax.sharding.NamedSharding(
 							spec=PartitionSpec(), mesh=self.arguments.get_mesh()
 						)
-						sharded_train_step_function = jit(
+						sharded_training_step_function = jit(
 							create_orpo_step_function(
 								mode="train",
 								beta=self.arguments.beta,
@@ -662,7 +661,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 							),
 						)
 
-						sharded_eval_step_function = jit(
+						sharded_evaluation_step_function = jit(
 							create_orpo_step_function(
 								mode="eval",
 								beta=self.arguments.beta,
@@ -679,8 +678,8 @@ class ORPOTrainer(BaseTrainer, ABC):
 						self.state_partition_spec = state_partition_spec
 						self.state_named_sharding = spec_named_sharding
 						self.state_shape = state_shape
-						self.sharded_train_step_function = sharded_train_step_function
-						self.sharded_eval_step_function = sharded_eval_step_function
+						self.sharded_training_step_function = sharded_training_step_function
+						self.sharded_evaluation_step_function = sharded_evaluation_step_function
 
 					if self.arguments.remove_ckpt_after_load:
 						os.remove(self.checkpoint_path)
@@ -690,9 +689,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 							"Model Parameters should be like FrozenDict({'params': params}) make sure to "
 							"pass as type FrozenDict in case of not getting UnExcepted Errors ",
 						)
-					sharded_state = self.create_sharded_state_from_params_function(
-						model_parameters
-					)
+					sharded_state = self.create_state_sharded(model_parameters)
 				elif model_parameters is not None and self.checkpoint_path is not None:
 					raise EasyDeLTimerError(
 						"You can't pass `model_parameters` and `checkpoint_path` at same time"
@@ -784,14 +781,12 @@ class ORPOTrainer(BaseTrainer, ABC):
 		operation_name = "configure functions and sharding them"
 		with self.timer(operation_name):
 			function_configurations = self.configure_functions()
-			self.create_sharded_state_from_params_function = (
-				function_configurations.create_sharded_state_from_params_function
+			self.create_state_sharded = function_configurations.create_state_sharded
+			self.sharded_training_step_function = (
+				function_configurations.sharded_training_step_function
 			)
-			self.sharded_train_step_function = (
-				function_configurations.sharded_train_step_function
-			)
-			self.sharded_eval_step_function = (
-				function_configurations.sharded_eval_step_function
+			self.sharded_evaluation_step_function = (
+				function_configurations.sharded_evaluation_step_function
 			)
 			self.mesh = function_configurations.mesh
 			self.checkpoint_manager = function_configurations.checkpoint_manager
@@ -1111,7 +1106,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 	def _execute_eval_step(self, state, batch):
 		"""Execute a single eval step."""
 		batch = {key: jnp.asarray(value) for key, value in batch.items()}
-		orpo_out = self.sharded_eval_step_function(state, batch)
+		orpo_out = self.sharded_evaluation_step_function(state, batch)
 		loss = orpo_out.loss
 		metrics = dict(
 			loss=loss,
@@ -1134,7 +1129,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 		try:
 			batch = {key: jnp.asarray(value) for key, value in batch.items()}
 
-			self.model_state, orpo_out = self.sharded_train_step_function(
+			self.model_state, orpo_out = self.sharded_training_step_function(
 				self.model_state, batch
 			)
 			# Apply post-gradient updates

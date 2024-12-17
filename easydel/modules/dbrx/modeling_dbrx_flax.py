@@ -22,15 +22,14 @@ import jax.numpy as jnp
 from fjformer.functions import auxiliary_load_balancing_loss_func
 from flax import nnx as nn
 
-from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import register_module
 from easydel.infra.modeling_outputs import MoeCausalLMOutput, MoeModelOutput
 from easydel.infra.utils import (
 	ACT2FN,
+	auto_remat,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
-	get_gradient_checkpoint_policy,
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
@@ -553,17 +552,11 @@ class DbrxBlock(nn.Module):
 		self.resid_pdrop = self.config.resid_pdrop
 		attn_block = DbrxNormAttentionNorm
 		ffn_block = DbrxFFN
-		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
-			attn_block = nn.remat(
-				attn_block,
-				static_argnums=(3, 5, 6, 7, 9),
-				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-			)
-			ffn_block = nn.remat(
-				ffn_block,
-				static_argnums=(1,),
-				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-			)
+		attn_block, ffn_block = auto_remat(
+			attn_block,
+			ffn_block,
+			policy=config.gradient_checkpointing,
+		)
 		self.norm_attn_norm = attn_block(
 			config=config,
 			dtype=dtype,

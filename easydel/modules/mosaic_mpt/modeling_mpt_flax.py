@@ -23,7 +23,6 @@ from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
 
-from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import register_module
 from easydel.infra.modeling_outputs import (
@@ -31,9 +30,9 @@ from easydel.infra.modeling_outputs import (
 	FlaxCausalLMOutput,
 )
 from easydel.infra.utils import (
+	auto_remat,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
-	get_gradient_checkpoint_policy,
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
@@ -259,17 +258,11 @@ class MptBlock(nn.Module):
 		self.rngs = rngs
 		attn_block = MptAttention
 		mlp_block = MptMLP
-		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
-			mlp_block = nn.remat(
-				mlp_block,
-				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-				static_argnums=(2,),
-			)
-			attn_block = nn.remat(
-				attn_block,
-				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-				static_argnums=(2, 3, 5, 6, 7, 8),
-			)
+		attn_block, mlp_block = auto_remat(
+			attn_block,
+			mlp_block,
+			policy=config.gradient_checkpointing,
+		)
 
 		self.norm_1 = nn.LayerNorm(
 			config.hidden_size,

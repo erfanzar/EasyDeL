@@ -46,6 +46,7 @@ from easydel.etils.etils import (
 	EasyDeLSchedulers,
 	get_logger,
 )
+from easydel.infra.loss_utils import LossConfig
 from easydel.trainers.utils import JaxDistributedConfig
 
 try:
@@ -65,107 +66,6 @@ AVAILABLE_BACKENDS: List[str] = ["cpu", "gpu", "tpu", None]
 
 @dataclass
 class TrainingArguments:
-	"""
-	Data class containing all the arguments for training a EasyDeL model.
-
-	Attributes:
-	    model_name (Optional[str]): Name of the model.
-	    num_train_epochs (Optional[int]): Number of training epochs.
-	    model_class (Optional[EasyDeLBaseModule]): The EasyDeL Flax Pretrained Model class to use.
-	    total_batch_size (int): Total batch size for training.
-	    eval_batch_size (int): Total batch size for evaluation of model.
-	    max_training_steps (Optional[int]): Maximum number of training steps.
-	    max_evaluation_steps (Optional[int]):  Maximum number of evaluation steps.
-	    optimizer (AVAILABLE_OPTIMIZERS): Optimizer to use for training.
-	    scheduler (AVAILABLE_SCHEDULERS): Learning rate scheduler to use.
-	    learning_rate (float): The initial learning rate.
-	    learning_rate_end (Optional[float]): The final learning rate for schedulers that support it.
-	    gradient_accumulation_steps (int): Number of steps for gradient accumulation.
-	    weight_decay (float): Weight decay applied to parameters.
-	    label_smoothing_factor (float): Label smoothing factor.
-	    z_loss (float): Coefficient for the z-loss term.
-	    gradient_checkpointing (AVAILABLE_GRADIENT_CHECKPOINTS): Gradient checkpointing strategy to use.
-	    clip_grad (Optional[float]): If provided, gradients will be clipped to this maximum norm.
-	    max_sequence_length (Optional[int]): Maximum sequence length for model input.
-	    is_fine_tuning (bool): Whether the model is being fine-tuned.
-	    do_train (bool): Whether to run training.
-	    do_eval  (bool): Whether to run evaluation.
-	    train_on_inputs (bool): Whether to train on model inputs (as opposed to labels).
-	    backend (Optional[str]): Backend to use for JAX computation.
-	    extra_optimizer_kwargs (dict):  Extra keyword arguments passed to the optimizer.
-	    save_steps (Optional[int]): Save checkpoints every specified number of steps.
-	    save_dir (str): Directory to save checkpoints.
-	    save_total_limit (Optional[int]): Total number of checkpoints to keep.
-	    use_wandb (bool): Whether to use Weights & Biases for logging.
-	    ids_to_pop_from_dataset (Optional[list]): List of IDs to remove from the dataset.
-	    remove_ckpt_after_load (bool): Remove checkpoint files after loading the model.
-	    configs_to_initialize_model_class (Optional[dict]): Configurations used to initialize the model class.
-	    do_last_save (bool): Whether to save the final model checkpoint.
-	    model_parameters (Optional[dict]): Model parameters for initialization.
-	    track_memory (Optional[bool]): Whether to track memory usage during training.
-	    loss_re_mat (str): Regular expression for loss rematerialization.
-	    loss_chunk (int): Chunk size for loss computation.
-	    truncation_mode (Literal["keep_end", "keep_start"]): Truncation mode for handling long sequences.
-	    warmup_steps (int): Number of warm-up steps for the scheduler.
-	    step_partition_spec (PartitionSpec): Partition specification for stepping the optimizer.
-	    training_time (Optional[str]): Maximum training time in the format "50min" or "23h".
-	    dataloader_num_workers (Optional[int]): Number of workers for the dataloader.
-	    dataloader_pin_memory (Optional[bool]): Pin memory for the dataloader.
-	    jax_distributed_config (Optional[dict]): Configuration for JAX distributed training.
-	    log_all_workers (bool): Log metrics from all workers (used with WandB).
-	    wandb_entity (Optional[str]): WandB entity to log metrics to.
-	    save_optimizer_state (bool): Save optimizer state in checkpoints.
-	    step_start_point (Optional[int]): Starting step for training (resuming from checkpoint).
-	    verbose (bool): Print verbose logs during training.
-	    offload_device (jax.Device): Device to offload computations to.
-			pruning_module (Optional[AVAILABLE_PRUNING_TYPE]): Configuration Pruning Module.
-			sparse_module_type (AVAILABLE_SPARSE_MODULE_TYPES): sparse model type to be used to prune the params.
-			sparsify_module (bool): whenever to use sparse apply method for faster and better training.
-	    state_apply_fn_kwarguments_to_model (Optional[dict]): Keyword arguments for the model's apply function.
-	    remove_unused_columns (bool): Remove unused columns from the dataset.
-	    force_batch_and_gradient_accumulation_steps_calculation (bool): Force calculation of batch and gradient accumulation steps.
-	    performance_mode (bool): Enable performance mode for faster training.
-	    neftune_noise_alpha (Optional[float]): NEFTune noise alpha parameter.
-	    log_grad_norms (bool): Log gradient norms during training.
-	    loaded_model_config_kwargs (Optional[dict]): Keyword arguments from loaded model configuration.
-			num_classification_labels (Optional[int]): num classification labels for SequenceClassification Trainer
-			classification_problem_type (Literal["regression", "single_label_classification", "multi_label_classification"]): num classification labels for SequenceClassification Trainer
-
-	Methods:
-	    __post_init__(): Validates configuration and sets up distributed training, optimizer, logging, and XRapTure.
-	    _validate_config(): Validates the configuration settings.
-	    _setup_distributed(): Sets up JAX distributed training.
-	    _setup_optimizer(): Configures the optimizer and scheduler.
-	    _setup_logging(): Sets up logging (TensorBoard, WandB).
-	    _setup_rapture(): Sets up XRapTure if enabled.
-	    _ensure_variables(): Checks and sets up variables for start.
-	    _time_to_seconds(time_str: str) -> int:
-	        Converts a time string ("50min", "23h") to seconds.
-	    get_path(self) -> pathlib.Path:
-	        Returns the path to the checkpoint directory.
-	    ensure_checkpoint_path(self):
-	        Creates the checkpoint directory if it doesn't exist.
-	    get_mesh(self):
-	        Returns the JAX device mesh for distributed training.
-	    get_mesh_names():
-	        Returns the names of the mesh dimensions.
-	    get_optimizer_and_scheduler(self, steps: Optional[int] = None):
-	        Returns the configured optimizer and scheduler.
-	    get_streaming_checkpointer(self):
-	        Returns the checkpoint manager for saving checkpoints.
-	    get_tensorboard(self):
-	        Returns the TensorBoard SummaryWriter for logging.
-	    get_wandb_init(self):
-	        Initializes WandB if enabled.
-	    log_metrics(self, metrics: Dict[str, Union[float, List, Tuple, np.ndarray, 'jnp.ndarray', 'torch.Tensor']], step: int):
-	        Logs metrics to TensorBoard and/or WandB.
-	    to_dict(self) -> Dict[str, Any]:
-	        Returns the configuration as a dictionary.
-	    from_dict(cls, config: Dict[str, Any]) -> 'TrainingArguments':
-	        Creates a TrainingArguments instance from a dictionary.
-	    __str__(self): Returns a string representation of the configuration.
-	"""
-
 	model_name: str = "Model"
 	num_train_epochs: int = 10
 	model_class: Optional[EasyDeLBaseModule] = None
@@ -180,8 +80,7 @@ class TrainingArguments:
 	gradient_accumulation_steps: int = 1
 	clip_grad: Optional[float] = None
 	weight_decay: float = 0.01
-	label_smoothing_factor: float = 0.0
-	z_loss: float = 0.0
+	loss_config: Optional[LossConfig] = None
 	gradient_checkpointing: AVAILABLE_GRADIENT_CHECKPOINTS = (
 		EasyDeLGradientCheckPointers.NONE
 	)
@@ -202,7 +101,7 @@ class TrainingArguments:
 	do_last_save: bool = True
 	model_parameters: Optional[dict] = None
 	track_memory: Optional[bool] = None
-	loss_re_mat: str = ""
+
 	loss_chunk: int = 1024
 	truncation_mode: Literal["keep_end", "keep_start"] = "keep_end"
 	warmup_steps: int = 500
@@ -227,10 +126,6 @@ class TrainingArguments:
 	neftune_noise_alpha: Optional[float] = None
 	log_grad_norms: bool = True
 	loaded_model_config_kwargs: Optional[dict] = None
-	num_classification_labels: Optional[int] = None
-	classification_problem_type: Literal[
-		"regression", "single_label_classification", "multi_label_classification"
-	] = "regression"
 
 	def __post_init__(self):
 		"""

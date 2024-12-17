@@ -12,12 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 import time
 import typing
 from typing import Any, Callable, Mapping, Optional
 
-import flax
 import jax
 import termcolor
 from fjformer.sharding import match_partition_rules
@@ -31,17 +29,11 @@ from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import get_logger
 from easydel.trainers.base_trainer import (
 	BaseTrainer,
-	MetricsTracker,
-	StepMetrics,
 	TrainerConfigureFunctionOutput,
 )
-from easydel.trainers.causal_language_model_trainer.functions import (
-	create_casual_language_model_evaluation_step,
-	create_casual_language_model_train_step,
-)
-from easydel.trainers.causal_language_model_trainer.modeling_output import (
-	CausalLMTrainerOutput,
-)
+from easydel.trainers.trainer._fn import create_evaluation_step, create_training_step
+from easydel.trainers.trainer.modeling_output import TrainerOutput
+from easydel.trainers.trainer_protocol import MetricsTracker, StepMetrics
 
 logger = get_logger(__name__)
 
@@ -100,77 +92,35 @@ class Trainer(BaseTrainer):
 		if self.arguments.sparsify_module:
 			self.model.__call__ = sparse.sparsify(self.model.__call__)
 
-		def create_state_from_params_function(parameters):
+		def create_state():
 			"""
-			Creates an EasyDeLState object from given parameters.
-
-			This function is used when loading a model from pretrained parameters
-			or a checkpoint.
-
-			Args:
-			    parameters (FrozenDict): The model parameters.
-
+			Creates an EasyDeLState object.
 			Returns:
-			    EasyDeLState: The EasyDeLState object initialized with the provided parameters.
+			    EasyDeLState: The EasyDeLState object initialized.
 			"""
-			if self.rapture is None:
-				return EasyDeLState.create(
-					tx=self.tx,
-					params=parameters,
-					apply_fn=self.model.__call__,
-					module_config=copy.deepcopy(self.model.config),
-					tx_init=copy.deepcopy(self.arguments.optimizer_kwargs),
-					hyperparameters=EasyDeLState.create_hyperparameters(
-						self.model.config.model_type
-					),
-					module=self.model,
-					module_config_args=None,
-				)
-			else:
-				return EasyDeLState(
-					step=0,
-					apply_fn=self.lora_apply_fn,
-					params=parameters,
-					tx=self.lora_tx,
-					opt_state=self.lora_opt_state,
-					tx_init=EasyDeLState.safe_dict(
-						copy.deepcopy(self.arguments.optimizer_kwargs)
-					),
-					hyperparameters=EasyDeLState.create_hyperparameters(
-						self.model.config.model_type
-					),
-					module=self.lora_model,
-					module_config=self.model.config,
-					module_config_args=None,
-				)
+			return EasyDeLState.create(
+				model=self.model,
+				tx=self.tx,
+				init_opt_state=True,
+			)
 
+		state_shape = jax.eval_shape(lambda: create_state())
 		state_partition_spec = match_partition_rules(
-			(
-				self.config.get_partition_rules(
-					fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
-				)
-				if self.arguments.custom_rule is None
-				else self.arguments.custom_rule
-			),
+			self.model.config.get_partition_rules(),
 			state_shape,
 		)
 
 		spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
 		empty_sharding = jax.sharding.NamedSharding(
 			spec=PartitionSpec(),
-			mesh=self.arguments.get_mesh(),
+			mesh=self.model.mesh,
 		)
-		create_sharded_state_from_params_function = jax.jit(
-			create_state_from_params_function,
-			in_shardings=(spec_named_sharding.params,),
-			out_shardings=spec_named_sharding,
-			donate_argnums=(0,),
-		)
-		sharded_train_step_function = jax.jit(
-			create_casual_language_model_train_step(
+		create_state_sharded = jax.jit(create_state, out_shardings=spec_named_sharding)
+		sharded_training_step_function = jax.jit(
+			create_training_step(
 				partition_spec=self.arguments.step_partition_spec,
-				label_smoothing_factor=self.arguments.label_smoothing_factor,
-				z_loss=self.arguments.z_loss,
+				loss_config=self.arguments.loss_config,
+				learning_rate_fn=self.scheduler,
 				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
 			),
 			in_shardings=(spec_named_sharding, empty_sharding),
@@ -178,12 +128,13 @@ class Trainer(BaseTrainer):
 			donate_argnums=(0, 0),
 		)
 
-		sharded_eval_step_function = jax.jit(
-			create_casual_language_model_evaluation_step(
+		sharded_evaluation_step_function = jax.jit(
+			create_evaluation_step(
 				partition_spec=self.arguments.step_partition_spec,
+				loss_config=self.arguments.loss_config,
 			),
 			in_shardings=(spec_named_sharding, empty_sharding),
-			out_shardings=(empty_sharding, empty_sharding, empty_sharding),
+			out_shardings=(empty_sharding),
 			donate_argnums=(0, 0),
 		)
 
@@ -195,39 +146,33 @@ class Trainer(BaseTrainer):
 		self.state_shape = state_shape
 
 		return TrainerConfigureFunctionOutput(
-			create_sharded_state_from_params_function=create_sharded_state_from_params_function,
-			sharded_train_step_function=sharded_train_step_function,
-			sharded_eval_step_function=sharded_eval_step_function,
+			create_state_sharded=create_state_sharded,
+			sharded_training_step_function=sharded_training_step_function,
+			sharded_evaluation_step_function=sharded_evaluation_step_function,
 			mesh=mesh,
 			checkpoint_manager=checkpoint_manager,
 		)
 
 	def _run_training_loop(
 		self,
-		sharded_state: EasyDeLState,
+		state: EasyDeLState,
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
-		start_time: float,
-		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
 	):
 		"""Core training loop implementation."""
 		pbar = tqdm(total=self.max_training_steps)
-		current_step = int(jax.device_get(sharded_state.step))
+		current_step = int(jax.device_get(state.step))
 		run_exception = None
 		with self.mesh:
 			for epoch in range(self.arguments.num_train_epochs):
-				sharded_state, current_step, run_exception = self._train_epoch(
-					sharded_state,
-					self.dataloader_train,
-					current_step,
-					metrics_tracker,
-					step_metrics,
-					pbar,
-					start_time,
-					epoch,
-					shard_fns,
-					gather_fns,
+				state, current_step, run_exception = self._train_epoch(
+					state=state,
+					train_dataset=self.dataloader_train,
+					current_step=current_step,
+					metrics_tracker=metrics_tracker,
+					step_metrics=step_metrics,
+					pbar=pbar,
+					epoch=epoch,
 				)
 
 				if current_step >= self.max_training_steps:
@@ -235,15 +180,12 @@ class Trainer(BaseTrainer):
 				if run_exception is not None:
 					break
 		return self._prepare_training_output(
-			sharded_state=sharded_state,
-			shard_fns=shard_fns,
-			gather_fns=gather_fns,
-			run_exception=run_exception,
+			state=state, run_exception=run_exception
 		), run_exception
 
 	def _run_evaluation(
 		self,
-		sharded_state: EasyDeLState,
+		state: EasyDeLState,
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
 		start_time: float,
@@ -251,10 +193,10 @@ class Trainer(BaseTrainer):
 		"""Core evaluation loop implementation."""
 		pbar = tqdm(total=self.max_evaluation_steps)
 		pbar.set_description("evaluation process")
-		current_step = int(jax.device_get(sharded_state.step))
+		current_step = int(jax.device_get(state.step))
 		with self.mesh:
 			for eval_metrics in self._eval_epoch(
-				sharded_state,
+				state,
 				self.dataloader_eval,
 				current_step,
 				metrics_tracker,
@@ -266,16 +208,13 @@ class Trainer(BaseTrainer):
 
 	def _train_epoch(
 		self,
-		sharded_state: EasyDeLState,
+		state: EasyDeLState,
 		train_dataset: int,
 		current_step: int,
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
 		pbar: tqdm,
-		start_time: float,
 		epoch: int,
-		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
 	):
 		"""Handles training for a single epoch."""
 		train_iter = iter(train_dataset)
@@ -287,16 +226,19 @@ class Trainer(BaseTrainer):
 					continue
 				step_metrics.start_step()
 			except (KeyboardInterrupt, EasyDeLTimerError, StopIteration) as exect:
-				return sharded_state, current_step, exect
+				return state, current_step, exect
 
 			# Execute training step
-			sharded_state, loss, metrics, run_exception = self._execute_train_step(
-				sharded_state, batch
+			state, loss, metrics, run_exception = self._execute_train_step(
+				state=state,
+				batch=batch,
 			)
 			# Update and log metrics
 			try:
 				mean_loss, mean_accuracy = metrics_tracker.update(
-					loss, metrics["accuracy"], current_step
+					loss=loss,
+					accuracy=metrics.accuracy,
+					step=current_step,
 				)
 
 				train_metrics = step_metrics.calculate(
@@ -325,22 +267,21 @@ class Trainer(BaseTrainer):
 				# Save checkpoint if needed
 				if self._should_save_checkpoint(current_step):
 					_ = self._save_state(
-						state=sharded_state,
-						gather_fns=gather_fns,
+						state=state,
 						milestone=True,
 						save_dir=self.arguments.save_dir,
 					)
 
 				current_step += 1
 			except (KeyboardInterrupt, EasyDeLTimerError):
-				return sharded_state, current_step, run_exception
+				return state, current_step, run_exception
 			if run_exception is not None:
 				break
-		return sharded_state, current_step, run_exception
+		return state, current_step, run_exception
 
 	def _eval_epoch(
 		self,
-		sharded_state: EasyDeLState,
+		state: EasyDeLState,
 		eval_dataset: int,
 		current_step: int,
 		metrics_tracker: MetricsTracker,
@@ -354,7 +295,7 @@ class Trainer(BaseTrainer):
 			try:
 				batch = self._get_next_batch(eval_iter)
 				step_metrics.start_step()
-				loss, metrics = self._execute_eval_step(sharded_state, batch)
+				loss, metrics = self._execute_eval_step(state, batch)
 				mean_loss, mean_accuracy = metrics_tracker.update(
 					loss, metrics["accuracy"], current_step
 				)
@@ -385,38 +326,31 @@ class Trainer(BaseTrainer):
 
 	def _execute_eval_step(self, state, batch):
 		"""Execute a single eval step."""
-		loss, accuracy, aux_loss = self.sharded_eval_step_function(state, batch)
+		loss, accuracy, aux_loss = self.sharded_evaluation_step_function(state, batch)
 		return loss, dict(loss=loss, accuracy=accuracy, aux_loss=aux_loss)
 
 	def _execute_train_step(self, state, batch):
 		"""Execute a single training step."""
 		if self.pruning_module is not None:
 			state = state.replace(
-				params=self.pruning_module.pre_forward_update(
-					state.params,
+				graphstate=self.pruning_module.pre_forward_update(
+					state.graphstate,
 					state.opt_state,
 				)
 			)
 
 		# Forward and backward pass
 		try:
-			state, loss, metrics = self.sharded_train_step_function(state, batch)
+			state, loss, metrics = self.sharded_training_step_function(state, batch)
 			# Apply post-gradient updates
 			if self.pruning_module is not None:
 				state = state.replace(
-					params=self.pruning_module.post_gradient_update(
-						state.params,
+					graphstate=self.pruning_module.post_gradient_update(
+						state.graphstate,
 						state.opt_state,
 					)
 				)
 
-			if self.arguments.log_grad_norms:
-				metrics.update(
-					{
-						"train/max_grad_norm": metrics["max_grad_norm"].tolist(),
-						"train/mean_grad_norm": metrics["mean_grad_norm"].tolist(),
-					}
-				)
 			return state, loss, metrics, None
 		except (KeyboardInterrupt, EasyDeLTimerError) as run_exception:
 			return state, loss, metrics, run_exception
@@ -427,7 +361,7 @@ class Trainer(BaseTrainer):
 			if self.arguments.merge_lora_rapture_parameters and self.rapture:
 				termcolor.cprint("Merging LoRA Parameters.", color="cyan", force_color=True)
 				output.state = output.state.replace(
-					params=self.rapture.merge_parameters(output.state.params)
+					graphstate=self.rapture.merge_parameters(output.state.graphstate)
 				)
 
 		if self.arguments.do_eval:
@@ -438,30 +372,18 @@ class Trainer(BaseTrainer):
 
 		return output
 
-	def train(
-		self,
-		model_parameters: Optional[flax.core.FrozenDict] = None,
-		state: Optional[EasyDeLState] = None,
-	) -> CausalLMTrainerOutput:
-		start_time = time.time()
-
-		sharded_state, shard_fns, gather_fns = self.initialize_state(
-			model_parameters=model_parameters, state=state
-		)
-
+	def train(self) -> TrainerOutput:
+		state = self.state
 		metrics_tracker = MetricsTracker()
 		step_metrics = StepMetrics(self.arguments)
 
 		# Setup initial metrics and logging
-		self._setup_initial_metrics(sharded_state)
+		self._setup_initial_metrics(state)
 
 		output, run_exception = self._run_training_loop(
-			sharded_state=sharded_state,
+			state=self.state,
 			metrics_tracker=metrics_tracker,
 			step_metrics=step_metrics,
-			start_time=start_time,
-			shard_fns=shard_fns,
-			gather_fns=gather_fns,
 		)
 		return self._finalize_training(output, run_exception)
 
@@ -489,7 +411,7 @@ class Trainer(BaseTrainer):
 		step_metrics = StepMetrics(self.arguments)
 
 		for metrics in self._run_evaluation(
-			sharded_state=model_state,
+			state=model_state,
 			metrics_tracker=metrics_tracker,
 			step_metrics=step_metrics,
 			start_time=start_time,

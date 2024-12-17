@@ -64,10 +64,13 @@ def main(use_iterable_dataset: bool):
 	new_rng = rng.rng
 
 	def data_generator(num_rows: int):
+		ones = jnp.ones((sequence_length,), dtype="i4")
+
 		for _ in range(num_rows):
 			yield {
-				"attention_mask": jnp.ones((sequence_length,), dtype="i4"),
-				"input_ids": random.randint(new_rng, (sequence_length,), 0, 32000, dtype="i4"),
+				"attention_mask": ones,
+				"input_ids": ones.at[-1].set(0),
+				"labels": ones.at[-1].set(0),
 			}
 
 	if not use_iterable_dataset:
@@ -99,8 +102,7 @@ def main(use_iterable_dataset: bool):
 			do_train=True,
 			do_eval=True,
 			max_sequence_length=sequence_length,
-			dtype=dtype,
-			param_dtype=dtype,
+			
 			track_memory=True,
 			use_wandb=False,
 			learning_rate=3e-4,

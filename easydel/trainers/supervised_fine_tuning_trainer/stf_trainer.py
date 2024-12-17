@@ -19,7 +19,7 @@ from typing import Callable, Dict, Optional, Union
 from easydel.etils.etils import get_logger
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.trainers.base_trainer import TrainerConfigureDataloaderOutput
-from easydel.trainers.causal_language_model_trainer import CausalLanguageModelTrainer
+from easydel.trainers.trainer import Trainer
 from easydel.trainers.training_configurations import TrainingArguments
 from easydel.trainers.utils import (
 	create_constant_length_dataset,
@@ -29,7 +29,7 @@ from easydel.trainers.utils import (
 logger = get_logger(__name__)
 
 
-class SFTTrainer(CausalLanguageModelTrainer, ABC):
+class SFTTrainer(Trainer, ABC):
 	"""
 	Trainer class for Supervised Fine-Tuning (SFT) of language models.
 

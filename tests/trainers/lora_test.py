@@ -18,7 +18,6 @@ from jax import random
 from easydel import (
 	AttentionMechanisms,
 	CausalLanguageModelTrainer,
-	LoraRaptureConfig,
 	MistralConfig,
 	MistralForCausalLM,
 	TrainingArguments,
@@ -96,15 +95,6 @@ def main(use_iterable_dataset: bool):
 			z_loss=0.0001,
 			train_on_inputs=True,
 			do_last_save=True,
-			rapture_config=LoraRaptureConfig(
-				parameters=flax.core.FrozenDict({"params": params}),
-				lora_dim=64,
-				fully_fine_tune_parameters=["o_proj"],
-				lora_fine_tune_parameters=["q_proj", "v_proj", "k_proj"],
-				tune_vectors=True,
-				verbose=False,
-				dtype=jnp.float32,
-			),
 		),
 		dataset_train=example_train_data,
 		dataset_eval=example_eval_data,

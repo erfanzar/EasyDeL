@@ -3,13 +3,15 @@ from easydel.infra.base_config import (
 	EasyDeLBaseConfigDict,
 )
 from easydel.infra.base_module import (
-	EasyDeLBaseModule,
-	EasyDeLBaseVisionModule,
+	EasyDeLBaseModule, 
+)
+from easydel.infra.loss_utils import (
+	LossConfig,
 )
 
 __all__ = (
 	"EasyDeLBaseModule",
-	"EasyDeLBaseVisionModule",
 	"EasyDeLBaseConfig",
 	"EasyDeLBaseConfigDict",
+	"LossConfig",
 )

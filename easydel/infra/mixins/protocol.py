@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from abc import ABC
 import typing as tp
 
 import chex
@@ -20,7 +21,10 @@ from jax.sharding import Mesh
 
 from easydel.etils.etils import EasyDeLQuantizationMethods
 from easydel.infra.base_config import EasyDeLBaseConfig
-from easydel.infra.loss_utils import LossConfig
+from easydel.infra.loss_utils import (
+	LossConfig,
+	LossMetrics,
+)
 from easydel.infra.modeling_outputs import (
 	FlaxCausalLMOutput,
 	FlaxSequenceClassifierOutput,
@@ -168,7 +172,7 @@ def prettify_nnx(
 	return "\n".join(output)
 
 
-class BaseModuleProtocol(nn.Module):
+class BaseModuleProtocol(ABC):
 	"""
 	Protocol defining the common interface for EasyDeL modules.
 	"""
@@ -330,7 +334,7 @@ class BaseModuleProtocol(nn.Module):
 		return_dict: bool = True,
 		loss_config: tp.Optional[LossConfig] = None,
 		loss_kwargs: tp.Optional[tp.Dict] = None,
-	) -> tp.Union[FlaxCausalLMOutput, tp.Tuple]:
+	) -> tp.Tuple[FlaxCausalLMOutput, LossMetrics]:
 		"""
 		Computes the loss for Causal Language Models.
 
@@ -347,8 +351,8 @@ class BaseModuleProtocol(nn.Module):
 		    return_dict: If True, returns a dictionary containing model outputs along with loss. Otherwise, return a tuple.
 
 		Returns:
-		    A FlaxCausalLMOutput if return_dict is True, or a tuple containing
-		    model outputs including the loss. See return type for more details.
+		    A FlaxCausalLMOutput and a tuple containing model outputs including the loss.
+				See return type for more details.
 		"""
 
 	@tp.overload
@@ -365,7 +369,7 @@ class BaseModuleProtocol(nn.Module):
 		return_dict: bool = True,
 		loss_config: tp.Optional[LossConfig] = None,
 		loss_kwargs: tp.Optional[tp.Dict] = None,
-	) -> tp.Union[FlaxSequenceClassifierOutput, tp.Tuple]:
+	) -> tp.Tuple[FlaxSequenceClassifierOutput, LossMetrics]:
 		"""
 		Computes the loss for Sequence Classification Models.
 
@@ -381,8 +385,8 @@ class BaseModuleProtocol(nn.Module):
 		    return_dict: If True, returns a dictionary containing model outputs along with loss. Otherwise, return a tuple.
 
 		Returns:
-		    A FlaxSequenceClassifierOutput if return_dict is True, or a tuple containing
-		    model outputs including the loss. See return type for more details.
+		    A FlaxSequenceClassifierOutput and a tuple containing model outputs including the loss.
+				See return type for more details.
 		"""
 
 	@tp.overload
@@ -401,7 +405,7 @@ class BaseModuleProtocol(nn.Module):
 		return_dict: bool = True,
 		loss_config: tp.Optional[LossConfig] = None,
 		loss_kwargs: tp.Optional[tp.Dict] = None,
-	) -> tp.Union[MoeModelOutput, tp.Tuple]:
+	) -> tp.Tuple[MoeModelOutput, LossMetrics]:
 		"""
 		Computes the loss for Mixture-of-Experts (MoE) Models.
 
@@ -419,8 +423,8 @@ class BaseModuleProtocol(nn.Module):
 		    return_dict: If True, returns a dictionary containing model outputs along with loss. Otherwise, return a tuple.
 
 		Returns:
-		     A MoeModelOutput if return_dict is True, or a tuple containing
-		    model outputs including the loss. See return type for more details.
+		    A MoeModelOutput and a tuple containing model outputs including the loss.
+				See return type for more details.
 		"""
 
 	@tp.overload
@@ -439,7 +443,7 @@ class BaseModuleProtocol(nn.Module):
 		return_dict: bool = True,
 		loss_config: tp.Optional[LossConfig] = None,
 		loss_kwargs: tp.Optional[tp.Dict] = None,
-	) -> tp.Union[MoeCausalLMOutput, tp.Tuple]:
+	) -> tp.Tuple[MoeCausalLMOutput, LossMetrics]:
 		"""
 		Computes the loss for Mixture-of-Experts (MoE) Causal Language Models.
 
@@ -457,9 +461,20 @@ class BaseModuleProtocol(nn.Module):
 		    return_dict: If True, returns a dictionary containing model outputs along with loss. Otherwise, return a tuple.
 
 		Returns:
-		    A MoeCausalLMOutput if return_dict is True, or a tuple containing
-		    model outputs including the loss. See return type for more details.
+		    A MoeCausalLMOutput and a tuple containing model outputs including the loss.
+				See return type for more details.
 		"""
+
+	@tp.overload
+	def compute_loss(
+		self,
+		*,
+		labels: tp.Optional[chex.Array] = None,
+		loss_config: tp.Optional[LossConfig] = None,
+		loss_kwargs: tp.Optional[tp.Dict] = None,
+		**batch,
+	) -> tp.Tuple[tp.Any, LossMetrics]:
+		"""basic `compute_loss` call"""
 
 	def half(self):
 		"""Converts Model paramters to float16."""

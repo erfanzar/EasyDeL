@@ -31,6 +31,7 @@ from jax.sharding import Mesh
 from optax import GradientTransformation, Schedule
 
 from easydel.etils.easystate import EasyDeLState
+from easydel.infra.loss_utils import LossMetrics
 from easydel.utils.traversals import flatten_dict
 
 try:
@@ -69,11 +70,11 @@ class TrainerConfigureModelOutput:
 
 @dataclass
 class TrainerConfigureFunctionOutput:
-	create_sharded_state_from_params_function: Callable
-	sharded_train_step_function: Callable
+	create_state_sharded: Callable
+	sharded_training_step_function: Callable
 	mesh: Mesh
 	checkpoint_manager: CheckpointManager
-	sharded_eval_step_function: Optional[Callable] = None
+	sharded_evaluation_step_function: Optional[Callable] = None
 
 
 @dataclass
@@ -108,22 +109,16 @@ class BaseTrainerProtocol(ABC):
 	scheduler: Any
 	tx: Any  # optax
 	model_state: Any  # flax.core.FrozenDict
-	rapture: Any
-	lora_parameters: Any
-	lora_model: Any
-	lora_tx: Any
-	lora_opt_state: Any
-	lora_apply_fn: Any
-	create_sharded_state_from_params_function: Callable
-	sharded_train_step_function: Callable
-	sharded_eval_step_function: Callable
+	create_state_sharded: Callable
+	sharded_training_step_function: Callable
+	sharded_evaluation_step_function: Callable
 	initialize_state_function: Callable
 	mesh: Any
 	checkpoint_manager: Any
 	state_shape: Any
 	state_partition_spec: Any
 	state_named_sharding: Any
-	sharded_state: Any
+	state: Any
 	pruning_module: Any
 
 	_base_model: Any
@@ -200,6 +195,11 @@ class BaseTrainerProtocol(ABC):
 		...
 
 	@abstractmethod
+	def _configure_state(self):
+		"""Configures and JIT-compiles the sharded state"""
+		...
+
+	@abstractmethod
 	def create_collect_function(
 		self,
 		max_sequence_length: int,
@@ -228,13 +228,6 @@ class BaseTrainerProtocol(ABC):
 	def configure_model(self) -> TrainerConfigureModelOutput:
 		"""
 		Configures the model, optimizer, scheduler, and configuration.
-		"""
-		...
-
-	@abstractmethod
-	def _configure_custom_model(self, extra_configs):
-		"""
-		Configures a custom model provided by the user.
 		"""
 		...
 
@@ -370,11 +363,6 @@ class BaseTrainerProtocol(ABC):
 		...
 
 	@abstractmethod
-	def get_layer_names(self, frozen_dict, prefix=""):
-		"""Recursively retrieves layer names and their corresponding parameter arrays from a FrozenDict."""
-		...
-
-	@abstractmethod
 	def _should_skip_step(self, current_step):
 		"""Determine if current step should be skipped."""
 		...
@@ -387,7 +375,7 @@ class BaseTrainerProtocol(ABC):
 	@abstractmethod
 	def _prepare_training_output(
 		self,
-		sharded_state: EasyDeLState,
+		state: EasyDeLState,
 		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
 		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
 		run_exception: Optional[Exception] = None,
@@ -398,7 +386,7 @@ class BaseTrainerProtocol(ABC):
 	@abstractmethod
 	def _handle_training_interruption(
 		self,
-		sharded_state: EasyDeLState,
+		state: EasyDeLState,
 		exception: Exception,
 		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
 		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
@@ -407,7 +395,7 @@ class BaseTrainerProtocol(ABC):
 		...
 
 	@abstractmethod
-	def _setup_initial_metrics(self, sharded_state):
+	def _setup_initial_metrics(self, state):
 		"""Setup initial metrics logging."""
 		...
 
@@ -430,7 +418,7 @@ class BaseTrainerProtocol(ABC):
 	@abstractmethod
 	def _run_training_loop(
 		self,
-		sharded_state: EasyDeLState,
+		state: EasyDeLState,
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
 		start_time: float,
@@ -443,7 +431,7 @@ class BaseTrainerProtocol(ABC):
 	@abstractmethod
 	def _run_evaluation(
 		self,
-		sharded_state: EasyDeLState,
+		state: EasyDeLState,
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
 		start_time: float,
@@ -454,7 +442,7 @@ class BaseTrainerProtocol(ABC):
 	@abstractmethod
 	def _train_epoch(
 		self,
-		sharded_state: EasyDeLState,
+		state: EasyDeLState,
 		train_iter: int,
 		current_step: int,
 		metrics_tracker: MetricsTracker,
@@ -471,7 +459,7 @@ class BaseTrainerProtocol(ABC):
 	@abstractmethod
 	def _eval_epoch(
 		self,
-		sharded_state: EasyDeLState,
+		state: EasyDeLState,
 		eval_iter: int,
 		current_step: int,
 		metrics_tracker: MetricsTracker,
@@ -529,7 +517,7 @@ class StepMetrics:
 	def calculate(
 		self,
 		loss,
-		metrics,
+		metrics: LossMetrics,
 		current_step,
 		epoch,
 		flops_per_device,
@@ -560,12 +548,12 @@ class StepMetrics:
 			**extras,
 		}
 
-		basic_metrics.update({"accuracy": metrics.get("accuracy", 0.0)})
+		basic_metrics.update({"accuracy": metrics.accuracy})
 
-		if metrics.get("mae", None) is not None:
-			basic_metrics.update({"mae": metrics.get("mae", 0.0)})
-		if metrics.get("mse", None) is not None:
-			basic_metrics.update({"mse": metrics.get("mse", 0.0)})
+		# if metrics.get("mae", None) is not None:
+		# 	basic_metrics.update({"mae": metrics.get("mae", 0.0)})
+		# if metrics.get("mse", None) is not None:
+		# 	basic_metrics.update({"mse": metrics.get("mse", 0.0)})
 
 		if not self.arguments.performance_mode and (mode == "train" or mode is None):
 			detailed_metrics = self._calculate_detailed_metrics(metrics)
@@ -578,15 +566,11 @@ class StepMetrics:
 		"""Calculate additional detailed metrics."""
 		detailed_metrics = {}
 
-		if self.arguments.log_grad_norms and metrics.get("grad_norms", None) is not None:
+		if self.arguments.log_grad_norms:
 			detailed_metrics.update(
 				{
-					"train/max_grad_norm": metrics.get(
-						"max_grad_norm", np.asarray(None)
-					).tolist(),
-					"train/mean_grad_norm": metrics.get(
-						"mean_grad_norm", np.asarray(None)
-					).tolist(),
+					"train/max_grad_norm": metrics.max_grad_norm.tolist(),
+					"train/mean_grad_norm": metrics.mean_grad_norm.tolist(),
 				}
 			)
 
@@ -594,7 +578,7 @@ class StepMetrics:
 			detailed_metrics.update(
 				{
 					f"grad_norm/{layer_name}": grad_norm.tolist()
-					for layer_name, grad_norm in flatten_dict(metrics["grad_norms"]).items()
+					for layer_name, grad_norm in flatten_dict(metrics.grad_norms).items()
 				}
 			)
 

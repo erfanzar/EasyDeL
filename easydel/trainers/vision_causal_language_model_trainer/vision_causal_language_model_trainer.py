@@ -34,7 +34,7 @@ from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import get_logger
 from easydel.trainers.base_trainer import TrainerConfigureFunctionOutput
-from easydel.trainers.causal_language_model_trainer import CausalLanguageModelTrainer
+from easydel.trainers.trainer import Trainer
 from easydel.trainers.vision_causal_language_model_trainer.functions import (
 	VisionCausalLanguageModelStepOutput,
 	create_vision_casual_language_model_evaluation_step,
@@ -47,7 +47,7 @@ from easydel.trainers.vision_causal_language_model_trainer.modelling_output impo
 logger = get_logger(__name__)
 
 
-class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
+class VisionCausalLanguageModelTrainer(Trainer):
 	def create_collect_function(
 		self,
 		max_sequence_length: int,
@@ -182,13 +182,13 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
 		empty_sharding = jax.sharding.NamedSharding(
 			spec=PartitionSpec(), mesh=self.arguments.get_mesh()
 		)
-		create_sharded_state_from_params_function = jax.jit(
+		create_state_sharded = jax.jit(
 			create_state_from_params_function,
 			in_shardings=(spec_named_sharding.params,),
 			out_shardings=spec_named_sharding,
 			donate_argnums=(0,),
 		)
-		sharded_train_step_function = jax.jit(
+		sharded_training_step_function = jax.jit(
 			create_vision_casual_language_model_train_step(
 				self.arguments.step_partition_spec
 			),
@@ -197,7 +197,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
 			donate_argnums=(0, 0),
 		)
 
-		sharded_eval_step_function = jax.jit(
+		sharded_evaluation_step_function = jax.jit(
 			create_vision_casual_language_model_evaluation_step(
 				self.arguments.step_partition_spec
 			),
@@ -214,9 +214,9 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
 		self.state_shape = state_shape
 
 		return TrainerConfigureFunctionOutput(
-			create_sharded_state_from_params_function=create_sharded_state_from_params_function,
-			sharded_train_step_function=sharded_train_step_function,
-			sharded_eval_step_function=sharded_eval_step_function,
+			create_state_sharded=create_state_sharded,
+			sharded_training_step_function=sharded_training_step_function,
+			sharded_evaluation_step_function=sharded_evaluation_step_function,
 			mesh=mesh,
 			checkpoint_manager=checkpoint_manager,
 			initialize_state_function=initialize_state_function,
@@ -280,7 +280,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
 						empty_sharding = jax.sharding.NamedSharding(
 							spec=PartitionSpec(), mesh=self.arguments.get_mesh()
 						)
-						sharded_train_step_function = jax.jit(
+						sharded_training_step_function = jax.jit(
 							create_vision_casual_language_model_train_step(
 								partition_spec=self.arguments.step_partition_spec,
 							),
@@ -293,7 +293,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
 							donate_argnums=(0, 0),
 						)
 
-						sharded_eval_step_function = jax.jit(
+						sharded_evaluation_step_function = jax.jit(
 							create_vision_casual_language_model_evaluation_step(
 								self.arguments.step_partition_spec
 							),
@@ -305,8 +305,8 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
 						self.state_partition_spec = state_partition_spec
 						self.state_named_sharding = spec_named_sharding
 						self.state_shape = state_shape
-						self.sharded_train_step_function = sharded_train_step_function
-						self.sharded_eval_step_function = sharded_eval_step_function
+						self.sharded_training_step_function = sharded_training_step_function
+						self.sharded_evaluation_step_function = sharded_evaluation_step_function
 
 					if self.arguments.remove_ckpt_after_load:
 						os.remove(self.checkpoint_path)
@@ -316,9 +316,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
 							"Model Parameters should be like FrozenDict({'params': params}) make sure to "
 							"pass as type FrozenDict in case of not getting UnExcepted Errors ",
 						)
-					sharded_state = self.create_sharded_state_from_params_function(
-						model_parameters
-					)
+					sharded_state = self.create_state_sharded(model_parameters)
 				elif model_parameters is not None and self.checkpoint_path is not None:
 					raise EasyDeLTimerError(
 						"You can't pass `model_parameters` and `checkpoint_path` at same time"
@@ -412,7 +410,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
 								EasyDeLState,
 								chex.Array,
 								VisionCausalLanguageModelStepOutput,
-							] = self.sharded_train_step_function(sharded_state, batch)
+							] = self.sharded_training_step_function(sharded_state, batch)
 
 							sharded_state, loss, information_and_accuracies = outputs_and_metrics
 
@@ -612,7 +610,7 @@ class VisionCausalLanguageModelTrainer(CausalLanguageModelTrainer):
 						_ = batch.pop(key, None)
 
 					metrics: tuple[chex.Array, VisionCausalLanguageModelStepOutput] = (
-						self.sharded_eval_step_function(model_state, batch)
+						self.sharded_evaluation_step_function(model_state, batch)
 					)
 					total_time = time.time() - time_start
 					flops = flops_per_device / total_time

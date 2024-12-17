@@ -21,16 +21,15 @@ import jax
 from flax import nnx as nn
 from jax import numpy as jnp
 
-from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import register_module
 from easydel.infra.modeling_outputs import MoeCausalLMOutput, MoeModelOutput
 from easydel.infra.utils import (
 	ACT2FN,
+	auto_remat,
 	block_wise_ffn,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
-	get_gradient_checkpoint_policy,
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
@@ -357,17 +356,11 @@ class ArcticDecoderLayer(nn.Module):
 		attn_block = ArcticAttention
 		mlp_block = ArcticMoeBlock
 
-		if self.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
-			attn_block = nn.remat(
-				attn_block,
-				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-				static_argnums=(2, 5, 6, 7, 8),
-			)
-			mlp_block = nn.remat(
-				mlp_block,
-				policy=get_gradient_checkpoint_policy(self.config.gradient_checkpointing),
-				static_argnums=(1,),
-			)
+		attn_block, mlp_block = auto_remat(
+			attn_block,
+			mlp_block,
+			policy=config.gradient_checkpointing,
+		)
 		self.self_attn = attn_block(
 			config=config,
 			dtype=dtype,
