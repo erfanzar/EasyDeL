@@ -14,10 +14,9 @@
 
 import time
 import typing
-from typing import Any, Callable, Mapping, Optional
+from typing import Callable
 
 import jax
-import termcolor
 from fjformer.sharding import match_partition_rules
 from jax import numpy as jnp
 from jax.experimental import sparse
@@ -138,7 +137,7 @@ class Trainer(BaseTrainer):
 			donate_argnums=(0, 0),
 		)
 
-		mesh = self.arguments.get_mesh()
+		mesh = self.model.mesh
 		self.arguments.ensure_checkpoint_path()
 		checkpoint_manager = self.arguments.get_streaming_checkpointer()
 		self.state_partition_spec = state_partition_spec
@@ -180,7 +179,8 @@ class Trainer(BaseTrainer):
 				if run_exception is not None:
 					break
 		return self._prepare_training_output(
-			state=state, run_exception=run_exception
+			state=state,
+			run_exception=run_exception,
 		), run_exception
 
 	def _run_evaluation(
@@ -357,12 +357,7 @@ class Trainer(BaseTrainer):
 
 	def _finalize_training(self, output, run_exception):
 		"""Finalize training and prepare output."""
-		if run_exception is None:
-			if self.arguments.merge_lora_rapture_parameters and self.rapture:
-				termcolor.cprint("Merging LoRA Parameters.", color="cyan", force_color=True)
-				output.state = output.state.replace(
-					graphstate=self.rapture.merge_parameters(output.state.graphstate)
-				)
+ 
 
 		if self.arguments.do_eval:
 			for _ in self.eval(output.state):

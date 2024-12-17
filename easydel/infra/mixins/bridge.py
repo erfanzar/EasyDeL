@@ -108,7 +108,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		config_to_save.architectures = [self.__class__.__name__]
 		config_to_save.save_pretrained(str(save_directory))
 
-		if self.can_generate():
+		if self.can_generate() and hasattr(self, "generation_config"):
 			self.generation_config.save_pretrained(str(save_directory))
 
 		output_model_file = save_directory / FLAX_WEIGHTS_NAME
@@ -163,7 +163,11 @@ class EasyBridgeMixin(PushToHubMixin):
 			files_timestamps = self._get_files_timestamps(save_directory)
 
 		self._save_model_files(
-			save_directory, gather_fns, float_dtype, verbose, mismatch_allowed
+			save_directory,
+			gather_fns,
+			float_dtype,
+			verbose,
+			mismatch_allowed,
 		)
 
 		readme_path = save_directory / "README.md"

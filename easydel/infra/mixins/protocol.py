@@ -12,13 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from abc import ABC
+from abc import ABC, abstractmethod
 import typing as tp
 
 import chex
 from flax import nnx as nn
 from jax.sharding import Mesh
-
 from easydel.etils.etils import EasyDeLQuantizationMethods
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.loss_utils import (
@@ -476,24 +475,31 @@ class BaseModuleProtocol(ABC):
 	) -> tp.Tuple[tp.Any, LossMetrics]:
 		"""basic `compute_loss` call"""
 
+	@abstractmethod
 	def half(self):
 		"""Converts Model paramters to float16."""
 
+	@abstractmethod
 	def float(self):
 		"""Converts Model paramters to float32."""
 
+	@abstractmethod
 	def _reformat_dtype(self, dtype):
 		"""Converts Model paramters to given data type."""
 
+	@abstractmethod
 	def _get_mesh(self, mesh: tp.Optional[Mesh] = None) -> Mesh:
 		"""Retrieves the mesh, either from the provided argument or the config."""
 
+	@abstractmethod
 	def _get_partition_rules(self, partition_rules: PartitionLike) -> PartitionLike:
 		"""Retrieves the partition rules from input or the config"""
 
+	@abstractmethod
 	def _apply_sharding_fns(self, sharding_fns: tp.Mapping[str, tp.Callable]):
 		"""Applies sharding functions to the model's state."""
 
+	@abstractmethod
 	def shard_model(
 		self,
 		partition_rules: PartitionLike = None,
@@ -509,6 +515,7 @@ class BaseModuleProtocol(ABC):
 		    nn.Module: The sharded model.
 		"""
 
+	@abstractmethod
 	def gather_model(
 		self,
 		partition_rules: PartitionLike = None,
@@ -524,6 +531,17 @@ class BaseModuleProtocol(ABC):
 		    nn.Module: The gathered model.
 		"""
 
+	@property
+	@abstractmethod
+	def _shard_fns(self):
+		"""property shard functions for model state and parameters."""
+
+	@property
+	@abstractmethod
+	def _gather_fns(self):
+		"""property gather functions for model state and parameters."""
+
+	@abstractmethod
 	def quantize(
 		self,
 		method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.A8BIT,
@@ -542,6 +560,9 @@ class BaseModuleProtocol(ABC):
 		"""
 
 	def __repr__(self):
-		return "EasyDeL-" + prettify_nnx(self)
+		try:
+			return "EasyDeL-" + prettify_nnx(self)
+		except AttributeError:
+			return "EasyDeL-Partitions"
 
 	__str__ = __repr__

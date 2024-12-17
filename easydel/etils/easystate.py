@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from __future__ import annotations
+import os
+import pathlib
 import typing as tp
 
 import jax
 import optax
 from flax import nnx as nn
 from flax import struct
-
 
 from easydel.etils.etils import get_logger
 
@@ -28,6 +29,8 @@ else:
 	EasyDeLBaseModule = tp.Any
 
 logger = get_logger(__name__)
+WEIGHTS_NAME = "easydel-model.parameters"
+OPTIMIZER_NAME = "easydel-optstate.parameters"
 
 
 class EasyDeLState(struct.PyTreeNode):
@@ -153,8 +156,27 @@ class EasyDeLState(struct.PyTreeNode):
 		return nn.merge(self.graphdef, tree, self.graphother)
 
 	@property
-	def model(self):
+	def model(self) -> EasyDeLBaseModule:
 		return nn.merge(self.graphdef, self.graphstate, self.graphother)
+
+	def save_state(
+		self,
+		save_directory: tp.Union[str, os.PathLike],
+		float_dtype: tp.Optional[jax.numpy.dtype] = None,
+		verbose: bool = True,
+		mismatch_allowed: bool = True,
+		save_optimizer: bool = True,
+	):
+		save_directory = pathlib.Path(save_directory)
+		self.model.save_pretrained(
+			save_directory=str(save_directory),
+			gather_fns=self.model._gather_fns,
+			float_dtype=float_dtype,
+			mismatch_allowed=mismatch_allowed,
+			verbose=verbose,
+		)
+
+	def load_state(self): ...
 
 	def __repr__(self):
 		return "EasyDeLState-" + str(self.model)
