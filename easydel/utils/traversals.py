@@ -496,7 +496,7 @@ def merge_state_and_tree(tree: dict, state: nnx.State) -> nnx.State:
 		params = flatten_dict(params)
 	if not is_flatten(tree):
 		tree = flatten_dict(tree)
-	tree = string_key_to_int(tree) 
+	tree = string_key_to_int(tree)
 
 	for keys in list(params.keys()):
 		tree_values = tree.get(keys, None)
@@ -515,6 +515,28 @@ def merge_state_and_tree(tree: dict, state: nnx.State) -> nnx.State:
 
 
 def merge_model_and_tree(model: M, tree: dict) -> M:
+	"""
+	Attaches a parameter tree to an nnx model.
+
+	This function takes a parameter tree, which is a dictionary containing
+	parameter values, and attaches it to an existing nnx model. It first
+	splits the nnx model into parameters and other model elements. Then,
+	it flattens the parameter tree and the nnx model's parameters for
+	easy traversal. For each parameter key in the flattened nnx model,
+	if the corresponding value is not None (indicating an existing
+	parameter), it replaces the value with the corresponding value from
+	the input parameter tree. Finally, it recreates the meta values in
+	the "others" part of the model (which includes things like RNG keys
+	and counts), and then merges the updated parameters and "others"
+	back into a single nnx.Module object.
+
+	Args:
+	    tree: The parameter tree to attach.
+	    model: The nnx model to attach the tree to.
+
+	Returns:
+	    nnx.Module: The updated nnx model with the attached parameter tree.
+	"""
 	graphdef, graphstate = nnx.split(model)
 	graphstate = merge_state_and_tree(tree=tree, state=graphstate)
 	return nnx.merge(graphdef, graphstate)

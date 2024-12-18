@@ -22,6 +22,7 @@ from flax import nnx as nn
 from flax import struct
 
 from easydel.etils.etils import get_logger
+from easydel.utils.checkpoint_managers.streamer import CheckpointManager
 
 if tp.TYPE_CHECKING:
 	from easydel.infra.base_module import EasyDeLBaseModule
@@ -175,6 +176,15 @@ class EasyDeLState(struct.PyTreeNode):
 			mismatch_allowed=mismatch_allowed,
 			verbose=verbose,
 		)
+		if save_optimizer:
+			CheckpointManager.save_checkpoint(
+				state=self.opt_state,
+				path=str(save_directory / OPTIMIZER_NAME),
+				float_dtype=float_dtype,
+				gather_fns=self.model._gather_fns,
+				verbose=verbose,
+				mismatch_allowed=mismatch_allowed,
+			)
 
 	def load_state(self): ...
 
