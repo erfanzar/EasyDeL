@@ -502,7 +502,7 @@ class BaseTrainer(BaseTrainerProtocol):
 
 	def _manage_checkpoint_limit(self, save_directory):
 		if self.arguments.save_total_limit:
-			checkpoint_files = glob(os.path.join(save_directory, f"run-*"))
+			checkpoint_files = glob(os.path.join(save_directory, "run-*"))
 			checkpoint_files.sort(key=os.path.getmtime)
 			for old_save_directory in checkpoint_files[: -self.arguments.save_total_limit]:
 				shutil.rmtree(old_save_directory, ignore_errors=True)

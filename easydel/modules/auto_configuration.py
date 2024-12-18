@@ -195,8 +195,10 @@ class AutoShardAndGatherFunctions:
 			partition_rules = config.get_partition_rules(True)
 		_, module, _ = get_modules_by_type(config.model_type, model_task)
 		model = flax.nnx.eval_shape(lambda: module(config=config, rngs=flax.nnx.Rngs(0)))
+
 		partition_specs = match_partition_rules(
-			partition_rules, model.graphtree_params_shape
+			partition_rules,
+			model.graphtree_params_shape,
 		)
 
 		shard_fns, gather_fns = make_shard_and_gather_fns(

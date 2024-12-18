@@ -109,16 +109,17 @@ class EasyDeLBaseModule(
 		_ = self.model_task
 		_ = self.model_type
 
-	@cached_property
+	@property
 	def graphtree_params_shape(self) -> tp.Dict:
 		"""Evaluates the shape of the model's parameters and returns a dictionary."""
 		graphtree = nn.eval_shape(lambda: nn.split(self, nn.Param, ...)[1])
+
 		flattened_tree = flatten_dict(graphtree)
 
 		param_shapes = {key: val.value for key, val in flattened_tree.items()}
 		return unflatten_dict(param_shapes)
 
-	@cached_property
+	@property
 	def mesh(self) -> jax.sharding.Mesh:
 		"""Returns the mesh from the config."""
 		return self.config.mesh

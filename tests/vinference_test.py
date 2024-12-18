@@ -81,7 +81,7 @@ def main():
 			eos_token_id=model.generation_config.eos_token_id,
 			streaming_chunks=16,
 		),
-	) 
+	)
 
 	print(model.model_task)
 	print(model.model_type)
@@ -92,10 +92,10 @@ def main():
 	prompt = "Find the value of $x$ that satisfies the equation $4x+5 = 6x+7$."
 
 	messages = [
-		{
-			"role": "system",
-			"content": "Please reason step by step, and put your final answer within \\boxed{}. and give 3 different responses",
-		},
+		# {
+		# 	"role": "system",
+		# 	"content": "Please reason step by step, and put your final answer within \\boxed{}. and give 3 different responses",
+		# },
 		{"role": "user", "content": prompt},
 	]
 
