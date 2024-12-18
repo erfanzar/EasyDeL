@@ -105,6 +105,7 @@ def main(use_iterable_dataset: bool):
 			use_wandb=False,
 			learning_rate=3e-4,
 			do_last_save=True,
+			save_optimizer_state=True,
 			training_time="80Min",
 			optimizer=EasyDeLOptimizers.ADAMW,
 			scheduler=EasyDeLSchedulers.COSINE,
