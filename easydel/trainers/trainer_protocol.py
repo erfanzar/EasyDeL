@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, Literal, Mapping, Optional, Union
+import typing as tp
 
 import flax
 import flax.core
@@ -50,15 +50,21 @@ from easydel.infra.base_module import (
 from easydel.trainers.training_configurations import TrainingArguments
 from easydel.utils import Timers
 
+if tp.TYPE_CHECKING:
+	from datasets import Dataset, IterableDataset
+else:
+	Dataset = tp.Any
+	IterableDataset = tp.Any
+
 logger = get_logger(__name__)
 
 
 @dataclass
 class TrainerConfigureDataloaderOutput:
-	dataloader_train: Iterator[np.ndarray]
+	dataloader_train: tp.Iterator[np.ndarray]
 	max_training_steps: int
-	dataloader_eval: Optional[Iterator[np.ndarray]] = None
-	max_evaluation_steps: Optional[int] = None
+	dataloader_eval: tp.Optional[tp.Iterator[np.ndarray]] = None
+	max_evaluation_steps: tp.Optional[int] = None
 
 
 @dataclass
@@ -66,71 +72,71 @@ class TrainerConfigureModelOutput:
 	model: EasyDeLBaseModule
 	tx: GradientTransformation
 	scheduler: Schedule
-	config: Optional[EasyDeLBaseConfig] = None
+	config: tp.Optional[EasyDeLBaseConfig] = None
 
 
 @dataclass
 class TrainerConfigureFunctionOutput:
-	create_state_sharded: Callable
-	sharded_training_step_function: Callable
+	create_state_sharded: tp.Callable
+	sharded_training_step_function: tp.Callable
 	mesh: Mesh
 	checkpoint_manager: CheckpointManager
-	sharded_evaluation_step_function: Optional[Callable] = None
+	sharded_evaluation_step_function: tp.Optional[tp.Callable] = None
 
 
 @dataclass
 class TrainerOutput:
 	state: EasyDeLState
-	mesh: Optional[jax.sharding.Mesh]
-	last_save_file_name: Optional[str] = None
-	checkpoint_path: Optional[str] = None
+	mesh: tp.Optional[jax.sharding.Mesh]
+	last_save_file_name: tp.Optional[str] = None
+	checkpoint_path: tp.Optional[str] = None
 
 
 class BaseTrainerProtocol(ABC):
 	# Required attributes for all trainers
 	arguments: TrainingArguments
-	dataset_train: Optional["Dataset"]  # type: ignore #noqa
-	dataset_eval: Optional["Dataset"]  # type: ignore #noqa
+	dataset_train: tp.Optional[Dataset]
+	dataset_eval: tp.Optional[Dataset]
 	finetune: bool
-	checkpoint_path: Optional[Union[str, os.PathLike]]
-	dtype: Any  # jax.numpy.dtype
-	param_dtype: Any  # jax.numpy.dtype
+	checkpoint_path: tp.Optional[tp.Union[str, os.PathLike]]
+	dtype: tp.Any  # jax.numpy.dtype
+	param_dtype: tp.Any  # jax.numpy.dtype
 
 	timer: Timers
-	wandb_runtime: Any  # wandb runtime
-	dataloader_train: Iterator[np.ndarray]
-	dataloader_eval: Optional[Iterator[np.ndarray]]
+	wandb_runtime: tp.Any  # wandb runtime
+	dataloader_train: tp.Iterator[np.ndarray]
+	dataloader_eval: tp.Optional[tp.Iterator[np.ndarray]]
 	max_training_steps: int
 	max_evaluation_steps: int
 	model: EasyDeLBaseModule
 	config: EasyDeLBaseConfig
 	scheduler: optax.Schedule
 	tx: optax.GradientTransformation  # optax
-	model_state: Any  # flax.core.FrozenDict
-	create_state_sharded: Callable
+	model_state: tp.Any  # flax.core.FrozenDict
+	create_state_sharded: tp.Callable
 
-	sharded_training_step_function: Callable
-	sharded_evaluation_step_function: Callable
+	sharded_training_step_function: tp.Callable
+	sharded_evaluation_step_function: tp.Callable
 
-	mesh: Any
-	checkpoint_manager: Any
-	state_shape: Any
-	state_partition_spec: Any
-	state_named_sharding: Any
-	state: Any
-	pruning_module: Any
+	mesh: tp.Any
+	checkpoint_manager: tp.Any
+	state_shape: tp.Any
+	state_partition_spec: tp.Any
+	state_named_sharding: tp.Any
+	state: tp.Any
+	pruning_module: tp.Any
 
-	_base_model: Any
+	_base_model: tp.Any
 
 	@abstractmethod
 	def __init__(
 		self,
 		arguments: TrainingArguments,
-		model: Any,
-		dataset_train: Optional["Dataset"] = None,  # type:ignore #noqa
-		dataset_eval: Optional["Dataset"] = None,  # type:ignore #noqa
+		model: EasyDeLBaseModule,
+		dataset_train: tp.Optional[Dataset] = None,
+		dataset_eval: tp.Optional[Dataset] = None,
 		finetune: bool = True,
-		checkpoint_path: Optional[Union[str, os.PathLike]] = None,
+		checkpoint_path: tp.Optional[tp.Union[str, os.PathLike]] = None,
 		_do_init_fns: bool = True,
 	):
 		"""
@@ -203,8 +209,8 @@ class BaseTrainerProtocol(ABC):
 	def create_collect_function(
 		self,
 		max_sequence_length: int,
-		truncation_mode: Literal["keep_end", "keep_start"],
-	) -> Callable:
+		truncation_mode: tp.Literal["keep_end", "keep_start"],
+	) -> tp.Callable:
 		"""
 		Creates a function to collect and process batches of data for training or evaluation.
 		"""
@@ -232,15 +238,17 @@ class BaseTrainerProtocol(ABC):
 		...
 
 	@abstractmethod
-	def _save_state(
-		self,
-		state: "EasyDeLState",  # noqa: F821 # type:ignore
-		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-		milestone: bool,
-		save_dir: Optional[str] = None,
-	) -> str:
+	def _save_state(self, state: EasyDeLState, *args, **kwargs) -> str:
 		"""
 		Saves the model state to a checkpoint file.
+
+		This method handles generating the filename, managing the checkpoint limit, saving the
+		state using the `EasyDeLState.save_state` method, and creating a README file with
+		information about the trained model.
+		Args:
+				state (EasyDeLState): The EasyDeLState object containing the model state to save.
+		Returns:
+				str: The filename of the saved checkpoint.
 		"""
 		...
 
@@ -252,23 +260,9 @@ class BaseTrainerProtocol(ABC):
 		...
 
 	@abstractmethod
-	def _get_save_directory(self, save_dir):
-		"""
-		Get the checkpoint directory.
-		"""
-		...
-
-	@abstractmethod
 	def _manage_checkpoint_limit(self, checkpoint_dir):
 		"""
 		Manages the checkpoint limit by deleting old checkpoints.
-		"""
-		...
-
-	@abstractmethod
-	def _generate_checkpoint_directory_name(self, step, milestone):
-		"""
-		Generates a checkpoint filename.
 		"""
 		...
 
@@ -297,7 +291,7 @@ class BaseTrainerProtocol(ABC):
 		...
 
 	@abstractmethod
-	def save_information(self, output_path: Union[str, Path]) -> None:
+	def save_information(self, output_path: tp.Union[str, Path]) -> None:
 		"""
 		Save the generated information to a markdown file.
 		"""
@@ -306,14 +300,15 @@ class BaseTrainerProtocol(ABC):
 	@abstractmethod
 	def save_pretrained(
 		self,
-		state: "EasyDeLState",  # noqa: F821 # type:ignore
-		save_dir: Optional[str] = None,
-		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None,
+		state: EasyDeLState,
+		save_directory: tp.Optional[str] = None,
+		gather_fns: tp.Optional[
+			tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]
+		] = None,
 		to_torch: bool = False,
 		base_hf_auto_class=None,
-		easystate_to_huggingface_model_kwargs: Optional[dict] = None,
-		add_params_field_to_torch_convertation: bool = False,
-		torch_save_pretrained_kwargs: Optional[dict] = None,
+		easystate_to_huggingface_model_kwargs: tp.Optional[dict] = None,
+		torch_save_pretrained_kwargs: tp.Optional[dict] = None,
 	):
 		"""
 		Saves the model state as a checkpoint file or to a Torch compatible directory.
@@ -324,7 +319,7 @@ class BaseTrainerProtocol(ABC):
 	def _save_to_torch(
 		self,
 		state,
-		save_dir,
+		save_directory,
 		base_hf_auto_class,
 		easystate_to_huggingface_model_kwargs,
 		torch_save_pretrained_kwargs,
@@ -337,7 +332,7 @@ class BaseTrainerProtocol(ABC):
 	@abstractmethod
 	def _create_hf_model_config(
 		self,
-		state: "EasyDeLState",  # noqa: F821 # type:ignore
+		state: EasyDeLState,
 		model_config,
 		model_type,
 	):
@@ -376,9 +371,9 @@ class BaseTrainerProtocol(ABC):
 	def _prepare_training_output(
 		self,
 		state: EasyDeLState,
-		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-		run_exception: Optional[Exception] = None,
+		shard_fns: tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]],
+		gather_fns: tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]],
+		run_exception: tp.Optional[Exception] = None,
 	):
 		"""Prepare training output after training loop completion."""
 		...
@@ -388,8 +383,8 @@ class BaseTrainerProtocol(ABC):
 		self,
 		state: EasyDeLState,
 		exception: Exception,
-		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+		shard_fns: tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]],
+		gather_fns: tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]],
 	):
 		"""Handle training interruption gracefully."""
 		...
@@ -407,7 +402,7 @@ class BaseTrainerProtocol(ABC):
 	@abstractmethod
 	def _log_metrics(
 		self,
-		metrics: Dict[str, float],
+		metrics: tp.Dict[str, float],
 		pbar: tqdm.tqdm,
 		step: int,
 		mode: str = "train",
@@ -422,8 +417,8 @@ class BaseTrainerProtocol(ABC):
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
 		start_time: float,
-		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+		shard_fns: tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]],
+		gather_fns: tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]],
 	):
 		"""Core training loop implementation."""
 		...
@@ -450,8 +445,8 @@ class BaseTrainerProtocol(ABC):
 		pbar: tqdm,
 		start_time: float,
 		epoch: int,
-		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+		shard_fns: tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]],
+		gather_fns: tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]],
 	):
 		"""Handles training for a single epoch."""
 		...
@@ -488,14 +483,14 @@ class BaseTrainerProtocol(ABC):
 	@abstractmethod
 	def train(
 		self,
-		model_parameters: Optional[flax.core.FrozenDict] = None,
-		state: Optional[EasyDeLState] = None,
-	) -> Any:
+		model_parameters: tp.Optional[flax.core.FrozenDict] = None,
+		state: tp.Optional[EasyDeLState] = None,
+	) -> tp.Any:
 		"""Train using the provided model state."""
 		...
 
 	@abstractmethod
-	def eval(self, model_state: EasyDeLState) -> Iterator[dict]:
+	def eval(self, model_state: EasyDeLState) -> tp.Iterator[dict]:
 		"""
 		Evaluates using the provided model state.
 		"""
@@ -524,9 +519,9 @@ class StepMetrics:
 		batch_size,
 		seq_length,
 		learning_rate,
-		mode: Optional[Literal["eval", "train"]] = None,
+		mode: tp.Optional[tp.Literal["eval", "train"]] = None,
 		**extras,
-	) -> Dict[str, float]:
+	) -> tp.Dict[str, float]:
 		"""Calculate comprehensive metrics for the training step."""
 		step_time = time.time() - self.step_start_time
 		total_time = time.time() - self.start_time

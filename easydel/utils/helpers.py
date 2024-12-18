@@ -113,7 +113,9 @@ class Timers:
 			self._print_log(name, elapsed_time)
 
 	def _print_log(self, name, elapsed_time):
-		logger.info(f"Time Took to Complete Task {name} (milliseconds) : {elapsed_time}")
+		logger.info(
+			f"time took for {name} (ms) : {elapsed_time:.4f}"
+		)
 
 	@contextlib.contextmanager
 	def timed(self, name, log=True, reset=True):

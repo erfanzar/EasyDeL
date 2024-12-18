@@ -15,15 +15,16 @@ from __future__ import annotations
 
 import os
 import pprint
+import shutil
 import sys
 import threading
 import time
+import typing as tp
 import warnings
 from abc import abstractmethod
 from glob import glob
 from logging import warning
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, Literal, Mapping, Optional, Union
 
 import flax
 import flax.core
@@ -58,18 +59,24 @@ from easydel.trainers.trainer_protocol import (
 from easydel.trainers.training_configurations import TrainingArguments
 from easydel.utils import Timers
 
+if tp.TYPE_CHECKING:
+	from datasets import Dataset, IterableDataset
+else:
+	Dataset = tp.Any
+	IterableDataset = tp.Any
+
 logger = get_logger(__name__)
 
 
 class BaseTrainer(BaseTrainerProtocol):
 	def __init__(
 		self,
-		arguments: Optional[TrainingArguments] = None,
-		model: Optional[EasyDeLBaseModule] = None,
-		dataset_train: Optional["Dataset"] = None,  # noqa: F821 # type:ignore
-		dataset_eval: Optional["Dataset"] = None,  # noqa: F821 # type:ignore
+		arguments: tp.Optional[TrainingArguments] = None,
+		model: tp.Optional[EasyDeLBaseModule] = None,
+		dataset_train: tp.Optional[Dataset] = None,
+		dataset_eval: tp.Optional[Dataset] = None,
 		finetune: bool = True,
-		checkpoint_path: Optional[Union[str, os.PathLike]] = None,
+		checkpoint_path: tp.Optional[tp.Union[str, os.PathLike]] = None,
 		_do_init_fns: bool = True,
 	):
 		assert arguments is not None, "training argument must be passed to Trainers."
@@ -253,8 +260,8 @@ class BaseTrainer(BaseTrainerProtocol):
 	def create_collect_function(
 		self,
 		max_sequence_length: int,
-		truncation_mode: Literal["keep_end", "keep_start"],
-	) -> Callable:
+		truncation_mode: tp.Literal["keep_end", "keep_start"],
+	) -> tp.Callable:
 		"""
 		Creates a function to collect and process batches of data for training or evaluation.
 
@@ -263,11 +270,11 @@ class BaseTrainer(BaseTrainerProtocol):
 
 		Args:
 				max_sequence_length (int): The maximum allowed sequence length.
-				truncation_mode (typing.Literal["keep_end", "keep_start"], optional):
+				truncation_mode (typing.tp.Literal["keep_end", "keep_start"], optional):
 						The truncation mode. Defaults to "keep_end".
 
 		Returns:
-				Callable: A function that takes a batch of data and returns a processed batch.
+				tp.Callable: A function that takes a batch of data and returns a processed batch.
 		"""
 		raise NotImplementedError
 
@@ -300,9 +307,9 @@ class BaseTrainer(BaseTrainerProtocol):
 		"""
 
 		def create_tf_dataset(
-			dataset: "Dataset",  # noqa: F821 # type:ignore
-			is_train: bool,  # noqa: F821 # type:ignore
-		) -> Iterator[np.ndarray]:
+			dataset: Dataset,
+			is_train: bool,
+		) -> tp.Iterator[np.ndarray]:
 			"""
 			Creates a TensorFlow dataset from a Hugging Face Dataset.
 
@@ -311,7 +318,7 @@ class BaseTrainer(BaseTrainerProtocol):
 					is_train (bool): Whether the dataset is for training.
 
 			Returns:
-					Iterator[np.ndarray]: The TensorFlow dataset iterator.
+					tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
 			"""
 			import tensorflow as tf
 
@@ -332,9 +339,9 @@ class BaseTrainer(BaseTrainerProtocol):
 			)
 
 		def create_tf_dataset_from_iterable(
-			dataset: "IterableDataset",  # noqa: F821 # type:ignore
-			is_train: bool,  # noqa: F821 # type:ignore
-		) -> Iterator[np.ndarray]:
+			dataset: IterableDataset,
+			is_train: bool,
+		) -> tp.Iterator[np.ndarray]:
 			"""
 			Creates a TensorFlow dataset from an iterable Hugging Face Dataset.
 
@@ -343,7 +350,7 @@ class BaseTrainer(BaseTrainerProtocol):
 					is_train (bool): Whether the dataset is for training.
 
 			Returns:
-					Iterator[np.ndarray]: The TensorFlow dataset iterator.
+					tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
 			"""
 			import tensorflow as tf
 
@@ -364,14 +371,14 @@ class BaseTrainer(BaseTrainerProtocol):
 			)
 
 		def calculate_steps(
-			dataset: Union["Dataset", "IterableDataset"],  # noqa: F821 # type:ignore
+			dataset: tp.Union[Dataset, IterableDataset],
 			is_train: bool,
 		) -> int:
 			"""
 			Calculates the number of training or evaluation steps based on dataset length and arguments.
 
 			Args:
-					dataset (Union[Dataset, IterableDataset]): The dataset to calculate steps for.
+					dataset (tp.Union[Dataset, IterableDataset]): The dataset to calculate steps for.
 					is_train (bool): Whether the dataset is for training.
 
 			Returns:
@@ -411,18 +418,18 @@ class BaseTrainer(BaseTrainerProtocol):
 				return num_steps
 
 		def to_tf_dataloader(
-			dataset: Union["Dataset", "IterableDataset"],  # noqa: F821 # type:ignore
+			dataset: tp.Union[Dataset, IterableDataset],
 			is_train: bool,
-		) -> Iterator[np.ndarray]:
+		) -> tp.Iterator[np.ndarray]:
 			"""
 			Converts a Hugging Face Dataset to a TensorFlow dataloader.
 
 			Args:
-					dataset (Union[Dataset, IterableDataset]): The Hugging Face Dataset.
+					dataset (tp.Union[Dataset, IterableDataset]): The Hugging Face Dataset.
 					is_train (bool): Whether the dataset is for training.
 
 			Returns:
-					Iterator[np.ndarray]: The TensorFlow dataloader iterator.
+					tp.Iterator[np.ndarray]: The TensorFlow dataloader iterator.
 			"""
 			if hasattr(dataset, "__len__"):
 				return create_tf_dataset(dataset, is_train)
@@ -467,47 +474,25 @@ class BaseTrainer(BaseTrainerProtocol):
 			config=self.model.config,
 		)
 
-	def _save_state(
-		self,
-		state: "EasyDeLState",  # noqa: F821 # type:ignore
-		milestone: bool = False,
-		save_dir: Optional[str] = None,
-	) -> str:
-		"""
-		Saves the model state to a checkpoint file.
-
-		This method handles generating the filename, managing the checkpoint limit, saving the
-		state using the `EasyDeLState.save_state` method, and creating a README file with
-		information about the trained model.
-
-		Args:
-				state (EasyDeLState): The EasyDeLState object containing the model state to save.
-				gather_fns (Optional[Any | Mapping[str, Callable] | dict[Callable]], optional):
-						Functions for gathering sharded parameters. Defaults to None.
-				milestone (bool, optional): Whether this checkpoint is a milestone (e.g., end of epoch). Defaults to False.
-				save_dir (Optional[str], optional): The directory to save the checkpoint to. If None, defaults to the
-																						directory specified in the training arguments. Defaults to None.
-
-		Returns:
-				str: The filename of the saved checkpoint.
-		"""
+	def _save_state(self, state: EasyDeLState, *args, **kwargs) -> str:
 		step = self._get_current_step(state)
-		save_directory = self._get_save_directory(save_dir)
-		self._manage_checkpoint_limit(save_directory)
+		self._manage_checkpoint_limit(self.arguments._get_save_directory())
+		directory_name = self.arguments._get_save_directory_milestone(
+			step=step,
+			create=True,
+		)
 
-		directory_name = self._generate_checkpoint_directory_name(step, milestone)
 		logger.info(f"saving state {directory_name}.")
-		save_directory = Path(save_directory) / directory_name
-		save_directory.mkdir(exist_ok=True, parents=True)
+
 		state.save_state(
-			save_directory=save_directory,
+			save_directory=directory_name,
 			float_dtype=self.model.dtype,
 			verbose=self.arguments.verbose,
 			save_optimizer=self.arguments.save_optimizer_state,
 		)
 
-		self._save_readme(save_directory)
-		return str(save_directory)
+		self._save_readme(directory_name)
+		return str(directory_name)
 
 	def _get_current_step(self, state):
 		step = int(jax.device_get(state.step))
@@ -515,27 +500,13 @@ class BaseTrainer(BaseTrainerProtocol):
 			step += self.arguments.step_start_point
 		return step
 
-	def _get_save_directory(self, save_dir):
-		return (
-			os.path.join(self.arguments.save_dir, self.arguments.model_name)
-			if save_dir is None
-			else save_dir
-		)
-
 	def _manage_checkpoint_limit(self, save_directory):
 		if self.arguments.save_total_limit:
-			checkpoint_files = glob(os.path.join(save_directory, "run-*"))
+			checkpoint_files = glob(os.path.join(save_directory, f"run-*"))
 			checkpoint_files.sort(key=os.path.getmtime)
-			for old_checkpoint in checkpoint_files[: -self.arguments.save_total_limit]:
-				os.remove(old_checkpoint)
-				logger.info(
-					f"Removed old checkpoint: {old_checkpoint}",
-				)
-
-	def _generate_checkpoint_directory_name(self, step, milestone):
-		checkpoint_name = f"{self.arguments.model_name}-S{step}"
-		filename = f"run-{checkpoint_name}-{step}" if milestone else checkpoint_name
-		return filename
+			for old_save_directory in checkpoint_files[: -self.arguments.save_total_limit]:
+				shutil.rmtree(old_save_directory, ignore_errors=True)
+				logger.info(f"Removed old directory: {old_save_directory}")
 
 	def _save_readme(self, save_directory):
 		with open(os.path.join(save_directory, "README.md"), "w") as f:
@@ -632,7 +603,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 *Generated with EasyDeL v{__version__}*
 """
 
-	def save_information(self, output_path: Union[str, Path]) -> None:
+	def save_information(self, output_path: tp.Union[str, Path]) -> None:
 		"""
 		Save the generated information to a markdown file.
 
@@ -654,17 +625,18 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 
 	def save_pretrained(
 		self,
-		state: "EasyDeLState",  # noqa: F821 # type:ignore
-		save_dir: Optional[str] = None,
-		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None,
+		state: EasyDeLState,
+		save_directory: tp.Optional[str] = None,
+		gather_fns: tp.Optional[
+			tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]
+		] = None,
 		to_torch: bool = False,
 		base_hf_auto_class=None,
-		easystate_to_huggingface_model_kwargs: Optional[dict] = None,
-		add_params_field_to_torch_convertation: bool = False,
-		torch_save_pretrained_kwargs: Optional[dict] = None,
+		easystate_to_huggingface_model_kwargs: tp.Optional[dict] = None,
+		torch_save_pretrained_kwargs: tp.Optional[dict] = None,
 	):
-		save_dir = save_dir or os.path.join(
-			self.arguments.save_dir, self.arguments.model_name
+		save_directory = save_directory or os.path.join(
+			self.arguments.save_directory, self.arguments.model_name
 		)
 
 		if base_hf_auto_class is None:
@@ -672,18 +644,20 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 		if to_torch:
 			return self._save_to_torch(
 				state,
-				save_dir,
+				save_directory,
 				base_hf_auto_class,
 				easystate_to_huggingface_model_kwargs,
 				torch_save_pretrained_kwargs,
 			)
 		else:
-			return self._save_state(state=state, gather_fns=gather_fns, save_dir=save_dir)
+			return self._save_state(
+				state=state, gather_fns=gather_fns, save_directory=save_directory
+			)
 
 	def _save_to_torch(
 		self,
 		state,
-		save_dir,
+		save_directory,
 		base_hf_auto_class,
 		easystate_to_huggingface_model_kwargs,
 		torch_save_pretrained_kwargs,
@@ -708,13 +682,13 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 			**easystate_to_huggingface_model_kwargs,
 		)
 
-		self._save_readme(save_dir)
-		hf_model.save_pretrained(save_dir, **torch_save_pretrained_kwargs)
+		self._save_readme(save_directory)
+		hf_model.save_pretrained(save_directory, **torch_save_pretrained_kwargs)
 		return hf_model
 
 	def _create_hf_model_config(
 		self,
-		state: "EasyDeLState",  # noqa: F821 # type:ignore
+		state: EasyDeLState,
 		model_config,
 		model_type,
 	):
@@ -773,7 +747,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 	def _prepare_training_output(
 		self,
 		state: EasyDeLState,
-		run_exception: Optional[Exception] = None,
+		run_exception: tp.Optional[Exception] = None,
 	):
 		if run_exception is not None:
 			if isinstance(run_exception, KeyboardInterrupt):
@@ -801,10 +775,10 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 			filename = self._save_state(
 				state=state,
 				milestone=False,
-				save_dir=self.arguments.save_dir,
+				save_directory=self.arguments.save_directory,
 			)
-			if self.arguments.save_dir is not None:
-				checkpoint_path = os.path.join(self.arguments.save_dir, filename)
+			if self.arguments.save_directory is not None:
+				checkpoint_path = os.path.join(self.arguments.save_directory, filename)
 		# except Exception as e:
 		# 	termcolor.cprint(
 		# 		f"Failed to save checkpoint on interruption: {str(e)}",
@@ -823,8 +797,8 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 		self,
 		state: EasyDeLState,
 		exception: Exception,
-		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+		shard_fns: tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]],
+		gather_fns: tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]],
 	):
 		"""Handle training interruption gracefully."""
 		if isinstance(exception, KeyboardInterrupt):
@@ -880,7 +854,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 
 	def _log_metrics(
 		self,
-		metrics: Dict[str, float],
+		metrics: tp.Dict[str, float],
 		pbar: tqdm.tqdm,
 		step: int,
 		mode: str = "train",
