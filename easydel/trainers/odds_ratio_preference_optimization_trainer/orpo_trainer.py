@@ -1046,7 +1046,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 						state=self.model_state,
 						gather_fns=gather_fns,
 						milestone=True,
-						save_dir=self.arguments.save_dir,
+						save_directory=self.arguments.save_directory,
 					)
 
 				current_step += 1

@@ -898,7 +898,9 @@ class DPOTrainer(BaseTrainer, ABC):
 		termcolor.cprint(f"Saving Model {filename}.", color="red", force_color=True)
 		state.save_state(
 			filename=filename,
-			checkpoint_dir=os.path.join(self.arguments.save_dir, self.arguments.model_name),
+			checkpoint_dir=os.path.join(
+				self.arguments.save_directory, self.arguments.model_name
+			),
 			gather_fns=gather_fns,
 			float_dtype=self.dtype,
 			verbose=self.arguments.verbose,
@@ -1025,7 +1027,7 @@ class DPOTrainer(BaseTrainer, ABC):
 						state=self.model_state,
 						gather_fns=gather_fns,
 						milestone=True,
-						save_dir=self.arguments.save_dir,
+						save_directory=self.arguments.save_directory,
 					)
 
 				current_step += 1

@@ -112,7 +112,7 @@ class EasyBridgeMixin(PushToHubMixin):
 			self.generation_config.save_pretrained(str(save_directory))
 
 		output_model_file = save_directory / FLAX_WEIGHTS_NAME
-		state = nn.split(self)[1]
+		state = nn.split(self, nn.Param, ...)[1]
 
 		CheckpointManager.save_checkpoint(
 			state=state.to_pure_dict(),
@@ -192,7 +192,6 @@ class EasyBridgeMixin(PushToHubMixin):
 		private: tp.Optional[bool] = None,
 		token: tp.Optional[tp.Union[bool, str]] = None,
 		create_pr: bool = False,
-		safe_serialization: bool = True,
 		gather_fns: tp.Optional[dict[tp.Callable]] = None,
 		float_dtype=None,
 		verbose: bool = True,
@@ -210,7 +209,6 @@ class EasyBridgeMixin(PushToHubMixin):
 		    private (bool, optional): If True, creates a private repository.
 		    token (str or bool, optional): The Hugging Face Hub token.
 		    create_pr (bool, optional): If True, creates a pull request.
-		    safe_serialization (bool, optional): If True, uses safe serialization.
 		    gather_fns (dict[Callable], optional): Custom gather functions for checkpoint saving.
 		    float_dtype (dtype, optional): Data type for saving weights.
 		    verbose (bool, optional): Whether to print verbose messages. Defaults to True.

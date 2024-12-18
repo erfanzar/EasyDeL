@@ -12,7 +12,6 @@ sys.path.append(
 		"../..",
 	)
 )
-os.environ["EKERNEL_OPS"] = "false"
 import fjformer
 from datasets import Dataset, IterableDataset
 from jax import numpy as jnp
@@ -29,7 +28,7 @@ from easydel import (
 )
 
 TOTAL_BATCH_SIZE = 1
-UPPER = 5
+UPPER = 600
 NUM_TRAIN_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
 NUM_EVAL_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
 NUM_TRAIN_EPOCHS = 2
@@ -73,26 +72,23 @@ def main(use_iterable_dataset: bool):
 
 	if not use_iterable_dataset:
 		example_train_data = Dataset.from_generator(
-			data_generator,
-			gen_kwargs={"num_rows": NUM_TRAIN_EXAMPLES},
+			data_generator, gen_kwargs={"num_rows": NUM_TRAIN_EXAMPLES}
 		)
 		example_eval_data = Dataset.from_generator(
-			data_generator,
-			gen_kwargs={"num_rows": NUM_EVAL_EXAMPLES},
+			data_generator, gen_kwargs={"num_rows": NUM_EVAL_EXAMPLES}
 		)
 	else:
 		example_train_data = IterableDataset.from_generator(
-			data_generator,
-			gen_kwargs={"num_rows": NUM_TRAIN_EXAMPLES},
+			data_generator, gen_kwargs={"num_rows": NUM_TRAIN_EXAMPLES}
 		)
 		example_eval_data = IterableDataset.from_generator(
-			data_generator,
-			gen_kwargs={"num_rows": NUM_EVAL_EXAMPLES},
+			data_generator, gen_kwargs={"num_rows": NUM_EVAL_EXAMPLES}
 		)
 
 	trainer = Trainer(
 		arguments=TrainingArguments(
-			model_name="CLM_TEST",
+			save_directory="tmp-files",
+			model_name="TrainerTest",
 			num_train_epochs=NUM_TRAIN_EPOCHS,
 			total_batch_size=TOTAL_BATCH_SIZE,
 			gradient_accumulation_steps=2,
@@ -105,6 +101,8 @@ def main(use_iterable_dataset: bool):
 			use_wandb=False,
 			learning_rate=3e-4,
 			do_last_save=True,
+			save_steps=10,
+			save_total_limit=5,
 			save_optimizer_state=True,
 			training_time="80Min",
 			optimizer=EasyDeLOptimizers.ADAMW,

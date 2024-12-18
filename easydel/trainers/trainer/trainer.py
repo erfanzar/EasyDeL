@@ -269,7 +269,7 @@ class Trainer(BaseTrainer):
 					_ = self._save_state(
 						state=state,
 						milestone=True,
-						save_dir=self.arguments.save_dir,
+						save_directory=self.arguments.save_directory,
 					)
 
 				current_step += 1
@@ -357,7 +357,6 @@ class Trainer(BaseTrainer):
 
 	def _finalize_training(self, output, run_exception):
 		"""Finalize training and prepare output."""
- 
 
 		if self.arguments.do_eval:
 			for _ in self.eval(output.state):

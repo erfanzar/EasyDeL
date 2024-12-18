@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import functools
-import pathlib
+from pathlib import Path
 import re
 import warnings
 from dataclasses import dataclass, field
@@ -34,14 +34,13 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import PartitionSpec
 
+
 from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import (
-	AVAILABLE_GRADIENT_CHECKPOINTS,
 	AVAILABLE_OPTIMIZERS,
 	AVAILABLE_PRUNING_TYPE,
 	AVAILABLE_SCHEDULERS,
 	AVAILABLE_SPARSE_MODULE_TYPES,
-	EasyDeLGradientCheckPointers,
 	EasyDeLOptimizers,
 	EasyDeLSchedulers,
 	get_logger,
@@ -68,7 +67,6 @@ AVAILABLE_BACKENDS: List[str] = ["cpu", "gpu", "tpu", None]
 class TrainingArguments:
 	model_name: str = "Model"
 	num_train_epochs: int = 10
-	model_class: Optional[EasyDeLBaseModule] = None
 	total_batch_size: int = 32
 	eval_batch_size: int = 64
 	max_training_steps: Optional[int] = None
@@ -81,9 +79,7 @@ class TrainingArguments:
 	clip_grad: Optional[float] = None
 	weight_decay: float = 0.01
 	loss_config: Optional[LossConfig] = None
-	gradient_checkpointing: AVAILABLE_GRADIENT_CHECKPOINTS = (
-		EasyDeLGradientCheckPointers.NONE
-	)
+
 	max_sequence_length: Optional[int] = 4096
 	is_fine_tuning: bool = True
 	do_train: bool = True
@@ -92,17 +88,15 @@ class TrainingArguments:
 	backend: Optional[str] = None
 	extra_optimizer_kwargs: dict = field(default_factory=dict)
 	save_steps: Optional[int] = None
-	save_dir: str = "EasyDeL-Checkpoints"
+	save_directory: str = "EasyDeL-Checkpoints"
 	save_total_limit: Optional[int] = None
 	use_wandb: bool = True
 	ids_to_pop_from_dataset: Optional[list] = field(default_factory=list)
 	remove_ckpt_after_load: bool = False
-	configs_to_initialize_model_class: Optional[dict] = None
 	do_last_save: bool = True
 	model_parameters: Optional[dict] = None
 	track_memory: Optional[bool] = None
 
-	loss_chunk: int = 1024
 	truncation_mode: Literal["keep_end", "keep_start"] = "keep_end"
 	warmup_steps: int = 500
 	step_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp")
@@ -125,7 +119,6 @@ class TrainingArguments:
 	performance_mode: bool = False
 	neftune_noise_alpha: Optional[float] = None
 	log_grad_norms: bool = True
-	loaded_model_config_kwargs: Optional[dict] = None
 
 	def __post_init__(self):
 		"""
@@ -138,12 +131,6 @@ class TrainingArguments:
 		self._setup_optimizer()
 		self._setup_logging()
 		self._ensure_variables()
-		if self.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
-			warnings.warn(
-				"Passing `gradient_checkpointing` in training arguments is deprecated, "
-				"please pass `gradient_checkpointing` to model config_kwargs while loading or creating model",
-				stacklevel=1,
-			)
 
 	def _validate_config(self):
 		"""
@@ -224,14 +211,14 @@ class TrainingArguments:
 		value, unit = match.groups()
 		return int(value) * (3600 if unit == "h" else 60)
 
-	def get_path(self) -> pathlib.Path:
+	def get_path(self) -> Path:
 		"""
 		Returns the path to the checkpoint directory.
 
 		Returns:
-		    pathlib.Path: The path to the checkpoint directory.
+		    Path: The path to the checkpoint directory.
 		"""
-		return pathlib.Path(self.save_dir, self.model_name)
+		return Path(self.save_directory, self.model_name)
 
 	def ensure_checkpoint_path(self):
 		"""
@@ -268,14 +255,16 @@ class TrainingArguments:
 		from easydel.utils.checkpoint_managers import CheckpointManager
 
 		return CheckpointManager(
-			checkpoint_dir=os.path.join(self.save_dir, self.model_name),
+			checkpoint_dir=os.path.join(self.save_directory, self.model_name),
 			save_optimizer_state=self.save_optimizer_state,
 			verbose=self.verbose,
 		)
 
 	@functools.cached_property
 	def _tensorboard(self):
-		return flax.metrics.tensorboard.SummaryWriter(log_dir=str(self.get_path()))
+		return flax.metrics.tensorboard.SummaryWriter(
+			log_dir=str(self._get_save_directory(create=True))
+		)
 
 	def get_tensorboard(self):
 		"""
@@ -442,7 +431,7 @@ class TrainingArguments:
 						value = np.array(value)
 					summary_writer.histogram(key, value, step)
 			except Exception as e:
-				logger.warn(f"Failed to log metric {key} to TensorBoard: {e}")
+				warnings.warn(f"Failed to log metric {key} to TensorBoard: {e}")
 
 		summary_writer.flush()
 
@@ -528,6 +517,20 @@ class TrainingArguments:
 			else:
 				result.append(" " * (indent + 2) + str(value))
 		return "\n".join(result)
+
+	def _get_save_directory(self, create: bool = True) -> Path:
+		bd = Path(self.save_directory)
+		dir = bd / Path(self.model_name)
+		if create:
+			dir.mkdir(exist_ok=True, parents=True)
+		return dir
+
+	def _get_save_directory_milestone(self, step, create: bool = True) -> Path:
+		directory_name = f"run-{step}"
+		save_directory = self._get_save_directory(create=create) / directory_name
+		if create:
+			save_directory.mkdir(exist_ok=True, parents=True)
+		return save_directory
 
 
 class EasyDeLBaseModule:
