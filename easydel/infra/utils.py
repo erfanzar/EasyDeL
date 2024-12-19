@@ -262,7 +262,7 @@ def quantize_linear_layers(
 	model: nn.Module,
 	/,
 	*,
-	method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.A8BIT,
+	method: tp.Optional[EasyDeLQuantizationMethods] = None,
 	block_size: int = 256,
 	quantization_pattern: tp.Optional[str] = None,
 	verbose: bool = True,
@@ -279,7 +279,7 @@ def quantize_linear_layers(
 	Returns:
 	    Quantized parameters in the same structure as the input.
 	"""
-	if method == EasyDeLQuantizationMethods.NONE:
+	if method == EasyDeLQuantizationMethods.NONE or method is None:
 		return model
 
 	from easydel.layers.quantization import Linear8bit, LinearNF4
