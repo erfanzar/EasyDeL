@@ -69,13 +69,13 @@ class AutoEasyDeLModelForSpeechSeq2Seq(BaseAutoEasyModel):
 	    >>> from easydel import AutoEasyDeLModelForSpeechSeq2Seq
 
 	    >>> # Load a openai/whisper-large-v3-turbo sharded
-	    >>> model, params = AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
+	    >>> model = AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
 	    ...  "openai/whisper-large-v3-turbo",
 	    ...  auto_shard_model=True,
 	    >>> )
 
 	    >>> # Load a openai/whisper-large-v3-turbo model sharded across 8 GPUs with data parallelism (DP) and fully sharded data parallelism (FSDP)
-	    >>> model, params = AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
+	    >>> model = AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
 	    ...  "openai/whisper-large-v3-turbo",
 	    ...  sharding_axis_dims=(1, 8, 1, 1),
 	    ...  sharding_axis_names=("dp", "fsdp", "tp", "sp"),
@@ -387,7 +387,7 @@ class AutoEasyDeLModelForSpeechSeq2Seq(BaseAutoEasyModel):
 				f"{sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(params))[0]) / 1e9}"
 				f" Billion Parameters"
 			)
-		return ed_model, params
+		return ed_model
 
 
 class AutoStateForSpeechSeq2Seq:
@@ -446,7 +446,7 @@ class AutoStateForSpeechSeq2Seq:
 		Returns:
 		    EasyDeLState: containing the EasyDeL state and the loaded and sharded model parameters.
 		"""
-		model, params = AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
+		model = AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
 			pretrained_model_name_or_path=pretrained_model_name_or_path,
 			device=device,
 			dtype=dtype,

@@ -844,7 +844,7 @@ if __name__ == "__main__":
 	try:
 		import flax
 
-		fo = flax.linen.attention.dot_product_attention(query, key, value, b)
+		fo = flax.nnx.dot_product_attention(query, key, value, b)
 		print(fo[-1, -1, -1, :5])
 	except Exception as er:
 		print("Flax OOM", er)

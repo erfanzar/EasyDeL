@@ -548,8 +548,9 @@ class OlmoForCausalLM(EasyDeLBaseModule):
 
 		hidden_states = outputs[0]
 		if self.config.tie_word_embeddings:
-			self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
-			lm_logits = self.lm_head(hidden_states)
+			# self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
+			# lm_logits = self.lm_head(hidden_states)
+			lm_logits = hidden_states @ self.model.embed_tokens.embedding.value.T
 		else:
 			lm_logits = self.lm_head(hidden_states)
 		if not return_dict:

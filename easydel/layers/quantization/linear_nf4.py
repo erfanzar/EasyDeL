@@ -281,6 +281,7 @@ class LinearNF4(QauntModule):
 			self.block_size,
 		).reshape(self.in_features, self.out_features)
 
+	@jax.named_scope("easydel-linear-nf4-call")
 	def __call__(self, inputs: Array) -> Array:
 		"""Applies a quantized linear transformation to the inputs along the last dimension."""
 		kernel = self._dequantize_kernel()

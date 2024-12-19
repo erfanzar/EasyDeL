@@ -106,7 +106,7 @@ class SFTTrainer(Trainer, ABC):
 	    >>> partition_axis = PartitionAxis()
 	    >>> sharding_axis_dims = (1, -1, 1, 1)  # Change to 1,1,1,-1 for Sequence Sharding
 
-	    >>> model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
+	    >>> model = AutoEasyDeLModelForCausalLM.from_pretrained(
 	    ...   huggingface_repo_id_or_path,
 	    ...   dtype=dtype,
 	    ...   param_dtype=dtype,

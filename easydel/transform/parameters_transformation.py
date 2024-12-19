@@ -26,6 +26,10 @@ from easydel.transform.utils import jax2pt
 from easydel.utils.analyze_memory import SMPMemoryMonitor
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
+if tp.TYPE_CHECKING:
+	from transformers import PreTrainedModel
+else:
+	PreTrainedModel = tp.Any
 mem_ops = SMPMemoryMonitor(5)
 logger = get_logger(__name__)
 
@@ -117,9 +121,9 @@ def process_tensor(
 		ndim = len(tensor.shape)
 		match ndim:
 			case 2:
-				tensor = tensor.transpose(0, 1) # linear layers
+				tensor = tensor.transpose(0, 1)  # linear layers
 			case 3:
-				tensor = tensor.transpose(0, 2) # 1d conv layers
+				tensor = tensor.transpose(0, 2)  # 1d conv layers
 			case _:
 				...
 		new_key = key.replace(".weight", ".kernel")
@@ -270,7 +274,7 @@ def easystate_to_torch(
 def easystate_to_huggingface_model(
 	state,
 	config,
-	base_huggingface_module: "transformers.PreTrainedModel",  # noqa #type:ignore
+	base_huggingface_module: PreTrainedModel,
 	base_huggingface_module_kwarguments=None,
 	dtype=jnp.float16,
 	transpose_needed=None,

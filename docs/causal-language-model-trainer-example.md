@@ -60,7 +60,7 @@ new_repo_id = "EasyDeL/Llama-3.2-3B-Instruct"
 dtype = jnp.bfloat16
 
 # Load the pretrained model with automatic sharding
-model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
     pretrained_model_name_or_path,
     input_shape=input_shape,
     auto_shard_model=True,

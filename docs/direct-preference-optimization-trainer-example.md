@@ -44,7 +44,7 @@ Here, we define various configuration parameters for model training. This includ
 
 
 ```python
-model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 	pretrained_model_name_or_path,
 	input_shape=input_shape,
 	device_map="auto",

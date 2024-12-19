@@ -585,7 +585,7 @@ class FlexibleAttentionModule(nn.Module):
 			f"\nMiss Match {value_states.shape} and " f"required Shape {k_v_req_shape}"
 		)
 
-	# @functools.partial(jax.jit, static_argnames=["self"])
+	@jax.named_scope("easydel-flexible-attention")
 	def __call__(
 		self,
 		query_states: Array,

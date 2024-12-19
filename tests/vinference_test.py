@@ -33,7 +33,7 @@ def main():
 	sharding_axis_dims = (1, 1, 1, -1)
 	max_length = 4096
 
-	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
+	pretrained_model_name_or_path = "microsoft/Phi-3-mini-128k-instruct"
 	dtype = jnp.float16
 	partition_axis = ed.PartitionAxis()
 
@@ -75,11 +75,12 @@ def main():
 		tokenizer=tokenizer,
 		generation_config=ed.vInferenceConfig(
 			max_new_tokens=1024,
-			temperature=0.4,
+			temperature=0.0,
+			do_sample=False,
 			top_p=0.95,
 			top_k=10,
 			eos_token_id=model.generation_config.eos_token_id,
-			streaming_chunks=16,
+			streaming_chunks=32,
 		),
 	)
 
@@ -89,14 +90,22 @@ def main():
 	inference.precompile(1, inference.model_prefill_length)
 	print("Done Compiling")
 
-	prompt = "Find the value of $x$ that satisfies the equation $4x+5 = 6x+7$."
-
 	messages = [
 		# {
 		# 	"role": "system",
 		# 	"content": "Please reason step by step, and put your final answer within \\boxed{}. and give 3 different responses",
 		# },
-		{"role": "user", "content": prompt},
+		# {"role": "user", "content": "Find the value of $x$ that satisfies the equation $4x+5 = 6x+7$."},
+		{"role": "system", "content": "You are a helpful AI assistant."},
+		{
+			"role": "user",
+			"content": "Can you provide ways to eat combinations of bananas and dragonfruits?",
+		},
+		{
+			"role": "assistant",
+			"content": "Sure! Here are some ways to eat bananas and dragonfruits together: 1. Banana and dragonfruit smoothie: Blend bananas and dragonfruits together with some milk and honey. 2. Banana and dragonfruit salad: Mix sliced bananas and dragonfruits together with some lemon juice and honey.",
+		},
+		{"role": "user", "content": "What about solving an 2x + 3 = 7 equation?"},
 	]
 
 	ids = tokenizer.apply_chat_template(

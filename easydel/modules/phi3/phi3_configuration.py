@@ -140,6 +140,8 @@ class Phi3Config(EasyDeLBaseConfig):
 
 		self.bits = bits
 		self.gradient_checkpointing = gradient_checkpointing
+		self.head_dim = hidden_size // num_attention_heads
+
 		super().__init__(
 			pad_token_id=pad_token_id,
 			bos_token_id=bos_token_id,
@@ -161,89 +163,24 @@ class Phi3Config(EasyDeLBaseConfig):
 			if not hasattr(self, k):
 				setattr(self, k, v)
 
-	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+	def get_partition_rules(self, *args, **kwargs):
 		"""
 		Get the partition rules for the model.
-
-		Args:
-		    fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
-		        Whether to use fully sharded data parallelism.
 
 		Returns:
 		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
-			(
-				("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-				(
-					"norm/kernel",
-					PartitionSpec(
-						("fsdp", "sp"),
-					),
-				),
-				(
-					"post_attention_layernorm/kernel",
-					PartitionSpec(
-						("fsdp", "sp"),
-					),
-				),
-				(
-					"input_layernorm/kernel",
-					PartitionSpec(
-						("fsdp", "sp"),
-					),
-				),
-				("mlp/gate_up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("self_attn/qkv_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				(
-					".*",
-					PartitionSpec(
-						None,
-					),
-				),
-			)
-			if fully_sharded_data_parallel
-			else (
-				("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-				(
-					"norm/kernel",
-					PartitionSpec(
-						None,
-					),
-				),
-				(
-					"post_attention_layernorm/kernel",
-					PartitionSpec(
-						None,
-					),
-				),
-				(
-					"input_layernorm/kernel",
-					PartitionSpec(
-						None,
-					),
-				),
-				("mlp/gate_up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-				(
-					"self_attn/o_proj/kernel",
-					PartitionSpec(
-						"tp",
-						("fsdp", "sp"),
-					),
-				),
-				("self_attn/qkv_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				(
-					".*",
-					PartitionSpec(
-						None,
-					),
-				),
-			)
+			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
+			("norm/kernel", PartitionSpec(("fsdp", "sp"))),
+			("post_attention_layernorm/kernel", PartitionSpec(("fsdp", "sp"))),
+			("input_layernorm/kernel", PartitionSpec(("fsdp", "sp"))),
+			("mlp/gate_up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("self_attn/qkv_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			(".*", PartitionSpec(None)),
 		)
 
 	def _rope_scaling_validation(self):
@@ -251,46 +188,11 @@ class Phi3Config(EasyDeLBaseConfig):
 		if self.rope_scaling is None:
 			return
 
-		if not isinstance(self.rope_scaling, dict) or len(self.rope_scaling) != 3:
-			raise ValueError(
-				"`rope_scaling` must be a dictionary with three fields, `type`, `short_factor` and `long_factor`, "
-				f"got {self.rope_scaling}"
-			)
 		rope_scaling_type = self.rope_scaling.get("type", None)
-		rope_scaling_short_factor = self.rope_scaling.get("short_factor", None)
-		rope_scaling_long_factor = self.rope_scaling.get("long_factor", None)
-		if rope_scaling_type is None or rope_scaling_type not in ["su", "yarn"]:
-			raise ValueError(
-				f"`rope_scaling`'s type field must be one of ['su', 'yarn'], got {rope_scaling_type}"
-			)
-		if not (
-			isinstance(rope_scaling_short_factor, list)
-			and all(isinstance(x, (int, float)) for x in rope_scaling_short_factor)
-		):
-			raise ValueError(
-				f"`rope_scaling`'s short_factor field must be a list of numbers, got {rope_scaling_short_factor}"
-			)
-		if (
-			not len(rope_scaling_short_factor)
-			== self.hidden_size // self.num_attention_heads // 2
-		):
-			raise ValueError(
-				f"`rope_scaling`'s short_factor field must have length {self.hidden_size // self.num_attention_heads // 2}, got {len(rope_scaling_short_factor)}"
-			)
-		if not (
-			isinstance(rope_scaling_long_factor, list)
-			and all(isinstance(x, (int, float)) for x in rope_scaling_long_factor)
-		):
-			raise ValueError(
-				f"`rope_scaling`'s long_factor field must be a list of numbers, got {rope_scaling_long_factor}"
-			)
-		if (
-			not len(rope_scaling_long_factor)
-			== self.hidden_size // self.num_attention_heads // 2
-		):
-			raise ValueError(
-				f"`rope_scaling`'s long_factor field must have length {self.hidden_size // self.num_attention_heads // 2}, got {len(rope_scaling_long_factor)}"
-			)
+
+		# For backward compatibility if previous version used "su" or "yarn"
+		if rope_scaling_type is not None and rope_scaling_type in ["su", "yarn"]:
+			self.rope_scaling["type"] = "longrope"
 
 	@property
 	def granted_freq_max_position_embedding(self) -> int:

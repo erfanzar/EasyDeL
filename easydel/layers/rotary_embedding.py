@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # from functools import partial
 from functools import partial
+import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import jax
@@ -283,71 +284,52 @@ def compute_yarn_frequencies(
 	return jnp.concatenate([cos, sin], axis=-1)
 
 
-def _compute_inner_phi3_frequencies(
-	base,
-	rescale_factors,
-	head_size,
-	position_embeddings,
-	mscale,
-):
-	rescale_factors = jnp.array(rescale_factors, dtype=jnp.float32)
-	inv_freq = 1.0 / (
-		rescale_factors
-		* (base ** (jnp.arange(0, head_size, 2, dtype=jnp.float32) / head_size))
-	)
-	times = jnp.arange(position_embeddings, dtype=jnp.float32)
-	freqs = jnp.einsum("i,j -> ij", times, inv_freq)
-	return jnp.concatenate([jnp.cos(freqs) * mscale, jnp.sin(freqs) * mscale], axis=-1)
-
-
 def compute_phi3_frequencies(
 	base,
 	head_size,
 	rotary_dim,
 	max_position_embeddings,
 	original_max_position_embeddings,
-	short_mscale,
-	long_mscale,
 	short_factor,
 	long_factor,
 ):
 	if rotary_dim != head_size:
-		raise ValueError(
-			f"`compute_phi3_frequencies` does not support "
-			f"rotary_dim != head_size ({rotary_dim}!={head_size})."
-		)
+		raise ValueError(f"rotary_dim != head_size ({rotary_dim}!={head_size})")
+	if max_position_embeddings > original_max_position_embeddings:
+		ext_factors = jnp.array(long_factor, dtype=jnp.float32)
+	else:
+		ext_factors = jnp.array(short_factor, dtype=jnp.float32)
+
+	inv_freq_shape = (
+		jnp.arange(0, head_size, 2, dtype=jnp.int64).astype(jnp.float32) / head_size
+	)
+	inv_freq = 1.0 / (ext_factors * (base**inv_freq_shape))
+
+	inv_freq_expanded = jnp.expand_dims(inv_freq, (0, 2)).astype(jnp.float32)
+	position_ids = jnp.arange(max_position_embeddings, dtype=jnp.int32).reshape(1, -1)
+	position_ids_expanded = jnp.expand_dims(position_ids, 1).astype(jnp.float32)
+	# print(inv_freq_expanded.shape)
+	# print(position_ids_expanded.shape)
+
+	freqs = (inv_freq_expanded @ position_ids_expanded).swapaxes(1, 2)
+	# print("F", freqs.shape)
+	emb = jnp.concatenate((freqs, freqs), axis=-1)
+	# print("E", emb.shape)
+
 	scale = max_position_embeddings / original_max_position_embeddings
 	if scale <= 1.0:
 		scaling_factor = 1.0
 	else:
-		scaling_factor = jnp.sqrt(
-			1 + jnp.log(scale) / jnp.log(original_max_position_embeddings)
+		scaling_factor = math.sqrt(
+			1 + math.log(scale) / math.log(original_max_position_embeddings)
 		)
 
-	if short_mscale is None:
-		short_mscale = scaling_factor
-	if long_mscale is None:
-		long_mscale = scaling_factor
+	cos = jnp.cos(emb) * scaling_factor
+	sin = jnp.sin(emb) * scaling_factor
+	# print("OC", cos.shape)
+	# print("OS", sin.shape)
 
-	return jnp.concatenate(
-		[
-			_compute_inner_phi3_frequencies(
-				position_embeddings=original_max_position_embeddings,
-				rescale_factors=short_factor,
-				mscale=short_mscale,
-				head_size=head_size,
-				base=base,
-			),
-			_compute_inner_phi3_frequencies(
-				position_embeddings=max_position_embeddings,
-				rescale_factors=long_factor,
-				mscale=long_mscale,
-				head_size=head_size,
-				base=base,
-			),
-		],
-		axis=0,
-	)
+	return jnp.concatenate([cos, sin], axis=-1)
 
 
 def compute_llama3_frequencies(
@@ -459,28 +441,23 @@ def apply_phi3_rope(
 	query,
 	key,
 	positions,
-	original_max_position_embeddings,
 	frequencies,
 	offsets: jax.Array = None,
 	dtype: jnp.dtype = jnp.float32,
 ):
-	long_prompt_offset = (
-		jnp.any(
-			positions > original_max_position_embeddings,
-		).astype(jnp.float32)
-		* jnp.full_like(
-			positions,
-			original_max_position_embeddings,
-		)
-	).astype(jnp.int32)
-	idx = positions + long_prompt_offset if long_prompt_offset is not None else positions
-	idx = idx + offsets if offsets is not None else idx
-	cos, sin = jnp.split(frequencies[idx], 2, axis=-1)
-	cos = cos.repeat(2, axis=-1).reshape(cos.shape[0], -1, 1, cos.shape[-1] * 2)
-	sin = sin.repeat(2, axis=-1).reshape(cos.shape[0], -1, 1, sin.shape[-1] * 2)
-	query = query * cos + _rotate_neox(query) * sin
-	key = key * cos + _rotate_neox(key) * sin
-	return query.astype(dtype), key.astype(dtype)
+	positions = positions
+	if offsets is not None:
+		positions = positions + offsets
+	emb = frequencies[0, positions]
+	cos, sin = jnp.split(emb, 2, axis=-1)
+	cos = jnp.expand_dims(cos, 2)
+	sin = jnp.expand_dims(sin, 2)
+
+	with jax.default_matmul_precision("float32"):
+		query_rot = query * cos + _rotate_neox(query) * sin
+		key_rot = key * cos + _rotate_neox(key) * sin
+
+	return query_rot.astype(dtype), key_rot.astype(dtype)
 
 
 @rope_wraper("default")
@@ -501,6 +478,7 @@ class RotaryEmbedding(nn.Module):
 		self.is_neox_style = is_neox_style
 		self.dtype = dtype
 
+	@jax.named_scope("easydel-rope-embedding")
 	def __call__(
 		self,
 		positions: jnp.ndarray,
@@ -551,7 +529,7 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
 		)
 		self.scaling_factors = scaling_factors
 
-	# @flax.linen.jit
+	@jax.named_scope("easydel-rope-linear-scaling")
 	def __call__(
 		self,
 		positions: jnp.ndarray,
@@ -605,7 +583,7 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
 		)
 		self.scaling_factor = scaling_factor
 
-	# @flax.linen.jit
+	@jax.named_scope("easydel-rope-dynamic-ntk-scaling")
 	def __call__(
 		self,
 		positions: jnp.ndarray,
@@ -671,7 +649,7 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
 		self.beta_fast = beta_fast
 		self.beta_slow = beta_slow
 
-	# @flax.linen.jit
+	@jax.named_scope("easydel-rope-yarn-scaling")
 	def __call__(
 		self,
 		positions: jnp.ndarray,
@@ -718,8 +696,6 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
 		dtype: jnp.dtype,
 		short_factor: List[float],
 		long_factor: List[float],
-		short_mscale: Optional[float] = None,
-		long_mscale: Optional[float] = None,
 	):
 		super().__init__()
 
@@ -732,9 +708,8 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
 		self.dtype = dtype
 		self.short_factor = short_factor
 		self.long_factor = long_factor
-		self.short_mscale = short_mscale
-		self.long_mscale = long_mscale
 
+	@jax.named_scope("easydel-rope-phi3-long")
 	def __call__(
 		self,
 		positions: jnp.ndarray,
@@ -752,8 +727,6 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
 					rotary_dim=self.rotary_dim,
 					max_position_embeddings=self.max_position_embeddings,
 					original_max_position_embeddings=self.original_max_position_embeddings,
-					short_mscale=self.short_mscale,
-					long_mscale=self.long_mscale,
 					short_factor=self.short_factor,
 					long_factor=self.long_factor,
 				)
@@ -763,7 +736,6 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
 				positions=positions,
 				frequencies=frequencies,
 				offsets=offsets,
-				original_max_position_embeddings=self.original_max_position_embeddings,
 				dtype=self.dtype,
 			)
 
@@ -797,6 +769,7 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
 		self.high_freq_factor = high_freq_factor
 		self.orig_max_position = orig_max_position
 
+	@jax.named_scope("easydel-rope-llama3")
 	def __call__(
 		self,
 		positions: jnp.ndarray,
@@ -869,6 +842,7 @@ class DeepseekScalingRotaryEmbedding(nn.Module):
 		self.mscale = mscale
 		self.mscale_all_dim = mscale_all_dim
 
+	@jax.named_scope("easydel-rope-deepseek")
 	def __call__(
 		self,
 		positions: jnp.ndarray,
@@ -1043,9 +1017,7 @@ def get_rope(
 			short_factor = rope_scaling["short_factor"]
 			long_factor = rope_scaling["long_factor"]
 			original_max_position = rope_scaling["original_max_position_embeddings"]
-			extra_kwargs = {
-				k: v for k, v in rope_scaling.items() if k in ("short_mscale", "long_mscale")
-			}
+
 			rotary_emb = Phi3LongRoPEScaledRotaryEmbedding(
 				head_size=head_size,
 				rotary_dim=rotary_dim,
@@ -1056,7 +1028,6 @@ def get_rope(
 				dtype=dtype,
 				short_factor=short_factor,
 				long_factor=long_factor,
-				**extra_kwargs,
 			)
 		else:
 			raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
@@ -1194,8 +1165,6 @@ def get_frequencies(
 				original_max_position_embeddings=original_max_position,
 				short_factor=short_factor,
 				long_factor=long_factor,
-				short_mscale=extra_kwargs["short_mscale"],
-				long_mscale=extra_kwargs["long_mscale"],
 			)
 		else:
 			raise ValueError(f"Unknown RoPE scaling type {scaling_type}")

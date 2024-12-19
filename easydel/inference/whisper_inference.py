@@ -16,18 +16,22 @@
 import math
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Dict, Optional, Tuple, Union
+import typing as tp
 
 import jax
 import numpy as np
 import requests
 from jax import numpy as jnp
-from transformers import GenerationConfig, WhisperProcessor, WhisperTokenizer
 from transformers.models.whisper.tokenization_whisper import TO_LANGUAGE_CODE
 from transformers.pipelines.audio_utils import ffmpeg_read
 
 from easydel.modules.whisper import WhisperForConditionalGeneration
 from easydel.utils.compiling_utils import get_safe_hash_int
+
+if tp.TYPE_CHECKING:
+	from transformers import GenerationConfig, WhisperProcessor, WhisperTokenizer
+else:
+	GenerationConfig, WhisperProcessor, WhisperTokenizer = [tp.Any] * 3
 
 
 @partial(
@@ -75,9 +79,9 @@ class vWhisperInferenceConfig:
 	        Whether the model is multilingual.
 	"""
 
-	batch_size: Optional[int] = 1
-	max_length: Optional[int] = None
-	generation_config: Optional[GenerationConfig] = None
+	batch_size: tp.Optional[int] = 1
+	max_length: tp.Optional[int] = None
+	generation_config: tp.Optional[GenerationConfig] = None
 	logits_processor = None
 	return_timestamps = None
 	task = None
@@ -111,7 +115,7 @@ class vWhisperInference:
 	Args:
 	    model (`WhisperForConditionalGeneration`):
 	        The fine-tuned Whisper model to use for inference.
-	    params (`Dict[str, Any]`):
+	    params (`tp.Dict[str, tp.Any]`):
 	        Model parameters.
 	    tokenizer (`WhisperTokenizer`):
 	        Tokenizer for Whisper.
@@ -129,7 +133,7 @@ class vWhisperInference:
 
 		>>> REPO_ID = "openai/whisper-small"  # Replace with your desired model
 
-		>>> model, params = ed.AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
+		>>> model = ed.AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
 		...		REPO_ID,
 		...		# ... (config_kwargs as needed)
 		>>> )
@@ -167,10 +171,10 @@ class vWhisperInference:
 	def __init__(
 		self,
 		model: WhisperForConditionalGeneration,
-		params: Dict[str, Any],
+		params: tp.Dict[str, tp.Any],
 		tokenizer: WhisperTokenizer,
 		processor: WhisperProcessor,
-		inference_config: Optional[vWhisperInferenceConfig] = None,
+		inference_config: tp.Optional[vWhisperInferenceConfig] = None,
 		dtype: jax.typing.DTypeLike = jnp.float32,
 	):
 		# fmt:off
@@ -193,8 +197,8 @@ class vWhisperInference:
 	def _generate(
 		self,
 		input_features: jax.Array,
-		language: Optional[str] = None,
-		task: Optional[str] = None,
+		language: tp.Optional[str] = None,
+		task: tp.Optional[str] = None,
 		return_timestamps: bool = False,
 	) -> jax.Array:
 		forced_decoder_ids = self.get_decoder_input_ids(
@@ -214,11 +218,11 @@ class vWhisperInference:
 
 	def get_decoder_input_ids(
 		self,
-		generation_config: Optional[GenerationConfig] = None,
-		task: Optional[str] = None,
-		language: Optional[str] = None,
+		generation_config: tp.Optional[GenerationConfig] = None,
+		task: tp.Optional[str] = None,
+		language: tp.Optional[str] = None,
 		return_timestamps: bool = False,
-	) -> list[Tuple[int, int]]:
+	) -> list[tp.Tuple[int, int]]:
 		generation_config = generation_config or self.model.generation_config
 		is_multilingual = getattr(generation_config, "is_multilingual", None)
 		decoder_input_ids = []
@@ -310,10 +314,12 @@ class vWhisperInference:
 
 	def _process_model_inputs(
 		self,
-		audio_input: Union[str, bytes, np.ndarray, Dict[str, Union[np.ndarray, int]]],
+		audio_input: tp.Union[
+			str, bytes, np.ndarray, tp.Dict[str, tp.Union[np.ndarray, int]]
+		],
 		chunk_length_s: float = 30.0,
-		stride_length_s: Optional[Union[float, list[float]]] = None,
-		batch_size: Optional[int] = None,
+		stride_length_s: tp.Optional[tp.Union[float, list[float]]] = None,
+		batch_size: tp.Optional[int] = None,
 	):
 		if isinstance(audio_input, str):
 			if audio_input.startswith("http://") or audio_input.startswith("https://"):
@@ -406,8 +412,8 @@ class vWhisperInference:
 	def _process_model_outputs(
 		self,
 		model_outputs,
-		return_timestamps: Optional[bool] = None,
-		return_language: Optional[str] = None,
+		return_timestamps: tp.Optional[bool] = None,
+		return_language: tp.Optional[str] = None,
 	):
 		# fmt:off
 		model_outputs = [
@@ -435,10 +441,10 @@ class vWhisperInference:
 
 	def _single_batch_process(
 		self,
-		model_inputs: Dict[str, Any],
+		model_inputs: tp.Dict[str, tp.Any],
 		batch_size: int,
-		language: Optional[str] = None,
-		task: Optional[str] = None,
+		language: tp.Optional[str] = None,
+		task: tp.Optional[str] = None,
 		return_timestamps: bool = False,
 	):
 		input_features = model_inputs.pop("input_features")
@@ -463,19 +469,21 @@ class vWhisperInference:
 
 	def generate(
 		self,
-		audio_input: Union[str, bytes, np.ndarray, Dict[str, Union[np.ndarray, int]]],
+		audio_input: tp.Union[
+			str, bytes, np.ndarray, tp.Dict[str, tp.Union[np.ndarray, int]]
+		],
 		chunk_length_s: float = 30.0,
-		stride_length_s: Optional[Union[float, list[float]]] = None,
-		batch_size: Optional[int] = None,
-		language: Optional[str] = None,
-		task: Optional[str] = None,
-		return_timestamps: Optional[bool] = None,
+		stride_length_s: tp.Optional[tp.Union[float, list[float]]] = None,
+		batch_size: tp.Optional[int] = None,
+		language: tp.Optional[str] = None,
+		task: tp.Optional[str] = None,
+		return_timestamps: tp.Optional[bool] = None,
 	):
 		"""
 		Transcribe or translate audio input.
 
 		Args:
-		    audio_input (`Union[str, bytes, np.ndarray, Dict[str, Union[np.ndarray, int]]]`):
+		    audio_input (`tp.Union[str, bytes, np.ndarray, tp.Dict[str, tp.Union[np.ndarray, int]]]`):
 		        Input audio. Can be a local file path, URL, bytes, numpy array, or a dictionary
 		        containing the array and sampling rate.
 		    chunk_length_s (`float`, *optional*, defaults to 30.0):

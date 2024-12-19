@@ -19,7 +19,7 @@ from typing import Optional
 import chex
 import jax
 from fjformer import GenerateRNG
-from flax.linen.attention import dot_product_attention as _dot_product_attention
+from flax.nnx import dot_product_attention as _dot_product_attention
 from jax import custom_vjp, extend
 from jax import numpy as jnp
 from jax import random as jrand

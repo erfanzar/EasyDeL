@@ -17,6 +17,7 @@ from typing import Optional
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
+import jax
 
 
 class RMSNorm(nn.Module):
@@ -46,6 +47,7 @@ class RMSNorm(nn.Module):
 	def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
 		return x * lax.rsqrt(jnp.square(x).mean(-1, keepdims=True) + self.eps)
 
+	@jax.named_scope("easydel-rmsnorm")
 	def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
 		x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
 		output = self._norm(x).astype(self.dtype)

@@ -398,6 +398,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		from easydel.modules.auto_configuration import (
 			AutoEasyDeLConfig,
 			AutoShardAndGatherFunctions,
+			get_modules_by_type,
 		)
 
 		api = HfApi(token=token)
@@ -469,8 +470,12 @@ class EasyBridgeMixin(PushToHubMixin):
 					raise FileNotFoundError(
 						f"No file named '{FLAX_WEIGHTS_NAME}' found in directory '{pretrained_model_name_or_path}'."
 					)
-			elif Path(subfolder) / pretrained_model_name_or_path:
-				archive_file = Path(subfolder) / pretrained_model_name_or_path
+			elif Path(
+				Path(subfolder) / pretrained_model_name_or_path / FLAX_WEIGHTS_NAME
+			).is_file():
+				archive_file = (
+					Path(subfolder) / pretrained_model_name_or_path / FLAX_WEIGHTS_NAME
+				)
 				is_local = True
 			elif _is_remote_url(pretrained_model_name_or_path):
 				filename = pretrained_model_name_or_path
@@ -503,12 +508,17 @@ class EasyBridgeMixin(PushToHubMixin):
 					) from None
 			if is_local:
 				logger.debug(f"loading weights file {archive_file}")
+
 				resolved_archive_file = str(archive_file)
+
 			else:
 				logger.debug(
 					f"loading weights file {filename} from cache at {resolved_archive_file}"
 				)
-
+		config_class, cls, _ = get_modules_by_type(
+			config.model_type,
+			cls._model_task,
+		)
 		model = nn.eval_shape(
 			lambda: cls(
 				config=config,

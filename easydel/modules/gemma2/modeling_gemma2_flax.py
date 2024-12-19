@@ -661,15 +661,20 @@ class Gemma2ForCausalLM(EasyDeLBaseModule):
 			),
 		)
 		if self.config.tie_word_embeddings:
-			self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
-			lm_logits = self.lm_head(hidden_states)
+			# self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
+			# lm_logits = self.lm_head(hidden_states)
+			lm_logits = hidden_states @ self.model.embed_tokens.embedding.value.T
 		else:
 			lm_logits = self.lm_head(hidden_states)
 
 		if self.config.final_logit_softcapping is not None:
-			lm_logits = lm_logits / self.config.final_logit_softcapping
-			lm_logits = jax.nn.tanh(lm_logits)
-			lm_logits = lm_logits * self.config.final_logit_softcapping
+			cap = jnp.array(self.config.final_logit_softcapping, dtype=lm_logits.dtype)
+			lm_logits = cap * jax.nn.tanh(lm_logits / cap)
+			# lm_logits = jnp.where(
+			# 	jnp.abs(lm_logits) > cap,
+			# 	cap * jnp.sign(lm_logits),
+			# 	lm_logits,
+			# )
 
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]

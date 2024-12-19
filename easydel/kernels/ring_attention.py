@@ -228,7 +228,7 @@ def _test_forward():
 	try:
 		import flax
 
-		fo = flax.linen.attention.dot_product_attention(q, k, v, b)
+		fo = flax.nnx.dot_product_attention(q, k, v, b)
 		print(fo[-1, -1, -1, :5])
 	except Exception as er:
 		print("Flax OOM", er)
@@ -279,9 +279,7 @@ def _test_backward():
 	try:
 		import flax
 
-		fo = jax.grad(lambda *x: flax.linen.attention.dot_product_attention(*x).sum())(
-			q, k, v, b
-		)
+		fo = jax.grad(lambda *x: flax.nnx.dot_product_attention(*x).sum())(q, k, v, b)
 		print("Flax backward pass gradients:")
 		print(fo[-1][-1, -1, :5])  # Print last 5 elements of last head of last batch
 	except Exception as e:
