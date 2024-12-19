@@ -193,7 +193,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 		self.eval_dataset = eval_dataset
 		self.tokenizer = tokenizer
 		self._loggers_initialized = False
-		self.mesh = self.arguments.get_mesh()
+		self.mesh = self.model.mesh
 		assert (
 			arguments.padding_value is not None
 		), "`padding_value` can not be set as `None` it must be an integer."
@@ -444,7 +444,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 		Returns:
 		    TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
 		"""
-		mesh = self.arguments.get_mesh()
+		mesh = self.model.mesh
 
 		def initialize_state_function():
 			initialized_parameters = self.model.init_weights(
@@ -645,7 +645,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 
 						spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
 						empty_sharding = jax.sharding.NamedSharding(
-							spec=PartitionSpec(), mesh=self.arguments.get_mesh()
+							spec=PartitionSpec(), mesh=self.model.mesh
 						)
 						sharded_training_step_function = jit(
 							create_orpo_step_function(

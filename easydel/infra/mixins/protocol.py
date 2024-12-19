@@ -38,6 +38,11 @@ PartitionLike = tp.Optional[
 _CP = tp.Type[EasyDeLBaseConfig]
 _T = tp.TypeVar("_T")
 
+if tp.TYPE_CHECKING:
+	from easydel.etils.easystate import EasyDeLState
+else:
+	EasyDeLState = tp.Any
+
 
 def return_type_adjuster(
 	original_return_type: tp.Type[_T],
@@ -558,6 +563,10 @@ class BaseModuleProtocol(ABC):
 		Returns:
 		    nn.Module: The quantized model.
 		"""
+
+	@abstractmethod
+	def to_state(self) -> EasyDeLState:
+		"""converts current model to a EasyDeLState"""
 
 	def __repr__(self):
 		try:

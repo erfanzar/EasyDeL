@@ -75,6 +75,8 @@ class LossMetrics:
 	max_grad_norm: tp.Optional[flax.struct.PyTreeNode] = None
 	mean_grad_norm: tp.Optional[flax.struct.PyTreeNode] = None
 	grad_norms: tp.Optional[flax.struct.PyTreeNode] = None
+	chosen_rewards: tp.Optional[jax.Array] = None
+	rejected_rewards: tp.Optional[jax.Array] = None
 
 
 def sigmoid_cross_entropy_with_logits(

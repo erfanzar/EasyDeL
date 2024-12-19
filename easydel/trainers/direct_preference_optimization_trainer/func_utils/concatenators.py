@@ -21,14 +21,14 @@ from jax import numpy as jnp
 from easydel.trainers.direct_preference_optimization_trainer.utils import pad_to_length
 
 
-def concatenated_dpo_inputs(
+def concatenated_inputs(
 	batch: Dict[str, Union[List, chex.Array]],
 	is_encoder_decoder: bool = False,
 	label_pad_token_id: int = -100,
 	padding_value: int = 0,
 	fixed_max_length: int | None = None,
 ) -> Dict[str, chex.Array]:
-	"""The concatenated_dpo_inputs function takes a batch of chosen and rejected examples,
+	"""The concatenated_inputs function takes a batch of chosen and rejected examples,
 	and concatenates them together. This is useful for training the model to predict whether an example was chosen
 	by the human annotator. The function also pads all inputs to
 	the same length as the longest input in that batch.
