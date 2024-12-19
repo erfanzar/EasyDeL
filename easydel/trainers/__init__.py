@@ -36,8 +36,5 @@ from easydel.trainers.utils import (
 	get_formatting_func_from_dataset,
 	instructions_formatting_function,
 )
-from easydel.trainers.vision_causal_language_model_trainer import (
-	VisionCausalLanguageModelTrainer,
-	VisionCausalLMTrainerOutput,
-)
+ 
 from easydel.trainers.trainer import Trainer

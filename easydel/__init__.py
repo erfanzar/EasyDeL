@@ -290,8 +290,6 @@ from easydel.trainers import (
 	ORPOTrainerOutput,
 	SFTTrainer,
 	TrainingArguments,
-	VisionCausalLanguageModelTrainer,
-	VisionCausalLMTrainerOutput,
 	pack_sequences,
 	Trainer,
 )
