@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import typing as tp
+
 import jax.numpy
 from jax.sharding import PartitionSpec
 
@@ -49,12 +50,12 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 	    >>> from easydel import AutoEasyDeLModelForCausalLM
 
 	    >>> # Load a GPT-2 model on a single CPU
-	    >>> model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
+	    >>> model = AutoEasyDeLModelForCausalLM.from_pretrained(
 	    >>>   "gpt2", device=jax.devices("cpu")[0]
 	    >>> )
 
 	    >>> # Load a GPT-2 model sharded across 8 GPUs with data parallelism (DP) and fully sharded data parallelism (FSDP)
-	    >>> model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
+	    >>> model = AutoEasyDeLModelForCausalLM.from_pretrained(
 	    ...  "gpt2",
 	    ...  sharding_axis_dims=(1, 8, 1, 1),
 	    ...  sharding_axis_names=("dp", "fsdp", "tp", "sp"),

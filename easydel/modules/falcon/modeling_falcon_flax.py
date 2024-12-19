@@ -74,7 +74,7 @@ def built_bloom_alibi(attention_mask, num_attention_heads):
 
 
 def dropout_add(
-	linen_drop: nn.Dropout,
+	nn_drop: nn.Dropout,
 	x: chex.Array,
 	residual: chex.Array,
 ) -> chex.Array:
@@ -85,7 +85,7 @@ def dropout_add(
 	The path without dropout (residual) allows us to backpropagate gradients through both paths at once.
 
 	Args:
-	    linen_drop: nn.Dropout: Specify the dropout layer
+	    nn_drop: nn.Dropout: Specify the dropout layer
 	    x: chex.Array: Pass in the input to the dropout layer
 	    residual: chex.Array: Add the residual to the output of
 	        dropout_add
@@ -95,7 +95,7 @@ def dropout_add(
 	Returns:
 	    A tensor that is the sum of the residual and a dropout layer
 	"""
-	out = linen_drop(inputs=x)
+	out = nn_drop(inputs=x)
 	out = residual + out
 	return out
 

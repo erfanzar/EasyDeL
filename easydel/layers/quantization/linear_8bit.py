@@ -220,6 +220,7 @@ class Linear8bit(QauntModule):
 			self.scales.value,
 		).astype(self.param_dtype)
 
+	@jax.named_scope("easydel-linear-8bit-call")
 	def __call__(self, inputs: Array) -> Array:
 		"""Applies a quantized linear transformation to the inputs along the last dimension."""
 		# Dequantize the kernel for computation

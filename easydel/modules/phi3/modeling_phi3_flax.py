@@ -154,7 +154,7 @@ class Phi3Attention(FlaxAttentionModule):
 
 		self.rotary = self.config.get_basic_rope(
 			self.dtype,
-			head_size=config.hidden_size // config.num_attention_heads,
+			head_size=self.head_dim,
 			base=config.rope_theta,
 			is_neox_style=True,
 		)
@@ -627,8 +627,9 @@ class Phi3ForCausalLM(EasyDeLBaseModule):
 		hidden_states = outputs.last_hidden_state
 
 		if self.config.tie_word_embeddings:
-			self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
-			lm_logits = self.lm_head(hidden_states)
+			# self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
+			# lm_logits = self.lm_head(hidden_states)
+			lm_logits = hidden_states @ self.model.embed_tokens.embedding.value.T
 		else:
 			lm_logits = self.lm_head(hidden_states)
 		if not return_dict:

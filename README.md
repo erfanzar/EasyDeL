@@ -117,7 +117,7 @@ The `vInference` class provides a streamlined interface for text generation usin
 import easydel as ed
 from transformers import AutoTokenizer
 
-model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(...)
+model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(...)
 tokenizer = AutoTokenizer.from_pretrained(...)
 
 inference = ed.vInference(

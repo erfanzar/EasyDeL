@@ -18,8 +18,9 @@ from enum import Enum
 from typing import Literal, Optional, Tuple, Union
 
 import chex
-import einops
-import flax.linen
+import einops 
+import flax
+import flax.nnx
 import jax
 import jax.numpy as jnp
 from jax import random as jrnd
@@ -435,7 +436,7 @@ def _test_backward():
 		co = None
 
 	try:
-		fo = jax.grad(lambda *x: flax.linen.attention.dot_product_attention(*x).sum())(
+		fo = jax.grad(lambda *x: flax.nnx.dot_product_attention(*x).sum())(
 			q, k, v, b
 		)
 

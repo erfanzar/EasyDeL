@@ -139,7 +139,7 @@ class EasyModelsTest(unittest.TestCase):
 		hf_model = hf_module_class(config=copy.deepcopy(config))
 		hf_model.eval()
 		hf_model = hf_model.float()
-		params = transform_function(
+		model_tree = transform_function(
 			state_dict=hf_model.state_dict(),
 			device=jax.devices("cpu")[0],
 			remove_state_dict=True,
@@ -172,14 +172,16 @@ class EasyModelsTest(unittest.TestCase):
 				past_key_values=None,
 			)
 			torch_time = time.time() - torch_time
-			ed_model = module_class(
-				config=config,
-				dtype=self.dtype,
-				param_dtype=self.dtype,
-				precision=self.precision,
-				rngs=nn.Rngs(0),
+			ed_model = nn.eval_shape(
+				lambda: module_class(
+					config=config,
+					dtype=self.dtype,
+					param_dtype=self.dtype,
+					precision=self.precision,
+					rngs=nn.Rngs(0),
+				)
 			)
-			ed_model = ed.traversals.merge_model_and_tree(ed_model, params)
+			ed_model = ed.traversals.merge_model_and_tree(ed_model, tree=model_tree)
 			ed_model.eval()
 			ed_model = ed_model.shard_model()
 
@@ -192,7 +194,7 @@ class EasyModelsTest(unittest.TestCase):
 			ed_output, metrics = jited(jax_input_ids)
 			easy_time = time.time() - easy_time
 
-			del params
+			del model_tree
 			del hf_model
 			gc.collect()
 			return self.compare_torch_to_jax(
@@ -524,10 +526,35 @@ class EasyModelsTest(unittest.TestCase):
 
 	def test_phi3(self):
 		self.header_config = None
-		hf_model, conf = self.get_hf_model_from_hub("microsoft/Phi-3-mini-128k-instruct")
+		self.rope_scaling = {
+			"long_factor": [
+				1.0199999809265137,
+				1.0299999713897705,
+				1.0399999618530273,
+				1.0499999523162842,
+				1.7,
+				1.7,
+				1.8,
+				1.9,
+			],
+			"long_mscale": 1.8,
+			"original_max_position_embeddings": 4,
+			"short_factor": [
+				1.0,
+				1.0399999618530273,
+				1.0399999618530273,
+				1.0399999618530273,
+				1.0499999523162842,
+				1.6,
+				1.7,
+				1.8,
+			],
+			"short_mscale": 1.1,
+			"type": "longrope",
+		}
 		res, err = self.create_test_for_models(
 			"phi3",
-			hf_model,
+			transformers.Phi3ForCausalLM,
 			ed.TaskType.CAUSAL_LM,
 		)
 		self.assertTrue(res, f"PHI3 model Failed [ERROR {err}]")
@@ -786,32 +813,32 @@ if __name__ == "__main__":
 	# unittest.main()
 	test = EasyModelsTest()
 	test.setUp()
-	test.test_arctic()  # Passed
-	test.test_cohere()  # Passed
-	test.test_dbrx()  # Passed
-	test.test_deepseek_v2()  # Passed
-	test.test_exaone()  # Passed
-	test.test_falcon()  # Passed
-	test.test_gemma()  # Passed
-	test.test_gemma2()  # Passed
-	test.test_gptj()  # Passed
+	# test.test_arctic()  # Passed
+	# test.test_cohere()  # Passed
+	# test.test_dbrx()  # Passed
+	# test.test_deepseek_v2()  # Passed
+	# test.test_exaone()  # Passed
+	# test.test_falcon()  # Passed
+	# test.test_gemma()  # Passed
+	# test.test_gemma2()  # Passed
+	# test.test_gptj()  # Passed
 	# test.test_gpt_noex()  # Failed
-	test.test_gpt2()  # Passed
+	# test.test_gpt2()  # Passed
 	# test.test_grok1() # Not Tested Yet!
-	test.test_internlm2()  # Passed
-	test.test_llama()  # Passed
-	test.test_mamba()  # Passed
-	test.test_mamba2()  # Passed
-	test.test_mistral()  # Passed
-	test.test_mixtral()  # Passed
-	test.test_mpt()  # Passed
-	test.test_olmo()  # Passed
-	test.test_olmo2()  # Passed
+	# test.test_internlm2()  # Passed
+	# test.test_llama()  # Passed
+	# test.test_mamba()  # Passed
+	# test.test_mamba2()  # Passed
+	# test.test_mistral()  # Passed
+	# test.test_mixtral()  # Passed
+	# test.test_mpt()  # Passed
+	# test.test_olmo()  # Passed
+	# test.test_olmo2()  # Passed
 	# test.test_openelm()  # Passed
-	test.test_phi()  # Passed
+	# test.test_phi()  # Passed
 	test.test_phi3()  # Passed
 	# test.test_phimoe()  # Failed v0.0.80 - N  Runtime
-	test.test_qwen2()  # Passed
-	test.test_qwen2_moe()  # Passed
-	test.test_stablelm()  # Passed
+	# test.test_qwen2()  # Passed
+	# test.test_qwen2_moe()  # Passed
+	# test.test_stablelm()  # Passed
 	# -----------------------------------------------

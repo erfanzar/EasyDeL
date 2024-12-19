@@ -22,7 +22,7 @@ async def main():
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
 	dtype = jnp.float16
 	partition_axis = ed.PartitionAxis()
-	model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		pretrained_model_name_or_path,
 		input_shape=input_shape,
 		auto_shard_model=True,
@@ -48,7 +48,6 @@ async def main():
 	tokenizer.pad_token_id = tokenizer.eos_token_id
 	inference = ed.vInference(
 		model=model,
-		params=params,
 		tokenizer=tokenizer,
 		generation_config=ed.vInferenceConfig(
 			max_new_tokens=1024,

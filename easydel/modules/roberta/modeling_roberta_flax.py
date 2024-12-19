@@ -16,9 +16,9 @@ import math
 from typing import Optional, Tuple
 
 import chex
+from flax.nnx.nn.attention import dot_product_attention_weights
 import jax
 from flax import nnx as nn
-from flax.linen.attention import dot_product_attention_weights
 from jax import lax
 from jax import numpy as jnp
 

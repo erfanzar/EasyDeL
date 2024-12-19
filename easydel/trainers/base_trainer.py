@@ -554,7 +554,7 @@ training Flax/Jax models on TPU/GPU, for both serving and training purposes.
 from easydel import AutoEasyDeLModelForCausalLM
 from jax import numpy as jnp, lax
 
-model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
+model = AutoEasyDeLModelForCausalLM.from_pretrained(
     f"REPO_ID/{self.arguments.model_name}",
     dtype=...,
     param_dtype=...,

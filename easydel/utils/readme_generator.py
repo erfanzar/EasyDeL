@@ -66,7 +66,7 @@ from jax import numpy as jnp, lax
 max_length = None # can be set to use lower memory for caching
 
 # Load model and parameters
-model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
+model = AutoEasyDeLModelForCausalLM.from_pretrained(
     "{{ model.repo_id }}",
     config_kwargs=ed.EasyDeLBaseConfigDict(
         use_scan_mlp=False,

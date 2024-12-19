@@ -20,7 +20,7 @@ import math
 from typing import Optional
 
 import flax
-import flax.linen
+import flax.nnx
 import jax
 import jax.numpy as jnp
 import jax.random as jrand
@@ -478,7 +478,7 @@ def fwd_test():
 		0,
 		jnp.finfo(dtype).min,
 	)
-	excepted_result = flax.linen.attention.dot_product_attention(
+	excepted_result = flax.nnx.dot_product_attention(
 		query=q,
 		key=k,
 		value=v,
@@ -513,9 +513,9 @@ def bwd_test():
 		jnp.finfo(dtype).min,
 	)
 
-	excepted_result = jax.grad(
-		lambda *x: flax.linen.attention.dot_product_attention(*x).sum()
-	)(q, k, v)
+	excepted_result = jax.grad(lambda *x: flax.nnx.dot_product_attention(*x).sum())(
+		q, k, v
+	)
 	result = jax.grad(
 		lambda *x: flash_attention2(
 			*x,

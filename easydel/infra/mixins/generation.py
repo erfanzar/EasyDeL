@@ -129,6 +129,9 @@ class EasyGenerationMixin:
 	_model_type: tp.Optional[str] = None
 
 	def init_cache(self, batch_size: int, max_length: int):
+		head_dim = getattr(self.config, "head_dim", None)
+		if head_dim is None:
+			head_dim = self.config.hidden_size // self.config.num_attention_heads
 		return TransformerCache.init_layers_cache(
 			num_hidden_layers=self.config.num_hidden_layers,
 			dtype=self.dtype,
@@ -142,7 +145,7 @@ class EasyGenerationMixin:
 				batch_size=batch_size,
 				sequence_length=max_length,
 				num_heads=self.config.num_key_value_heads,
-				head_dim=self.config.head_dim,
+				head_dim=head_dim,
 			),
 			quantizer=EasyQuantizer(
 				quantization_method=self.config.kv_cache_quantization_method,

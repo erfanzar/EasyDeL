@@ -23,7 +23,7 @@ import time
 import warnings
 from datetime import datetime
 from functools import cached_property
-from typing import Any, Dict, Generator, List, Optional, Union, overload
+import typing as tp
 from uuid import uuid4
 
 import jax
@@ -35,7 +35,6 @@ from jax import lax
 from jax import numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
 from pydantic import BaseModel
-from transformers import PreTrainedTokenizer
 
 from easydel.etils.etils import get_logger
 from easydel.inference.utils import (
@@ -57,6 +56,11 @@ from easydel.utils.compiling_utils import (
 	smart_compile,
 )
 
+
+if tp.TYPE_CHECKING:
+	from transformers import PreTrainedTokenizer
+else:
+	PreTrainedTokenizer = tp.Any
 logger = get_logger(__name__)
 TIME = str(datetime.fromtimestamp(time.time())).split(" ")[0]
 
@@ -83,11 +87,11 @@ class vInference:
 		self,
 		model: EasyDeLBaseModule,
 		tokenizer: PreTrainedTokenizer,
-		generation_config: Optional[vInferenceConfig] = None,
-		seed: Optional[int] = None,
-		input_partition_spec: Optional[PartitionSpec] = None,
+		generation_config: tp.Optional[vInferenceConfig] = None,
+		seed: tp.Optional[int] = None,
+		input_partition_spec: tp.Optional[PartitionSpec] = None,
 		max_new_tokens: int = 512,
-		inference_name: Optional[str] = None,
+		inference_name: tp.Optional[str] = None,
 	):
 		"""
 		Initializes the vInference class.
@@ -192,15 +196,15 @@ class vInference:
 
 		return max_length - self.generation_config.max_new_tokens
 
-	def _get_model_max_length(self, attributes: list[str]) -> Optional[int]:
+	def _get_model_max_length(self, attributes: list[str]) -> tp.Optional[int]:
 		"""
 		Find the first available maximum length configuration from a list of possible attributes.
 
 		Args:
-				attributes: List of attribute names to check in order of preference
+				attributes: tp.List of attribute names to check in order of preference
 
 		Returns:
-				Optional[int]: The maximum length if found, None otherwise
+				tp.Optional[int]: The maximum length if found, None otherwise
 		"""
 		for attr in attributes:
 			max_length = getattr(self.model.config, attr, None)
@@ -209,7 +213,7 @@ class vInference:
 		return None
 
 	def _init_generation_config(
-		self, generation_config: Optional[vInferenceConfig], max_new_tokens: int
+		self, generation_config: tp.Optional[vInferenceConfig], max_new_tokens: int
 	) -> vInferenceConfig:
 		"""
 		Initializes the generation configuration.
@@ -257,7 +261,7 @@ class vInference:
 		self,
 		input_ids: jax.Array,
 		attention_mask: jax.Array,
-		rng: Optional[PRNGKey] = None,
+		rng: tp.Optional[PRNGKey] = None,
 	):
 		if rng is None:
 			rng = self._rng_generator.rng
@@ -304,8 +308,8 @@ class vInference:
 	def generate(
 		self,
 		input_ids: jax.Array,
-		attention_mask: Optional[jax.Array] = None,
-	) -> Union[Generator[SampleState, Any, Any], SampleState]:
+		attention_mask: tp.Optional[jax.Array] = None,
+	) -> tp.Union[tp.Generator[SampleState, tp.Any, tp.Any], SampleState]:
 		"""
 		Generates text in streaming chunks.
 
@@ -459,7 +463,7 @@ class vInference:
 	def precompile(
 		self,
 		batch_size: int = 1,
-		input_tokens_length: Optional[int] = None,
+		input_tokens_length: tp.Optional[int] = None,
 	):
 		"""
 		Precompiles the generation functions for a given batch size and input length.
@@ -500,12 +504,12 @@ class vInference:
 				self._precompiled_configs.add(config_key)
 		return True
 
-	@overload
-	def count_tokens(self, messages: List[Dict[str, str]]): ...
-	@overload
+	@tp.overload
+	def count_tokens(self, messages: tp.List[tp.Dict[str, str]]): ...
+	@tp.overload
 	def count_tokens(self, text: str): ...
 
-	def count_tokens(self, conv: Union[str, List[Dict[str, str]]]) -> int:
+	def count_tokens(self, conv: tp.Union[str, tp.List[tp.Dict[str, str]]]) -> int:
 		if isinstance(conv, list) and all(isinstance(item, dict) for item in conv):
 			tokens = self.tokenizer.apply_chat_template(
 				conv,
@@ -517,7 +521,7 @@ class vInference:
 			tokens = self.tokenizer.encode(conv)
 			return len(tokens)
 
-	def save_inference(self, path: Union[os.PathLike, str]):
+	def save_inference(self, path: tp.Union[os.PathLike, str]):
 		path = pathlib.Path(path)
 		path.mkdir(exist_ok=True, parents=True)
 		metadata = vInferenceMetaData(
@@ -544,7 +548,7 @@ class vInference:
 	@classmethod
 	def load_inference(
 		cls,
-		path: Union[os.PathLike, str],
+		path: tp.Union[os.PathLike, str],
 		model: EasyDeLBaseModule,
 		tokenizer: PreTrainedTokenizer,
 	):

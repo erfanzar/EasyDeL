@@ -740,8 +740,15 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			low_freq_factor = self.rope_scaling.get("low_freq_factor", None)
 			high_freq_factor = self.rope_scaling.get("high_freq_factor", None)
 			original_max_position_embeddings = self.rope_scaling.get(
-				"original_max_position_embeddings", None
+				"original_max_position_embeddings",
+				None,
 			)
+			if original_max_position_embeddings is None:
+				original_max_position_embeddings = getattr(
+					self,
+					"original_max_position_embeddings",
+					None,
+				)
 			long_factor = self.rope_scaling.get("long_factor", None)
 			short_factor = self.rope_scaling.get("short_factor", None)
 			long_mscale = self.rope_scaling.get("long_mscale", None)
@@ -793,8 +800,15 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			low_freq_factor = self.rope_scaling.get("low_freq_factor", None)
 			high_freq_factor = self.rope_scaling.get("high_freq_factor", None)
 			original_max_position_embeddings = self.rope_scaling.get(
-				"original_max_position_embeddings", None
+				"original_max_position_embeddings",
+				None,
 			)
+			if original_max_position_embeddings is None:
+				original_max_position_embeddings = getattr(
+					self,
+					"original_max_position_embeddings",
+					None,
+				)
 			long_factor = self.rope_scaling.get("long_factor", None)
 			short_factor = self.rope_scaling.get("short_factor", None)
 			long_mscale = self.rope_scaling.get("long_mscale", None)
