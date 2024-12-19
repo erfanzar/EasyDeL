@@ -111,8 +111,8 @@ class BaseTrainerProtocol(ABC):
 	model: EasyDeLBaseModule
 	config: EasyDeLBaseConfig
 	scheduler: optax.Schedule
-	tx: optax.GradientTransformation  # optax
-	model_state: tp.Any  # flax.core.FrozenDict
+	tx: optax.GradientTransformation
+	model_state: EasyDeLState
 	create_state_sharded: tp.Callable
 
 	sharded_training_step_function: tp.Callable
@@ -513,9 +513,9 @@ class StepMetrics:
 		self,
 		loss,
 		metrics: LossMetrics,
-		current_step,
-		epoch,
-		flops_per_device,
+		current_step: int,
+		epoch: int,
+		flops_per_device: float,
 		batch_size,
 		seq_length,
 		learning_rate,
@@ -542,13 +542,13 @@ class StepMetrics:
 			"total_time": total_time,
 			**extras,
 		}
+		if metrics.accuracy is not None:
+			basic_metrics.update({"accuracy": metrics.accuracy})
 
-		basic_metrics.update({"accuracy": metrics.accuracy})
-
-		# if metrics.get("mae", None) is not None:
-		# 	basic_metrics.update({"mae": metrics.get("mae", 0.0)})
-		# if metrics.get("mse", None) is not None:
-		# 	basic_metrics.update({"mse": metrics.get("mse", 0.0)})
+		if metrics.chosen_rewards is not None:
+			basic_metrics.update({"chosen_rewards": jnp.mean(metrics.chosen_rewards)})
+		if metrics.rejected_rewards is not None:
+			basic_metrics.update({"rejected_rewards": jnp.mean(metrics.rejected_rewards)})
 
 		if not self.arguments.performance_mode and (mode == "train" or mode is None):
 			detailed_metrics = self._calculate_detailed_metrics(metrics)
@@ -557,26 +557,32 @@ class StepMetrics:
 			basic_metrics = {f"{mode}/{k}": v for k, v in basic_metrics.items()}
 		return basic_metrics
 
-	def _calculate_detailed_metrics(self, metrics):
+	def _calculate_detailed_metrics(self, metrics: LossMetrics):
 		"""Calculate additional detailed metrics."""
 		detailed_metrics = {}
 		getattr_in = lambda x: x if not hasattr(x, "value") else x.value  # noqa
 		if self.arguments.log_grad_norms:
-			detailed_metrics.update(
-				{
-					"train/max_grad_norm": getattr_in(metrics.max_grad_norm).tolist(),
-					"train/mean_grad_norm": getattr_in(metrics.mean_grad_norm).tolist(),
-				}
-			)
+			if metrics.max_grad_norm is not None:
+				detailed_metrics.update(
+					{"train/max_grad_norm": getattr_in(metrics.max_grad_norm).tolist()}
+				)
+
+			if metrics.mean_grad_norm is not None:
+				detailed_metrics.update(
+					{"train/mean_grad_norm": getattr_in(metrics.mean_grad_norm).tolist()}
+				)
 
 			# Add per-layer gradient norms
-			detailed_metrics.update(
-				{
-					f"grad_norm/{layer_name}": getattr_in(grad_norm).tolist()
-					for layer_name, grad_norm in flatten_dict(metrics.grad_norms).items()
-					if getattr_in(grad_norm) is not None
-				}
-			)
+			if metrics.grad_norms is not None:
+				detailed_metrics.update(
+					{
+						f"grad_norm/{'.'.join([str(s) for s in layer_name])}": getattr_in(
+							grad_norm
+						).tolist()
+						for layer_name, grad_norm in flatten_dict(metrics.grad_norms).items()
+						if getattr_in(grad_norm) is not None
+					}
+				)
 
 		return detailed_metrics
 

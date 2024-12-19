@@ -33,7 +33,7 @@ def main():
 	sharding_axis_dims = (1, 1, 1, -1)
 	max_length = 4096
 
-	pretrained_model_name_or_path = "microsoft/Phi-3-mini-128k-instruct"
+	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
 	dtype = jnp.float16
 	partition_axis = ed.PartitionAxis()
 

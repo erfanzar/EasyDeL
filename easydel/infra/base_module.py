@@ -28,6 +28,7 @@ from jax import lax
 from jax import numpy as jnp
 from jax.sharding import Mesh
 
+
 from easydel.etils.etils import (
 	EasyDeLQuantizationMethods,
 	get_logger,
@@ -49,6 +50,11 @@ from easydel.utils.traversals import (
 	flatten_dict,
 	unflatten_dict,
 )
+
+if tp.TYPE_CHECKING:
+	from easydel.etils.easystate import EasyDeLState
+else:
+	EasyDeLState = tp.Any
 
 PartitionLike = tp.Optional[
 	tp.Union[
@@ -335,6 +341,12 @@ class EasyDeLBaseModule(
 			block_size=block_size,
 			quantization_pattern=quantization_pattern,
 		)
+
+	def to_state(self) -> EasyDeLState:
+		"""converts current model to a EasyDeLState"""
+		from easydel.etils.easystate import EasyDeLState
+
+		return EasyDeLState.create(step=0, model=self)
 
 	def compute_loss(
 		self,

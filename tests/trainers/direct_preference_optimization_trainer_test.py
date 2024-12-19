@@ -1,6 +1,8 @@
 import os
 import sys
 
+import flax.nnx
+
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 dirname = os.path.dirname(os.path.abspath(__file__))
@@ -13,6 +15,7 @@ sys.path.append(
 )
 # jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 
+import flax
 import jax  # noqa
 import datasets
 from jax import numpy as jnp
@@ -23,8 +26,7 @@ from easydel import (
 	AttentionMechanisms,
 	DPOConfig,
 	DPOTrainer,
-	EasyDeLState,
-	FlaxLlamaForCausalLM,
+	LlamaForCausalLM,
 	LlamaConfig,
 )
 
@@ -40,19 +42,14 @@ def main():
 		)
 		.shuffle()
 		.shuffle()
-	).select(range(5000))
+	).select(range(1000))
 	train_dataset = train_dataset.rename_column("chosen_response", "chosen")
 	train_dataset = train_dataset.rename_column("rejected_response", "rejected")
 	train_dataset = train_dataset.rename_column("instruction", "prompt")
 
-	num_devices = len(jax.devices())
-	sharding_axis_dims = (1, 1, 1, -1)
-
 	max_length = 512
 	max_completion_length = 256
 	max_prompt_length = 256
-	input_shape = (num_devices, max_length)
-	dtype = jnp.bfloat16
 
 	# assert len(jax.devices("cpu")) == 8, "XLA Device manipulation failed."
 	with jax.default_device(jax.devices("gpu")[0]):
@@ -72,7 +69,8 @@ def main():
 		)
 		arguments = DPOConfig(
 			num_train_epochs=4,
-			model_name="DPO_TEST",
+			model_name="direct_preference_optimization_trainer",
+			save_directory="tmp-files",
 			loss_type="kto",
 			total_batch_size=8,
 			use_wandb=False,
@@ -83,12 +81,7 @@ def main():
 			scheduler=ed.EasyDeLSchedulers.WARM_UP_COSINE,
 			weight_decay=0.02,
 			max_sequence_length=max_length,
-			gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
-			sharding_array=sharding_axis_dims,
 			gradient_accumulation_steps=1,
-			init_input_shape=input_shape,
-			dtype=dtype,
-			param_dtype=dtype,
 			step_start_point=0,
 			do_last_save=False,
 			training_time="7H",
@@ -108,37 +101,22 @@ def main():
 		if tokenizer.pad_token_id is None:
 			tokenizer.pad_token_id = tokenizer.eos_token_id
 
-		module = FlaxLlamaForCausalLM(
+		model = LlamaForCausalLM(
 			config=conf,
 			dtype=jnp.float32,
 			param_dtype=jnp.float32,
-			_do_init=True,
-			input_shape=(8, 8),
+			rngs=flax.nnx.Rngs(0),
 		)
-		ref_module = FlaxLlamaForCausalLM(
+		ref_model = LlamaForCausalLM(
 			config=conf,
 			dtype=jnp.float32,
 			param_dtype=jnp.float32,
-			_do_init=True,
-			input_shape=(8, 8),
-		)
-
-		state = EasyDeLState.load(
-			module=module,
-			apply_fn=module.__call__,
-			params={"params": module.shard_model(module.params)},
-		)
-		ref_state = EasyDeLState.load(
-			module=ref_module,
-			apply_fn=ref_module.__call__,
-			params={
-				"params": ref_module.shard_model(ref_module.params),
-			},
+			rngs=flax.nnx.Rngs(0),
 		)
 
 		dpo_trainer = DPOTrainer(
-			model_state=state,
-			ref_model_state=ref_state,
+			model=model,
+			ref_model=ref_model,
 			train_dataset=train_dataset,
 			eval_dataset=None,
 			tokenizer=tokenizer,

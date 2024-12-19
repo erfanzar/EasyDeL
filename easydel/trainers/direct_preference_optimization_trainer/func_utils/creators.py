@@ -12,17 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
-from typing import Callable, Dict, List, Literal, Tuple, Union
+import typing as tp
 
 import chex
-import fjformer
 import flax
+import flax.nnx
 import jax
-
+from jax import numpy as jnp
 from easydel.etils.easystate import EasyDeLState
+from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.loss_utils import LossMetrics
 from easydel.trainers.direct_preference_optimization_trainer.func_utils.concatenators import (
-	concatenated_dpo_inputs,
+	concatenated_inputs,
 )
 from easydel.trainers.direct_preference_optimization_trainer.func_utils.log_probs import (
 	get_batch_log_probs,
@@ -32,29 +33,14 @@ from easydel.trainers.direct_preference_optimization_trainer.func_utils.loss_fun
 )
 
 
-@jax.tree_util.register_pytree_node_class
-@dataclass
-class DPOStepOut:
-	loss: chex.Array
-	chosen_rewards: chex.Array
-	rejected_rewards: chex.Array
-
-	@classmethod
-	def tree_unflatten(cls, aux, children):
-		return cls(*children)
-
-	def tree_flatten(self):
-		return (self.loss, self.chosen_rewards, self.rejected_rewards), {}
-
-
-def create_dpo_concatenated_forward(
+def create_concatenated_forward(
 	is_encoder_decoder,
 	label_pad_token_id,
 	padding_value,
-	truncation_mode: Literal["keep_end", "keep_start"] = "keep_end",
+	truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
 	fixed_max_length: int | None = None,
 ):
-	"""The create_dpo_concatenated_forward function is a helper function that creates a forward pass function for the
+	"""The create_concatenated_forward function is a helper function that creates a forward pass function for the
 	model. The forward pass function takes in an apply_fn, which is the model's apply_fn, and runs it on concatenated
 	inputs. It returns chosen log probs, rejected log probs, chosen logits and rejected logits.
 
@@ -63,7 +49,7 @@ def create_dpo_concatenated_forward(
 					decoder model or not
 			label_pad_token_id: Pad the labels to the same length
 			padding_value: Pad the inputs to the same length
-			truncation_mode: typing.Literal["keep_end","keep_start"]: where
+			truncation_mode: tp.Literal["keep_end","keep_start"]: where
 					to pad and where to keep.
 			fixed_max_length: int|None: by providing fixed_max_length the
 					func will always return a fixed sequence length
@@ -74,20 +60,15 @@ def create_dpo_concatenated_forward(
 			inputs,
 	"""
 
-	# Will be Moved under jax.jit.
-	@fjformer.core.implicit_compact
 	def concatenated_forward(
-		apply_fn: Callable,
-		params: dict | flax.core.FrozenDict,
-		batch: Dict[str, Union[List, chex.Array]],
-	) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
+		model: EasyDeLBaseModule,
+		batch: tp.Dict[str, tp.Union[tp.List, chex.Array]],
+	) -> tp.Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
 		"""The concatenated_forward function is used to compute the log-probabilities of both chosen and rejected labels.
 
 		Args:
-				apply_fn: Callable: Pass in the model function
-				params: dict | flax.core.FrozenDict: Pass the model
-						parameters to the function
-				batch: Dict[str, Union[List, chex.Array]] : Pass the batch
+				model: EasyDeLBaseModule Instance.
+				batch: tp.Dict[str, tp.Union[tp.List, chex.Array]] : Pass the batch
 						of data to the concatenated_forward function
 
 		Returns:
@@ -97,7 +78,7 @@ def create_dpo_concatenated_forward(
 		assert (
 			padding_value is not None
 		), "`padding_value` can not be set as `None` it must be an integer."
-		concatenated_batch = concatenated_dpo_inputs(
+		concatenated_batch = concatenated_inputs(
 			batch,
 			is_encoder_decoder=is_encoder_decoder,
 			label_pad_token_id=label_pad_token_id,
@@ -124,13 +105,13 @@ def create_dpo_concatenated_forward(
 			if is_encoder_decoder
 			else {}
 		)
-		all_logits = apply_fn(
+
+		all_logits = model(
 			concatenated_batch["concatenated_input_ids"],
 			attention_mask=concatenated_batch["concatenated_attention_mask"],
-			params=params,
 			**model_kwargs,
-		).logits
-
+		)
+		all_logits = all_logits.logits
 		all_log_probs = get_batch_log_probs(
 			all_logits,
 			concatenated_batch["concatenated_labels"],
@@ -149,12 +130,12 @@ def create_dpo_concatenated_forward(
 	return concatenated_forward
 
 
-def create_dpo_train_function(
-	concatenated_forward: Callable,
+def create_train_function(
+	concatenated_forward: tp.Callable,
 	ref_state: EasyDeLState = None,
 	beta: float = 0.1,
 	label_smoothing: float = 0,
-	loss_type: Literal[
+	loss_type: tp.Literal[
 		"sigmoid",
 		"hinge",
 		"ipo",
@@ -173,7 +154,7 @@ def create_dpo_train_function(
 	"""The create_dpo_train_function function is a helper function that creates the DPO training step.
 
 	Args:
-			concatenated_forward: Callable: Define the forward pass of the model
+			concatenated_forward: tp.Callable: Define the forward pass of the model
 			ref_state: EasyDeLState: Specify the reference policy
 			beta: float: Scale the logits
 			label_smoothing: float: Smooth the labels
@@ -188,8 +169,8 @@ def create_dpo_train_function(
 		label_smoothing=label_smoothing,
 	)
 
-	def dpo_step(state: EasyDeLState, batch: dict) -> tuple[EasyDeLState, DPOStepOut]:
-		"""The dpo_step function is the core of DPO. It takes a state and a batch,
+	def step(state: EasyDeLState, batch: dict) -> tuple[EasyDeLState, LossMetrics]:
+		"""The step function is the core of DPO. It takes a state and a batch,
 		and returns an updated state. The update is done by calculating the loss
 		for each example in the batch, then taking its gradient with respect to
 		the parameters of the policy network (which are stored in `state`). This
@@ -204,13 +185,13 @@ def create_dpo_train_function(
 				apply_fn
 		"""
 
-		def calculate_loss(params: dict | flax.core.FrozenDict):
+		def calculate_loss(tree: flax.nnx.GraphState):
 			(
 				policy_chosen_log_probs,
 				policy_rejected_log_probs,
 				policy_chosen_logits,
 				policy_rejected_logits,
-			) = concatenated_forward(state.apply_fn, params, batch)
+			) = concatenated_forward(state.merge(tree=tree), batch)
 
 			if (
 				"reference_chosen_log_probs" in batch
@@ -225,22 +206,14 @@ def create_dpo_train_function(
 						reference_rejected_log_probs,
 						_,
 						_,
-					) = concatenated_forward(
-						state.apply_fn,
-						state.params,
-						batch,
-					)
+					) = concatenated_forward(state.model, batch)
 				else:
 					(
 						reference_chosen_log_probs,
 						reference_rejected_log_probs,
 						_,
 						_,
-					) = concatenated_forward(
-						ref_state.apply_fn,
-						ref_state.params,
-						batch,
-					)
+					) = concatenated_forward(ref_state.model, batch)
 			reference_chosen_log_probs = jax.lax.stop_gradient(reference_chosen_log_probs)
 			reference_rejected_log_probs = jax.lax.stop_gradient(reference_rejected_log_probs)
 			pi_log_ratios = policy_chosen_log_probs - policy_rejected_log_probs
@@ -268,23 +241,37 @@ def create_dpo_train_function(
 			return losses.mean(), (chosen_rewards, rejected_rewards)
 
 		grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
-		(__loss, (__chosen_rewards, __rejected_rewards)), grads = grad_fn(state.params)
+		(_loss, (_chosen_rewards, _rejected_rewards)), grads = grad_fn(state.graphstate)
 		new_state = state.apply_gradients(grads=grads)
-		return new_state, DPOStepOut(
-			loss=__loss,
-			rejected_rewards=__rejected_rewards,
-			chosen_rewards=__chosen_rewards,
+		grad_norms = jax.tree_util.tree_map(jnp.linalg.norm, grads)
+		max_grad_norm = jax.tree_util.tree_reduce(jnp.maximum, grad_norms)
+
+		mean_grad_norm = jax.tree_util.tree_reduce(
+			jnp.add,
+			jax.tree_util.tree_map(jnp.sum, grad_norms),
+		) / jax.tree_util.tree_reduce(
+			jnp.add,
+			jax.tree_util.tree_map(jnp.size, grad_norms),
 		)
 
-	return dpo_step
+		return new_state, LossMetrics(
+			loss=_loss,
+			rejected_rewards=_rejected_rewards,
+			chosen_rewards=_chosen_rewards,
+			max_grad_norm=max_grad_norm,
+			mean_grad_norm=mean_grad_norm,
+			grad_norms=grad_norms,
+		)
+
+	return step
 
 
-def create_dpo_eval_function(
-	concatenated_forward: Callable,
+def create_eval_function(
+	concatenated_forward: tp.Callable,
 	ref_state: EasyDeLState = None,
 	beta: float = 0.1,
 	label_smoothing: float = 0,
-	loss_type: Literal[
+	loss_type: tp.Literal[
 		"sigmoid",
 		"hinge",
 		"ipo",
@@ -300,15 +287,15 @@ def create_dpo_eval_function(
 	] = "sigmoid",
 	reference_free: bool = False,
 ):
-	"""The create_dpo_eval_function function is a helper function that creates the DPO evaluating step.
+	"""The create_eval_function function is a helper function that creates the DPO evaluating step.
 
 	Args:
-			concatenated_forward: Callable: Define the forward pass of the
+			concatenated_forward: tp.Callable: Define the forward pass of the
 					model
 			ref_state: EasyDeLState: Specify the reference policy
 			beta: float: Scale the logits
 			label_smoothing: float: Smooth the labels
-			loss_type: Literal["sigmoid", "hinge", "ipo", "exo_pair", "nca_pair", "robust", "bco_pair", "sppo_hard", "aot", "aot_pair", "apo_zero", "apo_down"]: Determine
+			loss_type: tp.Literal["sigmoid", "hinge", "ipo", "exo_pair", "nca_pair", "robust", "bco_pair", "sppo_hard", "aot", "aot_pair", "apo_zero", "apo_down"]: Determine
 					the loss function
 			reference_free: bool: Indicate whether the reference policy is
 					used or not
@@ -322,8 +309,8 @@ def create_dpo_eval_function(
 		label_smoothing=label_smoothing,
 	)
 
-	def dpo_step(state: EasyDeLState, batch: dict) -> DPOStepOut:
-		"""The dpo_step function is the core of DPO. It takes a state and a batch,
+	def step(state: EasyDeLState, batch: dict) -> LossMetrics:
+		"""The step function is the core of DPO. It takes a state and a batch,
 		and returns an updated state. The update is done by calculating the loss
 		for each example in the batch, then taking its gradient with respect to
 		the parameters of the policy network (which are stored in `state`). This
@@ -337,13 +324,13 @@ def create_dpo_eval_function(
 				A `DPOStepOut` class
 		"""
 
-		def calculate_loss(params: dict | flax.core.FrozenDict):
+		def calculate_loss(tree: flax.nnx.GraphState):
 			(
 				policy_chosen_log_probs,
 				policy_rejected_log_probs,
 				policy_chosen_logits,
 				policy_rejected_logits,
-			) = concatenated_forward(state.apply_fn, params, batch)
+			) = concatenated_forward(state.merge(tree), batch)
 
 			if (
 				"reference_chosen_log_probs" in batch
@@ -358,14 +345,14 @@ def create_dpo_eval_function(
 						reference_rejected_log_probs,
 						_,
 						_,
-					) = concatenated_forward(state.apply_fn, state.params, batch)
+					) = concatenated_forward(state.model, batch)
 				else:
 					(
 						reference_chosen_log_probs,
 						reference_rejected_log_probs,
 						_,
 						_,
-					) = concatenated_forward(ref_state.apply_fn, ref_state.params, batch)
+					) = concatenated_forward(ref_state.model, batch)
 
 			pi_log_ratios = policy_chosen_log_probs - policy_rejected_log_probs
 
@@ -388,12 +375,12 @@ def create_dpo_eval_function(
 			)
 			return losses[0], (chosen_rewards, rejected_rewards)
 
-		__loss, (__chosen_rewards, __rejected_rewards) = calculate_loss(state.params)
+		_loss, (_chosen_rewards, _rejected_rewards) = calculate_loss(state.graphstate)
 
-		return DPOStepOut(
-			loss=__loss,
-			rejected_rewards=__rejected_rewards,
-			chosen_rewards=__chosen_rewards,
+		return LossMetrics(
+			loss=_loss,
+			rejected_rewards=_rejected_rewards,
+			chosen_rewards=_chosen_rewards,
 		)
 
-	return dpo_step
+	return step
