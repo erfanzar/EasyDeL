@@ -268,7 +268,7 @@ def quantize_linear_layers(
 	verbose: bool = True,
 ) -> nn.Module:
 	"""
-	Quantize parameters to 8-bit or nf4 precision, excluding specified layers.
+	Quantize parameters to requested precision, excluding specified layers.
 
 	Args:
 	    model: The model to quantize.

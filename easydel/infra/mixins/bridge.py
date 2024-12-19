@@ -13,10 +13,12 @@
 # limitations under the License.
 from __future__ import annotations
 
+import gc
 import os
 import typing as tp
 from copy import deepcopy
 from pathlib import Path
+import warnings
 
 import jax
 import jax.extend
@@ -30,13 +32,23 @@ from transformers.utils.hub import PushToHubMixin
 from easydel.etils.etils import (
 	EasyDeLBackends,
 	EasyDeLPlatforms,
+	EasyDeLQuantizationMethods,
 	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
-from easydel.infra.base_config import EasyDeLBaseConfig
+from easydel.infra.base_config import (
+	EasyDeLBaseConfig,
+	EasyDeLBaseConfigDict,
+)
+from easydel.infra.utils import quantize_linear_layers
+
 from easydel.utils.checkpoint_managers import CheckpointManager
-from easydel.utils.readme_generator import ModelInfo, ReadmeGenerator
+from easydel.utils.readme_generator import (
+	ModelInfo,
+	ReadmeGenerator,
+)
 from easydel.utils.traversals import (
+	is_flatten,
 	flatten_dict,
 	merge_model_and_tree,
 	string_key_to_int,
@@ -53,14 +65,12 @@ class EasyBridgeMixin(PushToHubMixin):
 	Mixin class for adding bridging functionalities like saving, loading, and pushing models to Hugging Face Hub.
 	"""
 
-	config_class: tp.Type[EasyDeLBaseConfig]
 	config: EasyDeLBaseConfig
-	base_model_prefix: str
+
+	config_class: tp.Optional[tp.Type[EasyDeLBaseConfig]] = None
+	base_model_prefix: tp.Optional[str] = None
 	_model_task: tp.Optional[str] = None
 	_model_type: tp.Optional[str] = None
-
-	_model_type: str = None
-	_model_task: str = None
 
 	def _model_card(self, name: str, repo_id: str) -> str:
 		"""Generates a model card (README.md) for the given model.
@@ -336,7 +346,6 @@ class EasyBridgeMixin(PushToHubMixin):
 		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec]]] = None,
 		backend: tp.Optional[EasyDeLBackends] = None,
 		platform: tp.Optional[EasyDeLPlatforms] = "jax",
-		model_task: tp.Optional[str] = None,
 		shard_fns: tp.Optional[dict[tp.Callable]] = None,
 		auto_shard_model: bool = False,
 		verbose: bool = True,
@@ -364,7 +373,6 @@ class EasyBridgeMixin(PushToHubMixin):
 		    partition_rules (tuple, optional): Custom partitioning rules for sharding.
 		    backend (EasyDeLBackends, optional): The backend to use.
 		    platform (EasyDeLPlatforms, optional): The platform to use.
-		    model_task (str, optional): The model task.
 		    shard_fns (dict[Callable], optional): Custom shard functions for loading checkpoint.
 		    auto_shard_model (bool, optional): Whether to automatically shard the model.
 		    verbose (bool, optional): Whether to print verbose messages. Defaults to True.
@@ -392,7 +400,6 @@ class EasyBridgeMixin(PushToHubMixin):
 		from easydel.modules.auto_configuration import (
 			AutoEasyDeLConfig,
 			AutoShardAndGatherFunctions,
-			get_modules_by_type,
 		)
 
 		api = HfApi(token=token)
@@ -503,13 +510,6 @@ class EasyBridgeMixin(PushToHubMixin):
 				logger.debug(
 					f"loading weights file {filename} from cache at {resolved_archive_file}"
 				)
-		if model_task is None:
-			model_task = "base-module"
-		if cls.__name__ == "EasyDeLBaseModule":
-			# if they are using EasyDeLBaseModule.from_pretrained
-			# they will get error AssertionError: `module` must be provided.` so we autoset this to make sure user don't
-			# experience this error.
-			_, cls, _ = get_modules_by_type(config.model_type, model_task)
 
 		model = nn.eval_shape(
 			lambda: cls(
@@ -555,4 +555,165 @@ class EasyBridgeMixin(PushToHubMixin):
 					"Generation config file not found, using a generation config created from the model config."
 				)
 
+		return model
+
+	@classmethod
+	def _from_torch_pretrained(
+		cls,
+		pretrained_model_name_or_path: str,
+		device: tp.Optional[jax.Device] = None,
+		dtype: jax.numpy.dtype = jax.numpy.float32,
+		param_dtype: jax.numpy.dtype = jax.numpy.float32,
+		precision: tp.Optional[jax.lax.Precision] = None,
+		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
+		sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+		partition_axis: tp.Optional[PartitionAxis] = None,
+		shard_attention_computation: bool = True,
+		shard_fns: tp.Optional[tp.Mapping[tuple, tp.Callable] | dict] = None,
+		backend: tp.Optional[EasyDeLBackends] = None,
+		platform: tp.Optional[EasyDeLPlatforms] = None,
+		config_kwargs: tp.Optional[EasyDeLBaseConfigDict] = None,
+		auto_shard_model: bool = False,
+		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]] = None,
+		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
+		quantization_block_size: int = 128,
+		verbose: bool = True,
+		**kwargs,
+	):
+		from transformers import AutoConfig, AutoModelForCausalLM
+		from easydel.modules.auto_configuration import (
+			AutoShardAndGatherFunctions,
+			get_modules_by_type,
+		)
+
+		try:
+			import torch
+
+			if torch.cuda.is_available():
+
+				def _clear():
+					gc.collect()
+					torch.cuda.empty_cache()
+
+			else:
+
+				class torch:
+					bfloat16 = None
+
+				def _clear():
+					gc.collect()
+
+		except ModuleNotFoundError as er:
+			raise ModuleNotFoundError(
+				"in order to load model from torch you should install torch first "
+				"run `pip install torch`"
+			) from er
+
+		logger.debug(f"Downloading model config from {pretrained_model_name_or_path}")
+		trust_remote_code = kwargs.get("trust_remote_code", False)
+		config = AutoConfig.from_pretrained(
+			pretrained_model_name_or_path,
+			trust_remote_code=trust_remote_code,
+		)
+		model_type: str = config.model_type
+
+		(
+			config_class,
+			module,
+			transform_function,
+		) = get_modules_by_type(
+			model_type,
+			task_type=cls._model_task,
+		)
+
+		logger.debug(f"Downloading hf_model weights from {pretrained_model_name_or_path}")
+		hf_model = AutoModelForCausalLM.from_pretrained(
+			pretrained_model_name_or_path,
+			**kwargs,
+		)
+		generation_config = getattr(hf_model, "generation_config", None)
+		config_class = config_class.from_pretrained(pretrained_model_name_or_path)
+		state_dict = hf_model.state_dict()
+
+		# Clear and collect memory after deleting the hf_model
+		del hf_model
+		_clear()
+
+		logger.debug("adding hf_model basic EasyDeL configurations.")
+		if hasattr(config_class, "add_jax_args"):
+			config_class.add_jax_args()
+		config_class.add_basic_configurations(
+			axis_dims=sharding_axis_dims,
+			axis_names=sharding_axis_names,
+			partition_axis=partition_axis,
+			backend=backend,
+			platform=platform,
+			shard_attention_computation=shard_attention_computation,
+		)
+		if config_kwargs is not None:
+			for k, v in config_kwargs.items():
+				setattr(config_class, k, v)
+
+		logger.debug("creating easydel model")
+		model = nn.eval_shape(
+			lambda: module(
+				config=config_class,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
+				rngs=nn.Rngs(0),
+			)
+		)
+		model.generation_config = generation_config
+
+		_clear()
+
+		if shard_fns is not None:
+			if auto_shard_model:
+				warnings.warn(
+					"`auto_shard_model` will be ignored since you are passing custom sharding functions",
+					stacklevel=1,
+				)
+			logger.debug("sharding model parameters based on the given `shard_fns`.")
+			if not is_flatten(shard_fns):
+				shard_fns = flatten_dict(shard_fns)
+		elif auto_shard_model:
+			shard_fns, _ = AutoShardAndGatherFunctions.from_pretrained(
+				pretrained_model_name_or_path=pretrained_model_name_or_path,
+				partition_rules=partition_rules,
+				sharding_axis_dims=sharding_axis_dims,
+				sharding_axis_names=sharding_axis_names,
+				partition_axis=partition_axis,
+				shard_attention_computation=shard_attention_computation,
+				backend=backend,
+				platform=platform,
+				config_kwargs=config_kwargs,
+				trust_remote_code=trust_remote_code,
+			)
+		logger.debug("converting huggingface-model to easydel-model.")
+		params_pattern_selection = None
+		uses_tie_word_embedding = getattr(config, "tie_word_embeddings", False)
+		params = transform_function(
+			state_dict,
+			config=config,
+			device=device,
+			shard_fns=shard_fns,
+			params_pattern_selection=params_pattern_selection,
+			remove_state_dict=True,
+			uses_tie_word_embedding=uses_tie_word_embedding,
+			dtype=param_dtype,
+		)
+		del state_dict
+		_clear()
+		if is_flatten(params):
+			logger.info("converted parameters are flatten making them unflatten ")
+			params = unflatten_dict(params)
+		model = merge_model_and_tree(model=model, tree=params)
+		if quantization_method is not None:
+			model = quantize_linear_layers(
+				model,
+				method=quantization_method,
+				block_size=quantization_block_size,
+				verbose=verbose,
+			)
 		return model

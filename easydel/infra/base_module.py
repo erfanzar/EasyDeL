@@ -345,7 +345,7 @@ class EasyDeLBaseModule(
 		**batch,
 	) -> tp.Tuple[tp.Any, LossMetrics]:
 		"""basic `compute_loss` call"""
-		if labels is None and isinstance(self.loss_function, ForCausalLMLoss):
+		if labels is None and self.loss_function.__name__ == ForCausalLMLoss.__name__:
 			labels = batch.get("input_ids", None)
 		assert labels is not None, "`labels` can not be `None` for computing loss."
 		loss_kwargs = loss_kwargs or {}

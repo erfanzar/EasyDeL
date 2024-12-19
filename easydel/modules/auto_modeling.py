@@ -31,6 +31,7 @@ from easydel.etils.etils import (
 	EasyDeLQuantizationMethods,
 )
 from easydel.etils.partition_module import PartitionAxis
+from easydel.infra.base_config import EasyDeLBaseConfigDict
 from easydel.infra.base_module import (
 	EasyDeLBaseModule,
 )
@@ -59,10 +60,12 @@ class BaseAutoEasyModel:
 		quantization_method: Optional[EasyDeLQuantizationMethods] = None,
 		quantization_platform: Optional[EasyDeLPlatforms] = EasyDeLPlatforms.JAX,
 		quantization_block_size: int = 128,
-		safe: bool = True,
 		**kwargs,
 	):
-		return EasyDeLBaseModule.from_pretrained(
+		class Base(EasyDeLBaseModule):
+			_model_task = cls.model_task
+
+		return Base.from_pretrained(
 			pretrained_model_name_or_path=pretrained_model_name_or_path,
 			dtype=dtype,
 			precision=precision,
@@ -79,8 +82,52 @@ class BaseAutoEasyModel:
 			quantization_method=quantization_method,
 			quantization_platform=quantization_platform,
 			quantization_block_size=quantization_block_size,
-			safe=safe,
-			model_task=cls.model_task,
+			**kwargs,
+		)
+
+	@classmethod
+	def _from_torch_pretrained(
+		cls,
+		pretrained_model_name_or_path: str,
+		device: Optional[jax.Device] = None,
+		dtype: jax.numpy.dtype = jax.numpy.float32,
+		param_dtype: jax.numpy.dtype = jax.numpy.float32,
+		precision: Optional[jax.lax.Precision] = None,
+		sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
+		sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+		partition_axis: Optional[PartitionAxis] = None,
+		shard_attention_computation: bool = True,
+		shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
+		backend: Optional[EasyDeLBackends] = None,
+		platform: Optional[EasyDeLPlatforms] = None,
+		config_kwargs: Optional[EasyDeLBaseConfigDict] = None,
+		auto_shard_model: bool = False,
+		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]] = None,
+		quantization_method: Optional[EasyDeLQuantizationMethods] = None,
+		quantization_block_size: int = 128,
+		**kwargs,
+	):
+		class Base(EasyDeLBaseModule):
+			_model_task = cls.model_task
+
+		return Base._from_torch_pretrained(
+			pretrained_model_name_or_path=pretrained_model_name_or_path,
+			param_dtype=param_dtype,
+			dtype=dtype,
+			shard_fns=shard_fns,
+			auto_shard_model=auto_shard_model,
+			precision=precision,
+			backend=backend,
+			platform=platform,
+			partition_axis=partition_axis,
+			quantization_method=quantization_method,
+			quantization_block_size=quantization_block_size,
+			partition_rules=partition_rules,
+			sharding_axis_names=sharding_axis_names,
+			sharding_axis_dims=sharding_axis_dims,
+			config_kwargs=config_kwargs,
+			device=device,
+			shard_attention_computation=shard_attention_computation,
 			**kwargs,
 		)
 
