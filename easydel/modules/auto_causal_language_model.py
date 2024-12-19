@@ -12,21 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import gc
-import warnings
-from tabnanny import verbose
-from typing import (
-	Any,
-	Callable,
-	List,
-	Mapping,
-	Optional,
-	Sequence,
-	Tuple,
-)
-
+import typing as tp
 import jax.numpy
-from flax import nnx
 from jax.sharding import PartitionSpec
 
 from easydel.etils.easystate import EasyDeLState
@@ -40,15 +27,7 @@ from easydel.etils.partition_module import PartitionAxis
 from easydel.infra.base_config import EasyDeLBaseConfigDict
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType
-from easydel.infra.utils import quantize_linear_layers
-from easydel.modules.auto_configuration import (
-	AutoShardAndGatherFunctions,
-	get_modules_by_type,
-	is_flatten,
-)
 from easydel.modules.auto_modeling import BaseAutoEasyModel
-from easydel.utils import traversals
-from easydel.utils.traversals import flatten_dict, unflatten_dict
 
 logger = get_logger(name=__name__)
 
@@ -91,24 +70,23 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 	def from_pretrained(
 		cls,
 		pretrained_model_name_or_path: str,
-		device: Optional[jax.Device] = None,
+		device: tp.Optional[jax.Device] = None,
 		dtype: jax.numpy.dtype = jax.numpy.float32,
 		param_dtype: jax.numpy.dtype = jax.numpy.float32,
-		precision: Optional[jax.lax.Precision] = None,
-		sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
-		sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-		partition_axis: Optional[PartitionAxis] = None,
+		precision: tp.Optional[jax.lax.Precision] = None,
+		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
+		sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+		partition_axis: tp.Optional[PartitionAxis] = None,
 		shard_attention_computation: bool = True,
-		shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
-		backend: Optional[EasyDeLBackends] = None,
-		platform: Optional[EasyDeLPlatforms] = None,
-		config_kwargs: Optional[EasyDeLBaseConfigDict] = None,
+		shard_fns: tp.Optional[tp.Mapping[tuple, tp.Callable] | dict] = None,
+		backend: tp.Optional[EasyDeLBackends] = None,
+		platform: tp.Optional[EasyDeLPlatforms] = None,
+		config_kwargs: tp.Optional[EasyDeLBaseConfigDict] = None,
 		auto_shard_model: bool = False,
-		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]] = None,
-		quantization_method: Optional[EasyDeLQuantizationMethods] = None,
+		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]] = None,
+		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
 		quantization_block_size: int = 128,
-		safe: bool = True,
-		from_torch: Optional[bool] = None,
+		from_torch: tp.Optional[bool] = None,
 		**kwargs,
 	) -> EasyDeLBaseModule:
 		"""Loads and shards a pretrained causal language model from the Hugging Face Hub and converts it into an
@@ -120,25 +98,24 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 		    dtype (jax.numpy.dtype, optional): Data type of the model. Defaults to jax.numpy.float32.
 		    param_dtype (jax.numpy.dtype, optional): Data type of the model parameters. Defaults to jax.numpy.float32.
 		    precision (jax.lax.Precision, optional): Precision for computations. Defaults to jax.lax.Precision("fastest").
-		    sharding_axis_dims (Sequence[int], optional): Dimensions of each sharding axis. Defaults to (1, -1, 1, 1).
-		    sharding_axis_names (Sequence[str], optional): Names of the sharding axes. Defaults to ("dp", "fsdp", "tp", "sp").
+		    sharding_axis_dims (tp.Sequence[int], optional): Dimensions of each sharding axis. Defaults to (1, -1, 1, 1).
+		    sharding_axis_names (tp.Sequence[str], optional): Names of the sharding axes. Defaults to ("dp", "fsdp", "tp", "sp").
 		    partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
 		    shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
-		    shard_fns (Optional[Mapping[tuple, Callable] | dict], optional): Sharding functions to use for the model. If None, auto-sharding is used if auto_shard_model is True. Defaults to None.
-		    platform (Optional[EasyDeLPlatforms], optional): platform to use for the model. Defaults to None.
-				backend (Optional[EasyDeLBackends], optional): backend to use for the model. Defaults to None.
-		    config_kwargs (Optional[Mapping[str, Any] | EasyDeLBaseConfigDict], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
+		    shard_fns (tp.Optional[tp.Mapping[tuple, tp.Callable] | dict], optional): Sharding functions to use for the model. If None, auto-sharding is used if auto_shard_model is True. Defaults to None.
+		    platform (tp.Optional[EasyDeLPlatforms], optional): platform to use for the model. Defaults to None.
+				backend (tp.Optional[EasyDeLBackends], optional): backend to use for the model. Defaults to None.
+		    config_kwargs (tp.Optional[tp.Mapping[str, Any] | EasyDeLBaseConfigDict], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
 		    auto_shard_model (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
-		    partition_rules (Optional[Tuple[Tuple[str, PartitionSpec]]], optional): Custom partition rules for parameter sharding. If not None, shard_fns should also be provided. Defaults to None.
+		    partition_rules (tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec]]], optional): Custom partition rules for parameter sharding. If not None, shard_fns should also be provided. Defaults to None.
 		    quantization_method (EasyDeLQuantizationMethods, optional): quantization_method to be used to quantize model weights. Defaults to None.
 		    quantization_block_size (int): block size to be used for quantizing arrays (only for NF4).
-		    bit_targeted_params (Optional[List[str]], optional): List of parameter names to convert to 8-bit precision. If  None and 8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
-		    safe (bool): whenever to use safetensors to load engine or parameters (requires engine or parameters to be saved with safe=True while saving them)
+		    bit_targeted_params (tp.Optional[List[str]], optional): List of parameter names to convert to 8-bit precision. If  None and 8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
 		    from_torch (bool): whenever to load the model from transformers-pytorch.
 		    **kwargs: Additional keyword arguments to pass to the model and config classes.
 
 		Returns:
-		    Tuple[EasyDeLBaseModule, dict]: A tuple containing the EasyDeL model and the loaded and sharded
+		    tp.Tuple[EasyDeLBaseModule, dict]: A tuple containing the EasyDeL model and the loaded and sharded
 		        model parameters.
 		"""
 		if device is None:
@@ -153,7 +130,7 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 			)
 
 		if from_torch:
-			return cls._from_torch(
+			return cls._from_torch_pretrained(
 				pretrained_model_name_or_path=pretrained_model_name_or_path,
 				param_dtype=param_dtype,
 				dtype=dtype,
@@ -190,160 +167,8 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 				pretrained_model_name_or_path=pretrained_model_name_or_path,
 				quantization_method=quantization_method,
 				quantization_block_size=quantization_block_size,
-				safe=safe,
 				**kwargs,
 			)
-
-	@staticmethod
-	def _from_torch(
-		pretrained_model_name_or_path: str,
-		device: Optional[jax.Device] = None,
-		dtype: jax.numpy.dtype = jax.numpy.float32,
-		param_dtype: jax.numpy.dtype = jax.numpy.float32,
-		precision: Optional[jax.lax.Precision] = None,
-		sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
-		sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-		partition_axis: Optional[PartitionAxis] = None,
-		shard_attention_computation: bool = True,
-		shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
-		backend: Optional[EasyDeLBackends] = None,
-		platform: Optional[EasyDeLPlatforms] = None,
-		config_kwargs: Optional[EasyDeLBaseConfigDict] = None,
-		auto_shard_model: bool = False,
-		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]] = None,
-		quantization_method: Optional[EasyDeLQuantizationMethods] = None,
-		quantization_block_size: int = 128,
-		**kwargs,
-	):
-		from transformers import AutoConfig, AutoModelForCausalLM
-
-		try:
-			import torch
-
-			if torch.cuda.is_available():
-
-				def _clear():
-					gc.collect()
-					torch.cuda.empty_cache()
-
-			else:
-
-				class torch:
-					bfloat16 = None
-
-				def _clear():
-					gc.collect()
-
-		except ModuleNotFoundError as er:
-			raise ModuleNotFoundError(
-				"in order to load model from torch you should install torch first "
-				"run `pip install torch`"
-			) from er
-
-		logger.debug(f"Downloading model config from {pretrained_model_name_or_path}")
-		trust_remote_code = kwargs.get("trust_remote_code", False)
-		config = AutoConfig.from_pretrained(
-			pretrained_model_name_or_path,
-			trust_remote_code=trust_remote_code,
-		)
-		model_type: str = config.model_type
-
-		config_class, module, transform_function = get_modules_by_type(
-			model_type,
-			task_type=TaskType.CAUSAL_LM,
-		)
-
-		logger.debug(f"Downloading hf_model weights from {pretrained_model_name_or_path}")
-		hf_model = AutoModelForCausalLM.from_pretrained(
-			pretrained_model_name_or_path,
-			**kwargs,
-		)
-		generation_config = getattr(hf_model, "generation_config", None)
-		config_class = config_class.from_pretrained(pretrained_model_name_or_path)
-		state_dict = hf_model.state_dict()
-
-		# Clear and collect memory after deleting the hf_model
-		del hf_model
-		_clear()
-
-		logger.debug("adding hf_model basic EasyDeL configurations.")
-		if hasattr(config_class, "add_jax_args"):
-			config_class.add_jax_args()
-		config_class.add_basic_configurations(
-			axis_dims=sharding_axis_dims,
-			axis_names=sharding_axis_names,
-			partition_axis=partition_axis,
-			backend=backend,
-			platform=platform,
-			shard_attention_computation=shard_attention_computation,
-		)
-		if config_kwargs is not None:
-			for k, v in config_kwargs.items():
-				setattr(config_class, k, v)
-
-		logger.debug("creating easydel model")
-		model = nnx.eval_shape(
-			lambda: module(
-				config=config_class,
-				dtype=dtype,
-				param_dtype=param_dtype,
-				precision=precision,
-				rngs=nnx.Rngs(0),
-			)
-		)
-		model.generation_config = generation_config
-
-		_clear()
-
-		if shard_fns is not None:
-			if auto_shard_model:
-				warnings.warn(
-					"`auto_shard_model` will be ignored since you are passing custom sharding functions",
-					stacklevel=1,
-				)
-			logger.debug("sharding model parameters based on the given `shard_fns`.")
-			if not is_flatten(shard_fns):
-				shard_fns = flatten_dict(shard_fns)
-		elif auto_shard_model:
-			shard_fns, gather_fns = AutoShardAndGatherFunctions.from_pretrained(
-				pretrained_model_name_or_path=pretrained_model_name_or_path,
-				partition_rules=partition_rules,
-				sharding_axis_dims=sharding_axis_dims,
-				sharding_axis_names=sharding_axis_names,
-				partition_axis=partition_axis,
-				shard_attention_computation=shard_attention_computation,
-				backend=backend,
-				platform=platform,
-				config_kwargs=config_kwargs,
-				trust_remote_code=trust_remote_code,
-			)
-		logger.debug("converting huggingface-model to easydel-model.")
-		params_pattern_selection = None
-		uses_tie_word_embedding = getattr(config, "tie_word_embeddings", False)
-		params = transform_function(
-			state_dict,
-			config=config,
-			device=device,
-			shard_fns=shard_fns,
-			params_pattern_selection=params_pattern_selection,
-			remove_state_dict=True,
-			uses_tie_word_embedding=uses_tie_word_embedding,
-			dtype=param_dtype,
-		)
-		del state_dict
-		_clear()
-		if is_flatten(params):
-			logger.info("converted parameters are flatten making them unflatten ")
-			params = unflatten_dict(params)
-		model = traversals.merge_model_and_tree(model=model, tree=params)
-
-		model = quantize_linear_layers(
-			model,
-			method=quantization_method,
-			block_size=quantization_block_size,
-			verbose=verbose,
-		)
-		return model
 
 
 class AutoStateForCausalLM:
@@ -351,24 +176,23 @@ class AutoStateForCausalLM:
 	def from_pretrained(
 		cls,
 		pretrained_model_name_or_path: str,
-		device: Optional[jax.Device] = None,
+		device: tp.Optional[jax.Device] = None,
 		dtype: jax.numpy.dtype = jax.numpy.float32,
 		param_dtype: jax.numpy.dtype = jax.numpy.float32,
-		precision: Optional[jax.lax.Precision] = None,
-		sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
-		sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-		partition_axis: Optional[PartitionAxis] = None,
+		precision: tp.Optional[jax.lax.Precision] = None,
+		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
+		sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+		partition_axis: tp.Optional[PartitionAxis] = None,
 		shard_attention_computation: bool = True,
-		shard_fns: Optional[Mapping[tuple, Callable] | dict] = None,
-		backend: Optional[str] = None,
-		config_kwargs: Optional[Mapping[str, Any]] = None,
+		shard_fns: tp.Optional[tp.Mapping[tuple, tp.Callable] | dict] = None,
+		backend: tp.Optional[EasyDeLBackends] = None,
+		platform: tp.Optional[EasyDeLPlatforms] = None,
+		config_kwargs: tp.Optional[EasyDeLBaseConfigDict] = None,
 		auto_shard_model: bool = False,
-		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec], ...]] = None,
-		load_in_8bit: bool = False,
-		bit_targeted_params: Optional[List[str]] = None,
-		verbose_params: bool = False,
-		safe: bool = True,
-		from_torch: bool = True,
+		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]] = None,
+		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
+		quantization_block_size: int = 128,
+		from_torch: tp.Optional[bool] = None,
 		**kwargs,
 	) -> EasyDeLState:
 		"""
@@ -381,17 +205,17 @@ class AutoStateForCausalLM:
 		    dtype (jax.numpy.dtype, optional): Data type of the model. Defaults to jax.numpy.float32.
 		    param_dtype (jax.numpy.dtype, optional): Data type of the model parameters. Defaults to jax.numpy.float32.
 		    precision (jax.lax.Precision, optional): Precision for computations. Defaults to jax.lax.Precision("fastest").
-		    sharding_axis_dims (Sequence[int], optional): Dimensions of each sharding axis. Defaults to (1, -1, 1, 1).
-		    sharding_axis_names (Sequence[str], optional): Names of the sharding axes. Defaults to ("dp", "fsdp", "tp", "sp").
+		    sharding_axis_dims (tp.Sequence[int], optional): Dimensions of each sharding axis. Defaults to (1, -1, 1, 1).
+		    sharding_axis_names (tp.Sequence[str], optional): Names of the sharding axes. Defaults to ("dp", "fsdp", "tp", "sp").
 		    partition_axis (PartitionAxis) : PartitionAxis is new module used for partitioning arrays in easydel.
 		    shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
-		    shard_fns (Optional[Mapping[tuple, Callable] | dict], optional): Sharding functions to use for the model. If None, auto-sharding is used if auto_shard_model is True. Defaults to None.
-		    backend (Optional[str], optional): Backend to use for the model. Defaults to None.
-		    config_kwargs (Optional[Mapping[str, Any]], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
+		    shard_fns (tp.Optional[tp.Mapping[tuple, tp.Callable] | dict], optional): Sharding functions to use for the model. If None, auto-sharding is used if auto_shard_model is True. Defaults to None.
+		    backend (tp.Optional[str], optional): Backend to use for the model. Defaults to None.
+		    config_kwargs (tp.Optional[tp.Mapping[str, Any]], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
 		    auto_shard_model (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
-		    partition_rules (Optional[Tuple[Tuple[str, PartitionSpec]]], optional): Custom partition rules for parameter sharding. If not None, shard_fns should also be provided. Defaults to None.
+		    partition_rules (tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec]]], optional): Custom partition rules for parameter sharding. If not None, shard_fns should also be provided. Defaults to None.
 		    quantization_method (EasyDeLQuantizationMethods, optional): quantization_method to be used to quantize model weights. Defaults to None.
-		    bit_targeted_params (Optional[List[str]], optional): List of parameter names to convert to 8-bit precision. If  None and 8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
+		    bit_targeted_params (tp.Optional[List[str]], optional): List of parameter names to convert to 8-bit precision. If  None and 8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
 		    verbose_params (bool): whenever to log number of parameters in converting state.
 		    safe (bool): whenever to use safetensors to load engine or parameters (requires engine or parameters to be saved with safe=True while saving them)
 		    from_torch (bool): whenever to load the model from transformers-pytorch.
@@ -400,33 +224,30 @@ class AutoStateForCausalLM:
 		Returns:
 		    EasyDeLState: containing the EasyDeL state and the loaded and sharded model parameters.
 		"""
-		model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
+		model = AutoEasyDeLModelForCausalLM.from_pretrained(
 			pretrained_model_name_or_path=pretrained_model_name_or_path,
-			device=device,
-			dtype=dtype,
 			param_dtype=param_dtype,
-			precision=precision,
-			sharding_axis_dims=sharding_axis_dims,
-			sharding_axis_names=sharding_axis_names,
-			partition_axis=partition_axis,
-			shard_attention_computation=shard_attention_computation,
+			dtype=dtype,
 			shard_fns=shard_fns,
-			backend=backend,
-			config_kwargs=config_kwargs,
 			auto_shard_model=auto_shard_model,
+			precision=precision,
+			backend=backend,
+			platform=platform,
+			partition_axis=partition_axis,
+			quantization_method=quantization_method,
+			quantization_block_size=quantization_block_size,
 			partition_rules=partition_rules,
-			load_in_8bit=load_in_8bit,
-			bit_targeted_params=bit_targeted_params,
-			verbose_params=verbose_params,
-			safe=safe,
+			sharding_axis_names=sharding_axis_names,
+			sharding_axis_dims=sharding_axis_dims,
+			config_kwargs=config_kwargs,
+			device=device,
+			shard_attention_computation=shard_attention_computation,
 			from_torch=from_torch,
 			**kwargs,
 		)
 		return EasyDeLState.create(
-			apply_fn=model.__call__,
-			params=params,
-			module=model,
-			module_config=model.config,
+			model=model,
 			tx=None,
-			tx_init=None,
+			init_opt_state=False,
+			step=0,
 		)

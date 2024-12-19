@@ -67,7 +67,7 @@ def main(use_iterable_dataset: bool):
 			yield {
 				"attention_mask": ones,
 				"input_ids": ones.at[-1].set(0),
-				"labels": ones.at[-1].set(0),
+				# "labels": ones.at[-1].set(0),
 			}
 
 	if not use_iterable_dataset:
