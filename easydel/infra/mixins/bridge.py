@@ -196,18 +196,17 @@ class EasyBridgeMixin(PushToHubMixin):
 	def push_to_hub(
 		self,
 		repo_id: str,
-		params: tp.Any,
 		use_temp_dir: tp.Optional[bool] = None,
 		commit_message: tp.Optional[str] = None,
 		private: tp.Optional[bool] = None,
 		token: tp.Optional[tp.Union[bool, str]] = None,
 		create_pr: bool = False,
 		gather_fns: tp.Optional[dict[tp.Callable]] = None,
-		float_dtype=None,
+		float_dtype: tp.Optional[jnp.dtype] = None,
 		verbose: bool = True,
 		mismatch_allowed: bool = True,
-		revision: str = None,
-		commit_description: str = None,
+		revision: tp.Optional[str] = None,
+		commit_description: tp.Optional[str] = None,
 	) -> str:
 		"""Pushes the model to the Hugging Face Hub.
 
@@ -248,7 +247,7 @@ class EasyBridgeMixin(PushToHubMixin):
 			work_dir_path = Path(work_dir)
 			files_timestamps = self._get_files_timestamps(work_dir_path)
 			self.save_pretrained(
-				work_dir,
+				save_directory=work_dir,
 				push_to_hub=False,
 				token=token,
 				gather_fns=gather_fns,
@@ -256,7 +255,6 @@ class EasyBridgeMixin(PushToHubMixin):
 				verbose=verbose,
 				mismatch_allowed=mismatch_allowed,
 				repo_id=repo_id,
-				params=params,
 			)
 
 			return self._upload_modified_files(
