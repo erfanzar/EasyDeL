@@ -63,9 +63,8 @@ def main():
 			max_position_embeddings=512,
 			use_scan_mlp=False,
 			attention_bias=False,
-			platform="jax",
 			attn_dtype=jnp.float16,
-			attn_mechanism=AttentionMechanisms.SDPA,
+			attn_mechanism=AttentionMechanisms.VANILLA,
 		)
 		arguments = DPOConfig(
 			num_train_epochs=4,

@@ -67,7 +67,7 @@ class LossConfig:
 
 @chex.dataclass
 class LossMetrics:
-	loss: tp.Union[float, chex.Array]
+	loss: tp.Optional[tp.Union[float, chex.Array]] = None
 	z_loss: tp.Optional[tp.Union[float, chex.Array]] = None
 	weight_sum: tp.Optional[tp.Union[float, chex.Array]] = None
 	accuracy: tp.Optional[tp.Union[float, chex.Array]] = None
@@ -77,6 +77,7 @@ class LossMetrics:
 	grad_norms: tp.Optional[flax.struct.PyTreeNode] = None
 	chosen_rewards: tp.Optional[jax.Array] = None
 	rejected_rewards: tp.Optional[jax.Array] = None
+	other_metrics: tp.Optional[tp.Mapping[str, jax.Array]] = None
 
 
 def sigmoid_cross_entropy_with_logits(

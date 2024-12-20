@@ -12,19 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
-import os
 import time
 import typing
 from abc import ABC
 from collections import defaultdict
-from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Union
+import typing as tp
 
-import flax.core
 import jax
 import numpy as np
-import termcolor
-from fjformer.sharding import make_shard_and_gather_fns, match_partition_rules
+from fjformer.sharding import match_partition_rules
 from jax import jit
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
@@ -34,6 +30,7 @@ from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import get_logger
 from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.loss_utils import LossMetrics
 from easydel.trainers.base_trainer import (
 	BaseTrainer,
 	TrainerConfigureDataloaderOutput,
@@ -42,10 +39,9 @@ from easydel.trainers.base_trainer import (
 from easydel.trainers.direct_preference_optimization_trainer.utils import (
 	DPODataCollatorWithPadding,
 )
-from easydel.trainers.odds_ratio_preference_optimization_trainer.fwd_bwd_functions import (
-	ORPOStepOut,
-	create_orpo_concatenated_forward,
-	create_orpo_step_function,
+from easydel.trainers.odds_ratio_preference_optimization_trainer._fns import (
+	create_concatenated_forward,
+	create_step_function,
 )
 from easydel.trainers.odds_ratio_preference_optimization_trainer.modelling_output import (
 	ORPOTrainerOutput,
@@ -55,63 +51,33 @@ from easydel.trainers.odds_ratio_preference_optimization_trainer.orpo_config imp
 )
 from easydel.trainers.trainer_protocol import MetricsTracker, StepMetrics
 
+if tp.TYPE_CHECKING:
+	from datasets import Dataset
+	from transformers import PreTrainedTokenizerBase
+	from tensorflow import data
+
+	TFDataset = data.Dataset
+
+else:
+	Dataset = tp.Any
+	PreTrainedTokenizerBase = tp.Any
+	TFDataset = tp.Any
+
 logger = get_logger(__name__)
 
 
 class ORPOTrainer(BaseTrainer, ABC):
-	"""
-	Trainer for Odds Ratio Preference Optimization (ORPO).
-
-	This trainer handles the training, evaluation, and checkpointing of language models
-	using the ORPO algorithm. It supports sharding, gradient accumulation, mixed precision
-	training, LoRA.
-
-	Attributes:
-	    arguments (ORPOConfig): The training arguments.
-	    data_collator (Optional[DPODataCollatorWithPadding]): The data collator used for batching.
-	    train_dataset (Optional[Dataset]): The training dataset.
-	    eval_dataset (Optional[Union[Dataset, Dict[str, Dataset]]]): The evaluation dataset.
-	    tokenizer (Optional[PreTrainedTokenizerBase]): The tokenizer used for preprocessing.
-	    dataset_num_proc (Optional[int]): The number of processes to use for dataset mapping.
-	    low_mem_usage (bool): Whether to prioritize low memory usage during training.
-
-	Methods:
-	    build_tokenized_answer(self, prompt: str, answer: str) -> Dict: Tokenizes a prompt and answer pair, handling special tokens and padding/truncation.
-	    tokenize_row(self, feature: Dict, state: EasyDeLState = None) -> Dict: Tokenizes a single row of data from the ORPO dataset.
-	    configure_functions(self) -> TrainerConfigureFunctionOutput: Configures and JIT-compiles the training and evaluation step functions.
-	    initialize_state(self, model_parameters: Optional[flax.core.FrozenDict] = None, state: Optional[EasyDeLState] = None) -> Tuple[EasyDeLState, Mapping[str, Callable], Mapping[str, Callable]]:
-	        Initializes the training state, either from scratch, pretrained parameters, or a checkpoint.
-	    initialize_trainer_utils(self): Initializes trainer utilities (logging, timer, dataloaders, model, etc.).
-	    _configure_dataloaders(self): Configures the dataloaders for training and evaluation.
-	    _configure_model(self): Configures the model, optimizer, scheduler, and configuration.
-	    _configure_functions(self):  Configures and JIT-compiles the training and evaluation step functions.
-	    create_collect_function(self, max_sequence_length: int, truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end") -> Callable:
-	        Creates a data collection function for batching.
-	    configure_dataloaders(self) -> TrainerConfigureDataloaderOutput: Configures the dataloaders for training and evaluation.
-	    _get_train_dataloader(self) -> tensorflow.data.Dataset: Creates the training dataloader.
-	    _get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> tensorflow.data.Dataset: Creates the evaluation dataloader.
-	    get_train_dataloader(self) -> tensorflow.data.Dataset: Returns the training dataloader.
-	    get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> tensorflow.data.Dataset: Returns the evaluation dataloader.
-	    train(self, model_parameters: Optional[flax.core.FrozenDict] = None, state: Optional[EasyDeLState] = None) -> ORPOTrainerOutput:
-	        Trains the ORPO model and returns the training output.
-	    eval(self, model_state: EasyDeLState) -> typing.Iterator[dict]: Evaluates the ORPO model and yields evaluation metrics.
-	"""
-
 	def __init__(
 		self,
 		arguments: ORPOConfig,
-		model: Optional[EasyDeLBaseModule] = None,
-		data_collator: Optional[DPODataCollatorWithPadding] = None,
-		train_dataset: Optional["Dataset"] = None,  # noqa #type:ignore
-		eval_dataset: Optional[
-			Union["Dataset", Dict[str, "Dataset"]]  # noqa #type:ignore
-		] = None,
-		tokenizer: Optional[
-			"transformers.PreTrainedTokenizerBase"  # noqa #type:ignore
-		] = None,
-		dataset_num_proc: Optional[int] = None,
+		model: tp.Optional[EasyDeLBaseModule] = None,
+		data_collator: tp.Optional[DPODataCollatorWithPadding] = None,
+		train_dataset: tp.Optional[Dataset] = None,
+		eval_dataset: tp.Optional[tp.Union[Dataset, tp.Dict[str, Dataset]]] = None,
+		tokenizer: tp.Optional[PreTrainedTokenizerBase] = None,
+		dataset_num_proc: tp.Optional[int] = None,
 		_do_init_fns: bool = True,
-		dataset_map_arguments: Optional[Dict[str, Any]] = None,
+		dataset_map_arguments: tp.Optional[tp.Dict[str, tp.Any]] = None,
 		low_mem_usage: bool = False,
 	):
 		"""
@@ -119,13 +85,13 @@ class ORPOTrainer(BaseTrainer, ABC):
 
 		Args:
 		    arguments (ORPOConfig): The training arguments.
-		    data_collator (Optional[DPODataCollatorWithPadding], optional): The data collator used for batching. Defaults to None.
-		    train_dataset (Optional[Dataset], optional): The training dataset. Defaults to None.
-		    eval_dataset (Optional[Union[Dataset, Dict[str, Dataset]]], optional): The evaluation dataset. Defaults to None.
-		    tokenizer (Optional[PreTrainedTokenizerBase], optional): The tokenizer used for preprocessing. Defaults to None.
-		    dataset_num_proc (Optional[int], optional): The number of processes to use for dataset mapping. Defaults to None.
+		    data_collator (tp.Optional[DPODataCollatorWithPadding], optional): The data collator used for batching. Defaults to None.
+		    train_dataset (tp.Optional[Dataset], optional): The training dataset. Defaults to None.
+		    eval_dataset (tp.Optional[tp.Union[Dataset, tp.Dict[str, Dataset]]], optional): The evaluation dataset. Defaults to None.
+		    tokenizer (tp.Optional[PreTrainedTokenizerBase], optional): The tokenizer used for preprocessing. Defaults to None.
+		    dataset_num_proc (tp.Optional[int], optional): The number of processes to use for dataset mapping. Defaults to None.
 		    _do_init_fns (bool, optional): Whether to automatically initialize trainer functions. Defaults to True.
-		    dataset_map_arguments (Optional[Dict[str, Any]], optional): Arguments to pass to the dataset `map` function for tokenization. Defaults to None.
+		    dataset_map_arguments (tp.Optional[tp.Dict[str, tp.Any]], optional): Arguments to pass to the dataset `map` function for tokenization. Defaults to None.
 		    low_mem_usage (bool, optional): Whether to prioritize low memory usage during training. Defaults to False.
 
 		Raises:
@@ -168,9 +134,8 @@ class ORPOTrainer(BaseTrainer, ABC):
 			dataset_map_arguments = {}
 
 		with jax.default_device(arguments.offload_device):
-			off_div = (
-				arguments.offload_device
-			)  # avoids TypeError: cannot pickle 'jaxlib.xla_extension.Device' object
+			off_div = arguments.offload_device
+			# avoids TypeError: cannot pickle 'jaxlib.xla_extension.Device' object
 			arguments.offload_device = None
 			train_dataset = train_dataset.map(
 				self.tokenize_row,
@@ -198,7 +163,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 			arguments.padding_value is not None
 		), "`padding_value` can not be set as `None` it must be an integer."
 
-		self.concatenated_forward = create_orpo_concatenated_forward(
+		self.concatenated_forward = create_concatenated_forward(
 			is_encoder_decoder=arguments.is_encoder_decoder,
 			padding_value=arguments.padding_value,
 			label_pad_token_id=arguments.label_pad_token_id,
@@ -218,7 +183,9 @@ class ORPOTrainer(BaseTrainer, ABC):
 			_do_init_fns=_do_init_fns,
 		)
 
-	def build_tokenized_answer(self, prompt: str, answer: str) -> Dict[str, np.ndarray]:
+	def build_tokenized_answer(
+		self, prompt: str, answer: str
+	) -> tp.Dict[str, np.ndarray]:
 		"""
 		Tokenizes a prompt and answer pair, handling special tokens and padding/truncation.
 
@@ -227,7 +194,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 		    answer (str): The answer text.
 
 		Returns:
-		    Dict[str, np.ndarray]: A dictionary containing the tokenized prompt and answer, along with attention masks.
+		    tp.Dict[str, np.ndarray]: A dictionary containing the tokenized prompt and answer, along with attention masks.
 
 		Raises:
 		    ValueError: If there's a mismatch in token lengths.
@@ -273,9 +240,9 @@ class ORPOTrainer(BaseTrainer, ABC):
 
 	def tokenize_row(
 		self,
-		feature: Dict[str, str],
-		state: Optional[object] = None,
-	) -> Dict[str, np.ndarray]:
+		feature: tp.Dict[str, str],
+		state: tp.Optional[object] = None,
+	) -> tp.Dict[str, np.ndarray]:
 		"""
 		Tokenizes a single row of data from the ORPO dataset.
 
@@ -283,11 +250,11 @@ class ORPOTrainer(BaseTrainer, ABC):
 		handles padding and truncation, and prepares the data for input to the DPO model.
 
 		Args:
-		    feature (Dict): A dictionary containing the "prompt", "chosen", and "rejected" texts.
+		    feature (tp.Dict): A dictionary containing the "prompt", "chosen", and "rejected" texts.
 		    state (EasyDeLState, optional): Not used in this implementation. Defaults to None.
 
 		Returns:
-		    Dict: A dictionary containing the tokenized prompt, chosen response, and rejected response,
+		    tp.Dict: A dictionary containing the tokenized prompt, chosen response, and rejected response,
 		          along with attention masks and labels.
 
 		Raises:
@@ -310,7 +277,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 			rejected_sequence,
 		)
 
-	def _validate_input(self, feature: Dict[str, str], key: str) -> str:
+	def _validate_input(self, feature: tp.Dict[str, str], key: str) -> str:
 		"""Validates input and returns the corresponding value."""
 		value = feature[key]
 		if self.arguments.apply_chat_template and key in ["chosen", "rejected"]:
@@ -319,12 +286,12 @@ class ORPOTrainer(BaseTrainer, ABC):
 			raise ValueError(f"{key} should be a string but got {type(value)}")
 		return value
 
-	def _tokenize_prompt(self, prompt: str) -> Dict[str, np.ndarray]:
+	def _tokenize_prompt(self, prompt: str) -> tp.Dict[str, np.ndarray]:
 		"""Tokenizes the prompt."""
 		tokens = self.tokenizer(prompt, add_special_tokens=False, return_tensors="np")
 		return {f"prompt_{k}": v for k, v in tokens.items()}
 
-	def _tokenize_answer(self, prompt: str, answer: str) -> Dict[str, np.ndarray]:
+	def _tokenize_answer(self, prompt: str, answer: str) -> tp.Dict[str, np.ndarray]:
 		"""Tokenizes the answer in context of the prompt."""
 		full_tokenized = self.tokenizer(prompt + answer, add_special_tokens=False)
 		prompt_length = len(self.tokenizer(prompt, add_special_tokens=False)["input_ids"])
@@ -346,9 +313,9 @@ class ORPOTrainer(BaseTrainer, ABC):
 
 	def _create_sequence(
 		self,
-		prompt_tokens: Dict[str, np.ndarray],
-		answer_tokens: Dict[str, np.ndarray],
-	) -> Dict[str, np.ndarray]:
+		prompt_tokens: tp.Dict[str, np.ndarray],
+		answer_tokens: tp.Dict[str, np.ndarray],
+	) -> tp.Dict[str, np.ndarray]:
 		"""Creates a full sequence by combining prompt and answer tokens."""
 		sequence = {}
 		for key in ["input_ids", "attention_mask"]:
@@ -391,10 +358,10 @@ class ORPOTrainer(BaseTrainer, ABC):
 
 	def _prepare_final_batch(
 		self,
-		prompt_tokens: Dict[str, np.ndarray],
-		chosen_sequence: Dict[str, np.ndarray],
-		rejected_sequence: Dict[str, np.ndarray],
-	) -> Dict[str, np.ndarray]:
+		prompt_tokens: tp.Dict[str, np.ndarray],
+		chosen_sequence: tp.Dict[str, np.ndarray],
+		rejected_sequence: tp.Dict[str, np.ndarray],
+	) -> tp.Dict[str, np.ndarray]:
 		"""Prepares the final batch by padding and truncating sequences."""
 		batch = {}
 		for prefix, tokens in [
@@ -446,133 +413,49 @@ class ORPOTrainer(BaseTrainer, ABC):
 		"""
 		mesh = self.model.mesh
 
-		def initialize_state_function():
-			initialized_parameters = self.model.init_weights(
-				jax.random.PRNGKey(0), self.arguments.init_input_shape
+		def create_state():
+			"""
+			Creates an EasyDeLState object.
+			Returns:
+			    EasyDeLState: The EasyDeLState object initialized.
+			"""
+			return EasyDeLState.create(
+				model=self.model,
+				tx=self.tx,
+				init_opt_state=True,
 			)
 
-			if self.arguments.dtype == jnp.bfloat16:
-				initialized_parameters = self.model.to_bf16(initialized_parameters)
-			elif self.arguments.dtype == jnp.float16:
-				initialized_parameters = self.model.to_fp16(initialized_parameters)
-
-			tx = self.tx
-			parameters = flax.core.freeze({"params": initialized_parameters})
-			tx_init = copy.deepcopy(self.arguments.optimizer_kwargs)
-
-			if self.rapture is not None:
-				lora_parameters = self.lora_parameters
-				if self.arguments.dtype == jnp.bfloat16:
-					lora_parameters = self.model.to_bf16(lora_parameters)
-				elif self.arguments.dtype == jnp.float16:
-					lora_parameters = self.model.to_fp16(lora_parameters)
-
-				return EasyDeLState(
-					step=0,
-					apply_fn=self.lora_apply_fn,
-					params=lora_parameters,
-					tx=self.lora_tx,
-					opt_state=self.lora_opt_state,
-					tx_init=EasyDeLState.safe_dict(tx_init),
-					hyperparameters=EasyDeLState.create_hyperparameters(
-						self.model.config.model_type
-					),
-					module=self.lora_model,
-					module_config=self.model.config,
-					module_config_args=None,
-				)
-			else:
-				return EasyDeLState.create(
-					tx=tx,
-					params=parameters,
-					apply_fn=self.model.__call__,
-					module_config=copy.deepcopy(self.model.config),
-					tx_init=tx_init,
-					hyperparameters=EasyDeLState.create_hyperparameters(
-						self.model.config.model_type
-					),
-					module=self.model,
-					module_config_args=None,
-				)
-
-		def create_state_from_params_function(parameters):
-			if self.rapture is None:
-				return EasyDeLState.create(
-					tx=self.tx,
-					params=parameters,
-					apply_fn=self.model.__call__,
-					module_config=copy.deepcopy(self.model.config),
-					tx_init=copy.deepcopy(self.arguments.optimizer_kwargs),
-					hyperparameters=EasyDeLState.create_hyperparameters(
-						self.model.config.model_type
-					),
-					module=self.model,
-					module_config_args=None,
-				)
-			else:
-				return EasyDeLState(
-					step=0,
-					apply_fn=self.lora_apply_fn,
-					params=parameters,
-					tx=self.lora_tx,
-					opt_state=self.lora_opt_state,
-					tx_init=EasyDeLState.safe_dict(
-						copy.deepcopy(self.arguments.optimizer_kwargs)
-					),
-					hyperparameters=EasyDeLState.create_hyperparameters(
-						self.model.config.model_type
-					),
-					module=self.lora_model,
-					module_config=self.model.config,
-					module_config_args=None,
-				)
-
-		state_shape = jax.eval_shape(initialize_state_function)
+		state_shape = jax.eval_shape(lambda: create_state())
 		state_partition_spec = match_partition_rules(
-			(
-				self.config.get_partition_rules(
-					fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
-				)
-				if self.arguments.custom_rule is None
-				else self.arguments.custom_rule
-			),
+			self.model.config.get_partition_rules(),
 			state_shape,
 		)
 
 		spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
+
+		spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
 		empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=mesh)
-		create_state_sharded = jit(
-			create_state_from_params_function,
-			in_shardings=(spec_named_sharding.params,),
-			out_shardings=spec_named_sharding,
-			donate_argnums=(0,),
-		)
+		create_state_sharded = jax.jit(create_state, out_shardings=spec_named_sharding)
 		sharded_training_step_function = jit(
-			create_orpo_step_function(
-				mode="train",
-				beta=self.arguments.beta,
+			create_step_function(
 				concatenated_forward=self.concatenated_forward,
+				beta=self.arguments.beta,
+				mode="train",
 				batch_partition_spec=self.arguments.step_partition_spec,
 			),
 			in_shardings=(spec_named_sharding, empty_sharding),
-			out_shardings=(
-				spec_named_sharding,
-				empty_sharding,
-			),
+			out_shardings=(spec_named_sharding, empty_sharding),
 		)
 
 		sharded_evaluation_step_function = jit(
-			create_orpo_step_function(
-				mode="eval",
-				beta=self.arguments.beta,
+			create_step_function(
 				concatenated_forward=self.concatenated_forward,
+				beta=self.arguments.beta,
+				mode="eval",
 				batch_partition_spec=self.arguments.step_partition_spec,
 			),
 			in_shardings=(spec_named_sharding, empty_sharding),
-			out_shardings=(
-				spec_named_sharding,
-				empty_sharding,
-			),
+			out_shardings=(spec_named_sharding, empty_sharding),
 		)
 
 		self.arguments.ensure_checkpoint_path()
@@ -587,122 +470,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 			sharded_evaluation_step_function=sharded_evaluation_step_function,
 			mesh=mesh,
 			checkpoint_manager=checkpoint_manager,
-			initialize_state_function=initialize_state_function,
 		)
-
-	def initialize_state(
-		self,
-		model_parameters: Optional[flax.core.FrozenDict] = None,
-		state: Optional[EasyDeLState] = None,
-	) -> Tuple[EasyDeLState, Mapping[str, Callable], Mapping[str, Callable]]:
-		if (
-			model_parameters is None
-			and state is None
-			and self.rapture is None
-			and self.checkpoint_path is None
-		):
-			raise RuntimeError(
-				"You are passing `model_parameters=None`, `state=None`, and `checkpoint_path=None` and also you are not"
-				" using LoRA, if you are "
-				"Using LoRA make sure to pass parameters and Rapture Config correctly otherwise pass the "
-				"model_parameters or state."
-			)
-		if model_parameters is None and state is None:
-			model_parameters = self.lora_parameters
-		with self.mesh:
-			shard_fns, gather_fns = make_shard_and_gather_fns(
-				self.state_partition_spec, mesh=self.mesh
-			)
-			if state is not None:
-				sharded_state = state
-				if sharded_state.opt_state is None:
-					logger.info("Optimizer State is not Found!, initializing one.")
-					with jax.default_device(self.arguments.offload_device):
-						sharded_state = sharded_state.init_opt_state()
-			elif self.finetune:
-				if model_parameters is None and self.checkpoint_path is not None:
-					logger.info(f"Loading Model From {self.checkpoint_path}")
-					with jax.default_device(self.arguments.offload_device):
-						sharded_state = EasyDeLState.load_state(
-							verbose=self.arguments.verbose,
-							state_shard_fns=shard_fns,
-							init_optimizer_state=True,
-							checkpoint_path=self.checkpoint_path,
-							input_shape=self.arguments.init_input_shape,
-							config_kwargs=self.arguments.loaded_model_config_kwargs,
-						)
-						state_shape = jax.eval_shape(lambda: sharded_state)
-						state_partition_spec = match_partition_rules(
-							(
-								self.config.get_partition_rules(
-									fully_sharded_data_parallel=self.arguments.fully_sharded_data_parallel
-								)
-								if self.arguments.custom_rule is None
-								else self.arguments.custom_rule
-							),
-							state_shape,
-						)
-
-						spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
-						empty_sharding = jax.sharding.NamedSharding(
-							spec=PartitionSpec(), mesh=self.model.mesh
-						)
-						sharded_training_step_function = jit(
-							create_orpo_step_function(
-								mode="train",
-								beta=self.arguments.beta,
-								concatenated_forward=self.concatenated_forward,
-								batch_partition_spec=self.arguments.step_partition_spec,
-							),
-							in_shardings=(spec_named_sharding, empty_sharding),
-							out_shardings=(
-								spec_named_sharding,
-								empty_sharding,
-							),
-						)
-
-						sharded_evaluation_step_function = jit(
-							create_orpo_step_function(
-								mode="eval",
-								beta=self.arguments.beta,
-								concatenated_forward=self.concatenated_forward,
-								batch_partition_spec=self.arguments.step_partition_spec,
-							),
-							in_shardings=(spec_named_sharding, empty_sharding),
-							out_shardings=(
-								spec_named_sharding,
-								empty_sharding,
-							),
-						)
-
-						self.state_partition_spec = state_partition_spec
-						self.state_named_sharding = spec_named_sharding
-						self.state_shape = state_shape
-						self.sharded_training_step_function = sharded_training_step_function
-						self.sharded_evaluation_step_function = sharded_evaluation_step_function
-
-					if self.arguments.remove_ckpt_after_load:
-						os.remove(self.checkpoint_path)
-				elif model_parameters is not None and self.checkpoint_path is None:
-					if not isinstance(model_parameters, flax.core.FrozenDict):
-						logger.warn(
-							"Model Parameters should be like FrozenDict({'params': params}) make sure to "
-							"pass as type FrozenDict in case of not getting UnExcepted Errors ",
-						)
-					sharded_state = self.create_state_sharded(model_parameters)
-				elif model_parameters is not None and self.checkpoint_path is not None:
-					raise EasyDeLTimerError(
-						"You can't pass `model_parameters` and `checkpoint_path` at same time"
-					)
-				else:
-					raise EasyDeLTimerError(
-						"You should pass `model_parameters` or `checkpoint_path` to trainer in order to load model"
-					)
-			else:
-				sharded_state = self.initialize_state_function()
-
-			self.sharded_state = sharded_state
-			return sharded_state, shard_fns, gather_fns
 
 	def initialize_trainer_utils(self):
 		"""
@@ -756,17 +524,6 @@ class ORPOTrainer(BaseTrainer, ABC):
 			self.tx = tx
 			self.scheduler = scheduler
 			self.config = config
-			if self.rapture is not None:
-				lora_modules = self.rapture.apply_lora(
-					module=model,
-					parameters=self.arguments.rapture_config.parameters,
-					tx=tx,
-				)
-				self.lora_parameters = lora_modules.lora_parameters
-				self.lora_apply_fn = lora_modules.lora_module.__call__
-				self.lora_opt_state = lora_modules.lora_opt_state
-				self.lora_model = lora_modules.lora_module
-				self.lora_tx = lora_modules.lora_tx
 
 		self.timer.log(operation_name)
 
@@ -797,7 +554,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 		self,
 		max_sequence_length: int,
 		truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
-	) -> Callable:
+	) -> tp.Callable:
 		return self.data_collator
 
 	def configure_dataloaders(self) -> TrainerConfigureDataloaderOutput:
@@ -830,7 +587,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 			max_evaluation_steps=max_evaluation_steps,
 		)
 
-	def _get_train_dataloader(self) -> "tensorflow.data.Dataset":  # noqa #type:ignore
+	def _get_train_dataloader(self) -> TFDataset:
 		"""
 		Creates the training dataloader as a TensorFlow Dataset.
 
@@ -864,8 +621,8 @@ class ORPOTrainer(BaseTrainer, ABC):
 
 	def _get_eval_dataloader(
 		self,
-		eval_dataset: Optional["Dataset"] = None,  # noqa #type:ignore
-	) -> "tensorflow.data.Dataset":  # noqa #type:ignore
+		eval_dataset: tp.Optional[Dataset] = None,
+	) -> TFDataset:
 		"""
 		Creates the evaluation dataloader as a TensorFlow Dataset.
 
@@ -874,7 +631,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 		it into a TensorFlow Dataset for efficient batching and data loading during evaluation.
 
 		Args:
-		    eval_dataset (Optional[Dataset], optional):
+		    eval_dataset (tp.Optional[Dataset], optional):
 		        An optional evaluation dataset to use. If None, `self.eval_dataset` is used. Defaults to None.
 
 		Returns:
@@ -900,7 +657,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 			)
 		)
 
-	def get_train_dataloader(self) -> "tensorflow.data.Dataset":  # noqa #type:ignore
+	def get_train_dataloader(self) -> TFDataset:
 		"""
 		Returns the training dataloader
 
@@ -909,14 +666,11 @@ class ORPOTrainer(BaseTrainer, ABC):
 		"""
 		return self._get_train_dataloader()
 
-	def get_eval_dataloader(
-		self,
-		eval_dataset: Optional["Dataset"] = None,  # noqa #type:ignore
-	) -> "tensorflow.data.Dataset":  # noqa #type:ignore
+	def get_eval_dataloader(self, eval_dataset: tp.Optional[Dataset] = None) -> TFDataset:
 		"""
 		Returns the evaluation dataloader
 		Args:
-		    eval_dataset (Optional[Dataset], optional):
+		    eval_dataset (tp.Optional[Dataset], optional):
 		        An optional evaluation dataset to use. If None, `self.eval_dataset` is used. Defaults to None.
 
 		Returns:
@@ -932,8 +686,6 @@ class ORPOTrainer(BaseTrainer, ABC):
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
 		start_time: float,
-		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
 	):
 		"""Core training loop implementation."""
 		pbar = tqdm(total=self.max_training_steps)
@@ -942,15 +694,12 @@ class ORPOTrainer(BaseTrainer, ABC):
 		with self.mesh:
 			for epoch in range(self.arguments.num_train_epochs):
 				current_step, run_exception = self._train_epoch(
-					self.dataloader_train,
-					current_step,
-					metrics_tracker,
-					step_metrics,
-					pbar,
-					start_time,
-					epoch,
-					shard_fns,
-					gather_fns,
+					train_dataset=self.dataloader_train,
+					current_step=current_step,
+					metrics_tracker=metrics_tracker,
+					step_metrics=step_metrics,
+					pbar=pbar,
+					epoch=epoch,
 				)
 
 				if current_step >= self.max_training_steps:
@@ -959,8 +708,6 @@ class ORPOTrainer(BaseTrainer, ABC):
 					break
 		return self._prepare_training_output(
 			sharded_state=self.model_state,
-			shard_fns=shard_fns,
-			gather_fns=gather_fns,
 			run_exception=run_exception,
 		), run_exception
 
@@ -969,7 +716,6 @@ class ORPOTrainer(BaseTrainer, ABC):
 		sharded_state: EasyDeLState,
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
-		start_time: float,
 	):
 		"""Core evaluation loop implementation."""
 		pbar = tqdm(total=self.max_evaluation_steps)
@@ -977,13 +723,12 @@ class ORPOTrainer(BaseTrainer, ABC):
 		current_step = int(jax.device_get(sharded_state.step))
 		with self.mesh:
 			for eval_metrics in self._eval_epoch(
-				sharded_state,
-				self.dataloader_eval,
-				current_step,
-				metrics_tracker,
-				step_metrics,
-				pbar,
-				start_time,
+				sharded_state=sharded_state,
+				eval_dataset=self.dataloader_eval,
+				current_step=current_step,
+				metrics_tracker=metrics_tracker,
+				step_metrics=step_metrics,
+				pbar=pbar,
 			):
 				yield eval_metrics
 
@@ -994,10 +739,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
 		pbar: tqdm,
-		start_time: float,
 		epoch: int,
-		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
 	):
 		"""Handles training for a single epoch."""
 		train_iter = iter(train_dataset)
@@ -1042,12 +784,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 
 				# Save checkpoint if needed
 				if self._should_save_checkpoint(current_step):
-					_ = self._save_state(
-						state=self.model_state,
-						gather_fns=gather_fns,
-						milestone=True,
-						save_directory=self.arguments.save_directory,
-					)
+					_ = self._save_state(state=self.model_state)
 
 				current_step += 1
 			except (KeyboardInterrupt, EasyDeLTimerError):
@@ -1064,7 +801,6 @@ class ORPOTrainer(BaseTrainer, ABC):
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
 		pbar: tqdm,
-		start_time: float,
 	):
 		"""Handles training for a single epoch."""
 		eval_iter = iter(eval_dataset)
@@ -1073,11 +809,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 				batch = self._get_next_batch(eval_iter)
 				step_metrics.start_step()
 				loss, metrics = self._execute_eval_step(sharded_state, batch)
-				mean_loss = metrics_tracker.update(
-					loss,
-					float("inf"),
-					current_step,  # Disable accuracy
-				)
+				mean_loss = metrics_tracker.update(loss, float("inf"), current_step)
 				eval_metrics = step_metrics.calculate(
 					loss=loss,
 					metrics=metrics,
@@ -1106,21 +838,16 @@ class ORPOTrainer(BaseTrainer, ABC):
 	def _execute_eval_step(self, state, batch):
 		"""Execute a single eval step."""
 		batch = {key: jnp.asarray(value) for key, value in batch.items()}
-		orpo_out = self.sharded_evaluation_step_function(state, batch)
-		loss = orpo_out.loss
-		metrics = dict(
-			loss=loss,
-			chosen_rewards=orpo_out.chosen_rewards,
-			rejected_rewards=orpo_out.rejected_rewards,
-		)
+		metrics = self.sharded_evaluation_step_function(state, batch)
+		loss = metrics.loss
 		return loss, metrics
 
 	def _execute_train_step(self, batch):
 		"""Execute a single training step."""
 		if self.pruning_module is not None:
 			self.model_state = self.model_state.replace(
-				params=self.pruning_module.pre_forward_update(
-					self.model_state.params,
+				graphstate=self.pruning_module.pre_forward_update(
+					self.model_state.graphstate,
 					self.model_state.opt_state,
 				)
 			)
@@ -1133,12 +860,12 @@ class ORPOTrainer(BaseTrainer, ABC):
 				self.model_state, batch
 			)
 			# Apply post-gradient updates
-			orpo_out: ORPOStepOut = orpo_out
+			orpo_out: LossMetrics = orpo_out
 			metrics = dict(loss=orpo_out.loss, metrics=orpo_out.metrics)
 			if self.pruning_module is not None:
 				self.model_state = self.model_state.replace(
-					params=self.pruning_module.post_gradient_update(
-						self.model_state.params,
+					graphstate=self.pruning_module.post_gradient_update(
+						self.model_state.graphstate,
 						self.model_state.opt_state,
 					)
 				)
@@ -1149,12 +876,6 @@ class ORPOTrainer(BaseTrainer, ABC):
 
 	def _finalize_training(self, output, run_exception):
 		"""Finalize training and prepare output."""
-		if run_exception is None:
-			if self.arguments.merge_lora_rapture_parameters and self.rapture:
-				termcolor.cprint("Merging LoRA Parameters.", color="cyan", force_color=True)
-				output.state = output.state.replace(
-					params=self.rapture.merge_parameters(output.state.params)
-				)
 
 		if self.arguments.do_eval:
 			for _ in self.eval(output.state):
@@ -1164,11 +885,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 
 		return output
 
-	def train(
-		self,
-		model_parameters: Optional[flax.core.FrozenDict] = None,
-		state: Optional[EasyDeLState] = None,
-	) -> ORPOTrainerOutput:
+	def train(self) -> ORPOTrainerOutput:
 		"""
 		Trains the ORPO model.
 
@@ -1176,20 +893,11 @@ class ORPOTrainer(BaseTrainer, ABC):
 		performing training steps, logging metrics, saving checkpoints, handling keyboard
 		interrupts and timeouts, and optionally evaluating the model.
 
-		Args:
-				model_parameters (Optional[flax.core.FrozenDict], optional):
-						Pretrained model parameters for initialization. Defaults to None.
-				state (Optional[EasyDeLState], optional):
-						An existing EasyDeLState to resume training from. Defaults to None.
-
 		Returns:
 				ORPOTrainerOutput: An object containing the trained model state and other training information.
 		"""
 		start_time = time.time()
-		self.model_state, shard_fns, gather_fns = self.initialize_state(
-			model_parameters=model_parameters,
-			state=state,
-		)
+
 		metrics_tracker = MetricsTracker()
 		step_metrics = StepMetrics(self.arguments)
 		# Setup initial metrics and logging
@@ -1198,8 +906,6 @@ class ORPOTrainer(BaseTrainer, ABC):
 			metrics_tracker=metrics_tracker,
 			step_metrics=step_metrics,
 			start_time=start_time,
-			shard_fns=shard_fns,
-			gather_fns=gather_fns,
 		)
 		return self._finalize_training(output, run_exception)
 

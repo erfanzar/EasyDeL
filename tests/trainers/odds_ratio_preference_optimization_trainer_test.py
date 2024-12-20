@@ -10,22 +10,16 @@ sys.path.append(
 		"../..",
 	)
 )
+# import jax
+
+# jax.config.update("jax_platform_name", "cpu")  # CPU Test !
+
+import easydel as ed
+import flax
 import jax
-
-jax.config.update("jax_platform_name", "cpu")  # CPU Test !
-
-import jax.numpy
 from datasets import load_dataset
-from flax.core import FrozenDict
 from jax import numpy as jnp
 from transformers import AutoTokenizer
-
-from easydel import (
-	MistralConfig,
-	MistralForCausalLM,
-	ORPOConfig,
-	ORPOTrainer,
-)
 
 SEQUENCE_LENGTH = 128
 NUM_TRAIN_EXAMPLES = 50
@@ -42,22 +36,24 @@ def orpo_main():
 	#####################
 	with jax.default_device(jax.devices("gpu")[0]):
 		model_name_or_path = "erfanzar/LLamaStory-70M"
-		conf = MistralConfig(
-			hidden_size=128,
+		config = ed.LlamaConfig(
+			head_dim=16,
+			hidden_size=64,
 			num_attention_heads=8,
 			num_key_value_heads=4,
-			num_hidden_layers=4,
-			intermediate_size=256,
-			gradient_checkpointing="",
-			max_position_embeddings=SEQUENCE_LENGTH * 4,
+			num_hidden_layers=1,
+			intermediate_size=128,
+			max_position_embeddings=SEQUENCE_LENGTH * 3,
+			attn_dtype=jnp.float32,
+			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		)
 
-		model = MistralForCausalLM(
-			config=conf,
-			dtype=jnp.float32,
-			param_dtype=jnp.float32,
-			_do_init=True,
-			input_shape=(8, 8),
+		dtype = jnp.float32
+		model = ed.LlamaForCausalLM(
+			config=config,
+			dtype=dtype,
+			param_dtype=dtype,
+			rngs=flax.nnx.Rngs(0),
 		)
 		tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
 
@@ -76,47 +72,29 @@ def orpo_main():
 	################
 	# Training     #
 	################
-	dtype = jnp.float32
-	trainer = ORPOTrainer(
-		max_prompt_length=SEQUENCE_LENGTH,
-		max_length=SEQUENCE_LENGTH * 2,
-		max_completion_length=SEQUENCE_LENGTH * 2,
+	trainer = ed.ORPOTrainer(
+		model=model,
 		train_dataset=train_dataset,
 		tokenizer=tokenizer,
 		dataset_num_proc=4,
-		apply_chat_template=True,
-		arguments=ORPOConfig(
-			model_name="ORPO_TEST",
+		arguments=ed.ORPOConfig(
+			model_name="odds_ratio_preference_optimization_trainer_test",
+			save_directory="tmp-files",
 			num_train_epochs=NUM_TRAIN_EPOCHS,
 			total_batch_size=TOTAL_BATCH_SIZE,
 			gradient_accumulation_steps=2,
-			model_class=type(model),
-			do_train=True,
-			configs_to_initialize_model_class={
-				"config": model.config,
-				"input_shape": (8, 8),
-				"dtype": dtype,
-				"param_dtype": dtype,
-			},
-			dtype=dtype,
-			param_dtype=dtype,
 			track_memory=False,
 			use_wandb=False,
 			learning_rate=5e-4,
 			do_last_save=True,
-			init_input_shape=(8, 8),
+			max_prompt_length=SEQUENCE_LENGTH,
+			max_length=SEQUENCE_LENGTH * 2,
+			max_completion_length=SEQUENCE_LENGTH * 2,
 		),
 	)
 
-	out = trainer.train(  # noqa
-		model_parameters=FrozenDict(
-			{
-				"params": model.shard_model(
-					model.params,
-				),
-			},
-		)
-	)
+	out = trainer.train()
+	print(out)
 
 
 if __name__ == "__main__":
