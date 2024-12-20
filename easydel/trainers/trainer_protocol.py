@@ -549,7 +549,8 @@ class StepMetrics:
 			basic_metrics.update({"chosen_rewards": jnp.mean(metrics.chosen_rewards)})
 		if metrics.rejected_rewards is not None:
 			basic_metrics.update({"rejected_rewards": jnp.mean(metrics.rejected_rewards)})
-
+		if metrics.other_metrics is not None:
+			basic_metrics.update(metrics.other_metrics)
 		if not self.arguments.performance_mode and (mode == "train" or mode is None):
 			detailed_metrics = self._calculate_detailed_metrics(metrics)
 			basic_metrics.update(detailed_metrics)
