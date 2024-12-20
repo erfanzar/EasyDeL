@@ -1,6 +1,8 @@
 import os
 import sys
 
+import flax.nnx
+
 dirname = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(dirname)
 sys.path.append(
@@ -17,21 +19,15 @@ from datasets import Dataset, IterableDataset
 from jax import numpy as jnp
 from jax import random
 
-from easydel import (
-	AttentionMechanisms,
-	EasyDeLOptimizers,
-	EasyDeLSchedulers,
-	FlaxLlamaForSequenceClassification,
-	LlamaConfig,
-	SequenceClassificationTrainer,
-	TrainingArguments,
-)
+import easydel as ed
 
 TOTAL_BATCH_SIZE = 8
 UPPER = 200
 NUM_TRAIN_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
 NUM_EVAL_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
 NUM_TRAIN_EPOCHS = 1
+PROBLEM = "single_label_classification"
+NUM_LABELS = 4
 rng = fjformer.GenerateRNG()
 
 
@@ -40,7 +36,9 @@ def create_sequence_classification_data_generator(
 	vocab_size: int,
 	num_labels: int,
 	problem_type: Literal[
-		"regression", "single_label_classification", "multi_label_classification"
+		"regression",
+		"single_label_classification",
+		"multi_label_classification",
 	] = "single_label_classification",
 	use_iterable_dataset: bool = False,
 	NUM_TRAIN_EXAMPLES: int = 1000,
@@ -62,7 +60,7 @@ def create_sequence_classification_data_generator(
 		if problem_type == "regression":
 			return random.uniform(key, (1,))
 		elif problem_type == "single_label_classification":
-			return random.randint(key, (1,), 0, num_labels - 1, dtype="i4")[0]
+			return random.randint(key, (1,), 0, num_labels - 1, dtype="i4")
 		elif problem_type == "multi_label_classification":
 			return random.choice(key, 2, shape=(num_labels,))
 		else:
@@ -90,7 +88,7 @@ def main(use_iterable_dataset: bool):
 	sequence_length = 1024
 	max_training_steps = NUM_TRAIN_EXAMPLES // TOTAL_BATCH_SIZE * NUM_TRAIN_EPOCHS
 	max_evaluation_steps = NUM_EVAL_EXAMPLES // TOTAL_BATCH_SIZE
-	config = LlamaConfig(
+	config = ed.LlamaConfig(
 		head_dim=128,
 		hidden_size=512,
 		num_attention_heads=8,
@@ -99,60 +97,63 @@ def main(use_iterable_dataset: bool):
 		intermediate_size=1024,
 		max_position_embeddings=sequence_length,
 		attn_dtype=jnp.float32,
-		attn_mechanism=AttentionMechanisms.VANILLA,
-		block_k=64,
-		block_q=64,
-		platform="jax",
+		attn_mechanism=ed.AttentionMechanisms.VANILLA,
 	)
 
 	dtype = jnp.float32
-	model = FlaxLlamaForSequenceClassification(
-		num_labels=4,
+	model = ed.LlamaForSequenceClassification(
+		num_labels=NUM_LABELS,
 		config=config,
-		_do_init=True,
 		dtype=dtype,
 		param_dtype=dtype,
+		rngs=flax.nnx.Rngs(0),
 	)
-	params = model.shard_model(model.params)
+	model = model.shard_model()
 
 	dataset_train, dataset_eval = create_sequence_classification_data_generator(
 		sequence_length=sequence_length,
 		vocab_size=config.vocab_size,
 		NUM_EVAL_EXAMPLES=NUM_EVAL_EXAMPLES,
 		NUM_TRAIN_EXAMPLES=NUM_TRAIN_EXAMPLES,
-		num_labels=4,
+		num_labels=NUM_LABELS,
+		problem_type=PROBLEM,
 	)
-	trainer = SequenceClassificationTrainer(
-		arguments=TrainingArguments(
-			model_name="SC_TEST",
+	trainer = ed.Trainer(
+		arguments=ed.TrainingArguments(
+			save_directory="tmp-files",
+			model_name="sequence_classification_trainers",
 			num_train_epochs=NUM_TRAIN_EPOCHS,
 			total_batch_size=TOTAL_BATCH_SIZE,
 			gradient_accumulation_steps=2,
 			max_training_steps=max_training_steps,
 			max_evaluation_steps=max_evaluation_steps,
 			do_train=True,
-			do_eval=True,
+			do_eval=False,
 			max_sequence_length=sequence_length,
-			dtype=dtype,
-			param_dtype=dtype,
 			track_memory=True,
-			use_wandb=True,
+			use_wandb=False,
 			learning_rate=3e-4,
-			label_smoothing_factor=0.1,
-			train_on_inputs=True,
 			do_last_save=True,
+			save_steps=10,
+			save_total_limit=5,
+			save_optimizer_state=True,
 			training_time="80Min",
-			optimizer=EasyDeLOptimizers.ADAMW,
-			scheduler=EasyDeLSchedulers.COSINE,
+			optimizer=ed.EasyDeLOptimizers.ADAMW,
+			scheduler=ed.EasyDeLSchedulers.COSINE,
 			clip_grad=1.0,
 			warmup_steps=5,
+			loss_config=ed.LossConfig(
+				classification_problem_type=PROBLEM,
+				num_labels=NUM_LABELS,
+			),
 		),
 		model=model,
 		dataset_train=dataset_train,
 		dataset_eval=dataset_eval,
 	)
 
-	trainer.train(model_parameters=flax.core.FrozenDict({"params": params}))
+	output = trainer.train()
+	print(output)
 	exit(0)
 
 

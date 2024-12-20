@@ -15,18 +15,7 @@
 import logging
 import random
 import warnings
-from typing import (
-	Any,
-	Callable,
-	Dict,
-	Iterator,
-	List,
-	Literal,
-	Mapping,
-	Optional,
-	Tuple,
-	Union,
-)
+import typing as tp
 
 import jax
 import numpy as np
@@ -76,7 +65,7 @@ class JaxDistributedConfig(object):
 
 
 # fmt:off
-def create_prompt_creator(tokenizer):
+def create_prompt_creator(processing_class):
 	def to_role_and_content(field):
 		return {
 			"conversation": [
@@ -85,16 +74,16 @@ def create_prompt_creator(tokenizer):
 			]
 		}
 	def _pc(sample):
-		return conversations_formatting_function(tokenizer, messages_field="conversation")(to_role_and_content(sample))
+		return conversations_formatting_function(processing_class, messages_field="conversation")(to_role_and_content(sample))
 	return _pc
 # fmt:on
 
 
 def create_constant_length_dataset(
-	tokenizer,
+	processing_class,
 	dataset,
-	dataset_text_field: Optional[str] = None,
-	formatting_func: Optional[Callable] = None,
+	dataset_text_field: tp.Optional[str] = None,
+	formatting_func: tp.Optional[tp.Callable] = None,
 	infinite: bool = False,
 	seq_length: int = 1024,
 	num_of_sequences: int = 1024,
@@ -103,12 +92,12 @@ def create_constant_length_dataset(
 	shuffle: bool = True,
 	append_concat_token: bool = True,
 	add_special_tokens: bool = True,
-) -> Callable[[], Iterator[Dict[str, jnp.ndarray]]]:
+) -> tp.Callable[[], tp.Iterator[tp.Dict[str, jnp.ndarray]]]:
 	"""
 	Creates a generator function that yields constant length chunks of tokens from a stream of text files.
 
 	Args:
-	    tokenizer: The processor used for processing the data.
+	    processing_class: The processor used for processing the data.
 	    dataset: Dataset with text files.
 	    dataset_text_field: Name of the field in the dataset that contains the text.
 	    formatting_func: Function that formats the text before tokenization.
@@ -116,22 +105,22 @@ def create_constant_length_dataset(
 	    seq_length: Length of token sequences to return.
 	    num_of_sequences: Number of token sequences to keep in buffer.
 	    chars_per_token: Number of characters per token used to estimate number of tokens in text buffer.
-	    eos_token_id: Id of the end of sequence token if the passed tokenizer does not have an EOS token.
+	    eos_token_id: Id of the end of sequence token if the passed processing_class does not have an EOS token.
 	    shuffle: Shuffle the examples before they are returned.
 	    append_concat_token: If true, appends eos_token_id at the end of each sample being packed.
-	    add_special_tokens: If true, tokenizer adds special tokens to each sample being packed.
+	    add_special_tokens: If true, processing_class adds special tokens to each sample being packed.
 
 	Returns:
 	    A generator function that yields dictionaries containing input_ids and attention_mask as jnp.arrays
 	"""
-	if tokenizer.eos_token_id is None:
+	if processing_class.eos_token_id is None:
 		warnings.warn(
-			"The passed tokenizer does not have an EOS token. We will use the passed eos_token_id instead which "
+			"The passed processing_class does not have an EOS token. We will use the passed eos_token_id instead which "
 			f"corresponds to {eos_token_id}. If this is not the correct EOS token, make sure to pass the correct eos_token_id.",
 			stacklevel=1,
 		)
 
-	concat_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id else eos_token_id
+	concat_token_id = processing_class.eos_token_id if processing_class.eos_token_id else eos_token_id
 	max_buffer_size = seq_length * chars_per_token * num_of_sequences
 
 	# Input validation and formatting function setup
@@ -157,7 +146,7 @@ def create_constant_length_dataset(
 			"Either `dataset_text_field` or `formatting_func` should be provided."
 		)
 
-	def constant_length_generator() -> Iterator[Dict[str, jnp.ndarray]]:
+	def constant_length_generator() -> tp.Iterator[tp.Dict[str, jnp.ndarray]]:
 		iterator = iter(dataset)
 		more_examples = True
 
@@ -189,7 +178,7 @@ def create_constant_length_dataset(
 				random.shuffle(buffer)
 
 			# Tokenize all texts in the buffer
-			tokens = tokenizer(
+			tokens = processing_class(
 				buffer,
 				add_special_tokens=add_special_tokens,
 				truncation=False,
@@ -232,7 +221,7 @@ def create_constant_length_dataset(
 	return constant_length_generator
 
 
-def _collate_batch(examples, tokenizer, pad_to_multiple_of: Optional[int] = None):
+def _collate_batch(examples, processing_class, pad_to_multiple_of: tp.Optional[int] = None):
 	if isinstance(examples[0], (list, tuple)):
 		examples = [jnp.array(e, dtype=jnp.int64) for e in examples]
 
@@ -243,10 +232,10 @@ def _collate_batch(examples, tokenizer, pad_to_multiple_of: Optional[int] = None
 	):
 		return jnp.stack(examples, axis=0)
 
-	if tokenizer._pad_token is None:
+	if processing_class._pad_token is None:
 		raise ValueError(
-			"You are attempting to pad samples but the tokenizer you are using"
-			f" ({tokenizer.__class__.__name__}) does not have a pad token."
+			"You are attempting to pad samples but the processing_class you are using"
+			f" ({processing_class.__class__.__name__}) does not have a pad token."
 		)
 
 	max_length = max(len(x) for x in examples)
@@ -254,11 +243,11 @@ def _collate_batch(examples, tokenizer, pad_to_multiple_of: Optional[int] = None
 		max_length = ((max_length // pad_to_multiple_of) + 1) * pad_to_multiple_of
 	result = jnp.full(
 		shape=(len(examples), max_length),
-		fill_value=tokenizer.pad_token_id,
+		fill_value=processing_class.pad_token_id,
 		dtype=examples[0].dtype,
 	)
 	for i, example in enumerate(examples):
-		if tokenizer.padding_side == "right":
+		if processing_class.padding_side == "right":
 			result[i, : example.shape[0]] = example
 		else:
 			result[i, -example.shape[0] :] = example
@@ -270,7 +259,7 @@ def tolist(x):
 	Args:
 	    x:
 
-	Returns: X as List
+	Returns: X as tp.List
 
 	"""
 	if isinstance(x, list):
@@ -288,9 +277,9 @@ class DataCollatorForCompletionOnlyLM:
 
 	def __init__(
 		self,
-		tokenizer: Union[str, "PreTrainedTokenizerBase"],  # type:ignore #noqa
-		response_template: Union[str, List[int]],
-		instruction_template: Optional[Union[str, List[int]]] = None,
+		processing_class: tp.Union[str, "PreTrainedTokenizerBase"],  # type:ignore #noqa
+		response_template: tp.Union[str, tp.List[int]],
+		instruction_template: tp.Optional[tp.Union[str, tp.List[int]]] = None,
 		*args,
 		mlm: bool = False,
 		ignore_index: int = -100,
@@ -298,12 +287,12 @@ class DataCollatorForCompletionOnlyLM:
 	):
 		from transformers import AutoTokenizer
 
-		if isinstance(tokenizer, str):
-			tokenizer = AutoTokenizer.from_pretrained(tokenizer)
-			self.tokenizer = tokenizer
+		if isinstance(processing_class, str):
+			processing_class = AutoTokenizer.from_pretrained(processing_class)
+			self.processing_class = processing_class
 		self.instruction_template = instruction_template
 		if isinstance(instruction_template, str):
-			self.instruction_token_ids = self.tokenizer.encode(
+			self.instruction_token_ids = self.processing_class.encode(
 				self.instruction_template, add_special_tokens=False
 			)
 		else:
@@ -311,7 +300,7 @@ class DataCollatorForCompletionOnlyLM:
 
 		self.response_template = response_template
 		if isinstance(response_template, str):
-			self.response_token_ids = self.tokenizer.encode(
+			self.response_token_ids = self.processing_class.encode(
 				self.response_template, add_special_tokens=False
 			)
 		else:
@@ -320,10 +309,10 @@ class DataCollatorForCompletionOnlyLM:
 		if (
 			not mlm
 			and self.instruction_template
-			and self.tokenizer.pad_token_id == self.tokenizer.eos_token_id
+			and self.processing_class.pad_token_id == self.processing_class.eos_token_id
 		):
 			warnings.warn(
-				"The pad_token_id and eos_token_id values of this tokenizer are identical. "
+				"The pad_token_id and eos_token_id values of this processing_class are identical. "
 				"If you are planning for multi-turn training, "
 				"it can result in the model continuously generating questions and answers without eos token. "
 				"To avoid this, set the pad_token_id to a different value.",
@@ -332,13 +321,13 @@ class DataCollatorForCompletionOnlyLM:
 
 		self.ignore_index = ignore_index
 
-	def _whole_word_mask(self, input_tokens: List[str], max_predictions=512):
+	def _whole_word_mask(self, input_tokens: tp.List[str], max_predictions=512):
 		from transformers import (
 			BertTokenizer,
 			BertTokenizerFast,
 		)
 
-		if not isinstance(self.tokenizer, (BertTokenizer, BertTokenizerFast)):
+		if not isinstance(self.processing_class, (BertTokenizer, BertTokenizerFast)):
 			warnings.warn(
 				"DataCollatorForWholeWordMask is only suitable for BertTokenizer-like tokenizers. "
 				"Please refer to the documentation for more information.",
@@ -383,14 +372,14 @@ class DataCollatorForCompletionOnlyLM:
 		return mask_labels
 
 	def jax_mask_tokens(
-		self, inputs: Any, special_tokens_mask: Optional[Any] = None
-	) -> Tuple[Any, Any]:
+		self, inputs: tp.Any, special_tokens_mask: tp.Optional[tp.Any] = None
+	) -> tp.Tuple[tp.Any, tp.Any]:
 		"""Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original."""
 		labels = np.copy(inputs)
 		probability_matrix = np.full(labels.shape, 0.15)
 		if special_tokens_mask is None:
 			special_tokens_mask = [
-				self.tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True)
+				self.processing_class.get_special_tokens_mask(val, already_has_special_tokens=True)
 				for val in labels.tolist()
 			]
 			special_tokens_mask = np.array(special_tokens_mask, dtype=bool)
@@ -405,7 +394,7 @@ class DataCollatorForCompletionOnlyLM:
 		indices_replaced = (
 			np.random.binomial(1, 0.8, size=labels.shape).astype(bool) & masked_indices
 		)
-		inputs[indices_replaced] = self.tokenizer.mask_token_id
+		inputs[indices_replaced] = self.processing_class.mask_token_id
 		indices_random = (
 			np.random.binomial(1, 0.5, size=labels.shape).astype(bool)
 			& masked_indices
@@ -413,7 +402,7 @@ class DataCollatorForCompletionOnlyLM:
 		)
 		random_words = np.random.randint(
 			low=0,
-			high=len(self.tokenizer),
+			high=len(self.processing_class),
 			size=np.count_nonzero(indices_random),
 			dtype=np.int64,
 		)
@@ -421,9 +410,9 @@ class DataCollatorForCompletionOnlyLM:
 		return inputs, labels
 
 	def jax_call(
-		self, examples: List[Union[List[int], Any, Dict[str, Any]]]
-	) -> Dict[str, Any]:
-		if isinstance(examples[0], Mapping):
+		self, examples: tp.List[tp.Union[tp.List[int], tp.Any, tp.Dict[str, tp.Any]]]
+	) -> tp.Dict[str, tp.Any]:
+		if isinstance(examples[0], tp.Mapping):
 			input_ids = [e["input_ids"] for e in examples]
 		else:
 			input_ids = examples
@@ -431,14 +420,14 @@ class DataCollatorForCompletionOnlyLM:
 
 		batch_input = _collate_batch(
 			input_ids,
-			self.tokenizer,
+			self.processing_class,
 		)
 
 		mask_labels = []
 		for e in examples:
 			ref_tokens = []
 			for ida in tolist(e["input_ids"]):
-				token = self.tokenizer._convert_id_to_token(ida)
+				token = self.processing_class._convert_id_to_token(ida)
 				ref_tokens.append(token)
 
 			# For Chinese tokens, we need extra inf to mark sub-word, e.g [喜,欢]-> [喜，##欢]
@@ -451,14 +440,14 @@ class DataCollatorForCompletionOnlyLM:
 			mask_labels.append(self._whole_word_mask(ref_tokens))
 		batch_mask = _collate_batch(
 			mask_labels,
-			self.tokenizer,
+			self.processing_class,
 		)
 		inputs, labels = self.jax_mask_tokens(batch_input, batch_mask)
 		return {"input_ids": inputs, "labels": labels}
 
 	def __call__(
-		self, examples: List[Union[List[int], Any, Dict[str, Any]]]
-	) -> Dict[str, Any]:
+		self, examples: tp.List[tp.Union[tp.List[int], tp.Any, tp.Dict[str, tp.Any]]]
+	) -> tp.Dict[str, tp.Any]:
 		batch = self.jax_call(examples)
 
 		if self.instruction_template is None:
@@ -475,7 +464,7 @@ class DataCollatorForCompletionOnlyLM:
 				if response_token_ids_start_idx is None:
 					warnings.warn(
 						f"Could not find response key `{self.response_template}` in the "
-						f'following instance: {self.tokenizer.decode(batch["input_ids"][i])} '
+						f'following instance: {self.processing_class.decode(batch["input_ids"][i])} '
 						f"This instance will be ignored in loss calculation. "
 						f"Note, if this happens often, consider increasing the `max_seq_length`.",
 						stacklevel=1,
@@ -506,7 +495,7 @@ class DataCollatorForCompletionOnlyLM:
 				if len(response_token_ids_idxs) == 0:
 					warnings.warn(
 						f"Could not find response key `{self.response_template}` in the "
-						f'following instance: {self.tokenizer.decode(batch["input_ids"][i])} '
+						f'following instance: {self.processing_class.decode(batch["input_ids"][i])} '
 						f"This instance will be ignored in loss calculation. "
 						f"Note, if this happens often, consider increasing the `max_seq_length`.",
 						stacklevel=1,
@@ -524,7 +513,7 @@ class DataCollatorForCompletionOnlyLM:
 				if len(human_token_ids_idxs) == 0:
 					warnings.warn(
 						f"Could not find instruction key `{self.instruction_template}` in the "
-						f'following instance: {self.tokenizer.decode(batch["input_ids"][i])} '
+						f'following instance: {self.processing_class.decode(batch["input_ids"][i])} '
 						f"This instance will be ignored in loss calculation. "
 						f"Note, if this happens often, consider increasing the `max_seq_length`.",
 						stacklevel=1,
@@ -553,11 +542,11 @@ class DataCollatorForCompletionOnlyLM:
 
 
 def conversations_formatting_function(
-	tokenizer: "AutoTokenizer",  # type:ignore #noqa
-	messages_field: Literal["messages", "conversations"],
+	processing_class: "AutoTokenizer",  # type:ignore #noqa
+	messages_field: tp.Literal["messages", "conversations"],
 ):
 	r"""
-	return a callable function that takes in a "messages" dataset and returns a formatted dataset, based on the tokenizer
+	return a callable function that takes in a "messages" dataset and returns a formatted dataset, based on the processing_class
 	apply chat template to the dataset
 	"""
 
@@ -566,18 +555,18 @@ def conversations_formatting_function(
 			output_texts = []
 			for i in range(len(examples[messages_field])):
 				output_texts.append(
-					tokenizer.apply_chat_template(examples[messages_field][i], tokenize=False)
+					processing_class.apply_chat_template(examples[messages_field][i], tokenize=False)
 				)  # type: ignore
 			return output_texts
 		else:
-			return tokenizer.apply_chat_template(examples[messages_field], tokenize=False)  # type: ignore
+			return processing_class.apply_chat_template(examples[messages_field], tokenize=False)  # type: ignore
 
 	return format_dataset
 
 
-def instructions_formatting_function(tokenizer: "AutoTokenizer"):  # type:ignore #noqa
+def instructions_formatting_function(processing_class: "AutoTokenizer"):  # type:ignore #noqa
 	r"""from TRL
-	return a callable function that takes in an "instructions" dataset and returns a formatted dataset, based on the tokenizer
+	return a callable function that takes in an "instructions" dataset and returns a formatted dataset, based on the processing_class
 	apply chat template to the dataset
 	"""
 
@@ -590,7 +579,7 @@ def instructions_formatting_function(tokenizer: "AutoTokenizer"):  # type:ignore
 					{"role": "assistant", "content": examples["completion"][i]},
 				]
 				output_texts.append(
-					tokenizer.apply_chat_template(converted_sample, tokenize=False)
+					processing_class.apply_chat_template(converted_sample, tokenize=False)
 				)  # type: ignore
 			return output_texts
 		else:
@@ -598,15 +587,15 @@ def instructions_formatting_function(tokenizer: "AutoTokenizer"):  # type:ignore
 				{"role": "user", "content": examples["prompt"]},
 				{"role": "assistant", "content": examples["completion"]},
 			]
-			return tokenizer.apply_chat_template(converted_sample, tokenize=False)  # type: ignore
+			return processing_class.apply_chat_template(converted_sample, tokenize=False)  # type: ignore
 
 	return format_dataset
 
 
 def get_formatting_func_from_dataset(
-	dataset: Union["Dataset", "ConstantLengthDataset"],  # type: ignore # noqa
-	tokenizer: "AutoTokenizer",  # type:ignore #noqa
-) -> Optional[Callable]:
+	dataset: tp.Union["Dataset", "ConstantLengthDataset"],  # type: ignore # noqa
+	processing_class: "AutoTokenizer",  # type:ignore #noqa
+) -> tp.Optional[tp.Callable]:
 	from datasets import Dataset, Value
 
 	FORMAT_MAPPING = {
@@ -626,26 +615,26 @@ def get_formatting_func_from_dataset(
 		if "messages" in dataset.features:
 			if dataset.features["messages"] == FORMAT_MAPPING["chatml"]:
 				logging.info("Formatting dataset with chatml format")
-				return conversations_formatting_function(tokenizer, "messages")
+				return conversations_formatting_function(processing_class, "messages")
 		if "conversations" in dataset.features:
 			if dataset.features["conversations"] == FORMAT_MAPPING["chatml"]:
 				logging.info("Formatting dataset with chatml format")
-				return conversations_formatting_function(tokenizer, "conversations")
+				return conversations_formatting_function(processing_class, "conversations")
 		elif dataset.features == FORMAT_MAPPING["instruction"]:
 			logging.info("Formatting dataset with instruction format")
-			return instructions_formatting_function(tokenizer)
+			return instructions_formatting_function(processing_class)
 
 	return None
 
 
 def add_bos_token_if_needed(
-	bos_token_id: Optional[int],
+	bos_token_id: tp.Optional[int],
 	prompt_len_input_ids: int,
-	prompt_tokens: Dict[str, List[int]],
+	prompt_tokens: tp.Dict[str, tp.List[int]],
 	chosen_prompt_len_input_ids: int,
-	chosen_tokens: Dict[str, List[int]],
+	chosen_tokens: tp.Dict[str, tp.List[int]],
 	rejected_prompt_len_input_ids: int,
-	rejected_tokens: Dict[str, List[int]],
+	rejected_tokens: tp.Dict[str, tp.List[int]],
 ):
 	if bos_token_id is not None:
 		if (
@@ -682,8 +671,8 @@ def add_bos_token_if_needed(
 
 def add_eos_token_if_needed(
 	eos_token_id: int,
-	chosen_tokens: Dict[str, List[int]],
-	rejected_tokens: Dict[str, List[int]],
+	chosen_tokens: tp.Dict[str, tp.List[int]],
+	rejected_tokens: tp.Dict[str, tp.List[int]],
 ):
 	if (
 		len(chosen_tokens["input_ids"]) == 0

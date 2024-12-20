@@ -224,22 +224,6 @@ def control_mlp_sharding(x: jax.Array, partition_axis: PartitionAxis):
 	"""
 	this functions is disabled for now, it will cause breakdown and incorrect computation on gpu with CU lower than 7.5
 	"""
-	# batch_size, sequence_length, hidden_size = x.shape
-	# is_gen = sequence_length == 1
-	# mesh = jax.interpreters.pxla.thread_resources.env.physical_mesh
-	# if not mesh.empty:
-	#     partition_spec = PartitionSpec(
-	#         partition_axis.batch_axis,
-	#         None if is_gen else partition_axis.sequence_axis,
-	#         (
-	#             partition_axis.hidden_state_axis
-	#             if (
-	#                     mesh.shape[partition_axis.hidden_state_axis] / hidden_size
-	#             ).is_integer()
-	#             else None
-	#         ),
-	#     )
-	#     x = with_sharding_constraint(x, partition_spec)
 	return x
 
 
@@ -438,3 +422,23 @@ def auto_remat(
 		)
 		outs += (module,)
 	return outs
+
+
+if tp.TYPE_CHECKING:
+	from transformers import (
+		BaseImageProcessor,
+		FeatureExtractionMixin,
+		PreTrainedTokenizerBase,
+		ProcessorMixin,
+	)
+
+	ProcessingClassType = tp.Optional[
+		tp.Union[
+			PreTrainedTokenizerBase,
+			BaseImageProcessor,
+			FeatureExtractionMixin,
+			ProcessorMixin,
+		]
+	]
+else:
+	ProcessingClassType = tp.Any

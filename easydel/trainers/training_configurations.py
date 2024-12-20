@@ -431,7 +431,7 @@ class TrainingArguments:
 						value = np.array(value)
 					summary_writer.histogram(key, value, step)
 			except Exception as e:
-				warnings.warn(f"Failed to log metric {key} to TensorBoard: {e}")
+				warnings.warn(f"Failed to log metric {key} to TensorBoard: {e}", stacklevel=1)
 
 		summary_writer.flush()
 

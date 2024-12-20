@@ -92,13 +92,13 @@ def main():
 			beta=0.1,
 		)
 
-		tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+		processing_class = AutoTokenizer.from_pretrained(model_name_or_path)
 
-		if tokenizer.pad_token is None:
-			tokenizer.pad_token = tokenizer.eos_token
+		if processing_class.pad_token is None:
+			processing_class.pad_token = processing_class.eos_token
 
-		if tokenizer.pad_token_id is None:
-			tokenizer.pad_token_id = tokenizer.eos_token_id
+		if processing_class.pad_token_id is None:
+			processing_class.pad_token_id = processing_class.eos_token_id
 
 		model = LlamaForCausalLM(
 			config=conf,
@@ -118,7 +118,7 @@ def main():
 			ref_model=ref_model,
 			train_dataset=train_dataset,
 			eval_dataset=None,
-			tokenizer=tokenizer,
+			processing_class=processing_class,
 			arguments=arguments,
 		)
 

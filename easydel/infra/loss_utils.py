@@ -654,7 +654,7 @@ def ForCausalLMLoss(
 
 def ForSequenceClassificationLoss(
 	labels: jax.Array,
-	pooled_logits: jax.Array,
+	logits: jax.Array,
 	attention_mask: tp.Optional[jax.Array] = None,
 	config: tp.Optional[LossConfig] = None,
 	batch: tp.Optional[tp.Mapping[str, chex.Array]] = None,
@@ -665,7 +665,7 @@ def ForSequenceClassificationLoss(
 
 	Args:
 	    labels: True labels, shape (batch_size,) or (batch_size, num_labels) for multi label classification.
-	    pooled_logits: Predicted logits, shape (batch_size, num_labels) or (batch_size, 1) or (batch_size,) for regression.
+	    logits: Predicted logits, shape (batch_size, num_labels) or (batch_size, 1) or (batch_size,) for regression.
 	    config: Configuration with problem_type and num_labels attributes.
 	    batch: tp.Optional batch for dynamic loss normalization
 	    **kwargs: Additional keyword arguments for the cross-entropy loss.
@@ -674,7 +674,7 @@ def ForSequenceClassificationLoss(
 	    The computed sequence classification loss.
 	"""
 
-	if pooled_logits is None or labels is None:
+	if logits is None or labels is None:
 		raise ValueError("Logits and labels cannot be None")
 
 	num_labels = config.num_labels
@@ -688,10 +688,10 @@ def ForSequenceClassificationLoss(
 			config.problem_type = "multi_label_classification"
 
 	if config.problem_type == "regression":
-		loss = jnp.mean((pooled_logits.squeeze() - labels.squeeze()) ** 2)
+		loss = jnp.mean((logits.squeeze() - labels.squeeze()) ** 2)
 	elif config.problem_type == "single_label_classification":
 		return fixed_cross_entropy(
-			source=pooled_logits,
+			source=logits,
 			target=labels,
 			attention_mask=attention_mask,
 			config=config,
@@ -701,7 +701,7 @@ def ForSequenceClassificationLoss(
 	elif config.problem_type == "multi_label_classification":
 		loss = jnp.mean(
 			sigmoid_cross_entropy_with_logits(
-				logits=pooled_logits,
+				logits=logits,
 				labels=labels,
 				label_smoothing=config.label_smoothing,
 			)
