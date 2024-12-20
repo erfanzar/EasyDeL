@@ -26,6 +26,7 @@ from tqdm.autonotebook import tqdm
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import get_logger
+from easydel.infra.loss_utils import ForCausalLMLoss
 from easydel.trainers.base_trainer import (
 	BaseTrainer,
 	TrainerConfigureFunctionOutput,
@@ -61,16 +62,21 @@ class Trainer(BaseTrainer):
 		def collate_fn(batch):
 			results = {}
 			for key in batch[0].keys():
-				if truncation_mode == "keep_end":
-					corrected_sequence = [
-						jnp.array(f[key])[..., -max_sequence_length:] for f in batch
-					]
+				if self.model.loss_function.__name__ == "ForCausalLMLoss":
+					if truncation_mode == "keep_end":
+						corrected_sequence = [
+							jnp.array(f[key])[..., -max_sequence_length:] for f in batch
+						]
+					else:
+						corrected_sequence = [
+							jnp.array(f[key])[..., :max_sequence_length] for f in batch
+						]
 				else:
-					corrected_sequence = [
-						jnp.array(f[key])[..., :max_sequence_length] for f in batch
-					]
+					corrected_sequence = [jnp.array(f[key]) for f in batch]
+				
 				results[key] = jnp.stack(corrected_sequence).reshape(
-					-1, corrected_sequence[0].shape[-1]
+					-1,
+					corrected_sequence[0].shape[-1],
 				)
 			return results
 

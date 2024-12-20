@@ -14,19 +14,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List, Optional, Sequence, TypeVar
+import typing as tp
 
-from transformers import PreTrainedTokenizer
+from easydel.infra.utils import ProcessingClassType
 
-DatasetType = TypeVar("DatasetType")
+DatasetType = tp.TypeVar("DatasetType")
 
 
-def is_conversational(example: Dict[str, Any]) -> bool:
+def is_conversational(example: tp.Dict[str, tp.Any]) -> bool:
 	r"""
 	Check if the example is in a conversational format.
 
 	Args:
-	    example (`Dict[str, Any]`):
+	    example (`tp.Dict[str, tp.Any]`):
 	        A single data entry of a dataset. The example can have different keys depending on the
 	        dataset type.
 
@@ -63,8 +63,9 @@ def is_conversational(example: Dict[str, Any]) -> bool:
 
 
 def apply_chat_template(
-	example: Dict[str, List[Dict[str, str]]], tokenizer: PreTrainedTokenizer
-) -> Dict[str, str]:
+	example: tp.Dict[str, tp.List[tp.Dict[str, str]]],
+	processing_class: ProcessingClassType,
+) -> tp.Dict[str, str]:
 	r"""
 	Apply a chat template to a conversational example.
 
@@ -85,36 +86,38 @@ def apply_chat_template(
 
 	# Apply the chat template to the whole conversation
 	if "messages" in example:
-		messages = tokenizer.apply_chat_template(example["messages"], tokenize=False)
+		messages = processing_class.apply_chat_template(example["messages"], tokenize=False)
 
 	# Apply the chat template to the prompt, adding the generation prompt
 	if "prompt" in example:
-		prompt = tokenizer.apply_chat_template(
+		prompt = processing_class.apply_chat_template(
 			example["prompt"], tokenize=False, add_generation_prompt=True
 		)
 
 	# Apply the chat template to the entire prompt + completion
 	if "prompt" in example:  # explicit prompt and prompt-completion case
 		if "chosen" in example:
-			prompt_chosen = tokenizer.apply_chat_template(
+			prompt_chosen = processing_class.apply_chat_template(
 				example["prompt"] + example["chosen"], tokenize=False
 			)
 			chosen = prompt_chosen[len(prompt) :]
 		if "rejected" in example and "prompt" in example:  # explicit prompt
-			prompt_rejected = tokenizer.apply_chat_template(
+			prompt_rejected = processing_class.apply_chat_template(
 				example["prompt"] + example["rejected"], tokenize=False
 			)
 			rejected = prompt_rejected[len(prompt) :]
 		if "completion" in example:
-			prompt_completion = tokenizer.apply_chat_template(
+			prompt_completion = processing_class.apply_chat_template(
 				example["prompt"] + example["completion"], tokenize=False
 			)
 			completion = prompt_completion[len(prompt) :]
 	else:  # implicit prompt case
 		if "chosen" in example:
-			chosen = tokenizer.apply_chat_template(example["chosen"], tokenize=False)
+			chosen = processing_class.apply_chat_template(example["chosen"], tokenize=False)
 		if "rejected" in example:
-			rejected = tokenizer.apply_chat_template(example["rejected"], tokenize=False)
+			rejected = processing_class.apply_chat_template(
+				example["rejected"], tokenize=False
+			)
 
 	# Ensure that the prompt is the initial part of the prompt-completion string
 	if "prompt" in example:
@@ -149,14 +152,14 @@ def apply_chat_template(
 
 
 def maybe_apply_chat_template(
-	example: Dict[str, List[Dict[str, str]]],
-	tokenizer: PreTrainedTokenizer,
-) -> Dict[str, str]:
+	example: tp.Dict[str, tp.List[tp.Dict[str, str]]],
+	processing_class: ProcessingClassType,
+) -> tp.Dict[str, str]:
 	r"""
 	If the example is in a conversational format, apply a chat template to it.
 
 	Args:
-	    example (`Dict[str, List[Dict[str, str]]`):
+	    example (`tp.Dict[str, tp.List[tp.Dict[str, str]]`):
 	        Dictionary representing a single data entry of a conversational dataset. Each data entry can have different
 	        keys depending on the dataset type. The supported dataset types are:
 
@@ -170,11 +173,11 @@ def maybe_apply_chat_template(
 	        For keys `"messages"`, `"prompt"`, `"chosen"`, `"rejected"`, and `"completion"`, the values are lists of
 	        messages, where each message is a dictionary with keys `"role"` and `"content"`.
 
-	    tokenizer (`PreTrainedTokenizer`):
-	        The tokenizer to apply the chat template with.
+	    processing_class (`ProcessingClassType`):
+	        The processing_class to apply the chat template with.
 
 	Returns:
-	    `Dict[str, str]`: The formatted example with the chat template applied.
+	    `tp.Dict[str, str]`: The formatted example with the chat template applied.
 
 	Note:
 	    This function does not alter the keys, except for Language modeling dataset, where `"messages"` is replaced by
@@ -183,24 +186,26 @@ def maybe_apply_chat_template(
 	Example:
 
 	>>> from transformers import AutoTokenizer
-	>>> tokenizer = AutoTokenizer.from_pretrained("microsoft/Phi-3-mini-128k-instruct")
+	>>> processing_class = AutoTokenizer.from_pretrained(
+	...   "microsoft/Phi-3-mini-128k-instruct"
+	... )
 	>>> example = {
 	...   "prompt": [{"role": "user", "content": "What color is the sky?"}],
 	...   "completion": [{"role": "assistant", "content": "It is blue."}],
 	... }
-	>>> apply_chat_template(example, tokenizer)
+	>>> apply_chat_template(example, processing_class)
 	{'prompt': '<|user|>\nWhat color is the sky?<|end|>\n<|assistant|>\n', 'completion': 'It is blue.<|end|>\n<|endoftext|>'}
 
 	"""
 	if is_conversational(example):
-		return apply_chat_template(example, tokenizer)
+		return apply_chat_template(example, processing_class)
 	else:
 		return example
 
 
 def _unpair_row(
-	examples: List[Dict[str, List[Dict[str, str]]]],
-) -> List[Dict[str, List[Dict[str, str]]]]:
+	examples: tp.List[tp.Dict[str, tp.List[tp.Dict[str, str]]]],
+) -> tp.List[tp.Dict[str, tp.List[tp.Dict[str, str]]]]:
 	batch_size = len(examples["chosen"])
 	new_rows = {
 		"completion": examples["chosen"] + examples["rejected"],
@@ -212,7 +217,7 @@ def _unpair_row(
 
 
 def unpair_preference_dataset(
-	dataset: DatasetType, num_proc: Optional[int] = None
+	dataset: DatasetType, num_proc: tp.Optional[int] = None
 ) -> DatasetType:
 	r"""
 	Unpair a preference dataset.
@@ -221,7 +226,7 @@ def unpair_preference_dataset(
 	    dataset (`Dataset` or `DatasetDict`):
 	        Preference dataset to unpair. The dataset must have columns `"chosen"`, `"rejected"` and optionally
 	        `"prompt"`.
-	    num_proc (`Optional[int]`, *optional*, defaults to `None`):
+	    num_proc (`tp.Optional[int]`, *optional*, defaults to `None`):
 	        Number of processes to use for processing the dataset.
 
 	Returns:
@@ -247,12 +252,15 @@ def unpair_preference_dataset(
 
 	"""
 	return dataset.map(
-		_unpair_row, batched=True, remove_columns=["chosen", "rejected"], num_proc=num_proc
+		_unpair_row,
+		batched=True,
+		remove_columns=["chosen", "rejected"],
+		num_proc=num_proc,
 	)
 
 
 def maybe_unpair_preference_dataset(
-	dataset: DatasetType, num_proc: Optional[int] = None
+	dataset: DatasetType, num_proc: tp.Optional[int] = None
 ) -> DatasetType:
 	r"""
 	Unpair a preference dataset if it is paired.
@@ -261,7 +269,7 @@ def maybe_unpair_preference_dataset(
 	    dataset (`Dataset` or `DatasetDict`):
 	        Preference dataset to unpair. The dataset must have columns `"chosen"`, `"rejected"` and optionally
 	        `"prompt"`.
-	    num_proc (`Optional[int]`, *optional*, defaults to `None`):
+	    num_proc (`tp.Optional[int]`, *optional*, defaults to `None`):
 	        Number of processes to use for processing the dataset.
 
 	Returns:
@@ -298,7 +306,7 @@ def maybe_unpair_preference_dataset(
 		return dataset
 
 
-def extract_prompt(example: Dict[str, Sequence]) -> Dict[str, Sequence]:
+def extract_prompt(example: tp.Dict[str, tp.Sequence]) -> tp.Dict[str, tp.Sequence]:
 	r"""
 	Extracts the shared prompt from a preference data example, where the prompt is implicit within both
 	the chosen and rejected completions.
@@ -318,7 +326,7 @@ def extract_prompt(example: Dict[str, Sequence]) -> Dict[str, Sequence]:
 	}
 
 
-def maybe_extract_prompt(example: Dict[str, List]) -> Dict[str, List]:
+def maybe_extract_prompt(example: tp.Dict[str, tp.List]) -> tp.Dict[str, tp.List]:
 	r"""
 	Extracts the shared prompt from a preference data example, where the prompt is implicit within both
 	the chosen and rejected completions.
@@ -329,12 +337,12 @@ def maybe_extract_prompt(example: Dict[str, List]) -> Dict[str, List]:
 	"rejected" completions.
 
 	Args:
-	    example (`Dict[str, List]`):
+	    example (`tp.Dict[str, tp.List]`):
 	        A dictionary representing a single data entry in the preference dataset. It must contain the keys
 	        `"chosen"` and `"rejected"`, where each value is either conversational or standard (`str`).
 
 	Returns:
-	    `Dict[str, List]`: A dictionary containing:
+	    `tp.Dict[str, tp.List]`: A dictionary containing:
 	        - `"prompt"`: The longest common prefix between the "chosen" and "rejected" completions.
 	        - `"chosen"`: The remainder of the "chosen" completion, with the prompt removed.
 	        - `"rejected"`: The remainder of the "rejected" completion, with the prompt removed.

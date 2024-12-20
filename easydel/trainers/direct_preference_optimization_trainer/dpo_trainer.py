@@ -29,7 +29,6 @@ from jax import numpy as jnp
 from jax.experimental import sparse
 from jax.sharding import PartitionSpec
 from tqdm.autonotebook import tqdm
-from transformers import PreTrainedTokenizerBase
 
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLTimerError
@@ -59,6 +58,7 @@ from easydel.trainers.prompt_utils import (
 	maybe_extract_prompt,
 )
 from easydel.trainers.trainer_protocol import MetricsTracker, StepMetrics
+from easydel.infra.utils import ProcessingClassType
 
 if tp.TYPE_CHECKING:
 	from datasets import Dataset
@@ -75,49 +75,6 @@ class DPOTrainer(BaseTrainer, ABC):
 	This trainer handles the training, evaluation, and checkpointing of language models
 	using the DPO algorithm. It supports sharding, gradient accumulation, mixed precision
 	training, LoRA, and precomputed reference model log probabilities.
-
-	Attributes:
-			arguments (DPOConfig): The dpo training config.
-			state (EasyDeLState): The EasyDeLState object for the model being trained.
-			ref_model (tp.Optional[EasyDeLState]): The EasyDeLState object for the reference model (if used).
-			beta (float): The strength of the regularization term in the DPO loss.
-			label_smoothing (float): The amount of label smoothing to apply.
-			loss_type (Literal["sigmoid", "hinge", "ipo", "exo_pair", "nca_pair", "robust", "bco_pair", "sppo_hard", "aot", "aot_pair", "apo_zero", "apo_down"]): The type of loss function to use.
-			label_pad_token_id (int): The ID of the padding token for labels.
-			padding_value (int): The padding value for input sequences.
-			train_dataset (tp.Optional[Dataset]): The training dataset.
-			eval_dataset (tp.Optional[Union[Dataset, tp.Dict[str, Dataset]]]): The evaluation dataset.
-			tokenizer (tp.Optional[PreTrainedTokenizerBase]): The tokenizer used for preprocessing.
-			data_collator (tp.Optional[tp.Callable]): The data collator used for batching.
-			max_length (tp.Optional[int]): The maximum sequence length.
-			max_prompt_length (tp.Optional[int]): The maximum prompt length.
-			max_completion_length (tp.Optional[int]): The maximum target length.
-			precompute_ref_log_probs (bool): Whether to precompute reference model log probabilities.
-			reference_free (bool): Whether to use a reference-free DPO variant.
-			is_encoder_decoder (bool): Whether the model is an encoder-decoder architecture.
-			dataset_map_arguments (tp.Optional[dict]): Arguments to pass to the dataset `map` function for tokenization.
-			low_mem_usage (bool): Whether to prioritize low memory usage during training.
-			auto_fix_data (bool): Whether to automatically fix data issues.
-			_do_init_fns (bool): Whether to automatically initialize trainer functions.
-
-	Methods:
-			initialize_trainer_utils(self): Initializes trainer utilities (logging, timer, dataloaders, model, etc.).
-			configure_dataloaders(self) -> TrainerConfigureDataloaderOutput: Configures the dataloaders for training and evaluation.
-			configure_model(self) -> TrainerConfigureModelOutput: Configures the model, optimizer, scheduler, and configuration.
-			configure_functions(self) -> TrainerConfigureFunctionOutput: Configures and JIT-compiles the training and evaluation step functions.
-
-			shard_states(self, state: EasyDeLState, rules: tp.Any) -> EasyDeLState: Shards the provided state according to the given rules.
-			create_collect_function(self, max_sequence_length: int, truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end") -> tp.Callable:
-					Creates a data collection function for batching.
-			_get_train_dataloader(self) -> tensorflow.data.Dataset: Creates the training dataloader.
-			_get_eval_dataloader(self, eval_dataset: tp.Optional[Dataset] = None) -> tensorflow.data.Dataset: Creates the evaluation dataloader.
-			get_train_dataloader(self) -> tensorflow.data.Dataset: Returns the training dataloader, potentially with precomputed reference log probabilities.
-			get_eval_dataloader(self, eval_dataset: tp.Optional[Dataset] = None) -> tensorflow.data.Dataset: Returns the evaluation dataloader, potentially with precomputed reference log probabilities.
-			compute_reference_log_probs(self, state: EasyDeLState, padded_batch: tp.Dict) -> tuple[tp.Any, tp.Any]: Computes log probabilities for the chosen and rejected responses using the reference model.
-			_save_state(self, state: EasyDeLState, gather_fns: tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]], milestone: bool = False) -> str:
-					Saves the model state to a checkpoint file.
-			train(self) -> DPOTrainerOutput: Trains the DPO model and returns the training output.
-			eval(self, state: EasyDeLState) -> Iterator[dict]: Evaluates the DPO model and yields evaluation metrics.
 	"""
 
 	def __init__(
@@ -125,7 +82,7 @@ class DPOTrainer(BaseTrainer, ABC):
 		arguments: DPOConfig,
 		model: EasyDeLBaseModule,
 		ref_model: tp.Optional[tp.Union[EasyDeLBaseModule, EasyDeLState]] = None,
-		tokenizer: tp.Optional[PreTrainedTokenizerBase] = None,
+		processing_class: tp.Optional[ProcessingClassType] = None,
 		train_dataset: tp.Optional[Dataset] = None,
 		eval_dataset: tp.Optional[Dataset] = None,
 		data_collator: tp.Optional[tp.Callable] = None,
@@ -143,12 +100,12 @@ class DPOTrainer(BaseTrainer, ABC):
 		), f"arguments type must be `DPOConfig` but got {type(arguments)}"
 
 		assert (
-			tokenizer is not None
-		), "tokenizer must be specified to tokenize a DPO dataset."
+			processing_class is not None
+		), "processing_class must be specified to tokenize a DPO dataset."
 		self.arguments = arguments
 		self.auto_fix_data = auto_fix_data
 		self.truncation_mode = arguments.truncation_mode
-		self.tokenizer = tokenizer
+		self.processing_class = processing_class
 		self.is_encoder_decoder = False
 		self._precomputed_train_ref_log_probs = False
 		self._precomputed_eval_ref_log_probs = False
@@ -157,13 +114,13 @@ class DPOTrainer(BaseTrainer, ABC):
 		arguments.padding_value = (
 			arguments.padding_value
 			if arguments.padding_value is not None
-			else tokenizer.pad_token_id
+			else processing_class.pad_token_id
 		)
 		data_collator = (
 			DPODataCollatorWithPadding(
 				max_prompt_length=arguments.max_prompt_length,
 				max_completion_length=arguments.max_completion_length,  # type: ignore
-				pad_token_id=tokenizer.pad_token_id,  # type: ignore
+				pad_token_id=processing_class.pad_token_id,  # type: ignore
 				label_pad_token_id=arguments.label_pad_token_id,
 				is_encoder_decoder=arguments.is_encoder_decoder,
 			)
@@ -175,7 +132,7 @@ class DPOTrainer(BaseTrainer, ABC):
 		if dataset_map_arguments is None:
 			dataset_map_arguments = {}
 
-		processing_class = tokenizer
+		processing_class = processing_class
 
 		if train_dataset[-1].get("chosen", None) is None:
 			warnings.warn(
@@ -202,7 +159,7 @@ class DPOTrainer(BaseTrainer, ABC):
 		)
 		train_dataset = train_dataset.map(
 			maybe_apply_chat_template,
-			fn_kwargs={"tokenizer": processing_class},
+			fn_kwargs={"processing_class": processing_class},
 			num_proc=arguments.dataset_num_proc,
 			desc="Apply Chat Template",
 		)
@@ -214,12 +171,12 @@ class DPOTrainer(BaseTrainer, ABC):
 			)
 			eval_dataset = eval_dataset.map(
 				maybe_apply_chat_template,
-				fn_kwargs={"tokenizer": processing_class},
+				fn_kwargs={"processing_class": processing_class},
 				num_proc=arguments.dataset_num_proc,
 				desc="Eval - Apply Chat Template",
 			)
 		fn_kwargs = {
-			"tokenizer": self.tokenizer,
+			"processing_class": self.processing_class,
 			"processor": None,
 		}
 		_tokenize = build_tokenize(
@@ -251,7 +208,7 @@ class DPOTrainer(BaseTrainer, ABC):
 		self.data_collator = data_collator
 		self.train_dataset = train_dataset
 		self.eval_dataset = eval_dataset
-		self.tokenizer = tokenizer
+		self.processing_class = processing_class
 		if not isinstance(ref_model, EasyDeLState):
 			ref_model = ref_model.to_state()
 		self.ref_model = ref_model

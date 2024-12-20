@@ -1,12 +1,18 @@
 from __future__ import annotations
+import typing as tp
+
+if tp.TYPE_CHECKING:
+	from datasets import Dataset
+else:
+	Dataset = tp.Any
 
 
 def pack_sequences(
-	dataset: "datasets.Dataset",  # noqa #type:ignore
-	max_length=512,
-	pad_token_id=0,
-	reset_position_ids=False,
-	num_proc=None,
+	dataset: Dataset,
+	max_length: int = 512,
+	pad_token_id: int = 0,
+	reset_position_ids: bool = False,
+	num_proc: tp.Optional[int] = None,
 ):
 	"""
 	Pack sequences together with their attention masks and position IDs

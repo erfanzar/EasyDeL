@@ -618,6 +618,7 @@ class LlamaForSequenceClassification(EasyDeLBaseModule):
 			use_bias=False,
 			kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
 			precision=self.precision,
+			rngs=rngs,
 		)
 
 	def __call__(

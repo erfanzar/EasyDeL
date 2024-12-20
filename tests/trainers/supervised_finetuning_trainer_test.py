@@ -37,7 +37,7 @@ def main():
 		attn_mechanism=ed.AttentionMechanisms.VANILLA,
 	)
 
-	tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
+	processing_class = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
 
 	train_dataset = load_dataset("LDJnr/Pure-Dove", split="train[:5%]")
 	dtype = jnp.float32
@@ -49,7 +49,7 @@ def main():
 	)
 	model = model.shard_model()
 
-	prompter = create_prompt_creator(tokenizer)
+	prompter = create_prompt_creator(processing_class)
 	trainer = ed.SFTTrainer(
 		arguments=ed.TrainingArguments(
 			save_directory="tmp-files",
@@ -75,7 +75,7 @@ def main():
 		),
 		model=model,
 		train_dataset=train_dataset,
-		tokenizer=tokenizer,
+		processing_class=processing_class,
 		formatting_func=prompter,
 		packing=True,
 		num_of_sequences=sequence_length,

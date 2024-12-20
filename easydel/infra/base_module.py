@@ -364,10 +364,10 @@ class EasyDeLBaseModule(
 		batch.pop("return_dict", None)
 		outputs = self(**batch, return_dict=True)
 		loss_output: LossMetrics = self.loss_function(
-			logits=outputs.logits,
 			labels=labels,
-			loss_config=loss_config,
+			config=loss_config,
 			**loss_kwargs,
+			**outputs,
 		)
 		if hasattr(outputs, "aux_loss"):
 			if outputs.aux_loss is not None:

@@ -16,16 +16,15 @@ import inspect
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-
+import typing as tp
 import chex
 import jax
 from jax import numpy as jnp
-from transformers import PreTrainedTokenizerBase
 
 from easydel.modules import EasyDeLBaseModule
 from easydel.trainers.direct_preference_optimization_trainer.dpo_config import DPOConfig
 from easydel.trainers.utils import add_bos_token_if_needed, add_eos_token_if_needed
+from easydel.infra.utils import ProcessingClassType
 
 
 @dataclass
@@ -35,7 +34,7 @@ class DPODataCollatorWithPadding:
 	Args:
 			pad_token_id: int: The tokenizers pad_token_id.
 			label_pad_token_id: int: The label used for masking.
-			is_encoder_decoder: Optional[bool]: Whether you model has an
+			is_encoder_decoder: tp.Optional[bool]: Whether you model has an
 					encoder_decoder architecture
 	"""
 
@@ -43,11 +42,11 @@ class DPODataCollatorWithPadding:
 	max_completion_length: int
 	pad_token_id: int = 0
 	label_pad_token_id: int = -100
-	is_encoder_decoder: Optional[bool] = False
-	ids_to_pop_from_dataset: Optional[dict] = None
+	is_encoder_decoder: tp.Optional[bool] = False
+	ids_to_pop_from_dataset: tp.Optional[dict] = None
 	auto_fix_data: bool = True
 
-	def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+	def __call__(self, features: tp.List[tp.Dict[str, tp.Any]]) -> tp.Dict[str, tp.Any]:
 		padded_batch = {}
 		for k in features[0].keys():
 			if (
@@ -138,7 +137,10 @@ class DPODataCollatorWithPadding:
 
 
 def pad_to_length(
-	tensor: chex.Array, length: int, pad_value: Union[int, float], axis: int = -1
+	tensor: chex.Array,
+	length: int,
+	pad_value: tp.Union[int, float],
+	axis: int = -1,
 ) -> chex.Array:
 	if tensor.shape[axis] >= length:
 		if tensor.ndim == 2:
@@ -205,16 +207,16 @@ def leave_alone_context_manager():
 
 
 def build_tokenize(
-	model: Optional[EasyDeLBaseModule] = None,
-	args: Optional[DPOConfig] = None,
+	model: tp.Optional[EasyDeLBaseModule] = None,
+	args: tp.Optional[DPOConfig] = None,
 ):
 	def _tokenize(
-		features: Dict[str, List],
-		tokenizer: PreTrainedTokenizerBase,
-		processor: Optional[Callable] = None,
-	) -> Dict[str, List]:
+		features: tp.Dict[str, tp.List],
+		processing_class: ProcessingClassType,
+		processor: tp.Optional[tp.Callable] = None,
+	) -> tp.Dict[str, tp.List]:
 		"""
-		Tokenizes and processes a batch of input features using the provided tokenizer and processor.
+		Tokenizes and processes a batch of input features using the provided processing_class and processor.
 		"""
 		batch = defaultdict(list)
 
@@ -225,21 +227,21 @@ def build_tokenize(
 			prompt_tokens = _process_prompt(
 				prompt,
 				processor,
-				tokenizer,
+				processing_class,
 				images,
 			)
 			chosen_tokens = _process_answer(
 				prompt,
 				features["chosen"],
 				processor,
-				tokenizer,
+				processing_class,
 				images,
 			)
 			rejected_tokens = _process_answer(
 				prompt,
 				features["rejected"],
 				processor,
-				tokenizer,
+				processing_class,
 				images,
 			)
 
@@ -250,7 +252,7 @@ def build_tokenize(
 			)
 
 			prompt_tokens, chosen_tokens, rejected_tokens = _add_special_tokens(
-				tokenizer,
+				processing_class,
 				prompt_len_input_ids,
 				prompt_tokens,
 				chosen_tokens,
@@ -265,7 +267,7 @@ def build_tokenize(
 		else:
 			_tokenize_encoder_decoder(
 				batch,
-				tokenizer,
+				processing_class,
 				features["prompt"],
 				features["chosen"],
 				features["rejected"],
@@ -278,11 +280,11 @@ def build_tokenize(
 
 
 def _process_prompt(
-	prompts: List[str],
-	processor: Optional[Callable],
-	tokenizer: PreTrainedTokenizerBase,
-	images: List[Optional[Any]],
-) -> List[Dict[str, List[int]]]:
+	prompts: tp.List[str],
+	processor: tp.Optional[tp.Callable],
+	processing_class: ProcessingClassType,
+	images: tp.List[tp.Optional[tp.Any]],
+) -> tp.List[tp.Dict[str, tp.List[int]]]:
 	"""
 	Processes a list of prompts by tokenizing them, optionally using a processor for additional processing.
 	"""
@@ -301,34 +303,36 @@ def _process_prompt(
 				tokens["attention_mask"] = tokens["attention_mask"].tolist()
 			prompt_tokens.append(tokens)
 	else:
-		prompt_tokens = [tokenizer(prompt, add_special_tokens=False) for prompt in prompts]
+		prompt_tokens = [
+			processing_class(prompt, add_special_tokens=False) for prompt in prompts
+		]
 	return [{f"prompt_{k}": v for k, v in tokens.items()} for tokens in prompt_tokens]
 
 
 def _process_answer(
-	prompts: List[str],
-	answers: List[str],
-	processor: Optional[Callable],
-	tokenizer: PreTrainedTokenizerBase,
-	images: List[Optional[Any]],
-) -> List[Dict[str, Any]]:
+	prompts: tp.List[str],
+	answers: tp.List[str],
+	processor: tp.Optional[tp.Callable],
+	processing_class: ProcessingClassType,
+	images: tp.List[tp.Optional[tp.Any]],
+) -> tp.List[tp.Dict[str, tp.Any]]:
 	return [
 		_build_tokenized_answer(
 			prompt,
 			answer,
 			image,
 			processor=processor,
-			tokenizer=tokenizer,
+			processing_class=processing_class,
 		)
 		for prompt, answer, image in zip(prompts, answers, images)
 	]
 
 
 def _adjust_prompt_length(
-	prompt_tokens: List[Dict[str, List[int]]],
-	chosen_tokens: List[Dict[str, List[int]]],
-	rejected_tokens: List[Dict[str, List[int]]],
-) -> List[int]:
+	prompt_tokens: tp.List[tp.Dict[str, tp.List[int]]],
+	chosen_tokens: tp.List[tp.Dict[str, tp.List[int]]],
+	rejected_tokens: tp.List[tp.Dict[str, tp.List[int]]],
+) -> tp.List[int]:
 	prompt_len_input_ids = []
 	for p_tokens, c_tokens, r_tokens in zip(
 		prompt_tokens, chosen_tokens, rejected_tokens
@@ -349,24 +353,26 @@ def _adjust_prompt_length(
 		num_diff_len = abs(c_len - r_len)
 		if num_diff_tokens > 1 or num_diff_len > 1:
 			raise ValueError(
-				"Chosen and rejected prompt_input_ids might only differ on the last token due to tokenizer merge ops."
+				"Chosen and rejected prompt_input_ids might only differ on the last token due to processing_class merge ops."
 			)
 		prompt_len_input_ids.append(min_len)
 	return prompt_len_input_ids
 
 
 def _add_special_tokens(
-	tokenizer: PreTrainedTokenizerBase,
-	prompt_len_input_ids: List[int],
-	prompt_tokens: List[Dict[str, List[int]]],
-	chosen_tokens: List[Dict[str, List[int]]],
-	rejected_tokens: List[Dict[str, List[int]]],
-) -> Tuple[
-	List[Dict[str, List[int]]], List[Dict[str, List[int]]], List[Dict[str, List[int]]]
+	processing_class: ProcessingClassType,
+	prompt_len_input_ids: tp.List[int],
+	prompt_tokens: tp.List[tp.Dict[str, tp.List[int]]],
+	chosen_tokens: tp.List[tp.Dict[str, tp.List[int]]],
+	rejected_tokens: tp.List[tp.Dict[str, tp.List[int]]],
+) -> tp.Tuple[
+	tp.List[tp.Dict[str, tp.List[int]]],
+	tp.List[tp.Dict[str, tp.List[int]]],
+	tp.List[tp.Dict[str, tp.List[int]]],
 ]:
 	for i in range(len(prompt_tokens)):
 		prompt_tokens[i], chosen_tokens[i], rejected_tokens[i] = add_bos_token_if_needed(
-			tokenizer.bos_token_id,
+			processing_class.bos_token_id,
 			prompt_len_input_ids[i],
 			prompt_tokens[i],
 			len(chosen_tokens[i]["prompt_input_ids"]),
@@ -376,15 +382,15 @@ def _add_special_tokens(
 		)
 
 		chosen_tokens[i], rejected_tokens[i] = add_eos_token_if_needed(
-			tokenizer.eos_token_id, chosen_tokens[i], rejected_tokens[i]
+			processing_class.eos_token_id, chosen_tokens[i], rejected_tokens[i]
 		)
 	return prompt_tokens, chosen_tokens, rejected_tokens
 
 
 def _truncate_tokens(
-	chosen_tokens: List[Dict[str, List[int]]],
-	rejected_tokens: List[Dict[str, List[int]]],
-	prompt_tokens: List[Dict[str, List[int]]],
+	chosen_tokens: tp.List[tp.Dict[str, tp.List[int]]],
+	rejected_tokens: tp.List[tp.Dict[str, tp.List[int]]],
+	prompt_tokens: tp.List[tp.Dict[str, tp.List[int]]],
 	args: DPOConfig,
 ) -> None:
 	"""
@@ -423,8 +429,8 @@ def _truncate_tokens(
 
 
 def _build_sequence_tokens(
-	batch: Dict[str, List[int]],
-	tokens: List[Dict[str, List[int]]],
+	batch: tp.Dict[str, tp.List[int]],
+	tokens: tp.List[tp.Dict[str, tp.List[int]]],
 	args: DPOConfig,
 	prefix: str,
 ) -> None:
@@ -448,8 +454,8 @@ def _build_sequence_tokens(
 
 
 def _append_prompt_tokens_to_batch(
-	batch: Dict[str, List[int]],
-	prompt_tokens: List[Dict[str, List[int]]],
+	batch: tp.Dict[str, tp.List[int]],
+	prompt_tokens: tp.List[tp.Dict[str, tp.List[int]]],
 	args: DPOConfig,
 ) -> None:
 	for p_tokens in prompt_tokens:
@@ -464,28 +470,28 @@ def _append_prompt_tokens_to_batch(
 
 
 def _tokenize_encoder_decoder(
-	batch: Dict[str, List[int]],
-	tokenizer: PreTrainedTokenizerBase,
-	prompt: List[str],
-	chosen: List[str],
-	rejected: List[str],
+	batch: tp.Dict[str, tp.List[int]],
+	processing_class: ProcessingClassType,
+	prompt: tp.List[str],
+	chosen: tp.List[str],
+	rejected: tp.List[str],
 	args: DPOConfig,
 ) -> None:
-	chosen_tokens = tokenizer(
+	chosen_tokens = processing_class(
 		chosen,
 		truncation=True,
 		max_length=args.max_completion_length,
 		padding="max_lenght",
 		add_special_tokens=True,
 	)
-	rejected_tokens = tokenizer(
+	rejected_tokens = processing_class(
 		rejected,
 		truncation=True,
 		max_length=args.max_completion_length,
 		padding="max_lenght",
 		add_special_tokens=True,
 	)
-	prompt_tokens = tokenizer(
+	prompt_tokens = processing_class(
 		prompt,
 		truncation=True,
 		max_length=args.max_prompt_length,
@@ -501,10 +507,10 @@ def _tokenize_encoder_decoder(
 def _build_tokenized_answer(
 	prompt: str,
 	answer: str,
-	images: Optional[List[Any]] = None,
-	processor: Optional[Callable] = None,
-	tokenizer: Optional[PreTrainedTokenizerBase] = None,
-) -> Dict[str, Any]:
+	images: tp.Optional[tp.List[tp.Any]] = None,
+	processor: tp.Optional[tp.Callable] = None,
+	processing_class: tp.Optional[ProcessingClassType] = None,
+) -> tp.Dict[str, tp.Any]:
 	"""
 	Build tokenized response, handling vision models and different tokenizers.
 	"""
@@ -522,7 +528,7 @@ def _build_tokenized_answer(
 				tokenized["input_ids"] = tokenized["input_ids"].tolist()
 				tokenized["attention_mask"] = tokenized["attention_mask"].tolist()
 		else:
-			tokenized = tokenizer(text, add_special_tokens=False)
+			tokenized = processing_class(text, add_special_tokens=False)
 		return tokenized
 
 	full_tokenized = tokenize(prompt + answer, images)

@@ -24,12 +24,12 @@ from easydel.trainers.utils import (
 	create_constant_length_dataset,
 	get_formatting_func_from_dataset,
 )
+from easydel.infra.utils import ProcessingClassType
 
 if tp.TYPE_CHECKING:
-	from transformers import PreTrainedTokenizerBase
 	from datasets import Dataset
 else:
-	Dataset, PreTrainedTokenizerBase = tp.Any, tp.Any
+	Dataset = tp.Any
 logger = get_logger(__name__)
 
 
@@ -44,7 +44,7 @@ class SFTTrainer(Trainer, ABC):
 	def __init__(
 		self,
 		arguments: TrainingArguments,
-		tokenizer: PreTrainedTokenizerBase,
+		processing_class: ProcessingClassType,
 		model: tp.Optional[EasyDeLBaseModule] = None,
 		train_dataset: tp.Optional[Dataset] = None,
 		eval_dataset: tp.Optional[tp.Union[Dataset, tp.Dict[str, Dataset]]] = None,
@@ -62,8 +62,8 @@ class SFTTrainer(Trainer, ABC):
 		remove_unused_columns=True,
 		_do_init_fns: bool = True,
 	):
-		if getattr(tokenizer, "pad_token", None) is None:
-			tokenizer.pad_token = tokenizer.eos_token
+		if getattr(processing_class, "pad_token", None) is None:
+			processing_class.pad_token = processing_class.eos_token
 
 		self.dataset_num_proc = dataset_num_proc
 		self.dataset_batch_size = dataset_batch_size
@@ -81,7 +81,9 @@ class SFTTrainer(Trainer, ABC):
 			self.neftune_noise_alpha = neftune_noise_alpha
 
 		if formatting_func is None and dataset_text_field is None:
-			formatting_func = get_formatting_func_from_dataset(train_dataset, tokenizer)  # type: ignore
+			formatting_func = get_formatting_func_from_dataset(
+				train_dataset, processing_class
+			)  # type: ignore
 
 		if not packing:
 			if dataset_text_field is None and formatting_func is None:
@@ -95,7 +97,7 @@ class SFTTrainer(Trainer, ABC):
 		if train_dataset is not None:
 			train_dataset = self._prepare_dataset(
 				train_dataset,
-				tokenizer,
+				processing_class,
 				packing,
 				dataset_text_field,
 				arguments.max_sequence_length,
@@ -114,7 +116,7 @@ class SFTTrainer(Trainer, ABC):
 			for _eval_dataset_name, _eval_dataset in _eval_datasets.items():
 				_eval_datasets[_eval_dataset_name] = self._prepare_dataset(
 					_eval_dataset,
-					tokenizer,
+					processing_class,
 					eval_packing,
 					dataset_text_field,
 					arguments.max_sequence_length,
@@ -126,11 +128,14 @@ class SFTTrainer(Trainer, ABC):
 				)
 			if not _multiple:
 				eval_dataset = _eval_datasets["singleton"]
-		if tokenizer.padding_side is not None and tokenizer.padding_side != "right":
+		if (
+			processing_class.padding_side is not None
+			and processing_class.padding_side != "right"
+		):
 			warnings.warn(
-				"You passed a tokenizer with `padding_side` not equal to `right` to the SFTTrainer. This might lead "
+				"You passed a processing_class with `padding_side` not equal to `right` to the SFTTrainer. This might lead "
 				"to some unexpected behaviour due to overflow issues when training a model in half-precision. "
-				"You might consider adding `tokenizer.padding_side = 'right'` to your code.",
+				"You might consider adding `processing_class.padding_side = 'right'` to your code.",
 				stacklevel=1,
 			)
 
@@ -205,7 +210,7 @@ class SFTTrainer(Trainer, ABC):
 	def _prepare_dataset(
 		self,
 		dataset,
-		tokenizer,
+		processing_class,
 		packing,
 		dataset_text_field,
 		max_seq_length,
@@ -221,7 +226,7 @@ class SFTTrainer(Trainer, ABC):
 
 		Args:
 		    dataset (Dataset): The dataset to prepare.
-		    tokenizer (PreTrainedTokenizerBase): The tokenizer to use.
+		    processing_class (ProcessingClassType): The processing_class to use.
 		    packing (bool): Whether to pack multiple sequences into a single sample.
 		    dataset_text_field (str): The name of the text field in the dataset.
 		    max_seq_length (int): The maximum sequence length.
@@ -243,7 +248,7 @@ class SFTTrainer(Trainer, ABC):
 
 		if not packing:
 			return self._prepare_non_packed_dataloader(
-				tokenizer,
+				processing_class,
 				dataset,
 				dataset_text_field,
 				max_seq_length,
@@ -254,7 +259,7 @@ class SFTTrainer(Trainer, ABC):
 
 		else:
 			return self._prepare_packed_dataloader(
-				tokenizer,
+				processing_class,
 				dataset,
 				dataset_text_field,
 				max_seq_length,
@@ -267,7 +272,7 @@ class SFTTrainer(Trainer, ABC):
 
 	def _prepare_non_packed_dataloader(
 		self,
-		tokenizer,
+		processing_class,
 		dataset,
 		dataset_text_field,
 		max_seq_length,
@@ -283,7 +288,7 @@ class SFTTrainer(Trainer, ABC):
 		a single sequence.
 
 		Args:
-		    tokenizer: The tokenizer to use for text encoding.
+		    processing_class: The processing_class to use for text encoding.
 		    dataset (Dataset): The dataset to prepare.
 		    dataset_text_field (str): The name of the text field in the dataset.
 		    max_seq_length (int): The maximum sequence length.
@@ -304,7 +309,7 @@ class SFTTrainer(Trainer, ABC):
 				if not use_formatting_func
 				else formatting_func(element)
 			)
-			outputs = tokenizer(
+			outputs = processing_class(
 				inner,
 				add_special_tokens=add_special_tokens,
 				truncation=True,
@@ -354,7 +359,7 @@ class SFTTrainer(Trainer, ABC):
 
 	@staticmethod
 	def _prepare_packed_dataloader(
-		tokenizer,
+		processing_class,
 		dataset,
 		dataset_text_field,
 		max_seq_length,
@@ -372,7 +377,7 @@ class SFTTrainer(Trainer, ABC):
 		for handling long sequences and optimizing GPU/TPU utilization.
 
 		Args:
-		    tokenizer: The tokenizer used for text encoding.
+		    processing_class: The processing_class used for text encoding.
 		    dataset (Dataset): The dataset to prepare.
 		    dataset_text_field (str): The name of the text field in the dataset.
 		    max_seq_length (int): The maximum length of each packed sequence.
@@ -395,13 +400,13 @@ class SFTTrainer(Trainer, ABC):
 		        an error during dataset packing.
 		"""
 		if dataset_text_field is not None or formatting_func is not None:
-			if tokenizer is None:
+			if processing_class is None:
 				raise ValueError(
-					"You need to pass a tokenizer when using `dataset_text_field` with `SFTTrainer`."
+					"You need to pass a processing_class when using `dataset_text_field` with `SFTTrainer`."
 				)
 
 			constant_length_iterator = create_constant_length_dataset(
-				tokenizer=tokenizer,
+				processing_class=processing_class,
 				dataset=dataset,
 				dataset_text_field=dataset_text_field,
 				formatting_func=formatting_func,
@@ -409,7 +414,7 @@ class SFTTrainer(Trainer, ABC):
 				infinite=False,
 				num_of_sequences=num_of_sequences,
 				chars_per_token=chars_per_token,
-				eos_token_id=tokenizer.eos_token_id,
+				eos_token_id=processing_class.eos_token_id,
 				append_concat_token=append_concat_token,
 				add_special_tokens=add_special_tokens,
 			)
