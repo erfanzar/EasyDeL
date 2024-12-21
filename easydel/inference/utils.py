@@ -225,14 +225,6 @@ def compile_function(
 class SampleState:
 	"""
 	Data class representing the state of the sampling process.
-
-	Attributes:
-	    current_length: Current length of the generated sequence.
-	    sequences: Generated token sequences.
-	    running_token: The last generated token for each sequence.
-	    is_sequence_finished: Boolean array indicating finished sequences.
-	    prng_key: JAX PRNG key for random sampling.
-	    model_kwargs: Keyword arguments passed to the model.
 	"""
 
 	current_length: Union[jax.Array, sharding.NamedSharding]

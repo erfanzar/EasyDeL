@@ -29,7 +29,11 @@ from easydel.infra.utils import (
 	ACT2FN,
 	auto_remat,
 )
-from easydel.layers.caching.mamba2_cache import Mamba2Cache, Mamba2CacheView
+from easydel.layers.caching.mamba2_cache import (
+	Mamba2Cache,
+	Mamba2CacheMetaData,
+	Mamba2CacheView,
+)
 from easydel.layers.norms import RMSNorm as FlaxMamba2RMSNorm
 from easydel.modules.mamba2.mamba2_configuration import Mamba2Config as Mamba2Config
 
@@ -629,7 +633,7 @@ class Mamba2Block(nn.Module):
 			rngs=rngs,
 		)
 		block = Mamba2Mixer
-		block = auto_remat(
+		(block,) = auto_remat(
 			block,
 			policy=config.gradient_checkpointing,
 		)
@@ -755,9 +759,6 @@ class Mamba2Model(EasyDeLBaseModule):
 			if output_hidden_states:
 				all_hidden_states = all_hidden_states + (hidden_states,)
 
-		# if use_cache:
-		# 	cache_params.seqlen_offset += inputs_embeds.shape[1]
-
 		hidden_states = self.norm_f(hidden_states)
 
 		if output_hidden_states:
@@ -850,3 +851,60 @@ class Mamba2ForCausalLM(EasyDeLBaseModule):
 			cache_params=mamba_outputs.cache_params,
 			hidden_states=mamba_outputs.hidden_states,
 		)
+
+	def init_cache(self, batch_size: int, max_length: int):
+		return Mamba2Cache.init_layers_cache(
+			metadata=Mamba2CacheMetaData(
+				batch_size=batch_size,
+				intermediate_size=int(self.config.expand * self.config.hidden_size),
+				conv_kernel_size=self.config.conv_kernel,
+				head_dim=self.config.head_dim,
+				n_groups=self.config.n_groups,
+				state_size=self.config.state_size,
+				num_heads=self.config.num_heads,
+			),
+			dtype=self.dtype,
+			num_hidden_layers=self.config.num_hidden_layers,
+		)
+
+	def prepare_inputs_for_generation(
+		self,
+		input_ids,
+		inputs_embeds=None,
+		cache_params: tp.Optional[Mamba2Cache] = None,
+		cache_position: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		**kwargs,
+	):
+		if inputs_embeds is not None:
+			past_len = inputs_embeds.shape[1] + input_ids.shape[1]
+		else:
+			past_len = input_ids.shape[1]
+		if cache_params is None:
+			cache_params = self.init_cache(input_ids.shape[0], 0)
+		if attention_mask.shape[1] < past_len:
+			extended_mask = jnp.ones(
+				(
+					attention_mask.shape[0],
+					past_len - attention_mask.shape[1],
+				),
+				"i4",
+			)
+			attention_mask = jnp.concatenate([attention_mask, extended_mask], axis=1)
+		model_inputs = {}
+		if inputs_embeds is not None and cache_params is None:
+			model_inputs.update({"inputs_embeds": inputs_embeds})
+
+		model_inputs.update(
+			{
+				"attention_mask": attention_mask,
+				"cache_params": cache_params,
+				"cache_position": cache_position,
+			}
+		)
+		return model_inputs
+
+	def update_inputs_for_generation(self, model_outputs, model_kwargs):
+		model_outputs.cache_params.update_seq(1)
+		model_kwargs["cache_params"] = model_outputs.cache_params
+		return model_kwargs

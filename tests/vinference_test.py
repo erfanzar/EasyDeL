@@ -31,9 +31,10 @@ threading.Thread(target=log_mem)  # .start()
 
 def main():
 	sharding_axis_dims = (1, 1, 1, -1)
-	max_length = 4096
+	max_length = 2048
 
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
+	# pretrained_model_name_or_path = "AntonV/mamba2-370m-hf"
 	dtype = jnp.float16
 	partition_axis = ed.PartitionAxis()
 
