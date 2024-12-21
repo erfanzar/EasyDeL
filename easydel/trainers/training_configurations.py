@@ -22,10 +22,12 @@ from dataclasses import dataclass, field
 import typing as tp
 
 
+import flax.traverse_util
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import PartitionSpec
+import optax
 
 
 from easydel.etils.errors import EasyDeLTimerError
@@ -72,7 +74,7 @@ class TrainingArguments:
 	clip_grad: tp.Optional[float] = None
 	weight_decay: float = 0.01
 	loss_config: tp.Optional[LossConfig] = None
-
+	frozen_parameters: tp.Optional[str] = None
 	max_sequence_length: tp.Optional[int] = 4096
 	is_fine_tuning: bool = True
 	do_train: bool = True
@@ -236,7 +238,8 @@ class TrainingArguments:
 		from easydel.etils.auto_tx import get_optimizer_and_scheduler
 
 		self.optimizer_kwargs["steps"] = steps or self.optimizer_kwargs["steps"]
-		return get_optimizer_and_scheduler(**self.optimizer_kwargs)
+		tx, sc = get_optimizer_and_scheduler(**self.optimizer_kwargs)
+		return tx, sc
 
 	def get_streaming_checkpointer(self):
 		"""
