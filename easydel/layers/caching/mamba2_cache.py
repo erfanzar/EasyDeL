@@ -64,6 +64,7 @@ class Mamba2CacheView:
 	conv_states: tp.Union[cx.Array, ImplicitArray]
 	ssm_states: tp.Union[cx.Array, ImplicitArray]
 	positions: cx.Array
+	seqlen_offset: int
 	metadata: Mamba2CacheMetaData
 	layer_index: tp.Optional[int] = None
 
@@ -75,15 +76,12 @@ class Mamba2CacheView:
 		dtype: jnp.dtype,
 		layer_index: tp.Optional[int] = None,
 	):
-		expanded_size = (
-			metadata.intermediate_size + 2 * metadata.n_groups * metadata.state_size
-		)
 		return cls(
 			conv_states=with_sharding_constraint(
 				x=jnp.zeros(
 					shape=(
 						metadata.batch_size,
-						expanded_size,
+						metadata.intermediate_size + 2 * metadata.n_groups * metadata.state_size,
 						metadata.conv_kernel_size,
 					),
 					dtype=dtype,
@@ -105,6 +103,7 @@ class Mamba2CacheView:
 			positions=jnp.zeros((metadata.batch_size,), "i4"),
 			metadata=metadata,
 			layer_index=layer_index,
+			seqlen_offset=0,
 		)
 
 	def update_conv_state(
@@ -235,6 +234,12 @@ class Mamba2Cache:
 	@classmethod
 	def init_empty(cls, num_hidden_layers):
 		return cls(views=[None for _ in range(num_hidden_layers)])
+
+	def update_seq(self, num):
+		for view in self.views:
+			if view is not None:
+				view.positions += num
+				view.seqlen_offset += num
 
 	def __repr__(self):
 		return (
