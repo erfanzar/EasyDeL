@@ -13,8 +13,7 @@
 # limitations under the License.
 
 import time
-import typing
-from typing import Callable
+import typing as tp
 
 import jax
 from fjformer.sharding import match_partition_rules
@@ -26,7 +25,7 @@ from tqdm.autonotebook import tqdm
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import get_logger
-from easydel.infra.loss_utils import ForCausalLMLoss
+from easydel.infra.loss_utils import LossMetrics
 from easydel.trainers.base_trainer import (
 	BaseTrainer,
 	TrainerConfigureFunctionOutput,
@@ -42,8 +41,8 @@ class Trainer(BaseTrainer):
 	def create_collect_function(
 		self,
 		max_sequence_length: int,
-		truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
-	) -> Callable:
+		truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
+	) -> tp.Callable:
 		"""
 		Creates a function to collect and process batches of data for training or evaluation.
 
@@ -73,7 +72,7 @@ class Trainer(BaseTrainer):
 						]
 				else:
 					corrected_sequence = [jnp.array(f[key]) for f in batch]
-				
+
 				results[key] = jnp.stack(corrected_sequence).reshape(
 					-1,
 					corrected_sequence[0].shape[-1],
@@ -202,13 +201,13 @@ class Trainer(BaseTrainer):
 		current_step = int(jax.device_get(state.step))
 		with self.mesh:
 			for eval_metrics in self._eval_epoch(
-				state,
-				self.dataloader_eval,
-				current_step,
-				metrics_tracker,
-				step_metrics,
-				pbar,
-				start_time,
+				state=state,
+				eval_dataset=self.dataloader_eval,
+				current_step=current_step,
+				metrics_tracker=metrics_tracker,
+				step_metrics=step_metrics,
+				pbar=pbar,
+				start_time=start_time,
 			):
 				yield eval_metrics
 
@@ -236,8 +235,7 @@ class Trainer(BaseTrainer):
 
 			# Execute training step
 			state, loss, metrics, run_exception = self._execute_train_step(
-				state=state,
-				batch=batch,
+				state=state, batch=batch
 			)
 			# Update and log metrics
 			try:
@@ -277,6 +275,9 @@ class Trainer(BaseTrainer):
 						milestone=True,
 						save_directory=self.arguments.save_directory,
 					)
+				if self._should_run_evaluation(current_step):
+					for _ in self.eval(model_state=state):
+						...
 
 				current_step += 1
 			except (KeyboardInterrupt, EasyDeLTimerError):
@@ -303,7 +304,9 @@ class Trainer(BaseTrainer):
 				step_metrics.start_step()
 				loss, metrics = self._execute_eval_step(state, batch)
 				mean_loss, mean_accuracy = metrics_tracker.update(
-					loss, metrics["accuracy"], current_step
+					loss,
+					metrics.accuracy,
+					current_step,
 				)
 				eval_metrics = step_metrics.calculate(
 					loss=loss,
@@ -330,10 +333,10 @@ class Trainer(BaseTrainer):
 			except (KeyboardInterrupt, EasyDeLTimerError) as _:
 				break
 
-	def _execute_eval_step(self, state, batch):
+	def _execute_eval_step(self, state, batch) -> tp.Tuple[float, LossMetrics]:
 		"""Execute a single eval step."""
-		loss, accuracy, aux_loss = self.sharded_evaluation_step_function(state, batch)
-		return loss, dict(loss=loss, accuracy=accuracy, aux_loss=aux_loss)
+		metrics = self.sharded_evaluation_step_function(state, batch)
+		return metrics.loss, metrics
 
 	def _execute_train_step(self, state, batch):
 		"""Execute a single training step."""
@@ -387,7 +390,7 @@ class Trainer(BaseTrainer):
 		)
 		return self._finalize_training(output, run_exception)
 
-	def eval(self, model_state: EasyDeLState) -> typing.Iterator[dict]:
+	def eval(self, model_state: EasyDeLState) -> tp.Iterator[dict]:
 		"""
 		Evaluates the Causal Language Model (CLM) using the provided model state.
 

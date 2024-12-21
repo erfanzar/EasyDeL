@@ -19,15 +19,8 @@ from pathlib import Path
 import re
 import warnings
 from dataclasses import dataclass, field
-from typing import (
-	Any,
-	Dict,
-	List,
-	Literal,
-	Optional,
-	Tuple,
-	Union,
-)
+import typing as tp
+
 
 import jax
 import jax.numpy as jnp
@@ -60,64 +53,64 @@ logger = get_logger(__name__)
 
 
 # Constants
-AVAILABLE_BACKENDS: List[str] = ["cpu", "gpu", "tpu", None]
+AVAILABLE_BACKENDS: tp.List[str] = ["cpu", "gpu", "tpu", None]
 
 
 @dataclass
 class TrainingArguments:
-	model_name: str = "Model"
+	model_name: str = "EasyDeL-Model"
 	num_train_epochs: int = 10
 	total_batch_size: int = 32
-	eval_batch_size: int = 64
-	max_training_steps: Optional[int] = None
-	max_evaluation_steps: Optional[int] = None
+	eval_batch_size: tp.Optional[int] = None
+	max_training_steps: tp.Optional[int] = None
+	max_evaluation_steps: tp.Optional[int] = None
 	optimizer: AVAILABLE_OPTIMIZERS = EasyDeLOptimizers.ADAMW
 	scheduler: AVAILABLE_SCHEDULERS = EasyDeLSchedulers.NONE
 	learning_rate: float = 5e-5
-	learning_rate_end: Optional[float] = None
+	learning_rate_end: tp.Optional[float] = None
 	gradient_accumulation_steps: int = 1
-	clip_grad: Optional[float] = None
+	clip_grad: tp.Optional[float] = None
 	weight_decay: float = 0.01
-	loss_config: Optional[LossConfig] = None
+	loss_config: tp.Optional[LossConfig] = None
 
-	max_sequence_length: Optional[int] = 4096
+	max_sequence_length: tp.Optional[int] = 4096
 	is_fine_tuning: bool = True
 	do_train: bool = True
 	do_eval: bool = False
 	train_on_inputs: bool = True
-	backend: Optional[str] = None
+	backend: tp.Optional[str] = None
 	extra_optimizer_kwargs: dict = field(default_factory=dict)
-	save_steps: Optional[int] = None
+	evaluation_steps: tp.Optional[int] = None
+	save_steps: tp.Optional[int] = None
 	save_directory: str = "EasyDeL-Checkpoints"
-	save_total_limit: Optional[int] = None
+	save_total_limit: tp.Optional[int] = None
 	use_wandb: bool = True
-	ids_to_pop_from_dataset: Optional[list] = field(default_factory=list)
+	ids_to_pop_from_dataset: tp.Optional[list] = field(default_factory=list)
 	remove_ckpt_after_load: bool = False
 	do_last_save: bool = True
-	model_parameters: Optional[dict] = None
-	track_memory: Optional[bool] = None
+	model_parameters: tp.Optional[dict] = None
+	track_memory: tp.Optional[bool] = None
 
-	truncation_mode: Literal["keep_end", "keep_start"] = "keep_end"
+	truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end"
 	warmup_steps: int = 500
 	step_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp")
-	training_time: Optional[str] = None
-	dataloader_num_workers: Optional[int] = 0
-	dataloader_pin_memory: Optional[bool] = False
-	jax_distributed_config: Optional[dict] = None
+	training_time: tp.Optional[str] = None
+	dataloader_num_workers: tp.Optional[int] = 0
+	dataloader_pin_memory: tp.Optional[bool] = False
+	jax_distributed_config: tp.Optional[dict] = None
 	log_all_workers: bool = False
-	wandb_entity: Optional[str] = None
+	wandb_entity: tp.Optional[str] = None
 	save_optimizer_state: bool = False
-	step_start_point: Optional[int] = None
+	step_start_point: tp.Optional[int] = None
 	verbose: bool = True
 	offload_device: jax.Device = jax.devices("cpu")[0]
 	pruning_module: AVAILABLE_PRUNING_TYPE = None
 	sparsify_module: bool = False
 	sparse_module_type: AVAILABLE_SPARSE_MODULE_TYPES = "bcoo"
-	state_apply_fn_kwarguments_to_model: Optional[dict] = None
+	state_apply_fn_kwarguments_to_model: tp.Optional[dict] = None
 	remove_unused_columns: bool = True
 	force_batch_and_gradient_accumulation_steps_calculation: bool = False
 	performance_mode: bool = False
-	neftune_noise_alpha: Optional[float] = None
 	log_grad_norms: bool = True
 
 	def __post_init__(self):
@@ -141,9 +134,6 @@ class TrainingArguments:
 			raise ValueError(
 				f"Backend {self.backend} is not recognized. Available backends: {AVAILABLE_BACKENDS}"
 			)
-
-		if self.neftune_noise_alpha is not None and self.neftune_noise_alpha <= 0:
-			raise ValueError("NEFTune noise alpha must be positive")
 
 	def _setup_distributed(self):
 		"""
@@ -191,6 +181,11 @@ class TrainingArguments:
 		Checks and sets up variables for start.
 		"""
 		self.step_start_point = self.step_start_point or 0
+		self.eval_batch_size = (
+			self.eval_batch_size
+			if self.eval_batch_size is not None
+			else self.total_batch_size
+		)
 
 	@staticmethod
 	def _time_to_seconds(time_str: str) -> int:
@@ -227,12 +222,12 @@ class TrainingArguments:
 		path = self.get_path()
 		path.mkdir(parents=True, exist_ok=True)
 
-	def get_optimizer_and_scheduler(self, steps: Optional[int] = None):
+	def get_optimizer_and_scheduler(self, steps: tp.Optional[int] = None):
 		"""
 		Returns the configured optimizer and learning rate scheduler.
 
 		Args:
-		    steps (Optional[int]): The number of training steps.
+		    steps (tp.Optional[int]): The number of training steps.
 		        If not provided, uses the value from `self.optimizer_kwargs`.
 
 		Returns:
@@ -281,7 +276,7 @@ class TrainingArguments:
 		Initializes Weights & Biases for experiment tracking if enabled.
 
 		Returns:
-		    Optional[wandb.sdk.wandb_run.Run]: The WandB run object if initialized, else None.
+		    tp.Optional[wandb.sdk.wandb_run.Run]: The WandB run object if initialized, else None.
 		"""
 		if not self.use_wandb or wandb is None:
 			warnings.warn(
@@ -308,12 +303,12 @@ class TrainingArguments:
 
 	def log_metrics(
 		self,
-		metrics: Dict[
+		metrics: tp.Dict[
 			str,
-			Union[
+			tp.Union[
 				float,
-				List,
-				Tuple,
+				tp.List,
+				tp.Tuple,
 				np.ndarray,
 				"jnp.ndarray",
 				"torch.Tensor",  # type: ignore # noqa: F821
@@ -325,7 +320,7 @@ class TrainingArguments:
 		Logs training metrics to Weights & Biases and/or TensorBoard.
 
 		Args:
-		    metrics (Dict[str, Union[float, List, Tuple, np.ndarray, 'jnp.ndarray', 'torch.Tensor']]):
+		    metrics (tp.Dict[str, tp.Union[float, tp.List, tp.Tuple, np.ndarray, 'jnp.ndarray', 'torch.Tensor']]):
 		        A dictionary where keys are metric names and values are metric values.
 		    step (int): The current training step or iteration.
 		"""
@@ -400,7 +395,7 @@ class TrainingArguments:
 		    - Scalar values (float, int) are logged using summary_writer.scalar().
 		    - Lists, tuples, numpy arrays, JAX arrays, and PyTorch tensors are logged as histograms.
 		    - JAX arrays and PyTorch tensors are converted to numpy arrays before logging.
-		    - Any exceptions during logging are caught and warned about, allowing the process to continue.
+		    - tp.Any exceptions during logging are caught and warned about, allowing the process to continue.
 		    - The summary writer is flushed after logging all metrics.
 		"""
 
@@ -450,7 +445,7 @@ class TrainingArguments:
 		Notes:
 		    - Non-numpy array inputs are converted to numpy arrays.
 		    - float16 and bfloat16 dtypes are converted to float32 to avoid potential issues.
-		    - Any exceptions during histogram creation are caught and logged, returning None in such cases.
+		    - tp.Any exceptions during histogram creation are caught and logged, returning None in such cases.
 		"""
 		try:
 			# Convert to numpy array if it's not already
@@ -466,22 +461,22 @@ class TrainingArguments:
 			(f"Failed to create wandb histogram: {e}")
 			return None
 
-	def to_dict(self) -> Dict[str, Any]:
+	def to_dict(self) -> tp.Dict[str, tp.Any]:
 		"""
 		Converts the TrainingArguments object into a dictionary.
 
 		Returns:
-		    Dict[str, Any]: A dictionary representation of the TrainingArguments.
+		    tp.Dict[str, tp.Any]: A dictionary representation of the TrainingArguments.
 		"""
 		return {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
 
 	@classmethod
-	def from_dict(cls, config: Dict[str, Any]) -> "TrainingArguments":
+	def from_dict(cls, config: tp.Dict[str, tp.Any]) -> "TrainingArguments":
 		"""
 		Creates a TrainingArguments instance from a dictionary.
 
 		Args:
-		    config (Dict[str, Any]): The configuration dictionary.
+		    config (tp.Dict[str, tp.Any]): The configuration dictionary.
 
 		Returns:
 		    TrainingArguments: A TrainingArguments object initialized with values from the dictionary.
@@ -498,12 +493,12 @@ class TrainingArguments:
 		return self._pretty_print(self.to_dict())
 
 	@staticmethod
-	def _pretty_print(d: Dict[str, Any], indent: int = 0) -> str:
+	def _pretty_print(d: tp.Dict[str, tp.Any], indent: int = 0) -> str:
 		"""
 		Helper function for pretty-printing a dictionary.
 
 		Args:
-		    d (Dict[str, Any]): The dictionary to pretty-print.
+		    d (tp.Dict[str, tp.Any]): The dictionary to pretty-print.
 		    indent (int): The indentation level.
 
 		Returns:

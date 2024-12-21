@@ -14,16 +14,13 @@
 
 from __future__ import annotations
 
-import os
 import time
-import typing
 import typing as tp
 import warnings
 from abc import ABC
 from collections import defaultdict
 
 import jax
-import termcolor
 from fjformer.sharding import make_shard_and_gather_fns, match_partition_rules
 from jax import numpy as jnp
 from jax.experimental import sparse
@@ -34,6 +31,7 @@ from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import get_logger
 from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.utils import ProcessingClassType
 from easydel.trainers.base_trainer import (
 	BaseTrainer,
 	TrainerConfigureDataloaderOutput,
@@ -58,7 +56,6 @@ from easydel.trainers.prompt_utils import (
 	maybe_extract_prompt,
 )
 from easydel.trainers.trainer_protocol import MetricsTracker, StepMetrics
-from easydel.infra.utils import ProcessingClassType
 
 if tp.TYPE_CHECKING:
 	from datasets import Dataset
@@ -437,7 +434,7 @@ class DPOTrainer(BaseTrainer, ABC):
 					mesh=self.mesh,
 				),
 			),
-			out_shardings=(spec_named_sharding, empty_sharding),
+			out_shardings=empty_sharding,
 		)
 
 		self.arguments.ensure_checkpoint_path()
@@ -457,7 +454,7 @@ class DPOTrainer(BaseTrainer, ABC):
 	def create_collect_function(
 		self,
 		max_sequence_length: int,
-		truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
+		truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
 	) -> tp.Callable:
 		"""
 		Creates a data collection function for batching.
@@ -466,7 +463,7 @@ class DPOTrainer(BaseTrainer, ABC):
 
 		Args:
 				max_sequence_length (int): The maximum sequence length (not used in this implementation).
-				truncation_mode (typing.Literal["keep_end", "keep_start"], optional):
+				truncation_mode (tp.Literal["keep_end", "keep_start"], optional):
 						The truncation mode (not used in this implementation). Defaults to "keep_end".
 
 		Returns:
@@ -703,48 +700,6 @@ class DPOTrainer(BaseTrainer, ABC):
 
 		return reference_chosen_log_probs, reference_rejected_log_probs
 
-	def _save_state(
-		self,
-		state: EasyDeLState,
-		gather_fns: tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]],
-		milestone: bool = False,
-	) -> str:
-		"""
-		Saves the model state to a checkpoint file.
-
-		This method constructs the checkpoint file name, prints a message indicating the save operation,
-		and uses the `save_state` method of the `EasyDeLState` object to save the state to disk.
-
-		Args:
-				state (EasyDeLState): The EasyDeLState object to be saved.
-				gather_fns (tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]]):
-						Gather functions used to collect sharded data before saving.
-				milestone (bool, optional): Whether this save is a milestone (e.g., end of epoch). Defaults to False.
-
-		Returns:
-				str: The filename of the saved checkpoint.
-		"""
-		step = (
-			int(jax.device_get(state.step)) + self.arguments.step_start_point
-			if self.arguments.step_start_point is not None
-			else int(jax.device_get(state.step))
-		)
-		checkpoint_name = f"{self.arguments.model_name}-S{step}"
-		filename = f"{checkpoint_name}_{step}" if milestone else f"{checkpoint_name}"
-		filename += ".easy"
-		termcolor.cprint(f"Saving Model {filename}.", color="red", force_color=True)
-		state.save_state(
-			filename=filename,
-			checkpoint_dir=os.path.join(
-				self.arguments.save_directory, self.arguments.model_name
-			),
-			gather_fns=gather_fns,
-			float_dtype=self.dtype,
-			verbose=self.arguments.verbose,
-			save_optimizer=self.arguments.save_optimizer_state,
-		)
-		return filename
-
 	def _run_training_loop(
 		self,
 		metrics_tracker: MetricsTracker,
@@ -865,7 +820,9 @@ class DPOTrainer(BaseTrainer, ABC):
 						gather_fns=gather_fns,
 						milestone=True,
 					)
-
+				if self._should_run_evaluation(current_step):
+					for _ in self.eval(model_state=self.state):
+						...
 				current_step += 1
 			except (KeyboardInterrupt, EasyDeLTimerError):
 				return current_step, run_exception
@@ -890,6 +847,7 @@ class DPOTrainer(BaseTrainer, ABC):
 				batch = self._get_next_batch(eval_iter)
 				step_metrics.start_step()
 				metrics = self._execute_eval_step(sharded_state, batch)
+
 				loss = metrics.loss
 				mean_loss = metrics_tracker.update(loss, float("inf"), current_step)
 				eval_metrics = step_metrics.calculate(
@@ -920,14 +878,9 @@ class DPOTrainer(BaseTrainer, ABC):
 	def _execute_eval_step(self, state, batch):
 		"""Execute a single eval step."""
 		batch = {key: jnp.asarray(value) for key, value in batch.items()}
-		dpo_out = self.sharded_evaluation_step_function(state, batch)
-		loss = dpo_out.loss
-		metrics = dict(
-			loss=loss,
-			chosen_rewards=dpo_out.chosen_rewards,
-			rejected_rewards=dpo_out.rejected_rewards,
-		)
-		return loss, metrics
+
+		metrics = self.sharded_evaluation_step_function(state, batch)
+		return metrics
 
 	def _execute_train_step(self, batch):
 		"""Execute a single training step."""
@@ -992,7 +945,7 @@ class DPOTrainer(BaseTrainer, ABC):
 		)
 		return self._finalize_training(output, run_exception)
 
-	def eval(self, state: EasyDeLState) -> typing.Iterator[dict]:
+	def eval(self, model_state: EasyDeLState) -> tp.Iterator[dict]:
 		"""
 		Evaluates the DPO using the provided model state.
 
@@ -1001,7 +954,7 @@ class DPOTrainer(BaseTrainer, ABC):
 		each evaluation step.
 
 		Args:
-				state (EasyDeLState): The EasyDeLState object containing the model parameters
+				model_state (EasyDeLState): The EasyDeLState object containing the model parameters
 																		and other relevant information.
 
 		Yields:
@@ -1016,7 +969,7 @@ class DPOTrainer(BaseTrainer, ABC):
 		step_metrics = StepMetrics(self.arguments)
 
 		for metrics in self._run_evaluation(
-			sharded_state=state,
+			sharded_state=model_state,
 			metrics_tracker=metrics_tracker,
 			step_metrics=step_metrics,
 			start_time=start_time,

@@ -19,7 +19,7 @@ from easydel.etils.etils import get_logger
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.trainers.base_trainer import TrainerConfigureDataloaderOutput
 from easydel.trainers.trainer import Trainer
-from easydel.trainers.training_configurations import TrainingArguments
+from easydel.trainers.supervised_fine_tuning_trainer.sft_config import SFTConfig
 from easydel.trainers.utils import (
 	create_constant_length_dataset,
 	get_formatting_func_from_dataset,
@@ -43,88 +43,65 @@ class SFTTrainer(Trainer, ABC):
 
 	def __init__(
 		self,
-		arguments: TrainingArguments,
+		arguments: SFTConfig,
 		processing_class: ProcessingClassType,
 		model: tp.Optional[EasyDeLBaseModule] = None,
 		train_dataset: tp.Optional[Dataset] = None,
 		eval_dataset: tp.Optional[tp.Union[Dataset, tp.Dict[str, Dataset]]] = None,
-		dataset_text_field: tp.Optional[str] = None,
-		packing: tp.Optional[bool] = False,
 		formatting_func: tp.Optional[tp.Callable] = None,
-		num_of_sequences: tp.Optional[int] = 1024,
-		chars_per_token: tp.Optional[float] = 3.6,
-		dataset_num_proc: tp.Optional[int] = None,
-		dataset_batch_size: int = 1000,
-		neftune_noise_alpha: tp.Optional[float] = None,
-		dataset_kwargs: tp.Optional[tp.Dict] = None,
-		eval_packing: tp.Optional[bool] = None,
-		checkpoint_path: tp.Optional[str] = None,
-		remove_unused_columns=True,
 		_do_init_fns: bool = True,
 	):
 		if getattr(processing_class, "pad_token", None) is None:
 			processing_class.pad_token = processing_class.eos_token
+		assert isinstance(arguments, SFTConfig), "passed argument must be a `SFTConfig`."
 
-		self.dataset_num_proc = dataset_num_proc
-		self.dataset_batch_size = dataset_batch_size
-
-		self._trainer_supports_neftune = hasattr(arguments, "neftune_noise_alpha")
-
-		if neftune_noise_alpha is not None and self._trainer_supports_neftune:
-			arguments.neftune_noise_alpha = neftune_noise_alpha
-			warnings.warn(
-				"You passed a `neftune_noise_alpha` argument to the SFTTrainer, the value you passed will override "
-				"the one in the `TrainingArguments`.",
-				stacklevel=1,
-			)
-		elif not self._trainer_supports_neftune:
-			self.neftune_noise_alpha = neftune_noise_alpha
-
-		if formatting_func is None and dataset_text_field is None:
+		if formatting_func is None and arguments.dataset_text_field is None:
 			formatting_func = get_formatting_func_from_dataset(
 				train_dataset, processing_class
 			)  # type: ignore
 
-		if not packing:
-			if dataset_text_field is None and formatting_func is None:
+		if not arguments.packing:
+			if arguments.dataset_text_field is None and formatting_func is None:
 				raise ValueError(
 					"You passed `packing=False` to the SFTTrainer, but you didn't pass a "
 					"`dataset_text_field` or `formatting_func` argument."
 				)
 
-		if dataset_kwargs is None:
-			dataset_kwargs = {}
+		if arguments.dataset_kwargs is None:
+			arguments.dataset_kwargs = {}
 		if train_dataset is not None:
 			train_dataset = self._prepare_dataset(
 				train_dataset,
 				processing_class,
-				packing,
-				dataset_text_field,
+				arguments.packing,
+				arguments.dataset_text_field,
 				arguments.max_sequence_length,
 				formatting_func,
-				num_of_sequences,
-				chars_per_token,
-				remove_unused_columns=remove_unused_columns,
-				**dataset_kwargs,
+				arguments.num_of_sequences,
+				arguments.chars_per_token,
+				remove_unused_columns=arguments.remove_unused_columns,
+				**arguments.dataset_kwargs,
 			)
 		if eval_dataset is not None:
 			_multiple = isinstance(eval_dataset, dict)
 			_eval_datasets = eval_dataset if _multiple else {"singleton": eval_dataset}
 
-			eval_packing = packing if eval_packing is None else eval_packing
+			eval_packing = (
+				arguments.packing if arguments.eval_packing is None else arguments.eval_packing
+			)
 
 			for _eval_dataset_name, _eval_dataset in _eval_datasets.items():
 				_eval_datasets[_eval_dataset_name] = self._prepare_dataset(
 					_eval_dataset,
 					processing_class,
 					eval_packing,
-					dataset_text_field,
+					arguments.dataset_text_field,
 					arguments.max_sequence_length,
 					formatting_func,
-					num_of_sequences,
-					chars_per_token,
-					remove_unused_columns=remove_unused_columns,
-					**dataset_kwargs,
+					arguments.num_of_sequences,
+					arguments.chars_per_token,
+					remove_unused_columns=arguments.remove_unused_columns,
+					**arguments.dataset_kwargs,
 				)
 			if not _multiple:
 				eval_dataset = _eval_datasets["singleton"]
@@ -143,7 +120,6 @@ class SFTTrainer(Trainer, ABC):
 			arguments=arguments,
 			dataset_train=train_dataset,
 			dataset_eval=eval_dataset,
-			checkpoint_path=checkpoint_path,
 			model=model,
 			_do_init_fns=_do_init_fns,
 		)

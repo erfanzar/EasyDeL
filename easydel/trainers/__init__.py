@@ -26,7 +26,10 @@ from easydel.trainers.odds_ratio_preference_optimization_trainer import (
 )
 from easydel.trainers.packer import pack_sequences
 
-from easydel.trainers.supervised_fine_tuning_trainer import SFTTrainer
+from easydel.trainers.supervised_fine_tuning_trainer import (
+	SFTTrainer,
+	SFTConfig,
+)
 from easydel.trainers.training_configurations import TrainingArguments
 from easydel.trainers.utils import (
 	JaxDistributedConfig,
@@ -49,6 +52,7 @@ __all__ = (
 	"ORPOTrainerOutput",
 	"pack_sequences",
 	"SFTTrainer",
+	"SFTConfig",
 	"TrainingArguments",
 	"JaxDistributedConfig",
 	"conversations_formatting_function",

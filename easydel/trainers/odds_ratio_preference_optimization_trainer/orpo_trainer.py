@@ -14,9 +14,9 @@
 
 import time
 import typing
+import typing as tp
 from abc import ABC
 from collections import defaultdict
-import typing as tp
 
 import jax
 import numpy as np
@@ -53,8 +53,8 @@ from easydel.trainers.trainer_protocol import MetricsTracker, StepMetrics
 
 if tp.TYPE_CHECKING:
 	from datasets import Dataset
-	from transformers import PreTrainedTokenizerBase
 	from tensorflow import data
+	from transformers import PreTrainedTokenizerBase
 
 	TFDataset = data.Dataset
 
@@ -786,6 +786,9 @@ class ORPOTrainer(BaseTrainer, ABC):
 				if self._should_save_checkpoint(current_step):
 					_ = self._save_state(state=self.model_state)
 
+				if self._should_run_evaluation(current_step):
+					for _ in self.eval(model_state=self.model_state):
+						...
 				current_step += 1
 			except (KeyboardInterrupt, EasyDeLTimerError):
 				return current_step, run_exception
