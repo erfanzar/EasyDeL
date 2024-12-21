@@ -1,6 +1,6 @@
 import warnings
 from dataclasses import dataclass
-from typing import Optional
+import typing as tp
 
 from easydel.trainers.training_configurations import TrainingArguments
 from easydel.utils.compiling_utils import hash_fn
@@ -8,9 +8,9 @@ from easydel.utils.compiling_utils import hash_fn
 
 @dataclass
 class ORPOConfig(TrainingArguments):
-	max_length: Optional[int] = None
-	max_prompt_length: Optional[int] = None
-	max_completion_length: Optional[int] = None
+	max_length: tp.Optional[int] = None
+	max_prompt_length: tp.Optional[int] = None
+	max_completion_length: tp.Optional[int] = None
 	beta: float = 0.1
 	disable_dropout: bool = True
 	label_pad_token_id: int = -100

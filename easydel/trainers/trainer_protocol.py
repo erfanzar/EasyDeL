@@ -368,6 +368,11 @@ class BaseTrainerProtocol(ABC):
 		...
 
 	@abstractmethod
+	def _should_run_evaluation(self, current_step):
+		"""Determine if evaluation process should be runned current step."""
+		...
+
+	@abstractmethod
 	def _prepare_training_output(
 		self,
 		state: EasyDeLState,

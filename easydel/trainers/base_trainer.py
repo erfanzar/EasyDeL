@@ -741,7 +741,15 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 		return (
 			self.arguments.save_steps is not None
 			and current_step > 0
-			and current_step % self.arguments.save_steps == 0
+			and (current_step % self.arguments.save_steps) == 0
+		)
+
+	def _should_run_evaluation(self, current_step):
+		"""Determine if evaluation process should be runned current step."""
+		return (
+			self.arguments.evaluation_steps is not None
+			and current_step > 0
+			and (current_step % self.arguments.evaluation_steps) == 0
 		)
 
 	def _prepare_training_output(

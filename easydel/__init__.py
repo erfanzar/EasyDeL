@@ -289,6 +289,7 @@ from easydel.trainers import (
 	ORPOTrainer,
 	ORPOTrainerOutput,
 	SFTTrainer,
+	SFTConfig,
 	TrainingArguments,
 	pack_sequences,
 	Trainer,
