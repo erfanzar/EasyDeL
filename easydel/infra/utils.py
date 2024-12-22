@@ -49,6 +49,12 @@ warnings.filterwarnings(
 	message="Primitive dynamic_update_slice was not handled by class",
 )
 logger = get_logger(__name__)
+
+
+def quick_gelu(x):
+	return x * jax.nn.sigmoid(1.702 * x)
+
+
 ACT2FN = {
 	"gelu": partial(nn.gelu, approximate=False),
 	"relu": nn.relu,
@@ -62,6 +68,7 @@ ACT2FN = {
 	"glu": nn.glu,
 	"elu": nn.elu,
 	"softmax": nn.softmax,
+	"quick_gelu": quick_gelu,
 }
 
 ROPE_TYPES = tp.Optional[
