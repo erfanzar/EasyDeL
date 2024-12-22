@@ -37,6 +37,16 @@ from easydel.modules.auto_speech_seq2seq_model import (
 	AutoEasyDeLModelForSpeechSeq2Seq,
 	AutoStateForSpeechSeq2Seq,
 )
+from easydel.modules.clip import (
+	CLIPConfig,
+	CLIPForImageClassification,
+	CLIPModel,
+	CLIPTextConfig,
+	CLIPTextModel,
+	CLIPTextModelWithProjection,
+	CLIPVisionConfig,
+	CLIPVisionModel,
+)
 from easydel.modules.cohere import (
 	CohereConfig,
 	CohereForCausalLM,
@@ -178,16 +188,14 @@ from easydel.modules.qwen2_moe import (
 	Qwen2MoeForCausalLM,
 	Qwen2MoeModel,
 )
-
 from easydel.modules.roberta import (
+	RobertaConfig,
 	RobertaForCausalLM,
 	RobertaForMultipleChoice,
 	RobertaForQuestionAnswering,
 	RobertaForSequenceClassification,
 	RobertaForTokenClassification,
-	RobertaConfig,
 )
-
 from easydel.modules.stablelm import (
 	StableLmConfig,
 	StableLmForCausalLM,

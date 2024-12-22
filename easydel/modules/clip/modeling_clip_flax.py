@@ -1020,8 +1020,8 @@ class CLIPModel(EasyDeLBaseModule):
 			use_bias=False,
 			rngs=rngs,
 		)
-		self.visual_projection = linear_class(config.hidden_size, self.projection_dim)
-		self.text_projection = linear_class(config.hidden_size, self.projection_dim)
+		self.visual_projection = linear_class(config.vision_config.hidden_size, self.projection_dim)
+		self.text_projection = linear_class(config.text_config.hidden_size, self.projection_dim)
 
 		self.logit_scale = nn.Param(jnp.ones([]) * self.config.logit_scale_init_value)
 
