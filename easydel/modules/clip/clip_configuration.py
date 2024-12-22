@@ -12,11 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, Optional, Union
 
-from jax.sharding import PartitionSpec
-
-from easydel.etils.etils import EasyDeLGradientCheckPointers, get_logger
+from easydel.etils.etils import get_logger
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
 
