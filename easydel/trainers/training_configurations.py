@@ -27,7 +27,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import PartitionSpec
-import optax
 
 
 from easydel.etils.errors import EasyDeLTimerError
