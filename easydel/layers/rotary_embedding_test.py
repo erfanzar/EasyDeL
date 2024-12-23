@@ -182,8 +182,6 @@ def test_phi3_long_rope_scaled_rotary_embedding():
 		dtype,
 		short_factor,
 		long_factor,
-		1.0,
-		1.0,
 	)
 	positions = jnp.arange(run_seq_len).reshape(1, -1).repeat(run_batch_size, 0)
 	query = jnp.ones((run_batch_size, run_seq_len, run_nheads, head_size))

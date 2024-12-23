@@ -308,14 +308,9 @@ def compute_phi3_frequencies(
 	inv_freq_expanded = jnp.expand_dims(inv_freq, (0, 2)).astype(jnp.float32)
 	position_ids = jnp.arange(max_position_embeddings, dtype=jnp.int32).reshape(1, -1)
 	position_ids_expanded = jnp.expand_dims(position_ids, 1).astype(jnp.float32)
-	# print(inv_freq_expanded.shape)
-	# print(position_ids_expanded.shape)
 
 	freqs = (inv_freq_expanded @ position_ids_expanded).swapaxes(1, 2)
-	# print("F", freqs.shape)
 	emb = jnp.concatenate((freqs, freqs), axis=-1)
-	# print("E", emb.shape)
-
 	scale = max_position_embeddings / original_max_position_embeddings
 	if scale <= 1.0:
 		scaling_factor = 1.0
@@ -326,9 +321,6 @@ def compute_phi3_frequencies(
 
 	cos = jnp.cos(emb) * scaling_factor
 	sin = jnp.sin(emb) * scaling_factor
-	# print("OC", cos.shape)
-	# print("OS", sin.shape)
-
 	return jnp.concatenate([cos, sin], axis=-1)
 
 
