@@ -13,9 +13,15 @@ def main():
 	model = ed.AutoEasyDeLModelForZeroShotImageClassification.from_pretrained(REPO)
 	url = "http://images.cocodataset.org/val2017/000000039769.jpg"  # Cat Photo
 	image = Image.open(requests.get(url, stream=True).raw)
-
+	model()
+	ed.CLIPForImageClassification.from_pretrained()
 	inputs = processor(
-		text=["a photo of a cat", "a photo of a dog"],
+		text=[
+			"a photo of a cat",
+			"a photo of a dog",
+			"a photo of a erfan",
+			"a photo of a car",
+		],
 		images=image,
 		return_tensors="np",
 		padding=True,

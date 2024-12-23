@@ -707,7 +707,7 @@ class ORPOTrainer(BaseTrainer, ABC):
 				if run_exception is not None:
 					break
 		return self._prepare_training_output(
-			sharded_state=self.model_state,
+			state=self.model_state,
 			run_exception=run_exception,
 		), run_exception
 

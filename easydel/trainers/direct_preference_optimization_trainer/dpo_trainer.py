@@ -731,7 +731,7 @@ class DPOTrainer(BaseTrainer, ABC):
 				if run_exception is not None:
 					break
 		return self._prepare_training_output(
-			sharded_state=self.state,
+			state=self.state,
 			shard_fns=shard_fns,
 			gather_fns=gather_fns,
 			run_exception=run_exception,
