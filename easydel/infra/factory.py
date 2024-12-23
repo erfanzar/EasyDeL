@@ -17,12 +17,14 @@ class ConfigType(str, Enum):
 
 class TaskType(str, Enum):
 	CAUSAL_LM = "causal-language-model"
-	SEQ_CLASS = "sequence-classification"
 	VISION_LM = "vision-language-model"
-	AUDIO_CLASS = "audio-classification"
 	BASE_MODULE = "base-module"
 	BASE_VISION = "vision-module"
-	SEQ_TO_SEQ = "seq-to-seq"
+	SEQUENCE_TO_SEQUENCE = "sequence-to-sequence"
+	ZERO_SHOT_IMAGE_CLASSIFICATION = "zero-shot-image-classification"
+	SEQUENCE_CLASSIFICATION = "sequence-classification"
+	AUDIO_CLASSIFICATION = "audio-classification"
+	IMAGE_CLASSIFICATION = "image-classification"
 
 
 @dataclass
@@ -127,7 +129,7 @@ class Registry:
 			"vision-language-model",
 			"audio-classification",
 			"base-module",
-			"seq-to-seq",
+			"sequence-to-sequence",
 		],
 		model_type: str,
 	) -> ModuleRegistration:

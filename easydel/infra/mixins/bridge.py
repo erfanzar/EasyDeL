@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 from __future__ import annotations
 
 import gc
@@ -40,6 +41,7 @@ from easydel.infra.base_config import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseConfigDict,
 )
+
 from easydel.infra.utils import quantize_linear_layers
 
 from easydel.utils.checkpoint_managers import CheckpointManager
@@ -66,7 +68,7 @@ class EasyBridgeMixin(PushToHubMixin):
 	"""
 
 	config: EasyDeLBaseConfig
-
+	hf_torch_auto_loader: tp.Optional[tp.Any] = None
 	config_class: tp.Optional[tp.Type[EasyDeLBaseConfig]] = None
 	base_model_prefix: tp.Optional[str] = None
 	_model_task: tp.Optional[str] = None
@@ -395,7 +397,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		from transformers.utils import is_remote_url as _is_remote_url
 
 		from easydel.infra.utils import quantize_linear_layers
-		from easydel.modules.auto_configuration import (
+		from easydel.modules.auto.auto_configuration import (
 			AutoEasyDeLConfig,
 			AutoShardAndGatherFunctions,
 			get_modules_by_type,
@@ -588,8 +590,8 @@ class EasyBridgeMixin(PushToHubMixin):
 		verbose: bool = True,
 		**kwargs,
 	):
-		from transformers import AutoConfig, AutoModelForCausalLM
-		from easydel.modules.auto_configuration import (
+		from transformers import AutoConfig
+		from easydel.modules.auto.auto_configuration import (
 			AutoShardAndGatherFunctions,
 			get_modules_by_type,
 		)
@@ -635,7 +637,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		)
 
 		logger.debug(f"Downloading hf_model weights from {pretrained_model_name_or_path}")
-		hf_model = AutoModelForCausalLM.from_pretrained(
+		hf_model = cls.get_torch_loader().from_pretrained(
 			pretrained_model_name_or_path,
 			**kwargs,
 		)
@@ -725,3 +727,25 @@ class EasyBridgeMixin(PushToHubMixin):
 				verbose=verbose,
 			)
 		return model
+
+	@classmethod
+	def get_torch_loader(cls):
+		from easydel.infra.factory import TaskType
+
+		auto_loader = getattr(cls, "hf_torch_auto_loader", None)
+		if auto_loader is not None:
+			return auto_loader
+		if cls._model_task == TaskType.CAUSAL_LM:
+			from transformers import AutoModelForCausalLM as module
+		elif cls._model_task == TaskType.AUDIO_CLASSIFICATION:
+			from transformers import AutoModelForAudioClassification as module
+		elif cls._model_task == TaskType.SEQUENCE_TO_SEQUENCE:
+			from transformers import AutoModelForSeq2SeqLM as module
+		elif cls._model_task == TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION:
+			from transformers import AutoModelForZeroShotImageClassification as module
+		else:
+			raise ValueError(
+				"couldn't find requested hf autoloader,"
+				" you can set `hf_torch_auto_loader` to your class"
+			)
+		return module

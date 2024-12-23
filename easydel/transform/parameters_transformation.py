@@ -124,6 +124,8 @@ def process_tensor(
 				tensor = tensor.transpose(0, 1)  # linear layers
 			case 3:
 				tensor = tensor.transpose(0, 2)  # 1d conv layers
+			case 4:
+				tensor = tensor.permute(2, 3, 1, 0)  # 2d conv layers
 			case _:
 				...
 		new_key = key.replace(".weight", ".kernel")

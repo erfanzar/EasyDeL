@@ -100,18 +100,16 @@ from easydel.modules.arctic import (
 	ArcticForCausalLM,
 	ArcticModel,
 )
-from easydel.modules.auto_causal_language_model import (
-	AutoEasyDeLModelForCausalLM,
-	AutoStateForCausalLM,
-)
-from easydel.modules.auto_configuration import (
+from easydel.modules.auto import (
 	AutoEasyDeLConfig,
-	AutoShardAndGatherFunctions,
-	get_modules_by_type,
-)
-from easydel.modules.auto_speech_seq2seq_model import (
+	AutoEasyDeLModelForCausalLM,
 	AutoEasyDeLModelForSpeechSeq2Seq,
+	AutoEasyDeLModelForZeroShotImageClassification,
+	AutoShardAndGatherFunctions,
+	AutoStateForCausalLM,
 	AutoStateForSpeechSeq2Seq,
+	AutoStateForZeroShotImageClassification,
+	get_modules_by_type,
 )
 from easydel.modules.clip import (
 	CLIPConfig,

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import typing as tp
 
 import jax.numpy
@@ -22,50 +23,17 @@ from easydel.etils.etils import (
 	EasyDeLBackends,
 	EasyDeLPlatforms,
 	EasyDeLQuantizationMethods,
-	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
 from easydel.infra.base_config import EasyDeLBaseConfigDict
-from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.base_module import (
+	EasyDeLBaseModule,
+)
 from easydel.infra.factory import TaskType
-from easydel.modules.auto_modeling import BaseAutoEasyModel
-
-logger = get_logger(name=__name__)
 
 
-class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
-	"""This class provides a convenient way to load and shard pretrained causal language models from the Hugging Face Hub
-	and convert them into EasyDeL compatible models. It utilizes the EasyDeL library for distributed training and inference
-	with JAX.
-
-	This class inherits from the `EasyDeLBaseModule` class, providing functionalities for model loading,
-	parameter sharding, and interaction with the EasyDeL framework.
-
-	Attributes:
-	    None
-
-	Examples:
-
-	    >>> import jax
-	    >>> from easydel import AutoEasyDeLModelForCausalLM
-
-	    >>> # Load a GPT-2 model on a single CPU
-	    >>> model = AutoEasyDeLModelForCausalLM.from_pretrained(
-	    >>>   "gpt2", device=jax.devices("cpu")[0]
-	    >>> )
-
-	    >>> # Load a GPT-2 model sharded across 8 GPUs with data parallelism (DP) and fully sharded data parallelism (FSDP)
-	    >>> model = AutoEasyDeLModelForCausalLM.from_pretrained(
-	    ...  "gpt2",
-	    ...  sharding_axis_dims=(1, 8, 1, 1),
-	    ...  sharding_axis_names=("dp", "fsdp", "tp", "sp"),
-	    ...  device=jax.devices("cpu")[0],  # offload to CPU [OPTIONAL]
-	    ...  from_torch=True,
-	    >>> )
-	    ```
-	"""
-
-	model_task: TaskType = TaskType.CAUSAL_LM  # Static
+class BaseAutoEasyModel:
+	model_task: TaskType
 
 	@classmethod
 	def from_pretrained(
@@ -90,8 +58,8 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 		from_torch: tp.Optional[bool] = None,
 		**kwargs,
 	) -> EasyDeLBaseModule:
-		"""Loads and shards a pretrained causal language model from the Hugging Face Hub and converts it into an
-		EasyDeL compatible model.
+		"""
+		Loads and shards a pretrained model from the Hugging Face Hub and converts it into an EasyDeL compatible model.
 
 		Args:
 		    pretrained_model_name_or_path (str): Path or name of the pretrained model in the Hugging Face Hub.
@@ -171,8 +139,176 @@ class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 				**kwargs,
 			)
 
+	@classmethod
+	def _from_easydel_params(
+		cls,
+		pretrained_model_name_or_path: str,
+		dtype: jax.numpy.dtype = jax.numpy.float32,
+		param_dtype: jax.numpy.dtype = jax.numpy.float32,
+		precision: tp.Optional[jax.lax.Precision] = None,
+		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
+		sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+		partition_axis: tp.Optional[PartitionAxis] = None,
+		shard_fns: tp.Optional[tp.Mapping[tuple, tp.Callable] | dict] = None,
+		backend: tp.Optional[EasyDeLBackends] = None,
+		platform: tp.Optional[EasyDeLPlatforms] = None,
+		config_kwargs: tp.Optional[dict] = None,
+		auto_shard_model: bool = False,
+		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]] = None,
+		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
+		quantization_platform: tp.Optional[EasyDeLPlatforms] = EasyDeLPlatforms.JAX,
+		quantization_block_size: int = 128,
+		**kwargs,
+	):
+		class Base(EasyDeLBaseModule):
+			_model_task = cls.model_task
 
-class AutoStateForCausalLM:
+		return Base.from_pretrained(
+			pretrained_model_name_or_path=pretrained_model_name_or_path,
+			dtype=dtype,
+			precision=precision,
+			param_dtype=param_dtype,
+			partition_axis=partition_axis,
+			auto_shard_model=auto_shard_model,
+			shard_fns=shard_fns,
+			sharding_axis_dims=sharding_axis_dims,
+			sharding_axis_names=sharding_axis_names,
+			backend=backend,
+			platform=platform,
+			config_kwargs=config_kwargs,
+			partition_rules=partition_rules,
+			quantization_method=quantization_method,
+			quantization_platform=quantization_platform,
+			quantization_block_size=quantization_block_size,
+			**kwargs,
+		)
+
+	@classmethod
+	def _from_torch_pretrained(
+		cls,
+		pretrained_model_name_or_path: str,
+		device: tp.Optional[jax.Device] = None,
+		dtype: jax.numpy.dtype = jax.numpy.float32,
+		param_dtype: jax.numpy.dtype = jax.numpy.float32,
+		precision: tp.Optional[jax.lax.Precision] = None,
+		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
+		sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+		partition_axis: tp.Optional[PartitionAxis] = None,
+		shard_attention_computation: bool = True,
+		shard_fns: tp.Optional[tp.Mapping[tuple, tp.Callable] | dict] = None,
+		backend: tp.Optional[EasyDeLBackends] = None,
+		platform: tp.Optional[EasyDeLPlatforms] = None,
+		config_kwargs: tp.Optional[EasyDeLBaseConfigDict] = None,
+		auto_shard_model: bool = False,
+		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]] = None,
+		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
+		quantization_block_size: int = 128,
+		**kwargs,
+	):
+		class Base(EasyDeLBaseModule):
+			_model_task = cls.model_task
+
+		return Base._from_torch_pretrained(
+			pretrained_model_name_or_path=pretrained_model_name_or_path,
+			param_dtype=param_dtype,
+			dtype=dtype,
+			shard_fns=shard_fns,
+			auto_shard_model=auto_shard_model,
+			precision=precision,
+			backend=backend,
+			platform=platform,
+			partition_axis=partition_axis,
+			quantization_method=quantization_method,
+			quantization_block_size=quantization_block_size,
+			partition_rules=partition_rules,
+			sharding_axis_names=sharding_axis_names,
+			sharding_axis_dims=sharding_axis_dims,
+			config_kwargs=config_kwargs,
+			device=device,
+			shard_attention_computation=shard_attention_computation,
+			**kwargs,
+		)
+
+	@classmethod
+	def _is_easydel(
+		cls,
+		pretrained_model_name_or_path,
+		FLAX_WEIGHTS_NAME="easydel-model.parameters",
+		cache_dir: tp.Optional[tp.Union[str, os.PathLike]] = None,
+		force_download: bool = False,
+		local_files_only: bool = False,
+		token: tp.Optional[tp.Union[str, bool]] = None,
+		revision: str = "main",
+	):
+		from transformers.utils import cached_file as _cached_file
+		from transformers.utils import download_url as _download_url
+		from transformers.utils import is_remote_url as _is_remote_url
+
+		proxies = None
+		subfolder = ""
+		commit_hash = None
+		pretrained_model_name_or_path = str(pretrained_model_name_or_path)
+		if os.path.isdir(pretrained_model_name_or_path):
+			if os.path.isfile(
+				os.path.join(
+					pretrained_model_name_or_path,
+					subfolder,
+					FLAX_WEIGHTS_NAME,
+				)
+			):
+				archive_file = os.path.join(  # noqa
+					pretrained_model_name_or_path,
+					subfolder,
+					FLAX_WEIGHTS_NAME,
+				)
+			else:
+				raise EnvironmentError(
+					f"Error no file named {FLAX_WEIGHTS_NAME} found in"
+					f" directory {pretrained_model_name_or_path}"
+				)
+		elif os.path.isfile(os.path.join(subfolder, pretrained_model_name_or_path)):
+			...
+		elif _is_remote_url(pretrained_model_name_or_path):
+			filename = pretrained_model_name_or_path
+			resolved_archive_file = _download_url(pretrained_model_name_or_path)
+		else:
+			filename = FLAX_WEIGHTS_NAME
+			try:
+				cached_file_kwargs = {
+					"cache_dir": cache_dir,
+					"force_download": force_download,
+					"proxies": proxies,
+					"local_files_only": local_files_only,
+					"token": token,
+					"user_agent": {
+						"file_type": "model",
+						"framework": "flax",
+						"from_auto_class": False,
+					},
+					"revision": revision,
+					"subfolder": subfolder,
+					"_raise_exceptions_for_gated_repo": False,
+					"_raise_exceptions_for_missing_entries": False,
+					"_commit_hash": commit_hash,
+				}
+				resolved_archive_file = _cached_file(
+					pretrained_model_name_or_path,
+					filename,
+					**cached_file_kwargs,
+				)
+
+				if resolved_archive_file is None:
+					return False
+			except EnvironmentError:
+				raise
+			except Exception:
+				return False
+		return True
+
+
+class BaseAutoEasyState:
+	_base: tp.Any
+
 	@classmethod
 	def from_pretrained(
 		cls,
@@ -197,8 +333,7 @@ class AutoStateForCausalLM:
 		**kwargs,
 	) -> EasyDeLState:
 		"""
-		Loads and shards a pretrained causal language model from the Hugging Face Hub and converts it into an
-		EasyDeL compatible state.
+		Loads and shards a pretrained model from the Hugging Face Hub and converts it into an EasyDeL compatible state.
 
 		Args:
 		    pretrained_model_name_or_path (str): Path or name of the pretrained model in the Hugging Face Hub.
@@ -225,7 +360,7 @@ class AutoStateForCausalLM:
 		Returns:
 		    EasyDeLState: containing the EasyDeL state and the loaded and sharded model parameters.
 		"""
-		model = AutoEasyDeLModelForCausalLM.from_pretrained(
+		model = cls._base.from_pretrained(
 			pretrained_model_name_or_path=pretrained_model_name_or_path,
 			param_dtype=param_dtype,
 			dtype=dtype,
@@ -252,3 +387,102 @@ class AutoStateForCausalLM:
 			init_opt_state=False,
 			step=0,
 		)
+
+
+class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
+	"""
+	This class provides a convenient way to load and shard pretrained causal language models from the Hugging Face Hub
+	and convert them into EasyDeL compatible models. It utilizes the EasyDeL library for distributed training and inference
+	with JAX.
+
+	This class inherits from the `EasyDeLBaseModule` class, providing functionalities for model loading,
+	parameter sharding, and interaction with the EasyDeL framework.
+
+	Attributes:
+	    None
+
+	Examples:
+
+	    >>> import jax
+	    >>> from easydel import AutoEasyDeLModelForCausalLM
+
+	    >>> # Load a GPT-2 model on a single CPU
+	    >>> model = AutoEasyDeLModelForCausalLM.from_pretrained(
+	    >>>   "gpt2", device=jax.devices("cpu")[0]
+	    >>> )
+
+	    >>> # Load a GPT-2 model sharded across 8 GPUs with data parallelism (DP) and fully sharded data parallelism (FSDP)
+	    >>> model = AutoEasyDeLModelForCausalLM.from_pretrained(
+	    ...  "gpt2",
+	    ...  sharding_axis_dims=(1, 8, 1, 1),
+	    ...  sharding_axis_names=("dp", "fsdp", "tp", "sp"),
+	    ...  device=jax.devices("cpu")[0],  # offload to CPU [OPTIONAL]
+	    ...  from_torch=True,
+	    >>> )
+	    ```
+	"""
+
+	model_task: TaskType = TaskType.CAUSAL_LM  # Static
+
+
+class AutoStateForCausalLM(BaseAutoEasyState):
+	_base = AutoEasyDeLModelForCausalLM
+
+
+class AutoEasyDeLModelForZeroShotImageClassification(BaseAutoEasyModel):
+	"""
+	This class provides a convenient way to load and shard pretrained causal language models from the Hugging Face Hub
+	and convert them into EasyDeL compatible models. It utilizes the EasyDeL library for distributed training and inference
+	with JAX.
+
+	This class inherits from the `EasyDeLBaseModule` class, providing functionalities for model loading,
+	parameter sharding, and interaction with the EasyDeL framework.
+
+	"""
+
+	model_task: TaskType = TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION  # Static
+
+
+class AutoStateForZeroShotImageClassification(BaseAutoEasyState):
+	_base = AutoEasyDeLModelForZeroShotImageClassification
+
+
+class AutoEasyDeLModelForSpeechSeq2Seq(BaseAutoEasyModel):
+	"""
+	This class provides a convenient way to load and shard pretrained causal language models from the Hugging Face Hub
+	and convert them into EasyDeL compatible models. It utilizes the EasyDeL library for distributed training and inference
+	with JAX.
+
+	This class inherits from the `EasyDeLBaseModule` class, providing functionalities for model loading,
+	parameter sharding, and interaction with the EasyDeL framework.
+
+	Attributes:
+	    None
+
+	Examples:
+
+	    >>> import jax
+	    >>> from easydel import AutoEasyDeLModelForSpeechSeq2Seq
+
+	    >>> # Load a openai/whisper-large-v3-turbo sharded
+	    >>> model = AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
+	    ...  "openai/whisper-large-v3-turbo",
+	    ...  auto_shard_model=True,
+	    >>> )
+
+	    >>> # Load a openai/whisper-large-v3-turbo model sharded across 8 GPUs with data parallelism (DP) and fully sharded data parallelism (FSDP)
+	    >>> model = AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
+	    ...  "openai/whisper-large-v3-turbo",
+	    ...  sharding_axis_dims=(1, 8, 1, 1),
+	    ...  sharding_axis_names=("dp", "fsdp", "tp", "sp"),
+	    ...  device=jax.devices("cpu")[0],  # offload to CPU [OPTIONAL]
+	    ...  from_torch=True,
+	    >>> )
+	    ```
+	"""
+
+	model_task: TaskType = TaskType.SEQUENCE_TO_SEQUENCE  # Static
+
+
+class AutoStateForSpeechSeq2Seq(BaseAutoEasyState):
+	_base = AutoEasyDeLModelForSpeechSeq2Seq
