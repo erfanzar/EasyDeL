@@ -12,17 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import cached_property, partial
 import typing as tp
+from functools import cached_property, partial
+
 import chex
 import jax
 import jax.numpy as jnp
+from flax import nnx as nn
+from jax import lax
 
 from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
 	FlaxBaseModelOutputWithPooling,
-	ModelOutput,
+	FlaxCLIPOutput,
+	FlaxCLIPTextModelOutput,
+	FlaxImageClassifierOutput,
 )
 from easydel.infra.utils import (
 	ACT2FN,
@@ -34,107 +41,19 @@ from easydel.modules.clip.clip_configuration import (
 	CLIPTextConfig,
 	CLIPVisionConfig,
 )
-from flax import struct
-from flax import nnx as nn
-from jax import lax
 
 
-@struct.dataclass
-class FlaxCLIPTextModelOutput(ModelOutput):
-	"""
-	Base class for text model's outputs that also contains a pooling of the last hidden states.
-
-	Args:
-	    text_embeds (`jnp.ndarray` of shape `(batch_size, output_dim`):
-	        The text embeddings obtained by applying the projection layer to the pooled output of
-	        [`FlaxCLIPTextModel`].
-	    last_hidden_state (`jnp.ndarray` of shape `(batch_size, sequence_length, hidden_size)`):
-	        Sequence of hidden-states at the output of the last layer of the model.
-	    hidden_states (`tuple(jnp.ndarray)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
-	        Tuple of `jnp.ndarray` (one for the output of the embeddings + one for the output of each layer) of shape
-	        `(batch_size, sequence_length, hidden_size)`.
-
-	        Hidden-states of the model at the output of each layer plus the initial embedding outputs.
-	    attentions (`tuple(jnp.ndarray)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
-	        Tuple of `jnp.ndarray` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
-	        sequence_length)`.
-
-	        Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
-	        heads.
-	"""
-
-	text_embeds: jnp.ndarray = None
-	last_hidden_state: jnp.ndarray = None
-	hidden_states: tp.Optional[tp.Tuple[jnp.ndarray, ...]] = None
-	attentions: tp.Optional[tp.Tuple[jnp.ndarray, ...]] = None
+def contrastive_loss(logits: jax.Array) -> jax.Array:
+	labels = jnp.arange(len(logits))
+	return jnp.mean(
+		-jnp.sum(jax.nn.log_softmax(logits) * jax.nn.one_hot(labels, len(logits)), axis=-1)
+	)
 
 
-@struct.dataclass
-class ImageClassifierOutput(ModelOutput):
-	"""
-	Base class for text model's outputs that also contains a pooling of the last hidden states.
-
-	Args:
-	    text_embeds (`jnp.ndarray` of shape `(batch_size, output_dim`):
-	        The text embeddings obtained by applying the projection layer to the pooled output of
-	        [`FlaxCLIPTextModel`].
-	    last_hidden_state (`jnp.ndarray` of shape `(batch_size, sequence_length, hidden_size)`):
-	        Sequence of hidden-states at the output of the last layer of the model.
-	    hidden_states (`tuple(jnp.ndarray)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
-	        Tuple of `jnp.ndarray` (one for the output of the embeddings + one for the output of each layer) of shape
-	        `(batch_size, sequence_length, hidden_size)`.
-
-	        Hidden-states of the model at the output of each layer plus the initial embedding outputs.
-	    attentions (`tuple(jnp.ndarray)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
-	        Tuple of `jnp.ndarray` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
-	        sequence_length)`.
-
-	        Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
-	        heads.
-	"""
-
-	text_embeds: jnp.ndarray = None
-	last_hidden_state: jnp.ndarray = None
-	hidden_states: tp.Optional[tp.Tuple[jnp.ndarray, ...]] = None
-	attentions: tp.Optional[tp.Tuple[jnp.ndarray, ...]] = None
-
-
-@struct.dataclass
-class FlaxCLIPOutput(ModelOutput):
-	"""
-	Args:
-	    logits_per_image:(`jnp.ndarray` of shape `(image_batch_size, text_batch_size)`):
-	        The scaled dot product scores between `image_embeds` and `text_embeds`. This represents the image-text
-	        similarity scores.
-	    logits_per_text:(`jnp.ndarray` of shape `(text_batch_size, image_batch_size)`):
-	        The scaled dot product scores between `text_embeds` and `image_embeds`. This represents the text-image
-	        similarity scores.
-	    text_embeds(`jnp.ndarray` of shape `(batch_size, output_dim`):
-	        The text embeddings obtained by applying the projection layer to the pooled output of
-	        [`FlaxCLIPTextModel`].
-	    image_embeds(`jnp.ndarray` of shape `(batch_size, output_dim`):
-	        The image embeddings obtained by applying the projection layer to the pooled output of
-	        [`FlaxCLIPVisionModel`].
-	    text_model_output(`FlaxBaseModelOutputWithPooling`):
-	        The output of the [`FlaxCLIPTextModel`].
-	    vision_model_output(`FlaxBaseModelOutputWithPooling`):
-	        The output of the [`FlaxCLIPVisionModel`].
-	"""
-
-	logits_per_image: jnp.ndarray = None
-	logits_per_text: jnp.ndarray = None
-	text_embeds: jnp.ndarray = None
-	image_embeds: jnp.ndarray = None
-	text_model_output: FlaxBaseModelOutputWithPooling = None
-	vision_model_output: FlaxBaseModelOutputWithPooling = None
-
-	def to_tuple(self) -> tp.Tuple[tp.Any]:
-		return tuple(
-			self[k]
-			if k not in ["text_model_output", "vision_model_output"]
-			else getattr(self, k).to_tuple()
-			for k in self.keys()
-		)
+def clip_loss(similarity: jax.Array) -> jax.Array:
+	caption_loss = contrastive_loss(similarity)
+	image_loss = contrastive_loss(similarity.T)
+	return (caption_loss + image_loss) / 2.0
 
 
 class CLIPVisionEmbeddings(nn.Module):
@@ -147,6 +66,7 @@ class CLIPVisionEmbeddings(nn.Module):
 		*,
 		rngs: nn.Rngs,
 	):
+		self.config = config
 		embed_dim = config.hidden_size
 		image_size = config.image_size
 		patch_size = config.patch_size
@@ -295,81 +215,81 @@ class CLIPAttention(FlaxAttentionModule):
 			base_config=config,
 		)
 
-		def _split_heads(self, hidden_states):
-			return hidden_states.reshape(
-				hidden_states.shape[:2] + (self.num_heads, self.head_dim)
+	def _split_heads(self, hidden_states):
+		return hidden_states.reshape(
+			hidden_states.shape[:2] + (self.num_heads, self.head_dim)
+		)
+
+	def _merge_heads(self, hidden_states):
+		return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
+
+	def __call__(
+		self,
+		hidden_states: chex.Array,
+		attention_mask: tp.Optional[chex.Array] = None,
+		causal_mask: tp.Optional[chex.Array] = None,
+		output_attentions: bool = False,
+	):
+		query = self.q_proj(hidden_states)
+		key = self.k_proj(hidden_states)
+		value = self.v_proj(hidden_states)
+
+		query = self._split_heads(query)
+		key = self._split_heads(key)
+		value = self._split_heads(value)
+
+		causal_attention_mask = None
+		if self.causal:
+			assert causal_mask is not None
+			query_length, key_length = query.shape[1], key.shape[1]
+			causal_attention_mask = causal_mask[
+				:, :, key_length - query_length : key_length, :key_length
+			]
+
+		if attention_mask is not None and causal_attention_mask is not None:
+			if attention_mask.ndim == 2:
+				attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+			attention_mask = nn.combine_masks(
+				attention_mask,
+				causal_attention_mask,
+				dtype="i4",
+			)
+		elif causal_attention_mask is not None:
+			attention_mask = causal_attention_mask
+		elif attention_mask is not None:
+			if attention_mask.ndim == 2:
+				attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+		attention_bias = None
+		if attention_mask is not None:
+			attention_bias = lax.select(
+				attention_mask > 0,
+				jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+				jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
 			)
 
-		def _merge_heads(self, hidden_states):
-			return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
+		attentions = self.attention_performer(
+			query_states=query,
+			key_states=key,
+			value_states=value,
+			bias=attention_bias,
+			attention_mask=attention_mask,
+			causal=self.causal,
+			dropout_rng=self.rngs.params(),
+			query_sequence_length=query.shape[1],
+			key_value_sequence_length=key.shape[1],
+			uses_cache=None,
+			segment_ids=None,
+			causal_mask=causal_mask,
+		)
+		attn_output = self._merge_heads(attentions.attention_outputs)
+		attn_output = self.out_proj(attn_output)
 
-		def __call__(
-			self,
-			hidden_states: chex.Array,
-			attention_mask: tp.Optional[chex.Array] = None,
-			causal_mask: tp.Optional[chex.Array] = None,
-			output_attentions: bool = False,
-		):
-			query = self.q_proj(hidden_states)
-			key = self.k_proj(hidden_states)
-			value = self.v_proj(hidden_states)
-
-			query = self._split_heads(query)
-			key = self._split_heads(key)
-			value = self._split_heads(value)
-
-			causal_attention_mask = None
-			if self.causal:
-				assert causal_mask is not None
-				query_length, key_length = query.shape[1], key.shape[1]
-				causal_attention_mask = causal_mask[
-					:, :, key_length - query_length : key_length, :key_length
-				]
-
-			if attention_mask is not None and causal_attention_mask is not None:
-				if attention_mask.ndim == 2:
-					attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-				attention_mask = nn.combine_masks(
-					attention_mask,
-					causal_attention_mask,
-					dtype="i4",
-				)
-			elif causal_attention_mask is not None:
-				attention_mask = causal_attention_mask
-			elif attention_mask is not None:
-				if attention_mask.ndim == 2:
-					attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-			attention_bias = None
-			if attention_mask is not None:
-				attention_bias = lax.select(
-					attention_mask > 0,
-					jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-					jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-				)
-
-			attentions = self.attention_performer(
-				query_states=query,
-				key_states=key,
-				value_states=value,
-				bias=attention_bias,
-				attention_mask=attention_mask,
-				causal=self.causal,
-				dropout_rng=self.rngs.params(),
-				query_sequence_length=query.shape[1],
-				key_value_sequence_length=key.shape[1],
-				uses_cache=None,
-				segment_ids=None,
-				causal_mask=causal_mask,
-			)
-			attn_output = self._merge_heads(attentions.attention_outputs)
-			attn_output = self.out_proj(attn_output)
-
-			outputs = (
-				(attn_output, attentions.attention_weights)
-				if output_attentions
-				else (attn_output, None)
-			)
-			return outputs
+		outputs = (
+			(attn_output, attentions.attention_weights)
+			if output_attentions
+			else (attn_output, None)
+		)
+		return outputs
 
 
 class CLIPMLP(nn.Module):
@@ -830,7 +750,7 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
-	):
+	) -> tp.Union[FlaxCLIPTextModelOutput, tp.Tuple]:
 		text_outputs = self.text_model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
@@ -854,6 +774,22 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
 		)
 
 
+@register_module(
+	config=CLIPVisionConfig,
+	model_type="clip",
+	task_type=TaskType.BASE_VISION,
+	embedding_layer_names=[
+		"position_embedding",
+		"token_embedding",
+	],
+	layernorm_names=[
+		"layer_norm1",
+		"layer_norm2",
+		"pre_layrnorm",
+		"post_layernorm",
+		"final_layer_norm",
+	],
+)
 class CLIPVisionModel(EasyDeLBaseModule):
 	def __init__(
 		self,
@@ -894,6 +830,22 @@ class CLIPVisionModel(EasyDeLBaseModule):
 		)
 
 
+@register_module(
+	config=CLIPVisionConfig,
+	model_type="clip",
+	task_type=TaskType.IMAGE_CLASSIFICATION,
+	embedding_layer_names=[
+		"position_embedding",
+		"token_embedding",
+	],
+	layernorm_names=[
+		"layer_norm1",
+		"layer_norm2",
+		"pre_layrnorm",
+		"post_layernorm",
+		"final_layer_norm",
+	],
+)
 class CLIPForImageClassification(EasyDeLBaseModule):
 	def __init__(
 		self,
@@ -933,7 +885,7 @@ class CLIPForImageClassification(EasyDeLBaseModule):
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: tp.Optional[bool] = None,
-	) -> tp.Union[tuple, ImageClassifierOutput]:
+	) -> tp.Union[tuple, FlaxImageClassifierOutput]:
 		output_attentions = (
 			output_attentions
 			if output_attentions is not None
@@ -967,13 +919,29 @@ class CLIPForImageClassification(EasyDeLBaseModule):
 			output = (logits,) + outputs[2:]
 			return output
 
-		return ImageClassifierOutput(
+		return FlaxImageClassifierOutput(
 			logits=logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
 		)
 
 
+@register_module(
+	config=CLIPConfig,
+	model_type="clip",
+	task_type=TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION,
+	embedding_layer_names=[
+		"position_embedding",
+		"token_embedding",
+	],
+	layernorm_names=[
+		"layer_norm1",
+		"layer_norm2",
+		"pre_layrnorm",
+		"post_layernorm",
+		"final_layer_norm",
+	],
+)
 class CLIPModel(EasyDeLBaseModule):
 	def __init__(
 		self,
@@ -1020,8 +988,12 @@ class CLIPModel(EasyDeLBaseModule):
 			use_bias=False,
 			rngs=rngs,
 		)
-		self.visual_projection = linear_class(config.vision_config.hidden_size, self.projection_dim)
-		self.text_projection = linear_class(config.text_config.hidden_size, self.projection_dim)
+		self.visual_projection = linear_class(
+			config.vision_config.hidden_size, self.projection_dim
+		)
+		self.text_projection = linear_class(
+			config.text_config.hidden_size, self.projection_dim
+		)
 
 		self.logit_scale = nn.Param(jnp.ones([]) * self.config.logit_scale_init_value)
 
@@ -1034,7 +1006,11 @@ class CLIPModel(EasyDeLBaseModule):
 		output_attentions=None,
 		output_hidden_states=None,
 		return_dict=None,
-	):
+	) -> tp.Union[FlaxCLIPOutput, tp.Tuple]:
+		if attention_mask is None and input_ids is not None:
+			attention_mask = jnp.ones_like(input_ids)
+		if position_ids is None and attention_mask is not None:
+			position_ids = attention_mask.cumsum(-1) - 1
 		return_dict = return_dict if return_dict is not None else self.config.return_dict
 
 		vision_outputs = self.vision_model(
@@ -1105,3 +1081,18 @@ class CLIPModel(EasyDeLBaseModule):
 		pooled_output = vision_outputs[1]  # pooled_output
 		image_features = self.visual_projection(pooled_output)
 		return image_features
+
+	def compute_loss(
+		self,
+		*,
+		labels=None,  # just to extract
+		loss_config=None,  # just to extract
+		loss_kwargs=None,  # just to extract
+		**batch,
+	) -> tp.Tuple[tp.Any, FlaxCLIPOutput]:
+		batch.pop("return_dict", None)
+		outputs = self(**batch, return_dict=True)
+
+		loss = LossMetrics(loss=clip_loss(outputs.logits_per_text))
+		outputs = outputs.replace(loss=loss.loss)
+		return outputs, loss

@@ -758,6 +758,9 @@ class FlexibleAttentionModule(nn.Module):
 				if jax.default_backend() == "gpu"
 				else (causal if bias is None else False),
 			)
+			dtype = self.dtype
+			if jax.default_backend() == "gpu" and dtype == jnp.float32:
+				dtype = jnp.float16
 			attention_output = shard_map(
 				func,
 				mesh=self.mesh,
@@ -789,10 +792,10 @@ class FlexibleAttentionModule(nn.Module):
 				),
 				check_rep=False,
 			)(
-				query_states.astype(self.dtype),
-				key_states.astype(self.dtype),
-				value_states.astype(self.dtype),
-				bias.astype(self.dtype) if bias is not None else None,
+				query_states.astype(dtype),
+				key_states.astype(dtype),
+				value_states.astype(dtype),
+				bias.astype(dtype) if bias is not None else None,
 			)
 			return AttentionOutput(
 				attention_weights=None,

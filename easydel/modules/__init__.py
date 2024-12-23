@@ -16,26 +16,22 @@ from easydel.infra.base_config import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseConfigDict,
 )
-from easydel.infra.base_module import (
-	EasyDeLBaseModule,
-)
+from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.modules.arctic import (
 	ArcticConfig,
 	ArcticForCausalLM,
 	ArcticModel,
 )
-from easydel.modules.auto_causal_language_model import (
-	AutoEasyDeLModelForCausalLM,
-	AutoStateForCausalLM,
-)
-from easydel.modules.auto_configuration import (
+from easydel.modules.auto import (
 	AutoEasyDeLConfig,
-	AutoShardAndGatherFunctions,
-	get_modules_by_type,
-)
-from easydel.modules.auto_speech_seq2seq_model import (
+	AutoEasyDeLModelForCausalLM,
 	AutoEasyDeLModelForSpeechSeq2Seq,
+	AutoEasyDeLModelForZeroShotImageClassification,
+	AutoShardAndGatherFunctions,
+	AutoStateForCausalLM,
 	AutoStateForSpeechSeq2Seq,
+	AutoStateForZeroShotImageClassification,
+	get_modules_by_type,
 )
 from easydel.modules.clip import (
 	CLIPConfig,

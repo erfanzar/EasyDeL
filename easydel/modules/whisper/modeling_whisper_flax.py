@@ -936,7 +936,7 @@ class FlaxWhisperModel(EasyDeLBaseModule):
 
 
 @register_module(
-	"seq-to-seq",
+	"sequence-to-sequence",
 	config=WhisperConfig,
 	model_type="whisper",
 	embedding_layer_names=["embed_positions", "embed_tokens"],
