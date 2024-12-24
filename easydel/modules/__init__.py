@@ -184,6 +184,11 @@ from easydel.modules.qwen2_moe import (
 	Qwen2MoeForCausalLM,
 	Qwen2MoeModel,
 )
+from easydel.modules.qwen2_vl import (
+	Qwen2VLConfig,
+	Qwen2VLForConditionalGeneration,
+	Qwen2VLModel,
+)
 from easydel.modules.roberta import (
 	RobertaConfig,
 	RobertaForCausalLM,

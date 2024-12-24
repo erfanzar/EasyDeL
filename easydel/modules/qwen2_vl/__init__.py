@@ -11,3 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from easydel.modules.qwen2_vl.modeling_qwen2_vl_flax import (
+	Qwen2VLForConditionalGeneration,
+	Qwen2VLModel,
+)
+
+from easydel.modules.qwen2_vl.qwen2_vl_configuration import Qwen2VLConfig
+
+__all__ = ("Qwen2VLForConditionalGeneration", "Qwen2VLModel", "Qwen2VLConfig")
