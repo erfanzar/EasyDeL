@@ -178,6 +178,11 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
 		attention_dropout=0.0,
 		vision_config=None,
 		rope_scaling=None,
+		vision_start_token_id=151652,
+		vision_end_token_id=151653,
+		vision_token_id=151654,
+		image_token_id=151655,
+		video_token_id=151656,
 		**kwargs,
 	):
 		if isinstance(vision_config, dict):
@@ -207,7 +212,13 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
 		self.rope_theta = rope_theta
 		self.attention_dropout = attention_dropout
 		self.rope_scaling = rope_scaling
-
+		# EasyDeL Extended args.
+		self.head_dim = hidden_size // num_attention_heads
+		self.vision_start_token_id = vision_start_token_id
+		self.vision_end_token_id = vision_end_token_id
+		self.vision_token_id = vision_token_id
+		self.image_token_id = image_token_id
+		self.video_token_id = video_token_id
 		if self.rope_scaling is not None and "type" in self.rope_scaling:
 			if self.rope_scaling["type"] == "mrope":
 				self.rope_scaling["type"] = "default"
