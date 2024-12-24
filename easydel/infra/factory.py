@@ -18,6 +18,7 @@ class ConfigType(str, Enum):
 class TaskType(str, Enum):
 	CAUSAL_LM = "causal-language-model"
 	VISION_LM = "vision-language-model"
+	IMAGE_TEXT_TO_TEXT = "image-text-to-text"
 	BASE_MODULE = "base-module"
 	BASE_VISION = "vision-module"
 	SEQUENCE_TO_SEQUENCE = "sequence-to-sequence"
