@@ -22,6 +22,7 @@ import flax.struct
 import jax
 import jax.numpy as jnp
 from flax import nnx as nn
+import numpy
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -44,6 +45,8 @@ from easydel.modules.qwen2_vl.qwen2_vl_configuration import (
 	Qwen2VLVisionConfig,
 )
 
+jax.config.update("jax_enable_x64", True)
+
 
 @flax.struct.dataclass
 class Qwen2VLCausalLMOutputWithPast(ModelOutput):
@@ -56,6 +59,7 @@ class Qwen2VLCausalLMOutputWithPast(ModelOutput):
 	past_key_values: tp.Optional[tp.List[chex.Array]] = None
 	hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
 	attentions: tp.Optional[tp.Tuple[chex.Array]] = None
+	rope_deltas: tp.Optional[chex.Array] = None
 
 
 def precompute_vl_rotary(dim, theta, max_position):
@@ -80,32 +84,7 @@ def apply_rotary_pos_emb_vision(array: chex.Array, freqs: chex.Array) -> chex.Ar
 	sin = jnp.expand_dims(jnp.repeat(jnp.expand_dims(sin, 1), 2, -1), 0).astype("f4")
 	output = (array * cos) + (rotate_half(array) * sin)
 	output = output.astype(orig_dtype)
-	return output
-
-
-def create_attention_mask(q, cu_seqlens):
-	"""Creates an attention mask based on cumulative sequence lengths.
-
-	Args:
-	    q: A JAX array with the dtype from which we will get the min float value for the attention mask
-	    cu_seqlens: A JAX array representing cumulative sequence lengths.
-
-	Returns:
-	    A JAX array representing the attention mask.
-	"""
-	seq_length = cu_seqlens[-1] if len(cu_seqlens) > 0 else 0
-	attention_mask = jnp.full(
-		(1, seq_length, seq_length), jnp.finfo(q.dtype).min, dtype=q.dtype
-	)
-
-	def mask_loop(i, attention_mask):
-		start = cu_seqlens[i - 1]
-		end = cu_seqlens[i]
-		return attention_mask.at[..., start:end, start:end].set(0)
-
-	attention_mask = jax.lax.fori_loop(1, len(cu_seqlens), mask_loop, attention_mask)
-
-	return attention_mask
+	return output.squeeze(0)
 
 
 class PatchEmbed(nn.Module):
@@ -127,7 +106,7 @@ class PatchEmbed(nn.Module):
 		self.in_channels = in_channels
 		self.embed_dim = embed_dim
 
-		kernel_size = [temporal_patch_size, patch_size, patch_size]
+		kernel_size = (temporal_patch_size, patch_size, patch_size)
 		self.proj = nn.Conv(
 			in_features=in_channels,
 			out_features=embed_dim,
@@ -141,16 +120,18 @@ class PatchEmbed(nn.Module):
 		)
 
 	def __call__(self, hidden_states: chex.Array) -> chex.Array:
-		hidden_states = hidden_states.reshape(
-			-1,
-			self.in_channels,
-			self.temporal_patch_size,
-			self.patch_size,
-			self.patch_size,
+		hidden_states = jnp.transpose(
+			hidden_states.reshape(
+				-1,
+				self.in_channels,
+				self.temporal_patch_size,
+				self.patch_size,
+				self.patch_size,
+			),
+			(0, 2, 3, 4, 1),
 		)
-		hidden_states = self.proj(
-			hidden_states.astype(self.dtype),
-		).reshape(-1, self.embed_dim)
+		hidden_states = self.proj(hidden_states.astype(self.dtype))
+		hidden_states = hidden_states.reshape(-1, self.embed_dim)
 		return hidden_states
 
 
@@ -169,8 +150,14 @@ class PatchMerger(nn.Module):
 		super().__init__()
 		self.dtype = dtype
 		self.hidden_size = context_dim * (spatial_merge_size**2)
-		self.ln_q = nn.LayerNorm(context_dim, epsilon=1e-6)
-		self.mlp = nn.Sequential(
+		self.ln_q = nn.LayerNorm(
+			context_dim,
+			epsilon=1e-6,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			rngs=rngs,
+		)
+		self.mlp = [
 			nn.Linear(
 				self.hidden_size,
 				self.hidden_size,
@@ -188,10 +175,12 @@ class PatchMerger(nn.Module):
 				precision=precision,
 				rngs=rngs,
 			),
-		)
+		]
 
 	def __call__(self, x: chex.Array) -> chex.Array:
-		x = self.mlp(self.ln_q(x).reshape(-1, self.hidden_size))
+		x = self.ln_q(x).reshape(-1, self.hidden_size)
+		for mlp in self.mlp:  # make easy attach work with no effort
+			x = mlp(x)
 		return x
 
 
@@ -249,7 +238,7 @@ class VisionAttention(FlaxAttentionModule):
 		self.qkv = nn.Linear(
 			dim,
 			dim * 3,
-			bias=True,
+			use_bias=True,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
@@ -285,31 +274,65 @@ class VisionAttention(FlaxAttentionModule):
 		rotary_pos_emb: chex.Array = None,
 	) -> chex.Array:
 		seq_length = hidden_states.shape[0]
-		q, k, v = jnp.split(
-			self.qkv(hidden_states)
-			.reshape(seq_length, 3, self.num_heads, -1)
-			.transpose(1, 0, 2, 3),
-			3,
-			0,
+		q, k, v = map(
+			lambda x: x.squeeze(0),
+			jnp.split(
+				self.qkv(hidden_states)
+				.reshape(seq_length, 3, self.num_heads, -1)
+				.transpose(1, 0, 2, 3),  # seq spl nhd fea -> spl seq nhd fea
+				3,
+				0,
+			),
 		)
 		q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
 		k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
-		attn_msk = create_attention_mask(q, cu_seqlens)
-		attentions = self.attention_performer(
-			query_states=q,
-			key_states=k,
-			value_states=v,
-			bias=attn_msk,
-			attention_mask=None,
-			causal=True,
-			dropout_rng=self.rngs.params(),
-			query_sequence_length=q.shape[1],
-			key_value_sequence_length=k.shape[1],
-			uses_cache=None,
-			segment_ids=None,
-			causal_mask=None,
+
+		# q = jnp.expand_dims(q, 0)
+		# k = jnp.expand_dims(k, 0)
+		# v = jnp.expand_dims(v, 0)
+		attention_mask = jnp.full(
+			(1, seq_length, seq_length), jnp.finfo(q.dtype).min, dtype=q.dtype
 		)
-		return self.proj(attentions.attention_outputs.reshape(seq_length, -1))
+		for i in range(1, len(cu_seqlens)):
+			mask = attention_mask.at[
+				...,
+				cu_seqlens[i - 1] : cu_seqlens[i],
+				cu_seqlens[i - 1] : cu_seqlens[i],
+			].set(0)
+			attention_mask = mask
+		# attention_mask = jnp.expand_dims(attention_mask, 0)
+		# attn_output = self.attention_performer(
+		# 	query_states=q,
+		# 	key_states=k,
+		# 	value_states=v,
+		# 	bias=attention_mask,
+		# 	attention_mask=None,
+		# 	causal=True,
+		# 	dropout_rng=self.rngs.params(),
+		# 	query_sequence_length=q.shape[1],
+		# 	key_value_sequence_length=k.shape[1],
+		# 	uses_cache=None,
+		# 	segment_ids=None,
+		# 	causal_mask=None,
+		# )
+		# attn_output = self.proj(
+		# 	attn_output.attention_outputs.reshape(seq_length, -1),
+		# )
+		# return attn_output
+		q = q.swapaxes(0, 1)
+		k = k.swapaxes(0, 1)
+		v = v.swapaxes(0, 1)
+		attn_weights = jnp.matmul(q, k.swapaxes(1, 2)) / math.sqrt(self.head_dim)
+		attn_weights = attn_weights + attention_mask
+		attn_weights = jax.nn.softmax(
+			attn_weights.astype(jnp.float32),
+			axis=-1,
+		).astype(q.dtype)
+		attn_output = jnp.matmul(attn_weights, v)
+		attn_output = attn_output.swapaxes(0, 1)
+		attn_output = attn_output.reshape(seq_length, -1)
+		attn_output = self.proj(attn_output)
+		return attn_output
 
 
 class Qwen2VLVisionBlock(nn.Module):
@@ -340,7 +363,8 @@ class Qwen2VLVisionBlock(nn.Module):
 		mlp_hidden_dim = int(config.embed_dim * config.mlp_ratio)
 
 		self.attn = VisionAttention(
-			config.embed_dim,
+			config=config,
+			dim=config.embed_dim,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
@@ -356,7 +380,7 @@ class Qwen2VLVisionBlock(nn.Module):
 			rngs=rngs,
 		)
 
-	def forward(self, hidden_states, cu_seqlens, rotary_pos_emb) -> chex.Array:
+	def __call__(self, hidden_states, cu_seqlens, rotary_pos_emb) -> chex.Array:
 		hidden_states = hidden_states + self.attn(
 			self.norm1(hidden_states),
 			cu_seqlens=cu_seqlens,
@@ -384,7 +408,7 @@ class Qwen2VLMLP(nn.Module):
 			nn.Linear,
 			dtype=dtype,
 			param_dtype=param_dtype,
-			use_bias=self.config.mlp_bias,
+			use_bias=False,
 			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=precision,
 			rngs=rngs,
@@ -405,7 +429,6 @@ class Qwen2VLMLP(nn.Module):
 			config.intermediate_size,
 			rngs=rngs,
 		)
-		self.dropout = nn.Dropout(rate=self.config.resid_pdrop, rngs=rngs)
 		self.act_fn = ACT2FN[self.config.hidden_act]
 
 	def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
@@ -413,7 +436,7 @@ class Qwen2VLMLP(nn.Module):
 		hidden_states = self.down_proj(
 			self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
 		)
-		hidden_states = self.dropout(hidden_states)
+
 		return hidden_states
 
 
@@ -447,7 +470,6 @@ class Qwen2VLAttention(FlaxAttentionModule):
 			nn.Linear,
 			dtype=dtype,
 			param_dtype=param_dtype,
-			use_bias=config.attention_bias,
 			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=precision,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
@@ -456,21 +478,25 @@ class Qwen2VLAttention(FlaxAttentionModule):
 			config.hidden_size,
 			config.num_attention_heads * self.head_dim,
 			rngs=rngs,
+			use_bias=True,
 		)
 		self.k_proj = linear_class(
 			config.hidden_size,
 			config.num_key_value_heads * self.head_dim,
 			rngs=rngs,
+			use_bias=True,
 		)
 		self.v_proj = linear_class(
 			config.hidden_size,
 			config.num_key_value_heads * self.head_dim,
 			rngs=rngs,
+			use_bias=True,
 		)
 		self.o_proj = linear_class(
 			config.num_attention_heads * self.head_dim,
 			config.hidden_size,
 			rngs=rngs,
+			use_bias=False,
 		)
 
 		self.rotary = self.config.get_basic_rope(
@@ -493,10 +519,6 @@ class Qwen2VLAttention(FlaxAttentionModule):
 			sm_scale=1 / math.sqrt(self.head_dim),
 			axis_name=self.config.attention_axis_name,
 			base_config=self.config,
-		)
-		self.resid_dropout = nn.Dropout(
-			rate=config.resid_pdrop,
-			rngs=rngs,
 		)
 
 	def __call__(
@@ -532,7 +554,9 @@ class Qwen2VLAttention(FlaxAttentionModule):
 		query_states = query_states.reshape(qshape)
 		key_states = key_states.reshape(kv_shape)
 		value_states = value_states.reshape(kv_shape)
-
+		if position_ids.ndim == 3:
+			position_ids = position_ids[0]
+			# cond vision gen issue will be fixed with no mem issue.
 		query_states, key_states = self.rotary(
 			positions=position_ids,
 			query=query_states,
@@ -569,12 +593,10 @@ class Qwen2VLAttention(FlaxAttentionModule):
 			segment_ids=segment_ids,
 			causal_mask=causal_mask,
 		)
-		attn_output = self.resid_dropout(
-			self.o_proj(
-				self.shard_attention_prod(
-					attn_output=self._merge_heads(attentions.attention_outputs)
-				)
-			),
+		attn_output = self.o_proj(
+			self.shard_attention_prod(
+				attn_output=self._merge_heads(attentions.attention_outputs)
+			)
 		)
 		outputs = (
 			(attn_output, attentions.attention_weights)
@@ -704,17 +726,21 @@ class Qwen2VisionTransformerPretrainedModel(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.spatial_merge_size = config.spatial_merge_size
 
 		self.patch_embed = PatchEmbed(
 			patch_size=config.patch_size,
 			temporal_patch_size=config.temporal_patch_size,
 			in_channels=config.in_channels,
 			embed_dim=config.embed_dim,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
 
+		self.spatial_merge_size = config.spatial_merge_size
 		head_dim = config.embed_dim // config.num_heads
-		self._head_dim_ro = head_dim
+		self._head_dim_ro = head_dim // 2
 
 		self.blocks = [
 			Qwen2VLVisionBlock(
@@ -736,7 +762,6 @@ class Qwen2VisionTransformerPretrainedModel(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.gradient_checkpointing = False
 
 	def get_dtype(self) -> jnp.dtype:
 		return self.blocks[0].mlp.fc2.kernel.value.dtype
@@ -780,19 +805,18 @@ class Qwen2VisionTransformerPretrainedModel(EasyDeLBaseModule):
 			pos_ids.append(repeated)
 
 		# Concatenate all position ids
-		pos_ids = jnp.concatenate(pos_ids, axis=0)
+		pos_ids = jnp.concatenate(pos_ids, axis=0).squeeze(0)
 
 		# Get max grid size and compute embeddings
 		max_grid_size = jnp.max(grid_thw[:, 1:])
 
 		rotary_pos_emb_full = jnp.outer(
+			jnp.arange(0, max_grid_size, dtype="f4"),
 			1.0
 			/ (
 				10000 ** (jnp.arange(0, self._head_dim_ro, 2, dtype="f4") / self._head_dim_ro)
 			),
-			jnp.arange(max_grid_size, "f4"),
 		)
-
 		# Index into embeddings and flatten
 		rotary_pos_emb = jnp.take(rotary_pos_emb_full, pos_ids, axis=0)
 		rotary_pos_emb = rotary_pos_emb.reshape(pos_ids.shape[0], -1)
@@ -807,7 +831,6 @@ class Qwen2VisionTransformerPretrainedModel(EasyDeLBaseModule):
 		repeated = jnp.repeat(grid_lens, grid_thw[:, 0])
 		cu_seqlens = jnp.cumsum(repeated, dtype=grid_thw.dtype)
 		cu_seqlens = jnp.pad(cu_seqlens, (1, 0), constant_values=0)
-
 		for block in self.blocks:
 			hidden_states = block(
 				hidden_states,
@@ -1219,7 +1242,7 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 
 			return position_ids, mrope_position_deltas
 
-	def forward(
+	def __call__(
 		self,
 		input_ids: chex.Array = None,
 		attention_mask: tp.Optional[chex.Array] = None,
@@ -1233,6 +1256,7 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 		pixel_values_videos: tp.Optional[chex.Array] = None,
 		image_grid_thw: tp.Optional[chex.Array] = None,
 		video_grid_thw: tp.Optional[chex.Array] = None,
+		rope_deltas: tp.Optional[chex.Array] = None,
 	) -> tp.Union[tp.Tuple, Qwen2VLCausalLMOutputWithPast]:
 		output_attentions = (
 			output_attentions
@@ -1255,6 +1279,7 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 				image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
 				n_image_tokens = jnp.sum(input_ids == self.config.image_token_id).item()
 				n_image_features = image_embeds.shape[0]
+
 				if n_image_tokens != n_image_features:
 					raise ValueError(
 						f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
@@ -1267,7 +1292,13 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 				image_embeds = image_embeds.astype(inputs_embeds.dtype)
 
 				# Combine embeddings using mask
-				inputs_embeds = jnp.where(image_mask, image_embeds, inputs_embeds)
+				inputs_embeds = jnp.where(
+					image_mask,
+					image_embeds.reshape(-1)[: numpy.prod(image_mask.shape)].reshape(
+						image_mask.shape
+					),
+					inputs_embeds,
+				)
 
 			if pixel_values_videos is not None:
 				pixel_values_videos = pixel_values_videos.astype(self.visual.get_dtype())
@@ -1283,20 +1314,34 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 				video_mask = jnp.expand_dims(video_mask, axis=-1)
 				video_mask = jnp.broadcast_to(video_mask, inputs_embeds.shape)
 
-				# Ensure image_embeds has same dtype as inputs_embeds
+				# Ensure video_embeds has same dtype as inputs_embeds
 				video_mask = video_mask.astype(inputs_embeds.dtype)
 
 				# Combine embeddings using mask
-				inputs_embeds = jnp.where(video_mask, video_embeds, inputs_embeds)
+				inputs_embeds = jnp.where(
+					video_mask,
+					video_embeds.reshape(-1)[: numpy.prod(video_mask.shape)].reshape(
+						video_mask.shape
+					),
+					inputs_embeds,
+				)
 
 		if (
 			position_ids is None
 			and input_ids is not None
 			and (attention_mask is None or attention_mask.ndim == 2)
 		):
-			position_ids, rope_deltas = self.get_rope_index(
-				input_ids, image_grid_thw, video_grid_thw, attention_mask
-			)
+			if past_key_values is not None or rope_deltas is None:
+				position_ids, rope_deltas = self.get_rope_index(
+					input_ids,
+					image_grid_thw,
+					video_grid_thw,
+					attention_mask,
+				)
+			else:
+				batch_size, sequence_length = inputs_embeds.shape[:2]
+				position_ids = jnp.arange(sequence_length).reshape(1, -1).repeat(batch_size, 0)
+				position_ids = jnp.expand_dims(position_ids, 0).repeat(3, 0)
 
 		outputs = self.model(
 			input_ids=None,
@@ -1321,6 +1366,7 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 			past_key_values=outputs.past_key_values,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
+			rope_deltas=rope_deltas,
 		)
 
 	def prepare_inputs_for_generation(

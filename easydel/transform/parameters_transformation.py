@@ -121,11 +121,20 @@ def process_tensor(
 		ndim = len(tensor.shape)
 		match ndim:
 			case 2:
-				tensor = tensor.transpose(0, 1)  # linear layers
+				# linear layers
+				tensor = tensor.transpose(0, 1)
 			case 3:
-				tensor = tensor.transpose(0, 2)  # 1d conv layers
+				# 1d conv layers
+				tensor = tensor.transpose(0, 2)
 			case 4:
-				tensor = tensor.permute(2, 3, 1, 0)  # 2d conv layers
+				# 2d conv layers
+				tensor = tensor.permute(2, 3, 1, 0)
+			case 5:
+				# 3d conv layers
+				tensor = tensor.permute(2, 3, 4, 1, 0)
+			case 6:
+				# 4d conv layers
+				tensor = tensor.permute(4, 5, 3, 2, 1, 0)
 			case _:
 				...
 		new_key = key.replace(".weight", ".kernel")
