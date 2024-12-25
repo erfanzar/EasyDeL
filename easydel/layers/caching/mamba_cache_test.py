@@ -3,7 +3,7 @@ import pytest
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
-from easydel.layers.caching.mamba_cache import (
+from .mamba_cache import (
 	MambaCache,
 	MambaCacheMetaData,
 	MambaCacheView,

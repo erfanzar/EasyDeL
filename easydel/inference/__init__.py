@@ -13,9 +13,9 @@
 # limitations under the License.
 
 
-from easydel.inference.vinference.api_server import vInferenceApiServer
-from easydel.inference.vinference.vinference import vInference, vInferenceConfig
-from easydel.inference.whisper_inference import (
+from .vinference.api_server import vInferenceApiServer
+from .vinference.vinference import vInference, vInferenceConfig
+from .whisper_inference import (
 	vWhisperInference,
 	vWhisperInferenceConfig,
 )

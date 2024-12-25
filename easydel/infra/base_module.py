@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import re
 import typing as tp
-from functools import cached_property
 import warnings
+from functools import cached_property
 
 import chex
 import jax
@@ -27,7 +27,6 @@ from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import Mesh
-
 
 from easydel.etils.etils import (
 	EasyDeLQuantizationMethods,
@@ -149,6 +148,10 @@ class EasyDeLBaseModule(
 	def frequencies(self) -> jnp.ndarray:
 		"""Returns frequency values from the config."""
 		return self.config.get_basic_frequencies()
+
+	@cached_property
+	def static_arguments(self) -> tp.Tuple:
+		return self.get_static_arguments()
 
 	@cached_property
 	def loss_function(self):
@@ -347,6 +350,12 @@ class EasyDeLBaseModule(
 		from easydel.etils.easystate import EasyDeLState
 
 		return EasyDeLState.create(step=0, model=self)
+
+	def prepare_inputs_for_call(self, **kwargs):
+		return kwargs
+
+	def get_static_arguments(self) -> tp.Tuple:
+		return ()
 
 	def compute_loss(
 		self,

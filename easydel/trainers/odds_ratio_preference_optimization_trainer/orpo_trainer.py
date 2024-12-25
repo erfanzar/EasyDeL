@@ -15,7 +15,6 @@
 import time
 import typing
 import typing as tp
-from abc import ABC
 from collections import defaultdict
 
 import jax
@@ -66,7 +65,7 @@ else:
 logger = get_logger(__name__)
 
 
-class ORPOTrainer(BaseTrainer, ABC):
+class ORPOTrainer(BaseTrainer):
 	def __init__(
 		self,
 		arguments: ORPOConfig,

@@ -20,10 +20,10 @@ import pathlib
 import pickle
 import random
 import time
+import typing as tp
 import warnings
 from datetime import datetime
 from functools import cached_property
-import typing as tp
 from uuid import uuid4
 
 import jax
@@ -37,18 +37,6 @@ from jax.sharding import NamedSharding, PartitionSpec
 from pydantic import BaseModel
 
 from easydel.etils.etils import get_logger
-from easydel.inference.utils import (
-	SampleState,
-	vInferenceConfig,
-)
-from easydel.inference.vinference._fn import (
-	causal_lm_first_iter_fn,
-	causal_lm_iter_fn,
-	get_compiled_funcs,
-	measure_flops,
-	put_compiled_funcs,
-)
-from easydel.inference.vinference.metrics import vInferenceMetrics
 from easydel.infra import EasyDeLBaseModule
 from easydel.utils.compiling_utils import (
 	load_compiled_fn,
@@ -56,6 +44,18 @@ from easydel.utils.compiling_utils import (
 	smart_compile,
 )
 
+from ..utils import (
+	SampleState,
+	vInferenceConfig,
+)
+from ._fn import (
+	causal_lm_first_iter_fn,
+	causal_lm_iter_fn,
+	get_compiled_funcs,
+	measure_flops,
+	put_compiled_funcs,
+)
+from .metrics import vInferenceMetrics
 
 if tp.TYPE_CHECKING:
 	from transformers import PreTrainedTokenizer
@@ -259,9 +259,9 @@ class vInference:
 
 	def _init_state_non_jit(
 		self,
-		input_ids: jax.Array,
-		attention_mask: jax.Array,
+		input_ids: jax.Array = None,
 		rng: tp.Optional[PRNGKey] = None,
+		**model_kwargs,
 	):
 		if rng is None:
 			rng = self._rng_generator.rng
@@ -272,6 +272,7 @@ class vInference:
 		sequences = jnp.full((batch_size, max_length), pad_token_id, dtype=jnp.int32)
 		sequences = lax.dynamic_update_slice(sequences, input_ids, (0, 0))
 		is_sequence_finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
+
 		return SampleState(
 			current_length=current_length,
 			sequences=sequences,
@@ -281,7 +282,7 @@ class vInference:
 			model_kwargs=self.model.prepare_inputs_for_generation(
 				input_ids=input_ids,
 				max_length=max_length,
-				attention_mask=attention_mask,
+				**model_kwargs,
 			),
 			generated_tokens=0,
 		)
@@ -309,6 +310,7 @@ class vInference:
 		self,
 		input_ids: jax.Array,
 		attention_mask: tp.Optional[jax.Array] = None,
+		**model_kwargs,
 	) -> tp.Union[tp.Generator[SampleState, tp.Any, tp.Any], SampleState]:
 		"""
 		Generates text in streaming chunks.
@@ -325,6 +327,7 @@ class vInference:
 			SampleState: The generated text in streaming chunks.
 		"""
 		self.metrics.queue_size.labels(model_name=self.metrics.model_name).inc()
+
 		try:
 			with self.metrics.inference_latency.labels(
 				model_name=self.metrics.model_name,
@@ -351,7 +354,10 @@ class vInference:
 					dtype="i4",
 					device=self.input_sharding,
 				)
-				state = self._init_state(input_ids=input_ids, attention_mask=attention_mask)
+
+				model_kwargs.update(dict(input_ids=input_ids, attention_mask=attention_mask))
+
+				state = self._init_state(**model_kwargs)
 			with self.metrics.inference_latency.labels(
 				model_name=self.metrics.model_name,
 				stage="inference",
@@ -424,10 +430,11 @@ class vInference:
 		)
 		do_compile = compiled_generate_func is None or compiled_interval_func is None
 		if do_compile:
-			state = self._init_state(
+			model_kwargs = dict(
 				input_ids=jnp.ones((batch_size, input_tokens_length), dtype="i4"),
 				attention_mask=jnp.ones((batch_size, input_tokens_length), dtype="i4"),
 			)
+			state = self._init_state(**model_kwargs)
 			compiled_generate_func = smart_compile(
 				causal_lm_first_iter_fn.lower(
 					graphdef=self.graphdef,

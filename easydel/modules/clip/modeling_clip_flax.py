@@ -999,8 +999,8 @@ class CLIPModel(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: tp.Optional[chex.Array] = None,
-		pixel_values: tp.Optional[chex.Array] = None,
+		input_ids: chex.Array,
+		pixel_values: chex.Array,
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
 		output_attentions=None,

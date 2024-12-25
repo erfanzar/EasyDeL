@@ -29,7 +29,7 @@ from flax.typing import (
 )
 from jax import lax
 
-from easydel.layers.quantization.base_quant import QauntModule
+from .base_quant import QauntModule
 
 Array = jax.Array
 Axis = int

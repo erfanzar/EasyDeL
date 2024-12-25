@@ -24,7 +24,7 @@ import jax.random
 from jax import numpy as jnp
 from jax import random, sharding
 
-from easydel.inference.logits_process import (
+from .logits_process import (
 	FlaxForcedBOSTokenLogitsProcessor,
 	FlaxForcedEOSTokenLogitsProcessor,
 	FlaxLogitsProcessorList,

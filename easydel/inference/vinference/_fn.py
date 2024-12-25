@@ -21,7 +21,7 @@ import jax
 from flax import nnx as nn
 from jax import numpy as jnp
 
-from easydel.inference.utils import (
+from ..utils import (
 	SampleState,
 	create_sampling_step,
 	vInferenceConfig,
