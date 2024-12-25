@@ -32,19 +32,19 @@ from easydel.etils.etils import (
 	EasyDeLQuantizationMethods,
 	get_logger,
 )
-from easydel.infra.base_config import EasyDeLBaseConfig
-from easydel.infra.loss_utils import (
+from .base_config import EasyDeLBaseConfig
+from .loss_utils import (
 	LOSS_MAPPING,
 	ForCausalLMLoss,
 	LossConfig,
 	LossMetrics,
 )
-from easydel.infra.mixins import (
+from .mixins import (
 	BaseModuleProtocol,
 	EasyBridgeMixin,
 	EasyGenerationMixin,
 )
-from easydel.infra.utils import quantize_linear_layers
+from .utils import quantize_linear_layers
 from easydel.utils.traversals import (
 	flatten_dict,
 	unflatten_dict,
