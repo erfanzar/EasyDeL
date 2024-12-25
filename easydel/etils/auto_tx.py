@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+import typing as tp
 
 import fjformer.optimizers
 
-from easydel.etils.etils import (
+from .etils import (
 	AVAILABLE_OPTIMIZERS,
 	AVAILABLE_SCHEDULERS,
 	EasyDeLOptimizers,
@@ -33,7 +33,7 @@ def get_optimizer_and_scheduler(
 	gradient_accumulation_steps: int = 1,
 	weight_decay: float = 0.02,
 	warmup_steps: int = 0,
-	clip_grad: Optional[float] = None,
+	clip_grad: tp.Optional[float] = None,
 	**kwargs,
 ):
 	"""The get_optimizer_and_scheduler function is a helper function that returns an optimizer and scheduler

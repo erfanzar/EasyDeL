@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import math
+import typing as tp
 from functools import cached_property, partial
-from typing import Optional, Tuple, Union
 
 import chex
 import jax
@@ -47,7 +48,7 @@ class MptMLP(nn.Module):
 		config: MptConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -90,7 +91,7 @@ class MptAttention(FlaxAttentionModule):
 		config: MptConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -154,13 +155,13 @@ class MptAttention(FlaxAttentionModule):
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		position_bias: chex.Array | Tuple[chex.Array, chex.Array],
+		position_bias: chex.Array | tp.Tuple[chex.Array, chex.Array],
 		attention_mask: chex.Array,
 		causal_mask: chex.Array,
-		segment_ids: Optional[chex.Array] = None,
-		cache_view: Optional[TransformerCacheView] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
-		fcm_mask: Optional[chex.Array] = None,
+		fcm_mask: tp.Optional[chex.Array] = None,
 	):
 		inp_shape = hidden_states.shape
 		mixed_qkv = self.Wqkv(hidden_states)
@@ -247,7 +248,7 @@ class MptBlock(nn.Module):
 		config: MptConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -302,13 +303,13 @@ class MptBlock(nn.Module):
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		position_bias: chex.Array | Tuple[chex.Array, chex.Array],
+		position_bias: chex.Array | tp.Tuple[chex.Array, chex.Array],
 		attention_mask: chex.Array,
 		causal_mask: chex.Array,
-		segment_ids: Optional[chex.Array] = None,
-		cache_view: Optional[TransformerCacheView] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
-		fcm_mask: Optional[chex.Array] = None,
+		fcm_mask: tp.Optional[chex.Array] = None,
 	):
 		attn_out = self.attn(
 			self.norm_1(hidden_states),
@@ -376,7 +377,7 @@ class MptModel(EasyDeLBaseModule):
 		config: MptConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -424,15 +425,15 @@ class MptModel(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		output_attentions: Optional[bool] = None,
-		past_key_values: Optional[TransformerCache] = None,
-		output_hidden_states: Optional[bool] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		output_attentions: tp.Optional[bool] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
+		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
-	) -> Union[FlaxBaseModelOutput, Tuple]:
+	) -> tp.Union[FlaxBaseModelOutput, tp.Tuple]:
 		all_hidden_states = () if output_hidden_states else None
 		all_attentions = () if output_attentions else None
 		if (input_ids is None) ^ (inputs_embeds is not None):
@@ -502,7 +503,7 @@ class MptForCausalLM(EasyDeLBaseModule):
 		config: MptConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -535,16 +536,16 @@ class MptForCausalLM(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		output_attentions: Optional[bool] = None,
-		past_key_values: Optional[TransformerCache] = None,
-		output_hidden_states: Optional[bool] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		output_attentions: tp.Optional[bool] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
+		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
 		**kwargs,
-	) -> Union[FlaxBaseModelOutput, Tuple]:
+	) -> tp.Union[FlaxBaseModelOutput, tp.Tuple]:
 		outputs: FlaxBaseModelOutput = self.transformer(
 			input_ids=input_ids,
 			attention_mask=attention_mask,

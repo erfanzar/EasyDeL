@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.auto.auto_configuration import (
+from .auto_configuration import (
 	AutoEasyDeLConfig,
 	AutoShardAndGatherFunctions,
 	get_modules_by_type,
 )
-from easydel.modules.auto.auto_modeling import (
+from .auto_modeling import (
 	AutoEasyDeLModelForCausalLM,
 	AutoEasyDeLModelForSpeechSeq2Seq,
 	AutoEasyDeLModelForZeroShotImageClassification,

@@ -1,7 +1,20 @@
+# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import os
+import typing as tp
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
@@ -114,24 +127,24 @@ class ModelInfo:
 	name: str
 	type: str
 	repo_id: str
-	description: Optional[str] = None
-	model_type: Optional[str] = None
-	model_task: Optional[str] = None
-	features: Optional[list] = None
-	supported_tasks: Optional[list] = None
-	limitations: Optional[list] = None
+	description: tp.Optional[str] = None
+	model_type: tp.Optional[str] = None
+	model_task: tp.Optional[str] = None
+	features: tp.Optional[list] = None
+	supported_tasks: tp.Optional[list] = None
+	limitations: tp.Optional[list] = None
 	version: str = __version__
 
 
 class ReadmeGenerator:
 	"""Generate README files for EasyDeL models."""
 
-	def __init__(self, template_dir: Optional[str] = None):
+	def __init__(self, template_dir: tp.Optional[str] = None):
 		"""
 		Initialize the README generator.
 
 		Args:
-		    template_dir: Optional custom template directory path
+		    template_dir: tp.Optional custom template directory path
 		"""
 
 		# Setup Jinja environment
@@ -150,14 +163,14 @@ class ReadmeGenerator:
 	def generate_readme(
 		self,
 		model_info: ModelInfo,
-		output_path: Optional[str] = None,
+		output_path: tp.Optional[str] = None,
 	) -> str:
 		"""
 		Generate README content for a model.
 
 		Args:
 		    model_info: Model information
-		    output_path: Optional path to save the README
+		    output_path: tp.Optional path to save the README
 		    template_name: Name of the template to use
 
 		Returns:

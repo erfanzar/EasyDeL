@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from __future__ import annotations
 
 import time
@@ -31,30 +30,23 @@ from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import get_logger
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.utils import ProcessingClassType
-from easydel.trainers.base_trainer import (
+
+from ..base_trainer import (
 	BaseTrainer,
 	TrainerConfigureDataloaderOutput,
 	TrainerConfigureFunctionOutput,
 	TrainerConfigureModelOutput,
 )
-from easydel.trainers.direct_preference_optimization_trainer.dpo_config import DPOConfig
-from easydel.trainers.direct_preference_optimization_trainer.func_utils import (
+from ..prompt_utils import maybe_apply_chat_template, maybe_extract_prompt
+from ..trainer_protocol import MetricsTracker, StepMetrics
+from .dpo_config import DPOConfig
+from .func_utils import (
 	create_concatenated_forward,
 	create_eval_function,
 	create_train_function,
 )
-from easydel.trainers.direct_preference_optimization_trainer.modelling_output import (
-	DPOTrainerOutput,
-)
-from easydel.trainers.direct_preference_optimization_trainer.utils import (
-	DPODataCollatorWithPadding,
-	build_tokenize,
-)
-from easydel.trainers.prompt_utils import (
-	maybe_apply_chat_template,
-	maybe_extract_prompt,
-)
-from easydel.trainers.trainer_protocol import MetricsTracker, StepMetrics
+from .modelling_output import DPOTrainerOutput
+from .utils import DPODataCollatorWithPadding, build_tokenize
 
 if tp.TYPE_CHECKING:
 	from datasets import Dataset

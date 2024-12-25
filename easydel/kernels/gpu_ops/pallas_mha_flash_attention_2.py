@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import math
+import typing as tp
 from functools import partial
-from typing import Optional
 
 import chex
 import jax
@@ -141,7 +142,7 @@ def _call_gpu_fwd_flash_attn(
 	q: jax.Array,
 	k: jax.Array,
 	v: jax.Array,
-	b: Optional[jax.Array] = None,
+	b: tp.Optional[jax.Array] = None,
 	dtype: jnp.dtype = None,
 	qblock: int = 128,
 	kblock: int = 128,
@@ -485,7 +486,7 @@ def _gpu_flash_attn(
 	q: jax.Array,
 	k: jax.Array,
 	v: jax.Array,
-	b: Optional[jax.Array] = None,
+	b: tp.Optional[jax.Array] = None,
 	dtype: jnp.dtype = None,
 	qblock: int = 128,
 	kblock: int = 128,
@@ -515,7 +516,7 @@ def _flash_attn2(
 	q: jax.Array,
 	k: jax.Array,
 	v: jax.Array,
-	b: Optional[jax.Array] = None,
+	b: tp.Optional[jax.Array] = None,
 	dtype: jnp.dtype = None,
 	qblock: int = 128,
 	kblock: int = 128,

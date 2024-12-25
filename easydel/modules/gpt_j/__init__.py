@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.gpt_j.gpt_j_configuration import GPTJConfig
-from easydel.modules.gpt_j.modeling_gpt_j_flax import (
-	GPTJForCausalLM,
-	GPTJModel,
-)
+from .gpt_j_configuration import GPTJConfig
+from .modeling_gpt_j_flax import GPTJForCausalLM, GPTJModel
 
 __all__ = "GPTJForCausalLM", "GPTJModel", "GPTJConfig"

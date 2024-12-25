@@ -11,15 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import functools
 import math
 import os
 import time
+import typing as tp
 import warnings
 from dataclasses import dataclass
 from enum import Enum
 from functools import cached_property, lru_cache, partial
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import einops
 import fjformer
@@ -170,8 +171,8 @@ def _get_jax_dtype_from_string(dtype_string):
 
 @dataclass
 class AttentionOutput:
-	attention_weights: Optional[Array] = None
-	attention_outputs: Optional[Array] = None
+	attention_weights: tp.Optional[Array] = None
+	attention_outputs: tp.Optional[Array] = None
 
 
 class AttentionMechanisms(str, Enum):
@@ -230,8 +231,8 @@ DEFAULT_ATTENTION_MECHANISM = (
 def set_attrs_smartly_with_prp(
 	self,
 	attr_name: str,
-	default: Any,
-	new_attr: Any,
+	default: tp.Any,
+	new_attr: tp.Any,
 	prp: EasyDeLBaseConfig = None,
 	pickup_name=None,
 ):
@@ -324,12 +325,12 @@ class FlexibleAttentionModule(nn.Module):
 		precision: lax.Precision = ...,
 		force_float32_tpu: bool = ...,
 		shard_attention_computation: bool = ...,
-		use_sharding_constraint: Optional[bool] = ...,
+		use_sharding_constraint: tp.Optional[bool] = ...,
 		axis_name: str = ...,
 		platform: EasyDeLPlatforms = ...,
-		backend: Optional[EasyDeLBackends] = ...,
-		backward_pass_impl: Literal["triton", "xla"] = "triton",
-		base_config: Optional[EasyDeLBaseConfig] = None,
+		backend: tp.Optional[EasyDeLBackends] = ...,
+		backward_pass_impl: tp.Literal["triton", "xla"] = "triton",
+		base_config: tp.Optional[EasyDeLBaseConfig] = None,
 		_do_check: bool = True,
 	):
 		self.blocksize_k: int = ...
@@ -340,7 +341,7 @@ class FlexibleAttentionModule(nn.Module):
 		self.precision: lax.Precision = ...
 		self.force_float32_tpu: bool = ...
 		self.shard_attention_computation: bool = ...
-		self.use_sharding_constraint: Optional[bool] = ...
+		self.use_sharding_constraint: tp.Optional[bool] = ...
 		self.axis_name: str = ...
 		self.backend: str = ...
 		self.platform: str = ...
@@ -397,7 +398,7 @@ class FlexibleAttentionModule(nn.Module):
 		self,
 		query_sequence_length,
 		bias_dim_eql=False,
-	) -> Tuple[
+	) -> tp.Tuple[
 		PartitionSpec,
 		PartitionSpec,
 		PartitionSpec,
@@ -475,7 +476,7 @@ class FlexibleAttentionModule(nn.Module):
 		self,
 		query_sequence_length,
 		bias_dim_eql=False,
-	) -> Tuple[
+	) -> tp.Tuple[
 		PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, bool
 	]:
 		in_generating_processerating = query_sequence_length == 1
@@ -591,16 +592,16 @@ class FlexibleAttentionModule(nn.Module):
 		query_states: Array,
 		key_states: Array,
 		value_states: Array,
-		query_sequence_length: Optional[int] = None,
-		key_value_sequence_length: Optional[int] = None,
-		bias: Optional[Array] = None,
-		attention_mask: Optional[Array] = None,
-		segment_ids: Optional[Array] = None,
+		query_sequence_length: tp.Optional[int] = None,
+		key_value_sequence_length: tp.Optional[int] = None,
+		bias: tp.Optional[Array] = None,
+		attention_mask: tp.Optional[Array] = None,
+		segment_ids: tp.Optional[Array] = None,
 		causal: bool = True,
 		deterministic: bool = True,
-		dropout_rng: Optional[random.PRNGKey] = None,
+		dropout_rng: tp.Optional[random.PRNGKey] = None,
 		uses_cache: bool = False,
-		causal_mask: Optional[Array] = None,
+		causal_mask: tp.Optional[Array] = None,
 	):
 		global PRINT_COMMON
 		if query_sequence_length is None:
@@ -738,7 +739,7 @@ class FlexibleAttentionModule(nn.Module):
 		query_states: Array,
 		key_states: Array,
 		value_states: Array,
-		bias: Optional[Array] = None,
+		bias: tp.Optional[Array] = None,
 		causal: bool = False,
 	):
 		(
@@ -810,7 +811,7 @@ class FlexibleAttentionModule(nn.Module):
 		query_states: Array,
 		key_states: Array,
 		value_states: Array,
-		bias: Optional[Array] = None,
+		bias: tp.Optional[Array] = None,
 	):
 		(
 			query_partitionspec,
@@ -937,11 +938,11 @@ class FlexibleAttentionModule(nn.Module):
 		value_states: Array,
 		query_sequence_length: int,
 		key_value_sequence_length: int,
-		bias: Optional[Array] = None,
-		attention_mask: Optional[Array] = None,
+		bias: tp.Optional[Array] = None,
+		attention_mask: tp.Optional[Array] = None,
 		deterministic: bool = False,
-		dropout_rng: Optional[random.PRNGKey] = None,
-		segment_ids: Optional[Array] = None,
+		dropout_rng: tp.Optional[random.PRNGKey] = None,
+		segment_ids: tp.Optional[Array] = None,
 	):
 		key_states, value_states = self.repeat_kv_heads(
 			key_states,
@@ -998,9 +999,9 @@ class FlexibleAttentionModule(nn.Module):
 		query_states: Array,
 		key_states: Array,
 		value_states: Array,
-		bias: Optional[Array] = None,
+		bias: tp.Optional[Array] = None,
 		deterministic: bool = False,
-		dropout_rng: Optional[random.PRNGKey] = None,
+		dropout_rng: tp.Optional[random.PRNGKey] = None,
 		query_sequence_length: int,
 		key_value_sequence_length: int,
 	) -> AttentionOutput:
@@ -1094,9 +1095,9 @@ class FlexibleAttentionModule(nn.Module):
 		query_states: Array,
 		key_states: Array,
 		value_states: Array,
-		bias: Optional[Array] = None,
+		bias: tp.Optional[Array] = None,
 		deterministic: bool = False,
-		dropout_rng: Optional[random.PRNGKey] = None,
+		dropout_rng: tp.Optional[random.PRNGKey] = None,
 		query_sequence_length: int,
 		key_value_sequence_length: int,
 	) -> AttentionOutput:
@@ -1218,7 +1219,7 @@ class FlexibleAttentionModule(nn.Module):
 		query_states: Array,
 		key_states: Array,
 		value_states: Array,
-		bias: Optional[Array] = None,
+		bias: tp.Optional[Array] = None,
 		causal: bool = False,
 		deterministic: bool = True,
 		query_sequence_length: int,
@@ -1321,7 +1322,7 @@ class FlexibleAttentionModule(nn.Module):
 		batch_sizes=[1, 2, 4, 8],  # noqa
 		sequence_lengths=[512, 1024, 2048],  # noqa
 		attention_types=None,
-	) -> Dict[str, Union[Dict, "pd.DataFrame"]]:  # noqa #type:ignore
+	) -> tp.Dict[str, tp.Union[tp.Dict, "pd.DataFrame"]]:
 		"""Run comprehensive benchmarks across different configurations."""
 		results = {}
 
@@ -1381,12 +1382,12 @@ class BenchmarkConfig:
 	num_key_value_heads: int = 32
 	blocksize_q: int = 64
 	blocksize_k: int = 64
-	axis_dims: Tuple[int, int, int, int] = (1, -1, 1, 1)
+	axis_dims: tp.Tuple[int, int, int, int] = (1, -1, 1, 1)
 	head_dim: int = 128
 	dtype: jnp.dtype = jnp.float16
 	num_warmup_runs: int = 3
 	num_benchmark_runs: int = 10
-	metrics: List[BenchmarkMetrics] = None
+	metrics: tp.List[BenchmarkMetrics] = None
 
 
 class AttentionBenchmarker:
@@ -1395,7 +1396,7 @@ class AttentionBenchmarker:
 	def __init__(
 		self,
 		config: BenchmarkConfig,
-		run_attention_benchmarks: List[str] = None,
+		run_attention_benchmarks: tp.List[str] = None,
 		calculate_gradients: bool = True,
 	):
 		from fjformer import GenerateRNG
@@ -1594,7 +1595,7 @@ class AttentionBenchmarker:
 
 		return metrics, avg_output
 
-	def run_benchmarks(self) -> Union[Dict, "pd.DataFrame"]:  # noqa #type:ignore
+	def run_benchmarks(self) -> tp.Union[tp.Dict, "pd.DataFrame"]:
 		"""Run benchmarks with gradient comparison."""
 		inputs = self._create_attention_inputs()
 
@@ -1713,8 +1714,8 @@ class FlaxAttentionModule(nn.Module):
 		value: Array,
 		cache_view: TransformerCacheView,
 		attention_mask: Array,
-		causal_mask: Optional[Array] = None,
-	) -> Tuple[Array, Array, Array]:
+		causal_mask: tp.Optional[Array] = None,
+	) -> tp.Tuple[Array, Array, Array]:
 		num_updated_cache_vectors = query.shape[1]
 		end_index = cache_view.index[0]
 
@@ -1776,11 +1777,11 @@ class FlaxAttentionModule(nn.Module):
 		key: Array,
 		value: Array,
 		attention_mask: Array,
-		cache_view: Optional[TransformerCacheView] = None,
-		causal_mask: Optional[Array] = None,
-		fcm_mask: Optional[Array] = None,
-		sliding_windows: Optional[int] = None,
-	) -> Tuple[Array, Array, Array, Array]:
+		cache_view: tp.Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[Array] = None,
+		fcm_mask: tp.Optional[Array] = None,
+		sliding_windows: tp.Optional[int] = None,
+	) -> tp.Tuple[Array, Array, Array, Array]:
 		if cache_view is None:
 			query_length = query.shape[1]
 			key_length = key.shape[1]

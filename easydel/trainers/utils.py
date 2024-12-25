@@ -11,11 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import logging
 import random
-import warnings
 import typing as tp
+import warnings
 
 import jax
 import numpy as np
@@ -120,7 +119,9 @@ def create_constant_length_dataset(
 			stacklevel=1,
 		)
 
-	concat_token_id = processing_class.eos_token_id if processing_class.eos_token_id else eos_token_id
+	concat_token_id = (
+		processing_class.eos_token_id if processing_class.eos_token_id else eos_token_id
+	)
 	max_buffer_size = seq_length * chars_per_token * num_of_sequences
 
 	# Input validation and formatting function setup
@@ -221,7 +222,9 @@ def create_constant_length_dataset(
 	return constant_length_generator
 
 
-def _collate_batch(examples, processing_class, pad_to_multiple_of: tp.Optional[int] = None):
+def _collate_batch(
+	examples, processing_class, pad_to_multiple_of: tp.Optional[int] = None
+):
 	if isinstance(examples[0], (list, tuple)):
 		examples = [jnp.array(e, dtype=jnp.int64) for e in examples]
 
@@ -379,7 +382,9 @@ class DataCollatorForCompletionOnlyLM:
 		probability_matrix = np.full(labels.shape, 0.15)
 		if special_tokens_mask is None:
 			special_tokens_mask = [
-				self.processing_class.get_special_tokens_mask(val, already_has_special_tokens=True)
+				self.processing_class.get_special_tokens_mask(
+					val, already_has_special_tokens=True
+				)
 				for val in labels.tolist()
 			]
 			special_tokens_mask = np.array(special_tokens_mask, dtype=bool)
@@ -555,11 +560,15 @@ def conversations_formatting_function(
 			output_texts = []
 			for i in range(len(examples[messages_field])):
 				output_texts.append(
-					processing_class.apply_chat_template(examples[messages_field][i], tokenize=False)
+					processing_class.apply_chat_template(
+						examples[messages_field][i], tokenize=False
+					)
 				)  # type: ignore
 			return output_texts
 		else:
-			return processing_class.apply_chat_template(examples[messages_field], tokenize=False)  # type: ignore
+			return processing_class.apply_chat_template(
+				examples[messages_field], tokenize=False
+			)  # type: ignore
 
 	return format_dataset
 

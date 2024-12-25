@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import time
 import typing as tp
 
@@ -26,13 +25,14 @@ from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import get_logger
 from easydel.infra.loss_utils import LossMetrics
-from easydel.trainers.base_trainer import (
+
+from ..base_trainer import (
 	BaseTrainer,
 	TrainerConfigureFunctionOutput,
 )
-from easydel.trainers.trainer._fn import create_evaluation_step, create_training_step
-from easydel.trainers.trainer.modeling_output import TrainerOutput
-from easydel.trainers.trainer_protocol import MetricsTracker, StepMetrics
+from ..trainer_protocol import MetricsTracker, StepMetrics
+from ._fn import create_evaluation_step, create_training_step
+from .modeling_output import TrainerOutput
 
 logger = get_logger(__name__)
 

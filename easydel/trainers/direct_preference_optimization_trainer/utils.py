@@ -11,20 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import inspect
+import typing as tp
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
-import typing as tp
+
 import chex
 import jax
 from jax import numpy as jnp
 
-from easydel.modules import EasyDeLBaseModule
-from easydel.trainers.direct_preference_optimization_trainer.dpo_config import DPOConfig
-from easydel.trainers.utils import add_bos_token_if_needed, add_eos_token_if_needed
 from easydel.infra.utils import ProcessingClassType
+from easydel.modules import EasyDeLBaseModule
+
+from ..utils import add_bos_token_if_needed, add_eos_token_if_needed
+from .dpo_config import DPOConfig
 
 
 @dataclass

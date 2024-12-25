@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+
+import typing as tp
 
 from jax.sharding import PartitionSpec
 
@@ -121,7 +122,7 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
 		router_aux_loss_coef=0.001,
 		mlp_only_layers=None,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
 		self.vocab_size = vocab_size
@@ -168,7 +169,7 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
 		        Whether to use fully sharded data parallelism.
 
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
 			(
@@ -213,7 +214,7 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
 	def add_jax_args(
 		self,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
 		"""The add_jax_args function adds the following arguments to the Transformer class:
@@ -222,7 +223,7 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
 		    self: Refer to the current object
 		    gradient_checkpointing: str: Control the amount of memory
 		        used by jax
-		    bits: Optional[int]: Determine the number of bits used in
+		    bits: tp.Optional[int]: Determine the number of bits used in
 		        the quantization
 
 		Returns:

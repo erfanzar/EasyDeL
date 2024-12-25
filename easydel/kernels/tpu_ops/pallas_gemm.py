@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 # Implementation by @erfanzar,
 # with a few bug fixes and adjustments.
 
+import typing as tp
 from functools import partial
-from typing import Optional
 
 import jax
 import jax.interpreters
@@ -120,9 +121,9 @@ def _call_tpu_matmul_kernel_fwd(
 	A: jax.Array,
 	B: jax.Array,
 	*,
-	blocksize_m: Optional[int],
-	blocksize_k: Optional[int],
-	blocksize_n: Optional[int],
+	blocksize_m: tp.Optional[int],
+	blocksize_k: tp.Optional[int],
+	blocksize_n: tp.Optional[int],
 	precision: jax.lax.PrecisionLike = None,
 ):
 	assert A.ndim == 2 and B.ndim == 2, f"got {A.shape=} and {B.shape=}"
@@ -170,9 +171,9 @@ def _call_tpu_matmul_kernel_fwd(
 def _call_tpu_matmul_kernel_fwd_residual(
 	A: jax.Array,
 	B: jax.Array,
-	blocksize_m: Optional[int],
-	blocksize_k: Optional[int],
-	blocksize_n: Optional[int],
+	blocksize_m: tp.Optional[int],
+	blocksize_k: tp.Optional[int],
+	blocksize_n: tp.Optional[int],
 	precision: jax.lax.PrecisionLike = None,
 ):
 	return _call_tpu_matmul_kernel_fwd(
@@ -186,9 +187,9 @@ def _call_tpu_matmul_kernel_fwd_residual(
 
 
 def _call_tpu_matmul_kernel_bwd(
-	blocksize_m: Optional[int],
-	blocksize_k: Optional[int],
-	blocksize_n: Optional[int],
+	blocksize_m: tp.Optional[int],
+	blocksize_k: tp.Optional[int],
+	blocksize_n: tp.Optional[int],
 	precision: jax.lax.PrecisionLike,
 	res,
 	gO,
@@ -218,9 +219,9 @@ def _call_tpu_matmul_kernel_bwd(
 def pallas_gemm(
 	A: jax.Array,
 	B: jax.Array,
-	blocksize_m: Optional[int],
-	blocksize_k: Optional[int],
-	blocksize_n: Optional[int],
+	blocksize_m: tp.Optional[int],
+	blocksize_k: tp.Optional[int],
+	blocksize_n: tp.Optional[int],
 	precision: jax.lax.PrecisionLike = None,
 ):
 	return _call_tpu_matmul_kernel_fwd(

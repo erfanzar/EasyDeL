@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+
+import typing as tp
 
 from jax.sharding import PartitionSpec
 
@@ -63,7 +64,7 @@ class OlmoConfig(EasyDeLBaseConfig):
 	        Whether to tie the weights of the input embeddings and the output embeddings.
 	    rope_theta (`float`, *optional*, defaults to 10000.0):
 	        The theta value to use for rotary position embeddings.
-	    rope_scaling (`Dict[str, Union[str, float]]`, *optional*):
+	    rope_scaling (`tp.Dict[str, tp.Union[str, float]]`, *optional*):
 	        The configuration for rope scaling.
 	    attention_bias (`bool`, *optional*, defaults to `False`):
 	        Whether to use attention bias.
@@ -107,7 +108,7 @@ class OlmoConfig(EasyDeLBaseConfig):
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
 		self.vocab_size = vocab_size
@@ -147,7 +148,7 @@ class OlmoConfig(EasyDeLBaseConfig):
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 	):
 		self.gradient_checkpointing = gradient_checkpointing
 		self.use_scan_mlp = use_scan_mlp
@@ -158,7 +159,7 @@ class OlmoConfig(EasyDeLBaseConfig):
 		"""
 		Get the partition rules for the model.
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
 			("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),

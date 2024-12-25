@@ -20,7 +20,6 @@
 # Long-Term Benefits: While it might be a more opinionated choice, it reinforces the idea that
 #  infra is a central part of your system, and it will be better in the long term.
 # and i dont like to face `most likely due to a circular import` issue.
-
 import typing as tp
 from dataclasses import fields, is_dataclass
 

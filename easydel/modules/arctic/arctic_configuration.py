@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, Optional, Union
+
+import typing as tp
 
 from jax.sharding import PartitionSpec
 
@@ -100,7 +101,7 @@ class ArcticConfig(EasyDeLBaseConfig):
 	        The chunk size for scan MLP.
 	    bits (`int`, *optional*):
 	        The number of bits.
-	    rope_scaling (`Dict[str, Union[str, float]]`, *optional*):
+	    rope_scaling (`tp.Dict[str, tp.Union[str, float]]`, *optional*):
 	        The rope scaling configuration.
 	"""
 
@@ -140,8 +141,8 @@ class ArcticConfig(EasyDeLBaseConfig):
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
-		bits: Optional[int] = None,
-		rope_scaling: Dict[str, Union[str, float]] = None,
+		bits: tp.Optional[int] = None,
+		rope_scaling: tp.Dict[str, tp.Union[str, float]] = None,
 		**kwargs,
 	):
 		self.vocab_size = vocab_size
@@ -194,7 +195,7 @@ class ArcticConfig(EasyDeLBaseConfig):
 		"""
 		Get the partition rules for the model.
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
 			("model/embed_tokens/embedding", PartitionSpec("tp", ("sp", "fsdp"))),
@@ -219,8 +220,8 @@ class ArcticConfig(EasyDeLBaseConfig):
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
-		bits: Optional[int] = None,
-		rope_scaling: Dict[str, Union[str, float]] = None,
+		bits: tp.Optional[int] = None,
+		rope_scaling: tp.Dict[str, tp.Union[str, float]] = None,
 		**kwargs,
 	):
 		self.rope_scaling = rope_scaling

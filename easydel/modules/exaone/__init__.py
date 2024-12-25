@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.exaone.exaone_configuration import ExaoneConfig
-from easydel.modules.exaone.modeling_exaone_flax import (
-	ExaoneForCausalLM,
-	ExaoneModel,
-)
+from .exaone_configuration import ExaoneConfig
+from .modeling_exaone_flax import ExaoneForCausalLM, ExaoneModel
 
 __all__ = "ExaoneForCausalLM", "ExaoneModel", "ExaoneConfig"

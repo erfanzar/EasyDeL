@@ -11,14 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-
 import typing as tp
 
 import chex
 import jax
 
-from easydel.etils.easystate import EasyDeLState
+if tp.TYPE_CHECKING:
+	from easydel.etils.easystate import EasyDeLState
+else:
+	EasyDeLState = tp.Any
 
 
 @chex.dataclass

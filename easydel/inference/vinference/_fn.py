@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Module for text generation pipeline using JAX/Flax."""
 
 import time
@@ -21,13 +22,13 @@ import jax
 from flax import nnx as nn
 from jax import numpy as jnp
 
+from easydel.infra import EasyDeLBaseModule
+
 from ..utils import (
 	SampleState,
 	create_sampling_step,
 	vInferenceConfig,
 )
-
-from easydel.infra import EasyDeLBaseModule
 
 
 def measure_flops(func, *args, **kwargs):

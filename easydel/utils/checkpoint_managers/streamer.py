@@ -223,7 +223,7 @@ class CheckpointManager:
 			mismatch_allowed: Whether to allow mismatches between the state dictionary and gather functions.
 			metadata: Additional metadata to store in the checkpoint.
 		"""
-		state = to_state_dict(state) 
+		state = to_state_dict(state)
 		gather_mismatch_count = 0
 
 		if not is_flatten(state):

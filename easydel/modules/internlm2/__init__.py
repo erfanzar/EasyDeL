@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.internlm2.internlm2_configuration import InternLM2Config
-from easydel.modules.internlm2.modeling_internlm2_flax import (
+from .internlm2_configuration import InternLM2Config
+from .modeling_internlm2_flax import (
 	InternLM2ForCausalLM,
 	InternLM2ForSequenceClassification,
 	InternLM2Model,

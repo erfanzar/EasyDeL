@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 # Implementation based on FlashAttention 2 (https://arxiv.org/pdf/2307.08691) by @erfanzar,
 # with a few bug fixes and adjustments.
 
 import functools
 import math
-from typing import Optional
+import typing as tp
 
 import flax
 import flax.nnx
@@ -45,18 +46,18 @@ def flash_attention2(
 	query_state: jax.Array,
 	key_state: jax.Array,
 	value_state: jax.Array,
-	mask: Optional[jax.Array] = None,
-	bias: Optional[jax.Array] = None,
+	mask: tp.Optional[jax.Array] = None,
+	bias: tp.Optional[jax.Array] = None,
 	*,
 	dropout: float = 0.0,
 	inference: bool = True,
-	key: Optional[jax.random.PRNGKey] = None,
-	blocksize_q: Optional[int] = None,
-	blocksize_k: Optional[int] = None,
-	dtype: Optional[jnp.dtype] = None,
+	key: tp.Optional[jax.random.PRNGKey] = None,
+	blocksize_q: tp.Optional[int] = None,
+	blocksize_k: tp.Optional[int] = None,
+	dtype: tp.Optional[jnp.dtype] = None,
 	precision: lax.PrecisionLike = None,
-	head_dim: Optional[int] = None,
-	softmax_scale: Optional[float] = None,
+	head_dim: tp.Optional[int] = None,
+	softmax_scale: tp.Optional[float] = None,
 ) -> jax.Array:
 	"""
 	Computes multi-head attention using FlashAttention implementation.
@@ -69,7 +70,7 @@ def flash_attention2(
 		query_state: Query, shape (`batch_size`, `q_len`, `num_heads`, `head_dim`).
 		key_state: Key, shape (`batch_size`, `kv_len`, `num_heads`, `head_dim`).
 		value_state: Value, shape (`batch_size`, `kv_len`, `num_heads`, `head_dim`).
-		mask: Optional attention mask. This can be any of the following:
+		mask: tp.Optional attention mask. This can be any of the following:
 
 			- No mask (default):  All attention weights are computed.
 			- Boolean mask (2D): shape (`batch_size`, `q_len`), with `True` for
@@ -79,16 +80,16 @@ def flash_attention2(
 			- 4D mask: shape (`batch_size`, `q_len`, `kv_len`), with `True` for
 				valid and `False` for masked positions.
 
-		bias: Optional attention bias.
+		bias: tp.Optional attention bias.
 		dropout: Dropout rate.
 		inference: Whether to run in inference mode.
 		key: PRNG key for dropout.
 		blocksize_q: Block size for query processing.
 		blocksize_k: Block size for key/value processing.
-		dtype: Optional dtype for the output.
-		precision: Optional precision for matrix multiplication.
-		head_dim: Optional head dim to be used at `query_state = query_state / math.sqrt(float(head_dim or query_state.shape[-1]))`.
-		softmax_scale Optional softmax_scale to be used for `query_state = query_state * softmax_scale`
+		dtype: tp.Optional dtype for the output.
+		precision: tp.Optional precision for matrix multiplication.
+		head_dim: tp.Optional head dim to be used at `query_state = query_state / math.sqrt(float(head_dim or query_state.shape[-1]))`.
+		softmax_scale tp.Optional softmax_scale to be used for `query_state = query_state * softmax_scale`
 
 	Returns:
 		Output of multi-head attention, with shape
@@ -152,14 +153,14 @@ def _flash_attn2(
 	query_state: jax.Array,
 	key_state: jax.Array,
 	value_state: jax.Array,
-	mask: Optional[jax.Array] = None,
-	bias: Optional[jax.Array] = None,
+	mask: tp.Optional[jax.Array] = None,
+	bias: tp.Optional[jax.Array] = None,
 	dropout: float = 0.0,
 	inference: bool = False,
-	key: Optional[jax.random.PRNGKey] = None,
+	key: tp.Optional[jax.random.PRNGKey] = None,
 	blocksize_q: int = 128,
 	blocksize_k: int = 128,
-	dtype: Optional[jnp.dtype] = jnp.float32,
+	dtype: tp.Optional[jnp.dtype] = jnp.float32,
 	precision: lax.PrecisionLike = None,
 ) -> jax.Array:
 	"""Custom VJP-enabled wrapper for FlashAttention forward pass."""
@@ -184,14 +185,14 @@ def _fwd_flash_attn(
 	query_state: jax.Array,
 	key_state: jax.Array,
 	value_state: jax.Array,
-	mask: Optional[jax.Array],
-	bias: Optional[jax.Array],
+	mask: tp.Optional[jax.Array],
+	bias: tp.Optional[jax.Array],
 	dropout: float,
 	inference: bool,
-	key: Optional[jax.random.PRNGKey],
+	key: tp.Optional[jax.random.PRNGKey],
 	blocksize_q: int,
 	blocksize_k: int,
-	dtype: Optional[jnp.dtype],
+	dtype: tp.Optional[jnp.dtype],
 	precision: lax.PrecisionLike,
 ) -> tuple[jax.Array, tuple[jax.Array, ...]]:
 	"""Forward pass of FlashAttention."""
@@ -328,10 +329,10 @@ def _fwd_flash_attn(
 def _bwd_flash_attn(
 	dropout: float,
 	inference: bool,
-	key: Optional[jax.random.PRNGKey],
+	key: tp.Optional[jax.random.PRNGKey],
 	blocksize_q: int,
 	blocksize_k: int,
-	dtype: Optional[jnp.dtype],
+	dtype: tp.Optional[jnp.dtype],
 	precision: lax.PrecisionLike,
 	residuals,
 	grad_in: jax.Array,

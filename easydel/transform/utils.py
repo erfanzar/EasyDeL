@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import os
-from typing import Optional
+import typing as tp
 
 import jax
 from fjformer.checkpoint import CheckpointManager, float_tensor_to_dtype
@@ -80,7 +81,7 @@ def jax2pt(x: jax.Array):
 	return dlpack_pt.from_dlpack(dl_pack_jax)
 
 
-def pt2jax(x, transpose_raw: Optional[tuple] = None):
+def pt2jax(x, transpose_raw: tp.Optional[tuple] = None):
 	# from torch.utils import dlpack as dlpack_pt
 	#
 	# need_reshape = False

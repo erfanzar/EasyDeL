@@ -14,18 +14,11 @@
 
 # Implementation by @erfanzar,
 # with a few bug fixes and adjustments.
-
-from easydel.kernels.gpu_ops.pallas_gemm import gpu_matmul
-from easydel.kernels.gpu_ops.pallas_mha_flash_attention_2 import (
-	pallas_mha_flash_attention2_gpu,
-)
-from easydel.kernels.gpu_ops.pallas_gqa_flash_attention_2 import (
-	pallas_gqa_flash_attention2_gpu,
-)
-from easydel.kernels.gpu_ops.triton_gemm import gemm
-from easydel.kernels.gpu_ops.triton_gqa_flash_attention_2 import (
-	triton_gqa_flash_attention2_gpu,
-)
+from .pallas_gemm import gpu_matmul
+from .pallas_gqa_flash_attention_2 import pallas_gqa_flash_attention2_gpu
+from .pallas_mha_flash_attention_2 import pallas_mha_flash_attention2_gpu
+from .triton_gemm import gemm
+from .triton_gqa_flash_attention_2 import triton_gqa_flash_attention2_gpu
 
 __all__ = [
 	"triton_gqa_flash_attention2_gpu",

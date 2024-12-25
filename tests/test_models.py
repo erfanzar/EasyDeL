@@ -1,5 +1,6 @@
 import gc
 import os
+import typing as tp
 
 # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 import sys
@@ -20,7 +21,6 @@ sys.path.append(
 	)
 )
 import copy
-from typing import Dict, Optional, Union
 
 import jax
 import numpy as np
@@ -49,7 +49,7 @@ class EasyModelsTest(unittest.TestCase):
 		self.intermediate_size: int = 256
 		self.num_hidden_layers: int = 6
 		self.num_attention_heads: int = 8
-		self.num_key_value_heads: Optional[int] = 4
+		self.num_key_value_heads: tp.Optional[int] = 4
 		self.num_experts_per_tok = 4
 		self.num_experts = 8
 		self.num_local_experts = self.num_experts
@@ -68,9 +68,9 @@ class EasyModelsTest(unittest.TestCase):
 		self.gradient_checkpointing = EasyDeLGradientCheckPointers.NONE
 		self.fcm_min_ratio: float = -1
 		self.fcm_max_ratio: float = -1
-		self.rope_scaling: Optional[Dict[str, Union[str, float]]] = None
+		self.rope_scaling: tp.Optional[tp.Dict[str, tp.Union[str, float]]] = None
 		self.use_scan_mlp: bool = False
-		self.bits: Optional[int] = None
+		self.bits: tp.Optional[int] = None
 		self.hidden_act: str = "silu"
 		self.pretraining_tp: int = 1
 		self.scan_layers: bool = False
@@ -813,32 +813,32 @@ if __name__ == "__main__":
 	# unittest.main()
 	test = EasyModelsTest()
 	test.setUp()
-	# test.test_arctic()  # Passed
-	# test.test_cohere()  # Passed
-	# test.test_dbrx()  # Passed
-	# test.test_deepseek_v2()  # Passed
-	# test.test_exaone()  # Passed
-	# test.test_falcon()  # Passed
-	# test.test_gemma()  # Passed
-	# test.test_gemma2()  # Passed
-	# test.test_gptj()  # Passed
+	test.test_arctic()  # Passed
+	test.test_cohere()  # Passed
+	test.test_dbrx()  # Passed
+	test.test_deepseek_v2()  # Passed
+	test.test_exaone()  # Passed
+	test.test_falcon()  # Passed
+	test.test_gemma()  # Passed
+	test.test_gemma2()  # Passed
+	test.test_gptj()  # Passed
 	# test.test_gpt_noex()  # Failed
-	# test.test_gpt2()  # Passed
+	test.test_gpt2()  # Passed
 	# test.test_grok1() # Not Tested Yet!
-	# test.test_internlm2()  # Passed
-	# test.test_llama()  # Passed
-	# test.test_mamba()  # Passed
+	test.test_internlm2()  # Passed
+	test.test_llama()  # Passed
+	test.test_mamba()  # Passed
 	test.test_mamba2()  # Passed
-	# test.test_mistral()  # Passed
-	# test.test_mixtral()  # Passed
-	# test.test_mpt()  # Passed
-	# test.test_olmo()  # Passed
-	# test.test_olmo2()  # Passed
-	# test.test_openelm()  # Passed
-	# test.test_phi()  # Passed
-	# test.test_phi3()  # Passed
+	test.test_mistral()  # Passed
+	test.test_mixtral()  # Passed
+	test.test_mpt()  # Passed
+	test.test_olmo()  # Passed
+	test.test_olmo2()  # Passed
+	test.test_openelm()  # Passed
+	test.test_phi()  # Passed
+	test.test_phi3()  # Passed
 	# test.test_phimoe()  # Failed v0.0.80 - N  Runtime
-	# test.test_qwen2()  # Passed
-	# test.test_qwen2_moe()  # Passed
-	# test.test_stablelm()  # Passed
+	test.test_qwen2()  # Passed
+	test.test_qwen2_moe()  # Passed
+	test.test_stablelm()  # Passed
 	# -----------------------------------------------

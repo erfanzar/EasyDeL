@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+
+import typing as tp
 
 from jax.sharding import PartitionSpec
 
@@ -72,7 +73,7 @@ class InternLM2Config(EasyDeLBaseConfig):
 	        The minimum ratio for Flash Attention.
 	    fcm_max_ratio (`float`, *optional*, defaults to -1):
 	        The maximum ratio for Flash Attention.
-	    rope_scaling (`Dict[str, Union[str, float]]`, *optional*):
+	    rope_scaling (`tp.Dict[str, tp.Union[str, float]]`, *optional*):
 	        The configuration for rope scaling.
 	    scan_mlp_chunk_size (`int`, *optional*, defaults to 1024):
 	        The chunk size to use when scanning the MLP.
@@ -115,7 +116,7 @@ class InternLM2Config(EasyDeLBaseConfig):
 		fcm_min_ratio: float = -1,
 		fcm_max_ratio: float = -1,
 		scan_mlp_chunk_size: int = 1024,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		scan_layers: bool = False,
 		**kwargs,
 	):
@@ -156,7 +157,7 @@ class InternLM2Config(EasyDeLBaseConfig):
 		"""
 		Get the partition rules for the model.
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
 			("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
@@ -181,7 +182,7 @@ class InternLM2Config(EasyDeLBaseConfig):
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		fcm_min_ratio: float = 0.0,
 		fcm_max_ratio: float = 0.0,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		rope_theta: float = 10000.0,
 		hidden_act: str = "silu",
 		scan_layers: bool = True,
@@ -198,7 +199,7 @@ class InternLM2Config(EasyDeLBaseConfig):
 		        number of chunks to be used in flash-based computation
 		    fcm_max_ratio: float: Set the maximum ratio of the number of
 		        input tokens to output tokens
-		    bits: Optional[int]: Determine the number of bits used in
+		    bits: tp.Optional[int]: Determine the number of bits used in
 		        the quantization
 		    rope_theta: float : rope_theta for compute rope
 		    hidden_act: str : hidden_act for mlp

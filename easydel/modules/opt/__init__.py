@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.opt.modeling_opt_flax import (
-	OPTForCausalLM,
-	OPTModel,
-)
-from easydel.modules.opt.opt_configuration import OPTConfig
+from .modeling_opt_flax import OPTForCausalLM, OPTModel
+from .opt_configuration import OPTConfig
 
 __all__ = "OPTForCausalLM", "OPTModel", "OPTConfig"

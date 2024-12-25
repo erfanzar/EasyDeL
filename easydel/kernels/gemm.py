@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 # Implementation by @erfanzar,
 # with a few bug fixes and adjustments.
 
@@ -23,9 +24,9 @@
 # )
 
 import logging
+import typing as tp
 from dataclasses import dataclass
 from functools import partial
-from typing import Optional, Sequence, Tuple
 
 import jax
 import jax.interpreters
@@ -37,8 +38,8 @@ from jax import lax
 from jax import numpy as jnp
 from jax.lax import PrecisionLike
 
-from easydel.kernels.gpu_ops.triton_gemm import gemm as triton_gemm
-from easydel.kernels.tpu_ops.pallas_gemm import pallas_gemm
+from .gpu_ops.triton_gemm import gemm as triton_gemm
+from .tpu_ops.pallas_gemm import pallas_gemm
 
 PLATFORM = jax.extend.backend.get_backend().platform
 INTERPRET = PLATFORM == "cpu"
@@ -49,9 +50,9 @@ def gemm(
 	A: jax.Array,
 	B: jax.Array,
 	*,
-	blocksize_m: Optional[int] = None,
-	blocksize_k: Optional[int] = None,
-	blocksize_n: Optional[int] = None,
+	blocksize_m: tp.Optional[int] = None,
+	blocksize_k: tp.Optional[int] = None,
+	blocksize_n: tp.Optional[int] = None,
 	precision: PrecisionLike = None,
 	**_,
 ):
@@ -80,10 +81,10 @@ def gemm(
 def custom_dot_general_kernel(
 	lhs: jnp.ndarray,
 	rhs: jnp.ndarray,
-	dimension_numbers: Optional[
-		Tuple[
-			Tuple[Sequence[int], Sequence[int]],
-			Tuple[Sequence[int], Sequence[int]],
+	dimension_numbers: tp.Optional[
+		tp.Tuple[
+			tp.Tuple[tp.Sequence[int], tp.Sequence[int]],
+			tp.Tuple[tp.Sequence[int], tp.Sequence[int]],
 		]
 	] = None,
 	precision=None,
@@ -296,7 +297,7 @@ def matmul_benchmark(unused_args=None):
 
 	def autotune_block_sizes(
 		m: int, n: int, k: int, dtype: jnp.dtype = jnp.float32
-	) -> Tuple[Tuple[int, int, int], float]:
+	) -> tp.Tuple[tp.Tuple[int, int, int], float]:
 		best_time_config = None
 		best_flops_config = None
 

@@ -15,11 +15,11 @@ from __future__ import annotations
 
 import os
 import time
+import typing as tp
 from abc import ABCMeta, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-import typing as tp
 
 import flax
 import flax.core
@@ -47,8 +47,9 @@ from easydel.infra.base_module import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseModule,
 )
-from easydel.trainers.training_configurations import TrainingArguments
 from easydel.utils import Timers
+
+from .training_configurations import TrainingArguments
 
 if tp.TYPE_CHECKING:
 	from datasets import Dataset, IterableDataset

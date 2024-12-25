@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+
+import typing as tp
 
 from jax.sharding import PartitionSpec
 
@@ -71,7 +72,7 @@ class Olmo2Config(EasyDeLBaseConfig):
 					Whether to tie weight embeddings
 			rope_theta (`float`, *optional*, defaults to 10000.0):
 					The base period of the RoPE embeddings.
-			rope_scaling (`Dict`, *optional*):
+			rope_scaling (`tp.Dict`, *optional*):
 					Dictionary containing the scaling configuration for the RoPE embeddings. Currently supports two scaling
 					strategies: linear and dynamic. Their scaling factor must be a float greater than 1. The expected format is
 					`{"type": strategy name, "factor": scaling factor}`. When using this flag, don't update
@@ -127,7 +128,7 @@ class Olmo2Config(EasyDeLBaseConfig):
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
 		self.gradient_checkpointing = gradient_checkpointing
@@ -196,7 +197,7 @@ class Olmo2Config(EasyDeLBaseConfig):
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 	):
 		self.gradient_checkpointing = gradient_checkpointing
 		self.use_scan_mlp = use_scan_mlp
@@ -207,7 +208,7 @@ class Olmo2Config(EasyDeLBaseConfig):
 		"""
 		Get the partition rules for the model.
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
 			("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),

@@ -1,9 +1,24 @@
+# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
+
+import math
+import typing as tp
 
 # from functools import partial
 from functools import partial
-import math
-from typing import Any, Dict, List, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -30,7 +45,7 @@ def _yarn_find_correction_range(
 	dim: int,
 	base: float = 10000,
 	max_position_embeddings: int = 2048,
-) -> Tuple[int, int]:
+) -> tp.Tuple[int, int]:
 	hr = jnp.ceil(
 		_yarn_find_correction_dim(
 			high_rot,
@@ -212,14 +227,14 @@ def compute_linear_frequencies(
 	base: int,
 	rotary_dim: int,
 	max_position_embeddings: int,
-	scaling_factors: List[float],
+	scaling_factors: tp.List[float],
 ):
 	inv_freq = compute_basic_inv_frequencies(
 		base=base,
 		rotary_dim=rotary_dim,
 	)
-	cache_list: List[jnp.ndarray] = []
-	offsets: List[int] = []
+	cache_list: tp.List[jnp.ndarray] = []
+	offsets: tp.List[int] = []
 
 	for scaling_factor in scaling_factors:
 		max_len = max_position_embeddings * scaling_factor
@@ -476,9 +491,9 @@ class RotaryEmbedding(nn.Module):
 		positions: jnp.ndarray,
 		query: jnp.ndarray,
 		key: jnp.ndarray,
-		offsets: Optional[jnp.ndarray] = None,
-		frequencies: Optional[jnp.ndarray] = None,
-	) -> Tuple[jnp.ndarray, jnp.ndarray]:
+		offsets: tp.Optional[jnp.ndarray] = None,
+		frequencies: tp.Optional[jnp.ndarray] = None,
+	) -> tp.Tuple[jnp.ndarray, jnp.ndarray]:
 		"""__call__ pass for the rotary embedding."""
 		with jax.ensure_compile_time_eval():
 			if frequencies is None:
@@ -503,7 +518,7 @@ class RotaryEmbedding(nn.Module):
 class LinearScalingRotaryEmbedding(RotaryEmbedding):
 	def __init__(
 		self,
-		scaling_factors: Union[List[float], float],
+		scaling_factors: tp.Union[tp.List[float], float],
 		head_size: int,
 		rotary_dim: int,
 		max_position_embeddings: int,
@@ -527,9 +542,9 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
 		positions: jnp.ndarray,
 		query: jnp.ndarray,
 		key: jnp.ndarray,
-		offsets: Optional[jnp.ndarray] = None,
-		frequencies: Optional[jnp.ndarray] = None,
-	) -> Tuple[jnp.ndarray, jnp.ndarray]:
+		offsets: tp.Optional[jnp.ndarray] = None,
+		frequencies: tp.Optional[jnp.ndarray] = None,
+	) -> tp.Tuple[jnp.ndarray, jnp.ndarray]:
 		"""__call__ pass for the rotary embedding."""
 		with jax.ensure_compile_time_eval():
 			if frequencies is None:
@@ -557,7 +572,7 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
 
 	def __init__(
 		self,
-		scaling_factor: Union[List[float], float],
+		scaling_factor: tp.Union[tp.List[float], float],
 		head_size: int,
 		rotary_dim: int,
 		max_position_embeddings: int,
@@ -581,9 +596,9 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
 		positions: jnp.ndarray,
 		query: jnp.ndarray,
 		key: jnp.ndarray,
-		offsets: Optional[jnp.ndarray] = None,
-		frequencies: Optional[jnp.ndarray] = None,
-	) -> Tuple[jnp.ndarray, jnp.ndarray]:
+		offsets: tp.Optional[jnp.ndarray] = None,
+		frequencies: tp.Optional[jnp.ndarray] = None,
+	) -> tp.Tuple[jnp.ndarray, jnp.ndarray]:
 		"""__call__ pass for the rotary embedding."""
 		with jax.ensure_compile_time_eval():
 			if frequencies is None:
@@ -620,7 +635,7 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
 		base: int,
 		is_neox_style: bool,
 		dtype: jnp.dtype,
-		scaling_factor: Union[float, int] = 1.0,
+		scaling_factor: tp.Union[float, int] = 1.0,
 		extrapolation_factor: float = 1.0,
 		attn_factor: float = 1.0,
 		beta_fast: int = 32,
@@ -647,9 +662,9 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
 		positions: jnp.ndarray,
 		query: jnp.ndarray,
 		key: jnp.ndarray,
-		offsets: Optional[jnp.ndarray] = None,
-		frequencies: Optional[jnp.ndarray] = None,
-	) -> Tuple[jnp.ndarray, jnp.ndarray]:
+		offsets: tp.Optional[jnp.ndarray] = None,
+		frequencies: tp.Optional[jnp.ndarray] = None,
+	) -> tp.Tuple[jnp.ndarray, jnp.ndarray]:
 		"""__call__ pass for the rotary embedding."""
 		with jax.ensure_compile_time_eval():
 			if frequencies is None:
@@ -686,8 +701,8 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
 		base: int,
 		is_neox_style: bool,
 		dtype: jnp.dtype,
-		short_factor: List[float],
-		long_factor: List[float],
+		short_factor: tp.List[float],
+		long_factor: tp.List[float],
 	):
 		super().__init__()
 
@@ -707,9 +722,9 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
 		positions: jnp.ndarray,
 		query: jnp.ndarray,
 		key: jnp.ndarray,
-		offsets: Optional[jnp.ndarray] = None,
-		frequencies: Optional[jnp.ndarray] = None,
-	) -> Tuple[jnp.ndarray, jnp.ndarray]:
+		offsets: tp.Optional[jnp.ndarray] = None,
+		frequencies: tp.Optional[jnp.ndarray] = None,
+	) -> tp.Tuple[jnp.ndarray, jnp.ndarray]:
 		"""__call__ pass for the rotary embedding."""
 		with jax.ensure_compile_time_eval():
 			if frequencies is None:
@@ -767,9 +782,9 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
 		positions: jnp.ndarray,
 		query: jnp.ndarray,
 		key: jnp.ndarray,
-		offsets: Optional[jnp.ndarray] = None,
-		frequencies: Optional[jnp.ndarray] = None,
-	) -> Tuple[jnp.ndarray, jnp.ndarray]:
+		offsets: tp.Optional[jnp.ndarray] = None,
+		frequencies: tp.Optional[jnp.ndarray] = None,
+	) -> tp.Tuple[jnp.ndarray, jnp.ndarray]:
 		"""__call__ pass for the rotary embedding."""
 		with jax.ensure_compile_time_eval():
 			if frequencies is None:
@@ -840,9 +855,9 @@ class DeepseekScalingRotaryEmbedding(nn.Module):
 		positions: jnp.ndarray,
 		query: jnp.ndarray,
 		key: jnp.ndarray,
-		offsets: Optional[jnp.ndarray] = None,
-		frequencies: Optional[jnp.ndarray] = None,
-	) -> Tuple[jnp.ndarray, jnp.ndarray]:
+		offsets: tp.Optional[jnp.ndarray] = None,
+		frequencies: tp.Optional[jnp.ndarray] = None,
+	) -> tp.Tuple[jnp.ndarray, jnp.ndarray]:
 		if frequencies is None:
 			frequencies = compute_deepseek_frequencies(
 				self.base,
@@ -892,8 +907,8 @@ def get_rope(
 	max_position: int,
 	base: int,
 	is_neox_style: bool = True,
-	rope_scaling: Optional[Dict[str, Any]] = None,
-	dtype: Optional[jnp.dtype] = None,
+	rope_scaling: tp.Optional[tp.Dict[str, tp.Any]] = None,
+	dtype: tp.Optional[jnp.dtype] = None,
 	partial_rotary_factor: float = 1.0,
 ) -> RotaryEmbedding:
 	if dtype is None:
@@ -1043,7 +1058,7 @@ def get_frequencies(
 	rotary_dim: int,
 	max_position: int,
 	base: int,
-	rope_scaling: Optional[Dict[str, Any]] = None,
+	rope_scaling: tp.Optional[tp.Dict[str, tp.Any]] = None,
 	partial_rotary_factor: float = 1.0,
 ) -> jax.Array:
 	if partial_rotary_factor < 1.0:

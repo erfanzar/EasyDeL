@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.gpt_neo_x.gpt_neo_x_configuration import GPTNeoXConfig
-from easydel.modules.gpt_neo_x.modeling_gpt_neo_x_flax import (
-	GPTNeoXForCausalLM,
-	GPTNeoXModel,
-)
+from .gpt_neo_x_configuration import GPTNeoXConfig
+from .modeling_gpt_neo_x_flax import GPTNeoXForCausalLM, GPTNeoXModel
 
 __all__ = "GPTNeoXForCausalLM", "GPTNeoXModel", "GPTNeoXConfig"

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 # coding=utf-8
 # Copyright 2021 The Google Flax Team Authors and The HuggingFace Inc. team.
 #
@@ -28,7 +29,7 @@
 # limitations under the License.
 
 import math
-from typing import Any, Optional, Union
+import typing as tp
 
 import chex
 import jax
@@ -59,10 +60,10 @@ class Conv1D(nn.Module):
 		in_features: int,
 		out_features: int,
 		use_bias: bool = True,
-		dtype: Any = jnp.float32,
+		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
-		dot_general: Optional[None] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		dot_general: tp.Optional[None] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -111,7 +112,7 @@ class GPT2Attention(FlaxAttentionModule):
 		config: GPT2Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		causal: bool = True,
 		is_cross_attention: bool = False,
 		*,
@@ -203,8 +204,8 @@ class GPT2Attention(FlaxAttentionModule):
 		hidden_states: chex.Array,
 		key_value_states: chex.Array,
 		attention_mask: chex.Array,
-		causal_mask: Optional[chex.Array] = None,
-		cache_view: Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
 	):
 		is_cross_attention = key_value_states is not None
@@ -270,7 +271,7 @@ class GPT2MLP(nn.Module):
 		intermediate_size: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[jax.lax.Precision] = None,
+		precision: tp.Optional[jax.lax.Precision] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -312,7 +313,7 @@ class GPT2Block(nn.Module):
 		config: GPT2Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[jax.lax.Precision] = None,
+		precision: tp.Optional[jax.lax.Precision] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -386,9 +387,9 @@ class GPT2Block(nn.Module):
 		hidden_states,
 		attention_mask=None,
 		causal_mask=None,
-		encoder_hidden_states: Optional[chex.Array] = None,
-		encoder_attention_mask: Optional[chex.Array] = None,
-		cache_view: Optional[TransformerCacheView] = None,
+		encoder_hidden_states: tp.Optional[chex.Array] = None,
+		encoder_attention_mask: tp.Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
 	):
 		residual = hidden_states
@@ -455,7 +456,7 @@ class GPT2Model(EasyDeLBaseModule):
 		config: GPT2Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -507,11 +508,11 @@ class GPT2Model(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		encoder_hidden_states: Optional[chex.Array] = None,
-		encoder_attention_mask: Optional[chex.Array] = None,
-		past_key_values: Optional[TransformerCache] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		encoder_hidden_states: tp.Optional[chex.Array] = None,
+		encoder_attention_mask: tp.Optional[chex.Array] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
@@ -597,7 +598,7 @@ class GPT2LMHeadModel(EasyDeLBaseModule):
 		config: GPT2Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -630,11 +631,11 @@ class GPT2LMHeadModel(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		encoder_hidden_states: Optional[chex.Array] = None,
-		encoder_attention_mask: Optional[chex.Array] = None,
-		past_key_values: Optional[TransformerCache] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		encoder_hidden_states: tp.Optional[chex.Array] = None,
+		encoder_attention_mask: tp.Optional[chex.Array] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,

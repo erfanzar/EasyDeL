@@ -12,13 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-from easydel.utils.helpers import Timers, Timer
-from easydel.utils.quantizers import EasyQuantizer
 from easydel.utils import (
-	graph_utils,
 	analyze_memory,
 	compiling_utils,
+	graph_utils,
 	traversals,
 )
 from easydel.utils.compiling_utils import (
@@ -28,10 +25,12 @@ from easydel.utils.compiling_utils import (
 	load_compiled_fn,
 	save_compiled_fn,
 )
+from easydel.utils.helpers import Timer, Timers
+from easydel.utils.quantizers import EasyQuantizer
 
 __all__ = (
 	"Timers",
-	'Timer',
+	"Timer",
 	"EasyQuantizer",
 	"graph_utils",
 	"analyze_memory",

@@ -19,9 +19,9 @@ import socket
 import socketserver
 import threading
 import time
+import typing as tp
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Union
 
 import jax
 
@@ -53,7 +53,7 @@ class SMPMemoryMonitor:
 		self.history = []
 		self._monitor_thread = None
 
-	def analyze_device(self, device_stats: Dict, dev) -> Dict:
+	def analyze_device(self, device_stats: tp.Dict, dev) -> tp.Dict:
 		"""
 		Analyze memory stats for a single device.
 		"""
@@ -96,7 +96,7 @@ class SMPMemoryMonitor:
 			self.check_all_devices()
 			time.sleep(self.check_interval)
 
-	def check_all_devices(self) -> List[Dict]:
+	def check_all_devices(self) -> tp.List[tp.Dict]:
 		"""
 		Check memory usage on all available devices.
 		Returns list of analysis results.
@@ -123,7 +123,9 @@ class SMPMemoryMonitor:
 
 		return results
 
-	def get_summary(self, format: str = "auto") -> Union[List[Dict], "pd.DataFrame"]:
+	def get_summary(
+		self, format: str = "auto"
+	) -> tp.Union[tp.List[tp.Dict], "pd.DataFrame"]:
 		"""
 		Get a summary of memory usage history.
 
@@ -162,15 +164,15 @@ class SMPMemoryMonitor:
 			print(f"Peak Usage: {r['peak_usage_gb']} GB ({r['peak_utilization_pct']}%)")
 			print(f"Active Allocations: {r['num_allocations']}")
 
-	def get_device_history(self, device_id: Optional[str] = None) -> List[Dict]:
+	def get_device_history(self, device_id: tp.Optional[str] = None) -> tp.List[tp.Dict]:
 		"""
 		Get memory history for a specific device or all devices.
 
 		Args:
-		    device_id: Optional device ID to filter by
+		    device_id: tp.Optional device ID to filter by
 
 		Returns:
-		    List of history entries for the specified device(s)
+		    tp.List of history entries for the specified device(s)
 		"""
 		if device_id:
 			return [entry for entry in self.history if entry["device_id"] == device_id]
@@ -208,7 +210,7 @@ class DeviceStats:
 	fragmentation_ratio: float
 	allocation_efficiency: float
 	memory_pressure: str
-	raw_stats: Dict[str, Any]
+	raw_stats: tp.Dict[str, tp.Any]
 
 
 class MemoryMonitorServer:
@@ -296,7 +298,7 @@ class MemoryMonitorClient:
 		self.running = False
 		self.hostname = socket.gethostname()
 
-	def analyze_memory(self, memory_stats: Dict[str, Any]) -> DeviceStats:
+	def analyze_memory(self, memory_stats: tp.Dict[str, tp.Any]) -> DeviceStats:
 		"""Analyze memory statistics for a single device"""
 		bytes_limit = memory_stats["bytes_limit"]
 		current_usage = memory_stats["bytes_in_use"]

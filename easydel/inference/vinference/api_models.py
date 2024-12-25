@@ -11,10 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import time
+import typing as tp
 import uuid
-from typing import Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -25,13 +24,13 @@ class ChatMessage(BaseModel):
 
 
 class DeltaMessage(BaseModel):
-	role: Optional[str] = None
-	content: Optional[str] = None
+	role: tp.Optional[str] = None
+	content: tp.Optional[str] = None
 
 
 class UsageInfo(BaseModel):
 	prompt_tokens: int = 0
-	completion_tokens: Optional[int] = 0
+	completion_tokens: tp.Optional[int] = 0
 	total_tokens: int = 0
 	tokens_pre_second: float = 0
 	processing_time: float = 0.0
@@ -42,24 +41,24 @@ class UsageInfo(BaseModel):
 class ChatCompletionRequest(BaseModel):
 	# The openai api native parameters
 	model: str
-	messages: List[ChatMessage]
-	function_call: Optional[str] = "none"  # Ignored by EasyDeL
-	temperature: Optional[float] = 1  # Ignored by EasyDeL
-	top_p: Optional[float] = 1.0  # Ignored by EasyDeL
-	n: Optional[int] = 1  # Ignored by EasyDeL
-	stream: Optional[bool] = False
-	stop: Optional[Union[str, List[str]]] = None  # Ignored by EasyDeL
-	max_tokens: Optional[int] = 16
-	presence_penalty: Optional[float] = 0.0  # Ignored by EasyDeL
-	frequency_penalty: Optional[float] = 0.0  # Ignored by EasyDeL
-	logit_bias: Optional[Dict[str, float]] = None  # Ignored by EasyDeL
-	user: Optional[str] = None  # Ignored by EasyDeL
+	messages: tp.List[ChatMessage]
+	function_call: tp.Optional[str] = "none"  # Ignored by EasyDeL
+	temperature: tp.Optional[float] = 1  # Ignored by EasyDeL
+	top_p: tp.Optional[float] = 1.0  # Ignored by EasyDeL
+	n: tp.Optional[int] = 1  # Ignored by EasyDeL
+	stream: tp.Optional[bool] = False
+	stop: tp.Optional[tp.Union[str, tp.List[str]]] = None  # Ignored by EasyDeL
+	max_tokens: tp.Optional[int] = 16
+	presence_penalty: tp.Optional[float] = 0.0  # Ignored by EasyDeL
+	frequency_penalty: tp.Optional[float] = 0.0  # Ignored by EasyDeL
+	logit_bias: tp.Optional[tp.Dict[str, float]] = None  # Ignored by EasyDeL
+	user: tp.Optional[str] = None  # Ignored by EasyDeL
 
 
 class ChatCompletionResponseChoice(BaseModel):
 	index: int
 	message: ChatMessage
-	finish_reason: Optional[Literal["stop", "length", "function_call"]] = None
+	finish_reason: tp.Optional[tp.Literal["stop", "length", "function_call"]] = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -67,14 +66,14 @@ class ChatCompletionResponse(BaseModel):
 	object: str = "chat.completion"
 	created: int = Field(default_factory=lambda: int(time.time()))
 	model: str
-	choices: List[ChatCompletionResponseChoice]
+	choices: tp.List[ChatCompletionResponseChoice]
 	usage: UsageInfo
 
 
 class ChatCompletionStreamResponseChoice(BaseModel):
 	index: int
 	delta: DeltaMessage
-	finish_reason: Optional[Literal["stop", "length", "function_call"]] = None
+	finish_reason: tp.Optional[tp.Literal["stop", "length", "function_call"]] = None
 
 
 class ChatCompletionStreamResponse(BaseModel):
@@ -82,10 +81,10 @@ class ChatCompletionStreamResponse(BaseModel):
 	object: str = "chat.completion.chunk"
 	created: int = Field(default_factory=lambda: int(time.time()))
 	model: str
-	choices: List[ChatCompletionStreamResponseChoice]
+	choices: tp.List[ChatCompletionStreamResponseChoice]
 	usage: UsageInfo
 
 
 class CountTokenRequest(BaseModel):
 	model: str
-	conversation: Union[str, ChatMessage]
+	conversation: tp.Union[str, ChatMessage]

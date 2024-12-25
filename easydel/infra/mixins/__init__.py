@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.infra.mixins.bridge import EasyBridgeMixin
-from easydel.infra.mixins.generation import EasyGenerationMixin
-from easydel.infra.mixins.protocol import BaseModuleProtocol
+from .bridge import EasyBridgeMixin
+from .generation import EasyGenerationMixin
+from .protocol import BaseModuleProtocol
 
 __all__ = "BaseModuleProtocol", "EasyGenerationMixin", "EasyBridgeMixin"

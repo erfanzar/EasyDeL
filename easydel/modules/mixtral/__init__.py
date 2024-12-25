@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.mixtral.mixtral_configuration import MixtralConfig
-from easydel.modules.mixtral.modeling_mixtral_flax import (
-	MixtralForCausalLM,
-	MixtralModel,
-)
+from .mixtral_configuration import MixtralConfig
+from .modeling_mixtral_flax import MixtralForCausalLM, MixtralModel
 
 __all__ = "MixtralForCausalLM", "MixtralModel", "MixtralConfig"

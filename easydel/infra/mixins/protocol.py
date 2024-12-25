@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import typing as tp
 from abc import ABCMeta, abstractmethod
 
@@ -20,12 +19,14 @@ from flax import nnx as nn
 from jax.sharding import Mesh
 
 from easydel.etils.etils import EasyDeLQuantizationMethods
-from easydel.infra.base_config import EasyDeLBaseConfig
-from easydel.infra.loss_utils import (
+from easydel.layers.caching.transformer_cache import TransformerCache
+
+from ..base_config import EasyDeLBaseConfig
+from ..loss_utils import (
 	LossConfig,
 	LossMetrics,
 )
-from easydel.infra.modeling_outputs import (
+from ..modeling_outputs import (
 	FlaxCausalLMOutput,
 	FlaxCLIPOutput,
 	FlaxCLIPTextModelOutput,
@@ -34,7 +35,6 @@ from easydel.infra.modeling_outputs import (
 	MoeCausalLMOutput,
 	MoeModelOutput,
 )
-from easydel.layers.caching.transformer_cache import TransformerCache
 
 PartitionLike = tp.Optional[
 	tp.Union[tp.Mapping[str, tp.Callable], tp.Mapping[tuple, tp.Callable]]

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 from easydel.infra.base_module import EasyDeLBaseConfig
 
 
@@ -100,9 +101,9 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
 	        The number of layers that use SWA (Sliding Window Attention). The bottom layers use SWA while the top use full attention.
 	    attention_dropout (`float`, *optional*, defaults to 0.0):
 	        The dropout ratio for the attention probabilities.
-	    vision_config (`Dict`, *optional*):
+	    vision_config (`tp.Dict`, *optional*):
 	        The config for the visual encoder initialization.
-	    rope_scaling (`Dict`, *optional*):
+	    rope_scaling (`tp.Dict`, *optional*):
 	        Dictionary containing the scaling configuration for the RoPE embeddings. NOTE: if you apply new rope type
 	        and you expect the model to work on longer `max_position_embeddings`, we recommend you to update this value
 	        accordingly.
@@ -127,11 +128,11 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
 	            `beta_slow` (`float`, *optional*):
 	                Only used with 'yarn'. Parameter to set the boundary for interpolation (only) in the linear
 	                ramp function. If unspecified, it defaults to 1.
-	            `short_factor` (`List[float]`, *optional*):
+	            `short_factor` (`tp.List[float]`, *optional*):
 	                Only used with 'longrope'. The scaling factor to be applied to short contexts (<
 	                `original_max_position_embeddings`). Must be a list of numbers with the same length as the hidden
 	                size divided by the number of attention heads divided by 2
-	            `long_factor` (`List[float]`, *optional*):
+	            `long_factor` (`tp.List[float]`, *optional*):
 	                Only used with 'longrope'. The scaling factor to be applied to long contexts (<
 	                `original_max_position_embeddings`). Must be a list of numbers with the same length as the hidden
 	                size divided by the number of attention heads divided by 2

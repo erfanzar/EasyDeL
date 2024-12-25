@@ -12,4 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.smi.smi import get_capacity_matrix, get_mem, initialise_tracking, run
+from .smi import get_capacity_matrix, get_mem, initialise_tracking, run
+
+__all__ = "get_capacity_matrix", "get_mem", "initialise_tracking", "run"

@@ -11,18 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import functools
-from typing import (
-	Any,
-	Callable,
-	List,
-	Mapping,
-	Optional,
-	Sequence,
-	Tuple,
-	Type,
-)
+import typing as tp
 
 import flax.nnx
 from fjformer import make_shard_and_gather_fns, match_partition_rules
@@ -48,10 +38,10 @@ logger = get_logger(name=__name__)
 def get_modules_by_type(
 	model_type: str,
 	task_type: TaskType,
-) -> Tuple[
-	Type[EasyDeLBaseConfig],
-	Type[EasyDeLBaseModule] | Any,
-	functools.partial | Any,
+) -> tp.Tuple[
+	tp.Type[EasyDeLBaseConfig],
+	tp.Type[EasyDeLBaseModule] | tp.Any,
+	functools.partial | tp.Any,
 ]:
 	"""
 	The get_modules_by_type function is a helper function that returns the following:
@@ -94,12 +84,12 @@ class AutoEasyDeLConfig:
 	def from_pretrained(
 		cls,
 		pretrained_model_name_or_path: str,
-		sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
-		sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-		partition_axis: Optional[PartitionAxis] = None,
+		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
+		sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+		partition_axis: tp.Optional[PartitionAxis] = None,
 		shard_attention_computation: bool = True,
-		backend: Optional[EasyDeLBackends] = None,
-		platform: Optional[EasyDeLPlatforms] = None,
+		backend: tp.Optional[EasyDeLBackends] = None,
+		platform: tp.Optional[EasyDeLPlatforms] = None,
 		model_task: TaskType = TaskType.CAUSAL_LM,
 		from_torch: bool = False,
 		**kwargs,
@@ -111,9 +101,9 @@ class AutoEasyDeLConfig:
 		Args:
 		    cls: Create an instance of the class that called this function.
 		    pretrained_model_name_or_path: str: Identify the model in the huggingface model hub.
-		    sharding_axis_dims: Sequence[int]: Specify the dimension of each axis in the sharded model_tasking arrays in easydel.
+		    sharding_axis_dims: tp.Sequence[int]: Specify the dimension of each axis in the sharded model_tasking arrays in easydel.
 		    shard_attention_computation: bool: whenever to use shard_map for attention.
-		    backend: Optional[EasyDeLBackends] : backend to use for model.
+		    backend: tp.Optional[EasyDeLBackends] : backend to use for model.
 				model_task (TaskType): Task type of model load and find.
 		    from_torch: should config be loaded from torch models or not.
 		    **kwargs: Pass additional arguments to the model and config classes.
@@ -172,10 +162,10 @@ class AutoShardAndGatherFunctions:
 	def from_config(
 		cls,
 		config: EasyDeLBaseConfig,
-		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
+		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec]]] = None,
 		flatten: bool = True,
 		model_task: TaskType = TaskType.CAUSAL_LM,
-		depth_target: Optional[List[str]] = None,
+		depth_target: tp.Optional[tp.List[str]] = None,
 	):
 		"""
 		Generates shard and gather functions based on a provided `EasyDeLBaseConfig` object.
@@ -226,19 +216,19 @@ class AutoShardAndGatherFunctions:
 	def from_pretrained(
 		cls,
 		pretrained_model_name_or_path: str,
-		sharding_axis_dims: Sequence[int] = (1, -1, 1, 1),
-		sharding_axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-		partition_axis: Optional[PartitionAxis] = None,
+		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
+		sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+		partition_axis: tp.Optional[PartitionAxis] = None,
 		shard_attention_computation: bool = True,
-		backend: Optional[EasyDeLBackends] = None,
-		platform: Optional[EasyDeLPlatforms] = None,
-		partition_rules: Optional[Tuple[Tuple[str, PartitionSpec]]] = None,
+		backend: tp.Optional[EasyDeLBackends] = None,
+		platform: tp.Optional[EasyDeLPlatforms] = None,
+		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec]]] = None,
 		flatten: bool = True,
-		config_kwargs: Optional[Mapping[str, Any]] = None,
+		config_kwargs: tp.Optional[tp.Mapping[str, tp.Any]] = None,
 		model_task: TaskType = TaskType.CAUSAL_LM,
 		from_torch: bool = False,
 		trust_remote_code: bool = False,
-	) -> Tuple[Mapping[str, Callable], Mapping[str, Callable]]:
+	) -> tp.Tuple[tp.Mapping[str, tp.Callable], tp.Mapping[str, tp.Callable]]:
 		"""
 		Generates shard and gather functions based on a pretrained model name or path.
 

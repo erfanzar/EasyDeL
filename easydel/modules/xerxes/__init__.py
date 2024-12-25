@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.xerxes.modeling_xerxes_flax import XerxesForCausalLM, XerxesModel
-from easydel.modules.xerxes.xerxes_configuration import XerxesConfig
+from .modeling_xerxes_flax import XerxesForCausalLM, XerxesModel
+from .xerxes_configuration import XerxesConfig
 
 __all__ = "XerxesForCausalLM", "XerxesModel", "XerxesConfig"

@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, Optional, Union
+
+import typing as tp
 
 from jax.sharding import PartitionSpec
 
@@ -78,7 +79,7 @@ class LlamaConfig(EasyDeLBaseConfig):
 	        The minimum ratio for Flash Attention.
 	    fcm_max_ratio (`float`, *optional*, defaults to -1):
 	        The maximum ratio for Flash Attention.
-	    rope_scaling (`Dict[str, Union[str, float]]`, *optional*):
+	    rope_scaling (`tp.Dict[str, tp.Union[str, float]]`, *optional*):
 	        The configuration for rope scaling.
 	    scan_mlp_chunk_size (`int`, *optional*, defaults to 1024):
 	        The chunk size to use when scanning the MLP.
@@ -104,8 +105,8 @@ class LlamaConfig(EasyDeLBaseConfig):
 		num_hidden_layers: int = 32,
 		num_attention_heads: int = 32,
 		number_rep_kv: int = 1,
-		head_dim: Optional[int] = None,
-		num_key_value_heads: Optional[int] = None,
+		head_dim: tp.Optional[int] = None,
+		num_key_value_heads: tp.Optional[int] = None,
 		max_position_embeddings: int = 2048,
 		rms_norm_eps: float = 1e-6,
 		initializer_range: float = 0.02,
@@ -121,9 +122,9 @@ class LlamaConfig(EasyDeLBaseConfig):
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		fcm_min_ratio: float = -1,
 		fcm_max_ratio: float = -1,
-		rope_scaling: Dict[str, Union[str, float]] = None,
+		rope_scaling: tp.Dict[str, tp.Union[str, float]] = None,
 		scan_mlp_chunk_size: int = 1024,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		hidden_act: str = "silu",
 		pretraining_tp: int = 1,
 		mlp_bias: bool = False,
@@ -173,7 +174,7 @@ class LlamaConfig(EasyDeLBaseConfig):
 		"""
 		Get the partition rules for the model.
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
 			("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
@@ -202,7 +203,7 @@ class LlamaConfig(EasyDeLBaseConfig):
 		fcm_min_ratio: float = 0.0,
 		fcm_max_ratio: float = 0.0,
 		number_rep_kv: int = 1,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		rope_theta: float = 10000.0,
 		attention_bias: bool = False,
 		hidden_act: str = "silu",
@@ -229,7 +230,7 @@ class LlamaConfig(EasyDeLBaseConfig):
 		        input tokens to output tokens
 		    number_rep_kv: int: Determine how many times the key and
 		        value vectors are repeated
-		    bits: Optional[int]: Determine the number of bits used in
+		    bits: tp.Optional[int]: Determine the number of bits used in
 		        the quantization
 		    rope_theta: float : rope_theta for compute rope
 		    attention_bias: bool : whenever to use attention bias or no
@@ -293,7 +294,7 @@ class VisionLlamaConfig(LlamaConfig):
 		"""
 		Get the partition rules for the model.
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
 			("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),

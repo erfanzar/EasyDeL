@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+
+import typing as tp
 
 from jax.sharding import PartitionSpec
 
@@ -41,7 +42,7 @@ class StableLmConfig(EasyDeLBaseConfig):
 	        Number of attention heads for each attention layer in the Transformer encoder.
 	    num_key_value_heads (`int`, *optional*, defaults to 32):
 	        Number of key-value heads for each attention layer in the Transformer encoder.
-	    hidden_act (`str` or `Callable`, *optional*, defaults to `"silu"`):
+	    hidden_act (`str` or `tp.Callable`, *optional*, defaults to `"silu"`):
 	        The non-linear activation function (function or string) in the encoder and pooler. If string, `"gelu"`,
 	        `"relu"`, `"swish"` and `"gelu_new"` are supported.
 	    max_position_embeddings (`int`, *optional*, defaults to 4096):
@@ -105,7 +106,7 @@ class StableLmConfig(EasyDeLBaseConfig):
 		partial_rotary_factor=0.25,
 		bos_token_id=0,
 		eos_token_id=0,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	) -> None:
@@ -143,7 +144,7 @@ class StableLmConfig(EasyDeLBaseConfig):
 
 	def add_jax_args(
 		self,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	):
@@ -162,7 +163,7 @@ class StableLmConfig(EasyDeLBaseConfig):
 		        Whether to use fully sharded data parallelism.
 
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
 			(

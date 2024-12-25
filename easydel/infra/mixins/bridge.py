@@ -11,15 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from __future__ import annotations
 
 import gc
 import os
 import typing as tp
+import warnings
 from copy import deepcopy
 from pathlib import Path
-import warnings
 
 import jax
 import jax.extend
@@ -37,25 +36,24 @@ from easydel.etils.etils import (
 	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
-from easydel.infra.base_config import (
-	EasyDeLBaseConfig,
-	EasyDeLBaseConfigDict,
-)
-
-from easydel.infra.utils import quantize_linear_layers
-
 from easydel.utils.checkpoint_managers import CheckpointManager
 from easydel.utils.readme_generator import (
 	ModelInfo,
 	ReadmeGenerator,
 )
 from easydel.utils.traversals import (
-	is_flatten,
 	flatten_dict,
+	is_flatten,
 	merge_model_and_tree,
 	string_key_to_int,
 	unflatten_dict,
 )
+
+from ..base_config import (
+	EasyDeLBaseConfig,
+	EasyDeLBaseConfigDict,
+)
+from ..utils import quantize_linear_layers
 
 logger = get_logger(__name__)
 
@@ -396,12 +394,13 @@ class EasyBridgeMixin(PushToHubMixin):
 		from transformers.utils import is_offline_mode as _is_offline_mode
 		from transformers.utils import is_remote_url as _is_remote_url
 
-		from easydel.infra.utils import quantize_linear_layers
 		from easydel.modules.auto.auto_configuration import (
 			AutoEasyDeLConfig,
 			AutoShardAndGatherFunctions,
 			get_modules_by_type,
 		)
+
+		from ..utils import quantize_linear_layers
 
 		api = HfApi(token=token)
 
@@ -591,6 +590,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		**kwargs,
 	):
 		from transformers import AutoConfig
+
 		from easydel.modules.auto.auto_configuration import (
 			AutoShardAndGatherFunctions,
 			get_modules_by_type,
@@ -730,7 +730,7 @@ class EasyBridgeMixin(PushToHubMixin):
 
 	@classmethod
 	def get_torch_loader(cls):
-		from easydel.infra.factory import TaskType
+		from ..factory import TaskType
 
 		auto_loader = getattr(cls, "hf_torch_auto_loader", None)
 		if auto_loader is not None:

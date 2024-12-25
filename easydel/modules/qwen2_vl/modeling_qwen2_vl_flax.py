@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import math
 import typing as tp
 from functools import partial
@@ -21,8 +20,9 @@ import flax
 import flax.struct
 import jax
 import jax.numpy as jnp
-from flax import nnx as nn
 import numpy as np
+from flax import nnx as nn
+
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (

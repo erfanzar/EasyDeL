@@ -11,15 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-import optax
-from easydel.etils.easystate import EasyDeLState
-from easydel.infra.loss_utils import LossConfig, LossMetrics
 import typing as tp
+
 import jax
+import optax
+from fjformer.sharding import with_sharding_constraint
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-from fjformer.sharding import with_sharding_constraint
+
+from easydel.etils.easystate import EasyDeLState
+from easydel.infra.loss_utils import LossConfig, LossMetrics
 
 
 def create_training_step(

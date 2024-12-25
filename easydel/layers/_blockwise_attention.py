@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """An implementation of Blockwise parallel transformer https://arxiv.org/abs/2305.19370
 Also include a reference implementation of memory-efficient transformer https://arxiv.org/abs/2112.05682
 from EasyLM https://github.com/young-geng/EasyLM/blob/main/EasyLM/bpt.py
 """
 
 import functools
-from typing import NamedTuple
+import typing as tp
 
 import jax
 import jax.lax as lax
@@ -146,7 +147,7 @@ def blockwise_attn(
 	return res
 
 
-class Carry(NamedTuple):
+class Carry(tp.NamedTuple):
 	numerator: jax.Array
 	denominator: jax.Array
 	max_so_far: jax.Array

@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+import typing as tp
 
+import jax
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
-import jax
 
 
 class RMSNorm(nn.Module):
@@ -28,7 +28,7 @@ class RMSNorm(nn.Module):
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
 		*,
-		rngs: Optional[nn.Rngs] = None,
+		rngs: tp.Optional[nn.Rngs] = None,
 	) -> None:
 		if rngs is None:
 			rngs = nn.Rngs(0)
