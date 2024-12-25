@@ -1,6 +1,6 @@
 # EasyDeL 🔮
 
-[**Key Features**](#key-features) 
+[**Key Features**](#key-features)
 | [**Quick Start**](#quick-start)
 | [**Reference docs**](https://easydel.readthedocs.io/en/latest/)
 | [**License**](#license-)
@@ -15,13 +15,13 @@ EasyDeL is an open-source framework designed to enhance and streamline the train
   - SFTTrainer for supervised fine-tuning
   - DPOTrainer for direct preference optimization
   - ORPOTrainer for offline reinforcement learning
-  - More Trainers Like image-text-to-image and others are also supported in main trainer 
+  - More Trainers Like image-text-to-image and others are also supported in main trainer
 
 - **Vision Model Support**: Comprehensive support for:
   - Vision-to-Vision tasks
   - Image-Text-to-Image generation
   - Image-to-Text processing
-- **Production-Ready Serving**: 
+- **Production-Ready Serving**:
   - `vInference` engine for efficient LLM inference
   - `vInferenceApiServer` for OpenAI-compatible API endpoints
 - **Performance Optimization**:
@@ -41,23 +41,6 @@ EasyDeL's architecture is designed for maximum flexibility:
 ### Optimizations
 
 #### Attention Mechanisms
-EasyDeL offers various attention implementations optimized for different use cases:
-
-```python
-import easydel as ed
-
-# Choose platform during model initialization
-model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
-    "model_name",
-    platform=ed.EasyDeLPlatforms.TRITON,  # or .JAX, .PALLAS
-)
-```
-
-- **TRITON**: Optimized for GPU computation with custom CUDA/Triton kernels
-- **PALLAS**: Specialized for TPU performance
-- **JAX**: Default JAX backend for broad hardware support
-
-#### Attention Mechanisms
 
 EasyDeL offers various attention implementations optimized for different use cases:
 
@@ -65,12 +48,11 @@ EasyDeL offers various attention implementations optimized for different use cas
 import easydel as ed
 
 # Configure attention mechanism in model config
-config = ed.EasyDeLBaseConfigDict(
-    attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,  # Choose mechanism
-)
+config = ed.EasyDeLBaseConfigDict(attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,) # Choose mechanism
 ```
 
 Available mechanisms:
+
 - **FLASH_ATTN2**: Optimized Flash Attention 2 implementation
 - **CUDA_FLASH_ATTN2**: CUDA-specific Flash Attention 2 variant
 - **RING**: Memory-efficient ring attention for distributed computing
@@ -143,68 +125,112 @@ inference = ed.vInference(
 api_server = ed.vInferenceApiServer({inference.inference_name: inference})
 api_server.fire()
 ```
+
 ### Building Custom Modules 🛠️
-EasyDeL's architecture is designed for maximum flexibility and customization:
+
+The `EasyDeLBaseModule` is the core foundation for creating custom modules and models in EasyDeL. It provides a powerful set of built-in features for configuration, data handling, parameter management, and more. It inherits from `flax.nnx.Module`, `BaseModuleProtocol`, `EasyBridgeMixin`, and `EasyGenerationMixin`.
+
 ```python
 import easydel as ed
+import jax
 import jax.numpy as jnp
+import typing as tp
+from flax import nnx as nn
 
-# Create your custom module
-class MyCustomModule(ed.EasyDeLModule):
-		def __init__(
-				self,
-				config,
-				dtype: jnp.dtype = jnp.float32,
-				param_dtype: jnp.dtype = jnp.float32,
-				precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
-				other_parameters = ...,
-				*,
-				rngs: nn.Rngs,
-		):
-				super().__init__(
-					config=config,
-					dtype=dtype,
-					param_dtype=param_dtype,
-					precision=precision,
-					rngs=rngs,
-				)
-        self.other_parameters = other_parameters
-        
-    def __call__(self, x):
-        # Your custom implementation
-        return x
+# Example Custom Module
+class MyCustomModule(ed.EasyDeLBaseModule):
+ def __init__(
+  self,
+  config,
+  dtype: jnp.dtype = jnp.float32,
+  param_dtype: jnp.dtype = jnp.float32,
+  precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+  other_parameters=...,
+  other_parameters_1=...,
+  *,
+  rngs: nn.Rngs,
+ ):
+  super().__init__(
+   config=config,
+   dtype=dtype,
+   param_dtype=param_dtype,
+   precision=precision,
+   rngs=rngs,
+  )
+  self.other_parameters = other_parameters
 
-# Use it in your model
-class MyModel(ed.EasyDeLPreTrainedModel):
-		def __init__(
-				self,
-				config,
-				dtype: jnp.dtype = jnp.float32,
-				param_dtype: jnp.dtype = jnp.float32,
-				precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
-				other_parameters = ...,
-				*,
-				rngs: nn.Rngs,
-		):
-				super().__init__(
-					config=config,
-					dtype=dtype,
-					param_dtype=param_dtype,
-					precision=precision,
-					rngs=rngs,
-				)
-        self.custom_module = MyCustomModule(
-					config=config,
-					dtype=dtype,
-					param_dtype=param_dtype,
-					precision=precision,
-					other_parameters=other_parameters,
-					rngs=rngs,
-				)
-        
-    def __call__(self, x):
-        return self.custom_module(x)
+ def __call__(self, x):
+  # Custom implementation
+  return x
+
+
+# Example Model using the Custom Module
+class MyModel(ed.EasyDeLBaseModule):
+    config_class = ed.EasyDeLBaseConfig
+ def __init__(
+  self,
+  config,
+  dtype: jnp.dtype = jnp.float32,
+  param_dtype: jnp.dtype = jnp.float32,
+  precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+  other_parameters=...,
+  other_parameters_1=...,
+  other_parameters_2=...,
+  *,
+  rngs: nn.Rngs,
+ ):
+  super().__init__(
+   config=config,
+   dtype=dtype,
+   param_dtype=param_dtype,
+   precision=precision,
+   rngs=rngs,
+  )
+  self.custom_module = MyCustomModule(
+   config=config,
+   dtype=dtype,
+   param_dtype=param_dtype,
+   precision=precision,
+   other_parameters=other_parameters,
+   other_parameters_1=other_parameters_1,
+   rngs=rngs,
+  )
+
+ def __call__(self, x):
+  return self.custom_module(x)
 ```
+
+### Key Features at a Glance
+
+- **Core Class:** Foundation for building EasyDeL modules, inheriting from `flax.nnx.Module`, `BaseModuleProtocol`, `EasyBridgeMixin` and `EasyGenerationMixin`.
+- **Configuration:**
+  - Uses a `config` attribute of type `EasyDeLBaseConfig` for model settings.
+  - Provides `mesh` property for retrieving mesh from the config.
+  - Includes class attributes for model metadata: `config_class`, `base_model_prefix`, `_model_task`, and `_model_type`.
+- **Data Handling:**
+  - Controls data types (`dtype`, `param_dtype`) and numerical precision (`precision`).
+  - Supports quick precision switching with `half()` (float16) and `float()` (float32).
+  - `module_dtype` property returns the parameters dtype
+- **Randomness:** Manages random number generation via `nn.Rngs`.
+- **Parameter Shape:** Inspects the shape of all model parameters with `graphtree_params_shape` property.
+- **Causal Mask & Frequencies:** Accesses `causal_mask` and `frequencies` from the config for sequence modeling.
+- **Static Arguments:**
+  - `static_arguments` property with ability to define static arguments via `get_static_arguments` method.
+- **Dynamic Loss:** Dynamically loads loss functions via `loss_function` based on name or `loss_type`.
+- **Sharding/Gathering:** Offers `shard_model` and `gather_model` for parameter distribution across devices and has access to current sharding (`_shard_fns`) and gathering (`_gather_fns`) functions.
+- **Quantization:** Applies post-training quantization to linear layers using `quantize`.
+- **State Conversion:** Converts the module to a state object via `to_state`.
+- **Input Preparation**: Provides a method for pre-processing inputs with `prepare_inputs_for_call`.
+- **Generic Loss Calculation:** Computes loss via `compute_loss`.
+- **Easy Bridge:** Enables saving/loading models using `save_pretrained` and pushing to the Hub with `push_to_hub`, while also offering methods for loading from checkpoints (`_load_model_weights`),  from pretrained models(`from_pretrained`) and from torch (`_from_torch_pretrained`).
+- **Easy Generation:** Facilitates text generation via `generate` with multiple decoding algorithms, while using methods for caching, decoder initialization, beam search configurations, logits processing and other aspects of generation.
+
+**Benefits:**
+
+- **Modularity:** Encourages reusable, composable model components.
+- **Flexibility:** Adapts to diverse model architectures.
+- **Efficiency:** Integrates with EasyDeL's distributed training and optimization features.
+- **Ease of Use:** Simplifies saving/loading and text generation processes.
 
 ### Training Example
 
@@ -244,7 +270,7 @@ trainer.train()
 
 ## Latest Updates 🔥
 
-- **Modernized Architecture**: 
+- **Modernized Architecture**:
   - Migrated to Flax NNX for improved modularity and performance
   - Custom module system for better extensibility
   - Unified base trainer for consistent behavior
