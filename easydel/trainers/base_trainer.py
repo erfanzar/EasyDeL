@@ -49,15 +49,16 @@ from easydel.infra.base_module import (
 	EasyDeLBaseModule,
 )
 from easydel.smi import get_capacity_matrix, initialise_tracking
-from easydel.trainers.trainer_protocol import (
+from easydel.utils import Timers
+
+from .trainer_protocol import (
 	BaseTrainerProtocol,
 	TrainerConfigureDataloaderOutput,
 	TrainerConfigureFunctionOutput,
 	TrainerConfigureModelOutput,
 	TrainerOutput,
 )
-from easydel.trainers.training_configurations import TrainingArguments
-from easydel.utils import Timers
+from .training_configurations import TrainingArguments
 
 if tp.TYPE_CHECKING:
 	from datasets import Dataset, IterableDataset
@@ -68,7 +69,7 @@ else:
 logger = get_logger(__name__)
 
 
-class BaseTrainer(BaseTrainerProtocol): 
+class BaseTrainer(BaseTrainerProtocol):
 	def __init__(
 		self,
 		arguments: tp.Optional[TrainingArguments] = None,

@@ -6,13 +6,12 @@ os.environ["EASYDEL_AUTO"] = "true"
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-import jax
+import easydel as ed
 from huggingface_hub import HfApi
 from jax import numpy as jnp
 from jax import sharding
 from transformers import AutoTokenizer
 
-import easydel as ed
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
 

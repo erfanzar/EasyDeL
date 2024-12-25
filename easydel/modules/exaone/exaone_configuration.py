@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, Optional, Union
+
+import typing as tp
 
 from jax.sharding import PartitionSpec
 
@@ -66,7 +67,7 @@ class ExaoneConfig(EasyDeLBaseConfig):
 	        Whether to tie the weights of the input embeddings and the output embeddings.
 	    rope_theta (`float`, *optional*, defaults to 10000.0):
 	        The theta value to use for rotary position embeddings.
-	    rope_scaling (`Dict[str, Union[str, float]]`, *optional*):
+	    rope_scaling (`tp.Dict[str, tp.Union[str, float]]`, *optional*):
 	        The configuration for rope scaling.
 	    gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
 	        The gradient checkpointing configuration.
@@ -98,17 +99,17 @@ class ExaoneConfig(EasyDeLBaseConfig):
 		layer_norm_epsilon=1e-5,
 		use_cache=True,
 		embed_dropout: float = 0.0,
-		pad_token_id: Optional[int] = None,
+		pad_token_id: tp.Optional[int] = None,
 		bos_token_id: int = 1,
 		eos_token_id: int = 2,
 		tie_word_embeddings=False,
 		rope_theta=10000.0,
-		rope_scaling: Dict[str, Union[str, float]] = None,
+		rope_scaling: tp.Dict[str, tp.Union[str, float]] = None,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		attention_dropout: float = 0.0,
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
 		self.vocab_size = vocab_size
@@ -154,7 +155,7 @@ class ExaoneConfig(EasyDeLBaseConfig):
 		"""
 		Get the partition rules for the model.
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
 			("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
@@ -178,9 +179,9 @@ class ExaoneConfig(EasyDeLBaseConfig):
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		attention_dropout: float = 0.0,
-		rope_scaling: Dict[str, Union[str, float]] = None,
+		rope_scaling: tp.Dict[str, tp.Union[str, float]] = None,
 		attention_bias: bool = False,
 		**kwargs,
 	):
@@ -192,12 +193,12 @@ class ExaoneConfig(EasyDeLBaseConfig):
 		    use_scan_mlp (bool): Determine whether to use the scan_mlp
 		        function or notn
 		    scan_mlp_chunk_size (int): Chunk the input to the mlp
-		    bits (Optional[int]): Specify the number of bits to use for
+		    bits (tp.Optional[int]): Specify the number of bits to use for
 		        quantization
 		    attention_dropout (float): Set the dropout rate for the
 		        attention layer
 		    attention_bias (bool): when ever to use attention_bias
-		    rope_scaling (Dict[str, Union[str, float]]): rope_scaling for
+		    rope_scaling (tp.Dict[str, tp.Union[str, float]]): rope_scaling for
 		        rope
 
 		Returns:

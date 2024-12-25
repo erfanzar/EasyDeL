@@ -11,14 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import functools
 import inspect
 import re
 import types
+import typing as tp
 import warnings
 from functools import partial
-import typing as tp
 
 import fjformer
 import flax
@@ -30,7 +29,6 @@ from aqt.jax.v2 import config as q_config
 from aqt.jax.v2.flax import aqt_flax as q_flax
 from einops import rearrange
 from flax import nnx as nn
-
 from tqdm.auto import tqdm
 
 from easydel.etils.errors import EasyDeLBlockWiseFFNError
@@ -41,8 +39,9 @@ from easydel.etils.etils import (
 	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
-from easydel.infra.base_config import EasyMethod
 from easydel.utils.traversals import flatten_dict, unflatten_dict
+
+from .base_config import EasyMethod
 
 warnings.filterwarnings(
 	"ignore",

@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import functools
 import math
-from typing import Optional, Tuple, Union
+import typing as tp
 
 import chex
 import jax
@@ -47,7 +48,7 @@ class OlmoMLP(nn.Module):
 		config: OlmoConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -96,7 +97,7 @@ class OlmoAttention(FlaxAttentionModule):
 		config: OlmoConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -173,11 +174,11 @@ class OlmoAttention(FlaxAttentionModule):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
-		cache_view: Optional[TransformerCacheView] = None,
-		segment_ids: Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
-		fcm_mask: Optional[chex.Array] = None,
-		frequencies: Optional[chex.Array] = None,
+		fcm_mask: tp.Optional[chex.Array] = None,
+		frequencies: tp.Optional[chex.Array] = None,
 	):
 		batch_size, sequence_length = hidden_states.shape[:2]
 		query_states, key_states, value_states = (
@@ -267,7 +268,7 @@ class FlaxOlmoDecoderLayer(nn.Module):
 		config: OlmoConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -318,11 +319,11 @@ class FlaxOlmoDecoderLayer(nn.Module):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
-		cache_view: Optional[TransformerCacheView] = None,
-		segment_ids: Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
-		fcm_mask: Optional[chex.Array] = None,
-		frequencies: Optional[chex.Array] = None,
+		fcm_mask: tp.Optional[chex.Array] = None,
+		frequencies: tp.Optional[chex.Array] = None,
 	):
 		residual = hidden_states
 		attention_output = self.self_attn(
@@ -365,7 +366,7 @@ class OlmoModel(EasyDeLBaseModule):
 		config: OlmoConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -406,16 +407,16 @@ class OlmoModel(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		past_key_values: Optional[TransformerCache] = None,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
-	) -> Union[FlaxBaseModelOutput, Tuple]:
+	) -> tp.Union[FlaxBaseModelOutput, tp.Tuple]:
 		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
 				"You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -490,7 +491,7 @@ class OlmoForCausalLM(EasyDeLBaseModule):
 		config: OlmoConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -524,16 +525,16 @@ class OlmoForCausalLM(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		past_key_values: Optional[TransformerCache] = None,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
-	) -> Union[FlaxCausalLMOutput, Tuple]:
+	) -> tp.Union[FlaxCausalLMOutput, tp.Tuple]:
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,

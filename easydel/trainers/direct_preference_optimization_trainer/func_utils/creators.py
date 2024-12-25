@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import typing as tp
 
 import chex
@@ -19,18 +18,14 @@ import flax
 import flax.nnx
 import jax
 from jax import numpy as jnp
+
 from easydel.etils.easystate import EasyDeLState
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.loss_utils import LossMetrics
-from easydel.trainers.direct_preference_optimization_trainer.func_utils.concatenators import (
-	concatenated_inputs,
-)
-from easydel.trainers.direct_preference_optimization_trainer.func_utils.log_probs import (
-	get_batch_log_probs,
-)
-from easydel.trainers.direct_preference_optimization_trainer.func_utils.loss_funcs import (
-	get_loss_function,
-)
+
+from .concatenators import concatenated_inputs
+from .log_probs import get_batch_log_probs
+from .loss_funcs import get_loss_function
 
 
 def create_concatenated_forward(

@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Mapping, Optional
+
+import typing as tp
 
 from jax.sharding import PartitionSpec
 
@@ -86,7 +87,7 @@ class Qwen2Config(EasyDeLBaseConfig):
 	        The number of bits to quantize the model to.
 	    scan_layers (`bool`, *optional*, defaults to `True`):
 	        Whether to use the scan implementation for the layers.
-	    rope_scaling (`Dict[str, Union[str, float]]`, *optional*):
+	    rope_scaling (`tp.Dict[str, tp.Union[str, float]]`, *optional*):
 	        The configuration for rope scaling.
 	"""
 
@@ -119,9 +120,9 @@ class Qwen2Config(EasyDeLBaseConfig):
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
 		number_rep_kv: int = 1,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		scan_layers: bool = True,
-		rope_scaling: Optional[Mapping[str, str | float]] = None,
+		rope_scaling: tp.Optional[tp.Mapping[str, str | float]] = None,
 		**kwargs,
 	):
 		self.vocab_size = vocab_size
@@ -177,7 +178,7 @@ class Qwen2Config(EasyDeLBaseConfig):
 		        Whether to use fully sharded data parallelism.
 
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
 			("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
@@ -208,11 +209,11 @@ class Qwen2Config(EasyDeLBaseConfig):
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
 		number_rep_kv: int = 1,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		rope_theta: float = 10000.0,
 		hidden_act: str = "silu",
 		scan_layers: bool = True,
-		rope_scaling: Optional[Mapping[str, str | float]] = None,
+		rope_scaling: tp.Optional[tp.Mapping[str, str | float]] = None,
 		**kwargs,
 	):
 		"""The add_jax_args function adds the following arguments to the Transformer class:
@@ -238,7 +239,7 @@ class Qwen2Config(EasyDeLBaseConfig):
 		    scan_mlp_chunk_size: int: Set the chunk size for scan_mlp
 		    number_rep_kv: int: Determine how many times the key and
 		        value vectors are repeated
-		    bits: Optional[int]: Determine the number of bits used in
+		    bits: tp.Optional[int]: Determine the number of bits used in
 		        the quantization
 		    rope_theta: float : rope_theta for compute rope
 		    hidden_act: str : hidden_act for mlp

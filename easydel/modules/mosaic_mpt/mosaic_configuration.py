@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Union
+
+import typing as tp
 
 from jax.sharding import PartitionSpec
 
@@ -177,9 +178,9 @@ class MptConfig(EasyDeLBaseConfig):
 		layer_norm_epsilon: float = 1e-5,
 		emb_prob_drop: float = 0.0,
 		learned_pos_emb: bool = True,
-		attn_config: Optional[MptAttentionConfig] = None,
+		attn_config: tp.Optional[MptAttentionConfig] = None,
 		init_device: str = "cpu",  # Ignored by EasyDeL.
-		logit_scale: Optional[Union[float, str]] = None,
+		logit_scale: tp.Optional[tp.Union[float, str]] = None,
 		no_bias: bool = True,
 		verbose: int = 0,
 		embedding_fraction: float = 1.0,
@@ -193,7 +194,7 @@ class MptConfig(EasyDeLBaseConfig):
 		use_lm_head: bool = False,
 		use_norm_bias: bool = False,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
 		if attn_config is None:
@@ -243,7 +244,7 @@ class MptConfig(EasyDeLBaseConfig):
 		"""
 		Get the partition rules for the model.
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
 			("transformer/wte/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
@@ -261,7 +262,7 @@ class MptConfig(EasyDeLBaseConfig):
 	def add_jax_args(
 		self,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
 		if hasattr(self, "attn_config"):

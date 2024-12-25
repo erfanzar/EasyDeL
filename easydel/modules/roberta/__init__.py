@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.roberta.modeling_roberta_flax import (
+from .modeling_roberta_flax import (
 	RobertaForCausalLM,
 	RobertaForMultipleChoice,
 	RobertaForQuestionAnswering,
 	RobertaForSequenceClassification,
 	RobertaForTokenClassification,
 )
-from easydel.modules.roberta.roberta_configuration import RobertaConfig
+from .roberta_configuration import RobertaConfig
 
 __all__ = (
 	"RobertaForCausalLM",

@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import functools
-from typing import Optional, Union
+import typing as tp
 
 import chex
 import jax
@@ -44,7 +45,7 @@ class GPTNeoXAttention(FlaxAttentionModule):
 		config: GPTNeoXConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	) -> None:
@@ -104,11 +105,11 @@ class GPTNeoXAttention(FlaxAttentionModule):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
-		causal_mask: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		cache_view: Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
-		frequencies: Optional[chex.Array] = None,
+		frequencies: tp.Optional[chex.Array] = None,
 	):
 		query, key, value = jnp.split(
 			self.query_key_value(hidden_states),
@@ -172,7 +173,7 @@ class GPTNeoXMlp(nn.Module):
 		config: GPTNeoXConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	) -> None:
@@ -212,7 +213,7 @@ class GPTNeoXBlock(nn.Module):
 		config: GPTNeoXConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	) -> None:
@@ -265,11 +266,11 @@ class GPTNeoXBlock(nn.Module):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
-		causal_mask: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		cache_view: Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
-		frequencies: Optional[chex.Array] = None,
+		frequencies: tp.Optional[chex.Array] = None,
 	):
 		attn_out = self.attention(
 			self.input_layernorm(hidden_states),
@@ -305,7 +306,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
 		config: GPTNeoXConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -353,13 +354,13 @@ class GPTNeoXModel(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		past_key_values: Optional[TransformerCache] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		extra_embedding: Optional[chex.Array] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		extra_embedding: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
@@ -439,7 +440,7 @@ class GPTNeoXForCausalLM(EasyDeLBaseModule):
 		config: GPTNeoXConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -469,12 +470,12 @@ class GPTNeoXForCausalLM(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		past_key_values: Optional[TransformerCache] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		extra_embedding: Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		extra_embedding: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,

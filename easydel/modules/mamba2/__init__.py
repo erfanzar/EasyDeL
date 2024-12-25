@@ -12,14 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.mamba2.mamba2_configuration import Mamba2Config
-from easydel.modules.mamba2.modeling_mamba2_flax import (
-	Mamba2ForCausalLM,
-	Mamba2Model,
-)
+from .mamba2_configuration import Mamba2Config
+from .modeling_mamba2_flax import Mamba2ForCausalLM, Mamba2Model
 
-__all__ = (
-	"Mamba2ForCausalLM",
-	"Mamba2Model",
-	"Mamba2Config",
-)
+__all__ = ("Mamba2ForCausalLM", "Mamba2Model", "Mamba2Config")

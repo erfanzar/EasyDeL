@@ -11,23 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from __future__ import annotations
 
 import functools
-from pathlib import Path
 import re
+import typing as tp
 import warnings
 from dataclasses import dataclass, field
-import typing as tp
-
+from pathlib import Path
 
 import flax.traverse_util
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import PartitionSpec
-
 
 from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import (
@@ -40,7 +37,8 @@ from easydel.etils.etils import (
 	get_logger,
 )
 from easydel.infra.loss_utils import LossConfig
-from easydel.trainers.utils import JaxDistributedConfig
+
+from .utils import JaxDistributedConfig
 
 try:
 	import wandb  # type: ignore # noqa: F821

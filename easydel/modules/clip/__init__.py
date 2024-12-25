@@ -12,18 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.clip.clip_configuration import (
+from .clip_configuration import (
 	CLIPConfig,
 	CLIPTextConfig,
 	CLIPVisionConfig,
 )
-
-from easydel.modules.clip.modeling_clip_flax import (
+from .modeling_clip_flax import (
+	CLIPForImageClassification,
 	CLIPModel,
 	CLIPTextModel,
 	CLIPTextModelWithProjection,
 	CLIPVisionModel,
-	CLIPForImageClassification,
 )
 
 __all__ = (

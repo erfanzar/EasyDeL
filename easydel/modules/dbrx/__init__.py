@@ -12,15 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.dbrx.dbrx_configuration import (
-	DbrxAttentionConfig,
-	DbrxConfig,
-	DbrxFFNConfig,
-)
-from easydel.modules.dbrx.modeling_dbrx_flax import (
-	DbrxForCausalLM,
-	DbrxModel,
-)
+from .dbrx_configuration import DbrxAttentionConfig, DbrxConfig, DbrxFFNConfig
+from .modeling_dbrx_flax import DbrxForCausalLM, DbrxModel
 
 __all__ = (
 	"DbrxForCausalLM",

@@ -12,9 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.llama.llama_configuration import LlamaConfig, VisionLlamaConfig
-from easydel.modules.llama.modeling_llama_flax import (
+from .llama_configuration import LlamaConfig, VisionLlamaConfig
+from .modeling_llama_flax import (
 	LlamaForCausalLM,
 	LlamaForSequenceClassification,
-	LlamaModel, 
+	LlamaModel,
+)
+
+__all__ = (
+	"LlamaForCausalLM",
+	"LlamaForSequenceClassification",
+	"LlamaModel",
+	"LlamaConfig",
+	"VisionLlamaConfig",
 )

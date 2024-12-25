@@ -12,18 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.mosaic_mpt.modeling_mpt_flax import (
-	MptForCausalLM,
-	MptModel,
-)
-from easydel.modules.mosaic_mpt.mosaic_configuration import (
-	MptAttentionConfig,
-	MptConfig,
-)
+from .modeling_mpt_flax import MptForCausalLM, MptModel
+from .mosaic_configuration import MptAttentionConfig, MptConfig
 
-__all__ = (
-	"MptForCausalLM",
-	"MptModel",
-	"MptAttentionConfig",
-	"MptConfig",
-)
+__all__ = ("MptForCausalLM", "MptModel", "MptAttentionConfig", "MptConfig")

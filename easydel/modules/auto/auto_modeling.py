@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import os
 import typing as tp
 
@@ -74,12 +73,12 @@ class BaseAutoEasyModel:
 		    shard_fns (tp.Optional[tp.Mapping[tuple, tp.Callable] | dict], optional): Sharding functions to use for the model. If None, auto-sharding is used if auto_shard_model is True. Defaults to None.
 		    platform (tp.Optional[EasyDeLPlatforms], optional): platform to use for the model. Defaults to None.
 				backend (tp.Optional[EasyDeLBackends], optional): backend to use for the model. Defaults to None.
-		    config_kwargs (tp.Optional[tp.Mapping[str, Any] | EasyDeLBaseConfigDict], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
+		    config_kwargs (tp.Optional[tp.Mapping[str, tp.Any] | EasyDeLBaseConfigDict], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
 		    auto_shard_model (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
 		    partition_rules (tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec]]], optional): Custom partition rules for parameter sharding. If not None, shard_fns should also be provided. Defaults to None.
 		    quantization_method (EasyDeLQuantizationMethods, optional): quantization_method to be used to quantize model weights. Defaults to None.
 		    quantization_block_size (int): block size to be used for quantizing arrays (only for NF4).
-		    bit_targeted_params (tp.Optional[List[str]], optional): List of parameter names to convert to 8-bit precision. If  None and 8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
+		    bit_targeted_params (tp.Optional[tp.List[str]], optional): tp.List of parameter names to convert to 8-bit precision. If  None and 8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
 		    from_torch (bool): whenever to load the model from transformers-pytorch.
 		    **kwargs: Additional keyword arguments to pass to the model and config classes.
 
@@ -347,11 +346,11 @@ class BaseAutoEasyState:
 		    shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
 		    shard_fns (tp.Optional[tp.Mapping[tuple, tp.Callable] | dict], optional): Sharding functions to use for the model. If None, auto-sharding is used if auto_shard_model is True. Defaults to None.
 		    backend (tp.Optional[str], optional): Backend to use for the model. Defaults to None.
-		    config_kwargs (tp.Optional[tp.Mapping[str, Any]], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
+		    config_kwargs (tp.Optional[tp.Mapping[str, tp.Any]], optional): Configuration keyword arguments to pass to the model config. Defaults to None.
 		    auto_shard_model (bool, optional): Whether to automatically shard the model parameters. Defaults to False.
 		    partition_rules (tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec]]], optional): Custom partition rules for parameter sharding. If not None, shard_fns should also be provided. Defaults to None.
 		    quantization_method (EasyDeLQuantizationMethods, optional): quantization_method to be used to quantize model weights. Defaults to None.
-		    bit_targeted_params (tp.Optional[List[str]], optional): List of parameter names to convert to 8-bit precision. If  None and 8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
+		    bit_targeted_params (tp.Optional[tp.List[str]], optional): tp.List of parameter names to convert to 8-bit precision. If  None and 8bit is True, all kernels and embeddings are converted to 8-bit. Defaults to None.
 		    verbose_params (bool): whenever to log number of parameters in converting state.
 		    safe (bool): whenever to use safetensors to load engine or parameters (requires engine or parameters to be saved with safe=True while saving them)
 		    from_torch (bool): whenever to load the model from transformers-pytorch.

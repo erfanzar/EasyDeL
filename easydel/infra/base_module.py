@@ -32,6 +32,11 @@ from easydel.etils.etils import (
 	EasyDeLQuantizationMethods,
 	get_logger,
 )
+from easydel.utils.traversals import (
+	flatten_dict,
+	unflatten_dict,
+)
+
 from .base_config import EasyDeLBaseConfig
 from .loss_utils import (
 	LOSS_MAPPING,
@@ -45,10 +50,6 @@ from .mixins import (
 	EasyGenerationMixin,
 )
 from .utils import quantize_linear_layers
-from easydel.utils.traversals import (
-	flatten_dict,
-	unflatten_dict,
-)
 
 if tp.TYPE_CHECKING:
 	from easydel.etils.easystate import EasyDeLState

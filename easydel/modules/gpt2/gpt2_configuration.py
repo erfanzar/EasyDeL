@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+
+import typing as tp
 
 import jax
 
@@ -124,7 +125,7 @@ class GPT2Config(EasyDeLBaseConfig):
 		reorder_and_upcast_attn=False,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		tie_word_embeddings: bool = False,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
 		self.vocab_size = vocab_size
@@ -164,7 +165,7 @@ class GPT2Config(EasyDeLBaseConfig):
 	def add_jax_args(
 		self,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
 		args = dict(gradient_checkpointing=gradient_checkpointing, bits=bits, **kwargs)
@@ -181,7 +182,7 @@ class GPT2Config(EasyDeLBaseConfig):
 		        Whether to use fully sharded data parallelism.
 
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
 			(

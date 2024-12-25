@@ -1,19 +1,19 @@
 import jax
 import jax.numpy as jnp
-from easydel.infra.loss_utils import (
+import numpy as np
+import pytest
+
+from .loss_utils import (
 	SpecialLossNormalizingFactor,
+	auxiliary_load_balancing_loss_func,
 	compute_weighted_cross_entropy,
 	compute_weighted_cross_entropy_and_accuracy,
 	convert_special_loss_normalizing_factor_to_enum,
 	cross_entropy_with_logits,
 	fixed_cross_entropy,
 	get_loss_normalizing_factor_and_weights,
-	auxiliary_load_balancing_loss_func,
 	onehot,
-	_sum_weights_per_segment,
 )
-import pytest
-import numpy as np
 
 
 @pytest.fixture
@@ -211,7 +211,6 @@ def test_cross_entropy_integration(sample_data, label_smoothing, z_loss, use_wei
 	weights = (
 		sample_data["weights"] if use_weights else jnp.ones_like(targets, dtype=jnp.float32)
 	)
-	attention_mask = sample_data["attention_mask"]
 
 	loss, z_loss_val, weight_sum, accuracy = compute_weighted_cross_entropy_and_accuracy(
 		logits=logits,
@@ -338,8 +337,6 @@ def test_custom_vjp():
 	grad_fn = jax.grad(lambda x: jnp.sum(loss_fn(x, targets)))
 	grads = grad_fn(logits)
 	assert not jnp.any(jnp.isnan(grads))
-
-
 
 
 def test_fixed_cross_entropy_no_mask(sample_data):

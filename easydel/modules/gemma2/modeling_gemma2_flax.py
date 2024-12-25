@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+import typing as tp
 from functools import partial
-from typing import Optional, Tuple, Union
 
 import chex
 import jax
@@ -68,7 +69,7 @@ class Gemma2Attention(FlaxAttentionModule):
 		layer_idx: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None,
 		causal: bool = True,
 		is_cross_attention: bool = False,
 		*,
@@ -166,11 +167,11 @@ class Gemma2Attention(FlaxAttentionModule):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
-		cache_view: Optional[TransformerCacheView] = None,
-		segment_ids: Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
-		fcm_mask: Optional[chex.Array] = None,
-		frequencies: Optional[chex.Array] = None,
+		fcm_mask: tp.Optional[chex.Array] = None,
+		frequencies: tp.Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the attention module.
@@ -180,13 +181,13 @@ class Gemma2Attention(FlaxAttentionModule):
 		    attention_mask (chex.Array): Mask to apply on the attention scores.
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-		    segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
 		    deterministic (bool): If True, disables dropout for deterministic behavior.
 		    init_cache (bool): If True, initializes cache for caching keys and values.
 		    output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-		    fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+		    fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
 		Returns:
-		    Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+		    tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
 		"""
 		batch_size, sequence_length = hidden_states.shape[:2]
 		(query_states, key_states, value_states) = (
@@ -268,7 +269,7 @@ class Gemma2MLP(nn.Module):
 		config: Gemma2Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -328,7 +329,7 @@ class Gemma2DecoderLayer(nn.Module):
 		layer_idx: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -373,11 +374,11 @@ class Gemma2DecoderLayer(nn.Module):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
-		cache_view: Optional[TransformerCacheView] = None,
-		segment_ids: Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
-		fcm_mask: Optional[chex.Array] = None,
-		frequencies: Optional[chex.Array] = None,
+		fcm_mask: tp.Optional[chex.Array] = None,
+		frequencies: tp.Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the module block.
@@ -387,13 +388,13 @@ class Gemma2DecoderLayer(nn.Module):
 		    attention_mask (chex.Array): Mask to apply on the attention scores.
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-		    segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
 		    deterministic (bool): If True, disables dropout for deterministic behavior.
 		    init_cache (bool): If True, initializes cache for caching keys and values.
 		    output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-		    fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+		    fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
 		Returns:
-		    Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+		    tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
 		"""
 		residual = hidden_states
 
@@ -441,7 +442,7 @@ class Gemma2Model(EasyDeLBaseModule):
 		config: Gemma2Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -476,16 +477,16 @@ class Gemma2Model(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		past_key_values: Optional[TransformerCache] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		return_dict: bool = True,
-	) -> Union[FlaxBaseModelOutput, Tuple]:
+	) -> tp.Union[FlaxBaseModelOutput, tp.Tuple]:
 		"""
 		Forward pass through the Gemma2 module.
 
@@ -493,16 +494,16 @@ class Gemma2Model(EasyDeLBaseModule):
 		    input_ids (chex.Array): Input tensor containing token IDs.
 		    attention_mask (chex.Array): Mask for attention.
 		    position_ids (chex.Array): Positional indices.
-		    segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-		    inputs_embeds (Optional[chex.Array]): Embedded input tensor.
-		    output_attentions (Optional[bool]): If True, output attention weights.
-		    output_hidden_states (Optional[bool]): If True, output hidden states.
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
+		    inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
+		    output_attentions (tp.Optional[bool]): If True, output attention weights.
+		    output_hidden_states (tp.Optional[bool]): If True, output hidden states.
 		    init_cache (bool): If True, initialize cache for decoding.
 		    deterministic (bool): If True, disable dropout.
 		    return_dict (bool): If True, return a dictionary of outputs.
 
 		Returns:
-		    FlaxBaseModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
+		    FlaxBaseModelOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
 		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
@@ -578,7 +579,7 @@ class Gemma2ForCausalLM(EasyDeLBaseModule):
 		config: Gemma2Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -610,33 +611,33 @@ class Gemma2ForCausalLM(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		past_key_values: Optional[TransformerCache] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		return_dict: bool = True,
-	) -> Union[FlaxCausalLMOutput, Tuple]:
+	) -> tp.Union[FlaxCausalLMOutput, tp.Tuple]:
 		"""
 		Forward pass through the Gemma2 module.
 
 		Args:
-		    input_ids (Optional[chex.Array]): Input tensor containing token IDs.
-		    attention_mask (Optional[chex.Array]): Mask for attention.
-		    position_ids (Optional[chex.Array]): Positional indices.
-		    segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-		    inputs_embeds (Optional[chex.Array]): Embedded input tensor.
-		    output_attentions (Optional[bool]): If True, output attention weights.
-		    output_hidden_states (Optional[bool]): If True, output hidden states.
+		    input_ids (tp.Optional[chex.Array]): Input tensor containing token IDs.
+		    attention_mask (tp.Optional[chex.Array]): Mask for attention.
+		    position_ids (tp.Optional[chex.Array]): Positional indices.
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
+		    inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
+		    output_attentions (tp.Optional[bool]): If True, output attention weights.
+		    output_hidden_states (tp.Optional[bool]): If True, output hidden states.
 		    init_cache (bool): If True, initialize cache for decoding.
 		    deterministic (bool): If True, disable dropout.
 		    return_dict (bool): If True, return a dictionary of outputs.
 
 		Returns:
-		    FlaxCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
+		    FlaxCausalLMOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
 
 		outputs = self.model(

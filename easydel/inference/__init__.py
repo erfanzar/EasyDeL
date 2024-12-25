@@ -12,13 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-from .vinference.api_server import vInferenceApiServer
-from .vinference.vinference import vInference, vInferenceConfig
-from .whisper_inference import (
-	vWhisperInference,
-	vWhisperInferenceConfig,
-)
+from .vinference import vInference, vInferenceApiServer, vInferenceConfig
+from .whisper_inference import vWhisperInference, vWhisperInferenceConfig
 
 __all__ = [
 	"vInference",

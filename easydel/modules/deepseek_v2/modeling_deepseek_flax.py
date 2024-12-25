@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import functools
 import math
-import typing
-from typing import Optional, Tuple, Union
+import typing as tp
 
 import chex
 import jax
@@ -82,8 +82,8 @@ def init_deepseek_rotary_embedding(
 	dim,
 	max_position_embeddings=2048,
 	base=10000,
-	method: typing.Literal["linear", "yarn", "dynamic", None] = None,
-	kwargs: typing.Optional[dict] = None,
+	method: tp.Literal["linear", "yarn", "dynamic", None] = None,
+	kwargs: tp.Optional[dict] = None,
 ):
 	if method is None:
 		inv_freq = 1.0 / (base ** (jnp.arange(0, dim, 2).astype("float32") / dim))
@@ -181,9 +181,9 @@ class FlaxDeepseekV2MLP(nn.Module):
 		config: DeepseekV2Config,
 		dtype: jnp.dtype = jnp.bfloat16,
 		param_dtype: jnp.dtype = jnp.bfloat16,
-		precision: Optional[Union[str, jax.lax.Precision]] = None,
-		hidden_size: Optional[int] = None,
-		intermediate_size: Optional[int] = None,
+		precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None,
+		hidden_size: tp.Optional[int] = None,
+		intermediate_size: tp.Optional[int] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -217,7 +217,7 @@ class FlaxMoEGate(nn.Module):
 		config: DeepseekV2Config,
 		dtype: jnp.dtype = jnp.bfloat16,
 		param_dtype: jnp.dtype = jnp.bfloat16,
-		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -334,7 +334,7 @@ class FlaxDeepseekV2MoE(nn.Module):
 		config: DeepseekV2Config,
 		dtype: jnp.dtype = jnp.bfloat16,
 		param_dtype: jnp.dtype = jnp.bfloat16,
-		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -404,7 +404,7 @@ class FlaxDeepseekV2Attention(FlaxAttentionModule):
 		config: DeepseekV2Config,
 		dtype: jnp.dtype = jnp.bfloat16,
 		param_dtype: jnp.dtype = jnp.bfloat16,
-		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -516,31 +516,31 @@ class FlaxDeepseekV2Attention(FlaxAttentionModule):
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		frequencies: Tuple[chex.Array, chex.Array],
+		frequencies: tp.Tuple[chex.Array, chex.Array],
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
-		segment_ids: Optional[chex.Array] = None,
-		cache_view: Optional[TransformerCacheView] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
-		fcm_mask: Optional[chex.Array] = None,
+		fcm_mask: tp.Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the attention module.
 
 		Args:
 		    hidden_states (chex.Array): Input hidden states.
-		    frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+		    frequencies (tp.Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
 		    attention_mask (chex.Array): Mask to apply on the attention scores.
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-		    segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
 		    deterministic (bool): If True, disables dropout for deterministic behavior.
 		    init_cache (bool): If True, initializes cache for caching keys and values.
 		    output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-		    fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+		    fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
 		Returns:
-		    Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+		    tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
 		"""
 		bsz, q_len, _ = hidden_states.shape
 
@@ -642,7 +642,7 @@ class FlaxDeepseekV2DecoderLayer(nn.Module):
 		layer_idx: int,
 		dtype: jnp.dtype = jnp.bfloat16,
 		param_dtype: jnp.dtype = jnp.bfloat16,
-		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -711,31 +711,31 @@ class FlaxDeepseekV2DecoderLayer(nn.Module):
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		frequencies: Tuple[chex.Array, chex.Array],
+		frequencies: tp.Tuple[chex.Array, chex.Array],
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
-		segment_ids: Optional[chex.Array] = None,
-		cache_view: Optional[TransformerCacheView] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
-		fcm_mask: Optional[chex.Array] = None,
+		fcm_mask: tp.Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the module block.
 
 		Args:
 		    hidden_states (chex.Array): Input hidden states.
-		    frequencies (Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
+		    frequencies (tp.Tuple[chex.Array, chex.Array]): Cosine and sine components for rotary embeddings.
 		    attention_mask (chex.Array): Mask to apply on the attention scores.
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-		    segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
 		    deterministic (bool): If True, disables dropout for deterministic behavior.
 		    init_cache (bool): If True, initializes cache for caching keys and values.
 		    output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-		    fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+		    fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
 		Returns:
-		    Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+		    tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
 		"""
 		residual = hidden_states
 
@@ -794,7 +794,7 @@ class DeepseekV2Model(EasyDeLBaseModule):
 		config: DeepseekV2Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -865,16 +865,16 @@ class DeepseekV2Model(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		past_key_values: Optional[TransformerCache] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		return_dict: bool = True,
-	) -> Union[FlaxBaseModelOutput, Tuple]:
+	) -> tp.Union[FlaxBaseModelOutput, tp.Tuple]:
 		"""
 		Forward pass through the Deepseekv2 module.
 
@@ -882,16 +882,16 @@ class DeepseekV2Model(EasyDeLBaseModule):
 		    input_ids (chex.Array): Input tensor containing token IDs.
 		    attention_mask (chex.Array): Mask for attention.
 		    position_ids (chex.Array): Positional indices.
-		    segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-		    inputs_embeds (Optional[chex.Array]): Embedded input tensor.
-		    output_attentions (Optional[bool]): If True, output attention weights.
-		    output_hidden_states (Optional[bool]): If True, output hidden states.
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
+		    inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
+		    output_attentions (tp.Optional[bool]): If True, output attention weights.
+		    output_hidden_states (tp.Optional[bool]): If True, output hidden states.
 		    init_cache (bool): If True, initialize cache for decoding.
 		    deterministic (bool): If True, disable dropout.
 		    return_dict (bool): If True, return a dictionary of outputs.
 
 		Returns:
-		    FlaxBaseModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
+		    FlaxBaseModelOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
 		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
@@ -966,7 +966,7 @@ class DeepseekV2ForCausalLM(EasyDeLBaseModule):
 		config: DeepseekV2Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -998,16 +998,16 @@ class DeepseekV2ForCausalLM(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		past_key_values: Optional[TransformerCache] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		return_dict: bool = True,
-	) -> Union[FlaxCausalLMOutput, Tuple]:
+	) -> tp.Union[FlaxCausalLMOutput, tp.Tuple]:
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,

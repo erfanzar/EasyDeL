@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import math
-from typing import Optional, Tuple
+import typing as tp
 
 import chex
-from flax.nnx.nn.attention import dot_product_attention_weights
 import jax
 from flax import nnx as nn
+from flax.nnx.nn.attention import dot_product_attention_weights
 from jax import lax
 from jax import numpy as jnp
 
@@ -50,7 +51,7 @@ class RobertaEmbeddings(nn.Module):
 		config: RobertaConfig,
 		dtype: jnp.dtype = jnp.float32,  # the dtype of the computation
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[lax.Precision] = None,
+		precision: tp.Optional[lax.Precision] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -119,7 +120,7 @@ class RobertaSelfAttention(FlaxAttentionModule):
 		causal: bool = False,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[lax.Precision] = None,
+		precision: tp.Optional[lax.Precision] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -203,10 +204,10 @@ class RobertaSelfAttention(FlaxAttentionModule):
 		hidden_states,
 		attention_mask,
 		layer_head_mask,
-		causal_mask: Optional[chex.Array] = None,
-		cache_view: Optional[TransformerCacheView] = None,
-		segment_ids: Optional[chex.Array] = None,
-		key_value_states: Optional[jnp.array] = None,
+		causal_mask: tp.Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		key_value_states: tp.Optional[jnp.array] = None,
 		output_attentions: bool = False,
 	):
 		is_cross_attention = key_value_states is not None
@@ -282,7 +283,7 @@ class RobertaSelfOutput(nn.Module):
 		config: RobertaConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[lax.Precision] = None,
+		precision: tp.Optional[lax.Precision] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -323,7 +324,7 @@ class RobertaAttention(nn.Module):
 		causal: bool = False,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[lax.Precision] = None,
+		precision: tp.Optional[lax.Precision] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -353,8 +354,8 @@ class RobertaAttention(nn.Module):
 		hidden_states,
 		attention_mask,
 		layer_head_mask,
-		causal_mask: Optional[chex.Array] = None,
-		cache_view: Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
 		key_value_states=None,
 		output_attentions: bool = False,
 	):
@@ -384,7 +385,7 @@ class RobertaIntermediate(nn.Module):
 		config: RobertaConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[lax.Precision] = None,
+		precision: tp.Optional[lax.Precision] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -416,7 +417,7 @@ class RobertaOutput(nn.Module):
 		config: RobertaConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[lax.Precision] = None,
+		precision: tp.Optional[lax.Precision] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -459,7 +460,7 @@ class RobertaLayer(nn.Module):
 		config: RobertaConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[lax.Precision] = None,
+		precision: tp.Optional[lax.Precision] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -504,10 +505,10 @@ class RobertaLayer(nn.Module):
 		hidden_states,
 		attention_mask,
 		layer_head_mask,
-		causal_mask: Optional[chex.Array] = None,
-		cache_view: Optional[TransformerCacheView] = None,
-		encoder_hidden_states: Optional[chex.Array] = None,
-		encoder_attention_mask: Optional[chex.Array] = None,
+		causal_mask: tp.Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
+		encoder_hidden_states: tp.Optional[chex.Array] = None,
+		encoder_attention_mask: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 	):
 		# Self Attention
@@ -552,7 +553,7 @@ class RobertaEncoder(nn.Module):
 		config: RobertaConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[lax.Precision] = None,
+		precision: tp.Optional[lax.Precision] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -581,10 +582,10 @@ class RobertaEncoder(nn.Module):
 		hidden_states,
 		attention_mask,
 		head_mask,
-		causal_mask: Optional[chex.Array] = None,
-		encoder_hidden_states: Optional[chex.Array] = None,
-		encoder_attention_mask: Optional[chex.Array] = None,
-		past_key_values: Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[chex.Array] = None,
+		encoder_hidden_states: tp.Optional[chex.Array] = None,
+		encoder_attention_mask: tp.Optional[chex.Array] = None,
+		past_key_values: tp.Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
@@ -654,7 +655,7 @@ class RobertaPooler(nn.Module):
 		config: RobertaConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[lax.Precision] = None,
+		precision: tp.Optional[lax.Precision] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -685,7 +686,7 @@ class RobertaLMHead(nn.Module):
 		config: RobertaConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[lax.Precision] = None,
+		precision: tp.Optional[lax.Precision] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -752,7 +753,7 @@ class RobertaClassificationHead(nn.Module):
 		config: RobertaConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[lax.Precision] = None,
+		precision: tp.Optional[lax.Precision] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -817,7 +818,7 @@ class RobertaModel(EasyDeLBaseModule):
 		config: RobertaConfig,
 		dtype: jnp.dtype = jnp.float32,  # the dtype of the computation
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[lax.Precision] = None,
+		precision: tp.Optional[lax.Precision] = None,
 		add_pooling_layer: bool = True,
 		*,
 		rngs: nn.Rngs,
@@ -860,12 +861,12 @@ class RobertaModel(EasyDeLBaseModule):
 		self,
 		input_ids,
 		attention_mask,
-		token_type_ids: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		head_mask: Optional[chex.Array] = None,
-		encoder_hidden_states: Optional[chex.Array] = None,
-		encoder_attention_mask: Optional[chex.Array] = None,
-		past_key_values: Optional[Tuple[Tuple[chex.Array, chex.Array]]] = None,
+		token_type_ids: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		head_mask: tp.Optional[chex.Array] = None,
+		encoder_hidden_states: tp.Optional[chex.Array] = None,
+		encoder_attention_mask: tp.Optional[chex.Array] = None,
+		past_key_values: tp.Optional[tp.Tuple[tp.Tuple[chex.Array, chex.Array]]] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
@@ -935,7 +936,7 @@ class RobertaForSequenceClassification(EasyDeLBaseModule):
 		config: RobertaConfig,
 		dtype: jnp.dtype = jnp.float32,  # the dtype of the computation
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[lax.Precision] = None,
+		precision: tp.Optional[lax.Precision] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -1004,7 +1005,7 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
 		config: RobertaConfig,
 		dtype: jnp.dtype = jnp.float32,  # the dtype of the computation
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[lax.Precision] = None,
+		precision: tp.Optional[lax.Precision] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -1101,7 +1102,7 @@ class RobertaForTokenClassification(EasyDeLBaseModule):
 		config: RobertaConfig,
 		dtype: jnp.dtype = jnp.float32,  # the dtype of the computation
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[lax.Precision] = None,
+		precision: tp.Optional[lax.Precision] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -1182,7 +1183,7 @@ class RobertaForQuestionAnswering(EasyDeLBaseModule):
 		config: RobertaConfig,
 		dtype: jnp.dtype = jnp.float32,  # the dtype of the computation
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[lax.Precision] = None,
+		precision: tp.Optional[lax.Precision] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -1269,7 +1270,7 @@ class RobertaForCausalLM(EasyDeLBaseModule):
 		config: RobertaConfig,
 		dtype: jnp.dtype = jnp.float32,  # the dtype of the computation
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[lax.Precision] = None,
+		precision: tp.Optional[lax.Precision] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -1299,13 +1300,13 @@ class RobertaForCausalLM(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: chex.Array,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		token_type_ids: Optional[chex.Array] = None,
-		head_mask: Optional[chex.Array] = None,
-		encoder_hidden_states: Optional[chex.Array] = None,
-		encoder_attention_mask: Optional[chex.Array] = None,
-		past_key_values: Optional[Tuple[Tuple[chex.Array, chex.Array]]] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		token_type_ids: tp.Optional[chex.Array] = None,
+		head_mask: tp.Optional[chex.Array] = None,
+		encoder_hidden_states: tp.Optional[chex.Array] = None,
+		encoder_attention_mask: tp.Optional[chex.Array] = None,
+		past_key_values: tp.Optional[tp.Tuple[tp.Tuple[chex.Array, chex.Array]]] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,

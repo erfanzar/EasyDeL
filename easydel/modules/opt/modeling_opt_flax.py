@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 # coding=utf-8
 # Copyright 2022 The Fairseq Authors and The Google Flax Team Authors And The HuggingFace Inc. team. All rights reserved.
 #
@@ -30,8 +31,8 @@
 """Flax OPT model."""
 
 import math
+import typing as tp
 from functools import partial
-from typing import Optional, Tuple, Union
 
 import chex
 import jax
@@ -62,7 +63,7 @@ class OPTAttention(FlaxAttentionModule):
 		bias: bool = True,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	) -> None:
@@ -128,11 +129,11 @@ class OPTAttention(FlaxAttentionModule):
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		causal_mask: Optional[chex.Array] = None,
-		key_value_states: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		cache_view: Optional[TransformerCacheView] = None,
-	) -> Tuple[chex.Array]:
+		causal_mask: tp.Optional[chex.Array] = None,
+		key_value_states: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
+	) -> tp.Tuple[chex.Array]:
 		is_cross_attention = key_value_states is not None
 		batch_size, sequence_length = hidden_states.shape[:2]
 		query_states = self.q_proj(hidden_states)
@@ -204,7 +205,7 @@ class OPTDecoderLayer(nn.Module):
 		config: OPTConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	) -> None:
@@ -266,10 +267,10 @@ class OPTDecoderLayer(nn.Module):
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		causal_mask: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		cache_view: Optional[TransformerCacheView] = None,
-	) -> Tuple[chex.Array]:
+		causal_mask: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
+	) -> tp.Tuple[chex.Array]:
 		residual = hidden_states
 
 		# 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
@@ -321,7 +322,7 @@ class OPTLearnedPositionalEmbedding(nn.Embed):
 		features: int,
 		*,
 		offset: int = 2,
-		dtype: Optional[jnp.dtype] = None,
+		dtype: tp.Optional[jnp.dtype] = None,
 		param_dtype: jnp.dtype = jnp.float32,
 		embedding_init=None,
 		rngs: nn.Rngs,
@@ -354,7 +355,7 @@ class OPTDecoder(EasyDeLBaseModule):
 		offset: int = 2,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	) -> None:
@@ -440,9 +441,9 @@ class OPTDecoder(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: chex.Array,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		past_key_values: Optional[TransformerCache] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
@@ -516,7 +517,7 @@ class OPTModel(EasyDeLBaseModule):
 		offset: int = 2,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	) -> None:
@@ -542,9 +543,9 @@ class OPTModel(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: chex.Array,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		past_key_values: Optional[TransformerCache] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
@@ -589,7 +590,7 @@ class OPTForCausalLM(EasyDeLBaseModule):
 		offset: int = 2,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	) -> None:
@@ -622,9 +623,9 @@ class OPTForCausalLM(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: chex.Array,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		past_key_values: Optional[TransformerCache] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
@@ -680,7 +681,7 @@ class OPTForCausalLM(EasyDeLBaseModule):
 		self,
 		input_ids,
 		max_length,
-		attention_mask: Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
 	):
 		# initializing the cache
 		batch_size, seq_length = input_ids.shape

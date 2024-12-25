@@ -11,19 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import os
+import typing as tp
 import warnings
 from dataclasses import dataclass
-from typing import (
-	Any,
-	Literal,
-	Optional,
-	Sequence,
-	Tuple,
-	TypedDict,
-	Union,
-)
 
 import jax
 import jax.extend
@@ -86,7 +77,7 @@ if EKERNEL_OPS:
 	replace_dot_general_with_gemm()
 
 
-def set_attrs_smartly(self, attr_name: str, default: Any, new_attr: Any):
+def set_attrs_smartly(self, attr_name: str, default: tp.Any, new_attr: tp.Any):
 	if not hasattr(self, attr_name):
 		setattr(self, attr_name, default)
 	if not new_attr == Ellipsis:
@@ -110,9 +101,9 @@ warnings.filterwarnings(
 warnings.filterwarnings("ignore", message="You are using a model of type")
 
 
-class EasyDeLBaseConfigDict(TypedDict, total=False):
-	axis_dims: Sequence[int]
-	axis_names: Sequence[str]
+class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
+	axis_dims: tp.Sequence[int]
+	axis_names: tp.Sequence[str]
 	attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS
 	blocksize_k: int
 	blocksize_q: int
@@ -121,10 +112,10 @@ class EasyDeLBaseConfigDict(TypedDict, total=False):
 	shard_attention_computation: bool
 	use_sharded_kv_caching: bool
 	use_sharding_constraint: bool
-	backend: Optional[EasyDeLBackends]
-	platform: Optional[EasyDeLPlatforms]
-	easy_method: Literal["train", "serve", "convert"]
-	bits: Optional[int]
+	backend: tp.Optional[EasyDeLBackends]
+	platform: tp.Optional[EasyDeLPlatforms]
+	easy_method: tp.Literal["train", "serve", "convert"]
+	bits: tp.Optional[int]
 	scan_ring_attention: bool
 	scan_attention_layers: bool
 	use_scan_mlp: bool
@@ -133,8 +124,8 @@ class EasyDeLBaseConfigDict(TypedDict, total=False):
 	gradient_checkpointing: EasyDeLGradientCheckPointers
 	kv_cache_quantization_method: EasyDeLQuantizationMethods
 	kv_cache_quantization_blocksize: int
-	kv_cache_sharding_sequence_axis_name: Union[str, Tuple[str, ...]]
-	flash_attention_backward_pass_impl: Literal["triton", "xla"]
+	kv_cache_sharding_sequence_axis_name: tp.Union[str, tp.Tuple[str, ...]]
+	flash_attention_backward_pass_impl: tp.Literal["triton", "xla"]
 	attn_dtype: jnp.dtype
 	fcm_max_ratio: float
 	fcm_min_ratio: float
@@ -150,8 +141,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 	"""It initializes all the attributes of an object, and it's called when you create a new instance of that class.
 
 	Args:
-	    axis_dims (Sequence[int], optional): Specify the number of dimensions for each axis. Defaults to (1, -1, 1, 1).
-	    axis_names (Sequence[str], optional): Set the names of the axes. Defaults to ("dp", "fsdp", "tp", "sp").
+	    axis_dims (tp.Sequence[int], optional): Specify the number of dimensions for each axis. Defaults to (1, -1, 1, 1).
+	    axis_names (tp.Sequence[str], optional): Set the names of the axes. Defaults to ("dp", "fsdp", "tp", "sp").
 	    attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS, optional): attention mechanism to use. Defaults to DEFAULT_ATTENTION_MECHANISM.
 	    blocksize_k (int, optional): block size of key_states. Defaults to 128.
 	    blocksize_q (int, optional): block size of query_states. Defaults to 128.
@@ -159,10 +150,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
 	    partition_axis (PartitionAxis, optional): PartitionAxis is new module used for partitioning arrays in easydel. Defaults to PartitionAxis().
 	    shard_attention_computation (bool, optional): whenever to use shard_map for attention. Defaults to True.
 	    use_sharded_kv_caching (bool, optional): whenever to use shard_map and sharding for key and value. Defaults to True.
-	    backend (Optional[EasyDeLBackends], optional): Specify the backend to use. Defaults to None.
-	    platform (Optional[EasyDeLPlatforms], optional): Specify the platform to used to use. Defaults to None.
-	    easy_method (Literal["train", "serve", "convert"], optional): easydel Quantization Method to be applied for. Defaults to EasyMethod.TRAIN.
-	    bits (Optional[int], optional): Model bits for quantization. Defaults to None.
+	    backend (tp.Optional[EasyDeLBackends], optional): Specify the backend to use. Defaults to None.
+	    platform (tp.Optional[EasyDeLPlatforms], optional): Specify the platform to used to use. Defaults to None.
+	    easy_method (tp.Literal["train", "serve", "convert"], optional): easydel Quantization Method to be applied for. Defaults to EasyMethod.TRAIN.
+	    bits (tp.Optional[int], optional): Model bits for quantization. Defaults to None.
 	    scan_ring_attention (bool, optional): Whether to use can for ring attention. Defaults to True.
 	    scan_attention_layers (bool, optional): Whether to use can for attention layers. Defaults to False.
 	    use_sharding_constraint (bool, optional): whether to use sharding constraint for the arrays. Defaults to False.
@@ -174,8 +165,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 	    kv_cache_quantization_blocksize (int, optional): size of kv cache quantization. Defaults to 64.
 	    quantization_method (EasyDeLQuantizationMethods, optional): linear modules quantization type. Defaults to EasyDeLQuantizationMethods.NONE.
 	    quantization_blocksize (int, optional): size of linear quantization. Defaults to 64.
-	    kv_cache_sharding_sequence_axis_name (Union[str, Tuple[str, ...]], optional): axis name to target for sharding sequences. Defaults to "sp".
-	    flash_attention_backward_pass_impl (Literal["triton", "xla"], optional): Specify the backward pass kernel for flash attention. Defaults to "triton".
+	    kv_cache_sharding_sequence_axis_name (tp.Union[str, tp.Tuple[str, ...]], optional): axis name to target for sharding sequences. Defaults to "sp".
+	    flash_attention_backward_pass_impl (tp.Literal["triton", "xla"], optional): Specify the backward pass kernel for flash attention. Defaults to "triton".
 	    attn_dtype (jnp.dtype, optional): Data type for attention computations. Defaults to jnp.float32.
 	    fcm_max_ratio (float, optional): Maximum ratio for flash cross attention. Defaults to 0.0.
 	    fcm_min_ratio (float, optional): Minimum ratio for flash cross attention. Defaults to 0.0.
@@ -189,8 +180,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
 	def __init__(
 		self,
-		axis_dims: Sequence[int] = (1, -1, 1, 1),
-		axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+		axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
+		axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
 		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_ATTENTION_MECHANISM,
 		blocksize_k: int = 128,
 		blocksize_q: int = 128,
@@ -199,10 +190,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		shard_attention_computation: bool = True,
 		use_sharded_kv_caching: bool = False,
 		use_sharding_constraint: bool = False,
-		backend: Optional[EasyDeLBackends] = None,
-		platform: Optional[EasyDeLPlatforms] = None,
-		easy_method: Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
-		bits: Optional[int] = None,
+		backend: tp.Optional[EasyDeLBackends] = None,
+		platform: tp.Optional[EasyDeLPlatforms] = None,
+		easy_method: tp.Literal["train", "serve", "convert"] = EasyMethod.TRAIN,
+		bits: tp.Optional[int] = None,
 		scan_ring_attention: bool = True,
 		scan_attention_layers: bool = False,
 		use_scan_mlp: bool = False,
@@ -214,8 +205,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		quantization_method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.NONE,
 		quantization_pattern: str = ".*",
 		quantization_blocksize: int = 64,
-		kv_cache_sharding_sequence_axis_name: Union[str, Tuple[str, ...]] = "sp",
-		flash_attention_backward_pass_impl: Literal["triton", "xla"] = "triton",
+		kv_cache_sharding_sequence_axis_name: tp.Union[str, tp.Tuple[str, ...]] = "sp",
+		flash_attention_backward_pass_impl: tp.Literal["triton", "xla"] = "triton",
 		attn_dtype: jnp.dtype = jnp.float32,
 		fcm_max_ratio: float = 0.0,
 		fcm_min_ratio: float = 0.0,
@@ -229,8 +220,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		Initialize the EasyDeLBaseConfig class with configuration parameters.
 
 		Args:
-		    axis_dims (Sequence[int], optional): Specify the number of dimensions for each axis. Defaults to (1, -1, 1, 1).
-		    axis_names (Sequence[str], optional): Set the names of the axes. Defaults to ("dp", "fsdp", "tp", "sp").
+		    axis_dims (tp.Sequence[int], optional): Specify the number of dimensions for each axis. Defaults to (1, -1, 1, 1).
+		    axis_names (tp.Sequence[str], optional): Set the names of the axes. Defaults to ("dp", "fsdp", "tp", "sp").
 		    attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS, optional): attention mechanism to use. Defaults to DEFAULT_ATTENTION_MECHANISM.
 		    blocksize_k (int, optional): block size of key_states. Defaults to 128.
 		    blocksize_q (int, optional): block size of query_states. Defaults to 128.
@@ -238,10 +229,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		    partition_axis (PartitionAxis, optional): PartitionAxis is new module used for partitioning arrays in easydel. Defaults to PartitionAxis().
 		    shard_attention_computation (bool, optional): whenever to use shard_map for attention. Defaults to True.
 		    use_sharded_kv_caching (bool, optional): whenever to use shard_map and sharding for key and value. Defaults to True.
-		    backend (Optional[EasyDeLBackends], optional): Specify the backend to use. Defaults to None.
-		    platform (Optional[EasyDeLPlatforms], optional): Specify the platform to used to use. Defaults to None.
-		    easy_method (Literal["train", "serve", "convert"], optional): easydel Quantization Method to be applied for. Defaults to EasyMethod.TRAIN.
-		    bits (Optional[int], optional): Model bits for quantization. Defaults to None.
+		    backend (tp.Optional[EasyDeLBackends], optional): Specify the backend to use. Defaults to None.
+		    platform (tp.Optional[EasyDeLPlatforms], optional): Specify the platform to used to use. Defaults to None.
+		    easy_method (tp.Literal["train", "serve", "convert"], optional): easydel Quantization Method to be applied for. Defaults to EasyMethod.TRAIN.
+		    bits (tp.Optional[int], optional): Model bits for quantization. Defaults to None.
 		    scan_ring_attention (bool, optional): Whether to use can for ring attention. Defaults to True.
 		    scan_attention_layers (bool, optional): Whether to use can for attention layers. Defaults to False.
 		    use_sharding_constraint (bool, optional): whether to use sharding constraint for the arrays. Defaults to False.
@@ -254,8 +245,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		    quantization_method (EasyDeLQuantizationMethods, optional): linear modules quantization type. Defaults to EasyDeLQuantizationMethods.NONE.
 		    quantization_blocksize (int, optional): size of linear quantization. Defaults to 64.
 		    quantization_pattern (str): re pattern to be used for quantizing.
-				kv_cache_sharding_sequence_axis_name (Union[str, Tuple[str, ...]], optional): axis name to target for sharding sequences. Defaults to "sp".
-		    flash_attention_backward_pass_impl (Literal["triton", "xla"], optional): Specify the backward pass kernel for flash attention. Defaults to "triton".
+				kv_cache_sharding_sequence_axis_name (tp.Union[str, tp.Tuple[str, ...]], optional): axis name to target for sharding sequences. Defaults to "sp".
+		    flash_attention_backward_pass_impl (tp.Literal["triton", "xla"], optional): Specify the backward pass kernel for flash attention. Defaults to "triton".
 		    attn_dtype (jnp.dtype, optional): Data type for attention computations. Defaults to jnp.float32.
 		    fcm_max_ratio (float, optional): Maximum ratio for flash cross attention. Defaults to 0.0.
 		    fcm_min_ratio (float, optional): Minimum ratio for flash cross attention. Defaults to 0.0.
@@ -327,15 +318,15 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
 	@staticmethod
 	def create_mesh(
-		axis_dims: Sequence[int] = (1, -1, 1, 1),
-		axis_names: Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+		axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
+		axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
 		backend="",
 	):
 		"""The create_mesh function creates a mesh object that can be used to shard arrays.
 
 		Args:
-		    axis_dims: Sequence[int]: Specify the dimensions of the mesh
-		    axis_names: Sequence[str]: Name the axes of the mesh
+		    axis_dims: tp.Sequence[int]: Specify the dimensions of the mesh
+		    axis_names: tp.Sequence[str]: Name the axes of the mesh
 		    backend: Specify the backend to use
 
 		Returns:
@@ -347,7 +338,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		if isinstance(axis_dims, str):
 			axis_dims = eval(axis_dims)
 			warnings.warn(
-				"axis_dims argument is not a Sequence of int and it's an string. "
+				"axis_dims argument is not a tp.Sequence of int and it's an string. "
 				"(backbone Warning in EasyDeLModuleConfig)\n"
 				f"\tchanged to {axis_dims}",
 				stacklevel=1,
@@ -355,7 +346,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		if isinstance(axis_names, str):
 			axis_names = eval(axis_names)
 			warnings.warn(
-				"axis_names argument is not a Sequence of strings and it's an string class. "
+				"axis_names argument is not a tp.Sequence of strings and it's an string class. "
 				"(backbone Warning in EasyDeLModuleConfig)\n"
 				f"\tchanged to {axis_names}",
 				stacklevel=1,
@@ -402,11 +393,11 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		"""
 		Get the partition rules for the model.
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return ((".*", PartitionSpec(("fsdp", "sp"))),)
 
-	def get_axis_dims(self) -> Sequence[int]:
+	def get_axis_dims(self) -> tp.Sequence[int]:
 		"""The get_axis_dims function returns a sequence of integers representing the dimensions of each axis.
 
 		Args:
@@ -417,7 +408,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		"""
 		return self.axis_dims
 
-	def get_axis_names(self) -> Sequence[str]:
+	def get_axis_names(self) -> tp.Sequence[str]:
 		"""The get_axis_names function returns a list of the names of the axes.
 
 		Args:
@@ -446,8 +437,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
 	def add_basic_configurations(
 		self,
-		axis_dims: Sequence[int] = ...,
-		axis_names: Sequence[str] = ...,
+		axis_dims: tp.Sequence[int] = ...,
+		axis_names: tp.Sequence[str] = ...,
 		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = ...,
 		blocksize_k: int = ...,
 		blocksize_q: int = ...,
@@ -455,10 +446,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		partition_axis: PartitionAxis = ...,
 		shard_attention_computation: bool = ...,
 		use_sharded_kv_caching: bool = ...,
-		backend: Optional[EasyDeLBackends] = ...,
-		platform: Optional[EasyDeLPlatforms] = ...,
-		easy_method: Literal["train", "serve", "convert"] = ...,
-		bits: Optional[int] = ...,
+		backend: tp.Optional[EasyDeLBackends] = ...,
+		platform: tp.Optional[EasyDeLPlatforms] = ...,
+		easy_method: tp.Literal["train", "serve", "convert"] = ...,
+		bits: tp.Optional[int] = ...,
 		scan_ring_attention: bool = ...,
 		scan_attention_layers: bool = ...,
 		use_sharding_constraint: bool = ...,
@@ -471,8 +462,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		quantization_method: EasyDeLQuantizationMethods = ...,
 		quantization_blocksize: int = ...,
 		quantization_pattern: str = ...,
-		kv_cache_sharding_sequence_axis_name: Union[str, Tuple[str, ...]] = ...,
-		flash_attention_backward_pass_impl: Literal["triton", "xla"] = ...,
+		kv_cache_sharding_sequence_axis_name: tp.Union[str, tp.Tuple[str, ...]] = ...,
+		flash_attention_backward_pass_impl: tp.Literal["triton", "xla"] = ...,
 		attn_dtype: jnp.dtype = ...,
 		hardware_abstraction: bool = ...,
 		pallas_m_block_size: int = ...,
@@ -483,8 +474,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		It initializes all the attributes of an object, and it's called when you create a new instance of that class.
 
 		Args:
-		                    axis_dims (Sequence[int], optional): Specify the number of dimensions for each axis. Defaults to (1, -1, 1, 1).
-		    axis_names (Sequence[str], optional): Set the names of the axes. Defaults to ("dp", "fsdp", "tp", "sp").
+		                    axis_dims (tp.Sequence[int], optional): Specify the number of dimensions for each axis. Defaults to (1, -1, 1, 1).
+		    axis_names (tp.Sequence[str], optional): Set the names of the axes. Defaults to ("dp", "fsdp", "tp", "sp").
 		    attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS, optional): attention mechanism to use. Defaults to DEFAULT_ATTENTION_MECHANISM.
 		    blocksize_k (int, optional): block size of key_states. Defaults to 128.
 		    blocksize_q (int, optional): block size of query_states. Defaults to 128.
@@ -492,10 +483,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		    partition_axis (PartitionAxis, optional): PartitionAxis is new module used for partitioning arrays in easydel. Defaults to PartitionAxis().
 		    shard_attention_computation (bool, optional): whenever to use shard_map for attention. Defaults to True.
 		    use_sharded_kv_caching (bool, optional): whenever to use shard_map and sharding for key and value. Defaults to True.
-		    backend (Optional[EasyDeLBackends], optional): Specify the backend to use. Defaults to None.
-		    platform (Optional[EasyDeLPlatforms], optional): Specify the platform to used to use. Defaults to None.
-		    easy_method (Literal["train", "serve", "convert"], optional): easydel Quantization Method to be applied for. Defaults to EasyMethod.TRAIN.
-		    bits (Optional[int], optional): Model bits for quantization. Defaults to None.
+		    backend (tp.Optional[EasyDeLBackends], optional): Specify the backend to use. Defaults to None.
+		    platform (tp.Optional[EasyDeLPlatforms], optional): Specify the platform to used to use. Defaults to None.
+		    easy_method (tp.Literal["train", "serve", "convert"], optional): easydel Quantization Method to be applied for. Defaults to EasyMethod.TRAIN.
+		    bits (tp.Optional[int], optional): Model bits for quantization. Defaults to None.
 		    scan_ring_attention (bool, optional): Whether to use can for ring attention. Defaults to True.
 		    scan_attention_layers (bool, optional): Whether to use can for attention layers. Defaults to False.
 		    use_sharding_constraint (bool, optional): whether to use sharding constraint for the arrays. Defaults to False.
@@ -508,8 +499,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		    quantization_method (EasyDeLQuantizationMethods, optional): linear modules quantization type. Defaults to EasyDeLQuantizationMethods.NONE.
 		    quantization_blocksize (int, optional): size of linear quantization. Defaults to 64.
 				quantization_pattern (str): re pattern to be used for quantizing layers.
-				kv_cache_sharding_sequence_axis_name (Union[str, Tuple[str, ...]], optional): axis name to target for sharding sequences. Defaults to "sp".
-		    flash_attention_backward_pass_impl (Literal["triton", "xla"], optional): Specify the backward pass kernel for flash attention. Defaults to "triton".
+				kv_cache_sharding_sequence_axis_name (tp.Union[str, tp.Tuple[str, ...]], optional): axis name to target for sharding sequences. Defaults to "sp".
+		    flash_attention_backward_pass_impl (tp.Literal["triton", "xla"], optional): Specify the backward pass kernel for flash attention. Defaults to "triton".
 		    attn_dtype (jnp.dtype, optional): Data type for attention computations. Defaults to jnp.float32.
 		    fcm_max_ratio (float, optional): Maximum ratio for flash cross attention. Defaults to 0.0.
 		    fcm_min_ratio (float, optional): Minimum ratio for flash cross attention. Defaults to 0.0.
@@ -600,11 +591,11 @@ class EasyDeLBaseConfig(PretrainedConfig):
 	@classmethod  # From HF.
 	def from_pretrained(
 		cls,
-		pretrained_model_name_or_path: Union[str, os.PathLike],
-		cache_dir: Optional[Union[str, os.PathLike]] = None,
+		pretrained_model_name_or_path: tp.Union[str, os.PathLike],
+		cache_dir: tp.Optional[tp.Union[str, os.PathLike]] = None,
 		force_download: bool = False,
 		local_files_only: bool = False,
-		token: Optional[Union[str, bool]] = None,
+		token: tp.Optional[tp.Union[str, bool]] = None,
 		revision: str = "main",
 		**kwargs,
 	) -> "PretrainedConfig":
@@ -649,13 +640,13 @@ class EasyDeLBaseConfig(PretrainedConfig):
 				return_unused_kwargs (`bool`, *optional*, defaults to `False`):
 						If `False`, then this function returns just the final configuration object.
 
-						If `True`, then this functions returns a `Tuple(config, unused_kwargs)` where *unused_kwargs* is a
+						If `True`, then this functions returns a `tp.Tuple(config, unused_kwargs)` where *unused_kwargs* is a
 						dictionary consisting of the key/value pairs whose keys are not configuration attributes: i.e., the
 						part of `kwargs` which has not been used to update `config` and is otherwise ignored.
 				subfolder (`str`, *optional*, defaults to `""`):
 						In case the relevant files are located inside a subfolder of the model repo on huggingface.co, you can
 						specify the folder name here.
-				kwargs (`Dict[str, Any]`, *optional*):
+				kwargs (`Dict[str, tp.Any]`, *optional*):
 						The values in kwargs of any keys which are configuration attributes will be used to override the loaded
 						values. Behavior concerning key/value pairs whose keys are *not* configuration attributes is controlled
 						by the `return_unused_kwargs` keyword parameter.

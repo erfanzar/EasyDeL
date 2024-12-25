@@ -1,13 +1,6 @@
-from easydel.infra.base_config import (
-	EasyDeLBaseConfig,
-	EasyDeLBaseConfigDict,
-)
-from easydel.infra.base_module import (
-	EasyDeLBaseModule, 
-)
-from easydel.infra.loss_utils import (
-	LossConfig,
-)
+from .base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
+from .base_module import EasyDeLBaseModule
+from .loss_utils import LossConfig
 
 __all__ = (
 	"EasyDeLBaseModule",

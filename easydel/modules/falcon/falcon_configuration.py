@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+
+import typing as tp
 
 from jax.sharding import PartitionSpec
 
@@ -69,7 +70,7 @@ class FalconConfig(EasyDeLBaseConfig):
 	        just in case (e.g., 2048 or 4096).
 	    rope_theta (`float`, *optional*, defaults to 10000.0):
 	        The theta value to use for rotary position embeddings.
-	    rope_scaling (`Dict[str, Union[str, float]]`, *optional*):
+	    rope_scaling (`tp.Dict[str, tp.Union[str, float]]`, *optional*):
 	        The rope scaling configuration.
 	    bos_token_id (`int`, *optional*, defaults to 11):
 	        The index of the beginning of sequence token in the vocabulary.
@@ -121,7 +122,7 @@ class FalconConfig(EasyDeLBaseConfig):
 		ff_factor=None,
 		activation="gelu",
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
 		self.vocab_size = vocab_size
@@ -173,7 +174,7 @@ class FalconConfig(EasyDeLBaseConfig):
 		"""
 		Get the partition rules for the model.
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
 			("word_embeddings/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
@@ -206,7 +207,7 @@ class FalconConfig(EasyDeLBaseConfig):
 	def add_jax_args(
 		self,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
 		basics = dict(bits=bits, gradient_checkpointing=gradient_checkpointing, **kwargs)

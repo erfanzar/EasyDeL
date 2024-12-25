@@ -1,10 +1,10 @@
 import json
+import typing as tp
 import urllib.parse
-from typing import Generator, Optional, Union
 
 import requests
 
-from easydel.inference.vinference.api_models import (
+from .api_models import (
 	ChatCompletionRequest,
 	ChatCompletionResponse,
 	ChatCompletionStreamResponse,
@@ -13,7 +13,7 @@ from easydel.inference.vinference.api_models import (
 
 class vInferenceAPIError(Exception):
 	def __init__(
-		self, status_code: int, message: str, response_content: Optional[str] = None
+		self, status_code: int, message: str, response_content: tp.Optional[str] = None
 	):
 		self.status_code = status_code
 		self.message = message
@@ -46,9 +46,9 @@ class vInferenceChatCompletionClient:
 	def create_chat_completion(
 		self,
 		request: ChatCompletionRequest,
-		extra_headers: Optional[dict] = None,
-	) -> Generator[
-		Union[ChatCompletionStreamResponse, ChatCompletionResponse],
+		extra_headers: tp.Optional[dict] = None,
+	) -> tp.Generator[
+		tp.Union[ChatCompletionStreamResponse, ChatCompletionResponse],
 		None,
 		None,
 	]:

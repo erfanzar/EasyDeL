@@ -25,8 +25,8 @@ settings.
 - also adding softmax scale option to support custom scales
 """
 
+import typing as tp
 from functools import partial
-from typing import Optional
 
 import chex
 import jax
@@ -40,16 +40,16 @@ def _ring_attention_fwd(
 	query: chex.Array,
 	key: chex.Array,
 	value: chex.Array,
-	bias: Optional[chex.Array],
-	segment_ids: Optional[chex.Array],
+	bias: tp.Optional[chex.Array],
+	segment_ids: tp.Optional[chex.Array],
 	axis_name: str,
 	float32_logits: bool,
-	softmax_scale: Optional[float],
+	softmax_scale: tp.Optional[float],
 	blocksize_q: int,
 	blocksize_k: int,
-	blocksize_c: Optional[int],
+	blocksize_c: tp.Optional[int],
 	deterministic: bool,
-	dropout_rng: Optional[chex.PRNGKey],
+	dropout_rng: tp.Optional[chex.PRNGKey],
 	pdrop: float,
 	dtype: jnp.dtype,
 	policy,
@@ -62,8 +62,8 @@ def _ring_attention_fwd(
 		query: Query array of shape (batch, q_len, num_heads, dim_per_head).
 		key: Key array of shape (batch, kv_len, num_heads, dim_per_head).
 		value: Value array of shape (batch, kv_len, num_heads, dim_per_head).
-		bias: Optional bias array of shape (batch, num_heads, q_len, kv_len).
-		segment_ids: Optional segment ids array of shape (batch, seq_len).
+		bias: tp.Optional bias array of shape (batch, num_heads, q_len, kv_len).
+		segment_ids: tp.Optional segment ids array of shape (batch, seq_len).
 		axis_name: Name of the axis to ppermute over.
 		float32_logits: Whether to compute logits in float32.
 		softmax_scale: scale for softmax or depth ** -0.5.
@@ -148,14 +148,14 @@ def _ring_attention_fwd(
 
 
 def _ring_attention_bwd(
-	axis_name: Optional[str],
+	axis_name: tp.Optional[str],
 	float32_logits: bool,
-	softmax_scale: Optional[float],
+	softmax_scale: tp.Optional[float],
 	blocksize_q: int,
 	blocksize_k: int,
-	blocksize_c: Optional[int],
+	blocksize_c: tp.Optional[int],
 	deterministic: bool,
-	dropout_rng: Optional[chex.PRNGKey],
+	dropout_rng: tp.Optional[chex.PRNGKey],
 	pdrop: float,
 	dtype: jnp.dtype,
 	policy,
@@ -253,16 +253,16 @@ def ring_attention(
 	query: chex.Array,
 	key: chex.Array,
 	value: chex.Array,
-	bias: Optional[chex.Array] = None,
-	segment_ids: Optional[chex.Array] = None,
-	axis_name: Optional[str] = None,
+	bias: tp.Optional[chex.Array] = None,
+	segment_ids: tp.Optional[chex.Array] = None,
+	axis_name: tp.Optional[str] = None,
 	float32_logits: bool = True,
-	softmax_scale: Optional[float] = None,
+	softmax_scale: tp.Optional[float] = None,
 	blocksize_q: int = 512,
 	blocksize_k: int = 512,
-	blocksize_c: Optional[int] = None,
+	blocksize_c: tp.Optional[int] = None,
 	deterministic: bool = True,
-	dropout_rng: Optional[chex.PRNGKey] = None,
+	dropout_rng: tp.Optional[chex.PRNGKey] = None,
 	pdrop: float = 0.0,
 	dtype: jnp.dtype = jnp.float32,
 	policy=jax.checkpoint_policies.nothing_saveable,
@@ -276,8 +276,8 @@ def ring_attention(
 		query: Query array of shape (batch, q_len, num_heads, dim_per_head).
 		key: Key array of shape (batch, kv_len, num_heads, dim_per_head).
 		value: Value array of shape (batch, kv_len, num_heads, dim_per_head).
-		bias: Optional bias array of shape (batch, num_heads, q_len, kv_len).
-		segment_ids: Optional segment ids array of shape (batch, seq_len).
+		bias: tp.Optional bias array of shape (batch, num_heads, q_len, kv_len).
+		segment_ids: tp.Optional segment ids array of shape (batch, seq_len).
 		axis_name: Name of the axis to ppermute over.
 		float32_logits: Whether to compute logits in float32.
 		softmax_scale: scale for softmax or depth ** -0.5.
@@ -332,14 +332,14 @@ def _blockwise_attention_fwd(
 	carry,
 	q_chunk_idx_start: int,
 	k_chunk_idx_start: int,
-	bias: Optional[chex.Array],
-	segment_ids: Optional[chex.Array],
-	softmax_scale: Optional[float],
-	blocksize_c: Optional[int],
+	bias: tp.Optional[chex.Array],
+	segment_ids: tp.Optional[chex.Array],
+	softmax_scale: tp.Optional[float],
+	blocksize_c: tp.Optional[int],
 	blocksize_q: int,
 	blocksize_k: int,
 	deterministic: bool,
-	dropout_rng: Optional[chex.PRNGKey],
+	dropout_rng: tp.Optional[chex.PRNGKey],
 	pdrop: float,
 	dtype: jnp.dtype,
 	policy,
@@ -355,8 +355,8 @@ def _blockwise_attention_fwd(
 		carry: Tuple of intermediate values from the previous iteration.
 		q_chunk_idx_start: Start index of the query chunk.
 		k_chunk_idx_start: Start index of the key chunk.
-		bias: Optional bias array of shape (batch, num_heads, q_len, kv_len).
-		segment_ids: Optional segment ids array of shape (batch, seq_len).
+		bias: tp.Optional bias array of shape (batch, num_heads, q_len, kv_len).
+		segment_ids: tp.Optional segment ids array of shape (batch, seq_len).
 		softmax_scale: scale for softmax or depth ** -0.5.
 		blocksize_c: Size of causal blocks.
 		blocksize_q: Size of query chunks.
@@ -507,14 +507,14 @@ def _blockwise_attention_bwd(
 	carry,
 	q_chunk_idx_start: int,
 	k_chunk_idx_start: int,
-	bias: Optional[chex.Array],
-	segment_ids: Optional[chex.Array],
-	softmax_scale: Optional[float],
-	blocksize_c: Optional[int],
+	bias: tp.Optional[chex.Array],
+	segment_ids: tp.Optional[chex.Array],
+	softmax_scale: tp.Optional[float],
+	blocksize_c: tp.Optional[int],
 	blocksize_q: int,
 	blocksize_k: int,
 	deterministic: bool,
-	dropout_rng: Optional[chex.PRNGKey],
+	dropout_rng: tp.Optional[chex.PRNGKey],
 	pdrop: float,
 	dtype: jnp.dtype,
 	policy,
@@ -531,8 +531,8 @@ def _blockwise_attention_bwd(
 		carry: Tuple of intermediate values from the forward pass.
 		q_chunk_idx_start: Start index of the query chunk.
 		k_chunk_idx_start: Start index of the key chunk.
-		bias: Optional bias array of shape (batch, num_heads, q_len, kv_len).
-		segment_ids: Optional segment ids array of shape (batch, seq_len).
+		bias: tp.Optional bias array of shape (batch, num_heads, q_len, kv_len).
+		segment_ids: tp.Optional segment ids array of shape (batch, seq_len).
 		softmax_scale: scale for softmax or depth ** -0.5.
 		blocksize_c: Size of causal blocks.
 		blocksize_q: Size of query chunks.
@@ -696,12 +696,12 @@ def _blockwise_attention_bwd(
 def _chunk_attention_bias(
 	blocksize_q: int,
 	blocksize_k: int,
-	bias: Optional[chex.Array],
-	segment_ids: Optional[chex.Array],
+	bias: tp.Optional[chex.Array],
+	segment_ids: tp.Optional[chex.Array],
 	deterministic: bool,
-	attn_dropout: Optional[chex.Array],
+	attn_dropout: tp.Optional[chex.Array],
 	pdrop: float,
-	blocksize_c: Optional[int],
+	blocksize_c: tp.Optional[int],
 	dtype: jnp.dtype,
 	query_chunk_idx: int,
 	key_chunk_idx: int,
@@ -711,8 +711,8 @@ def _chunk_attention_bias(
 	Args:
 		blocksize_q: Size of query chunks.
 		blocksize_k: Size of key chunks.
-		bias: Optional bias array of shape (batch, num_heads, q_len, kv_len).
-		segment_ids: Optional segment ids array of shape (batch, seq_len).
+		bias: tp.Optional bias array of shape (batch, num_heads, q_len, kv_len).
+		segment_ids: tp.Optional segment ids array of shape (batch, seq_len).
 		deterministic: Whether to apply dropout.
 		attn_dropout: Dropout mask.
 		pdrop: Dropout probability.

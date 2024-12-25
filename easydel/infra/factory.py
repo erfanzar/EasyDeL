@@ -1,14 +1,14 @@
 import inspect
+import typing as tp
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Literal, Optional, Type, TypeVar
 
-from easydel.infra.base_module import (
+from .base_module import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseModule,
 )
 
-T = TypeVar("T")
+T = tp.TypeVar("T")
 
 
 class ConfigType(str, Enum):
@@ -32,16 +32,16 @@ class TaskType(str, Enum):
 class ModuleRegistration:
 	module: type[EasyDeLBaseModule]
 	config: type[EasyDeLBaseConfig]
-	embedding_layer_names: Optional[List[str]] = None
-	layernorm_names: Optional[List[str]] = None
+	embedding_layer_names: tp.Optional[tp.List[str]] = None
+	layernorm_names: tp.Optional[tp.List[str]] = None
 	rnn_based_or_rwkv: bool = False
 
 
 class Registry:
 	def __init__(self):
-		self._config_registry: Dict[ConfigType, Dict] = {ConfigType.MODULE_CONFIG: {}}
+		self._config_registry: tp.Dict[ConfigType, tp.Dict] = {ConfigType.MODULE_CONFIG: {}}
 
-		self._task_registry: Dict[TaskType, Dict[str, ModuleRegistration]] = {
+		self._task_registry: tp.Dict[TaskType, tp.Dict[str, ModuleRegistration]] = {
 			task_type: {} for task_type in TaskType
 		}
 
@@ -80,8 +80,8 @@ class Registry:
 		task_type: TaskType,
 		config: EasyDeLBaseConfig,
 		model_type: str,
-		embedding_layer_names: Optional[List[str]] = None,
-		layernorm_names: Optional[List[str]] = None,
+		embedding_layer_names: tp.Optional[tp.List[str]] = None,
+		layernorm_names: tp.Optional[tp.List[str]] = None,
 		rnn_based_or_rwkv: bool = False,
 	) -> callable:
 		"""
@@ -117,14 +117,14 @@ class Registry:
 		self,
 		config_type: str,
 		config_field: ConfigType = ConfigType.MODULE_CONFIG,
-	) -> Type:
+	) -> tp.Type:
 		"""Get registered configuration class."""
 		return self._config_registry[config_field][config_type]
 
 	def get_module_registration(
 		self,
 		task_type: TaskType
-		| Literal[
+		| tp.Literal[
 			"causal-language-model",
 			"sequence-classification",
 			"vision-language-model",

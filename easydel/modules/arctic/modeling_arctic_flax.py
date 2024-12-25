@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import math
+import typing as tp
 from functools import cached_property, partial
-from typing import Optional, Tuple, Union
 
 import chex
 import jax
@@ -43,7 +44,7 @@ class ArcticAttention(FlaxAttentionModule):
 		config: ArcticConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -116,11 +117,11 @@ class ArcticAttention(FlaxAttentionModule):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
-		cache_view: Optional[TransformerCacheView] = None,
-		segment_ids: Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
-		fcm_mask: Optional[chex.Array] = None,
-		frequencies: Optional[chex.Array] = None,
+		fcm_mask: tp.Optional[chex.Array] = None,
+		frequencies: tp.Optional[chex.Array] = None,
 	):
 		batch_size, sequence_length = hidden_states.shape[:2]
 		query_states, key_states, value_states = (
@@ -202,7 +203,7 @@ class ArcticMLP(nn.Module):
 		config: ArcticConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		is_residual_mlp: bool = False,
 		*,
 		rngs: nn.Rngs,
@@ -244,7 +245,7 @@ class ArcticMoeBlock(nn.Module):
 		layer_idx: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	) -> None:
@@ -292,7 +293,7 @@ class ArcticMoeBlock(nn.Module):
 				rngs=rngs,
 			)
 
-	def _call_moe(self, hidden_states: chex.Array) -> Tuple[chex.Array, chex.Array]:
+	def _call_moe(self, hidden_states: chex.Array) -> tp.Tuple[chex.Array, chex.Array]:
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
 
 		router_logits = self.gate(hidden_states).astype(  # no reshaping is needed
@@ -343,7 +344,7 @@ class ArcticDecoderLayer(nn.Module):
 		layer_idx: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	) -> None:
@@ -416,12 +417,12 @@ class ArcticDecoderLayer(nn.Module):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
-		cache_view: Optional[TransformerCacheView] = None,
-		segment_ids: Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
-		fcm_mask: Optional[chex.Array] = None,
-		frequencies: Optional[chex.Array] = None,
-	) -> Tuple[chex.Array, Optional[chex.Array], chex.Array]:
+		fcm_mask: tp.Optional[chex.Array] = None,
+		frequencies: tp.Optional[chex.Array] = None,
+	) -> tp.Tuple[chex.Array, tp.Optional[chex.Array], chex.Array]:
 		residual_input = hidden_states
 		hidden_states = self.input_layernorm(hidden_states)
 		attn_out = self.self_attn(
@@ -474,7 +475,7 @@ class ArcticModel(EasyDeLBaseModule):
 		config: ArcticConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	) -> None:
@@ -523,16 +524,16 @@ class ArcticModel(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		past_key_values: Optional[TransformerCache] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		return_dict: bool = True,
-	) -> Union[MoeModelOutput, Tuple]:
+	) -> tp.Union[MoeModelOutput, tp.Tuple]:
 		output_attentions = (
 			output_attentions
 			if output_attentions is not None
@@ -622,7 +623,7 @@ class ArcticForCausalLM(EasyDeLBaseModule):
 		config: ArcticConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -655,16 +656,16 @@ class ArcticForCausalLM(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		past_key_values: Optional[TransformerCache] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
-	) -> MoeCausalLMOutput | Tuple:
+	) -> MoeCausalLMOutput | tp.Tuple:
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,

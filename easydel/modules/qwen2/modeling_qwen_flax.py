@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import math
+import typing as tp
 from functools import partial
-from typing import Optional, Tuple, Union
 
 import chex
 import jax
@@ -47,7 +48,7 @@ class Qwen2MLP(nn.Module):
 		config: Qwen2Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -98,7 +99,7 @@ class Qwen2Attention(FlaxAttentionModule):
 		config: Qwen2Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -178,11 +179,11 @@ class Qwen2Attention(FlaxAttentionModule):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
-		cache_view: Optional[TransformerCacheView] = None,
-		segment_ids: Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
-		fcm_mask: Optional[chex.Array] = None,
-		frequencies: Optional[chex.Array] = None,
+		fcm_mask: tp.Optional[chex.Array] = None,
+		frequencies: tp.Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the attention module.
@@ -192,13 +193,13 @@ class Qwen2Attention(FlaxAttentionModule):
 		    attention_mask (chex.Array): Mask to apply on the attention scores.
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-		    segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
 		    deterministic (bool): If True, disables dropout for deterministic behavior.
 		    init_cache (bool): If True, initializes cache for caching keys and values.
 		    output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-		    fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+		    fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
 		Returns:
-		    Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+		    tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
 		"""
 		batch_size, sequence_length = hidden_states.shape[:2]
 		query_states, key_states, value_states = (
@@ -283,7 +284,7 @@ class Qwen2DecoderLayer(nn.Module):
 		config: Qwen2Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -335,11 +336,11 @@ class Qwen2DecoderLayer(nn.Module):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
-		cache_view: Optional[TransformerCacheView] = None,
-		segment_ids: Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
-		fcm_mask: Optional[chex.Array] = None,
-		frequencies: Optional[chex.Array] = None,
+		fcm_mask: tp.Optional[chex.Array] = None,
+		frequencies: tp.Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the module block.
@@ -349,13 +350,13 @@ class Qwen2DecoderLayer(nn.Module):
 		    attention_mask (chex.Array): Mask to apply on the attention scores.
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-		    segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
 		    deterministic (bool): If True, disables dropout for deterministic behavior.
 		    init_cache (bool): If True, initializes cache for caching keys and values.
 		    output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-		    fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+		    fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
 		Returns:
-		    Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+		    tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
 		"""
 		attn_outputs = self.self_attn(
 			self.input_layernorm(hidden_states),
@@ -401,7 +402,7 @@ class Qwen2Model(EasyDeLBaseModule):
 		config: Qwen2Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -441,16 +442,16 @@ class Qwen2Model(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		past_key_values: Optional[TransformerCache] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		return_dict: bool = True,
-	) -> Union[FlaxBaseModelOutput, Tuple]:
+	) -> tp.Union[FlaxBaseModelOutput, tp.Tuple]:
 		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
 				"You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -525,7 +526,7 @@ class Qwen2ForCausalLM(EasyDeLBaseModule):
 		config: Qwen2Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -558,16 +559,16 @@ class Qwen2ForCausalLM(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		past_key_values: Optional[TransformerCache] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		return_dict: bool = True,
-	) -> Union[FlaxCausalLMOutput, Tuple]:
+	) -> tp.Union[FlaxCausalLMOutput, tp.Tuple]:
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
@@ -613,7 +614,7 @@ class Qwen2ForSequenceClassification(EasyDeLBaseModule):
 		num_classes: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -645,16 +646,16 @@ class Qwen2ForSequenceClassification(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		past_key_values: Optional[TransformerCache] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		return_dict: bool = True,
-	) -> Union[FlaxSequenceClassifierOutput, Tuple]:
+	) -> tp.Union[FlaxSequenceClassifierOutput, tp.Tuple]:
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,

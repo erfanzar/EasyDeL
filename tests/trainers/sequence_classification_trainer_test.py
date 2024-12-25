@@ -11,7 +11,6 @@ sys.path.append(
 		"../..",
 	)
 )
-from typing import Literal
 
 import fjformer
 import flax.core

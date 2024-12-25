@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import math
+import typing as tp
 from functools import cached_property, partial
-from typing import Optional, Union
 
 import chex
 import jax
@@ -47,7 +48,7 @@ class GPTJAttention(FlaxAttentionModule):
 		config: GPTJConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		causal: bool = True,
 		is_cross_attention: bool = False,
 		*,
@@ -123,11 +124,11 @@ class GPTJAttention(FlaxAttentionModule):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
-		causal_mask: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		cache_view: Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
-		frequencies: Optional[chex.Array] = None,
+		frequencies: tp.Optional[chex.Array] = None,
 	):
 		query = self.q_proj(hidden_states)
 		key = self.k_proj(hidden_states)
@@ -194,7 +195,7 @@ class GPTJMLP(nn.Module):
 		intermediate_size: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -241,7 +242,7 @@ class GPTJBlock(nn.Module):
 		config: GPTJConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -290,11 +291,11 @@ class GPTJBlock(nn.Module):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
-		causal_mask: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		cache_view: Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
-		frequencies: Optional[chex.Array] = None,
+		frequencies: tp.Optional[chex.Array] = None,
 	):
 		residual = hidden_states
 		hidden_states = self.ln_1(hidden_states)
@@ -336,7 +337,7 @@ class GPTJModel(EasyDeLBaseModule):
 		config: GPTJConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -393,13 +394,13 @@ class GPTJModel(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		past_key_values: Optional[TransformerCache] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		extra_embedding: Optional[chex.Array] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		extra_embedding: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
@@ -480,7 +481,7 @@ class GPTJForCausalLM(EasyDeLBaseModule):
 		config: GPTJConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -511,13 +512,13 @@ class GPTJForCausalLM(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		past_key_values: Optional[TransformerCache] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		extra_embedding: Optional[chex.Array] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		extra_embedding: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,

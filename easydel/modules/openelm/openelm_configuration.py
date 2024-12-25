@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+import typing as tp
 from numbers import Number
-from typing import Dict, List, Optional, Union
 
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
@@ -24,10 +25,10 @@ from easydel.infra.factory import register_config
 
 
 def make_divisible(
-	v: Union[float, int],
-	divisor: Optional[int] = 8,
-	min_value: Optional[Union[float, int]] = None,
-) -> Union[float, int]:
+	v: tp.Union[float, int],
+	divisor: tp.Optional[int] = 8,
+	min_value: tp.Optional[tp.Union[float, int]] = None,
+) -> tp.Union[float, int]:
 	"""This function is taken from the original tf repo.
 	It ensures that all layers have a channel number that is divisible by the divisor
 	It can be seen at:
@@ -118,7 +119,7 @@ class OpenELMConfig(EasyDeLBaseConfig):
 	        The id of the *beginning-of-sequence* token.
 	    eos_token_id (`int`, *optional*, defaults to 2):
 	        The id of the *end-of-sequence* token.
-	    rope_scaling (`Dict[str, Union[str, float]]`, *optional*):
+	    rope_scaling (`tp.Dict[str, tp.Union[str, float]]`, *optional*):
 	        The configuration for rope scaling.
 	    gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
 	        The gradient checkpointing configuration.
@@ -140,10 +141,10 @@ class OpenELMConfig(EasyDeLBaseConfig):
 		num_transformer_layers: int = 12,
 		model_dim: int = 2048,
 		head_dim: int = 128,
-		qkv_multipliers: Union[Number, List[Number]] = 1.0,
-		num_query_heads: Union[int, None] = None,
+		qkv_multipliers: tp.Union[Number, tp.List[Number]] = 1.0,
+		num_query_heads: tp.Union[int, None] = None,
 		num_gqa_groups: int = 1,
-		ffn_multipliers: Union[Number, List[Number]] = 4.0,
+		ffn_multipliers: tp.Union[Number, tp.List[Number]] = 4.0,
 		ffn_with_glu: bool = True,
 		ffn_dim_divisor: int = 256,
 		activation_fn_name: str = "swish",
@@ -156,11 +157,11 @@ class OpenELMConfig(EasyDeLBaseConfig):
 		use_cache: bool = True,
 		bos_token_id: int = 1,
 		eos_token_id: int = 2,
-		rope_scaling: Dict[str, Union[str, float]] = None,
+		rope_scaling: tp.Dict[str, tp.Union[str, float]] = None,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
 		"""The __init__ function is called when the class is instantiated.
@@ -205,10 +206,10 @@ class OpenELMConfig(EasyDeLBaseConfig):
 		        the key and value vectors
 		    attention_dropout: float: Set the dropout rate for the
 		        attention layer
-		    bits: Optional[int]: Specify the number of bits used for
+		    bits: tp.Optional[int]: Specify the number of bits used for
 		        quantization
-		    axis_dims: Sequence[int]: Specify the dimension of each axis
-		    axis_names: Sequence[str]: Specify the names of each axis in
+		    axis_dims: tp.Sequence[int]: Specify the dimension of each axis
+		    axis_names: tp.Sequence[str]: Specify the names of each axis in
 		        the tensor
 		    &quot;mp&quot;): Define the maximum position embeddings
 		    attention_bias: bool: when ever to use attention_bias
@@ -262,7 +263,7 @@ class OpenELMConfig(EasyDeLBaseConfig):
 		"""
 		Get the partition rules for the model.
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 
 		return (
@@ -287,8 +288,8 @@ class OpenELMConfig(EasyDeLBaseConfig):
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
-		bits: Optional[int] = None,
-		rope_scaling: Dict[str, Union[str, float]] = None,
+		bits: tp.Optional[int] = None,
+		rope_scaling: tp.Dict[str, tp.Union[str, float]] = None,
 		**kwargs,
 	):
 		"""The add_jax_args function adds the following arguments to the model:
@@ -301,9 +302,9 @@ class OpenELMConfig(EasyDeLBaseConfig):
 		    use_scan_mlp: bool: Determine whether to use the scan_mlp
 		        function or notn
 		    scan_mlp_chunk_size: int: Chunk the input to the mlp
-		    bits: Optional[int]: Specify the number of bits to use for
+		    bits: tp.Optional[int]: Specify the number of bits to use for
 		        quantization
-		    rope_scaling: Dict[str, Union[str, float]]: rope_scaling for
+		    rope_scaling: tp.Dict[str, tp.Union[str, float]]: rope_scaling for
 		        rope
 
 		Returns:

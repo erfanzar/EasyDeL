@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.qwen2_moe.configuration_qwen2_moe import Qwen2MoeConfig
-from easydel.modules.qwen2_moe.modeling_qwen2_moe_flax import (
-	Qwen2MoeForCausalLM,
-	Qwen2MoeModel,
-)
+from .configuration_qwen2_moe import Qwen2MoeConfig
+from .modeling_qwen2_moe_flax import Qwen2MoeForCausalLM, Qwen2MoeModel
 
 __all__ = "Qwen2MoeForCausalLM", "Qwen2MoeModel", "Qwen2MoeConfig"

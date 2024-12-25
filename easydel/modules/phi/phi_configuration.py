@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+
+import typing as tp
 
 from jax.sharding import PartitionSpec
 
@@ -65,7 +66,7 @@ class PhiConfig(EasyDeLBaseConfig):
 	        Whether to tie the weights of the input embeddings and the output embeddings.
 	    rope_theta (`float`, *optional*, defaults to 10000.0):
 	        The theta value to use for rotary position embeddings.
-	    rope_scaling (`Dict[str, Union[str, float]]`, *optional*):
+	    rope_scaling (`tp.Dict[str, tp.Union[str, float]]`, *optional*):
 	        The configuration for rope scaling.
 	    partial_rotary_factor (`float`, *optional*, defaults to 0.5):
 	        The factor for partial rotary embeddings.
@@ -112,7 +113,7 @@ class PhiConfig(EasyDeLBaseConfig):
 		qk_layernorm=False,
 		bos_token_id=1,
 		eos_token_id=2,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	) -> None:
@@ -150,7 +151,7 @@ class PhiConfig(EasyDeLBaseConfig):
 
 	def add_jax_args(
 		self,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	):
@@ -169,7 +170,7 @@ class PhiConfig(EasyDeLBaseConfig):
 		        Whether to use fully sharded data parallelism.
 
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
 			(

@@ -11,15 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from __future__ import annotations
 
 import asyncio
 import time
+import typing as tp
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Any, AsyncGenerator, Callable, Dict, Optional
 
 import uvicorn
 from fastapi import APIRouter, FastAPI
@@ -27,6 +26,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from prometheus_client import start_http_server
 
 from easydel.etils.etils import get_logger
+
 from .api_models import (
 	ChatCompletionRequest,
 	ChatCompletionResponse,
@@ -45,10 +45,10 @@ TIMEOUT_KEEP_ALIVE = 5.0
 @dataclass
 class EndpointConfig:
 	path: str
-	handler: Callable
+	handler: tp.Callable
 	methods: list[str]
-	summary: Optional[str] = None
-	tags: Optional[list[str]] = None
+	summary: tp.Optional[str] = None
+	tags: tp.Optional[list[str]] = None
 
 
 def create_error_response(status_code: HTTPStatus, message: str) -> JSONResponse:
@@ -61,7 +61,7 @@ class vInferenceApiServer:
 		inference_map: Dict[str, "vInference"] = None,  # noqa #type:ignore
 		max_workers: int = 10,
 	) -> None:
-		from easydel.inference.vinference import vInference
+		from .vinference import vInference
 
 		assert inference_map is not None, "`inference_map` can not be None."
 		for inference in inference_map.values():
@@ -236,7 +236,7 @@ class vInferenceApiServer:
 	) -> StreamingResponse:
 		"""Handle streaming response generation asynchronously."""
 
-		async def stream_results() -> AsyncGenerator[bytes, Any]:
+		async def stream_results() -> tp.AsyncGenerator[bytes, tp.Any]:
 			prompt_tokens = inference.count_tokens(request.model_dump()["messages"])
 			start = time.perf_counter()
 			padded_sequence_length = inference.model_prefill_length
@@ -396,7 +396,7 @@ class vInferenceApiServer:
 		self,
 		host="0.0.0.0",
 		port=11556,
-		metrics_port: Optional[int] = None,
+		metrics_port: tp.Optional[int] = None,
 		log_level="debug",
 	):
 		metrics_port = metrics_port or (port + 1)

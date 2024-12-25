@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.gemma.gemma_configuration import GemmaConfig
-from easydel.modules.gemma.modeling_gemma_flax import (
-	GemmaForCausalLM,
-	GemmaModel,
-)
+from .gemma_configuration import GemmaConfig
+from .modeling_gemma_flax import GemmaForCausalLM, GemmaModel
 
 __all__ = "GemmaForCausalLM", "GemmaModel", "GemmaConfig"

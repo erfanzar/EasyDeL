@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.trainers.supervised_fine_tuning_trainer.sft_trainer import SFTTrainer
-from easydel.trainers.supervised_fine_tuning_trainer.sft_config import SFTConfig
+from .sft_config import SFTConfig
+from .sft_trainer import SFTTrainer
 
 __all__ = "SFTConfig", "SFTTrainer"

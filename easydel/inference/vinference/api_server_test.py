@@ -1,6 +1,6 @@
 import asyncio
 import json
-from typing import Any, AsyncGenerator, Dict, List
+import typing as tp
 
 import aiohttp
 
@@ -10,8 +10,12 @@ class ChatCompletionClient:
 		self.base_url = base_url
 
 	async def create_chat_completion(
-		self, messages: List[Dict[str, str]], model: str, stream: bool = True, **kwargs
-	) -> AsyncGenerator[Dict[str, Any], None]:
+		self,
+		messages: tp.List[tp.Dict[str, str]],
+		model: str,
+		stream: bool = True,
+		**kwargs,
+	) -> tp.AsyncGenerator[tp.Dict[str, tp.Any], None]:
 		url = f"{self.base_url}/v1/chat/completions"
 
 		payload = {"messages": messages, "model": model, "stream": stream, **kwargs}

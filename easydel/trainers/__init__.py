@@ -12,26 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.trainers.base_trainer import BaseTrainer
-
-from easydel.trainers.direct_preference_optimization_trainer import (
+from .base_trainer import BaseTrainer
+from .direct_preference_optimization_trainer import (
 	DPOConfig,
 	DPOTrainer,
 	DPOTrainerOutput,
 )
-from easydel.trainers.odds_ratio_preference_optimization_trainer import (
+from .odds_ratio_preference_optimization_trainer import (
 	ORPOConfig,
 	ORPOTrainer,
 	ORPOTrainerOutput,
 )
-from easydel.trainers.packer import pack_sequences
-
-from easydel.trainers.supervised_fine_tuning_trainer import (
-	SFTTrainer,
+from .packer import pack_sequences
+from .supervised_fine_tuning_trainer import (
 	SFTConfig,
+	SFTTrainer,
 )
-from easydel.trainers.training_configurations import TrainingArguments
-from easydel.trainers.utils import (
+from .trainer import Trainer
+from .training_configurations import TrainingArguments
+from .utils import (
 	JaxDistributedConfig,
 	conversations_formatting_function,
 	create_constant_length_dataset,
@@ -39,8 +38,6 @@ from easydel.trainers.utils import (
 	get_formatting_func_from_dataset,
 	instructions_formatting_function,
 )
-
-from easydel.trainers.trainer import Trainer
 
 __all__ = (
 	"BaseTrainer",

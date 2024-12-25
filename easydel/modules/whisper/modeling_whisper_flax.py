@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import math
 import random
+import typing as tp
 from functools import partial
-from typing import Any, Optional, Tuple, Union
 
 import jax
 import jax.numpy as jnp
@@ -77,7 +78,7 @@ class FlaxWhisperAttention(FlaxAttentionModule):
 		bias: bool = True,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	) -> None:
@@ -135,11 +136,11 @@ class FlaxWhisperAttention(FlaxAttentionModule):
 	def __call__(
 		self,
 		hidden_states: jnp.ndarray,
-		key_value_states: Optional[jnp.ndarray] = None,
-		cache_view: Optional[TransformerCacheView] = None,
-		attention_mask: Optional[jnp.ndarray] = None,
-		causal_mask: Optional[jnp.ndarray] = None,
-	) -> tuple[Any, Any]:
+		key_value_states: tp.Optional[jnp.ndarray] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
+		attention_mask: tp.Optional[jnp.ndarray] = None,
+		causal_mask: tp.Optional[jnp.ndarray] = None,
+	) -> tuple[tp.Any, tp.Any]:
 		is_cross_attention = key_value_states is not None
 		query_states = self.q_proj(hidden_states)
 
@@ -210,7 +211,7 @@ class FlaxWhisperEncoderLayer(nn.Module):
 		config: WhisperConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	) -> None:
@@ -265,9 +266,9 @@ class FlaxWhisperEncoderLayer(nn.Module):
 		self,
 		hidden_states: jnp.ndarray,
 		attention_mask: jnp.ndarray,
-		causal_mask: Optional[jnp.ndarray] = None,
+		causal_mask: tp.Optional[jnp.ndarray] = None,
 		output_attentions: bool = True,
-	) -> Tuple[jnp.ndarray]:
+	) -> tp.Tuple[jnp.ndarray]:
 		residual = hidden_states
 		hidden_states = self.self_attn_layer_norm(hidden_states)
 		hidden_states, attn_weights = self.self_attn(
@@ -302,7 +303,7 @@ class FlaxWhisperDecoderLayer(nn.Module):
 		config: WhisperConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	) -> None:
@@ -386,12 +387,12 @@ class FlaxWhisperDecoderLayer(nn.Module):
 		self,
 		hidden_states: jnp.ndarray,
 		attention_mask: jnp.ndarray,
-		causal_mask: Optional[jnp.ndarray] = None,
-		encoder_hidden_states: Optional[jnp.ndarray] = None,
-		encoder_attention_mask: Optional[jnp.ndarray] = None,
-		cache_view: Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[jnp.ndarray] = None,
+		encoder_hidden_states: tp.Optional[jnp.ndarray] = None,
+		encoder_attention_mask: tp.Optional[jnp.ndarray] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
 		output_attentions: bool = True,
-	) -> Tuple[jnp.ndarray]:
+	) -> tp.Tuple[jnp.ndarray]:
 		residual = hidden_states
 		hidden_states = self.self_attn_layer_norm(hidden_states)
 
@@ -443,7 +444,7 @@ class FlaxWhisperEncoder(EasyDeLBaseModule):
 		config: WhisperConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -519,7 +520,7 @@ class FlaxWhisperEncoder(EasyDeLBaseModule):
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
-	) -> tuple[Any | None, ...] | FlaxBaseModelOutput:
+	) -> tuple[tp.Any | None, ...] | FlaxBaseModelOutput:
 		all_attentions = () if output_attentions else None
 		all_hidden_states = () if output_hidden_states else None
 		if input_features.shape[1:] != (
@@ -586,7 +587,7 @@ class FlaxWhisperDecoder(EasyDeLBaseModule):
 		config: WhisperConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -642,12 +643,12 @@ class FlaxWhisperDecoder(EasyDeLBaseModule):
 		input_ids: jnp.ndarray,
 		attention_mask: jnp.ndarray,
 		position_ids: jnp.ndarray,
-		encoder_hidden_states: Optional[jnp.ndarray] = None,
-		past_key_values: Optional[TransformerCache] = None,
+		encoder_hidden_states: tp.Optional[jnp.ndarray] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
-	) -> tuple[Any, ...] | FlaxBaseModelOutputWithPastAndCrossAttentions:
+	) -> tuple[tp.Any, ...] | FlaxBaseModelOutputWithPastAndCrossAttentions:
 		inputs_embeds = self.embed_tokens(input_ids)
 		position_embeds = self.embed_positions(position_ids)
 
@@ -732,7 +733,7 @@ class FlaxWhisperModel(EasyDeLBaseModule):
 		config: WhisperConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -768,9 +769,9 @@ class FlaxWhisperModel(EasyDeLBaseModule):
 		self,
 		input_features: jnp.ndarray,
 		decoder_input_ids: jnp.ndarray,
-		decoder_attention_mask: Optional[jnp.ndarray] = None,
-		decoder_position_ids: Optional[jnp.ndarray] = None,
-		past_key_values: Optional[TransformerCache] = None,
+		decoder_attention_mask: tp.Optional[jnp.ndarray] = None,
+		decoder_position_ids: tp.Optional[jnp.ndarray] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
@@ -841,9 +842,9 @@ class FlaxWhisperModel(EasyDeLBaseModule):
 		self,
 		encoder_hidden_states: jnp.ndarray,
 		decoder_input_ids: jnp.ndarray,
-		decoder_attention_mask: Optional[jnp.ndarray] = None,
-		decoder_position_ids: Optional[jnp.ndarray] = None,
-		past_key_values: Optional[TransformerCache] = None,
+		decoder_attention_mask: tp.Optional[jnp.ndarray] = None,
+		decoder_position_ids: tp.Optional[jnp.ndarray] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
@@ -953,7 +954,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 		config: WhisperConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -992,9 +993,9 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 		self,
 		input_features,
 		decoder_input_ids,
-		decoder_attention_mask: Optional[jnp.ndarray] = None,
-		decoder_position_ids: Optional[jnp.ndarray] = None,
-		past_key_values: Optional[TransformerCache] = None,
+		decoder_attention_mask: tp.Optional[jnp.ndarray] = None,
+		decoder_position_ids: tp.Optional[jnp.ndarray] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
@@ -1037,13 +1038,13 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 		self,
 		decoder_input_ids,
 		encoder_outputs,
-		encoder_attention_mask: Optional[jnp.ndarray] = None,
-		decoder_attention_mask: Optional[jnp.ndarray] = None,
-		decoder_position_ids: Optional[jnp.ndarray] = None,
-		past_key_values: Optional[dict] = None,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		return_dict: Optional[bool] = None,
+		encoder_attention_mask: tp.Optional[jnp.ndarray] = None,
+		decoder_attention_mask: tp.Optional[jnp.ndarray] = None,
+		decoder_position_ids: tp.Optional[jnp.ndarray] = None,
+		past_key_values: tp.Optional[dict] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		return_dict: tp.Optional[bool] = None,
 	):
 		output_attentions = (
 			output_attentions
@@ -1153,7 +1154,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 		forced_decoder_ids: jax.Array,
 		params: dict,
 		return_timestamps: bool = False,
-		generation_config: Optional["transformers.GenerationConfig"] = None,  # noqa #type:ignore
+		generation_config: tp.Optional["transformers.GenerationConfig"] = None,  # noqa #type:ignore
 		**kwargs,
 	):
 		if generation_config is None:
@@ -1177,8 +1178,8 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 		self,
 		decoder_input_ids,
 		max_length,
-		attention_mask: Optional[jax.Array] = None,
-		decoder_attention_mask: Optional[jax.Array] = None,
+		attention_mask: tp.Optional[jax.Array] = None,
+		decoder_attention_mask: tp.Optional[jax.Array] = None,
 		encoder_outputs=None,
 		**kwargs,
 	):
@@ -1231,7 +1232,7 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
 		config: WhisperConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):

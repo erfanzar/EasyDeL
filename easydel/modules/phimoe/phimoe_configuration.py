@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+
+import typing as tp
 
 from jax.sharding import PartitionSpec
 
@@ -129,7 +130,7 @@ class PhiMoeConfig(EasyDeLBaseConfig):
 		attention_bias=False,
 		embd_pdrop: float = 0.0,
 		lm_head_bias=False,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	) -> None:
@@ -176,7 +177,7 @@ class PhiMoeConfig(EasyDeLBaseConfig):
 
 	def add_jax_args(
 		self,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		embd_pdrop: float = 0.0,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
@@ -197,7 +198,7 @@ class PhiMoeConfig(EasyDeLBaseConfig):
 		        Whether to use fully sharded data parallelism.
 
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
 			(

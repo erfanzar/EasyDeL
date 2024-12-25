@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.gpt2.gpt2_configuration import GPT2Config
-from easydel.modules.gpt2.modeling_gpt2_flax import (
-	GPT2LMHeadModel,
-	GPT2Model,
-)
+from .gpt2_configuration import GPT2Config
+from .modeling_gpt2_flax import GPT2LMHeadModel, GPT2Model
 
 __all__ = "GPT2LMHeadModel", "GPT2Model", "GPT2Config"

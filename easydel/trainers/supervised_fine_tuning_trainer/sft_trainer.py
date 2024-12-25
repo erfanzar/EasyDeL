@@ -11,19 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-import warnings
 import typing as tp
+import warnings
+
 from easydel.etils.etils import get_logger
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.trainers.base_trainer import TrainerConfigureDataloaderOutput
-from easydel.trainers.trainer import Trainer
-from easydel.trainers.supervised_fine_tuning_trainer.sft_config import SFTConfig
-from easydel.trainers.utils import (
+from easydel.infra.utils import ProcessingClassType
+
+from ..base_trainer import TrainerConfigureDataloaderOutput
+from ..trainer import Trainer
+from ..utils import (
 	create_constant_length_dataset,
 	get_formatting_func_from_dataset,
 )
-from easydel.infra.utils import ProcessingClassType
+from .sft_config import SFTConfig
 
 if tp.TYPE_CHECKING:
 	from datasets import Dataset

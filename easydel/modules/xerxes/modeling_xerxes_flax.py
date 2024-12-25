@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import functools
-from typing import Optional, Tuple, Union
+import typing as tp
 
 import chex
 import jax
@@ -73,7 +74,7 @@ class XerxesAttention(FlaxAttentionModule):
 		layer_idx: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None,
 		causal: bool = True,
 		is_cross_attention: bool = False,
 		*,
@@ -172,11 +173,11 @@ class XerxesAttention(FlaxAttentionModule):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
-		cache_view: Optional[TransformerCacheView] = None,
-		segment_ids: Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
-		fcm_mask: Optional[chex.Array] = None,
-		frequencies: Optional[chex.Array] = None,
+		fcm_mask: tp.Optional[chex.Array] = None,
+		frequencies: tp.Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the attention module.
@@ -186,13 +187,13 @@ class XerxesAttention(FlaxAttentionModule):
 		    attention_mask (chex.Array): Mask to apply on the attention scores.
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-		    segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
 		    deterministic (bool): If True, disables dropout for deterministic behavior.
 		    init_cache (bool): If True, initializes cache for caching keys and values.
 		    output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-		    fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+		    fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
 		Returns:
-		    Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+		    tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
 		"""
 		batch_size, sequence_length = hidden_states.shape[:2]
 		(query_states, key_states, value_states) = (
@@ -273,7 +274,7 @@ class XerxesMLP(nn.Module):
 		config: XerxesConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -318,7 +319,7 @@ class XerxesSparseMoeBlock(nn.Module):
 		config: XerxesConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[None, jax.lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[None, jax.lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -348,7 +349,7 @@ class XerxesSparseMoeBlock(nn.Module):
 			for _ in range(self.config.num_local_experts)
 		]
 
-	def __call__(self, hidden_states: chex.Array) -> Tuple[chex.Array, chex.Array]:
+	def __call__(self, hidden_states: chex.Array) -> tp.Tuple[chex.Array, chex.Array]:
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
 		router_logits = self.gate(hidden_states).astype(
 			jnp.promote_types(self.dtype, jnp.float32)
@@ -391,7 +392,7 @@ class XerxesDecoderLayer(nn.Module):
 		layer_idx: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -443,11 +444,11 @@ class XerxesDecoderLayer(nn.Module):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
-		cache_view: Optional[TransformerCacheView] = None,
-		segment_ids: Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
-		fcm_mask: Optional[chex.Array] = None,
-		frequencies: Optional[chex.Array] = None,
+		fcm_mask: tp.Optional[chex.Array] = None,
+		frequencies: tp.Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the module block.
@@ -457,13 +458,13 @@ class XerxesDecoderLayer(nn.Module):
 		    attention_mask (chex.Array): Mask to apply on the attention scores.
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-		    segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
 		    deterministic (bool): If True, disables dropout for deterministic behavior.
 		    init_cache (bool): If True, initializes cache for caching keys and values.
 		    output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-		    fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+		    fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
 		Returns:
-		    Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+		    tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
 		"""
 		residual = hidden_states
 
@@ -507,7 +508,7 @@ class XerxesModel(EasyDeLBaseModule):
 		config: XerxesConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -547,16 +548,16 @@ class XerxesModel(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		past_key_values: Optional[TransformerCache] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		return_dict: bool = True,
-	) -> Union[FlaxBaseModelOutput, Tuple]:
+	) -> tp.Union[FlaxBaseModelOutput, tp.Tuple]:
 		"""
 		Forward pass through the Xerxes module.
 
@@ -564,16 +565,16 @@ class XerxesModel(EasyDeLBaseModule):
 		    input_ids (chex.Array): Input tensor containing token IDs.
 		    attention_mask (chex.Array): Mask for attention.
 		    position_ids (chex.Array): Positional indices.
-		    segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-		    inputs_embeds (Optional[chex.Array]): Embedded input tensor.
-		    output_attentions (Optional[bool]): If True, output attention weights.
-		    output_hidden_states (Optional[bool]): If True, output hidden states.
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
+		    inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
+		    output_attentions (tp.Optional[bool]): If True, output attention weights.
+		    output_hidden_states (tp.Optional[bool]): If True, output hidden states.
 		    init_cache (bool): If True, initialize cache for decoding.
 		    deterministic (bool): If True, disable dropout.
 		    return_dict (bool): If True, return a dictionary of outputs.
 
 		Returns:
-		    FlaxBaseModelOutput | Tuple: Model output, either as a named tuple or a standard tuple.
+		    FlaxBaseModelOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
 		all_attentions = () if output_attentions else None
 		all_hidden_states = () if output_hidden_states else None
@@ -653,7 +654,7 @@ class XerxesForCausalLM(EasyDeLBaseModule):
 		config: XerxesConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, jax.lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -685,33 +686,33 @@ class XerxesForCausalLM(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		past_key_values: Optional[TransformerCache] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		return_dict: bool = True,
-	) -> Union[FlaxCausalLMOutput, Tuple]:
+	) -> tp.Union[FlaxCausalLMOutput, tp.Tuple]:
 		"""
 		Forward pass through the Xerxes module.
 
 		Args:
-		    input_ids (Optional[chex.Array]): Input tensor containing token IDs.
-		    attention_mask (Optional[chex.Array]): Mask for attention.
-		    position_ids (Optional[chex.Array]): Positional indices.
-		    segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
-		    inputs_embeds (Optional[chex.Array]): Embedded input tensor.
-		    output_attentions (Optional[bool]): If True, output attention weights.
-		    output_hidden_states (Optional[bool]): If True, output hidden states.
+		    input_ids (tp.Optional[chex.Array]): Input tensor containing token IDs.
+		    attention_mask (tp.Optional[chex.Array]): Mask for attention.
+		    position_ids (tp.Optional[chex.Array]): Positional indices.
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
+		    inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
+		    output_attentions (tp.Optional[bool]): If True, output attention weights.
+		    output_hidden_states (tp.Optional[bool]): If True, output hidden states.
 		    init_cache (bool): If True, initialize cache for decoding.
 		    deterministic (bool): If True, disable dropout.
 		    return_dict (bool): If True, return a dictionary of outputs.
 
 		Returns:
-		    FlaxCausalLMOutput | Tuple: Model output, either as a named tuple or a standard tuple.
+		    FlaxCausalLMOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
 
 		outputs = self.model(

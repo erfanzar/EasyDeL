@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import math
-from typing import Any, List, Mapping, Optional, Tuple, Union
+import typing as tp
 
 import chex
 import jax.lax
@@ -32,17 +33,17 @@ from easydel.modules.rwkv.rwkv_configuration import RwkvConfig as RwkvConfig
 @dataclass
 class RwkvOutput(ModelOutput):
 	last_hidden_state: chex.Array = None
-	state: Optional[Tuple[chex.Array, ...]] = None
-	hidden_states: Optional[Tuple[chex.Array, ...]] = None
-	attentions: Optional[Tuple[chex.Array, ...]] = None
+	state: tp.Optional[tp.Tuple[chex.Array, ...]] = None
+	hidden_states: tp.Optional[tp.Tuple[chex.Array, ...]] = None
+	attentions: tp.Optional[tp.Tuple[chex.Array, ...]] = None
 
 
 @dataclass
 class RwkvCausalLMOutput(ModelOutput):
 	logits: chex.Array = None
-	state: Optional[List[chex.Array]] = None
-	hidden_states: Optional[Tuple[chex.Array, ...]] = None
-	attentions: Optional[Tuple[chex.Array, ...]] = None
+	state: tp.Optional[tp.List[chex.Array]] = None
+	hidden_states: tp.Optional[tp.Tuple[chex.Array, ...]] = None
+	attentions: tp.Optional[tp.Tuple[chex.Array, ...]] = None
 
 
 def init_to_value(x, dtype):
@@ -102,7 +103,7 @@ class FlaxRwkvSelfAttention(nn.Module):
 	layer_id: int
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = None
+	precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None
 
 	def setup(self) -> None:
 		config = self.config
@@ -190,7 +191,7 @@ class FlaxRwkvSelfAttention(nn.Module):
 	def __call__(
 		self,
 		hidden: chex.Array,
-		state: Tuple[chex.Array, chex.Array, chex.Array, chex.Array],
+		state: tp.Tuple[chex.Array, chex.Array, chex.Array, chex.Array],
 	):
 		sx, aa, bb, pp = state
 		c_x = jnp.concatenate(
@@ -240,7 +241,7 @@ class FlaxRwkvFeedForward(nn.Module):
 	layer_id: int
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = None
+	precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
 		config = self.config
@@ -313,7 +314,7 @@ class SingleStandFlaxRwkvBlock(nn.Module):
 	layer_id: int
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = None
+	precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
 		config = self.config
@@ -391,7 +392,7 @@ class FlaxRwkvBlockCollection(nn.Module):
 	config: RwkvConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = None
+	precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None
 
 	def setup(self) -> None:
 		self.blocks = [
@@ -411,13 +412,13 @@ class FlaxRwkvBlockCollection(nn.Module):
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		attention_mask: Optional[chex.Array] = None,
-		state: Optional[List[chex.Array]] = None,
-		use_cache: Optional[bool] = None,
-		deterministic: Optional[bool] = True,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		return_dict: Optional[bool] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		state: tp.Optional[tp.List[chex.Array]] = None,
+		use_cache: tp.Optional[bool] = None,
+		deterministic: tp.Optional[bool] = True,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		return_dict: tp.Optional[bool] = None,
 	):
 		all_hidden_states = ()
 		all_self_attentions = ()
@@ -453,11 +454,11 @@ class FlaxRwkvPretrainedModel(EasyDeLBaseModule):
 	def __init__(
 		self,
 		config: RwkvConfig,
-		input_shape: Tuple = (1, 1),
+		input_shape: tp.Tuple = (1, 1),
 		seed: int = 0,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		_do_init: bool = True,
 		**kwargs,
 	):
@@ -477,8 +478,8 @@ class FlaxRwkvPretrainedModel(EasyDeLBaseModule):
 		)
 
 	def init_weights(
-		self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None
-	) -> FrozenDict[Any, Any] | Mapping[str, Any] | Any:
+		self, rng: jax.random.PRNGKey, input_shape: tp.Tuple, params: FrozenDict = None
+	) -> FrozenDict[tp.Any, tp.Any] | tp.Mapping[str, tp.Any] | tp.Any:
 		input_ids = jnp.zeros(input_shape, dtype="i4")
 		attention_mask = jnp.ones((batch_size, sequence_length), "i4")
 		params_rng, dropout_rng = jax.random.split(rng)
@@ -501,18 +502,18 @@ class FlaxRwkvPretrainedModel(EasyDeLBaseModule):
 
 	def __call__(  # noqa
 		self,
-		input_ids: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		state: Optional[List[chex.Array]] = None,
-		use_cache: Optional[bool] = None,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		return_dict: Optional[bool] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		state: tp.Optional[tp.List[chex.Array]] = None,
+		use_cache: tp.Optional[bool] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		return_dict: tp.Optional[bool] = None,
 		params: dict = None,
 		dropout_rng: jax.random.PRNGKey = None,
 		train: bool = False,
-		extra_embedding: Optional[Union[jnp.ndarray, None]] = None,
+		extra_embedding: tp.Optional[tp.Union[jnp.ndarray, None]] = None,
 		add_params_field: bool = False,
 	):
 		output_attentions = (
@@ -601,7 +602,7 @@ class FlaxRwkvModel(nn.Module):
 	config: RwkvConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = None
+	precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
 		config = self.config
@@ -626,16 +627,16 @@ class FlaxRwkvModel(nn.Module):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		state: Optional[List[chex.Array]] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		state: tp.Optional[tp.List[chex.Array]] = None,
 		deterministic: bool = True,
-		use_cache: Optional[bool] = None,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		return_dict: Optional[bool] = None,
-	) -> Union[Tuple, RwkvOutput]:
+		use_cache: tp.Optional[bool] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		return_dict: tp.Optional[bool] = None,
+	) -> tp.Union[tp.Tuple, RwkvOutput]:
 		output_attentions = (
 			output_attentions
 			if output_attentions is not None
@@ -723,7 +724,7 @@ class FlaxRwkvForCausalLM(nn.Module):
 	config: RwkvConfig
 	dtype: jnp.dtype = jnp.float32
 	param_dtype: jnp.dtype = jnp.float32
-	precision: Optional[Union[str, jax.lax.Precision]] = None
+	precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None
 
 	def setup(self):
 		config = self.config
@@ -743,16 +744,16 @@ class FlaxRwkvForCausalLM(nn.Module):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		state: Optional[List[chex.Array]] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		state: tp.Optional[tp.List[chex.Array]] = None,
 		deterministic: bool = True,
-		use_cache: Optional[bool] = None,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		return_dict: Optional[bool] = None,
-	) -> Union[Tuple, RwkvCausalLMOutput]:
+		use_cache: tp.Optional[bool] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		return_dict: tp.Optional[bool] = None,
+	) -> tp.Union[tp.Tuple, RwkvCausalLMOutput]:
 		return_dict = (
 			return_dict if return_dict is not None else self.config.use_return_dict
 		)

@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.arctic.arctic_configuration import ArcticConfig
-from easydel.modules.arctic.modeling_arctic_flax import (
-	ArcticForCausalLM,
-	ArcticModel,
-)
+from .arctic_configuration import ArcticConfig
+from .modeling_arctic_flax import ArcticForCausalLM, ArcticModel
 
 __all__ = "ArcticModel", "ArcticForCausalLM", "ArcticConfig"

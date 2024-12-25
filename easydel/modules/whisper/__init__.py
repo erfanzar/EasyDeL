@@ -12,9 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.whisper.modeling_whisper_flax import (
+from .modeling_whisper_flax import (
 	WhisperForAudioClassification,
 	WhisperForConditionalGeneration,
 	WhisperTimeStampLogitsProcessor,
 )
-from easydel.modules.whisper.whisper_configuration import WhisperConfig
+from .whisper_configuration import WhisperConfig
+
+__all__ = (
+	"WhisperForAudioClassification",
+	"WhisperForConditionalGeneration",
+	"WhisperTimeStampLogitsProcessor",
+	"WhisperConfig",
+)

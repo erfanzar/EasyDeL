@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+
+import typing as tp
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -65,10 +66,10 @@ class WhisperConfig(EasyDeLBaseConfig):
 	    scale_embedding (`bool`, *optional*, defaults to False):
 	        Scale embeddings by dividing by sqrt(d_model).
 	    max_source_positions (`int`, *optional*, defaults to 1500):
-	        The maximum sequence length allowed for the source text input to the model. Any longer inputs will be
+	        The maximum sequence length allowed for the source text input to the model. tp.Any longer inputs will be
 	        truncated.
 	    max_target_positions (`int`, *optional*, defaults to 448):
-	        The maximum sequence length allowed for the target text input to the model. Any longer inputs will be
+	        The maximum sequence length allowed for the target text input to the model. tp.Any longer inputs will be
 	        truncated.
 	    use_cache (`bool`, *optional*, defaults to `True`):
 	        Whether or not the model should return the last key/values attentions (not used by all models).
@@ -146,7 +147,7 @@ class WhisperConfig(EasyDeLBaseConfig):
 		mask_feature_length=10,
 		mask_feature_min_masks=0,
 		median_filter_width=7,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	):
@@ -202,7 +203,7 @@ class WhisperConfig(EasyDeLBaseConfig):
 
 	def add_jax_args(
 		self,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	):

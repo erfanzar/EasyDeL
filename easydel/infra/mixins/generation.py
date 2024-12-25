@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import copy
 import inspect
 import typing as tp
@@ -40,17 +39,18 @@ from easydel.inference.logits_process import (
 	FlaxTopKLogitsWarper,
 	FlaxTopPLogitsWarper,
 )
-from easydel.infra.base_config import EasyDeLBaseConfig
-from easydel.infra.modeling_outputs import (
-	FlaxBeamSearchOutput,
-	FlaxGreedySearchOutput,
-	FlaxSampleOutput,
-)
 from easydel.layers.caching.transformer_cache import (
 	TransformerCache,
 	TransformerCacheMetaData,
 )
 from easydel.utils.quantizers import EasyQuantizer
+
+from ..base_config import EasyDeLBaseConfig
+from ..modeling_outputs import (
+	FlaxBeamSearchOutput,
+	FlaxGreedySearchOutput,
+	FlaxSampleOutput,
+)
 
 logger = get_logger(__name__)
 

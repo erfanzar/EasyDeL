@@ -1,8 +1,8 @@
 import enum
-from functools import reduce
-from operator import mul
 import pprint
 import typing as tp
+from functools import reduce
+from operator import mul
 
 import chex
 import flax

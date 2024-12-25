@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import math
+import typing as tp
 from functools import cached_property
-from typing import Optional, Tuple, Union
 
 import chex
 import jax
@@ -46,7 +47,7 @@ class DbrxAttention(FlaxAttentionModule):
 		config: DbrxConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -118,11 +119,11 @@ class DbrxAttention(FlaxAttentionModule):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
-		cache_view: Optional[TransformerCacheView] = None,
-		segment_ids: Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
-		fcm_mask: Optional[chex.Array] = None,
-		frequencies: Optional[chex.Array] = None,
+		fcm_mask: tp.Optional[chex.Array] = None,
+		frequencies: tp.Optional[chex.Array] = None,
 	):
 		"""
 		Forward pass of the attention module.
@@ -132,13 +133,13 @@ class DbrxAttention(FlaxAttentionModule):
 		    attention_mask (chex.Array): Mask to apply on the attention scores.
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-		    segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
 		    deterministic (bool): If True, disables dropout for deterministic behavior.
 		    init_cache (bool): If True, initializes cache for caching keys and values.
 		    output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-		    fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+		    fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
 		Returns:
-		    Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+		    tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
 		"""
 		batch_size, sequence_length = hidden_states.shape[:2]
 		qkv_states = self.Wqkv(hidden_states)
@@ -226,7 +227,7 @@ class DbrxNormAttentionNorm(nn.Module):
 		config: DbrxConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -269,12 +270,12 @@ class DbrxNormAttentionNorm(nn.Module):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
-		cache_view: Optional[TransformerCacheView] = None,
-		segment_ids: Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
-		fcm_mask: Optional[chex.Array] = None,
-		frequencies: Optional[chex.Array] = None,
-	) -> Tuple[chex.Array, chex.Array, Optional[chex.Array]]:
+		fcm_mask: tp.Optional[chex.Array] = None,
+		frequencies: tp.Optional[chex.Array] = None,
+	) -> tp.Tuple[chex.Array, chex.Array, tp.Optional[chex.Array]]:
 		"""
 		Forward pass of the attentionNrom module.
 
@@ -283,13 +284,13 @@ class DbrxNormAttentionNorm(nn.Module):
 		    attention_mask (chex.Array): Mask to apply on the attention scores.
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-		    segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
 		    deterministic (bool): If True, disables dropout for deterministic behavior.
 		    init_cache (bool): If True, initializes cache for caching keys and values.
 		    output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-		    fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+		    fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
 		Returns:
-		    Tuple[chex.Array, chex.Array, Optional[chex.Array]]: A tuple containing the residual_states, hidden states, and the attention weights.
+		    tp.Tuple[chex.Array, chex.Array, tp.Optional[chex.Array]]: A tuple containing the residual_states, hidden states, and the attention weights.
 		"""
 		residual_states = hidden_states
 		hidden_states = self.norm_1(hidden_states)
@@ -321,7 +322,7 @@ class DbrxExpertGLU(nn.Module):
 		config: DbrxConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -377,7 +378,7 @@ class DbrxExperts(nn.Module):
 		config: DbrxConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -418,7 +419,7 @@ class DbrxRouter(nn.Module):
 		config: DbrxConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -457,7 +458,7 @@ class DbrxRouter(nn.Module):
 
 	def __call__(
 		self, x: chex.Array, deterministic: bool = True
-	) -> Tuple[chex.Array, chex.Array, chex.Array]:
+	) -> tp.Tuple[chex.Array, chex.Array, chex.Array]:
 		if not deterministic and self.moe_jitter_eps is not None:
 			x = x * self.jitter(x)
 
@@ -499,7 +500,7 @@ class DbrxFFN(nn.Module):
 		config: DbrxConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -525,7 +526,7 @@ class DbrxFFN(nn.Module):
 			rngs=rngs,
 		)
 
-	def __call__(self, x: chex.Array) -> Tuple[chex.Array, chex.Array]:
+	def __call__(self, x: chex.Array) -> tp.Tuple[chex.Array, chex.Array]:
 		x = control_mlp_sharding(x, self.config.partition_axis)
 		weights, top_weights, top_experts = self.router(x)
 		out = self.experts(x, weights, top_weights, top_experts)
@@ -538,7 +539,7 @@ class DbrxBlock(nn.Module):
 		config: DbrxConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -578,13 +579,13 @@ class DbrxBlock(nn.Module):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
-		segment_ids: Optional[chex.Array] = None,
-		cache_view: Optional[TransformerCacheView] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		cache_view: tp.Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
 		output_router_logits: bool = False,
-		fcm_mask: Optional[chex.Array] = None,
-		frequencies: Optional[chex.Array] = None,
-	) -> Tuple[chex.Array, chex.Array, Optional[chex.Array]]:
+		fcm_mask: tp.Optional[chex.Array] = None,
+		frequencies: tp.Optional[chex.Array] = None,
+	) -> tp.Tuple[chex.Array, chex.Array, tp.Optional[chex.Array]]:
 		"""
 		Forward pass of the attentionNrom module.
 
@@ -593,14 +594,14 @@ class DbrxBlock(nn.Module):
 		    attention_mask (chex.Array): Mask to apply on the attention scores.
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-		    segment_ids (Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
 		    deterministic (bool): If True, disables dropout for deterministic behavior.
 		    init_cache (bool): If True, initializes cache for caching keys and values.
 		    output_attentions (bool): If True, outputs attention weights.
 		    output_router_logits (bool): If True, outputs router logits.
-		    fcm_mask (Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+		    fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
 		Returns:
-		    Tuple[chex.Array, chex.Array, Optional[chex.Array]]: A tuple containing the residual_states, hidden states, and the attention weights.
+		    tp.Tuple[chex.Array, chex.Array, tp.Optional[chex.Array]]: A tuple containing the residual_states, hidden states, and the attention weights.
 		"""
 
 		resid_states, hidden_states, self_attn_weights = self.norm_attn_norm(
@@ -642,7 +643,7 @@ class DbrxModel(EasyDeLBaseModule):
 		config: DbrxConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -693,16 +694,16 @@ class DbrxModel(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: chex.Array,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		output_router_logits: Optional[bool] = None,
-		past_key_values: Optional[TransformerCache] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		output_router_logits: tp.Optional[bool] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		return_dict: bool = True,
-	) -> MoeModelOutput | Tuple:
+	) -> MoeModelOutput | tp.Tuple:
 		if output_router_logits is None:
 			output_router_logits = self.config.output_router_logits
 
@@ -799,7 +800,7 @@ class DbrxForCausalLM(EasyDeLBaseModule):
 		config: DbrxConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[jax.lax.Precision, str]] = None,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -832,16 +833,16 @@ class DbrxForCausalLM(EasyDeLBaseModule):
 	def __call__(
 		self,
 		input_ids: chex.Array,
-		attention_mask: Optional[chex.Array] = None,
-		position_ids: Optional[chex.Array] = None,
-		segment_ids: Optional[chex.Array] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		output_attentions: Optional[bool] = None,
-		output_hidden_states: Optional[bool] = None,
-		output_router_logits: Optional[bool] = None,
-		past_key_values: Optional[TransformerCache] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		output_router_logits: tp.Optional[bool] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		return_dict: bool = True,
-	) -> MoeCausalLMOutput | Tuple:
+	) -> MoeCausalLMOutput | tp.Tuple:
 		if output_router_logits is None:
 			output_router_logits = self.config.output_router_logits
 		outputs = self.transformer(

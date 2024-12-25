@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import functools
 import itertools
-from typing import Any, Callable, Dict, Optional, Sequence, Tuple, TypeVar, Union
+import typing as tp
 
 import chex
 import flax.struct
@@ -45,23 +46,25 @@ def init_to_value(x, dtype):
 @flax.struct.dataclass
 class MambaOutput(FlaxBaseModelOutput):
 	last_hidden_state: chex.Array = None
-	cache: Optional[MambaCache] = None
-	hidden_states: Optional[Tuple[chex.Array]] = None
+	cache: tp.Optional[MambaCache] = None
+	hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
 
 
 @flax.struct.dataclass
 class MambaCausalLMOutput(FlaxBaseModelOutput):
 	logits: chex.Array = None
-	cache: Optional[MambaCache] = None
-	hidden_states: Optional[Tuple[chex.Array]] = None
+	cache: tp.Optional[MambaCache] = None
+	hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
 
 
-_T = TypeVar("_T")
+_T = tp.TypeVar("_T")
 
 
-def create_tuple_parser(n: int) -> Callable[[Union[_T, Sequence[_T]]], tuple[_T, ...]]:
-	def parse(x: Union[_T, Sequence[_T]]) -> tuple[_T, ...]:
-		if isinstance(x, Sequence):
+def create_tuple_parser(
+	n: int,
+) -> tp.Callable[[tp.Union[_T, tp.Sequence[_T]]], tuple[_T, ...]]:
+	def parse(x: tp.Union[_T, tp.Sequence[_T]]) -> tuple[_T, ...]:
+		if isinstance(x, tp.Sequence):
 			if len(x) == n:
 				return tuple(x)
 			else:
@@ -73,7 +76,7 @@ def create_tuple_parser(n: int) -> Callable[[Union[_T, Sequence[_T]]], tuple[_T,
 
 
 class Lambda(nn.Module):
-	fn: Callable
+	fn: tp.Callable
 
 	def __call__(self, x, **kwargs):
 		return self.fn(x, **kwargs)
@@ -92,7 +95,7 @@ class MambaConv1D(nn.Module):
 		num_spatial_dims: int = 1,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -156,7 +159,7 @@ class MambaMixer(nn.Module):
 		layer_idx: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	) -> None:
@@ -261,9 +264,9 @@ class MambaMixer(nn.Module):
 	def __call__(
 		self,
 		input_states: chex.Array,
-		cache: Optional[MambaCacheView] = None,
-		position_ids: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
+		cache: tp.Optional[MambaCacheView] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
 	):
 		batch_size, seq_len, _ = input_states.shape
 		dtype = input_states.dtype
@@ -377,7 +380,7 @@ class MambaBlock(nn.Module):
 		layer_idx: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -394,7 +397,7 @@ class MambaBlock(nn.Module):
 			param_dtype=param_dtype,
 		)
 		block = MambaMixer
-		block = auto_remat(
+		(block,) = auto_remat(
 			block,
 			policy=config.gradient_checkpointing,
 		)
@@ -410,9 +413,9 @@ class MambaBlock(nn.Module):
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		cache: Optional[MambaCacheView] = None,
-		position_ids: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
+		cache: tp.Optional[MambaCacheView] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
 	) -> chex.Array:
 		residual = hidden_states
 		hidden_states = self.norm(hidden_states)
@@ -440,7 +443,7 @@ class MambaModel(EasyDeLBaseModule):
 		config: MambaConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	) -> None:
@@ -478,15 +481,15 @@ class MambaModel(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		cache: Optional[MambaCache] = None,
-		position_ids: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		output_hidden_states: Optional[bool] = None,
-		return_dict: Optional[bool] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		cache: tp.Optional[MambaCache] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		return_dict: tp.Optional[bool] = None,
 		**kwargs,
-	) -> Union[Tuple, MambaOutput]:
+	) -> tp.Union[tp.Tuple, MambaOutput]:
 		output_hidden_states = (
 			output_hidden_states
 			if output_hidden_states is not None
@@ -581,7 +584,7 @@ class MambaForCausalLM(EasyDeLBaseModule):
 		config: MambaConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: Optional[Union[str, lax.Precision]] = None,
+		precision: tp.Optional[tp.Union[str, lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -611,15 +614,15 @@ class MambaForCausalLM(EasyDeLBaseModule):
 
 	def __call__(
 		self,
-		input_ids: Optional[chex.Array] = None,
-		inputs_embeds: Optional[chex.Array] = None,
-		cache: Optional[MambaCache] = None,
-		position_ids: Optional[chex.Array] = None,
-		attention_mask: Optional[chex.Array] = None,
-		output_hidden_states: Optional[bool] = None,
-		return_dict: Optional[bool] = None,
+		input_ids: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		cache: tp.Optional[MambaCache] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		return_dict: tp.Optional[bool] = None,
 		**kwargs,
-	) -> Union[Tuple, MambaCausalLMOutput]:
+	) -> tp.Union[tp.Tuple, MambaCausalLMOutput]:
 		return_dict = (
 			return_dict if return_dict is not None else self.config.use_return_dict
 		)
@@ -650,9 +653,9 @@ class MambaForCausalLM(EasyDeLBaseModule):
 	def update_inputs_for_generation(
 		self,
 		outputs: MambaOutput,
-		model_kwargs: Dict[str, Any],
+		model_kwargs: tp.Dict[str, tp.Any],
 		**kwargs,
-	) -> Dict[str, Any]:
+	) -> tp.Dict[str, tp.Any]:
 		model_kwargs["cache"] = outputs.get("cache", None)
 		return model_kwargs
 

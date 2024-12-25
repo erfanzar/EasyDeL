@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+
+import typing as tp
 
 from jax.sharding import PartitionSpec
 
@@ -100,7 +101,7 @@ class GPTJConfig(EasyDeLBaseConfig):
 		eos_token_id: int = 50256,
 		tie_word_embeddings: bool = False,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
 		self.bits = bits
@@ -134,7 +135,7 @@ class GPTJConfig(EasyDeLBaseConfig):
 		"""
 		Get the partition rules for the model.
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
 			("model/wte/embedding", PartitionSpec(("fsdp", "sp"))),
@@ -175,7 +176,7 @@ class GPTJConfig(EasyDeLBaseConfig):
 		bos_token_id: int = 50256,
 		eos_token_id: int = 50256,
 		tie_word_embeddings: bool = False,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	):

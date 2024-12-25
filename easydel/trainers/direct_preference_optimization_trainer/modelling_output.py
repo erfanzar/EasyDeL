@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+import typing as tp
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Optional
 
 import jax
 
@@ -23,9 +24,13 @@ from easydel.etils.easystate import EasyDeLState
 @dataclass
 class DPOTrainerOutput:
 	state: EasyDeLState
-	mesh: Optional[jax.sharding.Mesh]
-	checkpoint_manager: Any
-	gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None
-	shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None
-	last_save_file_name: Optional[str] = None
-	checkpoint_path: Optional[str] = None
+	mesh: tp.Optional[jax.sharding.Mesh]
+	checkpoint_manager: tp.Any
+	gather_fns: tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]] = (
+		None
+	)
+	shard_fns: tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]] = (
+		None
+	)
+	last_save_file_name: tp.Optional[str] = None
+	checkpoint_path: tp.Optional[str] = None

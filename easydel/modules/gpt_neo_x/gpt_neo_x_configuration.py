@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
@@ -124,7 +125,7 @@ class GPTNeoXConfig(EasyDeLBaseConfig):
 		"""
 		Get the partition rules for the model.
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
 			("wte/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
