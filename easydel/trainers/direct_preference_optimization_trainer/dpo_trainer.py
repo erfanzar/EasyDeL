@@ -17,7 +17,6 @@ from __future__ import annotations
 import time
 import typing as tp
 import warnings
-from abc import ABC
 from collections import defaultdict
 
 import jax
@@ -65,7 +64,7 @@ else:
 logger = get_logger(__name__)
 
 
-class DPOTrainer(BaseTrainer, ABC):
+class DPOTrainer(BaseTrainer):
 	"""
 	Trainer for Direct Preference Optimization (DPO).
 

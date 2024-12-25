@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import os
 import time
-from abc import ABC, abstractmethod
+from abc import ABCMeta, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -92,7 +92,7 @@ class TrainerOutput:
 	checkpoint_path: tp.Optional[str] = None
 
 
-class BaseTrainerProtocol(ABC):
+class BaseTrainerProtocol(metaclass=ABCMeta):
 	# Required attributes for all trainers
 	arguments: TrainingArguments
 	dataset_train: tp.Optional[Dataset]

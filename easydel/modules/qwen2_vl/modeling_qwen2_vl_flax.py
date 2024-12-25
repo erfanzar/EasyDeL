@@ -22,8 +22,7 @@ import flax.struct
 import jax
 import jax.numpy as jnp
 from flax import nnx as nn
-import numpy
-
+import numpy as np
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
@@ -45,8 +44,6 @@ from easydel.modules.qwen2_vl.qwen2_vl_configuration import (
 	Qwen2VLVisionConfig,
 )
 
-jax.config.update("jax_enable_x64", True)
-
 
 @flax.struct.dataclass
 class Qwen2VLCausalLMOutputWithPast(ModelOutput):
@@ -60,6 +57,39 @@ class Qwen2VLCausalLMOutputWithPast(ModelOutput):
 	hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
 	attentions: tp.Optional[tp.Tuple[chex.Array]] = None
 	rope_deltas: tp.Optional[chex.Array] = None
+
+
+def create_attention_mask(cu_seqlens, seq_length, dtype):
+	"""
+	Creates an attention mask matrix.
+
+	Args:
+	    cu_seqlens: Cumulative sequence lengths.
+	    seq_length: Length of each sequence.
+	    dtype: Data type of the mask.
+
+	Returns:
+	    Attention mask matrix.
+	"""
+	attention_mask = jnp.full(
+		(1, seq_length, seq_length),
+		jnp.finfo(dtype).min,
+		dtype=dtype,
+	)
+
+	mask_updates = jnp.zeros((1, seq_length, seq_length), dtype=dtype)
+
+	for i in range(1, len(cu_seqlens)):
+		start_idx = cu_seqlens[i - 1]
+		end_idx = cu_seqlens[i]
+		mask_updates = mask_updates.at[
+			...,
+			start_idx:end_idx,
+			start_idx:end_idx,
+		].set(0)
+
+	attention_mask = jax.lax.dynamic_update_slice(attention_mask, mask_updates, (0, 0, 0))
+	return attention_mask
 
 
 def precompute_vl_rotary(dim, theta, max_position):
@@ -290,16 +320,27 @@ class VisionAttention(FlaxAttentionModule):
 		# q = jnp.expand_dims(q, 0)
 		# k = jnp.expand_dims(k, 0)
 		# v = jnp.expand_dims(v, 0)
-		attention_mask = jnp.full(
-			(1, seq_length, seq_length), jnp.finfo(q.dtype).min, dtype=q.dtype
+		# attention_mask = jnp.full(
+		# 	(1, seq_length, seq_length),
+		# 	jnp.finfo(q.dtype).min,
+		# 	dtype=q.dtype,
+		# )
+		# for i in range(1, len(cu_seqlens)):
+		# 	mask = attention_mask.at[
+		# 		...,
+		# 		cu_seqlens[i - 1] : cu_seqlens[i],
+		# 		cu_seqlens[i - 1] : cu_seqlens[i],
+		# 	].set(0)
+		# 	attention_mask = mask
+		row_ids = jnp.arange(seq_length)[None, None, :]
+		col_ids = jnp.arange(seq_length)[None, :, None]
+		starts = cu_seqlens[:-1][:, None, None]
+		ends = cu_seqlens[1:][:, None, None]
+		is_valid = (
+			(row_ids >= starts) & (row_ids < ends) & (col_ids >= starts) & (col_ids < ends)
 		)
-		for i in range(1, len(cu_seqlens)):
-			mask = attention_mask.at[
-				...,
-				cu_seqlens[i - 1] : cu_seqlens[i],
-				cu_seqlens[i - 1] : cu_seqlens[i],
-			].set(0)
-			attention_mask = mask
+		combined_mask = jnp.any(is_valid, axis=0)
+		attention_mask = jnp.where(combined_mask, 0.0, jnp.finfo(q.dtype).min)
 		# attention_mask = jnp.expand_dims(attention_mask, 0)
 		# attn_output = self.attention_performer(
 		# 	query_states=q,
@@ -766,8 +807,9 @@ class Qwen2VisionTransformerPretrainedModel(EasyDeLBaseModule):
 	def get_dtype(self) -> jnp.dtype:
 		return self.blocks[0].mlp.fc2.kernel.value.dtype
 
-	def rot_pos_emb(self, grid_thw):
+	def rot_pos_emb(self, grid_thw, max_grid_size):
 		pos_ids = []
+
 		for t, h, w in grid_thw:
 			# Create height position ids
 			hpos_ids = jnp.arange(h)
@@ -801,15 +843,10 @@ class Qwen2VisionTransformerPretrainedModel(EasyDeLBaseModule):
 
 			# Stack and repeat
 			stacked = jnp.stack([hpos_ids, wpos_ids], axis=-1)
-			repeated = jnp.repeat(stacked[None, :, :], t, axis=0)
+			repeated = jnp.repeat(stacked, t, axis=1)
 			pos_ids.append(repeated)
 
-		# Concatenate all position ids
-		pos_ids = jnp.concatenate(pos_ids, axis=0).squeeze(0)
-
-		# Get max grid size and compute embeddings
-		max_grid_size = jnp.max(grid_thw[:, 1:])
-
+		pos_ids = jnp.concatenate(pos_ids, axis=0)
 		rotary_pos_emb_full = jnp.outer(
 			jnp.arange(0, max_grid_size, dtype="f4"),
 			1.0
@@ -823,13 +860,18 @@ class Qwen2VisionTransformerPretrainedModel(EasyDeLBaseModule):
 
 		return rotary_pos_emb
 
-	def __call__(self, hidden_states: chex.Array, grid_thw: chex.Array) -> chex.Array:
+	def __call__(
+		self,
+		hidden_states: chex.Array,
+		grid_thw: chex.Array,
+		max_grid_size,
+	) -> chex.Array:
 		hidden_states = self.patch_embed(hidden_states)
-		rotary_pos_emb = self.rot_pos_emb(grid_thw)
+		rotary_pos_emb = self.rot_pos_emb(grid_thw, max_grid_size)
 
 		grid_lens = grid_thw[:, 1] * grid_thw[:, 2]
 		repeated = jnp.repeat(grid_lens, grid_thw[:, 0])
-		cu_seqlens = jnp.cumsum(repeated, dtype=grid_thw.dtype)
+		cu_seqlens = jnp.cumsum(repeated, dtype="i4")
 		cu_seqlens = jnp.pad(cu_seqlens, (1, 0), constant_values=0)
 		for block in self.blocks:
 			hidden_states = block(
@@ -1053,9 +1095,7 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 			if attention_mask is None:
 				attention_mask = jnp.ones_like(total_input_ids)
 
-			position_ids = jnp.ones(
-				(3, input_ids.shape[0], input_ids.shape[1]), dtype=input_ids.dtype
-			)
+			position_ids = jnp.ones((3, input_ids.shape[0], input_ids.shape[1]), dtype="i4")
 
 			image_index, video_index = 0, 0
 
@@ -1254,9 +1294,11 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 		return_dict: tp.Optional[bool] = None,
 		pixel_values: tp.Optional[chex.Array] = None,
 		pixel_values_videos: tp.Optional[chex.Array] = None,
-		image_grid_thw: tp.Optional[chex.Array] = None,
-		video_grid_thw: tp.Optional[chex.Array] = None,
+		image_grid_thw: tp.Optional[tuple] = None,
+		video_grid_thw: tp.Optional[tuple] = None,
 		rope_deltas: tp.Optional[chex.Array] = None,
+		image_max_grid_size: int = None,
+		video_max_grid_size: int = None,
 	) -> tp.Union[tp.Tuple, Qwen2VLCausalLMOutputWithPast]:
 		output_attentions = (
 			output_attentions
@@ -1276,55 +1318,44 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 			inputs_embeds = self.model.embed_tokens(input_ids)
 			if pixel_values is not None:
 				pixel_values = pixel_values.astype(self.visual.get_dtype())
-				image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-				n_image_tokens = jnp.sum(input_ids == self.config.image_token_id).item()
-				n_image_features = image_embeds.shape[0]
-
-				if n_image_tokens != n_image_features:
-					raise ValueError(
-						f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
-					)
+				image_embeds = self.visual(
+					pixel_values,
+					grid_thw=np.array(image_grid_thw),
+					max_grid_size=image_max_grid_size,
+				)
 				image_mask = input_ids == self.config.image_token_id
 				image_mask = jnp.expand_dims(image_mask, axis=-1)
 				image_mask = jnp.broadcast_to(image_mask, inputs_embeds.shape)
 
-				# Ensure image_embeds has same dtype as inputs_embeds
 				image_embeds = image_embeds.astype(inputs_embeds.dtype)
 
-				# Combine embeddings using mask
-				inputs_embeds = jnp.where(
-					image_mask,
-					image_embeds.reshape(-1)[: numpy.prod(image_mask.shape)].reshape(
-						image_mask.shape
-					),
-					inputs_embeds,
+				image_indices = jnp.where(image_mask.reshape(-1))[0]
+				scattered_embeds = (
+					inputs_embeds.reshape(-1)
+					.at[image_indices]
+					.set(image_embeds.reshape(-1)[: len(image_indices)])
 				)
+				inputs_embeds = scattered_embeds.reshape(inputs_embeds.shape)
 
 			if pixel_values_videos is not None:
 				pixel_values_videos = pixel_values_videos.astype(self.visual.get_dtype())
-				video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
-				n_video_tokens = jnp.sum(input_ids == self.config.video_token_id).item()
-				n_video_features = video_embeds.shape[0]
-				if n_video_tokens != n_video_features:
-					raise ValueError(
-						f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
-					)
+				video_embeds = self.visual(
+					pixel_values_videos,
+					grid_thw=np.array(video_grid_thw),
+					max_grid_size=video_max_grid_size,
+				)
 
 				video_mask = input_ids == self.config.video_token_id
 				video_mask = jnp.expand_dims(video_mask, axis=-1)
 				video_mask = jnp.broadcast_to(video_mask, inputs_embeds.shape)
-
-				# Ensure video_embeds has same dtype as inputs_embeds
 				video_mask = video_mask.astype(inputs_embeds.dtype)
-
-				# Combine embeddings using mask
-				inputs_embeds = jnp.where(
-					video_mask,
-					video_embeds.reshape(-1)[: numpy.prod(video_mask.shape)].reshape(
-						video_mask.shape
-					),
-					inputs_embeds,
+				video_indices = jnp.where(video_mask.reshape(-1))[0]
+				scattered_embeds = (
+					video_embeds.reshape(-1)
+					.at[video_indices]
+					.set(image_embeds.reshape(-1)[: len(video_indices)])
 				)
+				video_embeds = scattered_embeds.reshape(video_embeds.shape)
 
 		if (
 			position_ids is None
@@ -1402,3 +1433,39 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 			}
 		)
 		return model_inputs
+
+	def prepare_inputs_for_call(
+		self,
+		image_grid_thw: tp.Optional[chex.Array] = None,
+		video_grid_thw: tp.Optional[chex.Array] = None,
+		image_max_grid_size: int = None,
+		video_max_grid_size: int = None,
+		**others,
+	):
+		if image_grid_thw is not None:
+			if image_max_grid_size is None:
+				image_max_grid_size = int(np.max(image_grid_thw[:, 1:]).item())
+			image_grid_thw = tuple(map(tuple, np.asarray(image_grid_thw)))
+
+		if video_grid_thw is not None:
+			if video_max_grid_size is None:
+				video_max_grid_size = int(np.max(video_grid_thw[:, 1:]).item())
+			video_grid_thw = tuple(map(tuple, np.asarray(video_grid_thw)))
+
+		others.update(
+			dict(
+				video_max_grid_size=video_max_grid_size,
+				image_max_grid_size=image_max_grid_size,
+				video_grid_thw=video_grid_thw,
+				image_grid_thw=image_grid_thw,
+			)
+		)
+		return others
+
+	def get_static_arguments(self):
+		return (
+			"video_max_grid_size",
+			"image_max_grid_size",
+			"image_grid_thw",
+			"video_grid_thw",
+		)

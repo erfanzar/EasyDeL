@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import warnings
-from abc import ABC
 import typing as tp
 from easydel.etils.etils import get_logger
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -33,7 +32,7 @@ else:
 logger = get_logger(__name__)
 
 
-class SFTTrainer(Trainer, ABC):
+class SFTTrainer(Trainer):
 	"""
 	Trainer class for Supervised Fine-Tuning (SFT) of language models.
 
