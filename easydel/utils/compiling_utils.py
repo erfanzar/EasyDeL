@@ -23,10 +23,14 @@ import typing as tp
 import warnings
 
 import jax
-from jax._src.stages import Compiled, Lowered
 from jax.experimental.serialize_executable import deserialize_and_load, serialize
 
-from easydel.utils.helpers import get_cache_dir
+from .helpers import get_cache_dir
+
+if tp.TYPE_CHECKING:
+	from jax._src.stages import Compiled, Lowered
+else:
+	Compiled, Lowered = tp.Any, tp.Any
 
 RECOMPILE_FORCE = os.environ.get("RECOMPILE_FORCE", "false") in ["true", "1", "on"]
 ECACHE_COMPILES = os.environ.get("ECACHE_COMPILES", "true") in ["true", "1", "on"]

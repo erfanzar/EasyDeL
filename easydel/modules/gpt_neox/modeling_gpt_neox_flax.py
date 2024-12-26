@@ -21,7 +21,7 @@ import jax
 from flax import nnx as nn
 from jax import numpy as jnp
 
-from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.base_module import EasyDeLBaseModule 
 from easydel.infra.factory import register_module
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
@@ -34,7 +34,7 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.modules.gpt_neo_x.gpt_neo_x_configuration import (
+from easydel.modules.gpt_neox.gpt_neox_configuration import (
 	GPTNeoXConfig as GPTNeoXConfig,
 )
 

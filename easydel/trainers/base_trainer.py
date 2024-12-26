@@ -663,7 +663,7 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 		easystate_to_huggingface_model_kwargs,
 		torch_save_pretrained_kwargs,
 	):
-		from easydel.transform.parameters_transformation import (
+		from easydel.utils.parameters_transformation import (
 			easystate_to_huggingface_model,
 		)
 

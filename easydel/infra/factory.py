@@ -22,6 +22,7 @@ class TaskType(str, Enum):
 	BASE_MODULE = "base-module"
 	BASE_VISION = "vision-module"
 	SEQUENCE_TO_SEQUENCE = "sequence-to-sequence"
+	SPEECH_SEQUENCE_TO_SEQUENCE = "speech-sequence-to-sequence"
 	ZERO_SHOT_IMAGE_CLASSIFICATION = "zero-shot-image-classification"
 	SEQUENCE_CLASSIFICATION = "sequence-classification"
 	AUDIO_CLASSIFICATION = "audio-classification"

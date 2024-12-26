@@ -100,7 +100,7 @@ class EasyModelsTest(unittest.TestCase):
 		(
 			module_config,
 			module_class,
-			transform_function,
+			_,
 		) = ed.get_modules_by_type(module_name, task)
 		if self.header_config is None:
 			config = module_config(
@@ -139,11 +139,6 @@ class EasyModelsTest(unittest.TestCase):
 		hf_model = hf_module_class(config=copy.deepcopy(config))
 		hf_model.eval()
 		hf_model = hf_model.float()
-		model_tree = transform_function(
-			state_dict=hf_model.state_dict(),
-			device=jax.devices("cpu")[0],
-			remove_state_dict=True,
-		)
 
 		config.add_jax_args()
 		config.add_basic_configurations(
@@ -181,7 +176,10 @@ class EasyModelsTest(unittest.TestCase):
 					rngs=nn.Rngs(0),
 				)
 			)
-			ed_model = ed.traversals.merge_model_and_tree(ed_model, tree=model_tree)
+			ed_model = ed.traversals.merge_model_and_tree(
+				ed_model,
+				tree=ed_model.transform_fn(hf_model.state_dict()),
+			)
 			ed_model.eval()
 			ed_model = ed_model.shard_model()
 
@@ -194,7 +192,6 @@ class EasyModelsTest(unittest.TestCase):
 			ed_output, metrics = jited(jax_input_ids)
 			easy_time = time.time() - easy_time
 
-			del model_tree
 			del hf_model
 			gc.collect()
 			return self.compare_torch_to_jax(
@@ -425,6 +422,7 @@ class EasyModelsTest(unittest.TestCase):
 
 	def test_qwen2(self):
 		self.header_config = None
+		self.rope_scaling = None
 		res, err = self.create_test_for_models(
 			"qwen2",
 			transformers.Qwen2ForCausalLM,
@@ -678,6 +676,7 @@ class EasyModelsTest(unittest.TestCase):
 
 	def test_qwen2_moe(self):
 		self.header_config = None
+		self.rope_scaling = None
 		res, err = self.create_test_for_models(
 			"qwen2_moe",
 			transformers.Qwen2MoeForCausalLM,
@@ -813,32 +812,32 @@ if __name__ == "__main__":
 	# unittest.main()
 	test = EasyModelsTest()
 	test.setUp()
-	test.test_arctic()  # Passed
-	test.test_cohere()  # Passed
-	test.test_dbrx()  # Passed
-	test.test_deepseek_v2()  # Passed
-	test.test_exaone()  # Passed
-	test.test_falcon()  # Passed
-	test.test_gemma()  # Passed
-	test.test_gemma2()  # Passed
-	test.test_gptj()  # Passed
-	# test.test_gpt_noex()  # Failed
-	test.test_gpt2()  # Passed
+	# test.test_arctic()  # Passed
+	# test.test_cohere()  # Passed
+	# test.test_dbrx()  # Passed
+	# test.test_deepseek_v2()  # Passed
+	# test.test_exaone()  # Passed
+	# test.test_falcon()  # Passed
+	# test.test_gemma()  # Passed
+	# test.test_gemma2()  # Passed
+	# test.test_gptj()  # Passed
+	# test.test_gpt_noex()  # Passed
+	# test.test_gpt2()  # Passed
 	# test.test_grok1() # Not Tested Yet!
-	test.test_internlm2()  # Passed
-	test.test_llama()  # Passed
-	test.test_mamba()  # Passed
-	test.test_mamba2()  # Passed
-	test.test_mistral()  # Passed
-	test.test_mixtral()  # Passed
-	test.test_mpt()  # Passed
-	test.test_olmo()  # Passed
-	test.test_olmo2()  # Passed
-	test.test_openelm()  # Passed
-	test.test_phi()  # Passed
-	test.test_phi3()  # Passed
+	# test.test_internlm2()  # Passed
+	# test.test_llama()  # Passed
+	# test.test_mamba()  # Passed
+	# test.test_mamba2()  # Passed
+	# test.test_mistral()  # Passed
+	# test.test_mixtral()  # Passed
+	# test.test_mpt()  # Passed
+	# test.test_olmo()  # Passed
+	# test.test_olmo2()  # Passed
+	# test.test_openelm()  # Passed
+	# test.test_phi()  # Passed
+	# test.test_phi3()  # Passed
 	# test.test_phimoe()  # Failed v0.0.80 - N  Runtime
-	test.test_qwen2()  # Passed
-	test.test_qwen2_moe()  # Passed
-	test.test_stablelm()  # Passed
+	# test.test_qwen2()  # Passed
+	# test.test_qwen2_moe()  # Passed
+	# test.test_stablelm()  # Passed
 	# -----------------------------------------------

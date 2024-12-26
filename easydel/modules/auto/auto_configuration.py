@@ -29,7 +29,7 @@ from easydel.infra.base_module import (
 	EasyDeLBaseModule,
 )
 from easydel.infra.factory import TaskType, registry
-from easydel.transform.parameters_transformation import torch_dict_to_easydel_params
+from easydel.utils.parameters_transformation import torch_dict_to_easydel_params
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
 logger = get_logger(name=__name__)

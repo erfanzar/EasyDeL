@@ -132,6 +132,9 @@ class EasyGenerationMixin:
 		head_dim = getattr(self.config, "head_dim", None)
 		if head_dim is None:
 			head_dim = self.config.hidden_size // self.config.num_attention_heads
+		num_key_value_heads = getattr(self.config, "num_key_value_heads", None)
+		if num_key_value_heads is None:
+			num_key_value_heads = self.config.num_attention_heads
 		return TransformerCache.init_layers_cache(
 			num_hidden_layers=self.config.num_hidden_layers,
 			dtype=self.dtype,
@@ -144,7 +147,7 @@ class EasyGenerationMixin:
 			metadata=TransformerCacheMetaData.create(
 				batch_size=batch_size,
 				sequence_length=max_length,
-				num_heads=self.config.num_key_value_heads,
+				num_heads=num_key_value_heads,
 				head_dim=head_dim,
 			),
 			quantizer=EasyQuantizer(

@@ -15,8 +15,11 @@
 __version__ = "0.1.0"
 
 import os as _os
+from logging import getLogger as _getLogger
 
 if _os.environ.get("EASYDEL_AUTO", "true") in ["true", "1", "on", "yes"]:
+	# Tell jax xla bridge to stay quiet and only yied warnings or errors.
+	_getLogger("jax._src.xla_bridge").setLevel(30)
 	# Taking care of some optional GPU FLAGs
 	_os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 	_os.environ["KMP_AFFINITY"] = "noverbose"
@@ -49,18 +52,19 @@ if _os.environ.get("EASYDEL_AUTO", "true") in ["true", "1", "on", "yes"]:
 	if _os.environ.get("JAX_TRACEBACK_FILTERING", None) is None:
 		_os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 del _os
+del _getLogger
 
 # EasyDel Imports
 from packaging.version import Version as _Version
 
-from easydel import utils
-from easydel.etils.easystate import EasyDeLState
-from easydel.etils.errors import (
+from . import utils
+from .etils.easystate import EasyDeLState
+from .etils.errors import (
 	EasyDeLRuntimeError,
 	EasyDeLSyntaxRuntimeError,
 	EasyDeLTimerError,
 )
-from easydel.etils.etils import (
+from .etils.etils import (
 	EasyDeLBackends,
 	EasyDeLGradientCheckPointers,
 	EasyDeLOptimizers,
@@ -68,50 +72,52 @@ from easydel.etils.etils import (
 	EasyDeLQuantizationMethods,
 	EasyDeLSchedulers,
 )
-from easydel.etils.partition_module import PartitionAxis
-from easydel.inference.vinference import (
+from .etils.partition_module import PartitionAxis
+from .inference.vinference import (
 	vInference,
 	vInferenceApiServer,
 	vInferenceConfig,
 )
-from easydel.inference.whisper_inference import (
+from .inference.whisper_inference import (
 	vWhisperInference,
 	vWhisperInferenceConfig,
 )
-from easydel.infra import (
+from .infra import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseConfigDict,
 	EasyDeLBaseModule,
 	LossConfig,
 )
-from easydel.infra.factory import (
+from .infra.factory import (
 	ConfigType,
 	TaskType,
 	register_config,
 	register_module,
 )
-from easydel.layers.attention import (
+from .layers.attention import (
 	AttentionBenchmarker,
 	AttentionMechanisms,
 	FlexibleAttentionModule,
 )
-from easydel.modules.arctic import (
+from .modules.arctic import (
 	ArcticConfig,
 	ArcticForCausalLM,
 	ArcticModel,
 )
-from easydel.modules.auto import (
+from .modules.auto import (
 	AutoEasyDeLConfig,
 	AutoEasyDeLModelForCausalLM,
+	AutoEasyDeLModelForSeq2SeqLM,
 	AutoEasyDeLModelForSpeechSeq2Seq,
 	AutoEasyDeLModelForZeroShotImageClassification,
 	AutoShardAndGatherFunctions,
 	AutoStateForCausalLM,
+	AutoStateForSeq2SeqLM,
 	AutoStateForSpeechSeq2Seq,
 	AutoStateForZeroShotImageClassification,
 	get_modules_by_type,
 )
-from easydel.modules.clip import (
+from .modules.clip import (
 	CLIPConfig,
 	CLIPForImageClassification,
 	CLIPModel,
@@ -121,148 +127,148 @@ from easydel.modules.clip import (
 	CLIPVisionConfig,
 	CLIPVisionModel,
 )
-from easydel.modules.cohere import (
+from .modules.cohere import (
 	CohereConfig,
 	CohereForCausalLM,
 	CohereModel,
 )
-from easydel.modules.dbrx import (
+from .modules.dbrx import (
 	DbrxAttentionConfig,
 	DbrxConfig,
 	DbrxFFNConfig,
 	DbrxForCausalLM,
 	DbrxModel,
 )
-from easydel.modules.deepseek_v2 import (
+from .modules.deepseek_v2 import (
 	DeepseekV2Config,
 	DeepseekV2ForCausalLM,
 	DeepseekV2Model,
 )
-from easydel.modules.exaone import (
+from .modules.exaone import (
 	ExaoneConfig,
 	ExaoneForCausalLM,
 	ExaoneModel,
 )
-from easydel.modules.falcon import (
+from .modules.falcon import (
 	FalconConfig,
 	FalconForCausalLM,
 	FalconModel,
 )
-from easydel.modules.gemma import (
+from .modules.gemma import (
 	GemmaConfig,
 	GemmaForCausalLM,
 	GemmaModel,
 )
-from easydel.modules.gemma2 import (
+from .modules.gemma2 import (
 	Gemma2Config,
 	Gemma2ForCausalLM,
 	Gemma2Model,
 )
-from easydel.modules.gpt2 import (
+from .modules.gpt2 import (
 	GPT2Config,
 	GPT2LMHeadModel,
 	GPT2Model,
 )
-from easydel.modules.gpt_j import (
+from .modules.gpt_j import (
 	GPTJConfig,
 	GPTJForCausalLM,
 	GPTJModel,
 )
-from easydel.modules.gpt_neo_x import (
+from .modules.gpt_neox import (
 	GPTNeoXConfig,
 	GPTNeoXForCausalLM,
 	GPTNeoXModel,
 )
-from easydel.modules.grok_1 import (
+from .modules.grok_1 import (
 	Grok1Config,
 	Grok1ForCausalLM,
 	Grok1Model,
 )
-from easydel.modules.internlm2 import (
+from .modules.internlm2 import (
 	InternLM2Config,
 	InternLM2ForCausalLM,
 	InternLM2ForSequenceClassification,
 	InternLM2Model,
 )
-from easydel.modules.llama import (
+from .modules.llama import (
 	LlamaConfig,
 	LlamaForCausalLM,
 	LlamaForSequenceClassification,
 	LlamaModel,
 )
-from easydel.modules.mamba import (
+from .modules.mamba import (
 	MambaConfig,
 	MambaForCausalLM,
 	MambaModel,
 )
-from easydel.modules.mamba2 import (
+from .modules.mamba2 import (
 	Mamba2Config,
 	Mamba2ForCausalLM,
 	Mamba2Model,
 )
-from easydel.modules.mistral import (
+from .modules.mistral import (
 	MistralConfig,
 	MistralForCausalLM,
 	MistralModel,
 )
-from easydel.modules.mixtral import (
+from .modules.mixtral import (
 	MixtralConfig,
 	MixtralForCausalLM,
 	MixtralModel,
 )
-from easydel.modules.mosaic_mpt import (
+from .modules.mosaic_mpt import (
 	MptAttentionConfig,
 	MptConfig,
 	MptForCausalLM,
 	MptModel,
 )
-from easydel.modules.olmo import (
+from .modules.olmo import (
 	OlmoConfig,
 	OlmoForCausalLM,
 	OlmoModel,
 )
-from easydel.modules.olmo2 import (
+from .modules.olmo2 import (
 	Olmo2Config,
 	Olmo2ForCausalLM,
 	Olmo2Model,
 )
-from easydel.modules.openelm import (
+from .modules.openelm import (
 	OpenELMConfig,
 	OpenELMForCausalLM,
 	OpenELMModel,
 )
-from easydel.modules.opt import (
+from .modules.opt import (
 	OPTConfig,
 	OPTForCausalLM,
 	OPTModel,
 )
-from easydel.modules.phi import (
+from .modules.phi import (
 	PhiConfig,
 	PhiForCausalLM,
 	PhiModel,
 )
-from easydel.modules.phi3 import (
+from .modules.phi3 import (
 	Phi3Config,
 	Phi3ForCausalLM,
 	Phi3Model,
 )
-from easydel.modules.phimoe import (
+from .modules.phimoe import (
 	PhiMoeConfig,
 	PhiMoeForCausalLM,
 	PhiMoeModel,
 )
-from easydel.modules.qwen2 import (
+from .modules.qwen2 import (
 	Qwen2Config,
 	Qwen2ForCausalLM,
 	Qwen2ForSequenceClassification,
 	Qwen2Model,
 )
-from easydel.modules.qwen2_moe import (
+from .modules.qwen2_moe import (
 	Qwen2MoeConfig,
 	Qwen2MoeForCausalLM,
 	Qwen2MoeModel,
 )
-from easydel.modules.roberta import (
+from .modules.roberta import (
 	RobertaConfig,
 	RobertaForCausalLM,
 	RobertaForMultipleChoice,
@@ -270,24 +276,24 @@ from easydel.modules.roberta import (
 	RobertaForSequenceClassification,
 	RobertaForTokenClassification,
 )
-from easydel.modules.stablelm import (
+from .modules.stablelm import (
 	StableLmConfig,
 	StableLmForCausalLM,
 	StableLmModel,
 )
-from easydel.modules.whisper import (
+from .modules.whisper import (
 	WhisperConfig,
 	WhisperForAudioClassification,
 	WhisperForConditionalGeneration,
 	WhisperTimeStampLogitsProcessor,
 )
-from easydel.modules.xerxes import (
+from .modules.xerxes import (
 	XerxesConfig,
 	XerxesForCausalLM,
 	XerxesModel,
 )
-from easydel.smi import get_mem, initialise_tracking, run
-from easydel.trainers import (
+from .smi import get_mem, initialise_tracking, run
+from .trainers import (
 	BaseTrainer,
 	DPOConfig,
 	DPOTrainer,
@@ -302,12 +308,12 @@ from easydel.trainers import (
 	TrainingArguments,
 	pack_sequences,
 )
-from easydel.transform import (
+from .utils import traversals
+from .utils.parameters_transformation import (
 	easystate_to_huggingface_model,
 	easystate_to_torch,
 	torch_dict_to_easydel_params,
 )
-from easydel.utils import traversals
 
 _targeted_versions = ["0.0.91"]
 

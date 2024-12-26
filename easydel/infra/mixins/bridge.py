@@ -516,18 +516,13 @@ class EasyBridgeMixin(PushToHubMixin):
 				logger.debug(
 					f"loading weights file {filename} from cache at {resolved_archive_file}"
 				)
-		config_class, cls, _ = get_modules_by_type(
-			config.model_type,
-			cls._model_task,
-		)
-		model = nn.eval_shape(
-			lambda: cls(
-				config=config,
-				dtype=dtype,
-				param_dtype=param_dtype,
-				precision=precision,
-				rngs=nn.Rngs(0),
-			)
+		cls = get_modules_by_type(config.model_type, cls._model_task)[1]
+		model = cls.lazy_init(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=nn.Rngs(0),
 		)
 		model = quantize_linear_layers(
 			model,
@@ -627,14 +622,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		)
 		model_type: str = config.model_type
 
-		(
-			config_class,
-			module,
-			transform_function,
-		) = get_modules_by_type(
-			model_type,
-			task_type=cls._model_task,
-		)
+		config_class, module, _ = get_modules_by_type(model_type, task_type=cls._model_task)
 
 		logger.debug(f"Downloading hf_model weights from {pretrained_model_name_or_path}")
 		hf_model = cls.get_torch_loader().from_pretrained(
@@ -665,14 +653,12 @@ class EasyBridgeMixin(PushToHubMixin):
 				setattr(config_class, k, v)
 
 		logger.debug("creating easydel model")
-		model = nn.eval_shape(
-			lambda: module(
-				config=config_class,
-				dtype=dtype,
-				param_dtype=param_dtype,
-				precision=precision,
-				rngs=nn.Rngs(0),
-			)
+		model = module.lazy_init(
+			config=config_class,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=nn.Rngs(0),
 		)
 		model.generation_config = generation_config
 
@@ -703,7 +689,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		logger.debug("converting huggingface-model to easydel-model.")
 		params_pattern_selection = None
 		uses_tie_word_embedding = getattr(config, "tie_word_embeddings", False)
-		params = transform_function(
+		params = model.pure_transform_fn(
 			state_dict,
 			config=config,
 			device=device,
@@ -711,7 +697,6 @@ class EasyBridgeMixin(PushToHubMixin):
 			params_pattern_selection=params_pattern_selection,
 			remove_state_dict=True,
 			uses_tie_word_embedding=uses_tie_word_embedding,
-			dtype=param_dtype,
 		)
 		del state_dict
 		_clear()
@@ -741,6 +726,8 @@ class EasyBridgeMixin(PushToHubMixin):
 			from transformers import AutoModelForAudioClassification as module
 		elif cls._model_task == TaskType.SEQUENCE_TO_SEQUENCE:
 			from transformers import AutoModelForSeq2SeqLM as module
+		elif cls._model_task == TaskType.SPEECH_SEQUENCE_TO_SEQUENCE:
+			from transformers import AutoModelForSpeechSeq2Seq as module
 		elif cls._model_task == TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION:
 			from transformers import AutoModelForZeroShotImageClassification as module
 		else:

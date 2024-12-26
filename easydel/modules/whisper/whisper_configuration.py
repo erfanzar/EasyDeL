@@ -189,7 +189,7 @@ class WhisperConfig(EasyDeLBaseConfig):
 		self.median_filter_width = median_filter_width
 		self.bits = bits
 		self.gradient_checkpointing = gradient_checkpointing
-
+		self.max_position_embeddings = max(max_source_positions, max_target_positions)
 		super().__init__(
 			pad_token_id=pad_token_id,
 			bos_token_id=bos_token_id,
