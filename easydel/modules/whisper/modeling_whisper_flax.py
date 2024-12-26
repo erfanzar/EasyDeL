@@ -67,7 +67,7 @@ def sinusoidal_embedding_init(key, shape, dtype=jnp.float_) -> jax.Array:
 	)
 
 
-class FlaxWhisperAttention(FlaxAttentionModule):
+class WhisperAttention(FlaxAttentionModule):
 	def __init__(
 		self,
 		config: WhisperConfig,
@@ -83,6 +83,7 @@ class FlaxWhisperAttention(FlaxAttentionModule):
 		rngs: nn.Rngs,
 	) -> None:
 		super().__init__(config=config)
+		self.rngs = rngs
 		self.embed_dim = embed_dim
 		self.num_heads = num_heads
 		self.dropout = dropout
@@ -172,16 +173,17 @@ class FlaxWhisperAttention(FlaxAttentionModule):
 				fcm_mask=None,
 			)
 		else:
-			attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+			if attention_mask is not None:
+				attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
 			attention_bias = None
 
-		attentions = self.attention_performer.__call__(
+		attentions = self.attention_performer(
 			query_states=query_states,
 			key_states=key_states,
 			value_states=value_states,
 			bias=attention_bias,
 			attention_mask=attention_mask,
-			causal=False,
+			causal=self.causal,
 			dropout_rng=self.rngs.params(),
 			query_sequence_length=query_states.shape[1],
 			key_value_sequence_length=key_states.shape[1],
@@ -205,7 +207,7 @@ class FlaxWhisperAttention(FlaxAttentionModule):
 		return hidden_state.reshape(hidden_state.shape[:2] + (self.embed_dim,))
 
 
-class FlaxWhisperEncoderLayer(nn.Module):
+class WhisperEncoderLayer(nn.Module):
 	def __init__(
 		self,
 		config: WhisperConfig,
@@ -221,7 +223,7 @@ class FlaxWhisperEncoderLayer(nn.Module):
 		self.precision = precision
 		self.embed_dim = self.config.d_model
 
-		self.self_attn = FlaxWhisperAttention(
+		self.self_attn = WhisperAttention(
 			config=config,
 			embed_dim=self.embed_dim,
 			num_heads=config.encoder_attention_heads,
@@ -297,7 +299,7 @@ class FlaxWhisperEncoderLayer(nn.Module):
 		return outputs
 
 
-class FlaxWhisperDecoderLayer(nn.Module):
+class WhisperDecoderLayer(nn.Module):
 	def __init__(
 		self,
 		config: WhisperConfig,
@@ -312,7 +314,7 @@ class FlaxWhisperDecoderLayer(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		self.embed_dim = self.config.d_model
-		self.self_attn = FlaxWhisperAttention(
+		self.self_attn = WhisperAttention(
 			config=self.config,
 			embed_dim=self.embed_dim,
 			num_heads=self.config.decoder_attention_heads,
@@ -340,7 +342,7 @@ class FlaxWhisperDecoderLayer(nn.Module):
 			epsilon=1e-05,
 			rngs=rngs,
 		)
-		self.encoder_attn = FlaxWhisperAttention(
+		self.encoder_attn = WhisperAttention(
 			config=self.config,
 			embed_dim=self.embed_dim,
 			num_heads=self.config.decoder_attention_heads,
@@ -438,7 +440,7 @@ class FlaxWhisperDecoderLayer(nn.Module):
 		return outputs
 
 
-class FlaxWhisperEncoder(EasyDeLBaseModule):
+class WhisperEncoder(EasyDeLBaseModule):
 	def __init__(
 		self,
 		config: WhisperConfig,
@@ -484,7 +486,7 @@ class FlaxWhisperEncoder(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 
-		block = FlaxWhisperEncoderLayer
+		block = WhisperEncoderLayer
 		self.layers = [
 			block(
 				config=config,
@@ -581,7 +583,7 @@ class FlaxWhisperEncoder(EasyDeLBaseModule):
 		)
 
 
-class FlaxWhisperDecoder(EasyDeLBaseModule):
+class WhisperDecoder(EasyDeLBaseModule):
 	def __init__(
 		self,
 		config: WhisperConfig,
@@ -614,7 +616,7 @@ class FlaxWhisperDecoder(EasyDeLBaseModule):
 		)
 
 		self.layers = [
-			FlaxWhisperDecoderLayer(
+			WhisperDecoderLayer(
 				config=config,
 				dtype=dtype,
 				param_dtype=param_dtype,
@@ -727,7 +729,7 @@ class FlaxWhisperDecoder(EasyDeLBaseModule):
 		"layer_norm",
 	],
 )
-class FlaxWhisperModel(EasyDeLBaseModule):
+class WhisperModel(EasyDeLBaseModule):
 	def __init__(
 		self,
 		config: WhisperConfig,
@@ -744,14 +746,14 @@ class FlaxWhisperModel(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.encoder = FlaxWhisperEncoder(
+		self.encoder = WhisperEncoder(
 			config=config,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
 			rngs=rngs,
 		)
-		self.decoder = FlaxWhisperDecoder(
+		self.decoder = WhisperDecoder(
 			config=config,
 			dtype=dtype,
 			param_dtype=param_dtype,
@@ -899,6 +901,7 @@ class FlaxWhisperModel(EasyDeLBaseModule):
 			decoder_hidden_states=decoder_outputs.hidden_states,
 			decoder_attentions=decoder_outputs.attentions,
 			cross_attentions=decoder_outputs.cross_attentions,
+			past_key_values=past_key_values,
 		)
 
 	def encode(
@@ -937,7 +940,7 @@ class FlaxWhisperModel(EasyDeLBaseModule):
 
 
 @register_module(
-	"sequence-to-sequence",
+	"speech-sequence-to-sequence",
 	config=WhisperConfig,
 	model_type="whisper",
 	embedding_layer_names=["embed_positions", "embed_tokens"],
@@ -965,7 +968,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.model = FlaxWhisperModel(
+		self.model = WhisperModel(
 			config=config,
 			dtype=dtype,
 			param_dtype=param_dtype,
@@ -979,6 +982,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 			kernel_init=jax.nn.initializers.normal(config.init_std),
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
@@ -1059,7 +1063,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 		return_dict = return_dict if return_dict is not None else self.config.return_dict
 
 		encoder_hidden_states = encoder_outputs[0]
-		return self.model.decode(
+		outputs = self.model.decode(
 			encoder_hidden_states=encoder_hidden_states,
 			decoder_attention_mask=decoder_attention_mask,
 			decoder_input_ids=decoder_input_ids,
@@ -1067,6 +1071,57 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
+			return_dict=return_dict,
+		)
+		hidden_states = outputs[0]
+
+		if self.config.tie_word_embeddings:
+			self.proj_out.kernel.value = (
+				self.model.decoder.embed_tokens.embedding.value.T.astype(self.param_dtype)
+			)
+
+		lm_logits = self.proj_out(hidden_states)
+
+		if not return_dict:
+			output = (lm_logits,) + outputs[1:]
+			return output
+
+		return FlaxSeq2SeqLMOutput(
+			logits=lm_logits,
+			decoder_hidden_states=outputs.decoder_hidden_states,
+			decoder_attentions=outputs.decoder_attentions,
+			cross_attentions=outputs.cross_attentions,
+			encoder_last_hidden_state=outputs.encoder_last_hidden_state,
+			encoder_hidden_states=outputs.encoder_hidden_states,
+			encoder_attentions=outputs.encoder_attentions,
+			past_key_values=outputs.past_key_values,
+		)
+
+	def encode(
+		self,
+		input_features: jnp.ndarray,
+		attention_mask: tp.Optional[jnp.ndarray] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		return_dict: tp.Optional[bool] = None,
+		**kwargs,
+	):
+		output_attentions = (
+			output_attentions
+			if output_attentions is not None
+			else self.config.output_attentions
+		)
+		output_hidden_states = (
+			output_hidden_states
+			if output_hidden_states is not None
+			else self.config.output_hidden_states
+		)
+		return_dict = return_dict if return_dict is not None else self.config.return_dict
+
+		return self.model.encode(
+			input_features=jnp.array(input_features, dtype="f4"),
+			output_attentions=output_attentions,
+			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,
 		)
 
@@ -1152,7 +1207,6 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 		self,
 		input_features: jax.Array,
 		forced_decoder_ids: jax.Array,
-		params: dict,
 		return_timestamps: bool = False,
 		generation_config: tp.Optional["transformers.GenerationConfig"] = None,  # noqa #type:ignore
 		**kwargs,
@@ -1170,7 +1224,6 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 			input_features,
 			generation_config,
 			logits_processor=logits_processor,
-			params=params,
 			**kwargs,
 		)
 
@@ -1186,7 +1239,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 		# initializing the cache
 		batch_size, seq_length = decoder_input_ids.shape
 
-		past_key_values = self.init_cache(batch_size, max_length, encoder_outputs)
+		past_key_values = self.init_cache(batch_size, max_length)
 		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
 		if decoder_attention_mask is not None:
 			position_ids = decoder_attention_mask.cumsum(-1) - 1
@@ -1243,7 +1296,7 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.encoder = FlaxWhisperEncoder(
+		self.encoder = WhisperEncoder(
 			config=config,
 			dtype=dtype,
 			param_dtype=param_dtype,

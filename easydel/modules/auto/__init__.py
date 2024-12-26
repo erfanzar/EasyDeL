@@ -19,9 +19,11 @@ from .auto_configuration import (
 )
 from .auto_modeling import (
 	AutoEasyDeLModelForCausalLM,
+	AutoEasyDeLModelForSeq2SeqLM,
 	AutoEasyDeLModelForSpeechSeq2Seq,
 	AutoEasyDeLModelForZeroShotImageClassification,
 	AutoStateForCausalLM,
+	AutoStateForSeq2SeqLM,
 	AutoStateForSpeechSeq2Seq,
 	AutoStateForZeroShotImageClassification,
 )
@@ -31,9 +33,11 @@ __all__ = (
 	"AutoShardAndGatherFunctions",
 	"get_modules_by_type",
 	"AutoEasyDeLModelForCausalLM",
+	"AutoEasyDeLModelForSeq2SeqLM",
 	"AutoEasyDeLModelForSpeechSeq2Seq",
 	"AutoEasyDeLModelForZeroShotImageClassification",
 	"AutoStateForCausalLM",
+	"AutoStateForSeq2SeqLM",
 	"AutoStateForSpeechSeq2Seq",
 	"AutoStateForZeroShotImageClassification",
 )

@@ -27,10 +27,12 @@ from .arctic import (
 from .auto import (
 	AutoEasyDeLConfig,
 	AutoEasyDeLModelForCausalLM,
+	AutoEasyDeLModelForSeq2SeqLM,
 	AutoEasyDeLModelForSpeechSeq2Seq,
 	AutoEasyDeLModelForZeroShotImageClassification,
 	AutoShardAndGatherFunctions,
 	AutoStateForCausalLM,
+	AutoStateForSeq2SeqLM,
 	AutoStateForSpeechSeq2Seq,
 	AutoStateForZeroShotImageClassification,
 	get_modules_by_type,
@@ -92,7 +94,7 @@ from .gpt_j import (
 	GPTJForCausalLM,
 	GPTJModel,
 )
-from .gpt_neo_x import (
+from .gpt_neox import (
 	GPTNeoXConfig,
 	GPTNeoXForCausalLM,
 	GPTNeoXModel,

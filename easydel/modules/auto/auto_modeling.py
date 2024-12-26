@@ -390,7 +390,7 @@ class BaseAutoEasyState:
 
 class AutoEasyDeLModelForCausalLM(BaseAutoEasyModel):
 	"""
-	This class provides a convenient way to load and shard pretrained causal language models from the Hugging Face Hub
+	This class provides a convenient way to load and shard pretrained  models from the Hugging Face Hub
 	and convert them into EasyDeL compatible models. It utilizes the EasyDeL library for distributed training and inference
 	with JAX.
 
@@ -430,7 +430,7 @@ class AutoStateForCausalLM(BaseAutoEasyState):
 
 class AutoEasyDeLModelForZeroShotImageClassification(BaseAutoEasyModel):
 	"""
-	This class provides a convenient way to load and shard pretrained causal language models from the Hugging Face Hub
+	This class provides a convenient way to load and shard pretrained  models from the Hugging Face Hub
 	and convert them into EasyDeL compatible models. It utilizes the EasyDeL library for distributed training and inference
 	with JAX.
 
@@ -448,7 +448,7 @@ class AutoStateForZeroShotImageClassification(BaseAutoEasyState):
 
 class AutoEasyDeLModelForSpeechSeq2Seq(BaseAutoEasyModel):
 	"""
-	This class provides a convenient way to load and shard pretrained causal language models from the Hugging Face Hub
+	This class provides a convenient way to load and shard pretrained  models from the Hugging Face Hub
 	and convert them into EasyDeL compatible models. It utilizes the EasyDeL library for distributed training and inference
 	with JAX.
 
@@ -480,8 +480,25 @@ class AutoEasyDeLModelForSpeechSeq2Seq(BaseAutoEasyModel):
 	    ```
 	"""
 
-	model_task: TaskType = TaskType.SEQUENCE_TO_SEQUENCE  # Static
+	model_task: TaskType = TaskType.SPEECH_SEQUENCE_TO_SEQUENCE  # Static
 
 
 class AutoStateForSpeechSeq2Seq(BaseAutoEasyState):
 	_base = AutoEasyDeLModelForSpeechSeq2Seq
+
+
+class AutoEasyDeLModelForSeq2SeqLM(BaseAutoEasyModel):
+	"""
+	This class provides a convenient way to load and shard pretrained  models from the Hugging Face Hub
+	and convert them into EasyDeL compatible models. It utilizes the EasyDeL library for distributed training and inference
+	with JAX.
+
+	This class inherits from the `EasyDeLBaseModule` class, providing functionalities for model loading,
+	parameter sharding, and interaction with the EasyDeL framework.
+	"""
+
+	model_task: TaskType = TaskType.SEQUENCE_TO_SEQUENCE  # Static
+
+
+class AutoStateForSeq2SeqLM(BaseAutoEasyState):
+	_base = AutoEasyDeLModelForSeq2SeqLM

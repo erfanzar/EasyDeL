@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 import typing as tp
 import warnings
-from functools import cached_property
+from functools import cached_property, partial
 
 import chex
 import jax
@@ -66,7 +66,7 @@ PartitionLike = tp.Optional[
 
 logger = get_logger(__name__)
 
-
+MO = tp.TypeVar("MO")
 _CP = tp.TypeVar("CP")
 
 
@@ -357,6 +357,57 @@ class EasyDeLBaseModule(
 
 	def get_static_arguments(self) -> tp.Tuple:
 		return ()
+
+	@classmethod
+	def lazy_init(cls: tp.Type[MO], *args, **kwargs) -> MO:
+		return nn.eval_shape(lambda: cls(*args, **kwargs))
+
+	@property
+	def transform_fn(self):
+		from easydel.utils.parameters_transformation import torch_dict_to_easydel_params
+		from easydel.utils import graph_utils
+
+		embedding_path = [
+			pa[-1]
+			for pa, _ in graph_utils.iter_module_search(self, nn.Embed)
+			if not isinstance(pa[-1], int)
+		]
+		layernorm_path = [
+			pa[-1]
+			for pa, _ in graph_utils.iter_module_search(self, nn.LayerNorm)
+			if not isinstance(pa[-1], int)
+		]
+
+		return partial(
+			torch_dict_to_easydel_params,
+			embedding_layer_names=embedding_path,
+			layernorm_names=layernorm_path,
+			dtype=self.param_dtype,
+			shard_fns=self._shard_fns,
+		)
+
+	@property
+	def pure_transform_fn(self):
+		from easydel.utils.parameters_transformation import torch_dict_to_easydel_params
+		from easydel.utils import graph_utils
+
+		embedding_path = [
+			pa[-1]
+			for pa, _ in graph_utils.iter_module_search(self, nn.Embed)
+			if not isinstance(pa[-1], int)
+		]
+		layernorm_path = [
+			pa[-1]
+			for pa, _ in graph_utils.iter_module_search(self, nn.LayerNorm)
+			if not isinstance(pa[-1], int)
+		]
+
+		return partial(
+			torch_dict_to_easydel_params,
+			embedding_layer_names=embedding_path,
+			layernorm_names=layernorm_path,
+			dtype=self.param_dtype,
+		)
 
 	def compute_loss(
 		self,

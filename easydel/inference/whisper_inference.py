@@ -15,7 +15,7 @@ import math
 import typing as tp
 from dataclasses import dataclass
 from functools import partial
-
+from flax import nnx as nn
 import jax
 import numpy as np
 import requests
@@ -34,20 +34,24 @@ else:
 
 @partial(
 	jax.jit,
-	static_argnames=["model", "inference_config", "return_timestamps"],
+	static_argnames=[
+		"graphdef",
+		"inference_config",
+		"return_timestamps",
+	],
 )
 def _compiled_generate(
-	model,
+	graphdef,
+	graphstate,
 	inference_config,
-	params,
 	input_features,
 	decoder_input_ids,
 	return_timestamps,
 ):
+	model = nn.merge(graphdef, graphstate)
 	return model._force_generate(
 		input_features=input_features,
 		forced_decoder_ids=decoder_input_ids,
-		params=params,
 		return_timestamps=return_timestamps,
 		generation_config=inference_config.generation_config,
 	)
@@ -113,8 +117,6 @@ class vWhisperInference:
 	Args:
 	    model (`WhisperForConditionalGeneration`):
 	        The fine-tuned Whisper model to use for inference.
-	    params (`tp.Dict[str, tp.Any]`):
-	        Model parameters.
 	    tokenizer (`WhisperTokenizer`):
 	        Tokenizer for Whisper.
 	    processor (`WhisperProcessor`):
@@ -140,7 +142,6 @@ class vWhisperInference:
 
 		>>> inference = vWhisperInference(
 		...		model=model,
-		...		params=params,
 		...		tokenizer=tokenizer,
 		...		processor=processor,
 		...		dtype=jnp.float16,  # Or jnp.float32
@@ -169,7 +170,6 @@ class vWhisperInference:
 	def __init__(
 		self,
 		model: WhisperForConditionalGeneration,
-		params: tp.Dict[str, tp.Any],
 		tokenizer: WhisperTokenizer,
 		processor: WhisperProcessor,
 		inference_config: tp.Optional[vWhisperInferenceConfig] = None,
@@ -183,7 +183,9 @@ class vWhisperInference:
 		self.feature_extractor = self.processor.feature_extractor
 		self.tokenizer = tokenizer
 		self.model = model
-		self.params = {"params": params.get("params", params)}
+		graphdef, graphstate = nn.split(model)
+		self.graphdef = graphdef
+		self.graphstate = graphstate
 		generation_config = inference_config.generation_config or self.model.generation_config
 		inference_config.generation_config = generation_config
 		self.generation_config = generation_config
@@ -205,9 +207,9 @@ class vWhisperInference:
 			return_timestamps=return_timestamps,
 		)
 		output_sequences = self.generate_function(
-			model=self.model,
+			graphdef=self.graphdef,
+			graphstate=self.graphstate,
 			inference_config=self.inference_config,
-			params=self.params,
 			input_features=input_features,
 			decoder_input_ids=forced_decoder_ids,
 			return_timestamps=return_timestamps,

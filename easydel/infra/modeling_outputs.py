@@ -355,7 +355,7 @@ class FlaxBaseModelOutputWithPoolingAndCrossAttentions(ModelOutput):
 	last_hidden_state: chex.Array = None
 	pooler_output: chex.Array = None
 	hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
-	past_key_values: tp.Optional[tp.Tuple[tp.Tuple[chex.Array]]] = None
+	past_key_values: tp.Optional[TransformerCache] = None
 	attentions: tp.Optional[tp.Tuple[chex.Array]] = None
 	cross_attentions: tp.Optional[tp.Tuple[chex.Array]] = None
 	loss: tp.Optional[chex.Array] = None
@@ -401,7 +401,7 @@ class FlaxBaseModelOutputWithPastAndCrossAttentions(ModelOutput):
 	"""
 
 	last_hidden_state: chex.Array = None
-	past_key_values: tp.Optional[tp.Tuple[tp.Tuple[chex.Array]]] = None
+	past_key_values: tp.Optional[TransformerCache] = None
 	hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
 	attentions: tp.Optional[tp.Tuple[chex.Array]] = None
 	cross_attentions: tp.Optional[tp.Tuple[chex.Array]] = None
@@ -460,7 +460,7 @@ class FlaxSeq2SeqModelOutput(ModelOutput):
 	"""
 
 	last_hidden_state: chex.Array = None
-	past_key_values: tp.Optional[tp.Tuple[tp.Tuple[chex.Array]]] = None
+	past_key_values: tp.Optional[TransformerCache] = None
 	decoder_hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
 	decoder_attentions: tp.Optional[tp.Tuple[chex.Array]] = None
 	cross_attentions: tp.Optional[tp.Tuple[chex.Array]] = None
@@ -505,7 +505,7 @@ class FlaxCausalLMOutputWithCrossAttentions(ModelOutput):
 	"""
 
 	logits: chex.Array = None
-	past_key_values: tp.Optional[tp.Tuple[tp.Tuple[chex.Array]]] = None
+	past_key_values: tp.Optional[TransformerCache] = None
 	hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
 	attentions: tp.Optional[tp.Tuple[chex.Array]] = None
 	cross_attentions: tp.Optional[tp.Tuple[chex.Array]] = None
@@ -591,7 +591,7 @@ class FlaxSeq2SeqLMOutput(ModelOutput):
 	"""
 
 	logits: chex.Array = None
-	past_key_values: tp.Optional[tp.Tuple[tp.Tuple[chex.Array]]] = None
+	past_key_values: tp.Optional[TransformerCache] = None
 	decoder_hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
 	decoder_attentions: tp.Optional[tp.Tuple[chex.Array]] = None
 	cross_attentions: tp.Optional[tp.Tuple[chex.Array]] = None
@@ -704,7 +704,7 @@ class FlaxSeq2SeqSequenceClassifierOutput(ModelOutput):
 	"""
 
 	logits: chex.Array = None
-	past_key_values: tp.Optional[tp.Tuple[tp.Tuple[chex.Array]]] = None
+	past_key_values: tp.Optional[TransformerCache] = None
 	decoder_hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
 	decoder_attentions: tp.Optional[tp.Tuple[chex.Array]] = None
 	cross_attentions: tp.Optional[tp.Tuple[chex.Array]] = None
@@ -851,7 +851,7 @@ class FlaxSeq2SeqQuestionAnsweringModelOutput(ModelOutput):
 
 	start_logits: chex.Array = None
 	end_logits: chex.Array = None
-	past_key_values: tp.Optional[tp.Tuple[tp.Tuple[chex.Array]]] = None
+	past_key_values: tp.Optional[TransformerCache] = None
 	decoder_hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
 	decoder_attentions: tp.Optional[tp.Tuple[chex.Array]] = None
 	cross_attentions: tp.Optional[tp.Tuple[chex.Array]] = None

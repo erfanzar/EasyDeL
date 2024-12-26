@@ -11,19 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import gc
+import os
 import typing as tp
 from contextlib import contextmanager
 
 import jax
 from fjformer.checkpoint import get_dtype
+from jax import dlpack
 from jax import numpy as jnp
 from tqdm.autonotebook import tqdm
 
 from easydel.etils.etils import get_logger
-from easydel.transform.utils import jax2pt
-from easydel.utils.analyze_memory import SMPMemoryMonitor
-from easydel.utils.traversals import flatten_dict, unflatten_dict
+
+from .analyze_memory import SMPMemoryMonitor
+from .traversals import flatten_dict, unflatten_dict
 
 if tp.TYPE_CHECKING:
 	from transformers import PreTrainedModel
@@ -102,7 +105,6 @@ def process_tensor(
 	    tp.Tuple of processed key tuple and JAX array, or None if tensor should be skipped
 	"""
 	new_key = key
-
 	# Handle embedding layers
 	if any(layer_name in key for layer_name in config["embedding_layer_names"]):
 		new_key = f"{key[:-len('.weight')]}.embedding"
@@ -112,6 +114,7 @@ def process_tensor(
 		tensor = tensor.reshape(-1)
 
 	# Handle layer normalization
+
 	elif any(layer_norm in key for layer_norm in config["layernorm_names"]):
 		new_key = key.replace(".weight", ".scale")
 
@@ -223,6 +226,7 @@ def torch_dict_to_easydel_params(
 							jax_array = shard_fns[key_tuple](jax_array)
 						flax_dict[key_tuple] = jax_array
 				except Exception as e:
+					raise e
 					print(f"Error processing key {key}: {str(e)}")
 				pbar.update(1)
 
@@ -336,3 +340,39 @@ def easystate_to_huggingface_model(
 		)
 		model.load_state_dict(state_dict, assign=True, strict=True)
 	return model
+
+
+def jax2pt(x: jax.Array):
+	from torch import cuda
+	from torch.utils import dlpack as dlpack_pt
+
+	_jax_device = list(x.devices())[0].platform
+	cpu_force = not cuda.is_available()
+	if (
+		_jax_device in ["cpu", "gpu"]
+		and not cpu_force
+		and not bool(os.environ.get("EASYDEL_FORCE_TORCH_USE_CPU", "false"))
+	):
+		dl_pack_jax = dlpack.to_dlpack(
+			x,
+			stream=True if (_jax_device == "gpu" and not cpu_force) else None,
+			src_device=list(x.devices())[0],
+		)
+	else:
+		device = os.environ.get("EASYDEL_PERFRED_HOST_COPY", "cpu")
+		if device.lower() == "none":
+			device = None  # Auto JAX Select
+		perfred_host = jax.devices(device)[
+			int(os.environ.get("EASYDEL_PERFRED_HOST_COPY_IDEX", "0"))
+		]
+		x = jax.device_get(x)  # make sure it's local
+		x = jax.device_put(x, perfred_host)
+		dl_pack_jax = dlpack.to_dlpack(
+			x,
+			stream=None,
+		)
+	return dlpack_pt.from_dlpack(dl_pack_jax)
+
+
+def pt2jax(x, transpose_raw: tp.Optional[tuple] = None):
+	return jax.numpy.asarray(x.detach().cpu().numpy())

@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import typing as tp
 from abc import ABCMeta, abstractmethod
 
@@ -671,6 +673,24 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 	@abstractmethod
 	def get_static_arguments(self) -> tp.Tuple:
 		"""return static arguments kwargs for jax.jit"""
+		...
+
+	@classmethod
+	@abstractmethod
+	def lazy_init(cls, *args, **kwargs) -> BaseModuleProtocol:
+		"""initialize the base class with nnx.eval_shape carefully"""
+		...
+
+	@property
+	@abstractmethod
+	def transform_fn(self) -> tp.Callable:
+		"""generate transform function for converting torch to easydel module."""
+		...
+
+	@property
+	@abstractmethod
+	def pure_transform_fn(self) -> tp.Callable:
+		"""generates a pure transform function for converting torch to easydel module."""
 		...
 
 	def __repr__(self):

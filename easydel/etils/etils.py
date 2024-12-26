@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import argparse
 import logging
 import os
@@ -127,6 +128,7 @@ AVAILABLE_OPTIMIZERS = tp.Literal[
 	"rmsprop",
 ]
 
+
 AVAILABLE_PRUNING_TYPE = tp.Optional[
 	tp.Union[
 		MagnitudePruning,
@@ -139,6 +141,7 @@ AVAILABLE_PRUNING_TYPE = tp.Optional[
 		GlobalMagnitudePruning,
 	]
 ]
+
 _AVAILABLE_ATTENTION_MECHANISMS = [
 	"vanilla",
 	"flash_attn2",
@@ -148,6 +151,7 @@ _AVAILABLE_ATTENTION_MECHANISMS = [
 	"blockwise",
 	"sdpa",
 ]
+
 AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[
 	"vanilla",
 	"flash_attn2",
@@ -158,9 +162,11 @@ AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[
 	"sdpa",
 ]
 
+
 DEFAULT_ATTENTION_MECHANISM = (
 	"sdpa" if jax.extend.backend.get_backend().platform == "gpu" else "vanilla"
 )
+
 AVAILABLE_SPARSE_MODULE_TYPES = tp.Literal["bcoo", "bcsr", "coo", "csr"]
 
 _LOGGING_LEVELS = dict(
