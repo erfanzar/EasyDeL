@@ -115,6 +115,7 @@ def initialise_tracking(
 			jax.profiler.save_device_memory_profile(f"{dir_prefix}/memory.prof.new")
 			os.rename(f"{dir_prefix}/memory.prof.new", f"{dir_prefix}/memory.prof")
 			time.sleep(interval)
+			time.sleep(1)
 
 	thread = threading.Thread(target=inner, daemon=True)
 	thread.start()

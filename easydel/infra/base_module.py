@@ -28,14 +28,8 @@ from jax import lax
 from jax import numpy as jnp
 from jax.sharding import Mesh
 
-from easydel.etils.etils import (
-	EasyDeLQuantizationMethods,
-	get_logger,
-)
-from easydel.utils.traversals import (
-	flatten_dict,
-	unflatten_dict,
-)
+from easydel.etils.etils import EasyDeLQuantizationMethods, get_logger
+from easydel.utils.traversals import flatten_dict, unflatten_dict
 
 from .base_config import EasyDeLBaseConfig
 from .loss_utils import (
@@ -364,8 +358,8 @@ class EasyDeLBaseModule(
 
 	@property
 	def transform_fn(self):
-		from easydel.utils.parameters_transformation import torch_dict_to_easydel_params
 		from easydel.utils import graph_utils
+		from easydel.utils.parameters_transformation import torch_dict_to_easydel_params
 
 		embedding_path = [
 			pa[-1]
@@ -388,8 +382,8 @@ class EasyDeLBaseModule(
 
 	@property
 	def pure_transform_fn(self):
-		from easydel.utils.parameters_transformation import torch_dict_to_easydel_params
 		from easydel.utils import graph_utils
+		from easydel.utils.parameters_transformation import torch_dict_to_easydel_params
 
 		embedding_path = [
 			pa[-1]
