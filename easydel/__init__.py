@@ -257,6 +257,10 @@ from .modules.phimoe import (
 	PhiMoeForCausalLM,
 	PhiMoeModel,
 )
+from .modules.pixtral import (
+	PixtralVisionConfig,
+	PixtralVisionModel,
+)
 from .modules.qwen2 import (
 	Qwen2Config,
 	Qwen2ForCausalLM,
