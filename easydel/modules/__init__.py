@@ -177,6 +177,10 @@ from .phimoe import (
 	PhiMoeForCausalLM,
 	PhiMoeModel,
 )
+from .pixtral import (
+	PixtralVisionConfig,
+	PixtralVisionModel,
+)
 from .qwen2 import (
 	Qwen2Config,
 	Qwen2ForCausalLM,
