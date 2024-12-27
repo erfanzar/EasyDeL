@@ -17,6 +17,7 @@ import re
 import typing as tp
 import warnings
 from functools import cached_property, partial
+from tabnanny import verbose
 
 import chex
 import jax
@@ -355,6 +356,30 @@ class EasyDeLBaseModule(
 	@classmethod
 	def lazy_init(cls: tp.Type[MO], *args, **kwargs) -> MO:
 		return nn.eval_shape(lambda: cls(*args, **kwargs))
+
+	def apply_lora_to_layers(
+		self,
+		lora_rank: int,
+		lora_pattern: tp.Optional[str] = None,
+		verbose: bool = False,
+		rngs: tp.Optional[nn.Rngs] = None,
+	):
+		from easydel.infra.utils import apply_lora_to_layers
+
+		self = apply_lora_to_layers(
+			self,
+			lora_pattern=lora_pattern,
+			lora_rank=lora_rank,
+			rngs=rngs,
+			verbose=verbose,
+		)
+		return self
+
+	def unwrap_lora_to_layers(self, verbose: bool = False):
+		from easydel.infra.utils import unwrap_lora_to_layers
+
+		self = unwrap_lora_to_layers(self, verbose=verbose)
+		return unwrap_lora_to_layers
 
 	@property
 	def transform_fn(self):
