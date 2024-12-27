@@ -681,6 +681,22 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		"""initialize the base class with nnx.eval_shape carefully"""
 		...
 
+	@abstractmethod
+	def apply_lora_to_layers(
+		self,
+		lora_rank: int,
+		lora_pattern: tp.Optional[str] = None,
+		verbose: bool = True,
+		rngs: tp.Optional[nn.Rngs] = None,
+	):
+		"""Applies LoRA (Low-Rank Adaptation) to specified linear layers within a model."""
+		...
+
+	@abstractmethod
+	def unwrap_lora_to_layers(self, verbose: bool = False):
+		"""UnWrap LoRA (Low-Rank Adaptation) from specified linear layers within a model."""
+		...
+
 	@property
 	@abstractmethod
 	def transform_fn(self) -> tp.Callable:

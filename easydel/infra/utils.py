@@ -318,6 +318,105 @@ def quantize_linear_layers(
 	return model
 
 
+def apply_lora_to_layers(
+	model: nn.Module,
+	/,
+	*,
+	lora_rank: int,
+	lora_pattern: tp.Optional[str] = None,
+	verbose: bool = True,
+	rngs: tp.Optional[nn.Rngs] = None,
+) -> nn.Module:
+	"""
+	Applies LoRA (Low-Rank Adaptation) to specified linear layers within a model.
+
+	Args:
+	    model: The EasyDeL model to modify.
+	    lora_rank: The rank of the LoRA adapters.
+	    lora_pattern: A regular expression pattern to match the names of
+	                  modules to which LoRA should be applied. Defaults to ".*" (all linear layers).
+	    verbose: Whether to display a progress bar.
+	    rngs:  A `flax.nnx.Rngs` instance for random number generation. If None, initializes with a seed of 0.
+
+	Returns:
+	    The modified model with LoRA applied to the specified layers.
+	"""
+	from easydel.utils.graph_utils import (
+		get_module_from_path,
+		iter_module_search,
+		set_module_from_path,
+	)
+
+	if lora_pattern is None:
+		lora_pattern = ".*"
+	if rngs is None:
+		rngs = nn.Rngs(0)
+	pattern = re.compile(lora_pattern)
+
+	with tqdm(
+		total=len([p[0] for p in iter_module_search(model, nn.Linear)]),
+		desc="Applying LoRA",
+		disable=not verbose,
+	) as pbar:
+		for path, _ in iter_module_search(model, nn.Linear):
+			if pattern.search(".".join([str(p) for p in path])):
+				base_module: nn.Linear = get_module_from_path(model=model, path=path)
+				set_module_from_path(
+					model=model,
+					path=path,
+					new_value=nn.LoRA(
+						base_module=base_module,
+						rngs=rngs,
+						dtype=base_module.dtype,
+						param_dtype=base_module.param_dtype,
+						in_features=base_module.in_features,
+						lora_rank=lora_rank,
+						out_features=base_module.out_features,
+					),
+				)
+			pbar.update(1)
+
+	return model
+
+
+def unwrap_lora_to_layers(
+	model: nn.Module,
+	/,
+	*,
+	verbose: bool = True,
+) -> nn.Module:
+	"""
+	UnWrap LoRA (Low-Rank Adaptation) from specified linear layers within a model.
+	"""
+	from easydel.utils.graph_utils import (
+		get_module_from_path,
+		iter_module_search,
+		set_module_from_path,
+	)
+
+	with tqdm(
+		total=len([p[0] for p in iter_module_search(model, nn.Linear)]),
+		desc="Unwarping LoRA Layers",
+		disable=not verbose,
+	) as pbar:
+		for path, _ in iter_module_search(model, nn.LoRA):
+			base_module: nn.LoRA = get_module_from_path(model=model, path=path)
+			with jax.default_matmul_precision("float32"):
+				base_module.base_module.kernel.value = (
+					base_module.base_module.kernel.value
+					+ base_module.lora_a.value @ base_module.lora_b.value
+				)
+			del base_module.lora_a, base_module.lora_b
+			set_module_from_path(
+				model=model,
+				path=path,
+				new_value=base_module.base_module,
+			)
+		pbar.update(1)
+
+	return model
+
+
 def print_pytree(pytree):
 	jax.tree_util.tree_map_with_path(
 		lambda p, v: print(

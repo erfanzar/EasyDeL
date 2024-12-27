@@ -56,7 +56,6 @@ def setup_inference():
 
 	inference = ed.vInference(
 		model=model,
-		params=params,
 		tokenizer=tokenizer,
 		generation_config=ed.vInferenceConfig(
 			max_new_tokens=512,
