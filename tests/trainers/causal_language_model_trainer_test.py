@@ -71,6 +71,7 @@ def create_model(sequence_length=SEQUENCE_LENGTH, dtype=jnp.float32):
 	)
 
 	model = model.shard_model()
+	model = model.quantize()
 	logging.info("Model created.")
 	return model
 

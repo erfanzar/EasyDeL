@@ -56,7 +56,7 @@ def create_training_step(
 		(
 			(loss, metrics),
 			grads,
-		) = jax.value_and_grad(loss_fn, has_aux=True)(state.graphstate)
+		) = jax.value_and_grad(loss_fn, has_aux=True, allow_int=True)(state.graphstate)
 		state = state.apply_gradients(grads=grads)
 		if learning_rate_fn is not None:
 			metrics.learning_rate = learning_rate_fn(state.step)

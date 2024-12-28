@@ -17,7 +17,6 @@ import re
 import typing as tp
 import warnings
 from functools import cached_property, partial
-from tabnanny import verbose
 
 import chex
 import jax
