@@ -57,10 +57,8 @@ from ._fn import (
 )
 from .metrics import vInferenceMetrics
 
-if tp.TYPE_CHECKING:
-	from transformers import PreTrainedTokenizer
-else:
-	PreTrainedTokenizer = tp.Any
+from easydel.infra.utils import ProcessingClassType
+
 logger = get_logger(__name__)
 TIME = str(datetime.fromtimestamp(time.time())).split(" ")[0]
 
@@ -86,7 +84,7 @@ class vInference:
 	def __init__(
 		self,
 		model: EasyDeLBaseModule,
-		tokenizer: PreTrainedTokenizer,
+		processor_class: ProcessingClassType,
 		generation_config: tp.Optional[vInferenceConfig] = None,
 		seed: tp.Optional[int] = None,
 		input_partition_spec: tp.Optional[PartitionSpec] = None,
@@ -98,7 +96,7 @@ class vInference:
 
 		Args:
 			model: The pre-trained language model.
-			tokenizer: The tokenizer for the model.
+			processor_class: The processor_class for the model.
 			generation_config: The generation configuration.
 			seed: The random seed for generation.
 			input_partition_spec: The partitioning specification for input data.
@@ -109,7 +107,7 @@ class vInference:
 		self.graphdef = graphdef 
 		self.graphstate = graphstate
 		self.model=model 
-		self.tokenizer = tokenizer
+		self.processor_class = processor_class
 		self.generation_config = self._init_generation_config(generation_config, max_new_tokens)
 		if seed is None:
 			seed = random.randint(0, int(1e6))
@@ -125,6 +123,19 @@ class vInference:
 		self._inference_name = inference_name or self._generate_inference_name(model)
 		self.metrics = vInferenceMetrics(self._inference_name)
 		# fmt:on
+
+	@cached_property
+	def tokenizer(self):
+		from transformers import PreTrainedTokenizerBase
+
+		if isinstance(self.processor_class, PreTrainedTokenizerBase):
+			return self.processor_class
+
+		from transformers import ProcessorMixin
+
+		if isinstance(self.processor_class, ProcessorMixin):
+			return self.processor_class.tokenizer
+		raise ValueError("Unknown `processor_class` to extract `tokenizer` from.")
 
 	@cached_property
 	def _logits_warper(self):
@@ -291,6 +302,7 @@ class vInference:
 		"""
 		Validates the token IDs for padding, end-of-sequence, and beginning-of-sequence.
 		"""
+
 		if self.generation_config.pad_token_id is None:
 			self.generation_config.pad_token_id = self.tokenizer.pad_token_id
 		if self.generation_config.eos_token_id is None:
@@ -300,7 +312,8 @@ class vInference:
 
 		assert self.generation_config.pad_token_id is not None, (
 			"`pad_token_id` cannot be None. "
-			"(Set `tokenizer.pad_token_id = tokenizer.eos_token_id` if undefined)"
+			"(Set `tokenizer.pad_token_id = tokenizer.eos_token_id` if undefined"
+			" or (`processing_class.tokenizer.pad_token_id = processing_class.tokenizer.eos_token_id`))"
 		)
 		assert (
 			self.generation_config.eos_token_id is not None
@@ -518,7 +531,7 @@ class vInference:
 
 	def count_tokens(self, conv: tp.Union[str, tp.List[tp.Dict[str, str]]]) -> int:
 		if isinstance(conv, list) and all(isinstance(item, dict) for item in conv):
-			tokens = self.tokenizer.apply_chat_template(
+			tokens = self.processor_class.apply_chat_template(
 				conv,
 				tokenize=True,
 				apply_chat_template=True,
@@ -557,7 +570,7 @@ class vInference:
 		cls,
 		path: tp.Union[os.PathLike, str],
 		model: EasyDeLBaseModule,
-		tokenizer: PreTrainedTokenizer,
+		processor_class: ProcessingClassType,
 	):
 		path = pathlib.Path(path)
 		assert path.exists(), "provided path to vInference doesn't exists."
@@ -576,7 +589,7 @@ class vInference:
 			)
 		self = cls(
 			model=model,
-			tokenizer=tokenizer,
+			processor_class=processor_class,
 			generation_config=metadata.generation_config,
 			input_partition_spec=metadata.input_partition_spec,
 			inference_name=metadata.inference_name,

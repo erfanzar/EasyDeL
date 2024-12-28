@@ -85,6 +85,8 @@ def get_rope_index_numpy(
 	    position_ids (`np.ndarray` of shape `(3, batch_size, sequence_length)`)
 	    mrope_position_deltas (`np.ndarray` of shape `(batch_size)`)
 	"""
+	if input_ids.shape[-1] != 1:
+		attention_mask = attention_mask[:, : input_ids.shape[-1]]
 	if input_ids is not None and (
 		image_grid_thw is not None or video_grid_thw is not None
 	):
@@ -188,10 +190,10 @@ def get_rope_index_numpy(
 		return position_ids, mrope_position_deltas
 	else:
 		if attention_mask is not None:
-			position_ids = np.cumsum(attention_mask, axis=-1) - 1
-			position_ids = np.where(attention_mask == 0, 1, position_ids)
-			position_ids = np.expand_dims(position_ids, axis=0).repeat(3, axis=0)
-			max_position_ids = np.max(position_ids, axis=(0, 2), keepdims=True)
+			position_ids = jnp.cumsum(attention_mask, axis=-1) - 1
+			position_ids = jnp.where(attention_mask == 0, 1, position_ids)
+			position_ids = jnp.expand_dims(position_ids, axis=0).repeat(3, axis=0)
+			max_position_ids = jnp.max(position_ids, axis=(0, 2), keepdims=True)
 			mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
 		else:
 			position_ids = (
@@ -271,6 +273,16 @@ def jax_scatter(sec_embeds, ids, fir_embeds, TKN_ID):
 	flatten_emb = fir_embeds.reshape(-1)
 	flatten_img_emb = image_embeds.reshape(-1)[: len(image_indices)]
 	flatten_emb = jnp.pad(flatten_emb, (1, 0))
+	flatten_img_emb = jnp.pad(
+		flatten_img_emb,
+		(0, flatten_emb.size - flatten_img_emb.size),
+		# this will default be known as 0 so it wont be used anyway
+	)
+	image_indices = jnp.pad(
+		image_indices,
+		(0, flatten_emb.size - image_indices.size),
+		# this will default be known as 0 so it wont be used anyway
+	)
 	scattered_embeds = flatten_emb.at[image_indices].set(flatten_img_emb)[1:]
 	fir_embeds = scattered_embeds.reshape(fir_embeds.shape)
 	return fir_embeds
@@ -1339,7 +1351,6 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 				batch_size, sequence_length = inputs_embeds.shape[:2]
 				position_ids = jnp.arange(sequence_length).reshape(1, -1).repeat(batch_size, 0)
 				position_ids = jnp.expand_dims(position_ids, 0).repeat(3, 0)
-
 		outputs = self.model(
 			input_ids=None,
 			position_ids=position_ids,
@@ -1369,6 +1380,7 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 	def prepare_inputs_for_generation(
 		self,
 		input_ids,
+		max_length,
 		past_key_values=None,
 		attention_mask=None,
 		inputs_embeds=None,
@@ -1379,19 +1391,26 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 		video_grid_thw=None,
 		**kwargs,
 	):
+		batch_size, seq_length = input_ids.shape
+
 		if past_key_values is None:
-			past_key_values = self.init_cache()
+			past_key_values = self.init_cache(batch_size, max_length)
 
 		if inputs_embeds is not None:
 			model_inputs = {"inputs_embeds": inputs_embeds, "input_ids": None}
 		else:
 			model_inputs = {"input_ids": input_ids, "inputs_embeds": None}
 
+		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
+		if attention_mask is not None:
+			extended_attention_mask = jax.lax.dynamic_update_slice(
+				extended_attention_mask, attention_mask, (0, 0)
+			)
 		model_inputs.update(
 			{
 				"position_ids": position_ids,
 				"past_key_values": past_key_values,
-				"attention_mask": attention_mask,
+				"attention_mask": extended_attention_mask,
 				"pixel_values": pixel_values,
 				"pixel_values_videos": pixel_values_videos,
 				"image_grid_thw": image_grid_thw,
@@ -1420,6 +1439,7 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 		attention_mask = others.get("attention_mask", None)
 		rope_deltas = others.get("rope_deltas", None)
 		position_ids = others.get("position_ids", None)
+
 		if (
 			position_ids is None
 			and others.get("input_ids", None) is not None
@@ -1443,6 +1463,7 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 				batch_size, sequence_length = others.get("input_ids").shape
 				position_ids = jnp.arange(sequence_length).reshape(1, -1).repeat(batch_size, 0)
 				position_ids = jnp.expand_dims(position_ids, 0).repeat(3, 0)
+		others.pop("input_ids", None)
 		others.update(
 			dict(
 				video_max_grid_size=video_max_grid_size,
@@ -1454,6 +1475,11 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 			)
 		)
 		return others
+
+	def update_inputs_for_generation(self, model_outputs, model_kwargs):
+		model_kwargs["past_key_values"] = model_outputs.past_key_values
+		model_kwargs["position_ids"] = model_kwargs["position_ids"][..., -1:] + 1
+		return model_kwargs
 
 	def get_static_arguments(self):
 		return (

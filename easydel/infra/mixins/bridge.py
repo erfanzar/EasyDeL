@@ -685,6 +685,7 @@ class EasyBridgeMixin(PushToHubMixin):
 				platform=platform,
 				config_kwargs=config_kwargs,
 				trust_remote_code=trust_remote_code,
+				model_task=cls._model_task,
 			)
 		logger.debug("converting huggingface-model to easydel-model.")
 		params_pattern_selection = None
@@ -730,6 +731,8 @@ class EasyBridgeMixin(PushToHubMixin):
 			from transformers import AutoModelForSpeechSeq2Seq as module
 		elif cls._model_task == TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION:
 			from transformers import AutoModelForZeroShotImageClassification as module
+		elif cls._model_task == TaskType.IMAGE_TEXT_TO_TEXT:
+			from transformers import AutoModelForImageTextToText as module
 		else:
 			raise ValueError(
 				"couldn't find requested hf autoloader,"

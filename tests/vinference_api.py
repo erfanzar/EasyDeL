@@ -6,12 +6,12 @@ os.environ["EASYDEL_AUTO"] = "true"
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-import easydel as ed
 from huggingface_hub import HfApi
 from jax import numpy as jnp
 from jax import sharding
 from transformers import AutoTokenizer
 
+import easydel as ed
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
@@ -45,7 +45,7 @@ def main():
 	tokenizer.pad_token_id = tokenizer.eos_token_id
 	inference = ed.vInference(
 		model=model,
-		tokenizer=tokenizer,
+		processor_class=tokenizer,
 		generation_config=ed.vInferenceConfig(
 			max_new_tokens=2048,
 			temperature=model.generation_config.temperature,

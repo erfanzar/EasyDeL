@@ -6,16 +6,15 @@ import time
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-import easydel as ed
 # fmt:on
 import jax
 import torch
+import transformers
 from huggingface_hub import HfApi
 from jax import numpy as jnp
 from jax import sharding
 
-import transformers
-
+import easydel as ed
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
@@ -73,7 +72,7 @@ def main():
 
 	inference = ed.vInference(
 		model=model,
-		tokenizer=tokenizer,
+		processor_class=tokenizer,
 		generation_config=ed.vInferenceConfig(
 			max_new_tokens=1024,
 			temperature=0.0,
