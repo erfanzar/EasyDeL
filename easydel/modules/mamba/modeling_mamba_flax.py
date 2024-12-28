@@ -660,10 +660,7 @@ class MambaForCausalLM(EasyDeLBaseModule):
 		return model_kwargs
 
 	def prepare_inputs_for_generation(self, input_ids, max_length, **kwargs):
-		return {
-			"cache": kwargs.get("cache", None),
-			"input_ids": input_ids,
-		}
+		return self.prepare_inputs_for_call(**{"cache": kwargs.get("cache", None)})
 
 	def init_cache(self, batch_size: int, max_length: int):
 		return MambaCache.init_layers_cache(

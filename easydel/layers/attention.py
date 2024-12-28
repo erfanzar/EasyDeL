@@ -1045,29 +1045,16 @@ class FlexibleAttentionModule(nn.Module):
 
 		if bias is not None:
 			if bias.shape[1] == self.num_q_heads:
-				attention_weight = jnp.add(
-					attention_weight,
-					bias.reshape(
-						b,
-						self.num_kv_heads,
-						self.num_q_heads // self.num_kv_heads,
-						qs,
-						ks,
-					),
+				bias = bias.reshape(
+					b, self.num_kv_heads, self.num_q_heads // self.num_kv_heads, qs, ks
 				)
 			elif bias.shape[1] == self.num_kv_heads:
-				attention_weight = jnp.add(
-					attention_weight,
-					bias.reshape(b, self.num_kv_heads, 1, qs, ks),
-				)
+				bias = bias.reshape(b, self.num_kv_heads, 1, qs, ks)
 			elif bias.shape[1] == 1:
-				attention_weight = jnp.add(
-					attention_weight,
-					bias.reshape(b, 1, 1, qs, ks),
-				)
+				bias = bias.reshape(b, 1, 1, qs, ks)
 			else:
 				raise NotImplementedError("bias heads wont match!")
-
+			attention_weight = jnp.add(attention_weight, bias.astype(attention_weight))
 		attention_weight = jax.nn.softmax(attention_weight).astype(self.dtype)
 
 		if not deterministic and self.attention_dropout > 0.0:

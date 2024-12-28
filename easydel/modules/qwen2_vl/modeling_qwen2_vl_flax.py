@@ -14,6 +14,7 @@
 import math
 import typing as tp
 from functools import partial
+import warnings
 
 import chex
 import flax
@@ -43,6 +44,165 @@ from easydel.modules.qwen2_vl.qwen2_vl_configuration import (
 	Qwen2VLConfig,
 	Qwen2VLVisionConfig,
 )
+
+
+# TODO: Convert this to a jitable jax fn and use that inside model instead of precall
+def get_rope_index_numpy(
+	input_ids: np.ndarray,
+	image_grid_thw: tp.Optional[np.ndarray] = None,
+	video_grid_thw: tp.Optional[np.ndarray] = None,
+	attention_mask: tp.Optional[np.ndarray] = None,
+	spatial_merge_size: int = 1,
+	image_token_id: int = -1,
+	video_token_id: int = -1,
+	vision_start_token_id: int = -1,
+) -> tp.Tuple[np.ndarray, np.ndarray]:
+	"""
+	Calculate the 3D rope index based on image and video's temporal, height, and width in LLM.
+
+	Args:
+	    input_ids (`np.ndarray` of shape `(batch_size, sequence_length)`):
+	        Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you provide
+	        it.
+	    image_grid_thw (`np.ndarray` of shape `(num_images, 3)`, *optional*):
+	        The temporal, height, and width of feature shape of each image in LLM.
+	    video_grid_thw (`np.ndarray` of shape `(num_videos, 3)`, *optional*):
+	        The temporal, height, and width of feature shape of each video in LLM.
+	    attention_mask (`np.ndarray` of shape `(batch_size, sequence_length)`, *optional*):
+	        Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
+	        - 1 for tokens that are **not masked**,
+	        - 0 for tokens that are **masked**.
+	    spatial_merge_size (int):
+	        The spatial merge size for vision embeddings.
+	    image_token_id (int):
+	        The token ID representing an image.
+	    video_token_id (int):
+	        The token ID representing a video.
+	    vision_start_token_id (int):
+	        The token ID representing the start of a vision sequence.
+
+	Returns:
+	    position_ids (`np.ndarray` of shape `(3, batch_size, sequence_length)`)
+	    mrope_position_deltas (`np.ndarray` of shape `(batch_size)`)
+	"""
+	if input_ids is not None and (
+		image_grid_thw is not None or video_grid_thw is not None
+	):
+		total_input_ids = input_ids
+		if attention_mask is None:
+			attention_mask = np.ones_like(total_input_ids)
+
+		position_ids = np.ones(
+			(3, input_ids.shape[0], input_ids.shape[1]), dtype=input_ids.dtype
+		)
+		image_index, video_index = 0, 0
+		mrope_position_deltas = []
+
+		for i in range(input_ids.shape[0]):
+			input_ids_masked = input_ids[i][attention_mask[i] == 1]
+			vision_start_indices = np.where(input_ids_masked == vision_start_token_id)[0]
+			vision_tokens = input_ids_masked[vision_start_indices + 1]
+			image_nums = np.sum(vision_tokens == image_token_id)
+			video_nums = np.sum(vision_tokens == video_token_id)
+			input_tokens = input_ids_masked.tolist()
+			llm_pos_ids_list = []
+			st = 0
+			remain_images, remain_videos = image_nums, video_nums
+
+			for _ in range(image_nums + video_nums):
+				if image_token_id in input_tokens and remain_images > 0:
+					ed_image = input_tokens.index(image_token_id, st)
+				else:
+					ed_image = len(input_tokens) + 1
+				if video_token_id in input_tokens and remain_videos > 0:
+					ed_video = input_tokens.index(video_token_id, st)
+				else:
+					ed_video = len(input_tokens) + 1
+				if ed_image < ed_video:
+					t, h, w = (
+						image_grid_thw[image_index][0],
+						image_grid_thw[image_index][1],
+						image_grid_thw[image_index][2],
+					)
+					image_index += 1
+					remain_images -= 1
+					ed = ed_image
+				else:
+					t, h, w = (
+						video_grid_thw[video_index][0],
+						video_grid_thw[video_index][1],
+						video_grid_thw[video_index][2],
+					)
+					video_index += 1
+					remain_videos -= 1
+					ed = ed_video
+				llm_grid_t, llm_grid_h, llm_grid_w = (
+					int(t),
+					int(h) // spatial_merge_size,
+					int(w) // spatial_merge_size,
+				)
+				text_len = ed - st
+
+				st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+				llm_pos_ids_list.append(
+					np.arange(text_len).reshape(1, -1).repeat(3, axis=0) + st_idx
+				)
+
+				t_index = (
+					np.arange(llm_grid_t)
+					.reshape(-1, 1)
+					.repeat(llm_grid_h * llm_grid_w, axis=1)
+					.flatten()
+				)
+				h_index = (
+					np.arange(llm_grid_h)
+					.reshape(1, -1, 1)
+					.repeat(llm_grid_t, axis=0)
+					.repeat(llm_grid_w, axis=2)
+					.flatten()
+				)
+				w_index = (
+					np.arange(llm_grid_w)
+					.reshape(1, 1, -1)
+					.repeat(llm_grid_t, axis=0)
+					.repeat(llm_grid_h, axis=1)
+					.flatten()
+				)
+				llm_pos_ids_list.append(
+					np.stack([t_index, h_index, w_index]) + text_len + st_idx
+				)
+				st = ed + llm_grid_t * llm_grid_h * llm_grid_w
+
+			if st < len(input_tokens):
+				st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+				text_len = len(input_tokens) - st
+				llm_pos_ids_list.append(
+					np.arange(text_len).reshape(1, -1).repeat(3, axis=0) + st_idx
+				)
+
+			llm_positions = np.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
+			position_ids[:, i, attention_mask[i] == 1] = llm_positions
+			mrope_position_deltas.append(llm_positions.max() + 1 - len(total_input_ids[i]))
+
+		mrope_position_deltas = np.array(mrope_position_deltas).reshape(-1, 1)
+		return position_ids, mrope_position_deltas
+	else:
+		if attention_mask is not None:
+			position_ids = np.cumsum(attention_mask, axis=-1) - 1
+			position_ids = np.where(attention_mask == 0, 1, position_ids)
+			position_ids = np.expand_dims(position_ids, axis=0).repeat(3, axis=0)
+			max_position_ids = np.max(position_ids, axis=(0, 2), keepdims=True)
+			mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
+		else:
+			position_ids = (
+				np.arange(input_ids.shape[1])
+				.reshape(1, 1, -1)
+				.repeat(3, axis=0)
+				.repeat(input_ids.shape[0], axis=1)
+			)
+			mrope_position_deltas = np.zeros((input_ids.shape[0], 1), dtype=input_ids.dtype)
+
+		return position_ids, mrope_position_deltas
 
 
 @flax.struct.dataclass
@@ -90,6 +250,30 @@ def create_attention_mask(cu_seqlens, seq_length, dtype):
 
 	attention_mask = jax.lax.dynamic_update_slice(attention_mask, mask_updates, (0, 0, 0))
 	return attention_mask
+
+
+# some of my garbage ideas but they always endup workin
+# TODO: Fix this structure somehow
+@partial(jax.jit, static_argnames=["TKN_ID"])
+def jax_scatter(sec_embeds, ids, fir_embeds, TKN_ID):
+	image_embeds = sec_embeds.astype(fir_embeds.dtype)
+
+	image_indices = (
+		jnp.where(
+			jnp.broadcast_to(
+				jnp.expand_dims(ids == TKN_ID, axis=-1), fir_embeds.shape
+			).reshape(-1),
+			size=fir_embeds.size,
+			fill_value=-1,
+		)[0]
+		+ 1
+	)
+	flatten_emb = fir_embeds.reshape(-1)
+	flatten_img_emb = image_embeds.reshape(-1)[: len(image_indices)]
+	flatten_emb = jnp.pad(flatten_emb, (1, 0))
+	scattered_embeds = flatten_emb.at[image_indices].set(flatten_img_emb)[1:]
+	fir_embeds = scattered_embeds.reshape(fir_embeds.shape)
+	return fir_embeds
 
 
 def precompute_vl_rotary(dim, theta, max_position):
@@ -1068,220 +1252,6 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 	def get_decoder(self):
 		return self.model
 
-	def get_rope_index(
-		self,
-		input_ids: chex.Array,
-		image_grid_thw: tp.Optional[chex.Array] = None,
-		video_grid_thw: tp.Optional[chex.Array] = None,
-		attention_mask: tp.Optional[chex.Array] = None,
-	) -> tp.Tuple[chex.Array, chex.Array]:
-		"""
-		Calculate the 3D rope index based on image and video's temporal, height and width in LLM.
-
-		Returns:
-		    position_ids (`chex.Array` of shape `(3, batch_size, sequence_length)`)
-		    mrope_position_deltas (`chex.Array` of shape `(batch_size)`)
-		"""
-		spatial_merge_size = self.config.vision_config.spatial_merge_size
-		image_token_id = self.config.image_token_id
-		video_token_id = self.config.video_token_id
-		vision_start_token_id = self.config.vision_start_token_id
-		mrope_position_deltas = []
-
-		if input_ids is not None and (
-			image_grid_thw is not None or video_grid_thw is not None
-		):
-			total_input_ids = input_ids
-			if attention_mask is None:
-				attention_mask = jnp.ones_like(total_input_ids)
-
-			position_ids = jnp.ones((3, input_ids.shape[0], input_ids.shape[1]), dtype="i4")
-
-			image_index, video_index = 0, 0
-
-			# Process each sequence in the batch
-			def process_sequence(i, carry):
-				position_ids, image_index, video_index = carry
-
-				# Get masked input ids
-				seq_mask = attention_mask[i] == 1
-				curr_input_ids = input_ids[i][seq_mask]
-
-				# Find vision tokens
-				vision_start_indices = jnp.argwhere(
-					curr_input_ids == vision_start_token_id
-				).squeeze(-1)
-				vision_tokens = curr_input_ids[vision_start_indices + 1]
-
-				image_nums = jnp.sum(vision_tokens == image_token_id)
-				video_nums = jnp.sum(vision_tokens == video_token_id)
-
-				input_tokens = curr_input_ids.tolist()
-				llm_pos_ids_list = []
-				st = 0
-				remain_images, remain_videos = image_nums, video_nums
-
-				def process_token(state):
-					(
-						st,
-						remain_images,
-						remain_videos,
-						image_index,
-						video_index,
-						llm_pos_ids_list,
-					) = state
-
-					# Find next image and video positions
-					ed_image = (
-						input_tokens.index(image_token_id, st)
-						if image_token_id in input_tokens[st:] and remain_images > 0
-						else len(input_tokens) + 1
-					)
-					ed_video = (
-						input_tokens.index(video_token_id, st)
-						if video_token_id in input_tokens[st:] and remain_videos > 0
-						else len(input_tokens) + 1
-					)
-
-					# Determine which token type we found
-					if ed_image < ed_video:
-						t, h, w = (
-							image_grid_thw[image_index][0],
-							image_grid_thw[image_index][1],
-							image_grid_thw[image_index][2],
-						)
-						image_index += 1
-						remain_images -= 1
-						ed = ed_image
-					else:
-						t, h, w = (
-							video_grid_thw[video_index][0],
-							video_grid_thw[video_index][1],
-							video_grid_thw[video_index][2],
-						)
-						video_index += 1
-						remain_videos -= 1
-						ed = ed_video
-
-					# Calculate grid dimensions
-					llm_grid_t = int(t)
-					llm_grid_h = int(h) // spatial_merge_size
-					llm_grid_w = int(w) // spatial_merge_size
-					text_len = ed - st
-
-					# Calculate starting index
-					st_idx = jnp.max(llm_pos_ids_list[-1]) + 1 if len(llm_pos_ids_list) > 0 else 0
-
-					# Create position ids for text
-					text_pos_ids = jnp.arange(text_len)[None, :].repeat(3, axis=0) + st_idx
-					llm_pos_ids_list.append(text_pos_ids)
-
-					# Create position ids for vision tokens
-					t_index = (
-						jnp.arange(llm_grid_t)[:, None]
-						.repeat(llm_grid_h * llm_grid_w, axis=1)
-						.flatten()
-					)
-					h_index = (
-						jnp.arange(llm_grid_h)[None, :, None]
-						.repeat(llm_grid_t, axis=0)
-						.repeat(llm_grid_w, axis=2)
-						.flatten()
-					)
-					w_index = (
-						jnp.arange(llm_grid_w)[None, None, :]
-						.repeat(llm_grid_t, axis=0)
-						.repeat(llm_grid_h, axis=1)
-						.flatten()
-					)
-
-					vision_pos_ids = jnp.stack([t_index, h_index, w_index]) + text_len + st_idx
-					llm_pos_ids_list.append(vision_pos_ids)
-
-					new_st = ed + llm_grid_t * llm_grid_h * llm_grid_w
-					return (
-						new_st,
-						remain_images,
-						remain_videos,
-						image_index,
-						video_index,
-						llm_pos_ids_list,
-					)
-
-				# Process all vision tokens
-				for _ in range(image_nums + video_nums):
-					(
-						st,
-						remain_images,
-						remain_videos,
-						image_index,
-						video_index,
-						llm_pos_ids_list,
-					) = process_token(
-						(
-							st,
-							remain_images,
-							remain_videos,
-							image_index,
-							video_index,
-							llm_pos_ids_list,
-						)
-					)
-
-				# Handle remaining text
-				if st < len(input_tokens):
-					st_idx = jnp.max(llm_pos_ids_list[-1]) + 1 if len(llm_pos_ids_list) > 0 else 0
-					text_len = len(input_tokens) - st
-					final_text_pos_ids = jnp.arange(text_len)[None, :].repeat(3, axis=0) + st_idx
-					llm_pos_ids_list.append(final_text_pos_ids)
-
-				# Combine all position ids
-				llm_positions = jnp.concatenate(llm_pos_ids_list, axis=1)
-				position_ids = position_ids.at[..., i, seq_mask].set(llm_positions)
-
-				# Calculate position delta
-				mrope_position_delta = llm_positions.max() + 1 - len(total_input_ids[i])
-
-				return position_ids, image_index, video_index, mrope_position_delta
-
-			# Process all sequences in batch
-			position_ids_list = []
-			mrope_deltas = []
-			for i in range(len(total_input_ids)):
-				position_ids, image_index, video_index, delta = process_sequence(
-					i, (position_ids, image_index, video_index)
-				)
-				position_ids_list.append(position_ids)
-				mrope_deltas.append(delta)
-
-			position_ids = position_ids_list[-1]  # Take final state
-			mrope_position_deltas = jnp.array(mrope_deltas)[:, None]
-
-			return position_ids, mrope_position_deltas
-
-		else:
-			# Handle case without vision inputs
-			if attention_mask is not None:
-				position_ids = jnp.cumsum(attention_mask, axis=-1) - 1
-				position_ids = jnp.where(attention_mask == 0, 1, position_ids)
-				position_ids = position_ids[None, :, :].repeat(3, axis=0)
-
-				max_position_ids = jnp.max(
-					jnp.max(position_ids, axis=0), axis=-1, keepdims=True
-				)
-				mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
-			else:
-				position_ids = (
-					jnp.arange(input_ids.shape[1])[None, None, :]
-					.repeat(3, axis=0)
-					.repeat(input_ids.shape[0], axis=1)
-				)
-				mrope_position_deltas = jnp.zeros(
-					(input_ids.shape[0], 1), dtype=input_ids.dtype
-				)
-
-			return position_ids, mrope_position_deltas
-
 	def __call__(
 		self,
 		input_ids: chex.Array = None,
@@ -1323,19 +1293,12 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 					grid_thw=np.array(image_grid_thw),
 					max_grid_size=image_max_grid_size,
 				)
-				image_mask = input_ids == self.config.image_token_id
-				image_mask = jnp.expand_dims(image_mask, axis=-1)
-				image_mask = jnp.broadcast_to(image_mask, inputs_embeds.shape)
-
-				image_embeds = image_embeds.astype(inputs_embeds.dtype)
-
-				image_indices = jnp.where(image_mask.reshape(-1))[0]
-				scattered_embeds = (
-					inputs_embeds.reshape(-1)
-					.at[image_indices]
-					.set(image_embeds.reshape(-1)[: len(image_indices)])
+				inputs_embeds = jax_scatter(
+					image_embeds,
+					input_ids,
+					inputs_embeds,
+					self.config.image_token_id,
 				)
-				inputs_embeds = scattered_embeds.reshape(inputs_embeds.shape)
 
 			if pixel_values_videos is not None:
 				pixel_values_videos = pixel_values_videos.astype(self.visual.get_dtype())
@@ -1345,17 +1308,12 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 					max_grid_size=video_max_grid_size,
 				)
 
-				video_mask = input_ids == self.config.video_token_id
-				video_mask = jnp.expand_dims(video_mask, axis=-1)
-				video_mask = jnp.broadcast_to(video_mask, inputs_embeds.shape)
-				video_mask = video_mask.astype(inputs_embeds.dtype)
-				video_indices = jnp.where(video_mask.reshape(-1))[0]
-				scattered_embeds = (
-					video_embeds.reshape(-1)
-					.at[video_indices]
-					.set(image_embeds.reshape(-1)[: len(video_indices)])
+				inputs_embeds = jax_scatter(
+					video_embeds,
+					input_ids,
+					inputs_embeds,
+					self.config.video_token_id,
 				)
-				video_embeds = scattered_embeds.reshape(video_embeds.shape)
 
 		if (
 			position_ids is None
@@ -1363,11 +1321,19 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 			and (attention_mask is None or attention_mask.ndim == 2)
 		):
 			if past_key_values is not None or rope_deltas is None:
-				position_ids, rope_deltas = self.get_rope_index(
-					input_ids,
-					image_grid_thw,
-					video_grid_thw,
-					attention_mask,
+				warnings.warn(
+					"You shouldn't be here (make sure to call `prepare_inputs_for_call`)",
+					stacklevel=1,
+				)
+				position_ids, rope_deltas = get_rope_index_numpy(
+					input_ids=input_ids,
+					image_grid_thw=image_grid_thw,
+					video_grid_thw=video_grid_thw,
+					attention_mask=attention_mask,
+					spatial_merge_size=self.visual.spatial_merge_size,
+					image_token_id=self.config.image_token_id,
+					video_token_id=self.config.video_token_id,
+					vision_start_token_id=self.config.vision_start_token_id,
 				)
 			else:
 				batch_size, sequence_length = inputs_embeds.shape[:2]
@@ -1432,7 +1398,7 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 				"video_grid_thw": video_grid_thw,
 			}
 		)
-		return model_inputs
+		return self.prepare_inputs_for_call(**model_inputs)
 
 	def prepare_inputs_for_call(
 		self,
@@ -1451,13 +1417,40 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 			if video_max_grid_size is None:
 				video_max_grid_size = int(np.max(video_grid_thw[:, 1:]).item())
 			video_grid_thw = tuple(map(tuple, np.asarray(video_grid_thw)))
-
+		attention_mask = others.get("attention_mask", None)
+		rope_deltas = others.get("rope_deltas", None)
+		position_ids = others.get("position_ids", None)
+		if (
+			position_ids is None
+			and others.get("input_ids", None) is not None
+			and (attention_mask is None or attention_mask.ndim == 2)
+		):
+			if (
+				others.get("past_key_values", None) is not None
+				or others.get("rope_deltas", None) is None
+			):
+				position_ids, rope_deltas = get_rope_index_numpy(
+					input_ids=others.get("input_ids"),
+					image_grid_thw=image_grid_thw,
+					video_grid_thw=video_grid_thw,
+					attention_mask=attention_mask,
+					spatial_merge_size=self.visual.spatial_merge_size,
+					image_token_id=self.config.image_token_id,
+					video_token_id=self.config.video_token_id,
+					vision_start_token_id=self.config.vision_start_token_id,
+				)
+			else:
+				batch_size, sequence_length = others.get("input_ids").shape
+				position_ids = jnp.arange(sequence_length).reshape(1, -1).repeat(batch_size, 0)
+				position_ids = jnp.expand_dims(position_ids, 0).repeat(3, 0)
 		others.update(
 			dict(
 				video_max_grid_size=video_max_grid_size,
 				image_max_grid_size=image_max_grid_size,
 				video_grid_thw=video_grid_thw,
 				image_grid_thw=image_grid_thw,
+				position_ids=position_ids,
+				rope_deltas=rope_deltas,
 			)
 		)
 		return others

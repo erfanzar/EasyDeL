@@ -901,7 +901,7 @@ class Mamba2ForCausalLM(EasyDeLBaseModule):
 				"cache_position": cache_position,
 			}
 		)
-		return model_inputs
+		return self.prepare_inputs_for_call(model_inputs)
 
 	def update_inputs_for_generation(self, model_outputs, model_kwargs):
 		model_outputs.cache_params.update_seq(1)

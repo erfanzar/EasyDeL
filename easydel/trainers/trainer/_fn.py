@@ -44,10 +44,11 @@ def create_training_step(
 		def loss_fn(tree):
 			module = state.merge(tree)
 			module.train()
+			call_batch = module.prepare_inputs_for_call(**batch)
 			outputs, metrics = module.compute_loss(
-				labels=batch.pop("labels", None),
+				labels=call_batch.pop("labels", None),
 				loss_config=loss_config,
-				**batch,  # Passed directly to Model
+				**call_batch,  # Passed directly to Model
 			)
 
 			return outputs.loss, metrics
