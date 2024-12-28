@@ -326,8 +326,7 @@ def create_sampling_step(
 			(0, state.current_length),
 		)
 		next_model_kwargs = model.update_inputs_for_generation(
-			model_outputs,
-			state.model_kwargs,
+			model_outputs, state.model_kwargs
 		)
 
 		return SampleState(

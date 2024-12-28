@@ -56,7 +56,7 @@ def setup_inference():
 
 	inference = ed.vInference(
 		model=model,
-		tokenizer=tokenizer,
+		processor_class=tokenizer,
 		generation_config=ed.vInferenceConfig(
 			max_new_tokens=512,
 			temperature=model.generation_config.temperature,

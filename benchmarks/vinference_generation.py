@@ -48,7 +48,7 @@ async def main():
 	tokenizer.pad_token_id = tokenizer.eos_token_id
 	inference = ed.vInference(
 		model=model,
-		tokenizer=tokenizer,
+		processor_class=tokenizer,
 		generation_config=ed.vInferenceConfig(
 			max_new_tokens=1024,
 			temperature=model.generation_config.temperature,

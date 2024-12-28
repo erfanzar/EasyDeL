@@ -502,3 +502,20 @@ class AutoEasyDeLModelForSeq2SeqLM(BaseAutoEasyModel):
 
 class AutoStateForSeq2SeqLM(BaseAutoEasyState):
 	_base = AutoEasyDeLModelForSeq2SeqLM
+
+
+class AutoEasyDeLModelForImageTextToText(BaseAutoEasyModel):
+	"""
+	This class provides a convenient way to load and shard pretrained  models from the Hugging Face Hub
+	and convert them into EasyDeL compatible models. It utilizes the EasyDeL library for distributed training and inference
+	with JAX.
+
+	This class inherits from the `EasyDeLBaseModule` class, providing functionalities for model loading,
+	parameter sharding, and interaction with the EasyDeL framework.
+	"""
+
+	model_task: TaskType = TaskType.IMAGE_TEXT_TO_TEXT  # Static
+
+
+class AutoStateForImageTextToText(BaseAutoEasyState):
+	_base = AutoEasyDeLModelForImageTextToText

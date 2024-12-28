@@ -107,11 +107,13 @@ from .modules.arctic import (
 from .modules.auto import (
 	AutoEasyDeLConfig,
 	AutoEasyDeLModelForCausalLM,
+	AutoEasyDeLModelForImageTextToText,
 	AutoEasyDeLModelForSeq2SeqLM,
 	AutoEasyDeLModelForSpeechSeq2Seq,
 	AutoEasyDeLModelForZeroShotImageClassification,
 	AutoShardAndGatherFunctions,
 	AutoStateForCausalLM,
+	AutoStateForImageTextToText,
 	AutoStateForSeq2SeqLM,
 	AutoStateForSpeechSeq2Seq,
 	AutoStateForZeroShotImageClassification,

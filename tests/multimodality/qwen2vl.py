@@ -1,17 +1,38 @@
-from functools import partial
+# fmt:off
+import os
+import sys
+import threading
+
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+import easydel as ed
 import time
+from functools import partial
 
 import flax
 import flax.nnx
+
+# fmt:on
 import jax
 import torch
+from huggingface_hub import HfApi
 from jax import numpy as jnp
+from jax import sharding
 from qwen_vl_utils import process_vision_info
-from transformers import AutoProcessor
+from transformers import AutoProcessor, Qwen2VLProcessor
 from transformers import Qwen2VLForConditionalGeneration as hfmodel_cond
-from transformers import Qwen2VLModel as hfmodel
 
-import easydel as ed
+
+PartitionSpec, api = sharding.PartitionSpec, HfApi()
+
+
+def log_mem():
+	while True:
+		ed.utils.analyze_memory.SMPMemoryMonitor(5).print_current_status()
+		time.sleep(5)
+
+
+threading.Thread(target=log_mem)  # .start()
 
 
 def to_np(x):
@@ -50,7 +71,7 @@ def print_errors(left, right, prefix="", n_diff=5):
 	print("\n" + "=" * (len(prefix) + 20))
 
 
-def cond():
+def comparing_torch_to_easydel():
 	config = ed.Qwen2VLConfig(
 		hidden_size=256,
 		intermediate_size=256,
@@ -137,15 +158,11 @@ def cond():
 		add_generation_prompt=True,
 	)
 	image_inputs, video_inputs = process_vision_info(messages)
-
-	hf_res = hfm(
-		**processor(
-			text=[text],
-			images=image_inputs,
-			videos=video_inputs,
-			padding=True,
-			return_tensors="pt",
-		),
+	processor_kw = dict(
+		images=image_inputs,
+		videos=video_inputs,
+		padding="max_length",
+		max_length=2048,
 	)
 
 	@partial(jax.jit, static_argnames=model.static_arguments)
@@ -155,11 +172,16 @@ def cond():
 	inputs = model.prepare_inputs_for_call(
 		**processor(
 			text=[text],
-			images=image_inputs,
-			videos=video_inputs,
-			padding=True,
+			**processor_kw,
 			return_tensors="np",
 		)
+	)
+	hf_res = hfm(
+		**processor(
+			text=[text],
+			**processor_kw,
+			return_tensors="pt",
+		),
 	)
 
 	res = call(**inputs)
@@ -182,45 +204,7 @@ def cond():
 	# =============================
 
 
-def module():
-	config = ed.Qwen2VLConfig(
-		hidden_size=256,
-		intermediate_size=256,
-		num_hidden_layers=2,
-		num_attention_heads=2,
-		num_key_value_heads=2,
-		rope_scaling={"type": "mrope", "mrope_section": [16, 24, 24]},
-	)
-
-	hfm = hfmodel(config)
-	_, _, transform_function = ed.get_modules_by_type("qwen2_vl", ed.TaskType.BASE_MODULE)
-	model_tree = transform_function(
-		state_dict=hfm.state_dict(),
-		device=jax.devices("cpu")[0],
-		remove_state_dict=True,
-	)
-
-	model = ed.Qwen2VLModel.lazy_init(
-		config=config,
-		dtype=jnp.float16,
-		param_dtype=jnp.float16,
-		rngs=flax.nnx.Rngs(0),
-	)
-	model = ed.traversals.merge_model_and_tree(model, model_tree)
-	print(model)
-	hf_res = hfm(torch.ones(1, 64, dtype=torch.int32))
-	res = model(jnp.ones((1, 64), "i4"), return_dict=True)
-	print(
-		jnp.allclose(
-			hf_res.last_hidden_state.cpu().detach().numpy(),
-			res.last_hidden_state,
-			rtol=0.0,
-			atol=0.125,
-		)
-	)
-
-
-def gen():
+def generate():
 	model = hfmodel_cond.from_pretrained(
 		"Qwen/Qwen2-VL-2B-Instruct",
 		torch_dtype=torch.bfloat16,
@@ -236,17 +220,29 @@ def gen():
 		max_pixels=max_pixels,
 	)
 
+	# messages = [
+	#   {
+	#     "role": "user",
+	#     "content": [
+	#       {
+	#         "type": "image",
+	#         "image": "https://picsum.photos/seed/picsum/200/300",
+	#       },
+	#       {"type": "text", "text": "what are these metrics indication exacly"},
+	#     ],
+	#   }
+	# ]
 	messages = [
+		{"role": "system", "content": "You are a helpful AI assistant."},
 		{
 			"role": "user",
-			"content": [
-				{
-					"type": "image",
-					"image": "https://picsum.photos/seed/picsum/200/300",
-				},
-				{"type": "text", "text": "what are these metrics indication exacly"},
-			],
-		}
+			"content": "Can you provide ways to eat combinations of bananas and dragonfruits?",
+		},
+		{
+			"role": "assistant",
+			"content": "Sure! Here are some ways to eat bananas and dragonfruits together: 1. Banana and dragonfruit smoothie: Blend bananas and dragonfruits together with some milk and honey. 2. Banana and dragonfruit salad: Mix sliced bananas and dragonfruits together with some lemon juice and honey.",
+		},
+		{"role": "user", "content": "What about solving an 2x + 3 = 7 equation?"},
 	]
 
 	text = processor.apply_chat_template(
@@ -260,14 +256,13 @@ def gen():
 		text=[text],
 		images=image_inputs,
 		videos=video_inputs,
-		padding=True,
+		max_length=512,
+		padding="max_length",
 		return_tensors="pt",
 	)
 	inputs = inputs.to("cuda")
 	for k, v in inputs.items():
 		print(k, v.shape)
-	print(inputs["image_grid_thw"])
-
 	start = time.time()
 	generated_ids = model.generate(**inputs, max_new_tokens=64)
 	generated_ids_trimmed = [
@@ -283,6 +278,112 @@ def gen():
 	print(output_text[0])
 
 
+def easydel_generate():
+	sharding_axis_dims = (1, 1, 1, -1)
+	max_length = 512
+
+	pretrained_model_name_or_path = "Qwen/Qwen2-VL-2B-Instruct"
+	dtype = jnp.float16
+	partition_axis = ed.PartitionAxis()
+
+	dtype = jnp.float16
+
+	model = ed.AutoEasyDeLModelForImageTextToText.from_pretrained(
+		pretrained_model_name_or_path,
+		auto_shard_model=True,
+		sharding_axis_dims=sharding_axis_dims,
+		config_kwargs=ed.EasyDeLBaseConfigDict(
+			freq_max_position_embeddings=max_length,
+			mask_max_position_embeddings=max_length,
+			attn_dtype=dtype,
+			gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
+			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+			attn_mechanism=ed.AttentionMechanisms.VANILLA,
+		),
+		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+		platform=ed.EasyDeLPlatforms.TRITON,
+		param_dtype=jnp.float16,  # float8_e4m3fn,
+		dtype=dtype,
+		torch_dtype=torch.float16,
+		partition_axis=partition_axis,
+		precision=jax.lax.Precision("fastest"),
+	)
+
+	min_pixels = 256 * 28 * 28
+	max_pixels = min_pixels
+
+	processor: Qwen2VLProcessor = AutoProcessor.from_pretrained(
+		pretrained_model_name_or_path,
+		min_pixels=min_pixels,
+		max_pixels=max_pixels,
+	)
+	processor.padding_side = "left"
+	processor.eos_token_id = processor.tokenizer.eos_token_id
+	processor.pad_token_id = processor.tokenizer.pad_token_id
+
+	model.eval()
+	inference = ed.vInference(
+		model=model,
+		processor_class=processor,
+		generation_config=ed.vInferenceConfig(
+			max_new_tokens=128,
+			temperature=0.0,
+			do_sample=False,
+			top_p=0.95,
+			top_k=10,
+			eos_token_id=model.generation_config.eos_token_id,
+			streaming_chunks=32,
+		),
+	)
+
+	print(model.model_task)
+	print(model.model_type)
+	print("Compiling")
+	inference.precompile(1, inference.model_prefill_length)
+	print("Done Compiling")
+
+	messages = [
+		{"role": "system", "content": "You are a helpful AI assistant."},
+		{
+			"role": "user",
+			"content": "Can you provide ways to eat combinations of bananas and dragonfruits?",
+		},
+		{
+			"role": "assistant",
+			"content": "Sure! Here are some ways to eat bananas and dragonfruits together: 1. Banana and dragonfruit smoothie: Blend bananas and dragonfruits together with some milk and honey. 2. Banana and dragonfruit salad: Mix sliced bananas and dragonfruits together with some lemon juice and honey.",
+		},
+		{"role": "user", "content": "What about solving an 2x + 3 = 7 equation?"},
+	]
+	image_inputs, video_inputs = process_vision_info(messages)
+
+	pad_seq = inference.model_prefill_length
+	ids = processor(
+		text=[processor.apply_chat_template(messages, add_generation_prompt=True)],
+		images=image_inputs,
+		videos=video_inputs,
+		max_length=pad_seq,
+		padding="max_length",
+		return_tensors="jax",
+	)
+	print("Start Generation Process.")
+	with jax.profiler.trace("tmp-files/vinference"):
+		for response in inference.generate(**ids):
+			next_slice = slice(
+				pad_seq,
+				pad_seq + inference.generation_config.streaming_chunks,
+			)
+			pad_seq += inference.generation_config.streaming_chunks
+			print(
+				processor.decode(response.sequences[0][next_slice], skip_special_tokens=True),
+				end="",
+			)
+
+		print()
+		print(response.generated_tokens)
+		print("TPS :", response.tokens_pre_second)
+
+
 if __name__ == "__main__":
-	# module()
-	cond()
+	# comparing_torch_to_easydel()
+	# generate()
+	easydel_generate()
