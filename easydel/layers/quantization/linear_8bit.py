@@ -13,13 +13,14 @@
 # limitations under the License.
 from __future__ import annotations
 
+from functools import partial
 import typing as tp
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 from flax.nnx import rnglib
-from flax.nnx.nn import dtypes, initializers
+from flax.nnx.nn import initializers
 from flax.typing import (
 	DotGeneralT,
 	Dtype,
@@ -33,7 +34,6 @@ from .base_quant import QauntModule
 Array = jax.Array
 Axis = int
 Size = int
-
 
 default_kernel_init = initializers.lecun_normal()
 default_bias_init = initializers.zeros_init()
@@ -63,6 +63,88 @@ def dequantize_8bit(quants, scales):
 	"""
 	dequantized = quants * scales
 	return dequantized
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(2,))
+def quantized_matmul(x, weight, transpose_weight=False):
+	"""
+	Forward pass for 8-bit quantized matrix multiplication.
+	Args:
+	    x: Input tensor
+	    weight: Tuple of (quantized_weights, scales)
+	    transpose_weight: Whether to transpose the weight matrix
+	"""
+	qweight, qscale = weight
+	# Dequantize weights
+	dequantized = dequantize_8bit(qweight, qscale)
+
+	if transpose_weight:
+		dequantized = dequantized.T
+
+	return jnp.matmul(x, dequantized)
+
+
+def quantized_matmul_fwd(x, weight, transpose_weight):
+	"""Forward pass that saves required values for backward pass."""
+	qweight, qscale = weight
+	# Dequantize weights for forward computation
+	dequantized = dequantize_8bit(qweight, qscale)
+
+	if transpose_weight:
+		dequantized = dequantized.T
+
+	# Compute output
+	out = jnp.matmul(x, dequantized)
+
+	# Save values needed for backward pass
+	saved = (x, qweight, qscale, dequantized, transpose_weight)
+	return out, saved
+
+
+def quantized_matmul_bwd(transpose_weight, res, grad_output):
+	"""
+	Backward pass computing gradients for quantized matrix multiplication.
+	Args:
+	    transpose_weight: Whether weight matrix was transposed
+	    res: Saved values from forward pass
+	    grad_output: Gradient of loss with respect to output
+	"""
+	x, qweight, qscale, dequantized, _ = res
+
+	# Gradient with respect to input x
+	if transpose_weight:
+		grad_x = jnp.matmul(grad_output, dequantized.T)
+	else:
+		grad_x = jnp.matmul(grad_output, dequantized)
+
+	# Gradient with respect to quantized weights and scales
+	if transpose_weight:
+		grad_dequant = jnp.matmul(grad_output.T, x)
+	else:
+		grad_dequant = jnp.matmul(x.T, grad_output)
+
+		# Optimize gradient calculation for scales
+	abs_qweight = jnp.abs(qweight)
+
+	# Calculate scaling factors more efficiently
+	scale_grad_factor = jnp.where(
+		abs_qweight > 0, qweight.astype(grad_dequant.dtype) / (127.0 * abs_qweight), 0.0
+	)
+
+	# Compute gradients for scaling factors using einsum for better performance
+	grad_qscale = jnp.einsum("ij,ij->i", grad_dequant, scale_grad_factor)[:, jnp.newaxis]
+
+	# Compute gradients for quantized weights, avoiding clipping here
+	grad_qweight = grad_dequant * qscale
+
+	# Pack gradients for weight tuple
+	grad_weight = (grad_qweight, grad_qscale)
+
+	return grad_x, grad_weight
+
+
+# Register the custom VJP (Vector-Jacobian Product) rules
+quantized_matmul.defvjp(quantized_matmul_fwd, quantized_matmul_bwd)
 
 
 class Linear8bit(QauntModule):
@@ -222,29 +304,15 @@ class Linear8bit(QauntModule):
 
 	@jax.named_scope("easydel-linear-8bit-call")
 	def __call__(self, inputs: Array) -> Array:
-		"""Applies a quantized linear transformation to the inputs along the last dimension."""
-		# Dequantize the kernel for computation
-		kernel = self._dequantize_kernel()
-		assert (
-			kernel is not None
-		), "loaded and dequantized kernel is None, which means it have been loaded from another None Kernel Linear"
-		bias = self.bias.value
-
-		inputs, kernel, bias = dtypes.promote_dtype(
-			(inputs, kernel, bias), dtype=self.dtype
-		)
-
-		y = self.dot_general(
+		"""Forward pass using custom gradient computation."""
+		out = quantized_matmul(
 			inputs,
-			kernel,
-			(((inputs.ndim - 1,), (0,)), ((), ())),
-			precision=self.precision,
+			(self.kernel.value, self.scales.value),
+			transpose_weight=False,
 		)
-
-		assert self.use_bias == (bias is not None)
-		if bias is not None:
-			y += jnp.reshape(bias, (1,) * (y.ndim - 1) + (-1,))
-		return y
+		if self.use_bias:
+			out = out + self.bias.value
+		return out
 
 	def get_kernel(self):
 		"""Get the dequantized kernel weights."""
