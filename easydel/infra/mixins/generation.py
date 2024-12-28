@@ -193,11 +193,13 @@ class EasyGenerationMixin:
 				(batch_size, seq_length),
 			)
 
-		return {
-			"past_key_values": past_key_values,
-			"attention_mask": extended_attention_mask,
-			"position_ids": position_ids,
-		}
+		return self.prepare_inputs_for_call(
+			**{
+				"past_key_values": past_key_values,
+				"attention_mask": extended_attention_mask,
+				"position_ids": position_ids,
+			}
+		)
 
 	def update_inputs_for_generation(self, model_outputs, model_kwargs):
 		model_kwargs["past_key_values"] = model_outputs.past_key_values

@@ -1,3 +1,4 @@
+from functools import partial
 import time
 
 import flax
@@ -11,11 +12,6 @@ from transformers import Qwen2VLForConditionalGeneration as hfmodel_cond
 from transformers import Qwen2VLModel as hfmodel
 
 import easydel as ed
-from easydel.modules.qwen2_vl import (
-	Qwen2VLConfig,
-	Qwen2VLForConditionalGeneration,
-	Qwen2VLModel,
-)
 
 
 def to_np(x):
@@ -55,7 +51,7 @@ def print_errors(left, right, prefix="", n_diff=5):
 
 
 def cond():
-	config = Qwen2VLConfig(
+	config = ed.Qwen2VLConfig(
 		hidden_size=256,
 		intermediate_size=256,
 		num_hidden_layers=2,
@@ -87,13 +83,11 @@ def cond():
 		remove_state_dict=True,
 	)
 
-	model = flax.nnx.eval_shape(
-		lambda: Qwen2VLForConditionalGeneration(
-			config=config,
-			dtype=jnp.float16,
-			param_dtype=jnp.float16,
-			rngs=flax.nnx.Rngs(0),
-		)
+	model = ed.Qwen2VLForConditionalGeneration.lazy_init(
+		config=config,
+		dtype=jnp.float16,
+		param_dtype=jnp.float16,
+		rngs=flax.nnx.Rngs(0),
 	)
 
 	model = ed.traversals.merge_model_and_tree(model, model_tree)
@@ -111,7 +105,7 @@ def cond():
 			"content": [
 				{
 					"type": "image",
-					"image": "/home/erfan/Pictures/Screenshots/Screenshot from 2024-12-23 18-08-55.png",
+					"image": "https://picsum.photos/seed/picsum/200/300",
 				},
 				{"type": "text", "text": "what are these metrics indication exacly"},
 			],
@@ -121,7 +115,7 @@ def cond():
 			"content": [
 				{
 					"type": "image",
-					"image": "/home/erfan/Pictures/Screenshots/Screenshot from 2024-12-23 18-08-55.png",
+					"image": "https://picsum.photos/seed/picsum/200/300",
 				},
 				{"type": "text", "text": "Check Rope"},
 			],
@@ -131,7 +125,7 @@ def cond():
 			"content": [
 				{
 					"type": "image",
-					"image": "/home/erfan/Pictures/Screenshots/Screenshot from 2024-12-23 18-08-55.png",
+					"image": "https://picsum.photos/seed/picsum/200/300",
 				},
 				{"type": "text", "text": "Check Rope 2"},
 			],
@@ -153,14 +147,10 @@ def cond():
 			return_tensors="pt",
 		),
 	)
-	print(model.static_arguments)
 
-	# @partial(jax.jit, static_argnames=model.static_arguments)
+	@partial(jax.jit, static_argnames=model.static_arguments)
 	def call(**kwr):
-		return model(
-			**kwr,
-			return_dict=True,
-		)
+		return model(**kwr, return_dict=True)
 
 	inputs = model.prepare_inputs_for_call(
 		**processor(
@@ -193,7 +183,7 @@ def cond():
 
 
 def module():
-	config = Qwen2VLConfig(
+	config = ed.Qwen2VLConfig(
 		hidden_size=256,
 		intermediate_size=256,
 		num_hidden_layers=2,
@@ -210,13 +200,11 @@ def module():
 		remove_state_dict=True,
 	)
 
-	model = flax.nnx.eval_shape(
-		lambda: Qwen2VLModel(
-			config=config,
-			dtype=jnp.float16,
-			param_dtype=jnp.float16,
-			rngs=flax.nnx.Rngs(0),
-		)
+	model = ed.Qwen2VLModel.lazy_init(
+		config=config,
+		dtype=jnp.float16,
+		param_dtype=jnp.float16,
+		rngs=flax.nnx.Rngs(0),
 	)
 	model = ed.traversals.merge_model_and_tree(model, model_tree)
 	print(model)
@@ -233,7 +221,7 @@ def module():
 
 
 def gen():
-	model = Qwen2VLForConditionalGeneration.from_pretrained(
+	model = hfmodel_cond.from_pretrained(
 		"Qwen/Qwen2-VL-2B-Instruct",
 		torch_dtype=torch.bfloat16,
 		attn_implementation="sdpa",
@@ -254,7 +242,7 @@ def gen():
 			"content": [
 				{
 					"type": "image",
-					"image": "/home/erfan/Pictures/Screenshots/Screenshot from 2024-12-23 18-08-55.png",
+					"image": "https://picsum.photos/seed/picsum/200/300",
 				},
 				{"type": "text", "text": "what are these metrics indication exacly"},
 			],
