@@ -18,10 +18,11 @@
 import typing as tp
 import warnings
 
+from jax.sharding import PartitionSpec
+
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
-from jax.sharding import PartitionSpec
 
 DBRX_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 

@@ -13,8 +13,9 @@
 # limitations under the License.
 
 
-from easydel.infra.base_module import EasyDeLBaseConfig
 from jax.sharding import PartitionSpec
+
+from easydel.infra.base_module import EasyDeLBaseConfig
 
 
 class Qwen2VLVisionConfig(EasyDeLBaseConfig):

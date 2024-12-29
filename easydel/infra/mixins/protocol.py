@@ -45,8 +45,9 @@ _CP = tp.Type[EasyDeLBaseConfig]
 _T = tp.TypeVar("_T")
 
 if tp.TYPE_CHECKING:
-	from easydel.etils.easystate import EasyDeLState
 	from transformers import PreTrainedModel
+
+	from easydel.etils.easystate import EasyDeLState
 else:
 	EasyDeLState = tp.Any
 	PreTrainedModel = tp.Any

@@ -41,7 +41,7 @@ def create_training_step(
 	) -> tp.Tuple[EasyDeLState, jax.Array, LossMetrics]:
 		batch_size = batch[list(batch.keys())[0]].shape[0]
 		minibatch_size = batch_size // gradient_accumulation_steps
-		
+
 		assert minibatch_size * gradient_accumulation_steps == batch_size
 		batch = with_sharding_constraint(batch, partition_spec)
 

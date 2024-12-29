@@ -22,7 +22,7 @@ import jax.tree_util
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.experimental.mesh_utils import create_device_mesh
-from jax.sharding import Mesh, PartitionSpec
+from jax.sharding import Mesh
 from transformers.configuration_utils import PretrainedConfig
 
 from easydel.etils.etils import (

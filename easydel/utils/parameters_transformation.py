@@ -22,14 +22,17 @@ from fjformer.checkpoint import get_dtype
 from jax import dlpack
 from jax import numpy as jnp
 from tqdm.autonotebook import tqdm
+
 from easydel.etils.etils import get_logger
+
 from .analyze_memory import SMPMemoryMonitor
 from .traversals import flatten_dict, unflatten_dict
 
 if tp.TYPE_CHECKING:
 	from transformers import PreTrainedModel
-	from easydel.infra.base_module import EasyDeLBaseModule
+
 	from easydel.infra.base_config import EasyDeLBaseConfig
+	from easydel.infra.base_module import EasyDeLBaseModule
 
 else:
 	PreTrainedModel = tp.Any

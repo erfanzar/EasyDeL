@@ -38,6 +38,7 @@ from pydantic import BaseModel
 
 from easydel.etils.etils import get_logger
 from easydel.infra import EasyDeLBaseModule
+from easydel.infra.utils import ProcessingClassType
 from easydel.utils.compiling_utils import (
 	load_compiled_fn,
 	save_compiled_fn,
@@ -56,8 +57,6 @@ from ._fn import (
 	put_compiled_funcs,
 )
 from .metrics import vInferenceMetrics
-
-from easydel.infra.utils import ProcessingClassType
 
 logger = get_logger(__name__)
 TIME = str(datetime.fromtimestamp(time.time())).split(" ")[0]
