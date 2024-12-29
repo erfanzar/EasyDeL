@@ -254,7 +254,8 @@ class Trainer(BaseTrainer):
 					else self.arguments.learning_rate,
 					epoch=epoch,
 					flops_per_device=getattr(self, "_flops_per_device", 0),
-					batch_size=self.arguments.total_batch_size,
+					batch_size=self.arguments.total_batch_size
+					* self.arguments.gradient_accumulation_steps,
 					seq_length=self.arguments.max_sequence_length,
 					mean_loss=mean_loss,
 					mean_accuracy=mean_accuracy,
@@ -315,7 +316,8 @@ class Trainer(BaseTrainer):
 					learning_rate=0.000,
 					epoch=0,
 					flops_per_device=getattr(self, "_flops_per_device", 0),
-					batch_size=self.arguments.total_batch_size,
+					batch_size=self.arguments.total_batch_size
+					* self.arguments.gradient_accumulation_steps,
 					seq_length=self.arguments.max_sequence_length,
 					mean_loss=mean_loss,
 					mean_accuracy=mean_accuracy,

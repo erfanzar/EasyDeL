@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 
 # Constants
-TOTAL_BATCH_SIZE = 1
+TOTAL_BATCH_SIZE = 4
 UPPER = 600
 NUM_TRAIN_EPOCHS = 2
 SEQUENCE_LENGTH = 128
@@ -71,7 +71,7 @@ def create_model(sequence_length=SEQUENCE_LENGTH, dtype=jnp.float32):
 	)
 
 	model = model.shard_model()
-	model = model.quantize()
+	# model = model.quantize()
 	logging.info("Model created.")
 	return model
 

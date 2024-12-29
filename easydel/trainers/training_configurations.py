@@ -108,7 +108,6 @@ class TrainingArguments:
 	sparse_module_type: AVAILABLE_SPARSE_MODULE_TYPES = "bcoo"
 	state_apply_fn_kwarguments_to_model: tp.Optional[dict] = None
 	remove_unused_columns: bool = True
-	force_batch_and_gradient_accumulation_steps_calculation: bool = False
 	performance_mode: bool = False
 	log_grad_norms: bool = True
 
@@ -129,6 +128,13 @@ class TrainingArguments:
 		Performs validation checks on the provided configuration settings.
 		Raises ValueError if any configuration is invalid.
 		"""
+		assert (
+			self.gradient_accumulation_steps > 0
+		), "`gradient_accumulation_steps` can't be lower than 1."
+		if self.total_batch_size % self.gradient_accumulation_steps != 0:
+			raise ValueError(
+				"Number of `total_batch_size` should be even with `gradient_accumulation_steps`"
+			)
 		if self.backend not in AVAILABLE_BACKENDS:
 			raise ValueError(
 				f"Backend {self.backend} is not recognized. Available backends: {AVAILABLE_BACKENDS}"
@@ -526,7 +532,3 @@ class TrainingArguments:
 		if create:
 			save_directory.mkdir(exist_ok=True, parents=True)
 		return save_directory
-
-
-class EasyDeLBaseModule:
-	pass

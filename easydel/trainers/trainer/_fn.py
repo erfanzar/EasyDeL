@@ -39,12 +39,16 @@ def create_training_step(
 		state: EasyDeLState,
 		batch: tp.Mapping[str, jax.Array],
 	) -> tp.Tuple[EasyDeLState, jax.Array, LossMetrics]:
+		batch_size = batch[list(batch.keys())[0]].shape[0]
+		minibatch_size = batch_size // gradient_accumulation_steps
+		
+		assert minibatch_size * gradient_accumulation_steps == batch_size
 		batch = with_sharding_constraint(batch, partition_spec)
 
-		def loss_fn(tree):
+		def loss_fn(tree, minibatch):
 			module = state.merge(tree)
 			module.train()
-			call_batch = module.prepare_inputs_for_call(**batch)
+			call_batch = module.prepare_inputs_for_call(**minibatch)
 			outputs, metrics = module.compute_loss(
 				labels=call_batch.pop("labels", None),
 				loss_config=loss_config,
@@ -53,11 +57,46 @@ def create_training_step(
 
 			return outputs.loss, metrics
 
-		(
-			(loss, metrics),
-			grads,
-		) = jax.value_and_grad(loss_fn, has_aux=True, allow_int=True)(state.graphstate)
+		grad_fn = jax.value_and_grad(loss_fn, has_aux=True, allow_int=True)
+
+		def _minibatch_step(minibatch_idx: jax.Array | int):
+			minibatch = jax.tree_map(
+				lambda x: jax.lax.dynamic_slice_in_dim(  # Slicing with variable index (jax.Array).
+					x,
+					start_index=minibatch_idx * minibatch_size,
+					slice_size=minibatch_size,
+					axis=0,
+				),
+				batch,
+			)
+			(_, step_metrics), step_grads = grad_fn(state.graphstate, minibatch)
+
+			return step_grads, step_metrics
+
+		def _scan_step(carry, minibatch_idx: jax.Array | int):
+			"""Scan step function for looping over minibatches."""
+			step_grads, step_metrics = _minibatch_step(minibatch_idx)
+
+			carry = jax.tree_map(jnp.add, carry, (step_grads, step_metrics))
+
+			return carry, None
+
+		grads_shapes, metrics_shape = jax.eval_shape(_minibatch_step, 0)
+		grads = jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), grads_shapes)
+		metrics = jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), metrics_shape)
+		(grads, metrics), _ = jax.lax.scan(
+			_scan_step,
+			init=(grads, metrics),
+			xs=jnp.arange(minibatch_size),
+			length=minibatch_size,
+		)
+		# Average the accumulated gradients
+
+		grads = jax.tree_map(lambda g: g / minibatch_size, grads)
+		metrics = jax.tree_map(lambda m: m / minibatch_size, metrics)
+
 		state = state.apply_gradients(grads=grads)
+
 		if learning_rate_fn is not None:
 			metrics.learning_rate = learning_rate_fn(state.step)
 
@@ -75,7 +114,7 @@ def create_training_step(
 		metrics.mean_grad_norm = mean_grad_norm
 		metrics.grad_norms = grad_norms
 
-		return state, loss, metrics
+		return state, metrics.loss, metrics
 
 	return train_step
 

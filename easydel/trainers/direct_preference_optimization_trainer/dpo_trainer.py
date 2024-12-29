@@ -485,7 +485,8 @@ class DPOTrainer(BaseTrainer):
 
 		return tensorflow_datasets.as_numpy(
 			train_dataset.to_tf_dataset(
-				batch_size=self.arguments.total_batch_size,
+				batch_size=self.arguments.total_batch_size
+				* self.arguments.gradient_accumulation_steps,
 				collate_fn=data_collator,
 				num_workers=self.arguments.dataloader_num_workers,
 				shuffle=True,
@@ -550,7 +551,8 @@ class DPOTrainer(BaseTrainer):
 		):
 			data_loader = tensorflow_datasets.as_numpy(
 				self.train_dataset.to_tf_dataset(
-					batch_size=self.arguments.total_batch_size,
+					batch_size=self.arguments.total_batch_size
+					* self.arguments.gradient_accumulation_steps,
 					collate_fn=self.data_collator,
 					num_workers=self.arguments.dataloader_num_workers,
 					shuffle=False,
@@ -790,7 +792,8 @@ class DPOTrainer(BaseTrainer):
 					else self.arguments.learning_rate,
 					epoch=epoch,
 					flops_per_device=getattr(self, "_flops_per_device", 0),
-					batch_size=self.arguments.total_batch_size,
+					batch_size=self.arguments.total_batch_size
+					* self.arguments.gradient_accumulation_steps,
 					seq_length=self.arguments.max_prompt_length
 					+ self.arguments.max_completion_length * 2,
 					mean_loss=mean_loss,
@@ -848,7 +851,8 @@ class DPOTrainer(BaseTrainer):
 					learning_rate=0.000,
 					epoch=0,
 					flops_per_device=getattr(self, "_flops_per_device", 0),
-					batch_size=self.arguments.total_batch_size,
+					batch_size=self.arguments.total_batch_size
+					* self.arguments.gradient_accumulation_steps,
 					seq_length=self.arguments.max_prompt_length
 					+ self.arguments.max_completion_length * 2,
 					mean_loss=mean_loss,

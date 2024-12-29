@@ -329,7 +329,8 @@ class BaseTrainer(BaseTrainerProtocol):
 						max_sequence_length=self.arguments.max_sequence_length,
 						truncation_mode=self.arguments.truncation_mode,
 					),
-					batch_size=self.arguments.total_batch_size,
+					batch_size=self.arguments.total_batch_size
+					* self.arguments.gradient_accumulation_steps,
 					drop_remainder=True,
 					shuffle=is_train,
 					num_workers=self.arguments.dataloader_num_workers,
@@ -366,7 +367,10 @@ class BaseTrainer(BaseTrainerProtocol):
 					},
 				)
 				.repeat(self.arguments.num_train_epochs if is_train else 1)
-				.batch(self.arguments.total_batch_size, drop_remainder=False)
+				.batch(
+					self.arguments.total_batch_size * self.arguments.gradient_accumulation_steps,
+					drop_remainder=False,
+				)
 				.prefetch(tf.data.AUTOTUNE)
 				.as_numpy_iterator()
 			)
@@ -405,7 +409,7 @@ class BaseTrainer(BaseTrainerProtocol):
 					if is_train
 					else self.arguments.max_evaluation_steps
 				)
-				return min(num_steps, max_steps) if max_steps else num_steps
+				steps = min(num_steps, max_steps) if max_steps else num_steps
 			else:
 				num_steps = (
 					self.arguments.max_training_steps
@@ -416,7 +420,8 @@ class BaseTrainer(BaseTrainerProtocol):
 					raise ValueError(
 						f"Specify the number of {'training' if is_train else 'evaluation'} steps for a generator/streaming dataset."
 					)
-				return num_steps
+				steps = num_steps
+			return steps // self.arguments.gradient_accumulation_steps
 
 		def to_tf_dataloader(
 			dataset: tp.Union[Dataset, IterableDataset],
@@ -438,6 +443,7 @@ class BaseTrainer(BaseTrainerProtocol):
 				return create_tf_dataset_from_iterable(dataset, is_train)
 
 		max_training_steps = calculate_steps(self.dataset_train, is_train=True)
+		print(max_training_steps)
 		dataloader_train = to_tf_dataloader(self.dataset_train, is_train=True)
 
 		if self.dataset_eval is not None and self.arguments.do_eval:
@@ -587,8 +593,7 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 - **Params Dtype**: {self.model.param_dtype}
 
 ### Advanced Configuration
-- **Gradient Checkpointing**: {self.model.config.gradient_checkpointing} 
-- **Force Batch Gradient Accumulation**: {self.arguments.force_batch_and_gradient_accumulation_steps_calculation}
+- **Gradient Checkpointing**: {self.model.config.gradient_checkpointing}  
 - **Gradient Accumulation Steps**: {self.arguments.gradient_accumulation_steps}
 - **Max Training Steps**: {self.arguments.max_training_steps}
 - **Max Evaluation Steps**: {self.arguments.max_evaluation_steps}
