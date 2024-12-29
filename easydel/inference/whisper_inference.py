@@ -15,10 +15,11 @@ import math
 import typing as tp
 from dataclasses import dataclass
 from functools import partial
-from flax import nnx as nn
+
 import jax
 import numpy as np
 import requests
+from flax import nnx as nn
 from jax import numpy as jnp
 from transformers.models.whisper.tokenization_whisper import TO_LANGUAGE_CODE
 from transformers.pipelines.audio_utils import ffmpeg_read

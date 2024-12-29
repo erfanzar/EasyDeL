@@ -12,6 +12,5 @@ EasyDeL APIs 🔮
    Modules
    Smi
    Trainers
-   Transform
    Utils
    

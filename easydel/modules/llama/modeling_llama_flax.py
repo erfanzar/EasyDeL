@@ -547,7 +547,6 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
 	) -> tp.Union[FlaxCausalLMOutput, tp.Tuple]:
-		
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,

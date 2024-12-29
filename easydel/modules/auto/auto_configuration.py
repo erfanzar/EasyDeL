@@ -182,7 +182,7 @@ class AutoShardAndGatherFunctions:
 		    A tuple containing the shard and gather functions.
 		"""
 		if partition_rules is None:
-			partition_rules = config.get_partition_rules(True) 
+			partition_rules = config.get_partition_rules(True)
 		_, module, _ = get_modules_by_type(config.model_type, model_task)
 		model = module.lazy_init(config=config, rngs=flax.nnx.Rngs(0))
 

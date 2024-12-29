@@ -16,6 +16,10 @@ Modules
    modules.whisper.modeling_whisper_flax
    modules.phi3.phi3_configuration
    modules.phi3.modeling_phi3_flax
+   modules.gpt_neox.gpt_neox_configuration
+   modules.gpt_neox.modeling_gpt_neox_flax
+   modules.pixtral.modeling_pixtral_flax
+   modules.pixtral.pixtral_configuration
    modules.phimoe.modeling_phimoe_flax
    modules.phimoe.phimoe_configuration
    modules.falcon.falcon_configuration
@@ -50,6 +54,8 @@ Modules
    modules.roberta.modeling_roberta_flax
    modules.deepseek_v2.deepseek_configuration
    modules.deepseek_v2.modeling_deepseek_flax
+   modules.llava.modeling_llava_flax
+   modules.llava.llava_configuration
    modules.olmo.modeling_olmo_flax
    modules.olmo.olmo_configuration
    modules.exaone.exaone_configuration
@@ -72,7 +78,5 @@ Modules
    modules.auto.auto_modeling
    modules.mamba2.modeling_mamba2_flax
    modules.mamba2.mamba2_configuration
-   modules.gpt_neo_x.modeling_gpt_neo_x_flax
-   modules.gpt_neo_x.gpt_neo_x_configuration
    modules.cohere.modeling_cohere_flax
    modules.cohere.cohere_configuration

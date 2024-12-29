@@ -25,11 +25,8 @@ from flax.struct import PyTreeNode
 from tqdm import tqdm
 
 from easydel.etils.etils import get_logger
-from ..traversals import (
-	flatten_dict,
-	is_flatten,
-	unflatten_dict
-)
+
+from ..traversals import flatten_dict, is_flatten, unflatten_dict
 
 logger = get_logger(__name__)
 

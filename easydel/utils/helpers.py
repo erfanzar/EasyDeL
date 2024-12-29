@@ -17,12 +17,12 @@ import contextlib
 import os
 import sys
 import time
+import typing as tp
 import warnings
 from contextlib import contextmanager
 from pathlib import Path
-import typing as tp
-from easydel.etils.etils import get_logger
 
+from easydel.etils.etils import get_logger
 
 if tp.TYPE_CHECKING:
 	from flax.metrics.tensorboard import SummaryWriter

@@ -14,11 +14,12 @@
 import os
 
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
-import jax
-from jax.experimental import mesh_utils
 import typing as tp
-from jax.sharding import PartitionSpec, Mesh
+
+import jax
 import numpy as np
+from jax.experimental import mesh_utils
+from jax.sharding import Mesh, PartitionSpec
 
 jax.config.update("jax_platform_name", "cpu")
 

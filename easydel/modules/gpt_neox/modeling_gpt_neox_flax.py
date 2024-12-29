@@ -21,7 +21,7 @@ import jax
 from flax import nnx as nn
 from jax import numpy as jnp
 
-from easydel.infra.base_module import EasyDeLBaseModule 
+from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import register_module
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,

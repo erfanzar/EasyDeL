@@ -13,8 +13,8 @@
 # limitations under the License.
 from __future__ import annotations
 
-from functools import partial
 import typing as tp
+from functools import partial
 
 import jax
 import jax.numpy as jnp

@@ -13,8 +13,8 @@
 # limitations under the License.
 import math
 import typing as tp
-from functools import partial
 import warnings
+from functools import partial
 
 import chex
 import flax
