@@ -321,8 +321,8 @@ from .trainers import (
 )
 from .utils import traversals
 from .utils.parameters_transformation import (
-	easystate_to_huggingface_model,
-	easystate_to_torch,
+	module_to_huggingface_model,
+	module_to_torch,
 	torch_dict_to_easydel_params,
 )
 

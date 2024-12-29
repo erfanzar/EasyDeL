@@ -46,8 +46,10 @@ _T = tp.TypeVar("_T")
 
 if tp.TYPE_CHECKING:
 	from easydel.etils.easystate import EasyDeLState
+	from transformers import PreTrainedModel
 else:
 	EasyDeLState = tp.Any
+	PreTrainedModel = tp.Any
 
 
 def return_type_adjuster(
@@ -664,6 +666,11 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 	@abstractmethod
 	def to_state(self) -> EasyDeLState:
 		"""converts current model to a EasyDeLState"""
+
+	@abstractmethod
+	def to_torch(self) -> PreTrainedModel:
+		"""converts current model to a huggingface torch model"""
+		...
 
 	@abstractmethod
 	def prepare_inputs_for_call(self, **kwargs):
