@@ -71,21 +71,9 @@ class LlamaMLP(nn.Module):
 			rngs=rngs,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
-		self.gate_proj = linear_class(
-			config.hidden_size,
-			config.intermediate_size,
-			rngs=rngs,
-		)
-		self.down_proj = linear_class(
-			config.intermediate_size,
-			config.hidden_size,
-			rngs=rngs,
-		)
-		self.up_proj = linear_class(
-			config.hidden_size,
-			config.intermediate_size,
-			rngs=rngs,
-		)
+		self.gate_proj = linear_class(config.hidden_size, config.intermediate_size)
+		self.down_proj = linear_class(config.intermediate_size, config.hidden_size)
+		self.up_proj = linear_class(config.hidden_size, config.intermediate_size)
 		self.dropout = nn.Dropout(rate=self.config.resid_pdrop, rngs=rngs)
 		self.act_fn = ACT2FN[self.config.hidden_act]
 
