@@ -39,7 +39,6 @@ default_kernel_init = initializers.lecun_normal()
 default_bias_init = initializers.zeros_init()
 
 
-@jax.jit
 def quantize_8bit(x):
 	"""
 	Quantize a row of float32 values to 8-bit integers with blockwise scaling.
@@ -56,7 +55,6 @@ def quantize_8bit(x):
 	return qweight, qscale
 
 
-@jax.jit
 def dequantize_8bit(quants, scales):
 	"""
 	Dequantize 8-bit integers back to values using blockwise scaling.
@@ -65,16 +63,11 @@ def dequantize_8bit(quants, scales):
 	return dequantized
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(2,))
-def quantized_matmul(x, weight, transpose_weight=False):
+@partial(jax.custom_vjp, nondiff_argnums=(3,))
+def quantized_matmul(x, qweight, qscale, transpose_weight=False):
 	"""
 	Forward pass for 8-bit quantized matrix multiplication.
-	Args:
-	    x: Input tensor
-	    weight: Tuple of (quantized_weights, scales)
-	    transpose_weight: Whether to transpose the weight matrix
 	"""
-	qweight, qscale = weight
 	# Dequantize weights
 	dequantized = dequantize_8bit(qweight, qscale)
 
@@ -84,9 +77,9 @@ def quantized_matmul(x, weight, transpose_weight=False):
 	return jnp.matmul(x, dequantized)
 
 
-def quantized_matmul_fwd(x, weight, transpose_weight):
+def quantized_matmul_fwd(x, qweight, qscale, transpose_weight):
 	"""Forward pass that saves required values for backward pass."""
-	qweight, qscale = weight
+
 	# Dequantize weights for forward computation
 	dequantized = dequantize_8bit(qweight, qscale)
 
@@ -140,7 +133,7 @@ def quantized_matmul_bwd(transpose_weight, res, grad_output):
 	# Pack gradients for weight tuple
 	grad_weight = (grad_qweight, grad_qscale)
 
-	return grad_x, grad_weight
+	return grad_x, quantize_8bit(grad_weight)
 
 
 # Register the custom VJP (Vector-Jacobian Product) rules
@@ -307,7 +300,8 @@ class Linear8bit(QauntModule):
 		"""Forward pass using custom gradient computation."""
 		out = quantized_matmul(
 			inputs,
-			(self.kernel.value, self.scales.value),
+			self.kernel.value,
+			self.scales.value,
 			transpose_weight=False,
 		)
 		if self.use_bias:

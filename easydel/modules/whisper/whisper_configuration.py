@@ -18,6 +18,7 @@ import typing as tp
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
+from jax.sharding import PartitionSpec
 
 
 @register_config("whisper")
@@ -214,4 +215,40 @@ class WhisperConfig(EasyDeLBaseConfig):
 				setattr(self, k, v)
 
 	def get_partition_rules(self, *args, **kwargs):
-		return super().get_partition_rules()
+		return (
+			# Embeddings
+			(
+				"model/(encoder|decoder)/embed_tokens/embedding",
+				PartitionSpec("tp", ("fsdp", "sp")),
+			),
+			("model/(encoder|decoder)/embed_positions/embedding", PartitionSpec(None, "tp")),
+			# Projection output
+			("proj_out/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("proj_out/bias", PartitionSpec(None)),
+			# Encoder convolutions
+			("model/encoder/conv[12]/kernel", PartitionSpec(None, "tp", ("fsdp", "sp"))),
+			("model/encoder/conv[12]/bias", PartitionSpec("tp")),
+			# Self attention (both encoder and decoder)
+			("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("self_attn/(q_proj|k_proj|v_proj)/bias", PartitionSpec("tp")),
+			("self_attn/out_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/out_proj/bias", PartitionSpec(None)),
+			# Cross attention (decoder only)
+			(
+				"encoder_attn/(q_proj|k_proj|v_proj)/kernel",
+				PartitionSpec(("fsdp", "sp"), "tp"),
+			),
+			("encoder_attn/(q_proj|k_proj|v_proj)/bias", PartitionSpec("tp")),
+			("encoder_attn/out_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("encoder_attn/out_proj/bias", PartitionSpec(None)),
+			# FFN layers (both encoder and decoder)
+			("fc1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("fc1/bias", PartitionSpec("tp")),
+			("fc2/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("fc2/bias", PartitionSpec(None)),
+			# Layer norms
+			(".*layer_norm/(bias|scale)", PartitionSpec(None)),
+			(".*_layer_norm/(bias|scale)", PartitionSpec(None)),
+			# Catch-all
+			(".*", PartitionSpec(None)),
+		)

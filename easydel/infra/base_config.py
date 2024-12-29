@@ -395,7 +395,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		Returns:
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
-		return ((".*", PartitionSpec(("fsdp", "sp"))),)
+		# return ((".*", PartitionSpec(("fsdp", "sp"))),)
+		raise NotImplementedError("`get_partition_rules` is not implemented.")
 
 	def get_axis_dims(self) -> tp.Sequence[int]:
 		"""The get_axis_dims function returns a sequence of integers representing the dimensions of each axis.

@@ -15,6 +15,7 @@
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
+from jax.sharding import PartitionSpec
 
 
 @register_config("pixtral")
@@ -99,3 +100,25 @@ class PixtralVisionConfig(EasyDeLBaseConfig):
 		self.rope_theta = rope_theta
 		self.head_dim = hidden_size // num_attention_heads
 		self.initializer_range = initializer_range
+
+	def get_partition_rules(self, *args, **kwargs):
+		return (
+			# Patch embedding convolution
+			("patch_conv/kernel", PartitionSpec(None, None, None, "tp")),
+			("patch_conv/bias", PartitionSpec(None)),
+			# Attention layers
+			("attention/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("attention/(q_proj|k_proj|v_proj)/bias", PartitionSpec(None)),
+			("attention/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("attention/o_proj/bias", PartitionSpec(None)),
+			# Feed forward layers
+			("feed_forward/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("feed_forward/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("feed_forward/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("feed_forward/(gate_proj|up_proj|down_proj)/bias", PartitionSpec(None)),
+			# Layer norms
+			("ln_pre/kernel", PartitionSpec(None)),
+			(".*_norm/kernel", PartitionSpec(None)),
+			# Catch-all
+			(".*", PartitionSpec(None)),
+		)

@@ -170,20 +170,9 @@ def comparing_torch_to_easydel():
 		return model(**kwr, return_dict=True)
 
 	inputs = model.prepare_inputs_for_call(
-		**processor(
-			text=[text],
-			**processor_kw,
-			return_tensors="np",
-		)
+		**processor(text=[text], **processor_kw, return_tensors="np"), drop_ids=False
 	)
-	hf_res = hfm(
-		**processor(
-			text=[text],
-			**processor_kw,
-			return_tensors="pt",
-		),
-	)
-
+	hf_res = hfm(**processor(text=[text], **processor_kw, return_tensors="pt"))
 	res = call(**inputs)
 	hr = hf_res.logits
 	er = res.logits
@@ -280,7 +269,7 @@ def generate():
 
 def easydel_generate():
 	sharding_axis_dims = (1, 1, 1, -1)
-	max_length = 512
+	max_length = 1024
 
 	pretrained_model_name_or_path = "Qwen/Qwen2-VL-2B-Instruct"
 	dtype = jnp.float16
@@ -352,7 +341,17 @@ def easydel_generate():
 			"role": "assistant",
 			"content": "Sure! Here are some ways to eat bananas and dragonfruits together: 1. Banana and dragonfruit smoothie: Blend bananas and dragonfruits together with some milk and honey. 2. Banana and dragonfruit salad: Mix sliced bananas and dragonfruits together with some lemon juice and honey.",
 		},
-		{"role": "user", "content": "What about solving an 2x + 3 = 7 equation?"},
+		# {"role": "user", "content": "What about solving an 2x + 3 = 7 equation?"},
+		{
+			"role": "user",
+			"content": [
+				{
+					"type": "image",
+					"image": "https://picsum.photos/seed/picsum/200/300",
+				},
+				{"type": "text", "text": "what are these metrics indication exacly"},
+			],
+		},
 	]
 	image_inputs, video_inputs = process_vision_info(messages)
 
@@ -365,6 +364,8 @@ def easydel_generate():
 		padding="max_length",
 		return_tensors="jax",
 	)
+	for k, v in ids.items():
+		print(k, type(v), v.shape if hasattr(v, "shape") else None)
 	print("Start Generation Process.")
 	with jax.profiler.trace("tmp-files/vinference"):
 		for response in inference.generate(**ids):
@@ -384,6 +385,6 @@ def easydel_generate():
 
 
 if __name__ == "__main__":
-	# comparing_torch_to_easydel()
+	comparing_torch_to_easydel()
 	# generate()
-	easydel_generate()
+	# easydel_generate()

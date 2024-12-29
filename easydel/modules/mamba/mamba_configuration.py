@@ -18,6 +18,7 @@ import math
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
+from jax.sharding import PartitionSpec
 
 
 @register_config("mamba")
@@ -148,7 +149,34 @@ class MambaConfig(EasyDeLBaseConfig):
 		Returns:
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
-		return super().get_partition_rules()
+		return (
+			# Embeddings
+			("backbone/embeddings/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+			# Language model head
+			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("lm_head/bias", PartitionSpec(None)),
+			# Mixer layers
+			("mixer/in_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("mixer/in_proj/bias", PartitionSpec(None)),
+			("mixer/out_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("mixer/out_proj/bias", PartitionSpec(None)),
+			# Conv1d in mixer (3D kernel)
+			("mixer/conv1d/kernel", PartitionSpec("tp", None, None)),
+			("mixer/conv1d/bias", PartitionSpec("tp")),
+			# State space parameters
+			("mixer/A_log", PartitionSpec("tp", None)),
+			("mixer/D", PartitionSpec("tp")),
+			# Projections
+			("mixer/dt_proj/kernel", PartitionSpec(None, "tp")),
+			("mixer/dt_proj/bias", PartitionSpec("tp")),
+			("mixer/x_proj/kernel", PartitionSpec("tp", None)),
+			("mixer/x_proj/bias", PartitionSpec(None)),
+			# Normalization layers
+			("backbone/layers/.*/norm/kernel", PartitionSpec(None)),
+			("backbone/norm_f/kernel", PartitionSpec(None)),
+			# Catch-all
+			(".*", PartitionSpec(None)),
+		)
 
 	def add_jax_args(
 		self,

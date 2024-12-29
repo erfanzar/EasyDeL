@@ -21,6 +21,7 @@ import warnings
 from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
+from jax.sharding import PartitionSpec
 
 DBRX_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 
@@ -277,4 +278,32 @@ class DbrxConfig(EasyDeLBaseConfig):
 			self,
 			"mask_max_position_embeddings",
 			self.max_position_embeddings,
+		)
+
+	def get_partition_rules(self, *args, **kwargs):
+		"""
+		Get the partition rules for the model.
+		Returns:
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+		"""
+		return (
+			# Embeddings
+			("transformer/wte/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+			# Language model head
+			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("lm_head/bias", PartitionSpec(None)),
+			# Attention layers
+			("norm_attn_norm/attn/Wqkv/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("norm_attn_norm/attn/Wqkv/bias", PartitionSpec(None)),
+			("norm_attn_norm/attn/out_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("norm_attn_norm/attn/out_proj/bias", PartitionSpec(None)),
+			# MoE FFN layers
+			("ffn/experts/mlp/(v1|w1|w2)", PartitionSpec(("fsdp", "sp"), "tp")),
+			("ffn/router/layer/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("ffn/router/layer/bias", PartitionSpec(None)),
+			# Layer norms
+			("norm_attn_norm/norm_\d+/(bias|scale)", PartitionSpec(None)),
+			("transformer/norm_f/(bias|scale)", PartitionSpec(None)),
+			# Catch-all
+			(".*", PartitionSpec(None)),
 		)

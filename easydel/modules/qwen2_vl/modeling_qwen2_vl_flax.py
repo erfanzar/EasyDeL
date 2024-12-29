@@ -47,7 +47,7 @@ from easydel.modules.qwen2_vl.qwen2_vl_configuration import (
 
 
 # TODO: Convert this to a jitable jax fn and use that inside model instead of precall
-def get_rope_index_numpy(
+def get_rope_index(
 	input_ids: np.ndarray,
 	image_grid_thw: tp.Optional[np.ndarray] = None,
 	video_grid_thw: tp.Optional[np.ndarray] = None,
@@ -1337,7 +1337,7 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 					"You shouldn't be here (make sure to call `prepare_inputs_for_call`)",
 					stacklevel=1,
 				)
-				position_ids, rope_deltas = get_rope_index_numpy(
+				position_ids, rope_deltas = get_rope_index(
 					input_ids=input_ids,
 					image_grid_thw=image_grid_thw,
 					video_grid_thw=video_grid_thw,
@@ -1425,6 +1425,7 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 		video_grid_thw: tp.Optional[chex.Array] = None,
 		image_max_grid_size: int = None,
 		video_max_grid_size: int = None,
+		drop_ids: bool = True,
 		**others,
 	):
 		if image_grid_thw is not None:
@@ -1449,7 +1450,7 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 				others.get("past_key_values", None) is not None
 				or others.get("rope_deltas", None) is None
 			):
-				position_ids, rope_deltas = get_rope_index_numpy(
+				position_ids, rope_deltas = get_rope_index(
 					input_ids=others.get("input_ids"),
 					image_grid_thw=image_grid_thw,
 					video_grid_thw=video_grid_thw,
@@ -1463,7 +1464,8 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 				batch_size, sequence_length = others.get("input_ids").shape
 				position_ids = jnp.arange(sequence_length).reshape(1, -1).repeat(batch_size, 0)
 				position_ids = jnp.expand_dims(position_ids, 0).repeat(3, 0)
-		others.pop("input_ids", None)
+		if drop_ids:
+			others.pop("input_ids", None)
 		others.update(
 			dict(
 				video_max_grid_size=video_max_grid_size,

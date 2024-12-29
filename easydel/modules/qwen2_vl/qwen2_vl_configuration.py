@@ -14,6 +14,7 @@
 
 
 from easydel.infra.base_module import EasyDeLBaseConfig
+from jax.sharding import PartitionSpec
 
 
 class Qwen2VLVisionConfig(EasyDeLBaseConfig):
@@ -226,3 +227,56 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
 			self.rope_scaling["rope_type"] = self.rope_scaling["type"]
 
 		super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+
+	def get_partition_rules(self, *args, **kwargs):
+		"""
+		Get the partition rules for the model.
+		Returns:
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+		"""
+		return (
+			# Language model embeddings
+			("embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+			# Language model attention layers
+			(
+				"layers/.*/self_attn/(q_proj|k_proj|v_proj)/kernel",
+				PartitionSpec(("fsdp", "sp"), "tp"),
+			),
+			("layers/.*/self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("layers/.*/self_attn/(q_proj|k_proj|v_proj)/bias", PartitionSpec("tp")),
+			("layers/.*/self_attn/o_proj/bias", PartitionSpec(None)),
+			# Language model MLP layers
+			("layers/.*/mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("layers/.*/mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("layers/.*/mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("layers/.*/mlp/(gate_proj|down_proj|up_proj)/bias", PartitionSpec(None)),
+			# Language model norms
+			("layers/.*/input_layernorm/kernel", PartitionSpec(None)),
+			("layers/.*/post_attention_layernorm/kernel", PartitionSpec(None)),
+			("norm/kernel", PartitionSpec(None)),
+			# Language model head
+			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("lm_head/bias", PartitionSpec(None)),
+			# Visual model patch embedding
+			("patch_embed/proj/kernel", PartitionSpec(None, None, None, None, "tp")),
+			("patch_embed/proj/bias", PartitionSpec(None)),
+			# Visual model attention blocks
+			("blocks/.*/attn/qkv/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("blocks/.*/attn/qkv/bias", PartitionSpec("tp")),
+			("blocks/.*/attn/proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("blocks/.*/attn/proj/bias", PartitionSpec("tp")),
+			# Visual model MLP blocks
+			("blocks/.*/mlp/fc1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("blocks/.*/mlp/fc1/bias", PartitionSpec("tp")),
+			("blocks/.*/mlp/fc2/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("blocks/.*/mlp/fc2/bias", PartitionSpec("tp")),
+			# Visual model norms
+			("blocks/.*/norm1/(bias|scale)", PartitionSpec(None)),
+			("blocks/.*/norm2/(bias|scale)", PartitionSpec(None)),
+			# Visual model merger
+			("merger/ln_q/(bias|scale)", PartitionSpec(None)),
+			("merger/mlp/.*/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("merger/mlp/.*/bias", PartitionSpec("tp")),
+			# Catch-all for any remaining parameters
+			(".*", PartitionSpec(None)),
+		)
