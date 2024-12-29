@@ -1,77 +1,86 @@
 # EasyDeL 🔮
 
 [**Key Features**](#key-features)
-| [**Latest Updates**](#latest-updates-)
-| [**Vision**](#future-updates-and-vision-)
 | [**Quick Start**](#quick-start)
 | [**Reference docs**](https://easydel.readthedocs.io/en/latest/)
 | [**License**](#license-)
 
-EasyDeL is an open-source framework designed to enhance and streamline the training process of machine learning models, with a primary focus on Jax/Flax. It provides convenient and effective solutions for training and serving Flax/Jax models on TPU/GPU at scale.
+EasyDeL is an open-source framework designed to enhance and streamline the training process of machine learning models, with a primary focus on Jax/Flax. Built on modern Flax NNX, it provides convenient and effective solutions for training and serving Flax/Jax models on TPU/GPU at scale.
 
 ## Key Features
 
-- **Diverse Architecture Support**: Seamlessly work with various model architectures including Transformers, Mamba, RWKV, and more.
-- **Diverse Model Support**: Implements a wide range of models that never been implement before in JAX.
-- **Advanced Trainers**: Offers specialized trainers like DPOTrainer, ORPOTrainer, SFTTrainer, and VideoCLM Trainer.
-- **Serving and API Engines**: Provides engines for efficiently serving large language models (LLMs) in JAX.
-- **Quantization and Bit Operations**: Supports various quantization methods and 8, 6, and 4-bit operations for optimized inference and training.
-- **Performance Optimization**: Integrates FlashAttention, RingAttention, and other performance-enhancing features.
-- **Model Conversion**: Supports automatic conversion between JAX-EasyDeL and PyTorch-HF models.
+- **Modern Architecture**: Built on Flax NNX for better integration, modularity, and performance
+- **Diverse Model Support**: Seamless support for Transformers, Mamba, RWKV, Vision Models and more
+- **Advanced Trainers**: Specialized trainers with unified base class for consistent behavior:
+  - SFTTrainer for supervised fine-tuning
+  - DPOTrainer for direct preference optimization
+  - ORPOTrainer for offline reinforcement learning
+  - More Trainers Like image-text-to-image and others are also supported in main trainer
+
+- **Vision Model Support**: Comprehensive support for:
+  - Vision-to-Vision tasks
+  - Image-Text-to-Image generation
+  - Image-to-Text processing
+- **Production-Ready Serving**:
+  - `vInference` engine for efficient LLM inference
+  - `vInferenceApiServer` for OpenAI-compatible API endpoints
+- **Performance Optimization**:
+  - Integration with multiple attention mechanisms
+  - Advanced quantization support including NF4, A8BIT, A8Q, and A4Q
+  - Platform-specific optimizations (TRITON, XLA, Pallas)
 
 ### Fully Customizable and Hackable 🛠️
 
-EasyDeL stands out by providing unparalleled flexibility and transparency:
+EasyDeL's architecture is designed for maximum flexibility:
 
-- **Open Architecture**: Every single component of EasyDeL is open for inspection, modification, and customization. There are no black boxes here.
+- **Custom Module System**: Built on Flax NNX, allowing easy creation and integration of custom modules
+- **Transparent Architecture**: Every component is open for inspection and modification
+- **Dynamic Configuration**: Easily customize model architecture, training pipeline, and inference settings
+- **Platform Flexibility**: Choose between different platforms (TRITON, XLA, Pallas) for optimal performance
 
-- **Hackability at Its Core**: We believe in giving you full control. Whether you want to tweak a small function or completely overhaul a training loop, EasyDeL lets you do it.
+### Optimizations
 
-- **Custom Code Access**: All custom implementations are readily available and well-documented, allowing you to understand, learn from, and modify the internals as needed.
+#### Attention Mechanisms
 
-- **Encourage Experimentation**: We actively encourage users to experiment, extend, and improve upon the existing codebase. Your innovations could become the next big feature!
+EasyDeL offers various attention implementations optimized for different use cases:
 
-- **Community-Driven Development**: Share your custom implementations and improvements with the community, fostering a collaborative environment for advancing ML research and development.
+```python
+import easydel as ed
 
-With EasyDeL, you're not constrained by rigid frameworks. Instead, you have a flexible, powerful toolkit that adapts to your needs, no matter how unique or specialized they may be. Whether you're conducting cutting-edge research or building production-ready ML systems, EasyDeL provides the freedom to innovate without limitations.
+# Configure attention mechanism in model config
+config = ed.EasyDeLBaseConfigDict(attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,) # Choose mechanism
+```
 
-### Advanced Customization and Optimization 🔧
+Available mechanisms:
 
-EasyDeL provides unparalleled flexibility in customizing and optimizing your models:
+- **FLASH_ATTN2**: Optimized Flash Attention 2 implementation
+- **CUDA_FLASH_ATTN2**: CUDA-specific Flash Attention 2 variant
+- **RING**: Memory-efficient ring attention for distributed computing
+- **VANILLA**: Standard attention implementation
+- **SPLASH**: TPU-optimized splash attention
+- **CUDNN**: cuDNN-accelerated attention
+- **BLOCKWISE**: Memory-efficient blockwise attention
+- **SDPA**: Scaled dot-product attention
 
-- **Sharding Strategies**: Easily customize and experiment with different sharding strategies to optimize performance across multiple devices.
+Example of configuring a model with specific platform and attention:
 
-- **Algorithm Customization**: Modify and fine-tune algorithms to suit your specific needs and hardware configurations.
+```python
+import easydel as ed
+import jax.numpy as jnp
 
-- **Attention Mechanisms**: Choose from over 10 types of attention mechanisms optimized for GPU/TPU/CPU, including:
-  - Flash Attention 2 (CPU(*XLA*), GPU(*Triton*), TPU(*Pallas*)) 
-  - Blockwise Attention (CPU, GPU, TPU | *Pallas*-*Jax*)
-  - Ring Attention (CPU, GPU, TPU | *Pallas*-*Jax*)
-  - Splash Attention (TPU | *Pallas*)
-  - SDPA (CPU(*XLA*), GPU(*CUDA*), TPU(*XLA*)) 
-
-This level of customization allows you to squeeze every ounce of performance from your hardware while tailoring the model behavior to your exact requirements.
-
-## Future Updates and Vision 🚀
-
-EasyDeL is constantly evolving to meet the needs of the machine learning community. In upcoming updates, we plan to introduce:
-
-- **Cutting-Edge**: EasyDeL is committed to long-term maintenance and continuous improvement. We provide frequent updates, often on a daily basis, introducing new features, optimizations, and bug fixes. Our goal is to ensure that EasyDeL remains at the cutting edge of machine learning technology, providing researchers and developers with the most up-to-date tools and capabilities.
-- **Ready-to-Use Blocks**: Pre-configured, optimized building blocks for quick model assembly and experimentation.
-- **Enhanced Scalability**: Improved tools and methods for effortlessly scaling LLMs to handle larger datasets and more complex tasks.
-- **Advanced Customization Options**: More flexibility in model architecture and training pipeline customization.
-
-### Why Choose EasyDeL?
-
-1. **Flexibility**: EasyDeL offers a modular design that allows researchers and developers to easily mix and match components, experiment with different architectures (including Transformers, Mamba, RWKV, and ...), and adapt models to specific use cases.
-
-2. **Performance**: Leveraging the power of JAX and Flax, EasyDeL provides high-performance implementations of state-of-the-art models and training techniques, optimized for both TPUs and GPUs.
-
-3. **Scalability**: From small experiments to large-scale model training, EasyDeL provides tools and optimizations to efficiently scale your models and workflows.
-
-4. **Ease of Use**: Despite its powerful features, EasyDeL maintains an intuitive API, making it accessible for both beginners and experienced practitioners.
-
-5. **Cutting-Edge Research**: quickly implementing the latest advancements in model architectures, training techniques, and optimization methods.
+# Complete configuration example
+model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-2-7b",
+    platform=ed.EasyDeLPlatforms.TRITON,
+    config_kwargs=ed.EasyDeLBaseConfigDict(
+        attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
+        attn_dtype=jnp.float16,
+        gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
+    ),
+    dtype=jnp.float16,
+    auto_shard_model=True
+)
+```
 
 ## Quick Start
 
@@ -81,146 +90,215 @@ EasyDeL is constantly evolving to meet the needs of the machine learning communi
 pip install easydel
 ```
 
-### Testing Attention Mechanisms
-
-```python
-import easydel as ed
-ed.FlexibleAttentionModule.run_attention_benchmarks()
-```
-
-## Documentation 💫
-
-Comprehensive documentation and examples are available at [EasyDeL Documentation](https://easydel.readthedocs.io/en/latest/).
-
-Here's an improved version of your latest updates:
-
-### Latest Updates 🔥
-
-- **Platform and Backend Flexibility**: You can now specify the platform (e.g., TRITON) and backend (e.g., GPU) to optimize your workflows.  
-- **Expanded Model Support**: Added support for new models such as `olmo2`, `qwen2_moe`, `mamba2`, and others.  
-- **Enhanced Trainers**: Trainers are now more customizable and hackable, enabling greater flexibility in your projects.  
-- **New Trainer Types**:  
-  - **Sequence-to-Sequence Trainers**  
-  - **Sequence Classification Trainers**  
-- **`vInference` Engine**: Introduced as a robust inference engine for LLMs, with Long-Term Support (LTS).  
-- **`vInferenceApiServer`**: Added as a backend for the inference engine, fully compatible with OpenAI APIs.  
-- **Optimized GPU Integration**: EasyDeL now leverages custom, direct TRITON calls for improved GPU performance.  
-- **Dynamic Quantization Support**: Added support for quantization types like NF4, A8BIT, A8Q, and A4Q for efficiency and scalability.  
-
-## Key Components
-
-### vInference
-
-The `vInference` class provides a streamlined interface for text generation using pre-trained language models within JAX.
+### Basic Inference Example
 
 ```python
 import easydel as ed
 from transformers import AutoTokenizer
+import jax.numpy as jnp
 
-model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(...)
-tokenizer = AutoTokenizer.from_pretrained(...)
-
-inference = ed.vInference(
-	model=model,
-	params=params,
-	tokenizer=tokenizer,
-	generation_config=ed.vInferenceConfig(
-		temperature=model.generation_config.temperature,
-		top_k=model.generation_config.top_k,
-		top_p=model.generation_config.top_p,
-		bos_token_id=model.generation_config.bos_token_id,
-		eos_token_id=model.generation_config.eos_token_id,
-		pad_token_id=model.generation_config.pad_token_id,
-		streaming_chunks=32,
-		max_new_tokens=1024,
-	),
+# Initialize model
+model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-2-7b",
+    dtype=jnp.float16,
+    platform=ed.EasyDeLPlatforms.TRITON,
+    auto_shard_model=True
 )
+
+# Setup tokenizer
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b")
+tokenizer.pad_token_id = tokenizer.eos_token_id
+
+# Create inference engine
+inference = ed.vInference(
+    model=model,
+    tokenizer=tokenizer,
+    generation_config=ed.vInferenceConfig(
+        max_new_tokens=1024,
+        temperature=0.7,
+        top_p=0.95,
+        streaming_chunks=32
+    )
+)
+
+# Create API server (OpenAI compatible)
+api_server = ed.vInferenceApiServer({inference.inference_name: inference})
+api_server.fire()
 ```
 
-### vInferenceApiServer 
+### Building Custom Modules 🛠️
 
-`vInferenceApiServer` is a Serve API Engine for production or research purposes, providing a stable, efficient, and OpenAI API like API.
+The `EasyDeLBaseModule` is the core foundation for creating custom modules and models in EasyDeL. It provides a powerful set of built-in features for configuration, data handling, parameter management, and more. It inherits from `flax.nnx.Module`, `BaseModuleProtocol`, `EasyBridgeMixin`, and `EasyGenerationMixin`.
 
 ```python
 import easydel as ed
+import jax
+import jax.numpy as jnp
+import typing as tp
+from flax import nnx as nn
 
-api_inference = ed.vInferenceApiServer(
-	{inference.inference_name: inference}
-)  # you can load multi inferences together
-api_inference.fire()
+# Example Custom Module
+class MyCustomModule(ed.EasyDeLBaseModule):
+ def __init__(
+  self,
+  config,
+  dtype: jnp.dtype = jnp.float32,
+  param_dtype: jnp.dtype = jnp.float32,
+  precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+  other_parameters=...,
+  other_parameters_1=...,
+  *,
+  rngs: nn.Rngs,
+ ):
+  super().__init__(
+   config=config,
+   dtype=dtype,
+   param_dtype=param_dtype,
+   precision=precision,
+   rngs=rngs,
+  )
+  self.other_parameters = other_parameters
+
+ def __call__(self, x):
+  # Custom implementation
+  return x
+
+
+# Example Model using the Custom Module
+class MyModel(ed.EasyDeLBaseModule):
+    config_class = ed.EasyDeLBaseConfig
+ def __init__(
+  self,
+  config,
+  dtype: jnp.dtype = jnp.float32,
+  param_dtype: jnp.dtype = jnp.float32,
+  precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+  other_parameters=...,
+  other_parameters_1=...,
+  other_parameters_2=...,
+  *,
+  rngs: nn.Rngs,
+ ):
+  super().__init__(
+   config=config,
+   dtype=dtype,
+   param_dtype=param_dtype,
+   precision=precision,
+   rngs=rngs,
+  )
+  self.custom_module = MyCustomModule(
+   config=config,
+   dtype=dtype,
+   param_dtype=param_dtype,
+   precision=precision,
+   other_parameters=other_parameters,
+   other_parameters_1=other_parameters_1,
+   rngs=rngs,
+  )
+
+ def __call__(self, x):
+  return self.custom_module(x)
 ```
 
-### EasyDeLState
+### Key Features at a Glance
 
-`EasyDeLState` acts as a comprehensive container for your EasyDeL model, including training progress, model parameters, and optimizer information.
+- **Core Class:** Foundation for building EasyDeL modules, inheriting from `flax.nnx.Module`, `BaseModuleProtocol`, `EasyBridgeMixin` and `EasyGenerationMixin`.
+- **Configuration:**
+  - Uses a `config` attribute of type `EasyDeLBaseConfig` for model settings.
+  - Provides `mesh` property for retrieving mesh from the config.
+  - Includes class attributes for model metadata: `config_class`, `base_model_prefix`, `_model_task`, and `_model_type`.
+- **Data Handling:**
+  - Controls data types (`dtype`, `param_dtype`) and numerical precision (`precision`).
+  - Supports quick precision switching with `half()` (float16) and `float()` (float32).
+  - `module_dtype` property returns the parameters dtype
+- **Randomness:** Manages random number generation via `nn.Rngs`.
+- **Parameter Shape:** Inspects the shape of all model parameters with `graphtree_params_shape` property.
+- **Causal Mask & Frequencies:** Accesses `causal_mask` and `frequencies` from the config for sequence modeling.
+- **Static Arguments:**
+  - `static_arguments` property with ability to define static arguments via `get_static_arguments` method.
+- **Dynamic Loss:** Dynamically loads loss functions via `loss_function` based on name or `loss_type`.
+- **Sharding/Gathering:** Offers `shard_model` and `gather_model` for parameter distribution across devices and has access to current sharding (`_shard_fns`) and gathering (`_gather_fns`) functions.
+- **Quantization:** Applies post-training quantization to linear layers using `quantize`.
+- **State Conversion:** Converts the module to a state object via `to_state`.
+- **Input Preparation**: Provides a method for pre-processing inputs with `prepare_inputs_for_call`.
+- **Generic Loss Calculation:** Computes loss via `compute_loss`.
+- **Easy Bridge:** Enables saving/loading models using `save_pretrained` and pushing to the Hub with `push_to_hub`, while also offering methods for loading from checkpoints (`_load_model_weights`),  from pretrained models(`from_pretrained`) and from torch (`_from_torch_pretrained`).
+- **Easy Generation:** Facilitates text generation via `generate` with multiple decoding algorithms, while using methods for caching, decoder initialization, beam search configurations, logits processing and other aspects of generation.
+
+**Benefits:**
+
+- **Modularity:** Encourages reusable, composable model components.
+- **Flexibility:** Adapts to diverse model architectures.
+- **Efficiency:** Integrates with EasyDeL's distributed training and optimization features.
+- **Ease of Use:** Simplifies saving/loading and text generation processes.
+
+### Training Example
 
 ```python
-from easydel import EasyDeLState
+import easydel as ed
+import jax.numpy as jnp
 
-state = EasyDeLState.from_pretrained(
-    pretrained_model_name_or_path="model_name",
-    dtype=jnp.bfloat16,
-    param_dtype=jnp.bfloat16,
-    sharding_axis_dims=(1, -1, 1, 1)
-)
-```
-
-## Training Examples
-
-### Supervised Fine-Tuning
-
-```python
-from easydel import SFTTrainer, TrainingArguments
-
-trainer = SFTTrainer(
-    arguments=train_arguments,
-    train_dataset=train_dataset,
-    eval_dataset=eval_dataset,
-    tokenizer=tokenizer,
-    formatting_func=prompter,
-    packing=True,
-    num_of_sequences=max_length,
+# Create model
+model = ed.LlamaForCausalLM(
+    config=model_config,
+    dtype=jnp.float32,
+    param_dtype=jnp.float32
 )
 
-output = trainer.train(flax.core.FrozenDict({"params": params}))
-```
-
-### DPO Fine-tuning
-
-```python
-from easydel import DPOTrainer
-
-dpo_trainer = DPOTrainer(
-    model_state=state,
-    ref_model_state=ref_state,
-    beta=0.1,
-    train_dataset=train_dataset,
-    eval_dataset=eval_dataset,
-    tokenizer=tokenizer,
-    arguments=arguments,
-    max_length=max_length,
-    max_completion_length=max_completion_length,
-    max_prompt_length=max_prompt_length,
+# Configure training
+training_args = ed.TrainingArguments(
+    save_directory="checkpoints",
+    model_name="my_model",
+    num_train_epochs=3,
+    total_batch_size=8,
+    learning_rate=3e-4,
+    optimizer=ed.EasyDeLOptimizers.ADAMW,
+    scheduler=ed.EasyDeLSchedulers.COSINE
 )
 
-output = dpo_trainer.train()
+# Initialize trainer
+trainer = ed.Trainer(
+    arguments=training_args,
+    model=model,
+    dataset_train=train_dataset,
+    dataset_eval=eval_dataset
+)
+
+# Start training
+trainer.train()
 ```
+
+## Latest Updates 🔥
+
+- **Modernized Architecture**:
+  - Migrated to Flax NNX for improved modularity and performance
+  - Custom module system for better extensibility
+  - Unified base trainer for consistent behavior
+- **Enhanced Performance**:
+  - Faster training and inference
+  - Better large-scale handling
+  - Improved memory management
+- **Vision Model Support**:
+  - Added comprehensive vision model capabilities
+  - Support for multimodal tasks
+- **Major Improvements**:
+  - Fixed core issues from easydel-linen
+  - Enhanced stability and reliability
+  - Better error handling and debugging
+
+## Documentation 💫
+
+For comprehensive documentation, tutorials, and API reference, visit [EasyDeL Documentation](https://easydel.readthedocs.io/en/latest/).
 
 ## Contributing
 
-Contributions to EasyDeL are welcome! Please fork the repository, make your changes, and submit a pull request.
+We welcome contributions! Please see our contributing guidelines in the repository.
 
 ## License 📜
 
-EasyDeL is released under the Apache v2 license. See the LICENSE file for more details.
-
-## Contact
-
-If you have any questions or comments about EasyDeL, you can reach out to me at _erfanzare810@gmail.com_.
+EasyDeL is released under the Apache v2 license. See the LICENSE file for details.
 
 ## Citation
-
-To cite EasyDeL in your work:
 
 ```bibtex
 @misc{Zare Chavoshi_2023,
@@ -230,3 +308,7 @@ To cite EasyDeL in your work:
     year={2023}
 }
 ```
+
+## Contact
+
+For questions or comments about EasyDeL, contact: _erfanzare810@gmail.com_

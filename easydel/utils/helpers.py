@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import contextlib
 import os
 import sys
@@ -19,11 +20,14 @@ import time
 import warnings
 from contextlib import contextmanager
 from pathlib import Path
-
-import flax.metrics.tensorboard
-
+import typing as tp
 from easydel.etils.etils import get_logger
 
+
+if tp.TYPE_CHECKING:
+	from flax.metrics.tensorboard import SummaryWriter
+else:
+	SummaryWriter = tp.Any
 try:
 	import wandb  # type: ignore
 except ModuleNotFoundError:
@@ -73,9 +77,7 @@ class Timer:
 
 
 class Timers:
-	def __init__(
-		self, use_wandb, tensorboard_writer: flax.metrics.tensorboard.SummaryWriter
-	):
+	def __init__(self, use_wandb, tensorboard_writer: SummaryWriter):
 		self.timers = {}
 		self.use_wandb = use_wandb
 		self.tensorboard_writer = tensorboard_writer
@@ -113,7 +115,7 @@ class Timers:
 			self._print_log(name, elapsed_time)
 
 	def _print_log(self, name, elapsed_time):
-		logger.info(f"Time Took to Complete Task {name} (milliseconds) : {elapsed_time}")
+		logger.info(f"time took for {name} (ms) : {elapsed_time:.4f}")
 
 	@contextlib.contextmanager
 	def timed(self, name, log=True, reset=True):

@@ -42,11 +42,11 @@ max_length = 8192  # Maximum length of input sequences
 num_devices = jax.device_count()
 
 # Initialize the model with specific sharding and quantization settings
-model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
     pretrained_model_name_or_path,
     sharding_axis_dims=(1, 1, 1, -1),  # Adjust this based on device type
 		# Use Sequence Sharding or Tensor Parallelization for this
-    auto_shard_params=True,
+    auto_shard_model=True,
     dtype=jnp.float16, 
     param_dtype=jnp.float16,
     precision=None,

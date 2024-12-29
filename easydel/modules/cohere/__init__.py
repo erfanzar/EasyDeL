@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.cohere.cohere_configuration import CohereConfig
-from easydel.modules.cohere.modelling_cohere_flax import (
-	FlaxCohereForCausalLM,
-	FlaxCohereModel,
-)
+from .cohere_configuration import CohereConfig
+from .modeling_cohere_flax import CohereForCausalLM, CohereModel
 
-__all__ = "FlaxCohereForCausalLM", "FlaxCohereModel", "CohereConfig"
+__all__ = "CohereForCausalLM", "CohereModel", "CohereConfig"

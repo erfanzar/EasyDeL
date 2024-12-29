@@ -12,18 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 # impl GQA ATTN by @erfanzar
 
 import functools
 import math
 import os
+import typing as tp
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "1.0"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
-from typing import Optional
 
 import chex
 import jax
@@ -310,11 +311,11 @@ except ModuleNotFoundError:
 
 
 def _fwd_attention_kernel_call(
-	query: Optional[chex.Array],
-	key: Optional[chex.Array],
-	value: Optional[chex.Array],
-	bias: Optional[chex.Array] = None,
-	softmax_scale: Optional[float] = None,
+	query: tp.Optional[chex.Array],
+	key: tp.Optional[chex.Array],
+	value: tp.Optional[chex.Array],
+	bias: tp.Optional[chex.Array] = None,
+	softmax_scale: tp.Optional[float] = None,
 ):
 	"""Calls the Triton kernel for the forward pass of the attention mechanism.
 
@@ -908,11 +909,11 @@ def _bwd_attention_kernel_call(
 
 
 def _fwd_attention_kernel_call_with_residual(
-	query: Optional[chex.Array],
-	key: Optional[chex.Array],
-	value: Optional[chex.Array],
-	bias: Optional[chex.Array] = None,
-	softmax_scale: Optional[float] = None,
+	query: tp.Optional[chex.Array],
+	key: tp.Optional[chex.Array],
+	value: tp.Optional[chex.Array],
+	bias: tp.Optional[chex.Array] = None,
+	softmax_scale: tp.Optional[float] = None,
 ):
 	"""Calls the Triton kernel for the forward pass of the attention mechanism and returns the residual.
 
@@ -942,8 +943,8 @@ def _flash_attn2_gqa(
 	query: chex.Array,
 	key: chex.Array,
 	value: chex.Array,
-	bias: Optional[chex.Array] = None,
-	softmax_scale: Optional[float] = None,
+	bias: tp.Optional[chex.Array] = None,
+	softmax_scale: tp.Optional[float] = None,
 ) -> chex.Array:
 	"""Computes the attention mechanism using the Triton kernel.
 
@@ -951,7 +952,7 @@ def _flash_attn2_gqa(
 		query: Query array of shape (batch, seq_len_q, num_heads, head_dim).
 		key: Key array of shape (batch, seq_len_k, num_heads, head_dim).
 		value: Value array of shape (batch, seq_len_k, num_heads, head_dim).
-		bias: Optional bias array of shape (batch, num_heads, seq_len_q, seq_len_k).
+		bias: tp.Optional bias array of shape (batch, num_heads, seq_len_q, seq_len_k).
 		softmax_scale: Scaling factor for the softmax function.
 
 	Returns:

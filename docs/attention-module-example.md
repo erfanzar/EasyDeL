@@ -43,7 +43,7 @@ the best possible performance and numerical stability, here are some strategies 
 
 1. Flash Attention TPU/GPU/CPU known as "flash_attn2"
 2. Ring Attention to Support higher context length such 1 Million or above known as "ring"
-3. Normal Attention which use flax.linen.attention with shard map known as "vanilla"
+3. Normal Attention which use flax.nnx.attention with shard map known as "vanilla"
 4. Splash Attention on TPUs which is known as "splash"
 5. Other Attention modules might be added you can check source code for that..
 
@@ -69,7 +69,7 @@ print(
 
 ```python
 import jax
-import flax.linen.attention as flt
+import flax.nnx.attention as flt
 from fjformer import GenerateRNG
 from easydel import PartitionAxis
 from easydel.layers.attention import FlexibleAttentionModule, FlaxAttentionModule

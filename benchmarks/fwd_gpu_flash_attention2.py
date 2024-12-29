@@ -1,7 +1,7 @@
 import functools
 import os
 import sys
-from typing import Literal
+import typing as tp
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from easydel.kernels.gpu_ops.triton_gqa_flash_attention_2 import (
@@ -29,7 +29,7 @@ def _get_inputs(
 	QS,
 	KS,
 	D,
-	provider: Literal["triton", "cudnn_sdpa"],
+	provider: tp.Literal["triton", "cudnn_sdpa"],
 	USE_BIAS=True,
 ):
 	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)

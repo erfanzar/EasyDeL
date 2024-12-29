@@ -4,85 +4,75 @@ Modules
 .. toctree::
    :maxdepth: 2
 
-   modules.opt.opt_configuration
-   modules.opt.modelling_opt_flax
-   modules.gpt_j.gpt_j_configuration
-   modules.gpt_j.modeling_gpt_j_flax
-   modules.internlm2.internlm2_configuration
-   modules.internlm2.modeling_internlm2_flax
+   modules.dbrx.dbrx_configuration
+   modules.dbrx.modeling_dbrx_flax
+   modules.phi.phi_configuration
+   modules.phi.modeling_phi_flax
+   modules.clip.clip_configuration
+   modules.clip.modeling_clip_flax
    modules.llama.llama_configuration
    modules.llama.modeling_llama_flax
-   modules.roberta.modelling_roberta_flax
-   modules.roberta.roberta_configuration
-   modules.mamba2.modelling_mamba2_flax
-   modules.mamba2.mamba2_configuration
-   modules.mistral.modelling_mistral_flax
-   modules.mistral.mistral_configuration
-   modules.auto_modeling
-   modules.mamba.modelling_mamba_flax
-   modules.mamba.mamba_configuration
-   modules.gpt_neo_x.gpt_neo_x_configuration
-   modules.gpt_neo_x.modeling_gpt_neo_x_flax
-   modules.dbrx.dbrx_configuration
-   modules.dbrx.modelling_dbrx_flax
-   modules.rwkv.rwkv_configuration
-   modules.rwkv.modelling_rwkv_flax
-   modules.mixtral.mixtral_configuration
-   modules.mixtral.modelling_mixtral_flax
-   modules.arctic.arctic_configuration
-   modules.arctic.modelling_arctic_flax
-   modules.zamba2.zamba2_configuration
-   modules.zamba2.modeling_zamba2_flax
+   modules.whisper.whisper_configuration
+   modules.whisper.modeling_whisper_flax
+   modules.phi3.phi3_configuration
+   modules.phi3.modeling_phi3_flax
+   modules.phimoe.modeling_phimoe_flax
+   modules.phimoe.phimoe_configuration
    modules.falcon.falcon_configuration
    modules.falcon.modeling_falcon_flax
-   modules.phimoe.phimoe_configuration
-   modules.phimoe.modeling_phimoe_flax
-   modules.modeling_utils
-   modules.qwen2_moe.configuration_qwen2_moe
-   modules.qwen2_moe.modeling_qwen2_moe_flax
-   modules.t5.modelling_t5_flax
-   modules.t5.t5_configuration
-   modules.modeling_flax_outputs
-   modules.mosaic_mpt.modelling_mpt_flax
-   modules.mosaic_mpt.mosaic_configuration
-   modules.stablelm.modelling_stablelm_flax
-   modules.stablelm.stablelm_configuration
-   modules.xerxes.modeling_xerxes_flax
-   modules.xerxes.xerxes_configuration
-   modules.phi3.modelling_phi3_flax
-   modules.phi3.phi3_configuration
-   modules.auto_speech_seq2seq_model
-   modules.factory
-   modules.exaone.modeling_exaone_flax
-   modules.exaone.exaone_configuration
    modules.gpt2.gpt2_configuration
    modules.gpt2.modeling_gpt2_flax
-   modules.auto_configuration
+   modules.openelm.openelm_configuration
+   modules.openelm.modeling_openelm_flax
+   modules.opt.opt_configuration
+   modules.opt.modeling_opt_flax
+   modules.mosaic_mpt.modeling_mpt_flax
+   modules.mosaic_mpt.mosaic_configuration
+   modules.qwen2.qwen_configuration
+   modules.qwen2.modeling_qwen_flax
+   modules.qwen2_vl.qwen2_vl_configuration
+   modules.qwen2_vl.modeling_qwen2_vl_flax
+   modules.mixtral.modeling_mixtral_flax
+   modules.mixtral.mixtral_configuration
+   modules.internlm2.internlm2_configuration
+   modules.internlm2.modeling_internlm2_flax
+   modules.mistral.mistral_configuration
+   modules.mistral.modeling_mistral_flax
+   modules.xerxes.xerxes_configuration
+   modules.xerxes.modeling_xerxes_flax
    modules.grok_1.grok_1_configuration
    modules.grok_1.modeling_grok_1_flax
-   modules.qwen2.modeling_qwen_flax
-   modules.qwen2.qwen_configuration
-   modules.chatglm.chatglm_configuration
-   modules.chatglm.modelling_chatglm_flax
-   modules.phi.modelling_phi_flax
-   modules.phi.phi_configuration
-   modules.whisper.whisper_configuration
-   modules.whisper.modelling_whisper_flax
-   modules.flax_modeling_utils
-   modules.gemma2.modeling_gemma2_flax
-   modules.gemma2.gemma2_configuration
+   modules.gpt_j.gpt_j_configuration
+   modules.gpt_j.modeling_gpt_j_flax
+   modules.qwen2_moe.configuration_qwen2_moe
+   modules.qwen2_moe.modeling_qwen2_moe_flax
+   modules.roberta.roberta_configuration
+   modules.roberta.modeling_roberta_flax
+   modules.deepseek_v2.deepseek_configuration
+   modules.deepseek_v2.modeling_deepseek_flax
    modules.olmo.modeling_olmo_flax
    modules.olmo.olmo_configuration
-   modules.auto_causal_language_model
-   modules.cohere.cohere_configuration
-   modules.cohere.modelling_cohere_flax
-   modules.gemma.gemma_configuration
+   modules.exaone.exaone_configuration
+   modules.exaone.modeling_exaone_flax
    modules.gemma.modeling_gemma_flax
-   modules.deepseek_v2.modeling_deepseek_flax
-   modules.deepseek_v2.deepseek_configuration
-   modules.palm.modelling_palm_flax
-   modules.palm.palm_configuration
-   modules.openelm.openelm_configuration
-   modules.openelm.modelling_openelm_flax
+   modules.gemma.gemma_configuration
+   modules.gemma2.gemma2_configuration
+   modules.gemma2.modeling_gemma2_flax
+   modules.rwkv.modeling_rwkv_flax
+   modules.rwkv.rwkv_configuration
    modules.olmo2.olmo2_configuration
    modules.olmo2.modeling_olmo2_flax
+   modules.mamba.modeling_mamba_flax
+   modules.mamba.mamba_configuration
+   modules.stablelm.stablelm_configuration
+   modules.stablelm.modeling_stablelm_flax
+   modules.arctic.arctic_configuration
+   modules.arctic.modeling_arctic_flax
+   modules.auto.auto_configuration
+   modules.auto.auto_modeling
+   modules.mamba2.modeling_mamba2_flax
+   modules.mamba2.mamba2_configuration
+   modules.gpt_neo_x.modeling_gpt_neo_x_flax
+   modules.gpt_neo_x.gpt_neo_x_configuration
+   modules.cohere.modeling_cohere_flax
+   modules.cohere.cohere_configuration

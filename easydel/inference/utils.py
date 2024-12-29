@@ -11,19 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import dataclasses
-from typing import Dict, List, Optional, Union
+import typing as tp
 
+import chex
 import fjformer
 import jax
 import jax.experimental
 import jax.experimental.pallas
 import jax.random
+from jax import core, random, sharding
 from jax import numpy as jnp
-from jax import random, sharding
 
-from easydel.inference.logits_process import (
+from .logits_process import (
 	FlaxForcedBOSTokenLogitsProcessor,
 	FlaxForcedEOSTokenLogitsProcessor,
 	FlaxLogitsProcessorList,
@@ -36,25 +36,36 @@ from easydel.inference.logits_process import (
 	hash_fn,
 )
 
+if hasattr(core, "new_main"):
+	ic = fjformer.core.implicit_compact
+else:
+
+	def ic(fn):
+		# warnings.warn(
+		# 	"fjformer quantizers wont support current jax version (soon will be fixed).",
+		# 	stacklevel=3,
+		# )
+		return fn
+
 
 @jax.tree_util.register_pytree_node_class
 @dataclasses.dataclass
 class vInferenceConfig:
 	max_new_tokens: int = 64
-	min_length: Optional[int] = None
+	min_length: tp.Optional[int] = None
 	streaming_chunks: int = 16
 	temperature: float = 0.0
 	top_p: float = 0.95
 	top_k: int = 50
 	do_sample: bool = True
-	no_repeat_ngram_size: Optional[int] = None
-	suppress_tokens: Optional[list] = None
-	forced_bos_token_id: Optional[int] = None
-	forced_eos_token_id: Optional[int] = None
-	pad_token_id: Optional[int] = None
-	bos_token_id: Optional[int] = None
-	eos_token_id: Optional[Union[int, List[int]]] = None
-	_loop_rows: Optional[int] = None
+	no_repeat_ngram_size: tp.Optional[int] = None
+	suppress_tokens: tp.Optional[list] = None
+	forced_bos_token_id: tp.Optional[int] = None
+	forced_eos_token_id: tp.Optional[int] = None
+	pad_token_id: tp.Optional[int] = None
+	bos_token_id: tp.Optional[int] = None
+	eos_token_id: tp.Optional[tp.Union[int, tp.List[int]]] = None
+	_loop_rows: tp.Optional[int] = None
 
 	def tree_flatten(self):
 		return (
@@ -155,9 +166,9 @@ def lower_function(
 	    func: The JAX function to compile.
 	    func_input_args: Input arguments for the function.
 	    func_input_kwargs: Input keyword arguments for the function.
-	    mesh: Optional JAX mesh for distributed execution.
-	    in_shardings: Optional input sharding specifications.
-	    out_shardings: Optional output sharding specifications.
+	    mesh: tp.Optional JAX mesh for distributed execution.
+	    in_shardings: tp.Optional input sharding specifications.
+	    out_shardings: tp.Optional output sharding specifications.
 	    static_argnums: Indices of static arguments.
 	    donate_argnums: Indices of arguments to donate.
 
@@ -199,9 +210,9 @@ def compile_function(
 	    func: The JAX function to compile.
 	    func_input_args: Input arguments for the function.
 	    func_input_kwargs: Input keyword arguments for the function.
-	    mesh: Optional JAX mesh for distributed execution.
-	    in_shardings: Optional input sharding specifications.
-	    out_shardings: Optional output sharding specifications.
+	    mesh: tp.Optional JAX mesh for distributed execution.
+	    in_shardings: tp.Optional input sharding specifications.
+	    out_shardings: tp.Optional output sharding specifications.
 	    static_argnums: Indices of static arguments.
 	    donate_argnums: Indices of arguments to donate.
 
@@ -220,51 +231,24 @@ def compile_function(
 	).compile()
 
 
-@jax.tree_util.register_pytree_node_class
-@dataclasses.dataclass
+@chex.dataclass
 class SampleState:
 	"""
 	Data class representing the state of the sampling process.
-
-	Attributes:
-	    current_length: Current length of the generated sequence.
-	    sequences: Generated token sequences.
-	    running_token: The last generated token for each sequence.
-	    is_sequence_finished: Boolean array indicating finished sequences.
-	    prng_key: JAX PRNG key for random sampling.
-	    model_kwargs: Keyword arguments passed to the model.
 	"""
 
-	current_length: Union[jax.Array, sharding.NamedSharding]
-	sequences: Union[jax.Array, sharding.NamedSharding]
-	running_token: Union[jax.Array, sharding.NamedSharding]
-	is_sequence_finished: Union[jax.Array, sharding.NamedSharding]
-	prng_key: Union[random.PRNGKey, sharding.NamedSharding]
-	model_kwargs: Union[Dict[str, jax.Array], sharding.NamedSharding]
+	current_length: tp.Union[jax.Array, sharding.NamedSharding]
+	sequences: tp.Union[jax.Array, sharding.NamedSharding]
+	running_token: tp.Union[jax.Array, sharding.NamedSharding]
+	is_sequence_finished: tp.Union[jax.Array, sharding.NamedSharding]
+	prng_key: tp.Union[random.PRNGKey, sharding.NamedSharding]
+	model_kwargs: tp.Union[tp.Dict[str, jax.Array], sharding.NamedSharding]
 
 	# vInference Ops
-	generate_func_flops: Optional[float] = float("-inf")
-	interval_func_flops: Optional[float] = float("-inf")
-	tokens_pre_second: Optional[float] = float("-inf")
-	generated_tokens: Optional[int] = 0
-
-	def tree_flatten(self):
-		return (
-			self.current_length,
-			self.sequences,
-			self.running_token,
-			self.is_sequence_finished,
-			self.prng_key,
-			self.model_kwargs,
-			self.generate_func_flops,
-			self.interval_func_flops,
-			self.tokens_pre_second,
-			self.generated_tokens,
-		), {}
-
-	@classmethod
-	def tree_unflatten(cls, aux, children):
-		return cls(*children)
+	generate_func_flops: tp.Optional[float] = float("-inf")
+	interval_func_flops: tp.Optional[float] = float("-inf")
+	tokens_pre_second: tp.Optional[float] = float("-inf")
+	generated_tokens: tp.Optional[int] = 0
 
 	def __repr__(self):
 		"""
@@ -292,15 +276,14 @@ class SampleState:
 
 
 def create_sampling_step(
-	model,
 	logits_processor: FlaxLogitsProcessorList,
 	logits_warper: FlaxLogitsProcessorList,
 	eos_token_id: jax.Array,
 	pad_token_id: jax.Array,
 	do_sample: bool = True,
 ):
-	@fjformer.core.implicit_compact
-	def sampling_step(params, state: SampleState):
+	@ic
+	def sampling_step(model, state: SampleState):
 		"""
 		Performs a single sampling step for text generation.
 
@@ -313,8 +296,6 @@ def create_sampling_step(
 		"""
 		model_outputs = model(
 			input_ids=state.running_token,
-			params=params,
-			add_params_field=True,
 			return_dict=True,
 			**state.model_kwargs,
 		)
@@ -345,8 +326,7 @@ def create_sampling_step(
 			(0, state.current_length),
 		)
 		next_model_kwargs = model.update_inputs_for_generation(
-			model_outputs,
-			state.model_kwargs,
+			model_outputs, state.model_kwargs
 		)
 
 		return SampleState(

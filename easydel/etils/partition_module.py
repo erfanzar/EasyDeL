@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import NamedTuple, Optional, Tuple, Union
+import typing as tp
 
-AxisType = Optional[Union[Tuple[str, ...], str]]
+AxisType = tp.Optional[tp.Union[tp.Tuple[str, ...], str]]
 
 
-class PartitionAxis(NamedTuple):
+class PartitionAxis(tp.NamedTuple):
 	"""
 	A NamedTuple representing different axes of partitioning in a model.
 

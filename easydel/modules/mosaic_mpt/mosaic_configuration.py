@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Union
+
+import typing as tp
 
 from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
-from easydel.modules.factory import register_config
-from easydel.modules.modeling_utils import EasyDeLBaseConfig
+from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.infra.factory import register_config
 
 
 class MptAttentionConfig(EasyDeLBaseConfig):
@@ -161,6 +162,8 @@ class MptConfig(EasyDeLBaseConfig):
 		"num_attention_heads": "n_heads",
 		"hidden_size": "d_model",
 		"num_hidden_layers": "n_layers",
+		"max_position_embeddings": "max_seq_len",
+		"tie_word_embeddings": "use_lm_head",
 	}
 
 	def __init__(
@@ -175,9 +178,9 @@ class MptConfig(EasyDeLBaseConfig):
 		layer_norm_epsilon: float = 1e-5,
 		emb_prob_drop: float = 0.0,
 		learned_pos_emb: bool = True,
-		attn_config: Optional[MptAttentionConfig] = None,
-		init_device: str = "cpu",
-		logit_scale: Optional[Union[float, str]] = None,
+		attn_config: tp.Optional[MptAttentionConfig] = None,
+		init_device: str = "cpu",  # Ignored by EasyDeL.
+		logit_scale: tp.Optional[tp.Union[float, str]] = None,
 		no_bias: bool = True,
 		verbose: int = 0,
 		embedding_fraction: float = 1.0,
@@ -191,7 +194,7 @@ class MptConfig(EasyDeLBaseConfig):
 		use_lm_head: bool = False,
 		use_norm_bias: bool = False,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
 		if attn_config is None:
@@ -241,7 +244,7 @@ class MptConfig(EasyDeLBaseConfig):
 		"""
 		Get the partition rules for the model.
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
 			("transformer/wte/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
@@ -259,7 +262,7 @@ class MptConfig(EasyDeLBaseConfig):
 	def add_jax_args(
 		self,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
 		if hasattr(self, "attn_config"):

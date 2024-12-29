@@ -30,7 +30,7 @@ model at a given point in time. Think of it as a snapshot of your model. It incl
   state.
 * **Optimizer Management (`apply_gradients`, `free_opt_state`, `init_opt_state`)**: Provides methods for updating the
   model's parameters using gradients, releasing optimizer memory, and re-initializing the optimizer if needed.
-* **Sharding (`shard_params`)**:  Helps you distribute your model's parameters efficiently across multiple devices (
+* **Sharding (`shard_model`)**:  Helps you distribute your model's parameters efficiently across multiple devices (
   important for training large models).
 * **PyTorch Conversion (`to_pytorch`)**:  Gives you a way to convert your EasyDeL model to its PyTorch equivalent.
 

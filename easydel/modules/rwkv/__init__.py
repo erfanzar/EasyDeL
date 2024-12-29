@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.rwkv.modelling_rwkv_flax import (
-	FlaxRwkvForCausalLM,
-	FlaxRwkvModel,
-)
-from easydel.modules.rwkv.rwkv_configuration import RwkvConfig
+from .modeling_rwkv_flax import FlaxRwkvForCausalLM, FlaxRwkvModel
+from .rwkv_configuration import RwkvConfig
 
 __all__ = "FlaxRwkvForCausalLM", "FlaxRwkvModel", "RwkvConfig"

@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import warnings
-from typing import Dict, Optional, Union
+
+import typing as tp
 
 from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
-from easydel.modules.factory import register_config
-from easydel.modules.modeling_utils import EasyDeLBaseConfig
+from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.infra.factory import register_config
 
 
 @register_config("deepseek_v2")
@@ -119,7 +119,7 @@ class DeepseekV2Config(EasyDeLBaseConfig):
 	        The chunk size for scan MLP.
 	    bits (`int`, *optional*):
 	        The number of bits to quantize the model to.
-	    rope_scaling (`Dict[str, Union[str, float]]`, *optional*):
+	    rope_scaling (`tp.Dict[str, tp.Union[str, float]]`, *optional*):
 	        The rope scaling configuration.
 	"""
 
@@ -169,11 +169,10 @@ class DeepseekV2Config(EasyDeLBaseConfig):
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
-		bits: Optional[int] = None,
-		rope_scaling: Dict[str, Union[str, float]] = None,
+		bits: tp.Optional[int] = None,
+		rope_scaling: tp.Dict[str, tp.Union[str, float]] = None,
 		**kwargs,
 	):
-		warnings.warn("`DeepseekV2` is still in beta mode.", UserWarning, stacklevel=1)
 		self.vocab_size = vocab_size
 		self.max_position_embeddings = max_position_embeddings
 		self.hidden_size = hidden_size
@@ -230,7 +229,7 @@ class DeepseekV2Config(EasyDeLBaseConfig):
 		"""
 		Get the partition rules for the model.
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
 			("model/embed_tokens/embedding", PartitionSpec("tp", ("sp", "fsdp"))),
@@ -255,8 +254,8 @@ class DeepseekV2Config(EasyDeLBaseConfig):
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
-		bits: Optional[int] = None,
-		rope_scaling: Dict[str, Union[str, float]] = None,
+		bits: tp.Optional[int] = None,
+		rope_scaling: tp.Dict[str, tp.Union[str, float]] = None,
 		**kwargs,
 	):
 		"""The add_jax_args function adds the following arguments to the model:
@@ -269,7 +268,7 @@ class DeepseekV2Config(EasyDeLBaseConfig):
 		    use_scan_mlp: bool: Determine whether to use the scan_mlp
 		        function or not
 		    scan_mlp_chunk_size: int: Chunk the input to the mlp
-		    bits: Optional[int]: Specify the number of bits to use for
+		    bits: tp.Optional[int]: Specify the number of bits to use for
 		        quantization
 
 		Returns:

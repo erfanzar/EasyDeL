@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 # Implementation by @erfanzar,
 # with a few bug fixes and adjustments.
 
+import typing as tp
 from functools import partial
-from typing import Optional
 
 import jax
 import jax.interpreters
@@ -95,9 +96,9 @@ def _gpu_matmul_kernel_fwd(
 
 
 def _get_compiler_params(
-	blocksize_m: Optional[int],
-	blocksize_k: Optional[int],
-	blocksize_n: Optional[int],
+	blocksize_m: tp.Optional[int],
+	blocksize_k: tp.Optional[int],
+	blocksize_n: tp.Optional[int],
 	dtype: jnp.dtype,
 ):
 	params = None
@@ -178,9 +179,9 @@ def get_best_block_size(A, B):
 def _call_gpu_matmul_kernel_fwd(
 	A: jax.Array,
 	B: jax.Array,
-	blocksize_m: Optional[int],
-	blocksize_k: Optional[int],
-	blocksize_n: Optional[int],
+	blocksize_m: tp.Optional[int],
+	blocksize_k: tp.Optional[int],
+	blocksize_n: tp.Optional[int],
 	prod_dtype: jnp.dtype,
 	precision: jax.lax.PrecisionLike = None,
 ):
@@ -231,9 +232,9 @@ def _call_gpu_matmul_kernel_fwd(
 def _call_gpu_matmul_kernel_fwd_residual(
 	A: jax.Array,
 	B: jax.Array,
-	blocksize_m: Optional[int],
-	blocksize_k: Optional[int],
-	blocksize_n: Optional[int],
+	blocksize_m: tp.Optional[int],
+	blocksize_k: tp.Optional[int],
+	blocksize_n: tp.Optional[int],
 	prod_dtype: jnp.dtype,
 	precision: jax.lax.PrecisionLike = None,
 ):
@@ -292,9 +293,9 @@ def _call_gpu_matmul_kernel_bwd(
 def gpu_matmul(
 	A: jax.Array,
 	B: jax.Array,
-	blocksize_m: Optional[int],
-	blocksize_k: Optional[int],
-	blocksize_n: Optional[int],
+	blocksize_m: tp.Optional[int],
+	blocksize_k: tp.Optional[int],
+	blocksize_n: tp.Optional[int],
 	prod_dtype: jnp.dtype,
 	precision: jax.lax.PrecisionLike = None,
 ):

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Literal, Optional
+import typing as tp
 
 import chex
 import jax
@@ -21,10 +21,10 @@ from jax import numpy as jnp
 from jax import random as jrnd
 from jax.extend.backend import get_backend
 
-from easydel.kernels.cpu_ops import jax_ring_attention_mu
-from easydel.kernels.tpu_ops import pallas_ring_attention_tpu
+from .cpu_ops import jax_ring_attention_mu
+from .tpu_ops import pallas_ring_attention_tpu
 
-AVAILABLE_RING_ATTENTION_PLATFORM = Literal["pallas", "jax"]
+AVAILABLE_RING_ATTENTION_PLATFORM = tp.Literal["pallas", "jax"]
 BACKEND = get_backend().platform
 
 
@@ -32,23 +32,23 @@ def ring_attention(
 	query: chex.Array,
 	key: chex.Array,
 	value: chex.Array,
-	bias: Optional[chex.Array] = None,
-	segment_ids: Optional[chex.Array] = None,
-	axis_name: Optional[str] = None,
+	bias: tp.Optional[chex.Array] = None,
+	segment_ids: tp.Optional[chex.Array] = None,
+	axis_name: tp.Optional[str] = None,
 	float32_logits: bool = True,
-	softmax_scale: Optional[float] = None,
+	softmax_scale: tp.Optional[float] = None,
 	blocksize_q: int = 512,
 	blocksize_k: int = 512,
-	blocksize_c: Optional[int] = None,
+	blocksize_c: tp.Optional[int] = None,
 	deterministic: bool = True,
-	dropout_rng: Optional[chex.PRNGKey] = None,
+	dropout_rng: tp.Optional[chex.PRNGKey] = None,
 	pdrop: float = 0.0,
 	dtype: jnp.dtype = jnp.float32,
 	policy=jax.checkpoint_policies.nothing_saveable,
 	precision: lax.PrecisionLike = jax.lax.Precision.DEFAULT,
 	prevent_cse: bool = True,
 	cache_idx=None,
-	backend: Literal["cpu", "gpu", "tpu"] = ...,
+	backend: tp.Literal["cpu", "gpu", "tpu"] = ...,
 	platform: AVAILABLE_RING_ATTENTION_PLATFORM = ...,
 	autocheck: bool = True,
 ):
@@ -59,8 +59,8 @@ def ring_attention(
 		query: Query array of shape (batch, q_len, num_heads, dim_per_head).
 		key: Key array of shape (batch, kv_len, num_heads, dim_per_head).
 		value: Value array of shape (batch, kv_len, num_heads, dim_per_head).
-		bias: Optional bias array of shape (batch, num_heads, q_len, kv_len).
-		segment_ids: Optional segment ids array of shape (batch, seq_len).
+		bias: tp.Optional bias array of shape (batch, num_heads, q_len, kv_len).
+		segment_ids: tp.Optional segment ids array of shape (batch, seq_len).
 		axis_name: Name of the axis to ppermute over.
 		float32_logits: Whether to compute logits in float32.
 		softmax_scale: scale for softmax or depth ** -0.5.
@@ -228,7 +228,7 @@ def _test_forward():
 	try:
 		import flax
 
-		fo = flax.linen.attention.dot_product_attention(q, k, v, b)
+		fo = flax.nnx.dot_product_attention(q, k, v, b)
 		print(fo[-1, -1, -1, :5])
 	except Exception as er:
 		print("Flax OOM", er)
@@ -279,9 +279,7 @@ def _test_backward():
 	try:
 		import flax
 
-		fo = jax.grad(lambda *x: flax.linen.attention.dot_product_attention(*x).sum())(
-			q, k, v, b
-		)
+		fo = jax.grad(lambda *x: flax.nnx.dot_product_attention(*x).sum())(q, k, v, b)
 		print("Flax backward pass gradients:")
 		print(fo[-1][-1, -1, :5])  # Print last 5 elements of last head of last batch
 	except Exception as e:

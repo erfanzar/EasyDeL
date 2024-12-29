@@ -14,6 +14,7 @@
 
 # Implementation by @erfanzar,
 # with a few bug fixes and adjustments.
+from .pallas_gemm import pallas_gemm
+from .pallas_ring_attention import pallas_ring_attention_tpu
 
-from easydel.kernels.tpu_ops.pallas_gemm import pallas_gemm
-from easydel.kernels.tpu_ops.pallas_ring_attention import pallas_ring_attention_tpu
+__all__ = "pallas_gemm", "pallas_ring_attention_tpu"

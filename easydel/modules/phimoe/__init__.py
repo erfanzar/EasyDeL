@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.phimoe.modeling_phimoe_flax import (
-	FlaxPhiMoeForCausalLM,
-	FlaxPhiMoeModel,
-)
-from easydel.modules.phimoe.phimoe_configuration import PhiMoeConfig
+from .modeling_phimoe_flax import PhiMoeForCausalLM, PhiMoeModel
+from .phimoe_configuration import PhiMoeConfig
 
-__all__ = "FlaxPhiMoeForCausalLM", "FlaxPhiMoeModel", "PhiMoeConfig"
+__all__ = "PhiMoeForCausalLM", "PhiMoeModel", "PhiMoeConfig"

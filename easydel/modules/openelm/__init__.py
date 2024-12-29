@@ -12,10 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.openelm.modelling_openelm_flax import (
-	FlaxOpenELMForCausalLM,
-	FlaxOpenELMModel,
-)
-from easydel.modules.openelm.openelm_configuration import OpenELMConfig
+from .modeling_openelm_flax import OpenELMForCausalLM, OpenELMModel
+from .openelm_configuration import OpenELMConfig
 
-__all__ = "FlaxOpenELMForCausalLM", "FlaxOpenELMModel", "OpenELMConfig"
+__all__ = "OpenELMForCausalLM", "OpenELMModel", "OpenELMConfig"

@@ -43,10 +43,10 @@ Here, we define the basic configuration for our training process, including the 
 
 
 ```python
-model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 	pretrained_model_name_or_path,
 	input_shape=input_shape,
-	auto_shard_params=True,
+	auto_shard_model=True,
 	sharding_axis_dims=sharding_axis_dims,
 	config_kwargs=ed.EasyDeLBaseConfigDict(
 		use_scan_mlp=False,

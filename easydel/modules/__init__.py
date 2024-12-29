@@ -12,201 +12,214 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.arctic import (
+
+from easydel.infra.base_config import (
+	EasyDeLBaseConfig,
+	EasyDeLBaseConfigDict,
+)
+from easydel.infra.base_module import EasyDeLBaseModule
+
+from .arctic import (
 	ArcticConfig,
-	FlaxArcticForCausalLM,
-	FlaxArcticModel,
+	ArcticForCausalLM,
+	ArcticModel,
 )
-from easydel.modules.auto_causal_language_model import (
-	AutoEasyDeLModelForCausalLM,
-	AutoStateForCausalLM,
-)
-from easydel.modules.auto_speech_seq2seq_model import (
-	AutoEasyDeLModelForSpeechSeq2Seq,
-	AutoStateForSpeechSeq2Seq,
-)
-from easydel.modules.auto_configuration import (
+from .auto import (
 	AutoEasyDeLConfig,
+	AutoEasyDeLModelForCausalLM,
+	AutoEasyDeLModelForImageTextToText,
+	AutoEasyDeLModelForSeq2SeqLM,
+	AutoEasyDeLModelForSpeechSeq2Seq,
+	AutoEasyDeLModelForZeroShotImageClassification,
 	AutoShardAndGatherFunctions,
+	AutoStateForCausalLM,
+	AutoStateForImageTextToText,
+	AutoStateForSeq2SeqLM,
+	AutoStateForSpeechSeq2Seq,
+	AutoStateForZeroShotImageClassification,
 	get_modules_by_type,
 )
-from easydel.modules.cohere import (
-	CohereConfig,
-	FlaxCohereForCausalLM,
-	FlaxCohereModel,
+from .clip import (
+	CLIPConfig,
+	CLIPForImageClassification,
+	CLIPModel,
+	CLIPTextConfig,
+	CLIPTextModel,
+	CLIPTextModelWithProjection,
+	CLIPVisionConfig,
+	CLIPVisionModel,
 )
-from easydel.modules.dbrx import (
+from .cohere import (
+	CohereConfig,
+	CohereForCausalLM,
+	CohereModel,
+)
+from .dbrx import (
 	DbrxAttentionConfig,
 	DbrxConfig,
 	DbrxFFNConfig,
-	FlaxDbrxForCausalLM,
-	FlaxDbrxModel,
+	DbrxForCausalLM,
+	DbrxModel,
 )
-from easydel.modules.deepseek_v2 import (
+from .deepseek_v2 import (
 	DeepseekV2Config,
-	FlaxDeepseekV2ForCausalLM,
-	FlaxDeepseekV2Model,
+	DeepseekV2ForCausalLM,
+	DeepseekV2Model,
 )
-from easydel.modules.exaone import (
+from .exaone import (
 	ExaoneConfig,
-	FlaxExaoneForCausalLM,
-	FlaxExaoneModel,
+	ExaoneForCausalLM,
+	ExaoneModel,
 )
-from easydel.modules.falcon import (
+from .falcon import (
 	FalconConfig,
-	FlaxFalconForCausalLM,
-	FlaxFalconModel,
+	FalconForCausalLM,
+	FalconModel,
 )
-from easydel.modules.gemma import (
-	FlaxGemmaForCausalLM,
-	FlaxGemmaModel,
+from .gemma import (
 	GemmaConfig,
+	GemmaForCausalLM,
+	GemmaModel,
 )
-from easydel.modules.gemma2 import (
-	FlaxGemma2ForCausalLM,
-	FlaxGemma2Model,
+from .gemma2 import (
 	Gemma2Config,
+	Gemma2ForCausalLM,
+	Gemma2Model,
 )
-from easydel.modules.gpt2 import (
-	FlaxGPT2LMHeadModel,
-	FlaxGPT2Model,
+from .gpt2 import (
 	GPT2Config,
+	GPT2LMHeadModel,
+	GPT2Model,
 )
-from easydel.modules.gpt_j import (
-	FlaxGPTJForCausalLM,
-	FlaxGPTJModel,
+from .gpt_j import (
 	GPTJConfig,
+	GPTJForCausalLM,
+	GPTJModel,
 )
-from easydel.modules.gpt_neo_x import (
-	FlaxGPTNeoXForCausalLM,
-	FlaxGPTNeoXModel,
+from .gpt_neox import (
 	GPTNeoXConfig,
+	GPTNeoXForCausalLM,
+	GPTNeoXModel,
 )
-from easydel.modules.grok_1 import (
-	FlaxGrok1ForCausalLM,
-	FlaxGrok1Model,
+from .grok_1 import (
 	Grok1Config,
+	Grok1ForCausalLM,
+	Grok1Model,
 )
-from easydel.modules.internlm2.modeling_internlm2_flax import (
-	FlaxInternLM2ForCausalLM,
-	FlaxInternLM2ForSequenceClassification,
-	FlaxInternLM2Model,
+from .internlm2 import (
 	InternLM2Config,
+	InternLM2ForCausalLM,
+	InternLM2ForSequenceClassification,
+	InternLM2Model,
 )
-from easydel.modules.llama import (
-	FlaxLlamaForCausalLM,
-	FlaxLlamaForSequenceClassification,
-	FlaxLlamaModel,
-	FlaxVisionLlamaForCausalLM,
+from .llama import (
 	LlamaConfig,
-	VisionLlamaConfig,
+	LlamaForCausalLM,
+	LlamaForSequenceClassification,
+	LlamaModel,
 )
-from easydel.modules.mamba import (
-	FlaxMambaCache,
-	FlaxMambaForCausalLM,
-	FlaxMambaModel,
+from .mamba import (
 	MambaConfig,
+	MambaForCausalLM,
+	MambaModel,
 )
-from easydel.modules.mamba2 import (
-	FlaxMamba2Cache,
-	FlaxMamba2ForCausalLM,
-	FlaxMamba2Model,
+from .mamba2 import (
 	Mamba2Config,
+	Mamba2ForCausalLM,
+	Mamba2Model,
 )
-from easydel.modules.mistral import (
-	FlaxMistralForCausalLM,
-	FlaxMistralModel,
-	FlaxVisionMistralForCausalLM,
+from .mistral import (
 	MistralConfig,
-	VisionMistralConfig,
+	MistralForCausalLM,
+	MistralModel,
 )
-from easydel.modules.mixtral import (
-	FlaxMixtralForCausalLM,
-	FlaxMixtralModel,
+from .mixtral import (
 	MixtralConfig,
+	MixtralForCausalLM,
+	MixtralModel,
 )
-from easydel.modules.modeling_utils import (
-	EasyDeLBaseConfig,
-	EasyDeLBaseModule,
-	EasyDeLBaseVisionModule,
-	EasyDeLBaseConfigDict,
-)
-from easydel.modules.mosaic_mpt import (
-	FlaxMptForCausalLM,
-	FlaxMptModel,
+from .mosaic_mpt import (
 	MptAttentionConfig,
 	MptConfig,
+	MptForCausalLM,
+	MptModel,
 )
-from easydel.modules.olmo import (
-	FlaxOlmoForCausalLM,
-	FlaxOlmoModel,
+from .olmo import (
 	OlmoConfig,
+	OlmoForCausalLM,
+	OlmoModel,
 )
-from easydel.modules.olmo2 import (
-	FlaxOlmo2ForCausalLM,
-	FlaxOlmo2Model,
+from .olmo2 import (
 	Olmo2Config,
+	Olmo2ForCausalLM,
+	Olmo2Model,
 )
-
-from easydel.modules.openelm import (
-	FlaxOpenELMForCausalLM,
-	FlaxOpenELMModel,
+from .openelm import (
 	OpenELMConfig,
+	OpenELMForCausalLM,
+	OpenELMModel,
 )
-from easydel.modules.opt import (
-	FlaxOPTForCausalLM,
-	FlaxOPTModel,
+from .opt import (
 	OPTConfig,
+	OPTForCausalLM,
+	OPTModel,
 )
-from easydel.modules.palm import (
-	FlaxPalmForCausalLM,
-	FlaxPalmModel,
-	PalmConfig,
-)
-from easydel.modules.phi import (
-	FlaxPhiForCausalLM,
-	FlaxPhiModel,
+from .phi import (
 	PhiConfig,
+	PhiForCausalLM,
+	PhiModel,
 )
-from easydel.modules.phi3 import (
-	FlaxPhi3ForCausalLM,
-	FlaxPhi3Model,
+from .phi3 import (
 	Phi3Config,
+	Phi3ForCausalLM,
+	Phi3Model,
 )
-from easydel.modules.phimoe import (
-	FlaxPhiMoeForCausalLM,
-	FlaxPhiMoeModel,
+from .phimoe import (
 	PhiMoeConfig,
+	PhiMoeForCausalLM,
+	PhiMoeModel,
 )
-from easydel.modules.qwen2 import (
-	FlaxQwen2ForCausalLM,
-	FlaxQwen2ForSequenceClassification,
-	FlaxQwen2Model,
+from .pixtral import (
+	PixtralVisionConfig,
+	PixtralVisionModel,
+)
+from .qwen2 import (
 	Qwen2Config,
+	Qwen2ForCausalLM,
+	Qwen2ForSequenceClassification,
+	Qwen2Model,
 )
-from easydel.modules.qwen2_moe import (
-	FlaxQwen2MoeForCausalLM,
-	FlaxQwen2MoeModel,
+from .qwen2_moe import (
 	Qwen2MoeConfig,
+	Qwen2MoeForCausalLM,
+	Qwen2MoeModel,
 )
-from easydel.modules.stablelm import (
-	FlaxStableLmForCausalLM,
-	FlaxStableLmModel,
+from .qwen2_vl import (
+	Qwen2VLConfig,
+	Qwen2VLForConditionalGeneration,
+	Qwen2VLModel,
+)
+from .roberta import (
+	RobertaConfig,
+	RobertaForCausalLM,
+	RobertaForMultipleChoice,
+	RobertaForQuestionAnswering,
+	RobertaForSequenceClassification,
+	RobertaForTokenClassification,
+)
+from .stablelm import (
 	StableLmConfig,
+	StableLmForCausalLM,
+	StableLmModel,
 )
-from easydel.modules.t5 import (
-	FlaxT5ForConditionalGeneration,
-	FlaxT5Model,
-	T5Config,
-)
-from easydel.modules.whisper import (
-	FlaxWhisperForAudioClassification,
-	FlaxWhisperForConditionalGeneration,
-	FlaxWhisperTimeStampLogitsProcessor,
+from .whisper import (
 	WhisperConfig,
+	WhisperForAudioClassification,
+	WhisperForConditionalGeneration,
+	WhisperTimeStampLogitsProcessor,
 )
-from easydel.modules.xerxes import (
-	FlaxXerxesForCausalLM,
-	FlaxXerxesModel,
+from .xerxes import (
 	XerxesConfig,
+	XerxesForCausalLM,
+	XerxesModel,
 )
