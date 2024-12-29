@@ -141,7 +141,8 @@ class SFTTrainer(Trainer):
 
 		dataloader_train = tfds.as_numpy(
 			self.dataset_train.to_tf_dataset(
-				batch_size=self.arguments.total_batch_size,
+				batch_size=self.arguments.total_batch_size
+				* self.arguments.gradient_accumulation_steps,
 				drop_remainder=True,
 				num_workers=self.arguments.dataloader_num_workers,
 				collate_fn=self.create_collect_function(
