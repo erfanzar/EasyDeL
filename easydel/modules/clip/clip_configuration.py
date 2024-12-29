@@ -16,8 +16,39 @@
 from easydel.etils.etils import get_logger
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
+from jax.sharding import PartitionSpec
 
 logger = get_logger(__name__)
+
+
+def _get_partition_rules(self, *arg, **kwargs):
+	return (
+		# Embeddings
+		("token_embedding/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+		("position_embedding/embedding", PartitionSpec(None, "tp")),
+		# Patch embedding and class embedding (vision specific)
+		("patch_embedding/kernel", PartitionSpec(None, None, None, "tp")),
+		("patch_embedding/bias", PartitionSpec(None)),
+		("class_embedding", PartitionSpec("tp")),
+		# Common attention layers
+		("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+		("self_attn/(out_proj|o_proj)/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+		("self_attn/(q_proj|k_proj|v_proj)/bias", PartitionSpec("tp")),
+		("self_attn/(out_proj|o_proj)/bias", PartitionSpec(None)),
+		# Common MLP layers
+		("mlp/(fc1|gate_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+		("mlp/(fc2|down_proj)/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+		("mlp/(fc1|gate_proj)/bias", PartitionSpec("tp")),
+		("mlp/(fc2|down_proj)/bias", PartitionSpec(None)),
+		# Layer norms
+		("layer_norm\d*/(bias|scale)", PartitionSpec(None)),
+		(".*layernorm/(bias|scale)", PartitionSpec(None)),
+		# Projections
+		(".*projection/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+		(".*projection/bias", PartitionSpec(None)),
+		# Catch-all
+		(".*", PartitionSpec(None)),
+	)
 
 
 @register_config("clip_text_model")
@@ -124,6 +155,8 @@ class CLIPTextConfig(EasyDeLBaseConfig):
 		self.initializer_factor = initializer_factor
 		self.attention_dropout = attention_dropout
 
+	get_partition_rules = _get_partition_rules
+
 
 @register_config("clip_vision_model")
 class CLIPVisionConfig(EasyDeLBaseConfig):
@@ -216,6 +249,8 @@ class CLIPVisionConfig(EasyDeLBaseConfig):
 		self.attention_dropout = attention_dropout
 		self.layer_norm_eps = layer_norm_eps
 		self.hidden_act = hidden_act
+
+	get_partition_rules = _get_partition_rules
 
 
 @register_config("clip")
@@ -390,3 +425,5 @@ class CLIPConfig(EasyDeLBaseConfig):
 			vision_config=vision_config.to_dict(),
 			**kwargs,
 		)
+
+	get_partition_rules = _get_partition_rules
