@@ -22,16 +22,20 @@ from fjformer.checkpoint import get_dtype
 from jax import dlpack
 from jax import numpy as jnp
 from tqdm.autonotebook import tqdm
-
 from easydel.etils.etils import get_logger
-
 from .analyze_memory import SMPMemoryMonitor
 from .traversals import flatten_dict, unflatten_dict
 
 if tp.TYPE_CHECKING:
 	from transformers import PreTrainedModel
+	from easydel.infra.base_module import EasyDeLBaseModule
+	from easydel.infra.base_config import EasyDeLBaseConfig
+
 else:
 	PreTrainedModel = tp.Any
+	EasyDeLBaseModule = tp.Any
+	EasyDeLBaseConfig = tp.Any
+
 mem_ops = SMPMemoryMonitor(5)
 logger = get_logger(__name__)
 
@@ -237,14 +241,15 @@ def torch_dict_to_easydel_params(
 		return unflatten_dict(flax_dict)
 
 
-def easystate_to_torch(
-	state,
-	dtype=jnp.float16,
-	transpose_needed=None,
-	transpose_not_needed=None,
-	select_params_field: bool = True,
+def module_to_torch(
+	module: EasyDeLBaseModule,
+	dtype: jnp.dtype = jnp.float16,
+	transpose_needed: tp.Optional[tp.Dict] = None,
+	transpose_not_needed: tp.Optional[tp.Dict] = None,
 	rnn_based_or_rwkv: bool = False,
 ):
+	if dtype is None:
+		dtype = module.param_dtype
 	if transpose_needed is None:
 		transpose_needed = ["kernel"]
 	if transpose_not_needed is None:
@@ -259,18 +264,35 @@ def easystate_to_torch(
 				return False
 		return True
 
-	model_parameters = (
-		flatten_dict(state.params["params"], sep=".")
-		if select_params_field
-		else flatten_dict(state.params, sep=".")
-	)
+	graphtree = unflatten_dict(module.parameters)
+	model_parameters = flatten_dict(graphtree, sep=".")
 	torch_state_dict = {}
 	pbar = tqdm(
-		model_parameters.items(), desc="Converting EasyDeLState to torch state_dict"
+		model_parameters.items(), desc="Converting EasyDeLBaseModule to torch state_dict"
 	)
 	for key, tensor in pbar:
+		if tensor is None:
+			continue
 		if match_keywords(key, transpose_needed, transpose_not_needed):
-			tensor = tensor.T
+			ndim = tensor.ndim
+			match ndim:
+				case 2:
+					# linear layers
+					tensor = jnp.swapaxes(tensor, 0, 1)  # Same as PT->JAX since it's symmetric
+				case 3:
+					# 1d conv layers
+					tensor = jnp.swapaxes(tensor, 0, 2)  # Same as PT->JAX since it's symmetric
+				case 4:
+					# 2d conv layers
+					tensor = jnp.transpose(tensor, (3, 2, 0, 1))  # Reverse of (2,3,1,0)
+				case 5:
+					# 3d conv layers
+					tensor = jnp.transpose(tensor, (4, 3, 0, 1, 2))  # Reverse of (2,3,4,1,0)
+				case 6:
+					# 4d conv layers
+					tensor = jnp.transpose(tensor, (5, 4, 3, 2, 0, 1))  # Reverse of (4,5,3,2,1,0)
+				case _:
+					...
 		elif rnn_based_or_rwkv and ("time_mix_" in key or "time_" in key):
 			tensor = tensor.reshape(1, 1, -1)
 		if tensor.dtype != get_dtype(dtype):
@@ -285,15 +307,14 @@ def easystate_to_torch(
 	return torch_state_dict
 
 
-def easystate_to_huggingface_model(
-	state,
-	config,
+def module_to_huggingface_model(
+	module: EasyDeLBaseModule,
+	config: EasyDeLBaseConfig,
 	base_huggingface_module: PreTrainedModel,
-	base_huggingface_module_kwarguments=None,
+	base_huggingface_module_kwarguments: tp.Optional[tp.Dict] = None,
 	dtype=jnp.float16,
-	transpose_needed=None,
+	transpose_needed: tp.Optional[tp.List] = None,
 	transpose_not_needed=None,
-	select_params_field: bool = True,
 	rnn_based_or_rwkv: bool = False,
 	auto_correct: bool = True,
 	use_meta_torch: bool = True,
@@ -312,16 +333,15 @@ def easystate_to_huggingface_model(
 		base_huggingface_module_kwarguments = {}
 
 	if auto_correct:
-		for k, v in state.unsafe_dict(config.__dict__).items():
+		for k, v in config.__dict__.items():
 			if not hasattr(config, k):
 				setattr(config, k, v)
 
-	state_dict = easystate_to_torch(
-		state=state,
+	state_dict = module_to_torch(
+		module=module,
 		dtype=dtype,
 		transpose_needed=transpose_needed,
 		transpose_not_needed=transpose_not_needed,
-		select_params_field=select_params_field,
 		rnn_based_or_rwkv=rnn_based_or_rwkv,
 	)
 	import torch
@@ -332,13 +352,21 @@ def easystate_to_huggingface_model(
 				config=config,
 				**base_huggingface_module_kwarguments,
 			)
-		model.load_state_dict(state_dict, assign=True, strict=True)
+		model.load_state_dict(
+			state_dict,
+			assign=True,
+			strict=True,
+		)
 	else:
 		model = base_huggingface_module(
 			config=config,
 			**base_huggingface_module_kwarguments,
 		)
-		model.load_state_dict(state_dict, assign=True, strict=True)
+		model.load_state_dict(
+			state_dict,
+			assign=True,
+			strict=True,
+		)
 	return model
 
 

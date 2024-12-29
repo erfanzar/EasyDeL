@@ -110,6 +110,15 @@ class EasyDeLBaseModule(
 		_ = self.model_type
 
 	@property
+	def parameters(self):
+		from easydel.utils.graph_utils import iter_module_search
+
+		parameters = {}
+		for key, value in iter_module_search(self, nn.Param):
+			parameters[key] = value.value
+		return parameters
+
+	@property
 	def graphtree_params_shape(self) -> tp.Dict:
 		"""Evaluates the shape of the model's parameters and returns a dictionary."""
 		graphtree = nn.eval_shape(lambda: nn.split(self, nn.Param, ...)[1])
@@ -345,6 +354,19 @@ class EasyDeLBaseModule(
 		from easydel.etils.easystate import EasyDeLState
 
 		return EasyDeLState.create(step=0, model=self)
+
+	def to_torch(self, **kwargs):
+		from easydel.utils.parameters_transformation import module_to_huggingface_model
+
+		hf_autoloader = self.get_torch_loader()
+		model_class = hf_autoloader._model_mapping[type(self.config)]
+		hf_model = module_to_huggingface_model(
+			module=self,
+			base_huggingface_module=model_class,
+			config=self.config,
+			**kwargs,
+		)
+		return hf_model
 
 	def prepare_inputs_for_call(self, **kwargs):
 		return kwargs

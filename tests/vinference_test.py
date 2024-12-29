@@ -6,6 +6,7 @@ import time
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+import easydel as ed
 # fmt:on
 import jax
 import torch
@@ -14,7 +15,6 @@ from huggingface_hub import HfApi
 from jax import numpy as jnp
 from jax import sharding
 
-import easydel as ed
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
@@ -30,14 +30,14 @@ threading.Thread(target=log_mem)  # .start()
 
 def main():
 	sharding_axis_dims = (1, 1, 1, -1)
-	max_length = 2048
+	max_length = 8192
 
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
 	# pretrained_model_name_or_path = "AntonV/mamba2-370m-hf"
-	dtype = jnp.float16
+
 	partition_axis = ed.PartitionAxis()
 
-	dtype = jnp.float16
+	dtype = jnp.bfloat16
 
 	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		pretrained_model_name_or_path,
@@ -51,9 +51,9 @@ def main():
 			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		),
-		quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
+		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 		platform=ed.EasyDeLPlatforms.TRITON,
-		param_dtype=jnp.float16,
+		param_dtype=jnp.float8_e5m2,
 		dtype=dtype,
 		torch_dtype=torch.float16,
 		partition_axis=partition_axis,
@@ -88,8 +88,8 @@ def main():
 	print(model.model_type)
 	print("Compiling")
 	inference.precompile(1, inference.model_prefill_length)
-	print("Done Compiling")
 
+	print("Done Compiling")
 	messages = [
 		# {
 		# 	"role": "system",
