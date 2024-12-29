@@ -1,14 +1,16 @@
 import gc
 import os
+import typing as tp
 
-# os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
+os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=64"
 import sys
 import time
 import unittest
 
 import jax
 
-# jax.config.update("jax_platform_name", "cpu")  # CPU Test !
+jax.config.update("jax_platform_name", "cpu")  # CPU Test !
+import easydel as ed
 import jax.extend
 import jax.random
 from fjformer import make_shard_and_gather_fns, match_partition_rules
@@ -20,18 +22,16 @@ sys.path.append(
 	)
 )
 import copy
-from typing import Dict, Optional, Union
 
 import jax
 import numpy as np
 import torch
 import transformers
 from fjformer.functions import cross_entropy_loss_and_accuracy
-from flax.traverse_util import flatten_dict, unflatten_dict  # noqa
+from flax import nnx as nn
 from jax import numpy as jnp
 from tabulate import tabulate
 
-import easydel as ed
 from easydel.etils.etils import (
 	AVAILABLE_ATTENTION_MECHANISMS,
 	DEFAULT_ATTENTION_MECHANISM,
@@ -49,7 +49,7 @@ class EasyModelsTest(unittest.TestCase):
 		self.intermediate_size: int = 256
 		self.num_hidden_layers: int = 6
 		self.num_attention_heads: int = 8
-		self.num_key_value_heads: Optional[int] = 4
+		self.num_key_value_heads: tp.Optional[int] = 4
 		self.num_experts_per_tok = 4
 		self.num_experts = 8
 		self.num_local_experts = self.num_experts
@@ -68,9 +68,9 @@ class EasyModelsTest(unittest.TestCase):
 		self.gradient_checkpointing = EasyDeLGradientCheckPointers.NONE
 		self.fcm_min_ratio: float = -1
 		self.fcm_max_ratio: float = -1
-		self.rope_scaling: Optional[Dict[str, Union[str, float]]] = None
+		self.rope_scaling: tp.Optional[tp.Dict[str, tp.Union[str, float]]] = None
 		self.use_scan_mlp: bool = False
-		self.bits: Optional[int] = None
+		self.bits: tp.Optional[int] = None
 		self.hidden_act: str = "silu"
 		self.pretraining_tp: int = 1
 		self.scan_layers: bool = False
@@ -96,10 +96,12 @@ class EasyModelsTest(unittest.TestCase):
 		)
 		self.platform = "triton"
 
-	def create_test_for_models(self, module_name: str, hf_module_class):
-		(module_config, module_class, transform_function) = ed.get_modules_by_type(
-			module_name
-		)
+	def create_test_for_models(self, module_name: str, hf_module_class, task):
+		(
+			module_config,
+			module_class,
+			_,
+		) = ed.get_modules_by_type(module_name, task)
 		if self.header_config is None:
 			config = module_config(
 				num_experts_per_tok=self.num_experts_per_tok,
@@ -137,13 +139,6 @@ class EasyModelsTest(unittest.TestCase):
 		hf_model = hf_module_class(config=copy.deepcopy(config))
 		hf_model.eval()
 		hf_model = hf_model.float()
-		params = {
-			"params": transform_function(
-				state_dict=hf_model.state_dict(),
-				device=jax.devices("cpu")[0],
-				remove_state_dict=True,
-			)
-		}
 
 		config.add_jax_args()
 		config.add_basic_configurations(
@@ -154,74 +149,53 @@ class EasyModelsTest(unittest.TestCase):
 		mesh = config.mesh
 
 		with mesh:
-			partition_specs = match_partition_rules(config.get_partition_rules(True), params)
-			shard, _ = make_shard_and_gather_fns(partition_specs, mesh)
-
-			params = jax.tree_util.tree_map(lambda p, f: f(p), params, shard)
 			config.add_basic_configurations(
 				attn_mechanism=self.attn_mechanism,
 				blocksize_k=self.blocksize_k,
 				blocksize_q=self.blocksize_q,
 				attn_dtype=self.attn_dtype,
 			)
-			if module_name == "exaone":  # it's EXAONE Issue
-				flatten_params = flatten_dict(params, sep=".")
-				params = {}
-				for k in list(flatten_params.keys()):
-					params[k.replace("attn.attention", "attn")] = flatten_params[k]
-				params = unflatten_dict(params, sep=".")
 
 			torch_input_ids, jax_input_ids = self.make_input_id(
 				self.vocab_size,
-				(self.batch_size, self.sequence_length + 1),
+				(self.batch_size, self.sequence_length),
 			)
 			torch_time = time.time()
 			hf_output = hf_model(
-				input_ids=torch_input_ids[:, :-1],
-				labels=torch_input_ids[:, 1:],
+				input_ids=torch_input_ids,
+				labels=torch_input_ids,
 				past_key_values=None,
 			)
 			torch_time = time.time() - torch_time
-			ed_model = module_class(
+			ed_model = module_class.lazy_init(
 				config=config,
 				dtype=self.dtype,
 				param_dtype=self.dtype,
 				precision=self.precision,
-				_do_init=False,
-				input_shape=(self.batch_size, self.sequence_length),
+				rngs=nn.Rngs(0),
 			)
+			ed_model = ed.traversals.merge_model_and_tree(
+				ed_model,
+				tree=ed_model.transform_fn(hf_model.state_dict()),
+			)
+			ed_model.eval()
+			ed_model = ed_model.shard_model()
 
-			ed_output = ed_model(
-				input_ids=jax_input_ids[:, :-1],
-				params=params,
-				return_dict=True,
-				add_params_field=False,
-				train=False,
-				deterministic=True,
-			)
+			@jax.jit
+			def jited(ids):
+				return ed_model.compute_loss(input_ids=ids)
+
+			ed_output = jited(jax_input_ids)
 			easy_time = time.time()
-			ed_output = ed_model(
-				input_ids=jax_input_ids[:, :-1],
-				params=params,
-				return_dict=True,
-				add_params_field=False,
-				train=False,
-				deterministic=True,
-			)
+			ed_output, metrics = jited(jax_input_ids)
 			easy_time = time.time() - easy_time
-			loss, _ = cross_entropy_loss_and_accuracy(
-				ed_output.logits,
-				jax_input_ids[:, 1:],
-			)
 
-			del params
 			del hf_model
 			gc.collect()
 			return self.compare_torch_to_jax(
 				module_name,
 				hf_output,
 				ed_output,
-				loss,
 				easy_time=easy_time,
 				torch_time=torch_time,
 			)
@@ -279,14 +253,12 @@ class EasyModelsTest(unittest.TestCase):
 				blocksize_k=self.blocksize_k,
 				blocksize_q=self.blocksize_q,
 			)
-			# prm = flax.traverse_util.flatten_dict(params, sep=".")
+
 			ed_model = module_class(
 				config=config,
 				dtype=self.dtype,
 				param_dtype=self.dtype,
 				precision=self.precision,
-				_do_init=False,
-				input_shape=(self.batch_size, self.sequence_length),
 			)
 
 			torch_input_ids, jax_input_ids = self.make_input_id(
@@ -302,8 +274,6 @@ class EasyModelsTest(unittest.TestCase):
 				input_ids=jax_input_ids[:, :-1],
 				params=params,
 				return_dict=True,
-				add_params_field=False,
-				train=False,
 				output_router_logits=True,
 			)
 			loss, _ = cross_entropy_loss_and_accuracy(
@@ -331,7 +301,11 @@ class EasyModelsTest(unittest.TestCase):
 			"original_max_position_embeddings": 8192,
 			"rope_type": "llama3",
 		}
-		res, err = self.create_test_for_models("llama", transformers.LlamaForCausalLM)
+		res, err = self.create_test_for_models(
+			"llama",
+			transformers.LlamaForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"Llama model Failed [ERROR {err}]")
 		self.rope_scaling = None
 
@@ -339,11 +313,15 @@ class EasyModelsTest(unittest.TestCase):
 		self.header_config = ed.MptConfig(
 			d_model=self.hidden_size,
 			n_heads=self.num_attention_heads,
-			n_layers=1,
+			n_layers=4,
 			attn_config=ed.MptAttentionConfig(),
 			axis_dims=(1, 1, 1, -1),
 		)
-		res, err = self.create_test_for_models("mpt", transformers.MptForCausalLM)
+		res, err = self.create_test_for_models(
+			"mpt",
+			transformers.MptForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.header_config = None
 		self.assertTrue(res, f"MPT model Failed [ERROR {err}]")
 
@@ -353,35 +331,56 @@ class EasyModelsTest(unittest.TestCase):
 		res, err = self.create_test_for_models(
 			"falcon",
 			transformers.FalconForCausalLM,
+			ed.TaskType.CAUSAL_LM,
 		)
 		self.header_config = None
 		self.assertTrue(res, f"Falcon model Failed [ERROR {err}]")
 
 	def test_mistral(self):
 		self.header_config = None
-		res, err = self.create_test_for_models("mistral", transformers.MistralForCausalLM)
+		res, err = self.create_test_for_models(
+			"mistral",
+			transformers.MistralForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"Mistral model Failed [ERROR {err}]")
 
 	def test_exaone(self):
 		self.header_config = None
 		hf_model, conf = self.get_hf_model_from_hub("LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct")
-		res, err = self.create_test_for_models("exaone", hf_model)
+		res, err = self.create_test_for_models(
+			"exaone",
+			hf_model,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"EXAONE model Failed [ERROR {err}]")
 
 	def test_internlm2(self):
 		self.header_config = None
 		hf_model, conf = self.get_hf_model_from_hub("internlm/internlm2_5-7b-chat")
-		res, err = self.create_test_for_models("internlm2", hf_model)
+		res, err = self.create_test_for_models(
+			"internlm2",
+			hf_model,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"INTERNLM2 model Failed [ERROR {err}]")
 
 	def test_mixtral(self):
 		self.header_config = None
-		res, err = self.create_test_for_models("mixtral", transformers.MixtralForCausalLM)
+		res, err = self.create_test_for_models(
+			"mixtral",
+			transformers.MixtralForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"Mixtral model Failed [ERROR {err}]")
 
 	def test_gpt2(self):
 		self.header_config = None
-		res, err = self.create_test_for_models("gpt2", transformers.GPT2LMHeadModel)
+		res, err = self.create_test_for_models(
+			"gpt2",
+			transformers.GPT2LMHeadModel,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"GPT2 model Failed [ERROR {err}]")
 
 	def test_gptj(self):
@@ -393,24 +392,59 @@ class EasyModelsTest(unittest.TestCase):
 			n_head=self.num_attention_heads,
 			rotary_dim=self.hidden_size // self.num_attention_heads,
 		)
-		res, err = self.create_test_for_models("gptj", transformers.GPTJForCausalLM)
+		res, err = self.create_test_for_models(
+			"gptj",
+			transformers.GPTJForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.header_config = None
 		self.assertTrue(res, f"GPT-J model Failed [ERROR {err}]")
 
+	def test_gpt_noex(self):
+		self.header_config = ed.GPTNeoXConfig(
+			vocab_size=self.vocab_size,
+			max_position_embeddings=self.max_position_embeddings,
+			hidden_size=self.hidden_size,
+			num_hidden_layers=self.num_hidden_layers,
+			num_attention_heads=self.num_attention_heads,
+			rotary_pct=1,
+			rope_scaling=None,
+		)
+		res, err = self.create_test_for_models(
+			"gpt_neox",
+			transformers.GPTNeoXForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
+		self.header_config = None
+		self.assertTrue(res, f"GPT-NoeX model Failed [ERROR {err}]")
+
 	def test_qwen2(self):
 		self.header_config = None
-		res, err = self.create_test_for_models("qwen2", transformers.Qwen2ForCausalLM)
+		self.rope_scaling = None
+		res, err = self.create_test_for_models(
+			"qwen2",
+			transformers.Qwen2ForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"Qwen 2 model Failed [ERROR {err}]")
 
 	def test_olmo(self):
 		self.header_config = None
-		res, err = self.create_test_for_models("olmo", transformers.OlmoForCausalLM)
+		res, err = self.create_test_for_models(
+			"olmo",
+			transformers.OlmoForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"OLMo model Failed [ERROR {err}]")
 
 	def test_olmo2(self):
 		self.header_config = None
-		res, err = self.create_test_for_models("olmo2", transformers.Olmo2ForCausalLM)
-		self.assertTrue(res, f"OLMo model Failed [ERROR {err}]")
+		res, err = self.create_test_for_models(
+			"olmo2",
+			transformers.Olmo2ForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
+		self.assertTrue(res, f"OLMo2 model Failed [ERROR {err}]")
 
 	def test_phi(self):
 		self.header_config = ed.PhiConfig(
@@ -436,7 +470,11 @@ class EasyModelsTest(unittest.TestCase):
 			bos_token_id=1,
 			eos_token_id=2,
 		)
-		res, err = self.create_test_for_models("phi", transformers.PhiForCausalLM)
+		res, err = self.create_test_for_models(
+			"phi",
+			transformers.PhiForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.header_config = None
 		self.assertTrue(res, f"PHI 2 model Failed [ERROR {err}]")
 
@@ -444,7 +482,11 @@ class EasyModelsTest(unittest.TestCase):
 		self.header_config = None
 		org = self.tie_word_embeddings
 		self.tie_word_embeddings = True
-		res, err = self.create_test_for_models("gemma", transformers.GemmaForCausalLM)
+		res, err = self.create_test_for_models(
+			"gemma",
+			transformers.GemmaForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.tie_word_embeddings = org
 		self.assertTrue(res, f"Gemma model Failed [ERROR {err}]")
 
@@ -461,19 +503,56 @@ class EasyModelsTest(unittest.TestCase):
 			attn_config=ed.DbrxAttentionConfig(),
 		)
 
-		res, err = self.create_test_for_models("dbrx", transformers.DbrxForCausalLM)
+		res, err = self.create_test_for_models(
+			"dbrx",
+			transformers.DbrxForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"DBRX model Failed [ERROR {err}]")
 
 	def test_stablelm(self):
 		self.header_config = None
-		res, err = self.create_test_for_models("stablelm", transformers.StableLmForCausalLM)
+		res, err = self.create_test_for_models(
+			"stablelm",
+			transformers.StableLmForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 
 		self.assertTrue(res, f"StableLM model Failed [ERROR {err}]")
 
 	def test_phi3(self):
 		self.header_config = None
-		hf_model, conf = self.get_hf_model_from_hub("microsoft/Phi-3-mini-128k-instruct")
-		res, err = self.create_test_for_models("phi3", hf_model)
+		self.rope_scaling = {
+			"long_factor": [
+				1.0199999809265137,
+				1.0299999713897705,
+				1.0399999618530273,
+				1.0499999523162842,
+				1.7,
+				1.7,
+				1.8,
+				1.9,
+			],
+			"long_mscale": 1.8,
+			"original_max_position_embeddings": 4,
+			"short_factor": [
+				1.0,
+				1.0399999618530273,
+				1.0399999618530273,
+				1.0399999618530273,
+				1.0499999523162842,
+				1.6,
+				1.7,
+				1.8,
+			],
+			"short_mscale": 1.1,
+			"type": "longrope",
+		}
+		res, err = self.create_test_for_models(
+			"phi3",
+			transformers.Phi3ForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"PHI3 model Failed [ERROR {err}]")
 
 	def test_phimoe(self):
@@ -505,13 +584,19 @@ class EasyModelsTest(unittest.TestCase):
 			"short_mscale": 1.243163121016122,
 			"type": "longrope",
 		}
-		res, err = self.create_test_for_models("phimoe", hf_model)
+		res, err = self.create_test_for_models(
+			"phimoe",
+			hf_model,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"PHIMOE model Failed [ERROR {err}]")
 
 	def test_deepseek_v2(self):
 		self.header_config = None
 		hf_model, conf = self.get_hf_model_from_hub("deepseek-ai/DeepSeek-V2")
-		res, err = self.create_test_for_models("deepseek_v2", hf_model)
+		res, err = self.create_test_for_models(
+			"deepseek_v2", hf_model, ed.TaskType.CAUSAL_LM
+		)
 
 		self.assertTrue(res, f"DeepSeekv2 model Failed [ERROR {err}]")
 
@@ -522,14 +607,22 @@ class EasyModelsTest(unittest.TestCase):
 		for k, v in conf.__dict__.items():
 			setattr(conf_f, k, v)
 		self.header_config = conf_f
-		res, err = self.create_test_for_models("openelm", hf_model)
+		res, err = self.create_test_for_models(
+			"openelm",
+			hf_model,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.header_config = None
 		self.assertTrue(res, f"OpenELM model Failed [ERROR {err}]")
 
 	def test_arctic(self):
 		self.header_config = None
 		hf_model, conf = self.get_hf_model_from_hub("Snowflake/snowflake-arctic-instruct")
-		res, err = self.create_test_for_models("arctic", hf_model)
+		res, err = self.create_test_for_models(
+			"arctic",
+			hf_model,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"ARCTIC model Failed [ERROR {err}]")
 
 	def test_rwkv(self):
@@ -541,12 +634,20 @@ class EasyModelsTest(unittest.TestCase):
 		self.header_config = ed.Gemma2Config(
 			32000, 128, 256, 4, 8, 4, 128 // 8, use_scan_mlp=False
 		)
-		res, err = self.create_test_for_models("gemma2", transformers.Gemma2ForCausalLM)
+		res, err = self.create_test_for_models(
+			"gemma2",
+			transformers.Gemma2ForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"Gemma2 model Failed [ERROR {err}]")
 
 	def test_mamba(self):
 		self.header_config = None
-		res, err = self.create_test_for_models("mamba", transformers.MambaForCausalLM)
+		res, err = self.create_test_for_models(
+			"mamba",
+			transformers.MambaForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"MAMBA model Failed [ERROR {err}]")
 
 	def test_mamba2(self):
@@ -555,26 +656,53 @@ class EasyModelsTest(unittest.TestCase):
 			num_hidden_layers=16,
 			num_heads=8,
 		)
-		res, err = self.create_test_for_models("mamba2", transformers.Mamba2ForCausalLM)
+		res, err = self.create_test_for_models(
+			"mamba2",
+			transformers.Mamba2ForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res, f"Mamba 2 model Failed [ERROR {err}]")
 		self.header_config = None
 
 	def test_cohere(self):
 		self.header_config = None
-		res, err = self.create_test_for_models("cohere", transformers.CohereForCausalLM)
+		res, err = self.create_test_for_models(
+			"cohere", transformers.CohereForCausalLM, ed.TaskType.CAUSAL_LM
+		)
 
 		self.assertTrue(res, f"CoHERE model Failed [ERROR {err}]")
 
 	def test_qwen2_moe(self):
 		self.header_config = None
+		self.rope_scaling = None
 		res, err = self.create_test_for_models(
-			"qwen2_moe", transformers.Qwen2MoeForCausalLM
+			"qwen2_moe",
+			transformers.Qwen2MoeForCausalLM,
+			ed.TaskType.CAUSAL_LM,
 		)
 		self.assertTrue(res, f"Qwen2Moe model Failed [ERROR {err}]")
 
+	def test_roberta(self):
+		self.header_config = ed.RobertaConfig(
+			hidden_size=256,
+			intermediate_size=512,
+			num_hidden_layers=4,
+			num_attention_heads=8,
+		)
+		res, err = self.create_test_for_models(
+			"roberta",
+			transformers.RobertaForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
+		self.assertTrue(res, f"ROBERTA model Failed [ERROR {err}]")
+
 	def test_moe_mixtral(self):
 		self.header_config = None
-		res = self.create_moe_test_for_models("mixtral", transformers.MixtralForCausalLM)
+		res = self.create_moe_test_for_models(
+			"mixtral",
+			transformers.MixtralForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
 		self.assertTrue(res)
 
 	def test_moe_qwen2_moe(self):
@@ -603,7 +731,6 @@ class EasyModelsTest(unittest.TestCase):
 		name,
 		hf_out,
 		ed_out,
-		ed_loss,
 		atol: float = 0.125,
 		rtol: float = 0,
 		easy_time: float = None,
@@ -611,6 +738,7 @@ class EasyModelsTest(unittest.TestCase):
 	):
 		to, jo = hf_out.logits.cpu().detach().numpy(), ed_out.logits
 		err = jnp.mean(to) - jnp.mean(jo)
+		ed_loss = ed_out.loss
 		hf_loss = hf_out.loss.cpu().detach().numpy()
 		all_close = jnp.allclose(to, jo, atol=atol, rtol=rtol)
 		all_close_loss = jnp.allclose(hf_loss, ed_loss, atol=0.125, rtol=0)
@@ -680,33 +808,35 @@ class EasyModelsTest(unittest.TestCase):
 
 if __name__ == "__main__":
 	# unittest.main()
+	print(jax.devices())
 	test = EasyModelsTest()
 	test.setUp()
-	test.test_arctic()  # Passed v0.0.80 - N Runtime
-	test.test_cohere()  # Passed v0.0.80 - N Runtime
-	test.test_dbrx()  # Passed  v0.0.80 - N Runtime
-	test.test_deepseek_v2()  # Passed v0.0.80 - X Runtime
-	test.test_exaone()  # Passed v0.0.80 - N Runtime
-	test.test_falcon()  # Passed v0.0.80 - N Runtime
-	test.test_gemma()  # Passed v0.0.80 - N Runtime
-	test.test_gemma2()  # Passed v0.0.80 - N Runtime
-	test.test_gptj()  # Passed v0.0.80 - N Runtime
-	test.test_gpt2()  # Passed v0.0.80 - N Runtime
-	# test.test_grok1() # should be impl
-	test.test_internlm2()  # Passed v0.0.80 - N Runtime
-	test.test_llama()  # Passed v0.0.80 - N Runtime
-	test.test_mamba()  # Passed v0.0.80 - N Runtime
-	test.test_mamba2()  # Passed v0.0.80 - N Runtime
-	test.test_mistral()  # Passed v0.0.80 - N Runtime
-	test.test_mixtral()  # Passed v0.0.80 - N Runtime
-	test.test_mpt()  # Passed v0.0.80 - N Runtime
-	test.test_olmo()  # Passed v0.0.80 - N Runtime
-	test.test_olmo2()  # Passed v0.0.80 - N Runtime
-	test.test_openelm()  # Passed v0.0.80 - N Runtime
-	test.test_phi()  # Passed v0.0.80 - N Runtime
-	test.test_phi3()  # Passed v0.0.80 - N Runtime
+	test.test_arctic()  # Passed
+	test.test_cohere()  # Passed
+	test.test_dbrx()  # Passed
+	test.test_deepseek_v2()  # Passed
+	test.test_exaone()  # Passed
+	test.test_falcon()  # Passed
+	test.test_gemma()  # Passed
+	test.test_gemma2()  # Passed
+	test.test_gptj()  # Passed
+	test.test_gpt_noex()  # Passed
+	test.test_gpt2()  # Passed
+	# test.test_grok1() # Not Tested Yet!
+	test.test_internlm2()  # Passed
+	test.test_llama()  # Passed
+	test.test_mamba()  # Passed
+	test.test_mamba2()  # Passed
+	test.test_mistral()  # Passed
+	test.test_mixtral()  # Passed
+	test.test_mpt()  # Passed
+	test.test_olmo()  # Passed
+	test.test_olmo2()  # Passed
+	test.test_openelm()  # Passed
+	test.test_phi()  # Passed
+	test.test_phi3()  # Passed
 	# test.test_phimoe()  # Failed v0.0.80 - N  Runtime
-	test.test_qwen2()  # Passed v0.0.80 - N Runtime
-	test.test_qwen2_moe()  # Passed v0.0.80 - N Runtime
-	test.test_stablelm()  # Passed v0.0.80 - N Runtime
+	test.test_qwen2()  # Passed
+	test.test_qwen2_moe()  # Passed
+	test.test_stablelm()  # Passed
 	# -----------------------------------------------

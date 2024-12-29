@@ -12,13 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.trainers.direct_preference_optimization_trainer.dpo_trainer import (
-	DPOTrainer,
-	DPOTrainerOutput,
-  DPOConfig,
-)
-__all__ = [
-	"DPOTrainer",
-	"DPOTrainerOutput",
-	"DPOConfig",
-]
+from .dpo_trainer import DPOConfig, DPOTrainer, DPOTrainerOutput
+
+__all__ = ["DPOTrainer", "DPOTrainerOutput", "DPOConfig"]

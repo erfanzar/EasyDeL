@@ -15,17 +15,16 @@ from __future__ import annotations
 
 import os
 import pprint
+import shutil
 import sys
 import threading
 import time
+import typing as tp
 import warnings
-from abc import ABC, abstractmethod
-from collections import defaultdict
-from dataclasses import dataclass
+from abc import abstractmethod
 from glob import glob
 from logging import warning
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, Literal, Mapping, Optional, Union
 
 import flax
 import flax.core
@@ -33,10 +32,7 @@ import jax
 import numpy as np
 import termcolor
 import tqdm
-from fjformer.checkpoint import CheckpointManager
 from flax.core import unfreeze
-from jax.sharding import Mesh
-from optax import GradientTransformation, Schedule
 
 from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLTimerError
@@ -46,101 +42,53 @@ try:
 except ImportError:
 	wandb = None
 
-from jax import numpy as jnp
 
 from easydel import __version__
 from easydel.etils.etils import get_logger
-from easydel.modules.modeling_utils import (
-	EasyDeLBaseConfig,
+from easydel.infra.base_module import (
 	EasyDeLBaseModule,
 )
 from easydel.smi import get_capacity_matrix, initialise_tracking
-from easydel.trainers.training_configurations import TrainingArguments
 from easydel.utils import Timers
+
+from .trainer_protocol import (
+	BaseTrainerProtocol,
+	TrainerConfigureDataloaderOutput,
+	TrainerConfigureFunctionOutput,
+	TrainerConfigureModelOutput,
+	TrainerOutput,
+)
+from .training_configurations import TrainingArguments
+
+if tp.TYPE_CHECKING:
+	from datasets import Dataset, IterableDataset
+else:
+	Dataset = tp.Any
+	IterableDataset = tp.Any
 
 logger = get_logger(__name__)
 
 
-@dataclass
-class TrainerConfigureDataloaderOutput:
-	dataloader_train: Iterator[np.ndarray]
-	max_training_steps: int
-	dataloader_eval: Optional[Iterator[np.ndarray]] = None
-	max_evaluation_steps: Optional[int] = None
-
-
-@dataclass
-class TrainerConfigureModelOutput:
-	model: EasyDeLBaseModule
-	tx: GradientTransformation
-	scheduler: Schedule
-	config: Optional[EasyDeLBaseConfig] = None
-
-
-@dataclass
-class TrainerConfigureFunctionOutput:
-	create_sharded_state_from_params_function: Callable
-	sharded_train_step_function: Callable
-	mesh: Mesh
-	checkpoint_manager: CheckpointManager
-	initialize_state_function: Callable
-	sharded_eval_step_function: Optional[Callable] = None
-
-
-@dataclass
-class TrainerOutput:
-	state: EasyDeLState
-	mesh: Optional[jax.sharding.Mesh]
-	checkpoint_manager: Any
-	gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None
-	shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None
-	last_save_file_name: Optional[str] = None
-	checkpoint_path: Optional[str] = None
-
-
-def get_layer_names(frozen_dict, prefix=""):
-	"""
-	Recursively retrieves layer names and their corresponding parameter arrays from a FrozenDict.
-
-	Args:
-			frozen_dict (FrozenDict): The FrozenDict containing the model parameters.
-			prefix (str, optional): A prefix to add to the layer names. Defaults to "".
-
-	Returns:
-			dict[str, jnp.ndarray]: A dictionary mapping layer names to their parameter arrays.
-	"""
-
-	layer_names = {}
-	for key, value in frozen_dict.items():
-		if isinstance(value, flax.core.FrozenDict):
-			layer_names.update(get_layer_names(value, prefix=f"{prefix}_{key}"))
-		else:
-			layer_name = f"{prefix}_{key}".lstrip("/")
-			layer_names[layer_name] = value
-	return layer_names
-
-
-class BaseTrainer(ABC):
+class BaseTrainer(BaseTrainerProtocol):
 	def __init__(
 		self,
-		arguments: Optional[TrainingArguments] = None,
-		model: Optional[EasyDeLBaseModule] = None,
-		dataset_train: Optional["Dataset"] = None,  # noqa: F821 # type:ignore
-		dataset_eval: Optional["Dataset"] = None,  # noqa: F821 # type:ignore
+		arguments: tp.Optional[TrainingArguments] = None,
+		model: tp.Optional[EasyDeLBaseModule] = None,
+		dataset_train: tp.Optional[Dataset] = None,
+		dataset_eval: tp.Optional[Dataset] = None,
 		finetune: bool = True,
-		checkpoint_path: Optional[Union[str, os.PathLike]] = None,
+		checkpoint_path: tp.Optional[tp.Union[str, os.PathLike]] = None,
 		_do_init_fns: bool = True,
 	):
-		assert arguments is not None, "training argument must be passed to Trainers"
+		assert arguments is not None, "training argument must be passed to Trainers."
+		assert model is not None, "Model can not be None and it must be passed to Trainers."
 		self.arguments = arguments
 		self.dataset_train = dataset_train
 		self.dataset_eval = dataset_eval
 		self.finetune = finetune
 		self.checkpoint_path = checkpoint_path
-		self.dtype = arguments.dtype
-		self.param_dtype = arguments.param_dtype
 		self._initialize_attributes()
-		self._base_model = model
+		self.model = model
 
 		if _do_init_fns:
 			self.initialize_trainer_utils()
@@ -167,26 +115,19 @@ class BaseTrainer(ABC):
 		self.scheduler = getattr(self, "scheduler", None)
 		self.tx = getattr(self, "tx", None)
 		self.model_state = getattr(self, "model_state", None)
-		self.rapture = self.arguments.rapture
-		self.lora_parameters = getattr(self, "lora_parameters", None)
-		self.lora_model = getattr(self, "lora_model", None)
-		self.lora_tx = getattr(self, "lora_tx", None)
-		self.lora_opt_state = getattr(self, "lora_opt_state", None)
-		self.lora_apply_fn = getattr(self, "lora_apply_fn", None)
-		self.create_sharded_state_from_params_function = getattr(
-			self, "create_sharded_state_from_params_function", None
+		self.create_state_sharded = getattr(self, "create_state_sharded", None)
+		self.sharded_training_step_function = getattr(
+			self, "sharded_training_step_function", None
 		)
-		self.sharded_train_step_function = getattr(
-			self, "sharded_train_step_function", None
+		self.sharded_evaluation_step_function = getattr(
+			self, "sharded_evaluation_step_function", None
 		)
-		self.sharded_eval_step_function = getattr(self, "sharded_eval_step_function", None)
-		self.initialize_state_function = getattr(self, "initialize_state_function", None)
 		self.mesh = getattr(self, "mesh", None)
 		self.checkpoint_manager = getattr(self, "checkpoint_manager", None)
 		self.state_shape = getattr(self, "state_shape", None)
 		self.state_partition_spec = getattr(self, "state_partition_spec", None)
 		self.state_named_sharding = getattr(self, "state_named_sharding", None)
-		self.sharded_state = getattr(self, "sharded_state", None)
+		self.state = getattr(self, "state", None)
 		self.pruning_module = getattr(self.arguments, "pruning_module", None)
 
 	def _initialize_memory_tracking(self):
@@ -244,6 +185,7 @@ class BaseTrainer(ABC):
 		self._configure_dataloaders()
 		self._configure_model()
 		self._configure_functions()
+		self._configure_state()
 
 	def _initialize_wandb(self):
 		if self.arguments.use_wandb:
@@ -251,7 +193,8 @@ class BaseTrainer(ABC):
 
 	def _initialize_timer(self):
 		self.timer = Timers(
-			use_wandb=False, tensorboard_writer=self.arguments.get_tensorboard
+			use_wandb=False,
+			tensorboard_writer=self.arguments.get_tensorboard,
 		)
 
 	def _configure_dataloaders(self):
@@ -284,27 +227,8 @@ class BaseTrainer(ABC):
 			self.tx = model_configurations.tx
 			self.scheduler = model_configurations.scheduler
 			self.config = model_configurations.config
-			self._configure_lora()
+
 		self.timer.log("configure Model, Optimizer, Scheduler and Config")
-
-	def _configure_lora(self):
-		"""
-		Configures LoRA (Low-Rank Adaptation) if enabled in the training arguments.
-
-		This method applies LoRA to the model, sets up the LoRA parameters, apply function,
-		optimizer state, model, and optimizer, and logs the time taken for this configuration.
-		"""
-		if self.rapture is not None:
-			lora_modules = self.rapture.apply_lora(
-				module=self.model,
-				parameters=self.arguments.rapture_config.parameters,
-				tx=self.tx,
-			)
-			self.lora_parameters = lora_modules.lora_parameters
-			self.lora_apply_fn = lora_modules.lora_module.__call__
-			self.lora_opt_state = lora_modules.lora_opt_state
-			self.lora_model = lora_modules.lora_module
-			self.lora_tx = lora_modules.lora_tx
 
 	def _configure_functions(self):
 		"""
@@ -316,26 +240,29 @@ class BaseTrainer(ABC):
 		"""
 		with self.timer("configure functions and sharding them"):
 			function_configurations = self.configure_functions()
-			self.create_sharded_state_from_params_function = (
-				function_configurations.create_sharded_state_from_params_function
+			self.create_state_sharded = function_configurations.create_state_sharded
+			self.sharded_training_step_function = (
+				function_configurations.sharded_training_step_function
 			)
-			self.sharded_train_step_function = (
-				function_configurations.sharded_train_step_function
-			)
-			self.sharded_eval_step_function = (
-				function_configurations.sharded_eval_step_function
+			self.sharded_evaluation_step_function = (
+				function_configurations.sharded_evaluation_step_function
 			)
 			self.mesh = function_configurations.mesh
 			self.checkpoint_manager = function_configurations.checkpoint_manager
-			self.initialize_state_function = function_configurations.initialize_state_function
 		self.timer.log("configure functions and sharding them")
+
+	def _configure_state(self):
+		"""Configures and JIT-compiles the sharded state"""
+		with self.timer("configure sharded state"):
+			self.state = self.create_state_sharded()
+		self.timer.log("configure sharded state")
 
 	@abstractmethod
 	def create_collect_function(
 		self,
 		max_sequence_length: int,
-		truncation_mode: Literal["keep_end", "keep_start"],
-	) -> Callable:
+		truncation_mode: tp.Literal["keep_end", "keep_start"],
+	) -> tp.Callable:
 		"""
 		Creates a function to collect and process batches of data for training or evaluation.
 
@@ -344,11 +271,11 @@ class BaseTrainer(ABC):
 
 		Args:
 				max_sequence_length (int): The maximum allowed sequence length.
-				truncation_mode (typing.Literal["keep_end", "keep_start"], optional):
+				truncation_mode (typing.tp.Literal["keep_end", "keep_start"], optional):
 						The truncation mode. Defaults to "keep_end".
 
 		Returns:
-				Callable: A function that takes a batch of data and returns a processed batch.
+				tp.Callable: A function that takes a batch of data and returns a processed batch.
 		"""
 		raise NotImplementedError
 
@@ -381,9 +308,9 @@ class BaseTrainer(ABC):
 		"""
 
 		def create_tf_dataset(
-			dataset: "Dataset",  # noqa: F821 # type:ignore
-			is_train: bool,  # noqa: F821 # type:ignore
-		) -> Iterator[np.ndarray]:
+			dataset: Dataset,
+			is_train: bool,
+		) -> tp.Iterator[np.ndarray]:
 			"""
 			Creates a TensorFlow dataset from a Hugging Face Dataset.
 
@@ -392,7 +319,7 @@ class BaseTrainer(ABC):
 					is_train (bool): Whether the dataset is for training.
 
 			Returns:
-					Iterator[np.ndarray]: The TensorFlow dataset iterator.
+					tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
 			"""
 			import tensorflow as tf
 
@@ -413,9 +340,9 @@ class BaseTrainer(ABC):
 			)
 
 		def create_tf_dataset_from_iterable(
-			dataset: "IterableDataset",  # noqa: F821 # type:ignore
-			is_train: bool,  # noqa: F821 # type:ignore
-		) -> Iterator[np.ndarray]:
+			dataset: IterableDataset,
+			is_train: bool,
+		) -> tp.Iterator[np.ndarray]:
 			"""
 			Creates a TensorFlow dataset from an iterable Hugging Face Dataset.
 
@@ -424,7 +351,7 @@ class BaseTrainer(ABC):
 					is_train (bool): Whether the dataset is for training.
 
 			Returns:
-					Iterator[np.ndarray]: The TensorFlow dataset iterator.
+					tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
 			"""
 			import tensorflow as tf
 
@@ -445,14 +372,14 @@ class BaseTrainer(ABC):
 			)
 
 		def calculate_steps(
-			dataset: Union["Dataset", "IterableDataset"],  # noqa: F821 # type:ignore
+			dataset: tp.Union[Dataset, IterableDataset],
 			is_train: bool,
 		) -> int:
 			"""
 			Calculates the number of training or evaluation steps based on dataset length and arguments.
 
 			Args:
-					dataset (Union[Dataset, IterableDataset]): The dataset to calculate steps for.
+					dataset (tp.Union[Dataset, IterableDataset]): The dataset to calculate steps for.
 					is_train (bool): Whether the dataset is for training.
 
 			Returns:
@@ -492,18 +419,18 @@ class BaseTrainer(ABC):
 				return num_steps
 
 		def to_tf_dataloader(
-			dataset: Union["Dataset", "IterableDataset"],  # noqa: F821 # type:ignore
+			dataset: tp.Union[Dataset, IterableDataset],
 			is_train: bool,
-		) -> Iterator[np.ndarray]:
+		) -> tp.Iterator[np.ndarray]:
 			"""
 			Converts a Hugging Face Dataset to a TensorFlow dataloader.
 
 			Args:
-					dataset (Union[Dataset, IterableDataset]): The Hugging Face Dataset.
+					dataset (tp.Union[Dataset, IterableDataset]): The Hugging Face Dataset.
 					is_train (bool): Whether the dataset is for training.
 
 			Returns:
-					Iterator[np.ndarray]: The TensorFlow dataloader iterator.
+					tp.Iterator[np.ndarray]: The TensorFlow dataloader iterator.
 			"""
 			if hasattr(dataset, "__len__"):
 				return create_tf_dataset(dataset, is_train)
@@ -537,107 +464,36 @@ class BaseTrainer(ABC):
 		Returns:
 				TrainerConfigureModelOutput: An object containing the configured model, optimizer, scheduler, and configuration.
 		"""
-		extra_configs = self.arguments.extra_configs or {}
-		if self._base_model is None:
-			assert self.arguments.model_class is not None, (
-				"`model_class` is a required field "
-				"please pass `model_class` to `TrainingArguments`"
-			)
-		model = self._configure_custom_model(extra_configs)
 
 		tx, scheduler = self.arguments.get_optimizer_and_scheduler(self.max_training_steps)
 		if self.pruning_module is not None:
 			tx = self.pruning_module.wrap_optax(tx)
 		return TrainerConfigureModelOutput(
-			model=model,
+			model=self.model,
 			tx=tx,
 			scheduler=scheduler,
-			config=getattr(model, "config", None),
+			config=self.model.config,
 		)
 
-	def _configure_custom_model(self, extra_configs):
-		"""
-		Configures a custom model provided by the user.
-
-		This method checks if a custom rule for partitioning is provided, sets the axis dimensions
-		for the model configuration, and initializes the custom model class with the provided
-		configurations.
-
-		Args:
-				extra_configs (dict): Additional configurations to apply to the model.
-
-		Returns:
-				EasyDeLBaseModule: The configured custom model.
-
-		Raises:
-				AssertionError: If no custom rule is provided when initializing a custom model.
-		"""
-		if self._base_model is None:
-			if not hasattr(
-				self.arguments.configs_to_initialize_model_class["config"],
-				"get_partition_rules",
-			):
-				assert self.arguments.custom_rule is not None, (
-					"If you are using a custom model to initialize, you must "
-					"pass custom_rule for partition rules."
-				)
-
-			self.arguments.configs_to_initialize_model_class[
-				"config"
-			].axis_dims = self.arguments.sharding_array
-
-			return self.arguments.model_class(
-				**self.arguments.configs_to_initialize_model_class, _do_init=False
-			)
-		else:
-			assert hasattr(self._base_model, "config")
-			assert hasattr(self._base_model.config, "get_partition_rules")
-			self._base_model.config.axis_dims = self.arguments.sharding_array
-			return self._base_model
-
-	def _save_state(
-		self,
-		state: "EasyDeLState",  # noqa: F821 # type:ignore
-		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None,
-		milestone: bool = False,
-		save_dir: Optional[str] = None,
-	) -> str:
-		"""
-		Saves the model state to a checkpoint file.
-
-		This method handles generating the filename, managing the checkpoint limit, saving the
-		state using the `EasyDeLState.save_state` method, and creating a README file with
-		information about the trained model.
-
-		Args:
-				state (EasyDeLState): The EasyDeLState object containing the model state to save.
-				gather_fns (Optional[Any | Mapping[str, Callable] | dict[Callable]], optional):
-						Functions for gathering sharded parameters. Defaults to None.
-				milestone (bool, optional): Whether this checkpoint is a milestone (e.g., end of epoch). Defaults to False.
-				save_dir (Optional[str], optional): The directory to save the checkpoint to. If None, defaults to the
-																						directory specified in the training arguments. Defaults to None.
-
-		Returns:
-				str: The filename of the saved checkpoint.
-		"""
+	def _save_state(self, state: EasyDeLState, *args, **kwargs) -> str:
 		step = self._get_current_step(state)
-		checkpoint_dir = self._get_checkpoint_dir(save_dir)
-		self._manage_checkpoint_limit(checkpoint_dir)
+		self._manage_checkpoint_limit(self.arguments._get_save_directory())
+		directory_name = self.arguments._get_save_directory_milestone(
+			step=step,
+			create=True,
+		)
 
-		filename = self._generate_checkpoint_filename(step, milestone)
-		logger.info(f"saving state {filename}.")
+		logger.info(f"saving state {directory_name}.")
 
 		state.save_state(
-			filename=filename,
-			checkpoint_dir=checkpoint_dir,
-			gather_fns=gather_fns,
-			float_dtype=self.dtype,
+			save_directory=directory_name,
+			float_dtype=self.model.dtype,
 			verbose=self.arguments.verbose,
 			save_optimizer=self.arguments.save_optimizer_state,
 		)
 
-		self._save_readme(checkpoint_dir)
-		return filename
+		self._save_readme(directory_name)
+		return str(directory_name)
 
 	def _get_current_step(self, state):
 		step = int(jax.device_get(state.step))
@@ -645,44 +501,22 @@ class BaseTrainer(ABC):
 			step += self.arguments.step_start_point
 		return step
 
-	def _get_checkpoint_dir(self, save_dir):
-		return (
-			os.path.join(self.arguments.save_dir, self.arguments.model_name)
-			if save_dir is None
-			else save_dir
-		)
-
-	def _manage_checkpoint_limit(self, checkpoint_dir):
+	def _manage_checkpoint_limit(self, save_directory):
 		if self.arguments.save_total_limit:
-			checkpoint_files = glob(os.path.join(checkpoint_dir, "*.easy"))
+			checkpoint_files = glob(os.path.join(save_directory, "run-*"))
 			checkpoint_files.sort(key=os.path.getmtime)
-			for old_checkpoint in checkpoint_files[: -self.arguments.save_total_limit]:
-				os.remove(old_checkpoint)
-				logger.info(
-					f"Removed old checkpoint: {old_checkpoint}",
-				)
+			for old_save_directory in checkpoint_files[: -self.arguments.save_total_limit]:
+				shutil.rmtree(old_save_directory, ignore_errors=True)
+				logger.info(f"Removed old directory: {old_save_directory}")
 
-	def _generate_checkpoint_filename(self, step, milestone):
-		checkpoint_name = f"{self.arguments.model_name}-S{step}"
-		filename = f"{checkpoint_name}_{step}" if milestone else checkpoint_name
-		return f"{filename}.easy"
-
-	def _save_readme(self, checkpoint_dir):
-		with open(os.path.join(checkpoint_dir, "README.md"), "w") as f:
+	def _save_readme(self, save_directory):
+		with open(os.path.join(save_directory, "README.md"), "w") as f:
 			f.write(self._get_information())
 
 	def _format_partition_rules(self) -> str:
 		"""Format partition rules with proper indentation and formatting."""
 		try:
-			mdl = self.arguments.model_class if self.model is None else self.model
-			rules = (
-				self.arguments.custom_rule
-				if self.arguments.custom_rule is not None
-				else mdl.config_class.get_partition_rules(
-					self.arguments.fully_sharded_data_parallel
-				)
-			)
-			return pprint.pformat(rules, indent=2, width=80)
+			return pprint.pformat(self.model.config.get_partition_rules(), indent=2, width=80)
 		except Exception as e:
 			logger.error(f"Error formatting partition rules: {str(e)}")
 			return "Error retrieving partition rules"
@@ -704,7 +538,6 @@ class BaseTrainer(ABC):
 				str: Formatted markdown string containing model and training information
 		"""
 		device_info = self._get_device_info()
-		mdl = self.arguments.model_class if self.model is None else self.model
 		partition_rules = self._format_partition_rules()
 
 		return f"""
@@ -717,51 +550,24 @@ models. With a primary focus on Jax, EasyDeL aims to provide convenient and effe
 training Flax/Jax models on TPU/GPU, for both serving and training purposes.
 
 ## 📦 Installation & Usage
-
-### Method 1: Using EasyDeLState (_*.easy_ files)
-
-```python
-from easydel import EasyDeLState, AutoShardAndGatherFunctions
-from jax import numpy as jnp, lax
-
-# Initialize shard and gather functions
-shard_fns, gather_fns = AutoShardAndGatherFunctions.from_pretrained(
-    "REPO_ID",  # Repository ID for finding shard/gather functions
-    backend="gpu",
-    depth_target=["params", "params"],
-    flatten=False
-)
-
-# Load the state
-state = EasyDeLState.load_state(
-    f"REPO_ID/{self.arguments.model_name}.easy",
-    dtype=jnp.float16,
-    param_dtype=jnp.float16,
-    precision=lax.Precision("fastest"),
-    verbose=True,
-    state_shard_fns=shard_fns
-)
-```
-
-### Method 2: Using AutoEasyDeLModelForCausalLM 
-
+ 
 ```python
 from easydel import AutoEasyDeLModelForCausalLM
 from jax import numpy as jnp, lax
 
-model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
+model = AutoEasyDeLModelForCausalLM.from_pretrained(
     f"REPO_ID/{self.arguments.model_name}",
-    dtype=jnp.float16,
-    param_dtype=jnp.float16,
+    dtype=...,
+    param_dtype=...,
     precision=lax.Precision("fastest"),
-    auto_shard_params=True,
+    auto_shard_model=True,
 )
 ```
 
 ## 🔧 Training Configuration
 
 ### Model Details
-- **Architecture**: {mdl.config_class.model_type}
+- **Architecture**: {self.config.model_type}
 - **Platform**: {device_info['platform']}
 - **Number of Devices**: {device_info['device_count']}
 
@@ -771,19 +577,17 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 - **Scheduler**: {self.arguments.scheduler}
 - **Warmup Steps**: {self.arguments.warmup_steps}
 - **Weight Decay**: {self.arguments.weight_decay}
-- **Z Loss**: {self.arguments.z_loss}
+- **Loss Config**: {self.arguments.loss_config}
 
 ### Training Setup
 - **Epochs**: {self.arguments.num_train_epochs}
 - **Batch Size**: {self.arguments.total_batch_size}
-- **Sequence Length**: {self.arguments.max_sequence_length}
-- **Input Shape**: {self.arguments.init_input_shape}
-- **Dtype**: {self.arguments.dtype}
-- **Params Dtype**: {self.arguments.param_dtype}
+- **Sequence Length**: {self.arguments.max_sequence_length} 
+- **Dtype**: {self.model.dtype}
+- **Params Dtype**: {self.model.param_dtype}
 
 ### Advanced Configuration
-- **Gradient Checkpointing**: {self.arguments.gradient_checkpointing}
-- **Fully Sharded Data Parallel**: {self.arguments.fully_sharded_data_parallel}
+- **Gradient Checkpointing**: {self.model.config.gradient_checkpointing} 
 - **Force Batch Gradient Accumulation**: {self.arguments.force_batch_and_gradient_accumulation_steps_calculation}
 - **Gradient Accumulation Steps**: {self.arguments.gradient_accumulation_steps}
 - **Max Training Steps**: {self.arguments.max_training_steps}
@@ -800,7 +604,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 *Generated with EasyDeL v{__version__}*
 """
 
-	def save_information(self, output_path: Union[str, Path]) -> None:
+	def save_information(self, output_path: tp.Union[str, Path]) -> None:
 		"""
 		Save the generated information to a markdown file.
 
@@ -822,17 +626,18 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 
 	def save_pretrained(
 		self,
-		state: "EasyDeLState",  # noqa: F821 # type:ignore
-		save_dir: Optional[str] = None,
-		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]] = None,
+		state: EasyDeLState,
+		save_directory: tp.Optional[str] = None,
+		gather_fns: tp.Optional[
+			tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]
+		] = None,
 		to_torch: bool = False,
 		base_hf_auto_class=None,
-		easystate_to_huggingface_model_kwargs: Optional[dict] = None,
-		add_params_field_to_torch_convertation: bool = False,
-		torch_save_pretrained_kwargs: Optional[dict] = None,
+		easystate_to_huggingface_model_kwargs: tp.Optional[dict] = None,
+		torch_save_pretrained_kwargs: tp.Optional[dict] = None,
 	):
-		save_dir = save_dir or os.path.join(
-			self.arguments.save_dir, self.arguments.model_name
+		save_directory = save_directory or os.path.join(
+			self.arguments.save_directory, self.arguments.model_name
 		)
 
 		if base_hf_auto_class is None:
@@ -840,23 +645,25 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 		if to_torch:
 			return self._save_to_torch(
 				state,
-				save_dir,
+				save_directory,
 				base_hf_auto_class,
 				easystate_to_huggingface_model_kwargs,
 				torch_save_pretrained_kwargs,
 			)
 		else:
-			return self._save_state(state=state, gather_fns=gather_fns, save_dir=save_dir)
+			return self._save_state(
+				state=state, gather_fns=gather_fns, save_directory=save_directory
+			)
 
 	def _save_to_torch(
 		self,
 		state,
-		save_dir,
+		save_directory,
 		base_hf_auto_class,
 		easystate_to_huggingface_model_kwargs,
 		torch_save_pretrained_kwargs,
 	):
-		from easydel.transform.parameters_transformation import (
+		from easydel.utils.parameters_transformation import (
 			easystate_to_huggingface_model,
 		)
 
@@ -876,13 +683,13 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 			**easystate_to_huggingface_model_kwargs,
 		)
 
-		self._save_readme(save_dir)
-		hf_model.save_pretrained(save_dir, **torch_save_pretrained_kwargs)
+		self._save_readme(save_directory)
+		hf_model.save_pretrained(save_directory, **torch_save_pretrained_kwargs)
 		return hf_model
 
 	def _create_hf_model_config(
 		self,
-		state: "EasyDeLState",  # noqa: F821 # type:ignore
+		state: EasyDeLState,
 		model_config,
 		model_type,
 	):
@@ -905,7 +712,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 		return hf_model_config
 
 	def specs_to_name_sharding(self, tree, mesh=None):
-		mesh = mesh or self.mesh or self.arguments.get_mesh()
+		mesh = mesh or self.mesh or self.model.mesh
 		return jax.tree_util.tree_map(
 			lambda spec: jax.sharding.NamedSharding(spec=spec, mesh=mesh),
 			tree,
@@ -923,19 +730,6 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 		"""Prints the number of model parameters in billions."""
 		return sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(prm))[0])
 
-	def get_layer_names(self, frozen_dict, prefix=""):
-		"""
-		Recursively retrieves layer names and their corresponding parameter arrays from a FrozenDict.
-
-		Args:
-				frozen_dict (FrozenDict): The FrozenDict containing the model parameters.
-				prefix (str, optional): A prefix to add to the layer names. Defaults to "".
-
-		Returns:
-				dict[str, jnp.ndarray]: A dictionary mapping layer names to their parameter arrays.
-		"""
-		return get_layer_names(frozen_dict, prefix)
-
 	def _should_skip_step(self, current_step):
 		"""Determine if current step should be skipped."""
 		return (
@@ -948,15 +742,21 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 		return (
 			self.arguments.save_steps is not None
 			and current_step > 0
-			and current_step % self.arguments.save_steps == 0
+			and (current_step % self.arguments.save_steps) == 0
+		)
+
+	def _should_run_evaluation(self, current_step):
+		"""Determine if evaluation process should be runned current step."""
+		return (
+			self.arguments.evaluation_steps is not None
+			and current_step > 0
+			and (current_step % self.arguments.evaluation_steps) == 0
 		)
 
 	def _prepare_training_output(
 		self,
-		sharded_state: EasyDeLState,
-		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-		run_exception: Optional[Exception] = None,
+		state: EasyDeLState,
+		run_exception: tp.Optional[Exception] = None,
 	):
 		if run_exception is not None:
 			if isinstance(run_exception, KeyboardInterrupt):
@@ -977,47 +777,37 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 				raise RuntimeError("EasyDeL Runtime dumped") from run_exception
 		checkpoint_path = "SAVING_SKIPPED"
 		filename = None
-		if self.arguments.merge_lora_rapture_parameters and self.rapture is not None:
-			print(
-				termcolor.colored("Info : ", color="red", force_color=True),
-				termcolor.colored("Merging LoRA Parameters.", color="white", force_color=True),
+
+		# TODO: LoRA be added.
+		# try:
+		if self.arguments.do_last_save:
+			filename = self._save_state(
+				state=state,
+				milestone=False,
+				save_directory=self.arguments.save_directory,
 			)
-			sharded_state = sharded_state.replace(
-				params=self.rapture.merge_parameters(sharded_state.params)
-			)
-		try:
-			if self.arguments.do_last_save:
-				filename = self._save_state(
-					state=sharded_state,
-					gather_fns=gather_fns,
-					milestone=False,
-					save_dir=self.arguments.save_dir,
-				)
-				if self.arguments.save_dir is not None:
-					checkpoint_path = os.path.join(self.arguments.save_dir, filename)
-		except Exception as e:
-			termcolor.cprint(
-				f"Failed to save checkpoint on interruption: {str(e)}",
-				color="red",
-				force_color=True,
-			)
+			if self.arguments.save_directory is not None:
+				checkpoint_path = os.path.join(self.arguments.save_directory, filename)
+		# except Exception as e:
+		# 	termcolor.cprint(
+		# 		f"Failed to save checkpoint on interruption: {str(e)}",
+		# 		color="red",
+		# 		force_color=True,
+		# 	)
 
 		return TrainerOutput(
-			state=sharded_state,
+			state=state,
 			mesh=self.mesh,
-			shard_fns=shard_fns,
-			gather_fns=gather_fns,
-			checkpoint_manager=self.checkpoint_manager,
 			checkpoint_path=checkpoint_path,
 			last_save_file_name=filename,
 		)
 
 	def _handle_training_interruption(
 		self,
-		sharded_state: EasyDeLState,
+		state: EasyDeLState,
 		exception: Exception,
-		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
+		shard_fns: tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]],
+		gather_fns: tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]],
 	):
 		"""Handle training interruption gracefully."""
 		if isinstance(exception, KeyboardInterrupt):
@@ -1035,26 +825,26 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 		else:
 			raise RuntimeError("EasyDeL Runtime dumped") from exception
 		return self._prepare_training_output(
-			sharded_state=sharded_state,
+			state=state,
 			checkpoint_manager=self.checkpoint_manager,
 			shard_fns=shard_fns,
 			gather_fns=gather_fns,
 			run_exception=None,
 		)
 
-	def _setup_initial_metrics(self, sharded_state):
+	def _setup_initial_metrics(self, state):
 		"""Setup initial metrics logging."""
 		# Calculate and log model size
 		self.arguments.log_metrics(
 			{
 				"Number of Model Parameters (Billion)": self.count_model_parameters(
-					sharded_state.params
+					state.graphstate
 				)
 			},
 			step=0,
 		)
 		self._flops_per_device = (
-			self.calculate_number_total_flops_per_device(params=sharded_state.params) / 1e12
+			self.calculate_number_total_flops_per_device(params=state.graphstate) / 1e12
 		)
 
 	def _get_next_batch(self, train_iter):
@@ -1073,7 +863,7 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 
 	def _log_metrics(
 		self,
-		metrics: Dict[str, float],
+		metrics: tp.Dict[str, float],
 		pbar: tqdm.tqdm,
 		step: int,
 		mode: str = "train",
@@ -1090,203 +880,3 @@ model, params = AutoEasyDeLModelForCausalLM.from_pretrained(
 				metrics=metrics,
 				step=step,
 			)
-
-	@abstractmethod
-	def _run_training_loop(
-		self,
-		sharded_state: EasyDeLState,
-		metrics_tracker: MetricsTracker,
-		step_metrics: StepMetrics,
-		start_time: float,
-		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-	):
-		"""Core training loop implementation."""
-
-	@abstractmethod
-	def _run_evaluation(
-		self,
-		sharded_state: EasyDeLState,
-		metrics_tracker: MetricsTracker,
-		step_metrics: StepMetrics,
-		start_time: float,
-	):
-		"""Core evaluation implementation."""
-
-	@abstractmethod
-	def _train_epoch(
-		self,
-		sharded_state: EasyDeLState,
-		train_iter: int,
-		current_step: int,
-		metrics_tracker: MetricsTracker,
-		step_metrics: StepMetrics,
-		pbar: tqdm,
-		start_time: float,
-		epoch: int,
-		shard_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-		gather_fns: Optional[Any | Mapping[str, Callable] | dict[Callable]],
-	):
-		"""Handles training for a single epoch."""
-
-	@abstractmethod
-	def _eval_epoch(
-		self,
-		sharded_state: EasyDeLState,
-		eval_iter: int,
-		current_step: int,
-		metrics_tracker: MetricsTracker,
-		step_metrics: StepMetrics,
-		pbar: tqdm,
-		start_time: float,
-	):
-		"""Handles training for a single epoch."""
-
-	@abstractmethod
-	def _execute_eval_step(self, state, batch):
-		"""Execute a single eval step."""
-
-	@abstractmethod
-	def _execute_train_step(self, state, batch):
-		"""Execute a single train step."""
-
-	@abstractmethod
-	def _finalize_training(self, output, run_exception):
-		"""Finalize training and prepare output."""
-
-	@abstractmethod
-	def train(
-		self,
-		model_parameters: Optional[flax.core.FrozenDict] = None,
-		state: Optional[EasyDeLState] = None,
-	) -> Any:
-		"""Train using the provided model state."""
-
-	@abstractmethod
-	def eval(self, model_state: EasyDeLState) -> Iterator[dict]:
-		"""
-		Evaluates using the provided model state.
-
-		This method iterates over the evaluation dataset, performs forward passes,
-		calculates evaluation metrics, logs the metrics, and yields the metrics for
-		each evaluation step.
-		"""
-
-
-class StepMetrics:
-	"""Handles calculation and tracking of training metrics."""
-
-	def __init__(self, arguments):
-		self.arguments = arguments
-		self.start_time = time.time()
-		self.step_start_time = time.time()
-
-	def start_step(self):
-		"""Mark the start of a training step."""
-		self.step_start_time = time.time()
-
-	def calculate(
-		self,
-		loss,
-		metrics,
-		current_step,
-		epoch,
-		flops_per_device,
-		batch_size,
-		seq_length,
-		learning_rate,
-		mode: Optional[Literal["eval", "train"]] = None,
-		**extras,
-	) -> Dict[str, float]:
-		"""Calculate comprehensive metrics for the training step."""
-		step_time = time.time() - self.step_start_time
-		total_time = time.time() - self.start_time
-
-		visited_tokens = jnp.multiply(seq_length, jnp.multiply(current_step, batch_size))
-
-		flops = flops_per_device / step_time
-
-		basic_metrics = {
-			"loss": loss.tolist(),
-			"learning_rate": learning_rate,
-			"step": current_step,
-			"step_time": step_time,
-			"perplexity": jnp.exp(loss).tolist(),
-			"visited_tokens": visited_tokens,
-			"epoch": epoch,
-			"TFLOPs": flops,
-			"total_time": total_time,
-			**extras,
-		}
-
-		basic_metrics.update({"accuracy": metrics.get("accuracy", 0.0)})
-
-		if metrics.get("mae", None) is not None:
-			basic_metrics.update({"mae": metrics.get("mae", 0.0)})
-		if metrics.get("mse", None) is not None:
-			basic_metrics.update({"mse": metrics.get("mse", 0.0)})
-
-		if not self.arguments.performance_mode and (mode == "train" or mode is None):
-			detailed_metrics = self._calculate_detailed_metrics(metrics)
-			basic_metrics.update(detailed_metrics)
-		if mode is not None:
-			basic_metrics = {f"{mode}/{k}": v for k, v in basic_metrics.items()}
-		return basic_metrics
-
-	def _calculate_detailed_metrics(self, metrics):
-		"""Calculate additional detailed metrics."""
-		detailed_metrics = {}
-
-		if self.arguments.log_grad_norms and metrics.get("grad_norms", None) is not None:
-			detailed_metrics.update(
-				{
-					"train/max_grad_norm": metrics.get(
-						"max_grad_norm", np.asarray(None)
-					).tolist(),
-					"train/mean_grad_norm": metrics.get(
-						"mean_grad_norm", np.asarray(None)
-					).tolist(),
-				}
-			)
-
-			# Add per-layer gradient norms
-			detailed_metrics.update(
-				{
-					f"grad_norm/{layer_name}": grad_norm.tolist()
-					for layer_name, grad_norm in get_layer_names(metrics["grad_norms"]).items()
-				}
-			)
-
-		return detailed_metrics
-
-
-class MetricsTracker:
-	"""Tracks and aggregates training metrics over time."""
-
-	def __init__(self):
-		self.loss_sum = None
-		self.accuracy_sum = None
-		self.metrics_history = defaultdict(list)
-		self.step_offset = 0
-
-	def update(self, loss, accuracy, step):
-		"""Update tracked metrics with new values."""
-		with jax.spmd_mode("allow_all"):
-			self.loss_sum = loss if self.loss_sum is None else self.loss_sum + loss
-			mean_loss = self.loss_sum / (step + 1 - self.step_offset)
-			if accuracy != float("inf"):
-				if accuracy is None:
-					accuracy = 0.0
-				self.accuracy_sum = (
-					accuracy if self.accuracy_sum is None else self.accuracy_sum + accuracy
-				)
-				mean_accuracy = self.accuracy_sum / (step + 1 - self.step_offset)
-
-				return mean_loss, mean_accuracy
-			return mean_loss
-
-	def reset(self, step):
-		"""Reset tracked metrics."""
-		self.loss_sum = None
-		self.accuracy_sum = None
-		self.step_offset = step

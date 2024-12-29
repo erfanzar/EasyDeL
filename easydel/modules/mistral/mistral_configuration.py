@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, Optional, Union
+
+import typing as tp
 
 from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
-from easydel.modules.factory import register_config
-from easydel.modules.modeling_utils import EasyDeLBaseConfig
+from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.infra.factory import register_config
 
 
 @register_config("mistral")
@@ -66,7 +67,7 @@ class MistralConfig(EasyDeLBaseConfig):
 	        Whether to tie the weights of the input embeddings and the output embeddings.
 	    rope_theta (`float`, *optional*, defaults to 10000.0):
 	        The theta value to use for rotary position embeddings.
-	    rope_scaling (`Dict[str, Union[str, float]]`, *optional*):
+	    rope_scaling (`tp.Dict[str, tp.Union[str, float]]`, *optional*):
 	        The configuration for rope scaling.
 	    sliding_window (`int`, *optional*, defaults to 4096):
 	        The sliding window size.
@@ -107,14 +108,14 @@ class MistralConfig(EasyDeLBaseConfig):
 		eos_token_id: int = 2,
 		tie_word_embeddings=False,
 		rope_theta=10000.0,
-		rope_scaling: Dict[str, Union[str, float]] = None,
+		rope_scaling: tp.Dict[str, tp.Union[str, float]] = None,
 		sliding_window=4096,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		number_rep_kv: int = 1,
 		attention_dropout: float = 0.0,
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		attention_bias: bool = False,
 		**kwargs,
 	):
@@ -160,7 +161,7 @@ class MistralConfig(EasyDeLBaseConfig):
 		"""
 		Get the partition rules for the model.
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
 			("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
@@ -185,9 +186,9 @@ class MistralConfig(EasyDeLBaseConfig):
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
 		number_rep_kv: int = 1,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		attention_dropout: float = 0.0,
-		rope_scaling: Dict[str, Union[str, float]] = None,
+		rope_scaling: tp.Dict[str, tp.Union[str, float]] = None,
 		attention_bias: bool = False,
 		**kwargs,
 	):
@@ -203,12 +204,12 @@ class MistralConfig(EasyDeLBaseConfig):
 		    scan_mlp_chunk_size: int: Chunk the input to the mlp
 		    number_rep_kv: int: Control the number of times that the key
 		        and value vectors are repeated
-		    bits: Optional[int]: Specify the number of bits to use for
+		    bits: tp.Optional[int]: Specify the number of bits to use for
 		        quantization
 		    attention_dropout: float: Set the dropout rate for the
 		        attention layer
 		    attention_bias: bool: when ever to use attention_bias
-		    rope_scaling: Dict[str, Union[str, float]]: rope_scaling for
+		    rope_scaling: tp.Dict[str, tp.Union[str, float]]: rope_scaling for
 		        rope
 
 		Returns:
@@ -246,43 +247,4 @@ class MistralConfig(EasyDeLBaseConfig):
 			self,
 			"mask_max_position_embeddings",
 			self.max_position_embeddings,
-		)
-
-
-class VisionMistralConfig(MistralConfig):
-	def __init__(
-		self,
-		vision_vocab_size=8448,
-		tie_vision_embeddings=False,
-		sample_mode="all",
-		**kwargs,
-	):
-		super().__init__(**kwargs)
-		self.vision_vocab_size = vision_vocab_size
-		self.tie_vision_embeddings = tie_vision_embeddings
-		self.sample_mode = sample_mode
-
-	def get_partition_rules(self, *args, **kwargs):
-		"""
-		Get the partition rules for the model.
-		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
-		"""
-		return (
-			("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-			("model/embed_vision/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-			(
-				"self_attn/(q_proj|k_proj|v_proj)/kernel",
-				PartitionSpec(("fsdp", "sp"), "tp"),
-			),
-			("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("input_layernorm/kernel", PartitionSpec(None)),
-			("post_attention_layernorm/kernel", PartitionSpec(None)),
-			("model/norm/kernel", PartitionSpec(None)),
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("vision_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			(".*", PartitionSpec(None)),
 		)

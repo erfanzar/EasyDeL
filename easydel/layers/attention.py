@@ -11,19 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import functools
 import math
 import os
 import time
+import typing as tp
 import warnings
 from dataclasses import dataclass
 from enum import Enum
-from functools import lru_cache, partial
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from functools import cached_property, lru_cache, partial
 
 import einops
 import fjformer
-import flax.linen as nn
+import flax.nnx as nn
 import jax
 import jax.experimental
 import jax.extend
@@ -32,7 +33,7 @@ import jax.tree_util
 import numpy
 from chex import Array
 from fjformer import with_sharding_constraint
-from flax.linen.dtypes import promote_dtype
+from flax.nnx.nn.dtypes import promote_dtype
 from jax import lax, random
 from jax import numpy as jnp
 from jax.experimental.pallas.ops.tpu.splash_attention import (
@@ -52,14 +53,14 @@ from easydel.etils.etils import (
 	AVAILABLE_ATTENTION_MECHANISMS,
 	EasyDeLBackends,
 	EasyDeLPlatforms,
-	EasyDeLQuantizationMethods,
 	get_logger,
 )
 from easydel.etils.partition_module import PartitionAxis
+from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.kernels.flash_attention_2 import create_flash_attention
 from easydel.kernels.ring_attention import ring_attention
 from easydel.layers._blockwise_attention import blockwise_attn
-from easydel.modules.modeling_utils import EasyDeLBaseConfig
+from easydel.layers.caching import TransformerCacheView
 from easydel.utils.quantizers import EasyQuantizer
 
 try:
@@ -170,8 +171,8 @@ def _get_jax_dtype_from_string(dtype_string):
 
 @dataclass
 class AttentionOutput:
-	attention_weights: Optional[Array] = None
-	attention_outputs: Optional[Array] = None
+	attention_weights: tp.Optional[Array] = None
+	attention_outputs: tp.Optional[Array] = None
 
 
 class AttentionMechanisms(str, Enum):
@@ -230,8 +231,8 @@ DEFAULT_ATTENTION_MECHANISM = (
 def set_attrs_smartly_with_prp(
 	self,
 	attr_name: str,
-	default: Any,
-	new_attr: Any,
+	default: tp.Any,
+	new_attr: tp.Any,
 	prp: EasyDeLBaseConfig = None,
 	pickup_name=None,
 ):
@@ -249,7 +250,7 @@ def set_attrs_smartly_with_prp(
 		setattr(self, attr_name, new_attr)
 
 
-class FlexibleAttentionModule(object):
+class FlexibleAttentionModule(nn.Module):
 	"""
 	Manages different attention mechanisms for efficient computation in EasyDeL models.
 
@@ -324,12 +325,12 @@ class FlexibleAttentionModule(object):
 		precision: lax.Precision = ...,
 		force_float32_tpu: bool = ...,
 		shard_attention_computation: bool = ...,
-		use_sharding_constraint: Optional[bool] = ...,
+		use_sharding_constraint: tp.Optional[bool] = ...,
 		axis_name: str = ...,
 		platform: EasyDeLPlatforms = ...,
-		backend: Optional[EasyDeLBackends] = ...,
-		backward_pass_impl: Literal["triton", "xla"] = "triton",
-		base_config: Optional[EasyDeLBaseConfig] = None,
+		backend: tp.Optional[EasyDeLBackends] = ...,
+		backward_pass_impl: tp.Literal["triton", "xla"] = "triton",
+		base_config: tp.Optional[EasyDeLBaseConfig] = None,
 		_do_check: bool = True,
 	):
 		self.blocksize_k: int = ...
@@ -340,7 +341,7 @@ class FlexibleAttentionModule(object):
 		self.precision: lax.Precision = ...
 		self.force_float32_tpu: bool = ...
 		self.shard_attention_computation: bool = ...
-		self.use_sharding_constraint: Optional[bool] = ...
+		self.use_sharding_constraint: tp.Optional[bool] = ...
 		self.axis_name: str = ...
 		self.backend: str = ...
 		self.platform: str = ...
@@ -397,7 +398,7 @@ class FlexibleAttentionModule(object):
 		self,
 		query_sequence_length,
 		bias_dim_eql=False,
-	) -> Tuple[
+	) -> tp.Tuple[
 		PartitionSpec,
 		PartitionSpec,
 		PartitionSpec,
@@ -475,7 +476,7 @@ class FlexibleAttentionModule(object):
 		self,
 		query_sequence_length,
 		bias_dim_eql=False,
-	) -> Tuple[
+	) -> tp.Tuple[
 		PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, PartitionSpec, bool
 	]:
 		in_generating_processerating = query_sequence_length == 1
@@ -585,22 +586,22 @@ class FlexibleAttentionModule(object):
 			f"\nMiss Match {value_states.shape} and " f"required Shape {k_v_req_shape}"
 		)
 
-	# @functools.partial(jax.jit, static_argnames=["self"])
+	@jax.named_scope("easydel-flexible-attention")
 	def __call__(
 		self,
 		query_states: Array,
 		key_states: Array,
 		value_states: Array,
-		query_sequence_length: Optional[int] = None,
-		key_value_sequence_length: Optional[int] = None,
-		bias: Optional[Array] = None,
-		attention_mask: Optional[Array] = None,
-		segment_ids: Optional[Array] = None,
+		query_sequence_length: tp.Optional[int] = None,
+		key_value_sequence_length: tp.Optional[int] = None,
+		bias: tp.Optional[Array] = None,
+		attention_mask: tp.Optional[Array] = None,
+		segment_ids: tp.Optional[Array] = None,
 		causal: bool = True,
 		deterministic: bool = True,
-		dropout_rng: Optional[random.PRNGKey] = None,
+		dropout_rng: tp.Optional[random.PRNGKey] = None,
 		uses_cache: bool = False,
-		causal_mask: Optional[Array] = None,
+		causal_mask: tp.Optional[Array] = None,
 	):
 		global PRINT_COMMON
 		if query_sequence_length is None:
@@ -738,7 +739,7 @@ class FlexibleAttentionModule(object):
 		query_states: Array,
 		key_states: Array,
 		value_states: Array,
-		bias: Optional[Array] = None,
+		bias: tp.Optional[Array] = None,
 		causal: bool = False,
 	):
 		(
@@ -758,6 +759,9 @@ class FlexibleAttentionModule(object):
 				if jax.default_backend() == "gpu"
 				else (causal if bias is None else False),
 			)
+			dtype = self.dtype
+			if jax.default_backend() == "gpu" and dtype == jnp.float32:
+				dtype = jnp.float16
 			attention_output = shard_map(
 				func,
 				mesh=self.mesh,
@@ -789,10 +793,10 @@ class FlexibleAttentionModule(object):
 				),
 				check_rep=False,
 			)(
-				query_states.astype(self.dtype),
-				key_states.astype(self.dtype),
-				value_states.astype(self.dtype),
-				bias.astype(self.dtype) if bias is not None else None,
+				query_states.astype(dtype),
+				key_states.astype(dtype),
+				value_states.astype(dtype),
+				bias.astype(dtype) if bias is not None else None,
 			)
 			return AttentionOutput(
 				attention_weights=None,
@@ -807,7 +811,7 @@ class FlexibleAttentionModule(object):
 		query_states: Array,
 		key_states: Array,
 		value_states: Array,
-		bias: Optional[Array] = None,
+		bias: tp.Optional[Array] = None,
 	):
 		(
 			query_partitionspec,
@@ -934,11 +938,11 @@ class FlexibleAttentionModule(object):
 		value_states: Array,
 		query_sequence_length: int,
 		key_value_sequence_length: int,
-		bias: Optional[Array] = None,
-		attention_mask: Optional[Array] = None,
+		bias: tp.Optional[Array] = None,
+		attention_mask: tp.Optional[Array] = None,
 		deterministic: bool = False,
-		dropout_rng: Optional[random.PRNGKey] = None,
-		segment_ids: Optional[Array] = None,
+		dropout_rng: tp.Optional[random.PRNGKey] = None,
+		segment_ids: tp.Optional[Array] = None,
 	):
 		key_states, value_states = self.repeat_kv_heads(
 			key_states,
@@ -995,9 +999,9 @@ class FlexibleAttentionModule(object):
 		query_states: Array,
 		key_states: Array,
 		value_states: Array,
-		bias: Optional[Array] = None,
+		bias: tp.Optional[Array] = None,
 		deterministic: bool = False,
-		dropout_rng: Optional[random.PRNGKey] = None,
+		dropout_rng: tp.Optional[random.PRNGKey] = None,
 		query_sequence_length: int,
 		key_value_sequence_length: int,
 	) -> AttentionOutput:
@@ -1012,6 +1016,7 @@ class FlexibleAttentionModule(object):
 			) = self.get_bshd_partition_specs(query_sequence_length)
 		b, qs, qh, d = query_states.shape
 		b, ks, kh, d = key_states.shape
+
 		*_, vd = value_states.shape
 		with self.mesh:
 			query_states = fjformer.with_sharding_constraint(
@@ -1026,9 +1031,7 @@ class FlexibleAttentionModule(object):
 				(b, qs, self.num_kv_heads, qh // self.num_kv_heads, d),
 			)
 			query_states, key_states, value_states = promote_dtype(
-				query_states,
-				key_states,
-				value_states,
+				(query_states, key_states, value_states),
 				dtype=self.dtype,
 			)
 
@@ -1042,25 +1045,16 @@ class FlexibleAttentionModule(object):
 
 		if bias is not None:
 			if bias.shape[1] == self.num_q_heads:
-				attention_weight = jnp.add(
-					attention_weight,
-					bias.reshape(
-						b, self.num_kv_heads, self.num_q_heads // self.num_kv_heads, qs, ks
-					),
+				bias = bias.reshape(
+					b, self.num_kv_heads, self.num_q_heads // self.num_kv_heads, qs, ks
 				)
 			elif bias.shape[1] == self.num_kv_heads:
-				attention_weight = jnp.add(
-					attention_weight,
-					bias.reshape(b, self.num_kv_heads, 1, qs, ks),
-				)
+				bias = bias.reshape(b, self.num_kv_heads, 1, qs, ks)
 			elif bias.shape[1] == 1:
-				attention_weight = jnp.add(
-					attention_weight,
-					bias.reshape(b, 1, 1, qs, ks),
-				)
+				bias = bias.reshape(b, 1, 1, qs, ks)
 			else:
 				raise NotImplementedError("bias heads wont match!")
-
+			attention_weight = jnp.add(attention_weight, bias.astype(attention_weight))
 		attention_weight = jax.nn.softmax(attention_weight).astype(self.dtype)
 
 		if not deterministic and self.attention_dropout > 0.0:
@@ -1088,9 +1082,9 @@ class FlexibleAttentionModule(object):
 		query_states: Array,
 		key_states: Array,
 		value_states: Array,
-		bias: Optional[Array] = None,
+		bias: tp.Optional[Array] = None,
 		deterministic: bool = False,
-		dropout_rng: Optional[random.PRNGKey] = None,
+		dropout_rng: tp.Optional[random.PRNGKey] = None,
 		query_sequence_length: int,
 		key_value_sequence_length: int,
 	) -> AttentionOutput:
@@ -1212,7 +1206,7 @@ class FlexibleAttentionModule(object):
 		query_states: Array,
 		key_states: Array,
 		value_states: Array,
-		bias: Optional[Array] = None,
+		bias: tp.Optional[Array] = None,
 		causal: bool = False,
 		deterministic: bool = True,
 		query_sequence_length: int,
@@ -1315,7 +1309,7 @@ class FlexibleAttentionModule(object):
 		batch_sizes=[1, 2, 4, 8],  # noqa
 		sequence_lengths=[512, 1024, 2048],  # noqa
 		attention_types=None,
-	) -> Dict[str, Union[Dict, "pd.DataFrame"]]:  # noqa #type:ignore
+	) -> tp.Dict[str, tp.Union[tp.Dict, "pd.DataFrame"]]:
 		"""Run comprehensive benchmarks across different configurations."""
 		results = {}
 
@@ -1375,12 +1369,12 @@ class BenchmarkConfig:
 	num_key_value_heads: int = 32
 	blocksize_q: int = 64
 	blocksize_k: int = 64
-	axis_dims: Tuple[int, int, int, int] = (1, -1, 1, 1)
+	axis_dims: tp.Tuple[int, int, int, int] = (1, -1, 1, 1)
 	head_dim: int = 128
 	dtype: jnp.dtype = jnp.float16
 	num_warmup_runs: int = 3
 	num_benchmark_runs: int = 10
-	metrics: List[BenchmarkMetrics] = None
+	metrics: tp.List[BenchmarkMetrics] = None
 
 
 class AttentionBenchmarker:
@@ -1389,7 +1383,7 @@ class AttentionBenchmarker:
 	def __init__(
 		self,
 		config: BenchmarkConfig,
-		run_attention_benchmarks: List[str] = None,
+		run_attention_benchmarks: tp.List[str] = None,
 		calculate_gradients: bool = True,
 	):
 		from fjformer import GenerateRNG
@@ -1588,7 +1582,7 @@ class AttentionBenchmarker:
 
 		return metrics, avg_output
 
-	def run_benchmarks(self) -> Union[Dict, "pd.DataFrame"]:  # noqa #type:ignore
+	def run_benchmarks(self) -> tp.Union[tp.Dict, "pd.DataFrame"]:
 		"""Run benchmarks with gradient comparison."""
 		inputs = self._create_attention_inputs()
 
@@ -1667,7 +1661,23 @@ class AttentionBenchmarker:
 
 
 class FlaxAttentionModule(nn.Module):
-	config: "EasyDeLBaseConfig"  # type: ignore  # noqa
+	def __init__(
+		self,
+		config: "EasyDeLBaseConfig",  # type:ignore  # noqa
+	):
+		super().__init__()
+		self.config = config
+
+		self.cached_key: nn.Cache[Array] | None = None
+		self.cached_value: nn.Cache[Array] | None = None
+		self.cache_index: nn.Cache[Array] | None = None
+
+	@cached_property
+	def quantizer(self):
+		return EasyQuantizer(
+			quantization_method=self.config.kv_cache_quantization_method,
+			block_size=self.config.kv_cache_quantization_blocksize,
+		)
 
 	@staticmethod
 	def _transpose_sequence_head(*args):
@@ -1684,227 +1694,133 @@ class FlaxAttentionModule(nn.Module):
 			args,
 		)
 
-	@nn.compact
-	def _concatenate_to_cache(self, query, key, value, attention_mask):
-		"""The _concatenate_to_cache function is used to concatenate the key and value vectors
-		of a query  with those of previous queries. This allows for the attention mechanism to
-		look at all previous queries when computing its output. The function takes in three
-		arguments: key, value, and query . It also uses two variables that are stored in the cache:
-		cached_key and cached_value.
-
-		Args:
-		    self: Access the variables stored in the cache
-		    key: Store the keys of the encoder-decoder attention
-		    value: Initialize the cached_value variable
-		    query : Determine the number of cache vectors to update
-		    attention_mask: Mask out the padded vectors in the cache
-
-		Returns:
-		    The key, value and attention_mask
-		"""
-		paxs: PartitionAxis = self.config.partition_axis
-		quantization_method = self.config.kv_cache_quantization_method
-		kv_cache_quantization_blocksize = self.config.kv_cache_quantization_blocksize
-
-		quantizer = EasyQuantizer(
-			quantization_method=quantization_method,
-			block_size=kv_cache_quantization_blocksize,
-		)
-		is_initialized = self.has_variable("cache", "cached_key")
-		gen_kv_spec = PartitionSpec(
-			paxs.batch_axis,
-			None,
-			paxs.head_axis,
-			paxs.attention_dim_axis,
-		)
-		kv_spec = PartitionSpec(
-			paxs.batch_axis,
-			paxs.key_sequence_axis,
-			paxs.head_axis,
-			paxs.attention_dim_axis,
-		)
-		cached_key = self.variable(
-			"cache",
-			"cached_key",
-			lambda: quantizer(
-				jnp.zeros(
-					shape=key.shape,
-					dtype=key.dtype,
-					device=PartitionSpec(
-						paxs.batch_axis,
-						paxs.key_sequence_axis,
-						paxs.head_axis,
-						paxs.attention_dim_axis,
-					),
-				),
-			),
-		)
-		cached_value = self.variable(
-			"cache",
-			"cached_value",
-			lambda: quantizer(
-				jnp.zeros(
-					shape=key.shape,
-					dtype=key.dtype,
-					device=PartitionSpec(
-						paxs.batch_axis,
-						paxs.key_sequence_axis,
-						paxs.head_axis,
-						paxs.attention_dim_axis,
-					),
-				),
-			),
-		)
-		cache_index = self.variable(
-			"cache",
-			"cache_index",
-			lambda: jnp.array(0, dtype=jnp.int32),
-		)
-		if is_initialized:
-			*batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
-			cur_index = cache_index.value
-			if (
-				query.shape[1] == 1
-				and self.config.use_sharded_kv_caching
-				and quantization_method == EasyDeLQuantizationMethods.NONE
-			):
-				mesh = self.config.mesh
-
-				@partial(
-					shard_map,
-					mesh=mesh,
-					in_specs=(
-						kv_spec,
-						kv_spec,
-						gen_kv_spec,
-						gen_kv_spec,
-						PartitionSpec(),
-					),
-					out_specs=(
-						kv_spec,
-						kv_spec,
-					),
-					check_rep=False,
-				)
-				def fn(_cached_key, _cached_value, _key, _value, _cur_index):
-					assert _key.shape[1] == 1 and _value.shape[1] == 1, (
-						_key.shape,
-						_value.shape,
-					)
-					sp_size = (
-						max_length // mesh.shape[self.config.kv_cache_sharding_sequence_axis_name]
-					)
-					axis_index = jax.lax.axis_index(
-						self.config.kv_cache_sharding_sequence_axis_name
-					)
-					_cur_index = _cur_index - axis_index * sp_size
-					_key, _value = jax.lax.cond(
-						jnp.logical_and(_cur_index >= 0, _cur_index < sp_size),
-						lambda: (
-							_cached_key.at[:, _cur_index].set(_key[:, -1]),
-							_cached_value.at[:, _cur_index].set(_value[:, -1]),
-						),
-						lambda: (_cached_key, _cached_value),
-					)
-					return _key, _value
-
-				key, value = fn(cached_key.value, cached_value.value, key, value, cur_index)
-			else:
-				*batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
-				cur_index = cache_index.value
-				indices = (0,) * len(batch_dims) + (cur_index, 0, 0)  # type:ignore
-				key_val = cached_key.value
-				value_val = cached_value.value
-				try:
-					key_val = key_val.materialize()
-					value_val = value_val.materialize()
-				except Exception:
-					...
-				key = lax.dynamic_update_slice(key_val, key, indices)
-				value = lax.dynamic_update_slice(value_val, value, indices)
-				num_updated_cache_vectors = query.shape[1]
-				pad_mask = jnp.broadcast_to(
-					jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
-					tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
-				)
-				attention_mask = jnp.logical_and(pad_mask, attention_mask)
-			cached_key.value = quantizer(with_sharding_constraint(key, kv_spec))
-			cached_value.value = quantizer(with_sharding_constraint(value, kv_spec))
-			num_updated_cache_vectors = query.shape[1]
-			cache_index.value = cache_index.value + num_updated_cache_vectors
-		return key, value, attention_mask
-
-	def concatenate_to_cache(
+	def _concatenate_to_cache(
 		self,
-		*,
-		init_cache: bool,
-		query: jax.Array,
-		key: jax.Array,
-		value: jax.Array,
-		attention_mask: jax.Array,
-		causal_mask: Optional[jax.Array],
-		fcm_mask: Optional[jax.Array],
-	) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-		"""
-		takes in qkv with additional masks and concatenate them to cache for generation
+		query: Array,
+		key: Array,
+		value: Array,
+		cache_view: TransformerCacheView,
+		attention_mask: Array,
+		causal_mask: tp.Optional[Array] = None,
+	) -> tp.Tuple[Array, Array, Array]:
+		num_updated_cache_vectors = query.shape[1]
+		end_index = cache_view.index[0]
 
-		Args:
-				init_cache (bool): whenever to init cache or not.
-				query (jax.Array): query states from model proj.
-				key (jax.Array): key states from model proj.
-				value (jax.Array): value states from model proj.
-				attention_mask (jax.Array): attention mask.
-				causal_mask (Optional[jax.Array])): causal_mask if provided.
-				fcm_mask (Optional[jax.Array]): fcm mask if provided.
+		key_value_specs = PartitionSpec(
+			self.config.partition_axis.batch_axis,
+			self.config.partition_axis.key_sequence_axis,
+			self.config.partition_axis.head_axis,
+			self.config.partition_axis.attention_dim_axis,
+		)
 
-		Returns:
-				Tuple[jax.Array, jax.Array, jax.Array, jax.Array,jax.Array]: returns query, key, value, attention_mask, attention_bias
-		"""
-		query_length = query.shape[1]
-		key_length = key.shape[1]
-		if causal_mask is not None:
-			if self.has_variable("cache", "cached_key"):
-				causal_mask = lax.dynamic_slice(
-					causal_mask,
-					(0, 0, self.variables["cache"]["cache_index"], 0),
-					(1, 1, query_length, self.variables["cache"]["cached_key"].shape[1]),
-				)
-			else:
-				causal_mask = causal_mask[:, :, :query_length, :key_length]
-			causal_mask = jnp.broadcast_to(
-				causal_mask, (query.shape[0],) + causal_mask.shape[1:]
-			)
-			if attention_mask.ndim == 2:
-				attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-			attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
-			attention_mask = nn.combine_masks(attention_mask, causal_mask, fcm_mask)
-		else:
+		*batch_dims, max_length, num_heads, depth_per_head = cache_view.value.shape
+
+		if attention_mask.ndim == 2:
 			attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
 
-		if self.has_variable("cache", "cached_key") or init_cache:
+		if causal_mask is not None:
+			causal_mask = lax.dynamic_slice(
+				causal_mask,
+				(0, 0, end_index, 0),
+				(1, 1, num_updated_cache_vectors, max_length),
+			)
+			causal_mask = jnp.broadcast_to(
+				causal_mask,
+				(query.shape[0],) + causal_mask.shape[1:],
+			)
+			attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
+			attention_mask = jnp.logical_and(attention_mask, causal_mask)
+
+		slice_indices = (0, end_index % cache_view.value.shape[1], 0, 0)
+		value_cache = cache_view.value
+		key_cache = cache_view.key
+		try:
+			key_cache = key_cache.materialize()
+			value_cache = value_cache.materialize()
+		except Exception:
+			...
+		value_cache = lax.dynamic_update_slice(value_cache, value, slice_indices)
+		key_cache = lax.dynamic_update_slice(key_cache, key, slice_indices)
+		pad_mask = jnp.broadcast_to(
+			jnp.arange(max_length) < end_index + num_updated_cache_vectors,
+			tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
+		)
+		attention_mask = jnp.logical_and(pad_mask, attention_mask)
+
+		cache_view.key = self.quantizer(
+			with_sharding_constraint(key_cache, key_value_specs)
+		)
+		cache_view.value = self.quantizer(
+			with_sharding_constraint(value_cache, key_value_specs)
+		)
+		cache_view.index = cache_view.index + num_updated_cache_vectors
+
+		return key_cache, value_cache, attention_mask
+
+	def concatenate(
+		self,
+		*,
+		query: Array,
+		key: Array,
+		value: Array,
+		attention_mask: Array,
+		cache_view: tp.Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[Array] = None,
+		fcm_mask: tp.Optional[Array] = None,
+		sliding_windows: tp.Optional[int] = None,
+	) -> tp.Tuple[Array, Array, Array, Array]:
+		if cache_view is None:
+			query_length = query.shape[1]
+			key_length = key.shape[1]
+			if causal_mask is not None:
+				causal_mask = causal_mask[:, :, :query_length, :key_length]
+				causal_mask = jnp.broadcast_to(
+					causal_mask, (query.shape[0],) + causal_mask.shape[1:]
+				)
+				if attention_mask.ndim == 2:
+					attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+
+				attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
+				attention_mask = nn.combine_masks(attention_mask, causal_mask, fcm_mask)
+
+			else:
+				attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+				attention_mask = jnp.repeat(attention_mask, query.shape[1], -2)
+		else:
 			key, value, attention_mask = self._concatenate_to_cache(
 				query=query,
 				key=key,
 				value=value,
+				cache_view=cache_view,
 				attention_mask=attention_mask,
+				causal_mask=causal_mask,
 			)
+		if sliding_windows is not None:
+			sliding_window_mask = jnp.tril(
+				jnp.ones_like(attention_mask, dtype=jnp.bool),
+				k=-sliding_windows,
+			)
+			window_mask = jnp.where(sliding_window_mask, 0, 1)
+			attention_mask = jnp.logical_and(window_mask, attention_mask)
+			if attention_mask.shape[-1] <= 1:
+				attention_mask = attention_mask[:, :, :, -sliding_windows:]
 
 		attention_bias = lax.select(
 			attention_mask > 0,
 			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
 			jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
 		)
-		return query, key, value, attention_mask, attention_bias
+		return key, value, attention_mask, attention_bias
 
 	def shard_attention_prod(self, attn_output: jax.Array) -> jax.Array:
 		"""
 		shards attention output before passing that to output_proj
 
 		Args:
-				attn_output (jax.Array): merged output of dot product attention with 3 dims, (batch, seqlen, hidden_size).
+		    attn_output (jax.Array): merged output of dot product attention with 3 dims, (batch, seqlen, hidden_size).
 
 		Returns:
-				jax.Array: sharded version of `attn_output`
+		    jax.Array: sharded version of `attn_output`
 		"""
 		return with_sharding_constraint(
 			attn_output,

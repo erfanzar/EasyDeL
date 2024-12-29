@@ -12,14 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 """Dbrx configuration."""
 
+import typing as tp
 import warnings
-from typing import Any, Optional
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
-from easydel.modules.factory import register_config
-from easydel.modules.modeling_utils import EasyDeLBaseConfig
+from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.infra.factory import register_config
+from jax.sharding import PartitionSpec
 
 DBRX_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 
@@ -42,10 +44,10 @@ class DbrxAttentionConfig(EasyDeLBaseConfig):
 	def __init__(
 		self,
 		attn_pdrop: float = 0,
-		clip_qkv: Optional[float] = 8,
+		clip_qkv: tp.Optional[float] = 8,
 		kv_n_heads: int = 1,
 		rope_theta: float = 10000.0,
-		**kwargs: Any,
+		**kwargs: tp.Any,
 	):
 		super().__init__(**kwargs)
 		self.attn_pdrop = attn_pdrop
@@ -61,7 +63,7 @@ class DbrxAttentionConfig(EasyDeLBaseConfig):
 
 	@classmethod
 	def from_pretrained(
-		cls, pretrained_model_name_or_path: str, **kwargs: Any
+		cls, pretrained_model_name_or_path: str, **kwargs: tp.Any
 	) -> "PretrainedConfig":  # type: ignore[misc] # noqa: F821
 		cls._set_token_in_kwargs(kwargs)
 
@@ -109,15 +111,15 @@ class DbrxFFNConfig(EasyDeLBaseConfig):
 
 	def __init__(
 		self,
-		ffn_act_fn: Optional[dict] = None,
+		ffn_act_fn: tp.Optional[dict] = None,
 		ffn_hidden_size: int = 3584,
 		moe_num_experts: int = 4,
 		moe_top_k: int = 1,
-		moe_jitter_eps: Optional[float] = None,
+		moe_jitter_eps: tp.Optional[float] = None,
 		moe_loss_weight: float = 0.01,
-		moe_normalize_expert_weights: Optional[float] = 1,
+		moe_normalize_expert_weights: tp.Optional[float] = 1,
 		uniform_expert_assignment: bool = False,
-		**kwargs: Any,
+		**kwargs: tp.Any,
 	):
 		super().__init__()
 		if ffn_act_fn is None:
@@ -139,7 +141,7 @@ class DbrxFFNConfig(EasyDeLBaseConfig):
 
 	@classmethod
 	def from_pretrained(
-		cls, pretrained_model_name_or_path: str, **kwargs: Any
+		cls, pretrained_model_name_or_path: str, **kwargs: tp.Any
 	) -> "EasyDeLBaseConfig":
 		cls._set_token_in_kwargs(kwargs)
 
@@ -217,14 +219,14 @@ class DbrxConfig(EasyDeLBaseConfig):
 		vocab_size: int = 32000,
 		resid_pdrop: float = 0.0,
 		emb_pdrop: float = 0.0,
-		attn_config: Optional[DbrxAttentionConfig] = None,
-		ffn_config: Optional[DbrxFFNConfig] = None,
+		attn_config: tp.Optional[DbrxAttentionConfig] = None,
+		ffn_config: tp.Optional[DbrxFFNConfig] = None,
 		use_cache: bool = True,
 		initializer_range: float = 0.02,
 		output_router_logits: bool = False,
 		router_aux_loss_coef: float = 0.05,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		**kwargs: Any,
+		**kwargs: tp.Any,
 	):
 		if attn_config is None:
 			self.attn_config = DbrxAttentionConfig()
@@ -276,4 +278,32 @@ class DbrxConfig(EasyDeLBaseConfig):
 			self,
 			"mask_max_position_embeddings",
 			self.max_position_embeddings,
+		)
+
+	def get_partition_rules(self, *args, **kwargs):
+		"""
+		Get the partition rules for the model.
+		Returns:
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+		"""
+		return (
+			# Embeddings
+			("transformer/wte/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+			# Language model head
+			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("lm_head/bias", PartitionSpec(None)),
+			# Attention layers
+			("norm_attn_norm/attn/Wqkv/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("norm_attn_norm/attn/Wqkv/bias", PartitionSpec(None)),
+			("norm_attn_norm/attn/out_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("norm_attn_norm/attn/out_proj/bias", PartitionSpec(None)),
+			# MoE FFN layers
+			("ffn/experts/mlp/(v1|w1|w2)", PartitionSpec(("fsdp", "sp"), "tp")),
+			("ffn/router/layer/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("ffn/router/layer/bias", PartitionSpec(None)),
+			# Layer norms
+			("norm_attn_norm/norm_\d+/(bias|scale)", PartitionSpec(None)),
+			("transformer/norm_f/(bias|scale)", PartitionSpec(None)),
+			# Catch-all
+			(".*", PartitionSpec(None)),
 		)

@@ -21,8 +21,8 @@ settings.
 
 import dataclasses
 import functools
+import typing as tp
 from functools import partial
-from typing import Any, NamedTuple, Optional, Tuple
 
 import chex
 import jax
@@ -40,7 +40,7 @@ NUM_LANES = 128
 NUM_SUBLANES = 8
 
 
-class SegmentIds(NamedTuple):
+class SegmentIds(tp.NamedTuple):
 	"""SegmentIds for Q and KV sequences.
 
 	SegmentIds are used to generate segment mask, which prevents attention between
@@ -61,31 +61,31 @@ def _ring_flash_attention_fwd_tpu(
 	query: chex.Array,
 	key: chex.Array,
 	value: chex.Array,
-	bias: Optional[chex.Array] = None,
-	segment_ids: Optional[SegmentIds] = None,
-	cache_idx: Optional[int] = None,
-	axis_name: Optional[str] = None,
+	bias: tp.Optional[chex.Array] = None,
+	segment_ids: tp.Optional[SegmentIds] = None,
+	cache_idx: tp.Optional[int] = None,
+	axis_name: tp.Optional[str] = None,
 	float32_logits: bool = True,
-	softmax_scale: Optional[float] = None,
+	softmax_scale: tp.Optional[float] = None,
 	blocksize_q: int = 256,
 	blocksize_k: int = 256,
-	blocksize_c: Optional[int] = None,
-) -> Tuple[chex.Array, Tuple]:
+	blocksize_c: tp.Optional[int] = None,
+) -> tp.Tuple[chex.Array, tp.Tuple]:
 	"""Forward pass for ring attention on TPU.
 
 	Args:
 			query: Query array of shape (batch, query_len, num_heads, dim_per_head).
 			key: Key array of shape (batch, kv_len, num_heads, dim_per_head).
 			value: Value array of shape (batch, kv_len, num_heads, dim_per_head).
-			bias: Optional bias array. Its shape depends on the attention mechanism.
-			segment_ids: Optional segment ids for Q and KV sequences.
-			cache_idx: Optional cache index for use with caching.
-			axis_name: Optional name of the axis to ppermute over (for multi-host support).
+			bias: tp.Optional bias array. Its shape depends on the attention mechanism.
+			segment_ids: tp.Optional segment ids for Q and KV sequences.
+			cache_idx: tp.Optional cache index for use with caching.
+			axis_name: tp.Optional name of the axis to ppermute over (for multi-host support).
 			float32_logits: Whether to compute logits in float32.
-			softmax_scale: Optional scaling factor for the softmax function.
+			softmax_scale: tp.Optional scaling factor for the softmax function.
 			blocksize_q: Block size for the query sequence.
 			blocksize_k: Block size for the key/value sequence.
-			blocksize_c: Optional block size for causal masking.
+			blocksize_c: tp.Optional block size for causal masking.
 
 	Returns:
 			A tuple containing the output array and a tuple of intermediate values for use in the backward pass.
@@ -196,19 +196,19 @@ def _ring_flash_attention_fwd_tpu(
 
 
 def _ring_flash_attention_bwd_tpu(
-	axis_name: Optional[str],
+	axis_name: tp.Optional[str],
 	float32_logits: bool,
-	softmax_scale: Optional[float],
+	softmax_scale: tp.Optional[float],
 	blocksize_q: int,
 	blocksize_k: int,
-	blocksize_c: Optional[int],
-	res: Tuple,
+	blocksize_c: tp.Optional[int],
+	res: tp.Tuple,
 	g: chex.Array,
-) -> Tuple[chex.Array, chex.Array, chex.Array, None, None, None]:
+) -> tp.Tuple[chex.Array, chex.Array, chex.Array, None, None, None]:
 	"""Backward pass for ring attention on TPU.
 
 	Args:
-	    axis_name: Optional name of the axis to ppermute over.
+	    axis_name: tp.Optional name of the axis to ppermute over.
 	    float32_logits: Whether logits were computed in float32.
 	    softmax_scale: Softmax scaling factor used in the forward pass.
 	    blocksize_q: Block size for the query sequence.
@@ -218,7 +218,7 @@ def _ring_flash_attention_bwd_tpu(
 	    g: Gradient of the output.
 
 	Returns:
-	    Tuple containing the gradients of query, key, value, bias, segment_ids, and cache_idx.
+	    tp.Tuple containing the gradients of query, key, value, bias, segment_ids, and cache_idx.
 	"""
 	del float32_logits
 	o, query, key, value, bias, segment_ids, cache_idx, l, m = res
@@ -328,15 +328,15 @@ def ring_attention_tpu(
 	query: chex.Array,
 	key: chex.Array,
 	value: chex.Array,
-	bias: Optional[chex.Array] = None,
-	segment_ids: Optional[SegmentIds] = None,
-	cache_idx: Optional[int] = None,
-	axis_name: Optional[str] = None,
+	bias: tp.Optional[chex.Array] = None,
+	segment_ids: tp.Optional[SegmentIds] = None,
+	cache_idx: tp.Optional[int] = None,
+	axis_name: tp.Optional[str] = None,
 	float32_logits: bool = True,
-	softmax_scale: Optional[float] = None,
+	softmax_scale: tp.Optional[float] = None,
 	blocksize_q: int = 256,
 	blocksize_k: int = 256,
-	blocksize_c: Optional[int] = None,
+	blocksize_c: tp.Optional[int] = None,
 ) -> chex.Array:
 	"""Computes ring attention using FlashAttention on TPU.
 
@@ -344,15 +344,15 @@ def ring_attention_tpu(
 	    query: Query array of shape (batch, query_len, num_heads, dim_per_head).
 	    key: Key array of shape (batch, kv_len, num_heads, dim_per_head).
 	    value: Value array of shape (batch, kv_len, num_heads, dim_per_head).
-	    bias: Optional bias array.  Its shape depends on the attention mechanism.
-	    segment_ids: Optional segment ids for Q and KV sequences.
-	    cache_idx: Optional cache index for use with caching.
-	    axis_name: Optional name of the axis to ppermute over (for multi-host support).
+	    bias: tp.Optional bias array.  Its shape depends on the attention mechanism.
+	    segment_ids: tp.Optional segment ids for Q and KV sequences.
+	    cache_idx: tp.Optional cache index for use with caching.
+	    axis_name: tp.Optional name of the axis to ppermute over (for multi-host support).
 	    float32_logits: Whether to compute logits in float32.
-	    softmax_scale: Optional scaling factor for the softmax function.
+	    softmax_scale: tp.Optional scaling factor for the softmax function.
 	    blocksize_q: Block size for the query sequence.
 	    blocksize_k: Block size for the key/value sequence.
-	    blocksize_c: Optional block size for causal masking.
+	    blocksize_c: tp.Optional block size for causal masking.
 
 
 	Returns:
@@ -526,7 +526,7 @@ def _flash_attention_fwd(
 
 def _flash_attention_bwd(
 	save_residuals: bool,
-	blocksize_c: Optional[int],
+	blocksize_c: tp.Optional[int],
 	softmax_scale: float,
 	blocksizes: BlockSizes,
 	debug: bool,
@@ -638,8 +638,8 @@ def _flash_attention_kernel_single_batch(
 	m_scratch_ref,
 	l_scratch_ref,
 	acc_scratch_ref,
-	l_ref: Any | None = None,
-	m_ref: Any | None = None,
+	l_ref: tp.Any | None = None,
+	m_ref: tp.Any | None = None,
 	*,
 	blocksize_c,
 	softmax_scale,
@@ -1055,7 +1055,7 @@ def _flash_attention_dkv_kernel(
 	dv_scratch_ref,
 	*,
 	softmax_scale: float,
-	blocksize_c: Optional[int],
+	blocksize_c: tp.Optional[int],
 	mask_value: float,
 	q_seq_len: int,
 	blocksize_q: int,
@@ -1225,7 +1225,7 @@ def _flash_attention_bwd_dkv(
 	blocksize_k_major: int | None,
 	blocksize_k: int | None,
 	softmax_scale: float,
-	blocksize_c: Optional[int] = None,
+	blocksize_c: tp.Optional[int] = None,
 	mask_value: float = DEFAULT_MASK_VALUE,
 	debug: bool = False,
 ):
@@ -1467,7 +1467,7 @@ def _flash_attention_dq_kernel(
 	ds_tile_ref,
 	*,
 	softmax_scale: float,
-	blocksize_c: Optional[int],
+	blocksize_c: tp.Optional[int],
 	mask_value: float,
 	kv_seq_len: int,
 	blocksize_k: int,
@@ -1629,7 +1629,7 @@ def _flash_attention_bwd_dq(
 	blocksize_k_major: int | None,
 	blocksize_k: int | None,
 	softmax_scale: float,
-	blocksize_c: Optional[int],
+	blocksize_c: tp.Optional[int],
 	mask_value: float,
 	debug: bool,
 ):

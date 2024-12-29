@@ -12,20 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.mistral.mistral_configuration import (
-	MistralConfig,
-	VisionMistralConfig,
-)
-from easydel.modules.mistral.modelling_mistral_flax import (
-	FlaxMistralForCausalLM,
-	FlaxMistralModel,
-	FlaxVisionMistralForCausalLM,
-)
+from .mistral_configuration import MistralConfig
+from .modeling_mistral_flax import MistralForCausalLM, MistralModel
 
-__all__ = (
-	"FlaxMistralForCausalLM",
-	"FlaxMistralModel",
-	"FlaxVisionMistralForCausalLM",
-	"MistralConfig",
-	"VisionMistralConfig",
-)
+__all__ = ("MistralForCausalLM", "MistralModel", "MistralConfig")

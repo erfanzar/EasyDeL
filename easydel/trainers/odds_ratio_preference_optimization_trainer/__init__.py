@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.trainers.odds_ratio_preference_optimization_trainer.orpo_trainer import (
-	ORPOTrainer,
-	ORPOTrainerOutput,
-	ORPOConfig,
-)
+from .orpo_trainer import ORPOConfig, ORPOTrainer, ORPOTrainerOutput
+
+__all__ = ("ORPOTrainer", "ORPOTrainerOutput", "ORPOConfig")

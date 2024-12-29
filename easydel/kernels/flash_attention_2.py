@@ -12,14 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import os
+import typing as tp
 from dataclasses import dataclass
 from enum import Enum
-from typing import Literal, Optional, Tuple, Union
 
 import chex
 import einops
-import flax.linen
+import flax
+import flax.nnx
 import jax
 import jax.numpy as jnp
 from jax import random as jrnd
@@ -31,15 +33,15 @@ from jax.experimental.pallas.ops.tpu.flash_attention import (
 )
 from jax.extend.backend import get_backend
 
-from easydel.kernels.cpu_ops import jax_flash_attn_2_mu
-from easydel.kernels.gpu_ops import (
+from .cpu_ops import jax_flash_attn_2_mu
+from .gpu_ops import (
 	pallas_gqa_flash_attention2_gpu,
 	pallas_mha_flash_attention2_gpu,
 	triton_gqa_flash_attention2_gpu,
 )
 
-AVAILABLE_FLASH_ATTENTION2_PLATFORMS = Literal["triton", "pallas", "jax"]
-AVAILABLE_BACKENDS = Literal["gpu", "tpu", "cpu"]
+AVAILABLE_FLASH_ATTENTION2_PLATFORMS = tp.Literal["triton", "pallas", "jax"]
+AVAILABLE_BACKENDS = tp.Literal["gpu", "tpu", "cpu"]
 BACKEND = get_backend().platform
 
 
@@ -98,9 +100,9 @@ class AttentionConfig:
 
 	blocksize_q: int = 128
 	blocksize_k: int = 128
-	softmax_scale: Optional[float] = None
-	backend: Optional[Backend] = None
-	platform: Optional[Platform] = None
+	softmax_scale: tp.Optional[float] = None
+	backend: tp.Optional[Backend] = None
+	platform: tp.Optional[Platform] = None
 
 	def __post_init__(self):
 		if self.backend is None:
@@ -122,7 +124,7 @@ class AttentionConfig:
 class FlashAttention:
 	"""Flash Attention implementation with multiple backend support."""
 
-	def __init__(self, config: Optional[AttentionConfig] = None):
+	def __init__(self, config: tp.Optional[AttentionConfig] = None):
 		self.config = config or AttentionConfig()
 		self._validate_config()
 
@@ -146,7 +148,7 @@ class FlashAttention:
 	@staticmethod
 	def repeat_kv_heads(
 		key: chex.Array, value: chex.Array, num_reps: int
-	) -> Tuple[chex.Array, chex.Array]:
+	) -> tp.Tuple[chex.Array, chex.Array]:
 		"""Repeats key and value heads to match query heads."""
 		return (
 			einops.repeat(key, "b s h d -> b s (h r) d", r=num_reps),
@@ -155,7 +157,7 @@ class FlashAttention:
 
 	def _handle_bias(
 		self, bias: chex.Array, num_q_heads: int, num_kv_heads: int
-	) -> Optional[chex.Array]:
+	) -> tp.Optional[chex.Array]:
 		"""Processes attention bias based on head configuration."""
 		if bias is None:
 			return None
@@ -178,7 +180,7 @@ class FlashAttention:
 		query: chex.Array,
 		key: chex.Array,
 		value: chex.Array,
-		bias: Optional[chex.Array] = None,
+		bias: tp.Optional[chex.Array] = None,
 		adjust_sharindgs: bool = False,
 	) -> chex.Array:
 		"""
@@ -188,7 +190,7 @@ class FlashAttention:
 		            query: Query tensor of shape [batch, seq_len, num_heads, dim]
 		            key: Key tensor of shape [batch, seq_len, num_kv_heads, dim]
 		            value: Value tensor of shape [batch, seq_len, num_kv_heads, dim]
-		            bias: Optional attention bias tensor
+		            bias: tp.Optional attention bias tensor
 		adjust_sharindgs: whenever to change shardings for best fit in triton kernel
 
 		        Returns:
@@ -217,7 +219,7 @@ class FlashAttention:
 		query: chex.Array,
 		key: chex.Array,
 		value: chex.Array,
-		bias: Optional[chex.Array],
+		bias: tp.Optional[chex.Array],
 		adjust_sharindgs: bool = False,
 	) -> chex.Array:
 		"""Computes attention using Triton backend."""
@@ -261,7 +263,7 @@ class FlashAttention:
 		query: chex.Array,
 		key: chex.Array,
 		value: chex.Array,
-		bias: Optional[chex.Array],
+		bias: tp.Optional[chex.Array],
 	) -> chex.Array:
 		"""Computes attention using Pallas backend."""
 
@@ -321,7 +323,7 @@ class FlashAttention:
 		query: chex.Array,
 		key: chex.Array,
 		value: chex.Array,
-		bias: Optional[chex.Array],
+		bias: tp.Optional[chex.Array],
 	) -> chex.Array:
 		"""Computes attention using JAX backend."""
 		key, value = self.repeat_kv_heads(key, value, query.shape[2] // key.shape[2])
@@ -339,8 +341,8 @@ class FlashAttention:
 
 
 def create_flash_attention(
-	backend: Optional[Union[Backend, str]] = None,
-	platform: Optional[Union[Platform, str]] = None,
+	backend: tp.Optional[tp.Union[Backend, str]] = None,
+	platform: tp.Optional[tp.Union[Platform, str]] = None,
 	**kwargs,
 ) -> FlashAttention:
 	"""
@@ -435,9 +437,7 @@ def _test_backward():
 		co = None
 
 	try:
-		fo = jax.grad(lambda *x: flax.linen.attention.dot_product_attention(*x).sum())(
-			q, k, v, b
-		)
+		fo = jax.grad(lambda *x: flax.nnx.dot_product_attention(*x).sum())(q, k, v, b)
 
 		print(fo[0, 0, 0, :5])  # Print last 5 elements of last head of last batch
 	except Exception as e:

@@ -22,10 +22,10 @@ async def main():
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
 	dtype = jnp.float16
 	partition_axis = ed.PartitionAxis()
-	model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		pretrained_model_name_or_path,
 		input_shape=input_shape,
-		auto_shard_params=True,
+		auto_shard_model=True,
 		sharding_axis_dims=sharding_axis_dims,
 		config_kwargs=ed.EasyDeLBaseConfigDict(
 			use_scan_mlp=False,
@@ -48,8 +48,7 @@ async def main():
 	tokenizer.pad_token_id = tokenizer.eos_token_id
 	inference = ed.vInference(
 		model=model,
-		params=params,
-		tokenizer=tokenizer,
+		processor_class=tokenizer,
 		generation_config=ed.vInferenceConfig(
 			max_new_tokens=1024,
 			temperature=model.generation_config.temperature,

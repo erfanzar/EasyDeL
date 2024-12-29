@@ -25,10 +25,10 @@ def setup_inference():
 
 	dtype = jnp.float16
 	partition_axis = ed.PartitionAxis()
-	model, params = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		pretrained_model_name_or_path,
 		input_shape=input_shape,
-		auto_shard_params=True,
+		auto_shard_model=True,
 		sharding_axis_dims=sharding_axis_dims,
 		config_kwargs=ed.EasyDeLBaseConfigDict(
 			use_scan_mlp=False,
@@ -56,8 +56,7 @@ def setup_inference():
 
 	inference = ed.vInference(
 		model=model,
-		params=params,
-		tokenizer=tokenizer,
+		processor_class=tokenizer,
 		generation_config=ed.vInferenceConfig(
 			max_new_tokens=512,
 			temperature=model.generation_config.temperature,

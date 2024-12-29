@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Literal, Union
+
+
+import typing as tp
 
 import chex
 import jax
@@ -19,7 +21,7 @@ from jax import numpy as jnp
 
 
 def get_loss_function(
-	loss_type: Literal[
+	loss_type: tp.Literal[
 		"sigmoid",
 		"hinge",
 		"ipo",
@@ -34,7 +36,7 @@ def get_loss_function(
 		"apo_down",
 	],
 	beta: float,
-	label_smoothing: Union[float, int],
+	label_smoothing: tp.Union[float, int],
 ):
 	def _sigmoid_dpo_loss(
 		logits: chex.Array,

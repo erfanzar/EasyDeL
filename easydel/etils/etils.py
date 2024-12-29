@@ -15,16 +15,8 @@
 import argparse
 import logging
 import os
+import typing as tp
 from enum import Enum
-from typing import (
-	Any,
-	Dict,
-	List,
-	Literal,
-	Optional,
-	Tuple,
-	Union,
-)
 
 import jax
 import jax.extend
@@ -113,7 +105,7 @@ class EasyDeLBackends(str, Enum):
 	TPU = "tpu"
 
 
-AVAILABLE_GRADIENT_CHECKPOINTS = Literal[
+AVAILABLE_GRADIENT_CHECKPOINTS = tp.Literal[
 	"everything_saveable",
 	"nothing_saveable",
 	"checkpoint_dots",
@@ -121,7 +113,7 @@ AVAILABLE_GRADIENT_CHECKPOINTS = Literal[
 	"",
 ]
 
-AVAILABLE_SCHEDULERS = Literal[
+AVAILABLE_SCHEDULERS = tp.Literal[
 	"linear",
 	"cosine",
 	"none",
@@ -129,15 +121,16 @@ AVAILABLE_SCHEDULERS = Literal[
 	"warm_up_linear",
 ]
 
-AVAILABLE_OPTIMIZERS = Literal[
+AVAILABLE_OPTIMIZERS = tp.Literal[
 	"adafactor",
 	"lion",
 	"adamw",
 	"rmsprop",
 ]
 
-AVAILABLE_PRUNING_TYPE = Optional[
-	Union[
+
+AVAILABLE_PRUNING_TYPE = tp.Optional[
+	tp.Union[
 		MagnitudePruning,
 		NoPruning,
 		RandomPruning,
@@ -148,6 +141,7 @@ AVAILABLE_PRUNING_TYPE = Optional[
 		GlobalMagnitudePruning,
 	]
 ]
+
 _AVAILABLE_ATTENTION_MECHANISMS = [
 	"vanilla",
 	"flash_attn2",
@@ -157,7 +151,8 @@ _AVAILABLE_ATTENTION_MECHANISMS = [
 	"blockwise",
 	"sdpa",
 ]
-AVAILABLE_ATTENTION_MECHANISMS = Literal[
+
+AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[
 	"vanilla",
 	"flash_attn2",
 	"splash",
@@ -167,10 +162,12 @@ AVAILABLE_ATTENTION_MECHANISMS = Literal[
 	"sdpa",
 ]
 
+
 DEFAULT_ATTENTION_MECHANISM = (
 	"sdpa" if jax.extend.backend.get_backend().platform == "gpu" else "vanilla"
 )
-AVAILABLE_SPARSE_MODULE_TYPES = Literal["bcoo", "bcsr", "coo", "csr"]
+
+AVAILABLE_SPARSE_MODULE_TYPES = tp.Literal["bcoo", "bcsr", "coo", "csr"]
 
 _LOGGING_LEVELS = dict(
 	CRITICAL=50,
@@ -225,8 +222,8 @@ def set_loggers_level(level: int = logging.WARNING):
 
 
 def define_flags_with_default(
-	_required_fields: List = None, **kwargs
-) -> Tuple[argparse.Namespace, Dict[str, Any]]:
+	_required_fields: tp.List = None, **kwargs
+) -> tp.Tuple[argparse.Namespace, tp.Dict[str, tp.Any]]:
 	"""Defines flags with default values using argparse.
 
 	Args:

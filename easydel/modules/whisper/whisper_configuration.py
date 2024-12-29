@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+
+import typing as tp
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
-from easydel.modules.factory import register_config
-from easydel.modules.modeling_utils import EasyDeLBaseConfig
+from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.infra.factory import register_config
+from jax.sharding import PartitionSpec
 
 
 @register_config("whisper")
@@ -65,10 +67,10 @@ class WhisperConfig(EasyDeLBaseConfig):
 	    scale_embedding (`bool`, *optional*, defaults to False):
 	        Scale embeddings by dividing by sqrt(d_model).
 	    max_source_positions (`int`, *optional*, defaults to 1500):
-	        The maximum sequence length allowed for the source text input to the model. Any longer inputs will be
+	        The maximum sequence length allowed for the source text input to the model. tp.Any longer inputs will be
 	        truncated.
 	    max_target_positions (`int`, *optional*, defaults to 448):
-	        The maximum sequence length allowed for the target text input to the model. Any longer inputs will be
+	        The maximum sequence length allowed for the target text input to the model. tp.Any longer inputs will be
 	        truncated.
 	    use_cache (`bool`, *optional*, defaults to `True`):
 	        Whether or not the model should return the last key/values attentions (not used by all models).
@@ -146,7 +148,7 @@ class WhisperConfig(EasyDeLBaseConfig):
 		mask_feature_length=10,
 		mask_feature_min_masks=0,
 		median_filter_width=7,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	):
@@ -188,7 +190,7 @@ class WhisperConfig(EasyDeLBaseConfig):
 		self.median_filter_width = median_filter_width
 		self.bits = bits
 		self.gradient_checkpointing = gradient_checkpointing
-
+		self.max_position_embeddings = max(max_source_positions, max_target_positions)
 		super().__init__(
 			pad_token_id=pad_token_id,
 			bos_token_id=bos_token_id,
@@ -202,7 +204,7 @@ class WhisperConfig(EasyDeLBaseConfig):
 
 	def add_jax_args(
 		self,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	):
@@ -213,4 +215,40 @@ class WhisperConfig(EasyDeLBaseConfig):
 				setattr(self, k, v)
 
 	def get_partition_rules(self, *args, **kwargs):
-		return super().get_partition_rules()
+		return (
+			# Embeddings
+			(
+				"model/(encoder|decoder)/embed_tokens/embedding",
+				PartitionSpec("tp", ("fsdp", "sp")),
+			),
+			("model/(encoder|decoder)/embed_positions/embedding", PartitionSpec(None, "tp")),
+			# Projection output
+			("proj_out/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("proj_out/bias", PartitionSpec(None)),
+			# Encoder convolutions
+			("model/encoder/conv[12]/kernel", PartitionSpec(None, "tp", ("fsdp", "sp"))),
+			("model/encoder/conv[12]/bias", PartitionSpec("tp")),
+			# Self attention (both encoder and decoder)
+			("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("self_attn/(q_proj|k_proj|v_proj)/bias", PartitionSpec("tp")),
+			("self_attn/out_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/out_proj/bias", PartitionSpec(None)),
+			# Cross attention (decoder only)
+			(
+				"encoder_attn/(q_proj|k_proj|v_proj)/kernel",
+				PartitionSpec(("fsdp", "sp"), "tp"),
+			),
+			("encoder_attn/(q_proj|k_proj|v_proj)/bias", PartitionSpec("tp")),
+			("encoder_attn/out_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("encoder_attn/out_proj/bias", PartitionSpec(None)),
+			# FFN layers (both encoder and decoder)
+			("fc1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("fc1/bias", PartitionSpec("tp")),
+			("fc2/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("fc2/bias", PartitionSpec(None)),
+			# Layer norms
+			(".*layer_norm/(bias|scale)", PartitionSpec(None)),
+			(".*_layer_norm/(bias|scale)", PartitionSpec(None)),
+			# Catch-all
+			(".*", PartitionSpec(None)),
+		)

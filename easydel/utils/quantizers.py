@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+
+import typing as tp
 
 import chex
 from fjformer.dtypes import A4Q, A8Q, Array8Bit, ArrayNF4
@@ -30,7 +31,7 @@ class EasyQuantizer:
 	def __init__(
 		self,
 		quantization_method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.NF4,
-		quantization_platform: Optional[EasyDeLPlatforms] = EasyDeLPlatforms.JAX,
+		quantization_platform: tp.Optional[EasyDeLPlatforms] = EasyDeLPlatforms.JAX,
 		block_size: int = 256,
 		**kwargs,
 	) -> None:

@@ -1,17 +1,36 @@
+# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 from __future__ import annotations
 
 import functools
 import hashlib
 import os
 import pickle
+import typing as tp
 import warnings
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import jax
-from jax._src.stages import Compiled, Lowered
 from jax.experimental.serialize_executable import deserialize_and_load, serialize
 
-from easydel.utils.helpers import get_cache_dir
+from .helpers import get_cache_dir
+
+if tp.TYPE_CHECKING:
+	from jax._src.stages import Compiled, Lowered
+else:
+	Compiled, Lowered = tp.Any, tp.Any
 
 RECOMPILE_FORCE = os.environ.get("RECOMPILE_FORCE", "false") in ["true", "1", "on"]
 ECACHE_COMPILES = os.environ.get("ECACHE_COMPILES", "true") in ["true", "1", "on"]
@@ -21,7 +40,43 @@ COMPILE_FUNC_DIR = CACHE_DIR / "compiled_funcs"
 COMPILE_FUNC_DIR.mkdir(parents=True, exist_ok=True)
 COMPILED_FILE_NAME = "compiled.func"
 
-COMPILED_CACHE: Dict[Tuple, Any] = {}
+COMPILED_CACHE: tp.Dict[tp.Tuple, tp.Any] = {}
+
+
+def is_jit_wrapped(fn):
+	return all(
+		[
+			hasattr(fn, "_fun"),
+			hasattr(fn, "lower"),
+			hasattr(fn, "eval_shape"),
+			hasattr(fn, "trace"),
+		]
+	)
+
+
+def cjit(fn, static_argnames=None):
+	assert is_jit_wrapped(fn=fn), "function should be jit wrapped already"
+
+	@functools.wraps(fn)
+	def wrapped(**kwargs):  # kwargs only !
+		signature = get_signature((), kwargs)
+		cache_key = (fn, signature)
+		if cache_key in COMPILED_CACHE:
+			if static_argnames is not None:
+				for key in static_argnames:
+					kwargs.pop(key)
+			return COMPILED_CACHE[cache_key](**kwargs)
+
+		lowered_func: Lowered = fn.lower(**kwargs)
+		compiled_func = smart_compile(lowered_func, "cjit")
+		COMPILED_CACHE[cache_key] = compiled_func
+
+		if static_argnames is not None:
+			for key in static_argnames:
+				kwargs.pop(key)
+		return compiled_func(**kwargs)
+
+	return wrapped
 
 
 def hash_fn(self) -> int:
@@ -45,7 +100,7 @@ def get_safe_hash_int(text, algorithm="md5"):
 		raise Exception(f"Error generating hash: {str(e)}") from e
 
 
-def get_signature(args, kwargs) -> Tuple:
+def get_signature(args, kwargs) -> tp.Tuple:
 	"""Get a hashable signature of args/kwargs shapes and dtypes."""
 
 	def get_array_signature(x):
@@ -65,7 +120,7 @@ def get_hash_of_lowering(lowered_func: Lowered):
 	return hash_digest
 
 
-def smart_compile(lowered_func: Lowered, tag: Optional[str] = None):
+def smart_compile(lowered_func: Lowered, tag: tp.Optional[str] = None):
 	func_hash = get_hash_of_lowering(lowered_func)
 	foldername = str(func_hash) if tag is None else f"{tag}-{func_hash}"
 	func_dir = COMPILE_FUNC_DIR / foldername
@@ -90,7 +145,6 @@ def smart_compile(lowered_func: Lowered, tag: Optional[str] = None):
 				except Exception as e:  # noqa
 					warnings.warn(f"couldn't save compiled function due to {e}", stacklevel=4)
 			return compiled_func
-
 	else:
 		compiled_func: Compiled = lowered_func.compile()
 		if ECACHE_COMPILES:
@@ -104,9 +158,9 @@ def smart_compile(lowered_func: Lowered, tag: Optional[str] = None):
 
 
 def save_compiled_fn(
-	path: Union[str, os.PathLike],
+	path: tp.Union[str, os.PathLike],
 	fn: Compiled,
-	prefix: Optional[str] = None,
+	prefix: tp.Optional[str] = None,
 ):
 	path.mkdir(parents=True, exist_ok=True)
 	prefix = prefix or ""
@@ -119,8 +173,8 @@ def save_compiled_fn(
 
 
 def load_compiled_fn(
-	path: Union[str, os.PathLike],
-	prefix: Optional[str] = None,
+	path: tp.Union[str, os.PathLike],
+	prefix: tp.Optional[str] = None,
 ):
 	prefix = prefix or ""
 	filename = path / (prefix + "-" + COMPILED_FILE_NAME)
@@ -133,12 +187,12 @@ def load_compiled_fn(
 
 
 def cache_compiles(
-	tag: Optional[str] = None,
-	static_argnames: Optional[List[str]] = None,
+	tag: tp.Optional[str] = None,
+	static_argnames: tp.Optional[tp.List[str]] = None,
 ):
 	static_argnames = static_argnames or []
 
-	def create_wrapper(func: Callable, tag: Optional[str] = None) -> Callable:
+	def create_wrapper(func: tp.Callable, tag: tp.Optional[str] = None) -> tp.Callable:
 		original_func = getattr(func, "_fun", func)
 		func_id = str(
 			hashlib.sha256(
@@ -195,7 +249,7 @@ def cache_compiles(
 		wrapper._COMPILED_CACHE = COMPILED_CACHE
 		return wrapper
 
-	def decorator(func: Callable) -> Callable:
+	def decorator(func: tp.Callable) -> tp.Callable:
 		return create_wrapper(func, tag)
 
 	return decorator
@@ -218,9 +272,9 @@ def lower_function(
 	    func: The JAX function to compile.
 	    func_input_args: Input arguments for the function.
 	    func_input_kwargs: Input keyword arguments for the function.
-	    mesh: Optional JAX mesh for distributed execution.
-	    in_shardings: Optional input sharding specifications.
-	    out_shardings: Optional output sharding specifications.
+	    mesh: tp.Optional JAX mesh for distributed execution.
+	    in_shardings: tp.Optional input sharding specifications.
+	    out_shardings: tp.Optional output sharding specifications.
 	    static_argnums: Indices of static arguments.
 	    donate_argnums: Indices of arguments to donate.
 
@@ -262,9 +316,9 @@ def compile_function(
 	    func: The JAX function to compile.
 	    func_input_args: Input arguments for the function.
 	    func_input_kwargs: Input keyword arguments for the function.
-	    mesh: Optional JAX mesh for distributed execution.
-	    in_shardings: Optional input sharding specifications.
-	    out_shardings: Optional output sharding specifications.
+	    mesh: tp.Optional JAX mesh for distributed execution.
+	    in_shardings: tp.Optional input sharding specifications.
+	    out_shardings: tp.Optional output sharding specifications.
 	    static_argnums: Indices of static arguments.
 	    donate_argnums: Indices of arguments to donate.
 
@@ -281,3 +335,23 @@ def compile_function(
 		static_argnums=static_argnums,
 		donate_argnums=donate_argnums,
 	).compile()
+
+
+if __name__ == "__main__":
+	jnp = jax.numpy
+
+	@cjit
+	@jax.jit
+	def my_function(x, y):
+		return x * y + x
+
+	a = jnp.array([1, 2, 3], dtype=jnp.float32)
+	b = jnp.array([4, 5, 6], dtype=jnp.float32)
+
+	result1 = my_function(a, b)  # Compiles and caches on first call
+	result2 = my_function(a, b)  # Returns cached result
+
+	c = jnp.array([1, 2, 3], dtype=jnp.float32)
+	d = jnp.array([1, 1, 1], dtype=jnp.float32)
+	result3 = my_function(c, d)
+	print(result1, result2, result3)

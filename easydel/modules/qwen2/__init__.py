@@ -12,9 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.qwen2.modeling_qwen_flax import (
-	FlaxQwen2ForCausalLM, 
-	FlaxQwen2ForSequenceClassification, 
-	FlaxQwen2Model, 
+from .modeling_qwen_flax import (
+	Qwen2ForCausalLM,
+	Qwen2ForSequenceClassification,
+	Qwen2Model,
 )
-from easydel.modules.qwen2.qwen_configuration import Qwen2Config
+from .qwen_configuration import Qwen2Config
+
+__all__ = (
+	"Qwen2ForCausalLM",
+	"Qwen2ForSequenceClassification",
+	"Qwen2Model",
+	"Qwen2Config",
+)

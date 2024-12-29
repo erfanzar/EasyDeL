@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, Optional, Union
+
+import typing as tp
 
 from jax.sharding import PartitionSpec
 
 from easydel.etils.etils import EasyDeLGradientCheckPointers
-from easydel.modules.factory import register_config
-from easydel.modules.modeling_utils import EasyDeLBaseConfig
+from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.infra.factory import register_config
 
 
 @register_config("mixtral")
@@ -86,7 +87,7 @@ class MixtralConfig(EasyDeLBaseConfig):
 	        Number of repetitions for the key and value vectors.
 	    bits (`int`, *optional*):
 	        The number of bits to quantize the model to.
-	    rope_scaling (`Dict[str, Union[str, float]]`, *optional*):
+	    rope_scaling (`tp.Dict[str, tp.Union[str, float]]`, *optional*):
 	        The configuration for rope scaling.
 	    attention_bias (`bool`, *optional*, defaults to `False`):
 	        Whether to use bias in the attention layer.
@@ -126,8 +127,8 @@ class MixtralConfig(EasyDeLBaseConfig):
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
 		number_rep_kv: int = 1,
-		bits: Optional[int] = None,
-		rope_scaling: Dict[str, Union[str, float]] = None,
+		bits: tp.Optional[int] = None,
+		rope_scaling: tp.Dict[str, tp.Union[str, float]] = None,
 		attention_bias: bool = False,
 		initialization_of_moe: bool = False,
 		router_jitter_noise=0.0,
@@ -179,7 +180,7 @@ class MixtralConfig(EasyDeLBaseConfig):
 		"""
 		Get the partition rules for the model.
 		Returns:
-		    `Tuple[Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
 			("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
@@ -205,9 +206,9 @@ class MixtralConfig(EasyDeLBaseConfig):
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
 		number_rep_kv: int = 1,
-		bits: Optional[int] = None,
+		bits: tp.Optional[int] = None,
 		attention_dropout: float = 0.0,
-		rope_scaling: Dict[str, Union[str, float]] = None,
+		rope_scaling: tp.Dict[str, tp.Union[str, float]] = None,
 		attention_bias: bool = False,
 		initialization_of_moe: bool = False,
 		**kwargs,
@@ -224,7 +225,7 @@ class MixtralConfig(EasyDeLBaseConfig):
 		    scan_mlp_chunk_size: int: Chunk the input to the mlp
 		    number_rep_kv: int: Control the number of times that the key
 		        and value vectors are repeated
-		    bits: Optional[int]: Specify the number of bits to use for
+		    bits: tp.Optional[int]: Specify the number of bits to use for
 		        quantization
 		    attention_dropout: float: Set the dropout rate for the
 		        attention layer
@@ -232,7 +233,7 @@ class MixtralConfig(EasyDeLBaseConfig):
 		    initialization_of_moe: bool: initialization of moe needs to
 		        disable some dynamic part's this boolean variable will
 		        turn them off.
-		    rope_scaling: Dict[str, Union[str, float]]: rope_scaling for
+		    rope_scaling: tp.Dict[str, tp.Union[str, float]]: rope_scaling for
 		        rope
 
 		Returns:

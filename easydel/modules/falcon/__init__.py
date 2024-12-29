@@ -12,9 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.falcon.falcon_configuration import FalconConfig
-from easydel.modules.falcon.modeling_falcon_flax import (
-	FlaxFalconForCausalLM, 
-	FlaxFalconModel, 
-)
-__all__ = "FlaxFalconForCausalLM", "FlaxFalconModel", "FalconConfig"
+from .falcon_configuration import FalconConfig
+from .modeling_falcon_flax import FalconForCausalLM, FalconModel
+
+__all__ = "FalconForCausalLM", "FalconModel", "FalconConfig"

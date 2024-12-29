@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import math
+import typing as tp
 from functools import partial
-from typing import Optional
 
 import chex
 import jax
@@ -84,7 +85,7 @@ def forward_flash_attention(
 	query: jax.Array,
 	key: jax.Array,
 	value: jax.Array,
-	bias: Optional[jax.Array] = None,
+	bias: tp.Optional[jax.Array] = None,
 	dtype: jnp.dtype = None,
 	BLOCK_M: int = 128,
 	BLOCK_N: int = 128,
@@ -484,7 +485,7 @@ def _flash_attention2_hook(
 	query: jax.Array,
 	key: jax.Array,
 	value: jax.Array,
-	bias: Optional[jax.Array] = None,
+	bias: tp.Optional[jax.Array] = None,
 	dtype: jnp.dtype = None,
 	BLOCK_M: int = 128,
 	BLOCK_N: int = 128,
@@ -519,7 +520,7 @@ def flash_attention2(
 	query: jax.Array,
 	key: jax.Array,
 	value: jax.Array,
-	bias: Optional[jax.Array] = None,
+	bias: tp.Optional[jax.Array] = None,
 	dtype: jnp.dtype = None,
 	BLOCK_M: int = 128,
 	BLOCK_N: int = 128,

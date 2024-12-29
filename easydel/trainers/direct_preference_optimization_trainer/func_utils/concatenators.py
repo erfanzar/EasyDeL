@@ -11,30 +11,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-from typing import Dict, List, Union
+import typing as tp
 
 import chex
 import jax
 from jax import numpy as jnp
 
-from easydel.trainers.direct_preference_optimization_trainer.utils import pad_to_length
+from ..utils import pad_to_length
 
 
-def concatenated_dpo_inputs(
-	batch: Dict[str, Union[List, chex.Array]],
+def concatenated_inputs(
+	batch: tp.Dict[str, tp.Union[tp.List, chex.Array]],
 	is_encoder_decoder: bool = False,
 	label_pad_token_id: int = -100,
 	padding_value: int = 0,
 	fixed_max_length: int | None = None,
-) -> Dict[str, chex.Array]:
-	"""The concatenated_dpo_inputs function takes a batch of chosen and rejected examples,
+) -> tp.Dict[str, chex.Array]:
+	"""The concatenated_inputs function takes a batch of chosen and rejected examples,
 	and concatenates them together. This is useful for training the model to predict whether an example was chosen
 	by the human annotator. The function also pads all inputs to
 	the same length as the longest input in that batch.
 
 	Args:
-	    batch: Dict[str,Union[List,chex.Array]]: Pass the batch of data
+	    batch: tp.Dict[str,tp.Union[tp.List,chex.Array]]: Pass the batch of data
 	        into the function,
 	    is_encoder_decoder: bool: Determine whether the model is an
 	        encoder-decoder model

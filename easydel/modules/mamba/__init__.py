@@ -12,20 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from easydel.modules.mamba.mamba_configuration import MambaConfig
-from easydel.modules.mamba.modelling_mamba_flax import (
-	FlaxMambaCache,
-	FlaxMambaForCausalLM,
-	FlaxMambaForCausalLMModule,
-	FlaxMambaModel,
-	FlaxMambaModule,
-)
+from .mamba_configuration import MambaConfig
+from .modeling_mamba_flax import MambaForCausalLM, MambaModel
 
-__all__ = (
-	"FlaxMambaCache",
-	"FlaxMambaForCausalLM",
-	"FlaxMambaForCausalLMModule",
-	"FlaxMambaModel",
-	"FlaxMambaModule",
-	"MambaConfig",
-)
+__all__ = ("MambaForCausalLM", "MambaModel", "MambaConfig")
