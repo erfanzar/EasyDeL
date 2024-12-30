@@ -421,7 +421,7 @@ class BaseTrainer(BaseTrainerProtocol):
 						f"Specify the number of {'training' if is_train else 'evaluation'} steps for a generator/streaming dataset."
 					)
 				steps = num_steps
-			if is_train: 
+			if is_train:
 				steps = steps // self.arguments.gradient_accumulation_steps
 			return steps
 
@@ -445,7 +445,7 @@ class BaseTrainer(BaseTrainerProtocol):
 				return create_tf_dataset_from_iterable(dataset, is_train)
 
 		max_training_steps = calculate_steps(self.dataset_train, is_train=True)
-		print(max_training_steps)
+
 		dataloader_train = to_tf_dataloader(self.dataset_train, is_train=True)
 
 		if self.dataset_eval is not None and self.arguments.do_eval:
