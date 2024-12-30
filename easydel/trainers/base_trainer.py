@@ -421,7 +421,7 @@ class BaseTrainer(BaseTrainerProtocol):
 						f"Specify the number of {'training' if is_train else 'evaluation'} steps for a generator/streaming dataset."
 					)
 				steps = num_steps
-			if is_train:
+			if is_train: 
 				steps = steps // self.arguments.gradient_accumulation_steps
 			return steps
 
