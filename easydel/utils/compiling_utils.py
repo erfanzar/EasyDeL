@@ -148,12 +148,15 @@ def smart_compile(lowered_func: Lowered, tag: tp.Optional[str] = None):
 	else:
 		compiled_func: Compiled = lowered_func.compile()
 		if ECACHE_COMPILES:
-			serialized, in_tree, out_tree = serialize(compiled_func)
-			func_dir.mkdir(parents=True, exist_ok=True)
 			try:
+				serialized, in_tree, out_tree = serialize(compiled_func)
+				func_dir.mkdir(parents=True, exist_ok=True)
 				pickle.dump((serialized, in_tree, out_tree), open(filepath, "wb"))
 			except Exception as e:  # noqa
-				warnings.warn(f"couldn't save compiled function due to {e}", stacklevel=4)
+				warnings.warn(
+					f"couldn't save and serialize compiled function due to {e}",
+					stacklevel=4,
+				)
 		return compiled_func
 
 

@@ -34,7 +34,7 @@ import numpy
 from chex import Array
 from fjformer import with_sharding_constraint
 from flax.nnx.nn.dtypes import promote_dtype
-from jax import lax, random
+from jax import NamedSharding, lax, random
 from jax import numpy as jnp
 from jax.experimental.pallas.ops.tpu.splash_attention import (
 	BlockSizes as BlockSizesSplashAttn,
@@ -1684,6 +1684,22 @@ class FlaxAttentionModule(nn.Module):
 			block_size=self.config.kv_cache_quantization_blocksize,
 		)
 
+	@property
+	def default_key_value_sharding(self):
+		paxis = self.config.partition_axis
+		return NamedSharding(
+			mesh=self.config.mesh,
+			spec=PartitionSpec(
+				paxis.batch_axis,
+				paxis.key_sequence_axis,
+				paxis.head_axis,
+				paxis.attention_dim_axis,
+			),
+		)
+
+	def get_sharding_safely(self, tensor: jax.Array) -> PartitionSpec:
+		return getattr(tensor, "sharding", self.default_key_value_sharding).spec
+
 	@staticmethod
 	def _transpose_sequence_head(*args):
 		"""The _transpose_sequence_head function transposes the query, key and value matrices.
@@ -1694,10 +1710,7 @@ class FlaxAttentionModule(nn.Module):
 		Returns:
 		    The transpose of the query, key and value matrices
 		"""
-		return map(
-			lambda x: jnp.transpose(x, (0, 2, 1, 3)),
-			args,
-		)
+		return map(lambda x: jnp.transpose(x, (0, 2, 1, 3)), args)
 
 	def _concatenate_to_cache(
 		self,
@@ -1710,13 +1723,6 @@ class FlaxAttentionModule(nn.Module):
 	) -> tp.Tuple[Array, Array, Array]:
 		num_updated_cache_vectors = query.shape[1]
 		end_index = cache_view.index[0]
-
-		key_value_specs = PartitionSpec(
-			self.config.partition_axis.batch_axis,
-			self.config.partition_axis.key_sequence_axis,
-			self.config.partition_axis.head_axis,
-			self.config.partition_axis.attention_dim_axis,
-		)
 
 		*batch_dims, max_length, num_heads, depth_per_head = cache_view.value.shape
 
@@ -1751,12 +1757,11 @@ class FlaxAttentionModule(nn.Module):
 			tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
 		)
 		attention_mask = jnp.logical_and(pad_mask, attention_mask)
-
 		cache_view.key = self.quantizer(
-			with_sharding_constraint(key_cache, key_value_specs)
+			with_sharding_constraint(key_cache, self.get_sharding_safely(cache_view.key))
 		)
 		cache_view.value = self.quantizer(
-			with_sharding_constraint(value_cache, key_value_specs)
+			with_sharding_constraint(value_cache, self.get_sharding_safely(cache_view.value))
 		)
 		cache_view.index = cache_view.index + num_updated_cache_vectors
 

@@ -155,6 +155,7 @@ class EasyGenerationMixin:
 				block_size=self.config.kv_cache_quantization_blocksize,
 				quantization_platform=self.config.platform,
 			),
+			mesh=self.config.mesh,
 		)
 
 	def prepare_inputs_for_generation(

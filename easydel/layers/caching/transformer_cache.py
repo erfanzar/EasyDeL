@@ -14,10 +14,9 @@
 import typing as tp
 
 import chex as cx
-from fjformer import with_sharding_constraint
 from fjformer.core import ImplicitArray
 from jax import numpy as jnp
-from jax.sharding import PartitionSpec
+from jax.sharding import PartitionSpec, Mesh, NamedSharding
 
 from easydel.etils.etils import EasyDeLQuantizationMethods
 from easydel.etils.partition_module import PartitionAxis
@@ -133,35 +132,34 @@ class TransformerCacheView:
 		quantizer: EasyQuantizer,
 		key_values_partition_specs: PartitionSpec,
 		dtype: jnp.dtype,
+		mesh: Mesh,
 		layer_index: tp.Optional[int] = None,
 	):
+		device = NamedSharding(mesh=mesh, spec=key_values_partition_specs)
+
 		return cls(
 			key=quantizer(
-				with_sharding_constraint(
-					x=jnp.zeros(
-						shape=(
-							metadata.batch_size,
-							metadata.sequence_length,
-							metadata.key_heads,
-							metadata.key_dim,
-						),
-						dtype=dtype,
+				jnp.zeros(
+					shape=(
+						metadata.batch_size,
+						metadata.sequence_length,
+						metadata.key_heads,
+						metadata.key_dim,
 					),
-					partition_specs=key_values_partition_specs,
-				)
+					dtype=dtype,
+					device=device,
+				),
 			),
 			value=quantizer(
-				with_sharding_constraint(
-					x=jnp.zeros(
-						shape=(
-							metadata.batch_size,
-							metadata.sequence_length,
-							metadata.value_heads,
-							metadata.value_dim,
-						),
-						dtype=dtype,
+				jnp.zeros(
+					shape=(
+						metadata.batch_size,
+						metadata.sequence_length,
+						metadata.value_heads,
+						metadata.value_dim,
 					),
-					partition_specs=key_values_partition_specs,
+					dtype=dtype,
+					device=device,
 				)
 			),
 			index=jnp.zeros((metadata.batch_size,), dtype=jnp.int32),
@@ -187,6 +185,7 @@ class TransformerCache:
 		cls,
 		num_hidden_layers: int,
 		metadata: TransformerCacheMetaData,
+		mesh: Mesh,
 		quantizer: tp.Optional[EasyQuantizer] = None,
 		dtype: tp.Optional[jnp.dtype] = None,
 		key_values_partition_specs: tp.Optional[PartitionSpec] = None,
@@ -208,6 +207,7 @@ class TransformerCache:
 					quantizer=quantizer,
 					key_values_partition_specs=key_values_partition_specs,
 					dtype=dtype,
+					mesh=mesh,
 					layer_index=layer_index,
 				)
 				for layer_index in range(num_hidden_layers)
