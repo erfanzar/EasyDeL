@@ -22,7 +22,7 @@ import chex
 import jax
 import jax.extend
 import jax.tree_util
-from fjformer.sharding import make_shard_and_gather_fns, match_partition_rules
+from easydel.utils.escale import make_shard_and_gather_fns, match_partition_rules
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp

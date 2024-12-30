@@ -31,9 +31,10 @@ if tp.TYPE_CHECKING:
 	from jax._src.stages import Compiled, Lowered
 else:
 	Compiled, Lowered = tp.Any, tp.Any
-
-RECOMPILE_FORCE = os.environ.get("RECOMPILE_FORCE", "false") in ["true", "1", "on"]
-ECACHE_COMPILES = os.environ.get("ECACHE_COMPILES", "true") in ["true", "1", "on"]
+	
+_TFLAG = ["true", "1", "on", "yes"]
+RECOMPILE_FORCE = os.environ.get("RECOMPILE_FORCE", "false") in _TFLAG
+ECACHE_COMPILES = os.environ.get("ECACHE_COMPILES", "true") in _TFLAG
 
 CACHE_DIR = get_cache_dir()
 COMPILE_FUNC_DIR = CACHE_DIR / "compiled_funcs"

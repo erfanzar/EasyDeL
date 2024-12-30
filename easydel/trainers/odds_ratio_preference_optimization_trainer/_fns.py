@@ -17,13 +17,13 @@ import warnings
 import chex
 import jax
 from fjformer.functions import cross_entropy_loss_and_accuracy
-from fjformer.sharding import with_sharding_constraint
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 from easydel.etils.easystate import EasyDeLState
 from easydel.infra.loss_utils import LossMetrics
+from easydel.utils.escale import with_sharding_constraint
 
 
 def pad_to_length(

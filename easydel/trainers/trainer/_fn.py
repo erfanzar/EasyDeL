@@ -15,12 +15,12 @@ import typing as tp
 
 import jax
 import optax
-from fjformer.sharding import with_sharding_constraint
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 from easydel.etils.easystate import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
+from easydel.utils.escale import with_sharding_constraint
 
 
 def create_training_step(
