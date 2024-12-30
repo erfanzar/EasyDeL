@@ -433,6 +433,20 @@ class vInference:
 		finally:
 			self.metrics.queue_size.labels(model_name=self.metrics.model_name).dec()
 
+	def _get_compile_model_kwargs(self, batch_size, input_tokens_length):
+		return dict(
+			input_ids=jnp.ones(
+				(batch_size, input_tokens_length),
+				dtype="i4",
+				device=self.input_sharding,
+			),
+			attention_mask=jnp.ones(
+				(batch_size, input_tokens_length),
+				dtype="i4",
+				device=self.input_sharding,
+			),
+		)
+
 	def _compile_and_lower_funs(self, batch_size: int, input_tokens_length: int):
 		compiled_generate_func, compiled_interval_func = get_compiled_funcs(
 			batch_size=batch_size,
@@ -442,11 +456,12 @@ class vInference:
 		)
 		do_compile = compiled_generate_func is None or compiled_interval_func is None
 		if do_compile:
-			model_kwargs = dict(
-				input_ids=jnp.ones((batch_size, input_tokens_length), dtype="i4"),
-				attention_mask=jnp.ones((batch_size, input_tokens_length), dtype="i4"),
+			state = self._init_state(
+				**self._get_compile_model_kwargs(
+					batch_size=batch_size,
+					input_tokens_length=input_tokens_length,
+				)
 			)
-			state = self._init_state(**model_kwargs)
 			compiled_generate_func = smart_compile(
 				causal_lm_first_iter_fn.lower(
 					graphdef=self.graphdef,
