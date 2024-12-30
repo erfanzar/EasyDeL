@@ -421,7 +421,9 @@ class BaseTrainer(BaseTrainerProtocol):
 						f"Specify the number of {'training' if is_train else 'evaluation'} steps for a generator/streaming dataset."
 					)
 				steps = num_steps
-			return steps // self.arguments.gradient_accumulation_steps
+			if is_train:
+				steps = steps // self.arguments.gradient_accumulation_steps
+			return steps
 
 		def to_tf_dataloader(
 			dataset: tp.Union[Dataset, IterableDataset],
