@@ -1020,11 +1020,16 @@ class FlexibleAttentionModule(nn.Module):
 		*_, vd = value_states.shape
 		with self.mesh:
 			query_states = fjformer.with_sharding_constraint(
-				query_states, query_partitionspec
+				query_states,
+				query_partitionspec,
 			)
-			key_states = fjformer.with_sharding_constraint(key_states, key_partitionspec)
+			key_states = fjformer.with_sharding_constraint(
+				key_states,
+				key_partitionspec,
+			)
 			value_states = fjformer.with_sharding_constraint(
-				value_states, value_partitionspec
+				value_states,
+				value_partitionspec,
 			)
 			query_states = jnp.reshape(
 				query_states,

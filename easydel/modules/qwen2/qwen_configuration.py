@@ -158,7 +158,8 @@ class Qwen2Config(EasyDeLBaseConfig):
 		self.use_scan_mlp = use_scan_mlp
 		self.scan_mlp_chunk_size = scan_mlp_chunk_size
 		self.bits = bits
-
+		self.head_dim = hidden_size // num_attention_heads
+		
 		if self.rope_scaling is not None and "type" in self.rope_scaling:
 			self.rope_scaling["rope_type"] = self.rope_scaling["type"]
 		super().__init__(
@@ -249,6 +250,7 @@ class Qwen2Config(EasyDeLBaseConfig):
 		Returns:
 		    The following:
 		"""
+		self.head_dim = self.hidden_size // self.num_attention_heads
 		self.scan_layers = scan_layers
 		self.embd_pdrop = embd_pdrop
 		self.number_rep_kv = number_rep_kv
