@@ -11,17 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 import typing as tp
 
 import jax
 import numpy as np
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, PartitionSpec
-
-jax.config.update("jax_platform_name", "cpu")
 
 
 class MeshPartitionHelper:

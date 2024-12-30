@@ -13,7 +13,7 @@ import triton
 from jax import nn
 from jax import numpy as jnp
 from jax import random as jrnd
-from fjformer import create_mesh
+from easydel.utils.escale import create_mesh
 from jax.sharding import NamedSharding, PartitionSpec
 
 mesh = create_mesh(

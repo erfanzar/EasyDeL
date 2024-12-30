@@ -18,7 +18,6 @@ from collections import defaultdict
 
 import jax
 import numpy as np
-from fjformer.sharding import match_partition_rules
 from jax import jit
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
@@ -29,6 +28,7 @@ from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import get_logger
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.loss_utils import LossMetrics
+from easydel.utils.escale import match_partition_rules
 
 from ..base_trainer import (
 	BaseTrainer,

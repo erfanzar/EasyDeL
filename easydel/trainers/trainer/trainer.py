@@ -15,7 +15,6 @@ import time
 import typing as tp
 
 import jax
-from fjformer.sharding import match_partition_rules
 from jax import numpy as jnp
 from jax.experimental import sparse
 from jax.sharding import PartitionSpec
@@ -25,6 +24,7 @@ from easydel.etils.easystate import EasyDeLState
 from easydel.etils.errors import EasyDeLTimerError
 from easydel.etils.etils import get_logger
 from easydel.infra.loss_utils import LossMetrics
+from easydel.utils.escale import match_partition_rules
 
 from ..base_trainer import (
 	BaseTrainer,
