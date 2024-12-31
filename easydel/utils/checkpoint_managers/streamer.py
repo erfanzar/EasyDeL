@@ -24,7 +24,7 @@ from flax.serialization import to_bytes, to_state_dict
 from flax.struct import PyTreeNode
 from tqdm import tqdm
 
-from easydel.etils.etils import get_logger
+from easydel.utils.helpers import get_logger
 
 from ..traversals import flatten_dict, is_flatten, unflatten_dict
 

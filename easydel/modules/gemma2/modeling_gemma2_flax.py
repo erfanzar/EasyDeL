@@ -23,7 +23,6 @@ from fjformer import with_sharding_constraint
 from flax import nnx as nn
 from jax.sharding import PartitionSpec
 
-from easydel.etils.etils import get_logger
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import register_module
 from easydel.infra.modeling_outputs import (
@@ -40,6 +39,7 @@ from easydel.infra.utils import (
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
 from easydel.modules.gemma2.gemma2_configuration import Gemma2Config as Gemma2Config
+from easydel.utils.helpers import get_logger
 
 logger = get_logger(__name__)
 

@@ -22,7 +22,7 @@ from jax import numpy as jnp
 from ml_collections import ConfigDict
 from ml_collections.config_dict import placeholder
 
-from easydel.etils.etils import get_logger
+from easydel.utils.helpers import get_logger
 
 logger = get_logger(__name__)
 
@@ -605,8 +605,12 @@ def get_formatting_func_from_dataset(
 	dataset: tp.Union["Dataset", "ConstantLengthDataset"],  # type: ignore # noqa
 	processing_class: "AutoTokenizer",  # type:ignore #noqa
 ) -> tp.Optional[tp.Callable]:
-	from datasets import Dataset, Value
-
+	try:
+		from datasets import Dataset, Value
+	except ImportError as e:
+		raise ImportError(
+			"Please install the datasets library to use this function."
+		) from e
 	FORMAT_MAPPING = {
 		"chatml": [
 			{

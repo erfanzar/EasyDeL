@@ -20,8 +20,8 @@ import jax.lax as lax
 import jax.numpy as jnp
 from jax.experimental import sparse
 
-from easydel.etils.etils import get_logger
 from easydel.utils.compiling_utils import get_safe_hash_int, hash_fn
+from easydel.utils.helpers import get_logger
 
 
 def add_start_docstrings(*docstr):

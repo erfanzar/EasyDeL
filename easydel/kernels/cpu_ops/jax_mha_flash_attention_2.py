@@ -27,8 +27,9 @@ import jax.numpy as jnp
 import jax.random as jrand
 import jax.sharding
 from fjformer import GenerateRNG
-from easydel.utils.escale import with_sharding_constraint
 from jax import lax
+
+from easydel.escale import with_sharding_constraint
 
 rng = GenerateRNG()
 

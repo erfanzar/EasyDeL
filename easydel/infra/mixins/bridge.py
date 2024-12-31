@@ -29,14 +29,9 @@ from jax.sharding import PartitionSpec
 from transformers.utils.generic import working_or_temp_dir
 from transformers.utils.hub import PushToHubMixin
 
-from easydel.etils.etils import (
-	EasyDeLBackends,
-	EasyDeLPlatforms,
-	EasyDeLQuantizationMethods,
-	get_logger,
-)
-from easydel.etils.partition_module import PartitionAxis
+from easydel.escale import PartitionAxis
 from easydel.utils.checkpoint_managers import CheckpointManager
+from easydel.utils.helpers import get_logger
 from easydel.utils.readme_generator import (
 	ModelInfo,
 	ReadmeGenerator,
@@ -52,6 +47,11 @@ from easydel.utils.traversals import (
 from ..base_config import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseConfigDict,
+)
+from ..etils import (
+	EasyDeLBackends,
+	EasyDeLPlatforms,
+	EasyDeLQuantizationMethods,
 )
 from ..utils import quantize_linear_layers
 

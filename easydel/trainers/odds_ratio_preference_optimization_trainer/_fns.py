@@ -21,9 +21,9 @@ from flax import nnx as nn
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
-from easydel.etils.easystate import EasyDeLState
+from easydel.escale import with_sharding_constraint
+from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossMetrics
-from easydel.utils.escale import with_sharding_constraint
 
 
 def pad_to_length(

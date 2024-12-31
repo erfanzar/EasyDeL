@@ -13,8 +13,6 @@
 # limitations under the License.
 
 import argparse
-import logging
-import os
 import typing as tp
 from enum import Enum
 
@@ -142,15 +140,6 @@ AVAILABLE_PRUNING_TYPE = tp.Optional[
 	]
 ]
 
-_AVAILABLE_ATTENTION_MECHANISMS = [
-	"vanilla",
-	"flash_attn2",
-	"splash",
-	"ring",
-	"cudnn",
-	"blockwise",
-	"sdpa",
-]
 
 AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[
 	"vanilla",
@@ -168,57 +157,6 @@ DEFAULT_ATTENTION_MECHANISM = (
 )
 
 AVAILABLE_SPARSE_MODULE_TYPES = tp.Literal["bcoo", "bcsr", "coo", "csr"]
-
-_LOGGING_LEVELS = dict(
-	CRITICAL=50,
-	FATAL=50,
-	ERROR=40,
-	WARNING=30,
-	WARN=30,
-	INFO=20,
-	DEBUG=10,
-	NOTSET=0,
-)
-
-
-def get_logger(
-	name,
-	level: int = _LOGGING_LEVELS[os.environ.get("LOGGING_LEVEL_ED", "INFO")],
-) -> logging.Logger:
-	"""
-	Function to create and configure a logger.
-	Args:
-	    name (str): The name of the logger.
-	    level (int): The logging level. Defaults to logging.INFO.
-	Returns:
-	    logging.Logger: The configured logger instance.
-	"""
-	logger = logging.getLogger(name)
-	logger.propagate = False
-
-	# Set the logging level
-	logger.setLevel(level)
-
-	# Create a console handler
-	console_handler = logging.StreamHandler()
-	console_handler.setLevel(level)
-
-	formatter = logging.Formatter("%(asctime)s %(levelname)-8s [%(name)s] %(message)s")
-	console_handler.setFormatter(formatter)
-	logger.addHandler(console_handler)
-	return logger
-
-
-def set_loggers_level(level: int = logging.WARNING):
-	"""Function to set the logging level of all loggers to the specified level.
-
-	Args:
-	    level: int: The logging level to set. Defaults to
-	        logging.WARNING.
-	"""
-	logging.root.setLevel(level)
-	for handler in logging.root.handlers:
-		handler.setLevel(level)
 
 
 def define_flags_with_default(

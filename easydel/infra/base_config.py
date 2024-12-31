@@ -25,17 +25,18 @@ from jax.experimental.mesh_utils import create_device_mesh
 from jax.sharding import Mesh
 from transformers.configuration_utils import PretrainedConfig
 
-from easydel.etils.etils import (
+from easydel.escale import PartitionAxis
+from easydel.utils.compiling_utils import hash_fn
+from easydel.utils.helpers import get_logger
+
+from .etils import (
 	AVAILABLE_ATTENTION_MECHANISMS,
 	DEFAULT_ATTENTION_MECHANISM,
 	EasyDeLBackends,
 	EasyDeLGradientCheckPointers,
 	EasyDeLPlatforms,
 	EasyDeLQuantizationMethods,
-	get_logger,
 )
-from easydel.etils.partition_module import PartitionAxis
-from easydel.utils.compiling_utils import hash_fn
 
 logger = get_logger(__name__)
 
@@ -138,42 +139,46 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
 
 
 class EasyDeLBaseConfig(PretrainedConfig):
-	"""It initializes all the attributes of an object, and it's called when you create a new instance of that class.
-
+	"""
+	Initialize the configuration for EasyDeL.
 	Args:
-	    axis_dims (tp.Sequence[int], optional): Specify the number of dimensions for each axis. Defaults to (1, -1, 1, 1).
-	    axis_names (tp.Sequence[str], optional): Set the names of the axes. Defaults to ("dp", "fsdp", "tp", "sp").
-	    attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS, optional): attention mechanism to use. Defaults to DEFAULT_ATTENTION_MECHANISM.
-	    blocksize_k (int, optional): block size of key_states. Defaults to 128.
-	    blocksize_q (int, optional): block size of query_states. Defaults to 128.
-	    blocksize_b (int, optional): block size of bias. Defaults to 1.
-	    partition_axis (PartitionAxis, optional): PartitionAxis is new module used for partitioning arrays in easydel. Defaults to PartitionAxis().
-	    shard_attention_computation (bool, optional): whenever to use shard_map for attention. Defaults to True.
-	    use_sharded_kv_caching (bool, optional): whenever to use shard_map and sharding for key and value. Defaults to True.
-	    backend (tp.Optional[EasyDeLBackends], optional): Specify the backend to use. Defaults to None.
-	    platform (tp.Optional[EasyDeLPlatforms], optional): Specify the platform to used to use. Defaults to None.
-	    easy_method (tp.Literal["train", "serve", "convert"], optional): easydel Quantization Method to be applied for. Defaults to EasyMethod.TRAIN.
-	    bits (tp.Optional[int], optional): Model bits for quantization. Defaults to None.
-	    scan_ring_attention (bool, optional): Whether to use can for ring attention. Defaults to True.
-	    scan_attention_layers (bool, optional): Whether to use can for attention layers. Defaults to False.
-	    use_sharding_constraint (bool, optional): whether to use sharding constraint for the arrays. Defaults to False.
-	    use_scan_mlp (bool, optional): Determine whether to use scan_mlp or not. Defaults to False.
-	    scan_mlp_chunk_size (int, optional): Size of chunks in scan MLP. Defaults to 1024.
-	    attention_axis_name (str, optional): Name of the attention axis name. Defaults to "sp".
-			gradient_checkpointing (EasyDeLQuantizationMethods, optional): Gradient Checkpointing method for created or loaded module (applied on mlp and attn layers most of the times).
-	    kv_cache_quantization_method (EasyDeLQuantizationMethods, optional): key and value quantization type. Defaults to EasyDeLQuantizationMethods.NONE.
-	    kv_cache_quantization_blocksize (int, optional): size of kv cache quantization. Defaults to 64.
-	    quantization_method (EasyDeLQuantizationMethods, optional): linear modules quantization type. Defaults to EasyDeLQuantizationMethods.NONE.
-	    quantization_blocksize (int, optional): size of linear quantization. Defaults to 64.
-	    kv_cache_sharding_sequence_axis_name (tp.Union[str, tp.Tuple[str, ...]], optional): axis name to target for sharding sequences. Defaults to "sp".
-	    flash_attention_backward_pass_impl (tp.Literal["triton", "xla"], optional): Specify the backward pass kernel for flash attention. Defaults to "triton".
-	    attn_dtype (jnp.dtype, optional): Data type for attention computations. Defaults to jnp.float32.
-	    fcm_max_ratio (float, optional): Maximum ratio for flash cross attention. Defaults to 0.0.
-	    fcm_min_ratio (float, optional): Minimum ratio for flash cross attention. Defaults to 0.0.
-	    hardware_abstraction (bool, optional): whenever to switch to custom pallas kernels instead of JAX. Defaults to DEFAULT_HARDWARE_ABSTRACTION.
-	    pallas_m_block_size (int, optional): block size m dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`. Defaults to DEFAULT_PALLAS_M_BLOCK_SIZE.
-	    pallas_k_block_size (int, optional): block size k dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`. Defaults to DEFAULT_PALLAS_K_BLOCK_SIZE.
-	    pallas_n_block_size (int, optional): block size n dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`. Defaults to DEFAULT_PALLAS_N_BLOCK_SIZE.
+		axis_dims (tp.Sequence[int]): Dimensions of the axes. Default is (1, -1, 1, 1).
+		axis_names (tp.Sequence[str]): Names of the axes. Default is ("dp", "fsdp", "tp", "sp").
+		attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS): Attention mechanism to use. Default is DEFAULT_ATTENTION_MECHANISM.
+		blocksize_k (int): Block size for key. Default is 128.
+		blocksize_q (int): Block size for query. Default is 128.
+		blocksize_b (int): Block size for batch. Default is 1.
+		partition_axis (PartitionAxis): Partition axis configuration. Default is PartitionAxis().
+		shard_attention_computation (bool): Whether to shard attention computation. Default is True.
+		use_sharded_kv_caching (bool): Whether to use sharded key-value caching. Default is False.
+		use_sharding_constraint (bool): Whether to use sharding constraint. Default is False.
+		backend (tp.Optional[EasyDeLBackends]): Backend to use. Default is None.
+		platform (tp.Optional[EasyDeLPlatforms]): Platform to use. Default is None.
+		easy_method (tp.Literal["train", "serve", "convert"]): Method to use. Default is EasyMethod.TRAIN.
+		bits (tp.Optional[int]): Number of bits for quantization. Default is None.
+		scan_ring_attention (bool): Whether to scan ring attention. Default is True.
+		scan_attention_layers (bool): Whether to scan attention layers. Default is False.
+		use_scan_mlp (bool): Whether to use scan MLP. Default is False.
+		scan_mlp_chunk_size (int): Chunk size for scan MLP. Default is 1024.
+		attention_axis_name (str): Name of the attention axis. Default is "sp".
+		gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing method. Default is EasyDeLGradientCheckPointers.NONE.
+		kv_cache_quantization_method (EasyDeLQuantizationMethods): Key-value cache quantization method. Default is EasyDeLQuantizationMethods.NONE.
+		kv_cache_quantization_blocksize (int): Block size for key-value cache quantization. Default is 64.
+		quantization_method (EasyDeLQuantizationMethods): Quantization method. Default is EasyDeLQuantizationMethods.NONE.
+		quantization_pattern (str): Pattern for quantization. Default is ".*".
+		quantization_blocksize (int): Block size for quantization. Default is 64.
+		kv_cache_sharding_sequence_axis_name (tp.Union[str, tp.Tuple[str, ...]]): Name of the key-value cache sharding sequence axis. Default is "sp".
+		flash_attention_backward_pass_impl (tp.Literal["triton", "xla"]): Implementation for flash attention backward pass. Default is "triton".
+		attn_dtype (jnp.dtype): Data type for attention. Default is jnp.float32.
+		fcm_max_ratio (float): Maximum ratio for FCM. Default is 0.0.
+		fcm_min_ratio (float): Minimum ratio for FCM. Default is 0.0.
+		hardware_abstraction (bool): Whether to use hardware abstraction. Default is DEFAULT_HARDWARE_ABSTRACTION.
+		pallas_m_block_size (int): Block size for Pallas M. Default is DEFAULT_PALLAS_M_BLOCK_SIZE.
+		pallas_k_block_size (int): Block size for Pallas K. Default is DEFAULT_PALLAS_K_BLOCK_SIZE.
+		pallas_n_block_size (int): Block size for Pallas N. Default is DEFAULT_PALLAS_N_BLOCK_SIZE.
+		**kwargs: Additional keyword arguments.
+	Raises:
+		Warning: If `kv_cache_quantization_method` is not NONE and `use_sharded_kv_caching` is True.
 	"""
 
 	_show_private_attrs: bool = False
@@ -216,45 +221,6 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		pallas_n_block_size: int = DEFAULT_PALLAS_N_BLOCK_SIZE,
 		**kwargs,
 	):
-		"""
-		Initialize the EasyDeLBaseConfig class with configuration parameters.
-
-		Args:
-		    axis_dims (tp.Sequence[int], optional): Specify the number of dimensions for each axis. Defaults to (1, -1, 1, 1).
-		    axis_names (tp.Sequence[str], optional): Set the names of the axes. Defaults to ("dp", "fsdp", "tp", "sp").
-		    attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS, optional): attention mechanism to use. Defaults to DEFAULT_ATTENTION_MECHANISM.
-		    blocksize_k (int, optional): block size of key_states. Defaults to 128.
-		    blocksize_q (int, optional): block size of query_states. Defaults to 128.
-		    blocksize_b (int, optional): block size of bias. Defaults to 1.
-		    partition_axis (PartitionAxis, optional): PartitionAxis is new module used for partitioning arrays in easydel. Defaults to PartitionAxis().
-		    shard_attention_computation (bool, optional): whenever to use shard_map for attention. Defaults to True.
-		    use_sharded_kv_caching (bool, optional): whenever to use shard_map and sharding for key and value. Defaults to True.
-		    backend (tp.Optional[EasyDeLBackends], optional): Specify the backend to use. Defaults to None.
-		    platform (tp.Optional[EasyDeLPlatforms], optional): Specify the platform to used to use. Defaults to None.
-		    easy_method (tp.Literal["train", "serve", "convert"], optional): easydel Quantization Method to be applied for. Defaults to EasyMethod.TRAIN.
-		    bits (tp.Optional[int], optional): Model bits for quantization. Defaults to None.
-		    scan_ring_attention (bool, optional): Whether to use can for ring attention. Defaults to True.
-		    scan_attention_layers (bool, optional): Whether to use can for attention layers. Defaults to False.
-		    use_sharding_constraint (bool, optional): whether to use sharding constraint for the arrays. Defaults to False.
-		    use_scan_mlp (bool, optional): Determine whether to use scan_mlp or not. Defaults to False.
-		    scan_mlp_chunk_size (int, optional): Size of chunks in scan MLP. Defaults to 1024.
-		    attention_axis_name (str, optional): Name of the attention axis name. Defaults to "sp".
-				gradient_checkpointing (EasyDeLQuantizationMethods, optional): Gradient Checkpointing method for created or loaded module (applied on mlp and attn layers most of the times).
-		    kv_cache_quantization_method (EasyDeLQuantizationMethods, optional): key and value quantization type. Defaults to EasyDeLQuantizationMethods.NONE.
-		    kv_cache_quantization_blocksize (int, optional): size of kv cache quantization. Defaults to 64.
-		    quantization_method (EasyDeLQuantizationMethods, optional): linear modules quantization type. Defaults to EasyDeLQuantizationMethods.NONE.
-		    quantization_blocksize (int, optional): size of linear quantization. Defaults to 64.
-		    quantization_pattern (str): re pattern to be used for quantizing.
-				kv_cache_sharding_sequence_axis_name (tp.Union[str, tp.Tuple[str, ...]], optional): axis name to target for sharding sequences. Defaults to "sp".
-		    flash_attention_backward_pass_impl (tp.Literal["triton", "xla"], optional): Specify the backward pass kernel for flash attention. Defaults to "triton".
-		    attn_dtype (jnp.dtype, optional): Data type for attention computations. Defaults to jnp.float32.
-		    fcm_max_ratio (float, optional): Maximum ratio for flash cross attention. Defaults to 0.0.
-		    fcm_min_ratio (float, optional): Minimum ratio for flash cross attention. Defaults to 0.0.
-		    hardware_abstraction (bool, optional): whenever to switch to custom pallas kernels instead of JAX. Defaults to DEFAULT_HARDWARE_ABSTRACTION.
-		    pallas_m_block_size (int, optional): block size m dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`. Defaults to DEFAULT_PALLAS_M_BLOCK_SIZE.
-		    pallas_k_block_size (int, optional): block size k dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`. Defaults to DEFAULT_PALLAS_K_BLOCK_SIZE.
-		    pallas_n_block_size (int, optional): block size n dim in matmul for pallas kernel `A(mk)@B(kn)=B(mn)`. Defaults to DEFAULT_PALLAS_N_BLOCK_SIZE.
-		"""
 		self.axis_dims = getattr(self, "axis_dims", axis_dims)
 		self.axis_names = getattr(self, "axis_names", axis_names)
 		self.backend = getattr(

@@ -17,8 +17,8 @@ import typing as tp
 
 from jax.sharding import PartitionSpec
 
-from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
 
 
@@ -159,7 +159,7 @@ class Qwen2Config(EasyDeLBaseConfig):
 		self.scan_mlp_chunk_size = scan_mlp_chunk_size
 		self.bits = bits
 		self.head_dim = hidden_size // num_attention_heads
-		
+
 		if self.rope_scaling is not None and "type" in self.rope_scaling:
 			self.rope_scaling["rope_type"] = self.rope_scaling["type"]
 		super().__init__(

@@ -14,6 +14,7 @@
 
 
 import contextlib
+import logging
 import os
 import sys
 import time
@@ -21,8 +22,6 @@ import typing as tp
 import warnings
 from contextlib import contextmanager
 from pathlib import Path
-
-from easydel.etils.etils import get_logger
 
 if tp.TYPE_CHECKING:
 	from flax.metrics.tensorboard import SummaryWriter
@@ -32,6 +31,59 @@ try:
 	import wandb  # type: ignore
 except ModuleNotFoundError:
 	wandb = None
+
+
+_LOGGING_LEVELS = dict(
+	CRITICAL=50,
+	FATAL=50,
+	ERROR=40,
+	WARNING=30,
+	WARN=30,
+	INFO=20,
+	DEBUG=10,
+	NOTSET=0,
+)
+
+
+def get_logger(
+	name,
+	level: int = _LOGGING_LEVELS[os.environ.get("LOGGING_LEVEL_ED", "INFO")],
+) -> logging.Logger:
+	"""
+	Function to create and configure a logger.
+	Args:
+	    name (str): The name of the logger.
+	    level (int): The logging level. Defaults to logging.INFO.
+	Returns:
+	    logging.Logger: The configured logger instance.
+	"""
+	logger = logging.getLogger(name)
+	logger.propagate = False
+
+	# Set the logging level
+	logger.setLevel(level)
+
+	# Create a console handler
+	console_handler = logging.StreamHandler()
+	console_handler.setLevel(level)
+
+	formatter = logging.Formatter("%(asctime)s %(levelname)-8s [%(name)s] %(message)s")
+	console_handler.setFormatter(formatter)
+	logger.addHandler(console_handler)
+	return logger
+
+
+def set_loggers_level(level: int = logging.WARNING):
+	"""Function to set the logging level of all loggers to the specified level.
+
+	Args:
+	    level: int: The logging level to set. Defaults to
+	        logging.WARNING.
+	"""
+	logging.root.setLevel(level)
+	for handler in logging.root.handlers:
+		handler.setLevel(level)
+
 
 logger = get_logger(__name__)
 

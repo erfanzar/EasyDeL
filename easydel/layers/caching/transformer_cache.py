@@ -16,11 +16,15 @@ import typing as tp
 import chex as cx
 from fjformer.core import ImplicitArray
 from jax import numpy as jnp
-from jax.sharding import PartitionSpec, Mesh, NamedSharding
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from easydel.etils.etils import EasyDeLQuantizationMethods
-from easydel.etils.partition_module import PartitionAxis
-from easydel.utils.quantizers import EasyQuantizer
+from easydel.escale import PartitionAxis
+from easydel.infra.etils import EasyDeLQuantizationMethods
+
+if tp.TYPE_CHECKING:
+	from easydel.utils.quantizers import EasyQuantizer
+else:
+	EasyQuantizer = object
 
 
 @cx.dataclass
@@ -190,6 +194,8 @@ class TransformerCache:
 		dtype: tp.Optional[jnp.dtype] = None,
 		key_values_partition_specs: tp.Optional[PartitionSpec] = None,
 	):
+		from easydel.utils.quantizers import EasyQuantizer
+
 		paxis = PartitionAxis()
 		quantizer = quantizer or EasyQuantizer(EasyDeLQuantizationMethods.NONE)
 		key_values_partition_specs = key_values_partition_specs or PartitionSpec(

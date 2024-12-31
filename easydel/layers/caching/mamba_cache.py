@@ -20,7 +20,7 @@ from fjformer.core import ImplicitArray
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
-from easydel.etils.partition_module import PartitionAxis
+from easydel.escale import PartitionAxis
 
 
 @cx.dataclass

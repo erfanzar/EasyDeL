@@ -50,6 +50,8 @@ def main():
 			gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
 			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
+			use_scan_mlp=True,
+			scan_mlp_chunk_size=128,
 		),
 		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 		platform=ed.EasyDeLPlatforms.TRITON,

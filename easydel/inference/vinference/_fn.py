@@ -16,14 +16,17 @@
 """Module for text generation pipeline using JAX/Flax."""
 
 import time
+import typing as tp  # noqa: F401
 from functools import partial
 
 import jax
 from flax import nnx as nn
 from jax import numpy as jnp
 
-from easydel.infra import EasyDeLBaseModule
-
+if tp.TYPE_CHECKING:
+	from easydel.infra import EasyDeLBaseModule
+else:
+	EasyDeLBaseModule = object
 from ..utils import (
 	SampleState,
 	create_sampling_step,

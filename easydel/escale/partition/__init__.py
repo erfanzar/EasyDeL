@@ -11,32 +11,39 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from ._sharding import (
+
+from .auto_spec import (
 	auto_namedsharding,
 	auto_partition_spec,
 	auto_shard_array,
-	create_device_mesh,
-	create_mesh,
-	tree_apply,
-	tree_path_to_string,
-	named_tree_map,
+	vrn_auto_partition_spec,
+	convert_sharding_strategy,
+	optimize_sharding_for_memory,
+	validate_sharding_config,
+)
+from .constraints import (
+	get_names_from_partition_spec,
 	make_shard_and_gather_fns,
 	match_partition_rules,
 	with_sharding_constraint,
-	flatten_tree,
+	analyze_sharding_strategy,
+	create_pattern_based_partition_spec,
+	PartitionAxis,
 )
 
 __all__ = (
 	"auto_namedsharding",
 	"auto_partition_spec",
 	"auto_shard_array",
-	"create_device_mesh",
-	"create_mesh",
-	"tree_apply",
-	"tree_path_to_string",
-	"named_tree_map",
+	"vrn_auto_partition_spec",
+	"with_sharding_constraint",
+	"get_names_from_partition_spec",
 	"make_shard_and_gather_fns",
 	"match_partition_rules",
-	"with_sharding_constraint",
-	"flatten_tree",
+	"convert_sharding_strategy",
+	"optimize_sharding_for_memory",
+	"validate_sharding_config",
+	"analyze_sharding_strategy",
+	"create_pattern_based_partition_spec",
+	"PartitionAxis",
 )

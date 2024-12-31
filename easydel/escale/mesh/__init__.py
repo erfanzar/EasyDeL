@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .smi import get_capacity_matrix, get_mem, initialise_tracking, run
+from .creation import create_device_mesh, parse_mesh_from_string
+from .validation import names_in_current_mesh
+from .mesh_helpers import MeshPartitionHelper
 
-__all__ = "get_capacity_matrix", "get_mem", "initialise_tracking", "run"
+__all__ = (
+	"create_device_mesh",
+	"parse_mesh_from_string",
+	"names_in_current_mesh",
+	"MeshPartitionHelper",
+)

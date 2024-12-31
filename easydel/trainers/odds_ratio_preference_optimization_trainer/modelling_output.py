@@ -17,7 +17,7 @@ from dataclasses import dataclass
 import jax
 
 if tp.TYPE_CHECKING:
-	from easydel.etils.easystate import EasyDeLState
+	from easydel.infra.base_state import EasyDeLState
 else:
 	EasyDeLState = tp.Any
 

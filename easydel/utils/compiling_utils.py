@@ -31,7 +31,7 @@ if tp.TYPE_CHECKING:
 	from jax._src.stages import Compiled, Lowered
 else:
 	Compiled, Lowered = tp.Any, tp.Any
-	
+
 _TFLAG = ["true", "1", "on", "yes"]
 RECOMPILE_FORCE = os.environ.get("RECOMPILE_FORCE", "false") in _TFLAG
 ECACHE_COMPILES = os.environ.get("ECACHE_COMPILES", "true") in _TFLAG

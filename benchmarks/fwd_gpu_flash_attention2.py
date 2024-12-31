@@ -4,17 +4,18 @@ import sys
 import typing as tp
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from easydel.kernels.gpu_ops.triton_gqa_flash_attention_2 import (
-	triton_gqa_flash_attention2_gpu,
-)
 import jax
 import jaxlib
 import triton
 from jax import nn
 from jax import numpy as jnp
 from jax import random as jrnd
-from easydel.utils.escale import create_mesh
 from jax.sharding import NamedSharding, PartitionSpec
+
+from easydel.escale import create_mesh
+from easydel.kernels.gpu_ops.triton_gqa_flash_attention_2 import (
+	triton_gqa_flash_attention2_gpu,
+)
 
 mesh = create_mesh(
 	(1, 1, 1, -1),

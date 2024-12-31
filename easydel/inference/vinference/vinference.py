@@ -36,14 +36,12 @@ from jax import numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
 from pydantic import BaseModel
 
-from easydel.etils.etils import get_logger
-from easydel.infra import EasyDeLBaseModule
-from easydel.infra.utils import ProcessingClassType
 from easydel.utils.compiling_utils import (
 	load_compiled_fn,
 	save_compiled_fn,
 	smart_compile,
 )
+from easydel.utils.helpers import get_logger
 
 from ..utils import (
 	SampleState,
@@ -57,6 +55,13 @@ from ._fn import (
 	put_compiled_funcs,
 )
 from .metrics import vInferenceMetrics
+
+if tp.TYPE_CHECKING:
+	from easydel.infra import EasyDeLBaseModule
+	from easydel.infra.utils import ProcessingClassType
+else:
+	EasyDeLBaseModule = None
+	ProcessingClassType = None
 
 logger = get_logger(__name__)
 TIME = str(datetime.fromtimestamp(time.time())).split(" ")[0]

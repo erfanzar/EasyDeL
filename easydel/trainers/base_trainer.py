@@ -16,14 +16,10 @@ from __future__ import annotations
 import os
 import pprint
 import shutil
-import sys
-import threading
-import time
 import typing as tp
 import warnings
 from abc import abstractmethod
 from glob import glob
-from logging import warning
 from pathlib import Path
 
 import flax
@@ -34,8 +30,9 @@ import termcolor
 import tqdm
 from flax.core import unfreeze
 
-from easydel.etils.easystate import EasyDeLState
-from easydel.etils.errors import EasyDeLTimerError
+import easydel
+from easydel.infra.base_state import EasyDeLState
+from easydel.infra.errors import EasyDeLTimerError
 
 try:
 	import wandb  # noqa: F821 # type:ignore
@@ -44,12 +41,11 @@ except ImportError:
 
 
 from easydel import __version__
-from easydel.etils.etils import get_logger
 from easydel.infra.base_module import (
 	EasyDeLBaseModule,
 )
-from easydel.smi import get_capacity_matrix, initialise_tracking
 from easydel.utils import Timers
+from easydel.utils.helpers import get_logger
 
 from .trainer_protocol import (
 	BaseTrainerProtocol,
@@ -129,48 +125,21 @@ class BaseTrainer(BaseTrainerProtocol):
 		self.state_named_sharding = getattr(self, "state_named_sharding", None)
 		self.state = getattr(self, "state", None)
 		self.pruning_module = getattr(self.arguments, "pruning_module", None)
+		self.memory_monitor = getattr(self.arguments, "memory_monitor", None)
 
 	def _initialize_memory_tracking(self):
 		if not self.arguments.performance_mode:
-			initialise_tracking()
-			self.arguments._stop_capturing_memory = False
-			self._start_capturing_memory().start()
+			self.memory_monitor = easydel.utils.analyze_memory.SMPMemoryMonitor(1)
 
-	def __str__(self):
+	def __repr__(self):
 		return pprint.pformat(self.__dict__, indent=2)
 
-	__repr__ = __str__
+	__str__ = __repr__
 
 	@staticmethod
 	def finish():
 		if wandb is not None:
 			wandb.finish()
-
-	def _start_capturing_memory(
-		self,
-		dir_prefix: str = "/dev/shm" if sys.platform != "win32" else ".",
-	):
-		def _start():
-			try:
-				while not self.arguments._stop_capturing_memory:
-					information_queries = {
-						f"accelerators/{device.replace('_', ' ')} ({key})": float(
-							info[key].replace("%", "").replace("GB", "")
-						)
-						for key in ["Used", "Usage Percent"]
-						for device, info in get_capacity_matrix(dir_prefix=dir_prefix).items()
-					}
-					self.arguments._captured_memory = information_queries
-					time.sleep(1.5)
-			except FileNotFoundError as err:
-				if "directory: 'go'" in err.__str__():
-					warning(
-						"in order to capture memory you need to have `go-lang` already installed.(ignoring memory capture action)"
-					)
-				else:
-					raise FileNotFoundError(err) from err
-
-		return threading.Thread(target=_start)
 
 	def initialize_trainer_utils(self):
 		"""
@@ -321,8 +290,12 @@ class BaseTrainer(BaseTrainerProtocol):
 			Returns:
 					tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
 			"""
-			import tensorflow as tf
-
+			try:
+				import tensorflow as tf
+			except ImportError as exec:
+				raise ImportError(
+					"Please install TensorFlow to use the TensorFlow dataset conversion."
+				) from exec
 			return (
 				dataset.to_tf_dataset(
 					collate_fn=self.create_collect_function(
@@ -354,7 +327,12 @@ class BaseTrainer(BaseTrainerProtocol):
 			Returns:
 					tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
 			"""
-			import tensorflow as tf
+			try:
+				import tensorflow as tf
+			except ImportError as exec:
+				raise ImportError(
+					"Please install TensorFlow to use the TensorFlow dataset conversion."
+				) from exec
 
 			return (
 				tf.data.Dataset.from_generator(
@@ -795,12 +773,6 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 			)
 			if self.arguments.save_directory is not None:
 				checkpoint_path = os.path.join(self.arguments.save_directory, filename)
-		# except Exception as e:
-		# 	termcolor.cprint(
-		# 		f"Failed to save checkpoint on interruption: {str(e)}",
-		# 		color="red",
-		# 		force_color=True,
-		# 	)
 
 		return TrainerOutput(
 			state=state,

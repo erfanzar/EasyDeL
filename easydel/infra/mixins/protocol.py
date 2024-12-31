@@ -20,10 +20,10 @@ import chex
 from flax import nnx as nn
 from jax.sharding import Mesh
 
-from easydel.etils.etils import EasyDeLQuantizationMethods
 from easydel.layers.caching.transformer_cache import TransformerCache
 
 from ..base_config import EasyDeLBaseConfig
+from ..etils import EasyDeLQuantizationMethods
 from ..loss_utils import (
 	LossConfig,
 	LossMetrics,
@@ -47,7 +47,7 @@ _T = tp.TypeVar("_T")
 if tp.TYPE_CHECKING:
 	from transformers import PreTrainedModel
 
-	from easydel.etils.easystate import EasyDeLState
+	from easydel.infra.base_state import EasyDeLState
 else:
 	EasyDeLState = tp.Any
 	PreTrainedModel = tp.Any

@@ -19,8 +19,8 @@ import flax.nnx
 import jax
 from jax import numpy as jnp
 
-from easydel.etils.easystate import EasyDeLState
 from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossMetrics
 
 from .concatenators import concatenated_inputs

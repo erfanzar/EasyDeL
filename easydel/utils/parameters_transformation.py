@@ -23,7 +23,7 @@ from jax import dlpack
 from jax import numpy as jnp
 from tqdm.autonotebook import tqdm
 
-from easydel.etils.etils import get_logger
+from easydel.utils.helpers import get_logger
 
 from .analyze_memory import SMPMemoryMonitor
 from .traversals import flatten_dict, unflatten_dict

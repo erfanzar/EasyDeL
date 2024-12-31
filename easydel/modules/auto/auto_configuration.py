@@ -18,17 +18,17 @@ import flax.nnx
 from fjformer import make_shard_and_gather_fns, match_partition_rules
 from jax.sharding import PartitionSpec
 
-from easydel.etils.etils import (
-	EasyDeLBackends,
-	EasyDeLPlatforms,
-	get_logger,
-)
-from easydel.etils.partition_module import PartitionAxis
+from easydel.escale import PartitionAxis
 from easydel.infra.base_module import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseModule,
 )
+from easydel.infra.etils import (
+	EasyDeLBackends,
+	EasyDeLPlatforms,
+)
 from easydel.infra.factory import TaskType, registry
+from easydel.utils.helpers import get_logger
 from easydel.utils.parameters_transformation import torch_dict_to_easydel_params
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 

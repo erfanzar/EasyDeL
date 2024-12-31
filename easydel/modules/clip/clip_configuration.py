@@ -15,9 +15,9 @@
 
 from jax.sharding import PartitionSpec
 
-from easydel.etils.etils import get_logger
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
+from easydel.utils.helpers import get_logger
 
 logger = get_logger(__name__)
 

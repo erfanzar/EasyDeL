@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import functools
 import inspect
 import re
@@ -27,21 +28,19 @@ import jax.experimental
 import jax.tree_util
 from aqt.jax.v2 import config as q_config
 from aqt.jax.v2.flax import aqt_flax as q_flax
-from einops import rearrange
 from flax import nnx as nn
 from tqdm.auto import tqdm
 
-from easydel.etils.errors import EasyDeLBlockWiseFFNError
-from easydel.etils.etils import (
-	AVAILABLE_SPARSE_MODULE_TYPES,
-	EasyDeLGradientCheckPointers,
-	EasyDeLQuantizationMethods,
-	get_logger,
-)
-from easydel.etils.partition_module import PartitionAxis
+from easydel.escale import PartitionAxis
+from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
 from .base_config import EasyMethod
+from .etils import (
+	AVAILABLE_SPARSE_MODULE_TYPES,
+	EasyDeLGradientCheckPointers,
+	EasyDeLQuantizationMethods,
+)
 
 warnings.filterwarnings(
 	"ignore",
@@ -195,35 +194,36 @@ def get_dot_general_by_bits(
 	return {}  # empty just in case of not getting any error
 
 
-def block_wise_ffn(remat_ffn, inputs, chunk_size: int, deterministic: bool):
-	generating = inputs.shape[1] == 1
-	try:
-		if generating:
-			return remat_ffn(inputs)
-		else:
-			inputs = rearrange(inputs, "b (c n) d -> b c n d", c=chunk_size)
+def block_wise_ffn(remat_ffn, inputs, chunk_size: int):
+	# TODO: Update to NNX scan when it is available
+	return remat_ffn(inputs)
+	# generating = inputs.shape[1] == 1
+	# try:
+	# 	if generating:
+	# 		return remat_ffn(inputs)
+	# 	else:
+	# 		inputs = rearrange(inputs, "b (c n) d -> b c n d", c=chunk_size)
 
-			def scan_ffn(remat_ffn_, carry, hidden_states):
-				outputs = remat_ffn_(hidden_states)
-				return carry, outputs
+	# 		def scan_ffn(remat_ffn_, carry, hidden_states):
+	# 			outputs = remat_ffn_(hidden_states)
+	# 			return carry, outputs
 
-			scan_axis = inputs.ndim - 2
-			_, output = nn.scan(
-				scan_ffn,
-				variable_broadcast="params",
-				split_rngs={"params": False, "dropout": True},
-				in_axes=scan_axis,
-				out_axes=scan_axis,
-			)(remat_ffn, None, inputs)
-			output = rearrange(output, "b c n d -> b (c n) d")
-			return output
-	except Exception as e:
-		raise EasyDeLBlockWiseFFNError(
-			"You Are using BlockWise FFN from near-infinite-context length paper and you might be passing "
-			"input arguments in wrong way in case that you don'position_ids want to use this just pass `use_scan_mlp=False` in "
-			"model config or in config_kwargs in AutoEasyDeLModelForCausalLM or change `scan_mlp_chunk_size` "
-			f"in configs for more information read Docs.\nOriginal Error\n{e}"
-		) from e
+	# 		scan_axis = inputs.ndim - 2
+	# 		print(inputs.shape, scan_axis)
+	# 		_, output = nn.scan(
+	# 			f=scan_ffn,
+	# 			in_axes=1,
+	# 			out_axes=1,
+	# 		)(remat_ffn, None, inputs)
+	# 		output = rearrange(output, "b c n d -> b (c n) d")
+	# 		return output
+	# except Exception as e:
+	# 	raise EasyDeLBlockWiseFFNError(
+	# 		"You Are using BlockWise FFN from near-infinite-context length paper and you might be passing "
+	# 		"input arguments in wrong way in case that you don'position_ids want to use this just pass `use_scan_mlp=False` in "
+	# 		"model config or in config_kwargs in AutoEasyDeLModelForCausalLM or change `scan_mlp_chunk_size` "
+	# 		f"in configs for more information read Docs.\nOriginal Error\n{e}"
+	# 	) from e
 
 
 def control_mlp_sharding(x: jax.Array, partition_axis: PartitionAxis):

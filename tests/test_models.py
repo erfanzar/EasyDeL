@@ -32,7 +32,7 @@ from flax import nnx as nn
 from jax import numpy as jnp
 from tabulate import tabulate
 
-from easydel.etils.etils import (
+from easydel.infra.etils import (
 	AVAILABLE_ATTENTION_MECHANISMS,
 	DEFAULT_ATTENTION_MECHANISM,
 	EasyDeLGradientCheckPointers,

@@ -16,7 +16,6 @@
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
 
-
 DEEPSEEK_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 
 
