@@ -166,7 +166,7 @@ class MyCustomModule(ed.EasyDeLBaseModule):
 
 # Example Model using the Custom Module
 class MyModel(ed.EasyDeLBaseModule):
-    config_class = ed.EasyDeLBaseConfig
+ config_class = ed.EasyDeLBaseConfig
  def __init__(
   self,
   config,
