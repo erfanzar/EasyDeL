@@ -18,7 +18,7 @@ import typing as tp
 import chex
 from fjformer.dtypes import A4Q, A8Q, Array8Bit, ArrayNF4
 
-from easydel.etils.etils import EasyDeLPlatforms, EasyDeLQuantizationMethods
+from easydel.infra.etils import EasyDeLPlatforms, EasyDeLQuantizationMethods
 
 DEFAULT_QUANTIZATION_PATTERN = (
 	"(wo|wq|wk|wv|q_proj|k_proj|v_proj|o_proj|w1|w2|w3|"

@@ -19,7 +19,7 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from easydel import __version__
-from easydel.etils.etils import get_logger
+from easydel.utils.helpers import get_logger
 
 logger = get_logger(__name__)
 

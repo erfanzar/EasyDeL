@@ -20,11 +20,11 @@ from jax.experimental import sparse
 from jax.sharding import PartitionSpec
 from tqdm.autonotebook import tqdm
 
-from easydel.etils.easystate import EasyDeLState
-from easydel.etils.errors import EasyDeLTimerError
-from easydel.etils.etils import get_logger
+from easydel.escale import match_partition_rules
+from easydel.infra.base_state import EasyDeLState
+from easydel.infra.errors import EasyDeLTimerError
 from easydel.infra.loss_utils import LossMetrics
-from easydel.utils.escale import match_partition_rules
+from easydel.utils.helpers import get_logger
 
 from ..base_trainer import (
 	BaseTrainer,

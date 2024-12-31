@@ -1,7 +1,7 @@
 errors package
 ==============
 
-.. automodule:: easydel.etils.errors
+.. automodule:: easydel.infra.errors
     :members:
     :undoc-members:
     :show-inheritance:

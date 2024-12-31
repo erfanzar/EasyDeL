@@ -24,12 +24,12 @@ from jax.experimental import sparse
 from jax.sharding import PartitionSpec
 from tqdm.autonotebook import tqdm
 
-from easydel.etils.easystate import EasyDeLState
-from easydel.etils.errors import EasyDeLTimerError
-from easydel.etils.etils import get_logger
+from easydel.escale import make_shard_and_gather_fns, match_partition_rules
 from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.base_state import EasyDeLState
+from easydel.infra.errors import EasyDeLTimerError
 from easydel.infra.utils import ProcessingClassType
-from easydel.utils.escale import make_shard_and_gather_fns, match_partition_rules
+from easydel.utils.helpers import get_logger
 
 from ..base_trainer import (
 	BaseTrainer,
@@ -475,8 +475,12 @@ class DPOTrainer(BaseTrainer):
 		Raises:
 				ValueError: If the training dataset is not set.
 		"""
-		import tensorflow_datasets
-
+		try:
+			import tensorflow_datasets
+		except ImportError as e:
+			raise ImportError(
+				"tensorflow_datasets is not installed, please install it by running `pip install tensorflow_datasets`"
+			) from e
 		if self.train_dataset is None:
 			raise ValueError("Trainer: training requires a train_dataset.")
 
@@ -515,7 +519,12 @@ class DPOTrainer(BaseTrainer):
 		Raises:
 				ValueError: If no evaluation dataset is provided or set.
 		"""
-		import tensorflow_datasets
+		try:
+			import tensorflow_datasets
+		except ImportError as e:
+			raise ImportError(
+				"tensorflow_datasets is not installed, please install it by running `pip install tensorflow_datasets`"
+			) from e
 
 		if eval_dataset is None and self.eval_dataset is None:
 			raise ValueError("Trainer: evaluation requires an eval_dataset.")
@@ -543,7 +552,12 @@ class DPOTrainer(BaseTrainer):
 				tensorflow.data.Dataset: The training dataloader.
 		"""
 
-		import tensorflow_datasets
+		try:
+			import tensorflow_datasets
+		except ImportError as e:
+			raise ImportError(
+				"tensorflow_datasets is not installed, please install it by running `pip install tensorflow_datasets`"
+			) from e
 
 		if (
 			self.arguments.precompute_ref_log_probs
@@ -605,7 +619,12 @@ class DPOTrainer(BaseTrainer):
 				tensorflow.data.Dataset: The evaluation dataloader.
 		"""
 
-		import tensorflow_datasets
+		try:
+			import tensorflow_datasets
+		except ImportError as e:
+			raise ImportError(
+				"tensorflow_datasets is not installed, please install it by running `pip install tensorflow_datasets`"
+			) from e
 
 		if eval_dataset is None and self.eval_dataset is None:
 			raise ValueError("Trainer: evaluation requires an eval_dataset.")

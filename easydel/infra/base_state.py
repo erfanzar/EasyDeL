@@ -22,10 +22,10 @@ import optax
 from flax import nnx as nn
 from flax import struct
 
-from easydel.etils.etils import get_logger
+from easydel.utils.helpers import get_logger
 
 if tp.TYPE_CHECKING:
-	from easydel.infra.base_module import EasyDeLBaseModule
+	from .base_module import EasyDeLBaseModule
 else:
 	EasyDeLBaseModule = tp.Any
 

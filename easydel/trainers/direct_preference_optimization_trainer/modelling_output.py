@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 import jax
 
-from easydel.etils.easystate import EasyDeLState
+from easydel.infra.base_state import EasyDeLState
 
 
 @dataclass

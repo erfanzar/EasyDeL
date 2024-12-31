@@ -1,7 +1,7 @@
-partition_module package
+utils.tree_utils package
 ========================
 
-.. automodule:: easydel.etils.partition_module
+.. automodule:: easydel.escale.utils.tree_utils
     :members:
     :undoc-members:
     :show-inheritance:

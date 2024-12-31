@@ -16,8 +16,8 @@ import pytest
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
-from easydel.etils.etils import EasyDeLQuantizationMethods
-from easydel.etils.partition_module import PartitionAxis
+from easydel.escale import PartitionAxis
+from easydel.infra.etils import EasyDeLQuantizationMethods
 from easydel.utils.quantizers import EasyQuantizer
 
 from .transformer_cache import (

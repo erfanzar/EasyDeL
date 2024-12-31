@@ -19,8 +19,8 @@ from numbers import Number
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
-from easydel.etils.etils import EasyDeLGradientCheckPointers
 from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
 
 

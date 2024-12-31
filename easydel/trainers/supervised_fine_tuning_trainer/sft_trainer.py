@@ -14,9 +14,9 @@
 import typing as tp
 import warnings
 
-from easydel.etils.etils import get_logger
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.utils import ProcessingClassType
+from easydel.utils.helpers import get_logger
 
 from ..base_trainer import TrainerConfigureDataloaderOutput
 from ..trainer import Trainer
@@ -136,8 +136,12 @@ class SFTTrainer(Trainer):
 		    TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
 		                                    maximum number of training and evaluation steps.
 		"""
-
-		import tensorflow_datasets as tfds
+		try:
+			import tensorflow_datasets as tfds
+		except ImportError as e:
+			raise ImportError(
+				"tensorflow_datasets is not installed, please install it by running `pip install tensorflow_datasets`"
+			) from e
 
 		dataloader_train = tfds.as_numpy(
 			self.dataset_train.to_tf_dataset(
@@ -401,10 +405,14 @@ class SFTTrainer(Trainer):
 					yield d
 
 			# Import Only and Only when needed, don't dst the runtime.
-			from datasets import Dataset
-			from datasets.arrow_writer import SchemaInferenceError
-			from datasets.builder import DatasetGenerationError
-
+			try:
+				from datasets import Dataset
+				from datasets.arrow_writer import SchemaInferenceError
+				from datasets.builder import DatasetGenerationError
+			except ImportError as exc:
+				raise ImportError(
+					"Could not import `datasets` from Hugging Face. Make sure to install the library using `pip install datasets`."
+				) from exc
 			try:
 				packed_dataset = Dataset.from_generator(
 					data_generator,

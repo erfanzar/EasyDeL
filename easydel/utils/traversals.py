@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from flax import nnx, struct
 from flax.nnx import traversals
 
-from easydel.etils.etils import get_logger
+from easydel.utils.helpers import get_logger
 
 logger = get_logger(__name__)
 

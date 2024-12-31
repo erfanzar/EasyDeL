@@ -15,7 +15,7 @@ import copy
 import inspect
 import typing as tp
 import warnings
-from functools import partial
+from functools import cached_property, partial
 
 import chex
 import jax
@@ -25,7 +25,6 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from transformers.generation.configuration_utils import GenerationConfig
 
-from easydel.etils.etils import get_logger
 from easydel.inference.logits_process import (
 	FlaxForcedBOSTokenLogitsProcessor,
 	FlaxForcedEOSTokenLogitsProcessor,
@@ -43,7 +42,7 @@ from easydel.layers.caching.transformer_cache import (
 	TransformerCache,
 	TransformerCacheMetaData,
 )
-from easydel.utils.quantizers import EasyQuantizer
+from easydel.utils.helpers import get_logger
 
 from ..base_config import EasyDeLBaseConfig
 from ..modeling_outputs import (
@@ -150,13 +149,19 @@ class EasyGenerationMixin:
 				num_heads=num_key_value_heads,
 				head_dim=head_dim,
 			),
-			quantizer=EasyQuantizer(
+			quantizer=self._quant_class(
 				quantization_method=self.config.kv_cache_quantization_method,
 				block_size=self.config.kv_cache_quantization_blocksize,
 				quantization_platform=self.config.platform,
 			),
 			mesh=self.config.mesh,
 		)
+
+	@cached_property
+	def _quant_class(self):
+		from easydel.utils.quantizers import EasyQuantizer
+
+		return EasyQuantizer
 
 	def prepare_inputs_for_generation(
 		self,

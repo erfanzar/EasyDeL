@@ -13,7 +13,7 @@ sys.path.append(
 )
 
 from easydel import EasyDeLState, FlaxLlamaForCausalLM, LlamaConfig
-from easydel.etils.auto_tx import get_optimizer_and_scheduler
+from easydel.trainers.auto_tx import get_optimizer_and_scheduler
 
 
 def main():

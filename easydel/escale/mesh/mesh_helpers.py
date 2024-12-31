@@ -16,7 +16,6 @@ import typing as tp
 
 import jax
 import numpy as np
-from jax.experimental import mesh_utils
 from jax.sharding import Mesh, PartitionSpec
 
 
@@ -185,25 +184,3 @@ class MeshPartitionHelper:
 			return x
 
 		return jax.tree_util.tree_map(shard_leaf, pytree)
-
-
-if __name__ == "__main__":
-	mesh = Mesh(mesh_utils.create_device_mesh((2, 2, 1, 2)), ("dp", "fsdp", "sp", "tp"))
-
-	helper = MeshPartitionHelper(mesh)
-
-	# Auto-shard entire pytree
-	# sharded_pytree = helper.auto_shard_pytree(model_params)
-
-	# Or get specific partition spec
-	array_shape = (16, 512, 1024)
-	methods = helper._suggest_methods(array_shape)
-	spec = helper.create_partition_spec(array_shape, methods)
-	print(spec, methods)
-	# Output: PartitionSpec(('fsdp', 'sp'), None, None) [('fsdp', 'sp'), ('dp',), ('tp',)]
-
-	array_shape = (2, 16, 512, 1024)
-	methods = helper._suggest_methods(array_shape)
-	spec = helper.create_partition_spec(array_shape, methods)
-	print(spec, methods)
-	# Output: PartitionSpec(('fsdp', 'sp'), None, None, None) [('fsdp', 'sp'), ('dp',), ('tp',)]

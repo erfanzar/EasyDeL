@@ -16,7 +16,7 @@ import typing as tp
 
 import fjformer.optimizers
 
-from .etils import (
+from easydel.infra.etils import (
 	AVAILABLE_OPTIMIZERS,
 	AVAILABLE_SCHEDULERS,
 	EasyDeLOptimizers,

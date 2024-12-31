@@ -1,7 +1,7 @@
 etils package
 =============
 
-.. automodule:: easydel.etils.etils
+.. automodule:: easydel.infra.etils
     :members:
     :undoc-members:
     :show-inheritance:

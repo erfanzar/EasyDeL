@@ -22,7 +22,6 @@ import jax
 import jax.numpy as jnp
 from flax import nnx as nn
 
-from easydel.etils.etils import get_logger
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import register_module
 from easydel.infra.modeling_outputs import (
@@ -39,6 +38,7 @@ from easydel.infra.utils import (
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
 from easydel.modules.gemma.gemma_configuration import GemmaConfig as GemmaConfig
+from easydel.utils.helpers import get_logger
 
 logger = get_logger(__name__)
 

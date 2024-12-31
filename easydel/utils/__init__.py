@@ -19,12 +19,13 @@ from .compiling_utils import (
 	load_compiled_fn,
 	save_compiled_fn,
 )
-from .helpers import Timer, Timers
+from .helpers import Timer, Timers, get_logger
 from .quantizers import EasyQuantizer
 
 __all__ = (
 	"Timers",
 	"Timer",
+	"get_logger",
 	"EasyQuantizer",
 	"graph_utils",
 	"analyze_memory",

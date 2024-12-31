@@ -17,16 +17,16 @@ import typing as tp
 import jax.numpy
 from jax.sharding import PartitionSpec
 
-from easydel.etils.easystate import EasyDeLState
-from easydel.etils.etils import (
-	EasyDeLBackends,
-	EasyDeLPlatforms,
-	EasyDeLQuantizationMethods,
-)
-from easydel.etils.partition_module import PartitionAxis
+from easydel.escale import PartitionAxis
 from easydel.infra.base_config import EasyDeLBaseConfigDict
 from easydel.infra.base_module import (
 	EasyDeLBaseModule,
+)
+from easydel.infra.base_state import EasyDeLState
+from easydel.infra.etils import (
+	EasyDeLBackends,
+	EasyDeLPlatforms,
+	EasyDeLQuantizationMethods,
 )
 from easydel.infra.factory import TaskType
 

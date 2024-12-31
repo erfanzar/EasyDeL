@@ -26,17 +26,17 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import PartitionSpec
 
-from easydel.etils.errors import EasyDeLTimerError
-from easydel.etils.etils import (
+from easydel.infra.errors import EasyDeLTimerError
+from easydel.infra.etils import (
 	AVAILABLE_OPTIMIZERS,
 	AVAILABLE_PRUNING_TYPE,
 	AVAILABLE_SCHEDULERS,
 	AVAILABLE_SPARSE_MODULE_TYPES,
 	EasyDeLOptimizers,
 	EasyDeLSchedulers,
-	get_logger,
 )
 from easydel.infra.loss_utils import LossConfig
+from easydel.utils.helpers import get_logger
 
 from .utils import JaxDistributedConfig
 
@@ -178,9 +178,6 @@ class TrainingArguments:
 			warnings.warn("WandB logging disabled due to performance mode", stacklevel=1)
 			self.use_wandb = False
 
-		self._stop_capturing_memory = False
-		self._captured_memory = {}
-
 	def _ensure_variables(self):
 		"""
 		Checks and sets up variables for start.
@@ -238,7 +235,7 @@ class TrainingArguments:
 		Returns:
 		    tuple: A tuple containing the optimizer and scheduler.
 		"""
-		from easydel.etils.auto_tx import get_optimizer_and_scheduler
+		from easydel.trainers.auto_tx import get_optimizer_and_scheduler
 
 		self.optimizer_kwargs["steps"] = steps or self.optimizer_kwargs["steps"]
 		tx, sc = get_optimizer_and_scheduler(**self.optimizer_kwargs)
@@ -330,16 +327,17 @@ class TrainingArguments:
 		        A dictionary where keys are metric names and values are metric values.
 		    step (int): The current training step or iteration.
 		"""
+		if jax.process_index() != 0 and not self.log_all_workers:
 
-		def restructure_metric_name(metric_name):
-			if metric_name.startswith("train/grad_norm/"):
-				return metric_name.replace("train/grad_norm/", "grad_norm/")
-			return metric_name
+			def restructure_metric_name(metric_name):
+				if metric_name.startswith("train/grad_norm/"):
+					return metric_name.replace("train/grad_norm/", "grad_norm/")
+				return metric_name
 
-		with jax.spmd_mode("allow_all"):
-			metrics = {restructure_metric_name(k): v for k, v in metrics.items()}
-			self._log_to_wandb(metrics, step)
-			self._log_to_tensorboard(metrics, step)
+			with jax.spmd_mode("allow_all"):
+				metrics = {restructure_metric_name(k): v for k, v in metrics.items()}
+				self._log_to_wandb(metrics, step)
+				self._log_to_tensorboard(metrics, step)
 
 	def _log_to_wandb(self, metrics, step):
 		"""
@@ -427,7 +425,7 @@ class TrainingArguments:
 					),
 				):
 					if hasattr(value, "cpu"):
-						value = value.cpu().numpy()
+						value = value.cpu().detach().numpy()
 					elif isinstance(value, jnp.ndarray):
 						value = np.array(value)
 					summary_writer.histogram(key, value, step)

@@ -48,19 +48,18 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec
 
-from easydel.etils.etils import (
-	_AVAILABLE_ATTENTION_MECHANISMS,
+from easydel.escale import PartitionAxis
+from easydel.infra.base_module import EasyDeLBaseConfig
+from easydel.infra.etils import (
 	AVAILABLE_ATTENTION_MECHANISMS,
 	EasyDeLBackends,
 	EasyDeLPlatforms,
-	get_logger,
 )
-from easydel.etils.partition_module import PartitionAxis
-from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.kernels.flash_attention_2 import create_flash_attention
 from easydel.kernels.ring_attention import ring_attention
 from easydel.layers._blockwise_attention import blockwise_attn
 from easydel.layers.caching import TransformerCacheView
+from easydel.utils.helpers import get_logger
 from easydel.utils.quantizers import EasyQuantizer
 
 try:
@@ -1396,9 +1395,15 @@ class AttentionBenchmarker:
 		from easydel import MistralConfig
 
 		self.config = config
-		self.run_attention_benchmarks = (
-			run_attention_benchmarks or _AVAILABLE_ATTENTION_MECHANISMS
-		)
+		self.run_attention_benchmarks = run_attention_benchmarks or [
+			"vanilla",
+			"flash_attn2",
+			"splash",
+			"ring",
+			"cudnn",
+			"blockwise",
+			"sdpa",
+		]
 		self.calculate_gradients = calculate_gradients
 		self.rng = GenerateRNG()
 

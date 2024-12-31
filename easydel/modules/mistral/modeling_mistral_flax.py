@@ -21,7 +21,6 @@ import jax
 from flax import nnx as nn
 from jax import numpy as jnp
 
-from easydel.etils.etils import get_logger
 from easydel.infra.base_module import (
 	EasyDeLBaseModule,
 )
@@ -43,6 +42,7 @@ from easydel.layers.norms import RMSNorm
 from easydel.modules.mistral.mistral_configuration import (
 	MistralConfig,
 )
+from easydel.utils.helpers import get_logger
 
 logger = get_logger(__name__)
 

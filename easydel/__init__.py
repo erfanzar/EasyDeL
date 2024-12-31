@@ -21,7 +21,7 @@ if _os.environ.get("EASYDEL_AUTO", "true") in ["true", "1", "on", "yes"]:
 	# Tell jax xla bridge to stay quiet and only yied warnings or errors.
 	_getLogger("jax._src.xla_bridge").setLevel(30)
 	_getLogger("jax._src.mesh_utils").setLevel(30)
-	
+
 	# Taking care of some optional GPU FLAGs
 	_os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 	_os.environ["KMP_AFFINITY"] = "noverbose"
@@ -59,22 +59,8 @@ del _getLogger
 # EasyDel Imports
 from packaging.version import Version as _Version
 
-from . import utils
-from .etils.easystate import EasyDeLState
-from .etils.errors import (
-	EasyDeLRuntimeError,
-	EasyDeLSyntaxRuntimeError,
-	EasyDeLTimerError,
-)
-from .etils.etils import (
-	EasyDeLBackends,
-	EasyDeLGradientCheckPointers,
-	EasyDeLOptimizers,
-	EasyDeLPlatforms,
-	EasyDeLQuantizationMethods,
-	EasyDeLSchedulers,
-)
-from .etils.partition_module import PartitionAxis
+from . import escale, utils
+from .escale import PartitionAxis
 from .inference.vinference import (
 	vInference,
 	vInferenceApiServer,
@@ -89,6 +75,20 @@ from .infra import (
 	EasyDeLBaseConfigDict,
 	EasyDeLBaseModule,
 	LossConfig,
+)
+from .infra.base_state import EasyDeLState
+from .infra.errors import (
+	EasyDeLRuntimeError,
+	EasyDeLSyntaxRuntimeError,
+	EasyDeLTimerError,
+)
+from .infra.etils import (
+	EasyDeLBackends,
+	EasyDeLGradientCheckPointers,
+	EasyDeLOptimizers,
+	EasyDeLPlatforms,
+	EasyDeLQuantizationMethods,
+	EasyDeLSchedulers,
 )
 from .infra.factory import (
 	ConfigType,
@@ -305,7 +305,6 @@ from .modules.xerxes import (
 	XerxesForCausalLM,
 	XerxesModel,
 )
-from .smi import get_mem, initialise_tracking, run
 from .trainers import (
 	BaseTrainer,
 	DPOConfig,

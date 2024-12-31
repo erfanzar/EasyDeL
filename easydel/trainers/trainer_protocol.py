@@ -31,7 +31,7 @@ from fjformer.checkpoint import CheckpointManager
 from jax.sharding import Mesh
 from optax import GradientTransformation, Schedule
 
-from easydel.etils.easystate import EasyDeLState
+from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossMetrics
 from easydel.utils.traversals import flatten_dict
 
@@ -42,12 +42,12 @@ except ImportError:
 
 from jax import numpy as jnp
 
-from easydel.etils.etils import get_logger
 from easydel.infra.base_module import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseModule,
 )
 from easydel.utils import Timers
+from easydel.utils.helpers import get_logger
 
 from .training_configurations import TrainingArguments
 

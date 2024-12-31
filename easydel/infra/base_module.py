@@ -22,16 +22,17 @@ import chex
 import jax
 import jax.extend
 import jax.tree_util
-from easydel.utils.escale import make_shard_and_gather_fns, match_partition_rules
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import Mesh
 
-from easydel.etils.etils import EasyDeLQuantizationMethods, get_logger
+from easydel.escale import make_shard_and_gather_fns, match_partition_rules
+from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
 from .base_config import EasyDeLBaseConfig
+from .etils import EasyDeLQuantizationMethods
 from .loss_utils import (
 	LOSS_MAPPING,
 	ForCausalLMLoss,
@@ -46,7 +47,7 @@ from .mixins import (
 from .utils import quantize_linear_layers
 
 if tp.TYPE_CHECKING:
-	from easydel.etils.easystate import EasyDeLState
+	from easydel.infra.base_state import EasyDeLState
 else:
 	EasyDeLState = tp.Any
 
@@ -275,7 +276,7 @@ class EasyDeLBaseModule(
 		shard_fns = make_shard_and_gather_fns(
 			partition_specs=match_partition_rules(
 				rules=partition_rules,
-				params=self.graphtree_params_shape,
+				tree=self.graphtree_params_shape,
 			),
 			mesh=mesh,
 		)[0]
@@ -287,7 +288,7 @@ class EasyDeLBaseModule(
 		mesh = self._get_mesh(None)
 		partition_specs = match_partition_rules(
 			rules=self._get_partition_rules(None),
-			params=self.graphtree_params_shape,
+			tree=self.graphtree_params_shape,
 		)
 		return make_shard_and_gather_fns(partition_specs=partition_specs, mesh=mesh)[0]
 
@@ -296,7 +297,7 @@ class EasyDeLBaseModule(
 		mesh = self._get_mesh(None)
 		partition_specs = match_partition_rules(
 			rules=self._get_partition_rules(None),
-			params=self.graphtree_params_shape,
+			tree=self.graphtree_params_shape,
 		)
 		return make_shard_and_gather_fns(partition_specs=partition_specs, mesh=mesh)[1]
 
@@ -320,7 +321,7 @@ class EasyDeLBaseModule(
 		gather_fns = make_shard_and_gather_fns(
 			partition_specs=match_partition_rules(
 				rules=partition_rules,
-				params=self.graphtree_params_shape,
+				tree=self.graphtree_params_shape,
 			),
 			mesh=mesh,
 		)[1]
@@ -351,7 +352,7 @@ class EasyDeLBaseModule(
 
 	def to_state(self) -> EasyDeLState:
 		"""converts current model to a EasyDeLState"""
-		from easydel.etils.easystate import EasyDeLState
+		from easydel.infra.base_state import EasyDeLState
 
 		return EasyDeLState.create(step=0, model=self)
 

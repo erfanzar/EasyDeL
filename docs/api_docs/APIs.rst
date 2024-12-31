@@ -4,13 +4,12 @@ EasyDeL APIs 🔮
 .. toctree::
    :maxdepth: 2
    
-   Etils
+   Escale
    Inference
    Infra
    Kernels
    Layers
    Modules
-   Smi
    Trainers
    Utils
    

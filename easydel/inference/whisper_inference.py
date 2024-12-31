@@ -24,13 +24,19 @@ from jax import numpy as jnp
 from transformers.models.whisper.tokenization_whisper import TO_LANGUAGE_CODE
 from transformers.pipelines.audio_utils import ffmpeg_read
 
-from easydel.modules.whisper import WhisperForConditionalGeneration
 from easydel.utils.compiling_utils import get_safe_hash_int
 
 if tp.TYPE_CHECKING:
 	from transformers import GenerationConfig, WhisperProcessor, WhisperTokenizer
+
+	from easydel.modules.whisper import WhisperForConditionalGeneration
 else:
-	GenerationConfig, WhisperProcessor, WhisperTokenizer = [tp.Any] * 3
+	(
+		GenerationConfig,
+		WhisperProcessor,
+		WhisperTokenizer,
+		WhisperForConditionalGeneration,
+	) = [tp.Any] * 4
 
 
 @partial(

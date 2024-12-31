@@ -25,7 +25,7 @@ from fastapi import APIRouter, FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 from prometheus_client import start_http_server
 
-from easydel.etils.etils import get_logger
+from easydel.utils.helpers import get_logger
 
 from .api_models import (
 	ChatCompletionRequest,
