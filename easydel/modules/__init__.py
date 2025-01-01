@@ -66,6 +66,11 @@ from .deepseek_v2 import (
 	DeepseekV2ForCausalLM,
 	DeepseekV2Model,
 )
+from .deepseek_v3 import (
+	DeepseekV3Config,
+	DeepseekV3ForCausalLM,
+	DeepseekV3Model,
+)
 from .exaone import (
 	ExaoneConfig,
 	ExaoneForCausalLM,

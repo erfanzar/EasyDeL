@@ -3,13 +3,15 @@ import os
 import typing as tp
 
 os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=64"
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["JAX_PLATFORMS"] = "cpu"
+
 import sys
 import time
 import unittest
 
 import jax
 
-jax.config.update("jax_platform_name", "cpu")  # CPU Test !
 import easydel as ed
 import jax.extend
 import jax.random
@@ -595,7 +597,20 @@ class EasyModelsTest(unittest.TestCase):
 		self.header_config = None
 		hf_model, conf = self.get_hf_model_from_hub("deepseek-ai/DeepSeek-V2")
 		res, err = self.create_test_for_models(
-			"deepseek_v2", hf_model, ed.TaskType.CAUSAL_LM
+			"deepseek_v2",
+			hf_model,
+			ed.TaskType.CAUSAL_LM,
+		)
+
+		self.assertTrue(res, f"DeepSeekv2 model Failed [ERROR {err}]")
+
+	def test_deepseek_v3(self):
+		self.header_config = None
+		hf_model, conf = self.get_hf_model_from_hub("deepseek-ai/DeepSeek-V3")
+		res, err = self.create_test_for_models(
+			"deepseek_v3",
+			hf_model,
+			ed.TaskType.CAUSAL_LM,
 		)
 
 		self.assertTrue(res, f"DeepSeekv2 model Failed [ERROR {err}]")
@@ -808,35 +823,36 @@ class EasyModelsTest(unittest.TestCase):
 
 if __name__ == "__main__":
 	# unittest.main()
-	print(jax.devices())
+	# print(jax.devices())
 	test = EasyModelsTest()
 	test.setUp()
-	test.test_arctic()  # Passed
-	test.test_cohere()  # Passed
-	test.test_dbrx()  # Passed
-	test.test_deepseek_v2()  # Passed
-	test.test_exaone()  # Passed
-	test.test_falcon()  # Passed
-	test.test_gemma()  # Passed
-	test.test_gemma2()  # Passed
-	test.test_gptj()  # Passed
-	test.test_gpt_noex()  # Passed
-	test.test_gpt2()  # Passed
+	# test.test_arctic()  # Passed
+	# test.test_cohere()  # Passed
+	# test.test_dbrx()  # Passed
+	# test.test_deepseek_v2()  # Passed
+	test.test_deepseek_v3()  # Passed
+	# test.test_exaone()  # Passed
+	# test.test_falcon()  # Passed
+	# test.test_gemma()  # Passed
+	# test.test_gemma2()  # Passed
+	# test.test_gptj()  # Passed
+	# test.test_gpt_noex()  # Passed
+	# test.test_gpt2()  # Passed
 	# test.test_grok1() # Not Tested Yet!
-	test.test_internlm2()  # Passed
-	test.test_llama()  # Passed
-	test.test_mamba()  # Passed
-	test.test_mamba2()  # Passed
-	test.test_mistral()  # Passed
-	test.test_mixtral()  # Passed
-	test.test_mpt()  # Passed
-	test.test_olmo()  # Passed
-	test.test_olmo2()  # Passed
-	test.test_openelm()  # Passed
-	test.test_phi()  # Passed
-	test.test_phi3()  # Passed
+	# test.test_internlm2()  # Passed
+	# test.test_llama()  # Passed
+	# test.test_mamba()  # Passed
+	# test.test_mamba2()  # Passed
+	# test.test_mistral()  # Passed
+	# test.test_mixtral()  # Passed
+	# test.test_mpt()  # Passed
+	# test.test_olmo()  # Passed
+	# test.test_olmo2()  # Passed
+	# test.test_openelm()  # Passed
+	# test.test_phi()  # Passed
+	# test.test_phi3()  # Passed
 	# test.test_phimoe()  # Failed v0.0.80 - N  Runtime
-	test.test_qwen2()  # Passed
-	test.test_qwen2_moe()  # Passed
-	test.test_stablelm()  # Passed
+	# test.test_qwen2()  # Passed
+	# test.test_qwen2_moe()  # Passed
+	# test.test_stablelm()  # Passed
 	# -----------------------------------------------

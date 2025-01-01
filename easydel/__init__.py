@@ -148,6 +148,11 @@ from .modules.deepseek_v2 import (
 	DeepseekV2ForCausalLM,
 	DeepseekV2Model,
 )
+from .modules.deepseek_v3 import (
+	DeepseekV3Config,
+	DeepseekV3ForCausalLM,
+	DeepseekV3Model,
+)
 from .modules.exaone import (
 	ExaoneConfig,
 	ExaoneForCausalLM,
