@@ -20,7 +20,6 @@ import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import flax.traverse_util
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -45,9 +44,10 @@ try:
 except ImportError:
 	wandb = None
 
-
-import flax.metrics.tensorboard
-
+if tp.TYPE_CHECKING:
+	from flax.metrics.tensorboard import SummaryWriter
+else:
+	SummaryWriter = tp.Any
 logger = get_logger(__name__)
 
 
@@ -260,9 +260,9 @@ class TrainingArguments:
 
 	@functools.cached_property
 	def _tensorboard(self):
-		return flax.metrics.tensorboard.SummaryWriter(
-			log_dir=str(self._get_save_directory(create=True))
-		)
+		from flax.metrics.tensorboard import SummaryWriter
+
+		return SummaryWriter(log_dir=str(self._get_save_directory(create=True)))
 
 	def get_tensorboard(self):
 		"""
