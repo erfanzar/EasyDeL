@@ -15,6 +15,7 @@
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
+from jax.sharding import PartitionSpec
 
 DEEPSEEK_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 
@@ -217,4 +218,28 @@ class DeepseekV3Config(EasyDeLBaseConfig):
 			eos_token_id=eos_token_id,
 			tie_word_embeddings=tie_word_embeddings,
 			**kwargs,
+		)
+
+	def get_partition_rules(self, *args, **kwargs):
+		"""
+		Get the partition rules for the model.
+		Returns:
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+		"""
+		return (
+			("model/embed_tokens/embedding", PartitionSpec("tp", ("sp", "fsdp"))),
+			(
+				"self_attn/(q_proj|k_proj|v_proj)/kernel",
+				PartitionSpec(("fsdp", "sp"), "tp"),
+			),
+			("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
+			("gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("gate/kernel", PartitionSpec(("fsdp", "sp"))),
+			("input_layernorm/kernel", PartitionSpec(None)),
+			("post_attention_layernorm/kernel", PartitionSpec(None)),
+			("model/norm/kernel", PartitionSpec(None)),
+			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			(".*", PartitionSpec(None)),
 		)

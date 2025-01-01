@@ -50,12 +50,12 @@ def main():
 			gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
 			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
-			use_scan_mlp=True,
-			scan_mlp_chunk_size=128,
+			# use_scan_mlp=True,
+			# scan_mlp_chunk_size=128,
 		),
 		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 		platform=ed.EasyDeLPlatforms.TRITON,
-		param_dtype=jnp.float8_e5m2,
+		param_dtype=dtype,
 		dtype=dtype,
 		torch_dtype=torch.float16,
 		partition_axis=partition_axis,
@@ -66,7 +66,7 @@ def main():
 	tokenizer.padding_side = "left"
 	tokenizer.pad_token_id = tokenizer.eos_token_id
 	model.eval()
-	# model = model.quantize(
+	model = model.quantize()
 	# 	method=ed.EasyDeLQuantizationMethods.A8BIT,
 	# 	block_size=128,
 	# 	quantization_pattern=".*(gate_proj|up_proj).*",
