@@ -89,7 +89,7 @@ class TrainingArguments:
 	do_last_save: bool = True
 	model_parameters: tp.Optional[dict] = None
 	track_memory: tp.Optional[bool] = None
-
+	use_data_collactor: bool = True
 	truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end"
 	warmup_steps: int = 500
 	step_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp")
