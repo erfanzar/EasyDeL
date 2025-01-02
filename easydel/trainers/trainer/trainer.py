@@ -96,19 +96,7 @@ class Trainer(BaseTrainer):
 		if self.arguments.sparsify_module:
 			self.model.__call__ = sparse.sparsify(self.model.__call__)
 
-		def create_state():
-			"""
-			Creates an EasyDeLState object.
-			Returns:
-			    EasyDeLState: The EasyDeLState object initialized.
-			"""
-			return EasyDeLState.create(
-				model=self.model,
-				tx=self.tx,
-				init_opt_state=True,
-			)
-
-		state_shape = jax.eval_shape(lambda: create_state())
+		state_shape = jax.eval_shape(lambda: self.model_state)
 		state_partition_spec = match_partition_rules(
 			self.model.config.get_partition_rules(),
 			state_shape,
@@ -119,7 +107,6 @@ class Trainer(BaseTrainer):
 			spec=PartitionSpec(),
 			mesh=self.model.mesh,
 		)
-		create_state_sharded = jax.jit(create_state, out_shardings=spec_named_sharding)
 		sharded_training_step_function = jax.jit(
 			create_training_step(
 				partition_spec=self.arguments.step_partition_spec,
@@ -150,7 +137,6 @@ class Trainer(BaseTrainer):
 		self.state_shape = state_shape
 
 		return TrainerConfigureFunctionOutput(
-			create_state_sharded=create_state_sharded,
 			sharded_training_step_function=sharded_training_step_function,
 			sharded_evaluation_step_function=sharded_evaluation_step_function,
 			mesh=mesh,
@@ -378,7 +364,7 @@ class Trainer(BaseTrainer):
 		return output
 
 	def train(self) -> TrainerOutput:
-		state = self.state
+		state = self.model_state
 		metrics_tracker = MetricsTracker()
 		step_metrics = StepMetrics(self.arguments)
 
@@ -386,7 +372,7 @@ class Trainer(BaseTrainer):
 		self._setup_initial_metrics(state)
 
 		output, run_exception = self._run_training_loop(
-			state=self.state,
+			state=self.model_state,
 			metrics_tracker=metrics_tracker,
 			step_metrics=step_metrics,
 		)

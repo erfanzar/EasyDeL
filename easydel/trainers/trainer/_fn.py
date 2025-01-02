@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import typing as tp
 
 import jax
@@ -84,16 +85,19 @@ def create_training_step(
 		grads_shapes, metrics_shape = jax.eval_shape(_minibatch_step, 0)
 		grads = jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), grads_shapes)
 		metrics = jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), metrics_shape)
-		(grads, metrics), _ = jax.lax.scan(
-			_scan_step,
-			init=(grads, metrics),
-			xs=jnp.arange(minibatch_size),
-			length=minibatch_size,
-		)
-		# Average the accumulated gradients
-
-		grads = jax.tree_map(lambda g: g / minibatch_size, grads)
-		metrics = jax.tree_map(lambda m: m / minibatch_size, metrics)
+		if os.environ.get("SCAN_TRAINER", "true").lower() in ["true", "1", "on", "yes"]:
+			(grads, metrics), _ = jax.lax.scan(
+				_scan_step,
+				init=(grads, metrics),
+				xs=jnp.arange(minibatch_size),
+				length=minibatch_size,
+			)
+		else:
+			for minibatch_idx in range(minibatch_size):
+				(grads, metrics), _ = _scan_step((grads, metrics), minibatch_idx)
+		if minibatch_size != 1:
+			grads = jax.tree_map(lambda g: g / minibatch_size, grads)
+			metrics = jax.tree_map(lambda m: m / minibatch_size, metrics)
 
 		state = state.apply_gradients(grads=grads)
 

@@ -32,7 +32,7 @@ def main():
 	sharding_axis_dims = (1, 1, 1, -1)
 	max_length = 4096
 
-	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
+	pretrained_model_name_or_path = "Qwen/Qwen2.5-7B-Instruct"
 	# pretrained_model_name_or_path = "AntonV/mamba2-370m-hf"
 
 	partition_axis = ed.PartitionAxis()
@@ -55,7 +55,7 @@ def main():
 		),
 		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 		platform=ed.EasyDeLPlatforms.TRITON,
-		param_dtype=dtype,
+		param_dtype=jnp.float8_e5m2,
 		dtype=dtype,
 		torch_dtype=torch.float16,
 		partition_axis=partition_axis,
@@ -66,7 +66,7 @@ def main():
 	tokenizer.padding_side = "left"
 	tokenizer.pad_token_id = tokenizer.eos_token_id
 	model.eval()
-	model = model.quantize()
+	# model = model.quantize(
 	# 	method=ed.EasyDeLQuantizationMethods.A8BIT,
 	# 	block_size=128,
 	# 	quantization_pattern=".*(gate_proj|up_proj).*",

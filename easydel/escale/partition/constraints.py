@@ -39,13 +39,13 @@ def make_shard_and_gather_fns(
 	designed for use with Flax's `jax.tree_util.tree_map`.
 
 	Args:
-	    partition_specs: A dictionary mapping parameter names to their respective `PartitionSpec`.
-	    mesh: The JAX mesh to use for sharding. If None, the current mesh is used.
+		partition_specs: A dictionary mapping parameter names to their respective `PartitionSpec`.
+		mesh: The JAX mesh to use for sharding. If None, the current mesh is used.
 
 	Returns:
-	    A tuple containing two dictionaries:
-	        - `shard_fns`: A dictionary mapping parameter names to their corresponding shard functions.
-	        - `gather_fns`: A dictionary mapping parameter names to their corresponding gather functions.
+		A tuple containing two dictionaries:
+			- `shard_fns`: A dictionary mapping parameter names to their corresponding shard functions.
+			- `gather_fns`: A dictionary mapping parameter names to their corresponding gather functions.
 	"""
 	if mesh is None:
 		mesh = jax.interpreters.pxla.thread_resources.env.physical_mesh
@@ -55,7 +55,8 @@ def make_shard_and_gather_fns(
 		)
 
 	named_shardings = jax.tree_util.tree_map(
-		lambda p: NamedSharding(mesh=mesh, spec=p), partition_specs
+		lambda p: NamedSharding(mesh=mesh, spec=p),
+		partition_specs,
 	)
 
 	def make_shard_fn(partition_spec: NamedSharding) -> tp.Callable:
@@ -63,7 +64,9 @@ def make_shard_and_gather_fns(
 		Create a shard function for a specific partition spec.
 		"""
 		jax_shard_function = jax.jit(
-			lambda x: x, in_shardings=None, out_shardings=partition_spec
+			lambda x: x,
+			in_shardings=None,
+			out_shardings=partition_spec,
 		)
 
 		def shard_fn(tensor: jnp.ndarray) -> jnp.ndarray:
@@ -101,10 +104,10 @@ def get_names_from_partition_spec(
 	dictionary and extracts all unique axis names used in the sharding specifications.
 
 	Args:
-	    partition_specs: A dictionary mapping parameter names to their respective `PartitionSpec`.
+		partition_specs: A dictionary mapping parameter names to their respective `PartitionSpec`.
 
 	Returns:
-	    A list of unique axis names used in the partition specs.
+		A list of unique axis names used in the partition specs.
 	"""
 	names = set()
 	if isinstance(partition_specs, dict):
@@ -130,11 +133,11 @@ def with_sharding_constraint(
 	present in the current JAX mesh.
 
 	Args:
-	    x: The JAX array to apply sharding constraints to.
-	    partition_specs: A dictionary mapping parameter names to their respective `PartitionSpec`.
+		x: The JAX array to apply sharding constraints to.
+		partition_specs: A dictionary mapping parameter names to their respective `PartitionSpec`.
 
 	Returns:
-	    The JAX array with sharding constraints applied (if applicable).
+		The JAX array with sharding constraints applied (if applicable).
 	"""
 	axis_names = get_names_from_partition_spec(partition_specs)
 	if names_in_current_mesh(*axis_names):
@@ -154,14 +157,14 @@ def match_partition_rules(
 	based on their names. It's useful for automatically defining sharding strategies.
 
 	Args:
-	    rules: A list of tuples, where each tuple contains:
-	           - A regular expression to match parameter names.
-	           - A `PartitionSpec` to apply if the name matches.
-	    tree: A dictionary of parameters, where keys are parameter names.
+		rules: A list of tuples, where each tuple contains:
+				 - A regular expression to match parameter names.
+				 - A `PartitionSpec` to apply if the name matches.
+		tree: A dictionary of parameters, where keys are parameter names.
 
 	Returns:
-	    A dictionary with the same keys as `tree`, but values are replaced
-	    with the corresponding `PartitionSpec` based on matching rules.
+		A dictionary with the same keys as `tree`, but values are replaced
+		with the corresponding `PartitionSpec` based on matching rules.
 	"""
 
 	def get_partition_spec(name: str, leaf: jnp.ndarray) -> PartitionSpec:
@@ -187,9 +190,9 @@ def match_partition_rules(
 
 def analyze_sharding_strategy(
 	pytree: tp.Any,
-	partition_specs: dict[str, PartitionSpec],
+	partition_specs: tp.Dict[str, PartitionSpec],
 	mesh: tp.Optional[Mesh] = None,
-) -> dict:
+) -> tp.Dict:
 	"""
 	Analyzes the effectiveness of a sharding strategy.
 
@@ -239,9 +242,9 @@ def create_pattern_based_partition_spec(
 	Creates a function that returns PartitionSpec based on parameter name patterns.
 
 	Example:
-	    pattern_fn = create_pattern_based_partition_spec(
-	        "attention|mlp->data,hidden->model"
-	    )
+		pattern_fn = create_pattern_based_partition_spec(
+			"attention|mlp->data,hidden->model"
+		)
 	"""
 	if default_spec is None:
 		default_spec = PartitionSpec()
@@ -278,26 +281,26 @@ class PartitionAxis(tp.NamedTuple):
 	* None: The axis is not partitioned.
 	* str: The name of the single mesh dimension across which the axis is partitioned.
 	* Tuple[str, ...]: A tuple of mesh dimension names, indicating a sharding strategy
-	  where the axis is split across multiple mesh dimensions.
+		where the axis is split across multiple mesh dimensions.
 
 	Attributes:
-	    batch_axis: Partitioning strategy for the batch dimension. Defaults to ("fsdp", "dp").
-	    sequence_axis: Partitioning strategy for the sequence dimension. Defaults to "sp".
-	    query_sequence_axis: Partitioning strategy for the query sequence dimension. Defaults to "sp".
-	    head_axis: Partitioning strategy for the attention head dimension. Defaults to "tp".
-	    key_sequence_axis: Partitioning strategy for the key sequence dimension. Defaults to "sp".
-	    hidden_state_axis: Partitioning strategy for the hidden state dimension. Defaults to "tp".
-	    attention_dim_axis: Partitioning strategy for the attention dimension. Defaults to None.
-	    bias_head_sequence_axis: Partitioning strategy for the bias head sequence dimension. Defaults to None.
-	    bias_key_sequence_axis: Partitioning strategy for the bias key sequence dimension. Defaults to None.
-	    generation_query_sequence_axis: Partitioning strategy for the query sequence dimension during generation.
-	        Defaults to None.
-	    generation_head_axis: Partitioning strategy for the attention head dimension during generation.
-	        Defaults to "tp".
-	    generation_key_sequence_axis: Partitioning strategy for the key sequence dimension during generation.
-	        Defaults to "sp".
-	    generation_attention_dim_axis: Partitioning strategy for the attention dimension during generation.
-	        Defaults to None.
+		batch_axis: Partitioning strategy for the batch dimension. Defaults to ("fsdp", "dp").
+		sequence_axis: Partitioning strategy for the sequence dimension. Defaults to "sp".
+		query_sequence_axis: Partitioning strategy for the query sequence dimension. Defaults to "sp".
+		head_axis: Partitioning strategy for the attention head dimension. Defaults to "tp".
+		key_sequence_axis: Partitioning strategy for the key sequence dimension. Defaults to "sp".
+		hidden_state_axis: Partitioning strategy for the hidden state dimension. Defaults to "tp".
+		attention_dim_axis: Partitioning strategy for the attention dimension. Defaults to None.
+		bias_head_sequence_axis: Partitioning strategy for the bias head sequence dimension. Defaults to None.
+		bias_key_sequence_axis: Partitioning strategy for the bias key sequence dimension. Defaults to None.
+		generation_query_sequence_axis: Partitioning strategy for the query sequence dimension during generation.
+			Defaults to None.
+		generation_head_axis: Partitioning strategy for the attention head dimension during generation.
+			Defaults to "tp".
+		generation_key_sequence_axis: Partitioning strategy for the key sequence dimension during generation.
+			Defaults to "sp".
+		generation_attention_dim_axis: Partitioning strategy for the attention dimension during generation.
+			Defaults to None.
 	"""
 
 	batch_axis: AxisType = ("fsdp", "dp")

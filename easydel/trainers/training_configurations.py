@@ -57,59 +57,60 @@ AVAILABLE_BACKENDS: tp.List[str] = ["cpu", "gpu", "tpu", None]
 
 @dataclass
 class TrainingArguments:
-	model_name: str = "EasyDeL-Model"
-	num_train_epochs: int = 10
-	total_batch_size: int = 32
-	eval_batch_size: tp.Optional[int] = None
-	max_training_steps: tp.Optional[int] = None
-	max_evaluation_steps: tp.Optional[int] = None
-	optimizer: AVAILABLE_OPTIMIZERS = EasyDeLOptimizers.ADAMW
-	scheduler: AVAILABLE_SCHEDULERS = EasyDeLSchedulers.NONE
-	learning_rate: float = 5e-5
-	learning_rate_end: tp.Optional[float] = None
-	gradient_accumulation_steps: int = 1
-	clip_grad: tp.Optional[float] = None
-	weight_decay: float = 0.01
-	loss_config: tp.Optional[LossConfig] = None
-	frozen_parameters: tp.Optional[str] = None
-	max_sequence_length: tp.Optional[int] = 4096
-	is_fine_tuning: bool = True
-	do_train: bool = True
-	do_eval: bool = False
-	train_on_inputs: bool = True
 	backend: tp.Optional[str] = None
-	extra_optimizer_kwargs: dict = field(default_factory=dict)
-	evaluation_steps: tp.Optional[int] = None
-	save_steps: tp.Optional[int] = None
-	save_directory: str = "EasyDeL-Checkpoints"
-	save_total_limit: tp.Optional[int] = None
-	use_wandb: bool = True
-	ids_to_pop_from_dataset: tp.Optional[list] = field(default_factory=list)
-	remove_ckpt_after_load: bool = False
-	do_last_save: bool = True
-	model_parameters: tp.Optional[dict] = None
-	track_memory: tp.Optional[bool] = None
-	use_data_collactor: bool = True
-	truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end"
-	warmup_steps: int = 500
-	step_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp")
-	training_time: tp.Optional[str] = None
+	clip_grad: tp.Optional[float] = None
 	dataloader_num_workers: tp.Optional[int] = 0
 	dataloader_pin_memory: tp.Optional[bool] = False
+	do_eval: bool = False
+	do_last_save: bool = True
+	do_train: bool = True
+	eval_batch_size: tp.Optional[int] = None
+	evaluation_steps: tp.Optional[int] = None
+	extra_optimizer_kwargs: dict = field(default_factory=dict)
+	frozen_parameters: tp.Optional[str] = None
+	gradient_accumulation_steps: int = 1
+	ids_to_pop_from_dataset: tp.Optional[list] = field(default_factory=list)
+	is_fine_tuning: bool = True
 	jax_distributed_config: tp.Optional[dict] = None
+	learning_rate: float = 5e-5
+	learning_rate_end: tp.Optional[float] = None
 	log_all_workers: bool = False
-	wandb_entity: tp.Optional[str] = None
-	save_optimizer_state: bool = False
-	step_start_point: tp.Optional[int] = None
-	verbose: bool = True
+	log_grad_norms: bool = True
+	loss_config: tp.Optional[LossConfig] = None
+	max_evaluation_steps: tp.Optional[int] = None
+	max_sequence_length: tp.Optional[int] = 4096
+	max_training_steps: tp.Optional[int] = None
+	model_name: str = "EasyDeL-Model"
+	model_parameters: tp.Optional[dict] = None
+	num_train_epochs: int = 10
 	offload_device: jax.Device = jax.devices("cpu")[0]
+	optimizer: AVAILABLE_OPTIMIZERS = EasyDeLOptimizers.ADAMW
+	performance_mode: bool = False
 	pruning_module: AVAILABLE_PRUNING_TYPE = None
+	remove_ckpt_after_load: bool = False
+	remove_unused_columns: bool = True
+	save_directory: str = "EasyDeL-Checkpoints"
+	save_optimizer_state: bool = False
+	save_steps: tp.Optional[int] = None
+	save_total_limit: tp.Optional[int] = None
+	scheduler: AVAILABLE_SCHEDULERS = EasyDeLSchedulers.NONE
 	sparsify_module: bool = False
 	sparse_module_type: AVAILABLE_SPARSE_MODULE_TYPES = "bcoo"
 	state_apply_fn_kwarguments_to_model: tp.Optional[dict] = None
-	remove_unused_columns: bool = True
-	performance_mode: bool = False
-	log_grad_norms: bool = True
+	step_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp")
+	step_start_point: tp.Optional[int] = None
+	total_batch_size: int = 32
+	training_time: tp.Optional[str] = None
+	train_on_inputs: bool = True
+	truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end"
+	tx_mu_dtype: tp.Optional[jnp.dtype] = None
+	track_memory: bool = False
+	use_data_collactor: bool = True
+	use_wandb: bool = True
+	verbose: bool = True
+	wandb_entity: tp.Optional[str] = None
+	warmup_steps: int = 500
+	weight_decay: float = 0.01
 
 	def __post_init__(self):
 		"""
@@ -166,6 +167,7 @@ class TrainingArguments:
 			"gradient_accumulation_steps": self.gradient_accumulation_steps,
 			"weight_decay": self.weight_decay,
 			"steps": self.max_training_steps,
+			"mu_dtype": self.tx_mu_dtype,
 			**extra_optimizer_kwargs,
 		}
 

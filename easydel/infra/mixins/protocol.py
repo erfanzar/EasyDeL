@@ -717,6 +717,49 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		"""generates a pure transform function for converting torch to easydel module."""
 		...
 
+	@property
+	@abstractmethod
+	def params_sharding(self) -> tp.Dict:
+		"""return the sharding of the model parameters"""
+		...
+
+	@abstractmethod
+	def merge_params(self, tree):
+		"""merge state to the current model"""
+		...
+
+	@abstractmethod
+	def split_params(self):
+		"""split the model parameters"""
+		...
+
+	@abstractmethod
+	def split_params_dict(
+		self,
+		extract_fn: tp.Optional[tp.Callable] = None,
+		remove_none: bool = True,
+	) -> tp.Dict:
+		"""Splits the model parameters and returns them as a dictionary, removing `VariableState` from the tree.
+
+		Args:
+			extract_fn (tp.Optional[tp.Callable], optional): Function to extract values from the parameters.
+			remove_none (bool, optional): Whether to remove `None` values from the dictionary.
+
+		Returns:
+			tp.Dict: The dictionary of split parameters.
+		"""
+
+	@abstractmethod
+	def merge_params_dict(self, params_dict: tp.Dict):
+		"""Merges the model parameters from a dictionary into the current model.
+
+		Args:
+			params_dict (tp.Dict): A dictionary containing the parameters to merge.
+
+		Returns:
+			EasyDeLBaseModule: The model with merged parameters.
+		"""
+
 	def __repr__(self):
 		try:
 			return "EasyDeL-" + prettify_nnx(self)

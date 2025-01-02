@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+from functools import partial
 import os
 import pathlib
 import typing as tp
@@ -22,14 +23,13 @@ import optax
 from flax import nnx as nn
 from flax import struct
 
-from easydel.utils.helpers import get_logger
+from easydel.utils.traversals import specs_to_name_sharding
 
 if tp.TYPE_CHECKING:
 	from .base_module import EasyDeLBaseModule
 else:
 	EasyDeLBaseModule = tp.Any
 
-logger = get_logger(__name__)
 WEIGHTS_NAME = "easydel-model.parameters"
 OPTIMIZER_NAME = "easydel-optstate.parameters"
 
@@ -153,12 +153,123 @@ class EasyDeLState(struct.PyTreeNode):
 			opt_state=opt_state,
 		)
 
+	def init_tx(
+		self,
+		tx: optax.GradientTransformation,
+		partition_rules: tp.Optional[tp.Any] = None,
+	) -> EasyDeLState:
+		"""
+		Initialize the optimizer state with the given gradient transformation.
+
+		Args:
+			tx (optax.GradientTransformation): A gradient transformation to initialize the optimizer state.
+			partition_rules (Optional[Any], optional): Rules for partitioning the optimizer state. Defaults to None.
+
+		Returns:
+			EasyDeLState: An updated EasyDeLState object with the new gradient transformation and sharded optimizer state.
+		"""
+
+		if partition_rules is None:
+			partition_rules = self.model.config.get_partition_rules()
+
+		from easydel.escale import match_partition_rules
+
+		eval_opt_state = jax.eval_shape(lambda: tx.init(self.graphstate))
+		partition_specs = match_partition_rules(partition_rules, eval_opt_state)
+		named_shardings = specs_to_name_sharding(partition_specs, self.model.mesh)
+
+		@partial(jax.jit, out_shardings=named_shardings)
+		def make():
+			return tx.init(self.graphstate)
+
+		opt_state = make()
+		return self.replace(tx=tx, opt_state=opt_state)
+
+	def shard_optimizer_state(
+		self,
+		opt_state: tp.Optional[tp.Any] = None,
+		partition_rules: tp.Optional[tp.Any] = None,
+	) -> tp.Any:
+		"""
+		Shards the optimizer state according to the provided partition rules.
+
+		Args:
+			opt_state (Optional[Any]): The optimizer state to be sharded. If None, the method will use `self.opt_state`.
+																Raises a ValueError if both `opt_state` and `self.opt_state` are None.
+			partition_rules (Optional[Any]): The partition rules to be used for sharding. If None, the method will use
+																			the partition rules from `self.model.config`.
+
+		Returns:
+			Any: The sharded optimizer state.
+
+		Raises:
+			ValueError: If both `opt_state` and `self.opt_state` are None.
+		"""
+		if opt_state is None and self.opt_state is None:
+			raise ValueError("Optimizer state is not initialized.")
+		if opt_state is None:
+			opt_state = self.opt_state
+		if partition_rules is None:
+			partition_rules = self.model.config.get_partition_rules()
+
+		from easydel.escale import match_partition_rules, make_shard_and_gather_fns
+
+		partition_specs = match_partition_rules(partition_rules, opt_state)
+		shard_fns, _ = make_shard_and_gather_fns(partition_specs)
+		opt_state = jax.tree_util.tree_map(
+			lambda f, o: f(o),
+			shard_fns,
+			opt_state,
+		)
+		return self.replace(opt_state=opt_state)
+
+	def gather_optimizer_state(self, partition_rules=None):
+		assert self.opt_state is not None, "Optimizer state is not initialized."
+		if partition_rules is None:
+			partition_rules = self.model.config.get_partition_rules()
+
+		from easydel.escale import match_partition_rules, make_shard_and_gather_fns
+
+		partition_specs = match_partition_rules(partition_rules, self.opt_state)
+		_, gather = make_shard_and_gather_fns(partition_specs)
+		self = self.replace(
+			opt_state=jax.tree_util.tree_map(
+				lambda f, o: f(o),
+				gather,
+				self.opt_state,
+			)
+		)
+		return self
+
 	def merge(self, tree) -> EasyDeLBaseModule:
 		return nn.merge(self.graphdef, tree, self.graphother)
 
 	@property
 	def model(self) -> EasyDeLBaseModule:
 		return nn.merge(self.graphdef, self.graphstate, self.graphother)
+
+	@property
+	def size(self) -> int:
+		"""
+		Calculates the total size of the optimizer state and model graph state.
+
+		Returns:
+		    int: The total size in bytes.
+		"""
+
+		def calculate_size(pytree):
+			if pytree is None:
+				return 0
+			leaves, _ = jax.tree_util.tree_flatten(pytree)
+			return sum(
+				leaf.size * leaf.itemsize
+				for leaf in leaves
+				if isinstance(leaf, jax.numpy.ndarray)
+			)
+
+		opt_state_size = calculate_size(self.opt_state)
+		graphstate_size = calculate_size(self.graphstate)
+		return opt_state_size + graphstate_size
 
 	def save_state(
 		self,
