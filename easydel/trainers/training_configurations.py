@@ -290,15 +290,14 @@ class TrainingArguments:
 			)
 			return None
 
-		if not self.log_all_workers and jax.process_index() != 0:
-			return None
-
-		return wandb.init(
-			project=f"EasyDeL-{self.model_name}",
-			config=self.to_dict(),
-			tags=["EasyDeL", "Jax/Flax"],
-			entity=self.wandb_entity,
-		)
+		if jax.process_index() == 0 or self.log_all_workers:
+			return wandb.init(
+				project=f"EasyDeL-{self.model_name}",
+				config=self.to_dict(),
+				tags=["EasyDeL", "Jax/Flax"],
+				entity=self.wandb_entity,
+			)
+		return None
 
 	def ensure_training_time(self, time_passed):
 		if self.training_time is not None and time_passed > self._time_to_seconds(
@@ -329,7 +328,7 @@ class TrainingArguments:
 		        A dictionary where keys are metric names and values are metric values.
 		    step (int): The current training step or iteration.
 		"""
-		if jax.process_index() != 0 and not self.log_all_workers:
+		if jax.process_index() == 0 or self.log_all_workers:
 
 			def restructure_metric_name(metric_name):
 				if metric_name.startswith("train/grad_norm/"):

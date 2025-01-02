@@ -8,9 +8,9 @@ sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import easydel as ed
 
 MODEL_REPO_ID = "meta-llama/Llama-3.2-3B-Instruct"
-MAX_LENGTH = 4096
+MAX_LENGTH = 2048
 MAX_TRAINING_STEPS = 10_000
-SHARDING_AXIS_DIMS = (1, 1, 1, -1)
+SHARDING_AXIS_DIMS = (1, -1, 1, 1)
 
 DTYPE = jnp.bfloat16
 PARAM_DTYPE = jnp.bfloat16
@@ -37,8 +37,7 @@ TRAIN_ARGUMENTS = ed.TrainingArguments(
 	weight_decay=0.02,
 	total_batch_size=BATCH_SIZE,
 	max_sequence_length=MAX_LENGTH,
-	gradient_accumulation_steps=GRAD_ACCUMULATION_STEPS,
-	track_memory=False,
+	gradient_accumulation_steps=GRAD_ACCUMULATION_STEPS, 
 	do_last_save=False,
 	# max_training_steps=MAX_TRAINING_STEPS,
 	# use_wandb=True,

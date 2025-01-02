@@ -58,7 +58,7 @@ def get_optimizer_and_scheduler(
 		A tuple of two objects: (Optimizer and scheduler)
 	"""
 	optimizer_kwargs = {
-		"learning_rate_start": learning_rate,
+		"learning_rate": learning_rate,
 		"learning_rate_end": learning_rate_end,
 		"steps": steps,
 		"gradient_accumulation_steps": gradient_accumulation_steps,
