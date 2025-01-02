@@ -21,6 +21,8 @@ import jax
 import jax.numpy as jnp
 from flax import nnx, struct
 from flax.nnx import traversals
+from jax.interpreters import pxla
+from jax.sharding import Mesh, NamedSharding
 
 from easydel.utils.helpers import get_logger
 
@@ -540,3 +542,20 @@ def merge_model_and_tree(model: M, tree: dict) -> M:
 	graphdef, graphstate = nnx.split(model)
 	graphstate = merge_state_and_tree(tree=tree, state=graphstate)
 	return nnx.merge(graphdef, graphstate)
+
+
+def specs_to_name_sharding(tree: tp.Dict, mesh: tp.Optional[Mesh] = None) -> tp.Dict:
+	"""
+	Converts a dictionary of specifications to a dictionary of NamedSharding objects.
+
+	Args:
+		tree (Dict): A dictionary where the keys are names and the values are specifications.
+		mesh (Optional[Mesh]): An optional Mesh object. If not provided, the default physical mesh from
+								 pxla.thread_resources.env.physical_mesh is used.
+
+	Returns:
+		Dict: A dictionary where the keys are the same as the input dictionary, and the values are NamedSharding
+				objects created from the specifications and the provided or default mesh.
+	"""
+	mesh = mesh or pxla.thread_resources.env.physical_mesh
+	return jax.tree_util.tree_map(lambda spec: NamedSharding(spec=spec, mesh=mesh), tree)

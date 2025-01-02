@@ -29,7 +29,7 @@ from jax.sharding import Mesh
 
 from easydel.escale import make_shard_and_gather_fns, match_partition_rules
 from easydel.utils.helpers import get_logger
-from easydel.utils.traversals import flatten_dict, unflatten_dict
+from easydel.utils.traversals import flatten_dict, is_flatten, unflatten_dict
 
 from .base_config import EasyDeLBaseConfig
 from .etils import EasyDeLQuantizationMethods
@@ -426,6 +426,70 @@ class EasyDeLBaseModule(
 			dtype=self.param_dtype,
 			shard_fns=self._shard_fns,
 		)
+
+	@property
+	def params_sharding(self) -> tp.Dict:
+		return jax.tree_util.tree_map(
+			lambda x: x.sharding if hasattr(x, "sharding") else None,
+			self.split_params_dict(),
+		)
+
+	def merge_params(self, tree):
+		"""merge state to the current model"""
+		gdef, _, gother = nn.split(self, nn.Param, ...)
+		self = nn.merge(gdef, tree, gother)
+		return self
+
+	def split_params(self):
+		"""split the model parameters"""
+		return nn.split(self, nn.Param, ...)[1]
+
+	def split_params_dict(
+		self,
+		extract_fn: tp.Optional[tp.Callable] = None,
+		remove_none: bool = True,
+	) -> tp.Dict:
+		"""Splits the model parameters and returns them as a dictionary, removing `VariableState` from the tree.
+
+		Args:
+			extract_fn (tp.Optional[tp.Callable], optional): Function to extract values from the parameters.
+			remove_none (bool, optional): Whether to remove `None` values from the dictionary.
+
+		Returns:
+			tp.Dict: The dictionary of split parameters.
+		"""
+		flat_params = flatten_dict(self.split_params().to_pure_dict(extract_fn=extract_fn))
+		if remove_none:
+			flat_params = {
+				k: v.value if hasattr(v, "value") else v
+				for k, v in flat_params.items()
+				if (v.value if hasattr(v, "value") else v) is not None
+			}
+		else:
+			flat_params = {
+				k: v.value if hasattr(v, "value") else v for k, v in flat_params.items()
+			}
+		return unflatten_dict(flat_params)
+
+	def merge_params_dict(self, params_dict: tp.Dict) -> EasyDeLBaseModule:
+		"""Merges the model parameters from a dictionary into the current model.
+
+		Args:
+			params_dict (tp.Dict): A dictionary containing the parameters to merge.
+
+		Returns:
+			EasyDeLBaseModule: The model with merged parameters.
+		"""
+		current_state = self.split_params().flat_state()
+		if not is_flatten(params_dict):
+			params_dict = flatten_dict(params_dict)
+		for key, value in params_dict.items():
+			if key in current_state:
+				current_state[key].value = value
+			else:
+				raise KeyError(f"Parameter key {key} not found in the current model state.")
+		self = self.merge_params(unflatten_dict(current_state))
+		return self
 
 	@property
 	def pure_transform_fn(self):

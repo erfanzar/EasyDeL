@@ -17,13 +17,13 @@ import os
 import pprint
 import shutil
 import typing as tp
-import warnings
 from abc import abstractmethod
 from glob import glob
 from pathlib import Path
 
 import flax
 import flax.core
+import flax.nnx
 import jax
 import numpy as np
 import termcolor
@@ -33,6 +33,7 @@ from flax.core import unfreeze
 import easydel
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLTimerError
+from easydel.utils.traversals import specs_to_name_sharding
 
 try:
 	import wandb  # noqa: F821 # type:ignore
@@ -69,34 +70,38 @@ class BaseTrainer(BaseTrainerProtocol):
 	def __init__(
 		self,
 		arguments: tp.Optional[TrainingArguments] = None,
-		model: tp.Optional[EasyDeLBaseModule] = None,
+		model_state: tp.Optional[EasyDeLState] = None,
+		model: tp.type[EasyDeLBaseModule] = None,
 		dataset_train: tp.Optional[Dataset] = None,
 		dataset_eval: tp.Optional[Dataset] = None,
 		finetune: bool = True,
 		checkpoint_path: tp.Optional[tp.Union[str, os.PathLike]] = None,
-		_do_init_fns: bool = True,
+		**deprecated_kwargs,
 	):
 		assert arguments is not None, "training argument must be passed to Trainers."
-		assert model is not None, "Model can not be None and it must be passed to Trainers."
+		if model_state is not None and model is not None:
+			raise ValueError("Either model or model_state should be passed, not both.")
+		elif model_state is None and model is None:
+			raise ValueError("Either model or model_state should be passed.")
+		elif model_state is None:
+			model_state = model.to_state()
+
 		self.arguments = arguments
+		self.model_state = model_state
+		self._model = flax.nnx.eval_shape(lambda: self.model_state.model)
 		self.dataset_train = dataset_train
 		self.dataset_eval = dataset_eval
 		self.finetune = finetune
 		self.checkpoint_path = checkpoint_path
 		self._initialize_attributes()
-		self.model = model
-
-		if _do_init_fns:
-			self.initialize_trainer_utils()
-		else:
-			warnings.warn(
-				"You have set `_do_init_fns = False`. Functions will not be initialized automatically. "
-				"Call `trainer.initialize_trainer_utils()` manually.",
-				stacklevel=2,
-			)
+		self.initialize_trainer_utils()
 
 		if self.arguments.track_memory:
 			self._initialize_memory_tracking()
+
+	@property
+	def model(self):
+		return self._model
 
 	def _initialize_attributes(self):
 		# Initialize all attributes with default values
@@ -106,26 +111,33 @@ class BaseTrainer(BaseTrainerProtocol):
 		self.dataloader_eval = getattr(self, "dataloader_eval", None)
 		self.max_training_steps = getattr(self, "max_training_steps", None)
 		self.max_evaluation_steps = getattr(self, "max_evaluation_steps", None)
-		self.model = getattr(self, "model", None)
-		self.config = getattr(self, "config", None)
+
 		self.scheduler = getattr(self, "scheduler", None)
 		self.tx = getattr(self, "tx", None)
-		self.model_state = getattr(self, "model_state", None)
-		self.create_state_sharded = getattr(self, "create_state_sharded", None)
-		self.sharded_training_step_function = getattr(
-			self, "sharded_training_step_function", None
-		)
-		self.sharded_evaluation_step_function = getattr(
-			self, "sharded_evaluation_step_function", None
-		)
+
 		self.mesh = getattr(self, "mesh", None)
 		self.checkpoint_manager = getattr(self, "checkpoint_manager", None)
-		self.state_shape = getattr(self, "state_shape", None)
 		self.state_partition_spec = getattr(self, "state_partition_spec", None)
 		self.state_named_sharding = getattr(self, "state_named_sharding", None)
-		self.state = getattr(self, "state", None)
 		self.pruning_module = getattr(self.arguments, "pruning_module", None)
 		self.memory_monitor = getattr(self.arguments, "memory_monitor", None)
+
+		self._model = getattr(self, "_model", None)
+		self.config = getattr(self, "config", None)
+
+		self.state_shape = getattr(self, "state_shape", None)
+		self.model_state = getattr(self, "model_state", None)
+
+		self.sharded_training_step_function = getattr(
+			self,
+			"sharded_training_step_function",
+			None,
+		)
+		self.sharded_evaluation_step_function = getattr(
+			self,
+			"sharded_evaluation_step_function",
+			None,
+		)
 
 	def _initialize_memory_tracking(self):
 		if not self.arguments.performance_mode:
@@ -153,8 +165,8 @@ class BaseTrainer(BaseTrainerProtocol):
 		self._initialize_timer()
 		self._configure_dataloaders()
 		self._configure_model()
-		self._configure_functions()
 		self._configure_state()
+		self._configure_functions()
 
 	def _initialize_wandb(self):
 		if self.arguments.use_wandb:
@@ -192,7 +204,7 @@ class BaseTrainer(BaseTrainerProtocol):
 		"""
 		with self.timer("configure Model, Optimizer, Scheduler and Config"):
 			model_configurations = self.configure_model()
-			self.model = model_configurations.model
+			self._model = model_configurations.model
 			self.tx = model_configurations.tx
 			self.scheduler = model_configurations.scheduler
 			self.config = model_configurations.config
@@ -208,22 +220,18 @@ class BaseTrainer(BaseTrainerProtocol):
 		function, and logs the time taken for this configuration.
 		"""
 		with self.timer("configure functions and sharding them"):
-			function_configurations = self.configure_functions()
-			self.create_state_sharded = function_configurations.create_state_sharded
-			self.sharded_training_step_function = (
-				function_configurations.sharded_training_step_function
-			)
-			self.sharded_evaluation_step_function = (
-				function_configurations.sharded_evaluation_step_function
-			)
-			self.mesh = function_configurations.mesh
-			self.checkpoint_manager = function_configurations.checkpoint_manager
+			functions = self.configure_functions()
+			self.sharded_training_step_function = functions.sharded_training_step_function
+			self.sharded_evaluation_step_function = functions.sharded_evaluation_step_function
+			self.mesh = functions.mesh
+			self.checkpoint_manager = functions.checkpoint_manager
 		self.timer.log("configure functions and sharding them")
 
 	def _configure_state(self):
 		"""Configures and JIT-compiles the sharded state"""
 		with self.timer("configure sharded state"):
-			self.state = self.create_state_sharded()
+			with self.model.mesh:
+				self.model_state = self.model_state.init_tx(self.tx)
 		self.timer.log("configure sharded state")
 
 	@abstractmethod
@@ -698,10 +706,7 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 
 	def specs_to_name_sharding(self, tree, mesh=None):
 		mesh = mesh or self.mesh or self.model.mesh
-		return jax.tree_util.tree_map(
-			lambda spec: jax.sharding.NamedSharding(spec=spec, mesh=mesh),
-			tree,
-		)
+		return specs_to_name_sharding(tree, mesh)
 
 	def calculate_number_total_flops_per_device(self, params):
 		return (

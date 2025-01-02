@@ -1,20 +1,19 @@
 import os
 import sys
 
-
 # Local imports (assuming easydel is in parent directory or installed)
 dirname = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(dirname, "..", ".."))
 
-import easydel as ed
-import flax
-
 import logging
-import jax
+from functools import partial
+
+import fjformer
+import flax 
 import jax.numpy as jnp
 from datasets import Dataset, IterableDataset
-import fjformer
-from functools import partial
+
+import easydel as ed
 
 # Configure logging
 logging.basicConfig(
@@ -70,7 +69,7 @@ def create_model(sequence_length=SEQUENCE_LENGTH, dtype=jnp.float32):
 		rngs=flax.nnx.Rngs(0),
 	)
 
-	model = model.shard_model()
+	model = model.shard_model() 
 	# model = model.quantize()
 	logging.info("Model created.")
 	return model
@@ -145,13 +144,6 @@ def create_training_args(
 
 
 def main(use_iterable_dataset: bool = True):
-	# Device selection (choose GPU if available, else CPU)
-	devices = jax.devices("gpu")
-	if not devices:
-		logging.warning("No GPU found, using CPU.")
-		devices = jax.devices("cpu")
-	jax.default_device(devices[0])
-
 	model = create_model()
 	train_dataset = create_dummy_dataset(
 		NUM_TRAIN_EXAMPLES,

@@ -68,7 +68,7 @@ class DPOTrainer(BaseTrainer):
 	def __init__(
 		self,
 		arguments: DPOConfig,
-		model: EasyDeLBaseModule,
+		model: tp.Union[EasyDeLBaseModule, EasyDeLState],
 		ref_model: tp.Optional[tp.Union[EasyDeLBaseModule, EasyDeLState]] = None,
 		processing_class: tp.Optional[ProcessingClassType] = None,
 		train_dataset: tp.Optional[Dataset] = None,
@@ -167,8 +167,14 @@ class DPOTrainer(BaseTrainer):
 			"processing_class": self.processing_class,
 			"processor": None,
 		}
+		if not isinstance(model, EasyDeLState):
+			model = model.to_state()
+
+		if not isinstance(ref_model, EasyDeLState):
+			ref_model = ref_model.to_state()
+
 		_tokenize = build_tokenize(
-			model=model if arguments.is_encoder_decoder else None,
+			model=model.model if arguments.is_encoder_decoder else None,
 			args=arguments,
 		)
 
@@ -197,12 +203,9 @@ class DPOTrainer(BaseTrainer):
 		self.train_dataset = train_dataset
 		self.eval_dataset = eval_dataset
 		self.processing_class = processing_class
-		if not isinstance(ref_model, EasyDeLState):
-			ref_model = ref_model.to_state()
 		self.ref_model = ref_model
-		self.model = model
 		self._loggers_initialized = False
-		self.mesh = self.model.mesh
+		self.mesh = model.model.mesh
 
 		self.concatenated_forward = jax.jit(
 			create_concatenated_forward(
@@ -218,7 +221,7 @@ class DPOTrainer(BaseTrainer):
 		self._cached_c_l_s = None
 		self._cached_r_l_s = None
 		super().__init__(
-			model=model,
+			model_state=model,
 			arguments=arguments,
 			dataset_train=train_dataset,
 			dataset_eval=eval_dataset,
@@ -267,14 +270,7 @@ class DPOTrainer(BaseTrainer):
 		the `configure_model` method and configures LoRA (if enabled). It also logs
 		the time taken for this configuration.
 		"""
-		with self.timer("configure Model, Optimizer, Scheduler and Config"):
-			model_configurations = self.configure_model()
-			self.model = model_configurations.model
-			self.tx = model_configurations.tx
-			self.scheduler = model_configurations.scheduler
-			self.config = model_configurations.config
-
-		self.timer.log("configure Model, Optimizer, Scheduler and Config")
+		super()._configure_model()
 
 	def _configure_functions(self):
 		"""
@@ -284,16 +280,7 @@ class DPOTrainer(BaseTrainer):
 		method, sets up the mesh, checkpoint manager, and state initialization
 		function, and logs the time taken for this configuration.
 		"""
-		operation_name = "configure functions and sharding them"
-		with self.timer(operation_name):
-			functions = self.configure_functions()
-
-			self.create_state_sharded = functions.create_state_sharded
-			self.sharded_training_step_function = functions.sharded_training_step_function
-			self.sharded_evaluation_step_function = functions.sharded_evaluation_step_function
-			self.mesh = functions.mesh
-			self.checkpoint_manager = functions.checkpoint_manager
-		self.timer.log(operation_name)
+		super()._configure_functions()
 
 	def configure_dataloaders(self) -> TrainerConfigureDataloaderOutput:
 		"""
@@ -363,19 +350,7 @@ class DPOTrainer(BaseTrainer):
 		if self.arguments.sparsify_module:
 			self.model.__call__ = sparse.sparsify(self.model.__call__)
 
-		def create_state():
-			"""
-			Creates an EasyDeLState object.
-			Returns:
-			    EasyDeLState: The EasyDeLState object initialized.
-			"""
-			return EasyDeLState.create(
-				model=self.model,
-				tx=self.tx,
-				init_opt_state=True,
-			)
-
-		state_shape = jax.eval_shape(lambda: create_state())
+		state_shape = jax.eval_shape(lambda: self.model_state)
 		state_partition_spec = match_partition_rules(
 			self.model.config.get_partition_rules(),
 			state_shape,
@@ -386,7 +361,7 @@ class DPOTrainer(BaseTrainer):
 			spec=PartitionSpec(),
 			mesh=self.model.mesh,
 		)
-		create_state_sharded = jax.jit(create_state, out_shardings=spec_named_sharding)
+
 		train_function = create_train_function(
 			concatenated_forward=self.concatenated_forward,
 			ref_state=self.ref_model,
@@ -435,7 +410,6 @@ class DPOTrainer(BaseTrainer):
 		checkpoint_manager = self.arguments.get_streaming_checkpointer()
 		mesh = self.model.mesh
 		return TrainerConfigureFunctionOutput(
-			create_state_sharded=create_state_sharded,
 			sharded_training_step_function=sharded_training_step_function,
 			sharded_evaluation_step_function=sharded_evaluation_step_function,
 			mesh=mesh,
@@ -580,7 +554,7 @@ class DPOTrainer(BaseTrainer):
 			):
 				reference_chosen_logp, reference_rejected_logp = (
 					self.compute_reference_log_probs(
-						self.state,
+						self.model_state,
 						padded_batch,
 					)
 				)
@@ -651,7 +625,7 @@ class DPOTrainer(BaseTrainer):
 				iterable=data_loader, desc="Eval dataset reference log probs"
 			):
 				reference_chosen_logp, reference_rejected_logp = (
-					self.compute_reference_log_probs(self.state, padded_batch)
+					self.compute_reference_log_probs(self.model_state, padded_batch)
 				)
 				reference_chosen_log_probs.append(reference_chosen_logp.cpu())
 				reference_rejected_log_probs.append(reference_rejected_logp.cpu())
@@ -722,7 +696,7 @@ class DPOTrainer(BaseTrainer):
 	):
 		"""Core training loop implementation."""
 		pbar = tqdm(total=self.max_training_steps)
-		current_step = int(jax.device_get(self.state.step))
+		current_step = int(jax.device_get(self.model_state.step))
 		run_exception = None
 		with self.mesh:
 			for epoch in range(self.arguments.num_train_epochs):
@@ -743,7 +717,7 @@ class DPOTrainer(BaseTrainer):
 				if run_exception is not None:
 					break
 		return self._prepare_training_output(
-			state=self.state,
+			state=self.model_state,
 			shard_fns=shard_fns,
 			gather_fns=gather_fns,
 			run_exception=run_exception,
@@ -794,7 +768,7 @@ class DPOTrainer(BaseTrainer):
 					continue
 				step_metrics.start_step()
 			except (KeyboardInterrupt, EasyDeLTimerError, StopIteration) as exect:
-				return self.state, current_step, exect
+				return self.model_state, current_step, exect
 
 			# Execute training step
 			loss, metrics, run_exception = self._execute_train_step(batch)
@@ -829,12 +803,12 @@ class DPOTrainer(BaseTrainer):
 				# Save checkpoint if needed
 				if self._should_save_checkpoint(current_step):
 					_ = self._save_state(
-						state=self.state,
+						state=self.model_state,
 						gather_fns=gather_fns,
 						milestone=True,
 					)
 				if self._should_run_evaluation(current_step):
-					for _ in self.eval(model_state=self.state):
+					for _ in self.eval(model_state=self.model_state):
 						...
 				current_step += 1
 			except (KeyboardInterrupt, EasyDeLTimerError):
@@ -898,29 +872,16 @@ class DPOTrainer(BaseTrainer):
 
 	def _execute_train_step(self, batch):
 		"""Execute a single training step."""
-		if self.pruning_module is not None:
-			self.state = self.state.replace(
-				graphstate=self.pruning_module.pre_forward_update(
-					self.state.graphstate,
-					self.state.opt_state,
-				)
-			)
 
-		# Forward and backward pass
 		try:
 			batch = {key: jnp.asarray(value) for key, value in batch.items()}
 
-			self.state, metrics = self.sharded_training_step_function(self.state, batch)
+			self.model_state, metrics = self.sharded_training_step_function(
+				self.model_state,
+				batch,
+			)
 			# Apply post-gradient updates
 			loss = metrics.loss
-			if self.pruning_module is not None:
-				self.state = self.state.replace(
-					graphstate=self.pruning_module.post_gradient_update(
-						self.state.graphstate,
-						self.state.opt_state,
-					)
-				)
-
 			return loss, metrics, None
 		except (KeyboardInterrupt, EasyDeLTimerError) as run_exception:
 			return loss, metrics, run_exception
@@ -940,7 +901,9 @@ class DPOTrainer(BaseTrainer):
 		start_time = time.time()
 		rules = self.model.config.get_partition_rules()
 		shard_fns, gather_fns = make_shard_and_gather_fns(
-			partition_specs=match_partition_rules(rules, jax.eval_shape(lambda: self.state)),
+			partition_specs=match_partition_rules(
+				rules, jax.eval_shape(lambda: self.model_state)
+			),
 			mesh=self.mesh,
 		)
 
@@ -948,7 +911,7 @@ class DPOTrainer(BaseTrainer):
 		step_metrics = StepMetrics(self.arguments)
 
 		# Setup initial metrics and logging
-		self._setup_initial_metrics(self.state)
+		self._setup_initial_metrics(self.model_state)
 
 		output, run_exception = self._run_training_loop(
 			metrics_tracker=metrics_tracker,

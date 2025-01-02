@@ -9,15 +9,14 @@ import sys
 dirname = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(dirname, "..", ".."))
 
-import easydel as ed
-
-
 import logging
-import jax
-import jax.numpy as jnp
+
 import datasets
 import flax
+import jax.numpy as jnp
 from transformers import AutoTokenizer
+
+import easydel as ed
 
 # Configure logging
 logging.basicConfig(
@@ -118,7 +117,7 @@ def create_dpo_config(
 		gradient_accumulation_steps=1,
 		step_start_point=0,
 		do_last_save=False,
-		training_time="7H", 
+		training_time="7H",
 		track_memory=True,
 		max_length=max_length,
 		max_completion_length=max_completion_length,
@@ -132,15 +131,7 @@ def create_dpo_config(
 
 
 def main():
-	# Device selection (choose GPU if available, else CPU)
-	devices = jax.devices("gpu")
-	if not devices:
-		logging.warning("No GPU found, using CPU.")
-		devices = jax.devices("cpu")
-
-	jax.default_device(devices[0])
-
-	model_name_or_path = "mistralai/Mistral-7B-Instruct-v0.2"
+	model_name_or_path = "meta-llama/Llama-3.2-3B-Instruct"
 	train_dataset, eval_dataset = create_datasets()
 	model, ref_model, tokenizer = create_model_and_tokenizer(model_name_or_path)
 	arguments = create_dpo_config()

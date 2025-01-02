@@ -33,18 +33,18 @@ def auto_partition_spec(
 	Create an optimized PartitionSpec to shard an array across a device mesh.
 
 	Args:
-	    x: The input array to be sharded.
-	    mesh: The device mesh to shard across. If None, uses the current thread's mesh.
-	    names: List of mesh axis names to use for sharding. If None, derives from mesh shape.
-	    min_sharding_size: Minimum size of array to shard. If None, uses mesh device count.
-	    reverse: If True, reverses dimension sorting order for sharding assignment.
+		x: The input array to be sharded.
+		mesh: The device mesh to shard across. If None, uses the current thread's mesh.
+		names: List of mesh axis names to use for sharding. If None, derives from mesh shape.
+		min_sharding_size: Minimum size of array to shard. If None, uses mesh device count.
+		reverse: If True, reverses dimension sorting order for sharding assignment.
 
 	Returns:
-	    PartitionSpec: Optimized sharding specification for the input array.
+		PartitionSpec: Optimized sharding specification for the input array.
 
 	Raises:
-	    ValueError: If mesh is unavailable or invalid names are provided.
-	    TypeError: If input types are incorrect.
+		ValueError: If mesh is unavailable or invalid names are provided.
+		TypeError: If input types are incorrect.
 	"""
 	# Validate input array
 	if not isinstance(x, (chex.Array, np.ndarray)):
@@ -75,7 +75,7 @@ def auto_partition_spec(
 	mesh_sizes = {
 		name: (
 			np.prod([mesh.shape[n] for n in name])
-			if isinstance(name, tuple)
+			if isinstance(name, tp.Tuple)
 			else mesh.shape[name]
 		)
 		for name in names
@@ -121,18 +121,18 @@ def vrn_auto_partition_spec(
 	Create an optimized PartitionSpec to shard an array across a device mesh.
 
 	Args:
-	    x: The input array to be sharded.
-	    mesh: The device mesh to shard across. If None, uses the current thread's mesh.
-	    names: List of mesh axis names to use for sharding. If None, derives from mesh shape.
-	    min_sharding_size: Minimum size of array to shard. If None, uses the product of mesh device shape.
-	    reverse: If True, reverses the sorting order of array dimensions.
+		x: The input array to be sharded.
+		mesh: The device mesh to shard across. If None, uses the current thread's mesh.
+		names: List of mesh axis names to use for sharding. If None, derives from mesh shape.
+		min_sharding_size: Minimum size of array to shard. If None, uses the product of mesh device shape.
+		reverse: If True, reverses the sorting order of array dimensions.
 
 	Returns:
-	    A PartitionSpec describing optimal array sharding.
+		A PartitionSpec describing optimal array sharding.
 
 	Raises:
-	    ValueError: If mesh is unavailable or invalid names are provided.
-	    TypeError: If input types are incorrect.
+		ValueError: If mesh is unavailable or invalid names are provided.
+		TypeError: If input types are incorrect.
 	"""
 	# Input validation
 	if not isinstance(x, (np.ndarray, chex.Array)):
@@ -163,7 +163,7 @@ def vrn_auto_partition_spec(
 	mesh_sizes = {
 		name: (
 			np.prod([mesh.shape[n] for n in name])
-			if isinstance(name, tuple)
+			if isinstance(name, tp.Tuple)
 			else mesh.shape[name]
 		)
 		for name in names
@@ -205,14 +205,14 @@ def auto_shard_array(
 	This function acts as a wrapper around `pjit(x, in_axis_resources=...)`.
 
 	Args:
-	    x: The input array to be sharded.
-	    mesh: The device mesh to shard across. If None, uses the current thread's mesh.
-	    names: List of mesh axis names to use for sharding. If None, derives from mesh shape.
-	    min_sharding_size: Minimum size of array to shard. If None, uses the product of mesh device shape.
-	    reverse: If True, reverses the sorting order of array dimensions.
+		x: The input array to be sharded.
+		mesh: The device mesh to shard across. If None, uses the current thread's mesh.
+		names: List of mesh axis names to use for sharding. If None, derives from mesh shape.
+		min_sharding_size: Minimum size of array to shard. If None, uses the product of mesh device shape.
+		reverse: If True, reverses the sorting order of array dimensions.
 
 	Returns:
-	    The sharded array.
+		The sharded array.
 	"""
 	if mesh is None:
 		mesh = pxla.thread_resources.env.physical_mesh
@@ -242,13 +242,13 @@ def auto_namedsharding(
 	Returns a function that creates a NamedSharding for an array based on the provided parameters.
 
 	Args:
-	    mesh: The device mesh to shard across. If None, uses the current thread's mesh.
-	    names: List of mesh axis names to use for sharding. If None, derives from mesh shape.
-	    min_sharding_size: Minimum size of array to shard. If None, uses the product of mesh device shape.
-	    reverse: If True, reverses the sorting order of array dimensions.
+		mesh: The device mesh to shard across. If None, uses the current thread's mesh.
+		names: List of mesh axis names to use for sharding. If None, derives from mesh shape.
+		min_sharding_size: Minimum size of array to shard. If None, uses the product of mesh device shape.
+		reverse: If True, reverses the sorting order of array dimensions.
 
 	Returns:
-	    A function that takes an array as input and returns a NamedSharding object.
+		A function that takes an array as input and returns a NamedSharding object.
 	"""
 
 	def _named_sharding_fn(x: chex.Array):
@@ -271,7 +271,7 @@ def optimize_sharding_for_memory(
 	mesh: tp.Optional[Mesh] = None,
 	max_memory_per_device: tp.Optional[int] = None,
 	names: tp.Optional[tp.List[str]] = None,
-) -> dict[str, PartitionSpec]:
+) -> tp.Dict[str, PartitionSpec]:
 	"""
 	Optimizes sharding strategy to fit within memory constraints.
 	"""
@@ -324,11 +324,11 @@ def validate_sharding_config(
 
 def convert_sharding_strategy(
 	array: chex.Array,
-	old_partition_specs: dict[str, PartitionSpec],
+	old_partition_specs: tp.Dict[str, PartitionSpec],
 	old_mesh: Mesh,
 	new_mesh: Mesh,
 	strategy: str = "preserve_balance",
-) -> dict[str, PartitionSpec]:
+) -> tp.Dict[str, PartitionSpec]:
 	"""
 	Converts sharding strategy between different mesh configurations.
 	"""

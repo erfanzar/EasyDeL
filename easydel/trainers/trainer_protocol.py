@@ -78,7 +78,6 @@ class TrainerConfigureModelOutput:
 
 @dataclass
 class TrainerConfigureFunctionOutput:
-	create_state_sharded: tp.Callable
 	sharded_training_step_function: tp.Callable
 	mesh: Mesh
 	checkpoint_manager: CheckpointManager
@@ -109,7 +108,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 	dataloader_eval: tp.Optional[tp.Iterator[np.ndarray]]
 	max_training_steps: int
 	max_evaluation_steps: int
-	model: EasyDeLBaseModule
+	_model: EasyDeLBaseModule
 	config: EasyDeLBaseConfig
 	scheduler: optax.Schedule
 	tx: optax.GradientTransformation
@@ -127,7 +126,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 	state: tp.Any
 	pruning_module: tp.Any
 
-	_base_model: tp.Any
+	memory_monitor: tp.Any
 
 	@abstractmethod
 	def __init__(
@@ -145,6 +144,9 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 		"""
 		...
 
+	@property
+	@abstractmethod
+	def model(self): ...
 	@abstractmethod
 	def _initialize_attributes(self):
 		"""
@@ -500,6 +502,21 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 		"""
 		Evaluates using the provided model state.
 		"""
+		...
+
+	@abstractmethod
+	def finish(self):
+		"""Finalize the training process."""
+		...
+
+	@abstractmethod
+	def __repr__(self):
+		"""Return a string representation of the trainer."""
+		...
+
+	@abstractmethod
+	def __str__(self):
+		"""Return a string representation of the trainer."""
 		...
 
 
