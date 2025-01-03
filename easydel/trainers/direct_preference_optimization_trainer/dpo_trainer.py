@@ -20,7 +20,6 @@ from collections import defaultdict
 
 import jax
 from jax import numpy as jnp
-from jax.experimental import sparse
 from jax.sharding import PartitionSpec
 from tqdm.autonotebook import tqdm
 
@@ -347,9 +346,6 @@ class DPOTrainer(BaseTrainer):
 				TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
 		"""
 
-		if self.arguments.sparsify_module:
-			self.model.__call__ = sparse.sparsify(self.model.__call__)
-
 		empty_sharding = jax.sharding.NamedSharding(
 			spec=PartitionSpec(),
 			mesh=self.model.mesh,
@@ -366,14 +362,14 @@ class DPOTrainer(BaseTrainer):
 		sharded_training_step_function = jax.jit(
 			train_function,
 			in_shardings=(
-				self.model_state.shardings,
+				self.state_shardings,
 				jax.sharding.NamedSharding(
 					spec=self.arguments.step_partition_spec,
 					mesh=self.mesh,
 				),
 			),
 			out_shardings=(
-				self.model_state.shardings,
+				self.state_shardings,
 				empty_sharding,
 			),
 		)
@@ -390,7 +386,7 @@ class DPOTrainer(BaseTrainer):
 		sharded_evaluation_step_function = jax.jit(
 			eval_function,
 			in_shardings=(
-				self.model_state.shardings,
+				self.state_shardings,
 				jax.sharding.NamedSharding(
 					spec=self.arguments.step_partition_spec,
 					mesh=self.mesh,
@@ -398,9 +394,7 @@ class DPOTrainer(BaseTrainer):
 			),
 			out_shardings=empty_sharding,
 		)
-
 		self.arguments.ensure_checkpoint_path()
-		self.state_shape = self.model_state.shardings
 		checkpoint_manager = self.arguments.get_streaming_checkpointer()
 		mesh = self.model.mesh
 		return TrainerConfigureFunctionOutput(

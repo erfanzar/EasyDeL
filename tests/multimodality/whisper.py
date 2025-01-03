@@ -2,9 +2,6 @@
 
 # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
 
-# import jax
-
-# jax.config.update("jax_platform_name", "cpu")
 
 from jax import numpy as jnp
 from transformers import (
@@ -24,7 +21,7 @@ def main():
 	)
 	tokenizer = WhisperTokenizer.from_pretrained(REPO_ID)
 	processor = WhisperProcessor.from_pretrained(REPO_ID)
-	model = model.quantize()
+	# model = model.quantize()
 	inference = ed.vWhisperInference(
 		model=model,
 		tokenizer=tokenizer,

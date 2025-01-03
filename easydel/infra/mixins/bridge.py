@@ -538,11 +538,7 @@ class EasyBridgeMixin(PushToHubMixin):
 			verbose,
 			shard_fns,
 		)
-		if auto_shard_model or shard_fns is not None:
-			model = model.shard_model(
-				partition_rules=partition_rules,
-				overlay_fns=shard_fns,
-			)
+
 		if model.can_generate():
 			try:
 				model.generation_config = GenerationConfig.from_pretrained(
@@ -709,11 +705,7 @@ class EasyBridgeMixin(PushToHubMixin):
 			logger.info("converted parameters are flatten making them unflatten ")
 			params = unflatten_dict(params)
 		model = merge_model_and_tree(model=model, tree=params)
-		if auto_shard_model or shard_fns is not None:
-			model = model.shard_model(
-				partition_rules=partition_rules,
-				overlay_fns=shard_fns,
-			)
+
 		if quantization_method is not None:
 			model = quantize_linear_layers(
 				model,

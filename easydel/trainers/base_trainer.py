@@ -28,6 +28,7 @@ import jax
 import numpy as np
 import termcolor
 import tqdm
+from flax import nnx as nn
 from flax.core import unfreeze
 
 import easydel
@@ -123,7 +124,7 @@ class BaseTrainer(BaseTrainerProtocol):
 		self._model = getattr(self, "_model", None)
 		self.config = getattr(self, "config", None)
 
-		self.state_shape = getattr(self, "state_shape", None)
+		self.state_shardings = getattr(self, "state_shardings", None)
 		self.model_state = getattr(self, "model_state", None)
 
 		self.sharded_training_step_function = getattr(
@@ -228,10 +229,25 @@ class BaseTrainer(BaseTrainerProtocol):
 	def _configure_state(self):
 		"""Configures and JIT-compiles the sharded state"""
 		with self.timer("configure sharded state"):
+			from easydel.escale import match_partition_rules
+
 			with self.model.mesh:
 				self.model_state = self.model_state.init_tx(self.tx)
-				if self.arguments.auto_shard_states:
-					self.model_state = self.model_state.shard_model()
+
+				shape = nn.eval_shape(lambda: self.model_state)
+				rules = self.model.config.get_partition_rules()
+				state_shardings = specs_to_name_sharding(match_partition_rules(rules, shape))
+
+				def shard_state(state):
+					return state
+
+				self.model_state = jax.jit(
+					shard_state,
+					in_shardings=(self.model_state.shardings,),
+					out_shardings=state_shardings,
+				)(self.model_state)
+				self.state_shardings = state_shardings
+
 		self.timer.log("configure sharded state")
 
 	@abstractmethod
