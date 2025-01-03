@@ -24,6 +24,9 @@ import flax.struct
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax.sharding import PartitionSpec
+
+from easydel.escale import PartitionAxis, with_sharding_constraint
 
 
 @enum.unique
@@ -631,6 +634,7 @@ def ForCausalLMLoss(
 	labels: jax.Array,
 	attention_mask: tp.Optional[jax.Array] = None,
 	config: tp.Optional[LossConfig] = None,
+	paxis: tp.Optional[PartitionAxis] = None,
 	num_items_in_batch: tp.Optional[int] = None,
 	batch: tp.Optional[tp.Mapping[str, chex.Array]] = None,
 	**kwargs: tp.Any,
@@ -650,7 +654,22 @@ def ForCausalLMLoss(
 	"""
 	if logits is None or labels is None:
 		raise ValueError("Logits and labels cannot be None")
-
+	if paxis is not None:
+		logits = with_sharding_constraint(
+			logits,
+			PartitionSpec(
+				paxis.batch_axis,
+				paxis.sequence_axis,
+				paxis.hidden_state_axis,
+			),
+		)
+		labels = with_sharding_constraint(
+			labels,
+			PartitionSpec(
+				paxis.batch_axis,
+				paxis.sequence_axis,
+			),
+		)
 	shift_logits = logits[:, :-1, :]
 	shift_labels = labels[:, 1:]
 
@@ -671,6 +690,7 @@ def ForSequenceClassificationLoss(
 	logits: jax.Array,
 	attention_mask: tp.Optional[jax.Array] = None,
 	config: tp.Optional[LossConfig] = None,
+	paxis: tp.Optional[PartitionAxis] = None,
 	batch: tp.Optional[tp.Mapping[str, chex.Array]] = None,
 	**kwargs: tp.Any,
 ) -> LossMetrics:
@@ -731,6 +751,7 @@ def ForQuestionAnsweringLoss(
 	start_positions: jax.Array,
 	end_positions: jax.Array,
 	config: tp.Optional[LossConfig] = None,
+	paxis: tp.Optional[PartitionAxis] = None,
 	batch: tp.Optional[tp.Mapping[str, chex.Array]] = None,
 	**kwargs: tp.Any,
 ) -> LossMetrics:
@@ -790,6 +811,7 @@ def ForTokenClassification(
 	logits: jax.Array,
 	labels: jax.Array,
 	config: tp.Optional[LossConfig] = None,
+	paxis: tp.Optional[PartitionAxis] = None,
 	batch: tp.Optional[tp.Mapping[str, chex.Array]] = None,
 	**kwargs: tp.Any,
 ) -> LossMetrics:

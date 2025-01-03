@@ -8,5 +8,5 @@ Escale
    escale.partition.auto_spec
    escale.helpers.base
    escale.mesh.creation
-   escale.mesh.mesh_helpers
    escale.mesh.validation
+   escale.mesh.mesh_helpers

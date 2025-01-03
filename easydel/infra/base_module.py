@@ -280,7 +280,7 @@ class EasyDeLBaseModule(
 		Args:
 		    partition_rules (PartitionLike, optional): Partitioning rules for sharding.
 		    mesh (jax.sharding.Mesh, optional): The mesh to shard across.
-				overlay_fns (tp.Optional[tp.Mapping[str, tp.Callable]]): Overlay functions to apply to the model.
+		                overlay_fns (tp.Optional[tp.Mapping[str, tp.Callable]]): Overlay functions to apply to the model.
 
 		Returns:
 		    EasyDeLBaseModule: The sharded model.
@@ -311,7 +311,7 @@ class EasyDeLBaseModule(
 		Args:
 		    partition_rules (PartitionLike, optional): Partitioning rules for gathering.
 		    mesh (jax.sharding.Mesh, optional): The mesh to gather from.
-				overlay_fns (tp.Optional[tp.Mapping[str, tp.Callable]]): Overlay functions to apply to the model.
+		                overlay_fns (tp.Optional[tp.Mapping[str, tp.Callable]]): Overlay functions to apply to the model.
 		Returns:
 		    EasyDeLBaseModule: The gathered model.
 		"""
@@ -479,11 +479,11 @@ class EasyDeLBaseModule(
 		"""Splits the model parameters and returns them as a dictionary, removing `VariableState` from the tree.
 
 		Args:
-			extract_fn (tp.Optional[tp.Callable], optional): Function to extract values from the parameters.
-			remove_none (bool, optional): Whether to remove `None` values from the dictionary.
+		        extract_fn (tp.Optional[tp.Callable], optional): Function to extract values from the parameters.
+		        remove_none (bool, optional): Whether to remove `None` values from the dictionary.
 
 		Returns:
-			tp.Dict: The dictionary of split parameters.
+		        tp.Dict: The dictionary of split parameters.
 		"""
 		flat_params = flatten_dict(self.split_params().to_pure_dict(extract_fn=extract_fn))
 		if remove_none:
@@ -502,10 +502,10 @@ class EasyDeLBaseModule(
 		"""Merges the model parameters from a dictionary into the current model.
 
 		Args:
-			params_dict (tp.Dict): A dictionary containing the parameters to merge.
+		        params_dict (tp.Dict): A dictionary containing the parameters to merge.
 
 		Returns:
-			EasyDeLBaseModule: The model with merged parameters.
+		        EasyDeLBaseModule: The model with merged parameters.
 		"""
 		current_state = self.split_params().flat_state()
 		if not is_flatten(params_dict):
@@ -559,6 +559,7 @@ class EasyDeLBaseModule(
 		loss_output: LossMetrics = self.loss_function(
 			labels=labels,
 			config=loss_config,
+			paxis=self.config.partition_axis,
 			**loss_kwargs,
 			**outputs,
 		)
