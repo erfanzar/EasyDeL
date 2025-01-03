@@ -126,6 +126,7 @@ def smart_compile(lowered_func: Lowered, tag: tp.Optional[str] = None):
 	foldername = str(func_hash) if tag is None else f"{tag}-{func_hash}"
 	func_dir = COMPILE_FUNC_DIR / foldername
 	filepath = func_dir / COMPILED_FILE_NAME
+	post_fix = f" (TAG : {tag})" if tag else ""
 	if filepath.exists() and not RECOMPILE_FORCE:
 		try:
 			(serialized, in_tree, out_tree) = pickle.load(open(filepath, "rb"))
@@ -137,7 +138,7 @@ def smart_compile(lowered_func: Lowered, tag: tp.Optional[str] = None):
 			return compiled_func
 		except Exception as e:
 			warnings.warn(
-				f"couldn't load compiled function due to {e} (TAG : {tag})",
+				f"couldn't load compiled function due to {e}" + post_fix,
 				stacklevel=4,
 			)
 			compiled_func: Compiled = lowered_func.compile()
@@ -148,7 +149,7 @@ def smart_compile(lowered_func: Lowered, tag: tp.Optional[str] = None):
 					pickle.dump((serialized, in_tree, out_tree), open(filepath, "wb"))
 				except Exception as e:  # noqa
 					warnings.warn(
-						f"couldn't save compiled function due to {e} (TAG : {tag})",
+						f"couldn't save compiled function due to {e}" + post_fix,
 						stacklevel=4,
 					)
 			return compiled_func
@@ -161,7 +162,7 @@ def smart_compile(lowered_func: Lowered, tag: tp.Optional[str] = None):
 				pickle.dump((serialized, in_tree, out_tree), open(filepath, "wb"))
 			except Exception as e:  # noqa
 				warnings.warn(
-					f"couldn't save and serialize compiled function due to {e} (TAG : {tag})",
+					f"couldn't save and serialize compiled function due to {e}" + post_fix,
 					stacklevel=4,
 				)
 		return compiled_func

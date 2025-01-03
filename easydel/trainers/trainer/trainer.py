@@ -13,6 +13,7 @@
 # limitations under the License.
 import time
 import typing as tp
+from functools import partial
 
 import jax
 from jax import numpy as jnp
@@ -29,7 +30,7 @@ from ..base_trainer import (
 	TrainerConfigureFunctionOutput,
 )
 from ..trainer_protocol import MetricsTracker, StepMetrics
-from ._fn import create_evaluation_step, create_training_step
+from ._fn import eval_step, train_step
 from .modeling_output import TrainerOutput
 
 logger = get_logger(__name__)
@@ -97,22 +98,31 @@ class Trainer(BaseTrainer):
 			mesh=self.model.mesh,
 		)
 		sharded_training_step_function = jax.jit(
-			create_training_step(
+			partial(
+				train_step,
 				partition_spec=self.arguments.step_partition_spec,
 				loss_config=self.arguments.loss_config,
 				learning_rate_fn=self.scheduler,
 				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
 			),
+			static_argnames=[
+				"partition_spec",
+				"loss_config",
+				"learning_rate_fn",
+				"gradient_accumulation_steps",
+			],
 			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=(self.state_shardings, empty_sharding),
 			donate_argnums=(0, 0),
 		)
 
 		sharded_evaluation_step_function = jax.jit(
-			create_evaluation_step(
+			partial(
+				eval_step,
 				partition_spec=self.arguments.step_partition_spec,
 				loss_config=self.arguments.loss_config,
 			),
+			static_argnames=["partition_spec", "loss_config"],
 			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=(empty_sharding),
 			donate_argnums=(0, 0),
@@ -137,27 +147,25 @@ class Trainer(BaseTrainer):
 	):
 		"""Core training loop implementation."""
 		pbar = tqdm(total=self.max_training_steps)
-		current_step = int(jax.device_get(state.step))
 		run_exception = None
 		with self.mesh:
 			for epoch in range(self.arguments.num_train_epochs):
-				state, current_step, run_exception = self._train_epoch(
+				state, run_exception = self._train_epoch(
 					state=state,
 					train_dataset=self.dataloader_train,
-					current_step=current_step,
 					metrics_tracker=metrics_tracker,
 					step_metrics=step_metrics,
 					pbar=pbar,
 					epoch=epoch,
 				)
 
+				current_step = int(jax.device_get(state.step))
 				if current_step >= self.max_training_steps:
 					break
 				if run_exception is not None:
 					break
 		return self._prepare_training_output(
-			state=state,
-			run_exception=run_exception,
+			state=state, run_exception=run_exception
 		), run_exception
 
 	def _run_evaluation(
@@ -187,7 +195,6 @@ class Trainer(BaseTrainer):
 		self,
 		state: EasyDeLState,
 		train_dataset: int,
-		current_step: int,
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
 		pbar: tqdm,
@@ -196,6 +203,7 @@ class Trainer(BaseTrainer):
 		"""Handles training for a single epoch."""
 		train_iter = iter(train_dataset)
 		for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
+			current_step = int(jax.device_get(state.step))
 			try:  # to make training loop safer if user wants to break that.
 				batch = self._get_next_batch(train_iter)
 				if self._should_skip_step(current_step):
@@ -203,7 +211,7 @@ class Trainer(BaseTrainer):
 					continue
 				step_metrics.start_step()
 			except (KeyboardInterrupt, EasyDeLTimerError, StopIteration) as exect:
-				return state, current_step, exect
+				return state, exect
 
 			# Execute training step
 			state, metrics, run_exception = self._execute_train_step(state=state, batch=batch)
@@ -250,12 +258,11 @@ class Trainer(BaseTrainer):
 					for _ in self.eval(model_state=state):
 						...
 
-				current_step += 1
 			except (KeyboardInterrupt, EasyDeLTimerError):
-				return state, current_step, run_exception
+				return state, run_exception
 			if run_exception is not None:
 				break
-		return state, current_step, run_exception
+		return state, run_exception
 
 	def _eval_epoch(
 		self,
@@ -366,7 +373,7 @@ class Trainer(BaseTrainer):
 
 	def eval(self, model_state: EasyDeLState) -> tp.Iterator[dict]:
 		"""
-		Evaluates the Causal Language Model (CLM) using the provided model state.
+		Evaluates Model using the provided model state.
 
 		This method iterates over the evaluation dataset, performs forward passes,
 		calculates evaluation metrics, logs the metrics, and yields the metrics for
@@ -382,15 +389,18 @@ class Trainer(BaseTrainer):
 		Raises:
 		    AssertionError: If `self.dataloader_eval` is not set (meaning the evaluation dataloader is missing).
 		"""
-		start_time = time.time()
+		try:
+			start_time = time.time()
 
-		metrics_tracker = MetricsTracker()
-		step_metrics = StepMetrics(self.arguments)
+			metrics_tracker = MetricsTracker()
+			step_metrics = StepMetrics(self.arguments)
 
-		for metrics in self._run_evaluation(
-			state=model_state,
-			metrics_tracker=metrics_tracker,
-			step_metrics=step_metrics,
-			start_time=start_time,
-		):
-			yield metrics
+			for metrics in self._run_evaluation(
+				state=model_state,
+				metrics_tracker=metrics_tracker,
+				step_metrics=step_metrics,
+				start_time=start_time,
+			):
+				yield metrics
+		except RuntimeError:  # sometimes we get a RuntimeError in multi-host evaluation, we should catch it and continue.
+			...
