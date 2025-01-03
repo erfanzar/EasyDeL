@@ -763,7 +763,7 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 		return (
 			self.arguments.save_steps is not None
 			and current_step > 0
-			and ((current_step + 1) % self.arguments.save_steps) == 0
+			and (current_step % self.arguments.save_steps) == 0
 		)
 
 	def _should_run_evaluation(self, current_step):
@@ -771,7 +771,7 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 		return (
 			self.arguments.evaluation_steps is not None
 			and current_step > 0
-			and ((current_step + 1) % self.arguments.evaluation_steps) == 0
+			and (current_step % self.arguments.evaluation_steps) == 0
 		)
 
 	def _prepare_training_output(
@@ -885,11 +885,11 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 	):
 		"""Log metrics and update progress bar."""
 		# Update progress bar
-		if (step + 1) % self.arguments.log_steps == 0:
+		if step % self.arguments.log_steps == 0:
 			pbar.set_postfix(
 				**{k.replace(f"{mode}/", ""): v for k, v in metrics.items() if len(k) < 30}
 			)
-			pbar.update(self.arguments.log_steps)
+			pbar.update(1 if step == 0 else self.arguments.log_steps)
 		# Log metrics if tracking is enabled
 		if not self.arguments.performance_mode:
 			self.arguments.log_metrics(

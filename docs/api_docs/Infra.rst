@@ -4,16 +4,16 @@ Infra
 .. toctree::
    :maxdepth: 2
 
-   infra.etils
-   infra.mixins.protocol
-   infra.mixins.generation
-   infra.mixins.bridge
-   infra.errors
-   infra.base_module
-   infra.loss_utils
-   infra.base_config
-   infra.modeling_outputs
    infra.factory
+   infra.base_config
+   infra.base_module
    infra.utils
-   infra.loss_utils_test
+   infra.loss_utils
    infra.base_state
+   infra.mixins.bridge
+   infra.mixins.generation
+   infra.mixins.protocol
+   infra.errors
+   infra.loss_utils_test
+   infra.modeling_outputs
+   infra.etils

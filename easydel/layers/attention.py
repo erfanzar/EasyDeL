@@ -31,7 +31,6 @@ import jax.lib
 import jax.tree_util
 import numpy
 from chex import Array
-from easydel.escale import with_sharding_constraint
 from flax.nnx.nn.dtypes import promote_dtype
 from jax import NamedSharding, lax, random
 from jax import numpy as jnp
@@ -47,7 +46,7 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec
 
-from easydel.escale import PartitionAxis
+from easydel.escale import PartitionAxis, with_sharding_constraint
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import (
 	AVAILABLE_ATTENTION_MECHANISMS,
