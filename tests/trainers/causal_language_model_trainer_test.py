@@ -1,6 +1,7 @@
 import os
 import sys
 
+os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 # Local imports (assuming easydel is in parent directory or installed)
 dirname = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(dirname, "..", ".."))
