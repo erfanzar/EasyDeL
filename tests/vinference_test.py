@@ -55,7 +55,7 @@ def main():
 		),
 		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 		platform=ed.EasyDeLPlatforms.TRITON,
-		param_dtype=jnp.float8_e5m2,
+		param_dtype=dtype,  # jnp.float8_e5m2,
 		dtype=dtype,
 		torch_dtype=torch.float16,
 		partition_axis=partition_axis,
