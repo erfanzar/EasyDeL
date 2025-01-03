@@ -4,12 +4,12 @@ Utils
 .. toctree::
    :maxdepth: 2
 
-   utils.readme_generator
-   utils.quantizers
-   utils.compiling_utils
-   utils.checkpoint_managers.streamer
-   utils.graph_utils
    utils.traversals
-   utils.helpers
-   utils.analyze_memory
+   utils.compiling_utils
    utils.parameters_transformation
+   utils.quantizers
+   utils.analyze_memory
+   utils.readme_generator
+   utils.graph_utils
+   utils.helpers
+   utils.checkpoint_managers.streamer
