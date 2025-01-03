@@ -16,7 +16,6 @@ import typing as tp
 
 import jax
 from jax import numpy as jnp
-from jax.experimental import sparse
 from jax.sharding import PartitionSpec
 from tqdm.autonotebook import tqdm
 
@@ -92,8 +91,6 @@ class Trainer(BaseTrainer):
 		Returns:
 		    TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
 		"""
-		if self.arguments.sparsify_module:
-			self.model.__call__ = sparse.sparsify(self.model.__call__)
 
 		empty_sharding = jax.sharding.NamedSharding(
 			spec=PartitionSpec(),
@@ -106,8 +103,8 @@ class Trainer(BaseTrainer):
 				learning_rate_fn=self.scheduler,
 				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
 			),
-			in_shardings=(self.model_state.shardings, empty_sharding),
-			out_shardings=(self.model_state.shardings, empty_sharding, empty_sharding),
+			in_shardings=(self.state_shardings, empty_sharding),
+			out_shardings=(self.state_shardings, empty_sharding, empty_sharding),
 			donate_argnums=(0, 0),
 		)
 
@@ -116,7 +113,7 @@ class Trainer(BaseTrainer):
 				partition_spec=self.arguments.step_partition_spec,
 				loss_config=self.arguments.loss_config,
 			),
-			in_shardings=(self.model_state.shardings, empty_sharding),
+			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=(empty_sharding),
 			donate_argnums=(0, 0),
 		)
@@ -124,7 +121,6 @@ class Trainer(BaseTrainer):
 		mesh = self.model.mesh
 		self.arguments.ensure_checkpoint_path()
 		checkpoint_manager = self.arguments.get_streaming_checkpointer()
-		self.state_shape = self.model_state.shardings
 
 		return TrainerConfigureFunctionOutput(
 			sharded_training_step_function=sharded_training_step_function,

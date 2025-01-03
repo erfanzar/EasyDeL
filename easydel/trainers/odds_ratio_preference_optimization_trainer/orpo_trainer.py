@@ -412,8 +412,8 @@ class ORPOTrainer(BaseTrainer):
 				mode="train",
 				batch_partition_spec=self.arguments.step_partition_spec,
 			),
-			in_shardings=(self.model_state.shardings, empty_sharding),
-			out_shardings=(self.model_state.shardings, empty_sharding),
+			in_shardings=(self.state_shardings, empty_sharding),
+			out_shardings=(self.state_shardings, empty_sharding),
 		)
 
 		sharded_evaluation_step_function = jit(
@@ -423,14 +423,13 @@ class ORPOTrainer(BaseTrainer):
 				mode="eval",
 				batch_partition_spec=self.arguments.step_partition_spec,
 			),
-			in_shardings=(self.model_state.shardings, empty_sharding),
-			out_shardings=(self.model_state.shardings, empty_sharding),
+			in_shardings=(self.state_shardings, empty_sharding),
+			out_shardings=(self.state_shardings, empty_sharding),
 		)
 
 		self.arguments.ensure_checkpoint_path()
 		checkpoint_manager = self.arguments.get_streaming_checkpointer()
-
-		self.state_shape = self.model_state.shardings
+ 
 
 		return TrainerConfigureFunctionOutput(
 			sharded_training_step_function=sharded_training_step_function,

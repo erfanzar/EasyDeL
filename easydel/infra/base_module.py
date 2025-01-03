@@ -256,7 +256,7 @@ class EasyDeLBaseModule(
 		sharding_fns: tp.Mapping[str, tp.Callable],
 	) -> nn.Module:
 		"""Applies sharding functions to the model's state."""
-		gdef, state = nn.split(self)
+		gdef, state, others = nn.split(self, nn.Param, ...)
 		sharding_fns = flatten_dict(sharding_fns)
 		_shard_keys = list(sharding_fns.keys())
 
@@ -266,7 +266,7 @@ class EasyDeLBaseModule(
 			return val
 
 		state.update(state.map(_map))
-		self = nn.merge(gdef, state)
+		self = nn.merge(gdef, state, others)
 		return self
 
 	def shard_model(
@@ -289,7 +289,7 @@ class EasyDeLBaseModule(
 		partition_rules = self._get_partition_rules(partition_rules)
 		partition_specs = match_partition_rules(
 			rules=partition_rules,
-			tree=self.graphtree_shape,
+			tree=self.graphtree_params_shape,
 		)
 		shard_fns, _ = make_shard_and_gather_fns(
 			partition_specs=partition_specs,
@@ -319,7 +319,7 @@ class EasyDeLBaseModule(
 		partition_rules = self._get_partition_rules(partition_rules)
 		partition_specs = match_partition_rules(
 			rules=partition_rules,
-			tree=self.graphtree_shape,
+			tree=self.graphtree_params_shape,
 		)
 		_, gather_fns = make_shard_and_gather_fns(
 			partition_specs=partition_specs,
@@ -335,7 +335,7 @@ class EasyDeLBaseModule(
 		mesh = self._get_mesh(None)
 		partition_specs = match_partition_rules(
 			rules=self._get_partition_rules(None),
-			tree=self.graphtree_shape,
+			tree=self.graphtree_params_shape,
 		)
 		return make_shard_and_gather_fns(
 			partition_specs=partition_specs,
@@ -347,7 +347,7 @@ class EasyDeLBaseModule(
 		mesh = self._get_mesh(None)
 		partition_specs = match_partition_rules(
 			rules=self._get_partition_rules(None),
-			tree=self.graphtree_shape,
+			tree=self.graphtree_params_shape,
 		)
 		return make_shard_and_gather_fns(
 			partition_specs=partition_specs,
