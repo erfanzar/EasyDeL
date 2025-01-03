@@ -104,7 +104,7 @@ class Trainer(BaseTrainer):
 				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
 			),
 			in_shardings=(self.state_shardings, empty_sharding),
-			out_shardings=(self.state_shardings, empty_sharding, empty_sharding),
+			out_shardings=(self.state_shardings, empty_sharding),
 			donate_argnums=(0, 0),
 		)
 
@@ -206,19 +206,17 @@ class Trainer(BaseTrainer):
 				return state, current_step, exect
 
 			# Execute training step
-			state, loss, metrics, run_exception = self._execute_train_step(
-				state=state, batch=batch
-			)
+			state, metrics, run_exception = self._execute_train_step(state=state, batch=batch)
 			# Update and log metrics
 			try:
 				mean_loss, mean_accuracy = metrics_tracker.update(
-					loss=loss,
+					loss=metrics.loss,
 					accuracy=metrics.accuracy,
 					step=current_step,
 				)
 
 				train_metrics = step_metrics.calculate(
-					loss=loss,
+					loss=metrics.loss,
 					metrics=metrics,
 					current_step=current_step,
 					learning_rate=self.scheduler(current_step)
@@ -275,14 +273,14 @@ class Trainer(BaseTrainer):
 			try:
 				batch = self._get_next_batch(eval_iter)
 				step_metrics.start_step()
-				loss, metrics = self._execute_eval_step(state, batch)
+				metrics = self._execute_eval_step(state, batch)
 				mean_loss, mean_accuracy = metrics_tracker.update(
-					loss,
+					metrics.loss,
 					metrics.accuracy,
 					current_step,
 				)
 				eval_metrics = step_metrics.calculate(
-					loss=loss,
+					loss=metrics.loss,
 					metrics=metrics,
 					current_step=current_step,
 					learning_rate=0.000,
@@ -307,12 +305,14 @@ class Trainer(BaseTrainer):
 			except (KeyboardInterrupt, EasyDeLTimerError) as _:
 				break
 
-	def _execute_eval_step(self, state, batch) -> tp.Tuple[float, LossMetrics]:
+	def _execute_eval_step(self, state, batch) -> LossMetrics:
 		"""Execute a single eval step."""
 		metrics = self.sharded_evaluation_step_function(state, batch)
-		return metrics.loss, metrics
+		return metrics
 
-	def _execute_train_step(self, state, batch):
+	def _execute_train_step(
+		self, state, batch
+	) -> tp.Tuple[EasyDeLState, LossMetrics, Exception]:
 		"""Execute a single training step."""
 		if self.pruning_module is not None:
 			state = state.replace(
@@ -324,7 +324,7 @@ class Trainer(BaseTrainer):
 
 		# Forward and backward pass
 		try:
-			state, loss, metrics = self.sharded_training_step_function(state, batch)
+			state, metrics = self.sharded_training_step_function(state, batch)
 			# Apply post-gradient updates
 			if self.pruning_module is not None:
 				state = state.replace(
@@ -334,9 +334,9 @@ class Trainer(BaseTrainer):
 					)
 				)
 
-			return state, loss, metrics, None
+			return state, metrics, None
 		except (KeyboardInterrupt, EasyDeLTimerError) as run_exception:
-			return state, loss, metrics, run_exception
+			return state, metrics, run_exception
 
 	def _finalize_training(self, output, run_exception):
 		"""Finalize training and prepare output."""

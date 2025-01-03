@@ -28,7 +28,7 @@ SEQUENCE_LENGTH = 128
 LEARNING_RATE = 3e-4
 WARMUP_STEPS = 5
 SAVE_STEPS = 10
-
+DO_LAST_SAVE = False
 # Derived Constants
 NUM_TRAIN_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
 NUM_EVAL_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
@@ -127,8 +127,8 @@ def create_training_args(
 		track_memory=True,
 		use_wandb=False,
 		learning_rate=learning_rate,
-		do_last_save=True,
-		save_steps=SAVE_STEPS,
+		do_last_save=DO_LAST_SAVE,
+		# save_steps=SAVE_STEPS,
 		save_total_limit=5,
 		save_optimizer_state=True,
 		training_time="80Min",
@@ -160,6 +160,11 @@ def main(use_iterable_dataset: bool = True):
 		dataset_train=train_dataset,
 		dataset_eval=eval_dataset,
 	)
+
+	logging.info("Compiling AOT...")
+	trainer.compile_aot()
+	logging.info("AOT COMP finished.")
+
 	logging.info("Starting training...")
 	trainer.train()
 	logging.info("Training finished.")
