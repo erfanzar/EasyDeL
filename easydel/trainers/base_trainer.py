@@ -238,16 +238,8 @@ class BaseTrainer(BaseTrainerProtocol):
 				shape = nn.eval_shape(lambda: self.model_state)
 				rules = self.model.config.get_partition_rules()
 				state_shardings = specs_to_name_sharding(match_partition_rules(rules, shape))
-
-				def shard_state(state):
-					return state
-
-				self.model_state = jax.jit(
-					shard_state,
-					in_shardings=(self.model_state.shardings,),
-					out_shardings=state_shardings,
-				)(self.model_state)
 				self.state_shardings = state_shardings
+				self.model_state = self.model_state.shard_with_shape(state_shardings)
 
 		self.timer.log("configure sharded state")
 

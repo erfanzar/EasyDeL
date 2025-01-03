@@ -98,11 +98,13 @@ def create_dataset():
 	)
 
 
-trianer = ed.Trainer(
+trainer = ed.Trainer(
 	model=MODEL,
 	arguments=TRAIN_ARGUMENTS,
 	dataset_train=create_dataset(),
 )
-
-output = trianer.train()
+print("Compiling")
+trainer.compile_aot()
+print("Compiled")
+output = trainer.train()
 output.state.save_state("/home/erfan/model-ckpt")

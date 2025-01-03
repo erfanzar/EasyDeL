@@ -304,15 +304,26 @@ class EasyDeLState(struct.PyTreeNode):
 		# 	)
 
 	def load_state(
-		self,
-		load_directory: tp.Union[str, os.PathLike],
-		verbose: bool = True,
+		self, load_directory: tp.Union[str, os.PathLike], verbose: bool = True
 	): ...
 
-	def shard_state(
-		self,
-		partition_rules: PartitionLike = None,
-	) -> EasyDeLState:
+	def shard_with_shape(self, shape) -> EasyDeLState:
+		"""shard current state with a given shape"""
+		from easydel.escale import with_sharding_constraint
+
+		self = nn.from_tree(
+			jax.tree_util.tree_map(
+				lambda arr, sharding: with_sharding_constraint(
+					arr,
+					sharding,
+				),
+				nn.to_tree(self),
+				nn.to_tree(shape),
+			)
+		)
+		return self
+
+	def shard_state(self, partition_rules: PartitionLike = None) -> EasyDeLState:
 		"""
 		Shards the entire state, according to the provided partition rules.
 
