@@ -53,7 +53,9 @@ from .training_configurations import TrainingArguments
 
 if tp.TYPE_CHECKING:
 	from datasets import Dataset, IterableDataset
+	from jax._src.pjit import JitWrapped
 else:
+	JitWrapped = tp.Callable
 	Dataset = tp.Any
 	IterableDataset = tp.Any
 
@@ -78,10 +80,10 @@ class TrainerConfigureModelOutput:
 
 @dataclass
 class TrainerConfigureFunctionOutput:
-	sharded_training_step_function: tp.Callable
+	sharded_training_step_function: JitWrapped
 	mesh: Mesh
 	checkpoint_manager: CheckpointManager
-	sharded_evaluation_step_function: tp.Optional[tp.Callable] = None
+	sharded_evaluation_step_function: tp.Optional[JitWrapped] = None
 
 
 @dataclass
@@ -113,10 +115,9 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 	scheduler: optax.Schedule
 	tx: optax.GradientTransformation
 	model_state: EasyDeLState
-	create_state_sharded: tp.Callable
 
-	sharded_training_step_function: tp.Callable
-	sharded_evaluation_step_function: tp.Callable
+	sharded_training_step_function: JitWrapped
+	sharded_evaluation_step_function: JitWrapped
 
 	mesh: tp.Any
 	checkpoint_manager: tp.Any
@@ -474,12 +475,14 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 		...
 
 	@abstractmethod
-	def _execute_eval_step(self, state, batch):
+	def _execute_eval_step(self, state, batch) -> LossMetrics:
 		"""Execute a single eval step."""
 		...
 
 	@abstractmethod
-	def _execute_train_step(self, state, batch):
+	def _execute_train_step(
+		self, state, batch
+	) -> tp.Tuple[EasyDeLState, LossMetrics, Exception]:
 		"""Execute a single train step."""
 		...
 
@@ -502,6 +505,11 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 		"""
 		Evaluates using the provided model state.
 		"""
+		...
+
+	@abstractmethod
+	def compile_aot(self) -> bool:
+		"""Compile the state ahead of time for faster execution."""
 		...
 
 	@abstractmethod

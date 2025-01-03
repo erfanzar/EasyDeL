@@ -77,6 +77,8 @@ class TrainingArguments:
 	learning_rate_end: tp.Optional[float] = None
 	log_all_workers: bool = False
 	log_grad_norms: bool = True
+	report_metrics: bool = True
+	log_steps: int = 10
 	loss_config: tp.Optional[LossConfig] = None
 	max_evaluation_steps: tp.Optional[int] = None
 	max_sequence_length: tp.Optional[int] = 4096
@@ -178,8 +180,11 @@ class TrainingArguments:
 		Handles warnings if performance mode is enabled and disables WandB logging accordingly.
 		"""
 		if self.use_wandb and self.performance_mode:
-			warnings.warn("WandB logging disabled due to performance mode", stacklevel=1)
+			logger.info("WandB logging disabled due to performance mode")
 			self.use_wandb = False
+		if self.report_metrics and self.performance_mode:
+			logger.info("Metrics reporting disabled due to performance mode")
+			self.report_metrics = False
 
 	def _ensure_variables(self):
 		"""
@@ -284,20 +289,21 @@ class TrainingArguments:
 		Returns:
 		    tp.Optional[wandb.sdk.wandb_run.Run]: The WandB run object if initialized, else None.
 		"""
-		if not self.use_wandb or wandb is None:
-			warnings.warn(
-				"you have used `use_wandb=True` but you haven't install wandb.",
-				stacklevel=1,
-			)
-			return None
+		if self.report_metrics:
+			if not self.use_wandb or wandb is None:
+				warnings.warn(
+					"you have used `use_wandb=True` but you haven't install wandb.",
+					stacklevel=1,
+				)
+				return None
 
-		if jax.process_index() == 0 or self.log_all_workers:
-			return wandb.init(
-				project=f"EasyDeL-{self.model_name}",
-				config=self.to_dict(),
-				tags=["EasyDeL", "Jax/Flax"],
-				entity=self.wandb_entity,
-			)
+			if jax.process_index() == 0 or self.log_all_workers:
+				return wandb.init(
+					project=f"EasyDeL-{self.model_name}",
+					config=self.to_dict(),
+					tags=["EasyDeL", "JAX/Flax"],
+					entity=self.wandb_entity,
+				)
 		return None
 
 	def ensure_training_time(self, time_passed):
@@ -325,21 +331,30 @@ class TrainingArguments:
 		Logs training metrics to Weights & Biases and/or TensorBoard.
 
 		Args:
-		    metrics (tp.Dict[str, tp.Union[float, tp.List, tp.Tuple, np.ndarray, 'jnp.ndarray', 'torch.Tensor']]):
-		        A dictionary where keys are metric names and values are metric values.
-		    step (int): The current training step or iteration.
+			metrics (tp.Dict[str, tp.Union[float, tp.List, tp.Tuple, np.ndarray, 'jnp.ndarray', 'torch.Tensor']]):
+				A dictionary where keys are metric names and values are metric values.
+			step (int): The current training step or iteration.
 		"""
-		if jax.process_index() == 0 or self.log_all_workers:
+		if self.report_metrics:
+			if step % self.log_steps == 0:
+				if jax.process_index() == 0 or self.log_all_workers:
+					metrics = {self._restructure_metric_name(k): v for k, v in metrics.items()}
+					self._log_to_wandb(metrics, step)
+					self._log_to_tensorboard(metrics, step)
 
-			def restructure_metric_name(metric_name):
-				if metric_name.startswith("train/grad_norm/"):
-					return metric_name.replace("train/grad_norm/", "grad_norm/")
-				return metric_name
+	def _restructure_metric_name(self, metric_name: str) -> str:
+		"""
+		Restructures the metric name for logging.
 
-			with jax.spmd_mode("allow_all"):
-				metrics = {restructure_metric_name(k): v for k, v in metrics.items()}
-				self._log_to_wandb(metrics, step)
-				self._log_to_tensorboard(metrics, step)
+		Args:
+			metric_name (str): The original metric name.
+
+		Returns:
+			str: The restructured metric name.
+		"""
+		if metric_name.startswith("train/grad_norm/"):
+			return metric_name.replace("train/grad_norm/", "grad_norm/")
+		return metric_name
 
 	def _log_to_wandb(self, metrics, step):
 		"""
@@ -348,43 +363,20 @@ class TrainingArguments:
 		This method processes the given metrics and logs them to wandb if it's enabled and properly initialized.
 
 		Args:
-		    metrics (dict): A dictionary of metrics to log. Keys are metric names, values are the metric values.
-		    step (int): The current step or iteration number.
-
-		Notes:
-		    - If a metric value is a list, tuple, or numpy array, it's converted to a wandb.Histogram.
-		    - For JAX arrays or PyTorch tensors, they're converted to numpy arrays before creating a histogram.
-		    - Other types of values are logged as-is.
-		    - Any exceptions during logging are caught and warned about, allowing the process to continue.
+			metrics (dict): A dictionary of metrics to log. Keys are metric names, values are the metric values.
+			step (int): The current step or iteration number.
 		"""
-		if self.use_wandb and wandb is not None:
-
-			class Tensor: ...
-
-			try:
-				from torch import Tensor
-			except ModuleNotFoundError:
-				...
+		if self.use_wandb and wandb is not None and self.report_metrics:
 			wandb_metrics = {}
 			for key, value in metrics.items():
 				try:
-					if isinstance(value, (list, tuple, np.ndarray)):
-						wandb_metrics[key] = self._create_wandb_histogram(value)
-					elif isinstance(
-						value,
-						(
-							jnp.ndarray,
-							Tensor,
-						),
-					):  # Use string for Tensor to avoid import issues
-						wandb_metrics[key] = self._create_wandb_histogram(
-							value.cpu().numpy() if hasattr(value, "cpu") else np.array(value)
-						)
-					else:
-						wandb_metrics[key] = value
+					wandb_metrics[key] = (
+						self._create_wandb_histogram(value)
+						if isinstance(value, (list, tuple, np.ndarray, jnp.ndarray))
+						else value
+					)
 				except Exception as e:
 					warnings.warn(f"Failed to log metric {key} to wandb: {e}", stacklevel=3)
-
 			wandb.log(wandb_metrics, step=step)
 
 	def _log_to_tensorboard(self, metrics, step):
@@ -394,46 +386,18 @@ class TrainingArguments:
 		This method processes the given metrics and logs them to TensorBoard.
 
 		Args:
-		    metrics (dict): A dictionary of metrics to log. Keys are metric names, values are the metric values.
-		    step (int): The current step or iteration number.
-
-		Notes:
-		    - Scalar values (float, int) are logged using summary_writer.scalar().
-		    - Lists, tuples, numpy arrays, JAX arrays, and PyTorch tensors are logged as histograms.
-		    - JAX arrays and PyTorch tensors are converted to numpy arrays before logging.
-		    - tp.Any exceptions during logging are caught and warned about, allowing the process to continue.
-		    - The summary writer is flushed after logging all metrics.
+			metrics (dict): A dictionary of metrics to log. Keys are metric names, values are the metric values.
+			step (int): The current step or iteration number.
 		"""
-
-		class Tensor: ...
-
-		try:
-			from torch import Tensor
-		except ModuleNotFoundError:
-			...
 		summary_writer = self.get_tensorboard()
 		for key, value in metrics.items():
 			try:
 				if isinstance(value, (float, int)):
 					summary_writer.scalar(key, value, step)
-				elif isinstance(
-					value,
-					(
-						list,
-						tuple,
-						np.ndarray,
-						jnp.ndarray,
-						Tensor,
-					),
-				):
-					if hasattr(value, "cpu"):
-						value = value.cpu().detach().numpy()
-					elif isinstance(value, jnp.ndarray):
-						value = np.array(value)
-					summary_writer.histogram(key, value, step)
+				elif isinstance(value, (list, tuple, np.ndarray, jnp.ndarray)):
+					summary_writer.histogram(key, np.array(value), step)
 			except Exception as e:
 				warnings.warn(f"Failed to log metric {key} to TensorBoard: {e}", stacklevel=1)
-
 		summary_writer.flush()
 
 	def _create_wandb_histogram(self, value):

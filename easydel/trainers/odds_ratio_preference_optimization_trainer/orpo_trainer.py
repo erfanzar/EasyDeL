@@ -429,7 +429,6 @@ class ORPOTrainer(BaseTrainer):
 
 		self.arguments.ensure_checkpoint_path()
 		checkpoint_manager = self.arguments.get_streaming_checkpointer()
- 
 
 		return TrainerConfigureFunctionOutput(
 			sharded_training_step_function=sharded_training_step_function,
@@ -503,17 +502,12 @@ class ORPOTrainer(BaseTrainer):
 		"""
 		operation_name = "configure functions and sharding them"
 		with self.timer(operation_name):
-			function_configurations = self.configure_functions()
-			self.create_state_sharded = function_configurations.create_state_sharded
-			self.sharded_training_step_function = (
-				function_configurations.sharded_training_step_function
-			)
-			self.sharded_evaluation_step_function = (
-				function_configurations.sharded_evaluation_step_function
-			)
-			self.mesh = function_configurations.mesh
-			self.checkpoint_manager = function_configurations.checkpoint_manager
-			self.initialize_state_function = function_configurations.initialize_state_function
+			functions = self.configure_functions()
+			self.sharded_training_step_function = functions.sharded_training_step_function
+			self.sharded_evaluation_step_function = functions.sharded_evaluation_step_function
+			self.mesh = functions.mesh
+			self.checkpoint_manager = functions.checkpoint_manager
+			self.initialize_state_function = functions.initialize_state_function
 		self.timer.log(operation_name)
 
 	def create_collect_function(

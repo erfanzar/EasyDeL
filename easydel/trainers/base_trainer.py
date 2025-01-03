@@ -34,6 +34,7 @@ from flax.core import unfreeze
 import easydel
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLTimerError
+from easydel.utils.compiling_utils import smart_compile
 from easydel.utils.traversals import specs_to_name_sharding
 
 try:
@@ -736,6 +737,28 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 		"""Prints the number of model parameters in billions."""
 		return sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(prm))[0])
 
+	def compile_aot(self) -> bool:
+		compiled = False
+		if self.dataloader_train is not None:
+			self.sharded_training_step_function = smart_compile(
+				self.sharded_training_step_function.lower(
+					self.model_state,
+					next(iter(self.dataloader_train)),
+				),
+				tag="BaseTrainer.compile_aot.training",
+			)
+			compiled = True
+		if self.dataloader_eval is not None:
+			self.sharded_evaluation_step_function = smart_compile(
+				self.sharded_evaluation_step_function.lower(
+					self.model_state,
+					next(iter(self.dataloader_eval)),
+				),
+				tag="BaseTrainer.compile_aot.evalutation",
+			)
+			compiled = True
+		return compiled
+
 	def _should_skip_step(self, current_step):
 		"""Determine if current step should be skipped."""
 		return (
@@ -870,10 +893,11 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 	):
 		"""Log metrics and update progress bar."""
 		# Update progress bar
-		pbar.set_postfix(
-			**{k.replace(f"{mode}/", ""): v for k, v in metrics.items() if len(k) < 30}
-		)
-		pbar.update()
+		if step % self.arguments.log_steps == 0:
+			pbar.set_postfix(
+				**{k.replace(f"{mode}/", ""): v for k, v in metrics.items() if len(k) < 30}
+			)
+			pbar.update(self.arguments.log_steps)
 		# Log metrics if tracking is enabled
 		if not self.arguments.performance_mode:
 			self.arguments.log_metrics(

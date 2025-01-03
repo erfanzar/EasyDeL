@@ -136,7 +136,10 @@ def smart_compile(lowered_func: Lowered, tag: tp.Optional[str] = None):
 			)
 			return compiled_func
 		except Exception as e:
-			warnings.warn(f"couldn't load compiled function due to {e}", stacklevel=4)
+			warnings.warn(
+				f"couldn't load compiled function due to {e} (TAG : {tag})",
+				stacklevel=4,
+			)
 			compiled_func: Compiled = lowered_func.compile()
 			if ECACHE_COMPILES:
 				serialized, in_tree, out_tree = serialize(compiled_func)
@@ -144,7 +147,10 @@ def smart_compile(lowered_func: Lowered, tag: tp.Optional[str] = None):
 				try:
 					pickle.dump((serialized, in_tree, out_tree), open(filepath, "wb"))
 				except Exception as e:  # noqa
-					warnings.warn(f"couldn't save compiled function due to {e}", stacklevel=4)
+					warnings.warn(
+						f"couldn't save compiled function due to {e} (TAG : {tag})",
+						stacklevel=4,
+					)
 			return compiled_func
 	else:
 		compiled_func: Compiled = lowered_func.compile()
@@ -155,7 +161,7 @@ def smart_compile(lowered_func: Lowered, tag: tp.Optional[str] = None):
 				pickle.dump((serialized, in_tree, out_tree), open(filepath, "wb"))
 			except Exception as e:  # noqa
 				warnings.warn(
-					f"couldn't save and serialize compiled function due to {e}",
+					f"couldn't save and serialize compiled function due to {e} (TAG : {tag})",
 					stacklevel=4,
 				)
 		return compiled_func

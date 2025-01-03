@@ -85,7 +85,7 @@ def create_training_step(
 		grads_shapes, metrics_shape = jax.eval_shape(_minibatch_step, 0)
 		grads = jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), grads_shapes)
 		metrics = jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), metrics_shape)
-		if os.environ.get("SCAN_TRAINER", "false").lower() in ["true", "1", "on", "yes"]:
+		if os.environ.get("SCAN_TRAINER", "true").lower() in ["true", "1", "on", "yes"]:
 			(grads, metrics), _ = jax.lax.scan(
 				_scan_step,
 				init=(grads, metrics),
@@ -118,7 +118,7 @@ def create_training_step(
 		metrics.mean_grad_norm = mean_grad_norm
 		metrics.grad_norms = grad_norms
 
-		return state, metrics.loss, metrics
+		return state, metrics
 
 	return train_step
 
