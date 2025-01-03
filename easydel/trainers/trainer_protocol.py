@@ -447,15 +447,11 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 	def _train_epoch(
 		self,
 		state: EasyDeLState,
-		train_iter: int,
-		current_step: int,
+		train_dataset: int,
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
 		pbar: tqdm,
-		start_time: float,
 		epoch: int,
-		shard_fns: tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]],
-		gather_fns: tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]],
 	):
 		"""Handles training for a single epoch."""
 		...

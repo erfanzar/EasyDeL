@@ -123,7 +123,7 @@ def create_training_args(
 		max_training_steps=max_training_steps,
 		max_evaluation_steps=max_evaluation_steps,
 		do_train=True,
-		do_eval=False,
+		do_eval=True,
 		max_sequence_length=sequence_length,
 		track_memory=True,
 		use_wandb=False,

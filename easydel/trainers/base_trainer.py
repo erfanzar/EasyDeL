@@ -34,7 +34,6 @@ from flax.core import unfreeze
 import easydel
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLTimerError
-from easydel.utils.compiling_utils import smart_compile
 from easydel.utils.traversals import specs_to_name_sharding
 
 try:
@@ -313,14 +312,18 @@ class BaseTrainer(BaseTrainerProtocol):
 				raise ImportError(
 					"Please install TensorFlow to use the TensorFlow dataset conversion."
 				) from exec
+			batch_size = (
+				(self.arguments.total_batch_size * self.arguments.gradient_accumulation_steps)
+				if is_train
+				else self.arguments.total_batch_size
+			)
 			return (
 				dataset.to_tf_dataset(
 					collate_fn=self.create_collect_function(
 						max_sequence_length=self.arguments.max_sequence_length,
 						truncation_mode=self.arguments.truncation_mode,
 					),
-					batch_size=self.arguments.total_batch_size
-					* self.arguments.gradient_accumulation_steps,
+					batch_size=batch_size,
 					drop_remainder=True,
 					shuffle=is_train,
 					num_workers=self.arguments.dataloader_num_workers,
@@ -350,7 +353,11 @@ class BaseTrainer(BaseTrainerProtocol):
 				raise ImportError(
 					"Please install TensorFlow to use the TensorFlow dataset conversion."
 				) from exec
-
+			batch_size = (
+				(self.arguments.total_batch_size * self.arguments.gradient_accumulation_steps)
+				if is_train
+				else self.arguments.total_batch_size
+			)
 			return (
 				tf.data.Dataset.from_generator(
 					lambda: dataset,
@@ -362,10 +369,7 @@ class BaseTrainer(BaseTrainerProtocol):
 					},
 				)
 				.repeat(self.arguments.num_train_epochs if is_train else 1)
-				.batch(
-					self.arguments.total_batch_size * self.arguments.gradient_accumulation_steps,
-					drop_remainder=False,
-				)
+				.batch(batch_size, drop_remainder=False)
 				.prefetch(tf.data.AUTOTUNE)
 				.as_numpy_iterator()
 			)
@@ -378,14 +382,14 @@ class BaseTrainer(BaseTrainerProtocol):
 			Calculates the number of training or evaluation steps based on dataset length and arguments.
 
 			Args:
-					dataset (tp.Union[Dataset, IterableDataset]): The dataset to calculate steps for.
-					is_train (bool): Whether the dataset is for training.
+				dataset (tp.Union[Dataset, IterableDataset]): The dataset to calculate steps for.
+				is_train (bool): Whether the dataset is for training.
 
 			Returns:
-					int: The number of steps.
+				int: The number of steps.
 
 			Raises:
-					ValueError: If the dataset is a generator/streaming dataset and the number of steps is not specified.
+				ValueError: If the dataset is a generator/streaming dataset and the number of steps is not specified.
 			"""
 			if hasattr(dataset, "__len__"):
 				total_data_len = len(dataset)
@@ -406,16 +410,15 @@ class BaseTrainer(BaseTrainerProtocol):
 				)
 				steps = min(num_steps, max_steps) if max_steps else num_steps
 			else:
-				num_steps = (
+				steps = (
 					self.arguments.max_training_steps
 					if is_train
 					else self.arguments.max_evaluation_steps
 				)
-				if not num_steps:
+				if not steps:
 					raise ValueError(
 						f"Specify the number of {'training' if is_train else 'evaluation'} steps for a generator/streaming dataset."
 					)
-				steps = num_steps
 			if is_train:
 				steps = steps // self.arguments.gradient_accumulation_steps
 			return steps
@@ -732,21 +735,17 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 	def compile_aot(self) -> bool:
 		compiled = False
 		if self.dataloader_train is not None:
-			self.sharded_training_step_function = smart_compile(
-				self.sharded_training_step_function.lower(
-					self.model_state,
-					next(iter(self.dataloader_train)),
-				),
-				tag="BaseTrainer.compile_aot.training",
-			)
+			self.sharded_training_step_function = self.sharded_training_step_function.lower(
+				self.model_state,
+				next(iter(self.dataloader_train)),
+			).compile()
 			compiled = True
 		if self.dataloader_eval is not None:
-			self.sharded_evaluation_step_function = smart_compile(
+			self.sharded_evaluation_step_function = (
 				self.sharded_evaluation_step_function.lower(
 					self.model_state,
 					next(iter(self.dataloader_eval)),
-				),
-				tag="BaseTrainer.compile_aot.evalutation",
+				).compile()
 			)
 			compiled = True
 		return compiled
@@ -885,11 +884,19 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 	):
 		"""Log metrics and update progress bar."""
 		# Update progress bar
-		if step % self.arguments.log_steps == 0:
+		if ((step + 1) % self.arguments.log_steps == 0) or (step == 0):
 			pbar.set_postfix(
-				**{k.replace(f"{mode}/", ""): v for k, v in metrics.items() if len(k) < 30}
+				**{
+					k.replace(
+						f"{mode}/",
+						"",
+					): v
+					for k, v in metrics.items()
+					if len(k) < 30
+				}
 			)
-			pbar.update(1 if step == 0 else self.arguments.log_steps)
+			update_size = 0 if step == 0 else self.arguments.log_steps
+			pbar.update(update_size)
 		# Log metrics if tracking is enabled
 		if not self.arguments.performance_mode:
 			self.arguments.log_metrics(
