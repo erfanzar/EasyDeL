@@ -336,7 +336,7 @@ class TrainingArguments:
 			step (int): The current training step or iteration.
 		"""
 		if self.report_metrics:
-			if step % self.log_steps == 0:
+			if (step + 1) % self.log_steps == 0:
 				if jax.process_index() == 0 or self.log_all_workers:
 					metrics = {self._restructure_metric_name(k): v for k, v in metrics.items()}
 					self._log_to_wandb(metrics, step)
