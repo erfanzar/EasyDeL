@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "easydel"
-version = "0.1.0.dev008"
+version = "0.1.0.dev009"
 description = "An open-source library to make training faster and more optimized in JAX"
 authors = ["Erfan Zare Chavoshi <Erfanzare810@gmail.com>"]
 license = "Apache-2.0"
@@ -37,18 +37,10 @@ uvloop = "^0.21.0"
 uvicorn = "^0.32.0"
 
 
-[tool.poetry.group.all.dependencies]
+[tool.poetry.extras]
+all = ["datasets", "tensorboard", "tensorflow-cpu", "tensorflow-datasets"]
+torch = ["torch", "torchvision", "torchaudio"]
 
-datasets = "^2.19.2"
-tensorboard = "^2.18.0"
-tensorflow-cpu = "^2.18.0"
-tensorflow-datasets = "^4.9.6"
-
-
-[tool.poetry.group.torch.dependencies]
-torch = "*"
-torchvision = "*"
-torchaudio = "*"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
