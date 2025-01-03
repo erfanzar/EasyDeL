@@ -167,7 +167,20 @@ class Timers:
 			self._print_log(name, elapsed_time)
 
 	def _print_log(self, name, elapsed_time):
-		logger.info(f"time took for {name} (ms) : {elapsed_time:.4f}")
+		if elapsed_time < 1000:
+			time_str = f"{elapsed_time:.4f} ms"
+			color = "\033[94m"  # Blue
+		elif elapsed_time < 60000:
+			time_str = f"{elapsed_time / 1000:.4f} sec"
+			color = "\033[92m"  # Green
+		elif elapsed_time < 3600000:
+			time_str = f"{elapsed_time / 60000:.4f} min"
+			color = "\033[93m"  # Yellow
+		else:
+			time_str = f"{elapsed_time / 3600000:.4f} hr"
+			color = "\033[91m"  # Red
+
+		logger.info(f"time took for {name} : {color}{time_str}\033[0m")
 
 	@contextlib.contextmanager
 	def timed(self, name, log=True, reset=True):

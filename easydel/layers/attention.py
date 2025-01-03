@@ -23,7 +23,6 @@ from enum import Enum
 from functools import cached_property, lru_cache, partial
 
 import einops
-import fjformer
 import flax.nnx as nn
 import jax
 import jax.experimental
@@ -32,7 +31,7 @@ import jax.lib
 import jax.tree_util
 import numpy
 from chex import Array
-from fjformer import with_sharding_constraint
+from easydel.escale import with_sharding_constraint
 from flax.nnx.nn.dtypes import promote_dtype
 from jax import NamedSharding, lax, random
 from jax import numpy as jnp
@@ -800,7 +799,8 @@ class FlexibleAttentionModule(nn.Module):
 			return AttentionOutput(
 				attention_weights=None,
 				attention_outputs=with_sharding_constraint(
-					attention_output, attention_partitionspec
+					arr=attention_output,
+					sharding=attention_partitionspec,
 				),
 			)
 
@@ -909,11 +909,16 @@ class FlexibleAttentionModule(nn.Module):
 
 			output = cuda_flash_attn2_mha(
 				q=with_sharding_constraint(
-					query_states.astype(self.dtype), query_partitionspec
+					arr=query_states.astype(self.dtype),
+					sharding=query_partitionspec,
 				),
-				k=with_sharding_constraint(key_states.astype(self.dtype), key_partitionspec),
+				k=with_sharding_constraint(
+					arr=key_states.astype(self.dtype),
+					sharding=key_partitionspec,
+				),
 				v=with_sharding_constraint(
-					value_states.astype(self.dtype), value_partitionspec
+					arr=value_states.astype(self.dtype),
+					sharding=value_partitionspec,
 				),
 				softmax_scale=self.sm_scale,
 				is_causal=False if in_generating_process else causal,
@@ -922,8 +927,8 @@ class FlexibleAttentionModule(nn.Module):
 			return AttentionOutput(
 				attention_weights=None,
 				attention_outputs=with_sharding_constraint(
-					output,
-					attention_partitionspec,
+					arr=output,
+					sharding=attention_partitionspec,
 				),
 			)
 		else:
@@ -1018,17 +1023,17 @@ class FlexibleAttentionModule(nn.Module):
 
 		*_, vd = value_states.shape
 		with self.mesh:
-			query_states = fjformer.with_sharding_constraint(
-				query_states,
-				query_partitionspec,
+			query_states = with_sharding_constraint(
+				arr=query_states,
+				sharding=query_partitionspec,
 			)
-			key_states = fjformer.with_sharding_constraint(
-				key_states,
-				key_partitionspec,
+			key_states = with_sharding_constraint(
+				arr=key_states,
+				sharding=key_partitionspec,
 			)
-			value_states = fjformer.with_sharding_constraint(
-				value_states,
-				value_partitionspec,
+			value_states = with_sharding_constraint(
+				arr=value_states,
+				sharding=value_partitionspec,
 			)
 			query_states = jnp.reshape(
 				query_states,
@@ -1075,7 +1080,10 @@ class FlexibleAttentionModule(nn.Module):
 			value_states,
 			precision=self.precision,
 		).reshape(b, qs, qh, vd)
-		attention = fjformer.with_sharding_constraint(attention, attention_partitionspec)
+		attention = with_sharding_constraint(
+			arr=attention,
+			sharding=attention_partitionspec,
+		)
 		return AttentionOutput(
 			attention_weights=attention_weight, attention_outputs=attention
 		)
@@ -1107,10 +1115,22 @@ class FlexibleAttentionModule(nn.Module):
 		) = self.get_bshd_partition_specs(query_sequence_length)
 
 		with self.mesh:
-			query_states = with_sharding_constraint(query_states, query_partitionspec)
-			key_states = with_sharding_constraint(key_states, key_partitionspec)
-			value_states = with_sharding_constraint(value_states, value_partitionspec)
-			bias = with_sharding_constraint(bias, bias_partitionspec)
+			query_states = with_sharding_constraint(
+				arr=query_states,
+				sharding=query_partitionspec,
+			)
+			key_states = with_sharding_constraint(
+				arr=key_states,
+				sharding=key_partitionspec,
+			)
+			value_states = with_sharding_constraint(
+				arr=value_states,
+				sharding=value_partitionspec,
+			)
+			bias = with_sharding_constraint(
+				arr=bias,
+				sharding=bias_partitionspec,
+			)
 			o = blockwise_attn(
 				query=query_states,
 				key=key_states,
@@ -1128,7 +1148,7 @@ class FlexibleAttentionModule(nn.Module):
 				float32_logits=True,
 			)
 
-			o = with_sharding_constraint(o, attention_partitionspec)
+			o = with_sharding_constraint(arr=o, sharding=attention_partitionspec)
 			return AttentionOutput(attention_weights=None, attention_outputs=o)
 
 	def splash_attention(
@@ -1763,10 +1783,16 @@ class FlaxAttentionModule(nn.Module):
 		)
 		attention_mask = jnp.logical_and(pad_mask, attention_mask)
 		cache_view.key = self.quantizer(
-			with_sharding_constraint(key_cache, self.get_sharding_safely(cache_view.key))
+			with_sharding_constraint(
+				arr=key_cache,
+				sharding=self.get_sharding_safely(cache_view.key),
+			)
 		)
 		cache_view.value = self.quantizer(
-			with_sharding_constraint(value_cache, self.get_sharding_safely(cache_view.value))
+			with_sharding_constraint(
+				arr=value_cache,
+				sharding=self.get_sharding_safely(cache_view.value),
+			)
 		)
 		cache_view.index = cache_view.index + num_updated_cache_vectors
 
@@ -1838,8 +1864,8 @@ class FlaxAttentionModule(nn.Module):
 		    jax.Array: sharded version of `attn_output`
 		"""
 		return with_sharding_constraint(
-			attn_output,
-			PartitionSpec(
+			arr=attn_output,
+			sharding=PartitionSpec(
 				self.config.partition_axis.batch_axis,
 				(
 					self.config.partition_axis.sequence_axis

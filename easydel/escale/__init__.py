@@ -34,12 +34,7 @@ from .partition import (
 	with_sharding_constraint,
 	PartitionAxis,
 )
-from .utils import (
-	flatten_tree,
-	named_tree_map,
-	tree_apply,
-	tree_path_to_string,
-)
+
 from .helpers import (
 	AutoShardingRule,
 	CompositeShardingRule,
@@ -75,8 +70,4 @@ __all__ = (
 	"create_pattern_based_partition_spec",
 	"make_shard_and_gather_fns",
 	"match_partition_rules",
-	"flatten_tree",
-	"named_tree_map",
-	"tree_apply",
-	"tree_path_to_string",
 )

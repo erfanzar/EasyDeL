@@ -229,7 +229,7 @@ def auto_shard_array(
 		reverse=reverse,
 	)
 	with mesh:
-		return with_sharding_constraint(x=x, partition_specs=partition_spec)
+		return with_sharding_constraint(arr=x, sharding=partition_spec)
 
 
 def auto_namedsharding(

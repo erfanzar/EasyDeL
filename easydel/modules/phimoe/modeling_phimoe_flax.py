@@ -246,8 +246,8 @@ class PhiMoEAttention(FlaxAttentionModule):
 		attn_output = self._merge_heads(attentions.attention_outputs)
 		if self.config.shard_attention_computation:
 			attn_output = with_sharding_constraint(
-				attn_output,
-				PartitionSpec(
+				arr=attn_output,
+				sharding=PartitionSpec(
 					self.config.partition_axis.batch_axis,
 					(
 						self.config.partition_axis.sequence_axis

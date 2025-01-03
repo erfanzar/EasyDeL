@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import contextlib
 import re
 import typing as tp
 import warnings
@@ -19,12 +20,14 @@ import chex
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax import tree_util as tu
 from jax.interpreters import pxla
 from jax.lax import with_sharding_constraint as _with_sharding_constraint
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
+from easydel.utils.traversals import named_tree_map
+
 from ..mesh.validation import names_in_current_mesh
-from ..utils.tree_utils import named_tree_map
 
 
 def make_shard_and_gather_fns(
@@ -36,7 +39,7 @@ def make_shard_and_gather_fns(
 
 	This function generates dictionaries of shard and gather functions that can be used
 	to distribute and collect arrays across a JAX mesh. The functions are specifically
-	designed for use with Flax's `jax.tree_util.tree_map`.
+	designed for use with Flax's `tu.tree_map`.
 
 	Args:
 		partition_specs: A dictionary mapping parameter names to their respective `PartitionSpec`.
@@ -54,43 +57,40 @@ def make_shard_and_gather_fns(
 			"at least call that under mesh context manager"
 		)
 
-	named_shardings = jax.tree_util.tree_map(
+	named_shardings = tu.tree_map(
 		lambda p: NamedSharding(mesh=mesh, spec=p),
 		partition_specs,
 	)
 
-	def make_shard_fn(partition_spec: NamedSharding) -> tp.Callable:
+	def make_shard_fn(sharding: NamedSharding) -> tp.Callable:
 		"""
 		Create a shard function for a specific partition spec.
 		"""
-		jax_shard_function = jax.jit(
-			lambda x: x,
-			in_shardings=None,
-			out_shardings=partition_spec,
-		)
 
 		def shard_fn(tensor: jnp.ndarray) -> jnp.ndarray:
-			return jax_shard_function(tensor).block_until_ready()
+			with mesh:
+				tensor = with_sharding_constraint(arr=tensor, sharding=sharding)
+			return tensor
 
 		return shard_fn
 
-	def make_gather_fn(partition_spec: NamedSharding) -> tp.Callable:
+	def make_gather_fn(sharding: NamedSharding) -> tp.Callable:
 		"""
 		Create a gather function for a specific partition spec.
 		"""
-		jax_gather_fn = jax.jit(
-			lambda x: x,
-			in_shardings=partition_spec,
-			out_shardings=NamedSharding(mesh, PartitionSpec()),
-		)
 
 		def gather_fn(tensor: jnp.ndarray) -> jnp.ndarray:
-			return jax.device_get(jax_gather_fn(tensor))
+			return jax.device_get(
+				with_sharding_constraint(
+					arr=tensor,
+					sharding=NamedSharding(mesh, PartitionSpec()),
+				)
+			)
 
 		return gather_fn
 
-	shard_fns = jax.tree_util.tree_map(make_shard_fn, named_shardings)
-	gather_fns = jax.tree_util.tree_map(make_gather_fn, named_shardings)
+	shard_fns = tu.tree_map(make_shard_fn, named_shardings)
+	gather_fns = tu.tree_map(make_gather_fn, named_shardings)
 	return shard_fns, gather_fns
 
 
@@ -122,8 +122,14 @@ def get_names_from_partition_spec(
 	return list(names)
 
 
+@contextlib.contextmanager
+def nullcontext(enter_result=None):
+	yield enter_result
+
+
 def with_sharding_constraint(
-	x: jnp.ndarray, partition_specs: tp.Dict[str, PartitionSpec]
+	arr: jnp.ndarray,
+	sharding: tp.Dict[str, tp.Union[PartitionSpec, NamedSharding]],
 ) -> jnp.ndarray:
 	"""
 	Apply sharding constraints if axis names are present in the current mesh.
@@ -133,16 +139,25 @@ def with_sharding_constraint(
 	present in the current JAX mesh.
 
 	Args:
-		x: The JAX array to apply sharding constraints to.
-		partition_specs: A dictionary mapping parameter names to their respective `PartitionSpec`.
+		arr: The JAX array to apply sharding constraints to.
+		sharding: A dictionary mapping parameter names to their respective `PartitionSpec`.
 
 	Returns:
 		The JAX array with sharding constraints applied (if applicable).
 	"""
-	axis_names = get_names_from_partition_spec(partition_specs)
-	if names_in_current_mesh(*axis_names):
-		x = _with_sharding_constraint(x, partition_specs)
-	return x
+	if isinstance(arr, (jax.Array, jnp.ndarray)):
+		if isinstance(sharding, NamedSharding):
+			mesh = sharding.mesh
+			sharding = sharding.spec
+		else:
+			mesh = None
+		if mesh is None:
+			mesh = pxla.thread_resources.env.physical_mesh
+		axis_names = get_names_from_partition_spec(sharding)
+		if names_in_current_mesh(*axis_names):
+			with mesh or nullcontext():
+				arr = _with_sharding_constraint(arr, sharding)
+	return arr
 
 
 def match_partition_rules(
@@ -171,6 +186,9 @@ def match_partition_rules(
 		"""
 		Determine the partition spec for a parameter based on its name.
 		"""
+
+		if not hasattr(leaf, "shape"):
+			return PartitionSpec()
 		if len(leaf.shape) == 0 or np.prod(leaf.shape) == 1:
 			""" Don't partition scalar values. """
 			return PartitionSpec()
@@ -228,7 +246,7 @@ def analyze_sharding_strategy(
 		return sharded_size
 
 	# Traverse the pytree and collect statistics
-	jax.tree_util.tree_map_with_path(analyze_leaf, pytree, partition_specs)
+	tu.tree_map_with_path(analyze_leaf, pytree, partition_specs)
 
 	return analysis
 

@@ -13,10 +13,10 @@
 # limitations under the License.
 from __future__ import annotations
 
-from functools import partial
 import os
 import pathlib
 import typing as tp
+from functools import partial
 
 import jax
 import optax
@@ -26,9 +26,14 @@ from flax import struct
 from easydel.utils.traversals import specs_to_name_sharding
 
 if tp.TYPE_CHECKING:
-	from .base_module import EasyDeLBaseModule
+	from jax.sharding import Mesh, PartitionSpec
+
+	from .base_module import EasyDeLBaseModule, PartitionLike
 else:
 	EasyDeLBaseModule = tp.Any
+	PartitionSpec = tp.Any
+	PartitionLike = tp.Any
+	Mesh = tp.Any
 
 WEIGHTS_NAME = "easydel-model.parameters"
 OPTIMIZER_NAME = "easydel-optstate.parameters"
@@ -156,7 +161,7 @@ class EasyDeLState(struct.PyTreeNode):
 	def init_tx(
 		self,
 		tx: optax.GradientTransformation,
-		partition_rules: tp.Optional[tp.Any] = None,
+		partition_rules: PartitionLike = None,
 	) -> EasyDeLState:
 		"""
 		Initialize the optimizer state with the given gradient transformation.
@@ -188,7 +193,7 @@ class EasyDeLState(struct.PyTreeNode):
 	def shard_optimizer_state(
 		self,
 		opt_state: tp.Optional[tp.Any] = None,
-		partition_rules: tp.Optional[tp.Any] = None,
+		partition_rules: PartitionLike = None,
 	) -> tp.Any:
 		"""
 		Shards the optimizer state according to the provided partition rules.
@@ -212,7 +217,7 @@ class EasyDeLState(struct.PyTreeNode):
 		if partition_rules is None:
 			partition_rules = self.model.config.get_partition_rules()
 
-		from easydel.escale import match_partition_rules, make_shard_and_gather_fns
+		from easydel.escale import make_shard_and_gather_fns, match_partition_rules
 
 		partition_specs = match_partition_rules(partition_rules, opt_state)
 		shard_fns, _ = make_shard_and_gather_fns(partition_specs)
@@ -228,7 +233,7 @@ class EasyDeLState(struct.PyTreeNode):
 		if partition_rules is None:
 			partition_rules = self.model.config.get_partition_rules()
 
-		from easydel.escale import match_partition_rules, make_shard_and_gather_fns
+		from easydel.escale import make_shard_and_gather_fns, match_partition_rules
 
 		partition_specs = match_partition_rules(partition_rules, self.opt_state)
 		_, gather = make_shard_and_gather_fns(partition_specs)
@@ -298,7 +303,127 @@ class EasyDeLState(struct.PyTreeNode):
 		# 		mismatch_allowed=mismatch_allowed,
 		# 	)
 
-	def load_state(self): ...
+	def load_state(
+		self,
+		load_directory: tp.Union[str, os.PathLike],
+		verbose: bool = True,
+	): ...
+
+	def shard_state(
+		self,
+		partition_rules: PartitionLike = None,
+	) -> EasyDeLState:
+		"""
+		Shards the entire state, according to the provided partition rules.
+
+		Args:
+			partition_rules (Optional[Any]): The partition rules to be used for sharding. If None, the method will use
+																			the partition rules from `self.model.config`.
+
+		Returns:
+			EasyDeLState: An updated EasyDeLState object with the sharded state.
+		"""
+
+		if self.opt_state is not None:
+			self = self.shard_optimizer_state(partition_rules=partition_rules)
+		self = self.shard_model(partition_rules=partition_rules)
+		return self
+
+	def gather_state(self):
+		"""
+		Gathers the entire state.
+
+		Returns:
+			EasyDeLState: An updated EasyDeLState object with the gathered state.
+		"""
+		if self.opt_state is not None:
+			self = self.gather_optimizer_state()
+		self = self.gather_model()
+		return self
+
+	def gather_model(
+		self,
+		partition_rules: PartitionLike = None,
+		mesh: tp.Optional[Mesh] = None,
+	) -> EasyDeLState:
+		"""
+		Gathers the model according to the provided partition rules.
+
+		Returns:
+			EasyDeLState: An updated EasyDeLState object with the gathered model.
+		"""
+		from easydel.escale import make_shard_and_gather_fns, match_partition_rules
+
+		rules = partition_rules or self.model._get_partition_rules(None)
+		mesh = mesh or self.model._get_mesh(None)
+		partition_specs = match_partition_rules(
+			rules=rules,
+			tree=self.graphstate,
+		)
+		_, gather_fns = make_shard_and_gather_fns(
+			partition_specs=partition_specs,
+			mesh=mesh,
+		)
+		graphstate = jax.tree_util.tree_map(
+			lambda f, o: f(o),
+			gather_fns,
+			self.graphstate,
+		)
+		graphother = jax.tree_util.tree_map(
+			lambda f, o: f(o),
+			gather_fns,
+			self.graphother,
+		)
+		self = self.replace(graphstate=graphstate, graphother=graphother)
+		return self
+
+	def shard_model(
+		self,
+		partition_rules: PartitionLike = None,
+		mesh: tp.Optional[Mesh] = None,
+	) -> EasyDeLState:
+		"""
+		Shards the model according to the provided partition rules.
+
+		Args:
+			partition_rules (Optional[Any]): The partition rules to be used for sharding. If None, the method will use
+																			the partition rules from `self.model.config`.
+			mesh (Optional[Mesh]): The mesh to be used for sharding. If None, the method will use the mesh from `self.model`.
+
+		Returns:
+			EasyDeLState: An updated EasyDeLState object with the sharded model.
+		"""
+
+		rules = partition_rules or self.model._get_partition_rules(None)
+		mesh = mesh or self.model._get_mesh(None)
+
+		def appy_sharding_on_tree(tree):
+			from easydel.escale import make_shard_and_gather_fns, match_partition_rules
+
+			partition_specs = match_partition_rules(rules, tree)
+			shard_fns, _ = make_shard_and_gather_fns(partition_specs, mesh)
+			return jax.tree_util.tree_map(lambda f, o: f(o), shard_fns, tree)
+
+		graphstate = appy_sharding_on_tree(self.graphstate)
+		graphother = appy_sharding_on_tree(self.graphother)
+
+		self = self.replace(graphstate=graphstate, graphother=graphother)
+		return self
+
+	@property
+	def shardings(self):
+		"""
+		Returns the sharding information for the state.
+
+		Returns:
+			Any: The sharding information.
+		"""
+		return nn.from_tree(
+			jax.tree_util.tree_map(
+				lambda x: x.sharding if hasattr(x, "sharding") else None,
+				nn.to_tree(self),
+			)
+		)
 
 	def __repr__(self):
 		return "EasyDeLState-" + str(self.model)

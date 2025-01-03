@@ -215,10 +215,13 @@ def _fwd_flash_attn(
 	if hasattr(query_state, "sharding"):
 		if isinstance(query_state.sharding, jax.sharding.NamedSharding):
 			with query_state.sharding.mesh:
-				o = with_sharding_constraint(o, query_state.sharding.spec)
+				o = with_sharding_constraint(
+					arr=o,
+					sharding=query_state.sharding,
+				)
 				lse = with_sharding_constraint(
-					lse,
-					jax.sharding.PartitionSpec(*query_state.sharding.spec[:3]),
+					arr=lse,
+					sharding=jax.sharding.PartitionSpec(*query_state.sharding.spec[:3]),
 				)
 		elif isinstance(
 			query_state.sharding, jax.sharding.SingleDeviceSharding

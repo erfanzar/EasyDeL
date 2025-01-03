@@ -15,7 +15,6 @@ import jax
 import easydel as ed
 import jax.extend
 import jax.random
-from fjformer import make_shard_and_gather_fns, match_partition_rules
 
 sys.path.append(
 	os.path.join(
@@ -246,8 +245,14 @@ class EasyModelsTest(unittest.TestCase):
 		mesh = config.mesh
 
 		with mesh:
-			partition_specs = match_partition_rules(config.get_partition_rules(True), params)
-			shard, _ = make_shard_and_gather_fns(partition_specs, mesh)
+			partition_specs = ed.escale.match_partition_rules(
+				config.get_partition_rules(True),
+				params,
+			)
+			shard, _ = ed.escale.make_shard_and_gather_fns(
+				partition_specs,
+				mesh,
+			)
 
 			params = jax.tree_util.tree_map(lambda p, f: f(p), params, shard)
 			config.add_basic_configurations(

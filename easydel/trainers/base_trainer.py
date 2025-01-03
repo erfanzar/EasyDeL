@@ -116,9 +116,7 @@ class BaseTrainer(BaseTrainerProtocol):
 		self.tx = getattr(self, "tx", None)
 
 		self.mesh = getattr(self, "mesh", None)
-		self.checkpoint_manager = getattr(self, "checkpoint_manager", None)
-		self.state_partition_spec = getattr(self, "state_partition_spec", None)
-		self.state_named_sharding = getattr(self, "state_named_sharding", None)
+		self.checkpoint_manager = getattr(self, "checkpoint_manager", None)  #
 		self.pruning_module = getattr(self.arguments, "pruning_module", None)
 		self.memory_monitor = getattr(self.arguments, "memory_monitor", None)
 
@@ -232,6 +230,8 @@ class BaseTrainer(BaseTrainerProtocol):
 		with self.timer("configure sharded state"):
 			with self.model.mesh:
 				self.model_state = self.model_state.init_tx(self.tx)
+				if self.arguments.auto_shard_states:
+					self.model_state = self.model_state.shard_model()
 		self.timer.log("configure sharded state")
 
 	@abstractmethod

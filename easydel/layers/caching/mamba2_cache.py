@@ -15,12 +15,11 @@
 import typing as tp
 
 import chex as cx
-from fjformer import with_sharding_constraint
 from fjformer.core import ImplicitArray
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
-from easydel.escale import PartitionAxis
+from easydel.escale import PartitionAxis, with_sharding_constraint
 
 
 @cx.dataclass
@@ -92,7 +91,7 @@ class Mamba2CacheView:
 	):
 		return cls(
 			conv_states=with_sharding_constraint(
-				x=jnp.zeros(
+				arr=jnp.zeros(
 					shape=(
 						metadata.batch_size,
 						metadata.intermediate_size + 2 * metadata.n_groups * metadata.state_size,
@@ -100,10 +99,10 @@ class Mamba2CacheView:
 					),
 					dtype=dtype,
 				),
-				partition_specs=partition_specs,
+				sharding=partition_specs,
 			),
 			ssm_states=with_sharding_constraint(
-				x=jnp.zeros(
+				arr=jnp.zeros(
 					shape=(
 						metadata.batch_size,
 						metadata.num_heads,
@@ -112,7 +111,7 @@ class Mamba2CacheView:
 					),
 					dtype=dtype,
 				),
-				partition_specs=partition_specs,
+				sharding=partition_specs,
 			),
 			positions=jnp.zeros((metadata.batch_size,), "i4"),
 			metadata=metadata,

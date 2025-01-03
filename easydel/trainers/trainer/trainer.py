@@ -20,7 +20,6 @@ from jax.experimental import sparse
 from jax.sharding import PartitionSpec
 from tqdm.autonotebook import tqdm
 
-from easydel.escale import match_partition_rules
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLTimerError
 from easydel.infra.loss_utils import LossMetrics
@@ -96,13 +95,6 @@ class Trainer(BaseTrainer):
 		if self.arguments.sparsify_module:
 			self.model.__call__ = sparse.sparsify(self.model.__call__)
 
-		state_shape = jax.eval_shape(lambda: self.model_state)
-		state_partition_spec = match_partition_rules(
-			self.model.config.get_partition_rules(),
-			state_shape,
-		)
-
-		spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
 		empty_sharding = jax.sharding.NamedSharding(
 			spec=PartitionSpec(),
 			mesh=self.model.mesh,
@@ -114,8 +106,8 @@ class Trainer(BaseTrainer):
 				learning_rate_fn=self.scheduler,
 				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
 			),
-			in_shardings=(spec_named_sharding, empty_sharding),
-			out_shardings=(spec_named_sharding, empty_sharding, empty_sharding),
+			in_shardings=(self.model_state.shardings, empty_sharding),
+			out_shardings=(self.model_state.shardings, empty_sharding, empty_sharding),
 			donate_argnums=(0, 0),
 		)
 
@@ -124,7 +116,7 @@ class Trainer(BaseTrainer):
 				partition_spec=self.arguments.step_partition_spec,
 				loss_config=self.arguments.loss_config,
 			),
-			in_shardings=(spec_named_sharding, empty_sharding),
+			in_shardings=(self.model_state.shardings, empty_sharding),
 			out_shardings=(empty_sharding),
 			donate_argnums=(0, 0),
 		)
@@ -132,9 +124,7 @@ class Trainer(BaseTrainer):
 		mesh = self.model.mesh
 		self.arguments.ensure_checkpoint_path()
 		checkpoint_manager = self.arguments.get_streaming_checkpointer()
-		self.state_partition_spec = state_partition_spec
-		self.state_named_sharding = spec_named_sharding
-		self.state_shape = state_shape
+		self.state_shape = self.model_state.shardings
 
 		return TrainerConfigureFunctionOutput(
 			sharded_training_step_function=sharded_training_step_function,

@@ -350,13 +350,6 @@ class DPOTrainer(BaseTrainer):
 		if self.arguments.sparsify_module:
 			self.model.__call__ = sparse.sparsify(self.model.__call__)
 
-		state_shape = jax.eval_shape(lambda: self.model_state)
-		state_partition_spec = match_partition_rules(
-			self.model.config.get_partition_rules(),
-			state_shape,
-		)
-
-		spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
 		empty_sharding = jax.sharding.NamedSharding(
 			spec=PartitionSpec(),
 			mesh=self.model.mesh,
@@ -373,13 +366,16 @@ class DPOTrainer(BaseTrainer):
 		sharded_training_step_function = jax.jit(
 			train_function,
 			in_shardings=(
-				spec_named_sharding,
+				self.model_state.shardings,
 				jax.sharding.NamedSharding(
 					spec=self.arguments.step_partition_spec,
 					mesh=self.mesh,
 				),
 			),
-			out_shardings=(spec_named_sharding, empty_sharding),
+			out_shardings=(
+				self.model_state.shardings,
+				empty_sharding,
+			),
 		)
 
 		eval_function = create_eval_function(
@@ -394,7 +390,7 @@ class DPOTrainer(BaseTrainer):
 		sharded_evaluation_step_function = jax.jit(
 			eval_function,
 			in_shardings=(
-				spec_named_sharding,
+				self.model_state.shardings,
 				jax.sharding.NamedSharding(
 					spec=self.arguments.step_partition_spec,
 					mesh=self.mesh,
@@ -404,9 +400,7 @@ class DPOTrainer(BaseTrainer):
 		)
 
 		self.arguments.ensure_checkpoint_path()
-		self.state_partition_spec = state_partition_spec
-		self.state_named_sharding = spec_named_sharding
-		self.state_shape = state_shape
+		self.state_shape = self.model_state.shardings
 		checkpoint_manager = self.arguments.get_streaming_checkpointer()
 		mesh = self.model.mesh
 		return TrainerConfigureFunctionOutput(
