@@ -1,10 +1,10 @@
 import unittest
-from easydel.trainers.auto_tx import get_optimizer_and_scheduler
-from easydel.infra.etils import EasyDeLOptimizers, EasyDeLSchedulers
 
 # FILE: easydel/trainers/test_auto_tx.py
-
 import fjformer.optimizers
+
+from easydel.infra.etils import EasyDeLOptimizers, EasyDeLSchedulers
+from easydel.trainers.auto_tx import get_optimizer_and_scheduler
 
 
 class TestGetOptimizerAndScheduler(unittest.TestCase):

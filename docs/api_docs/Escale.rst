@@ -7,7 +7,6 @@ Escale
    escale.partition.constraints
    escale.partition.auto_spec
    escale.helpers.base
-   escale.mesh.validation
    escale.mesh.creation
    escale.mesh.mesh_helpers
-   escale.utils.tree_utils
+   escale.mesh.validation

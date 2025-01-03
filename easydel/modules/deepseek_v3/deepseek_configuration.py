@@ -13,9 +13,10 @@
 # limitations under the License.
 
 
+from jax.sharding import PartitionSpec
+
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
-from jax.sharding import PartitionSpec
 
 DEEPSEEK_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
 

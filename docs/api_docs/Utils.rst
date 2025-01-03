@@ -5,11 +5,11 @@ Utils
    :maxdepth: 2
 
    utils.readme_generator
+   utils.quantizers
    utils.compiling_utils
-   utils.analyze_memory
-   utils.parameters_transformation
-   utils.traversals
    utils.checkpoint_managers.streamer
    utils.graph_utils
-   utils.quantizers
+   utils.traversals
    utils.helpers
+   utils.analyze_memory
+   utils.parameters_transformation
