@@ -9,7 +9,7 @@ import logging
 from functools import partial
 
 import fjformer
-import flax 
+import flax
 import jax.numpy as jnp
 from datasets import Dataset, IterableDataset
 
@@ -69,8 +69,7 @@ def create_model(sequence_length=SEQUENCE_LENGTH, dtype=jnp.float32):
 		rngs=flax.nnx.Rngs(0),
 	)
 
-	model = model.shard_model() 
-	# model = model.quantize()
+	model = model.shard_model()
 	logging.info("Model created.")
 	return model
 

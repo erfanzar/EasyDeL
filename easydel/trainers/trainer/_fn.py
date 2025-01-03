@@ -44,7 +44,7 @@ def create_training_step(
 		minibatch_size = batch_size // gradient_accumulation_steps
 
 		assert minibatch_size * gradient_accumulation_steps == batch_size
-		batch = with_sharding_constraint(batch, partition_spec)
+		batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
 
 		def loss_fn(tree, minibatch):
 			module = state.merge(tree)
@@ -134,7 +134,7 @@ def create_evaluation_step(
 		state: EasyDeLState,
 		batch: tp.Mapping[str, jax.Array],
 	) -> tp.Tuple[tp.Any, LossMetrics]:
-		batch = with_sharding_constraint(batch, partition_spec)
+		batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
 
 		def loss_fn(tree):
 			module = state.merge(tree)

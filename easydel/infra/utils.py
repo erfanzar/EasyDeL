@@ -31,6 +31,7 @@ from aqt.jax.v2.flax import aqt_flax as q_flax
 from flax import nnx as nn
 from tqdm.auto import tqdm
 
+import easydel
 from easydel.escale import PartitionAxis
 from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import flatten_dict, unflatten_dict
@@ -82,7 +83,7 @@ ROPE_TYPES = tp.Optional[
 ]
 
 
-with_sharding_constraint = fjformer.with_sharding_constraint
+with_sharding_constraint = easydel.escale.with_sharding_constraint
 
 
 def canonicalize_dtype(

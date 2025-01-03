@@ -23,7 +23,6 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from tqdm.autonotebook import tqdm
 
-from easydel.escale import match_partition_rules
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLTimerError
@@ -405,29 +404,7 @@ class ORPOTrainer(BaseTrainer):
 		"""
 		mesh = self.model.mesh
 
-		def create_state():
-			"""
-			Creates an EasyDeLState object.
-			Returns:
-			    EasyDeLState: The EasyDeLState object initialized.
-			"""
-			return EasyDeLState.create(
-				model=self.model,
-				tx=self.tx,
-				init_opt_state=True,
-			)
-
-		state_shape = jax.eval_shape(lambda: create_state())
-		state_partition_spec = match_partition_rules(
-			self.model.config.get_partition_rules(),
-			state_shape,
-		)
-
-		spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
-
-		spec_named_sharding = self.specs_to_name_sharding(state_partition_spec)
 		empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=mesh)
-		create_state_sharded = jax.jit(create_state, out_shardings=spec_named_sharding)
 		sharded_training_step_function = jit(
 			create_step_function(
 				concatenated_forward=self.concatenated_forward,
@@ -435,8 +412,8 @@ class ORPOTrainer(BaseTrainer):
 				mode="train",
 				batch_partition_spec=self.arguments.step_partition_spec,
 			),
-			in_shardings=(spec_named_sharding, empty_sharding),
-			out_shardings=(spec_named_sharding, empty_sharding),
+			in_shardings=(self.model_state.shardings, empty_sharding),
+			out_shardings=(self.model_state.shardings, empty_sharding),
 		)
 
 		sharded_evaluation_step_function = jit(
@@ -446,18 +423,16 @@ class ORPOTrainer(BaseTrainer):
 				mode="eval",
 				batch_partition_spec=self.arguments.step_partition_spec,
 			),
-			in_shardings=(spec_named_sharding, empty_sharding),
-			out_shardings=(spec_named_sharding, empty_sharding),
+			in_shardings=(self.model_state.shardings, empty_sharding),
+			out_shardings=(self.model_state.shardings, empty_sharding),
 		)
 
 		self.arguments.ensure_checkpoint_path()
 		checkpoint_manager = self.arguments.get_streaming_checkpointer()
-		self.state_partition_spec = state_partition_spec
-		self.state_named_sharding = spec_named_sharding
-		self.state_shape = state_shape
+
+		self.state_shape = self.model_state.shardings
 
 		return TrainerConfigureFunctionOutput(
-			create_state_sharded=create_state_sharded,
 			sharded_training_step_function=sharded_training_step_function,
 			sharded_evaluation_step_function=sharded_evaluation_step_function,
 			mesh=mesh,

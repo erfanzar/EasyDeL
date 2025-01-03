@@ -105,6 +105,7 @@ class EasyDeLBaseModule(
 		self.rngs: nn.Rngs = rngs
 
 		# these useless call's are just here to init values in graphdef
+		_ = self.graphtree_shape
 		_ = self.graphtree_params_shape
 		_ = self.mesh
 		_ = self.model_task
@@ -123,6 +124,16 @@ class EasyDeLBaseModule(
 	def graphtree_params_shape(self) -> tp.Dict:
 		"""Evaluates the shape of the model's parameters and returns a dictionary."""
 		graphtree = nn.eval_shape(lambda: nn.split(self, nn.Param, ...)[1])
+
+		flattened_tree = flatten_dict(graphtree)
+
+		param_shapes = {key: val.value for key, val in flattened_tree.items()}
+		return unflatten_dict(param_shapes)
+
+	@property
+	def graphtree_shape(self) -> tp.Dict:
+		"""Evaluates the shape of the modeland returns a dictionary."""
+		graphtree = nn.eval_shape(lambda: nn.split(self)[1])
 
 		flattened_tree = flatten_dict(graphtree)
 
@@ -241,10 +252,11 @@ class EasyDeLBaseModule(
 		return partition_rules
 
 	def _apply_sharding_fns(
-		self, sharding_fns: tp.Mapping[str, tp.Callable]
+		self,
+		sharding_fns: tp.Mapping[str, tp.Callable],
 	) -> nn.Module:
 		"""Applies sharding functions to the model's state."""
-		gdef, state, other = nn.split(self, nn.Param, ...)
+		gdef, state = nn.split(self)
 		sharding_fns = flatten_dict(sharding_fns)
 		_shard_keys = list(sharding_fns.keys())
 
@@ -253,79 +265,94 @@ class EasyDeLBaseModule(
 				val.value = sharding_fns[path](val.value)
 			return val
 
-		state = state.map(_map)
-		return nn.merge(gdef, state, other)
+		state.update(state.map(_map))
+		self = nn.merge(gdef, state)
+		return self
 
 	def shard_model(
 		self,
 		partition_rules: PartitionLike = None,
 		mesh: tp.Optional[Mesh] = None,
+		overlay_fns: tp.Optional[tp.Mapping[str, tp.Callable]] = None,
 	) -> EasyDeLBaseModule:
 		"""Shards the model's parameters using the specified partitioning rules and mesh.
 
 		Args:
 		    partition_rules (PartitionLike, optional): Partitioning rules for sharding.
 		    mesh (jax.sharding.Mesh, optional): The mesh to shard across.
+				overlay_fns (tp.Optional[tp.Mapping[str, tp.Callable]]): Overlay functions to apply to the model.
 
 		Returns:
 		    EasyDeLBaseModule: The sharded model.
 		"""
 		mesh = self._get_mesh(mesh)
 		partition_rules = self._get_partition_rules(partition_rules)
-
-		shard_fns = make_shard_and_gather_fns(
-			partition_specs=match_partition_rules(
-				rules=partition_rules,
-				tree=self.graphtree_params_shape,
-			),
+		partition_specs = match_partition_rules(
+			rules=partition_rules,
+			tree=self.graphtree_shape,
+		)
+		shard_fns, _ = make_shard_and_gather_fns(
+			partition_specs=partition_specs,
 			mesh=mesh,
-		)[0]
-
-		return self._apply_sharding_fns(shard_fns)
-
-	@property
-	def _shard_fns(self):
-		mesh = self._get_mesh(None)
-		partition_specs = match_partition_rules(
-			rules=self._get_partition_rules(None),
-			tree=self.graphtree_params_shape,
 		)
-		return make_shard_and_gather_fns(partition_specs=partition_specs, mesh=mesh)[0]
-
-	@property
-	def _gather_fns(self):
-		mesh = self._get_mesh(None)
-		partition_specs = match_partition_rules(
-			rules=self._get_partition_rules(None),
-			tree=self.graphtree_params_shape,
-		)
-		return make_shard_and_gather_fns(partition_specs=partition_specs, mesh=mesh)[1]
+		if overlay_fns is not None:
+			shard_fns.update(overlay_fns)
+		self = self._apply_sharding_fns(shard_fns)
+		return self
 
 	def gather_model(
 		self,
 		partition_rules: PartitionLike = None,
 		mesh: tp.Optional[Mesh] = None,
+		overlay_fns: tp.Optional[tp.Mapping[str, tp.Callable]] = None,
 	) -> EasyDeLBaseModule:
 		"""Gathers the model's parameters based on the specified partitioning rules and mesh.
 
 		Args:
 		    partition_rules (PartitionLike, optional): Partitioning rules for gathering.
 		    mesh (jax.sharding.Mesh, optional): The mesh to gather from.
-
+				overlay_fns (tp.Optional[tp.Mapping[str, tp.Callable]]): Overlay functions to apply to the model.
 		Returns:
 		    EasyDeLBaseModule: The gathered model.
 		"""
 		mesh = self._get_mesh(mesh)
 		partition_rules = self._get_partition_rules(partition_rules)
+		partition_specs = match_partition_rules(
+			rules=partition_rules,
+			tree=self.graphtree_shape,
+		)
+		_, gather_fns = make_shard_and_gather_fns(
+			partition_specs=partition_specs,
+			mesh=mesh,
+		)
 
-		gather_fns = make_shard_and_gather_fns(
-			partition_specs=match_partition_rules(
-				rules=partition_rules,
-				tree=self.graphtree_params_shape,
-			),
+		if overlay_fns is not None:
+			gather_fns.update(overlay_fns)
+		return self._apply_sharding_fns(gather_fns)
+
+	@property
+	def _shard_fns(self):
+		mesh = self._get_mesh(None)
+		partition_specs = match_partition_rules(
+			rules=self._get_partition_rules(None),
+			tree=self.graphtree_shape,
+		)
+		return make_shard_and_gather_fns(
+			partition_specs=partition_specs,
+			mesh=mesh,
+		)[0]
+
+	@property
+	def _gather_fns(self):
+		mesh = self._get_mesh(None)
+		partition_specs = match_partition_rules(
+			rules=self._get_partition_rules(None),
+			tree=self.graphtree_shape,
+		)
+		return make_shard_and_gather_fns(
+			partition_specs=partition_specs,
 			mesh=mesh,
 		)[1]
-		return self._apply_sharding_fns(gather_fns)
 
 	def quantize(
 		self,

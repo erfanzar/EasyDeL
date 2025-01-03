@@ -59,7 +59,10 @@ del _getLogger
 # EasyDel Imports
 from packaging.version import Version as _Version
 
-from . import escale, utils
+# fmt: off
+from . import utils # utils should be improted first to prevent circular imports
+from . import escale
+# fmt: on
 from .escale import PartitionAxis
 from .inference.vinference import (
 	vInference,

@@ -57,6 +57,7 @@ AVAILABLE_BACKENDS: tp.List[str] = ["cpu", "gpu", "tpu", None]
 
 @dataclass
 class TrainingArguments:
+	auto_shard_states: bool = True
 	backend: tp.Optional[str] = None
 	clip_grad: tp.Optional[float] = None
 	dataloader_num_workers: tp.Optional[int] = 0

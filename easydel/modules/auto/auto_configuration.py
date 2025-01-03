@@ -15,10 +15,13 @@ import functools
 import typing as tp
 
 import flax.nnx
-from fjformer import make_shard_and_gather_fns, match_partition_rules
 from jax.sharding import PartitionSpec
 
-from easydel.escale import PartitionAxis
+from easydel.escale import (
+	PartitionAxis,
+	make_shard_and_gather_fns,
+	match_partition_rules,
+)
 from easydel.infra.base_module import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseModule,
@@ -186,10 +189,7 @@ class AutoShardAndGatherFunctions:
 		_, module, _ = get_modules_by_type(config.model_type, model_task)
 		model = module.lazy_init(config=config, rngs=flax.nnx.Rngs(0))
 
-		partition_specs = match_partition_rules(
-			partition_rules,
-			model.graphtree_params_shape,
-		)
+		partition_specs = match_partition_rules(partition_rules, model.graphtree_shape)
 
 		shard_fns, gather_fns = make_shard_and_gather_fns(
 			partition_specs=partition_specs,

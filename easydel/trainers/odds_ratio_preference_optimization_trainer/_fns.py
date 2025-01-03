@@ -386,8 +386,8 @@ def create_step_function(
 		    apply_fn
 		"""
 		batch = with_sharding_constraint(
-			batch,
-			partition_specs=batch_partition_spec,
+			arr=batch,
+			sharding=batch_partition_spec,
 		)
 
 		def calculate_loss(tree: nn.GraphState):
