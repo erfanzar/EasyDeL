@@ -1,14 +1,26 @@
 [tool.poetry]
 name = "easydel"
-version = "0.1.0.dev011"
+version = "0.1.0.dev013"
+
 description = "An open-source library to make training faster and more optimized in JAX"
 authors = ["Erfan Zare Chavoshi <Erfanzare810@gmail.com>"]
 license = "Apache-2.0"
 readme = "README.md"
+
 homepage = "https://github.com/erfanzar/EasyDeL"
 repository = "https://github.com/erfanzar/EasyDeL"
-documentation = "https://erfanzar.github.io/EasyDeL"
-keywords = ["JAX", "CUDA", "Deep Learning", "Machine Learning", "XLA"]
+documentation = "https://easydel.readthedocs.io/en/latest/"
+
+keywords = [
+	"Deep Learning",
+	"Machine Learning",
+	"JAX",
+	"CUDA",
+	"XLA",
+	"Triton",
+	"Pallas",
+]
+
 classifiers = [
 	"Development Status :: 3 - Alpha",
 	"Intended Audience :: Developers",
@@ -20,7 +32,7 @@ classifiers = [
 ]
 
 [tool.poetry.dependencies]
-python = ">=3.10,<3.13"
+python = ">=3.10,<3.14"
 jax = ">=0.4.34"
 jaxlib = ">=0.4.34"
 fjformer = "0.0.91"
@@ -29,12 +41,34 @@ flax = ">=0.10.2"
 optax = "^0.2.2"
 tqdm = "*"
 termcolor = "*"
-tensorboard = "^2.18.0"
 fastapi = "^0.115.2"
 prometheus_client = "^0.21.0"
 wandb = "^0.18.5"
 uvloop = "^0.21.0"
 uvicorn = "^0.32.0"
+
+
+tensorflow-datasets = { version = "^4.9.6", optional = true }
+tensorflow-cpu = { version = "^2.18.0", optional = true }
+tensorboard = { version = "^2.18.0", optional = true }
+datasets = { version = "^2.19.2", optional = true }
+torch = { version = ">=2.5.0", extras = [], optional = false }
+
+
+[tool.poetry.group.tf]
+optional = true
+
+[tool.poetry.group.tf.dependencies]
+tensorflow-datasets = "^4.9.6"
+tensorflow-cpu = "^2.18.0"
+tensorboard = "^2.18.0"
+datasets = "^2.19.2"
+
+[tool.poetry.group.torch]
+optional = true
+
+[tool.poetry.group.torch.dependencies]
+torch = { version = ">=2.5.0", extras = [], optional = false }
 
 
 [tool.poetry.group.all]
@@ -45,19 +79,19 @@ tensorflow-datasets = "^4.9.6"
 tensorflow-cpu = "^2.18.0"
 tensorboard = "^2.18.0"
 datasets = "^2.19.2"
+torch = ">=2.5.0"
 
-[tool.poetry.group.torch]
-optional = true
-
-[tool.poetry.group.torch.dependencies]
-torch = "*"
-torchvision = "*"
-torchaudio = "*"
 
 [tool.poetry.extras]
-all = ["tensorflow-datasets", "tensorflow-cpu", "tensorboard", "datasets"]
-torch = ["torch", "torchvision", "torchaudio"]
-
+tf = ["tensorflow-datasets", "tensorflow-cpu", "tensorboard", "datasets"]
+torch = ["torch"]
+all = [
+	"tensorflow-datasets",
+	"tensorflow-cpu",
+	"tensorboard",
+	"datasets",
+	"torch",
+]
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
