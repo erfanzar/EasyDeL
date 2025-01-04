@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .orpo_trainer import ORPOConfig, ORPOTrainer, ORPOTrainerOutput
+from .orpo_trainer import ORPOConfig, ORPOTrainer
 
-__all__ = ("ORPOTrainer", "ORPOTrainerOutput", "ORPOConfig")
+__all__ = ("ORPOTrainer", "ORPOConfig")

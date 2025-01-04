@@ -365,7 +365,7 @@ def create_flash_attention(
 	return FlashAttention(config)
 
 
-def _attn_refrence(query_states, key_states, value_states, bias):
+def _attn_reference(query_states, key_states, value_states, bias):
 	b, qs, num_q_heads, d = query_states.shape
 	num_kv_heads = value_states.shape[2]
 	ks = value_states.shape[1]
@@ -482,7 +482,7 @@ def _test_forward():
 		print("Flash OOM", er)
 		co = None
 	try:
-		fo = _attn_refrence(q, k, v, b)
+		fo = _attn_reference(q, k, v, b)
 		print(fo[0, 0, 0, :5])
 	except Exception as er:
 		print("Flax OOM", er)

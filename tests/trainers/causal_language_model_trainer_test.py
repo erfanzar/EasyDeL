@@ -132,7 +132,7 @@ def create_training_args(
 		# save_steps=SAVE_STEPS,
 		save_total_limit=5,
 		save_optimizer_state=True,
-		training_time="80Min",
+		# training_time_limit="80Min",
 		optimizer=ed.EasyDeLOptimizers.ADAMW,
 		scheduler=ed.EasyDeLSchedulers.COSINE,
 		clip_grad=1.0,
@@ -162,9 +162,9 @@ def main(use_iterable_dataset: bool = True):
 		dataset_eval=eval_dataset,
 	)
 
-	logging.info("Compiling AOT...")
-	trainer.compile_aot()
-	logging.info("AOT COMP finished.")
+	# logging.info("Compiling AOT...")
+	# trainer.compile_aot()
+	# logging.info("AOT COMP finished.")
 
 	logging.info("Starting training...")
 	trainer.train()

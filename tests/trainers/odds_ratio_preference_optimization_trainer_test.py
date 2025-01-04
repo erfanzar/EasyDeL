@@ -10,7 +10,6 @@ sys.path.append(os.path.join(dirname, "..", ".."))
 import easydel as ed  # this is first import
 
 import logging
-import jax
 import jax.numpy as jnp
 from datasets import load_dataset
 from transformers import AutoTokenizer
@@ -25,7 +24,7 @@ os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 SEQUENCE_LENGTH = 128
 NUM_TRAIN_EXAMPLES = 500
 NUM_EVAL_EXAMPLES = 500
-TOTAL_BATCH_SIZE = 1
+TOTAL_BATCH_SIZE = 4
 NUM_TRAIN_EPOCHS = 3
 LEARNING_RATE = 5e-4
 DATASET_NAME = "orpo-explorers/OpenHermesPreferences-10k"
@@ -33,7 +32,9 @@ MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.2"
 
 
 def create_model_and_tokenizer(
-	model_name_or_path=MODEL_NAME, sequence_length=SEQUENCE_LENGTH, dtype=jnp.float32
+	model_name_or_path=MODEL_NAME,
+	sequence_length=SEQUENCE_LENGTH,
+	dtype=jnp.float32,
 ):
 	"""Creates model and tokenizer."""
 	logging.info(f"Loading model: {model_name_or_path}")
@@ -87,6 +88,8 @@ def create_orpo_config(sequence_length=SEQUENCE_LENGTH, learning_rate=LEARNING_R
 		num_train_epochs=NUM_TRAIN_EPOCHS,
 		total_batch_size=TOTAL_BATCH_SIZE,
 		gradient_accumulation_steps=2,
+		do_eval=True,
+		do_train=True,
 		track_memory=False,
 		use_wandb=False,
 		learning_rate=learning_rate,
@@ -101,11 +104,6 @@ def create_orpo_config(sequence_length=SEQUENCE_LENGTH, learning_rate=LEARNING_R
 
 def orpo_main():
 	# Device selection (choose GPU if available, else CPU)
-	devices = jax.devices("gpu")
-	if not devices:
-		logging.warning("No GPU found, using CPU.")
-		devices = jax.devices("cpu")
-	jax.default_device(devices[0])
 
 	model, tokenizer = create_model_and_tokenizer()
 	train_dataset, eval_dataset = create_datasets()
@@ -122,9 +120,8 @@ def orpo_main():
 	)
 
 	logging.info("Starting training...")
-	out = trainer.train()
+	trainer.train()
 	logging.info("Training finished.")
-	print(out)
 
 
 if __name__ == "__main__":

@@ -249,6 +249,9 @@ class EasyDeLState(struct.PyTreeNode):
 	def merge(self, tree) -> EasyDeLBaseModule:
 		return nn.merge(self.graphdef, tree, self.graphother)
 
+	def merge_to_state(self, tree) -> EasyDeLState:
+		return self.replace(graphstate=tree)
+
 	@property
 	def model(self) -> EasyDeLBaseModule:
 		return nn.merge(self.graphdef, self.graphstate, self.graphother)

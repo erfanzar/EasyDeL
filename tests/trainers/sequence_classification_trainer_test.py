@@ -11,7 +11,7 @@ sys.path.append(
 		"../..",
 	)
 )
-
+import typing as tp
 import fjformer
 import flax.core
 from datasets import Dataset, IterableDataset
@@ -34,7 +34,7 @@ def create_sequence_classification_data_generator(
 	sequence_length: int,
 	vocab_size: int,
 	num_labels: int,
-	problem_type: Literal[
+	problem_type: tp.Literal[
 		"regression",
 		"single_label_classification",
 		"multi_label_classification",
@@ -136,7 +136,7 @@ def main(use_iterable_dataset: bool):
 			save_steps=10,
 			save_total_limit=5,
 			save_optimizer_state=True,
-			training_time="80Min",
+			training_time_limit="80Min",
 			optimizer=ed.EasyDeLOptimizers.ADAMW,
 			scheduler=ed.EasyDeLSchedulers.COSINE,
 			clip_grad=1.0,

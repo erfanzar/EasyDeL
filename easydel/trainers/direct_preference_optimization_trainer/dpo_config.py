@@ -7,25 +7,27 @@ from easydel.utils.compiling_utils import hash_fn
 from ..training_configurations import TrainingArguments
 
 
+LOSS_FN_VARIENTS = tp.Literal[
+	"sigmoid",
+	"hinge",
+	"ipo",
+	"exo_pair",
+	"nca_pair",
+	"robust",
+	"bco_pair",
+	"sppo_hard",
+	"aot",
+	"aot_pair",
+	"apo_zero",
+	"apo_down",
+]
+
+
 @dataclass
 class DPOConfig(TrainingArguments):
 	beta: float = 0.1
 	label_smoothing: float = 0.0
-	loss_type: tp.Literal[
-		"ipo",
-		"kto",
-		"hinge",
-		"sigmoid",
-		"robust",
-		"exo_pair",
-		"bco_pair",
-		"sppo_hard",
-		"nca_pair",
-		"aot_pair",
-		"aot",
-		"apo_zero",
-		"apo_down",
-	] = "sigmoid"
+	loss_type: LOSS_FN_VARIENTS = "sigmoid"
 	use_weighting: bool = False
 	label_pad_token_id: int = -100
 	padding_value: tp.Optional[int] = None

@@ -7,15 +7,16 @@ import flax
 dirname = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(dirname, "..", ".."))
 
-import easydel as ed
-
 import logging
+from functools import partial
+
+import fjformer
 import jax
 import jax.numpy as jnp
 from datasets import load_dataset
 from transformers import AutoTokenizer
-import fjformer
-from functools import partial
+
+import easydel as ed
 
 # Configure logging
 logging.basicConfig(
@@ -113,7 +114,7 @@ def create_sft_config(
 		save_steps=350,
 		save_total_limit=5,
 		save_optimizer_state=True,
-		training_time="80Min",
+		training_time_limit="80Min",
 		optimizer=ed.EasyDeLOptimizers.ADAMW,
 		scheduler=ed.EasyDeLSchedulers.COSINE,
 		clip_grad=1.0,

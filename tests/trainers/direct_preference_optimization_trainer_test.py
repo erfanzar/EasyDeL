@@ -50,7 +50,7 @@ def create_datasets(dataset_size=1000, train_split=500):
 	return train_dataset, eval_dataset
 
 
-def create_model_and_tokenizer(model_name_or_path, attention_dtype=jnp.float16):
+def create_model_and_tokenizer(model_name_or_path):
 	"""Creates model and tokenizer."""
 	logging.info(f"Loading model and tokenizer: {model_name_or_path}")
 	conf = ed.LlamaConfig(
@@ -62,7 +62,7 @@ def create_model_and_tokenizer(model_name_or_path, attention_dtype=jnp.float16):
 		max_position_embeddings=512,
 		use_scan_mlp=False,
 		attention_bias=False,
-		attn_dtype=attention_dtype,
+		attn_dtype=jnp.float32,
 		attn_mechanism=ed.AttentionMechanisms.VANILLA,
 	)
 	tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
@@ -104,7 +104,7 @@ def create_dpo_config(
 		num_train_epochs=4,
 		model_name=model_name,
 		save_directory=save_directory,
-		loss_type="kto",
+		loss_type="sigmoid",
 		total_batch_size=total_batch_size,
 		use_wandb=False,
 		learning_rate=learning_rate,
@@ -117,14 +117,14 @@ def create_dpo_config(
 		gradient_accumulation_steps=1,
 		step_start_point=0,
 		do_last_save=False,
-		training_time="7H",
+		training_time_limit=None,
 		track_memory=True,
 		max_length=max_length,
 		max_completion_length=max_completion_length,
 		max_prompt_length=max_prompt_length,
 		beta=0.1,
 		save_steps=50,
-		evaluation_steps=100,
+		# evaluation_steps=100,
 	)
 	logging.info("DPO config created successfully.")
 	return config
@@ -138,9 +138,9 @@ def main():
 
 	dpo_trainer = ed.DPOTrainer(
 		model=model,
-		ref_model=ref_model,
+		reference_model=ref_model,
 		train_dataset=train_dataset,
-		eval_dataset=eval_dataset,
+		# eval_dataset=eval_dataset,
 		processing_class=tokenizer,
 		arguments=arguments,
 	)

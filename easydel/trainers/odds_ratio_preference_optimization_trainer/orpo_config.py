@@ -31,7 +31,7 @@ class ORPOConfig(TrainingArguments):
 	label_pad_token_id: int = -100
 	is_encoder_decoder: bool = False
 	padding_value: int = None
-	apply_chat_template: bool = False
+	apply_chat_template: bool = True
 
 	def __post_init__(self):
 		if self.max_length is None:

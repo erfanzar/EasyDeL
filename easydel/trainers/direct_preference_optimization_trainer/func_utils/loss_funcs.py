@@ -19,6 +19,8 @@ import chex
 import jax
 from jax import numpy as jnp
 
+from jax.nn import sigmoid, relu, log_sigmoid as logsigmoid
+
 
 def get_loss_function(
 	loss_type: tp.Literal[
@@ -34,225 +36,288 @@ def get_loss_function(
 		"aot_pair",
 		"apo_zero",
 		"apo_down",
+		"discopop",
 	],
 	beta: float,
 	label_smoothing: tp.Union[float, int],
 ):
+	def _base_dpo_loss(
+		chosen_logps: chex.Array,
+		rejected_logps: chex.Array,
+		ref_chosen_logps: chex.Array,
+		ref_rejected_logps: chex.Array,
+		beta: float,
+		label_smoothing: float,
+		**kwargs,
+	) -> chex.Array:
+		"""Base DPO loss calculation."""
+		logratios = chosen_logps - rejected_logps
+		ref_logratios = ref_chosen_logps - ref_rejected_logps
+		logits = logratios - ref_logratios
+		return logits, logratios, ref_logratios
+
+	# Update existing and add missing loss functions
 	def _sigmoid_dpo_loss(
-		logits: chex.Array,
-		policy_chosen_log_probs: chex.Array = None,  # IGNORED
-		reference_chosen_log_probs: chex.Array = None,  # IGNORED
-		policy_rejected_log_probs: chex.Array = None,  # IGNORED
-		reference_rejected_log_probs: chex.Array = None,  # IGNORED
-	):
-		losses = (
-			-jax.nn.log_sigmoid(beta * logits) * (1 - label_smoothing)
-			- jax.nn.log_sigmoid(-beta * logits) * label_smoothing
+		chosen_logps: chex.Array,
+		rejected_logps: chex.Array,
+		ref_chosen_logps: chex.Array,
+		ref_rejected_logps: chex.Array,
+		beta: float,
+		label_smoothing: float,
+		**kwargs,
+	) -> chex.Array:
+		logits, _, _ = _base_dpo_loss(
+			chosen_logps,
+			rejected_logps,
+			ref_chosen_logps,
+			ref_rejected_logps,
+			beta,
+			label_smoothing,
 		)
-		return losses
+		return -(
+			jax.nn.log_sigmoid(beta * logits) * (1 - label_smoothing)
+			+ jax.nn.log_sigmoid(-beta * logits) * label_smoothing
+		)
+
+	def _nca_pair_dpo_loss(
+		chosen_logps: chex.Array,
+		rejected_logps: chex.Array,
+		ref_chosen_logps: chex.Array,
+		ref_rejected_logps: chex.Array,
+		beta: float,
+		label_smoothing: float,
+		**kwargs,
+	) -> chex.Array:
+		chosen_rewards = (chosen_logps - ref_chosen_logps) * beta
+		rejected_rewards = (rejected_logps - ref_rejected_logps) * beta
+		return -(
+			jax.nn.log_sigmoid(chosen_rewards)
+			+ 0.5 * jax.nn.log_sigmoid(-chosen_rewards)
+			+ 0.5 * jax.nn.log_sigmoid(-rejected_rewards)
+		)
+
+	def _aot_dpo_loss(
+		chosen_logps: chex.Array,
+		rejected_logps: chex.Array,
+		ref_chosen_logps: chex.Array,
+		ref_rejected_logps: chex.Array,
+		beta: float,
+		label_smoothing: float,
+		**kwargs,
+	) -> chex.Array:
+		logratios = chosen_logps - rejected_logps
+		ref_logratios = ref_chosen_logps - ref_rejected_logps
+		logratios_sorted = jnp.sort(logratios, axis=0)
+		ref_logratios_sorted = jnp.sort(ref_logratios, axis=0)
+		delta = logratios_sorted - ref_logratios_sorted
+		return -(
+			jax.nn.log_sigmoid(beta * delta) * (1 - label_smoothing)
+			+ jax.nn.log_sigmoid(-beta * delta) * label_smoothing
+		)
+
+	def _discopop_dpo_loss(
+		chosen_logps: chex.Array,
+		rejected_logps: chex.Array,
+		ref_chosen_logps: chex.Array,
+		ref_rejected_logps: chex.Array,
+		beta: float,
+		label_smoothing: float,
+		discopop_tau: float = 1.0,
+		**kwargs,
+	) -> chex.Array:
+		logits, _, _ = _base_dpo_loss(
+			chosen_logps,
+			rejected_logps,
+			ref_chosen_logps,
+			ref_rejected_logps,
+			beta,
+			label_smoothing,
+		)
+		logits = logits * beta
+		log_ratio_modulation = jax.nn.sigmoid(logits / discopop_tau)
+		logistic_component = -jax.nn.log_sigmoid(logits)
+		exp_component = jnp.exp(-logits)
+		return (
+			logistic_component * (1 - log_ratio_modulation)
+			+ exp_component * log_ratio_modulation
+		)
 
 	def _hinge_dpo_loss(
-		logits: chex.Array,
-		policy_chosen_log_probs: chex.Array,  # IGNORED
-		reference_chosen_log_probs: chex.Array,  # IGNORED
-		policy_rejected_log_probs: chex.Array,  # IGNORED
-		reference_rejected_log_probs: chex.Array,  # IGNORED
+		chosen_logps: chex.Array,
+		rejected_logps: chex.Array,
+		ref_chosen_logps: chex.Array,
+		ref_rejected_logps: chex.Array,
+		beta: float,
+		label_smoothing: float,
 	):
-		return jax.nn.relu(1 - beta * logits)
+		logits = (chosen_logps - rejected_logps) - (ref_chosen_logps - ref_rejected_logps)
+		return relu(1 - beta * logits)
 
 	def _ipo_dpo_loss(
-		logits: chex.Array,
-		policy_chosen_log_probs: chex.Array,  # IGNORED
-		reference_chosen_log_probs: chex.Array,  # IGNORED
-		policy_rejected_log_probs: chex.Array,  # IGNORED
-		reference_rejected_log_probs: chex.Array,  # IGNORED
+		chosen_logps: chex.Array,
+		rejected_logps: chex.Array,
+		ref_chosen_logps: chex.Array,
+		ref_rejected_logps: chex.Array,
+		beta: float,
+		label_smoothing: float,
 	):
+		logits = (chosen_logps - rejected_logps) - (ref_chosen_logps - ref_rejected_logps)
 		return (logits - 1 / (2 * beta)) ** 2
 
 	def _kto_pair_dpo_loss(
-		logits: chex.Array,  # IGNORED
-		policy_chosen_log_probs: chex.Array,
-		reference_chosen_log_probs: chex.Array,
-		policy_rejected_log_probs: chex.Array,
-		reference_rejected_log_probs: chex.Array,
+		chosen_logps: chex.Array,
+		rejected_logps: chex.Array,
+		ref_chosen_logps: chex.Array,
+		ref_rejected_logps: chex.Array,
+		beta: float,
+		label_smoothing: float,
 	):
-		x = jnp.mean(policy_chosen_log_probs - reference_chosen_log_probs)
-		chosen_kl = jax.lax.clamp(
-			min=jnp.array(0, dtype=x.dtype),
-			x=x,
-			max=jnp.array(1e9, dtype=x.dtype),
+		logits = (chosen_logps - rejected_logps) - (ref_chosen_logps - ref_rejected_logps)
+		return (
+			-logsigmoid(beta * logits) * (1 - label_smoothing)
+			- logsigmoid(-beta * logits) * label_smoothing
 		)
-		x = jnp.mean(policy_rejected_log_probs - reference_rejected_log_probs)
-		rejected_kl = jax.lax.clamp(
-			min=jnp.array(0, dtype=x.dtype),
-			x=x,
-			max=jnp.array(1e9, dtype=x.dtype),
-		)
-
-		chosen_log_ratios = policy_chosen_log_probs - reference_chosen_log_probs
-		rejected_log_ratios = policy_rejected_log_probs - reference_rejected_log_probs
-		losses = jnp.concatenate(
-			(
-				1 - jax.nn.sigmoid(beta * (chosen_log_ratios - rejected_kl)),
-				1 - jax.nn.sigmoid(beta * (chosen_kl - rejected_log_ratios)),
-			),
-			0,
-		)
-
-		return losses
 
 	def _robust_dpo_loss(
-		logits: jax.Array,
-		policy_chosen_log_probs: jax.Array = None,  # IGNORED
-		reference_chosen_log_probs: jax.Array = None,  # IGNORED
-		policy_rejected_log_probs: jax.Array = None,  # IGNORED
-		reference_rejected_log_probs: jax.Array = None,  # IGNORED
+		chosen_logps: chex.Array,
+		rejected_logps: chex.Array,
+		ref_chosen_logps: chex.Array,
+		ref_rejected_logps: chex.Array,
+		beta: float,
+		label_smoothing: float,
 	):
-		losses = (
-			-jax.nn.log_sigmoid(beta * logits) * (1 - label_smoothing)
-			+ jax.nn.log_sigmoid(-beta * logits) * label_smoothing
+		logits = (chosen_logps - rejected_logps) - (ref_chosen_logps - ref_rejected_logps)
+		return (
+			-logsigmoid(beta * logits) * (1 - label_smoothing)
+			+ logsigmoid(-beta * logits) * label_smoothing
 		) / (1 - 2 * label_smoothing)
-		return losses
 
 	def _exo_pair_dpo_loss(
-		logits: jax.Array,
-		policy_chosen_log_probs: jax.Array = None,  # IGNORED
-		reference_chosen_log_probs: jax.Array = None,  # IGNORED
-		policy_rejected_log_probs: jax.Array = None,  # IGNORED
-		reference_rejected_log_probs: jax.Array = None,  # IGNORED
+		chosen_logps: chex.Array,
+		rejected_logps: chex.Array,
+		ref_chosen_logps: chex.Array,
+		ref_rejected_logps: chex.Array,
+		beta: float,
+		label_smoothing: float,
 	):
-		nonlocal label_smoothing
-		if label_smoothing == 0:
-			label_smoothing = 1e-3
-		losses = jax.nn.sigmoid(beta * logits) * (
-			jax.nn.log_sigmoid(beta * logits) - jnp.log(1 - label_smoothing)
-		) + jax.nn.sigmoid(-beta * logits) * (
-			jax.nn.log_sigmoid(-beta * logits) - jnp.log(label_smoothing)
+		import math
+
+		logits = (chosen_logps - rejected_logps) - (ref_chosen_logps - ref_rejected_logps)
+		label_smoothing = jnp.maximum(label_smoothing, 1e-3)
+		return sigmoid(beta * logits) * (
+			logsigmoid(beta * logits) - math.log(1 - label_smoothing)
+		) + sigmoid(-beta * logits) * (
+			logsigmoid(-beta * logits) - math.log(label_smoothing)
 		)
-		return losses
 
 	def _bco_pair_dpo_loss(
-		logits: jax.Array,
-		policy_chosen_log_probs: jax.Array,
-		reference_chosen_log_probs: jax.Array,
-		policy_rejected_log_probs: jax.Array,
-		reference_rejected_log_probs: jax.Array,
+		chosen_logps: chex.Array,
+		rejected_logps: chex.Array,
+		ref_chosen_logps: chex.Array,
+		ref_rejected_logps: chex.Array,
+		beta: float,
+		label_smoothing: float,
 	):
-		chosen_logratios = policy_chosen_log_probs - reference_chosen_log_probs
-		rejected_logratios = policy_rejected_log_probs - reference_rejected_log_probs
-
-		# chosen_rewards = beta * chosen_logratios
-		# rejected_rewards = beta * rejected_logratios
-		# rewards = jnp.mean(jnp.concatenate((chosen_rewards, rejected_rewards), 0))
-		delta = 0
-
-		losses = -jax.nn.log_sigmoid(
-			(beta * chosen_logratios) - delta
-		) - jax.nn.log_sigmoid(-(beta * rejected_logratios - delta))
-		return losses
+		chosen_logratios = chosen_logps - ref_chosen_logps
+		rejected_logratios = rejected_logps - ref_rejected_logps
+		chosen_rewards = beta * chosen_logratios
+		rejected_rewards = beta * rejected_logratios
+		delta = jnp.mean(jnp.concatenate([chosen_rewards, rejected_rewards]))
+		return -logsigmoid((beta * chosen_logratios) - delta) - logsigmoid(
+			-(beta * rejected_logratios - delta)
+		)
 
 	def _sppo_hard_dpo_loss(
-		logits: jax.Array,
-		policy_chosen_log_probs: jax.Array,
-		reference_chosen_log_probs: jax.Array,
-		policy_rejected_log_probs: jax.Array,
-		reference_rejected_log_probs: jax.Array,
+		chosen_logps: chex.Array,
+		rejected_logps: chex.Array,
+		ref_chosen_logps: chex.Array,
+		ref_rejected_logps: chex.Array,
+		beta: float,
+		label_smoothing: float,
 	):
-		a = policy_chosen_log_probs - reference_chosen_log_probs
-		b = policy_rejected_log_probs - reference_rejected_log_probs
-
-		losses = (a - 0.5 / beta) ** 2 + (b + 0.5 / beta) ** 2
-		return losses
+		a = chosen_logps - ref_chosen_logps
+		b = rejected_logps - ref_rejected_logps
+		return (a - 0.5 / beta) ** 2 + (b + 0.5 / beta) ** 2
 
 	def _nca_pair_dpo_loss(
-		logits: jax.Array,
-		policy_chosen_log_probs: jax.Array,
-		reference_chosen_log_probs: jax.Array,
-		policy_rejected_log_probs: jax.Array,
-		reference_rejected_log_probs: jax.Array,
+		chosen_logps: chex.Array,
+		rejected_logps: chex.Array,
+		ref_chosen_logps: chex.Array,
+		ref_rejected_logps: chex.Array,
+		beta: float,
+		label_smoothing: float,
 	):
-		chosen_rewards = (policy_chosen_log_probs - reference_chosen_log_probs) * beta
-		rejected_rewards = (policy_rejected_log_probs - reference_rejected_log_probs) * beta
-		losses = (
-			-jax.nn.log_sigmoid(chosen_rewards)
-			- 0.5 * jax.nn.log_sigmoid(-chosen_rewards)
-			- 0.5 * jax.nn.log_sigmoid(-rejected_rewards)
+		chosen_rewards = (chosen_logps - ref_chosen_logps) * beta
+		rejected_rewards = (rejected_logps - ref_rejected_logps) * beta
+		return (
+			-logsigmoid(chosen_rewards)
+			- 0.5 * logsigmoid(-chosen_rewards)
+			- 0.5 * logsigmoid(-rejected_rewards)
 		)
-		return losses
 
 	def _aot_pair_dpo_loss(
-		logits: jax.Array,
-		policy_chosen_log_probs: jax.Array,
-		reference_chosen_log_probs: jax.Array,
-		policy_rejected_log_probs: jax.Array,
-		reference_rejected_log_probs: jax.Array,
+		chosen_logps: chex.Array,
+		rejected_logps: chex.Array,
+		ref_chosen_logps: chex.Array,
+		ref_rejected_logps: chex.Array,
+		beta: float,
+		label_smoothing: float,
 	):
-		chosen_logratios = policy_chosen_log_probs - reference_chosen_log_probs
-		rejected_logratios = policy_rejected_log_probs - reference_rejected_log_probs
-
+		chosen_logratios = chosen_logps - ref_chosen_logps
+		rejected_logratios = rejected_logps - ref_rejected_logps
 		chosen_logratios_sorted = jnp.sort(chosen_logratios, axis=0)
 		rejected_logratios_sorted = jnp.sort(rejected_logratios, axis=0)
-
 		delta = chosen_logratios_sorted - rejected_logratios_sorted
-
-		losses = (
-			-jax.nn.log_sigmoid(beta * delta) * (1 - label_smoothing)
-			- jax.nn.log_sigmoid(-beta * delta) * label_smoothing
+		return (
+			-logsigmoid(beta * delta) * (1 - label_smoothing)
+			- logsigmoid(-beta * delta) * label_smoothing
 		)
-		return losses
 
 	def _aot_dpo_loss(
-		logits: jax.Array,
-		policy_chosen_log_probs: jax.Array,
-		reference_chosen_log_probs: jax.Array,
-		policy_rejected_log_probs: jax.Array,
-		reference_rejected_log_probs: jax.Array,
+		chosen_logps: chex.Array,
+		rejected_logps: chex.Array,
+		ref_chosen_logps: chex.Array,
+		ref_rejected_logps: chex.Array,
+		beta: float,
+		label_smoothing: float,
 	):
-		pi_logratios = policy_chosen_log_probs - policy_rejected_log_probs
-		ref_logratios = reference_chosen_log_probs - reference_rejected_log_probs
-
-		pi_logratios_sorted = jnp.sort(pi_logratios, axis=0)
+		logratios = chosen_logps - rejected_logps
+		ref_logratios = ref_chosen_logps - ref_rejected_logps
+		logratios_sorted = jnp.sort(logratios, axis=0)
 		ref_logratios_sorted = jnp.sort(ref_logratios, axis=0)
-
-		delta = pi_logratios_sorted - ref_logratios_sorted
-
-		losses = (
-			-jax.nn.log_sigmoid(beta * delta) * (1 - label_smoothing)
-			- jax.nn.log_sigmoid(-beta * delta) * label_smoothing
+		delta = logratios_sorted - ref_logratios_sorted
+		return (
+			-logsigmoid(beta * delta) * (1 - label_smoothing)
+			- logsigmoid(-beta * delta) * label_smoothing
 		)
-		return losses
 
 	def _apo_zero_dpo_loss(
-		logits: jax.Array,
-		policy_chosen_log_probs: jax.Array,
-		reference_chosen_log_probs: jax.Array,
-		policy_rejected_log_probs: jax.Array,
-		reference_rejected_log_probs: jax.Array,
+		chosen_logps: chex.Array,
+		rejected_logps: chex.Array,
+		ref_chosen_logps: chex.Array,
+		ref_rejected_logps: chex.Array,
+		beta: float,
+		label_smoothing: float,
 	):
-		chosen_logratios = policy_chosen_log_probs - reference_chosen_log_probs
-		rejected_logratios = policy_rejected_log_probs - reference_rejected_log_probs
-
-		losses_chosen = 1 - jax.nn.sigmoid(beta * chosen_logratios)
-		losses_rejected = jax.nn.sigmoid(beta * rejected_logratios)
-
-		losses = losses_chosen + losses_rejected
-		return losses
+		chosen_logratios = chosen_logps - ref_chosen_logps
+		rejected_logratios = rejected_logps - ref_rejected_logps
+		losses_chosen = 1 - sigmoid(beta * chosen_logratios)
+		losses_rejected = sigmoid(beta * rejected_logratios)
+		return losses_chosen + losses_rejected
 
 	def _apo_down_dpo_loss(
-		logits: jax.Array,
-		policy_chosen_log_probs: jax.Array,
-		reference_chosen_log_probs: jax.Array,
-		policy_rejected_log_probs: jax.Array,
-		reference_rejected_log_probs: jax.Array,
+		chosen_logps: chex.Array,
+		rejected_logps: chex.Array,
+		ref_chosen_logps: chex.Array,
+		ref_rejected_logps: chex.Array,
+		beta: float,
+		label_smoothing: float,
 	):
-		chosen_logratios = policy_chosen_log_probs - reference_chosen_log_probs
-		rejected_logratios = policy_rejected_log_probs - reference_rejected_log_probs
-
-		losses_chosen = jax.nn.sigmoid(beta * chosen_logratios)
-		losses_rejected = 1 - jax.nn.sigmoid(beta * (chosen_logratios - rejected_logratios))
-
-		losses = losses_chosen + losses_rejected
-		return losses
+		chosen_logratios = chosen_logps - ref_chosen_logps
+		rejected_logratios = rejected_logps - ref_rejected_logps
+		losses_chosen = sigmoid(beta * chosen_logratios)
+		losses_rejected = 1 - sigmoid(beta * (chosen_logratios - rejected_logratios))
+		return losses_chosen + losses_rejected
 
 	loss_function = {
 		"ipo": _ipo_dpo_loss,
@@ -268,6 +333,7 @@ def get_loss_function(
 		"aot": _aot_dpo_loss,
 		"apo_zero": _apo_zero_dpo_loss,
 		"apo_down": _apo_down_dpo_loss,
+		"discopop": _discopop_dpo_loss,
 	}.get(loss_type, None)
 	assert loss_function is not None, f"given loss_type({loss_function}) is not valid"
 	return loss_function

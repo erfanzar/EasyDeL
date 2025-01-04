@@ -57,6 +57,7 @@ class LossConfig:
 	num_labels: tp.Optional[str] = None
 	problem_type: tp.Optional[str] = None
 	divide_weight_sum: bool = False
+	break_on_nan: bool = True
 	num_classification_labels: tp.Optional[int] = None
 	classification_problem_type: tp.Optional[
 		tp.Literal[
@@ -76,6 +77,7 @@ class LossConfig:
 				"num_labels": self.num_labels,
 				"problem_type": self.problem_type,
 				"divide_weight_sum": self.divide_weight_sum,
+				"break_on_nan": self.break_on_nan,
 				"num_classification_labels": self.num_classification_labels,
 				"classification_problem_type": self.classification_problem_type,
 			}

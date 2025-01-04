@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .dpo_trainer import DPOConfig, DPOTrainer, DPOTrainerOutput
+from .dpo_trainer import DPOConfig, DPOTrainer
 
-__all__ = ["DPOTrainer", "DPOTrainerOutput", "DPOConfig"]
+__all__ = "DPOTrainer", "DPOConfig"

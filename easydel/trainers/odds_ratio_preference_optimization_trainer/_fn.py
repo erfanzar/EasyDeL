@@ -23,7 +23,13 @@ from jax.sharding import PartitionSpec
 
 from easydel.escale import with_sharding_constraint
 from easydel.infra.base_state import EasyDeLState
-from easydel.infra.loss_utils import LossMetrics
+from easydel.infra.loss_utils import LossConfig, LossMetrics
+from easydel.trainers.training_utils import (
+	make_assertions_and_get_sizes,
+	minibatch_call,
+	update_metrics,
+	update_state_respectfully,
+)
 
 
 def pad_to_length(
@@ -48,127 +54,101 @@ def pad_to_length(
 		)
 
 
-def create_concatenated_forward(
+def concatenated_forward(
+	state: EasyDeLState,
+	batch: tp.Mapping[str, tp.Union[tp.List, chex.Array]],
 	is_encoder_decoder,
 	label_pad_token_id,
 	padding_value,
-	truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
 	fixed_max_length: int | None = None,
-):
-	"""The create_concatenated_forward function is a helper function that creates a forward pass function for the
-	model. The forward pass function takes in an apply_fn, which is the model's apply_fn, and runs it on concatenated
-	inputs. It returns chosen log probs, rejected log probs, chosen logits and rejected logits.
+) -> tp.Tuple[chex.Array, chex.Array, chex.Array, chex.Array, chex.Array]:
+	"""The concatenated_forward function is used to compute the log-probabilities of both chosen and rejected labels.
 
 	Args:
-	    is_encoder_decoder: Determine whether the model is an encoder-
-	        decoder model or not
-	    label_pad_token_id: Pad the labels to the same length
-	    padding_value: Pad the inputs to the same length
-	    truncation_mode: tp.Literal["keep_end","keep_start"]: where
-	        to pad and where to keep.
-	    fixed_max_length: int|None: by providing fixed_max_length the
-	        func will always return a fixed sequence length
-	and won't use dynamic methods.
+			apply_fn: tp.Callable: Pass in the model function
+			params: dict | FrozenDict: Pass the model
+					parameters to the function
+			batch: tp.Dict[str, tp.Union[tp.List, chex.Array]] : Pass the batch
+					of data to the concatenated_forward function
 
 	Returns:
-	    A function that takes in a apply_fn, params and a batch of
-	    inputs,
+			The log_probs of the chosen and rejected labels, as well as
+			their corresponding logits
 	"""
+	assert (
+		padding_value is not None
+	), "`padding_value` can not be set as `None` it must be an integer."
+	concatenated_batch = concatenated_inputs(
+		batch,
+		is_encoder_decoder=is_encoder_decoder,
+		label_pad_token_id=label_pad_token_id,
+		padding_value=padding_value,
+		fixed_max_length=fixed_max_length,
+	)
+	len_chosen = batch["chosen_labels"].shape[0]
+	concatenated_batch["concatenated_input_ids"] = concatenated_batch[
+		"concatenated_input_ids"
+	].reshape(concatenated_batch["concatenated_input_ids"].shape[0], -1)
+	concatenated_batch["concatenated_labels"] = concatenated_batch[
+		"concatenated_labels"
+	].reshape(concatenated_batch["concatenated_labels"].shape[0], -1)
+	concatenated_batch["concatenated_attention_mask"] = concatenated_batch[
+		"concatenated_attention_mask"
+	].reshape(concatenated_batch["concatenated_attention_mask"].shape[0], -1)
+	model_kwargs = (
+		{
+			"labels": concatenated_batch["concatenated_labels"],
+			"decoder_input_ids": concatenated_batch.pop(
+				"concatenated_decoder_input_ids", None
+			),
+		}
+		if is_encoder_decoder
+		else {}
+	)
+	all_logits = state.model(
+		concatenated_batch["concatenated_input_ids"],
+		attention_mask=concatenated_batch["concatenated_attention_mask"],
+		**model_kwargs,
+	).logits
 
-	def concatenated_forward(
-		state: EasyDeLState,
-		batch: tp.Mapping[str, tp.Union[tp.List, chex.Array]],
-	) -> tp.Tuple[chex.Array, chex.Array, chex.Array, chex.Array, chex.Array]:
-		"""The concatenated_forward function is used to compute the log-probabilities of both chosen and rejected labels.
+	def cross_entropy_loss(logits, labels, mask):
+		if not is_encoder_decoder:
+			logits = logits[..., :-1, :]
+			labels = labels[..., 1:]
+			mask = mask[..., 1:]
+		loss = cross_entropy_loss_and_accuracy(logits, labels, mask)[0]
+		return loss
 
-		Args:
-		    apply_fn: tp.Callable: Pass in the model function
-		    params: dict | FrozenDict: Pass the model
-		        parameters to the function
-		    batch: tp.Dict[str, tp.Union[tp.List, chex.Array]] : Pass the batch
-		        of data to the concatenated_forward function
+	if is_encoder_decoder:
+		labels = concatenated_batch["concatenated_labels"]
+	else:
+		labels = concatenated_batch["concatenated_input_ids"]
 
-		Returns:
-		    The log_probs of the chosen and rejected labels, as well as
-		    their corresponding logits
-		"""
-		assert (
-			padding_value is not None
-		), "`padding_value` can not be set as `None` it must be an integer."
-		concatenated_batch = concatenated_inputs(
-			batch,
-			is_encoder_decoder=is_encoder_decoder,
-			label_pad_token_id=label_pad_token_id,
-			padding_value=padding_value,
-			truncation_mode=truncation_mode,
-			fixed_max_length=fixed_max_length,
-		)
-		len_chosen = batch["chosen_labels"].shape[0]
-		concatenated_batch["concatenated_input_ids"] = concatenated_batch[
-			"concatenated_input_ids"
-		].reshape(concatenated_batch["concatenated_input_ids"].shape[0], -1)
-		concatenated_batch["concatenated_labels"] = concatenated_batch[
-			"concatenated_labels"
-		].reshape(concatenated_batch["concatenated_labels"].shape[0], -1)
-		concatenated_batch["concatenated_attention_mask"] = concatenated_batch[
-			"concatenated_attention_mask"
-		].reshape(concatenated_batch["concatenated_attention_mask"].shape[0], -1)
-		model_kwargs = (
-			{
-				"labels": concatenated_batch["concatenated_labels"],
-				"decoder_input_ids": concatenated_batch.pop(
-					"concatenated_decoder_input_ids", None
-				),
-			}
-			if is_encoder_decoder
-			else {}
-		)
-		all_logits = state.model(
-			concatenated_batch["concatenated_input_ids"],
-			attention_mask=concatenated_batch["concatenated_attention_mask"],
-			**model_kwargs,
-		).logits
+	chosen_nll_loss = cross_entropy_loss(
+		all_logits[:len_chosen],
+		labels[:len_chosen],
+		concatenated_batch["concatenated_attention_mask"][:len_chosen],
+	)
+	all_log_probs = get_batch_log_probs(
+		all_logits,
+		concatenated_batch["concatenated_labels"],
+		average_log_prob=False,
+		is_encoder_decoder=is_encoder_decoder,
+		label_pad_token_id=label_pad_token_id,
+	)
 
-		def cross_entropy_loss(logits, labels, mask):
-			if not is_encoder_decoder:
-				logits = logits[..., :-1, :]
-				labels = labels[..., 1:]
-				mask = mask[..., 1:]
-			loss = cross_entropy_loss_and_accuracy(logits, labels, mask)[0]
-			return loss
+	chosen_log_probs = all_log_probs[:len_chosen]
+	rejected_log_probs = all_log_probs[len_chosen:]
 
-		if is_encoder_decoder:
-			labels = concatenated_batch["concatenated_labels"]
-		else:
-			labels = concatenated_batch["concatenated_input_ids"]
-
-		chosen_nll_loss = cross_entropy_loss(
-			all_logits[:len_chosen],
-			labels[:len_chosen],
-			concatenated_batch["concatenated_attention_mask"][:len_chosen],
-		)
-		all_log_probs = get_batch_log_probs(
-			all_logits,
-			concatenated_batch["concatenated_labels"],
-			average_log_prob=False,
-			is_encoder_decoder=is_encoder_decoder,
-			label_pad_token_id=label_pad_token_id,
-		)
-
-		chosen_log_probs = all_log_probs[:len_chosen]
-		rejected_log_probs = all_log_probs[len_chosen:]
-
-		chosen_logits = all_logits[:len_chosen]
-		rejected_logits = all_logits[len_chosen:]
-		return (
-			chosen_log_probs,
-			rejected_log_probs,
-			chosen_logits,
-			rejected_logits,
-			chosen_nll_loss,
-		)
-
-	return concatenated_forward
+	chosen_logits = all_logits[:len_chosen]
+	rejected_logits = all_logits[len_chosen:]
+	return (
+		chosen_log_probs,
+		rejected_log_probs,
+		chosen_logits,
+		rejected_logits,
+		chosen_nll_loss,
+	)
 
 
 def get_batch_log_probs(
@@ -228,7 +208,6 @@ def concatenated_inputs(
 	is_encoder_decoder: bool = False,
 	label_pad_token_id: int = -100,
 	padding_value: int = 0,
-	truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
 	fixed_max_length: int | None = None,
 ) -> tp.Dict[str, chex.Array]:
 	"""The concatenated_inputs function takes a batch of chosen and rejected examples,
@@ -251,8 +230,6 @@ def concatenated_inputs(
 	        use dynamic methods.
 	Allow for the batch to be a list of arrays or just an array,
 	Specify the type of data that is being passed in
-
-	array or the end of the array?.
 
 	Returns:
 	    A dictionary of the concatenated inputs
@@ -349,89 +326,87 @@ def odds_ratio_loss(
 	)
 
 
-def create_step_function(
+def orpo_step(
+	state: EasyDeLState,
+	batch: dict,
 	concatenated_forward: tp.Callable,
 	beta: float = 0.1,
+	learning_rate_fn: tp.Optional[tp.Callable] = None,
 	mode: tp.Literal["train", "eval"] = "train",
-	batch_partition_spec: tp.Optional[PartitionSpec] = None,
-):
-	"""The create_step_function function is a helper function that creates the ORPO training step.
+	loss_config: tp.Optional[LossConfig] = None,
+	partition_spec: tp.Optional[PartitionSpec] = None,
+	gradient_accumulation_steps: int = 1,
+) -> tuple[EasyDeLState, LossMetrics] | LossMetrics:
+	batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+		batch=batch,
+		batch_partition_spec=partition_spec,
+		gradient_accumulation_steps=gradient_accumulation_steps if mode == "train" else 1,
+	)
 
-	Args:
-	    concatenated_forward: tp.Callable: Define the forward pass of the
-	        model
-	    beta: float: Scale the logits
-	    mode: tp.Literal["train", "eval"] : "train", "eval" function modes
-	    batch_partition_spec: PartitionSpec: Batch PartitionSpec
+	batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
 
-	Returns:
-	    A function that takes in a state and a batch
-	"""
-	if batch_partition_spec is None:
-		batch_partition_spec = PartitionSpec(("fsdp", "dp"), "sp")
+	def calculate_loss(tree: nn.GraphState, batch: tp.Dict):
+		(
+			mean_chosen_logits,
+			mean_rejected_logits,
+			policy_chosen_logits,
+			policy_rejected_logits,
+			policy_nll_loss,
+		) = concatenated_forward(state.merge_to_state(tree), batch)
 
-	def orpo_step(state: EasyDeLState, batch: dict) -> tuple[EasyDeLState, LossMetrics]:
-		"""The orpo_step function is the core of ORPO. It takes a state and a batch,
-		and returns an updated state. The update is done by calculating the loss
-		for each example in the batch, then taking its gradient with respect to
-		the parameters of the policy network (which are stored in `state`). This
-		gradient is then used to update `state`.
+		(
+			losses,
+			chosen_rewards,
+			rejected_rewards,
+			log_odds_ratio,
+			log_odds_chosen,
+		) = odds_ratio_loss(beta, mean_chosen_logits, mean_rejected_logits)
 
-		Args:
-		    state: EasyDeLState: Store the parameters of the model
-		    batch: dict: Pass the data to the model
+		loss = policy_nll_loss - losses.mean()
 
-		Returns:
-		    A new state, which is a collection of the parameters and
-		    apply_fn
-		"""
-		batch = with_sharding_constraint(
-			arr=batch,
-			sharding=batch_partition_spec,
+		reward_accuracies = (chosen_rewards > rejected_rewards).astype("float32")
+		metrics = {
+			"rewards/chosen": chosen_rewards.mean(),
+			"rewards/rejected": rejected_rewards.mean(),
+			"rewards/accuracies": reward_accuracies.mean(),
+			"rewards/margins": (chosen_rewards - rejected_rewards).mean(),
+			"logps/rejected": mean_rejected_logits.mean(),
+			"logps/chosen": mean_chosen_logits.mean(),
+			"logits/rejected": policy_rejected_logits.mean(),
+			"logits/chosen": policy_chosen_logits.mean(),
+			"nll_loss": policy_nll_loss.mean(),
+			"log_odds_ratio": log_odds_ratio,
+			"log_odds_chosen": log_odds_chosen,
+		}
+
+		if mode == "eval":
+			metrics = {f"eval_{k}": v for k, v in metrics.items()}
+
+		return loss, LossMetrics(
+			loss=loss,
+			other_metrics=metrics,
 		)
 
-		def calculate_loss(tree: nn.GraphState):
-			(
-				policy_chosen_log_probs,
-				policy_rejected_log_probs,
-				policy_chosen_logits,
-				policy_rejected_logits,
-				policy_nll_loss,
-			) = concatenated_forward(state.merge(tree), batch)
-
-			(
-				losses,
-				chosen_rewards,
-				rejected_rewards,
-				log_odds_ratio,
-				log_odds_chosen,
-			) = odds_ratio_loss(beta, policy_chosen_log_probs, policy_rejected_log_probs)
-
-			loss = policy_nll_loss - losses.mean()
-
-			reward_accuracies = (chosen_rewards > rejected_rewards).astype("float32")
-			metrics = {}
-			prefix = "eval_" if mode == "eval" else ""
-			metrics[f"{prefix}rewards/chosen"] = chosen_rewards.mean()
-			metrics[f"{prefix}rewards/rejected"] = rejected_rewards.mean()
-			metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.mean()
-			metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).mean()
-			metrics[f"{prefix}logps/rejected"] = policy_rejected_log_probs.mean()
-			metrics[f"{prefix}logps/chosen"] = policy_chosen_log_probs.mean()
-			metrics[f"{prefix}logits/rejected"] = policy_rejected_logits.mean()
-			metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.mean()
-			metrics[f"{prefix}nll_loss"] = policy_nll_loss.mean()
-			metrics[f"{prefix}log_odds_ratio"] = log_odds_ratio
-			metrics[f"{prefix}log_odds_chosen"] = log_odds_chosen
-			return loss, metrics
-
-		if mode == "train":
-			grad_fn = jax.value_and_grad(calculate_loss, has_aux=True)
-			(_loss, (_metrics)), grads = grad_fn(state.params)
-			new_state = state.apply_gradients(grads=grads)
-		else:
-			_loss, _metrics = calculate_loss(state.params)
-			new_state = state
-		return new_state, LossMetrics(loss=_loss, other_metrics=_metrics)
-
-	return orpo_step
+	if mode == "train":
+		gradients, metrics = minibatch_call(
+			state=state,
+			batch=batch,
+			minibatch_size=minibatch_size,
+			grad_fn=jax.value_and_grad(calculate_loss, has_aux=True),
+		)
+		state = update_state_respectfully(
+			state=state,
+			gradients=gradients,
+			loss_config=loss_config,
+			metrics=metrics,
+		)
+		metrics = update_metrics(
+			metrics=metrics,
+			learning_rate_fn=learning_rate_fn,
+			step=state.step,
+			gradients=gradients,
+		)
+		return state, metrics
+	else:
+		_, metrics = calculate_loss(state.graphstate, batch)
+		return metrics
