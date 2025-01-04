@@ -11,22 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import time
 import typing
 import typing as tp
+import warnings
 from collections import defaultdict
+from functools import partial
 
 import jax
 import numpy as np
 from jax import jit
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-from tqdm.autonotebook import tqdm
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
-from easydel.infra.errors import EasyDeLTimerError
+from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
 from easydel.infra.loss_utils import LossMetrics
+from easydel.trainers.trainer.trainer import Trainer
 from easydel.utils.helpers import get_logger
 
 from ..base_trainer import (
@@ -37,9 +38,7 @@ from ..base_trainer import (
 from ..direct_preference_optimization_trainer.utils import (
 	DPODataCollatorWithPadding,
 )
-from ..trainer_protocol import MetricsTracker, StepMetrics
-from ._fns import create_concatenated_forward, create_step_function
-from .modelling_output import ORPOTrainerOutput
+from ._fn import concatenated_forward, orpo_step
 from .orpo_config import ORPOConfig
 
 if tp.TYPE_CHECKING:
@@ -57,17 +56,16 @@ else:
 logger = get_logger(__name__)
 
 
-class ORPOTrainer(BaseTrainer):
+class ORPOTrainer(Trainer):
 	def __init__(
 		self,
 		arguments: ORPOConfig,
-		model: tp.Optional[EasyDeLBaseModule] = None,
+		model: tp.Optional[tp.Union[EasyDeLBaseModule, EasyDeLState]] = None,
 		data_collator: tp.Optional[DPODataCollatorWithPadding] = None,
 		train_dataset: tp.Optional[Dataset] = None,
 		eval_dataset: tp.Optional[tp.Union[Dataset, tp.Dict[str, Dataset]]] = None,
 		tokenizer: tp.Optional[PreTrainedTokenizerBase] = None,
 		dataset_num_proc: tp.Optional[int] = None,
-		_do_init_fns: bool = True,
 		dataset_map_arguments: tp.Optional[tp.Dict[str, tp.Any]] = None,
 		low_mem_usage: bool = False,
 	):
@@ -81,7 +79,6 @@ class ORPOTrainer(BaseTrainer):
 		    eval_dataset (tp.Optional[tp.Union[Dataset, tp.Dict[str, Dataset]]], optional): The evaluation dataset. Defaults to None.
 		    tokenizer (tp.Optional[PreTrainedTokenizerBase], optional): The tokenizer used for preprocessing. Defaults to None.
 		    dataset_num_proc (tp.Optional[int], optional): The number of processes to use for dataset mapping. Defaults to None.
-		    _do_init_fns (bool, optional): Whether to automatically initialize trainer functions. Defaults to True.
 		    dataset_map_arguments (tp.Optional[tp.Dict[str, tp.Any]], optional): Arguments to pass to the dataset `map` function for tokenization. Defaults to None.
 		    low_mem_usage (bool, optional): Whether to prioritize low memory usage during training. Defaults to False.
 
@@ -131,12 +128,14 @@ class ORPOTrainer(BaseTrainer):
 			train_dataset = train_dataset.map(
 				self.tokenize_row,
 				num_proc=dataset_num_proc,
+				batched=False,
 				**dataset_map_arguments,
 			)
 			if eval_dataset is not None:
 				eval_dataset = eval_dataset.map(
 					self.tokenize_row,
 					num_proc=dataset_num_proc,
+					batched=False,
 					**dataset_map_arguments,
 				)
 			arguments.offload_device = off_div
@@ -149,16 +148,13 @@ class ORPOTrainer(BaseTrainer):
 		self.eval_dataset = eval_dataset
 		self.tokenizer = tokenizer
 		self._loggers_initialized = False
-		self.mesh = self.model.mesh
+		if not isinstance(model, EasyDeLState):
+			model = model.to_state()
+		model_state = model
+		self.mesh = model_state.model.mesh
 		assert (
 			arguments.padding_value is not None
 		), "`padding_value` can not be set as `None` it must be an integer."
-
-		self.concatenated_forward = create_concatenated_forward(
-			is_encoder_decoder=arguments.is_encoder_decoder,
-			padding_value=arguments.padding_value,
-			label_pad_token_id=arguments.label_pad_token_id,
-		)
 
 		self._cached_p_l_s = None
 		self._cached_c_l_s = None
@@ -166,16 +162,17 @@ class ORPOTrainer(BaseTrainer):
 
 		super().__init__(
 			arguments=arguments,
-			model=model,
+			model_state=model_state,
 			dataset_train=train_dataset,
 			dataset_eval=eval_dataset,
 			finetune=True,
 			checkpoint_path=None,
-			_do_init_fns=_do_init_fns,
 		)
 
 	def build_tokenized_answer(
-		self, prompt: str, answer: str
+		self,
+		prompt: str,
+		answer: str,
 	) -> tp.Dict[str, np.ndarray]:
 		"""
 		Tokenizes a prompt and answer pair, handling special tokens and padding/truncation.
@@ -273,6 +270,7 @@ class ORPOTrainer(BaseTrainer):
 		value = feature[key]
 		if self.arguments.apply_chat_template and key in ["chosen", "rejected"]:
 			value = self.tokenizer.apply_chat_template(value, tokenize=False)
+
 		if not isinstance(value, str):
 			raise ValueError(f"{key} should be a string but got {type(value)}")
 		return value
@@ -403,31 +401,71 @@ class ORPOTrainer(BaseTrainer):
 		    TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
 		"""
 		mesh = self.model.mesh
-
+		partial_concatenated_forward = partial(
+			concatenated_forward,
+			is_encoder_decoder=self.arguments.is_encoder_decoder,
+			padding_value=self.arguments.padding_value,
+			label_pad_token_id=self.arguments.label_pad_token_id,
+		)
+		jited_concatenated_forward = jax.jit(
+			partial_concatenated_forward,
+			static_argnames=[
+				"is_encoder_decoder",
+				"padding_value",
+				"label_pad_token_id",
+			],
+		)
 		empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=mesh)
 		sharded_training_step_function = jit(
-			create_step_function(
-				concatenated_forward=self.concatenated_forward,
+			partial(
+				orpo_step,
+				concatenated_forward=partial_concatenated_forward,
 				beta=self.arguments.beta,
+				learning_rate_fn=self.scheduler,
 				mode="train",
-				batch_partition_spec=self.arguments.step_partition_spec,
+				partition_spec=self.arguments.step_partition_spec,
+				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
+				loss_config=self.arguments.loss_config,
 			),
 			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=(self.state_shardings, empty_sharding),
+			static_argnames=[
+				"concatenated_forward",
+				"beta",
+				"learning_rate_fn",
+				"mode",
+				"partition_spec",
+				"gradient_accumulation_steps",
+				"loss_config",
+			],
 		)
 
 		sharded_evaluation_step_function = jit(
-			create_step_function(
-				concatenated_forward=self.concatenated_forward,
+			partial(
+				orpo_step,
+				concatenated_forward=partial_concatenated_forward,
 				beta=self.arguments.beta,
+				learning_rate_fn=self.scheduler,
 				mode="eval",
-				batch_partition_spec=self.arguments.step_partition_spec,
+				partition_spec=self.arguments.step_partition_spec,
+				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
+				loss_config=self.arguments.loss_config,
 			),
 			in_shardings=(self.state_shardings, empty_sharding),
-			out_shardings=(self.state_shardings, empty_sharding),
+			out_shardings=(empty_sharding),
+			static_argnames=[
+				"concatenated_forward",
+				"beta",
+				"learning_rate_fn",
+				"mode",
+				"partition_spec",
+				"gradient_accumulation_steps",
+				"loss_config",
+			],
 		)
 
 		self.arguments.ensure_checkpoint_path()
+		self.concatenated_forward = jited_concatenated_forward
 		checkpoint_manager = self.arguments.get_streaming_checkpointer()
 
 		return TrainerConfigureFunctionOutput(
@@ -436,79 +474,6 @@ class ORPOTrainer(BaseTrainer):
 			mesh=mesh,
 			checkpoint_manager=checkpoint_manager,
 		)
-
-	def initialize_trainer_utils(self):
-		"""
-		Initializes various utilities used by the trainer.
-
-		This includes setting up Weights & Biases, initializing the training timer,
-		configuring dataloaders, configuring the model and optimizer, sharding the
-		model and reference model states, and configuring the training and evaluation functions.
-		"""
-		self._initialize_wandb()
-		self._initialize_timer()
-		self._configure_dataloaders()
-		self._configure_model()
-		self._configure_functions()
-
-	def _configure_dataloaders(self):
-		"""
-		Configures the dataloaders for training and evaluation.
-
-		This method retrieves the dataloaders from the `configure_dataloaders` method,
-		sets the maximum training and evaluation steps, and logs the time taken for
-		this configuration.
-		"""
-
-		operation_name = "configure dataloaders"
-
-		with self.timer(operation_name):
-			dataset_configurations = self.configure_dataloaders()
-			self.dataloader_train = dataset_configurations.dataloader_train
-			self.max_training_steps = dataset_configurations.max_training_steps
-			self.dataloader_eval = dataset_configurations.dataloader_eval
-			self.max_evaluation_steps = dataset_configurations.max_evaluation_steps
-		self.timer.log(operation_name)
-
-	def _configure_model(self):
-		"""
-		Configures the model, optimizer, scheduler, and configuration.
-
-		This method retrieves the model, optimizer, scheduler, and configuration from
-		the `configure_model` method and configures LoRA (if enabled). It also logs
-		the time taken for this configuration.
-		"""
-		operation_name = "configure Model, Optimizer, Scheduler and Config"
-		with self.timer(operation_name):
-			model_configurations = self.configure_model()
-			model = model_configurations.model
-			tx = model_configurations.tx
-			scheduler = model_configurations.scheduler
-			config = model_configurations.config
-			self.model = model
-			self.tx = tx
-			self.scheduler = scheduler
-			self.config = config
-
-		self.timer.log(operation_name)
-
-	def _configure_functions(self):
-		"""
-		Configures and JIT-compiles the training and evaluation step functions.
-
-		This method retrieves the configured functions from the `configure_functions`
-		method, sets up the mesh, checkpoint manager, and state initialization
-		function, and logs the time taken for this configuration.
-		"""
-		operation_name = "configure functions and sharding them"
-		with self.timer(operation_name):
-			functions = self.configure_functions()
-			self.sharded_training_step_function = functions.sharded_training_step_function
-			self.sharded_evaluation_step_function = functions.sharded_evaluation_step_function
-			self.mesh = functions.mesh
-			self.checkpoint_manager = functions.checkpoint_manager
-			self.initialize_state_function = functions.initialize_state_function
-		self.timer.log(operation_name)
 
 	def create_collect_function(
 		self,
@@ -576,8 +541,7 @@ class ORPOTrainer(BaseTrainer):
 
 		return tensorflow_datasets.as_numpy(
 			train_dataset.to_tf_dataset(
-				batch_size=self.arguments.total_batch_size
-				* self.arguments.gradient_accumulation_steps,
+				batch_size=self.training_batch_size,
 				collate_fn=data_collator,
 				num_workers=self.arguments.dataloader_num_workers,
 				shuffle=True,
@@ -620,7 +584,7 @@ class ORPOTrainer(BaseTrainer):
 
 		return tensorflow_datasets.as_numpy(
 			eval_dataset.to_tf_dataset(
-				batch_size=self.arguments.eval_batch_size,
+				batch_size=self.evaluation_batch_size,
 				collate_fn=self.data_collator,
 				num_workers=self.arguments.dataloader_num_workers,
 				shuffle=False,
@@ -652,266 +616,49 @@ class ORPOTrainer(BaseTrainer):
 		eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
 		return self._get_eval_dataloader(eval_dataset=eval_dataset)
 
-	def _run_training_loop(
-		self,
-		metrics_tracker: MetricsTracker,
-		step_metrics: StepMetrics,
-		start_time: float,
-	):
-		"""Core training loop implementation."""
-		pbar = tqdm(total=self.max_training_steps)
-		current_step = int(jax.device_get(self.model_state.step))
-		run_exception = None
-		with self.mesh:
-			for epoch in range(self.arguments.num_train_epochs):
-				current_step, run_exception = self._train_epoch(
-					train_dataset=self.dataloader_train,
-					current_step=current_step,
-					metrics_tracker=metrics_tracker,
-					step_metrics=step_metrics,
-					pbar=pbar,
-					epoch=epoch,
-				)
-
-				if current_step >= self.max_training_steps:
-					break
-				if run_exception is not None:
-					break
-		return self._prepare_training_output(
-			state=self.model_state,
-			run_exception=run_exception,
-		), run_exception
-
-	def _run_evaluation(
-		self,
-		sharded_state: EasyDeLState,
-		metrics_tracker: MetricsTracker,
-		step_metrics: StepMetrics,
-	):
-		"""Core evaluation loop implementation."""
-		pbar = tqdm(total=self.max_evaluation_steps)
-		pbar.set_description("evaluation process")
-		current_step = int(jax.device_get(sharded_state.step))
-		with self.mesh:
-			for eval_metrics in self._eval_epoch(
-				sharded_state=sharded_state,
-				eval_dataset=self.dataloader_eval,
-				current_step=current_step,
-				metrics_tracker=metrics_tracker,
-				step_metrics=step_metrics,
-				pbar=pbar,
-			):
-				yield eval_metrics
-
-	def _train_epoch(
-		self,
-		train_dataset,
-		current_step: int,
-		metrics_tracker: MetricsTracker,
-		step_metrics: StepMetrics,
-		pbar: tqdm,
-		epoch: int,
-	):
-		"""Handles training for a single epoch."""
-		train_iter = iter(train_dataset)
-		for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
-			try:  # to make training loop safer if user wants to break that.
-				batch = self._get_next_batch(train_iter)
-				if self._should_skip_step(current_step):
-					pbar.update(1)
-					continue
-				step_metrics.start_step()
-			except (KeyboardInterrupt, EasyDeLTimerError, StopIteration) as exect:
-				return self.model_state, current_step, exect
-
-			# Execute training step
-			loss, metrics, run_exception = self._execute_train_step(batch)
-			# Update and log metrics
-			try:
-				mean_loss = metrics_tracker.update(loss, float("inf"), current_step)
-
-				train_metrics = step_metrics.calculate(
-					loss=loss,
-					metrics=metrics,
-					current_step=current_step,
-					learning_rate=self.scheduler(current_step)
-					if self.scheduler is not None
-					else self.arguments.learning_rate,
-					epoch=epoch,
-					flops_per_device=getattr(self, "_flops_per_device", 0),
-					batch_size=self.arguments.total_batch_size
-					* self.arguments.gradient_accumulation_steps,
-					seq_length=self.arguments.max_prompt_length
-					+ self.arguments.max_completion_length * 2,
-					mean_loss=mean_loss,
-					mode="train",
-				)
-
-				self._log_metrics(
-					metrics=train_metrics,
-					pbar=pbar,
-					step=current_step,
-					mode="train",
-				)
-
-				# Save checkpoint if needed
-				if self._should_save_checkpoint(current_step):
-					_ = self._save_state(state=self.model_state)
-
-				if self._should_run_evaluation(current_step):
-					for _ in self.eval(model_state=self.model_state):
-						...
-				current_step += 1
-			except (KeyboardInterrupt, EasyDeLTimerError):
-				return current_step, run_exception
-			if run_exception is not None:
-				break
-		return current_step, run_exception
-
-	def _eval_epoch(
-		self,
-		sharded_state: EasyDeLState,
-		eval_dataset,
-		current_step: int,
-		metrics_tracker: MetricsTracker,
-		step_metrics: StepMetrics,
-		pbar: tqdm,
-	):
-		"""Handles training for a single epoch."""
-		eval_iter = iter(eval_dataset)
-		for _ in range(self.max_evaluation_steps):
-			try:
-				batch = self._get_next_batch(eval_iter)
-				step_metrics.start_step()
-				loss, metrics = self._execute_eval_step(sharded_state, batch)
-				mean_loss = metrics_tracker.update(loss, float("inf"), current_step)
-				eval_metrics = step_metrics.calculate(
-					loss=loss,
-					metrics=metrics,
-					current_step=current_step,
-					learning_rate=0.000,
-					epoch=0,
-					flops_per_device=getattr(self, "_flops_per_device", 0),
-					batch_size=self.arguments.total_batch_size
-					* self.arguments.gradient_accumulation_steps,
-					seq_length=self.arguments.max_prompt_length
-					+ self.arguments.max_completion_length * 2,
-					mean_loss=mean_loss,
-					mode="eval",
-				)
-				self._log_metrics(
-					metrics=eval_metrics,
-					pbar=pbar,
-					step=current_step,
-					mode="eval",
-				)
-				current_step += 1
-
-				yield eval_metrics
-			except (KeyboardInterrupt, EasyDeLTimerError) as _:
-				break
-
-	def _execute_eval_step(self, state, batch):
+	def _execute_eval_step(self, state: EasyDeLState, batch) -> LossMetrics:
 		"""Execute a single eval step."""
 		batch = {key: jnp.asarray(value) for key, value in batch.items()}
+
 		metrics = self.sharded_evaluation_step_function(state, batch)
-		loss = metrics.loss
-		return loss, metrics
+		return metrics
 
-	def _execute_train_step(self, batch):
+	def _execute_train_step(
+		self, state: EasyDeLState, batch
+	) -> tp.Tuple[EasyDeLState, LossMetrics, Exception]:
 		"""Execute a single training step."""
-		if self.pruning_module is not None:
-			self.model_state = self.model_state.replace(
-				graphstate=self.pruning_module.pre_forward_update(
-					self.model_state.graphstate,
-					self.model_state.opt_state,
-				)
-			)
 
-		# Forward and backward pass
 		try:
 			batch = {key: jnp.asarray(value) for key, value in batch.items()}
+			state, metrics = self.sharded_training_step_function(state, batch)
+			return state, metrics, None
+		except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest) as run_exception:
+			return state, metrics, run_exception
 
-			self.model_state, orpo_out = self.sharded_training_step_function(
-				self.model_state, batch
-			)
-			# Apply post-gradient updates
-			orpo_out: LossMetrics = orpo_out
-			metrics = dict(loss=orpo_out.loss, metrics=orpo_out.metrics)
-			if self.pruning_module is not None:
-				self.model_state = self.model_state.replace(
-					graphstate=self.pruning_module.post_gradient_update(
-						self.model_state.graphstate,
-						self.model_state.opt_state,
-					)
-				)
 
-			return orpo_out.loss, metrics, None
-		except (KeyboardInterrupt, EasyDeLTimerError) as run_exception:
-			return orpo_out.loss, metrics, run_exception
+def check_unimplemented_abstract_methods():
+	from inspect import getmembers, isfunction
 
-	def _finalize_training(self, output, run_exception):
-		"""Finalize training and prepare output."""
+	base_class = BaseTrainer
+	derived_class = ORPOTrainer
+	abstract_methods = [
+		method
+		for method in getmembers(base_class, predicate=isfunction)
+		if getattr(getattr(base_class, method[0]), "__isabstractmethod__", False)
+	]
 
-		if self.arguments.do_eval:
-			for _ in self.eval(output.state):
-				...
-
-		self.finish()
-
-		return output
-
-	def train(self) -> ORPOTrainerOutput:
-		"""
-		Trains the ORPO model.
-
-		This method orchestrates the training process, iterating over epochs and batches,
-		performing training steps, logging metrics, saving checkpoints, handling keyboard
-		interrupts and timeouts, and optionally evaluating the model.
-
-		Returns:
-				ORPOTrainerOutput: An object containing the trained model state and other training information.
-		"""
-		start_time = time.time()
-
-		metrics_tracker = MetricsTracker()
-		step_metrics = StepMetrics(self.arguments)
-		# Setup initial metrics and logging
-		self._setup_initial_metrics(self.model_state)
-		output, run_exception = self._run_training_loop(
-			metrics_tracker=metrics_tracker,
-			step_metrics=step_metrics,
-			start_time=start_time,
+	not_implemented = [
+		method[0]
+		for method in abstract_methods
+		if getattr(derived_class, method[0]) is getattr(base_class, method[0])
+	]
+	if len(not_implemented) != 0:
+		warnings.warn(
+			f"{ORPOConfig.__name__} does not implement the following abstract methods: {', '.join(not_implemented)}. "
+			f"Please ensure these methods are implemented in {ORPOConfig.__name__}.",
+			stacklevel=1,
+			category=UserWarning,
 		)
-		return self._finalize_training(output, run_exception)
 
-	def eval(self, model_state: EasyDeLState) -> typing.Iterator[dict]:
-		"""
-		Evaluates the DPO using the provided model state.
 
-		This method iterates over the evaluation dataset, performs forward passes,
-		calculates evaluation metrics, logs the metrics, and yields the metrics for
-		each evaluation step.
-
-		Args:
-				model_state (EasyDeLState): The EasyDeLState object containing the model parameters
-																		and other relevant information.
-
-		Yields:
-				Iterator[dict]: An iterator yielding a dictionary of evaluation metrics for each step.
-
-		Raises:
-				AssertionError: If `self.dataloader_eval` is not set (meaning the evaluation dataloader is missing).
-		"""
-		start_time = time.time()
-
-		metrics_tracker = MetricsTracker()
-		step_metrics = StepMetrics(self.arguments)
-
-		for metrics in self._run_evaluation(
-			sharded_state=model_state,
-			metrics_tracker=metrics_tracker,
-			step_metrics=step_metrics,
-			start_time=start_time,
-		):
-			yield metrics
+check_unimplemented_abstract_methods()

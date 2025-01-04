@@ -764,6 +764,6 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		try:
 			return "EasyDeL-" + prettify_nnx(self)
 		except AttributeError:
-			return "EasyDeL-Partitions"
+			return "EasyDeL-Partitions-" + super().__repr__()
 
 	__str__ = __repr__

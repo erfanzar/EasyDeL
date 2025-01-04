@@ -49,7 +49,6 @@ class SFTTrainer(Trainer):
 		train_dataset: tp.Optional[Dataset] = None,
 		eval_dataset: tp.Optional[tp.Union[Dataset, tp.Dict[str, Dataset]]] = None,
 		formatting_func: tp.Optional[tp.Callable] = None,
-		_do_init_fns: bool = True,
 	):
 		if getattr(processing_class, "pad_token", None) is None:
 			processing_class.pad_token = processing_class.eos_token
@@ -121,7 +120,6 @@ class SFTTrainer(Trainer):
 			dataset_train=train_dataset,
 			dataset_eval=eval_dataset,
 			model=model,
-			_do_init_fns=_do_init_fns,
 		)
 
 	def configure_dataloaders(self) -> TrainerConfigureDataloaderOutput:
@@ -145,8 +143,7 @@ class SFTTrainer(Trainer):
 
 		dataloader_train = tfds.as_numpy(
 			self.dataset_train.to_tf_dataset(
-				batch_size=self.arguments.total_batch_size
-				* self.arguments.gradient_accumulation_steps,
+				batch_size=self.training_batch_size,
 				drop_remainder=True,
 				num_workers=self.arguments.dataloader_num_workers,
 				collate_fn=self.create_collect_function(
@@ -163,7 +160,7 @@ class SFTTrainer(Trainer):
 		if self.dataset_eval is not None and self.arguments.do_eval:
 			dataloader_eval = tfds.as_numpy(
 				self.dataset_eval.to_tf_dataset(
-					batch_size=self.arguments.eval_batch_size,
+					batch_size=self.evaluation_batch_size,
 					drop_remainder=True,
 					shuffle=True,
 					num_workers=self.arguments.dataloader_num_workers,

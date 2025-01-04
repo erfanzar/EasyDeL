@@ -11,37 +11,39 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
+
 import typing as tp
 
 import jax
 import optax
-from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 from easydel.escale import with_sharding_constraint
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
+from ..training_utils import (
+	minibatch_call,
+	update_metrics,
+	update_state_respectfully,
+	make_assertions_and_get_sizes,
+)
 
-def train_step(
+
+def training_step(
 	state: EasyDeLState,
 	batch: tp.Mapping[str, jax.Array],
-	loss_config: LossConfig = None,
+	loss_config: tp.Optional[LossConfig] = None,
 	learning_rate_fn: optax.Schedule = None,
 	partition_spec: tp.Optional[PartitionSpec] = None,
 	gradient_accumulation_steps: int = 1,
-) -> tp.Tuple[EasyDeLState, jax.Array, LossMetrics]:
-	if partition_spec is None:
-		partition_spec = PartitionSpec(("dp", "fsdp"), "sp")
-	assert (
-		gradient_accumulation_steps > 0
-	), "`gradient_accumulation_steps` must be greater than 0."
+) -> tp.Tuple[EasyDeLState, LossMetrics]:
+	batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+		batch=batch,
+		gradient_accumulation_steps=gradient_accumulation_steps,
+		batch_partition_spec=partition_spec,
+	)
 
-	batch_size = batch[list(batch.keys())[0]].shape[0]
-	minibatch_size = batch_size // gradient_accumulation_steps
-
-	assert minibatch_size * gradient_accumulation_steps == batch_size
 	batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
 
 	def loss_fn(tree, minibatch):
@@ -51,82 +53,45 @@ def train_step(
 		outputs, metrics = module.compute_loss(
 			labels=call_batch.pop("labels", None),
 			loss_config=loss_config,
-			**call_batch,  # Passed directly to Model
+			**call_batch,
 		)
-
 		return outputs.loss, metrics
 
-	grad_fn = jax.value_and_grad(loss_fn, has_aux=True, allow_int=True)
-
-	def _minibatch_step(minibatch_idx: jax.Array | int):
-		minibatch = jax.tree_map(
-			lambda x: jax.lax.dynamic_slice_in_dim(  # Slicing with variable index (jax.Array).
-				x,
-				start_index=minibatch_idx * minibatch_size,
-				slice_size=minibatch_size,
-				axis=0,
-			),
-			batch,
-		)
-		(_, step_metrics), step_grads = grad_fn(state.graphstate, minibatch)
-
-		return step_grads, step_metrics
-
-	def _scan_step(carry, minibatch_idx: jax.Array | int):
-		"""Scan step function for looping over minibatches."""
-		step_grads, step_metrics = _minibatch_step(minibatch_idx)
-
-		carry = jax.tree_map(jnp.add, carry, (step_grads, step_metrics))
-
-		return carry, None
-
-	grads_shapes, metrics_shape = jax.eval_shape(_minibatch_step, 0)
-	grads = jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), grads_shapes)
-	metrics = jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), metrics_shape)
-	if os.environ.get("SCAN_TRAINER", "true").lower() in ["true", "1", "on", "yes"]:
-		(grads, metrics), _ = jax.lax.scan(
-			_scan_step,
-			init=(grads, metrics),
-			xs=jnp.arange(minibatch_size),
-			length=minibatch_size,
-		)
-	else:
-		for minibatch_idx in range(minibatch_size):
-			(grads, metrics), _ = _scan_step((grads, metrics), minibatch_idx)
-	if minibatch_size != 1:
-		grads = jax.tree_map(lambda g: g / minibatch_size, grads)
-		metrics = jax.tree_map(lambda m: m / minibatch_size, metrics)
-
-	state = state.apply_gradients(grads=grads)
-
-	if learning_rate_fn is not None:
-		metrics.learning_rate = learning_rate_fn(state.step)
-
-	grad_norms = jax.tree_util.tree_map(jnp.linalg.norm, grads)
-	max_grad_norm = jax.tree_util.tree_reduce(jnp.maximum, grad_norms)
-
-	mean_grad_norm = jax.tree_util.tree_reduce(
-		jnp.add,
-		jax.tree_util.tree_map(jnp.sum, grad_norms),
-	) / jax.tree_util.tree_reduce(
-		jnp.add,
-		jax.tree_util.tree_map(jnp.size, grad_norms),
+	gradients, metrics = minibatch_call(
+		state=state,
+		batch=batch,
+		minibatch_size=minibatch_size,
+		grad_fn=jax.value_and_grad(loss_fn, has_aux=True, allow_int=True),
 	)
-	metrics.max_grad_norm = max_grad_norm
-	metrics.mean_grad_norm = mean_grad_norm
-	metrics.grad_norms = grad_norms
+
+	metrics = update_metrics(
+		metrics=metrics,
+		learning_rate_fn=learning_rate_fn,
+		step=state.step,
+		gradients=gradients,
+	)
+
+	state = update_state_respectfully(
+		state=state,
+		gradients=gradients,
+		loss_config=loss_config,
+		metrics=metrics,
+	)
 
 	return state, metrics
 
 
-def eval_step(
+def evaluation_step(
 	state: EasyDeLState,
 	batch: tp.Mapping[str, jax.Array],
-	loss_config: LossConfig = None,
+	loss_config: tp.Optional[LossConfig] = None,
 	partition_spec: tp.Optional[PartitionSpec] = None,
 ) -> tp.Tuple[tp.Any, LossMetrics]:
-	if partition_spec is None:
-		partition_spec = PartitionSpec(("dp", "fsdp"), "sp")
+	*_, partition_spec = make_assertions_and_get_sizes(
+		batch=batch,
+		gradient_accumulation_steps=1,
+		batch_partition_spec=partition_spec,
+	)
 	batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
 
 	def loss_fn(tree):

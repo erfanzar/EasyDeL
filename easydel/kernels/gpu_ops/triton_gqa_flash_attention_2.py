@@ -899,7 +899,7 @@ def _bwd_attention_kernel_call(
 		return Dq.reshape(batch, seqlen_q, num_q_heads, headdim), Dk, Dv, None
 	else:
 		_, f_vjp = jax.vjp(
-			functools.partial(_attn_refrence, softmax_scale=softmax_scale),
+			functools.partial(_attn_reference, softmax_scale=softmax_scale),
 			query,
 			key,
 			value,
@@ -973,7 +973,7 @@ _flash_attn2_gqa.defvjp(
 )
 
 
-def _attn_refrence(query_states, key_states, value_states, bias):
+def _attn_reference(query_states, key_states, value_states, bias):
 	b, qs, num_q_heads, d = query_states.shape
 	num_kv_heads = value_states.shape[2]
 	ks = value_states.shape[1]
@@ -1041,7 +1041,7 @@ def _test_forward():
 	print("QKV Allocated")
 	co = triton_gqa_flash_attention2_gpu(q, k, v, b)
 	print(co[-1, -1, -1, :5])
-	fo = _attn_refrence(q, k, v, b)
+	fo = _attn_reference(q, k, v, b)
 	print(fo[-1, -1, -1, :5])
 	print("Results are Close" if jnp.allclose(co, fo, 0, 0.125) else "Wrong results!")
 
@@ -1072,7 +1072,7 @@ def _test_backward():
 		co = None
 
 	try:
-		fo = jax.grad(lambda *x: _attn_refrence(*x).sum())(q, k, v, b)
+		fo = jax.grad(lambda *x: _attn_reference(*x).sum())(q, k, v, b)
 
 		print(fo[-1, -1, -1, :5])  # Print last 5 elements of last head of last batch
 	except Exception as e:

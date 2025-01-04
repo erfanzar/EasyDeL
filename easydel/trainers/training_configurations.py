@@ -46,8 +46,16 @@ except ImportError:
 
 if tp.TYPE_CHECKING:
 	from flax.metrics.tensorboard import SummaryWriter
+	from jax import Array
+	from torch import Tensor
+
+	MetricsType = tp.Dict[
+		str,
+		tp.Union[float, tp.List, tp.Tuple, np.ndarray, Array, Tensor],
+	]
 else:
 	SummaryWriter = tp.Any
+	MetricsType = tp.Any
 logger = get_logger(__name__)
 
 
@@ -103,7 +111,7 @@ class TrainingArguments:
 	step_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp")
 	step_start_point: tp.Optional[int] = None
 	total_batch_size: int = 32
-	training_time: tp.Optional[str] = None
+	training_time_limit: tp.Optional[str] = None
 	train_on_inputs: bool = True
 	truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end"
 	tx_mu_dtype: tp.Optional[jnp.dtype] = None
@@ -114,6 +122,12 @@ class TrainingArguments:
 	wandb_entity: tp.Optional[str] = None
 	warmup_steps: int = 500
 	weight_decay: float = 0.01
+
+	@property
+	def training_time_seconds(self) -> int:
+		if self.training_time_limit is None:
+			return None
+		return self._time_to_seconds(self.training_time_limit)
 
 	def __post_init__(self):
 		"""
@@ -196,6 +210,8 @@ class TrainingArguments:
 			if self.eval_batch_size is not None
 			else self.total_batch_size
 		)
+		if self.loss_config is None:
+			self.loss_config = LossConfig()
 
 	@staticmethod
 	def _time_to_seconds(time_str: str) -> int:
@@ -208,13 +224,26 @@ class TrainingArguments:
 		Returns:
 		    int: The equivalent time in seconds.
 		"""
-		match = re.match(r"(\d+)\s*(h|min)", time_str.lower())
+		match = re.match(
+			r"(\d+)\s*(h|hour|hours|min|m|minutes|s|sec|seconds)", time_str.lower()
+		)
 		if not match:
 			raise ValueError(
-				"Invalid time format. Use `50min` for minutes or `23h` for hours."
+				"Invalid time format. Use `50min` for minutes, `23h` for hours, or `30s` for seconds."
 			)
 		value, unit = match.groups()
-		return int(value) * (3600 if unit == "h" else 60)
+		unit_to_seconds = {
+			"h": 3600,
+			"hour": 3600,
+			"hours": 3600,
+			"min": 60,
+			"m": 60,
+			"minutes": 60,
+			"s": 1,
+			"sec": 1,
+			"seconds": 1,
+		}.get(unit.lower())
+		return int(value) * unit_to_seconds
 
 	def get_path(self) -> Path:
 		"""
@@ -306,27 +335,13 @@ class TrainingArguments:
 				)
 		return None
 
-	def ensure_training_time(self, time_passed):
-		if self.training_time is not None and time_passed > self._time_to_seconds(
-			self.training_time
+	def ensure_training_time_limit(self, time_passed):
+		if self.training_time_limit is not None and time_passed > self._time_to_seconds(
+			self.training_time_limit
 		):
 			raise EasyDeLTimerError("Time Out")
 
-	def log_metrics(
-		self,
-		metrics: tp.Dict[
-			str,
-			tp.Union[
-				float,
-				tp.List,
-				tp.Tuple,
-				np.ndarray,
-				"jnp.ndarray",
-				"torch.Tensor",  # type: ignore # noqa: F821
-			],
-		],
-		step: int,
-	):
+	def log_metrics(self, metrics: MetricsType, step: int):
 		"""
 		Logs training metrics to Weights & Biases and/or TensorBoard.
 

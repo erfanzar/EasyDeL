@@ -13,21 +13,22 @@
 # limitations under the License.
 from __future__ import annotations
 
-import time
 import typing as tp
 import warnings
 from collections import defaultdict
+from functools import partial
 
 import jax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from tqdm.autonotebook import tqdm
 
-from easydel.escale import make_shard_and_gather_fns, match_partition_rules
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
-from easydel.infra.errors import EasyDeLTimerError
+from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
+from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import ProcessingClassType
+from easydel.trainers.trainer.trainer import Trainer
 from easydel.utils.helpers import get_logger
 
 from ..base_trainer import (
@@ -37,14 +38,8 @@ from ..base_trainer import (
 	TrainerConfigureModelOutput,
 )
 from ..prompt_utils import maybe_apply_chat_template, maybe_extract_prompt
-from ..trainer_protocol import MetricsTracker, StepMetrics
 from .dpo_config import DPOConfig
-from .func_utils import (
-	create_concatenated_forward,
-	create_eval_function,
-	create_train_function,
-)
-from .modelling_output import DPOTrainerOutput
+from .func_utils import concatenated_forward, evaluation_step, training_step
 from .utils import DPODataCollatorWithPadding, build_tokenize
 
 if tp.TYPE_CHECKING:
@@ -55,7 +50,7 @@ else:
 logger = get_logger(__name__)
 
 
-class DPOTrainer(BaseTrainer):
+class DPOTrainer(Trainer):
 	"""
 	Trainer for Direct Preference Optimization (DPO).
 
@@ -64,11 +59,13 @@ class DPOTrainer(BaseTrainer):
 	training, LoRA, and precomputed reference model log probabilities.
 	"""
 
+	arguments: DPOConfig
+
 	def __init__(
 		self,
 		arguments: DPOConfig,
 		model: tp.Union[EasyDeLBaseModule, EasyDeLState],
-		ref_model: tp.Optional[tp.Union[EasyDeLBaseModule, EasyDeLState]] = None,
+		reference_model: tp.Optional[tp.Union[EasyDeLBaseModule, EasyDeLState]] = None,
 		processing_class: tp.Optional[ProcessingClassType] = None,
 		train_dataset: tp.Optional[Dataset] = None,
 		eval_dataset: tp.Optional[Dataset] = None,
@@ -76,7 +73,6 @@ class DPOTrainer(BaseTrainer):
 		dataset_map_arguments: tp.Optional[dict] = None,
 		low_mem_usage: bool = True,
 		auto_fix_data: bool = True,
-		_do_init_fns: bool = True,
 	):
 		assert arguments is not None, (
 			"You Have to pass arguments that will be used for training but you have passed"
@@ -169,8 +165,8 @@ class DPOTrainer(BaseTrainer):
 		if not isinstance(model, EasyDeLState):
 			model = model.to_state()
 
-		if not isinstance(ref_model, EasyDeLState):
-			ref_model = ref_model.to_state()
+		if not isinstance(reference_model, EasyDeLState):
+			reference_model = reference_model.to_state()
 
 		_tokenize = build_tokenize(
 			model=model.model if arguments.is_encoder_decoder else None,
@@ -202,19 +198,9 @@ class DPOTrainer(BaseTrainer):
 		self.train_dataset = train_dataset
 		self.eval_dataset = eval_dataset
 		self.processing_class = processing_class
-		self.ref_model = ref_model
+		self.reference_state = reference_model
 		self._loggers_initialized = False
 		self.mesh = model.model.mesh
-
-		self.concatenated_forward = jax.jit(
-			create_concatenated_forward(
-				is_encoder_decoder=arguments.is_encoder_decoder,
-				padding_value=arguments.padding_value,
-				label_pad_token_id=arguments.label_pad_token_id,
-				truncation_mode=arguments.truncation_mode,
-			),
-			static_argnums=[0],
-		)
 
 		self._cached_p_l_s = None
 		self._cached_c_l_s = None
@@ -224,62 +210,7 @@ class DPOTrainer(BaseTrainer):
 			arguments=arguments,
 			dataset_train=train_dataset,
 			dataset_eval=eval_dataset,
-			finetune=True,
-			checkpoint_path=None,
-			_do_init_fns=_do_init_fns,
 		)
-
-	def initialize_trainer_utils(self):
-		"""
-		Initializes various utilities used by the trainer.
-
-		This includes setting up Weights & Biases, initializing the training timer,
-		configuring dataloaders, configuring the model and optimizer, sharding the
-		model and reference model states, and configuring the training and evaluation functions.
-		"""
-		self._initialize_wandb()
-		self._initialize_timer()
-		self._configure_dataloaders()
-		self._configure_model()
-		self._configure_functions()
-		self._configure_state()
-
-	def _configure_dataloaders(self):
-		"""
-		Configures the dataloaders for training and evaluation.
-
-		This method retrieves the dataloaders from the `configure_dataloaders` method,
-		sets the maximum training and evaluation steps, and logs the time taken for
-		this configuration.
-		"""
-		operation_name = "configure dataloaders"
-		with self.timer(operation_name):
-			dataset_configurations = self.configure_dataloaders()
-			self.dataloader_train = dataset_configurations.dataloader_train
-			self.max_training_steps = dataset_configurations.max_training_steps
-			self.dataloader_eval = dataset_configurations.dataloader_eval
-			self.max_evaluation_steps = dataset_configurations.max_evaluation_steps
-		self.timer.log(operation_name)
-
-	def _configure_model(self):
-		"""
-		Configures the model, optimizer, scheduler, and configuration.
-
-		This method retrieves the model, optimizer, scheduler, and configuration from
-		the `configure_model` method and configures LoRA (if enabled). It also logs
-		the time taken for this configuration.
-		"""
-		super()._configure_model()
-
-	def _configure_functions(self):
-		"""
-		Configures and JIT-compiles the training and evaluation step functions.
-
-		This method retrieves the configured functions from the `configure_functions`
-		method, sets up the mesh, checkpoint manager, and state initialization
-		function, and logs the time taken for this configuration.
-		"""
-		super()._configure_functions()
 
 	def configure_dataloaders(self) -> TrainerConfigureDataloaderOutput:
 		"""
@@ -345,58 +276,83 @@ class DPOTrainer(BaseTrainer):
 		Returns:
 				TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
 		"""
-
+		mesh = self.model.mesh
 		empty_sharding = jax.sharding.NamedSharding(
 			spec=PartitionSpec(),
-			mesh=self.model.mesh,
+			mesh=mesh,
 		)
+		input_sharding = jax.sharding.NamedSharding(
+			spec=self.arguments.step_partition_spec,
+			mesh=mesh,
+		)
+		# returns chosen_log_probs, rejected_log_probs, chosen_logits, rejected_logits
 
-		train_function = create_train_function(
-			concatenated_forward=self.concatenated_forward,
-			ref_state=self.ref_model,
-			loss_type=self.arguments.loss_type,
-			reference_free=self.arguments.reference_free,
-			label_smoothing=self.arguments.label_smoothing,
-			beta=self.arguments.beta,
+		partial_concatenated_forward = partial(
+			concatenated_forward,
+			is_encoder_decoder=self.arguments.is_encoder_decoder,
+			padding_value=self.arguments.padding_value,
+			label_pad_token_id=self.arguments.label_pad_token_id,
+			fixed_max_length=self.arguments.max_length,
+		)
+		jited_concatenated_forward = jax.jit(
+			partial_concatenated_forward,
+			# in_shardings=(self.state_shardings.model, input_sharding),
+			out_shardings=(empty_sharding, empty_sharding, empty_sharding, empty_sharding),
+			static_argnames=[
+				"is_encoder_decoder",
+				"padding_value",
+				"label_pad_token_id",
+			],
 		)
 		sharded_training_step_function = jax.jit(
-			train_function,
-			in_shardings=(
-				self.state_shardings,
-				jax.sharding.NamedSharding(
-					spec=self.arguments.step_partition_spec,
-					mesh=self.mesh,
-				),
+			partial(
+				training_step,
+				learning_rate_fn=self.scheduler,
+				concatenated_forward=partial_concatenated_forward,
+				reference_state=self.reference_state,
+				beta=self.arguments.beta,
+				label_smoothing=self.arguments.label_smoothing,
+				loss_type=self.arguments.loss_type,
+				reference_free=self.arguments.reference_free,
 			),
-			out_shardings=(
-				self.state_shardings,
-				empty_sharding,
-			),
-		)
-
-		eval_function = create_eval_function(
-			concatenated_forward=self.concatenated_forward,
-			ref_state=self.ref_model,
-			loss_type=self.arguments.loss_type,
-			reference_free=self.arguments.reference_free,
-			label_smoothing=self.arguments.label_smoothing,
-			beta=self.arguments.beta,
+			in_shardings=(self.state_shardings, input_sharding),
+			out_shardings=(self.state_shardings, empty_sharding),
+			static_argnames=[
+				"learning_rate_fn",
+				"concatenated_forward",
+				"reference_state",
+				"beta",
+				"label_smoothing",
+				"loss_type",
+				"reference_free",
+			],
 		)
 
 		sharded_evaluation_step_function = jax.jit(
-			eval_function,
-			in_shardings=(
-				self.state_shardings,
-				jax.sharding.NamedSharding(
-					spec=self.arguments.step_partition_spec,
-					mesh=self.mesh,
-				),
+			partial(
+				evaluation_step,
+				concatenated_forward=partial_concatenated_forward,
+				reference_state=self.reference_state,
+				beta=self.arguments.beta,
+				label_smoothing=self.arguments.label_smoothing,
+				loss_type=self.arguments.loss_type,
+				reference_free=self.arguments.reference_free,
 			),
+			in_shardings=(self.state_shardings, input_sharding),
 			out_shardings=empty_sharding,
+			static_argnames=[
+				"concatenated_forward",
+				"reference_state",
+				"beta",
+				"label_smoothing",
+				"loss_type",
+				"reference_free",
+			],
 		)
 		self.arguments.ensure_checkpoint_path()
+		self.concatenated_forward = jited_concatenated_forward
 		checkpoint_manager = self.arguments.get_streaming_checkpointer()
-		mesh = self.model.mesh
+
 		return TrainerConfigureFunctionOutput(
 			sharded_training_step_function=sharded_training_step_function,
 			sharded_evaluation_step_function=sharded_evaluation_step_function,
@@ -451,8 +407,7 @@ class DPOTrainer(BaseTrainer):
 
 		return tensorflow_datasets.as_numpy(
 			train_dataset.to_tf_dataset(
-				batch_size=self.arguments.total_batch_size
-				* self.arguments.gradient_accumulation_steps,
+				batch_size=self.training_batch_size,
 				collate_fn=data_collator,
 				num_workers=self.arguments.dataloader_num_workers,
 				shuffle=True,
@@ -494,7 +449,7 @@ class DPOTrainer(BaseTrainer):
 
 		return tensorflow_datasets.as_numpy(
 			eval_dataset.to_tf_dataset(
-				batch_size=self.arguments.eval_batch_size,
+				batch_size=self.evaluation_batch_size,
 				collate_fn=self.data_collator,
 				num_workers=self.arguments.dataloader_num_workers,
 				shuffle=False,
@@ -527,8 +482,7 @@ class DPOTrainer(BaseTrainer):
 		):
 			data_loader = tensorflow_datasets.as_numpy(
 				self.train_dataset.to_tf_dataset(
-					batch_size=self.arguments.total_batch_size
-					* self.arguments.gradient_accumulation_steps,
+					batch_size=self.training_batch_size,
 					collate_fn=self.data_collator,
 					num_workers=self.arguments.dataloader_num_workers,
 					shuffle=False,
@@ -536,7 +490,7 @@ class DPOTrainer(BaseTrainer):
 				)
 			)
 			reference_chosen_log_probs = []
-			reference_rejected_log_probs = []
+			ref_rejected_logps = []
 			for padded_batch in tqdm(
 				iterable=data_loader, desc="Train dataset reference log probs"
 			):
@@ -547,16 +501,16 @@ class DPOTrainer(BaseTrainer):
 					)
 				)
 				reference_chosen_log_probs.append(reference_chosen_logp)
-				reference_rejected_log_probs.append(reference_rejected_logp)
+				ref_rejected_logps.append(reference_rejected_logp)
 
 			all_reference_chosen_log_probs = jnp.concatenate(reference_chosen_log_probs)
-			all_reference_rejected_log_probs = jnp.concatenate(reference_rejected_log_probs)
+			all_ref_rejected_logps = jnp.concatenate(ref_rejected_logps)
 			self.train_dataset = self.train_dataset.add_column(
 				name="reference_chosen_log_probs", column=all_reference_chosen_log_probs
 			)
 			self.train_dataset = self.train_dataset.add_column(
-				name="reference_rejected_log_probs",
-				column=all_reference_rejected_log_probs,
+				name="ref_rejected_logps",
+				column=all_ref_rejected_logps,
 			)
 
 			self._precomputed_train_ref_log_probs = True
@@ -599,7 +553,7 @@ class DPOTrainer(BaseTrainer):
 			# prepare dataloader
 			data_loader = tensorflow_datasets.as_numpy(
 				eval_dataset.to_tf_dataset(
-					batch_size=self.arguments.eval_batch_size,
+					batch_size=self.evaluation_batch_size,
 					collate_fn=self.data_collator,
 					num_workers=self.arguments.dataloader_num_workers,
 					shuffle=False,
@@ -608,7 +562,7 @@ class DPOTrainer(BaseTrainer):
 			)
 
 			reference_chosen_log_probs = []
-			reference_rejected_log_probs = []
+			ref_rejected_logps = []
 			for padded_batch in tqdm(
 				iterable=data_loader, desc="Eval dataset reference log probs"
 			):
@@ -616,17 +570,17 @@ class DPOTrainer(BaseTrainer):
 					self.compute_reference_log_probs(self.model_state, padded_batch)
 				)
 				reference_chosen_log_probs.append(reference_chosen_logp.cpu())
-				reference_rejected_log_probs.append(reference_rejected_logp.cpu())
+				ref_rejected_logps.append(reference_rejected_logp.cpu())
 
 			all_reference_chosen_log_probs = jnp.concatenate(reference_chosen_log_probs)
-			all_reference_rejected_log_probs = jnp.concatenate(reference_rejected_log_probs)
+			all_ref_rejected_logps = jnp.concatenate(ref_rejected_logps)
 
 			eval_dataset = eval_dataset.add_column(
 				name="reference_chosen_log_probs", column=all_reference_chosen_log_probs
 			)
 			eval_dataset = eval_dataset.add_column(
-				name="reference_rejected_log_probs",
-				column=all_reference_rejected_log_probs,
+				name="ref_rejected_logps",
+				column=all_ref_rejected_logps,
 			)
 
 			if self.eval_dataset is not None:
@@ -651,295 +605,29 @@ class DPOTrainer(BaseTrainer):
 				tuple[tp.Any, tp.Any]: A tuple containing the log probabilities for the chosen and rejected responses.
 		"""
 
-		if self.ref_model is None:
-			(
-				reference_chosen_log_probs,
-				reference_rejected_log_probs,
-				_,
-				_,
-			) = self.concatenated_forward(
-				state,
-				batch=padded_batch,
-			)
+		if self.reference_state is None:
+			outs = self.concatenated_forward(state.model, batch=padded_batch)
 		else:
-			(
-				reference_chosen_log_probs,
-				reference_rejected_log_probs,
-				_,
-				_,
-			) = self.concatenated_forward(
-				self.ref_model,
-				batch=padded_batch,
-			)
+			outs = self.concatenated_forward(self.reference_state.model, batch=padded_batch)
+		return outs["chosen_logps"], outs["rejected_logps"]
 
-		return reference_chosen_log_probs, reference_rejected_log_probs
-
-	def _run_training_loop(
-		self,
-		metrics_tracker: MetricsTracker,
-		step_metrics: StepMetrics,
-		start_time: float,
-		shard_fns: tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]],
-		gather_fns: tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]],
-	):
-		"""Core training loop implementation."""
-		pbar = tqdm(total=self.max_training_steps)
-		current_step = int(jax.device_get(self.model_state.step))
-		run_exception = None
-		with self.mesh:
-			for epoch in range(self.arguments.num_train_epochs):
-				current_step, run_exception = self._train_epoch(
-					self.dataloader_train,
-					current_step,
-					metrics_tracker,
-					step_metrics,
-					pbar,
-					start_time,
-					epoch,
-					shard_fns,
-					gather_fns,
-				)
-
-				if current_step >= self.max_training_steps:
-					break
-				if run_exception is not None:
-					break
-		return self._prepare_training_output(
-			state=self.model_state,
-			shard_fns=shard_fns,
-			gather_fns=gather_fns,
-			run_exception=run_exception,
-		), run_exception
-
-	def _run_evaluation(
-		self,
-		sharded_state: EasyDeLState,
-		metrics_tracker: MetricsTracker,
-		step_metrics: StepMetrics,
-		start_time: float,
-	):
-		"""Core evaluation loop implementation."""
-		pbar = tqdm(total=self.max_evaluation_steps)
-		pbar.set_description("evaluation process")
-		current_step = int(jax.device_get(sharded_state.step))
-		with self.mesh:
-			for eval_metrics in self._eval_epoch(
-				sharded_state,
-				self.dataloader_eval,
-				current_step,
-				metrics_tracker,
-				step_metrics,
-				pbar,
-				start_time,
-			):
-				yield eval_metrics
-
-	def _train_epoch(
-		self,
-		train_dataset,
-		current_step: int,
-		metrics_tracker: MetricsTracker,
-		step_metrics: StepMetrics,
-		pbar: tqdm,
-		start_time: float,
-		epoch: int,
-		shard_fns: tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]],
-		gather_fns: tp.Optional[tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]],
-	):
-		"""Handles training for a single epoch."""
-		train_iter = iter(train_dataset)
-		for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
-			try:  # to make training loop safer if user wants to break that.
-				batch = self._get_next_batch(train_iter)
-				if self._should_skip_step(current_step):
-					pbar.update(1)
-					continue
-				step_metrics.start_step()
-			except (KeyboardInterrupt, EasyDeLTimerError, StopIteration) as exect:
-				return self.model_state, current_step, exect
-
-			# Execute training step
-			loss, metrics, run_exception = self._execute_train_step(batch)
-			# Update and log metrics
-			try:
-				mean_loss = metrics_tracker.update(loss, float("inf"), current_step)
-
-				train_metrics = step_metrics.calculate(
-					loss=loss,
-					metrics=metrics,
-					current_step=current_step,
-					learning_rate=self.scheduler(current_step)
-					if self.scheduler is not None
-					else self.arguments.learning_rate,
-					epoch=epoch,
-					flops_per_device=getattr(self, "_flops_per_device", 0),
-					batch_size=self.arguments.total_batch_size
-					* self.arguments.gradient_accumulation_steps,
-					seq_length=self.arguments.max_prompt_length
-					+ self.arguments.max_completion_length * 2,
-					mean_loss=mean_loss,
-					mode="train",
-				)
-
-				self._log_metrics(
-					metrics=train_metrics,
-					pbar=pbar,
-					step=current_step,
-					mode="train",
-				)
-
-				# Save checkpoint if needed
-				if self._should_save_checkpoint(current_step):
-					_ = self._save_state(
-						state=self.model_state,
-						gather_fns=gather_fns,
-						milestone=True,
-					)
-				if self._should_run_evaluation(current_step):
-					for _ in self.eval(model_state=self.model_state):
-						...
-				current_step += 1
-			except (KeyboardInterrupt, EasyDeLTimerError):
-				return current_step, run_exception
-			if run_exception is not None:
-				break
-		return current_step, run_exception
-
-	def _eval_epoch(
-		self,
-		sharded_state: EasyDeLState,
-		eval_dataset,
-		current_step: int,
-		metrics_tracker: MetricsTracker,
-		step_metrics: StepMetrics,
-		pbar: tqdm,
-		start_time: float,
-	):
-		"""Handles training for a single epoch."""
-		eval_iter = iter(eval_dataset)
-		for _ in range(self.max_evaluation_steps):
-			try:
-				batch = self._get_next_batch(eval_iter)
-				step_metrics.start_step()
-				metrics = self._execute_eval_step(sharded_state, batch)
-
-				loss = metrics.loss
-				mean_loss = metrics_tracker.update(loss, float("inf"), current_step)
-				eval_metrics = step_metrics.calculate(
-					loss=loss,
-					metrics=metrics,
-					current_step=current_step,
-					learning_rate=0.000,
-					epoch=0,
-					flops_per_device=getattr(self, "_flops_per_device", 0),
-					batch_size=self.arguments.total_batch_size
-					* self.arguments.gradient_accumulation_steps,
-					seq_length=self.arguments.max_prompt_length
-					+ self.arguments.max_completion_length * 2,
-					mean_loss=mean_loss,
-					mode="eval",
-				)
-				self._log_metrics(
-					metrics=eval_metrics,
-					pbar=pbar,
-					step=current_step,
-					mode="eval",
-				)
-				current_step += 1
-
-				yield eval_metrics
-			except (KeyboardInterrupt, EasyDeLTimerError) as _:
-				break
-
-	def _execute_eval_step(self, state, batch):
+	def _execute_eval_step(self, state: EasyDeLState, batch) -> LossMetrics:
 		"""Execute a single eval step."""
 		batch = {key: jnp.asarray(value) for key, value in batch.items()}
 
 		metrics = self.sharded_evaluation_step_function(state, batch)
 		return metrics
 
-	def _execute_train_step(self, batch):
+	def _execute_train_step(
+		self, state: EasyDeLState, batch
+	) -> tp.Tuple[EasyDeLState, LossMetrics, Exception]:
 		"""Execute a single training step."""
-
 		try:
 			batch = {key: jnp.asarray(value) for key, value in batch.items()}
-
-			self.model_state, metrics = self.sharded_training_step_function(
-				self.model_state,
-				batch,
-			)
-			# Apply post-gradient updates
-			loss = metrics.loss
-			return loss, metrics, None
-		except (KeyboardInterrupt, EasyDeLTimerError) as run_exception:
-			return loss, metrics, run_exception
-
-	def _finalize_training(self, output, run_exception):
-		"""Finalize training and prepare output."""
-
-		if self.arguments.do_eval:
-			for _ in self.eval(output.state):
-				...
-
-		self.finish()
-
-		return output
-
-	def train(self) -> DPOTrainerOutput:
-		start_time = time.time()
-		rules = self.model.config.get_partition_rules()
-		shard_fns, gather_fns = make_shard_and_gather_fns(
-			partition_specs=match_partition_rules(
-				rules, jax.eval_shape(lambda: self.model_state)
-			),
-			mesh=self.mesh,
-		)
-
-		metrics_tracker = MetricsTracker()
-		step_metrics = StepMetrics(self.arguments)
-
-		# Setup initial metrics and logging
-		self._setup_initial_metrics(self.model_state)
-
-		output, run_exception = self._run_training_loop(
-			metrics_tracker=metrics_tracker,
-			step_metrics=step_metrics,
-			start_time=start_time,
-			shard_fns=shard_fns,
-			gather_fns=gather_fns,
-		)
-		return self._finalize_training(output, run_exception)
-
-	def eval(self, model_state: EasyDeLState) -> tp.Iterator[dict]:
-		"""
-		Evaluates the DPO using the provided model state.
-
-		This method iterates over the evaluation dataset, performs forward passes,
-		calculates evaluation metrics, logs the metrics, and yields the metrics for
-		each evaluation step.
-
-		Args:
-				model_state (EasyDeLState): The EasyDeLState object containing the model parameters
-																		and other relevant information.
-
-		Yields:
-				Iterator[dict]: An iterator yielding a dictionary of evaluation metrics for each step.
-
-		Raises:
-				AssertionError: If `self.dataloader_eval` is not set (meaning the evaluation dataloader is missing).
-		"""
-		start_time = time.time()
-
-		metrics_tracker = MetricsTracker()
-		step_metrics = StepMetrics(self.arguments)
-
-		for metrics in self._run_evaluation(
-			sharded_state=model_state,
-			metrics_tracker=metrics_tracker,
-			step_metrics=step_metrics,
-			start_time=start_time,
-		):
-			yield metrics
+			state, metrics = self.sharded_training_step_function(state, batch)
+			return state, metrics, None
+		except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest) as run_exception:
+			return state, metrics, run_exception
 
 
 def check_unimplemented_abstract_methods():

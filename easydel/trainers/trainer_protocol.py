@@ -138,7 +138,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 		dataset_eval: tp.Optional[Dataset] = None,
 		finetune: bool = True,
 		checkpoint_path: tp.Optional[tp.Union[str, os.PathLike]] = None,
-		_do_init_fns: bool = True,
 	):
 		"""
 		Initializes the trainer.
@@ -148,6 +147,15 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 	@property
 	@abstractmethod
 	def model(self): ...
+
+	@property
+	@abstractmethod
+	def training_batch_size(self): ...
+
+	@property
+	@abstractmethod
+	def evaluation_batch_size(self): ...
+
 	@abstractmethod
 	def _initialize_attributes(self):
 		"""
@@ -350,15 +358,15 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 		"""Convert specs to named sharding."""
 		...
 
-	@abstractmethod
-	def calculate_number_total_flops_per_device(self, params):
-		"""Calculate total FLOPs per device."""
-		...
-
 	@staticmethod
 	@abstractmethod
 	def count_model_parameters(prm):
 		"""Prints the number of model parameters in billions."""
+		...
+
+	@abstractmethod
+	def apply_training_hooks(self, metrics: LossMetrics) -> LossMetrics:
+		"""Apply training hooks to the model."""
 		...
 
 	@abstractmethod
@@ -504,6 +512,14 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 		...
 
 	@abstractmethod
+	def start_training_hook(self):
+		"""Hook to run before training starts."""
+
+	@abstractmethod
+	def start_evaluation_hook(self):
+		"""Hook to run before evaluation starts."""
+
+	@abstractmethod
 	def compile_aot(self) -> bool:
 		"""Compile the state ahead of time for faster execution."""
 		...
@@ -511,6 +527,16 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 	@abstractmethod
 	def finish(self):
 		"""Finalize the training process."""
+		...
+
+	@abstractmethod
+	def get_runstage_flops(self, is_training: bool) -> float:
+		"""Return the total number of FLOPs for the model."""
+		...
+
+	@abstractmethod
+	def _ensure_functions_compiled(self):
+		"""Ensure functions are compiled."""
 		...
 
 	@abstractmethod
@@ -538,11 +564,10 @@ class StepMetrics:
 
 	def calculate(
 		self,
-		loss,
 		metrics: LossMetrics,
 		current_step: int,
 		epoch: int,
-		flops_per_device: float,
+		flops: float,
 		batch_size,
 		seq_length,
 		learning_rate,
@@ -553,29 +578,31 @@ class StepMetrics:
 		step_time = time.time() - self.step_start_time
 		total_time = time.time() - self.start_time
 
-		visited_tokens = jnp.multiply(seq_length, jnp.multiply(current_step, batch_size))
+		visited_tokens = seq_length * current_step * batch_size
 
-		flops = flops_per_device / step_time
-
+		flops_per_step = flops / step_time
+		loss = metrics.loss
+		z_loss = metrics.z_loss
 		basic_metrics = {
-			"loss": loss.tolist(),
+			"loss": float(loss),
+			"z_loss": float(z_loss) if z_loss is not None else None,
 			"learning_rate": learning_rate,
 			"step": current_step,
 			"step_time": step_time,
-			"perplexity": jnp.exp(loss).tolist(),
+			"perplexity": float(jnp.exp(loss)),
 			"visited_tokens": visited_tokens,
 			"epoch": epoch,
-			"TFLOPs": flops,
+			"TFLOPs": flops_per_step,
 			"total_time": total_time,
 			**extras,
 		}
 		if metrics.accuracy is not None:
-			basic_metrics.update({"accuracy": metrics.accuracy})
+			basic_metrics["accuracy"] = float(metrics.accuracy)
 
 		if metrics.chosen_rewards is not None:
-			basic_metrics.update({"chosen_rewards": jnp.mean(metrics.chosen_rewards)})
+			basic_metrics["chosen_rewards"] = float(jnp.mean(metrics.chosen_rewards))
 		if metrics.rejected_rewards is not None:
-			basic_metrics.update({"rejected_rewards": jnp.mean(metrics.rejected_rewards)})
+			basic_metrics["rejected_rewards"] = float(jnp.mean(metrics.rejected_rewards))
 		if metrics.other_metrics is not None:
 			basic_metrics.update(metrics.other_metrics)
 		if not self.arguments.performance_mode and (mode == "train" or mode is None):

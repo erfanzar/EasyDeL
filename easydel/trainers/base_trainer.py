@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import pprint
 import shutil
+import time
 import typing as tp
 from abc import abstractmethod
 from glob import glob
@@ -30,10 +31,12 @@ import termcolor
 import tqdm
 from flax import nnx as nn
 from flax.core import unfreeze
+from jax._src.stages import Compiled
 
 import easydel
 from easydel.infra.base_state import EasyDeLState
-from easydel.infra.errors import EasyDeLTimerError
+from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
+from easydel.infra.loss_utils import LossMetrics
 from easydel.utils.traversals import specs_to_name_sharding
 
 try:
@@ -104,6 +107,14 @@ class BaseTrainer(BaseTrainerProtocol):
 	def model(self):
 		return self._model
 
+	@property
+	def training_batch_size(self):
+		return self.arguments.total_batch_size * self.arguments.gradient_accumulation_steps
+
+	@property
+	def evaluation_batch_size(self):
+		return self.arguments.eval_batch_size
+
 	def _initialize_attributes(self):
 		# Initialize all attributes with default values
 		self.timer = getattr(self, "timer", None)
@@ -126,6 +137,9 @@ class BaseTrainer(BaseTrainerProtocol):
 
 		self.state_shardings = getattr(self, "state_shardings", None)
 		self.model_state = getattr(self, "model_state", None)
+
+		self._training_time_start = getattr(self, "_training_time_start", None)
+		self._evaluation_time_start = getattr(self, "_evaluation_time_start", None)
 
 		self.sharded_training_step_function = getattr(
 			self,
@@ -151,6 +165,19 @@ class BaseTrainer(BaseTrainerProtocol):
 	def finish():
 		if wandb is not None:
 			wandb.finish()
+
+	def get_runstage_flops(self, is_training):
+		try:
+			if is_training:
+				flops = self.sharded_training_step_function.cost_analysis()[0]["flops"]
+			else:
+				flops = self.sharded_evaluation_step_function.cost_analysis()[0]["flops"]
+		except Exception:
+			flops = 1
+		return flops
+
+	def _ensure_functions_compiled(self):
+		self.compile_aot()
 
 	def initialize_trainer_utils(self):
 		"""
@@ -312,11 +339,7 @@ class BaseTrainer(BaseTrainerProtocol):
 				raise ImportError(
 					"Please install TensorFlow to use the TensorFlow dataset conversion."
 				) from exec
-			batch_size = (
-				(self.arguments.total_batch_size * self.arguments.gradient_accumulation_steps)
-				if is_train
-				else self.arguments.total_batch_size
-			)
+			batch_size = self.training_batch_size if is_train else self.evaluation_batch_size
 			return (
 				dataset.to_tf_dataset(
 					collate_fn=self.create_collect_function(
@@ -353,11 +376,7 @@ class BaseTrainer(BaseTrainerProtocol):
 				raise ImportError(
 					"Please install TensorFlow to use the TensorFlow dataset conversion."
 				) from exec
-			batch_size = (
-				(self.arguments.total_batch_size * self.arguments.gradient_accumulation_steps)
-				if is_train
-				else self.arguments.total_batch_size
-			)
+			batch_size = self.training_batch_size if is_train else self.evaluation_batch_size
 			return (
 				tf.data.Dataset.from_generator(
 					lambda: dataset,
@@ -394,9 +413,7 @@ class BaseTrainer(BaseTrainerProtocol):
 			if hasattr(dataset, "__len__"):
 				total_data_len = len(dataset)
 				batch_size = (
-					self.arguments.total_batch_size
-					if is_train
-					else self.arguments.eval_batch_size
+					self.arguments.total_batch_size if is_train else self.evaluation_batch_size
 				)
 				num_steps = (
 					(total_data_len + batch_size - 1)
@@ -597,7 +614,7 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 - **Gradient Accumulation Steps**: {self.arguments.gradient_accumulation_steps}
 - **Max Training Steps**: {self.arguments.max_training_steps}
 - **Max Evaluation Steps**: {self.arguments.max_evaluation_steps}
-- **Training Duration**: {self.arguments.training_time}
+- **Training Duration**: {self.arguments.training_time_limit}
 
 ### Sharding Configuration
 ```python
@@ -720,34 +737,66 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 		mesh = mesh or self.mesh or self.model.mesh
 		return specs_to_name_sharding(tree, mesh)
 
-	def calculate_number_total_flops_per_device(self, params):
-		return (
-			6
-			* sum(x.size for x in jax.tree_util.tree_flatten(unfreeze(params))[0])
-			* (self.arguments.total_batch_size * self.arguments.max_sequence_length)
-		) / jax.device_count()
+	def calculate_number_total_flops(self, params, is_training=True):
+		return 6 * sum(x.size for x in jax.tree_util.tree_flatten(unfreeze(params))[0])
 
 	@staticmethod
 	def count_model_parameters(prm):
 		"""Prints the number of model parameters in billions."""
 		return sum(n.size for n in jax.tree_util.tree_flatten(flax.core.unfreeze(prm))[0])
 
+	def apply_training_hooks(self, metrics: LossMetrics) -> LossMetrics:
+		if (
+			self.arguments.loss_config is not None and self.arguments.loss_config.break_on_nan
+		):
+			if jax.numpy.isnan(metrics.loss):
+				info = "Prevent Running Model Due to NaN Loss"
+				logger.info(info)
+				raise EasyDeLBreakRequest(info)
+		if (
+			self.arguments.training_time_seconds is not None
+			and time.time() > self.arguments.training_time_seconds + self._training_time_start
+		):
+			info = "Prevent Running Model Due to Time Limit"
+			logger.info(info)
+			raise EasyDeLTimerError(info)
+		return metrics
+
+	def start_training_hook(self):
+		self._ensure_functions_compiled()
+		self._training_time_start = time.time()
+
+	def start_evaluation_hook(self):
+		self._ensure_functions_compiled()
+		self._evaluation_time_start = time.time()
+
 	def compile_aot(self) -> bool:
 		compiled = False
+
+		def compile_function(function, dataloader, state, tag):
+			if not isinstance(function, Compiled):
+				logger.info("Compiling function: %s", tag)
+				return function.lower(state, next(iter(dataloader))).compile()
+			return function
+
 		if self.dataloader_train is not None:
-			self.sharded_training_step_function = self.sharded_training_step_function.lower(
+			self.sharded_training_step_function = compile_function(
+				self.sharded_training_step_function,
+				self.dataloader_train,
 				self.model_state,
-				next(iter(self.dataloader_train)),
-			).compile()
-			compiled = True
-		if self.dataloader_eval is not None:
-			self.sharded_evaluation_step_function = (
-				self.sharded_evaluation_step_function.lower(
-					self.model_state,
-					next(iter(self.dataloader_eval)),
-				).compile()
+				"trainer.sharded_training_step_function",
 			)
 			compiled = True
+
+		if self.dataloader_eval is not None:
+			self.sharded_evaluation_step_function = compile_function(
+				self.sharded_evaluation_step_function,
+				self.dataloader_eval,
+				self.model_state,
+				"trainer.sharded_evaluation_step_function",
+			)
+			compiled = True
+
 		return compiled
 
 	def _should_skip_step(self, current_step):
@@ -857,9 +906,7 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 			},
 			step=0,
 		)
-		self._flops_per_device = (
-			self.calculate_number_total_flops_per_device(params=state.graphstate) / 1e12
-		)
+		self._flops_model_state = self.calculate_number_total_flops(params=state.graphstate)
 
 	def _get_next_batch(self, train_iter):
 		"""Get next batch from iterator, reinitializing if needed."""
@@ -899,7 +946,4 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 			pbar.update(update_size)
 		# Log metrics if tracking is enabled
 		if not self.arguments.performance_mode:
-			self.arguments.log_metrics(
-				metrics=metrics,
-				step=step,
-			)
+			self.arguments.log_metrics(metrics=metrics, step=step)

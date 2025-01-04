@@ -12,14 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .creators import (
-	create_concatenated_forward,
-	create_eval_function,
-	create_train_function,
-)
+from ._fn import concatenated_forward, training_step, evaluation_step
 
-__all__ = [
-	"create_concatenated_forward",
-	"create_eval_function",
-	"create_train_function",
-]
+__all__ = ("concatenated_forward", "training_step", "evaluation_step")

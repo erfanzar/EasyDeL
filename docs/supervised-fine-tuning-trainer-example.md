@@ -123,7 +123,7 @@ train_arguments = ed.TrainingArguments(
 	dtype=dtype,
 	param_dtype=dtype,
 	model_name=new_repo_id.split("/")[-1].split("-v")[0],
-	training_time="7H",
+	training_time_limit="7H",
 	track_memory=False,
 )
 ```

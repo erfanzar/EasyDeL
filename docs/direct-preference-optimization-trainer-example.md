@@ -154,7 +154,7 @@ training_arguments = ed.DPOConfig(
 	dtype=dtype,
 	param_dtype=dtype,
 	model_name=new_repo_id.split("/")[-1].split("-v0")[0],
-	training_time="7H",
+	training_time_limit="7H",
 	track_memory=True,
 )
 ```
@@ -181,7 +181,7 @@ This converts the model and its parameters into a format compatible with `EasyDe
 trainer = ed.DPOTrainer(
 	arguments=training_arguments,
 	model_state=model_state,
-	ref_model_state=model_state,  # since we dont have a renfrence model for now, but you can use other models as refrence.
+	ref_model_state=model_state,  # since we dont have a renfrence model for now, but you can use other models as reference.
 	tokenizer=tokenizer,
 	train_dataset=train_dataset,
 )

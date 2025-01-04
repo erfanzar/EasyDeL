@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import time
 import typing as tp
 from functools import partial
 
@@ -21,7 +20,7 @@ from jax.sharding import PartitionSpec
 from tqdm.autonotebook import tqdm
 
 from easydel.infra.base_state import EasyDeLState
-from easydel.infra.errors import EasyDeLTimerError
+from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
 from easydel.infra.loss_utils import LossMetrics
 from easydel.utils.helpers import get_logger
 
@@ -30,7 +29,7 @@ from ..base_trainer import (
 	TrainerConfigureFunctionOutput,
 )
 from ..trainer_protocol import MetricsTracker, StepMetrics
-from ._fn import eval_step, train_step
+from ._fn import evaluation_step, training_step
 from .modeling_output import TrainerOutput
 
 logger = get_logger(__name__)
@@ -99,7 +98,7 @@ class Trainer(BaseTrainer):
 		)
 		sharded_training_step_function = jax.jit(
 			partial(
-				train_step,
+				training_step,
 				partition_spec=self.arguments.step_partition_spec,
 				loss_config=self.arguments.loss_config,
 				learning_rate_fn=self.scheduler,
@@ -118,7 +117,7 @@ class Trainer(BaseTrainer):
 
 		sharded_evaluation_step_function = jax.jit(
 			partial(
-				eval_step,
+				evaluation_step,
 				partition_spec=self.arguments.step_partition_spec,
 				loss_config=self.arguments.loss_config,
 			),
@@ -146,7 +145,10 @@ class Trainer(BaseTrainer):
 		step_metrics: StepMetrics,
 	):
 		"""Core training loop implementation."""
-		pbar = tqdm(total=self.max_training_steps)
+		pbar = tqdm(
+			total=self.max_training_steps,
+			disable=jax.process_index() != 0,
+		)
 		run_exception = None
 		with self.mesh:
 			for epoch in range(self.arguments.num_train_epochs):
@@ -173,21 +175,20 @@ class Trainer(BaseTrainer):
 		state: EasyDeLState,
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
-		start_time: float,
 	):
 		"""Core evaluation loop implementation."""
-		pbar = tqdm(total=self.max_evaluation_steps)
+		pbar = tqdm(
+			total=self.max_evaluation_steps,
+			disable=jax.process_index() != 0,
+		)
 		pbar.set_description("evaluation process")
-		current_step = int(jax.device_get(state.step))
 		with self.mesh:
 			for eval_metrics in self._eval_epoch(
 				state=state,
 				eval_dataset=self.dataloader_eval,
-				current_step=current_step,
 				metrics_tracker=metrics_tracker,
 				step_metrics=step_metrics,
 				pbar=pbar,
-				start_time=start_time,
 			):
 				yield eval_metrics
 
@@ -201,7 +202,7 @@ class Trainer(BaseTrainer):
 		epoch: int,
 	):
 		"""Handles training for a single epoch."""
-		train_iter = iter(train_dataset)
+		train_iter = iter(train_dataset) 
 		for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
 			current_step = int(jax.device_get(state.step))
 			try:  # to make training loop safer if user wants to break that.
@@ -210,7 +211,12 @@ class Trainer(BaseTrainer):
 					pbar.update(1)
 					continue
 				step_metrics.start_step()
-			except (KeyboardInterrupt, EasyDeLTimerError, StopIteration) as exect:
+			except (
+				KeyboardInterrupt,
+				EasyDeLTimerError,
+				EasyDeLBreakRequest,
+				StopIteration,
+			) as exect:
 				return state, exect
 
 			# Execute training step
@@ -222,18 +228,16 @@ class Trainer(BaseTrainer):
 					accuracy=metrics.accuracy,
 					step=current_step,
 				)
-
+				metrics = self.apply_training_hooks(metrics=metrics)
 				train_metrics = step_metrics.calculate(
-					loss=metrics.loss,
 					metrics=metrics,
 					current_step=current_step,
 					learning_rate=self.scheduler(current_step)
 					if self.scheduler is not None
 					else self.arguments.learning_rate,
 					epoch=epoch,
-					flops_per_device=getattr(self, "_flops_per_device", 0),
-					batch_size=self.arguments.total_batch_size
-					* self.arguments.gradient_accumulation_steps,
+					flops=self.get_runstage_flops(is_training=True),
+					batch_size=self.training_batch_size,
 					seq_length=self.arguments.max_sequence_length,
 					mean_loss=mean_loss,
 					mean_accuracy=mean_accuracy,
@@ -258,7 +262,7 @@ class Trainer(BaseTrainer):
 					for _ in self.eval(model_state=state):
 						...
 
-			except (KeyboardInterrupt, EasyDeLTimerError):
+			except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest):
 				return state, run_exception
 			if run_exception is not None:
 				break
@@ -268,15 +272,13 @@ class Trainer(BaseTrainer):
 		self,
 		state: EasyDeLState,
 		eval_dataset: int,
-		current_step: int,
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
 		pbar: tqdm,
-		start_time: float,
 	):
 		"""Handles training for a single epoch."""
 		eval_iter = iter(eval_dataset)
-		for _ in range(self.max_evaluation_steps):
+		for current_step in range(self.max_evaluation_steps):
 			try:
 				batch = self._get_next_batch(eval_iter)
 				step_metrics.start_step()
@@ -287,14 +289,12 @@ class Trainer(BaseTrainer):
 					current_step,
 				)
 				eval_metrics = step_metrics.calculate(
-					loss=metrics.loss,
 					metrics=metrics,
 					current_step=current_step,
 					learning_rate=0.000,
 					epoch=0,
-					flops_per_device=getattr(self, "_flops_per_device", 0),
-					batch_size=self.arguments.total_batch_size
-					* self.arguments.gradient_accumulation_steps,
+					flops=self.get_runstage_flops(is_training=False),
+					batch_size=self.evaluation_batch_size,
 					seq_length=self.arguments.max_sequence_length,
 					mean_loss=mean_loss,
 					mean_accuracy=mean_accuracy,
@@ -306,10 +306,9 @@ class Trainer(BaseTrainer):
 					step=current_step,
 					mode="eval",
 				)
-				current_step += 1
 
 				yield eval_metrics
-			except (KeyboardInterrupt, EasyDeLTimerError) as _:
+			except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest) as _:
 				break
 
 	def _execute_eval_step(self, state, batch) -> LossMetrics:
@@ -342,7 +341,7 @@ class Trainer(BaseTrainer):
 				)
 
 			return state, metrics, None
-		except (KeyboardInterrupt, EasyDeLTimerError) as run_exception:
+		except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest) as run_exception:
 			return state, metrics, run_exception
 
 	def _finalize_training(self, output, run_exception):
@@ -357,6 +356,8 @@ class Trainer(BaseTrainer):
 		return output
 
 	def train(self) -> TrainerOutput:
+		self.start_training_hook()
+
 		state = self.model_state
 		metrics_tracker = MetricsTracker()
 		step_metrics = StepMetrics(self.arguments)
@@ -389,9 +390,8 @@ class Trainer(BaseTrainer):
 		Raises:
 		    AssertionError: If `self.dataloader_eval` is not set (meaning the evaluation dataloader is missing).
 		"""
+		self.start_evaluation_hook()
 		try:
-			start_time = time.time()
-
 			metrics_tracker = MetricsTracker()
 			step_metrics = StepMetrics(self.arguments)
 
@@ -399,7 +399,6 @@ class Trainer(BaseTrainer):
 				state=model_state,
 				metrics_tracker=metrics_tracker,
 				step_metrics=step_metrics,
-				start_time=start_time,
 			):
 				yield metrics
 		except RuntimeError:  # sometimes we get a RuntimeError in multi-host evaluation, we should catch it and continue.

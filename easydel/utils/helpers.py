@@ -23,6 +23,8 @@ import warnings
 from contextlib import contextmanager
 from pathlib import Path
 
+import jax
+
 if tp.TYPE_CHECKING:
 	from flax.metrics.tensorboard import SummaryWriter
 else:
@@ -57,6 +59,9 @@ def get_logger(
 	Returns:
 	    logging.Logger: The configured logger instance.
 	"""
+	if jax.process_index() > 0:
+		level = logging.WARNING
+		
 	logger = logging.getLogger(name)
 	logger.propagate = False
 

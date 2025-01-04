@@ -25,7 +25,7 @@ from jax import random as jrand
 from jax.experimental import pallas as pl
 
 
-def _attn_refrence(query_states, key_states, value_states, bias):
+def _attn_reference(query_states, key_states, value_states, bias):
 	b, qs, num_q_heads, d = query_states.shape
 	num_kv_heads = value_states.shape[2]
 	ks = value_states.shape[1]
@@ -562,7 +562,7 @@ def _forward_test():
 	BLOCK_M = 32
 	BLOCK_N = 32
 	query, key, value, bias = _get_dummy_inputs(B, H, Kh, Qs, S, D, dtype)
-	excepted_result = _attn_refrence(query, key, value, bias)
+	excepted_result = _attn_reference(query, key, value, bias)
 
 	result = flash_attention2(
 		query=query,
@@ -586,7 +586,7 @@ def _backward_test():
 	BLOCK_N = 32
 	query, key, value, bias = _get_dummy_inputs(B, H, Kh, Qs, S, D, dtype)
 
-	excepted_result = jax.grad(lambda *x: _attn_refrence(*x).sum())(
+	excepted_result = jax.grad(lambda *x: _attn_reference(*x).sum())(
 		query, key, value, bias
 	)
 	result = jax.grad(

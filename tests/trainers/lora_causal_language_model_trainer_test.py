@@ -1,20 +1,20 @@
 import os
 import sys
 
-
 # Local imports (assuming easydel is in parent directory or installed)
 dirname = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(dirname, "..", ".."))
 
-import easydel as ed
-import flax
-
 import logging
+from functools import partial
+
+import fjformer
+import flax
 import jax
 import jax.numpy as jnp
 from datasets import Dataset, IterableDataset
-import fjformer
-from functools import partial
+
+import easydel as ed
 
 # Configure logging
 logging.basicConfig(
@@ -22,7 +22,7 @@ logging.basicConfig(
 )
 
 # Constants
-TOTAL_BATCH_SIZE = 1
+TOTAL_BATCH_SIZE = 8
 UPPER = 600
 NUM_TRAIN_EPOCHS = 2
 SEQUENCE_LENGTH = 128
@@ -130,10 +130,10 @@ def create_training_args(
 		use_wandb=False,
 		learning_rate=learning_rate,
 		do_last_save=True,
-		save_steps=SAVE_STEPS,
-		save_total_limit=5,
-		save_optimizer_state=True,
-		training_time="80Min",
+		# save_steps=SAVE_STEPS,
+		# save_total_limit=5,
+		# save_optimizer_state=True,
+		training_time_limit="10sec",
 		optimizer=ed.EasyDeLOptimizers.ADAMW,
 		scheduler=ed.EasyDeLSchedulers.COSINE,
 		clip_grad=1.0,

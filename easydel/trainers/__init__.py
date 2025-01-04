@@ -16,12 +16,10 @@ from .base_trainer import BaseTrainer
 from .direct_preference_optimization_trainer import (
 	DPOConfig,
 	DPOTrainer,
-	DPOTrainerOutput,
 )
 from .odds_ratio_preference_optimization_trainer import (
 	ORPOConfig,
 	ORPOTrainer,
-	ORPOTrainerOutput,
 )
 from .packer import pack_sequences
 from .supervised_fine_tuning_trainer import (
@@ -43,10 +41,8 @@ __all__ = (
 	"BaseTrainer",
 	"DPOConfig",
 	"DPOTrainer",
-	"DPOTrainerOutput",
 	"ORPOConfig",
 	"ORPOTrainer",
-	"ORPOTrainerOutput",
 	"pack_sequences",
 	"SFTTrainer",
 	"SFTConfig",
