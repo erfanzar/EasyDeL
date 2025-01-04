@@ -1,7 +1,10 @@
 # import os
 
 # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
+import os
+import sys
 
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
 from jax import numpy as jnp
 from transformers import (
