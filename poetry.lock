@@ -1210,13 +1210,13 @@ files = [
 
 [[package]]
 name = "importlib-resources"
-version = "6.5.1"
+version = "6.5.2"
 description = "Read resources from Python packages"
 optional = false
 python-versions = ">=3.9"
 files = [
-    {file = "importlib_resources-6.5.1-py3-none-any.whl", hash = "sha256:1db285ef06f980573f0a2c33de835cf9bcbd511c320d7bb332adfc4860c1ec2c"},
-    {file = "importlib_resources-6.5.1.tar.gz", hash = "sha256:095007d90b03799a362408af71a9657657b2f147358585ba451bb4214d72c7a8"},
+    {file = "importlib_resources-6.5.2-py3-none-any.whl", hash = "sha256:789cfdc3ed28c78b67a06acb8126751ced69a3d5f79c095a98298cd8a760ccec"},
+    {file = "importlib_resources-6.5.2.tar.gz", hash = "sha256:185f87adef5bcc288449d98fb4fba07cea78bc036455dd44c5fc4a2fe78fed2c"},
 ]
 
 [package.extras]
@@ -4749,7 +4749,11 @@ enabler = ["pytest-enabler (>=2.2)"]
 test = ["big-O", "importlib-resources", "jaraco.functools", "jaraco.itertools", "jaraco.test", "more-itertools", "pytest (>=6,!=8.1.*)", "pytest-ignore-flaky"]
 type = ["pytest-mypy"]
 
+[extras]
+all = ["tensorboard"]
+torch = []
+
 [metadata]
 lock-version = "2.0"
 python-versions = ">=3.10,<3.13"
-content-hash = "f6d284dc1e426d572eb1620376b1ee95b9f38cada0929c62174c8ba1ff9a7ade"
+content-hash = "32b77d883e2327ae7bb5c95bee93e2e52f18aff2929be9ca187e0831f7a384a3"
