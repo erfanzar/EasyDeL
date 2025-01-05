@@ -30,7 +30,7 @@ threading.Thread(target=log_mem)  # .start()
 
 def main():
 	sharding_axis_dims = (1, 1, 1, -1)
-	max_length = 4096
+	max_length = 8192
 
 	pretrained_model_name_or_path = "Qwen/Qwen2.5-7B-Instruct"
 	# pretrained_model_name_or_path = "AntonV/mamba2-370m-hf"

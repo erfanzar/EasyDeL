@@ -1,6 +1,9 @@
 import os
 import sys
 
+import jax
+import torch
+
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 os.environ["EASYDEL_AUTO"] = "true"
 
@@ -18,31 +21,35 @@ PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
 def main():
 	sharding_axis_dims = (1, 1, 1, -1)
-	max_length = 6144
-	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
-	dtype = jnp.float16
+	max_length = 8192
+	pretrained_model_name_or_path = "Qwen/Qwen2.5-7B-Instruct"
 	partition_axis = ed.PartitionAxis()
+	dtype = jnp.bfloat16
 	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		pretrained_model_name_or_path,
 		auto_shard_model=True,
 		sharding_axis_dims=sharding_axis_dims,
 		config_kwargs=ed.EasyDeLBaseConfigDict(
-			use_scan_mlp=False,
-			partition_axis=partition_axis,
-			attn_dtype=jnp.float16,
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
+			attn_dtype=dtype,
+			gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
+			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		),
 		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 		platform=ed.EasyDeLPlatforms.TRITON,
-		partition_axis=partition_axis,
-		param_dtype=dtype,
+		param_dtype=dtype,  # jnp.float8_e5m2,
 		dtype=dtype,
+		torch_dtype=torch.float16,
+		partition_axis=partition_axis,
+		precision=jax.lax.Precision("fastest"),
 	)
+
+	model.eval()
 	tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
 	tokenizer.padding_side = "left"
-	tokenizer.pad_token_id = tokenizer.eos_token_id
+
 	inference = ed.vInference(
 		model=model,
 		processor_class=tokenizer,
@@ -52,9 +59,10 @@ def main():
 			top_p=model.generation_config.top_p,
 			top_k=model.generation_config.top_k,
 			eos_token_id=model.generation_config.eos_token_id,
-			streaming_chunks=32,
+			pad_token_id=model.generation_config.pad_token_id,
+			bos_token_id=model.generation_config.bos_token_id,
+			streaming_chunks=64,
 		),
-		inference_name="llama3-1B",
 	)
 
 	inference.precompile()

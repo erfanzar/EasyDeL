@@ -411,6 +411,7 @@ class vInference:
 						interval_func_flops = np.mean(all_interval_func_flops)
 						state.generate_func_flops = generate_func_flops
 						state.interval_func_flops = interval_func_flops
+						
 						state.tokens_pre_second = state.generated_tokens / interval_time
 						yield state
 						if state.is_sequence_finished:
