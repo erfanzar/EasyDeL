@@ -33,17 +33,30 @@ from ..utils import (
 	vInferenceConfig,
 )
 
+if jax.default_backend() == "tpu":
 
-def measure_flops(func, *args, **kwargs):
-	try:
-		flops = func.cost_analysis()[0]["flops"]
-	except:  # noqa
-		flops = 1
-	start_time = time.perf_counter()
-	result = func(*args, **kwargs)
-	end_time = time.perf_counter()
-	elapsed_time = end_time - start_time
-	return result, flops, flops / elapsed_time, elapsed_time
+	def measure_flops(func, *args, **kwargs):
+		try:
+			flops = func.cost_analysis()[0]["flops"]
+		except Exception:   
+			flops = 1
+		start_time = time.perf_counter()
+		result = jax.block_until_ready(func(*args, **kwargs))
+		end_time = time.perf_counter()
+		elapsed_time = end_time - start_time
+		return result, flops, flops / elapsed_time, elapsed_time
+else:
+	# On GPUs this will be much more efficient 
+	def measure_flops(func, *args, **kwargs):
+		try:
+			flops = func.cost_analysis()[0]["flops"]
+		except Exception:  
+			flops = 1
+		start_time = time.perf_counter()
+		result = func(*args, **kwargs)
+		end_time = time.perf_counter()
+		elapsed_time = end_time - start_time
+		return result, flops, flops / elapsed_time, elapsed_time
 
 
 @partial(
