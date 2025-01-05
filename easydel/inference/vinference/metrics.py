@@ -115,7 +115,10 @@ class vInferenceMetrics:
 		)
 
 		# Start monitoring threads
-		self._start_memory_monitoring()
+		try:
+			self._start_memory_monitoring()  # Fixes 181 (currently)
+		except Exception:
+			...
 
 	def _start_memory_monitoring(self):
 		def monitor_memory():
