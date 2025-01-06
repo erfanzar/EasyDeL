@@ -241,7 +241,7 @@ def torch_dict_to_easydel_params(
 			del state_dict
 			_clear()
 
-		return unflatten_dict(flax_dict)
+		return jax.block_until_ready(unflatten_dict(flax_dict))
 
 
 def module_to_torch(
