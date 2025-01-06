@@ -9,7 +9,6 @@ sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import easydel as ed
 # fmt:on
 import jax
-import torch
 import transformers
 from huggingface_hub import HfApi
 from jax import numpy as jnp
@@ -42,7 +41,7 @@ def main():
 	print("LOADING MODEL ... ")
 	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		pretrained_model_name_or_path,
-		auto_shard_model=True,
+		auto_shard_model=False,
 		sharding_axis_dims=sharding_axis_dims,
 		config_kwargs=ed.EasyDeLBaseConfigDict(
 			freq_max_position_embeddings=max_length,
@@ -51,18 +50,18 @@ def main():
 			gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
 			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
-			# use_scan_mlp=True,
-			# scan_mlp_chunk_size=128,
 		),
 		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-		platform=ed.EasyDeLPlatforms.TRITON,
-		param_dtype=dtype,  # jnp.float8_e5m2,
+		platform=ed.EasyDeLPlatforms.JAX,
+		param_dtype=dtype,
 		dtype=dtype,
-		torch_dtype=torch.float16,
 		partition_axis=partition_axis,
 		precision=jax.lax.Precision("fastest"),
 	)
 	print("MODEL LOADED")
+	model = model.shard_model()
+	print("MODEL SHARDED")
+
 	tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
 	tokenizer.padding_side = "left"
 	tokenizer.pad_token_id = tokenizer.eos_token_id
