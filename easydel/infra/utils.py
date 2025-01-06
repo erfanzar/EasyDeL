@@ -232,19 +232,19 @@ def control_mlp_sharding(x: jax.Array, partition_axis: PartitionAxis):
 	"""
 	this functions is disabled for now, it will cause breakdown and incorrect computation on gpu with CU lower than 7.5
 	"""
-	sqax = (
-		partition_axis.sequence_axis
-		if x.shape[1] != 1
-		else partition_axis.generation_query_sequence_axis
-	)
-	x = with_sharding_constraint(
-		x,
-		sharding=PartitionSpec(
-			partition_axis.batch_axis,
-			sqax,
-			partition_axis.hidden_state_axis,
-		),
-	)
+	# sqax = (
+	# 	partition_axis.sequence_axis
+	# 	if x.shape[1] != 1
+	# 	else partition_axis.generation_query_sequence_axis
+	# )
+	# x = with_sharding_constraint(
+	# 	x,
+	# 	sharding=PartitionSpec(
+	# 		partition_axis.batch_axis,
+	# 		sqax,
+	# 		partition_axis.hidden_state_axis,
+	# 	),
+	# )
 	return x
 
 
