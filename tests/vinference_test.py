@@ -30,7 +30,7 @@ threading.Thread(target=log_mem)  # .start()
 
 def main():
 	sharding_axis_dims = (1, 1, 1, -1)
-	max_length = 8192
+	max_length = 4096
 
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
 	# pretrained_model_name_or_path = "AntonV/mamba2-370m-hf"
@@ -56,7 +56,7 @@ def main():
 		),
 		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 		platform=ed.EasyDeLPlatforms.TRITON,
-		param_dtype=dtype,  # jnp.float8_e5m2,
+		param_dtype=jnp.float8_e5m2,  # dtype,  #
 		dtype=dtype,
 		torch_dtype=torch.float16,
 		partition_axis=partition_axis,
