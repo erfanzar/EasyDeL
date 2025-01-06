@@ -1,4 +1,3 @@
-# fmt:off
 import os
 import sys
 import threading
@@ -6,14 +5,14 @@ import time
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-import easydel as ed
-# fmt:on
 import jax
+import easydel as ed
 import transformers
 from huggingface_hub import HfApi
 from jax import numpy as jnp
-from jax import sharding
+from jax import sharding, config
 
+config.update("jax_spmd_mode", "allow_all")
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
@@ -41,7 +40,7 @@ def main():
 	print("LOADING MODEL ... ")
 	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		pretrained_model_name_or_path,
-		auto_shard_model=False,
+		auto_shard_model=True,
 		sharding_axis_dims=sharding_axis_dims,
 		config_kwargs=ed.EasyDeLBaseConfigDict(
 			freq_max_position_embeddings=max_length,
@@ -59,8 +58,6 @@ def main():
 		precision=jax.lax.Precision("fastest"),
 	)
 	print("MODEL LOADED")
-	model = model.shard_model()
-	print("MODEL SHARDED")
 
 	tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
 	tokenizer.padding_side = "left"
