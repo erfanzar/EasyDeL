@@ -115,10 +115,8 @@ class vInferenceMetrics:
 		)
 
 		# Start monitoring threads
-		try:
+		if jax.device_count() == jax.local_device_count():
 			self._start_memory_monitoring()  # Fixes 181 (currently)
-		except Exception:
-			...
 
 	def _start_memory_monitoring(self):
 		def monitor_memory():
