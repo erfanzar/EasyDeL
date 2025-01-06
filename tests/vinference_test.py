@@ -4,44 +4,45 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import jax
-import easydel as ed
-import transformers
-from jax import numpy as jnp
 from jax import config
 
+jax.config.update("jax_platform_name", "tpu")
+jax.config.update("jax_disable_jit", False)
+jax.config.update("jax_debug_nans", False)
 config.update("jax_spmd_mode", "allow_all")
+import transformers
+from jax import numpy as jnp
 
+import easydel as ed
 
-sharding_axis_dims = (1, 1, 1, -1)
+print("Available devices:", jax.devices())
+print("Device memory:", jax.device_memory_info())
+sharding_axis_dims = (1, 1, 8, -1)
 max_length = 8192
 
 pretrained_model_name_or_path = "Qwen/Qwen2.5-7B-Instruct"
-# pretrained_model_name_or_path = "AntonV/mamba2-370m-hf"
-
-partition_axis = ed.PartitionAxis()
-
 dtype = jnp.bfloat16
 
 print("LOADING MODEL ... ")
-model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
-	pretrained_model_name_or_path,
-	auto_shard_model=True,
-	sharding_axis_dims=sharding_axis_dims,
-	config_kwargs=ed.EasyDeLBaseConfigDict(
-		freq_max_position_embeddings=max_length,
-		mask_max_position_embeddings=max_length,
-		attn_dtype=dtype,
-		gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
-		kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-		attn_mechanism=ed.AttentionMechanisms.VANILLA,
-	),
-	quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-	platform=ed.EasyDeLPlatforms.JAX,
-	param_dtype=dtype,
-	dtype=dtype,
-	partition_axis=partition_axis,
-	precision=jax.lax.Precision("fastest"),
-)
+try:
+	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+		pretrained_model_name_or_path,
+		auto_shard_model=True,
+		sharding_axis_dims=sharding_axis_dims,
+		config_kwargs=ed.EasyDeLBaseConfigDict(
+			freq_max_position_embeddings=max_length,
+			mask_max_position_embeddings=max_length,
+			attn_dtype=dtype,
+			attn_mechanism=ed.AttentionMechanisms.VANILLA,
+		),
+		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+		platform=ed.EasyDeLPlatforms.JAX,
+		param_dtype=dtype,
+		dtype=dtype,
+	)
+except Exception as e:
+	print(f"Error loading model: {str(e)}")
+	raise
 print("MODEL LOADED")
 
 tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
