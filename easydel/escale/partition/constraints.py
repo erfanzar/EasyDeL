@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
-from functools import partial
 import re
 import typing as tp
 import warnings
@@ -67,22 +66,13 @@ def make_shard_and_gather_fns(
 		"""
 		Create a shard function for a specific partition spec.
 		"""
-		if jax.device_count() == jax.local_device_count():
 
-			def shard_fn(tensor: jnp.ndarray) -> jnp.ndarray:
-				with mesh:
-					tensor = with_sharding_constraint(arr=tensor, sharding=sharding)
-				return tensor
-		else:
+		def shard_fn(tensor: jnp.ndarray) -> jnp.ndarray:
+			with mesh:
+				tensor = with_sharding_constraint(arr=tensor, sharding=sharding)
+			return tensor
 
-			@partial(jax.jit, in_shardings=None, out_shardings=sharding)
-			def shard(tensor):
-				return tensor
-
-			def shard_fn(tensor: jnp.ndarray) -> jnp.ndarray:
-				return shard(tensor).block_until_ready()
-
-			return shard_fn
+		return shard_fn
 
 	def make_gather_fn(sharding: NamedSharding) -> tp.Callable:
 		"""

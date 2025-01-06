@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import contextlib
 import os
 import typing as tp
 
@@ -86,8 +87,6 @@ class BaseAutoEasyModel:
 		    tp.Tuple[EasyDeLBaseModule, dict]: A tuple containing the EasyDeL model and the loaded and sharded
 		        model parameters.
 		"""
-		if device is None:
-			device = jax.local_devices()[0]
 		if precision is None:
 			precision = jax.lax.Precision("fastest")
 		if partition_axis is None:
@@ -118,7 +117,8 @@ class BaseAutoEasyModel:
 				shard_attention_computation=shard_attention_computation,
 				**kwargs,
 			)
-		with jax.default_device(device):
+		cmg = jax.default_device(device) if device is not None else contextlib.nullcontext()
+		with cmg:
 			return cls._from_easydel_params(
 				auto_shard_model=auto_shard_model,
 				partition_axis=partition_axis,

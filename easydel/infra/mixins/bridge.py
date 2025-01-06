@@ -720,7 +720,6 @@ class EasyBridgeMixin(PushToHubMixin):
 				block_size=quantization_block_size,
 				verbose=verbose,
 			)
-		model = jax.block_until_ready(model)
 		logger.debug("returning model.")
 		return model
 

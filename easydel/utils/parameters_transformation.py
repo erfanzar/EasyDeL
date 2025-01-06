@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import gc
 import os
 import typing as tp
-from contextlib import contextmanager
 
 import jax
 from fjformer.checkpoint import get_dtype
@@ -90,11 +90,6 @@ def match_keywords(string, ts, ns):
 		if n in string:
 			return False
 	return True
-
-
-@contextmanager
-def _dummy_context_manager():
-	yield
 
 
 def process_tensor(
@@ -215,14 +210,18 @@ def torch_dict_to_easydel_params(
 		"uses_tie_word_embedding": uses_tie_word_embedding,
 		"dtype": dtype,
 	}
+	cmg = (
+		jax.default_device(device)
+		if device is not None and shard_fns is None
+		else contextlib.nullcontext()
+	)
 
-	device = device or jax.local_devices()[0]
-	ctx_m = jax.default_device(device) if shard_fns is None else _dummy_context_manager()
-
-	with ctx_m:
+	with cmg:
 		flax_dict = {}
 		with tqdm(
-			total=len(state_dict), disable=not verbose, desc="Converting Model"
+			total=len(state_dict),
+			disable=not verbose,
+			desc="Converting Model",
 		) as pbar:
 			for key, tensor in state_dict.items():
 				try:
@@ -241,7 +240,7 @@ def torch_dict_to_easydel_params(
 			del state_dict
 			_clear()
 
-		return jax.block_until_ready(unflatten_dict(flax_dict))
+		return unflatten_dict(flax_dict)
 
 
 def module_to_torch(
