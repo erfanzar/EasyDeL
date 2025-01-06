@@ -39,6 +39,7 @@ def main():
 
 	dtype = jnp.bfloat16
 
+	print("LOADING MODEL ... ")
 	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		pretrained_model_name_or_path,
 		auto_shard_model=True,
@@ -61,16 +62,18 @@ def main():
 		partition_axis=partition_axis,
 		precision=jax.lax.Precision("fastest"),
 	)
-
+	print("MODEL LOADED")
 	tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
 	tokenizer.padding_side = "left"
 	tokenizer.pad_token_id = tokenizer.eos_token_id
+	print("TOKENIZER LOADED")
 	model.eval()
 	# model = model.quantize(
 	# 	method=ed.EasyDeLQuantizationMethods.A8BIT,
 	# 	block_size=128,
 	# 	quantization_pattern=".*(gate_proj|up_proj).*",
 	# )
+	print("CREATING vInference")
 
 	inference = ed.vInference(
 		model=model,
