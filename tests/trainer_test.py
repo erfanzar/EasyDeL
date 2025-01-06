@@ -11,7 +11,7 @@ import easydel as ed
 MODEL_REPO_ID = "Qwen/Qwen2.5-7B-Instruct"
 MAX_LENGTH = 2048
 MAX_TRAINING_STEPS = 10_000
-SHARDING_AXIS_DIMS = (1, -1, 1, 1)
+SHARDING_AXIS_DIMS = (1, 1, 1, -1)
 
 DTYPE = jnp.bfloat16
 PARAM_DTYPE = jnp.bfloat16
