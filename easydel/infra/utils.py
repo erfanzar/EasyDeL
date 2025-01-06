@@ -29,7 +29,6 @@ import jax.tree_util
 from aqt.jax.v2 import config as q_config
 from aqt.jax.v2.flax import aqt_flax as q_flax
 from flax import nnx as nn
-from jax.sharding import PartitionSpec
 from tqdm.auto import tqdm
 
 import easydel

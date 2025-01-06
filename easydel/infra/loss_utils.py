@@ -24,9 +24,8 @@ import flax.struct
 import jax
 import jax.numpy as jnp
 from jax import lax
-from jax.sharding import PartitionSpec
 
-from easydel.escale import PartitionAxis, with_sharding_constraint
+from easydel.escale import PartitionAxis
 
 
 @enum.unique
@@ -35,11 +34,13 @@ class SpecialLossNormalizingFactor(enum.Enum):
 	Specially calculated loss normalizing factors that are not constant.
 
 	Attributes:
+			NO_WEIGHT_NUM_REAL_TARGET_TOKENS: Divide the loss by the number of real (non-padding) tokens (wont calculate Weights).
 	    NUM_REAL_TARGET_TOKENS: Divide the loss by the number of real (non-padding) tokens.
 	    NUM_TOTAL_TARGET_TOKENS: Divide the loss by the total number of target tokens.
 	    AVERAGE_PER_SEQUENCE: Compute the average loss per sequence.
 	"""
 
+	NO_WEIGHT_NUM_REAL_TARGET_TOKENS = 0
 	NUM_REAL_TARGET_TOKENS = 1
 	NUM_TOTAL_TARGET_TOKENS = 2
 	AVERAGE_PER_SEQUENCE = 3
@@ -53,7 +54,10 @@ class LossConfig:
 	ignore_index: int = -100
 	label_smoothing: float = 0.0
 	z_loss: float = 0.0
-	loss_normalizing_factor: FACTOR_TYPE = "NUM_REAL_TARGET_TOKENS"
+	loss_normalizing_factor: FACTOR_TYPE = (
+		# "NUM_REAL_TARGET_TOKENS"
+		"NO_WEIGHT_NUM_REAL_TARGET_TOKENS"
+	)
 	num_labels: tp.Optional[str] = None
 	problem_type: tp.Optional[str] = None
 	divide_weight_sum: bool = False
@@ -375,6 +379,29 @@ def compute_weighted_cross_entropy_and_accuracy(
 	return total_loss, total_z_loss, weight_sum, accuracy
 
 
+def cross_entropy_loss_and_accuracy(source, target, valid=None):
+	if valid is None:
+		valid = jnp.ones(target.shape[:2])
+	valid = valid.astype(jnp.float32)
+	valid_text_length = jnp.maximum(jnp.sum(valid, axis=-1), 1e-10)
+	source = source.astype(jnp.float32)
+	token_log_prob = jnp.squeeze(
+		jnp.take_along_axis(
+			jax.nn.log_softmax(source, axis=-1),
+			jnp.expand_dims(target, -1),
+			axis=-1,
+		),
+		-1,
+	)
+	token_log_prob = jnp.where(valid > 0.0, token_log_prob, jnp.array(0.0))
+	loss = -jnp.mean(jnp.sum(token_log_prob, axis=-1) / valid_text_length)
+	correct = jnp.where(
+		valid > 0.0, jnp.argmax(source, axis=-1) == target, jnp.array(False)
+	)
+	accuracy = jnp.mean(jnp.sum(correct, axis=-1) / valid_text_length)
+	return loss, accuracy
+
+
 def convert_special_loss_normalizing_factor_to_enum(
 	x: str,
 ) -> SpecialLossNormalizingFactor:
@@ -394,6 +421,8 @@ def convert_special_loss_normalizing_factor_to_enum(
 		return SpecialLossNormalizingFactor.NUM_TOTAL_TARGET_TOKENS
 	if x == "AVERAGE_PER_SEQUENCE":
 		return SpecialLossNormalizingFactor.AVERAGE_PER_SEQUENCE
+	if x == "NO_WEIGHT_NUM_REAL_TARGET_TOKENS":
+		return SpecialLossNormalizingFactor.NO_WEIGHT_NUM_REAL_TARGET_TOKENS
 	raise ValueError(f'Could not convert string "{x}" to SpecialLossNormalizingFactor')
 
 
@@ -588,40 +617,53 @@ def fixed_cross_entropy(
 	mask = (
 		attention_mask if attention_mask is not None else (target != config.ignore_index)
 	)
+	if config.loss_normalizing_factor in str(
+		SpecialLossNormalizingFactor.NO_WEIGHT_NUM_REAL_TARGET_TOKENS
+	):
+		(
+			loss,
+			accuracy,
+		) = cross_entropy_loss_and_accuracy(
+			source=source,
+			target=target,
+			valid=mask,
+		)
+		total_z_loss = 0.0
+		weight_sum = 1.0
+	else:
+		if batch is None:
+			if config.loss_normalizing_factor in str(
+				SpecialLossNormalizingFactor.NUM_REAL_TARGET_TOKENS
+			):
+				batch = {
+					"decoder_target_tokens": target,
+					"decoder_loss_weights": mask,
+				}
+			else:
+				batch = {}
+		(
+			loss_normalizing_factor,
+			loss_weights,
+		) = get_loss_normalizing_factor_and_weights(config.loss_normalizing_factor, batch)
 
-	if batch is None:
-		if config.loss_normalizing_factor in str(
-			SpecialLossNormalizingFactor.NUM_REAL_TARGET_TOKENS
-		):
-			batch = {
-				"decoder_target_tokens": target,
-				"decoder_loss_weights": mask,
-			}
-		else:
-			batch = {}
-	(
-		loss_normalizing_factor,
-		loss_weights,
-	) = get_loss_normalizing_factor_and_weights(config.loss_normalizing_factor, batch)
-
-	(
-		total_loss,
-		total_z_loss,
-		weight_sum,
-		accuracy,
-	) = compute_weighted_cross_entropy_and_accuracy(
-		logits=source,
-		targets=target,
-		weights=loss_weights,
-		label_smoothing=config.label_smoothing,
-		z_loss=config.z_loss,
-		loss_normalizing_factor=loss_normalizing_factor,
-	)
-	loss = total_loss
-	if num_items_in_batch is not None:
-		loss = total_loss / num_items_in_batch
-	elif config.divide_weight_sum:
-		loss = total_loss / weight_sum
+		(
+			total_loss,
+			total_z_loss,
+			weight_sum,
+			accuracy,
+		) = compute_weighted_cross_entropy_and_accuracy(
+			logits=source,
+			targets=target,
+			weights=loss_weights,
+			label_smoothing=config.label_smoothing,
+			z_loss=config.z_loss,
+			loss_normalizing_factor=loss_normalizing_factor,
+		)
+		loss = total_loss
+		if num_items_in_batch is not None:
+			loss = total_loss / num_items_in_batch
+		elif config.divide_weight_sum:
+			loss = total_loss / weight_sum
 
 	return LossMetrics(
 		loss=loss,
@@ -656,22 +698,22 @@ def ForCausalLMLoss(
 	"""
 	if logits is None or labels is None:
 		raise ValueError("Logits and labels cannot be None")
-	if paxis is not None:
-		logits = with_sharding_constraint(
-			logits,
-			PartitionSpec(
-				paxis.batch_axis,
-				paxis.sequence_axis,
-				paxis.hidden_state_axis,
-			),
-		)
-		labels = with_sharding_constraint(
-			labels,
-			PartitionSpec(
-				paxis.batch_axis,
-				paxis.sequence_axis,
-			),
-		)
+	# if paxis is not None:
+	# 	logits = with_sharding_constraint(
+	# 		logits,
+	# 		PartitionSpec(
+	# 			paxis.batch_axis,
+	# 			paxis.sequence_axis,
+	# 			paxis.hidden_state_axis,
+	# 		),
+	# 	)
+	# 	labels = with_sharding_constraint(
+	# 		labels,
+	# 		PartitionSpec(
+	# 			paxis.batch_axis,
+	# 			paxis.sequence_axis,
+	# 		),
+	# 	)
 	shift_logits = logits[:, :-1, :]
 	shift_labels = labels[:, 1:]
 
