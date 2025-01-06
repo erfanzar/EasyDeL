@@ -709,7 +709,10 @@ class EasyBridgeMixin(PushToHubMixin):
 		model = merge_model_and_tree(model=model, tree=params)
 		logger.debug("model and parameters pytree merged.")
 
-		if quantization_method is not None:
+		if (
+			quantization_method is not None
+			and quantization_method != EasyDeLQuantizationMethods.NONE
+		):
 			logger.debug("quantizing model.")
 			model = quantize_linear_layers(
 				model,
@@ -717,7 +720,7 @@ class EasyBridgeMixin(PushToHubMixin):
 				block_size=quantization_block_size,
 				verbose=verbose,
 			)
-
+		model = jax.block_until_ready(model)
 		logger.debug("returning model.")
 		return model
 
