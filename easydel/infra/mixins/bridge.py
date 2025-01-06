@@ -704,8 +704,11 @@ class EasyBridgeMixin(PushToHubMixin):
 		if is_flatten(params):
 			logger.info("converted parameters are flatten making them unflatten ")
 			params = unflatten_dict(params)
-		model = merge_model_and_tree(model=model, tree=params)
 
+		logger.debug("merging model and parameters pytree")
+		model = merge_model_and_tree(model=model, tree=params)
+		logger.debug("model and parameters pytree merged")
+		
 		if quantization_method is not None:
 			model = quantize_linear_layers(
 				model,
