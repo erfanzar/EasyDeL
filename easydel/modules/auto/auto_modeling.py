@@ -87,7 +87,7 @@ class BaseAutoEasyModel:
 		        model parameters.
 		"""
 		if device is None:
-			device = jax.devices("cpu")[0]
+			device = jax.local_devices("cpu")[0]
 		if precision is None:
 			precision = jax.lax.Precision("fastest")
 		if partition_axis is None:
