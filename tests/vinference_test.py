@@ -16,7 +16,7 @@ from jax import numpy as jnp
 import easydel as ed
 
 print("Available devices:", jax.devices())
-print("Device memory:", jax.device_memory_info())
+
 sharding_axis_dims = (1, 1, 8, -1)
 max_length = 8192
 
