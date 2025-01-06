@@ -216,7 +216,7 @@ def torch_dict_to_easydel_params(
 		"dtype": dtype,
 	}
 
-	device = device or jax.devices()[0]
+	device = device or jax.local_devices()[0]
 	ctx_m = jax.default_device(device) if shard_fns is None else _dummy_context_manager()
 
 	with ctx_m:

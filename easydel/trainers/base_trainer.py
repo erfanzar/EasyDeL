@@ -547,8 +547,10 @@ class BaseTrainer(BaseTrainerProtocol):
 	def _get_device_info(self) -> dict:
 		"""Get information about available devices."""
 		try:
-			devices = jax.devices()
-			return {"platform": devices[0].platform.upper(), "device_count": len(devices)}
+			return {
+				"platform": jax.local_devices()[0].platform.upper(),
+				"device_count": jax.device_count(),
+			}
 		except Exception as e:
 			logger.error(f"Error getting device info: {str(e)}")
 			return {"platform": "UNKNOWN", "device_count": 0}

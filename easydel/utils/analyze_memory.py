@@ -102,7 +102,7 @@ class SMPMemoryMonitor:
 		Returns list of analysis results.
 		"""
 		results = []
-		for device in jax.devices():
+		for device in jax.local_devices():
 			try:
 				stats = device.memory_stats()
 				analysis = self.analyze_device(stats, device)
@@ -327,7 +327,7 @@ class MemoryMonitorClient:
 		)
 
 		return DeviceStats(
-			device_id=str(jax.devices()[0]),
+			device_id=str(jax.local_devices()[0]),
 			hostname=self.hostname,
 			timestamp=datetime.now(),
 			utilization_percent=round(utilization, 2),
@@ -354,7 +354,7 @@ class MemoryMonitorClient:
 		"""Main monitoring loop"""
 		while self.running:
 			try:
-				for device in jax.devices():
+				for device in jax.local_devices():
 					memory_stats = device.memory_stats()
 					stats = self.analyze_memory(memory_stats)
 					self._send_stats(stats)
