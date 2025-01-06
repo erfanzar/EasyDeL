@@ -124,7 +124,7 @@ class vInferenceMetrics:
 		def monitor_memory():
 			while True:
 				# JAX memory monitoring
-				for device in jax.devices():
+				for device in jax.local_devices():
 					memory_stats = device.memory_stats()
 					if memory_stats:  # Some devices might not support memory stats
 						self.jax_memory_used.labels(
