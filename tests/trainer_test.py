@@ -1,13 +1,14 @@
 import os
 import sys
 
+import jax
 import transformers
 from jax import numpy as jnp
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import easydel as ed
 
-MODEL_REPO_ID = "meta-llama/Llama-3.2-3B-Instruct"
+MODEL_REPO_ID = "Qwen/Qwen2.5-7B-Instruct"
 MAX_LENGTH = 2048
 MAX_TRAINING_STEPS = 10_000
 SHARDING_AXIS_DIMS = (1, -1, 1, 1)
@@ -37,7 +38,7 @@ TRAIN_ARGUMENTS = ed.TrainingArguments(
 	weight_decay=0.02,
 	total_batch_size=BATCH_SIZE,
 	max_sequence_length=MAX_LENGTH,
-	gradient_accumulation_steps=GRAD_ACCUMULATION_STEPS, 
+	gradient_accumulation_steps=GRAD_ACCUMULATION_STEPS,
 	do_last_save=False,
 	# max_training_steps=MAX_TRAINING_STEPS,
 	# use_wandb=True,
@@ -107,4 +108,5 @@ print("Compiling")
 trainer.compile_aot()
 print("Compiled")
 output = trainer.train()
-output.state.save_state("/home/erfan/model-ckpt")
+if jax.process_index() == 0:
+	output.state.save_state("/home/erfan/model-ckpt")
