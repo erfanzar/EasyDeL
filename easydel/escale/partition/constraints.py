@@ -75,11 +75,14 @@ def make_shard_and_gather_fns(
 				return tensor
 		else:
 
-			@partial(jax.jit, out_shardings=named_shardings)
-			def shard_fn(tensor: jnp.ndarray) -> jnp.ndarray:
+			@partial(jax.jit, in_shardings=None, out_shardings=sharding)
+			def shard(tensor):
 				return tensor
 
-		return shard_fn
+			def shard_fn(tensor: jnp.ndarray) -> jnp.ndarray:
+				return shard(tensor).block_until_ready()
+
+			return shard_fn
 
 	def make_gather_fn(sharding: NamedSharding) -> tp.Callable:
 		"""
