@@ -24,8 +24,10 @@ import flax.struct
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax.sharding import PartitionSpec
 
 from easydel.escale import PartitionAxis
+from easydel.escale.partition.constraints import with_sharding_constraint
 
 
 @enum.unique
@@ -698,22 +700,22 @@ def ForCausalLMLoss(
 	"""
 	if logits is None or labels is None:
 		raise ValueError("Logits and labels cannot be None")
-	# if paxis is not None:
-	# 	logits = with_sharding_constraint(
-	# 		logits,
-	# 		PartitionSpec(
-	# 			paxis.batch_axis,
-	# 			paxis.sequence_axis,
-	# 			paxis.hidden_state_axis,
-	# 		),
-	# 	)
-	# 	labels = with_sharding_constraint(
-	# 		labels,
-	# 		PartitionSpec(
-	# 			paxis.batch_axis,
-	# 			paxis.sequence_axis,
-	# 		),
-	# 	)
+	if paxis is not None:
+		logits = with_sharding_constraint(
+			logits,
+			PartitionSpec(
+				paxis.batch_axis,
+				paxis.sequence_axis,
+				paxis.hidden_state_axis,
+			),
+		)
+		labels = with_sharding_constraint(
+			labels,
+			PartitionSpec(
+				paxis.batch_axis,
+				paxis.sequence_axis,
+			),
+		)
 	shift_logits = logits[:, :-1, :]
 	shift_labels = labels[:, 1:]
 

@@ -29,6 +29,7 @@ import jax.tree_util
 from aqt.jax.v2 import config as q_config
 from aqt.jax.v2.flax import aqt_flax as q_flax
 from flax import nnx as nn
+from jax.sharding import PartitionSpec
 from tqdm.auto import tqdm
 
 import easydel
@@ -231,19 +232,19 @@ def control_mlp_sharding(x: jax.Array, partition_axis: PartitionAxis):
 	"""
 	this functions is disabled for now, it will cause breakdown and incorrect computation on gpu with CU lower than 7.5
 	"""
-	# sqax = (
-	# 	partition_axis.sequence_axis
-	# 	if x.shape[1] != 1
-	# 	else partition_axis.generation_query_sequence_axis
-	# )
-	# x = with_sharding_constraint(
-	# 	x,
-	# 	sharding=PartitionSpec(
-	# 		partition_axis.batch_axis,
-	# 		sqax,
-	# 		partition_axis.hidden_state_axis,
-	# 	),
-	# )
+	sqax = (
+		partition_axis.sequence_axis
+		if x.shape[1] != 1
+		else partition_axis.generation_query_sequence_axis
+	)
+	x = with_sharding_constraint(
+		x,
+		sharding=PartitionSpec(
+			partition_axis.batch_axis,
+			sqax,
+			partition_axis.hidden_state_axis,
+		),
+	)
 	return x
 
 
