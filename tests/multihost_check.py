@@ -24,16 +24,21 @@ def main():
 		config_kwargs=ed.EasyDeLBaseConfigDict(
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
-			attn_dtype=dtype, 
+			attn_dtype=dtype,
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
-		), 
+		),
 		platform=ed.EasyDeLPlatforms.JAX,
 		param_dtype=dtype,
 		dtype=dtype,
 		partition_axis=partition_axis,
 		precision=jax.lax.Precision("fastest"),
 	)
-	pytree = nn.to_tree(model)
+
+	pytree = multihost_utils.host_local_array_to_global_array(
+		nn.to_tree(model),
+		model.mesh,
+		nn.to_tree(model._specs_sharding),
+	)
 	tr = []
 	for ar in jax.tree_util.tree_leaves(pytree):
 		tr.append(isinstance(ar, jax.Array))

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
+from functools import partial
 import re
 import typing as tp
 import warnings
@@ -67,9 +68,14 @@ def make_shard_and_gather_fns(
 		Create a shard function for a specific partition spec.
 		"""
 
+		@partial(jax.jit, out_shardings=sharding)
+		def _self_shard(tensor):
+			return jnp.asarray(tensor)
+
 		def shard_fn(tensor: jnp.ndarray) -> jnp.ndarray:
 			with mesh:
-				tensor = with_sharding_constraint(arr=tensor, sharding=sharding)
+				tensor = jax.block_until_ready(_self_shard(tensor))
+				assert tensor.sharding == sharding, "sharding Failed!."
 			return tensor
 
 		return shard_fn
@@ -79,13 +85,12 @@ def make_shard_and_gather_fns(
 		Create a gather function for a specific partition spec.
 		"""
 
+		@partial(jax.jit, out_shardings=NamedSharding(mesh=mesh, spec=PartitionSpec()))
+		def _self_gather(tensor):
+			return jnp.asarray(tensor)
+
 		def gather_fn(tensor: jnp.ndarray) -> jnp.ndarray:
-			return jax.device_get(
-				with_sharding_constraint(
-					arr=tensor,
-					sharding=NamedSharding(mesh, PartitionSpec()),
-				)
-			)
+			return jax.device_get(jax.block_until_ready(_self_gather(tensor)))
 
 		return gather_fn
 
@@ -122,11 +127,6 @@ def get_names_from_partition_spec(
 	return list(names)
 
 
-@contextlib.contextmanager
-def nullcontext(enter_result=None):
-	yield enter_result
-
-
 def with_sharding_constraint(
 	arr: jnp.ndarray,
 	sharding: tp.Dict[str, tp.Union[PartitionSpec, NamedSharding]],
@@ -155,7 +155,7 @@ def with_sharding_constraint(
 			mesh = pxla.thread_resources.env.physical_mesh
 		axis_names = get_names_from_partition_spec(sharding)
 		if names_in_current_mesh(*axis_names):
-			with mesh or nullcontext():
+			with mesh or contextlib.nullcontext():
 				arr = _with_sharding_constraint(arr, sharding)
 	return arr
 
