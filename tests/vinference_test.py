@@ -14,7 +14,7 @@ import easydel as ed
 
 def main():
 	if jax.device_count() > 4:
-		sharding_axis_dims = (1, 2, -1)
+		sharding_axis_dims = (1, 1, -1)
 	else:
 		sharding_axis_dims = (1, 1, -1)
 

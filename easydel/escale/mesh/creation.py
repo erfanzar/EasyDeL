@@ -23,6 +23,7 @@ from jax.experimental.mesh_utils import create_device_mesh, create_hybrid_device
 from jax.sharding import Mesh
 
 IS_GRANULE = os.environ.get("IS_GRANULE", "true") in ["true", "yes", "on", "1"]
+HYBRID_MESH = os.environ.get("HYBRID_MESH", "true") in ["true", "yes", "on", "1"]
 DEFAULT_SHARDING_STG = (1, -1, 1, 1)
 DEFAULT_NAMED_SHARDING_STG = ("dp", "fsdp", "tp", "sp")
 
@@ -68,7 +69,7 @@ def _cached_mesh(
 	backend: tp.Optional[str] = None,
 ):
 	mesh_shape = jnp.ones((jax.device_count(backend), 1)).reshape(axis_dims).shape
-	if jax.process_count() > 1:
+	if jax.process_count() > 1 and HYBRID_MESH:
 		dcn_mesh_shape = calculate_host_mesh_shape(mesh_shape)
 		try:
 			ndarray = create_hybrid_device_mesh(
@@ -78,7 +79,9 @@ def _cached_mesh(
 				process_is_granule=IS_GRANULE,
 			)
 		except Exception as e:
-			raise ValueError(f"try using flag `IS_GRANULE=false` : {str(e)}") from e
+			raise ValueError(
+				f"try using flag `IS_GRANULE=false` : {str(e)} \n(current status = IS_GRANULE={IS_GRANULE})"
+			) from e
 	else:
 		ndarray = create_device_mesh(mesh_shape=mesh_shape)
 	return Mesh(ndarray, axis_names)
