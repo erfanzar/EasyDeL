@@ -19,12 +19,12 @@ import typing as tp
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.experimental.mesh_utils import create_hybrid_device_mesh
+from jax.experimental.mesh_utils import create_device_mesh, create_hybrid_device_mesh
 from jax.sharding import Mesh
 
+IS_GRANULE = os.environ.get("IS_GRANULE", "true") in ["true", "yes", "on", "1"]
 DEFAULT_SHARDING_STG = (1, -1, 1, 1)
 DEFAULT_NAMED_SHARDING_STG = ("dp", "fsdp", "tp", "sp")
-IS_GRANULE = os.environ.get("PROCESS_IS_GRANULE", "false") in ["true", "1", "on", "yes"]
 
 
 def calculate_host_mesh_shape(
@@ -68,14 +68,19 @@ def _cached_mesh(
 	backend: tp.Optional[str] = None,
 ):
 	mesh_shape = jnp.ones((jax.device_count(backend), 1)).reshape(axis_dims).shape
-	dcn_mesh_shape = calculate_host_mesh_shape(mesh_shape)
-
-	ndarray = create_hybrid_device_mesh(
-		mesh_shape=mesh_shape,
-		dcn_mesh_shape=dcn_mesh_shape,
-		devices=jax.devices(backend),
-		process_is_granule=IS_GRANULE,
-	)
+	if jax.process_count() > 1:
+		dcn_mesh_shape = calculate_host_mesh_shape(mesh_shape)
+		try:
+			ndarray = create_hybrid_device_mesh(
+				mesh_shape=mesh_shape,
+				dcn_mesh_shape=dcn_mesh_shape,
+				devices=jax.devices(backend),
+				process_is_granule=IS_GRANULE,
+			)
+		except Exception as e:
+			raise ValueError("try using flag `IS_GRANULE=false`") from e
+	else:
+		ndarray = create_device_mesh(mesh_shape=mesh_shape)
 	return Mesh(ndarray, axis_names)
 
 

@@ -8,30 +8,51 @@ import jax
 import torch
 import transformers
 from jax import numpy as jnp
-
+from jax import sharding as sh
 import easydel as ed
 
 
 def main():
 	if jax.device_count() > 4:
-		sharding_axis_dims = (1, 1, 2, -1)
+		sharding_axis_dims = (1, 2, -1)
 	else:
-		sharding_axis_dims = (1, 1, 1, -1)
+		sharding_axis_dims = (1, 1, -1)
 
 	max_length = 4096
 
-	# pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
-	pretrained_model_name_or_path = "Qwen/Qwen2.5-7B-Instruct"
+	if jax.default_backend() == "gpu":
+		pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
+	else:
+		pretrained_model_name_or_path = "Qwen/Qwen2.5-7B-Instruct"
 
-	partition_axis = ed.PartitionAxis()
+	partition_axis = ed.PartitionAxis(
+		batch_axis="fsdp",
+		sequence_axis="sp",
+		query_sequence_axis="sp",
+		head_axis="tp",
+		key_sequence_axis="sp",
+		hidden_state_axis="tp",
+		attention_dim_axis=None,
+		bias_head_sequence_axis=None,
+		bias_key_sequence_axis=None,
+		generation_query_sequence_axis=None,
+		generation_head_axis="tp",
+		generation_key_sequence_axis="sp",
+		generation_attention_dim_axis=None,
+	)
 
 	dtype = jnp.bfloat16
+	if jax.default_backend() == "gpu":
+		param_dtype = jnp.float8_e5m2
+	else:
+		param_dtype = jnp.bfloat16
 
 	print("LOADING MODEL ... ")
 	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		pretrained_model_name_or_path,
 		auto_shard_model=True,
 		sharding_axis_dims=sharding_axis_dims,
+		sharding_axis_names=("fsdp", "tp", "sp"),
 		config_kwargs=ed.EasyDeLBaseConfigDict(
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
@@ -42,7 +63,7 @@ def main():
 		),
 		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 		platform=ed.EasyDeLPlatforms.JAX,
-		param_dtype=dtype,
+		param_dtype=param_dtype,
 		dtype=dtype,
 		torch_dtype=torch.float16,
 		partition_axis=partition_axis,
@@ -68,6 +89,7 @@ def main():
 			eos_token_id=model.generation_config.eos_token_id,
 			streaming_chunks=32,
 		),
+		input_partition_spec=sh.PartitionSpec("fsdp", "sp"),
 	)
 
 	print(model.model_task)
