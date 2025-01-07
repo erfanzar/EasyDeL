@@ -1,39 +1,27 @@
-# fmt:off
 import os
 import sys
-import threading
-import time
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-import easydel as ed
-# fmt:on
+
 import jax
 import torch
 import transformers
-from huggingface_hub import HfApi
 from jax import numpy as jnp
-from jax import sharding
 
-
-PartitionSpec, api = sharding.PartitionSpec, HfApi()
-
-
-def log_mem():
-	while True:
-		ed.utils.analyze_memory.SMPMemoryMonitor(5).print_current_status()
-		time.sleep(5)
-
-
-threading.Thread(target=log_mem)  # .start()
+import easydel as ed
 
 
 def main():
-	sharding_axis_dims = (1, 1, 1, -1)
+	if jax.device_count() > 4:
+		sharding_axis_dims = (1, 1, 2, -1)
+	else:
+		sharding_axis_dims = (1, 1, 1, -1)
+
 	max_length = 4096
 
-	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
-	# pretrained_model_name_or_path = "AntonV/mamba2-370m-hf"
+	# pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
+	pretrained_model_name_or_path = "Qwen/Qwen2.5-7B-Instruct"
 
 	partition_axis = ed.PartitionAxis()
 
@@ -51,12 +39,10 @@ def main():
 			gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
 			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
-			# use_scan_mlp=True,
-			# scan_mlp_chunk_size=128,
 		),
 		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-		platform=ed.EasyDeLPlatforms.TRITON,
-		param_dtype=jnp.float8_e5m2,  # dtype,  #
+		platform=ed.EasyDeLPlatforms.JAX,
+		param_dtype=dtype,
 		dtype=dtype,
 		torch_dtype=torch.float16,
 		partition_axis=partition_axis,
@@ -68,11 +54,6 @@ def main():
 	tokenizer.pad_token_id = tokenizer.eos_token_id
 	print("TOKENIZER LOADED")
 	model.eval()
-	# model = model.quantize(
-	# 	method=ed.EasyDeLQuantizationMethods.A8BIT,
-	# 	block_size=128,
-	# 	quantization_pattern=".*(gate_proj|up_proj).*",
-	# )
 	print("CREATING vInference")
 
 	inference = ed.vInference(
@@ -96,12 +77,10 @@ def main():
 
 	print("Done Compiling")
 	messages = [
-		# {
-		# 	"role": "system",
-		# 	"content": "Please reason step by step, and put your final answer within \\boxed{}. and give 3 different responses",
-		# },
-		# {"role": "user", "content": "Find the value of $x$ that satisfies the equation $4x+5 = 6x+7$."},
-		{"role": "system", "content": "You are a helpful AI assistant."},
+		{
+			"role": "system",
+			"content": "You are a helpful AI assistant.",
+		},
 		{
 			"role": "user",
 			"content": "Can you provide ways to eat combinations of bananas and dragonfruits?",
@@ -110,7 +89,10 @@ def main():
 			"role": "assistant",
 			"content": "Sure! Here are some ways to eat bananas and dragonfruits together: 1. Banana and dragonfruit smoothie: Blend bananas and dragonfruits together with some milk and honey. 2. Banana and dragonfruit salad: Mix sliced bananas and dragonfruits together with some lemon juice and honey.",
 		},
-		{"role": "user", "content": "What about solving an 2x + 3 = 7 equation?"},
+		{
+			"role": "user",
+			"content": "What about solving an 2x + 3 = 7 equation?",
+		},
 	]
 
 	ids = tokenizer.apply_chat_template(
@@ -125,21 +107,20 @@ def main():
 	pad_seq = inference.model_prefill_length
 
 	print("Start Generation Process.")
-	with jax.profiler.trace("tmp-files/vinference"):
-		for response in inference.generate(**ids):
-			next_slice = slice(
-				pad_seq,
-				pad_seq + inference.generation_config.streaming_chunks,
-			)
-			pad_seq += inference.generation_config.streaming_chunks
-			print(
-				tokenizer.decode(response.sequences[0][next_slice], skip_special_tokens=True),
-				end="",
-			)
+	for response in inference.generate(**ids):
+		next_slice = slice(
+			pad_seq,
+			pad_seq + inference.generation_config.streaming_chunks,
+		)
+		pad_seq += inference.generation_config.streaming_chunks
+		print(
+			tokenizer.decode(response.sequences[0][next_slice], skip_special_tokens=True),
+			end="",
+		)
 
-		print()
-		print(response.generated_tokens)
-		print("TPS :", response.tokens_pre_second)
+	print()
+	print(response.generated_tokens)
+	print("TPS :", response.tokens_pre_second)
 
 
 if __name__ == "__main__":
