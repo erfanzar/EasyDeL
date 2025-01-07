@@ -24,9 +24,7 @@ from jax.sharding import Mesh
 
 DEFAULT_SHARDING_STG = (1, -1, 1, 1)
 DEFAULT_NAMED_SHARDING_STG = ("dp", "fsdp", "tp", "sp")
-IS_GRANULE = bool(
-	os.environ.get("PROCESS_IS_GRANULE", "false") in ["true", "1", "on", "yes"]
-)
+IS_GRANULE = os.environ.get("PROCESS_IS_GRANULE", "false") in ["true", "1", "on", "yes"]
 
 
 def calculate_host_mesh_shape(
