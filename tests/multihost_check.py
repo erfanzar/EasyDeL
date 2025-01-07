@@ -12,7 +12,7 @@ import easydel as ed
 
 
 def main():
-	sharding_axis_dims = (1, 1, -1, 1)
+	sharding_axis_dims = (1, 1, 1, -1)
 
 	max_length = 4096
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
@@ -36,16 +36,21 @@ def main():
 	)
 
 	tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
+	tokenizer.pad_token = tokenizer.eos_token
+	tokenizer.padding_side = "left"
 	print(model)
-	ids = tokenizer.encode(
+	ids = tokenizer(
 		"I notice this appears to be an incomplete sentence or thought. Could you please share the rest of what you'd like me to complete? That way, I can help make it accurately reflect what you want to",
 		return_tensors="np",
+		return_attention_mask=True,
+		padding="max_length",
+		max_length=128,
 	)
-	output = model(ids)
+	output = model(**ids)
 	next_token = jnp.argmax(jax.nn.softmax(output.logits[0, -1, :])).reshape(1, 1)
 	print(output.logits)
 	print(next_token)
-	nids = jnp.concatenate([ids, next_token], axis=-1)[0]
+	nids = jnp.concatenate([ids["input_ids"], next_token], axis=-1)[0]
 	print(tokenizer.decode(nids))
 	print(len(nids))
 	# <|begin_of_text|>I notice this appears to be an incomplete sentence or thought. Could you please share the rest of what you'd like me to complete? That way, I can help make it accurately reflect what you want to convey
