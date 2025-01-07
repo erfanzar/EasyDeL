@@ -25,7 +25,8 @@ import jax.tree_util
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
-from jax.sharding import Mesh
+
+from jax.sharding import Mesh, PartitionSpec, NamedSharding
 
 from easydel.escale import make_shard_and_gather_fns, match_partition_rules
 from easydel.utils.helpers import get_logger
@@ -225,6 +226,46 @@ class EasyDeLBaseModule(
 		self.dtype = dtype
 		self.param_dtype = dtype
 		return self
+
+	def _match_partition_rules(self, partition_rules: tp.Any = None):
+		return match_partition_rules(
+			rules=self._get_partition_rules(partition_rules),
+			tree=self.graphtree_params_shape,
+		)
+
+	@property
+	def _specs_sharding(self):
+		def _map(array):
+			if hasattr(array, "sharding"):
+				sharding = array.sharding
+				if isinstance(sharding, NamedSharding):
+					return sharding.spec
+			return PartitionSpec()
+
+		return nn.from_tree(
+			jax.tree_util.tree_map(
+				_map,
+				nn.to_tree(self),
+			)
+		)
+
+	@property
+	def _shardings(self):
+		return nn.from_tree(
+			jax.tree_util.tree_map(
+				lambda x: x.sharding if hasattr(x, "sharding") else PartitionSpec(),
+				nn.to_tree(self),
+			)
+		)
+
+	@property
+	def _named_shardings(self):
+		return nn.from_tree(
+			jax.tree_util.tree_map(
+				lambda x: x.sharding if hasattr(x, "sharding") else None,
+				nn.to_tree(self),
+			)
+		)
 
 	def _get_mesh(self, mesh: tp.Optional[Mesh] = None) -> Mesh:
 		"""Retrieves the mesh, either from the provided argument or the config."""
