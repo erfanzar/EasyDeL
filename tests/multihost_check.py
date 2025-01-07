@@ -8,6 +8,7 @@ from jax import numpy as jnp
 
 import easydel as ed
 from jax.experimental import multihost_utils
+from flax import nnx as nn
 
 
 def main():
@@ -23,19 +24,21 @@ def main():
 		config_kwargs=ed.EasyDeLBaseConfigDict(
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
-			attn_dtype=dtype,
-			gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
-			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+			attn_dtype=dtype, 
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
-		),
-		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-		platform=ed.EasyDeLPlatforms.TRITON,
+		), 
+		platform=ed.EasyDeLPlatforms.JAX,
 		param_dtype=dtype,
 		dtype=dtype,
 		partition_axis=partition_axis,
 		precision=jax.lax.Precision("fastest"),
 	)
-	multihost_utils.assert_equal(jax.tree_util.tree_leaves(model), "failed!")
+	pytree = nn.to_tree(model)
+	tr = []
+	for ar in jax.tree_util.tree_leaves(pytree):
+		tr.append(isinstance(ar, jax.Array))
+	print(set(tr))
+	multihost_utils.assert_equal(jax.tree_util.tree_leaves(pytree), "failed!")
 
 
 if __name__ == "__main__":
