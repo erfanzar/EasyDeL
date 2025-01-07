@@ -14,7 +14,7 @@
 
 from .mesh import (
 	MeshPartitionHelper,
-	create_device_mesh,
+	create_mesh,
 	names_in_current_mesh,
 	parse_mesh_from_string,
 )
@@ -52,7 +52,7 @@ __all__ = (
 	"ShapeBasedShardingRule",
 	"ShardingAnalyzer",
 	"ShardingRule",
-	"create_device_mesh",
+	"create_mesh",
 	"parse_mesh_from_string",
 	"names_in_current_mesh",
 	"MeshPartitionHelper",
