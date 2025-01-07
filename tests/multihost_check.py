@@ -13,6 +13,7 @@ from flax import nnx as nn
 
 def main():
 	sharding_axis_dims = (1, 1, 1, -1)
+	local_shrading_axis_dims = (1, 1, 1, -1)
 	max_length = 4096
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
 	partition_axis = ed.PartitionAxis()
@@ -36,7 +37,10 @@ def main():
 
 	pytree = multihost_utils.host_local_array_to_global_array(
 		nn.to_tree(model),
-		model.mesh,
+		ed.escale.create_mesh(
+			axis_dims=local_shrading_axis_dims,
+			local_only=True,
+		),
 		nn.to_tree(model._specs_sharding),
 	)
 	tr = []

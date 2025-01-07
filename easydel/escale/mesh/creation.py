@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import typing as tp
 
 import jax
@@ -21,21 +22,35 @@ from jax.experimental import mesh_utils
 from jax.experimental.mesh_utils import create_device_mesh
 from jax.sharding import Mesh
 
+DEFAULT_SHARDING_STG = (1, -1, 1, 1)
+
+DEFAULT_NAMED_SHARDING_STG = ("dp", "fsdp", "tp", "sp")
+
+
+@functools.lru_cache
+def _cached_mesh(
+	axis_dims: tp.Sequence[int],
+	axis_names: tp.Sequence[str],
+	backend: tp.Optional[str] = None,
+	local_only: bool = False,
+):
+	nd = jax.local_device_count(backend) if local_only else jax.device_count(backend)
+	ones = jnp.ones((nd, 1))
+	ndarray = create_device_mesh((ones.reshape(axis_dims).shape))
+	return Mesh(ndarray, axis_names)
+
 
 def create_mesh(
-	axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
-	axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+	axis_dims: tp.Sequence[int] = DEFAULT_SHARDING_STG,
+	axis_names: tp.Sequence[str] = DEFAULT_NAMED_SHARDING_STG,
 	backend: tp.Optional[str] = None,
+	local_only: bool = False,
 ) -> Mesh:
-	return Mesh(
-		create_device_mesh(
-			(
-				jnp.ones((len(jax.devices(backend)) if backend else len(jax.devices()), 1))
-				.reshape(axis_dims)
-				.shape
-			)
-		),
-		axis_names,
+	return _cached_mesh(
+		axis_dims=axis_dims,
+		axis_names=axis_names,
+		backend=backend,
+		local_only=local_only,
 	)
 
 
