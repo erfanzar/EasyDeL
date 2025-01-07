@@ -19,7 +19,6 @@ import typing as tp
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.experimental import mesh_utils
 from jax.experimental.mesh_utils import create_hybrid_device_mesh
 from jax.sharding import Mesh
 
@@ -93,15 +92,9 @@ def create_mesh(
 
 
 def parse_mesh_from_string(
-	axis_dims: str,
+	axis_dims: tp.Sequence[str],
 	names: tp.Sequence[str],
 ) -> Mesh:
-	if axis_dims.startswith("!"):
-		mesh_axis_splitting = True
-		axis_dims = axis_dims[1:]
-	else:
-		mesh_axis_splitting = False
-
 	if ":" in axis_dims:
 		dims = []
 		dim_names = []
@@ -117,11 +110,7 @@ def parse_mesh_from_string(
 	assert len(dims) == len(names), "Number of dimensions and names must match"
 
 	mesh_shape = np.arange(jax.device_count()).reshape(dims).shape
-	if mesh_axis_splitting:
-		physical_mesh = np.array(jax.devices()).reshape(mesh_shape)
-	else:
-		physical_mesh = mesh_utils.create_device_mesh(mesh_shape)
-	return Mesh(physical_mesh, dim_names)
+	return create_mesh(mesh_shape, dim_names)
 
 
 if __name__ == "__main__":
