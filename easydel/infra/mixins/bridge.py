@@ -674,6 +674,7 @@ class EasyBridgeMixin(PushToHubMixin):
 			if not is_flatten(shard_fns):
 				shard_fns = flatten_dict(shard_fns)
 		elif auto_shard_model:
+			
 			shard_fns, _ = AutoShardAndGatherFunctions.from_pretrained(
 				pretrained_model_name_or_path=pretrained_model_name_or_path,
 				partition_rules=partition_rules,
