@@ -19,10 +19,10 @@ def main():
 
 	max_length = 4096
 
-	if jax.default_backend() == "gpu":
-		pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
-	else:
-		pretrained_model_name_or_path = "Qwen/Qwen2.5-7B-Instruct"
+	# if jax.default_backend() == "gpu":
+	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
+	# else:
+	# 	pretrained_model_name_or_path = "Qwen/Qwen2.5-7B-Instruct"
 
 	dtype = jnp.bfloat16
 	if jax.default_backend() == "gpu":
