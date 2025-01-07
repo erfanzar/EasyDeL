@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import functools
-import os
 import typing as tp
 
 import jax
@@ -22,8 +21,6 @@ import numpy as np
 from jax.experimental.mesh_utils import create_device_mesh, create_hybrid_device_mesh
 from jax.sharding import Mesh
 
-IS_GRANULE = os.environ.get("IS_GRANULE", "true") in ["true", "yes", "on", "1"]
-HYBRID_MESH = os.environ.get("HYBRID_MESH", "true") in ["true", "yes", "on", "1"]
 DEFAULT_SHARDING_STG = (1, -1, 1, 1)
 DEFAULT_NAMED_SHARDING_STG = ("dp", "fsdp", "tp", "sp")
 
@@ -68,22 +65,21 @@ def _cached_mesh(
 	axis_names: tp.Sequence[str],
 	backend: tp.Optional[str] = None,
 ):
-	dcn_mesh_shape = jnp.ones((jax.device_count(backend), 1)).reshape(axis_dims).shape
-	if jax.process_count() > 1 and HYBRID_MESH:
-		mesh_shape = calculate_host_mesh_shape(dcn_mesh_shape)
-		try:
-			ndarray = create_hybrid_device_mesh(
-				mesh_shape=mesh_shape,
-				dcn_mesh_shape=dcn_mesh_shape,
-				devices=jax.devices(backend),
-				process_is_granule=IS_GRANULE,
-			)
-		except Exception as e:
-			raise ValueError(
-				f"try using flag `IS_GRANULE=false` : {str(e)} \n(current status = IS_GRANULE={IS_GRANULE})"
-			) from e
+	mesh_shape = jnp.ones((jax.device_count(backend), 1)).reshape(axis_dims).shape
+	if jax.process_count() > 1 and hasattr(jax.devices()[0], "slice_index"):
+		dcn_mesh_shape = calculate_host_mesh_shape(mesh_shape)
+		ndarray = create_hybrid_device_mesh(
+			mesh_shape=mesh_shape,
+			dcn_mesh_shape=dcn_mesh_shape,
+			devices=jax.devices(backend),
+			allow_split_physical_axes=True,
+		)
+
 	else:
-		ndarray = create_device_mesh(mesh_shape=dcn_mesh_shape)
+		ndarray = create_device_mesh(
+			mesh_shape=mesh_shape,
+			allow_split_physical_axes=True,
+		)
 	return Mesh(ndarray, axis_names)
 
 
