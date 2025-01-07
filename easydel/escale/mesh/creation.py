@@ -78,7 +78,7 @@ def _cached_mesh(
 				process_is_granule=IS_GRANULE,
 			)
 		except Exception as e:
-			raise ValueError("try using flag `IS_GRANULE=false`") from e
+			raise ValueError(f"try using flag `IS_GRANULE=false` : {str(e)}") from e
 	else:
 		ndarray = create_device_mesh(mesh_shape=mesh_shape)
 	return Mesh(ndarray, axis_names)
