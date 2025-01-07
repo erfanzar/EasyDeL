@@ -21,8 +21,7 @@ import jax.extend
 import jax.tree_util
 from flax import nnx as nn
 from jax import numpy as jnp
-from jax.experimental.mesh_utils import create_device_mesh
-from jax.sharding import Mesh
+
 from transformers.configuration_utils import PretrainedConfig
 
 from easydel.escale import PartitionAxis
@@ -286,7 +285,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 	def create_mesh(
 		axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
 		axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-		backend="",
+		backend: tp.Optional[str] = None,
 	):
 		"""The create_mesh function creates a mesh object that can be used to shard arrays.
 
@@ -298,28 +297,15 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		Returns:
 		    A mesh object
 		"""
-		array_devices = jax.numpy.ones(
-			(len(jax.devices() if backend == "" else jax.devices(backend)), 1)
-		)
-		if isinstance(axis_dims, str):
-			axis_dims = eval(axis_dims)
-			warnings.warn(
-				"axis_dims argument is not a tp.Sequence of int and it's an string. "
-				"(backbone Warning in EasyDeLModuleConfig)\n"
-				f"\tchanged to {axis_dims}",
-				stacklevel=1,
-			)
-		if isinstance(axis_names, str):
-			axis_names = eval(axis_names)
-			warnings.warn(
-				"axis_names argument is not a tp.Sequence of strings and it's an string class. "
-				"(backbone Warning in EasyDeLModuleConfig)\n"
-				f"\tchanged to {axis_names}",
-				stacklevel=1,
-			)
-		resh = array_devices.reshape(axis_dims).shape
+		from easydel.escale import create_mesh
 
-		return Mesh(create_device_mesh(resh), axis_names)
+		if backend == "":
+			backend = None
+		return create_mesh(
+			axis_dims=axis_dims,
+			axis_names=axis_names,
+			backend=backend,
+		)
 
 	@property
 	def mesh(self):
