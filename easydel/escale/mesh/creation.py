@@ -68,9 +68,9 @@ def _cached_mesh(
 	axis_names: tp.Sequence[str],
 	backend: tp.Optional[str] = None,
 ):
-	mesh_shape = jnp.ones((jax.device_count(backend), 1)).reshape(axis_dims).shape
+	dcn_mesh_shape = jnp.ones((jax.device_count(backend), 1)).reshape(axis_dims).shape
 	if jax.process_count() > 1 and HYBRID_MESH:
-		dcn_mesh_shape = calculate_host_mesh_shape(mesh_shape)
+		mesh_shape = calculate_host_mesh_shape(dcn_mesh_shape)
 		try:
 			ndarray = create_hybrid_device_mesh(
 				mesh_shape=mesh_shape,
@@ -83,7 +83,7 @@ def _cached_mesh(
 				f"try using flag `IS_GRANULE=false` : {str(e)} \n(current status = IS_GRANULE={IS_GRANULE})"
 			) from e
 	else:
-		ndarray = create_device_mesh(mesh_shape=mesh_shape)
+		ndarray = create_device_mesh(mesh_shape=dcn_mesh_shape)
 	return Mesh(ndarray, axis_names)
 
 
@@ -124,6 +124,7 @@ def parse_mesh_from_string(
 if __name__ == "__main__":
 	test_cases = [
 		# (global_mesh, total_devices, num_processes, expected_host_mesh)
+		((1, 1, 32), 4, 8, (1, 1, 4)),
 		((8, 4), 4, 8, (1, 4)),  # 32 = 4 * 8
 		((1, 1, 8, 4), 4, 8, (1, 1, 1, 4)),  # 32 = 4 * 8
 		((2, 4, 8), 8, 8, (1, 1, 8)),  # 64 = 8 * 8  <- Fixed this case
@@ -141,7 +142,9 @@ if __name__ == "__main__":
 		), f"Mesh size {mesh_size} must equal total devices {device_total}"
 
 		result = calculate_host_mesh_shape(
-			global_mesh, total_devices=devices, num_processes=processes
+			global_mesh,
+			total_devices=devices,
+			num_processes=processes,
 		)
 		print(f"Result: {result}")
 		assert (
