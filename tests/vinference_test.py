@@ -1,24 +1,21 @@
 import os
 import sys
 
+import transformers
+
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+import jax
+from jax import numpy as jnp
 
 import easydel as ed
-
-ed.JaxDistributedConfig.initialize()
-import jax
-import torch
-import transformers
-from jax import numpy as jnp
-from jax import sharding as sh
 
 
 def main():
 	if jax.device_count() > 4:
-		sharding_axis_dims = (1, 1, -1)
+		sharding_axis_dims = (1, 1, 1, -1)
 	else:
-		sharding_axis_dims = (1, 1, -1)
+		sharding_axis_dims = (1, 1, 1, -1)
 
 	max_length = 4096
 
@@ -27,56 +24,36 @@ def main():
 	else:
 		pretrained_model_name_or_path = "Qwen/Qwen2.5-7B-Instruct"
 
-	partition_axis = ed.PartitionAxis(
-		batch_axis="fsdp",
-		sequence_axis="sp",
-		query_sequence_axis="sp",
-		head_axis="tp",
-		key_sequence_axis="sp",
-		hidden_state_axis="tp",
-		attention_dim_axis=None,
-		bias_head_sequence_axis=None,
-		bias_key_sequence_axis=None,
-		generation_query_sequence_axis=None,
-		generation_head_axis="tp",
-		generation_key_sequence_axis="sp",
-		generation_attention_dim_axis=None,
-	)
-
 	dtype = jnp.bfloat16
 	if jax.default_backend() == "gpu":
 		param_dtype = jnp.float8_e5m2
 	else:
 		param_dtype = jnp.bfloat16
 
+	partition_axis = ed.PartitionAxis()
+	tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
+	tokenizer.padding_side = "left"
+	tokenizer.pad_token_id = tokenizer.eos_token_id
+	print("TOKENIZER LOADED")
 	print("LOADING MODEL ... ")
 	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		pretrained_model_name_or_path,
 		auto_shard_model=True,
 		sharding_axis_dims=sharding_axis_dims,
-		sharding_axis_names=("fsdp", "tp", "sp"),
 		config_kwargs=ed.EasyDeLBaseConfigDict(
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
 			attn_dtype=dtype,
-			gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
-			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		),
-		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 		platform=ed.EasyDeLPlatforms.JAX,
 		param_dtype=param_dtype,
 		dtype=dtype,
-		torch_dtype=torch.float16,
 		partition_axis=partition_axis,
 		precision=jax.lax.Precision("fastest"),
 	)
 	print("MODEL LOADED")
-	tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
-	tokenizer.padding_side = "left"
-	tokenizer.pad_token_id = tokenizer.eos_token_id
-	print("TOKENIZER LOADED")
-	model.eval()
+
 	print("CREATING vInference")
 
 	inference = ed.vInference(
@@ -91,7 +68,6 @@ def main():
 			eos_token_id=model.generation_config.eos_token_id,
 			streaming_chunks=32,
 		),
-		input_partition_spec=sh.PartitionSpec("fsdp", "sp"),
 	)
 
 	print(model.model_task)
@@ -118,7 +94,7 @@ def main():
 			"content": "What about solving an 2x + 3 = 7 equation?",
 		},
 	]
-
+	ed.utils.helpers.get_logger(name=__name__).info("Applying Chat Template")
 	ids = tokenizer.apply_chat_template(
 		messages,
 		return_tensors="jax",
