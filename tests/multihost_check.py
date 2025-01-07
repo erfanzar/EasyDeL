@@ -1,19 +1,19 @@
 import os
 import sys
 
+import transformers
+
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import jax
 from jax import numpy as jnp
 
 import easydel as ed
-from jax.experimental import multihost_utils
-from flax import nnx as nn
 
 
 def main():
 	sharding_axis_dims = (1, 1, 1, -1)
-	local_shrading_axis_dims = (1, 1, 1, -1)
+
 	max_length = 4096
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
 	partition_axis = ed.PartitionAxis()
@@ -34,21 +34,16 @@ def main():
 		partition_axis=partition_axis,
 		precision=jax.lax.Precision("fastest"),
 	)
+
+	tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
 	print(model)
-	print(model(jnp.ones((1, 64))))
-	pytree = multihost_utils.host_local_array_to_global_array(
-		nn.to_tree(model),
-		ed.escale.create_mesh(
-			axis_dims=local_shrading_axis_dims,
-			local_only=True,
-		),
-		nn.to_tree(model._specs_sharding),
-	)
-	tr = []
-	for ar in jax.tree_util.tree_leaves(pytree):
-		tr.append(isinstance(ar, jax.Array))
-	print(set(tr))
-	multihost_utils.assert_equal(jax.tree_util.tree_leaves(pytree), "failed!")
+	ids = tokenizer.encode("this might be a test? But I", return_tensors="np")
+	output = model(ids)
+	next_token = jnp.argmax(jax.nn.softmax(output.logits[0, -1, :])).reshape(1, 1)
+	print(output.logits)
+	print(next_token)
+	print(tokenizer.decode(jnp.concatenate([ids, next_token], axis=-1)[0]))
+	# <|begin_of_text|>this might be a test? But I'm
 
 
 if __name__ == "__main__":
