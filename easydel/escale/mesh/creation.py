@@ -24,6 +24,9 @@ from jax.sharding import Mesh
 
 DEFAULT_SHARDING_STG = (1, -1, 1, 1)
 DEFAULT_NAMED_SHARDING_STG = ("dp", "fsdp", "tp", "sp")
+IS_GRANULE = bool(
+	os.environ.get("PROCESS_IS_GRANULE", "false") in ["true", "1", "on", "yes"]
+)
 
 
 def calculate_host_mesh_shape(
@@ -73,8 +76,7 @@ def _cached_mesh(
 		mesh_shape=mesh_shape,
 		dcn_mesh_shape=dcn_mesh_shape,
 		devices=jax.devices(backend),
-		process_is_granule=os.environ("PROCESS_IS_GRANULE", "false")
-		in ["true", "1", "on", "yes"],
+		process_is_granule=IS_GRANULE,
 	)
 	return Mesh(ndarray, axis_names)
 
