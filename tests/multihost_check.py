@@ -34,7 +34,8 @@ def main():
 		partition_axis=partition_axis,
 		precision=jax.lax.Precision("fastest"),
 	)
-
+	print(model)
+	print(model(jnp.ones((1, 64))))
 	pytree = multihost_utils.host_local_array_to_global_array(
 		nn.to_tree(model),
 		ed.escale.create_mesh(

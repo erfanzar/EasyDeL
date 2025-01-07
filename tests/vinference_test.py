@@ -4,12 +4,14 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 
+import easydel as ed
+
+ed.JaxDistributedConfig.initialize()
 import jax
 import torch
 import transformers
 from jax import numpy as jnp
 from jax import sharding as sh
-import easydel as ed
 
 
 def main():

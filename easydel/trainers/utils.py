@@ -47,7 +47,7 @@ class JaxDistributedConfig(object):
 		return config
 
 	@classmethod
-	def initialize(cls, config):
+	def initialize(cls, config=None):
 		config = cls.get_default_config(config)
 		if config.initialize_jax_distributed:
 			if config.local_device_ids is not None:
