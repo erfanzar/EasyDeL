@@ -57,8 +57,8 @@ class LossConfig:
 	label_smoothing: float = 0.0
 	z_loss: float = 0.0
 	loss_normalizing_factor: FACTOR_TYPE = (
-		# "NUM_REAL_TARGET_TOKENS"
-		"NO_WEIGHT_NUM_REAL_TARGET_TOKENS"
+		 "NUM_REAL_TARGET_TOKENS"
+#		"NO_WEIGHT_NUM_REAL_TARGET_TOKENS"
 	)
 	num_labels: tp.Optional[str] = None
 	problem_type: tp.Optional[str] = None
