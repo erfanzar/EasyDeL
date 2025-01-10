@@ -43,6 +43,7 @@ PartitionLike = tp.Optional[
 ]
 _CP = tp.Type[EasyDeLBaseConfig]
 _T = tp.TypeVar("_T")
+SELF = tp.TypeVar("SELF")
 
 if tp.TYPE_CHECKING:
 	from transformers import PreTrainedModel
@@ -648,11 +649,11 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 
 	@abstractmethod
 	def quantize(
-		self,
+		self: SELF,
 		method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.A8BIT,
 		block_size: int = 128,
 		quantization_pattern: tp.Optional[str] = None,
-	):
+	) -> SELF:
 		"""Quantizes the model's linear layers.
 
 		Args:
@@ -685,19 +686,33 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 
 	@classmethod
 	@abstractmethod
-	def lazy_init(cls, *args, **kwargs) -> BaseModuleProtocol:
+	def lazy_init(cls: tp.Type[SELF], *args, **kwargs) -> SELF:
 		"""initialize the base class with nnx.eval_shape carefully"""
 		...
 
 	@abstractmethod
 	def apply_lora_to_layers(
-		self,
+		self: SELF,
 		lora_rank: int,
 		lora_pattern: tp.Optional[str] = None,
 		verbose: bool = True,
 		rngs: tp.Optional[nn.Rngs] = None,
-	):
+	) -> SELF:
 		"""Applies LoRA (Low-Rank Adaptation) to specified linear layers within a model."""
+		...
+
+	@abstractmethod
+	def merge_lora_params(self: SELF, pytree: tp.Dict) -> SELF:
+		"""
+		Merge Given Pytree (LoRA Params) with current LoRA Module.
+		"""
+		...
+
+	@abstractmethod
+	def split_lora_params(self: SELF) -> dict:
+		"""
+		split Given Module (LoRA Module) and return LoRA Params.
+		"""
 		...
 
 	@abstractmethod

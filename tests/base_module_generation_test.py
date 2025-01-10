@@ -65,6 +65,8 @@ def main():
 	tokenizer.padding_side = "left"
 	tokenizer.pad_token_id = tokenizer.eos_token_id
 	model.eval()
+	model = model.apply_lora_to_layers(32, ".*(q_proj|k_proj).*")
+	print(model)
 	# model = model.quantize(
 	# 	method=ed.EasyDeLQuantizationMethods.A8BIT,
 	# 	block_size=128,
@@ -117,10 +119,6 @@ def main():
 	tokens = jnp.sum(output.sequences[0][max_length - 1024 :] != 128001)
 	print(tokens / time_spent)  # vinference is faster btw.
 	print(tokens)
-	# print(generate._fun)
-	# print(generate.lower)
-	# print(generate.eval_shape)
-	# print(generate.trace)
 
 
 if __name__ == "__main__":

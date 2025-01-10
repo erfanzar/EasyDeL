@@ -28,7 +28,8 @@ def main():
 	if jax.default_backend() == "gpu":
 		param_dtype = jnp.float8_e5m2
 	else:
-		param_dtype = jnp.bfloat16
+		...
+	param_dtype = jnp.bfloat16
 
 	partition_axis = ed.PartitionAxis()
 	tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
@@ -52,8 +53,9 @@ def main():
 		partition_axis=partition_axis,
 		precision=jax.lax.Precision("fastest"),
 	)
-	print("MODEL LOADED")
 
+	print("MODEL LOADED")
+	model = model.apply_lora_to_layers(32, ".*(q_proj|k_proj).*")
 	print("CREATING vInference")
 
 	inference = ed.vInference(
