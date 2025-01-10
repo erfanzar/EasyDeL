@@ -62,8 +62,8 @@ PartitionLike = tp.Optional[
 
 logger = get_logger(__name__)
 
-MO = tp.TypeVar("MO")
 _CP = tp.TypeVar("CP")
+SELF = tp.TypeVar("SELF")
 
 
 class EasyDeLBaseModule(
@@ -156,6 +156,10 @@ class EasyDeLBaseModule(
 		"""Returns the model type."""
 		return self._model_type
 
+	@property
+	def params(self) -> tp.Dict:
+		return nn.split(self)[-1]
+
 	@cached_property
 	def causal_mask(self) -> jnp.ndarray:
 		"""Returns a causal mask from the config."""
@@ -201,13 +205,13 @@ class EasyDeLBaseModule(
 		params_state = nn.split(self, nn.Param, ...)[1].flat_state()
 		return jax.tree_util.tree_leaves(params_state)[0].dtype
 
-	def half(self) -> EasyDeLBaseModule:
+	def half(self: SELF) -> SELF:
 		return self._reformat_dtype(jnp.float16)
 
-	def float(self) -> EasyDeLBaseModule:
+	def float(self: SELF) -> SELF:
 		return self._reformat_dtype(jnp.float32)
 
-	def _reformat_dtype(self, dtype) -> EasyDeLBaseModule:
+	def _reformat_dtype(self: SELF, dtype) -> SELF:
 		gdef, gtree, others = nn.split(self, nn.Param, ...)
 
 		def _map(array):
@@ -293,9 +297,9 @@ class EasyDeLBaseModule(
 		return partition_rules
 
 	def _apply_sharding_fns(
-		self,
+		self: SELF,
 		sharding_fns: tp.Mapping[str, tp.Callable],
-	) -> nn.Module:
+	) -> SELF:
 		"""Applies sharding functions to the model's state."""
 		gdef, state, others = nn.split(self, nn.Param, ...)
 		sharding_fns = flatten_dict(sharding_fns)
@@ -311,11 +315,11 @@ class EasyDeLBaseModule(
 		return self
 
 	def shard_model(
-		self,
+		self: SELF,
 		partition_rules: PartitionLike = None,
 		mesh: tp.Optional[Mesh] = None,
 		overlay_fns: tp.Optional[tp.Mapping[str, tp.Callable]] = None,
-	) -> EasyDeLBaseModule:
+	) -> SELF:
 		"""Shards the model's parameters using the specified partitioning rules and mesh.
 
 		Args:
@@ -342,11 +346,11 @@ class EasyDeLBaseModule(
 		return self
 
 	def gather_model(
-		self,
+		self: SELF,
 		partition_rules: PartitionLike = None,
 		mesh: tp.Optional[Mesh] = None,
 		overlay_fns: tp.Optional[tp.Mapping[str, tp.Callable]] = None,
-	) -> EasyDeLBaseModule:
+	) -> SELF:
 		"""Gathers the model's parameters based on the specified partitioning rules and mesh.
 
 		Args:
@@ -396,11 +400,11 @@ class EasyDeLBaseModule(
 		)[1]
 
 	def quantize(
-		self,
+		self: SELF,
 		method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.A8BIT,
 		block_size: int = 128,
 		quantization_pattern: tp.Optional[str] = None,
-	) -> EasyDeLBaseModule:
+	) -> SELF:
 		"""Quantizes the model's linear layers.
 
 		Args:
@@ -444,16 +448,28 @@ class EasyDeLBaseModule(
 		return ()
 
 	@classmethod
-	def lazy_init(cls: tp.Type[MO], *args, **kwargs) -> MO:
+	def lazy_init(cls: tp.Type[SELF], *args, **kwargs) -> SELF:
 		return nn.eval_shape(lambda: cls(*args, **kwargs))
 
+	def merge_lora_params(self: SELF, pytree: tp.Dict) -> SELF:
+		from easydel.infra.utils import merge_lora_params
+
+		self = merge_lora_params(self, pytree)
+		return self
+
+	def split_lora_params(self: SELF) -> tp.Dict:
+		from easydel.infra.utils import split_lora_params
+
+		pytree = split_lora_params(self)
+		return pytree
+
 	def apply_lora_to_layers(
-		self,
+		self: SELF,
 		lora_rank: int,
 		lora_pattern: tp.Optional[str] = None,
 		verbose: bool = False,
 		rngs: tp.Optional[nn.Rngs] = None,
-	):
+	) -> SELF:
 		from easydel.infra.utils import apply_lora_to_layers
 
 		self = apply_lora_to_layers(
@@ -465,11 +481,11 @@ class EasyDeLBaseModule(
 		)
 		return self
 
-	def unwrap_lora_to_layers(self, verbose: bool = False):
+	def unwrap_lora_to_layers(self: SELF, verbose: bool = False) -> SELF:
 		from easydel.infra.utils import unwrap_lora_to_layers
 
 		self = unwrap_lora_to_layers(self, verbose=verbose)
-		return unwrap_lora_to_layers
+		return self
 
 	@property
 	def transform_fn(self):
@@ -539,7 +555,7 @@ class EasyDeLBaseModule(
 			}
 		return unflatten_dict(flat_params)
 
-	def merge_params_dict(self, params_dict: tp.Dict) -> EasyDeLBaseModule:
+	def merge_params_dict(self: SELF, params_dict: tp.Dict) -> SELF:
 		"""Merges the model parameters from a dictionary into the current model.
 
 		Args:

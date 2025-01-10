@@ -2,11 +2,14 @@ import gc
 import os
 import typing as tp
 
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=64"
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
-os.environ["JAX_PLATFORMS"] = "cpu"
+# os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=64"
+# os.environ["CUDA_VISIBLE_DEVICES"] = ""
+# os.environ["JAX_PLATFORMS"] = "cpu"
 
 import sys
+
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
 import time
 import unittest
 
@@ -16,12 +19,6 @@ import easydel as ed
 import jax.extend
 import jax.random
 
-sys.path.append(
-	os.path.join(
-		os.path.dirname(os.path.abspath(__file__)),
-		"..",
-	)
-)
 import copy
 
 import jax
@@ -70,7 +67,7 @@ class EasyModelsTest(unittest.TestCase):
 		self.fcm_min_ratio: float = -1
 		self.fcm_max_ratio: float = -1
 		self.rope_scaling: tp.Optional[tp.Dict[str, tp.Union[str, float]]] = None
-		self.use_scan_mlp: bool = False
+		self.use_scan_mlp: bool = True
 		self.bits: tp.Optional[int] = None
 		self.hidden_act: str = "silu"
 		self.pretraining_tp: int = 1
@@ -131,6 +128,8 @@ class EasyModelsTest(unittest.TestCase):
 				qk_layernorm=self.qk_layernorm,
 				rope_scaling=self.rope_scaling,
 				platform=self.platform,
+				use_scan_mlp=self.use_scan_mlp,
+				scan_mlp=self.use_scan_mlp,
 			)
 		else:
 			config = self.header_config
@@ -835,7 +834,7 @@ if __name__ == "__main__":
 	# test.test_cohere()  # Passed
 	# test.test_dbrx()  # Passed
 	# test.test_deepseek_v2()  # Passed
-	test.test_deepseek_v3()  # Passed
+	# test.test_deepseek_v3()  # Passed
 	# test.test_exaone()  # Passed
 	# test.test_falcon()  # Passed
 	# test.test_gemma()  # Passed
@@ -845,7 +844,7 @@ if __name__ == "__main__":
 	# test.test_gpt2()  # Passed
 	# test.test_grok1() # Not Tested Yet!
 	# test.test_internlm2()  # Passed
-	# test.test_llama()  # Passed
+	test.test_llama()  # Passed
 	# test.test_mamba()  # Passed
 	# test.test_mamba2()  # Passed
 	# test.test_mistral()  # Passed

@@ -28,6 +28,7 @@ import jax.experimental
 import jax.tree_util
 from aqt.jax.v2 import config as q_config
 from aqt.jax.v2.flax import aqt_flax as q_flax
+from einops import rearrange
 from flax import nnx as nn
 from jax.sharding import PartitionSpec
 from tqdm.auto import tqdm
@@ -38,6 +39,7 @@ from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
 from .base_config import EasyMethod
+from .errors import EasyDeLBlockWiseFFNError
 from .etils import (
 	AVAILABLE_SPARSE_MODULE_TYPES,
 	EasyDeLGradientCheckPointers,
@@ -197,40 +199,33 @@ def get_dot_general_by_bits(
 
 
 def block_wise_ffn(remat_ffn, inputs, chunk_size: int):
-	# TODO: Update to NNX scan when it is available
-	return remat_ffn(inputs)
-	# generating = inputs.shape[1] == 1
-	# try:
-	# 	if generating:
-	# 		return remat_ffn(inputs)
-	# 	else:
-	# 		inputs = rearrange(inputs, "b (c n) d -> b c n d", c=chunk_size)
-
-	# 		def scan_ffn(remat_ffn_, carry, hidden_states):
-	# 			outputs = remat_ffn_(hidden_states)
-	# 			return carry, outputs
-
-	# 		scan_axis = inputs.ndim - 2
-	# 		print(inputs.shape, scan_axis)
-	# 		_, output = nn.scan(
-	# 			f=scan_ffn,
-	# 			in_axes=1,
-	# 			out_axes=1,
-	# 		)(remat_ffn, None, inputs)
-	# 		output = rearrange(output, "b c n d -> b (c n) d")
-	# 		return output
-	# except Exception as e:
-	# 	raise EasyDeLBlockWiseFFNError(
-	# 		"You Are using BlockWise FFN from near-infinite-context length paper and you might be passing "
-	# 		"input arguments in wrong way in case that you don'position_ids want to use this just pass `use_scan_mlp=False` in "
-	# 		"model config or in config_kwargs in AutoEasyDeLModelForCausalLM or change `scan_mlp_chunk_size` "
-	# 		f"in configs for more information read Docs.\nOriginal Error\n{e}"
-	# 	) from e
+	generating = inputs.shape[1] == 1
+	try:
+		if generating:
+			return remat_ffn(inputs)
+		else:
+			return rearrange(
+				jax.lax.scan(
+					f=lambda carry, idx: (carry.at[:, idx].set(remat_ffn(carry[:, idx])), None),
+					init=rearrange(inputs, "b (c n) d -> b c n d", c=chunk_size),
+					xs=jax.numpy.arange(chunk_size),
+					length=chunk_size,
+					unroll=True,
+				)[0],
+				"b c n d -> b (c n) d",
+			)
+	except Exception as e:
+		raise EasyDeLBlockWiseFFNError(
+			"You Are using BlockWise FFN from near-infinite-context length paper and you might be passing "
+			"input arguments in wrong way in case that you don'position_ids want to use this just pass `use_scan_mlp=False` in "
+			"model config or in config_kwargs in AutoEasyDeLModelFor... or change `scan_mlp_chunk_size` "
+			f"in configs for more information read Docs.\nOriginal Error\n{e}"
+		) from e
 
 
 def control_mlp_sharding(x: jax.Array, partition_axis: PartitionAxis):
 	"""
-	this functions is disabled for now, it will cause breakdown and incorrect computation on gpu with CU lower than 7.5
+	handles MLP Shardings
 	"""
 	sqax = (
 		partition_axis.sequence_axis
@@ -362,6 +357,8 @@ def apply_lora_to_layers(
 		set_module_from_path,
 	)
 
+	if not (lora_rank > 0):
+		raise ValueError("lora_rank should be a positive value and higher than `0`.")
 	if lora_pattern is None:
 		lora_pattern = ".*"
 	if rngs is None:
@@ -391,6 +388,54 @@ def apply_lora_to_layers(
 				)
 			pbar.update(1)
 
+	return model
+
+
+def split_lora_params(model: nn.Module) -> nn.Module:
+	"""
+	get LoRA (Low-Rank Adaptation) from layers within a model.
+
+	Args:
+	    model: The EasyDeL model.
+	Returns:
+	    LoRA Layer Weights.
+	"""
+	from easydel.utils.graph_utils import get_module_from_path, iter_module_search
+
+	od = {}
+	with tqdm(
+		total=len([p[0] for p in iter_module_search(model, nn.LoRA)]),
+		desc="Split LoRA Params",
+	) as pbar:
+		for path, _ in iter_module_search(model, nn.LoRA):
+			base_module: nn.LoRA = get_module_from_path(model=model, path=path)
+			od.update({path: {"lora_a": base_module.lora_a, "lora_b": base_module.lora_b}})
+			pbar.update(1)
+	return unflatten_dict(od)
+
+
+def merge_lora_params(model: nn.Module, lora_tree: tp.Dict) -> nn.Module:
+	"""
+	get LoRA (Low-Rank Adaptation) from layers within a model.
+
+	Args:
+	    model: The EasyDeL model.
+	Returns:
+	    LoRA Layer Weights.
+	"""
+	from easydel.utils.graph_utils import get_module_from_path, iter_module_search
+
+	if not is_flatten(lora_tree):
+		lora_tree = flatten_dict(lora_tree)
+	with tqdm(
+		total=len([p[0] for p in iter_module_search(model, nn.LoRA)]),
+		desc="Merge LoRA Params",
+	) as pbar:
+		for path, _ in iter_module_search(model, nn.LoRA):
+			base_module: nn.LoRA = get_module_from_path(model=model, path=path)
+			base_module.lora_b = lora_tree[path + ("lora_b",)]
+			base_module.lora_a = lora_tree[path + ("lora_a",)]
+			pbar.update(1)
 	return model
 
 
