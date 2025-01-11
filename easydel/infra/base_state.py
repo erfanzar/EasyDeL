@@ -111,8 +111,7 @@ class EasyDeLState(struct.PyTreeNode):
 		# Validate mutual exclusivity of model and graph-related parameters
 		graph_params_provided = (
 			graphdef is not None or graphstate is not None or graphother is not None
-		)
-
+		) 
 		if model is not None and graph_params_provided:
 			raise ValueError(
 				"Cannot provide both a model and graph-related parameters. "

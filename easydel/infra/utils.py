@@ -32,7 +32,6 @@ from einops import rearrange
 from flax import nnx as nn
 from jax.sharding import PartitionSpec
 from tqdm.auto import tqdm
-
 import easydel
 from easydel.escale import PartitionAxis
 from easydel.utils.helpers import get_logger
@@ -587,6 +586,9 @@ def auto_remat(
 		)
 		outs += (module,)
 	return outs
+
+
+class ModuleCaches(nn.Cache): ...
 
 
 if tp.TYPE_CHECKING:

@@ -514,14 +514,6 @@ class ArcticModel(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 
-	@cached_property
-	def causal_mask(self):
-		return self.config.get_basic_causal_mask()
-
-	@cached_property
-	def frequencies(self):
-		return self.config.get_basic_frequencies()
-
 	def __call__(
 		self,
 		input_ids: tp.Optional[chex.Array] = None,

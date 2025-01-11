@@ -141,12 +141,11 @@ class Conv1D(nn.Module):
 		precision: tp.Optional[tp.Union[str, lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
-	):
-		kernel_shape = (features, 1, kernel_size)
+	): 
 		self.kernel = nn.Param(
 			nn.initializers.lecun_normal(dtype=param_dtype)(
 				rngs.params(),
-				kernel_shape,
+				(kernel_size, 1, features),
 				param_dtype,
 			),
 		)
@@ -179,10 +178,10 @@ class Conv1D(nn.Module):
 				f"Input to `Conv` needs to have rank {unbatched_rank},"
 				f" but input has shape {x.shape}.",
 			)
-
+		rhs = jnp.asarray(jnp.swapaxes(self.kernel.value, 0, 2), dtype=self.dtype)
 		x = lax.conv_general_dilated(
 			lhs=x,
-			rhs=jnp.asarray(jnp.swapaxes(self.kernel.value, 0, 2), dtype=self.dtype),
+			rhs=rhs,
 			window_strides=(self.stride,),
 			padding=((self.padding, self.padding),),
 			rhs_dilation=(self.dilation,),
@@ -340,7 +339,7 @@ class Mamba2Mixer(nn.Module):
 			and attention_mask.shape[1] > 1
 			and attention_mask.shape[0] > 1
 		):
-			input_states = (input_states * attention_mask[:, :, None]).to(dtype)
+			input_states = (input_states * attention_mask[:, :, None]).astype(dtype)
 		batch_size, seq_len, _ = input_states.shape
 		dtype = input_states.dtype
 
@@ -428,19 +427,10 @@ class Mamba2Mixer(nn.Module):
 				(batch_size, self.num_heads, self.head_dim, self.ssm_state_size),
 				dtype=dtype,
 			)
-			hidden_states = self.act(
-				jnp.swapaxes(
-					self.conv1d(
-						jnp.swapaxes(
-							hidden_states,
-							2,
-							1,
-						)
-					)[..., :seq_len],
-					2,
-					1,
-				)
-			)
+
+			convin = self.conv1d(jnp.swapaxes(hidden_states, 2, 1))[..., :seq_len]
+			hidden_states = self.act(jnp.swapaxes(convin, 2, 1))
+
 			hidden_states, B, C = jnp.split(
 				hidden_states,
 				[
@@ -746,6 +736,8 @@ class Mamba2Model(EasyDeLBaseModule):
 			inputs_embeds = self.embeddings(input_ids)
 		if cache_params is None:
 			cache_params = Mamba2Cache.init_empty(len(self.layers))
+		if attention_mask is None:
+			attention_mask = jnp.ones(inputs_embeds.shape[:2], dtype="i4")
 		hidden_states = inputs_embeds
 		for idx, block in enumerate(self.layers):
 			hidden_states = block(
@@ -829,6 +821,7 @@ class Mamba2ForCausalLM(EasyDeLBaseModule):
 		return_dict = (
 			return_dict if return_dict is not None else self.config.use_return_dict
 		)
+
 		mamba_outputs = self.backbone(
 			input_ids=input_ids,
 			inputs_embeds=inputs_embeds,

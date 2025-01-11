@@ -27,6 +27,7 @@ from easydel.infra.factory import register_module
 from easydel.infra.modeling_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 from easydel.infra.utils import (
 	ACT2FN,
+	ModuleCaches,
 	auto_remat,
 	block_wise_ffn,
 	control_mlp_sharding,
@@ -770,14 +771,7 @@ class DeepseekV3DecoderLayer(nn.Module):
 		residual = hidden_states
 		hidden_states = self.post_attention_layernorm(hidden_states)
 
-		if self.config.use_scan_mlp:
-			feed_forward_hidden_states = block_wise_ffn(
-				self.mlp,
-				hidden_states,
-				self.config.scan_mlp_chunk_size,
-			)
-		else:
-			feed_forward_hidden_states = self.mlp(hidden_states)
+		feed_forward_hidden_states = self.mlp(hidden_states)
 		hidden_states = residual + feed_forward_hidden_states
 
 		outputs = (hidden_states,)
@@ -861,12 +855,14 @@ class DeepseekV3Model(EasyDeLBaseModule):
 					if key in self.config.rope_scaling
 				}
 				initial_rope_kwargs["scaling_factor"] = self.config.rope_scaling["factor"]
-		return init_deepseek_rotary_embedding(
-			dim=self.config.qk_rope_head_dim,
-			max_position_embeddings=self.config.granted_freq_max_position_embedding,
-			base=self.config.rope_theta,
-			method=method,  # type:ignore
-			kwargs=initial_rope_kwargs,
+		return ModuleCaches(
+			init_deepseek_rotary_embedding(
+				dim=self.config.qk_rope_head_dim,
+				max_position_embeddings=self.config.granted_freq_max_position_embedding,
+				base=self.config.rope_theta,
+				method=method,  # type:ignore
+				kwargs=initial_rope_kwargs,
+			)
 		)
 
 	def __call__(

@@ -41,7 +41,7 @@ torch.manual_seed(42)
 
 class EasyModelsTest(unittest.TestCase):
 	def setUp(self) -> None:
-		self.batch_size: int = 2
+		self.batch_size: int = 4
 		self.vocab_size: int = 32000
 		self.hidden_size: int = 128
 		self.intermediate_size: int = 256
@@ -79,7 +79,7 @@ class EasyModelsTest(unittest.TestCase):
 		self.attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_ATTENTION_MECHANISM
 		self.blocksize_k: int = 64
 		self.blocksize_q: int = 128
-		self.sequence_length = 64
+		self.sequence_length = 128
 		self.scan_mlp_chunk_size = self.sequence_length // 2
 		self.head_dim = self.hidden_size // self.num_attention_heads
 		self.use_parallel_residual = True
@@ -136,6 +136,7 @@ class EasyModelsTest(unittest.TestCase):
 
 		config.axis_dims = (1, 1, 1, -1)
 		config.pad_token_id = 0
+
 		hf_model = hf_module_class(config=copy.deepcopy(config))
 		hf_model.eval()
 		hf_model = hf_model.float()
@@ -163,6 +164,7 @@ class EasyModelsTest(unittest.TestCase):
 			torch_time = time.time()
 			hf_output = hf_model(
 				input_ids=torch_input_ids,
+				attention_mask=torch.ones_like(torch_input_ids),
 				labels=torch_input_ids,
 				past_key_values=None,
 			)
@@ -183,7 +185,10 @@ class EasyModelsTest(unittest.TestCase):
 
 			@jax.jit
 			def jited(ids):
-				return ed_model.compute_loss(input_ids=ids)
+				return ed_model.compute_loss(
+					input_ids=ids,
+					attention_mask=jnp.ones_like(ids),
+				)
 
 			ed_output = jited(jax_input_ids)
 			easy_time = time.time()
@@ -844,9 +849,9 @@ if __name__ == "__main__":
 	# test.test_gpt2()  # Passed
 	# test.test_grok1() # Not Tested Yet!
 	# test.test_internlm2()  # Passed
-	test.test_llama()  # Passed
+	# test.test_llama()  # Passed
 	# test.test_mamba()  # Passed
-	# test.test_mamba2()  # Passed
+	test.test_mamba2()  # Passed
 	# test.test_mistral()  # Passed
 	# test.test_mixtral()  # Passed
 	# test.test_mpt()  # Passed
