@@ -31,6 +31,7 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import (
 	ACT2FN,
+	ModuleCaches,
 	auto_remat,
 	block_wise_ffn,
 	control_mlp_sharding,
@@ -855,12 +856,14 @@ class DeepseekV2Model(EasyDeLBaseModule):
 					if key in self.config.rope_scaling
 				}
 				initial_rope_kwargs["scaling_factor"] = self.config.rope_scaling["factor"]
-		return init_deepseek_rotary_embedding(
-			dim=self.config.qk_rope_head_dim,
-			max_position_embeddings=self.config.granted_freq_max_position_embedding,
-			base=self.config.rope_theta,
-			method=method,  # type:ignore
-			kwargs=initial_rope_kwargs,
+		return ModuleCaches(
+			init_deepseek_rotary_embedding(
+				dim=self.config.qk_rope_head_dim,
+				max_position_embeddings=self.config.granted_freq_max_position_embedding,
+				base=self.config.rope_theta,
+				method=method,  # type:ignore
+				kwargs=initial_rope_kwargs,
+			)
 		)
 
 	def __call__(

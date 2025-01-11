@@ -294,6 +294,9 @@ class FlashAttention:
 				)
 
 		key, value = self.repeat_kv_heads(key, value, query.shape[2] // key.shape[2])
+		if bias is not None:
+			if bias.shape[1] != value.shape[2]:
+				bias = jnp.repeat(bias, value.shape[2] // bias.shape[1], 1)
 		# TPU implementation
 		block_sizes = TPUBlockSizes(
 			block_q=self.config.blocksize_q,

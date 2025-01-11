@@ -10,6 +10,13 @@ from jax.sharding import PartitionSpec
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
+SCAN_TRAINER = os.environ.get("SCAN_TRAINER", "true").lower() in [
+	"true",
+	"1",
+	"on",
+	"yes",
+]
+
 
 def make_assertions_and_get_sizes(
 	batch: tp.Dict,
@@ -147,34 +154,28 @@ def minibatch_call(
 			),
 			batch,
 		)
-		(_, step_metrics), step_grads = grad_fn(state.graphstate, minibatch)
-		return step_grads, step_metrics
+		(_, step_aux), step_grads = grad_fn(state.graphstate, minibatch)
+		return step_grads, step_aux
 
 	def _scan_step(carry, minibatch_idx: jax.Array | int):
-		step_grads, step_metrics = _minibatch_step(minibatch_idx)
-		carry = jax.tree_map(jnp.add, carry, (step_grads, step_metrics))
+		step_grads, step_aux = _minibatch_step(minibatch_idx)
+		carry = jax.tree_map(jnp.add, carry, (step_grads, step_aux))
 		return carry, None
 
-	grads_shapes, metrics_shape = jax.eval_shape(_minibatch_step, 0)
+	grads_shapes, aux_shape = jax.eval_shape(_minibatch_step, 0)
 	gradients = jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), grads_shapes)
-	metrics = jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), metrics_shape)
+	aux = jax.tree_map(lambda x: jnp.zeros(x.shape, x.dtype), aux_shape)
 
-	if os.environ.get("SCAN_TRAINER", "true").lower() in ["true", "1", "on", "yes"]:
-		(gradients, metrics), _ = jax.lax.scan(
+	if SCAN_TRAINER and minibatch_size != 1:
+		(gradients, aux), _ = jax.lax.scan(
 			_scan_step,
-			init=(gradients, metrics),
+			init=(gradients, aux),
 			xs=jnp.arange(minibatch_size),
 			length=minibatch_size,
 		)
+		gradients = jax.tree_util.tree_map(lambda g: g / minibatch_size, gradients)
+		aux = jax.tree_util.tree_map(lambda m: m / minibatch_size, aux)
 	else:
 		for minibatch_idx in range(minibatch_size):
-			(gradients, metrics), _ = _scan_step(
-				(gradients, metrics),
-				minibatch_idx,
-			)
-
-	if minibatch_size != 1:
-		gradients = jax.tree_util.tree_map(lambda g: g / minibatch_size, gradients)
-		metrics = jax.tree_util.tree_map(lambda m: m / minibatch_size, metrics)
-
-	return gradients, metrics
+			(gradients, aux), _ = _scan_step((gradients, aux), minibatch_idx)
+	return gradients, aux

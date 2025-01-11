@@ -16,12 +16,12 @@ import typing as tp
 import warnings
 from dataclasses import dataclass
 
+import chex
 import jax
 import jax.extend
 import jax.tree_util
 from flax import nnx as nn
 from jax import numpy as jnp
-
 from transformers.configuration_utils import PretrainedConfig
 
 from easydel.escale import PartitionAxis
@@ -37,6 +37,13 @@ from .etils import (
 	EasyDeLQuantizationMethods,
 )
 
+
+if tp.TYPE_CHECKING:
+	from easydel.layers.rotary_embedding import RopeConfig
+	from .utils import ModuleCaches
+else:
+	RopeConfig = tp.Any
+	ModuleCaches = tp.Any
 logger = get_logger(__name__)
 
 FLAX_WEIGHTS_NAME = "easydel-model.parameters"
@@ -659,55 +666,49 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			self.max_position_embeddings,
 		)
 
-	def get_basic_rope(
-		self,
-		dtype,
-		head_size,
-		rotary_dim=None,
-		is_neox_style=True,
-		base=None,
-	):
-		from easydel.layers.rotary_embedding import get_rope
+	def _get_rope_config(self) -> RopeConfig:
+		"""Get RoPE configuration from the instance attributes."""
+		from easydel.layers.rotary_embedding import RopeConfig
 
-		if rotary_dim is None:
-			rotary_dim = head_size
+		if not hasattr(self, "rope_scaling") or self.rope_scaling is None:
+			config = RopeConfig()
+		else:
+			config = RopeConfig.from_dict(self.rope_scaling)
 
-		class rope_scaling(dict):
-			__hash__ = hash_fn
-
-		initial_rope_kwargs = rope_scaling(rope_type="default")
-		if getattr(self, "rope_scaling", None) is not None:
-			scaling_type = self.rope_scaling.get("rope_type", None)
-			scaling_type = self.rope_scaling.get("type", scaling_type)
-			scaling_factor = self.rope_scaling.get("factor", None)
-			low_freq_factor = self.rope_scaling.get("low_freq_factor", None)
-			high_freq_factor = self.rope_scaling.get("high_freq_factor", None)
-			original_max_position_embeddings = self.rope_scaling.get(
-				"original_max_position_embeddings",
-				None,
-			)
-			if original_max_position_embeddings is None:
-				original_max_position_embeddings = getattr(
+			if config.original_max_position_embeddings is None:
+				config.original_max_position_embeddings = getattr(
 					self,
 					"original_max_position_embeddings",
 					None,
 				)
-			long_factor = self.rope_scaling.get("long_factor", None)
-			short_factor = self.rope_scaling.get("short_factor", None)
-			long_mscale = self.rope_scaling.get("long_mscale", None)
-			short_mscale = self.rope_scaling.get("short_mscale", None)
-			initial_rope_kwargs = rope_scaling(
-				rope_type=scaling_type,
-				factor=scaling_factor,
-				low_freq_factor=low_freq_factor,
-				high_freq_factor=high_freq_factor,
-				original_max_position_embeddings=original_max_position_embeddings,
-				long_factor=long_factor,
-				short_factor=short_factor,
-				long_mscale=long_mscale,
-				short_mscale=short_mscale,
-			)
 
+		return config
+
+	def get_basic_rope(
+		self,
+		dtype: chex.Array,
+		head_size: int,
+		rotary_dim: tp.Optional[int] = None,
+		is_neox_style: bool = True,
+		base: tp.Optional[float] = None,
+	) -> chex.Array:
+		"""
+		Get basic rotary position embeddings.
+
+		Args:
+		    dtype: Data type for the embeddings
+		    head_size: Size of attention heads
+		    rotary_dim: Dimension for rotary embeddings (defaults to head_size)
+		    is_neox_style: Whether to use NeoX style embeddings
+		    base: Base value for frequency computation (defaults to self.rope_theta)
+
+		Returns:
+		    Rotary position embeddings
+		"""
+		from easydel.layers.rotary_embedding import get_rope
+
+		rotary_dim = rotary_dim or head_size
+		rope_config = self._get_rope_config()
 		return get_rope(
 			head_size=head_size,
 			rotary_dim=rotary_dim,
@@ -715,74 +716,54 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			base=base or self.rope_theta,
 			dtype=dtype,
 			is_neox_style=is_neox_style,
-			rope_scaling=initial_rope_kwargs,
+			rope_scaling=rope_config.to_dict(),
 		)
 
 	def get_basic_frequencies(
 		self,
-		head_size=None,
-		rotary_dim=None,
-		base=None,
-	):
+		head_size: tp.Optional[int] = None,
+		rotary_dim: tp.Optional[int] = None,
+		base: tp.Optional[float] = None,
+	) -> ModuleCaches:
+		"""
+		Get basic frequencies for rotary embeddings.
+
+		Args:
+		    head_size: Size of attention heads (defaults to self.head_dim)
+		    rotary_dim: Dimension for rotary embeddings (defaults to head_size)
+		    base: Base value for frequency computation (defaults to self.rope_theta)
+
+		Returns:
+		    ModuleCaches instance containing computed frequencies
+		"""
 		from easydel.layers.rotary_embedding import get_frequencies
+		from .utils import ModuleCaches
 
-		if head_size is None:
-			head_size = self.head_dim  # last point
-		if rotary_dim is None:
-			rotary_dim = head_size
+		head_size = head_size or self.head_dim
+		rotary_dim = rotary_dim or head_size
+		rope_config = self._get_rope_config()
 
-		class rope_scaling(dict):
-			__hash__ = hash_fn
-
-		initial_rope_kwargs = rope_scaling(rope_type="default")
-
-		if getattr(self, "rope_scaling", None) is not None:
-			scaling_type = self.rope_scaling.get("rope_type", None)
-			scaling_type = self.rope_scaling.get("type", scaling_type)
-			scaling_factor = self.rope_scaling.get("factor", None)
-			low_freq_factor = self.rope_scaling.get("low_freq_factor", None)
-			high_freq_factor = self.rope_scaling.get("high_freq_factor", None)
-			original_max_position_embeddings = self.rope_scaling.get(
-				"original_max_position_embeddings",
-				None,
-			)
-			if original_max_position_embeddings is None:
-				original_max_position_embeddings = getattr(
-					self,
-					"original_max_position_embeddings",
-					None,
-				)
-			long_factor = self.rope_scaling.get("long_factor", None)
-			short_factor = self.rope_scaling.get("short_factor", None)
-			long_mscale = self.rope_scaling.get("long_mscale", None)
-			short_mscale = self.rope_scaling.get("short_mscale", None)
-			initial_rope_kwargs = rope_scaling(
-				rope_type=scaling_type,
-				factor=scaling_factor,
-				low_freq_factor=low_freq_factor,
-				high_freq_factor=high_freq_factor,
-				original_max_position_embeddings=original_max_position_embeddings,
-				long_factor=long_factor,
-				short_factor=short_factor,
-				long_mscale=long_mscale,
-				short_mscale=short_mscale,
-			)
-
-		return get_frequencies(
+		frequencies = get_frequencies(
 			head_size=head_size,
 			rotary_dim=rotary_dim,
 			max_position=self.granted_freq_max_position_embedding,
 			base=base or self.rope_theta,
-			rope_scaling=initial_rope_kwargs,
+			rope_scaling=rope_config.to_dict(),
 		)
 
+		return ModuleCaches(frequencies)
+
 	def get_basic_causal_mask(self, dtype="bool"):
-		return nn.make_causal_mask(
-			jnp.ones(
-				shape=(1, self.granted_mask_max_position_embedding),
+		from .utils import ModuleCaches
+
+		return ModuleCaches(
+			nn.make_causal_mask(
+				jnp.ones(
+					shape=(1, self.granted_mask_max_position_embedding),
+					dtype=dtype,
+				),
 				dtype=dtype,
-			),
-			dtype=dtype,
+			)
 		)
 
 	def get_fcm_mask(self, batch_size, seq_length, deterministic: bool):

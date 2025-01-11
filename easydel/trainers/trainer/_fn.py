@@ -50,8 +50,9 @@ def training_step(
 		module = state.merge(tree)
 		module.train()
 		call_batch = module.prepare_inputs_for_call(**minibatch)
+		labels = call_batch.pop("labels", None)
 		outputs, metrics = module.compute_loss(
-			labels=call_batch.pop("labels", None),
+			labels=labels,
 			loss_config=loss_config,
 			**call_batch,
 		)
@@ -63,7 +64,6 @@ def training_step(
 		minibatch_size=minibatch_size,
 		grad_fn=jax.value_and_grad(loss_fn, has_aux=True, allow_int=True),
 	)
-
 	metrics = update_metrics(
 		metrics=metrics,
 		learning_rate_fn=learning_rate_fn,
@@ -97,10 +97,12 @@ def evaluation_step(
 	def loss_fn(tree):
 		module = state.merge(tree)
 		module.eval()
+		labels = batch.pop("labels", None)
 		outputs, metrics = module.compute_loss(
-			labels=batch.pop("labels", None),
+			labels=labels,
 			loss_config=loss_config,
-			**batch,  # Passed directly to Model
+			**batch,
+			# Passed directly to Model
 		)
 
 		return metrics

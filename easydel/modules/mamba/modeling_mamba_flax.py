@@ -99,7 +99,7 @@ class MambaConv1D(nn.Module):
 		*,
 		rngs: nn.Rngs,
 	):
-		kernel_shape = (features, 1, kernel_size)
+		kernel_shape = (kernel_size, 1, features)
 		self.kernel = nn.Param(
 			nn.initializers.lecun_normal(dtype=param_dtype)(
 				rngs.params(),

@@ -361,7 +361,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 					self.experts[index],
 					hidden_states,
 					self.config.scan_mlp_chunk_size,
-					False,
 				)
 				if self.config.use_scan_mlp
 				else self.experts[index](hidden_states)
