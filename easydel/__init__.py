@@ -48,6 +48,16 @@ if _os.environ.get("EASYDEL_AUTO", "true") in ["true", "1", "on", "yes"]:
 		"--xla_gpu_enable_latency_hiding_scheduler=true  "
 		"--xla_gpu_enable_command_buffer=  "
 	)
+	_os.environ["LIBTPU_INIT_ARGS"] = (
+		_os.environ.get("LIBTPU_INIT_ARGS", "") + " "
+		"--xla_jf_spmd_threshold_for_windowed_einsum_mib=0  "
+		"--xla_tpu_spmd_threshold_for_allgather_cse=10000  "
+		"--xla_tpu_spmd_rewrite_einsum_with_reshape=true  "
+		"--jax_enable_async_collective_offload=true  "
+		"--xla_tpu_enable_latency_hiding_scheduler=true  "
+		"--xla_enable_async_all_gather=true  "
+		"TPU_MEGACORE=MEGACORE_DENSE"
+	)
 	_os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 	if _os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION", None) is None:
 		_os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "1.0"
