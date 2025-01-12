@@ -415,7 +415,7 @@ class EasyDeLBaseModule(
 			),
 		)
 
-		@partial(jax.jit, in_shardings=(shardings,))
+		@partial(jax.jit, out_shardings=shardings)
 		def _call(cl):
 			return cl
 
@@ -437,7 +437,7 @@ class EasyDeLBaseModule(
 			),
 		)
 
-		@partial(jax.jit, in_shardings=(shardings,))
+		@partial(jax.jit, out_shardings=shardings)
 		def _call(cl):
 			return cl
 
