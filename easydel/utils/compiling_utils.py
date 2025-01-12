@@ -122,7 +122,9 @@ def get_hash_of_lowering(lowered_func: Lowered):
 
 
 def smart_compile(lowered_func: Lowered, tag: tp.Optional[str] = None):
-	
+	if jax.process_count() > 1:
+		compiled_func: Compiled = lowered_func.compile()
+		return compiled_func
 	func_hash = get_hash_of_lowering(lowered_func)
 	foldername = str(func_hash) if tag is None else f"{tag}-{func_hash}"
 	func_dir = COMPILE_FUNC_DIR / foldername

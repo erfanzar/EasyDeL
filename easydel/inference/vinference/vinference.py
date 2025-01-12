@@ -514,7 +514,7 @@ class vInference:
 				state=state,
 				generation_config=self.generation_config,
 			)
-			logger.debug("`first_iter_fn` lowered sucessfully.")
+			logger.debug("`first_iter_fn` lowered successfully.")
 			compiled_generate_func = smart_compile(first_iter_fn_lowered, tag="vinference")
 			logger.debug("smart compiling `iter_fn`")
 			logger.debug("lowering `iter_fn`")
@@ -528,7 +528,7 @@ class vInference:
 				generation_config=self.generation_config,
 				loop_max_tokens=self.generation_config.streaming_chunks,
 			)
-			logger.debug("`iter_fn` lowered sucessfully.")
+			logger.debug("`iter_fn` lowered successfully.")
 			compiled_interval_func = smart_compile(iter_fn_lowered, tag="vinference")
 
 			del state
