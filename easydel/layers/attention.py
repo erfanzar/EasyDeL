@@ -1754,6 +1754,8 @@ class FlaxAttentionModule(nn.Module):
 			attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
 
 		if causal_mask is not None:
+			if hasattr(causal_mask, "value"):
+				causal_mask = causal_mask.value
 			causal_mask = lax.dynamic_slice(
 				causal_mask,
 				(0, 0, end_index, 0),
