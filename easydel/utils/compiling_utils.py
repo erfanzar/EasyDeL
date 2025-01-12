@@ -122,6 +122,7 @@ def get_hash_of_lowering(lowered_func: Lowered):
 
 
 def smart_compile(lowered_func: Lowered, tag: tp.Optional[str] = None):
+	
 	func_hash = get_hash_of_lowering(lowered_func)
 	foldername = str(func_hash) if tag is None else f"{tag}-{func_hash}"
 	func_dir = COMPILE_FUNC_DIR / foldername
