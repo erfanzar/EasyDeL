@@ -299,7 +299,6 @@ class vInferenceApiServer:
 				if response.generated_tokens == inference.generation_config.max_new_tokens
 				else "stop"
 			)
-
 			stream_resp = ChatCompletionStreamResponse(
 				model=request.model,
 				choices=[

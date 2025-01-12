@@ -25,11 +25,16 @@ def main():
 	# 	pretrained_model_name_or_path = "Qwen/Qwen2.5-7B-Instruct"
 
 	dtype = jnp.bfloat16
+	extra = {}
 	if jax.default_backend() == "gpu":
+		import torch
+
+		extra = {"torch_dtype": torch.float16}
 		param_dtype = jnp.float8_e5m2
+		if os.environ.get("APPED_LORA_TEST", "false") in ["true", "yes"]:
+			param_dtype = jnp.bfloat16
 	else:
-		...
-	param_dtype = jnp.bfloat16
+		param_dtype = jnp.bfloat16
 
 	partition_axis = ed.PartitionAxis()
 	tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
@@ -52,6 +57,7 @@ def main():
 		dtype=dtype,
 		partition_axis=partition_axis,
 		precision=jax.lax.Precision("fastest"),
+		**extra,
 	)
 
 	print("MODEL LOADED")
@@ -76,10 +82,10 @@ def main():
 
 	print(model.model_task)
 	print(model.model_type)
-	print("Compiling")
-	inference.precompile(1, inference.model_prefill_length)
-
-	print("Done Compiling")
+	if os.environ.get("USE_AOT", "true") in ["true", "yes", "on", "1"]:
+		print("Compiling")
+		inference.precompile(1, inference.model_prefill_length)
+		print("Done Compiling")
 	messages = [
 		{
 			"role": "system",

@@ -38,7 +38,7 @@ if jax.default_backend() == "tpu":
 	def measure_flops(func, *args, **kwargs):
 		try:
 			flops = func.cost_analysis()[0]["flops"]
-		except Exception:   
+		except Exception:
 			flops = 1
 		start_time = time.perf_counter()
 		result = jax.block_until_ready(func(*args, **kwargs))
@@ -46,11 +46,11 @@ if jax.default_backend() == "tpu":
 		elapsed_time = end_time - start_time
 		return result, flops, flops / elapsed_time, elapsed_time
 else:
-	# On GPUs this will be much more efficient 
+	# On GPUs this will be much more efficient
 	def measure_flops(func, *args, **kwargs):
 		try:
 			flops = func.cost_analysis()[0]["flops"]
-		except Exception:  
+		except Exception:
 			flops = 1
 		start_time = time.perf_counter()
 		result = func(*args, **kwargs)
@@ -59,14 +59,8 @@ else:
 		return result, flops, flops / elapsed_time, elapsed_time
 
 
-@partial(
-	jax.jit,
-	static_argnames=[
-		"graphdef",
-		"generation_config",
-	],
-)
-def causal_lm_first_iter_fn(
+@partial(jax.jit, static_argnums=(0, 3))
+def basic_generation_first_iter_fn(
 	graphdef: EasyDeLBaseModule,
 	graphstate: dict,
 	state: SampleState,
@@ -96,14 +90,8 @@ def causal_lm_first_iter_fn(
 	return state
 
 
-@partial(
-	jax.jit,
-	static_argnames=[
-		"graphdef",
-		"generation_config",
-	],
-)
-def causal_lm_iter_fn(
+@partial(jax.jit, static_argnums=(0, 3))
+def basic_generation_iter_fn(
 	graphdef: EasyDeLBaseModule,
 	graphstate: dict,
 	state: SampleState,
@@ -149,7 +137,14 @@ def causal_lm_iter_fn(
 COMPILED_FUNCS = {}
 
 
-def get_compiled_funcs(batch_size, input_tokens_length, id, safe=True):
+def get_compiled_funcs(
+	batch_size,
+	input_tokens_length,
+	id,
+	safe=True,
+	fn1: tp.Optional[tp.Callable] = None,
+	fn2: tp.Optional[tp.Callable] = None,
+):
 	"""
 	Retrieves compiled generation functions from a cache.
 
@@ -163,7 +158,7 @@ def get_compiled_funcs(batch_size, input_tokens_length, id, safe=True):
 			interval generate functions, or (None, None) if not found in the cache.
 	"""
 	search_key = f"Bx{batch_size}-Sx{input_tokens_length}-UUID{id}"
-	f1, f2 = COMPILED_FUNCS.get(search_key, (None, None))
+	f1, f2 = COMPILED_FUNCS.get(search_key, (fn1, fn2))
 	if (f1 is None or f2 is None) and safe:
 		raise RuntimeError(
 			"wasn't able to find requested functions please `precompile`"

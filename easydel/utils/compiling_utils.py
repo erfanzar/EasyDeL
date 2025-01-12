@@ -122,7 +122,10 @@ def get_hash_of_lowering(lowered_func: Lowered):
 	return hash_digest
 
 
-def smart_compile(lowered_func: Lowered, tag: tp.Optional[str] = None) -> Compiled:
+def smart_compile(
+	lowered_func: Lowered,
+	tag: tp.Optional[str] = None,
+) -> Compiled:
 	pc = jax.process_count()
 	if pc > 1:
 		logger.debug(
@@ -155,7 +158,7 @@ def smart_compile(lowered_func: Lowered, tag: tp.Optional[str] = None) -> Compil
 				func_dir.mkdir(parents=True, exist_ok=True)
 				try:
 					pickle.dump((serialized, in_tree, out_tree), open(filepath, "wb"))
-				except Exception as e:  # noqa
+				except Exception as e:
 					warnings.warn(
 						f"couldn't save compiled function due to {e}" + post_fix,
 						stacklevel=4,
@@ -168,7 +171,7 @@ def smart_compile(lowered_func: Lowered, tag: tp.Optional[str] = None) -> Compil
 				serialized, in_tree, out_tree = serialize(compiled_func)
 				func_dir.mkdir(parents=True, exist_ok=True)
 				pickle.dump((serialized, in_tree, out_tree), open(filepath, "wb"))
-			except Exception as e:  # noqa
+			except Exception as e:
 				warnings.warn(
 					f"couldn't save and serialize compiled function due to {e}" + post_fix,
 					stacklevel=4,

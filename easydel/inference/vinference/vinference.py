@@ -33,6 +33,7 @@ from fjformer import GenerateRNG
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
+from jax._src.stages import Compiled
 from jax.sharding import NamedSharding, PartitionSpec
 from pydantic import BaseModel
 
@@ -48,8 +49,8 @@ from ..utils import (
 	vInferenceConfig,
 )
 from ._fn import (
-	causal_lm_first_iter_fn,
-	causal_lm_iter_fn,
+	basic_generation_first_iter_fn,
+	basic_generation_iter_fn,
 	get_compiled_funcs,
 	measure_flops,
 	put_compiled_funcs,
@@ -130,6 +131,9 @@ class vInference:
 		if not self._report_metrics:
 			logger.info("vInference-metrics is disabled")
 			logger.debug(f"vInference-metrics is disabled [status erm={erm}]")
+
+		self._basic_generation_first_iter_fn = basic_generation_first_iter_fn
+		self._basic_generation_iter_fn = basic_generation_iter_fn
 
 	@cached_property
 	def metrics(self):
@@ -386,95 +390,187 @@ class vInference:
 		**model_kwargs,
 	) -> tp.Union[tp.Generator[SampleState, tp.Any, tp.Any], SampleState]:
 		"""
-		Generates text in streaming chunks.
-
-		This function takes the input IDs, attention mask, and position IDs as input,
-		precompiles the generation functions if necessary, and yields the generated text
-		in streaming chunks.
+		Generates text in streaming chunks with improved performance monitoring and error handling.
 
 		Args:
-			input_ids: The input token IDs.
-			attention_mask: The attention mask.
+		    input_ids: Input token IDs as a JAX array
+		    attention_mask: Optional attention mask for the input
+		    **model_kwargs: Additional model-specific keyword arguments
 
-		Yields:
-			SampleState: The generated text in streaming chunks.
+		Returns:
+		    Generator yielding SampleState objects containing generation results and metrics
+
+		Raises:
+		    ValueError: If input dimensions are invalid
+		    RuntimeError: If generation fails
 		"""
 		self._metrics_increase_queue()
 
 		try:
+			# Input validation and preprocessing
+			if not isinstance(input_ids, jax.Array):
+				input_ids = jnp.array(input_ids, dtype=jnp.int32)
+
+			batch_size, sequence_length = input_ids.shape
+			if batch_size <= 0 or sequence_length <= 0:
+				raise ValueError(f"Invalid input dimensions: {input_ids.shape}")
+
+			# Prepare generation context
 			with self._inference_latency_context_manager("preprocessing"):
-				input_ids = jnp.array(input_ids, dtype="i4", device=self.input_sharding)
-				batch_size, sequence_length = input_ids.shape
+				state = self._prepare_generation_state(
+					input_ids=input_ids,
+					attention_mask=attention_mask,
+					batch_size=batch_size,
+					sequence_length=sequence_length,
+					model_kwargs=model_kwargs,
+				)
 
 				generate_func, interval_func = get_compiled_funcs(
 					batch_size=batch_size,
 					input_tokens_length=sequence_length,
 					id=self._uuid4,
-				)
-				if attention_mask is None:
-					warnings.warn(
-						"`attention_mask` is not provided, it's recommended to "
-						"pass an attention mask for better results.",
-						stacklevel=1,
-					)
-					attention_mask = jnp.ones((batch_size, sequence_length), "i4")
-
-				attention_mask = jnp.array(
-					attention_mask,
-					dtype="i4",
-					device=self.input_sharding,
+					fn1=self._basic_generation_first_iter_fn,
+					fn2=self._basic_generation_iter_fn,
 				)
 
-				model_kwargs.update(dict(input_ids=input_ids, attention_mask=attention_mask))
-
-				state = self._init_state(**model_kwargs)
+			# Main generation loop
 			with self._inference_latency_context_manager("inference"):
-				(
-					state,
-					flop,
-					generate_func_flops,
-					generate_func_elapsed_time,
-				) = measure_flops(
-					generate_func,
-					graphstate=self.graphstate,
-					state=state,
-				)
-				interval_time = 0
-				state.generate_func_flops = generate_func_flops
-				if not state.is_sequence_finished:
-					all_interval_func_flops = []
-					for _ in range(self.generation_config._loop_rows):
-						(
-							state,
-							flop,
-							interval_func_flops,
-							interval_func_elapsed_time,
-						) = measure_flops(
-							interval_func,
-							graphstate=self.graphstate,
-							state=state,
-							loop_max_tokens=self.generation_config.streaming_chunks,
-						)
-						interval_time += interval_func_elapsed_time
-
-						all_interval_func_flops.append(interval_func_flops)
-						interval_func_flops = np.mean(all_interval_func_flops)
-						state.generate_func_flops = generate_func_flops
-						state.interval_func_flops = interval_func_flops
-
-						state.tokens_pre_second = state.generated_tokens / interval_time
-						yield state
-						if state.is_sequence_finished:
-							break
-				else:
-					yield state
+				state = yield from self._inner_generate(state, generate_func, interval_func)
 
 			self._post_generation_metrics_update(state)
+			return state
+
 		except Exception as e:
-			self._submit_during_generation_metrics_update()
-			raise e
+			self._handle_generation_error(e)
+
 		finally:
 			self._metrics_decrease_queue()
+
+	def _prepare_generation_state(
+		self,
+		input_ids: jax.Array,
+		attention_mask: tp.Optional[jax.Array],
+		batch_size: int,
+		sequence_length: int,
+		model_kwargs: dict,
+	) -> SampleState:
+		"""Prepares the initial state for text generation."""
+		if attention_mask is None:
+			warnings.warn(
+				"No attention mask provided. Using default mask.",
+				UserWarning,
+				stacklevel=2,
+			)
+			attention_mask = jnp.ones(
+				(batch_size, sequence_length),
+				dtype=jnp.int32,
+			)
+
+		attention_mask = jnp.array(
+			attention_mask,
+			dtype=jnp.int32,
+			device=self.input_sharding,
+		)
+
+		model_kwargs.update({"input_ids": input_ids, "attention_mask": attention_mask})
+
+		return self._init_state(**model_kwargs)
+
+	def _inner_generate(
+		self,
+		state: SampleState,
+		generate_func: callable,
+		interval_func: callable,
+	) -> tp.Generator[SampleState, tp.Any, tp.Any]:
+		"""Core generation loop with performance monitoring."""
+
+		# Initial generation step
+		state = self._execute_generation_step(generate_func, state)
+		all_interval_func_flops = []
+		if not state.is_sequence_finished:
+			# Subsequent generation steps
+			interval_time = 0
+			for _ in range(self.generation_config._loop_rows):
+				state, interval_time = self._execute_interval_step(
+					interval_func,
+					state,
+					interval_time,
+					all_interval_func_flops,
+				)
+				yield state
+				if state.is_sequence_finished:
+					break
+		return state
+
+	def _prepare_function_inputs(
+		self,
+		state,
+		func,
+	) -> tp.Tuple[tp.Union[tp.Any, jax.Array]]:
+		if isinstance(func, Compiled):
+			return (
+				self.graphstate,
+				state,
+			)
+
+		return (
+			self.graphdef,
+			self.graphstate,
+			state,
+			self.generation_config,
+		)
+
+	def _prepare_iter_function_inputs(
+		self,
+		state,
+		interval_func,
+	) -> tp.Tuple[tp.Union[tp.Any, jax.Array]]:
+		if isinstance(interval_func, Compiled):
+			return (
+				self.graphstate,
+				state,
+				self.generation_config.streaming_chunks,
+			)
+
+		return (
+			self.graphdef,
+			self.graphstate,
+			state,
+			self.generation_config,
+			self.generation_config.streaming_chunks,
+		)
+
+	def _execute_generation_step(self, func: callable, state: SampleState) -> SampleState:
+		"""Executes a single generation step with performance monitoring."""
+		inputs = self._prepare_function_inputs(state, func)
+		state, _, generate_func_flops, __ = measure_flops(func, *inputs)
+		state.generate_func_flops = generate_func_flops
+		return state
+
+	def _execute_interval_step(
+		self,
+		interval_func,
+		state,
+		interval_time,
+		all_interval_func_flops,
+	):
+		inputs = self._prepare_iter_function_inputs(state, interval_func)
+		state, _, interval_func_flops, elapsed_time = measure_flops(interval_func, *inputs)
+		interval_time += elapsed_time
+		all_interval_func_flops.append(interval_func_flops)
+		interval_func_flops = np.mean(all_interval_func_flops)
+		state.interval_func_flops = interval_func_flops
+		state.tokens_pre_second = state.generated_tokens / interval_time
+		return (state, interval_time)
+
+	def _handle_generation_error(self, error: Exception):
+		"""Handles errors during generation with appropriate logging and cleanup."""
+		self._submit_during_generation_metrics_update()
+
+		if isinstance(error, ValueError):
+			raise ValueError(f"Invalid input configuration: {str(error)}") from error
+
+		raise RuntimeError(f"Generation failed: {str(error)}") from error
 
 	def _get_compile_model_kwargs(self, batch_size, input_tokens_length):
 		return dict(
@@ -508,28 +604,31 @@ class vInference:
 			)
 			logger.debug("smart compiling `first_iter_fn`")
 			logger.debug("lowering `first_iter_fn`")
-			first_iter_fn_lowered = causal_lm_first_iter_fn.lower(
-				graphdef=self.graphdef,
-				graphstate=self.graphstate,
-				state=state,
-				generation_config=self.generation_config,
+			first_iter_fn_lowered = basic_generation_first_iter_fn.lower(
+				self.graphdef,
+				self.graphstate,
+				state,
+				self.generation_config,
 			)
 			logger.debug("`first_iter_fn` lowered successfully.")
-			compiled_generate_func = smart_compile(first_iter_fn_lowered, tag="vinference")
+			compiled_generate_func = smart_compile(
+				first_iter_fn_lowered,
+				tag="vinference.basic_generation_first_iter_fn",
+			)
 			logger.debug("smart compiling `iter_fn`")
 			logger.debug("lowering `iter_fn`")
-			iter_fn_lowered = causal_lm_iter_fn.lower(
-				graphdef=self.graphdef,
-				graphstate=self.graphstate,
-				state=compiled_generate_func(
-					graphstate=self.graphstate,
-					state=state,
-				),
-				generation_config=self.generation_config,
-				loop_max_tokens=self.generation_config.streaming_chunks,
+			iter_fn_lowered = basic_generation_iter_fn.lower(
+				self.graphdef,
+				self.graphstate,
+				compiled_generate_func(self.graphstate, state),
+				self.generation_config,
+				self.generation_config.streaming_chunks,
 			)
 			logger.debug("`iter_fn` lowered successfully.")
-			compiled_interval_func = smart_compile(iter_fn_lowered, tag="vinference")
+			compiled_interval_func = smart_compile(
+				iter_fn_lowered,
+				tag="vinference.basic_generation_iter_fn",
+			)
 
 			del state
 			logger.debug("saving compiled functions...")
