@@ -124,13 +124,12 @@ class vInference:
 		self._validate_token_ids()
 		self._uuid4 = uuid4().hex 
 		self._inference_name = inference_name or self._generate_inference_name(model)
-		self._report_metrics = (
-			os.environ.get("EASYDEL_RECORDS_METRICS", "ture").lower() in ["true", "yes", "1", "on"]
-			and jax.process_count() == 1
-		)
+		erm = os.environ.get("EASYDEL_RECORDS_METRICS", "true").lower() in ["true", "yes", "1", "on"]
+		# fmt:on
+		self._report_metrics = erm and jax.process_count() == 1
 		if not self._report_metrics:
 			logger.info("vInference-metrics is disabled")
-		# fmt:on
+			logger.debug(f"vInference-metrics is disabled [status erm={erm}]")
 
 	@cached_property
 	def metrics(self):
@@ -500,12 +499,14 @@ class vInference:
 		)
 		do_compile = compiled_generate_func is None or compiled_interval_func is None
 		if do_compile:
+			logger.debug("initiating state for lowering and compiling func.")
 			state = self._init_state(
 				**self._get_compile_model_kwargs(
 					batch_size=batch_size,
 					input_tokens_length=input_tokens_length,
 				)
 			)
+			logger.debug("smart compiling `first_iter_fn`")
 			compiled_generate_func = smart_compile(
 				causal_lm_first_iter_fn.lower(
 					graphdef=self.graphdef,
@@ -515,6 +516,7 @@ class vInference:
 				),
 				tag="vinference",
 			)
+			logger.debug("smart compiling `iter_fn`")
 			compiled_interval_func = smart_compile(
 				causal_lm_iter_fn.lower(
 					graphdef=self.graphdef,
@@ -530,6 +532,7 @@ class vInference:
 			)
 
 			del state
+			logger.debug("saving compiled functions...")
 			put_compiled_funcs(
 				compiled_generate_func=compiled_generate_func,
 				compiled_interval_func=compiled_interval_func,
@@ -559,11 +562,17 @@ class vInference:
 		"""
 		if input_tokens_length is None:
 			input_tokens_length = self.model_prefill_length
+			logger.debug(
+				"`input_tokens_length` is None using `vInference.model_prefill_length`"
+			)
 		config_key = (batch_size, input_tokens_length)
 
 		if config_key in self._precompiled_configs:
 			return True
 		if config_key in self._in_compiling_process:
+			logger.debug(
+				f"lowering and compiling with `config` {config_key} have already been requested adding 5 second timeout"
+			)
 			time.sleep(5)
 			return self.precompile(
 				batch_size=batch_size,
@@ -571,6 +580,7 @@ class vInference:
 			)
 		else:
 			with self._compilation_metrics_recorder():
+				logger.debug(f"lowering and compiling with `config` {config_key}")
 				self._in_compiling_process.add(config_key)
 				self._compile_and_lower_funs(
 					batch_size=batch_size,
@@ -581,6 +591,7 @@ class vInference:
 
 	@tp.overload
 	def count_tokens(self, messages: tp.List[tp.Dict[str, str]]): ...
+
 	@tp.overload
 	def count_tokens(self, text: str): ...
 
