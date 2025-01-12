@@ -466,12 +466,8 @@ class vInference:
 				dtype=jnp.int32,
 			)
 
-		attention_mask = jnp.array(
-			attention_mask,
-			dtype=jnp.int32,
-			device=self.input_sharding,
-		)
-
+		attention_mask = jnp.asarray(attention_mask, dtype="i4", device=self.input_sharding)
+		input_ids = jnp.asarray(input_ids, dtype="i4", device=self.input_sharding)
 		model_kwargs.update({"input_ids": input_ids, "attention_mask": attention_mask})
 
 		return self._init_state(**model_kwargs)
