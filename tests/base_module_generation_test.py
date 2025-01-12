@@ -65,7 +65,8 @@ def main():
 	tokenizer.padding_side = "left"
 	tokenizer.pad_token_id = tokenizer.eos_token_id
 	model.eval()
-	model = model.apply_lora_to_layers(32, ".*(q_proj|k_proj).*")
+	if os.environ.get("APPED_LORA_TEST", "false") in ["true", "yes"]:
+		model = model.apply_lora_to_layers(32, ".*(q_proj|k_proj).*")
 	print(model)
 	# model = model.quantize(
 	# 	method=ed.EasyDeLQuantizationMethods.A8BIT,

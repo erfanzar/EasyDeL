@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Module for text generation pipeline using JAX/Flax."""
 
 import asyncio
+import contextlib
 import os
 import pathlib
 import pickle
@@ -54,7 +54,6 @@ from ._fn import (
 	measure_flops,
 	put_compiled_funcs,
 )
-from .metrics import vInferenceMetrics
 
 if tp.TYPE_CHECKING:
 	from easydel.infra import EasyDeLBaseModule
@@ -115,9 +114,9 @@ class vInference:
 		self.generation_config = self._init_generation_config(generation_config, max_new_tokens)
 		if seed is None:
 			seed = random.randint(0, int(1e6))
-		self._rng_generator = GenerateRNG(seed)
 		self.input_partition_spec = input_partition_spec or PartitionSpec(("dp", "fsdp"), "sp")
 		self.mesh = self.model.config.mesh
+		self._rng_generator = GenerateRNG(seed)
 		self._precompile_lock = asyncio.Lock()
 		self._precompiled_configs = set()
 		self._in_compiling_process = set()
@@ -125,8 +124,65 @@ class vInference:
 		self._validate_token_ids()
 		self._uuid4 = uuid4().hex 
 		self._inference_name = inference_name or self._generate_inference_name(model)
-		self.metrics = vInferenceMetrics(self._inference_name)
+		self._report_metrics = (
+			os.environ.get("EASYDEL_RECORDS_METRICS", "ture").lower() in ["true", "yes", "1", "on"]
+			and jax.process_count() == 1
+		)
+		if not self._report_metrics:
+			logger.info("vInference-metrics is disabled")
 		# fmt:on
+
+	@cached_property
+	def metrics(self):
+		if self._report_metrics:
+			from .metrics import vInferenceMetrics
+
+			return vInferenceMetrics(self._inference_name)
+		return None
+
+	def _metrics_increase_queue(self):
+		if self._report_metrics:
+			self.metrics.queue_size.labels(model_name=self.metrics.model_name).inc()
+
+	def _metrics_decrease_queue(self):
+		if self._report_metrics:
+			self.metrics.queue_size.labels(model_name=self.metrics.model_name).dec()
+
+	def _inference_latency_context_manager(self, stage):
+		if self._report_metrics:
+			return self.metrics.inference_latency.labels(
+				model_name=self.metrics.model_name,
+				stage=stage,
+			).time()
+		return contextlib.nullcontext()
+
+	def _post_generation_metrics_update(self, state):
+		if self._report_metrics:
+			self.metrics.token_throughput.labels(
+				model_name=self.metrics.model_name,
+				operation="output",
+			).inc(state.generated_tokens)
+			self.metrics.generation_length.labels(
+				model_name=self.metrics.model_name,
+			).observe(state.generated_tokens)
+			self.metrics.inference_requests.labels(
+				model_name=self.metrics.model_name,
+				status="success",
+			).inc()
+
+	def _submit_during_generation_metrics_update(self):
+		if self._report_metrics:
+			self.metrics.inference_requests.labels(
+				model_name=self.metrics.model_name, status="error"
+			).inc()
+
+	def _compilation_metrics_recorder(self):
+		if self._report_metrics:
+			return self.metrics.compilation_time.labels(
+				model_name=self.metrics.model_name,
+				function_name="_compile_and_lower_funs",
+			).time()
+		return contextlib.nullcontext()
 
 	@cached_property
 	def tokenizer(self):
@@ -134,7 +190,6 @@ class vInference:
 
 		if isinstance(self.processor_class, PreTrainedTokenizerBase):
 			return self.processor_class
-
 		from transformers import ProcessorMixin
 
 		if isinstance(self.processor_class, ProcessorMixin):
@@ -228,7 +283,9 @@ class vInference:
 		return None
 
 	def _init_generation_config(
-		self, generation_config: tp.Optional[vInferenceConfig], max_new_tokens: int
+		self,
+		generation_config: tp.Optional[vInferenceConfig],
+		max_new_tokens: int,
 	) -> vInferenceConfig:
 		"""
 		Initializes the generation configuration.
@@ -343,13 +400,10 @@ class vInference:
 		Yields:
 			SampleState: The generated text in streaming chunks.
 		"""
-		self.metrics.queue_size.labels(model_name=self.metrics.model_name).inc()
+		self._metrics_increase_queue()
 
 		try:
-			with self.metrics.inference_latency.labels(
-				model_name=self.metrics.model_name,
-				stage="preprocessing",
-			).time():
+			with self._inference_latency_context_manager("preprocessing"):
 				input_ids = jnp.array(input_ids, dtype="i4", device=self.input_sharding)
 				batch_size, sequence_length = input_ids.shape
 
@@ -375,10 +429,7 @@ class vInference:
 				model_kwargs.update(dict(input_ids=input_ids, attention_mask=attention_mask))
 
 				state = self._init_state(**model_kwargs)
-			with self.metrics.inference_latency.labels(
-				model_name=self.metrics.model_name,
-				stage="inference",
-			).time():
+			with self._inference_latency_context_manager("inference"):
 				(
 					state,
 					flop,
@@ -411,7 +462,7 @@ class vInference:
 						interval_func_flops = np.mean(all_interval_func_flops)
 						state.generate_func_flops = generate_func_flops
 						state.interval_func_flops = interval_func_flops
-						
+
 						state.tokens_pre_second = state.generated_tokens / interval_time
 						yield state
 						if state.is_sequence_finished:
@@ -419,25 +470,12 @@ class vInference:
 				else:
 					yield state
 
-			self.metrics.token_throughput.labels(
-				model_name=self.metrics.model_name,
-				operation="output",
-			).inc(state.generated_tokens)
-			self.metrics.generation_length.labels(
-				model_name=self.metrics.model_name,
-			).observe(state.generated_tokens)
-			self.metrics.inference_requests.labels(
-				model_name=self.metrics.model_name,
-				status="success",
-			).inc()
+			self._post_generation_metrics_update(state)
 		except Exception as e:
-			self.metrics.inference_requests.labels(
-				model_name=self.metrics.model_name,
-				status="error",
-			).inc()
+			self._submit_during_generation_metrics_update()
 			raise e
 		finally:
-			self.metrics.queue_size.labels(model_name=self.metrics.model_name).dec()
+			self._metrics_decrease_queue()
 
 	def _get_compile_model_kwargs(self, batch_size, input_tokens_length):
 		return dict(
@@ -532,10 +570,7 @@ class vInference:
 				input_tokens_length=input_tokens_length,
 			)
 		else:
-			with self.metrics.compilation_time.labels(
-				model_name=self.metrics.model_name,
-				function_name="_compile_and_lower_funs",
-			).time():
+			with self._compilation_metrics_recorder():
 				self._in_compiling_process.add(config_key)
 				self._compile_and_lower_funs(
 					batch_size=batch_size,
