@@ -42,9 +42,10 @@ def main():
 		param_dtype = jnp.bfloat16
 		attn_kwargs = dict(
 			attn_dtype=jnp.float32,
-			attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
-			blocksize_q=512,
-			blocksize_k=512,
+			attn_mechanism=ed.AttentionMechanisms.VANILLA,
+			# attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
+			# blocksize_q=512,
+			# blocksize_k=512,
 		)
 
 	partition_axis = ed.PartitionAxis()
