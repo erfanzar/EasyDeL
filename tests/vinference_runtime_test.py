@@ -59,7 +59,6 @@ def main():
 		precision=jax.lax.Precision("fastest"),
 		**extra,
 	)
-
 	print("MODEL LOADED")
 
 	if os.environ.get("APPED_LORA_TEST", "false") in ["true", "yes"]:

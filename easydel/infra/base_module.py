@@ -19,6 +19,8 @@ import warnings
 from functools import cached_property, partial
 
 import chex
+import flax
+import flax.struct
 import jax
 import jax.extend
 import jax.tree_util
@@ -398,6 +400,50 @@ class EasyDeLBaseModule(
 			partition_specs=partition_specs,
 			mesh=mesh,
 		)[1]
+
+	def fully_shard(self: SELF, partition_rules: PartitionLike = None) -> SELF:
+		class ShardState(flax.struct.PyTreeNode):
+			graphdef: nn.GraphDef
+			graphstate: nn.GraphState
+
+		gdef, gstate = nn.split(self)
+		mock = ShardState(graphdef=gdef, graphstate=gstate)
+		shardings = jax.tree_util.tree_map(
+			lambda x: NamedSharding(mesh=self.mesh, spec=x),
+			match_partition_rules(
+				self._get_partition_rules(partition_rules), nn.eval_shape(lambda: mock)
+			),
+		)
+
+		@partial(jax.jit, in_shardings=(shardings,))
+		def _call(cl):
+			return cl
+
+		mock = _call(mock)
+		self = nn.merge(mock.graphdef, mock.graphstate)
+		return self
+
+	def fully_gather(self: SELF) -> SELF:
+		class ShardState(flax.struct.PyTreeNode):
+			graphdef: nn.GraphDef
+			graphstate: nn.GraphState
+
+		gdef, gstate = nn.split(self)
+		mock = ShardState(graphdef=gdef, graphstate=gstate)
+		shardings = jax.tree_util.tree_map(
+			lambda x: NamedSharding(mesh=self.mesh, spec=PartitionSpec()),
+			match_partition_rules(
+				self._get_partition_rules(None), nn.eval_shape(lambda: mock)
+			),
+		)
+
+		@partial(jax.jit, in_shardings=(shardings,))
+		def _call(cl):
+			return cl
+
+		mock = _call(mock)
+		self = nn.merge(mock.graphdef, mock.graphstate)
+		return self
 
 	def quantize(
 		self: SELF,

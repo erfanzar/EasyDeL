@@ -539,6 +539,8 @@ class EasyBridgeMixin(PushToHubMixin):
 			shard_fns,
 		)
 
+		if auto_shard_model:
+			model = model.fully_shard()
 		if model.can_generate():
 			try:
 				model.generation_config = GenerationConfig.from_pretrained(
@@ -674,7 +676,6 @@ class EasyBridgeMixin(PushToHubMixin):
 			if not is_flatten(shard_fns):
 				shard_fns = flatten_dict(shard_fns)
 		elif auto_shard_model:
-			
 			shard_fns, _ = AutoShardAndGatherFunctions.from_pretrained(
 				pretrained_model_name_or_path=pretrained_model_name_or_path,
 				partition_rules=partition_rules,
@@ -709,7 +710,8 @@ class EasyBridgeMixin(PushToHubMixin):
 		logger.debug("merging model and parameters pytree.")
 		model = merge_model_and_tree(model=model, tree=params)
 		logger.debug("model and parameters pytree merged.")
-
+		if auto_shard_model:
+			model = model.fully_shard()
 		if (
 			quantization_method is not None
 			and quantization_method != EasyDeLQuantizationMethods.NONE
