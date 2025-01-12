@@ -497,6 +497,8 @@ class RotaryEmbedding(nn.Module):
 					rotary_dim=self.rotary_dim,
 					max_position_embeddings=self.max_position_embeddings,
 				)
+			if hasattr(frequencies, "value"):
+				frequencies = frequencies.value
 			return apply_basic_rope(
 				query=query,
 				key=key,
@@ -549,6 +551,8 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
 					max_position_embeddings=self.max_position_embeddings,
 					scaling_factors=self.scaling_factors,
 				)
+			if hasattr(frequencies, "value"):
+				frequencies = frequencies.value
 			return apply_basic_rope(
 				query=query,
 				key=key,
@@ -603,6 +607,8 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
 					max_position_embeddings=self.max_position_embeddings,
 					scaling_factor=self.scaling_factor,
 				)
+			if hasattr(frequencies, "value"):
+				frequencies = frequencies.value
 			return apply_basic_rope(
 				query=query,
 				key=key,
@@ -673,6 +679,8 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
 					extrapolation_factor=self.extrapolation_factor,
 					attn_factor=self.attn_factor,
 				)
+			if hasattr(frequencies, "value"):
+				frequencies = frequencies.value
 			return apply_basic_rope(
 				query=query,
 				key=key,
@@ -732,6 +740,8 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
 					short_factor=self.short_factor,
 					long_factor=self.long_factor,
 				)
+			if hasattr(frequencies, "value"):
+				frequencies = frequencies.value
 			return apply_phi3_rope(
 				query=query,
 				key=key,
@@ -791,6 +801,8 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
 					scaling_factor=self.scaling_factor,
 					max_position_embeddings=self.orig_max_position,
 				)
+			if hasattr(frequencies, "value"):
+				frequencies = frequencies.value
 
 			return apply_basic_rope(
 				query=query,
