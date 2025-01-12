@@ -55,7 +55,9 @@ def main():
 	)
 
 	print("MODEL LOADED")
-	model = model.apply_lora_to_layers(32, ".*(q_proj|k_proj).*")
+
+	if os.environ.get("APPED_LORA_TEST", "false") in ["true", "yes"]:
+		model = model.apply_lora_to_layers(32, ".*(q_proj|k_proj).*")
 	print("CREATING vInference")
 
 	inference = ed.vInference(
