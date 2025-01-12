@@ -329,7 +329,7 @@ def create_sampling_step(
 			model_outputs, state.model_kwargs
 		)
 
-		return SampleState(
+		return state.replace(
 			current_length=state.current_length + 1,
 			sequences=next_sequences,
 			running_token=next_token,

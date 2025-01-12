@@ -16,7 +16,7 @@
 import gc
 import threading
 import time
-from dataclasses import dataclass
+from chex import dataclass
 
 import jax
 import psutil

@@ -21,8 +21,8 @@ PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
 def main():
 	sharding_axis_dims = (1, 1, 1, -1)
-	max_length = 8192
-	pretrained_model_name_or_path = "Qwen/Qwen2.5-7B-Instruct"
+	max_length = 4096
+	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
 	partition_axis = ed.PartitionAxis()
 	dtype = jnp.bfloat16
 	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
@@ -48,6 +48,8 @@ def main():
 
 	model.eval()
 	tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
+	if tokenizer.pad_token_id is None:
+		tokenizer.pad_token_id = tokenizer.eos_token_id
 	tokenizer.padding_side = "left"
 
 	inference = ed.vInference(
