@@ -507,29 +507,29 @@ class vInference:
 				)
 			)
 			logger.debug("smart compiling `first_iter_fn`")
-			compiled_generate_func = smart_compile(
-				causal_lm_first_iter_fn.lower(
-					graphdef=self.graphdef,
+			logger.debug("lowering `first_iter_fn`")
+			first_iter_fn_lowered = causal_lm_first_iter_fn.lower(
+				graphdef=self.graphdef,
+				graphstate=self.graphstate,
+				state=state,
+				generation_config=self.generation_config,
+			)
+			logger.debug("`first_iter_fn` lowered sucessfully.")
+			compiled_generate_func = smart_compile(first_iter_fn_lowered, tag="vinference")
+			logger.debug("smart compiling `iter_fn`")
+			logger.debug("lowering `iter_fn`")
+			iter_fn_lowered = causal_lm_iter_fn.lower(
+				graphdef=self.graphdef,
+				graphstate=self.graphstate,
+				state=compiled_generate_func(
 					graphstate=self.graphstate,
 					state=state,
-					generation_config=self.generation_config,
 				),
-				tag="vinference",
+				generation_config=self.generation_config,
+				loop_max_tokens=self.generation_config.streaming_chunks,
 			)
-			logger.debug("smart compiling `iter_fn`")
-			compiled_interval_func = smart_compile(
-				causal_lm_iter_fn.lower(
-					graphdef=self.graphdef,
-					graphstate=self.graphstate,
-					state=compiled_generate_func(
-						graphstate=self.graphstate,
-						state=state,
-					),
-					generation_config=self.generation_config,
-					loop_max_tokens=self.generation_config.streaming_chunks,
-				),
-				tag="vinference",
-			)
+			logger.debug("`iter_fn` lowered sucessfully.")
+			compiled_interval_func = smart_compile(iter_fn_lowered, tag="vinference")
 
 			del state
 			logger.debug("saving compiled functions...")
