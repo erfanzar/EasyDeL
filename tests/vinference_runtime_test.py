@@ -33,8 +33,19 @@ def main():
 		param_dtype = jnp.float8_e5m2
 		if os.environ.get("APPED_LORA_TEST", "false") in ["true", "yes"]:
 			param_dtype = jnp.bfloat16
+		attn_kwargs = dict(
+			attn_dtype=jnp.float16,
+			attn_mechanism=ed.AttentionMechanisms.VANILLA,
+		)
+
 	else:
 		param_dtype = jnp.bfloat16
+		attn_kwargs = dict(
+			attn_dtype=jnp.float32,
+			attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
+			blocksize_q=512,
+			blocksize_k=512,
+		)
 
 	partition_axis = ed.PartitionAxis()
 	tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
@@ -49,10 +60,8 @@ def main():
 		config_kwargs=ed.EasyDeLBaseConfigDict(
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
-			attn_dtype=dtype,
-			attn_mechanism=ed.AttentionMechanisms.VANILLA,
+			**attn_kwargs,
 		),
-		platform=ed.EasyDeLPlatforms.JAX,
 		param_dtype=param_dtype,
 		dtype=dtype,
 		partition_axis=partition_axis,

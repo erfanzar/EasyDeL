@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+from functools import partial
 import os
 import typing as tp
 from dataclasses import dataclass
@@ -294,31 +295,35 @@ class FlashAttention:
 				)
 
 		key, value = self.repeat_kv_heads(key, value, query.shape[2] // key.shape[2])
+		query_lenght = query.shape[1]
+		value_lenght = value.shape[1]
 		if bias is not None:
 			if bias.shape[1] != value.shape[2]:
 				bias = jnp.repeat(bias, value.shape[2] // bias.shape[1], 1)
 		# TPU implementation
 		block_sizes = TPUBlockSizes(
-			block_q=self.config.blocksize_q,
-			block_k_major=self.config.blocksize_k,
-			block_k=self.config.blocksize_k,
+			block_q=min(self.config.blocksize_q, query_lenght),
+			block_k_major=min(self.config.blocksize_k, value_lenght),
+			block_k=min(self.config.blocksize_k, value_lenght),
 			block_b=1,
-			block_q_major_dkv=self.config.blocksize_q,
-			block_k_major_dkv=self.config.blocksize_k,
-			block_k_dkv=self.config.blocksize_k,
-			block_q_dkv=self.config.blocksize_q,
-			block_k_major_dq=self.config.blocksize_k,
-			block_k_dq=self.config.blocksize_k,
-			block_q_dq=self.config.blocksize_q,
+			block_q_major_dkv=min(self.config.blocksize_q, query_lenght),
+			block_k_major_dkv=min(self.config.blocksize_k, value_lenght),
+			block_k_dkv=min(self.config.blocksize_k, value_lenght),
+			block_q_dkv=min(self.config.blocksize_q, query_lenght),
+			block_k_major_dq=min(self.config.blocksize_k, value_lenght),
+			block_k_dq=min(self.config.blocksize_k, value_lenght),
+			block_q_dq=min(self.config.blocksize_q, query_lenght),
 		)
 
-		return pallas_flash_attention_tpu(
-			q=query.transpose(0, 2, 1, 3),
-			k=key.transpose(0, 2, 1, 3),
-			v=value.transpose(0, 2, 1, 3),
-			ab=bias,
+		return partial(
+			pallas_flash_attention_tpu,
 			sm_scale=self.config.softmax_scale,
 			block_sizes=block_sizes,
+		)(
+			query.transpose(0, 2, 1, 3),
+			key.transpose(0, 2, 1, 3),
+			value.transpose(0, 2, 1, 3),
+			bias,
 		).transpose(0, 2, 1, 3)
 
 	def _compute_jax(
