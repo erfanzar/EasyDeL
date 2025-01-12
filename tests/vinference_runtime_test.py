@@ -1,14 +1,14 @@
 import os
 import sys
 
-import transformers
+os.environ["LOGGING_LEVEL_ED"] = "DEBUG"
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+import easydel as ed
+import transformers
 import jax
 from jax import numpy as jnp
-
-import easydel as ed
 
 
 def main():
