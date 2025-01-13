@@ -196,10 +196,11 @@ def match_partition_rules(
 			if re.search(rule, name) is not None:
 				if len(ps) > leaf.ndim:
 					ps = PartitionSpec(*tuple(ps[: leaf.ndim]))
-					warnings.warn(
-						f"PartitionSpec Related to {name} went out of range (will be auto trimed to {ps}).",
-						stacklevel=1,
-					)
+					if jax.process_index() == 0:
+						warnings.warn(
+							f"PartitionSpec Related to {name} went out of range (will be auto trimed to {ps}).",
+							stacklevel=1,
+						)
 				return ps
 		raise ValueError(f"Partition rule not found for param: {name}")
 
