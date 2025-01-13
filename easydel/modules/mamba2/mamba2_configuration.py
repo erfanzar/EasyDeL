@@ -165,14 +165,14 @@ class Mamba2Config(EasyDeLBaseConfig):
 			("backbone/embeddings/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
 			# Language model head
 			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("lm_head/bias", PartitionSpec(None)),
+			("lm_head/bias", PartitionSpec("tp")),
 			# Mixer layers
 			("mixer/in_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mixer/in_proj/bias", PartitionSpec(None)),
+			("mixer/in_proj/bias", PartitionSpec("tp")),
 			("mixer/out_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("mixer/out_proj/bias", PartitionSpec(None)),
+			("mixer/out_proj/bias", PartitionSpec(("fsdp", "sp"))),
 			# Conv1d in mixer (3D kernel)
-			("mixer/conv1d/kernel", PartitionSpec("tp", None, None)),
+			("mixer/conv1d/kernel", PartitionSpec(None, None, "tp")),
 			("mixer/conv1d/bias", PartitionSpec("tp")),
 			# State space parameters
 			("mixer/A_log", PartitionSpec(None)),
