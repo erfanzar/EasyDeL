@@ -24,21 +24,23 @@ def main():
 	# else:
 	# 	pretrained_model_name_or_path = "Qwen/Qwen2.5-7B-Instruct"
 
-	dtype = jnp.bfloat16
 	extra = {}
 	if jax.default_backend() == "gpu":
 		import torch
 
 		extra = {"torch_dtype": torch.float16}
+
+		dtype = jnp.float16
 		param_dtype = jnp.float8_e5m2
 		if os.environ.get("APPED_LORA_TEST", "false") in ["true", "yes"]:
-			param_dtype = jnp.bfloat16
+			param_dtype = jnp.float16
 		attn_kwargs = dict(
 			attn_dtype=jnp.float16,
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		)
 
 	else:
+		dtype = jnp.bfloat16
 		param_dtype = jnp.bfloat16
 		attn_kwargs = dict(
 			attn_dtype=jnp.float32,

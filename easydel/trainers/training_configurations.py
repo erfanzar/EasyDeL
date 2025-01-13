@@ -149,10 +149,7 @@ class TrainingArguments:
 		assert (
 			self.gradient_accumulation_steps > 0
 		), "`gradient_accumulation_steps` can't be lower than 1."
-		if self.total_batch_size % self.gradient_accumulation_steps != 0:
-			raise ValueError(
-				"Number of `total_batch_size` should be even with `gradient_accumulation_steps`"
-			)
+
 		if self.backend not in AVAILABLE_BACKENDS:
 			raise ValueError(
 				f"Backend {self.backend} is not recognized. Available backends: {AVAILABLE_BACKENDS}"
