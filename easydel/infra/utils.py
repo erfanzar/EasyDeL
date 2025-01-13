@@ -790,6 +790,12 @@ def count_flop_jaxpr(jaxpr: Jaxpr) -> int:
 		# Remainder typically involves division and multiplication
 		return 2 * compute_binary_op_flops(eqn)
 
+	def compute_square_flops(eqn) -> int:
+		"""Compute FLOPs for square operation (x * x)."""
+		# Square is a single multiplication of a number by itself
+		shape = eqn.invars[0].aval.shape
+		return get_shape_size(shape)
+
 	# Dictionary mapping primitives to their FLOP counting functions
 	primitive_flops: tp.Dict[str, tp.Callable] = {
 		# Binary operations
@@ -853,7 +859,10 @@ def count_flop_jaxpr(jaxpr: Jaxpr) -> int:
 		"stop_gradient": lambda eqn: 0,  # Just passes through the value
 		"squeeze": lambda eqn: 0,  # Reshapes data, no computation
 		"copy": lambda eqn: 0,  # Memory operation only
+		"split": lambda eqn: 0,
+		"remat2": lambda eqn: 0,
 		# Computation operations
+		"square": compute_square_flops,
 		"sqrt": compute_sqrt_flops,
 		"argmax": compute_argmax_flops,
 		"add_any": compute_binary_op_flops,  # Similar to regular add
