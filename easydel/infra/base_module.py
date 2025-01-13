@@ -27,8 +27,7 @@ import jax.tree_util
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
-
-from jax.sharding import Mesh, PartitionSpec, NamedSharding
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from easydel.escale import make_shard_and_gather_fns, match_partition_rules
 from easydel.utils.helpers import get_logger
@@ -620,6 +619,12 @@ class EasyDeLBaseModule(
 				raise KeyError(f"Parameter key {key} not found in the current model state.")
 		self = self.merge_params(unflatten_dict(current_state))
 		return self
+
+	def _flop(self, *args, **kwargs) -> tp.Optional[float]:
+		"""Calculates the FLOP (Floating Point Operations) from JaxPr"""
+		from .utils import count_flop_jaxpr
+
+		return count_flop_jaxpr(jax.make_jaxpr(self.__call__)(*args, **kwargs))
 
 	@property
 	def pure_transform_fn(self):

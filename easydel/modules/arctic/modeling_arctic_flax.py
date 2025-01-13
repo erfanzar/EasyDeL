@@ -15,7 +15,7 @@
 
 import math
 import typing as tp
-from functools import cached_property, partial
+from functools import partial
 
 import chex
 import jax

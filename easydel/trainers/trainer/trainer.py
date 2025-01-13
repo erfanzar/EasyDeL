@@ -202,7 +202,7 @@ class Trainer(BaseTrainer):
 		epoch: int,
 	):
 		"""Handles training for a single epoch."""
-		train_iter = iter(train_dataset) 
+		train_iter = iter(train_dataset)
 		for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
 			current_step = int(jax.device_get(state.step))
 			try:  # to make training loop safer if user wants to break that.
@@ -346,11 +346,15 @@ class Trainer(BaseTrainer):
 
 	def _finalize_training(self, output, run_exception):
 		"""Finalize training and prepare output."""
-
-		if self.arguments.do_eval:
-			for _ in self.eval(output.state):
-				...
-
+		try:
+			if self.arguments.do_eval:
+				for _ in self.eval(output.state):
+					...
+		except RuntimeError:
+			logger.info(
+				"Catched RunTimeError from eval function "
+				"(mostly due to `StopIteration` being called manually)"
+			)
 		self.finish()
 
 		return output

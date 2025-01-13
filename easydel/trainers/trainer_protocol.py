@@ -117,7 +117,13 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 	model_state: EasyDeLState
 
 	sharded_training_step_function: JitWrapped
+	sharded_training_step_function_flops: tp.Optional[
+		tp.Union[tp.Tuple[float, bool], float]
+	]
 	sharded_evaluation_step_function: JitWrapped
+	sharded_evaluation_step_function_flops: tp.Optional[
+		tp.Union[tp.Tuple[float, bool], float]
+	]
 
 	mesh: tp.Any
 	checkpoint_manager: tp.Any
@@ -567,7 +573,7 @@ class StepMetrics:
 		metrics: LossMetrics,
 		current_step: int,
 		epoch: int,
-		flops: float,
+		flops: tp.Union[tp.Tuple[float, bool], float],
 		batch_size,
 		seq_length,
 		learning_rate,
@@ -578,9 +584,14 @@ class StepMetrics:
 		step_time = time.time() - self.step_start_time
 		total_time = time.time() - self.start_time
 
-		visited_tokens = seq_length * current_step * batch_size
+		if isinstance(flops, tuple):
+			assert len(flops) == 2
+			flops = flops[0] / step_time
 
-		flops_per_step = flops / step_time
+		visited_tokens = seq_length * (current_step + 1) * batch_size
+		flops_per_token = flops / visited_tokens
+		flops_per_sequence = flops / ((current_step + 1) * batch_size)
+
 		loss = metrics.loss
 		z_loss = metrics.z_loss
 		basic_metrics = {
@@ -592,7 +603,9 @@ class StepMetrics:
 			"perplexity": float(jnp.exp(loss)),
 			"visited_tokens": visited_tokens,
 			"epoch": epoch,
-			"TFLOPs": flops_per_step,
+			"flops": flops,
+			"flops_per_token": flops_per_token,
+			"flops_per_sequence": flops_per_sequence,
 			"total_time": total_time,
 			**extras,
 		}
