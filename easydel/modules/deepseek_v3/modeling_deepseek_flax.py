@@ -29,7 +29,6 @@ from easydel.infra.utils import (
 	ACT2FN,
 	ModuleCaches,
 	auto_remat,
-	block_wise_ffn,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 )

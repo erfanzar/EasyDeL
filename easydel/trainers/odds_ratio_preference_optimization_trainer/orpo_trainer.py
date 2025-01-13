@@ -616,7 +616,11 @@ class ORPOTrainer(Trainer):
 		eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
 		return self._get_eval_dataloader(eval_dataset=eval_dataset)
 
-	def _execute_eval_step(self, state: EasyDeLState, batch) -> LossMetrics:
+	def _execute_eval_step(
+		self,
+		state: EasyDeLState,
+		batch,
+	) -> LossMetrics:
 		"""Execute a single eval step."""
 		batch = {key: jnp.asarray(value) for key, value in batch.items()}
 
@@ -624,7 +628,9 @@ class ORPOTrainer(Trainer):
 		return metrics
 
 	def _execute_train_step(
-		self, state: EasyDeLState, batch
+		self,
+		state: EasyDeLState,
+		batch,
 	) -> tp.Tuple[EasyDeLState, LossMetrics, Exception]:
 		"""Execute a single training step."""
 

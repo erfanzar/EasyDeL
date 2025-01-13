@@ -775,6 +775,11 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 			EasyDeLBaseModule: The model with merged parameters.
 		"""
 
+	@abstractmethod
+	def _flop(self, *args, **kwargs) -> tp.Optional[float]:
+		"""Calculates the FLOP (Floating Point Operations) from JaxPr."""
+		...
+
 	def __repr__(self):
 		try:
 			return "EasyDeL-" + prettify_nnx(self)

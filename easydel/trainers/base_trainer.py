@@ -151,6 +151,16 @@ class BaseTrainer(BaseTrainerProtocol):
 			"sharded_evaluation_step_function",
 			None,
 		)
+		self.sharded_training_step_function_flops = getattr(
+			self,
+			"sharded_training_step_function_flops",
+			None,
+		)
+		self.sharded_evaluation_step_function_flops = getattr(
+			self,
+			"sharded_evaluation_step_function_flops",
+			None,
+		)
 
 	def _initialize_memory_tracking(self):
 		if not self.arguments.performance_mode:
@@ -166,14 +176,17 @@ class BaseTrainer(BaseTrainerProtocol):
 		if wandb is not None:
 			wandb.finish()
 
-	def get_runstage_flops(self, is_training):
+	def get_runstage_flops(self, is_training) -> tp.Union[float, tp.Tuple[float, bool]]:
 		try:
 			if is_training:
 				flops = self.sharded_training_step_function.cost_analysis()[0]["flops"]
 			else:
 				flops = self.sharded_evaluation_step_function.cost_analysis()[0]["flops"]
 		except Exception:
-			flops = 1
+			if is_training:
+				flops = self.sharded_training_step_function_flops
+			else:
+				flops = self.sharded_evaluation_step_function_flops
 		return flops
 
 	def _ensure_functions_compiled(self):
@@ -765,12 +778,47 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 		return metrics
 
 	def start_training_hook(self):
-		self._ensure_functions_compiled()
+		self.get_runstage_flops(True)
+		self._setup_static_metrics()
 		self._training_time_start = time.time()
 
 	def start_evaluation_hook(self):
-		self._ensure_functions_compiled()
+		self.get_runstage_flops(False)
+		self._setup_static_metrics()
 		self._evaluation_time_start = time.time()
+
+	def _setup_static_metrics(self):
+		from easydel.infra.utils import count_flop_jaxpr
+
+		try:
+			if self.sharded_training_step_function_flops is None:
+				self.sharded_training_step_function_flops = (
+					count_flop_jaxpr(
+						self.sharded_training_step_function.trace(
+							self.model_state,
+							next(iter(self.dataloader_train)),
+						).jaxpr
+					),
+					True,
+				)
+			if (
+				self.dataloader_eval is not None
+				and self.sharded_evaluation_step_function_flops is None
+			):
+				self.sharded_evaluation_step_function_flops = (
+					count_flop_jaxpr(
+						self.sharded_evaluation_step_function.trace(
+							self.model_state,
+							next(iter(self.dataloader_eval)),
+						).jaxpr
+					),
+					True,
+				)
+		except Exception as e:
+			logger.error(
+				"Error in `_setup_static_metrics`: %s. If you are tweaking the function, you must override it.",
+				str(e),
+			)
 
 	def compile_aot(self) -> bool:
 		compiled = False
