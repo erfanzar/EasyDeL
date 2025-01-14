@@ -285,6 +285,7 @@ class EasyDeLState(struct.PyTreeNode):
 		verbose: bool = True,
 		mismatch_allowed: bool = True,
 		save_optimizer: bool = True,
+		enable: bool = True,
 	):
 		save_directory = pathlib.Path(save_directory)
 		self.model.save_pretrained(
@@ -293,6 +294,7 @@ class EasyDeLState(struct.PyTreeNode):
 			float_dtype=float_dtype,
 			mismatch_allowed=mismatch_allowed,
 			verbose=verbose,
+			enable=enable,
 		)
 		# Fix this
 		# if save_optimizer:

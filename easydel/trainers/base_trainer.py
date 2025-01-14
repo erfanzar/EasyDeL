@@ -514,6 +514,7 @@ class BaseTrainer(BaseTrainerProtocol):
 	def _save_state(self, state: EasyDeLState, *args, **kwargs) -> str:
 		step = self._get_current_step(state)
 		self._manage_checkpoint_limit(self.arguments._get_save_directory())
+
 		directory_name = self.arguments._get_save_directory_milestone(
 			step=step,
 			create=True,
@@ -523,9 +524,10 @@ class BaseTrainer(BaseTrainerProtocol):
 
 		state.save_state(
 			save_directory=directory_name,
-			float_dtype=self.model.dtype,
+			float_dtype=self.model.param_dtype,
 			verbose=self.arguments.verbose,
 			save_optimizer=self.arguments.save_optimizer_state,
+			enable=self.arguments.process_zero_is_admin and jax.process_index() == 0,
 		)
 
 		self._save_readme(directory_name)
@@ -841,8 +843,6 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 		if self.arguments.save_steps is None or current_step <= 0:
 			return False
 		if current_step % self.arguments.save_steps == 0:
-			if self.arguments.process_zero_is_admin:
-				return jax.jax.process_index() == 0
 			return True
 		return False
 

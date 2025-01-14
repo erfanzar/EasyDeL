@@ -101,6 +101,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		float_dtype=None,
 		verbose: bool = True,
 		mismatch_allowed: bool = True,
+		enable: bool = True,
 	):
 		"""Saves the model's configuration, weights, and potentially the generation config to the specified directory.
 
@@ -110,7 +111,9 @@ class EasyBridgeMixin(PushToHubMixin):
 		  float_dtype (dtype, optional): Data type for saving weights. Defaults to None.
 		  verbose (bool, optional): Whether to print verbose messages. Defaults to True.
 		  mismatch_allowed (bool, optional): If True allows mismatch in parameters. Defaults to True.
+			enable (bool): if True, allows file to be saved (used for multi-host saving models).
 		"""
+
 		save_directory.mkdir(parents=True, exist_ok=True)
 
 		config_to_save = deepcopy(self.config)
@@ -125,13 +128,14 @@ class EasyBridgeMixin(PushToHubMixin):
 		state = nn.split(self, nn.Param, ...)[1]
 		if gather_fns is None:
 			gather_fns = self._gather_fns
-		CheckpointManager.save_checkpoint(
+		output_model_file = CheckpointManager.save_checkpoint(
 			state=state.to_pure_dict(),
 			path=str(output_model_file),
 			gather_fns=gather_fns,
 			mismatch_allowed=mismatch_allowed,
 			float_dtype=float_dtype,
 			verbose=verbose,
+			enable=enable,
 		)
 
 		logger.info(f"Model weights saved in {output_model_file}")
@@ -145,6 +149,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		float_dtype=None,
 		verbose: bool = True,
 		mismatch_allowed: bool = True,
+		enable: bool = True,
 		**kwargs,
 	):
 		"""Saves the model, its configuration, and optionally pushes it to the Hugging Face Hub.
@@ -157,8 +162,10 @@ class EasyBridgeMixin(PushToHubMixin):
 		    float_dtype (dtype, optional): Data type for saving weights.
 		    verbose (bool, optional): Whether to print verbose messages. Defaults to True.
 		    mismatch_allowed (bool, optional): If True, allows mismatch in parameters while loading. Defaults to True.
+				enable (bool): if True, allows file to be saved (used for multi-host saving models).
 		    **kwargs: Additional keyword arguments for Hugging Face Hub.
 		"""
+
 		save_directory = Path(save_directory)
 
 		if save_directory.is_file():
@@ -179,13 +186,14 @@ class EasyBridgeMixin(PushToHubMixin):
 			float_dtype=float_dtype,
 			verbose=verbose,
 			mismatch_allowed=mismatch_allowed,
+			enable=enable,
 		)
 
 		readme_path = save_directory / "README.md"
-		if not readme_path.exists():
+		if not readme_path.exists() and enable:
 			readme_path.write_text(self._model_card(repo_id, repo_id))
 
-		if push_to_hub:
+		if push_to_hub and enable:
 			self._upload_modified_files(
 				str(save_directory),
 				repo_id,

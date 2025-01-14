@@ -209,7 +209,8 @@ class CheckpointManager:
 		verbose: bool = True,
 		mismatch_allowed: bool = True,
 		metadata: tp.Optional[dict[str, str]] = None,
-	):
+		enable: bool = True,
+	) -> tp.Union[str, os.PathLike]:
 		"""
 		Save a checkpoint to the given path using SafeTensors.
 
@@ -221,7 +222,12 @@ class CheckpointManager:
 			verbose: Whether to print verbose output.
 			mismatch_allowed: Whether to allow mismatches between the state dictionary and gather functions.
 			metadata: Additional metadata to store in the checkpoint.
+			enable: whenever checkpointer is enable to save file or not.
+		Returns:
+			path where data is saved to.
 		"""
+		if not enable:
+			path = "/dev/null"
 		state = to_state_dict(state)
 		gather_mismatch_count = 0
 
@@ -259,6 +265,7 @@ class CheckpointManager:
 		}
 
 		safetensors.flax.save_file(tensors=state, filename=path, metadata=metadata)
+		return path
 
 	@staticmethod
 	def save_state_to_file(
