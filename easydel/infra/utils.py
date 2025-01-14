@@ -796,6 +796,30 @@ def count_flop_jaxpr(jaxpr: Jaxpr) -> int:
 		shape = eqn.invars[0].aval.shape
 		return get_shape_size(shape)
 
+	def compute_triangular_solve_flops(eqn) -> int:
+		"""Compute FLOPs for triangular solve operation."""
+		# For a triangular solve with a matrix of size n x n,
+		# each row/column requires n^2/2 multiply-adds
+		matrix_shape = eqn.invars[0].aval.shape
+		n = matrix_shape[-1]  # Size of the last dimension
+		batch_dims = matrix_shape[:-2]
+		batch_size = np.prod(batch_dims) if batch_dims else 1
+		return batch_size * n * (n + 1) * (2 * n + 1) // 6
+
+	def compute_erf_inv_flops(eqn) -> int:
+		"""Compute FLOPs for inverse error function."""
+		# erf_inv is computationally expensive, typically implemented
+		# as a series expansion or numerical approximation
+		return 15 * compute_unary_op_flops(eqn)
+
+	def compute_or_flops(eqn) -> int:
+		"""Compute FLOPs for logical or operation."""
+		return compute_binary_op_flops(eqn)
+
+	def compute_shift_right_logical_flops(eqn) -> int:
+		"""Compute FLOPs for logical right shift."""
+		return compute_binary_op_flops(eqn)
+
 	# Dictionary mapping primitives to their FLOP counting functions
 	primitive_flops: tp.Dict[str, tp.Callable] = {
 		# Binary operations
@@ -861,6 +885,19 @@ def count_flop_jaxpr(jaxpr: Jaxpr) -> int:
 		"copy": lambda eqn: 0,  # Memory operation only
 		"split": lambda eqn: 0,
 		"remat2": lambda eqn: 0,
+		"random_seed": lambda eqn: 0,
+		"random_unwrap": lambda eqn: 0,
+		"random_wrap": lambda eqn: 0,
+		"random_split": lambda eqn: 0,
+		"random_bits": lambda eqn: 0,
+		# Bitwise and type conversion operations
+		"shift_right_logical": compute_shift_right_logical_flops,
+		"or": compute_or_flops,
+		"bitcast_convert_type": lambda eqn: 0,  # Type conversion, no computation
+		# Mathematical operations
+		"abs": compute_unary_op_flops,  # Single comparison/selection per element
+		"erf_inv": compute_erf_inv_flops,  # Inverse error function
+		"triangular_solve": compute_triangular_solve_flops,
 		# Computation operations
 		"square": compute_square_flops,
 		"sqrt": compute_sqrt_flops,
