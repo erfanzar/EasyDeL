@@ -669,7 +669,6 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 			tp.Any | tp.Mapping[str, tp.Callable] | dict[tp.Callable]
 		] = None,
 		to_torch: bool = False,
-		base_hf_auto_class=None,
 		easystate_to_huggingface_model_kwargs: tp.Optional[dict] = None,
 		torch_save_pretrained_kwargs: tp.Optional[dict] = None,
 	):
@@ -677,49 +676,30 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 			self.arguments.save_directory, self.arguments.model_name
 		)
 
-		if base_hf_auto_class is None:
-			from transformers import AutoModelForCausalLM as base_hf_auto_class
 		if to_torch:
 			return self._save_to_torch(
-				state,
-				save_directory,
-				base_hf_auto_class,
-				easystate_to_huggingface_model_kwargs,
-				torch_save_pretrained_kwargs,
+				state=state,
+				save_directory=save_directory,
+				easystate_to_huggingface_model_kwargs=easystate_to_huggingface_model_kwargs,
+				torch_save_pretrained_kwargs=torch_save_pretrained_kwargs,
 			)
 		else:
 			return self._save_state(
-				state=state, gather_fns=gather_fns, save_directory=save_directory
+				state=state,
+				gather_fns=gather_fns,
+				save_directory=save_directory,
 			)
 
 	def _save_to_torch(
 		self,
-		state,
-		save_directory,
-		base_hf_auto_class,
-		easystate_to_huggingface_model_kwargs,
-		torch_save_pretrained_kwargs,
+		state: EasyDeLState,
+		save_directory: tp.Union[str, os.PathLike],
+		easystate_to_huggingface_model_kwargs: tp.Optional[dict] = None,
+		torch_save_pretrained_kwargs: tp.Optional[dict] = None,
 	):
-		from easydel.utils.parameters_transformation import (
-			easystate_to_huggingface_model,
-		)
-
 		easystate_to_huggingface_model_kwargs = easystate_to_huggingface_model_kwargs or {}
 		torch_save_pretrained_kwargs = torch_save_pretrained_kwargs or {}
-
-		model_config = state.module_config or state.module.config_class
-		model_type = model_config.model_type
-		model_class = base_hf_auto_class._model_mapping[type(model_config)]
-
-		hf_model_config = self._create_hf_model_config(state, model_config, model_type)
-
-		hf_model = easystate_to_huggingface_model(
-			state=state,
-			base_huggingface_module=model_class,
-			config=hf_model_config,
-			**easystate_to_huggingface_model_kwargs,
-		)
-
+		hf_model = state.model.to_torch(**easystate_to_huggingface_model_kwargs)
 		self._save_readme(save_directory)
 		hf_model.save_pretrained(save_directory, **torch_save_pretrained_kwargs)
 		return hf_model

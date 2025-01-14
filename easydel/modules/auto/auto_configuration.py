@@ -61,8 +61,7 @@ def get_modules_by_type(
 		functools.partial(
 			torch_dict_to_easydel_params,
 			embedding_layer_names=registred_module.embedding_layer_names,
-			layernorm_names=registred_module.layernorm_names,
-			rnn_based_or_rwkv=registred_module.rnn_based_or_rwkv,
+			layernorm_names=registred_module.layernorm_names, 
 		),
 	)
 

@@ -564,11 +564,16 @@ def extract_static_parameters(module):
 	return None
 
 
+M = tp.TypeVar("M")
+
+
 def auto_remat(
-	*modules,
-	policy: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
+	*modules: tp.Type[M],
+	policy: tp.Union[
+		EasyDeLGradientCheckPointers, str
+	] = EasyDeLGradientCheckPointers.NONE,
 	prevent_cse: bool = True,
-):
+) -> tp.Tuple[tp.Type[M], ...]:
 	if policy == EasyDeLGradientCheckPointers.NONE:
 		return modules
 	if isinstance(policy, str):
