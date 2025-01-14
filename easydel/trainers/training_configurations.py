@@ -98,6 +98,7 @@ class TrainingArguments:
 	optimizer: AVAILABLE_OPTIMIZERS = EasyDeLOptimizers.ADAMW
 	performance_mode: bool = False
 	pruning_module: AVAILABLE_PRUNING_TYPE = None
+	process_zero_is_admin: bool = True
 	remove_ckpt_after_load: bool = False
 	remove_unused_columns: bool = True
 	save_directory: str = "EasyDeL-Checkpoints"

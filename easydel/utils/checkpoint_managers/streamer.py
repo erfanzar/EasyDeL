@@ -17,6 +17,8 @@ import typing as tp
 from functools import partial
 
 import jax
+import jax.experimental
+import jax.experimental.multihost_utils
 import jax.numpy as jnp
 import msgpack
 import safetensors
@@ -262,6 +264,8 @@ class CheckpointManager:
 			for key, value in state.items()
 			if value is not None
 		}
+		if jax.process_count() > 1:
+			state = jax.experimental.multihost_utils.process_allgather(state)
 
 		safetensors.flax.save_file(tensors=state, filename=path, metadata=metadata)
 

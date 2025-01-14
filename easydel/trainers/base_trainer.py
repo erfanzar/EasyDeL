@@ -295,12 +295,12 @@ class BaseTrainer(BaseTrainerProtocol):
 		based on the chosen `truncation_mode`.
 
 		Args:
-				max_sequence_length (int): The maximum allowed sequence length.
-				truncation_mode (typing.tp.Literal["keep_end", "keep_start"], optional):
-						The truncation mode. Defaults to "keep_end".
+		    max_sequence_length (int): The maximum allowed sequence length.
+		    truncation_mode (typing.tp.Literal["keep_end", "keep_start"], optional):
+		        The truncation mode. Defaults to "keep_end".
 
 		Returns:
-				tp.Callable: A function that takes a batch of data and returns a processed batch.
+		    tp.Callable: A function that takes a batch of data and returns a processed batch.
 		"""
 		raise NotImplementedError
 
@@ -310,12 +310,12 @@ class BaseTrainer(BaseTrainerProtocol):
 		Configures and JIT-compiles the training and evaluation step functions.
 
 		This method sets up the necessary functions for training and evaluation, including:
-				- Initialization of the model state.
-				- Sharding of the model parameters and optimizer state.
-				- JIT-compilation of the training and evaluation step functions.
+		    - Initialization of the model state.
+		    - Sharding of the model parameters and optimizer state.
+		    - JIT-compilation of the training and evaluation step functions.
 
 		Returns:
-				TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
+		    TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
 		"""
 		raise NotImplementedError
 
@@ -328,8 +328,8 @@ class BaseTrainer(BaseTrainerProtocol):
 		and evaluation steps based on the dataset sizes and training arguments.
 
 		Returns:
-				TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
-																				maximum number of training and evaluation steps.
+		    TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
+		                                    maximum number of training and evaluation steps.
 		"""
 
 		def create_tf_dataset(
@@ -340,11 +340,11 @@ class BaseTrainer(BaseTrainerProtocol):
 			Creates a TensorFlow dataset from a Hugging Face Dataset.
 
 			Args:
-					dataset (Dataset): The Hugging Face Dataset.
-					is_train (bool): Whether the dataset is for training.
+			    dataset (Dataset): The Hugging Face Dataset.
+			    is_train (bool): Whether the dataset is for training.
 
 			Returns:
-					tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
+			    tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
 			"""
 			try:
 				import tensorflow as tf
@@ -377,11 +377,11 @@ class BaseTrainer(BaseTrainerProtocol):
 			Creates a TensorFlow dataset from an iterable Hugging Face Dataset.
 
 			Args:
-					dataset (IterableDataset): The iterable Hugging Face Dataset.
-					is_train (bool): Whether the dataset is for training.
+			    dataset (IterableDataset): The iterable Hugging Face Dataset.
+			    is_train (bool): Whether the dataset is for training.
 
 			Returns:
-					tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
+			    tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
 			"""
 			try:
 				import tensorflow as tf
@@ -414,14 +414,14 @@ class BaseTrainer(BaseTrainerProtocol):
 			Calculates the number of training or evaluation steps based on dataset length and arguments.
 
 			Args:
-				dataset (tp.Union[Dataset, IterableDataset]): The dataset to calculate steps for.
-				is_train (bool): Whether the dataset is for training.
+			  dataset (tp.Union[Dataset, IterableDataset]): The dataset to calculate steps for.
+			  is_train (bool): Whether the dataset is for training.
 
 			Returns:
-				int: The number of steps.
+			  int: The number of steps.
 
 			Raises:
-				ValueError: If the dataset is a generator/streaming dataset and the number of steps is not specified.
+			  ValueError: If the dataset is a generator/streaming dataset and the number of steps is not specified.
 			"""
 			if hasattr(dataset, "__len__"):
 				total_data_len = len(dataset)
@@ -461,11 +461,11 @@ class BaseTrainer(BaseTrainerProtocol):
 			Converts a Hugging Face Dataset to a TensorFlow dataloader.
 
 			Args:
-					dataset (tp.Union[Dataset, IterableDataset]): The Hugging Face Dataset.
-					is_train (bool): Whether the dataset is for training.
+			    dataset (tp.Union[Dataset, IterableDataset]): The Hugging Face Dataset.
+			    is_train (bool): Whether the dataset is for training.
 
 			Returns:
-					tp.Iterator[np.ndarray]: The TensorFlow dataloader iterator.
+			    tp.Iterator[np.ndarray]: The TensorFlow dataloader iterator.
 			"""
 			if hasattr(dataset, "__len__"):
 				return create_tf_dataset(dataset, is_train)
@@ -498,7 +498,7 @@ class BaseTrainer(BaseTrainerProtocol):
 		object containing the configured model, optimizer, scheduler, and configuration.
 
 		Returns:
-				TrainerConfigureModelOutput: An object containing the configured model, optimizer, scheduler, and configuration.
+		    TrainerConfigureModelOutput: An object containing the configured model, optimizer, scheduler, and configuration.
 		"""
 
 		tx, scheduler = self.arguments.get_optimizer_and_scheduler(self.max_training_steps)
@@ -573,7 +573,7 @@ class BaseTrainer(BaseTrainerProtocol):
 		Generate formatted information about the model and training setup.
 
 		Returns:
-				str: Formatted markdown string containing model and training information
+		    str: Formatted markdown string containing model and training information
 		"""
 		device_info = self._get_device_info()
 		partition_rules = self._format_partition_rules()
@@ -646,7 +646,7 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 		Save the generated information to a markdown file.
 
 		Args:
-				output_path: Path where the markdown file should be saved
+		    output_path: Path where the markdown file should be saved
 		"""
 		try:
 			output_path = Path(output_path)
@@ -858,11 +858,13 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 
 	def _should_save_checkpoint(self, current_step):
 		"""Determine if checkpoint should be saved at current step."""
-		return (
-			self.arguments.save_steps is not None
-			and current_step > 0
-			and (current_step % self.arguments.save_steps) == 0
-		)
+		if self.arguments.save_steps is None or current_step <= 0:
+			return False
+		if current_step % self.arguments.save_steps == 0:
+			if self.arguments.process_zero_is_admin:
+				return jax.jax.process_index() == 0
+			return True
+		return False
 
 	def _should_run_evaluation(self, current_step):
 		"""Determine if evaluation process should be runned current step."""
