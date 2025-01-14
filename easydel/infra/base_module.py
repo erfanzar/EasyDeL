@@ -114,7 +114,7 @@ class EasyDeLBaseModule(
 		_ = self.model_type
 
 	@property
-	def parameters(self):
+	def parameters(self) -> tp.Dict:
 		from easydel.utils.graph_utils import iter_module_search
 
 		parameters = {}
@@ -482,6 +482,7 @@ class EasyDeLBaseModule(
 			module=self,
 			base_huggingface_module=model_class,
 			config=self.config,
+			dtype=self.param_dtype,
 			**kwargs,
 		)
 		return hf_model

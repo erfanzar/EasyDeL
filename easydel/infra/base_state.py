@@ -111,7 +111,7 @@ class EasyDeLState(struct.PyTreeNode):
 		# Validate mutual exclusivity of model and graph-related parameters
 		graph_params_provided = (
 			graphdef is not None or graphstate is not None or graphother is not None
-		) 
+		)
 		if model is not None and graph_params_provided:
 			raise ValueError(
 				"Cannot provide both a model and graph-related parameters. "
@@ -306,7 +306,9 @@ class EasyDeLState(struct.PyTreeNode):
 		# 	)
 
 	def load_state(
-		self, load_directory: tp.Union[str, os.PathLike], verbose: bool = True
+		self,
+		load_directory: tp.Union[str, os.PathLike],
+		verbose: bool = True,
 	): ...
 
 	def shard_with_shape(self, shape) -> EasyDeLState:

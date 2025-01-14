@@ -230,7 +230,7 @@ class CheckpointManager:
 
 		if gather_fns:
 			if not is_flatten(gather_fns):
-				gather_fns = flatten_dict(gather_fns)
+				gather_fns = flatten_dict(gather_fns, sep=".")
 
 			pbar_gather = tqdm(
 				list(state.keys()),
@@ -238,34 +238,25 @@ class CheckpointManager:
 				disable=not verbose,
 			)
 			for key in pbar_gather:
-				try:
-					callable_func = gather_fns.get(key)
-					if callable_func is None:
-						if not mismatch_allowed:
-							raise KeyError(
-								f"Gather Function {key} is None and NoneType OBJ is not callable."
-							)
-						gather_mismatch_count += 1
-					else:
-						state[key] = callable_func(state[key])
-
-				except KeyError as e:
+				callable_func = gather_fns.get(key, None)
+				if callable_func is None:
 					if not mismatch_allowed:
-						raise KeyError(e) from None
+						raise KeyError(f"Gather Function {key} missing.")
 					gather_mismatch_count += 1
+				else:
+					state[key] = callable_func(state[key])
+
 				pbar_gather.set_postfix(gather_mismatch=gather_mismatch_count)
 				pbar_gather.update(1)
 
 		state = {
 			key: get_dtype(
-				jnp.array(value) if not isinstance(value, jax.Array) else value,
+				jax.device_get(jnp.array(value)) if not isinstance(value, jax.Array) else value,
 				float_dtype,
 			)
 			for key, value in state.items()
 			if value is not None
 		}
-		if jax.process_count() > 1:
-			state = jax.experimental.multihost_utils.process_allgather(state)
 
 		safetensors.flax.save_file(tensors=state, filename=path, metadata=metadata)
 

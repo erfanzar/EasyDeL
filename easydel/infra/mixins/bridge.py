@@ -123,7 +123,8 @@ class EasyBridgeMixin(PushToHubMixin):
 
 		output_model_file = save_directory / FLAX_WEIGHTS_NAME
 		state = nn.split(self, nn.Param, ...)[1]
-
+		if gather_fns is None:
+			gather_fns = self._gather_fns
 		CheckpointManager.save_checkpoint(
 			state=state.to_pure_dict(),
 			path=str(output_model_file),
@@ -173,11 +174,11 @@ class EasyBridgeMixin(PushToHubMixin):
 			files_timestamps = self._get_files_timestamps(save_directory)
 
 		self._save_model_files(
-			save_directory,
-			gather_fns,
-			float_dtype,
-			verbose,
-			mismatch_allowed,
+			save_directory=save_directory,
+			gather_fns=gather_fns,
+			float_dtype=float_dtype,
+			verbose=verbose,
+			mismatch_allowed=mismatch_allowed,
 		)
 
 		readme_path = save_directory / "README.md"
