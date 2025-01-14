@@ -19,9 +19,11 @@ import typing as tp
 import warnings
 
 import jax
+import jax.extend
+import numpy as np
+import torch
 from jax import dlpack
 from jax import numpy as jnp
-import jax.extend
 from tqdm.autonotebook import tqdm
 
 from easydel.utils.helpers import get_logger
@@ -335,10 +337,11 @@ def module_to_huggingface_model(
 	state_dict = module_to_torch(module=module, dtype=dtype)
 	import torch
 
+	base_config = base_huggingface_module.config_class.from_dict(config.to_dict())
 	ctxm = torch.device("meta") if use_meta_torch else contextlib.nullcontext()
 	with ctxm:
 		model: torch.nn.Module = base_huggingface_module(
-			config=config,
+			config=base_config,
 			**base_huggingface_module_kwarguments,
 		)
 		key_shape_checks = {
@@ -356,30 +359,36 @@ def module_to_huggingface_model(
 
 
 def jax2pt(x: jax.Array):
-	from torch import cuda
-	from torch.utils import dlpack as dlpack_pt
-
-	platform = jax.extend.backend.get_backend()
-	cpu_force = not cuda.is_available()
-	if (
-		platform in ["cpu", "gpu"]
-		and not cpu_force
-		and not bool(os.environ.get("EASYDEL_FORCE_TORCH_USE_CPU", "false"))
-	):
-		dl_pack_jax = dlpack.to_dlpack(
-			x,
-			stream=True if (platform == "gpu" and not cpu_force) else None,
-			src_device=list(x.devices())[0],
-		)
+	if os.environ.get("EASY_SAFE_TRANSFER", "true") in ["true", "yes", "1", "on"]:
+		x = jax.device_get(x)
+		return torch.from_numpy(np.array(x.tolist(), dtype=x.dtype))
 	else:
-		dl_pack_jax = dlpack.to_dlpack(
-			jax.device_put(
-				jax.device_get(x),
-				jax.devices(EASYDEL_PERFRED_HOST_COPY)[EASYDEL_PERFRED_HOST_COPY_INDEX],
-			),
-			stream=None,
-		)
-	return dlpack_pt.from_dlpack(dl_pack_jax)
+		# This one causes a lot of funny bugs, where weights in state_dict are same (both in cpp and python)
+		#  but estimated correct elements are ~85%
+		from torch import cuda
+		from torch.utils import dlpack as dlpack_pt
+
+		platform = jax.extend.backend.get_backend()
+		cpu_force = not cuda.is_available()
+		if (
+			platform in ["cpu", "gpu"]
+			and not cpu_force
+			and not bool(os.environ.get("EASYDEL_FORCE_TORCH_USE_CPU", "false"))
+		):
+			dl_pack_jax = dlpack.to_dlpack(
+				x,
+				stream=True if (platform == "gpu" and not cpu_force) else None,
+				src_device=list(x.devices())[0],
+			)
+		else:
+			dl_pack_jax = dlpack.to_dlpack(
+				jax.device_put(
+					jax.device_get(x),
+					jax.devices(EASYDEL_PERFRED_HOST_COPY)[EASYDEL_PERFRED_HOST_COPY_INDEX],
+				),
+				stream=None,
+			)
+		return dlpack_pt.from_dlpack(dl_pack_jax)
 
 
 def pt2jax(x):

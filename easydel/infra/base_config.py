@@ -531,6 +531,19 @@ class EasyDeLBaseConfig(PretrainedConfig):
 					pass
 		return string + ")"
 
+	def to_dict(self) -> tp.Dict[str, tp.Any]:
+		sd = self.__dict__
+		forbidden_types = ["_ScalarMeta"]
+		extracted_values = {
+			k: sd.pop(k)
+			for k in list(sd.keys())
+			if sd.get(k).__class__.__name__ in forbidden_types
+		}
+		result = super().to_dict()
+		for k, v in extracted_values.items():
+			sd[k] = v
+		return result
+
 	def add_jax_args(self, **kwargs):
 		for k, v in kwargs.items():
 			set_attrs_smartly(self, k, v, v)

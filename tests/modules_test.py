@@ -70,7 +70,6 @@ class EasyModelsTest(unittest.TestCase):
 		self.use_scan_mlp: bool = True
 		self.bits: tp.Optional[int] = None
 		self.hidden_act: str = "silu"
-		self.pretraining_tp: int = 1
 		self.scan_layers: bool = False
 		self.shard_attention_computation: bool = True
 		self.rotary_dim = 32
@@ -169,6 +168,7 @@ class EasyModelsTest(unittest.TestCase):
 				past_key_values=None,
 			)
 			torch_time = time.time() - torch_time
+
 			ed_model = module_class.lazy_init(
 				config=config,
 				dtype=self.dtype,
@@ -194,7 +194,22 @@ class EasyModelsTest(unittest.TestCase):
 			easy_time = time.time()
 			ed_output, metrics = jited(jax_input_ids)
 			easy_time = time.time() - easy_time
+			# try:
+			# 	second_hf_model = ed_model.to_torch()
+			# 	_ = second_hf_model(
+			# 		input_ids=torch_input_ids,
+			# 		attention_mask=torch.ones_like(torch_input_ids),
+			# 		labels=torch_input_ids,
+			# 		past_key_values=None,
+			# 	)
 
+			# 	for k, v in hf_model.state_dict().items():
+			# 		ov = second_hf_model.state_dict()[k]
+			# 		err_msg = f"converted easydel model to torch wont match with orginal state_dict at {k}."
+			# 		assert v.shape == ov.shape
+			# 		assert (v - ov).sum() == 0, err_msg
+			# except Exception as e:
+			# 	print(e)
 			del hf_model
 			gc.collect()
 			return self.compare_torch_to_jax(
