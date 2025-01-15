@@ -101,7 +101,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		float_dtype=None,
 		verbose: bool = True,
 		mismatch_allowed: bool = True,
-		enable: bool = True,
+		enable: tp.Optional[bool] = None,
 	):
 		"""Saves the model's configuration, weights, and potentially the generation config to the specified directory.
 
@@ -149,7 +149,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		float_dtype=None,
 		verbose: bool = True,
 		mismatch_allowed: bool = True,
-		enable: bool = True,
+		enable: tp.Optional[bool] = None,
 		**kwargs,
 	):
 		"""Saves the model, its configuration, and optionally pushes it to the Hugging Face Hub.
@@ -167,7 +167,9 @@ class EasyBridgeMixin(PushToHubMixin):
 		"""
 
 		save_directory = Path(save_directory)
-
+		if enable is None:
+			enable = jax.process_index() == 0
+			
 		if save_directory.is_file():
 			logger.error(
 				f"Provided path ({save_directory}) should be a directory, not a file"
@@ -188,7 +190,6 @@ class EasyBridgeMixin(PushToHubMixin):
 			mismatch_allowed=mismatch_allowed,
 			enable=enable,
 		)
-
 		readme_path = save_directory / "README.md"
 		if not readme_path.exists() and enable:
 			readme_path.write_text(self._model_card(repo_id, repo_id))

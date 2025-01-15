@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import abc
 import os
 import time
 import typing as tp
@@ -30,6 +31,13 @@ import tqdm
 from fjformer.checkpoint import CheckpointManager
 from jax.sharding import Mesh
 from optax import GradientTransformation, Schedule
+from rich.progress import (
+	Progress,
+	ProgressColumn,
+	Task,
+	TaskID,
+)
+from rich.text import Text
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossMetrics
@@ -423,15 +431,22 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 		...
 
 	@abstractmethod
-	def _log_metrics(
+	def create_progress_bar(
+		total: int,
+		desc: str = "",
+		disabled: bool = False,
+	) -> BaseProgressBar:
+		"""Create a progress bar of the specified type."""
+
+	@abstractmethod
+	def log_metrics(
 		self,
 		metrics: tp.Dict[str, float],
-		pbar: tqdm.tqdm,
+		pbar: BaseProgressBar,
 		step: int,
 		mode: str = "train",
-	):
+	) -> None:
 		"""Log metrics and update progress bar."""
-		...
 
 	@abstractmethod
 	def _run_training_loop(
@@ -464,7 +479,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 		train_dataset: int,
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
-		pbar: tqdm,
+		pbar: BaseProgressBar,
 		epoch: int,
 	):
 		"""Handles training for a single epoch."""
@@ -478,7 +493,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 		current_step: int,
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
-		pbar: tqdm,
+		pbar: BaseProgressBar,
 		start_time: float,
 	):
 		"""Handles training for a single epoch."""
@@ -574,9 +589,9 @@ class StepMetrics:
 		current_step: int,
 		epoch: int,
 		flops: tp.Union[tp.Tuple[float, bool], float],
-		batch_size,
-		seq_length,
-		learning_rate,
+		batch_size: int,
+		seq_length: int,
+		learning_rate: float,
 		mode: tp.Optional[tp.Literal["eval", "train"]] = None,
 		**extras,
 	) -> tp.Dict[str, float]:
@@ -597,25 +612,27 @@ class StepMetrics:
 		basic_metrics = {
 			"loss": float(loss),
 			"z_loss": float(z_loss) if z_loss is not None else None,
-			"learning_rate": learning_rate,
-			"step": current_step,
-			"step_time": step_time,
+			"learning_rate": float(np.array(learning_rate).item()),
+			"step": int(current_step),
+			"step_time": float(step_time),
 			"perplexity": float(jnp.exp(loss)),
 			"visited_tokens": visited_tokens,
-			"epoch": epoch,
-			"flops": flops,
-			"flops_per_token": flops_per_token,
-			"flops_per_sequence": flops_per_sequence,
-			"total_time": total_time,
+			"epoch": int(epoch),
+			"flops": float(flops),
+			"flops_per_token": float(flops_per_token),
+			"flops_per_sequence": float(flops_per_sequence),
+			"total_time": float(total_time),
 			**extras,
 		}
 		if metrics.accuracy is not None:
 			basic_metrics["accuracy"] = float(metrics.accuracy)
 
 		if metrics.chosen_rewards is not None:
-			basic_metrics["chosen_rewards"] = float(jnp.mean(metrics.chosen_rewards))
+			basic_metrics["chosen_rewards"] = float(jnp.mean(metrics.chosen_rewards).item())
 		if metrics.rejected_rewards is not None:
-			basic_metrics["rejected_rewards"] = float(jnp.mean(metrics.rejected_rewards))
+			basic_metrics["rejected_rewards"] = float(
+				jnp.mean(metrics.rejected_rewards).item()
+			)
 		if metrics.other_metrics is not None:
 			basic_metrics.update(metrics.other_metrics)
 		if not self.arguments.performance_mode and (mode == "train" or mode is None):
@@ -677,11 +694,135 @@ class MetricsTracker:
 				)
 				mean_accuracy = self.accuracy_sum / (step + 1 - self.step_offset)
 
-				return mean_loss, mean_accuracy
-			return mean_loss
+				return float(mean_loss), float(mean_accuracy)
+			return float(mean_loss)
 
 	def reset(self, step):
 		"""Reset tracked metrics."""
 		self.loss_sum = None
 		self.accuracy_sum = None
 		self.step_offset = step
+
+
+class MetricsColumn(ProgressColumn):
+	"""A custom progress column for displaying metrics."""
+
+	def __init__(self, metrics_to_show=None):
+		super().__init__()
+		self.metrics_to_show = metrics_to_show
+
+	def render(self, task: Task) -> Text:
+		"""Render the metrics in a organized way."""
+		if not task.fields.get("metrics"):
+			return Text("")
+
+		metrics = task.fields["metrics"]
+		display_items = []
+
+		for key, value in metrics.items():
+			if self.metrics_to_show is None:
+				if isinstance(value, float):
+					if abs(value) < 0.01 or abs(value) > 1000:
+						formatted_value = f"{value:.4e}"
+					else:
+						formatted_value = f"{value:.4f}"
+				else:
+					formatted_value = str(value)
+
+				display_items.append(f"{key}={formatted_value}")
+			else:
+				if any(metric in key for metric in self.metrics_to_show):
+					if isinstance(value, float):
+						if abs(value) < 0.01 or abs(value) > 1000:
+							formatted_value = f"{value:.4e}"
+						else:
+							formatted_value = f"{value:.4f}"
+					else:
+						formatted_value = str(value)
+
+					display_items.append(f"{key}={formatted_value}")
+
+		return Text(" • ".join(display_items), style="cyan")
+
+
+class BaseProgressBar(abc.ABC):
+	"""Abstract base class for progress bar implementations."""
+
+	@abc.abstractmethod
+	def update(self, n: int = 1) -> None:
+		pass
+
+	@abc.abstractmethod
+	def set_postfix(self, **kwargs) -> None:
+		pass
+
+	@abc.abstractmethod
+	def reset(self) -> None:
+		pass
+
+	@abc.abstractmethod
+	def close(self) -> None:
+		pass
+
+
+class NullProgressBar(BaseProgressBar):
+	"""Dummy progress bar that does nothing - useful for multiprocessing."""
+
+	def update(self, n: int = 1) -> None:
+		pass
+
+	def set_postfix(self, **kwargs) -> None:
+		pass
+
+	def reset(self) -> None:
+		pass
+
+	def close(self) -> None:
+		pass
+
+
+class TqdmProgressBar(BaseProgressBar):
+	"""Wrapper for tqdm progress bar."""
+
+	def __init__(self, pbar: tqdm.tqdm):
+		self.pbar = pbar
+
+	def update(self, n: int = 1) -> None:
+		self.pbar.update(n)
+
+	def set_postfix(self, **kwargs) -> None:
+		self.pbar.set_postfix(**kwargs)
+
+	def reset(self) -> None:
+		self.pbar.n = 0
+		self.pbar.start_t = self.pbar._time()
+
+	def close(self) -> None:
+		self.pbar.close()
+
+
+class RichProgressBar(BaseProgressBar):
+	"""Wrapper for rich progress bar."""
+
+	def __init__(self, progress: Progress, task_id: TaskID):
+		"""Initialize RichProgressBar with an existing Progress instance and task_id."""
+		self.progress = progress
+		self.task_id = task_id
+		self._postfix = {}
+
+	def update(self, n: int = 1) -> None:
+		self.progress.update(self.task_id, advance=n)
+
+	def set_postfix(self, **kwargs) -> None:
+		self._postfix.update(kwargs)
+		self.progress.update(self.task_id, metrics=self._postfix)
+
+	def reset(self) -> None:
+		self.progress.reset(self.task_id)
+		self._postfix = {}
+
+	def close(self) -> None:
+		try:
+			self.progress.remove_task(self.task_id)
+		except KeyError:
+			pass

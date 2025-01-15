@@ -285,7 +285,7 @@ class EasyDeLState(struct.PyTreeNode):
 		verbose: bool = True,
 		mismatch_allowed: bool = True,
 		save_optimizer: bool = True,
-		enable: bool = True,
+		enable: tp.Optional[bool] = None,
 	):
 		save_directory = pathlib.Path(save_directory)
 		self.model.save_pretrained(

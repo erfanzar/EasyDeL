@@ -93,12 +93,14 @@ class TrainingArguments:
 	max_training_steps: tp.Optional[int] = None
 	model_name: str = "EasyDeL-Model"
 	model_parameters: tp.Optional[dict] = None
+	metrics_to_show_in_rich_pbar: tp.Optional[list] = None
 	num_train_epochs: int = 10
 	offload_device: jax.Device = jax.devices("cpu")[0]
 	optimizer: AVAILABLE_OPTIMIZERS = EasyDeLOptimizers.ADAMW
 	performance_mode: bool = False
 	pruning_module: AVAILABLE_PRUNING_TYPE = None
 	process_zero_is_admin: bool = True
+	progress_bar_type: tp.Literal["tqdm", "rich"] = "tqdm"
 	remove_ckpt_after_load: bool = False
 	remove_unused_columns: bool = True
 	save_directory: str = "EasyDeL-Checkpoints"
@@ -130,6 +132,10 @@ class TrainingArguments:
 			return None
 		return self._time_to_seconds(self.training_time_limit)
 
+	@functools.cached_property
+	def is_process_zero(self):
+		return jax.process_index() == 0
+
 	def __post_init__(self):
 		"""
 		Validates the configuration, sets up distributed training,
@@ -147,9 +153,9 @@ class TrainingArguments:
 		Performs validation checks on the provided configuration settings.
 		Raises ValueError if any configuration is invalid.
 		"""
-		assert (
-			self.gradient_accumulation_steps > 0
-		), "`gradient_accumulation_steps` can't be lower than 1."
+		assert self.gradient_accumulation_steps > 0, (
+			"`gradient_accumulation_steps` can't be lower than 1."
+		)
 
 		if self.backend not in AVAILABLE_BACKENDS:
 			raise ValueError(
@@ -197,6 +203,13 @@ class TrainingArguments:
 		if self.report_metrics and self.performance_mode:
 			logger.info("Metrics reporting disabled due to performance mode")
 			self.report_metrics = False
+		if self.report_metrics:
+			if self.is_process_zero or self.log_all_workers:
+				logger.info(
+					"Metrics reporting disabled and it's only working on process index 0 or "
+					"admin process (`log_all_workers` is `False`)."
+				)
+				self.report_metrics = False
 
 	def _ensure_variables(self):
 		"""
@@ -324,13 +337,12 @@ class TrainingArguments:
 				)
 				return None
 
-			if jax.process_index() == 0 or self.log_all_workers:
-				return wandb.init(
-					project=f"EasyDeL-{self.model_name}",
-					config=self.to_dict(),
-					tags=["EasyDeL", "JAX/Flax"],
-					entity=self.wandb_entity,
-				)
+			return wandb.init(
+				project=f"EasyDeL-{self.model_name}",
+				config=self.to_dict(),
+				tags=["EasyDeL", "JAX/Flax"],
+				entity=self.wandb_entity,
+			)
 		return None
 
 	def ensure_training_time_limit(self, time_passed):
@@ -344,26 +356,26 @@ class TrainingArguments:
 		Logs training metrics to Weights & Biases and/or TensorBoard.
 
 		Args:
-			metrics (tp.Dict[str, tp.Union[float, tp.List, tp.Tuple, np.ndarray, 'jnp.ndarray', 'torch.Tensor']]):
-				A dictionary where keys are metric names and values are metric values.
-			step (int): The current training step or iteration.
+		  metrics (tp.Dict[str, tp.Union[float, tp.List, tp.Tuple, np.ndarray, 'jnp.ndarray', 'torch.Tensor']]):
+		    A dictionary where keys are metric names and values are metric values.
+		  step (int): The current training step or iteration.
 		"""
 		if self.report_metrics:
-			if (step + 1) % self.log_steps == 0:
-				if jax.process_index() == 0 or self.log_all_workers:
-					metrics = {self._restructure_metric_name(k): v for k, v in metrics.items()}
-					self._log_to_wandb(metrics, step)
-					self._log_to_tensorboard(metrics, step)
+			metrics = {
+				self._restructure_metric_name(k): v for k, v in metrics.items() if v is not None
+			}
+			self._log_to_wandb(metrics, step)
+			self._log_to_tensorboard(metrics, step)
 
 	def _restructure_metric_name(self, metric_name: str) -> str:
 		"""
 		Restructures the metric name for logging.
 
 		Args:
-			metric_name (str): The original metric name.
+		  metric_name (str): The original metric name.
 
 		Returns:
-			str: The restructured metric name.
+		  str: The restructured metric name.
 		"""
 		if metric_name.startswith("train/grad_norm/"):
 			return metric_name.replace("train/grad_norm/", "grad_norm/")
@@ -376,8 +388,8 @@ class TrainingArguments:
 		This method processes the given metrics and logs them to wandb if it's enabled and properly initialized.
 
 		Args:
-			metrics (dict): A dictionary of metrics to log. Keys are metric names, values are the metric values.
-			step (int): The current step or iteration number.
+		  metrics (dict): A dictionary of metrics to log. Keys are metric names, values are the metric values.
+		  step (int): The current step or iteration number.
 		"""
 		if self.use_wandb and wandb is not None and self.report_metrics:
 			wandb_metrics = {}
@@ -390,7 +402,10 @@ class TrainingArguments:
 					)
 				except Exception as e:
 					warnings.warn(f"Failed to log metric {key} to wandb: {e}", stacklevel=3)
-			wandb.log(wandb_metrics, step=step)
+			try:
+				wandb.log(wandb_metrics, step=step)
+			except Exception:
+				...
 
 	def _log_to_tensorboard(self, metrics, step):
 		"""
@@ -399,8 +414,8 @@ class TrainingArguments:
 		This method processes the given metrics and logs them to TensorBoard.
 
 		Args:
-			metrics (dict): A dictionary of metrics to log. Keys are metric names, values are the metric values.
-			step (int): The current step or iteration number.
+		    metrics (dict): A dictionary of metrics to log. Keys are metric names, values are the metric values.
+		    step (int): The current step or iteration number.
 		"""
 		summary_writer = self.get_tensorboard()
 		for key, value in metrics.items():
@@ -411,7 +426,8 @@ class TrainingArguments:
 					summary_writer.histogram(key, np.array(value), step)
 			except Exception as e:
 				warnings.warn(f"Failed to log metric {key} to TensorBoard: {e}", stacklevel=1)
-		summary_writer.flush()
+			finally:
+				summary_writer.flush()
 
 	def _create_wandb_histogram(self, value):
 		"""

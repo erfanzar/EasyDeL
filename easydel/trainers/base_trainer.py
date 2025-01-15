@@ -19,6 +19,7 @@ import shutil
 import time
 import typing as tp
 from abc import abstractmethod
+from functools import cached_property
 from glob import glob
 from pathlib import Path
 
@@ -53,13 +54,17 @@ from easydel.utils import Timers
 from easydel.utils.helpers import get_logger
 
 from .trainer_protocol import (
+	BaseProgressBar,
 	BaseTrainerProtocol,
+	NullProgressBar,
+	RichProgressBar,
+	TqdmProgressBar,
 	TrainerConfigureDataloaderOutput,
 	TrainerConfigureFunctionOutput,
 	TrainerConfigureModelOutput,
 	TrainerOutput,
 )
-from .training_configurations import TrainingArguments
+from .training_configurations import MetricsType, TrainingArguments
 
 if tp.TYPE_CHECKING:
 	from datasets import Dataset, IterableDataset
@@ -110,6 +115,10 @@ class BaseTrainer(BaseTrainerProtocol):
 	@property
 	def training_batch_size(self):
 		return self.arguments.total_batch_size * self.arguments.gradient_accumulation_steps
+
+	@cached_property
+	def is_process_zero(self):
+		return self.arguments.is_process_zero
 
 	@property
 	def evaluation_batch_size(self):
@@ -178,15 +187,18 @@ class BaseTrainer(BaseTrainerProtocol):
 
 	def get_runstage_flops(self, is_training) -> tp.Union[float, tp.Tuple[float, bool]]:
 		try:
-			if is_training:
-				flops = self.sharded_training_step_function.cost_analysis()[0]["flops"]
-			else:
-				flops = self.sharded_evaluation_step_function.cost_analysis()[0]["flops"]
+			function = (
+				self.sharded_training_step_function
+				if is_training
+				else self.sharded_evaluation_step_function
+			)
+			flops = function.cost_analysis()[0]["flops"]
 		except Exception:
-			if is_training:
-				flops = self.sharded_training_step_function_flops
-			else:
-				flops = self.sharded_evaluation_step_function_flops
+			flops = (
+				self.sharded_training_step_function_flops
+				if is_training
+				else self.sharded_evaluation_step_function_flops
+			)
 		return flops
 
 	def _ensure_functions_compiled(self):
@@ -527,7 +539,7 @@ class BaseTrainer(BaseTrainerProtocol):
 			float_dtype=self.model.param_dtype,
 			verbose=self.arguments.verbose,
 			save_optimizer=self.arguments.save_optimizer_state,
-			enable=self.arguments.process_zero_is_admin and jax.process_index() == 0,
+			enable=self.arguments.process_zero_is_admin and self.arguments.is_process_zero,
 		)
 
 		self._save_readme(directory_name)
@@ -540,12 +552,19 @@ class BaseTrainer(BaseTrainerProtocol):
 		return step
 
 	def _manage_checkpoint_limit(self, save_directory):
-		if self.arguments.save_total_limit:
+		def _save():
 			checkpoint_files = glob(os.path.join(save_directory, "run-*"))
 			checkpoint_files.sort(key=os.path.getmtime)
 			for old_save_directory in checkpoint_files[: -self.arguments.save_total_limit]:
 				shutil.rmtree(old_save_directory, ignore_errors=True)
 				logger.info(f"Removed old directory: {old_save_directory}")
+
+		if self.arguments.save_total_limit:
+			if self.arguments.process_zero_is_admin:
+				if self.is_process_zero:
+					_save()
+			else:
+				_save()
 
 	def _save_readme(self, save_directory):
 		with open(os.path.join(save_directory, "README.md"), "w") as f:
@@ -608,8 +627,8 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 
 ### Model Details
 - **Architecture**: {self.config.model_type}
-- **Platform**: {device_info['platform']}
-- **Number of Devices**: {device_info['device_count']}
+- **Platform**: {device_info["platform"]}
+- **Number of Devices**: {device_info["device_count"]}
 
 ### Training Parameters
 - **Learning Rate**: {self.arguments.learning_rate} → {self.arguments.learning_rate_end}
@@ -840,11 +859,11 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 
 	def _should_save_checkpoint(self, current_step):
 		"""Determine if checkpoint should be saved at current step."""
-		if self.arguments.save_steps is None or current_step <= 0:
-			return False
-		if current_step % self.arguments.save_steps == 0:
-			return True
-		return False
+		return (
+			self.arguments.save_steps is not None
+			and current_step > 0
+			and current_step % self.arguments.save_steps == 0
+		)
 
 	def _should_run_evaluation(self, current_step):
 		"""Determine if evaluation process should be runned current step."""
@@ -954,28 +973,71 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 
 		return batch
 
-	def _log_metrics(
+	def create_progress_bar(
 		self,
-		metrics: tp.Dict[str, float],
-		pbar: tqdm.tqdm,
+		total: int,
+		desc: str = "",
+		disabled: bool = False,
+	) -> BaseProgressBar:
+		"""Create a progress bar of the specified type."""
+		if disabled:
+			return NullProgressBar()
+		if self.arguments.progress_bar_type == "tqdm":
+			return TqdmProgressBar(tqdm.tqdm(total=total, desc=desc, disable=disabled))
+		else:  # rich
+			from rich.progress import Progress
+
+			if hasattr(self, "_hidden_rich_pbar"):
+				progress = self._hidden_rich_pbar
+			else:
+				from rich.progress import (
+					BarColumn,
+					Progress,
+					SpinnerColumn,
+					TextColumn,
+					TimeRemainingColumn,
+				)
+
+				from .trainer_protocol import MetricsColumn
+
+				progress = Progress(
+					SpinnerColumn(),
+					TextColumn("[bold blue]{task.description}"),
+					BarColumn(bar_width=None),
+					TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+					TimeRemainingColumn(),
+					MetricsColumn(metrics_to_show=self.arguments.metrics_to_show_in_rich_pbar),
+					expand=True,
+					refresh_per_second=10,
+					disable=disabled,
+				)
+				progress.start()
+				self._hidden_rich_pbar = progress
+			task_id = progress.add_task(desc, total=total)
+			return RichProgressBar(progress, task_id)
+
+	def log_metrics(
+		self,
+		metrics: MetricsType,
+		pbar: BaseProgressBar,
 		step: int,
 		mode: str = "train",
 	):
 		"""Log metrics and update progress bar."""
-		# Update progress bar
+
 		if ((step + 1) % self.arguments.log_steps == 0) or (step == 0):
-			pbar.set_postfix(
-				**{
-					k.replace(
-						f"{mode}/",
-						"",
-					): v
-					for k, v in metrics.items()
-					if len(k) < 30
-				}
-			)
+			if step == 0:
+				pbar.reset()
+
+			# Filter and format metrics for display
+			display_metrics = {
+				k.replace(f"{mode}/", ""): v for k, v in metrics.items() if len(k) < 30
+			}
+
+			# Update progress bar
+			pbar.set_postfix(**display_metrics)
 			update_size = 0 if step == 0 else self.arguments.log_steps
 			pbar.update(update_size)
-		# Log metrics if tracking is enabled
-		if not self.arguments.performance_mode:
+
+			# Log metrics to wandb/tensorboard
 			self.arguments.log_metrics(metrics=metrics, step=step)
