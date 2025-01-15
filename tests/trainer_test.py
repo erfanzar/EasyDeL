@@ -1,7 +1,6 @@
 import os
 import sys
 
-import jax
 import transformers
 from jax import numpy as jnp
 
@@ -28,6 +27,7 @@ TOKENIZER.pad_token = TOKENIZER.eos_token
 
 PA_AXIS = ed.PartitionAxis()
 TRAIN_ARGUMENTS = ed.TrainingArguments(
+	model_name="Qwen2-7B-QWQ",
 	save_directory="/home/erfan/runner/model",
 	num_train_epochs=EPOCHS,
 	learning_rate=LEARNING_RATE,
@@ -40,8 +40,10 @@ TRAIN_ARGUMENTS = ed.TrainingArguments(
 	max_sequence_length=MAX_LENGTH,
 	gradient_accumulation_steps=GRAD_ACCUMULATION_STEPS,
 	do_last_save=False,
+	save_steps=1000,
+	save_total_limit=5,
 	# max_training_steps=MAX_TRAINING_STEPS,
-	# use_wandb=True,
+	# use_wandb=False,
 )
 
 
@@ -63,7 +65,6 @@ MODEL = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 	param_dtype=PARAM_DTYPE,
 	dtype=DTYPE,
 	partition_axis=PA_AXIS,
-	# precision=jax.lax.Precision("fastest"),
 )
 
 
@@ -104,9 +105,7 @@ trainer = ed.Trainer(
 	arguments=TRAIN_ARGUMENTS,
 	dataset_train=create_dataset(),
 )
-print("Compiling")
-trainer.compile_aot()
-print("Compiled")
+
 output = trainer.train()
-if jax.process_index() == 0:
-	output.state.save_state("/home/erfan/model-ckpt")
+
+output.state.save_state("/home/erfan/model-ckpt")

@@ -17,7 +17,6 @@ from functools import partial
 import jax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-from tqdm.autonotebook import tqdm
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
@@ -28,7 +27,7 @@ from ..base_trainer import (
 	BaseTrainer,
 	TrainerConfigureFunctionOutput,
 )
-from ..trainer_protocol import MetricsTracker, StepMetrics
+from ..trainer_protocol import BaseProgressBar, MetricsTracker, StepMetrics
 from ._fn import evaluation_step, training_step
 from .modeling_output import TrainerOutput
 
@@ -145,30 +144,38 @@ class Trainer(BaseTrainer):
 		step_metrics: StepMetrics,
 	):
 		"""Core training loop implementation."""
-		pbar = tqdm(
-			total=self.max_training_steps,
-			disable=jax.process_index() != 0,
-		)
-		run_exception = None
-		with self.mesh:
-			for epoch in range(self.arguments.num_train_epochs):
-				state, run_exception = self._train_epoch(
-					state=state,
-					train_dataset=self.dataloader_train,
-					metrics_tracker=metrics_tracker,
-					step_metrics=step_metrics,
-					pbar=pbar,
-					epoch=epoch,
-				)
 
-				current_step = int(jax.device_get(state.step))
-				if current_step >= self.max_training_steps:
-					break
-				if run_exception is not None:
-					break
-		return self._prepare_training_output(
-			state=state, run_exception=run_exception
-		), run_exception
+		disabled = False
+		if jax.process_index() != 0 and not self.arguments.log_all_workers:
+			disabled = True
+		pbar = self.create_progress_bar(
+			total=self.max_training_steps,
+			disabled=disabled,
+			desc="training process",
+		)
+		try:
+			run_exception = None
+			with self.mesh:
+				for epoch in range(self.arguments.num_train_epochs):
+					state, run_exception = self._train_epoch(
+						state=state,
+						train_dataset=self.dataloader_train,
+						metrics_tracker=metrics_tracker,
+						step_metrics=step_metrics,
+						pbar=pbar,
+						epoch=epoch,
+					)
+
+					current_step = int(jax.device_get(state.step))
+					if current_step >= self.max_training_steps:
+						break
+					if run_exception is not None:
+						break
+			return self._prepare_training_output(
+				state=state, run_exception=run_exception
+			), run_exception
+		finally:
+			pbar.close()
 
 	def _run_evaluation(
 		self,
@@ -177,20 +184,28 @@ class Trainer(BaseTrainer):
 		step_metrics: StepMetrics,
 	):
 		"""Core evaluation loop implementation."""
-		pbar = tqdm(
+
+		disabled = False
+		if jax.process_index() != 0 and not self.arguments.log_all_workers:
+			disabled = True
+		pbar = self.create_progress_bar(
 			total=self.max_evaluation_steps,
-			disable=jax.process_index() != 0,
+			disabled=disabled,
+			desc="evaluation process",
 		)
-		pbar.set_description("evaluation process")
-		with self.mesh:
-			for eval_metrics in self._eval_epoch(
-				state=state,
-				eval_dataset=self.dataloader_eval,
-				metrics_tracker=metrics_tracker,
-				step_metrics=step_metrics,
-				pbar=pbar,
-			):
-				yield eval_metrics
+		try:
+			with self.mesh:
+				for eval_metrics in self._eval_epoch(
+					state=state,
+					eval_dataset=self.dataloader_eval,
+					metrics_tracker=metrics_tracker,
+					step_metrics=step_metrics,
+					pbar=pbar,
+				):
+					yield eval_metrics
+
+		finally:
+			pbar.close()
 
 	def _train_epoch(
 		self,
@@ -198,7 +213,7 @@ class Trainer(BaseTrainer):
 		train_dataset: int,
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
-		pbar: tqdm,
+		pbar: BaseProgressBar,
 		epoch: int,
 	):
 		"""Handles training for a single epoch."""
@@ -244,7 +259,7 @@ class Trainer(BaseTrainer):
 					mode="train",
 				)
 
-				self._log_metrics(
+				self.log_metrics(
 					metrics=train_metrics,
 					pbar=pbar,
 					step=current_step,
@@ -274,7 +289,7 @@ class Trainer(BaseTrainer):
 		eval_dataset: int,
 		metrics_tracker: MetricsTracker,
 		step_metrics: StepMetrics,
-		pbar: tqdm,
+		pbar: BaseProgressBar,
 	):
 		"""Handles training for a single epoch."""
 		eval_iter = iter(eval_dataset)
@@ -300,7 +315,7 @@ class Trainer(BaseTrainer):
 					mean_accuracy=mean_accuracy,
 					mode="eval",
 				)
-				self._log_metrics(
+				self.log_metrics(
 					metrics=eval_metrics,
 					pbar=pbar,
 					step=current_step,

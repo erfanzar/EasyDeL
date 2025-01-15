@@ -146,12 +146,10 @@ def create_training_args(
 def main(use_iterable_dataset: bool = True):
 	model = create_model()
 	train_dataset = create_dummy_dataset(
-		NUM_TRAIN_EXAMPLES,
-		use_iterable_dataset=use_iterable_dataset,
+		NUM_TRAIN_EXAMPLES, use_iterable_dataset=use_iterable_dataset
 	)
 	eval_dataset = create_dummy_dataset(
-		NUM_EVAL_EXAMPLES,
-		use_iterable_dataset=use_iterable_dataset,
+		NUM_EVAL_EXAMPLES, use_iterable_dataset=use_iterable_dataset
 	)
 	training_args = create_training_args()
 

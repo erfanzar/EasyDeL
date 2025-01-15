@@ -135,7 +135,7 @@ class CheckpointManager:
 	def __init__(
 		self,
 		checkpoint_dir: tp.Union[str, os.PathLike],
-		enable: bool = True,
+		enable: tp.Optional[bool] = None,
 		float_dtype: jnp.dtype = jnp.bfloat16,
 		save_optimizer_state: bool = True,
 		verbose: bool = False,
@@ -209,7 +209,7 @@ class CheckpointManager:
 		verbose: bool = True,
 		mismatch_allowed: bool = True,
 		metadata: tp.Optional[dict[str, str]] = None,
-		enable: bool = True,
+		enable: tp.Optional[bool] = None,
 	) -> tp.Union[str, os.PathLike]:
 		"""
 		Save a checkpoint to the given path using SafeTensors.
@@ -226,6 +226,8 @@ class CheckpointManager:
 		Returns:
 			path where data is saved to.
 		"""
+		if enable is None:
+			enable = jax.process_index() == 0
 		if not enable:
 			path = "/dev/null"
 		state = to_state_dict(state)
