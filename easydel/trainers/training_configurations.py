@@ -204,7 +204,7 @@ class TrainingArguments:
 			logger.info("Metrics reporting disabled due to performance mode")
 			self.report_metrics = False
 		if self.report_metrics:
-			if self.is_process_zero or self.log_all_workers:
+			if not self.is_process_zero and not self.log_all_workers:
 				logger.info(
 					"Metrics reporting disabled and it's only working on process index 0 or "
 					"admin process (`log_all_workers` is `False`)."
