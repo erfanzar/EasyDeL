@@ -391,7 +391,7 @@ class TrainingArguments:
 		  metrics (dict): A dictionary of metrics to log. Keys are metric names, values are the metric values.
 		  step (int): The current step or iteration number.
 		"""
-		if self.use_wandb and wandb is not None and self.report_metrics:
+		if self.use_wandb and wandb is not None:
 			wandb_metrics = {}
 			for key, value in metrics.items():
 				try:
