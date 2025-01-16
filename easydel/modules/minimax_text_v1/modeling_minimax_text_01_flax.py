@@ -13,18 +13,20 @@
 # limitations under the License.
 
 
-import functools
+import copy
 import math
 import typing as tp
+import warnings
+from functools import partial
 
 import chex
 import jax
-from fjformer.functions import auxiliary_load_balancing_loss_func
+import jax.numpy as jnp
 from flax import nnx as nn
-from jax import numpy as jnp
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import register_module
+from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
 	MoeCausalLMOutput,
 	MoeModelOutput,
@@ -39,81 +41,131 @@ from easydel.infra.utils import (
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
 from easydel.layers.norms import RMSNorm
-from easydel.modules.mixtral.mixtral_configuration import MixtralConfig as MixtralConfig
+
+from .minimax_text_01_configuration import MiniMaxText01Config
 
 
-class MixtralAttention(FlaxAttentionModule):
+def compute_slops(nhd):
+	def get_slopes(n):
+		def get_slopes_power_of_2(n):
+			start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+			ratio = start
+			return [start * ratio**i for i in range(n)]
+
+		if math.log2(n).is_integer():
+			return get_slopes_power_of_2(n)
+		else:
+			closest_power_of_2 = 2 ** math.floor(math.log2(n))
+			return (
+				get_slopes_power_of_2(closest_power_of_2)
+				+ get_slopes(2 * closest_power_of_2)[0::2][: n - closest_power_of_2]
+			)
+
+	return jnp.asarray(get_slopes(nhd), dtype=jnp.float32).reshape(nhd, 1, 1)
+
+
+def get_activation_fn(activation):
+	if activation == "gelu":
+		return partial(jax.nn.gelu, approximate=False)
+	elif activation == "relu":
+		return jax.nn.relu
+	elif activation == "elu":
+		return jax.nn.elu
+	elif activation == "sigmoid":
+		return jax.nn.sigmoid
+	elif activation == "exp":
+
+		def f(x):
+			x_max = jax.lax.stop_gradient(jnp.max(x, axis=-1, keepdims=True))
+			y = jnp.exp(x - x_max)
+
+			return y
+
+		return f
+	elif activation == "leak":
+		return jax.nn.leaky_relu
+	elif activation == "1+elu":
+
+		def f(x):
+			return 1 + jax.nn.elu(x)
+
+		return f
+	elif activation == "2+elu":
+
+		def f(x):
+			return 2 + jax.nn.elu(x)
+
+		return f
+	elif activation == "silu" or activation == "swish":
+		return jax.nn.silu
+	elif activation == "sine":
+		return jax.numpy.sin
+	else:
+		warnings.warn(
+			f"activation: does not support {activation}, use Identity!!!",
+			stacklevel=1,
+		)
+		return lambda x: x
+
+
+class GLU(nn.Module):
 	def __init__(
 		self,
-		config: MixtralConfig,
+		d1,
+		d2,
+		bias=False,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
-		super().__init__(config=config)
-		self.dtype = dtype
-		self.param_dtype = param_dtype
-		self.precision = precision
-		self.rngs = rngs
+		super().__init__()
 
-		self.hidden_size = config.hidden_size
-		self.num_heads = config.num_attention_heads
-		self.head_dim = self.hidden_size // self.num_heads
-		self.num_key_value_heads = config.num_key_value_heads
-		self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-		self.max_position_embeddings = config.max_position_embeddings
-
-		linear = functools.partial(
-			nn.Linear,
-			use_bias=getattr(config, "attention_bias", False),
+		self.l1 = nn.Linear(
+			d1,
+			d2,
+			use_bias=bias,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
-			kernel_init=nn.initializers.normal(),
-			**get_dot_general_by_bits(config.bits, config.easy_method),
+			rngs=rngs,
+		)
+		self.l2 = nn.Linear(
+			d1,
+			d2,
+			use_bias=bias,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+		self.l3 = nn.Linear(
+			d2,
+			d1,
+			use_bias=bias,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
 		)
 
-		self.q_proj = linear(
-			self.hidden_size,
-			self.num_heads * self.head_dim,
-			rngs=rngs,
-		)
-		self.k_proj = linear(
-			self.hidden_size,
-			self.num_key_value_heads * self.head_dim,
-			rngs=rngs,
-		)
-		self.v_proj = linear(
-			self.hidden_size,
-			self.num_key_value_heads * self.head_dim,
-			rngs=rngs,
-		)
-		self.o_proj = linear(
-			self.num_heads * self.head_dim,
-			self.hidden_size,
-			rngs=rngs,
-		)
-		self.attention_performer = FlexibleAttentionModule(
-			num_q_heads=self.config.num_attention_heads,
-			num_kv_heads=self.config.num_key_value_heads,
-			attention_dropout=self.config.attention_dropout,
-			head_dims=self.head_dim,
-			shard_attention_computation=self.config.shard_attention_computation,
-			precision=self.precision,
-			force_float32_tpu=True,
-			attn_mechanism=self.config.attn_mechanism,
-			dtype=self.config.attn_dtype,
-			partition_axis=self.config.partition_axis,
-			scan_ring_attention=self.config.scan_ring_attention,
-			mesh=self.config.mesh,
-			sm_scale=1 / math.sqrt(self.head_dim),
-			axis_name=self.config.attention_axis_name,
-			base_config=self.config,
-		)
+	def __call__(self, x: jax.Array) -> jax.Array:
+		return self.l3(self.l1(x) * self.l2(x))
 
-		self.rotary = self.config.get_basic_rope(self.dtype, self.head_dim)
+
+class MiniMaxText01LightningAttention(nn.Module):
+	def __init__(
+		self,
+		config: MiniMaxText01Config,
+		layer_idx: int,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: jax.lax.PrecisionLike = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__()
 
 	def __call__(
 		self,
@@ -126,37 +178,121 @@ class MixtralAttention(FlaxAttentionModule):
 		output_attentions: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
 		frequencies: tp.Optional[chex.Array] = None,
+	): ...
+
+
+class MiniMaxText01Attention(FlaxAttentionModule):
+	def __init__(
+		self,
+		config: MiniMaxText01Config,
+		layer_idx: int,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
 	):
+		super().__init__(config=config)
+
+		self.layer_idx = layer_idx
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
+
+		self.hidden_size = config.hidden_size
+		head_dim = config.hidden_size // config.num_attention_heads
+		self.head_dim = getattr(config, "head_dim", head_dim)
+		self.num_key_value_groups = (
+			self.config.num_attention_heads // self.config.num_key_value_heads
+		)
+
+		if self.num_key_value_groups == 1:
+			assert self.config.num_attention_heads == self.config.num_key_value_heads
+
+		linear_class = partial(
+			nn.Linear,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			use_bias=False,
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
+			precision=precision,
+			rngs=rngs,
+			**get_dot_general_by_bits(config.bits, config.easy_method),
+		)
+		self.q_proj = linear_class(
+			config.hidden_size, config.num_attention_heads * self.head_dim
+		)
+		self.k_proj = linear_class(
+			config.hidden_size, config.num_key_value_heads * self.head_dim
+		)
+		self.v_proj = linear_class(
+			config.hidden_size, config.num_key_value_heads * self.head_dim
+		)
+		self.o_proj = linear_class(
+			config.num_attention_heads * self.head_dim, config.hidden_size
+		)
+		self.rotary_dim = getattr(config, "rotary_dim", self.head_dim)
+		self.rotary = self.config.get_basic_rope(
+			self.dtype,
+			self.head_dim,
+			self.rotary_dim,
+			True,
+		)
+
+		self.attention_performer = FlexibleAttentionModule(
+			attention_dropout=self.config.attention_dropout,
+			num_q_heads=self.config.num_attention_heads,
+			num_kv_heads=self.config.num_key_value_heads,
+			head_dims=self.head_dim,
+			precision=self.precision,
+			force_float32_tpu=True,
+			attn_mechanism=self.config.attn_mechanism,
+			dtype=self.config.attn_dtype,
+			mesh=self.config.mesh,
+			sm_scale=1 / math.sqrt(self.head_dim),
+			axis_name=self.config.attention_axis_name,
+			base_config=self.config,
+		)
+
+	def __call__(
+		self,
+		hidden_states: chex.Array,
+		attention_mask: chex.Array,
+		position_ids: chex.Array,
+		causal_mask: chex.Array,
+		cache_view: tp.Optional[TransformerCacheView] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		output_attentions: bool = False,
+		fcm_mask: tp.Optional[chex.Array] = None,
+		frequencies: tp.Optional[chex.Array] = None,
+	) -> tp.Tuple[chex.Array, chex.Array]:
 		batch_size, sequence_length = hidden_states.shape[:2]
 		query_states, key_states, value_states = (
 			self.q_proj(hidden_states),
 			self.k_proj(hidden_states),
 			self.v_proj(hidden_states),
 		)
-
-		query_states = query_states.reshape(
+		qshape = (
 			batch_size,
 			sequence_length,
 			self.config.num_attention_heads,
 			self.head_dim,
 		)
-		key_states = key_states.reshape(
+		kv_shape = (
 			batch_size,
 			sequence_length,
 			self.config.num_key_value_heads,
 			self.head_dim,
 		)
-		value_states = value_states.reshape(
-			batch_size,
-			sequence_length,
-			self.config.num_key_value_heads,
-			self.head_dim,
-		)
+		query_states = query_states.reshape(qshape)
+		key_states = key_states.reshape(kv_shape)
+		value_states = value_states.reshape(kv_shape)
 
 		query_states, key_states = self.rotary(
+			positions=position_ids,
 			query=query_states,
 			key=key_states,
-			positions=position_ids,
 			frequencies=frequencies,
 		)
 
@@ -189,70 +325,95 @@ class MixtralAttention(FlaxAttentionModule):
 			segment_ids=segment_ids,
 			causal_mask=causal_mask,
 		)
-
-		attn_output = self.shard_attention_prod(
-			self._merge_heads(attentions.attention_outputs)
+		attn_output = self.o_proj(
+			self.shard_attention_prod(
+				attn_output=self._merge_heads(attentions.attention_outputs)
+			)
 		)
-		attn_output = self.o_proj(attn_output)
 		outputs = (
 			(attn_output, attentions.attention_weights)
 			if output_attentions
-			else (attn_output,)
+			else (attn_output, None)
 		)
 		return outputs
 
 
-class MixtralBLockSparseTop2MLP(nn.Module):
+class MiniMaxText01MLP(nn.Module):
 	def __init__(
 		self,
-		config: MixtralConfig,
+		config: MiniMaxText01Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
 		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
-		super().__init__()
 		self.config = config
 		self.dtype = dtype
 		self.param_dtype = param_dtype
 		self.precision = precision
-		self.rngs = rngs
-		linear = functools.partial(
+		linear_class = partial(
 			nn.Linear,
-			use_bias=False,
 			dtype=dtype,
 			param_dtype=param_dtype,
+			use_bias=False,
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=precision,
-			kernel_init=nn.initializers.normal(),
+			rngs=rngs,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
-		self.w1 = linear(
-			self.config.hidden_size,
-			self.config.intermediate_size,
-			rngs=rngs,
-		)
-		self.w3 = linear(
-			self.config.hidden_size,
-			self.config.intermediate_size,
-			rngs=rngs,
-		)
-		self.w2 = linear(
-			self.config.intermediate_size,
-			self.config.hidden_size,
-			rngs=rngs,
-		)
+		self.gate_proj = linear_class(config.hidden_size, config.intermediate_size)
+		self.down_proj = linear_class(config.intermediate_size, config.hidden_size)
+		self.up_proj = linear_class(config.hidden_size, config.intermediate_size)
 		self.act_fn = ACT2FN[self.config.hidden_act]
 
-	def __call__(self, hidden_states: chex.Array):
+	def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-		return self.w2(self.act_fn(self.w1(hidden_states)) * self.w3(hidden_states))
+		return self.down_proj(
+			self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+		)
 
 
-class MixtralSparseMoeBlock(nn.Module):
+class MiniMaxText01BlockSparseTop2MLP(nn.Module):
 	def __init__(
 		self,
-		config: MixtralConfig,
+		config: MiniMaxText01Config,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		linear_class = partial(
+			nn.Linear,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			use_bias=False,
+			kernel_init=jax.nn.initializers.normal(config.initializer_range),
+			precision=precision,
+			rngs=rngs,
+			**get_dot_general_by_bits(config.bits, config.easy_method),
+		)
+		self.w1 = linear_class(config.hidden_size, config.intermediate_size)
+		self.w2 = linear_class(config.intermediate_size, config.hidden_size)
+		self.w3 = linear_class(config.hidden_size, config.intermediate_size)
+		self.act_fn = ACT2FN[self.config.hidden_act]
+
+	def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
+		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
+		current_hidden_states = self.act_fn(self.w1(hidden_states)) * self.w3(hidden_states)
+		current_hidden_states = self.w2(current_hidden_states)
+		return current_hidden_states
+
+
+class MiniMaxText01SparseMoeBlock(nn.Module):
+	def __init__(
+		self,
+		config: MiniMaxText01Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
 		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
@@ -277,7 +438,7 @@ class MixtralSparseMoeBlock(nn.Module):
 		)
 
 		self.experts = [
-			MixtralBLockSparseTop2MLP(
+			MiniMaxText01BlockSparseTop2MLP(
 				config=config,
 				dtype=dtype,
 				param_dtype=param_dtype,
@@ -286,21 +447,28 @@ class MixtralSparseMoeBlock(nn.Module):
 			)
 			for i in range(config.num_local_experts)
 		]
+		self.jitter_noise = config.router_jitter_noise
+		self.deterministic = False
 
 	def __call__(self, hidden_states: chex.Array) -> tp.Tuple[chex.Array, chex.Array]:
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-
+		if not self.deterministic and self.jitter_noise > 0:
+			hidden_states *= jax.random.uniform(
+				self.rngs.param(),
+				shape=hidden_states.shape,
+				minval=1.0 - self.jitter_noise,
+				maxval=1.0 + self.jitter_noise,
+			)
 		router_logits = self.gate(hidden_states).astype(
 			jnp.promote_types(self.dtype, jnp.float32)
 		)
 		routing_weights, selected_experts = jax.lax.top_k(
-			router_logits,
-			k=self.config.num_experts_per_tok,
+			router_logits, k=self.config.num_experts_per_tok
 		)
 		routing_weights = jax.nn.softmax(
-			routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32)),
-			axis=-1,
+			routing_weights.astype(jnp.promote_types(self.dtype, jnp.float32)), axis=-1
 		)
+		routing_weights /= routing_weights.sum(axis=-1, keepdims=True)
 		final_hidden_state = jnp.zeros_like(hidden_states)
 
 		for index in range(self.config.num_local_experts):
@@ -308,42 +476,48 @@ class MixtralSparseMoeBlock(nn.Module):
 				block_wise_ffn(
 					self.experts[index],
 					hidden_states,
-					self.config.scan_mlp_chunk_size, 
+					self.config.scan_mlp_chunk_size,
 				)
 				if self.config.use_scan_mlp
 				else self.experts[index](hidden_states)
 			)
 			expert_layer_output_exp = (
-				jnp.sum(jnp.multiply(selected_experts == index, routing_weights), axis=-1)[
-					:, :, None
-				]
+				jnp.sum(
+					jnp.multiply(
+						selected_experts == index,
+						routing_weights,
+					),
+					axis=-1,
+				)[:, :, None]
 				* expert_layer_output
 			)
 			final_hidden_state += expert_layer_output_exp
-		return (
-			final_hidden_state,
-			router_logits,
-		)
+		return (final_hidden_state, router_logits)
 
 
-class MixtralDecoderLayer(nn.Module):
+class MiniMaxText01DecoderLayer(nn.Module):
 	def __init__(
 		self,
-		config: MixtralConfig,
+		config: MiniMaxText01Config,
+		layer_idx: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
 		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
 		*,
 		rngs: nn.Rngs,
 	):
-		super().__init__()
 		self.config = config
+		self.layer_idx = layer_idx
 		self.dtype = dtype
 		self.param_dtype = param_dtype
 		self.precision = precision
-		self.rngs = rngs
-		attn_block = MixtralAttention
-		mlp_block = MixtralSparseMoeBlock
+
+		if config.attention_type == 0:
+			attn_block = MiniMaxText01LightningAttention
+		else:
+			attn_block = MiniMaxText01Attention
+		mlp_block = MiniMaxText01SparseMoeBlock
+
 		attn_block, mlp_block = auto_remat(
 			attn_block,
 			mlp_block,
@@ -351,11 +525,13 @@ class MixtralDecoderLayer(nn.Module):
 		)
 		self.self_attn = attn_block(
 			config=config,
+			layer_idx=layer_idx,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
 			rngs=rngs,
 		)
+
 		self.block_sparse_moe = mlp_block(
 			config=config,
 			dtype=dtype,
@@ -364,19 +540,82 @@ class MixtralDecoderLayer(nn.Module):
 			rngs=rngs,
 		)
 		self.input_layernorm = RMSNorm(
-			dim=config.hidden_size,
+			config.hidden_size,
 			eps=config.rms_norm_eps,
+			rngs=rngs,
 			dtype=dtype,
 			param_dtype=param_dtype,
-			rngs=rngs,
 		)
 		self.post_attention_layernorm = RMSNorm(
-			dim=config.hidden_size,
+			config.hidden_size,
 			eps=config.rms_norm_eps,
+			rngs=rngs,
 			dtype=dtype,
 			param_dtype=param_dtype,
-			rngs=rngs,
 		)
+
+		self.postnorm = getattr(config, "postnorm", False)
+		self.layernorm_attention_alpha = (
+			getattr(
+				config,
+				"layernorm_linear_attention_alpha",
+				1,
+			)
+			if config.attention_type == 0
+			else getattr(
+				config,
+				"layernorm_full_attention_alpha",
+				1,
+			)
+		)
+		self.layernorm_attention_beta = (
+			getattr(
+				config,
+				"layernorm_linear_attention_beta",
+				1,
+			)
+			if config.attention_type == 0
+			else getattr(
+				config,
+				"layernorm_full_attention_beta",
+				1,
+			)
+		)
+		self.layernorm_mlp_alpha = getattr(
+			config,
+			"layernorm_mlp_alpha",
+			1,
+		)
+		self.layernorm_mlp_beta = getattr(
+			config,
+			"layernorm_mlp_beta",
+			1,
+		)
+
+		shared_intermediate = getattr(
+			config,
+			"shared_intermediate_size",
+			0,
+		)
+		self.shared_moe = False
+		if shared_intermediate > 0:
+			self.shared_moe = True
+			self.shared_mlp = MiniMaxText01MLP(
+				config=config,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
+				rngs=rngs,
+			)
+			self.coefficient = nn.Linear(
+				self.hidden_size,
+				1,
+				use_bias=False,
+				rngs=rngs,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
+			)
 
 	def __call__(
 		self,
@@ -384,72 +623,81 @@ class MixtralDecoderLayer(nn.Module):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: chex.Array,
-		segment_ids: tp.Optional[chex.Array] = None,
 		cache_view: tp.Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
 		output_router_logits: bool = False,
-		fcm_mask: tp.Optional[chex.Array] = None,
+		slope_rate: tp.Optional[float] = None,
 		frequencies: tp.Optional[chex.Array] = None,
-	) -> tp.Tuple[chex.Array, chex.Array, tp.Optional[chex.Array]]:
-		"""
-		Forward pass of the attentionNrom module.
+	):
+		# if self.config.use_scan_mlp:
+		# 	feed_forward_hidden_states = block_wise_ffn(
+		# 		self.mlp,
+		# 		feed_forward_input,
+		# 		self.config.scan_mlp_chunk_size,
+		# 	)
+		# else:
+		# 	feed_forward_hidden_states = self.mlp(feed_forward_input)
 
-		Args:
-		    hidden_states (chex.Array): Input hidden states.
-		    attention_mask (chex.Array): Mask to apply on the attention scores.
-		    position_ids (chex.Array): Position indices for the tokens.
-		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
-		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-		    deterministic (bool): If True, disables dropout for deterministic behavior.
-		    init_cache (bool): If True, initializes cache for caching keys and values.
-		    output_attentions (bool): If True, outputs attention weights.
-		    output_router_logits (bool): If True, outputs router logits.
-		    fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
-		Returns:
-		    tp.Tuple[chex.Array, chex.Array, tp.Optional[chex.Array]]: A tuple containing the residual_states, hidden states, and the attention weights.
-		"""
 		residual = hidden_states
+
 		hidden_states = self.input_layernorm(hidden_states)
+		if self.postnorm:
+			residual = hidden_states
 
-		attn_out = self.self_attn(
-			hidden_states,
-			attention_mask,
-			position_ids,
-			causal_mask,
-			cache_view,
-			segment_ids,
-			output_attentions,
-			fcm_mask,
-			frequencies,
+		hidden_states, self_attn_weights = self.self_attn(
+			hidden_states=hidden_states,
+			causal_mask=causal_mask,
+			position_ids=position_ids,
+			attention_mask=attention_mask,
+			cache_view=cache_view,
+			output_attentions=output_attentions,
+			slope_rate=slope_rate,
+			frequencies=frequencies,
 		)
-		hidden_states, self_attn_weights = (
-			attn_out if output_attentions else (attn_out[0], None)
-		)
-		hidden_states = residual + hidden_states
 
+		hidden_states = (
+			residual * self.layernorm_attention_alpha
+			+ hidden_states * self.layernorm_attention_beta
+		)
+
+		# Fully Connected
 		residual = hidden_states
 		hidden_states = self.post_attention_layernorm(hidden_states)
-		hidden_states, router_logits = self.block_sparse_moe(hidden_states)
-		hidden_states = residual + hidden_states
+		if self.postnorm:
+			residual = hidden_states
 
-		outputs = (hidden_states,)
-		if output_attentions:
-			outputs += (self_attn_weights,)
-		if output_router_logits:
-			outputs += (router_logits,)
+		moe_hidden_states, router_logits = self.block_sparse_moe(hidden_states)
+		if self.shared_moe:
+			output_mlp = self.shared_mlp(hidden_states)
+			weight_fp32 = self.coefficient.kernel.value.astype(jnp.float32)
+			coef = hidden_states.astype(jnp.float32) @ weight_fp32
+			coef = jax.nn.sigmoid(coef).to(hidden_states.dtype)
+			hidden_states = moe_hidden_states * (1 - coef) + output_mlp * coef
+		else:
+			hidden_states = moe_hidden_states
+
+		hidden_states = (
+			residual * self.layernorm_mlp_alpha + hidden_states * self.layernorm_mlp_beta
+		)
+
+		outputs = (
+			hidden_states,
+			self_attn_weights if output_attentions else None,
+			router_logits if output_router_logits else None,
+		)
 		return outputs
 
 
 @register_module(
 	"base-module",
-	config=MixtralConfig,
-	model_type="mixtral",
+	config=MiniMaxText01Config,
+	model_type="MiniMaxText01",
 	embedding_layer_names=["embed_tokens"],
 )
-class MixtralModel(EasyDeLBaseModule):
+class MiniMaxText01Model(EasyDeLBaseModule):
 	def __init__(
 		self,
-		config: MixtralConfig,
+		config: MiniMaxText01Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
 		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
@@ -463,28 +711,38 @@ class MixtralModel(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
+
 		self.embed_tokens = nn.Embed(
-			config.vocab_size,
-			config.hidden_size,
+			num_embeddings=self.config.vocab_size,
+			features=self.config.hidden_size,
 			dtype=dtype,
 			param_dtype=param_dtype,
+			embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
 			rngs=rngs,
 		)
 
-		self.layers = [
-			MixtralDecoderLayer(
-				config=config,
-				dtype=dtype,
-				param_dtype=param_dtype,
-				precision=precision,
-				rngs=rngs,
+		self.layers: tp.List[MiniMaxText01DecoderLayer] = []
+
+		for i in range(config.num_hidden_layers):
+			_config = copy.deepcopy(config)
+			if self.attn_type_list[i] == 0:
+				_config.attention_type = 0
+			else:
+				_config.attention_type = 1
+			self.layers.append(
+				MiniMaxText01DecoderLayer(
+					config=_config,
+					layer_idx=i,
+					dtype=dtype,
+					param_dtype=param_dtype,
+					precision=precision,
+					rngs=rngs,
+				)
 			)
-			for _ in range(config.num_hidden_layers)
-		]
 
 		self.norm = RMSNorm(
-			dim=config.hidden_size,
-			eps=config.rms_norm_eps,
+			self.config.hidden_size,
+			eps=self.config.rms_norm_eps,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			rngs=rngs,
@@ -497,34 +755,12 @@ class MixtralModel(EasyDeLBaseModule):
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		output_router_logits: tp.Optional[bool] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
 		return_dict: bool = True,
-	) -> MoeModelOutput | tp.Tuple:
-		if output_router_logits is None:
-			output_router_logits = self.config.output_router_logits
-
-		output_attentions = (
-			output_attentions
-			if output_attentions is not None
-			else self.config.output_attentions
-		)
-		output_router_logits = (
-			output_router_logits
-			if output_router_logits is not None
-			else self.config.output_router_logits
-		)
-		output_hidden_states = (
-			output_hidden_states
-			if output_hidden_states is not None
-			else self.config.output_hidden_states
-		)
-		all_hidden_states = () if output_hidden_states else None
-		all_self_attns = () if output_attentions else None
-		all_router_logits = () if output_router_logits else None
-
+	) -> tp.Union[MoeModelOutput, tp.Tuple]:
 		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
 				"You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -533,82 +769,82 @@ class MixtralModel(EasyDeLBaseModule):
 			inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
 		batch_size, sequence_length, _ = inputs_embeds.shape
 
+		all_attentions = () if output_attentions else None
+		all_hidden_states = () if output_hidden_states else None
+		all_router_logits = () if output_router_logits else None
 		assert (
 			sequence_length <= self.config.max_position_embeddings
 		), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
-
 		if attention_mask is None:
 			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
-
 		if position_ids is None:
 			position_ids = jnp.broadcast_to(
 				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
 				(batch_size, sequence_length),
 			).astype(jnp.int32)
 
-		if attention_mask.ndim == 2:
-			attention_mask = jnp.expand_dims(attention_mask, (1, 2))
-
-		hidden_states = inputs_embeds
+		hidden_states = self.dropout(inputs_embeds)
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
 
+		sr = compute_slops(nhd=self.config.num_attention_heads)
 		for idx, block in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
+
 			layer_outputs = block(
 				hidden_states=hidden_states,
 				attention_mask=attention_mask,
 				position_ids=position_ids,
 				cache_view=past_key_values.views[idx],
+				causal_mask=self.causal_mask,
 				output_attentions=output_attentions,
 				output_router_logits=output_router_logits,
-				causal_mask=self.causal_mask,
 				segment_ids=segment_ids,
 				frequencies=self.frequencies,
+				slope_rate=sr[idx] * (1 - idx / (len(self.layers) - 1) + 1e-5),
 			)
-
 			hidden_states = layer_outputs[0]
 
 			if output_attentions:
-				all_self_attns += (layer_outputs[1],)
-
+				all_attentions += (layer_outputs[1],)
 			if output_router_logits:
-				all_router_logits += (layer_outputs[-1],)
+				all_router_logits += (layer_outputs[2],)
 
 		hidden_states = self.norm(hidden_states)
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
+		outputs = (
+			hidden_states,
+			all_hidden_states,
+			all_attentions,
+			all_router_logits,
+			past_key_values,
+		)
+
 		if not return_dict:
-			return tuple(
-				v
-				for v in [
-					hidden_states,
-					all_hidden_states,
-					all_self_attns,
-					all_router_logits,
-				]
-				if v is not None
-			)
+			return tuple(v for v in outputs if v is not None)
+
 		return MoeModelOutput(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
-			attentions=all_self_attns,
 			router_logits=all_router_logits,
+			attentions=all_attentions,
+			past_key_values=past_key_values,
 		)
 
 
 @register_module(
 	"causal-language-model",
-	config=MixtralConfig,
-	model_type="mixtral",
+	config=MiniMaxText01Config,
+	model_type="MiniMaxText01",
 	embedding_layer_names=["embed_tokens"],
 )
-class MixtralForCausalLM(EasyDeLBaseModule):
+class MiniMaxText01ForCausalLM(EasyDeLBaseModule):
 	def __init__(
 		self,
-		config: MixtralConfig,
+		config: MiniMaxText01Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
 		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
@@ -622,7 +858,7 @@ class MixtralForCausalLM(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.model = MixtralModel(
+		self.model = MiniMaxText01Model(
 			config=config,
 			dtype=dtype,
 			param_dtype=param_dtype,
