@@ -533,13 +533,15 @@ class BaseTrainer(BaseTrainerProtocol):
 		)
 
 		logger.info(f"saving state {directory_name}.")
-
+		enable = True
+		if self.arguments.process_zero_is_admin and not self.arguments.is_process_zero:
+			enable = False
 		state.save_state(
 			save_directory=directory_name,
 			float_dtype=self.model.param_dtype,
 			verbose=self.arguments.verbose,
 			save_optimizer=self.arguments.save_optimizer_state,
-			enable=self.arguments.process_zero_is_admin and self.arguments.is_process_zero,
+			enable=enable,
 		)
 
 		self._save_readme(directory_name)

@@ -364,7 +364,6 @@ class FlaxGrok1SparseMoeBlock(nn.Module):
 					self.layers[index],
 					hidden_states,
 					self.config.scan_mlp_chunk_size,
-					False,
 				)
 				if self.config.use_scan_mlp
 				else self.layers[index](hidden_states)
