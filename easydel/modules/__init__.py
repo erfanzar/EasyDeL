@@ -228,3 +228,8 @@ from .xerxes import (
 	XerxesForCausalLM,
 	XerxesModel,
 )
+from .xerxes2 import (
+	Xerxes2Model,
+	Xerxes2ForCausalLM,
+	Xerxes2Config,
+)

@@ -61,8 +61,8 @@ if _os.environ.get("EASYDEL_AUTO", "true") in ["true", "1", "on", "yes"]:
 		"--xla_tpu_enable_async_collective_fusion=true "
 		"--xla_tpu_enable_async_collective_fusion_multiple_steps=true "
 		"--xla_tpu_overlap_compute_collective_tc=true "
-		"--xla_enable_async_all_gather=true " 
-		"--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true " 
+		"--xla_enable_async_all_gather=true "
+		"--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true "
 		"TPU_MEGACORE=MEGACORE_DENSE "
 	)
 	_os.environ.update(
@@ -337,6 +337,13 @@ from .modules.xerxes import (
 	XerxesForCausalLM,
 	XerxesModel,
 )
+
+from .modules.xerxes2 import (
+	Xerxes2Model,
+	Xerxes2ForCausalLM,
+	Xerxes2Config,
+)
+
 from .trainers import (
 	BaseTrainer,
 	DPOConfig,

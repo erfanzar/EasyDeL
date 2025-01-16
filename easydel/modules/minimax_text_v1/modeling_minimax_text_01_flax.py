@@ -20,10 +20,11 @@ import warnings
 from functools import partial
 
 import chex
+from einops import rearrange
 import jax
 import jax.numpy as jnp
 from flax import nnx as nn
-
+from jax import lax
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
@@ -178,7 +179,86 @@ class MiniMaxText01LightningAttention(nn.Module):
 		output_attentions: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
 		frequencies: tp.Optional[chex.Array] = None,
-	): ...
+		slope_rate: tp.Optional[chex.Array] = None,
+	):
+		# TODO: fix these static issues here
+		to_shape = (batch_size, sequence_length, self.num_heads, self.head_dim)
+		query_states = query_states.reshape(*to_shape)
+		key_states = key_states.reshape(*to_shape)
+		value_states = value_states.reshape(*to_shape)
+		query_states = jnp.transpose(query_states, (0, 2, 1, 3))
+		key_states = jnp.transpose(key_states, (0, 2, 1, 3))
+		value_states = jnp.transpose(value_states, (0, 2, 1, 3))
+
+		attn_output = self.shard_attention_prod()
+		attn_output = self.o_proj(attn_output)
+
+		b, h, n, d = query_states.shape
+		e = value_states.shape[-1]
+		BLOCK = self.config.compute_blocksize
+		NUM_BLOCK = (n + BLOCK - 1) // BLOCK
+
+		ratio = jnp.exp(-slope_rate)
+		if attention_mask is not None:
+			mask = (1 - attention_mask).reshape(attention_mask.shape + (1,))
+			value_states = jnp.where(mask, 0.0, value_states)
+		array = jnp.arange(BLOCK) + 1
+		q_decay = jnp.exp(-slope_rate * array.reshape(-1, 1))
+		k_decay = jnp.exp(-slope_rate * (BLOCK - array.reshape(-1, 1)))
+		index = array[:, None] - array[None, :]
+		s_index = slope_rate * index[None, None]
+		s_index = jnp.where(index >= 0, -s_index, float("-inf"))
+		diag_decay = jnp.exp(s_index)
+
+		# TODO: Creating Pallas kernel of this operation is really easy, make one.
+		def process_block(carry, i):
+			kv = carry
+			si = i * BLOCK
+			ei = jnp.minimum(si + BLOCK, n)
+			m = ei - si
+			qi = jax.lax.dynamic_slice(query_states, (0, 0, si, 0), (b, h, m, d))
+			ki = jax.lax.dynamic_slice(key_states, (0, 0, si, 0), (b, h, m, d))
+			vi = jax.lax.dynamic_slice(value_states, (0, 0, si, 0), (b, h, m, e))
+			qkv_none_diag = jnp.matmul(qi * q_decay[:, :m], kv)
+			qk = jnp.matmul(qi, jnp.transpose(ki, (0, 1, 3, 2))) * diag_decay[:, :, :m, :m]
+			qkv_diag = jnp.matmul(qk, vi)
+			output_block = qkv_none_diag + qkv_diag
+			block_decay = jnp.exp(-slope_rate * m)
+			new_kv = block_decay * kv + jnp.matmul(
+				jnp.transpose(ki * k_decay[:, -m:], (0, 1, 3, 2)), vi
+			)
+
+			return new_kv, output_block
+
+		if cache_view is None:
+			kv_init = jnp.zeros((b, h, d, e))
+			_, outputs = lax.scan(process_block, kv_init, jnp.arange(NUM_BLOCK))
+			output = jnp.concatenate(outputs, axis=2)
+
+		else:
+			kv = cache_view.key_value
+
+			def process_token(carry, i):
+				kv = carry
+				kv = ratio * kv + jnp.einsum(
+					"...nd,...ne->...de",
+					jax.lax.dynamic_slice(key_states, (0, 0, i, 0), (b, h, 1, d)),
+					jax.lax.dynamic_slice(value_states, (0, 0, i, 0), (b, h, 1, e)),
+				)
+				return kv, jnp.einsum(
+					"...ne,...ed->...nd",
+					jax.lax.dynamic_slice(query_states, (0, 0, i, 0), (b, h, 1, d)),
+					kv,
+				)
+
+			_, outputs = lax.scan(process_token, kv, jnp.arange(n))
+			output = outputs
+
+		output = rearrange(output, "b h n d -> b n (h d)")
+		output = self.norm(output)
+		output = jax.nn.sigmoid(self.g_proj(hidden_states)) * output
+		output = self.o_proj(output)
+		return (attn_output, None)
 
 
 class MiniMaxText01Attention(FlaxAttentionModule):
