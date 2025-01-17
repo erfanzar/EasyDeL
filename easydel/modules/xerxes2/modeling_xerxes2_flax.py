@@ -21,7 +21,6 @@ import jax
 import jax.numpy as jnp
 from einops import rearrange
 from flax import nnx as nn
-from jax import lax
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import register_module
@@ -38,7 +37,7 @@ from easydel.infra.utils import (
 from easydel.layers.caching import TransformerCache, TransformerCacheView
 from easydel.layers.norms import RMSNorm
 from easydel.utils.helpers import get_logger
-
+from easydel.layers.ops.lightning_attention import linear_attn, build_slope_tensor
 from .xerxes2_configuration import Xerxes2Config as Xerxes2Config
 
 logger = get_logger(__name__)
@@ -59,7 +58,7 @@ class Xerxes2Attention(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		self.rngs = rngs
-		
+
 		self.embed_dim = config.hidden_size
 		self.head_dim = config.head_dim
 		self.num_heads = config.num_attention_heads
@@ -142,67 +141,17 @@ class Xerxes2Attention(nn.Module):
 		query_states = jnp.transpose(query_states, (0, 2, 1, 3))
 		key_states = jnp.transpose(key_states, (0, 2, 1, 3))
 		value_states = jnp.transpose(value_states, (0, 2, 1, 3))
-
-		b, h, n, d = query_states.shape
-		e = value_states.shape[-1]
-		BLOCK = self.config.compute_blocksize
-		NUM_BLOCK = (n + BLOCK - 1) // BLOCK
-
-		ratio = jnp.exp(-slope_rate)
 		if attention_mask is not None:
-			mask = (1 - attention_mask).reshape(attention_mask.shape + (1,))
-			value_states = jnp.where(mask, 0.0, value_states)
-		array = jnp.arange(BLOCK) + 1
-		q_decay = jnp.exp(-slope_rate * array.reshape(-1, 1))
-		k_decay = jnp.exp(-slope_rate * (BLOCK - array.reshape(-1, 1)))
-		index = array[:, None] - array[None, :]
-		s_index = slope_rate * index[None, None]
-		s_index = jnp.where(index >= 0, -s_index, float("-inf"))
-		diag_decay = jnp.exp(s_index)
-
-		# TODO: Creating Pallas kernel of this operation is really easy, make one.
-		def process_block(carry, i):
-			kv = carry
-			si = i * BLOCK
-			ei = jnp.minimum(si + BLOCK, n)
-			m = ei - si
-			qi = jax.lax.dynamic_slice(query_states, (0, 0, si, 0), (b, h, m, d))
-			ki = jax.lax.dynamic_slice(key_states, (0, 0, si, 0), (b, h, m, d))
-			vi = jax.lax.dynamic_slice(value_states, (0, 0, si, 0), (b, h, m, e))
-			qkv_none_diag = jnp.matmul(qi * q_decay[:, :m], kv)
-			qk = jnp.matmul(qi, jnp.transpose(ki, (0, 1, 3, 2))) * diag_decay[:, :, :m, :m]
-			qkv_diag = jnp.matmul(qk, vi)
-			output_block = qkv_none_diag + qkv_diag
-			block_decay = jnp.exp(-slope_rate * m)
-			new_kv = block_decay * kv + jnp.matmul(
-				jnp.transpose(ki * k_decay[:, -m:], (0, 1, 3, 2)), vi
-			)
-
-			return new_kv, output_block
-
-		if cache_view is None:
-			kv_init = jnp.zeros((b, h, d, e))
-			_, outputs = lax.scan(process_block, kv_init, jnp.arange(NUM_BLOCK))
-			output = jnp.concatenate(outputs, axis=2)
-
-		else:
-			kv = cache_view.key_value
-
-			def process_token(carry, i):
-				kv = carry
-				kv = ratio * kv + jnp.einsum(
-					"...nd,...ne->...de",
-					jax.lax.dynamic_slice(key_states, (0, 0, i, 0), (b, h, 1, d)),
-					jax.lax.dynamic_slice(value_states, (0, 0, i, 0), (b, h, 1, e)),
-				)
-				return kv, jnp.einsum(
-					"...ne,...ed->...nd",
-					jax.lax.dynamic_slice(query_states, (0, 0, i, 0), (b, h, 1, d)),
-					kv,
-				)
-
-			_, outputs = lax.scan(process_token, kv, jnp.arange(n))
-			output = outputs
+			assert attention_mask.ndim == 2
+			b, h, s, e = value_states.shape
+			value_states = value_states * attention_mask.reshape(b, 1, s, 1)
+		output = linear_attn(
+			q=query_states,
+			k=key_states,
+			v=value_states,
+			slopes=slope_rate,
+			dtype=self.config.attn_dtype,
+		)
 
 		output = rearrange(output, "b h n d -> b n (h d)")
 		output = self.norm(output)
@@ -404,7 +353,6 @@ class Xerxes2Model(EasyDeLBaseModule):
 		self,
 		input_ids: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
-		slope_rate: tp.Optional[chex.Array] = None,
 		inputs_embeds: tp.Optional[chex.Array] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache] = None,
@@ -428,9 +376,6 @@ class Xerxes2Model(EasyDeLBaseModule):
 		if attention_mask is None:
 			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
 
-		if attention_mask.ndim == 2:
-			attention_mask = jnp.expand_dims(attention_mask, (1, 2))
-
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
 		hidden_states = inputs_embeds
@@ -442,7 +387,7 @@ class Xerxes2Model(EasyDeLBaseModule):
 				hidden_states=hidden_states,
 				attention_mask=attention_mask,
 				cache_view=past_key_values.views[idx],
-				slope_rate=slope_rate,
+				slope_rate=build_slope_tensor(self.config.num_attention_heads),
 			)
 			hidden_states = outputs[0]
 
@@ -509,7 +454,6 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 		self,
 		input_ids: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
-		slope_rate: tp.Optional[chex.Array] = None,
 		inputs_embeds: tp.Optional[chex.Array] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache] = None,
@@ -537,7 +481,6 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
-			slope_rate=slope_rate,
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
 			return_dict=return_dict,
