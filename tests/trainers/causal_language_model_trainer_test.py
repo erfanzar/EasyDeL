@@ -23,8 +23,8 @@ logging.basicConfig(
 
 # Constants
 TOTAL_BATCH_SIZE = 2
-UPPER = 100
-NUM_TRAIN_EPOCHS = 2
+UPPER = 600
+NUM_TRAIN_EPOCHS = 4
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 3e-4
 WARMUP_STEPS = 5
@@ -51,19 +51,20 @@ PURNING_MODULE = (
 def create_model(sequence_length=SEQUENCE_LENGTH, dtype=jnp.float32):
 	"""Creates the model."""
 	logging.info("Creating model...")
-	config = ed.LlamaConfig(
-		head_dim=16,
+	config = ed.Xerxes2Config(
+		vocab_size=32000,
+		# head_dim=16,
 		hidden_size=64,
 		num_attention_heads=8,
-		num_key_value_heads=4,
-		num_hidden_layers=1,
+		# num_key_value_heads=4,
+		num_hidden_layers=4,
 		intermediate_size=128,
 		max_position_embeddings=sequence_length,
 		attn_dtype=dtype,
 		attn_mechanism=ed.AttentionMechanisms.VANILLA,
 	)
 
-	model = ed.LlamaForCausalLM(
+	model = ed.Xerxes2ForCausalLM(
 		config=config,
 		dtype=dtype,
 		param_dtype=dtype,

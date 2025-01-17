@@ -1,6 +1,5 @@
 import jax
 import jax.numpy as jnp
-from functools import partial
 import math
 
 
@@ -23,7 +22,7 @@ def get_full_mask(n, slopes):
 		return masks
 
 
-@partial(jax.jit, static_argnums=(4,))
+# @partial(jax.jit, static_argnums=(4,))
 def linear_attn(q, k, v, slopes, dtype=jnp.float32):
 	b, h, n, d = q.shape
 	mask = get_full_mask(n, slopes).astype(dtype)
