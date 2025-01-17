@@ -34,10 +34,13 @@ from easydel.infra.utils import (
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 )
-from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.caching import LightningCache, LightningCacheView
 from easydel.layers.norms import RMSNorm
 from easydel.utils.helpers import get_logger
-from easydel.layers.ops.lightning_attention import linear_attn, build_slope_tensor
+from easydel.layers.ops.lightning_attention import (
+	lightning_attention,
+	build_slope_tensor,
+)
 from .xerxes2_configuration import Xerxes2Config as Xerxes2Config
 
 logger = get_logger(__name__)
@@ -117,7 +120,7 @@ class Xerxes2Attention(nn.Module):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		slope_rate: chex.Array,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		cache_view: tp.Optional[LightningCacheView] = None,
 	):
 		"""
 		Forward pass of the attention module.
@@ -141,18 +144,25 @@ class Xerxes2Attention(nn.Module):
 		query_states = jnp.transpose(query_states, (0, 2, 1, 3))
 		key_states = jnp.transpose(key_states, (0, 2, 1, 3))
 		value_states = jnp.transpose(value_states, (0, 2, 1, 3))
-		if attention_mask is not None:
-			assert attention_mask.ndim == 2
-			b, h, s, e = value_states.shape
-			value_states = value_states * attention_mask.reshape(b, 1, s, 1)
-		output = linear_attn(
+		print(
+			query_states.shape,
+			key_states.shape,
+			value_states.shape,
+			slope_rate.shape,
+			attention_mask.shape,
+		)
+		output, ola = lightning_attention(
 			q=query_states,
 			k=key_states,
 			v=value_states,
-			slopes=slope_rate,
+			slope_rate=slope_rate,
+			attn_mask=attention_mask,
+			past_key_value=cache_view.key_value if cache_view is not None else None,
 			dtype=self.config.attn_dtype,
 		)
-
+		if cache_view is not None:
+			cache_view.key_value = ola
+		print(output.shape)
 		output = rearrange(output, "b h n d -> b n (h d)")
 		output = self.norm(output)
 		output = jax.nn.sigmoid(self.g_proj(hidden_states)) * output
@@ -262,7 +272,7 @@ class Xerxes2DecoderLayer(nn.Module):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		slope_rate: chex.Array,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		cache_view: tp.Optional[LightningCacheView] = None,
 	):
 		"""
 		Forward pass of the module block.
@@ -355,7 +365,7 @@ class Xerxes2Model(EasyDeLBaseModule):
 		attention_mask: tp.Optional[chex.Array] = None,
 		inputs_embeds: tp.Optional[chex.Array] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[LightningCache] = None,
 		return_dict: bool = True,
 	) -> tp.Union[FlaxBaseModelOutput, tp.Tuple]:
 		"""Forward pass through the Xerxes module."""
@@ -377,7 +387,7 @@ class Xerxes2Model(EasyDeLBaseModule):
 			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
 
 		if past_key_values is None:
-			past_key_values = TransformerCache.init_empty(len(self.layers))
+			past_key_values = LightningCache.init_empty(len(self.layers))
 		hidden_states = inputs_embeds
 		for idx, block in enumerate(self.layers):
 			if output_hidden_states:
@@ -456,7 +466,7 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 		attention_mask: tp.Optional[chex.Array] = None,
 		inputs_embeds: tp.Optional[chex.Array] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[LightningCache] = None,
 		return_dict: bool = True,
 	) -> tp.Union[FlaxCausalLMOutput, tp.Tuple]:
 		"""
