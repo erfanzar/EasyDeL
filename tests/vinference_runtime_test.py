@@ -11,6 +11,7 @@ import jax
 from jax import numpy as jnp
 
 
+print('loaded modules')
 def main():
 	if jax.device_count() > 4:
 		sharding_axis_dims = (1, 1, 1, -1)
