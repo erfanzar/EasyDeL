@@ -30,7 +30,7 @@ if _os.environ.get("EASYDEL_AUTO", "true") in ["true", "1", "on", "yes"]:
 	_os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 	_os.environ["CACHE_TRITON_KERNELS"] = "1"
 	_os.environ["XLA_FLAGS"] = (
-		_os.environ.get("XLA_FLAGS", "") + " "
+		_os.environ.get("XLA_FLAGS", "") # + " "
 		# "--xla_gpu_triton_gemm_any=True  "
 		# "--xla_gpu_enable_while_loop_double_buffering=true  "
 		# "--xla_gpu_enable_pipelined_all_gather=true  "
