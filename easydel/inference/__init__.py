@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from .vinference import vInference, vInferenceApiServer, vInferenceConfig
-# from .whisper_inference import vWhisperInference, vWhisperInferenceConfig
+from .whisper_inference import vWhisperInference, vWhisperInferenceConfig
 
 __all__ = [
 	"vInference",
