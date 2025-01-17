@@ -512,7 +512,6 @@ wheels = [
 [package.optional-dependencies]
 tpu = [
     { name = "jaxlib" },
-    { name = "libtpu" },
     { name = "libtpu-nightly" },
     { name = "requests" },
 ]
@@ -568,14 +567,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/af/92/b3130cbbf5591acf9
 wheels = [
     { url = "https://files.pythonhosted.org/packages/bd/0f/2ba5fbcd631e3e88689309dbe978c5769e883e4b84ebfe7da30b43275c5a/jinja2-3.1.5-py3-none-any.whl", hash = "sha256:aba0f4dc9ed8013c424088f68a5c226f7d6097ed89b246d7749c2ec4175c6adb", size = 134596 },
 ]
-
-# [[package]]
-# name = "libtpu"
-# version = "0.0.8"
-# source = { registry = "https://storage.googleapis.com/jax-releases/libtpu_releases.html" }
-# wheels = [
-#     { url = "https://storage.googleapis.com/libtpu-lts-releases/wheels/libtpu/libtpu-0.0.8-py3-none-linux_x86_64.whl" },
-# ]
 
 [[package]]
 name = "libtpu-nightly"
