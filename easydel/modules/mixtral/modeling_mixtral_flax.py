@@ -308,7 +308,7 @@ class MixtralSparseMoeBlock(nn.Module):
 				block_wise_ffn(
 					self.experts[index],
 					hidden_states,
-					self.config.scan_mlp_chunk_size, 
+					self.config.scan_mlp_chunk_size,
 				)
 				if self.config.use_scan_mlp
 				else self.experts[index](hidden_states)

@@ -595,7 +595,7 @@ class FlaxRwkvPretrainedModel(EasyDeLBaseModule):
 	config=RwkvConfig,
 	model_type="rwkv",
 	embedding_layer_names=["embed_tokens"],
-	layernorm_names=["ln_out", "ln2", "ln1", "pre_ln"], 
+	layernorm_names=["ln_out", "ln2", "ln1", "pre_ln"],
 )
 class FlaxRwkvModel(nn.Module):
 	config: RwkvConfig
@@ -716,7 +716,7 @@ class FlaxRwkvModel(nn.Module):
 	config=RwkvConfig,
 	model_type="rwkv",
 	embedding_layer_names=["embed_tokens"],
-	layernorm_names=["ln_out", "ln2", "ln1", "pre_ln"], 
+	layernorm_names=["ln_out", "ln2", "ln1", "pre_ln"],
 )
 class FlaxRwkvForCausalLM(nn.Module):
 	config: RwkvConfig

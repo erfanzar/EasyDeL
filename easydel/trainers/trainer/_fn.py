@@ -23,10 +23,10 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 
 from ..training_utils import (
+	make_assertions_and_get_sizes,
 	minibatch_call,
 	update_metrics,
 	update_state_respectfully,
-	make_assertions_and_get_sizes,
 )
 
 

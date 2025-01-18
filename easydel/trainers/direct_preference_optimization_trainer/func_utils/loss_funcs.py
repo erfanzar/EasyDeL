@@ -18,8 +18,8 @@ import typing as tp
 import chex
 import jax
 from jax import numpy as jnp
-
-from jax.nn import sigmoid, relu, log_sigmoid as logsigmoid
+from jax.nn import log_sigmoid as logsigmoid
+from jax.nn import relu, sigmoid
 
 
 def get_loss_function(

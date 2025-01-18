@@ -36,11 +36,12 @@ from easydel.infra.utils import (
 )
 from easydel.layers.caching import LightningCache, LightningCacheView
 from easydel.layers.norms import RMSNorm
-from easydel.utils.helpers import get_logger
 from easydel.layers.ops.lightning_attention import (
-	lightning_attention,
 	build_slope_tensor,
+	lightning_attention,
 )
+from easydel.utils.helpers import get_logger
+
 from .xerxes2_configuration import Xerxes2Config as Xerxes2Config
 
 logger = get_logger(__name__)
@@ -144,13 +145,7 @@ class Xerxes2Attention(nn.Module):
 		query_states = jnp.transpose(query_states, (0, 2, 1, 3))
 		key_states = jnp.transpose(key_states, (0, 2, 1, 3))
 		value_states = jnp.transpose(value_states, (0, 2, 1, 3))
-		print(
-			query_states.shape,
-			key_states.shape,
-			value_states.shape,
-			slope_rate.shape,
-			attention_mask.shape,
-		)
+
 		output, ola = lightning_attention(
 			q=query_states,
 			k=key_states,
@@ -158,11 +153,11 @@ class Xerxes2Attention(nn.Module):
 			slope_rate=slope_rate,
 			attn_mask=attention_mask,
 			past_key_value=cache_view.key_value if cache_view is not None else None,
+			init_cache=True if cache_view is not None else False,
 			dtype=self.config.attn_dtype,
 		)
 		if cache_view is not None:
 			cache_view.key_value = ola
-		print(output.shape)
 		output = rearrange(output, "b h n d -> b n (h d)")
 		output = self.norm(output)
 		output = jax.nn.sigmoid(self.g_proj(hidden_states)) * output

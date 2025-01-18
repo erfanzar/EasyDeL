@@ -141,7 +141,7 @@ class Conv1D(nn.Module):
 		precision: tp.Optional[tp.Union[str, lax.Precision]] = None,
 		*,
 		rngs: nn.Rngs,
-	): 
+	):
 		self.kernel = nn.Param(
 			nn.initializers.lecun_normal(dtype=param_dtype)(
 				rngs.params(),

@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
-from functools import partial
 import re
 import typing as tp
 import warnings
+from functools import partial
 
 import chex
 import jax

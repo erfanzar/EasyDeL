@@ -16,10 +16,10 @@
 import gc
 import threading
 import time
-from chex import dataclass
 
 import jax
 import psutil
+from chex import dataclass
 
 try:
 	from prometheus_client import Counter, Gauge, Histogram, Info, start_http_server

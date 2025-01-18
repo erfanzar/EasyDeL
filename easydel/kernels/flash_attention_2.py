@@ -13,11 +13,11 @@
 # limitations under the License.
 
 
-from functools import partial
 import os
 import typing as tp
 from dataclasses import dataclass
 from enum import Enum
+from functools import partial
 
 import chex
 import einops
