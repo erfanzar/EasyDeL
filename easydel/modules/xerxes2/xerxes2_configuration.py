@@ -139,9 +139,10 @@ class Xerxes2Config(EasyDeLBaseConfig):
 		return (
 			("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
 			(
-				"self_attn/(q_proj|k_proj|v_proj|e_proj)/kernel",
+				"self_attn/(q_proj|k_proj|v_proj|g_proj)/kernel",
 				PartitionSpec(("fsdp", "sp"), "tp"),
 			),
+			("self_attn/norm/kernel", PartitionSpec("tp")),
 			("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
 			("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
