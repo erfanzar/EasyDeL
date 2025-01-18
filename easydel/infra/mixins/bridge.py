@@ -169,7 +169,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		save_directory = Path(save_directory)
 		if enable is None:
 			enable = jax.process_index() == 0
-			
+
 		if save_directory.is_file():
 			logger.error(
 				f"Provided path ({save_directory}) should be a directory, not a file"

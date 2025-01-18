@@ -12,15 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from __future__ import annotations
+
 import typing as tp
 
 import chex as cx
 from fjformer.core import ImplicitArray
 from jax import numpy as jnp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
-
-from easydel.escale import PartitionAxis
-from easydel.infra.etils import EasyDeLQuantizationMethods
 
 if tp.TYPE_CHECKING:
 	from easydel.utils.quantizers import EasyQuantizer
@@ -100,30 +97,9 @@ class LightningCacheView:
 	layer_index: tp.Optional[int] = None
 
 	@classmethod
-	def init(
-		cls,
-		metadata: LightningCacheMetaData,
-		quantizer: EasyQuantizer,
-		key_values_partition_specs: PartitionSpec,
-		dtype: jnp.dtype,
-		mesh: Mesh,
-		layer_index: tp.Optional[int] = None,
-	):
-		device = NamedSharding(mesh=mesh, spec=key_values_partition_specs)
-
+	def init(cls, metadata: LightningCacheMetaData, layer_index: tp.Optional[int] = None):
 		return cls(
-			key_value=quantizer(
-				jnp.zeros(
-					shape=(
-						metadata.batch_size,
-						metadata.num_heads,
-						metadata.key_dim,
-						metadata.value_dim,
-					),
-					dtype=dtype,
-					device=device,
-				),
-			),
+			key_value=None,
 			index=jnp.zeros((metadata.batch_size,), dtype=jnp.int32),
 			metadata=metadata,
 			layer_index=layer_index,
@@ -143,37 +119,10 @@ class LightningCache:
 	views: tp.List[tp.Optional[LightningCacheView]]
 
 	@classmethod
-	def init_layers_cache(
-		cls,
-		num_hidden_layers: int,
-		metadata: LightningCacheMetaData,
-		mesh: Mesh,
-		quantizer: tp.Optional[EasyQuantizer] = None,
-		dtype: tp.Optional[jnp.dtype] = None,
-		key_values_partition_specs: tp.Optional[PartitionSpec] = None,
-	):
-		from easydel.utils.quantizers import EasyQuantizer
-
-		paxis = PartitionAxis()
-		quantizer = quantizer or EasyQuantizer(EasyDeLQuantizationMethods.NONE)
-		key_values_partition_specs = key_values_partition_specs or PartitionSpec(
-			paxis.batch_axis,
-			paxis.head_axis,
-			None,
-			None,
-		)
-		if dtype is None:
-			dtype = jnp.bfloat16
+	def init_layers_cache(cls, num_hidden_layers: int, metadata: LightningCacheMetaData):
 		return cls(
 			views=[
-				LightningCacheView.init(
-					metadata=metadata,
-					quantizer=quantizer,
-					key_values_partition_specs=key_values_partition_specs,
-					dtype=dtype,
-					mesh=mesh,
-					layer_index=layer_index,
-				)
+				LightningCacheView.init(metadata=metadata, layer_index=layer_index)
 				for layer_index in range(num_hidden_layers)
 			]
 		)

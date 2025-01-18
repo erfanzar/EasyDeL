@@ -153,9 +153,9 @@ class TrainingArguments:
 		Performs validation checks on the provided configuration settings.
 		Raises ValueError if any configuration is invalid.
 		"""
-		assert self.gradient_accumulation_steps > 0, (
-			"`gradient_accumulation_steps` can't be lower than 1."
-		)
+		assert (
+			self.gradient_accumulation_steps > 0
+		), "`gradient_accumulation_steps` can't be lower than 1."
 
 		if self.backend not in AVAILABLE_BACKENDS:
 			raise ValueError(

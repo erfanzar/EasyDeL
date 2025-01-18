@@ -1,7 +1,8 @@
-import jax
-import jax.numpy as jnp
 import math
 import typing as tp
+
+import jax
+import jax.numpy as jnp
 
 
 def lightning_attention(
@@ -9,38 +10,58 @@ def lightning_attention(
 	k: jax.Array,
 	v: jax.Array,
 	slope_rate: jax.Array,
+	position_ids: tp.Optional[jax.Array] = None,
 	attn_mask: tp.Optional[jax.Array] = None,
 	past_key_value: tp.Optional[jax.Array] = None,
 	init_cache: bool = False,
 	dtype: jnp.dtype = jnp.float32,
-) -> tp.Tuple[jax.Array, jax.Array]:
+) -> tp.Tuple[jax.Array, tp.Optional[jax.Array]]:
 	ratio = jnp.exp(-slope_rate)
 	slope_rate = jnp.asarray(slope_rate).astype(dtype)
 	b, h, n, d = q.shape
-	positions = jnp.arange(n) + 1
+	if position_ids is None:
+		positions = jnp.arange(n) + 1
+	else:
+		position_ids += 1
 	index = positions[:, None] - positions[None, :]
 	s_index = jnp.expand_dims(slope_rate * index, 0)
-	diag_decay = jnp.where(index >= 0, jnp.exp(-s_index), 0.0).astype(dtype)
+	s_index = jnp.where(index >= 0, -s_index, float("-inf")).astype(dtype)
+	diag_decay = jnp.exp(s_index)
 	if attn_mask is not None:
 		attn_mask = attn_mask[:, None, :, None]
 		v = v * attn_mask
-	qk = jnp.matmul(q, jnp.transpose(k, (0, 1, 3, 2)))
-	qk_decay = qk * diag_decay
-	qkv_diag = jnp.matmul(qk_decay, v)
-	if past_key_value is None and not init_cache:
-		return qkv_diag, None
-	else:
+	qk = jnp.matmul(q, jnp.transpose(k, (0, 1, 3, 2))) * diag_decay
+	qkv_diag = jnp.matmul(qk, v)
+	output = qkv_diag
+	if past_key_value is not None:
+		output = []
+		for i in range(n):
+			past_key_value = ratio * past_key_value + jnp.einsum(
+				"... n d, ... n e -> ... d e",
+				k[:, :, i : i + 1],
+				v[:, :, i : i + 1],
+			)
+			output.append(
+				jnp.einsum(
+					"... n e, ... e d -> ... n d",
+					q[:, :, i : i + 1],
+					past_key_value.astype(q.dtype),
+				)
+			)
+		output = jnp.concatenate(output, axis=-2)
+	elif init_cache:
 		if past_key_value is None:
 			past_key_value = jnp.zeros((b, h, d, v.shape[-1]), dtype=v.dtype)
-		kv = past_key_value
-		q_decay = jnp.exp(-slope_rate * positions).reshape(1, 1, n, 1)
-		q_decay = q_decay.astype(dtype)
-		qkv_none_diag = jnp.matmul(q * q_decay, kv)
+		q_decay = jnp.exp(-slope_rate * positions).reshape(h, n, 1).astype(dtype)
+		k_decay = jnp.exp(-slope_rate * (n - positions)).reshape(h, n, 1).astype(dtype)
+		qkv_none_diag = jnp.matmul(q * q_decay, past_key_value)
 		output = qkv_none_diag + qkv_diag
-		k_decay = jnp.exp(-slope_rate * (n - positions)).reshape(1, 1, n, 1)
-		k_decay = k_decay.astype(dtype)
-		kv = ratio * kv + jnp.matmul((k * k_decay).transpose(0, 1, 3, 2), v)
-		return output, kv
+		past_key_value = ratio * past_key_value + jnp.matmul(
+			(k * k_decay).transpose(0, 1, 3, 2),
+			v,
+		)
+
+	return output, past_key_value
 
 
 def build_slope_tensor(n_attention_heads):

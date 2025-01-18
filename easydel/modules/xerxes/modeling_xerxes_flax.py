@@ -62,7 +62,16 @@ class RMSNorm(nn.Module):
 		)
 
 	def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-		x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
+		if self.dtype in [
+			jnp.float8_e4m3b11fnuz,
+			jnp.float8_e4m3fn,
+			jnp.float8_e4m3fnuz,
+			jnp.float8_e5m2,
+			jnp.float8_e5m2fnuz,
+		]:
+			x = x.astype(jnp.float32)
+		else:
+			x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
 		output = self._norm(x).astype(self.dtype)
 		return (self.weight.value.astype(self.dtype)) * output
 

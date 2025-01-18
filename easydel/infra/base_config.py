@@ -37,9 +37,9 @@ from .etils import (
 	EasyDeLQuantizationMethods,
 )
 
-
 if tp.TYPE_CHECKING:
 	from easydel.layers.rotary_embedding import RopeConfig
+
 	from .utils import ModuleCaches
 else:
 	RopeConfig = tp.Any
@@ -750,6 +750,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		    ModuleCaches instance containing computed frequencies
 		"""
 		from easydel.layers.rotary_embedding import get_frequencies
+
 		from .utils import ModuleCaches
 
 		head_size = head_size or self.head_dim

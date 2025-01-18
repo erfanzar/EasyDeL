@@ -20,11 +20,11 @@ import warnings
 from functools import partial
 
 import chex
-from einops import rearrange
 import jax
 import jax.numpy as jnp
+from einops import rearrange
 from flax import nnx as nn
-from jax import lax
+
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
@@ -42,6 +42,7 @@ from easydel.infra.utils import (
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
 from easydel.layers.norms import RMSNorm
+from easydel.layers.ops import lightning_attention
 
 from .minimax_text_01_configuration import MiniMaxText01Config
 
@@ -167,6 +168,48 @@ class MiniMaxText01LightningAttention(nn.Module):
 		rngs: nn.Rngs,
 	):
 		super().__init__()
+		self.config = config
+		self.layer_idx = layer_idx
+		self.hidden_size = config.hidden_size
+		self.num_heads = config.num_attention_heads
+		self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
+
+		self.out_proj = nn.Linear(
+			self.head_dim * self.num_heads,
+			self.hidden_size,
+			use_bias=False,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+		self.act = get_activation_fn(config.hidden_act)
+		self.norm = RMSNorm(
+			self.head_dim * self.num_heads,
+			eps=config.rms_norm_eps,
+			rngs=rngs,
+			dtype=dtype,
+			param_dtype=param_dtype,
+		)
+
+		self.qkv_proj = nn.Linear(
+			self.hidden_size,
+			3 * self.head_dim * self.num_heads,
+			use_bias=False,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+		self.output_gate = nn.Linear(
+			self.hidden_size,
+			self.head_dim * self.num_heads,
+			use_bias=False,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
 
 	def __call__(
 		self,
@@ -182,6 +225,11 @@ class MiniMaxText01LightningAttention(nn.Module):
 		slope_rate: tp.Optional[chex.Array] = None,
 	):
 		# TODO: fix these static issues here
+		batch_size, sequence_length, _ = hidden_states.shape
+		query_states, key_states, value_states = jnp.split(
+			self.act(self.qkv_proj(hidden_states)), 3, -1
+		)
+
 		to_shape = (batch_size, sequence_length, self.num_heads, self.head_dim)
 		query_states = query_states.reshape(*to_shape)
 		key_states = key_states.reshape(*to_shape)
@@ -189,76 +237,24 @@ class MiniMaxText01LightningAttention(nn.Module):
 		query_states = jnp.transpose(query_states, (0, 2, 1, 3))
 		key_states = jnp.transpose(key_states, (0, 2, 1, 3))
 		value_states = jnp.transpose(value_states, (0, 2, 1, 3))
-
-		attn_output = self.shard_attention_prod()
-		attn_output = self.o_proj(attn_output)
-
-		b, h, n, d = query_states.shape
-		e = value_states.shape[-1]
-		BLOCK = self.config.compute_blocksize
-		NUM_BLOCK = (n + BLOCK - 1) // BLOCK
-
-		ratio = jnp.exp(-slope_rate)
-		if attention_mask is not None:
-			mask = (1 - attention_mask).reshape(attention_mask.shape + (1,))
-			value_states = jnp.where(mask, 0.0, value_states)
-		array = jnp.arange(BLOCK) + 1
-		q_decay = jnp.exp(-slope_rate * array.reshape(-1, 1))
-		k_decay = jnp.exp(-slope_rate * (BLOCK - array.reshape(-1, 1)))
-		index = array[:, None] - array[None, :]
-		s_index = slope_rate * index[None, None]
-		s_index = jnp.where(index >= 0, -s_index, float("-inf"))
-		diag_decay = jnp.exp(s_index)
-
-		# TODO: Creating Pallas kernel of this operation is really easy, make one.
-		def process_block(carry, i):
-			kv = carry
-			si = i * BLOCK
-			ei = jnp.minimum(si + BLOCK, n)
-			m = ei - si
-			qi = jax.lax.dynamic_slice(query_states, (0, 0, si, 0), (b, h, m, d))
-			ki = jax.lax.dynamic_slice(key_states, (0, 0, si, 0), (b, h, m, d))
-			vi = jax.lax.dynamic_slice(value_states, (0, 0, si, 0), (b, h, m, e))
-			qkv_none_diag = jnp.matmul(qi * q_decay[:, :m], kv)
-			qk = jnp.matmul(qi, jnp.transpose(ki, (0, 1, 3, 2))) * diag_decay[:, :, :m, :m]
-			qkv_diag = jnp.matmul(qk, vi)
-			output_block = qkv_none_diag + qkv_diag
-			block_decay = jnp.exp(-slope_rate * m)
-			new_kv = block_decay * kv + jnp.matmul(
-				jnp.transpose(ki * k_decay[:, -m:], (0, 1, 3, 2)), vi
-			)
-
-			return new_kv, output_block
-
-		if cache_view is None:
-			kv_init = jnp.zeros((b, h, d, e))
-			_, outputs = lax.scan(process_block, kv_init, jnp.arange(NUM_BLOCK))
-			output = jnp.concatenate(outputs, axis=2)
-
-		else:
-			kv = cache_view.key_value
-
-			def process_token(carry, i):
-				kv = carry
-				kv = ratio * kv + jnp.einsum(
-					"...nd,...ne->...de",
-					jax.lax.dynamic_slice(key_states, (0, 0, i, 0), (b, h, 1, d)),
-					jax.lax.dynamic_slice(value_states, (0, 0, i, 0), (b, h, 1, e)),
-				)
-				return kv, jnp.einsum(
-					"...ne,...ed->...nd",
-					jax.lax.dynamic_slice(query_states, (0, 0, i, 0), (b, h, 1, d)),
-					kv,
-				)
-
-			_, outputs = lax.scan(process_token, kv, jnp.arange(n))
-			output = outputs
-
+		output, ola = lightning_attention.lightning_attention(
+			q=query_states,
+			k=key_states,
+			v=value_states,
+			position_ids=None,
+			slope_rate=slope_rate,
+			attn_mask=attention_mask,
+			past_key_value=cache_view.key_value if cache_view is not None else None,
+			init_cache=True if cache_view is not None else False,
+			dtype=self.config.attn_dtype,
+		)
+		if cache_view is not None:
+			cache_view.key_value = ola
 		output = rearrange(output, "b h n d -> b n (h d)")
 		output = self.norm(output)
 		output = jax.nn.sigmoid(self.g_proj(hidden_states)) * output
 		output = self.o_proj(output)
-		return (attn_output, None)
+		return (output, None)
 
 
 class MiniMaxText01Attention(FlaxAttentionModule):

@@ -61,7 +61,7 @@ def get_logger(
 	"""
 	if jax.process_index() > 0:
 		level = logging.WARNING
-		
+
 	logger = logging.getLogger(name)
 	logger.propagate = False
 
