@@ -969,7 +969,10 @@ class CompilationTracker:
 			return 0
 		cached_flops = 0
 		for cm in self.functions:
-			cached_flops += getattr(cm.cost_analysis(), "flops", 0)
+			try:
+				cached_flops += cm.cost_analysis()["flops"]
+			except Exception:
+				...
 		return cached_flops
 
 	@contextmanager
@@ -983,7 +986,10 @@ class CompilationTracker:
 				cmpf = list(new)
 				self.functions = cmpf
 				for cm in cmpf:
-					self.cached_flops += getattr(cm.cost_analysis(), "flops", 0)
+					try:
+						self.cached_flops += cm.cost_analysis()["flops"]
+					except Exception:
+						...
 			self.first_time = False
 		else:
 			yield
