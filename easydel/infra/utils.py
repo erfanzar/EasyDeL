@@ -483,7 +483,7 @@ def unwrap_lora_to_layers(
 def print_pytree(pytree):
 	jax.tree_util.tree_map_with_path(
 		lambda p, v: print(
-			f"{fjformer.tree_path_to_string(p,'.')}: dtype:{v.dtype}, shape:{v.shape}"
+			f"{fjformer.tree_path_to_string(p, '.')}: dtype:{v.dtype}, shape:{v.shape}"
 		),
 		pytree,
 	)
@@ -969,7 +969,7 @@ class CompilationTracker:
 			return 0
 		cached_flops = 0
 		for cm in self.functions:
-			cached_flops += cm.cost_analysis()["flops"]
+			cached_flops += getattr(cm.cost_analysis(), "flops", 0)
 		return cached_flops
 
 	@contextmanager
@@ -983,7 +983,7 @@ class CompilationTracker:
 				cmpf = list(new)
 				self.functions = cmpf
 				for cm in cmpf:
-					self.cached_flops += cm.cost_analysis()["flops"]
+					self.cached_flops += getattr(cm.cost_analysis(), "flops", 0)
 			self.first_time = False
 		else:
 			yield
