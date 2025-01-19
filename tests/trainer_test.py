@@ -8,8 +8,7 @@ sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import easydel as ed
 
 MODEL_REPO_ID = "meta-llama/Llama-3.1-8B-Instruct"
-MAX_LENGTH = 2048
-MAX_TRAINING_STEPS = 10_000
+MAX_LENGTH = 1024
 SHARDING_AXIS_DIMS = (1, -1, 1, 1)
 
 DTYPE = jnp.bfloat16
