@@ -132,7 +132,9 @@ def smart_compile(
 			f"`smart_compile` is being called in `spmd` env with {pc} "
 			f"process count skip loading and saving compiled fn with tag=`{tag}`."
 		)
-		return lowered_func.compile()
+		lfunc = lowered_func.compile()
+		logger.debug(f"compiled function with tag=`{tag}`.")
+		return lfunc
 	func_hash = get_hash_of_lowering(lowered_func)
 	foldername = str(func_hash) if tag is None else f"{tag}-{func_hash}"
 	func_dir = COMPILE_FUNC_DIR / foldername

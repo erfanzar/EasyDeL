@@ -117,6 +117,7 @@ class BaseAutoEasyModel:
 				shard_attention_computation=shard_attention_computation,
 				**kwargs,
 			)
+			
 		cmg = jax.default_device(device) if device is not None else contextlib.nullcontext()
 		with cmg:
 			return cls._from_easydel_params(
