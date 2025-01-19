@@ -24,6 +24,7 @@ from flax.nnx import traversals
 from jax.interpreters import pxla
 from jax.sharding import Mesh, NamedSharding
 
+from collections.abc import Iterable
 from easydel.utils.helpers import get_logger
 
 PyTree = tp.Dict
@@ -119,6 +120,10 @@ def _dict_flatten_dict(xs, keep_empty_nodes=False, is_leaf=None, sep=None):
 		return result
 
 	return _flatten(xs, ())
+
+
+def is_iterable(obj):
+	return isinstance(obj, Iterable)
 
 
 def _dict_unflatten_dict(xs, sep=None):

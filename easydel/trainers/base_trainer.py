@@ -38,6 +38,7 @@ import easydel
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
 from easydel.infra.loss_utils import LossMetrics
+from easydel.infra.utils import CompilationTracker
 from easydel.utils.traversals import specs_to_name_sharding
 
 try:
@@ -56,6 +57,7 @@ from easydel.utils.helpers import get_logger
 from .trainer_protocol import (
 	BaseProgressBar,
 	BaseTrainerProtocol,
+	JSONProgressBar,
 	NullProgressBar,
 	RichProgressBar,
 	TqdmProgressBar,
@@ -160,16 +162,9 @@ class BaseTrainer(BaseTrainerProtocol):
 			"sharded_evaluation_step_function",
 			None,
 		)
-		self.sharded_training_step_function_flops = getattr(
-			self,
-			"sharded_training_step_function_flops",
-			None,
-		)
-		self.sharded_evaluation_step_function_flops = getattr(
-			self,
-			"sharded_evaluation_step_function_flops",
-			None,
-		)
+
+		self.train_tracker = getattr(self, "train_tracker", CompilationTracker())
+		self.evalu_tracker = getattr(self, "evalu_tracker", CompilationTracker())
 
 	def _initialize_memory_tracking(self):
 		if not self.arguments.performance_mode:
@@ -195,9 +190,9 @@ class BaseTrainer(BaseTrainerProtocol):
 			flops = function.cost_analysis()[0]["flops"]
 		except Exception:
 			flops = (
-				self.sharded_training_step_function_flops
+				self.train_tracker.cached_flops
 				if is_training
-				else self.sharded_evaluation_step_function_flops
+				else self.evalu_tracker.cached_flops
 			)
 		return flops
 
@@ -790,38 +785,7 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 		self._setup_static_metrics()
 		self._evaluation_time_start = time.time()
 
-	def _setup_static_metrics(self):
-		from easydel.infra.utils import count_flop_jaxpr
-
-		try:
-			if self.sharded_training_step_function_flops is None:
-				self.sharded_training_step_function_flops = (
-					count_flop_jaxpr(
-						self.sharded_training_step_function.trace(
-							self.model_state,
-							next(iter(self.dataloader_train)),
-						).jaxpr
-					),
-					True,
-				)
-			if (
-				self.dataloader_eval is not None
-				and self.sharded_evaluation_step_function_flops is None
-			):
-				self.sharded_evaluation_step_function_flops = (
-					count_flop_jaxpr(
-						self.sharded_evaluation_step_function.trace(
-							self.model_state,
-							next(iter(self.dataloader_eval)),
-						).jaxpr
-					),
-					True,
-				)
-		except Exception as e:
-			logger.error(
-				"Error in `_setup_static_metrics`: %s. If you are tweaking the function, you must override it.",
-				str(e),
-			)
+	def _setup_static_metrics(self): ...
 
 	def compile_aot(self) -> bool:
 		compiled = False
@@ -984,9 +948,10 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 		"""Create a progress bar of the specified type."""
 		if disabled:
 			return NullProgressBar()
-		if self.arguments.progress_bar_type == "tqdm":
+		rpr = self.arguments.progress_bar_type
+		if rpr == "tqdm":
 			return TqdmProgressBar(tqdm.tqdm(total=total, desc=desc, disable=disabled))
-		else:  # rich
+		elif rpr == "rich":  # rich
 			from rich.progress import Progress
 
 			if hasattr(self, "_hidden_rich_pbar"):
@@ -1017,6 +982,10 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 				self._hidden_rich_pbar = progress
 			task_id = progress.add_task(desc, total=total)
 			return RichProgressBar(progress, task_id)
+		elif rpr == "json":
+			return JSONProgressBar(desc=desc)
+		else:
+			raise NotImplementedError(f"Progress Bar type {rpr}'s not supported.")
 
 	def log_metrics(
 		self,
@@ -1030,12 +999,7 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 		if ((step + 1) % self.arguments.log_steps == 0) or (step == 0):
 			if step == 0:
 				pbar.reset()
-
-			# Filter and format metrics for display
-			display_metrics = {
-				k.replace(f"{mode}/", ""): v for k, v in metrics.items() if len(k) < 30
-			}
-
+			display_metrics = {k: v for k, v in metrics.items() if len(k) < 40}
 			# Update progress bar
 			pbar.set_postfix(**display_metrics)
 			update_size = 0 if step == 0 else self.arguments.log_steps

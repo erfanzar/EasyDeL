@@ -16,6 +16,7 @@ from functools import partial
 
 import jax
 from jax import numpy as jnp
+import jax.lib
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_state import EasyDeLState
@@ -235,7 +236,11 @@ class Trainer(BaseTrainer):
 				return state, exect
 
 			# Execute training step
-			state, metrics, run_exception = self._execute_train_step(state=state, batch=batch)
+			with self.train_tracker.trace_compilation():
+				state, metrics, run_exception = self._execute_train_step(
+					state=state,
+					batch=batch,
+				)
 			# Update and log metrics
 			try:
 				mean_loss, mean_accuracy = metrics_tracker.update(
@@ -297,7 +302,9 @@ class Trainer(BaseTrainer):
 			try:
 				batch = self._get_next_batch(eval_iter)
 				step_metrics.start_step()
-				metrics = self._execute_eval_step(state, batch)
+
+				with self.evalu_tracker.trace_compilation():
+					metrics = self._execute_eval_step(state, batch)
 				mean_loss, mean_accuracy = metrics_tracker.update(
 					metrics.loss,
 					metrics.accuracy,
@@ -342,8 +349,6 @@ class Trainer(BaseTrainer):
 					state.opt_state,
 				)
 			)
-
-		# Forward and backward pass
 		try:
 			state, metrics = self.sharded_training_step_function(state, batch)
 			# Apply post-gradient updates
