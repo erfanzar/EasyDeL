@@ -100,7 +100,7 @@ class TrainingArguments:
 	performance_mode: bool = False
 	pruning_module: AVAILABLE_PRUNING_TYPE = None
 	process_zero_is_admin: bool = True
-	progress_bar_type: tp.Literal["tqdm", "rich"] = "tqdm"
+	progress_bar_type: tp.Literal["tqdm", "rich", "json"] = "json"
 	remove_ckpt_after_load: bool = False
 	remove_unused_columns: bool = True
 	save_directory: str = "EasyDeL-Checkpoints"

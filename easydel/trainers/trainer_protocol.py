@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import abc
 import os
+import pprint
 import time
 import typing as tp
 from abc import ABCMeta, abstractmethod
@@ -41,6 +42,7 @@ from rich.text import Text
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossMetrics
+from easydel.infra.utils import CompilationTracker
 from easydel.utils.traversals import flatten_dict
 
 try:
@@ -125,13 +127,9 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 	model_state: EasyDeLState
 
 	sharded_training_step_function: JitWrapped
-	sharded_training_step_function_flops: tp.Optional[
-		tp.Union[tp.Tuple[float, bool], float]
-	]
+	train_tracker: CompilationTracker
 	sharded_evaluation_step_function: JitWrapped
-	sharded_evaluation_step_function_flops: tp.Optional[
-		tp.Union[tp.Tuple[float, bool], float]
-	]
+	evalu_tracker: CompilationTracker
 
 	mesh: tp.Any
 	checkpoint_manager: tp.Any
@@ -140,7 +138,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 	state_named_sharding: tp.Any
 	state: tp.Any
 	pruning_module: tp.Any
-
 	memory_monitor: tp.Any
 
 	@abstractmethod
@@ -588,7 +585,7 @@ class StepMetrics:
 		metrics: LossMetrics,
 		current_step: int,
 		epoch: int,
-		flops: tp.Union[tp.Tuple[float, bool], float],
+		flops: float,
 		batch_size: int,
 		seq_length: int,
 		learning_rate: float,
@@ -599,14 +596,25 @@ class StepMetrics:
 		step_time = time.time() - self.step_start_time
 		total_time = time.time() - self.start_time
 
-		if isinstance(flops, tuple):
-			assert len(flops) == 2
-			flops = flops[0] / step_time
-
 		visited_tokens = seq_length * (current_step + 1) * batch_size
+		throughput = (seq_length * batch_size) / step_time
 		flops_per_token = flops / visited_tokens
 		flops_per_sequence = flops / ((current_step + 1) * batch_size)
 
+		flops_pre_second = flops / step_time
+		flops_token_pre_second = flops / visited_tokens
+		flops_sequence_pre_second = flops / ((current_step + 1) * batch_size)
+		mlperf_metrics = {
+			"mlperf/flops": float(flops),
+			"mlperf/flops_per_token": float(flops_per_token),
+			"mlperf/flops_per_sequence": float(flops_per_sequence),
+			"mlperf/flops_pre_second": float(flops_pre_second),
+			"mlperf/flops_token_pre_second": float(flops_token_pre_second),
+			"mlperf/flops_sequence_pre_second": float(flops_sequence_pre_second),
+			"mlperf/throughput": throughput,
+			"mlperf/step_time": float(step_time),
+			"mlperf/total_time": float(total_time),
+		}
 		loss = metrics.loss
 		z_loss = metrics.z_loss
 		basic_metrics = {
@@ -614,14 +622,9 @@ class StepMetrics:
 			"z_loss": float(z_loss) if z_loss is not None else None,
 			"learning_rate": float(np.array(learning_rate).item()),
 			"step": int(current_step),
-			"step_time": float(step_time),
 			"perplexity": float(jnp.exp(loss)),
 			"visited_tokens": visited_tokens,
 			"epoch": int(epoch),
-			"flops": float(flops),
-			"flops_per_token": float(flops_per_token),
-			"flops_per_sequence": float(flops_per_sequence),
-			"total_time": float(total_time),
 			**extras,
 		}
 		if metrics.accuracy is not None:
@@ -640,6 +643,7 @@ class StepMetrics:
 			basic_metrics.update(detailed_metrics)
 		if mode is not None:
 			basic_metrics = {f"{mode}/{k}": v for k, v in basic_metrics.items()}
+		basic_metrics.update(mlperf_metrics)
 		return basic_metrics
 
 	def _calculate_detailed_metrics(self, metrics: LossMetrics):
@@ -799,6 +803,27 @@ class TqdmProgressBar(BaseProgressBar):
 
 	def close(self) -> None:
 		self.pbar.close()
+
+
+class JSONProgressBar(BaseProgressBar):
+	"""Wrapper for JSON"""
+
+	def __init__(self, desc=""):
+		self.desc = desc
+
+	def update(self, n: int = 1) -> None: ...
+
+	def set_postfix(self, **kwargs) -> None:
+		print(self.desc, end=" - ")
+		pprint.pprint(
+			kwargs,
+			indent=2,
+			compact=True,
+		)
+
+	def reset(self) -> None: ...
+
+	def close(self) -> None: ...
 
 
 class RichProgressBar(BaseProgressBar):

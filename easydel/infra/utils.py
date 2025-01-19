@@ -18,7 +18,9 @@ import re
 import types
 import typing as tp
 import warnings
-from functools import partial
+from contextlib import contextmanager
+from functools import lru_cache, partial
+from typing import List, Set
 
 import fjformer
 import flax
@@ -929,6 +931,75 @@ def count_flop_jaxpr(jaxpr: Jaxpr) -> int:
 
 	visit_jaxpr(jaxpr)
 	return flops
+
+
+class TraceResult:
+	def __init__(self, executable):
+		self._executable = executable
+		self._cached_cost = None
+
+	@property
+	@lru_cache(maxsize=1)  # noqa
+	def cost_analysis(self):
+		return self._executable.cost_analysis()
+
+	@property
+	def flops(self):
+		return self.cost_analysis["flops"]
+
+
+class FunctionTracer:
+	def __init__(self):
+		self.new_executables: List[TraceResult] = []
+		self._before: Set = set()
+
+	def __getitem__(self, idx):
+		return self.new_executables[idx]
+
+
+class CompilationTracker:
+	def __init__(self):
+		self.first_time = True
+		self.cached_flops = 0
+		self.functions = None
+
+	@property
+	def online_flops(self):
+		if self.functions is None:
+			return 0
+		cached_flops = 0
+		for cm in self.functions:
+			cached_flops += cm.cost_analysis()["flops"]
+		return cached_flops
+
+	@contextmanager
+	def trace_compilation(self):
+		if self.first_time:
+			before = set(jax.lib.xla_bridge.get_backend().live_executables())
+			yield
+			after = set(jax.lib.xla_bridge.get_backend().live_executables())
+			new = after - before
+			if new:
+				cmpf = list(new)
+				self.functions = cmpf
+				for cm in cmpf:
+					self.cached_flops += cm.cost_analysis()["flops"]
+			self.first_time = False
+		else:
+			yield
+
+
+@contextmanager
+def trace_functions():
+	tracer = FunctionTracer()
+	tracer._before = set(jax.lib.xla_bridge.get_backend().live_executables())
+
+	try:
+		yield tracer
+	finally:
+		after = set(jax.lib.xla_bridge.get_backend().live_executables())
+		new = after - tracer._before
+		tracer.new_executables = [TraceResult(exe) for exe in new]
 
 
 class ModuleCaches(nn.Cache): ...
