@@ -18,7 +18,7 @@ def main():
 	else:
 		sharding_axis_dims = (1, 1, 1, -1)
 
-	max_length = 4096
+	max_length = 2048
 
 	# if jax.default_backend() == "gpu":
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
