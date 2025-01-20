@@ -172,11 +172,16 @@ class TransformerCacheView:
 		)
 
 	def __repr__(self):
-		return (
-			self.__class__.__name__
-			+ f"(key={self.key.shape}, value={self.value.shape}, layer_index={self.layer_index})"
-		)
-
+		try:
+			return (
+				self.__class__.__name__
+				+ f"(key={self.key.shape}, value={self.value.shape}, layer_index={self.layer_index})"
+			)
+		except AttributeError:
+			return (
+				self.__class__.__name__
+				+ f"(key={self.key}, value={self.value}, layer_index={self.layer_index})"
+			)
 	__str__ = __repr__
 
 

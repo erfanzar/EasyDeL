@@ -613,6 +613,7 @@ class StepMetrics:
 			"mlperf/flops_sequence_pre_second": float(flops_sequence_pre_second),
 			"mlperf/throughput": throughput,
 			"mlperf/step_time": float(step_time),
+			"mlperf/execution_time": float(metrics.execution_time),
 			"mlperf/total_time": float(total_time),
 		}
 		loss = metrics.loss

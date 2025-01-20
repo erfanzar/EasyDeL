@@ -33,6 +33,7 @@ from fjformer import GenerateRNG
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
+from jax.interpreters import pxla
 from jax._src.stages import Compiled
 from jax.sharding import NamedSharding, PartitionSpec
 from pydantic import BaseModel
@@ -67,6 +68,22 @@ logger = get_logger(__name__)
 TIME = str(datetime.fromtimestamp(time.time())).split(" ")[0]
 
 
+def extract_shardings(tree, mesh=None):
+	if mesh is None:
+		mesh = pxla.thread_resources.env.physical_mesh
+
+	def cond(x):
+		sharding = x.sharding if hasattr(x, "sharding") else None
+		if isinstance(sharding, jax.sharding.PartitionSpec):
+			assert mesh is not None, "Mesh Can not be none (use function under with `mesh`)."
+			sharding = jax.sharding.NamedSharding(mesh=mesh, spec=sharding)
+		if not isinstance(sharding, jax.sharding.NamedSharding):
+			return None
+		return sharding
+
+	return jax.tree_util.tree_map(cond, tree)
+
+
 class vInferenceMetaData(BaseModel):
 	inference_name: str
 	generation_config: vInferenceConfig
@@ -96,26 +113,28 @@ class vInference:
 		inference_name: tp.Optional[str] = None,
 	):
 		"""
-		Initializes the vInference class.
-
-		Args:
-			model: The pre-trained language model.
-			processor_class: The processor_class for the model.
-			generation_config: The generation configuration.
-			seed: The random seed for generation.
-			input_partition_spec: The partitioning specification for input data.
-			max_new_tokens: The maximum number of new tokens to generate.
+		Arguments:
+		  model: The pre-trained language model.
+		  processor_class: The processor_class for the model.
+		  generation_config: The generation configuration.
+		  seed: The random seed for generation.
+		  input_partition_spec: The partitioning specification for input data.
+		  max_new_tokens: The maximum number of new tokens to generate.
 		"""
-		# fmt:off
+
 		graphdef, graphstate = nn.split(model)
-		self.graphdef = graphdef 
+		self.graphdef = graphdef
 		self.graphstate = graphstate
-		self.model=model 
+		self.model = model
 		self.processor_class = processor_class
-		self.generation_config = self._init_generation_config(generation_config, max_new_tokens)
+		self.generation_config = self._init_generation_config(
+			generation_config, max_new_tokens
+		)
 		if seed is None:
 			seed = random.randint(0, int(1e6))
-		self.input_partition_spec = input_partition_spec or PartitionSpec(("dp", "fsdp"), "sp")
+		self.input_partition_spec = input_partition_spec or PartitionSpec(
+			("dp", "fsdp"), "sp"
+		)
 		self.mesh = self.model.config.mesh
 		self._rng_generator = GenerateRNG(seed)
 		self._precompile_lock = asyncio.Lock()
@@ -123,17 +142,18 @@ class vInference:
 		self._in_compiling_process = set()
 		self._init_variables()
 		self._validate_token_ids()
-		self._uuid4 = uuid4().hex 
+		self._uuid4 = uuid4().hex
 		self._inference_name = inference_name or self._generate_inference_name(model)
-		erm = os.environ.get("EASYDEL_RECORDS_METRICS", "true").lower() in ["true", "yes", "1", "on"]
-		# fmt:on
+		erm = os.environ.get("EASYDEL_RECORDS_METRICS", "true").lower() in [
+			"true",
+			"yes",
+			"1",
+			"on",
+		]
 		self._report_metrics = erm and jax.process_count() == 1
 		if not self._report_metrics:
 			logger.info("vInference-metrics is disabled")
 			logger.debug(f"vInference-metrics is disabled [status erm={erm}]")
-
-		self._basic_generation_first_iter_fn = basic_generation_first_iter_fn
-		self._basic_generation_iter_fn = basic_generation_iter_fn
 
 	@cached_property
 	def metrics(self):
@@ -248,10 +268,10 @@ class vInference:
 		the maximum new tokens from the model's maximum sequence length.
 
 		Returns:
-				int: The maximum length available for input prefill
+		    int: The maximum length available for input prefill
 
 		Raises:
-				ValueError: If no maximum sequence length configuration is found
+		    ValueError: If no maximum sequence length configuration is found
 		"""
 		possible_length_attributes = [
 			"granted_mask_max_position_embedding",
@@ -274,10 +294,10 @@ class vInference:
 		Find the first available maximum length configuration from a list of possible attributes.
 
 		Args:
-				attributes: tp.List of attribute names to check in order of preference
+		    attributes: tp.List of attribute names to check in order of preference
 
 		Returns:
-				tp.Optional[int]: The maximum length if found, None otherwise
+		    tp.Optional[int]: The maximum length if found, None otherwise
 		"""
 		for attr in attributes:
 			max_length = getattr(self.model.config, attr, None)
@@ -294,11 +314,11 @@ class vInference:
 		Initializes the generation configuration.
 
 		Args:
-			generation_config: The generation configuration.
-			max_new_tokens: The maximum number of new tokens to generate.
+		  generation_config: The generation configuration.
+		  max_new_tokens: The maximum number of new tokens to generate.
 
 		Returns:
-			vInferenceConfig: The initialized generation configuration.
+		  vInferenceConfig: The initialized generation configuration.
 		"""
 		if generation_config is None:
 			if self.model.generation_config is not None:
@@ -326,7 +346,7 @@ class vInference:
 			spec=PartitionSpec(),
 			mesh=self.model.mesh,
 		)
-		self.gen_input_sharding = NamedSharding(
+		self.generation_input_shape = NamedSharding(
 			spec=PartitionSpec(self.input_partition_spec[0], None),
 			mesh=self.model.mesh,
 		)
@@ -338,8 +358,6 @@ class vInference:
 		rng: tp.Optional[PRNGKey] = None,
 		**model_kwargs,
 	):
-		if rng is None:
-			rng = self._rng_generator.rng
 		pad_token_id = jnp.array(self.generation_config.pad_token_id, dtype=jnp.int32)
 		batch_size, current_length = input_ids.shape
 		max_length = current_length + self.generation_config.max_new_tokens
@@ -379,9 +397,9 @@ class vInference:
 			"(Set `tokenizer.pad_token_id = tokenizer.eos_token_id` if undefined"
 			" or (`processing_class.tokenizer.pad_token_id = processing_class.tokenizer.eos_token_id`))"
 		)
-		assert (
-			self.generation_config.eos_token_id is not None
-		), "`eos_token_id` cannot be None."
+		assert self.generation_config.eos_token_id is not None, (
+			"`eos_token_id` cannot be None."
+		)
 
 	def generate(
 		self,
@@ -412,6 +430,7 @@ class vInference:
 				input_ids = jnp.array(input_ids, dtype=jnp.int32)
 
 			batch_size, sequence_length = input_ids.shape
+			self.precompile(batch_size=batch_size, input_tokens_length=sequence_length)
 			if batch_size <= 0 or sequence_length <= 0:
 				raise ValueError(f"Invalid input dimensions: {input_ids.shape}")
 
@@ -429,8 +448,6 @@ class vInference:
 					batch_size=batch_size,
 					input_tokens_length=sequence_length,
 					id=self._uuid4,
-					fn1=self._basic_generation_first_iter_fn,
-					fn2=self._basic_generation_iter_fn,
 				)
 
 			# Main generation loop
@@ -469,7 +486,9 @@ class vInference:
 		attention_mask = jnp.asarray(attention_mask, dtype="i4", device=self.input_sharding)
 		input_ids = jnp.asarray(input_ids, dtype="i4", device=self.input_sharding)
 		model_kwargs.update({"input_ids": input_ids, "attention_mask": attention_mask})
-
+		if model_kwargs.get("rng") is None:
+			rng = self._rng_generator.rng
+			model_kwargs["rng"] = rng
 		return self._init_state(**model_kwargs)
 
 	def _inner_generate(
@@ -580,6 +599,7 @@ class vInference:
 				dtype="i4",
 				device=self.input_sharding,
 			),
+			rng=self._rng_generator.rng,
 		)
 
 	def _compile_and_lower_funs(self, batch_size: int, input_tokens_length: int):
@@ -592,15 +612,22 @@ class vInference:
 		do_compile = compiled_generate_func is None or compiled_interval_func is None
 		if do_compile:
 			logger.debug("initiating state for lowering and compiling func.")
-			state = self._init_state(
-				**self._get_compile_model_kwargs(
-					batch_size=batch_size,
-					input_tokens_length=input_tokens_length,
-				)
+			wargs = self._get_compile_model_kwargs(
+				batch_size=batch_size,
+				input_tokens_length=input_tokens_length,
 			)
+
+			state = self._init_state(**wargs)
 			logger.debug("smart compiling `first_iter_fn`")
 			logger.debug("lowering `first_iter_fn`")
-			first_iter_fn_lowered = basic_generation_first_iter_fn.lower(
+			first_iter_fn_lowered = jax.jit(
+				basic_generation_first_iter_fn,
+				static_argnums=(0, 3),
+				in_shardings=(
+					extract_shardings(self.graphstate),
+					extract_shardings(state),
+				),
+			).lower(
 				self.graphdef,
 				self.graphstate,
 				state,
@@ -613,10 +640,21 @@ class vInference:
 			)
 			logger.debug("smart compiling `iter_fn`")
 			logger.debug("lowering `iter_fn`")
-			iter_fn_lowered = basic_generation_iter_fn.lower(
+			sample_state = compiled_generate_func(self.graphstate, state)
+			sample_state_shardings = extract_shardings(sample_state)
+			iter_fn_lowered = jax.jit(
+				basic_generation_iter_fn,
+				static_argnums=(0, 3),
+				in_shardings=(
+					extract_shardings(self.graphstate),
+					sample_state_shardings,
+					None,
+				),
+				out_shardings=sample_state_shardings,
+			).lower(
 				self.graphdef,
 				self.graphstate,
-				compiled_generate_func(self.graphstate, state),
+				sample_state,
 				self.generation_config,
 				self.generation_config.streaming_chunks,
 			)
@@ -649,11 +687,11 @@ class vInference:
 		in a cache.
 
 		Args:
-			batch_size: The batch size.
-			input_tokens_length: The length of the input tokens.
+		  batch_size: The batch size.
+		  input_tokens_length: The length of the input tokens.
 
 		Returns:
-			bool: True if precompilation was successful, False otherwise.
+		  bool: True if precompilation was successful, False otherwise.
 		"""
 		if input_tokens_length is None:
 			input_tokens_length = self.model_prefill_length
@@ -677,10 +715,11 @@ class vInference:
 			with self._compilation_metrics_recorder():
 				logger.debug(f"lowering and compiling with `config` {config_key}")
 				self._in_compiling_process.add(config_key)
-				self._compile_and_lower_funs(
-					batch_size=batch_size,
-					input_tokens_length=input_tokens_length,
-				)
+				with self.mesh:
+					self._compile_and_lower_funs(
+						batch_size=batch_size,
+						input_tokens_length=input_tokens_length,
+					)
 				self._precompiled_configs.add(config_key)
 		return True
 

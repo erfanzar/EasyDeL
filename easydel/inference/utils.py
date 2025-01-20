@@ -86,6 +86,7 @@ class vInferenceConfig:
 			self._loop_rows,
 		), {}
 
+	@classmethod
 	def tree_unflatten(cls, aux, children):
 		return cls(*children)
 
@@ -268,7 +269,7 @@ class SampleState:
 						if len(repr_src) < 500
 						else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
 					)
-				except TypeError:
+				except (TypeError,AttributeError):
 					pass
 		return string.strip() + "\n)"
 

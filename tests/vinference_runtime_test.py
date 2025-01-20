@@ -94,7 +94,7 @@ def main():
 
 	print(model.model_task)
 	print(model.model_type)
-	if os.environ.get("USE_AOT", "true") in ["true", "yes", "on", "1"]:
+	if os.environ.get("USE_AOT", "false") in ["true", "yes", "on", "1"]:
 		print("Compiling")
 		inference.precompile(1, inference.model_prefill_length)
 		print("Done Compiling")

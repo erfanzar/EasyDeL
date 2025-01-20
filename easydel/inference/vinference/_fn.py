@@ -17,7 +17,6 @@
 
 import time
 import typing as tp  # noqa: F401
-from functools import partial
 
 import jax
 from flax import nnx as nn
@@ -59,7 +58,6 @@ else:
 		return result, flops, flops / elapsed_time, elapsed_time
 
 
-@partial(jax.jit, static_argnums=(0, 3))
 def basic_generation_first_iter_fn(
 	graphdef: EasyDeLBaseModule,
 	graphstate: dict,
@@ -90,7 +88,7 @@ def basic_generation_first_iter_fn(
 	return state
 
 
-@partial(jax.jit, static_argnums=(0, 3))
+# @partial(jax.jit, static_argnums=(0, 3))
 def basic_generation_iter_fn(
 	graphdef: EasyDeLBaseModule,
 	graphstate: dict,
