@@ -90,6 +90,35 @@ def set_loggers_level(level: int = logging.WARNING):
 		handler.setLevel(level)
 
 
+@contextlib.contextmanager
+def capture_time():
+	"""
+	A context manager that measures elapsed time.
+
+	Returns:
+	    Callable that returns the current elapsed time while the context is active,
+	    or the final elapsed time after the context exits.
+
+	Example:
+	    with capture_time() as get_time:
+	        # Do some work
+	        print(f"Current time: {get_time()}")
+	    print(f"Final time: {get_time()}")
+	"""
+	start = time.perf_counter_ns()
+	is_active = True
+
+	def get_elapsed():
+		current = time.perf_counter_ns() if is_active else end
+		return (current - start) / 1e9
+
+	try:
+		yield get_elapsed
+	finally:
+		end = time.perf_counter_ns()
+		is_active = False
+
+
 logger = get_logger(__name__)
 
 

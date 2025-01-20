@@ -22,7 +22,7 @@ from jax.sharding import PartitionSpec
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
 from easydel.infra.loss_utils import LossMetrics
-from easydel.utils.helpers import get_logger
+from easydel.utils.helpers import capture_time, get_logger
 
 from ..base_trainer import (
 	BaseTrainer,
@@ -237,10 +237,12 @@ class Trainer(BaseTrainer):
 
 			# Execute training step
 			with self.train_tracker.trace_compilation():
-				state, metrics, run_exception = self._execute_train_step(
-					state=state,
-					batch=batch,
-				)
+				with capture_time() as execution_time:
+					state, metrics, run_exception = self._execute_train_step(
+						state=state,
+						batch=batch,
+					)
+					metrics.execution_time = execution_time()
 			# Update and log metrics
 			try:
 				mean_loss, mean_accuracy = metrics_tracker.update(
@@ -304,7 +306,10 @@ class Trainer(BaseTrainer):
 				step_metrics.start_step()
 
 				with self.evalu_tracker.trace_compilation():
-					metrics = self._execute_eval_step(state, batch)
+					with capture_time() as execution_time:
+						metrics = self._execute_eval_step(state, batch)
+						metrics.execution_time = execution_time()
+
 				mean_loss, mean_accuracy = metrics_tracker.update(
 					metrics.loss,
 					metrics.accuracy,
@@ -350,7 +355,9 @@ class Trainer(BaseTrainer):
 				)
 			)
 		try:
-			state, metrics = self.sharded_training_step_function(state, batch)
+			state, metrics = jax.block_until_ready(
+				self.sharded_training_step_function(state, batch)
+			)
 			# Apply post-gradient updates
 			if self.pruning_module is not None:
 				state = state.replace(

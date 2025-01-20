@@ -103,6 +103,7 @@ class LossMetrics:
 	chosen_rewards: tp.Optional[jax.Array] = None
 	rejected_rewards: tp.Optional[jax.Array] = None
 	other_metrics: tp.Optional[tp.Mapping[str, jax.Array]] = None
+	execution_time: tp.Optional[float] = None
 
 
 def sigmoid_cross_entropy_with_logits(

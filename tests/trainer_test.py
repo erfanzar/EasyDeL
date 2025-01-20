@@ -1,10 +1,11 @@
 import os
 import sys
 
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import flax
 import transformers
 from jax import numpy as jnp
 
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import easydel as ed
 
 MODEL_REPO_ID = "meta-llama/Llama-3.1-8B-Instruct"
@@ -58,25 +59,25 @@ def create_dataset():
 	)
 
 
-TRAIN_ARGUMENTS = ed.TrainingArguments(
-	model_name="Runtime-Tests",
-	save_directory="/home/erfan/runner/model",
-	num_train_epochs=EPOCHS,
-	learning_rate=LEARNING_RATE,
-	learning_rate_end=LEARNING_RATE_END,
-	warmup_steps=WARPUP_STEPS,
-	optimizer=ed.EasyDeLOptimizers.ADAMW,
-	scheduler=ed.EasyDeLSchedulers.WARM_UP_COSINE,
-	weight_decay=0.02,
-	total_batch_size=BATCH_SIZE,
-	max_sequence_length=MAX_LENGTH,
-	gradient_accumulation_steps=GRAD_ACCUMULATION_STEPS,
-	do_last_save=False,
-	save_steps=500,
-	save_total_limit=5,
-)
-
 if ed.__version__ == "0.1.0":
+	TRAIN_ARGUMENTS = ed.TrainingArguments(
+		model_name="Runtime-Tests",
+		save_directory="/home/erfan/runner/model",
+		num_train_epochs=EPOCHS,
+		learning_rate=LEARNING_RATE,
+		learning_rate_end=LEARNING_RATE_END,
+		warmup_steps=WARPUP_STEPS,
+		optimizer=ed.EasyDeLOptimizers.ADAMW,
+		scheduler=ed.EasyDeLSchedulers.WARM_UP_COSINE,
+		weight_decay=0.02,
+		total_batch_size=BATCH_SIZE,
+		max_sequence_length=MAX_LENGTH,
+		gradient_accumulation_steps=GRAD_ACCUMULATION_STEPS,
+		do_last_save=False,
+		save_steps=500,
+		save_total_limit=1,
+	)
+
 	MODEL = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		MODEL_REPO_ID,
 		auto_shard_model=True,
@@ -102,5 +103,53 @@ if ed.__version__ == "0.1.0":
 	)
 
 	output = trainer.train()
+
+	output.state.save_state("/home/erfan/model-ckpt")
+elif ed.__version__ == "0.0.80":
+	TRAIN_ARGUMENTS = ed.TrainingArguments(
+		model_name="Runtime-Tests",
+		save_dir="/home/erfan/runner/model",
+		num_train_epochs=EPOCHS,
+		learning_rate=LEARNING_RATE,
+		learning_rate_end=LEARNING_RATE_END,
+		warmup_steps=WARPUP_STEPS,
+		optimizer=ed.EasyDeLOptimizers.ADAMW,
+		scheduler=ed.EasyDeLSchedulers.WARM_UP_COSINE,
+		weight_decay=0.02,
+		total_batch_size=BATCH_SIZE,
+		max_sequence_length=MAX_LENGTH,
+		gradient_accumulation_steps=GRAD_ACCUMULATION_STEPS,
+		do_last_save=False,
+		save_steps=500,
+		save_total_limit=1,
+	)
+	MODEL, PARAMS = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+		MODEL_REPO_ID,
+		auto_shard_params=True,
+		sharding_axis_dims=SHARDING_AXIS_DIMS,
+		config_kwargs=ed.EasyDeLBaseConfigDict(
+			freq_max_position_embeddings=MAX_LENGTH,
+			mask_max_position_embeddings=MAX_LENGTH,
+			attn_dtype=DTYPE,
+			gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
+			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+			attn_mechanism=ed.AttentionMechanisms.VANILLA,
+		),
+		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+		platform=ed.EasyDeLPlatforms.JAX,
+		param_dtype=PARAM_DTYPE,
+		dtype=DTYPE,
+		partition_axis=PA_AXIS,
+	)
+	TRAIN_ARGUMENTS.gradient_checkpointing = (
+		ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE
+	)
+	trainer = ed.CausalLanguageModelTrainer(
+		model=MODEL,
+		arguments=TRAIN_ARGUMENTS,
+		dataset_train=create_dataset(),
+	)
+
+	output = trainer.train(model_parameters=flax.core.FrozenDict({"params": PARAMS}))
 
 	output.state.save_state("/home/erfan/model-ckpt")

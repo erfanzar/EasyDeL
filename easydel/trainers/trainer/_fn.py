@@ -14,13 +14,18 @@
 
 import typing as tp
 
+import flax
+import flax.nnx
 import jax
 import optax
 from jax.sharding import PartitionSpec
 
 from easydel.escale import with_sharding_constraint
 from easydel.infra.base_state import EasyDeLState
-from easydel.infra.loss_utils import LossConfig, LossMetrics
+from easydel.infra.loss_utils import (
+	LossConfig,
+	LossMetrics,
+)
 
 from ..training_utils import (
 	make_assertions_and_get_sizes,
@@ -43,12 +48,10 @@ def training_step(
 		gradient_accumulation_steps=gradient_accumulation_steps,
 		batch_partition_spec=partition_spec,
 	)
-
 	batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
 
 	def loss_fn(tree, minibatch):
-		module = state.merge(tree)
-		module.train()
+		module = flax.nnx.merge(state.graphdef, tree, state.graphother)
 		call_batch = module.prepare_inputs_for_call(**minibatch)
 		labels = call_batch.pop("labels", None)
 		outputs, metrics = module.compute_loss(
@@ -62,22 +65,19 @@ def training_step(
 		state=state,
 		batch=batch,
 		minibatch_size=minibatch_size,
-		grad_fn=jax.value_and_grad(loss_fn, has_aux=True, allow_int=True),
+		grad_fn=jax.value_and_grad(loss_fn, has_aux=True),
 	)
-	metrics = update_metrics(
-		metrics=metrics,
-		learning_rate_fn=learning_rate_fn,
-		step=state.step,
-		gradients=gradients,
-	)
-
 	state = update_state_respectfully(
 		state=state,
 		gradients=gradients,
 		loss_config=loss_config,
-		metrics=metrics,
+		metrics=update_metrics(
+			metrics=metrics,
+			learning_rate_fn=learning_rate_fn,
+			step=state.step,
+			gradients=gradients,
+		),
 	)
-
 	return state, metrics
 
 
