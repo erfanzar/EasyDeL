@@ -16,9 +16,10 @@ from functools import partial
 
 import jax
 from jax import numpy as jnp
+import jax.experimental
 import jax.lib
 from jax.sharding import PartitionSpec
-
+from jax.experimental import multihost_utils
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
 from easydel.infra.loss_utils import LossMetrics
@@ -97,15 +98,15 @@ class Trainer(BaseTrainer):
 			mesh=self.model.mesh,
 		)
 
-		# input_sharding = jax.sharding.NamedSharding(
-		# 	spec=self.arguments.step_partition_spec,
-		# 	mesh=self.model.mesh,
-		# )
+		input_sharding = jax.sharding.NamedSharding(
+			spec=self.arguments.step_partition_spec,
+			mesh=self.model.mesh,
+		)
+		self.input_sharding = input_sharding
 		sharded_training_step_function = jax.jit(
 			partial(
 				training_step,
 				loss_config=self.arguments.loss_config,
-				partition_spec=self.arguments.step_partition_spec,
 				learning_rate_fn=self.scheduler,
 				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
 			),
@@ -115,7 +116,7 @@ class Trainer(BaseTrainer):
 				"learning_rate_fn",
 				"gradient_accumulation_steps",
 			],
-			in_shardings=(self.state_shardings, empty_sharding),
+			in_shardings=(self.state_shardings, input_sharding),
 			out_shardings=(self.state_shardings, empty_sharding),
 			donate_argnums=(0,),
 		)
@@ -123,11 +124,10 @@ class Trainer(BaseTrainer):
 		sharded_evaluation_step_function = jax.jit(
 			partial(
 				evaluation_step,
-				partition_spec=self.arguments.step_partition_spec,
 				loss_config=self.arguments.loss_config,
 			),
-			static_argnames=["partition_spec", "loss_config"],
-			in_shardings=(self.state_shardings, empty_sharding),
+			static_argnames=["loss_config"],
+			in_shardings=(self.state_shardings, input_sharding),
 			out_shardings=(empty_sharding),
 		)
 
@@ -359,6 +359,11 @@ class Trainer(BaseTrainer):
 				)
 			)
 		try:
+			batch = multihost_utils.host_local_array_to_global_array(
+				batch,
+				self.mesh,
+				self.arguments.step_partition_spec,
+			)
 			state, metrics = jax.block_until_ready(
 				self.sharded_training_step_function(state, batch)
 			)

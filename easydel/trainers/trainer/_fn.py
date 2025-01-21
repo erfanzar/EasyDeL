@@ -18,9 +18,7 @@ import flax
 import flax.nnx
 import jax
 import optax
-from jax.sharding import PartitionSpec
 
-from easydel.escale import with_sharding_constraint
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import (
 	LossConfig,
@@ -40,15 +38,13 @@ def training_step(
 	batch: tp.Mapping[str, jax.Array],
 	loss_config: tp.Optional[LossConfig] = None,
 	learning_rate_fn: optax.Schedule = None,
-	partition_spec: tp.Optional[PartitionSpec] = None,
 	gradient_accumulation_steps: int = 1,
 ) -> tp.Tuple[EasyDeLState, LossMetrics]:
-	batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
+	batch_size, minibatch_size, _ = make_assertions_and_get_sizes(
 		batch=batch,
 		gradient_accumulation_steps=gradient_accumulation_steps,
-		batch_partition_spec=partition_spec,
+		batch_partition_spec=None,
 	)
-	batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
 
 	def loss_fn(tree, minibatch):
 		module = flax.nnx.merge(state.graphdef, tree, state.graphother)
@@ -85,15 +81,7 @@ def evaluation_step(
 	state: EasyDeLState,
 	batch: tp.Mapping[str, jax.Array],
 	loss_config: tp.Optional[LossConfig] = None,
-	partition_spec: tp.Optional[PartitionSpec] = None,
 ) -> tp.Tuple[tp.Any, LossMetrics]:
-	*_, partition_spec = make_assertions_and_get_sizes(
-		batch=batch,
-		gradient_accumulation_steps=1,
-		batch_partition_spec=partition_spec,
-	)
-	batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
-
 	def loss_fn(tree):
 		module = state.merge(tree)
 		module.eval()
