@@ -88,7 +88,7 @@ def create_constant_length_dataset(
 	num_of_sequences: int = 1024,
 	chars_per_token: float = 3.6,
 	eos_token_id: int = 0,
-	shuffle: bool = True if jax.process_count() == 1 else False,
+	shuffle: bool = True ,
 	append_concat_token: bool = True,
 	add_special_tokens: bool = True,
 ) -> tp.Callable[[], tp.Iterator[tp.Dict[str, jnp.ndarray]]]:
