@@ -15,6 +15,7 @@
 """Utility functions for managing and manipulating nnx module states."""
 
 import typing as tp
+from collections.abc import Iterable
 
 import chex
 import jax
@@ -24,7 +25,6 @@ from flax.nnx import traversals
 from jax.interpreters import pxla
 from jax.sharding import Mesh, NamedSharding
 
-from collections.abc import Iterable
 from easydel.utils.helpers import get_logger
 
 PyTree = tp.Dict

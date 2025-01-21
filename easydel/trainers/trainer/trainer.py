@@ -97,7 +97,7 @@ class Trainer(BaseTrainer):
 			spec=PartitionSpec(),
 			mesh=self.model.mesh,
 		)
- 
+
 		sharded_training_step_function = jax.jit(
 			partial(
 				training_step,
@@ -355,7 +355,7 @@ class Trainer(BaseTrainer):
 					state.opt_state,
 				)
 			)
-		try: 
+		try:
 			state, metrics = jax.block_until_ready(
 				self.sharded_training_step_function(state, batch)
 			)

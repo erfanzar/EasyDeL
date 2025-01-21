@@ -182,6 +182,7 @@ class TransformerCacheView:
 				self.__class__.__name__
 				+ f"(key={self.key}, value={self.value}, layer_index={self.layer_index})"
 			)
+
 	__str__ = __repr__
 
 

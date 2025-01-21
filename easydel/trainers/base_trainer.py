@@ -27,6 +27,7 @@ import flax
 import flax.core
 import flax.nnx
 import jax
+import jax.extend
 import numpy as np
 import termcolor
 import tqdm
@@ -915,15 +916,19 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 	def _setup_initial_metrics(self, state):
 		"""Setup initial metrics logging."""
 		# Calculate and log model size
+		model_size = self.count_model_parameters(state.graphstate)
 		self.arguments.log_metrics(
 			{
-				"Number of Model Parameters (Billion)": self.count_model_parameters(
-					state.graphstate
-				)
+				"Number of Model Parameters (Billion)": model_size,
+				"process_count": jax.process_count(),
+				"device_count": jax.device_count(),
+				"local_device_count": jax.local_device_count(),
+				"platform": jax.extend.backend.get_backend().platform,
+				"XLA_FLAGS": os.environ.get("XLA_FLAGS", ""),
+				"LIBTPU_INIT_ARGS": os.environ.get("LIBTPU_INIT_ARGS", ""),
 			},
 			step=0,
 		)
-		self._flops_model_state = self.calculate_number_total_flops(params=state.graphstate)
 
 	def _get_next_batch(self, train_iter):
 		"""Get next batch from iterator, reinitializing if needed."""

@@ -269,7 +269,7 @@ class SampleState:
 						if len(repr_src) < 500
 						else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
 					)
-				except (TypeError,AttributeError):
+				except (TypeError, AttributeError):
 					pass
 		return string.strip() + "\n)"
 

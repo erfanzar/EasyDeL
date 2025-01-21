@@ -59,6 +59,7 @@ def get_optimizer_and_scheduler(
 	"""
 	optimizer_kwargs = {
 		"learning_rate": learning_rate,
+		"learning_rate_start": learning_rate,
 		"learning_rate_end": learning_rate
 		if scheduler == EasyDeLSchedulers.NONE
 		else learning_rate_end,
