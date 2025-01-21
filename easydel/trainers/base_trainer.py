@@ -368,7 +368,7 @@ class BaseTrainer(BaseTrainerProtocol):
 					),
 					batch_size=batch_size,
 					drop_remainder=True,
-					shuffle=is_train,
+					shuffle=is_train if jax.process_count() == 1 else False,
 					num_workers=self.arguments.dataloader_num_workers,
 				)
 				.repeat(self.arguments.num_train_epochs if is_train else 1)
