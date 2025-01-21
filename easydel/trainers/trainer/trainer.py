@@ -96,35 +96,36 @@ class Trainer(BaseTrainer):
 			spec=PartitionSpec(),
 			mesh=self.model.mesh,
 		)
+
+		input_sharding = jax.sharding.NamedSharding(
+			spec=self.arguments.step_partition_spec,
+			mesh=self.model.mesh,
+		)
 		sharded_training_step_function = jax.jit(
 			partial(
 				training_step,
-				partition_spec=self.arguments.step_partition_spec,
 				loss_config=self.arguments.loss_config,
 				learning_rate_fn=self.scheduler,
 				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
 			),
 			static_argnames=[
-				"partition_spec",
 				"loss_config",
 				"learning_rate_fn",
 				"gradient_accumulation_steps",
 			],
-			in_shardings=(self.state_shardings, empty_sharding),
+			in_shardings=(self.state_shardings, input_sharding),
 			out_shardings=(self.state_shardings, empty_sharding),
-			donate_argnums=(0, 0),
+			donate_argnums=(0,),
 		)
 
 		sharded_evaluation_step_function = jax.jit(
 			partial(
 				evaluation_step,
-				partition_spec=self.arguments.step_partition_spec,
 				loss_config=self.arguments.loss_config,
 			),
-			static_argnames=["partition_spec", "loss_config"],
-			in_shardings=(self.state_shardings, empty_sharding),
+			static_argnames=["loss_config"],
+			in_shardings=(self.state_shardings, input_sharding),
 			out_shardings=(empty_sharding),
-			donate_argnums=(0, 0),
 		)
 
 		mesh = self.model.mesh

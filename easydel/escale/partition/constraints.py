@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
+import os
 import re
 import typing as tp
 import warnings
@@ -29,6 +30,14 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from easydel.utils.traversals import named_tree_map
 
 from ..mesh.validation import names_in_current_mesh
+
+MIN_SHARDING_SIZE = int(os.environ.get("MIN_SHARDING_SIZE", "16384"))
+LOG_SHARDING_MOVE = os.environ.get("LOG_SHARDING_MOVE", "false") in [
+	"true",
+	"yes",
+	"1",
+	"on",
+]
 
 
 def make_shard_and_gather_fns(
@@ -189,14 +198,23 @@ def match_partition_rules(
 
 		if not hasattr(leaf, "shape"):
 			return PartitionSpec()
-		if len(leaf.shape) == 0 or np.prod(leaf.shape) == 1:
+		size = np.prod(leaf.shape)
+		if len(leaf.shape) == 0:
 			""" Don't partition scalar values. """
 			return PartitionSpec()
+
 		for rule, ps in rules:
 			if re.search(rule, name) is not None:
+				if size < MIN_SHARDING_SIZE:
+					if LOG_SHARDING_MOVE:
+						warnings.warn(
+							f"PartitionSpec Related to {name} was safer and faster being local array.",
+							stacklevel=1,
+						)
+					return PartitionSpec()
 				if len(ps) > leaf.ndim:
 					ps = PartitionSpec(*tuple(ps[: leaf.ndim]))
-					if jax.process_index() == 0:
+					if LOG_SHARDING_MOVE:
 						warnings.warn(
 							f"PartitionSpec Related to {name} went out of range (will be auto trimed to {ps}).",
 							stacklevel=1,

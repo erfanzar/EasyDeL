@@ -100,7 +100,7 @@ class TrainingArguments:
 	performance_mode: bool = False
 	pruning_module: AVAILABLE_PRUNING_TYPE = None
 	process_zero_is_admin: bool = True
-	progress_bar_type: tp.Literal["tqdm", "rich", "json"] = "json"
+	progress_bar_type: tp.Literal["tqdm", "rich", "json"] = "tqdm"
 	remove_ckpt_after_load: bool = False
 	remove_unused_columns: bool = True
 	save_directory: str = "EasyDeL-Checkpoints"
@@ -153,9 +153,9 @@ class TrainingArguments:
 		Performs validation checks on the provided configuration settings.
 		Raises ValueError if any configuration is invalid.
 		"""
-		assert (
-			self.gradient_accumulation_steps > 0
-		), "`gradient_accumulation_steps` can't be lower than 1."
+		assert self.gradient_accumulation_steps > 0, (
+			"`gradient_accumulation_steps` can't be lower than 1."
+		)
 
 		if self.backend not in AVAILABLE_BACKENDS:
 			raise ValueError(
