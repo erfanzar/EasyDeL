@@ -1,6 +1,8 @@
 import os
 import sys
 
+import jax
+
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import flax
 import transformers
@@ -10,16 +12,26 @@ import easydel as ed
 
 MODEL_REPO_ID = "meta-llama/Llama-3.1-8B-Instruct"
 MAX_LENGTH = 1024
-SHARDING_AXIS_DIMS = (1, 1, -1, 1)
+SHARDING_AXIS_DIMS = (1, -1, 1, 1)
 
 DTYPE = jnp.bfloat16
 PARAM_DTYPE = jnp.bfloat16
 EPOCHS = 3
-BATCH_SIZE = 8
+BATCH_SIZE = 8 * jax.process_count()
 GRAD_ACCUMULATION_STEPS = 1
 WARPUP_STEPS = 100
 LEARNING_RATE = 1e-5
 LEARNING_RATE_END = 8e-6
+
+if jax.process_index() == 0:
+	print("DTYPE", DTYPE)
+	print("PARAM_DTYPE", PARAM_DTYPE)
+	print("EPOCHS", EPOCHS)
+	print("BATCH_SIZE", BATCH_SIZE)
+	print("GRAD_ACCUMULATION_STEPS", GRAD_ACCUMULATION_STEPS)
+	print("WARPUP_STEPS", WARPUP_STEPS)
+	print("LEARNING_RATE", LEARNING_RATE)
+	print("LEARNING_RATE_END", LEARNING_RATE_END)
 
 TOKENIZER = transformers.AutoTokenizer.from_pretrained(MODEL_REPO_ID)
 TOKENIZER.padding_side = "left"
@@ -76,8 +88,9 @@ if ed.__version__ == "0.1.0":
 		do_last_save=False,
 		save_steps=500,
 		save_total_limit=1,
+		progress_bar_type="json",
 	)
-	
+
 	MODEL = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		MODEL_REPO_ID,
 		auto_shard_model=True,
