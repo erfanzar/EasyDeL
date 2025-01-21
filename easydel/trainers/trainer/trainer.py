@@ -110,8 +110,7 @@ class Trainer(BaseTrainer):
 				learning_rate_fn=self.scheduler,
 				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
 			),
-			static_argnames=[
-				"partition_spec",
+			static_argnames=[ 
 				"loss_config",
 				"learning_rate_fn",
 				"gradient_accumulation_steps",
