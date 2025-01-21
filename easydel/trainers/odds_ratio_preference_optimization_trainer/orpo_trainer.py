@@ -544,7 +544,7 @@ class ORPOTrainer(Trainer):
 				batch_size=self.training_batch_size,
 				collate_fn=data_collator,
 				num_workers=self.arguments.dataloader_num_workers,
-				shuffle=True,
+				shuffle=True if jax.process_count() == 1 else False,
 				drop_remainder=True,
 			)
 		)

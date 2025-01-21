@@ -14,6 +14,8 @@
 import typing as tp
 import warnings
 
+import jax
+
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils.helpers import get_logger
@@ -162,7 +164,7 @@ class SFTTrainer(Trainer):
 				self.dataset_eval.to_tf_dataset(
 					batch_size=self.evaluation_batch_size,
 					drop_remainder=True,
-					shuffle=True,
+					shuffle=True if jax.process_count() == 1 else False,
 					num_workers=self.arguments.dataloader_num_workers,
 					collate_fn=self.create_collect_function(
 						max_sequence_length=self.arguments.max_sequence_length,
