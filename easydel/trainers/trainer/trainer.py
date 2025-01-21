@@ -15,11 +15,11 @@ import typing as tp
 from functools import partial
 
 import jax
-from jax import numpy as jnp
 import jax.experimental
 import jax.lib
+from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-from jax.experimental import multihost_utils
+
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
 from easydel.infra.loss_utils import LossMetrics
@@ -355,8 +355,7 @@ class Trainer(BaseTrainer):
 					state.opt_state,
 				)
 			)
-		try:
-			batch = multihost_utils.host_local_array_to_global_array(batch, self.mesh, )
+		try: 
 			state, metrics = jax.block_until_ready(
 				self.sharded_training_step_function(state, batch)
 			)
