@@ -10,7 +10,7 @@ import easydel as ed
 
 MODEL_REPO_ID = "meta-llama/Llama-3.1-8B-Instruct"
 MAX_LENGTH = 1024
-SHARDING_AXIS_DIMS = (1, -1, 1, 1)
+SHARDING_AXIS_DIMS = (1, 1, -1, 1)
 
 DTYPE = jnp.bfloat16
 PARAM_DTYPE = jnp.bfloat16
@@ -77,7 +77,7 @@ if ed.__version__ == "0.1.0":
 		save_steps=500,
 		save_total_limit=1,
 	)
-
+	
 	MODEL = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		MODEL_REPO_ID,
 		auto_shard_model=True,
