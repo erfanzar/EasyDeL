@@ -43,13 +43,13 @@ class EasyModelsTest(unittest.TestCase):
 	def setUp(self) -> None:
 		self.batch_size: int = 4
 		self.vocab_size: int = 32000
-		self.hidden_size: int = 128
-		self.intermediate_size: int = 256
-		self.num_hidden_layers: int = 6
+		self.hidden_size: int = 64
+		self.intermediate_size: int = 128
+		self.num_hidden_layers: int = 2
 		self.num_attention_heads: int = 8
 		self.num_key_value_heads: tp.Optional[int] = 4
-		self.num_experts_per_tok = 4
-		self.num_experts = 8
+		self.num_experts_per_tok = 2
+		self.num_experts = 4
 		self.num_local_experts = self.num_experts
 		self.rms_norm_eps: float = 1e-6
 		self.layer_norm_eps = self.rms_norm_eps
@@ -190,7 +190,7 @@ class EasyModelsTest(unittest.TestCase):
 					attention_mask=jnp.ones_like(ids),
 				)
 
-			ed_output = jited(jax_input_ids)
+			# ed_output = jited(jax_input_ids)
 			easy_time = time.time()
 			ed_output, metrics = jited(jax_input_ids)
 			easy_time = time.time() - easy_time
@@ -854,7 +854,7 @@ if __name__ == "__main__":
 	# test.test_cohere()  # Passed
 	# test.test_dbrx()  # Passed
 	# test.test_deepseek_v2()  # Passed
-	# test.test_deepseek_v3()  # Passed
+	test.test_deepseek_v3()  # Failed
 	# test.test_exaone()  # Passed
 	# test.test_falcon()  # Passed
 	# test.test_gemma()  # Passed
@@ -864,7 +864,7 @@ if __name__ == "__main__":
 	# test.test_gpt2()  # Passed
 	# test.test_grok1() # Not Tested Yet!
 	# test.test_internlm2()  # Passed
-	test.test_llama()  # Passed
+	# test.test_llama()  # Passed
 	# test.test_mamba()  # Passed
 	# test.test_mamba2()  # Passed
 	# test.test_mistral()  # Passed
