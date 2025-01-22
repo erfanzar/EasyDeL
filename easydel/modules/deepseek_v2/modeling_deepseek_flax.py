@@ -582,12 +582,12 @@ class FlaxDeepseekV2Attention(FlaxAttentionModule):
 		)
 
 		query_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), q_pe.dtype)
-		query_states.at[..., : self.qk_nope_head_dim].set(q_nope)
-		query_states.at[..., self.qk_nope_head_dim :].set(q_pe)
+		query_states = query_states.at[..., : self.qk_nope_head_dim].set(q_nope)
+		query_states = query_states.at[..., self.qk_nope_head_dim :].set(q_pe)
 
 		key_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), k_pe.dtype)
-		key_states.at[..., : self.qk_nope_head_dim].set(k_nope)
-		key_states.at[..., self.qk_nope_head_dim :].set(k_pe)
+		key_states = key_states.at[..., : self.qk_nope_head_dim].set(k_nope)
+		key_states = key_states.at[..., self.qk_nope_head_dim :].set(k_pe)
 
 		query_states = query_states.transpose(0, 2, 1, 3)
 		key_states = key_states.transpose(0, 2, 1, 3)

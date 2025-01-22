@@ -16,6 +16,7 @@ import functools
 import math
 import typing as tp
 from functools import partial
+import warnings
 
 import chex
 import jax
@@ -216,7 +217,8 @@ class DeepseekV3MLP(nn.Module):
 		self.act_fn = ACT2FN[config.hidden_act]
 
 	def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
+		if hidden_states.ndim == 3:  # if not in moe infer
+			hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
 		hidden_states = self.down_proj(
 			self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
 		)
@@ -307,7 +309,6 @@ class MoEGate(nn.Module):
 			topk_weight = topk_weight / denominator
 
 		topk_weight = topk_weight * self.routed_scaling_factor
-
 		return topk_idx, topk_weight
 
 
@@ -326,10 +327,7 @@ class DeepseekV3MoE(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		self.num_experts_per_tok = self.config.num_experts_per_tok
-
-		self.ep_size = 1
 		self.experts_per_rank = config.n_routed_experts
-		self.ep_rank = 0
 		self.deterministic = False
 		self.experts = [
 			DeepseekV3MLP(
@@ -362,6 +360,7 @@ class DeepseekV3MoE(nn.Module):
 			)
 
 	def __call__(self, hidden_states):
+		warnings.warn("DeepSeekv3's not fully checked yet, please open an issue.")
 		identity = hidden_states
 		orig_shape = hidden_states.shape
 		topk_idx, topk_weight = self.gate(hidden_states)
@@ -372,42 +371,30 @@ class DeepseekV3MoE(nn.Module):
 			y = y + self.shared_experts(identity)
 		return y
 
-	def moe_infer(self, x, topk_ids, topk_weight):
-		# TODO (erfanzar): This is a naive implementation. We should optimize this (need to be jitable).
-		cnts = (
-			jnp.zeros((topk_ids.shape[0], len(self.experts)))
-			.at[jnp.arange(topk_ids.shape[0])[:, None], topk_ids]
-			.set(1)
-		)
-		tokens_per_expert = cnts.sum(axis=0)
-		idxs = topk_ids.reshape(-1).argsort()
-		sorted_tokens = x[idxs // topk_ids.shape[1]]
-		outputs = []
-		start_idx = 0
-		for i, num_tokens in enumerate(tokens_per_expert):
-			end_idx = start_idx + num_tokens
-			if num_tokens == 0:  # Issue
-				continue
-			expert = self.experts[i]
-			tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-			expert_out = expert(tokens_for_this_expert)
-			outputs.append(expert_out)
-			start_idx = end_idx
+	def moe_infer(
+		self,
+		x: jnp.ndarray,
+		topk_ids: jnp.ndarray,
+		topk_weight: jnp.ndarray,
+	) -> jnp.ndarray:
+		"""
+		Args:
+		        x: Input tensor of shape [batch_size, hidden_dim]
+		        topk_ids: Tensor of expert assignments [batch_size, top_k]
+		        topk_weight: Tensor of expert weights [batch_size, top_k]
+		Returns:
+		        Output tensor of shape [batch_size, hidden_dim]
+		"""
+		final_hidden_state = jnp.zeros_like(x)
 
-		outs = (
-			jnp.concatenate(outputs, axis=0)
-			if outputs
-			else jnp.empty((0,), dtype=sorted_tokens.dtype)
-		)
+		for index in range(len(self.experts)):
+			expert_output = self.experts[index](x)
+			expert_mask = jnp.sum(jnp.multiply(topk_ids == index, topk_weight), axis=-1)[
+				:, None
+			]
+			final_hidden_state += expert_mask * expert_output
 
-		new_x = jnp.empty_like(outs)
-		new_x = new_x.at[idxs].set(outs)
-		final_out = (
-			new_x.reshape(*topk_ids.shape, -1).astype(topk_weight.dtype)
-			* topk_weight[..., None]
-		)
-		final_out = final_out.sum(axis=1).astype(new_x.dtype)
-		return final_out
+		return final_hidden_state
 
 
 class DeepseekV3Attention(FlaxAttentionModule):
@@ -588,12 +575,12 @@ class DeepseekV3Attention(FlaxAttentionModule):
 		)
 
 		query_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), q_pe.dtype)
-		query_states.at[..., : self.qk_nope_head_dim].set(q_nope)
-		query_states.at[..., self.qk_nope_head_dim :].set(q_pe)
+		query_states = query_states.at[..., : self.qk_nope_head_dim].set(q_nope)
+		query_states = query_states.at[..., self.qk_nope_head_dim :].set(q_pe)
 
 		key_states = jnp.zeros((bsz, self.num_heads, q_len, self.q_head_dim), k_pe.dtype)
-		key_states.at[..., : self.qk_nope_head_dim].set(k_nope)
-		key_states.at[..., self.qk_nope_head_dim :].set(k_pe)
+		key_states = key_states.at[..., : self.qk_nope_head_dim].set(k_nope)
+		key_states = key_states.at[..., self.qk_nope_head_dim :].set(k_pe)
 
 		query_states = query_states.transpose(0, 2, 1, 3)
 		key_states = key_states.transpose(0, 2, 1, 3)
@@ -922,7 +909,11 @@ class DeepseekV3Model(EasyDeLBaseModule):
 		for idx, layer in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
-
+			jax.debug.print(
+				"EasyDeL - Input Layer {}, {}",
+				idx,
+				hidden_states[-1, -1, -5:],
+			)
 			output = layer(
 				hidden_states=hidden_states,
 				frequencies=self.frequencies,

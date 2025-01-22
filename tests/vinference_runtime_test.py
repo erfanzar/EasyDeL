@@ -31,7 +31,7 @@ def main():
 
 		extra = {"torch_dtype": torch.float16}
 
-		dtype = jnp.float8_e5m2
+		dtype = jnp.float16
 		param_dtype = jnp.float8_e5m2
 		if os.environ.get("APPED_LORA_TEST", "false") in ["true", "yes"]:
 			param_dtype = jnp.float16
