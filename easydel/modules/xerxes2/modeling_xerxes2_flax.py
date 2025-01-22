@@ -35,6 +35,7 @@ from easydel.infra.utils import (
 	get_dot_general_by_bits,
 )
 from easydel.layers.caching import LightningCache, LightningCacheView
+from easydel.layers.caching.lightning_cache import LightningCacheMetaData
 from easydel.layers.norms import RMSNorm
 from easydel.layers.ops.lightning_attention import (
 	build_slope_tensor,
@@ -459,6 +460,7 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 		self,
 		input_ids: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
 		inputs_embeds: tp.Optional[chex.Array] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[LightningCache] = None,
@@ -506,3 +508,17 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 			attentions=outputs.attentions,
 			past_key_values=outputs.past_key_values,
 		)
+
+	def init_cache(self, batch_size, max_length):
+		head_dim = getattr(self.config, "head_dim", None)
+		if head_dim is None:
+			head_dim = self.config.hidden_size // self.config.num_attention_heads
+		num_key_value_heads = getattr(self.config, "num_key_value_heads", None)
+		if num_key_value_heads is None:
+			num_key_value_heads = self.config.num_attention_heads
+
+		with self.config.mesh:
+			return LightningCache.init_layers_cache(
+				num_hidden_layers=self.config.num_hidden_layers,
+				metadata=LightningCacheMetaData.create(batch_size=batch_size),
+			)

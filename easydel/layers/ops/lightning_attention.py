@@ -28,7 +28,7 @@ def lightning_attention(
 	s_index = jnp.where(index >= 0, -s_index, float("-inf")).astype(dtype)
 	diag_decay = jnp.exp(s_index)
 	if attn_mask is not None:
-		attn_mask = attn_mask[:, None, :, None]
+		attn_mask = attn_mask[:, None, :n, None]
 		v = v * attn_mask
 	qk = jnp.matmul(q, jnp.transpose(k, (0, 1, 3, 2))) * diag_decay
 	qkv_diag = jnp.matmul(qk, v)

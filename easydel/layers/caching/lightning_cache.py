@@ -17,7 +17,6 @@ import typing as tp
 
 import chex as cx
 from fjformer.core import ImplicitArray
-from jax import numpy as jnp
 
 if tp.TYPE_CHECKING:
 	from easydel.utils.quantizers import EasyQuantizer
@@ -29,7 +28,7 @@ else:
 class LightningCacheMetaData:
 	"""Metadata for transformer cache configuration."""
 
-	batch_size: int
+	batch_size: tp.Optional[int]
 	num_heads: tp.Optional[int]
 	head_dim: tp.Optional[int]
 	key_heads: tp.Optional[int]
@@ -40,13 +39,13 @@ class LightningCacheMetaData:
 	@classmethod
 	def create(
 		cls,
-		batch_size: int,
-		num_heads: tp.Optional[int],
-		head_dim: tp.Optional[int],
-		key_heads: tp.Optional[int],
-		value_heads: tp.Optional[int],
-		key_dim: tp.Optional[int],
-		value_dim: tp.Optional[int],
+		batch_size: tp.Optional[int] = None,
+		num_heads: tp.Optional[int] = None,
+		head_dim: tp.Optional[int] = None,
+		key_heads: tp.Optional[int] = None,
+		value_heads: tp.Optional[int] = None,
+		key_dim: tp.Optional[int] = None,
+		value_dim: tp.Optional[int] = None,
 	) -> LightningCacheMetaData:
 		"""
 		Create a LightningCacheMetaData instance with validation.
@@ -56,29 +55,6 @@ class LightningCacheMetaData:
 		Raises:
 		    ValueError: If required parameters are missing or invalid.
 		"""
-
-		if batch_size <= 0:
-			raise ValueError("batch_size must be positive")
-
-		if head_dim is not None:
-			key_dim = key_dim or head_dim
-			value_dim = value_dim or head_dim
-		else:
-			if key_dim is None or value_dim is None:
-				raise ValueError(
-					"Either head_dim or both key_dim and value_dim must be specified"
-				)
-
-		# Derive heads from num_heads if not specified
-		if num_heads is not None:
-			key_heads = key_heads or num_heads
-			value_heads = value_heads or num_heads
-		else:
-			if key_heads is None or value_heads is None:
-				raise ValueError(
-					"Either num_heads or both key_heads and value_heads must be specified"
-				)
-
 		return cls(
 			batch_size=batch_size,
 			num_heads=num_heads,
@@ -100,7 +76,6 @@ class LightningCacheView:
 	def init(cls, metadata: LightningCacheMetaData, layer_index: tp.Optional[int] = None):
 		return cls(
 			key_value=None,
-			index=jnp.zeros((metadata.batch_size,), dtype=jnp.int32),
 			metadata=metadata,
 			layer_index=layer_index,
 		)
