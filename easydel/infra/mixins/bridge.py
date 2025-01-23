@@ -444,6 +444,7 @@ class EasyBridgeMixin(PushToHubMixin):
 			from_torch=False,
 			backend=backend,
 			platform=platform,
+			model_task=cls._model_task,
 		)
 
 		if config_kwargs:

@@ -18,9 +18,9 @@ import easydel as ed
 def main():
 	REPO_ID = "openai/whisper-large-v3-turbo"
 	model = ed.AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
-		REPO_ID,
-		dtype=jnp.float16,
-		param_dtype=jnp.float16,
+		"/home/erfan/ASR-runtime/WhisperNu/run-100",
+		dtype=jnp.bfloat16,
+		param_dtype=jnp.bfloat16,
 	)
 	tokenizer = WhisperTokenizer.from_pretrained(REPO_ID)
 	processor = WhisperProcessor.from_pretrained(REPO_ID)
@@ -31,7 +31,7 @@ def main():
 		processor=processor,
 	)
 	result_url = inference(
-		"https://www2.cs.uic.edu/~i101/SoundFiles/gettysburg10.wav",
+		"https://www.uclass.psychol.ucl.ac.uk/Release2/Conversation/AudioOnly/wav/F_0126_6y9m_1.wav",
 		return_timestamps=True,
 	)
 	print(result_url)

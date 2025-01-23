@@ -109,6 +109,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 	arguments: TrainingArguments
 	dataset_train: tp.Optional[Dataset]
 	dataset_eval: tp.Optional[Dataset]
+	data_collator: tp.Optional[tp.Callable]
 	finetune: bool
 	checkpoint_path: tp.Optional[tp.Union[str, os.PathLike]]
 	dtype: tp.Any  # jax.numpy.dtype

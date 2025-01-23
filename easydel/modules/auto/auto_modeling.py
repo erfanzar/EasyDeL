@@ -161,7 +161,7 @@ class BaseAutoEasyModel:
 	):
 		class Base(EasyDeLBaseModule):
 			_model_task = cls.model_task
-
+ 
 		return Base.from_pretrained(
 			pretrained_model_name_or_path=pretrained_model_name_or_path,
 			dtype=dtype,

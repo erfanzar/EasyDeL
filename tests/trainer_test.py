@@ -45,8 +45,8 @@ def create_dataset():
 
 	dataset = datasets.load_dataset(
 		"PowerInfer/QWQ-LONGCOT-500K",
-		split="train[:20%]",
-		streaming=False,
+		split="train",
+		streaming=True,
 	)
 
 	def to_ids(sample):
@@ -57,17 +57,21 @@ def create_dataset():
 			],
 			max_length=MAX_LENGTH,
 			padding="max_length",
-			return_tensors="np",
+			return_tensors="jax",
 			return_dict=True,
+			truncation=True,
 		)
-
+		input_ids = ids["input_ids"]
+		attention_mask = ids["attention_mask"]
+		ids["input_ids"] = input_ids.squeeze(0)  # [-MAX_LENGTH:]
+		ids["attention_mask"] = attention_mask.squeeze(0)  # [-MAX_LENGTH:]
 		return ids
 
 	return dataset.map(
 		to_ids,
-		batched=False,
+		# batched=False,
 		remove_columns=["prompt", "response"],
-		num_proc=os.cpu_count(),
+		# num_proc=os.cpu_count(),
 	)
 
 
@@ -89,6 +93,7 @@ if ed.__version__ == "0.1.0":
 		save_steps=500,
 		save_total_limit=1,
 		progress_bar_type="json",
+		max_training_steps=100_000,
 	)
 
 	MODEL = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
