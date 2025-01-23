@@ -179,6 +179,8 @@ class EasyDeLBaseModule(
 	def loss_function(self):
 		if getattr(self.config, "loss_type", None) is not None:
 			loss_type = self.config.loss_type
+		elif getattr(self, "loss_type", None) is not None:
+			loss_type = self.loss_type
 		else:
 			loss_type = self.__class__.__name__
 			if loss_type not in LOSS_MAPPING:

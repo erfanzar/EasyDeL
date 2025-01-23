@@ -145,7 +145,15 @@ class Registry:
 		],
 		model_type: str,
 	) -> ModuleRegistration:
-		return self._task_registry[task_type][model_type]
+		
+		task_in = self._task_registry.get(task_type, None)
+		assert task_in is not None, f"task type {task_type} is not defined."
+		type_in = task_in.get(model_type, None)
+		assert type_in is not None, (
+			f"model type {model_type} is not defined. (upper task {task_type})"
+		)
+		
+		return type_in
 
 	@property
 	def task_registry(self):

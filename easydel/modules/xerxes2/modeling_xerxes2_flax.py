@@ -375,9 +375,9 @@ class Xerxes2Model(EasyDeLBaseModule):
 		batch_size, sequence_length, _ = inputs_embeds.shape
 
 		inputs_embeds = inputs_embeds * (self.config.hidden_size**0.5)
-		assert (
-			sequence_length <= self.config.max_position_embeddings
-		), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+		assert sequence_length <= self.config.max_position_embeddings, (
+			f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+		)
 
 		if attention_mask is None:
 			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
@@ -522,3 +522,36 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 				num_hidden_layers=self.config.num_hidden_layers,
 				metadata=LightningCacheMetaData.create(batch_size=batch_size),
 			)
+
+	def prepare_inputs_for_generation(
+		self,
+		input_ids,
+		max_length,
+		attention_mask: tp.Optional[chex.Array] = None,
+	):
+		"""The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
+
+		Args:
+		    self: Access variables that belong to the class
+		    input_ids: Pass in the input tokens
+		    max_length: Set the length of the sequence to be generated
+		    attention_mask: tp.Optional[chex.Array]: Mask the attention
+		        weights
+
+		Returns:
+		    A dictionary of the past_key_values, attention_mask and
+		    position ids
+		"""
+		batch_size, _ = input_ids.shape
+		past_key_values = self.init_cache(batch_size, max_length)
+		sharding = input_ids.sharding if hasattr(input_ids, "sharding") else None
+		return self.prepare_inputs_for_call(
+			**{
+				"past_key_values": past_key_values,
+				"attention_mask": jax.device_put(attention_mask, device=sharding),
+			}
+		)
+
+	def update_inputs_for_generation(self, model_outputs, model_kwargs):
+		model_kwargs["past_key_values"] = model_outputs.past_key_values
+		return model_kwargs

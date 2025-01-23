@@ -18,6 +18,7 @@ import random
 import typing as tp
 from functools import partial
 
+import chex
 import jax
 import jax.numpy as jnp
 
@@ -32,6 +33,7 @@ from easydel.inference.logits_process import (
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import register_module
+from easydel.infra.loss_utils import LossConfig, LossMetrics
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
 	FlaxBaseModelOutputWithPastAndCrossAttentions,
@@ -51,6 +53,26 @@ from easydel.layers.caching.transformer_cache import (
 from easydel.modules.whisper.whisper_configuration import WhisperConfig as WhisperConfig
 
 remat = nn.remat
+
+
+def shift_tokens_right(
+	input_ids: jnp.ndarray,
+	pad_token_id: int,
+	decoder_start_token_id: int,
+):
+	"""
+	Shift input ids one token to the right using JAX.
+	"""
+	batch_size, seq_length = input_ids.shape
+	shifted_input_ids = jnp.full(
+		(batch_size, seq_length),
+		pad_token_id,
+		dtype=input_ids.dtype,
+	)
+	shifted_input_ids = shifted_input_ids.at[:, 1:].set(input_ids[:, :-1])
+	shifted_input_ids = shifted_input_ids.at[:, 0].set(decoder_start_token_id)
+	shifted_input_ids = jnp.where(input_ids == -100, pad_token_id, shifted_input_ids)
+	return shifted_input_ids
 
 
 def sinusoidal_embedding_init(key, shape, dtype=jnp.float_) -> jax.Array:
@@ -652,6 +674,17 @@ class WhisperDecoder(EasyDeLBaseModule):
 		return_dict: bool = True,
 	) -> tuple[tp.Any, ...] | FlaxBaseModelOutputWithPastAndCrossAttentions:
 		inputs_embeds = self.embed_tokens(input_ids)
+		if position_ids is None:
+			position_ids = (
+				jnp.arange(inputs_embeds.shape[1])
+				.reshape(1, -1)
+				.repeat(
+					inputs_embeds.shape[0],
+					0,
+				)
+			)
+
+		position_ids = position_ids.astype("i4")
 		position_embeds = self.embed_positions(position_ids)
 
 		hidden_states = inputs_embeds + position_embeds
@@ -808,7 +841,7 @@ class WhisperModel(EasyDeLBaseModule):
 					jnp.arange(sequence_length)[None, :],
 					(batch_size, sequence_length),
 				)
-
+		decoder_position_ids = decoder_position_ids.astype("i4")
 		encoder_outputs = self.encoder(
 			input_features=input_features,
 			output_attentions=output_attentions,
@@ -952,6 +985,8 @@ class WhisperModel(EasyDeLBaseModule):
 	],
 )
 class WhisperForConditionalGeneration(EasyDeLBaseModule):
+	loss_type = "ForCausalLM"
+
 	def __init__(
 		self,
 		config: WhisperConfig,
@@ -1267,6 +1302,35 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 			model_kwargs["decoder_position_ids"][:, -1:] + 1
 		)
 		return model_kwargs
+
+	def compute_loss(
+		self,
+		*,
+		labels: tp.Optional[chex.Array] = None,
+		loss_config: tp.Optional[LossConfig] = None,
+		loss_kwargs: tp.Optional[tp.Dict] = None,
+		**batch,
+	) -> tp.Tuple[tp.Any, LossMetrics]:
+		if loss_config is None:
+			loss_config = LossConfig()
+		loss_config.reduction = "mean"
+		loss_config.shift_tokens = False
+		if labels is not None:
+			if (
+				batch.get("decoder_input_ids", None) is None
+				and batch.get("decoder_inputs_embeds", None) is None
+			):
+				batch["decoder_input_ids"] = shift_tokens_right(
+					labels,
+					self.config.pad_token_id,
+					self.config.decoder_start_token_id,
+				)
+		return super().compute_loss(
+			labels=labels,
+			loss_config=loss_config,
+			loss_kwargs=loss_kwargs,
+			**batch,
+		)
 
 
 @register_module(

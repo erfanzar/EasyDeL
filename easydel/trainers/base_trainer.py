@@ -86,6 +86,7 @@ class BaseTrainer(BaseTrainerProtocol):
 		model: tp.type[EasyDeLBaseModule] = None,
 		dataset_train: tp.Optional[Dataset] = None,
 		dataset_eval: tp.Optional[Dataset] = None,
+		data_collator: tp.Optional[tp.Callable] = None,
 		finetune: bool = True,
 		checkpoint_path: tp.Optional[tp.Union[str, os.PathLike]] = None,
 		**deprecated_kwargs,
@@ -103,6 +104,7 @@ class BaseTrainer(BaseTrainerProtocol):
 		self._model = flax.nnx.eval_shape(lambda: self.model_state.model)
 		self.dataset_train = dataset_train
 		self.dataset_eval = dataset_eval
+		self.data_collator = data_collator
 		self.finetune = finetune
 		self.checkpoint_path = checkpoint_path
 		self._initialize_attributes()
@@ -398,14 +400,27 @@ class BaseTrainer(BaseTrainerProtocol):
 					"Please install TensorFlow to use the TensorFlow dataset conversion."
 				) from exec
 			batch_size = self.training_batch_size if is_train else self.evaluation_batch_size
+			tf_data_mapping = {
+				"float16": tf.float16,
+				"float32": tf.float32,
+				"float64": tf.float64,
+				"int16": tf.int16,
+				"int32": tf.int32,
+				"int64": tf.int64,
+				"bool": tf.bool,
+			}
 			return (
 				tf.data.Dataset.from_generator(
 					lambda: dataset,
 					output_signature={
 						col: tf.TensorSpec(
-							shape=(self.arguments.max_sequence_length,), dtype=tf.int32
+							shape=vals.shape[1:]
+							if len(vals.shape) > 1 and vals.shape[0] == 1  # auto remove batch dim
+							else vals.shape,
+							dtype=tf_data_mapping[str(vals.dtype)],
 						)
-						for col in next(iter(dataset)).keys()
+						for col, vals in next(iter(dataset)).items()
+						if hasattr(vals, "shape")
 					},
 				)
 				.repeat(self.arguments.num_train_epochs if is_train else 1)
@@ -1001,7 +1016,7 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 	):
 		"""Log metrics and update progress bar."""
 
-		if ((step + 1) % self.arguments.log_steps == 0) or (step == 0):
+		if (step % self.arguments.log_steps == 0) or (step == 0):
 			if step == 0:
 				pbar.reset()
 			display_metrics = {k: v for k, v in metrics.items() if len(k) < 40}

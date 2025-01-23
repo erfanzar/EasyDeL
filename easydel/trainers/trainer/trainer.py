@@ -220,6 +220,12 @@ class Trainer(BaseTrainer):
 	):
 		"""Handles training for a single epoch."""
 		train_iter = iter(train_dataset)
+		data_collator = self.data_collator
+		if data_collator is None:
+
+			def data_collator(x):
+				return x
+
 		for _ in range(self.max_training_steps // self.arguments.num_train_epochs):
 			current_step = int(jax.device_get(state.step))
 			try:  # to make training loop safer if user wants to break that.
@@ -241,7 +247,7 @@ class Trainer(BaseTrainer):
 				with capture_time() as execution_time:
 					state, metrics, run_exception = self._execute_train_step(
 						state=state,
-						batch=batch,
+						batch=data_collator(batch),
 					)
 					metrics.execution_time = execution_time()
 			# Update and log metrics
@@ -275,13 +281,13 @@ class Trainer(BaseTrainer):
 				)
 
 				# Save checkpoint if needed
-				if self._should_save_checkpoint(current_step):
+				if self._should_save_checkpoint(current_step + 1):
 					_ = self._save_state(
 						state=state,
 						milestone=True,
 						save_directory=self.arguments.save_directory,
 					)
-				if self._should_run_evaluation(current_step):
+				if self._should_run_evaluation(current_step + 1):
 					for _ in self.eval(model_state=state):
 						...
 
@@ -301,6 +307,13 @@ class Trainer(BaseTrainer):
 	):
 		"""Handles training for a single epoch."""
 		eval_iter = iter(eval_dataset)
+
+		data_collator = self.data_collator
+		if data_collator is None:
+
+			def data_collator(x):
+				return x
+
 		for current_step in range(self.max_evaluation_steps):
 			try:
 				batch = self._get_next_batch(eval_iter)
@@ -308,7 +321,7 @@ class Trainer(BaseTrainer):
 
 				with self.evalu_tracker.trace_compilation():
 					with capture_time() as execution_time:
-						metrics = self._execute_eval_step(state, batch)
+						metrics = self._execute_eval_step(state, data_collator(batch))
 						metrics.execution_time = execution_time()
 
 				mean_loss, mean_accuracy = metrics_tracker.update(
