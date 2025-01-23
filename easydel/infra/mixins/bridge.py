@@ -458,6 +458,7 @@ class EasyBridgeMixin(PushToHubMixin):
 				config=config,
 				flatten=False,
 				partition_rules=partition_rules,
+				model_task=cls._model_task,
 			)
 			fns = {"params": shard_fns}
 			fns.update(shard_fns)
