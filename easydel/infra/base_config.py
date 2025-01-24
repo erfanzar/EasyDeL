@@ -704,7 +704,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		rotary_dim: tp.Optional[int] = None,
 		is_neox_style: bool = True,
 		base: tp.Optional[float] = None,
-	) -> chex.Array:
+	):
 		"""
 		Get basic rotary position embeddings.
 
@@ -716,7 +716,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		    base: Base value for frequency computation (defaults to self.rope_theta)
 
 		Returns:
-		    Rotary position embeddings
+		    Rotary position embeddings func
 		"""
 		from easydel.layers.rotary_embedding import get_rope
 

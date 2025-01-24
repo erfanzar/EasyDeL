@@ -86,7 +86,6 @@ class Xerxes2Config(EasyDeLBaseConfig):
 		num_hidden_layers: int = 32,
 		num_attention_heads: int = 32,
 		max_position_embeddings: int = 16384,
-		compute_blocksize: int = 64,
 		initializer_range: float = 0.02,
 		rms_norm_eps: float = 1e-6,
 		use_cache: bool = True,
@@ -98,6 +97,11 @@ class Xerxes2Config(EasyDeLBaseConfig):
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		bits: tp.Optional[int] = None,
 		scan_layers: bool = False,
+		q_lora_dim: tp.Optional[int] = 1536,
+		kv_lora_dim: int = 512,
+		qk_rope_head_dim: int = 64,
+		qk_nope_head_dim: int = 128,
+		vhead_dim: int = 128,
 		**kwargs,
 	):
 		self.gradient_checkpointing = gradient_checkpointing
@@ -113,8 +117,11 @@ class Xerxes2Config(EasyDeLBaseConfig):
 		self.rms_norm_eps = rms_norm_eps
 		self.use_cache = use_cache
 		self.rope_theta = rope_theta
-		self.compute_blocksize = compute_blocksize
-		self.head_dim = hidden_size // num_attention_heads
+		self.q_lora_dim = q_lora_dim
+		self.kv_lora_dim = kv_lora_dim
+		self.qk_rope_head_dim = qk_rope_head_dim
+		self.qk_nope_head_dim = qk_nope_head_dim
+		self.vhead_dim = vhead_dim
 		super().__init__(
 			bos_token_id=bos_token_id,
 			eos_token_id=eos_token_id,
