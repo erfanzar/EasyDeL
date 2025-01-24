@@ -204,7 +204,7 @@ class CheckpointManager:
 	def save_checkpoint(
 		state: PyTreeNode,
 		path: tp.Union[str, os.PathLike],
-		gather_fns: tp.Optional[dict[tp.Callable]] = None,
+		gather_fns: tp.Optional[tp.Union[dict[tp.Callable], bool]] = None,
 		float_dtype: tp.Optional[tp.Union[str, jnp.dtype]] = None,
 		verbose: bool = True,
 		mismatch_allowed: bool = True,
@@ -237,25 +237,30 @@ class CheckpointManager:
 			state = flatten_dict(state, sep=".")
 
 		if gather_fns:
-			if not is_flatten(gather_fns):
-				gather_fns = flatten_dict(gather_fns, sep=".")
-
 			pbar_gather = tqdm(
 				list(state.keys()),
 				desc="Gathering State",
 				disable=not verbose,
 			)
-			for key in pbar_gather:
-				callable_func = gather_fns.get(key, None)
-				if callable_func is None:
-					if not mismatch_allowed:
-						raise KeyError(f"Gather Function {key} missing.")
-					gather_mismatch_count += 1
-				else:
-					state[key] = callable_func(state[key])
+			if isinstance(gather_fns, bool):
+				for key in pbar_gather:
+					pbar_gather.update(1)
+					state[key] = jax.device_get(state[key])
+			else:
+				if not is_flatten(gather_fns):
+					gather_fns = flatten_dict(gather_fns, sep=".")
 
-				pbar_gather.set_postfix(gather_mismatch=gather_mismatch_count)
-				pbar_gather.update(1)
+				for key in pbar_gather:
+					callable_func = gather_fns.get(key, None)
+					if callable_func is None:
+						if not mismatch_allowed:
+							raise KeyError(f"Gather Function {key} missing.")
+						gather_mismatch_count += 1
+					else:
+						state[key] = callable_func(state[key])
+
+					pbar_gather.set_postfix(gather_mismatch=gather_mismatch_count)
+					pbar_gather.update(1)
 
 		state = {
 			key: get_dtype(
