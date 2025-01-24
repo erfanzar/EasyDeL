@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import pickle
 import typing as tp
 from functools import partial
 
@@ -22,21 +23,25 @@ import jax
 import optax
 from flax import nnx as nn
 from flax import struct
+from jax.sharding import NamedSharding, PartitionSpec
+from safetensors.flax import save_file as safe_save_file, load_file as safe_load_file
 
+from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import specs_to_name_sharding
 
 if tp.TYPE_CHECKING:
-	from jax.sharding import Mesh, PartitionSpec
+	from jax.sharding import Mesh
 
 	from .base_module import EasyDeLBaseModule, PartitionLike
 else:
 	EasyDeLBaseModule = tp.Any
-	PartitionSpec = tp.Any
 	PartitionLike = tp.Any
 	Mesh = tp.Any
 
 WEIGHTS_NAME = "easydel-model.parameters"
 OPTIMIZER_NAME = "easydel-optstate.parameters"
+OPTIMIZER_STRUCT_NAME = "easydel-optstate.structure"
+logger = get_logger(__name__)
 
 
 class EasyDeLState(struct.PyTreeNode):
@@ -97,16 +102,16 @@ class EasyDeLState(struct.PyTreeNode):
 		Create an instance with flexible initialization options.
 
 		Args:
-				step: Optional number of training steps.
-				graphdef: Optional graph definition.
-				graphstate: Optional graph state.
-				graphother: Optional graph *others.
-				model: Optional neural network module.
-				tx: Optional gradient transformation.
-				opt_state: Optional optimizer state.
+		    step: Optional number of training steps.
+		    graphdef: Optional graph definition.
+		    graphstate: Optional graph state.
+		    graphother: Optional graph *others.
+		    model: Optional neural network module.
+		    tx: Optional gradient transformation.
+		    opt_state: Optional optimizer state.
 
 		Raises:
-				ValueError: If initialization parameters are inconsistent.
+		    ValueError: If initialization parameters are inconsistent.
 		"""
 		# Validate mutual exclusivity of model and graph-related parameters
 		graph_params_provided = (
@@ -166,11 +171,11 @@ class EasyDeLState(struct.PyTreeNode):
 		Initialize the optimizer state with the given gradient transformation.
 
 		Args:
-			tx (optax.GradientTransformation): A gradient transformation to initialize the optimizer state.
-			partition_rules (Optional[Any], optional): Rules for partitioning the optimizer state. Defaults to None.
+		  tx (optax.GradientTransformation): A gradient transformation to initialize the optimizer state.
+		  partition_rules (Optional[Any], optional): Rules for partitioning the optimizer state. Defaults to None.
 
 		Returns:
-			EasyDeLState: An updated EasyDeLState object with the new gradient transformation and sharded optimizer state.
+		  EasyDeLState: An updated EasyDeLState object with the new gradient transformation and sharded optimizer state.
 		"""
 
 		if partition_rules is None:
@@ -198,16 +203,16 @@ class EasyDeLState(struct.PyTreeNode):
 		Shards the optimizer state according to the provided partition rules.
 
 		Args:
-			opt_state (Optional[Any]): The optimizer state to be sharded. If None, the method will use `self.opt_state`.
-																Raises a ValueError if both `opt_state` and `self.opt_state` are None.
-			partition_rules (Optional[Any]): The partition rules to be used for sharding. If None, the method will use
-																			the partition rules from `self.model.config`.
+		  opt_state (Optional[Any]): The optimizer state to be sharded. If None, the method will use `self.opt_state`.
+		                            Raises a ValueError if both `opt_state` and `self.opt_state` are None.
+		  partition_rules (Optional[Any]): The partition rules to be used for sharding. If None, the method will use
+		                                  the partition rules from `self.model.config`.
 
 		Returns:
-			Any: The sharded optimizer state.
+		  Any: The sharded optimizer state.
 
 		Raises:
-			ValueError: If both `opt_state` and `self.opt_state` are None.
+		  ValueError: If both `opt_state` and `self.opt_state` are None.
 		"""
 		if opt_state is None and self.opt_state is None:
 			raise ValueError("Optimizer state is not initialized.")
@@ -218,14 +223,15 @@ class EasyDeLState(struct.PyTreeNode):
 
 		from easydel.escale import make_shard_and_gather_fns, match_partition_rules
 
-		partition_specs = match_partition_rules(partition_rules, opt_state)
-		shard_fns, _ = make_shard_and_gather_fns(partition_specs)
-		opt_state = jax.tree_util.tree_map(
-			lambda f, o: f(o),
-			shard_fns,
-			opt_state,
-		)
-		return self.replace(opt_state=opt_state)
+		with self.model.mesh:
+			partition_specs = match_partition_rules(partition_rules, opt_state)
+			shard_fns, _ = make_shard_and_gather_fns(partition_specs)
+			opt_state = jax.tree_util.tree_map(
+				lambda f, o: f(o),
+				shard_fns,
+				opt_state,
+			)
+			return self.replace(opt_state=opt_state)
 
 	def gather_optimizer_state(self, partition_rules=None):
 		assert self.opt_state is not None, "Optimizer state is not initialized."
@@ -278,6 +284,32 @@ class EasyDeLState(struct.PyTreeNode):
 		graphstate_size = calculate_size(self.graphstate)
 		return opt_state_size + graphstate_size
 
+	def load_optimizer(self, load_directory: tp.Union[str, os.PathLike]):
+		load_directory = pathlib.Path(load_directory)
+		optim_path = load_directory / OPTIMIZER_NAME
+		struct_path = load_directory / OPTIMIZER_STRUCT_NAME
+
+		if not (optim_path.exists() and struct_path.exists()):
+			raise FileNotFoundError(f"Optimizer files missing in {load_directory}")
+
+		try:
+			# All processes load simultaneously
+			with open(struct_path, "rb") as f:
+				tdef = pickle.load(f)
+
+			tensors = safe_load_file(str(optim_path))
+			ordered_params = [tensors[f"param_{i}"] for i in range(len(tensors))]
+
+			sharded_params = [arr for arr in ordered_params]
+			opt_state = jax.tree_util.tree_unflatten(tdef, sharded_params)
+
+			logger.info(f"Optimizer state loaded from {load_directory}")
+			self = self.replace(opt_state=opt_state)
+			return self
+		except Exception as e:
+			logger.error(f"Optimizer load failed: {str(e)}")
+			raise e
+
 	def save_state(
 		self,
 		save_directory: tp.Union[str, os.PathLike],
@@ -288,6 +320,44 @@ class EasyDeLState(struct.PyTreeNode):
 		enable: tp.Optional[bool] = None,
 	):
 		save_directory = pathlib.Path(save_directory)
+		save_directory = pathlib.Path(save_directory)
+		if save_optimizer:
+			if enable is None:
+				enable = jax.process_index() == 0
+			if enable:
+				save_directory.mkdir(parents=True, exist_ok=True)
+				optim_path = save_directory / OPTIMIZER_NAME
+				struct_path = save_directory / OPTIMIZER_STRUCT_NAME
+			else:
+				optim_path = pathlib.Path("/dev/null")
+				struct_path = pathlib.Path("/dev/null")
+
+			logger.info(f"Coordinated optimizer save through {optim_path}")
+
+			try:
+				tdef = jax.tree_util.tree_structure(self.opt_state)
+				with open(struct_path, "wb") as f:
+					pickle.dump(tdef, f)
+
+				@partial(
+					jax.jit,
+					out_shardings=NamedSharding(self.model.mesh, PartitionSpec()),
+				)
+				def gather_fn(x):
+					return x
+
+				tree = jax.tree_util.tree_leaves(self.opt_state)
+				gathered = {
+					f"param_{i}": jax.device_get(gather_fn(param)) for i, param in enumerate(tree)
+				}
+				safe_save_file(tensors=gathered, filename=str(optim_path))
+
+			except Exception as e:
+				logger.error(f"Optimizer save failed: {str(e)}")
+				raise
+		else:
+			logger.info("Skipping optimizer saving as requested")
+
 		self.model.save_pretrained(
 			save_directory=str(save_directory),
 			gather_fns=self.model._gather_fns,
@@ -296,16 +366,6 @@ class EasyDeLState(struct.PyTreeNode):
 			verbose=verbose,
 			enable=enable,
 		)
-		# Fix this
-		# if save_optimizer:
-		# 	CheckpointManager.save_checkpoint(
-		# 		state=self.opt_state,
-		# 		path=str(save_directory / OPTIMIZER_NAME),
-		# 		float_dtype=float_dtype,
-		# 		gather_fns=self.model._gather_fns,
-		# 		verbose=verbose,
-		# 		mismatch_allowed=mismatch_allowed,
-		# 	)
 
 	def load_state(
 		self,
@@ -334,24 +394,24 @@ class EasyDeLState(struct.PyTreeNode):
 		Shards the entire state, according to the provided partition rules.
 
 		Args:
-			partition_rules (Optional[Any]): The partition rules to be used for sharding. If None, the method will use
-																			the partition rules from `self.model.config`.
+		  partition_rules (Optional[Any]): The partition rules to be used for sharding. If None, the method will use
+		                                  the partition rules from `self.model.config`.
 
 		Returns:
-			EasyDeLState: An updated EasyDeLState object with the sharded state.
+		  EasyDeLState: An updated EasyDeLState object with the sharded state.
 		"""
-
-		if self.opt_state is not None:
-			self = self.shard_optimizer_state(partition_rules=partition_rules)
-		self = self.shard_model(partition_rules=partition_rules)
-		return self
+		with self.model.mesh:
+			if self.opt_state is not None:
+				self = self.shard_optimizer_state(partition_rules=partition_rules)
+			self = self.shard_model(partition_rules=partition_rules)
+			return self
 
 	def gather_state(self):
 		"""
 		Gathers the entire state.
 
 		Returns:
-			EasyDeLState: An updated EasyDeLState object with the gathered state.
+		  EasyDeLState: An updated EasyDeLState object with the gathered state.
 		"""
 		if self.opt_state is not None:
 			self = self.gather_optimizer_state()
@@ -367,7 +427,7 @@ class EasyDeLState(struct.PyTreeNode):
 		Gathers the model according to the provided partition rules.
 
 		Returns:
-			EasyDeLState: An updated EasyDeLState object with the gathered model.
+		  EasyDeLState: An updated EasyDeLState object with the gathered model.
 		"""
 		from easydel.escale import make_shard_and_gather_fns, match_partition_rules
 
@@ -403,12 +463,12 @@ class EasyDeLState(struct.PyTreeNode):
 		Shards the model according to the provided partition rules.
 
 		Args:
-			partition_rules (Optional[Any]): The partition rules to be used for sharding. If None, the method will use
-																			the partition rules from `self.model.config`.
-			mesh (Optional[Mesh]): The mesh to be used for sharding. If None, the method will use the mesh from `self.model`.
+		  partition_rules (Optional[Any]): The partition rules to be used for sharding. If None, the method will use
+		                                  the partition rules from `self.model.config`.
+		  mesh (Optional[Mesh]): The mesh to be used for sharding. If None, the method will use the mesh from `self.model`.
 
 		Returns:
-			EasyDeLState: An updated EasyDeLState object with the sharded model.
+		  EasyDeLState: An updated EasyDeLState object with the sharded model.
 		"""
 
 		rules = partition_rules or self.model._get_partition_rules(None)
@@ -433,7 +493,7 @@ class EasyDeLState(struct.PyTreeNode):
 		Returns the sharding information for the state.
 
 		Returns:
-			Any: The sharding information.
+		  Any: The sharding information.
 		"""
 		return nn.from_tree(
 			jax.tree_util.tree_map(

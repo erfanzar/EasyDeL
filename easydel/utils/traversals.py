@@ -96,8 +96,9 @@ def string_key_to_int(xs):
 	return xs
 
 
-def _dict_flatten_dict(xs, keep_empty_nodes=False, is_leaf=None, sep=None):
-	assert isinstance(xs, dict), f"expected dict; got {type(xs)}"
+def _dict_flatten_dict(xs, keep_empty_nodes=False, is_leaf=None, sep=None, fumap=False):
+	if not fumap:
+		assert isinstance(xs, dict), f"expected dict; got {type(xs)}"
 
 	def _key(path):
 		if sep is None:
@@ -148,6 +149,7 @@ def flatten_dict(
 	keep_empty_nodes: bool = False,
 	is_leaf: tp.Optional[tp.Callable[[tuple, tp.Any], bool]] = None,
 	sep: tp.Optional[str] = None,
+	fumap: bool = False,
 ) -> tp.Dict[tp.Union[tuple, str], tp.Any]:
 	"""
 	Enhanced dictionary flattening with better type handling and validation.
@@ -165,7 +167,7 @@ def flatten_dict(
 	    TypeError: If input is not a dictionary or mapping
 	"""
 
-	if isinstance(xs, dict):
+	if isinstance(xs, dict) or fumap:
 		if sep is not None:
 			xs = int_key_to_string(xs)
 		return _dict_flatten_dict(
@@ -173,6 +175,7 @@ def flatten_dict(
 			keep_empty_nodes=keep_empty_nodes,
 			is_leaf=is_leaf,
 			sep=sep,
+			fumap=fumap,
 		)
 	return traversals.flatten_mapping(
 		xs,
