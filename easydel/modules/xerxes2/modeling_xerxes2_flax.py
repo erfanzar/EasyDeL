@@ -195,7 +195,7 @@ class Xerxes2Attention(FlaxAttentionModule):
 		)
 		key_states = (
 			jnp.zeros(
-				(batch_size, sequence_length, self.num_heads, self.qhead_dim),
+				(batch_size, sequence_length, 1, self.qhead_dim),
 				dtype=q_pe.dtype,
 			)
 			.at[..., : self.qk_nope_head_dim]
@@ -203,7 +203,7 @@ class Xerxes2Attention(FlaxAttentionModule):
 			.at[..., self.qk_nope_head_dim :]
 			.set(k_pe)
 		)
-
+		
 		(
 			key_states,
 			value_states,
