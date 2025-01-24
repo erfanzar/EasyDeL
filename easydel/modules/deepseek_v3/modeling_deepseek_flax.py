@@ -360,7 +360,10 @@ class DeepseekV3MoE(nn.Module):
 			)
 
 	def __call__(self, hidden_states):
-		warnings.warn("DeepSeekv3's not fully checked yet, please open an issue.")
+		warnings.warn(
+			"DeepSeekv3's not fully checked yet, please open an issue.",
+			stacklevel=5,
+		)
 		identity = hidden_states
 		orig_shape = hidden_states.shape
 		topk_idx, topk_weight = self.gate(hidden_states)
@@ -909,11 +912,6 @@ class DeepseekV3Model(EasyDeLBaseModule):
 		for idx, layer in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
-			jax.debug.print(
-				"EasyDeL - Input Layer {}, {}",
-				idx,
-				hidden_states[-1, -1, -5:],
-			)
 			output = layer(
 				hidden_states=hidden_states,
 				frequencies=self.frequencies,

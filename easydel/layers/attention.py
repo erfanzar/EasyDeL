@@ -1689,13 +1689,16 @@ class AttentionBenchmarker:
 		return results
 
 
+SC = tp.TypeVar("SC")
+
+
 class FlaxAttentionModule(nn.Module):
 	def __init__(
 		self,
-		config: "EasyDeLBaseConfig",  # type:ignore  # noqa
+		config: SC,
 	):
 		super().__init__()
-		self.config = config
+		self.config: SC | EasyDeLBaseConfig = config
 
 		self.cached_key: nn.Cache[Array] | None = None
 		self.cached_value: nn.Cache[Array] | None = None
