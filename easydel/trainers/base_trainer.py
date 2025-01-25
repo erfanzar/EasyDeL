@@ -655,8 +655,8 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 - **Epochs**: {self.arguments.num_train_epochs}
 - **Batch Size**: {self.arguments.total_batch_size}
 - **Sequence Length**: {self.arguments.max_sequence_length} 
-- **Dtype**: {self.model.dtype}
-- **Params Dtype**: {self.model.param_dtype}
+- **Dtype**: {str(self.model.dtype)}
+- **Params Dtype**: {str(self.model.param_dtype)}
 
 ### Advanced Configuration
 - **Gradient Checkpointing**: {self.model.config.gradient_checkpointing}  
@@ -943,6 +943,7 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 				"LIBTPU_INIT_ARGS": os.environ.get("LIBTPU_INIT_ARGS", ""),
 			},
 			step=0,
+			log_as="summary",
 		)
 
 	def _get_next_batch(self, train_iter):
