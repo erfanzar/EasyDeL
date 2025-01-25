@@ -351,7 +351,12 @@ class TrainingArguments:
 		):
 			raise EasyDeLTimerError("Time Out")
 
-	def log_metrics(self, metrics: MetricsType, step: int):
+	def log_metrics(
+		self,
+		metrics: MetricsType,
+		step: int,
+		log_as: tp.Optional[tp.Literal["summary", "config"]] = None,
+	):
 		"""
 		Logs training metrics to Weights & Biases and/or TensorBoard.
 
@@ -364,8 +369,8 @@ class TrainingArguments:
 			metrics = {
 				self._restructure_metric_name(k): v for k, v in metrics.items() if v is not None
 			}
-			self._log_to_wandb(metrics, step)
-			self._log_to_tensorboard(metrics, step)
+			self._log_to_wandb(metrics, step, log_as)
+			self._log_to_tensorboard(metrics, step, log_as)
 
 	def _restructure_metric_name(self, metric_name: str) -> str:
 		"""
@@ -381,7 +386,12 @@ class TrainingArguments:
 			return metric_name.replace("train/grad_norm/", "grad_norm/")
 		return metric_name
 
-	def _log_to_wandb(self, metrics, step):
+	def _log_to_wandb(
+		self,
+		metrics,
+		step,
+		log_as: tp.Optional[tp.Literal["summary", "config"]] = None,
+	):
 		"""
 		Log metrics to Weights & Biases (wandb).
 
@@ -391,23 +401,34 @@ class TrainingArguments:
 		  metrics (dict): A dictionary of metrics to log. Keys are metric names, values are the metric values.
 		  step (int): The current step or iteration number.
 		"""
-		if self.use_wandb and wandb is not None:
-			wandb_metrics = {}
-			for key, value in metrics.items():
-				try:
-					wandb_metrics[key] = (
-						self._create_wandb_histogram(value)
-						if isinstance(value, (list, tuple, np.ndarray, jnp.ndarray))
-						else value
-					)
-				except Exception as e:
-					warnings.warn(f"Failed to log metric {key} to wandb: {e}", stacklevel=3)
-			try:
-				wandb.log(wandb_metrics, step=step)
-			except Exception:
-				...
 
-	def _log_to_tensorboard(self, metrics, step):
+		if self.use_wandb and wandb is not None:
+			if log_as == "summary":
+				wandb.summary.update(metrics)
+			elif log_as == "config":
+				wandb.config.update(metrics)
+			else:
+				wandb_metrics = {}
+				for key, value in metrics.items():
+					try:
+						wandb_metrics[key] = (
+							self._create_wandb_histogram(value)
+							if isinstance(value, (list, tuple, np.ndarray, jnp.ndarray))
+							else value
+						)
+					except Exception as e:
+						warnings.warn(f"Failed to log metric {key} to wandb: {e}", stacklevel=3)
+				try:
+					wandb.log(wandb_metrics, step=step)
+				except Exception:
+					...
+
+	def _log_to_tensorboard(
+		self,
+		metrics,
+		step,
+		log_as: tp.Optional[tp.Literal["summary", "config"]] = None,
+	):
 		"""
 		Log metrics to TensorBoard.
 
