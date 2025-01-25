@@ -35,12 +35,13 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching.transformer_cache import (
+	TransformerCacheMetaData,
 	TransformerCacheView,
 	TransformerCache,
 )
 from easydel.layers.norms import RMSNorm
 from easydel.utils.helpers import get_logger
-
+from jax.sharding import PartitionSpec
 from .xerxes2_configuration import Xerxes2Config as Xerxes2Config
 
 logger = get_logger(__name__)
@@ -203,7 +204,7 @@ class Xerxes2Attention(FlaxAttentionModule):
 			.at[..., self.qk_nope_head_dim :]
 			.set(k_pe)
 		)
-		
+
 		(
 			key_states,
 			value_states,
@@ -464,9 +465,9 @@ class Xerxes2Model(EasyDeLBaseModule):
 
 		all_attentions = () if output_attentions else None
 		all_hidden_states = () if output_hidden_states else None
-		assert (
-			sequence_length <= self.config.max_position_embeddings
-		), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+		assert sequence_length <= self.config.max_position_embeddings, (
+			f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+		)
 		if attention_mask is None:
 			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
 		if position_ids is None:
@@ -596,4 +597,29 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
 			past_key_values=outputs.past_key_values,
+		)
+
+	def init_cache(self, batch_size: int, max_length: int): 
+		return TransformerCache.init_layers_cache(
+			num_hidden_layers=self.config.num_hidden_layers,
+			dtype=self.dtype,
+			key_values_partition_specs=PartitionSpec(
+				self.config.partition_axis.batch_axis,
+				self.config.partition_axis.key_sequence_axis,
+				None,  # it's 1 by default
+				self.config.partition_axis.attention_dim_axis,
+			),
+			metadata=TransformerCacheMetaData.create(
+				batch_size=batch_size,
+				sequence_length=max_length,
+				num_heads=1,
+				key_dim=self.config.qk_rope_head_dim + self.config.qk_nope_head_dim,
+				value_dim=self.config.vhead_dim
+			),
+			quantizer=self._quant_class(
+				quantization_method=self.config.kv_cache_quantization_method,
+				block_size=self.config.kv_cache_quantization_blocksize,
+				quantization_platform=self.config.platform,
+			),
+			mesh=self.config.mesh,
 		)

@@ -250,6 +250,7 @@ class Trainer(BaseTrainer):
 						batch=data_collator(batch),
 					)
 					metrics.execution_time = execution_time()
+					current_step = int(jax.device_get(state.step))
 			# Update and log metrics
 			try:
 				mean_loss, mean_accuracy = metrics_tracker.update(
@@ -281,13 +282,13 @@ class Trainer(BaseTrainer):
 				)
 
 				# Save checkpoint if needed
-				if self._should_save_checkpoint(current_step + 1):
+				if self._should_save_checkpoint(current_step):
 					_ = self._save_state(
 						state=state,
 						milestone=True,
 						save_directory=self.arguments.save_directory,
 					)
-				if self._should_run_evaluation(current_step + 1):
+				if self._should_run_evaluation(current_step):
 					for _ in self.eval(model_state=state):
 						...
 
@@ -314,7 +315,7 @@ class Trainer(BaseTrainer):
 			def data_collator(x):
 				return x
 
-		for current_step in range(self.max_evaluation_steps):
+		for current_step in range(1, self.max_evaluation_steps + 1):
 			try:
 				batch = self._get_next_batch(eval_iter)
 				step_metrics.start_step()

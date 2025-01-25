@@ -597,14 +597,14 @@ class StepMetrics:
 		step_time = time.time() - self.step_start_time
 		total_time = time.time() - self.start_time
 
-		visited_tokens = seq_length * (current_step + 1) * batch_size
+		visited_tokens = seq_length * (current_step) * batch_size
 		throughput = (seq_length * batch_size) / step_time
 		flops_per_token = flops / visited_tokens
-		flops_per_sequence = flops / ((current_step + 1) * batch_size)
+		flops_per_sequence = flops / ((current_step) * batch_size)
 
 		flops_pre_second = flops / step_time
 		flops_token_pre_second = flops / visited_tokens
-		flops_sequence_pre_second = flops / ((current_step + 1) * batch_size)
+		flops_sequence_pre_second = flops / ((current_step) * batch_size)
 		mlperf_metrics = {
 			"mlperf/flops": float(flops),
 			"mlperf/flops_per_token": float(flops_per_token),
@@ -691,14 +691,14 @@ class MetricsTracker:
 		"""Update tracked metrics with new values."""
 		with jax.spmd_mode("allow_all"):
 			self.loss_sum = loss if self.loss_sum is None else self.loss_sum + loss
-			mean_loss = self.loss_sum / (step + 1 - self.step_offset)
+			mean_loss = self.loss_sum / (step - self.step_offset)
 			if accuracy != float("inf"):
 				if accuracy is None:
 					accuracy = 0.0
 				self.accuracy_sum = (
 					accuracy if self.accuracy_sum is None else self.accuracy_sum + accuracy
 				)
-				mean_accuracy = self.accuracy_sum / (step + 1 - self.step_offset)
+				mean_accuracy = self.accuracy_sum / (step - self.step_offset)
 
 				return float(mean_loss), float(mean_accuracy)
 			return float(mean_loss)
