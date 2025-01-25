@@ -104,7 +104,7 @@ class TrainingArguments:
 	remove_ckpt_after_load: bool = False
 	remove_unused_columns: bool = True
 	save_directory: str = "EasyDeL-Checkpoints"
-	save_optimizer_state: bool = False
+	save_optimizer_state: bool = True
 	save_steps: tp.Optional[int] = None
 	save_total_limit: tp.Optional[int] = None
 	scheduler: AVAILABLE_SCHEDULERS = EasyDeLSchedulers.NONE
@@ -153,9 +153,9 @@ class TrainingArguments:
 		Performs validation checks on the provided configuration settings.
 		Raises ValueError if any configuration is invalid.
 		"""
-		assert (
-			self.gradient_accumulation_steps > 0
-		), "`gradient_accumulation_steps` can't be lower than 1."
+		assert self.gradient_accumulation_steps > 0, (
+			"`gradient_accumulation_steps` can't be lower than 1."
+		)
 
 		if self.backend not in AVAILABLE_BACKENDS:
 			raise ValueError(
