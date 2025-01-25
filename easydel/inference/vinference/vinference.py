@@ -397,9 +397,9 @@ class vInference:
 			"(Set `tokenizer.pad_token_id = tokenizer.eos_token_id` if undefined"
 			" or (`processing_class.tokenizer.pad_token_id = processing_class.tokenizer.eos_token_id`))"
 		)
-		assert (
-			self.generation_config.eos_token_id is not None
-		), "`eos_token_id` cannot be None."
+		assert self.generation_config.eos_token_id is not None, (
+			"`eos_token_id` cannot be None."
+		)
 
 	def generate(
 		self,
@@ -502,7 +502,7 @@ class vInference:
 		# Initial generation step
 		state = self._execute_generation_step(generate_func, state)
 		all_interval_func_flops = []
-		if not state.is_sequence_finished:
+		if not state.is_sequence_finished.all():
 			# Subsequent generation steps
 			interval_time = 0
 			for _ in range(self.generation_config._loop_rows):
@@ -513,7 +513,7 @@ class vInference:
 					all_interval_func_flops,
 				)
 				yield state
-				if state.is_sequence_finished:
+				if state.is_sequence_finished.all():
 					break
 		return state
 
