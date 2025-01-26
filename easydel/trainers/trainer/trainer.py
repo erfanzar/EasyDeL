@@ -60,7 +60,7 @@ class Trainer(BaseTrainer):
 		def collate_fn(batch):
 			results = {}
 			for key in batch[0].keys():
-				if self.model.loss_function.__name__ == "ForCausalLMLoss":
+				if self.model.__class__.__name__ == "ForCausalLMLoss":
 					if truncation_mode == "keep_end":
 						corrected_sequence = [
 							jnp.array(f[key])[..., -max_sequence_length:] for f in batch
@@ -69,13 +69,10 @@ class Trainer(BaseTrainer):
 						corrected_sequence = [
 							jnp.array(f[key])[..., :max_sequence_length] for f in batch
 						]
+					results[key] = jnp.stack(corrected_sequence)
 				else:
 					corrected_sequence = [jnp.array(f[key]) for f in batch]
-
-				results[key] = jnp.stack(corrected_sequence).reshape(
-					-1,
-					corrected_sequence[0].shape[-1],
-				)
+					results[key] = jnp.stack(corrected_sequence)
 			return results
 
 		return collate_fn
@@ -359,7 +356,9 @@ class Trainer(BaseTrainer):
 		return metrics
 
 	def _execute_train_step(
-		self, state, batch
+		self,
+		state,
+		batch,
 	) -> tp.Tuple[EasyDeLState, LossMetrics, Exception]:
 		"""Execute a single training step."""
 		if self.pruning_module is not None:
@@ -369,6 +368,7 @@ class Trainer(BaseTrainer):
 					state.opt_state,
 				)
 			)
+		metrics = LossMetrics()
 		try:
 			state, metrics = jax.block_until_ready(
 				self.sharded_training_step_function(state, batch)

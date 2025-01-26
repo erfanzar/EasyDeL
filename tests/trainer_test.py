@@ -45,8 +45,8 @@ def create_dataset():
 
 	dataset = datasets.load_dataset(
 		"PowerInfer/QWQ-LONGCOT-500K",
-		split="train",
-		streaming=True,
+		split="train[:5%]",
+		streaming=False,
 	)
 
 	def to_ids(sample):
