@@ -51,9 +51,8 @@ ALLOWED_DATA_TYPES = [
 ]
 
 
-def get_dtype(
-	array: jax.Array,
-	dtype: tp.Optional[tp.Union[str, jnp.dtype]],
+def put_dtype(
+	array: jax.Array, dtype: tp.Optional[tp.Union[str, jnp.dtype]]
 ) -> jax.Array:
 	"""
 	Get the tensor with the specified data type.
@@ -78,7 +77,18 @@ def get_dtype(
 			"float32": jnp.float32,
 			"fp64": jnp.float64,
 			"float64": jnp.float64,
-		}
+			"fp8": jnp.float8_e5m2,
+			"fp8_e4m3fn": jnp.float8_e4m3fn,
+			"fp8_e4m3fnuz": jnp.float8_e4m3fnuz,
+			"fp8_e4m3b11fnuz": jnp.float8_e4m3b11fnuz,
+			"fp8_e5m2": jnp.float8_e5m2,
+			"fp8_e5m2fnuz": jnp.float8_e5m2fnuz,
+			"float8_e4m3fn": jnp.float8_e4m3fn,
+			"float8_e4m3fnuz": jnp.float8_e4m3fnuz,
+			"float8_e4m3b11fnuz": jnp.float8_e4m3b11fnuz,
+			"float8_e5m2": jnp.float8_e5m2,
+			"float8_e5m2fnuz": jnp.float8_e5m2fnuz,
+		}[dtype]
 		try:
 			dtype = dtype_map[dtype]
 		except KeyError as e:
@@ -95,6 +105,7 @@ def _read_process_array(
 	mismatch_allowed,
 	manager,
 	callback: tp.Optional[tp.Callable[[jax.Array, str], jax.Array]] = None,
+	dtype: tp.Optional[tp.Union[str, jnp.dtype]] = None,
 ):
 	"""Helper function to process a single tensor from a checkpoint."""
 	tensor = manager.get_tensor(key)
@@ -117,6 +128,7 @@ def _read_process_array(
 
 	if callback:
 		tensor = callback(tensor, key)
+	tensor = put_dtype(tensor, dtype)
 	return key, tensor, mismatch
 
 
@@ -153,6 +165,7 @@ class CheckpointManager:
 		verbose: bool = False,
 		mismatch_allowed: bool = True,
 		callback: tp.Optional[tp.Callable[[jax.Array, str], jax.Array]] = None,
+		dtype: tp.Optional[tp.Union[str, jnp.dtype]] = None,
 	) -> tp.Tuple[tp.Union[PyTreeNode, dict], dict]:
 		"""
 		Load a checkpoint from the given path.
@@ -180,6 +193,7 @@ class CheckpointManager:
 				mismatch_allowed=mismatch_allowed,
 				manager=f,
 				callback=callback,
+				dtype=dtype,
 			)
 			results = [
 				process_func(key)
@@ -263,7 +277,7 @@ class CheckpointManager:
 					pbar_gather.update(1)
 
 		state = {
-			key: get_dtype(
+			key: put_dtype(
 				jax.device_get(jnp.array(value)) if not isinstance(value, jax.Array) else value,
 				float_dtype,
 			)
@@ -326,7 +340,7 @@ class CheckpointManager:
 							raise KeyError(k_err) from None
 						gather_mismatch_count += 1
 				pbar.set_postfix(gather_mismatch=gather_mismatch_count)
-				value = get_dtype(value, float_dtype)
+				value = put_dtype(value, float_dtype)
 				stream.write(packer.pack((key, to_bytes(value))))
 
 	def save_pickle(self, obj: object, filename: tp.Union[str, os.PathLike]):

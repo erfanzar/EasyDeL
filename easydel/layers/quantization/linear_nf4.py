@@ -167,16 +167,16 @@ class LinearNF4(QauntModule):
 			param_dtype=param_dtype,
 			precision=precision,
 		)
-		# Initialize the kernel
+		# Initialize the quant_kernel
 		if do_init:
 			kernel_key = rngs.params()
-			kernel = kernel_init(kernel_key, (in_features, out_features), param_dtype)
-			kernel, scales = self._quantize_kernel(kernel)
+			quant_kernel = kernel_init(kernel_key, (in_features, out_features), param_dtype)
+			quant_kernel, quant_scales = self._quantize_kernel(quant_kernel)
 		else:
-			kernel, scales = None, None
+			quant_kernel, quant_scales = None, None
 
-		self.kernel = nnx.Param(kernel)
-		self.scales = nnx.Param(scales)
+		self.quant_kernel = nnx.Param(quant_kernel)
+		self.quant_scales = nnx.Param(quant_scales)
 
 		if use_bias and do_init:
 			bias_key = rngs.params()
@@ -222,9 +222,9 @@ class LinearNF4(QauntModule):
 			)
 		)
 
-		kernel, scales = cls._quantize_kernel(linear.kernel.value, block_size)
-		instance.kernel = nnx.Param(kernel)
-		instance.scales = nnx.Param(scales)
+		quant_kernel, quant_scales = cls._quantize_kernel(linear.kernel.value, block_size)
+		instance.quant_kernel = nnx.Param(quant_kernel)
+		instance.quant_scales = nnx.Param(quant_scales)
 
 		if linear.use_bias:
 			instance.bias = nnx.Param(linear.bias.value)
@@ -251,7 +251,7 @@ class LinearNF4(QauntModule):
 		)
 
 		dequantized_kernel = self._dequantize_kernel()
-		linear.kernel = nnx.Param(dequantized_kernel)
+		linear.quant_kernel = nnx.Param(dequantized_kernel)
 
 		if self.use_bias:
 			linear.bias = nnx.Param(self.bias.value)
@@ -259,46 +259,46 @@ class LinearNF4(QauntModule):
 		return linear
 
 	@staticmethod
-	def _quantize_kernel(kernel, block_size):
-		"""Quantize the kernel weights using NF4."""
-		if kernel is None or isinstance(kernel, jax.ShapeDtypeStruct):
+	def _quantize_kernel(quant_kernel, block_size):
+		"""Quantize the quant_kernel weights using NF4."""
+		if quant_kernel is None or isinstance(quant_kernel, jax.ShapeDtypeStruct):
 			return None, None
-		return quantize_and_pack_nf4(kernel, block_size)
+		return quantize_and_pack_nf4(quant_kernel, block_size)
 
 	def _dequantize_kernel(self):  # in case someone's using tie word embedding.
-		"""Dequantize the kernel weights from NF4."""
+		"""Dequantize the quant_kernel weights from NF4."""
 		if (
-			self.kernel.value is None
-			and self.scales.value is None
+			self.quant_kernel.value is None
+			and self.quant_scales.value is None
 			and self.block_size is None
 		):
 			return None
-		elif self.scales.value is None and self.block_size is None:
-			return self.kernel
+		elif self.quant_scales.value is None and self.block_size is None:
+			return self.quant_kernel
 		return dequantize_nf4(
-			self.kernel.value,
-			self.scales.value,
+			self.quant_kernel.value,
+			self.quant_scales.value,
 			self.block_size,
 		).reshape(self.in_features, self.out_features)
 
 	@jax.named_scope("easydel-linear-nf4-call")
 	def __call__(self, inputs: Array) -> Array:
 		"""Applies a quantized linear transformation to the inputs along the last dimension."""
-		kernel = self._dequantize_kernel()
+		quant_kernel = self._dequantize_kernel()
 
 		assert (
-			kernel is not None
-		), "loaded and dequantized kernel is None, which means it have been loaded from another None Kernel Linear"
+			quant_kernel is not None
+		), "loaded and dequantized quant_kernel is None, which means it have been loaded from another None Kernel Linear"
 
 		bias = self.bias.value
 
-		inputs, kernel, bias = dtypes.promote_dtype(
-			(inputs, kernel, bias), dtype=self.dtype
+		inputs, quant_kernel, bias = dtypes.promote_dtype(
+			(inputs, quant_kernel, bias), dtype=self.dtype
 		)
 
 		y = self.dot_general(
 			inputs,
-			kernel,
+			quant_kernel,
 			(((inputs.ndim - 1,), (0,)), ((), ())),
 			precision=self.precision,
 		)
@@ -309,12 +309,12 @@ class LinearNF4(QauntModule):
 		return y
 
 	def get_kernel(self):
-		"""Get the dequantized kernel weights."""
+		"""Get the dequantized quant_kernel weights."""
 		return self._dequantize_kernel()
 
 	def get_quantized_kernel(self):
-		"""Get the quantized kernel weights and scales."""
-		return self.kernel.value, self.scales.value
+		"""Get the quantized quant_kernel weights and quant_scales."""
+		return self.quant_kernel.value, self.quant_scales.value
 
 	@staticmethod
 	def metadata():
@@ -322,4 +322,4 @@ class LinearNF4(QauntModule):
 
 	@staticmethod
 	def quantization_mapping():
-		return {"kernel": ["kernel", "scales", "block_size"]}
+		return {"kernel": ["quant_kernel", "quant_scales", "block_size"]}

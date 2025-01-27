@@ -298,9 +298,13 @@ class EasyBridgeMixin(PushToHubMixin):
 		cls,
 		resolved_archive_file: tp.Optional[str],
 		model: nn.Module,
+		param_dtype: jnp.dtype,
 		mismatch_allowed: bool,
 		verbose: bool,
 		shard_fns: tp.Optional[dict[tp.Callable]],
+		quantization_method: tp.Optional[EasyDeLQuantizationMethods],
+		quantization_block_size: int,
+		vebose: bool,
 	) -> nn.Module:
 		"""Loads model weights from a checkpoint file.
 
@@ -321,6 +325,7 @@ class EasyBridgeMixin(PushToHubMixin):
 				verbose=verbose,
 				shard_fns=shard_fns,
 				callback=None,
+				dtype=param_dtype,
 			)
 
 			params = state.get("params", None)
@@ -331,7 +336,13 @@ class EasyBridgeMixin(PushToHubMixin):
 
 			required_params = set(flatten_dict(model.graphtree_params_shape))
 			unexpected_keys = set(state.keys()) - required_params
-
+			if any([k[-1].startswith("quant_") for k in state.keys()]):
+				model = quantize_linear_layers(
+					model,
+					method=quantization_method,
+					block_size=quantization_block_size,
+					verbose=vebose,
+				)
 			for unexpected_key in unexpected_keys:
 				del state[unexpected_key]
 
@@ -365,6 +376,10 @@ class EasyBridgeMixin(PushToHubMixin):
 		local_files_only: bool = False,
 		token: tp.Optional[tp.Union[str, bool]] = None,
 		revision: str = "main",
+		vebose: bool = True,
+		quantization_platform: tp.Optional[EasyDeLPlatforms] = None,
+		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
+		quantization_block_size: int = 128,
 		**kwargs,
 	):
 		"""Loads an EasyDeL model from a pretrained model or path.
@@ -536,23 +551,26 @@ class EasyBridgeMixin(PushToHubMixin):
 			precision=precision,
 			rngs=nn.Rngs(0),
 		)
-		model = quantize_linear_layers(
-			model,
-			method=config.quantization_method,
-			block_size=config.quantization_blocksize,
-			quantization_pattern=config.quantization_pattern,
-		)
 
 		model = cls._load_model_weights(
 			resolved_archive_file,
 			model,
+			param_dtype,
 			mismatch_allowed,
 			verbose,
 			shard_fns,
+			quantization_method,
+			quantization_block_size,
+			vebose,
 		)
-
+		model = quantize_linear_layers(
+			model,
+			method=quantization_method,
+			block_size=quantization_block_size,
+			verbose=vebose,
+		)
 		if auto_shard_model:
-			model = model.fully_shard()
+			model = model.shard_model()
 		if model.can_generate():
 			try:
 				model.generation_config = GenerationConfig.from_pretrained(
@@ -593,6 +611,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		config_kwargs: tp.Optional[EasyDeLBaseConfigDict] = None,
 		auto_shard_model: bool = False,
 		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]] = None,
+		quantization_platform: tp.Optional[EasyDeLPlatforms] = None,
 		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
 		quantization_block_size: int = 128,
 		verbose: bool = True,

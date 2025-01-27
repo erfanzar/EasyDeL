@@ -72,12 +72,14 @@ def get_module_repr(module: nn.Module) -> str:
 
 	if isinstance(module, nn.Linear):
 		in_features = (
-			module.kernel.shape[0]
+			(module.kernel.shape[0] if hasattr(module.kernel, "shape") else "Null")
 			if hasattr(module, "kernel")
 			else module.kernel_init.__wrapped__.__code__.co_argcount - 1
 		)
 		out_features = (
-			module.features if hasattr(module, "features") else module.kernel.shape[1]
+			module.features
+			if hasattr(module, "features")
+			else (module.kernel.shape[-1] if hasattr(module.kernel, "shape") else "Null")
 		)
 		use_bias = module.use_bias if hasattr(module, "use_bias") else False
 		return (

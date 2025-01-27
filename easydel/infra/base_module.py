@@ -299,6 +299,20 @@ class EasyDeLBaseModule(
 			return self.config.get_partition_rules(fully_sharded_data_parallel=True)
 		return partition_rules
 
+	def to_dtype(self: SELF, dtype: jnp.dtype) -> SELF:
+		"""Applies sharding functions to the model's state."""
+		gdef, state, others = nn.split(self, nn.Param, ...)
+
+		def _map(path, val: nn.VariableState):
+			if val.value is not None:
+				if not path[-1].startswith("quant_"):
+					val.value = val.value.astype(dtype)
+			return val
+
+		state.update(state.map(_map))
+		self = nn.merge(gdef, state, others)
+		return self
+
 	def _apply_sharding_fns(
 		self: SELF,
 		sharding_fns: tp.Mapping[str, tp.Callable],

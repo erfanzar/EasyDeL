@@ -20,6 +20,7 @@ import chex
 import jax
 import jax.numpy as jnp
 from flax import nnx as nn
+from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import register_module
@@ -35,13 +36,13 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching.transformer_cache import (
+	TransformerCache,
 	TransformerCacheMetaData,
 	TransformerCacheView,
-	TransformerCache,
 )
 from easydel.layers.norms import RMSNorm
 from easydel.utils.helpers import get_logger
-from jax.sharding import PartitionSpec
+
 from .xerxes2_configuration import Xerxes2Config as Xerxes2Config
 
 logger = get_logger(__name__)
@@ -465,9 +466,9 @@ class Xerxes2Model(EasyDeLBaseModule):
 
 		all_attentions = () if output_attentions else None
 		all_hidden_states = () if output_hidden_states else None
-		assert sequence_length <= self.config.max_position_embeddings, (
-			f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
-		)
+		assert (
+			sequence_length <= self.config.max_position_embeddings
+		), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 		if attention_mask is None:
 			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
 		if position_ids is None:
@@ -585,7 +586,11 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 
 		hidden_states = outputs[0]
 		if self.config.tie_word_embeddings:
-			lm_logits = hidden_states @ self.model.embed_tokens.embedding.value.T
+			lm_logits = jax.lax.dot_general(
+				hidden_states,
+				self.model.embed_tokens.embedding.value.T,
+				(((hidden_states.ndim - 1), (0,)), ((), ())),
+			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
 
@@ -599,7 +604,7 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 			past_key_values=outputs.past_key_values,
 		)
 
-	def init_cache(self, batch_size: int, max_length: int): 
+	def init_cache(self, batch_size: int, max_length: int):
 		return TransformerCache.init_layers_cache(
 			num_hidden_layers=self.config.num_hidden_layers,
 			dtype=self.dtype,
@@ -614,7 +619,7 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 				sequence_length=max_length,
 				num_heads=1,
 				key_dim=self.config.qk_rope_head_dim + self.config.qk_nope_head_dim,
-				value_dim=self.config.vhead_dim
+				value_dim=self.config.vhead_dim,
 			),
 			quantizer=self._quant_class(
 				quantization_method=self.config.kv_cache_quantization_method,

@@ -397,9 +397,9 @@ class vInference:
 			"(Set `tokenizer.pad_token_id = tokenizer.eos_token_id` if undefined"
 			" or (`processing_class.tokenizer.pad_token_id = processing_class.tokenizer.eos_token_id`))"
 		)
-		assert self.generation_config.eos_token_id is not None, (
-			"`eos_token_id` cannot be None."
-		)
+		assert (
+			self.generation_config.eos_token_id is not None
+		), "`eos_token_id` cannot be None."
 
 	def generate(
 		self,

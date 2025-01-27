@@ -165,14 +165,14 @@ class Linear8bit(QauntModule):
 		)
 		if do_init:
 			kernel_key = rngs.params()
-			kernel = kernel_init(kernel_key, (in_features, out_features), param_dtype)
-			quantized_kernel, scales = self._quantize_kernel(kernel)
+			quant_kernel = kernel_init(kernel_key, (in_features, out_features), param_dtype)
+			quantized_kernel, quant_scales = self._quantize_kernel(quant_kernel)
 		else:
-			quantized_kernel, scales = None, None
-		# Quantize the kernel
+			quantized_kernel, quant_scales = None, None
+		# Quantize the quant_kernel
 
-		self.kernel = nnx.Param(quantized_kernel)
-		self.scales = nnx.Param(scales)
+		self.quant_kernel = nnx.Param(quantized_kernel)
+		self.quant_scales = nnx.Param(quant_scales)
 
 		if use_bias and do_init:
 			bias_key = rngs.params()
@@ -225,12 +225,12 @@ class Linear8bit(QauntModule):
 			)
 		)
 
-		# Quantize the kernel from the original linear layer
-		quantized_kernel, scales = cls._quantize_kernel(linear.kernel.value)
+		# Quantize the quant_kernel from the original linear layer
+		quantized_kernel, quant_scales = cls._quantize_kernel(linear.kernel.value)
 
 		# Update the parameters
-		instance.kernel = nnx.Param(quantized_kernel)
-		instance.scales = nnx.Param(scales)
+		instance.quant_kernel = nnx.Param(quantized_kernel)
+		instance.quant_scales = nnx.Param(quant_scales)
 
 		# Copy the bias if it exists
 		if linear.use_bias:
@@ -266,9 +266,9 @@ class Linear8bit(QauntModule):
 			)
 		)
 
-		# Dequantize the kernel and update the linear layer
+		# Dequantize the quant_kernel and update the linear layer
 		dequantized_kernel = self._dequantize_kernel()
-		linear.kernel = nnx.Param(dequantized_kernel)
+		linear.quant_kernel = nnx.Param(dequantized_kernel)
 
 		# Copy the bias if it exists
 		if self.use_bias:
@@ -277,22 +277,22 @@ class Linear8bit(QauntModule):
 		return linear
 
 	@staticmethod
-	def _quantize_kernel(kernel):
-		"""Quantize the kernel weights."""
-		if kernel is None or isinstance(kernel, jax.ShapeDtypeStruct):
+	def _quantize_kernel(quant_kernel):
+		"""Quantize the quant_kernel weights."""
+		if quant_kernel is None or isinstance(quant_kernel, jax.ShapeDtypeStruct):
 			return None, None
-		quantized, scales = quantize_8bit(kernel)
-		return quantized, scales
+		quantized, quant_scales = quantize_8bit(quant_kernel)
+		return quantized, quant_scales
 
 	def _dequantize_kernel(self):  # in case somebody using tie word embedding.
-		"""Dequantize the kernel weights."""
-		if self.kernel.value is None and self.scales.value is None:
+		"""Dequantize the quant_kernel weights."""
+		if self.quant_kernel.value is None and self.quant_scales.value is None:
 			return None
-		elif self.scales.value is None:
-			return self.kernel
+		elif self.quant_scales.value is None:
+			return self.quant_kernel
 		return dequantize_8bit(
-			self.kernel.value,
-			self.scales.value,
+			self.quant_kernel.value,
+			self.quant_scales.value,
 		).astype(self.param_dtype)
 
 	@jax.named_scope("easydel-linear-8bit-call")
@@ -300,8 +300,8 @@ class Linear8bit(QauntModule):
 		"""Forward pass using custom gradient computation."""
 		out = quantized_matmul(
 			inputs,
-			self.kernel.value,
-			self.scales.value,
+			self.quant_kernel.value,
+			self.quant_scales.value,
 			transpose_weight=False,
 		)
 		if self.use_bias:
@@ -309,12 +309,12 @@ class Linear8bit(QauntModule):
 		return out
 
 	def get_kernel(self):
-		"""Get the dequantized kernel weights."""
+		"""Get the dequantized quant_kernel weights."""
 		return self._dequantize_kernel()
 
 	def get_quantized_kernel(self):
-		"""Get the quantized kernel weights and scales."""
-		return self.kernel.value, self.scales.value
+		"""Get the quantized quant_kernel weights and quant_scales."""
+		return self.quant_kernel.value, self.quant_scales.value
 
 	@staticmethod
 	def metadata():
@@ -322,4 +322,4 @@ class Linear8bit(QauntModule):
 
 	@staticmethod
 	def quantization_mapping():
-		return {"kernel": ["kernel", "scales"]}
+		return {"kernel": ["quant_kernel", "quant_scales"]}
