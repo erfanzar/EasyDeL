@@ -175,6 +175,8 @@ class Gemma2Config(EasyDeLBaseConfig):
 			("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("input_layernorm/kernel", PartitionSpec(None)),
 			("post_attention_layernorm/kernel", PartitionSpec(None)),
+			("pre_feedforward_layernorm/kernel", PartitionSpec(None)),
+			("post_feedforward_layernorm/kernel", PartitionSpec(None)),
 			("model/norm/kernel", PartitionSpec(None)),
 			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			(".*", PartitionSpec(None)),

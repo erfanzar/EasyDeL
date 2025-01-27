@@ -145,19 +145,21 @@ class Xerxes2Config(EasyDeLBaseConfig):
 		"""
 		return (
 			("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-			(
-				"self_attn/(q_proj|k_proj|v_proj|g_proj)/kernel",
-				PartitionSpec(("fsdp", "sp"), "tp"),
-			),
-			("self_attn/norm/kernel", PartitionSpec("tp")),
-			("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("self_attn/qa_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("self_attn/qb_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("self_attn/kv_mqa_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("self_attn/kvi_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))), 
+			("self_attn/qa_norm/(bias|scale)", PartitionSpec(None)),
+			("self_attn/kv_norm/(bias|scale)", PartitionSpec(None)), 
+			("mlp/gate_up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))), 
 			("input_layernorm/kernel", PartitionSpec(None)),
 			("post_attention_layernorm/kernel", PartitionSpec(None)),
-			("model/norm/kernel", PartitionSpec(None)),
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("pre_feedforward_layernorm/kernel", PartitionSpec(None)),
+			("post_feedforward_layernorm/kernel", PartitionSpec(None)),
+			("model/norm/kernel", PartitionSpec(None)), 
+			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")), 
 			(".*", PartitionSpec(None)),
 		)
 
