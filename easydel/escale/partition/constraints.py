@@ -20,6 +20,7 @@ from functools import partial
 
 import chex
 import jax
+import jax.extend
 import jax.numpy as jnp
 import numpy as np
 from jax import tree_util as tu
@@ -76,18 +77,27 @@ def make_shard_and_gather_fns(
 		"""
 		Create a shard function for a specific partition spec.
 		"""
+		if jax.process_count() > 1:
 
-		@partial(jax.jit, out_shardings=sharding)
-		def _self_shard(tensor):
-			return jnp.asarray(tensor)
+			@partial(jax.jit, out_shardings=sharding)
+			def _self_shard(tensor):
+				return jnp.asarray(tensor)
 
-		def shard_fn(tensor: jnp.ndarray) -> jnp.ndarray:
-			with mesh:
-				tensor = jax.block_until_ready(_self_shard(tensor))
-				assert tensor.sharding == sharding, "sharding Failed!."
-			return tensor
+			def shard_fn(tensor: jnp.ndarray) -> jnp.ndarray:
+				with mesh:
+					tensor = jax.block_until_ready(_self_shard(tensor))
+					assert tensor.sharding == sharding, "sharding Failed!."
+				return tensor
 
-		return shard_fn
+			return shard_fn
+		else:
+
+			def shard_fn(tensor: jnp.ndarray) -> jnp.ndarray:
+				with mesh:
+					tensor = with_sharding_constraint(tensor, sharding=sharding)
+				return tensor
+
+			return shard_fn
 
 	def make_gather_fn(sharding: NamedSharding) -> tp.Callable:
 		"""

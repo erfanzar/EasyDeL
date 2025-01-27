@@ -519,12 +519,13 @@ def merge_state_and_tree(tree: dict, state: nnx.State) -> nnx.State:
 		if tree_values is not None:
 			params[keys].value = tree_values
 		else:
-			if keys[-1] == "kernel":
+			if keys[-1] != "bias":
 				_path = ".".join([str(k) for k in keys])
 				logger.info(f"a parameter's missing at {_path}, please double check.")
 
 			# Avoid type '<class 'jax._src.api.ShapeDtypeStruct'>' is not a valid JAX type
 			params[keys].value = None
+
 	others = recreate_meta_values(others)
 	state = refine_graphs(others, params)
 	return state

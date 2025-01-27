@@ -337,7 +337,7 @@ def create_sampling_step(
 			is_sequence_finished=next_sequence_finished,
 			prng_key=jax.random.split(state.prng_key, 2)[0],
 			model_kwargs=next_model_kwargs,
-			generated_tokens=state.generated_tokens + (1 * next_sequences.shape[-1]),
+			generated_tokens=state.generated_tokens + 1,
 		)
 
 	return sampling_step

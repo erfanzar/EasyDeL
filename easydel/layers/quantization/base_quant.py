@@ -23,6 +23,7 @@ from flax.typing import (
 	Dtype,
 	PrecisionLike,
 )
+from flax.nnx import Param
 
 Array = jax.Array
 Axis = int
@@ -31,6 +32,9 @@ Size = int
 
 default_kernel_init = initializers.lecun_normal()
 default_bias_init = initializers.zeros_init()
+
+
+class QuantParam(Param): ...
 
 
 class QauntModule(Module):
