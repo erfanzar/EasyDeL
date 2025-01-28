@@ -22,7 +22,6 @@ import jax
 from jax import numpy as jnp
 
 from easydel.infra.utils import ProcessingClassType
-from easydel.modules import EasyDeLBaseModule
 
 from ..utils import add_bos_token_if_needed, add_eos_token_if_needed
 from .dpo_config import DPOConfig
@@ -96,6 +95,7 @@ class DPODataCollatorWithPadding:
 		if self.ids_to_pop_from_dataset:
 			for key in self.ids_to_pop_from_dataset:
 				_ = padded_batch.pop(key, None)
+				
 		for key in list(padded_batch.keys()):
 			if not (
 				key.endswith("_input_ids")
@@ -207,77 +207,73 @@ def leave_alone_context_manager():
 	yield
 
 
-def build_tokenize(
-	model: tp.Optional[EasyDeLBaseModule] = None,
+def apply_dpo_tokenize(
+	features: tp.Dict[str, tp.List],
+	processing_class: ProcessingClassType,
+	processor: tp.Optional[tp.Callable] = None,
+	is_encoder_decoder: bool = False,
 	args: tp.Optional[DPOConfig] = None,
-):
-	def _tokenize(
-		features: tp.Dict[str, tp.List],
-		processing_class: ProcessingClassType,
-		processor: tp.Optional[tp.Callable] = None,
-	) -> tp.Dict[str, tp.List]:
-		"""
-		Tokenizes and processes a batch of input features using the provided processing_class and processor.
-		"""
-		batch = defaultdict(list)
+) -> tp.Dict[str, tp.List]:
+	"""
+	Tokenizes and processes a batch of input features using the provided processing_class and processor.
+	"""
+	batch = defaultdict(list)
 
-		if model is None:
-			prompt = features["prompt"]
-			images = features.get("images", [None] * len(features["prompt"]))
+	if not is_encoder_decoder:
+		prompt = features["prompt"]
+		images = features.get("images", [None] * len(features["prompt"]))
 
-			prompt_tokens = _process_prompt(
-				prompt,
-				processor,
-				processing_class,
-				images,
-			)
-			chosen_tokens = _process_answer(
-				prompt,
-				features["chosen"],
-				processor,
-				processing_class,
-				images,
-			)
-			rejected_tokens = _process_answer(
-				prompt,
-				features["rejected"],
-				processor,
-				processing_class,
-				images,
-			)
+		prompt_tokens = _process_prompt(
+			prompt,
+			processor,
+			processing_class,
+			images,
+		)
+		chosen_tokens = _process_answer(
+			prompt,
+			features["chosen"],
+			processor,
+			processing_class,
+			images,
+		)
+		rejected_tokens = _process_answer(
+			prompt,
+			features["rejected"],
+			processor,
+			processing_class,
+			images,
+		)
 
-			prompt_len_input_ids = _adjust_prompt_length(
-				prompt_tokens,
-				chosen_tokens,
-				rejected_tokens,
-			)
+		prompt_len_input_ids = _adjust_prompt_length(
+			prompt_tokens,
+			chosen_tokens,
+			rejected_tokens,
+		)
 
-			prompt_tokens, chosen_tokens, rejected_tokens = _add_special_tokens(
-				processing_class,
-				prompt_len_input_ids,
-				prompt_tokens,
-				chosen_tokens,
-				rejected_tokens,
-			)
+		prompt_tokens, chosen_tokens, rejected_tokens = _add_special_tokens(
+			processing_class,
+			prompt_len_input_ids,
+			prompt_tokens,
+			chosen_tokens,
+			rejected_tokens,
+		)
 
-			_truncate_tokens(chosen_tokens, rejected_tokens, prompt_tokens, args)
-			_build_sequence_tokens(batch, chosen_tokens, args, "chosen")
-			_build_sequence_tokens(batch, rejected_tokens, args, "rejected")
-			_append_prompt_tokens_to_batch(batch, prompt_tokens, args)
+		_truncate_tokens(chosen_tokens, rejected_tokens, prompt_tokens, args)
+		_build_sequence_tokens(batch, chosen_tokens, args, "chosen")
+		_build_sequence_tokens(batch, rejected_tokens, args, "rejected")
+		_append_prompt_tokens_to_batch(batch, prompt_tokens, args)
 
-		else:
-			_tokenize_encoder_decoder(
-				batch,
-				processing_class,
-				features["prompt"],
-				features["chosen"],
-				features["rejected"],
-				args,
-			)
+	else:
+		_tokenize_encoder_decoder(
+			batch,
+			processing_class,
+			features["prompt"],
+			features["chosen"],
+			features["rejected"],
+			args,
+		)
 
-		return dict(batch)
-
-	return _tokenize
+	return dict(batch)
 
 
 def _process_prompt(
@@ -482,14 +478,14 @@ def _tokenize_encoder_decoder(
 		chosen,
 		truncation=True,
 		max_length=args.max_completion_length,
-		padding="max_lenght",
+		padding="max_length",
 		add_special_tokens=True,
 	)
 	rejected_tokens = processing_class(
 		rejected,
 		truncation=True,
 		max_length=args.max_completion_length,
-		padding="max_lenght",
+		padding="max_length",
 		add_special_tokens=True,
 	)
 	prompt_tokens = processing_class(
