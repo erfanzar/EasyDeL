@@ -79,6 +79,7 @@ logger = get_logger(__name__)
 
 
 class BaseTrainer(BaseTrainerProtocol):
+	
 	def __init__(
 		self,
 		arguments: tp.Optional[TrainingArguments] = None,

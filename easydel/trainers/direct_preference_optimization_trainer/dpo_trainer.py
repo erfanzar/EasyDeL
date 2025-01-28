@@ -33,14 +33,13 @@ from easydel.utils.helpers import get_logger
 
 from ..base_trainer import (
 	BaseTrainer,
-	TrainerConfigureDataloaderOutput,
 	TrainerConfigureFunctionOutput,
 	TrainerConfigureModelOutput,
 )
 from ..prompt_utils import maybe_apply_chat_template, maybe_extract_prompt
 from .dpo_config import DPOConfig
 from .func_utils import concatenated_forward, evaluation_step, training_step
-from .utils import DPODataCollatorWithPadding, build_tokenize
+from .utils import DPODataCollatorWithPadding, apply_dpo_tokenize
 
 if tp.TYPE_CHECKING:
 	from datasets import Dataset
@@ -99,7 +98,7 @@ class DPOTrainer(Trainer):
 			if arguments.padding_value is not None
 			else processing_class.pad_token_id
 		)
-		data_collator = (
+		input_data_collator = (
 			DPODataCollatorWithPadding(
 				max_prompt_length=arguments.max_prompt_length,
 				max_completion_length=arguments.max_completion_length,  # type: ignore
@@ -110,6 +109,8 @@ class DPOTrainer(Trainer):
 			if data_collator is None
 			else data_collator
 		)
+		self.input_data_collator = input_data_collator
+
 		self._stored_metrics = defaultdict(lambda: defaultdict(list))
 
 		if dataset_map_arguments is None:
@@ -161,17 +162,17 @@ class DPOTrainer(Trainer):
 		fn_kwargs = {
 			"processing_class": self.processing_class,
 			"processor": None,
+			"is_encoder_decoder": True if arguments.is_encoder_decoder else False,
+			"args": arguments,
 		}
 		if not isinstance(model, EasyDeLState):
 			model = model.to_state()
-
+		if reference_model is None:
+			reference_model = model
 		if not isinstance(reference_model, EasyDeLState):
 			reference_model = reference_model.to_state()
 
-		_tokenize = build_tokenize(
-			model=model.model if arguments.is_encoder_decoder else None,
-			args=arguments,
-		)
+		_tokenize = apply_dpo_tokenize
 
 		train_dataset = train_dataset.map(
 			_tokenize,
@@ -180,6 +181,7 @@ class DPOTrainer(Trainer):
 			num_proc=arguments.dataset_num_proc,
 			writer_batch_size=10,
 			desc="Tokenizing train dataset",
+			remove_columns=["prompt", "chosen", "rejected"],
 		)
 		if eval_dataset is not None:
 			eval_dataset = eval_dataset.map(
@@ -189,12 +191,12 @@ class DPOTrainer(Trainer):
 				num_proc=arguments.dataset_num_proc,
 				writer_batch_size=10,
 				desc="Tokenizing eval dataset",
+				remove_columns=["prompt", "chosen", "rejected"],
 			)
 
 		self.arguments = arguments
 
 		self.is_in_train = False
-		self.data_collator = data_collator
 		self.train_dataset = train_dataset
 		self.eval_dataset = eval_dataset
 		self.processing_class = processing_class
@@ -210,37 +212,7 @@ class DPOTrainer(Trainer):
 			arguments=arguments,
 			dataset_train=train_dataset,
 			dataset_eval=eval_dataset,
-		)
-
-	def configure_dataloaders(self) -> TrainerConfigureDataloaderOutput:
-		"""
-		Configures the dataloaders for training and evaluation.
-
-		This method creates the training and evaluation dataloaders using the provided
-		datasets and data collator. It also determines the maximum number of training
-		and evaluation steps based on the dataset sizes and training arguments.
-
-		Returns:
-				TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
-																				maximum number of training and evaluation steps.
-		"""
-		dataloader_train = self.get_train_dataloader()
-		max_evaluation_steps = None
-		dataloader_eval = None
-
-		max_training_steps = (
-			self.arguments.num_train_epochs * len(dataloader_train)
-			if self.arguments.max_training_steps is None
-			else self.arguments.max_training_steps
-		)
-		if self.eval_dataset is not None:
-			dataloader_eval = self.get_eval_dataloader(self.eval_dataset)
-			max_evaluation_steps = len(dataloader_eval)
-		return TrainerConfigureDataloaderOutput(
-			dataloader_eval=dataloader_eval,
-			dataloader_train=dataloader_train,
-			max_evaluation_steps=max_evaluation_steps,
-			max_training_steps=max_training_steps,
+			data_collator=None,
 		)
 
 	def configure_model(self) -> TrainerConfigureModelOutput:
@@ -252,7 +224,7 @@ class DPOTrainer(Trainer):
 		object containing the configured model, optimizer, scheduler, and configuration.
 
 		Returns:
-				TrainerConfigureModelOutput: An object containing the configured model, optimizer, scheduler, and configuration.
+		    TrainerConfigureModelOutput: An object containing the configured model, optimizer, scheduler, and configuration.
 		"""
 		tx, scheduler = self.arguments.get_optimizer_and_scheduler(self.max_training_steps)
 		if self.pruning_module is not None:
@@ -269,20 +241,16 @@ class DPOTrainer(Trainer):
 		Configures and JIT-compiles the training and evaluation step functions.
 
 		This method sets up the necessary functions for training and evaluation, including:
-				- Initialization of the model state.
-				- Sharding of the model parameters and optimizer state.
-				- JIT-compilation of the training and evaluation step functions.
+		    - Initialization of the model state.
+		    - Sharding of the model parameters and optimizer state.
+		    - JIT-compilation of the training and evaluation step functions.
 
 		Returns:
-				TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
+		    TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
 		"""
 		mesh = self.model.mesh
 		empty_sharding = jax.sharding.NamedSharding(
 			spec=PartitionSpec(),
-			mesh=mesh,
-		)
-		input_sharding = jax.sharding.NamedSharding(
-			spec=self.arguments.step_partition_spec,
 			mesh=mesh,
 		)
 		# returns chosen_log_probs, rejected_log_probs, chosen_logits, rejected_logits
@@ -296,7 +264,6 @@ class DPOTrainer(Trainer):
 		)
 		jited_concatenated_forward = jax.jit(
 			partial_concatenated_forward,
-			# in_shardings=(self.state_shardings.model, input_sharding),
 			out_shardings=(empty_sharding, empty_sharding, empty_sharding, empty_sharding),
 			static_argnames=[
 				"is_encoder_decoder",
@@ -315,7 +282,7 @@ class DPOTrainer(Trainer):
 				loss_type=self.arguments.loss_type,
 				reference_free=self.arguments.reference_free,
 			),
-			in_shardings=(self.state_shardings, input_sharding),
+			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=(self.state_shardings, empty_sharding),
 			static_argnames=[
 				"learning_rate_fn",
@@ -338,7 +305,7 @@ class DPOTrainer(Trainer):
 				loss_type=self.arguments.loss_type,
 				reference_free=self.arguments.reference_free,
 			),
-			in_shardings=(self.state_shardings, input_sharding),
+			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=empty_sharding,
 			static_argnames=[
 				"concatenated_forward",
@@ -371,93 +338,16 @@ class DPOTrainer(Trainer):
 		For DPO training, this method simply returns the pre-configured `data_collator`.
 
 		Args:
-				max_sequence_length (int): The maximum sequence length (not used in this implementation).
-				truncation_mode (tp.Literal["keep_end", "keep_start"], optional):
-						The truncation mode (not used in this implementation). Defaults to "keep_end".
+		    max_sequence_length (int): The maximum sequence length (not used in this implementation).
+		    truncation_mode (tp.Literal["keep_end", "keep_start"], optional):
+		        The truncation mode (not used in this implementation). Defaults to "keep_end".
 
 		Returns:
-				tp.Callable: The data collator function.
+		    tp.Callable: The data collator function.
 		"""
-		return self.data_collator
+		return self.input_data_collator
 
-	def _get_train_dataloader(self) -> "tensorflow.data.Dataset":  # noqa #type:ignore
-		"""
-		Creates the training dataloader as a TensorFlow Dataset.
-
-		This method retrieves the training dataset, applies the data collator, and converts
-		it into a TensorFlow Dataset for efficient batching and data loading during training.
-
-		Returns:
-				tensorflow.data.Dataset: The training dataloader.
-
-		Raises:
-				ValueError: If the training dataset is not set.
-		"""
-		try:
-			import tensorflow_datasets
-		except ImportError as e:
-			raise ImportError(
-				"tensorflow_datasets is not installed, please install it by running `pip install tensorflow_datasets`"
-			) from e
-		if self.train_dataset is None:
-			raise ValueError("Trainer: training requires a train_dataset.")
-
-		train_dataset = self.train_dataset
-		data_collator = self.data_collator
-
-		return tensorflow_datasets.as_numpy(
-			train_dataset.to_tf_dataset(
-				batch_size=self.training_batch_size,
-				collate_fn=data_collator,
-				num_workers=self.arguments.dataloader_num_workers,
-				shuffle=True,
-				drop_remainder=True,
-			)
-		)
-
-	def _get_eval_dataloader(
-		self,
-		eval_dataset: tp.Optional["Dataset"] = None,  # noqa #type:ignore
-	) -> "tensorflow.data.Dataset":  # noqa #type:ignore
-		"""
-		Creates the evaluation dataloader as a TensorFlow Dataset.
-
-		This method retrieves the evaluation dataset (either provided as an argument or
-		from the `self.eval_dataset` attribute), applies the data collator, and converts
-		it into a TensorFlow Dataset for efficient batching and data loading during evaluation.
-
-		Args:
-				eval_dataset (tp.Optional[Dataset], optional):
-						An optional evaluation dataset to use. If None, `self.eval_dataset` is used. Defaults to None.
-
-		Returns:
-				tensorflow.data.Dataset: The evaluation dataloader.
-
-		Raises:
-				ValueError: If no evaluation dataset is provided or set.
-		"""
-		try:
-			import tensorflow_datasets
-		except ImportError as e:
-			raise ImportError(
-				"tensorflow_datasets is not installed, please install it by running `pip install tensorflow_datasets`"
-			) from e
-
-		if eval_dataset is None and self.eval_dataset is None:
-			raise ValueError("Trainer: evaluation requires an eval_dataset.")
-		eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
-
-		return tensorflow_datasets.as_numpy(
-			eval_dataset.to_tf_dataset(
-				batch_size=self.evaluation_batch_size,
-				collate_fn=self.data_collator,
-				num_workers=self.arguments.dataloader_num_workers,
-				shuffle=False,
-				drop_remainder=True,
-			)
-		)
-
-	def get_train_dataloader(self) -> "tensorflow.data.Dataset":  # noqa #type:ignore
+	def configure_dataloaders(self):
 		"""
 		Returns the training dataloader, potentially with precomputed reference log probabilities.
 
@@ -466,7 +356,7 @@ class DPOTrainer(Trainer):
 		them as columns to the dataset.
 
 		Returns:
-				tensorflow.data.Dataset: The training dataloader.
+		    tensorflow.data.Dataset: The training dataloader.
 		"""
 
 		try:
@@ -475,119 +365,89 @@ class DPOTrainer(Trainer):
 			raise ImportError(
 				"tensorflow_datasets is not installed, please install it by running `pip install tensorflow_datasets`"
 			) from e
-
-		if (
-			self.arguments.precompute_ref_log_probs
-			and not self._precomputed_train_ref_log_probs
-		):
-			data_loader = tensorflow_datasets.as_numpy(
-				self.train_dataset.to_tf_dataset(
-					batch_size=self.training_batch_size,
-					collate_fn=self.data_collator,
-					num_workers=self.arguments.dataloader_num_workers,
-					shuffle=False,
-					drop_remainder=True,
-				)
-			)
-			reference_chosen_log_probs = []
-			ref_rejected_logps = []
-			for padded_batch in tqdm(
-				iterable=data_loader, desc="Train dataset reference log probs"
+		if self.train_dataset is not None:
+			if (
+				self.arguments.precompute_ref_log_probs
+				and not self._precomputed_train_ref_log_probs
 			):
-				reference_chosen_logp, reference_rejected_logp = (
-					self.compute_reference_log_probs(
-						self.model_state,
-						padded_batch,
+				data_loader = tensorflow_datasets.as_numpy(
+					self.train_dataset.to_tf_dataset(
+						batch_size=self.training_batch_size,
+						collate_fn=self.input_data_collator,
+						num_workers=self.arguments.dataloader_num_workers,
+						shuffle=False,
+						drop_remainder=True,
 					)
 				)
-				reference_chosen_log_probs.append(reference_chosen_logp)
-				ref_rejected_logps.append(reference_rejected_logp)
+				reference_chosen_log_probs = []
+				ref_rejected_logps = []
+				for padded_batch in tqdm(
+					iterable=data_loader,
+					desc="Train dataset reference log probs",
+				):
+					reference_chosen_logp, reference_rejected_logp = (
+						self.compute_reference_log_probs(
+							self.model_state,
+							padded_batch,
+						)
+					)
+					reference_chosen_log_probs.append(reference_chosen_logp)
+					ref_rejected_logps.append(reference_rejected_logp)
 
-			all_reference_chosen_log_probs = jnp.concatenate(reference_chosen_log_probs)
-			all_ref_rejected_logps = jnp.concatenate(ref_rejected_logps)
-			self.train_dataset = self.train_dataset.add_column(
-				name="reference_chosen_log_probs", column=all_reference_chosen_log_probs
-			)
-			self.train_dataset = self.train_dataset.add_column(
-				name="ref_rejected_logps",
-				column=all_ref_rejected_logps,
-			)
-
-			self._precomputed_train_ref_log_probs = True
-		return self._get_train_dataloader()
-
-	def get_eval_dataloader(
-		self,
-		eval_dataset: tp.Optional["Dataset"] = None,  # noqa #type:ignore
-	) -> "tensorflow.data.Dataset":  # noqa #type:ignore
-		"""
-		Returns the evaluation dataloader, potentially with precomputed reference log probabilities.
-
-		If `precompute_ref_log_probs` is enabled, this method computes the reference model's log
-		probabilities for the chosen and rejected responses in the evaluation dataset and adds
-		them as columns to the dataset.
-
-		Args:
-				eval_dataset (tp.Optional[Dataset], optional):
-						An optional evaluation dataset to use. If None, `self.eval_dataset` is used. Defaults to None.
-
-		Returns:
-				tensorflow.data.Dataset: The evaluation dataloader.
-		"""
-
-		try:
-			import tensorflow_datasets
-		except ImportError as e:
-			raise ImportError(
-				"tensorflow_datasets is not installed, please install it by running `pip install tensorflow_datasets`"
-			) from e
-
-		if eval_dataset is None and self.eval_dataset is None:
-			raise ValueError("Trainer: evaluation requires an eval_dataset.")
-		eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
-
-		if (
-			self.arguments.precompute_ref_log_probs
-			and not self._precomputed_eval_ref_log_probs
-		):
-			# prepare dataloader
-			data_loader = tensorflow_datasets.as_numpy(
-				eval_dataset.to_tf_dataset(
-					batch_size=self.evaluation_batch_size,
-					collate_fn=self.data_collator,
-					num_workers=self.arguments.dataloader_num_workers,
-					shuffle=False,
-					drop_remainder=True,
+				all_reference_chosen_log_probs = jnp.concatenate(reference_chosen_log_probs)
+				all_ref_rejected_logps = jnp.concatenate(ref_rejected_logps)
+				self.train_dataset = self.train_dataset.add_column(
+					name="reference_chosen_log_probs",
+					column=all_reference_chosen_log_probs,
 				)
-			)
+				self.train_dataset = self.train_dataset.add_column(
+					name="ref_rejected_logps",
+					column=all_ref_rejected_logps,
+				)
 
-			reference_chosen_log_probs = []
-			ref_rejected_logps = []
-			for padded_batch in tqdm(
-				iterable=data_loader, desc="Eval dataset reference log probs"
+				self._precomputed_train_ref_log_probs = True
+		if self.eval_dataset is not None:
+			if (
+				self.arguments.precompute_ref_log_probs
+				and not self._precomputed_eval_ref_log_probs
 			):
-				reference_chosen_logp, reference_rejected_logp = (
-					self.compute_reference_log_probs(self.model_state, padded_batch)
+				data_loader = tensorflow_datasets.as_numpy(
+					self.eval_dataset.to_tf_dataset(
+						batch_size=self.evaluation_batch_size,
+						collate_fn=self.input_data_collator,
+						num_workers=self.arguments.dataloader_num_workers,
+						shuffle=False,
+						drop_remainder=True,
+					)
 				)
-				reference_chosen_log_probs.append(reference_chosen_logp.cpu())
-				ref_rejected_logps.append(reference_rejected_logp.cpu())
+				reference_chosen_log_probs = []
+				ref_rejected_logps = []
+				for padded_batch in tqdm(
+					iterable=data_loader,
+					desc="Eval dataset reference log probs",
+				):
+					reference_chosen_logp, reference_rejected_logp = (
+						self.compute_reference_log_probs(
+							self.model_state,
+							padded_batch,
+						)
+					)
+					reference_chosen_log_probs.append(reference_chosen_logp)
+					ref_rejected_logps.append(reference_rejected_logp)
 
-			all_reference_chosen_log_probs = jnp.concatenate(reference_chosen_log_probs)
-			all_ref_rejected_logps = jnp.concatenate(ref_rejected_logps)
+				all_reference_chosen_log_probs = jnp.concatenate(reference_chosen_log_probs)
+				all_ref_rejected_logps = jnp.concatenate(ref_rejected_logps)
+				self.eval_dataset = self.eval_dataset.add_column(
+					name="reference_chosen_log_probs",
+					column=all_reference_chosen_log_probs,
+				)
+				self.eval_dataset = self.eval_dataset.add_column(
+					name="ref_rejected_logps",
+					column=all_ref_rejected_logps,
+				)
 
-			eval_dataset = eval_dataset.add_column(
-				name="reference_chosen_log_probs", column=all_reference_chosen_log_probs
-			)
-			eval_dataset = eval_dataset.add_column(
-				name="ref_rejected_logps",
-				column=all_ref_rejected_logps,
-			)
-
-			if self.eval_dataset is not None:
-				self.eval_dataset = eval_dataset
-			self._precomputed_eval_ref_log_probs = True
-
-		return self._get_eval_dataloader(eval_dataset=eval_dataset)
+				self._precomputed_train_ref_log_probs = True
+		return super().configure_dataloaders()
 
 	def compute_reference_log_probs(
 		self,
@@ -598,11 +458,11 @@ class DPOTrainer(Trainer):
 		Computes log probabilities of the reference model for a single padded batch of a DPO specific dataset.
 
 		Args:
-				state (EasyDeLState): The EasyDeLState object of the model (used if no reference model is provided).
-				padded_batch (tp.Dict): The padded batch of data.
+		    state (EasyDeLState): The EasyDeLState object of the model (used if no reference model is provided).
+		    padded_batch (tp.Dict): The padded batch of data.
 
 		Returns:
-				tuple[tp.Any, tp.Any]: A tuple containing the log probabilities for the chosen and rejected responses.
+		    tuple[tp.Any, tp.Any]: A tuple containing the log probabilities for the chosen and rejected responses.
 		"""
 
 		if self.reference_state is None:
@@ -623,7 +483,8 @@ class DPOTrainer(Trainer):
 	) -> tp.Tuple[EasyDeLState, LossMetrics, Exception]:
 		"""Execute a single training step."""
 		try:
-			batch = {key: jnp.asarray(value) for key, value in batch.items()}
+			print({key: value.dtype == jnp.dtype("O") for key, value in batch.items()})
+			batch = {key: jnp.array(value) for key, value in batch.items()}
 			state, metrics = self.sharded_training_step_function(state, batch)
 			return state, metrics, None
 		except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest) as run_exception:

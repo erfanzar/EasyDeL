@@ -121,10 +121,9 @@ class ORPOTrainer(Trainer):
 		if dataset_map_arguments is None:
 			dataset_map_arguments = {}
 
-		with jax.default_device(arguments.offload_device):
-			off_div = arguments.offload_device
-			# avoids TypeError: cannot pickle 'jaxlib.xla_extension.Device' object
-			arguments.offload_device = None
+		with jax.default_device(
+			jax.devices(arguments.offload_device_type)[arguments.offload_device_index]
+		):
 			train_dataset = train_dataset.map(
 				self.tokenize_row,
 				num_proc=dataset_num_proc,
@@ -138,7 +137,6 @@ class ORPOTrainer(Trainer):
 					batched=False,
 					**dataset_map_arguments,
 				)
-			arguments.offload_device = off_div
 		self.hp_name = None
 		self.deepspeed = None
 		self.is_in_train = False

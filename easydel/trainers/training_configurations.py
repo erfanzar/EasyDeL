@@ -35,6 +35,7 @@ from easydel.infra.etils import (
 	EasyDeLSchedulers,
 )
 from easydel.infra.loss_utils import LossConfig
+from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.helpers import get_logger
 
 from .utils import JaxDistributedConfig
@@ -95,7 +96,8 @@ class TrainingArguments:
 	model_parameters: tp.Optional[dict] = None
 	metrics_to_show_in_rich_pbar: tp.Optional[list] = None
 	num_train_epochs: int = 10
-	offload_device: jax.Device = jax.devices("cpu")[0]
+	offload_device_type: str = "cpu"
+	offload_device_index: int = 0
 	optimizer: AVAILABLE_OPTIMIZERS = EasyDeLOptimizers.ADAMW
 	performance_mode: bool = False
 	pruning_module: AVAILABLE_PRUNING_TYPE = None
@@ -127,6 +129,10 @@ class TrainingArguments:
 	weight_decay: float = 0.01
 
 	@property
+	def offload_device(self):
+		return jax.devices(self.offload_device_type)[self.offload_device_index]
+
+	@property
 	def training_time_seconds(self) -> int:
 		if self.training_time_limit is None:
 			return None
@@ -153,9 +159,9 @@ class TrainingArguments:
 		Performs validation checks on the provided configuration settings.
 		Raises ValueError if any configuration is invalid.
 		"""
-		assert self.gradient_accumulation_steps > 0, (
-			"`gradient_accumulation_steps` can't be lower than 1."
-		)
+		assert (
+			self.gradient_accumulation_steps > 0
+		), "`gradient_accumulation_steps` can't be lower than 1."
 
 		if self.backend not in AVAILABLE_BACKENDS:
 			raise ValueError(
@@ -546,3 +552,5 @@ class TrainingArguments:
 		if create:
 			save_directory.mkdir(exist_ok=True, parents=True)
 		return save_directory
+
+	__hash__ = hash_fn
