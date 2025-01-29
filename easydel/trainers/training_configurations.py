@@ -67,6 +67,7 @@ AVAILABLE_BACKENDS: tp.List[str] = ["cpu", "gpu", "tpu", None]
 @dataclass
 class TrainingArguments:
 	auto_shard_states: bool = True
+	aux_loss_enabled: bool = False
 	backend: tp.Optional[str] = None
 	clip_grad: tp.Optional[float] = None
 	dataloader_num_workers: tp.Optional[int] = 0
@@ -115,6 +116,7 @@ class TrainingArguments:
 	state_apply_fn_kwarguments_to_model: tp.Optional[dict] = None
 	step_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp")
 	step_start_point: tp.Optional[int] = None
+	shuffle_train_dataset: bool = True
 	total_batch_size: int = 32
 	training_time_limit: tp.Optional[str] = None
 	train_on_inputs: bool = True

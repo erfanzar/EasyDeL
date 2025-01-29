@@ -67,14 +67,20 @@ def get_batch_log_probs(
 	)
 	logits_log_s = jax.nn.log_softmax(logits, -1)
 	per_token_log_probs = jnp.take_along_axis(
-		logits_log_s, axis=2, indices=labels[:, :, None]
+		logits_log_s,
+		axis=2,
+		indices=labels[:, :, None],
 	).reshape(batch, seq_len)
 
 	if average_log_prob:
-		log_prob = jnp.sum((per_token_log_probs * loss_mask), axis=-1) / jnp.sum(
-			loss_mask, axis=-1
-		)
+		log_prob = jnp.sum(
+			(per_token_log_probs * loss_mask),
+			axis=-1,
+		) / jnp.sum(loss_mask, axis=-1)
 	else:
-		log_prob = jnp.sum((per_token_log_probs * loss_mask), axis=-1)
+		log_prob = jnp.sum(
+			(per_token_log_probs * loss_mask),
+			axis=-1,
+		)
 
 	return log_prob

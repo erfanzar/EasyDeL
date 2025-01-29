@@ -1,5 +1,4 @@
 import typing as tp
-import warnings
 from dataclasses import dataclass
 
 from easydel.utils.compiling_utils import hash_fn
@@ -30,9 +29,8 @@ class DPOConfig(TrainingArguments):
 	use_weighting: bool = False
 	label_pad_token_id: int = -100
 	padding_value: tp.Optional[int] = None
-	truncation_mode: str = "keep_end"
-	max_length: tp.Optional[int] = None
-	max_prompt_length: tp.Optional[int] = None
+	max_length: tp.Optional[int] = 512
+	max_prompt_length: tp.Optional[int] = 256
 	max_completion_length: tp.Optional[int] = None
 	is_encoder_decoder: tp.Optional[bool] = None
 	disable_dropout: bool = True
@@ -47,24 +45,11 @@ class DPOConfig(TrainingArguments):
 	ref_model_mixup_alpha: float = 0.9
 	ref_model_sync_steps: int = 64
 	rpo_alpha: tp.Optional[float] = None
+	tools: tp.Optional[tp.List[tp.Union[dict, tp.Callable]]] = None
 
 	def __post_init__(self):
-		if self.max_length is None:
-			warnings.warn(
-				"`max_length` is not set in the DPOConfig init"
-				" it will default to `512` by default, but you should do it yourself in the future.",
-				UserWarning,
-				stacklevel=1,
-			)
-			self.max_length = 512
-		if self.max_prompt_length is None:
-			warnings.warn(
-				"`max_prompt_length` is not set in the DPOConfig init"
-				" it will default to `128` by default, but you should do it yourself in the future.",
-				UserWarning,
-				stacklevel=1,
-			)
-			self.max_prompt_length = 128
+		if self.max_completion_length is None:
+			self.max_completion_length = self.max_length - self.max_prompt_length
 		return super().__post_init__()
 
 	__hash__ = hash_fn

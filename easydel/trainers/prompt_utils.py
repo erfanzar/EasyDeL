@@ -63,15 +63,10 @@ def is_conversational(example: tp.Dict[str, tp.Any]) -> bool:
 
 
 def apply_chat_template(
-	example: tp.Dict[str, tp.List[tp.Dict[str, str]]],
-	processing_class: ProcessingClassType,
-) -> tp.Dict[str, str]:
-	r"""
-	Apply a chat template to a conversational example.
-
-	For more details, see [`maybe_apply_chat_template`].
-	"""
-	# Check that the example has the correct keys
+	example: dict[str, list[dict[str, str]]],
+	tokenizer: ProcessingClassType,
+	tools: tp.Optional[list[tp.Union[dict, tp.Callable]]] = None,
+) -> dict[str, str]:
 	supported_keys = ["prompt", "chosen", "rejected", "completion", "messages", "label"]
 	example_keys = {key for key in example.keys() if key in supported_keys}
 	if example_keys not in [
@@ -86,37 +81,41 @@ def apply_chat_template(
 
 	# Apply the chat template to the whole conversation
 	if "messages" in example:
-		messages = processing_class.apply_chat_template(example["messages"], tokenize=False)
+		messages = tokenizer.apply_chat_template(
+			example["messages"], tools=tools, tokenize=False
+		)
 
 	# Apply the chat template to the prompt, adding the generation prompt
 	if "prompt" in example:
-		prompt = processing_class.apply_chat_template(
-			example["prompt"], tokenize=False, add_generation_prompt=True
+		prompt = tokenizer.apply_chat_template(
+			example["prompt"], tools=tools, tokenize=False, add_generation_prompt=True
 		)
 
 	# Apply the chat template to the entire prompt + completion
 	if "prompt" in example:  # explicit prompt and prompt-completion case
 		if "chosen" in example:
-			prompt_chosen = processing_class.apply_chat_template(
-				example["prompt"] + example["chosen"], tokenize=False
+			prompt_chosen = tokenizer.apply_chat_template(
+				example["prompt"] + example["chosen"], tools=tools, tokenize=False
 			)
 			chosen = prompt_chosen[len(prompt) :]
 		if "rejected" in example and "prompt" in example:  # explicit prompt
-			prompt_rejected = processing_class.apply_chat_template(
-				example["prompt"] + example["rejected"], tokenize=False
+			prompt_rejected = tokenizer.apply_chat_template(
+				example["prompt"] + example["rejected"], tools=tools, tokenize=False
 			)
 			rejected = prompt_rejected[len(prompt) :]
 		if "completion" in example:
-			prompt_completion = processing_class.apply_chat_template(
-				example["prompt"] + example["completion"], tokenize=False
+			prompt_completion = tokenizer.apply_chat_template(
+				example["prompt"] + example["completion"], tools=tools, tokenize=False
 			)
 			completion = prompt_completion[len(prompt) :]
 	else:  # implicit prompt case
 		if "chosen" in example:
-			chosen = processing_class.apply_chat_template(example["chosen"], tokenize=False)
+			chosen = tokenizer.apply_chat_template(
+				example["chosen"], tools=tools, tokenize=False
+			)
 		if "rejected" in example:
-			rejected = processing_class.apply_chat_template(
-				example["rejected"], tokenize=False
+			rejected = tokenizer.apply_chat_template(
+				example["rejected"], tools=tools, tokenize=False
 			)
 
 	# Ensure that the prompt is the initial part of the prompt-completion string
@@ -133,7 +132,6 @@ def apply_chat_template(
 		if "completion" in example and not prompt_completion.startswith(prompt):
 			raise ValueError(error_message.format(prompt, prompt_completion))
 
-	# Extract the completion by removing the prompt part from the prompt-completion string
 	output = {}
 	if "messages" in example:
 		output["text"] = messages
@@ -152,14 +150,15 @@ def apply_chat_template(
 
 
 def maybe_apply_chat_template(
-	example: tp.Dict[str, tp.List[tp.Dict[str, str]]],
-	processing_class: ProcessingClassType,
-) -> tp.Dict[str, str]:
+	example: dict[str, list[dict[str, str]]],
+	tokenizer: ProcessingClassType,
+	tools: tp.Optional[list[tp.Union[dict, tp.Callable]]] = None,
+) -> dict[str, str]:
 	r"""
 	If the example is in a conversational format, apply a chat template to it.
 
 	Args:
-	    example (`tp.Dict[str, tp.List[tp.Dict[str, str]]`):
+	    example (`dict[str, list[dict[str, str]]`):
 	        Dictionary representing a single data entry of a conversational dataset. Each data entry can have different
 	        keys depending on the dataset type. The supported dataset types are:
 
@@ -172,12 +171,14 @@ def maybe_apply_chat_template(
 
 	        For keys `"messages"`, `"prompt"`, `"chosen"`, `"rejected"`, and `"completion"`, the values are lists of
 	        messages, where each message is a dictionary with keys `"role"` and `"content"`.
-
-	    processing_class (`ProcessingClassType`):
-	        The processing_class to apply the chat template with.
+	    tokenizer (`ProcessingClassType`):
+	        The tokenizer to apply the chat template with.
+	    tools (`list[Union[dict, Callable]]` or `None`, *optional*, defaults to `None`):
+	        A list of tools (callable functions) that will be accessible to the model.
+	        If the template does not support function calling, this argument will have no effect
 
 	Returns:
-	    `tp.Dict[str, str]`: The formatted example with the chat template applied.
+	    `dict[str, str]`: The formatted example with the chat template applied.
 
 	Note:
 	    This function does not alter the keys, except for Language modeling dataset, where `"messages"` is replaced by
@@ -185,20 +186,19 @@ def maybe_apply_chat_template(
 
 	Example:
 
+	```python
 	>>> from transformers import AutoTokenizer
-	>>> processing_class = AutoTokenizer.from_pretrained(
-	...   "microsoft/Phi-3-mini-128k-instruct"
-	... )
+	>>> tokenizer = AutoTokenizer.from_pretrained("microsoft/Phi-3-mini-128k-instruct")
 	>>> example = {
-	...   "prompt": [{"role": "user", "content": "What color is the sky?"}],
-	...   "completion": [{"role": "assistant", "content": "It is blue."}],
+	...     "prompt": [{"role": "user", "content": "What color is the sky?"}],
+	...     "completion": [{"role": "assistant", "content": "It is blue."}]
 	... }
-	>>> apply_chat_template(example, processing_class)
+	>>> apply_chat_template(example, tokenizer)
 	{'prompt': '<|user|>\nWhat color is the sky?<|end|>\n<|assistant|>\n', 'completion': 'It is blue.<|end|>\n<|endoftext|>'}
-
+	```
 	"""
 	if is_conversational(example):
-		return apply_chat_template(example, processing_class)
+		return apply_chat_template(example, tokenizer, tools)
 	else:
 		return example
 

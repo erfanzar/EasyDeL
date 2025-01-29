@@ -162,6 +162,10 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 
 	@property
 	@abstractmethod
+	def mesh(self): ...
+
+	@property
+	@abstractmethod
 	def training_batch_size(self): ...
 
 	@property
