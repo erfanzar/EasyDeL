@@ -22,7 +22,7 @@ ModulePath = tp.Tuple[str, ...]
 
 def iter_module_search(
 	model: nn.Module,
-	instance: tp.Type[T],
+	instance: tp.Optional[tp.Type[T]] = None,
 ) -> tp.Iterator[tp.Tuple[ModulePath, T]]:
 	"""
 	Iterates through a model and yields paths and modules of a specific type.
@@ -40,9 +40,13 @@ def iter_module_search(
 	    >>> for path, module in iter_module_search(model, nn.Linear):
 	    ...   print(f"Found Linear layer at {path}")
 	"""
-	for path, module in nn.graph.iter_graph(model):
-		if isinstance(module, instance):
+	if instance is None:
+		for path, module in nn.graph.iter_graph(model):
 			yield path, module
+	else:
+		for path, module in nn.graph.iter_graph(model):
+			if isinstance(module, instance):
+				yield path, module
 
 
 def get_module_from_path(model: nn.Module, path: ModulePath) -> tp.Optional[nn.Module]:

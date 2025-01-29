@@ -584,11 +584,15 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		"""basic `compute_loss` call"""
 
 	@abstractmethod
-	def half(self):
+	def to_dtype(self: SELF, dtype) -> SELF:
+		"""Converts Model paramters to given dtype"""
+
+	@abstractmethod
+	def half(self, change_runtime_dtype: bool = True):
 		"""Converts Model paramters to float16."""
 
 	@abstractmethod
-	def float(self):
+	def float(self, change_runtime_dtype: bool = True):
 		"""Converts Model paramters to float32."""
 
 	@abstractmethod

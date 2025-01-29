@@ -208,13 +208,51 @@ class EasyDeLBaseModule(
 		params_state = nn.split(self, nn.Param, ...)[1].flat_state()
 		return jax.tree_util.tree_leaves(params_state)[0].dtype
 
-	def half(self: SELF) -> SELF:
+	def to_dtype(self: SELF, dtype: jnp.dtype) -> SELF:
+		"""Applies sharding functions to the model's state."""
+		from easydel.utils.graph_utils import iter_module_search
+
+		gdef, state, others = nn.split(self, nn.Param, ...)
+
+		def _map(path, val: nn.VariableState):
+			if val.value is not None:
+				if not path[-1].startswith("quant_"):
+					val.value = val.value.astype(dtype)
+			return val
+
+		state.update(state.map(_map))
+		self = nn.merge(gdef, state, others)
+
+		for path, module in iter_module_search(self):
+			if hasattr(module, "param_dtype"):
+				module.param_dtype = dtype
+		return self
+
+	def half(self: SELF, change_runtime_dtype: bool = True) -> SELF:
+		if change_runtime_dtype:
+			self = self._reformat_runtime_dtype(jnp.float16)
 		return self._reformat_dtype(jnp.float16)
 
-	def float(self: SELF) -> SELF:
+	def float(self: SELF, change_runtime_dtype: bool = True) -> SELF:
+		if change_runtime_dtype:
+			self = self._reformat_runtime_dtype(jnp.float32)
 		return self._reformat_dtype(jnp.float32)
 
+	def _reformat_runtime_dtype(self: SELF, dtype) -> SELF:
+		from easydel.utils.graph_utils import iter_module_search
+
+		for path, module in iter_module_search(self):
+			if hasattr(module, "dtype"):
+				if str(type(module.dtype)).endswith(
+					"lax_numpy._ScalarMeta'>"
+				):  # dont change numpy based dtypes
+					module.dtype = dtype
+		self.dtype = dtype
+		return self
+
 	def _reformat_dtype(self: SELF, dtype) -> SELF:
+		from easydel.utils.graph_utils import iter_module_search
+
 		gdef, gtree, others = nn.split(self, nn.Param, ...)
 
 		def _map(array):
@@ -230,7 +268,12 @@ class EasyDeLBaseModule(
 
 		gtree = jax.tree_util.tree_map(_map, gtree)
 		self = nn.merge(gdef, gtree, others)
-		self.dtype = dtype
+
+		for path, module in iter_module_search(self):
+			if hasattr(module, "param_dtype"):
+				if isinstance(module.param_dtype, jnp.dtype):
+					module.param_dtype = dtype
+
 		self.param_dtype = dtype
 		return self
 
@@ -298,20 +341,6 @@ class EasyDeLBaseModule(
 
 			return self.config.get_partition_rules(fully_sharded_data_parallel=True)
 		return partition_rules
-
-	def to_dtype(self: SELF, dtype: jnp.dtype) -> SELF:
-		"""Applies sharding functions to the model's state."""
-		gdef, state, others = nn.split(self, nn.Param, ...)
-
-		def _map(path, val: nn.VariableState):
-			if val.value is not None:
-				if not path[-1].startswith("quant_"):
-					val.value = val.value.astype(dtype)
-			return val
-
-		state.update(state.map(_map))
-		self = nn.merge(gdef, state, others)
-		return self
 
 	def _apply_sharding_fns(
 		self: SELF,
