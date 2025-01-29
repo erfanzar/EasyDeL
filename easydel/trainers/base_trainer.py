@@ -79,7 +79,6 @@ logger = get_logger(__name__)
 
 
 class BaseTrainer(BaseTrainerProtocol):
-	
 	def __init__(
 		self,
 		arguments: tp.Optional[TrainingArguments] = None,
@@ -119,6 +118,14 @@ class BaseTrainer(BaseTrainerProtocol):
 		return self._model
 
 	@property
+	def mesh(self):
+		return self.model.mesh
+
+	@mesh.setter
+	def mesh(self, val):
+		return val
+
+	@property
 	def training_batch_size(self):
 		return self.arguments.total_batch_size * self.arguments.gradient_accumulation_steps
 
@@ -142,7 +149,6 @@ class BaseTrainer(BaseTrainerProtocol):
 		self.scheduler = getattr(self, "scheduler", None)
 		self.tx = getattr(self, "tx", None)
 
-		self.mesh = getattr(self, "mesh", None)
 		self.checkpoint_manager = getattr(self, "checkpoint_manager", None)  #
 		self.pruning_module = getattr(self.arguments, "pruning_module", None)
 		self.memory_monitor = getattr(self.arguments, "memory_monitor", None)
@@ -372,7 +378,7 @@ class BaseTrainer(BaseTrainerProtocol):
 					),
 					batch_size=batch_size,
 					drop_remainder=True,
-					shuffle=is_train,
+					shuffle=is_train and self.arguments.shuffle_train_dataset,
 					num_workers=self.arguments.dataloader_num_workers,
 				)
 				.repeat(self.arguments.num_train_epochs if is_train else 1)
@@ -944,7 +950,7 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 				"LIBTPU_INIT_ARGS": os.environ.get("LIBTPU_INIT_ARGS", ""),
 			},
 			step=0,
-			log_as="summary",
+			log_as="config",
 		)
 
 	def _get_next_batch(self, train_iter):

@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 import typing as tp
 
 import chex
@@ -33,7 +32,6 @@ from ...training_utils import (
 	update_state_respectfully,
 )
 from .concatenators import concatenated_inputs
-from .log_probs import get_batch_log_probs
 from .loss_funcs import get_loss_function
 
 LOSS_FN_VARIENTS = tp.Literal[
@@ -55,119 +53,140 @@ LOSS_FN_VARIENTS = tp.Literal[
 def concatenated_forward(
 	model: EasyDeLBaseModule,
 	batch: tp.Dict[str, tp.Union[tp.List, chex.Array]],
-	is_encoder_decoder: bool = False,
-	label_pad_token_id: int = -100,
-	padding_value: int = 0,
-	fixed_max_length: int | None = None,
+	is_encoder_decoder: bool,
+	label_pad_token_id: int,
+	padding_value: int,
+	max_length: int | None = None,
+	truncation_mode: str = "keep_end",
+	aux_loss_enabled: bool = False,
+	loss_type: str = "sigmoid",
 ) -> tp.Dict[str, chex.Array]:
 	"""Run model on concatenated chosen/rejected inputs for efficiency."""
 
-	# Get concatenated inputs
-	concatenated_batch = concatenated_inputs(
-		batch=batch,
-		padding_value=padding_value,
-		fixed_max_length=fixed_max_length,
-	)
-
 	num_examples = batch["prompt_input_ids"].shape[0]
+	concatenated_batch = concatenated_inputs(batch=batch, padding_value=padding_value)
+
 	model_kwargs = {}
+	if aux_loss_enabled:
+		model_kwargs["output_router_logits"] = True
 
-	# Add image-related features
-	for k in ["pixel_values", "pixel_attention_mask", "image_sizes"]:
-		if k in concatenated_batch:
-			model_kwargs[k] = concatenated_batch[f"{k}"]
+	if "pixel_values" in concatenated_batch:
+		model_kwargs["pixel_values"] = concatenated_batch["pixel_values"]
+	if "pixel_attention_mask" in concatenated_batch:
+		model_kwargs["pixel_attention_mask"] = concatenated_batch["pixel_attention_mask"]
+	if "image_sizes" in concatenated_batch:
+		model_kwargs["image_sizes"] = concatenated_batch["image_sizes"]
 
+	prompt_input_ids = concatenated_batch["prompt_input_ids"]
+	prompt_attention_mask = concatenated_batch["prompt_attention_mask"]
+	completion_input_ids = concatenated_batch["completion_input_ids"]
+	completion_attention_mask = concatenated_batch["completion_attention_mask"]
 	if is_encoder_decoder:
-		# Handle encoder-decoder models
-		labels = concatenated_batch["completion_input_ids"]
+		labels = completion_input_ids
 		labels = jnp.where(
-			concatenated_batch["completion_attention_mask"] == 0,
+			completion_attention_mask == 0,
 			label_pad_token_id,
-			labels,
+			completion_input_ids,
 		)
-		model_kwargs["labels"] = labels
 
 		outputs = model(
-			input_ids=concatenated_batch["prompt_input_ids"],
-			attention_mask=concatenated_batch["prompt_attention_mask"],
+			input_ids=prompt_input_ids,
+			attention_mask=prompt_attention_mask,
+			labels=labels,
 			**model_kwargs,
 		)
 		logits = outputs.logits
-		loss_mask = concatenated_batch["completion_attention_mask"].astype(bool)
-
+		loss_mask = completion_attention_mask.astype(bool)
 	else:
-		# Handle decoder-only models
+		# Concatenate the prompt and completion inputs
 		input_ids = jnp.concatenate(
-			[
-				concatenated_batch["prompt_input_ids"],
-				concatenated_batch["completion_input_ids"],
-			],
+			[prompt_input_ids, completion_input_ids],
 			axis=1,
 		)
-
 		attention_mask = jnp.concatenate(
-			[
-				concatenated_batch["prompt_attention_mask"],
-				concatenated_batch["completion_attention_mask"],
-			],
+			[prompt_attention_mask, completion_attention_mask],
 			axis=1,
 		)
 
 		loss_mask = jnp.concatenate(
 			[
-				jnp.zeros_like(concatenated_batch["prompt_attention_mask"]),
-				concatenated_batch["completion_attention_mask"],
+				jnp.zeros_like(prompt_attention_mask),
+				completion_attention_mask,
 			],
 			axis=1,
 		)
 
-		# Apply max length if specified
-		if fixed_max_length is not None:
-			input_ids = input_ids[:, :fixed_max_length]
-			attention_mask = attention_mask[:, :fixed_max_length]
-			loss_mask = loss_mask[:, :fixed_max_length]
+		if max_length is not None:
+			if truncation_mode == "keep_end":
+				input_ids = input_ids[:, -max_length:]
+				attention_mask = attention_mask[:, -max_length:]
+				loss_mask = loss_mask[:, -max_length:]
+			elif truncation_mode == "keep_start":
+				input_ids = input_ids[:, :max_length]
+				attention_mask = attention_mask[:, :max_length]
+				loss_mask = loss_mask[:, :max_length]
+			else:
+				raise ValueError(
+					f"Unknown truncation mode: '{truncation_mode}'. Should be one of ['keep_end', "
+					"'keep_start']."
+				)
+		model_kwargs["input_ids"] = input_ids
+		model_kwargs["attention_mask"] = attention_mask
+		# jax.debug.print("{} A ", jnp.any(attention_mask == 1))
+		# jax.debug.print("{} I ", jnp.any(jnp.isnan(input_ids)))
 
-		outputs = model(
-			input_ids=input_ids,
-			attention_mask=attention_mask,
-			**model_kwargs,
-		)
+		# jax.debug.print("{} IDS", input_ids)
+		# jax.debug.print("{} ATN", attention_mask)
+		# jax.debug.print("{} ATN", attention_mask.shape)
 
-		logits = outputs.logits[:, :-1, :]
-		labels = input_ids[:, 1:].copy()
-		loss_mask = loss_mask[:, 1:].astype(bool)
+		outputs = model(**model_kwargs)
 
-	# Calculate log probabilities
-	per_token_logps = get_batch_log_probs(
-		logits,
-		labels,
-		average_log_prob=False,
-		is_encoder_decoder=is_encoder_decoder,
-		label_pad_token_id=label_pad_token_id,
-	)
-	per_token_logps = jnp.where(
-		jnp.broadcast_shapes(loss_mask, per_token_logps.shape),
-		per_token_logps,
-		0,
-	)
+		# jax.debug.print("{}", jnp.any(jnp.isnan(outputs.logits)))
+		logits = outputs.logits
+		labels = jnp.roll(input_ids, shift=-1, axis=1)
+		loss_mask = jnp.roll(loss_mask, shift=-1, axis=1).astype("bool")
+
+	if logits.shape[:2] != labels.shape[:2]:
+		seq_len = labels.shape[1]
+		logits = logits[:, -seq_len:]
+
+	labels = jnp.where(loss_mask, labels, 0)
+	log_probs = jax.nn.log_softmax(logits, axis=-1)
+	batch_size, seq_len = labels.shape
+	batch_indices = jnp.arange(batch_size)[:, None]
+	seq_indices = jnp.arange(seq_len)[None, :]
+	per_token_logps = log_probs[batch_indices, seq_indices, labels]
+	per_token_logps = jnp.where(loss_mask, per_token_logps, 0)
+	per_token_logps = jnp.roll(per_token_logps, shift=1, axis=1)
+
 	all_logps = per_token_logps.sum(-1)
+	# jax.debug.print("{} all_logps", all_logps)
+	if loss_type == "ipo":
+		all_logps = all_logps / loss_mask.sum(-1)
+	output = {}
+	output["chosen_logps"] = all_logps[:num_examples]
+	output["rejected_logps"] = all_logps[num_examples:]
 
-	# Prepare output dictionary
-	output = {
-		"chosen_logps": all_logps[:num_examples],
-		"rejected_logps": all_logps[num_examples:],
-		"mean_chosen_logits": jnp.mean(logits[:num_examples][loss_mask[:num_examples]]),
-		"mean_rejected_logits": jnp.mean(logits[num_examples:][loss_mask[num_examples:]]),
-	}
+	mean_chosen_logits = jnp.sum(
+		jnp.where(
+			loss_mask[:num_examples, :, None],
+			logits[:num_examples],
+			0,
+		)
+	) / jnp.sum(loss_mask[:num_examples])
 
-	if os.environ("AUX_LOSS_ENABLED_DPO", "true") in [
-		"true",
-		"1",
-		"os",
-		"yes",
-	] and hasattr(outputs, "aux_loss"):
+	mean_rejected_logits = jnp.sum(
+		jnp.where(
+			loss_mask[num_examples:, :, None],
+			logits[num_examples:],
+			0,
+		)
+	) / jnp.sum(loss_mask[num_examples:])
+
+	output["mean_chosen_logits"] = mean_chosen_logits
+	output["mean_rejected_logits"] = mean_rejected_logits
+	if aux_loss_enabled and hasattr(outputs, "aux_loss"):
 		output["aux_loss"] = outputs.aux_loss
-
 	return output
 
 
@@ -181,6 +200,7 @@ def training_step(
 	label_smoothing: float = 0,
 	loss_type: LOSS_FN_VARIENTS = "sigmoid",
 	reference_free: bool = False,
+	ref_precalculated: bool = True,
 	loss_config: tp.Optional[LossConfig] = None,
 	partition_spec: tp.Optional[PartitionSpec] = None,
 	gradient_accumulation_steps: int = 1,
@@ -201,7 +221,7 @@ def training_step(
 	def calculate_loss(tree: flax.nnx.GraphState, call_batch):
 		model_output = concatenated_forward(state.merge(tree=tree), call_batch)
 
-		if "ref_chosen_logps" in call_batch and "ref_rejected_logps" in call_batch:
+		if ref_precalculated:
 			ref_chosen_logps = call_batch["ref_chosen_logps"]
 			ref_rejected_logps = call_batch["ref_rejected_logps"]
 		else:
@@ -210,8 +230,8 @@ def training_step(
 			else:
 				out = concatenated_forward(reference_state.model, call_batch)
 
-			ref_chosen_logps = out["ref_chosen_logps"]
-			ref_rejected_logps = out["ref_rejected_logps"]
+			ref_chosen_logps = out["chosen_logps"]
+			ref_rejected_logps = out["rejected_logps"]
 
 		chosen_logps = model_output["chosen_logps"]
 		rejected_logps = model_output["rejected_logps"]
@@ -220,18 +240,20 @@ def training_step(
 			rejected_logps,
 			ref_chosen_logps,
 			ref_rejected_logps,
+			beta,
+			label_smoothing,
 		)
 
 		chosen_rewards = beta * jax.lax.stop_gradient(chosen_logps - ref_chosen_logps)
 		rejected_rewards = beta * jax.lax.stop_gradient(rejected_logps - ref_rejected_logps)
 		if hasattr(model_output, "aux_loss"):
 			losses += model_output["aux_loss"]
-		jax.debug.print("chosen_logps {}", chosen_logps)
-		jax.debug.print("rejected_logps {}", rejected_logps)
-		jax.debug.print("ref_chosen_logps {}", ref_chosen_logps)
-		jax.debug.print("ref_rejected_logps {}", ref_rejected_logps)
-		jax.debug.print("LOSS {}", losses)
-		jax.debug.print("MEAN {}", jnp.mean(losses))
+		# jax.debug.print("chosen_logps {}", chosen_logps)
+		# jax.debug.print("rejected_logps {}", rejected_logps)
+		# jax.debug.print("ref_chosen_logps {}", ref_chosen_logps)
+		# jax.debug.print("ref_rejected_logps {}", ref_rejected_logps)
+		# jax.debug.print("LOSS {}", losses)
+		# jax.debug.print("MEAN {}", jnp.mean(losses))
 		metrics = LossMetrics(
 			loss=losses.mean(),
 			rejected_rewards=rejected_rewards,
@@ -269,6 +291,7 @@ def evaluation_step(
 	beta: float = 0.1,
 	label_smoothing: float = 0,
 	loss_type: LOSS_FN_VARIENTS = "sigmoid",
+	ref_precalculated: bool = True,
 	reference_free: bool = False,
 	partition_spec: tp.Optional[PartitionSpec] = None,
 ) -> LossMetrics:
@@ -293,7 +316,7 @@ def evaluation_step(
 			_,
 		) = concatenated_forward(state.merge(tree), batch)
 
-		if "ref_chosen_logps" in batch and "ref_rejected_logps" in batch:
+		if ref_precalculated:
 			ref_chosen_logps = batch["ref_chosen_logps"]
 			ref_rejected_logps = batch["ref_rejected_logps"]
 		else:

@@ -369,6 +369,7 @@ class Trainer(BaseTrainer):
 				)
 			)
 		metrics = LossMetrics()
+		# print({k: v.shape for k, v in batch.items()})
 		try:
 			state, metrics = jax.block_until_ready(
 				self.sharded_training_step_function(state, batch)

@@ -25,8 +25,6 @@ from tqdm.autonotebook import tqdm
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
-from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
-from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import ProcessingClassType
 from easydel.trainers.trainer.trainer import Trainer
 from easydel.utils.helpers import get_logger
@@ -34,17 +32,27 @@ from easydel.utils.helpers import get_logger
 from ..base_trainer import (
 	BaseTrainer,
 	TrainerConfigureFunctionOutput,
-	TrainerConfigureModelOutput,
 )
 from ..prompt_utils import maybe_apply_chat_template, maybe_extract_prompt
 from .dpo_config import DPOConfig
 from .func_utils import concatenated_forward, evaluation_step, training_step
-from .utils import DPODataCollatorWithPadding, apply_dpo_tokenize
+from .utils import DPODataCollatorWithPadding
 
 if tp.TYPE_CHECKING:
-	from datasets import Dataset
+	from datasets import Dataset, IterableDataset
+	from transformers import (
+		BaseImageProcessor,
+		FeatureExtractionMixin,
+		PreTrainedTokenizerBase,
+		ProcessorMixin,
+	)
 else:
 	Dataset = tp.Any
+	IterableDataset = tp.Any
+	BaseImageProcessor = tp.Any
+	FeatureExtractionMixin = tp.Any
+	PreTrainedTokenizerBase = tp.Any
+	ProcessorMixin = tp.Any
 
 logger = get_logger(__name__)
 
@@ -88,21 +96,37 @@ class DPOTrainer(Trainer):
 		self.auto_fix_data = auto_fix_data
 		self.truncation_mode = arguments.truncation_mode
 		self.processing_class = processing_class
-		self.is_encoder_decoder = False
+		self.is_encoder_decoder = arguments.is_encoder_decoder
 		self._precomputed_train_ref_log_probs = False
 		self._precomputed_eval_ref_log_probs = False
 		self.low_mem_usage = low_mem_usage
 
-		arguments.padding_value = (
-			arguments.padding_value
-			if arguments.padding_value is not None
-			else processing_class.pad_token_id
-		)
+		if arguments.padding_value is not None:
+			self.padding_value = arguments.padding_value
+		else:
+			if (
+				hasattr(processing_class, "pad_token_id")
+				and processing_class.pad_token_id is not None
+			):
+				self.padding_value = processing_class.pad_token_id
+			elif (
+				hasattr(processing_class, "tokenizer")
+				and processing_class.tokenizer.pad_token_id is not None
+			):
+				self.padding_value = processing_class.tokenizer.pad_token_id
+			else:
+				raise ValueError(
+					"`padding_value` is not specified in `DPOConfig`, and `pad_token_id` is missing in the "
+					"`processing_class`. Please either set the `padding_value` argument in `DPOConfig`, or set "
+					"`tokenizer.pad_token` (e.g., `tokenizer.pad_token = tokenizer.eos_token`) before instantiating "
+					"the trainer."
+				)
+		arguments.padding_value = self.padding_value
 		input_data_collator = (
 			DPODataCollatorWithPadding(
 				max_prompt_length=arguments.max_prompt_length,
 				max_completion_length=arguments.max_completion_length,  # type: ignore
-				pad_token_id=processing_class.pad_token_id,  # type: ignore
+				pad_token_id=self.padding_value,  # type: ignore
 				label_pad_token_id=arguments.label_pad_token_id,
 				is_encoder_decoder=arguments.is_encoder_decoder,
 			)
@@ -118,53 +142,6 @@ class DPOTrainer(Trainer):
 
 		processing_class = processing_class
 
-		if train_dataset[-1].get("chosen", None) is None:
-			warnings.warn(
-				"couldn't find `chosen` column in dataset"
-				", this might make DPOTrainer break down if you haven't customize trainer.",
-				stacklevel=2,
-			)
-		if train_dataset[-1].get("rejected", None) is None:
-			warnings.warn(
-				"couldn't find `rejected` column in dataset"
-				", this might make DPOTrainer break down if you haven't customize trainer.",
-				stacklevel=2,
-			)
-		if train_dataset[-1].get("prompt", None) is None:
-			warnings.warn(
-				"couldn't find `prompt` column in dataset"
-				", this might make DPOTrainer break down if you haven't customize trainer.",
-				stacklevel=2,
-			)
-		train_dataset = train_dataset.map(
-			maybe_extract_prompt,
-			num_proc=arguments.dataset_num_proc,
-			desc="Extracting Prompts",
-		)
-		train_dataset = train_dataset.map(
-			maybe_apply_chat_template,
-			fn_kwargs={"processing_class": processing_class},
-			num_proc=arguments.dataset_num_proc,
-			desc="Apply Chat Template",
-		)
-		if eval_dataset is not None:
-			eval_dataset = eval_dataset.map(
-				maybe_extract_prompt,
-				num_proc=arguments.dataset_num_proc,
-				desc="Eval - Extracting Prompts",
-			)
-			eval_dataset = eval_dataset.map(
-				maybe_apply_chat_template,
-				fn_kwargs={"processing_class": processing_class},
-				num_proc=arguments.dataset_num_proc,
-				desc="Eval - Apply Chat Template",
-			)
-		fn_kwargs = {
-			"processing_class": self.processing_class,
-			"processor": None,
-			"is_encoder_decoder": True if arguments.is_encoder_decoder else False,
-			"args": arguments,
-		}
 		if not isinstance(model, EasyDeLState):
 			model = model.to_state()
 		if reference_model is None:
@@ -172,41 +149,33 @@ class DPOTrainer(Trainer):
 		if not isinstance(reference_model, EasyDeLState):
 			reference_model = reference_model.to_state()
 
-		_tokenize = apply_dpo_tokenize
-
-		train_dataset = train_dataset.map(
-			_tokenize,
-			fn_kwargs=fn_kwargs,
-			batched=True,
-			num_proc=arguments.dataset_num_proc,
-			writer_batch_size=10,
-			desc="Tokenizing train dataset",
-			remove_columns=["prompt", "chosen", "rejected"],
+		train_dataset = self._prepare_dataset(
+			train_dataset,
+			processing_class,
+			arguments,
+			"train",
 		)
 		if eval_dataset is not None:
-			eval_dataset = eval_dataset.map(
-				_tokenize,
-				fn_kwargs=fn_kwargs,
-				batched=True,
-				num_proc=arguments.dataset_num_proc,
-				writer_batch_size=10,
-				desc="Tokenizing eval dataset",
-				remove_columns=["prompt", "chosen", "rejected"],
-			)
+			if isinstance(eval_dataset, dict):
+				eval_dataset = {
+					key: self._prepare_dataset(dataset, processing_class, arguments, key)
+					for key, dataset in eval_dataset.items()
+				}
+			else:
+				eval_dataset = self._prepare_dataset(
+					eval_dataset,
+					processing_class,
+					arguments,
+					"eval",
+				)
 
 		self.arguments = arguments
 
-		self.is_in_train = False
 		self.train_dataset = train_dataset
 		self.eval_dataset = eval_dataset
 		self.processing_class = processing_class
 		self.reference_state = reference_model
-		self._loggers_initialized = False
-		self.mesh = model.model.mesh
 
-		self._cached_p_l_s = None
-		self._cached_c_l_s = None
-		self._cached_r_l_s = None
 		super().__init__(
 			model_state=model,
 			arguments=arguments,
@@ -215,26 +184,174 @@ class DPOTrainer(Trainer):
 			data_collator=None,
 		)
 
-	def configure_model(self) -> TrainerConfigureModelOutput:
-		"""
-		Configures the model, optimizer, scheduler, and configuration.
+	def _prepare_dataset(
+		self,
+		dataset: tp.Union[Dataset, IterableDataset],
+		processing_class: tp.Union[
+			PreTrainedTokenizerBase,
+			BaseImageProcessor,
+			FeatureExtractionMixin,
+			ProcessorMixin,
+		],
+		arguments: DPOConfig,
+		dataset_name: str,
+	) -> tp.Union[Dataset, IterableDataset]:
+		map_kwargs = {"writer_batch_size": 10}
+		from datasets import Dataset
 
-		This method retrieves the model configuration from the model state, creates
-		the optimizer and scheduler using the training arguments, and returns an
-		object containing the configured model, optimizer, scheduler, and configuration.
+		if isinstance(dataset, Dataset):
+			map_kwargs["num_proc"] = arguments.dataset_num_proc
+
+		if isinstance(dataset, Dataset):
+			map_kwargs["desc"] = f"Extracting prompt in {dataset_name} dataset"
+		dataset = dataset.map(maybe_extract_prompt, **map_kwargs)
+
+		if isinstance(dataset, Dataset):
+			map_kwargs["desc"] = f"Applying chat template to {dataset_name} dataset"
+		dataset = dataset.map(
+			maybe_apply_chat_template,
+			fn_kwargs={
+				"tokenizer": processing_class,
+				"tools": arguments.tools,
+			},
+			**map_kwargs,
+		)
+
+		if isinstance(dataset, Dataset):
+			map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
+
+		dataset = dataset.map(
+			self.tokenize_row,  # if not self.is_vision_model else self.process_row,
+			remove_columns=["prompt", "chosen", "rejected"],
+			fn_kwargs={
+				"processing_class": processing_class,
+				"max_prompt_length": arguments.max_prompt_length,
+				"max_completion_length": arguments.max_completion_length,
+				"add_special_tokens": False,
+			},
+			**map_kwargs,
+		)
+		return dataset
+
+	@staticmethod
+	def tokenize_row(
+		features,
+		processing_class,
+		max_prompt_length,
+		max_completion_length,
+		add_special_tokens,
+	):
+		"""
+		Tokenize a row of the dataset.
+
+		Args:
+		    features (`dict[str, str]`):
+		        Row of the dataset, should contain the keys `"prompt"`, `"chosen"`, and `"rejected"`.
+		    processing_class (`PreTrainedTokenizerBase`):
+		        Processing class used to process the data.
+		    max_prompt_length (`int` or `None`):
+		        Maximum length of the prompt sequence. If `None`, the prompt sequence is not truncated.
+		    max_completion_length (`int` or `None`):
+		        Maximum length of the completion sequences. If `None`, the completion sequences are not truncated.
+		    add_special_tokens (`bool`):
+		        Whether to add special tokens to the sequences. Typically used for encoder-decoder models. If `True`,
+		        the prompt sequence will have a bos token prepended and an eos token appended. In any case, the
+		        completion sequences will have an eos token appended.
 
 		Returns:
-		    TrainerConfigureModelOutput: An object containing the configured model, optimizer, scheduler, and configuration.
+		    `dict[str, list[int]]`:
+		        Tokenized sequences with the keys `"prompt_input_ids"`, `"chosen_input_ids"`, and
+		        `"rejected_input_ids".
 		"""
-		tx, scheduler = self.arguments.get_optimizer_and_scheduler(self.max_training_steps)
-		if self.pruning_module is not None:
-			tx = self.pruning_module.wrap_optax(tx)
-		return TrainerConfigureModelOutput(
-			model=self.model,
-			tx=tx,
-			scheduler=scheduler,
-			config=self.model.config,
+		tokenizer = processing_class
+		prompt_input_ids = tokenizer(
+			features["prompt"],
+			add_special_tokens=False,
+		)["input_ids"]
+		chosen_input_ids = tokenizer(
+			features["chosen"],
+			add_special_tokens=False,
+		)["input_ids"]
+		rejected_input_ids = tokenizer(
+			features["rejected"],
+			add_special_tokens=False,
+		)["input_ids"]
+
+		if add_special_tokens:
+			if tokenizer.bos_token_id is not None:
+				prompt_input_ids = [tokenizer.bos_token_id] + prompt_input_ids
+			if tokenizer.eos_token_id is not None:
+				prompt_input_ids = prompt_input_ids + [tokenizer.eos_token_id]
+		chosen_input_ids = chosen_input_ids + [tokenizer.eos_token_id]
+		rejected_input_ids = rejected_input_ids + [tokenizer.eos_token_id]
+
+		if max_prompt_length is not None:
+			prompt_input_ids = prompt_input_ids[-max_prompt_length:]
+		if max_completion_length is not None:
+			chosen_input_ids = chosen_input_ids[:max_completion_length]
+			rejected_input_ids = rejected_input_ids[:max_completion_length]
+
+		return {
+			"prompt_input_ids": prompt_input_ids,
+			"chosen_input_ids": chosen_input_ids,
+			"rejected_input_ids": rejected_input_ids,
+		}
+
+	@staticmethod
+	def process_row(
+		features,
+		processing_class,
+		max_prompt_length,
+		max_completion_length,
+		add_special_tokens,
+	):
+		processor, tokenizer = (processing_class, processing_class.tokenizer)
+		processed_features = processor(
+			images=features["images"],
+			text=features["prompt"],
+			add_special_tokens=False,
 		)
+
+		prompt_input_ids = processed_features["input_ids"][0]
+		pixel_values = processed_features["pixel_values"][0]
+		chosen_input_ids = tokenizer(
+			features["chosen"],
+			add_special_tokens=False,
+			return_tensors="jax",
+		)["input_ids"]
+		rejected_input_ids = tokenizer(
+			features["rejected"],
+			add_special_tokens=False,
+			return_tensors="jax",
+		)["input_ids"]
+
+		if add_special_tokens:
+			if tokenizer.bos_token_id is not None:
+				prompt_input_ids = [tokenizer.bos_token_id] + prompt_input_ids
+			if tokenizer.eos_token_id is not None:
+				prompt_input_ids = prompt_input_ids + [tokenizer.eos_token_id]
+		chosen_input_ids = chosen_input_ids + [tokenizer.eos_token_id]
+		rejected_input_ids = rejected_input_ids + [tokenizer.eos_token_id]
+
+		if max_prompt_length is not None:
+			prompt_input_ids = prompt_input_ids[-max_prompt_length:]
+		if max_completion_length is not None:
+			chosen_input_ids = chosen_input_ids[:max_completion_length]
+			rejected_input_ids = rejected_input_ids[:max_completion_length]
+
+		output = {
+			"prompt_input_ids": prompt_input_ids,
+			"pixel_values": pixel_values,
+			"chosen_input_ids": chosen_input_ids,
+			"rejected_input_ids": rejected_input_ids,
+		}
+
+		if "pixel_attention_mask" in processed_features:
+			output["pixel_attention_mask"] = processed_features["pixel_attention_mask"][0]
+		if "image_sizes" in processed_features:
+			output["image_sizes"] = processed_features["image_sizes"][0]
+
+		return output
 
 	def configure_functions(self) -> TrainerConfigureFunctionOutput:
 		"""
@@ -258,19 +375,29 @@ class DPOTrainer(Trainer):
 		partial_concatenated_forward = partial(
 			concatenated_forward,
 			is_encoder_decoder=self.arguments.is_encoder_decoder,
-			padding_value=self.arguments.padding_value,
+			padding_value=self.padding_value,
 			label_pad_token_id=self.arguments.label_pad_token_id,
-			fixed_max_length=self.arguments.max_length,
+			max_length=self.arguments.max_length,
+			loss_type=self.arguments.loss_type,
+			aux_loss_enabled=self.arguments.aux_loss_enabled,
+			truncation_mode=self.arguments.truncation_mode,
 		)
 		jited_concatenated_forward = jax.jit(
 			partial_concatenated_forward,
-			out_shardings=(empty_sharding, empty_sharding, empty_sharding, empty_sharding),
+			out_shardings=(empty_sharding,),
 			static_argnames=[
 				"is_encoder_decoder",
 				"padding_value",
 				"label_pad_token_id",
+				"aux_loss_enabled",
+				"truncation_mode",
+				"loss_type",
 			],
 		)
+		if self.dataset_train is not None:
+			ds_columns = self.dataset_train.column_names
+		else:
+			ds_columns = []
 		sharded_training_step_function = jax.jit(
 			partial(
 				training_step,
@@ -281,9 +408,12 @@ class DPOTrainer(Trainer):
 				label_smoothing=self.arguments.label_smoothing,
 				loss_type=self.arguments.loss_type,
 				reference_free=self.arguments.reference_free,
+				ref_precalculated="ref_chosen_logps" in ds_columns
+				and "ref_rejected_logps" in ds_columns,
 			),
 			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=(self.state_shardings, empty_sharding),
+			donate_argnums=(0,),
 			static_argnames=[
 				"learning_rate_fn",
 				"concatenated_forward",
@@ -292,9 +422,14 @@ class DPOTrainer(Trainer):
 				"label_smoothing",
 				"loss_type",
 				"reference_free",
+				"ref_precalculated",
 			],
 		)
 
+		if self.dataset_eval is not None:
+			ds_columns = self.dataset_eval.column_names
+		else:
+			ds_columns = []
 		sharded_evaluation_step_function = jax.jit(
 			partial(
 				evaluation_step,
@@ -304,6 +439,8 @@ class DPOTrainer(Trainer):
 				label_smoothing=self.arguments.label_smoothing,
 				loss_type=self.arguments.loss_type,
 				reference_free=self.arguments.reference_free,
+				ref_precalculated="ref_chosen_logps" in ds_columns
+				and "ref_rejected_logps" in ds_columns,
 			),
 			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=empty_sharding,
@@ -314,6 +451,7 @@ class DPOTrainer(Trainer):
 				"label_smoothing",
 				"loss_type",
 				"reference_free",
+				"ref_precalculated",
 			],
 		)
 		self.arguments.ensure_checkpoint_path()
@@ -470,25 +608,6 @@ class DPOTrainer(Trainer):
 		else:
 			outs = self.concatenated_forward(self.reference_state.model, batch=padded_batch)
 		return outs["chosen_logps"], outs["rejected_logps"]
-
-	def _execute_eval_step(self, state: EasyDeLState, batch) -> LossMetrics:
-		"""Execute a single eval step."""
-		batch = {key: jnp.asarray(value) for key, value in batch.items()}
-
-		metrics = self.sharded_evaluation_step_function(state, batch)
-		return metrics
-
-	def _execute_train_step(
-		self, state: EasyDeLState, batch
-	) -> tp.Tuple[EasyDeLState, LossMetrics, Exception]:
-		"""Execute a single training step."""
-		try:
-			print({key: value.dtype == jnp.dtype("O") for key, value in batch.items()})
-			batch = {key: jnp.array(value) for key, value in batch.items()}
-			state, metrics = self.sharded_training_step_function(state, batch)
-			return state, metrics, None
-		except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest) as run_exception:
-			return state, metrics, run_exception
 
 
 def check_unimplemented_abstract_methods():

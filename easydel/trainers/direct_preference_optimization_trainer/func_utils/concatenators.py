@@ -21,18 +21,23 @@ from ..utils import pad_to_length
 
 def concatenated_inputs(
 	batch: tp.Dict[str, tp.Union[tp.List, chex.Array]],
-	padding_value: int = 0,
-	fixed_max_length: int | None = None,
+	padding_value: int,
 ) -> tp.Dict[str, chex.Array]:
-	"""Concatenates and processes the chosen and rejected inputs from a batch.
+	"""The concatenated_inputs function takes a batch of chosen and rejected examples,
+	and concatenates them together. This is useful for training the model to predict whether an example was chosen
+	by the human annotator. The function also pads all inputs to
+	the same length as the longest input in that batch.
 
 	Args:
-	    batch: Dictionary containing input tensors for prompts, chosen and rejected sequences
-	    padding_value: Padding value for input IDs
-	    fixed_max_length: Optional fixed length for outputs
+	    batch: tp.Dict[str,tp.Union[tp.List,chex.Array]]: Pass the batch of data
+	        into the function
+	    padding_value: int: Pad the input_ids and attention_mask arrays
+	        to the same length
+	Allow for the batch to be a list of arrays or just an array,
+	Specify the type of data that is being passed in
 
 	Returns:
-	    Dictionary containing concatenated and processed tensors
+	    A dictionary of the concatenated inputs
 	"""
 	output = {}
 
@@ -61,24 +66,36 @@ def concatenated_inputs(
 			axis=0,
 		)
 
+	max_completion_length = max(
+		batch["chosen_input_ids"].shape[1],
+		batch["rejected_input_ids"].shape[1],
+	)
 	output["completion_input_ids"] = jnp.concatenate(
 		(
 			pad_to_length(
 				batch["chosen_input_ids"],
-				fixed_max_length,
+				max_completion_length,
 				pad_value=padding_value,
 			),
 			pad_to_length(
 				batch["rejected_input_ids"],
-				fixed_max_length,
+				max_completion_length,
 				pad_value=padding_value,
 			),
 		),
 	)
 	output["completion_attention_mask"] = jnp.concatenate(
 		(
-			pad_to_length(batch["chosen_attention_mask"], fixed_max_length, pad_value=0),
-			pad_to_length(batch["rejected_attention_mask"], fixed_max_length, pad_value=0),
+			pad_to_length(
+				batch["chosen_attention_mask"],
+				max_completion_length,
+				pad_value=0,
+			),
+			pad_to_length(
+				batch["rejected_attention_mask"],
+				max_completion_length,
+				pad_value=0,
+			),
 		),
 	)
 
