@@ -1011,6 +1011,9 @@ def trace_functions():
 class ModuleCaches(nn.Cache): ...
 
 
+class OverWriteWithGradient(nn.Param): ...
+
+
 if tp.TYPE_CHECKING:
 	from transformers import (
 		BaseImageProcessor,

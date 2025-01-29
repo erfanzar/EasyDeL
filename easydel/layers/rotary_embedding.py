@@ -145,7 +145,7 @@ def rope_wraper(type):
 
 
 def compute_basic_inv_frequencies(base: int, rotary_dim: int):
-	return 1.0 / (base ** (jnp.arange(0, rotary_dim, 2, dtype=jnp.float32) / rotary_dim))
+	return 1.0 / (base ** (jnp.arange(0, rotary_dim, 2, dtype="f4") / rotary_dim))
 
 
 def compute_yarn_inv_frequencies(

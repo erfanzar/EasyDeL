@@ -1779,8 +1779,17 @@ class FlaxAttentionModule(nn.Module):
 			value_cache = value_cache.materialize()
 		except Exception:
 			...
-		value_cache = lax.dynamic_update_slice(value_cache, value, slice_indices)
-		key_cache = lax.dynamic_update_slice(key_cache, key, slice_indices)
+		org_cache_dtype = key_cache.dtype
+		value_cache = lax.dynamic_update_slice(
+			value_cache.astype(value),
+			value,
+			slice_indices,
+		)
+		key_cache = lax.dynamic_update_slice(
+			key_cache.astype(key),
+			key,
+			slice_indices,
+		)
 		pad_mask = jnp.broadcast_to(
 			jnp.arange(max_length) < end_index + num_updated_cache_vectors,
 			tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
@@ -1788,13 +1797,13 @@ class FlaxAttentionModule(nn.Module):
 		attention_mask = jnp.logical_and(pad_mask, attention_mask)
 		cache_view.key = self.quantizer(
 			with_sharding_constraint(
-				arr=key_cache,
+				arr=key_cache.astype(org_cache_dtype),
 				sharding=self.get_sharding_safely(cache_view.key),
 			)
 		)
 		cache_view.value = self.quantizer(
 			with_sharding_constraint(
-				arr=value_cache,
+				arr=value_cache.astype(org_cache_dtype),
 				sharding=self.get_sharding_safely(cache_view.value),
 			)
 		)

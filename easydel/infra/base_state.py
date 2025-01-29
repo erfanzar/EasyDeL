@@ -72,7 +72,7 @@ class EasyDeLState(struct.PyTreeNode):
 		"""
 		assert self.opt_state is not None
 		assert self.tx is not None
-		# updates: Updates, state: OptState, params: Optional[Params] = None
+
 		updates, new_opt_state = self.tx.update(
 			updates=grads,
 			state=self.opt_state,
