@@ -73,7 +73,7 @@ class RMSNorm(nn.Module):
 		else:
 			x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
 		output = self._norm(x).astype(self.dtype)
-		return (self.weight.value.astype(self.dtype)) * output
+		return (self.kernel.value.astype(self.dtype)) * output
 
 
 class XerxesAttention(FlaxAttentionModule):
