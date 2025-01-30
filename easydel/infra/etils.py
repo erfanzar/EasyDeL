@@ -16,8 +16,6 @@ import argparse
 import typing as tp
 from enum import Enum
 
-import jax
-import jax.extend
 from fjformer.jaxpruner import (
 	GlobalMagnitudePruning,
 	GlobalSaliencyPruning,
@@ -152,10 +150,7 @@ AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[
 ]
 
 
-DEFAULT_ATTENTION_MECHANISM = (
-	"sdpa" if jax.extend.backend.get_backend().platform == "gpu" else "vanilla"
-)
-
+DEFAULT_ATTENTION_MECHANISM = "vanilla"
 AVAILABLE_SPARSE_MODULE_TYPES = tp.Literal["bcoo", "bcsr", "coo", "csr"]
 
 

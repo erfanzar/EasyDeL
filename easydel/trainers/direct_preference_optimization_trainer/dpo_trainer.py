@@ -28,6 +28,7 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
 from easydel.trainers.trainer.trainer import Trainer
 from easydel.utils.helpers import get_logger
+from easydel.utils.traversals import deepcopy_model
 
 from ..base_trainer import (
 	BaseTrainer,
@@ -145,7 +146,7 @@ class DPOTrainer(Trainer):
 		if not isinstance(model, EasyDeLState):
 			model = model.to_state()
 		if reference_model is None:
-			reference_model = model
+			reference_model = deepcopy_model(model)
 		if not isinstance(reference_model, EasyDeLState):
 			reference_model = reference_model.to_state()
 
