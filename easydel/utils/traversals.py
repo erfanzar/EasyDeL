@@ -14,6 +14,7 @@
 
 """Utility functions for managing and manipulating nnx module states."""
 
+from copy import deepcopy
 import typing as tp
 from collections.abc import Iterable
 
@@ -670,3 +671,24 @@ def named_tree_map(
 		*rest,
 		is_leaf=is_leaf,
 	)
+
+
+def deepcopy_model(model):
+	"""
+	Creates a deep copy of a JAX model.
+
+	This function takes a JAX model, extracts its leaves (the individual
+	components of the model), deep copies them, and then reconstructs the
+	model with the copied leaves.
+
+	Args:
+		model: A JAX model to be deep copied. This can be any nested structure
+				 of JAX arrays, lists, tuples, dicts, etc.
+
+	Returns:
+		A deep copy of the input model with the same structure but with all
+		leaves deep copied.
+	"""
+	leaves = deepcopy(jax.tree_util.tree_leaves(model))
+	struct = jax.tree_util.tree_structure(model)
+	return jax.tree_util.tree_unflatten(struct, leaves)

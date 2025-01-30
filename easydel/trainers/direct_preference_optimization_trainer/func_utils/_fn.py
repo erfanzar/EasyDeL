@@ -132,16 +132,8 @@ def concatenated_forward(
 				)
 		model_kwargs["input_ids"] = input_ids
 		model_kwargs["attention_mask"] = attention_mask
-		# jax.debug.print("{} A ", jnp.any(attention_mask == 1))
-		# jax.debug.print("{} I ", jnp.any(jnp.isnan(input_ids)))
-
-		# jax.debug.print("{} IDS", input_ids)
-		# jax.debug.print("{} ATN", attention_mask)
-		# jax.debug.print("{} ATN", attention_mask.shape)
-
 		outputs = model(**model_kwargs)
 
-		# jax.debug.print("{}", jnp.any(jnp.isnan(outputs.logits)))
 		logits = outputs.logits
 		labels = jnp.roll(input_ids, shift=-1, axis=1)
 		loss_mask = jnp.roll(loss_mask, shift=-1, axis=1).astype("bool")
@@ -160,7 +152,6 @@ def concatenated_forward(
 	per_token_logps = jnp.roll(per_token_logps, shift=1, axis=1)
 
 	all_logps = per_token_logps.sum(-1)
-	# jax.debug.print("{} all_logps", all_logps)
 	if loss_type == "ipo":
 		all_logps = all_logps / loss_mask.sum(-1)
 	output = {}
@@ -193,9 +184,9 @@ def concatenated_forward(
 def training_step(
 	state: EasyDeLState,
 	batch: dict,
+	reference_state: EasyDeLState,
 	learning_rate_fn: tp.Callable,
 	concatenated_forward: tp.Callable,
-	reference_state: EasyDeLState = None,
 	beta: float = 0.1,
 	label_smoothing: float = 0,
 	loss_type: LOSS_FN_VARIENTS = "sigmoid",
@@ -204,7 +195,7 @@ def training_step(
 	loss_config: tp.Optional[LossConfig] = None,
 	partition_spec: tp.Optional[PartitionSpec] = None,
 	gradient_accumulation_steps: int = 1,
-) -> tuple[EasyDeLState, LossMetrics]:
+) -> tp.Tuple[EasyDeLState, LossMetrics]:
 	batch_size, minibatch_size, partition_spec = make_assertions_and_get_sizes(
 		batch=batch,
 		gradient_accumulation_steps=gradient_accumulation_steps,
@@ -225,11 +216,7 @@ def training_step(
 			ref_chosen_logps = call_batch["ref_chosen_logps"]
 			ref_rejected_logps = call_batch["ref_rejected_logps"]
 		else:
-			if reference_state is None:
-				out = concatenated_forward(state.model, call_batch)
-			else:
-				out = concatenated_forward(reference_state.model, call_batch)
-
+			out = concatenated_forward(reference_state.model, call_batch)
 			ref_chosen_logps = out["chosen_logps"]
 			ref_rejected_logps = out["rejected_logps"]
 
@@ -248,12 +235,7 @@ def training_step(
 		rejected_rewards = beta * jax.lax.stop_gradient(rejected_logps - ref_rejected_logps)
 		if hasattr(model_output, "aux_loss"):
 			losses += model_output["aux_loss"]
-		# jax.debug.print("chosen_logps {}", chosen_logps)
-		# jax.debug.print("rejected_logps {}", rejected_logps)
-		# jax.debug.print("ref_chosen_logps {}", ref_chosen_logps)
-		# jax.debug.print("ref_rejected_logps {}", ref_rejected_logps)
-		# jax.debug.print("LOSS {}", losses)
-		# jax.debug.print("MEAN {}", jnp.mean(losses))
+
 		metrics = LossMetrics(
 			loss=losses.mean(),
 			rejected_rewards=rejected_rewards,
