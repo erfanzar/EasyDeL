@@ -54,7 +54,7 @@ class RMSNorm(nn.Module):
 		self.eps = eps
 		self.dtype = dtype
 		self.param_dtype = param_dtype
-		self.weight = nn.Param(jnp.ones(self.dim, dtype=param_dtype))
+		self.kernel = nn.Param(jnp.ones(self.dim, dtype=param_dtype))
 
 	def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
 		return x / lax.sqrt(
