@@ -21,6 +21,7 @@ if _os.environ.get("EASYDEL_AUTO", "true") in ["true", "1", "on", "yes"]:
 	# Tell jax xla bridge to stay quiet and only yied warnings or errors.
 	_getLogger("jax._src.xla_bridge").setLevel(30)
 	_getLogger("jax._src.mesh_utils").setLevel(30)
+	_getLogger("datasets").setLevel(30)
 
 	# Taking care of some optional GPU FLAGs
 	_os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"

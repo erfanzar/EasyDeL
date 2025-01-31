@@ -128,7 +128,7 @@ class DPODataCollatorWithPadding:
 		if ref_chosen_logps is not None and ref_rejected_logps is not None:
 			output["ref_chosen_logps"] = ref_chosen_logps
 			output["ref_rejected_logps"] = ref_rejected_logps
-
+		# print(output["prompt_input_ids"])
 		return output
 
 
