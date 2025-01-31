@@ -126,6 +126,30 @@ api_server = ed.vInferenceApiServer({inference.inference_name: inference})
 api_server.fire()
 ```
 
+### DPOTraining Example
+
+`DPOTrainer` implements Direct Preference Optimization (DPO) - a state-of-the-art algorithm used for preference-based model fine-tuning. DPO is widely used across major language models like Llama 3 to align them with human preferences. Here's how to use DPOTrainer in EasyDeL:
+
+```python
+import easydel as ed
+from transformers import AutoTokenizer
+from datasets import load_dataset
+
+
+ed.DPOTrainer(
+ model=ed.AutoEasyDeLModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct"),
+ arguments=ed.DPOConfig(
+  max_completion_length=128,
+  max_prompt_length=128,
+  max_length=256,
+  save_steps=100,
+ ),
+ train_dataset=load_dataset("trl-lib/ultrafeedback_binarized", split="train"),
+ processing_class=AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct"),
+).train()
+
+```
+
 ### Building Custom Modules 🛠️
 
 The `EasyDeLBaseModule` is the core foundation for creating custom modules and models in EasyDeL. It provides a powerful set of built-in features for configuration, data handling, parameter management, and more. It inherits from `flax.nnx.Module`, `BaseModuleProtocol`, `EasyBridgeMixin`, and `EasyGenerationMixin`.

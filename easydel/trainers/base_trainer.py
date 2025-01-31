@@ -188,7 +188,10 @@ class BaseTrainer(BaseTrainerProtocol):
 	@staticmethod
 	def finish():
 		if wandb is not None:
-			wandb.finish()
+			try:
+				wandb.finish()
+			except Exception:
+				...
 
 	def get_runstage_flops(self, is_training) -> tp.Union[float, tp.Tuple[float, bool]]:
 		try:

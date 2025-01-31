@@ -98,7 +98,6 @@ def concatenated_forward(
 		logits = outputs.logits
 		loss_mask = completion_attention_mask.astype(bool)
 	else:
-		# Concatenate the prompt and completion inputs
 		input_ids = jnp.concatenate(
 			[prompt_input_ids, completion_input_ids],
 			axis=1,
@@ -143,15 +142,20 @@ def concatenated_forward(
 		logits = logits[:, -seq_len:]
 
 	labels = jnp.where(loss_mask, labels, 0)
-	log_probs = jax.nn.log_softmax(logits, axis=-1)
+	lsmax = jax.nn.log_softmax(logits, axis=-1)
 	batch_size, seq_len = labels.shape
-	batch_indices = jnp.arange(batch_size)[:, None]
-	seq_indices = jnp.arange(seq_len)[None, :]
-	per_token_logps = log_probs[batch_indices, seq_indices, labels]
-	per_token_logps = jnp.where(loss_mask, per_token_logps, 0)
-	per_token_logps = jnp.roll(per_token_logps, shift=1, axis=1)
+	per_token_logps = jnp.roll(
+		jnp.where(
+			loss_mask,
+			lsmax[jnp.arange(batch_size)[:, None], jnp.arange(seq_len)[None, :], labels],
+			0,
+		),
+		shift=1,
+		axis=1,
+	)
 
 	all_logps = per_token_logps.sum(-1)
+
 	if loss_type == "ipo":
 		all_logps = all_logps / loss_mask.sum(-1)
 	output = {}
@@ -213,10 +217,12 @@ def training_step(
 		model_output = concatenated_forward(state.merge(tree=tree), call_batch)
 
 		if ref_precalculated:
-			ref_chosen_logps = call_batch["ref_chosen_logps"]
-			ref_rejected_logps = call_batch["ref_rejected_logps"]
+			ref_chosen_logps = jax.lax.stop_gradient(call_batch["ref_chosen_logps"])
+			ref_rejected_logps = jax.lax.stop_gradient(call_batch["ref_rejected_logps"])
 		else:
-			out = concatenated_forward(reference_state.model, call_batch)
+			rfm = reference_state.model
+			rfm.eval()
+			out = jax.lax.stop_gradient(concatenated_forward(rfm, call_batch))
 			ref_chosen_logps = out["chosen_logps"]
 			ref_rejected_logps = out["rejected_logps"]
 

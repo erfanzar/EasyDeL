@@ -42,6 +42,7 @@ class DPOConfig(TrainingArguments):
 	reference_free: bool = False
 	force_use_ref_model: bool = False
 	sync_ref_model: bool = False
+	learning_rate: float = 1e-6
 	ref_model_mixup_alpha: float = 0.9
 	ref_model_sync_steps: int = 64
 	rpo_alpha: tp.Optional[float] = None
@@ -50,6 +51,7 @@ class DPOConfig(TrainingArguments):
 	def __post_init__(self):
 		if self.max_completion_length is None:
 			self.max_completion_length = self.max_length - self.max_prompt_length
+		self.max_sequence_length = self.max_length * 2  # Chosen - Rejected
 		return super().__post_init__()
 
 	__hash__ = hash_fn
