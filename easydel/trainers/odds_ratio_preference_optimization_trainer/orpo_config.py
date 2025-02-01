@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import typing as tp
-import warnings
 from dataclasses import dataclass
 
 from easydel.utils.compiling_utils import hash_fn
@@ -23,42 +22,32 @@ from ..training_configurations import TrainingArguments
 
 @dataclass
 class ORPOConfig(TrainingArguments):
-	max_length: tp.Optional[int] = None
-	max_prompt_length: tp.Optional[int] = None
-	max_completion_length: tp.Optional[int] = None
 	beta: float = 0.1
 	disable_dropout: bool = True
-	label_pad_token_id: int = -100
 	is_encoder_decoder: bool = False
-	padding_value: int = None
 	apply_chat_template: bool = True
+	label_pad_token_id: int = -100
+	padding_value: tp.Optional[int] = None
+	max_length: tp.Optional[int] = 512
+	max_prompt_length: tp.Optional[int] = 256
+	max_completion_length: tp.Optional[int] = None
+	is_encoder_decoder: tp.Optional[bool] = None
+	disable_dropout: bool = True
+	precompute_ref_log_probs: bool = False
+	dataset_num_proc: tp.Optional[int] = None
+	reference_free: bool = False
+	force_use_ref_model: bool = False
+	sync_ref_model: bool = False
+	learning_rate: float = 1e-6
+	ref_model_mixup_alpha: float = 0.9
+	ref_model_sync_steps: int = 64
+	rpo_alpha: tp.Optional[float] = None
+	tools: tp.Optional[tp.List[tp.Union[dict, tp.Callable]]] = None
 
 	def __post_init__(self):
-		if self.max_length is None:
-			warnings.warn(
-				"`max_length` is not set in the ORPOConfig init"
-				" it will default to `512` by default, but you should do it yourself in the future.",
-				UserWarning,
-				stacklevel=1,
-			)
-			self.max_length = 512
-		if self.max_prompt_length is None:
-			warnings.warn(
-				"`max_prompt_length` is not set in the ORPOConfig init"
-				" it will default to `128` by default, but you should do it yourself in the future.",
-				UserWarning,
-				stacklevel=1,
-			)
-			self.max_prompt_length = 128
-
 		if self.max_completion_length is None:
-			warnings.warn(
-				"When using an encoder decoder architecture, you should set `max_completion_length` in the "
-				"ORPOTrainer's init it will default to `128` by default, but you should do it yourself in the future.",
-				UserWarning,
-				stacklevel=1,
-			)
-			self.max_completion_length = 128
+			self.max_completion_length = self.max_length - self.max_prompt_length
+		self.max_sequence_length = self.max_length * 2  # Chosen - Rejected
 		return super().__post_init__()
 
 	__hash__ = hash_fn

@@ -90,6 +90,7 @@ class TrainingArguments:
 	report_metrics: bool = True
 	log_steps: int = 10
 	loss_config: tp.Optional[LossConfig] = None
+	low_mem_usage: bool = True
 	max_evaluation_steps: tp.Optional[int] = None
 	max_sequence_length: tp.Optional[int] = 4096
 	max_training_steps: tp.Optional[int] = None

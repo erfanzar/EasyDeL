@@ -35,7 +35,7 @@ from ..base_trainer import (
 	TrainerConfigureDataloaderOutput,
 	TrainerConfigureFunctionOutput,
 )
-from ..direct_preference_optimization_trainer.utils import DPODataCollatorWithPadding
+from ..utils import DPODataCollatorWithPadding
 from ._fn import concatenated_forward, orpo_step
 from .orpo_config import ORPOConfig
 
