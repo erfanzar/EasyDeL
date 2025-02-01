@@ -35,9 +35,9 @@ from ..base_trainer import (
 	TrainerConfigureFunctionOutput,
 )
 from ..prompt_utils import maybe_apply_chat_template, maybe_extract_prompt
+from ..utils import DPODataCollatorWithPadding
+from ._fn import concatenated_forward, evaluation_step, training_step
 from .dpo_config import DPOConfig
-from .func_utils import concatenated_forward, evaluation_step, training_step
-from .utils import DPODataCollatorWithPadding
 
 if tp.TYPE_CHECKING:
 	from datasets import Dataset, IterableDataset
@@ -78,9 +78,7 @@ class DPOTrainer(Trainer):
 		train_dataset: tp.Optional[Dataset] = None,
 		eval_dataset: tp.Optional[Dataset] = None,
 		data_collator: tp.Optional[tp.Callable] = None,
-		dataset_map_arguments: tp.Optional[dict] = None,
-		low_mem_usage: bool = True,
-		auto_fix_data: bool = True,
+		dataset_map_arguments: tp.Optional[dict] = None,  
 	):
 		assert arguments is not None, (
 			"You Have to pass arguments that will be used for training but you have passed"
@@ -93,14 +91,13 @@ class DPOTrainer(Trainer):
 		assert (
 			processing_class is not None
 		), "processing_class must be specified to tokenize a DPO dataset."
-		self.arguments = arguments
-		self.auto_fix_data = auto_fix_data
+		self.arguments = arguments 
 		self.truncation_mode = arguments.truncation_mode
 		self.processing_class = processing_class
 		self.is_encoder_decoder = arguments.is_encoder_decoder
 		self._precomputed_train_ref_log_probs = False
 		self._precomputed_eval_ref_log_probs = False
-		self.low_mem_usage = low_mem_usage
+
 
 		if arguments.padding_value is not None:
 			self.padding_value = arguments.padding_value
