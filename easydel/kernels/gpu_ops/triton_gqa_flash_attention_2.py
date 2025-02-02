@@ -306,7 +306,7 @@ try:
 		list(filter(fwd_keep, fwd_configs)),
 		key=["CQL", "CKL", "HAVE_BIAS", "BIAS_SINGLE_HEAD", "BLOCK_HEADDIM"],
 	)(_fwd_attention_kernel)
-except ModuleNotFoundError:
+except Exception:
 	...
 
 
