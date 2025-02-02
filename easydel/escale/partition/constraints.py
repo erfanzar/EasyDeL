@@ -315,6 +315,32 @@ def create_pattern_based_partition_spec(
 	return get_partition_spec
 
 
+def extract_sharding_structure(pytree: tp.Any) -> tp.Any:
+	"""
+	Extract a PyTree of NamedShardings matching the input structure.
+	Returns None for leaves without shardings.
+	"""
+	leaves, treedef = jax.tree_util.tree_flatten(pytree)
+
+	sharding_leaves = []
+	for leaf in leaves:
+		if isinstance(leaf, jax.Array) and (shard := leaf.sharding) is not None:
+			sharding_leaves.append(shard if isinstance(shard, NamedSharding) else None)
+		else:
+			sharding_leaves.append(None)
+
+	return jax.tree_util.tree_unflatten(treedef, sharding_leaves)
+
+
+def get_shardings_with_structure(pytree: tp.Any) -> tp.Any:
+	"""
+	Returns a PyTree matching the input structure containing either:
+	- NamedSharding objects where present
+	- None for leaves without NamedShardings
+	"""
+	return extract_sharding_structure(pytree)
+
+
 AxisType = tp.Optional[tp.Union[tp.Tuple[str, ...], str]]
 
 

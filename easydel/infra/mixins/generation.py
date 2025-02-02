@@ -799,10 +799,10 @@ class EasyGenerationMixin:
 
 			logits = logits_processor(state.sequences, logits, state.cur_len)
 
-			next_token = jnp.argmax(logits, axis=-1) 
+			next_token = jnp.argmax(logits, axis=-1)
 			next_token = (
 				next_token * ~state.is_sent_finished + pad_token_id * state.is_sent_finished
-			) 
+			)
 			next_is_sent_finished = state.is_sent_finished | jnp.isin(
 				next_token,
 				eos_token_id,
@@ -812,7 +812,7 @@ class EasyGenerationMixin:
 				state.sequences,
 				next_token,
 				(0, state.cur_len),
-			) 
+			)
 			next_model_kwargs = self.update_inputs_for_generation(
 				model_outputs, state.model_kwargs
 			)

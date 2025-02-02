@@ -24,7 +24,8 @@ import optax
 from flax import nnx as nn
 from flax import struct
 from jax.sharding import NamedSharding, PartitionSpec
-from safetensors.flax import save_file as safe_save_file, load_file as safe_load_file
+from safetensors.flax import load_file as safe_load_file
+from safetensors.flax import save_file as safe_save_file
 
 from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import specs_to_name_sharding

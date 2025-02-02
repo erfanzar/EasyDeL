@@ -11,9 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import typing
 import typing as tp
-import warnings
 from collections import defaultdict
 from functools import partial
 
@@ -25,17 +23,22 @@ from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
-from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
-from easydel.infra.loss_utils import LossMetrics
-from easydel.trainers.trainer.trainer import Trainer
+from easydel.infra.utils import ProcessingClassType
 from easydel.utils.helpers import get_logger
 
 from ..base_trainer import (
-	BaseTrainer,
-	TrainerConfigureDataloaderOutput,
 	TrainerConfigureFunctionOutput,
 )
-from ..utils import DPODataCollatorWithPadding
+from ..prompt_utils import (
+	maybe_apply_chat_template,
+	maybe_extract_prompt,
+)
+from ..trainer.trainer import Trainer
+from ..utils import (
+	DPODataCollatorWithPadding,
+	add_bos_token_if_needed,
+	add_eos_token_if_needed,
+)
 from ._fn import concatenated_forward, orpo_step
 from .orpo_config import ORPOConfig
 
@@ -55,6 +58,8 @@ logger = get_logger(__name__)
 
 
 class ORPOTrainer(Trainer):
+	arguments: ORPOConfig
+
 	def __init__(
 		self,
 		arguments: ORPOConfig,
@@ -62,107 +67,101 @@ class ORPOTrainer(Trainer):
 		data_collator: tp.Optional[DPODataCollatorWithPadding] = None,
 		train_dataset: tp.Optional[Dataset] = None,
 		eval_dataset: tp.Optional[tp.Union[Dataset, tp.Dict[str, Dataset]]] = None,
-		tokenizer: tp.Optional[PreTrainedTokenizerBase] = None,
-		dataset_num_proc: tp.Optional[int] = None,
-		dataset_map_arguments: tp.Optional[tp.Dict[str, tp.Any]] = None,
-		low_mem_usage: bool = False,
+		processing_class: tp.Optional[ProcessingClassType] = None,
 	):
-		"""
-		Initializes the ORPOTrainer.
-
-		Args:
-		    arguments (ORPOConfig): The training arguments.
-		    data_collator (tp.Optional[DPODataCollatorWithPadding], optional): The data collator used for batching. Defaults to None.
-		    train_dataset (tp.Optional[Dataset], optional): The training dataset. Defaults to None.
-		    eval_dataset (tp.Optional[tp.Union[Dataset, tp.Dict[str, Dataset]]], optional): The evaluation dataset. Defaults to None.
-		    tokenizer (tp.Optional[PreTrainedTokenizerBase], optional): The tokenizer used for preprocessing. Defaults to None.
-		    dataset_num_proc (tp.Optional[int], optional): The number of processes to use for dataset mapping. Defaults to None.
-		    dataset_map_arguments (tp.Optional[tp.Dict[str, tp.Any]], optional): Arguments to pass to the dataset `map` function for tokenization. Defaults to None.
-		    low_mem_usage (bool, optional): Whether to prioritize low memory usage during training. Defaults to False.
-
-		Raises:
-		    ValueError: If `arguments` is not provided or is not a `TrainingArguments` instance, or if `tokenizer` is not provided.
-		"""
-
 		assert arguments is not None, (
 			"You Have to pass arguments that will be used for training but you have passed"
 			"`arguments=None`"
 		)
 		assert isinstance(
 			arguments, ORPOConfig
-		), f"arguments type must be `TrainingArguments` but got {type(arguments)}"
+		), f"arguments type must be `ORPOConfig` but got {type(arguments)}"
 
-		if tokenizer is None:
-			raise ValueError("tokenizer must be specified to tokenize a ORPO dataset.")
-
-		arguments.padding_value = (
-			arguments.padding_value
-			if arguments.padding_value is not None
-			else tokenizer.pad_token_id
-		)
+		assert (
+			processing_class is not None
+		), "processing_class must be specified to tokenize a DPO dataset."
 		self.arguments = arguments
-		self.tokenizer = tokenizer
-		self.low_mem_usage = low_mem_usage
-		self.dataset_num_proc = dataset_num_proc
-		data_collator = (
+		self.truncation_mode = arguments.truncation_mode
+		self.processing_class = processing_class
+		self.is_encoder_decoder = arguments.is_encoder_decoder
+
+		if arguments.padding_value is not None:
+			self.padding_value = arguments.padding_value
+		else:
+			if (
+				hasattr(processing_class, "pad_token_id")
+				and processing_class.pad_token_id is not None
+			):
+				self.padding_value = processing_class.pad_token_id
+			elif (
+				hasattr(processing_class, "tokenizer")
+				and processing_class.tokenizer.pad_token_id is not None
+			):
+				self.padding_value = processing_class.tokenizer.pad_token_id
+			else:
+				raise ValueError(
+					"`padding_value` is not specified in `ORPOConfig`, and `pad_token_id` is missing in the "
+					"`processing_class`. Please either set the `padding_value` argument in `ORPOConfig`, or set "
+					"`tokenizer.pad_token` (e.g., `tokenizer.pad_token = tokenizer.eos_token`) before instantiating "
+					"the trainer."
+				)
+		arguments.padding_value = self.padding_value
+		input_data_collator = (
 			DPODataCollatorWithPadding(
 				max_prompt_length=arguments.max_prompt_length,
 				max_completion_length=arguments.max_completion_length,
-				pad_token_id=tokenizer.pad_token_id,
+				pad_token_id=self.padding_value,
 				label_pad_token_id=arguments.label_pad_token_id,
-				is_encoder_decoder=False,
+				is_encoder_decoder=arguments.is_encoder_decoder,
+				prepadded=True,
 			)
 			if data_collator is None
 			else data_collator
 		)
+		self.input_data_collator = input_data_collator
+
 		self._stored_metrics = defaultdict(lambda: defaultdict(list))
-		if dataset_map_arguments is None:
-			dataset_map_arguments = {}
 
-		with jax.default_device(
-			jax.devices(arguments.offload_device_type)[arguments.offload_device_index]
-		):
-			train_dataset = train_dataset.map(
-				self.tokenize_row,
-				num_proc=dataset_num_proc,
-				batched=False,
-				**dataset_map_arguments,
-			)
-			if eval_dataset is not None:
-				eval_dataset = eval_dataset.map(
-					self.tokenize_row,
-					num_proc=dataset_num_proc,
-					batched=False,
-					**dataset_map_arguments,
-				)
-		self.hp_name = None
-		self.deepspeed = None
-		self.is_in_train = False
+		processing_class = processing_class
 
-		self.data_collator = data_collator
-		self.train_dataset = train_dataset
-		self.eval_dataset = eval_dataset
-		self.tokenizer = tokenizer
-		self._loggers_initialized = False
 		if not isinstance(model, EasyDeLState):
 			model = model.to_state()
-		model_state = model
-		self.mesh = model_state.model.mesh
-		assert (
-			arguments.padding_value is not None
-		), "`padding_value` can not be set as `None` it must be an integer."
 
-		self._cached_p_l_s = None
-		self._cached_c_l_s = None
-		self._cached_r_l_s = None
-
+		train_dataset = train_dataset.map(
+			maybe_extract_prompt,
+			num_proc=arguments.dataset_num_proc,
+		)
+		train_dataset = train_dataset.map(
+			maybe_apply_chat_template,
+			fn_kwargs={"tokenizer": processing_class},
+			num_proc=arguments.dataset_num_proc,
+		)
+		train_dataset = train_dataset.map(
+			self.tokenize_row,
+			num_proc=arguments.dataset_num_proc,
+		)
+		if eval_dataset is not None:
+			eval_dataset = eval_dataset.map(
+				maybe_extract_prompt,
+				num_proc=arguments.dataset_num_proc,
+			)
+			eval_dataset = eval_dataset.map(
+				maybe_apply_chat_template,
+				fn_kwargs={"tokenizer": processing_class},
+				num_proc=arguments.dataset_num_proc,
+			)
+			eval_dataset = eval_dataset.map(
+				self.tokenize_row,
+				num_proc=arguments.dataset_num_proc,
+			)
+		self.arguments = arguments
+		self.processing_class = processing_class
 		super().__init__(
+			model_state=model,
 			arguments=arguments,
-			model_state=model_state,
 			dataset_train=train_dataset,
 			dataset_eval=eval_dataset,
-			finetune=True,
-			checkpoint_path=None,
+			data_collator=None,
 		)
 
 	def build_tokenized_answer(
@@ -183,49 +182,49 @@ class ORPOTrainer(Trainer):
 		Raises:
 		    ValueError: If there's a mismatch in token lengths.
 		"""
-		full_tokenized = self.tokenizer(prompt + answer, add_special_tokens=False)
-		prompt_input_ids = self.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+		full_tokenized = self.processing_class(
+			prompt + answer,
+			add_special_tokens=False,
+		)
+		prompt_input_ids = self.processing_class(
+			prompt,
+			add_special_tokens=False,
+		)["input_ids"]
 
-		# Convert to numpy arrays for consistency
+		answer_input_ids = full_tokenized["input_ids"][len(prompt_input_ids) :]
+		answer_attention_mask = full_tokenized["attention_mask"][len(prompt_input_ids) :]
+		full_concat_input_ids = np.concatenate([prompt_input_ids, answer_input_ids])
 		full_input_ids = np.array(full_tokenized["input_ids"])
-		prompt_input_ids = np.array(prompt_input_ids)
 
+		if len(full_input_ids) != len(full_concat_input_ids):
+			raise ValueError(
+				"Prompt input ids and answer input ids should have the same length."
+			)
 		response_token_ids_start_idx = len(prompt_input_ids)
-
-		# Check for potential off-by-one error
-		if not np.array_equal(
-			prompt_input_ids, full_input_ids[:response_token_ids_start_idx]
-		):
+		if prompt_input_ids != full_tokenized["input_ids"][:response_token_ids_start_idx]:
 			response_token_ids_start_idx -= 1
-			if not np.array_equal(
-				prompt_input_ids, full_input_ids[:response_token_ids_start_idx]
-			):
-				raise ValueError("Mismatch in prompt tokenization")
 
+		prompt_input_ids = full_tokenized["input_ids"][:response_token_ids_start_idx]
 		prompt_attention_mask = full_tokenized["attention_mask"][
 			:response_token_ids_start_idx
 		]
-		answer_input_ids = full_input_ids[response_token_ids_start_idx:]
-		answer_attention_mask = full_tokenized["attention_mask"][
-			response_token_ids_start_idx:
-		]
-
 		if len(prompt_input_ids) != len(prompt_attention_mask):
 			raise ValueError(
 				"Prompt input ids and attention mask should have the same length."
 			)
-
-		return {
-			"prompt_input_ids": prompt_input_ids.astype(np.int32),
-			"prompt_attention_mask": np.array(prompt_attention_mask, dtype=np.int32),
-			"input_ids": answer_input_ids.astype(np.int32),
-			"attention_mask": np.array(answer_attention_mask, dtype=np.int32),
-		}
+		answer_input_ids = full_tokenized["input_ids"][response_token_ids_start_idx:]
+		answer_attention_mask = full_tokenized["attention_mask"][
+			response_token_ids_start_idx:
+		]
+		return dict(
+			prompt_input_ids=prompt_input_ids,
+			prompt_attention_mask=prompt_attention_mask,
+			input_ids=answer_input_ids,
+			attention_mask=answer_attention_mask,
+		)
 
 	def tokenize_row(
-		self,
-		feature: tp.Dict[str, str],
-		state: tp.Optional[object] = None,
+		self, feature: tp.Dict[str, str], state: tp.Optional[object] = None
 	) -> tp.Dict[str, np.ndarray]:
 		"""
 		Tokenizes a single row of data from the ORPO dataset.
@@ -244,145 +243,165 @@ class ORPOTrainer(Trainer):
 		Raises:
 		    ValueError: If the input data types are incorrect.
 		"""
-		prompt = self._validate_input(feature, "prompt")
-		chosen = self._validate_input(feature, "chosen")
-		rejected = self._validate_input(feature, "rejected")
-
-		prompt_tokens = self._tokenize_prompt(prompt)
-		chosen_tokens = self._tokenize_answer(prompt, chosen)
-		rejected_tokens = self._tokenize_answer(prompt, rejected)
-
-		chosen_sequence = self._create_sequence(prompt_tokens, chosen_tokens)
-		rejected_sequence = self._create_sequence(prompt_tokens, rejected_tokens)
-
-		return self._prepare_final_batch(
-			prompt_tokens,
-			chosen_sequence,
-			rejected_sequence,
-		)
-
-	def _validate_input(self, feature: tp.Dict[str, str], key: str) -> str:
-		"""Validates input and returns the corresponding value."""
-		value = feature[key]
-		if self.arguments.apply_chat_template and key in ["chosen", "rejected"]:
-			value = self.tokenizer.apply_chat_template(value, tokenize=False)
-
-		if not isinstance(value, str):
-			raise ValueError(f"{key} should be a string but got {type(value)}")
-		return value
-
-	def _tokenize_prompt(self, prompt: str) -> tp.Dict[str, np.ndarray]:
-		"""Tokenizes the prompt."""
-		tokens = self.tokenizer(prompt, add_special_tokens=False, return_tensors="np")
-		return {f"prompt_{k}": v for k, v in tokens.items()}
-
-	def _tokenize_answer(self, prompt: str, answer: str) -> tp.Dict[str, np.ndarray]:
-		"""Tokenizes the answer in context of the prompt."""
-		full_tokenized = self.tokenizer(prompt + answer, add_special_tokens=False)
-		prompt_length = len(self.tokenizer(prompt, add_special_tokens=False)["input_ids"])
-
-		return {
-			"prompt_input_ids": np.array(
-				full_tokenized["input_ids"][:prompt_length], dtype=np.int32
-			),
-			"prompt_attention_mask": np.array(
-				full_tokenized["attention_mask"][:prompt_length], dtype=np.int32
-			),
-			"input_ids": np.array(
-				full_tokenized["input_ids"][prompt_length:], dtype=np.int32
-			),
-			"attention_mask": np.array(
-				full_tokenized["attention_mask"][prompt_length:], dtype=np.int32
-			),
-		}
-
-	def _create_sequence(
-		self,
-		prompt_tokens: tp.Dict[str, np.ndarray],
-		answer_tokens: tp.Dict[str, np.ndarray],
-	) -> tp.Dict[str, np.ndarray]:
-		"""Creates a full sequence by combining prompt and answer tokens."""
-		sequence = {}
-		for key in ["input_ids", "attention_mask"]:
-			sequence[key] = np.concatenate(
-				[
-					self._add_special_token(
-						prompt_tokens[f"prompt_{key}"],
-						self.tokenizer.bos_token_id,
-						start=True,
-					),
-					self._add_special_token(
-						answer_tokens[key],
-						self.tokenizer.eos_token_id,
-						start=False,
-					),
-				],
-				axis=1,
-			)
-		sequence["labels"] = self._create_labels(
-			sequence["input_ids"], len(prompt_tokens["prompt_input_ids"])
-		)
-		return sequence
-
-	def _add_special_token(
-		self,
-		array: np.ndarray,
-		token_id: int,
-		start: bool,
-	) -> np.ndarray:
-		"""Adds a special token to the start or end of an array."""
-		token = np.array([[token_id]], dtype=np.int32)
-		array = np.atleast_2d(array)
-		return np.concatenate([token, array] if start else [array, token], axis=1)
-
-	def _create_labels(self, input_ids: np.ndarray, prompt_length: int) -> np.ndarray:
-		"""Creates labels for the sequence, masking the prompt part."""
-		labels = input_ids.copy()
-		labels[:, :prompt_length] = self.arguments.label_pad_token_id
-		return labels
-
-	def _prepare_final_batch(
-		self,
-		prompt_tokens: tp.Dict[str, np.ndarray],
-		chosen_sequence: tp.Dict[str, np.ndarray],
-		rejected_sequence: tp.Dict[str, np.ndarray],
-	) -> tp.Dict[str, np.ndarray]:
-		"""Prepares the final batch by padding and truncating sequences."""
 		batch = {}
-		for prefix, tokens in [
-			("", prompt_tokens),
-			("chosen_", chosen_sequence),
-			("rejected_", rejected_sequence),
-		]:
-			for key, value in tokens.items():
-				if key == "token_type_ids":
-					continue
-				max_length = (
-					self.arguments.max_prompt_length
-					if prefix == ""
-					else self.arguments.max_completion_length
-				)
-				pad_value = (
-					self.arguments.padding_value if key in ["input_ids", "labels"] else 0
-				)
-				batch[f"{prefix}{key}"] = self._pad_and_truncate(value, max_length, pad_value)
-		return batch
+		prompt = feature["prompt"]
+		chosen = feature["chosen"]
+		rejected = feature["rejected"]
 
-	def _pad_and_truncate(
-		self,
-		array: np.ndarray,
-		max_length: int,
-		pad_value: int,
-	) -> np.ndarray:
-		"""Pads or truncates an array to the specified length."""
-		if array.shape[1] < max_length:
-			padding = np.full(
-				(array.shape[0], max_length - array.shape[1]),
-				pad_value,
-				dtype=array.dtype,
+		if not self.is_encoder_decoder:
+			if not isinstance(prompt, str):
+				raise ValueError(f"prompt should be an str but got {type(prompt)}")
+			prompt_tokens = self.processing_class(prompt, add_special_tokens=False)
+			prompt_tokens = {f"prompt_{k}": v for k, v in prompt_tokens.items()}
+
+			if not isinstance(chosen, str):
+				raise ValueError(f"chosen should be an str but got {type(chosen)}")
+			chosen_tokens = self.build_tokenized_answer(prompt, chosen)
+
+			if not isinstance(rejected, str):
+				raise ValueError(f"rejected should be an str but got {type(rejected)}")
+			rejected_tokens = self.build_tokenized_answer(prompt, rejected)
+			prompt_len_input_ids = len(prompt_tokens["prompt_input_ids"])
+
+			chosen_prompt_len_input_ids = len(chosen_tokens["prompt_input_ids"])
+			rejected_prompt_len_input_ids = len(rejected_tokens["prompt_input_ids"])
+			prompt_len_input_ids = min(
+				chosen_prompt_len_input_ids, rejected_prompt_len_input_ids
 			)
-			return np.concatenate([array, padding], axis=1)
-		return array[:, :max_length]
+
+			for k, v in prompt_tokens.items():
+				prompt_tokens[k] = v[:prompt_len_input_ids]
+			num_diff_tokens = sum(
+				[
+					a != b
+					for a, b in zip(
+						chosen_tokens["prompt_input_ids"], rejected_tokens["prompt_input_ids"]
+					)
+				]
+			)
+			num_diff_len = abs(chosen_prompt_len_input_ids - rejected_prompt_len_input_ids)
+			if num_diff_tokens > 1 or num_diff_len > 1:
+				raise ValueError(
+					"Chosen and rejected prompt_input_ids might only differ on the "
+					"last token due to tokenizer merge ops."
+				)
+			prompt_tokens, chosen_tokens, rejected_tokens = add_bos_token_if_needed(
+				self.processing_class.bos_token_id,
+				prompt_len_input_ids,
+				prompt_tokens,
+				chosen_prompt_len_input_ids,
+				chosen_tokens,
+				rejected_prompt_len_input_ids,
+				rejected_tokens,
+			)
+
+			chosen_tokens, rejected_tokens = add_eos_token_if_needed(
+				self.processing_class.eos_token_id,
+				chosen_tokens,
+				rejected_tokens,
+			)
+
+			longer_response_length = max(
+				len(chosen_tokens["input_ids"]), len(rejected_tokens["input_ids"])
+			)
+
+			for answer_tokens in [chosen_tokens, rejected_tokens, prompt_tokens]:
+				if (
+					len(answer_tokens["prompt_input_ids"]) + longer_response_length
+					> self.arguments.max_length
+				):
+					if self.truncation_mode == "keep_start":
+						for k in ["prompt_input_ids", "prompt_attention_mask"]:
+							answer_tokens[k] = answer_tokens[k][: self.arguments.max_prompt_length]
+					elif self.truncation_mode == "keep_end":
+						for k in ["prompt_input_ids", "prompt_attention_mask"]:
+							answer_tokens[k] = answer_tokens[k][-self.arguments.max_prompt_length :]
+					else:
+						raise ValueError(f"Unknown truncation mode: {self.truncation_mode}")
+			for answer_tokens in [chosen_tokens, rejected_tokens]:
+				if (
+					len(answer_tokens["prompt_input_ids"]) + longer_response_length
+					> self.arguments.max_length
+				):
+					for k in ["input_ids", "attention_mask"]:
+						answer_tokens[k] = answer_tokens[k][
+							: self.arguments.max_length - self.arguments.max_prompt_length
+						]
+			chosen_sequence_tokens = {
+				k: chosen_tokens[f"prompt_{k}"] + chosen_tokens[k]
+				for k in ["input_ids", "attention_mask"]
+			}
+			rejected_sequence_tokens = {
+				k: rejected_tokens[f"prompt_{k}"] + rejected_tokens[k]
+				for k in ["input_ids", "attention_mask"]
+			}
+			chosen_sequence_tokens["labels"] = chosen_sequence_tokens["input_ids"][:]
+			chosen_sequence_tokens["labels"][: len(chosen_tokens["prompt_input_ids"])] = [
+				self.arguments.label_pad_token_id
+			] * len(chosen_tokens["prompt_input_ids"])
+			rejected_sequence_tokens["labels"] = rejected_sequence_tokens["input_ids"][:]
+			rejected_sequence_tokens["labels"][: len(rejected_tokens["prompt_input_ids"])] = [
+				self.arguments.label_pad_token_id
+			] * len(rejected_tokens["prompt_input_ids"])
+
+			for k, toks in {
+				"chosen_": chosen_sequence_tokens,
+				"rejected_": rejected_sequence_tokens,
+				"": prompt_tokens,
+			}.items():
+				for type_key, tokens in toks.items():
+					if type_key == "token_type_ids":
+						continue
+					batch[f"{k}{type_key}"] = tokens
+
+		else:
+			chosen_tokens = self.processing_class(
+				chosen,
+				truncation=True,
+				max_length=self.arguments.max_completion_length,
+				add_special_tokens=True,
+			)
+			rejected_tokens = self.processing_class(
+				rejected,
+				truncation=True,
+				max_length=self.arguments.max_completion_length,
+				add_special_tokens=True,
+			)
+			prompt_tokens = self.processing_class(
+				prompt,
+				truncation=True,
+				max_length=self.arguments.max_prompt_length,
+				add_special_tokens=True,
+			)
+
+			batch["chosen_labels"] = chosen_tokens["input_ids"]
+			batch["rejected_labels"] = rejected_tokens["input_ids"]
+			batch["prompt_input_ids"] = prompt_tokens["input_ids"]
+			batch["prompt_attention_mask"] = prompt_tokens["attention_mask"]
+
+			if state is not None and hasattr(
+				state.model,
+				"prepare_decoder_input_ids_from_labels",
+			):
+				model = state.model
+				batch["rejected_decoder_input_ids"] = (
+					model.prepare_decoder_input_ids_from_labels(
+						labels=jnp.asarray(batch["rejected_labels"])
+					)
+				)
+				batch["chosen_decoder_input_ids"] = model.prepare_decoder_input_ids_from_labels(
+					labels=jnp.asarray(batch["chosen_labels"])
+				)
+
+		for k in batch:
+			if "labels" in k or self.is_encoder_decoder:
+				pad_value = self.arguments.label_pad_token_id
+			elif k.endswith("_input_ids"):
+				pad_value = self.padding_value
+			elif k.endswith("_attention_mask"):
+				pad_value = 0
+			batch[k] = batch[k] + [pad_value] * (self.arguments.max_length - len(batch[k]))
+		return batch
 
 	def configure_functions(self) -> TrainerConfigureFunctionOutput:
 		"""
@@ -402,6 +421,7 @@ class ORPOTrainer(Trainer):
 			is_encoder_decoder=self.arguments.is_encoder_decoder,
 			padding_value=self.arguments.padding_value,
 			label_pad_token_id=self.arguments.label_pad_token_id,
+			max_length=self.arguments.max_length,
 		)
 		jited_concatenated_forward = jax.jit(
 			partial_concatenated_forward,
@@ -409,6 +429,7 @@ class ORPOTrainer(Trainer):
 				"is_encoder_decoder",
 				"padding_value",
 				"label_pad_token_id",
+				"max_length",
 			],
 		)
 		empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=mesh)
@@ -425,6 +446,7 @@ class ORPOTrainer(Trainer):
 			),
 			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=(self.state_shardings, empty_sharding),
+			donate_argnums=(0,),
 			static_argnames=[
 				"concatenated_forward",
 				"beta",
@@ -448,7 +470,7 @@ class ORPOTrainer(Trainer):
 				loss_config=self.arguments.loss_config,
 			),
 			in_shardings=(self.state_shardings, empty_sharding),
-			out_shardings=(empty_sharding),
+			out_shardings=empty_sharding,
 			static_argnames=[
 				"concatenated_forward",
 				"beta",
@@ -474,193 +496,19 @@ class ORPOTrainer(Trainer):
 	def create_collect_function(
 		self,
 		max_sequence_length: int,
-		truncation_mode: typing.Literal["keep_end", "keep_start"] = "keep_end",
+		truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end",
 	) -> tp.Callable:
-		return self.data_collator
-
-	def configure_dataloaders(self) -> TrainerConfigureDataloaderOutput:
 		"""
-		Configures the dataloaders for training and evaluation.
+		Creates a data collection function for batching.
 
-		This method creates the training and evaluation dataloaders using the provided
-		datasets and data collator. It also determines the maximum number of training
-		and evaluation steps based on the dataset sizes and training arguments.
-
-		Returns:
-		    TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the maximum number of training and evaluation steps.
-		"""
-		dataloader_train = self.get_train_dataloader()
-		max_evaluation_steps = None
-		dataloader_eval = None
-
-		max_training_steps = (
-			self.arguments.num_train_epochs * len(dataloader_train)
-			if self.arguments.max_training_steps is None
-			else self.arguments.max_training_steps
-		)
-		if self.eval_dataset is not None:
-			dataloader_eval = self.get_eval_dataloader(self.eval_dataset)
-			max_evaluation_steps = len(dataloader_eval)
-		return TrainerConfigureDataloaderOutput(
-			dataloader_train=dataloader_train,  # type:ignore
-			max_training_steps=max_training_steps,
-			dataloader_eval=dataloader_eval,
-			max_evaluation_steps=max_evaluation_steps,
-		)
-
-	def _get_train_dataloader(self) -> TFDataset:
-		"""
-		Creates the training dataloader as a TensorFlow Dataset.
-
-		This method retrieves the training dataset, applies the data collator, and converts
-		it into a TensorFlow Dataset for efficient batching and data loading during training.
-
-		Returns:
-		    tensorflow.data.Dataset: The training dataloader.
-
-		Raises:
-		    ValueError: If the training dataset is not set.
-		"""
-
-		try:
-			import tensorflow_datasets
-		except ImportError as e:
-			raise ImportError(
-				"tensorflow_datasets is not installed, please install it by running `pip install tensorflow_datasets`"
-			) from e
-
-		if self.train_dataset is None:
-			raise ValueError("Trainer: training requires a train_dataset.")
-
-		train_dataset = self.train_dataset
-		data_collator = self.data_collator
-
-		return tensorflow_datasets.as_numpy(
-			train_dataset.to_tf_dataset(
-				batch_size=self.training_batch_size,
-				collate_fn=data_collator,
-				num_workers=self.arguments.dataloader_num_workers,
-				shuffle=True,
-				drop_remainder=True,
-			)
-		)
-
-	def _get_eval_dataloader(
-		self,
-		eval_dataset: tp.Optional[Dataset] = None,
-	) -> TFDataset:
-		"""
-		Creates the evaluation dataloader as a TensorFlow Dataset.
-
-		This method retrieves the evaluation dataset (either provided as an argument or
-		from the `self.eval_dataset` attribute), applies the data collator, and converts
-		it into a TensorFlow Dataset for efficient batching and data loading during evaluation.
+		For DPO training, this method simply returns the pre-configured `data_collator`.
 
 		Args:
-		    eval_dataset (tp.Optional[Dataset], optional):
-		        An optional evaluation dataset to use. If None, `self.eval_dataset` is used. Defaults to None.
+		    max_sequence_length (int): The maximum sequence length (not used in this implementation).
+		    truncation_mode (tp.Literal["keep_end", "keep_start"], optional):
+		        The truncation mode (not used in this implementation). Defaults to "keep_end".
 
 		Returns:
-		    tensorflow.data.Dataset: The evaluation dataloader.
-
-		Raises:
-		    ValueError: If no evaluation dataset is provided or set.
+		    tp.Callable: The data collator function.
 		"""
-
-		try:
-			import tensorflow_datasets
-		except ImportError as e:
-			raise ImportError(
-				"tensorflow_datasets is not installed, please install it by running `pip install tensorflow_datasets`"
-			) from e
-
-		if eval_dataset is None and self.eval_dataset is None:
-			raise ValueError("Trainer: evaluation requires an eval_dataset.")
-		eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
-
-		return tensorflow_datasets.as_numpy(
-			eval_dataset.to_tf_dataset(
-				batch_size=self.evaluation_batch_size,
-				collate_fn=self.data_collator,
-				num_workers=self.arguments.dataloader_num_workers,
-				shuffle=False,
-				drop_remainder=True,
-			)
-		)
-
-	def get_train_dataloader(self) -> TFDataset:
-		"""
-		Returns the training dataloader
-
-		Returns:
-		    tensorflow.data.Dataset: The training dataloader.
-		"""
-		return self._get_train_dataloader()
-
-	def get_eval_dataloader(self, eval_dataset: tp.Optional[Dataset] = None) -> TFDataset:
-		"""
-		Returns the evaluation dataloader
-		Args:
-		    eval_dataset (tp.Optional[Dataset], optional):
-		        An optional evaluation dataset to use. If None, `self.eval_dataset` is used. Defaults to None.
-
-		Returns:
-		    tensorflow.data.Dataset: The evaluation dataloader.
-		"""
-		if eval_dataset is None and self.eval_dataset is None:
-			raise ValueError("Trainer: evaluation requires an eval_dataset.")
-		eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
-		return self._get_eval_dataloader(eval_dataset=eval_dataset)
-
-	def _execute_eval_step(
-		self,
-		state: EasyDeLState,
-		batch,
-	) -> LossMetrics:
-		"""Execute a single eval step."""
-		batch = {key: jnp.asarray(value) for key, value in batch.items()}
-
-		metrics = self.sharded_evaluation_step_function(state, batch)
-		return metrics
-
-	def _execute_train_step(
-		self,
-		state: EasyDeLState,
-		batch,
-	) -> tp.Tuple[EasyDeLState, LossMetrics, Exception]:
-		"""Execute a single training step."""
-
-		try:
-			batch = {key: jnp.asarray(value) for key, value in batch.items()}
-			state, metrics = self.sharded_training_step_function(state, batch)
-			return state, metrics, None
-		except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest) as run_exception:
-			return state, metrics, run_exception
-
-
-def check_unimplemented_abstract_methods():
-	from inspect import getmembers, isfunction
-
-	base_class = BaseTrainer
-	derived_class = ORPOTrainer
-	abstract_methods = [
-		method
-		for method in getmembers(base_class, predicate=isfunction)
-		if getattr(getattr(base_class, method[0]), "__isabstractmethod__", False)
-	]
-
-	not_implemented = [
-		method[0]
-		for method in abstract_methods
-		if getattr(derived_class, method[0]) is getattr(base_class, method[0])
-	]
-	if len(not_implemented) != 0:
-		warnings.warn(
-			f"{ORPOConfig.__name__} does not implement the following abstract methods: {', '.join(not_implemented)}. "
-			f"Please ensure these methods are implemented in {ORPOConfig.__name__}.",
-			stacklevel=1,
-			category=UserWarning,
-		)
-
-
-check_unimplemented_abstract_methods()
+		return self.input_data_collator

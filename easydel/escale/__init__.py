@@ -32,6 +32,8 @@ from .partition import (
 	validate_sharding_config,
 	vrn_auto_partition_spec,
 	with_sharding_constraint,
+	extract_sharding_structure,
+	get_shardings_with_structure,
 	PartitionAxis,
 )
 
@@ -61,6 +63,8 @@ __all__ = (
 	"auto_shard_array",
 	"vrn_auto_partition_spec",
 	"with_sharding_constraint",
+	"extract_sharding_structure",
+	"get_shardings_with_structure",
 	"PartitionAxis",
 	"get_names_from_partition_spec",
 	"convert_sharding_strategy",
