@@ -1030,7 +1030,15 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 		if (step % self.arguments.log_steps == 0) or (step == 0):
 			if step == 0:
 				pbar.reset()
-			display_metrics = {k: v for k, v in metrics.items() if len(k) < 40}
+			display_metrics = {
+				k.replace("train/", "").replace("eval/", ""): v
+				for k, v in metrics.items()
+				if not (
+					k.startswith("mlperf/")
+					or k.startswith("train/grad_norm")
+					or k.startswith("eval/grad_norm")
+				)
+			}
 			# Update progress bar
 			pbar.set_postfix(**display_metrics)
 			update_size = 0 if step == 0 else self.arguments.log_steps

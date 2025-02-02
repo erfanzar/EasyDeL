@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import abc
 import os
-import pprint
 import time
 import typing as tp
 from abc import ABCMeta, abstractmethod
@@ -820,12 +819,12 @@ class JSONProgressBar(BaseProgressBar):
 	def update(self, n: int = 1) -> None: ...
 
 	def set_postfix(self, **kwargs) -> None:
-		print(self.desc, end=" - ")
-		pprint.pprint(
-			kwargs,
-			indent=2,
-			compact=True,
-		)
+		for k in list(kwargs.keys()):
+			val = kwargs.get(k)
+			if hasattr(val, "size") and val.size == 1:
+				kwargs[k] = val.item()
+
+		print(kwargs)
 
 	def reset(self) -> None: ...
 

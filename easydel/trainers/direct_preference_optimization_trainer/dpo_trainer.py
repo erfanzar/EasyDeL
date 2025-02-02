@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import typing as tp
-import warnings
 from collections import defaultdict
 from functools import partial
 
@@ -25,17 +24,18 @@ from tqdm.autonotebook import tqdm
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
+from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
+from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import ProcessingClassType
-from easydel.trainers.trainer.trainer import Trainer
 from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import deepcopy_model
 
 from ..base_trainer import (
-	BaseTrainer,
 	TrainerConfigureFunctionOutput,
 )
 from ..prompt_utils import maybe_apply_chat_template, maybe_extract_prompt
-from ..utils import DPODataCollatorWithPadding
+from ..trainer.trainer import Trainer
+from ..utils import DataCollatorForPreference
 from ._fn import concatenated_forward, evaluation_step, training_step
 from .dpo_config import DPOConfig
 
@@ -78,7 +78,6 @@ class DPOTrainer(Trainer):
 		train_dataset: tp.Optional[Dataset] = None,
 		eval_dataset: tp.Optional[Dataset] = None,
 		data_collator: tp.Optional[tp.Callable] = None,
-		dataset_map_arguments: tp.Optional[dict] = None,  
 	):
 		assert arguments is not None, (
 			"You Have to pass arguments that will be used for training but you have passed"
@@ -91,13 +90,12 @@ class DPOTrainer(Trainer):
 		assert (
 			processing_class is not None
 		), "processing_class must be specified to tokenize a DPO dataset."
-		self.arguments = arguments 
+		self.arguments = arguments
 		self.truncation_mode = arguments.truncation_mode
 		self.processing_class = processing_class
 		self.is_encoder_decoder = arguments.is_encoder_decoder
 		self._precomputed_train_ref_log_probs = False
 		self._precomputed_eval_ref_log_probs = False
-
 
 		if arguments.padding_value is not None:
 			self.padding_value = arguments.padding_value
@@ -121,7 +119,7 @@ class DPOTrainer(Trainer):
 				)
 		arguments.padding_value = self.padding_value
 		input_data_collator = (
-			DPODataCollatorWithPadding(
+			DataCollatorForPreference(
 				max_prompt_length=arguments.max_prompt_length,
 				max_completion_length=arguments.max_completion_length,  # type: ignore
 				pad_token_id=self.padding_value,  # type: ignore
@@ -134,9 +132,6 @@ class DPOTrainer(Trainer):
 		self.input_data_collator = input_data_collator
 
 		self._stored_metrics = defaultdict(lambda: defaultdict(list))
-
-		if dataset_map_arguments is None:
-			dataset_map_arguments = {}
 
 		processing_class = processing_class
 
@@ -392,42 +387,33 @@ class DPOTrainer(Trainer):
 				"loss_type",
 			],
 		)
-		if self.dataset_train is not None:
-			ds_columns = self.dataset_train.column_names
-		else:
-			ds_columns = []
 		sharded_training_step_function = jax.jit(
 			partial(
 				training_step,
 				learning_rate_fn=self.scheduler,
 				concatenated_forward=partial_concatenated_forward,
-				reference_state=self.reference_state,
 				beta=self.arguments.beta,
 				label_smoothing=self.arguments.label_smoothing,
 				loss_type=self.arguments.loss_type,
 				reference_free=self.arguments.reference_free,
-				ref_precalculated="ref_chosen_logps" in ds_columns
-				and "ref_rejected_logps" in ds_columns,
 			),
-			in_shardings=(self.state_shardings, empty_sharding),
+			in_shardings=(
+				self.state_shardings,
+				empty_sharding,
+				self.reference_state.shardings,
+			),
 			out_shardings=(self.state_shardings, empty_sharding),
 			donate_argnums=(0,),
 			static_argnames=[
 				"learning_rate_fn",
 				"concatenated_forward",
-				"reference_state",
 				"beta",
 				"label_smoothing",
 				"loss_type",
 				"reference_free",
-				"ref_precalculated",
 			],
 		)
 
-		if self.dataset_eval is not None:
-			ds_columns = self.dataset_eval.column_names
-		else:
-			ds_columns = []
 		sharded_evaluation_step_function = jax.jit(
 			partial(
 				evaluation_step,
@@ -437,19 +423,19 @@ class DPOTrainer(Trainer):
 				label_smoothing=self.arguments.label_smoothing,
 				loss_type=self.arguments.loss_type,
 				reference_free=self.arguments.reference_free,
-				ref_precalculated="ref_chosen_logps" in ds_columns
-				and "ref_rejected_logps" in ds_columns,
 			),
-			in_shardings=(self.state_shardings, empty_sharding),
+			in_shardings=(
+				self.state_shardings,
+				empty_sharding,
+				self.reference_state.shardings,
+			),
 			out_shardings=empty_sharding,
 			static_argnames=[
 				"concatenated_forward",
-				"reference_state",
 				"beta",
 				"label_smoothing",
 				"loss_type",
 				"reference_free",
-				"ref_precalculated",
 			],
 		)
 		self.arguments.ensure_checkpoint_path()
@@ -607,30 +593,70 @@ class DPOTrainer(Trainer):
 			outs = self.concatenated_forward(self.reference_state.model, batch=padded_batch)
 		return outs["chosen_logps"], outs["rejected_logps"]
 
+	def _execute_eval_step(self, state, batch) -> LossMetrics:
+		"""
+		Executes a single evaluation step.
 
-def check_unimplemented_abstract_methods():
-	from inspect import getmembers, isfunction
+		Args:
+		    state: The current model state.
+		    batch: A processed batch of evaluation data.
 
-	base_class = BaseTrainer
-	derived_class = DPOTrainer
-	abstract_methods = [
-		method
-		for method in getmembers(base_class, predicate=isfunction)
-		if getattr(getattr(base_class, method[0]), "__isabstractmethod__", False)
-	]
-
-	not_implemented = [
-		method[0]
-		for method in abstract_methods
-		if getattr(derived_class, method[0]) is getattr(base_class, method[0])
-	]
-	if len(not_implemented) != 0:
-		warnings.warn(
-			f"{DPOConfig.__name__} does not implement the following abstract methods: {', '.join(not_implemented)}. "
-			f"Please ensure these methods are implemented in {DPOConfig.__name__}.",
-			stacklevel=1,
-			category=UserWarning,
+		Returns:
+		    LossMetrics: The loss metrics computed by the sharded evaluation step function.
+		"""
+		metrics = self.sharded_evaluation_step_function(
+			state,
+			batch,
+			self.reference_state,
 		)
+		return metrics
 
+	def _execute_train_step(
+		self,
+		state,
+		batch,
+	) -> tp.Tuple[EasyDeLState, LossMetrics, Exception]:
+		"""
+		Executes a single training step.
 
-check_unimplemented_abstract_methods()
+		This function optionally updates the model's pruning module before and after the gradient step.
+		It then calls the sharded training step function to compute the gradients and update the state.
+		If an exception occurs (e.g. KeyboardInterrupt, timer error, or break request), it is captured and returned.
+
+		Args:
+		    state: The current model state.
+		    batch: A processed batch of training data.
+
+		Returns:
+		    A tuple containing:
+		        - The updated model state.
+		        - The computed LossMetrics.
+		        - An exception instance if one was raised during execution; otherwise, None.
+		"""
+		if self.pruning_module is not None:
+			state = state.replace(
+				graphstate=self.pruning_module.pre_forward_update(
+					state.graphstate,
+					state.opt_state,
+				)
+			)
+		metrics = LossMetrics()
+		try:
+			state, metrics = jax.block_until_ready(
+				self.sharded_training_step_function(
+					state,
+					batch,
+					self.reference_state,
+				)
+			)
+			# Apply post-gradient updates via the pruning module, if present.
+			if self.pruning_module is not None:
+				state = state.replace(
+					graphstate=self.pruning_module.post_gradient_update(
+						state.graphstate,
+						state.opt_state,
+					)
+				)
+			return state, metrics, None
+		except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest) as run_exception:
+			return state, metrics, run_exception

@@ -116,66 +116,61 @@ def dynamic_cross_entropy_loss(
 	label_smoothing: float = 0.0,
 ) -> tp.Tuple[jnp.ndarray, jnp.ndarray]:
 	"""
-	Comprehensive cross entropy loss implementation in Jax.
+	Cross entropy loss with support for masking, weights, and label smoothing.
 
 	Args:
 	    logits: Predicted logits (B, C) or (B, T, C)
-	    targets: Ground truth labels or probabilities
-	    weight: Optional per-class weights
-	    ignore_index: Value of tokens to ignore
+	    targets: Ground truth integer labels (B, ...) or probabilities (B, ..., C)
+	    weight: Optional per-class weights (C,)
+	    ignore_index: Value of tokens to ignore (only for integer targets)
 	    reduction: 'none', 'mean', or 'sum'
 	    label_smoothing: Smoothing factor between 0 and 1
 
 	Returns:
-	    Scalar or array loss depending on reduction
+	    Loss and accuracy (accuracy only valid for integer targets)
 	"""
 	if label_smoothing > 0:
 		num_classes = logits.shape[-1]
-		smooth_positives = 1 - label_smoothing
-		smooth_negatives = label_smoothing / (num_classes - 1)
-		if targets.dtype == jnp.int32 or targets.dtype == jnp.int64:
+		smooth_pos = 1.0 - label_smoothing
+		smooth_neg = label_smoothing / (num_classes - 1)
+		if targets.dtype in (jnp.int32, jnp.int64):
 			targets_one_hot = jax.nn.one_hot(targets, num_classes)
-			targets_one_hot = targets_one_hot * smooth_positives + smooth_negatives
+			targets_one_hot = targets_one_hot * smooth_pos + smooth_neg
 		else:
-			targets_one_hot = targets * smooth_positives + smooth_negatives
+			targets_one_hot = targets * smooth_pos + smooth_neg
 	else:
-		if targets.dtype == jnp.int32 or targets.dtype == jnp.int64:
+		if targets.dtype in (jnp.int32, jnp.int64):
 			targets_one_hot = jax.nn.one_hot(targets, logits.shape[-1])
 		else:
 			targets_one_hot = targets
-	if ignore_index is not None:
-		if targets.dtype == jnp.int32 or targets.dtype == jnp.int64:
-			mask = targets != ignore_index
-		else:
-			mask = jnp.ones_like(targets[..., 0], dtype=bool)
+	if ignore_index is not None and targets.dtype in (jnp.int32, jnp.int64):
+		mask = targets != ignore_index
 	else:
 		mask = jnp.ones_like(targets[..., 0], dtype=bool)
+
 	log_probs = jax.nn.log_softmax(logits, axis=-1)
 	losses = -jnp.sum(targets_one_hot * log_probs, axis=-1)
 	if weight is not None:
-		if targets.dtype == jnp.int32 or targets.dtype == jnp.int64:
-			losses = losses * weight[targets]
+		if targets.dtype in (jnp.int32, jnp.int64):
+			safe_targets = jnp.where(mask, targets, 0)
+			losses = losses * weight[safe_targets]
 		else:
 			losses = losses * jnp.sum(weight * targets_one_hot, axis=-1)
 	losses = losses * mask
-	if reduction == "none":
-		...
-	elif reduction == "sum":
+	if reduction == "sum":
 		losses = jnp.sum(losses)
+	elif reduction == "mean":
+		losses = jnp.sum(losses) / (jnp.sum(mask) + 1e-8)
+	if targets.dtype not in (jnp.int32, jnp.int64):
+		accuracy = jnp.array(0.0)
 	else:
-		losses = jnp.sum(losses) / jnp.sum(mask)
-	predictions = jnp.argmax(logits, axis=-1)
-
-	if ignore_index is not None:
-		valid_mask = targets != ignore_index
+		predictions = jnp.argmax(logits, axis=-1)
+		valid_mask = (
+			mask if ignore_index is not None else jnp.ones_like(targets, dtype=bool)
+		)
 		correct = jnp.sum((predictions == targets) * valid_mask)
 		total = jnp.sum(valid_mask)
-	else:
-		correct = jnp.sum(predictions == targets)
-		total = targets.size
-
-	accuracy = correct / total
-
+		accuracy = correct / (total + 1e-8)
 	return losses, accuracy
 
 

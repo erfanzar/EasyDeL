@@ -17,13 +17,13 @@ import typing as tp
 
 import jax
 import jax.numpy as jnp
+from flax.nnx import Param
 from flax.nnx.module import Module
 from flax.nnx.nn import initializers
 from flax.typing import (
 	Dtype,
 	PrecisionLike,
 )
-from flax.nnx import Param
 
 Array = jax.Array
 Axis = int

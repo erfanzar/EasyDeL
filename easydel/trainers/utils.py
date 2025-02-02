@@ -550,23 +550,14 @@ class DataCollatorForCompletionOnlyLM:
 
 
 @dataclass
-class DPODataCollatorWithPadding:
-	r"""DPO DataCollator class that pads the tokenized inputs to the maximum length of the batch.
-
-	Args:
-	    pad_token_id: int: The tokenizers pad_token_id.
-	    label_pad_token_id: int: The label used for masking.
-	    is_encoder_decoder: tp.Optional[bool]: Whether you model has an
-	        encoder_decoder architecture
-	"""
+class DataCollatorForPreference:
+	r"""DPO DataCollator class that pads the tokenized inputs to the maximum length of the batch."""
 
 	max_prompt_length: int
 	max_completion_length: int
 	pad_token_id: int = 0
 	label_pad_token_id: int = -100
 	is_encoder_decoder: tp.Optional[bool] = False
-	ids_to_pop_from_dataset: tp.Optional[dict] = None
-	auto_fix_data: bool = True
 
 	def __call__(self, features: tp.List[tp.Dict[str, tp.Any]]) -> tp.Dict[str, tp.Any]:
 		prompt_input_ids = [jnp.array(feature["prompt_input_ids"]) for feature in features]
@@ -658,6 +649,115 @@ class DPODataCollatorWithPadding:
 		return output
 
 
+@dataclass
+class DPODataCollatorWithPadding:
+	r"""
+	DPO DataCollator class that pads the tokenized inputs to the maximum length of the batch.
+	"""
+
+	max_prompt_length: int
+	max_completion_length: int
+	pad_token_id: int = 0
+	label_pad_token_id: int = -100
+	is_encoder_decoder: tp.Optional[bool] = False
+	output_arrays_only: bool = True
+	prepadded: bool = True
+
+	def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, tp.Any]:
+		camax_length = self.max_completion_length + self.max_prompt_length
+		padded_batch = {}
+		for k in features[0].keys():
+			if k.endswith(("_input_ids", "_attention_mask", "_labels", "_pixel_values")):
+				match k.split("_")[0]:
+					case "rejected":
+						max_length = self.max_completion_length
+					case "chosen":
+						max_length = self.max_completion_length
+					case "prompt":
+						max_length = self.max_prompt_length
+					case _:
+						max_length = camax_length
+
+				if self.is_encoder_decoder:
+					to_pad = [jnp.array(ex[k], dtype="i4") for ex in features]
+
+					if (k.startswith("prompt")) and (k.endswith("input_ids")):
+						if self.pad_token_id is None:
+							raise ValueError(
+								"Padding is enabled, but the tokenizer is not configured with a padding token."
+								" Explicitly set `tokenizer.pad_token` (e.g. `tokenizer.pad_token = tokenizer.eos_token`)"
+								" before calling the trainer."
+							)
+						padding_value = self.pad_token_id
+					elif k.endswith("_attention_mask"):
+						padding_value = 0
+					elif k.startswith(("chosen", "rejected", "completion")) or ("decoder" in k):
+						padding_value = self.label_pad_token_id
+					else:
+						raise ValueError(f"Unexpected key in batch '{k}'")
+
+					padded_batch[k] = pad_sequence(
+						to_pad,
+						batch_first=False,
+						padding_value=padding_value,
+						max_len=None if self.prepadded else max_length,
+					)
+				else:
+					if k.endswith("_input_ids"):
+						if self.pad_token_id is None:
+							raise ValueError(
+								"Padding is enabled, but the tokenizer is not configured with a padding token."
+								" Explicitly set `tokenizer.pad_token` (e.g. `tokenizer.pad_token = tokenizer.eos_token`)"
+								" before calling the trainer."
+							)
+						padding_value = self.pad_token_id
+					elif k.endswith("_labels"):
+						padding_value = self.label_pad_token_id
+					elif k.endswith("_attention_mask"):
+						padding_value = 0
+					elif k.endswith("_pixel_values"):
+						padding_value = 0
+					else:
+						raise ValueError(f"Unexpected key in batch '{k}'")
+
+					if k in ["prompt_input_ids", "prompt_attention_mask"]:
+						padding_side = "left"
+					else:
+						padding_side = "right"
+					if k.endswith("_pixel_values"):
+						dtype = jnp.float32
+					else:
+						dtype = jnp.int32
+
+					to_pad = [jnp.array(ex[k], dtype=dtype) for ex in features]
+
+					padded_batch[k] = pad(
+						to_pad,
+						None if self.prepadded else max_length,
+						padding_value=padding_value,
+						padding_side=padding_side,
+					)
+			elif k.endswith("_logps"):
+				padded_batch[k] = jnp.array([ex[k] for ex in features])
+			else:
+				padded_batch[k] = [ex[k] for ex in features]
+			if self.output_arrays_only:
+				val = padded_batch.get(k)
+				if hasattr(val, "dtype"):
+					if val.dtype not in [
+						jnp.float64,
+						jnp.float32,
+						jnp.float16,
+						jnp.int32,
+						jnp.int16,
+						jnp.int8,
+					]:
+						padded_batch.pop(k)
+				else:
+					padded_batch.pop(k)
+		return padded_batch
+
+
 def shift_and_pad(mask, *tensors):
 	for i in range(mask.shape[0]):
 		first_one_idx = np.nonzero(mask[i])[0][0].item()
@@ -673,7 +773,7 @@ def shift_and_pad(mask, *tensors):
 
 def pad(
 	tensors: list[jnp.ndarray],
-	max_lenght: int,
+	max_lenght: tp.Optional[int],
 	padding_value: int = 0,
 	padding_side: str = "right",
 ) -> jnp.ndarray:
@@ -681,7 +781,11 @@ def pad(
 	Pads a list of tensors to the same shape along the first dimension.
 	"""
 	output_shape = tensors[0].shape[:-1]
-	output_shape += (max_lenght,)
+	current_max = tensors[0].shape[-1]
+	if max_lenght is None:
+		max_lenght = current_max
+	x_lenght = max(current_max, max_lenght)
+	output_shape += (x_lenght,)
 	output = jnp.full(
 		(len(tensors), *output_shape),
 		padding_value,
@@ -697,6 +801,13 @@ def pad(
 
 		slices = (i,) + (seq_slice,) + tuple(slice(0, s) for s in t.shape[1:])
 		output = output.at[slices].set(t)
+
+	if padding_side == "left":
+		output = output[..., -max_lenght:]
+	elif padding_side == "right":
+		output = output[..., :max_lenght]
+	else:
+		raise ValueError("padding_side must be 'left' or 'right'")
 	return output
 
 
@@ -930,19 +1041,6 @@ def first_true_indices(bools, dtype=jnp.int32):
 	"""
 	Takes an N-dimensional bool array and returns an (N-1)-dimensional array of integers giving
 	the position of the first True in each "row".
-
-	Returns the length of the rows (bools.shape[-1]) if no element is True in a given row.
-
-	Args:
-	    bools (jax.Array):
-	        An N-dimensional boolean array.
-	    dtype (jnp.dtype, optional):
-	        The desired data type of the output array. Defaults to `jnp.int32`.
-
-	Returns:
-	    jax.Array:
-	        An (N-1)-dimensional array of integers indicating the position of the first True
-	        in each row. If no True value is found in a row, returns the length of the row.
 	"""
 	row_len = bools.shape[-1]
 	zero_or_index = row_len * (~bools).astype(dtype) + jnp.arange(row_len, dtype=dtype)
@@ -952,21 +1050,6 @@ def first_true_indices(bools, dtype=jnp.int32):
 def truncate_right(input_ids, stop_token_id, pad_token_id):
 	"""
 	Truncates the input array from the right side after the first occurrence of the stop token.
-
-	Args:
-	    input_ids (jax.Array):
-	        The array containing the responses to be truncated
-	    stop_token_id (int):
-	        The token ID representing the stop token where truncation occurs
-	    pad_token_id (int):
-	        The token ID representing the pad token used to fill the truncated responses
-
-	Returns:
-	    tuple:
-	        - output_ids (jax.Array):
-	            The truncated responses array with pad tokens filled after the stop token
-	        - mask (jax.Array):
-	            The mask array to indicate the padding tokens
 	"""
 	trunc_idxs = first_true_indices(input_ids == stop_token_id).reshape((-1, 1))
 	idxs = jnp.arange(input_ids.shape[1]).reshape((1, -1))

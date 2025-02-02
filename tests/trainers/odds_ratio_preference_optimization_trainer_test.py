@@ -105,17 +105,16 @@ def create_orpo_config(sequence_length=SEQUENCE_LENGTH, learning_rate=LEARNING_R
 def orpo_main():
 	# Device selection (choose GPU if available, else CPU)
 
-	model, tokenizer = create_model_and_tokenizer()
+	model, processing_class = create_model_and_tokenizer()
 	train_dataset, eval_dataset = create_datasets()
 	orpo_config = create_orpo_config()
-	if tokenizer.chat_template is None:
-		tokenizer.chat_template = "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
+	if processing_class.chat_template is None:
+		processing_class.chat_template = "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
 	trainer = ed.ORPOTrainer(
 		model=model,
 		train_dataset=train_dataset,
 		eval_dataset=eval_dataset,
-		tokenizer=tokenizer,
-		dataset_num_proc=4,
+		processing_class=processing_class, 
 		arguments=orpo_config,
 	)
 

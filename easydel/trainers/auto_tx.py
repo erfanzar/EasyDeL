@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import typing as tp
 
 import fjformer.optimizers
@@ -25,9 +26,40 @@ from easydel.infra.etils import (
 )
 
 
+def filter_kwargs(fn, kwargs):
+	"""
+	Filters the kwargs to only include the ones that match parameters in fn's signature.
+
+	Args:
+	    fn: The function whose signature is used to filter kwargs.
+	    kwargs: The dictionary of keyword arguments to filter.
+
+	Returns:
+	    A filtered dictionary containing only kwargs accepted by fn.
+	"""
+	sig = inspect.signature(fn)
+	if any(param.kind == param.VAR_KEYWORD for param in sig.parameters.values()):
+		return kwargs
+
+	allowed_keys = {
+		name
+		for name, param in sig.parameters.items()
+		if param.kind
+		in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD, param.KEYWORD_ONLY)
+	}
+
+	filtered = {}
+	for k, v in kwargs.items():
+		if k in allowed_keys:
+			filtered[k] = v
+		else:
+			print(f"Removing unexpected kwarg: {k}")
+	return filtered
+
+
 def get_optimizer_and_scheduler(
-	optimizer: AVAILABLE_OPTIMIZERS,
-	scheduler: AVAILABLE_SCHEDULERS,
+	optimizer: "AVAILABLE_OPTIMIZERS",
+	scheduler: "AVAILABLE_SCHEDULERS",
 	steps: int,
 	learning_rate: float = 1e-5,
 	learning_rate_end: float = 1e-5,
@@ -39,23 +71,23 @@ def get_optimizer_and_scheduler(
 	**kwargs,
 ):
 	"""The get_optimizer_and_scheduler function is a helper function that returns an optimizer and scheduler
-		based on the parameters passed to it.
+	based on the parameters passed to it.
 
 	Args:
-		optimizer: AVAILABLE_OPTIMIZERS: Choose the optimizer
-		scheduler: AVAILABLE_SCHEDULERS: Determine the learning rate scheduler
-		steps: int: Specify the number of steps in the training process
-		learning_rate: float: Set the learning rate for the optimizer
-		learning_rate_end: float: Set the final learning rate
-		gradient_accumulation_steps: int: Accumulate the gradients before updating the weights
-		weight_decay: float: Set the weight decay for adamw optimizer
-		warmup_steps: int: Specify the number of steps to warm up the learning rate
-		clip_grad (Optional[float]): If provided, gradients will be clipped to this maximum norm.
-		mu_dtype (Optional[jax.numpy.dtype]): The dtype for the optimizer.
-		**kwargs: Pass extra arguments to the optimizer
+	    optimizer: AVAILABLE_OPTIMIZERS: Choose the optimizer
+	    scheduler: AVAILABLE_SCHEDULERS: Determine the learning rate scheduler
+	    steps: int: Specify the number of steps in the training process
+	    learning_rate: float: Set the learning rate for the optimizer
+	    learning_rate_end: float: Set the final learning rate
+	    gradient_accumulation_steps: int: Accumulate the gradients before updating the weights
+	    weight_decay: float: Set the weight decay for adamw optimizer
+	    warmup_steps: int: Specify the number of steps to warm up the learning rate
+	    clip_grad (Optional[float]): If provided, gradients will be clipped to this maximum norm.
+	    mu_dtype (Optional[jax.numpy.dtype]): The dtype for the optimizer.
+	    **kwargs: Pass extra arguments to the optimizer
 
 	Returns:
-		A tuple of two objects: (Optimizer and scheduler)
+	    A tuple of two objects: (Optimizer and scheduler)
 	"""
 	optimizer_kwargs = {
 		"learning_rate": learning_rate,
@@ -122,6 +154,8 @@ def get_optimizer_and_scheduler(
 	optimizer_fn = get_optimizer_fn(optimizer, scheduler)
 	if optimizer_fn is None:
 		raise ValueError(f"Invalid optimizer {optimizer} or scheduler {scheduler}")
+
+	optimizer_kwargs = filter_kwargs(optimizer_fn, optimizer_kwargs)
 
 	tx, sc = optimizer_fn(**optimizer_kwargs)
 	return tx, sc

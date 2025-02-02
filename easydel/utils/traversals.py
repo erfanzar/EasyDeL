@@ -14,9 +14,9 @@
 
 """Utility functions for managing and manipulating nnx module states."""
 
-from copy import deepcopy
 import typing as tp
 from collections.abc import Iterable
+from copy import deepcopy
 
 import chex
 import jax
