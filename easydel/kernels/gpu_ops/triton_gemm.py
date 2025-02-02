@@ -235,7 +235,7 @@ try:
 	_triton_gemm = triton.autotune(configs=_get_autotune_config(), key=["M", "N", "K"])(
 		_triton_gemm
 	)
-except ModuleNotFoundError:
+except Exception:
 	...
 
 
