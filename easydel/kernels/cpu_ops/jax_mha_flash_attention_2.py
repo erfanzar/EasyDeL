@@ -26,10 +26,10 @@ import jax
 import jax.numpy as jnp
 import jax.random as jrand
 import jax.sharding
-from fjformer import GenerateRNG
+from eformer.escale import with_sharding_constraint
 from jax import lax
 
-from easydel.escale import with_sharding_constraint
+from easydel.utils import GenerateRNG
 
 rng = GenerateRNG()
 

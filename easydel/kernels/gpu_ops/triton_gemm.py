@@ -15,7 +15,7 @@
 
 from functools import partial
 
-import fjformer.jax_triton as jt
+from eformer.callib import triton_call
 import jax
 import triton
 from jax import core as jcore
@@ -319,7 +319,7 @@ def _triton_call_gemm(A, B):
 		N=N,
 		K=K,
 	)
-	return jt.triton_call(
+	return triton_call(
 		A,
 		B,
 		kernel=_triton_gemm,

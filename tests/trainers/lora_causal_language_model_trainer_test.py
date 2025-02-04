@@ -6,9 +6,7 @@ dirname = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(dirname, "..", ".."))
 
 import logging
-from functools import partial
 
-import fjformer
 import flax
 import jax
 import jax.numpy as jnp
@@ -35,17 +33,6 @@ NUM_TRAIN_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
 NUM_EVAL_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
 MAX_TRAINING_STEPS = NUM_TRAIN_EXAMPLES // TOTAL_BATCH_SIZE * NUM_TRAIN_EPOCHS
 MAX_EVALUATION_STEPS = NUM_EVAL_EXAMPLES // TOTAL_BATCH_SIZE
-PURNING_MODULE = (
-	fjformer.jaxpruner.MagnitudePruning(
-		sparsity_distribution_fn=partial(
-			fjformer.jaxpruner.sparsity_distributions.uniform,
-			sparsity=0.8,
-		),
-		scheduler=fjformer.jaxpruner.sparsity_schedules.OneShotSchedule(0),
-	)
-	if False
-	else None
-)  # Not Supported Yet in new version
 
 
 def create_model(sequence_length=SEQUENCE_LENGTH, dtype=jnp.float32):
@@ -138,7 +125,6 @@ def create_training_args(
 		scheduler=ed.EasyDeLSchedulers.COSINE,
 		clip_grad=1.0,
 		warmup_steps=warmup_steps,
-		pruning_module=PURNING_MODULE,
 	)
 	logging.info("Training arguments created.")
 	return training_args

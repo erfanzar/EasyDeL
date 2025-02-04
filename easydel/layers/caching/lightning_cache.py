@@ -16,10 +16,10 @@ from __future__ import annotations
 import typing as tp
 
 import chex as cx
-from fjformer.core import ImplicitArray
+from eformer.jaximus import ArrayValue
 
 if tp.TYPE_CHECKING:
-	from easydel.utils.quantizers import EasyQuantizer
+	from easydel.layers.quantization.quantizers import EasyQuantizer
 else:
 	EasyQuantizer = object
 
@@ -68,7 +68,7 @@ class LightningCacheMetaData:
 
 @cx.dataclass
 class LightningCacheView:
-	key_value: tp.Union[cx.Array, ImplicitArray]
+	key_value: tp.Union[cx.Array, ArrayValue]
 	metadata: LightningCacheMetaData
 	layer_index: tp.Optional[int] = None
 

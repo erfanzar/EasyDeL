@@ -180,6 +180,7 @@ class PhiAttention(FlaxAttentionModule):
 			force_float32_tpu=True,
 			attn_mechanism=self.config.attn_mechanism,
 			dtype=self.config.attn_dtype,
+			softmax_dtype=self.config.attn_softmax_dtype,
 			partition_axis=self.config.partition_axis,
 			scan_ring_attention=self.config.scan_ring_attention,
 			mesh=self.config.mesh,

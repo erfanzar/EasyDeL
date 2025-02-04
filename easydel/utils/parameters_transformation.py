@@ -33,7 +33,6 @@ from .traversals import flatten_dict, unflatten_dict
 
 if tp.TYPE_CHECKING:
 	from transformers import PreTrainedModel
-
 	from easydel.infra.base_config import EasyDeLBaseConfig
 	from easydel.infra.base_module import EasyDeLBaseModule
 
@@ -204,6 +203,7 @@ def torch_dict_to_easydel_params(
 	shard_fns: tp.Optional[tp.Mapping[tuple, tp.Callable]] = None,
 	dtype: jnp.dtype = jnp.float16,
 	verbose: bool = True,
+	callback: tp.Optional[tp.Callable[[jax.Array, tuple], jax.Array]] = None,
 	remove_state_dict: bool = False,
 	lm_head_name: tp.Optional[str] = None,
 	uses_tie_word_embedding: bool = False,
@@ -222,6 +222,7 @@ def torch_dict_to_easydel_params(
 	    params_pattern_selection: Regex pattern for parameter selection
 	    dtype: Target dtype for parameters
 	    verbose: Whether to show progress bar
+			callback: callback for tensors after they are converted to a jax array.
 	    remove_state_dict: Whether to delete state_dict after conversion
 	    lm_head_name: Name of language model head
 	    uses_tie_word_embedding: Whether model uses tied embeddings
@@ -265,6 +266,8 @@ def torch_dict_to_easydel_params(
 						key_tuple, jax_array = result
 						if shard_fns and key_tuple in shard_fns:
 							jax_array = shard_fns[key_tuple](jax_array)
+						if callback is not None:
+							jax_array = callback(jax_array, key_tuple)
 						flax_dict[key_tuple] = jax_array
 				except Exception as e:
 					print(f"Error processing key {key}: {str(e)}")
@@ -293,6 +296,10 @@ def module_to_torch(module: EasyDeLBaseModule, dtype: jnp.dtype = jnp.float16):
 			continue
 
 		if tensor.dtype != get_dtype(dtype):
+			if hasattr(tensor, "materialize"):
+				tensor = tensor.materialize()
+			if hasattr(tensor, "value") and hasattr(tensor.value, "materialize"):
+				tensor = tensor.value.materialize()
 			tensor = tensor.astype(get_dtype(dtype))
 
 		tensor = jax2pt(jax.block_until_ready(tensor))

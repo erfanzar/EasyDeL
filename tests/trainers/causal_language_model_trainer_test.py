@@ -7,9 +7,7 @@ dirname = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(dirname, "..", ".."))
 
 import logging
-from functools import partial
 
-import fjformer
 import flax
 import jax.numpy as jnp
 from datasets import Dataset, IterableDataset
@@ -35,17 +33,6 @@ NUM_TRAIN_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
 NUM_EVAL_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
 MAX_TRAINING_STEPS = NUM_TRAIN_EXAMPLES // TOTAL_BATCH_SIZE * NUM_TRAIN_EPOCHS
 MAX_EVALUATION_STEPS = NUM_EVAL_EXAMPLES // TOTAL_BATCH_SIZE
-PURNING_MODULE = (
-	fjformer.jaxpruner.MagnitudePruning(
-		sparsity_distribution_fn=partial(
-			fjformer.jaxpruner.sparsity_distributions.uniform,
-			sparsity=0.8,
-		),
-		scheduler=fjformer.jaxpruner.sparsity_schedules.OneShotSchedule(0),
-	)
-	if False
-	else None
-)  # Not Supported Yet in new version
 
 
 def create_model(sequence_length=SEQUENCE_LENGTH, dtype=jnp.float32):
@@ -53,14 +40,13 @@ def create_model(sequence_length=SEQUENCE_LENGTH, dtype=jnp.float32):
 	logging.info("Creating model...")
 	config = ed.Xerxes2Config(
 		vocab_size=32000,
-		# head_dim=16,
 		hidden_size=64,
 		num_attention_heads=8,
-		# num_key_value_heads=4,
 		num_hidden_layers=4,
 		intermediate_size=128,
 		max_position_embeddings=sequence_length,
-		attn_dtype=dtype,
+		attn_dtype=jnp.float32,
+		attn_softmax_dtype=jnp.float32,
 		attn_mechanism=ed.AttentionMechanisms.VANILLA,
 	)
 
@@ -138,7 +124,6 @@ def create_training_args(
 		scheduler=ed.EasyDeLSchedulers.COSINE,
 		clip_grad=1.0,
 		warmup_steps=warmup_steps,
-		pruning_module=PURNING_MODULE,
 	)
 	logging.info("Training arguments created.")
 	return training_args

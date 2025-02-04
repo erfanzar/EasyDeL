@@ -1,40 +1,34 @@
 import gc
 import os
-import typing as tp
 
 # os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=64"
 # os.environ["CUDA_VISIBLE_DEVICES"] = ""
 # os.environ["JAX_PLATFORMS"] = "cpu"
-
 import sys
+import typing as tp
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-
+import copy
 import time
 import unittest
 
 import jax
-
-import easydel as ed
 import jax.extend
 import jax.random
-
-import copy
-
-import jax
 import numpy as np
 import torch
 import transformers
-from fjformer.functions import cross_entropy_loss_and_accuracy
 from flax import nnx as nn
 from jax import numpy as jnp
 from tabulate import tabulate
 
+import easydel as ed
 from easydel.infra.etils import (
 	AVAILABLE_ATTENTION_MECHANISMS,
 	DEFAULT_ATTENTION_MECHANISM,
 	EasyDeLGradientCheckPointers,
 )
+from easydel.infra.loss_utils import cross_entropy_loss_and_accuracy
 
 torch.manual_seed(42)
 
@@ -88,9 +82,8 @@ class EasyModelsTest(unittest.TestCase):
 		self.header_config = None
 		self.pad_token_id = None
 		self.rope_scaling = None
-		self.attn_dtype = (
-			jnp.float16 if jax.extend.backend.get_backend().platform == "gpu" else jnp.float32
-		)
+		self.attn_dtype = jnp.float32
+		self.attn_softmax_dtype = jnp.float32
 		self.platform = "triton"
 
 	def create_test_for_models(self, module_name: str, hf_module_class, task):

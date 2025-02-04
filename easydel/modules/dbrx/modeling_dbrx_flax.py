@@ -20,7 +20,7 @@ from functools import cached_property
 import chex
 import jax
 import jax.numpy as jnp
-from fjformer.functions import auxiliary_load_balancing_loss_func
+from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule

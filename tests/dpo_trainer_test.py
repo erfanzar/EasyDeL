@@ -13,24 +13,19 @@ logger = logging.getLogger(__name__)
 
 
 def main():
-	# Define the repository for the pretrained model
 	REPO = "Qwen/Qwen2.5-0.5B-Instruct"
 	logger.info("Loading tokenizer from the repository.")
 
-	# Load the tokenizer from the repository
 	tokenizer = AutoTokenizer.from_pretrained(REPO)
 
-	# Define model configuration parameters
-	model_config = ed.EasyDeLBaseConfigDict(
-		attn_mechanism="vanilla",
-		attn_dtype=jnp.float32,
-	)
-
 	logger.info("Loading model with specified configuration and precision settings.")
-	# Load the model with the given configuration and precision settings
 	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		REPO,
-		config_kwargs=model_config,
+		config_kwargs=ed.EasyDeLBaseConfigDict(
+			attn_mechanism="vanilla",
+			attn_dtype=jnp.float32,
+			attn_softmax_dtype=jnp.float32,
+		),
 		precision=jax.lax.Precision.HIGHEST,
 		dtype=jnp.float32,
 		param_dtype=jnp.float32,

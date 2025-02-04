@@ -23,11 +23,10 @@ import flax
 import flax.struct
 import jax
 import jax.numpy as jnp
+from eformer.escale import PartitionAxis
+from eformer.escale.partition.constraints import with_sharding_constraint
 from jax import lax
 from jax.sharding import PartitionSpec
-
-from easydel.escale import PartitionAxis
-from easydel.escale.partition.constraints import with_sharding_constraint
 
 
 @enum.unique

@@ -19,12 +19,12 @@ import typing as tp
 
 import chex
 import jax
-from fjformer.functions import auxiliary_load_balancing_loss_func
 from flax import nnx as nn
 from jax import numpy as jnp
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import register_module
+from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
 	MoeCausalLMOutput,
 	MoeModelOutput,
@@ -105,6 +105,7 @@ class MixtralAttention(FlaxAttentionModule):
 			force_float32_tpu=True,
 			attn_mechanism=self.config.attn_mechanism,
 			dtype=self.config.attn_dtype,
+			softmax_dtype=self.config.attn_softmax_dtype,
 			partition_axis=self.config.partition_axis,
 			scan_ring_attention=self.config.scan_ring_attention,
 			mesh=self.config.mesh,

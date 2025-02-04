@@ -22,16 +22,16 @@ switch between them and experiment with different configurations.
 **How it Works:**
 
 1. **Initialization:**
-    - During initialization, you provide the desired `attn_mechanism`, JAX `mesh` for sharding, scaling
+    * During initialization, you provide the desired `attn_mechanism`, JAX `mesh` for sharding, scaling
       factor (`sm_scale`), number of attention heads, head dimensions, and other configuration parameters.
-    - The class automatically sets default values for many parameters based on the chosen attention mechanism and the
+    * The class automatically sets default values for many parameters based on the chosen attention mechanism and the
       provided EasyDeL configuration (`base_module_class`).
 2. **Calling the Module:**
-    - When you call the `FlexibleAttentionModule` object, you pass in the query, key, and value states, along with optional
+    * When you call the `FlexibleAttentionModule` object, you pass in the query, key, and value states, along with optional
       parameters like attention masks, biases, and causal flags.
-    - The module internally selects the appropriate attention function based on the specified `attn_mechanism`.
-    - It performs any necessary sharding and partitioning based on the configured partition specifications.
-    - The attention computation is executed, and the attention outputs (and optionally attention weights) are returned.
+    * The module internally selects the appropriate attention function based on the specified `attn_mechanism`.
+    * It performs any necessary sharding and partitioning based on the configured partition specifications.
+    * The attention computation is executed, and the attention outputs (and optionally attention weights) are returned.
 
 **Advantages:**
 
@@ -50,6 +50,7 @@ the best possible performance and numerical stability, here are some strategies 
 ## Testing which Attention Module works best
 
 in order to test which attention module in what axis dims works best for you you can run
+
 ```python
 from easydel import FlexibleAttentionModule
 
@@ -69,15 +70,13 @@ print(
 
 ```python
 import jax
-import flax.nnx.attention as flt
-from fjformer import GenerateRNG
+import flax.nnx.attention as flt 
 from easydel import PartitionAxis
 from easydel.layers.attention import FlexibleAttentionModule, FlaxAttentionModule
 from easydel.modules.easydel_modelling_utils import EasyDeLBaseConfig
 from jax import numpy as jnp, random, lax
 import math
-
-rng_gen = GenerateRNG(seed=42)
+ 
 config = EasyDeLBaseConfig(
     axis_dims=(1, -1, 1, 1),
     axis_names=("dp", "fsdp", "tp", "sp"),
@@ -97,9 +96,9 @@ def make_fake_input_data(
         context_length: int,
         head_dim: int,
 ):
-    q = random.normal(next(rng_gen), (batch_size, context_length, num_attention_head, head_dim), dtype=jnp.float32)
-    k = random.normal(next(rng_gen), (batch_size, context_length, num_attention_head, head_dim), dtype=jnp.float32)
-    v = random.normal(next(rng_gen), (batch_size, context_length, num_attention_head, head_dim), dtype=jnp.float32)
+    q = random.normal(random.key(0), (batch_size, context_length, num_attention_head, head_dim), dtype=jnp.float32)
+    k = random.normal(random.key(1), (batch_size, context_length, num_attention_head, head_dim), dtype=jnp.float32)
+    v = random.normal(random.key(2), (batch_size, context_length, num_attention_head, head_dim), dtype=jnp.float32)
 
     attention_mask = jnp.ones((batch_size, context_length))
     causal_mask = flt.make_causal_mask(attention_mask)

@@ -30,7 +30,7 @@ import chex
 import jax
 import numpy as np
 import triton
-from fjformer.jax_triton import triton_call
+from eformer.callib import triton_call
 from jax import custom_vjp
 from jax import numpy as jnp
 from jax import random as jrnd

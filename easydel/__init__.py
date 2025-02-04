@@ -86,9 +86,7 @@ from packaging.version import Version as _Version
 
 # fmt: off
 from . import utils # utils should be improted first to prevent circular imports
-from . import escale
 # fmt: on
-from .escale import PartitionAxis
 from .inference.vinference import (
 	vInference,
 	vInferenceApiServer,
@@ -365,15 +363,17 @@ from .utils.parameters_transformation import (
 	torch_dict_to_easydel_params,
 )
 
-_targeted_versions = ["0.0.91"]
+_targeted_versions = ["0.0.4"]
 
-from fjformer import __version__ as _fjformer_version
+from eformer import __version__ as _eform_version
+from eformer import escale
+from eformer.escale import PartitionAxis
 
-assert _Version(_fjformer_version) in [
+assert _Version(_eform_version) in [
 	_Version(_targeted_version) for _targeted_version in _targeted_versions
 ], (
-	f"this version of EasyDeL is only compatible with fjformer {', '.join(_targeted_versions)},"
-	f" but found fjformer {_fjformer_version}"
+	f"this version of EasyDeL is only compatible with eformer {', '.join(_targeted_versions)},"
+	f" but found eformer {_eform_version}"
 )
 import jax as _jax
 
@@ -389,4 +389,4 @@ if _jax.default_backend() == "gpu":
 		)
 del _jax
 del _Version
-del _fjformer_version
+del _eform_version

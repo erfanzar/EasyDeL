@@ -36,6 +36,7 @@ def main():
 			param_dtype = jnp.float16
 		attn_kwargs = dict(
 			attn_dtype=jnp.float16,
+			attn_softmax_dtype=jnp.float16,
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		)
 
@@ -44,6 +45,7 @@ def main():
 		param_dtype = jnp.bfloat16
 		attn_kwargs = dict(
 			attn_dtype=jnp.float32,
+			attn_softmax_dtype=jnp.float32,
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 			# attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
 			# blocksize_q=512,
@@ -63,8 +65,10 @@ def main():
 		config_kwargs=ed.EasyDeLBaseConfigDict(
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
+			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 			**attn_kwargs,
 		),
+		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 		param_dtype=param_dtype,
 		dtype=dtype,
 		partition_axis=partition_axis,
@@ -97,7 +101,7 @@ def main():
 		print("Compiling")
 		inference.precompile(1, inference.model_prefill_length)
 		print("Done Compiling")
-	if os.environ.get("USE_CHAT_TEMPLATE", "false") in ["true", "yes"]:
+	if os.environ.get("USE_CHAT_TEMPLATE", "true") in ["true", "yes"]:
 		messages = [
 			{
 				"role": "system",

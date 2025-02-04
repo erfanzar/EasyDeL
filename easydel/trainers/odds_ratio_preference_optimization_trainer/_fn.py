@@ -15,11 +15,11 @@ import typing as tp
 
 import chex
 import jax
+from eformer.escale import with_sharding_constraint
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
-from easydel.escale import with_sharding_constraint
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics, dynamic_cross_entropy_loss
 from easydel.trainers.training_utils import (

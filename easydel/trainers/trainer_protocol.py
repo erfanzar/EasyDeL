@@ -28,7 +28,6 @@ import jax
 import numpy as np
 import optax
 import tqdm
-from fjformer.checkpoint import CheckpointManager
 from jax.sharding import Mesh
 from optax import GradientTransformation, Schedule
 from rich.progress import (
@@ -42,6 +41,7 @@ from rich.text import Text
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import CompilationTracker
+from easydel.utils.checkpoint_managers.streamer import CheckpointManager
 from easydel.utils.traversals import flatten_dict
 
 try:

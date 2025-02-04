@@ -22,7 +22,6 @@ from contextlib import contextmanager
 from functools import lru_cache, partial
 from typing import List, Set
 
-import fjformer
 import flax
 import flax.core
 import jax
@@ -31,13 +30,13 @@ import jax.tree_util
 import numpy as np
 from aqt.jax.v2 import config as q_config
 from aqt.jax.v2.flax import aqt_flax as q_flax
+from eformer.escale import PartitionAxis, with_sharding_constraint
 from einops import rearrange
 from flax import nnx as nn
 from jax.core import Jaxpr
 from jax.sharding import PartitionSpec
 from tqdm.auto import tqdm
 
-from easydel.escale import PartitionAxis, with_sharding_constraint
 from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
@@ -478,15 +477,6 @@ def unwrap_lora_to_layers(
 		pbar.update(1)
 
 	return model
-
-
-def print_pytree(pytree):
-	jax.tree_util.tree_map_with_path(
-		lambda p, v: print(
-			f"{fjformer.tree_path_to_string(p, '.')}: dtype:{v.dtype}, shape:{v.shape}"
-		),
-		pytree,
-	)
 
 
 def apply_sparsity_to_params(

@@ -159,7 +159,7 @@ class EasyGenerationMixin:
 
 	@cached_property
 	def _quant_class(self):
-		from easydel.utils.quantizers import EasyQuantizer
+		from easydel.layers.quantization.quantizers import EasyQuantizer
 
 		return EasyQuantizer
 

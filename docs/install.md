@@ -1,6 +1,6 @@
 # Installing EasyDeL
 
-EasyDeL uses FJFormer and JAX as main dependencies in order to run the scripts but there are some packages that needs to
+EasyDeL uses EFormer and JAX as main dependencies in order to run the scripts but there are some packages that needs to
 be installed such as GO-lang to JAX specific platform installations, but you can simply install EasyDeL via pip:
 
 ```shell
@@ -12,21 +12,6 @@ or install from head
 ```shell
 pip install git+https://github.com/erfanzar/EasyDeL.git -U -q
 ```
-
-### Tensorflow Issues for EasyDeL>=0.0.80
-EasyDeL uses tensorflow for dataloaders and streamers so they are not in main process 
-and latest tensorflow version and `jax>=0.4.34` which is recommended for easydel, they have package conflicts 
-and here's how you should install easydel in case that your facing this issue.
-
-```shell
-pip uninstall easydel -y
-pip install git+https://github.com/erfanzar/EasyDeL.git -q -U
-pip install jax[tpu]==0.4.35 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q -U
-python -c 'import easydel;print(True)' 
-```
-
-(you can change the TPU jax installation to `pip install --upgrade "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html` if you want)
-
 
 ## Installing Jax
 
@@ -44,6 +29,7 @@ inorder to install jax on TPU Devices use following command
 ```
 
 ### GPU
+
 inorder to install jax on cuda 12 use following command
 
 ```shell

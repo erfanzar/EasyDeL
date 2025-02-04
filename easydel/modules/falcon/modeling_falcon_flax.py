@@ -171,6 +171,7 @@ class FalconAttention(FlaxAttentionModule):
 			force_float32_tpu=True,
 			attn_mechanism=config.attn_mechanism,
 			dtype=self.config.attn_dtype,
+			softmax_dtype=self.config.attn_softmax_dtype,
 			mesh=config.mesh,
 			sm_scale=self.inv_norm_factor,
 			axis_name=config.attention_axis_name,

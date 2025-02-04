@@ -15,11 +15,10 @@
 import typing as tp
 
 import chex as cx
-from fjformer.core import ImplicitArray
+from eformer.escale import PartitionAxis, with_sharding_constraint
+from eformer.jaximus import ArrayValue
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-
-from easydel.escale import PartitionAxis, with_sharding_constraint
 
 
 @cx.dataclass
@@ -74,8 +73,8 @@ class MambaCacheMetaData:
 
 @cx.dataclass
 class MambaCacheView:
-	conv_states: tp.Union[cx.Array, ImplicitArray]
-	ssm_states: tp.Union[cx.Array, ImplicitArray]
+	conv_states: tp.Union[cx.Array, ArrayValue]
+	ssm_states: tp.Union[cx.Array, ArrayValue]
 	positions: cx.Array
 	metadata: MambaCacheMetaData
 	layer_index: tp.Optional[int] = None

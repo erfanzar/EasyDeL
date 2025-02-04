@@ -20,11 +20,11 @@ from functools import cached_property
 import chex
 import jax
 import jax.numpy as jnp
-from fjformer.functions import auxiliary_load_balancing_loss_func
 from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import register_module
+from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
 	MoeCausalLMOutput,
 	MoeModelOutput,

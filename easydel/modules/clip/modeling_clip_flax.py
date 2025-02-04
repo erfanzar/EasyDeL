@@ -208,6 +208,7 @@ class CLIPAttention(FlaxAttentionModule):
 			force_float32_tpu=True,
 			attn_mechanism=config.attn_mechanism,
 			dtype=config.attn_dtype,
+			softmax_dtype=config.attn_softmax_dtype,
 			mesh=config.mesh,
 			sm_scale=self.head_dim**-0.5,
 			axis_name=config.attention_axis_name,

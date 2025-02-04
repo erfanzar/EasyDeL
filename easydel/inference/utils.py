@@ -13,15 +13,14 @@
 # limitations under the License.
 import dataclasses
 import typing as tp
-
+from eformer.jaximus import implicit
 import chex
-import fjformer
 import jax
 import jax.experimental
 import jax.experimental.pallas
 import jax.random
-from jax import core, random, sharding
 from jax import numpy as jnp
+from jax import random, sharding
 
 from .logits_process import (
 	FlaxForcedBOSTokenLogitsProcessor,
@@ -35,17 +34,6 @@ from .logits_process import (
 	FlaxTopPLogitsWarper,
 	hash_fn,
 )
-
-if hasattr(core, "new_main"):
-	ic = fjformer.core.implicit_compact
-else:
-
-	def ic(fn):
-		# warnings.warn(
-		# 	"fjformer quantizers wont support current jax version (soon will be fixed).",
-		# 	stacklevel=3,
-		# )
-		return fn
 
 
 @jax.tree_util.register_pytree_node_class
@@ -283,7 +271,7 @@ def create_sampling_step(
 	pad_token_id: jax.Array,
 	do_sample: bool = True,
 ):
-	@ic
+	@implicit
 	def sampling_step(model, state: SampleState):
 		"""
 		Performs a single sampling step for text generation.

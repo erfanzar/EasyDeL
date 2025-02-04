@@ -17,18 +17,19 @@ import functools
 import re
 import typing as tp
 import warnings
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from eformer.optimizers import OptimizerFactory, SchedulerConfig
 from jax.sharding import PartitionSpec
 
 from easydel.infra.errors import EasyDeLTimerError
 from easydel.infra.etils import (
 	AVAILABLE_OPTIMIZERS,
-	AVAILABLE_PRUNING_TYPE,
 	AVAILABLE_SCHEDULERS,
 	AVAILABLE_SPARSE_MODULE_TYPES,
 	EasyDeLOptimizers,
@@ -70,6 +71,7 @@ class TrainingArguments:
 	aux_loss_enabled: bool = False
 	backend: tp.Optional[str] = None
 	clip_grad: tp.Optional[float] = None
+	custom_scheduler: tp.Optional[tp.Callable[[int], tp.Any]] = None
 	dataloader_num_workers: tp.Optional[int] = 0
 	dataloader_pin_memory: tp.Optional[bool] = False
 	do_eval: bool = False
@@ -102,7 +104,7 @@ class TrainingArguments:
 	offload_device_index: int = 0
 	optimizer: AVAILABLE_OPTIMIZERS = EasyDeLOptimizers.ADAMW
 	performance_mode: bool = False
-	pruning_module: AVAILABLE_PRUNING_TYPE = None
+	pruning_module: tp.Any = None
 	process_zero_is_admin: bool = True
 	progress_bar_type: tp.Literal["tqdm", "rich", "json"] = "tqdm"
 	remove_ckpt_after_load: bool = False
@@ -197,6 +199,7 @@ class TrainingArguments:
 			"gradient_accumulation_steps": self.gradient_accumulation_steps,
 			"weight_decay": self.weight_decay,
 			"steps": self.max_training_steps,
+			"clip_grad": self.clip_grad,
 			"mu_dtype": self.tx_mu_dtype,
 			**extra_optimizer_kwargs,
 		}
@@ -292,18 +295,37 @@ class TrainingArguments:
 		Returns:
 		    tuple: A tuple containing the optimizer and scheduler.
 		"""
-		from easydel.trainers.auto_tx import get_optimizer_and_scheduler
 
 		self.optimizer_kwargs["steps"] = steps or self.optimizer_kwargs["steps"]
-		tx, sc = get_optimizer_and_scheduler(**self.optimizer_kwargs)
-		return tx, sc
+		optimizer_kwargs = deepcopy(self.optimizer_kwargs)
+		scheduler = optimizer_kwargs.pop("scheduler", None)
+		if scheduler == "none":
+			scheduler = None
+		scheduler_config = SchedulerConfig(
+			scheduler_type=scheduler,
+			steps=optimizer_kwargs.pop("steps"),
+			learning_rate=optimizer_kwargs.pop("learning_rate"),
+			learning_rate_end=optimizer_kwargs.pop("learning_rate_end"),
+			warmup_steps=optimizer_kwargs.pop("warmup_steps"),
+			exponent=optimizer_kwargs.pop("exponent", 1),
+		)
+		optimizer_kwargs.pop("gradient_accumulation_steps", 0)
+		optimizer, scheduler = OptimizerFactory.create(
+			optimizer_type=optimizer_kwargs.pop("optimizer"),
+			scheduler_config=scheduler_config,
+			clip_grad=optimizer_kwargs.pop("clip_grad"),
+			weight_decay=optimizer_kwargs.pop("weight_decay"),
+			custom_scheduler=self.custom_scheduler,
+			**optimizer_kwargs,
+		)
+		return optimizer, scheduler
 
 	def get_streaming_checkpointer(self):
 		"""
 		Returns the checkpoint manager, responsible for saving model checkpoints.
 
 		Returns:
-		    fjformer.CheckpointManager: The checkpoint manager.
+		    CheckpointManager: The checkpoint manager.
 		"""
 		import os.path
 

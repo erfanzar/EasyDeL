@@ -33,10 +33,11 @@ import jax.interpreters
 import jax.interpreters.pxla
 import jax.random
 import numpy as np
-from fjformer import GenerateRNG
 from jax import lax
 from jax import numpy as jnp
 from jax.lax import PrecisionLike
+
+from easydel.utils import GenerateRNG
 
 from .gpu_ops.triton_gemm import gemm as triton_gemm
 from .tpu_ops.pallas_gemm import pallas_gemm

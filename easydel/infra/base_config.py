@@ -20,11 +20,11 @@ import chex
 import jax
 import jax.extend
 import jax.tree_util
+from eformer.escale import PartitionAxis
 from flax import nnx as nn
 from jax import numpy as jnp
 from transformers.configuration_utils import PretrainedConfig
 
-from easydel.escale import PartitionAxis
 from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.helpers import get_logger
 
@@ -134,6 +134,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
 	kv_cache_sharding_sequence_axis_name: tp.Union[str, tp.Tuple[str, ...]]
 	flash_attention_backward_pass_impl: tp.Literal["triton", "xla"]
 	attn_dtype: jnp.dtype
+	attn_softmax_dtype: jnp.dtype
 	fcm_max_ratio: float
 	fcm_min_ratio: float
 	hardware_abstraction: bool
@@ -175,7 +176,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		quantization_blocksize (int): Block size for quantization. Default is 64.
 		kv_cache_sharding_sequence_axis_name (tp.Union[str, tp.Tuple[str, ...]]): Name of the key-value cache sharding sequence axis. Default is "sp".
 		flash_attention_backward_pass_impl (tp.Literal["triton", "xla"]): Implementation for flash attention backward pass. Default is "triton".
-		attn_dtype (jnp.dtype): Data type for attention. Default is jnp.float32.
+		attn_dtype (jnp.dtype): Data type for attention. Default is device half.
+		attn_softmax_dtype (jnp.dtype): Data type for softmax ops in attention. Default is jnp.float32.
 		fcm_max_ratio (float): Maximum ratio for FCM. Default is 0.0.
 		fcm_min_ratio (float): Minimum ratio for FCM. Default is 0.0.
 		hardware_abstraction (bool): Whether to use hardware abstraction. Default is DEFAULT_HARDWARE_ABSTRACTION.
@@ -219,6 +221,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		kv_cache_sharding_sequence_axis_name: tp.Union[str, tp.Tuple[str, ...]] = "sp",
 		flash_attention_backward_pass_impl: tp.Literal["triton", "xla"] = "triton",
 		attn_dtype: jnp.dtype = jnp.float32,
+		attn_softmax_dtype: jnp.dtype = jnp.float32,
 		fcm_max_ratio: float = 0.0,
 		fcm_min_ratio: float = 0.0,
 		hardware_abstraction: bool = DEFAULT_HARDWARE_ABSTRACTION,
@@ -266,7 +269,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		self.quantization_blocksize = getattr(self, "quantization_blocksize", quantization_blocksize)
 		self.quantization_pattern = getattr(self, "quantization_pattern", quantization_pattern)
 		self.flash_attention_backward_pass_impl = getattr(self, "flash_attention_backward_pass_impl", flash_attention_backward_pass_impl)
-		self.attn_dtype = getattr(self, "attn_dtype", attn_dtype)
+		self.attn_dtype = getattr(self, "attn_dtype",  attn_dtype)
+		self.attn_softmax_dtype = getattr(self, "attn_softmax_dtype", attn_softmax_dtype)
 		self.fcm_max_ratio = getattr(self, "fcm_max_ratio", fcm_max_ratio)
 		self.fcm_min_ratio = getattr(self, "fcm_min_ratio", fcm_min_ratio)
 		self.hardware_abstraction = getattr(self, "hardware_abstraction", hardware_abstraction)
@@ -304,7 +308,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		Returns:
 		    A mesh object
 		"""
-		from easydel.escale import create_mesh
+		from eformer.escale import create_mesh
 
 		if backend == "":
 			backend = None
@@ -424,6 +428,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		kv_cache_sharding_sequence_axis_name: tp.Union[str, tp.Tuple[str, ...]] = ...,
 		flash_attention_backward_pass_impl: tp.Literal["triton", "xla"] = ...,
 		attn_dtype: jnp.dtype = ...,
+		attn_softmax_dtype: jnp.dtype = ...,
 		hardware_abstraction: bool = ...,
 		pallas_m_block_size: int = ...,
 		pallas_k_block_size: int = ...,
@@ -433,7 +438,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		It initializes all the attributes of an object, and it's called when you create a new instance of that class.
 
 		Args:
-		                    axis_dims (tp.Sequence[int], optional): Specify the number of dimensions for each axis. Defaults to (1, -1, 1, 1).
+				axis_dims (tp.Sequence[int], optional): Specify the number of dimensions for each axis. Defaults to (1, -1, 1, 1).
 		    axis_names (tp.Sequence[str], optional): Set the names of the axes. Defaults to ("dp", "fsdp", "tp", "sp").
 		    attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS, optional): attention mechanism to use. Defaults to DEFAULT_ATTENTION_MECHANISM.
 		    blocksize_k (int, optional): block size of key_states. Defaults to 128.
@@ -460,7 +465,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 				quantization_pattern (str): re pattern to be used for quantizing layers.
 				kv_cache_sharding_sequence_axis_name (tp.Union[str, tp.Tuple[str, ...]], optional): axis name to target for sharding sequences. Defaults to "sp".
 		    flash_attention_backward_pass_impl (tp.Literal["triton", "xla"], optional): Specify the backward pass kernel for flash attention. Defaults to "triton".
-		    attn_dtype (jnp.dtype, optional): Data type for attention computations. Defaults to jnp.float32.
+		    attn_dtype (jnp.dtype, optional): Data type for attention computations. Defaults to device half.
+				attn_softmax_dtype (jnp.dtype, optional): Data type for softmax in attention op computations. Defaults to jnp.float32.
 		    fcm_max_ratio (float, optional): Maximum ratio for flash cross attention. Defaults to 0.0.
 		    fcm_min_ratio (float, optional): Minimum ratio for flash cross attention. Defaults to 0.0.
 		    hardware_abstraction (bool, optional): whenever to switch to custom pallas kernels instead of JAX. Defaults to DEFAULT_HARDWARE_ABSTRACTION.
@@ -497,7 +503,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		set_attrs_smartly(self, "quantization_blocksize", EasyDeLQuantizationMethods.NONE, quantization_blocksize)
 		set_attrs_smartly(self, "quantization_pattern", ".*", quantization_pattern)
 		set_attrs_smartly(self, "flash_attention_backward_pass_impl", "triton", flash_attention_backward_pass_impl)
-		set_attrs_smartly(self, "attn_dtype", jnp.float32, attn_dtype)
+		set_attrs_smartly(self, "attn_dtype",  jnp.float32, attn_dtype)
+		set_attrs_smartly(self, "attn_softmax_dtype", jnp.float32, attn_softmax_dtype) 
 		set_attrs_smartly(self, "hardware_abstraction", DEFAULT_HARDWARE_ABSTRACTION, hardware_abstraction)
 		set_attrs_smartly(self, "pallas_m_block_size", DEFAULT_PALLAS_M_BLOCK_SIZE, pallas_m_block_size)
 		set_attrs_smartly(self, "pallas_k_block_size", DEFAULT_PALLAS_K_BLOCK_SIZE, pallas_k_block_size)

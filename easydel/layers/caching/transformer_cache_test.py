@@ -13,12 +13,12 @@
 # limitations under the License.
 
 import pytest
+from eformer.escale import PartitionAxis
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
-from easydel.escale import PartitionAxis
 from easydel.infra.etils import EasyDeLQuantizationMethods
-from easydel.utils.quantizers import EasyQuantizer
+from easydel.layers.quantization.quantizers import EasyQuantizer
 
 from .transformer_cache import (
 	TransformerCache,
