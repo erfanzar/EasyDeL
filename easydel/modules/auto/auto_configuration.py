@@ -15,13 +15,13 @@ import functools
 import typing as tp
 
 import flax.nnx
-from jax.sharding import PartitionSpec
-
-from easydel.escale import (
+from eformer.escale import (
 	PartitionAxis,
 	make_shard_and_gather_fns,
 	match_partition_rules,
 )
+from jax.sharding import PartitionSpec
+
 from easydel.infra.base_module import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseModule,

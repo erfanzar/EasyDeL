@@ -19,12 +19,13 @@ from functools import partial
 
 import chex
 import jax
-from fjformer import GenerateRNG
 from flax.nnx import dot_product_attention as _dot_product_attention
 from jax import custom_vjp, extend
 from jax import numpy as jnp
 from jax import random as jrand
 from jax.experimental import pallas as pl
+
+from easydel.utils import GenerateRNG
 
 _PLATFORM = extend.backend.get_backend().platform
 _INTERPRET = _PLATFORM == "cpu"

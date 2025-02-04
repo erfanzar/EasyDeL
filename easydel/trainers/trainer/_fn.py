@@ -18,9 +18,9 @@ import flax
 import flax.nnx
 import jax
 import optax
+from eformer.escale import with_sharding_constraint
 from jax.sharding import PartitionSpec
 
-from easydel.escale import with_sharding_constraint
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import (
 	LossConfig,

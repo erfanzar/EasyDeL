@@ -8,9 +8,7 @@ dirname = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(dirname, "..", ".."))
 
 import logging
-from functools import partial
 
-import fjformer
 import jax
 import jax.numpy as jnp
 from datasets import load_dataset
@@ -33,17 +31,6 @@ TRAIN_SPLIT = 500
 EVAL_SPLIT = 1000
 LEARNING_RATE = 3e-4
 WARMUP_STEPS = 5
-PURNING_MODULE = (
-	fjformer.jaxpruner.MagnitudePruning(
-		sparsity_distribution_fn=partial(
-			fjformer.jaxpruner.sparsity_distributions.uniform,
-			sparsity=0.8,
-		),
-		scheduler=fjformer.jaxpruner.sparsity_schedules.OneShotSchedule(0),
-	)
-	if False
-	else None
-)  # Not Supported Yet in new version
 
 
 def create_model_and_tokenizer(sequence_length=SEQUENCE_LENGTH, dtype=jnp.float32):
@@ -122,7 +109,6 @@ def create_sft_config(
 		packing=True,
 		num_of_sequences=sequence_length,
 		evaluation_steps=200,
-		pruning_module=PURNING_MODULE,
 	)
 	logging.info("SFT config created successfully.")
 	return config

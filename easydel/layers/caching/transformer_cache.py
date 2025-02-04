@@ -14,15 +14,15 @@
 import typing as tp
 
 import chex as cx
-from fjformer.core import ImplicitArray
+from eformer.escale import PartitionAxis
+from eformer.jaximus import ArrayValue
 from jax import numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from easydel.escale import PartitionAxis
 from easydel.infra.etils import EasyDeLQuantizationMethods
 
 if tp.TYPE_CHECKING:
-	from easydel.utils.quantizers import EasyQuantizer
+	from easydel.layers.quantization.quantizers import EasyQuantizer
 else:
 	EasyQuantizer = object
 
@@ -123,9 +123,9 @@ class TransformerCacheMetaData:
 
 @cx.dataclass
 class TransformerCacheView:
-	key: tp.Union[cx.Array, ImplicitArray]
-	value: tp.Union[cx.Array, ImplicitArray]
-	index: tp.Union[cx.Array, ImplicitArray]
+	key: tp.Union[cx.Array, ArrayValue]
+	value: tp.Union[cx.Array, ArrayValue]
+	index: tp.Union[cx.Array, ArrayValue]
 	metadata: TransformerCacheMetaData
 	layer_index: tp.Optional[int] = None
 
@@ -141,7 +141,7 @@ class TransformerCacheView:
 	):
 		device = NamedSharding(mesh=mesh, spec=key_values_partition_specs)
 
-		return cls(
+		out = cls(
 			key=quantizer(
 				jnp.zeros(
 					shape=(
@@ -170,6 +170,7 @@ class TransformerCacheView:
 			metadata=metadata,
 			layer_index=layer_index,
 		)
+		return out
 
 	def __repr__(self):
 		try:
@@ -200,7 +201,7 @@ class TransformerCache:
 		dtype: tp.Optional[jnp.dtype] = None,
 		key_values_partition_specs: tp.Optional[PartitionSpec] = None,
 	):
-		from easydel.utils.quantizers import EasyQuantizer
+		from easydel.layers.quantization.quantizers import EasyQuantizer
 
 		paxis = PartitionAxis()
 		quantizer = quantizer or EasyQuantizer(EasyDeLQuantizationMethods.NONE)

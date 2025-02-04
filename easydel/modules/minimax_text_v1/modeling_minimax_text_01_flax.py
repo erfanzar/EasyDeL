@@ -247,6 +247,7 @@ class MiniMaxText01LightningAttention(nn.Module):
 			past_key_value=cache_view.key_value if cache_view is not None else None,
 			init_cache=True if cache_view is not None else False,
 			dtype=self.config.attn_dtype,
+			softmax_dtype=self.config.attn_softmax_dtype,
 		)
 		if cache_view is not None:
 			cache_view.key_value = ola
@@ -325,6 +326,7 @@ class MiniMaxText01Attention(FlaxAttentionModule):
 			force_float32_tpu=True,
 			attn_mechanism=self.config.attn_mechanism,
 			dtype=self.config.attn_dtype,
+			softmax_dtype=self.config.attn_softmax_dtype,
 			mesh=self.config.mesh,
 			sm_scale=1 / math.sqrt(self.head_dim),
 			axis_name=self.config.attention_axis_name,

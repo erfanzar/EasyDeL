@@ -17,12 +17,12 @@ import chex
 import flax
 import flax.nnx
 import jax
+from eformer.escale.partition.constraints import with_sharding_constraint
 from jax import numpy as jnp
 from jax.nn import log_sigmoid as logsigmoid
 from jax.nn import relu, sigmoid
 from jax.sharding import PartitionSpec
 
-from easydel.escale.partition.constraints import with_sharding_constraint
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossConfig, LossMetrics

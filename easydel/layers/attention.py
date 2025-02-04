@@ -31,6 +31,7 @@ import jax.lib
 import jax.tree_util
 import numpy
 from chex import Array
+from eformer.escale import PartitionAxis, with_sharding_constraint
 from flax.nnx.nn.dtypes import promote_dtype
 from jax import NamedSharding, lax, random
 from jax import numpy as jnp
@@ -46,7 +47,6 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec
 
-from easydel.escale import PartitionAxis, with_sharding_constraint
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import (
 	AVAILABLE_ATTENTION_MECHANISMS,
@@ -57,8 +57,8 @@ from easydel.kernels.flash_attention_2 import create_flash_attention
 from easydel.kernels.ring_attention import ring_attention
 from easydel.layers._blockwise_attention import blockwise_attn
 from easydel.layers.caching import TransformerCacheView
+from easydel.layers.quantization.quantizers import EasyQuantizer
 from easydel.utils.helpers import get_logger
-from easydel.utils.quantizers import EasyQuantizer
 
 try:
 	from flash_attn_jax import flash_mha as cuda_flash_attn2_mha  # noqa #type:ignore
@@ -319,6 +319,7 @@ class FlexibleAttentionModule(nn.Module):
 		scan_attention_layers: bool = ...,
 		attention_dropout: float = 0.0,
 		dtype: jnp.dtype = ...,
+		softmax_dtype: jnp.dtype = ...,
 		precision: lax.Precision = ...,
 		force_float32_tpu: bool = ...,
 		shard_attention_computation: bool = ...,
@@ -348,7 +349,8 @@ class FlexibleAttentionModule(nn.Module):
 		set_attrs_smartly_with_prp(self, "blocksize_q", DEFAULT_Q_BLOCK, blocksize_q, base_config)
 		set_attrs_smartly_with_prp(self, "blocksize_k", DEFAULT_K_BLOCK, blocksize_k, base_config)
 		set_attrs_smartly_with_prp(self, "blocksize_b", 1, blocksize_b, base_config)
-		set_attrs_smartly_with_prp(self, "dtype", jnp.float32, dtype, base_config, "attn_dtype")
+		set_attrs_smartly_with_prp(self, "dtype",  jnp.float32, dtype, base_config, "attn_dtype")
+		set_attrs_smartly_with_prp(self, "softmax_dtype", jnp.float32, softmax_dtype, base_config, "attn_softmax_dtype")
 		set_attrs_smartly_with_prp(self, "shard_attention_computation", True, shard_attention_computation, base_config)
 		set_attrs_smartly_with_prp(self, "scan_ring_attention", True, scan_ring_attention, base_config)
 		set_attrs_smartly_with_prp(self, "partition_axis", PartitionAxis(), partition_axis, base_config)
@@ -378,6 +380,12 @@ class FlexibleAttentionModule(nn.Module):
 		if isinstance(self.dtype, str):
 			self.dtype = _get_jax_dtype_from_string(self.dtype)
 			assert self.dtype is not None, "Please consider passing attn_dtype to config."
+
+		if isinstance(self.softmax_dtype, str):
+			self.softmax_dtype = _get_jax_dtype_from_string(self.softmax_dtype)
+			assert (
+				self.softmax_dtype is not None
+			), "Please consider passing attn_softmax_dtype to config."
 
 	def get_block_size_splash_attn(self, q_seq, k_seq):
 		return BlockSizesSplashAttn(
@@ -757,7 +765,7 @@ class FlexibleAttentionModule(nn.Module):
 				else (causal if bias is None else False),
 			)
 			dtype = self.dtype
-			if jax.default_backend() == "gpu" and dtype == jnp.float32:
+			if jax.default_backend() == "gpu":
 				dtype = jnp.float16
 			attention_output = shard_map(
 				func,
@@ -1017,6 +1025,7 @@ class FlexibleAttentionModule(nn.Module):
 				attention_partitionspec,
 				_,
 			) = self.get_bshd_partition_specs(query_sequence_length)
+
 		b, qs, qh, d = query_states.shape
 		b, ks, kh, d = key_states.shape
 
@@ -1409,9 +1418,8 @@ class AttentionBenchmarker:
 		run_attention_benchmarks: tp.List[str] = None,
 		calculate_gradients: bool = True,
 	):
-		from fjformer import GenerateRNG
-
 		from easydel import MistralConfig
+		from easydel.utils import GenerateRNG
 
 		self.config = config
 		self.run_attention_benchmarks = run_attention_benchmarks or [
@@ -1748,6 +1756,7 @@ class FlaxAttentionModule(nn.Module):
 		attention_mask: Array,
 		causal_mask: tp.Optional[Array] = None,
 	) -> tp.Tuple[Array, Array, Array]:
+		# print(cache_view.key)
 		num_updated_cache_vectors = query.shape[1]
 		end_index = cache_view.index[0]
 
@@ -1774,11 +1783,6 @@ class FlaxAttentionModule(nn.Module):
 		slice_indices = (0, end_index % cache_view.value.shape[1], 0, 0)
 		value_cache = cache_view.value
 		key_cache = cache_view.key
-		try:
-			key_cache = key_cache.materialize()
-			value_cache = value_cache.materialize()
-		except Exception:
-			...
 		org_cache_dtype = key_cache.dtype
 		value_cache = lax.dynamic_update_slice(
 			value_cache.astype(value),
@@ -1807,6 +1811,8 @@ class FlaxAttentionModule(nn.Module):
 				sharding=self.get_sharding_safely(cache_view.value),
 			)
 		)
+
+		# jax.debug.print("{}", hasattr(cache_view.key, "scale"))
 		cache_view.index = cache_view.index + num_updated_cache_vectors
 
 		return key_cache, value_cache, attention_mask

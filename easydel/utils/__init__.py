@@ -20,7 +20,8 @@ from .compiling_utils import (
 	save_compiled_fn,
 )
 from .helpers import Timer, Timers, get_logger
-from .quantizers import EasyQuantizer
+from ..layers.quantization.quantizers import EasyQuantizer
+from .rngs_utils import GenerateRNG, JaxRNG
 
 __all__ = (
 	"Timers",
@@ -36,4 +37,6 @@ __all__ = (
 	"compile_function",
 	"load_compiled_fn",
 	"save_compiled_fn",
+	"GenerateRNG",
+	"JaxRNG",
 )

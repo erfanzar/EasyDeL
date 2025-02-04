@@ -16,17 +16,6 @@ import argparse
 import typing as tp
 from enum import Enum
 
-from fjformer.jaxpruner import (
-	GlobalMagnitudePruning,
-	GlobalSaliencyPruning,
-	MagnitudePruning,
-	NoPruning,
-	RandomPruning,
-	SaliencyPruning,
-	SteMagnitudePruning,
-	SteRandomPruning,
-)
-
 
 class EasyDeLOptimizers(str, Enum):
 	"""
@@ -74,8 +63,6 @@ class EasyDeLQuantizationMethods(str, Enum):
 
 	NONE = None
 	NF4 = "nf4"
-	A8Q = "a8q"
-	A4Q = "a4q"
 	A8BIT = "8bit"
 
 
@@ -122,20 +109,6 @@ AVAILABLE_OPTIMIZERS = tp.Literal[
 	"lion",
 	"adamw",
 	"rmsprop",
-]
-
-
-AVAILABLE_PRUNING_TYPE = tp.Optional[
-	tp.Union[
-		MagnitudePruning,
-		NoPruning,
-		RandomPruning,
-		SaliencyPruning,
-		SteRandomPruning,
-		SteMagnitudePruning,
-		GlobalSaliencyPruning,
-		GlobalMagnitudePruning,
-	]
 ]
 
 

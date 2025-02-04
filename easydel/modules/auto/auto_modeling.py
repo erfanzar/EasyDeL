@@ -16,9 +16,9 @@ import os
 import typing as tp
 
 import jax.numpy
+from eformer.escale import PartitionAxis
 from jax.sharding import PartitionSpec
 
-from easydel.escale import PartitionAxis
 from easydel.infra.base_config import EasyDeLBaseConfigDict
 from easydel.infra.base_module import (
 	EasyDeLBaseModule,
@@ -55,6 +55,7 @@ class BaseAutoEasyModel:
 		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]] = None,
 		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
 		quantization_block_size: int = 128,
+		quantize_tensors: bool = False,
 		from_torch: tp.Optional[bool] = None,
 		**kwargs,
 	) -> EasyDeLBaseModule:
@@ -109,6 +110,7 @@ class BaseAutoEasyModel:
 				partition_axis=partition_axis,
 				quantization_method=quantization_method,
 				quantization_block_size=quantization_block_size,
+				quantize_tensors=quantize_tensors,
 				partition_rules=partition_rules,
 				sharding_axis_names=sharding_axis_names,
 				sharding_axis_dims=sharding_axis_dims,
@@ -135,6 +137,7 @@ class BaseAutoEasyModel:
 				pretrained_model_name_or_path=pretrained_model_name_or_path,
 				quantization_method=quantization_method,
 				quantization_block_size=quantization_block_size,
+				quantize_tensors=quantize_tensors,
 				**kwargs,
 			)
 
@@ -157,6 +160,7 @@ class BaseAutoEasyModel:
 		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
 		quantization_platform: tp.Optional[EasyDeLPlatforms] = EasyDeLPlatforms.JAX,
 		quantization_block_size: int = 128,
+		quantize_tensors: bool = False,
 		**kwargs,
 	):
 		class Base(EasyDeLBaseModule):
@@ -179,6 +183,7 @@ class BaseAutoEasyModel:
 			quantization_method=quantization_method,
 			quantization_platform=quantization_platform,
 			quantization_block_size=quantization_block_size,
+			quantize_tensors=quantize_tensors,
 			**kwargs,
 		)
 
@@ -202,6 +207,7 @@ class BaseAutoEasyModel:
 		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]] = None,
 		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
 		quantization_block_size: int = 128,
+		quantize_tensors: bool = False,
 		**kwargs,
 	):
 		class Base(EasyDeLBaseModule):
@@ -219,6 +225,7 @@ class BaseAutoEasyModel:
 			partition_axis=partition_axis,
 			quantization_method=quantization_method,
 			quantization_block_size=quantization_block_size,
+			quantize_tensors=quantize_tensors,
 			partition_rules=partition_rules,
 			sharding_axis_names=sharding_axis_names,
 			sharding_axis_dims=sharding_axis_dims,

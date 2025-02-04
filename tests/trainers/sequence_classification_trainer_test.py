@@ -12,7 +12,6 @@ sys.path.append(
 	)
 )
 import typing as tp
-import fjformer
 import flax.core
 from datasets import Dataset, IterableDataset
 from jax import numpy as jnp
@@ -27,7 +26,6 @@ NUM_EVAL_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
 NUM_TRAIN_EPOCHS = 1
 PROBLEM = "single_label_classification"
 NUM_LABELS = 4
-rng = fjformer.GenerateRNG()
 
 
 def create_sequence_classification_data_generator(

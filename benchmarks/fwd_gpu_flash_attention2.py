@@ -7,12 +7,12 @@ sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import jax
 import jaxlib
 import triton
+from eformer.escale import create_mesh
 from jax import nn
 from jax import numpy as jnp
 from jax import random as jrnd
 from jax.sharding import NamedSharding, PartitionSpec
 
-from easydel.escale import create_mesh
 from easydel.kernels.gpu_ops.triton_gqa_flash_attention_2 import (
 	triton_gqa_flash_attention2_gpu,
 )

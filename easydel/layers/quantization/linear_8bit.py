@@ -63,8 +63,8 @@ def dequantize_8bit(quants, scales):
 	return dequantized
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(3,))
-def quantized_matmul(x, qweight, qscale, transpose_weight=False):
+@partial(jax.custom_vjp, nondiff_argnums=(3, 4))
+def quantized_matmul(x, qweight, qscale, transpose_weight=False, smt=True):
 	"""
 	Forward pass for 8-bit quantized matrix multiplication.
 	"""

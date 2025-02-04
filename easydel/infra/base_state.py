@@ -182,7 +182,7 @@ class EasyDeLState(struct.PyTreeNode):
 		if partition_rules is None:
 			partition_rules = self.model.config.get_partition_rules()
 
-		from easydel.escale import match_partition_rules
+		from eformer.escale import match_partition_rules
 
 		eval_opt_state = jax.eval_shape(lambda: tx.init(self.graphstate))
 		partition_specs = match_partition_rules(partition_rules, eval_opt_state)
@@ -222,7 +222,7 @@ class EasyDeLState(struct.PyTreeNode):
 		if partition_rules is None:
 			partition_rules = self.model.config.get_partition_rules()
 
-		from easydel.escale import make_shard_and_gather_fns, match_partition_rules
+		from eformer.escale import make_shard_and_gather_fns, match_partition_rules
 
 		with self.model.mesh:
 			partition_specs = match_partition_rules(partition_rules, opt_state)
@@ -239,7 +239,7 @@ class EasyDeLState(struct.PyTreeNode):
 		if partition_rules is None:
 			partition_rules = self.model.config.get_partition_rules()
 
-		from easydel.escale import make_shard_and_gather_fns, match_partition_rules
+		from eformer.escale import make_shard_and_gather_fns, match_partition_rules
 
 		partition_specs = match_partition_rules(partition_rules, self.opt_state)
 		_, gather = make_shard_and_gather_fns(partition_specs)
@@ -376,7 +376,7 @@ class EasyDeLState(struct.PyTreeNode):
 
 	def shard_with_shape(self, shape) -> EasyDeLState:
 		"""shard current state with a given shape"""
-		from easydel.escale import with_sharding_constraint
+		from eformer.escale import with_sharding_constraint
 
 		self = nn.from_tree(
 			jax.tree_util.tree_map(
@@ -430,7 +430,7 @@ class EasyDeLState(struct.PyTreeNode):
 		Returns:
 		  EasyDeLState: An updated EasyDeLState object with the gathered model.
 		"""
-		from easydel.escale import make_shard_and_gather_fns, match_partition_rules
+		from eformer.escale import make_shard_and_gather_fns, match_partition_rules
 
 		rules = partition_rules or self.model._get_partition_rules(None)
 		mesh = mesh or self.model._get_mesh(None)
@@ -476,7 +476,7 @@ class EasyDeLState(struct.PyTreeNode):
 		mesh = mesh or self.model._get_mesh(None)
 
 		def appy_sharding_on_tree(tree):
-			from easydel.escale import make_shard_and_gather_fns, match_partition_rules
+			from eformer.escale import make_shard_and_gather_fns, match_partition_rules
 
 			partition_specs = match_partition_rules(rules, tree)
 			shard_fns, _ = make_shard_and_gather_fns(partition_specs, mesh)

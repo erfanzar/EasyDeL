@@ -29,7 +29,6 @@ from uuid import uuid4
 import jax
 import numpy as np
 from chex import PRNGKey
-from fjformer import GenerateRNG
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
@@ -37,6 +36,7 @@ from jax._src.stages import Compiled
 from jax.interpreters import pxla
 from jax.sharding import NamedSharding, PartitionSpec
 from pydantic import BaseModel
+
 
 from easydel.utils.compiling_utils import (
 	load_compiled_fn,
@@ -121,6 +121,7 @@ class vInference:
 		  input_partition_spec: The partitioning specification for input data.
 		  max_new_tokens: The maximum number of new tokens to generate.
 		"""
+		from easydel.utils import GenerateRNG
 
 		graphdef, graphstate = nn.split(model)
 		self.graphdef = graphdef
@@ -642,6 +643,7 @@ class vInference:
 			logger.debug("lowering `iter_fn`")
 			sample_state = compiled_generate_func(self.graphstate, state)
 			sample_state_shardings = extract_shardings(sample_state)
+			
 			iter_fn_lowered = jax.jit(
 				basic_generation_iter_fn,
 				static_argnums=(0, 3),
@@ -657,7 +659,7 @@ class vInference:
 				sample_state,
 				self.generation_config,
 				self.generation_config.streaming_chunks,
-			)
+			) 
 			logger.debug("`iter_fn` lowered successfully.")
 			compiled_interval_func = smart_compile(
 				iter_fn_lowered,

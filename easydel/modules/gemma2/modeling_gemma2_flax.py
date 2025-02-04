@@ -19,10 +19,10 @@ from functools import partial
 import chex
 import jax
 import jax.numpy as jnp
+from eformer.escale import with_sharding_constraint
 from flax import nnx as nn
 from jax.sharding import PartitionSpec
 
-from easydel.escale import with_sharding_constraint
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import register_module
 from easydel.infra.modeling_outputs import (

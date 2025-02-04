@@ -289,7 +289,7 @@ class BaseTrainer(BaseTrainerProtocol):
 	def _configure_state(self):
 		"""Configures and JIT-compiles the sharded state"""
 		with self.timer("configure sharded state"):
-			from easydel.escale import match_partition_rules
+			from eformer.escale import match_partition_rules
 
 			with self.model.mesh:
 				self.model_state = self.model_state.init_tx(self.tx)

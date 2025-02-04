@@ -24,12 +24,12 @@ import flax.struct
 import jax
 import jax.extend
 import jax.tree_util
+from eformer.escale import make_shard_and_gather_fns, match_partition_rules
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from easydel.escale import make_shard_and_gather_fns, match_partition_rules
 from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import flatten_dict, is_flatten, unflatten_dict
 
@@ -46,7 +46,6 @@ from .mixins import (
 	EasyBridgeMixin,
 	EasyGenerationMixin,
 )
-from .utils import quantize_linear_layers
 
 if tp.TYPE_CHECKING:
 	from easydel.infra.base_state import EasyDeLState
@@ -494,6 +493,8 @@ class EasyDeLBaseModule(
 		method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.A8BIT,
 		block_size: int = 128,
 		quantization_pattern: tp.Optional[str] = None,
+		quantize_tensors: bool = False,
+		verbose: tp.Optional[bool] = None,
 	) -> SELF:
 		"""Quantizes the model's linear layers.
 
@@ -501,16 +502,25 @@ class EasyDeLBaseModule(
 		    method (EasyDeLQuantizationMethods, optional): The quantization method to use.
 		    block_size (int, optional): The block size for quantization.
 		    quantization_pattern (str, optional): The quantization pattern to use.
-
+				quantize_tensors (bool): whenever to quantize tensors or quantize Linear Layers.`
+				verbose (bool, optional): Verbose quantizing process
 		Returns:
 		    EasyDeLBaseModule: The quantized model.
 		"""
-		return quantize_linear_layers(
-			self,
-			method=method,
-			block_size=block_size,
-			quantization_pattern=quantization_pattern,
-		)
+		from easydel.layers.quantization.quantizers import EasyQuantizer
+
+		quantizer = EasyQuantizer(quantization_method=method, block_size=block_size)
+		if verbose is None:
+			verbose = jax.process_index() == 0
+		if quantize_tensors:
+			...
+		else:
+			self = quantizer.quantize_linears(
+				self,
+				quantization_pattern=quantization_pattern,
+				verbose=verbose,
+			)
+		return self
 
 	def to_state(self) -> EasyDeLState:
 		"""converts current model to a EasyDeLState"""
