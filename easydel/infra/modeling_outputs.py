@@ -653,6 +653,7 @@ class FlaxSequenceClassifierOutput(ModelOutput):
 	logits: chex.Array = None
 	hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
 	attentions: tp.Optional[tp.Tuple[chex.Array]] = None
+	past_key_values: tp.Optional[TransformerCache] = None
 	loss: tp.Optional[chex.Array] = None
 	aux_loss: tp.Optional[chex.Array] = None
 
