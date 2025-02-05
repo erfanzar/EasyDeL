@@ -109,6 +109,7 @@ class TrainingArguments:
 	progress_bar_type: tp.Literal["tqdm", "rich", "json"] = "tqdm"
 	remove_ckpt_after_load: bool = False
 	remove_unused_columns: bool = True
+	report_steps: int = 5
 	save_directory: str = "EasyDeL-Checkpoints"
 	save_optimizer_state: bool = True
 	save_steps: tp.Optional[int] = None

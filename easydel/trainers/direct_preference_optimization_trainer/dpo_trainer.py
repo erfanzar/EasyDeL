@@ -671,7 +671,7 @@ class DPOTrainer(Trainer):
 		if (
 			self.arguments.sync_ref_model
 			and self.reference_state is not None
-			and (step % self.arguments.ref_model_sync_steps)
+			and (step % self.arguments.ref_model_sync_steps == 0)
 		):
 			self.reference_state = self.reference_state.replace(
 				graphstate=deepcopy_model(state.graphstate)
