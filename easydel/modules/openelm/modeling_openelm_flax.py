@@ -53,7 +53,7 @@ class OpenELMMultiHeadCausalAttention(FlaxAttentionModule):
 		layer_idx: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -281,7 +281,7 @@ class OpenELMFeedForwardNetwork(nn.Module):
 		layer_idx: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -369,7 +369,7 @@ class OpenELMDecoderLayer(nn.Module):
 		layer_idx: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -496,7 +496,7 @@ class OpenELMModel(EasyDeLBaseModule):
 		config: OpenELMConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -641,7 +641,7 @@ class OpenELMForCausalLM(EasyDeLBaseModule):
 		config: OpenELMConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):

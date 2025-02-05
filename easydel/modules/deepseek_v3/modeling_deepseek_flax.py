@@ -187,7 +187,7 @@ class DeepseekV3MLP(nn.Module):
 		config: DeepseekV3Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		hidden_size=None,
 		intermediate_size=None,
 		*,
@@ -231,7 +231,7 @@ class MoEGate(nn.Module):
 		config: DeepseekV3Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -318,7 +318,7 @@ class DeepseekV3MoE(nn.Module):
 		config: DeepseekV3Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -783,7 +783,7 @@ class DeepseekV3Model(EasyDeLBaseModule):
 		config: DeepseekV3Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -956,7 +956,7 @@ class DeepseekV3ForCausalLM(EasyDeLBaseModule):
 		config: DeepseekV3Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):

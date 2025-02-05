@@ -50,7 +50,7 @@ class PhiMoEBlockSparseTop2MLP(nn.Module):
 		config: PhiMoeConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -87,7 +87,7 @@ class PhiMoEAttention(FlaxAttentionModule):
 		layer_idx: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -274,7 +274,7 @@ class PhiMoeSparseMoeBlock(nn.Module):
 		layer_idx: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -364,7 +364,7 @@ class FlaxPhiMoeDecoderLayer(nn.Module):
 		layer_idx: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -476,7 +476,7 @@ class PhiMoeModel(EasyDeLBaseModule):
 		config: PhiMoeConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -608,7 +608,7 @@ class PhiMoeForCausalLM(EasyDeLBaseModule):
 		config: PhiMoeConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):

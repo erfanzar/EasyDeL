@@ -38,6 +38,7 @@ from .etils import EasyDeLQuantizationMethods
 from .loss_utils import (
 	LOSS_MAPPING,
 	ForCausalLMLoss,
+	ForSequenceClassificationLoss,
 	LossConfig,
 	LossMetrics,
 )
@@ -705,6 +706,14 @@ class EasyDeLBaseModule(
 			dtype=self.param_dtype,
 		)
 
+	@property
+	def _default_loss_config(self) -> tp.Optional[LossConfig]:
+		return None
+
+	@_default_loss_config.setter
+	def _default_loss_config(self, val):
+		return val
+
 	def compute_loss(
 		self,
 		*,
@@ -716,10 +725,19 @@ class EasyDeLBaseModule(
 		"""basic `compute_loss` call"""
 		if labels is None and self.loss_function.__name__ == ForCausalLMLoss.__name__:
 			labels = batch.get("input_ids", None)
+
+		if self.loss_function.__name__ == ForSequenceClassificationLoss.__name__:
+			if loss_config is None:
+				assert hasattr(
+					self.config, "num_labels"
+				), "in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
+				loss_config = LossConfig(num_labels=self.config.num_labels)
+				
 		assert labels is not None, "`labels` can not be `None` for computing loss."
 		loss_kwargs = loss_kwargs or {}
 		batch.pop("return_dict", None)
 		outputs = self(**batch, return_dict=True)
+
 		loss_output: LossMetrics = self.loss_function(
 			labels=labels,
 			config=loss_config,
