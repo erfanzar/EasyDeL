@@ -35,11 +35,9 @@ class EasyDeLSchedulers(str, Enum):
 	Each enum member represents a different learning rate schedule.
 	"""
 
+	NONE = None
 	LINEAR = "linear"
 	COSINE = "cosine"
-	NONE = "none"
-	WARM_UP_COSINE = "warm_up_cosine"
-	WARM_UP_LINEAR = "warm_up_linear"
 
 
 class EasyDeLGradientCheckPointers(str, Enum):
@@ -100,8 +98,6 @@ AVAILABLE_SCHEDULERS = tp.Literal[
 	"linear",
 	"cosine",
 	"none",
-	"warm_up_cosine",
-	"warm_up_linear",
 ]
 
 AVAILABLE_OPTIMIZERS = tp.Literal[

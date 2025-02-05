@@ -132,7 +132,7 @@ elif ed.__version__ == "0.0.80":
 		learning_rate_end=LEARNING_RATE_END,
 		warmup_steps=WARPUP_STEPS,
 		optimizer=ed.EasyDeLOptimizers.ADAMW,
-		scheduler=ed.EasyDeLSchedulers.WARM_UP_COSINE,
+		scheduler=ed.EasyDeLSchedulers.COSINE,
 		weight_decay=0.02,
 		total_batch_size=BATCH_SIZE,
 		max_sequence_length=MAX_LENGTH,

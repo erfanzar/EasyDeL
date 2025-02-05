@@ -280,6 +280,7 @@ class Trainer(BaseTrainer):
 					pbar.update(1)
 					continue
 				step_metrics.start_step()
+				state = self.on_step_start(state=state, step=current_step)
 			except (
 				KeyboardInterrupt,
 				EasyDeLTimerError,
@@ -318,6 +319,11 @@ class Trainer(BaseTrainer):
 					mean_loss=mean_loss,
 					mean_accuracy=mean_accuracy,
 					mode="train",
+				)
+				state, metrics = self.on_step_end(
+					state=state,
+					metrics=metrics,
+					step=current_step,
 				)
 				self.log_metrics(
 					metrics=train_metrics,

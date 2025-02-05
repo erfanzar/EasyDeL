@@ -111,7 +111,7 @@ def create_dpo_config(
 		learning_rate_end=9e-6,
 		warmup_steps=100,
 		optimizer=ed.EasyDeLOptimizers.ADAMW,
-		scheduler=ed.EasyDeLSchedulers.WARM_UP_COSINE,
+		scheduler=ed.EasyDeLSchedulers.COSINE,
 		weight_decay=0.02,
 		max_sequence_length=max_length,
 		gradient_accumulation_steps=1,
