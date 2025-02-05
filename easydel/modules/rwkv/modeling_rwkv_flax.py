@@ -458,7 +458,7 @@ class FlaxRwkvPretrainedModel(EasyDeLBaseModule):
 		seed: int = 0,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		_do_init: bool = True,
 		**kwargs,
 	):

@@ -13,6 +13,15 @@
 # limitations under the License.
 
 from .exaone_configuration import ExaoneConfig
-from .modeling_exaone_flax import ExaoneForCausalLM, ExaoneModel
+from .modeling_exaone_flax import (
+	ExaoneForCausalLM,
+	ExaoneModel,
+	ExaoneForSequenceClassification,
+)
 
-__all__ = "ExaoneForCausalLM", "ExaoneModel", "ExaoneConfig"
+__all__ = (
+	"ExaoneForCausalLM",
+	"ExaoneModel",
+	"ExaoneConfig",
+	"ExaoneForSequenceClassification",
+)

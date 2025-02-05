@@ -12,7 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .modeling_olmo2_flax import Olmo2ForCausalLM, Olmo2Model
+from .modeling_olmo2_flax import (
+	Olmo2ForCausalLM,
+	Olmo2Model,
+	Olmo2ForSequenceClassification,
+)
 from .olmo2_configuration import Olmo2Config
 
-__all__ = "Olmo2ForCausalLM", "Olmo2Model", "Olmo2Config"
+__all__ = (
+	"Olmo2ForCausalLM",
+	"OlmoForSequenceClassification",
+	"Olmo2Model",
+	"Olmo2Config",
+)

@@ -13,6 +13,15 @@
 # limitations under the License.
 
 from .gemma2_configuration import Gemma2Config
-from .modeling_gemma2_flax import Gemma2ForCausalLM, Gemma2Model
+from .modeling_gemma2_flax import (
+	Gemma2ForCausalLM,
+	Gemma2Model,
+	Gemma2ForSequenceClassification,
+)
 
-__all__ = "Gemma2ForCausalLM", "Gemma2Model", "Gemma2Config"
+__all__ = (
+	"Gemma2ForCausalLM",
+	"Gemma2Model",
+	"Gemma2Config",
+	"Gemma2ForSequenceClassification",
+)

@@ -23,7 +23,7 @@ import jax.numpy as jnp
 from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
@@ -53,7 +53,7 @@ class LlamaMLP(nn.Module):
 		config: LlamaConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -92,7 +92,7 @@ class LlamaAttention(FlaxAttentionModule):
 		config: LlamaConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -260,7 +260,7 @@ class LlamaDecoderLayer(nn.Module):
 		config: LlamaConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -360,7 +360,7 @@ class LlamaModel(EasyDeLBaseModule):
 		config: LlamaConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -493,7 +493,7 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 		config: LlamaConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -570,7 +570,7 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 
 
 @register_module(
-	"sequence-classification",
+	TaskType.SEQUENCE_CLASSIFICATION,
 	config=LlamaConfig,
 	model_type="llama",
 	embedding_layer_names=["embed_tokens"],
@@ -579,10 +579,9 @@ class LlamaForSequenceClassification(EasyDeLBaseModule):
 	def __init__(
 		self,
 		config: LlamaConfig,
-		num_labels: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -593,7 +592,6 @@ class LlamaForSequenceClassification(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.num_labels = num_labels
 		self.model = LlamaModel(
 			config=config,
 			dtype=dtype,
@@ -601,9 +599,12 @@ class LlamaForSequenceClassification(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
+		assert hasattr(
+			config, "num_labels"
+		), "in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
 		self.score = nn.Linear(
 			self.config.hidden_size,
-			self.num_labels,
+			config.num_labels,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
@@ -619,14 +620,16 @@ class LlamaForSequenceClassification(EasyDeLBaseModule):
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
 	) -> tp.Union[FlaxSequenceClassifierOutput, tp.Tuple]:
-		outputs = self.model(
+		transformer_outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
+			past_key_values=past_key_values,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,
@@ -634,12 +637,36 @@ class LlamaForSequenceClassification(EasyDeLBaseModule):
 			segment_ids=segment_ids,
 		)
 
-		hidden_states = outputs[0]
-		prediction = self.score(hidden_states)
-		if return_dict:
-			return FlaxSequenceClassifierOutput(
-				logits=prediction,
-				hidden_states=hidden_states,
-			)
+		hidden_states = transformer_outputs[0]
+		logits = self.score(hidden_states)
+		if input_ids is not None:
+			batch_size = input_ids.shape[0]
 		else:
-			return (prediction,)
+			batch_size = inputs_embeds.shape[0]
+
+		if self.config.pad_token_id is None and batch_size != 1:
+			raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
+		if self.config.pad_token_id is None:
+			sequence_lengths = -1
+		else:
+			if input_ids is not None:
+				sequence_lengths = (
+					jnp.argmax(jnp.equal(input_ids, self.config.pad_token_id).astype("i4"), -1)
+					- 1
+				)
+				sequence_lengths = sequence_lengths % input_ids.shape[-1]
+			else:
+				sequence_lengths = -1
+
+		pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
+
+		if not return_dict:
+			output = (pooled_logits,) + transformer_outputs[1:]
+			return output
+
+		return FlaxSequenceClassifierOutput(
+			logits=pooled_logits,
+			past_key_values=past_key_values,
+			hidden_states=transformer_outputs.hidden_states,
+			attentions=transformer_outputs.attentions,
+		)

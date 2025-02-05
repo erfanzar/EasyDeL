@@ -13,6 +13,15 @@
 # limitations under the License.
 
 from .mistral_configuration import MistralConfig
-from .modeling_mistral_flax import MistralForCausalLM, MistralModel
+from .modeling_mistral_flax import (
+	MistralForCausalLM,
+	MistralModel,
+	MistralForSequenceClassification,
+)
 
-__all__ = ("MistralForCausalLM", "MistralModel", "MistralConfig")
+__all__ = (
+	"MistralForCausalLM",
+	"MistralModel",
+	"MistralConfig",
+	"MistralForSequenceClassification",
+)

@@ -265,7 +265,7 @@ class MiniMaxText01Attention(FlaxAttentionModule):
 		layer_idx: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -422,7 +422,7 @@ class MiniMaxText01MLP(nn.Module):
 		config: MiniMaxText01Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -458,7 +458,7 @@ class MiniMaxText01BlockSparseTop2MLP(nn.Module):
 		config: MiniMaxText01Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -494,7 +494,7 @@ class MiniMaxText01SparseMoeBlock(nn.Module):
 		config: MiniMaxText01Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -580,7 +580,7 @@ class MiniMaxText01DecoderLayer(nn.Module):
 		layer_idx: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -778,7 +778,7 @@ class MiniMaxText01Model(EasyDeLBaseModule):
 		config: MiniMaxText01Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -925,7 +925,7 @@ class MiniMaxText01ForCausalLM(EasyDeLBaseModule):
 		config: MiniMaxText01Config,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
