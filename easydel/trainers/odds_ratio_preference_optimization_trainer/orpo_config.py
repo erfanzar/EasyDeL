@@ -57,7 +57,7 @@ class ORPOConfig(TrainingArguments):
 	    max_sequence_length (int): Computed attribute representing the maximum sequence length
 	                               used for training. It is set in the __post_init__ method.
 	"""
-
+	model_name: str = "EasyDeL-ORPOTrainer-Model"
 	learning_rate: float = 1e-6
 	max_length: tp.Optional[int] = 1024
 	max_prompt_length: tp.Optional[int] = 512

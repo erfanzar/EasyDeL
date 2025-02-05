@@ -89,9 +89,12 @@ class DPOConfig(TrainingArguments):
 	        (e.g., custom metrics, logging hooks). Default: None
 
 	Example:
-	    >>> config = DPOConfig(beta=0.2, loss_type="ipo", max_length=1024, learning_rate=5e-6)
+	    >>> config = DPOConfig(
+	    ...   beta=0.2, loss_type="ipo", max_length=1024, learning_rate=5e-6
+	    ... )
 	"""
 
+	model_name: str = "EasyDeL-DPOTrainer-Model"
 	beta: float = 0.1
 	label_smoothing: float = 0.0
 	loss_type: LOSS_FN_VARIENTS = "sigmoid"

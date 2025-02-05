@@ -1044,7 +1044,7 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 	):
 		"""Log metrics and update progress bar."""
 
-		if (step % self.arguments.log_steps == 0) or (step == 0):
+		if step % self.arguments.log_steps == 0:
 			if step == 0:
 				pbar.reset()
 			display_metrics = {
@@ -1060,6 +1060,5 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 			pbar.set_postfix(**display_metrics)
 			update_size = 0 if step == 0 else self.arguments.log_steps
 			pbar.update(update_size)
-
-			# Log metrics to wandb/tensorboard
+		if step % self.arguments.report_steps == 0:
 			self.arguments.log_metrics(metrics=metrics, step=step)
