@@ -58,7 +58,7 @@ from easydel.infra.base_module import (
 from easydel.utils import Timers
 from easydel.utils.helpers import get_logger
 
-from .training_configurations import TrainingArguments
+from .training_configurations import TrainingArguments, MetricsType
 
 if tp.TYPE_CHECKING:
 	from datasets import Dataset, IterableDataset
@@ -549,6 +549,25 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 	@abstractmethod
 	def finish(self):
 		"""Finalize the training process."""
+		...
+
+	@abstractmethod
+	def on_step_start(
+		self,
+		state: EasyDeLState,
+		step: int,
+	) -> EasyDeLState:
+		"""hook process to call in start of the step."""
+		...
+
+	@abstractmethod
+	def on_step_end(
+		self,
+		state: EasyDeLState,
+		metrics: MetricsType,
+		step: int,
+	) -> tp.Tuple[EasyDeLState, MetricsType]:
+		"""hook process to call in start of the step."""
 		...
 
 	@abstractmethod

@@ -30,14 +30,13 @@ from easydel.infra.utils import ProcessingClassType
 from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import deepcopy_model
 
-from ..base_trainer import (
-	TrainerConfigureFunctionOutput,
-)
+from ..base_trainer import TrainerConfigureFunctionOutput
 from ..prompt_utils import maybe_apply_chat_template, maybe_extract_prompt
 from ..trainer.trainer import Trainer
 from ..utils import DataCollatorForPreference
 from ._fn import concatenated_forward, evaluation_step, training_step
 from .dpo_config import DPOConfig
+from ..training_configurations import MetricsType
 
 if tp.TYPE_CHECKING:
 	from datasets import Dataset, IterableDataset
@@ -83,13 +82,13 @@ class DPOTrainer(Trainer):
 			"You Have to pass arguments that will be used for training but you have passed"
 			"`arguments=None`"
 		)
-		assert isinstance(
-			arguments, DPOConfig
-		), f"arguments type must be `DPOConfig` but got {type(arguments)}"
+		assert isinstance(arguments, DPOConfig), (
+			f"arguments type must be `DPOConfig` but got {type(arguments)}"
+		)
 
-		assert (
-			processing_class is not None
-		), "processing_class must be specified to tokenize a DPO dataset."
+		assert processing_class is not None, (
+			"processing_class must be specified to tokenize a DPO dataset."
+		)
 		self.arguments = arguments
 		self.truncation_mode = arguments.truncation_mode
 		self.processing_class = processing_class
@@ -660,3 +659,21 @@ class DPOTrainer(Trainer):
 			return state, metrics, None
 		except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest) as run_exception:
 			return state, metrics, run_exception
+
+	def on_step_end(
+		self,
+		state: EasyDeLState,
+		metrics: MetricsType,
+		step: int,
+	) -> tp.Tuple[EasyDeLState, MetricsType]:
+		"""hook process to call in start of the step."""
+
+		if (
+			self.arguments.sync_ref_model
+			and self.reference_state is not None
+			and (step % self.arguments.ref_model_sync_steps)
+		):
+			self.reference_state = self.reference_state.replace(
+				graphstate=deepcopy_model(state.graphstate)
+			)
+		return state, metrics

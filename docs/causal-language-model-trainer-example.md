@@ -1,13 +1,14 @@
 # Training a Causal Language Model with EasyDeL
+
 In this tutorial, we will guide you through setting up and training a causal language model using the `EasyDeL` library. The example uses the Llama model architecture, demonstrating how to set up the model, prepare a training dataset, and configure the training process.
 
 ----
 
-### 1. Install Required Libraries
+## 1. Install Required Libraries
+
 First, let's install the necessary libraries and set up authentication for accessing the Hugging Face and Weights & Biases platforms.
 
-
-```
+```shell
 !pip install git+https://github.com/huggingface/transformers -U -q
 !pip install git+https://github.com/erfanzar/easydel.git -U -q
 !pip install jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q -U
@@ -24,9 +25,9 @@ Make sure to replace `YOUR_HUGGINGFACE_TOKEN` and `YOUR_WANDB_API_KEY` with your
 
 ----
 
-### 2. Import Required Libraries
-After installing the dependencies, import the necessary libraries for training.
+## 2. Import Required Libraries
 
+After installing the dependencies, import the necessary libraries for training.
 
 ```python
 import easydel as ed
@@ -43,12 +44,11 @@ PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
 ```
 
-
 ----
 
-### 3. Model Configuration and Initialization
-Here, we define model parameters and load a pretrained Llama model using EasyDeL.
+## 3. Model Configuration and Initialization
 
+Here, we define model parameters and load a pretrained Llama model using EasyDeL.
 
 ```python
 sharding_axis_dims = (1, -1, 1, 1)
@@ -82,11 +82,9 @@ This code initializes a Llama model with sharding for efficient multi-device tra
 
 ----
 
-### 4. Prepare the Tokenizer
+## 4. Prepare the Tokenizer
+
 We set up a tokenizer for the model, which is responsible for converting text into input IDs for training.
-
-
-
 
 ```python
 config = model.config
@@ -99,12 +97,11 @@ tokenizer.pad_token = tokenizer.eos_token if tokenizer.pad_token is None else to
 tokenizer.padding_side = "right"
 ```
 
-
 ----
 
-### 5. Load and Prepare the Dataset
-In this step, load your training data using the datasets library and apply the tokenizer.
+## 5. Load and Prepare the Dataset
 
+In this step, load your training data using the datasets library and apply the tokenizer.
 
 ```python
 # Replace with your dataset loading code
@@ -126,9 +123,9 @@ Make sure to replace the placeholder with your actual dataset details. You can e
 
 ----
 
-### 6. Define Training Arguments
-Configure the training process by setting up various arguments such as learning rate, batch size, and training epochs.
+## 6. Define Training Arguments
 
+Configure the training process by setting up various arguments such as learning rate, batch size, and training epochs.
 
 ```python
 train_arguments = ed.TrainingArguments(
@@ -137,7 +134,7 @@ train_arguments = ed.TrainingArguments(
     learning_rate_end=9e-6,
     warmup_steps=100,
     optimizer=ed.EasyDeLOptimizers.ADAMW,
-    scheduler=ed.EasyDeLSchedulers.WARM_UP_COSINE,
+    scheduler=ed.EasyDeLSchedulers.COSINE,
     weight_decay=0.02,
     total_batch_size=48,
     max_sequence_length=max_length,
@@ -157,15 +154,15 @@ The arguments can be adjusted based on your computational resources and training
 
 ----
 
-### 7. Train the Model
-Now, create the trainer and start training.
+## 7. Train the Model
 
+Now, create the trainer and start training.
 
 ```python
 trainer = ed.CausalLanguageModelTrainer(
-	arguments=train_arguments,
-	model=model,
-	dataset_train=packed_dataset,
+ arguments=train_arguments,
+ model=model,
+ dataset_train=packed_dataset,
 )
 
 output = trainer.train(model_parameters=model_parameters, state=None)
@@ -175,9 +172,9 @@ This code will start the training process and save model checkpoints at specifie
 
 ----
 
-### 8. Save and Upload the Model
-After training, save the model and upload it to the Hugging Face Hub.
+## 8. Save and Upload the Model
 
+After training, save the model and upload it to the Hugging Face Hub.
 
 ```python
 # Create a new repository or update an existing one
@@ -186,14 +183,14 @@ api.create_repo(new_repo_id, private=True, exist_ok=True)
 # Save the trained model
 file_path = "/".join(output.checkpoint_path.split("/")[:-1])
 output.state.module.save_pretrained(
-	file_path, output.state.params["params"], float_dtype=dtype
+ file_path, output.state.params["params"], float_dtype=dtype
 )
 
 # Upload the model to the Hugging Face Hub
 api.upload_folder(
-	repo_id=new_repo_id,
-	folder_path=file_path,
-	ignore_patterns="events.out.tfevents.*",
+ repo_id=new_repo_id,
+ folder_path=file_path,
+ ignore_patterns="events.out.tfevents.*",
 )
 ```
 
@@ -201,7 +198,8 @@ This step allows you to save and share your trained model, making it accessible 
 
 ----
 
-### Conclusion
+## Conclusion
+
 You've now trained a causal language model using `EasyDeL`! Feel free to explore more configuration options and try different datasets to see how the model's performance varies. For further customization and detailed explanations, refer to the `EasyDeL` documentation.
 
 Happy training!

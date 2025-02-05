@@ -193,6 +193,23 @@ class BaseTrainer(BaseTrainerProtocol):
 			except Exception:
 				...
 
+	def on_step_start(
+		self,
+		state: EasyDeLState,
+		step: int,
+	) -> EasyDeLState:
+		"""hook process to call in start of the step."""
+		return state
+
+	def on_step_end(
+		self,
+		state: EasyDeLState,
+		metrics: MetricsType,
+		step: int,
+	) -> tp.Tuple[EasyDeLState, MetricsType]:
+		"""hook process to call in start of the step."""
+		return state, metrics
+
 	def get_runstage_flops(self, is_training) -> tp.Union[float, tp.Tuple[float, bool]]:
 		try:
 			function = (

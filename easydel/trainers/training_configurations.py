@@ -130,7 +130,7 @@ class TrainingArguments:
 	use_wandb: bool = True
 	verbose: bool = True
 	wandb_entity: tp.Optional[str] = None
-	warmup_steps: int = 500
+	warmup_steps: int = 0
 	weight_decay: float = 0.01
 
 	@property
@@ -164,9 +164,9 @@ class TrainingArguments:
 		Performs validation checks on the provided configuration settings.
 		Raises ValueError if any configuration is invalid.
 		"""
-		assert (
-			self.gradient_accumulation_steps > 0
-		), "`gradient_accumulation_steps` can't be lower than 1."
+		assert self.gradient_accumulation_steps > 0, (
+			"`gradient_accumulation_steps` can't be lower than 1."
+		)
 
 		if self.backend not in AVAILABLE_BACKENDS:
 			raise ValueError(
@@ -300,6 +300,8 @@ class TrainingArguments:
 		optimizer_kwargs = deepcopy(self.optimizer_kwargs)
 		scheduler = optimizer_kwargs.pop("scheduler", None)
 		if scheduler == "none":
+			scheduler = None
+		if scheduler == EasyDeLSchedulers.NONE:
 			scheduler = None
 		scheduler_config = SchedulerConfig(
 			scheduler_type=scheduler,
