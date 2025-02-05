@@ -28,8 +28,7 @@ import jax
 import jax.experimental
 import jax.tree_util
 import numpy as np
-from aqt.jax.v2 import config as q_config
-from aqt.jax.v2.flax import aqt_flax as q_flax
+
 from eformer.escale import PartitionAxis, with_sharding_constraint
 from einops import rearrange
 from flax import nnx as nn
@@ -181,22 +180,31 @@ def get_dot_general_by_bits(
 	Returns:
 	    A dict that contain dot_general_cls
 	"""
-	if mode == EasyMethod.TRAIN:
-		rhs_quant_mode = q_flax.QuantMode.TRAIN
-	elif mode == EasyMethod.EVAL or mode == EasyMethod.SERVE:
-		rhs_quant_mode = q_flax.QuantMode.SERVE
-	elif mode == EasyMethod.CONVERT:
-		rhs_quant_mode = q_flax.QuantMode.CONVERT
-	else:
-		raise ValueError("Unknown Quant Method for EasyMethod")
 	if bits is not None:
-		return {
-			"dot_general_cls": functools.partial(
-				q_flax.AqtDotGeneral,
-				cfg=q_config.fully_quantized(fwd_bits=bits, bwd_bits=bits),
-				rhs_quant_mode=rhs_quant_mode,
-			)
-		}
+		try:
+			from aqt.jax.v2 import config as q_config
+			from aqt.jax.v2.flax import aqt_flax as q_flax
+		except ModuleNotFoundError as e:
+			raise ModuleNotFoundError(
+				"No module named `aqt` has been found, please "
+				"install aqt before using bits option in EasyDeL"
+			) from e
+		if mode == EasyMethod.TRAIN:
+			rhs_quant_mode = q_flax.QuantMode.TRAIN
+		elif mode == EasyMethod.EVAL or mode == EasyMethod.SERVE:
+			rhs_quant_mode = q_flax.QuantMode.SERVE
+		elif mode == EasyMethod.CONVERT:
+			rhs_quant_mode = q_flax.QuantMode.CONVERT
+		else:
+			raise ValueError("Unknown Quant Method for EasyMethod")
+
+			return {
+				"dot_general_cls": functools.partial(
+					q_flax.AqtDotGeneral,
+					cfg=q_config.fully_quantized(fwd_bits=bits, bwd_bits=bits),
+					rhs_quant_mode=rhs_quant_mode,
+				)
+			}
 	return {}  # empty just in case of not getting any error
 
 

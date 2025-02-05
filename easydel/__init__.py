@@ -392,8 +392,9 @@ if _jax.default_backend() == "gpu":
 		del torch
 	except ModuleNotFoundError:
 		print(
-			"UserWarning: please install `torch-cpu` since `easydel` "
-			"uses `triton` and `triton` uses `torch` for autotuning.",
+			"UserWarning: please install `torch` (cpu or gpu) since `easydel` "
+			"uses `triton` and `triton` uses `torch` for autotuning, "
+			"and you can not use AutoEasyModel from torch.",
 		)
 del _jax
 del _Version
