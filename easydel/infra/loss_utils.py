@@ -818,8 +818,8 @@ def ForCausalLMLoss(
 
 
 def ForSequenceClassificationLoss(
-	labels: jax.Array,
 	logits: jax.Array,
+	labels: jax.Array,
 	attention_mask: tp.Optional[jax.Array] = None,
 	config: tp.Optional[LossConfig] = None,
 	paxis: tp.Optional[PartitionAxis] = None,
@@ -857,8 +857,8 @@ def ForSequenceClassificationLoss(
 		loss = jnp.mean((logits.squeeze() - labels.squeeze()) ** 2)
 	elif config.problem_type == "single_label_classification":
 		return fixed_cross_entropy(
-			source=logits,
-			target=labels,
+			source=logits.reshape(-1, num_labels),
+			target=labels.reshape(-1),
 			attention_mask=attention_mask,
 			config=config,
 			batch=batch,
