@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import functools
 import gc
 import os
 import typing as tp
@@ -21,7 +22,6 @@ import warnings
 import jax
 import jax.extend
 import numpy as np
-import torch
 from jax import dlpack
 from jax import numpy as jnp
 from tqdm.autonotebook import tqdm
@@ -33,6 +33,7 @@ from .traversals import flatten_dict, unflatten_dict
 
 if tp.TYPE_CHECKING:
 	from transformers import PreTrainedModel
+
 	from easydel.infra.base_config import EasyDeLBaseConfig
 	from easydel.infra.base_module import EasyDeLBaseModule
 
@@ -150,7 +151,7 @@ def process_tensor(
 	new_key = key
 	# Handle embedding layers
 	if any(layer_name in key for layer_name in config["embedding_layer_names"]):
-		new_key = f"{key[:-len('.weight')]}.embedding"
+		new_key = f"{key[: -len('.weight')]}.embedding"
 
 	# Handle layer normalization
 
@@ -365,10 +366,17 @@ def module_to_huggingface_model(
 	return model
 
 
+@functools.lru_cache
+def get_torch():
+	import torch
+
+	return torch
+
+
 def jax2pt(x: jax.Array):
 	if os.environ.get("EASY_SAFE_TRANSFER", "true") in ["true", "yes", "1", "on"]:
 		x = jax.device_get(x)
-		return torch.from_numpy(np.array(x.tolist(), dtype=x.dtype))
+		return get_torch().from_numpy(np.array(x.tolist(), dtype=x.dtype))
 	else:
 		# This one causes a lot of funny bugs, where weights in state_dict are same (both in cpp and python)
 		#  but estimated correct elements are ~85%
