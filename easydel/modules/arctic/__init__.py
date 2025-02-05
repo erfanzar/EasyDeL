@@ -13,6 +13,15 @@
 # limitations under the License.
 
 from .arctic_configuration import ArcticConfig
-from .modeling_arctic_flax import ArcticForCausalLM, ArcticModel
+from .modeling_arctic_flax import (
+	ArcticForCausalLM,
+	ArcticModel,
+	ArcticForSequenceClassification,
+)
 
-__all__ = "ArcticModel", "ArcticForCausalLM", "ArcticConfig"
+__all__ = (
+	"ArcticModel",
+	"ArcticForCausalLM",
+	"ArcticConfig",
+	"ArcticForSequenceClassification",
+)

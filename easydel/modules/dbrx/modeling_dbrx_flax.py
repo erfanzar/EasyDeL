@@ -20,12 +20,16 @@ from functools import cached_property
 import chex
 import jax
 import jax.numpy as jnp
-from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
-from easydel.infra.modeling_outputs import MoeCausalLMOutput, MoeModelOutput
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
+from easydel.infra.modeling_outputs import (
+	FlaxSequenceClassifierOutput,
+	MoeCausalLMOutput,
+	MoeModelOutput,
+)
 from easydel.infra.utils import (
 	ACT2FN,
 	auto_remat,
@@ -47,7 +51,7 @@ class DbrxAttention(FlaxAttentionModule):
 		config: DbrxConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -227,7 +231,7 @@ class DbrxNormAttentionNorm(nn.Module):
 		config: DbrxConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -322,7 +326,7 @@ class DbrxExpertGLU(nn.Module):
 		config: DbrxConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -378,7 +382,7 @@ class DbrxExperts(nn.Module):
 		config: DbrxConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -419,7 +423,7 @@ class DbrxRouter(nn.Module):
 		config: DbrxConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -500,7 +504,7 @@ class DbrxFFN(nn.Module):
 		config: DbrxConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -539,7 +543,7 @@ class DbrxBlock(nn.Module):
 		config: DbrxConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -643,7 +647,7 @@ class DbrxModel(EasyDeLBaseModule):
 		config: DbrxConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -800,7 +804,7 @@ class DbrxForCausalLM(EasyDeLBaseModule):
 		config: DbrxConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -892,4 +896,127 @@ class DbrxForCausalLM(EasyDeLBaseModule):
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
 			router_logits=outputs.router_logits,
+		)
+
+
+@register_module(
+	TaskType.SEQUENCE_CLASSIFICATION,
+	config=DbrxConfig,
+	model_type="dbrx",
+	embedding_layer_names=["wte"],
+	layernorm_names=["norm_1", "norm_2", "norm_f"],
+)
+class DbrxForSequenceClassification(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: DbrxConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: jax.lax.PrecisionLike = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+		self.transformer = DbrxModel(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+
+		assert hasattr(
+			config, "num_labels"
+		), "in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
+		self.score = nn.Linear(
+			config.hidden_size,
+			config.num_labels,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			use_bias=False,
+			kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
+			precision=precision,
+			rngs=rngs,
+		)
+
+	def __call__(
+		self,
+		input_ids: chex.Array,
+		attention_mask: tp.Optional[chex.Array] = None,
+		position_ids: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
+		output_attentions: tp.Optional[bool] = None,
+		output_hidden_states: tp.Optional[bool] = None,
+		output_router_logits: tp.Optional[bool] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
+		return_dict: bool = True,
+	) -> FlaxSequenceClassifierOutput:
+		if output_router_logits is None:
+			output_router_logits = self.config.output_router_logits
+		transformer_outputs = self.transformer(
+			input_ids=input_ids,
+			attention_mask=attention_mask,
+			position_ids=position_ids,
+			inputs_embeds=inputs_embeds,
+			output_attentions=output_attentions,
+			output_hidden_states=output_hidden_states,
+			output_router_logits=output_router_logits,
+			past_key_values=past_key_values,
+			return_dict=True,
+			segment_ids=segment_ids,
+		)
+
+		hidden_states = transformer_outputs[0]
+		logits = self.score(hidden_states)
+		if input_ids is not None:
+			batch_size = input_ids.shape[0]
+		else:
+			batch_size = inputs_embeds.shape[0]
+
+		if self.config.pad_token_id is None and batch_size != 1:
+			raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
+		if self.config.pad_token_id is None:
+			sequence_lengths = -1
+		else:
+			if input_ids is not None:
+				sequence_lengths = (
+					jnp.argmax(jnp.equal(input_ids, self.config.pad_token_id).astype("i4"), -1)
+					- 1
+				)
+				sequence_lengths = sequence_lengths % input_ids.shape[-1]
+			else:
+				sequence_lengths = -1
+
+		pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
+		aux_loss = None
+		if output_router_logits and transformer_outputs.router_logits is not None:
+			aux_loss = auxiliary_load_balancing_loss_func(
+				gate_logits=tuple(
+					[
+						logit.reshape(batch_size * sequence_lengths, -1)
+						for logit in transformer_outputs.router_logits
+					]
+				),
+				num_experts=self.config.ffn_config.moe_num_experts,
+				top_k=self.config.ffn_config.moe_top_k,
+				attention_mask=attention_mask,
+			)
+			aux_loss = aux_loss * self.config.router_aux_loss_coef
+		if not return_dict:
+			output = (pooled_logits,) + transformer_outputs[1:] + (aux_loss,)
+			return output
+
+		return FlaxSequenceClassifierOutput(
+			logits=pooled_logits,
+			past_key_values=past_key_values,
+			hidden_states=transformer_outputs.hidden_states,
+			attentions=transformer_outputs.attentions,
+			aux_loss=aux_loss,
 		)

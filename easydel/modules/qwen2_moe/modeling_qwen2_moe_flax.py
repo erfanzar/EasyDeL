@@ -51,7 +51,7 @@ class Qwen2MoeMLP(nn.Module):
 		intermediate_size: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -100,7 +100,7 @@ class Qwen2MoeAttention(FlaxAttentionModule):
 		config: Qwen2MoeConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -285,7 +285,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 		config: Qwen2MoeConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -389,7 +389,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
 		layer_idx: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -500,7 +500,7 @@ class Qwen2MoeModel(EasyDeLBaseModule):
 		config: Qwen2MoeConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -652,7 +652,7 @@ class Qwen2MoeForCausalLM(EasyDeLBaseModule):
 		config: Qwen2MoeConfig,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -769,10 +769,9 @@ class Qwen2MoeForSequenceClassification(EasyDeLBaseModule):
 	def __init__(
 		self,
 		config: Qwen2MoeConfig,
-		num_classes: int,
 		dtype: jnp.dtype = jnp.float32,
 		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[jax.lax.Precision, str]] = None,
+		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
 	):
@@ -783,7 +782,6 @@ class Qwen2MoeForSequenceClassification(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.num_classes = num_classes
 		self.model = Qwen2MoeModel(
 			config=config,
 			dtype=dtype,
@@ -791,55 +789,74 @@ class Qwen2MoeForSequenceClassification(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-
-		self.classifier = nn.Linear(
-			config.hidden_size,
-			num_classes,
+		assert hasattr(
+			config, "num_labels"
+		), "in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
+		self.score = nn.Linear(
+			self.config.hidden_size,
+			config.num_labels,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
 			kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
-			precision=precision,
+			precision=self.precision,
 			rngs=rngs,
 		)
 
 	def __call__(
 		self,
 		input_ids: tp.Optional[chex.Array] = None,
+		inputs_embeds: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
-		inputs_embeds: tp.Optional[chex.Array] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		output_router_logits: tp.Optional[bool] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
 		return_dict: bool = True,
 	) -> tp.Union[FlaxSequenceClassifierOutput, tp.Tuple]:
-		if output_router_logits is None:
-			output_router_logits = self.config.output_router_logits
-		if output_hidden_states is None:
-			output_hidden_states = self.config.output_hidden_states
-		if output_attentions is None:
-			output_attentions = self.config.output_attentions
-		outputs = self.model(
+		transformer_outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
-			inputs_embeds=inputs_embeds,
+			past_key_values=past_key_values,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			output_router_logits=output_router_logits,
-			past_key_values=past_key_values,
-			return_dict=True,
+			return_dict=return_dict,
+			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
 
-		hidden_states = outputs.last_hidden_state
-		prediction = self.classifier(hidden_states)
-		if return_dict:
-			return FlaxSequenceClassifierOutput(
-				logits=prediction, hidden_states=hidden_states
-			)
+		hidden_states = transformer_outputs[0]
+		logits = self.score(hidden_states)
+		if input_ids is not None:
+			batch_size = input_ids.shape[0]
 		else:
-			return (prediction,)
+			batch_size = inputs_embeds.shape[0]
+
+		if self.config.pad_token_id is None and batch_size != 1:
+			raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
+		if self.config.pad_token_id is None:
+			sequence_lengths = -1
+		else:
+			if input_ids is not None:
+				sequence_lengths = (
+					jnp.argmax(jnp.equal(input_ids, self.config.pad_token_id).astype("i4"), -1)
+					- 1
+				)
+				sequence_lengths = sequence_lengths % input_ids.shape[-1]
+			else:
+				sequence_lengths = -1
+
+		pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
+
+		if not return_dict:
+			output = (pooled_logits,) + transformer_outputs[1:]
+			return output
+
+		return FlaxSequenceClassifierOutput(
+			logits=pooled_logits,
+			past_key_values=past_key_values,
+			hidden_states=transformer_outputs.hidden_states,
+			attentions=transformer_outputs.attentions,
+		)

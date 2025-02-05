@@ -22,6 +22,7 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from .arctic import (
 	ArcticConfig,
 	ArcticForCausalLM,
+	ArcticForSequenceClassification,
 	ArcticModel,
 )
 from .auto import (
@@ -52,6 +53,7 @@ from .clip import (
 from .cohere import (
 	CohereConfig,
 	CohereForCausalLM,
+	CohereForSequenceClassification,
 	CohereModel,
 )
 from .dbrx import (
@@ -59,6 +61,7 @@ from .dbrx import (
 	DbrxConfig,
 	DbrxFFNConfig,
 	DbrxForCausalLM,
+	DbrxForSequenceClassification,
 	DbrxModel,
 )
 from .deepseek_v2 import (
@@ -74,6 +77,7 @@ from .deepseek_v3 import (
 from .exaone import (
 	ExaoneConfig,
 	ExaoneForCausalLM,
+	ExaoneForSequenceClassification,
 	ExaoneModel,
 )
 from .falcon import (
@@ -84,11 +88,13 @@ from .falcon import (
 from .gemma import (
 	GemmaConfig,
 	GemmaForCausalLM,
+	GemmaForSequenceClassification,
 	GemmaModel,
 )
 from .gemma2 import (
 	Gemma2Config,
 	Gemma2ForCausalLM,
+	Gemma2ForSequenceClassification,
 	Gemma2Model,
 )
 from .gpt2 import (
@@ -136,11 +142,13 @@ from .mamba2 import (
 from .mistral import (
 	MistralConfig,
 	MistralForCausalLM,
+	MistralForSequenceClassification,
 	MistralModel,
 )
 from .mixtral import (
 	MixtralConfig,
 	MixtralForCausalLM,
+	MixtralForSequenceClassification,
 	MixtralModel,
 )
 from .mosaic_mpt import (
@@ -152,11 +160,13 @@ from .mosaic_mpt import (
 from .olmo import (
 	OlmoConfig,
 	OlmoForCausalLM,
+	OlmoForSequenceClassification,
 	OlmoModel,
 )
 from .olmo2 import (
 	Olmo2Config,
 	Olmo2ForCausalLM,
+	Olmo2ForSequenceClassification,
 	Olmo2Model,
 )
 from .openelm import (
@@ -197,6 +207,7 @@ from .qwen2 import (
 from .qwen2_moe import (
 	Qwen2MoeConfig,
 	Qwen2MoeForCausalLM,
+	Qwen2MoeForSequenceClassification,
 	Qwen2MoeModel,
 )
 from .qwen2_vl import (
@@ -229,7 +240,7 @@ from .xerxes import (
 	XerxesModel,
 )
 from .xerxes2 import (
-	Xerxes2Model,
-	Xerxes2ForCausalLM,
 	Xerxes2Config,
+	Xerxes2ForCausalLM,
+	Xerxes2Model,
 )

@@ -13,6 +13,15 @@
 # limitations under the License.
 
 from .cohere_configuration import CohereConfig
-from .modeling_cohere_flax import CohereForCausalLM, CohereModel
+from .modeling_cohere_flax import (
+	CohereForCausalLM,
+	CohereModel,
+	CohereForSequenceClassification,
+)
 
-__all__ = "CohereForCausalLM", "CohereModel", "CohereConfig"
+__all__ = (
+	"CohereForCausalLM",
+	"CohereModel",
+	"CohereConfig",
+	"CohereForSequenceClassification",
+)
