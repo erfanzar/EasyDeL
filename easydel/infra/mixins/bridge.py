@@ -128,7 +128,8 @@ class EasyBridgeMixin(PushToHubMixin):
 		config_to_save.save_pretrained(str(save_directory))
 
 		if self.can_generate() and hasattr(self, "generation_config"):
-			self.generation_config.save_pretrained(str(save_directory))
+			if self.generation_config is not None:
+				self.generation_config.save_pretrained(str(save_directory))
 
 		output_model_file = save_directory / FLAX_WEIGHTS_NAME
 		state = nn.split(self, nn.Param, ...)[1]
@@ -813,6 +814,8 @@ class EasyBridgeMixin(PushToHubMixin):
 			from transformers import AutoModelForZeroShotImageClassification as module
 		elif cls._model_task == TaskType.IMAGE_TEXT_TO_TEXT:
 			from transformers import AutoModelForImageTextToText as module
+		elif cls._model_task == TaskType.SEQUENCE_CLASSIFICATION:
+			from transformers import AutoModelForSequenceClassification as module
 		else:
 			raise ValueError(
 				"couldn't find requested hf autoloader,"

@@ -15,6 +15,7 @@ import typing as tp
 import warnings
 
 from easydel.infra.base_module import EasyDeLBaseModule
+from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils.helpers import get_logger
 
@@ -45,7 +46,7 @@ class SFTTrainer(Trainer):
 		self,
 		arguments: SFTConfig,
 		processing_class: ProcessingClassType,
-		model: tp.Optional[EasyDeLBaseModule] = None,
+		model: tp.Optional[tp.Union[EasyDeLBaseModule, EasyDeLState]] = None,
 		train_dataset: tp.Optional[Dataset] = None,
 		eval_dataset: tp.Optional[tp.Union[Dataset, tp.Dict[str, Dataset]]] = None,
 		formatting_func: tp.Optional[tp.Callable] = None,
@@ -115,12 +116,14 @@ class SFTTrainer(Trainer):
 				"You might consider adding `processing_class.padding_side = 'right'` to your code.",
 				stacklevel=1,
 			)
-
+		if not isinstance(model, EasyDeLState):
+			model = model.to_state()
 		super().__init__(
 			arguments=arguments,
 			dataset_train=train_dataset,
 			dataset_eval=eval_dataset,
-			model=model,
+			model_state=model,
+			data_collator=None,
 		)
 
 	def configure_dataloaders(self) -> TrainerConfigureDataloaderOutput:

@@ -26,6 +26,7 @@ from ml_collections import ConfigDict
 from ml_collections.config_dict import placeholder
 
 from easydel.utils.helpers import get_logger
+from easydel.infra.utils import ProcessingClassType
 
 logger = get_logger(__name__)
 
@@ -472,7 +473,7 @@ class DataCollatorForCompletionOnlyLM:
 				if response_token_ids_start_idx is None:
 					warnings.warn(
 						f"Could not find response key `{self.response_template}` in the "
-						f'following instance: {self.processing_class.decode(batch["input_ids"][i])} '
+						f"following instance: {self.processing_class.decode(batch['input_ids'][i])} "
 						f"This instance will be ignored in loss calculation. "
 						f"Note, if this happens often, consider increasing the `max_seq_length`.",
 						stacklevel=1,
@@ -503,7 +504,7 @@ class DataCollatorForCompletionOnlyLM:
 				if len(response_token_ids_idxs) == 0:
 					warnings.warn(
 						f"Could not find response key `{self.response_template}` in the "
-						f'following instance: {self.processing_class.decode(batch["input_ids"][i])} '
+						f"following instance: {self.processing_class.decode(batch['input_ids'][i])} "
 						f"This instance will be ignored in loss calculation. "
 						f"Note, if this happens often, consider increasing the `max_seq_length`.",
 						stacklevel=1,
@@ -521,7 +522,7 @@ class DataCollatorForCompletionOnlyLM:
 				if len(human_token_ids_idxs) == 0:
 					warnings.warn(
 						f"Could not find instruction key `{self.instruction_template}` in the "
-						f'following instance: {self.processing_class.decode(batch["input_ids"][i])} '
+						f"following instance: {self.processing_class.decode(batch['input_ids'][i])} "
 						f"This instance will be ignored in loss calculation. "
 						f"Note, if this happens often, consider increasing the `max_seq_length`.",
 						stacklevel=1,
@@ -546,6 +547,79 @@ class DataCollatorForCompletionOnlyLM:
 				if len(response_token_ids_idxs) < len(human_token_ids_idxs):
 					batch["labels"][i, human_token_ids_idxs[-1] :] = self.ignore_index
 
+		return batch
+
+
+@dataclass
+class RewardDataCollatorWithPadding:
+	r"""
+	Reward DataCollator class that pads the inputs to the maximum length of the batch.
+
+	Args:
+	    tokenizer (`ProcessingClassType`):
+	        The tokenizer used for encoding the data.
+	    padding (`Union[bool, str, `PaddingStrategy`]`, `optional`, defaults to `True`):
+	        padding_strategy to pass to the tokenizer.
+	    max_length (`int` or `None`, `optional`, defaults to `None`):
+	        If set will pad the sequence to a maximum provided value.
+	"""
+
+	tokenizer: ProcessingClassType
+	padding: tp.Union[bool, str] = "max_length"
+	max_length: tp.Optional[int] = None
+	truncation_mode: str = "keep_end"
+
+	def __call__(self, features: list[dict[str, tp.Any]]) -> dict[str, tp.Any]:
+		features_chosen = []
+		features_rejected = []
+		margin = []
+		has_margin = "margin" in features[0]
+		for feature in features:
+			if (
+				"input_ids_chosen" not in feature
+				or "input_ids_rejected" not in feature
+				or "attention_mask_chosen" not in feature
+				or "attention_mask_rejected" not in feature
+			):
+				raise ValueError(
+					"The features should include `input_ids_chosen`, `attention_mask_chosen`, `input_ids_rejected` and `attention_mask_rejected`"
+				)
+
+			features_chosen.append(
+				{
+					"input_ids": feature["input_ids_chosen"],
+					"attention_mask": feature["attention_mask_chosen"],
+				}
+			)
+			features_rejected.append(
+				{
+					"input_ids": feature["input_ids_rejected"],
+					"attention_mask": feature["attention_mask_rejected"],
+				}
+			)
+			if has_margin:
+				margin.append(feature["margin"])
+		batch_chosen = self.tokenizer.pad(
+			features_chosen,
+			padding=self.padding,
+			max_length=self.max_length,
+			return_tensors="jax",
+		)
+		batch_rejected = self.tokenizer.pad(
+			features_rejected,
+			padding=self.padding,
+			max_length=self.max_length,
+			return_tensors="jax",
+		)
+		batch = {
+			"input_ids_chosen": batch_chosen["input_ids"],
+			"attention_mask_chosen": batch_chosen["attention_mask"],
+			"input_ids_rejected": batch_rejected["input_ids"],
+			"attention_mask_rejected": batch_rejected["attention_mask"],
+		}
+		if has_margin:
+			margin = jnp.array(margin, dtype="f4")
+			batch["margin"] = margin
 		return batch
 
 
