@@ -801,14 +801,19 @@ def ForCausalLMLoss(
 	if config.shift_tokens:
 		shift_logits = logits[:, :-1, :]
 		shift_labels = labels[:, 1:]
+		if attention_mask is not None:
+			shift_attn_m = attention_mask[:, 1:]
 	else:
 		shift_logits = logits
 		shift_labels = labels
+		
+		if attention_mask is not None:
+			shift_attn_m = attention_mask
 
 	loss = fixed_cross_entropy(
 		source=shift_logits,
 		target=shift_labels,
-		attention_mask=attention_mask,
+		attention_mask=shift_attn_m,
 		config=config,
 		num_items_in_batch=num_items_in_batch,
 		batch=batch,

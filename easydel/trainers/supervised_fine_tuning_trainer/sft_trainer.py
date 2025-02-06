@@ -115,12 +115,12 @@ class SFTTrainer(Trainer):
 				eval_dataset = _eval_datasets["singleton"]
 		if (
 			processing_class.padding_side is not None
-			and processing_class.padding_side != "right"
+			and processing_class.padding_side != "left"
 		):
 			warnings.warn(
-				"You passed a processing_class with `padding_side` not equal to `right` to the SFTTrainer. This might lead "
+				"You passed a processing_class with `padding_side` not equal to `left` to the SFTTrainer. This might lead "
 				"to some unexpected behaviour due to overflow issues when training a model in half-precision. "
-				"You might consider adding `processing_class.padding_side = 'right'` to your code.",
+				"You might consider adding `processing_class.padding_side = 'left'` to your code.",
 				stacklevel=1,
 			)
 		if not isinstance(model, EasyDeLState):

@@ -728,11 +728,11 @@ class EasyDeLBaseModule(
 
 		if self.loss_function.__name__ == ForSequenceClassificationLoss.__name__:
 			if loss_config is None:
-				assert hasattr(
-					self.config, "num_labels"
-				), "in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
+				assert hasattr(self.config, "num_labels"), (
+					"in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
+				)
 				loss_config = LossConfig(num_labels=self.config.num_labels)
-				
+
 		assert labels is not None, "`labels` can not be `None` for computing loss."
 		loss_kwargs = loss_kwargs or {}
 		batch.pop("return_dict", None)
@@ -744,6 +744,7 @@ class EasyDeLBaseModule(
 			paxis=self.config.partition_axis,
 			**loss_kwargs,
 			**outputs,
+			**batch,
 		)
 		if hasattr(outputs, "aux_loss"):
 			if outputs.aux_loss is not None:
