@@ -13,19 +13,11 @@
 # limitations under the License.
 
 from .base_trainer import BaseTrainer
-from .direct_preference_optimization_trainer import (
-	DPOConfig,
-	DPOTrainer,
-)
-from .odds_ratio_preference_optimization_trainer import (
-	ORPOConfig,
-	ORPOTrainer,
-)
+from .direct_preference_optimization_trainer import DPOConfig, DPOTrainer
+from .odds_ratio_preference_optimization_trainer import ORPOConfig, ORPOTrainer
 from .packer import pack_sequences
-from .supervised_fine_tuning_trainer import (
-	SFTConfig,
-	SFTTrainer,
-)
+from .reward_trainer import RewardConfig, RewardTrainer
+from .supervised_fine_tuning_trainer import SFTConfig, SFTTrainer
 from .trainer import Trainer
 from .training_configurations import TrainingArguments
 from .utils import (
@@ -43,6 +35,8 @@ __all__ = (
 	"DPOTrainer",
 	"ORPOConfig",
 	"ORPOTrainer",
+	"RewardTrainer",
+	"RewardConfig",
 	"pack_sequences",
 	"SFTTrainer",
 	"SFTConfig",
