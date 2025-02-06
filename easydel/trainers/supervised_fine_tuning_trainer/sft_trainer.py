@@ -22,6 +22,7 @@ from easydel.utils.helpers import get_logger
 from ..base_trainer import TrainerConfigureDataloaderOutput
 from ..trainer import Trainer
 from ..utils import (
+	DataCollatorForCompletionOnlyLM,
 	create_constant_length_dataset,
 	get_formatting_func_from_dataset,
 )
@@ -50,6 +51,7 @@ class SFTTrainer(Trainer):
 		train_dataset: tp.Optional[Dataset] = None,
 		eval_dataset: tp.Optional[tp.Union[Dataset, tp.Dict[str, Dataset]]] = None,
 		formatting_func: tp.Optional[tp.Callable] = None,
+		data_collator: tp.Optional[DataCollatorForCompletionOnlyLM] = None,
 	):
 		if getattr(processing_class, "pad_token", None) is None:
 			processing_class.pad_token = processing_class.eos_token
@@ -57,17 +59,20 @@ class SFTTrainer(Trainer):
 
 		if formatting_func is None and arguments.dataset_text_field is None:
 			formatting_func = get_formatting_func_from_dataset(
-				train_dataset, processing_class
-			)  # type: ignore
+				train_dataset,
+				processing_class,
+			)
 
 		if not arguments.packing:
-			if arguments.dataset_text_field is None and formatting_func is None:
+			if data_collator:
 				raise ValueError(
 					"You passed `packing=False` to the SFTTrainer, but you didn't pass a "
 					"`dataset_text_field` or `formatting_func` argument."
 				)
+
 		self.dataset_num_proc = arguments.dataset_num_proc
 		self.dataset_batch_size = arguments.dataset_batch_size
+		self.arguments = arguments
 		if arguments.dataset_kwargs is None:
 			arguments.dataset_kwargs = {}
 		if train_dataset is not None:
@@ -81,6 +86,7 @@ class SFTTrainer(Trainer):
 				arguments.num_of_sequences,
 				arguments.chars_per_token,
 				remove_unused_columns=arguments.remove_unused_columns,
+				add_special_tokens=arguments.add_special_tokens,
 				**arguments.dataset_kwargs,
 			)
 		if eval_dataset is not None:
@@ -102,6 +108,7 @@ class SFTTrainer(Trainer):
 					arguments.num_of_sequences,
 					arguments.chars_per_token,
 					remove_unused_columns=arguments.remove_unused_columns,
+					add_special_tokens=arguments.add_special_tokens,
 					**arguments.dataset_kwargs,
 				)
 			if not _multiple:
@@ -123,7 +130,7 @@ class SFTTrainer(Trainer):
 			dataset_train=train_dataset,
 			dataset_eval=eval_dataset,
 			model_state=model,
-			data_collator=None,
+			data_collator=data_collator,
 		)
 
 	def configure_dataloaders(self) -> TrainerConfigureDataloaderOutput:
@@ -254,7 +261,7 @@ class SFTTrainer(Trainer):
 
 	def _prepare_non_packed_dataloader(
 		self,
-		processing_class,
+		processing_class: ProcessingClassType,
 		dataset,
 		dataset_text_field,
 		max_seq_length,
@@ -282,61 +289,62 @@ class SFTTrainer(Trainer):
 		Returns:
 		    Dataset: The processed dataset ready for training.
 		"""
-		use_formatting_func = formatting_func is not None and dataset_text_field is None
-		self._dataset_sanity_checked = False
+		from datasets import Dataset
 
 		def tokenize(element):
-			inner = (
+			inputs = (
 				element[dataset_text_field]
-				if not use_formatting_func
+				if formatting_func is None
 				else formatting_func(element)
 			)
+
 			outputs = processing_class(
-				inner,
+				inputs,
 				add_special_tokens=add_special_tokens,
 				truncation=True,
 				padding="max_length",
 				max_length=max_seq_length,
 				return_overflowing_tokens=False,
+				return_attention_mask=True,
 				return_length=False,
 			)
 
-			if use_formatting_func and not self._dataset_sanity_checked:
-				if not isinstance(inner, list):
-					raise ValueError(
-						"The `formatting_func` should return a list of processed strings since it can lead"
-						" to silent bugs."
-					)
-				else:
-					self._dataset_sanity_checked = True
+			if formatting_func is not None and not isinstance(formatting_func(element), list):
+				raise ValueError(
+					"The `formatting_func` should return a list of processed strings since it can lead to silent bugs."
+				)
 
 			return {
-				"input_ids": outputs["input_ids"][0],
-				"attention_mask": outputs["attention_mask"][0],
+				"input_ids": outputs["input_ids"],
+				"attention_mask": outputs["attention_mask"],
 			}
 
 		signature_columns = ["input_ids", "labels", "attention_mask"]
 
-		extra_columns = list(set(dataset.column_names) - set(signature_columns))
+		if dataset.column_names is not None:
+			extra_columns = list(set(dataset.column_names) - set(signature_columns))
+		else:
+			extra_columns = []
 
 		if not remove_unused_columns and len(extra_columns) > 0:
 			warnings.warn(
 				"You passed `remove_unused_columns=False` on a non-packed dataset. This might create some issues with "
-				"the default collator and yield to errors. If you want to inspect dataset other columns "
-				f"(in this case {extra_columns}), you can subclass `DataCollatorForLanguageModeling` in case you "
-				"used the default collator and create your own data collator in order to inspect the "
-				"unused dataset columns.",
+				"the default collator and yield to errors. If you want to inspect dataset other columns (in this "
+				f"case {extra_columns}), you can subclass `DataCollatorForLanguageModeling` in case you used the "
+				"default collator and create your own data collator in order to inspect the unused dataset columns.",
+				UserWarning,
 				stacklevel=1,
 			)
 
-		tokenized_dataset = dataset.map(
-			tokenize,
-			batched=False,
-			remove_columns=dataset.column_names if remove_unused_columns else None,
-			num_proc=self.dataset_num_proc,
-			batch_size=self.dataset_batch_size,
-		)
-
+		map_kwargs = {
+			"batched": True,
+			"remove_columns": dataset.column_names if remove_unused_columns else None,
+			"batch_size": self.dataset_batch_size,
+		}
+		if isinstance(dataset, Dataset):
+			map_kwargs["num_proc"] = self.dataset_num_proc
+		tokenized_dataset = dataset.map(tokenize, **map_kwargs)
+		print(tokenized_dataset)
 		return tokenized_dataset
 
 	@staticmethod
