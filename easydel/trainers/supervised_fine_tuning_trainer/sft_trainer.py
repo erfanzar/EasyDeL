@@ -343,8 +343,7 @@ class SFTTrainer(Trainer):
 		}
 		if isinstance(dataset, Dataset):
 			map_kwargs["num_proc"] = self.dataset_num_proc
-		tokenized_dataset = dataset.map(tokenize, **map_kwargs)
-		print(tokenized_dataset)
+		tokenized_dataset = dataset.map(tokenize, **map_kwargs) 
 		return tokenized_dataset
 
 	@staticmethod
