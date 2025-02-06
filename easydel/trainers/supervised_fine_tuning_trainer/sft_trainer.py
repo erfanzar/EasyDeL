@@ -65,7 +65,8 @@ class SFTTrainer(Trainer):
 					"You passed `packing=False` to the SFTTrainer, but you didn't pass a "
 					"`dataset_text_field` or `formatting_func` argument."
 				)
-
+		self.dataset_num_proc = arguments.dataset_num_proc
+		self.dataset_batch_size = arguments.dataset_batch_size
 		if arguments.dataset_kwargs is None:
 			arguments.dataset_kwargs = {}
 		if train_dataset is not None:
@@ -298,7 +299,7 @@ class SFTTrainer(Trainer):
 			)
 
 			if use_formatting_func and not self._dataset_sanity_checked:
-				if not isinstance(formatting_func(element), list):
+				if not isinstance(inner, list):
 					raise ValueError(
 						"The `formatting_func` should return a list of processed strings since it can lead"
 						" to silent bugs."
@@ -307,8 +308,8 @@ class SFTTrainer(Trainer):
 					self._dataset_sanity_checked = True
 
 			return {
-				"input_ids": outputs["input_ids"],
-				"attention_mask": outputs["attention_mask"],
+				"input_ids": outputs["input_ids"][0],
+				"attention_mask": outputs["attention_mask"][0],
 			}
 
 		signature_columns = ["input_ids", "labels", "attention_mask"]
