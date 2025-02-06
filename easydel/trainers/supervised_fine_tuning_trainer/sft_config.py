@@ -25,7 +25,7 @@ class SFTConfig(TrainingArguments):
 	Configuration class for the [`SFTTrainer`].
 
 	Parameters:
-			dataset_text_field (`str`, *optional*, defaults to `"text"`):
+			dataset_text_field (`str`, *optional*, defaults to `None`):
 					Name of the text field of the dataset. If provided, the trainer will automatically create a
 					[`ConstantLengthDataset`] based on `dataset_text_field`.
 			packing (`bool`, *optional*, defaults to `False`):
@@ -50,8 +50,10 @@ class SFTConfig(TrainingArguments):
 					Number of characters per token to use for the [`ConstantLengthDataset`]. See
 					[chars_token_ratio](https://github.com/huggingface/trl/blob/08f550674c553c36c51d1027613c29f14f3676a5/examples/stack_llama/scripts/supervised_finetuning.py#L53) for more details.
 	"""
+
 	model_name: str = "EasyDeL-SFTTrainer-Model"
-	dataset_text_field: tp.Optional[str] = "text"
+	dataset_text_field: tp.Optional[str] = None
+	add_special_tokens: bool = False
 	packing: bool = False
 	learning_rate: float = 2.0e-5
 	max_seq_length: tp.Optional[int] = None

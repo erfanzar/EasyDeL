@@ -329,10 +329,7 @@ class DataCollatorForCompletionOnlyLM:
 		self.ignore_index = ignore_index
 
 	def _whole_word_mask(self, input_tokens: tp.List[str], max_predictions=512):
-		from transformers import (
-			BertTokenizer,
-			BertTokenizerFast,
-		)
+		from transformers import BertTokenizer, BertTokenizerFast
 
 		if not isinstance(self.processing_class, (BertTokenizer, BertTokenizerFast)):
 			warnings.warn(
@@ -958,6 +955,7 @@ def leave_alone_context_manager():
 def conversations_formatting_function(
 	processing_class: "AutoTokenizer",  # type:ignore #noqa
 	messages_field: tp.Literal["messages", "conversations"],
+	tools: tp.Optional[list] = None,
 ):
 	r"""
 	return a callable function that takes in a "messages" dataset and returns a formatted dataset, based on the processing_class
@@ -970,14 +968,18 @@ def conversations_formatting_function(
 			for i in range(len(examples[messages_field])):
 				output_texts.append(
 					processing_class.apply_chat_template(
-						examples[messages_field][i], tokenize=False
+						examples[messages_field][i],
+						tokenize=False,
+						tools=tools,
 					)
-				)  # type: ignore
+				)
 			return output_texts
 		else:
 			return processing_class.apply_chat_template(
-				examples[messages_field], tokenize=False
-			)  # type: ignore
+				examples[messages_field],
+				tokenize=False,
+				tools=tools,
+			)
 
 	return format_dataset
 
@@ -1013,6 +1015,7 @@ def instructions_formatting_function(processing_class: "AutoTokenizer"):  # type
 def get_formatting_func_from_dataset(
 	dataset: tp.Union["Dataset", "ConstantLengthDataset"],  # type: ignore # noqa
 	processing_class: "AutoTokenizer",  # type:ignore #noqa
+	tools: tp.Optional[list] = None,
 ) -> tp.Optional[tp.Callable]:
 	try:
 		from datasets import Dataset, Value
@@ -1037,11 +1040,19 @@ def get_formatting_func_from_dataset(
 		if "messages" in dataset.features:
 			if dataset.features["messages"] == FORMAT_MAPPING["chatml"]:
 				logging.info("Formatting dataset with chatml format")
-				return conversations_formatting_function(processing_class, "messages")
+				return conversations_formatting_function(
+					processing_class,
+					"messages",
+					tools,
+				)
 		if "conversations" in dataset.features:
 			if dataset.features["conversations"] == FORMAT_MAPPING["chatml"]:
 				logging.info("Formatting dataset with chatml format")
-				return conversations_formatting_function(processing_class, "conversations")
+				return conversations_formatting_function(
+					processing_class,
+					"conversations",
+					tools,
+				)
 		elif dataset.features == FORMAT_MAPPING["instruction"]:
 			logging.info("Formatting dataset with instruction format")
 			return instructions_formatting_function(processing_class)
