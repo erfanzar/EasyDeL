@@ -1333,7 +1333,6 @@ class RobertaForCausalLM(EasyDeLBaseModule):
 		else:
 			shared_embedding = None
 
-		# Compute the prediction scores
 		logits = self.lm_head(hidden_states, shared_embedding=shared_embedding)
 
 		if not return_dict:

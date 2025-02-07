@@ -63,7 +63,11 @@ class Trainer(BaseTrainer):
 		def collate_fn(batch):
 			results = {}
 			for key in batch[0].keys():
-				# For causal language modeling, perform truncation as needed.
+				data_sample = batch[0][key]
+				try:
+					data_sample = jnp.array(data_sample)
+				except TypeError:
+					continue
 				if self.model.__class__.__name__ == "ForCausalLMLoss":
 					if truncation_mode == "keep_end":
 						corrected_sequence = [
@@ -75,7 +79,6 @@ class Trainer(BaseTrainer):
 						]
 					results[key] = jnp.stack(corrected_sequence)
 				else:
-					# Otherwise, simply stack the arrays.
 					corrected_sequence = [jnp.array(f[key]) for f in batch]
 					results[key] = jnp.stack(corrected_sequence)
 			return results

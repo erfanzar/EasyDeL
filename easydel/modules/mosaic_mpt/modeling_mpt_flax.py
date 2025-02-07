@@ -560,8 +560,11 @@ class MptForCausalLM(EasyDeLBaseModule):
 		last_hidden_state = outputs.last_hidden_state
 
 		if self.config.use_lm_head:
-			self.lm_head.kernel.value = self.transformer.wte.embedding.value.T
-			logits = self.lm_head(last_hidden_state)
+			logits = jax.lax.dot_general(
+				last_hidden_state,
+				self.transformer.wte.embedding.value.T,
+				(((last_hidden_state.ndim - 1), (0,)), ((), ())),
+			)
 		else:
 			logits = self.lm_head(last_hidden_state)
 

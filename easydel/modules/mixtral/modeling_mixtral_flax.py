@@ -675,11 +675,11 @@ class MixtralForCausalLM(EasyDeLBaseModule):
 		aux_loss = None
 		if output_router_logits and outputs.router_logits is not None:
 			aux_loss = auxiliary_load_balancing_loss_func(
-				gate_logits=tuple(  # type:ignore
+				gate_logits=tuple(
 					[
 						logit.reshape(batch_size * seq_length, -1)
 						for logit in outputs.router_logits
-					]  # type:ignore
+					]
 				),
 				num_experts=self.config.num_local_experts,
 				top_k=self.config.num_experts_per_tok,

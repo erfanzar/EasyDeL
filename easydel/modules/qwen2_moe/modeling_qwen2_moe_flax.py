@@ -717,8 +717,11 @@ class Qwen2MoeForCausalLM(EasyDeLBaseModule):
 		hidden_states = outputs.last_hidden_state
 
 		if self.config.tie_word_embeddings:
-			self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
-			logits = self.lm_head(hidden_states)
+			logits = jax.lax.dot_general(
+				hidden_states,
+				self.model.embed_tokens.embedding.value.T,
+				(((hidden_states.ndim - 1), (0,)), ((), ())),
+			)
 		else:
 			logits = self.lm_head(hidden_states)
 

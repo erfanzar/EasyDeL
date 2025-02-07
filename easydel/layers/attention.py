@@ -1074,7 +1074,7 @@ class FlexibleAttentionModule(nn.Module):
 			attention_weight = jnp.add(attention_weight, bias.astype(attention_weight))
 		attention_weight = jax.nn.softmax(attention_weight).astype(self.dtype)
 
-		if not deterministic and self.attention_dropout > 0.0:
+		if not deterministic and self.attention_dropout > 0.0 and dropout_rng is not None:
 			keep_prob = 1.0 - self.attention_dropout
 			dropout_shape = tuple([1] * (key_states.ndim - 2)) + attention_weight.shape[-2:]
 			keep = random.bernoulli(dropout_rng, keep_prob, dropout_shape)  # type: ignore
@@ -1781,9 +1781,16 @@ class FlaxAttentionModule(nn.Module):
 			attention_mask = jnp.logical_and(attention_mask, causal_mask)
 
 		slice_indices = (0, end_index % cache_view.value.shape[1], 0, 0)
+
 		value_cache = cache_view.value
 		key_cache = cache_view.key
+		try:
+			value_cache = value_cache.materialize()
+			key_cache = key_cache.materialize()
+		except Exception:
+			...
 		org_cache_dtype = key_cache.dtype
+
 		value_cache = lax.dynamic_update_slice(
 			value_cache.astype(value),
 			value,
@@ -1811,8 +1818,6 @@ class FlaxAttentionModule(nn.Module):
 				sharding=self.get_sharding_safely(cache_view.value),
 			)
 		)
-
-		# jax.debug.print("{}", hasattr(cache_view.key, "scale"))
 		cache_view.index = cache_view.index + num_updated_cache_vectors
 
 		return key_cache, value_cache, attention_mask

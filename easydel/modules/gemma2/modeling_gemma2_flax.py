@@ -19,9 +19,7 @@ from functools import partial
 import chex
 import jax
 import jax.numpy as jnp
-from eformer.escale import with_sharding_constraint
 from flax import nnx as nn
-from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import register_module
@@ -654,14 +652,7 @@ class Gemma2ForCausalLM(EasyDeLBaseModule):
 		)
 
 		hidden_states = outputs[0]
-		hidden_states = with_sharding_constraint(
-			arr=hidden_states,
-			sharding=PartitionSpec(
-				self.config.partition_axis.batch_axis,
-				self.config.partition_axis.sequence_axis,
-				None,
-			),
-		)
+
 		if self.config.tie_word_embeddings:
 			lm_logits = jax.lax.dot_general(
 				hidden_states,
