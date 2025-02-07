@@ -562,8 +562,11 @@ class InternLM2ForCausalLM(EasyDeLBaseModule):
 		hidden_states = outputs[0]
 
 		if self.config.tie_word_embeddings:
-			self.output.kernel.value = self.model.tok_embeddings.embedding.value.T
-			lm_logits = self.output(hidden_states)
+			lm_logits = jax.lax.dot_general(
+				hidden_states,
+				self.model.tok_embeddings.embedding.value.T,
+				(((hidden_states.ndim - 1), (0,)), ((), ())),
+			)
 		else:
 			lm_logits = self.output(hidden_states)
 

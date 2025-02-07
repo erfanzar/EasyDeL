@@ -651,12 +651,15 @@ class PhiForCausalLM(EasyDeLBaseModule):
 			segment_ids=segment_ids,
 			return_dict=True,
 		)
-
+		hidden_states = outputs.last_hidden_state
 		if self.config.tie_word_embeddings:
-			self.lm_head.kernel.value = self.model.embed_tokens.embedding.value.T
-			lm_logits = self.lm_head(outputs.last_hidden_state)
+			lm_logits = jax.lax.dot_general(
+				hidden_states,
+				self.model.embed_tokens.embedding.value.T,
+				(((hidden_states.ndim - 1), (0,)), ((), ())),
+			)
 		else:
-			lm_logits = self.lm_head(outputs.last_hidden_state)
+			lm_logits = self.lm_head(hidden_states)
 
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]

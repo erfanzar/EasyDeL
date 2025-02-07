@@ -100,6 +100,7 @@ class TrainingArguments:
 	model_parameters: tp.Optional[dict] = None
 	metrics_to_show_in_rich_pbar: tp.Optional[list] = None
 	num_train_epochs: int = 10
+	offload_dataset: bool = False
 	offload_device_type: str = "cpu"
 	offload_device_index: int = 0
 	optimizer: AVAILABLE_OPTIMIZERS = EasyDeLOptimizers.ADAMW
@@ -165,9 +166,9 @@ class TrainingArguments:
 		Performs validation checks on the provided configuration settings.
 		Raises ValueError if any configuration is invalid.
 		"""
-		assert self.gradient_accumulation_steps > 0, (
-			"`gradient_accumulation_steps` can't be lower than 1."
-		)
+		assert (
+			self.gradient_accumulation_steps > 0
+		), "`gradient_accumulation_steps` can't be lower than 1."
 
 		if self.backend not in AVAILABLE_BACKENDS:
 			raise ValueError(

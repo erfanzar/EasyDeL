@@ -496,8 +496,11 @@ class GPTNeoXForCausalLM(EasyDeLBaseModule):
 		hidden_states = outputs[0]
 
 		if self.config.tie_word_embeddings:
-			self.lm_head.kernel.value = self.gpt_neox.embed_in.embedding.value.T
-			lm_logits = self.lm_head(hidden_states)
+			lm_logits = jax.lax.dot_general(
+				hidden_states,
+				self.gpt_neox.embed_in.embedding.value.T,
+				(((hidden_states.ndim - 1), (0,)), ((), ())),
+			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
 

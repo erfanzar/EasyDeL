@@ -380,6 +380,44 @@ class EasyGenerationMixin:
 				" generate arguments will also show up in this list)"
 			)
 
+	@staticmethod
+	def _expand_inputs_for_generation(
+		expand_size: int = 1,
+		is_encoder_decoder: bool = False,
+		input_ids: tp.Optional[jnp.ndarray] = None,
+		**model_kwargs,
+	) -> tp.Tuple[jnp.ndarray, tp.Dict[str, tp.Any]]:
+		if expand_size == 1:
+			return input_ids, model_kwargs
+
+		def _expand_dict_for_generation(dict_to_expand):
+			for key in dict_to_expand:
+				if dict_to_expand[key] is not None and isinstance(
+					dict_to_expand[key], jax.Array
+				):
+					dict_to_expand[key] = jnp.repeat(
+						dict_to_expand[key],
+						axis=0,
+						repeats=expand_size,
+					)
+			return dict_to_expand
+
+		if input_ids is not None:
+			input_ids = input_ids.repeat(repeats=expand_size, axis=0)
+
+		model_kwargs = _expand_dict_for_generation(model_kwargs)
+
+		if is_encoder_decoder:
+			if model_kwargs.get("encoder_outputs") is None:
+				raise ValueError(
+					"If `is_encoder_decoder` is True, make sure that `encoder_outputs` is defined."
+				)
+			model_kwargs["encoder_outputs"] = _expand_dict_for_generation(
+				model_kwargs["encoder_outputs"]
+			)
+
+		return input_ids, model_kwargs
+
 	def generate(
 		self,
 		input_ids: chex.Array,
@@ -564,6 +602,13 @@ class EasyGenerationMixin:
 		)
 
 		if not generation_config.do_sample and generation_config.num_beams == 1:
+			if generation_config.num_return_sequences > 1:
+				input_ids, model_kwargs = self._expand_inputs_for_generation(
+					expand_size=generation_config.num_return_sequences,
+					is_encoder_decoder=self.config.is_encoder_decoder,
+					input_ids=input_ids,
+					**model_kwargs,
+				)
 			return self._greedy_search(
 				input_ids,
 				generation_config.max_length,
@@ -574,6 +619,13 @@ class EasyGenerationMixin:
 				model_kwargs=model_kwargs,
 			)
 		elif generation_config.do_sample and generation_config.num_beams == 1:
+			if generation_config.num_return_sequences > 1:
+				input_ids, model_kwargs = self._expand_inputs_for_generation(
+					expand_size=generation_config.num_return_sequences,
+					is_encoder_decoder=self.config.is_encoder_decoder,
+					input_ids=input_ids,
+					**model_kwargs,
+				)
 			logits_warper = self._get_logits_warper(generation_config=generation_config)
 			return self._sample(
 				input_ids,
@@ -931,7 +983,6 @@ class EasyGenerationMixin:
 				prng_key=prng_key_next,
 			)
 
-		# The very first prompt often has sequence length > 1, so run outside of `lax.while_loop` to comply with TPU
 		if input_ids.shape[1] > 1:
 			state = sample_search_body_fn(state)
 

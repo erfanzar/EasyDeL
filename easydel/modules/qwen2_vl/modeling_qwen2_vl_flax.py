@@ -1415,7 +1415,7 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 				"pixel_values": pixel_values,
 				"pixel_values_videos": pixel_values_videos,
 				"image_grid_thw": image_grid_thw,
-				"video_grid_thw": video_grid_thw,
+				"video_grid_thw": video_grid_thw, 
 			}
 		)
 		return self.prepare_inputs_for_call(**model_inputs)

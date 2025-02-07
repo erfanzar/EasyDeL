@@ -23,6 +23,7 @@ from functools import cached_property
 from glob import glob
 from pathlib import Path
 
+import contextlib2
 import flax
 import flax.core
 import flax.nnx
@@ -237,6 +238,7 @@ class BaseTrainer(BaseTrainerProtocol):
 		configuring dataloaders, configuring the model and optimizer, sharding the
 		model and reference model states, and configuring the training and evaluation functions.
 		"""
+
 		self._initialize_wandb()
 		self._initialize_timer()
 		self._configure_dataloaders()
@@ -263,11 +265,17 @@ class BaseTrainer(BaseTrainerProtocol):
 		this configuration.
 		"""
 		with self.timer("configure dataloaders"):
-			dataset_configurations = self.configure_dataloaders()
-			self.dataloader_train = dataset_configurations.dataloader_train
-			self.max_training_steps = dataset_configurations.max_training_steps
-			self.dataloader_eval = dataset_configurations.dataloader_eval
-			self.max_evaluation_steps = dataset_configurations.max_evaluation_steps
+			manager = (
+				jax.default_device(jax.devices(self.arguments.offload_device))
+				if self.arguments.offload_dataset
+				else contextlib2.nullcontext()
+			)
+			with manager:
+				dataset_configurations = self.configure_dataloaders()
+				self.dataloader_train = dataset_configurations.dataloader_train
+				self.max_training_steps = dataset_configurations.max_training_steps
+				self.dataloader_eval = dataset_configurations.dataloader_eval
+				self.max_evaluation_steps = dataset_configurations.max_evaluation_steps
 		self.timer.log("configure dataloaders")
 
 	def _configure_model(self):
@@ -390,6 +398,7 @@ class BaseTrainer(BaseTrainerProtocol):
 					"Please install TensorFlow to use the TensorFlow dataset conversion."
 				) from exec
 			batch_size = self.training_batch_size if is_train else self.evaluation_batch_size
+
 			return (
 				dataset.to_tf_dataset(
 					collate_fn=self.create_collect_function(
