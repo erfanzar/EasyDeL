@@ -353,7 +353,10 @@ class EasyDeLBaseModule(
 
 		def _map(path, val: nn.VariableState):
 			if val.value is not None and path in _shard_keys:
-				val.value = sharding_fns[path](val.value)
+				try:
+					val.value = sharding_fns[path](val.value)
+				except TypeError:
+					warnings.warn(f"couldn't shard/gather {'.'.join(path)}", stacklevel=1)
 			return val
 
 		state.update(state.map(_map))
@@ -728,9 +731,9 @@ class EasyDeLBaseModule(
 
 		if self.loss_function.__name__ == ForSequenceClassificationLoss.__name__:
 			if loss_config is None:
-				assert hasattr(self.config, "num_labels"), (
-					"in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
-				)
+				assert hasattr(
+					self.config, "num_labels"
+				), "in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
 				loss_config = LossConfig(num_labels=self.config.num_labels)
 
 		assert labels is not None, "`labels` can not be `None` for computing loss."

@@ -37,6 +37,16 @@ METHOD_TO_LINEAR_MAPPING = {
 }
 
 
+class Array8Bc(Array8B):
+	def astype(self, dtype):
+		return self
+
+
+class ArrayNF4c(ArrayNF4):
+	def astype(self, dtype):
+		return self
+
+
 class EasyQuantizer:
 	def __init__(
 		self,
@@ -50,16 +60,17 @@ class EasyQuantizer:
 		self.quantization_platform = quantization_platform
 
 	def __call__(self, array) -> chex.Array:
-		
 		match self.quantization_method:
 			case EasyDeLQuantizationMethods.A8BIT:
-				return Array8B(array=array)
+				return Array8Bc(array=array)
+
 			case EasyDeLQuantizationMethods.NF4:
 				should_be_quantized = True
 				if array.size % self.block_size != 0:
 					should_be_quantized = False
 				if should_be_quantized:
-					return ArrayNF4(array=array, block_size=self.block_size)
+					return ArrayNF4c(array=array, block_size=self.block_size)
+
 				return array
 			case EasyDeLQuantizationMethods.NONE:
 				return array
