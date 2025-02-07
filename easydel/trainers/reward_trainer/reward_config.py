@@ -32,7 +32,7 @@ class RewardConfig(TrainingArguments):
 	        Whether to disable dropout in the model.
 	    dataset_num_proc (`int`, *optional*, defaults to `None`):
 	        Number of processes to use for processing the dataset.
-	    center_rewards_coefficient (`float`, *optional*, defaults to `None`):
+	    center_rewards_coefficient (`float`, *optional*, defaults to `0.1`):
 	        Coefficient to incentivize the reward model to output mean-zero rewards.
 	    remove_unused_columns (`bool`, *optional*, defaults to `False`):
 	        Whether to remove the columns that are not used by the model's forward pass. Can be `True` only if
@@ -43,6 +43,6 @@ class RewardConfig(TrainingArguments):
 	max_length: tp.Optional[int] = 1024
 	disable_dropout: bool = True
 	dataset_num_proc: tp.Optional[int] = None
-	center_rewards_coefficient: tp.Optional[float] = None
+	center_rewards_coefficient: tp.Optional[float] = 0.1
 	remove_unused_columns: bool = False
 	__hash__ = hash_fn
