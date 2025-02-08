@@ -64,10 +64,11 @@ def main():
 			pad_token_id=model.generation_config.pad_token_id,
 			bos_token_id=model.generation_config.bos_token_id,
 			streaming_chunks=64,
+			num_return_sequences={1024: 4, 2048: 2},
 		),
 	)
 
-	inference.precompile()
+	inference.precompile(1, [1024, 2048])
 	print(inference.inference_name)
 	ed.vInferenceApiServer({inference.inference_name: inference}).fire()
 

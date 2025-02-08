@@ -124,6 +124,8 @@ def create_training_args(
 		scheduler=ed.EasyDeLSchedulers.COSINE,
 		clip_grad=1.0,
 		warmup_steps=warmup_steps,
+		report_steps=100,
+		log_steps=100,
 	)
 	logging.info("Training arguments created.")
 	return training_args

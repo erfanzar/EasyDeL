@@ -374,7 +374,13 @@ class Trainer(BaseTrainer):
 		Yields:
 		    dict: A dictionary of evaluation metrics for each evaluation step.
 		"""
-		eval_iter = iter(eval_dataset)
+		try:
+			eval_iter = iter(eval_dataset)
+		except TypeError as e:
+			raise RuntimeError(
+				f"Error {e} (make sure to evaluation dataset to trainer "
+				"and set do_eval to True in arguments)"
+			) from e
 		data_collator = self.data_collator
 		if data_collator is None:
 
@@ -427,7 +433,10 @@ class Trainer(BaseTrainer):
 		Returns:
 		    LossMetrics: The loss metrics computed by the sharded evaluation step function.
 		"""
-		metrics = self.sharded_evaluation_step_function(state, batch)
+		metrics = self.sharded_evaluation_step_function(
+			state,
+			self._preprocess_batch_input(state=state, batch=batch, is_train=False),
+		)
 		return metrics
 
 	def _execute_train_step(
@@ -462,7 +471,10 @@ class Trainer(BaseTrainer):
 		metrics = LossMetrics()
 		try:
 			state, metrics = jax.block_until_ready(
-				self.sharded_training_step_function(state, batch)
+				self.sharded_training_step_function(
+					state,
+					self._preprocess_batch_input(state=state, batch=batch, is_train=True),
+				)
 			)
 			# Apply post-gradient updates via the pruning module, if present.
 			if self.pruning_module is not None:

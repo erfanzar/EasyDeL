@@ -61,6 +61,7 @@ else:
 def basic_generation_first_iter_fn(
 	graphdef: EasyDeLBaseModule,
 	graphstate: dict,
+	graphother,
 	state: SampleState,
 	generation_config: vInferenceConfig,
 ) -> SampleState:
@@ -74,7 +75,7 @@ def basic_generation_first_iter_fn(
 	Returns:
 		SampleState: The initial generation state after the first sampling step.
 	"""
-	model = nn.merge(graphdef, graphstate)
+	model = nn.merge(graphdef, graphstate, graphother)
 
 	with model.config.mesh:
 		if state.running_token.shape[-1] > 1:
@@ -92,6 +93,7 @@ def basic_generation_first_iter_fn(
 def basic_generation_iter_fn(
 	graphdef: EasyDeLBaseModule,
 	graphstate: dict,
+	graphother,
 	state: SampleState,
 	generation_config: vInferenceConfig,
 	loop_max_tokens: int,
@@ -107,7 +109,7 @@ def basic_generation_iter_fn(
 		SampleState: The updated generation state after the interval generation steps.
 	"""
 
-	model = nn.merge(graphdef, graphstate)
+	model = nn.merge(graphdef, graphstate, graphother)
 
 	tlen = state.current_length + loop_max_tokens
 
@@ -136,10 +138,10 @@ COMPILED_FUNCS = {}
 
 
 def get_compiled_funcs(
-	batch_size,
-	input_tokens_length,
-	id,
-	safe=True,
+	batch_size: int,
+	input_tokens_length: int,
+	id: str,
+	safe: bool = True,
 	fn1: tp.Optional[tp.Callable] = None,
 	fn2: tp.Optional[tp.Callable] = None,
 ):

@@ -39,6 +39,10 @@ from .api_models import (
 	UsageInfo,
 )
 
+if tp.TYPE_CHECKING:
+	from .vinference import vInference
+else:
+	vInference = tp.Any
 TIMEOUT_KEEP_ALIVE = 5.0
 
 
@@ -58,16 +62,16 @@ def create_error_response(status_code: HTTPStatus, message: str) -> JSONResponse
 class vInferenceApiServer:
 	def __init__(
 		self,
-		inference_map: Dict[str, "vInference"] = None,  # noqa #type:ignore
+		inference_map: tp.Dict[str, vInference] = None,
 		max_workers: int = 10,
 	) -> None:
 		from .vinference import vInference
 
 		assert inference_map is not None, "`inference_map` can not be None."
 		for inference in inference_map.values():
-			assert isinstance(
-				inference, vInference
-			), "values and inferences in inference_map must be `vInference`"
+			assert isinstance(inference, vInference), (
+				"values and inferences in inference_map must be `vInference`"
+			)
 
 		self.thread_pool = ThreadPoolExecutor(max_workers=max_workers)
 		self.inference_map = inference_map
@@ -128,7 +132,7 @@ class vInferenceApiServer:
 		except Exception as e:
 			return create_error_response(HTTPStatus.EXPECTATION_FAILED, str(e))
 
-	def _get_inference_model(self, model_name: str) -> "vInference":  # noqa #type:ignore
+	def _get_inference_model(self, model_name: str) -> vInference:
 		"""Get and validate inference model."""
 		inference = self.inference_map.get(model_name)
 		if inference is None:
@@ -138,18 +142,16 @@ class vInferenceApiServer:
 	def _prepare_tokenized_input(
 		self,
 		request: ChatCompletionRequest,
-		inference: "vInference",  # noqa #type:ignore
+		inference: vInference,
 	) -> dict:
 		"""Prepare tokenized input for the model."""
 
 		return inference.tokenizer.apply_chat_template(
 			conversation=request.messages,
-			return_dict=True,
-			tokenize=True,
 			return_tensors="np",
 			add_generation_prompt=True,
-			max_length=inference.model_prefill_length,
-			padding="max_length",
+			return_dict=True,
+			tokenize=True,
 		)
 
 	def _create_usage_info(
@@ -175,7 +177,7 @@ class vInferenceApiServer:
 	def _handle_non_streaming_response(
 		self,
 		request: ChatCompletionRequest,
-		inference: "vInference",  # noqa #type:ignore
+		inference: vInference,
 		ids: dict,
 	) -> ChatCompletionResponse:
 		"""Handle non-streaming response generation."""
@@ -191,8 +193,8 @@ class vInferenceApiServer:
 
 		processing_time = time.perf_counter() - start
 
-		final_response = inference.tokenizer.decode(
-			response.sequences[0][inference.model_prefill_length :],
+		final_responses = inference.tokenizer.batch_decode(
+			response.sequences[..., response.padded_length :],
 			skip_special_tokens=True,
 		)
 
@@ -207,10 +209,11 @@ class vInferenceApiServer:
 			model=request.model,
 			choices=[
 				ChatCompletionResponseChoice(
-					index=response.generated_tokens,
+					index=0,
 					message=ChatMessage(role="assistant", content=final_response).model_dump(),
 					finish_reason=finish_reason,
 				)
+				for final_response in final_responses
 			],
 			usage=self._create_usage_info(
 				prompt_tokens,
@@ -224,14 +227,18 @@ class vInferenceApiServer:
 
 	async def _handle_non_streaming_response_async(self, request, inference, ids):
 		response = await asyncio.get_event_loop().run_in_executor(
-			self.thread_pool, self._handle_non_streaming_response, request, inference, ids
+			self.thread_pool,
+			self._handle_non_streaming_response,
+			request,
+			inference,
+			ids,
 		)
 		return response
 
 	async def _handle_streaming_response(
 		self,
 		request: ChatCompletionRequest,
-		inference: "vInference",  # noqa #type:ignore
+		inference: vInference,
 		ids: dict,
 	) -> StreamingResponse:
 		"""Handle streaming response generation asynchronously."""
@@ -239,7 +246,6 @@ class vInferenceApiServer:
 		async def stream_results() -> tp.AsyncGenerator[bytes, tp.Any]:
 			prompt_tokens = inference.count_tokens(request.model_dump()["messages"])
 			start = time.perf_counter()
-			padded_sequence_length = inference.model_prefill_length
 
 			# Create generator in thread pool to not block the event loop
 			async def generate_tokens():
@@ -251,8 +257,11 @@ class vInferenceApiServer:
 				)
 
 			index = 0
+			padded_sequence_length = None
 			async for response in self._aiter_generator(await generate_tokens()):
 				# Process each chunk asynchronously
+				if padded_sequence_length is None:
+					padded_sequence_length = response.padded_length
 				next_slice = slice(
 					padded_sequence_length,
 					padded_sequence_length + inference.generation_config.streaming_chunks,
@@ -262,10 +271,10 @@ class vInferenceApiServer:
 				processing_time = time.perf_counter() - start
 
 				# Decode tokens in thread pool to avoid blocking
-				decoded_response = await asyncio.get_event_loop().run_in_executor(
+				decoded_responses = await asyncio.get_event_loop().run_in_executor(
 					None,
-					inference.tokenizer.decode,
-					response.sequences[0][next_slice],
+					inference.tokenizer.batch_decode,
+					response.sequences[..., next_slice],
 					True,  # skip_special_tokens
 				)
 
@@ -273,10 +282,11 @@ class vInferenceApiServer:
 					model=request.model,
 					choices=[
 						ChatCompletionStreamResponseChoice(
-							index=0,
+							index=index,
 							delta=DeltaMessage(role="assistant", content=decoded_response),
 							finish_reason=None,
 						)
+						for decoded_response in decoded_responses
 					],
 					usage=await self._create_usage_info_async(
 						prompt_tokens,
@@ -307,6 +317,7 @@ class vInferenceApiServer:
 						delta=DeltaMessage(role="assistant", content=""),
 						finish_reason=finish_reason,
 					)
+					for i in decoded_responses
 				],
 				usage=await self._create_usage_info_async(
 					prompt_tokens,

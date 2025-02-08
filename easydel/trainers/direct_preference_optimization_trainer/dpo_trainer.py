@@ -605,7 +605,7 @@ class DPOTrainer(Trainer):
 		"""
 		metrics = self.sharded_evaluation_step_function(
 			state,
-			batch,
+			self._preprocess_batch_input(state=state, batch=batch, is_train=False),
 			self.reference_state,
 		)
 		return metrics
@@ -644,7 +644,7 @@ class DPOTrainer(Trainer):
 			state, metrics = jax.block_until_ready(
 				self.sharded_training_step_function(
 					state,
-					batch,
+					self._preprocess_batch_input(state=state, batch=batch, is_train=True),
 					self.reference_state,
 				)
 			)

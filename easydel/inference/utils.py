@@ -47,6 +47,7 @@ class vInferenceConfig:
 	top_k: int = 50
 	do_sample: bool = True
 	no_repeat_ngram_size: tp.Optional[int] = None
+	num_return_sequences: tp.Optional[tp.Union[int, tp.Dict[int, int]]] = 1
 	suppress_tokens: tp.Optional[list] = None
 	forced_bos_token_id: tp.Optional[int] = None
 	forced_eos_token_id: tp.Optional[int] = None
@@ -65,6 +66,7 @@ class vInferenceConfig:
 			self.top_k,
 			self.do_sample,
 			self.no_repeat_ngram_size,
+			self.num_return_sequences,
 			self.suppress_tokens,
 			self.forced_bos_token_id,
 			self.forced_eos_token_id,
@@ -238,6 +240,7 @@ class SampleState:
 	interval_func_flops: tp.Optional[float] = float("-inf")
 	tokens_pre_second: tp.Optional[float] = float("-inf")
 	generated_tokens: tp.Optional[int] = 0
+	padded_length: tp.Optional[int] = 0
 
 	def __repr__(self):
 		"""

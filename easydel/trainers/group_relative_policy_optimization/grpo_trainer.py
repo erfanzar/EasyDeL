@@ -19,9 +19,9 @@ import eformer.escale
 import flax
 import flax.nnx
 import jax
+from transformers import AutoTokenizer
 from jax import numpy as jnp
-from transformers import AutoTokenizer, GenerationConfig
-
+from easydel.inference.vinference.vinference import vInference
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
@@ -67,6 +67,7 @@ class GRPOTrainer(Trainer):
 	def __init__(
 		self,
 		arguments: GRPOConfig,
+		vinference: vInference,
 		model: tp.Optional[tp.Union[EasyDeLBaseModule, EasyDeLState]],
 		reward_funcs: tp.Union[RewardFunc, list[RewardFunc]],
 		train_dataset: tp.Optional[Dataset] = None,
@@ -121,30 +122,11 @@ class GRPOTrainer(Trainer):
 				reward_func.model.config.pad_token_id = reward_processing_class.pad_token_id
 				reward_processing_classes[i] = reward_processing_class
 				reward_funcs[i] = reward_func
-		self.vinference = None
-		if arguments.use_vinference:
-			raise NotImplementedError("`use_vinference` is not supported yet")
-		generation_config = arguments.generation_config
-		if generation_config is None:
-			generation_config = GenerationConfig(
-				max_new_tokens=arguments.max_completion_length,
-				do_sample=True,
-				temperature=arguments.temperature,
-				num_return_sequences=arguments.num_generations,
-				pad_token_id=processing_class.pad_token_id,
-				eos_token_id=processing_class.eos_token_id,
-			)
-		if generation_config.eos_token_id is None:
-			generation_config.eos_token_id = processing_class.eos_token_id
-			if generation_config.eos_token_id is None:
-				if hasattr(model.model, "generation_config"):
-					generation_config.eos_token_id = model.model.generation_config.eos_token_id
-				if generation_config.eos_token_id is None:
-					raise ValueError(
-						"`eos_token_id` can not be None and you have to change "
-						"that value in your processing_class or generation_config"
-					)
-		self.generation_config = generation_config
+
+		self.vinference = vinference
+		self.num_return_sequences = vinference.generation_config.num_return_sequences
+		self.eos_token_id = vinference.generation_config.eos_token_id
+		self.pad_token_id = vinference.generation_config.pad_token_id
 		self.reward_processing_classes = reward_processing_classes
 		self.reward_funcs = reward_funcs
 		self.arguments = arguments
@@ -164,7 +146,6 @@ class GRPOTrainer(Trainer):
 				arguments=arguments,
 				dataset_name="eval",
 			)
-
 		super().__init__(
 			model_state=model,
 			arguments=arguments,
@@ -240,26 +221,28 @@ class GRPOTrainer(Trainer):
 		sharded_training_step_function = jax.jit(
 			partial(
 				grpo_step,
+				eos_token_id=self.eos_token_id,
+				num_generations=self.num_return_sequences,
 				beta=self.arguments.beta,
 				learning_rate_fn=self.scheduler,
 				partition_spec=self.arguments.step_partition_spec,
 				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
 				loss_config=self.arguments.loss_config,
 				reward_funcs=self.reward_funcs,
-				generation_config=self.generation_config,
 				is_training=True,
 			),
-			in_shardings=(self.state_shardings, empty_sharding, self.ref_state.shardings),
+			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=(self.state_shardings, empty_sharding),
 			donate_argnums=(0,),
 			static_argnames=[
+				"eos_token_id",
+				"num_generations",
 				"beta",
 				"learning_rate_fn",
 				"partition_spec",
 				"gradient_accumulation_steps",
 				"loss_config",
 				"reward_funcs",
-				"generation_config",
 				"is_training",
 			],
 		)
@@ -267,58 +250,32 @@ class GRPOTrainer(Trainer):
 		sharded_evaluation_step_function = jax.jit(
 			partial(
 				grpo_step,
+				eos_token_id=self.eos_token_id,
+				num_generations=self.num_return_sequences,
 				beta=self.arguments.beta,
 				learning_rate_fn=self.scheduler,
 				partition_spec=self.arguments.step_partition_spec,
 				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
 				loss_config=self.arguments.loss_config,
 				reward_funcs=self.reward_funcs,
-				generation_config=self.generation_config,
 				is_training=False,
 			),
-			in_shardings=(self.state_shardings, empty_sharding, self.ref_state.shardings),
+			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=(empty_sharding),
 			static_argnames=[
+				"eos_token_id",
+				"num_generations",
 				"beta",
 				"learning_rate_fn",
 				"partition_spec",
 				"gradient_accumulation_steps",
 				"loss_config",
 				"reward_funcs",
-				"generation_config",
 				"is_training",
 			],
 		)
 
-		def _generate_func(graphtree, batch, graphdef, graphother):
-			batch = eformer.escale.with_sharding_constraint(
-				arr=batch,
-				sharding=self.arguments.step_partition_spec,
-			)
-			apply = flax.nnx.merge(graphdef, graphtree, graphother)
-			prompt_completion_ids = apply.generate(
-				**batch,
-				generation_config=self.generation_config,
-			).sequences
-			seq_length = prompt_completion_ids.shape[1]
-
-			is_eos = jnp.equal(prompt_completion_ids, self.generation_config.eos_token_id)
-			is_eos = jnp.array(is_eos, dtype=jnp.int32)
-			masked_positions = jnp.where(is_eos == 1, jnp.arange(seq_length), seq_length * 2)
-			first_eos_positions = jnp.min(masked_positions, axis=1)
-			has_eos = first_eos_positions < seq_length
-			eos_idx = jnp.where(has_eos, first_eos_positions, seq_length)
-			sequence_indices = jnp.arange(seq_length)
-			prompt_completion_mask = jnp.array(
-				sequence_indices[None, :] <= eos_idx[:, None],
-				dtype=jnp.int32,
-			)
-			return {
-				"prompt_completion_ids": prompt_completion_ids,
-				"prompt_completion_mask": prompt_completion_mask,
-			}
-
-		def _compute_refmodel_logps(graphtree, batch, graphdef, graphother):
+		def _compute_refmodel_logps(graphtree, graphother, batch, graphdef):
 			batch = eformer.escale.with_sharding_constraint(
 				arr=batch,
 				sharding=self.arguments.step_partition_spec,
@@ -330,25 +287,17 @@ class GRPOTrainer(Trainer):
 				batch["input_ids"].shape[-1],
 			)
 
-		self.generate_func = jax.jit(
-			partial(
-				_generate_func,
-				graphdef=self.model_state.graphdef,
-				graphother=self.model_state.graphother,
-			),
-			static_argnames=["graphdef"],
-			in_shardings=(self.model_state.shardings.graphstate, empty_sharding),
-			out_shardings=(empty_sharding),
-		)
-
 		self.compute_refmodel_logps = jax.jit(
 			partial(
 				_compute_refmodel_logps,
 				graphdef=self.model_state.graphdef,
-				graphother=self.model_state.graphother,
 			),
 			static_argnames=["graphdef"],
-			in_shardings=(self.model_state.shardings.graphstate, empty_sharding),
+			in_shardings=(
+				self.model_state.shardings.graphstate,
+				self.model_state.shardings.graphother,
+				empty_sharding,
+			),
 			out_shardings=empty_sharding,
 		)
 
@@ -362,80 +311,44 @@ class GRPOTrainer(Trainer):
 			checkpoint_manager=checkpoint_manager,
 		)
 
-	def _execute_eval_step(self, state, batch) -> LossMetrics:
-		"""
-		Executes a single evaluation step.
-
-		Args:
-		    state: The current model state.
-		    batch: A processed batch of evaluation data.
-
-		Returns:
-		    LossMetrics: The loss metrics computed by the sharded evaluation step function.
-		"""
-		metrics = self.sharded_evaluation_step_function(
-			state,
-			batch,
-			self.ref_state,
-		)
-		return metrics
-
-	def _execute_train_step(
+	def _preprocess_batch_input(
 		self,
-		state,
-		batch: dict,
-	) -> tp.Tuple[EasyDeLState, LossMetrics, Exception]:
-		"""
-		Executes a single training step.
+		state: EasyDeLState,
+		batch: tp.Dict[str, jax.Array],
+		is_train: bool,
+	) -> tp.Dict[str, jax.Array]:
+		for output in self.vinference.generate(
+			input_ids=batch["input_ids"],
+			attention_mask=batch["attention_mask"],
+			graphother=state.graphother,
+			graphstate=state.graphstate,
+		):
+			...
+		sequences = output.sequences
+		completion_ids = sequences[..., output.padded_length :]
+		is_eos = completion_ids == self.vinference.generation_config.eos_token_id
+		eos_idx = jnp.full((is_eos.shape[0],), is_eos.shape[1])
+		has_eos = is_eos.any(axis=1)
+		completion_mask = (
+			(jnp.arange(is_eos.shape[1])[None, :].repeat(is_eos.shape[0], axis=0))
+			<= jnp.where(
+				has_eos,
+				jnp.argmax(is_eos.astype(jnp.int32), axis=1),
+				eos_idx,
+			)[:, None]
+		).astype(jnp.int32)
+		del output  # free kv memory
+		batch["prompt_completion_ids"] = sequences
+		batch["prompt_completion_mask"] = completion_mask
 
-		This function optionally updates the model's pruning module before and after the gradient step.
-		It then calls the sharded training step function to compute the gradients and update the state.
-		If an exception occurs (e.g. KeyboardInterrupt, timer error, or break request), it is captured and returned.
+		token_logps = self.compute_refmodel_logps(
+			self.ref_state.graphstate,
+			self.ref_state.graphother,
+			batch,
+		)
+		batch["ref_per_token_logps"] = token_logps
 
-		Args:
-		    state: The current model state.
-		    batch: A processed batch of training data.
-
-		Returns:
-		    A tuple containing:
-		        - The updated model state.
-		        - The computed LossMetrics.
-		        - An exception instance if one was raised during execution; otherwise, None.
-		"""
-		if self.pruning_module is not None:
-			state = state.replace(
-				graphstate=self.pruning_module.pre_forward_update(
-					state.graphstate,
-					state.opt_state,
-				)
-			)
-		metrics = LossMetrics()
-		try:
-			batch.update(self.generate_func(state.graphstate, batch))
-
-			batch["ref_per_token_logps"] = self.compute_refmodel_logps(
-				self.ref_state.graphstate,
-				batch,
-			)
-
-			state, metrics = jax.block_until_ready(
-				self.sharded_training_step_function(
-					state,
-					batch,
-					self.ref_state,
-				)
-			)
-			# Apply post-gradient updates via the pruning module, if present.
-			if self.pruning_module is not None:
-				state = state.replace(
-					graphstate=self.pruning_module.post_gradient_update(
-						state.graphstate,
-						state.opt_state,
-					)
-				)
-			return state, metrics, None
-		except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest) as run_exception:
-			return state, metrics, run_exception
+		return batch
 
 	def on_step_end(
 		self,
