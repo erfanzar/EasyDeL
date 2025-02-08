@@ -24,8 +24,8 @@ class GRPOConfig(TrainingArguments):
 	"""
 
 	remove_unused_columns: tp.Optional[bool] = False
-	max_prompt_length: tp.Optional[int] = 512
-	max_completion_length: tp.Optional[int] = 256
+	max_prompt_length: int = 512
+	max_completion_length: int = 256
 	dataset_num_proc: tp.Optional[int] = None
 	learning_rate: float = 1e-6
 	beta: float = 0.04
@@ -33,3 +33,7 @@ class GRPOConfig(TrainingArguments):
 	ref_model_mixup_alpha: float = 0.9
 	ref_model_sync_steps: int = 64
 	tools: tp.Optional[list] = None
+
+	def __post_init__(self):
+		self.max_sequence_length = self.max_prompt_length + self.max_completion_length
+		return super().__post_init__()

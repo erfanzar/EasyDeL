@@ -19,19 +19,21 @@ import eformer.escale
 import flax
 import flax.nnx
 import jax
-from transformers import AutoTokenizer
+from flax import nnx as nn
 from jax import numpy as jnp
+from transformers import AutoTokenizer
+
 from easydel.inference.vinference.vinference import vInference
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
-from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
-from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import ProcessingClassType
 from easydel.trainers.group_relative_policy_optimization._fn import (
 	get_per_token_logps,
 	grpo_step,
 )
 from easydel.trainers.prompt_utils import (
+	apply_chat_template,
+	is_conversational,
 	maybe_apply_chat_template,
 	maybe_extract_prompt,
 )
@@ -105,13 +107,38 @@ class GRPOTrainer(Trainer):
 				raise ValueError(
 					"The number of reward processing classes must match the number of reward functions."
 				)
-
+		empty_sharding = jax.sharding.NamedSharding(
+			spec=jax.sharding.PartitionSpec(),
+			mesh=model.model.mesh,
+		)
 		for i, (reward_processing_class, reward_func) in enumerate(
 			zip(reward_processing_classes, reward_funcs)
 		):
 			if isinstance(reward_func, (EasyDeLBaseModule, EasyDeLState)):
 				if isinstance(reward_func, EasyDeLBaseModule):
 					reward_func = reward_func.to_state()
+					sharding = reward_func.shardings
+
+					@partial(
+						jax.jit,
+						static_argnums=(0,),
+						in_shardings=(
+							sharding.graphdef,
+							sharding.graphstate,
+							sharding.graphother,
+							empty_sharding,
+						),
+						out_shardings=empty_sharding,
+					)
+					def _gen_fn(gd, gs, gt, batch):
+						batch = eformer.escale.with_sharding_constraint(
+							arr=batch,
+							sharding=self.arguments.step_partition_spec,
+						)
+						return nn.merge(gd, gs, gt)(**batch)
+
+					reward_func._gen_fn = _gen_fn
+
 				if reward_processing_class is None:
 					reward_processing_class = AutoTokenizer.from_pretrained(
 						reward_func.model.config._name_or_path
@@ -131,7 +158,8 @@ class GRPOTrainer(Trainer):
 		self.reward_funcs = reward_funcs
 		self.arguments = arguments
 		self.processing_class = processing_class
-
+		self.train_is_conversational = False
+		self.eval_is_conversational = False
 		if train_dataset is not None:
 			train_dataset = self._prepare_dataset(
 				dataset=train_dataset,
@@ -169,10 +197,16 @@ class GRPOTrainer(Trainer):
 
 		if isinstance(dataset, Dataset):
 			map_kwargs["desc"] = f"Extracting prompt in {dataset_name} dataset"
+		if dataset_name == "train":
+			self.train_is_conversational = is_conversational(dataset[0])
+		else:
+			self.eval_is_conversational = is_conversational(dataset[0])
+
 		dataset = dataset.map(maybe_extract_prompt, **map_kwargs)
 
 		if isinstance(dataset, Dataset):
 			map_kwargs["desc"] = f"Applying chat template to {dataset_name} dataset"
+
 		dataset = dataset.map(
 			maybe_apply_chat_template,
 			fn_kwargs={
@@ -228,7 +262,7 @@ class GRPOTrainer(Trainer):
 				partition_spec=self.arguments.step_partition_spec,
 				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
 				loss_config=self.arguments.loss_config,
-				reward_funcs=self.reward_funcs,
+				prompt_length=self.arguments.max_prompt_length,
 				is_training=True,
 			),
 			in_shardings=(self.state_shardings, empty_sharding),
@@ -242,7 +276,7 @@ class GRPOTrainer(Trainer):
 				"partition_spec",
 				"gradient_accumulation_steps",
 				"loss_config",
-				"reward_funcs",
+				"prompt_length",
 				"is_training",
 			],
 		)
@@ -257,7 +291,7 @@ class GRPOTrainer(Trainer):
 				partition_spec=self.arguments.step_partition_spec,
 				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
 				loss_config=self.arguments.loss_config,
-				reward_funcs=self.reward_funcs,
+				prompt_length=self.arguments.max_prompt_length,
 				is_training=False,
 			),
 			in_shardings=(self.state_shardings, empty_sharding),
@@ -270,7 +304,7 @@ class GRPOTrainer(Trainer):
 				"partition_spec",
 				"gradient_accumulation_steps",
 				"loss_config",
-				"reward_funcs",
+				"prompt_length",
 				"is_training",
 			],
 		)
@@ -284,7 +318,8 @@ class GRPOTrainer(Trainer):
 			return get_per_token_logps(
 				apply,
 				batch["prompt_completion_ids"],
-				batch["input_ids"].shape[-1],
+				batch["prompt_completion_mask"],
+				self.arguments.max_prompt_length,
 			)
 
 		self.compute_refmodel_logps = jax.jit(
@@ -311,6 +346,17 @@ class GRPOTrainer(Trainer):
 			checkpoint_manager=checkpoint_manager,
 		)
 
+	def _make_attn_mask(self, arr):
+		is_eos = arr == self.vinference.generation_config.eos_token_id
+		return (
+			(jnp.arange(is_eos.shape[1])[None, :].repeat(is_eos.shape[0], axis=0))
+			<= jnp.where(
+				is_eos.any(axis=1),
+				jnp.argmax(is_eos.astype(jnp.int32), axis=1),
+				jnp.full((is_eos.shape[0],), is_eos.shape[1]),
+			)[:, None]
+		).astype(jnp.int32)
+
 	def _preprocess_batch_input(
 		self,
 		state: EasyDeLState,
@@ -326,20 +372,12 @@ class GRPOTrainer(Trainer):
 			...
 		sequences = output.sequences
 		completion_ids = sequences[..., output.padded_length :]
-		is_eos = completion_ids == self.vinference.generation_config.eos_token_id
-		eos_idx = jnp.full((is_eos.shape[0],), is_eos.shape[1])
-		has_eos = is_eos.any(axis=1)
-		completion_mask = (
-			(jnp.arange(is_eos.shape[1])[None, :].repeat(is_eos.shape[0], axis=0))
-			<= jnp.where(
-				has_eos,
-				jnp.argmax(is_eos.astype(jnp.int32), axis=1),
-				eos_idx,
-			)[:, None]
-		).astype(jnp.int32)
+
 		del output  # free kv memory
 		batch["prompt_completion_ids"] = sequences
-		batch["prompt_completion_mask"] = completion_mask
+		batch["prompt_completion_mask"] = self._make_attn_mask(sequences)
+		batch["completion_ids"] = completion_ids
+		batch["completion_mask"] = self._make_attn_mask(completion_ids)
 
 		token_logps = self.compute_refmodel_logps(
 			self.ref_state.graphstate,
@@ -347,7 +385,67 @@ class GRPOTrainer(Trainer):
 			batch,
 		)
 		batch["ref_per_token_logps"] = token_logps
+		prompts = self.processing_class.batch_decode(
+			batch["input_ids"],
+			skip_special_tokens=True,
+		)
+		completions = self.processing_class.batch_decode(
+			completion_ids,
+			skip_special_tokens=True,
+		)
 
+		is_conversational = (
+			self.train_is_conversational if is_train else self.eval_is_conversational
+		)
+		if is_conversational:
+			completions = [
+				[{"role": "assistant", "content": completion}] for completion in completions
+			]
+
+		prompts = [
+			prompt
+			for prompt in prompts
+			for _ in range(self.vinference.generation_config.num_return_sequences)
+		]
+		rewards_per_func = jnp.zeros((len(prompts), len(self.reward_funcs)), dtype="f4")
+		for i, (reward_func, reward_processing_class) in enumerate(
+			zip(
+				self.reward_funcs,
+				self.reward_processing_classes,
+			)
+		):
+			if isinstance(reward_func, EasyDeLState):
+				if is_conversational:
+					messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
+					texts = [
+						apply_chat_template(x, reward_processing_class)["text"] for x in messages
+					]
+				else:
+					texts = [p + c for p, c in zip(prompts, completions)]
+				rew = reward_func._gen_fn(
+					reward_func.graphdef,
+					reward_func.graphstate,
+					reward_func.graphother,
+					reward_processing_class(
+						texts,
+						return_tensors="jax",
+						padding=True,
+						padding_side="right",
+						add_special_tokens=False,
+						truncation=True,
+						retrun_attention_mask=True,
+					),
+				).logits[:, 0]
+			else:
+				output_reward_func = reward_func(
+					prompts=prompts,
+					completions=completions,
+					max_length=self.arguments.max_sequence_length,
+					batch=batch,
+				)
+				rew = jnp.array(output_reward_func, dtype="f4")
+			rewards_per_func = rewards_per_func.at[:, i].set(rew.reshape(-1))
+		batch["rewards"] = rewards_per_func.sum(axis=1)
 		return batch
 
 	def on_step_end(
