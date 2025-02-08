@@ -41,17 +41,21 @@ RewardFunc = tp.Union[
 ]
 
 
-def get_per_token_logps(model, input_ids, prompt_length):
+def get_per_token_logps(model, input_ids, attention_mask, prompt_length):
 	"""
 	Get per-token log probabilities using the model outputs.
 
 	Args:
 	    model: The language model
 	    input_ids: Input token ids [batch_size, seq_len]
+	    attention_mask: Input masks [batch_size, seq_len]
 	    prompt_length: Length of the prompt
 	"""
 
-	logits = model(input_ids=input_ids).logits[:, prompt_length - 1 :]
+	logits = model(
+		input_ids=input_ids,
+		attention_mask=attention_mask,
+	).logits[:, prompt_length - 1 :]
 	logits = logits[:, :-1, :]
 	token_log_probs = compute_per_token_logps(logits, input_ids, prompt_length)
 	return token_log_probs
@@ -82,8 +86,8 @@ def grpo_step(
 	batch: tp.Mapping[str, jax.Array],
 	eos_token_id: int,
 	num_generations: int,
-	reward_funcs: RewardFunc,
 	beta: float,
+	prompt_length: int,
 	loss_config: tp.Optional[LossConfig] = None,
 	learning_rate_fn: optax.Schedule = None,
 	partition_spec: tp.Optional[PartitionSpec] = None,
@@ -102,57 +106,23 @@ def grpo_step(
 
 	def loss_fn(tree, minibatch):
 		module = flax.nnx.merge(state.graphdef, tree, state.graphother)
-		input_ids = minibatch["input_ids"]
-		attention_mask = minibatch["attention_mask"]
+
 		prompt_completion_ids = minibatch["prompt_completion_ids"]
 		prompt_completion_mask = minibatch["prompt_completion_mask"]
 		ref_per_token_logps = minibatch["ref_per_token_logps"]
-
-		batch_size, prompt_length = input_ids.shape
-		completion_ids = prompt_completion_ids[:, prompt_length:]
-		per_token_logps = get_per_token_logps(module, prompt_completion_ids, prompt_length)
+		rewards = minibatch["rewards"]
+		completion_mask = minibatch["completion_mask"]
+		per_token_logps = get_per_token_logps(
+			module,
+			prompt_completion_ids,
+			prompt_completion_mask,
+			prompt_length,
+		)
 		per_token_kl = (
 			jnp.exp(ref_per_token_logps - per_token_logps)
 			- (ref_per_token_logps - per_token_logps)
 			- 1
-		)
-		is_eos = completion_ids == eos_token_id
-		eos_idx = jnp.full((is_eos.shape[0],), is_eos.shape[1])
-		has_eos = is_eos.any(axis=1)
-		first_eos_positions = jnp.argmax(is_eos.astype(jnp.int32), axis=1)
-		eos_idx = jnp.where(has_eos, first_eos_positions, eos_idx)
-		sequence_indices = jnp.arange(is_eos.shape[1])[None, :].repeat(
-			is_eos.shape[0],
-			axis=0,
-		)
-		completion_mask = (sequence_indices <= eos_idx[:, None]).astype(jnp.int32)
-
-		rewards_per_func = jnp.zeros(
-			(batch_size * num_generations, len(reward_funcs)),
-			dtype="f4",
-		)
-		for i, reward_func in enumerate(reward_funcs):
-			if isinstance(reward_func, EasyDeLState):
-				reward_i = jax.lax.stop_gradient(
-					reward_func.model(
-						input_ids=prompt_completion_ids,
-						attention_mask=prompt_completion_mask,
-					).logits[:, 0]
-				)
-
-			else:
-				reward_i = reward_func(
-					prompt_completion_ids=prompt_completion_ids,
-					prompt_completion_mask=prompt_completion_mask,
-					completion_ids=completion_ids,
-					completion_mask=completion_mask,
-					input_ids=input_ids,
-					attention_mask=attention_mask,
-				)
-			rewards_per_func = rewards_per_func.at[:, i].set(reward_i.reshape(-1))
-		rewards = rewards_per_func.sum(axis=1)
-
-		# Reshape rewards for grouping and compute statistics
+		) 
 		grouped_rewards = rewards.reshape(-1, num_generations)
 		mean_grouped_rewards = jnp.mean(grouped_rewards, axis=1)
 		std_grouped_rewards = jnp.std(grouped_rewards, axis=1)
