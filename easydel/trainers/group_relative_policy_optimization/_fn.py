@@ -21,7 +21,6 @@ import optax
 from eformer.escale import with_sharding_constraint
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-from transformers import GenerationConfig
 
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import (
@@ -43,31 +42,47 @@ RewardFunc = tp.Union[
 
 
 def get_per_token_logps(model, input_ids, prompt_length):
+	"""
+	Get per-token log probabilities using the model outputs.
+
+	Args:
+	    model: The language model
+	    input_ids: Input token ids [batch_size, seq_len]
+	    prompt_length: Length of the prompt
+	"""
+
 	logits = model(input_ids=input_ids).logits[:, prompt_length - 1 :]
 	logits = logits[:, :-1, :]
-	return compute_per_token_logps(logits, input_ids, prompt_length)
+	token_log_probs = compute_per_token_logps(logits, input_ids, prompt_length)
+	return token_log_probs
 
 
 def compute_per_token_logps(logits, input_ids, prompt_length):
-	per_token_logps = []
-	for logits_row, input_ids_row in zip(logits, input_ids[:, prompt_length:]):
-		log_probs = jax.nn.log_softmax(logits_row, axis=-1)
-		token_log_prob = jnp.take_along_axis(
-			log_probs,
-			jnp.expand_dims(input_ids_row, axis=1),
-			axis=1,
-		)
-		token_log_prob = jnp.squeeze(token_log_prob, axis=1)
-		per_token_logps.append(token_log_prob)
-	return jnp.stack(per_token_logps)
+	"""
+	Compute per-token log probabilities in a vectorized way.
+
+	Args:
+	    logits: Pre-trimmed logits [batch_size, seq_len, vocab_size]
+	    input_ids: Input token ids [batch_size, seq_len]
+	    prompt_length: Length of the prompt
+	"""
+	log_probs = jax.nn.log_softmax(logits, axis=-1)
+	target_ids = input_ids[:, prompt_length:]
+	token_log_probs = jnp.take_along_axis(
+		log_probs,
+		jnp.expand_dims(target_ids, axis=-1),
+		axis=-1,
+	)
+	token_log_probs = jnp.squeeze(token_log_probs, axis=-1)
+	return token_log_probs
 
 
 def grpo_step(
 	state: EasyDeLState,
 	batch: tp.Mapping[str, jax.Array],
-	ref_state: EasyDeLState,
+	eos_token_id: int,
+	num_generations: int,
 	reward_funcs: RewardFunc,
-	generation_config: GenerationConfig,
 	beta: float,
 	loss_config: tp.Optional[LossConfig] = None,
 	learning_rate_fn: optax.Schedule = None,
@@ -82,12 +97,10 @@ def grpo_step(
 		batch_partition_spec=partition_spec,
 	)
 	batch = with_sharding_constraint(arr=batch, sharding=partition_spec)
-	eos_token_id = generation_config.eos_token_id
-	num_generations = generation_config.num_return_sequences
+
 	assert eos_token_id is not None, "`eos_token_id` can not be None"
 
 	def loss_fn(tree, minibatch):
-		
 		module = flax.nnx.merge(state.graphdef, tree, state.graphother)
 		input_ids = minibatch["input_ids"]
 		attention_mask = minibatch["attention_mask"]

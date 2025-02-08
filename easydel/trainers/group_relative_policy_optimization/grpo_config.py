@@ -14,11 +14,6 @@
 import typing as tp
 from dataclasses import dataclass
 
-from jax import sharding
-from transformers import GenerationConfig
-
-from easydel.inference import vInferenceConfig
-
 from ..training_configurations import TrainingArguments
 
 
@@ -30,8 +25,6 @@ class GRPOConfig(TrainingArguments):
 
 	remove_unused_columns: tp.Optional[bool] = False
 	max_prompt_length: tp.Optional[int] = 512
-	num_generations: tp.Optional[int] = 8
-	temperature: tp.Optional[float] = 0.9
 	max_completion_length: tp.Optional[int] = 256
 	dataset_num_proc: tp.Optional[int] = None
 	learning_rate: float = 1e-6
@@ -39,9 +32,4 @@ class GRPOConfig(TrainingArguments):
 	sync_ref_model: bool = False
 	ref_model_mixup_alpha: float = 0.9
 	ref_model_sync_steps: int = 64
-	generation_config: tp.Optional[GenerationConfig] = None
-	vinference_config: tp.Optional[vInferenceConfig] = None
-	vinference_input_partition_spec: tp.Optional[sharding.PartitionSpec] = None
-	vinference_seed: int = 0
-	use_vinference: bool = False
 	tools: tp.Optional[list] = None

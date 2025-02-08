@@ -211,6 +211,14 @@ class BaseTrainer(BaseTrainerProtocol):
 		"""hook process to call in start of the step."""
 		return state, metrics
 
+	def _preprocess_batch_input(
+		self,
+		state: EasyDeLState,
+		batch: tp.Dict[str, jax.Array],
+		is_train: bool,
+	) -> tp.Dict[str, jax.Array]:
+		return batch
+
 	def get_runstage_flops(self, is_training) -> tp.Union[float, tp.Tuple[float, bool]]:
 		try:
 			function = (
@@ -317,7 +325,8 @@ class BaseTrainer(BaseTrainerProtocol):
 			from eformer.escale import match_partition_rules
 
 			with self.model.mesh:
-				self.model_state = self.model_state.init_tx(self.tx)
+				if self.arguments.init_tx:
+					self.model_state = self.model_state.init_tx(self.tx)
 
 				shape = nn.eval_shape(lambda: self.model_state)
 				rules = self.model.config.get_partition_rules()

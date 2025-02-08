@@ -37,7 +37,6 @@ from jax.interpreters import pxla
 from jax.sharding import NamedSharding, PartitionSpec
 from pydantic import BaseModel
 
-
 from easydel.utils.compiling_utils import (
 	load_compiled_fn,
 	save_compiled_fn,
@@ -123,10 +122,11 @@ class vInference:
 		"""
 		from easydel.utils import GenerateRNG
 
-		graphdef, graphstate = nn.split(model)
+		graphdef, graphstate, graphother = nn.split(model, nn.Param, ...)
 		self.graphdef = graphdef
 		self.graphstate = graphstate
-		self.model = model
+		self.graphother = graphother
+
 		self.processor_class = processor_class
 		self.generation_config = self._init_generation_config(
 			generation_config, max_new_tokens
@@ -155,6 +155,10 @@ class vInference:
 		if not self._report_metrics:
 			logger.info("vInference-metrics is disabled")
 			logger.debug(f"vInference-metrics is disabled [status erm={erm}]")
+
+	@property
+	def model(self):
+		return nn.merge(self.graphdef, self.graphstate, self.graphother)
 
 	@cached_property
 	def metrics(self):
@@ -339,19 +343,38 @@ class vInference:
 		"""
 		Initializes the shardings for input data.
 		"""
+		mesh = self.model.mesh
+		fsdp = self.input_partition_spec[0]
+
 		self.input_sharding = NamedSharding(
 			spec=self.input_partition_spec,
-			mesh=self.model.mesh,
+			mesh=mesh,
 		)
 		self.empty_sharding = NamedSharding(
 			spec=PartitionSpec(),
-			mesh=self.model.mesh,
+			mesh=mesh,
 		)
 		self.generation_input_shape = NamedSharding(
-			spec=PartitionSpec(self.input_partition_spec[0], None),
-			mesh=self.model.mesh,
+			spec=PartitionSpec(fsdp, None),
+			mesh=mesh,
 		)
-		self._init_state = jax.jit(self._init_state_non_jit)
+
+	def _get_init_state(self, signature: tuple[int, int], model_kwargs):
+		assert len(signature) == 2
+		assert isinstance(signature, tuple)
+		batch_size, sequence_length = signature
+		func, _ = get_compiled_funcs(
+			batch_size,
+			sequence_length,
+			id="_init_state",
+			safe=False,
+		)
+		if func is None:
+			logger.debug(f"registering new signature({signature}) for `_init_state`")
+			lowered = jax.jit(self._init_state_non_jit).lower(**model_kwargs)
+			func = smart_compile(lowered, tag="vinference-init-state")
+			put_compiled_funcs(func, None, batch_size, sequence_length, "_init_state")
+		return func(**model_kwargs)
 
 	def _init_state_non_jit(
 		self,
@@ -359,6 +382,21 @@ class vInference:
 		rng: tp.Optional[PRNGKey] = None,
 		**model_kwargs,
 	):
+		num_return_sequences = self.generation_config.num_return_sequences
+		if num_return_sequences is None:
+			num_return_sequences = 1
+		elif isinstance(num_return_sequences, dict):
+			num_return_sequences = num_return_sequences.get(input_ids.shape[1], 1)
+
+		assert isinstance(num_return_sequences, int), (
+			"`num_return_sequences` should be int or dict mapping int to int."
+		)
+		input_ids, model_kwargs = self._expand_inputs_for_generation(
+			num_return_sequences,
+			False,
+			input_ids=input_ids,
+			**model_kwargs,
+		)
 		pad_token_id = jnp.array(self.generation_config.pad_token_id, dtype=jnp.int32)
 		batch_size, current_length = input_ids.shape
 		max_length = current_length + self.generation_config.max_new_tokens
@@ -366,18 +404,18 @@ class vInference:
 		sequences = jnp.full((batch_size, max_length), pad_token_id, dtype=jnp.int32)
 		sequences = lax.dynamic_update_slice(sequences, input_ids, (0, 0))
 		is_sequence_finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
-
+		model_kwargs = self.model.prepare_inputs_for_generation(
+			input_ids=input_ids,
+			max_length=max_length,
+			**model_kwargs,
+		)
 		return SampleState(
 			current_length=current_length,
 			sequences=sequences,
 			running_token=input_ids,
 			is_sequence_finished=is_sequence_finished,
 			prng_key=rng,
-			model_kwargs=self.model.prepare_inputs_for_generation(
-				input_ids=input_ids,
-				max_length=max_length,
-				**model_kwargs,
-			),
+			model_kwargs=model_kwargs,
 			generated_tokens=0,
 		)
 
@@ -398,68 +436,305 @@ class vInference:
 			"(Set `tokenizer.pad_token_id = tokenizer.eos_token_id` if undefined"
 			" or (`processing_class.tokenizer.pad_token_id = processing_class.tokenizer.eos_token_id`))"
 		)
-		assert (
-			self.generation_config.eos_token_id is not None
-		), "`eos_token_id` cannot be None."
+		assert self.generation_config.eos_token_id is not None, (
+			"`eos_token_id` cannot be None."
+		)
+
+	@staticmethod
+	def _expand_inputs_for_generation(
+		expand_size: tp.Optional[int] = 1,
+		is_encoder_decoder: bool = False,
+		input_ids: tp.Optional[jnp.ndarray] = None,
+		**model_kwargs,
+	) -> tp.Tuple[jnp.ndarray, tp.Dict[str, tp.Any]]:
+		if expand_size == 1 or expand_size is None:
+			return input_ids, model_kwargs
+
+		def _expand_dict_for_generation(dict_to_expand):
+			for key in dict_to_expand:
+				if dict_to_expand[key] is not None and isinstance(
+					dict_to_expand[key], jax.Array
+				):
+					dict_to_expand[key] = jnp.repeat(
+						dict_to_expand[key],
+						axis=0,
+						repeats=expand_size,
+					)
+			return dict_to_expand
+
+		if input_ids is not None:
+			input_ids = input_ids.repeat(repeats=expand_size, axis=0)
+
+		model_kwargs = _expand_dict_for_generation(model_kwargs)
+
+		if is_encoder_decoder:
+			if model_kwargs.get("encoder_outputs") is None:
+				raise ValueError(
+					"If `is_encoder_decoder` is True, make sure that `encoder_outputs` is defined."
+				)
+			model_kwargs["encoder_outputs"] = _expand_dict_for_generation(
+				model_kwargs["encoder_outputs"]
+			)
+
+		return input_ids, model_kwargs
+
+	@property
+	def SEQUENCE_DIM_MAPPING(self):
+		return {
+			"input_ids": 1,
+			"attention_mask": 1,
+			"position_ids": 1,
+			"past_key_values": 2,
+			"token_type_ids": 1,
+			"inputs_embeds": 1,
+		}
+
+	@SEQUENCE_DIM_MAPPING.setter
+	def SEQUENCE_DIM_MAPPING(self, val):
+		return val
+
+	def _find_optimal_config(
+		self,
+		batch_size: int,
+		sequence_length: int,
+	) -> tuple[int, int]:
+		"""
+		Finds the optimal precompiled configuration for given input dimensions.
+
+		Args:
+		    batch_size: The batch size of input
+		    sequence_length: The sequence length of input
+
+		Returns:
+		    tuple[int, int]: The optimal (batch_size, sequence_length) configuration
+		"""
+		if not self._precompiled_configs:
+			warnings.warn(
+				f"vInference [{self.inference_name}] doesn't contain any precompiled "
+				"config please precompile instance for best performance (eg : vinference.precompile(1,[1024, 2048, 4096, 6144]))",
+				stacklevel=1,
+			)
+			return (batch_size, sequence_length)
+
+		# Group configs by batch size
+		batch_configs = {}
+		for b, s in self._precompiled_configs:
+			if b not in batch_configs:
+				batch_configs[b] = []
+			batch_configs[b].append(s)
+
+		# Find best batch size
+		available_batches = sorted(batch_configs.keys())
+		best_batch = None
+		for b in available_batches:
+			if b >= batch_size:
+				best_batch = b
+				break
+
+		if best_batch is None:
+			best_batch = max(available_batches)
+
+		# Find best sequence length
+		available_lengths = sorted(batch_configs[best_batch])
+		max_length = max(available_lengths)
+
+		# If sequence length exceeds maximum, use maximum
+		if sequence_length > max_length:
+			best_length = max_length
+			logger.warning(
+				f"Input sequence length {sequence_length} exceeds maximum available length "
+				f"{max_length}. Input will be truncated."
+			)
+		else:
+			# Find smallest config that fits
+			best_length = None
+			for length in available_lengths:
+				if length >= sequence_length:
+					best_length = length
+					break
+
+			if best_length is None:
+				best_length = max_length
+
+		return (best_batch, best_length)
+
+	def _adjust_inputs_to_config(
+		self,
+		model_kwargs: dict,
+		target_batch: int,
+		target_length: int,
+	) -> dict:
+		"""
+		Adjusts all model inputs to match target configuration dimensions through truncation or padding.
+
+		Args:
+		    model_kwargs: Dictionary containing all model inputs
+		    target_batch: Target batch size
+		    target_length: Target sequence length
+
+		Returns:
+		    dict: Adjusted model inputs
+		"""
+		adjusted_kwargs = {}
+
+		# Get current dimensions from input_ids
+		input_ids = model_kwargs["input_ids"]
+		current_batch, current_length = input_ids.shape
+		# Define dimension adjustments for different input types
+
+		# Process each input tensor
+		for key, tensor in model_kwargs.items():
+			if tensor is None:
+				adjusted_kwargs[key] = None
+				continue
+
+			if not isinstance(tensor, (jax.Array, jax.numpy.ndarray, np.generic, np.ndarray)):
+				adjusted_kwargs[key] = tensor
+				continue
+
+			seq_dim = self.SEQUENCE_DIM_MAPPING.get(key, None)
+			if seq_dim is None:
+				adjusted_kwargs[key] = tensor
+				continue
+
+			tensor_shape = list(tensor.shape)
+
+			if seq_dim < len(tensor_shape):
+				if current_length > target_length:
+					slicing = [slice(None)] * len(tensor_shape)
+					slicing[seq_dim] = slice(0, target_length)
+					tensor = tensor[tuple(slicing)]
+				elif current_length < target_length:
+					# Pad
+					pad_width = [(0, 0)] * len(tensor_shape)
+					pad_width[seq_dim] = (0, target_length - current_length)
+
+					# Choose appropriate padding value
+					if key == "input_ids":
+						pad_value = self.generation_config.pad_token_id
+					elif key in ["attention_mask", "token_type_ids"]:
+						pad_value = 0
+					elif key == "position_ids":
+						pad_value = target_length - 1  # Use last position id
+					else:
+						pad_value = 0
+
+					tensor = jax.numpy.pad(tensor, pad_width, constant_values=pad_value)
+
+			if current_batch != target_batch:
+				batch_dim = 0
+				if current_batch > target_batch:
+					slicing = [slice(None)] * len(tensor_shape)
+					slicing[batch_dim] = slice(0, target_batch)
+					tensor = tensor[tuple(slicing)]
+				else:
+					pad_width = [(0, 0)] * len(tensor_shape)
+					pad_width[batch_dim] = (0, target_batch - current_batch)
+
+					if key == "input_ids":
+						pad_value = self.generation_config.pad_token_id
+					elif key in ["attention_mask", "token_type_ids"]:
+						pad_value = 0
+					elif key == "position_ids":
+						pad_value = tensor_shape[seq_dim] - 1
+					else:
+						pad_value = 0
+
+					tensor = jax.numpy.pad(tensor, pad_width, constant_values=pad_value)
+
+			adjusted_kwargs[key] = tensor
+
+		return adjusted_kwargs
 
 	def generate(
 		self,
 		input_ids: jax.Array,
 		attention_mask: tp.Optional[jax.Array] = None,
+		*,
+		graphstate: tp.Optional[nn.GraphState] = None,
+		graphother: tp.Optional[nn.GraphState] = None,
 		**model_kwargs,
-	) -> tp.Union[tp.Generator[SampleState, tp.Any, tp.Any], SampleState]:
+	) -> tp.Generator[tp.Union[SampleState, tp.Any], SampleState, SampleState]:
 		"""
-		Generates text in streaming chunks with improved performance monitoring and error handling.
+		Generates text in streaming chunks with comprehensive input adjustment.
 
 		Args:
 		    input_ids: Input token IDs as a JAX array
 		    attention_mask: Optional attention mask for the input
+		    graphstate (nn.GraphState, optional): in case that you want to update model state for generation.
+		    graphother (nn.GraphState, optional): in case that you want to update model ostate for generation.
 		    **model_kwargs: Additional model-specific keyword arguments
 
 		Returns:
 		    Generator yielding SampleState objects containing generation results and metrics
-
-		Raises:
-		    ValueError: If input dimensions are invalid
-		    RuntimeError: If generation fails
 		"""
 		self._metrics_increase_queue()
-
 		try:
 			# Input validation and preprocessing
 			if not isinstance(input_ids, jax.Array):
 				input_ids = jnp.array(input_ids, dtype=jnp.int32)
 
+			# Combine all inputs into model_kwargs
+			model_kwargs["input_ids"] = input_ids
+			if attention_mask is not None:
+				model_kwargs["attention_mask"] = attention_mask
+
 			batch_size, sequence_length = input_ids.shape
-			self.precompile(batch_size=batch_size, input_tokens_length=sequence_length)
-			if batch_size <= 0 or sequence_length <= 0:
-				raise ValueError(f"Invalid input dimensions: {input_ids.shape}")
+
+			# Find optimal configuration
+			target_batch, target_length = self._find_optimal_config(
+				batch_size=batch_size,
+				sequence_length=sequence_length,
+			)
+			# Adjust all inputs
+			adjusted_kwargs = self._adjust_inputs_to_config(
+				model_kwargs=model_kwargs,
+				target_batch=target_batch,
+				target_length=target_length,
+			)
+			# Ensure compilation for optimal config
+			self.precompile(batch_size=target_batch, input_tokens_length=target_length)
+
+			if target_batch <= 0 or target_length <= 0:
+				raise ValueError(
+					f"Invalid target dimensions: ({target_batch}, {target_length})"
+				)
 
 			# Prepare generation context
 			with self._inference_latency_context_manager("preprocessing"):
+				input_ids = adjusted_kwargs.pop("input_ids", None)
+				attention_mask = adjusted_kwargs.pop("attention_mask", None)
 				state = self._prepare_generation_state(
 					input_ids=input_ids,
 					attention_mask=attention_mask,
-					batch_size=batch_size,
-					sequence_length=sequence_length,
-					model_kwargs=model_kwargs,
+					batch_size=target_batch,
+					sequence_length=target_length,
+					model_kwargs=adjusted_kwargs,
 				)
+				state.padded_length = target_length
 
 				generate_func, interval_func = get_compiled_funcs(
-					batch_size=batch_size,
-					input_tokens_length=sequence_length,
+					batch_size=target_batch,
+					input_tokens_length=target_length,
 					id=self._uuid4,
 				)
 
 			# Main generation loop
 			with self._inference_latency_context_manager("inference"):
-				state = yield from self._inner_generate(state, generate_func, interval_func)
+				state = yield from self._inner_generate(
+					state,
+					generate_func,
+					interval_func,
+					graphstate=graphstate,
+					graphother=graphother,
+				)
 
 			self._post_generation_metrics_update(state)
 			return state
 
 		except Exception as e:
-			self._handle_generation_error(e)
+			raise e
+			# self._handle_generation_error(e)
 
 		finally:
 			self._metrics_decrease_queue()
@@ -490,18 +765,26 @@ class vInference:
 		if model_kwargs.get("rng") is None:
 			rng = self._rng_generator.rng
 			model_kwargs["rng"] = rng
-		return self._init_state(**model_kwargs)
+		return self._get_init_state((batch_size, sequence_length), model_kwargs)
 
 	def _inner_generate(
 		self,
 		state: SampleState,
 		generate_func: callable,
 		interval_func: callable,
+		*,
+		graphstate: tp.Optional[nn.GraphState] = None,
+		graphother: tp.Optional[nn.GraphState] = None,
 	) -> tp.Generator[SampleState, tp.Any, tp.Any]:
 		"""Core generation loop with performance monitoring."""
 
 		# Initial generation step
-		state = self._execute_generation_step(generate_func, state)
+		state = self._execute_generation_step(
+			generate_func,
+			state,
+			graphstate=graphstate,
+			graphother=graphother,
+		)
 		all_interval_func_flops = []
 		if not state.is_sequence_finished.all():
 			# Subsequent generation steps
@@ -512,6 +795,8 @@ class vInference:
 					state,
 					interval_time,
 					all_interval_func_flops,
+					graphstate=graphstate,
+					graphother=graphother,
 				)
 				yield state
 				if state.is_sequence_finished.all():
@@ -520,18 +805,28 @@ class vInference:
 
 	def _prepare_function_inputs(
 		self,
-		state,
 		func,
+		state,
+		*,
+		graphstate: tp.Optional[nn.GraphState] = None,
+		graphother: tp.Optional[nn.GraphState] = None,
 	) -> tp.Tuple[tp.Union[tp.Any, jax.Array]]:
+		if graphstate is None:
+			graphstate = self.graphstate
+		if graphother is None:
+			graphother = self.graphother
+
 		if isinstance(func, Compiled):
 			return (
-				self.graphstate,
+				graphstate,
+				graphother,
 				state,
 			)
 
 		return (
 			self.graphdef,
-			self.graphstate,
+			graphstate,
+			graphother,
 			state,
 			self.generation_config,
 		)
@@ -540,25 +835,46 @@ class vInference:
 		self,
 		state,
 		interval_func,
+		*,
+		graphstate: tp.Optional[nn.GraphState] = None,
+		graphother: tp.Optional[nn.GraphState] = None,
 	) -> tp.Tuple[tp.Union[tp.Any, jax.Array]]:
+		if graphstate is None:
+			graphstate = self.graphstate
+		if graphother is None:
+			graphother = self.graphother
 		if isinstance(interval_func, Compiled):
 			return (
-				self.graphstate,
+				graphstate,
+				graphother,
 				state,
 				self.generation_config.streaming_chunks,
 			)
 
 		return (
 			self.graphdef,
-			self.graphstate,
+			graphstate,
+			graphother,
 			state,
 			self.generation_config,
 			self.generation_config.streaming_chunks,
 		)
 
-	def _execute_generation_step(self, func: callable, state: SampleState) -> SampleState:
+	def _execute_generation_step(
+		self,
+		func: callable,
+		state: SampleState,
+		*,
+		graphstate: tp.Optional[nn.GraphState] = None,
+		graphother: tp.Optional[nn.GraphState] = None,
+	) -> SampleState:
 		"""Executes a single generation step with performance monitoring."""
-		inputs = self._prepare_function_inputs(state, func)
+		inputs = self._prepare_function_inputs(
+			func=func,
+			state=state,
+			graphstate=graphstate,
+			graphother=graphother,
+		)
 		state, _, generate_func_flops, __ = measure_flops(func, *inputs)
 		state.generate_func_flops = generate_func_flops
 		return state
@@ -569,8 +885,16 @@ class vInference:
 		state,
 		interval_time,
 		all_interval_func_flops,
+		*,
+		graphstate: tp.Optional[nn.GraphState] = None,
+		graphother: tp.Optional[nn.GraphState] = None,
 	):
-		inputs = self._prepare_iter_function_inputs(state, interval_func)
+		inputs = self._prepare_iter_function_inputs(
+			state=state,
+			interval_func=interval_func,
+			graphstate=graphstate,
+			graphother=graphother,
+		)
 		state, _, interval_func_flops, elapsed_time = measure_flops(interval_func, *inputs)
 		interval_time += elapsed_time
 		all_interval_func_flops.append(interval_func_flops)
@@ -617,22 +941,23 @@ class vInference:
 				batch_size=batch_size,
 				input_tokens_length=input_tokens_length,
 			)
-
-			state = self._init_state(**wargs)
+			state = self._get_init_state((batch_size, input_tokens_length), wargs)
 			logger.debug("smart compiling `first_iter_fn`")
 			logger.debug("lowering `first_iter_fn`")
 			first_iter_fn_lowered = jax.jit(
 				basic_generation_first_iter_fn,
-				static_argnums=(0, 3),
+				static_argnums=(0, 4),
 				in_shardings=(
 					extract_shardings(self.graphstate),
+					extract_shardings(self.graphother),
 					extract_shardings(state),
 				),
 			).lower(
-				self.graphdef,
+				self.graphdef,  # Static
 				self.graphstate,
+				self.graphother,
 				state,
-				self.generation_config,
+				self.generation_config,  # Static
 			)
 			logger.debug("`first_iter_fn` lowered successfully.")
 			compiled_generate_func = smart_compile(
@@ -641,14 +966,15 @@ class vInference:
 			)
 			logger.debug("smart compiling `iter_fn`")
 			logger.debug("lowering `iter_fn`")
-			sample_state = compiled_generate_func(self.graphstate, state)
+			sample_state = compiled_generate_func(self.graphstate, self.graphother, state)
 			sample_state_shardings = extract_shardings(sample_state)
-			
+
 			iter_fn_lowered = jax.jit(
 				basic_generation_iter_fn,
-				static_argnums=(0, 3),
+				static_argnums=(0, 4),
 				in_shardings=(
 					extract_shardings(self.graphstate),
+					extract_shardings(self.graphother),
 					sample_state_shardings,
 					None,
 				),
@@ -656,10 +982,11 @@ class vInference:
 			).lower(
 				self.graphdef,
 				self.graphstate,
+				self.graphother,
 				sample_state,
 				self.generation_config,
 				self.generation_config.streaming_chunks,
-			) 
+			)
 			logger.debug("`iter_fn` lowered successfully.")
 			compiled_interval_func = smart_compile(
 				iter_fn_lowered,
@@ -678,8 +1005,8 @@ class vInference:
 
 	def precompile(
 		self,
-		batch_size: int = 1,
-		input_tokens_length: tp.Optional[int] = None,
+		batch_size: tp.Union[int, tp.List[int]] = 1,
+		input_tokens_length: tp.Optional[tp.Union[int, tp.List[int]]] = None,
 	):
 		"""
 		Precompiles the generation functions for a given batch size and input length.
@@ -700,30 +1027,41 @@ class vInference:
 			logger.debug(
 				"`input_tokens_length` is None using `vInference.model_prefill_length`"
 			)
-		config_key = (batch_size, input_tokens_length)
-
-		if config_key in self._precompiled_configs:
-			return True
-		if config_key in self._in_compiling_process:
-			logger.debug(
-				f"lowering and compiling with `config` {config_key} have already been requested adding 5 second timeout"
+		if isinstance(batch_size, list) or isinstance(input_tokens_length, list):
+			batch_size = batch_size if isinstance(batch_size, list) else [batch_size]
+			input_tokens_length = (
+				input_tokens_length
+				if isinstance(input_tokens_length, list)
+				else [input_tokens_length]
 			)
-			time.sleep(5)
-			return self.precompile(
-				batch_size=batch_size,
-				input_tokens_length=input_tokens_length,
-			)
+			for b in batch_size:
+				for i in input_tokens_length:
+					self.precompile(b, i)
 		else:
-			with self._compilation_metrics_recorder():
-				logger.debug(f"lowering and compiling with `config` {config_key}")
-				self._in_compiling_process.add(config_key)
-				with self.mesh:
-					self._compile_and_lower_funs(
-						batch_size=batch_size,
-						input_tokens_length=input_tokens_length,
-					)
-				self._precompiled_configs.add(config_key)
-		return True
+			config_key = (batch_size, input_tokens_length)
+
+			if config_key in self._precompiled_configs:
+				return True
+			if config_key in self._in_compiling_process:
+				logger.debug(
+					f"lowering and compiling with `config` {config_key} have already been requested adding 5 second timeout"
+				)
+				time.sleep(5)
+				return self.precompile(
+					batch_size=batch_size,
+					input_tokens_length=input_tokens_length,
+				)
+			else:
+				with self._compilation_metrics_recorder():
+					logger.debug(f"lowering and compiling with `config` {config_key}")
+					self._in_compiling_process.add(config_key)
+					with self.mesh:
+						self._compile_and_lower_funs(
+							batch_size=batch_size,
+							input_tokens_length=input_tokens_length,
+						)
+					self._precompiled_configs.add(config_key)
+			return True
 
 	@tp.overload
 	def count_tokens(self, messages: tp.List[tp.Dict[str, str]]): ...

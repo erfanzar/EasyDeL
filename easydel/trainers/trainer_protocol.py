@@ -571,6 +571,15 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 		...
 
 	@abstractmethod
+	def _preprocess_batch_input(
+		self,
+		state: EasyDeLState,
+		batch: tp.Dict[str, jax.Array],
+		is_train: bool,
+	) -> tp.Dict[str, jax.Array]:
+		"""hook call before passing data to function (called in `_execute` functions)"""
+
+	@abstractmethod
 	def get_runstage_flops(self, is_training: bool) -> float:
 		"""Return the total number of FLOPs for the model."""
 		...
