@@ -56,27 +56,33 @@ def is_jit_wrapped(fn):
 	)
 
 
-def cjit(fn, static_argnames=None):
+def cjit(
+	fn: tp.Callable,
+	static_argnums: tp.Optional[tp.Tuple[str]] = None,
+	static_argnames: tp.Optional[tp.Tuple[int]] = None,
+):
 	assert is_jit_wrapped(fn=fn), "function should be jit wrapped already"
 
 	@functools.wraps(fn)
-	def wrapped(**kwargs):  # kwargs only !
-		signature = get_signature((), kwargs)
+	def wrapped(*args, **kwargs):
+		static_arg_indices = set(static_argnums) if static_argnums is not None else set()
+		dynamic_args = tuple(
+			arg for i, arg in enumerate(args) if i not in static_arg_indices
+		)
+		dynamic_kwargs = kwargs.copy()
+		if static_argnames is not None:
+			for key in static_argnames:
+				dynamic_kwargs.pop(key, None)
+		signature = get_signature(dynamic_args, dynamic_kwargs)
 		cache_key = (fn, signature)
 		if cache_key in COMPILED_CACHE:
-			if static_argnames is not None:
-				for key in static_argnames:
-					kwargs.pop(key)
-			return COMPILED_CACHE[cache_key](**kwargs)
-
-		lowered_func: Lowered = fn.lower(**kwargs)
+			compiled_func = COMPILED_CACHE[cache_key]
+			return compiled_func(*dynamic_args, **dynamic_kwargs)
+		lowered_func: Lowered = fn.lower(*args, **kwargs)
 		compiled_func = smart_compile(lowered_func, "cjit")
 		COMPILED_CACHE[cache_key] = compiled_func
 
-		if static_argnames is not None:
-			for key in static_argnames:
-				kwargs.pop(key)
-		return compiled_func(**kwargs)
+		return compiled_func(*dynamic_args, **dynamic_kwargs)
 
 	return wrapped
 

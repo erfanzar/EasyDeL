@@ -216,8 +216,8 @@ class BaseTrainer(BaseTrainerProtocol):
 		state: EasyDeLState,
 		batch: tp.Dict[str, jax.Array],
 		is_train: bool,
-	) -> tp.Dict[str, jax.Array]:
-		return batch
+	) -> tp.Tuple[tp.Dict[str, jax.Array], tp.Dict[str, tp.Union[float, int, str]]]:
+		return batch, {}
 
 	def get_runstage_flops(self, is_training) -> tp.Union[float, tp.Tuple[float, bool]]:
 		try:

@@ -618,7 +618,7 @@ class vInference:
 						pad_value = target_length - 1  # Use last position id
 					else:
 						pad_value = 0
-
+				
 					tensor = jax.numpy.pad(tensor, pad_width, constant_values=pad_value)
 
 			if current_batch != target_batch:

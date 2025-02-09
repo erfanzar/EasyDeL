@@ -24,8 +24,6 @@ from tqdm.autonotebook import tqdm
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
-from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
-from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import deepcopy_model
@@ -33,10 +31,10 @@ from easydel.utils.traversals import deepcopy_model
 from ..base_trainer import TrainerConfigureFunctionOutput
 from ..prompt_utils import maybe_apply_chat_template, maybe_extract_prompt
 from ..trainer.trainer import Trainer
+from ..training_configurations import MetricsType
 from ..utils import DataCollatorForPreference
 from ._fn import concatenated_forward, evaluation_step, training_step
 from .dpo_config import DPOConfig
-from ..training_configurations import MetricsType
 
 if tp.TYPE_CHECKING:
 	from datasets import Dataset, IterableDataset
@@ -592,73 +590,13 @@ class DPOTrainer(Trainer):
 			outs = self.concatenated_forward(self.reference_state.model, batch=padded_batch)
 		return outs["chosen_logps"], outs["rejected_logps"]
 
-	def _execute_eval_step(self, state, batch) -> LossMetrics:
-		"""
-		Executes a single evaluation step.
+	@property
+	def _train_shared_fn_extra_args(self) -> tp.Tuple[tp.Any]:
+		return (self.reference_state,)
 
-		Args:
-		    state: The current model state.
-		    batch: A processed batch of evaluation data.
-
-		Returns:
-		    LossMetrics: The loss metrics computed by the sharded evaluation step function.
-		"""
-		metrics = self.sharded_evaluation_step_function(
-			state,
-			self._preprocess_batch_input(state=state, batch=batch, is_train=False),
-			self.reference_state,
-		)
-		return metrics
-
-	def _execute_train_step(
-		self,
-		state,
-		batch,
-	) -> tp.Tuple[EasyDeLState, LossMetrics, Exception]:
-		"""
-		Executes a single training step.
-
-		This function optionally updates the model's pruning module before and after the gradient step.
-		It then calls the sharded training step function to compute the gradients and update the state.
-		If an exception occurs (e.g. KeyboardInterrupt, timer error, or break request), it is captured and returned.
-
-		Args:
-		    state: The current model state.
-		    batch: A processed batch of training data.
-
-		Returns:
-		    A tuple containing:
-		        - The updated model state.
-		        - The computed LossMetrics.
-		        - An exception instance if one was raised during execution; otherwise, None.
-		"""
-		if self.pruning_module is not None:
-			state = state.replace(
-				graphstate=self.pruning_module.pre_forward_update(
-					state.graphstate,
-					state.opt_state,
-				)
-			)
-		metrics = LossMetrics()
-		try:
-			state, metrics = jax.block_until_ready(
-				self.sharded_training_step_function(
-					state,
-					self._preprocess_batch_input(state=state, batch=batch, is_train=True),
-					self.reference_state,
-				)
-			)
-			# Apply post-gradient updates via the pruning module, if present.
-			if self.pruning_module is not None:
-				state = state.replace(
-					graphstate=self.pruning_module.post_gradient_update(
-						state.graphstate,
-						state.opt_state,
-					)
-				)
-			return state, metrics, None
-		except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest) as run_exception:
-			return state, metrics, run_exception
+	@property
+	def _eval_shared_fn_extra_args(self) -> tp.Tuple[tp.Any]:
+		return (self.reference_state,)
 
 	def on_step_end(
 		self,

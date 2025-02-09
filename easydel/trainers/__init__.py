@@ -14,6 +14,7 @@
 
 from .base_trainer import BaseTrainer
 from .direct_preference_optimization_trainer import DPOConfig, DPOTrainer
+from .group_relative_policy_optimization import GRPOConfig, GRPOTrainer
 from .odds_ratio_preference_optimization_trainer import ORPOConfig, ORPOTrainer
 from .packer import pack_sequences
 from .reward_trainer import RewardConfig, RewardTrainer
@@ -33,6 +34,8 @@ __all__ = (
 	"BaseTrainer",
 	"DPOConfig",
 	"DPOTrainer",
+	"GRPOConfig",
+	"GRPOTrainer",
 	"ORPOConfig",
 	"ORPOTrainer",
 	"RewardTrainer",

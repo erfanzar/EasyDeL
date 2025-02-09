@@ -59,6 +59,7 @@ class EasyDeLState(struct.PyTreeNode):
 	graphother: nn.GraphState
 	tx: optax.GradientTransformation = struct.field(pytree_node=False)
 	opt_state: tp.Optional[optax.OptState] = struct.field(pytree_node=True)
+	apply_fn: tp.Optional[tp.Callable] = None
 
 	def apply_gradients(self, *, grads):
 		"""
