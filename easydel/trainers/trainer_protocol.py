@@ -58,7 +58,7 @@ from easydel.infra.base_module import (
 from easydel.utils import Timers
 from easydel.utils.helpers import get_logger
 
-from .training_configurations import TrainingArguments, MetricsType
+from .training_configurations import MetricsType, TrainingArguments
 
 if tp.TYPE_CHECKING:
 	from datasets import Dataset, IterableDataset
@@ -500,6 +500,14 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 		"""Handles training for a single epoch."""
 		...
 
+	@property
+	@abstractmethod
+	def _train_shared_fn_extra_args(self) -> tp.Tuple[tp.Any]: ...
+
+	@property
+	@abstractmethod
+	def _eval_shared_fn_extra_args(self) -> tp.Tuple[tp.Any]: ...
+
 	@abstractmethod
 	def _execute_eval_step(self, state, batch) -> LossMetrics:
 		"""Execute a single eval step."""
@@ -576,7 +584,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 		state: EasyDeLState,
 		batch: tp.Dict[str, jax.Array],
 		is_train: bool,
-	) -> tp.Dict[str, jax.Array]:
+	) -> tp.Tuple[tp.Dict[str, jax.Array], tp.Dict[str, tp.Union[float, int, str]]]:
 		"""hook call before passing data to function (called in `_execute` functions)"""
 
 	@abstractmethod

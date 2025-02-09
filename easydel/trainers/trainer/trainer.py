@@ -344,7 +344,7 @@ class Trainer(BaseTrainer):
 				if self._should_run_evaluation(current_step):
 					for _ in self.eval(model_state=state):
 						...
-			except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest):
+			except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, TypeError):
 				return state, run_exception
 			if run_exception is not None:
 				break
@@ -419,8 +419,16 @@ class Trainer(BaseTrainer):
 					mode="eval",
 				)
 				yield eval_metrics
-			except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest):
+			except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, TypeError):
 				break
+
+	@property
+	def _train_shared_fn_extra_args(self) -> tp.Tuple[tp.Any]:
+		return ()
+
+	@property
+	def _eval_shared_fn_extra_args(self) -> tp.Tuple[tp.Any]:
+		return ()
 
 	def _execute_eval_step(self, state, batch) -> LossMetrics:
 		"""
@@ -433,10 +441,16 @@ class Trainer(BaseTrainer):
 		Returns:
 		    LossMetrics: The loss metrics computed by the sharded evaluation step function.
 		"""
-		metrics = self.sharded_evaluation_step_function(
-			state,
-			self._preprocess_batch_input(state=state, batch=batch, is_train=False),
+		batch, informations = self._preprocess_batch_input(
+			state=state,
+			batch=batch,
+			is_train=False,
 		)
+		metrics = self.sharded_evaluation_step_function(state, batch)
+		if len(informations) != 0:
+			if metrics.other_metrics is not None:
+				informations.update(metrics.other_metrics)
+			metrics = metrics.replace(other_metrics=informations)
 		return metrics
 
 	def _execute_train_step(
@@ -470,12 +484,21 @@ class Trainer(BaseTrainer):
 			)
 		metrics = LossMetrics()
 		try:
-			state, metrics = jax.block_until_ready(
-				self.sharded_training_step_function(
-					state,
-					self._preprocess_batch_input(state=state, batch=batch, is_train=True),
-				)
+			batch, informations = self._preprocess_batch_input(
+				state=state,
+				batch=batch,
+				is_train=True,
 			)
+
+			state, metrics = jax.block_until_ready(
+				self.sharded_training_step_function(state, batch)
+			)
+
+			if len(informations) != 0:
+				if metrics.other_metrics is not None:
+					informations.update(metrics.other_metrics)
+				metrics = metrics.replace(other_metrics=informations)
+
 			# Apply post-gradient updates via the pruning module, if present.
 			if self.pruning_module is not None:
 				state = state.replace(
@@ -485,7 +508,12 @@ class Trainer(BaseTrainer):
 					)
 				)
 			return state, metrics, None
-		except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest) as run_exception:
+		except (
+			KeyboardInterrupt,
+			EasyDeLTimerError,
+			EasyDeLBreakRequest,
+			TypeError,
+		) as run_exception:
 			return state, metrics, run_exception
 
 	def _finalize_training(self, output, run_exception):

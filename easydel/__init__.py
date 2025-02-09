@@ -357,6 +357,8 @@ from .trainers import (
 	BaseTrainer,
 	DPOConfig,
 	DPOTrainer,
+	GRPOTrainer,
+	GRPOConfig,
 	JaxDistributedConfig,
 	ORPOConfig,
 	ORPOTrainer,

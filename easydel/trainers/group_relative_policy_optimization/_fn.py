@@ -107,47 +107,58 @@ def grpo_step(
 	def loss_fn(tree, minibatch):
 		module = flax.nnx.merge(state.graphdef, tree, state.graphother)
 
-		prompt_completion_ids = minibatch["prompt_completion_ids"]
-		prompt_completion_mask = minibatch["prompt_completion_mask"]
-		ref_per_token_logps = minibatch["ref_per_token_logps"]
-		rewards = minibatch["rewards"]
-		completion_mask = minibatch["completion_mask"]
+		(
+			prompt_ids,
+			prompt_mask,
+			completion_ids,
+			completion_mask,
+			advantages,
+		) = (
+			minibatch["prompt_ids"],
+			minibatch["prompt_mask"],
+			minibatch["completion_ids"],
+			minibatch["completion_mask"],
+			minibatch["advantages"],
+		)
+
+		input_ids = jnp.concatenate(
+			[prompt_ids.repeat(num_generations, 0), completion_ids],
+			axis=1,
+		)
+		attention_mask = jnp.concatenate(
+			[prompt_mask.repeat(num_generations, 0), completion_mask],
+			axis=1,
+		)
+
 		per_token_logps = get_per_token_logps(
 			module,
-			prompt_completion_ids,
-			prompt_completion_mask,
-			prompt_length,
+			input_ids,
+			attention_mask,
+			prompt_ids.shape[-1],
 		)
+
+		ref_per_token_logps = minibatch["ref_per_token_logps"]
 		per_token_kl = (
 			jnp.exp(ref_per_token_logps - per_token_logps)
 			- (ref_per_token_logps - per_token_logps)
 			- 1
-		) 
-		grouped_rewards = rewards.reshape(-1, num_generations)
-		mean_grouped_rewards = jnp.mean(grouped_rewards, axis=1)
-		std_grouped_rewards = jnp.std(grouped_rewards, axis=1)
-		mean_grouped_rewards = jnp.repeat(mean_grouped_rewards, num_generations)
-		std_grouped_rewards = jnp.repeat(std_grouped_rewards, num_generations)
-		advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
-		per_token_loss = (
-			jnp.exp(per_token_logps - jax.lax.stop_gradient(per_token_logps))
-			* advantages[:, None]
 		)
-		per_token_loss = -(per_token_loss - beta * per_token_kl)
 
-		masked_sum = (per_token_loss * completion_mask).sum(axis=1)
-		mask_sum = completion_mask.sum(axis=1)
-		loss = jnp.mean(masked_sum / mask_sum)
-		mean_kl = (
-			(per_token_kl * completion_mask).sum(axis=1) / completion_mask.sum(axis=1)
-		).mean()
+		per_token_loss = jnp.exp(
+			per_token_logps - jax.lax.stop_gradient(per_token_logps)
+		) * jnp.expand_dims(advantages, 1)
+		per_token_loss = -(per_token_loss - beta * per_token_kl)
+		comps = jnp.sum(completion_mask, axis=1)
+		loss = jnp.mean(jnp.sum(per_token_loss * completion_mask, axis=1) / comps)
+		mean_kl = jnp.mean(jnp.sum(per_token_kl * completion_mask, axis=1) / comps)
+
 		return loss, LossMetrics(
 			loss=loss,
 			accuracy=1,
 			other_metrics={
-				"mean_kl": mean_kl.mean(),
-				"reward": rewards.mean(),
-				"reward_std": std_grouped_rewards.mean(),
+				"mean_kl": mean_kl,
+				"ref_per_token_logps": jnp.mean(ref_per_token_logps),
+				"advantages": jnp.mean(advantages),
 			},
 		)
 
