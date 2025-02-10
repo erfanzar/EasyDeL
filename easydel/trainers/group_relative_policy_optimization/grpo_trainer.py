@@ -40,7 +40,7 @@ from easydel.trainers.training_configurations import MetricsType
 from easydel.utils.compiling_utils import cjit
 from easydel.utils.helpers import capture_time, get_logger
 from easydel.utils.traversals import deepcopy_model
-from tests.vinference_api_test import PartitionSpec
+from jax.sharding import PartitionSpec
 
 from ..trainer.trainer import Trainer
 from .grpo_config import GRPOConfig
