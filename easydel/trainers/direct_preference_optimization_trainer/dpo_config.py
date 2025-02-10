@@ -94,7 +94,7 @@ class DPOConfig(TrainingArguments):
 	    ... )
 	"""
 
-	model_name: str = "EasyDeL-DPOTrainer-Model"
+	model_name: str = "DPOTrainer"
 	beta: float = 0.1
 	label_smoothing: float = 0.0
 	loss_type: LOSS_FN_VARIENTS = "sigmoid"
