@@ -39,7 +39,7 @@ class RewardConfig(TrainingArguments):
 	        the dataset is pretokenized.
 	"""
 
-	model_name: str = "EasyDeL-RewardTrainer-Model"
+	model_name: str = "RewardTrainer"
 	max_length: tp.Optional[int] = 1024
 	disable_dropout: bool = True
 	dataset_num_proc: tp.Optional[int] = None

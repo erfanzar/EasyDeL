@@ -51,7 +51,7 @@ class SFTConfig(TrainingArguments):
 					[chars_token_ratio](https://github.com/huggingface/trl/blob/08f550674c553c36c51d1027613c29f14f3676a5/examples/stack_llama/scripts/supervised_finetuning.py#L53) for more details.
 	"""
 
-	model_name: str = "EasyDeL-SFTTrainer-Model"
+	model_name: str = "SFTTrainer"
 	dataset_text_field: tp.Optional[str] = None
 	add_special_tokens: bool = False
 	packing: bool = False

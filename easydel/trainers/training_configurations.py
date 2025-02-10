@@ -97,7 +97,7 @@ class TrainingArguments:
 	max_evaluation_steps: tp.Optional[int] = None
 	max_sequence_length: tp.Optional[int] = 4096
 	max_training_steps: tp.Optional[int] = None
-	model_name: str = "EasyDeL-Model"
+	model_name: str = "BaseTrainer"
 	model_parameters: tp.Optional[dict] = None
 	metrics_to_show_in_rich_pbar: tp.Optional[list] = None
 	num_train_epochs: int = 10

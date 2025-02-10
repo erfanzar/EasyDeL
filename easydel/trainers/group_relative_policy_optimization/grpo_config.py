@@ -23,6 +23,7 @@ class GRPOConfig(TrainingArguments):
 	Configuration class for the GRPOTrainer.
 	"""
 
+	model_name: str = "GRPOTrainer"
 	remove_unused_columns: tp.Optional[bool] = False
 	max_prompt_length: int = 512
 	max_completion_length: int = 256
