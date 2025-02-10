@@ -605,20 +605,18 @@ class vInference:
 					slicing[seq_dim] = slice(0, target_length)
 					tensor = tensor[tuple(slicing)]
 				elif current_length < target_length:
-					# Pad
 					pad_width = [(0, 0)] * len(tensor_shape)
-					pad_width[seq_dim] = (0, target_length - current_length)
+					pad_width[seq_dim] = (target_length - current_length, 0)
 
-					# Choose appropriate padding value
 					if key == "input_ids":
 						pad_value = self.generation_config.pad_token_id
 					elif key in ["attention_mask", "token_type_ids"]:
 						pad_value = 0
 					elif key == "position_ids":
-						pad_value = target_length - 1  # Use last position id
+						pad_value = -1
 					else:
 						pad_value = 0
-				
+
 					tensor = jax.numpy.pad(tensor, pad_width, constant_values=pad_value)
 
 			if current_batch != target_batch:
@@ -629,7 +627,7 @@ class vInference:
 					tensor = tensor[tuple(slicing)]
 				else:
 					pad_width = [(0, 0)] * len(tensor_shape)
-					pad_width[batch_dim] = (0, target_batch - current_batch)
+					pad_width[batch_dim] = (target_batch - current_batch, 0)
 
 					if key == "input_ids":
 						pad_value = self.generation_config.pad_token_id
@@ -639,7 +637,6 @@ class vInference:
 						pad_value = tensor_shape[seq_dim] - 1
 					else:
 						pad_value = 0
-
 					tensor = jax.numpy.pad(tensor, pad_width, constant_values=pad_value)
 
 			adjusted_kwargs[key] = tensor

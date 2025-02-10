@@ -17,10 +17,12 @@ from functools import partial
 import flax
 import flax.nnx
 import jax
+from eformer.escale import with_sharding_constraint
 from flax import nnx as nn
 from jax import numpy as jnp
+from jax.sharding import PartitionSpec
 from transformers import AutoTokenizer
-from eformer.escale import with_sharding_constraint
+
 from easydel.inference.vinference.vinference import vInference
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
@@ -40,7 +42,6 @@ from easydel.trainers.training_configurations import MetricsType
 from easydel.utils.compiling_utils import cjit
 from easydel.utils.helpers import capture_time, get_logger
 from easydel.utils.traversals import deepcopy_model
-from jax.sharding import PartitionSpec
 
 from ..trainer.trainer import Trainer
 from .grpo_config import GRPOConfig
@@ -502,6 +503,7 @@ class GRPOTrainer(Trainer):
 			"advantages": advantages,
 		}, {
 			"rewards": jnp.mean(rewards, -1),
+			"completion_length": jnp.sum(completion_mask.sum(-1), -1),
 			"grouped_comp_time": grouped_comp_time,
 			"rewarding_time": rewarding_time,
 			"token_logps_time": token_logps_time,
