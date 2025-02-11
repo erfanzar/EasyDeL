@@ -1016,12 +1016,13 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 			return NullProgressBar()
 		rpr = self.arguments.progress_bar_type
 		if rpr == "tqdm":
+			ncols = int(os.environ.get("TQDM_NCOLS", "0"))
 			return TqdmProgressBar(
 				tqdm.tqdm(
 					total=total,
 					desc=desc,
 					disable=disabled,
-					ncols=1500,
+					ncols=ncols if ncols > 0 else None,
 				)
 			)
 		elif rpr == "rich":  # rich
