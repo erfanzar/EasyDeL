@@ -19,7 +19,6 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils.helpers import get_logger
 
-from ..base_trainer import TrainerConfigureDataloaderOutput
 from ..trainer import Trainer
 from ..utils import (
 	DataCollatorForCompletionOnlyLM,
@@ -133,76 +132,13 @@ class SFTTrainer(Trainer):
 			data_collator=data_collator,
 		)
 
-	def configure_dataloaders(self) -> TrainerConfigureDataloaderOutput:
-		"""
-		Configures the dataloaders for training and evaluation.
-
-		This method creates the training and evaluation dataloaders using the provided
-		datasets and data collator. It also determines the maximum number of training
-		and evaluation steps based on the dataset sizes and training arguments.
-
-		Returns:
-		    TrainerConfigureDataloaderOutput: An object containing the configured dataloaders and the
-		                                    maximum number of training and evaluation steps.
-		"""
-		try:
-			import tensorflow_datasets as tfds
-		except ImportError as e:
-			raise ImportError(
-				"tensorflow_datasets is not installed, please install it by running `pip install tensorflow_datasets`"
-			) from e
-
-		dataloader_train = tfds.as_numpy(
-			self.dataset_train.to_tf_dataset(
-				batch_size=self.training_batch_size,
-				drop_remainder=True,
-				num_workers=self.arguments.dataloader_num_workers,
-				collate_fn=self.create_collect_function(
-					max_sequence_length=self.arguments.max_sequence_length,
-					truncation_mode=self.arguments.truncation_mode,
-				),
-			)
-		)
-		max_training_steps = (
-			self.arguments.num_train_epochs * len(dataloader_train)
-			if self.arguments.max_training_steps is None
-			else self.arguments.max_training_steps
-		)
-		if self.dataset_eval is not None and self.arguments.do_eval:
-			dataloader_eval = tfds.as_numpy(
-				self.dataset_eval.to_tf_dataset(
-					batch_size=self.evaluation_batch_size,
-					drop_remainder=True,
-					shuffle=True,
-					num_workers=self.arguments.dataloader_num_workers,
-					collate_fn=self.create_collect_function(
-						max_sequence_length=self.arguments.max_sequence_length,
-						truncation_mode=self.arguments.truncation_mode,
-					),
-				)
-			)
-			max_evaluation_steps = (
-				len(dataloader_eval)
-				if self.arguments.max_training_steps is None
-				else self.arguments.max_training_steps
-			)
-		else:
-			dataloader_eval, max_evaluation_steps = None, 0
-
-		return TrainerConfigureDataloaderOutput(
-			dataloader_train=dataloader_train,
-			max_training_steps=max_training_steps,
-			dataloader_eval=dataloader_eval,
-			max_evaluation_steps=max_evaluation_steps,
-		)
-
 	def _prepare_dataset(
 		self,
 		dataset,
 		processing_class,
 		packing,
 		dataset_text_field,
-		max_seq_length,
+		max_sequence_length,
 		formatting_func,
 		num_of_sequences,
 		chars_per_token,
@@ -218,7 +154,7 @@ class SFTTrainer(Trainer):
 		    processing_class (ProcessingClassType): The processing_class to use.
 		    packing (bool): Whether to pack multiple sequences into a single sample.
 		    dataset_text_field (str): The name of the text field in the dataset.
-		    max_seq_length (int): The maximum sequence length.
+		    max_sequence_length (int): The maximum sequence length.
 		    formatting_func (tp.Callable): A formatting function to apply to each sample.
 		    num_of_sequences (int): Number of sequences to pack in each sample (if packing is enabled).
 		    chars_per_token (float): Average number of characters per token.
@@ -240,7 +176,7 @@ class SFTTrainer(Trainer):
 				processing_class,
 				dataset,
 				dataset_text_field,
-				max_seq_length,
+				max_sequence_length,
 				formatting_func,
 				add_special_tokens,
 				remove_unused_columns,
@@ -251,7 +187,7 @@ class SFTTrainer(Trainer):
 				processing_class,
 				dataset,
 				dataset_text_field,
-				max_seq_length,
+				max_sequence_length,
 				num_of_sequences,
 				chars_per_token,
 				formatting_func,
@@ -264,7 +200,7 @@ class SFTTrainer(Trainer):
 		processing_class: ProcessingClassType,
 		dataset,
 		dataset_text_field,
-		max_seq_length,
+		max_sequence_length,
 		formatting_func=None,
 		add_special_tokens=True,
 		remove_unused_columns=True,
@@ -280,7 +216,7 @@ class SFTTrainer(Trainer):
 		    processing_class: The processing_class to use for text encoding.
 		    dataset (Dataset): The dataset to prepare.
 		    dataset_text_field (str): The name of the text field in the dataset.
-		    max_seq_length (int): The maximum sequence length.
+		    max_sequence_length (int): The maximum sequence length.
 		    formatting_func (tp.Callable, optional): A formatting function to apply to each sample before tokenization.
 		        Defaults to None.
 		    add_special_tokens (bool, optional): Whether to add special tokens during tokenization. Defaults to True.
@@ -303,7 +239,7 @@ class SFTTrainer(Trainer):
 				add_special_tokens=add_special_tokens,
 				truncation=True,
 				padding="max_length",
-				max_length=max_seq_length,
+				max_length=max_sequence_length,
 				return_overflowing_tokens=False,
 				return_attention_mask=True,
 				return_length=False,
@@ -343,7 +279,7 @@ class SFTTrainer(Trainer):
 		}
 		if isinstance(dataset, Dataset):
 			map_kwargs["num_proc"] = self.dataset_num_proc
-		tokenized_dataset = dataset.map(tokenize, **map_kwargs) 
+		tokenized_dataset = dataset.map(tokenize, **map_kwargs)
 		return tokenized_dataset
 
 	@staticmethod
@@ -351,7 +287,7 @@ class SFTTrainer(Trainer):
 		processing_class,
 		dataset,
 		dataset_text_field,
-		max_seq_length,
+		max_sequence_length,
 		num_of_sequences,
 		chars_per_token,
 		formatting_func=None,
@@ -369,7 +305,7 @@ class SFTTrainer(Trainer):
 		    processing_class: The processing_class used for text encoding.
 		    dataset (Dataset): The dataset to prepare.
 		    dataset_text_field (str): The name of the text field in the dataset.
-		    max_seq_length (int): The maximum length of each packed sequence.
+		    max_sequence_length (int): The maximum length of each packed sequence.
 		    num_of_sequences (int): The number of sequences to pack into a single sample.
 		    chars_per_token (float): The average number of characters per token, used for estimating
 		        the number of tokens in a text sequence.
@@ -399,7 +335,7 @@ class SFTTrainer(Trainer):
 				dataset=dataset,
 				dataset_text_field=dataset_text_field,
 				formatting_func=formatting_func,
-				seq_length=max_seq_length,
+				seq_length=max_sequence_length,
 				infinite=False,
 				num_of_sequences=num_of_sequences,
 				chars_per_token=chars_per_token,

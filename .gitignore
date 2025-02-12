@@ -9,6 +9,7 @@ __pycache__/
 env.ipynb
 env.py
 exp.py
+nohup.out
 sharding_test.py
 exprimental.py
 pallas_env.py

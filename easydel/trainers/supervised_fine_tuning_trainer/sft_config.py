@@ -32,9 +32,6 @@ class SFTConfig(TrainingArguments):
 					Controls whether the [`ConstantLengthDataset`] packs the sequences of the dataset.
 			learning_rate (`float`, *optional*, defaults to `2e-5`):
 					Initial learning rate for [`AdamW`] optimizer. The default value replaces that of [`~transformers.TrainingArguments`].
-			max_seq_length (`Optional[int]`, *optional*, defaults to `None`):
-					Maximum sequence length for the [`ConstantLengthDataset`] and for automatically creating the dataset. If
-					`None`, it uses the smaller value between `tokenizer.model_max_length` and `1024`.
 			dataset_num_proc (`Optional[int]`, *optional*, defaults to `None`):
 					Number of processes to use for processing the dataset. Only used when `packing=False`.
 			dataset_batch_size (`Union[int, None]`, *optional*, defaults to `1000`):
@@ -55,8 +52,7 @@ class SFTConfig(TrainingArguments):
 	dataset_text_field: tp.Optional[str] = None
 	add_special_tokens: bool = False
 	packing: bool = False
-	learning_rate: float = 2.0e-5
-	max_seq_length: tp.Optional[int] = None
+	learning_rate: float = 2.0e-5 
 	dataset_num_proc: tp.Optional[int] = None
 	dataset_batch_size: int = 1000
 	dataset_kwargs: tp.Optional[dict[str, tp.Any]] = None
