@@ -20,11 +20,7 @@ def main():
 
 	max_length = 8192
 
-	# if jax.default_backend() == "gpu":
-	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
-	# else:
-	# 	pretrained_model_name_or_path = "Qwen/Qwen2.5-7B-Instruct"
-	# "Qwen/Qwen2-7B-Instruct"
+	pretrained_model_name_or_path = "microsoft/Phi-3.5-mini-instruct"
 	extra = {}
 	if jax.default_backend() == "gpu":
 		import torch
