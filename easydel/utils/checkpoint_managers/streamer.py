@@ -25,7 +25,7 @@ import safetensors
 from flax.serialization import to_bytes, to_state_dict
 from flax.struct import PyTreeNode
 from tqdm import tqdm
-
+from eformer.jaximus import implicit
 from easydel.utils.helpers import get_logger
 
 from ..traversals import flatten_dict, is_flatten, unflatten_dict
@@ -51,8 +51,10 @@ ALLOWED_DATA_TYPES = [
 ]
 
 
+@implicit
 def put_dtype(
-	array: jax.Array, dtype: tp.Optional[tp.Union[str, jnp.dtype]]
+	array: jax.Array,
+	dtype: tp.Optional[tp.Union[str, jnp.dtype]],
 ) -> jax.Array:
 	"""
 	Get the tensor with the specified data type.

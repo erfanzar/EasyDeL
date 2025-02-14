@@ -55,6 +55,7 @@ class BaseAutoEasyModel:
 		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]] = None,
 		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
 		quantization_block_size: int = 128,
+		quantization_pattern: tp.Optional[str] = None,
 		quantize_tensors: bool = False,
 		from_torch: tp.Optional[bool] = None,
 		**kwargs,
@@ -110,6 +111,7 @@ class BaseAutoEasyModel:
 				partition_axis=partition_axis,
 				quantization_method=quantization_method,
 				quantization_block_size=quantization_block_size,
+				quantization_pattern=quantization_pattern,
 				quantize_tensors=quantize_tensors,
 				partition_rules=partition_rules,
 				sharding_axis_names=sharding_axis_names,
@@ -137,6 +139,7 @@ class BaseAutoEasyModel:
 				pretrained_model_name_or_path=pretrained_model_name_or_path,
 				quantization_method=quantization_method,
 				quantization_block_size=quantization_block_size,
+				quantization_pattern=quantization_pattern,
 				quantize_tensors=quantize_tensors,
 				**kwargs,
 			)
@@ -160,6 +163,7 @@ class BaseAutoEasyModel:
 		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
 		quantization_platform: tp.Optional[EasyDeLPlatforms] = EasyDeLPlatforms.JAX,
 		quantization_block_size: int = 128,
+		quantization_pattern: tp.Optional[str] = None,
 		quantize_tensors: bool = False,
 		**kwargs,
 	):
@@ -183,6 +187,7 @@ class BaseAutoEasyModel:
 			quantization_method=quantization_method,
 			quantization_platform=quantization_platform,
 			quantization_block_size=quantization_block_size,
+			quantization_pattern=quantization_pattern,
 			quantize_tensors=quantize_tensors,
 			**kwargs,
 		)
@@ -207,6 +212,7 @@ class BaseAutoEasyModel:
 		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]] = None,
 		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
 		quantization_block_size: int = 128,
+		quantization_pattern: tp.Optional[str] = None,
 		quantize_tensors: bool = False,
 		**kwargs,
 	):
@@ -225,6 +231,7 @@ class BaseAutoEasyModel:
 			partition_axis=partition_axis,
 			quantization_method=quantization_method,
 			quantization_block_size=quantization_block_size,
+			quantization_pattern=quantization_pattern,
 			quantize_tensors=quantize_tensors,
 			partition_rules=partition_rules,
 			sharding_axis_names=sharding_axis_names,
