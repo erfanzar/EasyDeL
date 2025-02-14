@@ -37,39 +37,47 @@ METHOD_TO_LINEAR_MAPPING = {
 }
 
 
-class Array8Bc(Array8B):
-	def astype(self, dtype):
-		return self
-
-
-class ArrayNF4c(ArrayNF4):
-	def astype(self, dtype):
-		return self
-
-
 class EasyQuantizer:
 	def __init__(
 		self,
 		quantization_method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.NF4,
 		quantization_platform: tp.Optional[EasyDeLPlatforms] = EasyDeLPlatforms.JAX,
+		quantization_pattern: tp.Optional[str] = None,
 		block_size: int = 256,
 		**kwargs,
 	) -> None:
 		self.block_size = block_size
 		self.quantization_method = quantization_method
 		self.quantization_platform = quantization_platform
+		if quantization_pattern is None:
+			quantization_pattern = r".*embedding$"
+		self.quantization_pattern = quantization_pattern
 
-	def __call__(self, array) -> chex.Array:
+	def __call__(
+		self,
+		array,
+		path: tp.Optional[tp.Union[str, tp.Tuple[str]]] = None,
+	) -> chex.Array:
+		should_be_quantized = True
+		if path is not None:
+			if isinstance(path, list):
+				path = tuple(path)
+			if isinstance(path, tuple):
+				path = ".".join(path)
+			if self.quantization_pattern is not None:
+				should_be_quantized = not bool(re.match(self.quantization_pattern, path))
+		if not should_be_quantized:
+			return array
 		match self.quantization_method:
 			case EasyDeLQuantizationMethods.A8BIT:
-				return Array8Bc(array=array)
+				return Array8B(array=array)
 
 			case EasyDeLQuantizationMethods.NF4:
 				should_be_quantized = True
 				if array.size % self.block_size != 0:
 					should_be_quantized = False
 				if should_be_quantized:
-					return ArrayNF4c(array=array, block_size=self.block_size)
+					return ArrayNF4(array=array, block_size=self.block_size)
 
 				return array
 			case EasyDeLQuantizationMethods.NONE:
@@ -112,7 +120,7 @@ class EasyQuantizer:
 		if quantizer is None:
 			raise NotImplementedError("Requested Quantizer is not Supported")
 		if quantization_pattern is None:
-			quantization_pattern = ".*"
+			quantization_pattern = self.quantization_pattern
 
 		if hasattr(model, "config"):
 			model.config.quantization_method = self.quantization_method

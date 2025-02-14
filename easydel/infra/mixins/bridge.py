@@ -310,7 +310,9 @@ class EasyBridgeMixin(PushToHubMixin):
 		verbose: bool,
 		shard_fns: tp.Optional[dict[tp.Callable]],
 		quantization_method: tp.Optional[EasyDeLQuantizationMethods],
+		quantization_platform: tp.Optional[EasyDeLQuantizationMethods],
 		quantization_block_size: int,
+		quantization_pattern: tp.Optional[str],
 		quantize_tensors: bool,
 		vebose: bool,
 	) -> EasyDeLBaseModule:
@@ -327,23 +329,32 @@ class EasyBridgeMixin(PushToHubMixin):
 		    an easydel, with loaded parameter.
 		"""
 		callback = None
+		passed_shard_fns = None
 		if quantize_tensors:
 			from easydel.layers.quantization.quantizers import EasyQuantizer
 
 			quantizer = EasyQuantizer(
 				quantization_method=quantization_method,
+				quantization_platform=quantization_platform,
+				quantization_pattern=quantization_pattern,
 				block_size=quantization_block_size,
 			)
+			passed_shard_fns = shard_fns
+			if quantize_tensors:
 
-			def callback(x, p):
-				return quantizer(x)
+				def callback(x, p):
+					if shard_fns is not None:
+						callable_fn = shard_fns.get(tuple(p.split(".")))
+						if callable_fn is not None:
+							x = callable_fn(x)
+					return quantizer(x, p)
 
 		if resolved_archive_file:
 			state, _ = CheckpointManager.load_checkpoint(
 				path=resolved_archive_file,
 				mismatch_allowed=mismatch_allowed,
 				verbose=verbose,
-				shard_fns=shard_fns,
+				shard_fns=passed_shard_fns,
 				callback=callback,
 				dtype=param_dtype,
 			)
@@ -402,6 +413,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		quantization_platform: tp.Optional[EasyDeLPlatforms] = None,
 		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
 		quantization_block_size: int = 128,
+		quantization_pattern: tp.Optional[str] = None,
 		quantize_tensors: bool = False,
 		**kwargs,
 	):
@@ -581,7 +593,9 @@ class EasyBridgeMixin(PushToHubMixin):
 			verbose,
 			shard_fns,
 			quantization_method,
+			quantization_platform,
 			quantization_block_size,
+			quantization_pattern,
 			quantize_tensors,
 			vebose,
 		)
@@ -591,9 +605,7 @@ class EasyBridgeMixin(PushToHubMixin):
 				block_size=quantization_block_size,
 				quantize_tensors=quantize_tensors,
 				verbose=vebose,
-			)
-		if auto_shard_model:
-			model = model.shard_model()
+			) 
 		if model.can_generate():
 			try:
 				model.generation_config = GenerationConfig.from_pretrained(
@@ -637,6 +649,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		quantization_platform: tp.Optional[EasyDeLPlatforms] = None,
 		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
 		quantization_block_size: int = 128,
+		quantization_pattern: tp.Optional[str] = None,
 		quantize_tensors: bool = False,
 		verbose: bool = True,
 		**kwargs,
@@ -753,18 +766,25 @@ class EasyBridgeMixin(PushToHubMixin):
 			quantization_method=quantization_method,
 			block_size=quantization_block_size,
 			quantization_platform=quantization_platform,
+			quantization_pattern=quantization_pattern,
 		)
 		callback = None
+		passed_shard_fns = shard_fns
 		if quantize_tensors:
+			passed_shard_fns = None
 
 			def callback(x, p):
-				return quantizer(x)
+				if shard_fns is not None:
+					callable_fn = shard_fns.get(tuple(p.split(".")))
+					if callable_fn is not None:
+						x = callable_fn(x)
+				return quantizer(x, p)
 
 		params = model.pure_transform_fn(
 			state_dict,
 			config=config,
 			device=device,
-			shard_fns=shard_fns,
+			shard_fns=passed_shard_fns,
 			params_pattern_selection=params_pattern_selection,
 			remove_state_dict=True,
 			uses_tie_word_embedding=uses_tie_word_embedding,
@@ -778,9 +798,7 @@ class EasyBridgeMixin(PushToHubMixin):
 
 		logger.debug("merging model and parameters pytree.")
 		model = merge_model_and_tree(model=model, tree=params)
-		logger.debug("model and parameters pytree merged.")
-		if auto_shard_model:
-			model = model.fully_shard()
+		logger.debug("model and parameters pytree merged.") 
 		if (
 			quantization_method is not None
 			and quantization_method != EasyDeLQuantizationMethods.NONE
@@ -790,6 +808,7 @@ class EasyBridgeMixin(PushToHubMixin):
 			model = model.quantize(
 				method=quantization_method,
 				block_size=quantization_block_size,
+				quantization_pattern=quantization_pattern,
 				verbose=verbose,
 			)
 		logger.debug("returning model.")

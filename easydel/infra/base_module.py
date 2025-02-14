@@ -32,7 +32,6 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import flatten_dict, is_flatten, unflatten_dict
-
 from .base_config import EasyDeLBaseConfig
 from .etils import EasyDeLQuantizationMethods
 from .loss_utils import (
@@ -356,6 +355,7 @@ class EasyDeLBaseModule(
 				try:
 					val.value = sharding_fns[path](val.value)
 				except TypeError:
+					path = map(str, path)
 					warnings.warn(f"couldn't shard/gather {'.'.join(path)}", stacklevel=1)
 			return val
 
@@ -513,7 +513,11 @@ class EasyDeLBaseModule(
 		"""
 		from easydel.layers.quantization.quantizers import EasyQuantizer
 
-		quantizer = EasyQuantizer(quantization_method=method, block_size=block_size)
+		quantizer = EasyQuantizer(
+			quantization_method=method,
+			block_size=block_size,
+			quantization_pattern=quantization_pattern,
+		)
 		if verbose is None:
 			verbose = jax.process_index() == 0
 		if quantize_tensors:
@@ -731,9 +735,9 @@ class EasyDeLBaseModule(
 
 		if self.loss_function.__name__ == ForSequenceClassificationLoss.__name__:
 			if loss_config is None:
-				assert hasattr(
-					self.config, "num_labels"
-				), "in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
+				assert hasattr(self.config, "num_labels"), (
+					"in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
+				)
 				loss_config = LossConfig(num_labels=self.config.num_labels)
 
 		assert labels is not None, "`labels` can not be `None` for computing loss."

@@ -13,7 +13,7 @@
 # limitations under the License.
 import dataclasses
 import typing as tp
-from eformer.jaximus import implicit
+
 import chex
 import jax
 import jax.experimental
@@ -274,7 +274,7 @@ def create_sampling_step(
 	pad_token_id: jax.Array,
 	do_sample: bool = True,
 ):
-	@implicit
+	# @implicit
 	def sampling_step(model, state: SampleState):
 		"""
 		Performs a single sampling step for text generation.
