@@ -317,7 +317,7 @@ def compute_phi3_frequencies(
 		ext_factors = jnp.array(short_factor, dtype=jnp.float32)
 
 	inv_freq_shape = (
-		jnp.arange(0, head_size, 2, dtype=jnp.int64).astype(jnp.float32) / head_size
+		jnp.arange(0, head_size, 2, dtype=jnp.int32).astype(jnp.float32) / head_size
 	)
 	inv_freq = 1.0 / (ext_factors * (base**inv_freq_shape))
 
