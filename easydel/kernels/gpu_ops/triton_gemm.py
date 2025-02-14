@@ -232,9 +232,10 @@ def _triton_gemm(
 
 
 try:
-	_triton_gemm = triton.autotune(configs=_get_autotune_config(), key=["M", "N", "K"])(
-		_triton_gemm
-	)
+	_triton_gemm = triton.autotune(
+		configs=_get_autotune_config(),
+		key=["M", "N", "K"],
+	)(_triton_gemm)
 except Exception:
 	...
 

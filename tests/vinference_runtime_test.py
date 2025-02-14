@@ -38,7 +38,7 @@ def main():
 		attn_kwargs = dict(
 			attn_dtype=jnp.float16,
 			attn_softmax_dtype=jnp.float16,
-			attn_mechanism=ed.AttentionMechanisms.VANILLA,
+			attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
 		)
 
 	else:
