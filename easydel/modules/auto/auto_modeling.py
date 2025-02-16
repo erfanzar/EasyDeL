@@ -56,7 +56,7 @@ class BaseAutoEasyModel:
 		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
 		quantization_block_size: int = 128,
 		quantization_pattern: tp.Optional[str] = None,
-		quantize_tensors: bool = False,
+		quantize_tensors: bool = True,
 		from_torch: tp.Optional[bool] = None,
 		**kwargs,
 	) -> EasyDeLBaseModule:
@@ -164,7 +164,7 @@ class BaseAutoEasyModel:
 		quantization_platform: tp.Optional[EasyDeLPlatforms] = EasyDeLPlatforms.JAX,
 		quantization_block_size: int = 128,
 		quantization_pattern: tp.Optional[str] = None,
-		quantize_tensors: bool = False,
+		quantize_tensors: bool = True,
 		**kwargs,
 	):
 		class Base(EasyDeLBaseModule):
@@ -213,7 +213,7 @@ class BaseAutoEasyModel:
 		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
 		quantization_block_size: int = 128,
 		quantization_pattern: tp.Optional[str] = None,
-		quantize_tensors: bool = False,
+		quantize_tensors: bool = True,
 		**kwargs,
 	):
 		class Base(EasyDeLBaseModule):

@@ -19,7 +19,6 @@ import time
 import typing as tp  # noqa: F401
 
 import jax
-from flax import nnx as nn
 from jax import numpy as jnp
 
 if tp.TYPE_CHECKING:
@@ -75,21 +74,24 @@ def basic_generation_first_iter_fn(
 	Returns:
 		SampleState: The initial generation state after the first sampling step.
 	"""
-	model = nn.merge(graphdef, graphstate, graphother)
 
-	with model.config.mesh:
-		if state.running_token.shape[-1] > 1:
-			state = create_sampling_step(
-				eos_token_id=jnp.array(generation_config.eos_token_id, dtype=jnp.int32),
-				pad_token_id=jnp.array(generation_config.pad_token_id, dtype=jnp.int32),
-				logits_processor=generation_config.get_logits_processor(),
-				logits_warper=generation_config.get_logits_processor(),
-				do_sample=generation_config.do_sample,
-			)(model, state)
+	if state.running_token.shape[-1] > 1:
+		runner = create_sampling_step(
+			eos_token_id=jnp.array(generation_config.eos_token_id, dtype=jnp.int32),
+			pad_token_id=jnp.array(generation_config.pad_token_id, dtype=jnp.int32),
+			logits_processor=generation_config.get_logits_processor(),
+			logits_warper=generation_config.get_logits_processor(),
+			do_sample=generation_config.do_sample,
+		)
+		state = runner(
+			graphdef=graphdef,
+			graphstate=graphstate,
+			graphother=graphother,
+			state=state,
+		)
 	return state
 
 
-# @partial(jax.jit, static_argnums=(0, 3))
 def basic_generation_iter_fn(
 	graphdef: EasyDeLBaseModule,
 	graphstate: dict,
@@ -109,8 +111,6 @@ def basic_generation_iter_fn(
 		SampleState: The updated generation state after the interval generation steps.
 	"""
 
-	model = nn.merge(graphdef, graphstate, graphother)
-
 	tlen = state.current_length + loop_max_tokens
 
 	def cond_fn(state):
@@ -125,12 +125,16 @@ def basic_generation_iter_fn(
 		logits_warper=generation_config.get_logits_processor(),
 		do_sample=generation_config.do_sample,
 	)
-	with model.config.mesh:
 
-		def interval_sample(state):
-			return sampling_step(model=model, state=state)
+	def interval_sample(state):
+		return sampling_step(
+			graphdef=graphdef,
+			graphstate=graphstate,
+			graphother=graphother,
+			state=state,
+		)
 
-		state = jax.lax.while_loop(cond_fn, body_fun=interval_sample, init_val=state)
+	state = jax.lax.while_loop(cond_fn, body_fun=interval_sample, init_val=state)
 	return state
 
 

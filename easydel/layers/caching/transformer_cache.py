@@ -15,7 +15,7 @@ import typing as tp
 
 import chex as cx
 from eformer.escale import PartitionAxis
-from eformer.jaximus import ArrayValue
+from eformer.jaximus import ImplicitArray
 from jax import numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
@@ -123,9 +123,9 @@ class TransformerCacheMetaData:
 
 @cx.dataclass
 class TransformerCacheView:
-	key: tp.Union[cx.Array, ArrayValue]
-	value: tp.Union[cx.Array, ArrayValue]
-	index: tp.Union[cx.Array, ArrayValue]
+	key: tp.Union[cx.Array, ImplicitArray]
+	value: tp.Union[cx.Array, ImplicitArray]
+	index: tp.Union[cx.Array, ImplicitArray]
 	metadata: TransformerCacheMetaData
 	layer_index: tp.Optional[int] = None
 
@@ -233,7 +233,7 @@ class TransformerCache:
 
 	def __repr__(self):
 		return (
-			f"{self.__class__.__name__ }(\n  "
+			f"{self.__class__.__name__}(\n  "
 			+ "\n  ".join(str(view) for view in self.views)
 			+ "\n)"
 		)

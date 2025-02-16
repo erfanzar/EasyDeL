@@ -16,7 +16,7 @@ from __future__ import annotations
 import typing as tp
 
 import chex as cx
-from eformer.jaximus import ArrayValue
+from eformer.jaximus import ImplicitArray
 
 if tp.TYPE_CHECKING:
 	from easydel.layers.quantization.quantizers import EasyQuantizer
@@ -68,7 +68,7 @@ class LightningCacheMetaData:
 
 @cx.dataclass
 class LightningCacheView:
-	key_value: tp.Union[cx.Array, ArrayValue]
+	key_value: tp.Union[cx.Array, ImplicitArray]
 	metadata: LightningCacheMetaData
 	layer_index: tp.Optional[int] = None
 
@@ -108,7 +108,7 @@ class LightningCache:
 
 	def __repr__(self):
 		return (
-			f"{self.__class__.__name__ }(\n  "
+			f"{self.__class__.__name__}(\n  "
 			+ "\n  ".join(str(view) for view in self.views)
 			+ "\n)"
 		)

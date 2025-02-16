@@ -63,6 +63,7 @@ class EasyQuantizer:
 			if isinstance(path, list):
 				path = tuple(path)
 			if isinstance(path, tuple):
+				path = map(str, path)
 				path = ".".join(path)
 			if self.quantization_pattern is not None:
 				should_be_quantized = not bool(re.match(self.quantization_pattern, path))
@@ -70,17 +71,19 @@ class EasyQuantizer:
 			return array
 		match self.quantization_method:
 			case EasyDeLQuantizationMethods.A8BIT:
-				return Array8B(array=array)
+				return Array8B.quantize(array=array)
 
 			case EasyDeLQuantizationMethods.NF4:
 				should_be_quantized = True
 				if array.size % self.block_size != 0:
 					should_be_quantized = False
 				if should_be_quantized:
-					return ArrayNF4(array=array, block_size=self.block_size)
+					return ArrayNF4.quantize(array=array, block_size=self.block_size)
 
 				return array
 			case EasyDeLQuantizationMethods.NONE:
+				return array
+			case None:
 				return array
 			case _:
 				raise ValueError(f"unknown quantization_method {self.quantization_method}.")

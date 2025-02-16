@@ -32,6 +32,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import flatten_dict, is_flatten, unflatten_dict
+
 from .base_config import EasyDeLBaseConfig
 from .etils import EasyDeLQuantizationMethods
 from .loss_utils import (
@@ -497,7 +498,7 @@ class EasyDeLBaseModule(
 		method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.A8BIT,
 		block_size: int = 128,
 		quantization_pattern: tp.Optional[str] = None,
-		quantize_tensors: bool = False,
+		quantize_tensors: bool = True,
 		verbose: tp.Optional[bool] = None,
 	) -> SELF:
 		"""Quantizes the model's linear layers.
