@@ -20,7 +20,7 @@ def main():
 
 	max_length = 8192
 
-	pretrained_model_name_or_path = "microsoft/Phi-3.5-mini-instruct"
+	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
 	extra = {}
 	if jax.default_backend() == "gpu":
 		import torch
@@ -34,7 +34,7 @@ def main():
 		attn_kwargs = dict(
 			attn_dtype=jnp.float16,
 			attn_softmax_dtype=jnp.float16,
-			attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
+			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		)
 
 	else:

@@ -344,7 +344,10 @@ class EasyBridgeMixin(PushToHubMixin):
 
 				def callback(x, p):
 					if shard_fns is not None:
-						callable_fn = shard_fns.get(tuple(p.split(".")))
+						key_get = p
+						if isinstance(p, str):
+							key_get = tuple(p.split("."))
+						callable_fn = shard_fns.get(key_get)
 						if callable_fn is not None:
 							x = callable_fn(x)
 					return quantizer(x, p)
@@ -414,7 +417,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
 		quantization_block_size: int = 128,
 		quantization_pattern: tp.Optional[str] = None,
-		quantize_tensors: bool = False,
+		quantize_tensors: bool = True,
 		**kwargs,
 	):
 		"""Loads an EasyDeL model from a pretrained model or path.
@@ -605,7 +608,7 @@ class EasyBridgeMixin(PushToHubMixin):
 				block_size=quantization_block_size,
 				quantize_tensors=quantize_tensors,
 				verbose=vebose,
-			) 
+			)
 		if model.can_generate():
 			try:
 				model.generation_config = GenerationConfig.from_pretrained(
@@ -650,7 +653,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
 		quantization_block_size: int = 128,
 		quantization_pattern: tp.Optional[str] = None,
-		quantize_tensors: bool = False,
+		quantize_tensors: bool = True,
 		verbose: bool = True,
 		**kwargs,
 	):
@@ -775,7 +778,10 @@ class EasyBridgeMixin(PushToHubMixin):
 
 			def callback(x, p):
 				if shard_fns is not None:
-					callable_fn = shard_fns.get(tuple(p.split(".")))
+					key_get = p
+					if isinstance(p, str):
+						key_get = tuple(p.split("."))
+					callable_fn = shard_fns.get(key_get)
 					if callable_fn is not None:
 						x = callable_fn(x)
 				return quantizer(x, p)
@@ -798,7 +804,7 @@ class EasyBridgeMixin(PushToHubMixin):
 
 		logger.debug("merging model and parameters pytree.")
 		model = merge_model_and_tree(model=model, tree=params)
-		logger.debug("model and parameters pytree merged.") 
+		logger.debug("model and parameters pytree merged.")
 		if (
 			quantization_method is not None
 			and quantization_method != EasyDeLQuantizationMethods.NONE

@@ -21,7 +21,8 @@ import jax.experimental.pallas
 import jax.random
 from jax import numpy as jnp
 from jax import random, sharding
-
+from eformer.jaximus import implicit
+from flax import nnx as nn
 from .logits_process import (
 	FlaxForcedBOSTokenLogitsProcessor,
 	FlaxForcedEOSTokenLogitsProcessor,
@@ -274,8 +275,8 @@ def create_sampling_step(
 	pad_token_id: jax.Array,
 	do_sample: bool = True,
 ):
-	# @implicit
-	def sampling_step(model, state: SampleState):
+	@implicit
+	def sampling_step(graphdef, graphstate, graphother, state: SampleState):
 		"""
 		Performs a single sampling step for text generation.
 
@@ -286,6 +287,7 @@ def create_sampling_step(
 		Returns:
 				inference_utils.SampleState: The updated generation state.
 		"""
+		model = nn.merge(graphdef, graphstate, graphother)
 		model_outputs = model(
 			input_ids=state.running_token,
 			return_dict=True,
