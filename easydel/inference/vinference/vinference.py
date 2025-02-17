@@ -36,7 +36,7 @@ from jax._src.stages import Compiled
 from jax.interpreters import pxla
 from jax.sharding import NamedSharding, PartitionSpec
 from pydantic import BaseModel
-
+import eformer.escale as es
 from easydel.utils.compiling_utils import (
 	load_compiled_fn,
 	save_compiled_fn,
@@ -129,8 +129,11 @@ class vInference:
 
 		self.processor_class = processor_class
 		self.generation_config = self._init_generation_config(
-			generation_config, max_new_tokens
+			generation_config,
+			max_new_tokens,
 		)
+		if self.generation_config.partition_axis is None:
+			self.generation_config.partition_axis = model.config.partition_axis
 		if seed is None:
 			seed = random.randint(0, int(1e6))
 		self.input_partition_spec = input_partition_spec or PartitionSpec(
@@ -154,7 +157,6 @@ class vInference:
 		self._report_metrics = erm and jax.process_count() == 1
 		if not self._report_metrics:
 			logger.info("vInference-metrics is disabled")
-			logger.debug(f"vInference-metrics is disabled [status erm={erm}]")
 
 	@property
 	def model(self):
@@ -370,8 +372,17 @@ class vInference:
 			safe=False,
 		)
 		if func is None:
-			logger.debug(f"registering new signature({signature}) for `_init_state`")
-			lowered = jax.jit(self._init_state_non_jit).lower(**model_kwargs)
+			logger.info(f"registering new signature({signature}) for `_init_state`")
+			lowered = jax.jit(
+				self._init_state_non_jit,
+				out_shardings=jax.tree_util.tree_map(
+					lambda spec: NamedSharding(mesh=self.mesh, spec=spec),
+					es.match_partition_rules(
+						self.generation_config.get_partition_rules(signature),
+						jax.eval_shape(self._init_state_non_jit, **model_kwargs),
+					),
+				),
+			).lower(**model_kwargs)
 			func = smart_compile(lowered, tag="vinference-init-state")
 			put_compiled_funcs(func, None, batch_size, sequence_length, "_init_state")
 		return func(**model_kwargs)
@@ -933,14 +944,14 @@ class vInference:
 		)
 		do_compile = compiled_generate_func is None or compiled_interval_func is None
 		if do_compile:
-			logger.debug("initiating state for lowering and compiling func.")
+			logger.info("initiating state for lowering and compiling func.")
 			wargs = self._get_compile_model_kwargs(
 				batch_size=batch_size,
 				input_tokens_length=input_tokens_length,
 			)
 			state = self._get_init_state((batch_size, input_tokens_length), wargs)
-			logger.debug("smart compiling `first_iter_fn`")
-			logger.debug("lowering `first_iter_fn`")
+			logger.info("smart compiling `first_iter_fn`")
+			logger.info("lowering `first_iter_fn`")
 			first_iter_fn_lowered = jax.jit(
 				basic_generation_first_iter_fn,
 				static_argnums=(0, 4),
@@ -956,13 +967,13 @@ class vInference:
 				state,
 				self.generation_config,  # Static
 			)
-			logger.debug("`first_iter_fn` lowered successfully.")
+			logger.info("`first_iter_fn` lowered successfully.")
 			compiled_generate_func = smart_compile(
 				first_iter_fn_lowered,
 				tag="vinference.basic_generation_first_iter_fn",
 			)
-			logger.debug("smart compiling `iter_fn`")
-			logger.debug("lowering `iter_fn`")
+			logger.info("smart compiling `iter_fn`")
+			logger.info("lowering `iter_fn`")
 			sample_state = compiled_generate_func(self.graphstate, self.graphother, state)
 			sample_state_shardings = extract_shardings(sample_state)
 
@@ -984,14 +995,14 @@ class vInference:
 				self.generation_config,
 				self.generation_config.streaming_chunks,
 			)
-			logger.debug("`iter_fn` lowered successfully.")
+			logger.info("`iter_fn` lowered successfully.")
 			compiled_interval_func = smart_compile(
 				iter_fn_lowered,
 				tag="vinference.basic_generation_iter_fn",
 			)
 
 			del state
-			logger.debug("saving compiled functions...")
+			logger.info("saving compiled functions...")
 			put_compiled_funcs(
 				compiled_generate_func=compiled_generate_func,
 				compiled_interval_func=compiled_interval_func,
@@ -1021,7 +1032,7 @@ class vInference:
 		"""
 		if input_tokens_length is None:
 			input_tokens_length = self.model_prefill_length
-			logger.debug(
+			logger.info(
 				"`input_tokens_length` is None using `vInference.model_prefill_length`"
 			)
 		if isinstance(batch_size, list) or isinstance(input_tokens_length, list):
@@ -1040,7 +1051,7 @@ class vInference:
 			if config_key in self._precompiled_configs:
 				return True
 			if config_key in self._in_compiling_process:
-				logger.debug(
+				logger.info(
 					f"lowering and compiling with `config` {config_key} have already been requested adding 5 second timeout"
 				)
 				time.sleep(5)
@@ -1050,7 +1061,7 @@ class vInference:
 				)
 			else:
 				with self._compilation_metrics_recorder():
-					logger.debug(f"lowering and compiling with `config` {config_key}")
+					logger.info(f"lowering and compiling with `config` {config_key}")
 					self._in_compiling_process.add(config_key)
 					with self.mesh:
 						self._compile_and_lower_funs(

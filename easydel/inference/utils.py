@@ -22,6 +22,8 @@ import jax.random
 from jax import numpy as jnp
 from jax import random, sharding
 from eformer.jaximus import implicit
+from eformer.escale import PartitionAxis
+from jax.sharding import PartitionSpec
 from flax import nnx as nn
 from .logits_process import (
 	FlaxForcedBOSTokenLogitsProcessor,
@@ -55,6 +57,8 @@ class vInferenceConfig:
 	pad_token_id: tp.Optional[int] = None
 	bos_token_id: tp.Optional[int] = None
 	eos_token_id: tp.Optional[tp.Union[int, tp.List[int]]] = None
+	partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, tp.Any]]] = None
+	partition_axis: tp.Optional[PartitionAxis] = None
 	_loop_rows: tp.Optional[int] = None
 
 	def tree_flatten(self):
@@ -74,12 +78,44 @@ class vInferenceConfig:
 			self.pad_token_id,
 			self.bos_token_id,
 			self.eos_token_id,
+			self.partition_rules,
+			self.partition_axis,
 			self._loop_rows,
 		), {}
 
 	@classmethod
 	def tree_unflatten(cls, aux, children):
 		return cls(*children)
+
+	def get_partition_rules(
+		self,
+		runtime_config: tp.Optional[
+			tp.Tuple[int, int]
+		] = None,  # in case that someone needs to customize this
+	):
+		if self.partition_rules is not None:
+			return self.partition_rules
+		assert self.partition_axis is not None, (
+			"partition axis is required for state sharding"
+		)
+		paxis = self.partition_axis
+		kvps = PartitionSpec(
+			paxis.batch_axis,
+			paxis.key_sequence_axis,
+			paxis.head_axis,
+			paxis.attention_dim_axis,
+		)
+		idps = PartitionSpec(paxis.batch_axis, paxis.sequence_axis)
+		return (
+			("(sequences|running_token)", idps),
+			("model_kwargs/(attention_mask|position_ids)", idps),
+			# A8BIT
+			("model_kwargs/past_key_values/views/[0-9]+/(key|value)/(scale|weight)", kvps),
+			# NF4
+			("model_kwargs/past_key_values/views/[0-9]+/(key|value)/(packed|absmax)", kvps),
+			("model_kwargs/past_key_values/views/[0-9]+/(key|value)", kvps),
+			(".*", PartitionSpec()),
+		)
 
 	def __post_init__(self):
 		if isinstance(self.max_new_tokens, int):
