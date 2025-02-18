@@ -25,7 +25,7 @@ import warnings
 import jax
 from jax.experimental.serialize_executable import deserialize_and_load, serialize
 
-from .helpers import get_cache_dir, get_logger
+from .helpers import get_cache_dir
 
 if tp.TYPE_CHECKING:
 	from jax._src.stages import Compiled, Lowered
@@ -42,7 +42,6 @@ COMPILE_FUNC_DIR.mkdir(parents=True, exist_ok=True)
 COMPILED_FILE_NAME = "compiled.func"
 
 COMPILED_CACHE: tp.Dict[tp.Tuple, tp.Any] = {}
-logger = get_logger(__name__)
 
 
 def is_jit_wrapped(fn):
@@ -132,13 +131,6 @@ def smart_compile(
 	lowered_func: Lowered,
 	tag: tp.Optional[str] = None,
 ) -> Compiled:
-	pc = jax.process_count()
-	if pc > 1:
-		logger.debug(
-			f"`smart_compile` is being called in `spmd` env with {pc} "
-			f"process count skip loading and saving compiled fn with tag=`{tag}`."
-		)
-		return lowered_func.compile()
 	func_hash = get_hash_of_lowering(lowered_func)
 	foldername = str(func_hash) if tag is None else f"{tag}-{func_hash}"
 	func_dir = COMPILE_FUNC_DIR / foldername
