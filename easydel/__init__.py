@@ -377,7 +377,7 @@ from .utils.parameters_transformation import (
 	torch_dict_to_easydel_params,
 )
 
-_targeted_versions = ["0.0.6", "0.0.7"]
+_targeted_versions = ["0.0.8"]
 
 from eformer import __version__ as _eform_version
 from eformer import escale
