@@ -80,7 +80,12 @@ class EasyDeLState(struct.PyTreeNode):
 			state=self.opt_state,
 			params=self.graphstate,
 		)
-		graphstate = optax.apply_updates(self.graphstate, updates)
+		
+		if hasattr(self.tx, "apply_updates_hook"):
+			graphstate = self.tx.apply_updates_hook(self.graphstate, updates)
+		else:
+			graphstate = optax.apply_updates(self.graphstate, updates)
+
 		return self.replace(
 			step=self.step + 1,
 			graphstate=graphstate,
