@@ -133,7 +133,7 @@ eopod run python -m easydel.scripts.finetune.sft \
 
 ```shell
 eopod run python -m easydel.scripts.finetune.gsm8k_grpo \
-  --repo_id meta-llama/Llama-3.2-1B-Instruct \
+  --repo_id meta-llama/Llama-3.1-8B-Instruct \
   --attn_mechanism vanilla \
   --sharding_axis 1,1,1,-1 \
   --max_prompt_length 2048 \
