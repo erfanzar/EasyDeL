@@ -10,6 +10,7 @@ EasyDeL APIs 🔮
    Kernels
    Layers
    Modules
+   Scripts
    Trainers
    Utils
    

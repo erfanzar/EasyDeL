@@ -7,6 +7,7 @@ Utils
    utils___init__
    utils_analyze_memory
    utils_checkpoint_managers
+   utils_cli_helpers
    utils_compiling_utils
    utils_graph_utils
    utils_helpers
