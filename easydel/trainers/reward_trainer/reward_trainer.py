@@ -87,10 +87,10 @@ class RewardTrainer(Trainer):
 					"A processing_class must be specified when using the default RewardDataCollatorWithPadding"
 				)
 
-			max_length = arguments.max_length
+			max_sequence_length = arguments.max_sequence_length
 			data_collator = RewardDataCollatorWithPadding(
 				processing_class,
-				max_length=arguments.max_length,
+				max_length=arguments.max_sequence_length,
 				truncation_mode=arguments.truncation_mode,
 			)
 
@@ -122,8 +122,8 @@ class RewardTrainer(Trainer):
 				num_proc=arguments.dataset_num_proc,
 			)
 			train_dataset = train_dataset.filter(
-				lambda x: len(x["input_ids_chosen"]) <= max_length
-				and len(x["input_ids_rejected"]) <= max_length,
+				lambda x: len(x["input_ids_chosen"]) <= max_sequence_length
+				and len(x["input_ids_rejected"]) <= max_sequence_length,
 				num_proc=arguments.dataset_num_proc,
 			)
 			if eval_dataset is not None:
@@ -138,8 +138,8 @@ class RewardTrainer(Trainer):
 					num_proc=arguments.dataset_num_proc,
 				)
 				eval_dataset = eval_dataset.filter(
-					lambda x: len(x["input_ids_chosen"]) <= max_length
-					and len(x["input_ids_rejected"]) <= max_length,
+					lambda x: len(x["input_ids_chosen"]) <= max_sequence_length
+					and len(x["input_ids_rejected"]) <= max_sequence_length,
 					num_proc=arguments.dataset_num_proc,
 				)
 		if not isinstance(model, EasyDeLState):

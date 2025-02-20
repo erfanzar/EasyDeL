@@ -13,8 +13,8 @@
 # limitations under the License.
 
 import enum
-import pprint
 import typing as tp
+from dataclasses import fields
 from functools import reduce
 from operator import mul
 
@@ -72,22 +72,14 @@ class LossConfig:
 	] = None
 
 	def __repr__(self):
-		return pprint.pformat(
-			{
-				"ignore_index": self.ignore_index,
-				"label_smoothing": self.label_smoothing,
-				"z_loss": self.z_loss,
-				"loss_normalizing_factor": self.loss_normalizing_factor,
-				"num_labels": self.num_labels,
-				"problem_type": self.problem_type,
-				"divide_weight_sum": self.divide_weight_sum,
-				"shift_tokens": self.shift_tokens,
-				"break_on_nan": self.break_on_nan,
-				"reduction": self.reduction,
-				"num_classification_labels": self.num_classification_labels,
-				"classification_problem_type": self.classification_problem_type,
-			}
-		)
+		cls_name = self.__class__.__name__
+		field_lines = [
+			f"    {f.name}: {getattr(self, f.name)!r}".replace("\n", "\n    ")
+			for f in fields(self)
+		]
+		return f"{cls_name}(\n" + "\n".join(field_lines) + "\n)"
+
+	__str__ = __repr__
 
 
 @chex.dataclass
@@ -806,7 +798,7 @@ def ForCausalLMLoss(
 	else:
 		shift_logits = logits
 		shift_labels = labels
-		
+
 		if attention_mask is not None:
 			shift_attn_m = attention_mask
 

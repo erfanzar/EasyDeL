@@ -202,15 +202,15 @@ def combine_flash_masks(causal_mask, segment_ids):
 	else:
 		raise ValueError("unexpected shape for `segment_ids`")
 
-	assert (
-		seq_query_sequence_length == query_sequence_length
-	), "`segment_ids` and `causal_mask` don't have same query axis length"
-	assert (
-		seq_key_sequence_length == key_sequence_length
-	), "`segment_ids` and `causal_mask` don't have same key/value axis length"
-	assert (
-		segment_ids.ndim == 2
-	), f"`segment_ids` don't have excepted shape {segment_ids.shape}"
+	assert seq_query_sequence_length == query_sequence_length, (
+		"`segment_ids` and `causal_mask` don't have same query axis length"
+	)
+	assert seq_key_sequence_length == key_sequence_length, (
+		"`segment_ids` and `causal_mask` don't have same key/value axis length"
+	)
+	assert segment_ids.ndim == 2, (
+		f"`segment_ids` don't have excepted shape {segment_ids.shape}"
+	)
 	segment_ids = jnp.expand_dims(
 		~jnp.equal(
 			jnp.expand_dims(segment_ids, axis=2), jnp.expand_dims(segment_ids, axis=1)
@@ -220,9 +220,7 @@ def combine_flash_masks(causal_mask, segment_ids):
 	return jnp.logical_or(~causal_mask, segment_ids)
 
 
-DEFAULT_ATTENTION_MECHANISM = (
-	"sdpa" if jax.extend.backend.get_backend().platform == "gpu" else "vanilla"
-)
+DEFAULT_ATTENTION_MECHANISM = "vanilla"
 
 
 def set_attrs_smartly_with_prp(
@@ -383,9 +381,9 @@ class FlexibleAttentionModule(nn.Module):
 
 		if isinstance(self.softmax_dtype, str):
 			self.softmax_dtype = _get_jax_dtype_from_string(self.softmax_dtype)
-			assert (
-				self.softmax_dtype is not None
-			), "Please consider passing attn_softmax_dtype to config."
+			assert self.softmax_dtype is not None, (
+				"Please consider passing attn_softmax_dtype to config."
+			)
 
 	def get_block_size_splash_attn(self, q_seq, k_seq):
 		return BlockSizesSplashAttn(
@@ -557,9 +555,9 @@ class FlexibleAttentionModule(nn.Module):
 		key_value_sequence_length: int,
 	):
 		batch_size = query_states.shape[0]
-		assert (
-			batch_size == key_states.shape[0] == value_states.shape[0]
-		), "Batch Size for q,k,v wont match"
+		assert batch_size == key_states.shape[0] == value_states.shape[0], (
+			"Batch Size for q,k,v wont match"
+		)
 		k_v_req_shape = (
 			batch_size,
 			key_value_sequence_length,
@@ -582,13 +580,13 @@ class FlexibleAttentionModule(nn.Module):
             """
 
 		assert query_states.shape == q_shape, assertion_mkv_err + (
-			f"\nMiss Match {query_states.shape} and " f"required Shape {q_shape}"
+			f"\nMiss Match {query_states.shape} and required Shape {q_shape}"
 		)
 		assert key_states.shape == k_v_req_shape, assertion_mkv_err + (
-			f"\nMiss Match {key_states.shape} and " f"required Shape {k_v_req_shape}"
+			f"\nMiss Match {key_states.shape} and required Shape {k_v_req_shape}"
 		)
 		assert value_states.shape == k_v_req_shape, assertion_mkv_err + (
-			f"\nMiss Match {value_states.shape} and " f"required Shape {k_v_req_shape}"
+			f"\nMiss Match {value_states.shape} and required Shape {k_v_req_shape}"
 		)
 
 	@jax.named_scope("easydel-flexible-attention")

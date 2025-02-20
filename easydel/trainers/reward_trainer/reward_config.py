@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import typing as tp
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from easydel.utils.compiling_utils import hash_fn
 
@@ -25,24 +25,46 @@ class RewardConfig(TrainingArguments):
 	Configuration class for the [`RewardTrainer`].
 
 	Parameters:
-	    max_length (`int` or `None`, *optional*, defaults to `1024`):
-	        Maximum length of the sequences (prompt + completion) in the batch, filters out entries that exceed the
-	        limit. This argument is required if you want to use the default data collator.
-	    disable_dropout (`bool`, *optional*, defaults to `True`):
-	        Whether to disable dropout in the model.
-	    dataset_num_proc (`int`, *optional*, defaults to `None`):
-	        Number of processes to use for processing the dataset.
-	    center_rewards_coefficient (`float`, *optional*, defaults to `0.1`):
-	        Coefficient to incentivize the reward model to output mean-zero rewards.
-	    remove_unused_columns (`bool`, *optional*, defaults to `False`):
-	        Whether to remove the columns that are not used by the model's forward pass. Can be `True` only if
-	        the dataset is pretokenized.
+	    model_name (str): The name of the model. Defaults to "RewardTrainer".
+	    max_length (int, optional): Maximum length of the sequences (prompt + completion) in the batch,
+	        filters out entries that exceed the limit.  Defaults to 1024.
+	    disable_dropout (bool, optional): Whether to disable dropout in the model. Defaults to True.
+	    dataset_num_proc (int, optional): Number of processes to use for processing the dataset. Defaults to None.
+	    center_rewards_coefficient (float, optional): Coefficient to incentivize the reward model to output
+	        mean-zero rewards. Defaults to 0.1.
+	    remove_unused_columns (bool, optional): Whether to remove the columns that are not used by the model's
+	        forward pass. Can be `True` only if the dataset is pretokenized. Defaults to False.
 	"""
 
-	model_name: str = "RewardTrainer"
-	max_length: tp.Optional[int] = 1024
-	disable_dropout: bool = True
-	dataset_num_proc: tp.Optional[int] = None
-	center_rewards_coefficient: tp.Optional[float] = 0.1
-	remove_unused_columns: bool = False
+	model_name: str = field(
+		default="RewardTrainer",
+		metadata={"help": "The name of the model."},
+	)
+	max_sequence_length: tp.Optional[int] = field(
+		default=1024,
+		metadata={
+			"help": "Maximum length of the sequences (prompt + completion) in the batch, filters out entries that exceed the limit."
+		},
+	)
+	disable_dropout: bool = field(
+		default=True,
+		metadata={"help": "Whether to disable dropout in the model."},
+	)
+	dataset_num_proc: tp.Optional[int] = field(
+		default=None,
+		metadata={"help": "Number of processes to use for processing the dataset."},
+	)
+	center_rewards_coefficient: tp.Optional[float] = field(
+		default=0.1,
+		metadata={
+			"help": "Coefficient to incentivize the reward model to output mean-zero rewards."
+		},
+	)
+	remove_unused_columns: bool = field(
+		default=False,
+		metadata={
+			"help": "Whether to remove the columns that are not used by the model's forward pass. Can be `True` only if the dataset is pretokenized."
+		},
+	)
+
 	__hash__ = hash_fn

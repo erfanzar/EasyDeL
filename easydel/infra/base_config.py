@@ -47,7 +47,6 @@ else:
 logger = get_logger(__name__)
 
 FLAX_WEIGHTS_NAME = "easydel-model.parameters"
-AVAILALBE_DEVICES = jax.device_count()
 DEFAULT_PALLAS_M_BLOCK_SIZE = 128
 DEFAULT_PALLAS_K_BLOCK_SIZE = 128
 DEFAULT_PALLAS_N_BLOCK_SIZE = 128
@@ -66,18 +65,12 @@ if ED_DEFAULT_HARDWARE_ABSTRACTION:
 	DEFAULT_HARDWARE_ABSTRACTION = True
 
 
-if jax.extend.backend.get_backend().platform == "tpu":
-	DEFAULT_PALLAS_M_BLOCK_SIZE = None  # Autoset
-	DEFAULT_PALLAS_K_BLOCK_SIZE = None  # Autoset
-	DEFAULT_PALLAS_N_BLOCK_SIZE = None  # Autoset
-
 if DEFAULT_HARDWARE_ABSTRACTION:
 	logger.info("HARDWARE_ABSTRACTION is ON by default")
 
 if EKERNEL_OPS:
 	logger.info(
-		"`EKERNEL_OPS` is ON and some operations will "
-		"automatically be replaced by EasyDeL."
+		"`EKERNEL_OPS` is ON and some operations will automatically be replaced by EasyDeL."
 	)
 	from easydel.kernels.gemm import replace_dot_general_with_gemm
 

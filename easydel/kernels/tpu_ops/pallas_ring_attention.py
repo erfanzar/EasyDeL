@@ -29,12 +29,10 @@ import jax
 import jax.lax as lax
 import jax.numpy as jnp
 from einops import rearrange
-from jax import extend
 from jax.experimental import pallas as pl  # type: ignore[import]
 from jax.experimental.pallas import tpu as pltpu  # type: ignore[import]
 
-_PLATFORM = extend.backend.get_backend().platform
-_INTERPRET = _PLATFORM != "tpu"
+_INTERPRET = False
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 NUM_LANES = 128
 NUM_SUBLANES = 8
@@ -406,7 +404,7 @@ class BlockSizes:
 				)
 			if major % minor != 0:
 				raise ValueError(
-					f"{prefix}{suffix}={minor} should divide" f" {prefix}_major{suffix}={major}"
+					f"{prefix}{suffix}={minor} should divide {prefix}_major{suffix}={major}"
 				)
 
 		verify_major_minor("blocksize_k", "", self.blocksize_k_major, self.blocksize_k)
@@ -541,7 +539,7 @@ def _flash_attention_bwd(
 	(query, key, value, ab, segment_ids, o, l, m) = residuals
 	if not blocksizes.has_backward_blocks:
 		raise ValueError(
-			"Program is being differentiated, but not all backward blocks are" " specified"
+			"Program is being differentiated, but not all backward blocks are specified"
 		)
 
 	di = jnp.sum(

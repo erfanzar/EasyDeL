@@ -27,12 +27,6 @@ from jax import numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from easydel.utils import GenerateRNG
-
-PLATFORM = jax.extend.backend.get_backend().platform
-INTERPRET = PLATFORM == "cpu"
-rng = GenerateRNG()
-
 
 def get_best_block_size_tpu(A, B):
 	# A is assumed to be of shape (m, k) and B is of shape (k, n)
@@ -128,9 +122,9 @@ def _call_tpu_matmul_kernel_fwd(
 	precision: jax.lax.PrecisionLike = None,
 ):
 	assert A.ndim == 2 and B.ndim == 2, f"got {A.shape=} and {B.shape=}"
-	assert (
-		A.shape[1] == B.shape[0]
-	), f"matmul can't be operated with these shapes {A.shape=} {B.shape=} "
+	assert A.shape[1] == B.shape[0], (
+		f"matmul can't be operated with these shapes {A.shape=} {B.shape=} "
+	)
 	m, k, n = A.shape[0], B.shape[0], B.shape[1]
 	pbm, pbk, pbn = get_best_block_size(A, B)
 
@@ -154,7 +148,6 @@ def _call_tpu_matmul_kernel_fwd(
 		f=partial(_tpu_matmul_kernel_fwd, precision=precision, k_grid=grid[-1]),
 		out_shape=jax.ShapeDtypeStruct(shape=(m, n), dtype=A.dtype),
 		debug=False,
-		interpret=INTERPRET,
 		grid_spec=pltpu.PrefetchScalarGridSpec(
 			num_scalar_prefetch=0,
 			grid=grid,

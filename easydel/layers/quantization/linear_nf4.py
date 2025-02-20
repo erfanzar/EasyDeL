@@ -38,49 +38,6 @@ Size = int
 
 default_kernel_init = initializers.lecun_normal()
 default_bias_init = initializers.zeros_init()
-NF4_TABLE = jnp.array(
-	[
-		-1.0,
-		-0.6961928009986877,
-		-0.5250730514526367,
-		-0.39491748809814453,
-		-0.28444138169288635,
-		-0.18477343022823334,
-		-0.09105003625154495,
-		0.0,
-		0.07958029955625534,
-		0.16093020141124725,
-		0.24611230194568634,
-		0.33791524171829224,
-		0.44070982933044434,
-		0.5626170039176941,
-		0.7229568362236023,
-		1.0,
-	],
-	dtype=jnp.float32,
-)
-
-NF4_BOUNDARIES = jnp.array(
-	[
-		-float("inf"),
-		-0.8480964004993439,
-		-0.6106329262256622,
-		-0.4599952697753906,
-		-0.33967943489551544,
-		-0.23460740596055984,
-		-0.13791173323988914,
-		-0.045525018125772476,
-		0.03979014977812767,
-		0.1202552504837513,
-		0.2035212516784668,
-		0.2920137718319893,
-		0.3893125355243683,
-		0.5016634166240692,
-		0.6427869200706482,
-		0.8614784181118011,
-	],
-	dtype=jnp.float32,
-)
 
 
 @partial(jax.jit, static_argnames=["block_size"])
@@ -99,7 +56,33 @@ def single_quantize_and_pack_nf4(blocks, block_size=64):
 	normalized = blocks / absmax[:, None]
 
 	# Quantize using vectorized operations
-	quantized = jnp.searchsorted(NF4_BOUNDARIES, normalized.reshape(-1)) - 1
+	quantized = (
+		jnp.searchsorted(
+			jnp.array(
+				[
+					-float("inf"),
+					-0.8480964004993439,
+					-0.6106329262256622,
+					-0.4599952697753906,
+					-0.33967943489551544,
+					-0.23460740596055984,
+					-0.13791173323988914,
+					-0.045525018125772476,
+					0.03979014977812767,
+					0.1202552504837513,
+					0.2035212516784668,
+					0.2920137718319893,
+					0.3893125355243683,
+					0.5016634166240692,
+					0.6427869200706482,
+					0.8614784181118011,
+				],
+				dtype=jnp.float32,
+			),
+			normalized.reshape(-1),
+		)
+		- 1
+	)
 
 	# Pack pairs efficiently using bit operations
 	quantized = quantized.reshape(-1, 2)
@@ -117,7 +100,27 @@ def single_dequantize_nf4(packed_values, absmax, block_size):
 	low = packed_values & 0xF
 	unpacked = jnp.stack([high, low], axis=1).reshape(-1)
 
-	dequantized = NF4_TABLE[unpacked]
+	dequantized = jnp.array(
+		[
+			-1.0,
+			-0.6961928009986877,
+			-0.5250730514526367,
+			-0.39491748809814453,
+			-0.28444138169288635,
+			-0.18477343022823334,
+			-0.09105003625154495,
+			0.0,
+			0.07958029955625534,
+			0.16093020141124725,
+			0.24611230194568634,
+			0.33791524171829224,
+			0.44070982933044434,
+			0.5626170039176941,
+			0.7229568362236023,
+			1.0,
+		],
+		dtype=jnp.float32,
+	)[unpacked]
 
 	num_blocks = len(absmax)
 	dequantized = dequantized.reshape(num_blocks, block_size)
@@ -286,9 +289,9 @@ class LinearNF4(QauntModule):
 		"""Applies a quantized linear transformation to the inputs along the last dimension."""
 		quant_kernel = self._dequantize_kernel()
 
-		assert (
-			quant_kernel is not None
-		), "loaded and dequantized quant_kernel is None, which means it have been loaded from another None Kernel Linear"
+		assert quant_kernel is not None, (
+			"loaded and dequantized quant_kernel is None, which means it have been loaded from another None Kernel Linear"
+		)
 
 		bias = self.bias.value
 

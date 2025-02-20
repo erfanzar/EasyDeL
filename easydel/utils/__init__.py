@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from ..layers.quantization.quantizers import EasyQuantizer
 from . import analyze_memory, compiling_utils, graph_utils, traversals
+from .cli_helpers import DataClassArgumentParser
 from .compiling_utils import (
 	cache_compiles,
 	cjit,
@@ -20,23 +22,23 @@ from .compiling_utils import (
 	save_compiled_fn,
 )
 from .helpers import Timer, Timers, get_logger
-from ..layers.quantization.quantizers import EasyQuantizer
 from .rngs_utils import GenerateRNG, JaxRNG
 
 __all__ = (
-	"Timers",
-	"Timer",
-	"get_logger",
 	"EasyQuantizer",
-	"graph_utils",
 	"analyze_memory",
 	"compiling_utils",
+	"graph_utils",
 	"traversals",
+	"DataClassArgumentParser",
 	"cache_compiles",
 	"cjit",
 	"compile_function",
 	"load_compiled_fn",
 	"save_compiled_fn",
+	"Timer",
+	"Timers",
+	"get_logger",
 	"GenerateRNG",
 	"JaxRNG",
 )

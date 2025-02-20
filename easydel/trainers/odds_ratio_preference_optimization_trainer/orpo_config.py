@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import typing as tp
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from easydel.utils.compiling_utils import hash_fn
 
@@ -31,10 +31,11 @@ class ORPOConfig(TrainingArguments):
 	some of the parameters after object initialization.
 
 	Attributes:
+	    model_name (str): The name of the model. Default is "ORPOTrainer".
 	    learning_rate (float): The learning rate used during training.
 	                          Default is 1e-6.
 	    max_length (Optional[int]): The maximum allowed sequence length for the input.
-	                                Default is 1024.
+	                               Default is 1024.
 	    max_prompt_length (Optional[int]): The maximum allowed length of the prompt portion
 	                                       of the input. Default is 512.
 	    max_completion_length (Optional[int]): The maximum allowed length of the completion.
@@ -50,26 +51,66 @@ class ORPOConfig(TrainingArguments):
 	                                 Default is False.
 	    is_encoder_decoder (Optional[bool]): Flag to indicate if the model is encoder-decoder.
 	                                         Default is None.
-	    model_init_kwargs (Optional[dict[str, Any]]): Additional keyword arguments for model initialization.
+	    model_init_kwargs (Optional[Dict[str, Any]]): Additional keyword arguments for model initialization.
 	                                                  Default is None.
 	    dataset_num_proc (Optional[int]): Number of processes to use for dataset processing.
 	                                      Default is None.
 	    max_sequence_length (int): Computed attribute representing the maximum sequence length
 	                               used for training. It is set in the __post_init__ method.
 	"""
-	model_name: str = "ORPOTrainer"
-	learning_rate: float = 1e-6
-	max_length: tp.Optional[int] = 1024
-	max_prompt_length: tp.Optional[int] = 512
-	max_completion_length: tp.Optional[int] = None
-	beta: float = 0.1
-	disable_dropout: bool = True
-	label_pad_token_id: int = -100
-	padding_value: tp.Optional[int] = None
-	generate_during_eval: bool = False
-	is_encoder_decoder: tp.Optional[bool] = None
-	model_init_kwargs: tp.Optional[dict[str, tp.Any]] = None
-	dataset_num_proc: tp.Optional[int] = None
+
+	model_name: str = field(
+		default="ORPOTrainer",
+		metadata={"help": "The name of the model."},
+	)
+	learning_rate: float = field(
+		default=1e-6,
+		metadata={"help": "The learning rate used during training."},
+	)
+	max_length: tp.Optional[int] = field(
+		default=1024,
+		metadata={"help": "The maximum allowed sequence length for the input."},
+	)
+	max_prompt_length: tp.Optional[int] = field(
+		default=512,
+		metadata={"help": "The maximum allowed length of the prompt portion of the input."},
+	)
+	max_completion_length: tp.Optional[int] = field(
+		default=None,
+		metadata={
+			"help": "The maximum allowed length of the completion. If not provided, it is set to max_length - max_prompt_length."
+		},
+	)
+	beta: float = field(
+		default=0.1,
+		metadata={"help": "A hyperparameter beta."},
+	)
+	disable_dropout: bool = field(
+		default=True,
+		metadata={"help": "Flag to disable dropout during training."},
+	)
+	label_pad_token_id: int = field(
+		default=-100,
+		metadata={"help": "The token id used for padding labels."},
+	)
+	padding_value: tp.Optional[int] = field(
+		default=None,
+		metadata={"help": "The value used for padding sequences."},
+	)
+	generate_during_eval: bool = field(
+		default=False,
+		metadata={
+			"help": "Flag indicating whether to generate sequences during evaluation."
+		},
+	)
+	is_encoder_decoder: tp.Optional[bool] = field(
+		default=None,
+		metadata={"help": "Flag to indicate if the model is encoder-decoder."},
+	)
+	dataset_num_proc: tp.Optional[int] = field(
+		default=None,
+		metadata={"help": "Number of processes to use for dataset processing."},
+	)
 
 	def __post_init__(self):
 		"""
@@ -89,6 +130,9 @@ class ORPOConfig(TrainingArguments):
 
 		# Set max_sequence_length based on a chosen policy.
 		self.max_sequence_length = self.max_length * 2  # Chosen - Rejected
-		return super().__post_init__()
+
+		# Call the post_init of the parent class if it exists.
+		if hasattr(super(), "__post_init__"):
+			super().__post_init__()
 
 	__hash__ = hash_fn
