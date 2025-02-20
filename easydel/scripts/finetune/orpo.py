@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import easydel as ed
 import typing as tp
-from datasets import load_dataset
-from transformers import AutoTokenizer
-from jax import numpy as jnp
-import jax
 from dataclasses import dataclass, field
+
+import jax
+from datasets import load_dataset
+from jax import numpy as jnp
+from transformers import AutoTokenizer
+
+import easydel as ed
 
 
 @dataclass
@@ -57,8 +59,8 @@ class RunTimeConfig:
 			"help": "The repository ID for the processor. If None, defaults to repo_id."
 		},
 	)
-	sharding_axis: tp.Union[tp.Tuple[int], str] = field(
-		default=(1, -1, 1, 1),
+	sharding_axis: str = field(
+		default="(1, -1, 1, 1)",
 		metadata={"help": "The sharding axis."},
 	)
 	attn_mechanism: ed.AttentionMechanisms = field(
