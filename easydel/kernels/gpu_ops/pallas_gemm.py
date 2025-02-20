@@ -26,13 +26,9 @@ import jax.random
 from jax import numpy as jnp
 from jax.experimental import pallas as pl
 
-from easydel.utils import GenerateRNG
 
-PLATFORM = jax.extend.backend.get_backend().platform
-INTERPRET = PLATFORM == "cpu"
-rng = GenerateRNG()
 
-# GPU KERNEL
+INTERPRET = False
 
 
 def _gpu_matmul_kernel_fwd(

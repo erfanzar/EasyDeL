@@ -13,7 +13,7 @@
 # limitations under the License.
 import os
 import typing as tp
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
@@ -124,16 +124,43 @@ This model is well-suited for the following tasks:
 class ModelInfo:
 	"""Model information container."""
 
-	name: str
-	type: str
-	repo_id: str
-	description: tp.Optional[str] = None
-	model_type: tp.Optional[str] = None
-	model_task: tp.Optional[str] = None
-	features: tp.Optional[list] = None
-	supported_tasks: tp.Optional[list] = None
-	limitations: tp.Optional[list] = None
-	version: str = __version__
+	name: str = field(
+		metadata={"help": "The name of the model."},
+	)
+	type: str = field(
+		metadata={"help": "The type of the model."},
+	)
+	repo_id: str = field(
+		metadata={"help": "The repository ID of the model."},
+	)
+	description: tp.Optional[str] = field(
+		default=None,
+		metadata={"help": "A description of the model."},
+	)
+	model_type: tp.Optional[str] = field(
+		default=None,
+		metadata={"help": "The model type."},
+	)
+	model_task: tp.Optional[str] = field(
+		default=None,
+		metadata={"help": "The model task."},
+	)
+	features: tp.Optional[tp.List[str]] = field(
+		default=None,
+		metadata={"help": "A list of features of the model."},
+	)
+	supported_tasks: tp.Optional[tp.List[str]] = field(
+		default=None,
+		metadata={"help": "A list of tasks supported by the model."},
+	)
+	limitations: tp.Optional[tp.List[str]] = field(
+		default=None,
+		metadata={"help": "A list of limitations of the model."},
+	)
+	version: str = field(
+		default=__version__,
+		metadata={"help": "The version of the model."},
+	)
 
 
 class ReadmeGenerator:

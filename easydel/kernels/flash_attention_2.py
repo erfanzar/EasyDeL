@@ -43,7 +43,7 @@ from .gpu_ops import (
 
 AVAILABLE_FLASH_ATTENTION2_PLATFORMS = tp.Literal["triton", "pallas", "jax"]
 AVAILABLE_BACKENDS = tp.Literal["gpu", "tpu", "cpu"]
-BACKEND = get_backend().platform
+
 
 
 def get_device_memory_usage(device: jax.Device) -> float:

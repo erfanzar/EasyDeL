@@ -683,8 +683,9 @@ class StepMetrics:
 			detailed_metrics = self._calculate_detailed_metrics(metrics)
 			basic_metrics.update(detailed_metrics)
 		if mode is not None:
-			basic_metrics = {f"{mode}/{k}": v for k, v in basic_metrics.items()}
+			basic_metrics = {f"{mode}/{k}": v for k, v in basic_metrics.items()} 
 		basic_metrics.update(mlperf_metrics)
+		
 		return basic_metrics
 
 	def _calculate_detailed_metrics(self, metrics: LossMetrics):

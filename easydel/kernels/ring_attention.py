@@ -25,7 +25,6 @@ from .cpu_ops import jax_ring_attention_mu
 from .tpu_ops import pallas_ring_attention_tpu
 
 AVAILABLE_RING_ATTENTION_PLATFORM = tp.Literal["pallas", "jax"]
-BACKEND = get_backend().platform
 
 
 def ring_attention(
@@ -82,7 +81,7 @@ def ring_attention(
 		Output array of shape (batch, q_len, num_heads, dim_per_head).
 	"""
 	if backend == Ellipsis or backend is None:
-		backend = BACKEND
+		backend = get_backend().platform
 	if platform == Ellipsis or platform is None:
 		match backend:
 			case "gpu":

@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 
 import uvicorn
-from fastapi import APIRouter, FastAPI
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 from prometheus_client import start_http_server
 
@@ -64,6 +64,7 @@ class vInferenceApiServer:
 		self,
 		inference_map: tp.Dict[str, vInference] = None,
 		max_workers: int = 10,
+		app: tp.Optional[FastAPI] = None,
 	) -> None:
 		from .vinference import vInference
 
@@ -75,7 +76,6 @@ class vInferenceApiServer:
 
 		self.thread_pool = ThreadPoolExecutor(max_workers=max_workers)
 		self.inference_map = inference_map
-		self.router = APIRouter()
 		self._endpoints = [
 			EndpointConfig(
 				path="/v1/chat/completions",
@@ -113,8 +113,7 @@ class vInferenceApiServer:
 				summary="Get available inference modules for requesting",
 			),
 		]
-		self.app = FastAPI()
-		self.server = uvicorn.Server(uvicorn.Config(app=self.app))
+		self.app = app if app is not None else FastAPI()
 		self.logger = get_logger(__name__)
 		self.patch_endpoints()
 

@@ -20,7 +20,7 @@ import socketserver
 import threading
 import time
 import typing as tp
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 import jax
@@ -202,15 +202,49 @@ class SMPMemoryMonitor:
 
 @dataclass
 class DeviceStats:
-	device_id: str
-	hostname: str
-	timestamp: datetime
-	utilization_percent: float
-	peak_utilization_percent: float
-	fragmentation_ratio: float
-	allocation_efficiency: float
-	memory_pressure: str
-	raw_stats: tp.Dict[str, tp.Any]
+	"""
+	Dataclass to store device statistics.
+
+	Attributes:
+	    device_id (str): The ID of the device.
+	    hostname (str): The hostname of the machine.
+	    timestamp (datetime): The timestamp of the statistics.
+	    utilization_percent (float): The utilization percentage of the device.
+	    peak_utilization_percent (float): The peak utilization percentage of the device.
+	    fragmentation_ratio (float): The fragmentation ratio of the device memory.
+	    allocation_efficiency (float): The allocation efficiency of the device memory.
+	    memory_pressure (str): The memory pressure status (e.g., 'low', 'medium', 'high').
+	    raw_stats (Dict[str, Any]): A dictionary containing the raw statistics from the device.
+	"""
+
+	device_id: str = field(
+		metadata={"help": "The ID of the device."},
+	)
+	hostname: str = field(
+		metadata={"help": "The hostname of the machine."},
+	)
+	timestamp: datetime = field(
+		metadata={"help": "The timestamp of the statistics."},
+	)
+	utilization_percent: float = field(
+		metadata={"help": "The utilization percentage of the device."},
+	)
+	peak_utilization_percent: float = field(
+		metadata={"help": "The peak utilization percentage of the device."},
+	)
+	fragmentation_ratio: float = field(
+		metadata={"help": "The fragmentation ratio of the device memory."},
+	)
+	allocation_efficiency: float = field(
+		metadata={"help": "The allocation efficiency of the device memory."},
+	)
+	memory_pressure: str = field(
+		metadata={"help": "The memory pressure status (e.g., 'low', 'medium', 'high')."},
+	)
+	raw_stats: tp.Dict[str, tp.Any] = field(
+		default_factory=dict,
+		metadata={"help": "A dictionary containing the raw statistics from the device."},
+	)
 
 
 class MemoryMonitorServer:

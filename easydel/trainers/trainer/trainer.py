@@ -446,7 +446,11 @@ class Trainer(BaseTrainer):
 			batch=batch,
 			is_train=False,
 		)
-		metrics = self.sharded_evaluation_step_function(state, batch)
+		metrics = self.sharded_evaluation_step_function(
+			state,
+			batch,
+			*self._eval_shared_fn_extra_args,
+		)
 		if len(informations) != 0:
 			if metrics.other_metrics is not None:
 				informations.update(metrics.other_metrics)
@@ -491,7 +495,11 @@ class Trainer(BaseTrainer):
 			)
 
 			state, metrics = jax.block_until_ready(
-				self.sharded_training_step_function(state, batch)
+				self.sharded_training_step_function(
+					state,
+					batch,
+					*self._train_shared_fn_extra_args,
+				)
 			)
 
 			if len(informations) != 0:

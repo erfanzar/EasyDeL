@@ -19,19 +19,12 @@ from functools import partial
 
 import chex
 import jax
+import jax.extend
 from flax.nnx import dot_product_attention as _dot_product_attention
-from jax import custom_vjp, extend
+from jax import custom_vjp
 from jax import numpy as jnp
 from jax import random as jrand
 from jax.experimental import pallas as pl
-
-from easydel.utils import GenerateRNG
-
-_PLATFORM = extend.backend.get_backend().platform
-_INTERPRET = _PLATFORM == "cpu"
-_TEST_DTYPE = jnp.float16
-# _INTERPRET = True
-_rng = GenerateRNG()
 
 
 def _gpu_fwd_flash_attn_kernel(
@@ -194,7 +187,6 @@ def _call_gpu_fwd_flash_attn(
 		in_specs=in_specs,
 		out_shape=out_shape,
 		compiler_params=dict(triton=dict(num_wraps=4 if dim <= 64 else 8, num_stages=1)),
-		interpret=_INTERPRET,
 		debug=False,
 		name=f"gpu_fwd_flash_attn_{inference_mode}",
 	)
@@ -441,7 +433,6 @@ def _call_gpu_bwd_flash_attn(
 		],
 		out_specs=pl.BlockSpec(lse.shape, lambda *_: (0,) * lse.ndim),
 		out_shape=jax.ShapeDtypeStruct(shape=lse.shape, dtype=o.dtype),
-		interpret=_INTERPRET,
 		debug=False,
 		name="gpu_bwd_flash_attn",
 	)(o, dO)
@@ -525,7 +516,7 @@ def _flash_attn2(
 ):
 	chex.assert_equal_shape(inputs=(k, v), dims=(0, 1, 2, 3))
 	chex.assert_equal_rank([q, k, v])
-	if _PLATFORM in ["gpu", "cpu"]:
+	if jax.extend.backend.get_backend().platform in ["gpu", "cpu"]:
 		return _gpu_flash_attn(
 			q=q,
 			k=k,
@@ -537,13 +528,16 @@ def _flash_attn2(
 			softmax_scale=softmax_scale,
 		)
 	raise NotImplementedError(
-		f"`_flash_attn2` is not implemented for requested platform {_PLATFORM}"
+		f"`_flash_attn2` is not implemented for requested platform {jax.extend.backend.get_backend().platform}"
 	)
 
 
 def gpu_fwd_test():
+	from easydel.utils import GenerateRNG
+
+	_rng = GenerateRNG()
 	b, h, qs, s, d = 2, 32, 2048, 2048, 128
-	dtype = _TEST_DTYPE
+	dtype = jnp.float16
 
 	q = jrand.normal(_rng.rng, shape=(b, qs, h, d), dtype=dtype)
 	k = jrand.normal(_rng.rng, shape=(b, s, h, d), dtype=dtype)
@@ -569,13 +563,16 @@ def gpu_fwd_test():
 		qblock=32,
 		kblock=32,
 	)
-	print(f"PRED : {result[-1,-1,-1,:5]}")
-	print(f"ORGN : {excepted_result[-1,-1,-1,:5]}")
+	print(f"PRED : {result[-1, -1, -1, :5]}")
+	print(f"ORGN : {excepted_result[-1, -1, -1, :5]}")
 
 	print(jnp.allclose(excepted_result, result, atol=0.125, rtol=0))
 
 
 def gpu_bwd_test():
+	from easydel.utils import GenerateRNG
+
+	_rng = GenerateRNG()
 	q_key, k_key, v_key = jrand.split(jrand.PRNGKey(8), 3)
 	B, H, S, D = 1, 2, 16, 16
 	blocksize_k = 16
@@ -592,7 +589,7 @@ def gpu_bwd_test():
 		if False
 		else None
 	)
-	dtype = _TEST_DTYPE
+	dtype = jnp.float16
 
 	excepted_result = jax.grad(lambda *x: _dot_product_attention(*x).sum())(q, k, v, b)
 	result = jax.grad(
@@ -603,8 +600,8 @@ def gpu_bwd_test():
 			kblock=blocksize_k,
 		).sum()
 	)(q, k, v, b)
-	print(f"PRED BWD : {result[-1,-1,-1,:5]}")
-	print(f"ORGN BWD : {excepted_result[-1,-1,-1,:5]}")
+	print(f"PRED BWD : {result[-1, -1, -1, :5]}")
+	print(f"ORGN BWD : {excepted_result[-1, -1, -1, :5]}")
 
 	print(jnp.allclose(excepted_result, result, atol=0.125, rtol=0))
 

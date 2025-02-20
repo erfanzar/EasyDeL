@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import typing as tp
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from easydel.utils.compiling_utils import hash_fn
 
@@ -86,7 +86,6 @@ class DPOConfig(TrainingArguments):
 	    rpo_alpha (float | None): Alpha parameter for Relative Preference Optimization.
 	        None disables RPO. Default: None
 	    tools (list[dict | Callable] | None): Additional tools for training process
-	        (e.g., custom metrics, logging hooks). Default: None
 
 	Example:
 	    >>> config = DPOConfig(
@@ -94,34 +93,125 @@ class DPOConfig(TrainingArguments):
 	    ... )
 	"""
 
-	model_name: str = "DPOTrainer"
-	beta: float = 0.1
-	label_smoothing: float = 0.0
-	loss_type: LOSS_FN_VARIENTS = "sigmoid"
-	use_weighting: bool = False
-	label_pad_token_id: int = -100
-	padding_value: tp.Optional[int] = None
-	max_length: tp.Optional[int] = 512
-	max_prompt_length: tp.Optional[int] = 256
-	max_completion_length: tp.Optional[int] = None
-	is_encoder_decoder: tp.Optional[bool] = None
-	disable_dropout: bool = True
-	precompute_ref_log_probs: bool = False
-	dataset_num_proc: tp.Optional[int] = None
-	reference_free: bool = False
-	force_use_ref_model: bool = False
-	sync_ref_model: bool = False
-	learning_rate: float = 1e-6
-	ref_model_mixup_alpha: float = 0.9
-	ref_model_sync_steps: int = 64
-	rpo_alpha: tp.Optional[float] = None
-	tools: tp.Optional[tp.List[tp.Union[dict, tp.Callable]]] = None
+	model_name: str = field(
+		default="DPOTrainer",
+		metadata={"help": "The name of the model."},
+	)
+	beta: float = field(
+		default=0.1,
+		metadata={
+			"help": "Temperature parameter (β) controlling deviation from reference model. Higher values make training focus more on preference matching."
+		},
+	)
+	label_smoothing: float = field(
+		default=0.0,
+		metadata={
+			"help": "Smoothing factor for labels in loss calculation. Helps prevent overconfidence. 0.0 means no smoothing."
+		},
+	)
+	loss_type: LOSS_FN_VARIENTS = field(
+		default="sigmoid",
+		metadata={
+			"help": "Type of contrastive loss function to use. Valid options: 'sigmoid', 'hinge', 'ipo', 'exo_pair', 'nca_pair', 'robust', 'bco_pair', 'sppo_hard', 'aot', 'aot_pair', 'apo_zero', 'apo_down'."
+		},
+	)
+	use_weighting: bool = field(
+		default=False,
+		metadata={"help": "Whether to apply example weighting in loss calculation."},
+	)
+	label_pad_token_id: int = field(
+		default=-100,
+		metadata={"help": "Token ID used for padding labels."},
+	)
+	padding_value: tp.Optional[int] = field(
+		default=None,
+		metadata={
+			"help": "Value used for padding sequences. If None, uses model's default padding token."
+		},
+	)
+	max_length: tp.Optional[int] = field(
+		default=512,
+		metadata={"help": "Maximum total sequence length (prompt + completion)."},
+	)
+	max_prompt_length: tp.Optional[int] = field(
+		default=256,
+		metadata={"help": "Maximum length for prompt sequences."},
+	)
+	max_completion_length: tp.Optional[int] = field(
+		default=None,
+		metadata={
+			"help": "Maximum length for completion sequences. Auto-calculated as max_length - max_prompt_length if None."
+		},
+	)
+	is_encoder_decoder: tp.Optional[bool] = field(
+		default=None,
+		metadata={
+			"help": "Explicitly set if model is encoder-decoder. Auto-detected if None."
+		},
+	)
+	disable_dropout: bool = field(
+		default=True,
+		metadata={
+			"help": "Whether to disable dropout during training for deterministic behavior."
+		},
+	)
+	precompute_ref_log_probs: bool = field(
+		default=False,
+		metadata={
+			"help": "Whether to precompute reference model log probabilities before training."
+		},
+	)
+	dataset_num_proc: tp.Optional[int] = field(
+		default=None,
+		metadata={
+			"help": "Number of processes for dataset preprocessing. Default: None (sequential processing)"
+		},
+	)
+	reference_free: bool = field(
+		default=False,
+		metadata={"help": "Whether to use reference-free variant of DPO."},
+	)
+	force_use_ref_model: bool = field(
+		default=False,
+		metadata={"help": "Force use reference model even when reference_free=True."},
+	)
+	sync_ref_model: bool = field(
+		default=False,
+		metadata={
+			"help": "Whether to periodically sync reference model with training model."
+		},
+	)
+	learning_rate: float = field(
+		default=1e-6,
+		metadata={"help": "Optimizer learning rate."},
+	)
+	ref_model_mixup_alpha: float = field(
+		default=0.9,
+		metadata={"help": "Alpha parameter for mixup between policy and reference models."},
+	)
+	ref_model_sync_steps: int = field(
+		default=64,
+		metadata={"help": "Number of steps between reference model syncs."},
+	)
+	rpo_alpha: tp.Optional[float] = field(
+		default=None,
+		metadata={
+			"help": "Alpha parameter for Relative Preference Optimization. None disables RPO."
+		},
+	)
+	tools: tp.Optional[tp.List[tp.Union[dict, tp.Callable]]] = field(
+		default=None,
+		metadata={"help": "Additional tools for training process."},
+	)
 
 	def __post_init__(self):
 		"""Post-initialization processing to derive dependent parameters."""
 		if self.max_completion_length is None:
 			self.max_completion_length = self.max_length - self.max_prompt_length
-		self.max_sequence_length = self.max_length * 2  # Chosen + Rejected sequences
-		return super().__post_init__()
+		# chosen + rejected sequences
+		self.max_sequence_length = self.max_length * 2
+		# Call the post_init of the parent class if it exists. Important for inheritance
+		if hasattr(super(), "__post_init__"):
+			super().__post_init__()
 
 	__hash__ = hash_fn

@@ -18,7 +18,7 @@ import re
 import typing as tp
 import warnings
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 import jax
@@ -67,74 +67,284 @@ AVAILABLE_BACKENDS: tp.List[str] = ["cpu", "gpu", "tpu", None]
 
 @dataclass
 class TrainingArguments:
-	auto_shard_states: bool = True
-	aux_loss_enabled: bool = False
-	backend: tp.Optional[str] = None
-	clip_grad: tp.Optional[float] = None
-	custom_scheduler: tp.Optional[tp.Callable[[int], tp.Any]] = None
-	dataloader_num_workers: tp.Optional[int] = 0
-	dataloader_pin_memory: tp.Optional[bool] = False
-	do_eval: bool = False
-	do_last_save: bool = True
-	do_train: bool = True
-	eval_batch_size: tp.Optional[int] = None
-	evaluation_steps: tp.Optional[int] = None
-	extra_optimizer_kwargs: dict = field(default_factory=dict)
-	frozen_parameters: tp.Optional[str] = None
-	gradient_accumulation_steps: int = 1
-	ids_to_pop_from_dataset: tp.Optional[list] = field(default_factory=list)
-	is_fine_tuning: bool = True
-	init_tx: bool = True
-	jax_distributed_config: tp.Optional[dict] = None
-	learning_rate: float = 5e-5
-	learning_rate_end: tp.Optional[float] = None
-	log_all_workers: bool = False
-	log_grad_norms: bool = True
-	report_metrics: bool = True
-	log_steps: int = 10
-	loss_config: tp.Optional[LossConfig] = None
-	low_mem_usage: bool = True
-	max_evaluation_steps: tp.Optional[int] = None
-	max_sequence_length: tp.Optional[int] = 4096
-	max_training_steps: tp.Optional[int] = None
-	model_name: str = "BaseTrainer"
-	model_parameters: tp.Optional[dict] = None
-	metrics_to_show_in_rich_pbar: tp.Optional[list] = None
-	num_train_epochs: int = 10
-	offload_dataset: bool = False
-	offload_device_type: str = "cpu"
-	offload_device_index: int = 0
-	optimizer: AVAILABLE_OPTIMIZERS = EasyDeLOptimizers.ADAMW
-	performance_mode: bool = False
-	pruning_module: tp.Any = None
-	process_zero_is_admin: bool = True
-	progress_bar_type: tp.Literal["tqdm", "rich", "json"] = "tqdm"
-	remove_ckpt_after_load: bool = False
-	remove_unused_columns: bool = True
-	report_steps: int = 5
-	save_directory: str = "EasyDeL-Checkpoints"
-	save_optimizer_state: bool = True
-	save_steps: tp.Optional[int] = None
-	save_total_limit: tp.Optional[int] = None
-	scheduler: AVAILABLE_SCHEDULERS = EasyDeLSchedulers.NONE
-	sparsify_module: bool = False
-	sparse_module_type: AVAILABLE_SPARSE_MODULE_TYPES = "bcoo"
-	state_apply_fn_kwarguments_to_model: tp.Optional[dict] = None
-	step_partition_spec: PartitionSpec = PartitionSpec(("dp", "fsdp"), "sp")
-	step_start_point: tp.Optional[int] = None
-	shuffle_train_dataset: bool = True
-	total_batch_size: int = 32
-	training_time_limit: tp.Optional[str] = None
-	train_on_inputs: bool = True
-	truncation_mode: tp.Literal["keep_end", "keep_start"] = "keep_end"
-	tx_mu_dtype: tp.Optional[jnp.dtype] = None
-	track_memory: bool = False
-	use_data_collactor: bool = True
-	use_wandb: bool = True
-	verbose: bool = True
-	wandb_entity: tp.Optional[str] = None
-	warmup_steps: int = 0
-	weight_decay: float = 0.01
+	auto_shard_states: bool = field(
+		default=True,
+		metadata={"help": "Whether to automatically shard model states across devices."},
+	)
+	aux_loss_enabled: bool = field(
+		default=False,
+		metadata={"help": "Whether to enable the auxiliary loss."},
+	)
+	backend: tp.Optional[str] = field(
+		default=None,
+		metadata={
+			"help": "The JAX backend to use (e.g., 'cpu', 'gpu', 'tpu').  If None, JAX will choose."
+		},
+	)
+	clip_grad: tp.Optional[float] = field(
+		default=None,
+		metadata={"help": "The value at which to clip the gradients."},
+	)
+	custom_scheduler: tp.Optional[tp.Callable[[int], tp.Any]] = field(
+		default=None,
+		metadata={
+			"help": "A custom scheduler function that takes the current step as input."
+		},
+	)
+	dataloader_num_workers: tp.Optional[int] = field(
+		default=0,
+		metadata={"help": "The number of workers to use for the dataloader."},
+	)
+	dataloader_pin_memory: tp.Optional[bool] = field(
+		default=False,
+		metadata={"help": "Whether to pin memory for the dataloader."},
+	)
+	do_eval: bool = field(
+		default=False,
+		metadata={"help": "Whether to run evaluation during training."},
+	)
+	do_last_save: bool = field(
+		default=True,
+		metadata={"help": "Whether to save the model at the end of training."},
+	)
+	do_train: bool = field(
+		default=True,
+		metadata={"help": "Whether to run training."},
+	)
+	eval_batch_size: tp.Optional[int] = field(
+		default=None,
+		metadata={"help": "The batch size to use for evaluation."},
+	)
+	evaluation_steps: tp.Optional[int] = field(
+		default=None,
+		metadata={"help": "Run evaluation every X steps."},
+	)
+	extra_optimizer_kwargs: dict = field(
+		default_factory=dict,
+		metadata={"help": "Additional keyword arguments to pass to the optimizer."},
+	)
+	frozen_parameters: tp.Optional[str] = field(
+		default=None,
+		metadata={"help": "A regex pattern of parameters to freeze (not train)."},
+	)
+	gradient_accumulation_steps: int = field(
+		default=1,
+		metadata={"help": "The number of steps to accumulate gradients over."},
+	)
+	ids_to_pop_from_dataset: tp.Optional[tp.List[str]] = field(
+		default_factory=list,
+		metadata={"help": "A list of dataset columns to remove before training."},
+	)
+	is_fine_tuning: bool = field(
+		default=True,
+		metadata={"help": "Whether the training is a fine-tuning run."},
+	)
+	init_tx: bool = field(
+		default=True,
+		metadata={"help": "Whether to initialize the training state."},
+	)
+	jax_distributed_config: tp.Optional[dict] = field(
+		default=None,
+		metadata={"help": "Configuration for JAX distributed training."},
+	)
+	learning_rate: float = field(
+		default=5e-5,
+		metadata={"help": "The learning rate."},
+	)
+	learning_rate_end: tp.Optional[float] = field(
+		default=None,
+		metadata={"help": "The final learning rate for linear decay schedulers."},
+	)
+	log_all_workers: bool = field(
+		default=False,
+		metadata={
+			"help": "Whether to log metrics from all workers in a distributed setup."
+		},
+	)
+	log_grad_norms: bool = field(
+		default=True,
+		metadata={"help": "Whether to log gradient norms."},
+	)
+	report_metrics: bool = field(
+		default=True,
+		metadata={"help": "Whether to report metrics to a logger."},
+	)
+	log_steps: int = field(
+		default=10,
+		metadata={"help": "Log metrics every X steps."},
+	)
+	loss_config: tp.Optional[LossConfig] = field(
+		default=None,
+		metadata={"help": "Configuration for the loss function."},
+	)
+	low_mem_usage: bool = field(
+		default=True,
+		metadata={"help": "Whether to try to minimize memory usage."},
+	)
+	max_evaluation_steps: tp.Optional[int] = field(
+		default=None,
+		metadata={"help": "Maximum number of evaluation steps."},
+	)
+	max_sequence_length: tp.Optional[int] = field(
+		default=4096,
+		metadata={"help": "The maximum sequence length."},
+	)
+	max_training_steps: tp.Optional[int] = field(
+		default=None,
+		metadata={"help": "The maximum number of training steps."},
+	)
+	model_name: str = field(
+		default="BaseTrainer",
+		metadata={"help": "The name of the model."},
+	)
+	model_parameters: tp.Optional[dict] = field(
+		default=None,
+		metadata={"help": "Model architecture config"},
+	)
+	metrics_to_show_in_rich_pbar: tp.Optional[tp.List[str]] = field(
+		default=None,
+		metadata={"help": "Metrics to display in the rich progress bar."},
+	)
+	num_train_epochs: int = field(
+		default=10,
+		metadata={"help": "The number of training epochs."},
+	)
+	offload_dataset: bool = field(
+		default=False,
+		metadata={"help": "Whether to offload the dataset to CPU or disk."},
+	)
+	offload_device_type: str = field(
+		default="cpu",
+		metadata={"help": "The device type to offload the dataset to (cpu or disk)."},
+	)
+	offload_device_index: int = field(
+		default=0,
+		metadata={"help": "The device index to offload the dataset to."},
+	)
+	optimizer: AVAILABLE_OPTIMIZERS = field(
+		default=EasyDeLOptimizers.ADAMW,
+		metadata={"help": "The optimizer to use."},
+	)
+	performance_mode: bool = field(
+		default=False,
+		metadata={"help": "Whether to enable performance mode (e.g., XLA compilation)."},
+	)
+	pruning_module: tp.Any = field(
+		default=None,
+		metadata={"help": "The pruning module to use."},
+	)
+	process_zero_is_admin: bool = field(
+		default=True,
+		metadata={"help": "Whether the process with rank 0 is the admin process."},
+	)
+	progress_bar_type: tp.Literal["tqdm", "rich", "json"] = field(
+		default="tqdm",
+		metadata={"help": "The type of progress bar to use."},
+	)
+	remove_ckpt_after_load: bool = field(
+		default=False,
+		metadata={"help": "Whether to remove the checkpoint after loading it."},
+	)
+	remove_unused_columns: bool = field(
+		default=True,
+		metadata={"help": "Whether to remove unused columns from the dataset."},
+	)
+	report_steps: int = field(
+		default=5,
+		metadata={"help": "Report metrics every X steps."},
+	)
+	save_directory: str = field(
+		default="EasyDeL-Checkpoints",
+		metadata={"help": "The directory to save checkpoints to."},
+	)
+	save_optimizer_state: bool = field(
+		default=True,
+		metadata={"help": "Whether to save the optimizer state along with the model."},
+	)
+	save_steps: tp.Optional[int] = field(
+		default=None,
+		metadata={"help": "Save a checkpoint every X steps."},
+	)
+	save_total_limit: tp.Optional[int] = field(
+		default=None,
+		metadata={"help": "The maximum number of checkpoints to keep."},
+	)
+	scheduler: AVAILABLE_SCHEDULERS = field(
+		default=EasyDeLSchedulers.NONE,
+		metadata={"help": "The scheduler to use."},
+	)
+	sparsify_module: bool = field(
+		default=False,
+		metadata={"help": "Whether to sparsify the model."},
+	)
+	sparse_module_type: AVAILABLE_SPARSE_MODULE_TYPES = field(
+		default="bcoo",
+		metadata={"help": "The type of sparse module to use."},
+	)
+	state_apply_fn_kwarguments_to_model: tp.Optional[dict] = field(
+		default=None,
+		metadata={"help": "Keyword arguments to pass to the state apply function."},
+	)
+	step_partition_spec: PartitionSpec = field(
+		default=PartitionSpec(("dp", "fsdp"), "sp"),
+		metadata={"help": "The partition specification for the training step."},
+	)
+	step_start_point: tp.Optional[int] = field(
+		default=None,
+		metadata={"help": "The step to start training from (for resuming)."},
+	)
+	shuffle_train_dataset: bool = field(
+		default=True,
+		metadata={"help": "Whether to shuffle the training dataset."},
+	)
+	total_batch_size: int = field(
+		default=32,
+		metadata={"help": "The total batch size."},
+	)
+	training_time_limit: tp.Optional[str] = field(
+		default=None,
+		metadata={"help": "The maximum training time (e.g., '1d', '2h30m')."},
+	)
+	train_on_inputs: bool = field(
+		default=True,
+		metadata={"help": "Whether to train on the input data."},
+	)
+	truncation_mode: tp.Literal["keep_end", "keep_start"] = field(
+		default="keep_end",
+		metadata={"help": "The truncation mode to use."},
+	)
+	tx_mu_dtype: tp.Optional[jnp.dtype] = field(
+		default=None,
+		metadata={"help": "The dtype to use for the `tx.mu` variable."},
+	)
+	track_memory: bool = field(
+		default=False,
+		metadata={"help": "Whether to track memory usage."},
+	)
+	use_data_collactor: bool = field(
+		default=True,
+		metadata={"help": "Whether to use a data collator."},
+	)
+	use_wandb: bool = field(
+		default=True,
+		metadata={"help": "Whether to use Weights & Biases for logging."},
+	)
+	verbose: bool = field(
+		default=True,
+		metadata={"help": "Whether to print verbose output."},
+	)
+	wandb_entity: tp.Optional[str] = field(
+		default=None,
+		metadata={"help": "The Weights & Biases entity."},
+	)
+	warmup_steps: int = field(
+		default=0,
+		metadata={"help": "The number of warmup steps for the learning rate scheduler."},
+	)
+	weight_decay: float = field(
+		default=0.01,
+		metadata={"help": "The weight decay value."},
+	)
 
 	@property
 	def offload_device(self):
@@ -539,35 +749,15 @@ class TrainingArguments:
 		"""
 		return cls(**config)
 
-	def __str__(self):
-		"""
-		Returns a formatted string representation of the configuration.
+	def __repr__(self):
+		cls_name = self.__class__.__name__
+		field_lines = [
+			f"    {f.name}: {getattr(self, f.name)!r}".replace("\n", "\n    ")
+			for f in fields(self)
+		]
+		return f"{cls_name}(\n" + "\n".join(field_lines) + "\n)"
 
-		Returns:
-		    str: A formatted string showing the configuration settings.
-		"""
-		return self._pretty_print(self.to_dict())
-
-	@staticmethod
-	def _pretty_print(d: tp.Dict[str, tp.Any], indent: int = 0) -> str:
-		"""
-		Helper function for pretty-printing a dictionary.
-
-		Args:
-		    d (tp.Dict[str, tp.Any]): The dictionary to pretty-print.
-		    indent (int): The indentation level.
-
-		Returns:
-		    str: The pretty-printed string representation of the dictionary.
-		"""
-		result = []
-		for key, value in d.items():
-			result.append(" " * indent + str(key) + ":")
-			if isinstance(value, dict):
-				result.append(TrainingArguments._pretty_print(value, indent + 2))
-			else:
-				result.append(" " * (indent + 2) + str(value))
-		return "\n".join(result)
+	__str__ = __repr__
 
 	def _get_save_directory(self, create: bool = True) -> Path:
 		bd = Path(self.save_directory)

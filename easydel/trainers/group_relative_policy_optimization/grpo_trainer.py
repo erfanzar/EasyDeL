@@ -64,6 +64,18 @@ RewardFunc = tp.Union[
 ]
 
 
+def _fileaf(x):
+	return isinstance(x, jax.Array)
+
+
+def delete_tree(pytree):
+	return jax.tree_util.tree_map(
+		lambda x: x.delete() if isinstance(x, jax.Array) else None,
+		pytree,
+		is_leaf=_fileaf,
+	)
+
+
 class GRPOTrainer(Trainer):
 	arguments: GRPOConfig
 
@@ -393,7 +405,7 @@ class GRPOTrainer(Trainer):
 			completion_ids = prompt_completion_ids[..., output.padded_length :]
 			completion_mask = self._make_attn_mask(completion_ids)
 			ridmask = batch["attention_mask"].repeat(self.num_generations, 0)
-			del output  # free kv memory
+			output = delete_tree(output)  # free kv memory
 
 			with capture_time() as token_logps_time_fn:
 				ref_per_token_logps = self.compute_refmodel_logps(
@@ -494,14 +506,7 @@ class GRPOTrainer(Trainer):
 				)
 			grouped_comp_time = grouped_comp_time_fn()
 		preprocessing_time = preprocessing_time_fn()
-		return {
-			"prompt_ids": prompt_ids,
-			"prompt_mask": prompt_mask,
-			"completion_ids": completion_ids,
-			"completion_mask": completion_mask,
-			"ref_per_token_logps": self._all_gather(ref_per_token_logps),
-			"advantages": advantages,
-		}, {
+		metrics_dict = {
 			"rewards": jnp.mean(rewards, -1),
 			"completion_length": jnp.sum(completion_mask.sum(-1), -1),
 			"grouped_comp_time": grouped_comp_time,
@@ -510,6 +515,21 @@ class GRPOTrainer(Trainer):
 			"vinference_time": vinference_time,
 			"preprocessing_time": preprocessing_time,
 		}
+		for i, reward_func in enumerate(self.reward_funcs):
+			metrics_dict[
+				getattr(reward_func, "__name__", None) or reward_func.__class__.__name__
+			] = jnp.mean(rewards_per_func[:, i])
+		return (
+			{
+				"prompt_ids": prompt_ids,
+				"prompt_mask": prompt_mask,
+				"completion_ids": completion_ids,
+				"completion_mask": completion_mask,
+				"ref_per_token_logps": self._all_gather(ref_per_token_logps),
+				"advantages": advantages,
+			},
+			metrics_dict,
+		)
 
 	def on_step_end(
 		self,

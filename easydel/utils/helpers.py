@@ -59,9 +59,11 @@ def get_logger(
 	Returns:
 	    logging.Logger: The configured logger instance.
 	"""
-	if jax.process_index() > 0:
-		level = logging.WARNING
-
+	try:
+		if jax.process_index() > 0:
+			level = logging.WARNING
+	except RuntimeError:
+		...
 	logger = logging.getLogger(name)
 	logger.propagate = False
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import typing as tp
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from easydel.utils.compiling_utils import hash_fn
 
@@ -25,39 +25,79 @@ class SFTConfig(TrainingArguments):
 	Configuration class for the [`SFTTrainer`].
 
 	Parameters:
-			dataset_text_field (`str`, *optional*, defaults to `None`):
-					Name of the text field of the dataset. If provided, the trainer will automatically create a
-					[`ConstantLengthDataset`] based on `dataset_text_field`.
-			packing (`bool`, *optional*, defaults to `False`):
-					Controls whether the [`ConstantLengthDataset`] packs the sequences of the dataset.
-			learning_rate (`float`, *optional*, defaults to `2e-5`):
-					Initial learning rate for [`AdamW`] optimizer. The default value replaces that of [`~transformers.TrainingArguments`].
-			dataset_num_proc (`Optional[int]`, *optional*, defaults to `None`):
-					Number of processes to use for processing the dataset. Only used when `packing=False`.
-			dataset_batch_size (`Union[int, None]`, *optional*, defaults to `1000`):
-					Number of examples to tokenize per batch. If `dataset_batch_size <= 0` or `dataset_batch_size is None`,
-					tokenizes the full dataset as a single batch.
-			dataset_kwargs (`Optional[dict[str, Any]]`, *optional*, defaults to `None`):
-					Dictionary of optional keyword arguments to pass when creating packed or non-packed datasets.
-			eval_packing (`Optional[bool]`, *optional*, defaults to `None`):
-					Whether to pack the eval dataset. If `None`, uses the same value as `packing`.
-			num_of_sequences (`int`, *optional*, defaults to `1024`):
-					Number of sequences to use for the [`ConstantLengthDataset`].
-			chars_per_token (`float`, *optional*, defaults to `3.6`):
-					Number of characters per token to use for the [`ConstantLengthDataset`]. See
-					[chars_token_ratio](https://github.com/huggingface/trl/blob/08f550674c553c36c51d1027613c29f14f3676a5/examples/stack_llama/scripts/supervised_finetuning.py#L53) for more details.
+	    model_name (str): The name of the model. Defaults to "SFTTrainer".
+	    dataset_text_field (str, optional): Name of the text field of the dataset. If provided, the trainer will
+	        automatically create a [`ConstantLengthDataset`] based on `dataset_text_field`. Defaults to None.
+	    packing (bool, optional): Controls whether the [`ConstantLengthDataset`] packs the sequences of the
+	        dataset. Defaults to False.
+	    learning_rate (float, optional): Initial learning rate for [`AdamW`] optimizer. The default value replaces
+	        that of [`~transformers.TrainingArguments`]. Defaults to 2e-5.
+	    dataset_num_proc (int, optional): Number of processes to use for processing the dataset. Only used when
+	        `packing=False`. Defaults to None.
+	    dataset_batch_size (int, optional): Number of examples to tokenize per batch. If
+	        `dataset_batch_size <= 0` or `dataset_batch_size is None`, tokenizes the full dataset as a single
+	        batch. Defaults to 1000.
+	    dataset_kwargs (dict[str, Any], optional): Dictionary of optional keyword arguments to pass when creating
+	        packed or non-packed datasets. Defaults to None.
+	    eval_packing (bool, optional): Whether to pack the eval dataset. If `None`, uses the same value as
+	        `packing`. Defaults to None.
+	    num_of_sequences (int, optional): Number of sequences to use for the [`ConstantLengthDataset`].
+	        Defaults to 1024.
+	    chars_per_token (float, optional): Number of characters per token to use for the
+	        [`ConstantLengthDataset`]. See
+	        [chars_token_ratio](https://github.com/huggingface/trl/blob/08f550674c553c36c51d1027613c29f14f3676a5/examples/stack_llama/scripts/supervised_finetuning.py#L53)
+	        for more details. Defaults to 3.6.
 	"""
 
-	model_name: str = "SFTTrainer"
-	dataset_text_field: tp.Optional[str] = None
-	add_special_tokens: bool = False
-	packing: bool = False
-	learning_rate: float = 2.0e-5 
-	dataset_num_proc: tp.Optional[int] = None
-	dataset_batch_size: int = 1000
-	dataset_kwargs: tp.Optional[dict[str, tp.Any]] = None
-	eval_packing: tp.Optional[bool] = None
-	num_of_sequences: int = 1024
-	chars_per_token: float = 3.6
+	model_name: str = field(
+		default="SFTTrainer",
+		metadata={"help": "The name of the model."},
+	)
+	dataset_text_field: tp.Optional[str] = field(
+		default=None,
+		metadata={"help": "Name of the text field of the dataset."},
+	)
+	add_special_tokens: bool = field(
+		default=False,
+		metadata={"help": "Whether to add special tokens."},
+	)
+	packing: bool = field(
+		default=False,
+		metadata={"help": "Controls whether the sequences of the dataset are packed."},
+	)
+	learning_rate: float = field(
+		default=2.0e-5,
+		metadata={"help": "Initial learning rate for the AdamW optimizer."},
+	)
+	dataset_num_proc: tp.Optional[int] = field(
+		default=None,
+		metadata={"help": "Number of processes to use for processing the dataset."},
+	)
+	dataset_batch_size: int = field(
+		default=1000,
+		metadata={"help": "Number of examples to tokenize per batch."},
+	)
+	dataset_kwargs: tp.Optional[dict[str, tp.Any]] = field(
+		default=None,
+		metadata={
+			"help": "Dictionary of optional keyword arguments to pass when creating datasets."
+		},
+	)
+	eval_packing: tp.Optional[bool] = field(
+		default=None,
+		metadata={
+			"help": "Whether to pack the eval dataset. If None, uses the same value as packing."
+		},
+	)
+	num_of_sequences: int = field(
+		default=1024,
+		metadata={"help": "Number of sequences to use for the ConstantLengthDataset."},
+	)
+	chars_per_token: float = field(
+		default=3.6,
+		metadata={
+			"help": "Number of characters per token to use for the ConstantLengthDataset."
+		},
+	)
 
 	__hash__ = hash_fn

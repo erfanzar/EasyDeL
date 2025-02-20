@@ -16,6 +16,7 @@
 import gc
 import threading
 import time
+from dataclasses import fields
 
 import jax
 import psutil
@@ -33,6 +34,16 @@ class ModelMetadata:
 	sequence_length: int
 	dtype: str
 	platfrom: str
+
+	def __repr__(self):
+		cls_name = self.__class__.__name__
+		field_lines = [
+			f"    {f.name}: {getattr(self, f.name)!r}".replace("\n", "\n    ")
+			for f in fields(self)
+		]
+		return f"{cls_name}(\n" + "\n".join(field_lines) + "\n)"
+
+	__str__ = __repr__
 
 
 class vInferenceMetrics:

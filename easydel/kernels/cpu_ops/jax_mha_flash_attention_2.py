@@ -29,10 +29,6 @@ import jax.sharding
 from eformer.escale import with_sharding_constraint
 from jax import lax
 
-from easydel.utils import GenerateRNG
-
-rng = GenerateRNG()
-
 
 @functools.partial(
 	jax.jit,
@@ -200,9 +196,9 @@ def _fwd_flash_attn(
 	b, h, _, d = query_state.shape
 	q_seq = query_state.shape[2]
 	k_seq = key_state.shape[2]
-	assert (
-		q_seq % blocksize_q == 0
-	), "Query sequence length is not visible by queryblock size"
+	assert q_seq % blocksize_q == 0, (
+		"Query sequence length is not visible by queryblock size"
+	)
 	assert k_seq % blocksize_k == 0, "Key sequence length is not visible by keyblock size"
 	Tr = q_seq // blocksize_q
 	Tc = k_seq // blocksize_k
@@ -472,6 +468,10 @@ _flash_attn2.defvjp(_fwd_flash_attn, _bwd_flash_attn)
 
 
 def fwd_test():
+	from easydel.utils import GenerateRNG
+
+	rng = GenerateRNG()
+
 	b, h, qs, s, d = 1, 32, 2048, 2048, 128
 	dtype = jnp.float16
 
@@ -499,13 +499,16 @@ def fwd_test():
 		blocksize_k=64,
 	)
 
-	print(f"PRED : {result[0,0,0,:5]}")
-	print(f"ORGN : {excepted_result[0,0,0,:5]}")
+	print(f"PRED : {result[0, 0, 0, :5]}")
+	print(f"ORGN : {excepted_result[0, 0, 0, :5]}")
 
 	print(jnp.allclose(excepted_result, result, atol=0.125, rtol=0))
 
 
 def bwd_test():
+	from easydel.utils import GenerateRNG
+
+	rng = GenerateRNG()
 	b, h, qs, s, d = 2, 32, 64, 64, 64
 	dtype = jnp.float16
 
@@ -531,8 +534,8 @@ def bwd_test():
 		).sum()
 	)(q, k, v)
 
-	print(f"PRED BWD : {result[0,0,0,:5]}")
-	print(f"ORGN BWD : {excepted_result[0,0,0,:5]}")
+	print(f"PRED BWD : {result[0, 0, 0, :5]}")
+	print(f"ORGN BWD : {excepted_result[0, 0, 0, :5]}")
 
 	print(jnp.allclose(excepted_result, result, atol=0.125, rtol=0))
 
