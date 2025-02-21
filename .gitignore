@@ -6,6 +6,7 @@ __pycache__/
 # C extensions
 .idea
 *.so
+*.slurm
 env.ipynb
 env.py
 exp.py
