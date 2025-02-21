@@ -13,6 +13,13 @@ First, install `eopod` using pip:
 ```shell
 pip install eopod
 ```
+> *note*
+> 
+> if you faced any error like eopod not found run following command
+>
+> ```shell
+> echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+> ```
 
 Next, configure `eopod` with your project details:
 
@@ -32,7 +39,7 @@ Login to your wandb and huggingface account:
 
 ```shell
 eopod run "python -c 'from huggingface_hub import login; login(token=\"<API-TOKEN-HERE>\")'"
-eopod run wandb login <API-TOKEN-HERE>
+eopod run python -m wandb login <API-TOKEN-HERE>
 ```
 
 ## Notes
