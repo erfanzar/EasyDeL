@@ -1,20 +1,15 @@
 import os
 import sys
 
-import jax
-import torch
-
-os.environ["JAX_TRACEBACK_FILTERING"] = "off"
-os.environ["EASYDEL_AUTO"] = "true"
-
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+import easydel as ed
 from huggingface_hub import HfApi
 from jax import numpy as jnp
 from jax import sharding
 from transformers import AutoTokenizer
 
-import easydel as ed
+import jax
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
@@ -33,17 +28,16 @@ def main():
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
 			attn_dtype=dtype,
+			attn_softmax_dtype=jnp.float32,
 			gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
 			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		),
 		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-		platform=ed.EasyDeLPlatforms.TRITON,
-		param_dtype=dtype,  # jnp.float8_e5m2,
+		param_dtype=dtype,
 		dtype=dtype,
-		torch_dtype=torch.float16,
 		partition_axis=partition_axis,
-		precision=jax.lax.Precision("fastest"),
+		precision=jax.lax.Precision.DEFAULT,
 	)
 
 	model.eval()
@@ -64,14 +58,42 @@ def main():
 			pad_token_id=model.generation_config.pad_token_id,
 			bos_token_id=model.generation_config.bos_token_id,
 			streaming_chunks=64,
-			num_return_sequences={1024: 4, 2048: 2},
+			num_return_sequences=1,
 		),
 	)
 
-	inference.precompile(1, [1024, 2048])
+	inference.precompile(1, [1024])
 	print(inference.inference_name)
-	ed.vInferenceApiServer({inference.inference_name: inference}).fire()
+	ed.vInferenceApiServer(inference).fire()
 
 
 if __name__ == "__main__":
 	main()
+
+
+# curl -X POST http://0.0.0.0:11556/v1/chat/completions \
+#      -H "Content-Type: application/json" \
+#      -d '{
+#   "model": "$MODEL_ID",
+#   "messages": [
+#     {
+#       "role": "user",
+#       "content": "hi"
+#     }
+#   ],
+#   "function_call": "none",
+#   "temperature": 1,
+#   "top_p": 1,
+#   "n": 1,
+#   "stream": false,
+#   "stop": "string",
+#   "max_tokens": 16,
+#   "presence_penalty": 0,
+#   "frequency_penalty": 0,
+#   "logit_bias": {
+#     "additionalProp1": 0,
+#     "additionalProp2": 0,
+#     "additionalProp3": 0
+#   },
+#   "user": "string"
+# }'

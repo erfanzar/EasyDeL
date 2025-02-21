@@ -19,7 +19,7 @@ import typing as tp
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from http import HTTPStatus
-
+from ray import serve as rserve
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -40,10 +40,14 @@ from .api_models import (
 )
 
 if tp.TYPE_CHECKING:
-	from .vinference import vInference
+	from .vinference import vInference, vInferenceConfig
 else:
 	vInference = tp.Any
+	vInferenceConfig = tp.Any
 TIMEOUT_KEEP_ALIVE = 5.0
+
+APP = FastAPI()
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -59,24 +63,35 @@ def create_error_response(status_code: HTTPStatus, message: str) -> JSONResponse
 	return JSONResponse({"message": message}, status_code=status_code.value)
 
 
+@rserve.ingress(APP)
 class vInferenceApiServer:
 	def __init__(
 		self,
-		inference_map: tp.Dict[str, vInference] = None,
+		inference_map: tp.Union[tp.Dict[str, vInference], vInference] = None,
+		inference_init_call: tp.Optional[tp.Callable[[], vInference]] = None,
 		max_workers: int = 10,
-		app: tp.Optional[FastAPI] = None,
 	) -> None:
 		from .vinference import vInference
 
+		if inference_init_call is not None:
+			inference_map = inference_init_call()
+
 		assert inference_map is not None, "`inference_map` can not be None."
+		if isinstance(inference_map, vInference):
+			inference_map = {inference_map.inference_name: inference_map}
 		for inference in inference_map.values():
-			assert isinstance(inference, vInference), (
-				"values and inferences in inference_map must be `vInference`"
-			)
+			err_msg = "values and inferences in inference_map must be `vInference`"
+			assert isinstance(inference, vInference), err_msg
 
 		self.thread_pool = ThreadPoolExecutor(max_workers=max_workers)
 		self.inference_map = inference_map
-		self._endpoints = [
+
+		self.logger = logger
+		self.patch_endpoints()
+
+	@property
+	def _endpoints(self):
+		return [
 			EndpointConfig(
 				path="/v1/chat/completions",
 				handler=self.chat_completions,
@@ -113,9 +128,6 @@ class vInferenceApiServer:
 				summary="Get available inference modules for requesting",
 			),
 		]
-		self.app = app if app is not None else FastAPI()
-		self.logger = get_logger(__name__)
-		self.patch_endpoints()
 
 	async def chat_completions(self, request: ChatCompletionRequest):
 		try:
@@ -397,9 +409,9 @@ class vInferenceApiServer:
 				if endpoint.tags:
 					route_params["tags"] = endpoint.tags
 				if method == "GET":
-					self.app.get(**route_params)(endpoint.handler)
+					APP.get(**route_params)(endpoint.handler)
 				elif method == "POST":
-					self.app.post(**route_params)(endpoint.handler)
+					APP.post(**route_params)(endpoint.handler)
 
 	def fire(
 		self,
@@ -411,7 +423,7 @@ class vInferenceApiServer:
 		metrics_port = metrics_port or (port + 1)
 		start_http_server(metrics_port)
 		uvicorn.run(
-			self.app,
+			APP,
 			host=host,
 			port=port,
 			log_level=log_level,
