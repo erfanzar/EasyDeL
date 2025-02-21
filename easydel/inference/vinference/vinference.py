@@ -26,6 +26,7 @@ from datetime import datetime
 from functools import cached_property
 from uuid import uuid4
 
+import eformer.escale as es
 import jax
 import numpy as np
 from chex import PRNGKey
@@ -36,7 +37,7 @@ from jax._src.stages import Compiled
 from jax.interpreters import pxla
 from jax.sharding import NamedSharding, PartitionSpec
 from pydantic import BaseModel
-import eformer.escale as es
+
 from easydel.utils.compiling_utils import (
 	load_compiled_fn,
 	save_compiled_fn,
@@ -63,7 +64,7 @@ else:
 	EasyDeLBaseModule = None
 	ProcessingClassType = None
 
-logger = get_logger(__name__)
+logger = get_logger("vInference")
 TIME = str(datetime.fromtimestamp(time.time())).split(" ")[0]
 
 
@@ -434,6 +435,13 @@ class vInference:
 		"""
 		Validates the token IDs for padding, end-of-sequence, and beginning-of-sequence.
 		"""
+		if hasattr(self.model, "generation_config"):
+			if self.generation_config.pad_token_id is None:
+				self.generation_config.pad_token_id = self.model.generation_config.pad_token_id
+			if self.generation_config.eos_token_id is None:
+				self.generation_config.eos_token_id = self.model.generation_config.eos_token_id
+			if self.generation_config.bos_token_id is None:
+				self.generation_config.bos_token_id = self.model.generation_config.bos_token_id
 
 		if self.generation_config.pad_token_id is None:
 			self.generation_config.pad_token_id = self.tokenizer.pad_token_id
