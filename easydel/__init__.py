@@ -13,11 +13,12 @@
 # limitations under the License.
 
 __version__ = "0.1.0"
-
 import os as _os
 from logging import getLogger as _getLogger
 
 if _os.environ.get("EASYDEL_AUTO", "true") in ["true", "1", "on", "yes"]:
+	import sys as _sys
+	_sys.setrecursionlimit(10000)
 	# Tell jax xla bridge to stay quiet and only yied warnings or errors.
 	_getLogger("jax._src.xla_bridge").setLevel(30)
 	_getLogger("jax._src.mesh_utils").setLevel(30)
