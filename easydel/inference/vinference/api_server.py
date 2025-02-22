@@ -19,7 +19,6 @@ import typing as tp
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from http import HTTPStatus
-from ray import serve as rserve
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -63,7 +62,6 @@ def create_error_response(status_code: HTTPStatus, message: str) -> JSONResponse
 	return JSONResponse({"message": message}, status_code=status_code.value)
 
 
-@rserve.ingress(APP)
 class vInferenceApiServer:
 	def __init__(
 		self,
