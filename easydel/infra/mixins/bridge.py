@@ -392,6 +392,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		cls,
 		pretrained_model_name_or_path: tp.Optional[tp.Union[str, os.PathLike]],
 		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
+		sharding_dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
 		sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
 		partition_axis: PartitionAxis = PartitionAxis(),  # noqa
 		dtype: jnp.dtype = jnp.float32,
@@ -490,6 +491,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		config = AutoEasyDeLConfig.from_pretrained(
 			config_path,
 			sharding_axis_dims=sharding_axis_dims,
+			sharding_dcn_axis_dims=sharding_dcn_axis_dims,
 			sharding_axis_names=sharding_axis_names,
 			partition_axis=partition_axis,
 			from_torch=False,
@@ -640,6 +642,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		param_dtype: jax.numpy.dtype = jax.numpy.float32,
 		precision: tp.Optional[jax.lax.Precision] = None,
 		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
+		sharding_dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
 		sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
 		partition_axis: tp.Optional[PartitionAxis] = None,
 		shard_attention_computation: bool = True,
@@ -716,6 +719,7 @@ class EasyBridgeMixin(PushToHubMixin):
 			config_class.add_jax_args()
 		config_class.add_basic_configurations(
 			axis_dims=sharding_axis_dims,
+			dcn_axis_dims=sharding_dcn_axis_dims,
 			axis_names=sharding_axis_names,
 			partition_axis=partition_axis,
 			backend=backend,
@@ -752,6 +756,7 @@ class EasyBridgeMixin(PushToHubMixin):
 				pretrained_model_name_or_path=pretrained_model_name_or_path,
 				partition_rules=partition_rules,
 				sharding_axis_dims=sharding_axis_dims,
+				sharding_dcn_axis_dims=sharding_dcn_axis_dims,
 				sharding_axis_names=sharding_axis_names,
 				partition_axis=partition_axis,
 				shard_attention_computation=shard_attention_computation,

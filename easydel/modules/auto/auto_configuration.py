@@ -87,6 +87,7 @@ class AutoEasyDeLConfig:
 		cls,
 		pretrained_model_name_or_path: str,
 		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
+		sharding_dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
 		sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
 		partition_axis: tp.Optional[PartitionAxis] = None,
 		shard_attention_computation: bool = True,
@@ -131,6 +132,7 @@ class AutoEasyDeLConfig:
 			config.add_jax_args()
 		config.add_basic_configurations(
 			axis_dims=sharding_axis_dims,
+			dcn_axis_dims=sharding_dcn_axis_dims,
 			axis_names=sharding_axis_names,
 			partition_axis=partition_axis,
 			backend=backend,
@@ -216,6 +218,7 @@ class AutoShardAndGatherFunctions:
 		cls,
 		pretrained_model_name_or_path: str,
 		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
+		sharding_dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
 		sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
 		partition_axis: tp.Optional[PartitionAxis] = None,
 		shard_attention_computation: bool = True,
@@ -253,6 +256,7 @@ class AutoShardAndGatherFunctions:
 		config = AutoEasyDeLConfig.from_pretrained(
 			pretrained_model_name_or_path,
 			sharding_axis_dims=sharding_axis_dims,
+			sharding_dcn_axis_dims=sharding_dcn_axis_dims,
 			sharding_axis_names=sharding_axis_names,
 			partition_axis=partition_axis,
 			shard_attention_computation=shard_attention_computation,
