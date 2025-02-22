@@ -103,6 +103,7 @@ warnings.filterwarnings("ignore", message="You are using a model of type")
 
 class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
 	axis_dims: tp.Sequence[int]
+	dcn_axis_dims: tp.Optional[tp.Sequence[int]]
 	axis_names: tp.Sequence[str]
 	attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS
 	blocksize_k: int
@@ -142,44 +143,44 @@ class EasyDeLBaseConfig(PretrainedConfig):
 	"""
 	Initialize the configuration for EasyDeL.
 	Args:
-		axis_dims (tp.Sequence[int]): Dimensions of the axes. Default is (1, -1, 1, 1).
-		axis_names (tp.Sequence[str]): Names of the axes. Default is ("dp", "fsdp", "tp", "sp").
-		attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS): Attention mechanism to use. Default is DEFAULT_ATTENTION_MECHANISM.
-		blocksize_k (int): Block size for key. Default is 128.
-		blocksize_q (int): Block size for query. Default is 128.
-		blocksize_b (int): Block size for batch. Default is 1.
-		partition_axis (PartitionAxis): Partition axis configuration. Default is PartitionAxis().
-		shard_attention_computation (bool): Whether to shard attention computation. Default is True.
-		use_sharded_kv_caching (bool): Whether to use sharded key-value caching. Default is False.
-		use_sharding_constraint (bool): Whether to use sharding constraint. Default is False.
-		backend (tp.Optional[EasyDeLBackends]): Backend to use. Default is None.
-		platform (tp.Optional[EasyDeLPlatforms]): Platform to use. Default is None.
-		easy_method (tp.Literal["train", "serve", "convert"]): Method to use. Default is EasyMethod.TRAIN.
-		bits (tp.Optional[int]): Number of bits for quantization. Default is None.
-		scan_ring_attention (bool): Whether to scan ring attention. Default is True.
-		scan_attention_layers (bool): Whether to scan attention layers. Default is False.
-		use_scan_mlp (bool): Whether to use scan MLP. Default is False.
-		scan_mlp_chunk_size (int): Chunk size for scan MLP. Default is 1024.
-		attention_axis_name (str): Name of the attention axis. Default is "sp".
-		gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing method. Default is EasyDeLGradientCheckPointers.NONE.
-		kv_cache_quantization_method (EasyDeLQuantizationMethods): Key-value cache quantization method. Default is EasyDeLQuantizationMethods.NONE.
-		kv_cache_quantization_blocksize (int): Block size for key-value cache quantization. Default is 64.
-		quantization_method (EasyDeLQuantizationMethods): Quantization method. Default is EasyDeLQuantizationMethods.NONE.
-		quantization_pattern (str): Pattern for quantization. Default is ".*".
-		quantization_blocksize (int): Block size for quantization. Default is 64.
-		kv_cache_sharding_sequence_axis_name (tp.Union[str, tp.Tuple[str, ...]]): Name of the key-value cache sharding sequence axis. Default is "sp".
-		flash_attention_backward_pass_impl (tp.Literal["triton", "xla"]): Implementation for flash attention backward pass. Default is "triton".
-		attn_dtype (jnp.dtype): Data type for attention. Default is device half.
-		attn_softmax_dtype (jnp.dtype): Data type for softmax ops in attention. Default is jnp.float32.
-		fcm_max_ratio (float): Maximum ratio for FCM. Default is 0.0.
-		fcm_min_ratio (float): Minimum ratio for FCM. Default is 0.0.
-		hardware_abstraction (bool): Whether to use hardware abstraction. Default is DEFAULT_HARDWARE_ABSTRACTION.
-		pallas_m_block_size (int): Block size for Pallas M. Default is DEFAULT_PALLAS_M_BLOCK_SIZE.
-		pallas_k_block_size (int): Block size for Pallas K. Default is DEFAULT_PALLAS_K_BLOCK_SIZE.
-		pallas_n_block_size (int): Block size for Pallas N. Default is DEFAULT_PALLAS_N_BLOCK_SIZE.
-		**kwargs: Additional keyword arguments.
+	  axis_dims (tp.Sequence[int]): Dimensions of the axes. Default is (1, -1, 1, 1).
+	  axis_names (tp.Sequence[str]): Names of the axes. Default is ("dp", "fsdp", "tp", "sp").
+	  attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS): Attention mechanism to use. Default is DEFAULT_ATTENTION_MECHANISM.
+	  blocksize_k (int): Block size for key. Default is 128.
+	  blocksize_q (int): Block size for query. Default is 128.
+	  blocksize_b (int): Block size for batch. Default is 1.
+	  partition_axis (PartitionAxis): Partition axis configuration. Default is PartitionAxis().
+	  shard_attention_computation (bool): Whether to shard attention computation. Default is True.
+	  use_sharded_kv_caching (bool): Whether to use sharded key-value caching. Default is False.
+	  use_sharding_constraint (bool): Whether to use sharding constraint. Default is False.
+	  backend (tp.Optional[EasyDeLBackends]): Backend to use. Default is None.
+	  platform (tp.Optional[EasyDeLPlatforms]): Platform to use. Default is None.
+	  easy_method (tp.Literal["train", "serve", "convert"]): Method to use. Default is EasyMethod.TRAIN.
+	  bits (tp.Optional[int]): Number of bits for quantization. Default is None.
+	  scan_ring_attention (bool): Whether to scan ring attention. Default is True.
+	  scan_attention_layers (bool): Whether to scan attention layers. Default is False.
+	  use_scan_mlp (bool): Whether to use scan MLP. Default is False.
+	  scan_mlp_chunk_size (int): Chunk size for scan MLP. Default is 1024.
+	  attention_axis_name (str): Name of the attention axis. Default is "sp".
+	  gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing method. Default is EasyDeLGradientCheckPointers.NONE.
+	  kv_cache_quantization_method (EasyDeLQuantizationMethods): Key-value cache quantization method. Default is EasyDeLQuantizationMethods.NONE.
+	  kv_cache_quantization_blocksize (int): Block size for key-value cache quantization. Default is 64.
+	  quantization_method (EasyDeLQuantizationMethods): Quantization method. Default is EasyDeLQuantizationMethods.NONE.
+	  quantization_pattern (str): Pattern for quantization. Default is ".*".
+	  quantization_blocksize (int): Block size for quantization. Default is 64.
+	  kv_cache_sharding_sequence_axis_name (tp.Union[str, tp.Tuple[str, ...]]): Name of the key-value cache sharding sequence axis. Default is "sp".
+	  flash_attention_backward_pass_impl (tp.Literal["triton", "xla"]): Implementation for flash attention backward pass. Default is "triton".
+	  attn_dtype (jnp.dtype): Data type for attention. Default is device half.
+	  attn_softmax_dtype (jnp.dtype): Data type for softmax ops in attention. Default is jnp.float32.
+	  fcm_max_ratio (float): Maximum ratio for FCM. Default is 0.0.
+	  fcm_min_ratio (float): Minimum ratio for FCM. Default is 0.0.
+	  hardware_abstraction (bool): Whether to use hardware abstraction. Default is DEFAULT_HARDWARE_ABSTRACTION.
+	  pallas_m_block_size (int): Block size for Pallas M. Default is DEFAULT_PALLAS_M_BLOCK_SIZE.
+	  pallas_k_block_size (int): Block size for Pallas K. Default is DEFAULT_PALLAS_K_BLOCK_SIZE.
+	  pallas_n_block_size (int): Block size for Pallas N. Default is DEFAULT_PALLAS_N_BLOCK_SIZE.
+	  **kwargs: Additional keyword arguments.
 	Raises:
-		Warning: If `kv_cache_quantization_method` is not NONE and `use_sharded_kv_caching` is True.
+	  Warning: If `kv_cache_quantization_method` is not NONE and `use_sharded_kv_caching` is True.
 	"""
 
 	_show_private_attrs: bool = False
@@ -187,6 +188,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 	def __init__(
 		self,
 		axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
+		dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
 		axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
 		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_ATTENTION_MECHANISM,
 		blocksize_k: int = 128,
@@ -224,6 +226,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		**kwargs,
 	):
 		self.axis_dims = getattr(self, "axis_dims", axis_dims)
+		self.dcn_axis_dims = getattr(self, "dcn_axis_dims", dcn_axis_dims)
 		self.axis_names = getattr(self, "axis_names", axis_names)
 		self.backend = getattr(
 			self,
@@ -289,14 +292,14 @@ class EasyDeLBaseConfig(PretrainedConfig):
 	def create_mesh(
 		axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
 		axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+		dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
+		process_is_granule: bool = False,
+		should_sort_granules_by_key: bool = True,
+		allow_split_physical_axes: bool = True,
 		backend: tp.Optional[str] = None,
 	):
-		"""The create_mesh function creates a mesh object that can be used to shard arrays.
-
-		Args:
-		    axis_dims: tp.Sequence[int]: Specify the dimensions of the mesh
-		    axis_names: tp.Sequence[str]: Name the axes of the mesh
-		    backend: Specify the backend to use
+		"""
+		The create_mesh function creates a mesh object that can be used to shard arrays.
 
 		Returns:
 		    A mesh object
@@ -305,9 +308,14 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
 		if backend == "":
 			backend = None
+
 		return create_mesh(
 			axis_dims=axis_dims,
 			axis_names=axis_names,
+			dcn_mesh_dims=dcn_axis_dims,
+			process_is_granule=process_is_granule,
+			should_sort_granules_by_key=should_sort_granules_by_key,
+			allow_split_physical_axes=allow_split_physical_axes,
 			backend=backend,
 		)
 
@@ -333,6 +341,29 @@ class EasyDeLBaseConfig(PretrainedConfig):
 				[v for k, v in self.axis_names.items()]
 				if isinstance(self.axis_names, dict)
 				else self.axis_names
+			),
+			dcn_axis_dims=(
+				[v for k, v in self.dcn_axis_dims.items()]
+				if isinstance(self.dcn_axis_dims, dict)
+				else self.dcn_axis_dims
+			),
+			should_sort_granules_by_key=(
+				(
+					self.should_sort_granules_by_key
+					if self.should_sort_granules_by_key is not None
+					else True
+				)
+				if hasattr(self, "should_sort_granules_by_key")
+				else True
+			),
+			allow_split_physical_axes=(
+				(
+					self.allow_split_physical_axes
+					if self.allow_split_physical_axes is not None
+					else True
+				)
+				if hasattr(self, "allow_split_physical_axes")
+				else True
 			),
 			backend=(
 				(self.backend if self.backend is not None else "")
@@ -394,6 +425,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 	def add_basic_configurations(
 		self,
 		axis_dims: tp.Sequence[int] = ...,
+		dcn_axis_dims: tp.Optional[tp.Sequence[int]] = ...,
 		axis_names: tp.Sequence[str] = ...,
 		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = ...,
 		blocksize_k: int = ...,
@@ -431,7 +463,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		It initializes all the attributes of an object, and it's called when you create a new instance of that class.
 
 		Args:
-				axis_dims (tp.Sequence[int], optional): Specify the number of dimensions for each axis. Defaults to (1, -1, 1, 1).
+		    axis_dims (tp.Sequence[int], optional): Specify the number of dimensions for each axis. Defaults to (1, -1, 1, 1).
 		    axis_names (tp.Sequence[str], optional): Set the names of the axes. Defaults to ("dp", "fsdp", "tp", "sp").
 		    attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS, optional): attention mechanism to use. Defaults to DEFAULT_ATTENTION_MECHANISM.
 		    blocksize_k (int, optional): block size of key_states. Defaults to 128.
@@ -450,16 +482,16 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		    use_scan_mlp (bool, optional): Determine whether to use scan_mlp or not. Defaults to False.
 		    scan_mlp_chunk_size (int, optional): Size of chunks in scan MLP. Defaults to 1024.
 		    attention_axis_name (str, optional): Name of the attention axis name. Defaults to "sp".
-				gradient_checkpointing (EasyDeLQuantizationMethods, optional): Gradient Checkpointing method for created or loaded module (applied on mlp and attn layers most of the times).
+		    gradient_checkpointing (EasyDeLQuantizationMethods, optional): Gradient Checkpointing method for created or loaded module (applied on mlp and attn layers most of the times).
 		    kv_cache_quantization_method (EasyDeLQuantizationMethods, optional): key and value quantization type. Defaults to EasyDeLQuantizationMethods.NONE.
 		    kv_cache_quantization_blocksize (int, optional): size of kv cache quantization. Defaults to 64.
 		    quantization_method (EasyDeLQuantizationMethods, optional): linear modules quantization type. Defaults to EasyDeLQuantizationMethods.NONE.
 		    quantization_blocksize (int, optional): size of linear quantization. Defaults to 64.
-				quantization_pattern (str): re pattern to be used for quantizing layers.
-				kv_cache_sharding_sequence_axis_name (tp.Union[str, tp.Tuple[str, ...]], optional): axis name to target for sharding sequences. Defaults to "sp".
+		    quantization_pattern (str): re pattern to be used for quantizing layers.
+		    kv_cache_sharding_sequence_axis_name (tp.Union[str, tp.Tuple[str, ...]], optional): axis name to target for sharding sequences. Defaults to "sp".
 		    flash_attention_backward_pass_impl (tp.Literal["triton", "xla"], optional): Specify the backward pass kernel for flash attention. Defaults to "triton".
 		    attn_dtype (jnp.dtype, optional): Data type for attention computations. Defaults to device half.
-				attn_softmax_dtype (jnp.dtype, optional): Data type for softmax in attention op computations. Defaults to jnp.float32.
+		    attn_softmax_dtype (jnp.dtype, optional): Data type for softmax in attention op computations. Defaults to jnp.float32.
 		    fcm_max_ratio (float, optional): Maximum ratio for flash cross attention. Defaults to 0.0.
 		    fcm_min_ratio (float, optional): Minimum ratio for flash cross attention. Defaults to 0.0.
 		    hardware_abstraction (bool, optional): whenever to switch to custom pallas kernels instead of JAX. Defaults to DEFAULT_HARDWARE_ABSTRACTION.
@@ -470,6 +502,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		"""
 		# fmt: off
 		set_attrs_smartly(self, "axis_dims", (1, -1, 1, 1), axis_dims)
+		set_attrs_smartly(self, "dcn_axis_dims", None, dcn_axis_dims)
 		set_attrs_smartly(self, "axis_names", ("dp", "fsdp", "tp", "sp"), axis_names)
 		set_attrs_smartly(self, "blocksize_q", 512, blocksize_q)
 		set_attrs_smartly(self, "blocksize_k", 512, blocksize_k)
@@ -575,56 +608,56 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		Instantiate a [`PretrainedConfig`] (or a derived class) from a pretrained model configuration.
 
 		Args:
-				pretrained_model_name_or_path (`str` or `os.PathLike`):
-						This can be either:
+		    pretrained_model_name_or_path (`str` or `os.PathLike`):
+		        This can be either:
 
-						- a string, the *model id* of a pretrained model configuration hosted inside a model repo on
-							huggingface.co.
-						- a path to a *directory* containing a configuration file saved using the
-							[`~PretrainedConfig.save_pretrained`] method, e.g., `./my_model_directory/`.
-						- a path or url to a saved configuration JSON *file*, e.g., `./my_model_directory/configuration.json`.
-				cache_dir (`str` or `os.PathLike`, *optional*):
-						Path to a directory in which a downloaded pretrained model configuration should be cached if the
-						standard cache should not be used.
-				force_download (`bool`, *optional*, defaults to `False`):
-						Whether or not to force to (re-)download the configuration files and override the cached versions if
-						they exist.
-				resume_download:
-						Deprecated and ignored. All downloads are now resumed by default when possible.
-						Will be removed in v5 of Transformers.
-				proxies (`Dict[str, str]`, *optional*):
-						A dictionary of proxy servers to use by protocol or endpoint, e.g., `{'http': 'foo.bar:3128',
-						'http://hostname': 'foo.bar:4012'}.` The proxies are used on each request.
-				token (`str` or `bool`, *optional*):
-						The token to use as HTTP bearer authorization for remote files. If `True`, or not specified, will use
-						the token generated when running `huggingface-cli login` (stored in `~/.huggingface`).
-				revision (`str`, *optional*, defaults to `"main"`):
-						The specific model version to use. It can be a branch name, a tag name, or a commit id, since we use a
-						git-based system for storing models and other artifacts on huggingface.co, so `revision` can be any
-						identifier allowed by git.
+		        - a string, the *model id* of a pretrained model configuration hosted inside a model repo on
+		          huggingface.co.
+		        - a path to a *directory* containing a configuration file saved using the
+		          [`~PretrainedConfig.save_pretrained`] method, e.g., `./my_model_directory/`.
+		        - a path or url to a saved configuration JSON *file*, e.g., `./my_model_directory/configuration.json`.
+		    cache_dir (`str` or `os.PathLike`, *optional*):
+		        Path to a directory in which a downloaded pretrained model configuration should be cached if the
+		        standard cache should not be used.
+		    force_download (`bool`, *optional*, defaults to `False`):
+		        Whether or not to force to (re-)download the configuration files and override the cached versions if
+		        they exist.
+		    resume_download:
+		        Deprecated and ignored. All downloads are now resumed by default when possible.
+		        Will be removed in v5 of Transformers.
+		    proxies (`Dict[str, str]`, *optional*):
+		        A dictionary of proxy servers to use by protocol or endpoint, e.g., `{'http': 'foo.bar:3128',
+		        'http://hostname': 'foo.bar:4012'}.` The proxies are used on each request.
+		    token (`str` or `bool`, *optional*):
+		        The token to use as HTTP bearer authorization for remote files. If `True`, or not specified, will use
+		        the token generated when running `huggingface-cli login` (stored in `~/.huggingface`).
+		    revision (`str`, *optional*, defaults to `"main"`):
+		        The specific model version to use. It can be a branch name, a tag name, or a commit id, since we use a
+		        git-based system for storing models and other artifacts on huggingface.co, so `revision` can be any
+		        identifier allowed by git.
 
-						<Tip>
+		        <Tip>
 
-						To test a pull request you made on the Hub, you can pass `revision="refs/pr/<pr_number>".
+		        To test a pull request you made on the Hub, you can pass `revision="refs/pr/<pr_number>".
 
-						</Tip>
+		        </Tip>
 
-				return_unused_kwargs (`bool`, *optional*, defaults to `False`):
-						If `False`, then this function returns just the final configuration object.
+		    return_unused_kwargs (`bool`, *optional*, defaults to `False`):
+		        If `False`, then this function returns just the final configuration object.
 
-						If `True`, then this functions returns a `tp.Tuple(config, unused_kwargs)` where *unused_kwargs* is a
-						dictionary consisting of the key/value pairs whose keys are not configuration attributes: i.e., the
-						part of `kwargs` which has not been used to update `config` and is otherwise ignored.
-				subfolder (`str`, *optional*, defaults to `""`):
-						In case the relevant files are located inside a subfolder of the model repo on huggingface.co, you can
-						specify the folder name here.
-				kwargs (`Dict[str, tp.Any]`, *optional*):
-						The values in kwargs of any keys which are configuration attributes will be used to override the loaded
-						values. Behavior concerning key/value pairs whose keys are *not* configuration attributes is controlled
-						by the `return_unused_kwargs` keyword parameter.
+		        If `True`, then this functions returns a `tp.Tuple(config, unused_kwargs)` where *unused_kwargs* is a
+		        dictionary consisting of the key/value pairs whose keys are not configuration attributes: i.e., the
+		        part of `kwargs` which has not been used to update `config` and is otherwise ignored.
+		    subfolder (`str`, *optional*, defaults to `""`):
+		        In case the relevant files are located inside a subfolder of the model repo on huggingface.co, you can
+		        specify the folder name here.
+		    kwargs (`Dict[str, tp.Any]`, *optional*):
+		        The values in kwargs of any keys which are configuration attributes will be used to override the loaded
+		        values. Behavior concerning key/value pairs whose keys are *not* configuration attributes is controlled
+		        by the `return_unused_kwargs` keyword parameter.
 
 		Returns:
-				[`PretrainedConfig`]: The configuration object instantiated from this pretrained model.
+		    [`PretrainedConfig`]: The configuration object instantiated from this pretrained model.
 
 		Examples:
 

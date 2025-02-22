@@ -18,6 +18,7 @@ from logging import getLogger as _getLogger
 
 if _os.environ.get("EASYDEL_AUTO", "true") in ["true", "1", "on", "yes"]:
 	import sys as _sys
+
 	_sys.setrecursionlimit(10000)
 	# Tell jax xla bridge to stay quiet and only yied warnings or errors.
 	_getLogger("jax._src.xla_bridge").setLevel(30)
@@ -378,7 +379,7 @@ from .utils.parameters_transformation import (
 	torch_dict_to_easydel_params,
 )
 
-_targeted_versions = ["0.0.11"]
+_targeted_versions = ["0.0.12"]
 
 from eformer import __version__ as _eform_version
 from eformer import escale
@@ -390,22 +391,17 @@ assert _Version(_eform_version) in [
 	f"this version of EasyDeL is only compatible with eformer {', '.join(_targeted_versions)},"
 	f" but found eformer {_eform_version}"
 )
-import jax as _jax
 
 try:
-	if _jax.default_backend() == "gpu":
-		try:
-			import torch  # noqa #type:ignore
+	import torch  # noqa # type: ignore
 
-			del torch
-		except ModuleNotFoundError:
-			print(
-				"UserWarning: please install `torch` (cpu or gpu) since `easydel` "
-				"uses `triton` and `triton` uses `torch` for autotuning, "
-				"and you can not use AutoEasyModel from torch.",
-			)
-except RuntimeError:
-	...
-del _jax
+	del torch
+except ModuleNotFoundError:
+	print(
+		"UserWarning: please install `torch` (cpu or gpu) since `easydel` "
+		"uses `triton` and `triton` uses `torch` for autotuning, "
+		"and you can not use AutoEasyModel from torch.",
+	)
+
 del _Version
 del _eform_version
