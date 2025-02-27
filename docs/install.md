@@ -1,57 +1,114 @@
-# Installing EasyDeL
+# EasyDeL Installation and Usage Guide
 
-EasyDeL uses EFormer and JAX as main dependencies in order to run the scripts but there are some packages that needs to
-be installed such as GO-lang to JAX specific platform installations, but you can simply install EasyDeL via pip:
+## Installation
 
-```shell
-pip install easydel
-```
+### Kaggle or Colab Installation
 
-or install from head
+To install EasyDeL in a Kaggle or Colab environment, follow these steps:
 
 ```shell
-pip install git+https://github.com/erfanzar/EasyDeL.git -U -q
+pip uninstall torch-xla -y -q  # Remove pre-installed torch-xla (for TPUs)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu -qU  # Install PyTorch for model conversion
+pip install git+https://github.com/erfanzar/easydel -qU  # Install EasyDeL from the latest source
+pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -qU  # Install JAX for TPUs
+pip install tensorflow tensorflow-datasets -qU  # Install TensorFlow and datasets for training
 ```
 
-## Installing Jax
+### Configuring TPU Hosts for Multi-Host or Multi-Slice Usage
 
-JAX uses XLA to compile and run your NumPy programs on GPUs and TPUs. Compilation happens under the hood by default,
-with library calls getting just-in-time compiled and executed. But JAX also lets you just-in-time compile your own
-Python functions into XLA-optimized kernels using a one-function API, jit.
-you can install other version too but easydel required at least version of 0.4.29
-
-### TPU
-
-inorder to install jax on TPU Devices use following command
+To set up TPU hosts for multi-host or multi-slice environments, install `eopod`:
 
 ```shell
-!pip install jax[tpu]==0.4.35 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -q
+pip install eopod
 ```
 
-### GPU
-
-inorder to install jax on cuda 12 use following command
+If you encounter an error where `eopod` is not found, add the local bin path to your shell profile:
 
 ```shell
-pip install --upgrade pip
-# CUDA 12 installation
-# Note: wheels only available on linux.
-pip install --upgrade "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc  # Apply changes immediately
 ```
 
-#### Installing GO
+#### Configuring TPU with EOpod
 
-Note this Library needs golang to run (for some tracking stuff on TPU/GPU/CPU)
-
-#### Ubuntu GO installation
+Next, configure `eopod` with your Google Cloud project details:
 
 ```shell
-sudo apt-get update && apt-get upgrade -y
-sudo apt-get install golang -y 
+eopod configure --project-id YOUR_PROJECT_ID --zone YOUR_ZONE --tpu-name YOUR_TPU_NAME
 ```
 
-#### Manjaro/Arch GO installation
+#### Installing Required Packages on TPU Hosts
+
+Use `eopod` to install the necessary packages on all TPU slices:
 
 ```shell
-sudo pacman -Syyuu go
+eopod run pip install torch --index-url https://download.pytorch.org/whl/cpu -qU  # Required for model conversion
+eopod run pip install git+https://github.com/erfanzar/easydel -qU  # Install EasyDeL from the latest source
+eopod run pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html -qU  # Install JAX for TPUs
+eopod run pip install tensorflow tensorflow-datasets -qU  # Required for training and data loaders
 ```
+
+## Using EasyDeL with Ray
+
+EasyDeL supports distributed execution with Ray, particularly for multi-host and multi-slice TPU environments. For GPUs, manual configuration is required, but TPUs can leverage `eformer`, an EasyDeL utility for cluster management.
+
+### Setting Up Ray with TPU Clusters
+
+For a 2x v4-64 TPU setup, run:
+
+```shell
+eopod run "python -m eformer.escale.tpexec.tpu_patcher --tpu-version TPU-VERSION --tpu-slice TPU-SLICES --num-slices NUM_SLICES --internal-ips INTERNAL_IP1-SLICE1,INTERNAL_IP2-SLICE1,INTERNAL_IP3-SLICE1,INTERNAL_IP4-SLICE1,INTERNAL_IP1-SLICE2,INTERNAL_IP2-SLICE2,INTERNAL_IP3-SLICE2,INTERNAL_IP4-SLICE2 --self-job"
+```
+
+For a v4-256 TPU:
+
+```shell
+eopod run "python -m eformer.escale.tpexec.tpu_patcher --tpu-version v4 --tpu-slice 256 --num-slices 1 --internal-ips <comma-separated-TPU-IPs> --self-job"
+```
+
+## Usage Example
+
+Once Ray is configured, you can use `eformer.escale.tpexec` instead of `eopod` for executing distributed code and benefiting from Ray's capabilities.
+
+### Authenticating with Hugging Face and Weights & Biases
+
+Before training, log in to Hugging Face and Weights & Biases:
+
+```shell
+eopod run "python -c 'from huggingface_hub import login; login(token=\"<API-TOKEN-HERE>\")'"
+eopod run python -m wandb login <API-TOKEN-HERE>
+```
+
+### Training a Model with EasyDeL-DPO
+
+Run the following command to fine-tune a model using EasyDeL's DPO framework:
+
+```shell
+eopod run python -m easydel.scripts.finetune.dpo \
+  --repo_id meta-llama/Llama-3.1-8B-Instruct \
+  --dataset_name trl-lib/ultrafeedback_binarized \
+  --dataset_split "train[:90%]" \
+  --refrence_model_repo_id meta-llama/Llama-3.3-70B-Instruct \
+  --attn_mechanism vanilla \
+  --beta 0.08 \
+  --loss_type sigmoid \
+  --max_length 2048 \
+  --max_prompt_length 1024 \
+  --ref_model_sync_steps 128 \
+  --total_batch_size 16 \
+  --learning_rate 1e-6 \
+  --learning_rate_end 6e-7 \
+  --log_steps 50 \
+  --shuffle_train_dataset \
+  --report_steps 1 \
+  --progress_bar_type tqdm \
+  --num_train_epochs 3 \
+  --auto_shard_states \
+  --optimizer adamw \
+  --scheduler linear \
+  --do_last_save \
+  --save_steps 1000 \
+  --use_wandb
+```
+
+This setup ensures proper installation and configuration for training large models using EasyDeL with TPUs and distributed environments.

@@ -82,27 +82,21 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
 
     install.md
     contributing
-    easydelstate.md
 
 .. toctree::
     :hidden:
     :maxdepth: 1
     :caption: APIs
 
-    api_docs/APIs
+    api_docs/apis
 
 
 .. toctree::
     :hidden:
     :maxdepth: 1
-    :caption: Examples
+    :caption: TRC
 
-    attention-module-example.md
-    causal-language-model-trainer-example.md
-    direct-preference-optimization-trainer-example.md
-    supervised-fine-tuning-trainer-example.md
-    vinference-serve-example.md
-
+    trc-welcome.md
 
  
 
