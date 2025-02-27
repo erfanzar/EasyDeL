@@ -1,5 +1,5 @@
 <div align="center">
-    <div style="margin-bottom: 20px;">
+    <div style="margin-bottom: 40px;">
         <a href="">
     <img src="https://raw.githubusercontent.com/erfanzar/easydel/main/images/easydel-logo-with-text.png" height="80">
     </a>
