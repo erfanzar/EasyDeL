@@ -230,7 +230,8 @@ def main():
 	for k, _ in uf_f.items():
 		parts = k.split("-")
 		if len(parts) > 1:
-			st.add(parts[1])
+			if parts[1] != "Init":
+				st.add(parts[1])
 	apis_index = """EasyDeL APIs 🔮
 ====
     
@@ -238,7 +239,7 @@ def main():
    :maxdepth: 2
    
    {form}
-   """.format(form="\n   ".join(sorted(st)))
+   """.format(form="\n   ".join([s.lower() for s in sorted(st)]))
 	with open(os.path.join(base_api_docs, "apis.rst"), "w", encoding="utf-8") as f:
 		f.write(apis_index)
 

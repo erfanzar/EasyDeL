@@ -1,9 +1,15 @@
-# EasyDeL 🔮
+<div align="center">
+    <div style="margin-bottom: 20px;">
+        <a href=""><img src="https://raw.githubusercontent.com/erfanzar/easydel/main/images/easydel-logo.png" height="80"></a>
+    </div>
+    <div>
+        <a href="https://discord.gg/FCAMNqnGtt"><img src="https://raw.githubusercontent.com/erfanzar/easydel/main/images/discord-button.png" height="48"></a>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+        <a href="https://easydel.readthedocs.io/en/latest/"><img src="https://raw.githubusercontent.com/erfanzar/easydel/main/images/documentation-button.png" height="48"></a>
+    </div>
+</div>
 
-[**Key Features**](#key-features)
-| [**Quick Start**](#quick-start)
-| [**Reference docs**](https://easydel.readthedocs.io/en/latest/)
-| [**License**](#license-)
+-----
 
 EasyDeL is an open-source framework designed to enhance and streamline the training process of machine learning models, with a primary focus on Jax/Flax. Built on modern Flax NNX, it provides convenient and effective solutions for training and serving Flax/Jax models on TPU/GPU at scale.
 
