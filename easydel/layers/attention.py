@@ -598,6 +598,7 @@ class FlexibleAttentionModule(nn.Module):
 		query_sequence_length: tp.Optional[int] = None,
 		key_value_sequence_length: tp.Optional[int] = None,
 		bias: tp.Optional[Array] = None,
+		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
 		attention_mask: tp.Optional[Array] = None,
 		segment_ids: tp.Optional[Array] = None,
 		causal: bool = True,
@@ -612,14 +613,6 @@ class FlexibleAttentionModule(nn.Module):
 		if key_value_sequence_length is None:
 			key_value_sequence_length = key_states.shape[1]
 		with self.mesh:
-			# if self._do_check:
-			# 	self._check_states(
-			# 		query_states=query_states,
-			# 		key_states=key_states,
-			# 		value_states=value_states,
-			# 		query_sequence_length=query_sequence_length,
-			# 		key_value_sequence_length=key_value_sequence_length,
-			# 	)
 			match self.attn_mechanism:
 				case AttentionMechanisms.FLASH_ATTN2:
 					return self.flash_attn2(
@@ -627,6 +620,7 @@ class FlexibleAttentionModule(nn.Module):
 						key_states=key_states,
 						value_states=value_states,
 						bias=bias,
+						init_bias=bias,
 					)
 				case AttentionMechanisms.SDPA:
 					return self.sdpa(
@@ -634,6 +628,7 @@ class FlexibleAttentionModule(nn.Module):
 						key_states=key_states,
 						value_states=value_states,
 						bias=bias,
+						init_bias=bias,
 						causal=causal,
 					)
 				case AttentionMechanisms.VANILLA:
@@ -642,6 +637,7 @@ class FlexibleAttentionModule(nn.Module):
 						key_states=key_states,
 						value_states=value_states,
 						bias=bias,
+						init_bias=bias,
 						dropout_rng=dropout_rng,
 						deterministic=deterministic,
 						query_sequence_length=query_sequence_length,
@@ -653,6 +649,7 @@ class FlexibleAttentionModule(nn.Module):
 						key_states=key_states,
 						value_states=value_states,
 						bias=bias,
+						init_bias=bias,
 						dropout_rng=dropout_rng,
 						deterministic=deterministic,
 						segment_ids=segment_ids,
@@ -702,6 +699,7 @@ class FlexibleAttentionModule(nn.Module):
 						key_states=key_states,
 						value_states=value_states,
 						bias=bias,
+						init_bias=bias,
 						deterministic=deterministic,
 						dropout_rng=dropout_rng,
 						query_sequence_length=query_sequence_length,
@@ -713,6 +711,7 @@ class FlexibleAttentionModule(nn.Module):
 						key_states=key_states,
 						value_states=value_states,
 						bias=bias,
+						init_bias=bias,
 						causal=causal,
 						deterministic=deterministic,
 						query_sequence_length=query_sequence_length,
@@ -743,6 +742,7 @@ class FlexibleAttentionModule(nn.Module):
 		key_states: Array,
 		value_states: Array,
 		bias: tp.Optional[Array] = None,
+		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
 		causal: bool = False,
 	):
 		(
@@ -816,6 +816,7 @@ class FlexibleAttentionModule(nn.Module):
 		key_states: Array,
 		value_states: Array,
 		bias: tp.Optional[Array] = None,
+		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
 	):
 		(
 			query_partitionspec,
@@ -948,6 +949,7 @@ class FlexibleAttentionModule(nn.Module):
 		query_sequence_length: int,
 		key_value_sequence_length: int,
 		bias: tp.Optional[Array] = None,
+		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
 		attention_mask: tp.Optional[Array] = None,
 		deterministic: bool = False,
 		dropout_rng: tp.Optional[random.PRNGKey] = None,
@@ -1009,6 +1011,7 @@ class FlexibleAttentionModule(nn.Module):
 		key_states: Array,
 		value_states: Array,
 		bias: tp.Optional[Array] = None,
+		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
 		deterministic: bool = False,
 		dropout_rng: tp.Optional[random.PRNGKey] = None,
 		query_sequence_length: int,
@@ -1101,6 +1104,7 @@ class FlexibleAttentionModule(nn.Module):
 		key_states: Array,
 		value_states: Array,
 		bias: tp.Optional[Array] = None,
+		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
 		deterministic: bool = False,
 		dropout_rng: tp.Optional[random.PRNGKey] = None,
 		query_sequence_length: int,
@@ -1237,6 +1241,7 @@ class FlexibleAttentionModule(nn.Module):
 		key_states: Array,
 		value_states: Array,
 		bias: tp.Optional[Array] = None,
+		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
 		causal: bool = False,
 		deterministic: bool = True,
 		query_sequence_length: int,
