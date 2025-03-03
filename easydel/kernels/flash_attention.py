@@ -240,8 +240,6 @@ class FlashAttention:
 			if query.shape[1] == 1:
 				causal = False
 			attention_mask = None
-		else:
-			bias = None
 
 		attn = triton_flash_attention(
 			q=query,
