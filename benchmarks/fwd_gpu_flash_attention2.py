@@ -13,9 +13,7 @@ from jax import numpy as jnp
 from jax import random as jrnd
 from jax.sharding import NamedSharding, PartitionSpec
 
-from easydel.kernels.gpu_ops._deprecated.triton_gqa_flash_attention_2 import (
-	triton_gqa_flash_attention2_gpu,
-)
+from easydel.kernels.gpu_ops import triton_flash_attention
 
 mesh = create_mesh(
 	(1, 1, 1, -1),
@@ -96,7 +94,7 @@ def mha_attention_benchmark(
 	query, key, value, bias = _get_inputs(B, H, H, S, S, D, provider, BIAS)
 	if mode == "fwd":
 		if provider == "triton":
-			fn = lambda: triton_gqa_flash_attention2_gpu(query, key, value, bias)
+			fn = lambda: triton_flash_attention(query, key, value, None, bias)
 		elif provider == "cudnn_sdpa":
 			_fn = jax.jit(
 				functools.partial(
@@ -107,8 +105,12 @@ def mha_attention_benchmark(
 			fn = lambda: _fn(query, key, value, bias).block_until_ready()
 	elif mode == "bwd":
 		if provider == "triton":
-			fn = lambda: jax.grad(lambda *x: triton_gqa_flash_attention2_gpu(*x).sum())(
-				query, key, value, bias
+			fn = lambda: jax.grad(lambda *x: triton_flash_attention(*x).sum())(
+				query,
+				key,
+				value,
+				None,
+				bias,
 			)
 		elif provider == "cudnn_sdpa":
 			_fn = jax.jit(
@@ -125,8 +127,6 @@ def mha_attention_benchmark(
 	except jaxlib.xla_extension.XlaRuntimeError:
 		ms = 1000.0000
 	return ms
-	# except:  # noqa
-	# 	return 500.0000
 
 
 if __name__ == "__main__":
