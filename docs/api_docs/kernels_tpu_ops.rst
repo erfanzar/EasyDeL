@@ -5,5 +5,5 @@ Tpu Ops
    :maxdepth: 2
 
    kernels_tpu_ops___init__
-   kernels_tpu_ops_pallas_gemm
-   kernels_tpu_ops_pallas_ring_attention
+   kernels_tpu_ops_matmul_pallas
+   kernels_tpu_ops_ring_attention_pallas
