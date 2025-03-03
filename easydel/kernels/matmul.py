@@ -16,13 +16,6 @@
 # Implementation by @erfanzar,
 # with a few bug fixes and adjustments.
 
-# import os
-# import sys
-
-# sys.path.append(
-# 	os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../..")
-# )
-
 import logging
 import typing as tp
 from dataclasses import dataclass
@@ -37,17 +30,15 @@ from jax import lax
 from jax import numpy as jnp
 from jax.lax import PrecisionLike
 
-from easydel.utils import GenerateRNG
 
-from .gpu_ops.triton_gemm import gemm as triton_gemm
-from .tpu_ops.pallas_gemm import pallas_gemm
+from .gpu_ops import triton_matmul
+from .tpu_ops import pallas_matmul
 
 PLATFORM = jax.extend.backend.get_backend().platform
 INTERPRET = PLATFORM == "cpu"
-rng = GenerateRNG()
 
 
-def gemm(
+def matmul(
 	A: jax.Array,
 	B: jax.Array,
 	*,
@@ -58,12 +49,12 @@ def gemm(
 	**_,
 ):
 	if PLATFORM == "gpu":
-		return triton_gemm(A, B)
+		return triton_matmul(A, B)
 	elif PLATFORM == "tpu":
 		org_dtype = A.dtype
 		A = A.astype(jnp.promote_types(jnp.bfloat16, A.dtype))
 		B = B.astype(jnp.promote_types(jnp.bfloat16, B.dtype))
-		return pallas_gemm(
+		return pallas_matmul(
 			A,
 			B,
 			blocksize_m,
@@ -75,7 +66,7 @@ def gemm(
 		return jax.lax.batch_matmul(A, B, precision=precision)
 	else:
 		raise NotImplementedError(
-			f"`gemm` is not implemented for request platform {PLATFORM}"
+			f"`matmul` is not implemented for request platform {PLATFORM}"
 		)
 
 
@@ -140,18 +131,21 @@ def custom_dot_general_kernel(
 		raise ValueError("Batch dimensions must match for batched matrix multiplication")
 
 	# Perform batched matrix multiplication using vmap
-	result_3d = jax.vmap(gemm)(lhs_reshaped, jnp.transpose(rhs_reshaped, (0, 2, 1)))
+	result_3d = jax.vmap(matmul)(lhs_reshaped, jnp.transpose(rhs_reshaped, (0, 2, 1)))
 
 	# Reshape result back to the original batch and output dimensions
 	final_shape = lhs_batch_shape + lhs_other_shape + rhs_other_shape
 	return result_3d.reshape(final_shape).astype(preferred_element_type)
 
 
-def replace_dot_general_with_gemm():
+def replace_dot_general_with_matmul():
 	jax.lax.dot_general = custom_dot_general_kernel
 
 
 def matmul_test():
+	from easydel.utils import GenerateRNG
+
+	rng = GenerateRNG()
 	print("RES TEST")
 	intermediate_size = 2048
 	hidden_size = 512
@@ -164,7 +158,7 @@ def matmul_test():
 		rng.rng,
 		(intermediate_size, hidden_size),
 	)
-	y_ = triton_gemm(A, B)
+	y_ = triton_matmul(A, B)
 	y = A @ B
 	print(jnp.allclose(y_, y, atol=0.125, rtol=0))
 	print(y[0, :5])
@@ -174,6 +168,9 @@ def matmul_test():
 
 
 def matmul_grad_test():
+	from easydel.utils import GenerateRNG
+
+	rng = GenerateRNG()
 	print("GRAD TEST")
 	intermediate_size = 2048
 	hidden_size = 512
@@ -187,7 +184,7 @@ def matmul_grad_test():
 		(intermediate_size, hidden_size),
 	)
 	g = jax.grad(lambda x, e: jnp.sum(x @ e))(A, B)
-	g_ = jax.grad(lambda x, e: jnp.sum(triton_gemm(x, e)))(A, B)
+	g_ = jax.grad(lambda x, e: jnp.sum(triton_matmul(x, e)))(A, B)
 	print(jnp.allclose(g, g_, atol=0.125, rtol=0))
 	print(g_[0])
 	print(g[0])
@@ -314,7 +311,7 @@ def matmul_benchmark(unused_args=None):
 						n=n,
 						dtype=dtype,
 						mm_func=partial(
-							gemm,
+							matmul,
 							blocksize_m=block_m,
 							blocksize_n=block_n,
 							blocksize_k=block_k,

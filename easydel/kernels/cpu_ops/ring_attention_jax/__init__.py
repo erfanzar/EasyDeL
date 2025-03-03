@@ -12,10 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Implementation by @erfanzar,
-# with a few bug fixes and adjustments.
+from ._ring_attention import ring_attention as jax_ring_attention
 
-from .matmul_pallas import pallas_matmul
-from .ring_attention_pallas import pallas_ring_attention
-
-__all__ = ("pallas_matmul", "pallas_ring_attention")
+__all__ = ("jax_ring_attention",)

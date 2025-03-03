@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .jax_mha_flash_attention_2 import jax_flash_attn_2_mu
-from .jax_ring_attention import jax_ring_attention_mu
+from .flash_attention_jax import jax_flash_attention
+from .ring_attention_jax import jax_ring_attention
 
-__all__ = "jax_ring_attention_mu", "jax_flash_attn_2_mu"
+__all__ = "jax_flash_attention", "jax_ring_attention"

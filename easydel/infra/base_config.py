@@ -72,9 +72,9 @@ if EKERNEL_OPS:
 	logger.info(
 		"`EKERNEL_OPS` is ON and some operations will automatically be replaced by EasyDeL."
 	)
-	from easydel.kernels.gemm import replace_dot_general_with_gemm
+	from easydel.kernels.matmul import replace_dot_general_with_matmul
 
-	replace_dot_general_with_gemm()
+	replace_dot_general_with_matmul()
 
 
 def set_attrs_smartly(self, attr_name: str, default: tp.Any, new_attr: tp.Any):

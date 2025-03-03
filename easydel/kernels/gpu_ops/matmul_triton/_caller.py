@@ -15,13 +15,15 @@
 
 from functools import partial
 
-from eformer.callib import triton_call
 import jax
 import triton
+from eformer.callib import triton_call
 from jax import core as jcore
 from jax import numpy as jnp
 from jax.interpreters import batching, mlir, xla
 from triton import language as tl
+
+from .._utils import safe_autotune
 
 
 def _is_cuda():
@@ -183,8 +185,12 @@ def _get_autotune_config():
 		return _get_cuda_autotune_config()
 
 
+@safe_autotune(
+	configs=_get_autotune_config(),
+	key=["M", "N", "K"],
+)
 @triton.jit
-def _triton_gemm(
+def _triton_matmul(
 	a_ptr,
 	b_ptr,
 	c_ptr,
@@ -231,17 +237,8 @@ def _triton_gemm(
 	tl.store(c_ptrs, acc, mask=c_mask)
 
 
-try:
-	_triton_gemm = triton.autotune(
-		configs=_get_autotune_config(),
-		key=["M", "N", "K"],
-	)(_triton_gemm)
-except Exception:
-	...
-
-
 @triton.jit
-def _gemm_activation_kernel(
+def _matmul_activation_kernel(
 	a_ptr,
 	b_ptr,
 	c_ptr,
@@ -289,26 +286,13 @@ def _gemm_activation_kernel(
 	tl.store(c_ptrs, acc, mask=c_mask)
 
 
-def _triton_call_gemm(A, B):
+def _triton_call_matmul(A, B):
 	M, K, N = A.shape[0], A.shape[1], B.shape[1]
 	out_shape = jax.ShapeDtypeStruct(
 		(A.shape[0], B.shape[1]),
 		dtype=A.dtype,
 	)
 
-	# stride_am: tl.constexpr,
-	# stride_ak: tl.constexpr,
-	# stride_bk: tl.constexpr,
-	# stride_bn: tl.constexpr,
-	# stride_cm: tl.constexpr,
-	# stride_cn: tl.constexpr,
-	# M: tl.constexpr,
-	# N: tl.constexpr,
-	# K: tl.constexpr,
-	# BLOCK_SIZE_M: tl.constexpr,
-	# BLOCK_SIZE_N: tl.constexpr,
-	# BLOCK_SIZE_K: tl.constexpr,
-	# GROUP_SIZE_M: tl.constexpr,
 	metaparams = dict(
 		stride_am=K,
 		stride_ak=1,
@@ -323,7 +307,7 @@ def _triton_call_gemm(A, B):
 	return triton_call(
 		A,
 		B,
-		kernel=_triton_gemm,
+		kernel=_triton_matmul,
 		grid=lambda META: (
 			triton.cdiv(META["M"], META["BLOCK_SIZE_M"])
 			* triton.cdiv(META["N"], META["BLOCK_SIZE_N"]),
@@ -333,7 +317,7 @@ def _triton_call_gemm(A, B):
 	)
 
 
-op_prim = jcore.Primitive("op_prim")
+triton_matmul_primitive = jcore.Primitive("triton_matmul_primitive")
 
 
 def impt_prim(A, B):
@@ -344,23 +328,23 @@ def impt_prim(A, B):
 		compute_dtype = jnp.float16
 	else:
 		compute_dtype = jnp.float32
-	return _triton_call_gemm(
+	return _triton_call_matmul(
 		A.astype(compute_dtype),
 		B.astype(compute_dtype),
 	).astype(A.dtype)
 
 
-op_prim.def_impl(partial(xla.apply_primitive, op_prim))
+triton_matmul_primitive.def_impl(partial(xla.apply_primitive, triton_matmul_primitive))
 
 mlir.register_lowering(
-	op_prim,
+	triton_matmul_primitive,
 	mlir.lower_fun(fun=impt_prim, multiple_results=False),
 	platform="gpu",
 )
 
 
-@op_prim.def_abstract_eval
-def triton_gemm_abstract_eval(A, B):
+@triton_matmul_primitive.def_abstract_eval
+def triton_matmul_abstract_eval(A, B):
 	if A.ndim != 2 or B.ndim != 2:
 		raise ValueError("Both inputs must be 2-dimensional")
 	if A.shape[1] != B.shape[0]:
@@ -370,19 +354,22 @@ def triton_gemm_abstract_eval(A, B):
 	return jax.core.ShapedArray((A.shape[0], B.shape[1]), A.dtype)
 
 
-def triton_gemm_vjp(A, B):
+def triton_matmul_vjp(A, B):
 	def vjp(y_bar):
-		return (op_prim.bind(y_bar, B.T), op_prim.bind(A.T, y_bar))
+		return (
+			triton_matmul_primitive.bind(y_bar, B.T),
+			triton_matmul_primitive.bind(A.T, y_bar),
+		)
 
-	return op_prim.bind(A, B), vjp
+	return triton_matmul_primitive.bind(A, B), vjp
 
 
-def triton_gemm_batch(args, batch_axes):
+def triton_matmul_batch(args, batch_axes):
 	A, B = args
 	A_axis, B_axis = batch_axes
 
 	if A_axis is None and B_axis is None:
-		return op_prim.bind(A, B), None
+		return triton_matmul_primitive.bind(A, B), None
 
 	# Helper function to prepare inputs
 	def prepare_input(X, axis):
@@ -399,35 +386,35 @@ def triton_gemm_batch(args, batch_axes):
 	B = jnp.broadcast_to(B, (batch_size,) + B.shape[1:])
 
 	# Perform batched matrix multiplication
-	def batched_gemm(A, B):
+	def batched_matmul(A, B):
 		assert A.ndim == 3 and B.ndim == 3, "Inputs must be 3D after batching"
-		return jax.lax.map(lambda x: op_prim.bind(x[0], x[1]), (A, B))
+		return jax.lax.map(lambda x: triton_matmul_primitive.bind(x[0], x[1]), (A, B))
 
-	result = batched_gemm(A, B)
+	result = batched_matmul(A, B)
 	return result, 0  # The result is always batched along the first dimension
 
 
-batching.primitive_batchers[op_prim] = triton_gemm_batch
+batching.primitive_batchers[triton_matmul_primitive] = triton_matmul_batch
 
 
 @jax.custom_vjp
-def gemm(A, B):
-	return op_prim.bind(A, B)
+def matmul(A, B):
+	return triton_matmul_primitive.bind(A, B)
 
 
-def _fwd_gemm(A, B):
-	return op_prim.bind(A, B), (A, B)
+def _fwd_matmul(A, B):
+	return triton_matmul_primitive.bind(A, B), (A, B)
 
 
-def _bwd_gemm(residual, gO):
+def _bwd_matmul(residual, gO):
 	return (
-		op_prim.bind(gO, residual[1].transpose(1, 0)),
-		op_prim.bind(residual[0].transpose(1, 0), gO),
+		triton_matmul_primitive.bind(gO, residual[1].transpose(1, 0)),
+		triton_matmul_primitive.bind(residual[0].transpose(1, 0), gO),
 	)
 
 
-gemm.defvjp(_fwd_gemm, _bwd_gemm)
-gemm = jax.jit(gemm)
+matmul.defvjp(_fwd_matmul, _bwd_matmul)
+matmul = jax.jit(matmul)
 
 
 def test_run(argv):
@@ -435,9 +422,9 @@ def test_run(argv):
 	dtype = jnp.float16
 	A = jax.nn.initializers.normal(0.02, dtype=dtype)(jax.random.key(0), (M, K))
 	B = jax.nn.initializers.normal(0.02, dtype=dtype)(jax.random.key(1), (K, N))
-	res = gemm(A, B)
+	res = matmul(A, B)
 	g = jax.grad(lambda x, e: jnp.sum(x @ e))(A, B)
-	g_ = jax.grad(lambda x, e: jnp.sum(gemm(x, e)))(A, B)
+	g_ = jax.grad(lambda x, e: jnp.sum(matmul(x, e)))(A, B)
 	print("Result Close : ", jnp.allclose(res, A @ B, atol=0.125, rtol=0))
 	print("Grad Close   : ", jnp.allclose(g, g_, atol=0.125, rtol=0))
 
@@ -448,11 +435,11 @@ def test_vmap(argv):
 	)  # Shape: (2, 2, 2)
 	B = jnp.array([[5.0, 6.0], [7.0, 8.0]])  # Shape: (2, 2)
 
-	result = jax.vmap(gemm, in_axes=(0, None))(A, B)
+	result = jax.vmap(matmul, in_axes=(0, None))(A, B)
 	print("Batched Result:", result)
 
 	# Test gradients with batching
-	grad_func = jax.grad(lambda A, B: jax.vmap(gemm, in_axes=(0, None))(A, B).sum())
+	grad_func = jax.grad(lambda A, B: jax.vmap(matmul, in_axes=(0, None))(A, B).sum())
 	grad_A, grad_B = grad_func(A, B)
 	print("Batched Gradient w.r.t. A:", grad_A)
 	print("Batched Gradient w.r.t. B:", grad_B)
@@ -466,7 +453,7 @@ def bench(argv):
 	dtype = jnp.float16
 	A = jax.nn.initializers.normal(0.02, dtype=dtype)(jax.random.key(0), (M, K))
 	B = jax.nn.initializers.normal(0.02, dtype=dtype)(jax.random.key(1), (K, N))
-	_ = gemm(A, B)  # skip autotuning process
+	_ = matmul(A, B)  # skip autotuning process
 
 	def _benchmark(f, ntrials: int = 100):
 		def run(*args, **kwargs):
@@ -479,14 +466,12 @@ def bench(argv):
 
 		return run
 
-	print("TRITON CALL : ", _benchmark(gemm, ntrials=ntrials)(A, B))
+	print("TRITON CALL : ", _benchmark(matmul, ntrials=ntrials)(A, B))
 	print("JAX.LAX CALL : ", _benchmark(jax.lax.batch_matmul, ntrials=ntrials)(A, B))
 
 
-__all__ = ["gemm"]
+__all__ = ["matmul"]
 if __name__ == "__main__":
 	from absl import app
 
-	# app.run(test_run)
-	# app.run(test_vmap)
 	app.run(bench)

@@ -28,13 +28,10 @@ def main():
 		extra = {"torch_dtype": torch.float16}
 
 		dtype = jnp.float16
-		param_dtype = jnp.float16
-		if os.environ.get("APPED_LORA_TEST", "false") in ["true", "yes"]:
-			param_dtype = jnp.float16
+		param_dtype = jnp.float8_e5m2
 		attn_kwargs = dict(
-			attn_dtype=jnp.float16,
-			attn_softmax_dtype=jnp.float16,
-			attn_mechanism=ed.AttentionMechanisms.VANILLA,
+			attn_dtype=jnp.bfloat16,
+			attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
 		)
 
 	else:
@@ -65,7 +62,7 @@ def main():
 			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 			**attn_kwargs,
 		),
-		quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
+		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 		param_dtype=param_dtype,
 		dtype=dtype,
 		partition_axis=partition_axis,
@@ -89,13 +86,13 @@ def main():
 			top_k=10,
 			eos_token_id=model.generation_config.eos_token_id,
 			streaming_chunks=32,
-			num_return_sequences=2,
+			num_return_sequences=1,
 		),
 	)
 
 	print(model.model_task)
 	print(model.model_type)
-	inference.precompile(1, [1024, 2048])
+	inference.precompile(1, [6144])
 
 	messages = [
 		{
@@ -125,11 +122,6 @@ def main():
 
 	print("Start Generation Process.")
 	for response in inference.generate(**ids):
-		# next_slice = slice(
-		# 	pad_seq,
-		# 	pad_seq + inference.generation_config.streaming_chunks,
-		# )
-		# pad_seq += inference.generation_config.streaming_chunks
 		...
 	print(
 		tokenizer.batch_decode(
@@ -137,6 +129,7 @@ def main():
 			skip_special_tokens=True,
 		)
 	)
+	print(response.tokens_pre_second)
 
 
 if __name__ == "__main__":

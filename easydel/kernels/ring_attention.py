@@ -21,8 +21,8 @@ from jax import numpy as jnp
 from jax import random as jrnd
 from jax.extend.backend import get_backend
 
-from .cpu_ops import jax_ring_attention_mu
-from .tpu_ops import pallas_ring_attention_tpu
+from .cpu_ops import jax_ring_attention
+from .tpu_ops import pallas_ring_attention
 
 AVAILABLE_RING_ATTENTION_PLATFORM = tp.Literal["pallas", "jax"]
 
@@ -105,7 +105,7 @@ def ring_attention(
 		case "gpu":
 			match platform:
 				case "jax":
-					return jax_ring_attention_mu(
+					return jax_ring_attention(
 						query=query,
 						key=key,
 						value=value,
@@ -128,7 +128,7 @@ def ring_attention(
 		case "cpu":
 			match platform:
 				case "jax":
-					return jax_ring_attention_mu(
+					return jax_ring_attention(
 						query=query,
 						key=key,
 						value=value,
@@ -151,7 +151,7 @@ def ring_attention(
 		case "tpu":
 			match platform:
 				case "jax":
-					return jax_ring_attention_mu(
+					return jax_ring_attention(
 						query=query,
 						key=key,
 						value=value,
@@ -172,7 +172,7 @@ def ring_attention(
 						prevent_cse=prevent_cse,
 					)
 				case "pallas":
-					return pallas_ring_attention_tpu(
+					return pallas_ring_attention(
 						query=query,
 						key=key,
 						value=value,

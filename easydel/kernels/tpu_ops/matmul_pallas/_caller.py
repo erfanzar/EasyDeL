@@ -210,7 +210,7 @@ def _call_tpu_matmul_kernel_bwd(
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(2, 3, 4, 5))
-def pallas_gemm(
+def matmul(
 	A: jax.Array,
 	B: jax.Array,
 	blocksize_m: tp.Optional[int],
@@ -228,6 +228,6 @@ def pallas_gemm(
 	)
 
 
-pallas_gemm.defvjp(_call_tpu_matmul_kernel_fwd_residual, _call_tpu_matmul_kernel_bwd)
+matmul.defvjp(_call_tpu_matmul_kernel_fwd_residual, _call_tpu_matmul_kernel_bwd)
 
-__all__ = ["pallas_gemm"]
+__all__ = ["matmul"]
