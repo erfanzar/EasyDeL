@@ -4,9 +4,8 @@ Gpu Ops
 .. toctree::
    :maxdepth: 2
 
+   deprecated
    kernels_gpu_ops___init__
-   kernels_gpu_ops_pallas_gemm
-   kernels_gpu_ops_pallas_gqa_flash_attention_2
-   kernels_gpu_ops_pallas_mha_flash_attention_2
-   kernels_gpu_ops_triton_matmul
-   kernels_gpu_ops_triton_gqa_flash_attention_2
+   kernels_gpu_ops__utils
+   kernels_gpu_ops_flash_attention_triton
+   kernels_gpu_ops_matmul_triton

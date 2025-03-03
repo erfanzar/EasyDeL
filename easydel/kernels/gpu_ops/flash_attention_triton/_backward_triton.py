@@ -1000,8 +1000,20 @@ def _bwd_attention_kernel_call(
 	if varlen_mode:
 		cum_seqlens_q = jnp.zeros(shape=(attention_mask.shape[0] + 1,), dtype="i4")
 		cum_seqlens_k = jnp.zeros(shape=(attention_mask.shape[0] + 1,), dtype="i4")
-		cum_seqlens_q[1:] = jnp.cumsum(jnp.sum(attention_mask, axis=1), axis=0)
-		cum_seqlens_k[1:] = jnp.cumsum(jnp.sum(attention_mask, axis=1), axis=0)
+		cum_seqlens_k = cum_seqlens_k.at[1:].set(
+			jnp.cumsum(
+				attention_mask.sum(axis=1, dtype="i4"),
+				axis=0,
+				dtype="i4",
+			)
+		)
+		cum_seqlens_q = cum_seqlens_q.at[1:].set(
+			jnp.cumsum(
+				attention_mask.sum(axis=1, dtype="i4"),
+				axis=0,
+				dtype="i4",
+			)
+		)
 		max_seqlen_q: int = attention_mask.shape[1]
 		max_seqlen_k: int = attention_mask.shape[1]
 
@@ -1019,7 +1031,6 @@ def _bwd_attention_kernel_call(
 		max_seqlen_q = QSeq
 		max_seqlen_k = KSeq
 
-	# Handle bias and dropout
 	bz, bh, bm = calc_bias_strides(
 		bias,
 		batch_size,
