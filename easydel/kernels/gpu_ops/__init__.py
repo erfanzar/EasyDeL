@@ -16,26 +16,7 @@
 # with a few bug fixes and adjustments.
 
 
-def _error_triton(*_, **__):
-	raise ModuleNotFoundError(
-		"You need to install triton first before using any of EasyDeL Triton specific kernels"
-	)
+from .flash_attention_triton import triton_flash_attention
+from .matmul_triton import triton_matmul
 
-
-from .pallas_gemm import gpu_matmul
-from .pallas_gqa_flash_attention_2 import pallas_gqa_flash_attention2_gpu
-from .pallas_mha_flash_attention_2 import pallas_mha_flash_attention2_gpu
-
-try:
-	from .triton_gemm import gemm
-	from .triton_gqa_flash_attention_2 import triton_gqa_flash_attention2_gpu
-except ModuleNotFoundError:
-	gemm = _error_triton
-	triton_gqa_flash_attention2_gpu = _error_triton
-__all__ = [
-	"triton_gqa_flash_attention2_gpu",
-	"pallas_gqa_flash_attention2_gpu",
-	"pallas_mha_flash_attention2_gpu",
-	"gemm",
-	"gpu_matmul",
-]
+__all__ = ("triton_matmul", "triton_flash_attention")

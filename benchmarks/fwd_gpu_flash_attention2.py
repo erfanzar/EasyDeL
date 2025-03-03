@@ -13,7 +13,7 @@ from jax import numpy as jnp
 from jax import random as jrnd
 from jax.sharding import NamedSharding, PartitionSpec
 
-from easydel.kernels.gpu_ops.triton_gqa_flash_attention_2 import (
+from easydel.kernels.gpu_ops._deprecated.triton_gqa_flash_attention_2 import (
 	triton_gqa_flash_attention2_gpu,
 )
 

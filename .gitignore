@@ -8,6 +8,7 @@ __pycache__/
 *.so
 *.slurm
 env.ipynb
+easydel/kernels/gpu_ops/paged_attention_triton/*
 env.py
 exp.py
 nohup.out

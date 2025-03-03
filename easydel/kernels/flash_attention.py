@@ -15,6 +15,7 @@
 
 import os
 import typing as tp
+import warnings
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
@@ -26,24 +27,17 @@ import flax.nnx
 import jax
 import jax.numpy as jnp
 from jax import random as jrnd
-from jax.experimental.pallas.ops.tpu.flash_attention import (
-	BlockSizes as TPUBlockSizes,
-)
+from jax.experimental.pallas.ops.tpu.flash_attention import BlockSizes as TPUBlockSizes
 from jax.experimental.pallas.ops.tpu.flash_attention import (
 	flash_attention as pallas_flash_attention_tpu,
 )
 from jax.extend.backend import get_backend
 
-from .cpu_ops import jax_flash_attn_2_mu
-from .gpu_ops import (
-	pallas_gqa_flash_attention2_gpu,
-	pallas_mha_flash_attention2_gpu,
-	triton_gqa_flash_attention2_gpu,
-)
+from .cpu_ops import jax_flash_attention
+from .gpu_ops import triton_flash_attention
 
 AVAILABLE_FLASH_ATTENTION2_PLATFORMS = tp.Literal["triton", "pallas", "jax"]
 AVAILABLE_BACKENDS = tp.Literal["gpu", "tpu", "cpu"]
-
 
 
 def get_device_memory_usage(device: jax.Device) -> float:
@@ -182,20 +176,14 @@ class FlashAttention:
 		key: chex.Array,
 		value: chex.Array,
 		bias: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		dropout_prob: float = 0.0,
+		causal: bool = False,
+		dropout_seed: tp.Optional[int] = None,
 		adjust_sharindgs: bool = False,
 	) -> chex.Array:
 		"""
-		        Computes flash attention using the configured backend and platform.
-
-		        Args:
-		            query: Query tensor of shape [batch, seq_len, num_heads, dim]
-		            key: Key tensor of shape [batch, seq_len, num_kv_heads, dim]
-		            value: Value tensor of shape [batch, seq_len, num_kv_heads, dim]
-		            bias: tp.Optional attention bias tensor
-		adjust_sharindgs: whenever to change shardings for best fit in triton kernel
-
-		        Returns:
-		            Output tensor of shape [batch, seq_len, num_heads, dim]
+		Computes flash attention using the configured backend and platform.
 		"""
 		num_q_heads = query.shape[2]
 		num_kv_heads = key.shape[2]
@@ -205,22 +193,36 @@ class FlashAttention:
 				f"Query heads ({num_q_heads}) must be divisible by "
 				f"key/value heads ({num_kv_heads})"
 			)
-
-		bias = self._handle_bias(bias, num_q_heads, num_kv_heads)
-
+		if bias is not None:
+			bias = self._handle_bias(bias, num_q_heads, num_kv_heads)
+		kw = dict(
+			query=query,
+			key=key,
+			value=value,
+			bias=bias,
+			adjust_sharindgs=adjust_sharindgs,
+			attention_mask=attention_mask,
+			causal=causal,
+			dropout_prob=dropout_prob,
+			dropout_seed=dropout_seed,
+		)
 		if self.config.platform == Platform.TRITON:
-			return self._compute_triton(query, key, value, bias, adjust_sharindgs)
+			return self._compute_triton(**kw)
 		elif self.config.platform == Platform.PALLAS:
-			return self._compute_pallas(query, key, value, bias)
+			return self._compute_pallas(**kw)
 		else:  # Platform.JAX
-			return self._compute_jax(query, key, value, bias)
+			return self._compute_jax(**kw)
 
 	def _compute_triton(
 		self,
 		query: chex.Array,
 		key: chex.Array,
 		value: chex.Array,
-		bias: tp.Optional[chex.Array],
+		bias: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		dropout_prob: float = 0.0,
+		causal: bool = False,
+		dropout_seed: tp.Optional[int] = None,
 		adjust_sharindgs: bool = False,
 	) -> chex.Array:
 		"""Computes attention using Triton backend."""
@@ -234,27 +236,25 @@ class FlashAttention:
 			value = jax.device_put(value, target_device)
 			if bias is not None:
 				bias = jax.device_put(bias, target_device)
-
-		if query.shape[2] == key.shape[2] or os.environ.get(
-			"FORCE_MHA",
-			"false",
-		) in ["true", "1", "on"]:
-			key, value = self.repeat_kv_heads(key, value, query.shape[2] // key.shape[2])
-			attn = triton_gqa_flash_attention2_gpu(
-				query=query,
-				key=key,
-				value=value,
-				bias=bias,
-				softmax_scale=self.config.softmax_scale,
-			)
+		if query.shape[1] != key.shape[1]:
+			if query.shape[1] == 1:
+				causal = False
+			attention_mask = None
 		else:
-			attn = triton_gqa_flash_attention2_gpu(
-				query=query,
-				key=key,
-				value=value,
-				bias=bias,
-				softmax_scale=self.config.softmax_scale,
-			)
+			bias = None
+
+		attn = triton_flash_attention(
+			q=query,
+			k=key,
+			v=value,
+			bias=bias,
+			attention_mask=attention_mask,
+			dropout_prob=dropout_prob,
+			causal=causal,
+			dropout_seed=dropout_seed,
+			softmax_scale=self.config.softmax_scale,
+		)
+
 		if adjust_sharindgs and query_sharding is not None:
 			attn = jax.device_put(attn, query_sharding)
 		return attn
@@ -264,35 +264,31 @@ class FlashAttention:
 		query: chex.Array,
 		key: chex.Array,
 		value: chex.Array,
-		bias: tp.Optional[chex.Array],
+		bias: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		dropout_prob: float = 0.0,
+		causal: bool = False,
+		dropout_seed: tp.Optional[int] = None,
+		adjust_sharindgs: bool = False,
 	) -> chex.Array:
 		"""Computes attention using Pallas backend."""
 
 		if self.config.backend == Backend.GPU:
-			if query.shape[2] == key.shape[2] or os.environ.get(
-				"FORCE_MHA",
-				"false",
-			) in ["true", "1", "on"]:
-				key, value = self.repeat_kv_heads(key, value, query.shape[2] // key.shape[2])
-				return pallas_mha_flash_attention2_gpu(
-					q=query,
-					k=key,
-					v=value,
-					b=bias,
-					qblock=self.config.blocksize_q,
-					kblock=self.config.blocksize_k,
-					softmax_scale=self.config.softmax_scale,
-				)
-			else:
-				return pallas_gqa_flash_attention2_gpu(
-					query=query,
-					key=key,
-					value=value,
-					bias=bias,
-					BLOCK_M=self.config.blocksize_q,
-					BLOCK_N=self.config.blocksize_k,
-					softmax_scale=self.config.softmax_scale,
-				)
+			warnings.warn(
+				"Pallas-FlashAttention has been deprecated on GPUs (triton backend will be used)",
+				stacklevel=1,
+			)
+			return self._compute_triton(
+				query=query,
+				key=key,
+				value=value,
+				bias=bias,
+				adjust_sharindgs=adjust_sharindgs,
+				attention_mask=attention_mask,
+				dropout_prob=dropout_prob,
+				causal=causal,
+				dropout_seed=dropout_seed,
+			)
 
 		key, value = self.repeat_kv_heads(key, value, query.shape[2] // key.shape[2])
 		query_lenght = query.shape[1]
@@ -319,6 +315,7 @@ class FlashAttention:
 			pallas_flash_attention_tpu,
 			sm_scale=self.config.softmax_scale,
 			block_sizes=block_sizes,
+			causal=causal,
 		)(
 			query.transpose(0, 2, 1, 3),
 			key.transpose(0, 2, 1, 3),
@@ -331,11 +328,16 @@ class FlashAttention:
 		query: chex.Array,
 		key: chex.Array,
 		value: chex.Array,
-		bias: tp.Optional[chex.Array],
+		bias: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		dropout_prob: float = 0.0,
+		causal: bool = False,
+		dropout_seed: tp.Optional[int] = None,
+		adjust_sharindgs: bool = False,
 	) -> chex.Array:
 		"""Computes attention using JAX backend."""
 		key, value = self.repeat_kv_heads(key, value, query.shape[2] // key.shape[2])
-		return jax_flash_attn_2_mu(
+		return jax_flash_attention(
 			query_state=query,
 			key_state=key,
 			value_state=value,
@@ -345,6 +347,7 @@ class FlashAttention:
 			blocksize_k=self.config.blocksize_k,
 			dtype=query.dtype,
 			softmax_scale=self.config.softmax_scale,
+			dropout=dropout_prob,
 		)
 
 

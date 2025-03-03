@@ -53,7 +53,7 @@ from easydel.infra.etils import (
 	EasyDeLBackends,
 	EasyDeLPlatforms,
 )
-from easydel.kernels.flash_attention_2 import create_flash_attention
+from easydel.kernels.flash_attention import create_flash_attention
 from easydel.kernels.ring_attention import ring_attention
 from easydel.layers._blockwise_attention import blockwise_attn
 from easydel.layers.caching import TransformerCacheView
@@ -407,6 +407,7 @@ class FlexibleAttentionModule(nn.Module):
 		PartitionSpec,
 		PartitionSpec,
 		PartitionSpec,
+		PartitionSpec,
 		bool,
 	]:
 		in_generating_processerating = query_sequence_length == 1
@@ -437,6 +438,12 @@ class FlexibleAttentionModule(nn.Module):
 				self.partition_axis.query_sequence_axis,
 				self.partition_axis.bias_key_sequence_axis,
 			)
+			mask_partition_spec = PartitionSpec(
+				self.partition_axis.batch_axis,
+				None,
+				self.partition_axis.query_sequence_axis,
+				self.partition_axis.key_sequence_axis,
+			)
 			attention_partition_spec = query_partition_spec
 		else:
 			query_partition_spec = PartitionSpec(
@@ -465,12 +472,19 @@ class FlexibleAttentionModule(nn.Module):
 				self.partition_axis.generation_query_sequence_axis,
 				self.partition_axis.bias_key_sequence_axis,
 			)
+			mask_partition_spec = PartitionSpec(
+				self.partition_axis.batch_axis,
+				None,
+				self.partition_axis.generation_query_sequence_axis,
+				self.partition_axis.generation_key_sequence_axis,
+			)
 			attention_partition_spec = query_partition_spec
 		return (
 			query_partition_spec,
 			key_partition_spec,
 			value_partition_spec,
 			bias_partition_spec,
+			mask_partition_spec,
 			attention_partition_spec,
 			in_generating_processerating,
 		)
@@ -508,6 +522,13 @@ class FlexibleAttentionModule(nn.Module):
 				self.partition_axis.query_sequence_axis,
 				self.partition_axis.bias_key_sequence_axis,
 			)
+
+			mask_partition_spec = PartitionSpec(
+				self.partition_axis.batch_axis,
+				None,
+				self.partition_axis.query_sequence_axis,
+				self.partition_axis.key_sequence_axis,
+			)
 			attention_partition_spec = query_partition_spec
 		else:
 			query_partition_spec = PartitionSpec(
@@ -536,12 +557,19 @@ class FlexibleAttentionModule(nn.Module):
 				self.partition_axis.generation_query_sequence_axis,
 				self.partition_axis.bias_key_sequence_axis,
 			)
+			mask_partition_spec = PartitionSpec(
+				self.partition_axis.batch_axis,
+				None,
+				self.partition_axis.generation_query_sequence_axis,
+				self.partition_axis.generation_key_sequence_axis,
+			)
 			attention_partition_spec = query_partition_spec
 		return (
 			query_partition_spec,
 			key_partition_spec,
 			value_partition_spec,
 			bias_partition_spec,
+			mask_partition_spec,
 			attention_partition_spec,
 			in_generating_processerating,
 		)
@@ -619,8 +647,10 @@ class FlexibleAttentionModule(nn.Module):
 						query_states=query_states,
 						key_states=key_states,
 						value_states=value_states,
+						attention_mask=attention_mask,
 						bias=bias,
 						init_bias=bias,
+						causal=causal,
 					)
 				case AttentionMechanisms.SDPA:
 					return self.sdpa(
@@ -750,6 +780,7 @@ class FlexibleAttentionModule(nn.Module):
 			key_partitionspec,
 			value_partitionspec,
 			bias_partitionspec,
+			mask_partitionspec,
 			attention_partitionspec,
 			in_generating_process,
 		) = self.get_bshd_partition_specs(query_states.shape[1])
@@ -817,12 +848,19 @@ class FlexibleAttentionModule(nn.Module):
 		value_states: Array,
 		bias: tp.Optional[Array] = None,
 		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
+		attention_mask: tp.Optional[Array] = None,
+		causal: bool = True,
+		deterministic: bool = True,
+		dropout_rng: tp.Optional[random.PRNGKey] = None,
+		uses_cache: bool = False,
+		causal_mask: tp.Optional[Array] = None,
 	):
 		(
 			query_partitionspec,
 			key_partitionspec,
 			value_partitionspec,
 			bias_partitionspec,
+			mask_partitionspec,
 			attention_partitionspec,
 			in_generating_process,
 		) = self.get_bshd_partition_specs(query_states.shape[1])
@@ -832,8 +870,11 @@ class FlexibleAttentionModule(nn.Module):
 			blocksize_q = int(os.environ.get("GENERATION_BLOCKSIZE_Q", self.blocksize_q))
 		if bias is not None:
 			assert bias.ndim == 4
+		attn_mask = None
+		if attention_mask is not None:
+			attn_mask = attention_mask[:, 0, -1, :]
 		with self.mesh:
-			# Helper function to get axis size
+
 			def get_axis_size(axis_name):
 				if isinstance(axis_name, tuple):
 					return numpy.prod([self.mesh.shape[name] for name in axis_name])
@@ -846,10 +887,16 @@ class FlexibleAttentionModule(nn.Module):
 				blocksize_k=self.blocksize_k,
 				softmax_scale=self.sm_scale,
 			)
-
+			attn_mask_partition_spec = PartitionSpec(
+				self.partition_axis.batch_axis,
+				self.partition_axis.generation_query_sequence_axis,
+			)
 			with self.mesh:
 				attention_outputs = shard_map(
-					attention,
+					partial(
+						attention,
+						causal=causal,
+					),
 					mesh=self.mesh,
 					in_specs=(
 						create_target_only_spec(
@@ -872,6 +919,7 @@ class FlexibleAttentionModule(nn.Module):
 							if bias_partitionspec is not None
 							else None
 						),
+						attn_mask_partition_spec if attn_mask is not None else None,
 					),
 					out_specs=create_target_only_spec(
 						attention_partitionspec,
@@ -883,6 +931,7 @@ class FlexibleAttentionModule(nn.Module):
 					key_states.astype(self.dtype),
 					value_states.astype(self.dtype),
 					bias.astype(self.dtype) if bias is not None else None,
+					attn_mask,
 				)
 			return AttentionOutput(
 				attention_weights=None,
@@ -908,6 +957,7 @@ class FlexibleAttentionModule(nn.Module):
 				query_partitionspec,
 				key_partitionspec,
 				value_partitionspec,
+				_,
 				_,
 				attention_partitionspec,
 				in_generating_process,
@@ -965,6 +1015,7 @@ class FlexibleAttentionModule(nn.Module):
 			key_partitionspec,
 			value_partitionspec,
 			bias_partitionspec,
+			mask_partitionspec,
 			attention_partitionspec,
 			gen,
 		) = self.get_bshd_partition_specs(query_states.shape[1], True)
@@ -1023,6 +1074,7 @@ class FlexibleAttentionModule(nn.Module):
 				key_partitionspec,
 				value_partitionspec,
 				bias_partitionspec,
+				mask_partitionspec,
 				attention_partitionspec,
 				_,
 			) = self.get_bshd_partition_specs(query_sequence_length)
@@ -1120,6 +1172,7 @@ class FlexibleAttentionModule(nn.Module):
 			key_partitionspec,
 			value_partitionspec,
 			bias_partitionspec,
+			mask_partitionspec,
 			attention_partitionspec,
 			_,
 		) = self.get_bshd_partition_specs(query_sequence_length)
@@ -1179,6 +1232,7 @@ class FlexibleAttentionModule(nn.Module):
 			query_partitionspec,
 			key_partitionspec,
 			value_partitionspec,
+			_,
 			_,
 			_,
 			_,
