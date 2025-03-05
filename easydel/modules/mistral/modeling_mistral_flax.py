@@ -218,7 +218,7 @@ class MistralAttention(FlaxAttentionModule):
 			key_states,
 			value_states,
 			attention_mask,
-			attention_bias,
+			init_attention_bias,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -233,7 +233,7 @@ class MistralAttention(FlaxAttentionModule):
 			query_states=query_states,
 			key_states=key_states,
 			value_states=value_states,
-			bias=attention_bias,
+			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
 			causal=True,
 			dropout_rng=self.rngs.params(),
@@ -422,12 +422,15 @@ class MistralModel(EasyDeLBaseModule):
 			inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
 		batch_size, sequence_length, _ = inputs_embeds.shape
 
-		assert (
-			sequence_length <= self.config.max_position_embeddings
-		), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+		assert sequence_length <= self.config.max_position_embeddings, (
+			f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+		)
 
 		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
+			attention_mask = jnp.ones((batch_size, sequence_length), "b1")
+		else:
+			if attention_mask.dtype != jnp.bool:
+				attention_mask = jnp.astype(attention_mask == 1, "b1")
 
 		if position_ids is None:
 			position_ids = jnp.broadcast_to(
@@ -596,9 +599,9 @@ class MistralForSequenceClassification(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		assert hasattr(
-			config, "num_labels"
-		), "in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
+		assert hasattr(config, "num_labels"), (
+			"in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
+		)
 		self.score = nn.Linear(
 			self.config.hidden_size,
 			config.num_labels,

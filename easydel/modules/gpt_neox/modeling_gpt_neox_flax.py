@@ -132,7 +132,7 @@ class GPTNeoXAttention(FlaxAttentionModule):
 			key,
 			value,
 			attention_mask,
-			attention_bias,
+			init_attention_bias,
 		) = self.concatenate(
 			query=query,
 			key=key,
@@ -146,7 +146,7 @@ class GPTNeoXAttention(FlaxAttentionModule):
 			query_states=query,
 			key_states=key,
 			value_states=value,
-			bias=attention_bias,
+			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
 			causal=True,
 			dropout_rng=self.rngs.params(),
@@ -377,16 +377,19 @@ class GPTNeoXModel(EasyDeLBaseModule):
 
 		batch_size, sequence_length, _ = inputs_embeds.shape
 		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
+			attention_mask = jnp.ones((batch_size, sequence_length), "b1")
+		else:
+			if attention_mask.dtype != jnp.bool:
+				attention_mask = jnp.astype(attention_mask == 1, "b1")
 		if position_ids is None:
 			position_ids = jnp.broadcast_to(
 				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
 				(batch_size, sequence_length),
 			).astype(jnp.int32)
 
-		assert (
-			sequence_length <= self.config.max_position_embeddings
-		), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+		assert sequence_length <= self.config.max_position_embeddings, (
+			f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+		)
 
 		hidden_states = self.emb_dropout(
 			inputs_embeds + extra_embedding if extra_embedding is not None else inputs_embeds

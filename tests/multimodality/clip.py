@@ -1,3 +1,7 @@
+import os
+import sys
+
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 import easydel as ed
 import jax
 from jax import numpy as jnp
@@ -25,11 +29,11 @@ def main():
 		return_tensors="np",
 		padding=True,
 	)
+
 	inputs["pixel_values"] = jnp.swapaxes(inputs["pixel_values"], 1, 3)
 	outputs = model(**inputs)
-	# this is the image-text similarity score
+
 	logits_per_image = outputs.logits_per_image
-	# we can take the softmax to get the label probabilities
 	probs = jax.nn.softmax(logits_per_image, axis=1)
 	print(probs)
 	assert probs[0, 0] > probs[0, 1], "test failed!"

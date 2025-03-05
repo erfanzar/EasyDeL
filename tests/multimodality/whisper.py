@@ -18,7 +18,7 @@ import easydel as ed
 def main():
 	REPO_ID = "openai/whisper-large-v3-turbo"
 	model = ed.AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
-		"/home/erfan/ASR-runtime/WhisperNu/run-100",
+		REPO_ID,
 		dtype=jnp.bfloat16,
 		param_dtype=jnp.bfloat16,
 	)

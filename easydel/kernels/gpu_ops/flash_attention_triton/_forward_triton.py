@@ -36,6 +36,9 @@ from ._utils import (
 	padded_load,
 )
 
+BIG_NEG: tl.constexpr = jnp.iinfo(jnp.int32).min
+LN2: tl.constexpr = 1.44269504089
+
 
 def config_prune_kernel(
 	configs: tp.List[Config],
@@ -53,9 +56,7 @@ def config_prune_kernel(
 	if kept_configs:
 		return kept_configs
 	return [
-		Config({"BLOCK_M": 16, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-		Config({"BLOCK_M": 16, "BLOCK_N": 64}, num_warps=4, num_stages=3),
-		Config({"BLOCK_M": 16, "BLOCK_N": 64}, num_warps=4, num_stages=5),
+		Config({"BLOCK_M": 16, "BLOCK_N": 64}, num_warps=4, num_stages=4),
 	]
 
 
@@ -84,13 +85,13 @@ def _attn_fwd_inner(
 	USE_DROPOUT: tl.constexpr,
 	IS_CAUSAL: tl.constexpr,
 	BIAS_ON: tl.constexpr,
+	BOOL_BIAS: tl.constexpr,
 	MASKED: tl.constexpr,
 	PADDED_COLS: tl.constexpr,
 	PADDED_HEADS: tl.constexpr,
 	BLOCK_M: tl.constexpr,
 	BLOCK_N: tl.constexpr,
 ):
-	LN2: tl.constexpr = 1.44269504089
 	index_start_n = tl.multiple_of(index_start_n, BLOCK_N)
 	offset_k_ptrs = k_ptrs + index_start_n * stride_kn
 	k = padded_load(
@@ -134,7 +135,10 @@ def _attn_fwd_inner(
 		qk += tl.where(causal_mask, 0, float("-inf"))
 
 	if BIAS_ON:
-		qk += bias * (LN2 / softmax_scale)
+		if BOOL_BIAS:
+			qk = tl.where(bias, qk, BIG_NEG)
+		else:
+			qk += bias * (LN2 / softmax_scale)
 	m_ij = tl.maximum(tl.max(qk, 1) * softmax_scale, me_i)
 	P_ij = tl.exp2(qk * softmax_scale - m_ij[:, None])
 	l_ij = tl.sum(P_ij, 1)
@@ -168,27 +172,23 @@ def _attn_fwd_inner(
 
 @safe_autotune(
 	configs=[
-		triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=5),
-		triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=5),
-		triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=4, num_stages=5),
-		triton.Config({"BLOCK_M": 256, "BLOCK_N": 256}, num_warps=4, num_stages=5),
-		triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=3),
-		triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=3),
-		triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=4, num_stages=3),
-		triton.Config({"BLOCK_M": 256, "BLOCK_N": 256}, num_warps=4, num_stages=3),
+		triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=4),
+		triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=4),
+		triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=4, num_stages=4),
+		triton.Config({"BLOCK_M": 256, "BLOCK_N": 256}, num_warps=4, num_stages=4),
 		triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=1),
 		triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
 		triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=4, num_stages=1),
 		triton.Config({"BLOCK_M": 256, "BLOCK_N": 256}, num_warps=4, num_stages=1),
+		triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+		triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+		triton.Config({"BLOCK_M": 32, "BLOCK_N": 256}, num_warps=4, num_stages=1),
+		triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
 		###
-		triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=8, num_stages=5),
-		triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=8, num_stages=5),
-		triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=5),
-		triton.Config({"BLOCK_M": 256, "BLOCK_N": 256}, num_warps=8, num_stages=5),
-		triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=8, num_stages=3),
-		triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=8, num_stages=3),
-		triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=3),
-		triton.Config({"BLOCK_M": 256, "BLOCK_N": 256}, num_warps=8, num_stages=3),
+		triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=8, num_stages=4),
+		triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=8, num_stages=4),
+		triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=4),
+		triton.Config({"BLOCK_M": 256, "BLOCK_N": 256}, num_warps=8, num_stages=4),
 		triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=8, num_stages=1),
 		triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=8, num_stages=1),
 		triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=1),
@@ -252,6 +252,7 @@ def _attn_fwd(
 	USE_DROPOUT: tl.constexpr,
 	IS_CAUSAL: tl.constexpr,
 	BIAS_ON: tl.constexpr,
+	BOOL_BIAS: tl.constexpr,
 	BLOCK_HEADDIM: tl.constexpr,
 	PADDED_HEADS: tl.constexpr,
 	EVEN_M: tl.constexpr,
@@ -259,7 +260,6 @@ def _attn_fwd(
 	BLOCK_M: tl.constexpr,
 	BLOCK_N: tl.constexpr,
 ):
-	LN2: tl.constexpr = 1.44269504089
 	i_start_m = tl.program_id(0)
 	off_zh = tl.program_id(1)
 	off_head_q = off_zh % nheads_q
@@ -393,6 +393,7 @@ def _attn_fwd(
 				USE_DROPOUT=USE_DROPOUT,
 				IS_CAUSAL=IS_CAUSAL,
 				BIAS_ON=BIAS_ON,
+				BOOL_BIAS=BOOL_BIAS,
 				MASKED=False,
 				PADDED_COLS=False,
 				PADDED_HEADS=PADDED_HEADS,
@@ -427,6 +428,7 @@ def _attn_fwd(
 				USE_DROPOUT=USE_DROPOUT,
 				IS_CAUSAL=IS_CAUSAL,
 				BIAS_ON=BIAS_ON,
+				BOOL_BIAS=BOOL_BIAS,
 				MASKED=True,
 				PADDED_COLS=pad_cols,
 				PADDED_HEADS=PADDED_HEADS,
@@ -497,8 +499,13 @@ def _fwd_attention_kernel_call(
 	assert q.dtype in [jnp.float16, jnp.bfloat16], "Only support fp16 and bf16"
 
 	softmax_scale = 1.0 / math.sqrt(head_dim) if softmax_scale is None else softmax_scale
-
+	BOOL_BIAS = False
 	varlen_mode = varlen_mode and (batch > 1)
+	if not varlen_mode and attention_mask is not None:
+		assert bias is None, "when using attention mask (bool) you can't use bias"
+		BOOL_BIAS = True
+		bias = jnp.astype(attention_mask, jnp.bool)
+
 	if varlen_mode:
 		cum_seqlens_q = jnp.zeros(shape=(attention_mask.shape[0] + 1,), dtype=jnp.int32)
 		cum_seqlens_q = cum_seqlens_q.at[1:].set(
@@ -538,6 +545,7 @@ def _fwd_attention_kernel_call(
 		USE_DROPOUT=(dropout_prob > 0),
 		IS_CAUSAL=causal,
 		BIAS_ON=(bias is not None),
+		BOOL_BIAS=BOOL_BIAS,
 		BLOCK_HEADDIM=BLOCK_HEADDIM,
 		PADDED_HEADS=PADDED_HEADS,
 	)
@@ -581,10 +589,7 @@ def _fwd_attention_kernel_call(
 		dtype_index(q),
 		kernel=_attn_fwd,
 		out_shape=out_shape,
-		grid=lambda META: (
-			triton.cdiv(max_seqlen_q, META["BLOCK_M"]),
-			batch * nheads_q,
-		),
+		grid=lambda META: (triton.cdiv(max_seqlen_q, META["BLOCK_M"]), batch * nheads_q),
 		name="triton::ops::_attn_fwd",
 		**metaparams,
 	)

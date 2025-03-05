@@ -150,23 +150,28 @@ class FlashAttention:
 			einops.repeat(value, "b s h d -> b s (h r) d", r=num_reps),
 		)
 
-	def _handle_bias(
-		self, bias: chex.Array, num_q_heads: int, num_kv_heads: int
+	def _handle_kvhead(
+		self,
+		array: chex.Array,
+		num_q_heads: int,
+		num_kv_heads: int,
 	) -> tp.Optional[chex.Array]:
 		"""Processes attention bias based on head configuration."""
-		if bias is None:
+		if array is None:
 			return None
 
-		if bias.shape[1] == num_q_heads or bias.shape[1] == 1:
-			return bias
+		if array.shape[1] == num_q_heads or array.shape[1] == 1:
+			return array
 
-		elif bias.shape[1] == num_kv_heads:
+		elif array.shape[1] == num_kv_heads:
 			return einops.repeat(
-				bias, "b h q k -> b (h r) q k", r=num_q_heads // bias.shape[1]
+				array,
+				"b h q k -> b (h r) q k",
+				r=num_q_heads // array.shape[1],
 			)
 		else:
 			raise ValueError(
-				f"Incompatible bias shape. Got {bias.shape[1]} heads, "
+				f"Incompatible array shape. Got {array.shape[1]} heads, "
 				f"expected {num_q_heads}, {num_kv_heads}, or 1"
 			)
 
@@ -193,8 +198,10 @@ class FlashAttention:
 				f"Query heads ({num_q_heads}) must be divisible by "
 				f"key/value heads ({num_kv_heads})"
 			)
+
 		if bias is not None:
-			bias = self._handle_bias(bias, num_q_heads, num_kv_heads)
+			bias = self._handle_kvhead(bias, num_q_heads, num_kv_heads)
+
 		kw = dict(
 			query=query,
 			key=key,
@@ -236,10 +243,8 @@ class FlashAttention:
 			value = jax.device_put(value, target_device)
 			if bias is not None:
 				bias = jax.device_put(bias, target_device)
-		if query.shape[1] != key.shape[1]:
-			if query.shape[1] == 1:
-				causal = False
-			attention_mask = None
+			if attention_mask is not None:
+				attention_mask = jax.device_put(attention_mask, target_device)
 
 		attn = triton_flash_attention(
 			q=query,
@@ -308,7 +313,8 @@ class FlashAttention:
 			block_k_dq=min(self.config.blocksize_k, value_lenght),
 			block_q_dq=min(self.config.blocksize_q, query_lenght),
 		)
-
+		if bias is None and attention_mask is not None:
+			bias = jnp.where(attention_mask, 0, jnp.finfo(query.dtype).min)
 		return partial(
 			pallas_flash_attention_tpu,
 			sm_scale=self.config.softmax_scale,
@@ -335,6 +341,10 @@ class FlashAttention:
 	) -> chex.Array:
 		"""Computes attention using JAX backend."""
 		key, value = self.repeat_kv_heads(key, value, query.shape[2] // key.shape[2])
+
+		if bias is None and attention_mask is not None:
+			bias = jnp.where(attention_mask, 0, jnp.finfo(query.dtype).min)
+
 		return jax_flash_attention(
 			query_state=query,
 			key_state=key,
@@ -421,24 +431,17 @@ def _attn_reference(query_states, key_states, value_states, bias):
 def _test_backward():
 	"""Tests the backward pass of the attention mechanism."""
 	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
-	B, QH, KVH, QS, KS, D = 1, 32, 32, 2048, 2048, 128
-	blocksize_k = 16
-	blocksize_q = 16
-	q = jax.nn.initializers.normal(2)(q_key, (B, QS, QH, D), dtype=jnp.float16)
-	k = jax.nn.initializers.normal(2)(k_key, (B, KS, KVH, D), dtype=jnp.float16)
-	v = jax.nn.initializers.normal(2)(v_key, (B, KS, KVH, D), dtype=jnp.float16)
-	b = (
-		jnp.where(
-			jrnd.randint(v_key, (B, QH, QS, KS), 0, 4) > 2,
-			jnp.finfo(jnp.float16).min,
-			0,
-		)
-		if True
-		else None
-	)
-	attention = create_flash_attention(blocksize_k=blocksize_k, blocksize_q=blocksize_q)
+	B, QH, KH, QS, KS, D = 1, 32, 32, 2048, 2048, 128
+	use_bias = True
+	q = jax.nn.initializers.normal(2)(q_key, (B, QS, QH, D), dtype="f2")
+	k = jax.nn.initializers.normal(2)(k_key, (B, KS, KH, D), dtype="f2")
+	v = jax.nn.initializers.normal(2)(v_key, (B, KS, KH, D), dtype="f2")
+	a = jnp.asarray(jrnd.randint(v_key, (B, 1, QS, KS), 0, 4) > 2, "b1")
+	b = jnp.where(a, 0, jnp.finfo(q.dtype).min) if use_bias else None
+
+	attention = create_flash_attention()
 	try:
-		co = jax.grad(lambda *x: attention(*x).sum())(q, k, v, b)
+		co = jax.grad(lambda *x: attention(*x).sum())(q, k, v, None, a)
 		print("Custom op backward pass gradients:")
 		print(co[0, 0, 0, :5])  # Print last 5 elements of last head of last batch
 	except Exception as er:
@@ -464,28 +467,17 @@ def _test_backward():
 def _test_forward():
 	q_key, k_key, v_key = jrnd.split(jrnd.PRNGKey(8), 3)
 	B, QH, KH, QS, KS, D = 1, 32, 8, 2048, 2048, 128
-	blocksize_k = 16
-	blocksize_q = 16
-	q = jax.nn.initializers.normal(2)(q_key, (B, QS, QH, D), dtype=jnp.float16)
-	k = jax.nn.initializers.normal(2)(k_key, (B, KS, KH, D), dtype=jnp.float16)
-	v = jax.nn.initializers.normal(2)(v_key, (B, KS, KH, D), dtype=jnp.float16)
-	b = (
-		jnp.where(
-			jrnd.randint(v_key, (B, 1, QS, KS), 0, 4) > 2,
-			jnp.finfo(jnp.float16).min,
-			0,
-		)
-		if True
-		else None
-	)
-	attention = create_flash_attention(
-		blocksize_q=blocksize_q,
-		blocksize_k=blocksize_k,
-		platform="pallas",
-	)
+	use_bias = True
+
+	q = jax.nn.initializers.normal(2)(q_key, (B, QS, QH, D), dtype="f2")
+	k = jax.nn.initializers.normal(2)(k_key, (B, KS, KH, D), dtype="f2")
+	v = jax.nn.initializers.normal(2)(v_key, (B, KS, KH, D), dtype="f2")
+	a = jnp.asarray(jrnd.randint(v_key, (B, 1, QS, KS), 0, 4) > 2, "b1")
+	b = jnp.where(a, 0, jnp.finfo(q.dtype).min) if use_bias else None
+	attention = create_flash_attention()
 	print("QKV Allocated")
 	try:
-		co = attention(q, k, v, b)
+		co = attention(q, k, v, None, a)
 		print(co[0, 0, 0, :5])
 	except Exception as er:
 		print("Flash OOM", er)

@@ -219,14 +219,15 @@ class MptAttention(FlaxAttentionModule):
 			query_states=query_states,
 			key_states=key_states,
 			value_states=value_states,
+			bias=attention_bias,
+			init_bias=lambda: attention_bias,
 			causal_mask=causal_mask,
-			attention_mask=attention_mask,
+			attention_mask=None,
 			deterministic=self.dropout.deterministic,
 			segment_ids=segment_ids,
 			query_sequence_length=query_states.shape[1],
 			key_value_sequence_length=key_states.shape[1],
 			uses_cache=cache_view is not None,
-			bias=attention_bias,
 			causal=False,
 		)
 
@@ -445,12 +446,15 @@ class MptModel(EasyDeLBaseModule):
 			inputs_embeds = self.wte(input_ids.astype("i4"))
 		batch_size, sequence_length, _ = inputs_embeds.shape
 
-		assert (
-			sequence_length <= self.config.max_position_embeddings
-		), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+		assert sequence_length <= self.config.max_position_embeddings, (
+			f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+		)
 
 		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
+			attention_mask = jnp.ones((batch_size, sequence_length), "b1")
+		else:
+			if attention_mask.dtype != jnp.bool:
+				attention_mask = jnp.astype(attention_mask == 1, "b1")
 
 		if attention_mask.ndim == 2:
 			attention_mask = jnp.expand_dims(attention_mask, (1, 2))

@@ -770,12 +770,9 @@ class vInference:
 				UserWarning,
 				stacklevel=2,
 			)
-			attention_mask = jnp.ones(
-				(batch_size, sequence_length),
-				dtype=jnp.int32,
-			)
+			attention_mask = jnp.ones((batch_size, sequence_length), dtype="b1")
 
-		attention_mask = jnp.asarray(attention_mask, dtype="i4", device=self.input_sharding)
+		attention_mask = jnp.asarray(attention_mask, dtype="b1", device=self.input_sharding)
 		input_ids = jnp.asarray(input_ids, dtype="i4", device=self.input_sharding)
 		model_kwargs.update({"input_ids": input_ids, "attention_mask": attention_mask})
 		if model_kwargs.get("rng") is None:
@@ -937,7 +934,7 @@ class vInference:
 			),
 			attention_mask=jnp.ones(
 				(batch_size, input_tokens_length),
-				dtype="i4",
+				dtype="b1",
 				device=self.input_sharding,
 			),
 			rng=self._rng_generator.rng,

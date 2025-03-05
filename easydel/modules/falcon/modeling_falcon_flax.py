@@ -295,7 +295,7 @@ class FalconAttention(FlaxAttentionModule):
 			key_layer,
 			value_layer,
 			attention_mask,
-			attention_bias,
+			init_attention_bias,
 		) = self.concatenate(
 			query=query_layer,
 			key=key_layer,
@@ -312,13 +312,14 @@ class FalconAttention(FlaxAttentionModule):
 				key_states=key_layer,
 				value_states=value_layer,
 				causal_mask=causal_mask,
-				attention_mask=attention_mask,
 				dropout_rng=self.rngs.params(),
 				segment_ids=segment_ids,
 				query_sequence_length=query_length,
 				key_value_sequence_length=key_length,
 				uses_cache=cache_view is not None,
-				bias=attention_bias,
+				init_bias=init_attention_bias,
+				bias=init_attention_bias(),
+				attention_mask=None,
 				causal=True,
 			)
 			attention_outputs = attention.attention_outputs
@@ -342,7 +343,10 @@ class FalconAttention(FlaxAttentionModule):
 				batch_size, self.num_heads, 1, -1
 			)
 			attention_scores *= self.inv_norm_factor
-			attention_scores = jax.nn.softmax(attention_scores + attention_bias, axis=-1)
+			attention_scores = jax.nn.softmax(
+				attention_scores + init_attention_bias(),
+				axis=-1,
+			)
 			attention_scores = attention_scores.reshape(
 				batch_size, self.num_heads, query_length, key_length
 			)

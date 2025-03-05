@@ -224,13 +224,13 @@ class GPT2Attention(FlaxAttentionModule):
 		key = self._split_heads(key)
 		value = self._split_heads(value)
 
-		attention_bias = None
+		init_attention_bias = lambda: None  # noqa
 		if self.causal:
 			(
 				key,
 				value,
 				attention_mask,
-				attention_bias,
+				init_attention_bias,
 			) = self.concatenate(
 				query=query,
 				key=key,
@@ -245,7 +245,7 @@ class GPT2Attention(FlaxAttentionModule):
 			query_states=query,
 			key_states=key,
 			value_states=value,
-			bias=attention_bias,
+			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
 			causal=self.causal,
 			dropout_rng=self.rngs.params(),
@@ -520,7 +520,10 @@ class GPT2Model(EasyDeLBaseModule):
 	):
 		batch_size, sequence_length = input_ids.shape
 		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
+			attention_mask = jnp.ones((batch_size, sequence_length), "b1")
+		else:
+			if attention_mask.dtype != jnp.bool:
+				attention_mask = jnp.astype(attention_mask == 1, "b1")
 		if position_ids is None:
 			position_ids = jnp.broadcast_to(
 				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),

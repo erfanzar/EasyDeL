@@ -185,8 +185,10 @@ class EasyGenerationMixin:
 		batch_size, seq_length = input_ids.shape
 		past_key_values = self.init_cache(batch_size, max_length)
 		sharding = input_ids.sharding if hasattr(input_ids, "sharding") else None
-		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
+		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="b1")
 		if attention_mask is not None:
+			if attention_mask.dtype != jnp.bool:
+				attention_mask = attention_mask.astype("b1")
 			position_ids = attention_mask.cumsum(axis=-1) - 1
 			extended_attention_mask = lax.dynamic_update_slice(
 				extended_attention_mask,

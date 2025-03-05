@@ -180,7 +180,7 @@ class EasyModelsTest(unittest.TestCase):
 			def jited(ids):
 				return ed_model.compute_loss(
 					input_ids=ids,
-					attention_mask=jnp.ones_like(ids),
+					attention_mask=jnp.ones_like(ids, dtype=jnp.bool),
 				)
 
 			# ed_output = jited(jax_input_ids)
@@ -547,10 +547,6 @@ class EasyModelsTest(unittest.TestCase):
 				1.0299999713897705,
 				1.0399999618530273,
 				1.0499999523162842,
-				1.7,
-				1.7,
-				1.8,
-				1.9,
 			],
 			"long_mscale": 1.8,
 			"original_max_position_embeddings": 4,
@@ -559,10 +555,6 @@ class EasyModelsTest(unittest.TestCase):
 				1.0399999618530273,
 				1.0399999618530273,
 				1.0399999618530273,
-				1.0499999523162842,
-				1.6,
-				1.7,
-				1.8,
 			],
 			"short_mscale": 1.1,
 			"type": "longrope",
@@ -867,9 +859,9 @@ if __name__ == "__main__":
 	# test.test_olmo2()  # Passed
 	# test.test_openelm()  # Passed
 	# test.test_phi()  # Passed
-	# test.test_phi3()  # Passed
+	test.test_phi3()  # Passed
 	# test.test_phimoe()  # Failed v0.0.80 - N  Runtime
 	test.test_qwen2()  # Passed
-	# test.test_qwen2_moe()  # Passed
-	# test.test_stablelm()  # Passed
+	test.test_qwen2_moe()  # Passed
+	test.test_stablelm()  # Passed
 	# -----------------------------------------------

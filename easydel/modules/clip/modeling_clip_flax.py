@@ -266,12 +266,13 @@ class CLIPAttention(FlaxAttentionModule):
 				jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
 				jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
 			)
+			attention_mask = None
 
 		attentions = self.attention_performer(
 			query_states=query,
 			key_states=key,
 			value_states=value,
-			bias=attention_bias,
+			init_bias=lambda: attention_bias,
 			attention_mask=attention_mask,
 			causal=self.causal,
 			dropout_rng=self.rngs.params(),

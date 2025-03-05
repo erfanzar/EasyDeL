@@ -37,6 +37,10 @@ from ._utils import (
 )
 
 
+BIG_NEG: tl.constexpr = jnp.iinfo(jnp.int32).min
+LN2: tl.constexpr = 1.44269504089
+
+
 def config_prune_kernel(
 	configs: tp.List[Config],
 	named_args: tp.Dict[str, tp.Any],
@@ -176,12 +180,12 @@ def _attn_bwd_dkdv(
 	MASKED: tl.constexpr,
 	IS_CAUSAL: tl.constexpr,
 	BIAS_ON: tl.constexpr,
+	BOOL_BIAS: tl.constexpr,
 	USE_DROPOUT: tl.constexpr,
 	PAD_ROWS: tl.constexpr,
 	PAD_COLS: tl.constexpr,
 	HEADS_PADDED: tl.constexpr,
 ):
-	LN2: tl.constexpr = 1.44269504089
 	q_ptrs = q_ptrs + index_start_m * stride_qm
 	do_ptrs = do_ptrs + index_start_m * stride_dom
 	if BIAS_ON:
@@ -214,7 +218,10 @@ def _attn_bwd_dkdv(
 
 	qk = tl.dot(q, tl.trans(k))
 	if BIAS_ON:
-		qk += bias / softmax_scale
+		if BOOL_BIAS:
+			qk = tl.where(bias, qk, BIG_NEG)
+		else:
+			qk += bias / softmax_scale
 
 	offs_n_causal = offs_n - actual_seqlen_k + actual_seqlen_q
 	if MASKED:
@@ -282,6 +289,7 @@ def _attn_bwd_block_dkdv(
 	headdim,
 	IS_CAUSAL: tl.constexpr,
 	BIAS_ON: tl.constexpr,
+	BOOL_BIAS: tl.constexpr,
 	USE_DROPOUT: tl.constexpr,
 	PAD_COLS: tl.constexpr,
 	HEADS_PADDED: tl.constexpr,
@@ -372,6 +380,7 @@ def _attn_bwd_block_dkdv(
 				MASKED=True,
 				IS_CAUSAL=IS_CAUSAL,
 				BIAS_ON=BIAS_ON,
+				BOOL_BIAS=BOOL_BIAS,
 				USE_DROPOUT=USE_DROPOUT,
 				PAD_ROWS=True,
 				PAD_COLS=PAD_COLS,
@@ -407,6 +416,7 @@ def _attn_bwd_block_dkdv(
 				MASKED=False,
 				IS_CAUSAL=IS_CAUSAL,
 				BIAS_ON=BIAS_ON,
+				BOOL_BIAS=BOOL_BIAS,
 				USE_DROPOUT=USE_DROPOUT,
 				PAD_ROWS=True,
 				PAD_COLS=PAD_COLS,
@@ -463,6 +473,7 @@ def _attn_bwd_dq(
 	MASKED: tl.constexpr,
 	IS_CAUSAL: tl.constexpr,
 	BIAS_ON: tl.constexpr,
+	BOOL_BIAS: tl.constexpr,
 	USE_DROPOUT: tl.constexpr,
 	PAD_COLS: tl.constexpr,
 	HEADS_PADDED: tl.constexpr,
@@ -492,7 +503,10 @@ def _attn_bwd_dq(
 		)
 	qk = tl.dot(q, tl.trans(k))
 	if BIAS_ON:
-		qk += bias / softmax_scale
+		if BOOL_BIAS:
+			qk = tl.where(bias, qk, BIG_NEG)
+		else:
+			qk += bias / softmax_scale
 	offs_n_causal = offs_n_curr - actual_seqlen_k + actual_seqlen_q
 	if MASKED:
 		if PAD_COLS:
@@ -545,6 +559,7 @@ def _attn_bwd_block_dq(
 	VARLEN: tl.constexpr,
 	IS_CAUSAL: tl.constexpr,
 	BIAS_ON: tl.constexpr,
+	BOOL_BIAS: tl.constexpr,
 	USE_DROPOUT: tl.constexpr,
 	PAD_ROWS: tl.constexpr,
 	HEADS_PADDED: tl.constexpr,
@@ -650,6 +665,7 @@ def _attn_bwd_block_dq(
 				headdim,
 				IS_CAUSAL=IS_CAUSAL,
 				BIAS_ON=BIAS_ON,
+				BOOL_BIAS=BOOL_BIAS,
 				USE_DROPOUT=USE_DROPOUT,
 				MASKED=False,
 				PAD_COLS=False,
@@ -686,6 +702,7 @@ def _attn_bwd_block_dq(
 				headdim,
 				IS_CAUSAL=IS_CAUSAL,
 				BIAS_ON=BIAS_ON,
+				BOOL_BIAS=BOOL_BIAS,
 				USE_DROPOUT=USE_DROPOUT,
 				MASKED=True,
 				PAD_COLS=pad_cols,
@@ -814,6 +831,7 @@ def _attn_bwd(
 	VARLEN: tl.constexpr,
 	IS_CAUSAL: tl.constexpr,
 	BIAS_ON: tl.constexpr,
+	BOOL_BIAS: tl.constexpr,
 	USE_DROPOUT: tl.constexpr,
 	BLOCK_HEADDIM: tl.constexpr,
 	# Heuristics
@@ -898,6 +916,7 @@ def _attn_bwd(
 			headdim,
 			IS_CAUSAL=IS_CAUSAL,
 			BIAS_ON=BIAS_ON,
+			BOOL_BIAS=BOOL_BIAS,
 			USE_DROPOUT=USE_DROPOUT,
 			PAD_COLS=pad_cols,
 			HEADS_PADDED=HEADS_PADDED,
@@ -937,6 +956,7 @@ def _attn_bwd(
 			VARLEN=VARLEN,
 			IS_CAUSAL=IS_CAUSAL,
 			BIAS_ON=BIAS_ON,
+			BOOL_BIAS=BOOL_BIAS,
 			USE_DROPOUT=USE_DROPOUT,
 			PAD_ROWS=pad_rows,
 			HEADS_PADDED=HEADS_PADDED,
@@ -996,6 +1016,11 @@ def _bwd_attention_kernel_call(
 	softmax_scale = 1.0 / math.sqrt(head_dim) if softmax_scale is None else softmax_scale
 	assert nheads_q % nheads_kv == 0, f"{nheads_q = } is not divisible by {nheads_kv =}"
 	assert M.shape == (batch_size, nheads_q, max_seqlen_q_rounded)
+	BOOL_BIAS = False
+	if not varlen_mode and attention_mask is not None:
+		assert bias is None, "when using attention mask (bool) you can't use bias"
+		BOOL_BIAS = True
+		bias = jnp.astype(attention_mask, jnp.bool)
 
 	if varlen_mode:
 		cum_seqlens_q = jnp.zeros(shape=(attention_mask.shape[0] + 1,), dtype="i4")
@@ -1127,11 +1152,12 @@ def _bwd_attention_kernel_call(
 		max_seqlen_q // 32,
 		max_seqlen_k // 32,
 		dtype_index(q),
+		BIAS_ON=(bias is not None),
 		VARLEN=varlen_mode,
 		IS_CAUSAL=causal,
-		BIAS_ON=(bias is not None),
 		USE_DROPOUT=(dropout_prob > 0),
 		BLOCK_HEADDIM=BLOCK_HEADDIM,
+		BOOL_BIAS=BOOL_BIAS,
 		kernel=_attn_bwd,
 		grid=lambda META: (
 			triton.cdiv(KSeq, META["BLOCK_N1"]) + triton.cdiv(QSeq, META["BLOCK_M2"]),
