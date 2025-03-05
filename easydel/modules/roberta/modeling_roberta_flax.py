@@ -228,7 +228,7 @@ class RobertaSelfAttention(FlaxAttentionModule):
 			key_states,
 			value_states,
 			attention_mask,
-			attention_bias,
+			init_attention_bias,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -246,7 +246,7 @@ class RobertaSelfAttention(FlaxAttentionModule):
 				key_states=key_states,
 				value_states=value_states,
 				causal=True,
-				bias=attention_bias,
+				init_bias=init_attention_bias,
 				attention_mask=attention_mask,
 				uses_cache=cache_view is not None,
 				query_sequence_length=query_states.shape[1],
@@ -260,7 +260,7 @@ class RobertaSelfAttention(FlaxAttentionModule):
 			attn_weights = dot_product_attention_weights(
 				query_states,
 				key_states,
-				bias=attention_bias,
+				init_bias=init_attention_bias,
 				dropout_rate=self.config.attention_probs_dropout_prob,
 				broadcast_dropout=True,
 				dtype=self.dtype,

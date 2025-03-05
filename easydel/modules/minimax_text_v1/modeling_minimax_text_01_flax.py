@@ -378,7 +378,7 @@ class MiniMaxText01Attention(FlaxAttentionModule):
 			key_states,
 			value_states,
 			attention_mask,
-			attention_bias,
+			init_attention_bias,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -393,7 +393,7 @@ class MiniMaxText01Attention(FlaxAttentionModule):
 			query_states=query_states,
 			key_states=key_states,
 			value_states=value_states,
-			bias=attention_bias,
+			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
 			causal=True,
 			dropout_rng=self.rngs.params(),
@@ -850,11 +850,14 @@ class MiniMaxText01Model(EasyDeLBaseModule):
 		all_attentions = () if output_attentions else None
 		all_hidden_states = () if output_hidden_states else None
 		all_router_logits = () if output_router_logits else None
-		assert (
-			sequence_length <= self.config.max_position_embeddings
-		), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+		assert sequence_length <= self.config.max_position_embeddings, (
+			f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+		)
 		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
+			attention_mask = jnp.ones((batch_size, sequence_length), "b1")
+		else:
+			if attention_mask.dtype != jnp.bool:
+				attention_mask = jnp.astype(attention_mask == 1, "b1")
 		if position_ids is None:
 			position_ids = jnp.broadcast_to(
 				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),

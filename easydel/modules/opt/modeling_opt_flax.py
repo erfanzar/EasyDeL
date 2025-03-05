@@ -167,7 +167,7 @@ class OPTAttention(FlaxAttentionModule):
 			key_states,
 			value_states,
 			attention_mask,
-			attention_bias,
+			init_attention_bias,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -181,7 +181,7 @@ class OPTAttention(FlaxAttentionModule):
 			query_states=query_states,
 			key_states=key_states,
 			value_states=value_states,
-			bias=attention_bias,
+			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
 			causal=self.causal,
 			dropout_rng=self.rngs.params(),
@@ -461,7 +461,10 @@ class OPTDecoder(EasyDeLBaseModule):
 		batch_size, sequence_length = inputs_embeds.shape[:2]
 		hidden_states = inputs_embeds + positions
 		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
+			attention_mask = jnp.ones((batch_size, sequence_length), "b1")
+		else:
+			if attention_mask.dtype != jnp.bool:
+				attention_mask = jnp.astype(attention_mask == 1, "b1")
 
 		if position_ids is None:
 			position_ids = jnp.broadcast_to(

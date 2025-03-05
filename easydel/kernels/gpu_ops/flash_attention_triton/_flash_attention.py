@@ -13,7 +13,6 @@
 # limitations under the License.
 import functools
 import typing as tp
-import warnings
 
 import chex
 import jax
@@ -134,14 +133,7 @@ def flash_attention(
 	dropout_seed: tp.Optional[int] = None,
 	varlen_mode: bool = True,
 ) -> chex.Array:
-	# TODO: Debug Varlen Mode
-	if attention_mask is not None and not DEV_MODE and bias is None:
-		warnings.warn(
-			"Varlen Mode and attention mask passing is still under development",
-			stacklevel=1,
-		)
-
-		attention_mask = None
+	del varlen_mode  # TODO: Debug varlen mode
 	return flash_attention_call(
 		q=q,
 		k=k,
@@ -152,5 +144,5 @@ def flash_attention(
 		dropout_prob=dropout_prob,
 		causal=causal,
 		dropout_seed=dropout_seed,
-		varlen_mode=varlen_mode,
+		varlen_mode=False,
 	)

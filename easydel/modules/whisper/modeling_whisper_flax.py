@@ -185,7 +185,7 @@ class WhisperAttention(FlaxAttentionModule):
 				key_states,
 				value_states,
 				attention_mask,
-				attention_bias,
+				init_attention_bias,
 			) = self.concatenate(
 				query=query_states,
 				key=key_states,
@@ -195,16 +195,17 @@ class WhisperAttention(FlaxAttentionModule):
 				causal_mask=causal_mask,
 				fcm_mask=None,
 			)
+			attention_mask = None
 		else:
 			if attention_mask is not None:
 				attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-			attention_bias = None
+			init_attention_bias = lambda: None  # noqa
 
 		attentions = self.attention_performer(
 			query_states=query_states,
 			key_states=key_states,
 			value_states=value_states,
-			bias=attention_bias,
+			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
 			causal=self.causal,
 			dropout_rng=self.rngs.params(),
@@ -1099,6 +1100,9 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 		return_dict = return_dict if return_dict is not None else self.config.return_dict
 
 		encoder_hidden_states = encoder_outputs[0]
+		if decoder_attention_mask is not None:
+			decoder_attention_mask = decoder_attention_mask.astype("b1")
+			
 		outputs = self.model.decode(
 			encoder_hidden_states=encoder_hidden_states,
 			decoder_attention_mask=decoder_attention_mask,

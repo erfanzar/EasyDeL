@@ -29,7 +29,6 @@ import jax.experimental
 import jax.extend
 import jax.lib
 import jax.tree_util
-import numpy
 from chex import Array
 from eformer.escale import PartitionAxis, with_sharding_constraint
 from flax.nnx.nn.dtypes import promote_dtype
@@ -442,7 +441,7 @@ class FlexibleAttentionModule(nn.Module):
 				self.partition_axis.batch_axis,
 				None,
 				self.partition_axis.query_sequence_axis,
-				self.partition_axis.key_sequence_axis,
+				self.partition_axis.bias_key_sequence_axis,
 			)
 			attention_partition_spec = query_partition_spec
 		else:
@@ -476,7 +475,7 @@ class FlexibleAttentionModule(nn.Module):
 				self.partition_axis.batch_axis,
 				None,
 				self.partition_axis.generation_query_sequence_axis,
-				self.partition_axis.generation_key_sequence_axis,
+				self.partition_axis.bias_key_sequence_axis,
 			)
 			attention_partition_spec = query_partition_spec
 		return (
@@ -527,7 +526,7 @@ class FlexibleAttentionModule(nn.Module):
 				self.partition_axis.batch_axis,
 				None,
 				self.partition_axis.query_sequence_axis,
-				self.partition_axis.key_sequence_axis,
+				self.partition_axis.bias_key_sequence_axis,
 			)
 			attention_partition_spec = query_partition_spec
 		else:
@@ -561,7 +560,7 @@ class FlexibleAttentionModule(nn.Module):
 				self.partition_axis.batch_axis,
 				None,
 				self.partition_axis.generation_query_sequence_axis,
-				self.partition_axis.generation_key_sequence_axis,
+				self.partition_axis.bias_key_sequence_axis,
 			)
 			attention_partition_spec = query_partition_spec
 		return (
@@ -649,7 +648,7 @@ class FlexibleAttentionModule(nn.Module):
 						value_states=value_states,
 						attention_mask=attention_mask,
 						bias=bias,
-						init_bias=bias,
+						init_bias=init_bias,
 						causal=causal,
 					)
 				case AttentionMechanisms.SDPA:
@@ -657,8 +656,9 @@ class FlexibleAttentionModule(nn.Module):
 						query_states=query_states,
 						key_states=key_states,
 						value_states=value_states,
+						attention_mask=attention_mask,
 						bias=bias,
-						init_bias=bias,
+						init_bias=init_bias,
 						causal=causal,
 					)
 				case AttentionMechanisms.VANILLA:
@@ -666,8 +666,9 @@ class FlexibleAttentionModule(nn.Module):
 						query_states=query_states,
 						key_states=key_states,
 						value_states=value_states,
+						attention_mask=attention_mask,
 						bias=bias,
-						init_bias=bias,
+						init_bias=init_bias,
 						dropout_rng=dropout_rng,
 						deterministic=deterministic,
 						query_sequence_length=query_sequence_length,
@@ -678,12 +679,12 @@ class FlexibleAttentionModule(nn.Module):
 						query_states=query_states,
 						key_states=key_states,
 						value_states=value_states,
+						attention_mask=attention_mask,
 						bias=bias,
-						init_bias=bias,
+						init_bias=init_bias,
 						dropout_rng=dropout_rng,
 						deterministic=deterministic,
 						segment_ids=segment_ids,
-						attention_mask=attention_mask,
 						query_sequence_length=query_sequence_length,
 						key_value_sequence_length=key_value_sequence_length,
 					)
@@ -729,7 +730,7 @@ class FlexibleAttentionModule(nn.Module):
 						key_states=key_states,
 						value_states=value_states,
 						bias=bias,
-						init_bias=bias,
+						init_bias=init_bias,
 						deterministic=deterministic,
 						dropout_rng=dropout_rng,
 						query_sequence_length=query_sequence_length,
@@ -741,7 +742,7 @@ class FlexibleAttentionModule(nn.Module):
 						key_states=key_states,
 						value_states=value_states,
 						bias=bias,
-						init_bias=bias,
+						init_bias=init_bias,
 						causal=causal,
 						deterministic=deterministic,
 						query_sequence_length=query_sequence_length,
@@ -771,17 +772,18 @@ class FlexibleAttentionModule(nn.Module):
 		query_states: Array,
 		key_states: Array,
 		value_states: Array,
+		attention_mask: tp.Optional[Array] = None,
 		bias: tp.Optional[Array] = None,
 		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
 		causal: bool = False,
 	):
 		(
-			query_partitionspec,
-			key_partitionspec,
-			value_partitionspec,
-			bias_partitionspec,
-			mask_partitionspec,
-			attention_partitionspec,
+			qps,
+			kps,
+			vps,
+			bps,
+			mps,
+			aps,
 			in_generating_process,
 		) = self.get_bshd_partition_specs(query_states.shape[1])
 		with self.mesh:
@@ -796,34 +798,45 @@ class FlexibleAttentionModule(nn.Module):
 			dtype = self.dtype
 			if jax.default_backend() == "gpu":
 				dtype = jnp.float16
+			if attention_mask is None and bias is None and init_bias is not None:
+				bias = init_bias()
+
 			attention_output = shard_map(
 				func,
 				mesh=self.mesh,
 				in_specs=(
 					create_target_only_spec(
-						query_partitionspec,
-						{0: query_partitionspec[0], 2: query_partitionspec[2]},
+						qps,
+						{0: qps[0], 2: qps[2]},
 					),
 					create_target_only_spec(
-						key_partitionspec,
-						{0: key_partitionspec[0], 2: key_partitionspec[2]},
+						kps,
+						{0: kps[0], 2: kps[2]},
 					),
 					create_target_only_spec(
-						value_partitionspec,
-						{0: value_partitionspec[0], 2: value_partitionspec[2]},
+						vps,
+						{0: vps[0], 2: vps[2]},
 					),
 					(
 						create_target_only_spec(
-							bias_partitionspec,
-							{0: bias_partitionspec[0], 1: bias_partitionspec[1]},
+							bps,
+							{0: bps[0], 1: bps[1]},
 						)
-						if bias_partitionspec is not None
+						if bps is not None
+						else None
+					),
+					(
+						create_target_only_spec(
+							mps,
+							{0: mps[0], 1: mps[1]},
+						)
+						if attention_mask is not None
 						else None
 					),
 				),
 				out_specs=create_target_only_spec(
-					attention_partitionspec,
-					{0: attention_partitionspec[0], 2: attention_partitionspec[2]},
+					aps,
+					{0: aps[0], 2: aps[2]},
 				),
 				check_rep=False,
 			)(
@@ -831,12 +844,13 @@ class FlexibleAttentionModule(nn.Module):
 				key_states.astype(dtype),
 				value_states.astype(dtype),
 				bias.astype(dtype) if bias is not None else None,
+				attention_mask.astype("b1") if attention_mask is not None else None,
 			)
 			return AttentionOutput(
 				attention_weights=None,
 				attention_outputs=with_sharding_constraint(
 					arr=attention_output,
-					sharding=attention_partitionspec,
+					sharding=aps,
 				),
 			)
 
@@ -850,36 +864,33 @@ class FlexibleAttentionModule(nn.Module):
 		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
 		attention_mask: tp.Optional[Array] = None,
 		causal: bool = True,
-		deterministic: bool = True,
-		dropout_rng: tp.Optional[random.PRNGKey] = None,
-		uses_cache: bool = False,
-		causal_mask: tp.Optional[Array] = None,
+		**kw,
 	):
 		(
-			query_partitionspec,
-			key_partitionspec,
-			value_partitionspec,
-			bias_partitionspec,
-			mask_partitionspec,
-			attention_partitionspec,
+			qps,
+			kps,
+			vps,
+			bps,
+			mps,
+			aps,
 			in_generating_process,
 		) = self.get_bshd_partition_specs(query_states.shape[1])
+
+		aps = create_target_only_spec(aps, {0: aps[0], 2: aps[2]})
+		qps = create_target_only_spec(qps, {0: qps[0], 2: qps[2]})
+		kps = create_target_only_spec(kps, {0: kps[0], 2: kps[2]})
+		vps = create_target_only_spec(vps, {0: vps[0], 2: vps[2]})
 
 		blocksize_q = self.blocksize_q
 		if in_generating_process:
 			blocksize_q = int(os.environ.get("GENERATION_BLOCKSIZE_Q", self.blocksize_q))
-		if bias is not None:
-			assert bias.ndim == 4
-		attn_mask = None
-		if attention_mask is not None:
-			attn_mask = attention_mask[:, 0, -1, :]
+
 		with self.mesh:
+			if attention_mask is None and bias is None and init_bias is not None:
+				bias = init_bias()
 
-			def get_axis_size(axis_name):
-				if isinstance(axis_name, tuple):
-					return numpy.prod([self.mesh.shape[name] for name in axis_name])
-				return self.mesh.shape[axis_name]
-
+			if bias is not None:
+				assert bias.ndim == 4
 			attention = get_cached_flash_attention(
 				backend=self.backend,
 				platform=self.platform,
@@ -887,51 +898,32 @@ class FlexibleAttentionModule(nn.Module):
 				blocksize_k=self.blocksize_k,
 				softmax_scale=self.sm_scale,
 			)
-			attn_mask_partition_spec = PartitionSpec(
-				self.partition_axis.batch_axis,
-				self.partition_axis.generation_query_sequence_axis,
+			bps = (
+				create_target_only_spec(bps, {0: bps[0], 1: bps[1]})
+				if bias is not None
+				else None
 			)
+			mps = mps if attention_mask is not None else None
+
 			with self.mesh:
 				attention_outputs = shard_map(
-					partial(
-						attention,
-						causal=causal,
-					),
+					partial(attention, causal=False),
 					mesh=self.mesh,
 					in_specs=(
-						create_target_only_spec(
-							query_partitionspec,
-							{0: query_partitionspec[0], 2: query_partitionspec[2]},
-						),
-						create_target_only_spec(
-							key_partitionspec,
-							{0: key_partitionspec[0], 2: key_partitionspec[2]},
-						),
-						create_target_only_spec(
-							value_partitionspec,
-							{0: value_partitionspec[0], 2: value_partitionspec[2]},
-						),
-						(
-							create_target_only_spec(
-								bias_partitionspec,
-								{0: bias_partitionspec[0], 1: bias_partitionspec[1]},
-							)
-							if bias_partitionspec is not None
-							else None
-						),
-						attn_mask_partition_spec if attn_mask is not None else None,
+						qps,
+						kps,
+						vps,
+						bps,
+						mps,
 					),
-					out_specs=create_target_only_spec(
-						attention_partitionspec,
-						{0: attention_partitionspec[0], 2: attention_partitionspec[2]},
-					),
+					out_specs=aps,
 					check_rep=False,
 				)(
 					query_states.astype(self.dtype),
 					key_states.astype(self.dtype),
 					value_states.astype(self.dtype),
 					bias.astype(self.dtype) if bias is not None else None,
-					attn_mask,
+					attention_mask.astype("b1") if attention_mask is not None else None,
 				)
 			return AttentionOutput(
 				attention_weights=None,
@@ -954,27 +946,27 @@ class FlexibleAttentionModule(nn.Module):
 				self.num_q_heads // self.num_kv_heads,
 			)
 			(
-				query_partitionspec,
-				key_partitionspec,
-				value_partitionspec,
+				qps,
+				kps,
+				vps,
 				_,
 				_,
-				attention_partitionspec,
+				aps,
 				in_generating_process,
 			) = self.get_bshd_partition_specs(query_states.shape[1], True)
 
 			output = cuda_flash_attn2_mha(
 				q=with_sharding_constraint(
 					arr=query_states.astype(self.dtype),
-					sharding=query_partitionspec,
+					sharding=qps,
 				),
 				k=with_sharding_constraint(
 					arr=key_states.astype(self.dtype),
-					sharding=key_partitionspec,
+					sharding=kps,
 				),
 				v=with_sharding_constraint(
 					arr=value_states.astype(self.dtype),
-					sharding=value_partitionspec,
+					sharding=vps,
 				),
 				softmax_scale=self.sm_scale,
 				is_causal=False if in_generating_process else causal,
@@ -984,7 +976,7 @@ class FlexibleAttentionModule(nn.Module):
 				attention_weights=None,
 				attention_outputs=with_sharding_constraint(
 					arr=output,
-					sharding=attention_partitionspec,
+					sharding=aps,
 				),
 			)
 		else:
@@ -996,29 +988,30 @@ class FlexibleAttentionModule(nn.Module):
 		query_states: Array,
 		key_states: Array,
 		value_states: Array,
-		query_sequence_length: int,
-		key_value_sequence_length: int,
 		bias: tp.Optional[Array] = None,
 		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
-		attention_mask: tp.Optional[Array] = None,
 		deterministic: bool = False,
 		dropout_rng: tp.Optional[random.PRNGKey] = None,
-		segment_ids: tp.Optional[Array] = None,
+		**kw,
 	):
 		key_states, value_states = self.repeat_kv_heads(
 			key_states,
 			value_states,
 			self.num_q_heads // self.num_kv_heads,
 		)
+		if bias is None and init_bias is not None:
+			bias = init_bias()
+
 		(
-			query_partitionspec,
-			key_partitionspec,
-			value_partitionspec,
-			bias_partitionspec,
-			mask_partitionspec,
-			attention_partitionspec,
+			qps,
+			kps,
+			vps,
+			bps,
+			mps,
+			aps,
 			gen,
 		) = self.get_bshd_partition_specs(query_states.shape[1], True)
+
 		attn_output = shard_map(
 			partial(
 				ring_attention,
@@ -1038,12 +1031,12 @@ class FlexibleAttentionModule(nn.Module):
 				dropout_rng=dropout_rng,
 			),
 			in_specs=(
-				query_partitionspec,
-				key_partitionspec,
-				value_partitionspec,
-				bias_partitionspec,
+				qps,
+				kps,
+				vps,
+				bps,
 			),
-			out_specs=attention_partitionspec,
+			out_specs=aps,
 			mesh=self.mesh,
 			check_rep=False,
 		)(
@@ -1061,6 +1054,7 @@ class FlexibleAttentionModule(nn.Module):
 		query_states: Array,
 		key_states: Array,
 		value_states: Array,
+		attention_mask: tp.Optional[Array] = None,
 		bias: tp.Optional[Array] = None,
 		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
 		deterministic: bool = False,
@@ -1070,14 +1064,17 @@ class FlexibleAttentionModule(nn.Module):
 	) -> AttentionOutput:
 		with self.mesh:
 			(
-				query_partitionspec,
-				key_partitionspec,
-				value_partitionspec,
-				bias_partitionspec,
-				mask_partitionspec,
-				attention_partitionspec,
+				qps,
+				kps,
+				vps,
+				bps,
+				mps,
+				aps,
 				_,
 			) = self.get_bshd_partition_specs(query_sequence_length)
+
+		if bias is None and attention_mask is None and init_bias is not None:
+			bias = init_bias()
 
 		b, qs, qh, d = query_states.shape
 		b, ks, kh, d = key_states.shape
@@ -1086,15 +1083,31 @@ class FlexibleAttentionModule(nn.Module):
 		with self.mesh:
 			query_states = with_sharding_constraint(
 				arr=query_states,
-				sharding=query_partitionspec,
+				sharding=qps,
 			)
 			key_states = with_sharding_constraint(
 				arr=key_states,
-				sharding=key_partitionspec,
+				sharding=kps,
 			)
 			value_states = with_sharding_constraint(
 				arr=value_states,
-				sharding=value_partitionspec,
+				sharding=vps,
+			)
+			bias = (
+				with_sharding_constraint(
+					arr=bias,
+					sharding=bps,
+				)
+				if bias is not None
+				else bias
+			)
+			attention_mask = (
+				with_sharding_constraint(
+					arr=attention_mask,
+					sharding=mps,
+				)
+				if attention_mask is not None
+				else attention_mask
 			)
 			query_states = jnp.reshape(
 				query_states,
@@ -1125,7 +1138,15 @@ class FlexibleAttentionModule(nn.Module):
 			else:
 				raise NotImplementedError("bias heads wont match!")
 			attention_weight = jnp.add(attention_weight, bias.astype(attention_weight))
-		attention_weight = jax.nn.softmax(attention_weight).astype(self.dtype)
+		elif attention_mask is not None:
+			attention_weight = jnp.where(
+				jnp.expand_dims(attention_mask, 1),
+				attention_weight,
+				jnp.finfo(attention_weight).min,
+			)
+		attention_weight = jax.nn.softmax(
+			attention_weight.astype(self.softmax_dtype)
+		).astype(self.dtype)
 
 		if not deterministic and self.attention_dropout > 0.0 and dropout_rng is not None:
 			keep_prob = 1.0 - self.attention_dropout
@@ -1141,12 +1162,13 @@ class FlexibleAttentionModule(nn.Module):
 			value_states,
 			precision=self.precision,
 		).reshape(b, qs, qh, vd)
-		attention = with_sharding_constraint(
-			arr=attention,
-			sharding=attention_partitionspec,
-		)
+
 		return AttentionOutput(
-			attention_weights=attention_weight, attention_outputs=attention
+			attention_weights=attention_weight,
+			attention_outputs=with_sharding_constraint(
+				arr=attention,
+				sharding=aps,
+			),
 		)
 
 	def blockwise_attention(
@@ -1168,31 +1190,32 @@ class FlexibleAttentionModule(nn.Module):
 			self.num_q_heads // self.num_kv_heads,
 		)
 		(
-			query_partitionspec,
-			key_partitionspec,
-			value_partitionspec,
-			bias_partitionspec,
-			mask_partitionspec,
-			attention_partitionspec,
+			qps,
+			kps,
+			vps,
+			bps,
+			mps,
+			aps,
 			_,
 		) = self.get_bshd_partition_specs(query_sequence_length)
-
+		if bias is None and init_bias is not None:
+			bias = init_bias()
 		with self.mesh:
 			query_states = with_sharding_constraint(
 				arr=query_states,
-				sharding=query_partitionspec,
+				sharding=qps,
 			)
 			key_states = with_sharding_constraint(
 				arr=key_states,
-				sharding=key_partitionspec,
+				sharding=kps,
 			)
 			value_states = with_sharding_constraint(
 				arr=value_states,
-				sharding=value_partitionspec,
+				sharding=vps,
 			)
 			bias = with_sharding_constraint(
 				arr=bias,
-				sharding=bias_partitionspec,
+				sharding=bps,
 			)
 			o = blockwise_attn(
 				query=query_states,
@@ -1211,7 +1234,7 @@ class FlexibleAttentionModule(nn.Module):
 				float32_logits=True,
 			)
 
-			o = with_sharding_constraint(arr=o, sharding=attention_partitionspec)
+			o = with_sharding_constraint(arr=o, sharding=aps)
 			return AttentionOutput(attention_weights=None, attention_outputs=o)
 
 	def splash_attention(
@@ -1229,9 +1252,9 @@ class FlexibleAttentionModule(nn.Module):
 			self.num_q_heads // self.num_kv_heads,
 		)
 		(
-			query_partitionspec,
-			key_partitionspec,
-			value_partitionspec,
+			qps,
+			kps,
+			vps,
 			_,
 			_,
 			_,
@@ -1255,12 +1278,12 @@ class FlexibleAttentionModule(nn.Module):
 		@partial(
 			shard_map,
 			in_specs=(
-				query_partitionspec,
-				key_partitionspec,
-				value_partitionspec,
-				PartitionSpec(query_partitionspec[0], query_partitionspec[2]),
+				qps,
+				kps,
+				vps,
+				PartitionSpec(qps[0], qps[2]),
 			),
-			out_specs=query_partitionspec,
+			out_specs=qps,
 			mesh=self.mesh,
 			check_rep=False,
 		)
@@ -1372,11 +1395,6 @@ class FlexibleAttentionModule(nn.Module):
 					axis=2,
 				),
 				bias=bias,
-				# mask=(
-				# 	jnp.zeros((batch, 1, query_sequence_length, key_value_sequence_length))
-				# 	if causal
-				# 	else None
-				# ),
 				seed=None,
 				attn_bias_type=attn_bias_type,
 				attn_mask_type=attn_mask_type,
@@ -1813,7 +1831,6 @@ class FlaxAttentionModule(nn.Module):
 		attention_mask: Array,
 		causal_mask: tp.Optional[Array] = None,
 	) -> tp.Tuple[Array, Array, Array]:
-		# print(cache_view.key)
 		num_updated_cache_vectors = query.shape[1]
 		end_index = cache_view.index[0]
 
@@ -1890,7 +1907,11 @@ class FlaxAttentionModule(nn.Module):
 		causal_mask: tp.Optional[Array] = None,
 		fcm_mask: tp.Optional[Array] = None,
 		sliding_windows: tp.Optional[int] = None,
-	) -> tp.Tuple[Array, Array, Array, Array]:
+	) -> tp.Tuple[Array, Array, Array, tp.Callable[[], Array]]:
+		if attention_mask is not None:
+			if attention_mask.dtype != jnp.bool:
+				warnings.warn("attention_mask should be a boolean array", stacklevel=1)
+				attention_mask = (attention_mask == 1).astype("b1")
 		if cache_view is None:
 			query_length = query.shape[1]
 			key_length = key.shape[1]
@@ -1927,12 +1948,14 @@ class FlaxAttentionModule(nn.Module):
 			if attention_mask.shape[-1] <= 1:
 				attention_mask = attention_mask[:, :, :, -sliding_windows:]
 
-		attention_bias = lax.select(
-			attention_mask > 0,
-			jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-			jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-		)
-		return key, value, attention_mask, attention_bias
+		def init_attention_bias():
+			return lax.select(
+				attention_mask > 0,
+				jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+				jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+			)
+
+		return key, value, attention_mask, init_attention_bias
 
 	def shard_attention_prod(self, attn_output: jax.Array) -> jax.Array:
 		"""

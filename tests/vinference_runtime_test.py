@@ -18,22 +18,19 @@ def main():
 	else:
 		sharding_axis_dims = (1, 1, 1, -1)
 
-	max_length = 8192
+	max_length = 16384
+	max_new_tokens = 4096
 
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
-	extra = {}
+
 	if jax.default_backend() == "gpu":
-		import torch
-
-		extra = {"torch_dtype": torch.float16}
-
 		dtype = jnp.float16
-		param_dtype = jnp.float8_e5m2
+		param_dtype = jnp.bfloat16
 		attn_kwargs = dict(
-			attn_dtype=jnp.bfloat16,
+			attn_dtype=jnp.float16,
+			attn_softmax_dtype=jnp.float32,
 			attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
 		)
-
 	else:
 		dtype = jnp.bfloat16
 		param_dtype = jnp.bfloat16
@@ -67,8 +64,8 @@ def main():
 		dtype=dtype,
 		partition_axis=partition_axis,
 		precision=jax.lax.Precision("fastest"),
-		**extra,
 	)
+
 	print("MODEL LOADED")
 
 	if os.environ.get("APPED_LORA_TEST", "false") in ["true", "yes"]:
@@ -79,7 +76,7 @@ def main():
 		model=model,
 		processor_class=tokenizer,
 		generation_config=ed.vInferenceConfig(
-			max_new_tokens=1024,
+			max_new_tokens=max_new_tokens,
 			temperature=0.0,
 			do_sample=False,
 			top_p=0.95,
@@ -92,7 +89,7 @@ def main():
 
 	print(model.model_task)
 	print(model.model_type)
-	inference.precompile(1, [6144])
+	inference.precompile(1, [max_length - max_new_tokens])
 
 	messages = [
 		{
@@ -101,15 +98,7 @@ def main():
 		},
 		{
 			"role": "user",
-			"content": "Can you provide ways to eat combinations of bananas and dragonfruits?",
-		},
-		{
-			"role": "assistant",
-			"content": "Sure! Here are some ways to eat bananas and dragonfruits together: 1. Banana and dragonfruit smoothie: Blend bananas and dragonfruits together with some milk and honey. 2. Banana and dragonfruit salad: Mix sliced bananas and dragonfruits together with some lemon juice and honey.",
-		},
-		{
-			"role": "user",
-			"content": "What about solving an 2x + 3 = 7 equation?",
+			"content": "Generate longest story that you can.",
 		},
 	]
 	ed.utils.helpers.get_logger(name=__name__).info("Applying Chat Template")
@@ -127,7 +116,7 @@ def main():
 		tokenizer.batch_decode(
 			response.sequences[..., response.padded_length :],
 			skip_special_tokens=True,
-		)
+		)[0]
 	)
 	print(response.tokens_pre_second)
 

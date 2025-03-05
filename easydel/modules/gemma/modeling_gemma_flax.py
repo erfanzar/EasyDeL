@@ -209,7 +209,7 @@ class GemmaAttention(FlaxAttentionModule):
 			key_states,
 			value_states,
 			attention_mask,
-			attention_bias,
+			init_attention_bias,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -224,7 +224,7 @@ class GemmaAttention(FlaxAttentionModule):
 			query_states=query_states,
 			key_states=key_states,
 			value_states=value_states,
-			bias=attention_bias,
+			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
 			causal=True,
 			dropout_rng=self.rngs.params(),
@@ -511,16 +511,19 @@ class GemmaModel(EasyDeLBaseModule):
 			input_ids.shape if input_ids is not None else inputs_embeds.shape[:2]
 		)
 		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, sequence_length), "i4")
+			attention_mask = jnp.ones((batch_size, sequence_length), "b1")
+		else:
+			if attention_mask.dtype != jnp.bool:
+				attention_mask = jnp.astype(attention_mask == 1, "b1")
 		if position_ids is None:
 			position_ids = jnp.broadcast_to(
 				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
 				(batch_size, sequence_length),
 			)
 		inputs_embeds = inputs_embeds * (self.config.hidden_size**0.5)
-		assert (
-			sequence_length <= self.config.max_position_embeddings
-		), f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+		assert sequence_length <= self.config.max_position_embeddings, (
+			f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
+		)
 		if attention_mask.ndim == 2:
 			attention_mask = jnp.expand_dims(attention_mask, (1, 2))
 
@@ -699,9 +702,9 @@ class GemmaForSequenceClassification(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		assert hasattr(
-			config, "num_labels"
-		), "in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
+		assert hasattr(config, "num_labels"), (
+			"in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
+		)
 		self.score = nn.Linear(
 			self.config.hidden_size,
 			config.num_labels,
