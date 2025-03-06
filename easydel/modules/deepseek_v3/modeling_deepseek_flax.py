@@ -15,7 +15,6 @@
 import functools
 import math
 import typing as tp
-import warnings
 from functools import partial
 
 import chex
@@ -360,10 +359,6 @@ class DeepseekV3MoE(nn.Module):
 			)
 
 	def __call__(self, hidden_states):
-		warnings.warn(
-			"DeepSeekv3's not fully checked yet, please open an issue.",
-			stacklevel=5,
-		)
 		identity = hidden_states
 		orig_shape = hidden_states.shape
 		topk_idx, topk_weight = self.gate(hidden_states)
@@ -382,21 +377,20 @@ class DeepseekV3MoE(nn.Module):
 	) -> jnp.ndarray:
 		"""
 		Args:
-		        x: Input tensor of shape [batch_size, hidden_dim]
-		        topk_ids: Tensor of expert assignments [batch_size, top_k]
-		        topk_weight: Tensor of expert weights [batch_size, top_k]
+			x: Input tensor of shape [batch_size, hidden_dim]
+			topk_ids: Tensor of expert assignments [batch_size, top_k]
+			topk_weight: Tensor of expert weights [batch_size, top_k]
 		Returns:
-		        Output tensor of shape [batch_size, hidden_dim]
+			Output tensor of shape [batch_size, hidden_dim]
 		"""
 		final_hidden_state = jnp.zeros_like(x)
-
-		for index in range(len(self.experts)):
-			expert_output = self.experts[index](x)
-			expert_mask = jnp.sum(jnp.multiply(topk_ids == index, topk_weight), axis=-1)[
-				:, None
-			]
-			final_hidden_state += expert_mask * expert_output
-
+		for expert_idx, expert in enumerate(self.experts):
+			expert_mask = jnp.sum(
+				jnp.multiply(topk_ids == expert_idx, topk_weight),
+				axis=-1,
+				keepdims=True,
+			)
+			final_hidden_state = final_hidden_state + (expert_mask * expert(x))
 		return final_hidden_state
 
 
@@ -494,7 +488,7 @@ class DeepseekV3Attention(FlaxAttentionModule):
 			scaling_factor = self.config.rope_scaling["factor"]
 			if mscale_all_dim:
 				mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
-				softmax_scale = self.softmax_scale * mscale * mscale
+				softmax_scale = softmax_scale * mscale * mscale
 		self.attention_performer = FlexibleAttentionModule(
 			num_q_heads=self.config.num_attention_heads,
 			num_kv_heads=self.config.num_attention_heads,
