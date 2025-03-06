@@ -27,23 +27,26 @@ def safe_autotune(
 		from triton.runtime.autotuner import Autotuner
 
 		def decorator(fn):
-			return Autotuner(
-				fn,
-				fn.arg_names,
-				configs,
-				key,
-				reset_to_zero,
-				restore_value,
-				pre_hook=pre_hook,
-				post_hook=post_hook,
-				prune_configs_by=prune_configs_by,
-				warmup=warmup,
-				rep=rep,
-				use_cuda_graph=use_cuda_graph,
-			)
+			try:
+				return Autotuner(
+					fn,
+					fn.arg_names,
+					configs,
+					key,
+					reset_to_zero,
+					restore_value,
+					pre_hook=pre_hook,
+					post_hook=post_hook,
+					prune_configs_by=prune_configs_by,
+					warmup=warmup,
+					rep=rep,
+					use_cuda_graph=use_cuda_graph,
+				)
+			except Exception:
+				return fn
 
 		return decorator
-	except Exception as err:
+	except (Exception, RuntimeError) as err:
 		print(f"Couldn't autotune given function due to {err}")
 
 		def decorator(fn):
