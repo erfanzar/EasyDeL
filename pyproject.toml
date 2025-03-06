@@ -33,8 +33,8 @@ classifiers = [
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.14"
-jax = ">=0.4.36"
-jaxlib = ">=0.4.36"
+jax = ">=0.5.0"
+jaxlib = ">=0.5.0"
 eformer = "0.0.16"
 einops = "~0.8.0"
 transformers = ">=4.47.0"
@@ -49,7 +49,7 @@ wandb = ">=0.18.5"
 uvloop = "0.21.0"
 uvicorn = "^0.32.0"
 jinja2 = ">=3.1.5"
-datasets = ">=3.2.0"
+datasets = ">=3.3.2"
 
 
 tensorflow-datasets = { version = ">=4.9.6", optional = true }

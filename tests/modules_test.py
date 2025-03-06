@@ -183,7 +183,7 @@ class EasyModelsTest(unittest.TestCase):
 					attention_mask=jnp.ones_like(ids, dtype=jnp.bool),
 				)
 
-			# ed_output = jited(jax_input_ids)
+			ed_output = jited(jax_input_ids)
 			easy_time = time.time()
 			ed_output, metrics = jited(jax_input_ids)
 			easy_time = time.time() - easy_time
@@ -616,6 +616,57 @@ class EasyModelsTest(unittest.TestCase):
 	def test_deepseek_v3(self):
 		self.header_config = None
 		hf_model, conf = self.get_hf_model_from_hub("deepseek-ai/DeepSeek-V3")
+		self.header_config = ed.DeepseekV3Config(
+			**{
+				"aux_loss_alpha": 0.001,
+				"bos_token_id": 0,
+				"eos_token_id": 1,
+				"ep_size": 1,
+				"first_k_dense_replace": 3,
+				"hidden_act": "silu",
+				"hidden_size": 128,
+				"initializer_range": 0.02,
+				"intermediate_size": 256,
+				"kv_lora_rank": 512,
+				"max_position_embeddings": 1024,
+				"moe_intermediate_size": 128,
+				"moe_layer_freq": 1,
+				"n_group": 8,
+				"n_routed_experts": 32,
+				"n_shared_experts": 1,
+				"norm_topk_prob": True,
+				"num_attention_heads": 128,
+				"num_experts_per_tok": 8,
+				"num_hidden_layers": 4,
+				"num_key_value_heads": 128,
+				"num_nextn_predict_layers": 1,
+				"pretraining_tp": 1,
+				"q_lora_rank": 1536,
+				"qk_nope_head_dim": 128,
+				"qk_rope_head_dim": 64,
+				"rms_norm_eps": 1e-06,
+				"rope_scaling": {
+					"beta_fast": 32,
+					"beta_slow": 1,
+					"factor": 40,
+					"mscale": 1.0,
+					"mscale_all_dim": 1.0,
+					"original_max_position_embeddings": 4096,
+					"type": "yarn",
+				},
+				"rope_theta": 10000,
+				"routed_scaling_factor": 2.5,
+				"scoring_func": "sigmoid",
+				"seq_aux": True,
+				"tie_word_embeddings": False,
+				"topk_group": 4,
+				"topk_method": "noaux_tc",
+				"transformers_version": "4.33.1",
+				"use_cache": True,
+				"v_head_dim": 128,
+				"vocab_size": 129280,
+			}
+		)
 		res, err = self.create_test_for_models(
 			"deepseek_v3",
 			hf_model,
@@ -839,7 +890,7 @@ if __name__ == "__main__":
 	# test.test_cohere()  # Passed
 	# test.test_dbrx()  # Passed
 	# test.test_deepseek_v2()  # Passed
-	# test.test_deepseek_v3()  # Failed
+	test.test_deepseek_v3()  # Passed
 	# test.test_exaone()  # Passed
 	# test.test_falcon()  # Passed
 	# test.test_gemma()  # Passed
@@ -859,9 +910,9 @@ if __name__ == "__main__":
 	# test.test_olmo2()  # Passed
 	# test.test_openelm()  # Passed
 	# test.test_phi()  # Passed
-	test.test_phi3()  # Passed
+	# test.test_phi3()  # Passed
 	# test.test_phimoe()  # Failed v0.0.80 - N  Runtime
-	test.test_qwen2()  # Passed
-	test.test_qwen2_moe()  # Passed
-	test.test_stablelm()  # Passed
+	# test.test_qwen2()  # Passed
+	# test.test_qwen2_moe()  # Passed
+	# test.test_stablelm()  # Passed
 	# -----------------------------------------------
