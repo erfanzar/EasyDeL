@@ -59,11 +59,11 @@ def main():
 			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 			**attn_kwargs,
 		),
-		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+		quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
 		param_dtype=param_dtype,
 		dtype=dtype,
 		partition_axis=partition_axis,
-		precision=jax.lax.Precision("fastest"),
+		precision=jax.lax.Precision.DEFAULT,
 	)
 
 	print("MODEL LOADED")
@@ -98,7 +98,7 @@ def main():
 		},
 		{
 			"role": "user",
-			"content": "Generate longest story that you can.",
+			"content": "write 10 lines story about why you love EasyDeL",
 		},
 	]
 	ed.utils.helpers.get_logger(name=__name__).info("Applying Chat Template")

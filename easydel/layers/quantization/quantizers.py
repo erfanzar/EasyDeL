@@ -50,7 +50,7 @@ class EasyQuantizer:
 		self.quantization_method = quantization_method
 		self.quantization_platform = quantization_platform
 		if quantization_pattern is None:
-			quantization_pattern = r".*embedding$"
+			quantization_pattern = r".*(?:embedding|layernorm|norm)$"
 		self.quantization_pattern = quantization_pattern
 
 	def __call__(
