@@ -788,6 +788,7 @@ def ForCausalLMLoss(
 				paxis.sequence_axis,
 			),
 		)
+	shift_attn_m = attention_mask
 	if config is None:
 		config = LossConfig()
 	if config.shift_tokens:
