@@ -1856,23 +1856,14 @@ class FlaxAttentionModule(nn.Module):
 
 		slice_indices = (0, end_index % cache_view.value.shape[1], 0, 0)
 
-		value_cache = cache_view.value
-		key_cache = cache_view.key
-		try:
-			value_cache = value_cache.materialize()
-			key_cache = key_cache.materialize()
-		except Exception:
-			...
-		org_cache_dtype = key_cache.dtype
-
 		value_cache = lax.dynamic_update_slice(
-			value_cache.astype(value),
-			value,
+			cache_view.value,
+			value.astype(cache_view.value.dtype),
 			slice_indices,
 		)
 		key_cache = lax.dynamic_update_slice(
-			key_cache.astype(key),
-			key,
+			cache_view.key,
+			key.astype(cache_view.key.dtype),
 			slice_indices,
 		)
 		pad_mask = jnp.broadcast_to(
@@ -1882,18 +1873,17 @@ class FlaxAttentionModule(nn.Module):
 		attention_mask = jnp.logical_and(pad_mask, attention_mask)
 		cache_view.key = self.quantizer(
 			with_sharding_constraint(
-				arr=key_cache.astype(org_cache_dtype),
+				arr=key_cache,
 				sharding=self.get_sharding_safely(cache_view.key),
 			)
 		)
 		cache_view.value = self.quantizer(
 			with_sharding_constraint(
-				arr=value_cache.astype(org_cache_dtype),
+				arr=value_cache,
 				sharding=self.get_sharding_safely(cache_view.value),
 			)
 		)
 		cache_view.index = cache_view.index + num_updated_cache_vectors
-
 		return key_cache, value_cache, attention_mask
 
 	def concatenate(
