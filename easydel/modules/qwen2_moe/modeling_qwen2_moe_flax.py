@@ -163,7 +163,7 @@ class Qwen2MoeAttention(FlaxAttentionModule):
 			scan_ring_attention=self.config.scan_ring_attention,
 			mesh=self.config.mesh,
 			sm_scale=1 / math.sqrt(self.head_dim),
-			axis_name=self.config.attention_axis_name,
+			axis_name=self.config.sequence_axis_name,
 			base_config=self.config,
 		)
 		self.resid_dropout = nn.Dropout(rate=config.attention_dropout, rngs=rngs)

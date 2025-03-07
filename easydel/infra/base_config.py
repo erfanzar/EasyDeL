@@ -121,7 +121,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
 	scan_attention_layers: bool
 	use_scan_mlp: bool
 	scan_mlp_chunk_size: int
-	attention_axis_name: str
+	sequence_axis_name: str
 	gradient_checkpointing: EasyDeLGradientCheckPointers
 	kv_cache_quantization_method: EasyDeLQuantizationMethods
 	kv_cache_quantization_blocksize: int
@@ -161,7 +161,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 	  scan_attention_layers (bool): Whether to scan attention layers. Default is False.
 	  use_scan_mlp (bool): Whether to use scan MLP. Default is False.
 	  scan_mlp_chunk_size (int): Chunk size for scan MLP. Default is 1024.
-	  attention_axis_name (str): Name of the attention axis. Default is "sp".
+	  sequence_axis_name (str): Name of the attention axis. Default is "sp".
 	  gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing method. Default is EasyDeLGradientCheckPointers.NONE.
 	  kv_cache_quantization_method (EasyDeLQuantizationMethods): Key-value cache quantization method. Default is EasyDeLQuantizationMethods.NONE.
 	  kv_cache_quantization_blocksize (int): Block size for key-value cache quantization. Default is 64.
@@ -206,7 +206,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		scan_attention_layers: bool = False,
 		use_scan_mlp: bool = False,
 		scan_mlp_chunk_size: int = 1024,
-		attention_axis_name: str = "sp",
+		sequence_axis_name: str = "sp",
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		kv_cache_quantization_method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.NONE,
 		kv_cache_quantization_blocksize: int = 64,
@@ -256,7 +256,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		self.use_scan_mlp = getattr(self, "use_scan_mlp", use_scan_mlp)
 		self.scan_mlp_chunk_size = getattr(self, "scan_mlp_chunk_size", scan_mlp_chunk_size)
 		self.use_sharding_constraint = getattr(self,"use_sharding_constraint", use_sharding_constraint)
-		self.attention_axis_name = getattr(self, "attention_axis_name", attention_axis_name)
+		self.sequence_axis_name = getattr(self, "sequence_axis_name", sequence_axis_name)
 		self.kv_cache_sharding_sequence_axis_name = getattr(self,"kv_cache_sharding_sequence_axis_name", kv_cache_sharding_sequence_axis_name)
 		self.gradient_checkpointing = getattr(self,"gradient_checkpointing", gradient_checkpointing)
 		self.kv_cache_quantization_method = getattr(self,"kv_cache_quantization_method", kv_cache_quantization_method)
@@ -443,7 +443,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		use_sharding_constraint: bool = ...,
 		use_scan_mlp: bool = ...,
 		scan_mlp_chunk_size: int = ...,
-		attention_axis_name: str = ...,
+		sequence_axis_name: str = ...,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = ...,
 		kv_cache_quantization_method: EasyDeLQuantizationMethods = ...,
 		kv_cache_quantization_blocksize: int = ...,
@@ -481,7 +481,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		    use_sharding_constraint (bool, optional): whether to use sharding constraint for the arrays. Defaults to False.
 		    use_scan_mlp (bool, optional): Determine whether to use scan_mlp or not. Defaults to False.
 		    scan_mlp_chunk_size (int, optional): Size of chunks in scan MLP. Defaults to 1024.
-		    attention_axis_name (str, optional): Name of the attention axis name. Defaults to "sp".
+		    sequence_axis_name (str, optional): Name of the attention axis name. Defaults to "sp".
 		    gradient_checkpointing (EasyDeLQuantizationMethods, optional): Gradient Checkpointing method for created or loaded module (applied on mlp and attn layers most of the times).
 		    kv_cache_quantization_method (EasyDeLQuantizationMethods, optional): key and value quantization type. Defaults to EasyDeLQuantizationMethods.NONE.
 		    kv_cache_quantization_blocksize (int, optional): size of kv cache quantization. Defaults to 64.
@@ -520,7 +520,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		set_attrs_smartly(self, "scan_ring_attention", True, scan_ring_attention)
 		set_attrs_smartly(self, "use_scan_mlp", False, use_scan_mlp)
 		set_attrs_smartly(self, "scan_mlp_chunk_size", 1024, scan_mlp_chunk_size)
-		set_attrs_smartly(self, "attention_axis_name", "sp", attention_axis_name)
+		set_attrs_smartly(self, "sequence_axis_name", "sp", sequence_axis_name)
 		set_attrs_smartly(self, "kv_cache_quantization_blocksize", 128, kv_cache_quantization_blocksize)
 		set_attrs_smartly(self, "kv_cache_sharding_sequence_axis_name",	"sp", kv_cache_sharding_sequence_axis_name)
 		set_attrs_smartly(self, "gradient_checkpointing", EasyDeLGradientCheckPointers.NONE, gradient_checkpointing)

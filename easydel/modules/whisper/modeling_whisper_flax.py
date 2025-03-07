@@ -153,7 +153,7 @@ class WhisperAttention(FlaxAttentionModule):
 			scan_ring_attention=self.config.scan_ring_attention,
 			mesh=self.config.mesh,
 			sm_scale=1 / math.sqrt(self.head_dim),
-			axis_name=self.config.attention_axis_name,
+			axis_name=self.config.sequence_axis_name,
 			backward_pass_impl=self.config.flash_attention_backward_pass_impl,
 		)
 
@@ -1102,7 +1102,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 		encoder_hidden_states = encoder_outputs[0]
 		if decoder_attention_mask is not None:
 			decoder_attention_mask = decoder_attention_mask.astype("b1")
-			
+
 		outputs = self.model.decode(
 			encoder_hidden_states=encoder_hidden_states,
 			decoder_attention_mask=decoder_attention_mask,
