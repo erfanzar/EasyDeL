@@ -130,6 +130,28 @@ class VanillaAttn(AttentionImpl):
 	def forward_rocm(self, *args, **kwargs) -> AttentionOutput:
 		return self.forward_native(*args, **kwargs)
 
+	def __call__(
+		self,
+		q: Array,
+		k: Array,
+		v: Array,
+		mask: tp.Optional[Array] = None,
+		bias: tp.Optional[Array] = None,
+		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
+		deterministic: bool = False,
+		dropout_rng: tp.Optional[jax.random.PRNGKey] = None,
+	) -> AttentionOutput:
+		return super().__call__(
+			q=q,
+			k=k,
+			v=v,
+			mask=mask,
+			bias=bias,
+			init_bias=init_bias,
+			deterministic=deterministic,
+			dropout_rng=dropout_rng,
+		)
+
 
 if __name__ == "__main__":
 	from easydel.infra import EasyDeLBaseConfig

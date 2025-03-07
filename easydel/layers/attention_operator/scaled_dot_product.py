@@ -153,6 +153,26 @@ class ScaledDotProductAttn(AttentionImpl):
 	def forward_rocm(self, *args, **kwargs) -> AttentionOutput:
 		return self.forward_native(*args, **kwargs)
 
+	def __call__(
+		self,
+		q: Array,
+		k: Array,
+		v: Array,
+		mask: tp.Optional[Array] = None,
+		bias: tp.Optional[Array] = None,
+		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
+		causal: bool = False,
+	) -> AttentionOutput:
+		return super().__call__(
+			q=q,
+			k=k,
+			v=v,
+			mask=mask,
+			bias=bias,
+			init_bias=init_bias,
+			causal=causal,
+		)
+
 
 if __name__ == "__main__":
 	from easydel.infra import EasyDeLBaseConfig
