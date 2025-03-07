@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 
+import einops
 import jax
 from eformer.escale import PartitionAxis
 from jax import Array
@@ -178,6 +179,70 @@ class AttentionImpl(ABC):
 
 	def current_backend(self) -> tp.Literal["tpu", "gpu", "cpu"]:
 		return jax.default_backend()
+
+	@staticmethod
+	def _split_attention_mask(attn_mask: Array) -> tp.Tuple[Array, Array]:
+		"""
+		Takes an attention mask and splits it into query mask and key-value mask.
+		"""
+		if attn_mask.ndim == 4:
+			attn_mask = attn_mask[:, -1, :, :]
+		return (
+			jnp.any(attn_mask, axis=-1),
+			jnp.any(attn_mask, axis=-2),
+		)
+
+	@staticmethod
+	def _combine_query_kv_masks(q_mask: Array, kv_mask: Array) -> Array:
+		"""
+		Takes separate query and key-value masks and combines them into an attention mask.
+		"""
+		if kv_mask.ndim == 2:
+			kv_mask = kv_mask[:, None, :]
+		if q_mask.ndim == 2:
+			q_mask = q_mask[:, :, None]
+		return q_mask * kv_mask
+
+	@staticmethod
+	def _create_causal_mask(qseq) -> Array:
+		return jnp.tril(jnp.ones((qseq, qseq), dtype="b1"))
+
+	@staticmethod
+	def repeat_kv_heads(
+		k: Array,
+		v: Array,
+		num_reps: int,
+	) -> tp.Tuple[Array, Array]:
+		"""Repeats k and v heads to match q heads."""
+		return (
+			einops.repeat(k, "b s h d -> b s (h r) d", r=num_reps),
+			einops.repeat(v, "b s h d -> b s (h r) d", r=num_reps),
+		)
+
+	def _handle_kvhead(
+		self,
+		array: Array,
+		num_q_heads: int,
+		num_kv_heads: int,
+	) -> tp.Optional[Array]:
+		"""Processes attention bias based on head configuration."""
+		if array is None:
+			return None
+
+		if array.shape[1] == num_q_heads or array.shape[1] == 1:
+			return array
+
+		elif array.shape[1] == num_kv_heads:
+			return einops.repeat(
+				array,
+				"b h q k -> b (h r) q k",
+				r=num_q_heads // array.shape[1],
+			)
+		else:
+			raise ValueError(
+				f"Incompatible array shape. Got {array.shape[1]} heads, "
+				f"expected {num_q_heads}, {num_kv_heads}, or 1"
+			)
 
 	def create_stable_sharding(
 		self,
