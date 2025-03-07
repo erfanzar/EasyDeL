@@ -211,7 +211,7 @@ class CLIPAttention(FlaxAttentionModule):
 			softmax_dtype=config.attn_softmax_dtype,
 			mesh=config.mesh,
 			sm_scale=self.head_dim**-0.5,
-			axis_name=config.attention_axis_name,
+			axis_name=config.sequence_axis_name,
 			base_config=config,
 		)
 

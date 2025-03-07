@@ -159,7 +159,7 @@ class ExaoneAttentionInner(FlaxAttentionModule):
 			attn_mechanism=self.config.attn_mechanism,
 			mesh=self.config.mesh,
 			sm_scale=1 / math.sqrt(self.head_dim),
-			axis_name=self.config.attention_axis_name,
+			axis_name=self.config.sequence_axis_name,
 			base_config=self.config,
 		)
 

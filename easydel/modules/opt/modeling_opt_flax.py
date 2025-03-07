@@ -114,7 +114,7 @@ class OPTAttention(FlaxAttentionModule):
 			dtype=config.attn_dtype,
 			mesh=config.mesh,
 			sm_scale=1 / math.sqrt(self.head_dim),
-			axis_name=config.attention_axis_name,
+			axis_name=config.sequence_axis_name,
 			base_config=config,
 		)
 

@@ -174,7 +174,7 @@ class FalconAttention(FlaxAttentionModule):
 			softmax_dtype=self.config.attn_softmax_dtype,
 			mesh=config.mesh,
 			sm_scale=self.inv_norm_factor,
-			axis_name=config.attention_axis_name,
+			axis_name=config.sequence_axis_name,
 			base_config=config,
 			_do_check=False,
 		)

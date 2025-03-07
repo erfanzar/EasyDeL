@@ -509,7 +509,7 @@ class FlaxDeepseekV2Attention(FlaxAttentionModule):
 			attn_mechanism="vanilla",
 			mesh=self.config.mesh,
 			sm_scale=softmax_scale,
-			axis_name=self.config.attention_axis_name,
+			axis_name=self.config.sequence_axis_name,
 			base_config=self.config,
 			_do_check=False,
 		)

@@ -129,7 +129,7 @@ class GemmaAttention(FlaxAttentionModule):
 			force_float32_tpu=True,
 			attn_mechanism=self.config.attn_mechanism,
 			sm_scale=self.head_dim**-0.5,
-			axis_name=self.config.attention_axis_name,
+			axis_name=self.config.sequence_axis_name,
 			base_config=self.config,
 			mesh=self.config.mesh,
 		)
