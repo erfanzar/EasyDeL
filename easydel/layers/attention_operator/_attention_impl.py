@@ -1,3 +1,17 @@
+# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import dataclasses
 import typing as tp
 from abc import ABC, abstractmethod
@@ -15,7 +29,7 @@ from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
 from easydel.utils.helpers import get_logger
 
-logger = get_logger("EasyDeL-AttentionOperator", "DEBUG")
+logger = get_logger("EasyDeL-AttentionOperator")
 
 
 @dataclass
@@ -70,12 +84,43 @@ class AttentionMetadata:
 			)
 			self.mesh = mesh
 		self._safety_check()
+		if self.backend is None:
+			current_backend = jax.default_backend()
+			self.backend = getattr(
+				EasyDeLBackends,
+				current_backend,
+				getattr(EasyDeLBackends, current_backend.upper()),
+			)
 
 	def _safety_check(self):
 		for field in dataclasses.fields(self):
 			val = getattr(self, field.name)
 			if val == Ellipsis:
 				raise ValueError(f"`{field.name}` shouldn't be ellipsis")
+
+	@classmethod
+	def from_config(
+		cls,
+		config: EasyDeLBaseConfig,
+		softmax_scale: float,
+		dropout_prob: float = 0.0,
+	):
+		return cls(
+			runtime_dtype=config.attn_dtype,
+			runtime_softmax_dtype=config.attn_softmax_dtype,
+			sequence_axis_name=config.sequence_axis_name,
+			mesh=config.mesh,
+			platform=config.platform,
+			backend=config.backend,
+			partition_axis=config.partition_axis,
+			base_config=config,
+			scan_ring_attention=config.scan_attention_layers,
+			softmax_scale=softmax_scale,
+			dropout_prob=dropout_prob,
+			blocksize_q=config.blocksize_q,
+			blocksize_k=config.blocksize_k,
+			blocksize_b=config.blocksize_b,
+		)
 
 	def get_partition_specs(self, mode: RuntimeType, BTHD: bool = True):
 		assert mode in RuntimeType, f"mode should be in `RuntimeType` but we got {mode}"
@@ -168,8 +213,9 @@ class AttentionImpl(ABC):
 	@abstractmethod
 	def forward_cuda(self, *args, **kwargs) -> AttentionOutput: ...
 
+	@classmethod
 	@abstractmethod
-	def get_impl_name(self) -> str: ...
+	def get_impl_name(cls) -> tp.Union[str, tp.Tuple[str]]: ...
 	@abstractmethod
 	def get_impl_metadata(self) -> AttentionMetadata: ...
 
@@ -279,3 +325,53 @@ class AttentionImpl(ABC):
 				return self.forward_native(*args, **kwargs)
 			case _:
 				raise RuntimeError(f"unknown backend at AttentionImpl! {self.metadata.backend}")
+
+
+class AttentionRegistry:
+	"""Registry for attention implementations."""
+
+	_registry: tp.Dict[str, tp.Type[AttentionImpl]] = {}
+
+	@classmethod
+	def register(cls, impl_cls: tp.Type[AttentionImpl]) -> tp.Type[AttentionImpl]:
+		"""
+		Decorator to register an attention implementation.
+
+		Example usage:
+
+		@AttentionRegistry.register
+		class CustomAttention(AttentionImpl):
+		    ...
+		"""
+		impl_names = impl_cls.get_impl_name()
+		if not isinstance(impl_names, (list, tuple)):
+			impl_names = [impl_names]
+
+		for impl_name in impl_names:
+			if impl_name in cls._registry:
+				logger.warning(
+					f"Attention implementation '{impl_name}' already registered. Overwriting."
+				)
+			cls._registry[impl_name] = impl_cls
+			logger.debug(f"Registered attention implementation: {impl_name}")
+		return impl_cls
+
+	@classmethod
+	def get(cls, impl_name: str) -> tp.Type[AttentionImpl]:
+		"""Get an attention implementation by name."""
+		if impl_name not in cls._registry:
+			raise ValueError(
+				f"Attention implementation '{impl_name}' not found. Available implementations: {list(cls._registry.keys())}"
+			)
+		return cls._registry[impl_name]
+
+	@classmethod
+	def create(cls, impl_name: str, metadata: AttentionMetadata) -> AttentionImpl:
+		"""Create an instance of an attention implementation by name."""
+		impl_cls = cls.get(impl_name)
+		return impl_cls(metadata)
+
+	@classmethod
+	def list_implementations(cls) -> tp.List[str]:
+		"""List all registered attention implementations."""
+		return list(cls._registry.keys())

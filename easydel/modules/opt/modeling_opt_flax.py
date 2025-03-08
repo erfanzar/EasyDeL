@@ -30,7 +30,6 @@
 # THIS SCRIPT IS EDITED FROM ORIGINAL IMPLEMENTATION OF TRANSFORMERS OPT
 """Flax OPT model."""
 
-import math
 import typing as tp
 from functools import partial
 
@@ -104,7 +103,7 @@ class OPTAttention(FlaxAttentionModule):
 
 		self.dropout_layer = nn.Dropout(rate=self.dropout, rngs=rngs)
 		self.attention_module: FlexibleAttentionModule = FlexibleAttentionModule(
-			attention_dropout=config.attention_dropout,
+			dropout_prob=config.attention_dropout,
 			num_q_heads=config.num_attention_heads,
 			num_kv_heads=config.num_attention_heads,
 			head_dims=self.head_dim,
@@ -113,7 +112,7 @@ class OPTAttention(FlaxAttentionModule):
 			attn_mechanism=config.attn_mechanism,
 			dtype=config.attn_dtype,
 			mesh=config.mesh,
-			sm_scale=1 / math.sqrt(self.head_dim),
+			softmax_scale=self.head_dim**-0.5,
 			axis_name=config.sequence_axis_name,
 			base_config=config,
 		)

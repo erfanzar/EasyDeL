@@ -114,18 +114,9 @@ class Xerxes2Attention(FlaxAttentionModule):
 		)
 
 		self.attention_performer = FlexibleAttentionModule(
-			num_q_heads=self.config.num_attention_heads,
-			num_kv_heads=self.config.num_attention_heads,
-			attention_dropout=0.0,
-			head_dims=self.qhead_dim,
-			precision=self.precision,
-			force_float32_tpu=True,
-			attn_mechanism="vanilla",
-			mesh=self.config.mesh,
-			sm_scale=self.qhead_dim**-0.5,
-			axis_name=self.config.sequence_axis_name,
-			base_config=self.config,
-			_do_check=False,
+			base_config=config,
+			softmax_scale=self.qhead_dim**-0.5,
+			dropout_prob=0.0,
 		)
 		self.rotary = self.config.get_basic_rope(
 			self.dtype,
@@ -220,19 +211,16 @@ class Xerxes2Attention(FlaxAttentionModule):
 			causal_mask=causal_mask,
 		)
 
-		attentions = self.attention_performer(
+		attentions = self.attention_performer.forward(
 			query_states=query_states,
 			key_states=key_states,
 			value_states=value_states,
+			bias=None,
 			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
+			segment_ids=segment_ids,
 			causal=True,
 			dropout_rng=self.rngs.params(),
-			query_sequence_length=query_states.shape[1],
-			key_value_sequence_length=key_states.shape[1],
-			uses_cache=cache_view is not None,
-			segment_ids=segment_ids,
-			causal_mask=causal_mask,
 		)
 
 		attn_output = self.o_proj(

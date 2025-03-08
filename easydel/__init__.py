@@ -126,9 +126,10 @@ from .infra.factory import (
 	register_module,
 )
 from .layers.attention import (
-	AttentionBenchmarker,
-	AttentionMechanisms,
 	FlexibleAttentionModule,
+	AttentionMechanisms,
+	AttentionMetadata,
+	AttentionRegistry,
 )
 from .modules.arctic import (
 	ArcticConfig,
@@ -359,8 +360,8 @@ from .trainers import (
 	BaseTrainer,
 	DPOConfig,
 	DPOTrainer,
-	GRPOTrainer,
 	GRPOConfig,
+	GRPOTrainer,
 	JaxDistributedConfig,
 	ORPOConfig,
 	ORPOTrainer,
@@ -379,7 +380,7 @@ from .utils.parameters_transformation import (
 	torch_dict_to_easydel_params,
 )
 
-_targeted_versions = ["0.0.17"]
+_targeted_versions = ["0.0.17", "0.0.18"]
 
 from eformer import __version__ as _eform_version
 from eformer import escale

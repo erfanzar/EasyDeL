@@ -12,25 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ._attention_impl import (
-	AttentionImpl,
-	AttentionMetadata,
-	AttentionOutput,
-	AttentionRegistry,
-)
-from .modules import (
-	FlashAttn,
-	RingAttn,
-	ScaledDotProductAttn,
-	SplashAttn,
-	VanillaAttn,
-)
+from .flash import FlashAttn
+from .ring import RingAttn
+from .scaled_dot_product import ScaledDotProductAttn
+from .splash import SplashAttn
+from .vanilla import VanillaAttn
 
 __all__ = (
-	"AttentionImpl",
-	"AttentionMetadata",
-	"AttentionOutput",
-	"AttentionRegistry",
 	"FlashAttn",
 	"RingAttn",
 	"ScaledDotProductAttn",

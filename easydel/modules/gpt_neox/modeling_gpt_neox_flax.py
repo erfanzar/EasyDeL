@@ -78,22 +78,9 @@ class GPTNeoXAttention(FlaxAttentionModule):
 			rngs=rngs,
 		)
 		self.attention_performer = FlexibleAttentionModule(
-			use_sharding_constraint=self.config.use_sharding_constraint,
-			num_q_heads=self.config.num_attention_heads,
-			num_kv_heads=self.config.num_attention_heads,
-			attention_dropout=self.config.attention_dropout,
-			head_dims=self.head_dim,
-			shard_attention_computation=self.config.shard_attention_computation,
-			precision=self.precision,
-			force_float32_tpu=True,
-			attn_mechanism=self.config.attn_mechanism,
-			dtype=self.config.attn_dtype,
-			softmax_dtype=self.config.attn_softmax_dtype,
-			partition_axis=self.config.partition_axis,
-			scan_ring_attention=self.config.scan_ring_attention,
-			mesh=self.config.mesh,
-			sm_scale=self.head_dim**-0.5,
-			base_config=self.config,
+			base_config=config,
+			softmax_scale=self.head_dim**-0.5, 
+			dropout_prob=config.attention_dropout,
 		)
 
 	def _split_heads(self, hidden_states):
@@ -142,20 +129,19 @@ class GPTNeoXAttention(FlaxAttentionModule):
 			causal_mask=causal_mask,
 			fcm_mask=None,
 		)
-		attentions = self.attention_performer(
+
+		attentions = self.attention_performer.forward(
 			query_states=query,
 			key_states=key,
 			value_states=value,
+			bias=None,
 			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
+			segment_ids=segment_ids,
 			causal=True,
 			dropout_rng=self.rngs.params(),
-			query_sequence_length=query.shape[1],
-			key_value_sequence_length=key.shape[1],
-			uses_cache=cache_view is not None,
-			segment_ids=segment_ids,
-			causal_mask=causal_mask,
 		)
+
 		attn_output = self.shard_attention_prod(
 			self._merge_heads(attentions.attention_outputs)
 		)

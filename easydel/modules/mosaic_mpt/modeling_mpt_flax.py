@@ -138,19 +138,9 @@ class MptAttention(FlaxAttentionModule):
 			self.softmax_scale = 1 / math.sqrt(self.hidden_size / self.n_heads)
 
 		self.attention_performer = FlexibleAttentionModule(
-			attention_dropout=self.config.attn_config.attn_pdrop,
-			num_q_heads=self.config.n_heads,
-			num_kv_heads=self.config.n_heads,
-			head_dims=self.head_dim,
-			precision=self.precision,
-			force_float32_tpu=True,
-			attn_mechanism=self.config.attn_mechanism,
-			dtype=self.config.attn_dtype,
-			softmax_dtype=self.config.attn_softmax_dtype,
-			mesh=self.config.mesh,
-			sm_scale=1 / math.sqrt(self.head_dim),
-			axis_name=self.config.sequence_axis_name,
-			base_config=self.config,
+			dropout_prob=self.config.attn_config.attn_pdrop,
+			base_config=config,
+			softmax_scale=self.head_dim**-0.5,
 		)
 
 	def __call__(
@@ -215,19 +205,14 @@ class MptAttention(FlaxAttentionModule):
 			jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
 		)
 
-		attention = self.attention_performer(
+		attention = self.attention_performer.forward(
 			query_states=query_states,
 			key_states=key_states,
 			value_states=value_states,
 			bias=attention_bias,
 			init_bias=lambda: attention_bias,
-			causal_mask=causal_mask,
 			attention_mask=None,
-			deterministic=self.dropout.deterministic,
 			segment_ids=segment_ids,
-			query_sequence_length=query_states.shape[1],
-			key_value_sequence_length=key_states.shape[1],
-			uses_cache=cache_view is not None,
 			causal=False,
 		)
 

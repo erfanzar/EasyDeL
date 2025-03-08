@@ -479,18 +479,9 @@ class VisionAttention(FlaxAttentionModule):
 			rngs=rngs,
 		)
 		self.attention_performer = FlexibleAttentionModule(
-			attention_dropout=0,
-			num_q_heads=num_heads,
-			num_kv_heads=num_heads,
-			head_dims=self.head_dim,
-			precision=precision,
-			force_float32_tpu=True,
-			attn_mechanism=config.attn_mechanism,
-			dtype=config.attn_dtype,
-			mesh=config.mesh,
-			sm_scale=1 / math.sqrt(self.head_dim),
-			axis_name=config.sequence_axis_name,
 			base_config=config,
+			softmax_scale=self.head_dim**-0.5,
+			dropout_prob=0.0,
 		)
 
 	def __call__(
@@ -537,25 +528,7 @@ class VisionAttention(FlaxAttentionModule):
 		)
 		combined_mask = jnp.any(is_valid, axis=0)
 		attention_mask = jnp.where(combined_mask, 0.0, jnp.finfo(q.dtype).min)
-		# attention_mask = jnp.expand_dims(attention_mask, 0)
-		# attn_output = self.attention_performer(
-		# 	query_states=q,
-		# 	key_states=k,
-		# 	value_states=v,
-		# 	bias=attention_mask,
-		# 	attention_mask=None,
-		# 	causal=True,
-		# 	dropout_rng=self.rngs.params(),
-		# 	query_sequence_length=q.shape[1],
-		# 	key_value_sequence_length=k.shape[1],
-		# 	uses_cache=None,
-		# 	segment_ids=None,
-		# 	causal_mask=None,
-		# )
-		# attn_output = self.proj(
-		# 	attn_output.attention_outputs.reshape(seq_length, -1),
-		# )
-		# return attn_output
+
 		q = q.swapaxes(0, 1)
 		k = k.swapaxes(0, 1)
 		v = v.swapaxes(0, 1)
@@ -744,19 +717,9 @@ class Qwen2VLAttention(FlaxAttentionModule):
 		)
 
 		self.attention_performer = FlexibleAttentionModule(
-			attention_dropout=self.config.attention_dropout,
-			num_q_heads=self.config.num_attention_heads,
-			num_kv_heads=self.config.num_key_value_heads,
-			head_dims=self.head_dim,
-			precision=self.precision,
-			force_float32_tpu=True,
-			attn_mechanism=self.config.attn_mechanism,
-			dtype=self.config.attn_dtype,
-			softmax_dtype=self.config.attn_softmax_dtype,
-			mesh=self.config.mesh,
-			sm_scale=1 / math.sqrt(self.head_dim),
-			axis_name=self.config.sequence_axis_name,
-			base_config=self.config,
+			base_config=config,
+			softmax_scale=self.head_dim**-0.5,
+			dropout_prob=config.attention_dropout,
 		)
 
 	def __call__(
@@ -817,20 +780,18 @@ class Qwen2VLAttention(FlaxAttentionModule):
 			fcm_mask=fcm_mask,
 		)
 
-		attentions = self.attention_performer(
+		attentions = self.attention_performer.forward(
 			query_states=query_states,
 			key_states=key_states,
 			value_states=value_states,
+			bias=None,
 			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
+			segment_ids=segment_ids,
 			causal=True,
 			dropout_rng=self.rngs.params(),
-			query_sequence_length=query_states.shape[1],
-			key_value_sequence_length=key_states.shape[1],
-			uses_cache=cache_view is not None,
-			segment_ids=segment_ids,
-			causal_mask=causal_mask,
 		)
+
 		attn_output = self.o_proj(
 			self.shard_attention_prod(
 				attn_output=self._merge_heads(attentions.attention_outputs)
