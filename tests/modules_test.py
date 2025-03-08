@@ -890,7 +890,7 @@ if __name__ == "__main__":
 	# test.test_cohere()  # Passed
 	# test.test_dbrx()  # Passed
 	# test.test_deepseek_v2()  # Passed
-	test.test_deepseek_v3()  # Passed
+	# test.test_deepseek_v3()  # Passed
 	# test.test_exaone()  # Passed
 	# test.test_falcon()  # Passed
 	# test.test_gemma()  # Passed
@@ -910,9 +910,9 @@ if __name__ == "__main__":
 	# test.test_olmo2()  # Passed
 	# test.test_openelm()  # Passed
 	# test.test_phi()  # Passed
-	# test.test_phi3()  # Passed
+	test.test_phi3()  # Passed
 	# test.test_phimoe()  # Failed v0.0.80 - N  Runtime
-	# test.test_qwen2()  # Passed
-	# test.test_qwen2_moe()  # Passed
-	# test.test_stablelm()  # Passed
+	test.test_qwen2()  # Passed
+	test.test_qwen2_moe()  # Passed
+	test.test_stablelm()  # Passed
 	# -----------------------------------------------

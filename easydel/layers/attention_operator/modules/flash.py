@@ -1,3 +1,18 @@
+# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 import functools
 import typing as tp
 
@@ -15,16 +30,19 @@ from jax.sharding import PartitionSpec as Ps
 
 from easydel.kernels.gpu_ops import triton_flash_attention
 
-from ._attention_impl import (
+from .._attention_impl import (
 	AttentionImpl,
 	AttentionMetadata,
 	AttentionOutput,
+	AttentionRegistry,
 )
 from .vanilla import VanillaAttn
 
 
+@AttentionRegistry.register
 class FlashAttn(AttentionImpl):
-	def get_impl_name(self) -> str:
+	@classmethod
+	def get_impl_name(cls) -> tp.Union[str, tp.Tuple[str]]:
 		return "flash_attn2"
 
 	def get_impl_metadata(self) -> AttentionMetadata:
@@ -39,6 +57,7 @@ class FlashAttn(AttentionImpl):
 		bias: tp.Optional[Array] = None,
 		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
 		causal: bool = False,
+		**ignore,
 	) -> AttentionOutput:
 		raise NotImplementedError("we wont call cpu impl of flash attention")
 
@@ -54,6 +73,7 @@ class FlashAttn(AttentionImpl):
 		bias: tp.Optional[Array] = None,
 		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
 		causal: bool = False,
+		**ignore,
 	) -> AttentionOutput:
 		sm_scale = self.metadata.softmax_scale
 		sm_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
@@ -165,6 +185,7 @@ class FlashAttn(AttentionImpl):
 		bias: tp.Optional[Array] = None,
 		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
 		causal: bool = False,
+		**ignore,
 	) -> AttentionOutput:
 		sm_scale = self.metadata.softmax_scale
 		sm_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
@@ -227,6 +248,7 @@ class FlashAttn(AttentionImpl):
 		bias: tp.Optional[Array] = None,
 		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
 		causal: bool = False,
+		**ignore,
 	) -> AttentionOutput:
 		return super().__call__(
 			q=q,

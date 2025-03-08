@@ -39,63 +39,41 @@ from functools import partial
 
 import chex
 import jax
-
+from jax import Array
 from ._utils import SegmentIds
 from ._forward_pallas import _ring_flash_attention_fwd_tpu
 from ._backward_pallas import _ring_flash_attention_bwd_tpu
 
 
-@partial(
-	jax.custom_vjp,
-	nondiff_argnums=(6, 7, 8, 9, 10, 11),
-)
+@partial(jax.custom_vjp, nondiff_argnums=(6, 7, 8, 9, 10))
 def ring_attention(
-	query: chex.Array,
-	key: chex.Array,
-	value: chex.Array,
-	bias: tp.Optional[chex.Array] = None,
-	segment_ids: tp.Optional[SegmentIds] = None,
-	cache_idx: tp.Optional[int] = None,
-	axis_name: tp.Optional[str] = None,
-	float32_logits: bool = True,
-	softmax_scale: tp.Optional[float] = None,
-	blocksize_q: int = 256,
-	blocksize_k: int = 256,
-	blocksize_c: tp.Optional[int] = None,
+	q: Array,
+	k: Array,
+	v: Array,
+	attn_bias: tp.Optional[Array],
+	segment_ids: tp.Optional[SegmentIds],
+	cache_idx,
+	axis_name: str,
+	float32_logits,
+	query_chunk_size,
+	key_chunk_size,
+	causal_block_size,
 ) -> chex.Array:
-	"""Computes ring attention using FlashAttention on TPU.
-
-	Args:
-	    query: Query array of shape (batch, query_len, num_heads, dim_per_head).
-	    key: Key array of shape (batch, kv_len, num_heads, dim_per_head).
-	    value: Value array of shape (batch, kv_len, num_heads, dim_per_head).
-	    bias: tp.Optional bias array.  Its shape depends on the attention mechanism.
-	    segment_ids: tp.Optional segment ids for Q and KV sequences.
-	    cache_idx: tp.Optional cache index for use with caching.
-	    axis_name: tp.Optional name of the axis to ppermute over (for multi-host support).
-	    float32_logits: Whether to compute logits in float32.
-	    softmax_scale: tp.Optional scaling factor for the softmax function.
-	    blocksize_q: Block size for the query sequence.
-	    blocksize_k: Block size for the key/value sequence.
-	    blocksize_c: tp.Optional block size for causal masking.
-
-
-	Returns:
-	    Output array of shape (batch, query_len, num_heads, dim_per_head).
+	"""
+	Computes ring attention using FlashAttention on TPU.
 	"""
 	y, _ = _ring_flash_attention_fwd_tpu(
-		query,
-		key,
-		value,
-		bias,
+		q,
+		k,
+		v,
+		attn_bias,
 		segment_ids,
 		cache_idx,
 		axis_name,
 		float32_logits,
-		softmax_scale,
-		blocksize_q,
-		blocksize_k,
-		blocksize_c,
+		query_chunk_size,
+		key_chunk_size,
+		causal_block_size,
 	)
 	return y
 

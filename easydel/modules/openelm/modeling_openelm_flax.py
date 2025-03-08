@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-import math
 import typing as tp
 from functools import cached_property
 
@@ -112,17 +111,9 @@ class OpenELMMultiHeadCausalAttention(FlaxAttentionModule):
 		self.head_dim = head_dim
 
 		self.attention_performer = FlexibleAttentionModule(
-			num_q_heads=q_heads,
-			num_kv_heads=k_heads,
-			attention_dropout=0.0,
-			head_dims=head_dim,
-			shard_attention_computation=self.config.shard_attention_computation,
-			precision=self.precision,
-			force_float32_tpu=True,
-			attn_mechanism=self.config.attn_mechanism,
-			mesh=self.config.mesh,
-			sm_scale=1 / math.sqrt(self.head_dim),
-			base_config=self.config,
+			base_config=config,
+			softmax_scale=self.head_dim**-0.5,
+			dropout_prob=0.0,
 		)
 
 		self.head_dim = config.head_dim
@@ -247,19 +238,16 @@ class OpenELMMultiHeadCausalAttention(FlaxAttentionModule):
 			fcm_mask=fcm_mask,
 		)
 
-		attentions = self.attention_performer(
+		attentions = self.attention_performer.forward(
 			query_states=query_states,
 			key_states=key_states,
 			value_states=value_states,
+			bias=None,
 			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
+			segment_ids=segment_ids,
 			causal=True,
 			dropout_rng=self.rngs.params(),
-			query_sequence_length=query_states.shape[1],
-			key_value_sequence_length=key_states.shape[1],
-			uses_cache=cache_view is not None,
-			segment_ids=segment_ids,
-			causal_mask=causal_mask,
 		)
 
 		attn_output = self.out_proj(

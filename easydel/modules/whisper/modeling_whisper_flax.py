@@ -138,23 +138,9 @@ class WhisperAttention(FlaxAttentionModule):
 		self.out_proj = linear(use_bias=self.bias, rngs=rngs)
 
 		self.attention_performer = FlexibleAttentionModule(
-			use_sharding_constraint=self.config.use_sharding_constraint,
-			num_q_heads=self.num_heads,
-			num_kv_heads=self.num_heads,
-			attention_dropout=self.config.attention_dropout,
-			head_dims=self.head_dim,
-			shard_attention_computation=self.config.shard_attention_computation,
-			precision=self.precision,
-			force_float32_tpu=True,
-			attn_mechanism=self.config.attn_mechanism,
-			dtype=self.config.attn_dtype,
-			softmax_dtype=self.config.attn_softmax_dtype,
-			partition_axis=self.config.partition_axis,
-			scan_ring_attention=self.config.scan_ring_attention,
-			mesh=self.config.mesh,
-			sm_scale=1 / math.sqrt(self.head_dim),
-			axis_name=self.config.sequence_axis_name,
-			backward_pass_impl=self.config.flash_attention_backward_pass_impl,
+			base_config=config,
+			softmax_scale=self.head_dim**-0.5,
+			dropout_prob=config.attention_dropout,
 		)
 
 	def __call__(
@@ -201,19 +187,16 @@ class WhisperAttention(FlaxAttentionModule):
 				attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
 			init_attention_bias = lambda: None  # noqa
 
-		attentions = self.attention_performer(
+		attentions = self.attention_performer.forward(
 			query_states=query_states,
 			key_states=key_states,
 			value_states=value_states,
+			bias=None,
 			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
+			segment_ids=None,
 			causal=self.causal,
 			dropout_rng=self.rngs.params(),
-			query_sequence_length=query_states.shape[1],
-			key_value_sequence_length=key_states.shape[1],
-			uses_cache=cache_view is not None,
-			segment_ids=None,
-			causal_mask=causal_mask,
 		)
 
 		attn_output = self.out_proj(

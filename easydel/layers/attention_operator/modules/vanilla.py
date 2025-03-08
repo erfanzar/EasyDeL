@@ -1,3 +1,17 @@
+# Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import typing as tp
 
 import jax
@@ -6,15 +20,19 @@ from flax.nnx.nn.dtypes import promote_dtype
 from jax import Array
 from jax import numpy as jnp
 from jax import random as jr
-from ._attention_impl import (
+
+from .._attention_impl import (
 	AttentionImpl,
 	AttentionMetadata,
 	AttentionOutput,
+	AttentionRegistry,
 )
 
 
+@AttentionRegistry.register
 class VanillaAttn(AttentionImpl):
-	def get_impl_name(self) -> str:
+	@classmethod
+	def get_impl_name(cls) -> tp.Union[str, tp.Tuple[str]]:
 		return "vanilla"
 
 	def get_impl_metadata(self) -> AttentionMetadata:
@@ -30,6 +48,7 @@ class VanillaAttn(AttentionImpl):
 		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
 		deterministic: bool = False,
 		dropout_rng: tp.Optional[jax.random.PRNGKey] = None,
+		**ignore,
 	) -> AttentionOutput:
 		sm_scale = self.metadata.softmax_scale
 		sm_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
@@ -140,6 +159,7 @@ class VanillaAttn(AttentionImpl):
 		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
 		deterministic: bool = False,
 		dropout_rng: tp.Optional[jax.random.PRNGKey] = None,
+		**ignore,
 	) -> AttentionOutput:
 		return super().__call__(
 			q=q,
