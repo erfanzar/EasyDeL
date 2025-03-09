@@ -17,7 +17,6 @@ import functools
 import typing as tp
 
 import jax
-from eformer.escale import with_sharding_constraint
 from jax import Array
 from jax import numpy as jnp
 from jax import random as jr
@@ -63,6 +62,10 @@ class SplashAttn(AttentionImpl):
 		mask: tp.Optional[Array] = None,
 		**ignore,
 	) -> AttentionOutput:
+		query_lenght = q.shape[1]
+		value_lenght = v.shape[1]
+		if query_lenght == 1:
+			return VanillaAttn(self.metadata)(q=q, k=k, v=v, mask=mask)
 		sm_scale = self.metadata.softmax_scale
 		sm_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
 		dtype = self.metadata.runtime_dtype
@@ -80,8 +83,6 @@ class SplashAttn(AttentionImpl):
 			num_reps_mask = q.shape[0] // mask.shape[0]
 			mask = jnp.repeat(mask, num_reps_mask, 0)
 
-		query_lenght = q.shape[1]
-		value_lenght = v.shape[1]
 		block_sizes = BlockSizes(
 			block_q=min(self.metadata.blocksize_q, query_lenght),
 			block_kv_compute=min(self.metadata.blocksize_k, value_lenght),
@@ -96,8 +97,17 @@ class SplashAttn(AttentionImpl):
 		q_mask, kv_mask = [None] * 2
 		if mask is not None:
 			q_mask, kv_mask = self._split_attention_mask(mask)
-			q_mask, kv_mask = q_mask.astype("i4"), kv_mask.astype("i4")
-		pi = [0, 2, 3]
+			q_mask, kv_mask = (
+				q_mask.astype("i4"),
+				kv_mask.astype("i4"),
+			)  # pallas dont support int1 or bool in shardmap idk why
+		pi = [0, 1, 3]
+		mpi = [0]
+		# query_partition_spec is like PB,PH,PS,PD
+		# v is like BSHD since it's not transposed yet
+		tparallel = self.metadata.mesh.shape[query_partition_spec[1]]
+		if (v.shape[2] % tparallel) == 0 and tparallel <= v.shape[2]:
+			pi = [0, 3]  # shard DP, FSDP and TP
 
 		@functools.partial(
 			shard_map,
@@ -106,8 +116,8 @@ class SplashAttn(AttentionImpl):
 				self.create_stable_sharding(query_partition_spec, pi, dep=q),
 				self.create_stable_sharding(key_partition_spec, pi, dep=k),
 				self.create_stable_sharding(value_partition_spec, pi, dep=v),
-				self.create_stable_sharding(qkv_mask_partition_spec, [0], dep=q_mask),
-				self.create_stable_sharding(qkv_mask_partition_spec, [0], dep=kv_mask),
+				self.create_stable_sharding(qkv_mask_partition_spec, mpi, dep=q_mask),
+				self.create_stable_sharding(qkv_mask_partition_spec, mpi, dep=kv_mask),
 			),
 			out_specs=self.create_stable_sharding(attention_partition_spec, pi),
 			check_rep=False,
@@ -141,13 +151,7 @@ class SplashAttn(AttentionImpl):
 			kv_mask,
 		).transpose(0, 2, 1, 3)
 
-		return AttentionOutput(
-			attention_weights=None,
-			attention_outputs=with_sharding_constraint(
-				arr=attn,
-				sharding=attention_partition_spec,
-			),
-		)
+		return AttentionOutput(attention_weights=None, attention_outputs=attn)
 
 	def forward_cpu(self, *args, **kwargs) -> AttentionOutput:
 		raise NotImplementedError("`forward_cpu` not implemented!")
@@ -172,25 +176,40 @@ class SplashAttn(AttentionImpl):
 if __name__ == "__main__":
 	from easydel.infra import EasyDeLBaseConfig
 
-	# Test cace when qkv might refer to mla
-	b, qs, ks, qh, kh, d, vd = 4, 1024, 1024, 32, 32, 128, 128
-
-	q = jr.normal(jr.key(0), (b, qs, qh, d), "f4")
-	k = jr.normal(jr.key(1), (b, ks, kh, d), "f4")
-	v = jr.normal(jr.key(2), (b, ks, kh, vd), "f4")
+	test_cases = [
+		# (batch_size, q_seq_len, k_seq_len, q_heads, k_heads)
+		(1, 2048, 2048, 32, 4),
+		(2, 2**13, 2**13, 32, 8),
+		(4, 2**14, 2**14, 16, 8),
+		(4, 2**13, 2**14, 16, 4),
+	]
 
 	metadata = AttentionMetadata(
 		runtime_dtype=jnp.bfloat16,
-		base_config=EasyDeLBaseConfig(axis_dims=(1, -1, 1, 1)),
+		base_config=EasyDeLBaseConfig(axis_dims=(1, 1, 1, -1)),
 	)
 
-	attn = SplashAttn(metadata)
-	mask = jnp.repeat(attn._create_causal_mask(qs)[None, None, :, :], b, 0)
-	vanilla = VanillaAttn(metadata)
-	fout = attn(q=q, k=k, v=v, mask=mask).attention_outputs
-	vout = vanilla(q=q, k=k, v=v, mask=mask).attention_outputs
+	splash_attn = SplashAttn(metadata)
+	vanilla_attn = VanillaAttn(metadata)
 
-	print(fout[-1, -1, -1, -5:], fout[-1, 0, -1, -5:])
-	print(vout[-1, -1, -1, -5:], vout[-1, 0, -1, -5:])
+	for idx, (b, qs, ks, qh, kh) in enumerate(test_cases):
+		d, vd = 128, 128
+		print(
+			f"Running test case {idx + 1}/{len(test_cases)}: "
+			f"b={b}, qs={qs}, ks={ks}, qh={qh}, kh={kh}, d={d}, vd={vd}"
+		)
+		key_q, key_k, key_v = jr.split(jr.PRNGKey(0), 3)
 
-	print(jnp.allclose(fout, vout, atol=0.125))
+		q = jr.normal(key_q, (b, qs, qh, d), dtype=jnp.float32)
+		k = jr.normal(key_k, (b, ks, kh, d), dtype=jnp.float32)
+		v = jr.normal(key_v, (b, ks, kh, vd), dtype=jnp.float32)
+
+		mask = SplashAttn._create_causal_mask(max(qs, ks))[-qs:, :ks]
+		mask = jnp.broadcast_to(mask, (b, 1, qs, ks))
+		splash_out = splash_attn(q=q, k=k, v=v, mask=None).attention_outputs
+		vanilla_out = vanilla_attn(q=q, k=k, v=v, mask=None).attention_outputs
+		is_close = jnp.allclose(splash_out, vanilla_out, atol=0.125)
+		max_diff = jnp.max(jnp.abs(splash_out - vanilla_out))
+
+		print(f"Test case {idx + 1} result: {'PASS' if is_close else 'FAIL'}")
+		print(f"Maximum absolute difference: {max_diff}\n")
