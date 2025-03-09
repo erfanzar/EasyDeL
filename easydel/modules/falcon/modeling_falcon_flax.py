@@ -163,20 +163,9 @@ class FalconAttention(FlaxAttentionModule):
 				dtype=self.dtype,
 			)
 		self.attention_performer = FlexibleAttentionModule(
-			attention_dropout=0.0,
-			num_q_heads=self.config.num_attention_heads,
-			num_kv_heads=self.config.num_attention_heads,
-			head_dims=self.head_dim,
-			precision=self.precision,
-			force_float32_tpu=True,
-			attn_mechanism=config.attn_mechanism,
-			dtype=self.config.attn_dtype,
-			softmax_dtype=self.config.attn_softmax_dtype,
-			mesh=config.mesh,
-			sm_scale=self.inv_norm_factor,
-			axis_name=config.attention_axis_name,
 			base_config=config,
-			_do_check=False,
+			softmax_scale=self.head_dim**-0.5,
+			dropout_prob=config.attention_dropout,
 		)
 
 	def _split_heads(
@@ -307,20 +296,16 @@ class FalconAttention(FlaxAttentionModule):
 		)
 
 		if alibi is None:
-			attention = self.attention_performer(
+			attention = self.attention_performer.forward(
 				query_states=query_layer,
 				key_states=key_layer,
 				value_states=value_layer,
-				causal_mask=causal_mask,
-				dropout_rng=self.rngs.params(),
-				segment_ids=segment_ids,
-				query_sequence_length=query_length,
-				key_value_sequence_length=key_length,
-				uses_cache=cache_view is not None,
-				init_bias=init_attention_bias,
 				bias=init_attention_bias(),
+				init_bias=init_attention_bias,
 				attention_mask=None,
+				segment_ids=segment_ids,
 				causal=True,
+				dropout_rng=self.rngs.params(),
 			)
 			attention_outputs = attention.attention_outputs
 			attention_outputs = attention_outputs.reshape(

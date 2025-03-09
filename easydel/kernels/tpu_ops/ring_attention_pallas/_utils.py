@@ -18,13 +18,19 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+from jax.experimental.pallas import BlockSpec
 
 INTERPRET = False
-MIN_blocksize = 128
+MIN_BLOCK_SIZE = 128
 TRANS_B_DIM_NUMBERS = (((1,), (1,)), ((), ()))
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 NUM_LANES = 128
 NUM_SUBLANES = 8
+
+
+class PatchBlockSpec(BlockSpec):
+	def __init__(self, index_map, block_shape):
+		super().__init__(block_shape=block_shape, index_map=index_map)
 
 
 class SegmentIds(tp.NamedTuple):
@@ -46,19 +52,19 @@ class SegmentIds(tp.NamedTuple):
 
 @dataclass(frozen=True)
 class BlockSizes:
-	blocksize_q: int
-	blocksize_k_major: int
-	blocksize_k: int
-	blocksize_b: int
+	block_q: int
+	block_k_major: int
+	block_k: int
+	block_b: int
 
-	blocksize_q_major_dkv: int | None = None
-	blocksizek_major_dkv: int | None = None
-	blocksizek_dkv: int | None = None
-	blocksizeq_dkv: int | None = None
+	block_q_major_dkv: int | None = None
+	block_k_major_dkv: int | None = None
+	block_k_dkv: int | None = None
+	block_q_dkv: int | None = None
 
-	blocksizek_major_dq: int | None = None
-	blocksizek_dq: int | None = None
-	blocksizeq_dq: int | None = None
+	block_k_major_dq: int | None = None
+	block_k_dq: int | None = None
+	block_q_dq: int | None = None
 
 	def __post_init__(self):
 		def verify_major_minor(prefix, suffix, major, minor):
@@ -72,30 +78,24 @@ class BlockSizes:
 					f"{prefix}{suffix}={minor} should divide {prefix}_major{suffix}={major}"
 				)
 
-		verify_major_minor("blocksize_k", "", self.blocksize_k_major, self.blocksize_k)
-		if self.blocksize_q_major_dkv is not None and self.blocksizeq_dkv is not None:
-			verify_major_minor(
-				"blocksize_q", "_dkv", self.blocksize_q_major_dkv, self.blocksizeq_dkv
-			)
-		if self.blocksizek_major_dkv is not None and self.blocksizek_dkv is not None:
-			verify_major_minor(
-				"blocksize_k", "_dkv", self.blocksizek_major_dkv, self.blocksizek_dkv
-			)
-		if self.blocksizek_major_dq is not None and self.blocksizek_dq is not None:
-			verify_major_minor(
-				"blocksize_k", "_dq", self.blocksizek_major_dq, self.blocksizek_dq
-			)
+		verify_major_minor("block_k", "", self.block_k_major, self.block_k)
+		if self.block_q_major_dkv is not None and self.block_q_dkv is not None:
+			verify_major_minor("block_q", "_dkv", self.block_q_major_dkv, self.block_q_dkv)
+		if self.block_k_major_dkv is not None and self.block_k_dkv is not None:
+			verify_major_minor("block_k", "_dkv", self.block_k_major_dkv, self.block_k_dkv)
+		if self.block_k_major_dq is not None and self.block_k_dq is not None:
+			verify_major_minor("block_k", "_dq", self.block_k_major_dq, self.block_k_dq)
 
 	@property
 	def has_backward_blocks(self) -> bool:
 		backward_blocks = (
-			self.blocksize_q_major_dkv,
-			self.blocksizek_major_dkv,
-			self.blocksizeq_dkv,
-			self.blocksizek_dkv,
-			self.blocksizek_major_dq,
-			self.blocksizek_dq,
-			self.blocksizeq_dq,
+			self.block_q_major_dkv,
+			self.block_k_major_dkv,
+			self.block_q_dkv,
+			self.block_k_dkv,
+			self.block_k_major_dq,
+			self.block_k_dq,
+			self.block_q_dq,
 		)
 		return all(b is not None for b in backward_blocks)
 
@@ -103,17 +103,17 @@ class BlockSizes:
 	def get_default(cls, batch_size, num_heads, q_seq_len, kv_len, d_model):
 		del batch_size, num_heads, q_seq_len, kv_len, d_model  # Unused.
 		return BlockSizes(
-			blocksize_q=128,
-			blocksize_k_major=128,
-			blocksize_k=128,
-			blocksize_b=1,
-			blocksize_q_major_dkv=128,
-			blocksizek_major_dkv=128,
-			blocksizek_dkv=128,
-			blocksizeq_dkv=128,
-			blocksizek_major_dq=128,
-			blocksizek_dq=128,
-			blocksizeq_dq=128,
+			block_q=128,
+			block_k_major=128,
+			block_k=128,
+			block_b=1,
+			block_q_major_dkv=128,
+			block_k_major_dkv=128,
+			block_k_dkv=128,
+			block_q_dkv=128,
+			block_k_major_dq=128,
+			block_k_dq=128,
+			block_q_dq=128,
 		)
 
 
@@ -127,7 +127,11 @@ def _verify_block(blocksizename, dim_name, block, dim, should_divide=True):
 
 
 def below_or_on_diag(
-	r: int, r_blk_size: int, c: int, c_blk_size: int, blocksize_c: int
+	r: int,
+	r_blk_size: int,
+	c: int,
+	c_blk_size: int,
+	blocksize_c: int,
 ):
 	"""Checks if the element at (r, c) is below or on the diagonal.
 
