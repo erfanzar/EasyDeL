@@ -5,8 +5,8 @@ Layers
    :maxdepth: 2
 
    layers___init__
-   layers__blockwise_attention
    layers_attention
+   layers_attention_operator
    layers_caching
    layers_norms
    layers_ops
