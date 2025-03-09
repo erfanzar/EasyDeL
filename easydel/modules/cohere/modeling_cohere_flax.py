@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-import math
 import typing as tp
 from functools import partial
 
@@ -178,18 +177,9 @@ class CohereAttention(FlaxAttentionModule):
 			True,
 		)
 		self.attention_performer = FlexibleAttentionModule(
-			num_q_heads=self.config.num_attention_heads,
-			num_kv_heads=self.config.num_key_value_heads,
-			attention_dropout=self.config.attention_dropout,
-			head_dims=self.head_dim,
-			precision=self.precision,
-			force_float32_tpu=True,
-			attn_mechanism=self.config.attn_mechanism,
-			mesh=self.config.mesh,
-			sm_scale=1 / math.sqrt(self.head_dim),
-			axis_name=self.config.attention_axis_name,
-			base_config=self.config,
-			backward_pass_impl=self.config.flash_attention_backward_pass_impl,
+			dropout_prob=config.attention_dropout,
+			base_config=config,
+			softmax_scale=self.head_dim**-0.5,
 		)
 
 	def __call__(
@@ -255,19 +245,16 @@ class CohereAttention(FlaxAttentionModule):
 			fcm_mask=fcm_mask,
 		)
 
-		attentions = self.attention_performer(
+		attentions = self.attention_performer.forward(
 			query_states=query_states,
 			key_states=key_states,
 			value_states=value_states,
+			bias=None,
 			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
+			segment_ids=segment_ids,
 			causal=True,
 			dropout_rng=self.rngs.params(),
-			query_sequence_length=query_states.shape[1],
-			key_value_sequence_length=key_states.shape[1],
-			uses_cache=cache_view is not None,
-			segment_ids=segment_ids,
-			causal_mask=causal_mask,
 		)
 
 		attn_output = self.shard_attention_prod(

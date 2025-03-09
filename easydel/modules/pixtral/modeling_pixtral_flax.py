@@ -14,7 +14,6 @@
 
 
 import functools
-import math
 import typing as tp
 
 import chex
@@ -248,19 +247,9 @@ class PixtralAttention(FlaxAttentionModule):
 		)
 
 		self.attention_performer = FlexibleAttentionModule(
-			attention_dropout=self.config.attention_dropout,
-			num_q_heads=self.config.num_attention_heads,
-			num_kv_heads=self.config.num_attention_heads,
-			head_dims=self.head_dim,
-			precision=self.precision,
-			force_float32_tpu=True,
-			attn_mechanism=self.config.attn_mechanism,
-			dtype=self.config.attn_dtype,
-			softmax_dtype=self.config.attn_softmax_dtype,
-			mesh=self.config.mesh,
-			sm_scale=1 / math.sqrt(self.head_dim),
-			axis_name=self.config.attention_axis_name,
-			base_config=self.config,
+			base_config=config,
+			softmax_scale=self.head_dim**-0.5,
+			dropout_prob=config.attention_dropout,
 		)
 
 	def __call__(
@@ -321,19 +310,16 @@ class PixtralAttention(FlaxAttentionModule):
 			fcm_mask=None,
 		)
 
-		attentions = self.attention_performer(
+		attentions = self.attention_performer.forward(
 			query_states=query_states,
 			key_states=key_states,
 			value_states=value_states,
+			bias=None,
 			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
+			segment_ids=None,
 			causal=True,
 			dropout_rng=self.rngs.params(),
-			query_sequence_length=query_states.shape[1],
-			key_value_sequence_length=key_states.shape[1],
-			uses_cache=False,
-			segment_ids=None,
-			causal_mask=None,
 		)
 
 		attn_output = self.shard_attention_prod(

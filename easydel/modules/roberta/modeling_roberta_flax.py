@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-import math
 import typing as tp
 
 import chex
@@ -136,24 +135,9 @@ class RobertaSelfAttention(FlaxAttentionModule):
 				"                   : {self.config.num_attention_heads}"
 			)
 		self.attention_performer = FlexibleAttentionModule(
-			use_sharding_constraint=self.config.use_sharding_constraint,
-			num_q_heads=self.config.num_attention_heads,
-			num_kv_heads=self.config.num_attention_heads,
-			attention_dropout=0.0,
-			head_dims=self.head_dim,
-			shard_attention_computation=self.config.shard_attention_computation,
-			precision=self.precision,
-			force_float32_tpu=True,
-			attn_mechanism=self.config.attn_mechanism,
-			dtype=self.config.attn_dtype,
-			softmax_dtype=self.config.attn_softmax_dtype,
-			partition_axis=self.config.partition_axis,
-			scan_ring_attention=self.config.scan_ring_attention,
-			mesh=self.config.mesh,
-			sm_scale=1 / math.sqrt(self.head_dim),
-			axis_name=self.config.attention_axis_name,
-			backward_pass_impl=self.config.flash_attention_backward_pass_impl,
-			base_config=self.config,
+			base_config=config,
+			softmax_scale=self.head_dim**-0.5,
+			dropout_prob=0.0,
 		)
 		self.query = nn.Linear(
 			self.config.hidden_size,
@@ -241,18 +225,14 @@ class RobertaSelfAttention(FlaxAttentionModule):
 		)
 
 		if layer_head_mask is None:
-			out = self.attention_performer(
+			out = self.attention_performer.forward(
 				query_states=query_states,
 				key_states=key_states,
 				value_states=value_states,
 				causal=True,
 				init_bias=init_attention_bias,
 				attention_mask=attention_mask,
-				uses_cache=cache_view is not None,
-				query_sequence_length=query_states.shape[1],
-				key_value_sequence_length=key_states.shape[1],
 				segment_ids=segment_ids,
-				causal_mask=None,
 			)
 			attn_weights = out.attention_weights
 			attn_output = out.attention_outputs

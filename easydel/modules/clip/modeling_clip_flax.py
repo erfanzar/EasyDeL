@@ -200,19 +200,9 @@ class CLIPAttention(FlaxAttentionModule):
 
 		self.causal = isinstance(config, CLIPTextConfig)
 		self.attention_performer = FlexibleAttentionModule(
-			attention_dropout=config.attention_dropout,
-			num_q_heads=config.num_attention_heads,
-			num_kv_heads=config.num_attention_heads,
-			head_dims=self.head_dim,
-			precision=precision,
-			force_float32_tpu=True,
-			attn_mechanism=config.attn_mechanism,
-			dtype=config.attn_dtype,
-			softmax_dtype=config.attn_softmax_dtype,
-			mesh=config.mesh,
-			sm_scale=self.head_dim**-0.5,
-			axis_name=config.attention_axis_name,
 			base_config=config,
+			softmax_scale=self.head_dim**-0.5,
+			dropout_prob=config.attention_dropout,
 		)
 
 	def _split_heads(self, hidden_states):
@@ -268,20 +258,18 @@ class CLIPAttention(FlaxAttentionModule):
 			)
 			attention_mask = None
 
-		attentions = self.attention_performer(
+		attentions = self.attention_performer.forward(
 			query_states=query,
 			key_states=key,
 			value_states=value,
+			bias=None,
 			init_bias=lambda: attention_bias,
 			attention_mask=attention_mask,
+			segment_ids=None,
 			causal=self.causal,
 			dropout_rng=self.rngs.params(),
-			query_sequence_length=query.shape[1],
-			key_value_sequence_length=key.shape[1],
-			uses_cache=None,
-			segment_ids=None,
-			causal_mask=causal_mask,
 		)
+
 		attn_output = self._merge_heads(attentions.attention_outputs)
 		attn_output = self.out_proj(attn_output)
 
