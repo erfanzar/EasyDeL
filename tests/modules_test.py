@@ -25,7 +25,6 @@ from tabulate import tabulate
 import easydel as ed
 from easydel.infra.etils import (
 	AVAILABLE_ATTENTION_MECHANISMS,
-	DEFAULT_ATTENTION_MECHANISM,
 	EasyDeLGradientCheckPointers,
 )
 from easydel.infra.loss_utils import cross_entropy_loss_and_accuracy
@@ -69,11 +68,12 @@ class EasyModelsTest(unittest.TestCase):
 		self.rotary_dim = 32
 		self.dtype: jax.numpy.dtype = jnp.float32
 		self.precision = jax.lax.Precision("highest")
-		self.attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_ATTENTION_MECHANISM
-		self.blocksize_k: int = 64
+		self.attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "flash_attn2"
+		self.blocksize_k: int = 128
 		self.blocksize_q: int = 128
-		self.sequence_length = 128
+		self.sequence_length = 2048
 		self.scan_mlp_chunk_size = self.sequence_length // 2
+		self.axis_dims = (1, 1, 1, -1)
 		self.head_dim = self.hidden_size // self.num_attention_heads
 		self.use_parallel_residual = True
 		self.qk_layernorm = True
@@ -84,7 +84,7 @@ class EasyModelsTest(unittest.TestCase):
 		self.rope_scaling = None
 		self.attn_dtype = jnp.float32
 		self.attn_softmax_dtype = jnp.float32
-		self.platform = "triton"
+		self.platform = None
 
 	def create_test_for_models(self, module_name: str, hf_module_class, task):
 		(
@@ -126,7 +126,7 @@ class EasyModelsTest(unittest.TestCase):
 		else:
 			config = self.header_config
 
-		config.axis_dims = (1, 1, 1, -1)
+		config.axis_dims = self.axis_dims
 		config.pad_token_id = 0
 
 		hf_model = hf_module_class(config=copy.deepcopy(config))
@@ -900,7 +900,7 @@ if __name__ == "__main__":
 	# test.test_gpt2()  # Passed
 	# test.test_grok1() # Not Tested Yet!
 	# test.test_internlm2()  # Passed
-	# test.test_llama()  # Passed
+	test.test_llama()  # Passed
 	# test.test_mamba()  # Passed
 	# test.test_mamba2()  # Passed
 	# test.test_mistral()  # Passed
@@ -910,9 +910,9 @@ if __name__ == "__main__":
 	# test.test_olmo2()  # Passed
 	# test.test_openelm()  # Passed
 	# test.test_phi()  # Passed
-	test.test_phi3()  # Passed
+	# test.test_phi3()  # Passed
 	# test.test_phimoe()  # Failed v0.0.80 - N  Runtime
-	test.test_qwen2()  # Passed
-	test.test_qwen2_moe()  # Passed
-	test.test_stablelm()  # Passed
+	# test.test_qwen2()  # Passed
+	# test.test_qwen2_moe()  # Passed
+	# test.test_stablelm()  # Passed
 	# -----------------------------------------------

@@ -53,6 +53,7 @@ def _get_jax_dtype_from_string(dtype_string):
 
 
 class AttentionMechanisms(str, Enum):
+	AUTO = "auto"
 	FLASH_ATTN2 = "flash_attn2"
 	RING = "ring"
 	VANILLA = "vanilla"
@@ -63,7 +64,33 @@ class AttentionMechanisms(str, Enum):
 	CUDA_FLASH_ATTN2 = "cuda_flash_attn2"
 
 
-DEFAULT_ATTENTION_MECHANISM = "vanilla"
+def tpu_version_check(version: str = "v4"):
+	if version in getattr(jax.local_devices()[0], "device_kind", "").lower():
+		return True
+
+	return False
+
+
+def get_optimal_config() -> tp.Tuple[AttentionMechanisms, jnp.dtype]:
+	"""
+	Returns the optimal attention mechanism and dtype for the current JAX device.
+
+	Returns:
+	    A tuple of (attention_mechanism, dtype)
+	"""
+
+	match jax.default_backend():
+		case "tpu":
+			if tpu_version_check("v3"):
+				return AttentionMechanisms.FLASH_ATTN2, jnp.float32
+			return AttentionMechanisms.SPLASH, jnp.bfloat16
+		case "gpu":
+			return AttentionMechanisms.FLASH_ATTN2, jnp.float16
+		case _:
+			return AttentionMechanisms.VANILLA, jnp.bfloat16
+
+
+DEFAULT_ATTENTION_MECHANISM = "auto"
 
 
 class FlexibleAttentionModule(nn.Module):
@@ -111,6 +138,13 @@ class FlexibleAttentionModule(nn.Module):
 		if isinstance(base_config.attn_softmax_dtype, str):
 			base_config.attn_softmax_dtype = _get_jax_dtype_from_string(base_config.attn_softmax_dtype)
 		# fmt:on
+
+		if base_config.attn_mechanism == AttentionMechanisms.AUTO:
+			impl_name, runtime_dtype = get_optimal_config()
+			logger.debug(f"Automatically select AttentionImpl {impl_name} | {runtime_dtype}")
+			base_config.attn_mechanism = impl_name
+			base_config.attn_dtype = runtime_dtype
+
 		metadata = AttentionMetadata.from_config(
 			config=base_config,
 			softmax_scale=softmax_scale,
