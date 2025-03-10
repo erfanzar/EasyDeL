@@ -204,6 +204,22 @@ class FlashAttn(AttentionImpl):
 		) = self.metadata.get_partition_specs(runtime_type, BTHD=True)
 		if mask is None and bias is None and init_bias is not None:
 			bias = init_bias()
+
+		pi = [0]  # only shard DP and FSDP
+		bi = [0]  # only shard DP and FSDP
+		axis_index = value_partition_spec[1]
+		tparallel = self.metadata.mesh.shape[axis_index]
+		if (q.shape[2] % tparallel) == 0 and tparallel <= q.shape[2]:
+			pi = [0, 2]  # shard DP, FSDP and TP
+		if bias is not None:
+			if (bias.shape[1] % tparallel) == 0 and tparallel <= bias.shape[1]:
+				pi = [0, 2]  # shard DP, FSDP and TP
+				bi = Ps(
+					bias_partition_spec[0],
+					key_partition_spec[2],
+					None,
+					None,
+				)
 		func = functools.partial(
 			triton_flash_attention,
 			dropout_prob=self.metadata.dropout_prob,
@@ -215,13 +231,13 @@ class FlashAttn(AttentionImpl):
 			func,
 			mesh=self.metadata.mesh,
 			in_specs=(
-				self.create_stable_sharding(query_partition_spec, [0], dep=q),
-				self.create_stable_sharding(key_partition_spec, [0], dep=k),
-				self.create_stable_sharding(value_partition_spec, [0], dep=v),
-				self.create_stable_sharding(bias_partition_spec, [0], dep=bias),
-				self.create_stable_sharding(mask_partition_spec, [0], dep=mask),
+				self.create_stable_sharding(query_partition_spec, pi),
+				self.create_stable_sharding(key_partition_spec, pi),
+				self.create_stable_sharding(value_partition_spec, pi),
+				self.create_stable_sharding(mask_partition_spec, bi, dep=mask),
+				self.create_stable_sharding(bias_partition_spec, bi, dep=bias),
 			),
-			out_specs=self.create_stable_sharding(attention_partition_spec, [0]),
+			out_specs=self.create_stable_sharding(attention_partition_spec, pi),
 			check_rep=False,
 		)(
 			q.astype(dtype),
