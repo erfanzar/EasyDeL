@@ -223,6 +223,7 @@ class RingAttn(AttentionImpl):
 	def get_impl_metadata(self) -> AttentionMetadata:
 		return self.metadata
 
+	@jax.named_scope("easydel-ringimpl-native-xla")
 	def forward_native(
 		self,
 		q: Array,
@@ -288,6 +289,7 @@ class RingAttn(AttentionImpl):
 	def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
 		return self.forward_cuda(*args, **kwargs)
 
+	@jax.named_scope("easydel-ringimpl-tpu")
 	def forward_tpu(
 		self,
 		q: Array,

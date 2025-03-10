@@ -61,6 +61,14 @@ else:
 logger = get_logger(__name__)
 
 
+def get_safe_arr(xs):
+	if isinstance(xs, (np.generic, jax.Array)):
+		if xs.size == 1:  # Only try .item() on size-1 arrays
+			return xs.item()
+		return xs
+	return xs
+
+
 # Constants
 AVAILABLE_BACKENDS: tp.List[str] = ["cpu", "gpu", "tpu", None]
 
@@ -611,9 +619,12 @@ class TrainingArguments:
 		    A dictionary where keys are metric names and values are metric values.
 		  step (int): The current training step or iteration.
 		"""
+
 		if self.report_metrics:
+			filtered_metrics = {k: v for k, v in metrics.items() if v is not None}
 			metrics = {
-				self._restructure_metric_name(k): v for k, v in metrics.items() if v is not None
+				self._restructure_metric_name(k): get_safe_arr(v)
+				for k, v in filtered_metrics.items()
 			}
 			self._log_to_wandb(metrics, step, log_as)
 			self._log_to_tensorboard(metrics, step, log_as)

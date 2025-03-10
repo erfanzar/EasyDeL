@@ -26,6 +26,7 @@ import jax.numpy as jnp
 from flax import nnx as nn
 
 
+@jax.named_scope("easydel-rotary-yarn-find-correction-dim")
 def _yarn_find_correction_dim(
 	num_rotations: int,
 	dim: int,
@@ -40,6 +41,7 @@ def _yarn_find_correction_dim(
 	) / (2 * jnp.log(base))
 
 
+@jax.named_scope("easydel-rotary-yarn-find-correction-range")
 def _yarn_find_correction_range(
 	low_rot: int,
 	high_rot: int,
@@ -66,6 +68,7 @@ def _yarn_find_correction_range(
 	return jax.lax.max(lr, 0.0), jax.lax.min(hr, jnp.array(dim - 1, dtype=jnp.float32))
 
 
+@jax.named_scope("easydel-rotary-yarn-linear-ramp-mask")
 def _yarn_linear_ramp_mask(
 	low: float,
 	high: float,
@@ -78,18 +81,21 @@ def _yarn_linear_ramp_mask(
 	return ramp_func
 
 
+@jax.named_scope("easydel-rotary-yarn-get-mscale")
 def _yarn_get_mscale(scale: float = 1) -> float:
 	if scale <= 1:
 		return 1.0
 	return 0.1 * jnp.log(scale) + 1.0
 
 
+@jax.named_scope("easydel-rotary-rotate-neox")
 def _rotate_neox(x: jnp.ndarray) -> jnp.ndarray:
 	x1 = x[..., : x.shape[-1] // 2]
 	x2 = x[..., x.shape[-1] // 2 :]
 	return jnp.concatenate((-x2, x1), axis=-1)
 
 
+@jax.named_scope("easydel-rotary-rotate-gptj")
 def _rotate_gptj(x: jnp.ndarray) -> jnp.ndarray:
 	x1 = x[..., ::2]
 	x2 = x[..., 1::2]
@@ -97,6 +103,7 @@ def _rotate_gptj(x: jnp.ndarray) -> jnp.ndarray:
 	return x.reshape(x.shape[:-2] + (-1,))
 
 
+@jax.named_scope("easydel-rotary-apply-rotary-emb")
 def _apply_rotary_emb(
 	x: jnp.ndarray,
 	cos: jnp.ndarray,
@@ -144,10 +151,12 @@ def rope_wraper(type):
 	return w
 
 
+@jax.named_scope("easydel-rotary-compute-basic-inv-frequencies")
 def compute_basic_inv_frequencies(base: int, rotary_dim: int):
 	return 1.0 / (base ** (jnp.arange(0, rotary_dim, 2, dtype="f4") / rotary_dim))
 
 
+@jax.named_scope("easydel-rotary-compute-yarn-inv-frequencies")
 def compute_yarn_inv_frequencies(
 	base: float,
 	rotary_dim: int,
@@ -177,6 +186,7 @@ def compute_yarn_inv_frequencies(
 	return inv_frequencies
 
 
+@jax.named_scope("easydel-rotary-compute-llama3-inv-frequencies")
 def compute_llama3_inv_frequencies(
 	base,
 	rotary_dim,
@@ -208,7 +218,7 @@ def compute_llama3_inv_frequencies(
 	return new_freqs
 
 
-# @partial(jax.jit, static_argnames=["base", "rotary_dim", "max_position_embeddings"])
+@jax.named_scope("easydel-rotary-compute-basic-frequencies")
 def compute_basic_frequencies(
 	base: int,
 	rotary_dim: int,
@@ -224,6 +234,7 @@ def compute_basic_frequencies(
 	return freqs
 
 
+@jax.named_scope("easydel-rotary-compute-linear-frequencies")
 def compute_linear_frequencies(
 	base: int,
 	rotary_dim: int,
@@ -257,6 +268,7 @@ def compute_linear_frequencies(
 	return jnp.concatenate(cache_list, axis=0)
 
 
+@jax.named_scope("easydel-rotary-compute-dynamic-frequencies")
 def compute_dynamic_frequencies(
 	base: int,
 	rotary_dim: int,
@@ -273,6 +285,7 @@ def compute_dynamic_frequencies(
 	return jnp.concatenate([jnp.cos(frequencies), jnp.sin(frequencies)], -1)
 
 
+@jax.named_scope("easydel-rotary-compute-yarn-frequencies")
 def compute_yarn_frequencies(
 	base: float,
 	rotary_dim: int,
@@ -300,6 +313,7 @@ def compute_yarn_frequencies(
 	return jnp.concatenate([cos, sin], axis=-1)
 
 
+@jax.named_scope("easydel-rotary-compute-phi3-frequencies")
 def compute_phi3_frequencies(
 	base,
 	head_size,
@@ -340,6 +354,7 @@ def compute_phi3_frequencies(
 	return jnp.concatenate([cos, sin], axis=-1)
 
 
+@jax.named_scope("easydel-rotary-compute-llama3-frequencies")
 def compute_llama3_frequencies(
 	base,
 	rotary_dim,
@@ -365,6 +380,7 @@ def compute_llama3_frequencies(
 	return freqs
 
 
+@jax.named_scope("easydel-rotary-compute-deepseek-frequencies")
 def compute_deepseek_frequencies(
 	base,
 	rotary_dim,
@@ -409,7 +425,7 @@ def compute_deepseek_frequencies(
 	return jnp.concatenate([jnp.cos(freqs) * mscale, jnp.sin(freqs) * mscale], axis=-1)
 
 
-# @partial(jax.jit, static_argnames=["rotary_dim", "is_neox_style", "dtype"])
+@jax.named_scope("easydel-rotary-apply-basic-rope")
 def apply_basic_rope(
 	query: jax.Array,
 	key: jax.Array,
@@ -435,10 +451,7 @@ def apply_basic_rope(
 		return query.astype(dtype), key.astype(dtype)
 
 
-# @partial(
-# 	jax.jit,
-# 	static_argnames=["original_max_position_embeddings", "dtype"],
-# )
+@jax.named_scope("easydel-rotary-apply-phi3-rope")
 def apply_phi3_rope(
 	query,
 	key,

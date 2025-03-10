@@ -64,6 +64,7 @@ class FlashAttn(AttentionImpl):
 	def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
 		return self.forward_cuda(*args, **kwargs)
 
+	@jax.named_scope("easydel-flash-attnimpl-tpu")
 	def forward_tpu(
 		self,
 		q: Array,
@@ -176,6 +177,7 @@ class FlashAttn(AttentionImpl):
 	def forward_cpu(self, *args, **kwargs) -> AttentionOutput:
 		return self.forward_native(*args, **kwargs)
 
+	@jax.named_scope("easydel-flash-attnimpl-gpu-cuda")
 	def forward_cuda(
 		self,
 		q: Array,

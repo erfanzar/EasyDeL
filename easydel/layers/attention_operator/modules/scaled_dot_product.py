@@ -40,6 +40,7 @@ class ScaledDotProductAttn(AttentionImpl):
 	def get_impl_metadata(self) -> AttentionMetadata:
 		return self.metadata
 
+	@jax.named_scope("easydel-sdpaimpl-native-xla")
 	def forward_native(
 		self,
 		q: Array,
@@ -108,6 +109,7 @@ class ScaledDotProductAttn(AttentionImpl):
 	def forward_cpu(self, *args, **kwargs) -> AttentionOutput:
 		return self.forward_native(*args, **kwargs)
 
+	@jax.named_scope("easydel-sdpaimpl-gpu-cuda")
 	def forward_cuda(
 		self,
 		q: Array,

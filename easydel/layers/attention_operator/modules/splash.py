@@ -54,6 +54,7 @@ class SplashAttn(AttentionImpl):
 	def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
 		raise NotImplementedError("`forward_gpu` not implemented!")
 
+	@jax.named_scope("easydel-splashimpl-tpu")
 	def forward_tpu(
 		self,
 		q: Array,

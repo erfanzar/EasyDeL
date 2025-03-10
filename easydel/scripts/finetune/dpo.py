@@ -67,7 +67,7 @@ class RunTimeConfig:
 		},
 	)
 	sharding_axis: str = field(
-		default="(1, -1, 1, 1)",
+		default="1, -1, 1, 1",
 		metadata={"help": "The sharding axis."},
 	)
 	attn_mechanism: ed.AttentionMechanisms = field(

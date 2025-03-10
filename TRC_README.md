@@ -76,7 +76,7 @@ eopod run python -m easydel.scripts.finetune.dpo \
   --dataset_name trl-lib/ultrafeedback_binarized \
   --dataset_split "train[:90%]" \
   --refrence_model_repo_id meta-llama/Llama-3.3-70B-Instruct \
-  --attn_mechanism vanilla \
+  --attn_mechanism auto \
   --beta 0.08 \
   --loss_type sigmoid \
   --max_length 2048 \
@@ -105,7 +105,7 @@ eopod run python -m easydel.scripts.finetune.orpo \
   --repo_id meta-llama/Llama-3.1-8B-Instruct \
   --dataset_name trl-lib/ultrafeedback_binarized \
   --dataset_split "train" \
-  --attn_mechanism vanilla \
+  --attn_mechanism auto \
   --beta 0.12 \
   --max_length 2048 \
   --max_prompt_length 1024 \
@@ -134,7 +134,7 @@ eopod run python -m easydel.scripts.finetune.sft \
   --dataset_split "train" \
   --dataset_text_field messages \
   --sharding_axis 1,-1,1,1 \
-  --attn_mechanism vanilla \
+  --attn_mechanism auto \
   --max_sequence_length 2048 \
   --total_batch_size 16 \
   --learning_rate 1e-6 \
@@ -157,7 +157,7 @@ eopod run python -m easydel.scripts.finetune.sft \
 ```shell
 eopod run python -m easydel.scripts.finetune.gsm8k_grpo \
   --repo_id meta-llama/Llama-3.1-8B-Instruct \
-  --attn_mechanism vanilla \
+  --attn_mechanism auto \
   --sharding_axis 1,1,1,-1 \
   --max_prompt_length 2048 \
   --max_completion_length 1024 \
@@ -209,4 +209,34 @@ eopod run python -m easydel.scripts.finetune.reward \
   --do_last_save \
   --save_steps 1000 \
   --use_wandb
+```
+
+### 6. NuminaMath GRPO
+
+```shell
+eopod run python -m easydel.scripts.finetune.numinamath_grpo \
+  --repo_id meta-llama/Llama-3.1-8B-Instruct \
+  --attn_mechanism auto \
+  --sharding_axis 1,1,1,-1 \
+  --max_prompt_length 2048 \
+  --max_completion_length 1024 \
+  --beta 0.04 \
+  --top_p 0.95 \
+  --top_k 50 \
+  --num_return_sequences 4 \
+  --total_batch_size 16 \
+  --learning_rate 1e-6 \
+  --learning_rate_end 6e-7 \
+  --log_steps 50 \
+  --shuffle_train_dataset \
+  --report_steps 1 \
+  --progress_bar_type tqdm \
+  --num_train_epochs 3 \
+  --auto_shard_states \
+  --optimizer adamw \
+  --scheduler linear \
+  --do_last_save \
+  --save_steps 1000 \
+  --use_wandb \
+  --kv-cache-quantization 8bit
 ```

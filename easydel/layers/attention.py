@@ -235,6 +235,7 @@ class FlaxAttentionModule(nn.Module):
 		"""
 		return map(lambda x: jnp.transpose(x, (0, 2, 1, 3)), args)
 
+	@jax.named_scope("easydel-flax-attention-concatenate-to-cache")
 	def _concatenate_to_cache(
 		self,
 		query: Array,
@@ -299,6 +300,7 @@ class FlaxAttentionModule(nn.Module):
 		cache_view.index = cache_view.index + num_updated_cache_vectors
 		return key_cache, value_cache, attention_mask
 
+	@jax.named_scope("easydel-flax-attention-concatenate")
 	def concatenate(
 		self,
 		*,
@@ -397,6 +399,7 @@ class FlaxAttentionModule(nn.Module):
 
 	@staticmethod
 	def repeat_key_value(key, value, num_reps: int):
-		key = einops.repeat(key, "b s h d -> b s (h r) d", r=num_reps)
-		value = einops.repeat(value, "b s h d -> b s (h r) d", r=num_reps)
+		with jax.named_scope("easydel-flax-attention-repeat-kvheads"):
+			key = einops.repeat(key, "b s h d -> b s (h r) d", r=num_reps)
+			value = einops.repeat(value, "b s h d -> b s (h r) d", r=num_reps)
 		return key, value
