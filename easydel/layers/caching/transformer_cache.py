@@ -17,6 +17,7 @@ import chex as cx
 from eformer.escale import PartitionAxis
 from eformer.jaximus import ImplicitArray
 from jax import numpy as jnp
+import jax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from easydel.infra.etils import EasyDeLQuantizationMethods
@@ -139,37 +140,38 @@ class TransformerCacheView:
 		mesh: Mesh,
 		layer_index: tp.Optional[int] = None,
 	):
-		device = NamedSharding(mesh=mesh, spec=key_values_partition_specs)
+		with jax.named_scope("easydel-transformer-cacheview-init"):
+			device = NamedSharding(mesh=mesh, spec=key_values_partition_specs)
 
-		out = cls(
-			key=quantizer(
-				jnp.zeros(
-					shape=(
-						metadata.batch_size,
-						metadata.sequence_length,
-						metadata.key_heads,
-						metadata.key_dim,
+			out = cls(
+				key=quantizer(
+					jnp.zeros(
+						shape=(
+							metadata.batch_size,
+							metadata.sequence_length,
+							metadata.key_heads,
+							metadata.key_dim,
+						),
+						dtype=dtype,
+						device=device,
 					),
-					dtype=dtype,
-					device=device,
 				),
-			),
-			value=quantizer(
-				jnp.zeros(
-					shape=(
-						metadata.batch_size,
-						metadata.sequence_length,
-						metadata.value_heads,
-						metadata.value_dim,
-					),
-					dtype=dtype,
-					device=device,
-				)
-			),
-			index=jnp.zeros((metadata.batch_size,), dtype=jnp.int32),
-			metadata=metadata,
-			layer_index=layer_index,
-		)
+				value=quantizer(
+					jnp.zeros(
+						shape=(
+							metadata.batch_size,
+							metadata.sequence_length,
+							metadata.value_heads,
+							metadata.value_dim,
+						),
+						dtype=dtype,
+						device=device,
+					)
+				),
+				index=jnp.zeros((metadata.batch_size,), dtype=jnp.int32),
+				metadata=metadata,
+				layer_index=layer_index,
+			)
 		return out
 
 	def __repr__(self):

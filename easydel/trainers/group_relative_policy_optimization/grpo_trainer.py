@@ -222,15 +222,15 @@ class GRPOTrainer(Trainer):
 
 		if isinstance(dataset, Dataset):
 			map_kwargs["desc"] = f"Applying chat template to {dataset_name} dataset"
-
-		dataset = dataset.map(
-			maybe_apply_chat_template,
-			fn_kwargs={
-				"tokenizer": processing_class,
-				"tools": arguments.tools,
-			},
-			**map_kwargs,
-		)
+		if not self.arguments.skip_apply_chat_template:
+			dataset = dataset.map(
+				maybe_apply_chat_template,
+				fn_kwargs={
+					"tokenizer": processing_class,
+					"tools": arguments.tools,
+				},
+				**map_kwargs,
+			)
 
 		def _tokenize(example):
 			return processing_class(

@@ -73,7 +73,10 @@ class GRPOConfig(TrainingArguments):
 		default=None,
 		metadata={"help": "Additional tools for training."},
 	)
-
+	skip_apply_chat_template: bool = field(
+		default=False,
+		metadata={"help": "whenever to skip extracting prompt from dataset."},
+	)
 	def __post_init__(self):
 		"""Post initialization to set dependent parameters."""
 		self.max_sequence_length = self.max_prompt_length + self.max_completion_length

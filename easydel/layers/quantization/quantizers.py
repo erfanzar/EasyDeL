@@ -17,11 +17,13 @@ import re
 import typing as tp
 
 import chex
+import jax
+import tqdm
 from eformer.ops.quantization import Array8B, ArrayNF4
 from flax import nnx as nn
-import tqdm
 
 from easydel.infra.etils import EasyDeLPlatforms, EasyDeLQuantizationMethods
+
 from .linear_8bit import Linear8bit
 from .linear_nf4 import LinearNF4
 
@@ -53,6 +55,7 @@ class EasyQuantizer:
 			quantization_pattern = r".*(?:embedding|layernorm|norm)$"
 		self.quantization_pattern = quantization_pattern
 
+	@jax.named_scope("easydel-easyquantize-call")
 	def __call__(
 		self,
 		array,

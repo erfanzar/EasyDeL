@@ -38,6 +38,7 @@ class VanillaAttn(AttentionImpl):
 	def get_impl_metadata(self) -> AttentionMetadata:
 		return self.metadata
 
+	@jax.named_scope("easydel-vanillaimpl-native-xla")
 	def forward_native(
 		self,
 		q: Array,
