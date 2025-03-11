@@ -99,7 +99,7 @@ class VanillaAttn(AttentionImpl):
 			aw = jnp.einsum("bskhd,bmkd->bkhsm", q * sm_scale, k, optimize=True)
 
 		if bias is not None:
-			if bias.shape[1] == qs:
+			if bias.shape[1] == (kh * num_reps):
 				bias = bias.reshape(b, kh, num_reps, qs, ks)
 			elif bias.shape[1] == kh:
 				bias = bias.reshape(b, kh, 1, qs, ks)
