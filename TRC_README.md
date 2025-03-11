@@ -34,7 +34,7 @@ pip install eopod
 > if you faced any error like eopod not found run following command
 >
 > ```shell
-> echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+> echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
 > ```
 
 Next, configure `eopod` with your project details:
