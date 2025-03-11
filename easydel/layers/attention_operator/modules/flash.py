@@ -115,49 +115,46 @@ class FlashAttn(AttentionImpl):
 			block_k_dq=min(self.metadata.blocksize_k, value_lenght),
 			block_q_dq=min(self.metadata.blocksize_q, query_lenght),
 		)
+		pi = [0]  # only shard DP and FSDP
+		bi = [0]  # only shard DP and FSDP
+
 		axis_index = value_partition_spec[1]
-		preserved_indices = [0]  # only shard DP and FSDP
-		bpreserved_indices = [0]  # only shard DP and FSDP
 		tparallel = self.metadata.mesh.shape[axis_index]
 		if (q.shape[2] % tparallel) == 0 and tparallel <= q.shape[2]:
-			preserved_indices = [0, 1]  # shard DP, FSDP and TP
+			pi = [0, 1]  # shard DP, FSDP and TP
 		if bias is not None:
 			if (bias.shape[1] % tparallel) == 0 and tparallel <= bias.shape[1]:
-				bpreserved_indices = [0, 1]  # shard DP, FSDP and TP
+				bi = [0, 1]
 				bias_partition_spec = Ps(
 					bias_partition_spec[0],
 					key_partition_spec[1],
 					None,
 					None,
 				)
-
+				
 		@functools.partial(
 			shard_map,
 			mesh=self.metadata.mesh,
 			in_specs=(
-				self.create_stable_sharding(query_partition_spec, preserved_indices, dep=q),
-				self.create_stable_sharding(key_partition_spec, preserved_indices, dep=k),
-				self.create_stable_sharding(value_partition_spec, preserved_indices, dep=v),
-				self.create_stable_sharding(bias_partition_spec, bpreserved_indices, dep=bias),
+				self.create_stable_sharding(query_partition_spec, pi, dep=q),
+				self.create_stable_sharding(key_partition_spec, pi, dep=k),
+				self.create_stable_sharding(value_partition_spec, pi, dep=v),
+				self.create_stable_sharding(bias_partition_spec, bi, dep=bias),
 			),
-			out_specs=self.create_stable_sharding(
-				attention_partition_spec,
-				preserved_indices,
-			),
+			out_specs=self.create_stable_sharding(attention_partition_spec, pi),
 			check_rep=False,
 		)
 		def _wraped_flash_attn(q, k, v, b):
-			kv_length = k.shape[2]
-			fn = functools.partial(
-				pallas_flash_attention,
+			out = pallas_flash_attention(
+				q,
+				k,
+				v,
+				b,
 				sm_scale=sm_scale,
 				block_sizes=block_sizes,
-				causal=causal,
+				causal=False if query_lenght == 1 else causal,
 			)
-			index = jax.lax.axis_index(axis_index)
-			if b is not None:
-				b = jax.lax.dynamic_slice_in_dim(b, index * kv_length, kv_length, -1)
-			return fn(q, k, v, b)
+			return out
 
 		attn = _wraped_flash_attn(
 			q.transpose(0, 2, 1, 3).astype(dtype),
@@ -213,8 +210,8 @@ class FlashAttn(AttentionImpl):
 			pi = [0, 2]  # shard DP, FSDP and TP
 		if bias is not None:
 			if (bias.shape[1] % tparallel) == 0 and tparallel <= bias.shape[1]:
-				pi = [0, 2]  # shard DP, FSDP and TP
-				bi = Ps(
+				pi = [0, 1]
+				bias_partition_spec = Ps(
 					bias_partition_spec[0],
 					key_partition_spec[2],
 					None,
