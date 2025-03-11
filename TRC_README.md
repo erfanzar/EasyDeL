@@ -48,7 +48,7 @@ Install the necessary dependencies and `easydel` from the latest source:
 ```shell
 eopod run pip install tensorflow tensorflow-datasets  # Required for training
 eopod run pip install torch --index-url https://download.pytorch.org/whl/cpu  # Required for model conversion
-eopod run pip install git+https://github.com/erfanzar/easydel  # Install easydel from the latest source
+eopod run pip install easydel
 ```
 
 Login to your wandb and huggingface account:
