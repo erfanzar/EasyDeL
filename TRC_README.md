@@ -34,7 +34,7 @@ pip install eopod
 > if you faced any error like eopod not found run following command
 >
 > ```shell
-> echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+> echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
 > ```
 
 Next, configure `eopod` with your project details:
@@ -48,7 +48,7 @@ Install the necessary dependencies and `easydel` from the latest source:
 ```shell
 eopod run pip install tensorflow tensorflow-datasets  # Required for training
 eopod run pip install torch --index-url https://download.pytorch.org/whl/cpu  # Required for model conversion
-eopod run pip install git+https://github.com/erfanzar/easydel  # Install easydel from the latest source
+eopod run pip install easydel
 ```
 
 Login to your wandb and huggingface account:
