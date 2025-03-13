@@ -34,7 +34,8 @@ from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.layers.caching import TransformerCacheView
 from easydel.layers.quantization.quantizers import EasyQuantizer
 from easydel.utils.helpers import get_logger
-from .attention_operator import AttentionMetadata, AttentionRegistry, AttentionOutput
+
+from .attention_operator import AttentionMetadata, AttentionOutput, AttentionRegistry
 
 logger = get_logger(__name__)
 
@@ -200,6 +201,15 @@ class FlaxAttentionModule(nn.Module):
 		self.cached_value: nn.Cache[Array] | None = None
 		self.cache_index: nn.Cache[Array] | None = None
 
+	@staticmethod
+	def build_cache_pos(
+		attention_mask: jax.Array,
+		cache_view: TransformerCacheView = None,
+	) -> jax.Array:
+		end_index = cache_view.index[0] if cache_view is not None else 0
+		inipos = jnp.cumsum(jnp.any(attention_mask, -1)[:, -1, :], axis=-1)
+		return (inipos - (inipos >= 1)) + end_index
+
 	@cached_property
 	def quantizer(self):
 		return EasyQuantizer(
@@ -300,6 +310,36 @@ class FlaxAttentionModule(nn.Module):
 		cache_view.index = cache_view.index + num_updated_cache_vectors
 		return key_cache, value_cache, attention_mask
 
+	@staticmethod
+	def _create_sliding_mask(
+		cache_pos: jnp.ndarray,
+		curr_index: int,
+		cache_length: int,
+		sliding_windows: int,
+	):
+		total_tokens = curr_index + cache_pos.shape[1]
+
+		def _reconstruct_rotated_cache_positions():
+			cache_positions = jnp.arange(cache_length) + total_tokens - cache_length
+			cache_positions = (
+				jnp.zeros_like(cache_positions)
+				.at[cache_positions % cache_length]
+				.set(cache_positions)
+			)
+			return cache_positions
+
+		cache_positions = jax.lax.cond(
+			total_tokens <= cache_length,
+			lambda: jnp.arange(cache_length),
+			_reconstruct_rotated_cache_positions,
+		)
+
+		cache_positions = cache_positions[None, None, :]
+		cache_pos = cache_pos[:, :, None]
+		sliding_mask = cache_positions > cache_pos - sliding_windows
+		sliding_mask *= cache_positions < cache_pos + sliding_windows
+		return sliding_mask
+
 	@jax.named_scope("easydel-flax-attention-concatenate")
 	def concatenate(
 		self,
@@ -343,15 +383,16 @@ class FlaxAttentionModule(nn.Module):
 				attention_mask=attention_mask,
 				causal_mask=causal_mask,
 			)
-		if sliding_windows is not None:
-			sliding_window_mask = jnp.tril(
-				jnp.ones_like(attention_mask, dtype=jnp.bool),
-				k=-sliding_windows,
+		if sliding_windows is not None and attention_mask is not None:
+			attention_mask = jnp.logical_and(
+				self._create_sliding_mask(
+					cache_pos=self.build_cache_pos(attention_mask, cache_view),
+					curr_index=cache_view.index[0] if cache_view is not None else 0,
+					cache_length=attention_mask.shape[-1],
+					sliding_windows=sliding_windows,
+				),
+				attention_mask,
 			)
-			window_mask = jnp.where(sliding_window_mask, 0, 1)
-			attention_mask = jnp.logical_and(window_mask, attention_mask)
-			if attention_mask.shape[-1] <= 1:
-				attention_mask = attention_mask[:, :, :, -sliding_windows:]
 
 		def init_attention_bias():
 			return lax.select(

@@ -126,10 +126,10 @@ from .infra.factory import (
 	register_module,
 )
 from .layers.attention import (
-	FlexibleAttentionModule,
 	AttentionMechanisms,
 	AttentionMetadata,
 	AttentionRegistry,
+	FlexibleAttentionModule,
 )
 from .modules.arctic import (
 	ArcticConfig,
@@ -138,19 +138,23 @@ from .modules.arctic import (
 )
 from .modules.auto import (
 	AutoEasyDeLConfig,
+	AutoEasyDeLModel,
 	AutoEasyDeLModelForCausalLM,
 	AutoEasyDeLModelForImageTextToText,
 	AutoEasyDeLModelForSeq2SeqLM,
 	AutoEasyDeLModelForSequenceClassification,
 	AutoEasyDeLModelForSpeechSeq2Seq,
 	AutoEasyDeLModelForZeroShotImageClassification,
+	AutoEasyDeLVisionModel,
 	AutoShardAndGatherFunctions,
+	AutoState,
 	AutoStateForCausalLM,
 	AutoStateForImageSequenceClassification,
 	AutoStateForImageTextToText,
 	AutoStateForSeq2SeqLM,
 	AutoStateForSpeechSeq2Seq,
 	AutoStateForZeroShotImageClassification,
+	AutoStateVisionModel,
 	get_modules_by_type,
 )
 from .modules.clip import (
@@ -209,6 +213,13 @@ from .modules.gemma2 import (
 	Gemma2ForCausalLM,
 	Gemma2ForSequenceClassification,
 	Gemma2Model,
+)
+from .modules.gemma3 import (
+	Gemma3Config,
+	Gemma3ForCausalLM,
+	Gemma3ForSequenceClassification,
+	Gemma3TextConfig,
+	Gemma3TextModel,
 )
 from .modules.gpt2 import (
 	GPT2Config,
@@ -335,6 +346,15 @@ from .modules.roberta import (
 	RobertaForSequenceClassification,
 	RobertaForTokenClassification,
 )
+from .modules.siglip import (
+	SiglipConfig,
+	SiglipForImageClassification,
+	SiglipModel,
+	SiglipTextConfig,
+	SiglipTextModel,
+	SiglipVisionConfig,
+	SiglipVisionModel,
+)
 from .modules.stablelm import (
 	StableLmConfig,
 	StableLmForCausalLM,
@@ -401,7 +421,7 @@ except ModuleNotFoundError:
 	print(
 		"UserWarning: please install `torch` (cpu or gpu) since `easydel` "
 		"uses `triton` and `triton` uses `torch` for autotuning, "
-		"and you can not use AutoEasyModel from torch.",
+		"and you can not use AutoEasyModel*.from_torch_pretrained.",
 	)
 
 del _Version

@@ -716,7 +716,7 @@ class EasyBridgeMixin(PushToHubMixin):
 
 		logger.debug("adding hf_model basic EasyDeL configurations.")
 		if hasattr(config_class, "add_jax_args"):
-			config_class.add_jax_args()
+			config_class.add_jax_args() 
 		config_class.add_basic_configurations(
 			axis_dims=sharding_axis_dims,
 			dcn_axis_dims=sharding_dcn_axis_dims,
@@ -846,6 +846,11 @@ class EasyBridgeMixin(PushToHubMixin):
 			from transformers import AutoModelForImageTextToText as module
 		elif cls._model_task == TaskType.SEQUENCE_CLASSIFICATION:
 			from transformers import AutoModelForSequenceClassification as module
+		elif cls._model_task == TaskType.BASE_MODULE:
+			from transformers import AutoModel as module
+		elif cls._model_task == TaskType.BASE_VISION:
+			# hf dont see anything diff between base and vision modules
+			from transformers import AutoModel as module
 		else:
 			raise ValueError(
 				"couldn't find requested hf autoloader,"
