@@ -27,19 +27,23 @@ from .arctic import (
 )
 from .auto import (
 	AutoEasyDeLConfig,
+	AutoEasyDeLModel,
 	AutoEasyDeLModelForCausalLM,
 	AutoEasyDeLModelForImageTextToText,
 	AutoEasyDeLModelForSeq2SeqLM,
 	AutoEasyDeLModelForSequenceClassification,
 	AutoEasyDeLModelForSpeechSeq2Seq,
 	AutoEasyDeLModelForZeroShotImageClassification,
+	AutoEasyDeLVisionModel,
 	AutoShardAndGatherFunctions,
+	AutoState,
 	AutoStateForCausalLM,
 	AutoStateForImageSequenceClassification,
 	AutoStateForImageTextToText,
 	AutoStateForSeq2SeqLM,
 	AutoStateForSpeechSeq2Seq,
 	AutoStateForZeroShotImageClassification,
+	AutoStateVisionModel,
 	get_modules_by_type,
 )
 from .clip import (
@@ -98,6 +102,13 @@ from .gemma2 import (
 	Gemma2ForCausalLM,
 	Gemma2ForSequenceClassification,
 	Gemma2Model,
+)
+from .gemma3 import (
+	Gemma3Config,
+	Gemma3ForCausalLM,
+	Gemma3ForSequenceClassification,
+	Gemma3TextConfig,
+	Gemma3TextModel,
 )
 from .gpt2 import (
 	GPT2Config,
@@ -224,6 +235,15 @@ from .roberta import (
 	RobertaForQuestionAnswering,
 	RobertaForSequenceClassification,
 	RobertaForTokenClassification,
+)
+from .siglip import (
+	SiglipConfig,
+	SiglipForImageClassification,
+	SiglipModel,
+	SiglipTextConfig,
+	SiglipTextModel,
+	SiglipVisionConfig,
+	SiglipVisionModel,
 )
 from .stablelm import (
 	StableLmConfig,

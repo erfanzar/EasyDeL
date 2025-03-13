@@ -60,7 +60,9 @@ class Registry:
 		}
 
 	def register_config(
-		self, config_type: str, config_field: ConfigType = ConfigType.MODULE_CONFIG
+		self,
+		config_type: str,
+		config_field: ConfigType = ConfigType.MODULE_CONFIG,
 	) -> callable:
 		"""
 		Register a configuration class.
@@ -79,7 +81,14 @@ class Registry:
 				for key in list(inspect.signature(obj.__init__).parameters.keys()):
 					attrb = getattr(self, key, "EMT_ATTR_EPLkey")
 					if attrb != "EMT_ATTR_EPLkey":
-						_stre += f"  {key}={repr(attrb)},\n"
+						if hasattr(attrb, "__str__") and not isinstance(
+							attrb,
+							(str, int, float, bool, list, dict, tuple),
+						):
+							nested_str = str(attrb).replace("\n", "\n  ")
+							_stre += f"  {key}={nested_str},\n"
+						else:
+							_stre += f"  {key}={repr(attrb)},\n"
 				return _stre + ")"
 
 			obj.__str__ = _str
@@ -148,9 +157,9 @@ class Registry:
 		task_in = self._task_registry.get(task_type, None)
 		assert task_in is not None, f"task type {task_type} is not defined."
 		type_in = task_in.get(model_type, None)
-		assert (
-			type_in is not None
-		), f"model type {model_type} is not defined. (upper task {task_type})"
+		assert type_in is not None, (
+			f"model type {model_type} is not defined. (upper task {task_type})"
+		)
 
 		return type_in
 

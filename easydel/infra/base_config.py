@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import os
 import typing as tp
 import warnings
@@ -422,6 +424,47 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			else jax.extend.backend.get_backend().platform
 		)
 
+	def read_basics_from_config(self, config: EasyDeLBaseConfig):
+		base_reads = [
+			"axis_dims",
+			"dcn_axis_dims",
+			"axis_names",
+			"attn_mechanism",
+			"blocksize_k",
+			"blocksize_q",
+			"blocksize_b",
+			"partition_axis",
+			"shard_attention_computation",
+			"use_sharded_kv_caching",
+			"backend",
+			"platform",
+			"easy_method",
+			"bits",
+			"scan_ring_attention",
+			"scan_attention_layers",
+			"use_sharding_constraint",
+			"use_scan_mlp",
+			"scan_mlp_chunk_size",
+			"sequence_axis_name",
+			"gradient_checkpointing",
+			"kv_cache_quantization_method",
+			"kv_cache_quantization_blocksize",
+			"quantization_method",
+			"quantization_blocksize",
+			"quantization_pattern",
+			"kv_cache_sharding_sequence_axis_name",
+			"flash_attention_backward_pass_impl",
+			"attn_dtype",
+			"attn_softmax_dtype",
+			"hardware_abstraction",
+			"pallas_m_block_size",
+			"pallas_k_block_size",
+			"pallas_n_block_size",
+		]
+		for key in base_reads:
+			if hasattr(config, key):
+				setattr(self, key, getattr(config, key))
+
 	def add_basic_configurations(
 		self,
 		axis_dims: tp.Sequence[int] = ...,
@@ -536,6 +579,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		set_attrs_smartly(self, "pallas_k_block_size", DEFAULT_PALLAS_K_BLOCK_SIZE, pallas_k_block_size)
 		set_attrs_smartly(self, "pallas_n_block_size", DEFAULT_PALLAS_N_BLOCK_SIZE, pallas_n_block_size)
 		# fmt: on
+
+		if getattr(self, "sub_configs", None) is not None:
+			for name, _ in getattr(self, "sub_configs").items():
+				getattr(self, name).read_basics_from_config(self)
 
 	def __repr__(self):
 		"""The __repr__ function is used to generate a string representation of an object.

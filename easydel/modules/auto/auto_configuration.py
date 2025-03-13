@@ -138,7 +138,7 @@ class AutoEasyDeLConfig:
 			backend=backend,
 			platform=platform,
 			shard_attention_computation=shard_attention_computation,
-		)
+		) 
 		for k, v in kwargs.items():
 			setattr(config, k, v)
 

@@ -34,7 +34,7 @@ torch.manual_seed(42)
 
 class EasyModelsTest(unittest.TestCase):
 	def setUp(self) -> None:
-		self.batch_size: int = 4
+		self.batch_size: int = 1
 		self.vocab_size: int = 32000
 		self.hidden_size: int = 64
 		self.intermediate_size: int = 128
@@ -68,10 +68,10 @@ class EasyModelsTest(unittest.TestCase):
 		self.rotary_dim = 32
 		self.dtype: jax.numpy.dtype = jnp.float32
 		self.precision = jax.lax.Precision("highest")
-		self.attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "flash_attn2"
+		self.attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "vanilla"
 		self.blocksize_k: int = 128
 		self.blocksize_q: int = 128
-		self.sequence_length = 2048
+		self.sequence_length = 8192
 		self.scan_mlp_chunk_size = self.sequence_length // 2
 		self.axis_dims = (1, 1, 1, -1)
 		self.head_dim = self.hidden_size // self.num_attention_heads
@@ -383,6 +383,28 @@ class EasyModelsTest(unittest.TestCase):
 			ed.TaskType.CAUSAL_LM,
 		)
 		self.assertTrue(res, f"INTERNLM2 model Failed [ERROR {err}]")
+
+	def test_gemma3_text(self): 
+		repo_id = "google/gemma-3-1b-it"
+		conf = ed.AutoEasyDeLConfig.from_pretrained(repo_id, trust_remote_code=True)
+		conf.hidden_size = self.hidden_size
+		conf.num_attention_heads = self.num_attention_heads
+		conf.num_key_value_heads = self.num_key_value_heads
+		# conf.num_hidden_layers = self.num_hidden_layers
+		conf.freq_max_position_embedding = self.max_position_embeddings
+		conf.mask_max_position_embedding = self.max_position_embeddings
+		conf.vocab_size = self.vocab_size
+		conf.attn_mechanism = "vanilla"
+		hf_model = transformers.Gemma3ForCausalLM
+
+		self.header_config = conf
+		res, err = self.create_test_for_models(
+			"gemma3_text",
+			hf_model,
+			ed.TaskType.CAUSAL_LM,
+		)
+		self.header_config = None
+		self.assertTrue(res, f"Gemma3Text model Failed [ERROR {err}]")
 
 	def test_mixtral(self):
 		self.header_config = None
@@ -822,11 +844,7 @@ class EasyModelsTest(unittest.TestCase):
 			return f"\x1b[{color_code}m{text}\x1b[0m"
 
 		correct_percentage = jnp.mean(
-			jnp.where(
-				jnp.isclose(to, jo, atol=0.125, rtol=0),
-				1,
-				0,
-			).reshape(-1)
+			jnp.where(jnp.isclose(to, jo, atol=0.125, rtol=0), 1, 0)
 		)
 		err = jnp.abs(to - jo).max()
 
@@ -886,6 +904,7 @@ if __name__ == "__main__":
 	# print(jax.devices())
 	test = EasyModelsTest()
 	test.setUp()
+	test.test_gemma3_text()
 	# test.test_arctic()  # Passed
 	# test.test_cohere()  # Passed
 	# test.test_dbrx()  # Passed
@@ -900,7 +919,7 @@ if __name__ == "__main__":
 	# test.test_gpt2()  # Passed
 	# test.test_grok1() # Not Tested Yet!
 	# test.test_internlm2()  # Passed
-	test.test_llama()  # Passed
+	# test.test_llama()  # Passed
 	# test.test_mamba()  # Passed
 	# test.test_mamba2()  # Passed
 	# test.test_mistral()  # Passed
