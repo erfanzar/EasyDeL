@@ -402,12 +402,13 @@ class GRPOTrainer(Trainer):
 				):
 					...
 			vinference_time = vinference_time_fn()
-			prompt_completion_ids = self._all_gather(output.sequences)
+			prompt_completion_ids = jnp.copy(self._all_gather(output.sequences))
 			completion_ids = prompt_completion_ids[..., output.padded_length :]
 			completion_mask = self._make_attn_mask(completion_ids)
-			ridmask = batch["attention_mask"].repeat(self.num_generations, 0)
+			ridmask = prompt_mask.repeat(self.num_generations, 0)
 			output = delete_tree(output)  # free kv memory
-
+			del output
+			
 			with capture_time() as token_logps_time_fn:
 				ref_per_token_logps = self.compute_refmodel_logps(
 					self.ref_state.graphstate,
