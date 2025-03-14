@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import dataclasses
-from hashlib import md5
 import typing as tp
 
 import chex
@@ -21,7 +20,6 @@ import jax.experimental
 import jax.experimental.pallas
 import jax.random
 from eformer.escale import PartitionAxis
-from eformer.jaximus import implicit
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax import random, sharding
@@ -43,7 +41,6 @@ from .logits_process import (
 )
 
 
-@jax.tree_util.register_pytree_node_class
 @dataclasses.dataclass
 class vInferencePreCompileConfig:
 	batch_size: tp.Union[int, tp.List[int]] = 1
@@ -77,21 +74,6 @@ class vInferencePreCompileConfig:
 		return hash_out
 
 	__hash__ = get_default_hash
-
-	def tree_flatten(self):
-		return (
-			self.batch_size,
-			self.prefill_length,
-			self.vision_included,
-			self.vision_batch_size,
-			self.vision_channels,
-			self.vision_height,
-			self.vision_width,
-		), {}
-
-	@classmethod
-	def tree_unflatten(cls, aux, children):
-		return cls(*children)
 
 	def get_standalones(self):
 		"""
@@ -137,6 +119,9 @@ class vInferencePreCompileConfig:
 			standalone_configs.append(vInferencePreCompileConfig(**config_kwargs))
 
 		return standalone_configs
+
+
+vInferencePreCompileConfig.__hash__ = vInferencePreCompileConfig.get_default_hash
 
 
 @jax.tree_util.register_pytree_node_class
@@ -410,7 +395,7 @@ def create_sampling_step(
 	pad_token_id: jax.Array,
 	do_sample: bool = True,
 ):
-	@implicit
+	
 	def sampling_step(graphdef, graphstate, graphother, state: SampleState):
 		"""
 		Performs a single sampling step for text generation.

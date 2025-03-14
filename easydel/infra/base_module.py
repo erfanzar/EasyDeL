@@ -30,11 +30,12 @@ from jax import lax
 from jax import numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
+from easydel.utils import traversals
 from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import flatten_dict, is_flatten, unflatten_dict
 
 from .base_config import EasyDeLBaseConfig
-from .etils import EasyDeLQuantizationMethods
+from .etils import EasyDeLGradientCheckPointers, EasyDeLQuantizationMethods
 from .loss_utils import (
 	LOSS_MAPPING,
 	ForCausalLMLoss,
@@ -620,6 +621,39 @@ class EasyDeLBaseModule(
 			dtype=self.param_dtype,
 			shard_fns=self._shard_fns,
 		)
+
+	@property
+	def _generate_compatible_graphdef(self):
+		from copy import deepcopy
+
+		adjusted_config = deepcopy(self.config)
+		adjusted_config.gradient_checkpointing = EasyDeLGradientCheckPointers.NONE
+		dummy = type(self).lazy_init(
+			config=adjusted_config,
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+			precision=self.precision,
+			rngs=self.rngs,
+		)
+		gdef, _, _ = nn.split(dummy, nn.Param, ...)
+		return gdef
+
+	@property
+	def _generate_compatible_graphother(self):
+		from copy import deepcopy
+
+		adjusted_config = deepcopy(self.config)
+		adjusted_config.gradient_checkpointing = EasyDeLGradientCheckPointers.NONE
+		dummy = type(self).lazy_init(
+			config=adjusted_config,
+			dtype=self.dtype,
+			param_dtype=self.param_dtype,
+			precision=self.precision,
+			rngs=self.rngs,
+		)
+		_, _, gother = nn.split(dummy, nn.Param, ...)
+		gother = traversals.recreate_meta_values(gother)
+		return gother
 
 	@property
 	def params_sharding(self) -> tp.Dict:

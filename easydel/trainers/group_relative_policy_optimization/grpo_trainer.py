@@ -392,10 +392,11 @@ class GRPOTrainer(Trainer):
 	) -> tp.Tuple[tp.Dict[str, jax.Array], tp.Dict[str, tp.Union[float, int, str]]]:
 		with capture_time() as preprocessing_time_fn:
 			prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]
+
 			with capture_time() as vinference_time_fn:
 				for output in self.vinference.generate(
-					input_ids=batch["input_ids"],
-					attention_mask=batch["attention_mask"],
+					input_ids=prompt_ids,
+					attention_mask=prompt_mask,
 					graphother=state.graphother,
 					graphstate=state.graphstate,
 				):

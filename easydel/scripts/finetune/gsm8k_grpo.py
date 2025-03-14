@@ -21,7 +21,6 @@ class RunTimeConfig:
 	    refrence_model_repo_id (str, optional): The repository ID for the reference model. If None, defaults to repo_id.
 	    sharding_axis (Tuple[int]): The sharding axis. Defaults to (1, -1, 1, 1).
 	    attn_mechanism (ed.AttentionMechanisms): The attention mechanism to use. Defaults to ed.AttentionMechanisms.VANILLA.
-	    gradient_checkpointing (ed.EasyDeLGradientCheckPointers): The gradient checkpointing strategy. Defaults to ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE.
 	    param_dtype (jnp.dtype): The data type for model parameters. Defaults to jnp.bfloat16.
 	    dtype (jnp.dtype): The data type for general computation. Defaults to jnp.bfloat16.
 	    attn_dtype (jnp.dtype): The data type for attention computation. Defaults to jnp.bfloat16.
@@ -49,6 +48,7 @@ class RunTimeConfig:
 		default=8,
 		metadata={"help": "number of sequences to generate from each sequence"},
 	)
+
 	top_p: float = field(
 		default=0.95,
 		metadata={"help": "top_p in vInference GenerationConfig"},
@@ -56,6 +56,10 @@ class RunTimeConfig:
 	top_k: int = field(
 		default=50,
 		metadata={"help": "top_k in vInference GenerationConfig"},
+	)
+	temperature: float = field(
+		default=0.7,
+		metadata={"help": "temperature in vInference GenerationConfig"},
 	)
 	sharding_axis: str = field(
 		default="1, -1, 1, 1",
@@ -65,10 +69,7 @@ class RunTimeConfig:
 		default=ed.AttentionMechanisms.VANILLA,
 		metadata={"help": "The attention mechanism to use."},
 	)
-	gradient_checkpointing: ed.EasyDeLGradientCheckPointers = field(
-		default=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
-		metadata={"help": "The gradient checkpointing strategy."},
-	)
+	
 	param_dtype: jnp.dtype = field(
 		default=jnp.bfloat16,
 		metadata={"help": "The data type for model parameters."},
@@ -111,7 +112,6 @@ def main():
 
 	if processor.pad_token_id is None:
 		processor.pad_token_id = processor.eos_token_id
-
 	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		runtime_config.repo_id,
 		auto_shard_model=True,
@@ -121,12 +121,10 @@ def main():
 			mask_max_position_embeddings=grpo_config.max_sequence_length,
 			attn_dtype=runtime_config.attn_dtype,
 			attn_softmax_dtype=runtime_config.attn_softmax_dtype,
-			gradient_checkpointing=runtime_config.gradient_checkpointing,
 			kv_cache_quantization_method=runtime_config.kv_cache_quantization,
 			attn_mechanism=runtime_config.attn_mechanism,
 		),
 		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-		platform=ed.EasyDeLPlatforms.JAX,
 		param_dtype=runtime_config.param_dtype,
 		dtype=runtime_config.dtype,
 		precision=jax.lax.Precision.DEFAULT,
@@ -240,6 +238,7 @@ def main():
 			do_sample=True,
 			max_new_tokens=max_completion_length,
 			streaming_chunks=max_completion_length,
+			temperature=runtime_config.temperature,
 			top_k=runtime_config.top_k,
 			top_p=runtime_config.top_p,
 			num_return_sequences=runtime_config.num_return_sequences,

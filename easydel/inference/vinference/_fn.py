@@ -16,7 +16,8 @@
 """Module for text generation pipeline using JAX/Flax."""
 
 import time
-import typing as tp  # noqa: F401
+import typing as tp
+import warnings  # noqa: F401
 
 import jax
 from jax import numpy as jnp
@@ -25,6 +26,8 @@ if tp.TYPE_CHECKING:
 	from easydel.infra import EasyDeLBaseModule
 else:
 	EasyDeLBaseModule = object
+from eformer.jaximus import implicit
+
 from ..utils import (
 	SampleState,
 	create_sampling_step,
@@ -71,6 +74,7 @@ def basic_generation_first_iter_fn(
 			logits_warper=generation_config.get_logits_processor(),
 			do_sample=generation_config.do_sample,
 		)
+		runner = implicit(runner)
 		state = runner(
 			graphdef=graphdef,
 			graphstate=graphstate,
@@ -113,6 +117,8 @@ def basic_generation_iter_fn(
 		logits_warper=generation_config.get_logits_processor(),
 		do_sample=generation_config.do_sample,
 	)
+
+	sampling_step = implicit(sampling_step)
 
 	def interval_sample(state):
 		return sampling_step(

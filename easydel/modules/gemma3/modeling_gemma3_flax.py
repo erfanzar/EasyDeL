@@ -258,8 +258,26 @@ class Gemma3Attention(FlaxAttentionModule):
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,
 			fcm_mask=fcm_mask,
-			sliding_windows=self.sliding_window if self.is_sliding else None,
+			sliding_windows=None,
 		)
+		if self.is_sliding:
+			attention_mask = jnp.logical_and(
+				self._create_sliding_mask(
+					cache_pos=self.build_cache_pos(attention_mask, cache_view),
+					curr_index=cache_view.index[0] if cache_view is not None else 0,
+					cache_length=attention_mask.shape[-1],
+					sliding_windows=self.sliding_window,
+				),
+				attention_mask,
+			)
+
+			def init_attention_bias():
+				return jax.lax.select(
+					attention_mask > 0,
+					jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+					jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+				)
+
 		attentions = self.attention_performer.forward(
 			query_states=query_states,
 			key_states=key_states,

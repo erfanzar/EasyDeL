@@ -22,7 +22,6 @@ class RunTimeConfig:
 	    refrence_model_repo_id (str, optional): The repository ID for the reference model. If None, defaults to repo_id.
 	    sharding_axis (Tuple[int]): The sharding axis. Defaults to (1, -1, 1, 1).
 	    attn_mechanism (ed.AttentionMechanisms): The attention mechanism to use. Defaults to ed.AttentionMechanisms.VANILLA.
-	    gradient_checkpointing (ed.EasyDeLGradientCheckPointers): The gradient checkpointing strategy. Defaults to ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE.
 	    param_dtype (jnp.dtype): The data type for model parameters. Defaults to jnp.bfloat16.
 	    dtype (jnp.dtype): The data type for general computation. Defaults to jnp.bfloat16.
 	    attn_dtype (jnp.dtype): The data type for attention computation. Defaults to jnp.bfloat16.
@@ -51,7 +50,6 @@ class RunTimeConfig:
 		default=100,
 		metadata={"help": "split in train or test dataset"},
 	)
-
 	top_p: float = field(
 		default=0.95,
 		metadata={"help": "top_p in vInference GenerationConfig"},
@@ -60,6 +58,10 @@ class RunTimeConfig:
 		default=50,
 		metadata={"help": "top_k in vInference GenerationConfig"},
 	)
+	temperature: float = field(
+		default=0.7,
+		metadata={"help": "temperature in vInference GenerationConfig"},
+	)
 	sharding_axis: str = field(
 		default="1, -1, 1, 1",
 		metadata={"help": "The sharding axis."},
@@ -67,10 +69,6 @@ class RunTimeConfig:
 	attn_mechanism: ed.AttentionMechanisms = field(
 		default=ed.AttentionMechanisms.AUTO,
 		metadata={"help": "The attention mechanism to use."},
-	)
-	gradient_checkpointing: ed.EasyDeLGradientCheckPointers = field(
-		default=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
-		metadata={"help": "The gradient checkpointing strategy."},
 	)
 	param_dtype: jnp.dtype = field(
 		default=jnp.bfloat16,
@@ -111,20 +109,23 @@ if jax.process_index() == 0:
 
 def main():
 	processor = AutoTokenizer.from_pretrained(runtime_config.processor_repo_id)
+	processor.padding_side = "left"
 
 	if processor.pad_token_id is None:
 		processor.pad_token_id = processor.eos_token_id
 
+	max_prompt_length = grpo_config.max_prompt_length
+	max_completion_length = grpo_config.max_completion_length
+	max_sequence_length = max_completion_length + max_prompt_length
 	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		runtime_config.repo_id,
 		auto_shard_model=True,
 		sharding_axis_dims=runtime_config.sharding_axis,
 		config_kwargs=ed.EasyDeLBaseConfigDict(
-			freq_max_position_embeddings=grpo_config.max_sequence_length,
-			mask_max_position_embeddings=grpo_config.max_sequence_length,
+			freq_max_position_embeddings=max_sequence_length,
+			mask_max_position_embeddings=max_sequence_length,
 			attn_dtype=runtime_config.attn_dtype,
 			attn_softmax_dtype=runtime_config.attn_softmax_dtype,
-			gradient_checkpointing=runtime_config.gradient_checkpointing,
 			kv_cache_quantization_method=runtime_config.kv_cache_quantization,
 			attn_mechanism=runtime_config.attn_mechanism,
 		),
@@ -135,8 +136,6 @@ def main():
 		partition_axis=ed.PartitionAxis(),
 	)
 
-	max_prompt_length = grpo_config.max_prompt_length
-	max_completion_length = grpo_config.max_completion_length
 	total_batch_size = grpo_config.total_batch_size
 
 	vinference = ed.vInference(
@@ -146,14 +145,14 @@ def main():
 			bos_token_id=processor.bos_token_id,
 			eos_token_id=processor.eos_token_id,
 			pad_token_id=processor.pad_token_id,
+			temperature=runtime_config.temperature,
 			do_sample=True,
 			max_new_tokens=max_completion_length,
-			streaming_chunks=max_completion_length,
+			streaming_chunks=32,
 			top_k=runtime_config.top_k,
 			top_p=runtime_config.top_p,
 			num_return_sequences=runtime_config.num_return_sequences,
 		),
-		seed=84,
 	)
 
 	vinference.precompile(
@@ -167,6 +166,7 @@ def main():
 		"""Reward function that checks if the completion has a specific format."""
 		pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
 		completion_contents = [completion[0]["content"] for completion in completions]
+		print(completion_contents)
 		matches = [re.match(pattern, content) for content in completion_contents]
 		rewards_list = [1.0 if match else 0.0 for match in matches]
 		return rewards_list
