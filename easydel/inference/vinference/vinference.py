@@ -38,8 +38,8 @@ from jax.sharding import NamedSharding, PartitionSpec
 from pydantic import BaseModel
 
 from easydel.infra.etils import EasyDeLGradientCheckPointers
+from jax._src.stages import Compiled
 from easydel.utils.compiling_utils import (
-	cjit,
 	load_compiled_fn,
 	save_compiled_fn,
 	smart_compile,
@@ -89,7 +89,7 @@ def extract_shardings(tree, mesh=None):
 class vInferenceMetaData(BaseModel):
 	inference_name: str
 	generation_config: vInferenceConfig
-	precompiled_configs: set
+	precompiled_configs: tp.Dict[int, vInferencePreCompileConfig]
 	in_compiling_process: set
 	input_partition_spec: jax.sharding.PartitionSpec
 	uuid4: str
@@ -151,7 +151,7 @@ class vInference:
 		self.mesh = self.model.config.mesh
 		self._rng_generator = GenerateRNG(seed)
 		self._precompile_lock = asyncio.Lock()
-		self._precompiled_configs: tp.Dict[str, vInferencePreCompileConfig] = dict()
+		self._precompiled_configs: tp.Dict[int, vInferencePreCompileConfig] = dict()
 		self._in_compiling_process = set()
 		self._init_variables()
 		self._validate_token_ids()
@@ -880,7 +880,12 @@ class vInference:
 			graphstate = self.graphstate
 		if graphother is None:
 			graphother = self.graphother
-
+		if isinstance(func, Compiled):
+			return (
+				graphstate,
+				graphother,
+				state,
+			)
 		return (
 			self.graphdef,
 			graphstate,
@@ -901,6 +906,13 @@ class vInference:
 			graphstate = self.graphstate
 		if graphother is None:
 			graphother = self.graphother
+		if isinstance(interval_func, Compiled):
+			return (
+				graphstate,
+				graphother,
+				state,
+				self.generation_config.streaming_chunks,
+			)
 		return (
 			self.graphdef,
 			graphstate,
@@ -987,45 +999,42 @@ class vInference:
 			state = self._get_init_state(standalone_config, wargs)
 			logger.info("smart compiling `first_iter_fn`")
 			logger.info("lowering `first_iter_fn`")
-			compiled_generate_func = cjit(
-				jax.jit(
-					basic_generation_first_iter_fn,
-					static_argnums=(0, 4),
-					in_shardings=(
-						extract_shardings(self.graphstate),
-						extract_shardings(self.graphother),
-						extract_shardings(state),
-					),
-				),
+			first_iter_fn_lowered = jax.jit(
+				basic_generation_first_iter_fn,
 				static_argnums=(0, 4),
-			)
-
-			logger.info("smart compiling `iter_fn`")
-			logger.info("lowering `iter_fn`")
-			sample_state = compiled_generate_func(
-				self.graphdef,
+				in_shardings=(
+					extract_shardings(self.graphstate),
+					extract_shardings(self.graphother),
+					extract_shardings(state),
+				),
+			).lower(
+				self.graphdef,  # Static
 				self.graphstate,
 				self.graphother,
 				state,
-				self.generation_config,
+				self.generation_config,  # Static
 			)
+			logger.info("`first_iter_fn` lowered successfully.")
+			compiled_generate_func = smart_compile(
+				first_iter_fn_lowered,
+				tag="vinference.basic_generation_first_iter_fn",
+			)
+			logger.info("smart compiling `iter_fn`")
+			logger.info("lowering `iter_fn`")
+			sample_state = compiled_generate_func(self.graphstate, self.graphother, state)
 			sample_state_shardings = extract_shardings(sample_state)
 
-			compiled_interval_func = cjit(
-				jax.jit(
-					basic_generation_iter_fn,
-					static_argnums=(0, 4),
-					in_shardings=(
-						extract_shardings(self.graphstate),
-						extract_shardings(self.graphother),
-						sample_state_shardings,
-						None,
-					),
-					out_shardings=sample_state_shardings,
-				),
+			iter_fn_lowered = jax.jit(
+				basic_generation_iter_fn,
 				static_argnums=(0, 4),
-			)
-			state = compiled_interval_func(
+				in_shardings=(
+					extract_shardings(self.graphstate),
+					extract_shardings(self.graphother),
+					sample_state_shardings,
+					None,
+				),
+				out_shardings=sample_state_shardings,
+			).lower(
 				self.graphdef,
 				self.graphstate,
 				self.graphother,
@@ -1033,6 +1042,12 @@ class vInference:
 				self.generation_config,
 				self.generation_config.streaming_chunks,
 			)
+			logger.info("`iter_fn` lowered successfully.")
+			compiled_interval_func = smart_compile(
+				iter_fn_lowered,
+				tag="vinference.basic_generation_iter_fn",
+			)
+
 			del state
 			logger.info("saving compiled functions...")
 			put_compiled_funcs(
@@ -1118,7 +1133,7 @@ class vInference:
 		path = pathlib.Path(path)
 		assert path.exists(), "provided path to vInference doesn't exists."
 		metadata = pickle.load(open(path / "config", "rb"))
-		for config_key, standalone_config in metadata.precompiled_configs:
+		for config_key, standalone_config in metadata.precompiled_configs.items():
 			metafile = f"{metadata.uuid4}-{config_key}"
 			compiled_generation_fn = load_compiled_fn(
 				path=path,

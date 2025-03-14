@@ -78,7 +78,7 @@ def cjit(
 			compiled_func = COMPILED_CACHE[cache_key]
 			return compiled_func(*dynamic_args, **dynamic_kwargs)
 		lowered_func: Lowered = fn.lower(*args, **kwargs)
-		compiled_func = smart_compile(lowered_func, "cjit")
+		compiled_func = smart_compile(lowered_func, "cached-jit")
 		COMPILED_CACHE[cache_key] = compiled_func
 
 		return compiled_func(*dynamic_args, **dynamic_kwargs)
