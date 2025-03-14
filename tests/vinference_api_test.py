@@ -62,7 +62,12 @@ def main():
 		),
 	)
 
-	inference.precompile(1, [1024])
+	inference.precompile(
+		ed.vInferencePreCompileConfig(
+			batch_size=1,
+			prefill_length=[1024],
+		)
+	)
 	print(inference.inference_name)
 	ed.vInferenceApiServer(inference).fire()
 

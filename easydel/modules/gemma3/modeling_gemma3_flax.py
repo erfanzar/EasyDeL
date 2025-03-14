@@ -14,6 +14,7 @@
 
 
 import typing as tp
+from dataclasses import dataclass
 from functools import cached_property, partial
 
 import chex
@@ -27,6 +28,7 @@ from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
 	FlaxSequenceClassifierOutput,
+	ModelOutput,
 )
 from easydel.infra.utils import (
 	ACT2FN,
@@ -37,7 +39,7 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.modules.siglip.modeling_siglip_flax import SiglipModel
+from easydel.modules.siglip.modeling_siglip_flax import SiglipVisionModel
 from easydel.utils.helpers import get_logger
 
 from .gemma3_configuration import Gemma3Config, Gemma3TextConfig
@@ -45,35 +47,44 @@ from .gemma3_configuration import Gemma3Config, Gemma3TextConfig
 logger = get_logger(__name__)
 
 
-def _create_sliding_mask(
-	position_ids: jnp.ndarray,
-	end_index: int,
-	cache_len: int,
-	sliding_window_size: int,
-):
-	"""Creates mask for sliding window attention."""
-	total_tokens = end_index + position_ids.shape[1]
+@dataclass
+class Gemma3CausalLMOutputWithPast(ModelOutput):
+	"""
+	Base class for Gemma3 causal language model (or autoregressive) outputs.
 
-	def _reconstruct_rotated_cache_positions():
-		cache_positions = jnp.arange(cache_len) + total_tokens - cache_len
-		cache_positions = (
-			jnp.zeros_like(cache_positions)
-			.at[cache_positions % cache_len]
-			.set(cache_positions)
-		)
-		return cache_positions
+	Args:
+	    loss (`chex.Array` of shape `(1,)`, *optional*, returned when `labels` is provided):
+	        Language modeling loss (for next-token prediction).
+	    logits (`chex.Array` of shape `(batch_size, sequence_length, config.text_config.vocab_size)`):
+	        Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+	    past_key_values (`tuple(tuple(chex.Array))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+	        Tuple of `tuple(chex.Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
+	        `(batch_size, num_heads, sequence_length, embed_size_per_head)`)
 
-	cache_positions = jax.lax.cond(
-		total_tokens <= cache_len,
-		lambda: jnp.arange(cache_len),
-		_reconstruct_rotated_cache_positions,
-	)
+	        Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
+	        `past_key_values` input) to speed up sequential decoding.
+	    hidden_states (`tuple(chex.Array)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+	        Tuple of `chex.Array` (one for the output of the embeddings, if the model has an embedding layer, +
+	        one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
 
-	cache_positions = cache_positions[None, None, :]
-	position_ids = position_ids[:, :, None]
-	sliding_mask = cache_positions > position_ids - sliding_window_size
-	sliding_mask *= cache_positions < position_ids + sliding_window_size
-	return sliding_mask
+	        Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
+	    attentions (`tuple(chex.Array)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+	        Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+	        sequence_length)`.
+
+	        Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+	        heads.
+	    image_hidden_states (`chex.Array`, *optional*):
+	        A `chex.Array` of size `(batch_size, sequence_length, hidden_size)`.
+	        image_hidden_states of the model produced by the vision encoder after projecting last hidden state.
+	"""
+
+	loss: tp.Optional[chex.Array] = None
+	logits: chex.Array = None
+	past_key_values: tp.Optional[TransformerCache] = None
+	hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
+	attentions: tp.Optional[tp.Tuple[chex.Array]] = None
+	image_hidden_states: tp.Optional[chex.Array] = None
 
 
 class Gemma3RMSNorm(nn.Module):
@@ -856,7 +867,19 @@ class Gemma3MultiModalProjector(nn.Module):
 		return projected_vision_outputs.astype(vision_outputs.dtype)
 
 
-# TODO: Register and fix this one
+@register_module(
+	TaskType.IMAGE_TEXT_TO_TEXT,
+	config=Gemma3Config,
+	model_type="gemma3",
+	embedding_layer_names=["embed_tokens", "position_embedding", "token_embedding"],
+	layernorm_names=[
+		"layernorm",
+		"layer_norm1",
+		"layer_norm2",
+		"final_layer_norm",
+		"post_layernorm",
+	],
+)
 class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 	def __init__(
 		self,
@@ -874,7 +897,7 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.vision_tower = SiglipModel(
+		self.vision_tower = SiglipVisionModel(
 			config=config.vision_config,
 			dtype=dtype,
 			param_dtype=param_dtype,
@@ -915,7 +938,6 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 		past_key_values: tp.Optional[TransformerCache] = None,
 		token_type_ids: tp.Optional[chex.Array] = None,
 		inputs_embeds: tp.Optional[chex.Array] = None,
-		use_cache: tp.Optional[bool] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: tp.Optional[bool] = None,
@@ -957,6 +979,12 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 				special_image_mask = jnp.broadcast_to(special_image_mask, inputs_embeds.shape)
 
 			image_features = image_features.astype(inputs_embeds.dtype)
+			inputs_embeds = jnp.place(
+				inputs_embeds,
+				special_image_mask,
+				image_features,
+				inplace=False,
+			)
 
 		outputs = self.language_model(
 			attention_mask=attention_mask,
@@ -969,19 +997,73 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 			segment_ids=None,
 			**lm_kwargs,
 		)
-		return outputs
+
+		return Gemma3CausalLMOutputWithPast(
+			loss=None,
+			logits=outputs.logits,
+			past_key_values=outputs.past_key_values,
+			hidden_states=outputs.hidden_states,
+			attentions=outputs.attentions,
+			image_hidden_states=image_features if pixel_values is not None else None,
+		)
+
+	def _get_compile_model_kwargs(
+		self,
+		batch_size: int,
+		input_tokens_length: int,
+		input_sharding: jax.sharding.PartitionSpec,
+		rngs: jax.random.PRNGKey,
+		include_vision: bool = False,
+		vision_batch_size: int = 1,
+		vision_channels: int = 3,
+		vision_height: tp.Optional[int] = None,
+		vision_width: tp.Optional[int] = None,
+		**kwargs,
+	):
+		basics = super()._get_compile_model_kwargs(
+			batch_size=batch_size,
+			input_tokens_length=input_tokens_length,
+			input_sharding=input_sharding,
+			rngs=rngs,
+			include_vision=include_vision,
+			vision_batch_size=vision_batch_size,
+			vision_channels=vision_channels,
+			vision_height=vision_height,
+			vision_width=vision_width,
+			**kwargs,
+		)
+		token_type_ids = jnp.ones(
+			(batch_size, input_tokens_length),
+			dtype="i4",
+			device=input_sharding,
+		)
+		basics.update({"token_type_ids": token_type_ids})
+		if include_vision:
+			pixel_values = jnp.ones(
+				(
+					vision_batch_size,
+					vision_channels,
+					self.config.vision_config.image_size,
+					self.config.vision_config.image_size,
+				),
+				dtype="f4",
+			)
+			basics.update({"pixel_values": pixel_values})
+		return basics
 
 	def prepare_inputs_for_generation(
 		self,
-		input_ids,
+		input_ids: chex.Array,
 		max_length: int,
-		pixel_values=None,
-		attention_mask=None,
+		pixel_values: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
+		token_type_ids: tp.Optional[chex.Array] = None,
 	):
 		model_inputs = self.language_model.prepare_inputs_for_generation(
 			input_ids=input_ids,
 			max_length=max_length,
 			attention_mask=attention_mask,
+			token_type_ids=token_type_ids,
 		)
 		model_inputs["pixel_values"] = pixel_values
 		return model_inputs

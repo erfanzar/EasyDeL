@@ -29,6 +29,7 @@ from ..utils import (
 	SampleState,
 	create_sampling_step,
 	vInferenceConfig,
+	vInferencePreCompileConfig,
 )
 
 
@@ -129,12 +130,10 @@ COMPILED_FUNCS = {}
 
 
 def get_compiled_funcs(
-	batch_size: int,
-	input_tokens_length: int,
+	standalone_config: vInferencePreCompileConfig,
 	id: str,
 	safe: bool = True,
-	fn1: tp.Optional[tp.Callable] = None,
-	fn2: tp.Optional[tp.Callable] = None,
+	false_instance: tp.Any = None,
 ):
 	"""
 	Retrieves compiled generation functions from a cache.
@@ -142,38 +141,32 @@ def get_compiled_funcs(
 	Args:
 		batch_size: The batch size.
 		input_tokens_length: The length of the input tokens.
+		vision_active: whenever the model using it vision features.
 		id: A unique identifier for the compilation.
 
-	Returns:
-		Tuple[Callable, Callable]: A tuple containing the compiled generate and
-			interval generate functions, or (None, None) if not found in the cache.
 	"""
-	search_key = f"Bx{batch_size}-Sx{input_tokens_length}-UUID{id}"
-	f1, f2 = COMPILED_FUNCS.get(search_key, (fn1, fn2))
-	if (f1 is None or f2 is None) and safe:
+	search_key = f"{standalone_config.get_default_hash()}-UUID{id}"
+	outs = COMPILED_FUNCS.get(search_key, false_instance)
+	if outs is None and safe:
 		raise RuntimeError(
 			"wasn't able to find requested functions please `precompile`"
 			" inference before using `generate` function."
 		)
-	return f1, f2
+	return outs
 
 
 def put_compiled_funcs(
-	compiled_generate_func,
-	compiled_interval_func,
-	batch_size,
-	input_tokens_length,
-	id,
+	funcs: tp.Any,
+	standalone_config: vInferencePreCompileConfig,
+	id: str,
 ):
 	"""
 	Stores compiled generation functions in a cache.
 
 	Args:
-		compiled_generate_func: The compiled generate function.
-		compiled_interval_func: The compiled interval generate function.
-		batch_size: The batch size.
-		input_tokens_length: The length of the input tokens.
+		funcs: functions to put.
+		standalone_config: vinference precompile config
 		id: A unique identifier for the compilation.
 	"""
-	search_key = f"Bx{batch_size}-Sx{input_tokens_length}-UUID{id}"
-	COMPILED_FUNCS[search_key] = (compiled_generate_func, compiled_interval_func)
+	search_key = f"{standalone_config.get_default_hash()}-UUID{id}"
+	COMPILED_FUNCS[search_key] = funcs

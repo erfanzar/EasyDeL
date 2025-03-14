@@ -241,6 +241,8 @@ def compute_linear_frequencies(
 	max_position_embeddings: int,
 	scaling_factors: tp.List[float],
 ):
+	if not isinstance(scaling_factors, list):
+		scaling_factors = [scaling_factors]
 	inv_freq = compute_basic_inv_frequencies(
 		base=base,
 		rotary_dim=rotary_dim,
@@ -982,7 +984,7 @@ def get_rope(
 				max_position_embeddings=max_position,
 				base=base,
 				is_neox_style=is_neox_style,
-				scaling_factor=scaling_factor,
+				scaling_factors=scaling_factor,
 				dtype=dtype,
 			)
 		elif scaling_type == "dynamic":

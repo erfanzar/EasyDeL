@@ -67,7 +67,12 @@ def setup_inference():
 		),
 	)
 	print("compiling...")
-	inference.precompile(1, MAX_INPUT_LENGTH)
+	inference.precompile(
+		ed.vInferencePreCompileConfig(
+			batch_size=1,
+			prefill_length=MAX_INPUT_LENGTH,
+		)
+	)
 	print("compiled.")
 	return inference, tokenizer
 
@@ -113,7 +118,7 @@ async def run_benchmark(
 		tps = new_tokens / (end_time - start_time)
 		tps_results.append(tps.reshape(-1, 1))
 
-		print(f"Run {i+1}/{num_iterations}: {tps:.2f} tokens/sec")
+		print(f"Run {i + 1}/{num_iterations}: {tps:.2f} tokens/sec")
 
 	# Calculate statistics
 	tps_results = jnp.concatenate(tps_results, axis=-1)
@@ -122,8 +127,8 @@ async def run_benchmark(
 
 	print("\nBenchmark Results:")
 	print(f"Average TPS: {avg_tps} ± {std_tps}")
-	print(f"Min TPS: {jnp.mean(tps_results,axis=-1)}")
-	print(f"Max TPS: {jnp.max(tps_results,axis=-1)}")
+	print(f"Min TPS: {jnp.mean(tps_results, axis=-1)}")
+	print(f"Max TPS: {jnp.max(tps_results, axis=-1)}")
 
 	return tps_results
 

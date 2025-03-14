@@ -581,7 +581,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		# fmt: on
 
 		if getattr(self, "sub_configs", None) is not None:
-			for name, _ in getattr(self, "sub_configs").items():
+			for name, _ in getattr(self, "sub_configs", {}).items():
 				getattr(self, name).read_basics_from_config(self)
 
 	def __repr__(self):

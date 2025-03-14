@@ -384,7 +384,40 @@ class EasyModelsTest(unittest.TestCase):
 		)
 		self.assertTrue(res, f"INTERNLM2 model Failed [ERROR {err}]")
 
-	def test_gemma3_text(self): 
+	def test_gemma3(self):
+		repo_id = "google/gemma-3-4b-it"
+		model_task = ed.TaskType.IMAGE_TEXT_TO_TEXT
+		conf = ed.AutoEasyDeLConfig.from_pretrained(
+			repo_id,
+			trust_remote_code=True,
+			model_task=model_task,
+		)
+
+		conf.text_config.hidden_size = self.hidden_size
+
+		conf.text_config.num_attention_heads = self.num_attention_heads
+		conf.text_config.num_key_value_heads = self.num_key_value_heads
+
+		# conf.num_hidden_layers = self.num_hidden_layers
+
+		conf.text_config.freq_max_position_embedding = self.max_position_embeddings
+		conf.text_config.mask_max_position_embedding = self.max_position_embeddings
+
+		conf.text_config.vocab_size = self.vocab_size
+		conf.text_config.attn_mechanism = "vanilla"
+
+		hf_model = transformers.Gemma3ForConditionalGeneration
+
+		self.header_config = conf
+		res, err = self.create_test_for_models(
+			"gemma3",
+			hf_model,
+			model_task,
+		)
+		self.header_config = None
+		self.assertTrue(res, f"Gemma3 model Failed [ERROR {err}]")
+
+	def test_gemma3_text(self):
 		repo_id = "google/gemma-3-1b-it"
 		conf = ed.AutoEasyDeLConfig.from_pretrained(repo_id, trust_remote_code=True)
 		conf.hidden_size = self.hidden_size
@@ -904,7 +937,9 @@ if __name__ == "__main__":
 	# print(jax.devices())
 	test = EasyModelsTest()
 	test.setUp()
-	test.test_gemma3_text()
+
+	# test.test_gemma3_text()  # Passed
+	test.test_gemma3()  # Passed
 	# test.test_arctic()  # Passed
 	# test.test_cohere()  # Passed
 	# test.test_dbrx()  # Passed

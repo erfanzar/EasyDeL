@@ -1,7 +1,7 @@
 import os
 import sys
 
-os.environ["LOGGING_LEVEL_ED"] = "DEBUG"
+# os.environ["LOGGING_LEVEL_ED"] = "DEBUG"
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
@@ -18,9 +18,9 @@ def main():
 	else:
 		sharding_axis_dims = (1, 1, 1, -1)
 
-	max_length = 16384
-	max_new_tokens = 4096
-
+	prefill_length = 4096
+	max_new_tokens = 2048
+	max_length = prefill_length + max_new_tokens
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
 
 	if jax.default_backend() == "gpu":
@@ -29,7 +29,7 @@ def main():
 		attn_kwargs = dict(
 			attn_dtype=jnp.float16,
 			attn_softmax_dtype=jnp.float32,
-			attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
+			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		)
 	else:
 		dtype = jnp.bfloat16
@@ -59,18 +59,15 @@ def main():
 			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 			**attn_kwargs,
 		),
-		quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
+		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 		param_dtype=param_dtype,
 		dtype=dtype,
 		partition_axis=partition_axis,
 		precision=jax.lax.Precision.DEFAULT,
 	)
 
-	print("MODEL LOADED")
-
 	if os.environ.get("APPED_LORA_TEST", "false") in ["true", "yes"]:
 		model = model.apply_lora_to_layers(32, ".*(q_proj|k_proj).*")
-	print("CREATING vInference")
 
 	inference = ed.vInference(
 		model=model,
@@ -87,9 +84,14 @@ def main():
 		),
 	)
 
-	print(model.model_task)
-	print(model.model_type)
-	inference.precompile(1, [max_length - max_new_tokens])
+	print(model.model_task, model.model_type)
+
+	inference.precompile(
+		ed.vInferencePreCompileConfig(
+			batch_size=1,
+			prefill_length=prefill_length,
+		)
+	)
 
 	messages = [
 		{
@@ -101,7 +103,7 @@ def main():
 			"content": "write 10 lines story about why you love EasyDeL",
 		},
 	]
-	ed.utils.helpers.get_logger(name=__name__).info("Applying Chat Template")
+
 	ids = tokenizer.apply_chat_template(
 		messages,
 		return_tensors="jax",

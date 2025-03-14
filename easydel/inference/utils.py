@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import dataclasses
+from hashlib import md5
 import typing as tp
 
 import chex
@@ -19,12 +20,15 @@ import jax
 import jax.experimental
 import jax.experimental.pallas
 import jax.random
+from eformer.escale import PartitionAxis
+from eformer.jaximus import implicit
+from flax import nnx as nn
 from jax import numpy as jnp
 from jax import random, sharding
-from eformer.jaximus import implicit
-from eformer.escale import PartitionAxis
 from jax.sharding import PartitionSpec
-from flax import nnx as nn
+
+from easydel.utils.compiling_utils import get_safe_hash_int
+
 from .logits_process import (
 	FlaxForcedBOSTokenLogitsProcessor,
 	FlaxForcedEOSTokenLogitsProcessor,
@@ -37,6 +41,102 @@ from .logits_process import (
 	FlaxTopPLogitsWarper,
 	hash_fn,
 )
+
+
+@jax.tree_util.register_pytree_node_class
+@dataclasses.dataclass
+class vInferencePreCompileConfig:
+	batch_size: tp.Union[int, tp.List[int]] = 1
+	prefill_length: tp.Optional[tp.Union[int, tp.List[int]]] = None
+	vision_included: tp.Union[bool, tp.List[bool]] = False
+	vision_batch_size: tp.Optional[tp.Union[int, tp.List[int]]] = None
+	vision_channels: tp.Optional[tp.Union[int, tp.List[int]]] = None
+	vision_height: tp.Optional[tp.Union[int, tp.List[int]]] = None
+	vision_width: tp.Optional[tp.Union[int, tp.List[int]]] = None
+
+	def _im_standalone(self):
+		standalone = True
+		for field in dataclasses.fields(self):
+			attr = getattr(self, field.name)
+			if isinstance(attr, list):
+				standalone = False
+		return standalone
+
+	_is_standalone = _im_standalone
+
+	def get_default_hash(self):
+		hash_str = ""
+		hash_str += str(self.batch_size) + "-"
+		hash_str += str(self.prefill_length) + "-"
+		hash_str += str(self.vision_included) + "-"
+		hash_str += str(self.vision_batch_size) + "-"
+		hash_str += str(self.vision_channels) + "-"
+		hash_str += str(self.vision_height) + "-"
+		hash_str += str(self.vision_width)
+		hash_out = get_safe_hash_int(hash_str)
+		return hash_out
+
+	__hash__ = get_default_hash
+
+	def tree_flatten(self):
+		return (
+			self.batch_size,
+			self.prefill_length,
+			self.vision_included,
+			self.vision_batch_size,
+			self.vision_channels,
+			self.vision_height,
+			self.vision_width,
+		), {}
+
+	@classmethod
+	def tree_unflatten(cls, aux, children):
+		return cls(*children)
+
+	def get_standalones(self):
+		"""
+		Creates standalone configurations when any field contains a list.
+		Returns a list of standalone vInferencePreCompileConfig instances.
+
+		For example, if batch_size=[1, 2, 3, 4], it will create 4 standalone configs
+		with batch_size values 1, 2, 3, and 4 respectively.
+		"""
+		if self._is_standalone():
+			return [self]
+
+		list_fields = {}
+		max_length = 0
+
+		for field in dataclasses.fields(self):
+			attr = getattr(self, field.name)
+			if isinstance(attr, list):
+				list_fields[field.name] = attr
+				max_length = max(max_length, len(attr))
+
+		# Create standalone configs
+		standalone_configs = []
+
+		for i in range(max_length):
+			config_kwargs = {}
+
+			for field in dataclasses.fields(self):
+				attr = getattr(self, field.name)
+				field_name = field.name
+
+				if field_name in list_fields:
+					list_attr = list_fields[field_name]
+					# Use value at index i if available, otherwise use the last value
+					if i < len(list_attr):
+						config_kwargs[field_name] = list_attr[i]
+					else:
+						config_kwargs[field_name] = list_attr[-1]
+				else:
+					# For non-list fields, use the original value
+					config_kwargs[field_name] = attr
+
+			standalone_configs.append(vInferencePreCompileConfig(**config_kwargs))
+
+		return standalone_configs
 
 
 @jax.tree_util.register_pytree_node_class
@@ -89,9 +189,8 @@ class vInferenceConfig:
 
 	def get_partition_rules(
 		self,
-		runtime_config: tp.Optional[
-			tp.Tuple[int, int]
-		] = None,  # in case that someone needs to customize this
+		# in case that someone needs to customize this
+		runtime_config: tp.Optional[vInferencePreCompileConfig] = None,
 	):
 		if self.partition_rules is not None:
 			return self.partition_rules

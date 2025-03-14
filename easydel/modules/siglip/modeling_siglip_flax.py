@@ -878,7 +878,7 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
 	def __call__(self, hidden_state):
 		batch_size = hidden_state.shape[0]
 		probe = self.probe.value.repeat(batch_size, 0)
-		hidden_state = self.attention(probe, hidden_state, hidden_state) 
+		hidden_state = self.attention(probe, hidden_state, hidden_state)
 		residual = hidden_state
 		hidden_state = self.layernorm(hidden_state)
 		hidden_state = residual + self.mlp(hidden_state)
@@ -928,9 +928,7 @@ class SiglipVisionModel(nn.Module):
 			pixel_values=pixel_values,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict
-			if return_dict is not None
-			else self.config.use_return_dict,
+			return_dict=return_dict,
 			interpolate_pos_encoding=interpolate_pos_encoding,
 		)
 
