@@ -37,6 +37,7 @@ from jax.interpreters import pxla
 from jax.sharding import NamedSharding, PartitionSpec
 from pydantic import BaseModel
 
+from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.utils.compiling_utils import (
 	cjit,
 	load_compiled_fn,
@@ -124,7 +125,13 @@ class vInference:
 		"""
 		from easydel.utils import GenerateRNG
 
+		if model.config.gradient_checkpointing != EasyDeLGradientCheckPointers.NONE:
+			logger.error(
+				"JAX generation with gradient checkpointing enabled may produce incorrect or junk outputs. "
+				"Consider disabling checkpointing for reliable results."
+			)
 		graphdef, graphstate, graphother = nn.split(model, nn.Param, ...)
+
 		self.graphdef = graphdef
 		self.graphstate = graphstate
 		self.graphother = graphother
@@ -1026,7 +1033,6 @@ class vInference:
 				self.generation_config,
 				self.generation_config.streaming_chunks,
 			)
-
 			del state
 			logger.info("saving compiled functions...")
 			put_compiled_funcs(
