@@ -369,7 +369,12 @@ def run_benchmark(
 			print(f"Actual prefill length: {actual_prefill_length}")
 
 			# Precompile for this specific length
-			inference.precompile(1, prefill_length)
+			inference.precompile(
+				ed.vInferencePreCompileConfig(
+					batch_size=1,
+					prefill_length=prefill_length,
+				)
+			)
 
 			# Run multiple times and average results
 			run_results = []

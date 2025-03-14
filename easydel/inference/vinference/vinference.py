@@ -33,12 +33,12 @@ from chex import PRNGKey
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
-from jax._src.stages import Compiled
 from jax.interpreters import pxla
 from jax.sharding import NamedSharding, PartitionSpec
 from pydantic import BaseModel
 
 from easydel.utils.compiling_utils import (
+	cjit,
 	load_compiled_fn,
 	save_compiled_fn,
 	smart_compile,
@@ -48,6 +48,7 @@ from easydel.utils.helpers import get_logger
 from ..utils import (
 	SampleState,
 	vInferenceConfig,
+	vInferencePreCompileConfig,
 )
 from ._fn import (
 	basic_generation_first_iter_fn,
@@ -143,7 +144,7 @@ class vInference:
 		self.mesh = self.model.config.mesh
 		self._rng_generator = GenerateRNG(seed)
 		self._precompile_lock = asyncio.Lock()
-		self._precompiled_configs = set()
+		self._precompiled_configs: tp.Dict[str, vInferencePreCompileConfig] = dict()
 		self._in_compiling_process = set()
 		self._init_variables()
 		self._validate_token_ids()
@@ -282,6 +283,7 @@ class vInference:
 		    ValueError: If no maximum sequence length configuration is found
 		"""
 		possible_length_attributes = [
+			"granted_freq_max_position_embedding",
 			"granted_mask_max_position_embedding",
 			"max_position_embedding",
 			"max_sequence_length",
@@ -362,30 +364,36 @@ class vInference:
 			mesh=mesh,
 		)
 
-	def _get_init_state(self, signature: tuple[int, int], model_kwargs):
-		assert len(signature) == 2
-		assert isinstance(signature, tuple)
-		batch_size, sequence_length = signature
-		func, _ = get_compiled_funcs(
-			batch_size,
-			sequence_length,
+	def _get_init_state(
+		self,
+		standalone_config: vInferencePreCompileConfig,
+		model_kwargs,
+	):
+		func = get_compiled_funcs(
+			standalone_config=standalone_config,
 			id="_init_state",
 			safe=False,
 		)
 		if func is None:
-			logger.info(f"registering new signature({signature}) for `_init_state`")
+			logger.info(
+				f"registering new signature({standalone_config.get_default_hash()}) for `_init_state`"
+			)
 			lowered = jax.jit(
 				self._init_state_non_jit,
 				out_shardings=jax.tree_util.tree_map(
 					lambda spec: NamedSharding(mesh=self.mesh, spec=spec),
 					es.match_partition_rules(
-						self.generation_config.get_partition_rules(signature),
+						self.generation_config.get_partition_rules(standalone_config),
 						jax.eval_shape(self._init_state_non_jit, **model_kwargs),
 					),
 				),
 			).lower(**model_kwargs)
 			func = smart_compile(lowered, tag="vinference-init-state")
-			put_compiled_funcs(func, None, batch_size, sequence_length, "_init_state")
+			put_compiled_funcs(
+				funcs=func,
+				standalone_config=standalone_config,
+				id="_init_state",
+			)
 		return func(**model_kwargs)
 
 	def _init_state_non_jit(
@@ -421,6 +429,7 @@ class vInference:
 			max_length=max_length,
 			**model_kwargs,
 		)
+
 		return SampleState(
 			current_length=current_length,
 			sequences=sequences,
@@ -530,17 +539,17 @@ class vInference:
 		if not self._precompiled_configs:
 			warnings.warn(
 				f"vInference [{self.inference_name}] doesn't contain any precompiled "
-				"config please precompile instance for best performance (eg : vinference.precompile(1,[1024, 2048, 4096, 6144]))",
+				"config please precompile instance for best performance",
 				stacklevel=1,
 			)
 			return (batch_size, sequence_length)
 
 		# Group configs by batch size
 		batch_configs = {}
-		for b, s in self._precompiled_configs:
-			if b not in batch_configs:
-				batch_configs[b] = []
-			batch_configs[b].append(s)
+		for confs in self._precompiled_configs.values():
+			if confs.batch_size not in batch_configs:
+				batch_configs[confs.batch_size] = []
+			batch_configs[confs.batch_size].append(confs.prefill_length)
 
 		# Find best batch size
 		available_batches = sorted(batch_configs.keys())
@@ -576,6 +585,37 @@ class vInference:
 				best_length = max_length
 
 		return (best_batch, best_length)
+
+	def _create_vinference_config_from_kwargs(
+		self,
+		batch_size: int,
+		prefill_length: int,
+		kwargs: tp.Dict,
+	) -> vInferencePreCompileConfig:
+		vision_included = False
+		vision_batch_size = None
+		vision_channels = None
+		vision_height = None
+		vision_width = None
+		if "pixle_values" in kwargs:
+			vision_included = True
+			(
+				vision_batch_size,
+				vision_channels,
+				vision_height,
+				vision_width,
+			) = kwargs["pixle_values"].shape
+		vinf_config = vInferencePreCompileConfig(
+			batch_size=batch_size,
+			prefill_length=prefill_length,
+			vision_included=vision_included,
+			vision_batch_size=vision_batch_size,
+			vision_channels=vision_channels,
+			vision_height=vision_height,
+			vision_width=vision_width,
+		)
+
+		return vinf_config
 
 	def _adjust_inputs_to_config(
 		self,
@@ -708,8 +748,12 @@ class vInference:
 				target_batch=target_batch,
 				target_length=target_length,
 			)
-			# Ensure compilation for optimal config
-			self.precompile(batch_size=target_batch, input_tokens_length=target_length)
+			vinference_compile_config = self._create_vinference_config_from_kwargs(
+				batch_size=batch_size,
+				prefill_length=target_length,
+				kwargs=adjusted_kwargs,
+			)
+			self.precompile(vinference_compile_config)
 
 			if target_batch <= 0 or target_length <= 0:
 				raise ValueError(
@@ -726,12 +770,12 @@ class vInference:
 					batch_size=target_batch,
 					sequence_length=target_length,
 					model_kwargs=adjusted_kwargs,
+					vinference_compile_config=vinference_compile_config,
 				)
 				state.padded_length = target_length
 
-				generate_func, interval_func = get_compiled_funcs(
-					batch_size=target_batch,
-					input_tokens_length=target_length,
+				(generate_func, interval_func) = get_compiled_funcs(
+					standalone_config=vinference_compile_config,
 					id=self._uuid4,
 				)
 
@@ -762,6 +806,7 @@ class vInference:
 		batch_size: int,
 		sequence_length: int,
 		model_kwargs: dict,
+		vinference_compile_config: vInferencePreCompileConfig,
 	) -> SampleState:
 		"""Prepares the initial state for text generation."""
 		if attention_mask is None:
@@ -778,7 +823,7 @@ class vInference:
 		if model_kwargs.get("rng") is None:
 			rng = self._rng_generator.rng
 			model_kwargs["rng"] = rng
-		return self._get_init_state((batch_size, sequence_length), model_kwargs)
+		return self._get_init_state(vinference_compile_config, model_kwargs)
 
 	def _inner_generate(
 		self,
@@ -829,13 +874,6 @@ class vInference:
 		if graphother is None:
 			graphother = self.graphother
 
-		if isinstance(func, Compiled):
-			return (
-				graphstate,
-				graphother,
-				state,
-			)
-
 		return (
 			self.graphdef,
 			graphstate,
@@ -856,14 +894,6 @@ class vInference:
 			graphstate = self.graphstate
 		if graphother is None:
 			graphother = self.graphother
-		if isinstance(interval_func, Compiled):
-			return (
-				graphstate,
-				graphother,
-				state,
-				self.generation_config.streaming_chunks,
-			)
-
 		return (
 			self.graphdef,
 			graphstate,
@@ -925,74 +955,70 @@ class vInference:
 
 		raise RuntimeError(f"Generation failed: {str(error)}") from error
 
-	def _get_compile_model_kwargs(self, batch_size, input_tokens_length):
-		return dict(
-			input_ids=jnp.ones(
-				(batch_size, input_tokens_length),
-				dtype="i4",
-				device=self.input_sharding,
-			),
-			attention_mask=jnp.ones(
-				(batch_size, input_tokens_length),
-				dtype="b1",
-				device=self.input_sharding,
-			),
-			rng=self._rng_generator.rng,
-		)
-
-	def _compile_and_lower_funs(self, batch_size: int, input_tokens_length: int):
-		compiled_generate_func, compiled_interval_func = get_compiled_funcs(
-			batch_size=batch_size,
-			input_tokens_length=input_tokens_length,
+	def _compile_and_lower_funs(self, standalone_config: vInferencePreCompileConfig):
+		assert standalone_config._im_standalone()
+		funs = get_compiled_funcs(
+			standalone_config=standalone_config,
 			id=self._uuid4,
 			safe=False,
 		)
-		do_compile = compiled_generate_func is None or compiled_interval_func is None
+		do_compile = funs is None
 		if do_compile:
 			logger.info("initiating state for lowering and compiling func.")
-			wargs = self._get_compile_model_kwargs(
-				batch_size=batch_size,
-				input_tokens_length=input_tokens_length,
+			wargs = self.model._get_compile_model_kwargs(
+				batch_size=standalone_config.batch_size,
+				input_tokens_length=standalone_config.prefill_length,
+				input_sharding=self.input_sharding,
+				rngs=self._rng_generator.rng,
+				include_vision=standalone_config.vision_included,
+				vision_batch_size=standalone_config.vision_batch_size,
+				vision_channels=standalone_config.vision_channels,
+				vision_height=standalone_config.vision_height,
+				vision_width=standalone_config.vision_width,
 			)
-			state = self._get_init_state((batch_size, input_tokens_length), wargs)
+
+			state = self._get_init_state(standalone_config, wargs)
 			logger.info("smart compiling `first_iter_fn`")
 			logger.info("lowering `first_iter_fn`")
-			first_iter_fn_lowered = jax.jit(
-				basic_generation_first_iter_fn,
-				static_argnums=(0, 4),
-				in_shardings=(
-					extract_shardings(self.graphstate),
-					extract_shardings(self.graphother),
-					extract_shardings(state),
+			compiled_generate_func = cjit(
+				jax.jit(
+					basic_generation_first_iter_fn,
+					static_argnums=(0, 4),
+					in_shardings=(
+						extract_shardings(self.graphstate),
+						extract_shardings(self.graphother),
+						extract_shardings(state),
+					),
 				),
-			).lower(
-				self.graphdef,  # Static
+				static_argnums=(0, 4),
+			)
+
+			logger.info("smart compiling `iter_fn`")
+			logger.info("lowering `iter_fn`")
+			sample_state = compiled_generate_func(
+				self.graphdef,
 				self.graphstate,
 				self.graphother,
 				state,
-				self.generation_config,  # Static
+				self.generation_config,
 			)
-			logger.info("`first_iter_fn` lowered successfully.")
-			compiled_generate_func = smart_compile(
-				first_iter_fn_lowered,
-				tag="vinference.basic_generation_first_iter_fn",
-			)
-			logger.info("smart compiling `iter_fn`")
-			logger.info("lowering `iter_fn`")
-			sample_state = compiled_generate_func(self.graphstate, self.graphother, state)
 			sample_state_shardings = extract_shardings(sample_state)
 
-			iter_fn_lowered = jax.jit(
-				basic_generation_iter_fn,
-				static_argnums=(0, 4),
-				in_shardings=(
-					extract_shardings(self.graphstate),
-					extract_shardings(self.graphother),
-					sample_state_shardings,
-					None,
+			compiled_interval_func = cjit(
+				jax.jit(
+					basic_generation_iter_fn,
+					static_argnums=(0, 4),
+					in_shardings=(
+						extract_shardings(self.graphstate),
+						extract_shardings(self.graphother),
+						sample_state_shardings,
+						None,
+					),
+					out_shardings=sample_state_shardings,
 				),
-				out_shardings=sample_state_shardings,
-			).lower(
+				static_argnums=(0, 4),
+			)
+			state = compiled_interval_func(
 				self.graphdef,
 				self.graphstate,
 				self.graphother,
@@ -1000,27 +1026,16 @@ class vInference:
 				self.generation_config,
 				self.generation_config.streaming_chunks,
 			)
-			logger.info("`iter_fn` lowered successfully.")
-			compiled_interval_func = smart_compile(
-				iter_fn_lowered,
-				tag="vinference.basic_generation_iter_fn",
-			)
 
 			del state
 			logger.info("saving compiled functions...")
 			put_compiled_funcs(
-				compiled_generate_func=compiled_generate_func,
-				compiled_interval_func=compiled_interval_func,
-				batch_size=batch_size,
-				input_tokens_length=input_tokens_length,
+				funcs=(compiled_generate_func, compiled_interval_func),
+				standalone_config=standalone_config,
 				id=self._uuid4,
 			)
 
-	def precompile(
-		self,
-		batch_size: tp.Union[int, tp.List[int]] = 1,
-		input_tokens_length: tp.Optional[tp.Union[int, tp.List[int]]] = None,
-	):
+	def precompile(self, config: vInferencePreCompileConfig):
 		"""
 		Precompiles the generation functions for a given batch size and input length.
 
@@ -1028,53 +1043,100 @@ class vInference:
 		the given configuration. If not, it compiles them asynchronously and stores them
 		in a cache.
 
-		Args:
-		  batch_size: The batch size.
-		  input_tokens_length: The length of the input tokens.
-
 		Returns:
 		  bool: True if precompilation was successful, False otherwise.
 		"""
-		if input_tokens_length is None:
-			input_tokens_length = self.model_prefill_length
+		if config.prefill_length is None:
+			config.prefill_length = self.model_prefill_length
 			logger.info(
 				"`input_tokens_length` is None using `vInference.model_prefill_length`"
 			)
-		if isinstance(batch_size, list) or isinstance(input_tokens_length, list):
-			batch_size = batch_size if isinstance(batch_size, list) else [batch_size]
-			input_tokens_length = (
-				input_tokens_length
-				if isinstance(input_tokens_length, list)
-				else [input_tokens_length]
-			)
-			for b in batch_size:
-				for i in input_tokens_length:
-					self.precompile(b, i)
-		else:
-			config_key = (batch_size, input_tokens_length)
+		for standalone_config in config.get_standalones():
+			config_hash = standalone_config.get_default_hash()
 
-			if config_key in self._precompiled_configs:
+			if config_hash in self._precompiled_configs.keys():
 				return True
-			if config_key in self._in_compiling_process:
+			if config_hash in self._in_compiling_process:
 				logger.info(
-					f"lowering and compiling with `config` {config_key} have already been requested adding 5 second timeout"
+					f"lowering and compiling with `config` {config_hash} have "
+					"already been requested adding 5 second timeout"
 				)
 				time.sleep(5)
-				return self.precompile(
-					batch_size=batch_size,
-					input_tokens_length=input_tokens_length,
-				)
+				return self.precompile(config=standalone_config)
 			else:
 				with self._compilation_metrics_recorder():
-					logger.info(f"lowering and compiling with `config` {config_key}")
-					self._in_compiling_process.add(config_key)
+					logger.info(f"lowering and compiling with `config` {config_hash}")
+					self._in_compiling_process.add(config_hash)
 					with self.mesh:
-						self._compile_and_lower_funs(
-							batch_size=batch_size,
-							input_tokens_length=input_tokens_length,
-						)
-					self._precompiled_configs.add(config_key)
-			return True
+						self._compile_and_lower_funs(standalone_config=standalone_config)
+					self._precompiled_configs.update({config_hash: standalone_config})
+		return True
+
+	def save_inference(self, path: tp.Union[os.PathLike, str]):
+		path = pathlib.Path(path)
+		path.mkdir(exist_ok=True, parents=True)
+		metadata = vInferenceMetaData(
+			inference_name=self.inference_name,
+			generation_config=self.generation_config,
+			precompiled_configs=self._precompiled_configs,
+			in_compiling_process=self._in_compiling_process,
+			input_partition_spec=self.input_partition_spec,
+			uuid4=self._uuid4,
+		)
+		for config_key, config in self._precompiled_configs.items():
+			metafile = f"{metadata.uuid4}-{config_key}"
+			(compiled_generation_fn, compiled_interval_fn) = get_compiled_funcs(
+				standalone_config=config,
+				id=metadata.uuid4,
+			)
+			save_compiled_fn(
+				path=path,
+				fn=compiled_generation_fn,
+				prefix=f"compiled-first-iter-{metafile}",
+			)
+			save_compiled_fn(
+				path=path,
+				fn=compiled_interval_fn,
+				prefix=f"compiled-iter-{metafile}",
+			)
+
+		metadata = pickle.dump(metadata, open(path / "config", "wb"))
+
+	@classmethod
+	def load_inference(
+		cls,
+		path: tp.Union[os.PathLike, str],
+		model: EasyDeLBaseModule,
+		processor_class: ProcessingClassType,
+	):
+		path = pathlib.Path(path)
+		assert path.exists(), "provided path to vInference doesn't exists."
+		metadata = pickle.load(open(path / "config", "rb"))
+		for config_key, standalone_config in metadata.precompiled_configs:
+			metafile = f"{metadata.uuid4}-{config_key}"
+			compiled_generation_fn = load_compiled_fn(
+				path=path,
+				prefix=f"compiled-first-iter-{metafile}",
+			)
+			compiled_interval_fn = load_compiled_fn(
+				path=path,
+				prefix=f"compiled-iter-{metafile}",
+			)
+			put_compiled_funcs(
+				funcs=(compiled_generation_fn, compiled_interval_fn),
+				standalone_config=standalone_config,
+				id=metadata.uuid4,
+			)
+		self = cls(
+			model=model,
+			processor_class=processor_class,
+			generation_config=metadata.generation_config,
+			input_partition_spec=metadata.input_partition_spec,
+			inference_name=metadata.inference_name,
+		)
+		self._uuid4 = metadata.uuid4
+		self._precompiled_configs = metadata.precompiled_configs
+		return self
 
 	@tp.overload
 	def count_tokens(self, messages: tp.List[tp.Dict[str, str]]): ...
@@ -1093,59 +1155,3 @@ class vInference:
 		else:
 			tokens = self.tokenizer.encode(conv)
 			return len(tokens)
-
-	def save_inference(self, path: tp.Union[os.PathLike, str]):
-		path = pathlib.Path(path)
-		path.mkdir(exist_ok=True, parents=True)
-		metadata = vInferenceMetaData(
-			inference_name=self.inference_name,
-			generation_config=self.generation_config,
-			precompiled_configs=self._precompiled_configs,
-			in_compiling_process=self._in_compiling_process,
-			input_partition_spec=self.input_partition_spec,
-			uuid4=self._uuid4,
-		)
-		for config_key in self._precompiled_configs:
-			batch_size, input_tokens_length = config_key
-			metafile = f"{metadata.uuid4}-{batch_size}-{input_tokens_length}"
-			compiled_generation_fn, compiled_interval_fn = get_compiled_funcs(
-				batch_size=batch_size,
-				input_tokens_length=input_tokens_length,
-				id=metadata.uuid4,
-			)
-			save_compiled_fn(path=path, fn=compiled_generation_fn, prefix=f"cgf-{metafile}")
-			save_compiled_fn(path=path, fn=compiled_interval_fn, prefix=f"cif-{metafile}")
-
-		metadata = pickle.dump(metadata, open(path / "config", "wb"))
-
-	@classmethod
-	def load_inference(
-		cls,
-		path: tp.Union[os.PathLike, str],
-		model: EasyDeLBaseModule,
-		processor_class: ProcessingClassType,
-	):
-		path = pathlib.Path(path)
-		assert path.exists(), "provided path to vInference doesn't exists."
-		metadata = pickle.load(open(path / "config", "rb"))
-		for config_key in metadata.precompiled_configs:
-			batch_size, input_tokens_length = config_key
-			metafile = f"{metadata.uuid4}-{batch_size}-{input_tokens_length}"
-			compiled_generation_fn = load_compiled_fn(path=path, prefix=f"cgf-{metafile}")
-			compiled_interval_fn = load_compiled_fn(path=path, prefix=f"cif-{metafile}")
-			put_compiled_funcs(
-				compiled_generate_func=compiled_generation_fn,
-				compiled_interval_func=compiled_interval_fn,
-				batch_size=batch_size,
-				input_tokens_length=input_tokens_length,
-				id=metadata.uuid4,
-			)
-		self = cls(
-			model=model,
-			processor_class=processor_class,
-			generation_config=metadata.generation_config,
-			input_partition_spec=metadata.input_partition_spec,
-			inference_name=metadata.inference_name,
-		)
-		self._uuid4 = metadata.uuid4
-		return self

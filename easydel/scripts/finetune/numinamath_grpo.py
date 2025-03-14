@@ -156,7 +156,12 @@ def main():
 		seed=84,
 	)
 
-	vinference.precompile(total_batch_size, max_prompt_length)
+	vinference.precompile(
+		ed.vInferencePreCompileConfig(
+			batch_size=total_batch_size,
+			prefill_length=max_prompt_length,
+		)
+	)
 
 	def format_reward(completions, **kwargs):
 		"""Reward function that checks if the completion has a specific format."""

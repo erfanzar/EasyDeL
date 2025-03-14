@@ -361,3 +361,26 @@ class Gemma3Config(EasyDeLBaseConfig):
 		self.initializer_range = initializer_range
 
 		super().__init__(**kwargs)
+
+	def get_partition_rules(self, *args, **kwargs):
+		return (
+			(
+				"language_model/model/embed_tokens/embedding",
+				PartitionSpec("tp", ("fsdp", "sp")),
+			),
+			(
+				"self_attn/(q_proj|k_proj|v_proj)/kernel",
+				PartitionSpec(("fsdp", "sp"), "tp"),
+			),
+			("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("input_layernorm/kernel", PartitionSpec(None)),
+			("post_attention_layernorm/kernel", PartitionSpec(None)),
+			("pre_feedforward_layernorm/kernel", PartitionSpec(None)),
+			("post_feedforward_layernorm/kernel", PartitionSpec(None)),
+			("language_model/model/norm/kernel", PartitionSpec(None)),
+			("language_model/lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			(".*", PartitionSpec(None)),
+		)

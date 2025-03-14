@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from ..utils import vInferencePreCompileConfig
 from .api_server import vInferenceApiServer
 from .vinference import vInference, vInferenceConfig
 
-__all__ = ["vInference", "vInferenceConfig", "vInferenceApiServer"]
+__all__ = (
+	"vInference",
+	"vInferenceConfig",
+	"vInferenceApiServer",
+	"vInferencePreCompileConfig",
+)

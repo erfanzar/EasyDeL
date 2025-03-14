@@ -168,6 +168,7 @@ class EasyGenerationMixin:
 		input_ids,
 		max_length,
 		attention_mask: tp.Optional[chex.Array] = None,
+		token_type_ids: tp.Optional[chex.Array] = None,
 	):
 		"""The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
 
@@ -175,8 +176,8 @@ class EasyGenerationMixin:
 		    self: Access variables that belong to the class
 		    input_ids: Pass in the input tokens
 		    max_length: Set the length of the sequence to be generated
-		    attention_mask: tp.Optional[chex.Array]: Mask the attention
-		        weights
+		    attention_mask: tp.Optional[chex.Array]: Mask the attention weights
+				token_type_ids: tp.Optional[chex.Array]: TokenTypeIds
 
 		Returns:
 		    A dictionary of the past_key_values, attention_mask and
@@ -199,19 +200,47 @@ class EasyGenerationMixin:
 			position_ids = jnp.broadcast_to(
 				jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length)
 			)
+		if token_type_ids is not None:
+			token_type_ids = lax.dynamic_update_slice(
+				jnp.zeros((batch_size, max_length), dtype="i4"),
+				token_type_ids,
+				(0, 0),
+			)
+			token_type_ids = jax.device_put(token_type_ids, device=sharding)
+		calldict = {
+			"past_key_values": past_key_values,
+			"attention_mask": jax.device_put(extended_attention_mask, device=sharding),
+			"position_ids": jax.device_put(position_ids, device=sharding),
+		}
+		if token_type_ids is not None:
+			calldict.update({"token_type_ids": token_type_ids})
 
-		return self.prepare_inputs_for_call(
-			**{
-				"past_key_values": past_key_values,
-				"attention_mask": jax.device_put(extended_attention_mask, device=sharding),
-				"position_ids": jax.device_put(position_ids, device=sharding),
-			}
-		)
+		return self.prepare_inputs_for_call(**calldict)
 
 	def update_inputs_for_generation(self, model_outputs, model_kwargs):
 		model_kwargs["past_key_values"] = model_outputs.past_key_values
 		model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
 		return model_kwargs
+
+	def _get_compile_model_kwargs(
+		self,
+		batch_size: int,
+		input_tokens_length: int,
+		input_sharding: jax.sharding.PartitionSpec,
+		rngs: jax.random.PRNGKey,
+		include_vision: bool = False,
+		vision_batch_size: int = 1,
+		vision_channels: int = 3,
+		vision_height: tp.Optional[int] = None,
+		vision_width: tp.Optional[int] = None,
+		**kwargs,
+	):
+		deteshape = (batch_size, input_tokens_length)
+		return dict(
+			input_ids=jnp.ones(deteshape, dtype="i4", device=input_sharding),
+			attention_mask=jnp.ones(deteshape, dtype="b1", device=input_sharding),
+			rng=rngs,
+		)
 
 	def _validate_signature(
 		self,

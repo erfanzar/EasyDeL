@@ -98,7 +98,12 @@ def main():
 	print(model.model_task)
 	print(model.model_type)
 	print("Compiling")
-	inference.precompile(1, inference.model_prefill_length)
+	inference.precompile(
+		ed.vInferencePreCompileConfig(
+			batch_size=1,
+			prefill_length=inference.model_prefill_length,
+		)
+	)
 
 	print("Done Compiling")
 	print("Evaluating on MMLU Lite")

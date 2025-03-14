@@ -16,6 +16,7 @@ Modules
    modules_falcon
    modules_gemma
    modules_gemma2
+   modules_gemma3
    modules_gpt2
    modules_gpt_j
    modules_gpt_neox
@@ -42,6 +43,7 @@ Modules
    modules_qwen2_vl
    modules_roberta
    modules_rwkv
+   modules_siglip
    modules_stablelm
    modules_whisper
    modules_xerxes

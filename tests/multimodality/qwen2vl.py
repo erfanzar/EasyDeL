@@ -5,7 +5,6 @@ import threading
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
-import easydel as ed
 import time
 from functools import partial
 
@@ -22,6 +21,7 @@ from qwen_vl_utils import process_vision_info
 from transformers import AutoProcessor, Qwen2VLProcessor
 from transformers import Qwen2VLForConditionalGeneration as hfmodel_cond
 
+import easydel as ed
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
@@ -328,7 +328,12 @@ def easydel_generate():
 	print(model.model_task)
 	print(model.model_type)
 	print("Compiling")
-	inference.precompile(1, inference.model_prefill_length)
+	inference.precompile(
+		ed.vInferencePreCompileConfig(
+			batch_size=1,
+			prefill_length=inference.model_prefill_length,
+		)
+	)
 	print("Done Compiling")
 
 	messages = [

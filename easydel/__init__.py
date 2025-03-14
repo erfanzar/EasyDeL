@@ -94,6 +94,7 @@ from .inference.vinference import (
 	vInference,
 	vInferenceApiServer,
 	vInferenceConfig,
+	vInferencePreCompileConfig,
 )
 from .inference.whisper_inference import (
 	vWhisperInference,
