@@ -28,7 +28,6 @@ import jax
 import jax.experimental
 import jax.tree_util
 import numpy as np
-
 from eformer.escale import PartitionAxis, with_sharding_constraint
 from einops import rearrange
 from flax import nnx as nn
@@ -182,8 +181,8 @@ def get_dot_general_by_bits(
 	"""
 	if bits is not None:
 		try:
-			from aqt.jax.v2 import config as q_config
-			from aqt.jax.v2.flax import aqt_flax as q_flax
+			from aqt.jax.v2 import config as q_config  # type: ignore
+			from aqt.jax.v2.flax import aqt_flax as q_flax  # type: ignore
 		except ModuleNotFoundError as e:
 			raise ModuleNotFoundError(
 				"No module named `aqt` has been found, please "
@@ -591,6 +590,7 @@ def auto_remat(
 			static_argnums=static_argnums,
 			policy=policy,
 		)
+
 		outs += (module,)
 	return outs
 

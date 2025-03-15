@@ -222,22 +222,21 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
 		Returns:
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
+		fsdpsp_over_tp = PartitionSpec(("fsdp", "sp"), "tp")
+		tp_over_fsdpsp = PartitionSpec("tp", ("fsdp", "sp"))
 		return (
-			("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-			(
-				"self_attn/(q_proj|k_proj|v_proj)/kernel",
-				PartitionSpec(("fsdp", "sp"), "tp"),
-			),
-			("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("model/embed_tokens/embedding", tp_over_fsdpsp),
+			("self_attn/(q_proj|k_proj|v_proj)/kernel", fsdpsp_over_tp),
+			("self_attn/o_proj/kernel", tp_over_fsdpsp),
+			("mlp/gate_proj/kernel", fsdpsp_over_tp),
+			("mlp/down_proj/kernel", tp_over_fsdpsp),
+			("mlp/up_proj/kernel", fsdpsp_over_tp),
 			("input_layernorm/kernel", PartitionSpec(None)),
 			("post_attention_layernorm/kernel", PartitionSpec(None)),
 			("pre_feedforward_layernorm/kernel", PartitionSpec(None)),
 			("post_feedforward_layernorm/kernel", PartitionSpec(None)),
 			("model/norm/kernel", PartitionSpec(None)),
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("lm_head/kernel", fsdpsp_over_tp),
 			(".*", PartitionSpec(None)),
 		)
 
@@ -363,24 +362,20 @@ class Gemma3Config(EasyDeLBaseConfig):
 		super().__init__(**kwargs)
 
 	def get_partition_rules(self, *args, **kwargs):
+		fsdpsp_over_tp = PartitionSpec(("fsdp", "sp"), "tp")
+		tp_over_fsdpsp = PartitionSpec("tp", ("fsdp", "sp"))
 		return (
-			(
-				"language_model/model/embed_tokens/embedding",
-				PartitionSpec("tp", ("fsdp", "sp")),
-			),
-			(
-				"self_attn/(q_proj|k_proj|v_proj)/kernel",
-				PartitionSpec(("fsdp", "sp"), "tp"),
-			),
-			("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("language_model/model/embed_tokens/embedding", tp_over_fsdpsp),
+			("self_attn/(q_proj|k_proj|v_proj)/kernel", fsdpsp_over_tp),
+			("self_attn/o_proj/kernel", tp_over_fsdpsp),
+			("mlp/gate_proj/kernel", fsdpsp_over_tp),
+			("mlp/down_proj/kernel", tp_over_fsdpsp),
+			("mlp/up_proj/kernel", fsdpsp_over_tp),
 			("input_layernorm/kernel", PartitionSpec(None)),
 			("post_attention_layernorm/kernel", PartitionSpec(None)),
 			("pre_feedforward_layernorm/kernel", PartitionSpec(None)),
 			("post_feedforward_layernorm/kernel", PartitionSpec(None)),
 			("language_model/model/norm/kernel", PartitionSpec(None)),
-			("language_model/lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("language_model/lm_head/kernel", fsdpsp_over_tp),
 			(".*", PartitionSpec(None)),
 		)
