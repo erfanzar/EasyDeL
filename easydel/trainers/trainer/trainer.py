@@ -334,6 +334,7 @@ class Trainer(BaseTrainer):
 					step=current_step,
 					mode="train",
 				)
+				self.log_weight_distribution(state=state, step=current_step)
 				# Save checkpoint if needed
 				if self._should_save_checkpoint(current_step):
 					_ = self._save_state(

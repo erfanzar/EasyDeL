@@ -1061,6 +1061,9 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 		else:
 			raise NotImplementedError(f"Progress Bar type {rpr}'s not supported.")
 
+	def log_weight_distribution(self, state: EasyDeLState, step: int):
+		return self.arguments.log_weight_distribution(state=state, step=step)
+
 	def log_metrics(
 		self,
 		metrics: MetricsType,

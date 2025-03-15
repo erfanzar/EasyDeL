@@ -167,7 +167,7 @@ def prettify_nnx(
 							item_param,
 						).lstrip()
 						output.append(
-							f"{new_indent}  (0-{len(value)-1}): {len(value)} x {child_str}"
+							f"{new_indent}  (0-{len(value) - 1}): {len(value)} x {child_str}"
 						)
 					else:
 						child_str = prettify_nnx(
@@ -582,6 +582,18 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		**batch,
 	) -> tp.Tuple[tp.Any, LossMetrics]:
 		"""basic `compute_loss` call"""
+
+	@property
+	@abstractmethod
+	def graphdef(self) -> nn.GraphDef: ...
+
+	@property
+	@abstractmethod
+	def graphstate(self) -> nn.GraphState: ...
+
+	@property
+	@abstractmethod
+	def graphother(self) -> nn.GraphState: ...
 
 	@abstractmethod
 	def to_dtype(self: SELF, dtype) -> SELF:
