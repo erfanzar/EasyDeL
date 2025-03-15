@@ -30,6 +30,7 @@ from easydel.infra.modeling_outputs import (
 	FlaxSequenceClassifierOutput,
 	ModelOutput,
 )
+from easydel.layers.norms import float8s
 from easydel.infra.utils import (
 	ACT2FN,
 	auto_remat,
@@ -91,25 +92,26 @@ class Gemma3RMSNorm(nn.Module):
 	def __init__(
 		self,
 		config: Gemma3TextConfig,
-		dtype: jnp.dtype = jnp.float32,
-		dim=None,
-		epsilon=None,
+		param_dtype: jnp.dtype = jnp.float32,
+		dim: tp.Optional[int] = None,
+		epsilon: tp.Optional[float] = None,
 	):
 		self.config = config
 		self.epsilon = self.config.rms_norm_eps if epsilon is None else epsilon
-		self.dtype = dtype
+		self.param_dtype = param_dtype
 		dim = self.config.hidden_size if dim is None else dim
-		self.kernel = nn.Param(jnp.ones(dim, dtype=dtype))
+		self.kernel = nn.Param(jnp.ones(dim, dtype=param_dtype))
 
-	def __call__(self, hidden_states):
-		variance = hidden_states.astype(jnp.float32)
-		hidden_states = variance * (
-			1 / jnp.sqrt(jnp.power(variance, 2).mean(-1, keepdims=True) + self.epsilon)
-		)
+	def _norm(self, x: jax.Array) -> jax.Array:
+		return x * (1 / jnp.sqrt(jnp.power(x, 2).mean(-1, keepdims=True) + self.epsilon))
 
-		return (1 + self.kernel.value.astype(self.dtype)) * jnp.asarray(
-			hidden_states, dtype=self.dtype
-		)
+	def __call__(self, hidden_states: jax.Array) -> jax.Array:
+		variance = self._norm(hidden_states.astype(jnp.float32)).astype(self.param_dtype)
+		out = (1 + self.kernel.value.astype(self.param_dtype)) * variance
+
+		if out.dtype in float8s:
+			out = out.astype(jnp.bfloat16)
+		return out
 
 
 class Gemma3Attention(FlaxAttentionModule):
@@ -136,7 +138,9 @@ class Gemma3Attention(FlaxAttentionModule):
 		self.embed_dim = config.hidden_size
 		self.num_heads = config.num_attention_heads
 		self.head_dim = getattr(
-			config, "head_dim", config.hidden_size // config.num_attention_heads
+			config,
+			"head_dim",
+			config.hidden_size // config.num_attention_heads,
 		)
 
 		self.num_key_value_heads = config.num_key_value_heads
@@ -161,8 +165,16 @@ class Gemma3Attention(FlaxAttentionModule):
 		self.is_sliding = bool((layer_idx + 1) % config.sliding_window_pattern)
 		self.sliding_window = config.sliding_window if self.is_sliding else None
 
-		self.q_norm = Gemma3RMSNorm(self.config, dtype=self.param_dtype, dim=self.head_dim)
-		self.k_norm = Gemma3RMSNorm(self.config, dtype=self.param_dtype, dim=self.head_dim)
+		self.q_norm = Gemma3RMSNorm(
+			self.config,
+			param_dtype=self.param_dtype,
+			dim=self.head_dim,
+		)
+		self.k_norm = Gemma3RMSNorm(
+			self.config,
+			param_dtype=self.param_dtype,
+			dim=self.head_dim,
+		)
 
 		self.attention_performer = FlexibleAttentionModule(
 			base_config=config,
@@ -388,10 +400,22 @@ class Gemma3DecoderLayer(nn.Module):
 			rngs=rngs,
 		)
 
-		self.input_layernorm = Gemma3RMSNorm(self.config, dtype=self.param_dtype)
-		self.post_attention_layernorm = Gemma3RMSNorm(self.config, dtype=self.param_dtype)
-		self.pre_feedforward_layernorm = Gemma3RMSNorm(self.config, dtype=self.param_dtype)
-		self.post_feedforward_layernorm = Gemma3RMSNorm(self.config, dtype=self.param_dtype)
+		self.input_layernorm = Gemma3RMSNorm(
+			self.config,
+			param_dtype=self.param_dtype,
+		)
+		self.post_attention_layernorm = Gemma3RMSNorm(
+			self.config,
+			param_dtype=self.param_dtype,
+		)
+		self.pre_feedforward_layernorm = Gemma3RMSNorm(
+			self.config,
+			param_dtype=self.param_dtype,
+		)
+		self.post_feedforward_layernorm = Gemma3RMSNorm(
+			self.config,
+			param_dtype=self.param_dtype,
+		)
 
 		self.is_sliding = self.self_attn.is_sliding
 		self.sliding_window = config.sliding_window
@@ -502,7 +526,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
 			)
 			for i in range(self.config.num_hidden_layers)
 		]
-		self.norm = Gemma3RMSNorm(self.config, dtype=self.dtype)
+		self.norm = Gemma3RMSNorm(self.config, param_dtype=self.dtype)
 
 	@cached_property
 	def default_frequencies(self):
@@ -638,6 +662,11 @@ class Gemma3ForCausalLM(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
+		if param_dtype == jnp.float16 or param_dtype == "f2":
+			logger.error(
+				"Gemma-3's recommended dtype is bfloat16, but you are using float16. "
+				"This may result in junk responses or incorrect predictions."
+			)
 		self.model = Gemma3TextModel(
 			config=config,
 			dtype=dtype,
@@ -847,9 +876,9 @@ class Gemma3MultiModalProjector(nn.Module):
 		)
 		self.mm_soft_emb_norm = Gemma3RMSNorm(
 			config.vision_config,
-			param_dtype,
-			config.vision_config.hidden_size,
-			config.vision_config.layer_norm_eps,
+			param_dtype=param_dtype,
+			dim=config.vision_config.hidden_size,
+			epsilon=config.vision_config.layer_norm_eps,
 		)
 		self.patches_per_image = int(
 			config.vision_config.image_size // config.vision_config.patch_size

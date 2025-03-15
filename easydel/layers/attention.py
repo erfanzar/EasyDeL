@@ -86,7 +86,7 @@ def get_optimal_config() -> tp.Tuple[AttentionMechanisms, jnp.dtype]:
 				return AttentionMechanisms.FLASH_ATTN2, jnp.float32
 			return AttentionMechanisms.SPLASH, jnp.bfloat16
 		case "gpu":
-			return AttentionMechanisms.FLASH_ATTN2, jnp.float16
+			return AttentionMechanisms.FLASH_ATTN2, jnp.bfloat16
 		case _:
 			return AttentionMechanisms.VANILLA, jnp.bfloat16
 

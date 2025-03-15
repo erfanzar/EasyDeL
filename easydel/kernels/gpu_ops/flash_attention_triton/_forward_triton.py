@@ -57,6 +57,7 @@ def config_prune_kernel(
 		return kept_configs
 	return [
 		Config({"BLOCK_M": 16, "BLOCK_N": 64}, num_warps=4, num_stages=4),
+		Config({"BLOCK_M": 16, "BLOCK_N": 64}, num_warps=2, num_stages=4),
 	]
 
 
@@ -172,6 +173,10 @@ def _attn_fwd_inner(
 
 @safe_autotune(
 	configs=[
+		triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=2, num_stages=4),
+		triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=2, num_stages=4),
+		triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=2, num_stages=4),
+		triton.Config({"BLOCK_M": 256, "BLOCK_N": 256}, num_warps=2, num_stages=4),
 		triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=4),
 		triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=4),
 		triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=4, num_stages=4),

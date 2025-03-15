@@ -19,6 +19,14 @@ from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
 
+float8s = [
+	jnp.float8_e4m3b11fnuz,
+	jnp.float8_e4m3fn,
+	jnp.float8_e4m3fnuz,
+	jnp.float8_e5m2,
+	jnp.float8_e5m2fnuz,
+]
+
 
 class RMSNorm(nn.Module):
 	def __init__(
@@ -49,16 +57,11 @@ class RMSNorm(nn.Module):
 
 	@jax.named_scope("easydel-rmsnorm")
 	def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-		if self.dtype in [
-			jnp.float8_e4m3b11fnuz,
-			jnp.float8_e4m3fn,
-			jnp.float8_e4m3fnuz,
-			jnp.float8_e5m2,
-			jnp.float8_e5m2fnuz,
-		]:
+		org_dtype = x.dtype
+		if self.param_dtype in float8s or self.dtype in float8s:
 			x = x.astype(jnp.float32)
 		else:
 			x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
 		output = self._norm(x).astype(self.dtype)
 		weight = self.kernel.astype(self.dtype)
-		return weight * output
+		return (weight * output).astype(org_dtype)
