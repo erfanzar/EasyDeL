@@ -78,7 +78,17 @@ def config_prune_kernel(
 			},
 			num_warps=4,
 			num_stages=0,
-		)
+		),
+		Config(
+			{
+				"BLOCK_M1": 32,
+				"BLOCK_N1": 32,
+				"BLOCK_M2": 32,
+				"BLOCK_N2": 32,
+			},
+			num_warps=2,
+			num_stages=0,
+		),
 	]
 
 
@@ -730,6 +740,31 @@ def _attn_bwd_block_dq(
 
 @safe_autotune(
 	configs=[
+		Config(
+			{"BLOCK_M1": 16, "BLOCK_N1": 16, "BLOCK_M2": 16, "BLOCK_N2": 16},
+			num_warps=2,
+			num_stages=0,
+		),
+		Config(
+			{"BLOCK_M1": 32, "BLOCK_N1": 16, "BLOCK_M2": 16, "BLOCK_N2": 32},
+			num_warps=2,
+			num_stages=0,
+		),
+		Config(
+			{"BLOCK_M1": 32, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 32},
+			num_warps=2,
+			num_stages=0,
+		),
+		Config(
+			{"BLOCK_M1": 64, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 64},
+			num_warps=2,
+			num_stages=0,
+		),
+		Config(
+			{"BLOCK_M1": 64, "BLOCK_N1": 128, "BLOCK_M2": 128, "BLOCK_N2": 64},
+			num_warps=2,
+			num_stages=0,
+		),
 		Config(
 			{"BLOCK_M1": 16, "BLOCK_N1": 16, "BLOCK_M2": 16, "BLOCK_N2": 16},
 			num_warps=4,
