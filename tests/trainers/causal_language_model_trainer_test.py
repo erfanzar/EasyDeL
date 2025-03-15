@@ -20,8 +20,8 @@ logging.basicConfig(
 )
 
 # Constants
-TOTAL_BATCH_SIZE = 2
-UPPER = 600
+TOTAL_BATCH_SIZE = 5
+UPPER = 2000
 NUM_TRAIN_EPOCHS = 4
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 3e-4
@@ -113,7 +113,8 @@ def create_training_args(
 		do_eval=True,
 		max_sequence_length=sequence_length,
 		track_memory=True,
-		use_wandb=False,
+		use_wandb=True,
+		weight_distribution_log_steps=5,
 		learning_rate=learning_rate,
 		do_last_save=DO_LAST_SAVE,
 		# save_steps=SAVE_STEPS,

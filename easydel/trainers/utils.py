@@ -11,8 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from functools import partial
 import logging
 import random
+import re
 import typing as tp
 import warnings
 from contextlib import contextmanager
@@ -25,8 +27,9 @@ from jax import numpy as jnp
 from ml_collections import ConfigDict
 from ml_collections.config_dict import placeholder
 
-from easydel.utils.helpers import get_logger
 from easydel.infra.utils import ProcessingClassType
+from easydel.utils import traversals
+from easydel.utils.helpers import get_logger
 
 logger = get_logger(__name__)
 
@@ -1141,3 +1144,28 @@ def truncate_right(input_ids, stop_token_id, pad_token_id):
 	output_ids = jnp.where(idxs > trunc_idxs, pad_token_id, input_ids)
 	mask = jnp.where(idxs > trunc_idxs, 0, 1)
 	return output_ids, mask
+
+
+@partial(jax.jit, static_argnums=(1,))
+def compute_weight_stats(params, repattern: str):
+	"""Compute statistics for model weights in a JIT-compatible way.
+
+	Args:
+	    params: Model parameters
+	    repattern: parameters to analyze
+
+	Returns:
+	    Dictionary of weight statistics
+	"""
+	stats = {}
+	for path, weight in traversals.flatten_dict(params).items():
+		weight = weight.value
+		pattern_search = ".".join([str(p) for p in path])
+		path = "/".join([str(p) for p in path])
+		if bool(re.match(repattern, pattern_search)):
+			stats[f"{path}/values"] = weight.flatten()
+			stats[f"{path}/mean"] = jnp.mean(weight)
+			stats[f"{path}/std"] = jnp.std(weight)
+			stats[f"{path}/min"] = jnp.min(weight)
+			stats[f"{path}/max"] = jnp.max(weight)
+	return stats

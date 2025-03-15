@@ -124,6 +124,18 @@ class EasyDeLBaseModule(
 		return parameters
 
 	@property
+	def graphdef(self) -> nn.GraphDef:
+		return nn.split(self, nn.Param, ...)[0]
+
+	@property
+	def graphstate(self) -> nn.GraphState:
+		return nn.split(self, nn.Param, ...)[1]
+
+	@property
+	def graphother(self) -> nn.GraphState:
+		return nn.split(self, nn.Param, ...)[-1]
+
+	@property
 	def graphtree_params_shape(self) -> tp.Dict:
 		"""Evaluates the shape of the model's parameters and returns a dictionary."""
 		graphtree = nn.eval_shape(lambda: nn.split(self, nn.Param, ...)[1])

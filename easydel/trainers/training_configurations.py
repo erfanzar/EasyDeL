@@ -39,7 +39,7 @@ from easydel.infra.loss_utils import LossConfig
 from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.helpers import get_logger
 
-from .utils import JaxDistributedConfig
+from .utils import JaxDistributedConfig, compute_weight_stats
 
 try:
 	import wandb  # type: ignore # noqa: F821
@@ -353,6 +353,14 @@ class TrainingArguments:
 		default=0.01,
 		metadata={"help": "The weight decay value."},
 	)
+	weight_distribution_pattern: str = field(
+		default=r".*?(layernorm|norm).*?",
+		metadata={"help": "The pattern to use to extract weight distribution."},
+	)
+	weight_distribution_log_steps: int = field(
+		default=0,
+		metadata={"help": "log weight distribution every X steps."},
+	)
 
 	@property
 	def offload_device(self):
@@ -643,6 +651,22 @@ class TrainingArguments:
 			return metric_name.replace("train/grad_norm/", "grad_norm/")
 		return metric_name
 
+	def log_weight_distribution(self, state, step: int):
+		if self.weight_distribution_log_steps > 0 and (
+			(step % self.weight_distribution_log_steps) == 0
+		):
+			stats = compute_weight_stats(state.graphstate, self.weight_distribution_pattern)
+			metrics = {}
+			for key, value in stats.items():
+				if key.endswith("/values"):
+					path: str = key[:-7]
+					path = path.replace("/", ".")
+					metrics[f"weights/histogram/{path}"] = np.array(jax.device_get(value))
+				else:
+					key = key.replace("/", ".")
+					metrics[f"weights/information/{key}"] = float(value)
+			self.log_metrics(metrics, step)
+
 	def _log_to_wandb(
 		self,
 		metrics,
@@ -670,7 +694,7 @@ class TrainingArguments:
 					try:
 						wandb_metrics[key] = (
 							self._create_wandb_histogram(value)
-							if isinstance(value, (list, tuple, np.ndarray, jnp.ndarray))
+							if isinstance(value, (list, tuple, np.generic, jax.Array))
 							else value
 						)
 					except Exception as e:
@@ -725,14 +749,11 @@ class TrainingArguments:
 		    - tp.Any exceptions during histogram creation are caught and logged, returning None in such cases.
 		"""
 		try:
-			# Convert to numpy array if it's not already
-			if not isinstance(value, np.ndarray):
-				value = np.array(value)
-
-			# Handle different dtypes
-			if value.dtype in [np.float16, np.bfloat16]:
+			if isinstance(value, jax.Array):
+				value = np.array(jax.device_get(value))
+			if value.dtype in [np.bfloat16]:
 				value = value.astype(np.float32)
-
+			value = value.astype(np.float16)
 			return wandb.Histogram(value)
 		except Exception as e:
 			(f"Failed to create wandb histogram: {e}")
