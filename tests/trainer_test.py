@@ -1,43 +1,31 @@
 import os
 import sys
 
-import jax
-
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-import flax
+
+import jax
 import transformers
 from jax import numpy as jnp
 
 import easydel as ed
 
-MODEL_REPO_ID = "meta-llama/Llama-3.1-8B-Instruct"
-MAX_LENGTH = 1024
-SHARDING_AXIS_DIMS = (1, -1, 1, 1)
+repo_id = "meta-llama/Llama-3.2-1B-Instruct"
+max_length = 2048
 
-DTYPE = jnp.bfloat16
-PARAM_DTYPE = jnp.bfloat16
-EPOCHS = 3
-BATCH_SIZE = 8 * jax.process_count()
-GRAD_ACCUMULATION_STEPS = 1
-WARPUP_STEPS = 100
-LEARNING_RATE = 1e-5
-LEARNING_RATE_END = 8e-6
 
-if jax.process_index() == 0:
-	print("DTYPE", DTYPE)
-	print("PARAM_DTYPE", PARAM_DTYPE)
-	print("EPOCHS", EPOCHS)
-	print("BATCH_SIZE", BATCH_SIZE)
-	print("GRAD_ACCUMULATION_STEPS", GRAD_ACCUMULATION_STEPS)
-	print("WARPUP_STEPS", WARPUP_STEPS)
-	print("LEARNING_RATE", LEARNING_RATE)
-	print("LEARNING_RATE_END", LEARNING_RATE_END)
+dtype = param_dtype = jnp.bfloat16
+epoch = 3
+batch_size = 24 * jax.process_count()
+gradient_accum_step = 1
+warmup_steps = 100
+learning_rate = 1e-5
+learning_rate_end = 8e-6
 
-TOKENIZER = transformers.AutoTokenizer.from_pretrained(MODEL_REPO_ID)
-TOKENIZER.padding_side = "left"
-TOKENIZER.pad_token = TOKENIZER.eos_token
+processor = transformers.AutoTokenizer.from_pretrained(repo_id)
+processor.padding_side = "left"
 
-PA_AXIS = ed.PartitionAxis()
+if processor.pad_token is None:
+	processor.pad_token = processor.eos_token
 
 
 def create_dataset():
@@ -45,17 +33,17 @@ def create_dataset():
 
 	dataset = datasets.load_dataset(
 		"PowerInfer/QWQ-LONGCOT-500K",
-		split="train[:5%]",
+		split="train",
 		streaming=False,
 	)
 
 	def to_ids(sample):
-		ids = TOKENIZER.apply_chat_template(
+		ids = processor.apply_chat_template(
 			[
 				{"role": "user", "content": sample["prompt"]},
 				{"role": "assistant", "content": sample["response"]},
 			],
-			max_length=MAX_LENGTH,
+			max_length=max_length,
 			padding="max_length",
 			return_tensors="jax",
 			return_dict=True,
@@ -63,111 +51,55 @@ def create_dataset():
 		)
 		input_ids = ids["input_ids"]
 		attention_mask = ids["attention_mask"]
-		ids["input_ids"] = input_ids.squeeze(0)  # [-MAX_LENGTH:]
-		ids["attention_mask"] = attention_mask.squeeze(0)  # [-MAX_LENGTH:]
+		ids["input_ids"] = input_ids.squeeze(0)
+		ids["attention_mask"] = attention_mask.squeeze(0)
 		return ids
 
-	return dataset.map(
-		to_ids,
-		# batched=False,
-		remove_columns=["prompt", "response"],
-		# num_proc=os.cpu_count(),
-	)
+	return dataset.select(range(4000)).map(to_ids, remove_columns=["prompt", "response"])
 
 
-if ed.__version__ == "0.1.0":
-	TRAIN_ARGUMENTS = ed.TrainingArguments(
-		model_name="Runtime-Tests",
-		save_directory="/home/erfan/runner/model",
-		num_train_epochs=EPOCHS,
-		learning_rate=LEARNING_RATE,
-		learning_rate_end=LEARNING_RATE_END,
-		warmup_steps=WARPUP_STEPS,
-		optimizer=ed.EasyDeLOptimizers.ADAMW,
-		scheduler=ed.EasyDeLSchedulers.WARM_UP_COSINE,
-		weight_decay=0.02,
-		total_batch_size=BATCH_SIZE,
-		max_sequence_length=MAX_LENGTH,
-		gradient_accumulation_steps=GRAD_ACCUMULATION_STEPS,
-		do_last_save=False,
-		save_steps=500,
-		save_total_limit=1,
-		progress_bar_type="json",
-		max_training_steps=100_000,
-	)
+arguments = ed.TrainingArguments(
+	model_name="Runtime-Tests",
+	num_train_epochs=epoch,
+	learning_rate=learning_rate,
+	learning_rate_end=learning_rate_end,
+	warmup_steps=warmup_steps,
+	optimizer=ed.EasyDeLOptimizers.ADAMW,
+	scheduler=ed.EasyDeLSchedulers.COSINE,
+	weight_decay=0.02,
+	wandb_entity="erfanzar",
+	total_batch_size=batch_size,
+	max_sequence_length=max_length,
+	gradient_accumulation_steps=gradient_accum_step,
+	do_last_save=False,
+	save_steps=500,
+	save_total_limit=1,
+	progress_bar_type="json",
+	max_training_steps=100_000,
+)
 
-	MODEL = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
-		MODEL_REPO_ID,
-		auto_shard_model=True,
-		sharding_axis_dims=SHARDING_AXIS_DIMS,
-		config_kwargs=ed.EasyDeLBaseConfigDict(
-			freq_max_position_embeddings=MAX_LENGTH,
-			mask_max_position_embeddings=MAX_LENGTH,
-			attn_dtype=DTYPE,
-			gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
-			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-			attn_mechanism=ed.AttentionMechanisms.VANILLA,
-		),
-		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-		platform=ed.EasyDeLPlatforms.JAX,
-		param_dtype=PARAM_DTYPE,
-		dtype=DTYPE,
-		partition_axis=PA_AXIS,
-	)
-	trainer = ed.Trainer(
-		model=MODEL,
-		arguments=TRAIN_ARGUMENTS,
-		dataset_train=create_dataset(),
-	)
+model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+	repo_id,
+	auto_shard_model=True,
+	sharding_axis_dims=(1, -1, 1, 1),
+	config_kwargs=ed.EasyDeLBaseConfigDict(
+		freq_max_position_embeddings=max_length,
+		mask_max_position_embeddings=max_length,
+		gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
+		kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+		attn_dtype=param_dtype,
+		attn_mechanism=ed.AttentionMechanisms.VANILLA,
+	),
+	param_dtype=param_dtype,
+	dtype=dtype,
+	partition_axis=ed.PartitionAxis(),
+)
+trainer = ed.Trainer(
+	model=model,
+	arguments=arguments,
+	dataset_train=create_dataset(),
+)
 
-	output = trainer.train()
+output = trainer.train()
 
-	output.state.save_state("/home/erfan/model-ckpt")
-elif ed.__version__ == "0.0.80":
-	TRAIN_ARGUMENTS = ed.TrainingArguments(
-		model_name="Runtime-Tests",
-		save_dir="/home/erfan/runner/model",
-		num_train_epochs=EPOCHS,
-		learning_rate=LEARNING_RATE,
-		learning_rate_end=LEARNING_RATE_END,
-		warmup_steps=WARPUP_STEPS,
-		optimizer=ed.EasyDeLOptimizers.ADAMW,
-		scheduler=ed.EasyDeLSchedulers.COSINE,
-		weight_decay=0.02,
-		total_batch_size=BATCH_SIZE,
-		max_sequence_length=MAX_LENGTH,
-		gradient_accumulation_steps=GRAD_ACCUMULATION_STEPS,
-		do_last_save=False,
-		save_steps=500,
-		save_total_limit=1,
-	)
-	MODEL, PARAMS = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
-		MODEL_REPO_ID,
-		auto_shard_params=True,
-		sharding_axis_dims=SHARDING_AXIS_DIMS,
-		config_kwargs=ed.EasyDeLBaseConfigDict(
-			freq_max_position_embeddings=MAX_LENGTH,
-			mask_max_position_embeddings=MAX_LENGTH,
-			attn_dtype=DTYPE,
-			gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
-			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-			attn_mechanism=ed.AttentionMechanisms.VANILLA,
-		),
-		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-		platform=ed.EasyDeLPlatforms.JAX,
-		param_dtype=PARAM_DTYPE,
-		dtype=DTYPE,
-		partition_axis=PA_AXIS,
-	)
-	TRAIN_ARGUMENTS.gradient_checkpointing = (
-		ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE
-	)
-	trainer = ed.CausalLanguageModelTrainer(
-		model=MODEL,
-		arguments=TRAIN_ARGUMENTS,
-		dataset_train=create_dataset(),
-	)
-
-	output = trainer.train(model_parameters=flax.core.FrozenDict({"params": PARAMS}))
-
-	output.state.save_state("/home/erfan/model-ckpt")
+output.state.save_state("/home/erfan/model-ckpt")
