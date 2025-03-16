@@ -218,7 +218,9 @@ from .modules.gemma2 import (
 from .modules.gemma3 import (
 	Gemma3Config,
 	Gemma3ForCausalLM,
+	Gemma3ForConditionalGeneration,
 	Gemma3ForSequenceClassification,
+	Gemma3MultiModalProjector,
 	Gemma3TextConfig,
 	Gemma3TextModel,
 )

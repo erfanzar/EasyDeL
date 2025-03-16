@@ -228,7 +228,7 @@ class EasyGenerationMixin:
 		input_tokens_length: int,
 		input_sharding: jax.sharding.PartitionSpec,
 		rngs: jax.random.PRNGKey,
-		include_vision: bool = False,
+		vision_included: bool = False,
 		vision_batch_size: int = 1,
 		vision_channels: int = 3,
 		vision_height: tp.Optional[int] = None,

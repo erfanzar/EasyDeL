@@ -33,12 +33,12 @@ from chex import PRNGKey
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
+from jax._src.stages import Compiled
 from jax.interpreters import pxla
 from jax.sharding import NamedSharding, PartitionSpec
 from pydantic import BaseModel
 
 from easydel.infra.etils import EasyDeLGradientCheckPointers
-from jax._src.stages import Compiled
 from easydel.utils.compiling_utils import (
 	load_compiled_fn,
 	save_compiled_fn,
@@ -604,14 +604,14 @@ class vInference:
 		vision_channels = None
 		vision_height = None
 		vision_width = None
-		if "pixle_values" in kwargs:
+		if "pixel_values" in kwargs.keys():
 			vision_included = True
 			(
 				vision_batch_size,
 				vision_channels,
 				vision_height,
 				vision_width,
-			) = kwargs["pixle_values"].shape
+			) = kwargs["pixel_values"].shape
 		vinf_config = vInferencePreCompileConfig(
 			batch_size=batch_size,
 			prefill_length=prefill_length,
@@ -755,6 +755,7 @@ class vInference:
 				target_batch=target_batch,
 				target_length=target_length,
 			)
+
 			vinference_compile_config = self._create_vinference_config_from_kwargs(
 				batch_size=batch_size,
 				prefill_length=target_length,
@@ -771,6 +772,7 @@ class vInference:
 			with self._inference_latency_context_manager("preprocessing"):
 				input_ids = adjusted_kwargs.pop("input_ids", None)
 				attention_mask = adjusted_kwargs.pop("attention_mask", None)
+
 				state = self._prepare_generation_state(
 					input_ids=input_ids,
 					attention_mask=attention_mask,
@@ -989,13 +991,12 @@ class vInference:
 				input_tokens_length=standalone_config.prefill_length,
 				input_sharding=self.input_sharding,
 				rngs=self._rng_generator.rng,
-				include_vision=standalone_config.vision_included,
+				vision_included=standalone_config.vision_included,
 				vision_batch_size=standalone_config.vision_batch_size,
 				vision_channels=standalone_config.vision_channels,
 				vision_height=standalone_config.vision_height,
 				vision_width=standalone_config.vision_width,
 			)
-
 			state = self._get_init_state(standalone_config, wargs)
 			logger.info("smart compiling `first_iter_fn`")
 			logger.info("lowering `first_iter_fn`")

@@ -15,7 +15,9 @@
 from .gemma3_configuration import Gemma3Config, Gemma3TextConfig
 from .modeling_gemma3_flax import (
 	Gemma3ForCausalLM,
+	Gemma3ForConditionalGeneration,
 	Gemma3ForSequenceClassification,
+	Gemma3MultiModalProjector,
 	Gemma3TextModel,
 )
 
@@ -23,6 +25,8 @@ __all__ = (
 	"Gemma3Config",
 	"Gemma3TextConfig",
 	"Gemma3ForCausalLM",
+	"Gemma3ForConditionalGeneration",
 	"Gemma3ForSequenceClassification",
+	"Gemma3MultiModalProjector",
 	"Gemma3TextModel",
 )
