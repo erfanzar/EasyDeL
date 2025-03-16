@@ -23,7 +23,6 @@ import jax
 import jax.extend
 import jax.tree_util
 from eformer.escale import PartitionAxis
-from flax import nnx as nn
 from jax import numpy as jnp
 from transformers.configuration_utils import PretrainedConfig
 
@@ -501,6 +500,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		pallas_m_block_size: int = ...,
 		pallas_k_block_size: int = ...,
 		pallas_n_block_size: int = ...,
+		**kwargs,
 	):
 		"""
 		It initializes all the attributes of an object, and it's called when you create a new instance of that class.
@@ -579,10 +579,13 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		set_attrs_smartly(self, "pallas_k_block_size", DEFAULT_PALLAS_K_BLOCK_SIZE, pallas_k_block_size)
 		set_attrs_smartly(self, "pallas_n_block_size", DEFAULT_PALLAS_N_BLOCK_SIZE, pallas_n_block_size)
 		# fmt: on
-
+		for key_, value_ in kwargs.items():
+			setattr(self, key_, value_)
 		if getattr(self, "sub_configs", None) is not None:
 			for name, _ in getattr(self, "sub_configs", {}).items():
 				getattr(self, name).read_basics_from_config(self)
+				for key_, value_ in kwargs.items():
+					setattr(getattr(self, name), key_, value_)
 
 	def __repr__(self):
 		"""The __repr__ function is used to generate a string representation of an object.
@@ -847,18 +850,27 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
 		return ModuleCaches(frequencies)
 
-	def get_basic_causal_mask(self, dtype="bool"):
+	def get_basic_causal_mask(self, *args, **kwargs):
 		from .utils import ModuleCaches
 
-		return ModuleCaches(
-			nn.make_causal_mask(
-				jnp.ones(
-					shape=(1, self.granted_mask_max_position_embedding),
-					dtype=dtype,
-				),
-				dtype=dtype,
-			)
-		)
+		target_length = self.granted_mask_max_position_embedding
+		causal_mask_bool = jnp.zeros((target_length, target_length), dtype=jnp.bool_)
+
+		if target_length != 1:
+			row_indices = jnp.arange(target_length)[:, None]
+			col_indices = jnp.arange(target_length)[None, :]
+			lower_triangular = row_indices >= col_indices
+			causal_mask_bool = jnp.logical_or(causal_mask_bool, lower_triangular)
+		else:
+			causal_mask_bool = causal_mask_bool.at[:, 0].set(True)
+
+		row_indices = jnp.arange(target_length)[:, None]
+		col_indices = jnp.arange(target_length)[None, :]
+		cache_mask = col_indices <= row_indices
+		causal_mask_bool = jnp.logical_and(causal_mask_bool, cache_mask)
+		causal_mask_bool = causal_mask_bool[None, None, :, :].astype("b1")
+
+		return ModuleCaches(causal_mask_bool)
 
 	def get_fcm_mask(self, batch_size, seq_length, deterministic: bool):
 		if not deterministic and self.fcm_max_ratio > 0:

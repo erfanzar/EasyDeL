@@ -214,6 +214,7 @@ class Gemma3Attention(FlaxAttentionModule):
 		causal_mask: chex.Array,
 		cache_view: tp.Optional[TransformerCacheView] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
+		token_type_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
 		frequencies: tp.Optional[chex.Array] = None,
@@ -269,6 +270,7 @@ class Gemma3Attention(FlaxAttentionModule):
 			value=value_states,
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,
+			token_type_ids=token_type_ids,
 			fcm_mask=fcm_mask,
 			sliding_windows=None,
 		)
@@ -376,6 +378,7 @@ class Gemma3DecoderLayer(nn.Module):
 		self.dtype = dtype
 		self.param_dtype = param_dtype
 		self.precision = precision
+
 		mlp_block = Gemma3MLP
 		attn_block = Gemma3Attention
 
@@ -384,6 +387,7 @@ class Gemma3DecoderLayer(nn.Module):
 			mlp_block,
 			policy=config.gradient_checkpointing,
 		)
+
 		self.self_attn = attn_block(
 			self.config,
 			layer_idx=self.layer_idx,
@@ -392,6 +396,7 @@ class Gemma3DecoderLayer(nn.Module):
 			precision=precision,
 			rngs=rngs,
 		)
+
 		self.mlp = mlp_block(
 			config=config,
 			dtype=dtype,
@@ -428,6 +433,7 @@ class Gemma3DecoderLayer(nn.Module):
 		causal_mask: chex.Array,
 		cache_view: tp.Optional[TransformerCacheView] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
+		token_type_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
 		frequencies: tp.Optional[chex.Array] = None,
@@ -459,6 +465,7 @@ class Gemma3DecoderLayer(nn.Module):
 			causal_mask,
 			cache_view,
 			segment_ids,
+			token_type_ids,
 			output_attentions,
 			fcm_mask,
 			frequencies,
@@ -550,6 +557,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
+		token_type_ids: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache] = None,
@@ -578,7 +586,9 @@ class Gemma3TextModel(EasyDeLBaseModule):
 				"You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
 			)
 		if inputs_embeds is None:
-			inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
+			inputs_embeds = self.embed_tokens(input_ids.astype("i4")) * (
+				self.config.hidden_size**0.5
+			)
 		batch_size, sequence_length, _ = inputs_embeds.shape
 
 		if attention_mask is None:
@@ -591,7 +601,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
 				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
 				(batch_size, sequence_length),
 			)
-		inputs_embeds = inputs_embeds * (self.config.hidden_size**0.5)
+		inputs_embeds = inputs_embeds
 		assert sequence_length <= self.config.max_position_embeddings, (
 			f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 		)
@@ -603,6 +613,8 @@ class Gemma3TextModel(EasyDeLBaseModule):
 		all_attentions = () if output_attentions else None
 		all_hidden_states = () if output_hidden_states else None
 
+		causal_mask = self.causal_mask
+
 		for idx, block in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
@@ -610,8 +622,9 @@ class Gemma3TextModel(EasyDeLBaseModule):
 				hidden_states=hidden_states,
 				attention_mask=attention_mask,
 				position_ids=position_ids,
-				causal_mask=self.causal_mask,
 				cache_view=past_key_values.views[idx],
+				causal_mask=causal_mask,
+				token_type_ids=token_type_ids,
 				output_attentions=output_attentions,
 				segment_ids=segment_ids,
 				frequencies=self.frequencies,
@@ -693,6 +706,7 @@ class Gemma3ForCausalLM(EasyDeLBaseModule):
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
+		token_type_ids: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache] = None,
@@ -727,6 +741,7 @@ class Gemma3ForCausalLM(EasyDeLBaseModule):
 			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
+			token_type_ids=token_type_ids,
 		)
 
 		hidden_states = outputs[0]
@@ -919,9 +934,11 @@ class Gemma3MultiModalProjector(nn.Module):
 		pooled_vision_outputs = pooled_vision_outputs.reshape(batch_size, seq_length, -1)
 		pooled_vision_outputs = jnp.transpose(pooled_vision_outputs, (0, 2, 1))
 		normed_vision_outputs = self.mm_soft_emb_norm(pooled_vision_outputs)
-		projected_vision_outputs = jnp.matmul(
+
+		projected_vision_outputs = jax.lax.dot_general(
 			normed_vision_outputs,
 			self.mm_input_projection_weight.T,
+			(((normed_vision_outputs.ndim - 1), (0,)), ((), ())),
 		)
 		return projected_vision_outputs.astype(vision_outputs.dtype)
 
@@ -985,7 +1002,9 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 
 	def get_image_features(self, pixel_values: chex.Array) -> chex.Array:
 		vision_outputs = self.vision_tower(pixel_values=pixel_values).last_hidden_state
+
 		image_features = self.multi_modal_projector(vision_outputs)
+
 		return image_features
 
 	def __call__(
@@ -1025,7 +1044,9 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 		else:
 			llm_input_ids = input_ids
 		if inputs_embeds is None:
-			inputs_embeds = self.language_model.model.embed_tokens(llm_input_ids)
+			inputs_embeds = self.language_model.model.embed_tokens(llm_input_ids) * (
+				self.config.text_config.hidden_size**0.5
+			)
 		if pixel_values is not None:
 			image_features = self.get_image_features(pixel_values)
 
@@ -1035,10 +1056,10 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 				)
 			else:
 				special_image_mask = jnp.expand_dims(
-					(input_ids == self.config.image_token_index), -1
+					(input_ids == self.config.image_token_index),
+					-1,
 				)
 				special_image_mask = jnp.broadcast_to(special_image_mask, inputs_embeds.shape)
-
 			image_features = image_features.astype(inputs_embeds.dtype)
 			inputs_embeds = jnp.place(
 				inputs_embeds,
@@ -1046,7 +1067,6 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 				image_features,
 				inplace=False,
 			)
-
 		outputs = self.language_model(
 			attention_mask=attention_mask,
 			position_ids=position_ids,
@@ -1055,6 +1075,7 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 			past_key_values=past_key_values,
 			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
+			token_type_ids=token_type_ids,
 			segment_ids=None,
 			**lm_kwargs,
 		)
