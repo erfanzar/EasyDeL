@@ -106,7 +106,9 @@ from .gemma2 import (
 from .gemma3 import (
 	Gemma3Config,
 	Gemma3ForCausalLM,
+	Gemma3ForConditionalGeneration,
 	Gemma3ForSequenceClassification,
+	Gemma3MultiModalProjector,
 	Gemma3TextConfig,
 	Gemma3TextModel,
 )

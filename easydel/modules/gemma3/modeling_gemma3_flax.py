@@ -30,7 +30,6 @@ from easydel.infra.modeling_outputs import (
 	FlaxSequenceClassifierOutput,
 	ModelOutput,
 )
-from easydel.layers.norms import float8s
 from easydel.infra.utils import (
 	ACT2FN,
 	auto_remat,
@@ -40,6 +39,7 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.norms import float8s
 from easydel.modules.siglip.modeling_siglip_flax import SiglipVisionModel
 from easydel.utils.helpers import get_logger
 
@@ -868,9 +868,18 @@ class Gemma3MultiModalProjector(nn.Module):
 		*,
 		rngs: nn.Rngs,
 	):
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
+
 		self.mm_input_projection_weight = nn.Param(
 			jnp.zeros(
-				(config.vision_config.hidden_size, config.text_config.hidden_size),
+				(
+					config.text_config.hidden_size,
+					config.vision_config.hidden_size,
+				),
 				dtype=param_dtype,
 			)
 		)
@@ -884,12 +893,16 @@ class Gemma3MultiModalProjector(nn.Module):
 			config.vision_config.image_size // config.vision_config.patch_size
 		)
 		self.tokens_per_side = int(config.mm_tokens_per_image**0.5)
-		self.kernel_size = self.patches_per_image // self.tokens_per_side
-		self.avg_pool = lambda x: nn.avg_pool(
+		kernel_size = self.patches_per_image // self.tokens_per_side
+		self.kernel_size = kernel_size
+		self.avg_pool = lambda x: jax.lax.reduce_window(
 			x,
-			(self.kernel_size,) * 2,
-			(self.kernel_size,) * 2,
-		)
+			init_value=0.0,
+			computation=jax.lax.add,
+			window_dimensions=(1, 1, kernel_size, kernel_size),
+			window_strides=(1, 1, kernel_size, kernel_size),
+			padding="VALID",
+		) / (kernel_size * kernel_size)
 
 	def __call__(self, vision_outputs):
 		batch_size, _, seq_length = vision_outputs.shape
@@ -905,11 +918,10 @@ class Gemma3MultiModalProjector(nn.Module):
 		pooled_vision_outputs = self.avg_pool(reshaped_vision_outputs)
 		pooled_vision_outputs = pooled_vision_outputs.reshape(batch_size, seq_length, -1)
 		pooled_vision_outputs = jnp.transpose(pooled_vision_outputs, (0, 2, 1))
-
 		normed_vision_outputs = self.mm_soft_emb_norm(pooled_vision_outputs)
 		projected_vision_outputs = jnp.matmul(
 			normed_vision_outputs,
-			self.mm_input_projection_weight,
+			self.mm_input_projection_weight.T,
 		)
 		return projected_vision_outputs.astype(vision_outputs.dtype)
 
@@ -971,7 +983,7 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 			self.config.pad_token_id if self.config.pad_token_id is not None else -1
 		)
 
-	def get_image_features(self, pixel_values: chex.Array):
+	def get_image_features(self, pixel_values: chex.Array) -> chex.Array:
 		vision_outputs = self.vision_tower(pixel_values=pixel_values).last_hidden_state
 		image_features = self.multi_modal_projector(vision_outputs)
 		return image_features
@@ -1022,7 +1034,9 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 					jnp.array(self.config.image_token_index, dtype="i4")
 				)
 			else:
-				special_image_mask = (input_ids == self.config.image_token_index).unsqueeze(-1)
+				special_image_mask = jnp.expand_dims(
+					(input_ids == self.config.image_token_index), -1
+				)
 				special_image_mask = jnp.broadcast_to(special_image_mask, inputs_embeds.shape)
 
 			image_features = image_features.astype(inputs_embeds.dtype)
@@ -1060,7 +1074,7 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 		input_tokens_length: int,
 		input_sharding: jax.sharding.PartitionSpec,
 		rngs: jax.random.PRNGKey,
-		include_vision: bool = False,
+		vision_included: bool = False,
 		vision_batch_size: int = 1,
 		vision_channels: int = 3,
 		vision_height: tp.Optional[int] = None,
@@ -1072,7 +1086,7 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 			input_tokens_length=input_tokens_length,
 			input_sharding=input_sharding,
 			rngs=rngs,
-			include_vision=include_vision,
+			vision_included=vision_included,
 			vision_batch_size=vision_batch_size,
 			vision_channels=vision_channels,
 			vision_height=vision_height,
@@ -1085,11 +1099,11 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 			device=input_sharding,
 		)
 		basics.update({"token_type_ids": token_type_ids})
-		if include_vision:
+		if vision_included:
 			pixel_values = jnp.ones(
 				(
-					vision_batch_size,
-					vision_channels,
+					vision_batch_size or 1,
+					vision_channels or 3,
 					self.config.vision_config.image_size,
 					self.config.vision_config.image_size,
 				),
