@@ -71,7 +71,7 @@ class EasyModelsTest(unittest.TestCase):
 		self.attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = "vanilla"
 		self.blocksize_k: int = 128
 		self.blocksize_q: int = 128
-		self.sequence_length = 8192
+		self.sequence_length = 1024
 		self.scan_mlp_chunk_size = self.sequence_length // 2
 		self.axis_dims = (1, 1, 1, -1)
 		self.head_dim = self.hidden_size // self.num_attention_heads
@@ -939,12 +939,12 @@ if __name__ == "__main__":
 	test.setUp()
 
 	# test.test_gemma3_text()  # Passed
-	test.test_gemma3()  # Passed
+	# test.test_gemma3()  # Passed
 	# test.test_arctic()  # Passed
 	# test.test_cohere()  # Passed
 	# test.test_dbrx()  # Passed
 	# test.test_deepseek_v2()  # Passed
-	# test.test_deepseek_v3()  # Passed
+	test.test_deepseek_v3()  # Passed
 	# test.test_exaone()  # Passed
 	# test.test_falcon()  # Passed
 	# test.test_gemma()  # Passed

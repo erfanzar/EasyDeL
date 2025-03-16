@@ -21,7 +21,9 @@ def main():
 	prefill_length = 4096
 	max_new_tokens = 2048
 	max_length = prefill_length + max_new_tokens
+
 	pretrained_model_name_or_path = "meta-llama/Llama-3.2-1B-Instruct"
+	# pretrained_model_name_or_path = "google/gemma-3-1b-it"
 
 	if jax.default_backend() == "gpu":
 		dtype = jnp.float16
@@ -34,21 +36,13 @@ def main():
 	else:
 		dtype = jnp.bfloat16
 		param_dtype = jnp.bfloat16
-		attn_kwargs = dict(
-			attn_dtype=jnp.float32,
-			attn_softmax_dtype=jnp.float32,
-			attn_mechanism=ed.AttentionMechanisms.VANILLA,
-			# attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
-			# blocksize_q=512,
-			# blocksize_k=512,
-		)
-	print(dtype, param_dtype)
+		attn_kwargs = dict(attn_mechanism=ed.AttentionMechanisms.AUTO)
+
 	partition_axis = ed.PartitionAxis()
-	tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
-	tokenizer.padding_side = "left"
-	tokenizer.pad_token_id = tokenizer.eos_token_id
-	print("TOKENIZER LOADED")
-	print("LOADING MODEL ... ")
+	processor = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
+	processor.padding_side = "left"
+	processor.pad_token_id = processor.eos_token_id
+
 	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
 		pretrained_model_name_or_path,
 		auto_shard_model=True,
@@ -71,11 +65,11 @@ def main():
 
 	inference = ed.vInference(
 		model=model,
-		processor_class=tokenizer,
+		processor_class=processor,
 		generation_config=ed.vInferenceConfig(
 			max_new_tokens=max_new_tokens,
-			temperature=0.0,
-			do_sample=False,
+			temperature=0.7,
+			do_sample=True,
 			top_p=0.95,
 			top_k=10,
 			eos_token_id=model.generation_config.eos_token_id,
@@ -94,17 +88,11 @@ def main():
 	)
 
 	messages = [
-		{
-			"role": "system",
-			"content": "You are a helpful AI assistant.",
-		},
-		{
-			"role": "user",
-			"content": "write 10 lines story about why you love EasyDeL",
-		},
+		{"role": "system", "content": "You are a helpful AI assistant."},
+		{"role": "user", "content": "write 10 lines story about why you love EasyDeL"},
 	]
 
-	ids = tokenizer.apply_chat_template(
+	inputs = processor.apply_chat_template(
 		messages,
 		return_tensors="jax",
 		return_dict=True,
@@ -112,14 +100,11 @@ def main():
 	)
 
 	print("Start Generation Process.")
-	for response in inference.generate(**ids):
+	for response in inference.generate(**inputs):
 		...
-	print(
-		tokenizer.batch_decode(
-			response.sequences[..., response.padded_length :],
-			skip_special_tokens=True,
-		)[0]
-	)
+	sequences = response.sequences[..., response.padded_length :]
+
+	print(processor.batch_decode(sequences, skip_special_tokens=True)[0])
 	print(response.tokens_pre_second)
 
 

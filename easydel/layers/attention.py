@@ -253,6 +253,7 @@ class FlaxAttentionModule(nn.Module):
 		cache_view: TransformerCacheView,
 		attention_mask: Array,
 		causal_mask: tp.Optional[Array] = None,
+		token_type_ids: tp.Optional[Array] = None,
 	) -> tp.Tuple[Array, Array, Array]:
 		num_updated_cache_vectors = query.shape[1]
 		end_index = cache_view.index[0]
@@ -270,10 +271,26 @@ class FlaxAttentionModule(nn.Module):
 				(0, 0, end_index, 0),
 				(1, 1, num_updated_cache_vectors, max_length),
 			)
+			if token_type_ids is not None and num_updated_cache_vectors != 1:
+				token_type_mask = jnp.equal(
+					jnp.expand_dims(token_type_ids, 2),
+					jnp.expand_dims(token_type_ids, 1),
+				)
+
+				token_type_mask = jnp.where(token_type_ids == 0, False, token_type_mask)
+				token_type_mask = jnp.expand_dims(token_type_mask, 1)
+				sequence_length = token_type_ids.shape[1]
+				masked_portion = jnp.logical_or(
+					token_type_mask[:, :, :num_updated_cache_vectors, :],
+					causal_mask[:, :, :, :sequence_length],
+				)
+				causal_mask = causal_mask.at[:, :, :, :sequence_length].set(masked_portion)
+
 			causal_mask = jnp.broadcast_to(
 				causal_mask,
 				(query.shape[0],) + causal_mask.shape[1:],
 			)
+
 			attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
 			attention_mask = jnp.logical_and(attention_mask, causal_mask)
 
@@ -349,6 +366,7 @@ class FlaxAttentionModule(nn.Module):
 		attention_mask: Array,
 		cache_view: tp.Optional[TransformerCacheView] = None,
 		causal_mask: tp.Optional[Array] = None,
+		token_type_ids: tp.Optional[Array] = None,
 		fcm_mask: tp.Optional[Array] = None,
 		sliding_windows: tp.Optional[int] = None,
 	) -> tp.Tuple[Array, Array, Array, tp.Callable[[], Array]]:
@@ -361,6 +379,31 @@ class FlaxAttentionModule(nn.Module):
 			key_length = key.shape[1]
 			if causal_mask is not None:
 				causal_mask = causal_mask[:, :, :query_length, :key_length]
+				if token_type_ids is not None and query_length != 1:
+					token_type_mask = jnp.equal(
+						jnp.expand_dims(token_type_ids, 2),
+						jnp.expand_dims(token_type_ids, 1),
+					)
+
+					token_type_mask = token_type_mask.at[token_type_ids == 0].set(False)
+					token_type_mask = jnp.expand_dims(token_type_mask, 1)
+					sequence_length = token_type_ids.shape[1]
+
+					masked_portion = jnp.logical_or(
+						token_type_mask,
+						causal_mask[
+							:,
+							:,
+							:,
+							:sequence_length,
+						],
+					)
+					causal_mask = causal_mask.at[
+						:,
+						:,
+						:,
+						:sequence_length,
+					].set(masked_portion)
 				causal_mask = jnp.broadcast_to(
 					causal_mask, (query.shape[0],) + causal_mask.shape[1:]
 				)
@@ -381,6 +424,7 @@ class FlaxAttentionModule(nn.Module):
 				cache_view=cache_view,
 				attention_mask=attention_mask,
 				causal_mask=causal_mask,
+				token_type_ids=token_type_ids,
 			)
 		if sliding_windows is not None and attention_mask is not None:
 			sliding_window_mask = jnp.tril(
