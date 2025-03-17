@@ -474,7 +474,7 @@ class Cohere2Model(EasyDeLBaseModule):
 		for idx, block in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
-
+				
 			layer_outputs = block(
 				hidden_states=hidden_states,
 				attention_mask=attention_mask,
@@ -580,17 +580,6 @@ class Cohere2ForCausalLM(EasyDeLBaseModule):
 		Returns:
 		    FlaxCausalLMOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
-		batch_size, sequence_length = input_ids.shape
-		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-		else:
-			if attention_mask.dtype != jnp.bool:
-				attention_mask = jnp.astype(attention_mask == 1, "b1")
-		if position_ids is None:
-			position_ids = jnp.broadcast_to(
-				jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
-				(batch_size, sequence_length),
-			)
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,

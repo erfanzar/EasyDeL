@@ -266,6 +266,10 @@ from .modules.llama import (
 	LlamaForSequenceClassification,
 	LlamaModel,
 )
+from .modules.llava import (
+	LlavaConfig,
+	LlavaForConditionalGeneration,
+)
 from .modules.mamba import (
 	MambaConfig,
 	MambaForCausalLM,

@@ -865,7 +865,7 @@ if __name__ == "__main__":
 	# test.test_gemma3()  # Passed
 	# test.test_arctic()  # Passed
 	# test.test_cohere()  # Passed
-	# test.test_cohere2()  # Passed
+	test.test_cohere2()  # Passed
 	# test.test_dbrx()  # Passed
 	# test.test_deepseek_v2()  # Passed
 	# test.test_deepseek_v3()  # Passed

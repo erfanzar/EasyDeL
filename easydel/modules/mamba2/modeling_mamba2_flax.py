@@ -21,7 +21,7 @@ from flax import nnx as nn
 from jax import lax
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import FlaxBaseModelOutput
 from easydel.infra.utils import (
 	ACT2FN,
@@ -657,10 +657,9 @@ class Mamba2Block(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=Mamba2Config,
 	model_type="mamba2",
-	embedding_layer_names=["embeddings"],
 )
 class Mamba2Model(EasyDeLBaseModule):
 	def __init__(
@@ -768,10 +767,9 @@ class Mamba2Model(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=Mamba2Config,
-	model_type="mamba2",
-	embedding_layer_names=["embeddings"],
+	model_type="mamba2", 
 )
 class Mamba2ForCausalLM(EasyDeLBaseModule):
 	def __init__(

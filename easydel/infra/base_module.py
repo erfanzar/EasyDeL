@@ -616,12 +616,12 @@ class EasyDeLBaseModule(
 		from easydel.utils.parameters_transformation import torch_dict_to_easydel_params
 
 		embedding_path = [
-			pa[-1]
+			".".join(tuple(map(str, pa)))
 			for pa, _ in graph_utils.iter_module_search(self, nn.Embed)
 			if not isinstance(pa[-1], int)
 		]
 		layernorm_path = [
-			pa[-1]
+			".".join(tuple(map(str, pa)))
 			for pa, _ in graph_utils.iter_module_search(self, nn.LayerNorm)
 			if not isinstance(pa[-1], int)
 		]
@@ -743,12 +743,12 @@ class EasyDeLBaseModule(
 		from easydel.utils.parameters_transformation import torch_dict_to_easydel_params
 
 		embedding_path = [
-			pa[-1]
+			".".join(tuple(map(str, pa)))
 			for pa, _ in graph_utils.iter_module_search(self, nn.Embed)
 			if not isinstance(pa[-1], int)
 		]
 		layernorm_path = [
-			pa[-1]
+			".".join(tuple(map(str, pa)))
 			for pa, _ in graph_utils.iter_module_search(self, nn.LayerNorm)
 			if not isinstance(pa[-1], int)
 		]
