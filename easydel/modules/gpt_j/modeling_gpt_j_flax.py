@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
@@ -98,7 +98,7 @@ class GPTJAttention(FlaxAttentionModule):
 		self.attention_performer = FlexibleAttentionModule(
 			dropout_prob=config.attn_pdrop,
 			base_config=config,
-			softmax_scale=self.head_dim**-0.5, 
+			softmax_scale=self.head_dim**-0.5,
 		)
 
 	def _split_heads(self, hidden_states):
@@ -308,11 +308,9 @@ class GPTJBlock(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=GPTJConfig,
 	model_type="gptj",
-	embedding_layer_names=["wte"],
-	layernorm_names=["ln_1", "ln_2", "ln_f"],
 )
 class GPTJModel(EasyDeLBaseModule):
 	def __init__(
@@ -455,11 +453,9 @@ class GPTJModel(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=GPTJConfig,
 	model_type="gptj",
-	embedding_layer_names=["wte"],
-	layernorm_names=["ln_1", "ln_2", "ln_f"],
 )
 class GPTJForCausalLM(EasyDeLBaseModule):
 	def __init__(

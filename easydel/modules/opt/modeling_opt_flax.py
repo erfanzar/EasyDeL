@@ -40,7 +40,7 @@ from flax import nnx as nn
 from jax import lax
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
 	FlaxMaskedLMOutput,
@@ -579,11 +579,9 @@ class OPTModel(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=OPTConfig,
 	model_type="opt",
-	embedding_layer_names=["embed_tokens"],
-	layernorm_names=["self_attn_layer_norm", "final_layer_norm"],
 )
 class OPTForCausalLM(EasyDeLBaseModule):
 	def __init__(
@@ -692,7 +690,7 @@ class OPTForCausalLM(EasyDeLBaseModule):
 		# Note that usually one would have to put 0's in the attention_mask for x > input_ids.shape[-1] and x < cache_length.
 		# But since the decoder uses a causal mask, those positions are masked anyway.
 		# Thus, we can create a single static attention_mask here, which is more efficient for compilation
-		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
+		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="b1")
 
 		if attention_mask is not None:
 			position_ids = attention_mask.cumsum(axis=1) - 1

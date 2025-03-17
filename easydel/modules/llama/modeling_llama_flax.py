@@ -333,10 +333,9 @@ class LlamaDecoderLayer(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=LlamaConfig,
 	model_type="llama",
-	embedding_layer_names=["embed_tokens"],
 )
 class LlamaModel(EasyDeLBaseModule):
 	def __init__(
@@ -461,10 +460,9 @@ class LlamaModel(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=LlamaConfig,
 	model_type="llama",
-	embedding_layer_names=["embed_tokens"],
 )
 class LlamaForCausalLM(EasyDeLBaseModule):
 	"""
@@ -561,7 +559,6 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 	TaskType.SEQUENCE_CLASSIFICATION,
 	config=LlamaConfig,
 	model_type="llama",
-	embedding_layer_names=["embed_tokens"],
 )
 class LlamaForSequenceClassification(EasyDeLBaseModule):
 	def __init__(

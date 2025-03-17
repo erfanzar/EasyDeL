@@ -20,10 +20,12 @@ import socketserver
 import threading
 import time
 import typing as tp
-from dataclasses import dataclass, field
+from dataclasses import field
 from datetime import datetime
 
 import jax
+
+from easydel.utils import traversals as etr
 
 logging.basicConfig(
 	level=logging.INFO,
@@ -200,7 +202,7 @@ class SMPMemoryMonitor:
 			print(f"Status: {entry['status']}")
 
 
-@dataclass
+@etr.auto_pytree
 class DeviceStats:
 	"""
 	Dataclass to store device statistics.

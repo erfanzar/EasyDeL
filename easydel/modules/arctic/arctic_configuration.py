@@ -215,20 +215,6 @@ class ArcticConfig(EasyDeLBaseConfig):
 			(".*", PartitionSpec(None)),
 		)
 
-	def add_jax_args(
-		self,
-		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		use_scan_mlp: bool = False,
-		scan_mlp_chunk_size: int = 1024,
-		bits: tp.Optional[int] = None,
-		rope_scaling: tp.Dict[str, tp.Union[str, float]] = None,
-		**kwargs,
-	):
-		self.rope_scaling = rope_scaling
-		self.gradient_checkpointing = gradient_checkpointing
-		self.use_scan_mlp = use_scan_mlp
-		self.scan_mlp_chunk_size = scan_mlp_chunk_size
-		self.bits = bits
 
 	@staticmethod
 	def get_weight_decay_exclusions():

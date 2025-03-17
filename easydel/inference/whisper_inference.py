@@ -13,7 +13,6 @@
 # limitations under the License.
 import math
 import typing as tp
-from dataclasses import dataclass
 from functools import partial
 
 import jax
@@ -24,6 +23,7 @@ from jax import numpy as jnp
 from transformers.models.whisper.tokenization_whisper import TO_LANGUAGE_CODE
 from transformers.pipelines.audio_utils import ffmpeg_read
 
+from easydel.utils import traversals as etr
 from easydel.utils.compiling_utils import get_safe_hash_int
 
 if tp.TYPE_CHECKING:
@@ -64,8 +64,7 @@ def _compiled_generate(
 	)
 
 
-@jax.tree_util.register_pytree_node_class
-@dataclass
+@etr.auto_pytree
 class vWhisperInferenceConfig:
 	"""
 	Configuration class for Whisper inference.
@@ -96,22 +95,6 @@ class vWhisperInferenceConfig:
 	task = None
 	language = None
 	is_multilingual = None
-
-	def tree_flatten(self):
-		return (
-			self.batch_size,
-			self.max_length,
-			self.generation_config,
-			self.logits_processor,
-			self.return_timestamps,
-			self.task,
-			self.language,
-			self.is_multilingual,
-		), {}
-
-	@classmethod
-	def tree_unflatten(cls, aux, children):
-		return cls(*children)
 
 	def __hash__(self):
 		return get_safe_hash_int("".join(str(k) + str(v) for k, v in self.__dict__.items()))

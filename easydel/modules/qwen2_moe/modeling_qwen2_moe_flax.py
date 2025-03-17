@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
 	FlaxSequenceClassifierOutput,
@@ -475,10 +475,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=Qwen2MoeConfig,
 	model_type="qwen2_moe",
-	embedding_layer_names=["embed_tokens"],
 )
 class Qwen2MoeModel(EasyDeLBaseModule):
 	def __init__(
@@ -630,10 +629,9 @@ class Qwen2MoeModel(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=Qwen2MoeConfig,
 	model_type="qwen2_moe",
-	embedding_layer_names=["embed_tokens"],
 )
 class Qwen2MoeForCausalLM(EasyDeLBaseModule):
 	def __init__(
@@ -752,10 +750,9 @@ class Qwen2MoeForCausalLM(EasyDeLBaseModule):
 
 
 @register_module(
-	"sequence-classification",
+	TaskType.SEQUENCE_CLASSIFICATION,
 	config=Qwen2MoeConfig,
 	model_type="qwen2_moe",
-	embedding_layer_names=["embed_tokens"],
 )
 class Qwen2MoeForSequenceClassification(EasyDeLBaseModule):
 	def __init__(

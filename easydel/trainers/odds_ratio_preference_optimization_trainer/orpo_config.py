@@ -13,14 +13,15 @@
 # limitations under the License.
 
 import typing as tp
-from dataclasses import dataclass, field
+from dataclasses import field
 
+from easydel.utils import traversals as etr
 from easydel.utils.compiling_utils import hash_fn
 
 from ..training_configurations import TrainingArguments
 
 
-@dataclass
+@etr.auto_pytree
 class ORPOConfig(TrainingArguments):
 	"""
 	Configuration class for ORPO training settings.

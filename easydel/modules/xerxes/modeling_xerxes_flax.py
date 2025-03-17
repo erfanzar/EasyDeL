@@ -23,7 +23,7 @@ from flax import nnx as nn
 from jax import lax
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
@@ -495,10 +495,9 @@ class XerxesDecoderLayer(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=XerxesConfig,
 	model_type="xerxes",
-	embedding_layer_names=["embed_tokens"],
 )
 class XerxesModel(EasyDeLBaseModule):
 	def __init__(
@@ -644,10 +643,9 @@ class XerxesModel(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=XerxesConfig,
 	model_type="xerxes",
-	embedding_layer_names=["embed_tokens"],
 )
 class XerxesForCausalLM(EasyDeLBaseModule):
 	def __init__(

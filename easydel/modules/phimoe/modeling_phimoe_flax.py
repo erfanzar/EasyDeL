@@ -24,7 +24,7 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
@@ -453,11 +453,9 @@ class FlaxPhiMoeDecoderLayer(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=PhiMoeConfig,
 	model_type="phimoe",
-	embedding_layer_names=["embed_tokens"],
-	layernorm_names=["norm", "input_layernorm", "post_attention_layernorm"],
 )
 class PhiMoeModel(EasyDeLBaseModule):
 	def __init__(
@@ -588,11 +586,9 @@ class PhiMoeModel(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=PhiMoeConfig,
 	model_type="phimoe",
-	embedding_layer_names=["embed_tokens"],
-	layernorm_names=["norm", "input_layernorm", "post_attention_layernorm"],
 )
 class PhiMoeForCausalLM(EasyDeLBaseModule):
 	def __init__(

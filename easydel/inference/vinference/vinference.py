@@ -606,12 +606,25 @@ class vInference:
 		vision_width = None
 		if "pixel_values" in kwargs.keys():
 			vision_included = True
-			(
-				vision_batch_size,
-				vision_channels,
-				vision_height,
-				vision_width,
-			) = kwargs["pixel_values"].shape
+			if kwargs["pixel_values"].ndim == 4:
+				(
+					vision_batch_size,
+					vision_channels,
+					vision_height,
+					vision_width,
+				) = kwargs["pixel_values"].shape
+			elif kwargs["pixel_values"].ndim == 3:
+				vision_batch_size = 1
+				(
+					vision_channels,
+					vision_height,
+					vision_width,
+				) = kwargs["pixel_values"].shape
+			elif kwargs["pixel_values"].ndim == 2:
+				vision_batch_size = 1
+				vision_channels = 1
+				vision_height, vision_width = kwargs["pixel_values"].shape
+		required_props = self.model._create_required_props_from_kwargs(model_kwargs=kwargs)
 		vinf_config = vInferencePreCompileConfig(
 			batch_size=batch_size,
 			prefill_length=prefill_length,
@@ -620,6 +633,7 @@ class vInference:
 			vision_channels=vision_channels,
 			vision_height=vision_height,
 			vision_width=vision_width,
+			required_props=required_props,
 		)
 
 		return vinf_config
@@ -996,6 +1010,7 @@ class vInference:
 				vision_channels=standalone_config.vision_channels,
 				vision_height=standalone_config.vision_height,
 				vision_width=standalone_config.vision_width,
+				required_props=standalone_config.required_props,
 			)
 			state = self._get_init_state(standalone_config, wargs)
 			logger.info("smart compiling `first_iter_fn`")

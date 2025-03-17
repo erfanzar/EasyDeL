@@ -32,7 +32,7 @@ from easydel.inference.logits_process import (
 	WhisperTimeStampLogitsProcessor,
 )
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
@@ -736,16 +736,9 @@ class WhisperDecoder(EasyDeLBaseModule):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=WhisperConfig,
 	model_type="whisper",
-	embedding_layer_names=["embed_positions", "embed_tokens"],
-	layernorm_names=[
-		"self_attn_layer_norm",
-		"final_layer_norm",
-		"encoder_attn_layer_norm",
-		"layer_norm",
-	],
 )
 class WhisperModel(EasyDeLBaseModule):
 	def __init__(
@@ -958,16 +951,9 @@ class WhisperModel(EasyDeLBaseModule):
 
 
 @register_module(
-	"speech-sequence-to-sequence",
+	TaskType.SPEECH_SEQUENCE_TO_SEQUENCE,
 	config=WhisperConfig,
 	model_type="whisper",
-	embedding_layer_names=["embed_positions", "embed_tokens"],
-	layernorm_names=[
-		"self_attn_layer_norm",
-		"final_layer_norm",
-		"encoder_attn_layer_norm",
-		"layer_norm",
-	],
 )
 class WhisperForConditionalGeneration(EasyDeLBaseModule):
 	loss_type = "ForCausalLM"
@@ -1263,7 +1249,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 		batch_size, seq_length = decoder_input_ids.shape
 
 		past_key_values = self.init_cache(batch_size, max_length)
-		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
+		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="b1")
 		if decoder_attention_mask is not None:
 			position_ids = decoder_attention_mask.cumsum(-1) - 1
 			extended_attention_mask = lax.dynamic_update_slice(
@@ -1322,16 +1308,9 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 
 
 @register_module(
-	"audio-classification",
+	TaskType.AUDIO_CLASSIFICATION,
 	config=WhisperConfig,
 	model_type="whisper",
-	embedding_layer_names=["embed_positions", "embed_tokens"],
-	layernorm_names=[
-		"self_attn_layer_norm",
-		"final_layer_norm",
-		"encoder_attn_layer_norm",
-		"layer_norm",
-	],
 )
 class WhisperForAudioClassification(EasyDeLBaseModule):
 	def __init__(

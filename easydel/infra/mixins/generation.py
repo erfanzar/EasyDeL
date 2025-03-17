@@ -222,6 +222,12 @@ class EasyGenerationMixin:
 		model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
 		return model_kwargs
 
+	def _create_required_props_from_kwargs(
+		self,
+		model_kwargs: tp.Dict[str, chex.Array],
+	) -> tp.Optional[tp.Mapping[str, tp.Dict[str, tp.Any]]]:
+		return None
+
 	def _get_compile_model_kwargs(
 		self,
 		batch_size: int,
@@ -233,6 +239,7 @@ class EasyGenerationMixin:
 		vision_channels: int = 3,
 		vision_height: tp.Optional[int] = None,
 		vision_width: tp.Optional[int] = None,
+		required_props: tp.Optional[tp.Mapping[str, tp.Dict[str, tp.Any]]] = None,
 		**kwargs,
 	):
 		deteshape = (batch_size, input_tokens_length)

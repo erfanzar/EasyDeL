@@ -767,17 +767,6 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
 	config=CLIPVisionConfig,
 	model_type="clip",
 	task_type=TaskType.BASE_VISION,
-	embedding_layer_names=[
-		"position_embedding",
-		"token_embedding",
-	],
-	layernorm_names=[
-		"layer_norm1",
-		"layer_norm2",
-		"pre_layrnorm",
-		"post_layernorm",
-		"final_layer_norm",
-	],
 )
 class CLIPVisionModel(EasyDeLBaseModule):
 	def __init__(
@@ -823,17 +812,6 @@ class CLIPVisionModel(EasyDeLBaseModule):
 	config=CLIPVisionConfig,
 	model_type="clip",
 	task_type=TaskType.IMAGE_CLASSIFICATION,
-	embedding_layer_names=[
-		"position_embedding",
-		"token_embedding",
-	],
-	layernorm_names=[
-		"layer_norm1",
-		"layer_norm2",
-		"pre_layrnorm",
-		"post_layernorm",
-		"final_layer_norm",
-	],
 )
 class CLIPForImageClassification(EasyDeLBaseModule):
 	def __init__(
@@ -919,17 +897,6 @@ class CLIPForImageClassification(EasyDeLBaseModule):
 	config=CLIPConfig,
 	model_type="clip",
 	task_type=TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION,
-	embedding_layer_names=[
-		"position_embedding",
-		"token_embedding",
-	],
-	layernorm_names=[
-		"layer_norm1",
-		"layer_norm2",
-		"pre_layrnorm",
-		"post_layernorm",
-		"final_layer_norm",
-	],
 )
 class CLIPModel(EasyDeLBaseModule):
 	def __init__(

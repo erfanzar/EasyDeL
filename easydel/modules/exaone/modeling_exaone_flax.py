@@ -383,10 +383,9 @@ class ExaoneDecoderLayer(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	ExaoneConfig,
 	model_type="exaone",
-	embedding_layer_names=["wte"],
 )
 class ExaoneModel(EasyDeLBaseModule):
 	def __init__(
@@ -527,10 +526,9 @@ class ExaoneModel(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	ExaoneConfig,
 	model_type="exaone",
-	embedding_layer_names=["wte"],
 )
 class ExaoneForCausalLM(EasyDeLBaseModule):
 	def __init__(
@@ -619,7 +617,6 @@ class ExaoneForCausalLM(EasyDeLBaseModule):
 	TaskType.SEQUENCE_CLASSIFICATION,
 	config=ExaoneConfig,
 	model_type="exaone",
-	embedding_layer_names=["wte"],
 )
 class ExaoneForSequenceClassification(EasyDeLBaseModule):
 	def __init__(

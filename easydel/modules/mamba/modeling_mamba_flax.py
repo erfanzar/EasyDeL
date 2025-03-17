@@ -18,7 +18,6 @@ import itertools
 import typing as tp
 
 import chex
-import flax.struct
 import jax
 import jax.numpy as jnp
 from einops import repeat
@@ -26,7 +25,7 @@ from flax import nnx as nn
 from jax import lax
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import FlaxBaseModelOutput
 from easydel.infra.utils import (
 	ACT2FN,
@@ -37,20 +36,21 @@ from easydel.layers.caching import MambaCache
 from easydel.layers.caching.mamba_cache import MambaCacheMetaData, MambaCacheView
 from easydel.layers.norms import RMSNorm as MambaRMSNorm
 from easydel.modules.mamba.mamba_configuration import MambaConfig as MambaConfig
+from easydel.utils import traversals as etr
 
 
 def init_to_value(x, dtype):
 	return lambda _, shape, dtype: jnp.broadcast_to(jnp.asarray(x, dtype=dtype), shape)
 
 
-@flax.struct.dataclass
+@etr.auto_pytree
 class MambaOutput(FlaxBaseModelOutput):
 	last_hidden_state: chex.Array = None
 	cache: tp.Optional[MambaCache] = None
 	hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
 
 
-@flax.struct.dataclass
+@etr.auto_pytree
 class MambaCausalLMOutput(FlaxBaseModelOutput):
 	logits: chex.Array = None
 	cache: tp.Optional[MambaCache] = None
@@ -432,10 +432,9 @@ class MambaBlock(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=MambaConfig,
 	model_type="mamba",
-	embedding_layer_names=["embeddings"],
 )
 class MambaModel(EasyDeLBaseModule):
 	def __init__(
@@ -576,10 +575,9 @@ class MambaModel(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=MambaConfig,
 	model_type="mamba",
-	embedding_layer_names=["embeddings"],
 )
 class MambaForCausalLM(EasyDeLBaseModule):
 	def __init__(

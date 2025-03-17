@@ -22,7 +22,7 @@ from flax import nnx as nn
 from jax import numpy as jnp
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
 	FlaxSequenceClassifierOutput,
@@ -426,10 +426,9 @@ class MixtralDecoderLayer(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=MixtralConfig,
 	model_type="mixtral",
-	embedding_layer_names=["embed_tokens"],
 )
 class MixtralModel(EasyDeLBaseModule):
 	def __init__(
@@ -588,10 +587,9 @@ class MixtralModel(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=MixtralConfig,
 	model_type="mixtral",
-	embedding_layer_names=["embed_tokens"],
 )
 class MixtralForCausalLM(EasyDeLBaseModule):
 	def __init__(
@@ -695,10 +693,9 @@ class MixtralForCausalLM(EasyDeLBaseModule):
 
 
 @register_module(
-	"sequence-classification",
+	TaskType.SEQUENCE_CLASSIFICATION,
 	config=MixtralConfig,
 	model_type="mixtral",
-	embedding_layer_names=["embed_tokens"],
 )
 class MixtralForSequenceClassification(EasyDeLBaseModule):
 	def __init__(

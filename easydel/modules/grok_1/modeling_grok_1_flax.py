@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
 	MoeCausalLMOutput,
@@ -496,10 +496,9 @@ class FlaxGrok1DecoderLayer(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=Grok1Config,
 	model_type="grok-1",
-	embedding_layer_names=["embed_tokens"],
 )
 class Grok1Model(EasyDeLBaseModule):
 	def __init__(
@@ -674,10 +673,9 @@ class Grok1Model(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=Grok1Config,
 	model_type="grok-1",
-	embedding_layer_names=["embed_tokens"],
 )
 class Grok1ForCausalLM(EasyDeLBaseModule):
 	def __init__(

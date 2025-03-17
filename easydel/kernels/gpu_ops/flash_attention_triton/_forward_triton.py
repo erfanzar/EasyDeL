@@ -58,6 +58,9 @@ def config_prune_kernel(
 	return [
 		Config({"BLOCK_M": 16, "BLOCK_N": 64}, num_warps=4, num_stages=4),
 		Config({"BLOCK_M": 16, "BLOCK_N": 64}, num_warps=2, num_stages=4),
+		Config({"BLOCK_M": 16, "BLOCK_N": 32}, num_warps=2, num_stages=4),
+		Config({"BLOCK_M": 16, "BLOCK_N": 64}, num_warps=2, num_stages=3),
+		Config({"BLOCK_M": 16, "BLOCK_N": 32}, num_warps=2, num_stages=3),
 	]
 
 

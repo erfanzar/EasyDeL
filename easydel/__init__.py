@@ -158,6 +158,10 @@ from .modules.auto import (
 	AutoStateVisionModel,
 	get_modules_by_type,
 )
+from .modules.aya_vision import (
+	AyaVisionConfig,
+	AyaVisionForConditionalGeneration,
+)
 from .modules.clip import (
 	CLIPConfig,
 	CLIPForImageClassification,
@@ -173,6 +177,12 @@ from .modules.cohere import (
 	CohereForCausalLM,
 	CohereForSequenceClassification,
 	CohereModel,
+)
+from .modules.cohere2 import (
+	Cohere2Config,
+	Cohere2ForCausalLM,
+	Cohere2ForSequenceClassification,
+	Cohere2Model,
 )
 from .modules.dbrx import (
 	DbrxAttentionConfig,

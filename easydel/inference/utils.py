@@ -24,7 +24,7 @@ from flax import nnx as nn
 from jax import numpy as jnp
 from jax import random, sharding
 from jax.sharding import PartitionSpec
-
+from easydel.utils import traversals as etr
 from easydel.utils.compiling_utils import get_safe_hash_int
 
 from .logits_process import (
@@ -41,7 +41,7 @@ from .logits_process import (
 )
 
 
-@dataclasses.dataclass
+@etr.auto_pytree
 class vInferencePreCompileConfig:
 	batch_size: tp.Union[int, tp.List[int]] = 1
 	prefill_length: tp.Optional[tp.Union[int, tp.List[int]]] = None
@@ -50,6 +50,12 @@ class vInferencePreCompileConfig:
 	vision_channels: tp.Optional[tp.Union[int, tp.List[int]]] = None
 	vision_height: tp.Optional[tp.Union[int, tp.List[int]]] = None
 	vision_width: tp.Optional[tp.Union[int, tp.List[int]]] = None
+	required_props: tp.Optional[
+		tp.Union[
+			tp.Mapping[str, tp.Dict[str, tp.Any]],
+			tp.List[tp.Mapping[str, tp.Dict[str, tp.Any]]],
+		]
+	] = None
 
 	def _im_standalone(self):
 		standalone = True
@@ -69,7 +75,8 @@ class vInferencePreCompileConfig:
 		hash_str += str(self.vision_batch_size) + "-"
 		hash_str += str(self.vision_channels) + "-"
 		hash_str += str(self.vision_height) + "-"
-		hash_str += str(self.vision_width)
+		hash_str += str(self.vision_width) + "-"
+		hash_str += str(self.required_props)
 		hash_out = get_safe_hash_int(hash_str)
 		return hash_out
 
@@ -124,8 +131,7 @@ class vInferencePreCompileConfig:
 vInferencePreCompileConfig.__hash__ = vInferencePreCompileConfig.get_default_hash
 
 
-@jax.tree_util.register_pytree_node_class
-@dataclasses.dataclass
+@etr.auto_pytree
 class vInferenceConfig:
 	max_new_tokens: int = 64
 	min_length: tp.Optional[int] = None
@@ -145,32 +151,6 @@ class vInferenceConfig:
 	partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, tp.Any]]] = None
 	partition_axis: tp.Optional[PartitionAxis] = None
 	_loop_rows: tp.Optional[int] = None
-
-	def tree_flatten(self):
-		return (
-			self.max_new_tokens,
-			self.min_length,
-			self.streaming_chunks,
-			self.temperature,
-			self.top_p,
-			self.top_k,
-			self.do_sample,
-			self.no_repeat_ngram_size,
-			self.num_return_sequences,
-			self.suppress_tokens,
-			self.forced_bos_token_id,
-			self.forced_eos_token_id,
-			self.pad_token_id,
-			self.bos_token_id,
-			self.eos_token_id,
-			self.partition_rules,
-			self.partition_axis,
-			self._loop_rows,
-		), {}
-
-	@classmethod
-	def tree_unflatten(cls, aux, children):
-		return cls(*children)
 
 	def get_partition_rules(
 		self,
@@ -395,7 +375,6 @@ def create_sampling_step(
 	pad_token_id: jax.Array,
 	do_sample: bool = True,
 ):
-	
 	def sampling_step(graphdef, graphstate, graphother, state: SampleState):
 		"""
 		Performs a single sampling step for text generation.

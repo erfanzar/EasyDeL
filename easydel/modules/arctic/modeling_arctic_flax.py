@@ -456,10 +456,9 @@ class ArcticDecoderLayer(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=ArcticConfig,
 	model_type="arctic",
-	embedding_layer_names=["embed_tokens"],
 )
 class ArcticModel(EasyDeLBaseModule):
 	def __init__(
@@ -599,10 +598,9 @@ class ArcticModel(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=ArcticConfig,
 	model_type="arctic",
-	embedding_layer_names=["embed_tokens"],
 )
 class ArcticForCausalLM(EasyDeLBaseModule):
 	def __init__(
@@ -699,8 +697,7 @@ class ArcticForCausalLM(EasyDeLBaseModule):
 @register_module(
 	TaskType.SEQUENCE_CLASSIFICATION,
 	config=ArcticConfig,
-	model_type="arctic",
-	embedding_layer_names=["embed_tokens"],
+	model_type="arctic", 
 )
 class ArcticForSequenceClassification(EasyDeLBaseModule):
 	def __init__(

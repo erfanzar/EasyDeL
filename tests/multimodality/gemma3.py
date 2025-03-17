@@ -7,37 +7,24 @@ import easydel as ed
 
 import jax
 from jax import numpy as jnp
-from transformers import AutoProcessor, Qwen2VLProcessor
-from qwen_vl_utils import process_vision_info
+from transformers import AutoProcessor
 
 
 def main():
 	sharding_axis_dims = (1, 1, -1, 1)
 
 	prefill_length = 2048
-	max_new_tokens = 128
+	max_new_tokens = 1024
 
 	max_length = max_new_tokens + prefill_length
-	pretrained_model_name_or_path = "Qwen/Qwen2-VL-2B-Instruct"
-
-	min_pixels = 256 * 28 * 28
-	max_pixels = min_pixels
-	resized_height, resized_width = 420, 420
+	pretrained_model_name_or_path = "google/gemma-3-4b-it"
 
 	dtype = jnp.float16
 	param_dtype = jnp.bfloat16
 	partition_axis = ed.PartitionAxis()
 
-	processor: Qwen2VLProcessor = AutoProcessor.from_pretrained(
-		pretrained_model_name_or_path,
-		min_pixels=min_pixels,
-		max_pixels=max_pixels,
-		resized_height=resized_height,
-		resized_width=resized_width,
-	)
+	processor = AutoProcessor.from_pretrained(pretrained_model_name_or_path)
 	processor.padding_side = "left"
-	processor.eos_token_id = processor.tokenizer.eos_token_id
-	processor.pad_token_id = processor.tokenizer.pad_token_id
 
 	model: ed.Gemma3ForConditionalGeneration = (
 		ed.AutoEasyDeLModelForImageTextToText.from_pretrained(
@@ -59,40 +46,26 @@ def main():
 			precision=jax.lax.Precision.DEFAULT,
 		)
 	)
+
 	messages = [
-		{"role": "system", "content": "You are a helpful AI assistant."},
-		{
-			"role": "user",
-			"content": "Can you provide ways to eat combinations of bananas and dragonfruits?",
-		},
-		{
-			"role": "assistant",
-			"content": "Sure! Here are some ways to eat bananas and dragonfruits together: 1. Banana and dragonfruit smoothie: Blend bananas and dragonfruits together with some milk and honey. 2. Banana and dragonfruit salad: Mix sliced bananas and dragonfruits together with some lemon juice and honey.",
-		},
-		# {"role": "user", "content": "Can you code?"},
 		{
 			"role": "user",
 			"content": [
 				{
 					"type": "image",
-					"image": "https://picsum.photos/seed/picsum/200/300",
-					"min_pixels": min_pixels,
-					"max_pixels": max_pixels,
-					"resized_height": resized_height,
-					"resized_width": resized_width,
+					"image": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/bee.jpg",
 				},
-				{"type": "text", "text": "what are these metrics indication exacly"},
+				{"type": "text", "text": "Describe this image in detail."},
 			],
 		},
 	]
-	image_inputs, video_inputs = process_vision_info(messages)
-	inputs = processor(
-		text=[processor.apply_chat_template(messages, add_generation_prompt=True)],
-		images=image_inputs,
-		videos=video_inputs,
-		max_length=prefill_length,
-		padding="max_length",
+
+	inputs = processor.apply_chat_template(
+		messages,
 		return_tensors="jax",
+		add_generation_prompt=True,
+		tokenize=True,
+		return_dict=True,
 	)
 	inference = ed.vInference(
 		model=model,
@@ -108,9 +81,18 @@ def main():
 			num_return_sequences=1,
 		),
 	)
+	inference.precompile(
+		ed.vInferencePreCompileConfig(
+			batch_size=1,
+			prefill_length=prefill_length,
+			vision_included=True,
+			vision_batch_size=1,
+			vision_channels=3,
+			vision_height=896,
+			vision_width=896,
+		)
+	)
 	print("Start Generation Process.")
-	print(inputs.keys())
-	print(inputs["input_ids"].shape)
 	for response in inference.generate(**inputs):
 		...
 	print(

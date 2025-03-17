@@ -14,7 +14,6 @@
 
 
 import typing as tp
-from dataclasses import dataclass
 from functools import cached_property, partial
 
 import chex
@@ -40,7 +39,8 @@ from easydel.infra.utils import (
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
 from easydel.layers.norms import float8s
-from easydel.modules.siglip.modeling_siglip_flax import SiglipVisionModel
+from easydel.modules.auto.auto_modeling import AutoEasyDeLVisionModel
+from easydel.utils import traversals as etr
 from easydel.utils.helpers import get_logger
 
 from .gemma3_configuration import Gemma3Config, Gemma3TextConfig
@@ -48,7 +48,7 @@ from .gemma3_configuration import Gemma3Config, Gemma3TextConfig
 logger = get_logger(__name__)
 
 
-@dataclass
+@etr.auto_pytree
 class Gemma3CausalLMOutputWithPast(ModelOutput):
 	"""
 	Base class for Gemma3 causal language model (or autoregressive) outputs.
@@ -493,8 +493,7 @@ class Gemma3DecoderLayer(nn.Module):
 @register_module(
 	TaskType.BASE_MODULE,
 	config=Gemma3TextConfig,
-	model_type="gemma3_text",
-	embedding_layer_names=["embed_tokens"],
+	model_type="gemma3_text", 
 )
 class Gemma3TextModel(EasyDeLBaseModule):
 	def __init__(
@@ -655,8 +654,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
 @register_module(
 	TaskType.CAUSAL_LM,
 	config=Gemma3TextConfig,
-	model_type="gemma3_text",
-	embedding_layer_names=["embed_tokens"],
+	model_type="gemma3_text", 
 )
 class Gemma3ForCausalLM(EasyDeLBaseModule):
 	def __init__(
@@ -773,8 +771,7 @@ class Gemma3ForCausalLM(EasyDeLBaseModule):
 @register_module(
 	TaskType.SEQUENCE_CLASSIFICATION,
 	config=Gemma3TextConfig,
-	model_type="gemma3_text",
-	embedding_layer_names=["embed_tokens"],
+	model_type="gemma3_text", 
 )
 class Gemma3ForSequenceClassification(EasyDeLBaseModule):
 	def __init__(
@@ -947,16 +944,10 @@ class Gemma3MultiModalProjector(nn.Module):
 	TaskType.IMAGE_TEXT_TO_TEXT,
 	config=Gemma3Config,
 	model_type="gemma3",
-	embedding_layer_names=["embed_tokens", "position_embedding", "token_embedding"],
-	layernorm_names=[
-		"layernorm",
-		"layer_norm1",
-		"layer_norm2",
-		"final_layer_norm",
-		"post_layernorm",
-	],
 )
 class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
+	loss_type = "ForCausalLM"
+
 	def __init__(
 		self,
 		config: Gemma3Config,
@@ -973,7 +964,7 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.vision_tower = SiglipVisionModel(
+		self.vision_tower = AutoEasyDeLVisionModel.from_config(
 			config=config.vision_config,
 			dtype=dtype,
 			param_dtype=param_dtype,
@@ -1100,6 +1091,7 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 		vision_channels: int = 3,
 		vision_height: tp.Optional[int] = None,
 		vision_width: tp.Optional[int] = None,
+		required_props: tp.Optional[tp.Mapping[str, tp.Dict[str, tp.Any]]] = None,
 		**kwargs,
 	):
 		basics = super()._get_compile_model_kwargs(
@@ -1112,6 +1104,7 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 			vision_channels=vision_channels,
 			vision_height=vision_height,
 			vision_width=vision_width,
+			required_props=required_props,
 			**kwargs,
 		)
 		token_type_ids = jnp.ones(
@@ -1149,3 +1142,9 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 		)
 		model_inputs["pixel_values"] = pixel_values
 		return model_inputs
+
+	def update_inputs_for_generation(self, model_outputs, model_kwargs):
+		model_kwargs = super().update_inputs_for_generation(model_outputs, model_kwargs)
+		model_kwargs.pop("pixel_values", None)  # only effect first iter
+		model_kwargs.pop("token_type_ids", None)  # only effect first iter
+		return model_kwargs
