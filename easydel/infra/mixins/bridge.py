@@ -699,7 +699,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		)
 		model_type: str = config.model_type
 
-		config_class, module, _ = get_modules_by_type(model_type, task_type=cls._model_task)
+		config_class, module = get_modules_by_type(model_type, task_type=cls._model_task)
 
 		logger.debug(f"Downloading hf_model weights from {pretrained_model_name_or_path}")
 		hf_model = cls.get_torch_loader().from_pretrained(

@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import typing as tp
-from dataclasses import dataclass, field
+from dataclasses import field
 
+from easydel.utils import traversals as etr
 from easydel.utils.compiling_utils import hash_fn
 
 from ..training_configurations import TrainingArguments
 
 
-@dataclass
+@etr.auto_pytree
 class GRPOConfig(TrainingArguments):
 	"""
 	Configuration class for the GRPOTrainer.
@@ -77,6 +78,7 @@ class GRPOConfig(TrainingArguments):
 		default=False,
 		metadata={"help": "whenever to skip extracting prompt from dataset."},
 	)
+
 	def __post_init__(self):
 		"""Post initialization to set dependent parameters."""
 		self.max_sequence_length = self.max_prompt_length + self.max_completion_length

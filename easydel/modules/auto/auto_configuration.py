@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import functools
 import typing as tp
 
 import flax.nnx
@@ -32,7 +31,6 @@ from easydel.infra.etils import (
 )
 from easydel.infra.factory import TaskType, registry
 from easydel.utils.helpers import get_logger
-from easydel.utils.parameters_transformation import torch_dict_to_easydel_params
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
 logger = get_logger(name=__name__)
@@ -41,29 +39,17 @@ logger = get_logger(name=__name__)
 def get_modules_by_type(
 	model_type: str,
 	task_type: TaskType,
-) -> tp.Tuple[
-	tp.Type[EasyDeLBaseConfig],
-	tp.Type[EasyDeLBaseModule] | tp.Any,
-	functools.partial | tp.Any,
-]:
+) -> tp.Tuple[tp.Type[EasyDeLBaseConfig], tp.Type[EasyDeLBaseModule] | tp.Any]:
 	"""
 	The get_modules_by_type function is a helper function that returns the following:
 	    1. The config class for the model type specified (e.g., LlamaConfig, FalconConfig)
-	    2. The Flax Model class for the model type specified (e.g., FlaxLlamaForCausalLM, FalconForCausalLM)
-	    3. A function to convert a HuggingFace pretrained checkpoint into an easydel checkpoint
+	    2. The EasyDeL Model class for the model type specified (e.g., FlaxLlamaForCausalLM, FalconForCausalLM)
 	"""
 	registred_module = registry.get_module_registration(
-		task_type=task_type, model_type=model_type
+		task_type=task_type,
+		model_type=model_type,
 	)
-	return (
-		registred_module.config,
-		registred_module.module,
-		functools.partial(
-			torch_dict_to_easydel_params,
-			embedding_layer_names=registred_module.embedding_layer_names,
-			layernorm_names=registred_module.layernorm_names,
-		),
-	)
+	return (registred_module.config, registred_module.module)
 
 
 def is_flatten(pytree: dict):
@@ -123,10 +109,7 @@ class AutoEasyDeLConfig:
 		config = cls_main.from_pretrained(pretrained_model_name_or_path)
 		model_type: str = config.model_type
 
-		config_class, module, transform_function = get_modules_by_type(
-			model_type,
-			model_task,
-		)
+		config_class = get_modules_by_type(model_type, model_task)[0]
 		config = config_class.from_pretrained(pretrained_model_name_or_path)
 		if hasattr(config, "add_jax_args"):
 			config.add_jax_args()
@@ -138,7 +121,7 @@ class AutoEasyDeLConfig:
 			backend=backend,
 			platform=platform,
 			shard_attention_computation=shard_attention_computation,
-		) 
+		)
 		for k, v in kwargs.items():
 			setattr(config, k, v)
 
@@ -187,7 +170,7 @@ class AutoShardAndGatherFunctions:
 		"""
 		if partition_rules is None:
 			partition_rules = config.get_partition_rules(True)
-		_, module, _ = get_modules_by_type(config.model_type, model_task)
+		_, module = get_modules_by_type(config.model_type, model_task)
 		model = module.lazy_init(config=config, rngs=flax.nnx.Rngs(0))
 
 		partition_specs = match_partition_rules(partition_rules, model.graphtree_shape)

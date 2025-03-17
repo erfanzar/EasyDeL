@@ -17,13 +17,14 @@ import asyncio
 import time
 import typing as tp
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from http import HTTPStatus
+
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 from prometheus_client import start_http_server
 
+from easydel.utils import traversals as etr
 from easydel.utils.helpers import get_logger
 
 from .api_models import (
@@ -49,7 +50,7 @@ APP = FastAPI()
 logger = get_logger(__name__)
 
 
-@dataclass
+@etr.auto_pytree
 class EndpointConfig:
 	path: str
 	handler: tp.Callable

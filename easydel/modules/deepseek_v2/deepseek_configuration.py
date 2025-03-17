@@ -250,37 +250,6 @@ class DeepseekV2Config(EasyDeLBaseConfig):
 			(".*", PartitionSpec(None)),
 		)
 
-	def add_jax_args(
-		self,
-		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		use_scan_mlp: bool = False,
-		scan_mlp_chunk_size: int = 1024,
-		bits: tp.Optional[int] = None,
-		rope_scaling: tp.Dict[str, tp.Union[str, float]] = None,
-		**kwargs,
-	):
-		"""The add_jax_args function adds the following arguments to the model:
-
-		Args:
-		    self: Bind the attributes and methods of a class to an
-		        instance of that class
-		    gradient_checkpointing: str: Determine whether to use
-		        gradient checkpointing
-		    use_scan_mlp: bool: Determine whether to use the scan_mlp
-		        function or not
-		    scan_mlp_chunk_size: int: Chunk the input to the mlp
-		    bits: tp.Optional[int]: Specify the number of bits to use for
-		        quantization
-
-		Returns:
-		    A tuple of the following:
-		"""
-		self.rope_scaling = rope_scaling
-		self.gradient_checkpointing = gradient_checkpointing
-		self.use_scan_mlp = use_scan_mlp
-		self.scan_mlp_chunk_size = scan_mlp_chunk_size
-		self.bits = bits
-
 	@staticmethod
 	def get_weight_decay_exclusions():
 		return tuple()

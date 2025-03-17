@@ -23,7 +23,7 @@ from einops import rearrange
 from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
@@ -317,10 +317,9 @@ class FlaxInternLM2Block(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=InternLM2Config,
 	model_type="internlm2",
-	embedding_layer_names=["tok_embeddings"],
 )
 class InternLM2Model(EasyDeLBaseModule):
 	def __init__(
@@ -463,10 +462,9 @@ class InternLM2Model(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=InternLM2Config,
 	model_type="internlm2",
-	embedding_layer_names=["tok_embeddings"],
 )
 class InternLM2ForCausalLM(EasyDeLBaseModule):
 	def __init__(
@@ -572,10 +570,9 @@ class InternLM2ForCausalLM(EasyDeLBaseModule):
 
 
 @register_module(
-	"sequence-classification",
+	TaskType.SEQUENCE_CLASSIFICATION,
 	config=InternLM2Config,
 	model_type="internlm2",
-	embedding_layer_names=["tok_embeddings"],
 )
 class InternLM2ForSequenceClassification(EasyDeLBaseModule):
 	def __init__(

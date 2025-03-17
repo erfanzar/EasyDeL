@@ -15,7 +15,6 @@
 import dataclasses
 import typing as tp
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from enum import Enum
 
 import einops
@@ -27,12 +26,13 @@ from jax.sharding import PartitionSpec as Ps
 
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
+from easydel.utils import traversals as etr
 from easydel.utils.helpers import get_logger
 
 logger = get_logger("EasyDeL-AttentionOperator")
 
 
-@dataclass
+@etr.auto_pytree
 class AttentionOutput:
 	attention_weights: tp.Optional[Array] = None
 	attention_outputs: tp.Optional[Array] = None
@@ -43,7 +43,7 @@ class RuntimeType(Enum):
 	generation = "generation"
 
 
-@dataclass
+@etr.auto_pytree
 class AttentionMetadata:
 	runtime_dtype: jax.typing.DTypeLike
 	runtime_softmax_dtype: tp.Optional[jax.typing.DTypeLike] = None

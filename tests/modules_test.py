@@ -27,7 +27,6 @@ from easydel.infra.etils import (
 	AVAILABLE_ATTENTION_MECHANISMS,
 	EasyDeLGradientCheckPointers,
 )
-from easydel.infra.loss_utils import cross_entropy_loss_and_accuracy
 
 torch.manual_seed(42)
 
@@ -87,11 +86,7 @@ class EasyModelsTest(unittest.TestCase):
 		self.platform = None
 
 	def create_test_for_models(self, module_name: str, hf_module_class, task):
-		(
-			module_config,
-			module_class,
-			_,
-		) = ed.get_modules_by_type(module_name, task)
+		module_config, module_class = ed.get_modules_by_type(module_name, task)
 		if self.header_config is None:
 			config = module_config(
 				num_experts_per_tok=self.num_experts_per_tok,
@@ -211,104 +206,6 @@ class EasyModelsTest(unittest.TestCase):
 				ed_output,
 				easy_time=easy_time,
 				torch_time=torch_time,
-			)
-
-	def create_moe_test_for_models(self, module_name: str, hf_module_class):
-		module_config, module_class, transform_function = ed.get_modules_by_type(
-			module_name
-		)
-		if self.header_config is None:
-			config = module_config(
-				num_experts_per_tok=self.num_experts_per_tok,
-				num_experts=self.num_experts,
-				num_local_experts=self.num_local_experts,
-				vocab_size=self.vocab_size,
-				hidden_size=self.hidden_size,
-				num_attention_heads=self.num_attention_heads,
-				num_hidden_layers=self.num_hidden_layers,
-				gradient_checkpointing=self.gradient_checkpointing,
-				max_position_embeddings=self.max_position_embeddings,
-				num_key_value_heads=self.num_key_value_heads,
-				scan_mlp_chunk_size=self.scan_mlp_chunk_size,
-				intermediate_size=self.intermediate_size,
-				rotary_dim=self.rotary_dim,
-				rms_norm_eps=self.rms_norm_eps,
-				layer_norm_eps=self.layer_norm_eps,
-				head_dim=self.head_dim,
-				# residual_in_fp32=True
-			)
-		else:
-			config = self.header_config
-
-		hf_model = hf_module_class(config=copy.deepcopy(config))
-		hf_model.eval()
-		params = {
-			"params": transform_function(
-				state_dict=hf_model.state_dict(),
-				device=jax.devices("cpu")[0],
-			)
-		}
-		config.add_jax_args()
-		config.add_basic_configurations(
-			shard_attention_computation=self.shard_attention_computation,
-			scan_mlp_chunk_size=self.scan_mlp_chunk_size,
-			use_sharding_constraint=self.use_sharding_constraint,
-		)
-		mesh = config.mesh
-
-		with mesh:
-			partition_specs = ed.escale.match_partition_rules(
-				config.get_partition_rules(True),
-				params,
-			)
-			shard, _ = ed.escale.make_shard_and_gather_fns(
-				partition_specs,
-				mesh,
-			)
-
-			params = jax.tree_util.tree_map(lambda p, f: f(p), params, shard)
-			config.add_basic_configurations(
-				attn_mechanism=self.attn_mechanism,
-				blocksize_k=self.blocksize_k,
-				blocksize_q=self.blocksize_q,
-			)
-
-			ed_model = module_class(
-				config=config,
-				dtype=self.dtype,
-				param_dtype=self.dtype,
-				precision=self.precision,
-			)
-
-			torch_input_ids, jax_input_ids = self.make_input_id(
-				self.vocab_size,
-				(self.batch_size, self.sequence_length + 1),
-			)
-			hf_output = hf_model(
-				input_ids=torch_input_ids[:, :-1],
-				labels=torch_input_ids[:, 1:],
-				output_router_logits=True,
-			)
-			ed_output = ed_model(
-				input_ids=jax_input_ids[:, :-1],
-				params=params,
-				return_dict=True,
-				output_router_logits=True,
-			)
-			loss, _ = cross_entropy_loss_and_accuracy(
-				ed_output.logits,
-				jax_input_ids[:, 1:],
-			)
-			loss += ed_output.aux_loss
-			del params
-			del hf_model
-			gc.collect()
-
-			return self.compare_torch_to_jax(
-				"Moe-" + module_name,
-				hf_output,
-				ed_output,
-				loss,
 			)
 
 	def test_llama(self):
@@ -797,10 +694,20 @@ class EasyModelsTest(unittest.TestCase):
 	def test_cohere(self):
 		self.header_config = None
 		res, err = self.create_test_for_models(
-			"cohere", transformers.CohereForCausalLM, ed.TaskType.CAUSAL_LM
+			"cohere",
+			transformers.CohereForCausalLM,
+			ed.TaskType.CAUSAL_LM,
 		)
+		self.assertTrue(res, f"Cohere model Failed [ERROR {err}]")
 
-		self.assertTrue(res, f"CoHERE model Failed [ERROR {err}]")
+	def test_cohere2(self):
+		self.header_config = None
+		res, err = self.create_test_for_models(
+			"cohere2",
+			transformers.Cohere2ForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
+		self.assertTrue(res, f"Cohere2 model Failed [ERROR {err}]")
 
 	def test_qwen2_moe(self):
 		self.header_config = None
@@ -811,6 +718,27 @@ class EasyModelsTest(unittest.TestCase):
 			ed.TaskType.CAUSAL_LM,
 		)
 		self.assertTrue(res, f"Qwen2Moe model Failed [ERROR {err}]")
+
+	def test_qwen2_vl(self):
+		self.header_config = ed.AutoEasyDeLConfig.from_pretrained(
+			"Qwen/Qwen2-VL-2B-Instruct",
+			model_task=ed.TaskType.IMAGE_TEXT_TO_TEXT,
+		)
+		self.header_config.hidden_size = 128 * 4
+		self.header_config.initializer_range = 0.02
+		self.header_config.intermediate_size = 256
+		self.header_config.max_position_embeddings = 1024
+		self.header_config.max_window_layers = 8
+		self.header_config.num_attention_heads = 4
+		self.header_config.num_hidden_layers = 8
+		self.header_config.num_key_value_heads = 2
+		res, err = self.create_test_for_models(
+			"qwen2_vl",
+			transformers.Qwen2VLForConditionalGeneration,
+			ed.TaskType.IMAGE_TEXT_TO_TEXT,
+		)
+		self.rope_scaling = None
+		self.assertTrue(res, f"Qwen2VL model Failed [ERROR {err}]")
 
 	def test_roberta(self):
 		self.header_config = ed.RobertaConfig(
@@ -914,7 +842,7 @@ class EasyModelsTest(unittest.TestCase):
 			jnp.asarray(np_input_ids, dtype="i4"),
 		)
 
-	def get_hf_model_from_hub(self, repo_id):
+	def get_hf_model_from_hub(self, repo_id, factory=transformers.AutoModelForCausalLM):
 		conf = transformers.AutoConfig.from_pretrained(
 			repo_id,
 			trust_remote_code=True,
@@ -922,12 +850,7 @@ class EasyModelsTest(unittest.TestCase):
 		for k, v in self.__dict__.items():
 			if isinstance(v, (bool, str, float, type(None), int)):
 				setattr(conf, k, v)
-		model = type(
-			transformers.AutoModelForCausalLM.from_config(
-				conf,
-				trust_remote_code=True,
-			)
-		)
+		model = type(factory.from_config(conf, trust_remote_code=True))
 
 		return model, conf
 
@@ -942,9 +865,10 @@ if __name__ == "__main__":
 	# test.test_gemma3()  # Passed
 	# test.test_arctic()  # Passed
 	# test.test_cohere()  # Passed
+	# test.test_cohere2()  # Passed
 	# test.test_dbrx()  # Passed
 	# test.test_deepseek_v2()  # Passed
-	test.test_deepseek_v3()  # Passed
+	# test.test_deepseek_v3()  # Passed
 	# test.test_exaone()  # Passed
 	# test.test_falcon()  # Passed
 	# test.test_gemma()  # Passed
@@ -968,5 +892,6 @@ if __name__ == "__main__":
 	# test.test_phimoe()  # Failed v0.0.80 - N  Runtime
 	# test.test_qwen2()  # Passed
 	# test.test_qwen2_moe()  # Passed
+	# test.test_qwen2_vl()  # Passed
 	# test.test_stablelm()  # Passed
 	# -----------------------------------------------

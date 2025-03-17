@@ -22,7 +22,7 @@ from flax import nnx as nn
 from jax import numpy as jnp
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
@@ -473,10 +473,9 @@ class OpenELMDecoderLayer(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=OpenELMConfig,
 	model_type="openelm",
-	embedding_layer_names=["token_embeddings"],
 )
 class OpenELMModel(EasyDeLBaseModule):
 	def __init__(
@@ -621,10 +620,9 @@ class OpenELMModel(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=OpenELMConfig,
 	model_type="openelm",
-	embedding_layer_names=["token_embeddings"],
 )
 class OpenELMForCausalLM(EasyDeLBaseModule):
 	def __init__(

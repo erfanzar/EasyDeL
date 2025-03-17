@@ -23,7 +23,7 @@ import jax.numpy as jnp
 from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
@@ -414,10 +414,9 @@ class GemmaDecoderLayer(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=GemmaConfig,
 	model_type="gemma",
-	embedding_layer_names=["embed_tokens"],
 )
 class GemmaModel(EasyDeLBaseModule):
 	def __init__(
@@ -557,10 +556,9 @@ class GemmaModel(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=GemmaConfig,
 	model_type="gemma",
-	embedding_layer_names=["embed_tokens"],
 )
 class GemmaForCausalLM(EasyDeLBaseModule):
 	def __init__(
@@ -663,10 +661,9 @@ class GemmaForCausalLM(EasyDeLBaseModule):
 
 
 @register_module(
-	"sequence-classification",
+	TaskType.SEQUENCE_CLASSIFICATION,
 	config=GemmaConfig,
 	model_type="gemma",
-	embedding_layer_names=["embed_tokens"],
 )
 class GemmaForSequenceClassification(EasyDeLBaseModule):
 	def __init__(

@@ -11,8 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from .aya_vision_configuration import AyaVisionConfig
+from .modeling_aya_vision_flax import AyaVisionForConditionalGeneration
 
-from .modeling_rwkv_flax import RwkvForCausalLM, RwkvModel
-from .rwkv_configuration import RwkvConfig
-
-__all__ = "RwkvForCausalLM", "RwkvModel", "RwkvConfig"
+__all__ = "AyaVisionForConditionalGeneration", "AyaVisionConfig"

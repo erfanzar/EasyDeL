@@ -18,19 +18,20 @@ import typing as tp
 
 import chex
 import jax.lax
-from flax import linen as nn
-from flax.core import FrozenDict, freeze, unfreeze
-from flax.struct import dataclass
-from flax.traverse_util import flatten_dict, unflatten_dict
+from flax import nnx as nn
 from jax import numpy as jnp
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import ModelOutput
 from easydel.modules.rwkv.rwkv_configuration import RwkvConfig as RwkvConfig
+from easydel.utils import traversals as etr
 
 
-@dataclass
+# NOTE:Updated but wont work forsure, check this later.
+
+
+@etr.auto_pytree
 class RwkvOutput(ModelOutput):
 	last_hidden_state: chex.Array = None
 	state: tp.Optional[tp.Tuple[chex.Array, ...]] = None
@@ -38,16 +39,12 @@ class RwkvOutput(ModelOutput):
 	attentions: tp.Optional[tp.Tuple[chex.Array, ...]] = None
 
 
-@dataclass
+@etr.auto_pytree
 class RwkvCausalLMOutput(ModelOutput):
 	logits: chex.Array = None
 	state: tp.Optional[tp.List[chex.Array]] = None
 	hidden_states: tp.Optional[tp.Tuple[chex.Array, ...]] = None
 	attentions: tp.Optional[tp.Tuple[chex.Array, ...]] = None
-
-
-def init_to_value(x, dtype):
-	return lambda _: x.astype(dtype)
 
 
 def init_state(hidden_size):
@@ -58,9 +55,13 @@ def init_state(hidden_size):
 	return time_mix_state, channel_mix_state
 
 
-@jax.jit
 def rwkv_linear_attention(
-	time_decay, time_first, key, value, state=None, return_state=False
+	time_decay,
+	time_first,
+	key,
+	value,
+	state=None,
+	return_state=False,
 ):
 	current_sequence_length = key.shape[1]
 	output = jnp.zeros_like(key)
@@ -98,18 +99,25 @@ def rwkv_linear_attention(
 	return output, state
 
 
-class FlaxRwkvSelfAttention(nn.Module):
-	config: RwkvConfig
-	layer_id: int
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None
-
-	def setup(self) -> None:
-		config = self.config
+class RwkvSelfAttention(nn.Module):
+	def __init__(
+		self,
+		config: RwkvConfig,
+		layer_id: int,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: jax.lax.PrecisionLike = None,
+		*,
+		rngs: nn.Rngs,
+	) -> None:
+		self.config = config
+		self.layer_id = layer_id
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
 		num_hidden_layers = config.num_hidden_layers
-		layer_id = self.layer_id
-		hidden_size = self.config.hidden_size
+		hidden_size = config.hidden_size
 		attention_hidden_size = (
 			config.attention_hidden_size
 			if config.attention_hidden_size is not None
@@ -129,63 +137,47 @@ class FlaxRwkvSelfAttention(nn.Module):
 		time_mix_value = time_mix_key + 0.3 * ratio_0_to_1
 		time_mix_receptance = jnp.power(x, 0.5 * ratio_1_to_almost_0)
 
-		# This makes it easier to convert torch model into easydel since we use automated/small translation between
-		# jax and torch
+		self.time_decay = nn.Param(time_decay.astype(self.param_dtype))
+		self.time_first = nn.Param(time_first.astype(self.param_dtype))
+		self.time_mix_key = nn.Param(time_mix_key.astype(self.param_dtype))
+		self.time_mix_value = nn.Param(time_mix_value.astype(self.param_dtype))
+		self.time_mix_receptance = nn.Param(time_mix_receptance.astype(self.param_dtype))
 
-		# time_decay = time_decay.reshape(1, 1, hidden_size)
-		# time_first = time_first.reshape(1, 1, hidden_size)
-		# time_mix_key = time_mix_key.reshape(1, 1, hidden_size)
-		# time_mix_value = time_mix_value.reshape(1, 1, hidden_size)
-		# time_mix_receptance = time_mix_receptance.reshape(1, 1, hidden_size)
-
-		self.time_decay = self.param(
-			"time_decay",
-			init_fn=init_to_value(time_decay, self.dtype),
-		)
-		self.time_first = self.param(
-			"time_first",
-			init_fn=init_to_value(time_first, self.dtype),
-		)
-		self.time_mix_key = self.param(
-			"time_mix_key",
-			init_fn=init_to_value(time_mix_key, self.dtype),
-		)
-		self.time_mix_value = self.param(
-			"time_mix_value",
-			init_fn=init_to_value(time_mix_value, self.dtype),
-		)
-		self.time_mix_receptance = self.param(
-			"time_mix_receptance",
-			init_fn=init_to_value(time_mix_receptance, self.dtype),
-		)
-
-		self.key = Dense(
+		self.key = nn.Linear(
+			hidden_size,
 			attention_hidden_size,
 			use_bias=False,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
-		self.value = Dense(
+		self.value = nn.Linear(
+			hidden_size,
 			attention_hidden_size,
 			use_bias=False,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
-		self.receptance = Dense(
+		self.receptance = nn.Linear(
+			hidden_size,
 			attention_hidden_size,
 			use_bias=False,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
-		self.output = Dense(
+		self.output = nn.Linear(
+			attention_hidden_size,
 			hidden_size,
 			use_bias=False,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
 
 	def __call__(
@@ -236,15 +228,23 @@ class FlaxRwkvSelfAttention(nn.Module):
 		return out, next_state
 
 
-class FlaxRwkvFeedForward(nn.Module):
-	config: RwkvConfig
-	layer_id: int
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None
-
-	def setup(self):
-		config = self.config
+class RwkvFeedForward(nn.Module):
+	def __init__(
+		self,
+		config: RwkvConfig,
+		layer_id: int,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: jax.lax.PrecisionLike = None,
+		*,
+		rngs: nn.Rngs,
+	) -> None:
+		self.config = config
+		self.layer_id = layer_id
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
 		hidden_size = config.hidden_size
 		layer_id = self.layer_id
 		num_hidden_layers = self.config.num_hidden_layers
@@ -259,41 +259,35 @@ class FlaxRwkvFeedForward(nn.Module):
 		ratio_1_to_almost_0 = 1.0 - (layer_id / num_hidden_layers)
 		time_mix_key = jnp.power(x, ratio_1_to_almost_0)
 		time_mix_receptance = jnp.power(x, 0.5 * ratio_1_to_almost_0)
+		self.time_mix_key = nn.Param(time_mix_key.astype(self.param_dtype))
+		self.time_mix_receptance = nn.Param(time_mix_receptance.astype(self.param_dtype))
 
-		# This makes it easier to convert torch model into easydel since we use automated/small translation between
-		# jax and torch
-
-		# time_mix_key = time_mix_key.reshape(1, 1, -1)
-		# time_mix_receptance = time_mix_receptance.reshape(1, 1, -1)
-
-		self.time_mix_key = self.param(
-			"time_mix_key", init_fn=init_to_value(time_mix_key, self.param_dtype)
-		)
-		self.time_mix_receptance = self.param(
-			"time_mix_receptance",
-			init_fn=init_to_value(time_mix_receptance, self.param_dtype),
-		)
-
-		self.key = Dense(
+		self.key = nn.Linear(
+			hidden_size,
 			intermediate_size,
 			use_bias=False,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
-		self.receptance = Dense(
+		self.receptance = nn.Linear(
+			intermediate_size,
 			hidden_size,
 			use_bias=False,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
-		self.value = Dense(
+		self.value = nn.Linear(
+			intermediate_size,
 			hidden_size,
 			use_bias=False,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
 
 	def __call__(self, hidden, state):
@@ -309,16 +303,23 @@ class FlaxRwkvFeedForward(nn.Module):
 		return r * self.value(k), hidden[-1, :]
 
 
-class SingleStandFlaxRwkvBlock(nn.Module):
-	config: RwkvConfig
-	layer_id: int
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None
-
-	def setup(self):
-		config = self.config
-		layer_id = self.layer_id
+class SingleStandRwkvBlock(nn.Module):
+	def __init__(
+		self,
+		config: RwkvConfig,
+		layer_id: int,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: jax.lax.PrecisionLike = None,
+		*,
+		rngs: nn.Rngs,
+	) -> None:
+		self.config = config
+		self.layer_id = layer_id
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
 
 		if layer_id == 0:
 			self.pre_ln = nn.LayerNorm(
@@ -328,24 +329,28 @@ class SingleStandFlaxRwkvBlock(nn.Module):
 			)
 
 		self.ln1 = nn.LayerNorm(
+			config.hidden_size,
 			epsilon=config.layer_norm_epsilon,
 			dtype=dtype,
 			param_dtype=param_dtype,
+			rngs=rngs,
 		)
 		self.ln2 = nn.LayerNorm(
+			config.hidden_size,
 			epsilon=config.layer_norm_epsilon,
 			dtype=dtype,
 			param_dtype=param_dtype,
+			rngs=rngs,
 		)
 
-		self.attention = FlaxRwkvSelfAttention(
+		self.attention = RwkvSelfAttention(
 			config=config,
 			layer_id=layer_id,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
 		)
-		self.feed_forward = FlaxRwkvFeedForward(
+		self.feed_forward = RwkvFeedForward(
 			config=config,
 			layer_id=layer_id,
 			dtype=dtype,
@@ -379,249 +384,57 @@ class SingleStandFlaxRwkvBlock(nn.Module):
 		return outputs
 
 
-FlaxRwkvBlock = nn.vmap(
-	SingleStandFlaxRwkvBlock,
-	in_axes=0,
-	out_axes=0,
-	split_rngs={"params": False},
-	variable_axes={"params": None},
-)
-
-
-class FlaxRwkvBlockCollection(nn.Module):
-	config: RwkvConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None
-
-	def setup(self) -> None:
-		self.blocks = [
-			FlaxRwkvBlock(
-				config=config,
-				dtype=dtype,
-				param_dtype=param_dtype,
-				precision=precision,
-				layer_id=idx,
-				name=str(idx),
-			)
-			for idx in range(self.config.num_hidden_layers)
-		]
-
-		self.layers_are_rescaled = False
-
-	def __call__(
-		self,
-		hidden_states: chex.Array,
-		attention_mask: tp.Optional[chex.Array] = None,
-		state: tp.Optional[tp.List[chex.Array]] = None,
-		use_cache: tp.Optional[bool] = None,
-		deterministic: tp.Optional[bool] = True,
-		output_attentions: tp.Optional[bool] = None,
-		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
-	):
-		all_hidden_states = ()
-		all_self_attentions = ()
-		use_cache = (
-			use_cache
-			if use_cache is not None
-			else (self.config.use_cache if not deterministic else False)
-		)
-		for idx, block in enumerate(self.blocks):
-			hidden_states, state, attentions = block(
-				hidden_states, state=state, output_attentions=output_attentions
-			)
-
-			if (
-				self.layers_are_rescaled
-				and self.config.rescale_every > 0
-				and (idx + 1) % self.config.rescale_every == 0
-			):
-				hidden_states = hidden_states / 2
-
-			if output_hidden_states:
-				all_hidden_states = all_hidden_states + (hidden_states,)
-
-			if output_attentions:
-				all_self_attentions = all_self_attentions + (attentions,)
-		return hidden_states, all_hidden_states, all_self_attentions
-
-
-class FlaxRwkvPretrainedModel(EasyDeLBaseModule):
-	module_class: nn.Module
-	config_class = RwkvConfig
-
-	def __init__(
-		self,
-		config: RwkvConfig,
-		input_shape: tp.Tuple = (1, 1),
-		seed: int = 0,
-		dtype: jnp.dtype = jnp.float32,
-		param_dtype: jnp.dtype = jnp.float32,
-		precision: jax.lax.PrecisionLike = None,
-		_do_init: bool = True,
-		**kwargs,
-	):
-		super().__init__(
-			config=config,
-			module=self.module_class(
-				config=config,
-				dtype=dtype,
-				param_dtype=param_dtype,
-				precision=precision,
-				**kwargs,
-			),
-			input_shape=input_shape,
-			seed=seed,
-			dtype=dtype,
-			_do_init=_do_init,
-		)
-
-	def init_weights(
-		self, rng: jax.random.PRNGKey, input_shape: tp.Tuple, params: FrozenDict = None
-	) -> FrozenDict[tp.Any, tp.Any] | tp.Mapping[str, tp.Any] | tp.Any:
-		input_ids = jnp.zeros(input_shape, dtype="i4")
-		attention_mask = jnp.ones((batch_size, sequence_length), "b1")
-		params_rng, dropout_rng = jax.random.split(rng)
-		rng_s = {"params": params_rng, "dropout": dropout_rng}
-		module_init_outputs = self.module.init(
-			rng_s, input_ids, attention_mask, return_dict=False
-		)
-
-		random_params = module_init_outputs["params"]
-
-		if params is not None:
-			random_params = flatten_dict(unfreeze(random_params))
-			params = flatten_dict(unfreeze(params))
-			for missing_key in self._missing_keys:
-				params[missing_key] = random_params[missing_key]
-			self._missing_keys = set()
-			return freeze(unflatten_dict(params))
-		else:
-			return random_params
-
-	def __call__(  # noqa
-		self,
-		input_ids: tp.Optional[chex.Array] = None,
-		attention_mask: tp.Optional[chex.Array] = None,
-		inputs_embeds: tp.Optional[chex.Array] = None,
-		state: tp.Optional[tp.List[chex.Array]] = None,
-		use_cache: tp.Optional[bool] = None,
-		output_attentions: tp.Optional[bool] = None,
-		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
-		params: dict = None,
-		dropout_rng: jax.random.PRNGKey = None,
-		train: bool = False,
-		extra_embedding: tp.Optional[tp.Union[jnp.ndarray, None]] = None,
-		add_params_field: bool = False,
-	):
-		output_attentions = (
-			output_attentions
-			if output_attentions is not None
-			else self.config.output_attentions
-		)
-		output_hidden_states = (
-			output_hidden_states
-			if output_hidden_states is not None
-			else self.config.output_hidden_states
-		)
-		return_dict = return_dict if return_dict is not None else self.config.return_dict
-
-		batch_size, sequence_length = input_ids.shape
-
-		if attention_mask is None:
-			attention_mask = jnp.ones((batch_size, sequence_length))
-
-		rng_s = {}
-		if dropout_rng is not None:
-			rng_s["dropout"] = dropout_rng
-
-		inputs = (
-			{"params": params or self.params} if add_params_field else params or self.params
-		)
-
-		if self.config.bits is not None:
-			rng_s["params"] = jax.random.key(0)
-
-		mutable = False
-
-		return self.module.apply(
-			inputs,
-			input_ids,
-			attention_mask,
-			inputs_embeds,
-			state,
-			use_cache,
-			train,
-			output_attentions,
-			output_hidden_states,
-			return_dict,
-			rngs=rng_s,
-			mutable=mutable,
-		)
-
-	def generate(self, *args, **kwargs):
-		try:
-			gen_output = super().generate(*args, **kwargs)
-		except AttributeError as exc:
-			if "past_key_values" in str(exc):
-				raise AttributeError(
-					"You tried to call `generate` with a decoding strategy that manipulates `past_key_values`. RWKV "
-					"doesn't have that attribute, try another generation strategy instead. For the available "
-					"generation strategies, check this doc:"
-					" https://huggingface.co/docs/transformers/en/generation_strategies#decoding-strategies"
-				) from None
-			else:
-				raise exc
-		return gen_output
-
-	def prepare_inputs_for_generation(
-		self, input_ids, state=None, inputs_embeds=None, **kwargs
-	):
-		if state is not None:
-			input_ids = input_ids[:, -1].unsqueeze(-1)
-		if inputs_embeds is not None and state is None:
-			model_inputs = {"inputs_embeds": inputs_embeds}
-		else:
-			model_inputs = {"input_ids": input_ids}
-
-		model_inputs["state"] = state
-		return model_inputs
+RwkvBlock = nn.vmap(SingleStandRwkvBlock, in_axes=0, out_axes=0)
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=RwkvConfig,
 	model_type="rwkv",
-	embedding_layer_names=["embed_tokens"],
-	layernorm_names=["ln_out", "ln2", "ln1", "pre_ln"],
 )
-class FlaxRwkvModel(nn.Module):
-	config: RwkvConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None
-
-	def setup(self):
-		config = self.config
-		self.embeddings = nn.Embed(
-			config.vocab_size,
-			config.hidden_size,
-			dtype=dtype,
-			param_dtype=param_dtype,
-		)
-		self.blocks = FlaxRwkvBlockCollection(
+class RwkvModel(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: RwkvConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: jax.lax.PrecisionLike = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
 			config=config,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
 			rngs=rngs,
 		)
-
-		self.ln_out = nn.LayerNorm(
+		self.embeddings = nn.Embed(
+			config.vocab_size,
+			config.hidden_size,
 			dtype=dtype,
 			param_dtype=param_dtype,
+			rngs=rngs,
+		)
+		self.blocks = self.blocks = [
+			RwkvBlock(
+				config=config,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
+				layer_id=idx,
+				rngs=rngs,
+			)
+			for idx in range(self.config.num_hidden_layers)
+		]
+
+		self.layers_are_rescaled = False
+		self.deterministic = True
+		self.ln_out = nn.LayerNorm(
+			config.hidden_size,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			rngs=rngs,
 		)
 
 	def __call__(
@@ -630,7 +443,6 @@ class FlaxRwkvModel(nn.Module):
 		attention_mask: tp.Optional[chex.Array] = None,
 		inputs_embeds: tp.Optional[chex.Array] = None,
 		state: tp.Optional[tp.List[chex.Array]] = None,
-		deterministic: bool = True,
 		use_cache: tp.Optional[bool] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
@@ -649,7 +461,7 @@ class FlaxRwkvModel(nn.Module):
 		use_cache = (
 			use_cache
 			if use_cache is not None
-			else (self.config.use_cache if not deterministic else False)
+			else (self.config.use_cache if not self.deterministic else False)
 		)
 		return_dict = (
 			return_dict if return_dict is not None else self.config.use_return_dict
@@ -680,16 +492,26 @@ class FlaxRwkvModel(nn.Module):
 
 		hidden_states = inputs_embeds
 
-		hidden_states, all_hidden_states, all_self_attentions = self.blocks(
-			hidden_states,
-			attention_mask,
-			state,
-			use_cache,
-			deterministic,
-			output_attentions,
-			output_hidden_states,
-			return_dict,
-		)
+		all_hidden_states = ()
+		all_self_attentions = ()
+
+		for idx, block in enumerate(self.blocks):
+			hidden_states, state, attentions = block(
+				hidden_states, state=state, output_attentions=output_attentions
+			)
+
+			if (
+				self.layers_are_rescaled
+				and self.config.rescale_every > 0
+				and (idx + 1) % self.config.rescale_every == 0
+			):
+				hidden_states = hidden_states / 2
+
+			if output_hidden_states:
+				all_hidden_states = all_hidden_states + (hidden_states,)
+
+			if output_attentions:
+				all_self_attentions = all_self_attentions + (attentions,)
 
 		hidden_states = self.ln_out(hidden_states)
 
@@ -712,32 +534,42 @@ class FlaxRwkvModel(nn.Module):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=RwkvConfig,
 	model_type="rwkv",
-	embedding_layer_names=["embed_tokens"],
-	layernorm_names=["ln_out", "ln2", "ln1", "pre_ln"],
 )
-class FlaxRwkvForCausalLM(nn.Module):
-	config: RwkvConfig
-	dtype: jnp.dtype = jnp.float32
-	param_dtype: jnp.dtype = jnp.float32
-	precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None
-
-	def setup(self):
-		config = self.config
-		self.rwkv = FlaxRwkvModel(
-			config,
+class RwkvForCausalLM(EasyDeLBaseModule):
+	def __init__(
+		self,
+		config: RwkvConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: jax.lax.PrecisionLike = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		super().__init__(
+			config=config,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
-		self.head = Dense(
+		self.rwkv = RwkvModel(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+		self.head = nn.Linear(
+			config.hidden_size,
 			config.vocab_size,
 			use_bias=False,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
+			rngs=rngs,
 		)
 
 	def __call__(
@@ -746,7 +578,6 @@ class FlaxRwkvForCausalLM(nn.Module):
 		attention_mask: tp.Optional[chex.Array] = None,
 		inputs_embeds: tp.Optional[chex.Array] = None,
 		state: tp.Optional[tp.List[chex.Array]] = None,
-		deterministic: bool = True,
 		use_cache: tp.Optional[bool] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
@@ -764,7 +595,6 @@ class FlaxRwkvForCausalLM(nn.Module):
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,
-			deterministic=deterministic,
 		)
 		hidden_states = rwkv_outputs[0]
 

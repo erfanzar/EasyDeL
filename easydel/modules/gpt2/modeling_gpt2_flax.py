@@ -37,7 +37,7 @@ from flax import nnx as nn
 from jax import lax
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutputWithPastAndCrossAttentions,
 	FlaxCausalLMOutputWithCrossAttentions,
@@ -166,7 +166,7 @@ class GPT2Attention(FlaxAttentionModule):
 		self.attention_performer = FlexibleAttentionModule(
 			dropout_prob=config.attn_pdrop,
 			base_config=config,
-			softmax_scale=self.head_dim**-0.5, 
+			softmax_scale=self.head_dim**-0.5,
 		)
 
 	def _split_heads(self, hidden_states):
@@ -427,11 +427,9 @@ class GPT2Block(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=GPT2Config,
 	model_type="gpt2",
-	embedding_layer_names=["wte", "wpe"],
-	layernorm_names=["ln_1", "ln_2", "ln_f"],
 )
 class GPT2Model(EasyDeLBaseModule):
 	def __init__(
@@ -572,11 +570,9 @@ class GPT2Model(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=GPT2Config,
 	model_type="gpt2",
-	embedding_layer_names=["wte", "wpe"],
-	layernorm_names=["ln_1", "ln_2", "ln_f"],
 )
 class GPT2LMHeadModel(EasyDeLBaseModule):
 	def __init__(

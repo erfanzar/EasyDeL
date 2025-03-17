@@ -20,7 +20,8 @@ from dataclasses import fields
 
 import jax
 import psutil
-from chex import dataclass
+
+from easydel.utils import traversals as etr
 
 try:
 	from prometheus_client import Counter, Gauge, Histogram, Info, start_http_server
@@ -28,7 +29,7 @@ except ModuleNotFoundError:
 	Counter, Gauge, Histogram, Info, start_http_server = [None] * 5
 
 
-@dataclass
+@etr.auto_pytree
 class ModelMetadata:
 	batch_size: int
 	sequence_length: int

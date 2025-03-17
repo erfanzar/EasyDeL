@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import typing as tp
-from dataclasses import dataclass, field
+from dataclasses import field
 
+from easydel.utils import traversals as etr
 from easydel.utils.compiling_utils import hash_fn
 
 from ..training_configurations import TrainingArguments
 
 
-@dataclass
+@etr.auto_pytree
 class SFTConfig(TrainingArguments):
 	r"""
 	Configuration class for the [`SFTTrainer`].

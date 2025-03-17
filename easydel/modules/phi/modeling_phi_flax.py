@@ -23,7 +23,7 @@ from flax import nnx as nn
 from jax import numpy as jnp
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
@@ -409,11 +409,9 @@ class FlaxPhiDecoderLayer(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=PhiConfig,
 	model_type="phi",
-	embedding_layer_names=["embed_tokens"],
-	layernorm_names=["input_layernorm", "final_layernorm", "q_layernorm", "k_layernorm"],
 )
 class PhiModel(EasyDeLBaseModule):
 	def __init__(
@@ -552,11 +550,9 @@ class PhiModel(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=PhiConfig,
 	model_type="phi",
-	embedding_layer_names=["embed_tokens"],
-	layernorm_names=["input_layernorm", "final_layernorm", "q_layernorm", "k_layernorm"],
 )
 class PhiForCausalLM(EasyDeLBaseModule):
 	def __init__(

@@ -513,8 +513,7 @@ class PixtralTransformer(nn.Module):
 @register_module(
 	TaskType.BASE_VISION,
 	config=PixtralVisionConfig,
-	model_type="pixtral",
-	embedding_layer_names=["embed_tokens"],
+	model_type="pixtral", 
 )
 class PixtralVisionModel(EasyDeLBaseModule):
 	def __init__(

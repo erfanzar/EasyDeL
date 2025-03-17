@@ -23,7 +23,7 @@ from flax import nnx as nn
 from jax import numpy as jnp
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
@@ -538,17 +538,9 @@ class FalconBlock(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=FalconConfig,
 	model_type="falcon",
-	embedding_layer_names=["word_embeddings"],
-	layernorm_names=[
-		"input_layernorm",
-		"ln_f",
-		"ln_attn",
-		"ln_mlp",
-		"post_attention_layernorm",
-	],
 )
 class FalconModel(EasyDeLBaseModule):
 	def __init__(
@@ -684,17 +676,9 @@ class FalconModel(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=FalconConfig,
 	model_type="falcon",
-	embedding_layer_names=["word_embeddings"],
-	layernorm_names=[
-		"input_layernorm",
-		"ln_f",
-		"ln_attn",
-		"ln_mlp",
-		"post_attention_layernorm",
-	],
 )
 class FalconForCausalLM(EasyDeLBaseModule):
 	def __init__(

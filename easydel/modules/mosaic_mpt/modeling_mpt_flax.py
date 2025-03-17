@@ -25,7 +25,7 @@ from jax import lax
 from jax import numpy as jnp
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
@@ -352,11 +352,9 @@ def build_mpt_alibi_tensor(num_heads, sequence_length, alibi_bias_max=8):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=MptConfig,
 	model_type="mpt",
-	embedding_layer_names=["wte"],
-	layernorm_names=["norm_1", "norm_2", "norm_f"],
 )
 class MptModel(EasyDeLBaseModule):
 	def __init__(
@@ -481,11 +479,9 @@ class MptModel(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=MptConfig,
 	model_type="mpt",
-	embedding_layer_names=["wte"],
-	layernorm_names=["norm_1", "norm_2", "norm_f"],
 )
 class MptForCausalLM(EasyDeLBaseModule):
 	def __init__(

@@ -13,8 +13,9 @@
 # limitations under the License.
 
 import typing as tp
-from dataclasses import dataclass, field
+from dataclasses import field
 
+from easydel.utils import traversals as etr
 from easydel.utils.compiling_utils import hash_fn
 
 from ..training_configurations import TrainingArguments
@@ -35,7 +36,7 @@ LOSS_FN_VARIENTS = tp.Literal[
 ]
 
 
-@dataclass
+@etr.auto_pytree
 class DPOConfig(TrainingArguments):
 	"""Configuration class for Direct Preference Optimization (DPO) training.
 

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import typing as tp
-from dataclasses import dataclass
 from functools import partial
 
 import chex
@@ -31,11 +30,12 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import ACT2FN, control_mlp_sharding
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.utils import traversals as etr
 
 from .configuration_siglip import SiglipConfig, SiglipTextConfig, SiglipVisionConfig
 
 
-@dataclass
+@etr.auto_pytree
 class SiglipVisionModelOutput(ModelOutput):
 	image_embeds: tp.Optional[chex.Array] = None
 	last_hidden_state: chex.Array = None
@@ -43,7 +43,7 @@ class SiglipVisionModelOutput(ModelOutput):
 	attentions: tp.Optional[tp.Tuple[chex.Array, ...]] = None
 
 
-@dataclass
+@etr.auto_pytree
 class SiglipTextModelOutput(ModelOutput):
 	text_embeds: tp.Optional[chex.Array] = None
 	last_hidden_state: chex.Array = None
@@ -51,7 +51,7 @@ class SiglipTextModelOutput(ModelOutput):
 	attentions: tp.Optional[tp.Tuple[chex.Array, ...]] = None
 
 
-@dataclass
+@etr.auto_pytree
 class SiglipOutput(ModelOutput):
 	loss: tp.Optional[chex.Array] = None
 	logits_per_image: chex.Array = None
@@ -604,14 +604,6 @@ class SiglipTextTransformer(EasyDeLBaseModule):
 	TaskType.BASE_MODULE,
 	config=SiglipTextConfig,
 	model_type="siglip_text_model",
-	embedding_layer_names=["position_embedding", "token_embedding"],
-	layernorm_names=[
-		"layernorm",
-		"layer_norm1",
-		"layer_norm2",
-		"final_layer_norm",
-		"post_layernorm",
-	],
 )
 class SiglipTextModel(EasyDeLBaseModule):
 	def __init__(
@@ -889,14 +881,6 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
 	TaskType.BASE_VISION,
 	config=SiglipVisionConfig,
 	model_type="siglip_vision_model",
-	embedding_layer_names=["position_embedding", "token_embedding"],
-	layernorm_names=[
-		"layernorm",
-		"layer_norm1",
-		"layer_norm2",
-		"final_layer_norm",
-		"post_layernorm",
-	],
 )
 class SiglipVisionModel(nn.Module):
 	def __init__(
@@ -937,14 +921,6 @@ class SiglipVisionModel(nn.Module):
 	TaskType.BASE_MODULE,
 	config=SiglipConfig,
 	model_type="siglip",
-	embedding_layer_names=["position_embedding", "token_embedding"],
-	layernorm_names=[
-		"layernorm",
-		"layer_norm1",
-		"layer_norm2",
-		"final_layer_norm",
-		"post_layernorm",
-	],
 )
 class SiglipModel(EasyDeLBaseModule):
 	def __init__(
@@ -1170,14 +1146,6 @@ class SiglipModel(EasyDeLBaseModule):
 	TaskType.IMAGE_CLASSIFICATION,
 	config=SiglipConfig,
 	model_type="siglip",
-	embedding_layer_names=["position_embedding", "token_embedding"],
-	layernorm_names=[
-		"layernorm",
-		"layer_norm1",
-		"layer_norm2",
-		"final_layer_norm",
-		"post_layernorm",
-	],
 )
 class SiglipForImageClassification(EasyDeLBaseModule):
 	def __init__(

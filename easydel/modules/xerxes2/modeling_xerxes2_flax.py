@@ -23,7 +23,7 @@ from flax import nnx as nn
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
@@ -379,10 +379,9 @@ class Xerxes2DecoderLayer(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=Xerxes2Config,
 	model_type="xerxes2",
-	embedding_layer_names=["embed_tokens"],
 )
 class Xerxes2Model(EasyDeLBaseModule):
 	def __init__(
@@ -510,10 +509,9 @@ class Xerxes2Model(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=Xerxes2Config,
 	model_type="xerxes2",
-	embedding_layer_names=["embed_tokens"],
 )
 class Xerxes2ForCausalLM(EasyDeLBaseModule):
 	def __init__(

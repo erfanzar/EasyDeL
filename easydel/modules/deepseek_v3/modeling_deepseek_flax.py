@@ -23,7 +23,7 @@ import jax.numpy as jnp
 from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 from easydel.infra.utils import (
 	ACT2FN,
@@ -754,10 +754,9 @@ class DeepseekV3DecoderLayer(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	DeepseekV3Config,
 	model_type="deepseek_v3",
-	embedding_layer_names=["embed_tokens"],
 )
 class DeepseekV3Model(EasyDeLBaseModule):
 	def __init__(
@@ -930,10 +929,9 @@ class DeepseekV3Model(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	DeepseekV3Config,
 	model_type="deepseek_v3",
-	embedding_layer_names=["embed_tokens"],
 )
 class DeepseekV3ForCausalLM(EasyDeLBaseModule):
 	def __init__(

@@ -16,7 +16,6 @@
 import os
 import typing as tp
 import warnings
-from dataclasses import dataclass
 from enum import Enum
 from functools import partial
 
@@ -32,6 +31,8 @@ from jax.experimental.pallas.ops.tpu.flash_attention import (
 	flash_attention as pallas_flash_attention_tpu,
 )
 from jax.extend.backend import get_backend
+
+from easydel.utils import traversals as etr
 
 from .cpu_ops import jax_flash_attention
 from .gpu_ops import triton_flash_attention
@@ -89,7 +90,7 @@ class Platform(str, Enum):
 	JAX = "jax"
 
 
-@dataclass
+@etr.auto_pytree
 class AttentionConfig:
 	"""Configuration for Flash Attention computation."""
 

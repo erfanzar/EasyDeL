@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import typing as tp
-from dataclasses import dataclass, field
+from dataclasses import field
 
 import jax
 from datasets import load_dataset
@@ -21,9 +21,10 @@ from jax import numpy as jnp
 from transformers import AutoTokenizer
 
 import easydel as ed
+from easydel.utils import traversals as etr
 
 
-@dataclass
+@etr.auto_pytree
 class RunTimeConfig:
 	"""
 	Configuration class for runtime settings.

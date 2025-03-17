@@ -13,7 +13,8 @@
 # limitations under the License.
 import os
 import typing as tp
-from dataclasses import dataclass, field
+from dataclasses import field
+from easydel.utils import traversals as etr
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
@@ -120,7 +121,7 @@ This model is well-suited for the following tasks:
 """
 
 
-@dataclass
+@etr.auto_pytree
 class ModelInfo:
 	"""Model information container."""
 

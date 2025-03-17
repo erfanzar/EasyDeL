@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
@@ -188,8 +188,8 @@ class StableLmAttention(FlaxAttentionModule):
 		self.rotary_emb_dim = int(self.config.partial_rotary_factor * self.head_dim)
 		self.attention_performer = FlexibleAttentionModule(
 			base_config=config,
-			softmax_scale=self.head_dim**-0.5, 
-			dropout_prob=config.attention_dropout, 
+			softmax_scale=self.head_dim**-0.5,
+			dropout_prob=config.attention_dropout,
 		)
 
 		self.qk_layernorm = config.qk_layernorm
@@ -426,16 +426,9 @@ class StableLmDecoderLayer(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=StableLmConfig,
 	model_type="stablelm",
-	embedding_layer_names=["embed_tokens"],
-	layernorm_names=[
-		"input_layernorm",
-		"post_attention_layernorm",
-		"norm",
-		"norms",
-	],
 )
 class StableLmModel(EasyDeLBaseModule):
 	def __init__(
@@ -591,16 +584,9 @@ class StableLmModel(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=StableLmConfig,
 	model_type="stablelm",
-	embedding_layer_names=["embed_tokens"],
-	layernorm_names=[
-		"input_layernorm",
-		"post_attention_layernorm",
-		"norm",
-		"norms",
-	],
 )
 class StableLmForCausalLM(EasyDeLBaseModule):
 	def __init__(

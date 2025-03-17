@@ -18,7 +18,7 @@ import re
 import typing as tp
 import warnings
 from copy import deepcopy
-from dataclasses import dataclass, field, fields
+from dataclasses import field, fields
 from pathlib import Path
 
 import jax
@@ -36,6 +36,7 @@ from easydel.infra.etils import (
 	EasyDeLSchedulers,
 )
 from easydel.infra.loss_utils import LossConfig
+from easydel.utils import traversals as etr
 from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.helpers import get_logger
 
@@ -73,7 +74,7 @@ def get_safe_arr(xs):
 AVAILABLE_BACKENDS: tp.List[str] = ["cpu", "gpu", "tpu", None]
 
 
-@dataclass
+@etr.auto_pytree
 class TrainingArguments:
 	auto_shard_states: bool = field(
 		default=True,

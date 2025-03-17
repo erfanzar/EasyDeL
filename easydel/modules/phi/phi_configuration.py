@@ -149,18 +149,6 @@ class PhiConfig(EasyDeLBaseConfig):
 			**kwargs,
 		)
 
-	def add_jax_args(
-		self,
-		bits: tp.Optional[int] = None,
-		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		**kwargs,
-	):
-		self.bits = bits
-		self.gradient_checkpointing = gradient_checkpointing
-		for k, v in kwargs.items():
-			if not hasattr(self, k):
-				setattr(self, k, v)
-
 	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
 		"""
 		Get the partition rules for the model.

@@ -15,7 +15,6 @@ import itertools
 import typing as tp
 
 import chex
-import flax.struct
 import jax
 import jax.numpy as jnp
 from flax import nnx as nn
@@ -35,20 +34,21 @@ from easydel.layers.caching.mamba2_cache import (
 )
 from easydel.layers.norms import RMSNorm as FlaxMamba2RMSNorm
 from easydel.modules.mamba2.mamba2_configuration import Mamba2Config as Mamba2Config
+from easydel.utils import traversals as etr
 
 
 def init_to_value(x, dtype):
 	return lambda *_: x.astype(dtype)
 
 
-@flax.struct.dataclass
+@etr.auto_pytree
 class Mamba2Output(FlaxBaseModelOutput):
 	last_hidden_state: chex.Array = None
 	cache_params: tp.Optional[Mamba2Cache] = None
 	hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
 
 
-@flax.struct.dataclass
+@etr.auto_pytree
 class Mamba2CausalLMOutput(FlaxBaseModelOutput):
 	logits: chex.Array = None
 	cache_params: tp.Optional[Mamba2Cache] = None

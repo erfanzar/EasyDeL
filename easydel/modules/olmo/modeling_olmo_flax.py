@@ -343,10 +343,9 @@ class FlaxOlmoDecoderLayer(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=OlmoConfig,
 	model_type="olmo",
-	embedding_layer_names=["embed_tokens"],
 )
 class OlmoModel(EasyDeLBaseModule):
 	def __init__(
@@ -471,10 +470,9 @@ class OlmoModel(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=OlmoConfig,
 	model_type="olmo",
-	embedding_layer_names=["embed_tokens"],
 )
 class OlmoForCausalLM(EasyDeLBaseModule):
 	def __init__(
@@ -561,8 +559,7 @@ class OlmoForCausalLM(EasyDeLBaseModule):
 @register_module(
 	TaskType.SEQUENCE_CLASSIFICATION,
 	config=OlmoConfig,
-	model_type="olmo",
-	embedding_layer_names=["embed_tokens"],
+	model_type="olmo", 
 )
 class OlmoForSequenceClassification(EasyDeLBaseModule):
 	def __init__(

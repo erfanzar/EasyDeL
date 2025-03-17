@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import register_module
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
 	FlaxCausalLMOutput,
@@ -147,27 +147,20 @@ class CohereAttention(FlaxAttentionModule):
 			use_bias=False,
 			kernel_init=jax.nn.initializers.normal(config.initializer_range),
 			precision=self.precision,
+			rngs=rngs,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.q_proj = linear_class(
-			config.hidden_size,
-			config.num_attention_heads * self.head_dim,
-			rngs=rngs,
+			config.hidden_size, config.num_attention_heads * self.head_dim
 		)
 		self.k_proj = linear_class(
-			config.hidden_size,
-			config.num_key_value_heads * self.head_dim,
-			rngs=rngs,
+			config.hidden_size, config.num_key_value_heads * self.head_dim
 		)
 		self.v_proj = linear_class(
-			config.hidden_size,
-			config.num_key_value_heads * self.head_dim,
-			rngs=rngs,
+			config.hidden_size, config.num_key_value_heads * self.head_dim
 		)
 		self.o_proj = linear_class(
-			config.num_attention_heads * self.head_dim,
-			config.hidden_size,
-			rngs=rngs,
+			config.num_attention_heads * self.head_dim, config.hidden_size
 		)
 
 		self.rotary = self.config.get_basic_rope(
@@ -294,21 +287,9 @@ class CohereMLP(nn.Module):
 			rngs=rngs,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
-		self.gate_proj = linear_class(
-			config.hidden_size,
-			config.intermediate_size,
-			rngs=rngs,
-		)
-		self.down_proj = linear_class(
-			config.intermediate_size,
-			config.hidden_size,
-			rngs=rngs,
-		)
-		self.up_proj = linear_class(
-			config.hidden_size,
-			config.intermediate_size,
-			rngs=rngs,
-		)
+		self.gate_proj = linear_class(config.hidden_size, config.intermediate_size)
+		self.down_proj = linear_class(config.intermediate_size, config.hidden_size)
+		self.up_proj = linear_class(config.hidden_size, config.intermediate_size)
 
 	def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
@@ -427,10 +408,9 @@ class CohereBlock(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=CohereConfig,
 	model_type="cohere",
-	embedding_layer_names=["embed_tokens"],
 )
 class CohereModel(EasyDeLBaseModule):
 	def __init__(
@@ -549,10 +529,9 @@ class CohereModel(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=CohereConfig,
 	model_type="cohere",
-	embedding_layer_names=["embed_tokens"],
 )
 class CohereForCausalLM(EasyDeLBaseModule):
 	def __init__(
@@ -656,7 +635,7 @@ class CohereForCausalLM(EasyDeLBaseModule):
 		else:
 			lm_logits = self.lm_head(hidden_states)
 
-		lm_logits = (lm_logits * self.logit_scale).astype(jnp.float32)
+		lm_logits = lm_logits * self.logit_scale
 
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
@@ -670,10 +649,9 @@ class CohereForCausalLM(EasyDeLBaseModule):
 
 
 @register_module(
-	"sequence-classification",
+	TaskType.SEQUENCE_CLASSIFICATION,
 	config=CohereConfig,
 	model_type="cohere",
-	embedding_layer_names=["embed_tokens"],
 )
 class CohereForSequenceClassification(EasyDeLBaseModule):
 	def __init__(

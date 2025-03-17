@@ -355,10 +355,9 @@ class Olmo2DecoderLayer(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=Olmo2Config,
 	model_type="olmo2",
-	embedding_layer_names=["embed_tokens"],
 )
 class Olmo2Model(EasyDeLBaseModule):
 	def __init__(
@@ -483,10 +482,9 @@ class Olmo2Model(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=Olmo2Config,
 	model_type="olmo2",
-	embedding_layer_names=["embed_tokens"],
 )
 class Olmo2ForCausalLM(EasyDeLBaseModule):
 	def __init__(
@@ -573,7 +571,6 @@ class Olmo2ForCausalLM(EasyDeLBaseModule):
 	TaskType.SEQUENCE_CLASSIFICATION,
 	config=Olmo2Config,
 	model_type="olmo2",
-	embedding_layer_names=["embed_tokens"],
 )
 class Olmo2ForSequenceClassification(EasyDeLBaseModule):
 	def __init__(

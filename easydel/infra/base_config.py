@@ -16,7 +16,6 @@ from __future__ import annotations
 import os
 import typing as tp
 import warnings
-from dataclasses import dataclass
 
 import chex
 import jax
@@ -26,6 +25,7 @@ from eformer.escale import PartitionAxis
 from jax import numpy as jnp
 from transformers.configuration_utils import PretrainedConfig
 
+from easydel.utils import traversals as etr
 from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.helpers import get_logger
 
@@ -85,7 +85,7 @@ def set_attrs_smartly(self, attr_name: str, default: tp.Any, new_attr: tp.Any):
 		setattr(self, attr_name, new_attr)
 
 
-@dataclass
+@etr.auto_pytree
 class EasyMethod:
 	TRAIN: str = "train"
 	SERVE: str = "serve"

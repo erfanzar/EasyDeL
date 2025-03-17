@@ -29,12 +29,11 @@ from eformer.escale import with_sharding_constraint
 from jax import NamedSharding, lax, random
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-
+from jax import tree_util as jtu
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.layers.caching import TransformerCacheView
 from easydel.layers.quantization.quantizers import EasyQuantizer
 from easydel.utils.helpers import get_logger
-
 from .attention_operator import AttentionMetadata, AttentionOutput, AttentionRegistry
 
 logger = get_logger(__name__)
@@ -169,17 +168,20 @@ class FlexibleAttentionModule(nn.Module):
 		causal: bool = True,
 		dropout_rng: tp.Optional[random.PRNGKey] = None,
 	) -> AttentionOutput:
-		return self.impl(
-			q=query_states,
-			k=key_states,
-			v=value_states,
-			bias=bias,
-			init_bias=init_bias,
-			mask=attention_mask,
-			segment_ids=segment_ids,
-			causal=causal,
-			deterministic=self.deterministic,
-			dropout_rng=dropout_rng,
+		return jtu.tree_map(
+			lambda x: x.astype(self.impl.metadata.runtime_dtype),
+			self.impl(
+				q=query_states,
+				k=key_states,
+				v=value_states,
+				bias=bias,
+				init_bias=init_bias,
+				mask=attention_mask,
+				segment_ids=segment_ids,
+				causal=causal,
+				deterministic=self.deterministic,
+				dropout_rng=dropout_rng,
+			),
 		)
 
 	__call__ = forward
@@ -199,6 +201,31 @@ class FlaxAttentionModule(nn.Module):
 		self.cached_key: nn.Cache[Array] | None = None
 		self.cached_value: nn.Cache[Array] | None = None
 		self.cache_index: nn.Cache[Array] | None = None
+
+	def make_flexible_sliding_window(
+		self,
+		attention_mask: jax.Array,
+		cache_view: TransformerCacheView,
+		sliding_window: int,
+	):
+		attention_mask = jnp.logical_and(
+			self._create_sliding_mask(
+				cache_pos=self.build_cache_pos(attention_mask, cache_view),
+				curr_index=cache_view.index[0] if cache_view is not None else 0,
+				cache_length=attention_mask.shape[-1],
+				sliding_windows=sliding_window,
+			),
+			attention_mask,
+		)
+
+		def init_attention_bias():
+			return jax.lax.select(
+				attention_mask > 0,
+				jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+				jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+			)
+
+		return attention_mask, init_attention_bias
 
 	@staticmethod
 	def build_cache_pos(

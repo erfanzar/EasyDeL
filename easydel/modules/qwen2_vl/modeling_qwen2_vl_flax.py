@@ -13,12 +13,9 @@
 # limitations under the License.
 import math
 import typing as tp
-import warnings
 from functools import partial
 
 import chex
-import flax
-import flax.struct
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -44,6 +41,7 @@ from easydel.modules.qwen2_vl.qwen2_vl_configuration import (
 	Qwen2VLConfig,
 	Qwen2VLVisionConfig,
 )
+from easydel.utils import traversals as etr
 
 
 # TODO: Convert this to a jitable jax fn and use that inside model instead of precall
@@ -207,7 +205,7 @@ def get_rope_index(
 		return position_ids, mrope_position_deltas
 
 
-@flax.struct.dataclass
+@etr.auto_pytree
 class Qwen2VLCausalLMOutputWithPast(ModelOutput):
 	"""
 	Base class for Qwen2VL causal language model (or autoregressive) outputs.
@@ -902,9 +900,7 @@ class Qwen2VLDecoderLayer(nn.Module):
 @register_module(
 	TaskType.BASE_VISION,
 	config=Qwen2VLConfig,
-	model_type="qwen2_vl",
-	embedding_layer_names=["embed_tokens"],
-	layernorm_names=["ln_q", "norm1", "norm2"],
+	model_type="qwen2_vl", 
 )
 class Qwen2VisionTransformerPretrainedModel(EasyDeLBaseModule):
 	config_class = Qwen2VLVisionConfig
@@ -1044,9 +1040,7 @@ class Qwen2VisionTransformerPretrainedModel(EasyDeLBaseModule):
 @register_module(
 	TaskType.BASE_MODULE,
 	config=Qwen2VLConfig,
-	model_type="qwen2_vl",
-	embedding_layer_names=["embed_tokens"],
-	layernorm_names=["ln_q", "norm1", "norm2"],
+	model_type="qwen2_vl", 
 )
 class Qwen2VLModel(EasyDeLBaseModule):
 	def __init__(
@@ -1174,10 +1168,10 @@ class Qwen2VLModel(EasyDeLBaseModule):
 	TaskType.IMAGE_TEXT_TO_TEXT,
 	config=Qwen2VLConfig,
 	model_type="qwen2_vl",
-	embedding_layer_names=["embed_tokens"],
-	layernorm_names=["ln_q", "norm1", "norm2"],
 )
 class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
+	loss_type = "ForCausalLM"
+
 	def __init__(
 		self,
 		config: Qwen2VLConfig,
@@ -1298,10 +1292,6 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 			and (attention_mask is None or attention_mask.ndim == 2)
 		):
 			if past_key_values is not None or rope_deltas is None:
-				warnings.warn(
-					"You shouldn't be here (make sure to call `prepare_inputs_for_call`)",
-					stacklevel=1,
-				)
 				position_ids, rope_deltas = get_rope_index(
 					input_ids=input_ids,
 					image_grid_thw=image_grid_thw,
@@ -1366,7 +1356,7 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 		else:
 			model_inputs = {"input_ids": input_ids, "inputs_embeds": None}
 
-		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
+		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="b1")
 		if attention_mask is not None:
 			extended_attention_mask = jax.lax.dynamic_update_slice(
 				extended_attention_mask, attention_mask, (0, 0)
@@ -1395,13 +1385,12 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 	):
 		if image_grid_thw is not None:
 			if image_max_grid_size is None:
-				image_max_grid_size = int(np.max(image_grid_thw[:, 1:]).item())
-			image_grid_thw = tuple(map(tuple, np.asarray(image_grid_thw)))
+				image_max_grid_size = jnp.max(image_grid_thw[:, 1:])
 
 		if video_grid_thw is not None:
 			if video_max_grid_size is None:
-				video_max_grid_size = int(np.max(video_grid_thw[:, 1:]).item())
-			video_grid_thw = tuple(map(tuple, np.asarray(video_grid_thw)))
+				video_max_grid_size = jnp.max(video_grid_thw[:, 1:])
+
 		attention_mask = others.get("attention_mask", None)
 		rope_deltas = others.get("rope_deltas", None)
 		position_ids = others.get("position_ids", None)
@@ -1443,11 +1432,6 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 		)
 		return others
 
-	def update_inputs_for_generation(self, model_outputs, model_kwargs):
-		model_kwargs["past_key_values"] = model_outputs.past_key_values
-		model_kwargs["position_ids"] = model_kwargs["position_ids"][..., -1:] + 1
-		return model_kwargs
-
 	def get_static_arguments(self):
 		return (
 			"video_max_grid_size",
@@ -1455,3 +1439,66 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 			"image_grid_thw",
 			"video_grid_thw",
 		)
+
+	def _get_compile_model_kwargs(
+		self,
+		batch_size: int,
+		input_tokens_length: int,
+		input_sharding: jax.sharding.PartitionSpec,
+		rngs: jax.random.PRNGKey,
+		vision_included: bool = False,
+		vision_batch_size: int = 1,
+		vision_channels: int = 3,
+		vision_height: tp.Optional[int] = None,
+		vision_width: tp.Optional[int] = None,
+		required_props: tp.Optional[tp.Mapping[str, tp.Dict[str, tp.Any]]] = None,
+		**kwargs,
+	):
+		basics = super()._get_compile_model_kwargs(
+			batch_size=batch_size,
+			input_tokens_length=input_tokens_length,
+			input_sharding=input_sharding,
+			rngs=rngs,
+			vision_included=vision_included,
+			vision_batch_size=vision_batch_size,
+			vision_channels=vision_channels,
+			vision_height=vision_height,
+			vision_width=vision_width,
+			required_props=required_props,
+			**kwargs,
+		)
+
+		if vision_included:
+			assert required_props is not None
+			assert "image_grid_thw" in required_props.keys()
+
+			pixel_values = jnp.ones((vision_height, vision_width), dtype="f4")
+			basics.update(
+				{
+					"pixel_values": pixel_values,
+					"image_grid_thw": jnp.array(required_props["image_grid_thw"]["value"]),
+				}
+			)
+		return basics
+
+	def _create_required_props_from_kwargs(
+		self,
+		model_kwargs: tp.Dict[str, chex.Array],
+	) -> tp.Optional[tp.Mapping[str, tp.Dict[str, tp.Any]]]:
+		basics = {}
+		if "image_grid_thw" in model_kwargs.keys():
+			basics.update(
+				{"image_grid_thw": {"value": jnp.array(model_kwargs["image_grid_thw"])}}
+			)
+		if "video_grid_thw" in model_kwargs.keys():
+			basics.update(
+				{"video_grid_thw": {"value": jnp.array(model_kwargs["video_grid_thw"])}}
+			)
+		return basics
+
+	def update_inputs_for_generation(self, model_outputs, model_kwargs):
+		model_kwargs["past_key_values"] = model_outputs.past_key_values
+		model_kwargs["position_ids"] = model_kwargs["position_ids"][:, :, -1:] + 1
+		model_kwargs.pop("pixel_values", None)  # only effect first iter
+		model_kwargs.pop("token_type_ids", None)  # only effect first iter
+		return model_kwargs

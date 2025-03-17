@@ -18,7 +18,6 @@
 
 import logging
 import typing as tp
-from dataclasses import dataclass
 from functools import partial
 
 import jax
@@ -30,6 +29,7 @@ from jax import lax
 from jax import numpy as jnp
 from jax.lax import PrecisionLike
 
+from easydel.utils import traversals as etr
 
 from .gpu_ops import triton_matmul
 from .tpu_ops import pallas_matmul
@@ -271,7 +271,7 @@ def _analyze_matmul(
 	return time, mm_flops
 
 
-@dataclass
+@etr.auto_pytree
 class _MatMulConfig:
 	block_m: int
 	block_n: int

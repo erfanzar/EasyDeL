@@ -798,10 +798,14 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		"""Calculates the FLOP (Floating Point Operations) from JaxPr."""
 		...
 
+	def __str__(self):
+		try:
+			return "EasyDeL-" + prettify_nnx(self)
+		except AttributeError:
+			return "EasyDeL-Partitions-" + super().__str__()
+
 	def __repr__(self):
 		try:
 			return "EasyDeL-" + prettify_nnx(self)
 		except AttributeError:
-			return "EasyDeL-Partitions-" + super().__repr__()
-
-	__str__ = __repr__
+			return "EasyDeL-Partitions-" + super().__str__()

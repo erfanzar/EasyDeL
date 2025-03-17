@@ -15,33 +15,55 @@ import contextlib
 import os
 import typing as tp
 
-import jax.numpy
+import flax
+import flax.nnx
+import jax
 from eformer.escale import PartitionAxis
+from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
-from easydel.infra.base_config import EasyDeLBaseConfigDict
-from easydel.infra.base_module import (
-	EasyDeLBaseModule,
-)
+from easydel.infra.base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
+from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.etils import (
 	EasyDeLBackends,
 	EasyDeLPlatforms,
 	EasyDeLQuantizationMethods,
 )
-from easydel.infra.factory import TaskType
+from easydel.infra.factory import TaskType, registry
 
 
 class BaseAutoEasyModel:
 	model_task: TaskType
 
 	@classmethod
+	def from_config(
+		cls,
+		config: EasyDeLBaseConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: tp.Optional[jax.lax.Precision] = None,
+		*,
+		rngs: tp.Optional[flax.nnx.Rngs] = None,
+	) -> EasyDeLBaseModule:
+		registration = registry.get_module_registration(cls.model_task, config.model_type)
+		if rngs is None:
+			rngs = flax.nnx.Rngs(42)
+		return registration.module(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		)
+
+	@classmethod
 	def from_pretrained(
 		cls,
 		pretrained_model_name_or_path: str,
 		device: tp.Optional[jax.Device] = None,
-		dtype: jax.numpy.dtype = jax.numpy.float32,
-		param_dtype: jax.numpy.dtype = jax.numpy.float32,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
 		precision: tp.Optional[jax.lax.Precision] = None,
 		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
 		sharding_dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
@@ -67,8 +89,8 @@ class BaseAutoEasyModel:
 		Args:
 		    pretrained_model_name_or_path (str): Path or name of the pretrained model in the Hugging Face Hub.
 		    device (jax.Device, optional): Device to load the model on. Defaults to the first CPU.
-		    dtype (jax.numpy.dtype, optional): Data type of the model. Defaults to jax.numpy.float32.
-		    param_dtype (jax.numpy.dtype, optional): Data type of the model parameters. Defaults to jax.numpy.float32.
+		    dtype (jnp.dtype, optional): Data type of the model. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype, optional): Data type of the model parameters. Defaults to jnp.float32.
 		    precision (jax.lax.Precision, optional): Precision for computations. Defaults to jax.lax.Precision("fastest").
 		    sharding_axis_dims (tp.Sequence[int], optional): Dimensions of each sharding axis. Defaults to (1, -1, 1, 1).
 		    sharding_axis_names (tp.Sequence[str], optional): Names of the sharding axes. Defaults to ("dp", "fsdp", "tp", "sp").
@@ -151,8 +173,8 @@ class BaseAutoEasyModel:
 	def _from_easydel_params(
 		cls,
 		pretrained_model_name_or_path: str,
-		dtype: jax.numpy.dtype = jax.numpy.float32,
-		param_dtype: jax.numpy.dtype = jax.numpy.float32,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
 		precision: tp.Optional[jax.lax.Precision] = None,
 		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
 		sharding_dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
@@ -202,8 +224,8 @@ class BaseAutoEasyModel:
 		cls,
 		pretrained_model_name_or_path: str,
 		device: tp.Optional[jax.Device] = None,
-		dtype: jax.numpy.dtype = jax.numpy.float32,
-		param_dtype: jax.numpy.dtype = jax.numpy.float32,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
 		precision: tp.Optional[jax.lax.Precision] = None,
 		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
 		sharding_dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
@@ -327,15 +349,33 @@ class BaseAutoEasyModel:
 
 
 class BaseAutoEasyState:
-	_base: tp.Any
+	_base: BaseAutoEasyModel
+
+	@classmethod
+	def from_config(
+		cls,
+		config: EasyDeLBaseConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: tp.Optional[jax.lax.Precision] = None,
+		*,
+		rngs: tp.Optional[flax.nnx.Rngs] = None,
+	) -> EasyDeLState:
+		return cls._base.from_config(
+			config=config,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			rngs=rngs,
+		).to_state()
 
 	@classmethod
 	def from_pretrained(
 		cls,
 		pretrained_model_name_or_path: str,
 		device: tp.Optional[jax.Device] = None,
-		dtype: jax.numpy.dtype = jax.numpy.float32,
-		param_dtype: jax.numpy.dtype = jax.numpy.float32,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
 		precision: tp.Optional[jax.lax.Precision] = None,
 		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
 		sharding_dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
@@ -359,8 +399,8 @@ class BaseAutoEasyState:
 		Args:
 		    pretrained_model_name_or_path (str): Path or name of the pretrained model in the Hugging Face Hub.
 		    device (jax.Device, optional): Device to load the model on. Defaults to the first CPU.
-		    dtype (jax.numpy.dtype, optional): Data type of the model. Defaults to jax.numpy.float32.
-		    param_dtype (jax.numpy.dtype, optional): Data type of the model parameters. Defaults to jax.numpy.float32.
+		    dtype (jnp.dtype, optional): Data type of the model. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype, optional): Data type of the model parameters. Defaults to jnp.float32.
 		    precision (jax.lax.Precision, optional): Precision for computations. Defaults to jax.lax.Precision("fastest").
 		    sharding_axis_dims (tp.Sequence[int], optional): Dimensions of each sharding axis. Defaults to (1, -1, 1, 1).
 		    sharding_axis_names (tp.Sequence[str], optional): Names of the sharding axes. Defaults to ("dp", "fsdp", "tp", "sp").

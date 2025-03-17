@@ -622,11 +622,9 @@ class DbrxBlock(nn.Module):
 
 
 @register_module(
-	"base-module",
+	TaskType.BASE_MODULE,
 	config=DbrxConfig,
 	model_type="dbrx",
-	embedding_layer_names=["wte"],
-	layernorm_names=["norm_1", "norm_2", "norm_f"],
 )
 class DbrxModel(EasyDeLBaseModule):
 	def __init__(
@@ -782,11 +780,9 @@ class DbrxModel(EasyDeLBaseModule):
 
 
 @register_module(
-	"causal-language-model",
+	TaskType.CAUSAL_LM,
 	config=DbrxConfig,
 	model_type="dbrx",
-	embedding_layer_names=["wte"],
-	layernorm_names=["norm_1", "norm_2", "norm_f"],
 )
 class DbrxForCausalLM(EasyDeLBaseModule):
 	def __init__(
@@ -892,9 +888,7 @@ class DbrxForCausalLM(EasyDeLBaseModule):
 @register_module(
 	TaskType.SEQUENCE_CLASSIFICATION,
 	config=DbrxConfig,
-	model_type="dbrx",
-	embedding_layer_names=["wte"],
-	layernorm_names=["norm_1", "norm_2", "norm_f"],
+	model_type="dbrx", 
 )
 class DbrxForSequenceClassification(EasyDeLBaseModule):
 	def __init__(
