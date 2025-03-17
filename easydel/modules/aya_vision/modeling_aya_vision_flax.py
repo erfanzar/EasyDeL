@@ -47,29 +47,29 @@ class AyaVisionCausalLMOutputWithPast(ModelOutput):
 	Base class for AyaVision causal language model (or autoregressive) outputs.
 
 	Args:
-	    loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+	    loss (`chex.Array` of shape `(1,)`, *optional*, returned when `labels` is provided):
 	        Language modeling loss (for next-token prediction).
-	    logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+	    logits (`chex.Array` of shape `(batch_size, sequence_length, config.vocab_size)`):
 	        Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-	    past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
-	        Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2 tensors of shape
+	    past_key_values (`tuple(tuple(chex.Array))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+	        Tuple of `tuple(chex.Array)` of length `config.n_layers`, with each tuple having 2 tensors of shape
 	        `(batch_size, num_heads, sequence_length, embed_size_per_head)`)
 
 	        Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
 	        `past_key_values` input) to speed up sequential decoding.
-	    hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
-	        Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
+	    hidden_states (`tuple(chex.Array)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+	        Tuple of `chex.Array` (one for the output of the embeddings, if the model has an embedding layer, +
 	        one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
 
 	        Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
-	    attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
-	        Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+	    attentions (`tuple(chex.Array)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+	        Tuple of `chex.Array` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
 	        sequence_length)`.
 
 	        Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
 	        heads.
-	    image_hidden_states (`torch.FloatTensor`, *optional*):
-	        A `torch.FloatTensor` of size (batch_size * num_patches, num_images, sequence_length, hidden_size)`.
+	    image_hidden_states (`chex.Array`, *optional*):
+	        A `chex.Array` of size (batch_size * num_patches, num_images, sequence_length, hidden_size)`.
 	        image_hidden_states of the model produced by the vision encoder and after projecting the last hidden state.
 	"""
 
@@ -116,7 +116,7 @@ class AyaVisionMultiModalProjector(nn.Module):
 			config.vision_config.hidden_size * (config.downsample_factor**2),
 			self.alignment_intermediate_size,
 			use_bias=True,
-			kernel_init=nn.initializers.normal(config.initializer_range),
+			kernel_init=nn.initializers.normal(0.02),
 			param_dtype=param_dtype,
 			dtype=dtype,
 			precision=precision,
@@ -128,7 +128,7 @@ class AyaVisionMultiModalProjector(nn.Module):
 			self.alignment_intermediate_size // 2,
 			config.text_config.hidden_size,
 			use_bias=True,
-			kernel_init=nn.initializers.normal(config.initializer_range),
+			kernel_init=nn.initializers.normal(0.02),
 			param_dtype=param_dtype,
 			dtype=dtype,
 			precision=precision,
@@ -342,12 +342,7 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
 			required_props=required_props,
 			**kwargs,
 		)
-		token_type_ids = jnp.ones(
-			(batch_size, input_tokens_length),
-			dtype="i4",
-			device=input_sharding,
-		)
-		basics.update({"token_type_ids": token_type_ids})
+ 
 		if vision_included:
 			pixel_values = jnp.ones(
 				(
@@ -366,20 +361,17 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
 		input_ids: chex.Array,
 		max_length: int,
 		pixel_values: tp.Optional[chex.Array] = None,
-		attention_mask: tp.Optional[chex.Array] = None,
-		token_type_ids: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None, 
 	):
 		model_inputs = self.language_model.prepare_inputs_for_generation(
 			input_ids=input_ids,
 			max_length=max_length,
-			attention_mask=attention_mask,
-			token_type_ids=token_type_ids,
+			attention_mask=attention_mask, 
 		)
 		model_inputs["pixel_values"] = pixel_values
 		return model_inputs
 
 	def update_inputs_for_generation(self, model_outputs, model_kwargs):
 		model_kwargs = super().update_inputs_for_generation(model_outputs, model_kwargs)
-		model_kwargs.pop("pixel_values", None)  # only effect first iter
-		model_kwargs.pop("token_type_ids", None)  # only effect first iter
+		model_kwargs.pop("pixel_values", None)  # only effect first iter 
 		return model_kwargs
