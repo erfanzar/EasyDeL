@@ -133,7 +133,6 @@ class vInferenceApiServer:
 			# Get model and tokenize input asynchronously
 			inference = self._get_inference_model(request.model)
 			ids = self._prepare_tokenized_input(request=request, inference=inference)
-
 			if not request.stream:
 				return await self._handle_non_streaming_response_async(request, inference, ids)
 			else:
@@ -156,12 +155,15 @@ class vInferenceApiServer:
 	) -> dict:
 		"""Prepare tokenized input for the model."""
 
-		return inference.tokenizer.apply_chat_template(
-			conversation=request.messages,
-			return_tensors="np",
+		conversation = request.model_dump()["messages"]
+
+		return inference.processor_class.apply_chat_template(
+			conversation=conversation,
+			return_tensors="jax",
 			add_generation_prompt=True,
 			return_dict=True,
 			tokenize=True,
+			padding_side="left",
 		)
 
 	def _create_usage_info(
@@ -195,10 +197,7 @@ class vInferenceApiServer:
 		prompt_tokens = inference.count_tokens(request.model_dump()["messages"])
 		# Generate response
 
-		for response in inference.generate(
-			input_ids=ids["input_ids"],
-			attention_mask=ids["attention_mask"],
-		):
+		for response in inference.generate(**ids):
 			pass  # Keep last response
 
 		processing_time = time.perf_counter() - start
@@ -262,8 +261,7 @@ class vInferenceApiServer:
 				return await asyncio.get_event_loop().run_in_executor(
 					None,  # Use default thread pool
 					inference.generate,
-					ids["input_ids"],
-					ids["attention_mask"],
+					**ids,
 				)
 
 			index = 0
