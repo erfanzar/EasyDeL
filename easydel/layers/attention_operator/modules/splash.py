@@ -61,12 +61,19 @@ class SplashAttn(AttentionImpl):
 		k: Array,
 		v: Array,
 		mask: tp.Optional[Array] = None,
+		causal: bool = True,
 		**ignore,
 	) -> AttentionOutput:
 		query_lenght = q.shape[1]
 		value_lenght = v.shape[1]
-		if query_lenght == 1:
-			return VanillaAttn(self.metadata)(q=q, k=k, v=v, mask=mask)
+		if (query_lenght == 1) or not causal or ((query_lenght % 128) != 0):
+			return VanillaAttn(self.metadata)(
+				q=q,
+				k=k,
+				v=v,
+				mask=mask,
+				causal=causal,
+			)
 		sm_scale = self.metadata.softmax_scale
 		sm_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
 		dtype = self.metadata.runtime_dtype
@@ -169,9 +176,10 @@ class SplashAttn(AttentionImpl):
 		k: Array,
 		v: Array,
 		mask: tp.Optional[Array] = None,
+		causal: bool = True,
 		**ignore,
 	) -> AttentionOutput:
-		return super().__call__(q=q, k=k, v=v, mask=mask)
+		return super().__call__(q=q, k=k, v=v, mask=mask, causal=causal)
 
 
 if __name__ == "__main__":

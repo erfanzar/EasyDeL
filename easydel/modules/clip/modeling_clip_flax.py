@@ -627,7 +627,8 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
 		return_dict = (
 			return_dict if return_dict is not None else self.config.use_return_dict
 		)
-
+		if pixel_values is not None and pixel_values.ndim == 4:
+			pixel_values = jnp.swapaxes(pixel_values, 1, 3)
 		hidden_states = self.embeddings(pixel_values)
 		hidden_states = self.pre_layrnorm(hidden_states)
 
@@ -765,8 +766,13 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
 
 @register_module(
 	config=CLIPVisionConfig,
-	model_type="clip",
+	model_type="clip_vision_model",
 	task_type=TaskType.BASE_VISION,
+)
+@register_module(
+	config=CLIPVisionConfig,
+	model_type="clip_vision_model",
+	task_type=TaskType.BASE_MODULE,
 )
 class CLIPVisionModel(EasyDeLBaseModule):
 	def __init__(

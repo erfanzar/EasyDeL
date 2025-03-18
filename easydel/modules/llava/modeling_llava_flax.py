@@ -290,7 +290,7 @@ class LlavaForConditionalGeneration(EasyDeLBaseModule):
 		required_props: tp.Optional[tp.Mapping[str, tp.Dict[str, tp.Any]]] = None,
 		**kwargs,
 	):
-		basics = super()._get_compile_model_kwargs(
+		basics = self.language_model._get_compile_model_kwargs(
 			batch_size=batch_size,
 			input_tokens_length=input_tokens_length,
 			input_sharding=input_sharding,
@@ -303,7 +303,6 @@ class LlavaForConditionalGeneration(EasyDeLBaseModule):
 			required_props=required_props,
 			**kwargs,
 		)
-
 		if vision_included:
 			pixel_values = jnp.ones(
 				(
@@ -333,6 +332,8 @@ class LlavaForConditionalGeneration(EasyDeLBaseModule):
 		return model_inputs
 
 	def update_inputs_for_generation(self, model_outputs, model_kwargs):
-		model_kwargs = super().update_inputs_for_generation(model_outputs, model_kwargs)
+		model_kwargs = self.language_model.update_inputs_for_generation(
+			model_outputs, model_kwargs
+		)
 		model_kwargs.pop("pixel_values", None)  # only effect first iter
 		return model_kwargs

@@ -4,7 +4,6 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 import easydel as ed
 import jax
-from jax import numpy as jnp
 from transformers import CLIPProcessor
 from PIL import Image
 import requests
@@ -30,7 +29,6 @@ def main():
 		padding=True,
 	)
 
-	inputs["pixel_values"] = jnp.swapaxes(inputs["pixel_values"], 1, 3)
 	outputs = model(**inputs)
 
 	logits_per_image = outputs.logits_per_image
