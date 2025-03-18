@@ -236,7 +236,7 @@ class FlashAttention:
 		"""Computes attention using Triton backend."""
 		if adjust_sharindgs:
 			query_sharding = query.sharding if hasattr(query, "sharding") else None
-			target_gpu_idx = int(os.environ.get("GPU_IDX_FLASH_ATTN", free_gpu_in_process()))
+			target_gpu_idx = int(os.getenv("GPU_IDX_FLASH_ATTN", free_gpu_in_process()))
 			devices = jax.local_devices(process_index=jax.process_index(), backend="gpu")
 			target_device = devices[target_gpu_idx]
 			query = jax.device_put(query, target_device)

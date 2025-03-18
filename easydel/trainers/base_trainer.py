@@ -30,7 +30,6 @@ import flax.nnx
 import jax
 import jax.extend
 import numpy as np
-import termcolor
 import tqdm
 from flax import nnx as nn
 from flax.core import unfreeze
@@ -41,6 +40,7 @@ from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
 from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import CompilationTracker
+from easydel.utils.lazy_import import is_package_available
 from easydel.utils.traversals import specs_to_name_sharding
 
 try:
@@ -400,12 +400,12 @@ class BaseTrainer(BaseTrainerProtocol):
 			Returns:
 			    tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
 			"""
-			try:
-				import tensorflow as tf
-			except ImportError as exec:
+			if not is_package_available("tensorflow"):
 				raise ImportError(
-					"Please install TensorFlow to use the TensorFlow dataset conversion."
-				) from exec
+					"Please install `tensorflow` to use the `tensorflow-datasets` conversion."
+				)
+			import tensorflow as tf  # type:ignore
+
 			batch_size = self.training_batch_size if is_train else self.evaluation_batch_size
 
 			return (
@@ -438,12 +438,13 @@ class BaseTrainer(BaseTrainerProtocol):
 			Returns:
 			    tp.Iterator[np.ndarray]: The TensorFlow dataset iterator.
 			"""
-			try:
-				import tensorflow as tf
-			except ImportError as exec:
+
+			if not is_package_available("tensorflow"):
 				raise ImportError(
-					"Please install TensorFlow to use the TensorFlow dataset conversion."
-				) from exec
+					"Please install `tensorflow` to use the `tensorflow-datasets` conversion."
+				)
+			import tensorflow as tf  # type:ignore
+
 			batch_size = self.training_batch_size if is_train else self.evaluation_batch_size
 			tf_data_mapping = {
 				"float16": tf.float16,
@@ -907,17 +908,11 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 	):
 		if run_exception is not None:
 			if isinstance(run_exception, KeyboardInterrupt):
-				termcolor.cprint(
-					"KeyboardInterrupt: Training interrupted. Saving current state...",
-					color="yellow",
-					force_color=True,
+				logger.warning(
+					"KeyboardInterrupt: Training interrupted. Saving current state..."
 				)
 			elif isinstance(run_exception, EasyDeLTimerError):
-				termcolor.cprint(
-					"Training reached maximum time limit. Saving current state...",
-					color="yellow",
-					force_color=True,
-				)
+				logger.warning("Training reached maximum time limit. Saving current state...")
 			elif isinstance(run_exception, StopIteration):
 				...  # simply just pass
 			else:
@@ -952,17 +947,9 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 	):
 		"""Handle training interruption gracefully."""
 		if isinstance(exception, KeyboardInterrupt):
-			termcolor.cprint(
-				"KeyboardInterrupt: Training interrupted. Saving current state...",
-				color="yellow",
-				force_color=True,
-			)
+			logger.warning("KeyboardInterrupt: Training interrupted. Saving current state...")
 		elif isinstance(exception, EasyDeLTimerError):
-			termcolor.cprint(
-				"Training reached maximum time limit. Saving current state...",
-				color="yellow",
-				force_color=True,
-			)
+			logger.warning("Training reached maximum time limit. Saving current state...")
 		else:
 			raise RuntimeError("EasyDeL Runtime dumped") from exception
 		return self._prepare_training_output(
@@ -984,8 +971,8 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 				"device_count": jax.device_count(),
 				"local_device_count": jax.local_device_count(),
 				"platform": jax.extend.backend.get_backend().platform,
-				"XLA_FLAGS": os.environ.get("XLA_FLAGS", ""),
-				"LIBTPU_INIT_ARGS": os.environ.get("LIBTPU_INIT_ARGS", ""),
+				"XLA_FLAGS": os.getenv("XLA_FLAGS", ""),
+				"LIBTPU_INIT_ARGS": os.getenv("LIBTPU_INIT_ARGS", ""),
 			},
 			step=0,
 			log_as="config",
@@ -1016,7 +1003,7 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 			return NullProgressBar()
 		rpr = self.arguments.progress_bar_type
 		if rpr == "tqdm":
-			ncols = int(os.environ.get("TQDM_NCOLS", "0"))
+			ncols = int(os.getenv("TQDM_NCOLS", "0"))
 			return TqdmProgressBar(
 				tqdm.tqdm(
 					total=total,

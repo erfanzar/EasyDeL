@@ -96,7 +96,7 @@ class ColorFormatter(logging.Formatter):
 class LazyLogger:
 	def __init__(self, name: str, level: tp.Optional[int] = None):
 		self._name = name
-		self._level = level or _LOGGING_LEVELS[os.environ.get("LOGGING_LEVEL_ED", "INFO")]
+		self._level = level or _LOGGING_LEVELS[os.getenv("LOGGING_LEVEL_ED", "INFO")]
 		self._logger: tp.Optional[logging.Logger] = None
 
 	def _ensure_initialized(self) -> None:
@@ -370,3 +370,8 @@ def quiet(suppress_stdout=True, suppress_stderr=True):
 			sys.stdout = original_stdout
 		if suppress_stderr:
 			sys.stderr = original_stderr
+
+
+def check_bool_flag(name: str, default: bool = True) -> bool:
+	default = "1" if default else "0"
+	return str(os.getenv(name, default)).lower() in ["true", "yes", "ok", "1", "easy"]

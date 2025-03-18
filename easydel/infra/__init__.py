@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from eformer import escale
+from eformer.escale import PartitionAxis
 
 from .base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
 from .base_module import EasyDeLBaseModule
@@ -19,6 +21,8 @@ from .base_state import EasyDeLState
 from .loss_utils import LossConfig
 
 __all__ = (
+	"escale",
+	"PartitionAxis",
 	"EasyDeLBaseModule",
 	"EasyDeLBaseConfig",
 	"EasyDeLBaseConfigDict",

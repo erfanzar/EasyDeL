@@ -148,7 +148,7 @@ class GPTNeoXConfig(EasyDeLBaseConfig):
 	def get_mesh_names():
 		return "dp", "fsdp", "tp", "sp"
 
-	def add_jax_args(
+	def attach_custom_arguments(
 		self,
 		**kwargs,
 	):

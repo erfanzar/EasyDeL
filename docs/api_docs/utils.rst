@@ -11,6 +11,7 @@ Utils
    utils_compiling_utils
    utils_graph_utils
    utils_helpers
+   utils_lazy_import
    utils_parameters_transformation
    utils_readme_generator
    utils_rngs_utils

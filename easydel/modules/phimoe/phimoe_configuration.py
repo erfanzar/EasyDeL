@@ -175,7 +175,7 @@ class PhiMoeConfig(EasyDeLBaseConfig):
 			**kwargs,
 		)
 
-	def add_jax_args(
+	def attach_custom_arguments(
 		self,
 		bits: tp.Optional[int] = None,
 		embd_pdrop: float = 0.0,

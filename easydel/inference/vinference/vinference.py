@@ -44,7 +44,8 @@ from easydel.utils.compiling_utils import (
 	save_compiled_fn,
 	smart_compile,
 )
-from easydel.utils.helpers import get_logger
+from easydel.utils.helpers import check_bool_flag, get_logger
+from easydel.utils.lazy_import import is_package_available
 
 from ..utils import (
 	SampleState,
@@ -157,15 +158,17 @@ class vInference:
 		self._validate_token_ids()
 		self._uuid4 = uuid4().hex
 		self._inference_name = inference_name or self._generate_inference_name(model)
-		erm = os.environ.get("EASYDEL_RECORDS_METRICS", "true").lower() in [
-			"true",
-			"yes",
-			"1",
-			"on",
-		]
-		self._report_metrics = erm and jax.process_count() == 1
+		erm = check_bool_flag("EASYDEL_RECORDS_METRICS")
+		self._report_metrics = (
+			erm and jax.process_count() == 1 and is_package_available("prometheus_client")
+		)
 		if not self._report_metrics:
-			logger.info("vInference-metrics is disabled")
+			if is_package_available("prometheus_client"):
+				logger.info("vInference-metrics is disabled")
+			else:
+				# fmt:off
+				logger.info("`prometheus_client` not found!, vInference-metrics will be disabled.")
+				# fmt:on
 
 	@property
 	def model(self):
@@ -176,7 +179,14 @@ class vInference:
 		if self._report_metrics:
 			from .metrics import vInferenceMetrics
 
-			return vInferenceMetrics(self._inference_name)
+			if is_package_available("prometheus_client"):
+				return vInferenceMetrics(self._inference_name)
+			else:
+				self._report_metrics = False
+				logger.info(
+					"`prometheus_client` not found!, "
+					"metrics logging in vinference will be disabled"
+				)
 		return None
 
 	def _metrics_increase_queue(self):

@@ -31,7 +31,6 @@ import numpy as np
 from eformer.escale import PartitionAxis, with_sharding_constraint
 from einops import rearrange
 from flax import nnx as nn
-from jax.core import Jaxpr
 from jax.sharding import PartitionSpec
 from tqdm.auto import tqdm
 
@@ -596,7 +595,7 @@ def auto_remat(
 
 
 # Main FLOP counting function
-def count_flop_jaxpr(jaxpr: Jaxpr) -> int:
+def count_flop_jaxpr(jaxpr) -> int:
 	"""Count flops in a Jaxpr."""
 
 	def get_shape_size(shape) -> int:

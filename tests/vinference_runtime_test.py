@@ -60,7 +60,7 @@ def main():
 		precision=jax.lax.Precision.DEFAULT,
 	)
 
-	if os.environ.get("APPED_LORA_TEST", "false") in ["true", "yes"]:
+	if os.getenv("APPED_LORA_TEST", "false") in ["true", "yes"]:
 		model = model.apply_lora_to_layers(32, ".*(q_proj|k_proj).*")
 
 	inference = ed.vInference(

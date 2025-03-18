@@ -179,7 +179,7 @@ class MambaConfig(EasyDeLBaseConfig):
 			(".*", PartitionSpec(None)),
 		)
 
-	def add_jax_args(
+	def attach_custom_arguments(
 		self,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 	):

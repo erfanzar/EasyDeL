@@ -21,7 +21,6 @@ import requests
 from flax import nnx as nn
 from jax import numpy as jnp
 from transformers.models.whisper.tokenization_whisper import TO_LANGUAGE_CODE
-from transformers.pipelines.audio_utils import ffmpeg_read
 
 from easydel.utils import traversals as etr
 from easydel.utils.compiling_utils import get_safe_hash_int
@@ -319,6 +318,8 @@ class vWhisperInference:
 					audio_input = f.read()
 
 		if isinstance(audio_input, bytes):
+			from transformers.pipelines.audio_utils import ffmpeg_read
+
 			audio_input = ffmpeg_read(audio_input, self.feature_extractor.sampling_rate)
 
 		stride = None

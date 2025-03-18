@@ -25,16 +25,15 @@ import warnings
 import jax
 from jax.experimental.serialize_executable import deserialize_and_load, serialize
 
-from .helpers import get_cache_dir
+from .helpers import check_bool_flag, get_cache_dir
 
 if tp.TYPE_CHECKING:
 	from jax._src.stages import Compiled, Lowered
 else:
 	Compiled, Lowered = tp.Any, tp.Any
 
-_TFLAG = ["true", "1", "on", "yes"]
-RECOMPILE_FORCE = os.environ.get("RECOMPILE_FORCE", "false") in _TFLAG
-ECACHE_COMPILES = os.environ.get("ECACHE_COMPILES", "true") in _TFLAG
+RECOMPILE_FORCE = check_bool_flag("RECOMPILE_FORCE", False)
+ECACHE_COMPILES = check_bool_flag("ECACHE_COMPILES", True)
 
 CACHE_DIR = get_cache_dir()
 COMPILE_FUNC_DIR = CACHE_DIR / "compiled_funcs"

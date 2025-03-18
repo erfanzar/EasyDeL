@@ -50,7 +50,7 @@ except ImportError:
 if tp.TYPE_CHECKING:
 	from flax.metrics.tensorboard import SummaryWriter
 	from jax import Array
-	from torch import Tensor
+	from torch import Tensor  # type:ignore
 
 	MetricsType = tp.Dict[
 		str,

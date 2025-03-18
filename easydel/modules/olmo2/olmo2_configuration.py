@@ -192,7 +192,7 @@ class Olmo2Config(EasyDeLBaseConfig):
 				f"`rope_scaling`'s factor field must be a float > 1, got {rope_scaling_factor}"
 			)
 
-	def add_jax_args(
+	def attach_custom_arguments(
 		self,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		use_scan_mlp: bool = False,

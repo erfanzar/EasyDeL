@@ -143,7 +143,7 @@ class OlmoConfig(EasyDeLBaseConfig):
 			**kwargs,
 		)
 
-	def add_jax_args(
+	def attach_custom_arguments(
 		self,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		use_scan_mlp: bool = False,

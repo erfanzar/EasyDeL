@@ -1,8 +1,8 @@
 [tool.poetry]
 name = "easydel"
-version = "0.1.0"
+version = "0.1.1"
 
-description = "An open-source library to make training faster and more optimized in JAX"
+description = "Accelerate, Optimize performance with streamlined training and serving options with JAX."
 authors = ["Erfan Zare Chavoshi <Erfanzare810@gmail.com>"]
 license = "Apache-2.0"
 readme = "README.md"
@@ -37,14 +37,12 @@ jax = ">=0.5.1"
 jaxlib = ">=0.5.1"
 eformer = "0.0.18.1"
 einops = "~0.8.0"
-transformers = ">=4.47.0"
+transformers = ">=4.49.0"
 flax = ">=0.10.2"
 optax = "^0.2.2"
 triton = "~3.2.0"
 tqdm = "*"
-termcolor = "*"
 fastapi = "^0.115.2"
-prometheus_client = ">=0.21.0"
 wandb = ">=0.18.5"
 uvloop = "0.21.0"
 uvicorn = "^0.32.0"
@@ -55,8 +53,12 @@ datasets = ">=3.3.2"
 tensorflow-datasets = { version = ">=4.9.6", optional = true }
 tensorflow-cpu = { version = ">=2.18.0", optional = true }
 tensorboard = { version = ">=2.18.0", optional = true }
-torch = { version = ">=2.5.0", extras = [], optional = false }
+torch = { version = ">=2.6.0", source = "torch-cpu", optional = true }
 
+[[tool.poetry.source]]
+name = "torch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+priority = "supplemental"
 
 [tool.poetry.group.tf]
 optional = true
@@ -70,7 +72,7 @@ tensorboard = "^2.18.0"
 optional = true
 
 [tool.poetry.group.torch.dependencies]
-torch = { version = ">=2.5.0", extras = [], optional = false }
+torch = { version = ">=2.6.0", source = "torch-cpu", optional = true }
 
 
 [tool.poetry.group.all]
@@ -80,7 +82,7 @@ optional = true
 tensorflow-datasets = "^4.9.6"
 tensorflow-cpu = "^2.18.0"
 tensorboard = "^2.18.0"
-torch = ">=2.5.0"
+torch = { version = ">=2.6.0", source = "torch-cpu", optional = true }
 
 
 [tool.poetry.extras]

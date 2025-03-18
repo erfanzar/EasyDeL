@@ -111,8 +111,8 @@ class AutoEasyDeLConfig:
 
 		config_class = get_modules_by_type(model_type, model_task)[0]
 		config = config_class.from_pretrained(pretrained_model_name_or_path)
-		if hasattr(config, "add_jax_args"):
-			config.add_jax_args()
+		if hasattr(config, "attach_custom_arguments"):
+			config.attach_custom_arguments()
 		config.add_basic_configurations(
 			axis_dims=sharding_axis_dims,
 			dcn_axis_dims=sharding_dcn_axis_dims,

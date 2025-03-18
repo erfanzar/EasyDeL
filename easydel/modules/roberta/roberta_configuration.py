@@ -181,7 +181,9 @@ class RobertaConfig(EasyDeLBaseConfig):
 			)
 		)
 
-	def add_jax_args(self, gradient_checkpointing="nothing_saveable", **kwargs):
+	def attach_custom_arguments(
+		self, gradient_checkpointing="nothing_saveable", **kwargs
+	):
 		self.gradient_checkpointing = gradient_checkpointing
 		for k, v in kwargs.items():
 			setattr(self, k, v)

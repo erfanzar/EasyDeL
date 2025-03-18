@@ -715,8 +715,9 @@ class EasyBridgeMixin(PushToHubMixin):
 		_clear()
 
 		logger.debug("adding hf_model basic EasyDeL configurations.")
-		if hasattr(config_class, "add_jax_args"):
-			config_class.add_jax_args()
+		if hasattr(config_class, "attach_custom_arguments"):
+			config_class.attach_custom_arguments()
+		config_kwargs = {} if config_kwargs is None else config_kwargs
 		config_class.add_basic_configurations(
 			axis_dims=sharding_axis_dims,
 			dcn_axis_dims=sharding_dcn_axis_dims,
