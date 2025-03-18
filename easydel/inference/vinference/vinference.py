@@ -1183,11 +1183,7 @@ class vInference:
 
 	def count_tokens(self, conv: tp.Union[str, tp.List[tp.Dict[str, str]]]) -> int:
 		if isinstance(conv, list) and all(isinstance(item, dict) for item in conv):
-			tokens = self.processor_class.apply_chat_template(
-				conv,
-				tokenize=True,
-				apply_chat_template=True,
-			)
+			tokens = self.processor_class.apply_chat_template(conv, tokenize=True)
 			return len(tokens)
 		else:
 			tokens = self.tokenizer.encode(conv)

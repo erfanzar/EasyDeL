@@ -20,12 +20,12 @@ from pydantic import BaseModel, Field
 
 class ChatMessage(BaseModel):
 	role: str
-	content: str
+	content: tp.Union[str, tp.List[tp.Mapping[str, str]]]
 
 
 class DeltaMessage(BaseModel):
 	role: tp.Optional[str] = None
-	content: tp.Optional[str] = None
+	content: tp.Optional[tp.Union[str, tp.List[tp.Mapping[str, str]]]] = None
 
 
 class UsageInfo(BaseModel):
