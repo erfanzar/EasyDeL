@@ -164,13 +164,13 @@ class CohereConfig(EasyDeLBaseConfig):
 			(".*", PartitionSpec(None)),
 		)
 
-	def add_jax_args(
+	def attach_custom_arguments(
 		self,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
-		"""The add_jax_args function adds the following arguments to the Transformer class:
+		"""The attach_custom_arguments function adds the following arguments to the Transformer class:
 
 		Args:
 		    self: Refer to the current object

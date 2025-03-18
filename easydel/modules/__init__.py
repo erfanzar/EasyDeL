@@ -1,6 +1,7 @@
 from . import (
 	arctic,
 	auto,
+	aya_vision,
 	clip,
 	cohere,
 	cohere2,

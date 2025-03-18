@@ -1,22 +1,22 @@
 # fmt:off
-from functools import partial
 import os
 import sys
 import threading
 import time
+from functools import partial
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-import easydel as ed
 # fmt:on
 import jax
-import torch
+import torch  # type:ignore
+from flax import nnx as nn
 from huggingface_hub import HfApi
 from jax import numpy as jnp
 from jax import sharding
-from flax import nnx as nn
 from transformers import AutoTokenizer
 
+import easydel as ed
 
 PartitionSpec, api = sharding.PartitionSpec, HfApi()
 
@@ -65,7 +65,7 @@ def main():
 	tokenizer.padding_side = "left"
 	tokenizer.pad_token_id = tokenizer.eos_token_id
 	model.eval()
-	if os.environ.get("APPED_LORA_TEST", "false") in ["true", "yes"]:
+	if os.getenv("APPED_LORA_TEST", "false") in ["true", "yes"]:
 		model = model.apply_lora_to_layers(32, ".*(q_proj|k_proj).*")
 	print(model)
 	# model = model.quantize(

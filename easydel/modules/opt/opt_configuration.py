@@ -148,7 +148,7 @@ class OPTConfig(EasyDeLBaseConfig):
 		else:
 			return (".*", PartitionSpec(("fsdp", "sp")))
 
-	def add_jax_args(
+	def attach_custom_arguments(
 		self,
 		vocab_size: int = 50272,
 		hidden_size: int = 768,

@@ -22,10 +22,11 @@ from http import HTTPStatus
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
-from prometheus_client import start_http_server
+
 
 from easydel.utils import traversals as etr
 from easydel.utils.helpers import get_logger
+from easydel.utils.lazy_import import is_package_available
 
 from .api_models import (
 	ChatCompletionRequest,
@@ -418,7 +419,11 @@ class vInferenceApiServer:
 		log_level="debug",
 	):
 		metrics_port = metrics_port or (port + 1)
-		start_http_server(metrics_port)
+		if is_package_available("prometheus_client"):
+			from prometheus_client import start_http_server  # type:ignore
+
+			start_http_server(metrics_port)
+
 		uvicorn.run(
 			APP,
 			host=host,

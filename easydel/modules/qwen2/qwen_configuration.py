@@ -198,7 +198,7 @@ class Qwen2Config(EasyDeLBaseConfig):
 			(".*", PartitionSpec(None)),
 		)
 
-	def add_jax_args(
+	def attach_custom_arguments(
 		self,
 		resid_pdrop: float = 0.0,
 		embd_pdrop: float = 0.0,
@@ -217,7 +217,7 @@ class Qwen2Config(EasyDeLBaseConfig):
 		rope_scaling: tp.Optional[tp.Mapping[str, str | float]] = None,
 		**kwargs,
 	):
-		"""The add_jax_args function adds the following arguments to the Transformer class:
+		"""The attach_custom_arguments function adds the following arguments to the Transformer class:
 
 		Args:
 		    self: Refer to the current object

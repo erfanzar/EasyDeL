@@ -24,7 +24,7 @@ import psutil
 from easydel.utils import traversals as etr
 
 try:
-	from prometheus_client import Counter, Gauge, Histogram, Info, start_http_server
+	from prometheus_client import Counter, Gauge, Histogram, Info, start_http_server  # type:ignore
 except ModuleNotFoundError:
 	Counter, Gauge, Histogram, Info, start_http_server = [None] * 5
 

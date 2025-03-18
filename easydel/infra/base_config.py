@@ -27,7 +27,7 @@ from transformers.configuration_utils import PretrainedConfig
 
 from easydel.utils import traversals as etr
 from easydel.utils.compiling_utils import hash_fn
-from easydel.utils.helpers import get_logger
+from easydel.utils.helpers import check_bool_flag, get_logger
 
 from .etils import (
 	AVAILABLE_ATTENTION_MECHANISMS,
@@ -52,15 +52,14 @@ DEFAULT_PALLAS_M_BLOCK_SIZE = 128
 DEFAULT_PALLAS_K_BLOCK_SIZE = 128
 DEFAULT_PALLAS_N_BLOCK_SIZE = 128
 DEFAULT_HARDWARE_ABSTRACTION = False
-ED_DEFAULT_HARDWARE_ABSTRACTION = os.environ.get(
+ED_DEFAULT_HARDWARE_ABSTRACTION = check_bool_flag(
 	"ED_DEFAULT_HARDWARE_ABSTRACTION",
-	default="false",
-).lower() in ["true", "1", "yes"]
-
-EKERNEL_OPS = os.environ.get(
+	default=False,
+)
+EKERNEL_OPS = check_bool_flag(
 	"EKERNEL_OPS",
-	default="false",
-).lower() in ["true", "1", "yes"]
+	default=False,
+)
 
 if ED_DEFAULT_HARDWARE_ABSTRACTION:
 	DEFAULT_HARDWARE_ABSTRACTION = True
@@ -627,7 +626,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			sd[k] = v
 		return result
 
-	def add_jax_args(self, **kwargs):
+	def attach_custom_arguments(self, **kwargs):
 		for k, v in kwargs.items():
 			set_attrs_smartly(self, k, v, v)
 

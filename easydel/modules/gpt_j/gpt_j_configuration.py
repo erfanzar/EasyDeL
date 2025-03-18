@@ -157,7 +157,7 @@ class GPTJConfig(EasyDeLBaseConfig):
 	def get_mesh_names():
 		return "dp", "fsdp", "sp", "sp"
 
-	def add_jax_args(
+	def attach_custom_arguments(
 		self,
 		vocab_size: int = 50400,
 		n_positions: int = 2048,

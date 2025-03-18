@@ -7,8 +7,10 @@ Modules
    modules___init__
    modules_arctic
    modules_auto
+   modules_aya_vision
    modules_clip
    modules_cohere
+   modules_cohere2
    modules_dbrx
    modules_deepseek_v2
    modules_deepseek_v3

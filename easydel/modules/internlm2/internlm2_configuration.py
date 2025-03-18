@@ -176,7 +176,7 @@ class InternLM2Config(EasyDeLBaseConfig):
 			(".*", PartitionSpec(None)),
 		)
 
-	def add_jax_args(
+	def attach_custom_arguments(
 		self,
 		tie_word_embeddings: bool = False,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
@@ -188,7 +188,7 @@ class InternLM2Config(EasyDeLBaseConfig):
 		scan_layers: bool = True,
 		**kwargs,
 	):
-		"""The add_jax_args function adds the following arguments to the Transformer class:
+		"""The attach_custom_arguments function adds the following arguments to the Transformer class:
 
 		Args:
 		    tie_word_embeddings: bool: Tie the word embeddings to the

@@ -128,7 +128,7 @@ class EasyModelsTest(unittest.TestCase):
 		hf_model.eval()
 		hf_model = hf_model.float()
 
-		config.add_jax_args()
+		config.attach_custom_arguments()
 		config.add_basic_configurations(
 			shard_attention_computation=self.shard_attention_computation,
 			use_sharding_constraint=self.use_sharding_constraint,

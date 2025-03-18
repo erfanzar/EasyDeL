@@ -174,7 +174,7 @@ class ExaoneConfig(EasyDeLBaseConfig):
 			(".*", PartitionSpec(None)),
 		)
 
-	def add_jax_args(
+	def attach_custom_arguments(
 		self,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		use_scan_mlp: bool = False,
@@ -185,7 +185,7 @@ class ExaoneConfig(EasyDeLBaseConfig):
 		attention_bias: bool = False,
 		**kwargs,
 	):
-		"""The add_jax_args function adds the following arguments to the model:
+		"""The attach_custom_arguments function adds the following arguments to the model:
 
 		Args:
 		    gradient_checkpointing (str): Determine whether to use

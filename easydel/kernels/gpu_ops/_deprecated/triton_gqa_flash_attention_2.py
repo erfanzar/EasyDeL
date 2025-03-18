@@ -831,8 +831,8 @@ def _bwd_attention_kernel_call(
 			**metaparams,
 		)
 		metaparams = dict(
-			BLOCK_M=int(os.environ.get("BLOCKSIZE_M_FLASH_ATTN", 64)),
-			BLOCK_N=int(os.environ.get("BLOCKSIZE_N_FLASH_ATTN", 64)),
+			BLOCK_M=int(os.getenv("BLOCKSIZE_M_FLASH_ATTN", 64)),
+			BLOCK_N=int(os.getenv("BLOCKSIZE_N_FLASH_ATTN", 64)),
 			num_warps=num_warps,
 			num_stages=1,
 			BLOCK_HEADDIM=BLOCK_HEADDIM,
