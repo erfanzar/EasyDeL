@@ -329,7 +329,7 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
 		required_props: tp.Optional[tp.Mapping[str, tp.Dict[str, tp.Any]]] = None,
 		**kwargs,
 	):
-		basics = super()._get_compile_model_kwargs(
+		basics = self.language_model._get_compile_model_kwargs(
 			batch_size=batch_size,
 			input_tokens_length=input_tokens_length,
 			input_sharding=input_sharding,
@@ -342,7 +342,7 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
 			required_props=required_props,
 			**kwargs,
 		)
- 
+
 		if vision_included:
 			pixel_values = jnp.ones(
 				(
@@ -361,17 +361,19 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
 		input_ids: chex.Array,
 		max_length: int,
 		pixel_values: tp.Optional[chex.Array] = None,
-		attention_mask: tp.Optional[chex.Array] = None, 
+		attention_mask: tp.Optional[chex.Array] = None,
 	):
 		model_inputs = self.language_model.prepare_inputs_for_generation(
 			input_ids=input_ids,
 			max_length=max_length,
-			attention_mask=attention_mask, 
+			attention_mask=attention_mask,
 		)
 		model_inputs["pixel_values"] = pixel_values
 		return model_inputs
 
 	def update_inputs_for_generation(self, model_outputs, model_kwargs):
-		model_kwargs = super().update_inputs_for_generation(model_outputs, model_kwargs)
-		model_kwargs.pop("pixel_values", None)  # only effect first iter 
+		model_kwargs = self.language_model.update_inputs_for_generation(
+			model_outputs, model_kwargs
+		)
+		model_kwargs.pop("pixel_values", None)  # only effect first iter
 		return model_kwargs
