@@ -745,9 +745,7 @@ def auto_pytree(
 		return False
 
 	def wrap(cls):
-		if not dataclasses.is_dataclass(cls):
-			cls = dataclasses.dataclass(cls)
-
+		cls = dataclasses.dataclass(cls)
 		fields = [f for f in dataclasses.fields(cls) if f.init]
 		all_field_names = tuple(f.name for f in fields)
 		final_meta_fields: tp.Set[str] = set(meta_fields or ())
@@ -784,7 +782,6 @@ def auto_pytree(
 				meta_info = (
 					f" [data_fields={data_fields}, meta_fields={tuple(final_meta_fields)}]"
 				)
-				# Insert before the last character (closing parenthesis)
 				return base_repr[:-1] + meta_info + base_repr[-1:]
 			return base_repr
 
@@ -793,7 +790,6 @@ def auto_pytree(
 			"data_fields": data_fields,
 			"meta_fields": tuple(final_meta_fields),
 		}
-
 		return jtu.register_dataclass(
 			cls,
 			data_fields=data_fields,
@@ -801,6 +797,7 @@ def auto_pytree(
 		)
 
 	# Handle both @auto_pytree and @auto_pytree(meta_fields=(...))
+
 	if cls is None:
 		return wrap
 	return wrap(cls)
