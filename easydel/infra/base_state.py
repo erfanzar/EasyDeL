@@ -26,7 +26,7 @@ from flax import struct
 from jax.sharding import NamedSharding, PartitionSpec
 from safetensors.flax import load_file as safe_load_file
 from safetensors.flax import save_file as safe_save_file
-
+from jax.interpreters import pxla
 from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import specs_to_name_sharding
 
@@ -43,6 +43,22 @@ WEIGHTS_NAME = "easydel-model.parameters"
 OPTIMIZER_NAME = "easydel-optstate.parameters"
 OPTIMIZER_STRUCT_NAME = "easydel-optstate.structure"
 logger = get_logger(__name__)
+
+
+def extract_shardings(tree, mesh=None):
+	if mesh is None:
+		mesh = pxla.thread_resources.env.physical_mesh
+
+	def cond(x):
+		sharding = x.sharding if hasattr(x, "sharding") else None
+		if isinstance(sharding, jax.sharding.PartitionSpec):
+			assert mesh is not None, "Mesh Can not be none (use function under with `mesh`)."
+			sharding = jax.sharding.NamedSharding(mesh=mesh, spec=sharding)
+		if not isinstance(sharding, jax.sharding.NamedSharding):
+			return None
+		return sharding
+
+	return jax.tree_util.tree_map(cond, tree)
 
 
 class EasyDeLState(struct.PyTreeNode):
@@ -80,7 +96,7 @@ class EasyDeLState(struct.PyTreeNode):
 			state=self.opt_state,
 			params=self.graphstate,
 		)
-		
+
 		if hasattr(self.tx, "apply_updates_hook"):
 			graphstate = self.tx.apply_updates_hook(self.graphstate, updates)
 		else:
@@ -190,15 +206,19 @@ class EasyDeLState(struct.PyTreeNode):
 
 		from eformer.escale import match_partition_rules
 
-		eval_opt_state = jax.eval_shape(lambda: tx.init(self.graphstate))
+		def make(graphstate):
+			return tx.init(graphstate)
+
+		eval_opt_state = jax.eval_shape(lambda: make(self.graphstate))
 		partition_specs = match_partition_rules(partition_rules, eval_opt_state)
 		named_shardings = specs_to_name_sharding(partition_specs, self.model.mesh)
 
-		@partial(jax.jit, out_shardings=named_shardings)
-		def make():
-			return tx.init(self.graphstate)
-
-		opt_state = make()
+		opt_state = jax.jit(
+			make,
+			out_shardings=named_shardings,
+			in_shardings=(extract_shardings(self.graphstate, mesh=self.model.mesh),),
+		)(self.graphstate)
+		
 		return self.replace(tx=tx, opt_state=opt_state)
 
 	def shard_optimizer_state(
