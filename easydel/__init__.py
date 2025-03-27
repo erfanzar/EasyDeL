@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 import os as _os
 import sys as _sys
@@ -761,7 +761,7 @@ else:
 		extra_objects={"__version__": __version__},
 	)
 
-	_targeted_versions = ["0.0.18.1"]
+	_targeted_versions = ["0.0.18.2"]
 
 	from eformer import __version__ as _eform_version
 
