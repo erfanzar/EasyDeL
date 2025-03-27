@@ -22,6 +22,8 @@ from dataclasses import field, fields
 from pathlib import Path
 
 import jax
+import jax.experimental
+import jax.experimental.multihost_utils
 import jax.numpy as jnp
 import numpy as np
 from eformer.optimizers import OptimizerFactory, SchedulerConfig
@@ -657,15 +659,16 @@ class TrainingArguments:
 			(step % self.weight_distribution_log_steps) == 0
 		):
 			stats = compute_weight_stats(state.graphstate, self.weight_distribution_pattern)
+			stats = jax.experimental.multihost_utils.process_allgather(stats)
 			metrics = {}
 			for key, value in stats.items():
 				if key.endswith("/values"):
 					path: str = key[:-7]
 					path = path.replace("/", ".")
-					metrics[f"weights/histogram/{path}"] = np.array(jax.device_get(value))
+					metrics[f"weights-histogram/{path}"] = np.array(value)
 				else:
 					key = key.replace("/", ".")
-					metrics[f"weights/information/{key}"] = float(value)
+					metrics[f"weights-information/{key}"] = float(value)
 			self.log_metrics(metrics, step)
 
 	def _log_to_wandb(
