@@ -37,13 +37,10 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
-from easydel.modules.llama.llama_configuration import (
-	LlamaConfig as LlamaConfig,
-)
-from easydel.modules.llama.llama_configuration import (
-	VisionLlamaConfig as VisionLlamaConfig,
-)
+
+from .llama_configuration import LlamaConfig
 
 
 class LlamaMLP(nn.Module):
@@ -61,7 +58,7 @@ class LlamaMLP(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=self.config.mlp_bias,
@@ -112,7 +109,7 @@ class LlamaAttention(FlaxAttentionModule):
 			assert self.config.num_attention_heads == self.config.num_key_value_heads
 
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=config.attention_bias,
@@ -497,7 +494,7 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			dtype=dtype,
@@ -587,7 +584,7 @@ class LlamaForSequenceClassification(EasyDeLBaseModule):
 		assert hasattr(config, "num_labels"), (
 			"in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
 		)
-		self.score = nn.Linear(
+		self.score = ParallelLinear(
 			self.config.hidden_size,
 			config.num_labels,
 			dtype=dtype,

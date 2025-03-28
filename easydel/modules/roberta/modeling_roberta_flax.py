@@ -41,7 +41,9 @@ from easydel.infra.utils import (
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCacheView
 from easydel.layers.caching.transformer_cache import TransformerCache
-from easydel.modules.roberta.roberta_configuration import RobertaConfig as RobertaConfig
+from easydel.layers.linear import ParallelLinear
+
+from .roberta_configuration import RobertaConfig as RobertaConfig
 
 
 class RobertaEmbeddings(nn.Module):
@@ -139,7 +141,7 @@ class RobertaSelfAttention(FlaxAttentionModule):
 			softmax_scale=self.head_dim**-0.5,
 			dropout_prob=0.0,
 		)
-		self.query = nn.Linear(
+		self.query = ParallelLinear(
 			self.config.hidden_size,
 			self.config.hidden_size,
 			dtype=dtype,
@@ -148,7 +150,7 @@ class RobertaSelfAttention(FlaxAttentionModule):
 			rngs=rngs,
 			**get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
 		)
-		self.key = nn.Linear(
+		self.key = ParallelLinear(
 			self.config.hidden_size,
 			self.config.hidden_size,
 			dtype=dtype,
@@ -157,7 +159,7 @@ class RobertaSelfAttention(FlaxAttentionModule):
 			rngs=rngs,
 			**get_dot_general_by_bits(bits=config.bits, mode=config.easy_method),
 		)
-		self.value = nn.Linear(
+		self.value = ParallelLinear(
 			self.config.hidden_size,
 			self.config.hidden_size,
 			dtype=dtype,
@@ -272,7 +274,7 @@ class RobertaSelfOutput(nn.Module):
 		self.dtype = dtype
 		self.param_dtype = param_dtype
 		self.precision = precision
-		self.dense = nn.Linear(
+		self.dense = ParallelLinear(
 			self.config.hidden_size,
 			self.config.hidden_size,
 			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
@@ -374,7 +376,7 @@ class RobertaIntermediate(nn.Module):
 		self.dtype = dtype
 		self.param_dtype = param_dtype
 		self.precision = precision
-		self.dense = nn.Linear(
+		self.dense = ParallelLinear(
 			self.config.intermediate_size,
 			self.config.hidden_size,
 			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
@@ -406,7 +408,7 @@ class RobertaOutput(nn.Module):
 		self.dtype = dtype
 		self.param_dtype = param_dtype
 		self.precision = precision
-		self.dense = nn.Linear(
+		self.dense = ParallelLinear(
 			self.config.hidden_size,
 			self.config.intermediate_size,
 			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
@@ -644,7 +646,7 @@ class RobertaPooler(nn.Module):
 		self.dtype = dtype
 		self.param_dtype = param_dtype
 		self.precision = precision
-		self.dense = nn.Linear(
+		self.dense = ParallelLinear(
 			self.config.hidden_size,
 			self.config.hidden_size,
 			kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
@@ -675,7 +677,7 @@ class RobertaLMHead(nn.Module):
 		self.dtype = dtype
 		self.param_dtype = param_dtype
 		self.precision = precision
-		self.dense = nn.Linear(
+		self.dense = ParallelLinear(
 			self.config.hidden_size,
 			self.config.hidden_size,
 			dtype=dtype,
@@ -692,7 +694,7 @@ class RobertaLMHead(nn.Module):
 			param_dtype=param_dtype,
 			rngs=rngs,
 		)
-		self.decoder = nn.Linear(
+		self.decoder = ParallelLinear(
 			self.config.vocab_size,
 			self.config.hidden_size,
 			dtype=dtype,
@@ -742,7 +744,7 @@ class RobertaClassificationHead(nn.Module):
 		self.dtype = dtype
 		self.param_dtype = param_dtype
 		self.precision = precision
-		self.dense = nn.Linear(
+		self.dense = ParallelLinear(
 			self.config.hidden_size,
 			self.config.hidden_size,
 			dtype=dtype,
@@ -761,7 +763,7 @@ class RobertaClassificationHead(nn.Module):
 			rate=classifier_dropout,
 			rngs=rngs,
 		)
-		self.out_proj = nn.Linear(
+		self.out_proj = ParallelLinear(
 			self.config.num_labels,
 			self.config.hidden_size,
 			dtype=dtype,
@@ -996,7 +998,7 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
 			rate=self.config.hidden_dropout_prob,
 			rngs=rngs,
 		)
-		self.classifier = nn.Linear(
+		self.classifier = ParallelLinear(
 			1,
 			self.config.hidden_size,
 			dtype=dtype,
@@ -1099,7 +1101,7 @@ class RobertaForTokenClassification(EasyDeLBaseModule):
 			rate=classifier_dropout,
 			rngs=rngs,
 		)
-		self.classifier = nn.Linear(
+		self.classifier = ParallelLinear(
 			self.config.num_labels,
 			self.config.hidden_size,
 			dtype=dtype,
@@ -1171,7 +1173,7 @@ class RobertaForQuestionAnswering(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.qa_outputs = nn.Linear(
+		self.qa_outputs = ParallelLinear(
 			self.config.num_labels,
 			self.config.hidden_size,
 			dtype=dtype,

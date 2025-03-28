@@ -38,8 +38,10 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.modules.gemma.gemma_configuration import GemmaConfig as GemmaConfig
+from easydel.layers.linear import ParallelLinear
 from easydel.utils.helpers import get_logger
+
+from .gemma_configuration import GemmaConfig as GemmaConfig
 
 logger = get_logger(__name__)
 
@@ -92,7 +94,7 @@ class GemmaAttention(FlaxAttentionModule):
 
 		kernel = jax.nn.initializers.normal(config.initializer_range)
 		linear = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			use_bias=config.attention_bias,
 			dtype=dtype,
 			param_dtype=param_dtype,
@@ -273,7 +275,7 @@ class GemmaMLP(nn.Module):
 		self.act = ACT2FN[hidden_activation]
 
 		linear_class = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			use_bias=False,
 			dtype=dtype,
 			param_dtype=param_dtype,
@@ -584,7 +586,7 @@ class GemmaForCausalLM(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			use_bias=False,
@@ -692,7 +694,7 @@ class GemmaForSequenceClassification(EasyDeLBaseModule):
 		assert hasattr(config, "num_labels"), (
 			"in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
 		)
-		self.score = nn.Linear(
+		self.score = ParallelLinear(
 			self.config.hidden_size,
 			config.num_labels,
 			dtype=dtype,

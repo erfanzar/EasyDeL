@@ -30,7 +30,7 @@ def main():
 		param_dtype = jnp.bfloat16
 		attn_kwargs = dict(
 			attn_dtype=jnp.float16,
-			attn_softmax_dtype=jnp.float32,
+			attn_softmax_dtype=jnp.float16,
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		)
 	else:
@@ -89,7 +89,7 @@ def main():
 
 	messages = [
 		{"role": "system", "content": "You are a helpful AI assistant."},
-		{"role": "user", "content": "write 10 lines story about why you love EasyDeL"},
+		{"role": "user", "content": "write long story about why you love EasyDeL"},
 	]
 
 	inputs = processor.apply_chat_template(

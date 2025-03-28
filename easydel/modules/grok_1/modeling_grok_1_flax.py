@@ -36,8 +36,10 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm as FlaxGrok1RMSNorm
-from easydel.modules.grok_1.grok_1_configuration import Grok1Config as Grok1Config
+
+from .grok_1_configuration import Grok1Config
 
 
 class FlaxGrok1Attention(FlaxAttentionModule):
@@ -65,7 +67,7 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 
 		if self.num_key_value_groups == 1:
 			assert self.config.num_attention_heads == self.config.num_key_value_heads
-		self.q_proj = nn.Linear(
+		self.q_proj = ParallelLinear(
 			config.hidden_size,
 			config.num_attention_heads * self.head_dim,
 			dtype=dtype,
@@ -76,7 +78,7 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 			rngs=rngs,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
-		self.k_proj = nn.Linear(
+		self.k_proj = ParallelLinear(
 			config.hidden_size,
 			config.num_key_value_heads * self.head_dim,
 			dtype=dtype,
@@ -87,7 +89,7 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 			rngs=rngs,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
-		self.v_proj = nn.Linear(
+		self.v_proj = ParallelLinear(
 			config.hidden_size,
 			config.num_key_value_heads * self.head_dim,
 			dtype=dtype,
@@ -98,7 +100,7 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 			rngs=rngs,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
-		self.o_proj = nn.Linear(
+		self.o_proj = ParallelLinear(
 			config.num_attention_heads * self.head_dim,
 			config.hidden_size,
 			dtype=dtype,
@@ -254,7 +256,7 @@ class FlaxGrok1BLockSparseMLP(nn.Module):
 		self.precision = precision
 		self.rngs = rngs
 
-		self.linear = nn.Linear(
+		self.linear = ParallelLinear(
 			config.hidden_size,
 			config.intermediate_size,
 			dtype=dtype,
@@ -265,7 +267,7 @@ class FlaxGrok1BLockSparseMLP(nn.Module):
 			rngs=rngs,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
-		self.linear_1 = nn.Linear(
+		self.linear_1 = ParallelLinear(
 			config.intermediate_size,
 			config.hidden_size,
 			dtype=dtype,
@@ -276,7 +278,7 @@ class FlaxGrok1BLockSparseMLP(nn.Module):
 			rngs=rngs,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
-		self.linear_v = nn.Linear(
+		self.linear_v = ParallelLinear(
 			config.hidden_size,
 			config.intermediate_size,
 			dtype=dtype,
@@ -311,7 +313,7 @@ class FlaxGrok1SparseMoeBlock(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		self.rngs = rngs
-		self.gate = nn.Linear(
+		self.gate = ParallelLinear(
 			self.config.hidden_size,
 			self.config.num_experts,
 			use_bias=False,
@@ -701,7 +703,7 @@ class Grok1ForCausalLM(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			dtype=self.dtype,

@@ -37,11 +37,9 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.modules.dbrx.dbrx_configuration import (
-	DbrxAttentionConfig as DbrxAttentionConfig,
-)
-from easydel.modules.dbrx.dbrx_configuration import DbrxConfig as DbrxConfig
-from easydel.modules.dbrx.dbrx_configuration import DbrxFFNConfig as DbrxFFNConfig
+from easydel.layers.linear import ParallelLinear
+
+from .dbrx_configuration import DbrxConfig
 
 
 class DbrxAttention(FlaxAttentionModule):
@@ -70,7 +68,7 @@ class DbrxAttention(FlaxAttentionModule):
 
 		if self.num_key_value_groups == 1:
 			assert self.num_attention_heads == self.config.attn_config.kv_n_heads
-		self.Wqkv = nn.Linear(
+		self.Wqkv = ParallelLinear(
 			config.hidden_size,
 			self.hidden_size + 2 * self.num_key_value_heads * self.head_dim,
 			dtype=dtype,
@@ -81,7 +79,7 @@ class DbrxAttention(FlaxAttentionModule):
 			rngs=rngs,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
-		self.out_proj = nn.Linear(
+		self.out_proj = ParallelLinear(
 			config.hidden_size,
 			config.hidden_size,
 			dtype=dtype,
@@ -429,7 +427,7 @@ class DbrxRouter(nn.Module):
 		)
 		self.uniform_expert_assignment = self.config.ffn_config.uniform_expert_assignment
 
-		self.layer = nn.Linear(
+		self.layer = ParallelLinear(
 			config.hidden_size,
 			self.moe_num_experts,
 			use_bias=False,
@@ -808,7 +806,7 @@ class DbrxForCausalLM(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			dtype=dtype,
@@ -888,7 +886,7 @@ class DbrxForCausalLM(EasyDeLBaseModule):
 @register_module(
 	TaskType.SEQUENCE_CLASSIFICATION,
 	config=DbrxConfig,
-	model_type="dbrx", 
+	model_type="dbrx",
 )
 class DbrxForSequenceClassification(EasyDeLBaseModule):
 	def __init__(
@@ -918,7 +916,7 @@ class DbrxForSequenceClassification(EasyDeLBaseModule):
 		assert hasattr(config, "num_labels"), (
 			"in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
 		)
-		self.score = nn.Linear(
+		self.score = ParallelLinear(
 			config.hidden_size,
 			config.num_labels,
 			dtype=dtype,

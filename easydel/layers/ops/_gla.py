@@ -19,13 +19,17 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 from jax import lax
+from ._base_operation import BaseOperation
 
 
 def ceildiv(a: int, b: int) -> int:
 	return -(a // -b)
 
 
-@partial(jax.jit, static_argnames=("chunk_size", "output_final_state", "dtype"))
+@partial(
+	jax.jit,
+	static_argnames=("chunk_size", "output_final_state", "dtype", "scale"),
+)
 def recurrent_gla(
 	query: jnp.ndarray,  # shape: (B, S, H, D)
 	key: jnp.ndarray,  # shape: (B, S, H, D)
@@ -190,6 +194,32 @@ def recurrent_gla(
 	return o, h
 
 
+class RecurrentGLA(BaseOperation):
+	def forward_native(
+		self,
+		query: jnp.ndarray,  # shape: (B, S, H, D)
+		key: jnp.ndarray,  # shape: (B, S, H, D)
+		value: jnp.ndarray,  # shape: (B, S, H, V)
+		gk: jnp.ndarray,  # shape: (B, S, H, D)
+		scale: float = -1.0,
+		initial_state: tp.Optional[jnp.ndarray] = None,  # shape: (B, H, D, V)
+		chunk_size: int = 0,  # if > 0, process sequence in chunks
+		dtype: jnp.dtype = jnp.float32,
+		output_final_state: bool = False,
+	) -> tp.Tuple[jnp.ndarray, tp.Optional[jnp.ndarray]]:
+		return recurrent_gla(
+			query=query,
+			key=key,
+			value=value,
+			gk=gk,
+			scale=scale,
+			initial_state=initial_state,
+			chunk_size=chunk_size,
+			dtype=dtype,
+			output_final_state=output_final_state,
+		)
+
+
 def test_recurrent_gla():
 	# Test dimensions
 	B, S, H, D, V = 1, 32, 4, 64, 32
@@ -205,7 +235,7 @@ def test_recurrent_gla():
 	h0 = jax.random.normal(keys[4], (B, H, D, V))
 
 	# Test case 1: Without chunking
-	o1, h1 = recurrent_gla(
+	o1, h1 = RecurrentGLA()(
 		query,
 		key,
 		value,

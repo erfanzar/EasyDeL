@@ -38,8 +38,9 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
-from easydel.modules.mixtral.mixtral_configuration import MixtralConfig as MixtralConfig
+from .mixtral_configuration import MixtralConfig as MixtralConfig
 
 
 class MixtralAttention(FlaxAttentionModule):
@@ -66,7 +67,7 @@ class MixtralAttention(FlaxAttentionModule):
 		self.max_position_embeddings = config.max_position_embeddings
 
 		linear = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			use_bias=getattr(config, "attention_bias", False),
 			dtype=dtype,
 			param_dtype=param_dtype,
@@ -204,7 +205,7 @@ class MixtralBLockSparseTop2MLP(nn.Module):
 		self.precision = precision
 		self.rngs = rngs
 		linear = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			use_bias=False,
 			dtype=dtype,
 			param_dtype=param_dtype,
@@ -250,7 +251,7 @@ class MixtralSparseMoeBlock(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		self.rngs = rngs
-		self.gate = nn.Linear(
+		self.gate = ParallelLinear(
 			config.hidden_size,
 			config.num_local_experts,
 			use_bias=False,
@@ -615,7 +616,7 @@ class MixtralForCausalLM(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			rngs=rngs,
@@ -724,7 +725,7 @@ class MixtralForSequenceClassification(EasyDeLBaseModule):
 		assert hasattr(config, "num_labels"), (
 			"in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
 		)
-		self.score = nn.Linear(
+		self.score = ParallelLinear(
 			self.config.hidden_size,
 			config.num_labels,
 			dtype=dtype,

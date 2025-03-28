@@ -36,12 +36,11 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
-from easydel.modules.qwen2_vl.qwen2_vl_configuration import (
-	Qwen2VLConfig,
-	Qwen2VLVisionConfig,
-)
 from easydel.utils import traversals as etr
+
+from .qwen2_vl_configuration import Qwen2VLConfig, Qwen2VLVisionConfig
 
 
 # TODO: Convert this to a jitable jax fn and use that inside model instead of precall
@@ -382,7 +381,7 @@ class PatchMerger(nn.Module):
 			rngs=rngs,
 		)
 		self.mlp = [
-			nn.Linear(
+			ParallelLinear(
 				self.hidden_size,
 				self.hidden_size,
 				dtype=dtype,
@@ -391,7 +390,7 @@ class PatchMerger(nn.Module):
 				rngs=rngs,
 			),
 			partial(nn.gelu, approximate=False),
-			nn.Linear(
+			ParallelLinear(
 				self.hidden_size,
 				dim,
 				dtype=dtype,
@@ -421,7 +420,7 @@ class VisionMlp(nn.Module):
 		rngs: nn.Rngs,
 	) -> None:
 		super().__init__()
-		self.fc1 = nn.Linear(
+		self.fc1 = ParallelLinear(
 			dim,
 			hidden_dim,
 			dtype=dtype,
@@ -430,7 +429,7 @@ class VisionMlp(nn.Module):
 			rngs=rngs,
 		)
 		self.act = ACT2FN[hidden_act]
-		self.fc2 = nn.Linear(
+		self.fc2 = ParallelLinear(
 			hidden_dim,
 			dim,
 			dtype=dtype,
@@ -459,7 +458,7 @@ class VisionAttention(FlaxAttentionModule):
 		self.rngs = rngs
 		self.num_heads = num_heads
 		self.head_dim = dim // num_heads
-		self.qkv = nn.Linear(
+		self.qkv = ParallelLinear(
 			dim,
 			dim * 3,
 			use_bias=True,
@@ -468,7 +467,7 @@ class VisionAttention(FlaxAttentionModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.proj = nn.Linear(
+		self.proj = ParallelLinear(
 			dim,
 			dim,
 			dtype=dtype,
@@ -613,7 +612,7 @@ class Qwen2VLMLP(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
@@ -675,7 +674,7 @@ class Qwen2VLAttention(FlaxAttentionModule):
 			assert self.config.num_attention_heads == self.config.num_key_value_heads
 
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			kernel_init=jax.nn.initializers.normal(config.initializer_range),
@@ -900,7 +899,7 @@ class Qwen2VLDecoderLayer(nn.Module):
 @register_module(
 	TaskType.BASE_VISION,
 	config=Qwen2VLConfig,
-	model_type="qwen2_vl", 
+	model_type="qwen2_vl",
 )
 class Qwen2VisionTransformerPretrainedModel(EasyDeLBaseModule):
 	config_class = Qwen2VLVisionConfig
@@ -1040,7 +1039,7 @@ class Qwen2VisionTransformerPretrainedModel(EasyDeLBaseModule):
 @register_module(
 	TaskType.BASE_MODULE,
 	config=Qwen2VLConfig,
-	model_type="qwen2_vl", 
+	model_type="qwen2_vl",
 )
 class Qwen2VLModel(EasyDeLBaseModule):
 	def __init__(
@@ -1204,7 +1203,7 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 		self.vocab_size = config.vocab_size
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			use_bias=False,

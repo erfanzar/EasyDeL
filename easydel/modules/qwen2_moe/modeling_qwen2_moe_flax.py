@@ -37,6 +37,7 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm as RMSNorm
 from easydel.modules.qwen2_moe.configuration_qwen2_moe import (
 	Qwen2MoeConfig as Qwen2MoeConfig,
@@ -59,7 +60,7 @@ class Qwen2MoeMLP(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
@@ -118,7 +119,7 @@ class Qwen2MoeAttention(FlaxAttentionModule):
 		if self.num_key_value_groups == 1:
 			assert self.config.num_attention_heads == self.config.num_key_value_heads
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			kernel_init=jax.nn.initializers.normal(config.initializer_range),
@@ -279,7 +280,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 		self.dtype = dtype
 		self.param_dtype = param_dtype
 		self.precision = precision
-		self.gate = nn.Linear(
+		self.gate = ParallelLinear(
 			config.hidden_size,
 			config.num_experts,
 			use_bias=False,
@@ -310,7 +311,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.shared_expert_gate = nn.Linear(
+		self.shared_expert_gate = ParallelLinear(
 			config.hidden_size,
 			1,
 			use_bias=False,
@@ -658,7 +659,7 @@ class Qwen2MoeForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			dtype=dtype,
@@ -781,7 +782,7 @@ class Qwen2MoeForSequenceClassification(EasyDeLBaseModule):
 		assert hasattr(config, "num_labels"), (
 			"in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
 		)
-		self.score = nn.Linear(
+		self.score = ParallelLinear(
 			self.config.hidden_size,
 			config.num_labels,
 			dtype=dtype,

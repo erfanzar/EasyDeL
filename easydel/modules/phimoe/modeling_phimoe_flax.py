@@ -39,8 +39,10 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm as RMSNorm
-from easydel.modules.phimoe.phimoe_configuration import PhiMoeConfig as PhiMoeConfig
+
+from .phimoe_configuration import PhiMoeConfig
 
 
 class PhiMoEBlockSparseTop2MLP(nn.Module):
@@ -58,7 +60,7 @@ class PhiMoEBlockSparseTop2MLP(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		linear_class = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
@@ -117,7 +119,7 @@ class PhiMoEAttention(FlaxAttentionModule):
 			)
 
 		linear_class = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=config.attention_bias,
@@ -278,7 +280,7 @@ class PhiMoeSparseMoeBlock(nn.Module):
 		self.top_k = config.num_experts_per_tok
 		self.router_jitter_noise = config.router_jitter_noise
 		self.input_jitter_noise = config.input_jitter_noise
-		self.gate = nn.Linear(
+		self.gate = ParallelLinear(
 			self.config.hidden_size,
 			self.config.num_local_experts,
 			use_bias=False,
@@ -615,7 +617,7 @@ class PhiMoeForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 		self.vocab_size = self.config.vocab_size
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			use_bias=config.lm_head_bias,

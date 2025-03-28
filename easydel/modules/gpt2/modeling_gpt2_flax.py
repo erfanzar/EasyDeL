@@ -50,7 +50,8 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.modules.gpt2.gpt2_configuration import GPT2Config as GPT2Config
+from easydel.layers.linear import ParallelLinear
+from .gpt2_configuration import GPT2Config as GPT2Config
 
 
 class Conv1D(nn.Module):
@@ -598,7 +599,7 @@ class GPT2LMHeadModel(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			use_bias=False,

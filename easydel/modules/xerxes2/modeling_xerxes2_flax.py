@@ -40,6 +40,7 @@ from easydel.layers.caching.transformer_cache import (
 	TransformerCacheMetaData,
 	TransformerCacheView,
 )
+from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
 from easydel.utils.helpers import get_logger
 
@@ -73,7 +74,7 @@ class Xerxes2Attention(FlaxAttentionModule):
 		self.qk_nope_head_dim = config.qk_nope_head_dim
 
 		linear_class = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
@@ -253,7 +254,7 @@ class Xerxes2MLP(nn.Module):
 
 		self.act = nn.silu
 		linear_class = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			use_bias=False,
 			dtype=dtype,
 			param_dtype=param_dtype,
@@ -537,7 +538,7 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			self.config.hidden_size,
 			self.config.vocab_size,
 			use_bias=False,

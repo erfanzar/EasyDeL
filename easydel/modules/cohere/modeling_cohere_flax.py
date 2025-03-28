@@ -36,7 +36,8 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.modules.cohere.cohere_configuration import CohereConfig as CohereConfig
+from easydel.layers.linear import ParallelLinear
+from .cohere_configuration import CohereConfig as CohereConfig
 
 
 def repeat_kv(x: chex.Array, n_rep: int) -> chex.Array:
@@ -141,7 +142,7 @@ class CohereAttention(FlaxAttentionModule):
 				do_t=True,
 			)
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
@@ -278,7 +279,7 @@ class CohereMLP(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
@@ -558,7 +559,7 @@ class CohereForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			dtype=dtype,
@@ -681,7 +682,7 @@ class CohereForSequenceClassification(EasyDeLBaseModule):
 		assert hasattr(config, "num_labels"), (
 			"in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
 		)
-		self.score = nn.Linear(
+		self.score = ParallelLinear(
 			config.hidden_size,
 			config.num_labels,
 			dtype=dtype,

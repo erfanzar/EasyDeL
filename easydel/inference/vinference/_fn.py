@@ -28,7 +28,7 @@ else:
 	EasyDeLBaseModule = object
 from eformer.jaximus import implicit
 
-from ..utils import (
+from ..utilities import (
 	SampleState,
 	create_sampling_step,
 	vInferenceConfig,
@@ -48,7 +48,43 @@ def measure_flops(func, *args, **kwargs):
 	return result, flops, flops / elapsed_time, elapsed_time
 
 
-def basic_generation_first_iter_fn(
+def expand_inputs_for_generation(
+	expand_size: tp.Optional[int] = 1,
+	is_encoder_decoder: bool = False,
+	input_ids: tp.Optional[jnp.ndarray] = None,
+	**model_kwargs,
+) -> tp.Tuple[jnp.ndarray, tp.Dict[str, tp.Any]]:
+	if expand_size == 1 or expand_size is None:
+		return input_ids, model_kwargs
+
+	def _expand_dict_for_generation(dict_to_expand):
+		for key in dict_to_expand:
+			if dict_to_expand[key] is not None and isinstance(dict_to_expand[key], jax.Array):
+				dict_to_expand[key] = jnp.repeat(
+					dict_to_expand[key],
+					axis=0,
+					repeats=expand_size,
+				)
+		return dict_to_expand
+
+	if input_ids is not None:
+		input_ids = input_ids.repeat(repeats=expand_size, axis=0)
+
+	model_kwargs = _expand_dict_for_generation(model_kwargs)
+
+	if is_encoder_decoder:
+		if model_kwargs.get("encoder_outputs") is None:
+			raise ValueError(
+				"If `is_encoder_decoder` is True, make sure that `encoder_outputs` is defined."
+			)
+		model_kwargs["encoder_outputs"] = _expand_dict_for_generation(
+			model_kwargs["encoder_outputs"]
+		)
+
+	return input_ids, model_kwargs
+
+
+def prefill_fn(
 	graphdef: EasyDeLBaseModule,
 	graphstate: dict,
 	graphother,
@@ -84,7 +120,7 @@ def basic_generation_first_iter_fn(
 	return state
 
 
-def basic_generation_iter_fn(
+def decode_fn(
 	graphdef: EasyDeLBaseModule,
 	graphstate: dict,
 	graphother,

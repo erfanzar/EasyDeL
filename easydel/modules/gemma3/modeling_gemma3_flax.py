@@ -38,6 +38,7 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import float8s
 from easydel.modules.auto.auto_modeling import AutoEasyDeLVisionModel
 from easydel.utils import traversals as etr
@@ -149,7 +150,7 @@ class Gemma3Attention(FlaxAttentionModule):
 		kernel = jax.nn.initializers.normal(config.initializer_range)
 
 		linear = partial(
-			nn.Linear,
+			ParallelLinear,
 			use_bias=config.attention_bias,
 			dtype=dtype,
 			param_dtype=param_dtype,
@@ -341,7 +342,7 @@ class Gemma3MLP(nn.Module):
 		self.act = ACT2FN[self.config.hidden_activation]
 
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			use_bias=False,
 			dtype=dtype,
 			param_dtype=param_dtype,
@@ -493,7 +494,7 @@ class Gemma3DecoderLayer(nn.Module):
 @register_module(
 	TaskType.BASE_MODULE,
 	config=Gemma3TextConfig,
-	model_type="gemma3_text", 
+	model_type="gemma3_text",
 )
 class Gemma3TextModel(EasyDeLBaseModule):
 	def __init__(
@@ -654,7 +655,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
 @register_module(
 	TaskType.CAUSAL_LM,
 	config=Gemma3TextConfig,
-	model_type="gemma3_text", 
+	model_type="gemma3_text",
 )
 class Gemma3ForCausalLM(EasyDeLBaseModule):
 	def __init__(
@@ -685,7 +686,7 @@ class Gemma3ForCausalLM(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			use_bias=False,
@@ -771,7 +772,7 @@ class Gemma3ForCausalLM(EasyDeLBaseModule):
 @register_module(
 	TaskType.SEQUENCE_CLASSIFICATION,
 	config=Gemma3TextConfig,
-	model_type="gemma3_text", 
+	model_type="gemma3_text",
 )
 class Gemma3ForSequenceClassification(EasyDeLBaseModule):
 	def __init__(
@@ -800,7 +801,7 @@ class Gemma3ForSequenceClassification(EasyDeLBaseModule):
 		assert hasattr(config, "num_labels"), (
 			"in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
 		)
-		self.score = nn.Linear(
+		self.score = ParallelLinear(
 			self.config.hidden_size,
 			config.num_labels,
 			dtype=dtype,

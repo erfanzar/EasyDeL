@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .utils import vInferencePreCompileConfig
+from .utilities import vInferencePreCompileConfig
 from .vinference import vInference, vInferenceApiServer, vInferenceConfig
 from .whisper_inference import vWhisperInference, vWhisperInferenceConfig
 

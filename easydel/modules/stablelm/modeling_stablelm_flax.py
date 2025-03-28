@@ -23,10 +23,7 @@ from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import (
-	FlaxBaseModelOutput,
-	FlaxCausalLMOutput,
-)
+from easydel.infra.modeling_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
 from easydel.infra.utils import (
 	ACT2FN,
 	auto_remat,
@@ -36,9 +33,8 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.modules.stablelm.stablelm_configuration import (
-	StableLmConfig as StableLmConfig,
-)
+from easydel.layers.linear import ParallelLinear
+from .stablelm_configuration import StableLmConfig
 
 
 class StableLmMLP(nn.Module):
@@ -56,7 +52,7 @@ class StableLmMLP(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
@@ -153,7 +149,7 @@ class StableLmAttention(FlaxAttentionModule):
 			assert self.config.num_attention_heads == self.config.num_key_value_heads
 
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			kernel_init=jax.nn.initializers.normal(config.initializer_range),
@@ -613,7 +609,7 @@ class StableLmForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 		self.vocab_size = self.config.vocab_size
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			use_bias=False,

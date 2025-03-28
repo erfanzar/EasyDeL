@@ -30,6 +30,7 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import ACT2FN, control_mlp_sharding
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.linear import ParallelLinear
 from easydel.utils import traversals as etr
 
 from .configuration_siglip import SiglipConfig, SiglipTextConfig, SiglipVisionConfig
@@ -238,7 +239,7 @@ class SiglipAttention(FlaxAttentionModule):
 
 		self.dropout = config.attention_dropout
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
@@ -344,7 +345,7 @@ class SiglipMLP(nn.Module):
 		self.rngs = rngs
 		self.activation_fn = ACT2FN[config.hidden_act]
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			use_bias=True,
 			dtype=dtype,
 			param_dtype=param_dtype,
@@ -538,7 +539,7 @@ class SiglipTextTransformer(EasyDeLBaseModule):
 			param_dtype=param_dtype,
 			rngs=rngs,
 		)
-		self.head = nn.Linear(
+		self.head = ParallelLinear(
 			embed_dim,
 			config.projection_size,
 			dtype=dtype,
@@ -785,7 +786,7 @@ class MultiheadAttention(nn.Module):
 
 		self.in_proj_weight = nn.Param(normal_init(embed_dim * 3, embed_dim))
 		self.in_proj_bias = nn.Param(ze_init(3 * embed_dim))
-		self.out_proj = nn.Linear(
+		self.out_proj = ParallelLinear(
 			embed_dim,
 			embed_dim,
 			use_bias=bias,
@@ -1176,7 +1177,7 @@ class SiglipForImageClassification(EasyDeLBaseModule):
 		self.use_classif = config.num_labels > 0
 		# Classifier head
 		if self.use_classif:
-			self.classifier = nn.Linear(
+			self.classifier = ParallelLinear(
 				config.vision_config.hidden_size,
 				config.num_labels,
 				dtype=dtype,

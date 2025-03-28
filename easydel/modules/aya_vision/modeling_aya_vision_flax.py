@@ -21,21 +21,18 @@ import jax.numpy as jnp
 from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import TaskType
-from easydel.infra.modeling_outputs import (
-	ModelOutput,
-)
-from easydel.infra.utils import (
-	ACT2FN,
-)
+from easydel.infra.factory import TaskType, register_module
+from easydel.infra.modeling_outputs import ModelOutput
+from easydel.infra.utils import ACT2FN
 from easydel.layers.caching import TransformerCache
+from easydel.layers.linear import ParallelLinear
 from easydel.modules.auto.auto_modeling import (
 	AutoEasyDeLModelForCausalLM,
 	AutoEasyDeLVisionModel,
 )
 from easydel.utils import traversals as etr
 from easydel.utils.helpers import get_logger
-from easydel.infra.factory import register_module
+
 from .aya_vision_configuration import AyaVisionConfig
 
 logger = get_logger(__name__)
@@ -112,7 +109,7 @@ class AyaVisionMultiModalProjector(nn.Module):
 			rngs=rngs,
 		)
 
-		self.linear_1 = nn.Linear(
+		self.linear_1 = ParallelLinear(
 			config.vision_config.hidden_size * (config.downsample_factor**2),
 			self.alignment_intermediate_size,
 			use_bias=True,
@@ -124,7 +121,7 @@ class AyaVisionMultiModalProjector(nn.Module):
 		)
 
 		self.act = ACT2FN["silu"]
-		self.linear_2 = nn.Linear(
+		self.linear_2 = ParallelLinear(
 			self.alignment_intermediate_size // 2,
 			config.text_config.hidden_size,
 			use_bias=True,

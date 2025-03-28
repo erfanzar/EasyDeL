@@ -37,8 +37,10 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm as RMSNorm
-from easydel.modules.qwen2.qwen_configuration import Qwen2Config as Qwen2Config
+
+from .qwen_configuration import Qwen2Config
 
 
 class Qwen2MLP(nn.Module):
@@ -56,7 +58,7 @@ class Qwen2MLP(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
@@ -117,7 +119,7 @@ class Qwen2Attention(FlaxAttentionModule):
 		if self.num_key_value_groups == 1:
 			assert self.config.num_attention_heads == self.config.num_key_value_heads
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			kernel_init=jax.nn.initializers.normal(config.initializer_range),
@@ -532,7 +534,7 @@ class Qwen2ForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			dtype=dtype,
@@ -622,7 +624,7 @@ class Qwen2ForSequenceClassification(EasyDeLBaseModule):
 		assert hasattr(config, "num_labels"), (
 			"in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
 		)
-		self.score = nn.Linear(
+		self.score = ParallelLinear(
 			self.config.hidden_size,
 			config.num_labels,
 			dtype=dtype,

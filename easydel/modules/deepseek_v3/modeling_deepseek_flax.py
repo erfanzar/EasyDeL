@@ -37,6 +37,7 @@ from easydel.layers.caching.transformer_cache import (
 	TransformerCache,
 	TransformerCacheView,
 )
+from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
 
 from .deepseek_configuration import DeepseekV3Config
@@ -201,7 +202,7 @@ class DeepseekV3MLP(nn.Module):
 			config.intermediate_size if intermediate_size is None else intermediate_size
 		)
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
@@ -427,14 +428,14 @@ class DeepseekV3Attention(FlaxAttentionModule):
 		self.is_causal = True
 
 		linear = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
 			rngs=rngs,
 		)
 		if self.config.q_lora_rank is None:
-			self.q_proj = nn.Linear(
+			self.q_proj = ParallelLinear(
 				self.hidden_size,
 				self.num_heads * self.q_head_dim,
 				use_bias=False,
@@ -957,7 +958,7 @@ class DeepseekV3ForCausalLM(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			dtype=dtype,

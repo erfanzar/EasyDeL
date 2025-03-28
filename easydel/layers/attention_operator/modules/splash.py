@@ -41,18 +41,55 @@ from .vanilla import VanillaAttn
 
 @AttentionRegistry.register
 class SplashAttn(AttentionImpl):
+	"""
+	An attention implementation using the Pallas Splash Attention kernel for TPUs.
+
+	Splash Attention is an optimized attention mechanism designed for TPUs.
+	This implementation provides a wrapper around the `make_splash_mqa_single_device`
+	primitive.
+
+	Note:
+	    - This implementation is primarily intended for TPUs.
+	    - It falls back to `VanillaAttn` under certain conditions:
+	        - Query sequence length is 1 (generation mode).
+	        - `causal` is False.
+	        - Query sequence length is not divisible by 128 (kernel constraint).
+	    - Non-TPU forward methods (`forward_native`, `forward_gpu`, etc.) are not
+	      implemented and will raise `NotImplementedError`.
+
+	Registered under the name "splash".
+	"""
+
 	@classmethod
 	def get_impl_name(cls) -> tp.Union[str, tp.Tuple[str]]:
+		"""
+		Returns the registered name of this attention implementation.
+
+		Returns:
+		    The string "splash".
+		"""
 		return "splash"
 
 	def get_impl_metadata(self) -> AttentionMetadata:
+		"""
+		Returns the metadata associated with this attention implementation instance.
+
+		Returns:
+		    The `AttentionMetadata` provided during initialization.
+		"""
 		return self.metadata
 
 	def forward_native(self, *args, **kwargs) -> AttentionOutput:
-		raise NotImplementedError("`forward_native` not implemented!")
+		"""Native (CPU) forward pass. Not implemented for Splash Attention."""
+		raise NotImplementedError(
+			"Splash Attention does not have a native CPU implementation."
+		)
 
 	def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
-		raise NotImplementedError("`forward_gpu` not implemented!")
+		"""GPU forward pass. Not implemented for Splash Attention."""
+		raise NotImplementedError(
+			"Splash Attention does not have a generic GPU implementation."
+		)
 
 	@jax.named_scope("easydel-splashimpl-tpu")
 	def forward_tpu(
@@ -64,6 +101,27 @@ class SplashAttn(AttentionImpl):
 		causal: bool = True,
 		**ignore,
 	) -> AttentionOutput:
+		"""
+		Performs Splash Attention on TPU using the Pallas kernel.
+
+		Handles fallback logic, mask processing, block size configuration, and
+		sharding via `shard_map`. Expects inputs potentially in BTHD format and
+		transposes them to BHTD for the kernel.
+
+		Args:
+		    q: Query tensor (B, T, Hq, D).
+		    k: Key tensor (B, S, Hkv, D).
+		    v: Value tensor (B, S, Hkv, Dv).
+		    mask: Optional boolean attention mask (broadcastable to B, 1, T, S).
+		        Used to generate segment IDs if provided.
+		    causal: If True, applies causal masking via the kernel's mask configuration.
+		        If False, falls back to VanillaAttn.
+		    **ignore: Ignored keyword arguments.
+
+		Returns:
+		    An `AttentionOutput` object containing the attention outputs. Attention weights
+		    are not computed or returned by Splash Attention.
+		"""
 		query_lenght = q.shape[1]
 		value_lenght = v.shape[1]
 		if (query_lenght == 1) or not causal or ((query_lenght % 128) != 0):
@@ -162,13 +220,16 @@ class SplashAttn(AttentionImpl):
 		return AttentionOutput(attention_weights=None, attention_outputs=attn)
 
 	def forward_cpu(self, *args, **kwargs) -> AttentionOutput:
-		raise NotImplementedError("`forward_cpu` not implemented!")
+		"""CPU forward pass. Not implemented for Splash Attention."""
+		raise NotImplementedError("Splash Attention does not have a CPU implementation.")
 
 	def forward_cuda(self, *args, **kwargs) -> AttentionOutput:
-		raise NotImplementedError("`forward_cuda` not implemented!")
+		"""CUDA GPU forward pass. Not implemented for Splash Attention."""
+		raise NotImplementedError("Splash Attention does not have a CUDA implementation.")
 
 	def forward_rocm(self, *args, **kwargs) -> AttentionOutput:
-		raise NotImplementedError("`forward_rocm` not implemented!")
+		"""ROCm GPU forward pass. Not implemented for Splash Attention."""
+		raise NotImplementedError("Splash Attention does not have a ROCm implementation.")
 
 	def __call__(
 		self,
@@ -179,7 +240,26 @@ class SplashAttn(AttentionImpl):
 		causal: bool = True,
 		**ignore,
 	) -> AttentionOutput:
-		return super().__call__(q=q, k=k, v=v, mask=mask, causal=causal)
+		"""
+		Executes the Splash Attention computation or falls back to Vanilla Attention.
+
+		Calls the appropriate backend-specific forward method (`forward_tpu`) via
+		`super().__call__`. If the backend is not TPU or fallback conditions are met,
+		it relies on the fallback mechanism within `forward_tpu`.
+
+		Args:
+		    q: Query tensor.
+		    k: Key tensor.
+		    v: Value tensor.
+		    mask: Optional attention mask.
+		    causal: If True, applies causal masking. Affects fallback logic and
+		        kernel configuration.
+		    **ignore: Additional ignored keyword arguments.
+
+		Returns:
+		    An `AttentionOutput` object containing the attention results.
+		"""
+		return super().__call__(q=q, k=k, v=v, mask=mask, causal=causal, **ignore)
 
 
 if __name__ == "__main__":

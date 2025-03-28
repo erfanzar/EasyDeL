@@ -36,8 +36,10 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.modules.xerxes.xerxes_configuration import XerxesConfig as XerxesConfig
+from easydel.layers.linear import ParallelLinear
 from easydel.utils.helpers import get_logger
+
+from .xerxes_configuration import XerxesConfig as XerxesConfig
 
 logger = get_logger(__name__)
 
@@ -109,7 +111,7 @@ class XerxesAttention(FlaxAttentionModule):
 		kernel = jax.nn.initializers.normal(config.initializer_range)
 
 		linear_class = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
@@ -285,7 +287,7 @@ class XerxesMLP(nn.Module):
 
 		self.act = functools.partial(nn.gelu, approximate=True)
 		linear_class = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			use_bias=False,
 			dtype=dtype,
 			param_dtype=param_dtype,
@@ -326,7 +328,7 @@ class XerxesSparseMoeBlock(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		self.rngs = rngs
-		self.gate = nn.Linear(
+		self.gate = ParallelLinear(
 			self.config.hidden_size,
 			self.config.num_local_experts,
 			use_bias=False,
@@ -671,7 +673,7 @@ class XerxesForCausalLM(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			self.config.hidden_size,
 			self.config.vocab_size,
 			use_bias=False,

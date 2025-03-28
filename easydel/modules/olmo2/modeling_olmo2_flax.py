@@ -37,8 +37,9 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
-from easydel.modules.olmo2.olmo2_configuration import Olmo2Config
+from .olmo2_configuration import Olmo2Config
 
 
 class Olmo2MLP(nn.Module):
@@ -56,7 +57,7 @@ class Olmo2MLP(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		linear_class = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
@@ -115,7 +116,7 @@ class Olmo2Attention(FlaxAttentionModule):
 			assert self.num_heads == self.config.num_key_value_heads
 
 		linear_class = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
@@ -511,7 +512,7 @@ class Olmo2ForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			dtype=dtype,
@@ -599,7 +600,7 @@ class Olmo2ForSequenceClassification(EasyDeLBaseModule):
 		assert hasattr(config, "num_labels"), (
 			"in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
 		)
-		self.score = nn.Linear(
+		self.score = ParallelLinear(
 			self.config.hidden_size,
 			config.num_labels,
 			dtype=dtype,

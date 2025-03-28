@@ -5,10 +5,12 @@ from dataclasses import field
 import jax
 from datasets import load_dataset
 from jax import numpy as jnp
-from math_verify import LatexExtractionConfig, parse, verify
-from transformers import AutoTokenizer
+from math_verify import LatexExtractionConfig, parse, verify  # type:ignore
+from transformers import AutoConfig, AutoTokenizer
 
 import easydel as ed
+from easydel.infra.factory import registry
+from easydel.modules import *  # noqa # init
 from easydel.utils import traversals as etr
 
 
@@ -118,7 +120,22 @@ def main():
 	max_prompt_length = grpo_config.max_prompt_length
 	max_completion_length = grpo_config.max_completion_length
 	max_sequence_length = max_completion_length + max_prompt_length
-	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+
+	hf_config = AutoConfig.from_pretrained(runtime_config.repo_id)
+
+	avails = [
+		v.module.__name__
+		for v in registry.task_registry[ed.TaskType.IMAGE_TEXT_TO_TEXT].values()
+	]
+
+	if hf_config.architectures and any(
+		arch in avails for arch in hf_config.architectures
+	):
+		load_module = ed.AutoEasyDeLModelForImageTextToText
+	else:
+		load_module = ed.AutoEasyDeLModelForCausalLM
+
+	model = load_module.from_pretrained(
 		runtime_config.repo_id,
 		auto_shard_model=True,
 		sharding_axis_dims=runtime_config.sharding_axis,

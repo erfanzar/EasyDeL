@@ -21,9 +21,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx as nn
 
-from easydel.infra.base_module import (
-	EasyDeLBaseModule,
-)
+from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
 	FlaxBaseModelOutput,
@@ -39,7 +37,8 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.modules.olmo.olmo_configuration import OlmoConfig
+from easydel.layers.linear import ParallelLinear
+from .olmo_configuration import OlmoConfig
 
 
 class OlmoMLP(nn.Module):
@@ -57,7 +56,7 @@ class OlmoMLP(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		linear_class = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
@@ -117,7 +116,7 @@ class OlmoAttention(FlaxAttentionModule):
 			assert self.config.num_attention_heads == self.config.num_key_value_heads
 
 		linear_class = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
@@ -500,7 +499,7 @@ class OlmoForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			dtype=dtype,
@@ -559,7 +558,7 @@ class OlmoForCausalLM(EasyDeLBaseModule):
 @register_module(
 	TaskType.SEQUENCE_CLASSIFICATION,
 	config=OlmoConfig,
-	model_type="olmo", 
+	model_type="olmo",
 )
 class OlmoForSequenceClassification(EasyDeLBaseModule):
 	def __init__(
@@ -588,7 +587,7 @@ class OlmoForSequenceClassification(EasyDeLBaseModule):
 		assert hasattr(config, "num_labels"), (
 			"in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
 		)
-		self.score = nn.Linear(
+		self.score = ParallelLinear(
 			self.config.hidden_size,
 			config.num_labels,
 			dtype=dtype,

@@ -34,6 +34,7 @@ from flax import nnx as nn
 from jax.sharding import PartitionSpec
 from tqdm.auto import tqdm
 
+from easydel.layers.linear import ParallelLinear
 from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import flatten_dict, unflatten_dict
 
@@ -316,11 +317,11 @@ def quantize_linear_layers(
 	pattern = re.compile(quantization_pattern)
 
 	with tqdm(
-		total=len([p[0] for p in iter_module_search(model, nn.Linear)]),
+		total=len([p[0] for p in iter_module_search(model, ParallelLinear)]),
 		desc=f"Quantizing to {method}",
 		disable=not verbose,
 	) as pbar:
-		for path, _ in iter_module_search(model, nn.Linear):
+		for path, _ in iter_module_search(model, ParallelLinear):
 			if pattern.search(".".join([str(p) for p in path])):
 				set_module_from_path(
 					model=model,
@@ -374,13 +375,13 @@ def apply_lora_to_layers(
 	pattern = re.compile(lora_pattern)
 
 	with tqdm(
-		total=len([p[0] for p in iter_module_search(model, nn.Linear)]),
+		total=len([p[0] for p in iter_module_search(model, ParallelLinear)]),
 		desc="Applying LoRA",
 		disable=not verbose,
 	) as pbar:
-		for path, _ in iter_module_search(model, nn.Linear):
+		for path, _ in iter_module_search(model, ParallelLinear):
 			if pattern.search(".".join([str(p) for p in path])):
-				base_module: nn.Linear = get_module_from_path(model=model, path=path)
+				base_module: ParallelLinear = get_module_from_path(model=model, path=path)
 				set_module_from_path(
 					model=model,
 					path=path,
@@ -463,7 +464,7 @@ def unwrap_lora_to_layers(
 	)
 
 	with tqdm(
-		total=len([p[0] for p in iter_module_search(model, nn.Linear)]),
+		total=len([p[0] for p in iter_module_search(model, ParallelLinear)]),
 		desc="Unwarping LoRA Layers",
 		disable=not verbose,
 	) as pbar:

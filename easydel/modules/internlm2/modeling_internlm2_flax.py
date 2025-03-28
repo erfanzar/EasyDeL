@@ -38,10 +38,9 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
-from easydel.modules.internlm2.internlm2_configuration import (
-	InternLM2Config as InternLM2Config,
-)
+from .internlm2_configuration import InternLM2Config
 
 
 class InternLM2Attention(FlaxAttentionModule):
@@ -70,7 +69,7 @@ class InternLM2Attention(FlaxAttentionModule):
 				f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
 				f" and `num_heads`: {self.num_heads})."
 			)
-		self.wqkv = nn.Linear(
+		self.wqkv = ParallelLinear(
 			config.hidden_size,
 			(self.num_heads + 2 * self.num_key_value_heads) * self.head_dim,
 			dtype=dtype,
@@ -81,7 +80,7 @@ class InternLM2Attention(FlaxAttentionModule):
 			precision=precision,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
-		self.wo = nn.Linear(
+		self.wo = ParallelLinear(
 			self.num_heads * self.head_dim,
 			config.hidden_size,
 			dtype=dtype,
@@ -206,7 +205,7 @@ class InternLM2MLP(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		linear = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
@@ -492,7 +491,7 @@ class InternLM2ForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 
-		self.output = nn.Linear(
+		self.output = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			dtype=dtype,
@@ -601,7 +600,7 @@ class InternLM2ForSequenceClassification(EasyDeLBaseModule):
 		assert hasattr(config, "num_labels"), (
 			"in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
 		)
-		self.score = nn.Linear(
+		self.score = ParallelLinear(
 			self.config.hidden_size,
 			config.num_labels,
 			dtype=dtype,

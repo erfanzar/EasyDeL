@@ -343,6 +343,9 @@ class SampleState:
 	generated_tokens: tp.Optional[int] = 0
 	padded_length: tp.Optional[int] = 0
 
+	_time_spent_computing: tp.Optional[float] = 0.0
+	_compile_config: tp.Optional[vInferencePreCompileConfig] = None
+
 	def __repr__(self):
 		"""
 		Args:

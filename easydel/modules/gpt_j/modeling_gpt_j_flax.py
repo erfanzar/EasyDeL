@@ -35,8 +35,10 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.modules.gpt_j.gpt_j_configuration import GPTJConfig as GPTJConfig
+from easydel.layers.linear import ParallelLinear
 from easydel.utils.helpers import get_logger
+
+from .gpt_j_configuration import GPTJConfig as GPTJConfig
 
 logger = get_logger(__name__)
 
@@ -67,7 +69,7 @@ class GPTJAttention(FlaxAttentionModule):
 		self.rotary_dim = config.rotary_dim
 
 		linear = partial(
-			nn.Linear,
+			ParallelLinear,
 			self.embed_dim,
 			self.embed_dim,
 			use_bias=False,
@@ -190,7 +192,7 @@ class GPTJMLP(nn.Module):
 		embed_dim = config.hidden_size
 		kernel_init = nn.initializers.normal(config.initializer_range)
 
-		self.fc_in = nn.Linear(
+		self.fc_in = ParallelLinear(
 			embed_dim,
 			intermediate_size,
 			dtype=dtype,
@@ -200,7 +202,7 @@ class GPTJMLP(nn.Module):
 			rngs=rngs,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
-		self.fc_out = nn.Linear(
+		self.fc_out = ParallelLinear(
 			intermediate_size,
 			embed_dim,
 			dtype=dtype,
@@ -481,7 +483,7 @@ class GPTJForCausalLM(EasyDeLBaseModule):
 			precision=self.precision,
 			rngs=rngs,
 		)
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			rngs=rngs,

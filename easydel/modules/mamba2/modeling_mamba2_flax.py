@@ -32,8 +32,9 @@ from easydel.layers.caching.mamba2_cache import (
 	Mamba2CacheMetaData,
 	Mamba2CacheView,
 )
+from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm as FlaxMamba2RMSNorm
-from easydel.modules.mamba2.mamba2_configuration import Mamba2Config as Mamba2Config
+from .mamba2_configuration import Mamba2Config as Mamba2Config
 from easydel.utils import traversals as etr
 
 
@@ -277,7 +278,7 @@ class Mamba2Mixer(nn.Module):
 
 		projection_size = self.intermediate_size + self.conv_dim + self.num_heads
 
-		self.in_proj = nn.Linear(
+		self.in_proj = ParallelLinear(
 			self.hidden_size,
 			projection_size,
 			use_bias=self.config.use_bias,
@@ -316,7 +317,7 @@ class Mamba2Mixer(nn.Module):
 			eps=self.layer_norm_epsilon,
 			dtype=self.param_dtype,
 		)
-		self.out_proj = nn.Linear(
+		self.out_proj = ParallelLinear(
 			self.intermediate_size,
 			self.hidden_size,
 			use_bias=self.config.use_bias,
@@ -769,7 +770,7 @@ class Mamba2Model(EasyDeLBaseModule):
 @register_module(
 	TaskType.CAUSAL_LM,
 	config=Mamba2Config,
-	model_type="mamba2", 
+	model_type="mamba2",
 )
 class Mamba2ForCausalLM(EasyDeLBaseModule):
 	def __init__(
@@ -795,7 +796,7 @@ class Mamba2ForCausalLM(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			use_bias=False,

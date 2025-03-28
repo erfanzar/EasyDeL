@@ -216,11 +216,23 @@ def _chunk_attention_bias(
 
 @AttentionRegistry.register
 class RingAttn(AttentionImpl):
+	"""
+	Attention implementation using ring-passing algorithm or blockwise scan.
+
+	This implementation supports:
+	- Native (scan-based) blockwise attention via `blockwise_attn`.
+	- TPU-specific ring attention using `pallas_ring_attention` kernel.
+
+	It is registered under the name "ring".
+	"""
+
 	@classmethod
 	def get_impl_name(cls) -> tp.Union[str, tp.Tuple[str]]:
+		"""Returns the registered name: "ring"."""
 		return "ring"
 
 	def get_impl_metadata(self) -> AttentionMetadata:
+		"""Returns the metadata associated with this instance."""
 		return self.metadata
 
 	@jax.named_scope("easydel-ringimpl-native-xla")
@@ -237,6 +249,27 @@ class RingAttn(AttentionImpl):
 		causal: bool = True,
 		**ignore,
 	) -> AttentionOutput:
+		"""
+		Computes attention using the scan-based `blockwise_attn` function.
+
+		Handles optional mask/bias, KV head repetition, and sharding constraints.
+
+		Args:
+		    q: Query tensor (B, T, H, D).
+		    k: Key tensor (B, S, H_kv, D).
+		    v: Value tensor (B, S, H_kv, D).
+		    mask: Optional boolean attention mask (broadcastable to B, 1, T, S).
+		    bias: Optional attention bias (broadcastable to B, H, T, S).
+		    init_bias: Optional callable to initialize bias if mask/bias are None.
+		    deterministic: If False, enables dropout. Requires `dropout_rng`.
+		    dropout_rng: JAX PRNG key for dropout if `deterministic` is False.
+		    causal: Apply causal mask if True.
+		    **ignore: Ignored keyword arguments.
+
+		Returns:
+		    AttentionOutput containing the attention result.
+		"""
+
 		sm_scale = self.metadata.softmax_scale
 		sm_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
 		dtype = self.metadata.runtime_dtype
@@ -287,6 +320,8 @@ class RingAttn(AttentionImpl):
 			return AttentionOutput(attention_weights=None, attention_outputs=output)
 
 	def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
+		"""GPU forward pass. Currently delegates to `forward_native` (scan-based)."""
+		# TODO: Implement GPU-specific ring attention kernel if available
 		return self.forward_cuda(*args, **kwargs)
 
 	@jax.named_scope("easydel-ringimpl-tpu")
@@ -303,6 +338,26 @@ class RingAttn(AttentionImpl):
 		causal: bool = True,
 		**ignore,
 	) -> AttentionOutput:
+		"""
+		Computes Ring Attention on TPU using the `pallas_ring_attention` kernel.
+
+		Handles optional mask/bias, sharding, and passes configuration to the kernel.
+
+		Args:
+		    q: Query tensor (B, T, H, D).
+		    k: Key tensor (B, S, H_kv, D).
+		    v: Value tensor (B, S, H_kv, D).
+		    mask: Optional boolean attention mask (broadcastable to B, 1, T, S).
+		    bias: Optional attention bias (broadcastable to B, H, T, S).
+		    init_bias: Optional callable to initialize bias if mask/bias are None.
+		    deterministic: If False, potentially enables dropout within the kernel (if supported).
+		    dropout_rng: JAX PRNG key (may be used by the kernel if dropout is enabled).
+		    causal: Apply causal mask if True. Passed to the kernel.
+		    **ignore: Ignored keyword arguments.
+
+		Returns:
+		    AttentionOutput containing the attention result.
+		"""
 		sm_scale = self.metadata.softmax_scale
 		sm_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
 		dtype = self.metadata.runtime_dtype
@@ -366,12 +421,17 @@ class RingAttn(AttentionImpl):
 		)
 
 	def forward_cpu(self, *args, **kwargs) -> AttentionOutput:
+		"""CPU forward pass. Delegates to `forward_native` (scan-based)."""
 		return self.forward_native(*args, **kwargs)
 
 	def forward_cuda(self, *args, **kwargs) -> AttentionOutput:
+		"""CUDA GPU forward pass. Currently delegates to `forward_native` (scan-based)."""
+		# TODO: Implement GPU-specific ring attention kernel if available
 		return self.forward_native(*args, **kwargs)
 
 	def forward_rocm(self, *args, **kwargs) -> AttentionOutput:
+		"""ROCm GPU forward pass. Currently delegates to `forward_native` (scan-based)."""
+		# TODO: Implement ROCm-specific ring attention kernel if available
 		return self.forward_native(*args, **kwargs)
 
 	def __call__(
@@ -387,7 +447,29 @@ class RingAttn(AttentionImpl):
 		causal: bool = True,
 		**ignore,
 	) -> AttentionOutput:
-		# TODO:Debug Ring Attention then uncomment code below
+		"""
+		Executes the Ring Attention computation.
+
+		Currently bypasses the backend dispatch and directly calls `forward_native`.
+		(See TODO in the original code).
+
+		Args:
+		    q: Query tensor.
+		    k: Key tensor.
+		    v: Value tensor.
+		    mask: Optional attention mask.
+		    bias: Optional attention bias.
+		    init_bias: Optional callable to initialize bias.
+		    deterministic: If False, enables dropout (requires dropout_rng).
+		    dropout_rng: JAX PRNG key for dropout if deterministic is False.
+		    causal: Apply causal mask if True.
+		    **ignore: Additional ignored keyword arguments.
+
+		Returns:
+		    An `AttentionOutput` object containing the results.
+		"""
+		# TODO: Debug Ring Attention then restore super().__call__ dispatch.
+		# The original code temporarily forces native execution.
 		return self.forward_native(
 			q=q,
 			k=k,
@@ -399,17 +481,6 @@ class RingAttn(AttentionImpl):
 			dropout_rng=dropout_rng,
 			causal=causal,
 		)
-		# return super().__call__(
-		# 	q=q,
-		# 	k=k,
-		# 	v=v,
-		# 	mask=mask,
-		# 	bias=bias,
-		# 	init_bias=init_bias,
-		# 	deterministic=deterministic,
-		# 	dropout_rng=dropout_rng,
-		# 	causal=causal,
-		# )
 
 
 if __name__ == "__main__":

@@ -37,8 +37,10 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
-from easydel.modules.arctic.arctic_configuration import ArcticConfig
+
+from .arctic_configuration import ArcticConfig
 
 
 class ArcticAttention(FlaxAttentionModule):
@@ -65,7 +67,7 @@ class ArcticAttention(FlaxAttentionModule):
 		self.max_position_embeddings = config.max_position_embeddings
 
 		linear = partial(
-			nn.Linear,
+			ParallelLinear,
 			use_bias=getattr(self.config, "attention_bias", False),
 			dtype=dtype,
 			param_dtype=param_dtype,
@@ -210,7 +212,7 @@ class ArcticMLP(nn.Module):
 			config.intermediate_size if not self.is_residual_mlp else self.hidden_dim
 		)
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			use_bias=False,
 			dtype=dtype,
 			param_dtype=param_dtype,
@@ -255,7 +257,7 @@ class ArcticMoeBlock(nn.Module):
 		self.is_moe_layer = (layer_idx + 1) % config.moe_layer_frequency == 0
 
 		if self.is_moe_layer:
-			self.gate = nn.Linear(
+			self.gate = ParallelLinear(
 				config.hidden_size,
 				config.num_local_experts,
 				use_bias=False,
@@ -627,7 +629,7 @@ class ArcticForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			dtype=dtype,
@@ -697,7 +699,7 @@ class ArcticForCausalLM(EasyDeLBaseModule):
 @register_module(
 	TaskType.SEQUENCE_CLASSIFICATION,
 	config=ArcticConfig,
-	model_type="arctic", 
+	model_type="arctic",
 )
 class ArcticForSequenceClassification(EasyDeLBaseModule):
 	def __init__(
@@ -727,7 +729,7 @@ class ArcticForSequenceClassification(EasyDeLBaseModule):
 		assert hasattr(config, "num_labels"), (
 			"in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
 		)
-		self.score = nn.Linear(
+		self.score = ParallelLinear(
 			config.hidden_size,
 			config.num_labels,
 			dtype=dtype,

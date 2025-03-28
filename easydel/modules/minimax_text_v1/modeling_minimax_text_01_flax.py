@@ -41,8 +41,9 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
-from easydel.layers.ops import lightning_attention
+from easydel.layers.ops import _lightning_attention
 
 from .minimax_text_01_configuration import MiniMaxText01Config
 
@@ -124,7 +125,7 @@ class GLU(nn.Module):
 	):
 		super().__init__()
 
-		self.l1 = nn.Linear(
+		self.l1 = ParallelLinear(
 			d1,
 			d2,
 			use_bias=bias,
@@ -133,7 +134,7 @@ class GLU(nn.Module):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.l2 = nn.Linear(
+		self.l2 = ParallelLinear(
 			d1,
 			d2,
 			use_bias=bias,
@@ -142,7 +143,7 @@ class GLU(nn.Module):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.l3 = nn.Linear(
+		self.l3 = ParallelLinear(
 			d2,
 			d1,
 			use_bias=bias,
@@ -174,7 +175,7 @@ class MiniMaxText01LightningAttention(nn.Module):
 		self.num_heads = config.num_attention_heads
 		self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
 
-		self.out_proj = nn.Linear(
+		self.out_proj = ParallelLinear(
 			self.head_dim * self.num_heads,
 			self.hidden_size,
 			use_bias=False,
@@ -192,7 +193,7 @@ class MiniMaxText01LightningAttention(nn.Module):
 			param_dtype=param_dtype,
 		)
 
-		self.qkv_proj = nn.Linear(
+		self.qkv_proj = ParallelLinear(
 			self.hidden_size,
 			3 * self.head_dim * self.num_heads,
 			use_bias=False,
@@ -201,7 +202,7 @@ class MiniMaxText01LightningAttention(nn.Module):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.output_gate = nn.Linear(
+		self.output_gate = ParallelLinear(
 			self.hidden_size,
 			self.head_dim * self.num_heads,
 			use_bias=False,
@@ -237,7 +238,7 @@ class MiniMaxText01LightningAttention(nn.Module):
 		query_states = jnp.transpose(query_states, (0, 2, 1, 3))
 		key_states = jnp.transpose(key_states, (0, 2, 1, 3))
 		value_states = jnp.transpose(value_states, (0, 2, 1, 3))
-		output, ola = lightning_attention.lightning_attention(
+		output, ola = _lightning_attention.lightning_attention(
 			q=query_states,
 			k=key_states,
 			v=value_states,
@@ -288,7 +289,7 @@ class MiniMaxText01Attention(FlaxAttentionModule):
 			assert self.config.num_attention_heads == self.config.num_key_value_heads
 
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
@@ -320,7 +321,7 @@ class MiniMaxText01Attention(FlaxAttentionModule):
 		self.attention_performer = FlexibleAttentionModule(
 			dropout_prob=config.attention_dropout,
 			base_config=config,
-			softmax_scale=self.head_dim**-0.5, 
+			softmax_scale=self.head_dim**-0.5,
 		)
 
 	def __call__(
@@ -419,7 +420,7 @@ class MiniMaxText01MLP(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
@@ -455,7 +456,7 @@ class MiniMaxText01BlockSparseTop2MLP(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
@@ -492,7 +493,7 @@ class MiniMaxText01SparseMoeBlock(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		self.rngs = rngs
-		self.gate = nn.Linear(
+		self.gate = ParallelLinear(
 			config.hidden_size,
 			config.num_local_experts,
 			use_bias=False,
@@ -673,7 +674,7 @@ class MiniMaxText01DecoderLayer(nn.Module):
 				precision=precision,
 				rngs=rngs,
 			)
-			self.coefficient = nn.Linear(
+			self.coefficient = ParallelLinear(
 				self.hidden_size,
 				1,
 				use_bias=False,
@@ -932,7 +933,7 @@ class MiniMaxText01ForCausalLM(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			rngs=rngs,
