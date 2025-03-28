@@ -33,11 +33,36 @@ from .._attention_impl import (
 
 @AttentionRegistry.register
 class ScaledDotProductAttn(AttentionImpl):
+	"""
+	An attention implementation that leverages `jax.nn.dot_product_attention`.
+
+	This class utilizes JAX's optimized SDPA primitive, which can dispatch to
+	different backend implementations (like XLA, cuDNN, or potentially Flash Attention
+	emulation on CUDA depending on JAX version and hardware).
+
+	It handles sharding using `shard_map` and manages backend-specific dispatch
+	(primarily distinguishing between CUDA/GPU and other backends like TPU/CPU).
+
+	Registered under the names "sdpa", "cudnn", and "cuda_flash_attn2".
+	"""
+
 	@classmethod
 	def get_impl_name(cls) -> tp.Union[str, tp.Tuple[str]]:
+		"""
+		Returns the registered name(s) for this implementation.
+
+		Returns:
+		    A tuple of strings: ("sdpa", "cudnn", "cuda_flash_attn2").
+		"""
 		return "sdpa", "cudnn", "cuda_flash_attn2"
 
 	def get_impl_metadata(self) -> AttentionMetadata:
+		"""
+		Returns the metadata associated with this attention implementation instance.
+
+		Returns:
+		    The `AttentionMetadata` provided during initialization.
+		"""
 		return self.metadata
 
 	@jax.named_scope("easydel-sdpaimpl-native-xla")
@@ -50,7 +75,29 @@ class ScaledDotProductAttn(AttentionImpl):
 		bias: tp.Optional[Array] = None,
 		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
 		causal: bool = False,
+		**ignore,
 	) -> AttentionOutput:
+		"""
+		Computes attention using `jax.nn.dot_product_attention` with the "xla" implementation.
+
+		This is typically used for CPU and TPU backends. It applies sharding via `shard_map`.
+
+		Args:
+		    q: Query tensor (B, T, H, D).
+		    k: Key tensor (B, S, H_kv, D).
+		    v: Value tensor (B, S, H_kv, D_v).
+		    mask: Optional boolean attention mask (broadcastable to B, 1, T, S).
+		        Passed directly to the primitive.
+		    bias: Optional attention bias tensor (broadcastable to B, H, T, S).
+		        Passed directly to the primitive. If bias is provided, `causal` is forced to False.
+		    init_bias: Optional callable to initialize bias if mask/bias are None.
+		    causal: If True and `bias` is None, applies causal masking within the primitive.
+		    **ignore: Ignored keyword arguments.
+
+		Returns:
+		    An `AttentionOutput` object. Note that `jax.nn.dot_product_attention`
+		    typically does not return attention weights.
+		"""
 		sm_scale = self.metadata.softmax_scale
 		sm_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
 		dtype = self.metadata.runtime_dtype
@@ -101,12 +148,15 @@ class ScaledDotProductAttn(AttentionImpl):
 			)
 
 	def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
+		"""GPU forward pass. Delegates to the CUDA-specific implementation."""
 		return self.forward_cuda(*args, **kwargs)
 
 	def forward_tpu(self, *args, **kwargs) -> AttentionOutput:
+		"""TPU forward pass. Delegates to `forward_native` (XLA implementation)."""
 		return self.forward_native(*args, **kwargs)
 
 	def forward_cpu(self, *args, **kwargs) -> AttentionOutput:
+		"""CPU forward pass. Delegates to `forward_native` (XLA implementation)."""
 		return self.forward_native(*args, **kwargs)
 
 	@jax.named_scope("easydel-sdpaimpl-gpu-cuda")
@@ -121,6 +171,26 @@ class ScaledDotProductAttn(AttentionImpl):
 		causal: bool = False,
 		**ignore,
 	) -> AttentionOutput:
+		"""
+		Computes attention using `jax.nn.dot_product_attention` with the "cudnn" implementation.
+
+		This is optimized for NVIDIA GPUs using cuDNN. It applies sharding via `shard_map`.
+		Note: The cuDNN implementation might have specific requirements (e.g., dtype).
+		Causal masking is disabled during generation mode (q_len=1) as it's unnecessary.
+
+		Args:
+		    q: Query tensor (B, T, H, D).
+		    k: Key tensor (B, S, H_kv, D).
+		    v: Value tensor (B, S, H_kv, D_v).
+		    mask: Optional boolean attention mask (broadcastable to B, 1, T, S).
+		    bias: Optional attention bias tensor (broadcastable to B, H, T, S).
+		    init_bias: Optional callable to initialize bias if mask/bias are None.
+		    causal: If True, applies causal masking within the primitive, unless in generation mode.
+		    **ignore: Ignored keyword arguments.
+
+		Returns:
+		    An `AttentionOutput` object. Weights are not returned.
+		"""
 		sm_scale = self.metadata.softmax_scale
 		sm_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
 		dtype = jnp.float16
@@ -171,6 +241,8 @@ class ScaledDotProductAttn(AttentionImpl):
 			)
 
 	def forward_rocm(self, *args, **kwargs) -> AttentionOutput:
+		"""ROCm GPU forward pass. Currently delegates to `forward_native`."""
+		# ROCm might require a specific implementation ("hipblaslt"?) if supported by JAX SDPA
 		return self.forward_native(*args, **kwargs)
 
 	def __call__(
@@ -184,6 +256,25 @@ class ScaledDotProductAttn(AttentionImpl):
 		causal: bool = False,
 		**ignore,
 	) -> AttentionOutput:
+		"""
+		Executes the Scaled Dot Product Attention computation using the appropriate backend.
+
+		Calls the relevant backend-specific forward method (`forward_cuda`, `forward_native`)
+		via the `super().__call__` dispatch mechanism based on the metadata's backend setting.
+
+		Args:
+		    q: Query tensor.
+		    k: Key tensor.
+		    v: Value tensor.
+		    mask: Optional attention mask.
+		    bias: Optional attention bias.
+		    init_bias: Optional callable to initialize bias.
+		    causal: Boolean indicating if causal masking should be applied.
+		    **ignore: Additional ignored keyword arguments.
+
+		Returns:
+		    An `AttentionOutput` object containing the attention results.
+		"""
 		return super().__call__(
 			q=q,
 			k=k,
@@ -192,6 +283,7 @@ class ScaledDotProductAttn(AttentionImpl):
 			bias=bias,
 			init_bias=init_bias,
 			causal=causal,
+			**ignore,
 		)
 
 

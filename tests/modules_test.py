@@ -865,7 +865,7 @@ if __name__ == "__main__":
 	# test.test_gemma3()  # Passed
 	# test.test_arctic()  # Passed
 	# test.test_cohere()  # Passed
-	test.test_cohere2()  # Passed
+	# test.test_cohere2()  # Passed
 	# test.test_dbrx()  # Passed
 	# test.test_deepseek_v2()  # Passed
 	# test.test_deepseek_v3()  # Passed
@@ -893,5 +893,5 @@ if __name__ == "__main__":
 	# test.test_qwen2()  # Passed
 	# test.test_qwen2_moe()  # Passed
 	# test.test_qwen2_vl()  # Passed
-	# test.test_stablelm()  # Passed
+	test.test_stablelm()  # Passed
 	# -----------------------------------------------

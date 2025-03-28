@@ -37,9 +37,9 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.modules.mosaic_mpt.mosaic_configuration import (
-	MptConfig as MptConfig,
-)
+from easydel.layers.linear import ParallelLinear
+
+from .mosaic_configuration import MptConfig as MptConfig
 
 
 class MptMLP(nn.Module):
@@ -54,7 +54,7 @@ class MptMLP(nn.Module):
 	):
 		self.config = config
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),
 			use_bias=config.use_bias,
 			dtype=dtype,
@@ -101,7 +101,7 @@ class MptAttention(FlaxAttentionModule):
 		self.precision = precision
 		self.rngs = rngs
 		self.hidden_size = config.hidden_size
-		self.Wqkv = nn.Linear(
+		self.Wqkv = ParallelLinear(
 			config.hidden_size,
 			config.hidden_size * 3,
 			rngs=rngs,
@@ -112,7 +112,7 @@ class MptAttention(FlaxAttentionModule):
 			precision=precision,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
-		self.out_proj = nn.Linear(
+		self.out_proj = ParallelLinear(
 			config.hidden_size,
 			config.hidden_size,
 			rngs=rngs,
@@ -508,7 +508,7 @@ class MptForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			kernel_init=jax.nn.initializers.normal(stddev=config.initializer_range),

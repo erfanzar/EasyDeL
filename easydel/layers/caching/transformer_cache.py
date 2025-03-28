@@ -128,6 +128,15 @@ class TransformerCacheView:
 	value: tp.Union[cx.Array, ImplicitArray]
 	index: tp.Union[cx.Array, ImplicitArray]
 	metadata: TransformerCacheMetaData
+
+	prefill_length: tp.Optional[tp.Union[jax.Array, NamedSharding]] = None
+
+	prefill_position: tp.Optional[tp.Union[jax.Array, NamedSharding]] = None
+	prefill_page_table: tp.Optional[tp.Union[jax.Array, NamedSharding]] = None
+
+	decode_position: tp.Optional[tp.Union[jax.Array, NamedSharding]] = None
+	decode_page_table: tp.Optional[tp.Union[jax.Array, NamedSharding]] = None
+	
 	layer_index: tp.Optional[int] = None
 
 	@classmethod

@@ -31,11 +31,35 @@ from .._attention_impl import (
 
 @AttentionRegistry.register
 class VanillaAttn(AttentionImpl):
+	"""
+	A standard, non-optimized implementation of multi-head attention.
+
+	This implementation uses basic JAX operations like `jnp.einsum` and standard
+	softmax. It serves as a reference implementation and a fallback for platforms
+	where optimized kernels (like Flash Attention) are not available or desired.
+	It supports features like attention bias, masking, dropout, and Grouped Query
+	Attention (GQA)/Multi-Query Attention (MQA) via reshaping.
+
+	Registered under the name "vanilla".
+	"""
+
 	@classmethod
 	def get_impl_name(cls) -> tp.Union[str, tp.Tuple[str]]:
+		"""
+		Returns the registered name of this attention implementation.
+
+		Returns:
+		    The string "vanilla".
+		"""
 		return "vanilla"
 
 	def get_impl_metadata(self) -> AttentionMetadata:
+		"""
+		Returns the metadata associated with this attention implementation instance.
+
+		Returns:
+		    The `AttentionMetadata` provided during initialization.
+		"""
 		return self.metadata
 
 	@jax.named_scope("easydel-vanillaimpl-native-xla")
@@ -47,10 +71,40 @@ class VanillaAttn(AttentionImpl):
 		mask: tp.Optional[Array] = None,
 		bias: tp.Optional[Array] = None,
 		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
-		deterministic: bool = False,
+		deterministic: bool = True,  # Default to deterministic (no dropout)
 		dropout_rng: tp.Optional[jax.random.PRNGKey] = None,
 		**ignore,
 	) -> AttentionOutput:
+		"""
+		Computes multi-head attention using standard JAX operations.
+
+		Supports GQA/MQA by reshaping the query tensor to match the number of
+		key/value heads. Applies scaling, optional bias/mask, softmax (potentially
+		in float32), and optional dropout.
+
+		Args:
+		    q: Query tensor (B, T, H_q, D).
+		    k: Key tensor (B, S, H_kv, D).
+		    v: Value tensor (B, S, H_kv, D_v).
+		    mask: Optional boolean attention mask (broadcastable to B, 1, T, S).
+		        Used if `bias` is not provided.
+		    bias: Optional attention bias tensor (broadcastable to B, H_q, T, S).
+		        Takes precedence over `mask`.
+		    init_bias: Optional callable to initialize bias if mask/bias are None.
+		    deterministic: If True, disables dropout.
+		    dropout_rng: JAX PRNG key for dropout. Required if `deterministic` is False
+		        and `dropout_prob` > 0.
+		    **ignore: Ignored keyword arguments.
+
+		Returns:
+		    An `AttentionOutput` object containing the attention weights (if computed)
+		    and the final attention outputs.
+
+		Raises:
+		    NotImplementedError: If the bias head dimension cannot be reshaped correctly
+		        to match the query head structure for GQA/MQA.
+		"""
+
 		sm_scale = self.metadata.softmax_scale
 		sm_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
 		dtype = self.metadata.runtime_dtype
@@ -136,18 +190,23 @@ class VanillaAttn(AttentionImpl):
 		)
 
 	def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
+		"""GPU forward pass. Delegates to `forward_native`."""
 		return self.forward_cuda(*args, **kwargs)
 
 	def forward_tpu(self, *args, **kwargs) -> AttentionOutput:
+		"""TPU forward pass. Delegates to `forward_native`."""
 		return self.forward_native(*args, **kwargs)
 
 	def forward_cpu(self, *args, **kwargs) -> AttentionOutput:
+		"""CPU forward pass. Delegates to `forward_native`."""
 		return self.forward_native(*args, **kwargs)
 
 	def forward_cuda(self, *args, **kwargs) -> AttentionOutput:
+		"""CUDA GPU forward pass. Delegates to `forward_native`."""
 		return self.forward_native(*args, **kwargs)
 
 	def forward_rocm(self, *args, **kwargs) -> AttentionOutput:
+		"""ROCm GPU forward pass. Delegates to `forward_native`."""
 		return self.forward_native(*args, **kwargs)
 
 	def __call__(
@@ -158,10 +217,33 @@ class VanillaAttn(AttentionImpl):
 		mask: tp.Optional[Array] = None,
 		bias: tp.Optional[Array] = None,
 		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
-		deterministic: bool = False,
+		deterministic: bool = True,
 		dropout_rng: tp.Optional[jax.random.PRNGKey] = None,
 		**ignore,
 	) -> AttentionOutput:
+		"""
+		Executes the vanilla attention computation.
+
+		Calls the appropriate backend-specific forward method via `super().__call__`.
+		Since all backend methods delegate to `forward_native`, this effectively
+		always runs the native JAX implementation.
+
+		Args:
+		    q: Query tensor.
+		    k: Key tensor.
+		    v: Value tensor.
+		    mask: Optional attention mask.
+		    bias: Optional attention bias.
+		    init_bias: Optional callable to initialize bias.
+		    deterministic: If True, disables dropout.
+		    dropout_rng: JAX PRNG key for dropout if deterministic is False.
+		    **ignore: Additional ignored keyword arguments.
+
+		Returns:
+		    An `AttentionOutput` object containing the attention results.
+		"""
+		# Uses the BaseOperation.__call__ which reads self.metadata.backend for dispatch,
+		# but all paths in VanillaAttn lead back to forward_native.
 		return super().__call__(
 			q=q,
 			k=k,
@@ -171,6 +253,7 @@ class VanillaAttn(AttentionImpl):
 			init_bias=init_bias,
 			deterministic=deterministic,
 			dropout_rng=dropout_rng,
+			**ignore,
 		)
 
 

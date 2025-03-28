@@ -37,7 +37,7 @@ def iter_module_search(
 	        - The module instance matching the specified type
 
 	Example:
-	    >>> for path, module in iter_module_search(model, nn.Linear):
+	    >>> for path, module in iter_module_search(model, ParallelLinear):
 	    ...   print(f"Found Linear layer at {path}")
 	"""
 	if instance is None:
@@ -86,7 +86,7 @@ def set_module_from_path(model: nn.Module, path: ModulePath, new_value: tp.Any) 
 	    IndexError: If trying to access an invalid index.
 
 	Example:
-	    >>> new_layer = nn.Linear(features=64)
+	    >>> new_layer = ParallelLinear(64, 128)
 	    >>> set_module_from_path(model, ("encoder", "layer1"), new_layer)
 	"""
 	if not path:

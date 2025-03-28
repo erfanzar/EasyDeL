@@ -34,9 +34,9 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.modules.gpt_neox.gpt_neox_configuration import (
-	GPTNeoXConfig as GPTNeoXConfig,
-)
+from easydel.layers.linear import ParallelLinear
+
+from .gpt_neox_configuration import GPTNeoXConfig as GPTNeoXConfig
 
 
 class GPTNeoXAttention(FlaxAttentionModule):
@@ -61,7 +61,7 @@ class GPTNeoXAttention(FlaxAttentionModule):
 			rotary_dim=int(self.head_dim * self.config.rotary_pct),
 			base=self.config.rotary_emb_base,
 		)
-		self.query_key_value = nn.Linear(
+		self.query_key_value = ParallelLinear(
 			config.hidden_size,
 			3 * config.hidden_size,
 			dtype=dtype,
@@ -69,7 +69,7 @@ class GPTNeoXAttention(FlaxAttentionModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.dense = nn.Linear(
+		self.dense = ParallelLinear(
 			config.hidden_size,
 			config.hidden_size,
 			dtype=dtype,
@@ -79,7 +79,7 @@ class GPTNeoXAttention(FlaxAttentionModule):
 		)
 		self.attention_performer = FlexibleAttentionModule(
 			base_config=config,
-			softmax_scale=self.head_dim**-0.5, 
+			softmax_scale=self.head_dim**-0.5,
 			dropout_prob=config.attention_dropout,
 		)
 
@@ -168,7 +168,7 @@ class GPTNeoXMlp(nn.Module):
 		self.dtype = dtype
 		self.param_dtype = param_dtype
 		self.precision = precision
-		self.dense_h_to_4h = nn.Linear(
+		self.dense_h_to_4h = ParallelLinear(
 			self.config.hidden_size,
 			self.config.intermediate_size,
 			dtype=dtype,
@@ -176,7 +176,7 @@ class GPTNeoXMlp(nn.Module):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.dense_4h_to_h = nn.Linear(
+		self.dense_4h_to_h = ParallelLinear(
 			self.config.intermediate_size,
 			self.config.hidden_size,
 			dtype=dtype,
@@ -446,7 +446,7 @@ class GPTNeoXForCausalLM(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			use_bias=False,

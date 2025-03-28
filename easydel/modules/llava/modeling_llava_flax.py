@@ -21,7 +21,7 @@ import jax.numpy as jnp
 from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.infra.factory import TaskType
+from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
 	ModelOutput,
 )
@@ -29,13 +29,14 @@ from easydel.infra.utils import (
 	ACT2FN,
 )
 from easydel.layers.caching import TransformerCache
+from easydel.layers.linear import ParallelLinear
 from easydel.modules.auto.auto_modeling import (
 	AutoEasyDeLModelForCausalLM,
 	AutoEasyDeLVisionModel,
 )
 from easydel.utils import traversals as etr
 from easydel.utils.helpers import get_logger
-from easydel.infra.factory import register_module
+
 from .llava_configuration import LlavaConfig
 
 logger = get_logger(__name__)
@@ -103,7 +104,7 @@ class LlavaMultiModalProjector(nn.Module):
 			else len(config.vision_feature_layer)
 		)
 
-		self.linear_1 = nn.Linear(
+		self.linear_1 = ParallelLinear(
 			config.vision_config.hidden_size * num_feature_layers,
 			config.text_config.hidden_size,
 			use_bias=config.multimodal_projector_bias,
@@ -115,7 +116,7 @@ class LlavaMultiModalProjector(nn.Module):
 		)
 
 		self.act = ACT2FN[config.projector_hidden_act]
-		self.linear_2 = nn.Linear(
+		self.linear_2 = ParallelLinear(
 			config.text_config.hidden_size,
 			config.text_config.hidden_size,
 			use_bias=config.multimodal_projector_bias,

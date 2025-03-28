@@ -36,13 +36,10 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
-from easydel.modules.openelm.openelm_configuration import (
-	OpenELMConfig as OpenELMConfig,
-)
-from easydel.modules.openelm.openelm_configuration import (
-	make_divisible,
-)
+
+from .openelm_configuration import OpenELMConfig, make_divisible
 
 
 class OpenELMMultiHeadCausalAttention(FlaxAttentionModule):
@@ -67,7 +64,7 @@ class OpenELMMultiHeadCausalAttention(FlaxAttentionModule):
 		k_heads = config.num_kv_heads[layer_idx]
 		v_heads = config.num_kv_heads[layer_idx]
 
-		self.qkv_proj = nn.Linear(
+		self.qkv_proj = ParallelLinear(
 			config.model_dim,
 			(q_heads + k_heads + v_heads) * head_dim,
 			dtype=dtype,
@@ -97,7 +94,7 @@ class OpenELMMultiHeadCausalAttention(FlaxAttentionModule):
 			self.q_norm = None
 			self.k_norm = None
 
-		self.out_proj = nn.Linear(
+		self.out_proj = ParallelLinear(
 			q_heads * head_dim,
 			config.model_dim,
 			dtype=dtype,
@@ -289,7 +286,7 @@ class OpenELMFeedForwardNetwork(nn.Module):
 		)
 		if config.ffn_with_glu:
 			# FFN with Gated linear unit, as described in https://arxiv.org/abs/2002.05202v1.
-			self.proj_1 = nn.Linear(
+			self.proj_1 = ParallelLinear(
 				config.model_dim,
 				2 * intermediate_dim,
 				use_bias=False,
@@ -300,7 +297,7 @@ class OpenELMFeedForwardNetwork(nn.Module):
 				kernel_init=jax.nn.initializers.normal(config.initializer_range),
 				**get_dot_general_by_bits(config.bits, config.easy_method),
 			)
-			self.proj_2 = nn.Linear(
+			self.proj_2 = ParallelLinear(
 				intermediate_dim,
 				config.model_dim,
 				use_bias=False,
@@ -313,7 +310,7 @@ class OpenELMFeedForwardNetwork(nn.Module):
 			)
 			self.ffn_with_glu = True
 		else:
-			self.proj_1 = nn.Linear(
+			self.proj_1 = ParallelLinear(
 				config.model_dim,
 				intermediate_dim,
 				use_bias=False,
@@ -324,7 +321,7 @@ class OpenELMFeedForwardNetwork(nn.Module):
 				kernel_init=jax.nn.initializers.normal(config.initializer_range),
 				**get_dot_general_by_bits(config.bits, config.easy_method),
 			)
-			self.proj_2 = nn.Linear(
+			self.proj_2 = ParallelLinear(
 				intermediate_dim,
 				config.model_dim,
 				use_bias=False,
@@ -523,7 +520,7 @@ class OpenELMModel(EasyDeLBaseModule):
 		if config.share_input_output_layers:
 			self.classifier = None
 		else:
-			self.classifier = nn.Linear(
+			self.classifier = ParallelLinear(
 				config.model_dim,
 				config.vocab_size,
 				use_bias=False,
@@ -649,7 +646,7 @@ class OpenELMForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.model_dim,
 			config.vocab_size,
 			dtype=dtype,

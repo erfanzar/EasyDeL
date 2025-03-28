@@ -32,6 +32,7 @@ from easydel.infra.utils import (
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
 
 from .pixtral_configuration import PixtralVisionConfig
@@ -158,7 +159,7 @@ class PixtralMLP(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		linear_class = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
@@ -217,7 +218,7 @@ class PixtralAttention(FlaxAttentionModule):
 			assert self.config.num_attention_heads == self.config.num_attention_heads
 
 		linear_class = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
@@ -513,7 +514,7 @@ class PixtralTransformer(nn.Module):
 @register_module(
 	TaskType.BASE_VISION,
 	config=PixtralVisionConfig,
-	model_type="pixtral", 
+	model_type="pixtral",
 )
 class PixtralVisionModel(EasyDeLBaseModule):
 	def __init__(

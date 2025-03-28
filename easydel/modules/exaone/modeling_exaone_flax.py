@@ -37,9 +37,11 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
-from easydel.modules.exaone.exaone_configuration import ExaoneConfig as ExaoneConfig
 from easydel.utils.helpers import get_logger
+
+from .exaone_configuration import ExaoneConfig
 
 logger = get_logger(__name__)
 
@@ -56,7 +58,7 @@ class ExaoneGatedMLP(nn.Module):
 	) -> None:
 		self.config = config
 		linear = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			use_bias=False,
 			dtype=dtype,
 			param_dtype=param_dtype,
@@ -104,7 +106,7 @@ class ExaoneAttentionInner(FlaxAttentionModule):
 			)
 
 		linear = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
@@ -555,7 +557,7 @@ class ExaoneForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			dtype=dtype,
@@ -645,7 +647,7 @@ class ExaoneForSequenceClassification(EasyDeLBaseModule):
 		assert hasattr(config, "num_labels"), (
 			"in order to use `SequenceClassification` Models in `EasyDeL` you first need to attach `num_labels` to model `config`"
 		)
-		self.score = nn.Linear(
+		self.score = ParallelLinear(
 			self.config.hidden_size,
 			config.num_labels,
 			dtype=dtype,

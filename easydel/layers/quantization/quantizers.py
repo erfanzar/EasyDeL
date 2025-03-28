@@ -23,7 +23,7 @@ from eformer.ops.quantization import Array8B, ArrayNF4
 from flax import nnx as nn
 
 from easydel.infra.etils import EasyDeLPlatforms, EasyDeLQuantizationMethods
-
+from easydel.layers.linear import ParallelLinear
 from .linear_8bit import Linear8bit
 from .linear_nf4 import LinearNF4
 
@@ -136,11 +136,11 @@ class EasyQuantizer:
 		pattern = re.compile(quantization_pattern)
 
 		with tqdm.tqdm(
-			total=len([p[0] for p in iter_module_search(model, nn.Linear)]),
+			total=len([p[0] for p in iter_module_search(model, ParallelLinear)]),
 			desc=f"Quantizing to {self.quantization_method}",
 			disable=not verbose,
 		) as pbar:
-			for path, _ in iter_module_search(model, nn.Linear):
+			for path, _ in iter_module_search(model, ParallelLinear):
 				if pattern.search(".".join([str(p) for p in path])):
 					set_module_from_path(
 						model=model,

@@ -30,12 +30,11 @@ from easydel.infra.modeling_outputs import (
 	FlaxCLIPTextModelOutput,
 	FlaxImageClassifierOutput,
 )
-from easydel.infra.utils import (
-	ACT2FN,
-	control_mlp_sharding,
-)
+from easydel.infra.utils import ACT2FN, control_mlp_sharding
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.modules.clip.clip_configuration import (
+from easydel.layers.linear import ParallelLinear
+
+from .clip_configuration import (
 	CLIPConfig,
 	CLIPTextConfig,
 	CLIPVisionConfig,
@@ -186,7 +185,7 @@ class CLIPAttention(FlaxAttentionModule):
 
 		self.dropout = config.attention_dropout
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
@@ -298,7 +297,7 @@ class CLIPMLP(nn.Module):
 		self.rngs = rngs
 		self.activation_fn = ACT2FN[config.hidden_act]
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			use_bias=True,
 			dtype=dtype,
 			param_dtype=param_dtype,
@@ -722,7 +721,7 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.text_projection = nn.Linear(
+		self.text_projection = ParallelLinear(
 			config.hidden_size,
 			config.projection_dim,
 			use_bias=False,
@@ -843,7 +842,7 @@ class CLIPForImageClassification(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.classifier = nn.Linear(
+		self.classifier = ParallelLinear(
 			config.vision_config.hidden_size,
 			config.num_labels,
 			rngs=rngs,
@@ -943,7 +942,7 @@ class CLIPModel(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 		linear_class = partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			kernel_init=jax.nn.initializers.normal(0.02),

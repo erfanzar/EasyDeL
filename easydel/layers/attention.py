@@ -28,18 +28,31 @@ from chex import Array
 from eformer.escale import with_sharding_constraint
 from jax import NamedSharding, lax, random
 from jax import numpy as jnp
-from jax.sharding import PartitionSpec
 from jax import tree_util as jtu
+from jax.sharding import PartitionSpec
+
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.layers.caching import TransformerCacheView
 from easydel.layers.quantization.quantizers import EasyQuantizer
 from easydel.utils.helpers import get_logger
+
 from .attention_operator import AttentionMetadata, AttentionOutput, AttentionRegistry
 
 logger = get_logger(__name__)
 
 
 def _get_jax_dtype_from_string(dtype_string):
+	"""
+	Converts a string representation of a JAX dtype back to the JAX dtype object.
+
+	Args:
+	    dtype_string (str): The string representation of the JAX dtype
+	                        (e.g., "<class 'jax.numpy.float32'>").
+
+	Returns:
+	    jnp.dtype or str: The corresponding JAX dtype object (e.g., jnp.float32)
+	                      if found, otherwise returns the original string.
+	"""
 	dtype_mapping = {
 		"<class 'jax.numpy.float32'>": jnp.float32,
 		"<class 'jax.numpy.float64'>": jnp.float64,
@@ -53,6 +66,21 @@ def _get_jax_dtype_from_string(dtype_string):
 
 
 class AttentionMechanisms(str, Enum):
+	"""
+	Enumeration of available attention mechanisms.
+
+	Attributes:
+	    AUTO: Automatically selects the best mechanism based on the backend.
+	    FLASH_ATTN2: FlashAttention-2 implementation.
+	    RING: RingAttention implementation.
+	    VANILLA: Standard dot-product attention.
+	    SPLASH: SplashAttention implementation (optimized for TPUs).
+	    CUDNN: cuDNN implementation (GPU specific).
+	    BLOCKWISE: Blockwise attention computation.
+	    SDPA: Scaled Dot Product Attention (potentially uses JAX native SDPA).
+	    CUDA_FLASH_ATTN2: CUDA specific FlashAttention-2 implementation.
+	"""
+
 	AUTO = "auto"
 	FLASH_ATTN2 = "flash_attn2"
 	RING = "ring"
@@ -65,6 +93,17 @@ class AttentionMechanisms(str, Enum):
 
 
 def tpu_version_check(version: str = "v4"):
+	"""
+	Checks if the local JAX device matches the specified TPU version.
+
+	Args:
+	    version (str, optional): The TPU version string to check against (e.g., "v4").
+	                             Defaults to "v4".
+
+	Returns:
+	    bool: True if the device kind of the first local device contains the
+	          specified version string (case-insensitive), False otherwise.
+	"""
 	if version in getattr(jax.local_devices()[0], "device_kind", "").lower():
 		return True
 
@@ -73,10 +112,12 @@ def tpu_version_check(version: str = "v4"):
 
 def get_optimal_config() -> tp.Tuple[AttentionMechanisms, jnp.dtype]:
 	"""
-	Returns the optimal attention mechanism and dtype for the current JAX device.
+	Determines the recommended attention mechanism and dtype for the current JAX backend.
 
 	Returns:
-	    A tuple of (attention_mechanism, dtype)
+	    tp.Tuple[AttentionMechanisms, jnp.dtype]: A tuple containing the recommended
+	                                               AttentionMechanisms enum member and
+	                                               the recommended jnp.dtype.
 	"""
 
 	match jax.default_backend():
@@ -122,8 +163,13 @@ class FlexibleAttentionModule(nn.Module):
 	The FlexibleAttentionModule class is a crucial component within EasyDeL, responsible for managing and optimizing attention
 	computations. It provides a user-friendly way to select and execute different attention mechanisms,
 	leveraging JAX's sharding capabilities and offering performance enhancements through specialized implementations
-	 like FlashAttention and SplashAttention. Its ability to handle block-wise computations and customization options
-	  makes it adaptable to a variety of model architectures and hardware configurations.
+	like FlashAttention and SplashAttention. Its ability to handle block-wise computations and customization options
+	makes it adaptable to a variety of model architectures and hardware configurations.
+	Attributes:
+		impl (AttentionBackend): The chosen attention implementation backend instance.
+		deterministic (bool): Flag indicating whether dropout should be applied (False) or not (True).
+													Currently hardcoded to True.
+		metadata (AttentionMetadata): Metadata derived from the configuration, used by the backend.
 	"""
 
 	def __init__(
@@ -132,6 +178,16 @@ class FlexibleAttentionModule(nn.Module):
 		softmax_scale: float,
 		dropout_prob: float = 0.0,
 	):
+		"""
+		Initializes the FlexibleAttentionModule.
+
+		Args:
+		    base_config (EasyDeLBaseConfig): Configuration object containing attention settings
+		                                     (mechanism, dtype, sharding, etc.).
+		    softmax_scale (float): The scaling factor to apply before the softmax function.
+		    dropout_prob (float, optional): The dropout probability for attention weights.
+		                                     Defaults to 0.0.
+		"""
 		if isinstance(base_config.attn_dtype, str):
 			base_config.attn_dtype = _get_jax_dtype_from_string(base_config.attn_dtype)
 		if isinstance(base_config.attn_softmax_dtype, str):
@@ -168,6 +224,27 @@ class FlexibleAttentionModule(nn.Module):
 		causal: bool = True,
 		dropout_rng: tp.Optional[random.PRNGKey] = None,
 	) -> AttentionOutput:
+		"""
+		Performs the attention computation using the selected backend implementation.
+
+		Args:
+		    query_states (Array): Query tensor.
+		    key_states (Array): Key tensor.
+		    value_states (Array): Value tensor.
+		    bias (tp.Optional[Array], optional): Optional attention bias. Defaults to None.
+		    init_bias (tp.Optional[tp.Callable[[], Array]], optional): Optional function to initialize bias.
+		                                                               Defaults to None.
+		    attention_mask (tp.Optional[Array], optional): Mask to prevent attention to certain positions.
+		                                                    Defaults to None.
+		    segment_ids (tp.Optional[Array], optional): Segment IDs for segment-based attention (RingAttention).
+		                                                Defaults to None.
+		    causal (bool, optional): If True, applies a causal mask. Defaults to True.
+		    dropout_rng (tp.Optional[random.PRNGKey], optional): PRNG key for dropout. Defaults to None.
+
+		Returns:
+		    AttentionOutput: An object containing the attention output tensor and potentially
+		                     attention weights (depending on the backend).
+		"""
 		return jtu.tree_map(
 			lambda x: x.astype(self.impl.metadata.runtime_dtype),
 			self.impl(
@@ -188,13 +265,32 @@ class FlexibleAttentionModule(nn.Module):
 
 
 SC = tp.TypeVar("SC")
+"""Type variable for configuration objects."""
 
 
 class FlaxAttentionModule(nn.Module):
-	def __init__(
-		self,
-		config: SC,
-	):
+	"""
+	Base class for Flax attention modules in EasyDeL, providing common utilities.
+
+	This class offers helper functions and attributes commonly needed by attention
+	implementations within Flax, such as handling KV caching, sharding, mask manipulation,
+	and head manipulation. Concrete attention implementations often inherit from this class.
+
+	Attributes:
+	    config (SC | EasyDeLBaseConfig): Configuration object for the attention module.
+	    cached_key (nn.Cache[Array] | None): Flax Cache for storing past key states (wont be used).
+	    cached_value (nn.Cache[Array] | None): Flax Cache for storing past value states (wont be used).
+	    cache_index (nn.Cache[Array] | None): Flax Cache for tracking the current index in the cache (wont be used).
+	"""
+
+	def __init__(self, config: SC):
+		"""
+		Initializes the FlaxAttentionModule.
+
+		Args:
+		    config (SC): The configuration object for this attention module.
+		                 It should conform to or include attributes from EasyDeLBaseConfig.
+		"""
 		super().__init__()
 		self.config: SC | EasyDeLBaseConfig = config
 
@@ -208,6 +304,19 @@ class FlaxAttentionModule(nn.Module):
 		cache_view: TransformerCacheView,
 		sliding_window: int,
 	):
+		"""
+		Applies a sliding window mask to the attention mask, considering cache state.
+
+		Args:
+		    attention_mask (jax.Array): The original attention mask.
+		    cache_view (TransformerCacheView): The current view of the KV cache.
+		    sliding_window (int): The size of the sliding window.
+
+		Returns:
+		    tp.Tuple[jax.Array, tp.Callable[[], jax.Array]]:
+		        - The attention mask combined with the sliding window mask.
+		        - A function (`init_attention_bias`) to create the corresponding attention bias.
+		"""
 		attention_mask = jnp.logical_and(
 			self._create_sliding_mask(
 				cache_pos=self.build_cache_pos(attention_mask, cache_view),
@@ -232,12 +341,32 @@ class FlaxAttentionModule(nn.Module):
 		attention_mask: jax.Array,
 		cache_view: TransformerCacheView = None,
 	) -> jax.Array:
+		"""
+		Calculates the position indices within the sequence for cache-aware operations.
+
+		Args:
+		    attention_mask (jax.Array): The attention mask (typically [batch, heads, q_len, k_len]).
+		    cache_view (TransformerCacheView, optional): The current KV cache view. Defaults to None.
+
+		Returns:
+		    jax.Array: An array representing the position of each token in the sequence,
+		               adjusted by the cache index if provided. Shape usually [batch, q_len].
+		"""
+
 		end_index = cache_view.index[0] if cache_view is not None else 0
 		inipos = jnp.cumsum(jnp.any(attention_mask, -1)[:, -1, :], axis=-1)
 		return (inipos - (inipos >= 1)) + end_index
 
 	@cached_property
 	def quantizer(self):
+		"""
+		Provides an EasyQuantizer instance based on the module's configuration.
+
+		Used for quantizing KV cache entries if enabled in the config.
+
+		Returns:
+		    EasyQuantizer: The quantizer instance.
+		"""
 		return EasyQuantizer(
 			quantization_method=self.config.kv_cache_quantization_method,
 			block_size=self.config.kv_cache_quantization_blocksize,
@@ -245,6 +374,14 @@ class FlaxAttentionModule(nn.Module):
 
 	@property
 	def default_key_value_sharding(self):
+		"""
+		Defines the default JAX sharding for key and value tensors.
+
+		Uses the partition specifications defined in the configuration's `partition_axis`.
+
+		Returns:
+		    NamedSharding: The default sharding configuration for K/V tensors.
+		"""
 		paxis = self.config.partition_axis
 		return NamedSharding(
 			mesh=self.config.mesh,
@@ -257,17 +394,30 @@ class FlaxAttentionModule(nn.Module):
 		)
 
 	def get_sharding_safely(self, tensor: jax.Array) -> PartitionSpec:
+		"""
+		Retrieves the PartitionSpec of a tensor, falling back to the default KV sharding.
+
+		Args:
+		    tensor (jax.Array): The tensor whose sharding spec is needed.
+
+		Returns:
+		    PartitionSpec: The sharding specification of the tensor.
+		"""
 		return getattr(tensor, "sharding", self.default_key_value_sharding).spec
 
 	@staticmethod
 	def _transpose_sequence_head(*args):
-		"""The _transpose_sequence_head function transposes the query, key and value matrices.
+		"""
+		Transposes the sequence and head dimensions of input tensors.
+
+		Typically used to change tensors from [Batch, Seq, Heads, Dim] to
+		[Batch, Heads, Seq, Dim] or vice-versa.
 
 		Args:
-		    *args: arrays to transpose
+		    *args: A variable number of arrays, each expected to have at least 4 dimensions.
 
 		Returns:
-		    The transpose of the query, key and value matrices
+		    map: A map object yielding the transposed arrays.
 		"""
 		return map(lambda x: jnp.transpose(x, (0, 2, 1, 3)), args)
 
@@ -282,6 +432,27 @@ class FlaxAttentionModule(nn.Module):
 		causal_mask: tp.Optional[Array] = None,
 		token_type_ids: tp.Optional[Array] = None,
 	) -> tp.Tuple[Array, Array, Array]:
+		"""
+		Updates the KV cache with new key/value states and adjusts the attention mask.
+
+		Internal helper function used when KV caching is enabled.
+
+		Args:
+		    query (Array): Current query states.
+		    key (Array): Current key states.
+		    value (Array): Current value states.
+		    cache_view (TransformerCacheView): The view into the KV cache.
+		    attention_mask (Array): Base attention mask.
+		    causal_mask (tp.Optional[Array], optional): Causal mask. Defaults to None.
+		    token_type_ids (tp.Optional[Array], optional): Token type IDs for segment-based masking.
+		                                                    Defaults to None.
+
+		Returns:
+		    tp.Tuple[Array, Array, Array]:
+		        - Updated key cache tensor.
+		        - Updated value cache tensor.
+		        - Updated attention mask reflecting the cached sequence length.
+		"""
 		num_updated_cache_vectors = query.shape[1]
 		end_index = cache_view.index[0]
 
@@ -360,6 +531,18 @@ class FlaxAttentionModule(nn.Module):
 		cache_length: int,
 		sliding_windows: int,
 	):
+		"""
+		Creates a sliding window attention mask relative to cache positions.
+
+		Args:
+		    cache_pos (jnp.ndarray): Position indices of query tokens relative to the start.
+		    curr_index (int): The current index offset in the KV cache.
+		    cache_length (int): The total length of the KV cache buffer.
+		    sliding_windows (int): The size of the sliding window.
+
+		Returns:
+		    jnp.ndarray: A boolean mask where True indicates positions within the sliding window.
+		"""
 		total_tokens = curr_index + cache_pos.shape[1]
 
 		def _reconstruct_rotated_cache_positions():
@@ -397,6 +580,31 @@ class FlaxAttentionModule(nn.Module):
 		fcm_mask: tp.Optional[Array] = None,
 		sliding_windows: tp.Optional[int] = None,
 	) -> tp.Tuple[Array, Array, Array, tp.Callable[[], Array]]:
+		"""
+		Prepares inputs for attention calculation, handling KV caching and mask merging.
+
+		This function combines the current query, key, and value with cached states (if applicable),
+		merges various masks (attention, causal, FCM, sliding window), and returns the final
+		key, value, attention mask, and a function to initialize the attention bias.
+
+		Args:
+		    query (Array): Current query states [Batch, q_len, Heads, Dim].
+		    key (Array): Current key states [Batch, kv_len, Heads, Dim].
+		    value (Array): Current value states [Batch, kv_len, Heads, Dim].
+		    attention_mask (Array): Base attention mask (e.g., padding mask) [Batch, kv_len] or compatible.
+		    cache_view (tp.Optional[TransformerCacheView], optional): View into the KV cache. If None, caching is disabled. Defaults to None.
+		    causal_mask (tp.Optional[Array], optional): Causal mask [1, 1, q_len, kv_len]. Defaults to None.
+		    token_type_ids (tp.Optional[Array], optional): Token type IDs for segment masking [Batch, q_len]. Defaults to None.
+		    fcm_mask (tp.Optional[Array], optional): Fused-Context-Mask (specific use case) [Batch, 1, q_len, kv_len]. Defaults to None.
+		    sliding_windows (tp.Optional[int], optional): Size of the sliding attention window. If None, not applied. Defaults to None.
+
+		Returns:
+		    tp.Tuple[Array, Array, Array, tp.Callable[[], Array]]:
+		        - key_states (Array): Final key states (potentially from cache).
+		        - value_states (Array): Final value states (potentially from cache).
+		        - attention_mask (Array): The final combined attention mask [Batch, Heads, q_len, kv_len].
+		        - init_attention_bias (Callable): Function to create the attention bias tensor.
+		"""
 		if attention_mask is not None:
 			if attention_mask.dtype != jnp.bool:
 				warnings.warn("attention_mask should be a boolean array", stacklevel=1)
@@ -474,13 +682,17 @@ class FlaxAttentionModule(nn.Module):
 
 	def shard_attention_prod(self, attn_output: jax.Array) -> jax.Array:
 		"""
-		shards attention output before passing that to output_proj
+		Applies sharding constraints to the attention output tensor.
+
+		This is typically done before projecting the attention output back to the
+		hidden dimension size.
 
 		Args:
-		    attn_output (jax.Array): merged output of dot product attention with 3 dims, (batch, seqlen, hidden_size).
+		    attn_output (jax.Array): The output from the attention mechanism, usually
+		                             with shape [Batch, SeqLen, NumHeads * DimPerHead].
 
 		Returns:
-		    jax.Array: sharded version of `attn_output`
+		    jax.Array: The input tensor with applied sharding constraints based on the config.
 		"""
 		return with_sharding_constraint(
 			arr=attn_output,
@@ -499,6 +711,8 @@ class FlaxAttentionModule(nn.Module):
 		"""
 		Merges the attention heads into a single hidden state tensor.
 
+		Reshapes [Batch, SeqLen, NumHeads, DimPerHead] -> [Batch, SeqLen, NumHeads * DimPerHead].
+
 		Args:
 		    hidden_states (jax.Array): The hidden states with separate head dimensions.
 
@@ -509,6 +723,21 @@ class FlaxAttentionModule(nn.Module):
 
 	@staticmethod
 	def repeat_key_value(key, value, num_reps: int):
+		"""
+		Repeats key and value tensors for Grouped Query Attention (GQA).
+
+		Expands the head dimension by repeating `num_reps` times.
+		Uses einops for concise repetition.
+
+		Args:
+		    key (Array): Key tensor [Batch, Seq, NumKVHeads, Dim].
+		    value (Array): Value tensor [Batch, Seq, NumKVHeads, Dim].
+		    num_reps (int): The number of times to repeat each KV head (num_attention_heads / num_kv_heads).
+
+		Returns:
+		    tp.Tuple[Array, Array]: Repeated key and value tensors, each with shape
+		                            [Batch, Seq, NumKVHeads * num_reps, Dim].
+		"""
 		with jax.named_scope("easydel-flax-attention-repeat-kvheads"):
 			key = einops.repeat(key, "b s h d -> b s (h r) d", r=num_reps)
 			value = einops.repeat(value, "b s h d -> b s (h r) d", r=num_reps)

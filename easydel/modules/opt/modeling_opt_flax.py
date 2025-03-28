@@ -48,7 +48,9 @@ from easydel.infra.modeling_outputs import (
 from easydel.infra.utils import ACT2FN, control_mlp_sharding
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.modules.opt.opt_configuration import OPTConfig as OPTConfig
+from easydel.layers.linear import ParallelLinear
+
+from .opt_configuration import OPTConfig
 
 
 class OPTAttention(FlaxAttentionModule):
@@ -86,7 +88,7 @@ class OPTAttention(FlaxAttentionModule):
 			)
 
 		linear = partial(
-			nn.Linear,
+			ParallelLinear,
 			use_bias=bias,
 			dtype=dtype,
 			param_dtype=param_dtype,
@@ -237,7 +239,7 @@ class OPTDecoderLayer(nn.Module):
 			rngs=rngs,
 			epsilon=1e-05,
 		)
-		self.fc1 = nn.Linear(
+		self.fc1 = ParallelLinear(
 			self.embed_dim,
 			self.embed_dim,
 			dtype=dtype,
@@ -246,7 +248,7 @@ class OPTDecoderLayer(nn.Module):
 			kernel_init=nn.initializers.normal(config.init_std),
 			rngs=rngs,
 		)
-		self.fc2 = nn.Linear(
+		self.fc2 = ParallelLinear(
 			self.embed_dim,
 			self.embed_dim,
 			dtype=dtype,
@@ -392,7 +394,7 @@ class OPTDecoder(EasyDeLBaseModule):
 		)
 
 		if self.config.word_embed_proj_dim != self.config.hidden_size:
-			self.project_in = nn.Linear(
+			self.project_in = ParallelLinear(
 				self.config.word_embed_proj_dim,
 				self.config.hidden_size,
 				use_bias=False,
@@ -401,7 +403,7 @@ class OPTDecoder(EasyDeLBaseModule):
 				precision=precision,
 				rngs=rngs,
 			)
-			self.project_out = nn.Linear(
+			self.project_out = ParallelLinear(
 				self.config.hidden_size,
 				self.config.word_embed_proj_dim,
 				use_bias=False,
@@ -609,7 +611,7 @@ class OPTForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 			offset=offset,
 		)
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			use_bias=False,

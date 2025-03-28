@@ -24,9 +24,10 @@ from jax import numpy as jnp
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import ModelOutput
-from easydel.modules.rwkv.rwkv_configuration import RwkvConfig as RwkvConfig
+from easydel.layers.linear import ParallelLinear
 from easydel.utils import traversals as etr
 
+from .rwkv_configuration import RwkvConfig as RwkvConfig
 
 # NOTE:Updated but wont work forsure, check this later.
 
@@ -143,7 +144,7 @@ class RwkvSelfAttention(nn.Module):
 		self.time_mix_value = nn.Param(time_mix_value.astype(self.param_dtype))
 		self.time_mix_receptance = nn.Param(time_mix_receptance.astype(self.param_dtype))
 
-		self.key = nn.Linear(
+		self.key = ParallelLinear(
 			hidden_size,
 			attention_hidden_size,
 			use_bias=False,
@@ -152,7 +153,7 @@ class RwkvSelfAttention(nn.Module):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.value = nn.Linear(
+		self.value = ParallelLinear(
 			hidden_size,
 			attention_hidden_size,
 			use_bias=False,
@@ -161,7 +162,7 @@ class RwkvSelfAttention(nn.Module):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.receptance = nn.Linear(
+		self.receptance = ParallelLinear(
 			hidden_size,
 			attention_hidden_size,
 			use_bias=False,
@@ -170,7 +171,7 @@ class RwkvSelfAttention(nn.Module):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.output = nn.Linear(
+		self.output = ParallelLinear(
 			attention_hidden_size,
 			hidden_size,
 			use_bias=False,
@@ -262,7 +263,7 @@ class RwkvFeedForward(nn.Module):
 		self.time_mix_key = nn.Param(time_mix_key.astype(self.param_dtype))
 		self.time_mix_receptance = nn.Param(time_mix_receptance.astype(self.param_dtype))
 
-		self.key = nn.Linear(
+		self.key = ParallelLinear(
 			hidden_size,
 			intermediate_size,
 			use_bias=False,
@@ -271,7 +272,7 @@ class RwkvFeedForward(nn.Module):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.receptance = nn.Linear(
+		self.receptance = ParallelLinear(
 			intermediate_size,
 			hidden_size,
 			use_bias=False,
@@ -280,7 +281,7 @@ class RwkvFeedForward(nn.Module):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.value = nn.Linear(
+		self.value = ParallelLinear(
 			intermediate_size,
 			hidden_size,
 			use_bias=False,
@@ -562,7 +563,7 @@ class RwkvForCausalLM(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.head = nn.Linear(
+		self.head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			use_bias=False,

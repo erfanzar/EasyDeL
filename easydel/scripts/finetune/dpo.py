@@ -18,9 +18,11 @@ from dataclasses import field
 import jax
 from datasets import load_dataset
 from jax import numpy as jnp
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 import easydel as ed
+from easydel.infra.factory import registry
+from easydel.modules import *  # noqa # init
 from easydel.utils import traversals as etr
 
 
@@ -149,11 +151,32 @@ def main():
 		partition_axis=ed.PartitionAxis(),
 	)
 	# Initialize model
-	model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
-		runtime_config.repo_id,
-		**load_kwrags,
-	)
-	ref_model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
+
+	hf_config = AutoConfig.from_pretrained(runtime_config.repo_id)
+	avails = [
+		v.module.__name__
+		for v in registry.task_registry[ed.TaskType.IMAGE_TEXT_TO_TEXT].values()
+	]
+
+	if hf_config.architectures and any(
+		arch in avails for arch in hf_config.architectures
+	):
+		load_module = ed.AutoEasyDeLModelForImageTextToText
+	else:
+		load_module = ed.AutoEasyDeLModelForCausalLM
+
+	model = load_module.from_pretrained(runtime_config.repo_id, **load_kwrags)
+
+	hf_config = AutoConfig.from_pretrained(runtime_config.refrence_model_repo_id)
+
+	if hf_config.architectures and any(
+		arch in avails for arch in hf_config.architectures
+	):
+		load_module = ed.AutoEasyDeLModelForImageTextToText
+	else:
+		load_module = ed.AutoEasyDeLModelForCausalLM
+
+	ref_model = load_module.from_pretrained(
 		runtime_config.refrence_model_repo_id,
 		**load_kwrags,
 	)

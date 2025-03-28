@@ -37,8 +37,10 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm as RMSNorm
-from easydel.modules.phi3.phi3_configuration import Phi3Config as Phi3Config
+
+from .phi3_configuration import Phi3Config
 
 
 class Phi3MLP(nn.Module):
@@ -56,7 +58,7 @@ class Phi3MLP(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		linear_class = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			use_bias=False,
@@ -117,7 +119,7 @@ class Phi3Attention(FlaxAttentionModule):
 			)
 
 		linear_class = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			use_bias=False,
 			precision=precision,
 			dtype=dtype,
@@ -562,7 +564,7 @@ class Phi3ForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 		self.vocab_size = self.config.vocab_size
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			use_bias=False,

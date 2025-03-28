@@ -34,8 +34,9 @@ from easydel.infra.utils import (
 )
 from easydel.layers.caching import MambaCache
 from easydel.layers.caching.mamba_cache import MambaCacheMetaData, MambaCacheView
+from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm as MambaRMSNorm
-from easydel.modules.mamba.mamba_configuration import MambaConfig as MambaConfig
+from .mamba_configuration import MambaConfig as MambaConfig
 from easydel.utils import traversals as etr
 
 
@@ -219,7 +220,7 @@ class MambaMixer(nn.Module):
 		inv_dt = dt + jnp.log(-jnp.expm1(-dt))
 
 		linear_class = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
@@ -603,7 +604,7 @@ class MambaForCausalLM(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			use_bias=False,

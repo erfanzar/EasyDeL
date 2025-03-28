@@ -21,6 +21,7 @@ from flax import nnx as nn
 from jax.sharding import Mesh
 
 from easydel.layers.caching.transformer_cache import TransformerCache
+from easydel.layers.linear import ParallelLinear
 
 from ..base_config import EasyDeLBaseConfig
 from ..etils import EasyDeLQuantizationMethods
@@ -70,7 +71,7 @@ def get_module_repr(module: nn.Module) -> str:
 	"""Get a string representation of module parameters."""
 	module_name = type(module).__name__
 
-	if isinstance(module, nn.Linear):
+	if isinstance(module, ParallelLinear):
 		in_features = (
 			(module.kernel.shape[0] if hasattr(module.kernel, "shape") else "Null")
 			if hasattr(module, "kernel")

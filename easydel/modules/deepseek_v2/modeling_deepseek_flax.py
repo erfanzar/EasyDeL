@@ -39,14 +39,17 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
-from easydel.modules.deepseek_v2.deepseek_configuration import (
-	DeepseekV2Config as DeepseekV2Config,
-)
+
+from .deepseek_configuration import DeepseekV2Config
 
 
 def yarn_find_correction_dim(
-	num_rotations, dim, base=10000, max_position_embeddings=2048
+	num_rotations,
+	dim,
+	base=10000,
+	max_position_embeddings=2048,
 ):
 	return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (
 		2 * math.log(base)
@@ -190,7 +193,7 @@ class FlaxDeepseekV2MLP(nn.Module):
 	):
 		self.config = config
 		linear = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			use_bias=False,
 			dtype=dtype,
 			param_dtype=param_dtype,
@@ -432,13 +435,13 @@ class FlaxDeepseekV2Attention(FlaxAttentionModule):
 		self.is_causal = True
 
 		linear = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
 		)
 		if self.config.q_lora_rank is None:
-			self.q_proj = nn.Linear(
+			self.q_proj = ParallelLinear(
 				self.hidden_size,
 				self.num_heads * self.q_head_dim,
 				use_bias=False,
@@ -976,7 +979,7 @@ class DeepseekV2ForCausalLM(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			dtype=dtype,

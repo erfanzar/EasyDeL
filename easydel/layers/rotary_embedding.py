@@ -16,8 +16,6 @@ from __future__ import annotations
 
 import math
 import typing as tp
-
-# from functools import partial
 from functools import partial
 
 import chex
@@ -33,6 +31,20 @@ def _yarn_find_correction_dim(
 	base: float = 10000,
 	max_position_embeddings: int = 2048,
 ) -> float:
+	"""
+	Calculates the correction dimension for YaRN scaling.
+
+	Internal helper function for YaRN.
+
+	Args:
+	    num_rotations (int): Number of rotations.
+	    dim (int): The dimension of the embeddings.
+	    base (float, optional): The base value for positional encoding. Defaults to 10000.
+	    max_position_embeddings (int, optional): The maximum sequence length. Defaults to 2048.
+
+	Returns:
+	    float: The calculated correction dimension.
+	"""
 	return (
 		dim
 		* jnp.log(
@@ -49,6 +61,22 @@ def _yarn_find_correction_range(
 	base: float = 10000,
 	max_position_embeddings: int = 2048,
 ) -> tp.Tuple[int, int]:
+	"""
+	Finds the correction range for YaRN scaling based on low and high rotation frequencies.
+
+	Internal helper function for YaRN.
+
+	Args:
+	    low_rot (int): Lower rotation frequency boundary.
+	    high_rot (int): Higher rotation frequency boundary.
+	    dim (int): The dimension of the embeddings.
+	    base (float, optional): The base value for positional encoding. Defaults to 10000.
+	    max_position_embeddings (int, optional): The maximum sequence length. Defaults to 2048.
+
+	Returns:
+	    tp.Tuple[int, int]: A tuple containing the lower and upper bounds of the correction range,
+	                        clipped between 0 and dim-1.
+	"""
 	hr = jnp.ceil(
 		_yarn_find_correction_dim(
 			high_rot,
@@ -75,6 +103,22 @@ def _yarn_linear_ramp_mask(
 	dim: int,
 	dtype: jnp.dtype,
 ) -> jnp.ndarray:
+	"""
+	Creates a linear ramp mask for YaRN scaling.
+
+	Internal helper function for YaRN. Generates a mask that ramps linearly from 0 to 1
+	between the `low` and `high` dimension indices.
+
+	Args:
+	    low (float): The starting dimension index for the ramp.
+	    high (float): The ending dimension index for the ramp.
+	    dim (int): The total dimension of the mask.
+	    dtype (jnp.dtype): The data type for the mask array.
+
+	Returns:
+	    jnp.ndarray: A 1D array of shape (dim,) representing the linear ramp mask,
+	                 clipped between 0 and 1.
+	"""
 	high = jax.lax.cond(low == high, lambda x: x + 0.001, lambda x: x, high)
 	linear_func = (jnp.arange(dim, dtype=dtype) - low) / (high - low)
 	ramp_func = jnp.clip(linear_func, 0, 1)
@@ -83,6 +127,17 @@ def _yarn_linear_ramp_mask(
 
 @jax.named_scope("easydel-rotary-yarn-get-mscale")
 def _yarn_get_mscale(scale: float = 1) -> float:
+	"""
+	Calculates the mscale factor for YaRN context extension method.
+
+	Internal helper function for YaRN.
+
+	Args:
+	    scale (float, optional): The scaling factor. Defaults to 1.
+
+	Returns:
+	    float: The calculated mscale value. Returns 1.0 if scale <= 1.
+	"""
 	if scale <= 1:
 		return 1.0
 	return 0.1 * jnp.log(scale) + 1.0
@@ -90,6 +145,18 @@ def _yarn_get_mscale(scale: float = 1) -> float:
 
 @jax.named_scope("easydel-rotary-rotate-neox")
 def _rotate_neox(x: jnp.ndarray) -> jnp.ndarray:
+	"""
+	Applies the Neox-style rotation to the input array.
+
+	Splits the last dimension in half and concatenates the negated second half
+	with the first half.
+
+	Args:
+	    x (jnp.ndarray): The input array.
+
+	Returns:
+	    jnp.ndarray: The rotated array.
+	"""
 	x1 = x[..., : x.shape[-1] // 2]
 	x2 = x[..., x.shape[-1] // 2 :]
 	return jnp.concatenate((-x2, x1), axis=-1)
@@ -97,6 +164,17 @@ def _rotate_neox(x: jnp.ndarray) -> jnp.ndarray:
 
 @jax.named_scope("easydel-rotary-rotate-gptj")
 def _rotate_gptj(x: jnp.ndarray) -> jnp.ndarray:
+	"""
+	Applies the GPT-J-style rotation to the input array.
+
+	Interleaves the negated odd-indexed elements with the even-indexed elements.
+
+	Args:
+	    x (jnp.ndarray): The input array.
+
+	Returns:
+	    jnp.ndarray: The rotated array.
+	"""
 	x1 = x[..., ::2]
 	x2 = x[..., 1::2]
 	x = jnp.stack((-x2, x1), axis=-1)
@@ -111,12 +189,22 @@ def _apply_rotary_emb(
 	is_neox_style: bool,
 ) -> jnp.ndarray:
 	"""
+	Applies rotary positional embedding to the input tensor.
+
 	Args:
-	    x: [num_tokens, num_heads, head_size]
-	    cos: [num_tokens, head_size // 2]
-	    sin: [num_tokens, head_size // 2]
-	    is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
-	        positional embeddings.
+	    x (jnp.ndarray): Input tensor, e.g., query or key. Expected shape
+	                     [..., num_tokens, head_size] or similar.
+	    cos (jnp.ndarray): Cosine components of the embedding. Expected shape
+	                       compatible for broadcasting with `x` after rotation,
+	                       e.g., [..., num_tokens, head_size//2].
+	    sin (jnp.ndarray): Sine components of the embedding. Expected shape
+	                       compatible for broadcasting with `x` after rotation,
+	                       e.g., [..., num_tokens, head_size//2].
+	    is_neox_style (bool): Whether to use Neox-style rotation (`_rotate_neox`)
+	                          or GPT-J-style rotation (`_rotate_gptj`).
+
+	Returns:
+	    jnp.ndarray: The tensor with rotary embeddings applied.
 	"""
 	cos = cos[:, :, None].astype(x.dtype)
 	sin = sin[:, :, None].astype(x.dtype)
@@ -137,10 +225,34 @@ def _apply_rotary_emb(
 
 
 AVAILABLE_ROPE_TYPES = {}
+"""A dictionary to store registered RoPE (Rotary Position Embedding) types and their configurations."""
 
 
 def rope_wraper(type):
+	"""
+	A decorator factory that registers a RotaryEmbedding class under a specific type name.
+
+	This allows retrieving RoPE configurations by type name later. It also sets
+	basic __str__ and __repr__ for the decorated class.
+
+	Args:
+	    type (str): The name to register the RoPE class under (e.g., "linear", "yarn").
+
+	Returns:
+	    Callable: A decorator function that takes a RotaryEmbedding class, registers it,
+	              and returns the class.
+	"""
+
 	def w(rope: RotaryEmbedding):
+		"""
+		Decorator function that registers the RoPE class.
+
+		Args:
+		    rope (RotaryEmbedding): The RotaryEmbedding class to register.
+
+		Returns:
+		    RotaryEmbedding: The registered RotaryEmbedding class.
+		"""
 		properties = {k: v for k, v in rope.__dict__.items()}
 		AVAILABLE_ROPE_TYPES[type] = properties
 		rope.__str__ = lambda cls: str(cls.__class__.__name__)
@@ -153,6 +265,16 @@ def rope_wraper(type):
 
 @jax.named_scope("easydel-rotary-compute-basic-inv-frequencies")
 def compute_basic_inv_frequencies(base: int, rotary_dim: int):
+	"""
+	Computes the inverse frequencies for standard RoPE.
+
+	Args:
+	    base (int): The base value for the geometric progression of frequencies.
+	    rotary_dim (int): The dimension of the rotary embeddings.
+
+	Returns:
+	    jnp.ndarray: An array of inverse frequencies of shape (rotary_dim // 2,).
+	"""
 	return 1.0 / (base ** (jnp.arange(0, rotary_dim, 2, dtype="f4") / rotary_dim))
 
 
@@ -166,6 +288,23 @@ def compute_yarn_inv_frequencies(
 	scaling_factor: float,
 	extrapolation_factor: float,
 ) -> jnp.ndarray:
+	"""
+	Computes the inverse frequencies for YaRN scaled RoPE.
+
+	Combines interpolation and extrapolation frequencies based on correction ranges.
+
+	Args:
+	    base (float): The base value for positional encoding.
+	    rotary_dim (int): The dimension of the rotary embeddings.
+	    beta_fast (float): YaRN parameter for faster rotating dimensions.
+	    beta_slow (float): YaRN parameter for slower rotating dimensions.
+	    max_position_embeddings (int): Original maximum sequence length before scaling.
+	    scaling_factor (float): The factor by which the context length is scaled.
+	    extrapolation_factor (float): YaRN parameter controlling extrapolation strength.
+
+	Returns:
+	    jnp.ndarray: An array of YaRN-adjusted inverse frequencies of shape (rotary_dim // 2,).
+	"""
 	pos_freqs = base ** (jnp.arange(0, rotary_dim, 2, dtype=jnp.float32) / rotary_dim)
 	inv_freq_extrapolation = 1.0 / pos_freqs
 	inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
@@ -195,6 +334,22 @@ def compute_llama3_inv_frequencies(
 	orig_max_position,
 	scaling_factor,
 ):
+	"""
+	Computes the inverse frequencies for Llama3-style scaled RoPE.
+
+	Adjusts frequencies based on wavelength thresholds and a smoothing factor.
+
+	Args:
+	    base (float): The base value for positional encoding.
+	    rotary_dim (int): The dimension of the rotary embeddings.
+	    low_freq_factor (float): Factor for adjusting low-frequency components.
+	    high_freq_factor (float): Factor for adjusting high-frequency components.
+	    orig_max_position (int): Original maximum sequence length before scaling.
+	    scaling_factor (float): The overall scaling factor applied.
+
+	Returns:
+	    jnp.ndarray: An array of Llama3-adjusted inverse frequencies of shape (rotary_dim // 2,).
+	"""
 	inv_freqs = compute_basic_inv_frequencies(base, rotary_dim)
 	low_freq_wavelen = orig_max_position / low_freq_factor
 	high_freq_wavelen = orig_max_position / high_freq_factor
@@ -224,6 +379,19 @@ def compute_basic_frequencies(
 	rotary_dim: int,
 	max_position_embeddings: int,
 ):
+	"""
+	Computes the basic RoPE frequencies (cos and sin values) for all positions.
+
+	Args:
+	    base (int): The base value for the geometric progression of frequencies.
+	    rotary_dim (int): The dimension of the rotary embeddings.
+	    max_position_embeddings (int): The maximum sequence length.
+
+	Returns:
+	    jnp.ndarray: A frequency cache tensor of shape
+	                 (max_position_embeddings, rotary_dim). Contains concatenated
+	                 cos and sin values.
+	"""
 	inv = compute_basic_inv_frequencies(base, rotary_dim)
 	freqs = jnp.einsum(
 		"i,j -> ij",
@@ -241,6 +409,26 @@ def compute_linear_frequencies(
 	max_position_embeddings: int,
 	scaling_factors: tp.List[float],
 ):
+	"""
+	Computes RoPE frequencies using linear scaling for potentially multiple factors.
+
+	This function computes frequency caches for each scaling factor and concatenates them.
+	Note: This implementation seems designed for a specific use case where different
+	parts of a sequence might use different scaling factors, determined by offsets.
+	If only one scaling factor is used, it behaves like standard linear scaling.
+
+	Args:
+	    base (int): The base value for the geometric progression of frequencies.
+	    rotary_dim (int): The dimension of the rotary embeddings.
+	    max_position_embeddings (int): The base maximum sequence length before scaling.
+	    scaling_factors (tp.Union[tp.List[float], float]): A single scaling factor or a list
+	                                                        of scaling factors.
+
+	Returns:
+	    jnp.ndarray: A frequency cache tensor. If multiple scaling factors are provided,
+	                 the caches are concatenated along the position dimension. Shape
+	                 is (total_scaled_length, rotary_dim).
+	"""
 	if not isinstance(scaling_factors, list):
 		scaling_factors = [scaling_factors]
 	inv_freq = compute_basic_inv_frequencies(
@@ -277,6 +465,21 @@ def compute_dynamic_frequencies(
 	max_position_embeddings: int,
 	scaling_factor: float,
 ):
+	"""
+	Computes RoPE frequencies using Dynamic NTK scaling.
+
+	Adjusts the 'base' dynamically based on the scaling factor.
+
+	Args:
+	    base (int): The initial base value before dynamic adjustment.
+	    rotary_dim (int): The dimension of the rotary embeddings.
+	    max_position_embeddings (int): The base maximum sequence length before scaling.
+	    scaling_factor (float): The scaling factor applied to the sequence length.
+
+	Returns:
+	    jnp.ndarray: A frequency cache tensor of shape
+	                 (max_position_embeddings * scaling_factor, rotary_dim).
+	"""
 	max_length = max_position_embeddings * scaling_factor
 	base = base * (
 		(scaling_factor * max_length / max_position_embeddings) - (scaling_factor - 1)
@@ -298,6 +501,25 @@ def compute_yarn_frequencies(
 	extrapolation_factor: float,
 	attn_factor: float,
 ) -> jnp.ndarray:
+	"""
+	Computes RoPE frequencies using the YaRN scaling method.
+
+	Includes adjustments based on YaRN parameters and applies an mscale factor.
+
+	Args:
+	    base (float): The base value for positional encoding.
+	    rotary_dim (int): The dimension of the rotary embeddings.
+	    beta_fast (float): YaRN parameter for faster rotating dimensions.
+	    beta_slow (float): YaRN parameter for slower rotating dimensions.
+	    max_position_embeddings (int): Original maximum sequence length before scaling.
+	    scaling_factor (float): The factor by which the context length is scaled.
+	    extrapolation_factor (float): YaRN parameter controlling extrapolation strength.
+	    attn_factor (float): YaRN parameter scaling the attention outputs.
+
+	Returns:
+	    jnp.ndarray: A frequency cache tensor of shape
+	                 (max_position_embeddings * scaling_factor, rotary_dim).
+	"""
 	inv_freq = compute_yarn_inv_frequencies(
 		base=base,
 		rotary_dim=rotary_dim,
@@ -325,6 +547,30 @@ def compute_phi3_frequencies(
 	short_factor,
 	long_factor,
 ):
+	"""
+	Computes RoPE frequencies using the Phi-3 LongRoPE scaling method.
+
+	Applies different scaling factors based on whether the target length is
+	shorter or longer than the original max length. Includes a scaling factor
+	adjustment based on the ratio of target length to original length.
+
+	Args:
+	    base (float): The base value for positional encoding.
+	    head_size (int): The dimension of each attention head.
+	    rotary_dim (int): The dimension of the rotary embeddings. Must equal head_size for Phi-3.
+	    max_position_embeddings (int): The target maximum sequence length after scaling.
+	    original_max_position_embeddings (int): Original maximum sequence length before scaling.
+	    short_factor (tp.List[float]): Scaling factors for frequencies when
+	                                    max_position_embeddings <= original_max_position_embeddings.
+	    long_factor (tp.List[float]): Scaling factors for frequencies when
+	                                   max_position_embeddings > original_max_position_embeddings.
+
+	Returns:
+	    jnp.ndarray: A frequency cache tensor of shape (1, max_position_embeddings, rotary_dim).
+
+	Raises:
+	    ValueError: If rotary_dim does not equal head_size.
+	"""
 	if rotary_dim != head_size:
 		raise ValueError(f"rotary_dim != head_size ({rotary_dim}!={head_size})")
 	if max_position_embeddings > original_max_position_embeddings:
@@ -365,6 +611,22 @@ def compute_llama3_frequencies(
 	scaling_factor,
 	max_position_embeddings: int,
 ):
+	"""
+	Computes RoPE frequencies using the Llama3 scaling method.
+
+	Args:
+	    base (float): The base value for positional encoding.
+	    rotary_dim (int): The dimension of the rotary embeddings.
+	    low_freq_factor (float): Factor for adjusting low-frequency components.
+	    high_freq_factor (float): Factor for adjusting high-frequency components.
+	    scaling_factor (float): The overall scaling factor applied.
+	    max_position_embeddings (int): Original maximum sequence length (referred to as
+	                                   `orig_max_position` in `compute_llama3_inv_frequencies`).
+	                                   This defines the length of the frequency cache.
+
+	Returns:
+	    jnp.ndarray: A frequency cache tensor of shape (max_position_embeddings, rotary_dim).
+	"""
 	inv = compute_llama3_inv_frequencies(
 		base,
 		rotary_dim,
@@ -395,6 +657,27 @@ def compute_deepseek_frequencies(
 	mscale_all_dim,
 	attn_factor,
 ) -> jnp.ndarray:
+	"""
+	Computes RoPE frequencies using the Deepseek-YaRN scaling method.
+
+	Similar to YaRN but potentially uses different mscale calculation parameters.
+
+	Args:
+	    base (float): The base value for positional encoding.
+	    rotary_dim (int): The dimension of the rotary embeddings.
+	    scaling_factor (float): The factor by which the context length is scaled.
+	    extrapolation_factor (float): YaRN parameter controlling extrapolation strength.
+	    beta_fast (int): YaRN parameter for faster rotating dimensions.
+	    beta_slow (int): YaRN parameter for slower rotating dimensions.
+	    max_position_embeddings (int): Original maximum sequence length before scaling.
+	    mscale (float): Parameter for `yarn_get_mscale` calculation.
+	    mscale_all_dim (float): Parameter for `yarn_get_mscale` calculation.
+	    attn_factor (float): Scaling factor applied to attention outputs.
+
+	Returns:
+	    jnp.ndarray: A frequency cache tensor of shape
+	                 (max_position_embeddings * scaling_factor, rotary_dim).
+	"""
 	pos_freqs = base ** (jnp.arange(0, rotary_dim, 2, dtype=jnp.float32) / rotary_dim)
 	inv_freq_extrapolation = 1.0 / pos_freqs
 	inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
@@ -438,6 +721,26 @@ def apply_basic_rope(
 	offsets: jax.Array = None,
 	dtype: jnp.dtype = jnp.float32,
 ):
+	"""
+	Applies standard or partially applied RoPE to query and key tensors.
+
+	Selects frequencies based on positions (and optional offsets), then applies
+	the rotation using `_apply_rotary_emb`. Handles cases where RoPE is
+	applied only to a subset of the head dimension (`rotary_dim < query.shape[-1]`).
+
+	Args:
+	    query (jax.Array): Query tensor. Shape [..., sequence_length, num_heads, head_dim].
+	    key (jax.Array): Key tensor. Shape [..., sequence_length, num_heads, head_dim].
+	    positions (jax.Array): Array of positions for lookup in the frequency cache. Shape [sequence_length].
+	    frequencies (jax.Array): Precomputed frequency cache. Shape [max_length, rotary_dim_freq].
+	    rotary_dim (int): The dimension up to which RoPE is applied.
+	    is_neox_style (bool): Whether to use Neox-style rotation.
+	    offsets (jax.Array, optional): Optional offsets to add to positions. Defaults to None.
+	    dtype (jnp.dtype, optional): Output dtype. Defaults to jnp.float32.
+
+	Returns:
+	    tp.Tuple[jax.Array, jax.Array]: The rotated query and key tensors with the specified dtype.
+	"""
 	if offsets is not None:
 		positions = positions + offsets
 	cos, sin = jnp.split(frequencies[positions], 2, -1)
@@ -462,6 +765,23 @@ def apply_phi3_rope(
 	offsets: jax.Array = None,
 	dtype: jnp.dtype = jnp.float32,
 ):
+	"""
+	Applies Phi-3 LongRoPE to query and key tensors.
+
+	Uses a specific rotation application style (`_rotate_neox`) assumed by Phi-3.
+
+	Args:
+	    query (jax.Array): Query tensor. Shape [batch_size, sequence_length, num_heads, head_dim].
+	    key (jax.Array): Key tensor. Shape [batch_size, sequence_length, num_heads, head_dim].
+	    positions (jax.Array): Array of positions. Shape [sequence_length].
+	    frequencies (jax.Array): Precomputed Phi-3 frequency cache.
+	                             Shape [1, max_length, rotary_dim].
+	    offsets (jax.Array, optional): Optional offsets to add to positions. Defaults to None.
+	    dtype (jnp.dtype, optional): Output dtype. Defaults to jnp.float32.
+
+	Returns:
+	    tp.Tuple[jax.Array, jax.Array]: The rotated query and key tensors with the specified dtype.
+	"""
 	positions = positions
 	if offsets is not None:
 		positions = positions + offsets
@@ -479,6 +799,18 @@ def apply_phi3_rope(
 
 @rope_wraper("default")
 class RotaryEmbedding(nn.Module):
+	"""
+	Standard Rotary Positional Embedding (RoPE) module.
+
+	Attributes:
+	    head_size (int): The dimension size of each attention head.
+	    rotary_dim (int): The dimension size of the rotary embeddings applied. Can be <= head_size.
+	    max_position_embeddings (int): The maximum sequence length the model can handle.
+	    base (int): The base value for calculating frequencies.
+	    is_neox_style (bool): Flag indicating whether to use Neox-style rotation.
+	    dtype (jnp.dtype): Data type for computations.
+	"""
+
 	def __init__(
 		self,
 		head_size: int,
@@ -528,6 +860,16 @@ class RotaryEmbedding(nn.Module):
 
 @rope_wraper("linear")
 class LinearScalingRotaryEmbedding(RotaryEmbedding):
+	"""
+	RotaryEmbedding extended with Linear Scaling.
+
+	Linearly scales the position indices before calculating frequencies.
+
+	Attributes:
+	    scaling_factors (tp.Union[tp.List[float], float]): The factor(s) to scale positions by.
+	    Inherits other attributes from RotaryEmbedding.
+	"""
+
 	def __init__(
 		self,
 		scaling_factors: tp.Union[tp.List[float], float],
@@ -582,7 +924,15 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
 
 @rope_wraper("dynamic")
 class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
-	"""RotaryEmbedding extended with Dynamic NTK scaling."""
+	"""
+	RotaryEmbedding extended with Dynamic NTK scaling.
+
+	Dynamically adjusts the `base` parameter based on the scaling factor.
+
+	Attributes:
+	    scaling_factor (float): The scaling factor applied to sequence length and base calculation.
+	    Inherits other attributes from RotaryEmbedding.
+	"""
 
 	def __init__(
 		self,
@@ -638,9 +988,19 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
 
 @rope_wraper("yarn")
 class YaRNScalingRotaryEmbedding(RotaryEmbedding):
-	"""RotaryEmbedding extended with YaRN method.
+	"""
+	RotaryEmbedding extended with the YaRN (Yet another RoPE extensioN method) scaling.
 
-	Credits to Peng et al. github.com/jquesnelle/yarn
+	Combines interpolation and extrapolation with frequency correction and magnitude scaling.
+
+	Attributes:
+	    scaling_factor (tp.Union[float, int]): The primary scaling factor for context length.
+	    extrapolation_factor (float): Controls the strength of extrapolation correction.
+	    attn_factor (float): Scales the output attention values.
+	    beta_fast (int): YaRN parameter for high-frequency dimensions correction range.
+	    beta_slow (int): YaRN parameter for low-frequency dimensions correction range.
+	    Inherits other attributes from RotaryEmbedding. Note: `max_position_embeddings`
+	    in the parent init likely refers to the *original* max length for YaRN calculations.
 	"""
 
 	def __init__(
@@ -710,6 +1070,25 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
 
 @rope_wraper("longrope")
 class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
+	"""
+	RotaryEmbedding using the Phi-3 LongRoPE scaling method.
+
+	Applies different frequency scaling factors (`short_factor`, `long_factor`)
+	depending on the target sequence length relative to the original maximum.
+	Requires `rotary_dim` to be equal to `head_size`.
+
+	Attributes:
+	    head_size (int): Dimension of each attention head. Must equal rotary_dim.
+	    rotary_dim (int): Dimension subjected to rotary embedding. Must equal head_size.
+	    max_position_embeddings (int): The target maximum sequence length after scaling.
+	    original_max_position_embeddings (int): Original maximum sequence length before scaling.
+	    base (int): Base for frequency calculation.
+	    is_neox_style (bool): Flag indicating whether Neox-style rotation is assumed (used by `apply_phi3_rope`).
+	    dtype (jnp.dtype): Data type for computations.
+	    short_factor (tp.List[float]): Scaling factors applied when target length <= original max length.
+	    long_factor (tp.List[float]): Scaling factors applied when target length > original max length.
+	"""
+
 	def __init__(
 		self,
 		head_size: int,
@@ -769,6 +1148,20 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
 
 @rope_wraper("llama3")
 class Llama3RotaryEmbedding(RotaryEmbedding):
+	"""
+	RotaryEmbedding implementing the Llama-3 scaling method.
+
+	Adjusts frequencies based on wavelength thresholds (`low_freq_factor`, `high_freq_factor`)
+	and applies an overall scaling factor.
+
+	Attributes:
+	    scaling_factor (float): Overall scaling factor.
+	    low_freq_factor (float): Factor related to low frequency wavelength threshold.
+	    high_freq_factor (float): Factor related to high frequency wavelength threshold.
+	    orig_max_position (int): Original maximum sequence length before scaling.
+	    Inherits other attributes from RotaryEmbedding.
+	"""
+
 	def __init__(
 		self,
 		head_size: int,
@@ -832,6 +1225,18 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
+	"""
+	Calculates the mscale factor, potentially used by Deepseek-YaRN or similar methods.
+
+	Allows specifying an additional `mscale` parameter compared to `_yarn_get_mscale`.
+
+	Args:
+	    scale (float, optional): The scaling factor. Defaults to 1.
+	    mscale (float, optional): An additional scaling parameter. Defaults to 1.
+
+	Returns:
+	    float: The calculated mscale value. Returns 1.0 if scale <= 1.
+	"""
 	if scale <= 1:
 		return 1.0
 	return 0.1 * mscale * jnp.log(scale) + 1.0
@@ -839,7 +1244,28 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
 
 @rope_wraper("deepseek_yarn")
 class DeepseekScalingRotaryEmbedding(nn.Module):
-	"""RotaryEmbedding extended with YaRN method."""
+	"""
+	RotaryEmbedding implementing a YaRN-like scaling method, potentially from Deepseek models.
+
+	Uses YaRN parameters (`beta_fast`, `beta_slow`, `extrapolation_factor`) and includes
+	additional m-scale parameters (`mscale`, `mscale_all_dim`). This version has a custom
+	`__call__` method differing slightly from `apply_basic_rope`.
+
+	Attributes:
+	    head_size (int): Dimension of each attention head.
+	    rotary_dim (int): Dimension subjected to rotary embedding.
+	    max_position_embeddings (int): Original maximum sequence length before scaling.
+	    base (int): Base for frequency calculation.
+	    is_neox_style (bool): Use Neox rotation if True, GPT-J otherwise.
+	    dtype (jnp.dtype): Data type for embeddings.
+	    scaling_factor (float): Primary scaling factor.
+	    extrapolation_factor (float): YaRN extrapolation factor.
+	    attn_factor (float): Attention scaling factor.
+	    beta_fast (int): YaRN parameter.
+	    beta_slow (int): YaRN parameter.
+	    mscale (float): Parameter for m-scale calculation.
+	    mscale_all_dim (float): Parameter for m-scale calculation.
+	"""
 
 	def __init__(
 		self,
@@ -933,6 +1359,32 @@ def get_rope(
 	dtype: tp.Optional[jnp.dtype] = None,
 	partial_rotary_factor: float = 1.0,
 ) -> RotaryEmbedding:
+	"""
+	Factory function to create and return a RotaryEmbedding instance based on configuration.
+
+	Selects the appropriate RoPE class (standard, linear, dynamic, YaRN, Llama3, Phi3, Deepseek)
+	based on the `rope_scaling` dictionary.
+
+	Args:
+	    head_size (int): Dimension of each attention head.
+	    rotary_dim (int): Base dimension for rotary embedding (before partial factor).
+	    max_position (int): Maximum sequence length the model should support (target length).
+	    base (int): Base value for frequency calculation.
+	    is_neox_style (bool, optional): Use Neox rotation style. Defaults to True.
+	    rope_scaling (tp.Optional[tp.Dict[str, tp.Any]], optional): Dictionary specifying the
+	        type and parameters of RoPE scaling. If None or 'rope_type' is 'default',
+	        uses standard RoPE. Keys like 'rope_type', 'factor',
+	        'original_max_position_embeddings', etc., are used. Defaults to None.
+	    dtype (tp.Optional[jnp.dtype], optional): Data type for embeddings. Defaults to jnp.float32.
+	    partial_rotary_factor (float, optional): Factor to reduce the rotary dimension
+	        (e.g., 0.5 applies RoPE to half the dimensions). Defaults to 1.0.
+
+	Returns:
+	    RotaryEmbedding: An instance of the configured RotaryEmbedding subclass.
+
+	Raises:
+	    ValueError: If `rope_scaling` specifies an unknown `rope_type`.
+	"""
 	if dtype is None:
 		dtype = jnp.float32  # Default JAX dtype
 
@@ -1083,6 +1535,32 @@ def get_frequencies(
 	rope_scaling: tp.Optional[tp.Dict[str, tp.Any]] = None,
 	partial_rotary_factor: float = 1.0,
 ) -> jax.Array:
+	"""
+	Computes and returns the RoPE frequency cache based on configuration.
+
+	Selects the appropriate frequency computation function (basic, linear, dynamic,
+	YaRN, Llama3, Phi3, Deepseek) based on the `rope_scaling` dictionary.
+	This function is JIT-compiled for performance, with relevant parameters marked static.
+
+	Args:
+	    head_size (int): Dimension of each attention head (needed for some scaling types like Phi3).
+	    rotary_dim (int): Base dimension for rotary embedding (before partial factor).
+	    max_position (int): Maximum sequence length for which to compute frequencies.
+	                        This might be the original or target length depending on scaling type.
+	    base (int): Base value for frequency calculation.
+	    rope_scaling (tp.Optional[tp.Dict[str, tp.Any]], optional): Dictionary specifying the
+	        type and parameters of RoPE scaling. Determines which frequency function to call.
+	        Defaults to None (uses `compute_basic_frequencies`).
+	    partial_rotary_factor (float, optional): Factor to reduce the rotary dimension.
+	        Defaults to 1.0.
+
+	Returns:
+	    jax.Array: The computed frequency cache tensor. Shape depends on the scaling method,
+	               typically [computed_length, rotary_dim_effective].
+
+	Raises:
+	    ValueError: If `rope_scaling` specifies an unknown `rope_type`.
+	"""
 	if partial_rotary_factor < 1.0:
 		rotary_dim = int(rotary_dim * partial_rotary_factor)
 
@@ -1240,7 +1718,32 @@ if __name__ == "__main__":
 
 @chex.dataclass
 class RopeConfig:
-	"""Configuration class for RoPE (Rotary Position Embedding) parameters."""
+	"""
+	Configuration class for RoPE (Rotary Position Embedding) parameters.
+
+	Stores the configuration related to RoPE type and its scaling parameters,
+	making it easy to manage and pass around RoPE settings.
+
+	Attributes:
+	    rope_type (str): The type of RoPE scaling to use (e.g., "default", "linear", "yarn", "llama3").
+	                     Defaults to "default".
+	    factor (tp.Optional[float]): General scaling factor used by some types (linear, dynamic, yarn, llama3).
+	    low_freq_factor (tp.Optional[float]): Specific factor for Llama3 scaling.
+	    high_freq_factor (tp.Optional[float]): Specific factor for Llama3 scaling.
+	    original_max_position_embeddings (tp.Optional[int]): Original context window size,
+	                                                        required by some scaling methods (yarn, llama3, phi3, deepseek).
+	    long_factor (tp.Optional[float]): Specific factor for Phi3 LongRoPE scaling (used for lengths > original).
+	    short_factor (tp.Optional[float]): Specific factor for Phi3 LongRoPE scaling (used for lengths <= original).
+	    long_mscale (tp.Optional[float]): Potentially used by variants like Phi3. (Not used in current `get_rope`).
+	    short_mscale (tp.Optional[float]): Potentially used by variants like Phi3. (Not used in current `get_rope`).
+	    # Add other potential scaling parameters here as needed (e.g., from YaRN, Deepseek)
+	    extrapolation_factor (tp.Optional[float]): YaRN/Deepseek parameter.
+	    attn_factor (tp.Optional[float]): YaRN/Deepseek parameter.
+	    beta_fast (tp.Optional[int]): YaRN/Deepseek parameter.
+	    beta_slow (tp.Optional[int]): YaRN/Deepseek parameter.
+	    mscale (tp.Optional[float]): Deepseek parameter.
+	    mscale_all_dim (tp.Optional[float]): Deepseek parameter.
+	"""
 
 	rope_type: str = "default"
 	factor: tp.Optional[float] = None
@@ -1253,8 +1756,18 @@ class RopeConfig:
 	short_mscale: tp.Optional[float] = None
 
 	@classmethod
-	def from_dict(cls, config_dict: tp.Dict[str, tp.Any]) -> "RopeConfig":
-		"""Create a RopeConfig instance from a dictionary."""
+	def from_dict(cls, config_dict: tp.Dict[str, tp.Any]) -> RopeConfig:
+		"""
+		Create a RopeConfig instance from a dictionary.
+
+		Handles potential alias 'type' for 'rope_type'.
+
+		Args:
+		    config_dict (tp.Dict[str, tp.Any]): Dictionary containing RoPE configuration.
+
+		Returns:
+		    RopeConfig: An instance populated from the dictionary.
+		"""
 		return cls(
 			rope_type=config_dict.get("rope_type") or config_dict.get("type", "default"),
 			factor=config_dict.get("factor"),
@@ -1270,10 +1783,21 @@ class RopeConfig:
 		)
 
 	def to_dict(self) -> tp.Dict[str, tp.Any]:
-		"""Convert the config to a dictionary, excluding None values."""
+		"""
+		Convert the RopeConfig instance to a dictionary.
+
+		Filters out attributes with None values. The dictionary is made hashable
+		using a custom class for potential use with JIT compilation contexts
+		(though making the dict itself static in `get_frequencies` is preferred).
+
+		Returns:
+		    tp.Dict[str, tp.Any]: A hashable dictionary containing non-None configuration values.
+		"""
 		from easydel.utils.compiling_utils import hash_fn
 
 		class rope_scaling(dict):
+			"""A dictionary subclass that is hashable."""
+
 			__hash__ = hash_fn
 
 		scale = rope_scaling({k: v for k, v in self.__dict__.items() if v is not None})

@@ -36,7 +36,9 @@ from easydel.infra.utils import (
 )
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import TransformerCache, TransformerCacheView
-from easydel.modules.falcon.falcon_configuration import FalconConfig as FalconConfig
+from easydel.layers.linear import ParallelLinear
+
+from .falcon_configuration import FalconConfig
 
 
 def built_bloom_alibi(attention_mask, num_attention_heads):
@@ -133,7 +135,7 @@ class FalconAttention(FlaxAttentionModule):
 		)
 		self.new_decoder_architecture = config.new_decoder_architecture
 		self.num_heads = config.num_attention_heads
-		self.query_key_value = nn.Linear(
+		self.query_key_value = ParallelLinear(
 			config.hidden_size,
 			qkv_out_dim,
 			rngs=rngs,
@@ -144,7 +146,7 @@ class FalconAttention(FlaxAttentionModule):
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.inv_norm_factor = 1 / math.sqrt(head_dim)
-		self.dense = nn.Linear(
+		self.dense = ParallelLinear(
 			qkv_out_dim,
 			config.hidden_size,
 			rngs=rngs,
@@ -368,7 +370,7 @@ class FalconMlp(nn.Module):
 		self.precision = precision
 		self.rngs = rngs
 		linear = functools.partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
@@ -705,7 +707,7 @@ class FalconForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 		)
 
-		self.lm_head = nn.Linear(
+		self.lm_head = ParallelLinear(
 			config.hidden_size,
 			config.vocab_size,
 			dtype=dtype,

@@ -41,16 +41,12 @@ from easydel.infra.modeling_outputs import (
 	FlaxSeq2SeqModelOutput,
 	FlaxSequenceClassifierOutput,
 )
-from easydel.infra.utils import (
-	ACT2FN,
-	get_dot_general_by_bits,
-)
+from easydel.infra.utils import ACT2FN, get_dot_general_by_bits
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching.transformer_cache import (
-	TransformerCache,
-	TransformerCacheView,
-)
-from easydel.modules.whisper.whisper_configuration import WhisperConfig as WhisperConfig
+from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.linear import ParallelLinear
+
+from .whisper_configuration import WhisperConfig as WhisperConfig
 
 remat = nn.remat
 
@@ -122,7 +118,7 @@ class WhisperAttention(FlaxAttentionModule):
 			)
 
 		linear = partial(
-			nn.Linear,
+			ParallelLinear,
 			self.embed_dim,
 			self.embed_dim,
 			dtype=dtype,
@@ -241,7 +237,7 @@ class WhisperEncoderLayer(nn.Module):
 			rngs=rngs,
 		)
 		linear = partial(
-			nn.Linear,
+			ParallelLinear,
 			dtype=dtype,
 			param_dtype=param_dtype,
 			precision=precision,
@@ -367,7 +363,7 @@ class WhisperDecoderLayer(nn.Module):
 			rngs=rngs,
 		)
 		linear = partial(
-			nn.Linear,
+			ParallelLinear,
 			param_dtype=self.param_dtype,
 			precision=self.precision,
 			dtype=self.dtype,
@@ -981,7 +977,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-		self.proj_out = nn.Linear(
+		self.proj_out = ParallelLinear(
 			config.d_model,
 			config.vocab_size,
 			use_bias=False,
@@ -1340,7 +1336,7 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
 		num_layers = config.num_hidden_layers + 1
 		if config.use_weighted_layer_sum:
 			self.layer_weights = jnp.repeat(1 / num_layers, num_layers)
-		self.projector = nn.Linear(
+		self.projector = ParallelLinear(
 			config.d_model,
 			config.classifier_proj_size,
 			dtype=dtype,
@@ -1349,7 +1345,7 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
 			rngs=rngs,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
-		self.classifier = nn.Linear(
+		self.classifier = ParallelLinear(
 			config.classifier_proj_size,
 			config.num_labels,
 			dtype=dtype,
