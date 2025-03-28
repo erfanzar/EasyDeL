@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 import typing as tp
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
@@ -171,20 +170,16 @@ class vInferenceApiServer:
 		self,
 		prompt_tokens: int,
 		ngenerated_tokens: int,
-		processing_time: float,
-		first_iter_flops: float,
-		iter_flops: float,
+		time_spent_computing: float,
 		tokens_pre_second: float,
 	) -> UsageInfo:
 		"""Create usage information."""
 		return UsageInfo(
-			first_iter_flops=first_iter_flops,
-			iter_flops=iter_flops,
 			prompt_tokens=prompt_tokens,
 			completion_tokens=ngenerated_tokens,
 			total_tokens=ngenerated_tokens + prompt_tokens,
 			tokens_pre_second=tokens_pre_second,
-			processing_time=processing_time,
+			processing_time=time_spent_computing,
 		)
 
 	def _handle_non_streaming_response(
@@ -194,14 +189,11 @@ class vInferenceApiServer:
 		ids: dict,
 	) -> ChatCompletionResponse:
 		"""Handle non-streaming response generation."""
-		start = time.perf_counter()
 		prompt_tokens = inference.count_tokens(request.model_dump()["messages"])
 		# Generate response
 
 		for response in inference.generate(**ids):
 			pass  # Keep last response
-
-		processing_time = time.perf_counter() - start
 
 		final_responses = inference.tokenizer.batch_decode(
 			response.sequences[..., response.padded_length :],
@@ -228,9 +220,7 @@ class vInferenceApiServer:
 			usage=self._create_usage_info(
 				prompt_tokens,
 				response.generated_tokens,
-				processing_time,
-				response.generate_func_flops,
-				response.interval_func_flops,
+				response._time_spent_computing,
 				response.tokens_pre_second,
 			),
 		)
@@ -255,14 +245,16 @@ class vInferenceApiServer:
 
 		async def stream_results() -> tp.AsyncGenerator[bytes, tp.Any]:
 			prompt_tokens = inference.count_tokens(request.model_dump()["messages"])
-			start = time.perf_counter()
+
+			def _execute(inputs):
+				yield from inference.generate(**inputs)
 
 			# Create generator in thread pool to not block the event loop
 			async def generate_tokens():
 				return await asyncio.get_event_loop().run_in_executor(
 					None,  # Use default thread pool
-					inference.generate,
-					**ids,
+					_execute,
+					ids,
 				)
 
 			index = 0
@@ -276,8 +268,6 @@ class vInferenceApiServer:
 					padded_sequence_length + inference.generation_config.streaming_chunks,
 				)
 				padded_sequence_length += inference.generation_config.streaming_chunks
-
-				processing_time = time.perf_counter() - start
 
 				# Decode tokens in thread pool to avoid blocking
 				decoded_responses = await asyncio.get_event_loop().run_in_executor(
@@ -300,9 +290,7 @@ class vInferenceApiServer:
 					usage=await self._create_usage_info_async(
 						prompt_tokens,
 						response.generated_tokens,
-						processing_time,
-						response.generate_func_flops,
-						response.interval_func_flops,
+						response._time_spent_computing,
 						response.tokens_pre_second,
 					),
 				)
@@ -331,9 +319,7 @@ class vInferenceApiServer:
 				usage=await self._create_usage_info_async(
 					prompt_tokens,
 					response.generated_tokens,
-					processing_time,
-					response.generate_func_flops,
-					response.interval_func_flops,
+					response._time_spent_computing,
 					response.tokens_pre_second,
 				),
 			)
@@ -353,9 +339,7 @@ class vInferenceApiServer:
 		self,
 		prompt_tokens: int,
 		generated_tokens: int,
-		processing_time: float,
-		generate_flops: int,
-		interval_flops: int,
+		time_spent_computing: float,
 		tokens_per_second: float,
 	) -> dict:
 		"""Async version of create_usage_info."""
@@ -365,9 +349,7 @@ class vInferenceApiServer:
 			self._create_usage_info,
 			prompt_tokens,
 			generated_tokens,
-			processing_time,
-			generate_flops,
-			interval_flops,
+			time_spent_computing,
 			tokens_per_second,
 		)
 
