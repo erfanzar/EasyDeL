@@ -421,109 +421,6 @@ class FlaxAttentionModule(nn.Module):
 		"""
 		return map(lambda x: jnp.transpose(x, (0, 2, 1, 3)), args)
 
-	@jax.named_scope("easydel-flax-attention-concatenate-to-cache")
-	def _concatenate_to_cache(
-		self,
-		query: Array,
-		key: Array,
-		value: Array,
-		cache_view: TransformerCacheView,
-		attention_mask: Array,
-		causal_mask: tp.Optional[Array] = None,
-		token_type_ids: tp.Optional[Array] = None,
-	) -> tp.Tuple[Array, Array, Array]:
-		"""
-		Updates the KV cache with new key/value states and adjusts the attention mask.
-
-		Internal helper function used when KV caching is enabled.
-
-		Args:
-		    query (Array): Current query states.
-		    key (Array): Current key states.
-		    value (Array): Current value states.
-		    cache_view (TransformerCacheView): The view into the KV cache.
-		    attention_mask (Array): Base attention mask.
-		    causal_mask (tp.Optional[Array], optional): Causal mask. Defaults to None.
-		    token_type_ids (tp.Optional[Array], optional): Token type IDs for segment-based masking.
-		                                                    Defaults to None.
-
-		Returns:
-		    tp.Tuple[Array, Array, Array]:
-		        - Updated key cache tensor.
-		        - Updated value cache tensor.
-		        - Updated attention mask reflecting the cached sequence length.
-		"""
-		num_updated_cache_vectors = query.shape[1]
-		end_index = cache_view.index[0]
-
-		*batch_dims, max_length, num_heads, depth_per_head = cache_view.value.shape
-
-		if attention_mask.ndim == 2:
-			attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
-
-		if causal_mask is not None:
-			if hasattr(causal_mask, "value"):
-				causal_mask = causal_mask.value
-			causal_mask = lax.dynamic_slice(
-				causal_mask,
-				(0, 0, end_index, 0),
-				(1, 1, num_updated_cache_vectors, max_length),
-			)
-			if token_type_ids is not None and num_updated_cache_vectors != 1:
-				token_type_mask = jnp.equal(
-					jnp.expand_dims(token_type_ids, 2),
-					jnp.expand_dims(token_type_ids, 1),
-				)
-
-				token_type_mask = jnp.where(token_type_ids == 0, False, token_type_mask)
-				token_type_mask = jnp.expand_dims(token_type_mask, 1)
-				sequence_length = token_type_ids.shape[1]
-				masked_portion = jnp.logical_or(
-					token_type_mask[:, :, :num_updated_cache_vectors, :],
-					causal_mask[:, :, :, :sequence_length],
-				)
-				causal_mask = causal_mask.at[:, :, :, :sequence_length].set(masked_portion)
-
-			causal_mask = jnp.broadcast_to(
-				causal_mask,
-				(query.shape[0],) + causal_mask.shape[1:],
-			)
-
-			attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
-			attention_mask = jnp.logical_and(attention_mask, causal_mask)
-
-		slice_indices = (0, end_index % cache_view.value.shape[1], 0, 0)
-
-		value_cache = lax.dynamic_update_slice(
-			cache_view.value,
-			value.astype(cache_view.value.dtype),
-			slice_indices,
-		)
-		key_cache = lax.dynamic_update_slice(
-			cache_view.key,
-			key.astype(cache_view.key.dtype),
-			slice_indices,
-		)
-		pad_mask = jnp.broadcast_to(
-			jnp.arange(max_length) < end_index + num_updated_cache_vectors,
-			tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
-		)
-		attention_mask = jnp.logical_and(pad_mask, attention_mask)
-		cache_view.key = self.quantizer(
-			with_sharding_constraint(
-				arr=key_cache,
-				sharding=self.get_sharding_safely(cache_view.key),
-			)
-		)
-		cache_view.value = self.quantizer(
-			with_sharding_constraint(
-				arr=value_cache,
-				sharding=self.get_sharding_safely(cache_view.value),
-			)
-		)
-		cache_view.index = cache_view.index + num_updated_cache_vectors
-		return key_cache, value_cache, attention_mask
-
 	@staticmethod
 	def _create_sliding_mask(
 		cache_pos: jnp.ndarray,
@@ -626,21 +523,12 @@ class FlaxAttentionModule(nn.Module):
 
 					masked_portion = jnp.logical_or(
 						token_type_mask,
-						causal_mask[
-							:,
-							:,
-							:,
-							:sequence_length,
-						],
+						causal_mask[:, :, :, :sequence_length],
 					)
-					causal_mask = causal_mask.at[
-						:,
-						:,
-						:,
-						:sequence_length,
-					].set(masked_portion)
+					causal_mask = causal_mask.at[:, :, :, :sequence_length].set(masked_portion)
 				causal_mask = jnp.broadcast_to(
-					causal_mask, (query.shape[0],) + causal_mask.shape[1:]
+					causal_mask,
+					(query.shape[0],) + causal_mask.shape[1:],
 				)
 				if attention_mask.ndim == 2:
 					attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
@@ -652,15 +540,21 @@ class FlaxAttentionModule(nn.Module):
 				attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
 				attention_mask = jnp.repeat(attention_mask, query.shape[1], -2)
 		else:
-			key, value, attention_mask = self._concatenate_to_cache(
-				query=query,
-				key=key,
-				value=value,
-				cache_view=cache_view,
-				attention_mask=attention_mask,
-				causal_mask=causal_mask,
-				token_type_ids=token_type_ids,
-			)
+			if isinstance(cache_view, TransformerCacheView):
+				key, value, attention_mask = cache_view.concatenate_to_cache(
+					query=query,
+					key=key,
+					value=value,
+					attention_mask=attention_mask,
+					causal_mask=causal_mask,
+					token_type_ids=token_type_ids,
+					kv_sharding=self.get_sharding_safely(cache_view.key),
+					quantizer=self.quantizer,
+				)
+			else:
+				raise NotImplementedError(
+					"requested type of CacheView is not supported for this attention module."
+				)
 		if sliding_windows is not None and attention_mask is not None:
 			sliding_window_mask = jnp.tril(
 				jnp.ones_like(attention_mask, dtype=jnp.bool),

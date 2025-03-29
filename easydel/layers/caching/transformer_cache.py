@@ -14,13 +14,12 @@
 import typing as tp
 
 import chex as cx
-from eformer.escale import PartitionAxis
+from eformer.escale import PartitionAxis, with_sharding_constraint
 from eformer.jaximus import ImplicitArray
 from jax import numpy as jnp
 import jax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-
-from easydel.infra.etils import EasyDeLQuantizationMethods
+from jax import lax
 
 if tp.TYPE_CHECKING:
 	from easydel.layers.quantization.quantizers import EasyQuantizer
@@ -128,15 +127,6 @@ class TransformerCacheView:
 	value: tp.Union[cx.Array, ImplicitArray]
 	index: tp.Union[cx.Array, ImplicitArray]
 	metadata: TransformerCacheMetaData
-
-	prefill_length: tp.Optional[tp.Union[jax.Array, NamedSharding]] = None
-
-	prefill_position: tp.Optional[tp.Union[jax.Array, NamedSharding]] = None
-	prefill_page_table: tp.Optional[tp.Union[jax.Array, NamedSharding]] = None
-
-	decode_position: tp.Optional[tp.Union[jax.Array, NamedSharding]] = None
-	decode_page_table: tp.Optional[tp.Union[jax.Array, NamedSharding]] = None
-	
 	layer_index: tp.Optional[int] = None
 
 	@classmethod
@@ -183,6 +173,107 @@ class TransformerCacheView:
 			)
 		return out
 
+	@jax.named_scope("easydel-transformer-cacheview-concatenate-to-cache")
+	def concatenate_to_cache(
+		self,
+		query: cx.Array,
+		key: cx.Array,
+		value: cx.Array,
+		attention_mask: cx.Array,
+		kv_sharding: PartitionSpec,
+		quantizer: EasyQuantizer,
+		causal_mask: tp.Optional[cx.Array] = None,
+		token_type_ids: tp.Optional[cx.Array] = None,
+	) -> tp.Tuple[cx.Array, cx.Array, cx.Array]:
+		"""
+		Updates the KV cache with new key/value states and adjusts the attention mask.
+
+		Internal helper function used when KV caching is enabled.
+
+		Args:
+		    query (Array): Current query states.
+		    key (Array): Current key states.
+		    value (Array): Current value states.
+		    attention_mask (Array): Base attention mask.
+		    causal_mask (tp.Optional[Array], optional): Causal mask. Defaults to None.
+		    token_type_ids (tp.Optional[Array], optional): Token type IDs for segment-based masking.
+		                                                    Defaults to None.
+
+		Returns:
+		    tp.Tuple[Array, Array, Array]:
+		        - Updated key cache tensor.
+		        - Updated value cache tensor.
+		        - Updated attention mask reflecting the cached sequence length.
+		"""
+		num_updated_cache_vectors = query.shape[1]
+		end_index = self.index[0]
+
+		*batch_dims, max_length, num_heads, depth_per_head = self.value.shape
+
+		if attention_mask.ndim == 2:
+			attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+
+		if causal_mask is not None:
+			if hasattr(causal_mask, "value"):
+				causal_mask = causal_mask.value
+			causal_mask = lax.dynamic_slice(
+				causal_mask,
+				(0, 0, end_index, 0),
+				(1, 1, num_updated_cache_vectors, max_length),
+			)
+			if token_type_ids is not None and num_updated_cache_vectors != 1:
+				token_type_mask = jnp.equal(
+					jnp.expand_dims(token_type_ids, 2),
+					jnp.expand_dims(token_type_ids, 1),
+				)
+
+				token_type_mask = jnp.where(token_type_ids == 0, False, token_type_mask)
+				token_type_mask = jnp.expand_dims(token_type_mask, 1)
+				sequence_length = token_type_ids.shape[1]
+				masked_portion = jnp.logical_or(
+					token_type_mask[:, :, :num_updated_cache_vectors, :],
+					causal_mask[:, :, :, :sequence_length],
+				)
+				causal_mask = causal_mask.at[:, :, :, :sequence_length].set(masked_portion)
+
+			causal_mask = jnp.broadcast_to(
+				causal_mask,
+				(query.shape[0],) + causal_mask.shape[1:],
+			)
+
+			attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
+			attention_mask = jnp.logical_and(attention_mask, causal_mask)
+
+		slice_indices = (0, end_index % self.value.shape[1], 0, 0)
+
+		value_cache = with_sharding_constraint(
+			lax.dynamic_update_slice(
+				self.value,
+				value.astype(self.value.dtype),
+				slice_indices,
+			),
+			sharding=kv_sharding,
+		)
+		key_cache = with_sharding_constraint(
+			lax.dynamic_update_slice(
+				self.key,
+				key.astype(self.key.dtype),
+				slice_indices,
+			),
+			sharding=kv_sharding,
+		)
+		pad_mask = jnp.broadcast_to(
+			jnp.arange(max_length) < end_index + num_updated_cache_vectors,
+			tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
+		)
+		attention_mask = jnp.logical_and(pad_mask, attention_mask)
+
+		self.key = quantizer(key_cache)
+		self.value = quantizer(value_cache)
+
+		self.index = self.index + num_updated_cache_vectors
+		return key_cache, value_cache, attention_mask
+
 	def __repr__(self):
 		try:
 			return (
@@ -208,13 +299,15 @@ class TransformerCache:
 		num_hidden_layers: int,
 		metadata: TransformerCacheMetaData,
 		mesh: Mesh,
+		partition_axis: PartitionAxis,
 		quantizer: tp.Optional[EasyQuantizer] = None,
 		dtype: tp.Optional[jnp.dtype] = None,
 		key_values_partition_specs: tp.Optional[PartitionSpec] = None,
 	):
 		from easydel.layers.quantization.quantizers import EasyQuantizer
+		from easydel.infra.etils import EasyDeLQuantizationMethods
 
-		paxis = PartitionAxis()
+		paxis = partition_axis
 		quantizer = quantizer or EasyQuantizer(EasyDeLQuantizationMethods.NONE)
 		key_values_partition_specs = key_values_partition_specs or PartitionSpec(
 			paxis.batch_axis,

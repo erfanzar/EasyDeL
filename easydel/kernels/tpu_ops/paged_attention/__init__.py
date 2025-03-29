@@ -12,19 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Implementation by @erfanzar,
-# with a few bug fixes and adjustments.
-
-from .matmul_pallas import pallas_matmul
-from .ring_attention_pallas import pallas_ring_attention
-from .paged_attention import (
-	pallas_paged_attention,
-	pallas_prefill_attention,
+from ._paged_attention import (
+	paged_attention as pallas_paged_attention,
+	prefill_attention as pallas_prefill_attention,
 )
 
-__all__ = (
-	"pallas_matmul",
-	"pallas_ring_attention",
-	"pallas_paged_attention",
-	"pallas_prefill_attention",
-)
+__all__ = ("pallas_paged_attention", "pallas_prefill_attention")
