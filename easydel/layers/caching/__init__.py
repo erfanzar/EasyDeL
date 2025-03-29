@@ -27,6 +27,11 @@ from .mamba_cache import (
 	MambaCacheMetaData,
 	MambaCacheView,
 )
+from .paged_attention_cache import (
+	PagedAttentionCache,
+	PagedAttentionCacheMetaData,
+	PagedAttentionCacheView,
+)
 from .transformer_cache import (
 	TransformerCache,
 	TransformerCacheMetaData,
@@ -37,6 +42,9 @@ __all__ = (
 	"LightningCache",
 	"LightningCacheMetaData",
 	"LightningCacheView",
+	"PagedAttentionCache",
+	"PagedAttentionCacheMetaData",
+	"PagedAttentionCacheView",
 	"TransformerCache",
 	"TransformerCacheMetaData",
 	"TransformerCacheView",

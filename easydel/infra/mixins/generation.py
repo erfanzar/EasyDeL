@@ -155,6 +155,7 @@ class EasyGenerationMixin:
 				quantization_platform=self.config.platform,
 			),
 			mesh=self.config.mesh,
+			partition_axis=self.config.partition_axis,
 		)
 
 	@cached_property
