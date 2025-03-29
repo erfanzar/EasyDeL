@@ -124,7 +124,13 @@ class SplashAttn(AttentionImpl):
 		"""
 		query_lenght = q.shape[1]
 		value_lenght = v.shape[1]
-		if (query_lenght == 1) or not causal or ((query_lenght % 128) != 0):
+		if (
+			(query_lenght == 1)
+			or not causal
+			or ((query_lenght % 128) != 0)
+			or ((q.shape[-1] % 128) != 0)
+			or ((v.shape[-1] % 128) != 0)
+		):
 			return VanillaAttn(self.metadata)(
 				q=q,
 				k=k,
