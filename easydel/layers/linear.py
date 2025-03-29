@@ -13,16 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import enum
 import typing as tp
-import warnings  # Use dataclass for config
 from dataclasses import dataclass
-
+from contextlib2 import nullcontext
+from jax.experimental.shard_map import shard_map
 import jax.numpy as jnp
 from flax import nnx as nn
 from flax.nnx.nn.dtypes import promote_dtype
 from jax import lax
 from jax.sharding import Mesh
+from eformer import escale as es
+from easydel.kernels.collective_matmul import (
+	MatrixMultiplyMethod,
+	create_distributed_matmul,
+	prepare_matrix_for_all_gather,
+	prepare_matrix_for_reduce_scatter,
+)
+from jax.sharding import PartitionSpec as Ps, NamedSharding as Ns
 
 # Type Aliases
 Array = jnp.ndarray
@@ -37,44 +44,160 @@ default_kernel_init = nn.initializers.lecun_normal()
 default_bias_init = nn.initializers.zeros
 
 
-@enum.unique
-class TensorParallelType(enum.Enum):
-	"""Type of tensor parallelism for layers."""
+def get_sharding(arr: Array) -> tp.Optional[Ps]:
+	"""Gets the sharding of an array.
 
-	ROW = enum.auto()
-	# Shards input features, aggregates output (AllReduce)
-	COLUMN = enum.auto()
-	# Shards output features, gathers output (AllGather/ReduceScatter)
+	Args:
+		arr: Array to get sharding from.
+
+	Returns:
+		Sharding of the array.
+	"""
+	sharding = getattr(arr, "sharding", None)
+	if sharding is not None:
+		return sharding.spec
+	return None
 
 
-@dataclass
+def get_output_partition_spec(
+	lhs: Array, rhs: Array, method: MatrixMultiplyMethod, axis_name: str
+):
+	"""Calculate output partition spec based on input arrays and matmul method.
+
+	Args:
+	    lhs: Left-hand side array (inputs)
+	    rhs: Right-hand side array (weights)
+	    method: Matrix multiplication method
+	    axis_name: Axis name for sharding
+
+	Returns:
+	    Output partition specification
+	"""
+	from jax.sharding import PartitionSpec as P
+
+	lhs_spec = get_sharding(lhs)
+	rhs_spec = get_sharding(rhs)
+
+	if lhs_spec is None or rhs_spec is None:
+		return None
+
+	if lhs.ndim == 2:
+		return P(rhs_spec[1], rhs_spec[0])
+	else:
+		return P(*(None,) * (lhs.ndim - 1) + (axis_name,))
+
+
+def get_matmul_output_sharding(lhs_pspec, rhs_pspec):
+	"""
+	Determine the output sharding PartitionSpec for a matrix multiplication
+	based on the partition specs of the input matrices.
+
+	For matrix multiplication X @ W:
+	- The contracting dimensions get reduced during matmul
+	- The non-contracting dimensions of X and W determine the output sharding
+	- Ensures no duplicate sharding dimensions in the output
+	- Ensures correct output dimensionality with None padding if needed
+
+	Args:
+	    lhs_pspec: PartitionSpec for the left-hand side matrix X
+	    rhs_pspec: PartitionSpec for the right-hand side matrix W
+
+	Returns:
+	    PartitionSpec for the output of X @ W
+	"""
+	if lhs_pspec is None or rhs_pspec is None:
+		return Ps()
+
+	# Extract non-contracting dimensions from LHS (all except the last)
+	lhs_output_dims = lhs_pspec[:-1] if len(lhs_pspec) > 1 else ()
+
+	# Extract non-contracting dimensions from RHS (all except second-to-last)
+	if len(rhs_pspec) >= 2:
+		rhs_output_dims = (rhs_pspec[-1],)
+	else:
+		rhs_output_dims = (rhs_pspec[-1],) if rhs_pspec else ()
+
+	# Collect all sharding dimensions to check for duplicates
+	all_shard_dims = set()
+	output_dims = []
+
+	# Process LHS dimensions first
+	for dim in lhs_output_dims:
+		if isinstance(dim, tuple):
+			# Check each nested dimension
+			filtered_tuple = tuple(d for d in dim if d not in all_shard_dims)
+			for d in dim:
+				all_shard_dims.add(d)
+			if filtered_tuple:  # Only add if there's something left
+				output_dims.append(filtered_tuple)
+			elif dim:  # If all dimensions were filtered out but original dim wasn't empty
+				output_dims.append(None)  # Add None as placeholder
+		else:
+			# Single dimension
+			if dim not in all_shard_dims:
+				output_dims.append(dim)
+				all_shard_dims.add(dim)
+			else:
+				output_dims.append(None)  # Add None if dimension is duplicate
+
+	# Then process RHS dimensions
+	for dim in rhs_output_dims:
+		if isinstance(dim, tuple):
+			# Check each nested dimension
+			filtered_tuple = tuple(d for d in dim if d not in all_shard_dims)
+			for d in dim:
+				all_shard_dims.add(d)
+			if filtered_tuple:  # Only add if there's something left
+				output_dims.append(filtered_tuple)
+			elif dim:  # If all dimensions were filtered out but original dim wasn't empty
+				output_dims.append(None)  # Add None as placeholder
+		else:
+			# Single dimension
+			if dim not in all_shard_dims:
+				output_dims.append(dim)
+				all_shard_dims.add(dim)
+			else:
+				output_dims.append(None)  # Add None if dimension is duplicate
+
+	# Calculate expected output dimensionality
+	# For X @ W where X is 3D and W is 2D, output should be 3D
+	expected_dims = len(lhs_pspec) - 1 + 1  # All LHS dims except contracting + 1 from RHS
+
+	# Add None padding if needed
+	while len(output_dims) < expected_dims:
+		output_dims.append(None)
+
+	return Ps(*output_dims)
+
+
+@es.auto_pytree
 class TensorParallelConfig:
 	"""Configuration for Tensor Parallelism.
 
 	Attributes:
 	    mesh: The JAX device mesh.
 	    axis_name: The name of the mesh axis to use for tensor parallelism.
-	    parallel_type: The type of parallelism (ROW or COLUMN).
+	    matmul_type: The type of matmul (MatrixMultiplyMethod).
 	    reduce_scatter_output: If True and parallel_type is COLUMN,
 	        use reduce-scatter instead of all-gather for the output.
 	        This keeps the output sharded (useful for sequence parallelism
 	        or subsequent RowParallel layers). Defaults to False.
 	"""
 
-	mesh: Mesh
+	mesh: Mesh = None
 	axis_name: str = "tp"
-	parallel_type: tp.Optional[TensorParallelType] = None
+	matmul_method: tp.Optional[MatrixMultiplyMethod] = None
+	reduce_output: bool = False
 	reduce_scatter_output: bool = False
 
 	def __post_init__(self):
-		if self.parallel_type is not None:
-			if not isinstance(self.mesh, Mesh):
-				msg = "`mesh` must be provided and be a `Mesh` when using tensor parallelism."
+		msg = None
+		if self.matmul_method is not None:
+			if self.mesh is None:
+				self.mesh = es.get_incontext_mesh()
 			if self.axis_name not in self.mesh.axis_names:
 				msg = f"axis_name '{self.axis_name}' not found in mesh axis names: {self.mesh.axis_names}"
-			if self.reduce_scatter_output and self.parallel_type != TensorParallelType.COLUMN:
-				msg = "`reduce_scatter_output=True` is only valid for `COLUMN`."
-
+		if msg is not None:
 			raise ValueError(msg)
 
 
@@ -109,8 +232,10 @@ class ParallelLinear(nn.Module):
 		kernel_init: Initializer = default_kernel_init,
 		bias_init: Initializer = default_bias_init,
 		parallel_config: tp.Optional[TensorParallelConfig] = None,
-		rngs: nn.Rngs,
+		rngs: tp.Optional[nn.Rngs] = None,
 	):
+		if rngs is None:
+			rngs = nn.Rngs(0)
 		self.in_features = in_features
 		self.out_features = out_features
 		self.use_bias = use_bias
@@ -120,29 +245,10 @@ class ParallelLinear(nn.Module):
 		self.kernel_init = kernel_init
 		self.bias_init = bias_init
 		self.parallel_config = parallel_config
+		self.rngs = rngs
 
-		if parallel_config:
-			mesh = parallel_config.mesh
-			axis_name = parallel_config.axis_name
-			tp_size = mesh.shape[axis_name]
-
-			if parallel_config.parallel_type == TensorParallelType.COLUMN:
-				if out_features % tp_size != 0:
-					raise ValueError(
-						f"Output features ({out_features}) must be divisible by "
-						f"tensor parallel size ({tp_size}) for COLUMN parallelism."
-					)
-
-			elif parallel_config.parallel_type == TensorParallelType.ROW:
-				if in_features % tp_size != 0:
-					raise ValueError(
-						f"Input features ({in_features}) must be divisible by "
-						f"tensor parallel size ({tp_size}) for ROW parallelism."
-					)
-			else:
-				raise ValueError(f"Invalid parallel_type: {parallel_config.parallel_type}")
-		self._num_merged = len(out_features) if isinstance(out_features, tp.Sequence) else 1
-		out_features_sum = sum(out_features) if self._num_merged > 1 else out_features
+		self.tp_merged = len(out_features) if isinstance(out_features, tp.Sequence) else 1
+		out_features_sum = sum(out_features) if self.tp_merged > 1 else out_features
 		kernel_key = rngs.params()
 		kernel_shape = (in_features, out_features_sum)
 		self.kernel = nn.Param(kernel_init(kernel_key, kernel_shape, param_dtype))
@@ -153,8 +259,65 @@ class ParallelLinear(nn.Module):
 			self.bias = nn.Param(bias_init(bias_key, bias_shape, param_dtype))
 		else:
 			self.bias = None
+		self.distributed_matmul = None
+		if parallel_config is not None and parallel_config.matmul_method is not None:
+			self.distributed_matmul = create_distributed_matmul(
+				parallel_config.matmul_method,
+				parallel_config.axis_name,
+			)
 
-	def __call__(self, inputs: Array) -> Array:
+	def collective_forward(self, inputs: Array) -> Array:
+		kernel = self.kernel.value
+		bias = self.bias.value if self.use_bias else None
+
+		if bias is not None:
+			inputs, kernel, bias = promote_dtype((inputs, kernel, bias), dtype=self.dtype)
+		else:
+			inputs, kernel = promote_dtype((inputs, kernel), dtype=self.dtype)
+
+		# Ensure inputs are 2D
+		orig_shape = inputs.shape
+		inputs_2d = inputs.reshape(-1, inputs.shape[-1])
+
+		# Get partition specs
+		input_spec = get_sharding(inputs_2d)
+		kernel_spec = get_sharding(kernel)
+		output_spec = get_output_partition_spec(
+			inputs_2d,
+			kernel,
+			self.parallel_config.matmul_method,
+			self.parallel_config.axis_name,
+		)
+
+		if self.parallel_config.matmul_method == MatrixMultiplyMethod.REDUCE_SCATTER:
+			kernel = prepare_matrix_for_reduce_scatter(
+				kernel,
+				self.parallel_config.mesh,
+				self.parallel_config.axis_name,
+			)
+		elif self.parallel_config.matmul_method == MatrixMultiplyMethod.ALL_GATHER:
+			kernel = prepare_matrix_for_all_gather(
+				kernel,
+				self.parallel_config.mesh,
+				self.parallel_config.axis_name,
+			)
+
+		output_2d = shard_map(
+			self.distributed_matmul,
+			mesh=self.parallel_config.mesh,
+			in_specs=(input_spec, kernel_spec),
+			out_specs=output_spec,
+			check_rep=False,
+		)(inputs_2d, kernel)
+
+		output = output_2d.reshape(orig_shape[:-1] + (self.out_features,))
+
+		if bias is not None:
+			output = output + jnp.reshape(bias, (1,) * (output.ndim - 1) + (-1,))
+
+		return output
+
+	def native_forward(self, inputs: Array) -> Array:
 		"""Applies the linear transformation with optional tensor parallelism.
 
 		Args:
@@ -176,101 +339,22 @@ class ParallelLinear(nn.Module):
 		else:
 			inputs, kernel = promote_dtype((inputs, kernel), dtype=self.dtype)
 
-		if self.parallel_config is None:
-			y = lax.dot_general(
-				inputs,
-				kernel,
-				(((inputs.ndim - 1,), (0,)), ((), ())),
-				precision=self.precision,
-			)
-		else:
-			axis_name = self.parallel_config.axis_name
-			parallel_type = self.parallel_config.parallel_type
+		subscript = "...ik,...kj->...ij" if inputs.ndim > 1 else "...k,...kj->...j"
 
-			if parallel_type == TensorParallelType.COLUMN:
-				y_local = lax.dot_general(
-					inputs,
-					kernel,
-					(((inputs.ndim - 1,), (0,)), ((), ())),
-					precision=self.precision,
-				)
+		y = jnp.einsum(
+			subscript,
+			inputs,
+			kernel,
+			precision=self.precision,
+			optimize=True,
+		)
 
-				if self.parallel_config.reduce_scatter_output:
-					if self.parallel_config.reduce_scatter_output:
-						y = lax.psum_scatter(
-							y_local,
-							axis_name=axis_name,
-							scatter_dimension=-1,
-							tiled=True,
-						)
-						warnings.warn(
-							"reduce_scatter_output=True in ColumnParallel forward pass is unusual. "
-							"Ensure this behavior (summing then scattering) is intended. "
-							"Typically requires subsequent RowParallel or specific gradient handling.",
-							stacklevel=1,
-						)
-					else:
-						y = lax.all_gather(y_local, axis_name=axis_name, axis=-1)
-
-				else:
-					y = lax.all_gather(y_local, axis_name=axis_name, axis=-1)
-
-			elif parallel_type == TensorParallelType.ROW:
-				y_partial = lax.dot_general(
-					inputs,
-					kernel,
-					(((inputs.ndim - 1,), (0,)), ((), ())),
-					precision=self.precision,
-				)
-
-				y = lax.psum(y_partial, axis_name=axis_name)
-
-			else:
-				raise AssertionError("Should be unreachable due to config validation")
-
-		if self.parallel_config is None:
-			y = lax.dot_general(
-				inputs, kernel, (((inputs.ndim - 1,), (0,)), ((), ())), precision=self.precision
-			)
-			if bias is not None:
-				y = y + jnp.reshape(bias, (1,) * (y.ndim - 1) + (-1,))
-
-		else:
-			axis_name = self.parallel_config.axis_name
-			parallel_type = self.parallel_config.parallel_type
-
-			if parallel_type == TensorParallelType.COLUMN:
-				y_local = lax.dot_general(
-					inputs,
-					kernel,
-					(((inputs.ndim - 1,), (0,)), ((), ())),
-					precision=self.precision,
-				)
-				if bias is not None:
-					y_local = y_local + jnp.reshape(bias, (1,) * (y_local.ndim - 1) + (-1,))
-
-				if self.parallel_config.reduce_scatter_output:
-					y = lax.psum_scatter(
-						y_local,
-						axis_name=axis_name,
-						scatter_dimension=-1,
-						tiled=True,
-					)
-				else:
-					y = lax.all_gather(y_local, axis_name=axis_name, axis=-1)
-
-			elif parallel_type == TensorParallelType.ROW:
-				y_partial = lax.dot_general(
-					inputs,
-					kernel,
-					(((inputs.ndim - 1,), (0,)), ((), ())),
-					precision=self.precision,
-				)
-				y = lax.psum(y_partial, axis_name=axis_name)
-				if bias is not None:
-					y = y + jnp.reshape(bias, (1,) * (y.ndim - 1) + (-1,))
-
-			else:
-				raise AssertionError("Should be unreachable")
+		if bias is not None:
+			y = y + jnp.reshape(bias, (1,) * (y.ndim - 1) + (-1,))
 
 		return y
+
+	def __call__(self, inputs: Array) -> Array:
+		if self.distributed_matmul is None:
+			return self.native_forward(inputs=inputs)
+		return self.collective_forward(inputs=inputs)

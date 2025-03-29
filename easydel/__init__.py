@@ -19,14 +19,12 @@ import sys as _sys
 import typing as _tp
 from logging import getLogger as _getlogger
 
-from .utils import (
-	check_bool_flag as _check_bool_flag,
-	LazyModule as _LazyModule,
-	is_package_available as _is_package_available,
-	get_logger as _get_logger,
-)
-
 from packaging.version import Version as _version
+
+from .utils import LazyModule as _LazyModule
+from .utils import check_bool_flag as _check_bool_flag
+from .utils import get_logger as _get_logger
+from .utils import is_package_available as _is_package_available
 
 if _check_bool_flag("EASYDEL_AUTO", True):
 	_sys.setrecursionlimit(10000)
@@ -440,6 +438,8 @@ if _tp.TYPE_CHECKING:
 		EasyDeLBaseConfigDict,
 		EasyDeLBaseModule,
 		LossConfig,
+		PartitionAxis,
+		escale,
 	)
 	from .infra.base_state import EasyDeLState
 	from .infra.errors import (
