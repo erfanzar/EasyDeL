@@ -85,11 +85,6 @@ tensorboard = "^2.18.0"
 torch = { version = ">=2.6.0", source = "torch-cpu", optional = true }
 
 
-[tool.poetry.extras]
-tf = ["tensorflow-datasets", "tensorflow-cpu", "tensorboard"]
-torch = ["torch"]
-all = ["tensorflow-datasets", "tensorflow-cpu", "tensorboard", "torch"]
-
 [build-system]
 requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
