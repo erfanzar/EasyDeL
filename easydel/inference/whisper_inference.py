@@ -337,7 +337,7 @@ class vWhisperInference:
 
 			if in_sampling_rate != self.feature_extractor.sampling_rate:
 				try:
-					import librosa
+					import librosa  # type:ignore
 				except ImportError as err:
 					raise ImportError(
 						"To support resampling audio files, please install 'librosa' and 'soundfile'."

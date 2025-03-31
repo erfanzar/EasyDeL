@@ -177,15 +177,14 @@ class LlamaConfig(EasyDeLBaseConfig):
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
-			("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-			(
-				"self_attn/(q_proj|k_proj|v_proj)/kernel",
-				PartitionSpec(("fsdp", "sp"), "tp"),
-			),
-			("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
+			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
+			("self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/o_proj/kernel", PartitionSpec(("sp", "fsdp"), "tp")),
 			("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
 			("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
 			("input_layernorm/kernel", PartitionSpec(None)),
 			("post_attention_layernorm/kernel", PartitionSpec(None)),
 			("model/norm/kernel", PartitionSpec(None)),
@@ -297,13 +296,12 @@ class VisionLlamaConfig(LlamaConfig):
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
-			("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-			("model/embed_vision/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-			(
-				"self_attn/(q_proj|k_proj|v_proj)/kernel",
-				PartitionSpec(("fsdp", "sp"), "tp"),
-			),
-			("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
+			("embed_vision/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
+			("self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
 			("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),

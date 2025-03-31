@@ -218,18 +218,18 @@ class WhisperConfig(EasyDeLBaseConfig):
 			("model/encoder/conv[12]/kernel", PartitionSpec(None, "tp", ("fsdp", "sp"))),
 			("model/encoder/conv[12]/bias", PartitionSpec("tp")),
 			# Self attention (both encoder and decoder)
-			("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("self_attn/(q_proj|k_proj|v_proj)/bias", PartitionSpec("tp")),
-			("self_attn/out_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/out_proj/bias", PartitionSpec(None)),
+			("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/(q_proj|k_proj|v_proj)/bias", PartitionSpec(("fsdp", "sp"))),
+			("self_attn/out_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("self_attn/out_proj/bias", PartitionSpec("tp")),
 			# Cross attention (decoder only)
 			(
 				"encoder_attn/(q_proj|k_proj|v_proj)/kernel",
-				PartitionSpec(("fsdp", "sp"), "tp"),
+				PartitionSpec("tp", ("fsdp", "sp")),
 			),
-			("encoder_attn/(q_proj|k_proj|v_proj)/bias", PartitionSpec("tp")),
-			("encoder_attn/out_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("encoder_attn/out_proj/bias", PartitionSpec(None)),
+			("encoder_attn/(q_proj|k_proj|v_proj)/bias", PartitionSpec(("fsdp", "sp"))),
+			("encoder_attn/out_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("encoder_attn/out_proj/bias", PartitionSpec("tp")),
 			# FFN layers (both encoder and decoder)
 			("fc1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("fc1/bias", PartitionSpec("tp")),

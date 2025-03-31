@@ -144,12 +144,12 @@ class Xerxes2Config(EasyDeLBaseConfig):
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
-			("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
 			("self_attn/qa_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("self_attn/qb_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("self_attn/kv_mqa_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("self_attn/kvi_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("self_attn/qa_norm/(bias|scale)", PartitionSpec(None)),
 			("self_attn/kv_norm/(bias|scale)", PartitionSpec(None)),
 			("mlp/gate_up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),

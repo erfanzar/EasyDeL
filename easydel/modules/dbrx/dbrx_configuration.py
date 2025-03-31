@@ -289,7 +289,7 @@ class DbrxConfig(EasyDeLBaseConfig):
 		"""
 		return (
 			# Embeddings
-			("transformer/wte/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+			("wte/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
 			# Language model head
 			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("lm_head/bias", PartitionSpec(None)),

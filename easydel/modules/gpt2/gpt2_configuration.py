@@ -173,21 +173,17 @@ class GPT2Config(EasyDeLBaseConfig):
 			if not hasattr(self, k):
 				setattr(self, k, v)
 
-	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+	def get_partition_rules(self, *args, **kwargs):
 		"""
 		Get the partition rules for the model.
-
-		Args:
-		    fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
-		        Whether to use fully sharded data parallelism.
 
 		Returns:
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
 			(
-				"transformer/wte/embedding",
-				jax.sharding.PartitionSpec("tp", ("fsdp", "sp")),
+				"wte/embedding",
+				jax.sharding.PartitionSpec(("fsdp", "sp"), "tp"),
 			),
 			("transformer/lm_head", jax.sharding.PartitionSpec(("fsdp", "sp"), "tp")),
 			(".*", jax.sharding.PartitionSpec(("fsdp", "sp"))),

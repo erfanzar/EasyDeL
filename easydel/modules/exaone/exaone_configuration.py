@@ -158,12 +158,11 @@ class ExaoneConfig(EasyDeLBaseConfig):
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
-			("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-			(
-				"self_attn/(q_proj|k_proj|v_proj)/kernel",
-				PartitionSpec(("fsdp", "sp"), "tp"),
-			),
-			("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
+			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
+			("self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/o_proj/kernel", PartitionSpec(("sp", "fsdp"), "tp")),
 			("mlp/c_fc_1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("mlp/c_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
 			("mlp/c_fc_0/kernel", PartitionSpec(("fsdp", "sp"), "tp")),

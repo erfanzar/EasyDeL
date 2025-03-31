@@ -198,12 +198,11 @@ class ArcticConfig(EasyDeLBaseConfig):
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
-			("model/embed_tokens/embedding", PartitionSpec("tp", ("sp", "fsdp"))),
-			(
-				"self_attn/(q_proj|k_proj|v_proj)/kernel",
-				PartitionSpec(("fsdp", "sp"), "tp"),
-			),
-			("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
+			("embed_tokens/embedding", PartitionSpec(("sp", "fsdp"), "tp")),
+			("self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/o_proj/kernel", PartitionSpec(("sp", "fsdp"), "tp")),
 			("w1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("w2/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("w3/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
@@ -214,7 +213,6 @@ class ArcticConfig(EasyDeLBaseConfig):
 			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			(".*", PartitionSpec(None)),
 		)
-
 
 	@staticmethod
 	def get_weight_decay_exclusions():

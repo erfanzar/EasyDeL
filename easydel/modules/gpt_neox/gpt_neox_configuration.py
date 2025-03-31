@@ -128,7 +128,7 @@ class GPTNeoXConfig(EasyDeLBaseConfig):
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
-			("wte/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+			("wte/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
 			("attention/w_qkv/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("attention/w_qkv/bias", PartitionSpec(("fsdp", "sp"))),  # 1D for bias
 			("attention/wo/kernel", PartitionSpec("tp", ("fsdp", "sp"))),

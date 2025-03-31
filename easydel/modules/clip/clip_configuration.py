@@ -32,9 +32,9 @@ def _get_partition_rules(self, *arg, **kwargs):
 		("patch_embedding/bias", PartitionSpec(None)),
 		("class_embedding", PartitionSpec("tp")),
 		# Common attention layers
-		("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-		("self_attn/(out_proj|o_proj)/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-		("self_attn/(q_proj|k_proj|v_proj)/bias", PartitionSpec("tp")),
+		("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+		("self_attn/(out_proj|o_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+		("self_attn/(q_proj|k_proj|v_proj)/bias", PartitionSpec(("fsdp", "sp"))),
 		("self_attn/(out_proj|o_proj)/bias", PartitionSpec(None)),
 		# Common MLP layers
 		("mlp/(fc1|gate_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),

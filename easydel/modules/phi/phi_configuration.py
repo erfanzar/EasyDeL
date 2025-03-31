@@ -149,129 +149,30 @@ class PhiConfig(EasyDeLBaseConfig):
 			**kwargs,
 		)
 
-	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+	def get_partition_rules(self, *args, **kwargs):
 		"""
 		Get the partition rules for the model.
-
-		Args:
-		    fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
-		        Whether to use fully sharded data parallelism.
 
 		Returns:
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
-			(
-				("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-				(
-					"final_layernorm/(scale|bias)",
-					PartitionSpec(
-						None,
-					),
-				),
-				(
-					"final_layernorm/(scale|bias)",
-					PartitionSpec(
-						None,
-					),
-				),
-				("mlp/fc1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				(
-					"mlp/fc1/bias",
-					PartitionSpec(
-						"tp",
-					),
-				),
-				("mlp/fc2/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-				(
-					"mlp/fc2/bias",
-					PartitionSpec(
-						("fsdp", "sp"),
-					),
-				),
-				("self_attn/dense/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-				("self_attn/dense/bias", PartitionSpec("tp")),
-				(
-					"self_attn/(q_proj|k_proj|v_proj)/kernel",
-					PartitionSpec(("fsdp", "sp"), "tp"),
-				),
-				(
-					"self_attn/(q_proj|k_proj|v_proj)/bias",
-					PartitionSpec(
-						"tp",
-					),
-				),
-				("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("lm_head/bias", PartitionSpec("tp")),
-				(
-					".*",
-					PartitionSpec(
-						None,
-					),
-				),
-			)
-			if fully_sharded_data_parallel
-			else (
-				(
-					"embed_tokens/embedding",
-					PartitionSpec(
-						"tp",
-						("fsdp", "sp"),
-					),
-				),
-				(
-					"final_layernorm/(scale|bias)",
-					PartitionSpec(
-						None,
-					),
-				),
-				(
-					"final_layernorm/(scale|bias)",
-					PartitionSpec(
-						None,
-					),
-				),
-				("mlp/fc1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				(
-					"mlp/fc1/bias",
-					PartitionSpec(
-						"tp",
-					),
-				),
-				("mlp/fc2/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-				(
-					"mlp/fc2/bias",
-					PartitionSpec(
-						("fsdp", "sp"),
-					),
-				),
-				(
-					"self_attn/dense/kernel",
-					PartitionSpec(
-						"tp",
-						("fsdp", "sp"),
-					),
-				),
-				("self_attn/dense/bias", PartitionSpec("tp")),
-				(
-					"self_attn/(q_proj|k_proj|v_proj)/kernel",
-					PartitionSpec(("fsdp", "sp"), "tp"),
-				),
-				(
-					"self_attn/(q_proj|k_proj|v_proj)/bias",
-					PartitionSpec(
-						"tp",
-					),
-				),
-				("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("lm_head/bias", PartitionSpec("tp")),
-				(
-					".*",
-					PartitionSpec(
-						None,
-					),
-				),
-			)
+			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
+			("final_layernorm/(scale|bias)", PartitionSpec(None)),
+			("final_layernorm/(scale|bias)", PartitionSpec(None)),
+			("mlp/fc1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("mlp/fc1/bias", PartitionSpec("tp")),
+			("mlp/fc2/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("mlp/fc2/bias", PartitionSpec(("fsdp", "sp"))),
+			("self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/(q_proj|k_proj|v_proj)/bias", PartitionSpec("tp")),
+			("self_attn/dense/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("self_attn/dense/bias", PartitionSpec("tp")),
+			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("lm_head/bias", PartitionSpec("tp")),
+			(".*", PartitionSpec(None)),
 		)
 
 	@property

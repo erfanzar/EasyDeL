@@ -177,14 +177,14 @@ class FalconConfig(EasyDeLBaseConfig):
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
-			("word_embeddings/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+			("word_embeddings/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
 			(
-				"self_attention/query_key_value/(kernel)",
+				"self_attention/query_key_value/kernel",
 				PartitionSpec("tp", ("fsdp", "sp")),
 			),
-			("self_attention/dense/(kernel)", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attention/dense/(kernel)", PartitionSpec(("fsdp", "sp"), "tp")),
 			("mlp/dense_4h_to_h/(kernel)", PartitionSpec("tp", ("fsdp", "sp"))),
-			("mlp/dense_h_to_4h/(kernel)", PartitionSpec("tp", ("fsdp", "sp"))),
+			("mlp/dense_h_to_4h/(kernel)", PartitionSpec(("fsdp", "sp"), "tp")),
 			("lm_head/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
 			("transformer/ln_f/bias", PartitionSpec(("fsdp", "sp"))),
 			("transformer/ln_f/scale", PartitionSpec(("fsdp", "sp"))),

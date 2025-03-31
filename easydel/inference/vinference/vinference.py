@@ -34,7 +34,6 @@ from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
 from jax._src.stages import Compiled
-from jax.interpreters import pxla
 from jax.sharding import NamedSharding, PartitionSpec
 from pydantic import BaseModel
 
@@ -69,22 +68,6 @@ else:
 
 logger = get_logger("vInference")
 TIME = str(datetime.fromtimestamp(time.time())).split(" ")[0]
-
-
-def extract_shardings(tree, mesh=None):
-	if mesh is None:
-		mesh = pxla.thread_resources.env.physical_mesh
-
-	def cond(x):
-		sharding = x.sharding if hasattr(x, "sharding") else None
-		if isinstance(sharding, jax.sharding.PartitionSpec):
-			assert mesh is not None, "Mesh Can not be none (use function under with `mesh`)."
-			sharding = jax.sharding.NamedSharding(mesh=mesh, spec=sharding)
-		if not isinstance(sharding, jax.sharding.NamedSharding):
-			return None
-		return sharding
-
-	return jax.tree_util.tree_map(cond, tree)
 
 
 class vInferenceMetaData(BaseModel):
@@ -1015,9 +998,9 @@ class vInference:
 				prefill_fn,
 				static_argnums=(0, 4),
 				in_shardings=(
-					extract_shardings(self.graphstate),
-					extract_shardings(self.graphother),
-					extract_shardings(state),
+					es.extract_shardings(self.graphstate),
+					es.extract_shardings(self.graphother),
+					es.extract_shardings(state),
 				),
 			).lower(
 				self.graphdef,  # Static
@@ -1031,14 +1014,14 @@ class vInference:
 			logger.info("smart compiling `decode`")
 			logger.info("lowering `decode`")
 			sample_state = compiled_prefill_fn(self.graphstate, self.graphother, state)
-			sample_state_shardings = extract_shardings(sample_state)
+			sample_state_shardings = es.extract_shardings(sample_state)
 
 			decode_lowered = jax.jit(
 				decode_fn,
 				static_argnums=(0, 4),
 				in_shardings=(
-					extract_shardings(self.graphstate),
-					extract_shardings(self.graphother),
+					es.extract_shardings(self.graphstate),
+					es.extract_shardings(self.graphother),
 					sample_state_shardings,
 					None,
 				),

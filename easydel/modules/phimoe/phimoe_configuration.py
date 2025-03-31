@@ -201,77 +201,17 @@ class PhiMoeConfig(EasyDeLBaseConfig):
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
-			(
-				("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-				(
-					"norm/kernel",
-					PartitionSpec(
-						("fsdp", "sp"),
-					),
-				),
-				(
-					"post_attention_layernorm/kernel",
-					PartitionSpec(
-						("fsdp", "sp"),
-					),
-				),
-				(
-					"input_layernorm/kernel",
-					PartitionSpec(
-						("fsdp", "sp"),
-					),
-				),
-				("mlp/gate_up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("self_attn/qkv_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				(
-					".*",
-					PartitionSpec(
-						None,
-					),
-				),
-			)
-			if fully_sharded_data_parallel
-			else (
-				("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-				(
-					"norm/kernel",
-					PartitionSpec(
-						None,
-					),
-				),
-				(
-					"post_attention_layernorm/kernel",
-					PartitionSpec(
-						None,
-					),
-				),
-				(
-					"input_layernorm/kernel",
-					PartitionSpec(
-						None,
-					),
-				),
-				("mlp/gate_up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-				(
-					"self_attn/o_proj/kernel",
-					PartitionSpec(
-						"tp",
-						("fsdp", "sp"),
-					),
-				),
-				("self_attn/qkv_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				(
-					".*",
-					PartitionSpec(
-						None,
-					),
-				),
-			)
+			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
+			("norm/kernel", PartitionSpec(("fsdp", "sp"))),
+			("post_attention_layernorm/kernel", PartitionSpec(("fsdp", "sp"))),
+			("input_layernorm/kernel", PartitionSpec(("fsdp", "sp"))),
+			("mlp/w1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("mlp/w3/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("mlp/w2/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("self_attn/qkv_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			(".*", PartitionSpec(None)),
 		)
 
 	def _rope_scaling_validation(self):
