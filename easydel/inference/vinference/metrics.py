@@ -17,19 +17,23 @@ import gc
 import threading
 import time
 from dataclasses import fields
-
+from eformer.pytree import auto_pytree
 import jax
 import psutil
 
-from easydel.utils import traversals as etr
-
 try:
-	from prometheus_client import Counter, Gauge, Histogram, Info, start_http_server  # type:ignore
+	from prometheus_client import (  # type:ignore
+		Counter,
+		Gauge,
+		Histogram,
+		Info,
+		start_http_server,
+	)
 except ModuleNotFoundError:
 	Counter, Gauge, Histogram, Info, start_http_server = [None] * 5
 
 
-@etr.auto_pytree
+@auto_pytree
 class ModelMetadata:
 	batch_size: int
 	sequence_length: int

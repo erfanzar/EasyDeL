@@ -19,12 +19,11 @@ import jax
 from datasets import load_dataset
 from jax import numpy as jnp
 from transformers import AutoTokenizer
-
+from eformer.pytree import auto_pytree
 import easydel as ed
-from easydel.utils import traversals as etr
 
 
-@etr.auto_pytree
+@auto_pytree
 class RunTimeConfig:
 	"""
 	Configuration class for runtime settings.

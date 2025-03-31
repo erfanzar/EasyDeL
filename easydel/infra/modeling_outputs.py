@@ -24,10 +24,10 @@ import typing as tp
 from dataclasses import fields, is_dataclass
 
 import chex
+from eformer.pytree import auto_pytree
 from jax.core import Tracer
 
 from easydel.layers.caching import TransformerCache
-from easydel.utils import traversals as etr
 
 
 def _is_array(array):
@@ -50,13 +50,13 @@ class ModelOutput(tp.OrderedDict):
 		if is_modeloutput_subclass and not is_dataclass(self):
 			raise TypeError(
 				f"{self.__module__}.{self.__class__.__name__} is not a dataclasss."
-				" This is a subclass of ModelOutput and so must use the @etr.auto_pytree decorator."
+				" This is a subclass of ModelOutput and so must use the @auto_pytree decorator."
 			)
 
 	def __post_init__(self):
 		"""Check the ModelOutput dataclass.
 
-		Only occurs if @etr.auto_pytree decorator has been used.
+		Only occurs if @auto_pytree decorator has been used.
 		"""
 		class_fields = fields(self)
 
@@ -159,7 +159,7 @@ class ModelOutput(tp.OrderedDict):
 		return tuple(self[k] for k in self.keys())
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxBaseModelOutput(ModelOutput):
 	"""
 	Base class for model's outputs, with potential hidden states and attentions.
@@ -187,7 +187,7 @@ class FlaxBaseModelOutput(ModelOutput):
 	loss: tp.Optional[chex.Array] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxBaseModelOutputWithNoAttention(ModelOutput):
 	"""
 	Base class for model's outputs, with potential hidden states.
@@ -206,7 +206,7 @@ class FlaxBaseModelOutputWithNoAttention(ModelOutput):
 	loss: tp.Optional[chex.Array] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxBaseModelOutputWithPoolingAndNoAttention(ModelOutput):
 	"""
 	Base class for model's outputs that also contains a pooling of the last hidden states.
@@ -228,7 +228,7 @@ class FlaxBaseModelOutputWithPoolingAndNoAttention(ModelOutput):
 	loss: tp.Optional[chex.Array] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxImageClassifierOutputWithNoAttention(ModelOutput):
 	"""
 	Base class for outputs of image classification models.
@@ -248,7 +248,7 @@ class FlaxImageClassifierOutputWithNoAttention(ModelOutput):
 	loss: tp.Optional[chex.Array] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxBaseModelOutputWithPast(ModelOutput):
 	"""
 	Base class for model's outputs, with potential hidden states and attentions.
@@ -279,7 +279,7 @@ class FlaxBaseModelOutputWithPast(ModelOutput):
 	loss: tp.Optional[chex.Array] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxBaseModelOutputWithPooling(ModelOutput):
 	"""
 	Base class for model's outputs that also contains a pooling of the last hidden states.
@@ -311,7 +311,7 @@ class FlaxBaseModelOutputWithPooling(ModelOutput):
 	loss: tp.Optional[chex.Array] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxBaseModelOutputWithPoolingAndCrossAttentions(ModelOutput):
 	"""
 	Base class for model's outputs that also contains a pooling of the last hidden states.
@@ -361,7 +361,7 @@ class FlaxBaseModelOutputWithPoolingAndCrossAttentions(ModelOutput):
 	loss: tp.Optional[chex.Array] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxBaseModelOutputWithPastAndCrossAttentions(ModelOutput):
 	"""
 	Base class for model's outputs that may also contain a past key/values (to speed up sequential decoding).
@@ -408,7 +408,7 @@ class FlaxBaseModelOutputWithPastAndCrossAttentions(ModelOutput):
 	loss: tp.Optional[chex.Array] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxSeq2SeqModelOutput(ModelOutput):
 	"""
 	Base class for model encoder's outputs that also contains : pre-computed hidden states that can speed up sequential
@@ -470,7 +470,7 @@ class FlaxSeq2SeqModelOutput(ModelOutput):
 	loss: tp.Optional[chex.Array] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxCausalLMOutputWithCrossAttentions(ModelOutput):
 	"""
 	Base class for causal language model (or autoregressive) outputs.
@@ -512,7 +512,7 @@ class FlaxCausalLMOutputWithCrossAttentions(ModelOutput):
 	loss: tp.Optional[chex.Array] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxMaskedLMOutput(ModelOutput):
 	"""
 	Base class for masked language models outputs.
@@ -543,7 +543,7 @@ class FlaxMaskedLMOutput(ModelOutput):
 FlaxCausalLMOutput = FlaxMaskedLMOutput
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxSeq2SeqLMOutput(ModelOutput):
 	"""
 	Base class for sequence-to-sequence language models outputs.
@@ -601,7 +601,7 @@ class FlaxSeq2SeqLMOutput(ModelOutput):
 	loss: tp.Optional[chex.Array] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxNextSentencePredictorOutput(ModelOutput):
 	"""
 	Base class for outputs of models predicting if two sentences are consecutive or not.
@@ -629,7 +629,7 @@ class FlaxNextSentencePredictorOutput(ModelOutput):
 	loss: tp.Optional[chex.Array] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxSequenceClassifierOutput(ModelOutput):
 	"""
 	Base class for outputs of sentence classification models.
@@ -658,7 +658,7 @@ class FlaxSequenceClassifierOutput(ModelOutput):
 	aux_loss: tp.Optional[chex.Array] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxSeq2SeqSequenceClassifierOutput(ModelOutput):
 	"""
 	Base class for outputs of sequence-to-sequence sentence classification models.
@@ -716,7 +716,7 @@ class FlaxSeq2SeqSequenceClassifierOutput(ModelOutput):
 	loss: tp.Optional[chex.Array] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxMultipleChoiceModelOutput(ModelOutput):
 	"""
 	Base class for outputs of multiple choice models.
@@ -745,7 +745,7 @@ class FlaxMultipleChoiceModelOutput(ModelOutput):
 	loss: tp.Optional[chex.Array] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxTokenClassifierOutput(ModelOutput):
 	"""
 	Base class for outputs of token classification models.
@@ -772,7 +772,7 @@ class FlaxTokenClassifierOutput(ModelOutput):
 	loss: tp.Optional[chex.Array] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxQuestionAnsweringModelOutput(ModelOutput):
 	"""
 	Base class for outputs of question answering models.
@@ -802,7 +802,7 @@ class FlaxQuestionAnsweringModelOutput(ModelOutput):
 	loss: tp.Optional[chex.Array] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxSeq2SeqQuestionAnsweringModelOutput(ModelOutput):
 	"""
 	Base class for outputs of sequence-to-sequence question answering models.
@@ -863,7 +863,7 @@ class FlaxSeq2SeqQuestionAnsweringModelOutput(ModelOutput):
 	loss: tp.Optional[chex.Array] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class MoeModelOutput(FlaxMaskedLMOutput):
 	"""
 	Base class for MoE model outputs.
@@ -896,7 +896,7 @@ class MoeModelOutput(FlaxMaskedLMOutput):
 	loss: tp.Optional[chex.Array] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class MoeCausalLMOutput(FlaxMaskedLMOutput):
 	"""
 	Base class for causal language modeling (CLM) outputs of MoE models.
@@ -915,7 +915,7 @@ class MoeCausalLMOutput(FlaxMaskedLMOutput):
 	loss: tp.Optional[chex.Array] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class MambaOutput(FlaxBaseModelOutput):
 	last_hidden_state: chex.Array = None
 	cache_params: tp.Optional[tp.List[chex.Array]] = None
@@ -923,7 +923,7 @@ class MambaOutput(FlaxBaseModelOutput):
 	loss: tp.Optional[chex.Array] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class MambaCausalLMOutput(FlaxBaseModelOutput):
 	logits: chex.Array = None
 	cache_params: tp.Optional[tp.List[chex.Array]] = None
@@ -931,7 +931,7 @@ class MambaCausalLMOutput(FlaxBaseModelOutput):
 	loss: tp.Optional[chex.Array] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxCLIPTextModelOutput(ModelOutput):
 	"""
 	Base class for text model's outputs that also contains a pooling of the last hidden states.
@@ -961,7 +961,7 @@ class FlaxCLIPTextModelOutput(ModelOutput):
 	attentions: tp.Optional[tp.Tuple[chex.Array, ...]] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxImageClassifierOutput(ModelOutput):
 	"""
 	Base class for text model's outputs that also contains a pooling of the last hidden states.
@@ -991,7 +991,7 @@ class FlaxImageClassifierOutput(ModelOutput):
 	attentions: tp.Optional[tp.Tuple[chex.Array, ...]] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxCLIPOutput(ModelOutput):
 	"""
 	Args:
@@ -1031,7 +1031,7 @@ class FlaxCLIPOutput(ModelOutput):
 		)
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxGreedySearchOutput(ModelOutput):
 	"""
 	Flax Base class for outputs of decoder-only generation models using greedy search.
@@ -1045,7 +1045,7 @@ class FlaxGreedySearchOutput(ModelOutput):
 	sequences: chex.Array = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxSampleOutput(ModelOutput):
 	"""
 	Flax Base class for outputs of decoder-only generation models using sampling.
@@ -1059,7 +1059,7 @@ class FlaxSampleOutput(ModelOutput):
 	sequences: chex.Array = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class FlaxBeamSearchOutput(ModelOutput):
 	"""
 	Flax Base class for outputs of decoder-only generation models using greedy search.

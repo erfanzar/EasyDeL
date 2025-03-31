@@ -14,7 +14,7 @@
 import math
 import typing as tp
 from functools import partial
-
+from eformer.pytree import auto_pytree
 import chex
 import jax
 import jax.numpy as jnp
@@ -38,7 +38,6 @@ from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModul
 from easydel.layers.caching import TransformerCache, TransformerCacheView
 from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
-from easydel.utils import traversals as etr
 
 from .qwen2_vl_configuration import Qwen2VLConfig, Qwen2VLVisionConfig
 
@@ -204,7 +203,7 @@ def get_rope_index(
 		return position_ids, mrope_position_deltas
 
 
-@etr.auto_pytree
+@auto_pytree
 class Qwen2VLCausalLMOutputWithPast(ModelOutput):
 	"""
 	Base class for Qwen2VL causal language model (or autoregressive) outputs.

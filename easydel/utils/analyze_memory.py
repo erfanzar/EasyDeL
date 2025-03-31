@@ -22,10 +22,8 @@ import time
 import typing as tp
 from dataclasses import field
 from datetime import datetime
-
+from eformer.pytree import auto_pytree
 import jax
-
-from easydel.utils import traversals as etr
 
 logging.basicConfig(
 	level=logging.INFO,
@@ -202,7 +200,7 @@ class SMPMemoryMonitor:
 			print(f"Status: {entry['status']}")
 
 
-@etr.auto_pytree
+@auto_pytree
 class DeviceStats:
 	"""
 	Dataclass to store device statistics.

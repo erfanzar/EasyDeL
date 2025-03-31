@@ -25,10 +25,9 @@ from eformer.escale import PartitionAxis
 from jax import Array
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec as Ps
-
+from eformer.pytree import auto_pytree
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
-from easydel.utils import traversals as etr
 from easydel.utils.helpers import get_logger
 
 from ..ops import BaseOperation
@@ -36,7 +35,7 @@ from ..ops import BaseOperation
 logger = get_logger("EasyDeL-AttentionOperator")
 
 
-@etr.auto_pytree
+@auto_pytree
 class AttentionOutput:
 	"""
 	Container for the outputs of an attention operation.
@@ -67,7 +66,7 @@ class RuntimeType(Enum):
 	generation = "generation"
 
 
-@etr.auto_pytree
+@auto_pytree
 class AttentionMetadata:
 	"""
 	Holds configuration, context, and metadata for attention operations.

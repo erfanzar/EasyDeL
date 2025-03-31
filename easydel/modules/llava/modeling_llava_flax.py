@@ -34,15 +34,14 @@ from easydel.modules.auto.auto_modeling import (
 	AutoEasyDeLModelForCausalLM,
 	AutoEasyDeLVisionModel,
 )
-from easydel.utils import traversals as etr
 from easydel.utils.helpers import get_logger
-
+from eformer.pytree import auto_pytree
 from .llava_configuration import LlavaConfig
 
 logger = get_logger(__name__)
 
 
-@etr.auto_pytree
+@auto_pytree
 class LlavaCausalLMOutputWithPast(ModelOutput):
 	"""
 	Base class for Llava causal language model (or autoregressive) outputs.

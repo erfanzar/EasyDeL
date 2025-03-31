@@ -14,12 +14,10 @@
 
 
 import typing as tp
-
+from eformer.pytree import auto_pytree
 import jax
 import jax.numpy as jnp
 from jax.experimental.pallas import BlockSpec
-
-from easydel.utils import traversals as etr
 
 INTERPRET = False
 MIN_BLOCK_SIZE = 128
@@ -51,7 +49,7 @@ class SegmentIds(tp.NamedTuple):
 	kv: jax.Array  # [kv_seq_len]
 
 
-@etr.auto_pytree
+@auto_pytree
 class BlockSizes:
 	block_q: int
 	block_k_major: int

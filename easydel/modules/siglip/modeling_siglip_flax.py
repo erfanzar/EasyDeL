@@ -31,12 +31,11 @@ from easydel.infra.modeling_outputs import (
 from easydel.infra.utils import ACT2FN, control_mlp_sharding
 from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
 from easydel.layers.linear import ParallelLinear
-from easydel.utils import traversals as etr
-
+from eformer.pytree import auto_pytree
 from .configuration_siglip import SiglipConfig, SiglipTextConfig, SiglipVisionConfig
 
 
-@etr.auto_pytree
+@auto_pytree
 class SiglipVisionModelOutput(ModelOutput):
 	image_embeds: tp.Optional[chex.Array] = None
 	last_hidden_state: chex.Array = None
@@ -44,7 +43,7 @@ class SiglipVisionModelOutput(ModelOutput):
 	attentions: tp.Optional[tp.Tuple[chex.Array, ...]] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class SiglipTextModelOutput(ModelOutput):
 	text_embeds: tp.Optional[chex.Array] = None
 	last_hidden_state: chex.Array = None
@@ -52,7 +51,7 @@ class SiglipTextModelOutput(ModelOutput):
 	attentions: tp.Optional[tp.Tuple[chex.Array, ...]] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class SiglipOutput(ModelOutput):
 	loss: tp.Optional[chex.Array] = None
 	logits_per_image: chex.Array = None
