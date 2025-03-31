@@ -172,43 +172,21 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
-			(
-				("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-				(
-					"self_attn/(q_proj|k_proj|v_proj)/kernel",
-					PartitionSpec(("fsdp", "sp"), "tp"),
-				),
-				("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
-				("gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-				("up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				("shared_expert_gate/kernel", PartitionSpec(("fsdp", "sp"))),
-				("gate/kernel", PartitionSpec(("fsdp", "sp"))),
-				("input_layernorm/kernel", PartitionSpec(None)),
-				("post_attention_layernorm/kernel", PartitionSpec(None)),
-				("model/norm/kernel", PartitionSpec(None)),
-				("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				(".*", PartitionSpec(None)),
-			)
-			if not fully_sharded_data_parallel
-			else (
-				("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-				(
-					"self_attn/(q_proj|k_proj|v_proj)/kernel",
-					PartitionSpec(("fsdp", "sp"), "tp"),
-				),
-				("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
-				("gate_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-				("down_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-				("up_proj/kernel", PartitionSpec(("fsdp", "sp"))),
-				("shared_expert_gate/kernel", PartitionSpec(("fsdp", "sp"))),
-				("gate/kernel", PartitionSpec(("fsdp", "sp"))),
-				("input_layernorm/kernel", PartitionSpec(None)),
-				("post_attention_layernorm/kernel", PartitionSpec(None)),
-				("model/norm/kernel", PartitionSpec(None)),
-				("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-				(".*", PartitionSpec(("fsdp", "sp"))),
-			)
+			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
+			("self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/o_proj/kernel", PartitionSpec(("sp", "fsdp"), "tp")),
+			("gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("shared_expert_gate/kernel", PartitionSpec(("fsdp", "sp"))),
+			("gate/kernel", PartitionSpec(("fsdp", "sp"))),
+			("input_layernorm/kernel", PartitionSpec(None)),
+			("post_attention_layernorm/kernel", PartitionSpec(None)),
+			("model/norm/kernel", PartitionSpec(None)),
+			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			(".*", PartitionSpec(("fsdp", "sp"))),
 		)
 
 	def attach_custom_arguments(

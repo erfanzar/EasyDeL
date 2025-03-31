@@ -108,9 +108,14 @@ class PixtralVisionConfig(EasyDeLBaseConfig):
 			("patch_conv/kernel", PartitionSpec(None, None, None, "tp")),
 			("patch_conv/bias", PartitionSpec(None)),
 			# Attention layers
-			("attention/(q_proj|k_proj|v_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("attention/(q_proj|k_proj|v_proj)/bias", PartitionSpec(None)),
-			("attention/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("attention/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("attention/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("attention/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("attention/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			
+			("attention/q_proj/bias", PartitionSpec(None)),
+			("attention/k_proj/bias", PartitionSpec(None)),
+			("attention/v_proj/bias", PartitionSpec(None)),
 			("attention/o_proj/bias", PartitionSpec(None)),
 			# Feed forward layers
 			("feed_forward/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),

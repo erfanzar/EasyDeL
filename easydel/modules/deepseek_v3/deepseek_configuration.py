@@ -228,12 +228,12 @@ class DeepseekV3Config(EasyDeLBaseConfig):
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
-			("model/embed_tokens/embedding", PartitionSpec("tp", ("sp", "fsdp"))),
+			("embed_tokens/embedding", PartitionSpec(("sp", "fsdp"), "tp")),
 			("self_attn/q_a_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("self_attn/q_b_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("self_attn/kv_a_proj_with_mqa/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("self_attn/kv_b_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("self_attn/o_proj/kernel", PartitionSpec("tp", ("sp", "fsdp"))),
+			("self_attn/o_proj/kernel", PartitionSpec(("sp", "fsdp"), "tp")),
 			("self_attn/q_a_layernorm/kernel", PartitionSpec(None)),
 			("self_attn/kv_a_layernorm/kernel", PartitionSpec(None)),
 			("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),

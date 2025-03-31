@@ -162,7 +162,7 @@ class Mamba2Config(EasyDeLBaseConfig):
 		"""
 		return (
 			# Embeddings
-			("backbone/embeddings/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+			("backbone/embeddings/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
 			# Language model head
 			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("lm_head/bias", PartitionSpec("tp")),

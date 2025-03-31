@@ -145,15 +145,17 @@ class CohereConfig(EasyDeLBaseConfig):
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
-			("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-			(
-				"attn/(q_proj|k_proj|v_proj)/kernel",
-				PartitionSpec(("fsdp", "sp"), "tp"),
-			),
-			("attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
+			("self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("linear/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("linear_1/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
 			("linear_v/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
 			("gate/kernel", PartitionSpec("tp")),
 			("post_attn_norm/kernel", PartitionSpec(None)),
 			("pre_attn_norm/kernel", PartitionSpec(None)),

@@ -149,12 +149,11 @@ class Grok1Config(EasyDeLBaseConfig):
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
-			("model/embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-			(
-				"attn/(q_proj|k_proj|v_proj)/kernel",
-				PartitionSpec(("fsdp", "sp"), "tp"),
-			),
-			("attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
+			("attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("linear/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("linear_1/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
 			("linear_v/kernel", PartitionSpec(("fsdp", "sp"), "tp")),

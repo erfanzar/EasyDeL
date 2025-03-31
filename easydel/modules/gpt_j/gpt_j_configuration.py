@@ -138,17 +138,17 @@ class GPTJConfig(EasyDeLBaseConfig):
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
-			("model/wte/embedding", PartitionSpec(("fsdp", "sp"))),
+			("wte/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
 			(
 				"attn/(k_proj|v_proj|q_proj)/kernel",
-				PartitionSpec(("fsdp", "sp"), "tp"),
+				PartitionSpec("tp", ("fsdp", "sp")),
 			),
-			("attn/out_proj/kernel", PartitionSpec(("fsdp", "sp"))),
+			("attn/out_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("mlp/fc_out/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/fc_out/bias", PartitionSpec(("fsdp", "sp"))),
-			("mlp/fc_in/kernel", PartitionSpec(("fsdp", "sp"))),
+			("mlp/fc_out/bias", PartitionSpec("tp")),
+			("mlp/fc_in/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
 			("mlp/fc_in/bias", PartitionSpec(("fsdp", "sp"))),
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"))),
+			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("lm_head/bias", PartitionSpec(("fsdp", "sp"))),
 			(".*", PartitionSpec(("fsdp", "sp"))),
 		)

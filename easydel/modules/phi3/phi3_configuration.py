@@ -167,7 +167,7 @@ class Phi3Config(EasyDeLBaseConfig):
 			("mlp/gate_up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("self_attn/qkv_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("self_attn/qkv_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
 			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			(".*", PartitionSpec(None)),
 		)

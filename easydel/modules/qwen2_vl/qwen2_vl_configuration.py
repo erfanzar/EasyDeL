@@ -237,19 +237,19 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
 		"""
 		return (
 			# Language model embeddings
-			("embed_tokens/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
 			# Language model attention layers
 			(
 				"layers/.*/self_attn/(q_proj|k_proj|v_proj)/kernel",
-				PartitionSpec(("fsdp", "sp"), "tp"),
+				PartitionSpec("tp", ("fsdp", "sp")),
 			),
-			("layers/.*/self_attn/o_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("layers/.*/self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("layers/.*/self_attn/(q_proj|k_proj|v_proj)/bias", PartitionSpec("tp")),
 			("layers/.*/self_attn/o_proj/bias", PartitionSpec(None)),
 			# Language model MLP layers
 			("layers/.*/mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("layers/.*/mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
 			("layers/.*/mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("layers/.*/mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
 			("layers/.*/mlp/(gate_proj|down_proj|up_proj)/bias", PartitionSpec(None)),
 			# Language model norms
 			("layers/.*/input_layernorm/kernel", PartitionSpec(None)),
@@ -262,9 +262,9 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
 			("patch_embed/proj/kernel", PartitionSpec(None, None, None, None, "tp")),
 			("patch_embed/proj/bias", PartitionSpec(None)),
 			# Visual model attention blocks
-			("blocks/.*/attn/qkv/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("blocks/.*/attn/qkv/bias", PartitionSpec("tp")),
-			("blocks/.*/attn/proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("blocks/.*/attn/qkv/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("blocks/.*/attn/qkv/bias", PartitionSpec(("fsdp", "sp"))),
+			("blocks/.*/attn/proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("blocks/.*/attn/proj/bias", PartitionSpec("tp")),
 			# Visual model MLP blocks
 			("blocks/.*/mlp/fc1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),

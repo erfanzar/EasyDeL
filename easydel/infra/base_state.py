@@ -23,10 +23,10 @@ import jax
 import optax
 from flax import nnx as nn
 from flax import struct
+from eformer import escale as es
 from jax.sharding import NamedSharding, PartitionSpec
 from safetensors.flax import load_file as safe_load_file
 from safetensors.flax import save_file as safe_save_file
-from jax.interpreters import pxla
 from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import specs_to_name_sharding
 
@@ -43,22 +43,6 @@ WEIGHTS_NAME = "easydel-model.parameters"
 OPTIMIZER_NAME = "easydel-optstate.parameters"
 OPTIMIZER_STRUCT_NAME = "easydel-optstate.structure"
 logger = get_logger(__name__)
-
-
-def extract_shardings(tree, mesh=None):
-	if mesh is None:
-		mesh = pxla.thread_resources.env.physical_mesh
-
-	def cond(x):
-		sharding = x.sharding if hasattr(x, "sharding") else None
-		if isinstance(sharding, jax.sharding.PartitionSpec):
-			assert mesh is not None, "Mesh Can not be none (use function under with `mesh`)."
-			sharding = jax.sharding.NamedSharding(mesh=mesh, spec=sharding)
-		if not isinstance(sharding, jax.sharding.NamedSharding):
-			return None
-		return sharding
-
-	return jax.tree_util.tree_map(cond, tree)
 
 
 class EasyDeLState(struct.PyTreeNode):
@@ -216,9 +200,9 @@ class EasyDeLState(struct.PyTreeNode):
 		opt_state = jax.jit(
 			make,
 			out_shardings=named_shardings,
-			in_shardings=(extract_shardings(self.graphstate, mesh=self.model.mesh),),
+			in_shardings=(es.extract_shardings(self.graphstate, mesh=self.model.mesh),),
 		)(self.graphstate)
-		
+
 		return self.replace(tx=tx, opt_state=opt_state)
 
 	def shard_optimizer_state(

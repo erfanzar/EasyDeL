@@ -225,12 +225,14 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
 		fsdpsp_over_tp = PartitionSpec(("fsdp", "sp"), "tp")
 		tp_over_fsdpsp = PartitionSpec("tp", ("fsdp", "sp"))
 		return (
-			("model/embed_tokens/embedding", tp_over_fsdpsp),
-			("self_attn/(q_proj|k_proj|v_proj)/kernel", fsdpsp_over_tp),
-			("self_attn/o_proj/kernel", tp_over_fsdpsp),
+			("model/embed_tokens/embedding", fsdpsp_over_tp),
+			("self_attn/q_proj/kernel", tp_over_fsdpsp),
+			("self_attn/k_proj/kernel", tp_over_fsdpsp),
+			("self_attn/v_proj/kernel", tp_over_fsdpsp),
+			("self_attn/o_proj/kernel", fsdpsp_over_tp),
 			("mlp/gate_proj/kernel", fsdpsp_over_tp),
-			("mlp/down_proj/kernel", tp_over_fsdpsp),
 			("mlp/up_proj/kernel", fsdpsp_over_tp),
+			("mlp/down_proj/kernel", tp_over_fsdpsp),
 			("input_layernorm/kernel", PartitionSpec(None)),
 			("post_attention_layernorm/kernel", PartitionSpec(None)),
 			("pre_feedforward_layernorm/kernel", PartitionSpec(None)),
@@ -365,9 +367,11 @@ class Gemma3Config(EasyDeLBaseConfig):
 		fsdpsp_over_tp = PartitionSpec(("fsdp", "sp"), "tp")
 		tp_over_fsdpsp = PartitionSpec("tp", ("fsdp", "sp"))
 		return (
-			("language_model/model/embed_tokens/embedding", tp_over_fsdpsp),
-			("self_attn/(q_proj|k_proj|v_proj)/kernel", fsdpsp_over_tp),
-			("self_attn/o_proj/kernel", tp_over_fsdpsp),
+			("language_model/model/embed_tokens/embedding", fsdpsp_over_tp),
+			("self_attn/q_proj/kernel", tp_over_fsdpsp),
+			("self_attn/k_proj/kernel", tp_over_fsdpsp),
+			("self_attn/v_proj/kernel", tp_over_fsdpsp),
+			("self_attn/o_proj/kernel", fsdpsp_over_tp),
 			("mlp/gate_proj/kernel", fsdpsp_over_tp),
 			("mlp/down_proj/kernel", tp_over_fsdpsp),
 			("mlp/up_proj/kernel", fsdpsp_over_tp),

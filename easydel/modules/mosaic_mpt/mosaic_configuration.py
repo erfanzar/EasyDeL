@@ -247,7 +247,7 @@ class MptConfig(EasyDeLBaseConfig):
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
-			("transformer/wte/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
+			("wte/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
 			("attn/Wqkv/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("attn/out_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
 			("ffn/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),

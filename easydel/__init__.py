@@ -62,20 +62,20 @@ if _check_bool_flag("EASYDEL_AUTO", True):
 	)
 	_os.environ["LIBTPU_INIT_ARGS"] = (
 		_os.getenv("LIBTPU_INIT_ARGS", "") + " "
-		"--xla_jf_spmd_threshold_for_windowed_einsum_mib=0 "
-		"--xla_tpu_spmd_threshold_for_allgather_cse=10000  "
-		"--xla_tpu_enable_latency_hiding_scheduler=true "
-		"--xla_tpu_megacore_fusion_allow_ags=false "
-		"--xla_enable_async_collective_permute=true "
-		"--xla_tpu_enable_ag_backward_pipelining=true "
-		"--xla_tpu_enable_data_parallel_all_reduce_opt=true "
-		"--xla_tpu_data_parallel_opt_different_sized_ops=true "
-		"--xla_tpu_enable_async_collective_fusion=true "
-		"--xla_tpu_enable_async_collective_fusion_multiple_steps=true "
-		"--xla_tpu_overlap_compute_collective_tc=true "
-		"--xla_enable_async_all_gather=true "
-		"--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true "
-		"TPU_MEGACORE=MEGACORE_DENSE "
+		"--xla_tpu_enable_latency_hiding_scheduler=true "  # Concept supported
+		"--xla_enable_async_collective_permute=true "  # Aligns with async strategy
+		"--xla_tpu_enable_ag_backward_pipelining=true "  # Aligns with async/overlap strategy
+		"--xla_tpu_enable_data_parallel_all_reduce_opt=true "  #  Good for DP overlap
+		"--xla_tpu_data_parallel_opt_different_sized_ops=true "  # : Enables pipelining, BUT watch memory!
+		"--xla_tpu_enable_async_collective_fusion=true "  #  Key fusion flag
+		"--xla_tpu_enable_async_collective_fusion_multiple_steps=true "  #  More fusion flexibility
+		"--xla_tpu_overlap_compute_collective_tc=true "  #  Fine-grained overlap
+		"--xla_enable_async_all_gather=true "  # Needed for async AG fusion
+		"--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true "  #  Controls AG fusion
+		"TPU_MEGACORE=MEGACORE_DENSE "  # Or MEGACORE_XL
+		# --- Apply Key Changes Recommended Before & Supported by Text ---
+		# Text Sec 6/8: Enabling allows AG fusion with conv/AR. Likely Speedup.
+		"--xla_tpu_megacore_fusion_allow_ags=true "
 	)
 	_os.environ.update(
 		{
@@ -761,7 +761,7 @@ else:
 		extra_objects={"__version__": __version__},
 	)
 
-	_targeted_versions = ["0.0.19"]
+	_targeted_versions = ["0.0.20"]
 
 	from eformer import __version__ as _eform_version
 
