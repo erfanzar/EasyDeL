@@ -18,7 +18,7 @@ import typing as tp
 import warnings
 from contextlib import contextmanager
 from functools import partial
-
+from eformer.pytree import auto_pytree
 import chex
 import jax
 import numpy as np
@@ -28,7 +28,6 @@ from ml_collections.config_dict import placeholder
 
 from easydel.infra.utils import ProcessingClassType
 from easydel.utils import traversals
-from easydel.utils import traversals as etr
 from easydel.utils.helpers import get_logger
 
 logger = get_logger(__name__)
@@ -550,7 +549,7 @@ class DataCollatorForCompletionOnlyLM:
 		return batch
 
 
-@etr.auto_pytree
+@auto_pytree
 class RewardDataCollatorWithPadding:
 	r"""
 	Reward DataCollator class that pads the inputs to the maximum length of the batch.
@@ -623,7 +622,7 @@ class RewardDataCollatorWithPadding:
 		return batch
 
 
-@etr.auto_pytree
+@auto_pytree
 class DataCollatorForPreference:
 	r"""DPO DataCollator class that pads the tokenized inputs to the maximum length of the batch."""
 
@@ -723,7 +722,7 @@ class DataCollatorForPreference:
 		return output
 
 
-@etr.auto_pytree
+@auto_pytree
 class DPODataCollatorWithPadding:
 	r"""
 	DPO DataCollator class that pads the tokenized inputs to the maximum length of the batch.

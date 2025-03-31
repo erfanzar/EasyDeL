@@ -1,7 +1,7 @@
-easydel.inference.utils
+easydel.layers.ops._gla
 =======================
 
-.. automodule:: easydel.inference.utils
+.. automodule:: easydel.layers.ops._gla
     :members:
     :undoc-members:
     :show-inheritance:

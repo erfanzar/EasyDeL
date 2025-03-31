@@ -7,14 +7,13 @@ from datasets import load_dataset
 from jax import numpy as jnp
 from math_verify import LatexExtractionConfig, parse, verify  # type:ignore
 from transformers import AutoConfig, AutoTokenizer
-
+from eformer.pytree import auto_pytree
 import easydel as ed
 from easydel.infra.factory import registry
 from easydel.modules import *  # noqa # init
-from easydel.utils import traversals as etr
 
 
-@etr.auto_pytree
+@auto_pytree
 class RunTimeConfig:
 	"""
 	Configuration class for runtime settings.

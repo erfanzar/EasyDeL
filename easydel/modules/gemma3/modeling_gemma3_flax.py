@@ -41,15 +41,14 @@ from easydel.layers.caching import TransformerCache, TransformerCacheView
 from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import float8s
 from easydel.modules.auto.auto_modeling import AutoEasyDeLVisionModel
-from easydel.utils import traversals as etr
 from easydel.utils.helpers import get_logger
-
+from eformer.pytree import auto_pytree
 from .gemma3_configuration import Gemma3Config, Gemma3TextConfig
 
 logger = get_logger(__name__)
 
 
-@etr.auto_pytree
+@auto_pytree
 class Gemma3CausalLMOutputWithPast(ModelOutput):
 	"""
 	Base class for Gemma3 causal language model (or autoregressive) outputs.

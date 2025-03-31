@@ -36,22 +36,22 @@ from easydel.layers.caching import MambaCache
 from easydel.layers.caching.mamba_cache import MambaCacheMetaData, MambaCacheView
 from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm as MambaRMSNorm
-from .mamba_configuration import MambaConfig as MambaConfig
-from easydel.utils import traversals as etr
 
+from .mamba_configuration import MambaConfig as MambaConfig
+from eformer.pytree import auto_pytree
 
 def init_to_value(x, dtype):
 	return lambda _, shape, dtype: jnp.broadcast_to(jnp.asarray(x, dtype=dtype), shape)
 
 
-@etr.auto_pytree
+@auto_pytree
 class MambaOutput(FlaxBaseModelOutput):
 	last_hidden_state: chex.Array = None
 	cache: tp.Optional[MambaCache] = None
 	hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class MambaCausalLMOutput(FlaxBaseModelOutput):
 	logits: chex.Array = None
 	cache: tp.Optional[MambaCache] = None

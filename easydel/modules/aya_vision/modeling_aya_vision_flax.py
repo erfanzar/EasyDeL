@@ -30,15 +30,14 @@ from easydel.modules.auto.auto_modeling import (
 	AutoEasyDeLModelForCausalLM,
 	AutoEasyDeLVisionModel,
 )
-from easydel.utils import traversals as etr
 from easydel.utils.helpers import get_logger
-
+from eformer.pytree import auto_pytree
 from .aya_vision_configuration import AyaVisionConfig
 
 logger = get_logger(__name__)
 
 
-@etr.auto_pytree
+@auto_pytree
 class AyaVisionCausalLMOutputWithPast(ModelOutput):
 	"""
 	Base class for AyaVision causal language model (or autoregressive) outputs.

@@ -28,9 +28,7 @@ import numpy as np
 from jax import lax
 from jax import numpy as jnp
 from jax.lax import PrecisionLike
-
-from easydel.utils import traversals as etr
-
+from eformer.pytree import auto_pytree
 from .gpu_ops import triton_matmul
 from .tpu_ops import pallas_matmul
 
@@ -271,7 +269,7 @@ def _analyze_matmul(
 	return time, mm_flops
 
 
-@etr.auto_pytree
+@auto_pytree
 class _MatMulConfig:
 	block_m: int
 	block_n: int

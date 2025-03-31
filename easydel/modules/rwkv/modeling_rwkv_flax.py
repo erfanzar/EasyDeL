@@ -25,14 +25,13 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import ModelOutput
 from easydel.layers.linear import ParallelLinear
-from easydel.utils import traversals as etr
-
+from eformer.pytree import auto_pytree
 from .rwkv_configuration import RwkvConfig as RwkvConfig
 
 # NOTE:Updated but wont work forsure, check this later.
 
 
-@etr.auto_pytree
+@auto_pytree
 class RwkvOutput(ModelOutput):
 	last_hidden_state: chex.Array = None
 	state: tp.Optional[tp.Tuple[chex.Array, ...]] = None
@@ -40,7 +39,7 @@ class RwkvOutput(ModelOutput):
 	attentions: tp.Optional[tp.Tuple[chex.Array, ...]] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class RwkvCausalLMOutput(ModelOutput):
 	logits: chex.Array = None
 	state: tp.Optional[tp.List[chex.Array]] = None

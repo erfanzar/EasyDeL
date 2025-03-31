@@ -12,24 +12,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import typing as tp
-from dataclasses import dataclass
-from contextlib2 import nullcontext
-from jax.experimental.shard_map import shard_map
+
 import jax.numpy as jnp
+from eformer import escale as es
+from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from flax.nnx.nn.dtypes import promote_dtype
 from jax import lax
+from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh
-from eformer import escale as es
+from jax.sharding import PartitionSpec as Ps
+
 from easydel.kernels.collective_matmul import (
 	MatrixMultiplyMethod,
 	create_distributed_matmul,
 	prepare_matrix_for_all_gather,
 	prepare_matrix_for_reduce_scatter,
 )
-from jax.sharding import PartitionSpec as Ps, NamedSharding as Ns
 
 # Type Aliases
 Array = jnp.ndarray
@@ -170,7 +170,7 @@ def get_matmul_output_sharding(lhs_pspec, rhs_pspec):
 	return Ps(*output_dims)
 
 
-@es.auto_pytree
+@auto_pytree
 class TensorParallelConfig:
 	"""Configuration for Tensor Parallelism.
 

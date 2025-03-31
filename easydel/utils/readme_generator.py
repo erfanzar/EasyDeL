@@ -14,9 +14,8 @@
 import os
 import typing as tp
 from dataclasses import field
-from easydel.utils import traversals as etr
 from pathlib import Path
-
+from eformer.pytree import auto_pytree
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from easydel import __version__
@@ -121,7 +120,7 @@ This model is well-suited for the following tasks:
 """
 
 
-@etr.auto_pytree
+@auto_pytree
 class ModelInfo:
 	"""Model information container."""
 

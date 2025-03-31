@@ -14,7 +14,7 @@
 import math
 import typing as tp
 from functools import partial
-
+from eformer.pytree import auto_pytree
 import jax
 import numpy as np
 import requests
@@ -22,7 +22,6 @@ from flax import nnx as nn
 from jax import numpy as jnp
 from transformers.models.whisper.tokenization_whisper import TO_LANGUAGE_CODE
 
-from easydel.utils import traversals as etr
 from easydel.utils.compiling_utils import get_safe_hash_int
 
 if tp.TYPE_CHECKING:
@@ -63,7 +62,7 @@ def _compiled_generate(
 	)
 
 
-@etr.auto_pytree
+@auto_pytree
 class vWhisperInferenceConfig:
 	"""
 	Configuration class for Whisper inference.

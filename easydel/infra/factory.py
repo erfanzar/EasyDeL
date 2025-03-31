@@ -15,9 +15,7 @@
 import inspect
 import typing as tp
 from enum import Enum
-
-from easydel.utils import traversals as etr
-
+from eformer.pytree import auto_pytree
 from .base_module import (
 	EasyDeLBaseConfig,
 	EasyDeLBaseModule,
@@ -44,7 +42,7 @@ class TaskType(str, Enum):
 	IMAGE_CLASSIFICATION = "image-classification"
 
 
-@etr.auto_pytree
+@auto_pytree
 class ModuleRegistration:
 	module: type[EasyDeLBaseModule]
 	config: type[EasyDeLBaseConfig]

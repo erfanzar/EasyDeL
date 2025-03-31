@@ -36,11 +36,10 @@ from rich.progress import (
 	TaskID,
 )
 from rich.text import Text
-
+from eformer.pytree import auto_pytree
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import CompilationTracker
-from easydel.utils import traversals as etr
 from easydel.utils.checkpoint_managers.streamer import CheckpointManager
 from easydel.utils.traversals import flatten_dict
 
@@ -71,7 +70,7 @@ else:
 logger = get_logger(__name__)
 
 
-@etr.auto_pytree
+@auto_pytree
 class TrainerConfigureDataloaderOutput:
 	dataloader_train: tp.Iterator[np.ndarray]
 	max_training_steps: int
@@ -79,7 +78,7 @@ class TrainerConfigureDataloaderOutput:
 	max_evaluation_steps: tp.Optional[int] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class TrainerConfigureModelOutput:
 	model: EasyDeLBaseModule
 	tx: GradientTransformation
@@ -87,7 +86,7 @@ class TrainerConfigureModelOutput:
 	config: tp.Optional[EasyDeLBaseConfig] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class TrainerConfigureFunctionOutput:
 	sharded_training_step_function: JitWrapped
 	mesh: Mesh
@@ -95,7 +94,7 @@ class TrainerConfigureFunctionOutput:
 	sharded_evaluation_step_function: tp.Optional[JitWrapped] = None
 
 
-@etr.auto_pytree
+@auto_pytree
 class TrainerOutput:
 	state: EasyDeLState
 	mesh: tp.Optional[jax.sharding.Mesh]

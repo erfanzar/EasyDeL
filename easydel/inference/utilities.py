@@ -20,11 +20,12 @@ import jax.experimental
 import jax.experimental.pallas
 import jax.random
 from eformer.escale import PartitionAxis
+from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax import random, sharding
 from jax.sharding import PartitionSpec
-from easydel.utils import traversals as etr
+
 from easydel.utils.compiling_utils import get_safe_hash_int
 
 from .logits_process import (
@@ -41,7 +42,7 @@ from .logits_process import (
 )
 
 
-@etr.auto_pytree
+@auto_pytree
 class vInferencePreCompileConfig:
 	batch_size: tp.Union[int, tp.List[int]] = 1
 	prefill_length: tp.Optional[tp.Union[int, tp.List[int]]] = None
@@ -131,7 +132,7 @@ class vInferencePreCompileConfig:
 vInferencePreCompileConfig.__hash__ = vInferencePreCompileConfig.get_default_hash
 
 
-@etr.auto_pytree
+@auto_pytree
 class vInferenceConfig:
 	max_new_tokens: int = 64
 	min_length: tp.Optional[int] = None

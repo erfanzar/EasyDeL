@@ -14,8 +14,6 @@
 
 """Utility functions for managing and manipulating nnx module states."""
 
-import dataclasses
-import types
 import typing as tp
 from collections.abc import Iterable
 from copy import deepcopy
@@ -25,7 +23,6 @@ import jax
 import jax.numpy as jnp
 from flax import nnx, struct
 from flax.nnx import traversals
-from jax import tree_util as jtu
 from jax.interpreters import pxla
 from jax.sharding import Mesh, NamedSharding
 
@@ -674,133 +671,6 @@ def named_tree_map(
 		*rest,
 		is_leaf=is_leaf,
 	)
-
-
-_CLS = tp.TypeVar("_CLS")
-
-
-def auto_pytree(
-	cls: _CLS = None,
-	meta_fields: tp.Optional[tp.Tuple[str, ...]] = None,
-) -> _CLS:
-	"""
-	Register a class as a JAX PyTree with automatic field inference.
-
-	This function wraps jax.tree_util.register_dataclass to automatically infer
-	data_fields based on the provided meta_fields. It first converts the class
-	to a dataclass if it isn't already one, then determines which fields should
-	be treated as data fields (traversed by JAX) and which should be treated as
-	metadata fields (not traversed).
-
-	Args:
-	    cls: The class to be registered as a PyTree.
-	    meta_fields: A tuple of field names to be treated as metadata fields.
-	                 These fields will not be traversed by JAX's PyTree functions.
-	                 Defaults to None (auto-detection).
-
-	Returns:
-	    The registered dataclass that can be used with JAX's PyTree operations.
-
-	Example:
-	    # Fully automatic inference
-	    >>> @auto_pytree
-	    >>> class Vector:
-	    >>>     x: float  # Automatically a data field
-	    >>>     y: float  # Automatically a data field
-	    >>>     name: str  # Automatically a meta field (str is not JAX-compatible)
-
-	    # With explicit meta_fields
-	    >>> @auto_pytree(meta_fields=("z",))
-	    >>> class Vector3D:
-	    >>>     x: float
-	    >>>     y: float
-	    >>>     z: float  # Explicitly marked as meta field despite being a JAX-compatible type
-	"""
-
-	NON_JAX_TYPES = (
-		str,
-		bytes,
-		types.FunctionType,
-		types.MethodType,
-		type,
-		tp.Callable,
-	)
-
-	def is_non_jax_type(typ):
-		"""Check if a type is not JAX-compatible."""
-		if typ is tp.Any:
-			return False
-		origin = tp.get_origin(typ)
-		if origin is tp.Union:
-			args = tp.get_args(typ)
-			return any(is_non_jax_type(arg) for arg in args)
-
-		for non_jax_type in NON_JAX_TYPES:
-			try:
-				if issubclass(typ, non_jax_type):
-					return True
-			except TypeError:
-				pass
-
-		return False
-
-	def wrap(cls):
-		cls = dataclasses.dataclass(cls)
-		fields = [f for f in dataclasses.fields(cls) if f.init]
-		all_field_names = tuple(f.name for f in fields)
-		final_meta_fields: tp.Set[str] = set(meta_fields or ())
-
-		# Get meta fields from metadata
-		metadata_meta_fields = {
-			f.name for f in fields if f.metadata and f.metadata.get("pytree_node") is False
-		}
-		final_meta_fields.update(metadata_meta_fields)
-
-		# Get meta fields from type
-		for field in fields:
-			if field.name in final_meta_fields:
-				continue
-
-			if hasattr(field, "type") and field.type is not None:
-				if is_non_jax_type(field.type):
-					final_meta_fields.add(field.name)
-
-		data_fields = tuple(f for f in all_field_names if f not in final_meta_fields)
-
-		# Fix the replace method to properly handle the class
-		def replace_method(self, **kwargs):
-			return dataclasses.replace(self, **kwargs)
-
-		cls.replace = replace_method
-
-		# Improve __repr__ to show which fields are data vs meta
-		original_repr = cls.__repr__
-
-		def enhanced_repr(self):
-			base_repr = original_repr(self)
-			if hasattr(self, "__pytree_meta__"):
-				meta_info = (
-					f" [data_fields={data_fields}, meta_fields={tuple(final_meta_fields)}]"
-				)
-				return base_repr[:-1] + meta_info + base_repr[-1:]
-			return base_repr
-
-		cls.__repr__ = enhanced_repr
-		cls.__pytree_meta__ = {
-			"data_fields": data_fields,
-			"meta_fields": tuple(final_meta_fields),
-		}
-		return jtu.register_dataclass(
-			cls,
-			data_fields=data_fields,
-			meta_fields=tuple(final_meta_fields),
-		)
-
-	# Handle both @auto_pytree and @auto_pytree(meta_fields=(...))
-
-	if cls is None:
-		return wrap
-	return wrap(cls)
 
 
 def deepcopy_model(model):

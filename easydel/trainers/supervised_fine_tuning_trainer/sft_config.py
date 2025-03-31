@@ -14,13 +14,12 @@
 import typing as tp
 from dataclasses import field
 
-from easydel.utils import traversals as etr
 from easydel.utils.compiling_utils import hash_fn
-
+from eformer.pytree import auto_pytree
 from ..training_configurations import TrainingArguments
 
 
-@etr.auto_pytree
+@auto_pytree
 class SFTConfig(TrainingArguments):
 	r"""
 	Configuration class for the [`SFTTrainer`].

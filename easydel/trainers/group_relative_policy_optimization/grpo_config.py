@@ -13,14 +13,13 @@
 # limitations under the License.
 import typing as tp
 from dataclasses import field
-
-from easydel.utils import traversals as etr
+from eformer.pytree import auto_pytree
 from easydel.utils.compiling_utils import hash_fn
 
 from ..training_configurations import TrainingArguments
 
 
-@etr.auto_pytree
+@auto_pytree
 class GRPOConfig(TrainingArguments):
 	"""
 	Configuration class for the GRPOTrainer.

@@ -17,13 +17,11 @@ import asyncio
 import typing as tp
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
-
+from eformer.pytree import auto_pytree
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 
-
-from easydel.utils import traversals as etr
 from easydel.utils.helpers import get_logger
 from easydel.utils.lazy_import import is_package_available
 
@@ -50,7 +48,7 @@ APP = FastAPI()
 logger = get_logger(__name__)
 
 
-@etr.auto_pytree
+@auto_pytree
 class EndpointConfig:
 	path: str
 	handler: tp.Callable
