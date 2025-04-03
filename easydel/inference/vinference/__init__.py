@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ..utilities import vInferencePreCompileConfig
+from ..utilities import vInferencePreCompileConfig, SamplingParams
 from .api_server import vInferenceApiServer
 from .vinference import vInference, vInferenceConfig
 
@@ -21,4 +21,5 @@ __all__ = (
 	"vInferenceConfig",
 	"vInferenceApiServer",
 	"vInferencePreCompileConfig",
+	"SamplingParams",
 )

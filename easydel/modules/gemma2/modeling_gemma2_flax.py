@@ -24,9 +24,9 @@ from flax import nnx as nn
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
-	FlaxBaseModelOutput,
-	FlaxCausalLMOutput,
-	FlaxSequenceClassifierOutput,
+	BaseModelOutput,
+	CausalLMOutput,
+	SequenceClassifierOutput,
 )
 from easydel.infra.utils import (
 	ACT2FN,
@@ -35,8 +35,15 @@ from easydel.infra.utils import (
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 )
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import (
+	PagedAttentionCache,
+	PagedAttentionCacheView,
+	PagedAttentionMetadata,
+	TransformerCache,
+	TransformerCacheView,
+	TransformerMetadata,
+)
 from easydel.layers.linear import ParallelLinear
 from easydel.utils.helpers import get_logger
 
@@ -63,7 +70,7 @@ class Gemma2RMSNorm(nn.Module):
 		)
 
 
-class Gemma2Attention(FlaxAttentionModule):
+class Gemma2Attention(AttentionModule):
 	def __init__(
 		self,
 		config: Gemma2Config,
@@ -160,8 +167,9 @@ class Gemma2Attention(FlaxAttentionModule):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
-		causal_mask: chex.Array,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[chex.Array | bool],
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
@@ -236,6 +244,8 @@ class Gemma2Attention(FlaxAttentionModule):
 			key_states=key_states,
 			value_states=value_states,
 			bias=None,
+			cache_metadata=cache_metadata,
+			cache_view=cache_view,
 			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
 			segment_ids=segment_ids,
@@ -364,8 +374,9 @@ class Gemma2DecoderLayer(nn.Module):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
-		causal_mask: chex.Array,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[chex.Array | bool],
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
@@ -396,6 +407,7 @@ class Gemma2DecoderLayer(nn.Module):
 			position_ids,
 			causal_mask,
 			cache_view,
+			cache_metadata,
 			segment_ids,
 			output_attentions,
 			fcm_mask,
@@ -474,9 +486,10 @@ class Gemma2Model(EasyDeLBaseModule):
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
-	) -> tp.Union[FlaxBaseModelOutput, tp.Tuple]:
+	) -> tp.Union[BaseModelOutput, tp.Tuple]:
 		"""
 		Forward pass through the Gemma2 module.
 
@@ -493,7 +506,7 @@ class Gemma2Model(EasyDeLBaseModule):
 		    return_dict (bool): If True, return a dictionary of outputs.
 
 		Returns:
-		    FlaxBaseModelOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
+		    BaseModelOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
 		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
@@ -534,6 +547,7 @@ class Gemma2Model(EasyDeLBaseModule):
 				position_ids=position_ids,
 				causal_mask=self.causal_mask,
 				cache_view=past_key_values.views[idx],
+				cache_metadata=cache_metadata,
 				output_attentions=output_attentions,
 				segment_ids=segment_ids,
 				frequencies=self.frequencies,
@@ -552,7 +566,7 @@ class Gemma2Model(EasyDeLBaseModule):
 		if not return_dict:
 			return tuple(v for v in outputs if v is not None)
 
-		return FlaxBaseModelOutput(
+		return BaseModelOutput(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
 			attentions=all_attentions,
@@ -610,9 +624,10 @@ class Gemma2ForCausalLM(EasyDeLBaseModule):
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
-	) -> tp.Union[FlaxCausalLMOutput, tp.Tuple]:
+	) -> tp.Union[CausalLMOutput, tp.Tuple]:
 		"""
 		Forward pass through the Gemma2 module.
 
@@ -629,7 +644,7 @@ class Gemma2ForCausalLM(EasyDeLBaseModule):
 		    return_dict (bool): If True, return a dictionary of outputs.
 
 		Returns:
-		    FlaxCausalLMOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
+		    CausalLMOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
 
 		outputs = self.model(
@@ -639,6 +654,7 @@ class Gemma2ForCausalLM(EasyDeLBaseModule):
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
@@ -662,7 +678,7 @@ class Gemma2ForCausalLM(EasyDeLBaseModule):
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
 
-		return FlaxCausalLMOutput(
+		return CausalLMOutput(
 			logits=lm_logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
@@ -720,11 +736,12 @@ class Gemma2ForSequenceClassification(EasyDeLBaseModule):
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
-	) -> tp.Union[FlaxSequenceClassifierOutput, tp.Tuple]:
+	) -> tp.Union[SequenceClassifierOutput, tp.Tuple]:
 		transformer_outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
@@ -764,7 +781,7 @@ class Gemma2ForSequenceClassification(EasyDeLBaseModule):
 			output = (pooled_logits,) + transformer_outputs[1:]
 			return output
 
-		return FlaxSequenceClassifierOutput(
+		return SequenceClassifierOutput(
 			logits=pooled_logits,
 			past_key_values=past_key_values,
 			hidden_states=transformer_outputs.hidden_states,

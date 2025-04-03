@@ -25,22 +25,27 @@ from jax import numpy as jnp
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
-	FlaxBaseModelOutputWithPastAndCrossAttentions,
-	FlaxBaseModelOutputWithPoolingAndCrossAttentions,
-	FlaxCausalLMOutputWithCrossAttentions,
-	FlaxMultipleChoiceModelOutput,
-	FlaxQuestionAnsweringModelOutput,
-	FlaxSequenceClassifierOutput,
-	FlaxTokenClassifierOutput,
+	BaseModelOutputWithPastAndCrossAttentions,
+	BaseModelOutputWithPoolingAndCrossAttentions,
+	CausalLMOutputWithCrossAttentions,
+	MultipleChoiceModelOutput,
+	QuestionAnsweringModelOutput,
+	SequenceClassifierOutput,
+	TokenClassifierOutput,
 )
 from easydel.infra.utils import (
 	ACT2FN,
 	auto_remat,
 	get_dot_general_by_bits,
 )
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import TransformerCacheView
-from easydel.layers.caching.transformer_cache import TransformerCache
+from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import (
+	PagedAttentionCacheView,
+	PagedAttentionMetadata,
+	TransformerCache,
+	TransformerCacheView,
+	TransformerMetadata,
+)
 from easydel.layers.linear import ParallelLinear
 
 from .roberta_configuration import RobertaConfig as RobertaConfig
@@ -114,7 +119,7 @@ class RobertaEmbeddings(nn.Module):
 		return hidden_states
 
 
-class RobertaSelfAttention(FlaxAttentionModule):
+class RobertaSelfAttention(AttentionModule):
 	def __init__(
 		self,
 		config: RobertaConfig,
@@ -192,7 +197,8 @@ class RobertaSelfAttention(FlaxAttentionModule):
 		attention_mask,
 		layer_head_mask,
 		causal_mask: tp.Optional[chex.Array] = None,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
 		key_value_states: tp.Optional[jnp.array] = None,
 		output_attentions: bool = False,
@@ -338,7 +344,8 @@ class RobertaAttention(nn.Module):
 		attention_mask,
 		layer_head_mask,
 		causal_mask: tp.Optional[chex.Array] = None,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		key_value_states=None,
 		output_attentions: bool = False,
 	):
@@ -489,7 +496,8 @@ class RobertaLayer(nn.Module):
 		attention_mask,
 		layer_head_mask,
 		causal_mask: tp.Optional[chex.Array] = None,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		encoder_hidden_states: tp.Optional[chex.Array] = None,
 		encoder_attention_mask: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
@@ -624,7 +632,7 @@ class RobertaEncoder(nn.Module):
 		if not return_dict:
 			return tuple(v for v in outputs if v is not None)
 
-		return FlaxBaseModelOutputWithPastAndCrossAttentions(
+		return BaseModelOutputWithPastAndCrossAttentions(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
 			attentions=all_attentions,
@@ -887,7 +895,7 @@ class RobertaModel(EasyDeLBaseModule):
 				return (hidden_states,) + outputs[1:]
 			return (hidden_states, pooled) + outputs[1:]
 
-		return FlaxBaseModelOutputWithPoolingAndCrossAttentions(
+		return BaseModelOutputWithPoolingAndCrossAttentions(
 			last_hidden_state=hidden_states,
 			pooler_output=pooled,
 			hidden_states=outputs.hidden_states,
@@ -963,7 +971,7 @@ class RobertaForSequenceClassification(EasyDeLBaseModule):
 		if not return_dict:
 			return (logits,) + outputs[1:]
 
-		return FlaxSequenceClassifierOutput(
+		return SequenceClassifierOutput(
 			logits=logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
@@ -1060,7 +1068,7 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
 		if not return_dict:
 			return (reshaped_logits,) + outputs[2:]
 
-		return FlaxMultipleChoiceModelOutput(
+		return MultipleChoiceModelOutput(
 			logits=reshaped_logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
@@ -1141,7 +1149,7 @@ class RobertaForTokenClassification(EasyDeLBaseModule):
 		if not return_dict:
 			return (logits,) + outputs[1:]
 
-		return FlaxTokenClassifierOutput(
+		return TokenClassifierOutput(
 			logits=logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
@@ -1216,7 +1224,7 @@ class RobertaForQuestionAnswering(EasyDeLBaseModule):
 		if not return_dict:
 			return (start_logits, end_logits) + outputs[1:]
 
-		return FlaxQuestionAnsweringModelOutput(
+		return QuestionAnsweringModelOutput(
 			start_logits=start_logits,
 			end_logits=end_logits,
 			hidden_states=outputs.hidden_states,
@@ -1302,7 +1310,7 @@ class RobertaForCausalLM(EasyDeLBaseModule):
 		if not return_dict:
 			return (logits,) + outputs[1:]
 
-		return FlaxCausalLMOutputWithCrossAttentions(
+		return CausalLMOutputWithCrossAttentions(
 			logits=logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,

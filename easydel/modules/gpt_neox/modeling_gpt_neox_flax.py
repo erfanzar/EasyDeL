@@ -23,23 +23,27 @@ from jax import numpy as jnp
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import (
-	FlaxBaseModelOutput,
-	FlaxCausalLMOutput,
-)
+from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
 from easydel.infra.utils import (
 	ACT2FN,
 	auto_remat,
 	control_mlp_sharding,
 )
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import (
+	PagedAttentionCache,
+	PagedAttentionCacheView,
+	PagedAttentionMetadata,
+	TransformerCache,
+	TransformerCacheView,
+	TransformerMetadata,
+)
 from easydel.layers.linear import ParallelLinear
 
 from .gpt_neox_configuration import GPTNeoXConfig as GPTNeoXConfig
 
 
-class GPTNeoXAttention(FlaxAttentionModule):
+class GPTNeoXAttention(AttentionModule):
 	def __init__(
 		self,
 		config: GPTNeoXConfig,
@@ -95,7 +99,8 @@ class GPTNeoXAttention(FlaxAttentionModule):
 		position_ids: chex.Array,
 		causal_mask: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 		frequencies: tp.Optional[chex.Array] = None,
 	):
@@ -135,6 +140,8 @@ class GPTNeoXAttention(FlaxAttentionModule):
 			key_states=key,
 			value_states=value,
 			bias=None,
+			cache_metadata=cache_metadata,
+			cache_view=cache_view,
 			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
 			segment_ids=segment_ids,
@@ -255,7 +262,8 @@ class GPTNeoXBlock(nn.Module):
 		position_ids: chex.Array,
 		causal_mask: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 		frequencies: tp.Optional[chex.Array] = None,
 	):
@@ -266,6 +274,7 @@ class GPTNeoXBlock(nn.Module):
 			causal_mask,
 			segment_ids,
 			cache_view,
+			cache_metadata,
 			output_attentions,
 			frequencies,
 		)
@@ -343,7 +352,8 @@ class GPTNeoXModel(EasyDeLBaseModule):
 		input_ids: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		inputs_embeds: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
 		extra_embedding: tp.Optional[chex.Array] = None,
@@ -391,6 +401,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
 				attention_mask=attention_mask,
 				position_ids=position_ids,
 				cache_view=past_key_values.views[idx],
+				cache_metadata=cache_metadata,
 				segment_ids=segment_ids,
 				causal_mask=self.causal_mask,
 				frequencies=self.frequencies,
@@ -408,7 +419,7 @@ class GPTNeoXModel(EasyDeLBaseModule):
 			all_attentions,
 		)
 		if return_dict:
-			return FlaxBaseModelOutput(
+			return BaseModelOutput(
 				last_hidden_state=hidden_states,
 				hidden_states=outputs[1],
 				attentions=outputs[2],
@@ -460,7 +471,8 @@ class GPTNeoXForCausalLM(EasyDeLBaseModule):
 		input_ids,
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		inputs_embeds: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
 		extra_embedding: tp.Optional[chex.Array] = None,
@@ -496,7 +508,7 @@ class GPTNeoXForCausalLM(EasyDeLBaseModule):
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
 
-		return FlaxCausalLMOutput(
+		return CausalLMOutput(
 			logits=lm_logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,

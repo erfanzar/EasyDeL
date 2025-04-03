@@ -14,6 +14,7 @@
 
 from eformer import escale
 from eformer.escale import PartitionAxis
+from eformer.pytree import PyTree, auto_pytree
 
 from .base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
 from .base_module import EasyDeLBaseModule
@@ -21,11 +22,13 @@ from .base_state import EasyDeLState
 from .loss_utils import LossConfig
 
 __all__ = (
-	"escale",
-	"PartitionAxis",
-	"EasyDeLBaseModule",
 	"EasyDeLBaseConfig",
 	"EasyDeLBaseConfigDict",
+	"EasyDeLBaseModule",
 	"EasyDeLState",
 	"LossConfig",
+	"PartitionAxis",
+	"PyTree",
+	"auto_pytree",
+	"escale",
 )

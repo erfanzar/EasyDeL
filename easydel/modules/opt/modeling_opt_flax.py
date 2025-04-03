@@ -41,19 +41,23 @@ from jax import lax
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import (
-	FlaxBaseModelOutput,
-	FlaxMaskedLMOutput,
-)
+from easydel.infra.modeling_outputs import BaseModelOutput, MaskedLMOutput
 from easydel.infra.utils import ACT2FN, control_mlp_sharding
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.attention import AttentionModule
+from easydel.layers.caching import (
+	PagedAttentionCache,
+	PagedAttentionCacheView,
+	PagedAttentionMetadata,
+	TransformerCache,
+	TransformerCacheView,
+	TransformerMetadata,
+)
 from easydel.layers.linear import ParallelLinear
 
 from .opt_configuration import OPTConfig
 
 
-class OPTAttention(FlaxAttentionModule):
+class OPTAttention(AttentionModule):
 	def __init__(
 		self,
 		config: OPTConfig,
@@ -104,7 +108,7 @@ class OPTAttention(FlaxAttentionModule):
 		self.out_proj = linear(embed_dim, embed_dim, rngs=rngs)
 
 		self.dropout_layer = nn.Dropout(rate=self.dropout, rngs=rngs)
-		self.attention_module: FlexibleAttentionModule = FlexibleAttentionModule(
+		self.attention_module: AttentionModule = AttentionModule(
 			dropout_prob=config.attention_dropout,
 			num_q_heads=config.num_attention_heads,
 			num_kv_heads=config.num_attention_heads,
@@ -133,7 +137,8 @@ class OPTAttention(FlaxAttentionModule):
 		causal_mask: tp.Optional[chex.Array] = None,
 		key_value_states: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 	) -> tp.Tuple[chex.Array]:
 		is_cross_attention = key_value_states is not None
 		batch_size, sequence_length = hidden_states.shape[:2]
@@ -270,7 +275,8 @@ class OPTDecoderLayer(nn.Module):
 		hidden_states: chex.Array,
 		causal_mask: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 	) -> tp.Tuple[chex.Array]:
 		residual = hidden_states
 
@@ -444,7 +450,8 @@ class OPTDecoder(EasyDeLBaseModule):
 		input_ids: chex.Array,
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
@@ -507,7 +514,7 @@ class OPTDecoder(EasyDeLBaseModule):
 		if not return_dict:
 			return tuple(v for v in outputs if v is not None)
 
-		return FlaxBaseModelOutput(
+		return BaseModelOutput(
 			last_hidden_state=hidden_state,
 			hidden_states=all_hidden_states,
 			attentions=all_self_attns,
@@ -549,7 +556,8 @@ class OPTModel(EasyDeLBaseModule):
 		input_ids: chex.Array,
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
@@ -567,7 +575,7 @@ class OPTModel(EasyDeLBaseModule):
 		if not return_dict:
 			return decoder_outputs
 
-		return FlaxBaseModelOutput(
+		return BaseModelOutput(
 			last_hidden_state=decoder_outputs.last_hidden_state,
 			hidden_states=decoder_outputs.hidden_states,
 			attentions=decoder_outputs.attentions,
@@ -627,7 +635,8 @@ class OPTForCausalLM(EasyDeLBaseModule):
 		input_ids: chex.Array,
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
@@ -655,7 +664,7 @@ class OPTForCausalLM(EasyDeLBaseModule):
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
 
-		return FlaxMaskedLMOutput(
+		return MaskedLMOutput(
 			logits=lm_logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,

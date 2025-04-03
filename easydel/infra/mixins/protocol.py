@@ -20,7 +20,12 @@ import chex
 from flax import nnx as nn
 from jax.sharding import Mesh
 
-from easydel.layers.caching.transformer_cache import TransformerCache
+from easydel.layers.caching import (
+	PagedAttentionCache,
+	PagedAttentionMetadata,
+	TransformerCache,
+	TransformerMetadata,
+)
 from easydel.layers.linear import ParallelLinear
 
 from ..base_config import EasyDeLBaseConfig
@@ -30,13 +35,13 @@ from ..loss_utils import (
 	LossMetrics,
 )
 from ..modeling_outputs import (
-	FlaxCausalLMOutput,
-	FlaxCLIPOutput,
-	FlaxCLIPTextModelOutput,
-	FlaxImageClassifierOutput,
-	FlaxSequenceClassifierOutput,
+	CausalLMOutput,
+	CLIPOutput,
+	CLIPTextModelOutput,
+	ImageClassifierOutput,
 	MoeCausalLMOutput,
 	MoeModelOutput,
+	SequenceClassifierOutput,
 )
 
 PartitionLike = tp.Optional[
@@ -208,11 +213,12 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
-	) -> tp.Union[FlaxCausalLMOutput, tp.Tuple]:
+	) -> tp.Union[CausalLMOutput, tp.Tuple]:
 		"""
 		Forward pass for Causal Language Models (e.g., GPT).
 
@@ -230,7 +236,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		    return_dict: If True, returns a dictionary containing model outputs. Otherwise, return a tuple.
 
 		Returns:
-		    A FlaxCausalLMOutput if return_dict is True, or a tuple containing
+		    A CausalLMOutput if return_dict is True, or a tuple containing
 		    model outputs. See return type for more details.
 		"""
 
@@ -245,7 +251,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
-	) -> tp.Union[FlaxSequenceClassifierOutput, tp.Tuple]:
+	) -> tp.Union[SequenceClassifierOutput, tp.Tuple]:
 		"""
 		Forward pass for Sequence Classification Models (e.g., BERT for sentiment analysis).
 
@@ -260,7 +266,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		    return_dict: If True, returns a dictionary containing model outputs. Otherwise, return a tuple.
 
 		Returns:
-		   A FlaxSequenceClassifierOutput if return_dict is True, or a tuple containing
+		   A SequenceClassifierOutput if return_dict is True, or a tuple containing
 		    model outputs. See return type for more details.
 		"""
 
@@ -275,7 +281,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		output_router_logits: tp.Optional[bool] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
 	) -> tp.Union[MoeModelOutput, tp.Tuple]:
 		"""
@@ -311,7 +318,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		output_router_logits: tp.Optional[bool] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
 	) -> tp.Union[MoeCausalLMOutput, tp.Tuple]:
 		"""
@@ -343,7 +351,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: tp.Optional[bool] = None,
-	) -> tp.Union[FlaxImageClassifierOutput, tp.Tuple]:
+	) -> tp.Union[ImageClassifierOutput, tp.Tuple]:
 		"""Process image inputs through the CLIP vision encoder.
 
 		Args:
@@ -351,11 +359,11 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		        containing the pixel values of the images to encode.
 		    output_attentions: Optional bool indicating whether to return attention weights.
 		    output_hidden_states: Optional bool indicating whether to return all hidden states.
-		    return_dict: Optional bool indicating whether to return a FlaxImageClassifierOutput
+		    return_dict: Optional bool indicating whether to return a ImageClassifierOutput
 		        object instead of a tuple.
 
 		Returns:
-		    Either a FlaxImageClassifierOutput containing the model outputs or a tuple of
+		    Either a ImageClassifierOutput containing the model outputs or a tuple of
 		    tensors depending on return_dict.
 		"""
 		...
@@ -369,7 +377,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
-	) -> tp.Union[FlaxCLIPTextModelOutput, tp.Tuple]:
+	) -> tp.Union[CLIPTextModelOutput, tp.Tuple]:
 		"""Process text inputs through the CLIP text encoder.
 
 		Args:
@@ -382,11 +390,11 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		    output_attentions: Wheth
 		    def __call__(er to return attention weights. Defaults to False.
 		    output_hidden_states: Whether to return all hidden states. Defaults to False.
-		    return_dict: Whether to return a FlaxCLIPTextModelOutput object instead of a
+		    return_dict: Whether to return a CLIPTextModelOutput object instead of a
 		        tuple. Defaults to True.
 
 		Returns:
-		    Either a FlaxCLIPTextModelOutput containing the model outputs or a tuple of
+		    Either a CLIPTextModelOutput containing the model outputs or a tuple of
 		    tensors depending on return_dict.
 		"""
 		...
@@ -401,7 +409,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		output_attentions=None,
 		output_hidden_states=None,
 		return_dict=None,
-	) -> tp.Union[FlaxCLIPOutput, tp.Tuple]:
+	) -> tp.Union[CLIPOutput, tp.Tuple]:
 		"""Process both text and image inputs through the full CLIP model.
 
 		This method handles the full CLIP model forward pass, encoding both text and image
@@ -418,10 +426,10 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		        position indices for text tokens.
 		    output_attentions: Whether to return attention weights.
 		    output_hidden_states: Whether to return all hidden states.
-		    return_dict: Whether to return a FlaxCLIPOutput object instead of a tuple.
+		    return_dict: Whether to return a CLIPOutput object instead of a tuple.
 
 		Returns:
-		    Either a FlaxCLIPOutput containing the model outputs (including text embeddings,
+		    Either a CLIPOutput containing the model outputs (including text embeddings,
 		    image embeddings, and their similarity) or a tuple of tensors depending on
 		    return_dict.
 		"""
@@ -436,13 +444,14 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
 		loss_config: tp.Optional[LossConfig] = None,
 		loss_kwargs: tp.Optional[tp.Dict] = None,
-	) -> tp.Tuple[FlaxCausalLMOutput, LossMetrics]:
+	) -> tp.Tuple[CausalLMOutput, LossMetrics]:
 		"""
 		Computes the loss for Causal Language Models.
 
@@ -459,7 +468,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		    return_dict: If True, returns a dictionary containing model outputs along with loss. Otherwise, return a tuple.
 
 		Returns:
-		    A FlaxCausalLMOutput and a tuple containing model outputs including the loss.
+		    A CausalLMOutput and a tuple containing model outputs including the loss.
 		    See return type for more details.
 		"""
 
@@ -477,7 +486,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		return_dict: bool = True,
 		loss_config: tp.Optional[LossConfig] = None,
 		loss_kwargs: tp.Optional[tp.Dict] = None,
-	) -> tp.Tuple[FlaxSequenceClassifierOutput, LossMetrics]:
+	) -> tp.Tuple[SequenceClassifierOutput, LossMetrics]:
 		"""
 		Computes the loss for Sequence Classification Models.
 
@@ -493,7 +502,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		    return_dict: If True, returns a dictionary containing model outputs along with loss. Otherwise, return a tuple.
 
 		Returns:
-		    A FlaxSequenceClassifierOutput and a tuple containing model outputs including the loss.
+		    A SequenceClassifierOutput and a tuple containing model outputs including the loss.
 		    See return type for more details.
 		"""
 
@@ -509,7 +518,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		output_router_logits: tp.Optional[bool] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
 		loss_config: tp.Optional[LossConfig] = None,
 		loss_kwargs: tp.Optional[tp.Dict] = None,
@@ -547,7 +557,8 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		output_router_logits: tp.Optional[bool] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
 		loss_config: tp.Optional[LossConfig] = None,
 		loss_kwargs: tp.Optional[tp.Dict] = None,

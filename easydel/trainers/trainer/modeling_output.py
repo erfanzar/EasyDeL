@@ -13,8 +13,8 @@
 # limitations under the License.
 import typing as tp
 
-import chex
 import jax
+from eformer.pytree import auto_pytree
 
 if tp.TYPE_CHECKING:
 	from easydel.infra.base_state import EasyDeLState
@@ -22,7 +22,7 @@ else:
 	EasyDeLState = tp.Any
 
 
-@chex.dataclass
+@auto_pytree
 class TrainerOutput:
 	state: EasyDeLState
 	mesh: tp.Optional[jax.sharding.Mesh]

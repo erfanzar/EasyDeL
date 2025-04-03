@@ -17,24 +17,25 @@ import typing as tp
 import chex
 import jax
 import jax.numpy as jnp
+from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax import lax
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import FlaxBaseModelOutput
+from easydel.infra.modeling_outputs import BaseModelOutput
 from easydel.infra.utils import (
 	ACT2FN,
 	auto_remat,
 )
-from easydel.layers.caching.mamba2_cache import (
+from easydel.layers.caching.mamba2 import (
 	Mamba2Cache,
 	Mamba2CacheMetaData,
 	Mamba2CacheView,
 )
 from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm as FlaxMamba2RMSNorm
-from eformer.pytree import auto_pytree
+
 from .mamba2_configuration import Mamba2Config as Mamba2Config
 
 
@@ -43,14 +44,14 @@ def init_to_value(x, dtype):
 
 
 @auto_pytree
-class Mamba2Output(FlaxBaseModelOutput):
+class Mamba2Output(BaseModelOutput):
 	last_hidden_state: chex.Array = None
 	cache_params: tp.Optional[Mamba2Cache] = None
 	hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
 
 
 @auto_pytree
-class Mamba2CausalLMOutput(FlaxBaseModelOutput):
+class Mamba2CausalLMOutput(BaseModelOutput):
 	logits: chex.Array = None
 	cache_params: tp.Optional[Mamba2Cache] = None
 	hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
@@ -844,8 +845,10 @@ class Mamba2ForCausalLM(EasyDeLBaseModule):
 		)
 
 	def init_cache(self, batch_size: int, max_length: int):
-		return Mamba2Cache.init_layers_cache(
-			metadata=Mamba2CacheMetaData(
+		return Mamba2Cache.init_cache(
+			metadata=Mamba2CacheMetaData.create(
+				num_hidden_layers=self.config.num_hidden_layers,
+				partition_axis=self.config.partition_axis,
 				batch_size=batch_size,
 				intermediate_size=int(self.config.expand * self.config.hidden_size),
 				conv_kernel_size=self.config.conv_kernel,
@@ -855,7 +858,6 @@ class Mamba2ForCausalLM(EasyDeLBaseModule):
 				num_heads=self.config.num_heads,
 			),
 			dtype=self.dtype,
-			num_hidden_layers=self.config.num_hidden_layers,
 		)
 
 	def prepare_inputs_for_generation(

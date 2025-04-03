@@ -162,12 +162,14 @@ def main():
 			bos_token_id=processor.bos_token_id,
 			eos_token_id=processor.eos_token_id,
 			pad_token_id=processor.pad_token_id,
-			temperature=runtime_config.temperature,
-			do_sample=True,
 			max_new_tokens=max_completion_length,
 			streaming_chunks=32,
-			top_k=runtime_config.top_k,
-			top_p=runtime_config.top_p,
+			sampling_params=ed.SamplingParams(
+				max_tokens=max_completion_length,
+				top_k=runtime_config.top_k,
+				top_p=runtime_config.top_p,
+				temperature=runtime_config.temperature,
+			),
 			num_return_sequences=runtime_config.num_return_sequences,
 		),
 	)

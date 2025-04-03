@@ -27,23 +27,27 @@ from flax import nnx as nn
 from jax import lax
 
 from easydel.inference.logits_process import (
-	FlaxLogitsProcessorList,
-	FlaxStaticForceTokensLogitsProcessor,
+	ForceTokensLogitsProcessor,
+	LogitsProcessorList,
 	WhisperTimeStampLogitsProcessor,
 )
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import LossConfig, LossMetrics
 from easydel.infra.modeling_outputs import (
-	FlaxBaseModelOutput,
-	FlaxBaseModelOutputWithPastAndCrossAttentions,
-	FlaxSeq2SeqLMOutput,
-	FlaxSeq2SeqModelOutput,
-	FlaxSequenceClassifierOutput,
+	BaseModelOutput,
+	BaseModelOutputWithPastAndCrossAttentions,
+	Seq2SeqLMOutput,
+	Seq2SeqModelOutput,
+	SequenceClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, get_dot_general_by_bits
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import (
+	TransformerCache,
+	TransformerCacheView,
+	TransformerMetadata,
+)
 from easydel.layers.linear import ParallelLinear
 
 from .whisper_configuration import WhisperConfig as WhisperConfig
@@ -85,7 +89,7 @@ def sinusoidal_embedding_init(key, shape, dtype=jnp.float_) -> jax.Array:
 	)
 
 
-class WhisperAttention(FlaxAttentionModule):
+class WhisperAttention(AttentionModule):
 	def __init__(
 		self,
 		config: WhisperConfig,
@@ -144,6 +148,7 @@ class WhisperAttention(FlaxAttentionModule):
 		hidden_states: jnp.ndarray,
 		key_value_states: tp.Optional[jnp.ndarray] = None,
 		cache_view: tp.Optional[TransformerCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata] = None,
 		attention_mask: tp.Optional[jnp.ndarray] = None,
 		causal_mask: tp.Optional[jnp.ndarray] = None,
 	) -> tuple[tp.Any, tp.Any]:
@@ -188,6 +193,8 @@ class WhisperAttention(FlaxAttentionModule):
 			key_states=key_states,
 			value_states=value_states,
 			bias=None,
+			cache_metadata=cache_metadata,
+			cache_view=cache_view,
 			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
 			segment_ids=None,
@@ -396,6 +403,7 @@ class WhisperDecoderLayer(nn.Module):
 		encoder_hidden_states: tp.Optional[jnp.ndarray] = None,
 		encoder_attention_mask: tp.Optional[jnp.ndarray] = None,
 		cache_view: tp.Optional[TransformerCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata] = None,
 		output_attentions: bool = True,
 	) -> tp.Tuple[jnp.ndarray]:
 		residual = hidden_states
@@ -407,6 +415,7 @@ class WhisperDecoderLayer(nn.Module):
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,
 			cache_view=cache_view,
+			cache_metadata=cache_metadata,
 		)
 		hidden_states = self.dropout_layer(hidden_states)
 		hidden_states = residual + hidden_states
@@ -525,7 +534,7 @@ class WhisperEncoder(EasyDeLBaseModule):
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
-	) -> tuple[tp.Any | None, ...] | FlaxBaseModelOutput:
+	) -> tuple[tp.Any | None, ...] | BaseModelOutput:
 		all_attentions = () if output_attentions else None
 		all_hidden_states = () if output_hidden_states else None
 		if input_features.shape[1:] != (
@@ -579,7 +588,7 @@ class WhisperEncoder(EasyDeLBaseModule):
 		if not return_dict:
 			return tuple(v for v in outputs if v is not None)
 
-		return FlaxBaseModelOutput(
+		return BaseModelOutput(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
 			attentions=all_attentions,
@@ -650,10 +659,11 @@ class WhisperDecoder(EasyDeLBaseModule):
 		position_ids: jnp.ndarray,
 		encoder_hidden_states: tp.Optional[jnp.ndarray] = None,
 		past_key_values: tp.Optional[TransformerCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
-	) -> tuple[tp.Any, ...] | FlaxBaseModelOutputWithPastAndCrossAttentions:
+	) -> tuple[tp.Any, ...] | BaseModelOutputWithPastAndCrossAttentions:
 		inputs_embeds = self.embed_tokens(input_ids)
 		if position_ids is None:
 			position_ids = (
@@ -695,6 +705,7 @@ class WhisperDecoder(EasyDeLBaseModule):
 					encoder_hidden_states=encoder_hidden_states,
 					encoder_attention_mask=None,
 					cache_view=past_key_values.views[idx],
+					cache_metadata=cache_metadata,
 					output_attentions=output_attentions,
 				)
 
@@ -723,7 +734,7 @@ class WhisperDecoder(EasyDeLBaseModule):
 		if not return_dict:
 			return tuple(v for v in outputs if v is not None)
 
-		return FlaxBaseModelOutputWithPastAndCrossAttentions(
+		return BaseModelOutputWithPastAndCrossAttentions(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
 			attentions=all_self_attns,
@@ -781,6 +792,7 @@ class WhisperModel(EasyDeLBaseModule):
 		decoder_attention_mask: tp.Optional[jnp.ndarray] = None,
 		decoder_position_ids: tp.Optional[jnp.ndarray] = None,
 		past_key_values: tp.Optional[TransformerCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
@@ -828,6 +840,7 @@ class WhisperModel(EasyDeLBaseModule):
 			attention_mask=decoder_attention_mask,
 			position_ids=decoder_position_ids,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			encoder_hidden_states=encoder_outputs[0],
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
@@ -837,7 +850,7 @@ class WhisperModel(EasyDeLBaseModule):
 		if not return_dict:
 			return decoder_outputs + encoder_outputs
 
-		return FlaxSeq2SeqModelOutput(
+		return Seq2SeqModelOutput(
 			last_hidden_state=decoder_outputs.last_hidden_state,
 			decoder_hidden_states=decoder_outputs.hidden_states,
 			decoder_attentions=decoder_outputs.attentions,
@@ -854,6 +867,7 @@ class WhisperModel(EasyDeLBaseModule):
 		decoder_attention_mask: tp.Optional[jnp.ndarray] = None,
 		decoder_position_ids: tp.Optional[jnp.ndarray] = None,
 		past_key_values: tp.Optional[TransformerCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
@@ -894,6 +908,7 @@ class WhisperModel(EasyDeLBaseModule):
 			attention_mask=decoder_attention_mask,
 			position_ids=decoder_position_ids,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			encoder_hidden_states=encoder_hidden_states,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
@@ -903,7 +918,7 @@ class WhisperModel(EasyDeLBaseModule):
 		if not return_dict:
 			return decoder_outputs
 
-		return FlaxSeq2SeqModelOutput(
+		return Seq2SeqModelOutput(
 			last_hidden_state=decoder_outputs.last_hidden_state,
 			decoder_hidden_states=decoder_outputs.hidden_states,
 			decoder_attentions=decoder_outputs.attentions,
@@ -939,7 +954,7 @@ class WhisperModel(EasyDeLBaseModule):
 		if not return_dict:
 			return encoder_outputs
 
-		return FlaxSeq2SeqModelOutput(
+		return Seq2SeqModelOutput(
 			encoder_last_hidden_state=encoder_outputs.last_hidden_state,
 			encoder_hidden_states=encoder_outputs.hidden_states,
 			encoder_attentions=encoder_outputs.attentions,
@@ -1002,6 +1017,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 		decoder_attention_mask: tp.Optional[jnp.ndarray] = None,
 		decoder_position_ids: tp.Optional[jnp.ndarray] = None,
 		past_key_values: tp.Optional[TransformerCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
@@ -1015,6 +1031,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 		)
 
 		hidden_states = outputs[0]
@@ -1030,7 +1047,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 			output = (lm_logits,) + outputs[1:]
 			return output
 
-		return FlaxSeq2SeqLMOutput(
+		return Seq2SeqLMOutput(
 			logits=lm_logits,
 			decoder_hidden_states=outputs.decoder_hidden_states,
 			decoder_attentions=outputs.decoder_attentions,
@@ -1047,7 +1064,8 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 		encoder_attention_mask: tp.Optional[jnp.ndarray] = None,
 		decoder_attention_mask: tp.Optional[jnp.ndarray] = None,
 		decoder_position_ids: tp.Optional[jnp.ndarray] = None,
-		past_key_values: tp.Optional[dict] = None,
+		past_key_values: tp.Optional[TransformerCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: tp.Optional[bool] = None,
@@ -1076,6 +1094,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			return_dict=return_dict,
 		)
 		hidden_states = outputs[0]
@@ -1091,7 +1110,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 			output = (lm_logits,) + outputs[1:]
 			return output
 
-		return FlaxSeq2SeqLMOutput(
+		return Seq2SeqLMOutput(
 			logits=lm_logits,
 			decoder_hidden_states=outputs.decoder_hidden_states,
 			decoder_attentions=outputs.decoder_attentions,
@@ -1219,8 +1238,8 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 		if generation_config is None:
 			generation_config = self.generation_config
 		generation_config.forced_decoder_ids = None
-		logits_processor = FlaxLogitsProcessorList()
-		logits_processor.append(FlaxStaticForceTokensLogitsProcessor(forced_decoder_ids))
+		logits_processor = LogitsProcessorList()
+		logits_processor.append(ForceTokensLogitsProcessor(forced_decoder_ids))
 		if return_timestamps:
 			logits_processor.append(
 				WhisperTimeStampLogitsProcessor(generation_config, self.config, 1)
@@ -1402,7 +1421,7 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
 		if not return_dict:
 			return (logits,) + encoder_outputs[1:]
 
-		return FlaxSequenceClassifierOutput(
+		return SequenceClassifierOutput(
 			logits=logits,
 			hidden_states=encoder_outputs.hidden_states,
 			attentions=encoder_outputs.attentions,

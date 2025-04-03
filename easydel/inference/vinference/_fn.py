@@ -33,6 +33,7 @@ from ..utilities import (
 	create_sampling_step,
 	vInferenceConfig,
 	vInferencePreCompileConfig,
+	SamplingParams,
 )
 
 
@@ -90,6 +91,7 @@ def prefill_fn(
 	graphother,
 	state: SampleState,
 	generation_config: vInferenceConfig,
+	sampling_params: SamplingParams,
 ) -> SampleState:
 	"""
 	Compiled function for performing the initial generation step.
@@ -106,9 +108,8 @@ def prefill_fn(
 		runner = create_sampling_step(
 			eos_token_id=jnp.array(generation_config.eos_token_id, dtype=jnp.int32),
 			pad_token_id=jnp.array(generation_config.pad_token_id, dtype=jnp.int32),
-			logits_processor=generation_config.get_logits_processor(),
-			logits_warper=generation_config.get_logits_processor(),
-			do_sample=generation_config.do_sample,
+			logits_processor=sampling_params.get_logits_processor(),
+			logits_warper=sampling_params.get_logits_warper(),
 		)
 		runner = implicit(runner)
 		state = runner(
@@ -126,6 +127,7 @@ def decode_fn(
 	graphother,
 	state: SampleState,
 	generation_config: vInferenceConfig,
+	sampling_params: SamplingParams,
 	loop_max_tokens: int,
 ) -> SampleState:
 	"""
@@ -144,14 +146,20 @@ def decode_fn(
 	def cond_fn(state):
 		"""state termination condition fn."""
 		all_sequence_finished = jnp.all(state.is_sequence_finished)
-		return ~jnp.logical_or(all_sequence_finished, state.current_length >= tlen)
+		streaming_loop_exit = state.current_length >= tlen
+		n_reached = state.generated_tokens >= (
+			sampling_params.max_tokens * state.sequences.shape[0]
+		)
+
+		endit = jax.lax.cond(n_reached, lambda x: True, lambda x: x, streaming_loop_exit)
+
+		return ~jnp.logical_or(all_sequence_finished, endit)
 
 	sampling_step = create_sampling_step(
 		eos_token_id=jnp.array(generation_config.eos_token_id, dtype=jnp.int32),
 		pad_token_id=jnp.array(generation_config.pad_token_id, dtype=jnp.int32),
-		logits_processor=generation_config.get_logits_processor(),
-		logits_warper=generation_config.get_logits_processor(),
-		do_sample=generation_config.do_sample,
+		logits_processor=sampling_params.get_logits_processor(),
+		logits_warper=sampling_params.get_logits_warper(),
 	)
 
 	sampling_step = implicit(sampling_step)

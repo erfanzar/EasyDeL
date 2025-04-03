@@ -15,17 +15,23 @@
 import typing as tp
 
 import chex as cx
+from eformer import escale as es
 from eformer.escale import PartitionAxis, with_sharding_constraint
 from eformer.jaximus import ImplicitArray
+from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
+from .._abstracts import BaseCache, BaseCacheMetadata, BaseCacheView, BaseRunTimeMetadata
 
-@cx.dataclass
-class MambaCacheMetaData:
+
+@auto_pytree
+class MambaCacheMetaData(BaseCacheMetadata):
 	"""Metadata for Mamba cache configuration."""
 
 	# Required fields
+	num_hidden_layers:int
+	partition_axis: es.PartitionAxis
 	batch_size: int
 	intermediate_size: int
 	ssm_state_size: int
@@ -34,6 +40,8 @@ class MambaCacheMetaData:
 	@classmethod
 	def create(
 		cls,
+		num_hidden_layers:int,
+		partition_axis: es.PartitionAxis,
 		batch_size: int,
 		intermediate_size: int,
 		ssm_state_size: int,
@@ -43,6 +51,7 @@ class MambaCacheMetaData:
 		Create a MambaCacheMetaData instance with validation.
 
 		Arguments:
+				partition_axis: Partition Axis.
 		    batch_size: Size of the batch
 		    intermediate_size: Model's intermediate size
 		    ssm_state_size: Model's state size
@@ -64,6 +73,8 @@ class MambaCacheMetaData:
 			raise ValueError("conv_kernel_size must be positive")
 
 		return cls(
+			num_hidden_layers=num_hidden_layers,
+			partition_axis=partition_axis,
 			batch_size=batch_size,
 			intermediate_size=intermediate_size,
 			ssm_state_size=ssm_state_size,
@@ -71,8 +82,8 @@ class MambaCacheMetaData:
 		)
 
 
-@cx.dataclass
-class MambaCacheView:
+@auto_pytree
+class MambaCacheView(BaseCacheView):
 	conv_states: tp.Union[cx.Array, ImplicitArray]
 	ssm_states: tp.Union[cx.Array, ImplicitArray]
 	positions: cx.Array
@@ -114,6 +125,9 @@ class MambaCacheView:
 			metadata=metadata,
 			layer_index=layer_index,
 		)
+
+	def concatenate_to_cache(self, *args, **kwargs):
+		raise NotImplementedError()
 
 	def update_conv_state(
 		self,
@@ -174,14 +188,13 @@ class MambaCacheView:
 	__str__ = __repr__
 
 
-@cx.dataclass
-class MambaCache:
+@auto_pytree
+class MambaCache(BaseCache):
 	views: tp.List[tp.Optional[MambaCacheView]]
 
 	@classmethod
-	def init_layers_cache(
-		cls,
-		num_hidden_layers: int,
+	def init_cache(
+		cls, 
 		metadata: MambaCacheMetaData,
 		dtype: tp.Optional[jnp.dtype] = None,
 		partition_specs: tp.Optional[PartitionSpec] = None,
@@ -203,7 +216,7 @@ class MambaCache:
 					dtype=dtype,
 					layer_index=layer_index,
 				)
-				for layer_index in range(num_hidden_layers)
+				for layer_index in range(metadata.num_hidden_layers)
 			]
 		)
 
@@ -284,3 +297,6 @@ class MambaCache:
 		)
 
 	__str__ = __repr__
+
+
+class MambaMetadata(BaseRunTimeMetadata): ...

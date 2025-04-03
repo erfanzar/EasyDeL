@@ -11,15 +11,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import typing as tp
 
 import chex as cx
-from eformer.escale import PartitionAxis, with_sharding_constraint
+import jax
+from eformer import escale as es
 from eformer.jaximus import ImplicitArray
 from jax import numpy as jnp
-import jax
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from jax import lax
+from jax.sharding import PartitionSpec
+
+from .._abstracts import (
+	BaseCache,
+	BaseCacheMetadata,
+	BaseCacheView,
+	BaseRunTimeMetadata,
+)
 
 if tp.TYPE_CHECKING:
 	from easydel.layers.quantization.quantizers import EasyQuantizer
@@ -28,14 +36,11 @@ else:
 
 
 @cx.dataclass
-class TransformerCacheMetaData:
+class LightningCacheMetaData(BaseCacheMetadata):
 	"""Metadata for transformer cache configuration."""
 
-	# Required fields
-	batch_size: int
-	sequence_length: int
-
-	# Optional attention-related fields
+	partition_axis: es.PartitionAxis
+	batch_size: tp.Optional[int]
 	num_heads: tp.Optional[int]
 	head_dim: tp.Optional[int]
 	key_heads: tp.Optional[int]
@@ -43,137 +48,53 @@ class TransformerCacheMetaData:
 	key_dim: tp.Optional[int]
 	value_dim: tp.Optional[int]
 
-	# Configuration flags
-	update_causal_mask: bool
-	create_attention_bias: bool
-
 	@classmethod
 	def create(
 		cls,
-		batch_size: int,
-		sequence_length: int,
+		partition_axis: es.PartitionAxis,
+		batch_size: tp.Optional[int] = None,
 		num_heads: tp.Optional[int] = None,
 		head_dim: tp.Optional[int] = None,
 		key_heads: tp.Optional[int] = None,
 		value_heads: tp.Optional[int] = None,
 		key_dim: tp.Optional[int] = None,
 		value_dim: tp.Optional[int] = None,
-		update_causal_mask: bool = True,
-		create_attention_bias: bool = True,
-	) -> "TransformerCacheMetaData":
+	) -> LightningCacheMetaData:
 		"""
-		Create a TransformerCacheMetaData instance with validation.
-
-		Arguments:
-		    batch_size: Size of the batch.
-		    sequence_length: Length of the sequence.
-		    num_heads: Number of attention heads.
-		    head_dim: Dimension of each head.
-		    key_heads: Number of key heads.
-		    value_heads: Number of value heads.
-		    key_dim: Dimension of keys.
-		    value_dim: Dimension of values.
-		    update_causal_mask: Whether to update causal mask.
-		    create_attention_bias: Whether to create attention bias.
-
+		Create a LightningCacheMetaData instance with validation.
 		Returns:
-		    TransformerCacheMetaData instance
+		    LightningCacheMetaData instance
 
 		Raises:
 		    ValueError: If required parameters are missing or invalid.
 		"""
-
-		if batch_size <= 0:
-			raise ValueError("batch_size must be positive")
-		if sequence_length <= 0:
-			raise ValueError("sequence_length must be positive")
-
-		if head_dim is not None:
-			key_dim = key_dim or head_dim
-			value_dim = value_dim or head_dim
-		else:
-			if key_dim is None or value_dim is None:
-				raise ValueError(
-					"Either head_dim or both key_dim and value_dim must be specified"
-				)
-
-		# Derive heads from num_heads if not specified
-		if num_heads is not None:
-			key_heads = key_heads or num_heads
-			value_heads = value_heads or num_heads
-		else:
-			if key_heads is None or value_heads is None:
-				raise ValueError(
-					"Either num_heads or both key_heads and value_heads must be specified"
-				)
-
 		return cls(
+			partition_axis=partition_axis,
 			batch_size=batch_size,
-			sequence_length=sequence_length,
 			num_heads=num_heads,
 			head_dim=head_dim,
 			key_heads=key_heads,
 			value_heads=value_heads,
 			key_dim=key_dim,
 			value_dim=value_dim,
-			update_causal_mask=update_causal_mask,
-			create_attention_bias=create_attention_bias,
 		)
 
 
 @cx.dataclass
-class TransformerCacheView:
-	key: tp.Union[cx.Array, ImplicitArray]
-	value: tp.Union[cx.Array, ImplicitArray]
-	index: tp.Union[cx.Array, ImplicitArray]
-	metadata: TransformerCacheMetaData
+class LightningCacheView(BaseCacheView):
+	key_value: tp.Union[cx.Array, ImplicitArray]
+	metadata: LightningCacheMetaData
 	layer_index: tp.Optional[int] = None
 
 	@classmethod
-	def init(
-		cls,
-		metadata: TransformerCacheMetaData,
-		quantizer: EasyQuantizer,
-		key_values_partition_specs: PartitionSpec,
-		dtype: jnp.dtype,
-		mesh: Mesh,
-		layer_index: tp.Optional[int] = None,
-	):
-		with jax.named_scope("easydel-transformer-cacheview-init"):
-			device = NamedSharding(mesh=mesh, spec=key_values_partition_specs)
+	def init(cls, metadata: LightningCacheMetaData, layer_index: tp.Optional[int] = None):
+		return cls(
+			key_value=None,
+			metadata=metadata,
+			layer_index=layer_index,
+		)
 
-			out = cls(
-				key=quantizer(
-					jnp.zeros(
-						shape=(
-							metadata.batch_size,
-							metadata.sequence_length,
-							metadata.key_heads,
-							metadata.key_dim,
-						),
-						dtype=dtype,
-						device=device,
-					),
-				),
-				value=quantizer(
-					jnp.zeros(
-						shape=(
-							metadata.batch_size,
-							metadata.sequence_length,
-							metadata.value_heads,
-							metadata.value_dim,
-						),
-						dtype=dtype,
-						device=device,
-					)
-				),
-				index=jnp.zeros((metadata.batch_size,), dtype=jnp.int32),
-				metadata=metadata,
-				layer_index=layer_index,
-			)
-		return out
-
-	@jax.named_scope("easydel-transformer-cacheview-concatenate-to-cache")
+	@jax.named_scope("easydel-lightning-cacheview-concatenate-to-cache")
 	def concatenate_to_cache(
 		self,
 		query: cx.Array,
@@ -182,7 +103,7 @@ class TransformerCacheView:
 		attention_mask: cx.Array,
 		kv_sharding: PartitionSpec,
 		quantizer: EasyQuantizer,
-		causal_mask: tp.Optional[cx.Array] = None,
+		causal_mask: tp.Optional[cx.Array | bool] = None,
 		token_type_ids: tp.Optional[cx.Array] = None,
 	) -> tp.Tuple[cx.Array, cx.Array, cx.Array]:
 		"""
@@ -216,7 +137,7 @@ class TransformerCacheView:
 		if causal_mask is not None:
 			if hasattr(causal_mask, "value"):
 				causal_mask = causal_mask.value
-			causal_mask = lax.dynamic_slice(
+			causal_mask = jax.lax.dynamic_slice(
 				causal_mask,
 				(0, 0, end_index, 0),
 				(1, 1, num_updated_cache_vectors, max_length),
@@ -246,16 +167,16 @@ class TransformerCacheView:
 
 		slice_indices = (0, end_index % self.value.shape[1], 0, 0)
 
-		value_cache = with_sharding_constraint(
-			lax.dynamic_update_slice(
+		value_cache = es.with_sharding_constraint(
+			jax.lax.dynamic_update_slice(
 				self.value,
 				value.astype(self.value.dtype),
 				slice_indices,
 			),
 			sharding=kv_sharding,
 		)
-		key_cache = with_sharding_constraint(
-			lax.dynamic_update_slice(
+		key_cache = es.with_sharding_constraint(
+			jax.lax.dynamic_update_slice(
 				self.key,
 				key.astype(self.key.dtype),
 				slice_indices,
@@ -275,58 +196,27 @@ class TransformerCacheView:
 		return key_cache, value_cache, attention_mask
 
 	def __repr__(self):
-		try:
-			return (
-				self.__class__.__name__
-				+ f"(key={self.key.shape}, value={self.value.shape}, layer_index={self.layer_index})"
-			)
-		except AttributeError:
-			return (
-				self.__class__.__name__
-				+ f"(key={self.key}, value={self.value}, layer_index={self.layer_index})"
-			)
+		return (
+			self.__class__.__name__
+			+ f"(key={self.key.shape}, value={self.value.shape}, layer_index={self.layer_index})"
+		)
 
 	__str__ = __repr__
 
 
 @cx.dataclass
-class TransformerCache:
-	views: tp.List[tp.Optional[TransformerCacheView]]
+class LightningCache(BaseCache):
+	views: tp.List[tp.Optional[LightningCacheView]]
 
 	@classmethod
-	def init_layers_cache(
+	def init_cache(
 		cls,
 		num_hidden_layers: int,
-		metadata: TransformerCacheMetaData,
-		mesh: Mesh,
-		partition_axis: PartitionAxis,
-		quantizer: tp.Optional[EasyQuantizer] = None,
-		dtype: tp.Optional[jnp.dtype] = None,
-		key_values_partition_specs: tp.Optional[PartitionSpec] = None,
+		metadata: LightningCacheMetaData,
 	):
-		from easydel.layers.quantization.quantizers import EasyQuantizer
-		from easydel.infra.etils import EasyDeLQuantizationMethods
-
-		paxis = partition_axis
-		quantizer = quantizer or EasyQuantizer(EasyDeLQuantizationMethods.NONE)
-		key_values_partition_specs = key_values_partition_specs or PartitionSpec(
-			paxis.batch_axis,
-			paxis.key_sequence_axis,
-			paxis.head_axis,
-			paxis.attention_dim_axis,
-		)
-		if dtype is None:
-			dtype = jnp.bfloat16
 		return cls(
 			views=[
-				TransformerCacheView.init(
-					metadata=metadata,
-					quantizer=quantizer,
-					key_values_partition_specs=key_values_partition_specs,
-					dtype=dtype,
-					mesh=mesh,
-					layer_index=layer_index,
-				)
+				LightningCacheView.init(metadata=metadata, layer_index=layer_index)
 				for layer_index in range(num_hidden_layers)
 			]
 		)
@@ -343,3 +233,6 @@ class TransformerCache:
 		)
 
 	__str__ = __repr__
+
+
+class LightningMetadata(BaseRunTimeMetadata): ...

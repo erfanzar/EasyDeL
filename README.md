@@ -78,15 +78,15 @@ import jax.numpy as jnp
 
 # Complete configuration example
 model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
-    "meta-llama/Llama-2-7b",
-    platform=ed.EasyDeLPlatforms.TRITON,
-    config_kwargs=ed.EasyDeLBaseConfigDict(
-        attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
-        attn_dtype=jnp.float16,
-        gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
-    ),
-    dtype=jnp.float16,
-    auto_shard_model=True
+ "meta-llama/Llama-3.2-1B-Instruct",
+ platform=ed.EasyDeLPlatforms.TRITON,
+ config_kwargs=ed.EasyDeLBaseConfigDict(
+  attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
+  attn_dtype=jnp.float16,
+  gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
+ ),
+ dtype=jnp.float16,
+ auto_shard_model=True
 )
 ```
 
@@ -107,26 +107,31 @@ import jax.numpy as jnp
 
 # Initialize model
 model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
-    "meta-llama/Llama-2-7b",
-    dtype=jnp.float16,
-    platform=ed.EasyDeLPlatforms.TRITON,
-    auto_shard_model=True
+ "meta-llama/Llama-3.2-1B-Instruct",
+ dtype=jnp.float16,
+ platform=ed.EasyDeLPlatforms.TRITON,
+ auto_shard_model=True
 )
 
 # Setup tokenizer
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b")
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
 tokenizer.pad_token_id = tokenizer.eos_token_id
 
 # Create inference engine
+sampling_params=ed.SamplingParams(
+ max_tokens=1024,
+ temperature=0.8,
+ top_p=0.95,
+ top_k=10,
+)
 inference = ed.vInference(
-    model=model,
-    tokenizer=tokenizer,
-    generation_config=ed.vInferenceConfig(
-        max_new_tokens=1024,
-        temperature=0.7,
-        top_p=0.95,
-        streaming_chunks=32
-    )
+ model=model,
+ tokenizer=tokenizer,
+ generation_config=ed.vInferenceConfig(
+   max_new_tokens=1024,
+   sampling_params=sampling_params,
+   streaming_chunks=32,
+ )
 )
 
 # Create API server (OpenAI compatible)
@@ -272,28 +277,28 @@ import jax.numpy as jnp
 
 # Create model
 model = ed.LlamaForCausalLM(
-    config=model_config,
-    dtype=jnp.float32,
-    param_dtype=jnp.float32
+ config=model_config,
+ dtype=jnp.float32,
+ param_dtype=jnp.float32
 )
 
 # Configure training
 training_args = ed.TrainingArguments(
-    save_directory="checkpoints",
-    model_name="my_model",
-    num_train_epochs=3,
-    total_batch_size=8,
-    learning_rate=3e-4,
-    optimizer=ed.EasyDeLOptimizers.ADAMW,
-    scheduler=ed.EasyDeLSchedulers.COSINE
+ save_directory="checkpoints",
+ model_name="my_model",
+ num_train_epochs=3,
+ total_batch_size=8,
+ learning_rate=3e-4,
+ optimizer=ed.EasyDeLOptimizers.ADAMW,
+ scheduler=ed.EasyDeLSchedulers.COSINE
 )
 
 # Initialize trainer
 trainer = ed.Trainer(
-    arguments=training_args,
-    model=model,
-    dataset_train=train_dataset,
-    dataset_eval=eval_dataset
+ arguments=training_args,
+ model=model,
+ dataset_train=train_dataset,
+ dataset_eval=eval_dataset
 )
 
 # Start training

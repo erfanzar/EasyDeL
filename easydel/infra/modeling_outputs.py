@@ -160,7 +160,7 @@ class ModelOutput(tp.OrderedDict):
 
 
 @auto_pytree
-class FlaxBaseModelOutput(ModelOutput):
+class BaseModelOutput(ModelOutput):
 	"""
 	Base class for model's outputs, with potential hidden states and attentions.
 
@@ -188,7 +188,7 @@ class FlaxBaseModelOutput(ModelOutput):
 
 
 @auto_pytree
-class FlaxBaseModelOutputWithNoAttention(ModelOutput):
+class BaseModelOutputWithNoAttention(ModelOutput):
 	"""
 	Base class for model's outputs, with potential hidden states.
 
@@ -207,7 +207,7 @@ class FlaxBaseModelOutputWithNoAttention(ModelOutput):
 
 
 @auto_pytree
-class FlaxBaseModelOutputWithPoolingAndNoAttention(ModelOutput):
+class BaseModelOutputWithPoolingAndNoAttention(ModelOutput):
 	"""
 	Base class for model's outputs that also contains a pooling of the last hidden states.
 
@@ -229,7 +229,7 @@ class FlaxBaseModelOutputWithPoolingAndNoAttention(ModelOutput):
 
 
 @auto_pytree
-class FlaxImageClassifierOutputWithNoAttention(ModelOutput):
+class ImageClassifierOutputWithNoAttention(ModelOutput):
 	"""
 	Base class for outputs of image classification models.
 
@@ -249,7 +249,7 @@ class FlaxImageClassifierOutputWithNoAttention(ModelOutput):
 
 
 @auto_pytree
-class FlaxBaseModelOutputWithPast(ModelOutput):
+class BaseModelOutputWithPast(ModelOutput):
 	"""
 	Base class for model's outputs, with potential hidden states and attentions.
 
@@ -280,7 +280,7 @@ class FlaxBaseModelOutputWithPast(ModelOutput):
 
 
 @auto_pytree
-class FlaxBaseModelOutputWithPooling(ModelOutput):
+class BaseModelOutputWithPooling(ModelOutput):
 	"""
 	Base class for model's outputs that also contains a pooling of the last hidden states.
 
@@ -312,7 +312,7 @@ class FlaxBaseModelOutputWithPooling(ModelOutput):
 
 
 @auto_pytree
-class FlaxBaseModelOutputWithPoolingAndCrossAttentions(ModelOutput):
+class BaseModelOutputWithPoolingAndCrossAttentions(ModelOutput):
 	"""
 	Base class for model's outputs that also contains a pooling of the last hidden states.
 
@@ -362,7 +362,7 @@ class FlaxBaseModelOutputWithPoolingAndCrossAttentions(ModelOutput):
 
 
 @auto_pytree
-class FlaxBaseModelOutputWithPastAndCrossAttentions(ModelOutput):
+class BaseModelOutputWithPastAndCrossAttentions(ModelOutput):
 	"""
 	Base class for model's outputs that may also contain a past key/values (to speed up sequential decoding).
 
@@ -409,7 +409,7 @@ class FlaxBaseModelOutputWithPastAndCrossAttentions(ModelOutput):
 
 
 @auto_pytree
-class FlaxSeq2SeqModelOutput(ModelOutput):
+class Seq2SeqModelOutput(ModelOutput):
 	"""
 	Base class for model encoder's outputs that also contains : pre-computed hidden states that can speed up sequential
 	decoding.
@@ -471,7 +471,7 @@ class FlaxSeq2SeqModelOutput(ModelOutput):
 
 
 @auto_pytree
-class FlaxCausalLMOutputWithCrossAttentions(ModelOutput):
+class CausalLMOutputWithCrossAttentions(ModelOutput):
 	"""
 	Base class for causal language model (or autoregressive) outputs.
 
@@ -513,7 +513,7 @@ class FlaxCausalLMOutputWithCrossAttentions(ModelOutput):
 
 
 @auto_pytree
-class FlaxMaskedLMOutput(ModelOutput):
+class MaskedLMOutput(ModelOutput):
 	"""
 	Base class for masked language models outputs.
 
@@ -540,11 +540,11 @@ class FlaxMaskedLMOutput(ModelOutput):
 	loss: tp.Optional[chex.Array] = None
 
 
-FlaxCausalLMOutput = FlaxMaskedLMOutput
+CausalLMOutput = MaskedLMOutput
 
 
 @auto_pytree
-class FlaxSeq2SeqLMOutput(ModelOutput):
+class Seq2SeqLMOutput(ModelOutput):
 	"""
 	Base class for sequence-to-sequence language models outputs.
 
@@ -602,7 +602,7 @@ class FlaxSeq2SeqLMOutput(ModelOutput):
 
 
 @auto_pytree
-class FlaxNextSentencePredictorOutput(ModelOutput):
+class NextSentencePredictorOutput(ModelOutput):
 	"""
 	Base class for outputs of models predicting if two sentences are consecutive or not.
 
@@ -630,7 +630,7 @@ class FlaxNextSentencePredictorOutput(ModelOutput):
 
 
 @auto_pytree
-class FlaxSequenceClassifierOutput(ModelOutput):
+class SequenceClassifierOutput(ModelOutput):
 	"""
 	Base class for outputs of sentence classification models.
 
@@ -659,7 +659,7 @@ class FlaxSequenceClassifierOutput(ModelOutput):
 
 
 @auto_pytree
-class FlaxSeq2SeqSequenceClassifierOutput(ModelOutput):
+class Seq2SeqSequenceClassifierOutput(ModelOutput):
 	"""
 	Base class for outputs of sequence-to-sequence sentence classification models.
 
@@ -717,7 +717,7 @@ class FlaxSeq2SeqSequenceClassifierOutput(ModelOutput):
 
 
 @auto_pytree
-class FlaxMultipleChoiceModelOutput(ModelOutput):
+class MultipleChoiceModelOutput(ModelOutput):
 	"""
 	Base class for outputs of multiple choice models.
 
@@ -746,7 +746,7 @@ class FlaxMultipleChoiceModelOutput(ModelOutput):
 
 
 @auto_pytree
-class FlaxTokenClassifierOutput(ModelOutput):
+class TokenClassifierOutput(ModelOutput):
 	"""
 	Base class for outputs of token classification models.
 
@@ -773,7 +773,7 @@ class FlaxTokenClassifierOutput(ModelOutput):
 
 
 @auto_pytree
-class FlaxQuestionAnsweringModelOutput(ModelOutput):
+class QuestionAnsweringModelOutput(ModelOutput):
 	"""
 	Base class for outputs of question answering models.
 
@@ -803,7 +803,7 @@ class FlaxQuestionAnsweringModelOutput(ModelOutput):
 
 
 @auto_pytree
-class FlaxSeq2SeqQuestionAnsweringModelOutput(ModelOutput):
+class Seq2SeqQuestionAnsweringModelOutput(ModelOutput):
 	"""
 	Base class for outputs of sequence-to-sequence question answering models.
 
@@ -864,7 +864,7 @@ class FlaxSeq2SeqQuestionAnsweringModelOutput(ModelOutput):
 
 
 @auto_pytree
-class MoeModelOutput(FlaxMaskedLMOutput):
+class MoeModelOutput(MaskedLMOutput):
 	"""
 	Base class for MoE model outputs.
 
@@ -897,7 +897,7 @@ class MoeModelOutput(FlaxMaskedLMOutput):
 
 
 @auto_pytree
-class MoeCausalLMOutput(FlaxMaskedLMOutput):
+class MoeCausalLMOutput(MaskedLMOutput):
 	"""
 	Base class for causal language modeling (CLM) outputs of MoE models.
 
@@ -916,7 +916,7 @@ class MoeCausalLMOutput(FlaxMaskedLMOutput):
 
 
 @auto_pytree
-class MambaOutput(FlaxBaseModelOutput):
+class MambaOutput(BaseModelOutput):
 	last_hidden_state: chex.Array = None
 	cache_params: tp.Optional[tp.List[chex.Array]] = None
 	hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
@@ -924,7 +924,7 @@ class MambaOutput(FlaxBaseModelOutput):
 
 
 @auto_pytree
-class MambaCausalLMOutput(FlaxBaseModelOutput):
+class MambaCausalLMOutput(BaseModelOutput):
 	logits: chex.Array = None
 	cache_params: tp.Optional[tp.List[chex.Array]] = None
 	hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
@@ -932,7 +932,7 @@ class MambaCausalLMOutput(FlaxBaseModelOutput):
 
 
 @auto_pytree
-class FlaxCLIPTextModelOutput(ModelOutput):
+class CLIPTextModelOutput(ModelOutput):
 	"""
 	Base class for text model's outputs that also contains a pooling of the last hidden states.
 
@@ -962,7 +962,7 @@ class FlaxCLIPTextModelOutput(ModelOutput):
 
 
 @auto_pytree
-class FlaxImageClassifierOutput(ModelOutput):
+class ImageClassifierOutput(ModelOutput):
 	"""
 	Base class for text model's outputs that also contains a pooling of the last hidden states.
 
@@ -992,7 +992,7 @@ class FlaxImageClassifierOutput(ModelOutput):
 
 
 @auto_pytree
-class FlaxCLIPOutput(ModelOutput):
+class CLIPOutput(ModelOutput):
 	"""
 	Args:
 			loss:(`chex.Array`) training loss
@@ -1008,9 +1008,9 @@ class FlaxCLIPOutput(ModelOutput):
 	    image_embeds(`chex.Array` of shape `(batch_size, output_dim`):
 	        The image embeddings obtained by applying the projection layer to the pooled output of
 	        [`FlaxCLIPVisionModel`].
-	    text_model_output(`FlaxBaseModelOutputWithPooling`):
+	    text_model_output(`BaseModelOutputWithPooling`):
 	        The output of the [`FlaxCLIPTextModel`].
-	    vision_model_output(`FlaxBaseModelOutputWithPooling`):
+	    vision_model_output(`BaseModelOutputWithPooling`):
 	        The output of the [`FlaxCLIPVisionModel`].
 	"""
 
@@ -1019,8 +1019,8 @@ class FlaxCLIPOutput(ModelOutput):
 	logits_per_text: chex.Array = None
 	text_embeds: chex.Array = None
 	image_embeds: chex.Array = None
-	text_model_output: FlaxBaseModelOutputWithPooling = None
-	vision_model_output: FlaxBaseModelOutputWithPooling = None
+	text_model_output: BaseModelOutputWithPooling = None
+	vision_model_output: BaseModelOutputWithPooling = None
 
 	def to_tuple(self) -> tp.Tuple[tp.Any]:
 		return tuple(
@@ -1032,7 +1032,7 @@ class FlaxCLIPOutput(ModelOutput):
 
 
 @auto_pytree
-class FlaxGreedySearchOutput(ModelOutput):
+class GreedySearchOutput(ModelOutput):
 	"""
 	Flax Base class for outputs of decoder-only generation models using greedy search.
 
@@ -1046,7 +1046,7 @@ class FlaxGreedySearchOutput(ModelOutput):
 
 
 @auto_pytree
-class FlaxSampleOutput(ModelOutput):
+class SampleOutput(ModelOutput):
 	"""
 	Flax Base class for outputs of decoder-only generation models using sampling.
 
@@ -1060,7 +1060,7 @@ class FlaxSampleOutput(ModelOutput):
 
 
 @auto_pytree
-class FlaxBeamSearchOutput(ModelOutput):
+class BeamSearchOutput(ModelOutput):
 	"""
 	Flax Base class for outputs of decoder-only generation models using greedy search.
 

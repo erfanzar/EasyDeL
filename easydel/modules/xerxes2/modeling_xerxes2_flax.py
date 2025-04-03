@@ -24,21 +24,22 @@ from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import (
-	FlaxBaseModelOutput,
-	FlaxCausalLMOutput,
-)
+from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
 from easydel.infra.utils import (
 	auto_remat,
 	block_wise_ffn,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 )
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching.transformer_cache import (
+from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import (
+	PagedAttentionCache,
+	PagedAttentionCacheView,
+	PagedAttentionMetadata,
 	TransformerCache,
 	TransformerCacheMetaData,
 	TransformerCacheView,
+	TransformerMetadata,
 )
 from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
@@ -49,7 +50,7 @@ from .xerxes2_configuration import Xerxes2Config as Xerxes2Config
 logger = get_logger(__name__)
 
 
-class Xerxes2Attention(FlaxAttentionModule):
+class Xerxes2Attention(AttentionModule):
 	def __init__(
 		self,
 		config: Xerxes2Config,
@@ -134,10 +135,11 @@ class Xerxes2Attention(FlaxAttentionModule):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
-		causal_mask: chex.Array,
+		causal_mask: tp.Optional[chex.Array | bool],
 		frequencies: tp.Tuple[chex.Array, chex.Array],
 		segment_ids: tp.Optional[chex.Array] = None,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 	):
 		"""Forward pass of the attention module."""
@@ -217,6 +219,8 @@ class Xerxes2Attention(FlaxAttentionModule):
 			key_states=key_states,
 			value_states=value_states,
 			bias=None,
+			cache_metadata=cache_metadata,
+			cache_view=cache_view,
 			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
 			segment_ids=segment_ids,
@@ -333,10 +337,11 @@ class Xerxes2DecoderLayer(nn.Module):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
-		causal_mask: chex.Array,
+		causal_mask: tp.Optional[chex.Array | bool],
 		frequencies: tp.Tuple[chex.Array, chex.Array],
 		segment_ids: tp.Optional[chex.Array] = None,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 	):
 		"""
@@ -359,6 +364,7 @@ class Xerxes2DecoderLayer(nn.Module):
 			frequencies,
 			segment_ids,
 			cache_view,
+			cache_metadata,
 			output_attentions,
 		)
 		hidden_states = self.post_attention_layernorm(hidden_states)
@@ -439,11 +445,12 @@ class Xerxes2Model(EasyDeLBaseModule):
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
-	) -> tp.Union[FlaxBaseModelOutput, tp.Tuple]:
+	) -> tp.Union[BaseModelOutput, tp.Tuple]:
 		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
 				"You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -480,6 +487,7 @@ class Xerxes2Model(EasyDeLBaseModule):
 				attention_mask=attention_mask,
 				position_ids=position_ids,
 				cache_view=past_key_values.views[idx],
+				cache_metadata=cache_metadata,
 				causal_mask=self.causal_mask,
 				output_attentions=output_attentions,
 				segment_ids=segment_ids,
@@ -501,7 +509,7 @@ class Xerxes2Model(EasyDeLBaseModule):
 		if not return_dict:
 			return tuple(v for v in outputs if v is not None)
 
-		return FlaxBaseModelOutput(
+		return BaseModelOutput(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
 			attentions=all_attentions,
@@ -557,11 +565,12 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
-	) -> tp.Union[FlaxCausalLMOutput, tp.Tuple]:
+	) -> tp.Union[CausalLMOutput, tp.Tuple]:
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
@@ -569,6 +578,7 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
@@ -587,7 +597,7 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
 
-		return FlaxCausalLMOutput(
+		return CausalLMOutput(
 			logits=lm_logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
@@ -595,8 +605,7 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 		)
 
 	def init_cache(self, batch_size: int, max_length: int):
-		return TransformerCache.init_layers_cache(
-			num_hidden_layers=self.config.num_hidden_layers,
+		return TransformerCache.init_cache(
 			dtype=self.dtype,
 			key_values_partition_specs=PartitionSpec(
 				self.config.partition_axis.batch_axis,
@@ -605,6 +614,8 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 				self.config.partition_axis.attention_dim_axis,
 			),
 			metadata=TransformerCacheMetaData.create(
+				partition_axis=self.config.partition_axis,
+				num_hidden_layers=self.config.num_hidden_layers,
 				batch_size=batch_size,
 				sequence_length=max_length,
 				num_heads=1,

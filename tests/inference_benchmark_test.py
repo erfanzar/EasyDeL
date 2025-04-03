@@ -59,9 +59,12 @@ def setup_inference():
 		processor_class=tokenizer,
 		generation_config=ed.vInferenceConfig(
 			max_new_tokens=512,
-			temperature=model.generation_config.temperature,
-			top_p=model.generation_config.top_p,
-			top_k=model.generation_config.top_k,
+			sampling_params=ed.SamplingParams(
+				max_tokens=512,
+				temperature=0.8,
+				top_p=0.95,
+				top_k=10,
+			),
 			eos_token_id=model.generation_config.eos_token_id,
 			streaming_chunks=32,
 		),

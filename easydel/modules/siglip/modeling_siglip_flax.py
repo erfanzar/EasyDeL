@@ -17,21 +17,22 @@ from functools import partial
 import chex
 import jax
 import jax.numpy as jnp
+from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax import image as jimg
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
-	FlaxBaseModelOutput,
-	FlaxBaseModelOutputWithPooling,
-	FlaxImageClassifierOutput,
+	BaseModelOutput,
+	BaseModelOutputWithPooling,
+	ImageClassifierOutput,
 	ModelOutput,
 )
 from easydel.infra.utils import ACT2FN, control_mlp_sharding
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.linear import ParallelLinear
-from eformer.pytree import auto_pytree
+
 from .configuration_siglip import SiglipConfig, SiglipTextConfig, SiglipVisionConfig
 
 
@@ -58,8 +59,8 @@ class SiglipOutput(ModelOutput):
 	logits_per_text: chex.Array = None
 	text_embeds: chex.Array = None
 	image_embeds: chex.Array = None
-	text_model_output: FlaxBaseModelOutputWithPooling = None
-	vision_model_output: FlaxBaseModelOutputWithPooling = None
+	text_model_output: BaseModelOutputWithPooling = None
+	vision_model_output: BaseModelOutputWithPooling = None
 
 	def to_tuple(self) -> tp.Tuple[tp.Any]:
 		return tuple(
@@ -212,7 +213,7 @@ class SiglipTextEmbeddings(nn.Module):
 		return embeddings
 
 
-class SiglipAttention(FlaxAttentionModule):
+class SiglipAttention(AttentionModule):
 	def __init__(
 		self,
 		config,
@@ -491,7 +492,7 @@ class SiglipEncoder(nn.Module):
 		if not return_dict:
 			return tuple(v for v in outputs if v is not None)
 
-		return FlaxBaseModelOutput(
+		return BaseModelOutput(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
 			attentions=all_attentions,
@@ -592,7 +593,7 @@ class SiglipTextTransformer(EasyDeLBaseModule):
 		if not return_dict:
 			return (last_hidden_state, pooled_output) + encoder_outputs[1:]
 
-		return FlaxBaseModelOutputWithPooling(
+		return BaseModelOutputWithPooling(
 			last_hidden_state=last_hidden_state,
 			pooler_output=pooled_output,
 			hidden_states=encoder_outputs.hidden_states,
@@ -638,7 +639,7 @@ class SiglipTextModel(EasyDeLBaseModule):
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: tp.Optional[bool] = None,
-	) -> tp.Union[tp.Tuple, FlaxBaseModelOutputWithPooling]:
+	) -> tp.Union[tp.Tuple, BaseModelOutputWithPooling]:
 		return self.text_model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
@@ -710,7 +711,7 @@ class SiglipVisionTransformer(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: tp.Optional[bool] = None,
 		interpolate_pos_encoding: tp.Optional[bool] = False,
-	) -> tp.Union[tp.Tuple, FlaxBaseModelOutputWithPooling]:
+	) -> tp.Union[tp.Tuple, BaseModelOutputWithPooling]:
 		output_attentions = (
 			output_attentions
 			if output_attentions is not None
@@ -744,7 +745,7 @@ class SiglipVisionTransformer(EasyDeLBaseModule):
 		if not return_dict:
 			return (last_hidden_state, pooler_output) + encoder_outputs[1:]
 
-		return FlaxBaseModelOutputWithPooling(
+		return BaseModelOutputWithPooling(
 			last_hidden_state=last_hidden_state,
 			pooler_output=pooler_output,
 			hidden_states=encoder_outputs.hidden_states,
@@ -907,7 +908,7 @@ class SiglipVisionModel(nn.Module):
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: tp.Optional[bool] = None,
 		interpolate_pos_encoding: bool = False,
-	) -> tp.Union[tp.Tuple, FlaxBaseModelOutputWithPooling]:
+	) -> tp.Union[tp.Tuple, BaseModelOutputWithPooling]:
 		return self.vision_model(
 			pixel_values=pixel_values,
 			output_attentions=output_attentions,
@@ -1193,7 +1194,7 @@ class SiglipForImageClassification(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: tp.Optional[bool] = None,
 		interpolate_pos_encoding: bool = False,
-	) -> tp.Union[tuple, FlaxImageClassifierOutput]:
+	) -> tp.Union[tuple, ImageClassifierOutput]:
 		output_attentions = (
 			output_attentions
 			if output_attentions is not None
@@ -1226,7 +1227,7 @@ class SiglipForImageClassification(EasyDeLBaseModule):
 			output = (logits,) + outputs[2:]
 			return output
 
-		return FlaxImageClassifierOutput(
+		return ImageClassifierOutput(
 			logits=logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,

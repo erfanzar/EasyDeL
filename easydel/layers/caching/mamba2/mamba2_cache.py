@@ -17,14 +17,24 @@ import typing as tp
 import chex as cx
 from eformer.escale import PartitionAxis, with_sharding_constraint
 from eformer.jaximus import ImplicitArray
+from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
+from .._abstracts import (
+	BaseCache,
+	BaseCacheMetadata,
+	BaseCacheView,
+	BaseRunTimeMetadata,
+)
 
-@cx.dataclass
-class Mamba2CacheMetaData:
+
+@auto_pytree
+class Mamba2CacheMetaData(BaseCacheMetadata):
 	"""Metadata for Mamba2 cache configuration."""
 
+	partition_axis: PartitionAxis
+	num_hidden_layers: int
 	batch_size: int
 	intermediate_size: int
 	num_heads: int
@@ -36,6 +46,8 @@ class Mamba2CacheMetaData:
 	@classmethod
 	def create(
 		cls,
+		parition_axis: PartitionAxis,
+		num_hidden_layers: int,
 		batch_size: int,
 		intermediate_size: int,
 		num_heads: int,
@@ -61,6 +73,8 @@ class Mamba2CacheMetaData:
 			raise ValueError("n_groups must be positive")
 
 		return cls(
+			num_hidden_layers=num_hidden_layers,
+			parition_axis=parition_axis,
 			batch_size=batch_size,
 			intermediate_size=intermediate_size,
 			num_heads=num_heads,
@@ -71,8 +85,8 @@ class Mamba2CacheMetaData:
 		)
 
 
-@cx.dataclass
-class Mamba2CacheView:
+@auto_pytree
+class Mamba2CacheView(BaseCacheView):
 	conv_states: tp.Union[cx.Array, ImplicitArray]
 	ssm_states: tp.Union[cx.Array, ImplicitArray]
 	positions: cx.Array
@@ -118,6 +132,9 @@ class Mamba2CacheView:
 			seqlen_offset=0,
 		)
 
+	def concatenate_to_cache(self, *args, **kwargs):
+		raise NotImplementedError()
+
 	def update_conv_state(
 		self,
 		new_conv_state: cx.Array,
@@ -145,12 +162,12 @@ class Mamba2CacheView:
 		return self
 
 
-@cx.dataclass
-class Mamba2Cache:
+@auto_pytree
+class Mamba2Cache(BaseCache):
 	views: tp.List[tp.Optional[Mamba2CacheView]]
 
 	@classmethod
-	def init_layers_cache(
+	def init_cache(
 		cls,
 		num_hidden_layers: int,
 		metadata: Mamba2CacheMetaData,
@@ -261,3 +278,6 @@ class Mamba2Cache:
 		)
 
 	__str__ = __repr__
+
+
+class Mamba2Metadata(BaseRunTimeMetadata): ...

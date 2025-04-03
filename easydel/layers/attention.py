@@ -32,7 +32,12 @@ from jax import tree_util as jtu
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
-from easydel.layers.caching import TransformerCacheView
+from easydel.layers.caching import (
+	PagedAttentionCacheView,
+	PagedAttentionMetadata,
+	TransformerCacheView,
+	TransformerMetadata,
+)
 from easydel.layers.quantization.quantizers import EasyQuantizer
 from easydel.utils.helpers import get_logger
 
@@ -79,6 +84,7 @@ class AttentionMechanisms(str, Enum):
 	    BLOCKWISE: Blockwise attention computation.
 	    SDPA: Scaled Dot Product Attention (potentially uses JAX native SDPA).
 	    CUDA_FLASH_ATTN2: CUDA specific FlashAttention-2 implementation.
+	    PAGED_ATTENTION: Paged attention for fast inference.
 	"""
 
 	AUTO = "auto"
@@ -90,6 +96,7 @@ class AttentionMechanisms(str, Enum):
 	BLOCKWISE = "blockwise"
 	SDPA = "sdpa"
 	CUDA_FLASH_ATTN2 = "cuda_flash_attn2"
+	PAGED_ATTENTION = "paged_attention"
 
 
 def tpu_version_check(version: str = "v4"):
@@ -160,16 +167,16 @@ class FlexibleAttentionModule(nn.Module):
 	  different attention mechanisms and help users identify the best-performing option.
 
 
-	The FlexibleAttentionModule class is a crucial component within EasyDeL, responsible for managing and optimizing attention
+	The AttentionModule class is a crucial component within EasyDeL, responsible for managing and optimizing attention
 	computations. It provides a user-friendly way to select and execute different attention mechanisms,
 	leveraging JAX's sharding capabilities and offering performance enhancements through specialized implementations
 	like FlashAttention and SplashAttention. Its ability to handle block-wise computations and customization options
 	makes it adaptable to a variety of model architectures and hardware configurations.
 	Attributes:
-		impl (AttentionBackend): The chosen attention implementation backend instance.
-		deterministic (bool): Flag indicating whether dropout should be applied (False) or not (True).
-													Currently hardcoded to True.
-		metadata (AttentionMetadata): Metadata derived from the configuration, used by the backend.
+	  impl (AttentionBackend): The chosen attention implementation backend instance.
+	  deterministic (bool): Flag indicating whether dropout should be applied (False) or not (True).
+	                        Currently hardcoded to True.
+	  metadata (AttentionMetadata): Metadata derived from the configuration, used by the backend.
 	"""
 
 	def __init__(
@@ -179,7 +186,7 @@ class FlexibleAttentionModule(nn.Module):
 		dropout_prob: float = 0.0,
 	):
 		"""
-		Initializes the FlexibleAttentionModule.
+		Initializes the AttentionModule.
 
 		Args:
 		    base_config (EasyDeLBaseConfig): Configuration object containing attention settings
@@ -205,6 +212,8 @@ class FlexibleAttentionModule(nn.Module):
 			softmax_scale=softmax_scale,
 			dropout_prob=dropout_prob,
 		)
+		self.config = base_config
+		self.metadata = metadata
 		self.impl = AttentionRegistry.create(
 			impl_name=base_config.attn_mechanism,
 			metadata=metadata,
@@ -218,6 +227,8 @@ class FlexibleAttentionModule(nn.Module):
 		key_states: Array,
 		value_states: Array,
 		bias: tp.Optional[Array] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
 		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
 		attention_mask: tp.Optional[Array] = None,
 		segment_ids: tp.Optional[Array] = None,
@@ -245,21 +256,26 @@ class FlexibleAttentionModule(nn.Module):
 		    AttentionOutput: An object containing the attention output tensor and potentially
 		                     attention weights (depending on the backend).
 		"""
-		return jtu.tree_map(
-			lambda x: x.astype(self.impl.metadata.runtime_dtype),
-			self.impl(
-				q=query_states,
-				k=key_states,
-				v=value_states,
-				bias=bias,
-				init_bias=init_bias,
-				mask=attention_mask,
-				segment_ids=segment_ids,
-				causal=causal,
-				deterministic=self.deterministic,
-				dropout_rng=dropout_rng,
-			),
-		)
+		if isinstance(cache_view, PagedAttentionCacheView):
+			assert self.config.attn_mechanism == AttentionMechanisms.PAGED_ATTENTION
+		with self.config.mesh:
+			return jtu.tree_map(
+				lambda x: x.astype(self.impl.metadata.runtime_dtype),
+				self.impl(
+					q=query_states,
+					k=key_states,
+					v=value_states,
+					bias=bias,
+					cache_metadata=cache_metadata,
+					cache_view=cache_view,
+					init_bias=init_bias,
+					mask=attention_mask,
+					segment_ids=segment_ids,
+					causal=causal,
+					deterministic=self.deterministic,
+					dropout_rng=dropout_rng,
+				),
+			)
 
 	__call__ = forward
 
@@ -268,7 +284,7 @@ SC = tp.TypeVar("SC")
 """Type variable for configuration objects."""
 
 
-class FlaxAttentionModule(nn.Module):
+class AttentionModule(nn.Module):
 	"""
 	Base class for Flax attention modules in EasyDeL, providing common utilities.
 
@@ -285,7 +301,7 @@ class FlaxAttentionModule(nn.Module):
 
 	def __init__(self, config: SC):
 		"""
-		Initializes the FlaxAttentionModule.
+		Initializes the AttentionModule.
 
 		Args:
 		    config (SC): The configuration object for this attention module.
@@ -471,7 +487,8 @@ class FlaxAttentionModule(nn.Module):
 		key: Array,
 		value: Array,
 		attention_mask: Array,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		causal_mask: tp.Optional[Array] = None,
 		token_type_ids: tp.Optional[Array] = None,
 		fcm_mask: tp.Optional[Array] = None,
@@ -506,6 +523,14 @@ class FlaxAttentionModule(nn.Module):
 			if attention_mask.dtype != jnp.bool:
 				warnings.warn("attention_mask should be a boolean array", stacklevel=1)
 				attention_mask = (attention_mask == 1).astype("b1")
+		if isinstance(causal_mask, bool) and causal_mask is False:
+			if cache_view is None:
+				causal_mask = self.config._create_causal_mask(target_length=key.shape[1])
+			elif isinstance(cache_view, TransformerCacheView):
+				target_length = cache_view.key.shape[1]
+				causal_mask = self.config._create_causal_mask(target_length)
+			elif isinstance(cache_view, PagedAttentionCacheView):
+				causal_mask = None  # PagedAttention dont need mask
 		if cache_view is None:
 			query_length = query.shape[1]
 			key_length = key.shape[1]
@@ -547,10 +572,15 @@ class FlaxAttentionModule(nn.Module):
 					value=value,
 					attention_mask=attention_mask,
 					causal_mask=causal_mask,
+					cache_metadata=cache_metadata,
 					token_type_ids=token_type_ids,
 					kv_sharding=self.get_sharding_safely(cache_view.key),
 					quantizer=self.quantizer,
 				)
+			elif isinstance(cache_view, PagedAttentionCacheView):
+				num_reps = query.shape[2] // key.shape[2]
+				if num_reps != 1:
+					key, value = self.repeat_key_value(key=key, value=value, num_reps=num_reps)
 			else:
 				raise NotImplementedError(
 					"requested type of CacheView is not supported for this attention module."

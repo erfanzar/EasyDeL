@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import dataclasses
+import queue
+import threading
 import typing as tp
+from dataclasses import field
 
-import chex
 import jax
-import jax.experimental
-import jax.experimental.pallas
 import jax.random
+import numpy as np
 from eformer.escale import PartitionAxis
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
@@ -29,15 +30,16 @@ from jax.sharding import PartitionSpec
 from easydel.utils.compiling_utils import get_safe_hash_int
 
 from .logits_process import (
-	FlaxForcedBOSTokenLogitsProcessor,
-	FlaxForcedEOSTokenLogitsProcessor,
-	FlaxLogitsProcessorList,
-	FlaxMinLengthLogitsProcessor,
-	FlaxNoRepeatNGramLogitsProcessor,
-	FlaxSuppressTokensLogitsProcessor,
-	FlaxTemperatureLogitsWarper,
-	FlaxTopKLogitsWarper,
-	FlaxTopPLogitsWarper,
+	FrequencyPenaltyLogitsProcessor,
+	LogitsProcessorList,
+	MinPLogitsWarper,
+	# NoRepeatNGramLogitsProcessor,
+	PresencePenaltyLogitsProcessor,
+	RepetitionPenaltyLogitsProcessor,
+	SuppressTokensLogitsProcessor,
+	TemperatureLogitsWarper,
+	TopKLogitsWarper,
+	TopPLogitsWarper,
 	hash_fn,
 )
 
@@ -60,13 +62,16 @@ class vInferencePreCompileConfig:
 
 	def _im_standalone(self):
 		standalone = True
-		for field in dataclasses.fields(self):
-			attr = getattr(self, field.name)
+		for rfield in dataclasses.fields(self):
+			attr = getattr(self, rfield.name)
 			if isinstance(attr, list):
 				standalone = False
 		return standalone
 
 	_is_standalone = _im_standalone
+
+	def extract(self) -> dict:
+		return dataclasses.asdict(self)
 
 	def get_default_hash(self):
 		hash_str = ""
@@ -97,10 +102,10 @@ class vInferencePreCompileConfig:
 		list_fields = {}
 		max_length = 0
 
-		for field in dataclasses.fields(self):
-			attr = getattr(self, field.name)
+		for rfield in dataclasses.fields(self):
+			attr = getattr(self, rfield.name)
 			if isinstance(attr, list):
-				list_fields[field.name] = attr
+				list_fields[rfield.name] = attr
 				max_length = max(max_length, len(attr))
 
 		# Create standalone configs
@@ -109,9 +114,9 @@ class vInferencePreCompileConfig:
 		for i in range(max_length):
 			config_kwargs = {}
 
-			for field in dataclasses.fields(self):
-				attr = getattr(self, field.name)
-				field_name = field.name
+			for rfield in dataclasses.fields(self):
+				attr = getattr(self, rfield.name)
+				field_name = rfield.name
 
 				if field_name in list_fields:
 					list_attr = list_fields[field_name]
@@ -133,25 +138,51 @@ vInferencePreCompileConfig.__hash__ = vInferencePreCompileConfig.get_default_has
 
 
 @auto_pytree
+class SamplingParams:
+	max_tokens: int = 16
+	presence_penalty: float = 0.0
+	frequency_penalty: float = 0.0
+	repetition_penalty: float = 1.0
+	temperature: float = 0.0
+	top_p: float = 1.0
+	top_k: int = 0
+	min_p: float = 0.0
+	suppress_tokens: list[int] = field(default_factory=lambda: list())
+
+	def get_logits_warper(self):
+		warpers = LogitsProcessorList()
+		warpers.append(TemperatureLogitsWarper(temperature=self.temperature))
+		warpers.append(TopKLogitsWarper(top_k=self.top_k, min_tokens_to_keep=1))
+		warpers.append(TopPLogitsWarper(top_p=self.top_p, min_tokens_to_keep=1))
+		warpers.append(MinPLogitsWarper(min_p=self.min_p, min_tokens_to_keep=1))
+		return warpers
+
+	def get_logits_processor(self):
+		processors = LogitsProcessorList()
+		processors.append(SuppressTokensLogitsProcessor(self.suppress_tokens))
+		processors.append(PresencePenaltyLogitsProcessor(self.presence_penalty))
+		processors.append(FrequencyPenaltyLogitsProcessor(self.frequency_penalty))
+		processors.append(RepetitionPenaltyLogitsProcessor(self.repetition_penalty))
+
+		return processors
+
+	__hash__ = hash_fn
+
+
+@auto_pytree
 class vInferenceConfig:
 	max_new_tokens: int = 64
-	min_length: tp.Optional[int] = None
 	streaming_chunks: int = 16
-	temperature: float = 0.0
-	top_p: float = 0.95
-	top_k: int = 50
-	do_sample: bool = True
-	no_repeat_ngram_size: tp.Optional[int] = None
+
 	num_return_sequences: tp.Optional[tp.Union[int, tp.Dict[int, int]]] = 1
-	suppress_tokens: tp.Optional[list] = None
-	forced_bos_token_id: tp.Optional[int] = None
-	forced_eos_token_id: tp.Optional[int] = None
 	pad_token_id: tp.Optional[int] = None
 	bos_token_id: tp.Optional[int] = None
 	eos_token_id: tp.Optional[tp.Union[int, tp.List[int]]] = None
 	partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, tp.Any]]] = None
 	partition_axis: tp.Optional[PartitionAxis] = None
 	_loop_rows: tp.Optional[int] = None
+
+	sampling_params: tp.Optional[SamplingParams] = None
 
 	def get_partition_rules(
 		self,
@@ -187,59 +218,10 @@ class vInferenceConfig:
 			self._loop_rows = (
 				self.max_new_tokens + self.streaming_chunks - 1
 			) // self.streaming_chunks
+		if self.sampling_params is None:
+			self.sampling_params = SamplingParams(max_tokens=self.max_new_tokens)
 
-	def __repr__(self):
-		# fmt:off
-		string = f"{self.__class__.__name__}(\n"
-		for k, v in self.__dict__.items():
-			if not k.startswith("_"):
-				try:
-					repr_src = f"  {k} : " + v.__str__().replace("\n", "\n  ") + "\n"
-					string += repr_src if len(repr_src) < 500 else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
-				except TypeError: pass #noqa
-		return string.strip() + "\n)"
-		# fmt:on
-
-	__str__ = __repr__
 	__hash__ = hash_fn
-
-	def get_logits_warper(self):
-		warpers = FlaxLogitsProcessorList()
-		if self.temperature is not None and self.temperature != 1.0:
-			warpers.append(FlaxTemperatureLogitsWarper(self.temperature))
-		if self.top_k is not None and self.top_k != 0:
-			warpers.append(FlaxTopKLogitsWarper(top_k=self.top_k, min_tokens_to_keep=1))
-		if self.top_p is not None and self.top_p < 1.0:
-			warpers.append(FlaxTopPLogitsWarper(top_p=self.top_p, min_tokens_to_keep=1))
-		print(hash(warpers))
-		if len(warpers) == 0:
-			return None
-
-		return warpers
-
-	def get_logits_processor(self):
-		processors = FlaxLogitsProcessorList()
-		eos_id = (
-			self.eos_token_id[0] if isinstance(self.eos_token_id, list) else self.eos_token_id
-		)
-		if (
-			self.min_length is not None
-			and self.eos_token_id is not None
-			and self.min_length > -1
-		):
-			processors.append(FlaxMinLengthLogitsProcessor(self.min_length, eos_id))
-		if self.forced_bos_token_id is not None:
-			processors.append(FlaxForcedBOSTokenLogitsProcessor(self.forced_bos_token_id))
-		if self.forced_eos_token_id is not None:
-			fet = FlaxForcedEOSTokenLogitsProcessor(self.max_length, self.forced_eos_token_id)
-			processors.append(fet)
-		if self.suppress_tokens is not None:
-			processors.append(FlaxSuppressTokensLogitsProcessor(self.suppress_tokens))
-		if self.no_repeat_ngram_size is not None and self.no_repeat_ngram_size > 0:
-			processors.append(FlaxNoRepeatNGramLogitsProcessor(self.no_repeat_ngram_size))
-		if len(processors) == 0:
-			return None
-		return processors
 
 
 def lower_function(
@@ -324,7 +306,46 @@ def compile_function(
 	).compile()
 
 
-@chex.dataclass
+@auto_pytree
+class PagedAttentionGenerateState:
+	"""Generate phase state"""
+
+	input_ids: jax.Array  # batch_size, 1
+	position_ids: jax.Array  # batch_size, 1
+	page_table: jax.Array  # batch_size, num_pages_per_seq
+	available_slots: queue.SimpleQueue
+	active_slot_req_map: dict
+	map_mutex: threading.Lock = threading.Lock()
+
+	@classmethod
+	def init(cls, metadata: "PagedAttentionCacheMetaData"):  # noqa #type:ignore
+		batch_size = metadata.batch_size
+		page_size = metadata.page_size
+		max_seq_len = metadata.max_sequences
+		tables = max_seq_len // page_size
+		batch_tensor = jnp.ones((batch_size), dtype=jnp.int32)
+		page_table_tensor = jnp.ones((batch_size, tables), dtype=jnp.int32)
+		return cls(
+			input_ids=batch_tensor,
+			positions=batch_tensor,
+			page_table=page_table_tensor,
+			available_slots=0,
+			active_slot_req_map={},
+		)
+
+
+@auto_pytree
+class SchedulerPostProcessRequest:
+	prefill_request_id: tp.Optional[str]
+	prefill_input_id: tp.Union[jax.Array, np.ndarray]
+	prefill_done: tp.Union[jax.Array, np.ndarray]
+	generate_active_slots: tp.List[int]
+	generate_active_request_ids: tp.List[str]
+	generate_input_ids: tp.Union[jax.Array, np.ndarray]
+	generate_done: tp.Union[jax.Array, np.ndarray]
+
+
+@auto_pytree
 class SampleState:
 	"""
 	Data class representing the state of the sampling process.
@@ -347,48 +368,23 @@ class SampleState:
 	_time_spent_computing: tp.Optional[float] = 0.0
 	_compile_config: tp.Optional[vInferencePreCompileConfig] = None
 
-	def __repr__(self):
-		"""
-		Args:
-		    self: Refer to the instance of the class
-
-		Returns:
-		    A string representation of the object
-		"""
-		string = f"{self.__class__.__name__}(\n"
-		for k, v in self.__dict__.items():
-			if not k.startswith("_"):
-				try:
-					repr_src = f"  {k} : " + v.__str__().replace("\n", "\n  ") + "\n"
-					string += (
-						repr_src
-						if len(repr_src) < 500
-						else f"  {k} : " + f"{v.__class__.__name__}(...)" + "\n"
-					)
-				except (TypeError, AttributeError):
-					pass
-		return string.strip() + "\n)"
-
-	__str__ = __repr__
-
 
 def create_sampling_step(
-	logits_processor: FlaxLogitsProcessorList,
-	logits_warper: FlaxLogitsProcessorList,
+	logits_processor: LogitsProcessorList,
+	logits_warper: LogitsProcessorList,
 	eos_token_id: jax.Array,
 	pad_token_id: jax.Array,
-	do_sample: bool = True,
 ):
 	def sampling_step(graphdef, graphstate, graphother, state: SampleState):
 		"""
 		Performs a single sampling step for text generation.
 
 		Args:
-				params: Model parameters.
-				state (inference_utils.SampleState): The current generation state.
+		    params: Model parameters.
+		    state (inference_utils.SampleState): The current generation state.
 
 		Returns:
-				inference_utils.SampleState: The updated generation state.
+		    inference_utils.SampleState: The updated generation state.
 		"""
 		model = nn.merge(graphdef, graphstate, graphother)
 		model_outputs = model(
@@ -401,12 +397,9 @@ def create_sampling_step(
 		if logits_processor is not None:
 			logits = logits_processor(state.sequences, logits, state.current_length)
 
-		if do_sample:
-			if logits_warper is not None:
-				logits = logits_warper(logits, logits, state.current_length)
-			next_token = jax.random.categorical(state.prng_key, logits, axis=-1)
-		else:
-			next_token = jnp.argmax(logits, axis=-1)
+		if logits_warper is not None:
+			logits = logits_warper(logits, logits, state.current_length)
+		next_token = jax.random.categorical(state.prng_key, logits, axis=-1)
 
 		next_token = (
 			next_token * ~state.is_sequence_finished
@@ -433,7 +426,7 @@ def create_sampling_step(
 			is_sequence_finished=next_sequence_finished,
 			prng_key=jax.random.split(state.prng_key, 2)[0],
 			model_kwargs=next_model_kwargs,
-			generated_tokens=state.generated_tokens + 1,
+			generated_tokens=state.generated_tokens + state.sequences.shape[0],
 		)
 
 	return sampling_step

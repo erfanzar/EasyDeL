@@ -25,6 +25,7 @@ import jax
 import jax.numpy as jnp
 from eformer.escale import PartitionAxis
 from eformer.escale.partition.constraints import with_sharding_constraint
+from eformer.pytree import auto_pytree
 from jax import lax
 from jax.sharding import PartitionSpec
 
@@ -50,7 +51,7 @@ class SpecialLossNormalizingFactor(enum.Enum):
 FACTOR_TYPE = tp.Optional[tp.Union[float, int, str, SpecialLossNormalizingFactor]]
 
 
-@chex.dataclass
+@auto_pytree
 class LossConfig:
 	ignore_index: int = -100
 	label_smoothing: float = 0.0
@@ -82,7 +83,7 @@ class LossConfig:
 	__str__ = __repr__
 
 
-@chex.dataclass
+@auto_pytree
 class LossMetrics:
 	loss: tp.Optional[tp.Union[float, chex.Array]] = None
 	z_loss: tp.Optional[tp.Union[float, chex.Array]] = None

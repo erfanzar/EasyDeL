@@ -142,7 +142,7 @@ def test_mamba2_cache_initialization():
 	)
 
 	num_layers = 3
-	cache = Mamba2Cache.init_layers_cache(
+	cache = Mamba2Cache.init_cache(
 		num_hidden_layers=num_layers, metadata=metadata, dtype=jnp.float32
 	)
 
@@ -161,7 +161,7 @@ def test_mamba2_cache_updates():
 		n_groups=1,
 	)
 
-	cache = Mamba2Cache.init_layers_cache(
+	cache = Mamba2Cache.init_cache(
 		num_hidden_layers=3, metadata=metadata, dtype=jnp.float32
 	)
 
@@ -194,7 +194,7 @@ def test_mamba2_cache_reset():
 		n_groups=1,
 	)
 
-	cache = Mamba2Cache.init_layers_cache(
+	cache = Mamba2Cache.init_cache(
 		num_hidden_layers=3, metadata=metadata, dtype=jnp.float32
 	)
 
@@ -238,7 +238,7 @@ def test_cache_string_representation():
 		n_groups=1,
 	)
 
-	cache = Mamba2Cache.init_layers_cache(
+	cache = Mamba2Cache.init_cache(
 		num_hidden_layers=2, metadata=metadata, dtype=jnp.float32
 	)
 
@@ -310,9 +310,7 @@ def test_dtype_consistency():
 	dtypes = [jnp.float32, jnp.float16, jnp.bfloat16]
 
 	for dtype in dtypes:
-		cache = Mamba2Cache.init_layers_cache(
-			num_hidden_layers=2, metadata=metadata, dtype=dtype
-		)
+		cache = Mamba2Cache.init_cache(num_hidden_layers=2, metadata=metadata, dtype=dtype)
 
 		assert cache.views[0].conv_states.dtype == dtype
 		assert cache.views[0].ssm_states.dtype == dtype
@@ -332,7 +330,7 @@ def test_batch_dimension_consistency():
 			n_groups=1,
 		)
 
-		cache = Mamba2Cache.init_layers_cache(
+		cache = Mamba2Cache.init_cache(
 			num_hidden_layers=2, metadata=metadata, dtype=jnp.float32
 		)
 
@@ -354,7 +352,7 @@ def test_partition_specs():
 
 	# Test with custom partition specs
 	custom_partition_spec = PartitionSpec("batch", "head", None)
-	cache = Mamba2Cache.init_layers_cache(
+	cache = Mamba2Cache.init_cache(
 		num_hidden_layers=2,
 		metadata=metadata,
 		dtype=jnp.float32,
@@ -362,7 +360,7 @@ def test_partition_specs():
 	)
 
 	# Test with default partition specs
-	default_cache = Mamba2Cache.init_layers_cache(
+	default_cache = Mamba2Cache.init_cache(
 		num_hidden_layers=2, metadata=metadata, dtype=jnp.float32
 	)
 

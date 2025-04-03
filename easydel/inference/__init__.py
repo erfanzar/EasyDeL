@@ -13,10 +13,16 @@
 # limitations under the License.
 
 from .utilities import vInferencePreCompileConfig
-from .vinference import vInference, vInferenceApiServer, vInferenceConfig
+from .vinference import (
+	SamplingParams,
+	vInference,
+	vInferenceApiServer,
+	vInferenceConfig,
+)
 from .whisper_inference import vWhisperInference, vWhisperInferenceConfig
 
 __all__ = [
+	"SamplingParams",
 	"vInference",
 	"vInferenceConfig",
 	"vInferenceApiServer",

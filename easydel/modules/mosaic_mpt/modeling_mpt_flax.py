@@ -26,17 +26,21 @@ from jax import numpy as jnp
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import (
-	FlaxBaseModelOutput,
-	FlaxCausalLMOutput,
-)
+from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
 from easydel.infra.utils import (
 	auto_remat,
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 )
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import (
+	PagedAttentionCache,
+	PagedAttentionCacheView,
+	PagedAttentionMetadata,
+	TransformerCache,
+	TransformerCacheView,
+	TransformerMetadata,
+)
 from easydel.layers.linear import ParallelLinear
 
 from .mosaic_configuration import MptConfig as MptConfig
@@ -85,7 +89,7 @@ class MptMLP(nn.Module):
 		return self.hidden_dropout(hidden_states) + residual
 
 
-class MptAttention(FlaxAttentionModule):
+class MptAttention(AttentionModule):
 	def __init__(
 		self,
 		config: MptConfig,
@@ -148,9 +152,10 @@ class MptAttention(FlaxAttentionModule):
 		hidden_states: chex.Array,
 		position_bias: chex.Array | tp.Tuple[chex.Array, chex.Array],
 		attention_mask: chex.Array,
-		causal_mask: chex.Array,
+		causal_mask: tp.Optional[chex.Array | bool],
 		segment_ids: tp.Optional[chex.Array] = None,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
 	):
@@ -210,6 +215,8 @@ class MptAttention(FlaxAttentionModule):
 			key_states=key_states,
 			value_states=value_states,
 			bias=attention_bias,
+			cache_metadata=cache_metadata,
+			cache_view=cache_view,
 			init_bias=lambda: attention_bias,
 			attention_mask=None,
 			segment_ids=segment_ids,
@@ -292,9 +299,10 @@ class MptBlock(nn.Module):
 		hidden_states: chex.Array,
 		position_bias: chex.Array | tp.Tuple[chex.Array, chex.Array],
 		attention_mask: chex.Array,
-		causal_mask: chex.Array,
+		causal_mask: tp.Optional[chex.Array | bool],
 		segment_ids: tp.Optional[chex.Array] = None,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
 	):
@@ -305,6 +313,7 @@ class MptBlock(nn.Module):
 			causal_mask,
 			segment_ids,
 			cache_view,
+			cache_metadata,
 			output_attentions,
 			fcm_mask,
 		)
@@ -415,10 +424,11 @@ class MptModel(EasyDeLBaseModule):
 		segment_ids: tp.Optional[chex.Array] = None,
 		inputs_embeds: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
-	) -> tp.Union[FlaxBaseModelOutput, tp.Tuple]:
+	) -> tp.Union[BaseModelOutput, tp.Tuple]:
 		all_hidden_states = () if output_hidden_states else None
 		all_attentions = () if output_attentions else None
 		if (input_ids is None) ^ (inputs_embeds is not None):
@@ -453,6 +463,7 @@ class MptModel(EasyDeLBaseModule):
 				causal_mask=self.causal_mask,
 				output_attentions=output_attentions,
 				cache_view=past_key_values.views[idx],
+				cache_metadata=cache_metadata,
 				position_bias=self.alibi,
 				segment_ids=segment_ids,
 			)
@@ -470,7 +481,7 @@ class MptModel(EasyDeLBaseModule):
 		if not return_dict:
 			return tuple(value for value in outputs if value is not None)
 
-		return FlaxBaseModelOutput(
+		return BaseModelOutput(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
 			attentions=all_attentions,
@@ -527,12 +538,13 @@ class MptForCausalLM(EasyDeLBaseModule):
 		segment_ids: tp.Optional[chex.Array] = None,
 		inputs_embeds: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
 		**kwargs,
-	) -> tp.Union[FlaxBaseModelOutput, tp.Tuple]:
-		outputs: FlaxBaseModelOutput = self.transformer(
+	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+		outputs: BaseModelOutput = self.transformer(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			segment_ids=segment_ids,
@@ -556,7 +568,7 @@ class MptForCausalLM(EasyDeLBaseModule):
 		if not return_dict:
 			return (logits,) + outputs[1:]
 
-		return FlaxCausalLMOutput(
+		return CausalLMOutput(
 			logits=logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,

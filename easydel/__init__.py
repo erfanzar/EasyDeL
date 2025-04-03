@@ -94,6 +94,7 @@ if _check_bool_flag("EASYDEL_AUTO", True):
 _import_structure = {
 	"utils": ["traversals"],
 	"inference": [
+		"SamplingParams",
 		"vInference",
 		"vInferenceApiServer",
 		"vInferenceConfig",
@@ -102,14 +103,16 @@ _import_structure = {
 		"vWhisperInferenceConfig",
 	],
 	"infra": [
-		"escale",
-		"PartitionAxis",
 		"EasyDeLBaseConfig",
 		"EasyDeLBaseConfigDict",
 		"EasyDeLBaseModule",
+		"EasyDeLState",
 		"LossConfig",
+		"PartitionAxis",
+		"PyTree",
+		"auto_pytree",
+		"escale",
 	],
-	"infra.base_state": ["EasyDeLState"],
 	"infra.errors": [
 		"EasyDeLRuntimeError",
 		"EasyDeLSyntaxRuntimeError",
@@ -134,7 +137,7 @@ _import_structure = {
 		"AttentionMechanisms",
 		"AttentionMetadata",
 		"AttentionRegistry",
-		"FlexibleAttentionModule",
+		"AttentionModule",
 	],
 	"modules": [],
 	"modules.arctic": [
@@ -425,7 +428,8 @@ _import_structure = {
 
 if _tp.TYPE_CHECKING:
 	from . import utils
-	from .inference.vinference import (
+	from .inference import (
+		SamplingParams,
 		vInference,
 		vInferenceApiServer,
 		vInferenceConfig,
@@ -437,11 +441,13 @@ if _tp.TYPE_CHECKING:
 		EasyDeLBaseConfig,
 		EasyDeLBaseConfigDict,
 		EasyDeLBaseModule,
+		EasyDeLState,
 		LossConfig,
 		PartitionAxis,
+		PyTree,
+		auto_pytree,
 		escale,
 	)
-	from .infra.base_state import EasyDeLState
 	from .infra.errors import (
 		EasyDeLRuntimeError,
 		EasyDeLSyntaxRuntimeError,
@@ -464,8 +470,8 @@ if _tp.TYPE_CHECKING:
 	from .layers.attention import (
 		AttentionMechanisms,
 		AttentionMetadata,
+		AttentionModule,
 		AttentionRegistry,
-		FlexibleAttentionModule,
 	)
 	from .modules.arctic import (
 		ArcticConfig,
@@ -761,7 +767,7 @@ else:
 		extra_objects={"__version__": __version__},
 	)
 
-	_targeted_versions = ["0.0.21"]
+	_targeted_versions = ["0.0.22"]
 
 	from eformer import __version__ as _eform_version
 

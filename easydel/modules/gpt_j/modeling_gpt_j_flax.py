@@ -23,18 +23,22 @@ from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import (
-	FlaxBaseModelOutput,
-	FlaxCausalLMOutput,
-)
+from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
 from easydel.infra.utils import (
 	ACT2FN,
 	auto_remat,
 	block_wise_ffn,
 	get_dot_general_by_bits,
 )
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import (
+	PagedAttentionCache,
+	PagedAttentionCacheView,
+	PagedAttentionMetadata,
+	TransformerCache,
+	TransformerCacheView,
+	TransformerMetadata,
+)
 from easydel.layers.linear import ParallelLinear
 from easydel.utils.helpers import get_logger
 
@@ -43,7 +47,7 @@ from .gpt_j_configuration import GPTJConfig as GPTJConfig
 logger = get_logger(__name__)
 
 
-class GPTJAttention(FlaxAttentionModule):
+class GPTJAttention(AttentionModule):
 	def __init__(
 		self,
 		config: GPTJConfig,
@@ -115,7 +119,8 @@ class GPTJAttention(FlaxAttentionModule):
 		position_ids: chex.Array,
 		causal_mask: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 		frequencies: tp.Optional[chex.Array] = None,
 	):
@@ -153,6 +158,8 @@ class GPTJAttention(FlaxAttentionModule):
 			key_states=key,
 			value_states=value,
 			bias=None,
+			cache_metadata=cache_metadata,
+			cache_view=cache_view,
 			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
 			segment_ids=segment_ids,
@@ -278,7 +285,8 @@ class GPTJBlock(nn.Module):
 		position_ids: chex.Array,
 		causal_mask: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 		frequencies: tp.Optional[chex.Array] = None,
 	):
@@ -291,6 +299,7 @@ class GPTJBlock(nn.Module):
 			causal_mask,
 			segment_ids,
 			cache_view,
+			cache_metadata,
 			output_attentions,
 			frequencies,
 		)
@@ -380,7 +389,8 @@ class GPTJModel(EasyDeLBaseModule):
 		input_ids: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		inputs_embeds: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
 		extra_embedding: tp.Optional[chex.Array] = None,
@@ -428,6 +438,7 @@ class GPTJModel(EasyDeLBaseModule):
 				hidden_states=hidden_states,
 				attention_mask=attention_mask,
 				cache_view=past_key_values.views[idx],
+				cache_metadata=cache_metadata,
 				position_ids=position_ids,
 				output_attentions=output_attentions,
 				segment_ids=segment_ids,
@@ -446,7 +457,7 @@ class GPTJModel(EasyDeLBaseModule):
 		if not return_dict:
 			return tuple(v for v in outputs if v is not None)
 
-		return FlaxBaseModelOutput(
+		return BaseModelOutput(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
 			attentions=all_attentions,
@@ -499,7 +510,8 @@ class GPTJForCausalLM(EasyDeLBaseModule):
 		input_ids: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		inputs_embeds: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
 		extra_embedding: tp.Optional[chex.Array] = None,
@@ -534,7 +546,7 @@ class GPTJForCausalLM(EasyDeLBaseModule):
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
 
-		return FlaxCausalLMOutput(
+		return CausalLMOutput(
 			logits=lm_logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
