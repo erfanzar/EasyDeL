@@ -23,7 +23,7 @@ from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
+from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
 from easydel.infra.utils import (
 	ACT2FN,
 	auto_remat,
@@ -31,9 +31,17 @@ from easydel.infra.utils import (
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 )
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import (
+	PagedAttentionCache,
+	PagedAttentionCacheView,
+	PagedAttentionMetadata,
+	TransformerCache,
+	TransformerCacheView,
+	TransformerMetadata,
+)
 from easydel.layers.linear import ParallelLinear
+
 from .stablelm_configuration import StableLmConfig
 
 
@@ -121,7 +129,7 @@ class StableLmLayerNormPerHead(nn.Module):
 		)
 
 
-class StableLmAttention(FlaxAttentionModule):
+class StableLmAttention(AttentionModule):
 	def __init__(
 		self,
 		config: StableLmConfig,
@@ -222,8 +230,9 @@ class StableLmAttention(FlaxAttentionModule):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
-		causal_mask: chex.Array,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[chex.Array | bool],
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
@@ -290,6 +299,8 @@ class StableLmAttention(FlaxAttentionModule):
 			key_states=key_states,
 			value_states=value_states,
 			bias=None,
+			cache_metadata=cache_metadata,
+			cache_view=cache_view,
 			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
 			segment_ids=segment_ids,
@@ -367,8 +378,9 @@ class StableLmDecoderLayer(nn.Module):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
-		causal_mask: chex.Array,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[chex.Array | bool],
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
@@ -382,6 +394,7 @@ class StableLmDecoderLayer(nn.Module):
 			position_ids,
 			causal_mask,
 			cache_view,
+			cache_metadata,
 			segment_ids,
 			output_attentions,
 			fcm_mask,
@@ -493,9 +506,10 @@ class StableLmModel(EasyDeLBaseModule):
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
-	) -> tp.Union[FlaxBaseModelOutput, tp.Tuple]:
+	) -> tp.Union[BaseModelOutput, tp.Tuple]:
 		"""
 		Forward pass through the StableLm module.
 
@@ -512,7 +526,7 @@ class StableLmModel(EasyDeLBaseModule):
 		    return_dict (bool): If True, return a dictionary of outputs.
 
 		Returns:
-		    FlaxBaseModelOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
+		    BaseModelOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
 		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
@@ -552,6 +566,7 @@ class StableLmModel(EasyDeLBaseModule):
 				attention_mask=attention_mask,
 				position_ids=position_ids,
 				cache_view=past_key_values.views[idx],
+				cache_metadata=cache_metadata,
 				causal_mask=self.causal_mask,
 				output_attentions=output_attentions,
 				segment_ids=segment_ids,
@@ -571,7 +586,7 @@ class StableLmModel(EasyDeLBaseModule):
 		if not return_dict:
 			return tuple(value for value in outputs if value is not None)
 
-		return FlaxBaseModelOutput(
+		return BaseModelOutput(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
 			attentions=all_attentions,
@@ -629,9 +644,10 @@ class StableLmForCausalLM(EasyDeLBaseModule):
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
-	) -> tp.Union[FlaxCausalLMOutput, tp.Tuple]:
+	) -> tp.Union[CausalLMOutput, tp.Tuple]:
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
@@ -639,6 +655,7 @@ class StableLmForCausalLM(EasyDeLBaseModule):
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
@@ -657,7 +674,7 @@ class StableLmForCausalLM(EasyDeLBaseModule):
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
 
-		return FlaxCausalLMOutput(
+		return CausalLMOutput(
 			logits=lm_logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,

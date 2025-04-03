@@ -20,25 +20,26 @@ from functools import cached_property, partial
 import chex
 import jax
 import numpy as np
+from eformer.pytree import auto_pytree
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from transformers.generation.configuration_utils import GenerationConfig
 
 from easydel.inference.logits_process import (
-	FlaxForcedBOSTokenLogitsProcessor,
-	FlaxForcedEOSTokenLogitsProcessor,
-	FlaxForceTokensLogitsProcessor,
-	FlaxLogitsProcessorList,
-	FlaxMinLengthLogitsProcessor,
-	FlaxNoRepeatNGramLogitsProcessor,
-	FlaxSuppressTokensAtBeginLogitsProcessor,
-	FlaxSuppressTokensLogitsProcessor,
-	FlaxTemperatureLogitsWarper,
-	FlaxTopKLogitsWarper,
-	FlaxTopPLogitsWarper,
+	ForcedBOSTokenLogitsProcessor,
+	ForcedEOSTokenLogitsProcessor,
+	ForceTokensLogitsProcessor,
+	LogitsProcessorList,
+	MinLengthLogitsProcessor,
+	NoRepeatNGramLogitsProcessor,
+	SuppressTokensAtBeginLogitsProcessor,
+	SuppressTokensLogitsProcessor,
+	TemperatureLogitsWarper,
+	TopKLogitsWarper,
+	TopPLogitsWarper,
 )
-from easydel.layers.caching.transformer_cache import (
+from easydel.layers.caching import (
 	TransformerCache,
 	TransformerCacheMetaData,
 )
@@ -46,15 +47,15 @@ from easydel.utils.helpers import get_logger
 
 from ..base_config import EasyDeLBaseConfig
 from ..modeling_outputs import (
-	FlaxBeamSearchOutput,
-	FlaxGreedySearchOutput,
-	FlaxSampleOutput,
+	BeamSearchOutput,
+	GreedySearchOutput,
+	SampleOutput,
 )
 
 logger = get_logger(__name__)
 
 
-@chex.dataclass
+@auto_pytree
 class GreedyState:
 	"""
 	State for greedy search generation.
@@ -74,7 +75,7 @@ class GreedyState:
 	model_kwargs: tp.Dict[str, chex.Array]
 
 
-@chex.dataclass
+@auto_pytree
 class SampleState:
 	"""
 	State for sampling generation.
@@ -96,7 +97,7 @@ class SampleState:
 	model_kwargs: tp.Dict[str, chex.Array]
 
 
-@chex.dataclass
+@auto_pytree
 class BeamSearchState:
 	"""
 	State for beam search generation.
@@ -134,8 +135,7 @@ class EasyGenerationMixin:
 		num_key_value_heads = getattr(self.config, "num_key_value_heads", None)
 		if num_key_value_heads is None:
 			num_key_value_heads = self.config.num_attention_heads
-		return TransformerCache.init_layers_cache(
-			num_hidden_layers=self.config.num_hidden_layers,
+		return TransformerCache.init_cache(
 			dtype=self.dtype,
 			key_values_partition_specs=PartitionSpec(
 				self.config.partition_axis.batch_axis,
@@ -144,6 +144,8 @@ class EasyGenerationMixin:
 				self.config.partition_axis.attention_dim_axis,
 			),
 			metadata=TransformerCacheMetaData.create(
+				partition_axis=self.config.partition_axis,
+				num_hidden_layers=self.config.num_hidden_layers,
 				batch_size=batch_size,
 				sequence_length=max_length,
 				num_heads=num_key_value_heads,
@@ -155,7 +157,6 @@ class EasyGenerationMixin:
 				quantization_platform=self.config.platform,
 			),
 			mesh=self.config.mesh,
-			partition_axis=self.config.partition_axis,
 		)
 
 	@cached_property
@@ -463,7 +464,7 @@ class EasyGenerationMixin:
 		generation_config: tp.Optional[GenerationConfig] = None,
 		prng_key: tp.Optional[chex.Array] = None,
 		trace: bool = True,
-		logits_processor: tp.Optional[FlaxLogitsProcessorList] = None,
+		logits_processor: tp.Optional[LogitsProcessorList] = None,
 		**kwargs,
 	):
 		r"""
@@ -482,7 +483,7 @@ class EasyGenerationMixin:
 				trace (`bool`, *optional*, defaults to `True`):
 						Whether to trace generation. Setting `trace=False` should only be used for debugging and will lead to a
 						considerably slower runtime.
-				logits_processor (`FlaxLogitsProcessorList `, *optional*):
+				logits_processor (`LogitsProcessorList `, *optional*):
 						Custom logits processors that complement the default logits processors built from arguments and
 						generation config. If a logit processor is passed that is already created with the arguments or a
 						generation config an error is thrown. This feature is intended for advanced users.
@@ -518,7 +519,7 @@ class EasyGenerationMixin:
 		self._validate_model_kwargs(model_kwargs.copy())
 
 		logits_processor = (
-			logits_processor if logits_processor is not None else FlaxLogitsProcessorList()
+			logits_processor if logits_processor is not None else LogitsProcessorList()
 		)
 
 		# set init values
@@ -713,25 +714,26 @@ class EasyGenerationMixin:
 			raise NotImplementedError("`Beam sampling is currently not implemented.")
 
 	def _get_logits_warper(
-		self, generation_config: GenerationConfig
-	) -> FlaxLogitsProcessorList:
+		self,
+		generation_config: GenerationConfig,
+	) -> LogitsProcessorList:
 		"""
-		This class returns a [`FlaxLogitsProcessorList`] list object that contains all relevant [`FlaxLogitsWarper`]
+		This class returns a [`LogitsProcessorList`] list object that contains all relevant [`LogitsWarper`]
 		instances used for multinomial sampling.
 		"""
-		warpers = FlaxLogitsProcessorList()
+		warpers = LogitsProcessorList()
 
 		if (
 			generation_config.temperature is not None and generation_config.temperature != 1.0
 		):
-			warpers.append(FlaxTemperatureLogitsWarper(generation_config.temperature))
+			warpers.append(TemperatureLogitsWarper(generation_config.temperature))
 		if generation_config.top_k is not None and generation_config.top_k != 0:
 			warpers.append(
-				FlaxTopKLogitsWarper(top_k=generation_config.top_k, min_tokens_to_keep=1)
+				TopKLogitsWarper(top_k=generation_config.top_k, min_tokens_to_keep=1)
 			)
 		if generation_config.top_p is not None and generation_config.top_p < 1.0:
 			warpers.append(
-				FlaxTopPLogitsWarper(top_p=generation_config.top_p, min_tokens_to_keep=1)
+				TopPLogitsWarper(top_p=generation_config.top_p, min_tokens_to_keep=1)
 			)
 
 		return warpers
@@ -740,13 +742,13 @@ class EasyGenerationMixin:
 		self,
 		generation_config: GenerationConfig,
 		input_ids_seq_length: int,
-		logits_processor: tp.Optional[FlaxLogitsProcessorList],
-	) -> FlaxLogitsProcessorList:
+		logits_processor: tp.Optional[LogitsProcessorList],
+	) -> LogitsProcessorList:
 		"""
-		This class returns a [`FlaxLogitsProcessorList`] list object that contains all relevant [`FlaxLogitsProcessor`]
+		This class returns a [`LogitsProcessorList`] list object that contains all relevant [`LogitsProcessor`]
 		instances used to modify the scores of the language model head.
 		"""
-		processors = FlaxLogitsProcessorList()
+		processors = LogitsProcessorList()
 
 		if (
 			generation_config.min_length is not None
@@ -755,24 +757,24 @@ class EasyGenerationMixin:
 			and generation_config.min_length > -1
 		):
 			processors.append(
-				FlaxMinLengthLogitsProcessor(
+				MinLengthLogitsProcessor(
 					generation_config.min_length,
 					generation_config.eos_token_id,
 				)
 			)
 		if generation_config.forced_bos_token_id is not None:
 			processors.append(
-				FlaxForcedBOSTokenLogitsProcessor(generation_config.forced_bos_token_id)
+				ForcedBOSTokenLogitsProcessor(generation_config.forced_bos_token_id)
 			)
 		if generation_config.forced_eos_token_id is not None:
 			processors.append(
-				FlaxForcedEOSTokenLogitsProcessor(
+				ForcedEOSTokenLogitsProcessor(
 					generation_config.max_length, generation_config.forced_eos_token_id
 				)
 			)
 		if generation_config.suppress_tokens is not None:
 			processors.append(
-				FlaxSuppressTokensLogitsProcessor(generation_config.suppress_tokens)
+				SuppressTokensLogitsProcessor(generation_config.suppress_tokens)
 			)
 		if generation_config.begin_suppress_tokens is not None:
 			begin_index = input_ids_seq_length
@@ -788,7 +790,7 @@ class EasyGenerationMixin:
 				# generation starts after the last token that is forced
 				begin_index += generation_config.forced_decoder_ids[-1][0]
 			processors.append(
-				FlaxSuppressTokensAtBeginLogitsProcessor(
+				SuppressTokensAtBeginLogitsProcessor(
 					generation_config.begin_suppress_tokens, begin_index
 				)
 			)
@@ -797,13 +799,13 @@ class EasyGenerationMixin:
 				[input_ids_seq_length + i[0] - 1, i[1]]
 				for i in generation_config.forced_decoder_ids
 			]
-			processors.append(FlaxForceTokensLogitsProcessor(forced_decoder_ids))
+			processors.append(ForceTokensLogitsProcessor(forced_decoder_ids))
 		if (
 			generation_config.no_repeat_ngram_size is not None
 			and generation_config.no_repeat_ngram_size > 0
 		):
 			processors.append(
-				FlaxNoRepeatNGramLogitsProcessor(generation_config.no_repeat_ngram_size)
+				NoRepeatNGramLogitsProcessor(generation_config.no_repeat_ngram_size)
 			)
 		processors = self._merge_criteria_processor_list(processors, logits_processor)
 
@@ -811,9 +813,9 @@ class EasyGenerationMixin:
 
 	def _merge_criteria_processor_list(
 		self,
-		default_list: FlaxLogitsProcessorList,
-		custom_list: FlaxLogitsProcessorList,
-	) -> FlaxLogitsProcessorList:
+		default_list: LogitsProcessorList,
+		custom_list: LogitsProcessorList,
+	) -> LogitsProcessorList:
 		if len(custom_list) == 0:
 			return default_list
 		for default in default_list:
@@ -836,7 +838,7 @@ class EasyGenerationMixin:
 		max_length: tp.Optional[int] = None,
 		pad_token_id: tp.Optional[int] = None,
 		eos_token_id: tp.Optional[int] = None,
-		logits_processor: tp.Optional[FlaxLogitsProcessorList] = None,
+		logits_processor: tp.Optional[LogitsProcessorList] = None,
 		trace: bool = True,
 		model_kwargs: tp.Optional[tp.Dict[str, chex.Array]] = None,
 	):
@@ -925,7 +927,7 @@ class EasyGenerationMixin:
 		else:
 			state = lax.while_loop(greedy_search_cond_fn, greedy_search_body_fn, state)
 
-		return FlaxGreedySearchOutput(sequences=state.sequences)
+		return GreedySearchOutput(sequences=state.sequences)
 
 	def _sample(
 		self,
@@ -934,8 +936,8 @@ class EasyGenerationMixin:
 		pad_token_id: tp.Optional[int] = None,
 		eos_token_id: tp.Optional[int] = None,
 		prng_key: tp.Optional[chex.Array] = None,
-		logits_processor: tp.Optional[FlaxLogitsProcessorList] = None,
-		logits_warper: tp.Optional[FlaxLogitsProcessorList] = None,
+		logits_processor: tp.Optional[LogitsProcessorList] = None,
+		logits_warper: tp.Optional[LogitsProcessorList] = None,
 		trace: bool = True,
 		model_kwargs: tp.Optional[tp.Dict[str, chex.Array]] = None,
 	):
@@ -1034,7 +1036,7 @@ class EasyGenerationMixin:
 		else:
 			state = lax.while_loop(sample_search_cond_fn, sample_search_body_fn, state)
 
-		return FlaxSampleOutput(sequences=state.sequences)
+		return SampleOutput(sequences=state.sequences)
 
 	def _beam_search(
 		self,
@@ -1044,7 +1046,7 @@ class EasyGenerationMixin:
 		eos_token_id: tp.Optional[int] = None,
 		length_penalty: tp.Optional[float] = None,
 		early_stopping: tp.Optional[tp.Union[bool, str]] = None,
-		logits_processor: tp.Optional[FlaxLogitsProcessorList] = None,
+		logits_processor: tp.Optional[LogitsProcessorList] = None,
 		trace: bool = True,
 		num_return_sequences: tp.Optional[int] = None,
 		model_kwargs: tp.Optional[tp.Dict[str, chex.Array]] = None,
@@ -1308,4 +1310,4 @@ class EasyGenerationMixin:
 		sequences = flatten_beam_dim(sequences[:, :num_return_sequences, :])
 		scores = flatten_beam_dim(scores[:, :num_return_sequences])
 
-		return FlaxBeamSearchOutput(sequences=sequences, scores=scores)
+		return BeamSearchOutput(sequences=sequences, scores=scores)

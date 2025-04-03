@@ -1,10 +1,9 @@
-import chex as cx
 import jax.numpy as jnp
 import pytest
 from eformer import escale as es
 from jax.sharding import NamedSharding, PartitionSpec
 
-from easydel.layers.caching.paged_attention_cache import (
+from easydel.layers.caching.paged_attention.paged_attention_cache import (
 	PagedAttentionCache,
 	PagedAttentionCacheMetaData,
 	PagedAttentionCacheView,

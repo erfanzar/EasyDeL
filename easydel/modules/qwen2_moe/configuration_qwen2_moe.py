@@ -107,6 +107,7 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
 		rms_norm_eps=1e-6,
 		use_cache=True,
 		tie_word_embeddings=False,
+		qkv_bias=False,
 		rope_theta=10000.0,
 		use_sliding_window=False,
 		sliding_window=4096,
@@ -134,7 +135,7 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
 		self.use_sliding_window = use_sliding_window
 		self.sliding_window = sliding_window
 		self.max_window_layers = max_window_layers
-
+		self.qkv_bias = qkv_bias
 		self.num_key_value_heads = num_key_value_heads
 		self.hidden_act = hidden_act
 		self.initializer_range = initializer_range

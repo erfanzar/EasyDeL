@@ -14,17 +14,18 @@
 import math
 import typing as tp
 from functools import partial
-from eformer.pytree import auto_pytree
+
 import chex
 import jax
 import jax.numpy as jnp
 import numpy as np
+from eformer.pytree import auto_pytree
 from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
-	FlaxBaseModelOutput,
+	BaseModelOutput,
 	ModelOutput,
 )
 from easydel.infra.utils import (
@@ -34,8 +35,15 @@ from easydel.infra.utils import (
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 )
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import (
+	PagedAttentionCache,
+	PagedAttentionCacheView,
+	PagedAttentionMetadata,
+	TransformerCache,
+	TransformerCacheView,
+	TransformerMetadata,
+)
 from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
 
@@ -441,7 +449,7 @@ class VisionMlp(nn.Module):
 		return self.fc2(self.act(self.fc1(x)))
 
 
-class VisionAttention(FlaxAttentionModule):
+class VisionAttention(AttentionModule):
 	def __init__(
 		self,
 		config,
@@ -646,7 +654,7 @@ class Qwen2VLMLP(nn.Module):
 		return hidden_states
 
 
-class Qwen2VLAttention(FlaxAttentionModule):
+class Qwen2VLAttention(AttentionModule):
 	def __init__(
 		self,
 		config: Qwen2VLConfig,
@@ -723,8 +731,9 @@ class Qwen2VLAttention(FlaxAttentionModule):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
-		causal_mask: chex.Array,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[chex.Array | bool],
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
@@ -781,6 +790,8 @@ class Qwen2VLAttention(FlaxAttentionModule):
 			key_states=key_states,
 			value_states=value_states,
 			bias=None,
+			cache_metadata=cache_metadata,
+			cache_view=cache_view,
 			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
 			segment_ids=segment_ids,
@@ -858,8 +869,9 @@ class Qwen2VLDecoderLayer(nn.Module):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
-		causal_mask: chex.Array,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[chex.Array | bool],
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
@@ -871,6 +883,7 @@ class Qwen2VLDecoderLayer(nn.Module):
 			position_ids,
 			causal_mask,
 			cache_view,
+			cache_metadata,
 			segment_ids,
 			output_attentions,
 			fcm_mask,
@@ -1092,11 +1105,12 @@ class Qwen2VLModel(EasyDeLBaseModule):
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
-	) -> tp.Union[FlaxBaseModelOutput, tp.Tuple]:
+	) -> tp.Union[BaseModelOutput, tp.Tuple]:
 		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
 				"You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -1133,6 +1147,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
 				attention_mask=attention_mask,
 				position_ids=position_ids,
 				cache_view=past_key_values.views[idx],
+				cache_metadata=cache_metadata,
 				causal_mask=self.causal_mask,
 				output_attentions=output_attentions,
 				segment_ids=segment_ids,
@@ -1154,7 +1169,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
 		if not return_dict:
 			return tuple(v for v in outputs if v is not None)
 
-		return FlaxBaseModelOutput(
+		return BaseModelOutput(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
 			attentions=all_attentions,
@@ -1226,7 +1241,8 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 		input_ids: chex.Array = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		inputs_embeds: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,

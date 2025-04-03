@@ -20,6 +20,7 @@ from ._attention_impl import (
 )
 from .modules import (
 	FlashAttn,
+	PagedAttn,
 	RingAttn,
 	ScaledDotProductAttn,
 	SplashAttn,
@@ -32,6 +33,7 @@ __all__ = (
 	"AttentionOutput",
 	"AttentionRegistry",
 	"FlashAttn",
+	"PagedAttn",
 	"RingAttn",
 	"ScaledDotProductAttn",
 	"SplashAttn",

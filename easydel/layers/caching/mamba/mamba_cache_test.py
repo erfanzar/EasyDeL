@@ -46,7 +46,7 @@ def basic_cache_view(cache_metadata):
 
 @pytest.fixture
 def basic_cache(cache_metadata):
-	return MambaCache.init_layers_cache(
+	return MambaCache.init_cache(
 		num_hidden_layers=2,
 		metadata=cache_metadata,
 		dtype=jnp.float32,
@@ -90,7 +90,7 @@ class TestMambaCacheMetaData:
 
 
 class TestMambaCache:
-	def test_init_layers_cache(self, basic_cache):
+	def test_init_cache(self, basic_cache):
 		assert len(basic_cache.views) == 2
 		assert all(isinstance(view, MambaCacheView) for view in basic_cache.views)
 
@@ -191,7 +191,7 @@ class TestCacheShapes:
 			conv_kernel_size=conv_kernel_size,
 		)
 
-		cache = MambaCache.init_layers_cache(
+		cache = MambaCache.init_cache(
 			num_hidden_layers=2,
 			metadata=metadata,
 			dtype=jnp.float32,
@@ -215,7 +215,7 @@ class TestCacheDTypes:
 		],
 	)
 	def test_different_dtypes(self, cache_metadata, dtype):
-		cache = MambaCache.init_layers_cache(
+		cache = MambaCache.init_cache(
 			num_hidden_layers=2,
 			metadata=cache_metadata,
 			dtype=dtype,
@@ -230,7 +230,7 @@ class TestCacheDTypes:
 class TestCachePartitioning:
 	def test_custom_partition_specs(self, cache_metadata):
 		custom_partition_spec = PartitionSpec("batch", "model", None)
-		cache = MambaCache.init_layers_cache(
+		cache = MambaCache.init_cache(
 			num_hidden_layers=2,
 			metadata=cache_metadata,
 			dtype=jnp.float32,

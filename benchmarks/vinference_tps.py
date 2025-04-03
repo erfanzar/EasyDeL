@@ -277,7 +277,6 @@ def run_benchmark(
 	dtype=jnp.bfloat16,
 	param_dtype=jnp.bfloat16,
 	temperature=0.7,
-	do_sample=True,
 	top_p=0.95,
 	top_k=10,
 ):
@@ -292,7 +291,7 @@ def run_benchmark(
 	    sharding_axis_dims: Sharding configuration
 	    dtype: Data type for model operations
 	    param_dtype: Data type for model parameters
-	    temperature, do_sample, top_p, top_k: Generation parameters
+	    temperature, top_p, top_k: Generation parameters
 
 	Returns:
 	    DataFrame with benchmark results
@@ -342,10 +341,12 @@ def run_benchmark(
 				processor_class=tokenizer,
 				generation_config=ed.vInferenceConfig(
 					max_new_tokens=max_new_tokens,
-					temperature=temperature,
-					do_sample=do_sample,
-					top_p=top_p,
-					top_k=top_k,
+					sampling_params=ed.SamplingParams(
+						max_tokens=max_new_tokens,
+						temperature=0.0,
+						top_p=1,
+						top_k=0,
+					),  # GREADY
 					eos_token_id=model.generation_config.eos_token_id,
 					streaming_chunks=64,
 					num_return_sequences=1,

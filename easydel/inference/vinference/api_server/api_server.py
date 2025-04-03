@@ -17,11 +17,13 @@ import asyncio
 import typing as tp
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
-from eformer.pytree import auto_pytree
+
 import uvicorn
+from eformer.pytree import auto_pytree
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from easydel.inference.utilities import SamplingParams
 from easydel.utils.helpers import get_logger
 from easydel.utils.lazy_import import is_package_available
 
@@ -38,7 +40,7 @@ from .api_models import (
 )
 
 if tp.TYPE_CHECKING:
-	from .vinference import vInference, vInferenceConfig
+	from ..vinference import vInference, vInferenceConfig
 else:
 	vInference = tp.Any
 	vInferenceConfig = tp.Any
@@ -68,7 +70,7 @@ class vInferenceApiServer:
 		inference_init_call: tp.Optional[tp.Callable[[], vInference]] = None,
 		max_workers: int = 10,
 	) -> None:
-		from .vinference import vInference
+		from ..vinference import vInference
 
 		if inference_init_call is not None:
 			inference_map = inference_init_call()
@@ -125,6 +127,18 @@ class vInferenceApiServer:
 				summary="Get available inference modules for requesting",
 			),
 		]
+
+	def _create_sampling_params_from_request(self, request: ChatCompletionRequest):
+		return SamplingParams(
+			max_tokens=int(request.max_tokens),
+			temperature=float(request.temperature),
+			presence_penalty=float(request.presence_penalty),
+			frequency_penalty=float(request.frequency_penalty),
+			repetition_penalty=float(request.repetition_penalty),
+			top_k=int(request.top_k),
+			top_p=float(request.top_p),
+			min_p=float(request.min_p),
+		)
 
 	async def chat_completions(self, request: ChatCompletionRequest):
 		try:
@@ -188,9 +202,10 @@ class vInferenceApiServer:
 	) -> ChatCompletionResponse:
 		"""Handle non-streaming response generation."""
 		prompt_tokens = inference.count_tokens(request.model_dump()["messages"])
+		sampling_params = self._create_sampling_params_from_request(request)
 		# Generate response
 
-		for response in inference.generate(**ids):
+		for response in inference.generate(**ids, sampling_params=sampling_params):
 			pass  # Keep last response
 
 		final_responses = inference.tokenizer.batch_decode(
@@ -243,9 +258,10 @@ class vInferenceApiServer:
 
 		async def stream_results() -> tp.AsyncGenerator[bytes, tp.Any]:
 			prompt_tokens = inference.count_tokens(request.model_dump()["messages"])
+			sampling_params = self._create_sampling_params_from_request(request)
 
 			def _execute(inputs):
-				yield from inference.generate(**inputs)
+				yield from inference.generate(**inputs, sampling_params=sampling_params)
 
 			# Create generator in thread pool to not block the event loop
 			async def generate_tokens():

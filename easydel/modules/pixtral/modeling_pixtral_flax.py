@@ -23,7 +23,7 @@ from jax import numpy as jnp
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import FlaxBaseModelOutput
+from easydel.infra.modeling_outputs import BaseModelOutput
 from easydel.infra.utils import (
 	ACT2FN,
 	auto_remat,
@@ -31,7 +31,7 @@ from easydel.infra.utils import (
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 )
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
 
@@ -192,7 +192,7 @@ class PixtralMLP(nn.Module):
 		)
 
 
-class PixtralAttention(FlaxAttentionModule):
+class PixtralAttention(AttentionModule):
 	def __init__(
 		self,
 		config: PixtralVisionConfig,
@@ -316,6 +316,7 @@ class PixtralAttention(FlaxAttentionModule):
 			key_states=key_states,
 			value_states=value_states,
 			bias=None,
+			cache_metadata=None,
 			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
 			segment_ids=None,
@@ -455,7 +456,7 @@ class PixtralTransformer(nn.Module):
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
-	) -> tp.Union[FlaxBaseModelOutput, tp.Tuple]:
+	) -> tp.Union[BaseModelOutput, tp.Tuple]:
 		all_attentions = () if output_attentions else None
 		all_hidden_states = () if output_hidden_states else None
 		batch_size, sequence_length, _ = inputs_embeds.shape
@@ -503,7 +504,7 @@ class PixtralTransformer(nn.Module):
 		if not return_dict:
 			return tuple(value for value in outputs if value is not None)
 
-		return FlaxBaseModelOutput(
+		return BaseModelOutput(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
 			attentions=all_attentions,
@@ -575,7 +576,7 @@ class PixtralVisionModel(EasyDeLBaseModule):
 		return_dict: tp.Optional[bool] = None,
 		*args,
 		**kwargs,
-	) -> tp.Union[tp.Tuple, FlaxBaseModelOutput]:
+	) -> tp.Union[tp.Tuple, BaseModelOutput]:
 		patch_embeds_list = [
 			self.patch_conv(jnp.expand_dims(img, 0).astype(self.dtype).transpose(0, 2, 3, 1))
 			for img in pixel_values

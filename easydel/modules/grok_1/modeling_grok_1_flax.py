@@ -34,15 +34,22 @@ from easydel.infra.utils import (
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 )
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import (
+	PagedAttentionCache,
+	PagedAttentionCacheView,
+	PagedAttentionMetadata,
+	TransformerCache,
+	TransformerCacheView,
+	TransformerMetadata,
+)
 from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm as FlaxGrok1RMSNorm
 
 from .grok_1_configuration import Grok1Config
 
 
-class FlaxGrok1Attention(FlaxAttentionModule):
+class Grok1Attention(AttentionModule):
 	def __init__(
 		self,
 		config: Grok1Config,
@@ -142,8 +149,9 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
-		causal_mask: chex.Array,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[chex.Array | bool],
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
@@ -218,6 +226,8 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 			key_states=key_states,
 			value_states=value_states,
 			bias=None,
+			cache_metadata=cache_metadata,
+			cache_view=cache_view,
 			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
 			segment_ids=segment_ids,
@@ -239,7 +249,7 @@ class FlaxGrok1Attention(FlaxAttentionModule):
 		return outputs
 
 
-class FlaxGrok1BLockSparseMLP(nn.Module):
+class Grok1BLockSparseMLP(nn.Module):
 	def __init__(
 		self,
 		config: Grok1Config,
@@ -297,7 +307,7 @@ class FlaxGrok1BLockSparseMLP(nn.Module):
 		)
 
 
-class FlaxGrok1SparseMoeBlock(nn.Module):
+class Grok1SparseMoeBlock(nn.Module):
 	def __init__(
 		self,
 		config: Grok1Config,
@@ -324,7 +334,7 @@ class FlaxGrok1SparseMoeBlock(nn.Module):
 		)
 
 		self.experts = [
-			FlaxGrok1BLockSparseMLP(
+			Grok1BLockSparseMLP(
 				config=config,
 				dtype=dtype,
 				param_dtype=param_dtype,
@@ -368,7 +378,7 @@ class FlaxGrok1SparseMoeBlock(nn.Module):
 		return (final_hidden_state, router_logits)
 
 
-class FlaxGrok1DecoderLayer(nn.Module):
+class Grok1DecoderLayer(nn.Module):
 	def __init__(
 		self,
 		config: Grok1Config,
@@ -384,8 +394,8 @@ class FlaxGrok1DecoderLayer(nn.Module):
 		self.param_dtype = param_dtype
 		self.precision = precision
 		self.rngs = rngs
-		attn_block = FlaxGrok1Attention
-		mlp_block = FlaxGrok1SparseMoeBlock
+		attn_block = Grok1Attention
+		mlp_block = Grok1SparseMoeBlock
 		attn_block, mlp_block = auto_remat(
 			attn_block,
 			mlp_block,
@@ -440,8 +450,9 @@ class FlaxGrok1DecoderLayer(nn.Module):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
-		causal_mask: chex.Array,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[chex.Array | bool],
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		output_router_logits: bool = False,
@@ -476,6 +487,7 @@ class FlaxGrok1DecoderLayer(nn.Module):
 			causal_mask,
 			segment_ids,
 			cache_view,
+			cache_metadata,
 			output_attentions,
 			fcm_mask,
 		)
@@ -528,7 +540,7 @@ class Grok1Model(EasyDeLBaseModule):
 		)
 
 		self.layers = [
-			FlaxGrok1DecoderLayer(
+			Grok1DecoderLayer(
 				layer_index=layer_index,
 				config=config,
 				dtype=dtype,
@@ -564,7 +576,8 @@ class Grok1Model(EasyDeLBaseModule):
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		output_router_logits: tp.Optional[bool] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
 	) -> MoeModelOutput | tp.Tuple:
 		"""
@@ -727,7 +740,8 @@ class Grok1ForCausalLM(EasyDeLBaseModule):
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		output_router_logits: tp.Optional[bool] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
 	) -> MoeCausalLMOutput | tp.Tuple:
 		"""

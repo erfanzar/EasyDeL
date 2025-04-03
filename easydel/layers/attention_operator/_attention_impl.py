@@ -572,6 +572,9 @@ class AttentionImpl(BaseOperation):
 				raise RuntimeError(f"unknown backend at AttentionImpl! {self.metadata.backend}")
 
 
+_I = tp.TypeVar("ICa", bound=AttentionImpl)
+
+
 class AttentionRegistry:
 	"""
 	Registry for discovering and managing different `AttentionImpl` classes.
@@ -583,7 +586,7 @@ class AttentionRegistry:
 	_registry: tp.Dict[str, tp.Type[AttentionImpl]] = {}
 
 	@classmethod
-	def register(cls, impl_cls: tp.Type[AttentionImpl]) -> tp.Type[AttentionImpl]:
+	def register(cls, impl_cls: tp.Type[_I]) -> tp.Type[_I]:
 		"""
 		Class method decorator to register an `AttentionImpl` subclass.
 

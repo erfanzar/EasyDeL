@@ -136,6 +136,7 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
 	pallas_n_block_size: int
 	mask_max_position_embeddings: int
 	freq_max_position_embeddings: int
+	precompute_masks: bool
 
 
 class EasyDeLBaseConfig(PretrainedConfig):
@@ -207,6 +208,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		scan_mlp_chunk_size: int = 1024,
 		sequence_axis_name: str = "sp",
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
+		precompute_masks: bool = True,
 		kv_cache_quantization_method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.NONE,
 		kv_cache_quantization_blocksize: int = 64,
 		quantization_method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.NONE,
@@ -258,6 +260,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		self.sequence_axis_name = getattr(self, "sequence_axis_name", sequence_axis_name)
 		self.kv_cache_sharding_sequence_axis_name = getattr(self,"kv_cache_sharding_sequence_axis_name", kv_cache_sharding_sequence_axis_name)
 		self.gradient_checkpointing = getattr(self,"gradient_checkpointing", gradient_checkpointing)
+		self.precompute_masks = getattr(self,"precompute_masks", precompute_masks)
+
 		self.kv_cache_quantization_method = getattr(self,"kv_cache_quantization_method", kv_cache_quantization_method)
 		self.kv_cache_quantization_blocksize = getattr(self,"kv_cache_quantization_blocksize", kv_cache_quantization_blocksize)
 		self.quantization_method = getattr(self, "quantization_method", quantization_method)
@@ -444,6 +448,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			"scan_mlp_chunk_size",
 			"sequence_axis_name",
 			"gradient_checkpointing",
+			"precompute_masks",
 			"kv_cache_quantization_method",
 			"kv_cache_quantization_blocksize",
 			"quantization_method",
@@ -485,6 +490,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		scan_mlp_chunk_size: int = ...,
 		sequence_axis_name: str = ...,
 		gradient_checkpointing: EasyDeLGradientCheckPointers = ...,
+		precompute_masks: bool = ...,
 		kv_cache_quantization_method: EasyDeLQuantizationMethods = ...,
 		kv_cache_quantization_blocksize: int = ...,
 		quantization_method: EasyDeLQuantizationMethods = ...,
@@ -565,6 +571,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		set_attrs_smartly(self, "kv_cache_quantization_blocksize", 128, kv_cache_quantization_blocksize)
 		set_attrs_smartly(self, "kv_cache_sharding_sequence_axis_name",	"sp", kv_cache_sharding_sequence_axis_name)
 		set_attrs_smartly(self, "gradient_checkpointing", EasyDeLGradientCheckPointers.NONE, gradient_checkpointing)
+		set_attrs_smartly(self, "precompute_masks", True, precompute_masks)
 		set_attrs_smartly(self, "kv_cache_quantization_method", EasyDeLQuantizationMethods.NONE, kv_cache_quantization_method)
 		set_attrs_smartly(self, "quantization_method", EasyDeLQuantizationMethods.NONE, quantization_method)
 		set_attrs_smartly(self, "quantization_blocksize", EasyDeLQuantizationMethods.NONE, quantization_blocksize)
@@ -848,10 +855,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
 		return ModuleCaches(frequencies)
 
-	def get_basic_causal_mask(self, *args, **kwargs):
-		from .utils import ModuleCaches
-
-		target_length = self.granted_mask_max_position_embedding
+	@staticmethod
+	def _create_causal_mask(target_length):
 		causal_mask_bool = jnp.zeros((target_length, target_length), dtype=jnp.bool_)
 
 		if target_length != 1:
@@ -867,8 +872,17 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		cache_mask = col_indices <= row_indices
 		causal_mask_bool = jnp.logical_and(causal_mask_bool, cache_mask)
 		causal_mask_bool = causal_mask_bool[None, None, :, :].astype("b1")
+		return causal_mask_bool
 
-		return ModuleCaches(causal_mask_bool)
+	def get_basic_causal_mask(self, *args, **kwargs):
+		from .utils import ModuleCaches
+
+		if self.precompute_masks is False:
+			return False
+
+		target_length = self.granted_mask_max_position_embedding
+
+		return ModuleCaches(self._create_causal_mask(target_length))
 
 	def get_fcm_mask(self, batch_size, seq_length, deterministic: bool):
 		if not deterministic and self.fcm_max_ratio > 0:

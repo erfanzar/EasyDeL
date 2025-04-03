@@ -50,10 +50,12 @@ def main():
 		processor_class=processor,
 		generation_config=ed.vInferenceConfig(
 			max_new_tokens=max_new_tokens,
-			temperature=0.8,
-			do_sample=True,
-			top_p=0.95,
-			top_k=10,
+			sampling_params=ed.SamplingParams(
+				max_tokens=max_new_tokens,
+				temperature=0.8,
+				top_p=0.95,
+				top_k=10,
+			),
 			eos_token_id=model.generation_config.eos_token_id,
 			streaming_chunks=32,
 			num_return_sequences=1,

@@ -18,24 +18,26 @@ import typing as tp
 import chex
 import jax
 import jax.numpy as jnp
+from eformer.pytree import auto_pytree
 from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import (
-	ModelOutput,
+from easydel.infra.modeling_outputs import ModelOutput
+from easydel.infra.utils import ACT2FN
+from easydel.layers.caching import (
+	PagedAttentionCache,
+	PagedAttentionMetadata,
+	TransformerCache,
+	TransformerMetadata,
 )
-from easydel.infra.utils import (
-	ACT2FN,
-)
-from easydel.layers.caching import TransformerCache
 from easydel.layers.linear import ParallelLinear
 from easydel.modules.auto.auto_modeling import (
 	AutoEasyDeLModelForCausalLM,
 	AutoEasyDeLVisionModel,
 )
 from easydel.utils.helpers import get_logger
-from eformer.pytree import auto_pytree
+
 from .llava_configuration import LlavaConfig
 
 logger = get_logger(__name__)
@@ -208,7 +210,8 @@ class LlavaForConditionalGeneration(EasyDeLBaseModule):
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		inputs_embeds: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
@@ -261,6 +264,7 @@ class LlavaForConditionalGeneration(EasyDeLBaseModule):
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,

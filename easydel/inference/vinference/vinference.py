@@ -48,6 +48,7 @@ from easydel.utils.lazy_import import is_package_available
 
 from ..utilities import (
 	SampleState,
+	SamplingParams,
 	vInferenceConfig,
 	vInferencePreCompileConfig,
 )
@@ -228,14 +229,6 @@ class vInference:
 			return self.processor_class.tokenizer
 		raise ValueError("Unknown `processor_class` to extract `tokenizer` from.")
 
-	@cached_property
-	def _logits_warper(self):
-		return self.generation_config.get_logits_warper()
-
-	@cached_property
-	def _logits_processor(self):
-		return self.generation_config.get_logits_processor()
-
 	def _generate_inference_name(self, model) -> str:
 		"""
 		Generate a standardized inference name combining model type, size, and timestamp.
@@ -374,15 +367,22 @@ class vInference:
 		  vInferenceConfig: The initialized generation configuration.
 		"""
 		if generation_config is None:
+			top_k = self.model.generation_config.top_k
+			top_p = self.model.generation_config.top_p
+			temperature = self.model.generation_config.temperature
+			max_new_tokens = self.model.generation_config.max_new_tokens or max_new_tokens
 			if self.model.generation_config is not None:
 				return vInferenceConfig(
 					bos_token_id=self.model.generation_config.bos_token_id,
 					eos_token_id=self.model.generation_config.eos_token_id,
 					pad_token_id=self.model.generation_config.pad_token_id,
-					top_k=self.model.generation_config.top_k,
-					top_p=self.model.generation_config.top_p,
-					temperature=self.model.generation_config.temperature,
-					max_new_tokens=self.model.generation_config.max_new_tokens or max_new_tokens,
+					max_new_tokens=max_new_tokens,
+					sampling_params=SamplingParams(
+						max_tokens=max_new_tokens,
+						temperature=temperature,
+						top_k=top_k,
+						top_p=top_p,
+					),
 				)
 			return vInferenceConfig(max_new_tokens=max_new_tokens)
 		return generation_config
@@ -737,6 +737,7 @@ class vInference:
 		*,
 		graphstate: tp.Optional[nn.GraphState] = None,
 		graphother: tp.Optional[nn.GraphState] = None,
+		sampling_params: tp.Optional[SamplingParams] = None,
 		**model_kwargs,
 	) -> tp.Generator[tp.Union[SampleState, tp.Any], SampleState, SampleState]:
 		"""
@@ -789,6 +790,8 @@ class vInference:
 					interval_func,
 					graphstate=graphstate,
 					graphother=graphother,
+					compile_config=vinference_compile_config,
+					sampling_params=sampling_params,
 				)
 
 			self._post_generation_metrics_update(state)
@@ -836,14 +839,20 @@ class vInference:
 		*,
 		graphstate: tp.Optional[nn.GraphState] = None,
 		graphother: tp.Optional[nn.GraphState] = None,
+		compile_config: tp.Optional[vInferencePreCompileConfig] = None,
+		sampling_params: tp.Optional[SamplingParams] = None,
 	) -> tp.Generator[SampleState, tp.Any, tp.Any]:
 		"""Core generation loop with performance monitoring."""
-
+		if sampling_params is not None:
+			if sampling_params.max_tokens > self.generation_config.max_new_tokens:
+				sampling_params.max_tokens = self.generation_config.max_new_tokens
 		# Initial generation step
 		state = self.execute_prefill(
 			state,
 			graphstate=graphstate,
 			graphother=graphother,
+			compile_config=compile_config,
+			sampling_params=sampling_params,
 			func=prefill_fn,
 		)
 
@@ -854,6 +863,8 @@ class vInference:
 					state,
 					graphstate=graphstate,
 					graphother=graphother,
+					compile_config=compile_config,
+					sampling_params=sampling_params,
 					func=decode_fn,
 				)
 				yield state
@@ -867,12 +878,19 @@ class vInference:
 		*,
 		graphstate: tp.Optional[nn.GraphState] = None,
 		graphother: tp.Optional[nn.GraphState] = None,
+		compile_config: tp.Optional[vInferencePreCompileConfig] = None,
+		sampling_params: tp.Optional[SamplingParams] = None,
 		func: tp.Optional[tp.Callable[[tp.Any], SampleState]] = None,
 	) -> tp.Tuple[tp.Union[tp.Any, jax.Array]]:
+		_ = compile_config
+
 		if graphstate is None:
 			graphstate = self.graphstate
 		if graphother is None:
 			graphother = self.graphother
+		if sampling_params is None:
+			sampling_params = self.generation_config.sampling_params
+
 		if func is None:
 			func = get_compiled_funcs(state._compile_config, self._uuid4)[0]
 		if isinstance(func, Compiled):
@@ -880,6 +898,7 @@ class vInference:
 				graphstate,
 				graphother,
 				state,
+				sampling_params,
 			)
 		return (
 			self.graphdef,
@@ -887,6 +906,7 @@ class vInference:
 			graphother,
 			state,
 			self.generation_config,
+			sampling_params,
 		)
 
 	def _prepare_decode_inputs(
@@ -895,12 +915,18 @@ class vInference:
 		*,
 		graphstate: tp.Optional[nn.GraphState] = None,
 		graphother: tp.Optional[nn.GraphState] = None,
+		compile_config: tp.Optional[vInferencePreCompileConfig] = None,
+		sampling_params: tp.Optional[SamplingParams] = None,
 		func: tp.Optional[tp.Callable[[tp.Any], SampleState]] = None,
 	) -> tp.Tuple[tp.Union[tp.Any, jax.Array]]:
+		_ = compile_config
 		if graphstate is None:
 			graphstate = self.graphstate
 		if graphother is None:
 			graphother = self.graphother
+		if sampling_params is None:
+			sampling_params = self.generation_config.sampling_params
+
 		if func is None:
 			func = get_compiled_funcs(state._compile_config, self._uuid4)[1]
 		if isinstance(func, Compiled):
@@ -908,6 +934,7 @@ class vInference:
 				graphstate,
 				graphother,
 				state,
+				sampling_params,
 				self.generation_config.streaming_chunks,
 			)
 		return (
@@ -915,7 +942,7 @@ class vInference:
 			graphstate,
 			graphother,
 			state,
-			self.generation_config,
+			self.sampling_params,
 			self.generation_config.streaming_chunks,
 		)
 
@@ -925,6 +952,8 @@ class vInference:
 		*,
 		graphstate: tp.Optional[nn.GraphState] = None,
 		graphother: tp.Optional[nn.GraphState] = None,
+		compile_config: tp.Optional[vInferencePreCompileConfig] = None,
+		sampling_params: tp.Optional[SamplingParams] = None,
 		func: tp.Optional[tp.Callable[[tp.Any], SampleState]],
 	) -> SampleState:
 		"""Executes a single generation step with performance monitoring."""
@@ -932,11 +961,11 @@ class vInference:
 			state,
 			graphstate=graphstate,
 			graphother=graphother,
+			compile_config=compile_config,
+			sampling_params=sampling_params,
 			func=func,
 		)
-		with capture_time() as time_spent:
-			state = jax.block_until_ready(func(*inputs))
-		state._time_spent_computing += time_spent()
+		state = jax.block_until_ready(func(*inputs))
 		return state
 
 	def execute_decode(
@@ -945,12 +974,16 @@ class vInference:
 		*,
 		graphstate: tp.Optional[nn.GraphState] = None,
 		graphother: tp.Optional[nn.GraphState] = None,
+		compile_config: tp.Optional[vInferencePreCompileConfig] = None,
+		sampling_params: tp.Optional[SamplingParams] = None,
 		func: tp.Optional[tp.Callable[[tp.Any], SampleState]],
 	) -> SampleState:
 		inputs = self._prepare_decode_inputs(
 			state,
 			graphstate=graphstate,
 			graphother=graphother,
+			compile_config=compile_config,
+			sampling_params=sampling_params,
 			func=func,
 		)
 
@@ -980,16 +1013,10 @@ class vInference:
 		if do_compile:
 			logger.info("initiating state for lowering and compiling func.")
 			wargs = self.model._get_compile_model_kwargs(
-				batch_size=standalone_config.batch_size,
 				input_tokens_length=standalone_config.prefill_length,
 				input_sharding=self.input_sharding,
 				rngs=self._rng_generator.rng,
-				vision_included=standalone_config.vision_included,
-				vision_batch_size=standalone_config.vision_batch_size,
-				vision_channels=standalone_config.vision_channels,
-				vision_height=standalone_config.vision_height,
-				vision_width=standalone_config.vision_width,
-				required_props=standalone_config.required_props,
+				**standalone_config.extract(),
 			)
 			state = self._get_init_state(standalone_config, wargs)
 			logger.info("smart compiling `prefill`")
@@ -1001,6 +1028,7 @@ class vInference:
 					es.extract_shardings(self.graphstate),
 					es.extract_shardings(self.graphother),
 					es.extract_shardings(state),
+					es.extract_shardings(self.generation_config.sampling_params),
 				),
 			).lower(
 				self.graphdef,  # Static
@@ -1008,12 +1036,18 @@ class vInference:
 				self.graphother,
 				state,
 				self.generation_config,  # Static
+				self.generation_config.sampling_params,
 			)
 			logger.info("`prefill` lowered successfully.")
 			compiled_prefill_fn = smart_compile(prefill_lowered, tag="vinference.prefill_fn")
 			logger.info("smart compiling `decode`")
 			logger.info("lowering `decode`")
-			sample_state = compiled_prefill_fn(self.graphstate, self.graphother, state)
+			sample_state = compiled_prefill_fn(
+				self.graphstate,
+				self.graphother,
+				state,
+				self.generation_config.sampling_params,
+			)
 			sample_state_shardings = es.extract_shardings(sample_state)
 
 			decode_lowered = jax.jit(
@@ -1023,15 +1057,17 @@ class vInference:
 					es.extract_shardings(self.graphstate),
 					es.extract_shardings(self.graphother),
 					sample_state_shardings,
+					es.extract_shardings(self.generation_config.sampling_params),
 					None,
 				),
 				out_shardings=sample_state_shardings,
 			).lower(
-				self.graphdef,
+				self.graphdef,  # STATIC
 				self.graphstate,
 				self.graphother,
 				sample_state,
-				self.generation_config,
+				self.generation_config,  # STATIC
+				self.generation_config.sampling_params,
 				self.generation_config.streaming_chunks,
 			)
 			logger.info("`decode` lowered successfully.")

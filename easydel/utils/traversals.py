@@ -18,9 +18,9 @@ import typing as tp
 from collections.abc import Iterable
 from copy import deepcopy
 
-import chex
 import jax
 import jax.numpy as jnp
+from eformer.pytree import auto_pytree
 from flax import nnx, struct
 from flax.nnx import traversals
 from jax.interpreters import pxla
@@ -59,7 +59,7 @@ class _EmptyNode:
 	pass
 
 
-@chex.dataclass
+@auto_pytree
 class StateValidationResult:
 	is_valid: bool
 	missing_keys: set

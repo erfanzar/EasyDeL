@@ -39,8 +39,8 @@ from jax import lax
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
-	FlaxBaseModelOutputWithPastAndCrossAttentions,
-	FlaxCausalLMOutputWithCrossAttentions,
+	BaseModelOutputWithPastAndCrossAttentions,
+	CausalLMOutputWithCrossAttentions,
 )
 from easydel.infra.utils import (
 	ACT2FN,
@@ -48,9 +48,17 @@ from easydel.infra.utils import (
 	block_wise_ffn,
 	get_dot_general_by_bits,
 )
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import (
+	PagedAttentionCache,
+	PagedAttentionCacheView,
+	PagedAttentionMetadata,
+	TransformerCache,
+	TransformerCacheView,
+	TransformerMetadata,
+)
 from easydel.layers.linear import ParallelLinear
+
 from .gpt2_configuration import GPT2Config as GPT2Config
 
 
@@ -106,7 +114,7 @@ class Conv1D(nn.Module):
 		return y
 
 
-class GPT2Attention(FlaxAttentionModule):
+class GPT2Attention(AttentionModule):
 	def __init__(
 		self,
 		config: GPT2Config,
@@ -193,7 +201,8 @@ class GPT2Attention(FlaxAttentionModule):
 		key_value_states: chex.Array,
 		attention_mask: chex.Array,
 		causal_mask: tp.Optional[chex.Array] = None,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 	):
 		is_cross_attention = key_value_states is not None
@@ -233,6 +242,8 @@ class GPT2Attention(FlaxAttentionModule):
 			key_states=key,
 			value_states=value,
 			init_bias=init_attention_bias,
+			cache_metadata=cache_metadata,
+			cache_view=cache_view,
 			attention_mask=attention_mask,
 			causal=self.causal,
 			dropout_rng=self.rngs.params(),
@@ -373,7 +384,8 @@ class GPT2Block(nn.Module):
 		causal_mask=None,
 		encoder_hidden_states: tp.Optional[chex.Array] = None,
 		encoder_attention_mask: tp.Optional[chex.Array] = None,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 	):
 		residual = hidden_states
@@ -384,6 +396,7 @@ class GPT2Block(nn.Module):
 			attention_mask,
 			causal_mask,
 			cache_view,
+			cache_metadata,
 			output_attentions,
 		)
 		attn_output = attn_outputs[0]
@@ -494,7 +507,8 @@ class GPT2Model(EasyDeLBaseModule):
 		position_ids: tp.Optional[chex.Array] = None,
 		encoder_hidden_states: tp.Optional[chex.Array] = None,
 		encoder_attention_mask: tp.Optional[chex.Array] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
@@ -535,6 +549,7 @@ class GPT2Model(EasyDeLBaseModule):
 				encoder_hidden_states=encoder_hidden_states,
 				encoder_attention_mask=encoder_attention_mask,
 				cache_view=past_key_values.views[idx],
+				cache_metadata=cache_metadata,
 				output_attentions=output_attentions,
 			)
 			hidden_states = layer_outputs[0]
@@ -562,7 +577,7 @@ class GPT2Model(EasyDeLBaseModule):
 		if not return_dict:
 			return tuple(v for v in outputs if v is not None)
 
-		return FlaxBaseModelOutputWithPastAndCrossAttentions(
+		return BaseModelOutputWithPastAndCrossAttentions(
 			last_hidden_state=hidden_states,
 			hidden_states=outputs[1],
 			attentions=outputs[2],
@@ -618,7 +633,8 @@ class GPT2LMHeadModel(EasyDeLBaseModule):
 		position_ids: tp.Optional[chex.Array] = None,
 		encoder_hidden_states: tp.Optional[chex.Array] = None,
 		encoder_attention_mask: tp.Optional[chex.Array] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
@@ -649,7 +665,7 @@ class GPT2LMHeadModel(EasyDeLBaseModule):
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
 
-		return FlaxCausalLMOutputWithCrossAttentions(
+		return CausalLMOutputWithCrossAttentions(
 			logits=lm_logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,

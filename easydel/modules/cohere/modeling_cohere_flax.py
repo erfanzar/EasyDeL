@@ -24,9 +24,9 @@ from flax import nnx as nn
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
-	FlaxBaseModelOutput,
-	FlaxCausalLMOutput,
-	FlaxSequenceClassifierOutput,
+	BaseModelOutput,
+	CausalLMOutput,
+	SequenceClassifierOutput,
 )
 from easydel.infra.utils import (
 	auto_remat,
@@ -34,9 +34,17 @@ from easydel.infra.utils import (
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 )
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import (
+	PagedAttentionCache,
+	PagedAttentionCacheView,
+	PagedAttentionMetadata,
+	TransformerCache,
+	TransformerCacheView,
+	TransformerMetadata,
+)
 from easydel.layers.linear import ParallelLinear
+
 from .cohere_configuration import CohereConfig as CohereConfig
 
 
@@ -98,7 +106,7 @@ class RMSNorm(nn.Module):
 		return output * weight
 
 
-class CohereAttention(FlaxAttentionModule):
+class CohereAttention(AttentionModule):
 	def __init__(
 		self,
 		config: CohereConfig,
@@ -181,8 +189,9 @@ class CohereAttention(FlaxAttentionModule):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
-		causal_mask: chex.Array,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[chex.Array | bool],
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
@@ -244,6 +253,8 @@ class CohereAttention(FlaxAttentionModule):
 			key_states=key_states,
 			value_states=value_states,
 			bias=None,
+			cache_metadata=cache_metadata,
+			cache_view=cache_view,
 			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
 			segment_ids=segment_ids,
@@ -352,8 +363,9 @@ class CohereBlock(nn.Module):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
-		causal_mask: chex.Array,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[chex.Array | bool],
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
@@ -383,6 +395,7 @@ class CohereBlock(nn.Module):
 			position_ids,
 			causal_mask,
 			cache_view,
+			cache_metadata,
 			segment_ids,
 			output_attentions,
 			fcm_mask,
@@ -464,9 +477,10 @@ class CohereModel(EasyDeLBaseModule):
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
-	) -> tp.Union[FlaxBaseModelOutput, tp.Tuple]:
+	) -> tp.Union[BaseModelOutput, tp.Tuple]:
 		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
 				"You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -502,6 +516,7 @@ class CohereModel(EasyDeLBaseModule):
 				attention_mask=attention_mask,
 				position_ids=position_ids,
 				cache_view=past_key_values.views[idx],
+				cache_metadata=cache_metadata,
 				causal_mask=self.causal_mask,
 				output_attentions=output_attentions,
 				segment_ids=segment_ids,
@@ -521,7 +536,7 @@ class CohereModel(EasyDeLBaseModule):
 		if not return_dict:
 			return tuple(v for v in outputs if v is not None)
 
-		return FlaxBaseModelOutput(
+		return BaseModelOutput(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
 			attentions=all_attentions,
@@ -581,9 +596,10 @@ class CohereForCausalLM(EasyDeLBaseModule):
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
-	) -> tp.Union[FlaxCausalLMOutput, tp.Tuple]:
+	) -> tp.Union[CausalLMOutput, tp.Tuple]:
 		"""
 		Forward pass through the Cohere module.
 
@@ -600,7 +616,7 @@ class CohereForCausalLM(EasyDeLBaseModule):
 		    return_dict (bool): If True, return a dictionary of outputs.
 
 		Returns:
-		    FlaxCausalLMOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
+		    CausalLMOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
 		"""
 		batch_size, sequence_length = input_ids.shape
 		if attention_mask is None:
@@ -620,6 +636,7 @@ class CohereForCausalLM(EasyDeLBaseModule):
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
@@ -641,7 +658,7 @@ class CohereForCausalLM(EasyDeLBaseModule):
 		if not return_dict:
 			return (lm_logits,) + outputs[1:]
 
-		return FlaxCausalLMOutput(
+		return CausalLMOutput(
 			logits=lm_logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
@@ -702,9 +719,10 @@ class CohereForSequenceClassification(EasyDeLBaseModule):
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
-	) -> tp.Union[FlaxSequenceClassifierOutput, tp.Tuple]:
+	) -> tp.Union[SequenceClassifierOutput, tp.Tuple]:
 		transformer_outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
@@ -744,7 +762,7 @@ class CohereForSequenceClassification(EasyDeLBaseModule):
 			output = (pooled_logits,) + transformer_outputs[1:]
 			return output
 
-		return FlaxSequenceClassifierOutput(
+		return SequenceClassifierOutput(
 			logits=pooled_logits,
 			past_key_values=past_key_values,
 			hidden_states=transformer_outputs.hidden_states,

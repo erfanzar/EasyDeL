@@ -18,9 +18,10 @@ import inspect
 import jax
 import jax.lax as lax
 import jax.numpy as jnp
+from eformer.pytree import auto_pytree
 from jax.experimental import sparse
 
-from easydel.utils.compiling_utils import get_safe_hash_int, hash_fn
+from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.helpers import get_logger
 
 
@@ -56,7 +57,8 @@ LOGITS_PROCESSOR_INPUTS_DOCSTRING = r"""
 """
 
 
-class FlaxLogitsProcessor:
+@auto_pytree
+class LogitsProcessor:
 	"""Abstract base class for all logit processors that can be applied during generation."""
 
 	@add_start_docstrings(LOGITS_PROCESSOR_INPUTS_DOCSTRING)
@@ -69,7 +71,8 @@ class FlaxLogitsProcessor:
 	__hash__ = hash_fn
 
 
-class FlaxLogitsWarper:
+@auto_pytree
+class LogitsWarper:
 	"""Abstract base class for all logit warpers that can be applied during generation with multinomial sampling."""
 
 	@add_start_docstrings(LOGITS_PROCESSOR_INPUTS_DOCSTRING)
@@ -82,11 +85,31 @@ class FlaxLogitsWarper:
 	__hash__ = hash_fn
 
 
-class FlaxLogitsProcessorList(list):
+@auto_pytree
+class EmptyProcessor(LogitsProcessor):
+	r"""
+	[`LogitsProcessor`] suppressing a list of tokens at each decoding step. The processor will set their log probs
+	to be `-inf` so they are not sampled.
+
+	Args:
+	    suppress_tokens (`list`):
+	        Tokens to not sample.
 	"""
-	This class can be used to create a list of [`FlaxLogitsProcessor`] or [`FlaxLogitsWarper`] to subsequently process
+
+	def __call__(
+		self,
+		input_ids: jnp.ndarray,
+		scores: jnp.ndarray,
+		cur_len: int,
+	) -> jnp.ndarray:
+		return scores
+
+
+class LogitsProcessorList(list):
+	"""
+	This class can be used to create a list of [`LogitsProcessor`] or [`LogitsWarper`] to subsequently process
 	a `scores` input tensor. This class inherits from list and adds a specific *__call__* method to apply each
-	[`FlaxLogitsProcessor`] or [`FlaxLogitsWarper`] to the inputs.
+	[`LogitsProcessor`] or [`LogitsWarper`] to the inputs.
 	"""
 
 	@add_start_docstrings(LOGITS_PROCESSOR_INPUTS_DOCSTRING)
@@ -106,44 +129,40 @@ class FlaxLogitsProcessorList(list):
 				scores = processor(input_ids, scores, cur_len)
 		return scores
 
-	def __hash__(self):
-		shu = ""
-		for processor in self:
-			shu += "".join(
-				str(cu)
-				for cu in processor.__dict__.values()
-				if isinstance(cu, (float, int, list, bool, dict))
-			)
-		return get_safe_hash_int(shu)
+	__hash__ = hash_fn
 
 
-class FlaxTemperatureLogitsWarper(FlaxLogitsWarper):
+@auto_pytree
+class TemperatureLogitsWarper(LogitsWarper):
 	r"""
-	[`FlaxLogitsWarper`] for temperature (exponential scaling output probability distribution).
+	[`LogitsWarper`] for temperature (exponential scaling output probability distribution).
 
 	Args:
 	    temperature (`float`):
 	        The value used to module the logits distribution.
 	"""
 
-	def __init__(self, temperature: float):
-		if not isinstance(temperature, float) or not (temperature > 0):
-			raise ValueError(
-				f"`temperature` has to be a strictly positive float, but is {temperature}"
-			)
-
-		self.temperature = temperature
+	temperature: float
 
 	def __call__(
-		self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int
+		self,
+		input_ids: jnp.ndarray,
+		scores: jnp.ndarray,
+		cur_len: int,
 	) -> jnp.ndarray:
-		scores = scores / self.temperature
-		return scores
+		return jax.lax.cond(
+			self.temperature != 0.0,
+			lambda x, temp: x / temp,
+			lambda *x: x[0],
+			scores,
+			self.temperature,
+		)
 
 
-class FlaxTopPLogitsWarper(FlaxLogitsWarper):
+@auto_pytree
+class TopPLogitsWarper(LogitsWarper):
 	"""
-	[`FlaxLogitsWarper`] that performs top-p, i.e. restricting to top tokens summing to prob_cut_off <= prob_cut_off.
+	[`LogitsWarper`] that performs top-p, i.e. restricting to top tokens summing to prob_cut_off <= prob_cut_off.
 
 	Args:
 	    top_p (`float`):
@@ -155,48 +174,45 @@ class FlaxTopPLogitsWarper(FlaxLogitsWarper):
 	        Minimum number of tokens that cannot be filtered.
 	"""
 
-	def __init__(
-		self,
-		top_p: float,
-		filter_value: float = -float("Inf"),
-		min_tokens_to_keep: int = 1,
-	):
-		if not isinstance(top_p, float) or (top_p < 0 or top_p > 1.0):
-			raise ValueError(f"`top_p` has to be a float > 0 and < 1, but is {top_p}")
-		if not isinstance(min_tokens_to_keep, int) or (min_tokens_to_keep < 1):
-			raise ValueError(
-				f"`min_tokens_to_keep` has to be a positive integer, but is {min_tokens_to_keep}"
-			)
-
-		self.top_p = top_p
-		self.filter_value = filter_value
-		self.min_tokens_to_keep = min_tokens_to_keep
+	top_p: float
+	filter_value: float = -float("Inf")
+	min_tokens_to_keep: int = 1
 
 	def __call__(
-		self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int
+		self,
+		input_ids: jnp.ndarray,
+		scores: jnp.ndarray,
+		cur_len: int,
 	) -> jnp.ndarray:
-		topk_scores, topk_indices = lax.top_k(scores, scores.shape[-1])
+		top_p = jnp.asarray(self.top_p)
+		min_keep = self.min_tokens_to_keep
 
-		mask_scores = jnp.full_like(scores, self.filter_value)
-		cumulative_probs = jax.nn.softmax(topk_scores, axis=-1).cumsum(axis=-1)
-		score_mask = cumulative_probs < self.top_p
+		def _apply(x):
+			topk_scores, topk_indices = lax.top_k(x, x.shape[-1])
 
-		# include the token that is higher than top_p as well
-		score_mask = jnp.roll(score_mask, 1)
-		score_mask |= score_mask.at[:, 0].set(True)
+			mask_scores = jnp.full_like(x, self.filter_value)
+			cumulative_probs = jax.nn.softmax(topk_scores, axis=-1).cumsum(axis=-1)
+			score_mask = cumulative_probs < top_p
+			score_mask = jnp.roll(score_mask, 1)
+			score_mask |= score_mask.at[:, 0].set(True)
+			score_mask = score_mask.at[:, :min_keep].set(True)
+			topk_next_scores = jnp.where(score_mask, topk_scores, mask_scores)
+			x = jax.lax.sort_key_val(topk_indices, topk_next_scores)[-1]
 
-		# min tokens to keep
-		score_mask = score_mask.at[:, : self.min_tokens_to_keep].set(True)
+			return x
 
-		topk_next_scores = jnp.where(score_mask, topk_scores, mask_scores)
-		next_scores = jax.lax.sort_key_val(topk_indices, topk_next_scores)[-1]
+		return jax.lax.cond(
+			(top_p > 0) & (top_p < 1),
+			_apply,
+			lambda x: x,
+			scores,
+		)
 
-		return next_scores
 
-
-class FlaxTopKLogitsWarper(FlaxLogitsWarper):
+@auto_pytree
+class TopKLogitsWarper(LogitsWarper):
 	r"""
-	[`FlaxLogitsWarper`] that performs top-k, i.e. restricting to the k highest probability elements.
+	[`LogitsWarper`] that performs top-k, i.e. restricting to the k highest probability elements.
 
 	Args:
 	    top_k (`int`):
@@ -207,51 +223,60 @@ class FlaxTopKLogitsWarper(FlaxLogitsWarper):
 	        Minimum number of tokens that cannot be filtered.
 	"""
 
-	def __init__(
-		self,
-		top_k: int,
-		filter_value: float = -float("Inf"),
-		min_tokens_to_keep: int = 1,
-	):
-		if not isinstance(top_k, int) or top_k <= 0:
-			raise ValueError(f"`top_k` has to be a strictly positive integer, but is {top_k}")
-
-		self.top_k = max(top_k, min_tokens_to_keep)
-		self.filter_value = filter_value
+	top_k: int
+	filter_value: float = -float("Inf")
+	min_tokens_to_keep: int = 1
 
 	def __call__(
-		self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int
+		self,
+		input_ids: jnp.ndarray,
+		scores: jnp.ndarray,
+		cur_len: int,
 	) -> jnp.ndarray:
-		batch_size, vocab_size = scores.shape
-		next_scores_flat = jnp.full(batch_size * vocab_size, self.filter_value)
+		k_val = jnp.asarray(self.top_k)
+		vocab_size = scores.shape[-1]
+		effective_k = jnp.maximum(k_val, self.min_tokens_to_keep)
+		effective_k = jnp.minimum(effective_k, vocab_size).astype(jnp.int32)
 
-		topk = min(self.top_k, scores.shape[-1])  # Safety check
-		topk_scores, topk_indices = lax.top_k(scores, topk)
-		shift = jnp.broadcast_to(
-			(jnp.arange(batch_size) * vocab_size)[:, None], (batch_size, topk)
-		).flatten()
-		topk_scores_flat = topk_scores.flatten()
-		topk_indices_flat = topk_indices.flatten() + shift
+		def _filter_scores(s: jnp.ndarray) -> jnp.ndarray:
+			"""Applies the dynamic filtering logic."""
+			sorted_scores = jnp.sort(s, axis=-1)[:, ::-1]
+			k_index = effective_k - 1
+			k_index = jnp.maximum(0, k_index)
+			threshold = sorted_scores[:, k_index]
+			threshold = threshold[:, None]
+			mask = s >= threshold
+			return jnp.where(mask, s, self.filter_value)
 
-		next_scores_flat = next_scores_flat.at[topk_indices_flat].set(topk_scores_flat)
-		next_scores = next_scores_flat.reshape(batch_size, vocab_size)
-		return next_scores
+		def _identity(s: jnp.ndarray) -> jnp.ndarray:
+			"""Returns scores unchanged."""
+			return s
+
+		return lax.cond(
+			(k_val > 0) & (effective_k < vocab_size),
+			_filter_scores,  # Apply filtering
+			_identity,  # Pass through unchanged
+			scores,  # Operand
+		)
 
 
-class FlaxForcedBOSTokenLogitsProcessor(FlaxLogitsProcessor):
+@auto_pytree
+class ForcedBOSTokenLogitsProcessor(LogitsProcessor):
 	r"""
-	[`FlaxLogitsProcessor`] that enforces the specified token as the first generated token.
+	[`LogitsProcessor`] that enforces the specified token as the first generated token.
 
 	Args:
 	    bos_token_id (`int`):
 	        The id of the token to force as the first generated token.
 	"""
 
-	def __init__(self, bos_token_id: int):
-		self.bos_token_id = bos_token_id
+	bos_token_id: int
 
 	def __call__(
-		self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int
+		self,
+		input_ids: jnp.ndarray,
+		scores: jnp.ndarray,
+		cur_len: int,
 	) -> jnp.ndarray:
 		new_scores = jnp.full(scores.shape, -float("inf"))
 
@@ -264,9 +289,10 @@ class FlaxForcedBOSTokenLogitsProcessor(FlaxLogitsProcessor):
 		return scores
 
 
-class FlaxForcedEOSTokenLogitsProcessor(FlaxLogitsProcessor):
+@auto_pytree
+class ForcedEOSTokenLogitsProcessor(LogitsProcessor):
 	r"""
-	[`FlaxLogitsProcessor`] that enforces the specified token as the last generated token when `max_length` is reached.
+	[`LogitsProcessor`] that enforces the specified token as the last generated token when `max_length` is reached.
 
 	Args:
 	    max_length (`int`):
@@ -275,12 +301,14 @@ class FlaxForcedEOSTokenLogitsProcessor(FlaxLogitsProcessor):
 	        The id of the token to force as the last generated token when `max_length` is reached.
 	"""
 
-	def __init__(self, max_length: int, eos_token_id: int):
-		self.max_length = max_length
-		self.eos_token_id = eos_token_id
+	max_length: int
+	eos_token_id: int
 
 	def __call__(
-		self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int
+		self,
+		input_ids: jnp.ndarray,
+		scores: jnp.ndarray,
+		cur_len: int,
 	) -> jnp.ndarray:
 		new_scores = jnp.full(scores.shape, -float("inf"))
 
@@ -293,9 +321,10 @@ class FlaxForcedEOSTokenLogitsProcessor(FlaxLogitsProcessor):
 		return scores
 
 
-class FlaxMinLengthLogitsProcessor(FlaxLogitsProcessor):
+@auto_pytree
+class MinLengthLogitsProcessor(LogitsProcessor):
 	r"""
-	[`FlaxLogitsProcessor`] enforcing a min-length by setting EOS probability to 0.
+	[`LogitsProcessor`] enforcing a min-length by setting EOS probability to 0.
 
 	Args:
 	    min_length (`int`):
@@ -304,22 +333,25 @@ class FlaxMinLengthLogitsProcessor(FlaxLogitsProcessor):
 	        The id of the *end-of-sequence* token.
 	"""
 
-	def __init__(self, min_length: int, eos_token_id: int):
-		if not isinstance(min_length, int) or min_length < 0:
+	min_length: int
+	eos_token_id: int
+
+	def __post_init__(self):
+		if not isinstance(self.min_length, int) or self.min_length < 0:
 			raise ValueError(
-				f"`min_length` has to be a positive integer, but is {min_length}"
+				f"`min_length` has to be a positive integer, but is {self.min_length}"
 			)
 
-		if not isinstance(eos_token_id, int) or eos_token_id < 0:
+		if not isinstance(self.eos_token_id, int) or self.eos_token_id < 0:
 			raise ValueError(
-				f"`eos_token_id` has to be a positive integer, but is {eos_token_id},"
+				f"`eos_token_id` has to be a positive integer, but is {self.eos_token_id},"
 			)
-
-		self.min_length = min_length
-		self.eos_token_id = eos_token_id
 
 	def __call__(
-		self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int
+		self,
+		input_ids: jnp.ndarray,
+		scores: jnp.ndarray,
+		cur_len: int,
 	) -> jnp.ndarray:
 		# create boolean flag to decide if min length penalty should be applied
 		apply_penalty = 1 - jnp.clip(cur_len - self.min_length, 0, 1)
@@ -331,9 +363,10 @@ class FlaxMinLengthLogitsProcessor(FlaxLogitsProcessor):
 		return scores
 
 
-class FlaxSuppressTokensAtBeginLogitsProcessor(FlaxLogitsProcessor):
+@auto_pytree
+class SuppressTokensAtBeginLogitsProcessor(LogitsProcessor):
 	r"""
-	[`FlaxLogitsProcessor`] supressing a list of tokens as soon as the `generate` function starts generating using
+	[`LogitsProcessor`] supressing a list of tokens as soon as the `generate` function starts generating using
 	`begin_index` tokens. This should ensure that the tokens defined by `begin_suppress_tokens` are not sampled at the
 	begining of the generation.
 
@@ -344,11 +377,15 @@ class FlaxSuppressTokensAtBeginLogitsProcessor(FlaxLogitsProcessor):
 	        Index where the tokens are suppressed.
 	"""
 
-	def __init__(self, begin_suppress_tokens, begin_index):
-		self.begin_suppress_tokens = list(begin_suppress_tokens)
-		self.begin_index = begin_index
+	begin_suppress_tokens: list
+	begin_index: int
 
-	def __call__(self, input_ids, scores, cur_len: int):
+	def __call__(
+		self,
+		input_ids: jnp.ndarray,
+		scores: jnp.ndarray,
+		cur_len: int,
+	) -> jnp.ndarray:
 		apply_penalty = 1 - jnp.bool_(cur_len - self.begin_index)
 
 		scores = jnp.where(
@@ -360,9 +397,10 @@ class FlaxSuppressTokensAtBeginLogitsProcessor(FlaxLogitsProcessor):
 		return scores
 
 
-class FlaxSuppressTokensLogitsProcessor(FlaxLogitsProcessor):
+@auto_pytree
+class SuppressTokensLogitsProcessor(LogitsProcessor):
 	r"""
-	[`FlaxLogitsProcessor`] suppressing a list of tokens at each decoding step. The processor will set their log probs
+	[`LogitsProcessor`] suppressing a list of tokens at each decoding step. The processor will set their log probs
 	to be `-inf` so they are not sampled.
 
 	Args:
@@ -370,20 +408,23 @@ class FlaxSuppressTokensLogitsProcessor(FlaxLogitsProcessor):
 	        Tokens to not sample.
 	"""
 
-	def __init__(self, suppress_tokens: list):
-		self.suppress_tokens = list(suppress_tokens)
+	suppress_tokens: list
 
 	def __call__(
-		self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int
+		self,
+		input_ids: jnp.ndarray,
+		scores: jnp.ndarray,
+		cur_len: int,
 	) -> jnp.ndarray:
-		scores = scores.at[..., self.suppress_tokens].set(-float("inf"))
-
+		if len(self.suppress_tokens) != 0:
+			scores = scores.at[..., self.suppress_tokens].set(-float("inf"))
 		return scores
 
 
-class FlaxForceTokensLogitsProcessor(FlaxLogitsProcessor):
+@auto_pytree
+class ForceTokensLogitsProcessor(LogitsProcessor):
 	r"""
-	[`FlaxLogitsProcessor`] that takes a list of pairs of integers which indicates a mapping from generation indices to
+	[`LogitsProcessor`] that takes a list of pairs of integers which indicates a mapping from generation indices to
 	token indices that will be forced before sampling. The processor will set their log probs to 0 and all other tokens
 	to `-inf` so that they are sampled at their corresponding index.
 
@@ -392,11 +433,11 @@ class FlaxForceTokensLogitsProcessor(FlaxLogitsProcessor):
 	        Map giving token ids and indices where they will be forced to be sampled.
 	"""
 
-	def __init__(self, force_token_map):
-		force_token_map = dict(force_token_map)
-		# Converts the dictionary of format {index: token} containing the tokens to be forced to an array, where the
-		# index of the array corresponds to the index of the token to be forced, for XLA compatibility.
-		# Indexes without forced tokens will have a negative value.
+	force_token_map: list | dict
+	force_token_array: jax.Array
+
+	def __post_init__(self):
+		force_token_map = dict(self.force_token_map)
 		force_token_array = (
 			jnp.ones((max(force_token_map.keys()) + 1), dtype=jnp.int32) * -1
 		)
@@ -406,7 +447,10 @@ class FlaxForceTokensLogitsProcessor(FlaxLogitsProcessor):
 		self.force_token_array = jnp.int32(force_token_array)
 
 	def __call__(
-		self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int
+		self,
+		input_ids: jnp.ndarray,
+		scores: jnp.ndarray,
+		cur_len: int,
 	) -> jnp.ndarray:
 		def _force_token(generation_idx):
 			batch_size = scores.shape[0]
@@ -419,21 +463,17 @@ class FlaxForceTokensLogitsProcessor(FlaxLogitsProcessor):
 
 		scores = lax.cond(
 			cur_len >= self.force_token_array.shape[0],
-			# If the current length is geq than the length of force_token_array, the processor does nothing.
 			lambda: scores,
-			# Otherwise, it may force a certain token.
 			lambda: lax.cond(
 				self.force_token_array[cur_len] >= 0,
-				# Only valid (positive) tokens are forced
 				lambda: _force_token(cur_len),
-				# Otherwise, the processor does nothing.
 				lambda: scores,
 			),
 		)
 		return scores
 
 
-class WhisperTimeStampLogitsProcessor(FlaxLogitsProcessor):
+class WhisperTimeStampLogitsProcessor(LogitsProcessor):
 	r"""
 	Whisper specific Processor. This processor can be used to force a list of tokens. The processor will set their log
 	probs to `inf` so that they are sampled at their corresponding index.
@@ -450,7 +490,7 @@ class WhisperTimeStampLogitsProcessor(FlaxLogitsProcessor):
 	                predicting timestamps that are too far in the future.
 	"""
 
-	def __init__(self, generate_config, model_config, decoder_input_length):
+	def __post_init__(self, generate_config, model_config, decoder_input_length):
 		self.eos_token_id = generate_config.eos_token_id
 		self.no_timestamps_token_id = generate_config.no_timestamps_token_id
 		self.timestamp_begin = generate_config.no_timestamps_token_id + 1
@@ -532,52 +572,216 @@ class WhisperTimeStampLogitsProcessor(FlaxLogitsProcessor):
 		return scores
 
 
-class FlaxStaticForceTokensLogitsProcessor(FlaxLogitsProcessor):
+@auto_pytree
+class PresencePenaltyLogitsProcessor(LogitsProcessor):
 	r"""
-	[`FlaxLogitsProcessor`] that takes a list of pairs of integers which indicates a mapping from generation indices to
-	token indices that will be forced before sampling. The processor will set their log probs to 0 and all other tokens
-	to `-inf` so that they are sampled at their corresponding index. This is a static version of the `transformers` logit
-	processor [`FlaxForceTokensLogitsProcessor`] that is compatible with sharded forced tokens.
+	[`LogitsProcessor`] that applies a penalty to the logit of tokens that have already appeared in the
+	`input_ids`.
 
 	Args:
-	    force_token_map (`list`):
-	        Map giving token ids and indices where they will be forced to be sampled.
+	    presence_penalty (`float`):
+	        The penalty value. It is subtracted from the logits of tokens that are present in the `input_ids`.
+	        A positive value penalizes new tokens according to whether they appear in the text so far,
+	        increasing the model's likelihood to talk about new topics. Must be >= 0.
 	"""
 
-	def __init__(self, force_token_map):
-		force_token_map = jnp.array(force_token_map)
-		force_token_array = jnp.ones(3, dtype=jnp.int32) * -1
-		for index, token in force_token_map:
-			force_token_array = force_token_array.at[index].set(token)
-		self.force_token_array = jnp.int32(force_token_array)
+	presence_penalty: float
 
 	def __call__(
-		self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int
+		self,
+		input_ids: jnp.ndarray,
+		scores: jnp.ndarray,
+		cur_len: int,
 	) -> jnp.ndarray:
-		def _force_token(generation_idx):
-			batch_size = scores.shape[0]
-			current_token = self.force_token_array[generation_idx]
+		def _apply(x, ids, presence_penalty):
+			batch_size, vocab_size = x.shape
+			one_hot_presence = jax.nn.one_hot(
+				ids,
+				num_classes=vocab_size,
+				dtype=x.dtype,
+			)
+			presence_mask = jnp.sum(one_hot_presence, axis=1) > 0
+			penalty_values = jnp.where(presence_mask, presence_penalty, 0.0)
+			x = x - penalty_values
 
-			new_scores = jnp.ones_like(scores, dtype=scores.dtype) * -float("inf")
-			updates = jnp.zeros((batch_size, 1), dtype=scores.dtype)
-			new_scores = lax.dynamic_update_slice(new_scores, updates, (0, current_token))
-			return new_scores
+			return x
 
-		scores = lax.cond(
-			cur_len >= self.force_token_array.shape[0],
-			lambda: scores,
-			lambda: lax.cond(
-				self.force_token_array[cur_len] >= 0,
-				lambda: _force_token(cur_len),
-				lambda: scores,
-			),
+		return jax.lax.cond(
+			self.presence_penalty == 0.0,
+			lambda *x: x[0],
+			_apply,
+			scores,
+			input_ids,
+			self.presence_penalty,
 		)
-		return scores
 
 
-class FlaxNoRepeatNGramLogitsProcessor(FlaxLogitsProcessor):
+@auto_pytree
+class FrequencyPenaltyLogitsProcessor(LogitsProcessor):
 	r"""
-	[`FlaxLogitsProcessor`] that enforces no repetition of n-grams. See
+	[`LogitsProcessor`] that applies a penalty based on the frequency of tokens that have already
+	appeared in the `input_ids`.
+
+	Args:
+	    frequency_penalty (`float`):
+	        The penalty value. It is subtracted from the logits proportionally to the frequency of the
+	        token in the `input_ids`. A positive value penalizes new tokens based on their existing
+	        frequency in the text so far, decreasing the model's likelihood to repeat the same line
+	        verbatim. Must be >= 0.
+	"""
+
+	frequency_penalty: float
+
+	def __call__(
+		self,
+		input_ids: jnp.ndarray,
+		scores: jnp.ndarray,
+		cur_len: int,
+	) -> jnp.ndarray:
+		def _apply(x, ids, frequency_penalty):
+			batch_size, vocab_size = x.shape
+
+			one_hot_counts = jax.nn.one_hot(
+				ids,
+				num_classes=vocab_size,
+				dtype=x.dtype,
+			)
+			token_counts = jnp.sum(one_hot_counts, axis=1)
+			penalty_values = token_counts * frequency_penalty
+			x = x - penalty_values
+
+			return x
+
+		return jax.lax.cond(
+			self.frequency_penalty == 0.0,
+			lambda *x: x[0],
+			_apply,
+			scores,
+			input_ids,
+			self.frequency_penalty,
+		)
+
+
+@auto_pytree
+class RepetitionPenaltyLogitsProcessor(LogitsProcessor):
+	r"""
+	[`LogitsProcessor`] enforcing an exponential penalty on repeated sequences.
+
+	Args:
+	    repetition_penalty (`float`):
+	        The parameter for repetition penalty. 1.0 means no penalty. Values > 1.0 discourage repetition,
+	        values < 1.0 encourage it. See [this paper](https://arxiv.org/pdf/1909.05858.pdf) for more details.
+	"""
+
+	repetition_penalty: float
+
+	def __call__(
+		self,
+		input_ids: jnp.ndarray,
+		scores: jnp.ndarray,
+		cur_len: int,
+	) -> jnp.ndarray:
+		def _apply(x, ids, repetition_penalty):
+			batch_size, vocab_size = x.shape
+			one_hot_presence = jax.nn.one_hot(
+				ids,
+				num_classes=vocab_size,
+				dtype=x.dtype,
+			)
+			presence_mask = jnp.sum(one_hot_presence, axis=1) > 0
+			positive_penalized_scores = x / repetition_penalty
+			negative_penalized_scores = x * repetition_penalty
+
+			scores_intermediate = jnp.where(x > 0, positive_penalized_scores, scores)
+			penalized_scores = jnp.where(
+				x < 0,
+				negative_penalized_scores,
+				scores_intermediate,
+			)
+
+			x = jnp.where(presence_mask, penalized_scores, x)
+
+			return x
+
+		return jax.lax.cond(
+			self.repetition_penalty == 1.0,
+			lambda *x: x[0],
+			_apply,
+			scores,
+			input_ids,
+			self.repetition_penalty,
+		)
+
+
+@auto_pytree
+class MinPLogitsWarper(LogitsWarper):
+	r"""
+	[`LogitsWarper`] that performs nucleus filtering, also known as top-p sampling.
+	Filters vocabulary based on cumulative probability threshold `min_p`.
+
+	Args:
+	    min_p (`float`):
+	        If set to < 1, only the most probable tokens with probabilities that add up to `min_p` or higher are
+	        kept for generation.
+	    filter_value (`float`, *optional*, defaults to -inf):
+	        All filtered values will be set to this float value.
+	    min_tokens_to_keep (`int`, *optional*, defaults to 1):
+	        Minimum number of tokens that cannot be filtered, even if their cumulative probability is above `min_p`.
+	"""
+
+	min_p: float
+	filter_value: float = -float("Inf")
+	min_tokens_to_keep: int = 1
+
+	def __call__(
+		self,
+		input_ids: jnp.ndarray,
+		scores: jnp.ndarray,
+		cur_len: int,
+	) -> jnp.ndarray:
+		min_p = jnp.asarray(self.min_p)
+
+		def _apply(x):
+			batch_size, vocab_size = x.shape
+			sorted_logits, sorted_indices = lax.top_k(x, k=vocab_size)
+			sorted_probs = jax.nn.softmax(sorted_logits, axis=-1)
+			cumulative_probs = jnp.cumsum(sorted_probs, axis=-1)
+
+			shifted_cum_probs = jnp.pad(
+				cumulative_probs[:, :-1],
+				((0, 0), (1, 0)),
+				constant_values=0.0,
+			)
+			sorted_indices_to_remove_mask = shifted_cum_probs >= min_p
+			min_keep_mask = jnp.arange(vocab_size) < self.min_tokens_to_keep
+			sorted_indices_to_remove_mask = sorted_indices_to_remove_mask & (~min_keep_mask)
+			indices_to_remove_mask = jnp.zeros_like(x, dtype=jnp.bool_)
+			batch_idx_mesh, _ = jnp.meshgrid(
+				jnp.arange(batch_size),
+				jnp.arange(vocab_size),
+				indexing="ij",
+			)
+			update_indices = (batch_idx_mesh, sorted_indices)
+			indices_to_remove_mask = indices_to_remove_mask.at[update_indices].set(
+				sorted_indices_to_remove_mask
+			)
+
+			final_scores = jnp.where(indices_to_remove_mask, self.filter_value, x)
+
+			return final_scores
+
+		return jax.lax.cond(
+			(min_p > 0) & (min_p < 1),
+			_apply,
+			lambda x: x,
+			scores,
+		)
+
+
+@auto_pytree
+class NoRepeatNGramLogitsProcessor(LogitsProcessor):
+	r"""
+	[`LogitsProcessor`] that enforces no repetition of n-grams. See
 	[Fairseq](https://github.com/pytorch/fairseq/blob/a07cb6f40480928c9e0548b737aadd36ee66ac76/fairseq/sequence_generator.py#L345).
 
 	Args:
@@ -585,81 +789,74 @@ class FlaxNoRepeatNGramLogitsProcessor(FlaxLogitsProcessor):
 	        All ngrams of size `ngram_size` can only occur once.
 	"""
 
-	def __init__(self, ngram_size: int):
-		if not isinstance(ngram_size, int) or ngram_size <= 0:
-			raise ValueError(
-				f"`ngram_size` has to be a strictly positive integer, but is {ngram_size}"
-			)
-		self.ngram_size = ngram_size
+	ngram_size: int
 
-	def get_previous_ngrams(self, input_ids: jnp.ndarray, vocab_size: int, cur_len: int):
-		"""
-		get a matrix of size (batch_size,) + (vocab_size,)*n (for n-grams) that
-		represent the n-grams that occurred previously.
-		The BCOO representation allow to store only the few non-zero entries, instead of the full (huge) matrix
-		"""
-		batch_size, seq_len = input_ids.shape
-		# number of n-grams in the whole sequence
-		seq_ngrams = seq_len - (self.ngram_size - 1)
-		# number of n-grams in the currently generated sequence
-		cur_ngrams = cur_len - (self.ngram_size - 1)
-
-		def body_fun(i, val):
-			b = i % batch_size
-			pos = i // batch_size
-			return val.at[i].set(
-				jnp.array(
-					[
-						b,
-					]
-					+ [jnp.array(input_ids)[b, pos + j] for j in range(self.ngram_size)]
-				)
-			)
-
-		shape = (batch_size * seq_ngrams, self.ngram_size + 1)
-		all_update_indices = jax.lax.fori_loop(
-			0,
-			batch_size * cur_ngrams,
-			body_fun,
-			jnp.zeros(shape, dtype=input_ids.dtype),
-		)
-
-		# ignore the n-grams not yet generated
-		data = (jnp.arange(batch_size * seq_ngrams) < batch_size * cur_ngrams).astype(
-			"float32"
-		)
-
-		return sparse.BCOO(
-			(data, all_update_indices),
-			shape=(batch_size,) + (vocab_size,) * self.ngram_size,
-		)
-
-	def get_banned_tokens_mask(
-		self, latest_tokens: jnp.ndarray, previous_ngrams
-	) -> jnp.ndarray:
-		"""
-		Determines which tokens must be banned given latest tokens and the previously seen
-		ngrams.
-		"""
-
-		@sparse.sparsify
-		@jax.vmap
-		def inner_fn(latest_tokens, previous_ngrams):
-			return previous_ngrams[tuple(latest_tokens)]
-
-		return sparse.bcoo_todense(inner_fn(latest_tokens, previous_ngrams))
-
-	def __call__(
-		self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int
+	def forward(
+		self,
+		input_ids: jnp.ndarray,
+		scores: jnp.ndarray,
+		cur_len: int,
 	) -> jnp.ndarray:
 		def true_fn():
-			_, vocab_size = scores.shape
-			# store the previously seen n-grams
-			previous_ngrams = self.get_previous_ngrams(input_ids, vocab_size, cur_len)
+			def get_previous_ngrams(
+				input_ids: jnp.ndarray,
+				vocab_size: int,
+				cur_len: int,
+			):
+				batch_size, seq_len = input_ids.shape
+				seq_ngrams = seq_len - (self.ngram_size - 1)
+				cur_ngrams = cur_len - (self.ngram_size - 1)
 
-			# get the n-1 last tokens that prefix the n-gram being generated
+				def body_fun(i, val):
+					b = i % batch_size
+					pos = i // batch_size
+					return val.at[i].set(
+						jnp.array(
+							[
+								b,
+							]
+							+ [jnp.array(input_ids)[b, pos + j] for j in range(self.ngram_size)]
+						)
+					)
+
+				shape = (batch_size * seq_ngrams, self.ngram_size + 1)
+				all_update_indices = jax.lax.fori_loop(
+					0,
+					batch_size * cur_ngrams,
+					body_fun,
+					jnp.zeros(shape, dtype=input_ids.dtype),
+				)
+
+				data = (jnp.arange(batch_size * seq_ngrams) < batch_size * cur_ngrams).astype(
+					"float32"
+				)
+
+				return sparse.BCOO(
+					(data, all_update_indices),
+					shape=(batch_size,) + (vocab_size,) * self.ngram_size,
+				)
+
+			def get_banned_tokens_mask(
+				latest_tokens: jnp.ndarray,
+				previous_ngrams,
+			) -> jnp.ndarray:
+				"""
+				Determines which tokens must be banned given latest tokens and the previously seen
+				ngrams.
+				"""
+
+				@sparse.sparsify
+				@jax.vmap
+				def inner_fn(latest_tokens, previous_ngrams):
+					return previous_ngrams[tuple(latest_tokens)]
+
+				return sparse.bcoo_todense(inner_fn(latest_tokens, previous_ngrams))
+
+			_, vocab_size = scores.shape
+			previous_ngrams = get_previous_ngrams(input_ids, vocab_size, cur_len)
 			latest_tokens = jnp.zeros(
-				(input_ids.shape[0], self.ngram_size - 1), dtype=input_ids.dtype
+				(input_ids.shape[0], self.ngram_size - 1),
+				dtype=input_ids.dtype,
 			)
 			latest_tokens = jax.lax.dynamic_update_slice(
 				latest_tokens,
@@ -670,12 +867,25 @@ class FlaxNoRepeatNGramLogitsProcessor(FlaxLogitsProcessor):
 				),
 				(0, 0),
 			)
-
-			# compute the banned tokens, ie all the tokens that when added to the latest tokens lead to a n-gram that was previously generated
-			banned_tokens_indices_mask = self.get_banned_tokens_mask(
+			banned_tokens_indices_mask = get_banned_tokens_mask(
 				latest_tokens, previous_ngrams
-			).astype("bool")
+			).astype("b1")
 			return jnp.where(banned_tokens_indices_mask, -float("inf"), scores)
 
 		output = jax.lax.cond((cur_len >= self.ngram_size - 1), true_fn, lambda: scores)
 		return output
+
+	def __call__(
+		self,
+		input_ids: jnp.ndarray,
+		scores: jnp.ndarray,
+		cur_len: int,
+	) -> jnp.ndarray:
+		return jax.lax.cond(
+			self.ngram_size != 0,
+			lambda a, b, c: self.forward(a, b, c),
+			lambda a, b, c: b,
+			input_ids,
+			scores,
+			cur_len,
+		)

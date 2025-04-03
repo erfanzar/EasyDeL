@@ -62,19 +62,26 @@ def main():
 
 	if os.getenv("APPED_LORA_TEST", "false") in ["true", "yes"]:
 		model = model.apply_lora_to_layers(32, ".*(q_proj|k_proj).*")
-
+	sampling_params = ed.SamplingParams(
+		max_tokens=max_new_tokens + 540,
+		presence_penalty=0.0,
+		frequency_penalty=0.0,
+		repetition_penalty=1.0,
+		temperature=0.0,
+		top_p=1.0,
+		top_k=4,
+		min_p=0.0,
+	)
 	inference = ed.vInference(
 		model=model,
 		processor_class=processor,
 		generation_config=ed.vInferenceConfig(
 			max_new_tokens=max_new_tokens,
-			temperature=0.7,
-			do_sample=True,
-			top_p=0.95,
-			top_k=10,
-			eos_token_id=model.generation_config.eos_token_id,
+			# eos_token_id=model.generation_config.eos_token_id,
+			eos_token_id=-1,
 			streaming_chunks=32,
 			num_return_sequences=1,
+			sampling_params=sampling_params,
 		),
 	)
 
@@ -99,12 +106,23 @@ def main():
 		add_generation_prompt=True,
 	)
 
-	print("Start Generation Process.")
-	for response in inference.generate(**inputs):
+	print("Stage 1 => Start Generation Process.")
+	for response in inference.generate(**inputs, sampling_params=sampling_params):
 		...
-	sequences = response.sequences[..., response.padded_length :]
 
-	print(processor.batch_decode(sequences, skip_special_tokens=True)[0])
+	# sequences = response.sequences[..., response.padded_length :]
+	# print(processor.batch_decode(sequences, skip_special_tokens=True)[0])
+
+	print(response.tokens_pre_second)
+
+	print("Stage 2 => Start Generation Process.")
+	sampling_params.top_p = 0.8
+	for response in inference.generate(**inputs, sampling_params=sampling_params):
+		...
+
+	# sequences = response.sequences[..., response.padded_length :]
+	# print(processor.batch_decode(sequences, skip_special_tokens=True)[0])
+
 	print(response.tokens_pre_second)
 
 

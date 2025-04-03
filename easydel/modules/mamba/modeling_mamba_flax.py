@@ -20,39 +20,39 @@ import typing as tp
 import chex
 import jax
 import jax.numpy as jnp
+from eformer.pytree import auto_pytree
 from einops import repeat
 from flax import nnx as nn
 from jax import lax
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import FlaxBaseModelOutput
+from easydel.infra.modeling_outputs import BaseModelOutput
 from easydel.infra.utils import (
 	ACT2FN,
 	auto_remat,
 	get_dot_general_by_bits,
 )
-from easydel.layers.caching import MambaCache
-from easydel.layers.caching.mamba_cache import MambaCacheMetaData, MambaCacheView
+from easydel.layers.caching import MambaCache, MambaCacheMetaData, MambaCacheView
 from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm as MambaRMSNorm
 
 from .mamba_configuration import MambaConfig as MambaConfig
-from eformer.pytree import auto_pytree
+
 
 def init_to_value(x, dtype):
 	return lambda _, shape, dtype: jnp.broadcast_to(jnp.asarray(x, dtype=dtype), shape)
 
 
 @auto_pytree
-class MambaOutput(FlaxBaseModelOutput):
+class MambaOutput(BaseModelOutput):
 	last_hidden_state: chex.Array = None
 	cache: tp.Optional[MambaCache] = None
 	hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
 
 
 @auto_pytree
-class MambaCausalLMOutput(FlaxBaseModelOutput):
+class MambaCausalLMOutput(BaseModelOutput):
 	logits: chex.Array = None
 	cache: tp.Optional[MambaCache] = None
 	hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
@@ -557,8 +557,7 @@ class MambaModel(EasyDeLBaseModule):
 		)
 
 	def init_cache(self, batch_size: int, max_length: int):
-		return MambaCache.init_layers_cache(
-			num_hidden_layers=self.config.num_hidden_layers,
+		return MambaCache.init_cache(
 			dtype=self.dtype,
 			partition_specs=jax.sharding.PartitionSpec(
 				self.config.partition_axis.batch_axis,
@@ -567,6 +566,8 @@ class MambaModel(EasyDeLBaseModule):
 				self.config.partition_axis.attention_dim_axis,
 			),
 			metadata=MambaCacheMetaData.create(
+				num_hidden_layers=self.config.num_hidden_layers,
+				partition_axis=self.config.partition_axis,
 				batch_size=batch_size,
 				sequence_length=max_length,
 				num_heads=self.config.num_key_value_heads,
@@ -665,8 +666,7 @@ class MambaForCausalLM(EasyDeLBaseModule):
 		return self.prepare_inputs_for_call(**{"cache": kwargs.get("cache", None)})
 
 	def init_cache(self, batch_size: int, max_length: int):
-		return MambaCache.init_layers_cache(
-			num_hidden_layers=self.config.num_hidden_layers,
+		return MambaCache.init_cache(
 			dtype=self.dtype,
 			partition_specs=jax.sharding.PartitionSpec(
 				self.config.partition_axis.batch_axis,
@@ -675,6 +675,8 @@ class MambaForCausalLM(EasyDeLBaseModule):
 				self.config.partition_axis.attention_dim_axis,
 			),
 			metadata=MambaCacheMetaData.create(
+				num_hidden_layers=self.config.num_hidden_layers,
+				partition_axis=self.config.partition_axis,
 				batch_size=batch_size,
 				sequence_length=max_length,
 				num_heads=self.config.num_key_value_heads,

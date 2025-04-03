@@ -17,7 +17,7 @@
 
 from .matmul_pallas import pallas_matmul
 from .ring_attention_pallas import pallas_ring_attention
-from .paged_attention import (
+from .paged_attention_pallas import (
 	pallas_paged_attention,
 	pallas_prefill_attention,
 )

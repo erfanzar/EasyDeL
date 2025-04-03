@@ -52,7 +52,7 @@ class EasyQuantizer:
 		self.quantization_method = quantization_method
 		self.quantization_platform = quantization_platform
 		if quantization_pattern is None:
-			quantization_pattern = r".*(?:embedding|layernorm|norm)$"
+			quantization_pattern = r"^(?!.*(?:embedding|norm)).*$"
 		self.quantization_pattern = quantization_pattern
 
 	@jax.named_scope("easydel-easyquantize-call")
@@ -69,13 +69,12 @@ class EasyQuantizer:
 				path = map(str, path)
 				path = ".".join(path)
 			if self.quantization_pattern is not None:
-				should_be_quantized = not bool(re.match(self.quantization_pattern, path))
+				should_be_quantized = bool(re.match(self.quantization_pattern, path))
 		if not should_be_quantized:
 			return array
 		match self.quantization_method:
 			case EasyDeLQuantizationMethods.A8BIT:
 				return Array8B.quantize(array=array)
-
 			case EasyDeLQuantizationMethods.NF4:
 				should_be_quantized = True
 				if array.size % self.block_size != 0:

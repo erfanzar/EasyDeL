@@ -24,14 +24,14 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.modeling_outputs import (
-	FlaxBaseModelOutput,
-	FlaxBaseModelOutputWithPooling,
-	FlaxCLIPOutput,
-	FlaxCLIPTextModelOutput,
-	FlaxImageClassifierOutput,
+	BaseModelOutput,
+	BaseModelOutputWithPooling,
+	CLIPOutput,
+	CLIPTextModelOutput,
+	ImageClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, control_mlp_sharding
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
+from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.linear import ParallelLinear
 
 from .clip_configuration import (
@@ -159,7 +159,7 @@ class CLIPTextEmbeddings(nn.Module):
 		return embeddings
 
 
-class CLIPAttention(FlaxAttentionModule):
+class CLIPAttention(AttentionModule):
 	def __init__(
 		self,
 		config: tp.Union[CLIPTextConfig, CLIPVisionConfig],
@@ -454,7 +454,7 @@ class CLIPEncoder(nn.Module):
 		if not return_dict:
 			return tuple(v for v in outputs if v is not None)
 
-		return FlaxBaseModelOutput(
+		return BaseModelOutput(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
 			attentions=all_attentions,
@@ -552,7 +552,7 @@ class CLIPTextTransformer(EasyDeLBaseModule):
 		if not return_dict:
 			return (last_hidden_state, pooled_output) + encoder_outputs[1:]
 
-		return FlaxBaseModelOutputWithPooling(
+		return BaseModelOutputWithPooling(
 			last_hidden_state=last_hidden_state,
 			pooler_output=pooled_output,
 			hidden_states=encoder_outputs.hidden_states,
@@ -645,7 +645,7 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
 		if not return_dict:
 			return (last_hidden_state, pooled_output) + encoder_outputs[1:]
 
-		return FlaxBaseModelOutputWithPooling(
+		return BaseModelOutputWithPooling(
 			last_hidden_state=last_hidden_state,
 			pooler_output=pooled_output,
 			hidden_states=encoder_outputs.hidden_states,
@@ -739,7 +739,7 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
-	) -> tp.Union[FlaxCLIPTextModelOutput, tp.Tuple]:
+	) -> tp.Union[CLIPTextModelOutput, tp.Tuple]:
 		text_outputs = self.text_model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
@@ -755,7 +755,7 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
 		if not return_dict:
 			return (text_embeds, text_outputs[0]) + text_outputs[2:]
 
-		return FlaxCLIPTextModelOutput(
+		return CLIPTextModelOutput(
 			text_embeds=text_embeds,
 			last_hidden_state=text_outputs.last_hidden_state,
 			hidden_states=text_outputs.hidden_states,
@@ -857,7 +857,7 @@ class CLIPForImageClassification(EasyDeLBaseModule):
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: tp.Optional[bool] = None,
-	) -> tp.Union[tuple, FlaxImageClassifierOutput]:
+	) -> tp.Union[tuple, ImageClassifierOutput]:
 		output_attentions = (
 			output_attentions
 			if output_attentions is not None
@@ -891,7 +891,7 @@ class CLIPForImageClassification(EasyDeLBaseModule):
 			output = (logits,) + outputs[2:]
 			return output
 
-		return FlaxImageClassifierOutput(
+		return ImageClassifierOutput(
 			logits=logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
@@ -967,7 +967,7 @@ class CLIPModel(EasyDeLBaseModule):
 		output_attentions=None,
 		output_hidden_states=None,
 		return_dict=None,
-	) -> tp.Union[FlaxCLIPOutput, tp.Tuple]:
+	) -> tp.Union[CLIPOutput, tp.Tuple]:
 		if attention_mask is None and input_ids is not None:
 			attention_mask = jnp.ones_like(input_ids)
 		if position_ids is None and attention_mask is not None:
@@ -1013,7 +1013,7 @@ class CLIPModel(EasyDeLBaseModule):
 				vision_outputs,
 			)
 
-		return FlaxCLIPOutput(
+		return CLIPOutput(
 			logits_per_image=logits_per_image,
 			logits_per_text=logits_per_text,
 			text_embeds=text_embeds,
@@ -1050,7 +1050,7 @@ class CLIPModel(EasyDeLBaseModule):
 		loss_config=None,  # just to extract
 		loss_kwargs=None,  # just to extract
 		**batch,
-	) -> tp.Tuple[tp.Any, FlaxCLIPOutput]:
+	) -> tp.Tuple[tp.Any, CLIPOutput]:
 		batch.pop("return_dict", None)
 		outputs = self(**batch, return_dict=True)
 

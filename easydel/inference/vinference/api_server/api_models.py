@@ -38,17 +38,25 @@ class UsageInfo(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
 	# The openai api native parameters
+
 	model: str
 	messages: tp.List[ChatMessage]
+
 	function_call: tp.Optional[str] = "none"  # Ignored by EasyDeL
-	temperature: tp.Optional[float] = 1  # Ignored by EasyDeL
-	top_p: tp.Optional[float] = 1.0  # Ignored by EasyDeL
-	n: tp.Optional[int] = 1  # Ignored by EasyDeL
+
+	max_tokens: int = 16
+	presence_penalty: float = 0.0
+	frequency_penalty: float = 0.0
+	repetition_penalty: float = 1.0
+	temperature: float = 0.0
+	top_p: float = 1.0
+	top_k: int = 0
+	min_p: float = 0.0
+
+	n: tp.Optional[int] = 1  # ignored
 	stream: tp.Optional[bool] = False
 	stop: tp.Optional[tp.Union[str, tp.List[str]]] = None  # Ignored by EasyDeL
-	max_tokens: tp.Optional[int] = 16
-	presence_penalty: tp.Optional[float] = 0.0  # Ignored by EasyDeL
-	frequency_penalty: tp.Optional[float] = 0.0  # Ignored by EasyDeL
+
 	logit_bias: tp.Optional[tp.Dict[str, float]] = None  # Ignored by EasyDeL
 	user: tp.Optional[str] = None  # Ignored by EasyDeL
 

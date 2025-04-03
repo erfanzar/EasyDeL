@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
+import pytest  # type:ignore
 from eformer.escale import PartitionAxis
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
@@ -197,7 +197,7 @@ class TestTransformerCacheView:
 
 
 class TestTransformerCache:
-	def test_init_layers_cache(self):
+	def test_init_cache(self):
 		num_layers = 3
 		metadata = TransformerCacheMetaData.create(
 			batch_size=2,
@@ -205,7 +205,7 @@ class TestTransformerCache:
 			num_heads=4,
 			head_dim=32,
 		)
-		cache = TransformerCache.init_layers_cache(
+		cache = TransformerCache.init_cache(
 			num_hidden_layers=num_layers,
 			metadata=metadata,
 		)
@@ -218,7 +218,7 @@ class TestTransformerCache:
 			assert view.layer_index == i
 			assert view.metadata == metadata
 
-	def test_init_layers_cache_with_custom_dtype_and_partition_spec(self):
+	def test_init_cache_with_custom_dtype_and_partition_spec(self):
 		num_layers = 2
 		metadata = TransformerCacheMetaData.create(
 			batch_size=1,
@@ -233,7 +233,7 @@ class TestTransformerCache:
 			None,
 			paxis.attention_dim_axis,
 		)
-		cache = TransformerCache.init_layers_cache(
+		cache = TransformerCache.init_cache(
 			num_hidden_layers=num_layers,
 			metadata=metadata,
 			dtype=jnp.float16,
@@ -261,7 +261,7 @@ class TestTransformerCache:
 			head_dim=32,
 		)
 
-		cache = TransformerCache.init_layers_cache(
+		cache = TransformerCache.init_cache(
 			num_hidden_layers=num_layers,
 			metadata=metadata,
 		)

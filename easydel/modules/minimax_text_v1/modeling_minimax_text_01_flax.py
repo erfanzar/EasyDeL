@@ -39,8 +39,15 @@ from easydel.infra.utils import (
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 )
-from easydel.layers.attention import FlaxAttentionModule, FlexibleAttentionModule
-from easydel.layers.caching import TransformerCache, TransformerCacheView
+from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
+from easydel.layers.caching import (
+	PagedAttentionCache,
+	PagedAttentionCacheView,
+	PagedAttentionMetadata,
+	TransformerCache,
+	TransformerCacheView,
+	TransformerMetadata,
+)
 from easydel.layers.linear import ParallelLinear
 from easydel.layers.norms import RMSNorm
 from easydel.layers.ops import _lightning_attention
@@ -217,8 +224,9 @@ class MiniMaxText01LightningAttention(nn.Module):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
-		causal_mask: chex.Array,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[chex.Array | bool],
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
@@ -259,7 +267,7 @@ class MiniMaxText01LightningAttention(nn.Module):
 		return (output, None)
 
 
-class MiniMaxText01Attention(FlaxAttentionModule):
+class MiniMaxText01Attention(AttentionModule):
 	def __init__(
 		self,
 		config: MiniMaxText01Config,
@@ -329,8 +337,9 @@ class MiniMaxText01Attention(FlaxAttentionModule):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
-		causal_mask: chex.Array,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[chex.Array | bool],
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
@@ -385,6 +394,8 @@ class MiniMaxText01Attention(FlaxAttentionModule):
 			key_states=key_states,
 			value_states=value_states,
 			bias=None,
+			cache_metadata=cache_metadata,
+			cache_view=cache_view,
 			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
 			segment_ids=segment_ids,
@@ -689,8 +700,9 @@ class MiniMaxText01DecoderLayer(nn.Module):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
-		causal_mask: chex.Array,
-		cache_view: tp.Optional[TransformerCacheView] = None,
+		causal_mask: tp.Optional[chex.Array | bool],
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 		output_router_logits: bool = False,
 		slope_rate: tp.Optional[float] = None,
@@ -821,7 +833,8 @@ class MiniMaxText01Model(EasyDeLBaseModule):
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		output_router_logits: tp.Optional[bool] = None,
@@ -866,6 +879,7 @@ class MiniMaxText01Model(EasyDeLBaseModule):
 				attention_mask=attention_mask,
 				position_ids=position_ids,
 				cache_view=past_key_values.views[idx],
+				cache_metadata=cache_metadata,
 				causal_mask=self.causal_mask,
 				output_attentions=output_attentions,
 				output_router_logits=output_router_logits,
@@ -955,7 +969,8 @@ class MiniMaxText01ForCausalLM(EasyDeLBaseModule):
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		output_router_logits: tp.Optional[bool] = None,
-		past_key_values: tp.Optional[TransformerCache] = None,
+		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
 	) -> MoeCausalLMOutput | tp.Tuple:
 		if output_router_logits is None:
