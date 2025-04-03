@@ -105,7 +105,8 @@ def main():
 	)
 	print("\n" + ("*" * 5))
 	print("TPS  :", response.tokens_pre_second)
-	print("Loss :", model.compute_loss(**inputs)[-1].loss)  # 21.4800
+	with model.mesh:
+		print("Loss :", model.compute_loss(**inputs)[-1].loss)  # 21.4800
 
 
 if __name__ == "__main__":
