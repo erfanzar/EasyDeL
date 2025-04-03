@@ -78,7 +78,7 @@ import jax.numpy as jnp
 
 # Complete configuration example
 model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
- "meta-llama/Llama-3.2-1B-Instruct",
+ "meta-llama/Llama-3.1-8B-instruct",
  platform=ed.EasyDeLPlatforms.TRITON,
  config_kwargs=ed.EasyDeLBaseConfigDict(
   attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2,
@@ -86,7 +86,9 @@ model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
   gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
  ),
  dtype=jnp.float16,
- auto_shard_model=True
+ param_dtype=jnp.float16,
+ auto_shard_model=True,
+ sharding_axis_dims=(1,1,-1,1) # Fully Tensor Parallel
 )
 ```
 
@@ -107,14 +109,14 @@ import jax.numpy as jnp
 
 # Initialize model
 model = ed.AutoEasyDeLModelForCausalLM.from_pretrained(
- "meta-llama/Llama-3.2-1B-Instruct",
+ "meta-llama/Llama-3.1-8B-instruct",
  dtype=jnp.float16,
  platform=ed.EasyDeLPlatforms.TRITON,
  auto_shard_model=True
 )
 
 # Setup tokenizer
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-instruct")
 tokenizer.pad_token_id = tokenizer.eos_token_id
 
 # Create inference engine
