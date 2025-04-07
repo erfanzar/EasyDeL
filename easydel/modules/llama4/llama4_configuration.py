@@ -76,16 +76,29 @@ class Llama4VisionConfig(EasyDeLBaseConfig):
 		super().__init__(**kwargs)
 
 	def get_partition_rules(self, *args, **kwargs):
-		"""Retrieves the combined partition rules from the text and vision configurations.
-
-		Args:
-		    *args: Positional arguments passed to the underlying config partition rule methods.
-		    **kwargs: Keyword arguments passed to the underlying config partition rule methods.
-
-		Returns:
-		    Tuple: Combined partition rules from both text and vision models.
 		"""
-		return ((".*", PartitionSpec(None)),)
+		Get the partition rules for the Llama4Vision model.
+		Returns:
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+		"""
+		return (
+			("patch_embedding/linear/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("class_embedding", PartitionSpec(None)),
+			("positional_embedding_vlm", PartitionSpec(None)),
+			("layernorm_pre/kernel", PartitionSpec(None)),
+			("layernorm_post/kernel", PartitionSpec(None)),
+			("model/layers/.*/self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("model/layers/.*/self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("model/layers/.*/self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("model/layers/.*/self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("model/layers/.*/mlp/fc1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("model/layers/.*/mlp/fc2/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("model/layers/.*/input_layernorm/kernel", PartitionSpec(None)),
+			("model/layers/.*/post_attention_layernorm/kernel", PartitionSpec(None)),
+			("vision_adapter/mlp/fc1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("vision_adapter/mlp/fc2/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			(".*", PartitionSpec(None)),
+		)
 
 
 @register_config("llama4_text")
@@ -193,16 +206,26 @@ class Llama4TextConfig(EasyDeLBaseConfig):
 		self.attention_chunk_size = attention_chunk_size
 
 	def get_partition_rules(self, *args, **kwargs):
-		"""Retrieves the combined partition rules from the text and vision configurations.
-
-		Args:
-		    *args: Positional arguments passed to the underlying config partition rule methods.
-		    **kwargs: Keyword arguments passed to the underlying config partition rule methods.
-
-		Returns:
-		    Tuple: Combined partition rules from both text and vision models.
 		"""
-		return ((".*", PartitionSpec(None)),)
+		Get the partition rules for the Llama4Text model.
+		Returns:
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+		"""
+		return (
+			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
+			("self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("input_layernorm/kernel", PartitionSpec(None)),
+			("post_attention_layernorm/kernel", PartitionSpec(None)),
+			("model/norm/kernel", PartitionSpec(None)),
+			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			(".*", PartitionSpec(None)),
+		)
 
 
 @register_config("llama4")
@@ -243,18 +266,20 @@ class Llama4Config(EasyDeLBaseConfig):
 		super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
 	def get_partition_rules(self, *args, **kwargs):
-		"""Retrieves the combined partition rules from the text and vision configurations.
-
-		Args:
-		    *args: Positional arguments passed to the underlying config partition rule methods.
-		    **kwargs: Keyword arguments passed to the underlying config partition rule methods.
-
-		Returns:
-		    Tuple: Combined partition rules from both text and vision models.
 		"""
-		tp = self.text_config.get_partition_rules(*args, **kwargs)
-		vp = self.vision_config.get_partition_rules(*args, **kwargs)
-		return tp + vp
+		Get the partition rules for the Llama4 model.
+		Returns:
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+		"""
+		text_rules = self.text_config.get_partition_rules(*args, **kwargs)
+		vision_rules = self.vision_config.get_partition_rules(*args, **kwargs)
+
+		# Add rules for the multi-modal projector
+		multimodal_rules = (
+			("multi_modal_projector/linear_1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+		)
+
+		return text_rules + vision_rules + multimodal_rules
 
 
 __all__ = ["Llama4Config", "Llama4TextConfig", "Llama4VisionConfig"]
