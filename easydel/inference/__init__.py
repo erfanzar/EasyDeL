@@ -12,16 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .utilities import SamplingParams
-
-# from .vengine import (
-# 	ContiguousSlotCacheManager,
-# 	vEngine,
-# 	vOrchestrator,
-# )
-ContiguousSlotCacheManager = None
-vEngine = None
-vOrchestrator = None
-
 from .vinference import (
 	vInference,
 	vInferenceApiServer,
@@ -35,9 +25,6 @@ from .vwhisper import (
 
 __all__ = (
 	"SamplingParams",
-	"ContiguousSlotCacheManager",
-	"vOrchestrator",
-	"vEngine",
 	"vInference",
 	"vInferenceApiServer",
 	"vInferenceConfig",

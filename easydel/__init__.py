@@ -94,14 +94,11 @@ if _check_bool_flag("EASYDEL_AUTO", True):
 _import_structure = {
 	"utils": ["traversals"],
 	"inference": [
-		"ContiguousSlotCacheManager",
 		"SamplingParams",
-		"vEngine",
 		"vInference",
 		"vInferenceApiServer",
 		"vInferenceConfig",
 		"vInferencePreCompileConfig",
-		"vOrchestrator",
 		"vWhisperInference",
 		"vWhisperInferenceConfig",
 	],
@@ -454,14 +451,11 @@ _import_structure = {
 if _tp.TYPE_CHECKING:
 	from . import utils
 	from .inference import (
-		ContiguousSlotCacheManager,
 		SamplingParams,
-		vEngine,
 		vInference,
 		vInferenceApiServer,
 		vInferenceConfig,
 		vInferencePreCompileConfig,
-		vOrchestrator,
 		vWhisperInference,
 		vWhisperInferenceConfig,
 	)
