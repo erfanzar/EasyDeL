@@ -25,6 +25,7 @@ Modules
    modules_grok_1
    modules_internlm2
    modules_llama
+   modules_llama4
    modules_llava
    modules_mamba
    modules_mamba2
@@ -43,6 +44,8 @@ Modules
    modules_qwen2
    modules_qwen2_moe
    modules_qwen2_vl
+   modules_qwen3
+   modules_qwen3_moe
    modules_roberta
    modules_rwkv
    modules_siglip
