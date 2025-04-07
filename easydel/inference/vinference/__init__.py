@@ -12,14 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ..utilities import vInferencePreCompileConfig, SamplingParams
-from .api_server import vInferenceApiServer
-from .vinference import vInference, vInferenceConfig
+from .api_server import (
+	ChatCompletionRequest,
+	ChatCompletionResponse,
+	ChatCompletionResponseChoice,
+	ChatCompletionStreamResponse,
+	ChatCompletionStreamResponseChoice,
+	ChatMessage,
+	CountTokenRequest,
+	vInferenceApiServer,
+	vInferenceChatCompletionClient,
+)
+from .utilities import SampleState, vInferenceConfig, vInferencePreCompileConfig
+from .vinference import vInference
 
 __all__ = (
-	"vInference",
-	"vInferenceConfig",
+	"ChatCompletionRequest",
+	"ChatCompletionResponse",
+	"ChatCompletionResponseChoice",
+	"ChatCompletionStreamResponse",
+	"ChatCompletionStreamResponseChoice",
+	"ChatMessage",
+	"CountTokenRequest",
 	"vInferenceApiServer",
+	"vInferenceChatCompletionClient",
+	"SampleState",
+	"vInferenceConfig",
 	"vInferencePreCompileConfig",
-	"SamplingParams",
+	"vInference",
 )

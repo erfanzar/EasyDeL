@@ -33,13 +33,19 @@ from jax.sharding import PartitionSpec
 @enum.unique
 class SpecialLossNormalizingFactor(enum.Enum):
 	"""
-	Specially calculated loss normalizing factors that are not constant.
+	Specifies special, dynamically calculated loss normalizing factors.
+
+	These enums are used in loss functions to indicate how the loss should be
+	normalized based on properties of the input batch, rather than using a fixed
+	constant.
 
 	Attributes:
-			NO_WEIGHT_NUM_REAL_TARGET_TOKENS: Divide the loss by the number of real (non-padding) tokens (wont calculate Weights).
-	    NUM_REAL_TARGET_TOKENS: Divide the loss by the number of real (non-padding) tokens.
-	    NUM_TOTAL_TARGET_TOKENS: Divide the loss by the total number of target tokens.
-	    AVERAGE_PER_SEQUENCE: Compute the average loss per sequence.
+	    NO_WEIGHT_NUM_REAL_TARGET_TOKENS: Divides the loss by the number of non-padding target tokens,
+	        ignoring any provided loss weights.
+	    NUM_REAL_TARGET_TOKENS: Divides the loss by the number of non-padding target tokens,
+	        considering provided loss weights.
+	    NUM_TOTAL_TARGET_TOKENS: Divides the loss by the total number of target tokens, including padding.
+	    AVERAGE_PER_SEQUENCE: Computes the average loss per sequence in the batch.
 	"""
 
 	NO_WEIGHT_NUM_REAL_TARGET_TOKENS = 0
@@ -53,6 +59,40 @@ FACTOR_TYPE = tp.Optional[tp.Union[float, int, str, SpecialLossNormalizingFactor
 
 @auto_pytree
 class LossConfig:
+	"""
+	Configuration class for customizing loss computation behavior.
+
+	Attributes:
+	    ignore_index (int): Specifies a target value that is ignored and does not contribute to the loss.
+	        Defaults to -100.
+	    label_smoothing (float): Amount of label smoothing to apply. 0.0 means no smoothing.
+	        Defaults to 0.0.
+	    z_loss (float): Coefficient for the z-loss regularization term, which encourages logits
+	        for non-target classes to be small. Defaults to 0.0.
+	    loss_normalizing_factor (FACTOR_TYPE): How to normalize the loss. Can be a constant float/int,
+	        a string representation of a `SpecialLossNormalizingFactor` enum, or the enum itself.
+	        Defaults to "NUM_REAL_TARGET_TOKENS".
+	    num_labels (tp.Optional[int]): The number of labels for classification tasks. Used in
+	        `ForSequenceClassificationLoss`. Defaults to None.
+	    problem_type (tp.Optional[str]): Specifies the problem type for sequence classification
+	        (e.g., "single_label_classification", "multi_label_classification").
+	        Defaults to None.
+	    divide_weight_sum (bool): If True, divides the loss by the sum of weights, in addition to
+	        the `loss_normalizing_factor`. Defaults to False.
+	    shift_tokens (bool): If True (typically for Causal LM), shifts the logits and labels
+	        so that the model predicts the next token. Defaults to True.
+	    break_on_nan (bool): If True, raises an `EasyDeLBreakRequest` if a NaN is encountered
+	        during loss computation. Defaults to True.
+	    reduction (tp.Optional[tp.Literal["none", "mean", "sum"]]): Specifies the reduction to apply
+	        to the loss. If None, the default reduction of the specific loss function is used.
+	        Defaults to None.
+	    num_classification_labels (tp.Optional[int]): Number of labels specifically for sequence
+	        classification. Alias for `num_labels`. Defaults to None.
+	    classification_problem_type (tp.Optional[tp.Literal["regression", "single_label_classification", "multi_label_classification"]]):
+	        Problem type specifically for sequence classification. Alias for `problem_type`.
+	        Defaults to None.
+	"""
+
 	ignore_index: int = -100
 	label_smoothing: float = 0.0
 	z_loss: float = 0.0
@@ -85,6 +125,24 @@ class LossConfig:
 
 @auto_pytree
 class LossMetrics:
+	"""
+	Container for various metrics related to loss computation and model training.
+
+	Attributes:
+	    loss (tp.Optional[tp.Union[float, chex.Array]]): The primary computed loss value.
+	    z_loss (tp.Optional[tp.Union[float, chex.Array]]): The computed z-loss regularization term.
+	    weight_sum (tp.Optional[tp.Union[float, chex.Array]]): The sum of weights used in the loss calculation.
+	    accuracy (tp.Optional[tp.Union[float, chex.Array]]): Computed accuracy, if applicable.
+	    learning_rate (tp.Optional[tp.Union[float, chex.Array]]): The learning rate used for the current step.
+	    max_grad_norm (tp.Optional[flax.struct.PyTreeNode]): The maximum gradient norm observed.
+	    mean_grad_norm (tp.Optional[flax.struct.PyTreeNode]): The mean gradient norm observed.
+	    grad_norms (tp.Optional[flax.struct.PyTreeNode]): A pytree containing the norms of gradients for each parameter.
+	    chosen_rewards (tp.Optional[jax.Array]): Rewards for the chosen sequence in preference-based tasks.
+	    rejected_rewards (tp.Optional[jax.Array]): Rewards for the rejected sequence in preference-based tasks.
+	    other_metrics (tp.Optional[tp.Mapping[str, jax.Array]]): A dictionary for any additional custom metrics.
+	    execution_time (tp.Optional[float]): Time taken for the computation step.
+	"""
+
 	loss: tp.Optional[tp.Union[float, chex.Array]] = None
 	z_loss: tp.Optional[tp.Union[float, chex.Array]] = None
 	weight_sum: tp.Optional[tp.Union[float, chex.Array]] = None
@@ -108,62 +166,71 @@ def dynamic_cross_entropy_loss(
 	label_smoothing: float = 0.0,
 ) -> tp.Tuple[jnp.ndarray, jnp.ndarray]:
 	"""
-	Cross entropy loss with support for masking, weights, and label smoothing.
+	Computes the cross-entropy loss with optional label smoothing and ignore index,
+	dynamically handling different reduction types.
 
 	Args:
-	    logits: Predicted logits (B, C) or (B, T, C)
-	    targets: Ground truth integer labels (B, ...) or probabilities (B, ..., C)
-	    weight: Optional per-class weights (C,)
-	    ignore_index: Value of tokens to ignore (only for integer targets)
-	    reduction: 'none', 'mean', or 'sum'
-	    label_smoothing: Smoothing factor between 0 and 1
+	    logits (jnp.ndarray): The predicted logits from the model (batch_size, ..., num_classes).
+	    targets (jnp.ndarray): The target labels (batch_size, ...).
+	    weight (tp.Optional[jnp.ndarray]): Optional weights for each element (batch_size, ...).
+	        Defaults to None.
+	    ignore_index (int): Index in the target labels to ignore. Defaults to -100.
+	    reduction (str): Specifies the reduction method: 'mean', 'sum', or 'none'.
+	        Defaults to "mean".
+	    label_smoothing (float): The amount of label smoothing to apply (0.0 means no smoothing).
+	        Defaults to 0.0.
 
 	Returns:
-	    Loss and accuracy (accuracy only valid for integer targets)
-	"""
-	if label_smoothing > 0:
-		num_classes = logits.shape[-1]
-		smooth_pos = 1.0 - label_smoothing
-		smooth_neg = label_smoothing / (num_classes - 1)
-		if targets.dtype in (jnp.int32, jnp.int64):
-			targets_one_hot = jax.nn.one_hot(targets, num_classes)
-			targets_one_hot = targets_one_hot * smooth_pos + smooth_neg
-		else:
-			targets_one_hot = targets * smooth_pos + smooth_neg
-	else:
-		if targets.dtype in (jnp.int32, jnp.int64):
-			targets_one_hot = jax.nn.one_hot(targets, logits.shape[-1])
-		else:
-			targets_one_hot = targets
-	if ignore_index is not None and targets.dtype in (jnp.int32, jnp.int64):
-		mask = targets != ignore_index
-	else:
-		mask = jnp.ones_like(targets[..., 0], dtype=bool)
+	    tp.Tuple[jnp.ndarray, jnp.ndarray]:
+	        - The computed loss (scalar if reduction is 'mean' or 'sum', array otherwise).
+	        - The normalization factor (sum of weights or count of non-ignored elements).
 
-	log_probs = jax.nn.log_softmax(logits, axis=-1)
-	losses = -jnp.sum(targets_one_hot * log_probs, axis=-1)
+	Raises:
+	    ValueError: If an invalid reduction method is specified.
+	"""
+	num_classes = logits.shape[-1]
+	targets = jax.nn.one_hot(targets, num_classes=num_classes)
+
+	if label_smoothing > 0.0:
+		targets = targets * (1.0 - label_smoothing) + label_smoothing / num_classes
+
+	loss = -jnp.sum(targets * jax.nn.log_softmax(logits, axis=-1), axis=-1)
+
+	# Create a mask for the ignore index
+	ignore_mask = targets[..., ignore_index] == 1
+
+	# Apply ignore_mask if ignore_index is used
+	if ignore_index >= 0:
+		loss = jnp.where(ignore_mask, 0.0, loss)
+
+	# Apply weights if provided
 	if weight is not None:
-		if targets.dtype in (jnp.int32, jnp.int64):
-			safe_targets = jnp.where(mask, targets, 0)
-			losses = losses * weight[safe_targets]
-		else:
-			losses = losses * jnp.sum(weight * targets_one_hot, axis=-1)
-	losses = losses * mask
-	if reduction == "sum":
-		losses = jnp.sum(losses)
-	elif reduction == "mean":
-		losses = jnp.sum(losses) / (jnp.sum(mask) + 1e-8)
-	if targets.dtype not in (jnp.int32, jnp.int64):
-		accuracy = jnp.array(0.0)
+		loss = loss * weight
+		# Adjust ignore_mask to consider weights as well
+		ignore_mask = ignore_mask | (weight == 0)
+
+	# Calculate the normalization factor (number of non-ignored elements or sum of weights)
+	if weight is None:
+		normalization_factor = jnp.sum(jnp.logical_not(ignore_mask))
 	else:
-		predictions = jnp.argmax(logits, axis=-1)
-		valid_mask = (
-			mask if ignore_index is not None else jnp.ones_like(targets, dtype=bool)
+		normalization_factor = jnp.sum(weight * jnp.logical_not(ignore_mask))
+
+	# Apply reduction
+	if reduction == "mean":
+		loss = jnp.sum(loss) / jnp.maximum(
+			normalization_factor, 1e-8
+		)  # Avoid division by zero
+	elif reduction == "sum":
+		loss = jnp.sum(loss)
+	elif reduction == "none":
+		# Keep the loss per element
+		pass
+	else:
+		raise ValueError(
+			f"Invalid reduction: {reduction}. Must be 'mean', 'sum', or 'none'."
 		)
-		correct = jnp.sum((predictions == targets) * valid_mask)
-		total = jnp.sum(valid_mask)
-		accuracy = correct / (total + 1e-8)
-	return losses, accuracy
+
+	return loss, normalization_factor
 
 
 def sigmoid_cross_entropy_with_logits(
@@ -174,67 +241,60 @@ def sigmoid_cross_entropy_with_logits(
 	axis: tp.Optional[tp.Union[int, tuple]] = None,
 ) -> jnp.ndarray:
 	"""
-	Computes sigmoid cross entropy given logits and labels.
+	Computes sigmoid cross-entropy loss between logits and labels.
+
+	Measures the probability error in discrete classification tasks in which each
+	class is independent and not mutually exclusive. For instance, one could
+	perform multilabel classification where a picture can contain both an elephant
+	and a dog at the same time.
 
 	Args:
-	    logits: Input tensor
-	    labels: Target tensor with the same shape as logits
-	    weights: tp.Optional weights to apply to the loss
-	    label_smoothing: Float in [0, 1]. Amount of smoothing to apply to labels
-	    axis: The dimensions to reduce. If None, reduces all dimensions.
+	    logits: The predicted logits from the model.
+	    labels: The target labels.
+	    weights (tp.Optional[jnp.ndarray]): Optional weights for the loss computation.
+	        Defaults to None.
+	    label_smoothing (float): Amount of label smoothing to apply (0.0 means no smoothing).
+	        Defaults to 0.0.
+	    axis (tp.Optional[tp.Union[int, tuple]]): The axis or axes along which to compute the mean.
+	        If None, the mean is computed over all elements. Defaults to None.
 
 	Returns:
-	    Sigmoid cross entropy loss, reduced according to axis if specified
+	    jnp.ndarray: The computed sigmoid cross-entropy loss.
 	"""
-	# Input validation
-	if logits.shape != labels.shape:
-		raise ValueError(
-			f"Logits shape {logits.shape} must match labels shape {labels.shape}"
-		)
-
-	if label_smoothing < 0 or label_smoothing > 1:
-		raise ValueError(f"Label smoothing must be in [0, 1], got {label_smoothing}")
-
-	# Apply label smoothing if specified
-	if label_smoothing > 0:
+	if label_smoothing > 0.0:
 		labels = labels * (1.0 - label_smoothing) + 0.5 * label_smoothing
 
-	# Compute stable sigmoid cross entropy
-	zeros = jnp.zeros_like(logits)
-	cond = logits >= zeros
-	relu_logits = jnp.where(cond, logits, zeros)
-	neg_abs_logits = jnp.where(cond, -logits, logits)
+	log_p = jax.nn.log_sigmoid(logits)
+	log_not_p = jax.nn.log_sigmoid(-logits)
+	loss = -labels * log_p - (1.0 - labels) * log_not_p
 
-	loss = relu_logits - logits * labels + jnp.log1p(jnp.exp(neg_abs_logits))
-
-	# Apply weights if specified
 	if weights is not None:
-		loss = loss * weights
+		loss *= weights
 
-	# Reduce if axis is specified
-	if axis is not None:
-		loss = jnp.mean(loss, axis=axis)
-
-	return loss
+	if axis is None:
+		return jnp.mean(loss)
+	else:
+		return jnp.mean(loss, axis=axis)
 
 
 def onehot(labels, num_classes, on_value=1.0, off_value=0.0):
-	"""Create a dense one-hot version of an indexed array.
-
-	NB: consider using the more standard ``jax.nn.one_hot`` instead.
+	"""
+	Creates one-hot encoded versions of integer labels.
 
 	Args:
-	  labels: an n-dim JAX array whose last dimension contains integer indices.
-	  num_classes: the maximum possible index.
-	  on_value: the "on" value for the one-hot array, defaults to 1.0.
-	  off_value: the "off" value for the one-hot array, defaults to 0.0.
+	    labels (jnp.ndarray): An array of integer labels.
+	    num_classes (int): The total number of classes.
+	    on_value (float): The value to use for the "on" state (corresponding to the label).
+	        Defaults to 1.0.
+	    off_value (float): The value to use for the "off" states.
+	        Defaults to 0.0.
+
 	Returns:
-	  A (n+1)-dim array whose last dimension contains one-hot vectors of length
-	  num_classes.
+	    jnp.ndarray: The one-hot encoded array with shape `labels.shape + (num_classes,)`.
 	"""
-	x = labels[..., None] == jnp.arange(num_classes).reshape((1,) * labels.ndim + (-1,))
-	x = lax.select(x, jnp.full(x.shape, on_value), jnp.full(x.shape, off_value))
-	return x.astype(jnp.float32)
+	x = lax.eq(labels[..., None], jnp.arange(num_classes)[(None,) * labels.ndim])
+	y = lax.select(x, jnp.full(x.shape, on_value), jnp.full(x.shape, off_value))
+	return y.astype(jnp.float32)
 
 
 @jax.custom_vjp
@@ -244,26 +304,29 @@ def cross_entropy_with_logits(
 	z_loss: float,
 ) -> tp.Tuple[chex.Array, chex.Array]:
 	"""
-	Computes cross-entropy loss with a stable custom gradient and z-loss.
+	Computes cross-entropy loss with potential z-loss regularization.
 
-	This function computes the cross-entropy loss with an optional auxiliary loss
-	term (`z_loss`) to prevent logits from drifting too far from zero.
+	This function calculates the standard cross-entropy loss between logits and targets.
+	It also includes an optional z-loss term, which penalizes large logits for non-target
+	classes, encouraging the model to be less confident in incorrect predictions.
+	A custom VJP (vector-Jacobian product) is defined for efficient gradient computation.
 
 	Args:
-	    logits: The predicted logits.
-	    targets: The one-hot encoded target labels.
-	    z_loss: Coefficient for the auxiliary z-loss term.
+	    logits (chex.Array): The predicted logits from the model (batch_size, ..., num_classes).
+	    targets (chex.Array): The target labels, typically one-hot encoded (batch_size, ..., num_classes).
+	    z_loss (float): The coefficient for the z-loss regularization. If 0, z-loss is not computed.
 
 	Returns:
-	    A tuple containing the total loss and the z_loss.
+	    tp.Tuple[chex.Array, chex.Array]:
+	        - loss: The cross-entropy loss for each example (batch_size, ...).
+	        - z_loss: The z-loss value for each example (batch_size, ...). Returns zero if `z_loss` coeff is 0.
 	"""
 	logits_sum = jax.scipy.special.logsumexp(logits, axis=-1, keepdims=True)
 	log_softmax = logits - logits_sum
 	loss = -jnp.sum(targets * log_softmax, axis=-1)
-
-	log_z = jnp.squeeze(logits_sum, axis=-1)
+	# Calculate the z-loss
+	log_z = jax.scipy.special.logsumexp(logits, axis=-1)
 	total_z_loss = z_loss * jax.lax.square(log_z)
-	loss += total_z_loss
 	return loss, total_z_loss
 
 
@@ -286,14 +349,19 @@ def _cross_entropy_with_logits_fwd(
 		chex.Array,
 	],
 ]:
-	"""Forward-mode of `cross_entropy_with_logits`."""
-	max_logit = logits.max(axis=-1, keepdims=True)
+	"""
+	Forward pass for cross_entropy_with_logits VJP.
+	Calculates the loss and intermediates needed for the backward pass.
+	"""
+	max_logit = jnp.max(logits, axis=-1, keepdims=True)
 	shifted = logits - max_logit
 	exp_shifted = jnp.exp(shifted)
-	sum_exp = jnp.sum(exp_shifted, axis=-1, keepdims=True)
-	log_softmax = shifted - jnp.log(sum_exp)
+	sum_exp = jnp.sum(exp_shifted, axis=-1)
+	log_sum_exp = jnp.log(sum_exp)
+	log_softmax = shifted - log_sum_exp[:, None]
 	loss = -jnp.sum(targets * log_softmax, axis=-1)
 
+	# Calculate the z-loss and its components for backward pass
 	log_z = jnp.squeeze(jnp.log(sum_exp) + max_logit, axis=-1)
 	total_z_loss = z_loss * jax.lax.square(log_z)
 	loss += total_z_loss
@@ -575,78 +643,128 @@ def auxiliary_load_balancing_loss_func(
 	num_experts: int,
 	top_k: int,
 	attention_mask: tp.Optional[chex.Array] = None,
-) -> chex.Array:
-	"""
-	Computes auxiliary load balancing loss as in Switch Transformer.
+) -> tp.Union[jax.Array, int]:
+	r"""
+	Computes auxiliary load balancing loss as in Switch Transformer - implemented in JAX.
 
-	See Switch Transformer (https://arxiv.org/abs/2101.03961)
+	See Switch Transformer (https://arxiv.org/abs/2101.03961) for more details. This function implements the loss
+	function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
+	experts is too unbalanced.
 
 	Args:
-	    gate_logits: The logits for the gating network, either as a single array
-	        or tuple of arrays.
-	    num_experts: The number of experts.
-	    top_k: The number of experts to select.
-	    attention_mask: An optional attention mask.
+			gate_logits:
+					Logits from the `gate`. Should be a tuple/list of JAX arrays,
+					with each array corresponding to a layer and having shape
+					[batch_size * sequence_length, num_experts].
+					Alternatively, can be a single stacked array of shape
+					[num_layers * batch_size * sequence_length, num_experts].
+			num_experts:
+					Number of experts. Must be provided if `gate_logits` is not None.
+			top_k:
+					The number of experts to route per-token, can be also interpreted as the `top-k` routing
+					parameter.
+			attention_mask (`jax.numpy.ndarray`, *optional*):
+					The attention_mask used in forward function
+					shape [batch_size, sequence_length] if not None.
 
 	Returns:
-	    The auxiliary load balancing loss as a scalar array.
-
-	Raises:
-	    ValueError: If num_experts or top_k are invalid.
+			The auxiliary loss as a JAX scalar array, or 0 if gate_logits is None.
 	"""
-	# Input validation
-	if num_experts < 1:
-		raise ValueError(f"num_experts must be positive, got {num_experts}")
-	if top_k < 1 or top_k > num_experts:
-		raise ValueError(f"top_k must be between 1 and num_experts, got {top_k}")
-
-	# Handle empty or invalid input
 	if gate_logits is None:
-		return jnp.array(0.0, dtype=jnp.float32)
+		return 0
+	if num_experts is None:
+		raise ValueError("num_experts must be specified if gate_logits is provided.")
 
-	# Convert tuple of logits to single array
-	if isinstance(gate_logits, tuple):
-		concatenated_gate_logits = jnp.concatenate(gate_logits, axis=0)
-	else:
+	# If gate_logits is a tuple or list, concatenate them.
+	# Assumes individual layer logits are already on the correct device.
+	if isinstance(gate_logits, (tuple, list)):
+		# Ensure all logits are JAX arrays before concatenation
+		gate_logits_list = [
+			jnp.asarray(layer_gate.reshape(-1, num_experts)) for layer_gate in gate_logits
+		]
+		concatenated_gate_logits = jnp.concatenate(gate_logits_list, axis=0)
+	elif isinstance(gate_logits, jnp.ndarray):
 		concatenated_gate_logits = gate_logits
+	else:
+		raise TypeError(
+			f"gate_logits must be a JAX array, tuple/list of JAX arrays, or None. Got {type(gate_logits)}"
+		)
 
-	# Compute routing weights with improved numerical stability
 	routing_weights = jax.nn.softmax(concatenated_gate_logits, axis=-1)
-
-	# Get top-k expert selections
-	_, selected_experts = jax.lax.top_k(routing_weights, top_k)
-	expert_mask = jax.nn.one_hot(selected_experts, num_experts)
+	_, selected_experts = jax.lax.top_k(routing_weights, k=top_k)
+	expert_mask = jax.nn.one_hot(
+		selected_experts, num_classes=num_experts, dtype=jnp.float32
+	)
 
 	if attention_mask is None:
-		# Compute mean utilization per expert
-		tokens_per_expert = jnp.mean(expert_mask.astype(jnp.float32), axis=0)
+		tokens_per_expert = jnp.mean(expert_mask, axis=0)
 		router_prob_per_expert = jnp.mean(routing_weights, axis=0)
 	else:
-		# Handle masked version
+		attention_mask = jnp.asarray(attention_mask)
+		if attention_mask.ndim != 2:
+			raise ValueError(
+				f"attention_mask must have shape [batch_size, sequence_length], got {attention_mask.shape}"
+			)
+
 		batch_size, sequence_length = attention_mask.shape
-		num_hidden_layers = concatenated_gate_logits.shape[0] // (
-			batch_size * sequence_length
+		total_tokens_per_layer = batch_size * sequence_length
+		num_effective_tokens = concatenated_gate_logits.shape[0]
+
+		if num_effective_tokens % total_tokens_per_layer != 0:
+			raise ValueError(
+				f"Total tokens in gate_logits ({num_effective_tokens}) is not divisible by "
+				f"batch_size*sequence_length ({total_tokens_per_layer}). Ensure gate_logits are correctly concatenated."
+			)
+
+		num_hidden_layers = num_effective_tokens // total_tokens_per_layer
+		mask_expanded = jnp.expand_dims(attention_mask, axis=(0, 3, 4))
+		target_mask_shape = (
+			num_hidden_layers,
+			batch_size,
+			sequence_length,
+			top_k,
+			num_experts,
+		)
+		expert_attention_mask_broadcast = jnp.broadcast_to(mask_expanded, target_mask_shape)
+		expert_attention_mask = jnp.reshape(
+			expert_attention_mask_broadcast, (-1, top_k, num_experts)
+		)
+		masked_expert_contributions = expert_mask * expert_attention_mask
+		tokens_per_expert_numerator = jnp.sum(masked_expert_contributions, axis=0)
+		tokens_per_expert_denominator = jnp.sum(expert_attention_mask, axis=0)
+		tokens_per_expert_denominator = jnp.where(
+			tokens_per_expert_denominator == 0, 1.0, tokens_per_expert_denominator
+		)
+		tokens_per_expert = tokens_per_expert_numerator / tokens_per_expert_denominator
+		mask_expanded_router = jnp.expand_dims(attention_mask, axis=(0, 3))
+
+		target_router_mask_shape = (
+			num_hidden_layers,
+			batch_size,
+			sequence_length,
+			num_experts,
+		)
+		router_attention_mask_broadcast = jnp.broadcast_to(
+			mask_expanded_router, target_router_mask_shape
+		)
+		router_per_expert_attention_mask = jnp.reshape(
+			router_attention_mask_broadcast, (-1, num_experts)
 		)
 
-		expert_attention_mask = jnp.broadcast_to(
-			attention_mask[jnp.newaxis, :, :, jnp.newaxis],
-			(num_hidden_layers, batch_size, sequence_length, top_k),
-		)
+		masked_routing_weights = routing_weights * router_per_expert_attention_mask
 
-		# Compute masked means
-		mask_sum = jnp.sum(attention_mask) + 1e-8  # Avoid division by zero
-		tokens_per_expert = (
-			jnp.sum(expert_mask * expert_attention_mask[..., jnp.newaxis], axis=(0, 1, 2))
-			/ mask_sum
+		router_prob_numerator = jnp.sum(masked_routing_weights, axis=0)
+		router_prob_denominator = jnp.sum(router_per_expert_attention_mask, axis=0)
+		router_prob_denominator = jnp.where(
+			router_prob_denominator == 0, 1.0, router_prob_denominator
 		)
-		router_prob_per_expert = (
-			jnp.sum(routing_weights * attention_mask[..., jnp.newaxis], axis=(0, 1))
-			/ mask_sum
-		)
+		router_prob_per_expert = router_prob_numerator / router_prob_denominator
+	router_prob_per_expert_expanded = jnp.expand_dims(router_prob_per_expert, axis=0)
+	per_expert_loss_terms = tokens_per_expert * router_prob_per_expert_expanded
+	overall_loss = jnp.sum(per_expert_loss_terms)
+	final_loss = overall_loss * num_experts
 
-	# Compute load balancing loss
-	aux_loss = jnp.sum(tokens_per_expert * router_prob_per_expert) * num_experts
-	return aux_loss
+	return jnp.asarray(final_loss, dtype=jnp.float32)
 
 
 def fixed_cross_entropy(

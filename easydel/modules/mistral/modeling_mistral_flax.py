@@ -353,6 +353,18 @@ class MistralDecoderLayer(nn.Module):
 	model_type="mistral",
 )
 class MistralModel(EasyDeLBaseModule):
+	"""Mistral model implementation.
+
+	This implements the Mistral language model architecture, utilizing transformer blocks
+	with RMSNorm, sliding window attention, and rotary position embeddings.
+
+	Attributes:
+		config (MistralConfig): Configuration for the model.
+		dtype (jnp.dtype): Data type for computations.
+		param_dtype (jnp.dtype): Data type for parameters.
+		precision: Precision setting for JAX operations.
+	"""
+
 	def __init__(
 		self,
 		config: MistralConfig,
@@ -409,6 +421,23 @@ class MistralModel(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
 	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+		"""Forward pass through the Mistral model.
+
+		Args:
+			input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
+			inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
+			attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
+			position_ids (chex.Array, optional): Indices of positions of each input sequence token.
+			segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
+			past_key_values (TransformerCache | PagedAttentionCache, optional): Cache containing precomputed key/value states.
+			cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling.
+			output_attentions (bool, optional): Whether to return attention weights.
+			output_hidden_states (bool, optional): Whether to return hidden states of all layers.
+			return_dict (bool, optional): Whether to return a model output object or a tuple.
+
+		Returns:
+			Union[BaseModelOutput, Tuple]: Model outputs (last hidden state, optional hidden states, optional attentions)
+		"""
 		all_attentions = () if output_attentions else None
 		all_hidden_states = () if output_hidden_states else None
 
@@ -485,6 +514,18 @@ class MistralModel(EasyDeLBaseModule):
 	model_type="mistral",
 )
 class MistralForCausalLM(EasyDeLBaseModule):
+	"""Mistral model with a language modeling head for causal language modeling tasks.
+
+	This model is a transformer-based language model with sliding window attention
+	applied to perform autoregressive language generation.
+
+	Attributes:
+		config (MistralConfig): Configuration for the model.
+		dtype (jnp.dtype): Data type for computations.
+		param_dtype (jnp.dtype): Data type for parameters.
+		precision: Precision setting for JAX operations.
+	"""
+
 	def __init__(
 		self,
 		config: MistralConfig,
@@ -534,6 +575,23 @@ class MistralForCausalLM(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
 	) -> tp.Union[CausalLMOutput, tp.Tuple]:
+		"""Forward pass through the Mistral model for causal language modeling.
+
+		Args:
+			input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
+			inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
+			attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
+			position_ids (chex.Array, optional): Indices of positions of each input sequence token.
+			segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
+			past_key_values (TransformerCache | PagedAttentionCache, optional): Cache containing precomputed key/value states.
+			cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling.
+			output_attentions (bool, optional): Whether to return attention weights.
+			output_hidden_states (bool, optional): Whether to return hidden states of all layers.
+			return_dict (bool, optional): Whether to return a model output object or a tuple.
+
+		Returns:
+			Union[CausalLMOutput, Tuple]: Model outputs (logits, optional hidden states, optional attentions)
+		"""
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
@@ -575,6 +633,18 @@ class MistralForCausalLM(EasyDeLBaseModule):
 	model_type="mistral",
 )
 class MistralForSequenceClassification(EasyDeLBaseModule):
+	"""Mistral model for sequence classification tasks.
+
+	This class extends the base Mistral model by adding a linear classification head
+	to perform sequence classification tasks such as sentiment analysis or text classification.
+
+	Attributes:
+		config (MistralConfig): Configuration for the model.
+		dtype (jnp.dtype): Data type for computations.
+		param_dtype (jnp.dtype): Data type for parameters.
+		precision: Precision setting for JAX operations.
+	"""
+
 	def __init__(
 		self,
 		config: MistralConfig,
@@ -625,11 +695,32 @@ class MistralForSequenceClassification(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
 	) -> tp.Union[SequenceClassifierOutput, tp.Tuple]:
+		"""Forward pass through the Mistral model for sequence classification.
+
+		This method processes input sequences through the Mistral model and applies
+		a classification head to the output.
+
+		Args:
+			input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
+			inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
+			attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
+			position_ids (chex.Array, optional): Indices of positions of each input sequence token.
+			segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
+			past_key_values (TransformerCache | PagedAttentionCache, optional): Cache containing precomputed key/value states.
+			cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling.
+			output_attentions (bool, optional): Whether to return attention weights.
+			output_hidden_states (bool, optional): Whether to return hidden states of all layers.
+			return_dict (bool, optional): Whether to return a model output object or a tuple.
+
+		Returns:
+			Union[SequenceClassifierOutput, Tuple]: Classification outputs including logits and optional model outputs
+		"""
 		transformer_outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,

@@ -120,6 +120,37 @@ class InternLM2Config(EasyDeLBaseConfig):
 		scan_layers: bool = False,
 		**kwargs,
 	):
+		"""Initializes an InternLM2Config object.
+
+		Args:
+		    vocab_size (int, optional): Vocabulary size. Defaults to 103168.
+		    hidden_size (int, optional): Hidden size. Defaults to 4096.
+		    intermediate_size (int, optional): Intermediate size of the feed-forward network. Defaults to 11008.
+		    num_hidden_layers (int, optional): Number of hidden layers. Defaults to 32.
+		    num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
+		    num_key_value_heads (int, optional): Number of key/value heads (for GQA). Defaults to None (uses num_attention_heads).
+		    hidden_act (str, optional): Activation function. Defaults to "silu".
+		    max_position_embeddings (int, optional): Maximum sequence length. Defaults to 2048.
+		    initializer_range (float, optional): Initializer range. Defaults to 0.02.
+		    rms_norm_eps (float, optional): Epsilon for RMS normalization. Defaults to 1e-6.
+		    use_cache (bool, optional): Whether to use KV cache. Defaults to True.
+		    pad_token_id (int, optional): Padding token ID. Defaults to 0.
+		    bos_token_id (int, optional): Beginning-of-sequence token ID. Defaults to 1.
+		    eos_token_id (int, optional): End-of-sequence token ID. Defaults to 2.
+		    pretraining_tp (int, optional): Tensor parallelism degree during pretraining. Defaults to 1.
+		    tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
+		    bias (bool, optional): Whether to use bias in linear layers. Defaults to True.
+		    rope_theta (float, optional): Base value for RoPE. Defaults to 10000.
+		    rope_scaling (dict, optional): RoPE scaling configuration. Defaults to None.
+		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
+		        Defaults to EasyDeLGradientCheckPointers.NONE.
+		    fcm_min_ratio (float, optional): Minimum ratio for Flash Attention. Defaults to -1.
+		    fcm_max_ratio (float, optional): Maximum ratio for Flash Attention. Defaults to -1.
+		    scan_mlp_chunk_size (int, optional): Chunk size for scan MLP. Defaults to 1024.
+		    bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
+		    scan_layers (bool, optional): Whether to use scan for layers. Defaults to False.
+		    **kwargs: Additional keyword arguments.
+		"""
 		num_key_value_heads = num_key_value_heads or num_attention_heads
 		self.num_key_value_heads = num_key_value_heads
 		self.vocab_size = vocab_size
@@ -155,9 +186,16 @@ class InternLM2Config(EasyDeLBaseConfig):
 
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model.
+		Get the partition rules for the model. This method defines how the model's parameters are
+		partitioned across devices for distributed training and inference.
+
+		Args:
+		    *args: Additional positional arguments (unused).
+		    **kwargs: Additional keyword arguments (unused).
+
 		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: A tuple of partition rules, where each rule is a tuple
+		        containing a regex pattern for parameter names and the corresponding `PartitionSpec`.
 		"""
 		return (
 			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
@@ -187,23 +225,23 @@ class InternLM2Config(EasyDeLBaseConfig):
 		scan_layers: bool = True,
 		**kwargs,
 	):
-		"""The attach_custom_arguments function adds the following arguments to the Transformer class:
+		"""Attaches custom arguments to the configuration object.
+
+		This method allows adding or overriding configuration attributes dynamically.
+		It iterates through the provided arguments and sets them as attributes
+		of the configuration object.
 
 		Args:
-		    tie_word_embeddings: bool: Tie the word embeddings to the
-		        decoder
-		    gradient_checkpointing: str: Control the amount of memory
-		        used by jax
-		    fcm_min_ratio: float: Control the minimum ratio of the
-		        number of chunks to be used in flash-based computation
-		    fcm_max_ratio: float: Set the maximum ratio of the number of
-		        input tokens to output tokens
-		    bits: tp.Optional[int]: Determine the number of bits used in
-		        the quantization
-		    rope_theta: float : rope_theta for compute rope
-		    hidden_act: str : hidden_act for mlp
-		    scan_layers: bool: Determine whether to use scan layers or
-		        not
+		    tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
+		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
+		        Defaults to EasyDeLGradientCheckPointers.NONE.
+		    fcm_min_ratio (float, optional): Minimum ratio for Flash Attention. Defaults to 0.0.
+		    fcm_max_ratio (float, optional): Maximum ratio for Flash Attention. Defaults to 0.0.
+		    bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
+		    rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
+		    hidden_act (str, optional): Activation function. Defaults to "silu".
+		    scan_layers (bool, optional): Whether to use scan layers. Defaults to True.
+		    **kwargs: Additional keyword arguments (ignored in this implementation).
 		"""
 		self.scan_layers = scan_layers
 		self.rope_theta = rope_theta
@@ -216,14 +254,32 @@ class InternLM2Config(EasyDeLBaseConfig):
 
 	@staticmethod
 	def get_weight_decay_exclusions():
+		"""Returns a tuple of parameter names for which weight decay should be excluded.
+
+		Returns:
+		    tuple: An empty tuple, indicating no specific weight decay exclusions for this model.
+		"""
 		return tuple()
 
 	@staticmethod
 	def rng_keys():
+		"""Returns the names of the random number generator keys used by the model.
+
+		Returns:
+		    tuple: A tuple containing "params", "dropout", and "fcm" as the RNG keys.
+		"""
 		return "params", "dropout", "fcm"
 
 	@property
 	def granted_freq_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size specifically for frequency-based position embeddings.
+
+		If `freq_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
+		`max_position_embeddings`.
+
+		Returns:
+		    int: The granted maximum position embedding size for frequency encoding.
+		"""
 		return getattr(
 			self,
 			"freq_max_position_embeddings",
@@ -232,6 +288,14 @@ class InternLM2Config(EasyDeLBaseConfig):
 
 	@property
 	def granted_mask_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size specifically for mask-based position embeddings.
+
+		If `mask_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
+		`max_position_embeddings`.
+
+		Returns:
+		    int: The granted maximum position embedding size for mask encoding.
+		"""
 		return getattr(
 			self,
 			"mask_max_position_embeddings",

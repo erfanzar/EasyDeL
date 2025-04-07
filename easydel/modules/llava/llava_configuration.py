@@ -119,6 +119,21 @@ class LlavaConfig(EasyDeLBaseConfig):
 		super().__init__(**kwargs)
 
 	def get_partition_rules(self, *args, **kwargs):
+		"""
+		Get the partition rules for distributed training by combining the partition rules
+		from both the text and vision configurations.
+
+		This method retrieves the partition rules from the text_config and vision_config
+		components and combines them to create a comprehensive set of rules for the entire
+		multimodal model.
+
+		Args:
+		    *args: Variable length argument list to be passed to the text and vision configs.
+		    **kwargs: Arbitrary keyword arguments to be passed to the text and vision configs.
+
+		Returns:
+		    tuple: A combined tuple of partition rules from both text and vision configurations.
+		"""
 		tp = self.text_config.get_partition_rules(*args, **kwargs)
 		vp = self.vision_config.get_partition_rules(*args, **kwargs)
 		return tp + vp

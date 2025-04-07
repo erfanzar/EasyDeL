@@ -153,6 +153,50 @@ class WhisperConfig(EasyDeLBaseConfig):
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	):
+		"""Initializes the WhisperConfig object.
+
+		Args:
+		    vocab_size (int): Vocabulary size.
+		    num_mel_bins (int): Number of Mel frequency bins.
+		    encoder_layers (int): Number of encoder layers.
+		    encoder_attention_heads (int): Number of encoder attention heads.
+		    decoder_layers (int): Number of decoder layers.
+		    decoder_attention_heads (int): Number of decoder attention heads.
+		    decoder_ffn_dim (int): Dimensionality of the decoder FFN.
+		    encoder_ffn_dim (int): Dimensionality of the encoder FFN.
+		    encoder_layerdrop (float): Dropout probability for encoder layers.
+		    decoder_layerdrop (float): Dropout probability for decoder layers.
+		    decoder_start_token_id (int): Decoder start token ID.
+		    use_cache (bool): Whether to use KV cache.
+		    is_encoder_decoder (bool): Whether the model is an encoder-decoder.
+		    activation_function (str): Activation function name.
+		    d_model (int): Dimensionality of the model.
+		    dropout (float): Dropout probability.
+		    attention_dropout (float): Attention dropout probability.
+		    activation_dropout (float): Activation dropout probability.
+		    init_std (float): Standard deviation for initialization.
+		    scale_embedding (bool): Whether to scale embeddings.
+		    max_source_positions (int): Maximum source sequence length.
+		    max_target_positions (int): Maximum target sequence length.
+		    pad_token_id (int): Padding token ID.
+		    bos_token_id (int): Beginning of sequence token ID.
+		    eos_token_id (int): End of sequence token ID.
+		    suppress_tokens (list[int], optional): List of tokens to suppress.
+		    begin_suppress_tokens (list[int]): List of tokens to suppress at the beginning.
+		    use_weighted_layer_sum (bool): Whether to use weighted layer sum.
+		    classifier_proj_size (int): Projection size for classification.
+		    apply_spec_augment (bool): Whether to apply SpecAugment.
+		    mask_time_prob (float): Probability for time masking in SpecAugment.
+		    mask_time_length (int): Length for time masking in SpecAugment.
+		    mask_time_min_masks (int): Minimum number of time masks in SpecAugment.
+		    mask_feature_prob (float): Probability for feature masking in SpecAugment.
+		    mask_feature_length (int): Length for feature masking in SpecAugment.
+		    mask_feature_min_masks (int): Minimum number of feature masks in SpecAugment.
+		    median_filter_width (int): Width for median filtering.
+		    bits (tp.Optional[int]): Quantization bits.
+		    gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing strategy.
+		    **kwargs: Additional keyword arguments.
+		"""
 		self.vocab_size = vocab_size
 		self.num_mel_bins = num_mel_bins
 		self.d_model = d_model
@@ -204,6 +248,11 @@ class WhisperConfig(EasyDeLBaseConfig):
 		)
 
 	def get_partition_rules(self, *args, **kwargs):
+		"""Returns the partition rules for the Whisper model. Arguments are ignored.
+
+		Returns:
+		    tuple: Partition rules.
+		"""
 		return (
 			# Embeddings
 			(

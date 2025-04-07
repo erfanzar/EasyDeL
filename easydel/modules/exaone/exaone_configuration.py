@@ -112,6 +112,34 @@ class ExaoneConfig(EasyDeLBaseConfig):
 		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
+		"""Initialize a new ExaoneConfig instance.
+
+		Args:
+			vocab_size (int, optional): Size of the vocabulary. Defaults to 102400.
+			hidden_size (int, optional): Dimensionality of the embeddings and hidden states. Defaults to 2048.
+			intermediate_size (int, optional): Dimensionality of the intermediate feed-forward layer. Defaults to 14336.
+			num_layers (int, optional): Number of hidden layers in the model. Defaults to 32.
+			num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
+			num_key_value_heads (int, optional): Number of key/value heads (for GQA). Defaults to 8.
+			activation_function (str, optional): Activation function to use. Defaults to "silu".
+			max_position_embeddings (int, optional): Maximum sequence length. Defaults to 2048.
+			initializer_range (float, optional): Range for weight initialization. Defaults to 0.02.
+			layer_norm_epsilon (float, optional): Epsilon for layer normalization. Defaults to 1e-5.
+			use_cache (bool, optional): Whether to use KV cache for generation. Defaults to True.
+			embed_dropout (float, optional): Dropout probability for embeddings. Defaults to 0.0.
+			pad_token_id (Optional[int], optional): ID for padding token. Defaults to None.
+			bos_token_id (int, optional): ID for beginning of sequence token. Defaults to 1.
+			eos_token_id (int, optional): ID for end of sequence token. Defaults to 2.
+			tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
+			rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
+			rope_scaling (Dict[str, Union[str, float]], optional): RoPE scaling configuration. Defaults to None.
+			gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
+			attention_dropout (float, optional): Dropout probability for attention. Defaults to 0.0.
+			use_scan_mlp (bool, optional): Whether to use scan for MLP computation. Defaults to False.
+			scan_mlp_chunk_size (int, optional): Chunk size for scan MLP. Defaults to 1024.
+			bits (Optional[int], optional): Quantization bits. Defaults to None.
+			**kwargs: Additional keyword arguments.
+		"""
 		self.vocab_size = vocab_size
 		self.max_position_embeddings = max_position_embeddings
 		self.hidden_size = hidden_size
@@ -214,14 +242,29 @@ class ExaoneConfig(EasyDeLBaseConfig):
 
 	@staticmethod
 	def get_weight_decay_exclusions():
+		"""Returns a tuple of parameter names for which weight decay should be excluded.
+
+		Returns:
+			tuple: An empty tuple, indicating no weight decay exclusions.
+		"""
 		return tuple()
 
 	@staticmethod
 	def rng_keys():
+		"""Returns the names of the random number generator keys used by the model.
+
+		Returns:
+			tuple: A tuple containing "params", "dropout", and "fcm" as the RNG keys.
+		"""
 		return "params", "dropout", "fcm"
 
 	@property
 	def granted_freq_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size for frequency-based position embeddings.
+
+		Returns:
+			int: The maximum position embedding size, falling back to max_position_embeddings if not explicitly set.
+		"""
 		return getattr(
 			self,
 			"freq_max_position_embeddings",
@@ -230,6 +273,11 @@ class ExaoneConfig(EasyDeLBaseConfig):
 
 	@property
 	def granted_mask_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size for mask-based position embeddings.
+
+		Returns:
+			int: The maximum position embedding size, falling back to max_position_embeddings if not explicitly set.
+		"""
 		return getattr(
 			self,
 			"mask_max_position_embeddings",

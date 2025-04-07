@@ -171,6 +171,52 @@ class DeepseekV3Config(EasyDeLBaseConfig):
 		attention_dropout=0.0,
 		**kwargs,
 	):
+		"""Initialize a new DeepseekV3Config instance.
+
+		Args:
+			vocab_size (int, optional): Size of the vocabulary. Defaults to 129280.
+			hidden_size (int, optional): Dimensionality of the embeddings and hidden states. Defaults to 7168.
+			intermediate_size (int, optional): Dimensionality of the MLP layer. Defaults to 18432.
+			moe_intermediate_size (int, optional): Dimensionality of the MoE intermediate layer. Defaults to 2048.
+			num_hidden_layers (int, optional): Number of hidden layers in the model. Defaults to 61.
+			num_nextn_predict_layers (int, optional): Number of next-n prediction layers. Defaults to 1.
+			num_attention_heads (int, optional): Number of attention heads. Defaults to 128.
+			num_key_value_heads (int, optional): Number of key/value heads (for GQA). Defaults to 128.
+			n_shared_experts (int, optional): Number of shared MoE experts. Defaults to 1.
+			n_routed_experts (int, optional): Number of routed MoE experts. Defaults to 256.
+			ep_size (int, optional): Expert parallelism size. Defaults to 1.
+			routed_scaling_factor (float, optional): Scaling factor for routed experts. Defaults to 2.5.
+			kv_lora_rank (int, optional): Rank for KV LoRA. Defaults to 512.
+			q_lora_rank (int, optional): Rank for Q LoRA. Defaults to 1536.
+			qk_rope_head_dim (int, optional): Head dimension for QK with RoPE. Defaults to 64.
+			v_head_dim (int, optional): Head dimension for V. Defaults to 128.
+			qk_nope_head_dim (int, optional): Head dimension for QK without RoPE. Defaults to 128.
+			topk_method (str, optional): Method for top-k expert selection. Defaults to "noaux_tc".
+			n_group (int, optional): Number of expert groups. Defaults to 8.
+			topk_group (int, optional): Top-k groups. Defaults to 4.
+			num_experts_per_tok (int, optional): Number of experts per token. Defaults to 8.
+			moe_layer_freq (int, optional): Frequency of MoE layers. Defaults to 1.
+			first_k_dense_replace (int, optional): First k dense layers to replace. Defaults to 3.
+			norm_topk_prob (bool, optional): Whether to normalize top-k probabilities. Defaults to True.
+			scoring_func (str, optional): Scoring function for expert selection. Defaults to "sigmoid".
+			aux_loss_alpha (float, optional): Weight for auxiliary loss. Defaults to 0.001.
+			seq_aux (bool, optional): Whether to use sequence auxiliary loss. Defaults to True.
+			hidden_act (str, optional): Activation function. Defaults to "silu".
+			max_position_embeddings (int, optional): Maximum sequence length. Defaults to 4096.
+			initializer_range (float, optional): Range for weight initialization. Defaults to 0.02.
+			rms_norm_eps (float, optional): Epsilon for RMS normalization. Defaults to 1e-6.
+			use_cache (bool, optional): Whether to use KV cache for generation. Defaults to True.
+			pad_token_id (int, optional): ID for padding token. Defaults to None.
+			bos_token_id (int, optional): ID for beginning of sequence token. Defaults to 0.
+			eos_token_id (int, optional): ID for end of sequence token. Defaults to 1.
+			pretraining_tp (int, optional): Tensor parallelism size during pretraining. Defaults to 1.
+			tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
+			rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
+			rope_scaling (Dict, optional): RoPE scaling configuration. Defaults to None.
+			attention_bias (bool, optional): Whether to use bias in attention. Defaults to False.
+			attention_dropout (float, optional): Dropout rate for attention. Defaults to 0.0.
+			**kwargs: Additional arguments.
+		"""
 		self.vocab_size = vocab_size
 		self.max_position_embeddings = max_position_embeddings
 		self.hidden_size = hidden_size
@@ -222,10 +268,16 @@ class DeepseekV3Config(EasyDeLBaseConfig):
 		)
 
 	def get_partition_rules(self, *args, **kwargs):
-		"""
-		Get the partition rules for the model.
+		"""Get the partition rules for model parameters.
+
+		These rules define how parameters should be sharded across devices when using model parallelism.
+
+		Args:
+			*args: Variable length argument list.
+			**kwargs: Arbitrary keyword arguments.
+
 		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+			Tuple: A tuple of partition rules for different parameter patterns.
 		"""
 		return (
 			("embed_tokens/embedding", PartitionSpec(("sp", "fsdp"), "tp")),

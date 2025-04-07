@@ -47,6 +47,23 @@ from .phi_configuration import PhiConfig
 
 
 class PhiMLP(nn.Module):
+	"""Phi MLP module.
+
+	This module implements the feed-forward network (MLP) used in the Phi model.
+	It consists of two linear projections with a GELU activation in between.
+
+	Attributes:
+	    config (PhiConfig): Configuration object for the model.
+	    layer_idx (int, optional): Index of the current layer.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    rngs (nn.Rngs): Random number generators.
+	    fc1 (ParallelLinear): First linear projection layer (up-projection).
+	    fc2 (ParallelLinear): Second linear projection layer (down-projection).
+	    act (callable): Activation function.
+	"""
+
 	def __init__(
 		self,
 		config: PhiConfig,
@@ -57,6 +74,16 @@ class PhiMLP(nn.Module):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the PhiMLP module.
+
+		Args:
+		    config (PhiConfig): The configuration object for the Phi model.
+		    layer_idx (int, optional): Index of the current layer. Defaults to None.
+		    dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		    precision (jax.lax.PrecisionLike, optional): Precision setting for JAX operations. Defaults to None.
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		self.config = config
 		self.layer_idx = layer_idx
 		self.dtype = dtype
@@ -85,11 +112,54 @@ class PhiMLP(nn.Module):
 		self.act = ACT2FN[self.config.hidden_act]
 
 	def __call__(self, hidden_states: Array) -> Array:
+		"""Forward pass of the PhiMLP module.
+
+		Args:
+		    hidden_states (Array): Input hidden states. Shape: (batch_size, sequence_length, hidden_size).
+
+		Returns:
+		    Array: Output hidden states after MLP transformation. Shape: (batch_size, sequence_length, hidden_size).
+		"""
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
 		return self.fc2(self.act(self.fc1(hidden_states)))
 
 
 class PhiAttention(AttentionModule):
+	"""Phi Attention module.
+
+	This module implements the multi-head attention mechanism used in the Phi model.
+	It supports Grouped Query Attention (GQA), partial Rotary Position Embeddings (RoPE),
+	and optional Layer Normalization for query and key projections.
+
+	Attributes:
+	    config (PhiConfig): Configuration object for the model.
+	    layer_idx (int, optional): Index of the current layer.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    rngs (nn.Rngs): Random number generators.
+	    attention_dropout (float): Dropout probability for attention scores.
+	    hidden_size (int): Dimensionality of the hidden states.
+	    num_heads (int): Number of attention query heads.
+	    head_dim (int): Dimensionality of each attention head.
+	    num_key_value_heads (int): Number of attention key/value heads (for GQA).
+	    num_key_value_groups (int): Number of query head groups for each key/value head.
+	    max_position_embeddings (int): Maximum sequence length supported by RoPE.
+	    rope_theta (float): Base value for RoPE frequency calculation.
+	    partial_rotary_factor (float): Factor determining the fraction of head dimension subject to RoPE.
+	    is_causal (bool): Whether the attention is causal (always True for this implementation).
+	    q_proj (ParallelLinear): Linear layer for query projection.
+	    k_proj (ParallelLinear): Linear layer for key projection.
+	    v_proj (ParallelLinear): Linear layer for value projection.
+	    dense (ParallelLinear): Linear layer for the output projection.
+	    rotary_emb_dim (int): The dimension of the rotary embeddings.
+	    qk_layernorm (bool): Whether to apply LayerNorm to query and key projections.
+	    q_layernorm (nn.LayerNorm, optional): Layer normalization for query projections.
+	    k_layernorm (nn.LayerNorm, optional): Layer normalization for key projections.
+	    attention_performer (FlexibleAttentionModule): Module to perform the core attention computation.
+	    rotary (RoPE): Rotary position embedding module.
+	"""
+
 	def __init__(
 		self,
 		config: PhiConfig,
@@ -100,6 +170,19 @@ class PhiAttention(AttentionModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the PhiAttention module.
+
+		Args:
+		    config (PhiConfig): The configuration object for the Phi model.
+		    layer_idx (int, optional): Index of the current layer. Defaults to None.
+		    dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		    precision (jax.lax.PrecisionLike, optional): Precision setting for JAX operations. Defaults to None.
+		    rngs (nn.Rngs): Random number generators.
+
+		Raises:
+		    ValueError: If `hidden_size` is not divisible by `num_heads`.
+		"""
 		super().__init__(config=config)
 
 		self.layer_idx = layer_idx
@@ -207,20 +290,24 @@ class PhiAttention(AttentionModule):
 		frequencies: tp.Optional[chex.Array] = None,
 	):
 		"""
-		Forward pass of the attention module.
+		Forward pass of the PhiAttention module.
 
 		Args:
-		    hidden_states (chex.Array): Input hidden states.
-		    attention_mask (chex.Array): Mask to apply on the attention scores.
-		    position_ids (chex.Array): Position indices for the tokens.
-		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+		    hidden_states (chex.Array): Input hidden states. Shape: (batch_size, sequence_length, hidden_size).
+		    attention_mask (chex.Array): Mask to apply on the attention scores. Shape: (batch_size, 1, query_length, key_length).
+		    position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
+		    causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
+		    cache_view (tp.Optional[TransformerCacheView | PagedAttentionCacheView]): Cache view for attention KVs.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
 		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-		    deterministic (bool): If True, disables dropout for deterministic behavior.
-		    init_cache (bool): If True, initializes cache for caching keys and values.
-		    output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-		    fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+		    output_attentions (bool): Whether to return attention weights. Default is False.
+		    fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
+		    frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
+
 		Returns:
-		    tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+		    tp.Union[tp.Tuple[chex.Array, chex.Array], tp.Tuple[chex.Array]]:
+		        A tuple containing the attention output hidden states. If `output_attentions` is True,
+		        it also includes the attention weights.
 		"""
 		batch_size, sequence_length = hidden_states.shape[:2]
 		(query_states, key_states, value_states) = (
@@ -302,6 +389,25 @@ class PhiAttention(AttentionModule):
 
 
 class PhiDecoderLayer(nn.Module):
+	"""Phi Transformer Decoder Layer.
+
+	This module represents a single decoder layer in the Phi model,
+	combining self-attention and MLP sub-layers with residual connections
+	and layer normalization.
+
+	Attributes:
+	    config (PhiConfig): Configuration object for the model.
+	    layer_idx (int, optional): Index of the current layer.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    rngs (nn.Rngs): Random number generators.
+	    input_layernorm (nn.LayerNorm): Layer normalization applied before the attention and MLP blocks.
+	    resid_dropout (nn.Dropout): Dropout applied to the residual connection after the MLP block.
+	    self_attn (PhiAttention): The self-attention module.
+	    mlp (PhiMLP): The feed-forward (MLP) module.
+	"""
+
 	def __init__(
 		self,
 		config: PhiConfig,
@@ -312,6 +418,16 @@ class PhiDecoderLayer(nn.Module):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the PhiDecoderLayer.
+
+		Args:
+		    config (PhiConfig): The configuration object for the Phi model.
+		    layer_idx (int, optional): Index of the current layer. Defaults to None.
+		    dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		    precision (jax.lax.PrecisionLike, optional): Precision setting for JAX operations. Defaults to None.
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		self.config = config
 		self.layer_idx = layer_idx
 		self.dtype = dtype
@@ -364,21 +480,23 @@ class PhiDecoderLayer(nn.Module):
 		fcm_mask: tp.Optional[chex.Array] = None,
 		frequencies: tp.Optional[chex.Array] = None,
 	):
-		"""
-		Forward pass of the module block.
+		"""Forward pass of the PhiDecoderLayer module.
 
 		Args:
-		    hidden_states (chex.Array): Input hidden states.
-		    attention_mask (chex.Array): Mask to apply on the attention scores.
-		    position_ids (chex.Array): Position indices for the tokens.
-		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+		    hidden_states (chex.Array): Input hidden states. Shape: (batch_size, sequence_length, hidden_size).
+		    attention_mask (chex.Array): Mask to apply on the attention scores. Shape: (batch_size, 1, query_length, key_length).
+		    position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
+		    causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
+		    cache_view (tp.Optional[TransformerCacheView | PagedAttentionCacheView]): Cache view for attention KVs.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
 		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-		    deterministic (bool): If True, disables dropout for deterministic behavior.
-		    init_cache (bool): If True, initializes cache for caching keys and values.
-		    output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-		    fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+		    output_attentions (bool): Whether to return attention weights. Default is False.
+		    fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
+		    frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
+
 		Returns:
-		    tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+		    tp.Tuple[chex.Array, tp.Optional[chex.Array]]:
+		        A tuple containing the output hidden states and optionally the attention weights.
 		"""
 		residual = hidden_states
 		hidden_states = self.input_layernorm(hidden_states)
@@ -425,6 +543,25 @@ class PhiDecoderLayer(nn.Module):
 	model_type="phi",
 )
 class PhiModel(EasyDeLBaseModule):
+	"""The base Phi model transformer.
+
+	This class represents the core transformer architecture of the Phi model,
+	consisting of an embedding layer, multiple PhiDecoderLayer layers,
+	and a final layer normalization.
+
+	Attributes:
+	    config (PhiConfig): Configuration object for the model.
+	    dtype (jnp.dtype): Data type for computation.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    rngs (nn.Rngs): Random number generators.
+	    embed_tokens (nn.Embed): Embedding layer for input tokens.
+	    layers (tp.List[PhiDecoderLayer]): List of decoder layers.
+	    final_layernorm (nn.LayerNorm): Final layer normalization.
+	    embed_dropout (nn.Dropout): Dropout layer applied after embeddings.
+	    gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
+	"""
+
 	def __init__(
 		self,
 		config: PhiConfig,
@@ -434,6 +571,15 @@ class PhiModel(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the PhiModel.
+
+		Args:
+		    config (PhiConfig): The configuration object for the Phi model.
+		    dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -497,6 +643,32 @@ class PhiModel(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
 	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+		"""Forward pass of the PhiModel.
+
+		Args:
+		    input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
+		    inputs_embeds (tp.Optional[chex.Array]): Input embeddings. Shape: (batch_size, sequence_length, hidden_size).
+		        Either `input_ids` or `inputs_embeds` must be provided.
+		    attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+		        Shape: (batch_size, sequence_length).
+		    position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+		        Shape: (batch_size, sequence_length).
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
+		    output_attentions (tp.Optional[bool]): Whether to return attention weights. Defaults to `config.output_attentions`.
+		    output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
+		        Defaults to `config.output_hidden_states`.
+		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for attention.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+		    return_dict (bool): Whether to return a `BaseModelOutput` object or a tuple.
+
+		Returns:
+		    tp.Union[BaseModelOutput, tp.Tuple]: The model's output. If `return_dict` is True,
+		        returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
+		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
+
+		Raises:
+		    ValueError: If neither `input_ids` nor `inputs_embeds` is provided.
+		"""
 		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
 				"You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -568,6 +740,23 @@ class PhiModel(EasyDeLBaseModule):
 	model_type="phi",
 )
 class PhiForCausalLM(EasyDeLBaseModule):
+	"""Phi model with a Causal Language Modeling head.
+
+	This model consists of the base Phi transformer (`PhiModel`) followed by a
+	linear layer (`lm_head`) that projects the transformer's output hidden states
+	to the vocabulary size, producing logits for next token prediction.
+	Optionally, the input token embeddings can be tied to the output projection layer.
+
+	Attributes:
+	    config (PhiConfig): Configuration object for the model.
+	    dtype (jnp.dtype): Data type for computation.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    rngs (nn.Rngs): Random number generators.
+	    transformer (PhiModel): The core Phi transformer model.
+	    lm_head (ParallelLinear): The linear layer for projecting hidden states to vocabulary logits.
+	"""
+
 	def __init__(
 		self,
 		config: PhiConfig,
@@ -577,6 +766,15 @@ class PhiForCausalLM(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the PhiForCausalLM model.
+
+		Args:
+		    config (PhiConfig): The configuration object for the Phi model.
+		    dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -616,30 +814,35 @@ class PhiForCausalLM(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
 	) -> tp.Union[CausalLMOutput, tp.Tuple]:
-		"""
-		Forward pass through the Phi module.
+		"""Forward pass of the PhiForCausalLM model.
 
 		Args:
-		    input_ids (tp.Optional[chex.Array]): Input tensor containing token IDs.
-		    attention_mask (tp.Optional[chex.Array]): Mask for attention.
-		    position_ids (tp.Optional[chex.Array]): Positional indices.
-		    segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
-		    inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
-		    output_attentions (tp.Optional[bool]): If True, output attention weights.
-		    output_hidden_states (tp.Optional[bool]): If True, output hidden states.
-		    init_cache (bool): If True, initialize cache for decoding.
-		    deterministic (bool): If True, disable dropout.
-		    return_dict (bool): If True, return a dictionary of outputs.
+		    input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
+		    inputs_embeds (tp.Optional[chex.Array]): Input embeddings. Shape: (batch_size, sequence_length, hidden_size).
+		        Either `input_ids` or `inputs_embeds` must be provided.
+		    attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+		        Shape: (batch_size, sequence_length).
+		    position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+		        Shape: (batch_size, sequence_length).
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
+		    output_attentions (tp.Optional[bool]): Whether to return attention weights. Defaults to `config.output_attentions`.
+		    output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
+		        Defaults to `config.output_hidden_states`.
+		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for attention.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+		    return_dict (bool): Whether to return a `CausalLMOutput` object or a tuple.
 
 		Returns:
-		    CausalLMOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
+		    tp.Union[CausalLMOutput, tp.Tuple]: The model's output. If `return_dict` is True,
+		        returns a `CausalLMOutput` object containing `logits`, `hidden_states` (optional),
+		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
 		"""
-
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			inputs_embeds=inputs_embeds,

@@ -3,12 +3,12 @@ import sys
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
-import easydel as ed
-
 import jax
 from jax import numpy as jnp
-from transformers import AutoProcessor, Qwen2VLProcessor
 from qwen_vl_utils import process_vision_info
+from transformers import AutoProcessor, Qwen2VLProcessor
+
+import easydel as ed
 
 
 def main():
@@ -122,7 +122,7 @@ def main():
 		)[0]
 	)
 	print("\n" + ("*" * 5))
-	print("TPS  :", response.tokens_pre_second)
+	print("TPS  :", response.tokens_per_second)
 	print("Loss :", model.compute_loss(**inputs)[-1].loss)  # 21.4800
 
 

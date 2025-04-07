@@ -49,6 +49,16 @@ from .cohere2_configuration import Cohere2Config
 
 
 class Cohere2LayerNorm(nn.Module):
+	"""Cohere Layer Normalization.
+
+	Attributes:
+		dim (Union[int, tuple]): The dimension(s) to normalize over.
+		eps (float): A small epsilon value to prevent division by zero.
+		dtype (jnp.dtype): The data type for computation.
+		param_dtype (jnp.dtype): The data type for the parameters.
+		rngs (Optional[nn.Rngs]): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		dim: tp.Union[int, tuple],
@@ -74,11 +84,20 @@ class Cohere2LayerNorm(nn.Module):
 		)
 
 	def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
+		"""Computes the Layer Normalization for a given input tensor."""
 		mean = jnp.mean(x, -1, keepdims=True)
 		variance = jnp.mean(jnp.pow((x - mean), 2), -1, keepdims=True)
 		return (x - mean) * jax.lax.rsqrt(variance + self.eps)
 
 	def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+		"""Applies Layer Normalization to the input tensor.
+
+		Args:
+			x (jnp.ndarray): The input tensor.
+
+		Returns:
+			jnp.ndarray: The normalized output tensor.
+		"""
 		if self.dtype in [
 			jnp.float8_e4m3b11fnuz,
 			jnp.float8_e4m3fn,
@@ -95,6 +114,18 @@ class Cohere2LayerNorm(nn.Module):
 
 
 class Cohere2Attention(AttentionModule):
+	"""
+	Cohere2 Attention module, incorporating features like RoPE and sliding window attention.
+
+	Attributes:
+		config (Cohere2Config): Configuration object.
+		layer_idx (int): The index of the current layer.
+		dtype (jnp.dtype): Data type for computation.
+		param_dtype (jnp.dtype): Data type for parameters.
+		precision (jax.lax.PrecisionLike): JAX precision level.
+		rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: Cohere2Config,
@@ -173,6 +204,23 @@ class Cohere2Attention(AttentionModule):
 		fcm_mask: tp.Optional[chex.Array] = None,
 		frequencies: tp.Optional[chex.Array] = None,
 	):
+		"""Forward pass for the Cohere2 attention module.
+
+		Args:
+			hidden_states (chex.Array): Input hidden states.
+			attention_mask (chex.Array): Attention mask.
+			position_ids (chex.Array): Position IDs for RoPE.
+			causal_mask (Optional[chex.Array | bool]): Causal mask.
+			cache_view (Optional[TransformerCacheView | PagedAttentionCacheView]): Cache view for kv-caching.
+			cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+			segment_ids (Optional[chex.Array]): Segment IDs (if applicable).
+			output_attentions (bool): Whether to output attention weights.
+			fcm_mask (Optional[chex.Array]): FCM mask (if applicable).
+			frequencies (Optional[chex.Array]): Precomputed RoPE frequencies.
+
+		Returns:
+			Tuple[chex.Array, Optional[chex.Array]]: Attention output and optionally attention weights.
+		"""
 		batch_size, sequence_length = hidden_states.shape[:2]
 		(query_states, key_states, value_states) = (
 			self.q_proj(hidden_states),
@@ -242,12 +290,7 @@ class Cohere2Attention(AttentionModule):
 		)
 		attn_output = self.o_proj(attn_output)
 
-		outputs = (
-			(attn_output, attentions.attention_weights)
-			if output_attentions
-			else (attn_output, None)
-		)
-		return outputs
+		return attn_output, attentions.attention_weights
 
 
 class Cohere2MLP(nn.Module):
@@ -695,6 +738,7 @@ class Cohere2ForSequenceClassification(EasyDeLBaseModule):
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,

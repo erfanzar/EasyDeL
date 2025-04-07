@@ -314,6 +314,32 @@ class AttentionModule(nn.Module):
 		self.cached_value: nn.Cache[Array] | None = None
 		self.cache_index: nn.Cache[Array] | None = None
 
+	@staticmethod
+	def apply_complex_rotary(
+		xq: jnp.ndarray,
+		xk: jnp.ndarray,
+		freqs_cis: jnp.ndarray,
+	) -> tp.Tuple[jnp.ndarray, jnp.ndarray]:
+		xq_reshaped = xq.astype(jnp.float32).reshape(*xq.shape[:-1], -1, 2)
+		xk_reshaped = xk.astype(jnp.float32).reshape(*xk.shape[:-1], -1, 2)
+		xq_complex = xq_reshaped[..., 0] + 1j * xq_reshaped[..., 1]
+		xk_complex = xk_reshaped[..., 0] + 1j * xk_reshaped[..., 1]
+		xq_out_complex = xq_complex * freqs_cis[:, :, None, :]
+		xk_out_complex = xk_complex * freqs_cis[:, :, None, :]
+		xq_out_real = jnp.stack(
+			[jnp.real(xq_out_complex), jnp.imag(xq_out_complex)],
+			axis=-1,
+		)
+		xk_out_real = jnp.stack(
+			[jnp.real(xk_out_complex), jnp.imag(xk_out_complex)],
+			axis=-1,
+		)
+		xq_out = xq_out_real.reshape(*xq_out_real.shape[:-2], -1)
+		xk_out = xk_out_real.reshape(*xk_out_real.shape[:-2], -1)
+		xq_out = xq_out.astype(xq.dtype)
+		xk_out = xk_out.astype(xk.dtype)
+		return xq_out, xk_out
+
 	def make_flexible_sliding_window(
 		self,
 		attention_mask: jax.Array,

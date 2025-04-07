@@ -169,55 +169,34 @@ class OpenELMConfig(EasyDeLBaseConfig):
 		The self parameter is a reference to the current instance of the class, and is used to access variables that belong to the class.
 
 		Args:
-		    self: Represent the instance of the class
-		    vocab_size: Define the size of the vocabulary
-		    hidden_size: Determine the size of the embedding layers
-		    intermediate_size: Define the size of the intermediate layer
-		        in each transformer block
-		    num_hidden_layers: Determine the number of layers in the
-		        encoder and decoder
-		    num_attention_heads: Determine the number of attention heads
-		        in each layer
-		    num_key_value_heads: Specify the number of heads for key and
-		        value
-		    hidden_act: Specify the activation function used in the
-		        hidden layers
-		    max_position_embeddings: Set the maximum length of the
-		        sequence
-		    initializer_range: Initialize the weights of the model
-		    rms_norm_eps: Avoid division by zero in the rms
-		        normalization
-		    use_cache: Determine whether to use the cache in the decoder
-		    pad_token_id: Specify the token id of the padding token
-		    bos_token_id: Specify the beginning of sentence token id
-		    eos_token_id: Specify the end of sentence token
-		    tie_word_embeddings: Tie the word embeddings and the output
-		        layer
-		    rope_theta: Control the number of tokens in a rope
-		    sliding_window: Control the number of tokens that are
-		        processed in parallel
-		    gradient_checkpointing: str: Specify whether to use gradient
-		        checkpointing
-		    use_scan_mlp: bool: Determine whether or not to use the
-		        scan_mlp function
-		    scan_mlp_chunk_size: int: Specify the chunk size of the scan
-		        mlp
-		    number_rep_kv: int: Specify the number of times to repeat
-		        the key and value vectors
-		    attention_dropout: float: Set the dropout rate for the
-		        attention layer
-		    bits: tp.Optional[int]: Specify the number of bits used for
-		        quantization
-		    axis_dims: tp.Sequence[int]: Specify the dimension of each axis
-		    axis_names: tp.Sequence[str]: Specify the names of each axis in
-		        the tensor
-		    &quot;mp&quot;): Define the maximum position embeddings
-		    attention_bias: bool: when ever to use attention_bias
-		    **kwargs: Pass a variable number of keyword arguments to a
-		        function
-
-		Returns:
-		    An instance of the class
+		    vocab_size (`int`, *optional*, defaults to 32000): Vocabulary size.
+		    max_context_length (`int`, *optional*, defaults to 2048): Maximum sequence length.
+		    num_transformer_layers (`int`, *optional*, defaults to 12): Number of transformer layers.
+		    model_dim (`int`, *optional*, defaults to 2048): Model dimension (embedding size).
+		    head_dim (`int`, *optional*, defaults to 128): Dimension of each attention head.
+		    qkv_multipliers (`float` or `list` of `float`, *optional*, defaults to 1.0): Multiplier(s) for QKV projection dimensions.
+		    num_query_heads (`int`, *optional*): Number of query heads. Calculated if None.
+		    num_gqa_groups (`int`, *optional*, defaults to 1): Number of GQA groups.
+		    ffn_multipliers (`float` or `list` of `float`, *optional*, defaults to 4.0): Multiplier(s) for FFN intermediate dimension.
+		    ffn_with_glu (`bool`, *optional*, defaults to `True`): Whether FFN uses GLU.
+		    ffn_dim_divisor (`int`, *optional*, defaults to 256): Divisor for FFN dimension calculation.
+		    activation_fn_name (`str`, *optional*, defaults to `"swish"`): Activation function name.
+		    normalization_layer_name (`str`, *optional*, defaults to `"rms_norm"`): Normalization layer name.
+		    normalize_qk_projections (`bool`, *optional*, defaults to `False`): Whether to normalize QK projections.
+		    share_input_output_layers (`bool`, *optional*, defaults to `False`): Whether to tie input/output embeddings.
+		    rope_freq_constant (`int`, *optional*, defaults to 10000): RoPE frequency constant.
+		    rope_max_length (`int`, *optional*, defaults to 4096): Maximum RoPE length.
+		    initializer_range (`float`, *optional*, defaults to 0.02): Initializer range.
+		    use_cache (`bool`, *optional*, defaults to `True`): Whether to use KV cache.
+		    bos_token_id (`int`, *optional*, defaults to 1): Beginning-of-sequence token ID.
+		    eos_token_id (`int`, *optional*, defaults to 2): End-of-sequence token ID.
+		    rope_scaling (`tp.Dict[str, tp.Union[str, float]]`, *optional*): RoPE scaling configuration. Defaults to None.
+		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
+		        Defaults to EasyDeLGradientCheckPointers.NONE.
+		    use_scan_mlp (bool, optional): Whether to use scan for MLP layers. Defaults to False.
+		    scan_mlp_chunk_size (int, optional): Chunk size for scan MLP. Defaults to 1024.
+		    bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
+		    **kwargs: Additional keyword arguments.
 		"""
 		self.vocab_size = vocab_size
 		self.max_context_length = max_context_length
@@ -261,9 +240,16 @@ class OpenELMConfig(EasyDeLBaseConfig):
 
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model.
+		Get the partition rules for the model. This method defines how the model's parameters are
+		partitioned across devices for distributed training and inference.
+
+		Args:
+		    *args: Additional positional arguments (unused).
+		    **kwargs: Additional keyword arguments (unused).
+
 		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: A tuple of partition rules, where each rule is a tuple
+		        containing a regex pattern for parameter names and the corresponding `PartitionSpec`.
 		"""
 
 		return (
@@ -284,13 +270,32 @@ class OpenELMConfig(EasyDeLBaseConfig):
 
 	@staticmethod
 	def get_weight_decay_exclusions():
-		return tuple()
+		"""Returns a tuple of parameter names for which weight decay should be excluded.
+
+		Returns:
+		    tuple: A tuple containing 'bias', 'normalization', and 'emb' as exclusions.
+		"""
+		return "bias", "normalization", "emb"
 
 	@staticmethod
 	def rng_keys():
-		return "params", "dropout", "fcm"
+		"""Returns the names of the random number generator keys used by the model.
+
+		Returns:
+		    tuple: A tuple containing "params" and "dropout" as the RNG keys.
+		"""
+		return "params", "dropout"
 
 	def __post_init__(self) -> None:
+		"""Performs post-initialization checks and calculations.
+
+		This method validates the configuration and computes derived values like
+		FFN dimensions and QKV dimensions based on the provided multipliers and divisors.
+		It ensures that the configuration parameters are consistent and valid.
+
+		Raises:
+		    ValueError: If the configuration parameters are invalid or inconsistent.
+		"""
 		if self.num_gqa_groups is not None:
 			head_multiple_of = self.num_gqa_groups
 		else:
@@ -374,6 +379,14 @@ class OpenELMConfig(EasyDeLBaseConfig):
 
 	@property
 	def granted_freq_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size specifically for frequency-based position embeddings.
+
+		If `freq_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
+		`max_context_length`.
+
+		Returns:
+		    int: The granted maximum position embedding size for frequency encoding.
+		"""
 		return getattr(
 			self,
 			"freq_max_position_embeddings",
@@ -382,6 +395,14 @@ class OpenELMConfig(EasyDeLBaseConfig):
 
 	@property
 	def granted_mask_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size specifically for mask-based position embeddings.
+
+		If `mask_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
+		`max_context_length`.
+
+		Returns:
+		    int: The granted maximum position embedding size for mask encoding.
+		"""
 		return getattr(
 			self,
 			"mask_max_position_embeddings",

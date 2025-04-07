@@ -52,6 +52,19 @@ from easydel.modules.qwen2_moe.configuration_qwen2_moe import (
 
 
 class Qwen2MoeMLP(nn.Module):
+	"""Multi-Layer Perceptron (MLP) block for the Qwen2 MoE model.
+
+	Attributes:
+	    config (Qwen2MoeConfig): Configuration object for the model.
+	    gate_proj (ParallelLinear): Linear layer for the gating mechanism.
+	    down_proj (ParallelLinear): Linear layer for down-projection.
+	    up_proj (ParallelLinear): Linear layer for up-projection.
+	    act_fn (callable): Activation function (SiLU).
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+	"""
+
 	def __init__(
 		self,
 		config: Qwen2MoeConfig,
@@ -62,6 +75,16 @@ class Qwen2MoeMLP(nn.Module):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the Qwen2MoeMLP module.
+
+		Args:
+		    config (Qwen2MoeConfig): The configuration object for the model.
+		    intermediate_size (int): The size of the intermediate layer.
+		    dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+		    param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		self.config = config
 		self.dtype = dtype
 		self.param_dtype = param_dtype
@@ -94,6 +117,14 @@ class Qwen2MoeMLP(nn.Module):
 		self.act_fn = nn.silu
 
 	def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
+		"""Forward pass of the MLP block.
+
+		Args:
+		    hidden_states (jnp.ndarray): Input hidden states.
+
+		Returns:
+		    jnp.ndarray: Output hidden states after MLP transformation.
+		"""
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
 		hidden_states = self.down_proj(
 			self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
@@ -102,6 +133,26 @@ class Qwen2MoeMLP(nn.Module):
 
 
 class Qwen2MoeAttention(AttentionModule):
+	"""Qwen2 MoE Attention module.
+
+	Attributes:
+	    config (Qwen2MoeConfig): Configuration object for the model.
+	    hidden_size (int): Dimensionality of the hidden states.
+	    head_dim (int): Dimensionality of each attention head.
+	    num_key_value_groups (int): Number of groups for key/value heads (for GQA).
+	    q_proj (ParallelLinear): Linear layer for query projection.
+	    k_proj (ParallelLinear): Linear layer for key projection.
+	    v_proj (ParallelLinear): Linear layer for value projection.
+	    o_proj (ParallelLinear): Linear layer for output projection.
+	    attention_performer (FlexibleAttentionModule): Module for performing attention computation.
+	    resid_dropout (nn.Dropout): Dropout layer for residual connections.
+	    rotary (RotaryEmbedding): Rotary positional embedding module.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+	    rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: Qwen2MoeConfig,
@@ -111,6 +162,15 @@ class Qwen2MoeAttention(AttentionModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the Qwen2MoeAttention module.
+
+		Args:
+		    config (Qwen2MoeConfig): The configuration object for the model.
+		    dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+		    param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__(config=config)
 		self.dtype = dtype
 		self.param_dtype = param_dtype
@@ -184,8 +244,7 @@ class Qwen2MoeAttention(AttentionModule):
 		fcm_mask: tp.Optional[chex.Array] = None,
 		frequencies: tp.Optional[chex.Array] = None,
 	):
-		"""
-		Forward pass of the attention module.
+		"""Forward pass of the attention module.
 
 		Args:
 		    hidden_states (chex.Array): Input hidden states.
@@ -277,6 +336,21 @@ class Qwen2MoeAttention(AttentionModule):
 
 
 class Qwen2MoeSparseMoeBlock(nn.Module):
+	"""Sparse Mixture of Experts (MoE) block for Qwen2 MoE.
+
+	This block routes input hidden states to a selected subset of experts
+	and combines their outputs.
+
+	Attributes:
+	    config (Qwen2MoeConfig): Configuration object for the model.
+	    gate (ParallelLinear): Linear layer for the gating network.
+	    experts (nn.List[Qwen2MoeMLP]): List of expert MLP modules.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+	    rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: Qwen2MoeConfig,
@@ -286,6 +360,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the Qwen2MoeSparseMoeBlock module.
+
+		Args:
+		    config (Qwen2MoeConfig): The configuration object for the model.
+		    dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+		    param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		self.config = config
 		self.dtype = dtype
 		self.param_dtype = param_dtype
@@ -332,6 +415,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 		)
 
 	def __call__(self, hidden_states: chex.Array) -> tp.Tuple[chex.Array, chex.Array]:
+		"""Forward pass of the Sparse MoE block.
+
+		Args:
+		    hidden_states (chex.Array): Input hidden states (batch_size * sequence_length, hidden_dim).
+
+		Returns:
+		    tp.Tuple[chex.Array, chex.Array]: A tuple containing:
+		        - final_hidden_states (chex.Array): The output hidden states after MoE processing.
+		        - router_logits (chex.Array): The logits output by the gating network.
+		"""
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
 		batch_size, sequence_length, hidden_dim = hidden_states.shape
 
@@ -380,6 +473,25 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
 
 class Qwen2MoeDecoderLayer(nn.Module):
+	"""A single decoder layer for the Qwen2 MoE model.
+
+	This layer combines self-attention, a sparse MoE block (or a standard MLP),
+	and residual connections with layer normalization.
+
+	Attributes:
+	    config (Qwen2MoeConfig): Configuration object for the model.
+	    layer_idx (int): Index of the current layer.
+	    self_attn (Qwen2MoeAttention): Self-attention module.
+	    mlp (Qwen2MoeSparseMoeBlock | Qwen2MoeMLP): MoE block or standard MLP.
+	    input_layernorm (RMSNorm): Layer normalization applied before self-attention.
+	    post_attention_layernorm (RMSNorm): Layer normalization applied after self-attention and before the MLP/MoE block.
+	    dropout_rng_key (str): Name of the RNG key for dropout.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+	    rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: Qwen2MoeConfig,
@@ -390,6 +502,16 @@ class Qwen2MoeDecoderLayer(nn.Module):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the Qwen2MoeDecoderLayer module.
+
+		Args:
+		    config (Qwen2MoeConfig): The configuration object for the model.
+		    layer_idx (int): The index of the current layer.
+		    dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+		    param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		self.config = config
 		self.layer_idx = layer_idx
 		self.dtype = dtype
@@ -455,6 +577,27 @@ class Qwen2MoeDecoderLayer(nn.Module):
 		fcm_mask: tp.Optional[chex.Array] = None,
 		frequencies: tp.Optional[chex.Array] = None,
 	) -> tp.Tuple[chex.Array, chex.Array, tp.Optional[chex.Array]]:
+		"""Forward pass of the decoder layer.
+
+		Args:
+		    hidden_states (chex.Array): Input hidden states (batch, seq_len, hidden_size).
+		    attention_mask (chex.Array): Attention mask (batch, 1, seq_len, kv_seq_len).
+		    position_ids (chex.Array): Position IDs (batch, seq_len).
+		    causal_mask (tp.Optional[chex.Array | bool]): Causal mask for autoregressive behavior.
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+		    cache_view (tp.Optional[TransformerCacheView | PagedAttentionCacheView]): Cache view for key/value states (optional).
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention (optional).
+		    output_attentions (bool): Whether to output attention weights (default: False).
+		    output_router_logits (bool): Whether to output router logits (default: False).
+		    fcm_mask (tp.Optional[chex.Array]): Forward causal mask (FCM) mask (optional).
+		    frequencies (tp.Optional[chex.Array]): Precomputed rotary frequencies (optional).
+
+		Returns:
+		    tp.Tuple[chex.Array, chex.Array, tp.Optional[chex.Array]]: A tuple containing:
+		        - hidden_states (chex.Array): Output hidden states after the decoder layer.
+		        - attention_outputs (chex.Array): Attention weights (if `output_attentions` is True).
+		        - router_logits (tp.Optional[chex.Array]): Router logits (if `output_router_logits` is True and it's an MoE layer).
+		"""
 		attn_outputs = self.self_attn(
 			self.input_layernorm(hidden_states),
 			attention_mask,
@@ -493,6 +636,23 @@ class Qwen2MoeDecoderLayer(nn.Module):
 	model_type="qwen2_moe",
 )
 class Qwen2MoeModel(EasyDeLBaseModule):
+	"""The base Qwen2 MoE transformer model.
+
+	This class implements the core transformer architecture, including embedding layers,
+	decoder layers, and final normalization.
+
+	Attributes:
+	    config (Qwen2MoeConfig): Configuration object for the model.
+	    embed_tokens (nn.Embed): Embedding layer for input tokens.
+	    layers (nn.List[Qwen2MoeDecoderLayer]): List of decoder layers.
+	    norm (RMSNorm): Final layer normalization.
+	    gradient_checkpointing (str): Gradient checkpointing strategy.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+	    rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: Qwen2MoeConfig,
@@ -502,6 +662,15 @@ class Qwen2MoeModel(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the Qwen2MoeModel module.
+
+		Args:
+		    config (Qwen2MoeConfig): The configuration object for the model.
+		    dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+		    param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -550,6 +719,27 @@ class Qwen2MoeModel(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
 	) -> tp.Union[MoeModelOutput, tp.Tuple]:
+		"""Forward pass of the Qwen2 MoE model.
+
+		Args:
+		    input_ids (tp.Optional[chex.Array]): Input token IDs (batch, seq_len). Mutually exclusive with `inputs_embeds`.
+		    inputs_embeds (tp.Optional[chex.Array]): Input embeddings (batch, seq_len, hidden_size). Mutually exclusive with `input_ids`.
+		    attention_mask (tp.Optional[chex.Array]): Attention mask (batch, seq_len). Usually used for padding tokens.
+		    position_ids (tp.Optional[chex.Array]): Position IDs (batch, seq_len). If None, automatically generated.
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+		    output_attentions (tp.Optional[bool]): Whether to output attention weights (default defined by config).
+		    output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all layers (default defined by config).
+		    output_router_logits (tp.Optional[bool]): Whether to output router logits (default defined by config).
+		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for caching.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention (optional).
+		    return_dict (bool): Whether to return a `MoeModelOutput` object or a tuple (default: True).
+
+		Returns:
+		    tp.Union[MoeModelOutput, tp.Tuple]: The model output, either as a `MoeModelOutput` object or a tuple.
+
+		Raises:
+		    ValueError: If both `input_ids` and `inputs_embeds` are provided or neither is provided.
+		"""
 		if output_router_logits is None:
 			output_router_logits = self.config.output_router_logits
 
@@ -649,6 +839,21 @@ class Qwen2MoeModel(EasyDeLBaseModule):
 	model_type="qwen2_moe",
 )
 class Qwen2MoeForCausalLM(EasyDeLBaseModule):
+	"""Qwen2 MoE model with a Causal Language Modeling (CLM) head.
+
+	This class wraps the base `Qwen2MoeModel` and adds a linear layer (language model head)
+	to predict the next token logits.
+
+	Attributes:
+	    config (Qwen2MoeConfig): Configuration object for the model.
+	    model (Qwen2MoeModel): The base Qwen2 MoE model.
+	    lm_head (ParallelLinear): The language model head (linear layer).
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+	    rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: Qwen2MoeConfig,
@@ -658,6 +863,15 @@ class Qwen2MoeForCausalLM(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the Qwen2MoeForCausalLM module.
+
+		Args:
+		    config (Qwen2MoeConfig): The configuration object for the model.
+		    dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+		    param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -699,6 +913,24 @@ class Qwen2MoeForCausalLM(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
 	) -> tp.Union[MoeCausalLMOutput, tp.Tuple]:
+		"""Forward pass of the Qwen2 MoE model for Causal Language Modeling.
+
+		Args:
+		    input_ids (tp.Optional[chex.Array]): Input token IDs (batch, seq_len). Mutually exclusive with `inputs_embeds`.
+		    inputs_embeds (tp.Optional[chex.Array]): Input embeddings (batch, seq_len, hidden_size). Mutually exclusive with `input_ids`.
+		    attention_mask (tp.Optional[chex.Array]): Attention mask (batch, seq_len). Usually used for padding tokens.
+		    position_ids (tp.Optional[chex.Array]): Position IDs (batch, seq_len). If None, automatically generated.
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+		    output_attentions (tp.Optional[bool]): Whether to output attention weights (default defined by config).
+		    output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all layers (default defined by config).
+		    output_router_logits (tp.Optional[bool]): Whether to output router logits (default defined by config).
+		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for caching.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention (optional).
+		    return_dict (bool): Whether to return a `MoeCausalLMOutput` object or a tuple (default: True).
+
+		Returns:
+		    tp.Union[MoeCausalLMOutput, tp.Tuple]: The model output, including logits, hidden states, attentions, and router logits.
+		"""
 		if output_router_logits is None:
 			output_router_logits = self.config.output_router_logits
 		if output_hidden_states is None:
@@ -714,6 +946,7 @@ class Qwen2MoeForCausalLM(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			output_router_logits=output_router_logits,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			return_dict=True,
 			segment_ids=segment_ids,
 		)
@@ -732,17 +965,12 @@ class Qwen2MoeForCausalLM(EasyDeLBaseModule):
 		aux_loss = None
 		if output_router_logits and outputs.router_logits is not None:
 			aux_loss = auxiliary_load_balancing_loss_func(
-				gate_logits=tuple(
-					[
-						logit.reshape(batch_size * seq_length, -1)
-						for logit in outputs.router_logits
-					]
-				),
+				gate_logits=outputs.router_logits,
 				num_experts=self.config.num_experts,
 				top_k=self.config.num_experts_per_tok,
 				attention_mask=attention_mask,
 			)
-			aux_loss = aux_loss * self.config.router_aux_loss_coef
+			aux_loss += aux_loss * self.config.router_aux_loss_coef
 		if not return_dict:
 			outputs = (logits,) + tuple(
 				v
@@ -771,6 +999,21 @@ class Qwen2MoeForCausalLM(EasyDeLBaseModule):
 	model_type="qwen2_moe",
 )
 class Qwen2MoeForSequenceClassification(EasyDeLBaseModule):
+	"""Qwen2 MoE model with a sequence classification head.
+
+	This class wraps the base `Qwen2MoeModel` and adds a linear layer on top
+	to perform sequence classification tasks.
+
+	Attributes:
+	    config (Qwen2MoeConfig): Configuration object for the model.
+	    model (Qwen2MoeModel): The base Qwen2 MoE model.
+	    score (ParallelLinear): The sequence classification head (linear layer).
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+	    rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: Qwen2MoeConfig,
@@ -780,6 +1023,15 @@ class Qwen2MoeForSequenceClassification(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the Qwen2MoeForSequenceClassification module.
+
+		Args:
+		    config (Qwen2MoeConfig): The configuration object for the model.
+		    dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+		    param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -821,11 +1073,29 @@ class Qwen2MoeForSequenceClassification(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
 	) -> tp.Union[SequenceClassifierOutput, tp.Tuple]:
+		"""Forward pass of the Qwen2 MoE model for sequence classification.
+
+		Args:
+		    input_ids (tp.Optional[chex.Array]): Input token IDs (batch, seq_len). Mutually exclusive with `inputs_embeds`.
+		    inputs_embeds (tp.Optional[chex.Array]): Input embeddings (batch, seq_len, hidden_size). Mutually exclusive with `input_ids`.
+		    attention_mask (tp.Optional[chex.Array]): Attention mask (batch, seq_len). Usually used for padding tokens.
+		    position_ids (tp.Optional[chex.Array]): Position IDs (batch, seq_len). If None, automatically generated.
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for caching (ignored in classification).
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention (ignored in classification).
+		    output_attentions (tp.Optional[bool]): Whether to output attention weights (default defined by config).
+		    output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all layers (default defined by config).
+		    return_dict (bool): Whether to return a `SequenceClassifierOutput` object or a tuple (default: True).
+
+		Returns:
+		    tp.Union[SequenceClassifierOutput, tp.Tuple]: The model output, including classification logits, hidden states, and attentions.
+		"""
 		transformer_outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,

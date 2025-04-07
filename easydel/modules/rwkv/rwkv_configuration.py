@@ -111,8 +111,6 @@ class RwkvConfig(EasyDeLBaseConfig):
 			**kwargs,
 		)
 
- 
-
 	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
 		"""
 		Get the partition rules for the model.

@@ -110,6 +110,34 @@ class GemmaConfig(EasyDeLBaseConfig):
 		hidden_activation="gelu_pytorch_tanh",
 		**kwargs,
 	):
+		"""Initialize a new GemmaConfig instance.
+
+		Args:
+			vocab_size (int, optional): Size of the vocabulary. Defaults to 256000.
+			hidden_size (int, optional): Dimensionality of the embeddings and hidden states. Defaults to 3072.
+			intermediate_size (int, optional): Dimensionality of the feed-forward layer. Defaults to 24576.
+			num_hidden_layers (int, optional): Number of hidden layers. Defaults to 28.
+			num_attention_heads (int, optional): Number of attention heads. Defaults to 16.
+			num_key_value_heads (int, optional): Number of key/value heads (for GQA). Defaults to 16.
+			head_dim (int, optional): Dimension of each attention head. Defaults to 256.
+			hidden_act (str, optional): Activation function for hidden layers. Defaults to "gelu_pytorch_tanh".
+			max_position_embeddings (int, optional): Maximum sequence length. Defaults to 8192.
+			initializer_range (float, optional): Range for weight initialization. Defaults to 0.02.
+			rms_norm_eps (float, optional): Epsilon for RMS normalization. Defaults to 1e-6.
+			use_cache (bool, optional): Whether to use KV cache for generation. Defaults to True.
+			pad_token_id (int, optional): ID for padding token. Defaults to 0.
+			eos_token_id (int, optional): ID for end of sequence token. Defaults to 1.
+			bos_token_id (int, optional): ID for beginning of sequence token. Defaults to 2.
+			tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to True.
+			rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
+			attention_bias (bool, optional): Whether to use bias in attention. Defaults to False.
+			attention_dropout (float, optional): Dropout probability for attention. Defaults to 0.0.
+			gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
+			bits (Optional[int], optional): Quantization bits. Defaults to None.
+			scan_layers (bool, optional): Whether to scan layers. Defaults to False.
+			hidden_activation (str, optional): Activation for hidden layers. Defaults to "gelu_pytorch_tanh".
+			**kwargs: Additional arguments.
+		"""
 		self.gradient_checkpointing = gradient_checkpointing
 		self.bits = bits
 		self.scan_layers = scan_layers
@@ -180,14 +208,29 @@ class GemmaConfig(EasyDeLBaseConfig):
 
 	@staticmethod
 	def get_weight_decay_exclusions():
+		"""Returns a tuple of parameter names for which weight decay should be excluded.
+
+		Returns:
+			tuple: An empty tuple, indicating no weight decay exclusions.
+		"""
 		return tuple()
 
 	@staticmethod
 	def rng_keys():
+		"""Returns the names of the random number generator keys used by the model.
+
+		Returns:
+			tuple: A tuple containing "params", "dropout", and "fcm" as the RNG keys.
+		"""
 		return "params", "dropout", "fcm"
 
 	@property
 	def granted_freq_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size for frequency-based position embeddings.
+
+		Returns:
+			int: The maximum position embedding size, falling back to max_position_embeddings if not explicitly set.
+		"""
 		return getattr(
 			self,
 			"freq_max_position_embeddings",
@@ -196,6 +239,11 @@ class GemmaConfig(EasyDeLBaseConfig):
 
 	@property
 	def granted_mask_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size for mask-based position embeddings.
+
+		Returns:
+			int: The maximum position embedding size, falling back to max_position_embeddings if not explicitly set.
+		"""
 		return getattr(
 			self,
 			"mask_max_position_embeddings",

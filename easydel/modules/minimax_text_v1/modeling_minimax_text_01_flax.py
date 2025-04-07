@@ -408,12 +408,7 @@ class MiniMaxText01Attention(AttentionModule):
 				attn_output=self._merge_heads(attentions.attention_outputs)
 			)
 		)
-		outputs = (
-			(attn_output, attentions.attention_weights)
-			if output_attentions
-			else (attn_output, None)
-		)
-		return outputs
+		return attn_output, attentions.attention_weights
 
 
 class MiniMaxText01MLP(nn.Module):
@@ -984,6 +979,7 @@ class MiniMaxText01ForCausalLM(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			output_router_logits=output_router_logits,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			return_dict=True,
 			segment_ids=segment_ids,
 		)
@@ -992,17 +988,12 @@ class MiniMaxText01ForCausalLM(EasyDeLBaseModule):
 		aux_loss = None
 		if output_router_logits and outputs.router_logits is not None:
 			aux_loss = auxiliary_load_balancing_loss_func(
-				gate_logits=tuple(  # type:ignore
-					[
-						logit.reshape(batch_size * seq_length, -1)
-						for logit in outputs.router_logits
-					]  # type:ignore
-				),
+				gate_logits=outputs.router_logits,
 				num_experts=self.config.num_local_experts,
 				top_k=self.config.num_experts_per_tok,
 				attention_mask=attention_mask,
 			)
-			aux_loss = aux_loss * self.config.router_aux_loss_coef
+			aux_loss += aux_loss * self.config.router_aux_loss_coef
 		if not return_dict:
 			outputs = (logits,) + tuple(
 				v

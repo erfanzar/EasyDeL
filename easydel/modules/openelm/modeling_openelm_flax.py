@@ -47,6 +47,32 @@ from .openelm_configuration import OpenELMConfig, make_divisible
 
 
 class OpenELMMultiHeadCausalAttention(AttentionModule):
+	"""OpenELM Multi-Head Causal Attention module.
+
+	This module implements the multi-head causal self-attention mechanism used in the OpenELM model.
+	It supports Grouped Query Attention (GQA) and optional RMS Normalization of query and key projections.
+
+	Attributes:
+	    config (OpenELMConfig): Configuration object for the model.
+	    layer_idx (int): The index of the current layer.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    rngs (nn.Rngs): Random number generators.
+	    qkv_proj (ParallelLinear): Combined linear layer for query, key, and value projections.
+	    q_norm (RMSNorm, optional): RMS Normalization applied to the query projection if enabled.
+	    k_norm (RMSNorm, optional): RMS Normalization applied to the key projection if enabled.
+	    out_proj (ParallelLinear): Linear layer for the output projection.
+	    head_dim (int): Dimensionality of each attention head.
+	    attention_performer (FlexibleAttentionModule): Module to perform the core attention computation.
+	    num_q_heads (int): Number of query heads.
+	    num_k_heads (int): Number of key heads.
+	    num_v_heads (int): Number of value heads.
+	    transformer_dim (int): Dimensionality of the transformer model.
+	    num_groups (int): Number of query groups for GQA.
+	    rotary (RoPE): Rotary position embedding module.
+	"""
+
 	def __init__(
 		self,
 		config: OpenELMConfig,
@@ -57,6 +83,16 @@ class OpenELMMultiHeadCausalAttention(AttentionModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the OpenELMMultiHeadCausalAttention module.
+
+		Args:
+		    config (OpenELMConfig): The configuration object for the OpenELM model.
+		    layer_idx (int): The index of the current decoder layer.
+		    dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__(config=config)
 		self.dtype = dtype
 		self.param_dtype = param_dtype
@@ -159,20 +195,24 @@ class OpenELMMultiHeadCausalAttention(AttentionModule):
 		frequencies: tp.Optional[chex.Array] = None,
 	):
 		"""
-		Forward pass of the attention module.
+		Forward pass of the OpenELMMultiHeadCausalAttention module.
 
 		Args:
-		    hidden_states (chex.Array): Input hidden states.
-		    attention_mask (chex.Array): Mask to apply on the attention scores.
-		    position_ids (chex.Array): Position indices for the tokens.
-		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+		    hidden_states (chex.Array): Input hidden states. Shape: (batch_size, sequence_length, hidden_size).
+		    attention_mask (chex.Array): Mask to apply on the attention scores. Shape: (batch_size, 1, query_length, key_length).
+		    position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
+		    causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
+		    cache_view (tp.Optional[TransformerCacheView | PagedAttentionCacheView]): Cache view for attention KVs.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
 		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-		    deterministic (bool): If True, disables dropout for deterministic behavior.
-		    init_cache (bool): If True, initializes cache for caching keys and values.
-		    output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-		    fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+		    output_attentions (bool): Whether to return attention weights. Default is False.
+		    fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
+		    frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
+
 		Returns:
-		    tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+		    tp.Union[tp.Tuple[chex.Array, chex.Array], tp.Tuple[chex.Array]]:
+		        A tuple containing the attention output hidden states. If `output_attentions` is True,
+		        it also includes the attention weights.
 		"""
 		batch_size, sequence_length = hidden_states.shape[:2]
 		output_attentions = False
@@ -212,7 +252,6 @@ class OpenELMMultiHeadCausalAttention(AttentionModule):
 
 		if self.k_norm is not None:
 			key_states = self.k_norm(key_states)
-
 		query_states, key_states, value_states = map(
 			lambda x: x.transpose(0, 2, 1, 3),
 			[query_states, key_states, value_states],
@@ -258,15 +297,29 @@ class OpenELMMultiHeadCausalAttention(AttentionModule):
 			self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
 		)
 
-		outputs = (
-			(attn_output, attentions.attention_weights)
-			if output_attentions
-			else (attn_output, None)
-		)
-		return outputs
+		return attn_output, attentions.attention_weights
 
 
 class OpenELMFeedForwardNetwork(nn.Module):
+	"""OpenELM Feed-Forward Network (FFN) module.
+
+	This module implements the FFN layer used in the OpenELM model.
+	It supports both standard MLP and Gated Linear Unit (GLU) variants.
+
+	Attributes:
+	    config (OpenELMConfig): Configuration object for the model.
+	    layer_idx (int): The index of the current layer.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    rngs (nn.Rngs): Random number generators.
+	    ffn_with_glu (bool): Whether the FFN uses a Gated Linear Unit.
+	    proj_1 (ParallelLinear): First linear projection layer (or gate projection in GLU).
+	    proj_2 (ParallelLinear): Second linear projection layer (down projection).
+	    gate_proj (ParallelLinear, optional): Gate projection layer used only if `ffn_with_glu` is True.
+	    activation_fn (callable): The activation function.
+	"""
+
 	def __init__(
 		self,
 		config: OpenELMConfig,
@@ -277,6 +330,16 @@ class OpenELMFeedForwardNetwork(nn.Module):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the OpenELMFeedForwardNetwork module.
+
+		Args:
+		    config (OpenELMConfig): The configuration object for the OpenELM model.
+		    layer_idx (int): The index of the current decoder layer.
+		    dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__()
 		self.config = config
 		self.dtype = dtype
@@ -355,6 +418,25 @@ class OpenELMFeedForwardNetwork(nn.Module):
 
 
 class OpenELMDecoderLayer(nn.Module):
+	"""OpenELM Transformer Decoder Layer.
+
+	This module represents a single decoder layer in the OpenELM model,
+	combining self-attention and FFN sub-layers with residual connections
+	and layer normalization applied before each sub-layer.
+
+	Attributes:
+	    config (OpenELMConfig): Configuration object for the model.
+	    layer_idx (int): The index of the current layer.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    rngs (nn.Rngs): Random number generators.
+	    attn (OpenELMMultiHeadCausalAttention): The self-attention module.
+	    ffn (OpenELMFeedForwardNetwork): The feed-forward network (FFN) module.
+	    attn_norm (RMSNorm): Layer normalization before the attention layer.
+	    ffn_norm (RMSNorm): Layer normalization before the FFN layer.
+	"""
+
 	def __init__(
 		self,
 		config: OpenELMConfig,
@@ -365,6 +447,16 @@ class OpenELMDecoderLayer(nn.Module):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the OpenELMDecoderLayer.
+
+		Args:
+		    config (OpenELMConfig): The configuration object for the OpenELM model.
+		    layer_idx (int): The index of the current decoder layer.
+		    dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__()
 		self.config = config
 		self.dtype = dtype
@@ -424,21 +516,23 @@ class OpenELMDecoderLayer(nn.Module):
 		fcm_mask: tp.Optional[chex.Array] = None,
 		frequencies: tp.Optional[chex.Array] = None,
 	):
-		"""
-		Forward pass of the module block.
+		"""Forward pass of the OpenELMDecoderLayer module.
 
 		Args:
-		    hidden_states (chex.Array): Input hidden states.
-		    attention_mask (chex.Array): Mask to apply on the attention scores.
-		    position_ids (chex.Array): Position indices for the tokens.
-		    causal_mask (chex.Array): Causal mask for ensuring autoregressive behavior.
+		    hidden_states (chex.Array): Input hidden states. Shape: (batch_size, sequence_length, hidden_size).
+		    attention_mask (chex.Array): Mask to apply on the attention scores. Shape: (batch_size, 1, query_length, key_length).
+		    position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
+		    causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
+		    cache_view (tp.Optional[TransformerCacheView | PagedAttentionCacheView]): Cache view for attention KVs.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
 		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
-		    deterministic (bool): If True, disables dropout for deterministic behavior.
-		    init_cache (bool): If True, initializes cache for caching keys and values.
-		    output_attentions (bool): If True, outputs attention weights alongside the hidden states.
-		    fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
+		    output_attentions (bool): Whether to return attention weights. Default is False.
+		    fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
+		    frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
+
 		Returns:
-		    tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
+		    tp.Tuple[chex.Array, tp.Optional[chex.Array]]:
+		        A tuple containing the output hidden states and optionally the attention weights.
 		"""
 		residual = hidden_states
 		hidden_states = self.attn_norm(hidden_states)
@@ -484,6 +578,24 @@ class OpenELMDecoderLayer(nn.Module):
 	model_type="openelm",
 )
 class OpenELMModel(EasyDeLBaseModule):
+	"""The base OpenELM model transformer.
+
+	This class represents the core transformer architecture of the OpenELM model,
+	consisting of an embedding layer, multiple OpenELMDecoderLayer layers,
+	and a final RMS normalization layer.
+
+	Attributes:
+	    config (OpenELMConfig): Configuration object for the model.
+	    dtype (jnp.dtype): Data type for computation.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    rngs (nn.Rngs): Random number generators.
+	    token_embeddings (nn.Embed): Embedding layer for input tokens.
+	    layers (tp.List[OpenELMDecoderLayer]): List of decoder layers.
+	    norm (RMSNorm): Final layer normalization.
+	    gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
+	"""
+
 	def __init__(
 		self,
 		config: OpenELMConfig,
@@ -493,6 +605,15 @@ class OpenELMModel(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the OpenELMModel.
+
+		Args:
+		    config (OpenELMConfig): The configuration object for the OpenELM model.
+		    dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -561,6 +682,32 @@ class OpenELMModel(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
 	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+		"""Forward pass of the OpenELMModel.
+
+		Args:
+		    input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
+		    inputs_embeds (tp.Optional[chex.Array]): Input embeddings. Shape: (batch_size, sequence_length, hidden_size).
+		        Either `input_ids` or `inputs_embeds` must be provided.
+		    attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+		        Shape: (batch_size, sequence_length).
+		    position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+		        Shape: (batch_size, sequence_length).
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
+		    output_attentions (tp.Optional[bool]): Whether to return attention weights. Defaults to `config.output_attentions`.
+		    output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
+		        Defaults to `config.output_hidden_states`.
+		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for attention.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+		    return_dict (bool): Whether to return a `BaseModelOutput` object or a tuple.
+
+		Returns:
+		    tp.Union[BaseModelOutput, tp.Tuple]: The model's output. If `return_dict` is True,
+		        returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
+		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
+
+		Raises:
+		    ValueError: If neither `input_ids` nor `inputs_embeds` is provided.
+		"""
 		all_attentions = () if output_attentions else None
 		all_hidden_states = () if output_hidden_states else None
 
@@ -633,6 +780,24 @@ class OpenELMModel(EasyDeLBaseModule):
 	model_type="openelm",
 )
 class OpenELMForCausalLM(EasyDeLBaseModule):
+	"""OpenELM model with a Causal Language Modeling head.
+
+	This model consists of the base OpenELM transformer (`OpenELMModel`) followed by a
+	linear layer (`lm_head`) that projects the transformer's output hidden states
+	to the vocabulary size, producing logits for next token prediction.
+	Optionally, the input token embeddings can be tied to the output projection layer.
+
+	Attributes:
+	    config (OpenELMConfig): Configuration object for the model.
+	    dtype (jnp.dtype): Data type for computation.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    rngs (nn.Rngs): Random number generators.
+	    transformer (OpenELMModel): The core OpenELM transformer model.
+	    lm_head (ParallelLinear, optional): The linear layer for projecting hidden states to vocabulary logits.
+	        This is None if `config.share_input_output_layers` is True.
+	"""
+
 	def __init__(
 		self,
 		config: OpenELMConfig,
@@ -642,6 +807,15 @@ class OpenELMForCausalLM(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the OpenELMForCausalLM model.
+
+		Args:
+		    config (OpenELMConfig): The configuration object for the OpenELM model.
+		    dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -682,12 +856,36 @@ class OpenELMForCausalLM(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
 	) -> tp.Union[CausalLMOutput, tp.Tuple]:
+		"""Forward pass of the OpenELMForCausalLM model.
+
+		Args:
+		    input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
+		    inputs_embeds (tp.Optional[chex.Array]): Input embeddings. Shape: (batch_size, sequence_length, hidden_size).
+		        Either `input_ids` or `inputs_embeds` must be provided.
+		    attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+		        Shape: (batch_size, sequence_length).
+		    position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+		        Shape: (batch_size, sequence_length).
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
+		    output_attentions (tp.Optional[bool]): Whether to return attention weights. Defaults to `config.output_attentions`.
+		    output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
+		        Defaults to `config.output_hidden_states`.
+		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for attention.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+		    return_dict (bool): Whether to return a `CausalLMOutput` object or a tuple.
+
+		Returns:
+		    tp.Union[CausalLMOutput, tp.Tuple]: The model's output. If `return_dict` is True,
+		        returns a `CausalLMOutput` object containing `logits`, `hidden_states` (optional),
+		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
+		"""
 		outputs = self.transformer(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			inputs_embeds=inputs_embeds,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,

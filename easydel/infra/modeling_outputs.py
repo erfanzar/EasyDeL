@@ -20,6 +20,7 @@
 # Long-Term Benefits: While it might be a more opinionated choice, it reinforces the idea that
 #  infra is a central part of your system, and it will be better in the long term.
 # and i dont like to face `most likely due to a circular import` issue.
+import dataclasses
 import typing as tp
 from dataclasses import fields, is_dataclass
 
@@ -52,6 +53,12 @@ class ModelOutput(tp.OrderedDict):
 				f"{self.__module__}.{self.__class__.__name__} is not a dataclasss."
 				" This is a subclass of ModelOutput and so must use the @auto_pytree decorator."
 			)
+
+	def to_tuple(self) -> tuple[tp.Any]:
+		"""
+		Convert self to a tuple containing all the attributes/keys that are not `None`.
+		"""
+		return tuple(self[k] for k in self.keys())
 
 	def __post_init__(self):
 		"""Check the ModelOutput dataclass.
@@ -151,12 +158,6 @@ class ModelOutput(tp.OrderedDict):
 		callable, _args, *remaining = super().__reduce__()
 		args = tuple(getattr(self, field.name) for field in fields(self))
 		return callable, args, *remaining
-
-	def to_tuple(self) -> tp.Tuple[tp.Any]:
-		"""
-		Convert self to a tuple containing all the attributes/keys that are not `None`.
-		"""
-		return tuple(self[k] for k in self.keys())
 
 
 @auto_pytree
@@ -864,7 +865,7 @@ class Seq2SeqQuestionAnsweringModelOutput(ModelOutput):
 
 
 @auto_pytree
-class MoeModelOutput(MaskedLMOutput):
+class MoeModelOutput(ModelOutput):
 	"""
 	Base class for MoE model outputs.
 
@@ -890,9 +891,11 @@ class MoeModelOutput(MaskedLMOutput):
 
 	last_hidden_state: chex.Array = None
 	hidden_states: tp.Optional[tp.Tuple[chex.Array]] = None
+	past_key_values: tp.Optional[TransformerCache] = None
 	attentions: tp.Optional[tp.Tuple[chex.Array]] = None
 	router_logits: tp.Optional[tp.Tuple[chex.Array]] = None
 	all_router_losses: tp.Optional[tp.Tuple[chex.Array]] = None
+	logits: chex.Array = None
 	loss: tp.Optional[chex.Array] = None
 
 
@@ -995,7 +998,7 @@ class ImageClassifierOutput(ModelOutput):
 class CLIPOutput(ModelOutput):
 	"""
 	Args:
-			loss:(`chex.Array`) training loss
+	    loss:(`chex.Array`) training loss
 	    logits_per_image:(`chex.Array` of shape `(image_batch_size, text_batch_size)`):
 	        The scaled dot product scores between `image_embeds` and `text_embeds`. This represents the image-text
 	        similarity scores.

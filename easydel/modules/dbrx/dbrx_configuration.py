@@ -229,6 +229,25 @@ class DbrxConfig(EasyDeLBaseConfig):
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs: tp.Any,
 	):
+		"""Initialize the DbrxConfig with the specified parameters.
+
+		Args:
+			d_model (int, optional): Hidden size for the transformer. Defaults to 2048.
+			n_heads (int, optional): Number of attention heads. Defaults to 16.
+			n_layers (int, optional): Number of transformer layers. Defaults to 24.
+			max_seq_len (int, optional): Maximum sequence length. Defaults to 2048.
+			vocab_size (int, optional): Vocabulary size. Defaults to 32000.
+			resid_pdrop (float, optional): Residual dropout probability. Defaults to 0.0.
+			emb_pdrop (float, optional): Embedding dropout probability. Defaults to 0.0.
+			attn_config (Optional[DbrxAttentionConfig], optional): Configuration for attention. Defaults to None.
+			ffn_config (Optional[DbrxFFNConfig], optional): Configuration for feed-forward network. Defaults to None.
+			use_cache (bool, optional): Whether to use KV cache for decoding. Defaults to True.
+			initializer_range (float, optional): Range for weight initialization. Defaults to 0.02.
+			output_router_logits (bool, optional): Whether to output router logits. Defaults to False.
+			router_aux_loss_coef (float, optional): Coefficient for router auxiliary loss. Defaults to 0.05.
+			gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
+			**kwargs (Any): Additional arguments.
+		"""
 		if attn_config is None:
 			self.attn_config = DbrxAttentionConfig()
 		elif isinstance(attn_config, dict):
@@ -267,6 +286,11 @@ class DbrxConfig(EasyDeLBaseConfig):
 
 	@property
 	def granted_freq_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size for frequency-based position embeddings.
+
+		Returns:
+			int: The maximum position embedding size, falling back to max_seq_len if not explicitly set.
+		"""
 		return getattr(
 			self,
 			"freq_max_position_embeddings",
@@ -275,6 +299,11 @@ class DbrxConfig(EasyDeLBaseConfig):
 
 	@property
 	def granted_mask_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size for mask-based position embeddings.
+
+		Returns:
+			int: The maximum position embedding size, falling back to max_seq_len if not explicitly set.
+		"""
 		return getattr(
 			self,
 			"mask_max_position_embeddings",
@@ -282,10 +311,16 @@ class DbrxConfig(EasyDeLBaseConfig):
 		)
 
 	def get_partition_rules(self, *args, **kwargs):
-		"""
-		Get the partition rules for the model.
+		"""Get the partition rules for the model parameters.
+
+		These rules define how parameters should be sharded across devices when using model parallelism.
+
+		Args:
+			*args: Variable length argument list.
+			**kwargs: Arbitrary keyword arguments.
+
 		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+			Tuple: A tuple of partition rules for different parameter patterns.
 		"""
 		return (
 			# Embeddings

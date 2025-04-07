@@ -21,12 +21,13 @@ from functools import partial
 
 import jax
 import optax
+from eformer import escale as es
 from flax import nnx as nn
 from flax import struct
-from eformer import escale as es
 from jax.sharding import NamedSharding, PartitionSpec
 from safetensors.flax import load_file as safe_load_file
 from safetensors.flax import save_file as safe_save_file
+
 from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import specs_to_name_sharding
 
@@ -47,10 +48,23 @@ logger = get_logger(__name__)
 
 class EasyDeLState(struct.PyTreeNode):
 	"""
-	**EasyDeLState A Snapshot of Your EasyDeL Model**
+	Represents the state of an EasyDeL model during training or inference.
 
-	The `EasyDeLState` class acts like a comprehensive container that holds all the essential information about your EasyDeL
-	model at a given point in time. Think of it as a snapshot of your model. It includes
+	This class encapsulates the model's parameters, optimizer state, training step,
+	and potentially other metadata. It provides methods for applying gradients,
+	managing sharding, saving, and loading the state.
+
+	Attributes:
+	    step (int | jax.Array): The current training step count.
+	    graphdef (nn.GraphDef): The definition of the model's computation graph (structure).
+	    graphstate (nn.GraphState): The state of the model's parameters.
+	    graphother (nn.GraphState): The state of non-parameter variables within the model.
+	    tx (optax.GradientTransformation): The optimizer transformation (e.g., AdamW, SGD).
+	        Marked as a non-pytree node.
+	    opt_state (tp.Optional[optax.OptState]): The state of the optimizer (e.g., moments).
+	        Marked as a pytree node.
+	    apply_fn (tp.Optional[tp.Callable]): A function to apply the model (often `model.__call__`).
+	        Typically not directly part of the state but can be associated.
 	"""
 
 	step: int | jax.Array
@@ -63,14 +77,17 @@ class EasyDeLState(struct.PyTreeNode):
 
 	def apply_gradients(self, *, grads):
 		"""
-		Applies gradients to the model parameters and updates the optimizer state.
-		This function is typically called during training to update the model based on the computed gradients.
+		Updates the model's parameters and optimizer state based on calculated gradients.
 
 		Args:
-		    grads: A dictionary of gradients, where keys correspond to model parameters.
+		    grads: A pytree matching the structure of `self.graphstate` containing the gradients.
 
 		Returns:
-		    EasyDeLState: An updated EasyDeLState object with modified parameters and optimizer state.
+		    EasyDeLState: A new state object with the updated parameters (`graphstate`),
+		        optimizer state (`opt_state`), and incremented step count.
+
+		Raises:
+		    AssertionError: If `opt_state` or `tx` is not initialized.
 		"""
 		assert self.opt_state is not None
 		assert self.tx is not None
@@ -106,19 +123,34 @@ class EasyDeLState(struct.PyTreeNode):
 		init_opt_state: bool = False,
 	) -> EasyDeLState:
 		"""
-		Create an instance with flexible initialization options.
+		Creates a new `EasyDeLState` instance.
+
+		This class method provides a flexible way to initialize the state, either from an
+		existing `nn.Module` or by providing the graph components (`graphdef`, `graphstate`,
+		`graphother`) directly. It also handles optimizer state initialization.
 
 		Args:
-		    step: Optional number of training steps.
-		    graphdef: Optional graph definition.
-		    graphstate: Optional graph state.
-		    graphother: Optional graph *others.
-		    model: Optional neural network module.
-		    tx: Optional gradient transformation.
-		    opt_state: Optional optimizer state.
+		    step (tp.Optional[int]): The initial training step. Defaults to 0.
+		    graphdef (tp.Optional[nn.GraphDef]): The model's graph definition.
+		    graphstate (tp.Optional[nn.GraphState]): The model's parameter state.
+		    graphother (tp.Optional[nn.GraphState]): The model's non-parameter state.
+		    model (tp.Optional[nn.Module]): An EasyDeL module instance. If provided,
+		        `graphdef`, `graphstate`, and `graphother` are derived from it.
+		        Cannot be provided simultaneously with graph components.
+		    tx (tp.Optional[optax.GradientTransformation]): The optimizer transformation.
+		    opt_state (tp.Optional[optax.OptState]): The initial optimizer state. Cannot be
+		        provided if `init_opt_state` is True.
+		    init_opt_state (bool): If True, initializes the optimizer state using `tx.init(graphstate)`.
+		        Requires `tx` to be provided. Defaults to False.
+
+		Returns:
+		    EasyDeLState: A new instance of the state.
 
 		Raises:
-		    ValueError: If initialization parameters are inconsistent.
+		    ValueError: If `model` and graph components are provided simultaneously.
+		    ValueError: If graph components are provided partially.
+		    ValueError: If `init_opt_state` is True and `opt_state` is also provided.
+		    ValueError: If `init_opt_state` is True but `tx` is not provided.
 		"""
 		# Validate mutual exclusivity of model and graph-related parameters
 		graph_params_provided = (
@@ -175,14 +207,18 @@ class EasyDeLState(struct.PyTreeNode):
 		partition_rules: PartitionLike = None,
 	) -> EasyDeLState:
 		"""
-		Initialize the optimizer state with the given gradient transformation.
+		Initializes the optimizer state (`opt_state`) for the current `graphstate`
+		using the provided optimizer transformation (`tx`). It automatically handles
+		sharding based on the model's partition rules.
 
 		Args:
-		  tx (optax.GradientTransformation): A gradient transformation to initialize the optimizer state.
-		  partition_rules (Optional[Any], optional): Rules for partitioning the optimizer state. Defaults to None.
+		    tx (optax.GradientTransformation): The optimizer transformation to initialize with.
+		    partition_rules (PartitionLike, optional): Partitioning rules for the optimizer state.
+		        If None, uses the rules from the associated model's config. Defaults to None.
 
 		Returns:
-		  EasyDeLState: An updated EasyDeLState object with the new gradient transformation and sharded optimizer state.
+		    EasyDeLState: A new state object with the initialized and potentially sharded
+		        `opt_state` and the provided `tx`.
 		"""
 
 		if partition_rules is None:
@@ -211,19 +247,20 @@ class EasyDeLState(struct.PyTreeNode):
 		partition_rules: PartitionLike = None,
 	) -> tp.Any:
 		"""
-		Shards the optimizer state according to the provided partition rules.
+		Applies sharding to the optimizer state based on partition rules.
 
 		Args:
-		  opt_state (Optional[Any]): The optimizer state to be sharded. If None, the method will use `self.opt_state`.
-		                            Raises a ValueError if both `opt_state` and `self.opt_state` are None.
-		  partition_rules (Optional[Any]): The partition rules to be used for sharding. If None, the method will use
-		                                  the partition rules from `self.model.config`.
+		    opt_state (tp.Optional[tp.Any]): The optimizer state pytree to shard. If None,
+		        uses `self.opt_state`. Defaults to None.
+		    partition_rules (PartitionLike, optional): Partitioning rules. If None, uses
+		        rules from the model's config. Defaults to None.
 
 		Returns:
-		  Any: The sharded optimizer state.
+		    EasyDeLState: A new state object with the sharded `opt_state`.
 
 		Raises:
-		  ValueError: If both `opt_state` and `self.opt_state` are None.
+		    ValueError: If optimizer state is not initialized (neither `opt_state`
+		        argument nor `self.opt_state` is available).
 		"""
 		if opt_state is None and self.opt_state is None:
 			raise ValueError("Optimizer state is not initialized.")
@@ -245,6 +282,20 @@ class EasyDeLState(struct.PyTreeNode):
 			return self.replace(opt_state=opt_state)
 
 	def gather_optimizer_state(self, partition_rules=None):
+		"""
+		Gathers the optimizer state from potentially distributed devices.
+
+		Args:
+		    partition_rules (PartitionLike, optional): Partitioning rules used to determine
+		        how the state was sharded. If None, uses rules from the model's config.
+		        Defaults to None.
+
+		Returns:
+		    EasyDeLState: A new state object with the gathered `opt_state`.
+
+		Raises:
+		    AssertionError: If `opt_state` is not initialized.
+		"""
 		assert self.opt_state is not None, "Optimizer state is not initialized."
 		if partition_rules is None:
 			partition_rules = self.model.config.get_partition_rules()
@@ -263,19 +314,45 @@ class EasyDeLState(struct.PyTreeNode):
 		return self
 
 	def merge(self, tree) -> EasyDeLBaseModule:
+		"""
+		Merges a given state tree (usually parameters) with the graph definition
+		and other state components to reconstruct the full model module.
+
+		Args:
+		    tree: The pytree (e.g., `nn.GraphState`) containing the parameters to merge.
+
+		Returns:
+		    EasyDeLBaseModule: The reconstructed model module.
+		"""
 		return nn.merge(self.graphdef, tree, self.graphother)
 
 	def merge_to_state(self, tree) -> EasyDeLState:
+		"""
+		Creates a new `EasyDeLState` by replacing the current `graphstate` with the provided tree.
+
+		Args:
+		    tree: The pytree (e.g., `nn.GraphState`) containing the new parameters.
+
+		Returns:
+		    EasyDeLState: A new state object with the updated `graphstate`.
+		"""
 		return self.replace(graphstate=tree)
 
 	@property
 	def model(self) -> EasyDeLBaseModule:
+		"""
+		Reconstructs and returns the full EasyDeL model module from the state components.
+
+		Returns:
+		    EasyDeLBaseModule: The model module instance.
+		"""
 		return nn.merge(self.graphdef, self.graphstate, self.graphother)
 
 	@property
 	def size(self) -> int:
 		"""
-		Calculates the total size of the optimizer state and model graph state.
+		Calculates the total size in bytes of the model parameters (`graphstate`) and
+		the optimizer state (`opt_state`).
 
 		Returns:
 		    int: The total size in bytes.
@@ -296,6 +373,24 @@ class EasyDeLState(struct.PyTreeNode):
 		return opt_state_size + graphstate_size
 
 	def load_optimizer(self, load_directory: tp.Union[str, os.PathLike]):
+		"""
+		Loads the optimizer state from saved files.
+
+		Reads the optimizer state structure from a pickle file (`OPTIMIZER_STRUCT_NAME`)
+		and the tensor data from a SafeTensors file (`OPTIMIZER_NAME`) within the
+		specified directory.
+
+		Args:
+		    load_directory (tp.Union[str, os.PathLike]): The directory containing the
+		        saved optimizer state files.
+
+		Returns:
+		    EasyDeLState: A new state object with the loaded `opt_state`.
+
+		Raises:
+		    FileNotFoundError: If the required optimizer files are not found.
+		    Exception: If any error occurs during loading or deserialization.
+		"""
 		load_directory = pathlib.Path(load_directory)
 		optim_path = load_directory / OPTIMIZER_NAME
 		struct_path = load_directory / OPTIMIZER_STRUCT_NAME
@@ -330,6 +425,24 @@ class EasyDeLState(struct.PyTreeNode):
 		save_optimizer: bool = True,
 		enable: tp.Optional[bool] = None,
 	):
+		"""
+		Saves the entire `EasyDeLState` to a directory.
+
+		This includes saving the model parameters (using `model.save_pretrained`)
+		and optionally the optimizer state.
+
+		Args:
+		    save_directory (tp.Union[str, os.PathLike]): The directory to save the state to.
+		    float_dtype (tp.Optional[jax.numpy.dtype]): Optional dtype to cast floating-point
+		        parameters to before saving. Defaults to None.
+		    verbose (bool): If True, logs information during saving. Defaults to True.
+		    mismatch_allowed (bool): Passed to `model.save_pretrained`, allows saving even if
+		        the model structure differs slightly from expected. Defaults to True.
+		    save_optimizer (bool): If True, saves the optimizer state. Defaults to True.
+		    enable (tp.Optional[bool]): If set, controls whether saving happens (True) or is skipped
+		        (False). If None, saving typically occurs only on JAX process index 0.
+		        Defaults to None.
+		"""
 		save_directory = pathlib.Path(save_directory)
 		save_directory = pathlib.Path(save_directory)
 		if save_optimizer:
@@ -385,7 +498,19 @@ class EasyDeLState(struct.PyTreeNode):
 	): ...
 
 	def shard_with_shape(self, shape) -> EasyDeLState:
-		"""shard current state with a given shape"""
+		"""
+		Applies sharding constraints to the entire state based on a reference shape pytree.
+
+		This method takes a pytree `shape` which has the same structure as the `EasyDeLState`
+		but contains sharding annotations (e.g., `NamedSharding`) instead of actual array data.
+		It applies these shardings as constraints to the corresponding arrays in the current state.
+
+		Args:
+		    shape: A pytree with the same structure as `self`, containing sharding annotations.
+
+		Returns:
+		    EasyDeLState: A new state object with sharding constraints applied.
+		"""
 		from eformer.escale import with_sharding_constraint
 
 		self = nn.from_tree(
@@ -402,14 +527,16 @@ class EasyDeLState(struct.PyTreeNode):
 
 	def shard_state(self, partition_rules: PartitionLike = None) -> EasyDeLState:
 		"""
-		Shards the entire state, according to the provided partition rules.
+		Shards the entire state (model parameters and optimizer state) based on partition rules.
+
+		This is a convenience method that calls `shard_model` and `shard_optimizer_state`.
 
 		Args:
-		  partition_rules (Optional[Any]): The partition rules to be used for sharding. If None, the method will use
-		                                  the partition rules from `self.model.config`.
+		    partition_rules (PartitionLike, optional): Partitioning rules. If None, uses
+		        rules from the model's config. Defaults to None.
 
 		Returns:
-		  EasyDeLState: An updated EasyDeLState object with the sharded state.
+		    EasyDeLState: A new state object with both model and optimizer states sharded.
 		"""
 		with self.model.mesh:
 			if self.opt_state is not None:
@@ -419,10 +546,12 @@ class EasyDeLState(struct.PyTreeNode):
 
 	def gather_state(self):
 		"""
-		Gathers the entire state.
+		Gathers the entire state (model parameters and optimizer state) from distributed devices.
+
+		This is a convenience method that calls `gather_model` and `gather_optimizer_state`.
 
 		Returns:
-		  EasyDeLState: An updated EasyDeLState object with the gathered state.
+		    EasyDeLState: A new state object with both model and optimizer states gathered.
 		"""
 		if self.opt_state is not None:
 			self = self.gather_optimizer_state()
@@ -435,10 +564,16 @@ class EasyDeLState(struct.PyTreeNode):
 		mesh: tp.Optional[Mesh] = None,
 	) -> EasyDeLState:
 		"""
-		Gathers the model according to the provided partition rules.
+		Gathers the model parameters (`graphstate` and `graphother`) from distributed devices.
+
+		Args:
+		    partition_rules (PartitionLike, optional): Partitioning rules used for the original sharding.
+		        If None, uses model config rules. Defaults to None.
+		    mesh (tp.Optional[Mesh], optional): The JAX device mesh to gather from. If None,
+		        uses model's mesh. Defaults to None.
 
 		Returns:
-		  EasyDeLState: An updated EasyDeLState object with the gathered model.
+		    EasyDeLState: A new state object with gathered `graphstate` and `graphother`.
 		"""
 		from eformer.escale import make_shard_and_gather_fns, match_partition_rules
 
@@ -471,15 +606,16 @@ class EasyDeLState(struct.PyTreeNode):
 		mesh: tp.Optional[Mesh] = None,
 	) -> EasyDeLState:
 		"""
-		Shards the model according to the provided partition rules.
+		Shards the model parameters (`graphstate` and `graphother`) based on partition rules.
 
 		Args:
-		  partition_rules (Optional[Any]): The partition rules to be used for sharding. If None, the method will use
-		                                  the partition rules from `self.model.config`.
-		  mesh (Optional[Mesh]): The mesh to be used for sharding. If None, the method will use the mesh from `self.model`.
+		    partition_rules (PartitionLike, optional): Partitioning rules. If None, uses
+		        model config rules. Defaults to None.
+		    mesh (tp.Optional[Mesh], optional): The JAX device mesh to shard across. If None,
+		        uses model's mesh. Defaults to None.
 
 		Returns:
-		  EasyDeLState: An updated EasyDeLState object with the sharded model.
+		    EasyDeLState: A new state object with sharded `graphstate` and `graphother`.
 		"""
 
 		rules = partition_rules or self.model._get_partition_rules(None)
@@ -501,10 +637,12 @@ class EasyDeLState(struct.PyTreeNode):
 	@property
 	def shardings(self):
 		"""
-		Returns the sharding information for the state.
+		Retrieves the sharding annotations (e.g., `NamedSharding`) for all components
+		of the `EasyDeLState` pytree.
 
 		Returns:
-		  Any: The sharding information.
+		    A pytree with the same structure as `self`, containing sharding annotations
+		    or None for components without sharding.
 		"""
 		return nn.from_tree(
 			jax.tree_util.tree_map(
@@ -514,6 +652,9 @@ class EasyDeLState(struct.PyTreeNode):
 		)
 
 	def __repr__(self):
+		"""
+		Returns a string representation of the EasyDeLState, primarily showing the model representation.
+		"""
 		return "EasyDeLState-" + str(self.model)
 
 	__str__ = __repr__

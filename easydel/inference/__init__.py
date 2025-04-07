@@ -11,22 +11,37 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from .utilities import SamplingParams
 
-from .utilities import vInferencePreCompileConfig
+# from .vengine import (
+# 	ContiguousSlotCacheManager,
+# 	vEngine,
+# 	vOrchestrator,
+# )
+ContiguousSlotCacheManager = None
+vEngine = None
+vOrchestrator = None
+
 from .vinference import (
-	SamplingParams,
 	vInference,
 	vInferenceApiServer,
 	vInferenceConfig,
+	vInferencePreCompileConfig,
 )
-from .whisper_inference import vWhisperInference, vWhisperInferenceConfig
+from .vwhisper import (
+	vWhisperInference,
+	vWhisperInferenceConfig,
+)
 
-__all__ = [
+__all__ = (
 	"SamplingParams",
+	"ContiguousSlotCacheManager",
+	"vOrchestrator",
+	"vEngine",
 	"vInference",
-	"vInferenceConfig",
 	"vInferenceApiServer",
+	"vInferenceConfig",
 	"vInferencePreCompileConfig",
 	"vWhisperInference",
 	"vWhisperInferenceConfig",
-]
+)

@@ -54,6 +54,7 @@ def main():
 			streaming_chunks=64,
 			num_return_sequences=1,
 		),
+		inference_name="LLaMA",
 	)
 
 	inference.precompile(
@@ -73,10 +74,10 @@ if __name__ == "__main__":
 	main()
 
 
-# curl -X POST http://0.0.0.0:11556/v1/chat/completions \
+# curl -X POST http://0.0.0.0:11557/v1/chat/completions \
 #      -H "Content-Type: application/json" \
 #      -d '{
-#   "model": "$MODEL_ID",
+#   "model": "LLaMA",
 #   "messages": [
 #     {
 #       "role": "user",
@@ -84,7 +85,7 @@ if __name__ == "__main__":
 #     }
 #   ],
 #   "function_call": "none",
-#   "temperature": 1,
+#   "temperature": 0.5,
 #   "top_p": 1,
 #   "n": 1,
 #   "stream": false,

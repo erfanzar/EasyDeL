@@ -232,7 +232,11 @@ def block_wise_ffn(remat_ffn, inputs, chunk_size: int):
 		) from e
 
 
-def control_mlp_sharding(x: jax.Array, partition_axis: PartitionAxis):
+def control_mlp_sharding(
+	x: jax.Array,
+	partition_axis: PartitionAxis,
+	force_spec: PartitionSpec = None,
+):
 	"""
 	handles MLP Shardings
 	"""
@@ -241,14 +245,12 @@ def control_mlp_sharding(x: jax.Array, partition_axis: PartitionAxis):
 		if x.shape[1] != 1
 		else partition_axis.generation_query_sequence_axis
 	)
-	x = with_sharding_constraint(
-		x,
-		sharding=PartitionSpec(
-			partition_axis.batch_axis,
-			sqax,
-			partition_axis.hidden_state_axis,
-		),
+	force_spec = force_spec or PartitionSpec(
+		partition_axis.batch_axis,
+		sqax,
+		partition_axis.hidden_state_axis,
 	)
+	x = with_sharding_constraint(x, sharding=force_spec)
 	return x
 
 

@@ -104,6 +104,34 @@ class OPTConfig(EasyDeLBaseConfig):
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	):
+		"""Initializes the OPTConfig object.
+
+		Args:
+		    vocab_size (int, optional): Vocabulary size. Defaults to 50272.
+		    hidden_size (int, optional): Dimensionality of the encoder layers. Defaults to 768.
+		    num_hidden_layers (int, optional): Number of hidden layers. Defaults to 12.
+		    ffn_dim (int, optional): Dimensionality of the feed-forward layer. Defaults to 3072.
+		    max_position_embeddings (int, optional): Maximum sequence length. Defaults to 2048.
+		    do_layer_norm_before (bool, optional): Whether to apply layer norm before attention. Defaults to True.
+		    _remove_final_layer_norm (bool, optional): Whether to remove the final layer norm. Defaults to False.
+		    word_embed_proj_dim (int, optional): Dimension of the word embedding projection. Defaults to `hidden_size`.
+		    dropout (float, optional): Dropout probability. Defaults to 0.1.
+		    attention_dropout (float, optional): Attention dropout probability. Defaults to 0.0.
+		    num_attention_heads (int, optional): Number of attention heads. Defaults to 12.
+		    activation_function (str, optional): Activation function name. Defaults to "relu".
+		    layerdrop (float, optional): LayerDrop probability. Defaults to 0.0.
+		    init_std (float, optional): Initialization standard deviation. Defaults to 0.02.
+		    use_cache (bool, optional): Whether to use key/value cache. Defaults to True.
+		    pad_token_id (int, optional): Padding token ID. Defaults to 1.
+		    bos_token_id (int, optional): Beginning-of-sequence token ID. Defaults to 2.
+		    eos_token_id (int, optional): End-of-sequence token ID. Defaults to 2.
+		    enable_bias (bool, optional): Whether to use bias in linear layers. Defaults to True.
+		    layer_norm_elementwise_affine (bool, optional): Whether layer norm uses elementwise affine parameters.
+		        Defaults to True.
+		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
+		        Defaults to EasyDeLGradientCheckPointers.NONE.
+		    **kwargs: Additional keyword arguments passed to the parent class.
+		"""
 		super().__init__(
 			pad_token_id=pad_token_id,
 			bos_token_id=bos_token_id,
@@ -173,6 +201,38 @@ class OPTConfig(EasyDeLBaseConfig):
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	):
+		"""Attaches custom arguments to the configuration object.
+
+		This method allows dynamically adding or overriding configuration attributes.
+		It iterates through the provided arguments and sets them as attributes
+		of the configuration object if they don't already exist.
+
+		Args:
+		    vocab_size (int, optional): Vocabulary size. Defaults to 50272.
+		    hidden_size (int, optional): Dimensionality of the encoder layers. Defaults to 768.
+		    num_hidden_layers (int, optional): Number of hidden layers. Defaults to 12.
+		    ffn_dim (int, optional): Dimensionality of the feed-forward layer. Defaults to 3072.
+		    max_position_embeddings (int, optional): Maximum sequence length. Defaults to 2048.
+		    do_layer_norm_before (bool, optional): Whether to apply layer norm before attention. Defaults to True.
+		    _remove_final_layer_norm (bool, optional): Whether to remove the final layer norm. Defaults to False.
+		    word_embed_proj_dim (int, optional): Dimension of the word embedding projection. Defaults to `hidden_size`.
+		    dropout (float, optional): Dropout probability. Defaults to 0.1.
+		    attention_dropout (float, optional): Attention dropout probability. Defaults to 0.0.
+		    num_attention_heads (int, optional): Number of attention heads. Defaults to 12.
+		    activation_function (str, optional): Activation function name. Defaults to "relu".
+		    layerdrop (float, optional): LayerDrop probability. Defaults to 0.0.
+		    init_std (float, optional): Initialization standard deviation. Defaults to 0.02.
+		    use_cache (bool, optional): Whether to use key/value cache. Defaults to True.
+		    pad_token_id (int, optional): Padding token ID. Defaults to 1.
+		    bos_token_id (int, optional): Beginning-of-sequence token ID. Defaults to 2.
+		    eos_token_id (int, optional): End-of-sequence token ID. Defaults to 2.
+		    enable_bias (bool, optional): Whether to use bias in linear layers. Defaults to True.
+		    layer_norm_elementwise_affine (bool, optional): Whether layer norm uses elementwise affine parameters.
+		        Defaults to True.
+		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
+		        Defaults to EasyDeLGradientCheckPointers.NONE.
+		    **kwargs: Additional keyword arguments to attach.
+		"""
 		basics = dict(
 			vocab_size=vocab_size,
 			hidden_size=hidden_size,

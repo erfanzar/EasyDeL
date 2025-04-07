@@ -320,12 +320,7 @@ class SiglipAttention(AttentionModule):
 		attn_output = self._merge_heads(attentions.attention_outputs)
 		attn_output = self.out_proj(attn_output)
 
-		outputs = (
-			(attn_output, attentions.attention_weights)
-			if output_attentions
-			else (attn_output, None)
-		)
-		return outputs
+		return attn_output, attentions.attention_weights
 
 
 class SiglipMLP(nn.Module):

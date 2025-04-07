@@ -19,8 +19,13 @@ from enum import Enum
 
 class EasyDeLOptimizers(str, Enum):
 	"""
-	Enum defining available optimizers for EasyDeL.
-	Each enum member represents a different optimization algorithm.
+	Enumeration of available optimizers in the EasyDeL library.
+
+	Attributes:
+	    ADAFACTOR: Represents the Adafactor optimizer.
+	    LION: Represents the Lion optimizer.
+	    ADAMW: Represents the AdamW optimizer.
+	    RMSPROP: Represents the RMSprop optimizer.
 	"""
 
 	ADAFACTOR = "adafactor"
@@ -31,8 +36,12 @@ class EasyDeLOptimizers(str, Enum):
 
 class EasyDeLSchedulers(str, Enum):
 	"""
-	Enum defining available schedulers for EasyDeL.
-	Each enum member represents a different learning rate schedule.
+	Enumeration of available learning rate schedulers in EasyDeL.
+
+	Attributes:
+	    NONE: Indicates no scheduler should be used.
+	    LINEAR: Represents a linear learning rate decay scheduler.
+	    COSINE: Represents a cosine annealing learning rate scheduler.
 	"""
 
 	NONE = None
@@ -42,8 +51,20 @@ class EasyDeLSchedulers(str, Enum):
 
 class EasyDeLGradientCheckPointers(str, Enum):
 	"""
-	Enum defining available gradient checkpointing strategies for EasyDeL.
-	Each enum member represents a different checkpointing approach.
+	Enumeration of gradient checkpointing strategies available in EasyDeL.
+
+	Gradient checkpointing is a technique to reduce memory usage during training
+	by recomputing activations during the backward pass instead of storing them.
+
+	Attributes:
+	    EVERYTHING_SAVEABLE: Checkpoints residuals, attentions, and hidden states.
+	        This is the most memory-intensive checkpointing strategy.
+	    NOTHING_SAVEABLE: Checkpoints only the residuals.
+	        This strategy saves the most memory but requires more recomputation.
+	    CHECKPOINT_DOTS: Checkpoints matrix multiplications and intermediate activations.
+	    CHECKPOINT_DOTS_WITH_NO_BATCH_DMIS: Similar to CHECKPOINT_DOTS but avoids checkpointing
+	        operations involving batch dimensions.
+	    NONE: No gradient checkpointing is applied.
 	"""
 
 	EVERYTHING_SAVEABLE = "everything_saveable"
@@ -55,8 +76,15 @@ class EasyDeLGradientCheckPointers(str, Enum):
 
 class EasyDeLQuantizationMethods(str, Enum):
 	"""
-	Enum defining available quantization strategies for EasyDeL.
-	Each enum member represents a different quantization approach.
+	Enumeration of quantization methods supported by EasyDeL.
+
+	Quantization reduces the precision of model weights and/or activations to save
+	memory and potentially speed up inference.
+
+	Attributes:
+	    NONE: No quantization is applied.
+	    NF4: Represents NormalFloat 4-bit quantization.
+	    A8BIT: Represents 8-bit affine quantization.
 	"""
 
 	NONE = None
@@ -66,8 +94,15 @@ class EasyDeLQuantizationMethods(str, Enum):
 
 class EasyDeLPlatforms(str, Enum):
 	"""
-	Enum defining available platforms for EasyDeL.
-	Each enum member represents a different kernel usage approach.
+	Enumeration of platforms or kernel execution backends supported by EasyDeL.
+
+	This allows selecting optimized kernel implementations for different hardware
+	or software environments.
+
+	Attributes:
+	    JAX: Use standard JAX kernel implementations.
+	    TRITON: Use Triton-based kernel implementations (often for GPUs).
+	    PALLAS: Use Pallas-based kernel implementations (often for TPUs).
 	"""
 
 	JAX = "jax"
@@ -77,8 +112,14 @@ class EasyDeLPlatforms(str, Enum):
 
 class EasyDeLBackends(str, Enum):
 	"""
-	Enum defining available backends for EasyDeL.
-	Each enum member represents a different kernel usage approach.
+	Enumeration of JAX backend types supported by EasyDeL.
+
+	Specifies the target hardware device type for JAX computations.
+
+	Attributes:
+	    CPU: Use the CPU backend.
+	    GPU: Use the GPU backend.
+	    TPU: Use the TPU backend.
 	"""
 
 	CPU = "cpu"
@@ -126,16 +167,27 @@ AVAILABLE_SPARSE_MODULE_TYPES = tp.Literal["bcoo", "bcsr", "coo", "csr"]
 def define_flags_with_default(
 	_required_fields: tp.List = None, **kwargs
 ) -> tp.Tuple[argparse.Namespace, tp.Dict[str, tp.Any]]:
-	"""Defines flags with default values using argparse.
+	"""Defines command-line flags using argparse based on provided keyword arguments.
+
+	This function dynamically creates argparse arguments for each key-value pair in `kwargs`.
+	It infers the argument type from the default value and handles tuple types specifically.
+	It also supports marking certain fields as required.
 
 	Args:
-	    _required_fields: A dictionary with required flag names
-	    **kwargs: Keyword arguments representing flag names and default values.
+	    _required_fields (tp.List, optional): A list of flag names that are mandatory.
+	        An error will be raised if these flags are not provided or are empty strings.
+	        Defaults to None.
+	    **kwargs: Keyword arguments where keys are flag names (without `--`) and values
+	        are their default values.
 
 	Returns:
-	    A tuple containing:
-	        - An argparse.Namespace object containing parsed arguments.
-	        - A dictionary mapping flag names to default values.
+	    tp.Tuple[argparse.Namespace, tp.Dict[str, tp.Any]]: A tuple containing:
+	        - An `argparse.Namespace` object holding the parsed command-line arguments.
+	        - A dictionary mapping the original flag names to their default values.
+
+	Raises:
+	    ValueError: If a required field (from `_required_fields`) is not provided
+	        or is an empty string on the command line.
 	"""
 	_required_fields = _required_fields if _required_fields is not None else []
 	parser = argparse.ArgumentParser()
@@ -169,7 +221,17 @@ def define_flags_with_default(
 
 
 class StoreTupleAction(argparse.Action):
-	"""Custom action to store a comma-separated string as a tuple of ints."""
+	"""
+	Custom argparse action to parse a comma-separated string into a tuple of integers.
+
+	This action is used by `define_flags_with_default` when a default value is a tuple.
+	It takes the comma-separated string provided on the command line and attempts to
+	convert each part into an integer, storing the result as a tuple in the namespace.
+
+	Raises:
+	    argparse.ArgumentTypeError: If the provided value cannot be parsed as a comma-separated
+	        list of integers.
+	"""
 
 	def __call__(self, parser, namespace, values, option_string=None):
 		try:

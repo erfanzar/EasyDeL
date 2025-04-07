@@ -51,6 +51,22 @@ from .olmo2_configuration import Olmo2Config
 
 
 class Olmo2MLP(nn.Module):
+	"""OLMo-2 MLP module.
+
+	This module implements the feed-forward network (MLP) used in the OLMo-2 model.
+	It consists of gate, up, and down projections with a SiLU activation.
+
+	Attributes:
+	    config (Olmo2Config): Configuration object for the model.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    gate_proj (ParallelLinear): Linear layer for the gate projection.
+	    down_proj (ParallelLinear): Linear layer for the down projection.
+	    up_proj (ParallelLinear): Linear layer for the up projection.
+	    act_fn (callable): Activation function (SiLU).
+	"""
+
 	def __init__(
 		self,
 		config: Olmo2Config,
@@ -60,6 +76,15 @@ class Olmo2MLP(nn.Module):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the Olmo2MLP module.
+
+		Args:
+		    config (Olmo2Config): The configuration object for the OLMo-2 model.
+		    dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		self.config = config
 		self.dtype = dtype
 		self.param_dtype = param_dtype
@@ -100,6 +125,32 @@ class Olmo2MLP(nn.Module):
 
 
 class Olmo2Attention(AttentionModule):
+	"""OLMo-2 Attention module.
+
+	This module implements the multi-head attention mechanism with rotary position embeddings
+	and Grouped Query Attention (GQA) used in the OLMo-2 model. It includes RMSNorm applied
+	to query and key projections before the attention calculation.
+
+	Attributes:
+	    config (Olmo2Config): Configuration object for the model.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    rngs (nn.Rngs): Random number generators.
+	    hidden_size (int): Dimensionality of the hidden states.
+	    num_heads (int): Number of attention heads.
+	    head_dim (int): Dimensionality of each attention head.
+	    num_key_value_groups (int): Number of query head groups for each key/value head.
+	    q_proj (ParallelLinear): Linear layer for query projection.
+	    k_proj (ParallelLinear): Linear layer for key projection.
+	    v_proj (ParallelLinear): Linear layer for value projection.
+	    o_proj (ParallelLinear): Linear layer for the output projection.
+	    q_norm (RMSNorm): RMS Normalization applied to the query projection.
+	    k_norm (RMSNorm): RMS Normalization applied to the key projection.
+	    attention_performer (FlexibleAttentionModule): Module to perform the core attention computation.
+	    rotary (RoPE): Rotary position embedding module.
+	"""
+
 	def __init__(
 		self,
 		config: Olmo2Config,
@@ -109,6 +160,15 @@ class Olmo2Attention(AttentionModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the Olmo2Attention module.
+
+		Args:
+		    config (Olmo2Config): The configuration object for the OLMo-2 model.
+		    dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__(config=config)
 		self.dtype = dtype
 		self.param_dtype = param_dtype
@@ -192,6 +252,25 @@ class Olmo2Attention(AttentionModule):
 		fcm_mask: tp.Optional[chex.Array] = None,
 		frequencies: tp.Optional[chex.Array] = None,
 	):
+		"""Forward pass of the Olmo2Attention module.
+
+		Args:
+		    hidden_states (chex.Array): Input hidden states. Shape: (batch_size, sequence_length, hidden_size).
+		    attention_mask (chex.Array): Mask to apply on the attention scores. Shape: (batch_size, 1, query_length, key_length).
+		    position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
+		    causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
+		    cache_view (tp.Optional[TransformerCacheView | PagedAttentionCacheView]): Cache view for attention KVs.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+		    output_attentions (bool): Whether to return attention weights. Default is False.
+		    fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
+		    frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
+
+		Returns:
+		    tp.Union[tp.Tuple[chex.Array, chex.Array], tp.Tuple[chex.Array]]:
+		        A tuple containing the attention output hidden states. If `output_attentions` is True,
+		        it also includes the attention weights.
+		"""
 		batch_size, sequence_length = hidden_states.shape[:2]
 		query_states, key_states, value_states = (
 			self.q_norm(self.q_proj(hidden_states)),
@@ -259,15 +338,28 @@ class Olmo2Attention(AttentionModule):
 		)
 		attn_output = self.o_proj(attn_output)
 
-		outputs = (
-			(attn_output, attentions.attention_weights)
-			if output_attentions
-			else (attn_output, None)
-		)
-		return outputs
+		return attn_output, attentions.attention_weights
 
 
 class Olmo2DecoderLayer(nn.Module):
+	"""OLMo-2 Transformer Decoder Layer.
+
+	This module represents a single decoder layer in the OLMo-2 model,
+	combining self-attention and MLP sub-layers with residual connections
+	and layer normalization applied before each sub-layer.
+
+	Attributes:
+	    config (Olmo2Config): Configuration object for the model.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    rngs (nn.Rngs): Random number generators.
+	    self_attn (Olmo2Attention): The self-attention module.
+	    mlp (Olmo2MLP): The feed-forward (MLP) module.
+	    input_layernorm (RMSNorm): Layer normalization before the attention layer.
+	    post_attention_layernorm (RMSNorm): Layer normalization before the MLP layer.
+	"""
+
 	def __init__(
 		self,
 		config: Olmo2Config,
@@ -277,6 +369,15 @@ class Olmo2DecoderLayer(nn.Module):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the Olmo2DecoderLayer.
+
+		Args:
+		    config (Olmo2Config): The configuration object for the OLMo-2 model.
+		    dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		self.config = config
 		self.dtype = dtype
 		self.param_dtype = param_dtype
@@ -332,6 +433,24 @@ class Olmo2DecoderLayer(nn.Module):
 		fcm_mask: tp.Optional[chex.Array] = None,
 		frequencies: tp.Optional[chex.Array] = None,
 	):
+		"""Forward pass of the Olmo2DecoderLayer module.
+
+		Args:
+		    hidden_states (chex.Array): Input hidden states. Shape: (batch_size, sequence_length, hidden_size).
+		    attention_mask (chex.Array): Mask to apply on the attention scores. Shape: (batch_size, 1, query_length, key_length).
+		    position_ids (chex.Array): Position indices for the tokens. Shape: (batch_size, sequence_length).
+		    causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
+		    cache_view (tp.Optional[TransformerCacheView | PagedAttentionCacheView]): Cache view for attention KVs.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+		    output_attentions (bool): Whether to return attention weights. Default is False.
+		    fcm_mask (tp.Optional[chex.Array]): Flash Chunking Mask (FCM) for attention.
+		    frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
+
+		Returns:
+		    tp.Tuple[chex.Array, tp.Optional[chex.Array]]:
+		        A tuple containing the output hidden states and optionally the attention weights.
+		"""
 		residual = hidden_states
 		attention_output = self.self_attn(
 			hidden_states,
@@ -374,6 +493,24 @@ class Olmo2DecoderLayer(nn.Module):
 	model_type="olmo2",
 )
 class Olmo2Model(EasyDeLBaseModule):
+	"""The base OLMo-2 model transformer.
+
+	This class represents the core transformer architecture of the OLMo-2 model,
+	consisting of an embedding layer, multiple Olmo2DecoderLayer layers,
+	and a final RMS normalization layer.
+
+	Attributes:
+	    config (Olmo2Config): Configuration object for the model.
+	    dtype (jnp.dtype): Data type for computation.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    rngs (nn.Rngs): Random number generators.
+	    embed_tokens (nn.Embed): Embedding layer for input tokens.
+	    layers (tp.List[Olmo2DecoderLayer]): List of decoder layers.
+	    norm (RMSNorm): Final layer normalization.
+	    gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
+	"""
+
 	def __init__(
 		self,
 		config: Olmo2Config,
@@ -383,6 +520,15 @@ class Olmo2Model(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the Olmo2Model.
+
+		Args:
+		    config (Olmo2Config): The configuration object for the OLMo-2 model.
+		    dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -431,6 +577,32 @@ class Olmo2Model(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
 	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+		"""Forward pass of the Olmo2Model.
+
+		Args:
+		    input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
+		    inputs_embeds (tp.Optional[chex.Array]): Input embeddings. Shape: (batch_size, sequence_length, hidden_size).
+		        Either `input_ids` or `inputs_embeds` must be provided.
+		    attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+		        Shape: (batch_size, sequence_length).
+		    position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+		        Shape: (batch_size, sequence_length).
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
+		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for attention.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+		    output_attentions (tp.Optional[bool]): Whether to return attention weights. Defaults to `config.output_attentions`.
+		    output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
+		        Defaults to `config.output_hidden_states`.
+		    return_dict (bool): Whether to return a `BaseModelOutput` object or a tuple.
+
+		Returns:
+		    tp.Union[BaseModelOutput, tp.Tuple]: The model's output. If `return_dict` is True,
+		        returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
+		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
+
+		Raises:
+		    ValueError: If neither `input_ids` nor `inputs_embeds` is provided.
+		"""
 		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
 				"You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -484,7 +656,7 @@ class Olmo2Model(EasyDeLBaseModule):
 			all_hidden_states += (hidden_states,)
 			outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
 		else:
-			outputs = (hidden_states, all_attentions)
+			outputs = (hidden_states, all_attentions, past_key_values)
 
 		if not return_dict:
 			return tuple(v for v in outputs if v is not None)
@@ -503,6 +675,22 @@ class Olmo2Model(EasyDeLBaseModule):
 	model_type="olmo2",
 )
 class Olmo2ForCausalLM(EasyDeLBaseModule):
+	"""OLMo-2 model with a Causal Language Modeling head.
+
+	This model consists of the base OLMo-2 transformer (`Olmo2Model`) followed by a
+	linear layer (`lm_head`) that projects the transformer's output hidden states
+	to the vocabulary size, producing logits for next token prediction.
+
+	Attributes:
+	    config (Olmo2Config): Configuration object for the model.
+	    dtype (jnp.dtype): Data type for computation.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    rngs (nn.Rngs): Random number generators.
+	    model (Olmo2Model): The core OLMo-2 transformer model.
+	    lm_head (ParallelLinear): The linear layer for projecting hidden states to vocabulary logits.
+	"""
+
 	def __init__(
 		self,
 		config: Olmo2Config,
@@ -512,6 +700,15 @@ class Olmo2ForCausalLM(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the Olmo2ForCausalLM model.
+
+		Args:
+		    config (Olmo2Config): The configuration object for the OLMo-2 model.
+		    dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -552,11 +749,35 @@ class Olmo2ForCausalLM(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
 	) -> tp.Union[CausalLMOutput, tp.Tuple]:
+		"""Forward pass of the Olmo2ForCausalLM model.
+
+		Args:
+		    input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
+		    inputs_embeds (tp.Optional[chex.Array]): Input embeddings. Shape: (batch_size, sequence_length, hidden_size).
+		        Either `input_ids` or `inputs_embeds` must be provided.
+		    attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+		        Shape: (batch_size, sequence_length).
+		    position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+		        Shape: (batch_size, sequence_length).
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
+		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for attention.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+		    output_attentions (tp.Optional[bool]): Whether to return attention weights. Defaults to `config.output_attentions`.
+		    output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
+		        Defaults to `config.output_hidden_states`.
+		    return_dict (bool): Whether to return a `CausalLMOutput` object or a tuple.
+
+		Returns:
+		    tp.Union[CausalLMOutput, tp.Tuple]: The model's output. If `return_dict` is True,
+		        returns a `CausalLMOutput` object containing `logits`, `hidden_states` (optional),
+		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
+		"""
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 			output_attentions=output_attentions,
@@ -590,6 +811,22 @@ class Olmo2ForCausalLM(EasyDeLBaseModule):
 	model_type="olmo2",
 )
 class Olmo2ForSequenceClassification(EasyDeLBaseModule):
+	"""OLMo-2 model with a Sequence Classification head.
+
+	This model consists of the base OLMo-2 transformer (`Olmo2Model`) followed by a
+	linear layer (`score`) that projects the transformer's output hidden states
+	(typically the hidden state of the last token) to the number of classes for classification.
+
+	Attributes:
+	    config (Olmo2Config): Configuration object for the model.
+	    dtype (jnp.dtype): Data type for computation.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    rngs (nn.Rngs): Random number generators.
+	    model (Olmo2Model): The core OLMo-2 transformer model.
+	    score (ParallelLinear): The linear layer for classification.
+	"""
+
 	def __init__(
 		self,
 		config: Olmo2Config,
@@ -599,6 +836,19 @@ class Olmo2ForSequenceClassification(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the Olmo2ForSequenceClassification model.
+
+		Args:
+		    config (Olmo2Config): The configuration object for the OLMo-2 model.
+		        Must include `num_labels`.
+		    dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		    rngs (nn.Rngs): Random number generators.
+
+		Raises:
+		    AssertionError: If `config.num_labels` is not defined.
+		"""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -640,11 +890,38 @@ class Olmo2ForSequenceClassification(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
 	) -> tp.Union[SequenceClassifierOutput, tp.Tuple]:
+		"""Forward pass of the Olmo2ForSequenceClassification model.
+
+		Args:
+		    input_ids (tp.Optional[chex.Array]): Input token IDs. Shape: (batch_size, sequence_length).
+		    inputs_embeds (tp.Optional[chex.Array]): Input embeddings. Shape: (batch_size, sequence_length, hidden_size).
+		        Either `input_ids` or `inputs_embeds` must be provided.
+		    attention_mask (tp.Optional[chex.Array]): Mask to avoid performing attention on padding token indices.
+		        Shape: (batch_size, sequence_length).
+		    position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+		        Shape: (batch_size, sequence_length).
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs (unused).
+		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for attention.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+		    output_attentions (tp.Optional[bool]): Whether to return attention weights. Defaults to `config.output_attentions`.
+		    output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
+		        Defaults to `config.output_hidden_states`.
+		    return_dict (bool): Whether to return a `SequenceClassifierOutput` object or a tuple.
+
+		Returns:
+		    tp.Union[SequenceClassifierOutput, tp.Tuple]: The model's output. If `return_dict` is True,
+		        returns a `SequenceClassifierOutput` object containing `logits`, `hidden_states` (optional),
+		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
+
+		Raises:
+		    ValueError: If `config.pad_token_id` is None and `batch_size > 1`.
+		"""
 		transformer_outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,

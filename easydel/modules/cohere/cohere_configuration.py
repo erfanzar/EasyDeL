@@ -108,6 +108,33 @@ class CohereConfig(EasyDeLBaseConfig):
 		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
+		"""Initializes the CohereConfig instance.
+
+		Args:
+		    vocab_size (int): Vocabulary size.
+		    hidden_size (int): Dimensionality of the hidden layers.
+		    intermediate_size (int): Dimensionality of the intermediate feed-forward layer.
+		    logit_scale (float): Logit scale for attention.
+		    num_hidden_layers (int): Number of hidden layers.
+		    num_attention_heads (int): Number of attention heads.
+		    num_key_value_heads (Optional[int]): Number of key/value heads.
+		    hidden_act (str): Activation function.
+		    max_position_embeddings (int): Maximum sequence length.
+		    initializer_range (float): Initializer range for weights.
+		    layer_norm_eps (float): Epsilon for layer normalization.
+		    use_cache (bool): Whether to use caching.
+		    pad_token_id (int): Padding token ID.
+		    bos_token_id (int): Beginning of sequence token ID.
+		    eos_token_id (int): End of sequence token ID.
+		    tie_word_embeddings (bool): Whether to tie word embeddings.
+		    rope_theta (float): RoPE theta value.
+		    attention_bias (bool): Whether to use attention bias.
+		    attention_dropout (float): Dropout rate for attention.
+		    use_qk_norm (bool): Whether to use QK normalization.
+		    gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing strategy.
+		    bits (Optional[int]): Number of bits for quantization.
+		    **kwargs: Additional keyword arguments.
+		"""
 		self.vocab_size = vocab_size
 		self.max_position_embeddings = max_position_embeddings
 		self.hidden_size = hidden_size
@@ -176,24 +203,26 @@ class CohereConfig(EasyDeLBaseConfig):
 
 		Args:
 		    self: Refer to the current object
-		    gradient_checkpointing: str: Control the amount of memory
-		        used by jax
-		    bits: tp.Optional[int]: Determine the number of bits used in
-		        the quantization
+		    gradient_checkpointing (EasyDeLGradientCheckPointers): Control the amount of memory used by jax
+		    bits (Optional[int]): Determine the number of bits used in the quantization
+		    **kwargs: Additional keyword arguments.
 		"""
 		self.gradient_checkpointing = gradient_checkpointing
 		self.bits = bits
 
 	@staticmethod
 	def get_weight_decay_exclusions():
+		"""Returns a tuple of parameter names for which weight decay should be excluded."""
 		return tuple()
 
 	@staticmethod
 	def rng_keys():
+		"""Returns the names of the random number generator keys used by the model."""
 		return "params", "dropout"
 
 	@property
 	def granted_freq_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size for frequency-based position embeddings, falling back to max_position_embeddings."""
 		return getattr(
 			self,
 			"freq_max_position_embeddings",
@@ -202,6 +231,7 @@ class CohereConfig(EasyDeLBaseConfig):
 
 	@property
 	def granted_mask_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size for mask-based position embeddings, falling back to max_position_embeddings."""
 		return getattr(
 			self,
 			"mask_max_position_embeddings",

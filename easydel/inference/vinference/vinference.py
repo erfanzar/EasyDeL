@@ -46,12 +46,7 @@ from easydel.utils.compiling_utils import (
 from easydel.utils.helpers import capture_time, check_bool_flag, get_logger
 from easydel.utils.lazy_import import is_package_available
 
-from ..utilities import (
-	SampleState,
-	SamplingParams,
-	vInferenceConfig,
-	vInferencePreCompileConfig,
-)
+from ..utilities import SamplingParams
 from ._fn import (
 	decode_fn,
 	expand_inputs_for_generation,
@@ -59,6 +54,7 @@ from ._fn import (
 	prefill_fn,
 	put_compiled_funcs,
 )
+from .utilities import SampleState, vInferenceConfig, vInferencePreCompileConfig
 
 if tp.TYPE_CHECKING:
 	from easydel.infra import EasyDeLBaseModule
@@ -990,7 +986,7 @@ class vInference:
 		with capture_time() as time_spent:
 			state = jax.block_until_ready(func(*inputs))
 		state._time_spent_computing += time_spent()
-		state.tokens_pre_second = state.generated_tokens / state._time_spent_computing
+		state.tokens_per_second = state.generated_tokens / state._time_spent_computing
 		return state
 
 	def _handle_generation_error(self, error: Exception):

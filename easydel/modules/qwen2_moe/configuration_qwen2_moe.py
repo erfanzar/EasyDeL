@@ -126,6 +126,41 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
 		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
+		"""Initializes a Qwen2MoeConfig object.
+
+		Args:
+		    vocab_size (int, optional): Vocabulary size. Defaults to 151936.
+		    hidden_size (int, optional): Dimensionality of the embeddings and hidden states. Defaults to 2048.
+		    intermediate_size (int, optional): Dimensionality of the intermediate layer in dense MLP. Defaults to 5632.
+		    num_hidden_layers (int, optional): Number of hidden layers. Defaults to 24.
+		    num_attention_heads (int, optional): Number of attention heads. Defaults to 16.
+		    num_key_value_heads (int, optional): Number of key/value heads (for GQA). Defaults to 16.
+		    hidden_act (str, optional): Activation function name. Defaults to "silu".
+		    max_position_embeddings (int, optional): Maximum sequence length. Defaults to 32768.
+		    initializer_range (float, optional): Standard deviation for weight initialization. Defaults to 0.02.
+		    rms_norm_eps (float, optional): Epsilon for RMS normalization. Defaults to 1e-6.
+		    use_cache (bool, optional): Whether to use KV cache. Defaults to True.
+		    tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
+		    qkv_bias (bool, optional): Whether to include bias in QKV projections. Defaults to False.
+		    rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
+		    use_sliding_window (bool, optional): Whether to use sliding window attention. Defaults to False.
+		    sliding_window (int, optional): Sliding window size. Defaults to 4096.
+		    max_window_layers (int, optional): Maximum number of layers for sliding window attention. Defaults to 28.
+		    attention_dropout (float, optional): Dropout probability for attention scores. Defaults to 0.0.
+		    decoder_sparse_step (int, optional): Frequency of MoE layers. Defaults to 1.
+		    moe_intermediate_size (int, optional): Intermediate size for MoE MLP layers. Defaults to 1408.
+		    shared_expert_intermediate_size (int, optional): Intermediate size for the shared expert MLP. Defaults to 5632.
+		    num_experts_per_tok (int, optional): Number of experts to route per token. Defaults to 4.
+		    num_experts (int, optional): Total number of experts. Defaults to 60.
+		    norm_topk_prob (bool, optional): Whether to normalize top-k probabilities in router. Defaults to False.
+		    output_router_logits (bool, optional): Whether to output router logits. Defaults to False.
+		    router_aux_loss_coef (float, optional): Coefficient for router auxiliary loss. Defaults to 0.001.
+		    mlp_only_layers (list[int], optional): List of layer indices that should only use MLP (no MoE). Defaults to None.
+		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
+		        Defaults to EasyDeLGradientCheckPointers.NONE.
+		    bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
+		    **kwargs: Additional keyword arguments passed to the parent class.
+		"""
 		self.vocab_size = vocab_size
 		self.max_position_embeddings = max_position_embeddings
 		self.hidden_size = hidden_size
@@ -190,37 +225,26 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
 			(".*", PartitionSpec(("fsdp", "sp"))),
 		)
 
-	def attach_custom_arguments(
-		self,
-		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		bits: tp.Optional[int] = None,
-		**kwargs,
-	):
-		"""The attach_custom_arguments function adds the following arguments to the Transformer class:
-
-		Args:
-		    self: Refer to the current object
-		    gradient_checkpointing: str: Control the amount of memory
-		        used by jax
-		    bits: tp.Optional[int]: Determine the number of bits used in
-		        the quantization
-
-		Returns:
-		    The following:
-		"""
-		self.gradient_checkpointing = gradient_checkpointing
-		self.bits = bits
-
 	@staticmethod
 	def get_weight_decay_exclusions():
+		"""Returns a tuple of parameter names for which weight decay should be excluded."""
 		return tuple()
 
 	@staticmethod
 	def rng_keys():
+		"""Returns the names of the random number generator keys used by the model."""
 		return "params", "dropout"
 
 	@property
 	def granted_freq_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size specifically for frequency-based position embeddings.
+
+		If `freq_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
+		`max_position_embeddings`.
+
+		Returns:
+		    int: The granted maximum position embedding size for frequency encoding.
+		"""
 		return getattr(
 			self,
 			"freq_max_position_embeddings",
@@ -229,6 +253,14 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
 
 	@property
 	def granted_mask_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size specifically for mask-based position embeddings.
+
+		If `mask_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
+		`max_position_embeddings`.
+
+		Returns:
+		    int: The granted maximum position embedding size for mask encoding.
+		"""
 		return getattr(
 			self,
 			"mask_max_position_embeddings",

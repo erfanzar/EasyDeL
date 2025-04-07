@@ -395,12 +395,12 @@ def run_benchmark(
 						"max_new_tokens": int(max_new_tokens),
 						"total_time": float(end_time - start_time),
 						"tokens_generated": int(response.generated_tokens),
-						"tokens_per_second": float(response.tokens_pre_second),
+						"tokens_per_second": float(response.tokens_per_second),
 						"run": int(run + 1),
 					}
 				)
 
-				print(f"  TPS: {response.tokens_pre_second}, Time: {end_time - start_time}s")
+				print(f"  TPS: {response.tokens_per_second}, Time: {end_time - start_time}s")
 			del inference
 			# Add all runs to results
 			results.extend(run_results)

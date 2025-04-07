@@ -548,6 +548,14 @@ class ExaoneModel(EasyDeLBaseModule):
 	model_type="exaone",
 )
 class ExaoneForCausalLM(EasyDeLBaseModule):
+	"""
+	Exaone model with a language modeling head for causal language modeling tasks.
+
+	This model extends the base ExaoneModel by adding a linear language modeling head
+	on top of the transformer model. It's designed for generative tasks and can be used
+	for text generation.
+	"""
+
 	def __init__(
 		self,
 		config: ExaoneConfig,
@@ -557,6 +565,15 @@ class ExaoneForCausalLM(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initialize the ExaoneForCausalLM model.
+
+		Args:
+			config (ExaoneConfig): The model configuration.
+			dtype (jnp.dtype, optional): The data type for computation. Defaults to jnp.float32.
+			param_dtype (jnp.dtype, optional): The data type for parameters. Defaults to jnp.float32.
+			precision (jax.lax.PrecisionLike, optional): The precision to use for matrix multiplication. Defaults to None.
+			rngs (nn.Rngs): The random number generators.
+		"""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -597,11 +614,30 @@ class ExaoneForCausalLM(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
 	) -> tp.Union[CausalLMOutput, tp.Tuple]:
+		"""
+		Forward pass of the causal language model.
+
+		Args:
+			input_ids (Optional[chex.Array], optional): Token IDs to process. Defaults to None.
+			inputs_embeds (Optional[chex.Array], optional): Pre-computed input embeddings. Defaults to None.
+			attention_mask (Optional[chex.Array], optional): Mask to avoid attention on padding tokens. Defaults to None.
+			position_ids (Optional[chex.Array], optional): Position IDs. Defaults to None.
+			segment_ids (Optional[chex.Array], optional): Segment IDs for segment-based attention. Defaults to None.
+			output_attentions (Optional[bool], optional): Whether to output attention weights. Defaults to None.
+			output_hidden_states (Optional[bool], optional): Whether to output hidden states. Defaults to None.
+			past_key_values (Optional[TransformerCache | PagedAttentionCache], optional): Cached key/values. Defaults to None.
+			cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata], optional): Cache metadata. Defaults to None.
+			return_dict (bool, optional): Whether to return a dictionary or tuple. Defaults to True.
+
+		Returns:
+			CausalLMOutput | Tuple: The model outputs, either as a named tuple or a standard tuple.
+		"""
 		outputs = self.transformer(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,
@@ -692,6 +728,7 @@ class ExaoneForSequenceClassification(EasyDeLBaseModule):
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,

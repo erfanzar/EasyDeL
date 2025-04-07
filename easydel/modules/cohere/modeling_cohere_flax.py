@@ -267,12 +267,7 @@ class CohereAttention(AttentionModule):
 		)
 		attn_output = self.o_proj(attn_output)
 
-		outputs = (
-			(attn_output, attentions.attention_weights)
-			if output_attentions
-			else (attn_output, None)
-		)
-		return outputs
+		return attn_output, attentions.attention_weights
 
 
 class CohereMLP(nn.Module):
@@ -481,6 +476,23 @@ class CohereModel(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
 	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+		"""Forward pass through the core Cohere model.
+
+		Args:
+		    input_ids (Optional[chex.Array]): Input token IDs.
+		    inputs_embeds (Optional[chex.Array]): Input embeddings (alternative to input_ids).
+		    attention_mask (Optional[chex.Array]): Attention mask.
+		    position_ids (Optional[chex.Array]): Position IDs.
+		    segment_ids (Optional[chex.Array]): Segment IDs.
+		    output_attentions (Optional[bool]): Whether to output attentions.
+		    output_hidden_states (Optional[bool]): Whether to output hidden states.
+		    past_key_values (Optional[TransformerCache | PagedAttentionCache]): KV cache.
+		    cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata]): Cache metadata.
+		    return_dict (bool): Whether to return a dictionary output.
+
+		Returns:
+		    Union[BaseModelOutput, Tuple]: Model output.
+		"""
 		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
 				"You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -601,22 +613,22 @@ class CohereForCausalLM(EasyDeLBaseModule):
 		return_dict: bool = True,
 	) -> tp.Union[CausalLMOutput, tp.Tuple]:
 		"""
-		Forward pass through the Cohere module.
+		Forward pass through the Cohere model for Causal Language Modeling.
 
 		Args:
-		    input_ids (chex.Array): Input tensor containing token IDs.
-		    attention_mask (chex.Array): Mask for attention.
-		    position_ids (chex.Array): Positional indices.
-		    segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
-		    inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
-		    output_attentions (tp.Optional[bool]): If True, output attention weights.
-		    output_hidden_states (tp.Optional[bool]): If True, output hidden states.
-		    init_cache (bool): If True, initialize cache for decoding.
-		    deterministic (bool): If True, disable dropout.
-		    return_dict (bool): If True, return a dictionary of outputs.
+		    input_ids (Optional[chex.Array]): Input tensor containing token IDs.
+		    inputs_embeds (Optional[chex.Array]): Embedded input tensor (alternative to input_ids).
+		    attention_mask (Optional[chex.Array]): Mask for attention.
+		    position_ids (Optional[chex.Array]): Positional indices.
+		    segment_ids (Optional[chex.Array]): Segment IDs for different input parts.
+		    output_attentions (Optional[bool]): If True, output attention weights.
+		    output_hidden_states (Optional[bool]): If True, output hidden states.
+		    past_key_values (Optional[TransformerCache | PagedAttentionCache]): KV cache for faster generation.
+		    cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+		    return_dict (bool): If True, return a CausalLMOutput object.
 
 		Returns:
-		    CausalLMOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
+		    Union[CausalLMOutput, Tuple]: Model output, including logits.
 		"""
 		batch_size, sequence_length = input_ids.shape
 		if attention_mask is None:
@@ -672,6 +684,17 @@ class CohereForCausalLM(EasyDeLBaseModule):
 	model_type="cohere",
 )
 class CohereForSequenceClassification(EasyDeLBaseModule):
+	"""
+	Cohere model for sequence classification.
+
+	Attributes:
+	    config (CohereConfig): Configuration object (must include num_labels).
+	    dtype (jnp.dtype): Data type for computation.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): JAX precision level.
+	    rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: CohereConfig,
@@ -681,6 +704,7 @@ class CohereForSequenceClassification(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the CohereForSequenceClassification model."""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -723,11 +747,30 @@ class CohereForSequenceClassification(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
 	) -> tp.Union[SequenceClassifierOutput, tp.Tuple]:
+		"""
+		Forward pass for sequence classification.
+
+		Args:
+		    input_ids (Optional[chex.Array]): Input token IDs.
+		    inputs_embeds (Optional[chex.Array]): Input embeddings (alternative to input_ids).
+		    attention_mask (Optional[chex.Array]): Attention mask.
+		    position_ids (Optional[chex.Array]): Position IDs.
+		    segment_ids (Optional[chex.Array]): Segment IDs.
+		    output_attentions (Optional[bool]): Whether to output attentions.
+		    output_hidden_states (Optional[bool]): Whether to output hidden states.
+		    past_key_values (Optional[TransformerCache | PagedAttentionCache]): KV cache.
+		    cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata]): Cache metadata.
+		    return_dict (bool): Whether to return a dictionary output.
+
+		Returns:
+		    Union[SequenceClassifierOutput, Tuple]: Classification output (logits and optional hidden states/attentions).
+		"""
 		transformer_outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,

@@ -2,7 +2,9 @@ import os
 import sys
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+
 import easydel as ed
+
 import jax
 from transformers import CLIPProcessor
 from PIL import Image
@@ -28,15 +30,15 @@ def main():
 		return_tensors="np",
 		padding=True,
 	)
+	with model.mesh:
+		outputs = model(**inputs)
 
-	outputs = model(**inputs)
-
-	logits_per_image = outputs.logits_per_image
-	probs = jax.nn.softmax(logits_per_image, axis=1)
-	print(probs)
-	assert probs[0, 0] > probs[0, 1], "test failed!"
-	print("loss", model.compute_loss(**inputs)[-1].loss)
-	print("test passed.")
+		logits_per_image = outputs.logits_per_image
+		probs = jax.nn.softmax(logits_per_image, axis=1)
+		print(probs)
+		assert probs[0, 0] > probs[0, 1], "test failed!"
+		print("loss", model.compute_loss(**inputs)[-1].loss)
+		print("test passed.")
 
 
 if __name__ == "__main__":

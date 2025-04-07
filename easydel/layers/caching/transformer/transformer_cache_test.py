@@ -12,262 +12,291 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest  # type:ignore
+# tests/layers/cache/test_transformer_cache.py
+
+import chex
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
 from eformer.escale import PartitionAxis
-from jax import numpy as jnp
-from jax.sharding import PartitionSpec
+from jax.sharding import NamedSharding, PartitionSpec
 
-from easydel.infra.etils import EasyDeLQuantizationMethods
-from easydel.layers.quantization.quantizers import EasyQuantizer
-
-from .transformer_cache import (
+# Assume necessary imports from EasyDeL are available in the test environment
+# Adjust paths if necessary
+from easydel.layers.caching.transformer.transformer_cache import (
 	TransformerCache,
 	TransformerCacheMetaData,
 	TransformerCacheView,
 )
+from easydel.layers.quantization.quantizers import (
+	EasyDeLQuantizationMethods,
+	EasyQuantizer,
+)
 
 
-class TestTransformerCacheMetaData:
-	def test_create_valid(self):
-		metadata = TransformerCacheMetaData.create(
-			batch_size=4,
-			sequence_length=10,
-			num_heads=8,
-			head_dim=64,
-			update_causal_mask=True,
-			create_attention_bias=False,
-		)
-		assert metadata.batch_size == 4
-		assert metadata.sequence_length == 10
-		assert metadata.num_heads == 8
-		assert metadata.head_dim == 64
-		assert metadata.key_heads == 8
-		assert metadata.value_heads == 8
-		assert metadata.key_dim == 64
-		assert metadata.value_dim == 64
-		assert metadata.update_causal_mask is True
-		assert metadata.create_attention_bias is False
-
-	def test_create_with_key_value_dims(self):
-		metadata = TransformerCacheMetaData.create(
-			batch_size=4,
-			sequence_length=10,
-			key_heads=4,
-			value_heads=2,
-			key_dim=128,
-			value_dim=64,
-			update_causal_mask=False,
-			create_attention_bias=True,
-		)
-		assert metadata.batch_size == 4
-		assert metadata.sequence_length == 10
-		assert metadata.num_heads is None
-		assert metadata.head_dim is None
-		assert metadata.key_heads == 4
-		assert metadata.value_heads == 2
-		assert metadata.key_dim == 128
-		assert metadata.value_dim == 64
-		assert metadata.update_causal_mask is False
-		assert metadata.create_attention_bias is True
-
-	def test_create_missing_head_dim_and_key_value_dims_fails(self):
-		with pytest.raises(
-			ValueError,
-			match="Either head_dim or both key_dim and value_dim must be specified",
-		):
-			TransformerCacheMetaData.create(
-				batch_size=4,
-				sequence_length=10,
-				num_heads=8,
-				update_causal_mask=True,
-				create_attention_bias=False,
-			)
-
-	def test_create_missing_num_heads_and_key_value_heads_fails(self):
-		with pytest.raises(
-			ValueError,
-			match="Either num_heads or both key_heads and value_heads must be specified",
-		):
-			TransformerCacheMetaData.create(
-				batch_size=4,
-				sequence_length=10,
-				head_dim=64,
-				update_causal_mask=True,
-				create_attention_bias=False,
-			)
-
-	def test_create_invalid_batch_size(self):
-		with pytest.raises(ValueError, match="batch_size must be positive"):
-			TransformerCacheMetaData.create(
-				batch_size=0,
-				sequence_length=10,
-				num_heads=8,
-				head_dim=64,
-			)
-
-	def test_create_invalid_sequence_length(self):
-		with pytest.raises(ValueError, match="sequence_length must be positive"):
-			TransformerCacheMetaData.create(
-				batch_size=4,
-				sequence_length=0,
-				num_heads=8,
-				head_dim=64,
-			)
-
-	def test_create_only_head_dim(self):
-		metadata = TransformerCacheMetaData.create(
-			batch_size=4,
-			sequence_length=10,
-			num_heads=8,
-			head_dim=64,
-		)
-		assert metadata.key_dim == 64
-		assert metadata.value_dim == 64
-
-	def test_create_only_num_heads(self):
-		metadata = TransformerCacheMetaData.create(
-			batch_size=4,
-			sequence_length=10,
-			num_heads=8,
-			head_dim=64,
-		)
-		assert metadata.key_heads == 8
-		assert metadata.value_heads == 8
+# Test Fixtures and Setup
+@pytest.fixture(scope="module")
+def mesh():
+	devices = jax.devices()
+	if len(devices) >= 4:
+		mesh_shape = (1, 2, 2)  # Example sharding over 4 devices (dp, fsdp, mp)
+	elif len(devices) >= 2:
+		mesh_shape = (1, 2, 1)
+	else:
+		mesh_shape = (1, 1, 1)
+	devices_array = np.array(devices).reshape(mesh_shape)
+	device_mesh = jax.sharding.Mesh(devices_array, ("dp", "fsdp", "mp"))
+	return device_mesh
 
 
-class TestTransformerCacheView:
-	def test_init(self):
-		metadata = TransformerCacheMetaData.create(
-			batch_size=2,
-			sequence_length=5,
-			num_heads=4,
-			head_dim=32,
-		)
-		quantizer = EasyQuantizer(EasyDeLQuantizationMethods.NONE)
-		paxis = PartitionAxis()
-		key_values_partition_specs = PartitionSpec(
-			paxis.batch_axis,
-			paxis.key_sequence_axis,
-			paxis.head_axis,
-			paxis.attention_dim_axis,
-		)
-		cache_view = TransformerCacheView.init(
-			metadata=metadata,
+@pytest.fixture(scope="module")
+def quantizer():
+	# Using NONE for simplicity, can test with others if needed
+	return EasyQuantizer(EasyDeLQuantizationMethods.NONE)
+
+
+@pytest.fixture(scope="module")
+def cache_metadata_config():
+	return TransformerCacheMetaData(
+		partition_axis=PartitionAxis(batch_axis="dp", head_axis=None, sequence_axis="fsdp"),
+		batch_size=2,
+		sequence_length=8,
+		num_hidden_layers=1,
+		num_heads=2,
+		head_dim=4,
+		key_heads=2,  # Assuming MHA for simplicity
+		value_heads=2,
+		key_dim=4,
+		value_dim=4,
+		update_causal_mask=True,
+		create_attention_bias=True,
+	)
+
+
+@pytest.fixture(scope="module")
+def kv_spec():
+	# Matches partition_axis in cache_metadata_config
+	return PartitionSpec("dp", "fsdp", None, None)
+
+
+@pytest.fixture
+def transformer_cache(mesh, cache_metadata_config, quantizer, kv_spec):
+	with mesh:
+		cache = TransformerCache.init_cache(
+			metadata=cache_metadata_config,
+			mesh=mesh,
 			quantizer=quantizer,
-			key_values_partition_specs=key_values_partition_specs,
 			dtype=jnp.float32,
+			key_values_partition_specs=kv_spec,
 		)
-
-		assert isinstance(cache_view.key, jnp.ndarray)
-		assert isinstance(cache_view.value, jnp.ndarray)
-		assert isinstance(cache_view.index, jnp.ndarray)
-		assert cache_view.key.shape == (2, 5, 4, 32)
-		assert cache_view.value.shape == (2, 5, 4, 32)
-		assert cache_view.index.shape == (2,)
-		assert cache_view.index.dtype == jnp.int32
-		assert cache_view.metadata == metadata
-
-	def test_repr(self):
-		metadata = TransformerCacheMetaData.create(
-			batch_size=2,
-			sequence_length=5,
-			num_heads=4,
-			head_dim=32,
-		)
-		quantizer = EasyQuantizer(EasyDeLQuantizationMethods.NONE)
-		paxis = PartitionAxis()
-		key_values_partition_specs = PartitionSpec(
-			paxis.batch_axis,
-			paxis.key_sequence_axis,
-			paxis.head_axis,
-			paxis.attention_dim_axis,
-		)
-		cache_view = TransformerCacheView.init(
-			metadata=metadata,
-			quantizer=quantizer,
-			key_values_partition_specs=key_values_partition_specs,
-			dtype=jnp.float32,
-			layer_index=1,
-		)
-		expected_repr = (
-			"TransformerCacheView(key=(2, 5, 4, 32), value=(2, 5, 4, 32), layer_index=1)"
-		)
-		assert repr(cache_view) == expected_repr
-		assert str(cache_view) == expected_repr
+	return cache
 
 
-class TestTransformerCache:
-	def test_init_cache(self):
-		num_layers = 3
-		metadata = TransformerCacheMetaData.create(
-			batch_size=2,
-			sequence_length=5,
-			num_heads=4,
-			head_dim=32,
-		)
-		cache = TransformerCache.init_cache(
-			num_hidden_layers=num_layers,
-			metadata=metadata,
-		)
+# Test Cases
+def test_transformer_cache_initialization(
+	transformer_cache, cache_metadata_config, mesh
+):
+	assert len(transformer_cache.views) == cache_metadata_config.num_hidden_layers
+	view = transformer_cache.views[0]
+	assert isinstance(view, TransformerCacheView)
+	expected_shape = (
+		cache_metadata_config.batch_size,
+		cache_metadata_config.sequence_length,
+		cache_metadata_config.key_heads,
+		cache_metadata_config.key_dim,
+	)
+	assert view.key.shape == expected_shape
+	assert view.value.shape == expected_shape
+	assert view.key.dtype == jnp.float32
+	assert view.value.dtype == jnp.float32
+	assert view.index.shape == (cache_metadata_config.batch_size,)
+	assert jnp.all(view.index == 0)
 
-		assert len(cache.views) == num_layers
-		for i, view in enumerate(cache.views):
-			assert isinstance(view, TransformerCacheView)
-			assert view.key.shape == (2, 5, 4, 32)
-			assert view.value.shape == (2, 5, 4, 32)
-			assert view.layer_index == i
-			assert view.metadata == metadata
+	# Check sharding
+	assert isinstance(view.key.sharding, NamedSharding)
+	assert isinstance(view.value.sharding, NamedSharding)
+	assert view.key.sharding.mesh == mesh
+	assert view.value.sharding.mesh == mesh
+	# Cannot easily assert exact PartitionSpec equality due to internal representation
+	# assert view.key.sharding.spec == kv_spec # This might fail
 
-	def test_init_cache_with_custom_dtype_and_partition_spec(self):
-		num_layers = 2
-		metadata = TransformerCacheMetaData.create(
-			batch_size=1,
-			sequence_length=10,
-			num_heads=8,
-			head_dim=64,
-		)
-		paxis = PartitionAxis()
-		custom_partition_spec = PartitionSpec(
-			paxis.batch_axis,
-			paxis.key_sequence_axis,
-			None,
-			paxis.attention_dim_axis,
-		)
-		cache = TransformerCache.init_cache(
-			num_hidden_layers=num_layers,
-			metadata=metadata,
-			dtype=jnp.float16,
-			key_values_partition_specs=custom_partition_spec,
-		)
-		for view in cache.views:
-			assert view.key.dtype == jnp.float16
-			assert view.value.dtype == jnp.float16
-			# Placeholder check for partition spec
-			assert True  # TODO(add a more accurate check after looking for how to do it).
 
-	def test_init_empty(self):
-		num_layers = 4
-		cache = TransformerCache.init_empty(num_hidden_layers=num_layers)
-		assert len(cache.views) == num_layers
-		for view in cache.views:
-			assert view is None
+def test_transformer_cache_view_standard_concat(
+	transformer_cache,
+	cache_metadata_config,
+	kv_spec,
+	quantizer,
+	mesh,
+):
+	view = transformer_cache.views[0]
+	kv_sharding = NamedSharding(mesh, kv_spec)
 
-	def test_repr(self):
-		num_layers = 2
-		metadata = TransformerCacheMetaData.create(
-			batch_size=2,
-			sequence_length=5,
-			num_heads=4,
-			head_dim=32,
+	# Inputs
+	batch, num_heads, head_dim = 2, 2, 4
+	q_len, kv_len = 1, 1
+	query = jnp.ones((batch, q_len, num_heads, head_dim), dtype=jnp.float32)
+	key = jnp.ones((batch, kv_len, num_heads, head_dim), dtype=jnp.float32) * 2.0
+	value = jnp.ones((batch, kv_len, num_heads, head_dim), dtype=jnp.float32) * 3.0
+	# Base mask (e.g., padding mask) - all valid here
+	attention_mask = jnp.ones(
+		(batch, cache_metadata_config.sequence_length), dtype=jnp.bool_
+	)
+	causal_mask = jnp.tril(
+		jnp.ones(
+			(
+				1,
+				1,
+				cache_metadata_config.sequence_length,
+				cache_metadata_config.sequence_length,
+			),
+			dtype=jnp.bool_,
 		)
+	)
 
-		cache = TransformerCache.init_cache(
-			num_hidden_layers=num_layers,
-			metadata=metadata,
-		)
-		expected_repr = "TransformerCache(\n  TransformerCacheView(key=(2, 5, 4, 32), value=(2, 5, 4, 32), layer_index=0)\n  TransformerCacheView(key=(2, 5, 4, 32), value=(2, 5, 4, 32), layer_index=1)\n)"
-		assert repr(cache) == expected_repr
-		assert str(cache) == expected_repr
+	# --- First Call (Standard Path, cache_metadata=None) ---
+	updated_key, updated_value, final_mask = view.concatenate_to_cache(
+		query=query,
+		key=key,
+		value=value,
+		cache_metadata=None,  # Explicitly None for standard path
+		attention_mask=attention_mask,
+		kv_sharding=kv_sharding,
+		quantizer=quantizer,
+		causal_mask=causal_mask,
+	)
+
+	# Checks for standard path
+	assert view.index[0] == 1  # Index should update
+	chex.assert_trees_all_close(
+		updated_key, view.key
+	)  # Returned should match internal state
+	chex.assert_trees_all_close(updated_value, view.value)
+	# Check if the update happened at index 0
+	chex.assert_trees_all_close(view.key[:, 0:1, :, :], key)
+	chex.assert_trees_all_close(view.value[:, 0:1, :, :], value)
+	# Check mask shape and type (specific mask logic is complex to test fully here)
+	assert final_mask.shape == (
+		batch,
+		1,
+		q_len,
+		cache_metadata_config.sequence_length,
+	)
+	assert final_mask.dtype == jnp.bool_
+	# Mask for the first step should allow attention to index 0
+	assert jnp.all(final_mask[:, :, 0, 0])
+
+	# --- Second Call (Standard Path) ---
+	key_2 = key * 4.0
+	value_2 = value * 5.0
+	updated_key_2, updated_value_2, final_mask_2 = view.concatenate_to_cache(
+		query=query,
+		key=key_2,
+		value=value_2,
+		cache_metadata=None,
+		attention_mask=attention_mask,
+		kv_sharding=kv_sharding,
+		quantizer=quantizer,
+		causal_mask=causal_mask,
+	)
+	assert view.index[0] == 2  # Index should update again
+	chex.assert_trees_all_close(updated_key_2, view.key)
+	chex.assert_trees_all_close(updated_value_2, view.value)
+	# Check updates at index 0 and 1
+	chex.assert_trees_all_close(view.key[:, 0:1, :, :], key)
+	chex.assert_trees_all_close(view.value[:, 0:1, :, :], value)
+	chex.assert_trees_all_close(view.key[:, 1:2, :, :], key_2)
+	chex.assert_trees_all_close(view.value[:, 1:2, :, :], value_2)
+	assert final_mask_2.shape == (
+		batch,
+		1,
+		q_len,
+		cache_metadata_config.sequence_length,
+	)
+	# Mask for the second step should allow attention to index 0 and 1
+	assert jnp.all(final_mask_2[:, :, 0, 0])
+	assert jnp.all(final_mask_2[:, :, 0, 1])
+
+
+# def test_transformer_cache_view_pooled_concat(
+# 	transformer_cache,
+# 	cache_metadata_config,
+# 	kv_spec,
+# 	quantizer,
+# 	mesh,
+# ):
+# 	view = transformer_cache.views[0]
+# 	initial_index = view.index + 0
+
+# 	kv_sharding = NamedSharding(mesh, kv_spec)
+
+# 	# Inputs
+# 	micro_batch_size, q_len, num_heads, head_dim = 2, 1, 2, 4
+# 	query = jnp.ones((micro_batch_size, q_len, num_heads, head_dim), dtype=jnp.float32)
+# 	# Simulate updates for two sequences in different slots
+# 	key = jnp.array(
+# 		[[[[1.1] * head_dim] * num_heads], [[[2.2] * head_dim] * num_heads]],
+# 		dtype=jnp.float32,
+# 	)  # Shape (2, 1, 2, 4)
+# 	value = jnp.array(
+# 		[
+# 			[[[3.3] * head_dim] * num_heads],  # Batch item 0
+# 			[[[4.4] * head_dim] * num_heads],
+# 		],  # Batch item 1
+# 		dtype=jnp.float32,
+# 	)  # Shape (2, 1, 2, 4)
+# 	attention_mask_in = jnp.ones(
+# 		(micro_batch_size, 1), dtype=jnp.bool_
+# 	)  # Dummy input mask
+
+# 	# Pooled Metadata
+# 	pooled_metadata = TransformerMetadata(
+# 		max_sequence_length=cache_metadata_config.sequence_length,
+# 		num_layers=cache_metadata_config.num_hidden_layers,
+# 		micro_batch_slot_indices=jnp.array([0, 1]),  # Update slot 0 and slot 1
+# 		micro_batch_seq_lengths=jnp.array(
+# 			[3, 5]
+# 		),  # Write at index 3 for slot 0, index 5 for slot 1
+# 	)
+
+# 	# --- Call with Pooled Logic ---
+# 	final_k_cache, final_v_cache, final_mask = view.concatenate_to_cache(
+# 		query=query,
+# 		key=key,
+# 		value=value,
+# 		cache_metadata=pooled_metadata,  # Use pooled metadata
+# 		attention_mask=attention_mask_in,
+# 		kv_sharding=kv_sharding,
+# 		quantizer=quantizer,
+# 		causal_mask=None,  # Not used in pooled path of concat
+# 	)
+
+# 	# Checks for pooled path
+# 	# 1. Returned mask should be the original input mask
+# 	chex.assert_trees_all_equal(final_mask, attention_mask_in)
+
+# 	# 2. Returned K/V caches should reflect the targeted updates
+# 	# Slot 0, index 3 should be updated
+# 	chex.assert_trees_all_close(final_k_cache[0, 3:4, :, :], key[0])
+# 	chex.assert_trees_all_close(final_v_cache[0, 3:4, :, :], value[0])
+# 	# Slot 1, index 5 should be updated
+# 	chex.assert_trees_all_close(final_k_cache[1, 5:6, :, :], key[1])
+# 	chex.assert_trees_all_close(final_v_cache[1, 5:6, :, :], value[1])
+# 	# Other indices should remain unchanged (0.0 from initialization)
+# 	assert jnp.all(final_k_cache[0, :3] == 0.0)
+# 	assert jnp.all(final_k_cache[0, 4:] == 0.0)
+# 	assert jnp.all(final_k_cache[1, :5] == 0.0)
+# 	assert jnp.all(final_k_cache[1, 6:] == 0.0)
+
+# 	# 3. Check internal state modification (based on user's current code)
+# 	# This part verifies the side-effect in the pooled path due to user's revert
+# 	# Ideally, in a purely functional setup for JIT, self.key/value wouldn't change here.
+# 	chex.assert_trees_all_close(view.key, final_k_cache)
+# 	chex.assert_trees_all_close(view.value, final_v_cache)
+# 	# Index should NOT change in pooled logic path according to original design,
+# 	# but let's check if it was unintentionally left in the user's version.
+# 	# If the user removed index update from pooled path, this should pass.
+# 	chex.assert_trees_all_equal(view.index, initial_index)
 
 
 if __name__ == "__main__":

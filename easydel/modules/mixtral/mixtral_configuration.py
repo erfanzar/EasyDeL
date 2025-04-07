@@ -134,6 +134,43 @@ class MixtralConfig(EasyDeLBaseConfig):
 		router_jitter_noise=0.0,
 		**kwargs,
 	):
+		"""Initializes a MixtralConfig object.
+
+		Args:
+		    vocab_size (int, optional): Vocabulary size. Defaults to 32000.
+		    hidden_size (int, optional): Hidden size. Defaults to 4096.
+		    intermediate_size (int, optional): Intermediate size of the feed-forward network. Defaults to 14336.
+		    num_hidden_layers (int, optional): Number of hidden layers. Defaults to 32.
+		    num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
+		    num_key_value_heads (int, optional): Number of key/value heads (for GQA). Defaults to 8.
+		    hidden_act (str, optional): Activation function. Defaults to "silu".
+		    max_position_embeddings (int, optional): Maximum sequence length. Defaults to 4096 * 32.
+		    initializer_range (float, optional): Initializer range. Defaults to 0.02.
+		    rms_norm_eps (float, optional): Epsilon for RMS normalization. Defaults to 1e-5.
+		    use_cache (bool, optional): Whether to use KV cache. Defaults to True.
+		    pad_token_id (int, optional): Padding token ID. Defaults to None.
+		    bos_token_id (int, optional): Beginning-of-sequence token ID. Defaults to 1.
+		    eos_token_id (int, optional): End-of-sequence token ID. Defaults to 2.
+		    tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
+		    rope_theta (float, optional): Base value for RoPE. Defaults to 1e6.
+		    sliding_window (int, optional): Sliding window size for attention. Defaults to 4096.
+		    attention_dropout (float, optional): Dropout probability for attention. Defaults to 0.0.
+		    num_experts_per_tok (int, optional): Number of experts to route per token. Defaults to 2.
+		    num_local_experts (int, optional): Total number of local experts. Defaults to 8.
+		    output_router_logits (bool, optional): Whether to output router logits. Defaults to False.
+		    router_aux_loss_coef (float, optional): Coefficient for router auxiliary loss. Defaults to 0.001.
+		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
+		        Defaults to EasyDeLGradientCheckPointers.NONE.
+		    use_scan_mlp (bool, optional): Whether to use scan for MLP layers. Defaults to False.
+		    scan_mlp_chunk_size (int, optional): Chunk size for scan MLP. Defaults to 1024.
+		    number_rep_kv (int, optional): Number of repetitions for key/value heads. Defaults to 1.
+		    bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
+		    rope_scaling (tp.Dict[str, tp.Union[str, float]], optional): RoPE scaling configuration. Defaults to None.
+		    attention_bias (bool, optional): Whether to use bias in attention layers. Defaults to False.
+		    initialization_of_moe (bool, optional): Whether MoE layers are being initialized. Defaults to False.
+		    router_jitter_noise (float, optional): Jitter noise for router gates. Defaults to 0.0.
+		    **kwargs: Additional keyword arguments.
+		"""
 		self.vocab_size = vocab_size
 		self.max_position_embeddings = max_position_embeddings
 		self.hidden_size = hidden_size
@@ -178,9 +215,16 @@ class MixtralConfig(EasyDeLBaseConfig):
 
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model.
+		Get the partition rules for the model. This method defines how the model's parameters are
+		partitioned across devices for distributed training and inference.
+
+		Args:
+		    *args: Additional positional arguments (unused).
+		    **kwargs: Additional keyword arguments (unused).
+
 		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: A tuple of partition rules, where each rule is a tuple
+		        containing a regex pattern for parameter names and the corresponding `PartitionSpec`.
 		"""
 		return (
 			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
@@ -215,25 +259,17 @@ class MixtralConfig(EasyDeLBaseConfig):
 		"""The attach_custom_arguments function adds the following arguments to the model:
 
 		Args:
-		    self: Bind the attributes and methods of a class to an
-		        instance of that class
-		    gradient_checkpointing: str: Determine whether to use
-		        gradient checkpointing
-		    use_scan_mlp: bool: Determine whether to use the scan_mlp
-		        function or not
-		    scan_mlp_chunk_size: int: Chunk the input to the mlp
-		    number_rep_kv: int: Control the number of times that the key
-		        and value vectors are repeated
-		    bits: tp.Optional[int]: Specify the number of bits to use for
-		        quantization
-		    attention_dropout: float: Set the dropout rate for the
-		        attention layer
-		    attention_bias: bool: when ever to use attention_bias
-		    initialization_of_moe: bool: initialization of moe needs to
-		        disable some dynamic part's this boolean variable will
-		        turn them off.
-		    rope_scaling: tp.Dict[str, tp.Union[str, float]]: rope_scaling for
-		        rope
+		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
+		        Defaults to EasyDeLGradientCheckPointers.NONE.
+		    use_scan_mlp (bool, optional): Whether to use scan for MLP layers. Defaults to False.
+		    scan_mlp_chunk_size (int, optional): Chunk size for scan MLP. Defaults to 1024.
+		    number_rep_kv (int, optional): Number of repetitions for key/value heads. Defaults to 1.
+		    bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
+		    attention_dropout (float, optional): Dropout probability for attention. Defaults to 0.0.
+		    rope_scaling (tp.Dict[str, tp.Union[str, float]], optional): RoPE scaling configuration. Defaults to None.
+		    attention_bias (bool, optional): Whether to use bias in attention layers. Defaults to False.
+		    initialization_of_moe (bool, optional): Whether MoE layers are being initialized. Defaults to False.
+		    **kwargs: Additional keyword arguments (ignored).
 
 		Returns:
 		    A tuple of the following:
@@ -250,14 +286,32 @@ class MixtralConfig(EasyDeLBaseConfig):
 
 	@staticmethod
 	def get_weight_decay_exclusions():
+		"""Returns a tuple of parameter names for which weight decay should be excluded.
+
+		Returns:
+		    tuple: An empty tuple, indicating no specific weight decay exclusions for this model.
+		"""
 		return tuple()
 
 	@staticmethod
 	def rng_keys():
-		return "params", "dropout", "fcm"
+		"""Returns the names of the random number generator keys used by the model.
+
+		Returns:
+		    tuple: A tuple containing "params", "dropout", and "jitter" as the RNG keys.
+		"""
+		return "params", "dropout"
 
 	@property
 	def granted_freq_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size specifically for frequency-based position embeddings.
+
+		If `freq_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
+		`max_position_embeddings`.
+
+		Returns:
+		    int: The granted maximum position embedding size for frequency encoding.
+		"""
 		return getattr(
 			self,
 			"freq_max_position_embeddings",
@@ -266,6 +320,14 @@ class MixtralConfig(EasyDeLBaseConfig):
 
 	@property
 	def granted_mask_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size specifically for mask-based position embeddings.
+
+		If `mask_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
+		`max_position_embeddings`.
+
+		Returns:
+		    int: The granted maximum position embedding size for mask encoding.
+		"""
 		return getattr(
 			self,
 			"mask_max_position_embeddings",

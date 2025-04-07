@@ -39,18 +39,11 @@ from easydel.inference.logits_process import (
 	TopKLogitsWarper,
 	TopPLogitsWarper,
 )
-from easydel.layers.caching import (
-	TransformerCache,
-	TransformerCacheMetaData,
-)
+from easydel.layers.caching import TransformerCache, TransformerCacheMetaData
 from easydel.utils.helpers import get_logger
 
 from ..base_config import EasyDeLBaseConfig
-from ..modeling_outputs import (
-	BeamSearchOutput,
-	GreedySearchOutput,
-	SampleOutput,
-)
+from ..modeling_outputs import BeamSearchOutput, GreedySearchOutput, SampleOutput
 
 logger = get_logger(__name__)
 

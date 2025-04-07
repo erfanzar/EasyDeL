@@ -638,6 +638,15 @@ class DbrxBlock(nn.Module):
 	model_type="dbrx",
 )
 class DbrxModel(EasyDeLBaseModule):
+	"""
+	Base DBRX Model outputting raw hidden-states.
+
+	This model is a Transformer-based model with a mixture of experts (MoE) architecture,
+	implementing the DBRX architecture as described in the original paper.
+
+	The model uses specialized attention modules and a router-based MoE FFN layer.
+	"""
+
 	def __init__(
 		self,
 		config: DbrxConfig,
@@ -647,6 +656,15 @@ class DbrxModel(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initialize the DbrxModel.
+
+		Args:
+			config (DbrxConfig): The model configuration.
+			dtype (jnp.dtype, optional): The data type for computation. Defaults to jnp.float32.
+			param_dtype (jnp.dtype, optional): The data type for parameters. Defaults to jnp.float32.
+			precision (jax.lax.PrecisionLike, optional): The precision to use for matrix multiplication. Defaults to None.
+			rngs (nn.Rngs): The random number generators.
+		"""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -705,6 +723,25 @@ class DbrxModel(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
 	) -> MoeModelOutput | tp.Tuple:
+		"""
+		Forward pass of the model.
+
+		Args:
+			input_ids (chex.Array): Token IDs to process.
+			attention_mask (Optional[chex.Array], optional): Mask to avoid attention on padding tokens. Defaults to None.
+			position_ids (Optional[chex.Array], optional): Position IDs. Defaults to None.
+			segment_ids (Optional[chex.Array], optional): Segment IDs for segment-based attention. Defaults to None.
+			inputs_embeds (Optional[chex.Array], optional): Pre-computed input embeddings. Defaults to None.
+			output_attentions (Optional[bool], optional): Whether to output attention weights. Defaults to None.
+			output_hidden_states (Optional[bool], optional): Whether to output hidden states. Defaults to None.
+			output_router_logits (Optional[bool], optional): Whether to output router logits. Defaults to None.
+			past_key_values (Optional[TransformerCache | PagedAttentionCache], optional): Cached key/values. Defaults to None.
+			cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata], optional): Cache metadata. Defaults to None.
+			return_dict (bool, optional): Whether to return a dictionary or tuple. Defaults to True.
+
+		Returns:
+			MoeModelOutput | Tuple: The model outputs, either as a named tuple or a standard tuple.
+		"""
 		if output_router_logits is None:
 			output_router_logits = self.config.output_router_logits
 
@@ -858,6 +895,7 @@ class DbrxForCausalLM(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			output_router_logits=output_router_logits,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			return_dict=True,
 			segment_ids=segment_ids,
 		)
@@ -866,17 +904,12 @@ class DbrxForCausalLM(EasyDeLBaseModule):
 		aux_loss = None
 		if output_router_logits and outputs.router_logits is not None:
 			aux_loss = auxiliary_load_balancing_loss_func(
-				gate_logits=tuple(  # type:ignore
-					[
-						logit.reshape(batch_size * seq_length, -1)
-						for logit in outputs.router_logits
-					]  # type:ignore
-				),
+				gate_logits=outputs.router_logits,
 				num_experts=self.config.ffn_config.moe_num_experts,
 				top_k=self.config.ffn_config.moe_top_k,
 				attention_mask=attention_mask,
 			)
-			aux_loss = aux_loss * self.config.router_aux_loss_coef
+			aux_loss += aux_loss * self.config.router_aux_loss_coef
 		if not return_dict:
 			outputs = (logits,) + tuple(
 				v
@@ -968,6 +1001,7 @@ class DbrxForSequenceClassification(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			output_router_logits=output_router_logits,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			return_dict=True,
 			segment_ids=segment_ids,
 		)
@@ -997,17 +1031,12 @@ class DbrxForSequenceClassification(EasyDeLBaseModule):
 		aux_loss = None
 		if output_router_logits and transformer_outputs.router_logits is not None:
 			aux_loss = auxiliary_load_balancing_loss_func(
-				gate_logits=tuple(
-					[
-						logit.reshape(batch_size * sequence_lengths, -1)
-						for logit in transformer_outputs.router_logits
-					]
-				),
+				gate_logits=transformer_outputs.router_logits,
 				num_experts=self.config.ffn_config.moe_num_experts,
 				top_k=self.config.ffn_config.moe_top_k,
 				attention_mask=attention_mask,
 			)
-			aux_loss = aux_loss * self.config.router_aux_loss_coef
+			aux_loss += aux_loss * self.config.router_aux_loss_coef
 		if not return_dict:
 			output = (pooled_logits,) + transformer_outputs[1:] + (aux_loss,)
 			return output

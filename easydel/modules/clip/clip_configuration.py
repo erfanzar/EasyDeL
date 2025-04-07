@@ -23,6 +23,16 @@ logger = get_logger(__name__)
 
 
 def _get_partition_rules(self, *arg, **kwargs):
+	"""Generic partition rules for CLIP text and vision models.
+
+	Args:
+		self: The configuration object (unused but part of method signature).
+		*arg: Additional positional arguments (unused).
+		**kwargs: Additional keyword arguments (unused).
+
+	Returns:
+		Tuple: A tuple of partition rules for model parameters.
+	"""
 	return (
 		# Embeddings
 		("token_embedding/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
@@ -64,40 +74,40 @@ class CLIPTextConfig(EasyDeLBaseConfig):
 	documentation from [`EasyDeLBaseConfig`] for more information.
 
 	Args:
-	    vocab_size (`int`, *optional*, defaults to 49408):
-	        Vocabulary size of the CLIP text model. Defines the number of different tokens that can be represented by
-	        the `inputs_ids` passed when calling [`CLIPModel`].
-	    hidden_size (`int`, *optional*, defaults to 512):
-	        Dimensionality of the encoder layers and the pooler layer.
-	    intermediate_size (`int`, *optional*, defaults to 2048):
-	        Dimensionality of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
-	    projection_dim (`int`, *optional*, defaults to 512):
-	        Dimensionality of text and vision projection layers.
-	    num_hidden_layers (`int`, *optional*, defaults to 12):
-	        Number of hidden layers in the Transformer encoder.
-	    num_attention_heads (`int`, *optional*, defaults to 8):
-	        Number of attention heads for each attention layer in the Transformer encoder.
-	    max_position_embeddings (`int`, *optional*, defaults to 77):
-	        The maximum sequence length that this model might ever be used with. Typically set this to something large
-	        just in case (e.g., 512 or 1024 or 2048).
-	    hidden_act (`str` or `function`, *optional*, defaults to `"quick_gelu"`):
-	        The non-linear activation function (function or string) in the encoder and pooler. If string, `"gelu"`,
-	        `"relu"`, `"selu"` and `"gelu_new"` `"quick_gelu"` are supported.
-	    layer_norm_eps (`float`, *optional*, defaults to 1e-05):
-	        The epsilon used by the layer normalization layers.
-	    attention_dropout (`float`, *optional*, defaults to 0.0):
-	        The dropout ratio for the attention probabilities.
-	    initializer_range (`float`, *optional*, defaults to 0.02):
-	        The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
-	    initializer_factor (`float`, *optional*, defaults to 1.0):
-	        A factor for initializing all weight matrices (should be kept to 1, used internally for initialization
-	        testing).
-	    pad_token_id (`int`, *optional*, defaults to 1):
-	        Padding token id.
-	    bos_token_id (`int`, *optional*, defaults to 49406):
-	        Beginning of stream token id.
-	    eos_token_id (`int`, *optional*, defaults to 49407):
-	        End of stream token id.
+		vocab_size (`int`, *optional*, defaults to 49408):
+			Vocabulary size of the CLIP text model. Defines the number of different tokens that can be represented by
+			the `inputs_ids` passed when calling [`CLIPModel`].
+		hidden_size (`int`, *optional*, defaults to 512):
+			Dimensionality of the encoder layers and the pooler layer.
+		intermediate_size (`int`, *optional*, defaults to 2048):
+			Dimensionality of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
+		projection_dim (`int`, *optional*, defaults to 512):
+			Dimensionality of text and vision projection layers.
+		num_hidden_layers (`int`, *optional*, defaults to 12):
+			Number of hidden layers in the Transformer encoder.
+		num_attention_heads (`int`, *optional*, defaults to 8):
+			Number of attention heads for each attention layer in the Transformer encoder.
+		max_position_embeddings (`int`, *optional*, defaults to 77):
+			The maximum sequence length that this model might ever be used with. Typically set this to something large
+			just in case (e.g., 512 or 1024 or 2048).
+		hidden_act (`str` or `function`, *optional*, defaults to `"quick_gelu"`):
+			The non-linear activation function (function or string) in the encoder and pooler. If string, `"gelu"`,
+			`"relu"`, `"selu"` and `"gelu_new"` `"quick_gelu"` are supported.
+		layer_norm_eps (`float`, *optional*, defaults to 1e-05):
+			The epsilon used by the layer normalization layers.
+		attention_dropout (`float`, *optional*, defaults to 0.0):
+			The dropout ratio for the attention probabilities.
+		initializer_range (`float`, *optional*, defaults to 0.02):
+			The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+		initializer_factor (`float`, *optional*, defaults to 1.0):
+			A factor for initializing all weight matrices (should be kept to 1, used internally for initialization
+			testing).
+		pad_token_id (`int`, *optional*, defaults to 1):
+			Padding token id.
+		bos_token_id (`int`, *optional*, defaults to 49406):
+			Beginning of stream token id.
+		eos_token_id (`int`, *optional*, defaults to 49407):
+			End of stream token id.
 
 	Example:
 
@@ -171,34 +181,34 @@ class CLIPVisionConfig(EasyDeLBaseConfig):
 	documentation from [`EasyDeLBaseConfig`] for more information.
 
 	Args:
-	    hidden_size (`int`, *optional*, defaults to 768):
-	        Dimensionality of the encoder layers and the pooler layer.
-	    intermediate_size (`int`, *optional*, defaults to 3072):
-	        Dimensionality of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
-	    projection_dim (`int`, *optional*, defaults to 512):
-	        Dimensionality of text and vision projection layers.
-	    num_hidden_layers (`int`, *optional*, defaults to 12):
-	        Number of hidden layers in the Transformer encoder.
-	    num_attention_heads (`int`, *optional*, defaults to 12):
-	        Number of attention heads for each attention layer in the Transformer encoder.
-	    num_channels (`int`, *optional*, defaults to 3):
-	        The number of input channels.
-	    image_size (`int`, *optional*, defaults to 224):
-	        The size (resolution) of each image.
-	    patch_size (`int`, *optional*, defaults to 32):
-	        The size (resolution) of each patch.
-	    hidden_act (`str` or `function`, *optional*, defaults to `"quick_gelu"`):
-	        The non-linear activation function (function or string) in the encoder and pooler. If string, `"gelu"`,
-	        `"relu"`, `"selu"` and `"gelu_new"` `"quick_gelu"` are supported.
-	    layer_norm_eps (`float`, *optional*, defaults to 1e-05):
-	        The epsilon used by the layer normalization layers.
-	    attention_dropout (`float`, *optional*, defaults to 0.0):
-	        The dropout ratio for the attention probabilities.
-	    initializer_range (`float`, *optional*, defaults to 0.02):
-	        The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
-	    initializer_factor (`float`, *optional*, defaults to 1.0):
-	        A factor for initializing all weight matrices (should be kept to 1, used internally for initialization
-	        testing).
+		hidden_size (`int`, *optional*, defaults to 768):
+			Dimensionality of the encoder layers and the pooler layer.
+		intermediate_size (`int`, *optional*, defaults to 3072):
+			Dimensionality of the "intermediate" (i.e., feed-forward) layer in the Transformer encoder.
+		projection_dim (`int`, *optional*, defaults to 512):
+			Dimensionality of text and vision projection layers.
+		num_hidden_layers (`int`, *optional*, defaults to 12):
+			Number of hidden layers in the Transformer encoder.
+		num_attention_heads (`int`, *optional*, defaults to 12):
+			Number of attention heads for each attention layer in the Transformer encoder.
+		num_channels (`int`, *optional*, defaults to 3):
+			The number of input channels.
+		image_size (`int`, *optional*, defaults to 224):
+			The size (resolution) of each image.
+		patch_size (`int`, *optional*, defaults to 32):
+			The size (resolution) of each patch.
+		hidden_act (`str` or `function`, *optional*, defaults to `"quick_gelu"`):
+			The non-linear activation function (function or string) in the encoder and pooler. If string, `"gelu"`,
+			`"relu"`, `"selu"` and `"gelu_new"` `"quick_gelu"` are supported.
+		layer_norm_eps (`float`, *optional*, defaults to 1e-05):
+			The epsilon used by the layer normalization layers.
+		attention_dropout (`float`, *optional*, defaults to 0.0):
+			The dropout ratio for the attention probabilities.
+		initializer_range (`float`, *optional*, defaults to 0.02):
+			The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+		initializer_factor (`float`, *optional*, defaults to 1.0):
+			A factor for initializing all weight matrices (should be kept to 1, used internally for initialization
+			testing).
 
 	Example:
 
@@ -266,16 +276,16 @@ class CLIPConfig(EasyDeLBaseConfig):
 	documentation from [`EasyDeLBaseConfig`] for more information.
 
 	Args:
-	    text_config (`dict`, *optional*):
-	        Dictionary of configuration options used to initialize [`CLIPTextConfig`].
-	    vision_config (`dict`, *optional*):
-	        Dictionary of configuration options used to initialize [`CLIPVisionConfig`].
-	    projection_dim (`int`, *optional*, defaults to 512):
-	        Dimensionality of text and vision projection layers.
-	    logit_scale_init_value (`float`, *optional*, defaults to 2.6592):
-	        The initial value of the *logit_scale* parameter. Default is used as per the original CLIP implementation.
-	    kwargs (*optional*):
-	        Dictionary of keyword arguments.
+		text_config (`dict`, *optional*):
+			Dictionary of configuration options used to initialize [`CLIPTextConfig`].
+		vision_config (`dict`, *optional*):
+			Dictionary of configuration options used to initialize [`CLIPVisionConfig`].
+		projection_dim (`int`, *optional*, defaults to 512):
+			Dimensionality of text and vision projection layers.
+		logit_scale_init_value (`float`, *optional*, defaults to 2.6592):
+			The initial value of the *logit_scale* parameter. Default is used as per the original CLIP implementation.
+		kwargs (*optional*):
+			Dictionary of keyword arguments.
 
 	Example:
 
@@ -417,8 +427,13 @@ class CLIPConfig(EasyDeLBaseConfig):
 		Instantiate a [`CLIPConfig`] (or a derived class) from clip text model configuration and clip vision model
 		configuration.
 
+		Args:
+			text_config (CLIPTextConfig): The text model configuration.
+			vision_config (CLIPVisionConfig): The vision model configuration.
+			**kwargs: Additional keyword arguments.
+
 		Returns:
-		    [`CLIPConfig`]: An instance of a configuration object
+			[`CLIPConfig`]: An instance of a configuration object
 		"""
 
 		return cls(

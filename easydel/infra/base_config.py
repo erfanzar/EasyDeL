@@ -16,12 +16,13 @@ from __future__ import annotations
 import os
 import typing as tp
 import warnings
-from eformer.pytree import auto_pytree
+
 import chex
 import jax
 import jax.extend
 import jax.tree_util
 from eformer.escale import PartitionAxis
+from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 from transformers.configuration_utils import PretrainedConfig
 
@@ -819,6 +820,43 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			is_neox_style=is_neox_style,
 			rope_scaling=rope_config.to_dict(),
 		)
+
+	def get_basic_inv_frequencies(
+		self,
+		head_size: tp.Optional[int] = None,
+		rotary_dim: tp.Optional[int] = None,
+		base: tp.Optional[float] = None,
+		partial_rotary_factor: float = 1.0,
+	) -> ModuleCaches:
+		"""
+		Get basic inv frequencies for rotary embeddings.
+
+		Args:
+		    head_size: Size of attention heads (defaults to self.head_dim)
+		    rotary_dim: Dimension for rotary embeddings (defaults to head_size)
+		    base: Base value for frequency computation (defaults to self.rope_theta)
+
+		Returns:
+		    ModuleCaches instance containing computed frequencies
+		"""
+		from easydel.layers.rotary_embedding import get_inv_frequencies
+
+		from .utils import ModuleCaches
+
+		head_size = head_size or self.head_dim
+		rotary_dim = rotary_dim or head_size
+		rope_config = self._get_rope_config()
+
+		frequencies = get_inv_frequencies(
+			head_size=head_size,
+			rotary_dim=rotary_dim,
+			max_position=self.granted_freq_max_position_embedding,
+			base=base or self.rope_theta,
+			rope_scaling=rope_config.to_dict(),
+			partial_rotary_factor=partial_rotary_factor,
+		)
+
+		return ModuleCaches(frequencies)
 
 	def get_basic_frequencies(
 		self,
