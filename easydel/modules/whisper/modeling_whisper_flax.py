@@ -76,6 +76,19 @@ def shift_tokens_right(
 
 
 def sinusoidal_embedding_init(key, shape, dtype=jnp.float_) -> jax.Array:
+	"""Initializes sinusoidal positional embeddings.
+
+	Args:
+	    key: JAX PRNG key (unused, but part of standard initializer signature).
+	    shape (tuple): Shape of the embedding matrix (length, channels).
+	    dtype: Data type of the embeddings (default: jnp.float_).
+
+	Returns:
+	    jax.Array: Sinusoidal positional embedding matrix.
+
+	Raises:
+	    ValueError: If the number of channels is not even.
+	"""
 	length, channels = shape
 	if channels % 2 != 0:
 		raise ValueError(
@@ -90,6 +103,30 @@ def sinusoidal_embedding_init(key, shape, dtype=jnp.float_) -> jax.Array:
 
 
 class WhisperAttention(AttentionModule):
+	"""Whisper Attention mechanism.
+
+	This module implements the standard multi-head attention mechanism used
+	in both the encoder and decoder of the Whisper model.
+
+	Attributes:
+	    config (WhisperConfig): Configuration object for the model.
+	    embed_dim (int): Dimensionality of the embedding layer.
+	    num_heads (int): Number of attention heads.
+	    dropout (float): Dropout probability.
+	    causal (bool): Whether this attention is causal (used in decoder self-attention).
+	    bias (bool): Whether to include bias in linear projections.
+	    head_dim (int): Dimensionality of each attention head.
+	    q_proj (ParallelLinear): Linear layer for query projection.
+	    k_proj (ParallelLinear): Linear layer for key projection.
+	    v_proj (ParallelLinear): Linear layer for value projection.
+	    out_proj (ParallelLinear): Linear layer for output projection.
+	    attention_performer (FlexibleAttentionModule): Module for performing attention computation.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+	    rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: WhisperConfig,
@@ -104,6 +141,23 @@ class WhisperAttention(AttentionModule):
 		*,
 		rngs: nn.Rngs,
 	) -> None:
+		"""Initializes the WhisperAttention module.
+
+		Args:
+		    config (WhisperConfig): The configuration object for the model.
+		    embed_dim (int): Dimensionality of the input and output features.
+		    num_heads (int): Number of attention heads.
+		    dropout (float): Dropout probability for attention weights (default: 0.0).
+		    causal (bool): Whether to apply causal masking (default: False).
+		    bias (bool): Whether to include bias terms in the projection layers (default: True).
+		    dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+		    param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+		    precision (tp.Optional[tp.Union[str, lax.Precision]]): Precision setting for JAX operations (default: None).
+		    rngs (nn.Rngs): Random number generators.
+
+		Raises:
+		    ValueError: If `embed_dim` is not divisible by `num_heads`.
+		"""
 		super().__init__(config=config)
 		self.rngs = rngs
 		self.embed_dim = embed_dim
@@ -152,6 +206,22 @@ class WhisperAttention(AttentionModule):
 		attention_mask: tp.Optional[jnp.ndarray] = None,
 		causal_mask: tp.Optional[jnp.ndarray] = None,
 	) -> tuple[tp.Any, tp.Any]:
+		"""Forward pass of the attention module.
+
+		Args:
+		    hidden_states (jnp.ndarray): Input hidden states (batch, seq_len, embed_dim).
+		    key_value_states (tp.Optional[jnp.ndarray]): Optional key/value states for cross-attention
+		        (batch, kv_seq_len, embed_dim). If None, self-attention is performed.
+		    cache_view (tp.Optional[TransformerCacheView]): Cache view for key/value states, used in causal attention.
+		    cache_metadata (tp.Optional[TransformerMetadata]): Metadata for paged attention.
+		    attention_mask (tp.Optional[jnp.ndarray]): Mask to apply to attention scores (batch, 1, seq_len, kv_seq_len).
+		    causal_mask (tp.Optional[jnp.ndarray]): Causal mask specific to this module (required if self.causal is True).
+
+		Returns:
+		    tuple[jnp.ndarray, jnp.ndarray]: A tuple containing:
+		        - attn_output (jnp.ndarray): Attention output (batch, seq_len, embed_dim).
+		        - attn_weights (jnp.ndarray): Attention weights (batch, num_heads, seq_len, kv_seq_len).
+		"""
 		is_cross_attention = key_value_states is not None
 		query_states = self.q_proj(hidden_states)
 
@@ -209,15 +279,37 @@ class WhisperAttention(AttentionModule):
 		return attn_output, attentions.attention_outputs
 
 	def _split_heads(self, hidden_state) -> jnp.ndarray:
+		"""Splits the last dimension of the hidden state into (num_heads, head_dim)."""
 		return hidden_state.reshape(
 			hidden_state.shape[:2] + (self.num_heads, self.head_dim)
 		)
 
 	def _merge_heads(self, hidden_state) -> jnp.ndarray:
+		"""Merges the last two dimensions (num_heads, head_dim) into embed_dim."""
 		return hidden_state.reshape(hidden_state.shape[:2] + (self.embed_dim,))
 
 
 class WhisperEncoderLayer(nn.Module):
+	"""A single layer for the Whisper encoder.
+
+	This layer consists of a self-attention mechanism followed by a feed-forward
+	network (FFN), with residual connections and layer normalization.
+
+	Attributes:
+	    config (WhisperConfig): Configuration object for the model.
+	    embed_dim (int): Dimensionality of the input and output features.
+	    self_attn (WhisperAttention): Self-attention module.
+	    self_attn_layer_norm (nn.LayerNorm): Layer normalization before self-attention.
+	    fc1 (ParallelLinear): First linear layer of the FFN.
+	    fc2 (ParallelLinear): Second linear layer of the FFN.
+	    final_layer_norm (nn.LayerNorm): Layer normalization after the FFN.
+	    activation_fn (callable): Activation function for the FFN.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+	    rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: WhisperConfig,
@@ -227,6 +319,15 @@ class WhisperEncoderLayer(nn.Module):
 		*,
 		rngs: nn.Rngs,
 	) -> None:
+		"""Initializes the WhisperEncoderLayer module.
+
+		Args:
+		    config (WhisperConfig): The configuration object for the model.
+		    dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+		    param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+		    precision (tp.Optional[tp.Union[str, lax.Precision]]): Precision setting for JAX operations (default: None).
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		self.config = config
 		self.dtype = dtype
 		self.param_dtype = param_dtype
@@ -281,6 +382,19 @@ class WhisperEncoderLayer(nn.Module):
 		causal_mask: tp.Optional[jnp.ndarray] = None,
 		output_attentions: bool = True,
 	) -> tp.Tuple[jnp.ndarray]:
+		"""Forward pass of the encoder layer.
+
+		Args:
+		    hidden_states (jnp.ndarray): Input hidden states (batch, seq_len, embed_dim).
+		    attention_mask (jnp.ndarray): Attention mask (batch, 1, seq_len, seq_len).
+		    causal_mask (tp.Optional[jnp.ndarray]): Causal mask, usually None for encoder.
+		    output_attentions (bool): Whether to return attention weights (default: True).
+
+		Returns:
+		    tp.Tuple[jnp.ndarray, ...]: A tuple containing:
+		        - hidden_states (jnp.ndarray): Output hidden states (batch, seq_len, embed_dim).
+		        - attn_weights (jnp.ndarray, optional): Attention weights if `output_attentions` is True.
+		"""
 		residual = hidden_states
 		hidden_states = self.self_attn_layer_norm(hidden_states)
 		hidden_states, attn_weights = self.self_attn(
@@ -310,6 +424,28 @@ class WhisperEncoderLayer(nn.Module):
 
 
 class WhisperDecoderLayer(nn.Module):
+	"""A single layer for the Whisper decoder.
+
+	This layer consists of self-attention, cross-attention (attending to encoder outputs),
+	and a feed-forward network (FFN), each followed by residual connections and layer normalization.
+
+	Attributes:
+	    config (WhisperConfig): Configuration object for the model.
+	    embed_dim (int): Dimensionality of the input and output features.
+	    self_attn (WhisperAttention): Self-attention module (causal).
+	    encoder_attn (WhisperAttention): Cross-attention module (attends to encoder outputs).
+	    self_attn_layer_norm (nn.LayerNorm): Layer normalization before self-attention.
+	    encoder_attn_layer_norm (nn.LayerNorm): Layer normalization before cross-attention.
+	    fc1 (ParallelLinear): First linear layer of the FFN.
+	    fc2 (ParallelLinear): Second linear layer of the FFN.
+	    final_layer_norm (nn.LayerNorm): Layer normalization after the FFN.
+	    activation_fn (callable): Activation function for the FFN.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+	    rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: WhisperConfig,
@@ -319,6 +455,15 @@ class WhisperDecoderLayer(nn.Module):
 		*,
 		rngs: nn.Rngs,
 	) -> None:
+		"""Initializes the WhisperDecoderLayer module.
+
+		Args:
+		    config (WhisperConfig): The configuration object for the model.
+		    dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+		    param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+		    precision (tp.Optional[tp.Union[str, lax.Precision]]): Precision setting for JAX operations (default: None).
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		self.config = config
 		self.dtype = dtype
 		self.param_dtype = param_dtype
@@ -406,6 +551,26 @@ class WhisperDecoderLayer(nn.Module):
 		cache_metadata: tp.Optional[TransformerMetadata] = None,
 		output_attentions: bool = True,
 	) -> tp.Tuple[jnp.ndarray]:
+		"""Forward pass of the decoder layer.
+
+		Args:
+		    hidden_states (jnp.ndarray): Input hidden states (batch, seq_len, embed_dim).
+		    attention_mask (jnp.ndarray): Attention mask for self-attention (batch, 1, seq_len, seq_len).
+		    causal_mask (tp.Optional[jnp.ndarray]): Causal mask for self-attention.
+		    encoder_hidden_states (tp.Optional[jnp.ndarray]): Hidden states from the encoder
+		        (batch, encoder_seq_len, embed_dim).
+		    encoder_attention_mask (tp.Optional[jnp.ndarray]): Attention mask for cross-attention
+		        (batch, 1, seq_len, encoder_seq_len).
+		    cache_view (tp.Optional[TransformerCacheView]): Cache view for key/value states.
+		    cache_metadata (tp.Optional[TransformerMetadata]): Metadata for paged attention.
+		    output_attentions (bool): Whether to return attention weights (default: True).
+
+		Returns:
+		    tp.Tuple[jnp.ndarray, ...]: A tuple containing:
+		        - hidden_states (jnp.ndarray): Output hidden states (batch, seq_len, embed_dim).
+		        - self_attn_weights (jnp.ndarray, optional): Self-attention weights if `output_attentions` is True.
+		        - cross_attn_weights (jnp.ndarray, optional): Cross-attention weights if `output_attentions` is True.
+		"""
 		residual = hidden_states
 		hidden_states = self.self_attn_layer_norm(hidden_states)
 
@@ -453,6 +618,30 @@ class WhisperDecoderLayer(nn.Module):
 
 
 class WhisperEncoder(EasyDeLBaseModule):
+	"""The Whisper Encoder transformer stack.
+
+	This module processes the input audio features (log-Mel spectrogram) through
+	convolutional layers followed by a stack of `WhisperEncoderLayer` modules.
+
+	Attributes:
+	    config (WhisperConfig): Configuration object for the model.
+	    conv1 (nn.Conv): First convolutional layer.
+	    conv2 (nn.Conv): Second convolutional layer.
+	    embed_positions (nn.Embed): Positional embedding layer.
+	    layers (nn.List[WhisperEncoderLayer]): List of encoder layers.
+	    layer_norm (nn.LayerNorm): Final layer normalization.
+	    embed_dim (int): Dimensionality of the model.
+	    num_mel_bins (int): Number of Mel frequency bins in the input features.
+	    padding_idx (int): Index of the padding token.
+	    max_source_positions (int): Maximum sequence length for the encoder.
+	    scale_embedding (float | None): Scaling factor for embeddings.
+	    embed_scale (float | None): Alias for scale_embedding.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: WhisperConfig,
@@ -462,6 +651,15 @@ class WhisperEncoder(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the WhisperEncoder module.
+
+		Args:
+		    config (WhisperConfig): The configuration object for the model.
+		    dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+		    param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+		    precision (tp.Optional[tp.Union[str, lax.Precision]]): Precision setting for JAX operations (default: None).
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -535,6 +733,20 @@ class WhisperEncoder(EasyDeLBaseModule):
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
 	) -> tuple[tp.Any | None, ...] | BaseModelOutput:
+		"""Forward pass of the Whisper encoder.
+
+		Args:
+		    input_features (jnp.ndarray): Input audio features (log-Mel spectrogram)
+		        of shape (batch_size, num_mel_bins, sequence_length).
+		    output_attentions (bool): Whether to return attention weights (default: False).
+		    output_hidden_states (bool): Whether to return hidden states for all layers (default: False).
+		    return_dict (bool): Whether to return a `BaseModelOutput` object or a tuple (default: True).
+
+		Returns:
+		    BaseModelOutput | tuple: The encoder output. If `return_dict` is True, returns a `BaseModelOutput`
+		        containing `last_hidden_state`, `hidden_states` (optional), and `attentions` (optional).
+		        Otherwise, returns a tuple of these outputs.
+		"""
 		all_attentions = () if output_attentions else None
 		all_hidden_states = () if output_hidden_states else None
 		if input_features.shape[1:] != (
@@ -596,6 +808,28 @@ class WhisperEncoder(EasyDeLBaseModule):
 
 
 class WhisperDecoder(EasyDeLBaseModule):
+	"""The Whisper Decoder transformer stack.
+
+	This module processes the target token IDs, incorporates positional embeddings,
+	and attends to both the input sequence (self-attention) and the encoder outputs
+	(cross-attention) through a stack of `WhisperDecoderLayer` modules.
+
+	Attributes:
+	    config (WhisperConfig): Configuration object for the model.
+	    embed_tokens (nn.Embed): Embedding layer for target tokens.
+	    embed_positions (nn.Embed): Positional embedding layer.
+	    layers (nn.List[WhisperDecoderLayer]): List of decoder layers.
+	    layer_norm (nn.LayerNorm): Final layer normalization (applied to pre-final outputs).
+	    dropout (nn.Dropout): Dropout layer.
+	    padding_idx (int): Index of the padding token.
+	    max_target_positions (int): Maximum sequence length for the decoder.
+	    embed_scale (float | None): Scaling factor for embeddings.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: WhisperConfig,
@@ -605,6 +839,15 @@ class WhisperDecoder(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the WhisperDecoder module.
+
+		Args:
+		    config (WhisperConfig): The configuration object for the model.
+		    dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+		    param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+		    precision (tp.Optional[tp.Union[str, lax.Precision]]): Precision setting for JAX operations (default: None).
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -664,6 +907,26 @@ class WhisperDecoder(EasyDeLBaseModule):
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
 	) -> tuple[tp.Any, ...] | BaseModelOutputWithPastAndCrossAttentions:
+		"""Forward pass of the Whisper decoder.
+
+		Args:
+		    input_ids (jnp.ndarray): Input token IDs (batch, target_sequence_length).
+		    attention_mask (jnp.ndarray): Attention mask for self-attention (batch, 1, target_sequence_length, target_sequence_length).
+		    position_ids (jnp.ndarray): Position IDs (batch, target_sequence_length).
+		    encoder_hidden_states (tp.Optional[jnp.ndarray]): Hidden states from the encoder
+		        (batch, encoder_sequence_length, embed_dim).
+		    past_key_values (tp.Optional[TransformerCache]): Cached key/value states for fast decoding.
+		    cache_metadata (tp.Optional[TransformerMetadata]): Metadata for paged attention.
+		    output_attentions (bool): Whether to return attention weights (default: False).
+		    output_hidden_states (bool): Whether to return hidden states for all layers (default: False).
+		    return_dict (bool): Whether to return a `BaseModelOutputWithPastAndCrossAttentions` object or a tuple (default: True).
+
+		Returns:
+		    BaseModelOutputWithPastAndCrossAttentions | tuple: The decoder output. If `return_dict` is True,
+		        returns a `BaseModelOutputWithPastAndCrossAttentions` containing `last_hidden_state`,
+		        `past_key_values` (if `use_cache` is True), `hidden_states` (optional), `attentions` (optional),
+		        and `cross_attentions` (optional). Otherwise, returns a tuple of these outputs.
+		"""
 		inputs_embeds = self.embed_tokens(input_ids)
 		if position_ids is None:
 			position_ids = (
@@ -748,6 +1011,18 @@ class WhisperDecoder(EasyDeLBaseModule):
 	model_type="whisper",
 )
 class WhisperModel(EasyDeLBaseModule):
+	"""The base Whisper Model transformer implementing the encoder-decoder architecture.
+
+	Attributes:
+	    config (WhisperConfig): Configuration object for the model.
+	    encoder (WhisperEncoder): The encoder stack.
+	    decoder (WhisperDecoder): The decoder stack.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: WhisperConfig,
@@ -757,6 +1032,15 @@ class WhisperModel(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the WhisperModel module.
+
+		Args:
+		    config (WhisperConfig): The configuration object for the model.
+		    dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+		    param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+		    precision (tp.Optional[tp.Union[str, lax.Precision]]): Precision setting for JAX operations (default: None).
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -780,9 +1064,11 @@ class WhisperModel(EasyDeLBaseModule):
 		)
 
 	def _get_decoder_module(self):
+		"""Returns the decoder module."""
 		return self.decoder
 
 	def _get_encoder_module(self):
+		"""Returns the encoder module."""
 		return self.encoder
 
 	def __call__(
@@ -797,6 +1083,23 @@ class WhisperModel(EasyDeLBaseModule):
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
 	):
+		"""Forward pass of the complete Whisper model (encoder + decoder).
+
+		Args:
+		    input_features (jnp.ndarray): Input audio features (batch, num_mel_bins, seq_len).
+		    decoder_input_ids (jnp.ndarray): Decoder input token IDs (batch, target_seq_len).
+		    decoder_attention_mask (tp.Optional[jnp.ndarray]): Mask for decoder self-attention.
+		    decoder_position_ids (tp.Optional[jnp.ndarray]): Position IDs for decoder inputs.
+		    past_key_values (tp.Optional[TransformerCache]): Cached key/value states for fast decoding.
+		    cache_metadata (tp.Optional[TransformerMetadata]): Metadata for paged attention.
+		    output_attentions (bool): Whether to return attention weights (default: False).
+		    output_hidden_states (bool): Whether to return hidden states for all layers (default: False).
+		    return_dict (bool): Whether to return a `Seq2SeqModelOutput` object or a tuple (default: True).
+
+		Returns:
+		    Seq2SeqModelOutput | tuple: The model output. If `return_dict` is True, returns a `Seq2SeqModelOutput`.
+		        Otherwise, returns a tuple.
+		"""
 		output_attentions = (
 			output_attentions
 			if output_attentions is not None
@@ -872,6 +1175,22 @@ class WhisperModel(EasyDeLBaseModule):
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
 	):
+		"""Performs decoding using the decoder module.
+
+		Args:
+		    encoder_hidden_states (jnp.ndarray): Hidden states from the encoder.
+		    decoder_input_ids (jnp.ndarray): Decoder input token IDs.
+		    decoder_attention_mask (tp.Optional[jnp.ndarray]): Mask for decoder self-attention.
+		    decoder_position_ids (tp.Optional[jnp.ndarray]): Position IDs for decoder inputs.
+		    past_key_values (tp.Optional[TransformerCache]): Cached key/value states.
+		    cache_metadata (tp.Optional[TransformerMetadata]): Metadata for paged attention.
+		    output_attentions (bool): Whether to return attention weights.
+		    output_hidden_states (bool): Whether to return hidden states for all layers.
+		    return_dict (bool): Whether to return a dictionary-like output.
+
+		Returns:
+		    BaseModelOutputWithPastAndCrossAttentions | tuple: Decoder output.
+		"""
 		output_attentions = (
 			output_attentions
 			if output_attentions is not None
@@ -933,6 +1252,17 @@ class WhisperModel(EasyDeLBaseModule):
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
 	):
+		"""Performs encoding using the encoder module.
+
+		Args:
+		    input_features (jnp.ndarray): Input audio features.
+		    output_attentions (bool): Whether to return attention weights.
+		    output_hidden_states (bool): Whether to return hidden states for all layers.
+		    return_dict (bool): Whether to return a dictionary-like output.
+
+		Returns:
+		    BaseModelOutput | tuple: Encoder output.
+		"""
 		output_attentions = (
 			output_attentions
 			if output_attentions is not None

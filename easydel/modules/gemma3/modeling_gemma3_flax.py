@@ -672,6 +672,13 @@ class Gemma3TextModel(EasyDeLBaseModule):
 	model_type="gemma3_text",
 )
 class Gemma3ForCausalLM(EasyDeLBaseModule):
+	"""Gemma3 model with a language modeling head for causal language modeling tasks.
+
+	This model extends the base Gemma3TextModel by incorporating a linear language modeling head on top
+	of the base model, designed for generative tasks and text generation. The model can optionally apply
+	softcapping to logits based on configuration settings.
+	"""
+
 	def __init__(
 		self,
 		config: Gemma3TextConfig,
@@ -727,18 +734,19 @@ class Gemma3ForCausalLM(EasyDeLBaseModule):
 		return_dict: bool = True,
 	) -> tp.Union[CausalLMOutput, tp.Tuple]:
 		"""
-		Forward pass through the Gemma2 module.
+		Forward pass through the Gemma3 model.
 
 		Args:
 		    input_ids (tp.Optional[chex.Array]): Input tensor containing token IDs.
 		    attention_mask (tp.Optional[chex.Array]): Mask for attention.
 		    position_ids (tp.Optional[chex.Array]): Positional indices.
 		    segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
+		    token_type_ids (tp.Optional[chex.Array]): Token type IDs for handling different types of tokens.
 		    inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
 		    output_attentions (tp.Optional[bool]): If True, output attention weights.
 		    output_hidden_states (tp.Optional[bool]): If True, output hidden states.
-		    init_cache (bool): If True, initialize cache for decoding.
-		    deterministic (bool): If True, disable dropout.
+		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Cached key values for faster inference.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for cache handling.
 		    return_dict (bool): If True, return a dictionary of outputs.
 
 		Returns:

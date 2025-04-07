@@ -1,11 +1,12 @@
 import os
 import sys
 
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
-os.environ["JAX_PLATFORMS"] = "cpu"
+# os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=2"
+# os.environ["CUDA_VISIBLE_DEVICES"] = ""
+# os.environ["JAX_PLATFORMS"] = "cpu"
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
+import easydel as ed
 
 import jax
 import requests
@@ -13,8 +14,6 @@ import torch
 from jax import numpy as jnp
 from PIL import Image
 from transformers import AutoProcessor, SiglipModel
-
-import easydel as ed
 
 
 def main():
@@ -42,7 +41,8 @@ def main():
 
 	with torch.no_grad():
 		tout = tmodel(**inputs)
-	eout = emodel(**jinputs)
+	with emodel.mesh:
+		eout = emodel(**jinputs)
 
 	probs = jax.nn.sigmoid(eout.logits_per_image)
 	print(f"E {probs[0][0]:.1%} that image 0 is '{texts[0]}'")

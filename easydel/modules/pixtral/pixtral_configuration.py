@@ -87,6 +87,23 @@ class PixtralVisionConfig(EasyDeLBaseConfig):
 		initializer_range: int = 0.02,
 		**kwargs,
 	):
+		"""Initializes a PixtralVisionConfig object.
+
+		Args:
+		    hidden_size (int, optional): Dimension of the hidden representations. Defaults to 1024.
+		    intermediate_size (int, optional): Dimension of the MLP representations. Defaults to 4096.
+		    num_hidden_layers (int, optional): Number of hidden layers in the Transformer encoder. Defaults to 24.
+		    num_attention_heads (int, optional): Number of attention heads in the Transformer encoder. Defaults to 16.
+		    num_channels (int, optional): Number of input channels in the input images. Defaults to 3.
+		    image_size (int, optional): Max dimension of the input images. Defaults to 1024.
+		    patch_size (int, optional): Size of the image patches. Defaults to 16.
+		    hidden_act (str, optional): Activation function used in the hidden layers. Defaults to "gelu".
+		    attention_dropout (float, optional): Dropout probability for the attention layers. Defaults to 0.0.
+		    rope_theta (float, optional): The base period of the RoPE embeddings. Defaults to 10000.0.
+		    initializer_range (float, optional): The standard deviation for initializing weight matrices.
+		        Defaults to 0.02.
+		    **kwargs: Additional keyword arguments passed to the parent class.
+		"""
 		super().__init__(**kwargs)
 
 		self.hidden_size = hidden_size
@@ -112,7 +129,6 @@ class PixtralVisionConfig(EasyDeLBaseConfig):
 			("attention/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
 			("attention/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
 			("attention/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			
 			("attention/q_proj/bias", PartitionSpec(None)),
 			("attention/k_proj/bias", PartitionSpec(None)),
 			("attention/v_proj/bias", PartitionSpec(None)),

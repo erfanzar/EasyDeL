@@ -190,6 +190,17 @@ class AutoShardAndGatherFunctions:
 
 	@staticmethod
 	def from_params(params, partition_rules, mesh):
+		"""
+		Generates shard and gather functions directly from model parameters, partition rules, and a mesh.
+
+		Args:
+		    params: The model parameters (pytree) to generate functions for.
+		    partition_rules: A tuple of tuples defining the partitioning strategy.
+		    mesh: The JAX device mesh to use for sharding.
+
+		Returns:
+		    A tuple containing the shard and gather functions.
+		"""
 		partition_specs = match_partition_rules(partition_rules, params)
 		return make_shard_and_gather_fns(
 			partition_specs=partition_specs,

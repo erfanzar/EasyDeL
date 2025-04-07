@@ -170,7 +170,7 @@ class SiglipVisionConfig(EasyDeLBaseConfig):
 	        The epsilon used by the layer normalization layers.
 	    attention_dropout (`float`, *optional*, defaults to 0.0):
 	        The dropout ratio for the attention probabilities.
-	```"""
+	"""
 
 	model_type = "siglip_vision_model"
 	base_config_key = "vision_config"
@@ -259,7 +259,17 @@ class SiglipConfig(EasyDeLBaseConfig):
 	"""
 
 	model_type = "siglip"
+	"""
+	The model type identifier used to determine which model configuration this represents.
+	This is set to "siglip" to identify this as the main configuration for the SigLIP model.
+	"""
+
 	sub_configs = {"text_config": SiglipTextConfig, "vision_config": SiglipVisionConfig}
+	"""
+	A dictionary that maps configuration keys to their respective configuration classes.
+	This enables the SiglipConfig to manage both text and vision components through
+	separate configurations while maintaining them as part of a single unified model.
+	"""
 
 	def __init__(self, text_config=None, vision_config=None, **kwargs):
 		super().__init__(**kwargs)
@@ -305,9 +315,17 @@ class SiglipConfig(EasyDeLBaseConfig):
 
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model.
+		Get the partition rules for the SigLIP model parameters for use with distributed training.
+
+		These rules define how parameters should be partitioned across multiple devices
+		when using techniques like Fully Sharded Data Parallelism (FSDP), Sharded Parallelism (SP),
+		and Tensor Parallelism (TP). Each rule consists of a regex pattern for matching
+		parameter names and a corresponding PartitionSpec.
+
 		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tuple`: A tuple of tuples where each inner tuple contains:
+		        - A regex pattern matching parameter names
+		        - A PartitionSpec object specifying how to partition matching parameters
 		"""
 		return (
 			(

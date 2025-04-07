@@ -110,6 +110,36 @@ class StableLmConfig(EasyDeLBaseConfig):
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	) -> None:
+		"""Initializes the StableLmConfig object.
+
+		Args:
+		    vocab_size (int, optional): Vocabulary size. Defaults to 50304.
+		    intermediate_size (int, optional): Dimensionality of the intermediate layer in MLP. Defaults to 6912.
+		    hidden_size (int, optional): Dimensionality of the embeddings and hidden states. Defaults to 2560.
+		    num_hidden_layers (int, optional): Number of hidden layers. Defaults to 32.
+		    num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
+		    num_key_value_heads (int, optional): Number of key/value heads (for GQA). Defaults to 32.
+		    hidden_act (str, optional): Activation function name. Defaults to "silu".
+		    max_position_embeddings (int, optional): Maximum sequence length. Defaults to 4096.
+		    initializer_range (float, optional): Standard deviation for weight initialization. Defaults to 0.02.
+		    layer_norm_eps (float, optional): Epsilon for layer normalization. Defaults to 1e-5.
+		    use_cache (bool, optional): Whether to use KV cache. Defaults to True.
+		    tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
+		    rope_theta (int, optional): Base value for RoPE. Defaults to 10000.
+		    rope_scaling (dict, optional): RoPE scaling configuration. Defaults to None.
+		    use_qkv_bias (bool, optional): Whether to use bias in QKV projections. Defaults to False.
+		    qk_layernorm (bool, optional): Whether to apply LayerNorm to query and key states. Defaults to False.
+		    use_parallel_residual (bool, optional): Whether to use parallel residual connections. Defaults to False.
+		    hidden_dropout (float, optional): Dropout probability for hidden layers. Defaults to 0.0.
+		    attention_dropout (float, optional): Dropout probability for attention scores. Defaults to 0.0.
+		    partial_rotary_factor (float, optional): Factor for partial rotary embeddings. Defaults to 0.25.
+		    bos_token_id (int, optional): Beginning of sequence token ID. Defaults to 0.
+		    eos_token_id (int, optional): End of sequence token ID. Defaults to 0.
+		    bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
+		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
+		        Defaults to EasyDeLGradientCheckPointers.NONE.
+		    **kwargs: Additional keyword arguments passed to the parent class.
+		"""
 		self.vocab_size = vocab_size
 		self.hidden_size = hidden_size
 		self.intermediate_size = intermediate_size
@@ -171,6 +201,14 @@ class StableLmConfig(EasyDeLBaseConfig):
 
 	@property
 	def granted_freq_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size specifically for frequency-based position embeddings.
+
+		If `freq_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
+		`max_position_embeddings`.
+
+		Returns:
+		    int: The granted maximum position embedding size for frequency encoding.
+		"""
 		return getattr(
 			self,
 			"freq_max_position_embeddings",
@@ -179,6 +217,14 @@ class StableLmConfig(EasyDeLBaseConfig):
 
 	@property
 	def granted_mask_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size specifically for mask-based position embeddings.
+
+		If `mask_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
+		`max_position_embeddings`.
+
+		Returns:
+		    int: The granted maximum position embedding size for mask encoding.
+		"""
 		return getattr(
 			self,
 			"mask_max_position_embeddings",

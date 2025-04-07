@@ -94,11 +94,14 @@ if _check_bool_flag("EASYDEL_AUTO", True):
 _import_structure = {
 	"utils": ["traversals"],
 	"inference": [
+		"ContiguousSlotCacheManager",
 		"SamplingParams",
+		"vEngine",
 		"vInference",
 		"vInferenceApiServer",
 		"vInferenceConfig",
 		"vInferencePreCompileConfig",
+		"vOrchestrator",
 		"vWhisperInference",
 		"vWhisperInferenceConfig",
 	],
@@ -274,6 +277,16 @@ _import_structure = {
 		"LlamaForSequenceClassification",
 		"LlamaModel",
 	],
+	"modules.llama4": [
+		"Llama4Config",
+		"Llama4ForCausalLM",
+		"Llama4ForConditionalGeneration",
+		"Llama4ForSequenceClassification",
+		"Llama4TextConfig",
+		"Llama4TextModel",
+		"Llama4VisionConfig",
+		"Llama4VisionModel",
+	],
 	"modules.llava": [
 		"LlavaConfig",
 		"LlavaForConditionalGeneration",
@@ -363,6 +376,18 @@ _import_structure = {
 		"Qwen2VLForConditionalGeneration",
 		"Qwen2VLModel",
 	],
+	"modules.qwen3": [
+		"Qwen3Config",
+		"Qwen3ForCausalLM",
+		"Qwen3ForSequenceClassification",
+		"Qwen3Model",
+	],
+	"modules.qwen3_moe": [
+		"Qwen3MoeConfig",
+		"Qwen3MoeForCausalLM",
+		"Qwen3MoeForSequenceClassification",
+		"Qwen3MoeModel",
+	],
 	"modules.roberta": [
 		"RobertaConfig",
 		"RobertaForCausalLM",
@@ -429,11 +454,14 @@ _import_structure = {
 if _tp.TYPE_CHECKING:
 	from . import utils
 	from .inference import (
+		ContiguousSlotCacheManager,
 		SamplingParams,
+		vEngine,
 		vInference,
 		vInferenceApiServer,
 		vInferenceConfig,
 		vInferencePreCompileConfig,
+		vOrchestrator,
 		vWhisperInference,
 		vWhisperInferenceConfig,
 	)
@@ -607,6 +635,16 @@ if _tp.TYPE_CHECKING:
 		LlamaForSequenceClassification,
 		LlamaModel,
 	)
+	from .modules.llama4 import (
+		Llama4Config,
+		Llama4ForCausalLM,
+		Llama4ForConditionalGeneration,
+		Llama4ForSequenceClassification,
+		Llama4TextConfig,
+		Llama4TextModel,
+		Llama4VisionConfig,
+		Llama4VisionModel,
+	)
 	from .modules.llava import (
 		LlavaConfig,
 		LlavaForConditionalGeneration,
@@ -696,6 +734,18 @@ if _tp.TYPE_CHECKING:
 		Qwen2VLForConditionalGeneration,
 		Qwen2VLModel,
 	)
+	from .modules.qwen3 import (
+		Qwen3Config,
+		Qwen3ForCausalLM,
+		Qwen3ForSequenceClassification,
+		Qwen3Model,
+	)
+	from .modules.qwen3_moe import (
+		Qwen3MoeConfig,
+		Qwen3MoeForCausalLM,
+		Qwen3MoeForSequenceClassification,
+		Qwen3MoeModel,
+	)
 	from .modules.roberta import (
 		RobertaConfig,
 		RobertaForCausalLM,
@@ -767,7 +817,7 @@ else:
 		extra_objects={"__version__": __version__},
 	)
 
-	_targeted_versions = ["0.0.22"]
+	_targeted_versions = ["0.0.23"]
 
 	from eformer import __version__ as _eform_version
 

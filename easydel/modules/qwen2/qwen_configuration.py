@@ -125,6 +125,40 @@ class Qwen2Config(EasyDeLBaseConfig):
 		rope_scaling: tp.Optional[tp.Mapping[str, str | float]] = None,
 		**kwargs,
 	):
+		"""Initializes a Qwen2Config object.
+
+		Args:
+		    vocab_size (int, optional): Vocabulary size. Defaults to 151936.
+		    hidden_size (int, optional): Dimensionality of the embeddings and hidden states. Defaults to 4096.
+		    intermediate_size (int, optional): Dimensionality of the intermediate layer in MLP. Defaults to 22016.
+		    num_hidden_layers (int, optional): Number of hidden layers. Defaults to 32.
+		    num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
+		    num_key_value_heads (int, optional): Number of key/value heads (for GQA). Defaults to 32.
+		    hidden_act (str, optional): Activation function name. Defaults to "silu".
+		    max_position_embeddings (int, optional): Maximum sequence length. Defaults to 32768.
+		    initializer_range (float, optional): Standard deviation for weight initialization. Defaults to 0.02.
+		    rms_norm_eps (float, optional): Epsilon for RMS normalization. Defaults to 1e-6.
+		    use_cache (bool, optional): Whether to use KV cache. Defaults to True.
+		    tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
+		    rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
+		    use_sliding_window (bool, optional): Whether to use sliding window attention. Defaults to False.
+		    sliding_window (int, optional): Sliding window size. Defaults to 4096.
+		    max_window_layers (int, optional): Maximum number of layers for sliding window attention. Defaults to 28.
+		    attention_dropout (float, optional): Dropout probability for attention scores. Defaults to 0.0.
+		    resid_pdrop (float, optional): Dropout probability for residual connections. Defaults to 0.0.
+		    embd_pdrop (float, optional): Dropout probability for embeddings. Defaults to 0.0.
+		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
+		        Defaults to EasyDeLGradientCheckPointers.NONE.
+		    fcm_min_ratio (float, optional): Minimum ratio for Flash Attention. Defaults to 0.0.
+		    fcm_max_ratio (float, optional): Maximum ratio for Flash Attention. Defaults to 0.0.
+		    use_scan_mlp (bool, optional): Whether to use scan for MLP layers. Defaults to False.
+		    scan_mlp_chunk_size (int, optional): Chunk size for scan MLP. Defaults to 1024.
+		    number_rep_kv (int, optional): Number of repetitions for key/value vectors. Defaults to 1.
+		    bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
+		    scan_layers (bool, optional): Whether to use scan for transformer layers. Defaults to True.
+		    rope_scaling (tp.Optional[tp.Mapping[str, str | float]], optional): RoPE scaling configuration. Defaults to None.
+		    **kwargs: Additional keyword arguments passed to the parent class.
+		"""
 		self.vocab_size = vocab_size
 		self.max_position_embeddings = max_position_embeddings
 		self.hidden_size = hidden_size
@@ -220,34 +254,22 @@ class Qwen2Config(EasyDeLBaseConfig):
 
 		Args:
 		    self: Refer to the current object
-		    resid_pdrop: float: Set the dropout rate for residual
-		        connections
-		    embd_pdrop: float: Set the probability of dropping an
-		        embedding
-		    attention_dropout: float: Set the probability of dropping
-		        out the attention layer
-		    tie_word_embeddings: bool: Tie the word embeddings to the
-		        decoder
-		    gradient_checkpointing: str: Control the amount of memory
-		        used by jax
-		    fcm_min_ratio: float: Control the minimum ratio of the
-		        number of chunks to be used in flash-based computation
-		    fcm_max_ratio: float: Set the maximum ratio of the number of
-		        input tokens to output tokens
-		    use_scan_mlp: bool: Determine whether to use the scan_mlp
-		        function or not
-		    scan_mlp_chunk_size: int: Set the chunk size for scan_mlp
-		    number_rep_kv: int: Determine how many times the key and
-		        value vectors are repeated
-		    bits: tp.Optional[int]: Determine the number of bits used in
-		        the quantization
-		    rope_theta: float : rope_theta for compute rope
-		    hidden_act: str : hidden_act for mlp
-		    scan_layers: bool: Determine whether to use scan layers or
-		        not
-
-		Returns:
-		    The following:
+		    resid_pdrop: float: Set the dropout rate for residual connections.
+		    embd_pdrop: float: Set the probability of dropping an embedding.
+		    attention_dropout: float: Set the probability of dropping out the attention layer.
+		    tie_word_embeddings: bool: Tie the word embeddings to the decoder.
+		    gradient_checkpointing: str: Control the amount of memory used by jax.
+		    fcm_min_ratio: float: Control the minimum ratio for Flash Attention.
+		    fcm_max_ratio: float: Set the maximum ratio for Flash Attention.
+		    use_scan_mlp: bool: Determine whether to use the scan_mlp function or not.
+		    scan_mlp_chunk_size: int: Set the chunk size for scan_mlp.
+		    number_rep_kv: int: Determine how many times the key and value vectors are repeated.
+		    bits: tp.Optional[int]: Determine the number of bits used in the quantization.
+		    rope_theta: float: Base value for RoPE.
+		    hidden_act: str: Activation function name.
+		    scan_layers: bool: Determine whether to use scan layers or not.
+		    rope_scaling (tp.Optional[tp.Mapping[str, str | float]], optional): RoPE scaling configuration.
+		    **kwargs: Additional keyword arguments to attach.
 		"""
 		self.head_dim = self.hidden_size // self.num_attention_heads
 		self.scan_layers = scan_layers
@@ -269,14 +291,24 @@ class Qwen2Config(EasyDeLBaseConfig):
 
 	@staticmethod
 	def get_weight_decay_exclusions():
-		return tuple()
+		"""Returns a tuple of parameter names for which weight decay should be excluded."""
+		return ("bias", "norm")
 
 	@staticmethod
 	def rng_keys():
-		return "params", "dropout", "fcm"
+		"""Returns the names of the random number generator keys used by the model."""
+		return "params", "dropout"
 
 	@property
 	def granted_freq_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size specifically for frequency-based position embeddings.
+
+		If `freq_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
+		`max_position_embeddings`.
+
+		Returns:
+		    int: The granted maximum position embedding size for frequency encoding.
+		"""
 		return getattr(
 			self,
 			"freq_max_position_embeddings",
@@ -285,6 +317,14 @@ class Qwen2Config(EasyDeLBaseConfig):
 
 	@property
 	def granted_mask_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size specifically for mask-based position embeddings.
+
+		If `mask_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
+		`max_position_embeddings`.
+
+		Returns:
+		    int: The granted maximum position embedding size for mask encoding.
+		"""
 		return getattr(
 			self,
 			"mask_max_position_embeddings",

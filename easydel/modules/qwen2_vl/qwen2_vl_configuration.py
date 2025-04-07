@@ -19,6 +19,33 @@ from easydel.infra.base_module import EasyDeLBaseConfig
 
 
 class Qwen2VLVisionConfig(EasyDeLBaseConfig):
+	"""
+	Configuration class for the vision component of Qwen2VL model.
+	This class stores the configuration parameters for the vision encoder part of the Qwen2VL multimodal model.
+
+	Args:
+		depth (`int`, *optional*, defaults to 32):
+			Number of layers in the vision transformer.
+		embed_dim (`int`, *optional*, defaults to 1280):
+			Dimensionality of the embeddings produced by the vision encoder.
+		hidden_size (`int`, *optional*, defaults to 3584):
+			Dimensionality of the intermediate representations in the vision transformer.
+		hidden_act (`str`, *optional*, defaults to "quick_gelu"):
+			The non-linear activation function used in the vision transformer.
+		mlp_ratio (`int`, *optional*, defaults to 4):
+			Ratio of the hidden size to the intermediate size in the MLP layers.
+		num_heads (`int`, *optional*, defaults to 16):
+			Number of attention heads in the vision transformer.
+		in_channels (`int`, *optional*, defaults to 3):
+			Number of input channels for the image (typically 3 for RGB).
+		patch_size (`int`, *optional*, defaults to 14):
+			Size of the patches that the image is divided into.
+		spatial_merge_size (`int`, *optional*, defaults to 2):
+			The merge size for spatial dimensions in the vision transformer.
+		temporal_patch_size (`int`, *optional*, defaults to 2):
+			Size of the temporal patches when processing video input.
+	"""
+
 	model_type = "qwen2_vl"
 	base_config_key = "vision_config"
 
@@ -231,9 +258,16 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
 
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model.
+		Get the partition rules for the model parameters for use with distributed training.
+
+		These rules define how model parameters should be partitioned across multiple devices
+		when using techniques like Fully Sharded Data Parallelism (FSDP), Sharded Parallelism (SP),
+		and Tensor Parallelism (TP).
+
 		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+			`tuple`: A tuple of tuples where each inner tuple contains:
+				- A regex pattern matching parameter names
+				- A PartitionSpec object specifying how to partition matching parameters
 		"""
 		return (
 			# Language model embeddings

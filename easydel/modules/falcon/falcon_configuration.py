@@ -125,6 +125,37 @@ class FalconConfig(EasyDeLBaseConfig):
 		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
+		"""Initialize a new FalconConfig instance.
+
+		Args:
+			vocab_size (int, optional): Size of the vocabulary. Defaults to 65024.
+			hidden_size (int, optional): Dimensionality of hidden layers. Defaults to 4544.
+			num_hidden_layers (int, optional): Number of hidden layers. Defaults to 32.
+			num_attention_heads (int, optional): Number of attention heads. Defaults to 71.
+			num_ln_in_parallel_attn (int, optional): Number of layer norms in parallel attention. Defaults to None.
+			layer_norm_epsilon (float, optional): Epsilon for layer normalization. Defaults to 1e-5.
+			initializer_range (float, optional): Range for weight initialization. Defaults to 0.02.
+			use_cache (bool, optional): Whether to use KV cache. Defaults to True.
+			hidden_dropout (float, optional): Dropout probability for hidden layers. Defaults to 0.0.
+			attention_dropout (float, optional): Dropout probability for attention. Defaults to 0.0.
+			num_kv_heads (int, optional): Number of key/value heads. Defaults to None (same as num_attention_heads).
+			alibi (bool, optional): Whether to use alibi attention. Defaults to False.
+			new_decoder_architecture (bool, optional): Whether to use new decoder architecture. Defaults to False.
+			multi_query (bool, optional): Whether to use multi-query attention. Defaults to True.
+			parallel_attn (bool, optional): Whether to use parallel attention. Defaults to True.
+			bias (bool, optional): Whether to use bias in linear layers. Defaults to False.
+			max_position_embeddings (int, optional): Maximum sequence length. Defaults to 2048.
+			rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
+			rope_scaling (dict, optional): RoPE scaling configuration. Defaults to None.
+			bos_token_id (int, optional): Beginning of sequence token ID. Defaults to 11.
+			eos_token_id (int, optional): End of sequence token ID. Defaults to 11.
+			ffn_hidden_size (int, optional): Size of feed-forward hidden layer. Defaults to None.
+			ff_factor (int, optional): Factor for feed-forward size. Defaults to None.
+			activation (str, optional): Activation function. Defaults to "gelu".
+			gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
+			bits (int, optional): Quantization bits. Defaults to None.
+			**kwargs: Additional arguments.
+		"""
 		self.vocab_size = vocab_size
 		n_embed = kwargs.pop("n_embed", None)
 		self.hidden_size = hidden_size if n_embed is None else n_embed
@@ -202,6 +233,11 @@ class FalconConfig(EasyDeLBaseConfig):
 
 	@staticmethod
 	def get_mesh_names():
+		"""Returns the mesh names used for model parallelism.
+
+		Returns:
+			tuple: A tuple containing "dp", "fsdp", and "tp" as the mesh names.
+		"""
 		return "dp", "fsdp", "tp", "sp"
 
 	def attach_custom_arguments(
@@ -210,6 +246,16 @@ class FalconConfig(EasyDeLBaseConfig):
 		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
+		"""Attach custom arguments to the configuration.
+
+		Args:
+			gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
+			bits (int, optional): Quantization bits. Defaults to None.
+			**kwargs: Additional keyword arguments.
+
+		Returns:
+			FalconConfig: The updated configuration instance.
+		"""
 		basics = dict(bits=bits, gradient_checkpointing=gradient_checkpointing, **kwargs)
 		for key_states, value_states in basics.items():
 			if not hasattr(self, key_states):
@@ -219,6 +265,11 @@ class FalconConfig(EasyDeLBaseConfig):
 
 	@property
 	def granted_freq_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size for frequency-based position embeddings.
+
+		Returns:
+			int: The maximum position embedding size, falling back to max_position_embeddings if not explicitly set.
+		"""
 		return getattr(
 			self,
 			"freq_max_position_embeddings",
@@ -227,6 +278,11 @@ class FalconConfig(EasyDeLBaseConfig):
 
 	@property
 	def granted_mask_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size for mask-based position embeddings.
+
+		Returns:
+			int: The maximum position embedding size, falling back to max_position_embeddings if not explicitly set.
+		"""
 		return getattr(
 			self,
 			"mask_max_position_embeddings",

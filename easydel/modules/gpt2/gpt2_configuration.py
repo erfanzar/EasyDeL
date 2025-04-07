@@ -128,6 +128,37 @@ class GPT2Config(EasyDeLBaseConfig):
 		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
+		"""Initializes a GPT2Config object.
+
+		Args:
+		    vocab_size (int, optional): Vocabulary size. Defaults to 50257.
+		    n_positions (int, optional): Maximum sequence length. Defaults to 1024.
+		    n_embd (int, optional): Hidden size. Defaults to 768.
+		    n_layer (int, optional): Number of hidden layers. Defaults to 12.
+		    n_head (int, optional): Number of attention heads. Defaults to 12.
+		    n_inner (int, optional): Inner dimension of FFN. Defaults to None.
+		    activation_function (str, optional): Activation function. Defaults to "gelu_new".
+		    resid_pdrop (float, optional): Residual dropout probability. Defaults to 0.1.
+		    embd_pdrop (float, optional): Embedding dropout probability. Defaults to 0.1.
+		    attn_pdrop (float, optional): Attention dropout probability. Defaults to 0.1.
+		    layer_norm_epsilon (float, optional): Epsilon for layer normalization. Defaults to 1e-5.
+		    initializer_range (float, optional): Initializer range. Defaults to 0.02.
+		    summary_type (str, optional): Type of summary. Defaults to "cls_index".
+		    summary_use_proj (bool, optional): Whether to use projection in summary. Defaults to True.
+		    summary_activation (str, optional): Activation for summary. Defaults to None.
+		    summary_proj_to_labels (bool, optional): Whether to project summary to labels. Defaults to True.
+		    summary_first_dropout (float, optional): Dropout after summary projection. Defaults to 0.1.
+		    scale_attn_weights (bool, optional): Whether to scale attention weights. Defaults to True.
+		    use_cache (bool, optional): Whether to use KV cache. Defaults to True.
+		    bos_token_id (int, optional): Beginning-of-sequence token ID. Defaults to 50256.
+		    eos_token_id (int, optional): End-of-sequence token ID. Defaults to 50256.
+		    scale_attn_by_inverse_layer_idx (bool, optional): Whether to scale attention by inverse layer index. Defaults to False.
+		    reorder_and_upcast_attn (bool, optional): Whether to reorder and upcast attention. Defaults to False.
+		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
+		    tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
+		    bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
+		    **kwargs: Additional keyword arguments.
+		"""
 		self.vocab_size = vocab_size
 		self.n_positions = n_positions
 		self.n_embd = n_embd
@@ -168,6 +199,18 @@ class GPT2Config(EasyDeLBaseConfig):
 		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
+		"""Attaches custom arguments to the configuration object.
+
+		This method allows adding or overriding configuration attributes dynamically.
+		It iterates through the provided arguments and sets them as attributes
+		of the configuration object if they don't already exist.
+
+		Args:
+		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
+		        Defaults to EasyDeLGradientCheckPointers.NONE.
+		    bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
+		    **kwargs: Additional keyword arguments to attach to the configuration.
+		"""
 		args = dict(gradient_checkpointing=gradient_checkpointing, bits=bits, **kwargs)
 		for k, v in args.items():
 			if not hasattr(self, k):
@@ -175,10 +218,16 @@ class GPT2Config(EasyDeLBaseConfig):
 
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model.
+		Get the partition rules for the model. This method defines how the model's parameters are
+		partitioned across devices for distributed training and inference.
+
+		Args:
+		    *args: Additional positional arguments (unused).
+		    **kwargs: Additional keyword arguments (unused).
 
 		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, jax.sharding.PartitionSpec]]`: A tuple of partition rules, where each rule is a tuple
+		        containing a regex pattern for parameter names and the corresponding `PartitionSpec`.
 		"""
 		return (
 			(

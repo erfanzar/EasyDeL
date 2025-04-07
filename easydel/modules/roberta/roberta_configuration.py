@@ -184,6 +184,19 @@ class RobertaConfig(EasyDeLBaseConfig):
 	def attach_custom_arguments(
 		self, gradient_checkpointing="nothing_saveable", **kwargs
 	):
+		"""
+		Attach custom arguments to the configuration.
+
+		This method allows attaching additional custom arguments to the configuration
+		that weren't part of the initial configuration.
+
+		Args:
+			gradient_checkpointing (`str`, *optional*, defaults to "nothing_saveable"):
+				What to save during gradient checkpointing. Choose one of "nothing_saveable",
+				"first_half_saveable", "full_saveable".
+			**kwargs:
+				Additional custom arguments to be attached to the configuration.
+		"""
 		self.gradient_checkpointing = gradient_checkpointing
 		for k, v in kwargs.items():
 			setattr(self, k, v)

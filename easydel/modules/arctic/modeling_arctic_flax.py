@@ -35,7 +35,6 @@ from easydel.infra.utils import (
 	control_mlp_sharding,
 	get_dot_general_by_bits,
 )
-
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
 	PagedAttentionCache,
@@ -52,6 +51,18 @@ from .arctic_configuration import ArcticConfig
 
 
 class ArcticAttention(AttentionModule):
+	"""
+	ArcticAttention module. This module implements the attention mechanism for the Arctic model,
+	supporting features like rotary position embeddings and flexible attention implementations.
+
+	Attributes:
+		config (ArcticConfig): Configuration object for the Arctic model.
+		dtype (jnp.dtype): Data type for computation (e.g., float32). Defaults to float32.
+		param_dtype (jnp.dtype): Data type for parameters (e.g., float32). Defaults to float32.
+		precision (jax.lax.PrecisionLike): Precision setting for JAX operations (e.g., None, 'high', 'highest'). Defaults to None.
+		rngs (nn.Rngs): Random number generators for the module.
+	"""
+
 	def __init__(
 		self,
 		config: ArcticConfig,
@@ -194,15 +205,23 @@ class ArcticAttention(AttentionModule):
 			self._merge_heads(attentions.attention_outputs)
 		)
 		attn_output = self.o_proj(attn_output)
-		outputs = (
-			(attn_output, attentions.attention_weights)
-			if output_attentions
-			else (attn_output, None)
-		)
-		return outputs
+		return attn_output, attentions.attention_weights
 
 
 class ArcticMLP(nn.Module):
+	"""
+	Arctic Multi-Layer Perceptron (MLP) block. This block implements the feed-forward network
+	used in the Arctic model. It can optionally function as a residual MLP.
+
+	Attributes:
+		config (ArcticConfig): Configuration object for the Arctic model.
+		dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		is_residual_mlp (bool): Whether this MLP block is a residual MLP. Defaults to False.
+		rngs (nn.Rngs): Random number generators for the module.
+	"""
+
 	def __init__(
 		self,
 		config: ArcticConfig,
@@ -244,6 +263,19 @@ class ArcticMLP(nn.Module):
 
 
 class ArcticMoeBlock(nn.Module):
+	"""
+	Arctic Mixture of Experts (MoE) block. This module implements the MoE layer used in the Arctic model,
+	routing tokens to different experts based on a gating mechanism.
+
+	Attributes:
+		config (ArcticConfig): Configuration object for the Arctic model.
+		layer_idx (int): The index of the current layer.
+		dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		rngs (nn.Rngs): Random number generators for the module.
+	"""
+
 	def __init__(
 		self,
 		config: ArcticConfig,
@@ -299,6 +331,15 @@ class ArcticMoeBlock(nn.Module):
 			)
 
 	def _call_moe(self, hidden_states: chex.Array) -> tp.Tuple[chex.Array, chex.Array]:
+		"""
+		Executes the Mixture of Experts (MoE) logic.
+
+		Args:
+			hidden_states (chex.Array): Input hidden states.
+
+		Returns:
+			tp.Tuple[chex.Array, chex.Array]: Tuple containing the final hidden state and the router logits.
+		"""
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
 
 		router_logits = self.gate(hidden_states).astype(  # no reshaping is needed
@@ -337,12 +378,37 @@ class ArcticMoeBlock(nn.Module):
 		return final_hidden_state, router_logits
 
 	def __call__(self, hidden_states: chex.Array):
+		"""
+		Forward pass for the ArcticMoeBlock.
+
+		If the current layer is an MoE layer, it calls the MoE logic (_call_moe).
+		Otherwise, it passes the input through the standard MLP.
+
+		Args:
+			hidden_states (chex.Array): Input hidden states.
+
+		Returns:
+			tp.Tuple[chex.Array, chex.Array]: Tuple containing the output hidden state and router logits (or 0.0 if not MoE).
+		"""
 		if self.is_moe_layer:
 			return self._call_moe(hidden_states=hidden_states)
 		return self.mlp(hidden_states), jnp.array(0.0, dtype=hidden_states.dtype)
 
 
 class ArcticDecoderLayer(nn.Module):
+	"""
+	Arctic Decoder Layer. This module combines the ArcticAttention and ArcticMoeBlock (or ArcticMLP)
+	with layer normalization and residual connections to form a standard Transformer decoder layer.
+
+	Attributes:
+		config (ArcticConfig): Configuration object for the Arctic model.
+		layer_idx (int): The index of the current layer.
+		dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		rngs (nn.Rngs): Random number generators for the module.
+	"""
+
 	def __init__(
 		self,
 		config: ArcticConfig,
@@ -476,6 +542,18 @@ class ArcticDecoderLayer(nn.Module):
 	model_type="arctic",
 )
 class ArcticModel(EasyDeLBaseModule):
+	"""
+	Core Arctic model architecture. This module implements the main Transformer stack
+	for the Arctic model, including token embeddings and decoder layers.
+
+	Attributes:
+		config (ArcticConfig): Configuration object for the Arctic model.
+		dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		rngs (nn.Rngs): Random number generators for the module.
+	"""
+
 	def __init__(
 		self,
 		config: ArcticConfig,
@@ -485,6 +563,7 @@ class ArcticModel(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	) -> None:
+		"""Initializes the ArcticModel."""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -533,6 +612,23 @@ class ArcticModel(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
 	) -> tp.Union[MoeModelOutput, tp.Tuple]:
+		"""Forward pass through the ArcticModel.
+
+		Args:
+			input_ids (Optional[chex.Array]): Input token IDs.
+			inputs_embeds (Optional[chex.Array]): Input embeddings (alternative to input_ids).
+			attention_mask (Optional[chex.Array]): Mask to avoid attending to padding tokens.
+			position_ids (Optional[chex.Array]): Position IDs for positional embeddings.
+			segment_ids (Optional[chex.Array]): Segment IDs (if applicable).
+			output_attentions (Optional[bool]): Whether to return attention weights.
+			output_hidden_states (Optional[bool]): Whether to return all hidden states.
+			past_key_values (Optional[TransformerCache | PagedAttentionCache]): Cached key/value states for faster decoding.
+			cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention cache.
+			return_dict (bool): Whether to return a MoeModelOutput object or a tuple.
+
+		Returns:
+			Union[MoeModelOutput, Tuple]: Model outputs, either as a dataclass or a tuple.
+		"""
 		output_attentions = (
 			output_attentions
 			if output_attentions is not None
@@ -620,6 +716,18 @@ class ArcticModel(EasyDeLBaseModule):
 	model_type="arctic",
 )
 class ArcticForCausalLM(EasyDeLBaseModule):
+	"""
+	Arctic model specifically adapted for Causal Language Modeling (CLM).
+	This module wraps the core ArcticModel and adds a language modeling head on top.
+
+	Attributes:
+		config (ArcticConfig): Configuration object for the Arctic model.
+		dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		rngs (nn.Rngs): Random number generators for the module.
+	"""
+
 	def __init__(
 		self,
 		config: ArcticConfig,
@@ -629,6 +737,7 @@ class ArcticForCausalLM(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the ArcticForCausalLM model."""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -669,6 +778,23 @@ class ArcticForCausalLM(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
 	) -> MoeCausalLMOutput | tp.Tuple:
+		"""Forward pass through the ArcticForCausalLM model.
+
+		Args:
+			input_ids (Optional[chex.Array]): Input token IDs.
+			attention_mask (Optional[chex.Array]): Mask to avoid attending to padding tokens.
+			position_ids (Optional[chex.Array]): Position IDs for positional embeddings.
+			segment_ids (Optional[chex.Array]): Segment IDs (if applicable).
+			past_key_values (Optional[TransformerCache | PagedAttentionCache]): Cached key/value states for faster decoding.
+			cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention cache.
+			inputs_embeds (Optional[chex.Array]): Input embeddings (alternative to input_ids).
+			output_attentions (Optional[bool]): Whether to return attention weights.
+			output_hidden_states (Optional[bool]): Whether to return all hidden states.
+			return_dict (bool): Whether to return a MoeCausalLMOutput object or a tuple.
+
+		Returns:
+			Union[MoeCausalLMOutput, Tuple]: Model outputs, including logits, either as a dataclass or a tuple.
+		"""
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
@@ -719,6 +845,18 @@ class ArcticForCausalLM(EasyDeLBaseModule):
 	model_type="arctic",
 )
 class ArcticForSequenceClassification(EasyDeLBaseModule):
+	"""
+	Arctic model adapted for sequence classification tasks.
+	This module wraps the core ArcticModel and adds a classification head on top.
+
+	Attributes:
+		config (ArcticConfig): Configuration object for the Arctic model (must include num_labels).
+		dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		rngs (nn.Rngs): Random number generators for the module.
+	"""
+
 	def __init__(
 		self,
 		config: ArcticConfig,
@@ -728,6 +866,7 @@ class ArcticForSequenceClassification(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the ArcticForSequenceClassification model."""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -770,11 +909,29 @@ class ArcticForSequenceClassification(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
 	) -> tp.Union[SequenceClassifierOutput, tp.Tuple]:
+		"""Forward pass through the ArcticForSequenceClassification model.
+
+		Args:
+			input_ids (Optional[chex.Array]): Input token IDs.
+			inputs_embeds (Optional[chex.Array]): Input embeddings (alternative to input_ids).
+			attention_mask (Optional[chex.Array]): Mask to avoid attending to padding tokens.
+			position_ids (Optional[chex.Array]): Position IDs for positional embeddings.
+			segment_ids (Optional[chex.Array]): Segment IDs (if applicable).
+			past_key_values (Optional[TransformerCache | PagedAttentionCache]): Cached key/value states for faster decoding.
+			cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention cache.
+			output_attentions (Optional[bool]): Whether to return attention weights.
+			output_hidden_states (Optional[bool]): Whether to return all hidden states.
+			return_dict (bool): Whether to return a SequenceClassifierOutput object or a tuple.
+
+		Returns:
+			Union[SequenceClassifierOutput, Tuple]: Model outputs, including classification logits, either as a dataclass or a tuple.
+		"""
 		transformer_outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,

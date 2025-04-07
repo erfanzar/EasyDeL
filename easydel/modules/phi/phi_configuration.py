@@ -117,6 +117,35 @@ class PhiConfig(EasyDeLBaseConfig):
 		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	) -> None:
+		"""Initializes a PhiConfig object.
+
+		Args:
+		    vocab_size (int, optional): Vocabulary size. Defaults to 51200.
+		    hidden_size (int, optional): Dimensionality of the embeddings and hidden states. Defaults to 2048.
+		    intermediate_size (int, optional): Dimensionality of the intermediate layer in MLP. Defaults to 8192.
+		    num_hidden_layers (int, optional): Number of hidden layers. Defaults to 24.
+		    num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
+		    num_key_value_heads (int, optional): Number of key/value heads (for GQA). Defaults to `num_attention_heads`.
+		    resid_pdrop (float, optional): Dropout probability for residual connections. Defaults to 0.0.
+		    embd_pdrop (float, optional): Dropout probability for embeddings. Defaults to 0.0.
+		    attention_dropout (float, optional): Dropout probability for attention scores. Defaults to 0.0.
+		    hidden_act (str, optional): Activation function name. Defaults to "gelu_new".
+		    max_position_embeddings (int, optional): Maximum sequence length. Defaults to 2048.
+		    initializer_range (float, optional): Standard deviation for weight initialization. Defaults to 0.02.
+		    layer_norm_eps (float, optional): Epsilon for layer normalization. Defaults to 1e-5.
+		    use_cache (bool, optional): Whether to use KV cache. Defaults to True.
+		    tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
+		    rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
+		    rope_scaling (dict, optional): RoPE scaling configuration. Defaults to None.
+		    partial_rotary_factor (float, optional): Factor for partial RoPE application. Defaults to 0.5.
+		    qk_layernorm (bool, optional): Whether to apply LayerNorm to QK projections. Defaults to False.
+		    bos_token_id (int, optional): Beginning-of-sequence token ID. Defaults to 1.
+		    eos_token_id (int, optional): End-of-sequence token ID. Defaults to 2.
+		    bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
+		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
+		        Defaults to EasyDeLGradientCheckPointers.NONE.
+		    **kwargs: Additional keyword arguments passed to the parent class.
+		"""
 		self.vocab_size = vocab_size
 		self.hidden_size = hidden_size
 		self.intermediate_size = intermediate_size
@@ -177,6 +206,14 @@ class PhiConfig(EasyDeLBaseConfig):
 
 	@property
 	def granted_freq_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size specifically for frequency-based position embeddings.
+
+		If `freq_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
+		`max_position_embeddings`.
+
+		Returns:
+		    int: The granted maximum position embedding size for frequency encoding.
+		"""
 		return getattr(
 			self,
 			"freq_max_position_embeddings",
@@ -185,6 +222,14 @@ class PhiConfig(EasyDeLBaseConfig):
 
 	@property
 	def granted_mask_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size specifically for mask-based position embeddings.
+
+		If `mask_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
+		`max_position_embeddings`.
+
+		Returns:
+		    int: The granted maximum position embedding size for mask encoding.
+		"""
 		return getattr(
 			self,
 			"mask_max_position_embeddings",

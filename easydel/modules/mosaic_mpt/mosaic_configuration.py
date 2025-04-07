@@ -63,6 +63,21 @@ class MptAttentionConfig(EasyDeLBaseConfig):
 		alibi_bias_max=8,
 		**kwargs,
 	):
+		"""Initializes an MptAttentionConfig object.
+
+		Args:
+		    attn_type (str, optional): Type of attention mechanism. Defaults to "multihead_attention".
+		    attn_pdrop (float, optional): Dropout probability for attention output. Defaults to 0.
+		    attn_impl (str, optional): Implementation of attention ("torch" or "flash"). Defaults to "torch".
+		    clip_qkv (float, optional): Clipping value for QKV projections. Defaults to None.
+		    softmax_scale (float, optional): Scale factor for softmax. Defaults to None.
+		    prefix_lm (bool, optional): Whether to use prefix language modeling. Defaults to False.
+		    qk_ln (bool, optional): Whether to apply LayerNorm to Q and K. Defaults to False.
+		    attn_uses_sequence_id (bool, optional): Whether attention uses sequence IDs. Defaults to False.
+		    alibi (bool, optional): Whether to use ALiBi positional bias. Defaults to True.
+		    alibi_bias_max (int, optional): Maximum ALiBi bias value. Defaults to 8.
+		    **kwargs: Additional keyword arguments.
+		"""
 		super().__init__()
 		self.attn_type = attn_type
 		self.attn_pdrop = attn_pdrop
@@ -84,6 +99,16 @@ class MptAttentionConfig(EasyDeLBaseConfig):
 	def from_pretrained(
 		cls, pretrained_model_name_or_path, **kwargs
 	) -> "EasyDeLBaseConfig":
+		"""Loads attention configuration from a pretrained model configuration file.
+
+		Args:
+		    cls (type): The class itself.
+		    pretrained_model_name_or_path (str): Path or identifier of the pretrained model.
+		    **kwargs: Additional keyword arguments passed to `get_config_dict` and `from_dict`.
+
+		Returns:
+		    EasyDeLBaseConfig: An instance of MptAttentionConfig loaded from the pretrained model.
+		"""
 		cls._set_token_in_kwargs(kwargs)
 		config_dict, kwargs = cls.get_config_dict(pretrained_model_name_or_path, **kwargs)
 		if config_dict.get("model_type") == "mpt":
@@ -197,6 +222,39 @@ class MptConfig(EasyDeLBaseConfig):
 		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
+		"""Initializes an MptConfig object.
+
+		Args:
+		    d_model (int, optional): Hidden size. Defaults to 2048.
+		    n_heads (int, optional): Number of attention heads. Defaults to 16.
+		    n_layers (int, optional): Number of hidden layers. Defaults to 24.
+		    expansion_ratio (int, optional): Expansion ratio for MLP. Defaults to 4.
+		    max_seq_len (int, optional): Maximum sequence length. Defaults to 2048.
+		    vocab_size (int, optional): Vocabulary size. Defaults to 50368.
+		    resid_prob_drop (float, optional): Residual dropout probability. Defaults to 0.0.
+		    layer_norm_epsilon (float, optional): Epsilon for layer normalization. Defaults to 1e-5.
+		    emb_prob_drop (float, optional): Embedding dropout probability. Defaults to 0.0.
+		    learned_pos_emb (bool, optional): Whether to learn positional embeddings. Defaults to True.
+		    attn_config (MptAttentionConfig, optional): Attention configuration. Defaults to None.
+		    init_device (str, optional): Device for initialization (ignored). Defaults to "cpu".
+		    logit_scale (float | str, optional): Logit scaling factor. Defaults to None.
+		    no_bias (bool, optional): Whether to disable bias in linear layers. Defaults to True.
+		    verbose (int, optional): Verbosity level (ignored). Defaults to 0.
+		    embedding_fraction (float, optional): Embedding fraction (ignored). Defaults to 1.0.
+		    norm_type (str, optional): Type of layer normalization. Defaults to "low_precision_layernorm".
+		    use_cache (bool, optional): Whether to use KV cache. Defaults to False.
+		    initializer_range (float, optional): Initializer range. Defaults to 0.02.
+		    alibi (bool, optional): Whether to use ALiBi positional bias. Defaults to True.
+		    use_bias (bool, optional): Whether to use bias in linear layers. Defaults to False.
+		    act_fn (str, optional): Activation function. Defaults to "gelu".
+		    qk_ln (bool, optional): Whether to apply LayerNorm to Q and K. Defaults to False.
+		    use_lm_head (bool, optional): Whether to use a language modeling head (tied embeddings). Defaults to False.
+		    use_norm_bias (bool, optional): Whether to use bias in layer normalization. Defaults to False.
+		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
+		        Defaults to EasyDeLGradientCheckPointers.NONE.
+		    bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
+		    **kwargs: Additional keyword arguments.
+		"""
 		if attn_config is None:
 			self.attn_config = MptAttentionConfig(**kwargs)
 		elif isinstance(attn_config, dict):
@@ -235,6 +293,15 @@ class MptConfig(EasyDeLBaseConfig):
 
 	@staticmethod
 	def _set_config_defaults(config, config_defaults):
+		"""Sets default values for missing configuration parameters.
+
+		Args:
+		    config (dict): The configuration dictionary to update.
+		    config_defaults (dict): A dictionary containing default values.
+
+		Returns:
+		    dict: The updated configuration dictionary.
+		"""
 		for k, v in config_defaults.items():
 			if k not in config:
 				config[k] = v
@@ -242,9 +309,16 @@ class MptConfig(EasyDeLBaseConfig):
 
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model.
+		Get the partition rules for the model. This method defines how the model's parameters are
+		partitioned across devices for distributed training and inference.
+
+		Args:
+		    *args: Additional positional arguments (unused).
+		    **kwargs: Additional keyword arguments (unused).
+
 		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: A tuple of partition rules, where each rule is a tuple
+		        containing a regex pattern for parameter names and the corresponding `PartitionSpec`.
 		"""
 		return (
 			("wte/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
@@ -265,6 +339,17 @@ class MptConfig(EasyDeLBaseConfig):
 		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
+		"""Attaches custom arguments to the configuration object.
+
+		This method allows adding or overriding configuration attributes dynamically.
+		It primarily sets attributes related to gradient checkpointing and quantization bits.
+
+		Args:
+		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
+		        Defaults to EasyDeLGradientCheckPointers.NONE.
+		    bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
+		    **kwargs: Additional keyword arguments (ignored).
+		"""
 		if hasattr(self, "attn_config"):
 			for k, v in self.attn_config.__dict__.items():
 				if not hasattr(self, k):
@@ -277,6 +362,14 @@ class MptConfig(EasyDeLBaseConfig):
 
 	@property
 	def granted_freq_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size specifically for frequency-based position embeddings.
+
+		If `freq_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
+		`max_seq_len`.
+
+		Returns:
+		    int: The granted maximum position embedding size for frequency encoding.
+		"""
 		return getattr(
 			self,
 			"freq_max_position_embeddings",
@@ -285,6 +378,14 @@ class MptConfig(EasyDeLBaseConfig):
 
 	@property
 	def granted_mask_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size specifically for mask-based position embeddings.
+
+		If `mask_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
+		`max_seq_len`.
+
+		Returns:
+		    int: The granted maximum position embedding size for mask encoding.
+		"""
 		return getattr(
 			self,
 			"mask_max_position_embeddings",

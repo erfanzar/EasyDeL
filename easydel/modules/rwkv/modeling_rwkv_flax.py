@@ -18,6 +18,7 @@ import typing as tp
 
 import chex
 import jax.lax
+from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax import numpy as jnp
 
@@ -25,7 +26,7 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import ModelOutput
 from easydel.layers.linear import ParallelLinear
-from eformer.pytree import auto_pytree
+
 from .rwkv_configuration import RwkvConfig as RwkvConfig
 
 # NOTE:Updated but wont work forsure, check this later.

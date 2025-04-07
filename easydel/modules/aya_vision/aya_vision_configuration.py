@@ -66,6 +66,18 @@ class AyaVisionConfig(EasyDeLBaseConfig):
 		image_token_index=255036,
 		**kwargs,
 	):
+		"""Initializes the AyaVisionConfig instance.
+
+		Args:
+		    vision_config (Optional[Union[dict, EasyDeLBaseConfig]]): Configuration for the vision model.
+		    text_config (Optional[Union[dict, EasyDeLBaseConfig]]): Configuration for the text model.
+		    vision_feature_select_strategy (str): Strategy for selecting vision features ("default" or "full").
+		    vision_feature_layer (int): Layer index for vision feature selection.
+		    downsample_factor (int): Factor to downsample vision features.
+		    adapter_layer_norm_eps (float): Epsilon for adapter layer normalization.
+		    image_token_index (int): Index of the image token.
+		    **kwargs: Additional keyword arguments passed to the parent class.
+		"""
 		self.image_token_index = image_token_index
 		self.downsample_factor = downsample_factor
 		self.adapter_layer_norm_eps = adapter_layer_norm_eps
@@ -115,6 +127,15 @@ class AyaVisionConfig(EasyDeLBaseConfig):
 		super().__init__(**kwargs)
 
 	def get_partition_rules(self, *args, **kwargs):
+		"""Retrieves the combined partition rules from the text and vision configurations.
+
+		Args:
+		    *args: Positional arguments passed to the underlying config partition rule methods.
+		    **kwargs: Keyword arguments passed to the underlying config partition rule methods.
+
+		Returns:
+		    Tuple: Combined partition rules from both text and vision models.
+		"""
 		tp = self.text_config.get_partition_rules(*args, **kwargs)
 		vp = self.vision_config.get_partition_rules(*args, **kwargs)
 		return tp + vp

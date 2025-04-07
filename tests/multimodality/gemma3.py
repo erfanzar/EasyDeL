@@ -104,7 +104,7 @@ def main():
 		)[0]
 	)
 	print("\n" + ("*" * 5))
-	print("TPS  :", response.tokens_pre_second)
+	print("TPS  :", response.tokens_per_second)
 	with model.mesh:
 		print("Loss :", model.compute_loss(**inputs)[-1].loss)  # 21.4800
 

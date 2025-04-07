@@ -580,6 +580,12 @@ class Gemma2Model(EasyDeLBaseModule):
 	model_type="gemma2",
 )
 class Gemma2ForCausalLM(EasyDeLBaseModule):
+	"""Gemma2 model with a language modeling head for causal language modeling tasks.
+
+	This model extends the base Gemma2Model by incorporating a linear language modeling head on top
+	of the base model, designed for generative tasks and text generation.
+	"""
+
 	def __init__(
 		self,
 		config: Gemma2Config,
@@ -589,6 +595,15 @@ class Gemma2ForCausalLM(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initialize a Gemma2ForCausalLM model.
+
+		Args:
+			config (Gemma2Config): Configuration object for the model.
+			dtype (jnp.dtype, optional): Data type for activations and weights. Defaults to jnp.float32.
+			param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
+			precision (jax.lax.PrecisionLike, optional): Numerical precision for computations. Defaults to None.
+			rngs (nn.Rngs): Random number generator keys for initialization.
+		"""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -628,23 +643,22 @@ class Gemma2ForCausalLM(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
 	) -> tp.Union[CausalLMOutput, tp.Tuple]:
-		"""
-		Forward pass through the Gemma2 module.
+		"""Forward pass of the causal language model.
 
 		Args:
-		    input_ids (tp.Optional[chex.Array]): Input tensor containing token IDs.
-		    attention_mask (tp.Optional[chex.Array]): Mask for attention.
-		    position_ids (tp.Optional[chex.Array]): Positional indices.
-		    segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
-		    inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
-		    output_attentions (tp.Optional[bool]): If True, output attention weights.
-		    output_hidden_states (tp.Optional[bool]): If True, output hidden states.
-		    init_cache (bool): If True, initialize cache for decoding.
-		    deterministic (bool): If True, disable dropout.
-		    return_dict (bool): If True, return a dictionary of outputs.
+			input_ids (Optional[chex.Array], optional): Input token IDs. Defaults to None.
+			inputs_embeds (Optional[chex.Array], optional): Pre-computed input embeddings. Defaults to None.
+			attention_mask (Optional[chex.Array], optional): Mask to avoid attention on padding tokens. Defaults to None.
+			position_ids (Optional[chex.Array], optional): Position IDs for positional embeddings. Defaults to None.
+			segment_ids (Optional[chex.Array], optional): Segment IDs for segment embeddings. Defaults to None.
+			output_attentions (Optional[bool], optional): Whether to return attention weights. Defaults to None.
+			output_hidden_states (Optional[bool], optional): Whether to return hidden states. Defaults to None.
+			past_key_values (Optional[TransformerCache | PagedAttentionCache], optional): Cached key values for faster inference. Defaults to None.
+			cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata], optional): Metadata for cache handling. Defaults to None.
+			return_dict (bool, optional): Whether to return a CausalLMOutput object. Defaults to True.
 
 		Returns:
-		    CausalLMOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
+			Union[CausalLMOutput, Tuple]: Model outputs containing logits and optional hidden states and attentions.
 		"""
 
 		outputs = self.model(
@@ -747,6 +761,7 @@ class Gemma2ForSequenceClassification(EasyDeLBaseModule):
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,

@@ -23,7 +23,7 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 from transformers import AutoTokenizer
 
-from easydel.inference.vinference.vinference import vInference
+from easydel.inference import vInference
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.utils import ProcessingClassType

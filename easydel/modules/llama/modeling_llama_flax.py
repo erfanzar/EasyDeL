@@ -237,12 +237,7 @@ class LlamaAttention(AttentionModule):
 				)
 			),
 		)
-		outputs = (
-			(attn_output, attentions.attention_weights)
-			if output_attentions
-			else (attn_output, None)
-		)
-		return outputs
+		return attn_output, attentions.attention_weights
 
 
 class LlamaDecoderLayer(nn.Module):
@@ -347,6 +342,18 @@ class LlamaDecoderLayer(nn.Module):
 	model_type="llama",
 )
 class LlamaModel(EasyDeLBaseModule):
+	"""Llama model implementation.
+
+	This implements the Llama language model architecture, utilizing transformer blocks
+	with RMSNorm, rotary position embeddings, and a specific attention mechanism.
+
+	Attributes:
+		config (LlamaConfig): Configuration for the model.
+		dtype (jnp.dtype): Data type for computations.
+		param_dtype (jnp.dtype): Data type for parameters.
+		precision: Precision setting for JAX operations.
+	"""
+
 	def __init__(
 		self,
 		config: LlamaConfig,
@@ -404,6 +411,23 @@ class LlamaModel(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
 	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+		"""Forward pass through the Llama model.
+
+		Args:
+			input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
+			inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
+			attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
+			position_ids (chex.Array, optional): Indices of positions of each input sequence token.
+			segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
+			past_key_values (TransformerCache | PagedAttentionCache, optional): Cache containing precomputed key/value states.
+			cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling.
+			output_attentions (bool, optional): Whether to return attention weights.
+			output_hidden_states (bool, optional): Whether to return hidden states of all layers.
+			return_dict (bool, optional): Whether to return a model output object or a tuple.
+
+		Returns:
+			Union[BaseModelOutput, Tuple]: Model outputs (last hidden state, optional hidden states, optional attentions)
+		"""
 		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
 				"You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -457,7 +481,7 @@ class LlamaModel(EasyDeLBaseModule):
 			all_hidden_states += (hidden_states,)
 			outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
 		else:
-			outputs = (hidden_states, all_attentions)
+			outputs = (hidden_states, all_attentions, past_key_values)
 
 		if not return_dict:
 			return tuple(v for v in outputs if v is not None)
@@ -476,12 +500,16 @@ class LlamaModel(EasyDeLBaseModule):
 	model_type="llama",
 )
 class LlamaForCausalLM(EasyDeLBaseModule):
-	"""
+	"""Llama model with a language modeling head for causal language modeling tasks.
+
+	This model is a transformer-based language model with causal attention masks
+	applied to perform autoregressive language generation.
+
 	Attributes:
-		config (LlamaConfig): Configuration for the attention module.
-		dtype (jnp.dtype): Data type for computations (default is jnp.bfloat16).
-		param_dtype (jnp.dtype): Data type for parameters (default is jnp.bfloat16).
-		precision (tp.Optional[tp.Union[str, jax.lax.Precision]]): Precision setting for JAX operations (default is "fastest").
+		config (LlamaConfig): Configuration for the model.
+		dtype (jnp.dtype): Data type for computations (default is jnp.float32).
+		param_dtype (jnp.dtype): Data type for parameters (default is jnp.float32).
+		precision (tp.Optional[tp.Union[str, jax.lax.Precision]]): Precision setting for JAX operations.
 	"""
 
 	def __init__(
@@ -533,7 +561,23 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
 	) -> tp.Union[CausalLMOutput, tp.Tuple]:
-		# jax.debug.print("IDs {} ", input_ids)
+		"""Forward pass through the Llama model for causal language modeling.
+
+		Args:
+			input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
+			inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
+			attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
+			position_ids (chex.Array, optional): Indices of positions of each input sequence token.
+			segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
+			past_key_values (TransformerCache | PagedAttentionCache, optional): Cache containing precomputed key/value states.
+			cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling.
+			output_attentions (bool, optional): Whether to return attention weights.
+			output_hidden_states (bool, optional): Whether to return hidden states of all layers.
+			return_dict (bool, optional): Whether to return a model output object or a tuple.
+
+		Returns:
+			Union[CausalLMOutput, Tuple]: Model outputs (logits, optional hidden states, optional attentions)
+		"""
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
@@ -574,6 +618,18 @@ class LlamaForCausalLM(EasyDeLBaseModule):
 	model_type="llama",
 )
 class LlamaForSequenceClassification(EasyDeLBaseModule):
+	"""Llama model for sequence classification tasks.
+
+	This class extends the base Llama model by adding a linear classification head
+	to perform sequence classification tasks such as sentiment analysis or text classification.
+
+	Attributes:
+		config (LlamaConfig): Configuration for the model.
+		dtype (jnp.dtype): Data type for computations.
+		param_dtype (jnp.dtype): Data type for parameters.
+		precision: Precision setting for JAX operations.
+	"""
+
 	def __init__(
 		self,
 		config: LlamaConfig,
@@ -624,11 +680,32 @@ class LlamaForSequenceClassification(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
 	) -> tp.Union[SequenceClassifierOutput, tp.Tuple]:
+		"""Forward pass through the Llama model for sequence classification.
+
+		This method processes input sequences through the Llama model and applies
+		a classification head to the output.
+
+		Args:
+			input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
+			inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
+			attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
+			position_ids (chex.Array, optional): Indices of positions of each input sequence token.
+			segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
+			past_key_values (TransformerCache | PagedAttentionCache, optional): Cache containing precomputed key/value states.
+			cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling.
+			output_attentions (bool, optional): Whether to return attention weights.
+			output_hidden_states (bool, optional): Whether to return hidden states of all layers.
+			return_dict (bool, optional): Whether to return a model output object or a tuple.
+
+		Returns:
+			Union[SequenceClassifierOutput, Tuple]: Classification outputs including logits and optional model outputs
+		"""
 		transformer_outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,

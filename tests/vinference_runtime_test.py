@@ -113,7 +113,7 @@ def main():
 	# sequences = response.sequences[..., response.padded_length :]
 	# print(processor.batch_decode(sequences, skip_special_tokens=True)[0])
 
-	print(response.tokens_pre_second)
+	print(response.tokens_per_second)
 
 	print("Stage 2 => Start Generation Process.")
 	sampling_params.top_p = 0.8
@@ -123,7 +123,7 @@ def main():
 	# sequences = response.sequences[..., response.padded_length :]
 	# print(processor.batch_decode(sequences, skip_special_tokens=True)[0])
 
-	print(response.tokens_pre_second)
+	print(response.tokens_per_second)
 
 
 if __name__ == "__main__":

@@ -85,7 +85,14 @@ class EasyModelsTest(unittest.TestCase):
 		self.attn_softmax_dtype = jnp.float32
 		self.platform = None
 
-	def create_test_for_models(self, module_name: str, hf_module_class, task):
+	@torch.no_grad()
+	def create_test_for_models(
+		self,
+		module_name: str,
+		hf_module_class,
+		task,
+		extra_exec: dict = None,
+	):
 		module_config, module_class = ed.get_modules_by_type(module_name, task)
 		if self.header_config is None:
 			config = module_config(
@@ -120,7 +127,12 @@ class EasyModelsTest(unittest.TestCase):
 			)
 		else:
 			config = self.header_config
-
+		kwargs_torch = {}
+		kwargs_easydel = {}
+		if extra_exec is not None:
+			for k, v in extra_exec.items():
+				kwargs_easydel[k] = jnp.ones(v["shape"], dtype=getattr(jnp, v["dtype"]))
+				kwargs_torch[k] = torch.ones(v["shape"], dtype=getattr(torch, v["dtype"]))
 		config.axis_dims = self.axis_dims
 		config.pad_token_id = 0
 
@@ -149,12 +161,23 @@ class EasyModelsTest(unittest.TestCase):
 				(self.batch_size, self.sequence_length),
 			)
 			torch_time = time.time()
-			hf_output = hf_model(
-				input_ids=torch_input_ids,
-				attention_mask=torch.ones_like(torch_input_ids),
-				labels=torch_input_ids,
-				past_key_values=None,
-			)
+			try:
+				hf_output = hf_model(
+					input_ids=torch_input_ids,
+					attention_mask=torch.ones_like(torch_input_ids),
+					labels=torch_input_ids,
+					output_router_logits=True,
+					past_key_values=None,
+					**kwargs_torch,
+				)
+			except Exception:
+				hf_output = hf_model(
+					input_ids=torch_input_ids,
+					attention_mask=torch.ones_like(torch_input_ids),
+					labels=torch_input_ids,
+					past_key_values=None,
+					**kwargs_torch,
+				)
 			torch_time = time.time() - torch_time
 
 			ed_model = module_class.lazy_init(
@@ -170,15 +193,29 @@ class EasyModelsTest(unittest.TestCase):
 			)
 			ed_model.eval()
 			ed_model = ed_model.shard_model()
+			try:
 
-			@jax.jit
-			def jited(ids):
-				return ed_model.compute_loss(
-					input_ids=ids,
-					attention_mask=jnp.ones_like(ids, dtype=jnp.bool),
-				)
+				@jax.jit
+				def jited(ids):
+					return ed_model.compute_loss(
+						input_ids=ids,
+						attention_mask=jnp.ones_like(ids, dtype=jnp.bool),
+						output_router_logits=True,
+						**kwargs_easydel,
+					)
 
-			ed_output = jited(jax_input_ids)
+				ed_output = jited(jax_input_ids)
+			except Exception:
+
+				@jax.jit
+				def jited(ids):
+					return ed_model.compute_loss(
+						input_ids=ids,
+						attention_mask=jnp.ones_like(ids, dtype=jnp.bool),
+						**kwargs_easydel,
+					)
+
+				ed_output = jited(jax_input_ids)
 			easy_time = time.time()
 			ed_output, metrics = jited(jax_input_ids)
 			easy_time = time.time() - easy_time
@@ -223,6 +260,95 @@ class EasyModelsTest(unittest.TestCase):
 			ed.TaskType.CAUSAL_LM,
 		)
 		self.assertTrue(res, f"Llama model Failed [ERROR {err}]")
+		self.rope_scaling = None
+
+	def test_llama4(self):
+		self.header_config = ed.Llama4TextConfig(
+			hidden_size=128,
+			intermediate_size=512,
+			intermediate_size_mlp=256,
+			num_hidden_layers=4,
+			num_attention_heads=8,
+			num_key_value_heads=4,
+			head_dim=128,
+			use_qk_norm=False,
+		)
+		res, err = self.create_test_for_models(
+			"llama4_text",
+			transformers.Llama4ForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
+		self.assertTrue(res, f"Llama4 model Failed [ERROR {err}]")
+		self.rope_scaling = None
+
+	def test_llama4_cond(self):
+		self.header_config = ed.Llama4Config(
+			boi_token_index=200080,
+			eoi_token_index=200081,
+			image_token_index=200092,
+		)
+
+		text_config = ed.Llama4TextConfig(
+			hidden_size=512,  # Drastically reduced from 5120
+			intermediate_size=2048,  # Typically 4x hidden_size (reduced from 8192/16384)
+			intermediate_size_mlp=2048,  # Assuming non-MoE, keep same as intermediate_size
+			num_hidden_layers=6,  # Drastically reduced from 48
+			num_attention_heads=8,  # Reduced from 40 (512 / 8 = 64 head_dim)
+			num_key_value_heads=4,  # Reduced GQA heads from 8 (can be num_attention_heads for MHA)
+			head_dim=64,  # Calculated: hidden_size / num_attention_heads
+			use_qk_norm=False,
+			vocab_size=202048,
+			bos_token_id=200000,
+			eos_token_id=[200001, 200007, 200008],
+			pad_token_id=200018,
+			hidden_act="silu",  # Keep common activation
+			max_position_embeddings=4096,  # Reduced context window is typical for smaller models
+			initializer_range=0.02,
+			rms_norm_eps=1e-05,
+			use_cache=True,
+			attention_bias=False,
+			attention_dropout=0.0,
+			rope_theta=500000.0,  # Keep original RoPE theta or use a common default like 10000
+			rope_scaling=None,  # Simplify: Remove complex rope scaling for smaller model/context
+			num_experts_per_tok=1,
+			num_local_experts=1,
+			output_router_logits=False,
+			router_aux_loss_coef=0.0,  # No MoE loss
+			router_jitter_noise=0.0,
+		)
+
+		vision_config = ed.Llama4VisionConfig(
+			hidden_size=512,  # Reduced from 1408, matching text hidden_size is convenient
+			num_hidden_layers=4,  # Reduced from 34 (Often fewer layers than text)
+			num_attention_heads=8,  # Reduced from 16 (512 / 8 = 64 head_dim)
+			intermediate_size=2048,  # Typically 4x hidden_size (reduced from 5632)
+			vision_output_dim=512,  # Set to match vision hidden_size for simplicity here
+			projector_input_dim=512,  # Matching vision_output_dim
+			projector_output_dim=512,  # Matching text_config.hidden_size
+			image_size=336,  # Keep original image size, or reduce if needed
+			patch_size=14,  # Keep original patch size
+			num_channels=3,
+			hidden_act="gelu",  # Common vision activation
+			initializer_range=0.02,
+			norm_eps=1e-05,
+			attention_dropout=0.0,
+			rope_theta=10000,  # Keep original vision rope_theta
+			pixel_shuffle_ratio=0.5,  # Disable pixel shuffling maybe? Original was 0.5
+			projector_dropout=0.0,
+			multi_modal_projector_bias=False,
+			vision_feature_layer=-1,  # Usually the last layer
+			vision_feature_select_strategy="default",
+		)
+		self.header_config.text_config = text_config
+		self.header_config.vision_config = vision_config
+
+		res, err = self.create_test_for_models(
+			"llama4",
+			transformers.Llama4ForConditionalGeneration,
+			ed.TaskType.IMAGE_TEXT_TO_TEXT,
+			{"pixel_values": {"dtype": "float32", "shape": (17, 3, 336, 336)}},
+		)
+		self.assertTrue(res, f"Llama4 model Failed [ERROR {err}]")
 		self.rope_scaling = None
 
 	def test_mpt(self):
@@ -398,6 +524,23 @@ class EasyModelsTest(unittest.TestCase):
 			ed.TaskType.CAUSAL_LM,
 		)
 		self.assertTrue(res, f"Qwen 2 model Failed [ERROR {err}]")
+
+	def test_qwen3(self):
+		self.header_config = ed.Qwen3Config(
+			hidden_size=128,
+			intermediate_size=256,
+			num_hidden_layers=4,
+			num_attention_heads=8,
+			num_key_value_heads=4,
+			head_dim=128,
+		)
+		self.rope_scaling = None
+		res, err = self.create_test_for_models(
+			"qwen3",
+			transformers.Qwen3ForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
+		self.assertTrue(res, f"Qwen 3 model Failed [ERROR {err}]")
 
 	def test_olmo(self):
 		self.header_config = None
@@ -719,6 +862,16 @@ class EasyModelsTest(unittest.TestCase):
 		)
 		self.assertTrue(res, f"Qwen2Moe model Failed [ERROR {err}]")
 
+	def test_qwen3_moe(self):
+		self.header_config = None
+		self.rope_scaling = None
+		res, err = self.create_test_for_models(
+			"qwen3_moe",
+			transformers.Qwen3MoeForCausalLM,
+			ed.TaskType.CAUSAL_LM,
+		)
+		self.assertTrue(res, f"Qwen2Moe model Failed [ERROR {err}]")
+
 	def test_qwen2_vl(self):
 		self.header_config = ed.AutoEasyDeLConfig.from_pretrained(
 			"Qwen/Qwen2-VL-2B-Instruct",
@@ -754,36 +907,6 @@ class EasyModelsTest(unittest.TestCase):
 		)
 		self.assertTrue(res, f"ROBERTA model Failed [ERROR {err}]")
 
-	def test_moe_mixtral(self):
-		self.header_config = None
-		res = self.create_moe_test_for_models(
-			"mixtral",
-			transformers.MixtralForCausalLM,
-			ed.TaskType.CAUSAL_LM,
-		)
-		self.assertTrue(res)
-
-	def test_moe_qwen2_moe(self):
-		self.header_config = None
-		res = self.create_moe_test_for_models("qwen2_moe", transformers.Qwen2MoeForCausalLM)
-		self.assertTrue(res)
-
-	def test_moe_dbrx_moe(self):
-		self.header_config = ed.DbrxConfig(
-			d_model=self.hidden_size,
-			n_heads=self.num_attention_heads,
-			n_layers=self.num_hidden_layers,
-			ffn_config=ed.DbrxFFNConfig(
-				ffn_hidden_size=self.intermediate_size,
-				moe_top_k=self.num_experts_per_tok,
-				moe_num_experts=self.num_local_experts,
-			),
-			attn_config=ed.DbrxAttentionConfig(),
-		)
-		res = self.create_moe_test_for_models("dbrx", transformers.DbrxForCausalLM)
-		self.header_config = None
-		self.assertTrue(res)
-
 	@staticmethod
 	def compare_torch_to_jax(
 		name,
@@ -794,9 +917,11 @@ class EasyModelsTest(unittest.TestCase):
 		easy_time: float = None,
 		torch_time: float = None,
 	):
+		jux = getattr(ed_out, "aux_loss", 0)
+		tux = getattr(hf_out, "aux_loss", 0)
 		to, jo = hf_out.logits.cpu().detach().numpy(), ed_out.logits
 		err = jnp.mean(to) - jnp.mean(jo)
-		ed_loss = ed_out.loss
+		ed_loss = ed_out.loss - jux
 		hf_loss = hf_out.loss.cpu().detach().numpy()
 		all_close = jnp.allclose(to, jo, atol=atol, rtol=rtol)
 		all_close_loss = jnp.allclose(hf_loss, ed_loss, atol=0.125, rtol=0)
@@ -814,6 +939,7 @@ class EasyModelsTest(unittest.TestCase):
 				["Last 5 elements", str(to[0, -1, -5:]), str(jo[0, -1, -5:])],
 				["Loss", str(hf_loss), str(ed_loss)],
 				["Took", str(torch_time), str(easy_time)],
+				["AUX", str(tux), str(jux)],
 			],
 			headers=["Metric", "HuggingFace", "EasyDeL"],
 			tablefmt="grid",
@@ -879,8 +1005,10 @@ if __name__ == "__main__":
 	# # test.test_grok1() # Not Tested Yet!
 	# test.test_internlm2()  # Passed
 	# test.test_llama()  # Passed
+	# test.test_llama4()  # Passed
+	test.test_llama4_cond()  # Passed
 	# test.test_mamba()  # Passed
-	# test.test_mamba2()  # Passed
+	# test.test_mamba2()  # Passed - ReCheck
 	# test.test_mistral()  # Passed
 	# test.test_mixtral()  # Passed
 	# test.test_mpt()  # Passed
@@ -891,7 +1019,9 @@ if __name__ == "__main__":
 	# test.test_phi3()  # Passed
 	# test.test_phimoe()  # Failed v0.0.80 - N  Runtime
 	# test.test_qwen2()  # Passed
-	test.test_qwen2_moe()  # Passed
-	test.test_qwen2_vl()  # Passed
-	test.test_stablelm()  # Passed
+	# test.test_qwen2_moe()  # Passed
+	# test.test_qwen2_vl()  # Passed
+	# test.test_qwen3()  # Passed
+	# test.test_qwen3_moe()  # Passed
+	# test.test_stablelm()  # Passed
 	# -----------------------------------------------

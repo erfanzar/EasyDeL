@@ -216,14 +216,24 @@ class ArcticConfig(EasyDeLBaseConfig):
 
 	@staticmethod
 	def get_weight_decay_exclusions():
+		"""
+		Returns a tuple of parameter names for which weight decay should be excluded.
+		"""
 		return tuple()
 
 	@staticmethod
 	def rng_keys():
+		"""
+		Returns the names of the random number generator keys used by the model.
+		"""
 		return "params", "dropout", "fcm"
 
 	@property
 	def granted_freq_max_position_embedding(self) -> int:
+		"""
+		Returns the maximum position embedding size for frequency-based position embeddings,
+		falling back to `max_position_embeddings` if `freq_max_position_embeddings` is not set.
+		"""
 		return getattr(
 			self,
 			"freq_max_position_embeddings",
@@ -232,6 +242,10 @@ class ArcticConfig(EasyDeLBaseConfig):
 
 	@property
 	def granted_mask_max_position_embedding(self) -> int:
+		"""
+		Returns the maximum position embedding size for mask-based position embeddings,
+		falling back to `max_position_embeddings` if `mask_max_position_embeddings` is not set.
+		"""
 		return getattr(
 			self,
 			"mask_max_position_embeddings",

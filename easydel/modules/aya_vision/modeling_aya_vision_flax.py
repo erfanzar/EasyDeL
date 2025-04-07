@@ -84,6 +84,18 @@ class AyaVisionCausalLMOutputWithPast(ModelOutput):
 
 
 class AyaVisionMultiModalProjector(nn.Module):
+	"""
+	A multi-modal projector module for AyaVision that processes image features.
+	It applies pixel shuffling, layer normalization, and linear transformations.
+
+	Attributes:
+	    config (AyaVisionConfig): Configuration object.
+	    dtype (jnp.dtype): Data type for computation.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): JAX precision level.
+	    rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: AyaVisionConfig,
@@ -93,6 +105,7 @@ class AyaVisionMultiModalProjector(nn.Module):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the AyaVisionMultiModalProjector."""
 		self.config = config
 		self.dtype = dtype
 		self.param_dtype = param_dtype
@@ -138,6 +151,14 @@ class AyaVisionMultiModalProjector(nn.Module):
 		)
 
 	def __call__(self, image_features: jax.Array) -> jax.Array:
+		"""Forward pass through the projector.
+
+		Args:
+		    image_features (jax.Array): Input image features.
+
+		Returns:
+		    jax.Array: Processed hidden states.
+		"""
 		image_features = self.pixel_shuffle(image_features)
 		image_features = self.layernorm(image_features)
 		hidden_states = self.linear_1(image_features)
@@ -148,6 +169,14 @@ class AyaVisionMultiModalProjector(nn.Module):
 		return hidden_states
 
 	def pixel_shuffle(self, image_features: jax.Array) -> jax.Array:
+		"""Performs pixel shuffling on the image features based on the downsample factor.
+
+		Args:
+		    image_features (jax.Array): Input image features (batch_size, seq_length, hidden_size).
+
+		Returns:
+		    jax.Array: Image features after pixel shuffling.
+		"""
 		batch_size, seq_length, _ = image_features.shape
 		height = width = int(seq_length**0.5)
 		image_features = image_features.reshape(
@@ -180,6 +209,18 @@ class AyaVisionMultiModalProjector(nn.Module):
 	model_type="aya_vision",
 )
 class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
+	"""
+	AyaVision model for conditional text generation based on image inputs.
+	Combines a vision tower and a language model with a multi-modal projector.
+
+	Attributes:
+	    config (AyaVisionConfig): Configuration object.
+	    dtype (jnp.dtype): Data type for computation.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): JAX precision level.
+	    rngs (nn.Rngs): Random number generators.
+	"""
+
 	loss_type = "ForCausalLM"
 
 	def __init__(
@@ -191,6 +232,7 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the AyaVisionForConditionalGeneration model."""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -232,6 +274,14 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
 		)
 
 	def get_image_features(self, pixel_values: chex.Array) -> chex.Array:
+		"""Extracts and projects image features from the vision tower.
+
+		Args:
+		    pixel_values (chex.Array): Input pixel values for the images.
+
+		Returns:
+		    chex.Array: Processed image features ready for the language model.
+		"""
 		image_features = self.vision_tower(pixel_values, output_hidden_states=True)
 		selected_image_feature = image_features.hidden_states[self.vision_feature_layer]
 		if self.vision_feature_select_strategy == "default":
@@ -257,6 +307,25 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
 		return_dict: tp.Optional[bool] = None,
 		**lm_kwargs,
 	):
+		"""Forward pass for the AyaVision model.
+
+		Args:
+		    input_ids (chex.Array): Input token IDs. (batch_size, sequence_length)
+		    pixel_values (chex.Array): Input pixel values for images. (batch_size, num_channels, height, width)
+		    attention_mask (Optional[chex.Array]): Mask for text attention.
+		    position_ids (Optional[chex.Array]): Position IDs for text.
+		    segment_ids (Optional[chex.Array]): Segment IDs (if applicable).
+		    past_key_values (Optional[TransformerCache | PagedAttentionCache]): Cached keys/values for language model.
+		    cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+		    inputs_embeds (Optional[chex.Array]): Input embeddings (alternative to input_ids).
+		    output_attentions (Optional[bool]): Whether to output attentions.
+		    output_hidden_states (Optional[bool]): Whether to output hidden states.
+		    return_dict (Optional[bool]): Whether to return a dictionary output.
+		    **lm_kwargs: Additional arguments passed to the language model.
+
+		Returns:
+		    AyaVisionCausalLMOutputWithPast: Model outputs including logits and potentially past key/values, hidden states, attentions, and image hidden states.
+		"""
 		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -333,6 +402,24 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
 		required_props: tp.Optional[tp.Mapping[str, tp.Dict[str, tp.Any]]] = None,
 		**kwargs,
 	):
+		"""Helper function to get keyword arguments for model compilation, potentially including vision inputs.
+
+		Args:
+		    batch_size (int): Batch size for text inputs.
+		    input_tokens_length (int): Sequence length for text inputs.
+		    input_sharding (jax.sharding.PartitionSpec): Sharding specification for text inputs.
+		    rngs (jax.random.PRNGKey): Random number generator key.
+		    vision_included (bool): Whether to include dummy vision inputs. Defaults to False.
+		    vision_batch_size (int): Batch size for vision inputs. Defaults to 1.
+		    vision_channels (int): Number of channels for vision inputs. Defaults to 3.
+		    vision_height (Optional[int]): Height for vision inputs (defaults to config).
+		    vision_width (Optional[int]): Width for vision inputs (defaults to config).
+		    required_props (Optional[Mapping[str, Dict[str, Any]]]): Required properties.
+		    **kwargs: Additional arguments passed to the language model's compile kwargs method.
+
+		Returns:
+		    dict: Keyword arguments for model compilation.
+		"""
 		basics = self.language_model._get_compile_model_kwargs(
 			batch_size=batch_size,
 			input_tokens_length=input_tokens_length,
@@ -367,6 +454,17 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
 		pixel_values: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 	):
+		"""Prepares inputs for text generation, including pixel values if provided.
+
+		Args:
+		    input_ids (chex.Array): Initial input token IDs.
+		    max_length (int): Maximum generation length.
+		    pixel_values (Optional[chex.Array]): Pixel values for image input.
+		    attention_mask (Optional[chex.Array]): Attention mask.
+
+		Returns:
+		    dict: Model inputs ready for generation.
+		"""
 		model_inputs = self.language_model.prepare_inputs_for_generation(
 			input_ids=input_ids,
 			max_length=max_length,
@@ -376,6 +474,15 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
 		return model_inputs
 
 	def update_inputs_for_generation(self, model_outputs, model_kwargs):
+		"""Updates model inputs for the next step of generation, removing pixel values after the first step.
+
+		Args:
+		    model_outputs: Outputs from the previous generation step.
+		    model_kwargs: Current keyword arguments for the model.
+
+		Returns:
+		    dict: Updated model keyword arguments.
+		"""
 		model_kwargs = self.language_model.update_inputs_for_generation(
 			model_outputs, model_kwargs
 		)

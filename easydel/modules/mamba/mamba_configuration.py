@@ -146,9 +146,16 @@ class MambaConfig(EasyDeLBaseConfig):
 
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model.
+		Get the partition rules for distributing the Mamba model parameters across multiple devices.
+
+		These rules define how parameters should be partitioned when using techniques like
+		Fully Sharded Data Parallelism (FSDP), Sharded Parallelism (SP), and Tensor Parallelism (TP).
+		Each rule consists of a regex pattern matching parameter names and a corresponding PartitionSpec.
+
 		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+		    tuple: A tuple of tuples where each inner tuple contains:
+		        - A regex pattern matching parameter names
+		        - A PartitionSpec object specifying how to partition matching parameters
 		"""
 		return (
 			# Embeddings
@@ -178,9 +185,3 @@ class MambaConfig(EasyDeLBaseConfig):
 			# Catch-all
 			(".*", PartitionSpec(None)),
 		)
-
-	def attach_custom_arguments(
-		self,
-		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-	):
-		self.gradient_checkpointing = gradient_checkpointing

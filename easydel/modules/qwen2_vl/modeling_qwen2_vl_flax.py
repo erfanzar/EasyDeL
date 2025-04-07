@@ -804,12 +804,7 @@ class Qwen2VLAttention(AttentionModule):
 				attn_output=self._merge_heads(attentions.attention_outputs)
 			)
 		)
-		outputs = (
-			(attn_output, attentions.attention_weights)
-			if output_attentions
-			else (attn_output, None)
-		)
-		return outputs
+		return attn_output, attentions.attention_weights
 
 
 class Qwen2VLDecoderLayer(nn.Module):
@@ -1164,7 +1159,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
 			all_hidden_states += (hidden_states,)
 			outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
 		else:
-			outputs = (hidden_states, all_attentions)
+			outputs = (hidden_states, all_attentions, past_key_values)
 
 		if not return_dict:
 			return tuple(v for v in outputs if v is not None)
@@ -1325,6 +1320,7 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 			position_ids=position_ids,
 			attention_mask=attention_mask,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			inputs_embeds=inputs_embeds,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,

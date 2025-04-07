@@ -343,6 +343,20 @@ class Gemma3Config(EasyDeLBaseConfig):
 		initializer_range: float = 0.02,
 		**kwargs,
 	):
+		"""Initialize a Gemma3Config instance.
+
+		Args:
+			text_config (Optional[Gemma3TextConfig], optional): The configuration for the text model component.
+			    If None is provided, a default Gemma3TextConfig will be used. Defaults to None.
+			vision_config (Optional[SiglipVisionConfig], optional): The configuration for the vision model component.
+			    If None is provided, a default SiglipVisionConfig will be used. Defaults to None.
+			mm_tokens_per_image (int, optional): Number of tokens per image embedding. Defaults to 256.
+			boi_token_index (int, optional): Begin-of-image token index to wrap the image prompt. Defaults to 255_999.
+			eoi_token_index (int, optional): End-of-image token index to wrap the image prompt. Defaults to 256_000.
+			image_token_index (int, optional): Image token index to encode the image prompt. Defaults to 262_144.
+			initializer_range (float, optional): Standard deviation for weight initialization. Defaults to 0.02.
+			**kwargs: Additional keyword arguments passed to the parent class constructor.
+		"""
 		if text_config is None:
 			text_config = Gemma3TextConfig()
 		elif isinstance(text_config, dict):
@@ -364,6 +378,12 @@ class Gemma3Config(EasyDeLBaseConfig):
 		super().__init__(**kwargs)
 
 	def get_partition_rules(self, *args, **kwargs):
+		"""Get the partition rules for the model.
+
+		Returns:
+			Tuple[Tuple[str, PartitionSpec]]: A tuple of tuples, where each inner tuple contains a regex pattern
+			matching parameter names and the corresponding PartitionSpec for sharding those parameters across devices.
+		"""
 		fsdpsp_over_tp = PartitionSpec(("fsdp", "sp"), "tp")
 		tp_over_fsdpsp = PartitionSpec("tp", ("fsdp", "sp"))
 		return (

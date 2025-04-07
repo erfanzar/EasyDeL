@@ -97,6 +97,34 @@ class GPTNeoXConfig(EasyDeLBaseConfig):
 		gradient_checkpointing=EasyDeLGradientCheckPointers.NONE,
 		**kwargs,
 	):
+		"""Initializes a GPTNeoXConfig object.
+
+		Args:
+		    vocab_size (int, optional): Vocabulary size. Defaults to 50432.
+		    hidden_size (int, optional): Hidden size. Defaults to 6144.
+		    num_hidden_layers (int, optional): Number of hidden layers. Defaults to 44.
+		    num_attention_heads (int, optional): Number of attention heads. Defaults to 64.
+		    intermediate_size (int, optional): Intermediate size. Defaults to 24576.
+		    hidden_act (str, optional): Activation function. Defaults to "gelu".
+		    rotary_pct (float, optional): Percentage of hidden dimensions for rotary embeddings. Defaults to 0.25.
+		    rotary_emb_base (int, optional): Base for rotary embeddings. Defaults to 10000.
+		    attention_dropout (float, optional): Attention dropout rate. Defaults to 0.0.
+		    hidden_dropout (float, optional): Hidden dropout rate. Defaults to 0.0.
+		    classifier_dropout (float, optional): Classifier dropout rate. Defaults to 0.1.
+		    max_position_embeddings (int, optional): Maximum position embeddings. Defaults to 2048.
+		    initializer_range (float, optional): Initializer range. Defaults to 0.02.
+		    layer_norm_eps (float, optional): Layer normalization epsilon. Defaults to 1e-5.
+		    use_cache (bool, optional): Whether to use KV cache. Defaults to True.
+		    bos_token_id (int, optional): Beginning-of-sequence token ID. Defaults to 0.
+		    eos_token_id (int, optional): End-of-sequence token ID. Defaults to 2.
+		    tie_word_embeddings (bool, optional): Whether to tie word embeddings. Defaults to False.
+		    use_parallel_residual (bool, optional): Whether to use parallel residual connections. Defaults to True.
+		    rope_scaling (dict, optional): RoPE scaling configuration. Defaults to None.
+		    attention_bias (bool, optional): Whether to use attention bias. Defaults to True.
+		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
+		        Defaults to EasyDeLGradientCheckPointers.NONE.
+		    **kwargs: Additional keyword arguments.
+		"""
 		self.vocab_size = vocab_size
 		self.max_position_embeddings = max_position_embeddings
 		self.hidden_size = hidden_size
@@ -123,9 +151,16 @@ class GPTNeoXConfig(EasyDeLBaseConfig):
 
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model.
+		Get the partition rules for the model. This method defines how the model's parameters are
+		partitioned across devices for distributed training and inference.
+
+		Args:
+		    *args: Additional positional arguments (unused).
+		    **kwargs: Additional keyword arguments (unused).
+
 		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: A tuple of partition rules, where each rule is a tuple
+		        containing a regex pattern for parameter names and the corresponding `PartitionSpec`.
 		"""
 		return (
 			("wte/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
@@ -146,10 +181,25 @@ class GPTNeoXConfig(EasyDeLBaseConfig):
 
 	@staticmethod
 	def get_mesh_names():
+		"""Returns the mesh names used for model parallelism. For GPT-NeoX, it returns mesh names for
+		data parallelism ('dp'), fully sharded data parallelism ('fsdp'), tensor parallelism ('tp'),
+		and sequence parallelism ('sp').
+
+		Returns:
+		    tuple: A tuple containing the mesh names ("dp", "fsdp", "tp", "sp").
+		"""
 		return "dp", "fsdp", "tp", "sp"
 
 	def attach_custom_arguments(
 		self,
 		**kwargs,
 	):
+		"""Attaches custom arguments to the configuration object.
+
+		This method allows adding or overriding configuration attributes dynamically.
+		It primarily sets the `from_pt` attribute to False and ignores other keyword arguments.
+
+		Args:
+		    **kwargs: Additional keyword arguments (ignored).
+		"""
 		self.from_pt = False

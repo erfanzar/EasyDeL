@@ -46,6 +46,19 @@ from .stablelm_configuration import StableLmConfig
 
 
 class StableLmMLP(nn.Module):
+	"""Multi-Layer Perceptron (MLP) block for the StableLM model.
+
+	Attributes:
+	    config (StableLmConfig): Configuration object for the model.
+	    gate_proj (ParallelLinear): Linear layer for the gating mechanism.
+	    down_proj (ParallelLinear): Linear layer for down-projection.
+	    up_proj (ParallelLinear): Linear layer for up-projection.
+	    act_fn (callable): Activation function (specified in config).
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+	"""
+
 	def __init__(
 		self,
 		config: StableLmConfig,
@@ -55,6 +68,15 @@ class StableLmMLP(nn.Module):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the StableLmMLP module.
+
+		Args:
+		    config (StableLmConfig): The configuration object for the model.
+		    dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+		    param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		self.config = config
 		self.dtype = dtype
 		self.param_dtype = param_dtype
@@ -87,6 +109,14 @@ class StableLmMLP(nn.Module):
 		self.act_fn = ACT2FN[config.hidden_act]
 
 	def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
+		"""Forward pass of the MLP block.
+
+		Args:
+		    hidden_states (jnp.ndarray): Input hidden states.
+
+		Returns:
+		    jnp.ndarray: Output hidden states after MLP transformation.
+		"""
 		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
 
 		return self.down_proj(
@@ -95,6 +125,12 @@ class StableLmMLP(nn.Module):
 
 
 class StableLmLayerNormPerHead(nn.Module):
+	"""Applies Layer Normalization independently to each attention head's dimension.
+
+	Attributes:
+	    norms (list[nn.LayerNorm]): List of LayerNorm modules, one per head.
+	"""
+
 	def __init__(
 		self,
 		head_dim: int,
@@ -106,6 +142,17 @@ class StableLmLayerNormPerHead(nn.Module):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the StableLmLayerNormPerHead module.
+
+		Args:
+		    head_dim (int): The dimension of each attention head.
+		    num_heads (int): The number of attention heads.
+		    eps (float): Epsilon value for LayerNorm (default: 1e-5).
+		    bias (bool): Whether to include bias in LayerNorm (default: False).
+		    dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+		    param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		self.norms = [
 			nn.LayerNorm(
 				head_dim,
@@ -119,6 +166,16 @@ class StableLmLayerNormPerHead(nn.Module):
 		]
 
 	def __call__(self, hidden_states):
+		"""Applies LayerNorm per head.
+
+		Args:
+		    hidden_states (chex.Array): Input hidden states, expected shape (..., num_heads * head_dim).
+
+		Returns:
+		    chex.Array: Hidden states after applying LayerNorm per head, same shape as input.
+		"""
+		# hidden_states: [batch, seq_len, num_heads * head_dim]
+		# Reshape to [batch, seq_len, num_heads, head_dim]
 		states_per_heads = jnp.split(hidden_states, 1, axis=1)
 		# Normalize and merge the heads back together
 		return jnp.concatenate(
@@ -130,6 +187,34 @@ class StableLmLayerNormPerHead(nn.Module):
 
 
 class StableLmAttention(AttentionModule):
+	"""StableLM Attention module with Rotary Position Embeddings and optional LayerNorm on QK.
+
+	Attributes:
+	    config (StableLmConfig): Configuration object for the model.
+	    hidden_size (int): Dimensionality of the hidden states.
+	    num_heads (int): Number of attention heads.
+	    head_dim (int): Dimensionality of each attention head.
+	    num_key_value_heads (int): Number of key/value heads (for GQA).
+	    num_key_value_groups (int): Number of query heads per key/value head.
+	    max_position_embeddings (int): Maximum sequence length.
+	    rope_theta (float): Base value for RoPE.
+	    partial_rotary_factor (float): Factor determining the portion of head dimension subject to RoPE.
+	    q_proj (ParallelLinear): Linear layer for query projection.
+	    k_proj (ParallelLinear): Linear layer for key projection.
+	    v_proj (ParallelLinear): Linear layer for value projection.
+	    o_proj (ParallelLinear): Linear layer for output projection.
+	    rotary_emb_dim (int): Dimensionality of the rotary embeddings.
+	    attention_performer (FlexibleAttentionModule): Module for performing attention computation.
+	    qk_layernorm (bool): Whether to apply LayerNorm to query and key states.
+	    q_layernorm (StableLmLayerNormPerHead): LayerNorm for query states (if qk_layernorm is True).
+	    k_layernorm (StableLmLayerNormPerHead): LayerNorm for key states (if qk_layernorm is True).
+	    rotary (RotaryEmbedding): Rotary positional embedding module.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+	    rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: StableLmConfig,
@@ -139,6 +224,15 @@ class StableLmAttention(AttentionModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the StableLmAttention module.
+
+		Args:
+		    config (StableLmConfig): The configuration object for the model.
+		    dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+		    param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__(config=config)
 		self.dtype = dtype
 		self.param_dtype = param_dtype
@@ -238,6 +332,24 @@ class StableLmAttention(AttentionModule):
 		fcm_mask: tp.Optional[chex.Array] = None,
 		frequencies: tp.Optional[chex.Array] = None,
 	):
+		"""Forward pass of the attention module.
+
+		Args:
+		    hidden_states (chex.Array): Input hidden states (batch, seq_len, hidden_size).
+		    attention_mask (chex.Array): Mask to apply on the attention scores (batch, 1, seq_len, kv_seq_len).
+		    position_ids (chex.Array): Position indices for the tokens (batch, seq_len).
+		    causal_mask (tp.Optional[chex.Array | bool]): Causal mask for ensuring autoregressive behavior.
+		    cache_view (tp.Optional[TransformerCacheView | PagedAttentionCacheView]): Cache view for key/value states (optional).
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention (optional).
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+		    output_attentions (bool): If True, outputs attention weights alongside the hidden states (default: False).
+		    fcm_mask (tp.Optional[chex.Array]): Forward causal mask (FCM) mask (optional).
+		    frequencies (tp.Optional[chex.Array]): Precomputed rotary frequencies (optional).
+
+		Returns:
+		    tp.Tuple[chex.Array, chex.Array | None]: A tuple containing the attention output (batch, seq_len, hidden_size)
+		        and optionally the attention weights (batch, num_heads, seq_len, kv_seq_len).
+		"""
 		batch_size, sequence_length = hidden_states.shape[:2]
 		query_states, key_states, value_states = (
 			self.q_proj(hidden_states),
@@ -321,6 +433,24 @@ class StableLmAttention(AttentionModule):
 
 
 class StableLmDecoderLayer(nn.Module):
+	"""A single decoder layer for the StableLM model.
+
+	This layer combines self-attention, MLP, and residual connections with layer normalization.
+	It supports parallel residual connections.
+
+	Attributes:
+	    config (StableLmConfig): Configuration object for the model.
+	    self_attn (StableLmAttention): Self-attention module.
+	    mlp (StableLmMLP): MLP module.
+	    input_layernorm (nn.LayerNorm): Layer normalization applied before self-attention.
+	    post_attention_layernorm (nn.LayerNorm): Layer normalization applied after self-attention and before the MLP.
+	    dropout_rng_key (str): Name of the RNG key for dropout.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+	    rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: StableLmConfig,
@@ -330,6 +460,15 @@ class StableLmDecoderLayer(nn.Module):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the StableLmDecoderLayer module.
+
+		Args:
+		    config (StableLmConfig): The configuration object for the model.
+		    dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+		    param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		self.config = config
 		self.dtype = dtype
 		self.param_dtype = param_dtype
@@ -386,6 +525,29 @@ class StableLmDecoderLayer(nn.Module):
 		fcm_mask: tp.Optional[chex.Array] = None,
 		frequencies: tp.Optional[chex.Array] = None,
 	):
+		"""Forward pass of the decoder layer.
+
+		Args:
+		    hidden_states (chex.Array): Input hidden states (batch, seq_len, hidden_size).
+		    attention_mask (chex.Array): Attention mask (batch, 1, seq_len, kv_seq_len).
+		    position_ids (chex.Array): Position IDs (batch, seq_len).
+		    causal_mask (tp.Optional[chex.Array | bool]): Causal mask for autoregressive behavior.
+		    cache_view (tp.Optional[TransformerCacheView | PagedAttentionCacheView]): Cache view for key/value states (optional).
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention (optional).
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+		    output_attentions (bool): Whether to output attention weights (default: False).
+		    fcm_mask (tp.Optional[chex.Array]): Forward causal mask (FCM) mask (optional).
+		    frequencies (tp.Optional[chex.Array]): Precomputed rotary frequencies (optional).
+
+		Returns:
+		    tp.Tuple[chex.Array, chex.Array | None]: A tuple containing:
+		        - hidden_states (chex.Array): Output hidden states after the decoder layer.
+		        - attention_outputs (chex.Array | None): Attention weights (if `output_attentions` is True).
+		"""
+		assert hidden_states.ndim == 3, (
+			f"Input hidden_states should be 3 dimensions, got {hidden_states.ndim}"
+		)
+
 		residual = hidden_states
 		hidden_states = self.input_layernorm(hidden_states)
 		attn_out = self.self_attn(
@@ -440,6 +602,23 @@ class StableLmDecoderLayer(nn.Module):
 	model_type="stablelm",
 )
 class StableLmModel(EasyDeLBaseModule):
+	"""The base StableLM transformer model.
+
+	This class implements the core transformer architecture, including embedding layers,
+	decoder layers, and final normalization.
+
+	Attributes:
+	    config (StableLmConfig): Configuration object for the model.
+	    embed_tokens (nn.Embed): Embedding layer for input tokens.
+	    layers (nn.List[StableLmDecoderLayer]): List of decoder layers.
+	    norm (nn.LayerNorm): Final layer normalization.
+	    gradient_checkpointing (str): Gradient checkpointing strategy.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+	    rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: StableLmConfig,
@@ -449,6 +628,15 @@ class StableLmModel(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the StableLmModel module.
+
+		Args:
+		    config (StableLmConfig): The configuration object for the model.
+		    dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+		    param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -488,6 +676,7 @@ class StableLmModel(EasyDeLBaseModule):
 
 	@cached_property
 	def frequencies(self):
+		"""Cached property for precomputed rotary frequencies."""
 		rotary_emb_dim = int(
 			self.config.partial_rotary_factor
 			* (self.config.hidden_size // self.config.num_attention_heads)
@@ -510,23 +699,25 @@ class StableLmModel(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
 	) -> tp.Union[BaseModelOutput, tp.Tuple]:
-		"""
-		Forward pass through the StableLm module.
+		"""Forward pass of the StableLM model.
 
 		Args:
-		    input_ids (chex.Array): Input tensor containing token IDs.
-		    attention_mask (chex.Array): Mask for attention.
-		    position_ids (chex.Array): Positional indices.
-		    segment_ids (tp.Optional[chex.Array]): Segment IDs for different input parts.
-		    inputs_embeds (tp.Optional[chex.Array]): Embedded input tensor.
-		    output_attentions (tp.Optional[bool]): If True, output attention weights.
-		    output_hidden_states (tp.Optional[bool]): If True, output hidden states.
-		    init_cache (bool): If True, initialize cache for decoding.
-		    deterministic (bool): If True, disable dropout.
-		    return_dict (bool): If True, return a dictionary of outputs.
+		    input_ids (tp.Optional[chex.Array]): Input token IDs (batch, seq_len). Mutually exclusive with `inputs_embeds`.
+		    inputs_embeds (tp.Optional[chex.Array]): Input embeddings (batch, seq_len, hidden_size). Mutually exclusive with `input_ids`.
+		    attention_mask (tp.Optional[chex.Array]): Attention mask (batch, seq_len). Usually used for padding tokens.
+		    position_ids (tp.Optional[chex.Array]): Position IDs (batch, seq_len). If None, automatically generated.
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+		    output_attentions (tp.Optional[bool]): Whether to output attention weights (default defined by config).
+		    output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all layers (default defined by config).
+		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for caching.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention (optional).
+		    return_dict (bool): Whether to return a `BaseModelOutput` object or a tuple (default: True).
 
 		Returns:
-		    BaseModelOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
+		    tp.Union[BaseModelOutput, tp.Tuple]: The model output, either as a `BaseModelOutput` object or a tuple.
+
+		Raises:
+		    ValueError: If both `input_ids` and `inputs_embeds` are provided or neither is provided.
 		"""
 		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
@@ -600,6 +791,21 @@ class StableLmModel(EasyDeLBaseModule):
 	model_type="stablelm",
 )
 class StableLmForCausalLM(EasyDeLBaseModule):
+	"""StableLM model with a Causal Language Modeling (CLM) head.
+
+	This class wraps the base `StableLmModel` and adds a linear layer (language model head)
+	to predict the next token logits.
+
+	Attributes:
+	    config (StableLmConfig): Configuration object for the model.
+	    model (StableLmModel): The base StableLM model.
+	    lm_head (ParallelLinear): The language model head (linear layer).
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for matrix multiplications.
+	    rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: StableLmConfig,
@@ -609,6 +815,15 @@ class StableLmForCausalLM(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the StableLmForCausalLM module.
+
+		Args:
+		    config (StableLmConfig): The configuration object for the model.
+		    dtype (jnp.dtype): Data type for computations (default: jnp.float32).
+		    param_dtype (jnp.dtype): Data type for parameters (default: jnp.float32).
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations (default: None).
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -648,6 +863,23 @@ class StableLmForCausalLM(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		return_dict: bool = True,
 	) -> tp.Union[CausalLMOutput, tp.Tuple]:
+		"""Forward pass of the StableLM model for Causal Language Modeling.
+
+		Args:
+		    input_ids (tp.Optional[chex.Array]): Input token IDs (batch, seq_len). Mutually exclusive with `inputs_embeds`.
+		    inputs_embeds (tp.Optional[chex.Array]): Input embeddings (batch, seq_len, hidden_size). Mutually exclusive with `input_ids`.
+		    attention_mask (tp.Optional[chex.Array]): Attention mask (batch, seq_len). Usually used for padding tokens.
+		    position_ids (tp.Optional[chex.Array]): Position IDs (batch, seq_len). If None, automatically generated.
+		    segment_ids (tp.Optional[chex.Array]): Segment IDs for segment-based attention (optional).
+		    output_attentions (tp.Optional[bool]): Whether to output attention weights (default defined by config).
+		    output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all layers (default defined by config).
+		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for caching.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention (optional).
+		    return_dict (bool): Whether to return a `CausalLMOutput` object or a tuple (default: True).
+
+		Returns:
+		    tp.Union[CausalLMOutput, tp.Tuple]: The model output, including logits, hidden states, and attentions.
+		"""
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,

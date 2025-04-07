@@ -17,24 +17,23 @@
 
 import time
 import typing as tp
-import warnings  # noqa: F401
 
 import jax
+from eformer.jaximus import implicit
 from jax import numpy as jnp
+
+from ..utilities import SamplingParams
+from .utilities import (
+	SampleState,
+	create_sampling_step,
+	vInferenceConfig,
+	vInferencePreCompileConfig,
+)
 
 if tp.TYPE_CHECKING:
 	from easydel.infra import EasyDeLBaseModule
 else:
 	EasyDeLBaseModule = object
-from eformer.jaximus import implicit
-
-from ..utilities import (
-	SampleState,
-	create_sampling_step,
-	vInferenceConfig,
-	vInferencePreCompileConfig,
-	SamplingParams,
-)
 
 
 def measure_flops(func, *args, **kwargs):

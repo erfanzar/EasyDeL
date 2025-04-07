@@ -1,17 +1,18 @@
 EasyDeL 🔮
 ==========
-EasyDeL is an open-source framework designed to enhance and streamline the training process of machine learning models, with a primary focus on Jax/Flax. It provides convenient and effective solutions for training and serving Flax/Jax models on TPU/GPU at scale.
+EasyDeL is an open-source framework designed to enhance and streamline the training process of machine learning models, with a primary focus on Jax/Flax. Built on modern Flax NNX, it provides convenient and effective solutions for training and serving Flax/Jax models on TPU/GPU at scale.
 
 Key Features
 ============
 
-- **Diverse Architecture Support**: Seamlessly work with various model architectures including Transformers, Mamba, RWKV, and more.
-- **Diverse Model Support**: Implements a wide range of models that never been implement before in JAX.
-- **Advanced Trainers**: Offers specialized trainers like DPOTrainer, ORPOTrainer, SFTTrainer, and VideoCLM Trainer.
-- **Serving and API Engines**: Provides engines for efficiently serving large language models (LLMs) in JAX.
-- **Quantization and Bit Operations**: Supports various quantization methods and 8, 6, and 4-bit operations for optimized inference and training.
-- **Performance Optimization**: Integrates FlashAttention, RingAttention, and other performance-enhancing features.
-- **Model Conversion**: Supports automatic conversion between JAX-EasyDeL and PyTorch-HF models.
+- **Modern Architecture**: Built on Flax NNX for better integration, modularity, and performance
+- **Diverse Model Support**: Seamlessly support for Transformers, Mamba, RWKV, Vision Models and more
+- **Advanced Trainers**: Specialized trainers like DPOTrainer, ORPOTrainer, SFTTrainer, and VideoCLM Trainer
+- **Vision Model Support**: Comprehensive support for vision-to-vision tasks, image-text-to-image generation, and image-to-text processing
+- **Production-Ready Serving**: Includes vInference engine for efficient LLM inference and API endpoints compatible with OpenAI standards
+- **Quantization and Bit Operations**: Supports various quantization methods including NF4, A8BIT, A8Q, and A4Q for optimized inference and training
+- **Performance Optimization**: Integrates FlashAttention, RingAttention, and other performance-enhancing features
+- **Model Conversion**: Supports automatic conversion between JAX-EasyDeL and PyTorch-HF models
 
 
 Fully Customizable and Hackable 🛠️
@@ -32,6 +33,10 @@ Advanced Customization and Optimization 🔧
 
 EasyDeL provides unparalleled flexibility in customizing and optimizing your models:
 
+- **Custom Module System**: Built on Flax NNX, allowing easy creation and integration of custom modules
+- **Transparent Architecture**: Every component is open for inspection and modification
+- **Dynamic Configuration**: Easily customize model architecture, training pipeline, and inference settings
+
 - **Sharding Strategies**: Easily customize and experiment with different sharding strategies to optimize performance across multiple devices.
 - **Algorithm Customization**: Modify and fine-tune algorithms to suit your specific needs and hardware configurations.
 - **Attention Mechanisms**: Choose from over 10 types of attention mechanisms optimized for GPU/TPU/CPU, including:
@@ -42,6 +47,19 @@ EasyDeL provides unparalleled flexibility in customizing and optimizing your mod
   - SDPA (CPU(*XLA*), GPU(*CUDA*), TPU(*XLA*)) 
 
 This level of customization allows you to squeeze every ounce of performance from your hardware while tailoring the model behavior to your exact requirements.
+
+
+Inference and Serving Solutions
+===============================
+
+EasyDeL provides powerful, production-ready serving solutions:
+
+- **vInference Engine**: Optimized for efficient inference of large language models
+- **vInference API Server**: Provides OpenAI-compatible endpoints for easy integration
+- **vWhisper Inference**: Specialized inference engine for audio transcription and translation
+- **Multimodal Support**: Process text, images, and audio with unified APIs
+- **Streaming Generation**: Optimized for low-latency response streaming
+- **Quantization Options**: Multiple precision options for optimal performance/quality trade-offs
 
 
 Future Updates and Vision 🚀
@@ -90,6 +108,33 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
 
     api_docs/apis
 
+.. toctree::
+    :hidden:
+    :maxdepth: 1
+    :caption: Inference Engines
+
+    whisper_api.md
+    vinference_api.md
+
+.. toctree::
+    :hidden:
+    :maxdepth: 1
+    :caption: Trainers
+
+    trainers/dpo.md
+    trainers/grpo.md
+    trainers/orpo.md
+    trainers/sft.md
+    trainers/reward.md
+
+.. toctree::
+    :hidden:
+    :maxdepth: 1
+    :caption: Multimodality
+
+    multimodality/vision_language.md
+    multimodality/audio_language.md
+    multimodality/inference.md
 
 .. toctree::
     :hidden:

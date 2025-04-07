@@ -47,6 +47,21 @@ from .mosaic_configuration import MptConfig as MptConfig
 
 
 class MptMLP(nn.Module):
+	"""MPT MLP module.
+
+	This module implements the feed-forward network (MLP) used in the MPT model.
+	It consists of an up-projection, GELU activation, and a down-projection, followed by dropout.
+
+	Attributes:
+	    config (MptConfig): Configuration object for the model.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    up_proj (ParallelLinear): Linear layer for up-projection.
+	    down_proj (ParallelLinear): Linear layer for down-projection.
+	    hidden_dropout (nn.Dropout): Dropout layer applied to the output.
+	"""
+
 	def __init__(
 		self,
 		config: MptConfig,
@@ -56,6 +71,15 @@ class MptMLP(nn.Module):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the MptMLP module.
+
+		Args:
+		    config (MptConfig): The configuration object for the MPT model.
+		    dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		self.config = config
 		linear_class = partial(
 			ParallelLinear,
@@ -90,6 +114,28 @@ class MptMLP(nn.Module):
 
 
 class MptAttention(AttentionModule):
+	"""MPT Attention module.
+
+	This module implements the multi-head attention mechanism used in the MPT model.
+	It supports ALiBi positional bias and allows for different attention implementations.
+
+	Attributes:
+	    config (MptConfig): Configuration object for the model.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    rngs (nn.Rngs): Random number generators.
+	    hidden_size (int): Dimensionality of the hidden states.
+	    Wqkv (ParallelLinear): Combined linear layer for query, key, and value projections.
+	    out_proj (ParallelLinear): Linear layer for the output projection.
+	    dropout (nn.Dropout): Dropout layer applied after the output projection.
+	    n_heads (int): Number of attention heads.
+	    max_seq_length (int): Maximum sequence length supported.
+	    head_dim (int): Dimensionality of each attention head.
+	    softmax_scale (float): Scale factor for the softmax function.
+	    attention_performer (FlexibleAttentionModule): Module to perform the core attention computation.
+	"""
+
 	def __init__(
 		self,
 		config: MptConfig,
@@ -99,6 +145,15 @@ class MptAttention(AttentionModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the MptAttention module.
+
+		Args:
+		    config (MptConfig): The configuration object for the MPT model.
+		    dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__(config=config)
 		self.dtype = dtype
 		self.param_dtype = param_dtype
@@ -237,6 +292,25 @@ class MptAttention(AttentionModule):
 
 
 class MptBlock(nn.Module):
+	"""MPT Transformer block.
+
+	This module represents a single transformer block in the MPT model,
+	containing self-attention and MLP sub-layers with residual connections
+	and layer normalization. It utilizes ALiBi for positional information.
+
+	Attributes:
+	    config (MptConfig): Configuration object for the model.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    rngs (nn.Rngs): Random number generators.
+	    norm_1 (nn.LayerNorm): Layer normalization before the attention layer.
+	    attn (MptAttention): The self-attention module.
+	    norm_2 (nn.LayerNorm): Layer normalization before the MLP layer.
+	    ffn (MptMLP): The feed-forward (MLP) module.
+	    resid_attn_dropout (nn.Dropout): Dropout applied after the attention layer's residual connection.
+	"""
+
 	def __init__(
 		self,
 		config: MptConfig,
@@ -246,6 +320,15 @@ class MptBlock(nn.Module):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the MptBlock module.
+
+		Args:
+		    config (MptConfig): The configuration object for the MPT model.
+		    dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		self.config = config
 		self.dtype = dtype
 		self.param_dtype = param_dtype
@@ -328,6 +411,20 @@ class MptBlock(nn.Module):
 
 
 def build_mpt_alibi_tensor(num_heads, sequence_length, alibi_bias_max=8):
+	"""Builds the ALiBi tensor for MPT models.
+
+	ALiBi (Attention with Linear Biases) is a method to incorporate positional information
+	into transformer models without explicit position embeddings. It adds a bias to the
+	attention scores based on the distance between query and key positions.
+
+	Args:
+	    num_heads (int): The number of attention heads.
+	    sequence_length (int): The length of the sequence.
+	    alibi_bias_max (int, optional): The maximum bias value allowed by ALiBi. Defaults to 8.
+
+	Returns:
+	    chex.Array: The ALiBi tensor of shape (1, num_heads, sequence_length, sequence_length).
+	"""
 	alibi = jnp.arange(
 		1 - sequence_length,
 		1,
@@ -366,6 +463,25 @@ def build_mpt_alibi_tensor(num_heads, sequence_length, alibi_bias_max=8):
 	model_type="mpt",
 )
 class MptModel(EasyDeLBaseModule):
+	"""MPT model implementation.
+
+	This class implements the main MPT transformer model architecture, consisting of
+	an embedding layer (token and optional positional), multiple MptBlock layers,
+	and a final layer normalization.
+
+	Attributes:
+	    config (MptConfig): Configuration object for the model.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    rngs (nn.Rngs): Random number generators.
+	    wte (nn.Embed): Token embedding layer.
+	    emb_drop (nn.Dropout): Dropout layer applied after embeddings.
+	    blocks (tp.List[MptBlock]): List of transformer blocks.
+	    norm_f (nn.LayerNorm): Final layer normalization.
+	    alibi (chex.Array, optional): Precomputed ALiBi tensor if using ALiBi.
+	"""
+
 	def __init__(
 		self,
 		config: MptConfig,
@@ -375,6 +491,15 @@ class MptModel(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the MptModel.
+
+		Args:
+		    config (MptConfig): The configuration object for the MPT model.
+		    dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -495,6 +620,23 @@ class MptModel(EasyDeLBaseModule):
 	model_type="mpt",
 )
 class MptForCausalLM(EasyDeLBaseModule):
+	"""MPT model with a language modeling head.
+
+	This model extends the base MptModel by adding a linear layer (lm_head)
+	on top to predict the next token in a sequence, making it suitable for causal
+	language modeling tasks.
+
+	Attributes:
+	    config (MptConfig): Configuration object for the model.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    rngs (nn.Rngs): Random number generators.
+	    transformer (MptModel): The core MPT transformer model.
+	    lm_head (ParallelLinear, optional): The language modeling head. If `use_lm_head`
+	        in the config is True (tying embeddings), this will be None.
+	"""
+
 	def __init__(
 		self,
 		config: MptConfig,
@@ -504,6 +646,15 @@ class MptForCausalLM(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the MptForCausalLM model.
+
+		Args:
+		    config (MptConfig): The configuration object for the MPT model.
+		    dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		    precision (jax.lax.PrecisionLike): Precision setting for JAX operations. Defaults to None.
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		super().__init__(
 			config=config,
 			dtype=dtype,
@@ -542,7 +693,6 @@ class MptForCausalLM(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		return_dict: bool = True,
-		**kwargs,
 	) -> tp.Union[BaseModelOutput, tp.Tuple]:
 		outputs: BaseModelOutput = self.transformer(
 			input_ids=input_ids,
@@ -550,6 +700,7 @@ class MptForCausalLM(EasyDeLBaseModule):
 			segment_ids=segment_ids,
 			inputs_embeds=inputs_embeds,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			output_hidden_states=output_hidden_states,
 			output_attentions=output_attentions,
 			return_dict=True,

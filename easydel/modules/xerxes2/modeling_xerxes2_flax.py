@@ -232,12 +232,7 @@ class Xerxes2Attention(AttentionModule):
 			self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
 		)
 
-		outputs = (
-			(attn_output, attentions.attention_weights)
-			if output_attentions
-			else (attn_output, None)
-		)
-		return outputs
+		return attn_output, attentions.attention_weights
 
 
 class Xerxes2MLP(nn.Module):
@@ -504,7 +499,7 @@ class Xerxes2Model(EasyDeLBaseModule):
 			all_hidden_states += (hidden_states,)
 			outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
 		else:
-			outputs = (hidden_states, all_attentions)
+			outputs = (hidden_states, all_attentions, past_key_values)
 
 		if not return_dict:
 			return tuple(v for v in outputs if v is not None)

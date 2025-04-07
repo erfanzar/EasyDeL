@@ -154,3 +154,49 @@ class MiniMaxText01Config(EasyDeLBaseConfig):
 			tie_word_embeddings=tie_word_embeddings,
 			**kwargs,
 		)
+
+	def get_partition_rules(self, *args, **kwargs):
+		"""
+		Get the partition rules for distributing the MiniMaxText01 model parameters across multiple devices.
+
+		These rules define how parameters should be partitioned when using techniques like
+		Fully Sharded Data Parallelism (FSDP), Sharded Parallelism (SP), and Tensor Parallelism (TP).
+		Each rule consists of a regex pattern matching parameter names and a corresponding PartitionSpec.
+
+		Returns:
+		    tuple: A tuple of tuples where each inner tuple contains:
+		        - A regex pattern matching parameter names
+		        - A PartitionSpec object specifying how to partition matching parameters
+		"""
+		from jax.sharding import PartitionSpec
+
+		return (
+			# Embeddings
+			("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
+			# Attention layers
+			("model/layers/.*/self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("model/layers/.*/self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("model/layers/.*/self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
+			("model/layers/.*/self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			# MoE layers
+			(
+				"model/layers/.*/block_sparse_moe/experts/.*/w[13]/kernel",
+				PartitionSpec(("fsdp", "sp"), "tp"),
+			),
+			(
+				"model/layers/.*/block_sparse_moe/experts/.*/w[24]/kernel",
+				PartitionSpec("tp", ("fsdp", "sp")),
+			),
+			(
+				"model/layers/.*/block_sparse_moe/gate/kernel",
+				PartitionSpec(("fsdp", "sp"), None),
+			),
+			# Normalization
+			("model/norm/kernel", PartitionSpec(None)),
+			("model/layers/.*/input_layernorm/kernel", PartitionSpec(None)),
+			("model/layers/.*/post_attention_layernorm/kernel", PartitionSpec(None)),
+			# LM head
+			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
+			# Catch-all
+			(".*", PartitionSpec(None)),
+		)

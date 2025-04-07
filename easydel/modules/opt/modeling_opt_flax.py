@@ -58,6 +58,29 @@ from .opt_configuration import OPTConfig
 
 
 class OPTAttention(AttentionModule):
+	"""OPT Attention mechanism module.
+
+	This module implements the multi-head self-attention mechanism used in the OPT model.
+
+	Attributes:
+	    config (OPTConfig): Configuration object for the model.
+	    embed_dim (int): The dimensionality of the embedding layer.
+	    num_heads (int): The number of attention heads.
+	    dropout (float): Dropout probability for the attention scores.
+	    causal (bool): Whether to use causal masking.
+	    bias (bool): Whether to include bias in the linear projections.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    head_dim (int): Dimensionality of each attention head.
+	    q_proj (ParallelLinear): Linear layer for query projection.
+	    k_proj (ParallelLinear): Linear layer for key projection.
+	    v_proj (ParallelLinear): Linear layer for value projection.
+	    out_proj (ParallelLinear): Linear layer for the output projection.
+	    dropout_layer (nn.Dropout): Dropout layer applied after attention.
+	    attention_module (AttentionModule): The core attention computation module.
+	"""
+
 	def __init__(
 		self,
 		config: OPTConfig,
@@ -72,6 +95,23 @@ class OPTAttention(AttentionModule):
 		*,
 		rngs: nn.Rngs,
 	) -> None:
+		"""Initializes the OPTAttention module.
+
+		Args:
+		    config (OPTConfig): The configuration object for the OPT model.
+		    embed_dim (int): Dimensionality of the input embeddings.
+		    num_heads (int): Number of attention heads.
+		    dropout (float, optional): Dropout rate for the attention scores. Defaults to 0.0.
+		    causal (bool, optional): Whether to apply causal masking. Defaults to False.
+		    bias (bool, optional): Whether to use bias in linear projections. Defaults to True.
+		    dtype (jnp.dtype, optional): Data type for computation. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
+		    precision (jax.lax.PrecisionLike, optional): Precision setting for JAX operations. Defaults to None.
+		    rngs (nn.Rngs): Random number generators.
+
+		Raises:
+		    ValueError: If `embed_dim` is not divisible by `num_heads`.
+		"""
 		super().__init__()
 
 		self.config = config
@@ -124,11 +164,13 @@ class OPTAttention(AttentionModule):
 		)
 
 	def _split_heads(self, hidden_states):
+		"""Splits the hidden states into multiple heads."""
 		return hidden_states.reshape(
 			hidden_states.shape[:2] + (self.num_heads, self.head_dim)
 		)
 
 	def _merge_heads(self, hidden_states):
+		"""Merges the attention heads back into a single hidden state tensor."""
 		return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
 
 	def __call__(
@@ -140,6 +182,23 @@ class OPTAttention(AttentionModule):
 		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 	) -> tp.Tuple[chex.Array]:
+		"""Forward pass of the OPTAttention module.
+
+		Args:
+		    hidden_states (chex.Array): Input hidden states. Shape: (batch_size, sequence_length, embed_dim).
+		    causal_mask (tp.Optional[chex.Array]): Causal mask for attention. Shape: (1, 1, query_len, key_len) or inferred.
+		    key_value_states (tp.Optional[chex.Array]): Optional hidden states for cross-attention. If provided,
+		        these are used as keys and values. Shape: (batch_size, key_sequence_length, embed_dim).
+		    attention_mask (tp.Optional[chex.Array]): Mask to prevent attention to certain positions.
+		        Shape: (batch_size, 1, query_length, key_length).
+		    cache_view (tp.Optional[TransformerCacheView | PagedAttentionCacheView]): Cache view for attention KVs.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+
+		Returns:
+		    tp.Tuple[chex.Array]: A tuple containing the attention output (shape: batch_size, sequence_length, embed_dim)
+		        and the attention weights (shape: batch_size, num_heads, sequence_length, key_sequence_length).
+		        Attention weights are returned only if `output_attentions` is True in the base attention module.
+		"""
 		is_cross_attention = key_value_states is not None
 		batch_size, sequence_length = hidden_states.shape[:2]
 		query_states = self.q_proj(hidden_states)
@@ -206,6 +265,28 @@ class OPTAttention(AttentionModule):
 
 
 class OPTDecoderLayer(nn.Module):
+	"""OPT Decoder Layer.
+
+	This module represents a single layer in the OPT decoder stack.
+	It consists of a self-attention mechanism, optional layer normalization,
+	a feed-forward network (FFN), and residual connections.
+
+	Attributes:
+	    config (OPTConfig): Configuration object for the model.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    embed_dim (int): Dimensionality of the embedding layer.
+	    self_attn (OPTAttention): The self-attention module.
+	    do_layer_norm_before (bool): Whether to apply layer normalization before the attention/FFN blocks.
+	    dropout_layer (nn.Dropout): Dropout layer applied to the hidden states.
+	    activation_fn (callable): The activation function used in the FFN.
+	    self_attn_layer_norm (nn.LayerNorm): Layer normalization applied before the self-attention module.
+	    fc1 (ParallelLinear): The first linear layer of the FFN.
+	    fc2 (ParallelLinear): The second linear layer (output) of the FFN.
+	    final_layer_norm (nn.LayerNorm): Layer normalization applied before the FFN module.
+	"""
+
 	def __init__(
 		self,
 		config: OPTConfig,
@@ -278,6 +359,22 @@ class OPTDecoderLayer(nn.Module):
 		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 	) -> tp.Tuple[chex.Array]:
+		"""Forward pass of the OPTDecoderLayer.
+
+		Args:
+		    hidden_states (chex.Array): Input hidden states. Shape: (batch_size, sequence_length, embed_dim).
+		    causal_mask (tp.Optional[chex.Array]): Causal mask for self-attention.
+		        Shape: (1, 1, query_len, key_len) or inferred.
+		    attention_mask (tp.Optional[chex.Array]): Mask to prevent attention to certain positions.
+		        Shape: (batch_size, 1, query_length, key_length).
+		    cache_view (tp.Optional[TransformerCacheView | PagedAttentionCacheView]): Cache view for attention KVs.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+
+		Returns:
+		    tp.Tuple[chex.Array]: A tuple containing the output hidden states (shape: batch_size, sequence_length, embed_dim)
+		        and the attention weights (shape: batch_size, num_heads, sequence_length, key_sequence_length).
+		        Attention weights are returned only if `output_attentions` is True in the base attention module.
+		"""
 		residual = hidden_states
 
 		# 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
@@ -323,6 +420,15 @@ class OPTDecoderLayer(nn.Module):
 
 
 class OPTLearnedPositionalEmbedding(nn.Embed):
+	"""Learned positional embedding for OPT.
+
+	This module learns positional embeddings up to a maximum specified length.
+	It includes an offset, typically used to account for padding tokens.
+
+	Attributes:
+	    offset (int): The offset added to position IDs before embedding lookup.
+	"""
+
 	def __init__(
 		self,
 		num_embeddings: int,
@@ -334,6 +440,18 @@ class OPTLearnedPositionalEmbedding(nn.Embed):
 		embedding_init=None,
 		rngs: nn.Rngs,
 	):
+		"""Initializes the OPTLearnedPositionalEmbedding module.
+
+		Args:
+		    num_embeddings (int): The maximum number of positions to embed (vocabulary size).
+		    features (int): The dimensionality of the embedding vectors.
+		    offset (int, optional): The offset added to position IDs. Defaults to 2.
+		    dtype (tp.Optional[jnp.dtype], optional): Data type for the embeddings. Defaults to None.
+		    param_dtype (jnp.dtype, optional): Data type for the parameters. Defaults to jnp.float32.
+		    embedding_init (callable, optional): Initializer function for the embeddings.
+		        Defaults to `jax.nn.initializers.normal(stddev=1.0)`.
+		    rngs (nn.Rngs): Random number generators.
+		"""
 		if embedding_init is None:
 			embedding_init = nn.initializers.variance_scaling(
 				1.0,
@@ -356,6 +474,30 @@ class OPTLearnedPositionalEmbedding(nn.Embed):
 
 
 class OPTDecoder(EasyDeLBaseModule):
+	"""OPT Decoder stack.
+
+	This module comprises the main transformer decoder layers for the OPT model,
+	including token embeddings, positional embeddings, the decoder layers themselves,
+	and optional final layer normalization.
+
+	Attributes:
+	    config (OPTConfig): Configuration object for the model.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    padding_idx (int): Index of the padding token.
+	    max_target_positions (int): Maximum sequence length the model can handle.
+	    embed_scale (float): Scaling factor for embeddings (usually 1.0).
+	    embed_tokens (nn.Embed): Token embedding layer.
+	    embed_positions (OPTLearnedPositionalEmbedding): Positional embedding layer.
+	    project_out (ParallelLinear, optional): Optional linear projection layer after embeddings.
+	    project_in (ParallelLinear, optional): Optional linear projection layer before embeddings.
+	    layers (tp.List[OPTDecoderLayer]): List of OPT decoder layers.
+	    dropout_layer (nn.Dropout): Dropout layer applied after embeddings.
+	    final_layer_norm (nn.LayerNorm, optional): Optional final layer normalization.
+	    gradient_checkpointing (EasyDeLGradientCheckPointers): Gradient checkpointing configuration.
+	"""
+
 	def __init__(
 		self,
 		config: OPTConfig,
@@ -456,6 +598,25 @@ class OPTDecoder(EasyDeLBaseModule):
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
 	):
+		"""Forward pass of the OPTDecoder.
+
+		Args:
+		    input_ids (chex.Array): Input token IDs. Shape: (batch_size, sequence_length).
+		    attention_mask (tp.Optional[chex.Array]): Mask to prevent attention to padding tokens.
+		        Shape: (batch_size, sequence_length).
+		    position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+		        Shape: (batch_size, sequence_length).
+		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for attention.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+		    output_attentions (bool): Whether to return attention weights. Defaults to False.
+		    output_hidden_states (bool): Whether to return hidden states for all layers. Defaults to False.
+		    return_dict (bool): Whether to return a `BaseModelOutput` object or a tuple. Defaults to True.
+
+		Returns:
+		    tp.Union[BaseModelOutput, tp.Tuple]: The decoder's output. If `return_dict` is True,
+		        returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
+		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
+		"""
 		input_shape = input_ids.shape
 		input_ids = input_ids.reshape(-1, input_shape[-1])
 		all_hidden_states = () if output_hidden_states else None
@@ -494,6 +655,7 @@ class OPTDecoder(EasyDeLBaseModule):
 				attention_mask=attention_mask,
 				output_attentions=output_attentions,
 				past_key_values=past_key_values.views[idx],
+				cache_metadata=cache_metadata,
 			)
 
 			hidden_states = layer_outputs[0]
@@ -522,6 +684,18 @@ class OPTDecoder(EasyDeLBaseModule):
 
 
 class OPTModel(EasyDeLBaseModule):
+	"""Base OPT Model class.
+
+	This class represents the core OPT model architecture, consisting primarily of the OPTDecoder.
+
+	Attributes:
+	    config (OPTConfig): Configuration object for the model.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    decoder (OPTDecoder): The OPT decoder stack.
+	"""
+
 	def __init__(
 		self,
 		config: OPTConfig,
@@ -562,6 +736,25 @@ class OPTModel(EasyDeLBaseModule):
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
 	):
+		"""Forward pass of the OPTModel.
+
+		Args:
+		    input_ids (chex.Array): Input token IDs. Shape: (batch_size, sequence_length).
+		    attention_mask (tp.Optional[chex.Array]): Mask to prevent attention to padding tokens.
+		        Shape: (batch_size, sequence_length).
+		    position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+		        Shape: (batch_size, sequence_length).
+		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for attention.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+		    output_attentions (bool): Whether to return attention weights. Defaults to False.
+		    output_hidden_states (bool): Whether to return hidden states for all layers. Defaults to False.
+		    return_dict (bool): Whether to return a `BaseModelOutput` object or a tuple. Defaults to True.
+
+		Returns:
+		    tp.Union[BaseModelOutput, tp.Tuple]: The model's output. If `return_dict` is True,
+		        returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
+		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
+		"""
 		decoder_outputs = self.decoder(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
@@ -570,6 +763,7 @@ class OPTModel(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 		)
 
 		if not return_dict:
@@ -582,10 +776,12 @@ class OPTModel(EasyDeLBaseModule):
 		)
 
 	def set_input_embeddings(self, value):
-		self.embed_tokens = value
+		"""Sets the input embeddings for the model."""
+		self.decoder.embed_tokens = value
 
 	def get_input_embeddings(self):
-		return self.embed_tokens
+		"""Gets the input embeddings from the model."""
+		return self.decoder.embed_tokens
 
 
 @register_module(
@@ -594,6 +790,20 @@ class OPTModel(EasyDeLBaseModule):
 	model_type="opt",
 )
 class OPTForCausalLM(EasyDeLBaseModule):
+	"""OPT Model with a Causal Language Modeling head.
+
+	This model consists of the base OPTModel followed by a linear layer
+	(the language modeling head) to predict the next token logits.
+
+	Attributes:
+	    config (OPTConfig): Configuration object for the model.
+	    dtype (jnp.dtype): Data type for computations.
+	    param_dtype (jnp.dtype): Data type for parameters.
+	    precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+	    model (OPTModel): The base OPT model.
+	    lm_head (ParallelLinear): The linear layer for projecting hidden states to vocabulary logits.
+	"""
+
 	def __init__(
 		self,
 		config: OPTConfig,
@@ -641,11 +851,31 @@ class OPTForCausalLM(EasyDeLBaseModule):
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
 	):
+		"""Forward pass of the OPTForCausalLM model.
+
+		Args:
+		    input_ids (chex.Array): Input token IDs. Shape: (batch_size, sequence_length).
+		    attention_mask (tp.Optional[chex.Array]): Mask to prevent attention to padding tokens.
+		        Shape: (batch_size, sequence_length).
+		    position_ids (tp.Optional[chex.Array]): Position indices for the tokens.
+		        Shape: (batch_size, sequence_length).
+		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for attention.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+		    output_attentions (bool): Whether to return attention weights. Defaults to False.
+		    output_hidden_states (bool): Whether to return hidden states for all layers. Defaults to False.
+		    return_dict (bool): Whether to return a `CausalLMOutput` object or a tuple. Defaults to True.
+
+		Returns:
+		    tp.Union[MaskedLMOutput, tp.Tuple]: The model's output. If `return_dict` is True,
+		        returns a `MaskedLMOutput` object containing `logits`, `hidden_states` (optional),
+		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
+		"""
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			return_dict=return_dict,
@@ -654,7 +884,7 @@ class OPTForCausalLM(EasyDeLBaseModule):
 		hidden_states = outputs[0]
 
 		if self.config.tie_word_embeddings:
-			shared_kernel = self.modeldecoder.embed_tokens.embedding.value.T
+			shared_kernel = self.model.decoder.embed_tokens.embedding.value.T
 			self.lm_head.kernel.value = shared_kernel
 			lm_logits = self.lm_head.apply(hidden_states)
 
@@ -671,22 +901,28 @@ class OPTForCausalLM(EasyDeLBaseModule):
 		)
 
 	def set_input_embeddings(self, value):
-		self.module.model.embed_tokens = value
+		"""Sets the input embeddings for the model."""
+		self.model.decoder.embed_tokens = value
 
 	def get_input_embeddings(self):
-		return self.model.embed_tokens
+		"""Gets the input embeddings from the model."""
+		return self.model.decoder.embed_tokens
 
 	def set_decoder(self, decoder):
-		self.module.model = decoder
+		"""Sets the decoder module for the model."""
+		self.model.decoder = decoder
 
 	def get_decoder(self):
-		return self.model
+		"""Gets the decoder module from the model."""
+		return self.model.decoder
 
 	def get_output_embeddings(self):
+		"""Gets the output embeddings (language modeling head)."""
 		return self.lm_head
 
 	def set_output_embeddings(self, new_embeddings):
-		self.module.lm_head = new_embeddings
+		"""Sets the output embeddings (language modeling head)."""
+		self.lm_head = new_embeddings
 
 	def prepare_inputs_for_generation(
 		self,

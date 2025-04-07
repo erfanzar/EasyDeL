@@ -29,22 +29,28 @@ class Mamba2Config(EasyDeLBaseConfig):
 	the documentation from [`EasyDeLBaseConfig`] for more information.
 
 	Args:
-	    vocab_size (`int`, *optional*, defaults to 50280):
-	        Vocabulary size of the Mamba model. Defines the number of different tokens that can be represented by the
+	    vocab_size (`int`, *optional*, defaults to 32768):
+	        Vocabulary size of the Mamba2 model. Defines the number of different tokens that can be represented by the
 	        `inputs_ids` passed to the forward method.
-	    hidden_size (`int`, *optional*, defaults to 768):
+	    hidden_size (`int`, *optional*, defaults to 4096):
 	        Dimensionality of the encoder layers and the pooler layer.
-	    state_size (`int`, *optional*, defaults to 16):
-	        State size of the Mamba model.
-	    num_hidden_layers (`int`, *optional*, defaults to 32):
-	        Number of hidden layers in the Transformer encoder.
+	    state_size (`int`, *optional*, defaults to 128):
+	        State size of the Mamba2 model.
+	    num_hidden_layers (`int`, *optional*, defaults to 64):
+	        Number of hidden layers in the Mamba2 encoder.
+	    num_heads (`int`, *optional*, defaults to 128):
+	        Number of attention heads for the grouped selective scan.
+	    head_dim (`int`, *optional*, defaults to 64):
+	        Dimension of each attention head.
+	    n_groups (`int`, *optional*, defaults to 8):
+	        Number of groups for the grouped selective scan.
 	    layer_norm_epsilon (`float`, *optional*, defaults to 1e-5):
 	        The epsilon used by the layer normalization layers.
-	    pad_token_id (`int`, *optional*, defaults to 0):
+	    pad_token_id (`int`, *optional*, defaults to 1):
 	        The index of the padding token in the vocabulary.
 	    bos_token_id (`int`, *optional*, defaults to 0):
 	        The id of the *beginning-of-sequence* token.
-	    eos_token_id (`int`, *optional*, defaults to 0):
+	    eos_token_id (`int`, *optional*, defaults to 2):
 	        The id of the *end-of-sequence* token.
 	    expand (`int`, *optional*, defaults to 2):
 	        Expansion factor for the intermediate size.
@@ -64,19 +70,27 @@ class Mamba2Config(EasyDeLBaseConfig):
 	    time_step_rank (`str` or `int`, *optional*, defaults to `"auto"`):
 	        The rank of the time step embedding. If set to `"auto"`, the rank is calculated as
 	        `math.ceil(self.hidden_size / 16)`.
-	    time_step_scale (`float`, *optional*, defaults to 1.0):
-	        The scale factor for the time step embedding.
 	    time_step_min (`float`, *optional*, defaults to 0.001):
 	        The minimum value for the time step embedding.
 	    time_step_max (`float`, *optional*, defaults to 0.1):
 	        The maximum value for the time step embedding.
 	    time_step_floor (`float`, *optional*, defaults to 1e-4):
 	        The floor value for the time step embedding.
+	    time_step_limit (`tuple`, *optional*, defaults to (0.0, float("inf"))):
+	        The minimum and maximum limits for the time step.
 	    rescale_prenorm_residual (`bool`, *optional*, defaults to `False`):
 	        Whether to rescale the pre-norm residual.
 	    use_cache (`bool`, *optional*, defaults to `True`):
 	        Whether or not the model should return the last key/values attentions (not used by all models). Only
 	        relevant if `config.is_decoder=True`.
+	    norm_before_gate (`bool`, *optional*, defaults to `True`):
+	        Whether to apply normalization before the gate activation.
+	    rms_norm (`bool`, *optional*, defaults to `True`):
+	        Whether to use root mean square normalization.
+	    chunk_size (`int`, *optional*, defaults to 256):
+	        Size of chunks for processing long sequences.
+	    tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+	        Whether to tie the word embedding weights with the output projection weights.
 	    gradient_checkpointing (`str`, *optional*, defaults to `"nothing_saveable"`):
 	        The gradient checkpointing configuration.
 	"""
@@ -156,9 +170,16 @@ class Mamba2Config(EasyDeLBaseConfig):
 
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model.
+		Get the partition rules for distributing the Mamba2 model parameters across multiple devices.
+
+		These rules define how parameters should be partitioned when using techniques like
+		Fully Sharded Data Parallelism (FSDP), Sharded Parallelism (SP), and Tensor Parallelism (TP).
+		Each rule consists of a regex pattern matching parameter names and a corresponding PartitionSpec.
+
 		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+		    tuple: A tuple of tuples where each inner tuple contains:
+		        - A regex pattern matching parameter names
+		        - A PartitionSpec object specifying how to partition matching parameters
 		"""
 		return (
 			# Embeddings
@@ -185,9 +206,3 @@ class Mamba2Config(EasyDeLBaseConfig):
 			# Catch-all
 			(".*", PartitionSpec(None)),
 		)
-
-	def attach_custom_arguments(
-		self,
-		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-	):
-		self.gradient_checkpointing = gradient_checkpointing

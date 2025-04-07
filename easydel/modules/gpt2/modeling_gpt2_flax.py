@@ -63,6 +63,23 @@ from .gpt2_configuration import GPT2Config as GPT2Config
 
 
 class Conv1D(nn.Module):
+	"""Custom 1D Convolution layer used in GPT-2.
+
+	This layer implements a 1D convolution operation often used as a substitute
+	for linear layers in transformer models, particularly in earlier GPT architectures.
+	It performs a matrix multiplication after transposing the kernel.
+
+	Attributes:
+		in_features (int): Dimensionality of the input features.
+		out_features (int): Dimensionality of the output features.
+		use_bias (bool): Whether to include a bias term. Defaults to True.
+		dtype (jnp.dtype): Data type for computations. Defaults to jnp.float32.
+		param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+		precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+		dot_general (tp.Optional[callable]): Custom dot_general function. Defaults to None (uses jax.lax.dot_general).
+		rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		in_features: int,
@@ -95,6 +112,14 @@ class Conv1D(nn.Module):
 		self.dot_general = dot_general
 
 	def __call__(self, inputs):
+		"""Forward pass of the Conv1D layer.
+
+		Args:
+		    inputs (chex.Array): Input tensor.
+
+		Returns:
+		    chex.Array: Output tensor after applying the 1D convolution.
+		"""
 		inputs = jnp.asarray(inputs, self.dtype)
 		bias = self.bias.value
 		kernel = self.kernel.value.transpose().astype(self.dtype)
@@ -115,6 +140,21 @@ class Conv1D(nn.Module):
 
 
 class GPT2Attention(AttentionModule):
+	"""GPT-2 Attention module.
+
+	This module implements the standard multi-head self-attention mechanism used in GPT-2.
+	It supports both self-attention and cross-attention.
+
+	Attributes:
+		config (GPT2Config): Configuration object for the model.
+		dtype (jnp.dtype): Data type for computations.
+		param_dtype (jnp.dtype): Data type for parameters.
+		precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+		causal (bool): Whether the attention is causal.
+		is_cross_attention (bool): Whether the attention is cross-attention.
+		rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: GPT2Config,
@@ -205,6 +245,20 @@ class GPT2Attention(AttentionModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 	):
+		"""Forward pass of the GPT2Attention module.
+
+		Args:
+		    hidden_states (chex.Array): Input hidden states.
+		    key_value_states (chex.Array, optional): Key/value states for cross-attention. Defaults to None (self-attention).
+		    attention_mask (chex.Array): Mask to apply on the attention scores.
+		    causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior. Defaults to None.
+		    cache_view (tp.Optional[TransformerCacheView | PagedAttentionCacheView], optional): Cache view for key/value states.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata], optional): Metadata for cache handling.
+		    output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+
+		Returns:
+		    tp.Tuple[chex.Array, tp.Optional[chex.Array]]: A tuple containing the attention output and optionally the attention weights.
+		"""
 		is_cross_attention = key_value_states is not None
 
 		if not is_cross_attention:
@@ -260,6 +314,20 @@ class GPT2Attention(AttentionModule):
 
 
 class GPT2MLP(nn.Module):
+	"""GPT-2 MLP module.
+
+	This module implements the feed-forward network (MLP) used in the GPT-2 model.
+	It consists of two Conv1D layers with a GELU activation in between.
+
+	Attributes:
+		config (GPT2Config): Configuration object for the model.
+		intermediate_size (int): Dimensionality of the intermediate layer.
+		dtype (jnp.dtype): Data type for computations.
+		param_dtype (jnp.dtype): Data type for parameters.
+		precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+		rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: GPT2Config,
@@ -299,10 +367,32 @@ class GPT2MLP(nn.Module):
 		)
 
 	def __call__(self, hidden_states):
+		"""Forward pass of the GPT2MLP module.
+
+		Args:
+		    hidden_states (chex.Array): Input hidden states.
+
+		Returns:
+		    chex.Array: Output hidden states after processing through the MLP.
+		"""
 		return self.dropout(self.c_proj(self.act(self.c_fc(hidden_states))))
 
 
 class GPT2Block(nn.Module):
+	"""GPT-2 Transformer block.
+
+	This module represents a single transformer block in the GPT-2 model,
+	containing self-attention and MLP sub-layers with residual connections
+	and layer normalization. It can optionally include cross-attention layers.
+
+	Attributes:
+		config (GPT2Config): Configuration object for the model.
+		dtype (jnp.dtype): Data type for computations.
+		param_dtype (jnp.dtype): Data type for parameters.
+		precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+		rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: GPT2Config,
@@ -388,6 +478,21 @@ class GPT2Block(nn.Module):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 	):
+		"""Forward pass of the GPT2Block module.
+
+		Args:
+		    hidden_states (chex.Array): Input hidden states.
+		    attention_mask (chex.Array, optional): Mask to apply on the self-attention scores. Defaults to None.
+		    causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior. Defaults to None.
+		    encoder_hidden_states (chex.Array, optional): Hidden states from the encoder for cross-attention. Defaults to None.
+		    encoder_attention_mask (chex.Array, optional): Mask for the encoder hidden states in cross-attention. Defaults to None.
+		    cache_view (tp.Optional[TransformerCacheView | PagedAttentionCacheView], optional): Cache view for key/value states.
+		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata], optional): Metadata for cache handling.
+		    output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+
+		Returns:
+		    tp.Tuple[chex.Array, ...]: A tuple containing the output hidden states and optionally attention weights (self and cross).
+		"""
 		residual = hidden_states
 		hidden_states = self.ln_1(hidden_states)
 		attn_outputs = self.attn(
@@ -446,6 +551,20 @@ class GPT2Block(nn.Module):
 	model_type="gpt2",
 )
 class GPT2Model(EasyDeLBaseModule):
+	"""GPT-2 model implementation.
+
+	This class implements the main GPT-2 transformer model architecture, consisting of
+	embedding layers (token and position), multiple GPT2Block layers, and a final
+	layer normalization.
+
+	Attributes:
+		config (GPT2Config): Configuration object for the model.
+		dtype (jnp.dtype): Data type for computations.
+		param_dtype (jnp.dtype): Data type for parameters.
+		precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+		rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: GPT2Config,
@@ -513,6 +632,23 @@ class GPT2Model(EasyDeLBaseModule):
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
 	):
+		"""Forward pass through the GPT2Model.
+
+		Args:
+		    input_ids (chex.Array): Input token IDs, shape (batch_size, sequence_length).
+		    attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens. Defaults to None.
+		    position_ids (chex.Array, optional): Indices of positions of each input sequence token. Defaults to None.
+		    encoder_hidden_states (chex.Array, optional): Hidden states from an encoder model for cross-attention. Defaults to None.
+		    encoder_attention_mask (chex.Array, optional): Mask for the encoder hidden states. Defaults to None.
+		    past_key_values (TransformerCache | PagedAttentionCache, optional): Cache containing precomputed key/value states. Defaults to None.
+		    cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling. Defaults to None.
+		    output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+		    output_hidden_states (bool, optional): Whether to return hidden states of all layers. Defaults to False.
+		    return_dict (bool, optional): Whether to return a model output object or a tuple. Defaults to True.
+
+		Returns:
+		    Union[BaseModelOutputWithPastAndCrossAttentions, Tuple]: Model outputs (last hidden state, optional past KVs, optional hidden states, optional attentions, optional cross-attentions).
+		"""
 		batch_size, sequence_length = input_ids.shape
 		if attention_mask is None:
 			attention_mask = jnp.ones((batch_size, sequence_length), "b1")
@@ -591,6 +727,20 @@ class GPT2Model(EasyDeLBaseModule):
 	model_type="gpt2",
 )
 class GPT2LMHeadModel(EasyDeLBaseModule):
+	"""GPT-2 model with a language modeling head.
+
+	This model extends the base GPT2Model by adding a linear layer on top to
+	predict the next token in a sequence, making it suitable for causal language
+	modeling tasks.
+
+	Attributes:
+		config (GPT2Config): Configuration object for the model.
+		dtype (jnp.dtype): Data type for computations.
+		param_dtype (jnp.dtype): Data type for parameters.
+		precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
+		rngs (nn.Rngs): Random number generators.
+	"""
+
 	def __init__(
 		self,
 		config: GPT2Config,
@@ -639,11 +789,29 @@ class GPT2LMHeadModel(EasyDeLBaseModule):
 		output_hidden_states: bool = False,
 		return_dict: bool = True,
 	):
+		"""Forward pass through the GPT2LMHeadModel.
+
+		Args:
+		    input_ids (chex.Array): Input token IDs, shape (batch_size, sequence_length).
+		    attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens. Defaults to None.
+		    position_ids (chex.Array, optional): Indices of positions of each input sequence token. Defaults to None.
+		    encoder_hidden_states (chex.Array, optional): Hidden states from an encoder model for cross-attention. Defaults to None.
+		    encoder_attention_mask (chex.Array, optional): Mask for the encoder hidden states. Defaults to None.
+		    past_key_values (TransformerCache | PagedAttentionCache, optional): Cache containing precomputed key/value states. Defaults to None.
+		    cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling. Defaults to None.
+		    output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
+		    output_hidden_states (bool, optional): Whether to return hidden states of all layers. Defaults to False.
+		    return_dict (bool, optional): Whether to return a model output object or a tuple. Defaults to True.
+
+		Returns:
+		    Union[CausalLMOutputWithCrossAttentions, Tuple]: Model outputs (logits, optional past KVs, optional hidden states, optional attentions, optional cross-attentions).
+		"""
 		outputs = self.transformer(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
 			past_key_values=past_key_values,
+			cache_metadata=cache_metadata,
 			encoder_hidden_states=encoder_hidden_states,
 			encoder_attention_mask=encoder_attention_mask,
 			output_attentions=output_attentions,

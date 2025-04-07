@@ -91,7 +91,7 @@ async def main():
 				end="",
 			)
 
-		print(f"\nTPS : {response.tokens_pre_second}")
+		print(f"\nTPS : {response.tokens_per_second}")
 
 		print("FIRST ATTEMPT 2")
 		async for response in inference.generate(
@@ -108,7 +108,7 @@ async def main():
 				end="",
 			)
 
-		print(f"\nTPS : {response.tokens_pre_second}")
+		print(f"\nTPS : {response.tokens_per_second}")
 
 
 if __name__ == "__main__":

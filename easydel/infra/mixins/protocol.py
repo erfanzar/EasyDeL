@@ -680,16 +680,18 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 	@abstractmethod
 	def quantize(
 		self: SELF,
-		method: EasyDeLQuantizationMethods = EasyDeLQuantizationMethods.A8BIT,
-		block_size: int = 128,
-		quantization_pattern: tp.Optional[str] = None,
-	) -> SELF:
+		method: EasyDeLQuantizationMethods,
+		skip_modules: list[str] | None = None,
+		verbose: bool = False,
+		**kwargs,
+	):
 		"""Quantizes the model's linear layers.
 
 		Args:
 		    method (EasyDeLQuantizationMethods, optional): The quantization method to use.
-		    block_size (int, optional): The block size for quantization.
-		    quantization_pattern (str, optional): The quantization pattern to use.
+		    skip_modules (list[str] | None, optional): List of module names to skip.
+		    verbose (bool, optional): Whether to print verbose output.
+		    **kwargs: Additional keyword arguments.
 
 		Returns:
 		    nn.Module: The quantized model.
@@ -725,23 +727,23 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		self: SELF,
 		lora_rank: int,
 		lora_pattern: tp.Optional[str] = None,
-		verbose: bool = True,
+		verbose: bool = False,
 		rngs: tp.Optional[nn.Rngs] = None,
 	) -> SELF:
-		"""Applies LoRA (Low-Rank Adaptation) to specified linear layers within a model."""
+		"""Apply LoRA (Low-Rank Adaptation) to specified linear layers within a model."""
 		...
 
 	@abstractmethod
 	def merge_lora_params(self: SELF, pytree: tp.Dict) -> SELF:
 		"""
-		Merge Given Pytree (LoRA Params) with current LoRA Module.
+		Merge LoRA (Low-Rank Adaptation) parameters into the base model parameters.
 		"""
 		...
 
 	@abstractmethod
 	def split_lora_params(self: SELF) -> dict:
 		"""
-		split Given Module (LoRA Module) and return LoRA Params.
+		Split LoRA (Low-Rank Adaptation) parameters from the base model parameters.
 		"""
 		...
 
@@ -781,28 +783,14 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 	@abstractmethod
 	def split_params_dict(
 		self,
-		extract_fn: tp.Optional[tp.Callable] = None,
-		remove_none: bool = True,
+		params_dict: tp.Dict,
 	) -> tp.Dict:
-		"""Splits the model parameters and returns them as a dictionary, removing `VariableState` from the tree.
-
-		Args:
-			extract_fn (tp.Optional[tp.Callable], optional): Function to extract values from the parameters.
-			remove_none (bool, optional): Whether to remove `None` values from the dictionary.
-
-		Returns:
-			tp.Dict: The dictionary of split parameters.
-		"""
+		"""Splits the model parameters from a dictionary into separate state components."""
 
 	@abstractmethod
 	def merge_params_dict(self, params_dict: tp.Dict):
-		"""Merges the model parameters from a dictionary into the current model.
-
-		Args:
-			params_dict (tp.Dict): A dictionary containing the parameters to merge.
-
-		Returns:
-			EasyDeLBaseModule: The model with merged parameters.
+		"""
+		Merges the model parameters from a dictionary into the current model.
 		"""
 
 	@abstractmethod

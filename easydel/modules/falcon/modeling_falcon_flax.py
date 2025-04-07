@@ -694,6 +694,13 @@ class FalconModel(EasyDeLBaseModule):
 	model_type="falcon",
 )
 class FalconForCausalLM(EasyDeLBaseModule):
+	"""Falcon model with a language modeling head for causal language modeling tasks.
+
+	This model extends the base FalconModel by incorporating a linear language modeling head on top
+	of the base model, designed for generative tasks and text generation. The model can use either
+	alibi positional embeddings or rotary position embeddings (RoPE) based on configuration.
+	"""
+
 	def __init__(
 		self,
 		config: FalconConfig,
@@ -703,6 +710,15 @@ class FalconForCausalLM(EasyDeLBaseModule):
 		*,
 		rngs: nn.Rngs,
 	):
+		"""Initialize a FalconForCausalLM model.
+
+		Args:
+			config (FalconConfig): Configuration object for the model.
+			dtype (jnp.dtype, optional): Data type for activations and weights. Defaults to jnp.float32.
+			param_dtype (jnp.dtype, optional): Data type for parameters. Defaults to jnp.float32.
+			precision (jax.lax.PrecisionLike, optional): Numerical precision for computations. Defaults to None.
+			rngs (nn.Rngs): Random number generator keys for initialization.
+		"""
 		super().__init__(
 			config=config,
 			dtype=dtype,

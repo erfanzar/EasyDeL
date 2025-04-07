@@ -34,6 +34,14 @@ from easydel.infra.factory import TaskType, registry
 
 
 class BaseAutoEasyModel:
+	"""
+	Base class for all Auto EasyDeL model classes. Provides common class methods
+	for loading models from configurations or pretrained checkpoints.
+
+	Attributes:
+		model_task (TaskType): The specific task the model class is designed for (e.g., CAUSAL_LM).
+	"""
+
 	model_task: TaskType
 
 	@classmethod
@@ -46,6 +54,18 @@ class BaseAutoEasyModel:
 		*,
 		rngs: tp.Optional[flax.nnx.Rngs] = None,
 	) -> EasyDeLBaseModule:
+		"""Instantiates a model module directly from a configuration object.
+
+		Args:
+			config (EasyDeLBaseConfig): The configuration object for the model.
+			dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+			param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+			precision (Optional[jax.lax.Precision]): JAX precision level. Defaults to None.
+			rngs (Optional[flax.nnx.Rngs]): Random number generators. Defaults to Rngs(42).
+
+		Returns:
+			EasyDeLBaseModule: An instance of the specific EasyDeL model module.
+		"""
 		registration = registry.get_module_registration(cls.model_task, config.model_type)
 		if rngs is None:
 			rngs = flax.nnx.Rngs(42)
@@ -193,6 +213,8 @@ class BaseAutoEasyModel:
 		quantize_tensors: bool = True,
 		**kwargs,
 	):
+		"""Helper method to load a model from EasyDeL saved parameters."""
+
 		class Base(EasyDeLBaseModule):
 			_model_task = cls.model_task
 
@@ -244,6 +266,8 @@ class BaseAutoEasyModel:
 		quantize_tensors: bool = True,
 		**kwargs,
 	):
+		"""Helper method to load a model from PyTorch pretrained weights."""
+
 		class Base(EasyDeLBaseModule):
 			_model_task = cls.model_task
 
@@ -282,6 +306,20 @@ class BaseAutoEasyModel:
 		token: tp.Optional[tp.Union[str, bool]] = None,
 		revision: str = "main",
 	):
+		"""Checks if the given path or identifier points to an EasyDeL model checkpoint.
+
+		Args:
+		    pretrained_model_name_or_path: Identifier or path to check.
+		    FLAX_WEIGHTS_NAME (str): The standard filename for EasyDeL weights.
+		    cache_dir (Optional[Union[str, os.PathLike]]): Cache directory.
+		    force_download (bool): Force download even if cached.
+		    local_files_only (bool): Only check local files.
+		    token (Optional[Union[str, bool]]): Hugging Face Hub token.
+		    revision (str): Git revision identifier.
+
+		Returns:
+		    bool: True if it's an EasyDeL checkpoint, False otherwise.
+		"""
 		from transformers.utils import cached_file as _cached_file
 		from transformers.utils import download_url as _download_url
 		from transformers.utils import is_remote_url as _is_remote_url
@@ -349,6 +387,14 @@ class BaseAutoEasyModel:
 
 
 class BaseAutoEasyState:
+	"""
+	Base class for Auto EasyDeL state classes. Provides common class methods
+	for creating model states from configurations or pretrained checkpoints.
+
+	Attributes:
+		_base (BaseAutoEasyModel): The corresponding Auto EasyDeL model class.
+	"""
+
 	_base: BaseAutoEasyModel
 
 	@classmethod
@@ -361,6 +407,18 @@ class BaseAutoEasyState:
 		*,
 		rngs: tp.Optional[flax.nnx.Rngs] = None,
 	) -> EasyDeLState:
+		"""Creates an EasyDeLState directly from a configuration object.
+
+		Args:
+			config (EasyDeLBaseConfig): The configuration object for the model.
+			dtype (jnp.dtype): Data type for computation. Defaults to jnp.float32.
+			param_dtype (jnp.dtype): Data type for parameters. Defaults to jnp.float32.
+			precision (Optional[jax.lax.Precision]): JAX precision level. Defaults to None.
+			rngs (Optional[flax.nnx.Rngs]): Random number generators. Defaults to Rngs(42).
+
+		Returns:
+			EasyDeLState: An initialized EasyDeLState for the model.
+		"""
 		return cls._base.from_config(
 			config=config,
 			dtype=dtype,

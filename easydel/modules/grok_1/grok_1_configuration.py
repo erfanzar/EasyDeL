@@ -109,6 +109,35 @@ class Grok1Config(EasyDeLBaseConfig):
 		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
+		"""Initializes a Grok1Config object.
+
+		Args:
+		    vocab_size (int, optional): Vocabulary size. Defaults to 32000.
+		    hidden_size (int, optional): Hidden size. Defaults to 4096.
+		    intermediate_size (int, optional): Intermediate size of the feed-forward network. Defaults to 32768.
+		    num_hidden_layers (int, optional): Number of hidden layers. Defaults to 32.
+		    num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
+		    num_key_value_heads (int, optional): Number of key/value heads (for GQA). Defaults to 32.
+		    attn_output_multiplier (float, optional): Multiplier for attention output. Defaults to 1.0.
+		    max_attn_value (float, optional): Maximum attention value. Defaults to 1.0.
+		    max_position_embeddings (int, optional): Maximum sequence length. Defaults to 4096.
+		    embedding_multiplier_scale (float, optional): Scale factor for embeddings. Defaults to 1.0.
+		    output_multiplier_scale (float, optional): Scale factor for the output layer. Defaults to 1.0.
+		    rms_norm_eps (float, optional): Epsilon for RMS normalization. Defaults to 1e-5.
+		    use_cache (bool, optional): Whether to use KV cache. Defaults to True.
+		    pad_token_id (int, optional): Padding token ID. Defaults to None.
+		    bos_token_id (int, optional): Beginning-of-sequence token ID. Defaults to 1.
+		    eos_token_id (int, optional): End-of-sequence token ID. Defaults to 2.
+		    tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to True.
+		    num_experts_per_tok (int, optional): Number of experts to route per token. Defaults to 2.
+		    num_experts (int, optional): Total number of experts. Defaults to 8.
+		    output_router_logits (bool, optional): Whether to output router logits. Defaults to False.
+		    router_aux_loss_coef (float, optional): Coefficient for router auxiliary loss. Defaults to 0.001.
+		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
+		        Defaults to EasyDeLGradientCheckPointers.NONE.
+		    bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
+		    **kwargs: Additional keyword arguments.
+		"""
 		self.vocab_size = vocab_size
 		self.attn_output_multiplier = attn_output_multiplier
 		self.max_attn_value = max_attn_value
@@ -144,9 +173,16 @@ class Grok1Config(EasyDeLBaseConfig):
 
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model.
+		Get the partition rules for the model. This method defines how the model's parameters are
+		partitioned across devices for distributed training and inference.
+
+		Args:
+		    *args: Additional positional arguments (unused).
+		    **kwargs: Additional keyword arguments (unused).
+
 		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: A tuple of partition rules, where each rule is a tuple
+		        containing a regex pattern for parameter names and the corresponding `PartitionSpec`.
 		"""
 		return (
 			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
@@ -174,16 +210,17 @@ class Grok1Config(EasyDeLBaseConfig):
 		bits: tp.Optional[int] = None,
 		**kwargs,
 	):
-		"""The attach_custom_arguments function adds the following arguments to the Transformer class:
+		"""Attaches custom arguments to the configuration object.
+
+		This method allows adding or overriding configuration attributes dynamically.
+		It primarily sets attributes related to word embeddings, gradient checkpointing, and quantization bits.
 
 		Args:
-		    self: Refer to the current object
-		    tie_word_embeddings: bool: Tie the word embeddings to the
-		        decoder
-		    gradient_checkpointing: str: Control the amount of memory
-		        used by jax
-		    bits: tp.Optional[int]: Determine the number of bits used in
-		        the quantization
+		    tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
+		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
+		        Defaults to EasyDeLGradientCheckPointers.NONE.
+		    bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
+		    **kwargs: Additional keyword arguments (ignored).
 		"""
 		self.tie_word_embeddings = tie_word_embeddings
 		self.gradient_checkpointing = gradient_checkpointing
@@ -191,14 +228,32 @@ class Grok1Config(EasyDeLBaseConfig):
 
 	@staticmethod
 	def get_weight_decay_exclusions():
+		"""Returns a tuple of parameter names for which weight decay should be excluded.
+
+		Returns:
+		    tuple: An empty tuple, indicating no specific weight decay exclusions for this model.
+		"""
 		return tuple()
 
 	@staticmethod
 	def rng_keys():
+		"""Returns the names of the random number generator keys used by the model.
+
+		Returns:
+		    tuple: A tuple containing "params" and "dropout" as the RNG keys.
+		"""
 		return "params", "dropout"
 
 	@property
 	def granted_freq_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size specifically for frequency-based position embeddings.
+
+		If `freq_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
+		`max_position_embeddings`.
+
+		Returns:
+		    int: The granted maximum position embedding size for frequency encoding.
+		"""
 		return getattr(
 			self,
 			"freq_max_position_embeddings",
@@ -207,6 +262,14 @@ class Grok1Config(EasyDeLBaseConfig):
 
 	@property
 	def granted_mask_max_position_embedding(self) -> int:
+		"""Returns the maximum position embedding size specifically for mask-based position embeddings.
+
+		If `mask_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
+		`max_position_embeddings`.
+
+		Returns:
+		    int: The granted maximum position embedding size for mask encoding.
+		"""
 		return getattr(
 			self,
 			"mask_max_position_embeddings",

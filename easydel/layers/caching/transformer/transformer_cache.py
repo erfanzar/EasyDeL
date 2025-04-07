@@ -20,6 +20,7 @@ import jax
 from eformer.escale import PartitionAxis, with_sharding_constraint
 from eformer.jaximus import ImplicitArray
 from eformer.pytree import auto_pytree
+from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -78,10 +79,10 @@ class TransformerCacheMetaData(BaseCacheMetadata):
 		Create a TransformerCacheMetaData instance with validation.
 
 		Arguments:
-				partition_axis: Partition axis.
+		    partition_axis: Partition axis.
 		    batch_size: Size of the batch.
 		    sequence_length: Length of the sequence.
-				num_hidden_layers: number of hidden layers.
+		    num_hidden_layers: number of hidden layers.
 		    num_heads: Number of attention heads.
 		    head_dim: Dimension of each head.
 		    key_heads: Number of key heads.
@@ -196,37 +197,36 @@ class TransformerCacheView(BaseCacheView):
 		query: cx.Array,
 		key: cx.Array,
 		value: cx.Array,
-		cache_metadata: TransformerMetadata,
+		cache_metadata: tp.Optional[TransformerMetadata],
 		attention_mask: cx.Array,
-		kv_sharding: PartitionSpec,
+		kv_sharding: NamedSharding,  # Ensure this is NamedSharding
 		quantizer: EasyQuantizer,
 		causal_mask: tp.Optional[cx.Array] = None,
 		token_type_ids: tp.Optional[cx.Array] = None,
 	) -> tp.Tuple[cx.Array, cx.Array, cx.Array]:
 		"""
-		Updates the KV cache with new key/value states and adjusts the attention mask.
-
-		Internal helper function used when KV caching is enabled.
+		Updates the KV cache functionally and returns the updated tensors along with the appropriate attention mask.
 
 		Args:
-		    query (Array): Current query states.
-		    key (Array): Current key states.
-		    value (Array): Current value states.
-		    attention_mask (Array): Base attention mask.
-		    causal_mask (tp.Optional[Array], optional): Causal mask. Defaults to None.
-		    token_type_ids (tp.Optional[Array], optional): Token type IDs for segment-based masking.
-		                                                    Defaults to None.
+		    query: Current query states.
+		    key: Current key states to add to the cache.
+		    value: Current value states to add to the cache.
+		    cache_metadata: Optional metadata. If provided and contains slot/length info, enables pooled caching.
+		    attention_mask: Base attention mask.
+		    kv_sharding: NamedSharding spec for the cache tensors.
+		    quantizer: Quantizer for the cache.
+		    causal_mask: Optional causal mask.
+		    token_type_ids: Optional token type IDs for segment masking.
 
 		Returns:
-		    tp.Tuple[Array, Array, Array]:
-		        - Updated key cache tensor.
-		        - Updated value cache tensor.
-		        - Updated attention mask reflecting the cached sequence length.
+		    Tuple[Array, Array, Array]:
+		        - Updated key cache tensor (functional update).
+		        - Updated value cache tensor (functional update).
+		        - Final attention mask to be used (either original or calculated).
 		"""
-		_ = cache_metadata  # not used
+
 		num_updated_cache_vectors = query.shape[1]
 		end_index = self.index[0]
-
 		*batch_dims, max_length, num_heads, depth_per_head = self.value.shape
 
 		if attention_mask.ndim == 2:
@@ -235,9 +235,9 @@ class TransformerCacheView(BaseCacheView):
 		if causal_mask is not None:
 			if hasattr(causal_mask, "value"):
 				causal_mask = causal_mask.value
-			causal_mask = lax.dynamic_slice(
+			causal_mask_slice = lax.dynamic_slice(
 				causal_mask,
-				(0, 0, end_index, 0),
+				(0, 0, end_index % max_length, 0),
 				(1, 1, num_updated_cache_vectors, max_length),
 			)
 			if token_type_ids is not None and num_updated_cache_vectors != 1:
@@ -245,53 +245,168 @@ class TransformerCacheView(BaseCacheView):
 					jnp.expand_dims(token_type_ids, 2),
 					jnp.expand_dims(token_type_ids, 1),
 				)
-
 				token_type_mask = jnp.where(token_type_ids == 0, False, token_type_mask)
 				token_type_mask = jnp.expand_dims(token_type_mask, 1)
 				sequence_length = token_type_ids.shape[1]
 				masked_portion = jnp.logical_or(
 					token_type_mask[:, :, :num_updated_cache_vectors, :],
-					causal_mask[:, :, :, :sequence_length],
+					causal_mask_slice[:, :, :, :sequence_length],
 				)
-				causal_mask = causal_mask.at[:, :, :, :sequence_length].set(masked_portion)
+				causal_mask_slice = causal_mask_slice.at[:, :, :, :sequence_length].set(
+					masked_portion
+				)
 
-			causal_mask = jnp.broadcast_to(
-				causal_mask,
-				(query.shape[0],) + causal_mask.shape[1:],
+			causal_mask_expanded = jnp.broadcast_to(
+				causal_mask_slice,
+				(query.shape[0],) + causal_mask_slice.shape[1:],
 			)
+			final_attention_mask = nn.combine_masks(attention_mask, causal_mask_expanded)
+		else:
+			final_attention_mask = attention_mask
+		slice_indices = (0, end_index % max_length, 0, 0)
 
-			attention_mask = jnp.broadcast_to(attention_mask, causal_mask.shape)
-			attention_mask = jnp.logical_and(attention_mask, causal_mask)
-
-		slice_indices = (0, end_index % self.value.shape[1], 0, 0)
-
-		value_cache = with_sharding_constraint(
-			lax.dynamic_update_slice(
-				self.value,
-				value.astype(self.value.dtype),
-				slice_indices,
-			),
-			sharding=kv_sharding,
+		value_cache_updated = lax.dynamic_update_slice(
+			self.value,
+			value.astype(self.value.dtype),
+			slice_indices,
 		)
-		key_cache = with_sharding_constraint(
-			lax.dynamic_update_slice(
-				self.key,
-				key.astype(self.key.dtype),
-				slice_indices,
-			),
-			sharding=kv_sharding,
+		key_cache_updated = lax.dynamic_update_slice(
+			self.key,
+			key.astype(self.key.dtype),
+			slice_indices,
 		)
+
+		value_cache_updated = with_sharding_constraint(value_cache_updated, kv_sharding)
+		key_cache_updated = with_sharding_constraint(key_cache_updated, kv_sharding)
+		self.key = quantizer(key_cache_updated)
+		self.value = quantizer(value_cache_updated)
+		self.index = self.index + num_updated_cache_vectors
+
 		pad_mask = jnp.broadcast_to(
-			jnp.arange(max_length) < end_index + num_updated_cache_vectors,
+			jnp.arange(max_length) < self.index[0],
 			tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
 		)
-		attention_mask = jnp.logical_and(pad_mask, attention_mask)
+		final_attention_mask = jnp.logical_and(pad_mask, final_attention_mask)
 
-		self.key = quantizer(key_cache)
-		self.value = quantizer(value_cache)
+		return key_cache_updated, value_cache_updated, final_attention_mask
 
-		self.index = self.index + num_updated_cache_vectors
-		return key_cache, value_cache, attention_mask
+	@staticmethod
+	def _update_cache_logic(
+		key_tensor_layer: jax.Array,
+		value_tensor_layer: jax.Array,
+		new_keys: jax.Array,
+		new_values: jax.Array,
+		micro_batch_slot_indices: jax.Array,
+		micro_batch_write_pos: jax.Array,
+	) -> tp.Tuple[jax.Array, jax.Array]:
+		"""Internal logic to update cache based on new keys/values for pooled cache."""
+		if new_keys.ndim == 4 and new_keys.shape[1] > 1:
+			# Prefill case
+			seq_len_delta = new_keys.shape[1]
+
+			def prefill_scan_body(carry, seq_idx_delta):
+				k_tensor, v_tensor, current_write_pos = carry
+				step_keys = lax.dynamic_slice_in_dim(
+					new_keys,
+					seq_idx_delta,
+					1,
+					axis=1,
+				).squeeze(1)
+				step_values = lax.dynamic_slice_in_dim(
+					new_values,
+					seq_idx_delta,
+					1,
+					axis=1,
+				).squeeze(1)
+				updated_k, updated_v = TransformerCacheView._update_single_token_step(
+					k_tensor,
+					v_tensor,
+					step_keys,
+					step_values,
+					micro_batch_slot_indices,
+					current_write_pos,
+				)
+				return (updated_k, updated_v, current_write_pos + 1), None
+
+			initial_carry = (key_tensor_layer, value_tensor_layer, micro_batch_write_pos)
+			(final_k_tensor, final_v_tensor, _), _ = lax.scan(
+				prefill_scan_body, initial_carry, xs=jnp.arange(seq_len_delta)
+			)
+		elif new_keys.ndim == 3 or (new_keys.ndim == 4 and new_keys.shape[1] == 1):
+			# Decode case (or prefill of length 1)
+			# Squeeze the sequence dimension if it exists and is 1
+			if new_keys.ndim == 4:
+				new_keys = new_keys.squeeze(1)
+				new_values = new_values.squeeze(1)
+
+			final_k_tensor, final_v_tensor = TransformerCacheView._update_single_token_step(
+				key_tensor_layer,
+				value_tensor_layer,
+				new_keys,
+				new_values,
+				micro_batch_slot_indices,
+				micro_batch_write_pos,
+			)
+		else:
+			raise ValueError(
+				f"Unexpected shape for new_keys: {new_keys.shape}. Expected 3D [B, H, D] or 4D [B, S, H, D]."
+			)
+		return final_k_tensor, final_v_tensor
+
+	@staticmethod
+	def _update_single_token_step(
+		key_tensor_layer,
+		value_tensor_layer,
+		new_keys,  # Shape [micro_batch_size, num_heads, dim]
+		new_values,  # Shape [micro_batch_size, num_heads, dim]
+		micro_batch_slot_indices,
+		micro_batch_write_pos,
+	):
+		"""Internal logic for updating cache for a single token step across the batch."""
+		micro_batch_size = micro_batch_slot_indices.shape[0]
+		# Expand dims for dynamic_update_slice: needs [1, 1, num_heads, dim]
+		new_keys_update = jnp.expand_dims(new_keys, axis=1)
+		new_values_update = jnp.expand_dims(new_values, axis=1)
+
+		def body_fn_batch_item(batch_item_idx, current_k_v_tensors):
+			k_tensor, v_tensor = current_k_v_tensors
+			slot_idx = micro_batch_slot_indices[batch_item_idx]
+			seq_pos = micro_batch_write_pos[batch_item_idx]
+			# Slice the update for the specific batch item
+			# Shape [1, 1, num_heads, dim]
+			item_key_update = lax.dynamic_slice_in_dim(
+				new_keys_update,
+				batch_item_idx,
+				1,
+				axis=0,
+			)
+			item_value_update = lax.dynamic_slice_in_dim(
+				new_values_update,
+				batch_item_idx,
+				1,
+				axis=0,
+			)
+			start_indices = (slot_idx, seq_pos, 0, 0)
+			updated_k_tensor = lax.dynamic_update_slice(
+				k_tensor,
+				item_key_update.astype(k_tensor.dtype),
+				start_indices,
+			)
+			updated_v_tensor = lax.dynamic_update_slice(
+				v_tensor,
+				item_value_update.astype(v_tensor.dtype),
+				start_indices,
+			)
+			return (updated_k_tensor, updated_v_tensor)
+
+		final_k_tensor, final_v_tensor = lax.fori_loop(
+			0,
+			micro_batch_size,
+			body_fn_batch_item,
+			(key_tensor_layer, value_tensor_layer),
+		)
+
+		return final_k_tensor, final_v_tensor
 
 	def __repr__(self):
 		try:

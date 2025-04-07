@@ -19,6 +19,7 @@ import chex as cx
 import jax
 from eformer import escale as es
 from eformer.jaximus import ImplicitArray
+from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
 
@@ -35,7 +36,7 @@ else:
 	EasyQuantizer = object
 
 
-@cx.dataclass
+@auto_pytree
 class LightningCacheMetaData(BaseCacheMetadata):
 	"""Metadata for transformer cache configuration."""
 
@@ -80,7 +81,7 @@ class LightningCacheMetaData(BaseCacheMetadata):
 		)
 
 
-@cx.dataclass
+@auto_pytree
 class LightningCacheView(BaseCacheView):
 	key_value: tp.Union[cx.Array, ImplicitArray]
 	metadata: LightningCacheMetaData
@@ -204,7 +205,7 @@ class LightningCacheView(BaseCacheView):
 	__str__ = __repr__
 
 
-@cx.dataclass
+@auto_pytree
 class LightningCache(BaseCache):
 	views: tp.List[tp.Optional[LightningCacheView]]
 
