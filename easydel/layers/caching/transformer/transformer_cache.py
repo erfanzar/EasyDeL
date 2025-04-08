@@ -47,6 +47,7 @@ class TransformerCacheMetaData(BaseCacheMetadata):
 	batch_size: int
 	sequence_length: int
 	num_hidden_layers: int
+	pad_token_id: int
 	# Optional attention-related fields
 	num_heads: tp.Optional[int]
 	head_dim: tp.Optional[int]
@@ -66,6 +67,7 @@ class TransformerCacheMetaData(BaseCacheMetadata):
 		batch_size: int,
 		sequence_length: int,
 		num_hidden_layers: int,
+		pad_token_id: int,
 		num_heads: tp.Optional[int] = None,
 		head_dim: tp.Optional[int] = None,
 		key_heads: tp.Optional[int] = None,
@@ -128,6 +130,7 @@ class TransformerCacheMetaData(BaseCacheMetadata):
 			batch_size=batch_size,
 			sequence_length=sequence_length,
 			num_hidden_layers=num_hidden_layers,
+			pad_token_id=pad_token_id,
 			num_heads=num_heads,
 			head_dim=head_dim,
 			key_heads=key_heads,
@@ -144,6 +147,7 @@ class TransformerCacheView(BaseCacheView):
 	key: tp.Union[cx.Array, ImplicitArray]
 	value: tp.Union[cx.Array, ImplicitArray]
 	index: tp.Union[cx.Array, ImplicitArray]
+	prefill_length: tp.Optional[tp.Union[cx.Array, ImplicitArray]]
 	metadata: TransformerCacheMetaData
 	layer_index: tp.Optional[int] = None
 
@@ -156,6 +160,7 @@ class TransformerCacheView(BaseCacheView):
 		dtype: jnp.dtype,
 		mesh: Mesh,
 		layer_index: tp.Optional[int] = None,
+		prefill_length: tp.Optional[jax.Array] = None,
 	):
 		with jax.named_scope("easydel-transformer-cacheview-init"):
 			device = NamedSharding(mesh=mesh, spec=key_values_partition_specs)
@@ -186,6 +191,7 @@ class TransformerCacheView(BaseCacheView):
 					)
 				),
 				index=jnp.zeros((metadata.batch_size,), dtype=jnp.int32),
+				prefill_length=prefill_length,
 				metadata=metadata,
 				layer_index=layer_index,
 			)
@@ -226,7 +232,9 @@ class TransformerCacheView(BaseCacheView):
 		"""
 
 		num_updated_cache_vectors = query.shape[1]
-		end_index = self.index[0]
+		batch_sharding = PartitionSpec(kv_sharding[0])
+		index = self.index
+		end_index = index[0]
 		*batch_dims, max_length, num_heads, depth_per_head = self.value.shape
 
 		if attention_mask.ndim == 2:
@@ -260,9 +268,9 @@ class TransformerCacheView(BaseCacheView):
 				causal_mask_slice,
 				(query.shape[0],) + causal_mask_slice.shape[1:],
 			)
-			final_attention_mask = nn.combine_masks(attention_mask, causal_mask_expanded)
+			attention_mask = nn.combine_masks(attention_mask, causal_mask_expanded)
 		else:
-			final_attention_mask = attention_mask
+			attention_mask = attention_mask
 		slice_indices = (0, end_index % max_length, 0, 0)
 
 		value_cache_updated = lax.dynamic_update_slice(
@@ -278,17 +286,20 @@ class TransformerCacheView(BaseCacheView):
 
 		value_cache_updated = with_sharding_constraint(value_cache_updated, kv_sharding)
 		key_cache_updated = with_sharding_constraint(key_cache_updated, kv_sharding)
-		self.key = quantizer(key_cache_updated)
-		self.value = quantizer(value_cache_updated)
-		self.index = self.index + num_updated_cache_vectors
 
+		index = index + num_updated_cache_vectors
 		pad_mask = jnp.broadcast_to(
-			jnp.arange(max_length) < self.index[0],
+			jnp.arange(max_length) < index[0],
 			tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
 		)
-		final_attention_mask = jnp.logical_and(pad_mask, final_attention_mask)
+		attention_mask = jnp.logical_and(pad_mask, attention_mask)
 
-		return key_cache_updated, value_cache_updated, final_attention_mask
+		self.key = quantizer(key_cache_updated)
+		self.value = quantizer(value_cache_updated)
+		self.index = with_sharding_constraint(index, batch_sharding)
+		attention_mask = with_sharding_constraint(attention_mask, batch_sharding)
+		
+		return key_cache_updated, value_cache_updated, attention_mask
 
 	@staticmethod
 	def _update_cache_logic(
@@ -435,6 +446,7 @@ class TransformerCache(BaseCache):
 		quantizer: tp.Optional[EasyQuantizer] = None,
 		dtype: tp.Optional[jnp.dtype] = None,
 		key_values_partition_specs: tp.Optional[PartitionSpec] = None,
+		prefill_length: tp.Optional[jax.Array] = None,
 	):
 		from easydel.infra.etils import EasyDeLQuantizationMethods
 		from easydel.layers.quantization.quantizers import EasyQuantizer
@@ -458,6 +470,7 @@ class TransformerCache(BaseCache):
 					dtype=dtype,
 					mesh=mesh,
 					layer_index=layer_index,
+					prefill_length=prefill_length,
 				)
 				for layer_index in range(metadata.num_hidden_layers)
 			]

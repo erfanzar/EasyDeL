@@ -259,43 +259,51 @@ class FalconAttention(AttentionModule):
 			self.num_heads if self.new_decoder_architecture else self.num_kv_heads
 		)
 		# 3 x [batch_size, seq_length, num_heads, head_dim]
-		(query_layer, key_layer, value_layer) = self._split_heads(fused_qkv)
-		batch_size, query_length, _, _ = query_layer.shape
+		(query_states, key_states, value_states) = self._split_heads(fused_qkv)
+		batch_size, query_length, _, _ = query_states.shape
 		key_length = query_length
-		query_layer = query_layer.reshape(
+		query_states = query_states.reshape(
 			batch_size,
 			query_length,
 			self.num_heads,
 			self.head_dim,
 		)
-		key_layer = key_layer.reshape(
+		key_states = key_states.reshape(
 			batch_size,
 			query_length,
 			num_kv_heads,
 			self.head_dim,
 		)
-		value_layer = value_layer.reshape(
+		value_states = value_states.reshape(
 			batch_size,
 			query_length,
 			num_kv_heads,
 			self.head_dim,
 		)
+
+		(
+			query_states,
+			key_states,
+			value_states,
+		) = self.apply_qkv_shardings(query_states, key_states, value_states)
+
 		if alibi is None:
-			query_layer, key_layer = self.rotary(
+			query_states, key_states = self.rotary(
 				positions=position_ids,
-				query=query_layer,
-				key=key_layer,
+				query=query_states,
+				key=key_states,
 				frequencies=frequencies,
 			)
+
 		(
-			key_layer,
-			value_layer,
+			key_states,
+			value_states,
 			attention_mask,
 			init_attention_bias,
 		) = self.concatenate(
-			query=query_layer,
-			key=key_layer,
-			value=value_layer,
+			query=query_states,
+			key=key_states,
+			value=value_states,
 			cache_view=cache_view,
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,
@@ -304,9 +312,9 @@ class FalconAttention(AttentionModule):
 
 		if alibi is None:
 			attention = self.attention_performer.forward(
-				query_states=query_layer,
-				key_states=key_layer,
-				value_states=value_layer,
+				query_states=query_states,
+				key_states=key_states,
+				value_states=value_states,
 				bias=init_attention_bias(),
 				cache_metadata=cache_metadata,
 				cache_view=cache_view,
@@ -326,8 +334,8 @@ class FalconAttention(AttentionModule):
 		else:
 			attention_scores = jnp.einsum(
 				"...qhd,...khd->...hqk",
-				query_layer,
-				key_layer,
+				query_states,
+				key_states,
 				precision=self.precision,
 			)
 			attention_scores = attention_scores.reshape(
@@ -346,7 +354,7 @@ class FalconAttention(AttentionModule):
 			)
 			# matmul: [batch_size * num_heads, q_length, head_dim]
 			attn_output = jax.lax.batch_matmul(
-				attention_scores, value_layer.transpose(0, 2, 1, 3)
+				attention_scores, value_states.transpose(0, 2, 1, 3)
 			)  # noqa
 			attn_output = attn_output.reshape(
 				(attn_output.shape[1] * attn_output.shape[0],) + attn_output.shape[2:]

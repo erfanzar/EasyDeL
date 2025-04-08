@@ -177,7 +177,7 @@ class LlamaConfig(EasyDeLBaseConfig):
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
 		return (
-			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
+			("embed_tokens/embedding", PartitionSpec(("fsdp", "tp"), "sp")),
 			("self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
 			("self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
 			("self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),

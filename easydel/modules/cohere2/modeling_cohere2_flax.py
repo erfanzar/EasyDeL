@@ -52,11 +52,11 @@ class Cohere2LayerNorm(nn.Module):
 	"""Cohere Layer Normalization.
 
 	Attributes:
-		dim (Union[int, tuple]): The dimension(s) to normalize over.
-		eps (float): A small epsilon value to prevent division by zero.
-		dtype (jnp.dtype): The data type for computation.
-		param_dtype (jnp.dtype): The data type for the parameters.
-		rngs (Optional[nn.Rngs]): Random number generators.
+	  dim (Union[int, tuple]): The dimension(s) to normalize over.
+	  eps (float): A small epsilon value to prevent division by zero.
+	  dtype (jnp.dtype): The data type for computation.
+	  param_dtype (jnp.dtype): The data type for the parameters.
+	  rngs (Optional[nn.Rngs]): Random number generators.
 	"""
 
 	def __init__(
@@ -93,10 +93,10 @@ class Cohere2LayerNorm(nn.Module):
 		"""Applies Layer Normalization to the input tensor.
 
 		Args:
-			x (jnp.ndarray): The input tensor.
+		  x (jnp.ndarray): The input tensor.
 
 		Returns:
-			jnp.ndarray: The normalized output tensor.
+		  jnp.ndarray: The normalized output tensor.
 		"""
 		if self.dtype in [
 			jnp.float8_e4m3b11fnuz,
@@ -118,12 +118,12 @@ class Cohere2Attention(AttentionModule):
 	Cohere2 Attention module, incorporating features like RoPE and sliding window attention.
 
 	Attributes:
-		config (Cohere2Config): Configuration object.
-		layer_idx (int): The index of the current layer.
-		dtype (jnp.dtype): Data type for computation.
-		param_dtype (jnp.dtype): Data type for parameters.
-		precision (jax.lax.PrecisionLike): JAX precision level.
-		rngs (nn.Rngs): Random number generators.
+	  config (Cohere2Config): Configuration object.
+	  layer_idx (int): The index of the current layer.
+	  dtype (jnp.dtype): Data type for computation.
+	  param_dtype (jnp.dtype): Data type for parameters.
+	  precision (jax.lax.PrecisionLike): JAX precision level.
+	  rngs (nn.Rngs): Random number generators.
 	"""
 
 	def __init__(
@@ -207,19 +207,19 @@ class Cohere2Attention(AttentionModule):
 		"""Forward pass for the Cohere2 attention module.
 
 		Args:
-			hidden_states (chex.Array): Input hidden states.
-			attention_mask (chex.Array): Attention mask.
-			position_ids (chex.Array): Position IDs for RoPE.
-			causal_mask (Optional[chex.Array | bool]): Causal mask.
-			cache_view (Optional[TransformerCacheView | PagedAttentionCacheView]): Cache view for kv-caching.
-			cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
-			segment_ids (Optional[chex.Array]): Segment IDs (if applicable).
-			output_attentions (bool): Whether to output attention weights.
-			fcm_mask (Optional[chex.Array]): FCM mask (if applicable).
-			frequencies (Optional[chex.Array]): Precomputed RoPE frequencies.
+		  hidden_states (chex.Array): Input hidden states.
+		  attention_mask (chex.Array): Attention mask.
+		  position_ids (chex.Array): Position IDs for RoPE.
+		  causal_mask (Optional[chex.Array | bool]): Causal mask.
+		  cache_view (Optional[TransformerCacheView | PagedAttentionCacheView]): Cache view for kv-caching.
+		  cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
+		  segment_ids (Optional[chex.Array]): Segment IDs (if applicable).
+		  output_attentions (bool): Whether to output attention weights.
+		  fcm_mask (Optional[chex.Array]): FCM mask (if applicable).
+		  frequencies (Optional[chex.Array]): Precomputed RoPE frequencies.
 
 		Returns:
-			Tuple[chex.Array, Optional[chex.Array]]: Attention output and optionally attention weights.
+		  Tuple[chex.Array, Optional[chex.Array]]: Attention output and optionally attention weights.
 		"""
 		batch_size, sequence_length = hidden_states.shape[:2]
 		(query_states, key_states, value_states) = (
@@ -247,6 +247,12 @@ class Cohere2Attention(AttentionModule):
 			self.config.num_key_value_heads,
 			self.head_dim,
 		)
+		(
+			query_states,
+			key_states,
+			value_states,
+		) = self.apply_qkv_shardings(query_states, key_states, value_states)
+
 		if self.sliding_window is not None:
 			query_states, key_states = self.rotary(
 				query=query_states,

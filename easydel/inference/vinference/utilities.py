@@ -25,12 +25,15 @@ from jax import random, sharding
 from jax.sharding import PartitionSpec
 
 from easydel.utils.compiling_utils import get_safe_hash_int
+from easydel.utils.helpers import get_logger
 
 from ..logits_process import LogitsProcessorList, hash_fn
 from ..utilities import SamplingParams
 
 AmapType = tp.Mapping[str, tp.Dict[str, tp.Any]]
 PropType = tp.Optional[tp.Union[AmapType, tp.List[AmapType]]]
+
+logger = get_logger("vInference-Utils")
 
 
 @auto_pytree
@@ -63,6 +66,56 @@ class vInferencePreCompileConfig:
 	vision_height: tp.Optional[tp.Union[int, tp.List[int]]] = None
 	vision_width: tp.Optional[tp.Union[int, tp.List[int]]] = None
 	required_props: PropType = None
+
+	@staticmethod
+	def _get_paddings(
+		min_token_size: int,
+		max_token_size: int,
+		padding_gap: int,
+	) -> list[int]:
+		paddings = []
+		if min_token_size == max_token_size:
+			return [min_token_size]
+		num = min_token_size
+		if padding_gap == 0:
+			while num <= max_token_size:
+				paddings.append(num)
+				num *= 2
+		else:
+			while num <= padding_gap:
+				paddings.append(num)
+				num *= 2
+			num //= 2
+			while num < max_token_size:
+				num += padding_gap
+				paddings.append(num)
+		return paddings
+
+	@classmethod
+	def create_optimized_compo(
+		cls,
+		batch_size: tp.Union[int, tp.List[int]] = 1,
+		max_prefill_length: int = 2048,
+		min_prefill_length: int = 64,
+		vision_included: tp.Union[bool, tp.List[bool]] = False,
+		vision_batch_size: tp.Optional[tp.Union[int, tp.List[int]]] = None,
+		vision_channels: tp.Optional[tp.Union[int, tp.List[int]]] = None,
+		vision_height: tp.Optional[tp.Union[int, tp.List[int]]] = None,
+		vision_width: tp.Optional[tp.Union[int, tp.List[int]]] = None,
+		required_props: PropType = None,
+	):
+		prefill_length = cls._get_paddings(min_prefill_length, max_prefill_length, 0)
+		logger.info(f"Prefill Lengths {prefill_length}")
+		return cls(
+			batch_size=batch_size,
+			prefill_length=prefill_length,
+			vision_included=vision_included,
+			vision_batch_size=vision_batch_size,
+			vision_channels=vision_channels,
+			vision_height=vision_height,
+			vision_width=vision_width,
+			required_props=required_props,
+		)
 
 	def _im_standalone(self) -> bool:
 		"""

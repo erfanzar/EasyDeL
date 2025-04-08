@@ -322,7 +322,7 @@ class vInference:
 			self.generation_config.eos_token_id = self.tokenizer.eos_token_id
 		if self.generation_config.bos_token_id is None:
 			self.generation_config.bos_token_id = self.tokenizer.bos_token_id
-
+		
 		assert self.generation_config.pad_token_id is not None, (
 			"`pad_token_id` cannot be None. "
 			"(Set `tokenizer.pad_token_id = tokenizer.eos_token_id` if undefined"
@@ -470,6 +470,8 @@ class vInference:
 		model_kwargs = self.model.prepare_inputs_for_generation(
 			input_ids=input_ids,
 			max_length=max_length,
+			pad_token_id=pad_token_id,
+			prefill_length=None,
 			**model_kwargs,
 		)
 

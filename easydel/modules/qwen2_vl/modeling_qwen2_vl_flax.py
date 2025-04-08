@@ -763,6 +763,12 @@ class Qwen2VLAttention(AttentionModule):
 		if position_ids.ndim == 3:
 			position_ids = position_ids[0]
 			# cond vision gen issue will be fixed with no mem issue.
+		(
+			query_states,
+			key_states,
+			value_states,
+		) = self.apply_qkv_shardings(query_states, key_states, value_states)
+
 		query_states, key_states = self.rotary(
 			positions=position_ids,
 			query=query_states,
@@ -1345,7 +1351,9 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 	def prepare_inputs_for_generation(
 		self,
 		input_ids,
-		max_length,
+		max_length: int,
+		pad_token_id: int,
+		prefill_length: int | None = None,
 		past_key_values=None,
 		attention_mask=None,
 		inputs_embeds=None,
@@ -1359,7 +1367,14 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 		batch_size, seq_length = input_ids.shape
 
 		if past_key_values is None:
-			past_key_values = self.init_cache(batch_size, max_length)
+			if prefill_length is None:
+				prefill_length = self.compute_prefill_length(input_ids, pad_token_id)
+			past_key_values = self.init_cache(
+				batch_size,
+				max_length,
+				pad_token_id,
+				prefill_length,
+			)
 
 		if inputs_embeds is not None:
 			model_inputs = {"inputs_embeds": inputs_embeds, "input_ids": None}

@@ -121,7 +121,13 @@ class EasyGenerationMixin:
 	_model_task: tp.Optional[str] = None
 	_model_type: tp.Optional[str] = None
 
-	def init_cache(self, batch_size: int, max_length: int):
+	def init_cache(
+		self,
+		batch_size: int,
+		max_length: int,
+		pad_token_id: int,
+		prefill_length: int | None = None,
+	):
 		head_dim = getattr(self.config, "head_dim", None)
 		if head_dim is None:
 			head_dim = self.config.hidden_size // self.config.num_attention_heads
@@ -139,6 +145,7 @@ class EasyGenerationMixin:
 			metadata=TransformerCacheMetaData.create(
 				partition_axis=self.config.partition_axis,
 				num_hidden_layers=self.config.num_hidden_layers,
+				pad_token_id=pad_token_id,
 				batch_size=batch_size,
 				sequence_length=max_length,
 				num_heads=num_key_value_heads,
@@ -150,6 +157,7 @@ class EasyGenerationMixin:
 				quantization_platform=self.config.platform,
 			),
 			mesh=self.config.mesh,
+			prefill_length=prefill_length,
 		)
 
 	@cached_property
@@ -158,10 +166,16 @@ class EasyGenerationMixin:
 
 		return EasyQuantizer
 
+	@staticmethod
+	def compute_prefill_length(array, padding_id):
+		return jnp.sum(jnp.cumsum(array != padding_id, axis=-1) == 0, axis=-1)
+
 	def prepare_inputs_for_generation(
 		self,
 		input_ids,
-		max_length,
+		max_length: int,
+		pad_token_id: int,
+		prefill_length: int | None = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 		token_type_ids: tp.Optional[chex.Array] = None,
 	):
@@ -179,7 +193,14 @@ class EasyGenerationMixin:
 		    position ids
 		"""
 		batch_size, seq_length = input_ids.shape
-		past_key_values = self.init_cache(batch_size, max_length)
+		if prefill_length is None:
+			prefill_length = self.compute_prefill_length(input_ids, pad_token_id)
+		past_key_values = self.init_cache(
+			batch_size,
+			max_length,
+			pad_token_id,
+			prefill_length,
+		)
 		sharding = input_ids.sharding if hasattr(input_ids, "sharding") else None
 		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="b1")
 		if attention_mask is not None:
@@ -860,7 +881,11 @@ class EasyGenerationMixin:
 
 		model = self.decode if self.config.is_encoder_decoder else self
 		model_kwargs = self.prepare_inputs_for_generation(
-			input_ids, max_length, **model_kwargs
+			input_ids,
+			max_length=max_length,
+			pad_token_id=pad_token_id,
+			prefill_length=None,
+			**model_kwargs,
 		)
 
 		state = GreedyState(
@@ -970,7 +995,9 @@ class EasyGenerationMixin:
 			prng_key=prng_key,
 			model_kwargs=self.prepare_inputs_for_generation(
 				input_ids,
-				max_length,
+				max_length=max_length,
+				pad_token_id=pad_token_id,
+				prefill_length=None,
 				**model_kwargs,
 			),
 		)
@@ -1151,7 +1178,11 @@ class EasyGenerationMixin:
 
 		# initialize model specific kwargs
 		model_kwargs = self.prepare_inputs_for_generation(
-			flatten_beam_dim(input_ids), max_length, **model_kwargs
+			flatten_beam_dim(input_ids),
+			max_length=max_length,
+			pad_token_id=pad_token_id,
+			prefill_length=None,
+			**model_kwargs,
 		)
 
 		# initialize state

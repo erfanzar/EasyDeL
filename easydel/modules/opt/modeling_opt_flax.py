@@ -927,13 +927,22 @@ class OPTForCausalLM(EasyDeLBaseModule):
 	def prepare_inputs_for_generation(
 		self,
 		input_ids,
-		max_length,
+		max_length: int,
+		pad_token_id: int,
+		prefill_length: int | None = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 	):
 		# initializing the cache
 		batch_size, seq_length = input_ids.shape
 
-		past_key_values = self.init_cache(batch_size, max_length)
+		if prefill_length is None:
+			prefill_length = self.compute_prefill_length(input_ids, pad_token_id)
+		past_key_values = self.init_cache(
+			batch_size,
+			max_length,
+			pad_token_id,
+			prefill_length,
+		)
 		# Note that usually one would have to put 0's in the attention_mask for x > input_ids.shape[-1] and x < cache_length.
 		# But since the decoder uses a causal mask, those positions are masked anyway.
 		# Thus, we can create a single static attention_mask here, which is more efficient for compilation

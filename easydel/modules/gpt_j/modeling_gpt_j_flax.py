@@ -147,7 +147,7 @@ class GPTJAttention(AttentionModule):
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior.
 		    segment_ids (tp.Optional[chex.Array], optional): Segment IDs for segment-based attention.
-		    cache_view (tp.Optional[TransformerCacheView | PagedAttentionCacheView], optional): Cache view for key/value states.
+		    cache_view (tp.Optional[TransformerCacheView | PagedAttentionCacheView], optional): Cache view for key_states/value_states states.
 		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata], optional): Metadata for cache handling.
 		    output_attentions (bool, optional): Whether to return attention weights.
 		    frequencies (tp.Optional[chex.Array], optional): Precomputed rotary frequencies.
@@ -155,39 +155,45 @@ class GPTJAttention(AttentionModule):
 		Returns:
 		    tp.Tuple[chex.Array, tp.Optional[chex.Array]]: A tuple containing the attention output and optionally the attention weights.
 		"""
-		query = self.q_proj(hidden_states)
-		key = self.k_proj(hidden_states)
-		value = self.v_proj(hidden_states)
+		query_states = self.q_proj(hidden_states)
+		key_states = self.k_proj(hidden_states)
+		value_states = self.v_proj(hidden_states)
 
-		query = self._split_heads(query)
-		key = self._split_heads(key)
-		value = self._split_heads(value)
+		query_states = self._split_heads(query_states)
+		key_states = self._split_heads(key_states)
+		value_states = self._split_heads(value_states)
 
-		query, key = self.rotary(
+		(
+			query_states,
+			key_states,
+			value_states,
+		) = self.apply_qkv_shardings(query_states, key_states, value_states)
+
+		query_states, key_states = self.rotary(
 			positions=position_ids,
-			query=query,
-			key=key,
+			query=query_states,
+			key=key_states,
 			frequencies=frequencies,
 		)
 
 		(
-			key,
-			value,
+			key_states,
+			value_states,
 			attention_mask,
 			init_attention_bias,
 		) = self.concatenate(
-			query=query,
-			key=key,
+			query_states=query_states,
+			key_states=key_states,
 			cache_view=cache_view,
-			value=value,
+			value_states=value_states,
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,
 			fcm_mask=None,
 		)
 		attentions = self.attention_performer.forward(
-			query_states=query,
-			key_states=key,
-			value_states=value,
+			query_states=query_states,
+			key_states=key_states,
+			value_states=value_states,
 			bias=None,
 			cache_metadata=cache_metadata,
 			cache_view=cache_view,
@@ -359,7 +365,7 @@ class GPTJBlock(nn.Module):
 		    position_ids (chex.Array): Position indices for the tokens.
 		    causal_mask (chex.Array, optional): Causal mask for ensuring autoregressive behavior.
 		    segment_ids (tp.Optional[chex.Array], optional): Segment IDs for segment-based attention.
-		    cache_view (tp.Optional[TransformerCacheView | PagedAttentionCacheView], optional): Cache view for key/value states.
+		    cache_view (tp.Optional[TransformerCacheView | PagedAttentionCacheView], optional): Cache view for key_states/value_states states.
 		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata], optional): Metadata for cache handling.
 		    output_attentions (bool, optional): Whether to return attention weights.
 		    frequencies (tp.Optional[chex.Array], optional): Precomputed rotary frequencies.
@@ -494,7 +500,7 @@ class GPTJModel(EasyDeLBaseModule):
 		    input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
 		    attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
 		    position_ids (chex.Array, optional): Indices of positions of each input sequence token.
-		    past_key_values (TransformerCache | PagedAttentionCache, optional): Cache containing precomputed key/value states.
+		    past_key_values (TransformerCache | PagedAttentionCache, optional): Cache containing precomputed key_states/value_states states.
 		    cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling.
 		    inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
 		    segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
@@ -647,7 +653,7 @@ class GPTJForCausalLM(EasyDeLBaseModule):
 		    input_ids (chex.Array, optional): Input token IDs, shape (batch_size, sequence_length).
 		    attention_mask (chex.Array, optional): Mask to avoid attention on padding tokens.
 		    position_ids (chex.Array, optional): Indices of positions of each input sequence token.
-		    past_key_values (TransformerCache | PagedAttentionCache, optional): Cache containing precomputed key/value states.
+		    past_key_values (TransformerCache | PagedAttentionCache, optional): Cache containing precomputed key_states/value_states states.
 		    cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling.
 		    inputs_embeds (chex.Array, optional): Input embeddings, shape (batch_size, sequence_length, hidden_size).
 		    segment_ids (chex.Array, optional): Segment token indices for segment embeddings.
@@ -678,7 +684,7 @@ class GPTJForCausalLM(EasyDeLBaseModule):
 		if self.config.tie_word_embeddings:
 			lm_logits = jax.lax.dot_general(
 				hidden_states,
-				self.transformer.wte.embedding.value.T,
+				self.transformer.wte.embedding.value_states.T,
 				(((hidden_states.ndim - 1), (0,)), ((), ())),
 			)
 		else:

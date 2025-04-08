@@ -173,12 +173,14 @@ class Xerxes2Attention(AttentionModule):
 			..., self.qk_nope_head_dim : self.qk_nope_head_dim + self.vhead_dim
 		]
 		k_nope = kv[..., : self.qk_nope_head_dim]
+
 		q_pe, k_pe = self.rotary(
 			positions=position_ids,
 			query=q_pe,
 			key=k_pe,
 			frequencies=frequencies,
 		)
+		
 		query_states = (
 			jnp.zeros(
 				(batch_size, sequence_length, self.num_heads, self.qhead_dim),
@@ -599,7 +601,13 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 			past_key_values=outputs.past_key_values,
 		)
 
-	def init_cache(self, batch_size: int, max_length: int):
+	def init_cache(
+		self,
+		batch_size: int,
+		max_length: int,
+		pad_token_id: int,
+		prefill_length: int | None = None,
+	):
 		return TransformerCache.init_cache(
 			dtype=self.dtype,
 			key_values_partition_specs=PartitionSpec(

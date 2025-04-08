@@ -1584,7 +1584,9 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 	def prepare_inputs_for_generation(
 		self,
 		decoder_input_ids,
-		max_length,
+		max_length: int,
+		pad_token_id: int,
+		prefill_length: int | None = None,
 		attention_mask: tp.Optional[jax.Array] = None,
 		decoder_attention_mask: tp.Optional[jax.Array] = None,
 		encoder_outputs=None,
@@ -1593,7 +1595,14 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 		# initializing the cache
 		batch_size, seq_length = decoder_input_ids.shape
 
-		past_key_values = self.init_cache(batch_size, max_length)
+		if prefill_length is None:
+			prefill_length = self.compute_prefill_length(decoder_input_ids, pad_token_id)
+		past_key_values = self.init_cache(
+			batch_size,
+			max_length,
+			pad_token_id,
+			prefill_length,
+		)
 		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="b1")
 		if decoder_attention_mask is not None:
 			position_ids = decoder_attention_mask.cumsum(-1) - 1
