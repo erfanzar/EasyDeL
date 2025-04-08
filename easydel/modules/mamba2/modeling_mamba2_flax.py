@@ -844,7 +844,13 @@ class Mamba2ForCausalLM(EasyDeLBaseModule):
 			hidden_states=mamba_outputs.hidden_states,
 		)
 
-	def init_cache(self, batch_size: int, max_length: int):
+	def init_cache(
+		self,
+		batch_size: int,
+		max_length: int,
+		pad_token_id: int,
+		prefill_length: int | None = None,
+	):
 		return Mamba2Cache.init_cache(
 			metadata=Mamba2CacheMetaData.create(
 				num_hidden_layers=self.config.num_hidden_layers,

@@ -12,9 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ._paged_attention import (
-	paged_attention as pallas_paged_attention,
-	prefill_attention as pallas_prefill_attention,
-)
+from ._caller import ragged_decode as pallas_ragged_decode
 
-__all__ = ("pallas_paged_attention", "pallas_prefill_attention")
+__all__ = ("pallas_ragged_decode",)

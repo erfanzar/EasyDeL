@@ -1892,6 +1892,8 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
 		self,
 		input_ids: chex.Array,
 		max_length: int,
+		pad_token_id: int,
+		prefill_length: int | None = None,
 		pixel_values: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 	):
@@ -1909,6 +1911,8 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
 		model_inputs = self.language_model.prepare_inputs_for_generation(
 			input_ids=input_ids,
 			max_length=max_length,
+			pad_token_id=pad_token_id,
+			prefill_length=prefill_length,
 			attention_mask=attention_mask,
 		)
 		model_inputs["pixel_values"] = pixel_values

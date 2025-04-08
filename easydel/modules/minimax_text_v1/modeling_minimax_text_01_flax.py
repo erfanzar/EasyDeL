@@ -367,6 +367,12 @@ class MiniMaxText01Attention(AttentionModule):
 		key_states = key_states.reshape(kv_shape)
 		value_states = value_states.reshape(kv_shape)
 
+		(
+			query_states,
+			key_states,
+			value_states,
+		) = self.apply_qkv_shardings(query_states, key_states, value_states)
+
 		query_states, key_states = self.rotary(
 			positions=position_ids,
 			query=query_states,

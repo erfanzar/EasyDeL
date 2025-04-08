@@ -29,7 +29,8 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 )
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as Ps
-
+from easydel.kernels.tpu_ops import ragged_attention_pallas
+from easydel.layers.caching.transformer.transformer_cache import TransformerCacheView
 from .._attention_impl import (
 	AttentionImpl,
 	AttentionMetadata,
@@ -99,6 +100,7 @@ class SplashAttn(AttentionImpl):
 		v: Array,
 		mask: tp.Optional[Array] = None,
 		causal: bool = True,
+		cache_view: tp.Optional[TransformerCacheView] = None,
 		**ignore,
 	) -> AttentionOutput:
 		"""
@@ -125,8 +127,7 @@ class SplashAttn(AttentionImpl):
 		query_lenght = q.shape[1]
 		value_lenght = v.shape[1]
 		if (
-			(query_lenght == 1)
-			or not causal
+			not causal
 			or ((query_lenght % 128) != 0)
 			or ((q.shape[-1] % 128) != 0)
 			or ((v.shape[-1] % 128) != 0)
@@ -166,13 +167,12 @@ class SplashAttn(AttentionImpl):
 			block_kv_dq=min(self.metadata.blocksize_k, value_lenght),
 		)
 		qkv_mask_partition_spec = Ps(query_partition_spec[0], query_partition_spec[2])
+		views_partition_spec = Ps(query_partition_spec[0])
 		q_mask, kv_mask = [None] * 2
 		if mask is not None:
 			q_mask, kv_mask = self._split_attention_mask(mask)
-			q_mask, kv_mask = (
-				q_mask.astype("i4"),
-				kv_mask.astype("i4"),
-			)  # pallas dont support int1 or bool in shardmap idk why
+			q_mask, kv_mask = (q_mask.astype("i4"), kv_mask.astype("i4"))
+			# pallas dont support int1 or bool in shardmap idk why
 		pi = [0, 1, 3]
 		mpi = [0]
 		# query_partition_spec is like PB,PH,PS,PD
@@ -180,6 +180,9 @@ class SplashAttn(AttentionImpl):
 		tparallel = self.metadata.mesh.shape[query_partition_spec[1]]
 		if (v.shape[2] % tparallel) == 0 and tparallel <= v.shape[2]:
 			pi = [0, 3]  # shard DP, FSDP and TP
+		index, prefill_length = [None] * 2
+		if cache_view is not None:
+			index, prefill_length = cache_view.index, cache_view.prefill_length
 
 		@functools.partial(
 			shard_map,
@@ -190,30 +193,45 @@ class SplashAttn(AttentionImpl):
 				self.create_stable_sharding(value_partition_spec, pi, dep=v),
 				self.create_stable_sharding(qkv_mask_partition_spec, mpi, dep=q_mask),
 				self.create_stable_sharding(qkv_mask_partition_spec, mpi, dep=kv_mask),
+				self.create_stable_sharding(views_partition_spec, mpi, dep=index),
+				self.create_stable_sharding(views_partition_spec, mpi, dep=prefill_length),
 			),
 			out_specs=self.create_stable_sharding(attention_partition_spec, pi),
 			check_rep=False,
 		)
-		def _wraped_flash_attn(q, k, v, q_mask, kv_mask):
+		def _wraped_flash_attn(q, k, v, q_mask, kv_mask, index, prefill_length):
 			output_shape = q.shape[:-1] + (v.shape[-1],)
 			num_reps = q.shape[1] // k.shape[1]
 			q = q.reshape(q.shape[:-3] + (k.shape[-3], num_reps, q.shape[-2], q.shape[-1]))
-			fn = jax.vmap(
-				jax.vmap(
-					make_splash_mqa_single_device(
-						mask=MultiHeadMask(
-							[CausalMask((q.shape[-2], k.shape[-2])) for _ in range(q.shape[-3])]
+			if q.shape[-2] != 1:
+				fn = jax.vmap(
+					jax.vmap(
+						make_splash_mqa_single_device(
+							mask=MultiHeadMask(
+								[CausalMask((q.shape[-2], k.shape[-2])) for _ in range(q.shape[-3])]
+							),
+							block_sizes=block_sizes,
 						),
-						block_sizes=block_sizes,
+						in_axes=(0, 0, 0, None),
 					),
-					in_axes=(0, 0, 0, None),
-				),
-				in_axes=(0, 0, 0, 0),
-			)
-			m = None
-			if kv_mask is not None:
-				m = SegmentIds(q_mask, kv_mask)
-			return fn(q * sm_scale, k, v, m).reshape(output_shape)
+					in_axes=(0, 0, 0, 0),
+				)
+				m = None
+				if kv_mask is not None:
+					m = SegmentIds(q_mask, kv_mask)
+				out = fn(q * sm_scale, k, v, m)
+			else:
+				out = jax.vmap(
+					functools.partial(
+						ragged_attention_pallas,
+						scale=sm_scale,
+						block_kv=512,
+						block_bs=32,
+					),
+					(1, 1, 1, None, None),
+					1,
+				)(q[..., 0, :], k, v, prefill_length, index)
+			return out.reshape(output_shape)
 
 		attn = _wraped_flash_attn(
 			q.transpose(0, 2, 1, 3).astype(dtype),
@@ -221,6 +239,8 @@ class SplashAttn(AttentionImpl):
 			v.transpose(0, 2, 1, 3).astype(dtype),
 			q_mask,
 			kv_mask,
+			index,
+			prefill_length,
 		).transpose(0, 2, 1, 3)
 
 		return AttentionOutput(attention_weights=None, attention_outputs=attn)
@@ -244,6 +264,7 @@ class SplashAttn(AttentionImpl):
 		v: Array,
 		mask: tp.Optional[Array] = None,
 		causal: bool = True,
+		cache_view: tp.Optional[TransformerCacheView] = None,
 		**ignore,
 	) -> AttentionOutput:
 		"""
@@ -260,12 +281,21 @@ class SplashAttn(AttentionImpl):
 		    mask: Optional attention mask.
 		    causal: If True, applies causal masking. Affects fallback logic and
 		        kernel configuration.
+				cache_view: cache view for current layer.
 		    **ignore: Additional ignored keyword arguments.
 
 		Returns:
 		    An `AttentionOutput` object containing the attention results.
 		"""
-		return super().__call__(q=q, k=k, v=v, mask=mask, causal=causal, **ignore)
+		return super().__call__(
+			q=q,
+			k=k,
+			v=v,
+			mask=mask,
+			causal=causal,
+			cache_view=cache_view,
+			**ignore,
+		)
 
 
 if __name__ == "__main__":

@@ -173,12 +173,19 @@ class DbrxAttention(AttentionModule):
 			self.head_dim,
 		)
 
+		(
+			query_states,
+			key_states,
+			value_states,
+		) = self.apply_qkv_shardings(query_states, key_states, value_states)
+
 		query_states, key_states = self.rotary(
-			position_ids,
+			positions=position_ids,
 			query=query_states,
 			key=key_states,
 			frequencies=frequencies,
 		)
+
 		(
 			key_states,
 			value_states,

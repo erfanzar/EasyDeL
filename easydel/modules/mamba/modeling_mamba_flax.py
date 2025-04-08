@@ -556,7 +556,13 @@ class MambaModel(EasyDeLBaseModule):
 			hidden_states=all_hidden_states,
 		)
 
-	def init_cache(self, batch_size: int, max_length: int):
+	def init_cache(
+		self,
+		batch_size: int,
+		max_length: int,
+		pad_token_id: int,
+		prefill_length: int | None = None,
+	):
 		return MambaCache.init_cache(
 			dtype=self.dtype,
 			partition_specs=jax.sharding.PartitionSpec(
@@ -662,10 +668,23 @@ class MambaForCausalLM(EasyDeLBaseModule):
 		model_kwargs["cache"] = outputs.get("cache", None)
 		return model_kwargs
 
-	def prepare_inputs_for_generation(self, input_ids, max_length, **kwargs):
+	def prepare_inputs_for_generation(
+		self,
+		input_ids,
+		max_length: int,
+		pad_token_id: int,
+		prefill_length: int | None = None,
+		**kwargs,
+	):
 		return self.prepare_inputs_for_call(**{"cache": kwargs.get("cache", None)})
 
-	def init_cache(self, batch_size: int, max_length: int):
+	def init_cache(
+		self,
+		batch_size: int,
+		max_length: int,
+		pad_token_id: int,
+		prefill_length: int | None = None,
+	):
 		return MambaCache.init_cache(
 			dtype=self.dtype,
 			partition_specs=jax.sharding.PartitionSpec(

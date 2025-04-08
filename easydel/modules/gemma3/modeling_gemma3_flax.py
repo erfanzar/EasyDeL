@@ -261,12 +261,19 @@ class Gemma3Attention(AttentionModule):
 		query_states = self.q_norm(query_states)
 		key_states = self.k_norm(key_states)
 
+		(
+			query_states,
+			key_states,
+			value_states,
+		) = self.apply_qkv_shardings(query_states, key_states, value_states)
+
 		query_states, key_states = self.rotary(
+			positions=position_ids,
 			query=query_states,
 			key=key_states,
-			positions=position_ids,
 			frequencies=frequencies,
 		)
+
 		(
 			key_states,
 			value_states,
@@ -1158,6 +1165,8 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 		self,
 		input_ids: chex.Array,
 		max_length: int,
+		pad_token_id: int,
+		prefill_length: int | None = None,
 		pixel_values: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 		token_type_ids: tp.Optional[chex.Array] = None,
@@ -1165,6 +1174,8 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 		model_inputs = self.language_model.prepare_inputs_for_generation(
 			input_ids=input_ids,
 			max_length=max_length,
+			pad_token_id=pad_token_id,
+			prefill_length=prefill_length,
 			attention_mask=attention_mask,
 			token_type_ids=token_type_ids,
 		)

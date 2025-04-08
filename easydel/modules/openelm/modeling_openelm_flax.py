@@ -215,7 +215,6 @@ class OpenELMMultiHeadCausalAttention(AttentionModule):
 		        it also includes the attention weights.
 		"""
 		batch_size, sequence_length = hidden_states.shape[:2]
-		output_attentions = False
 
 		# [B, S, d] --> [B, S, (q_h + k_h + v_h) * h]
 		qkv = self.qkv_proj(hidden_states)
@@ -257,10 +256,16 @@ class OpenELMMultiHeadCausalAttention(AttentionModule):
 			[query_states, key_states, value_states],
 		)
 
+		(
+			query_states,
+			key_states,
+			value_states,
+		) = self.apply_qkv_shardings(query_states, key_states, value_states)
+
 		query_states, key_states = self.rotary(
+			positions=position_ids,
 			query=query_states,
 			key=key_states,
-			positions=position_ids,
 			frequencies=frequencies,
 		)
 
