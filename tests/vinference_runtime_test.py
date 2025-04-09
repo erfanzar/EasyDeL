@@ -28,15 +28,8 @@ def main():
 	if jax.default_backend() == "gpu":
 		dtype = jnp.float16
 		param_dtype = jnp.bfloat16
-		attn_kwargs = dict(
-			attn_dtype=jnp.float16,
-			attn_softmax_dtype=jnp.float16,
-			attn_mechanism=ed.AttentionMechanisms.VANILLA,
-		)
 	else:
-		dtype = jnp.bfloat16
-		param_dtype = jnp.bfloat16
-		attn_kwargs = dict(attn_mechanism=ed.AttentionMechanisms.AUTO)
+		dtype = param_dtype = jnp.bfloat16
 
 	partition_axis = ed.PartitionAxis()
 	processor = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
@@ -51,7 +44,7 @@ def main():
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
 			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-			**attn_kwargs,
+			attn_mechanism=ed.AttentionMechanisms.AUTO,
 		),
 		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 		param_dtype=param_dtype,
