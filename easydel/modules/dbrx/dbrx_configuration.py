@@ -338,7 +338,7 @@ class DbrxConfig(EasyDeLBaseConfig):
 			("ffn/router/layer/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
 			("ffn/router/layer/bias", PartitionSpec(None)),
 			# Layer norms
-			("norm_attn_norm/norm_\d+/(bias|scale)", PartitionSpec(None)),
+			("norm_attn_norm/norm_\\d+/(bias|scale)", PartitionSpec(None)),
 			("transformer/norm_f/(bias|scale)", PartitionSpec(None)),
 			# Catch-all
 			(".*", PartitionSpec(None)),

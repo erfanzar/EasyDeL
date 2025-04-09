@@ -52,7 +52,7 @@ def _get_partition_rules(self, *arg, **kwargs):
 		("mlp/(fc1|gate_proj)/bias", PartitionSpec("tp")),
 		("mlp/(fc2|down_proj)/bias", PartitionSpec(None)),
 		# Layer norms
-		("layer_norm\d*/(bias|scale)", PartitionSpec(None)),
+		("layer_norm\\d*/(bias|scale)", PartitionSpec(None)),
 		(".*layernorm/(bias|scale)", PartitionSpec(None)),
 		# Projections
 		(".*projection/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
