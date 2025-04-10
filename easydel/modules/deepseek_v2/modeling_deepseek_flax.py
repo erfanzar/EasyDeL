@@ -28,10 +28,11 @@ from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
 from easydel.infra.utils import (
 	ACT2FN,
+	HiddenStateSharding,
 	ModuleCaches,
 	auto_remat,
 	block_wise_ffn,
-	control_mlp_sharding,
+	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -213,10 +214,22 @@ class DeepseekV2MLP(nn.Module):
 		self.act_fn = ACT2FN[config.hidden_act]
 
 	def __call__(self, hidden_states: chex.Array):
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-		return self.down_proj(
-			self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
 		)
+
+		gate = self.act_fn(self.gate_proj(hidden_states))
+		up = self.up_proj(hidden_states)
+		hidden_states = self.down_proj(gate * up)
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+		return hidden_states
 
 
 class MoEGate(nn.Module):
@@ -387,7 +400,11 @@ class DeepseekV2MoE(nn.Module):
 			)
 
 	def __call__(self, hidden_states: chex.Array):
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		identity = hidden_states
 		orig_shape = hidden_states.shape
 		topk_idx, topk_weight, aux_loss = self.gate(hidden_states)
@@ -740,7 +757,11 @@ class DeepseekV2DecoderLayer(nn.Module):
 		residual = hidden_states
 
 		hidden_states = self.input_layernorm(hidden_states)
-
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		# Self Attention
 		attn_out = self.self_attn(
 			hidden_states,
@@ -770,11 +791,13 @@ class DeepseekV2DecoderLayer(nn.Module):
 				self.config.scan_mlp_chunk_size,
 			)
 		else:
-			feed_forward_hidden_states = self.mlp(
-				hidden_states,
-			)
+			feed_forward_hidden_states = self.mlp(hidden_states)
 		hidden_states = residual + feed_forward_hidden_states
-
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		outputs = (hidden_states,)
 
 		if output_attentions:
@@ -924,6 +947,12 @@ class DeepseekV2Model(EasyDeLBaseModule):
 		hidden_states = inputs_embeds
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		for idx, layer in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
@@ -1064,6 +1093,12 @@ class DeepseekV2ForCausalLM(EasyDeLBaseModule):
 		)
 
 		hidden_states = outputs[0]
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 
 		if self.config.tie_word_embeddings:
 			lm_logits = jax.lax.dot_general(

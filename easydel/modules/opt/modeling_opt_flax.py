@@ -42,7 +42,7 @@ from jax import lax
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, MaskedLMOutput
-from easydel.infra.utils import ACT2FN, control_mlp_sharding
+from easydel.infra.utils import ACT2FN, HiddenStateSharding, control_runtime_sharding
 from easydel.layers.attention import AttentionModule
 from easydel.layers.caching import (
 	PagedAttentionCache,
@@ -390,8 +390,11 @@ class OPTDecoderLayer(nn.Module):
 		)
 		hidden_states = self.dropout_layer(hidden_states)
 		hidden_states = residual + hidden_states
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-		# 350m applies layer norm AFTER attention
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		if not self.do_layer_norm_before:
 			hidden_states = self.self_attn_layer_norm(hidden_states)
 
@@ -415,7 +418,11 @@ class OPTDecoderLayer(nn.Module):
 		# 350m applies layer norm AFTER attention
 		if not self.do_layer_norm_before:
 			hidden_states = self.final_layer_norm(hidden_states)
-
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		return hidden_states, self_attn_weights
 
 
@@ -646,6 +653,12 @@ class OPTDecoder(EasyDeLBaseModule):
 
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		for idx, decoder_layer in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
@@ -882,6 +895,12 @@ class OPTForCausalLM(EasyDeLBaseModule):
 		)
 
 		hidden_states = outputs[0]
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 
 		if self.config.tie_word_embeddings:
 			shared_kernel = self.model.decoder.embed_tokens.embedding.value.T

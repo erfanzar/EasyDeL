@@ -30,7 +30,7 @@ from easydel.infra.modeling_outputs import (
 	CLIPTextModelOutput,
 	ImageClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, control_mlp_sharding
+from easydel.infra.utils import ACT2FN, HiddenStateSharding, control_runtime_sharding
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.linear import ParallelLinear
 
@@ -424,8 +424,17 @@ class CLIPMLP(nn.Module):
 		Returns:
 			chex.Array: Output hidden states.
 		"""
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		hidden_states = self.fc2(self.activation_fn(self.fc1(hidden_states)))
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		return hidden_states
 
 

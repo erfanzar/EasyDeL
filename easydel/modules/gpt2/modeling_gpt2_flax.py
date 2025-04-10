@@ -44,8 +44,10 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import (
 	ACT2FN,
+	HiddenStateSharding,
 	auto_remat,
 	block_wise_ffn,
+	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -375,7 +377,18 @@ class GPT2MLP(nn.Module):
 		Returns:
 		    chex.Array: Output hidden states after processing through the MLP.
 		"""
-		return self.dropout(self.c_proj(self.act(self.c_fc(hidden_states))))
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+		hidden_states = self.dropout(self.c_proj(self.act(self.c_fc(hidden_states))))
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+		return hidden_states
 
 
 class GPT2Block(nn.Module):
@@ -539,7 +552,11 @@ class GPT2Block(nn.Module):
 		else:
 			feed_forward_hidden_states = self.mlp(hidden_states)
 		hidden_states = residual + feed_forward_hidden_states
-
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		outputs = (hidden_states,) + outputs
 
 		return outputs
@@ -704,6 +721,13 @@ class GPT2Model(EasyDeLBaseModule):
 		)
 
 		hidden_states = outputs[0]
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+
 		hidden_states = self.ln_f(hidden_states)
 
 		if output_hidden_states:
@@ -740,6 +764,8 @@ class GPT2LMHeadModel(EasyDeLBaseModule):
 		precision (jax.lax.PrecisionLike): Precision setting for JAX operations.
 		rngs (nn.Rngs): Random number generators.
 	"""
+
+	loss_type: str = "ForCausalLMLoss"
 
 	def __init__(
 		self,
@@ -820,6 +846,12 @@ class GPT2LMHeadModel(EasyDeLBaseModule):
 		)
 
 		hidden_states = outputs[0]
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 
 		if self.config.tie_word_embeddings:
 			lm_logits = jax.lax.dot_general(

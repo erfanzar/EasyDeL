@@ -30,9 +30,10 @@ from easydel.infra.modeling_outputs import (
 	SequenceClassifierOutput,
 )
 from easydel.infra.utils import (
+	HiddenStateSharding,
 	auto_remat,
 	block_wise_ffn,
-	control_mlp_sharding,
+	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -125,9 +126,18 @@ class Qwen2MoeMLP(nn.Module):
 		Returns:
 		    jnp.ndarray: Output hidden states after MLP transformation.
 		"""
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-		hidden_states = self.down_proj(
-			self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+		gate = self.act_fn(self.gate_proj(hidden_states))
+		up = self.up_proj(hidden_states)
+		hidden_states = self.down_proj(gate * up)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
 		)
 		return hidden_states
 
@@ -431,7 +441,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 		        - final_hidden_states (chex.Array): The output hidden states after MoE processing.
 		        - router_logits (chex.Array): The logits output by the gating network.
 		"""
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		batch_size, sequence_length, hidden_dim = hidden_states.shape
 
 		router_logits = self.gate(hidden_states).astype(
@@ -792,7 +806,12 @@ class Qwen2MoeModel(EasyDeLBaseModule):
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
 
-		hidden_states = inputs_embeds
+		hidden_states = control_runtime_sharding(
+			inputs_embeds,
+			self.config.partition_axis,
+			shorthand="B qS H",
+			decode_mode=1,
+		)
 		for idx, block in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)

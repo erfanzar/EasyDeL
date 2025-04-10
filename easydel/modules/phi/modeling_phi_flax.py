@@ -27,9 +27,10 @@ from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
 from easydel.infra.utils import (
 	ACT2FN,
+	HiddenStateSharding,
 	auto_remat,
 	block_wise_ffn,
-	control_mlp_sharding,
+	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -120,8 +121,18 @@ class PhiMLP(nn.Module):
 		Returns:
 		    Array: Output hidden states after MLP transformation. Shape: (batch_size, sequence_length, hidden_size).
 		"""
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-		return self.fc2(self.act(self.fc1(hidden_states)))
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+		hidden_states = self.fc2(self.act(self.fc1(hidden_states)))
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+		return hidden_states
 
 
 class PhiAttention(AttentionModule):
@@ -507,6 +518,12 @@ class PhiDecoderLayer(nn.Module):
 		residual = hidden_states
 		hidden_states = self.input_layernorm(hidden_states)
 
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+
 		attn_out = self.self_attn(
 			hidden_states,
 			attention_mask,
@@ -535,6 +552,11 @@ class PhiDecoderLayer(nn.Module):
 			feed_forward_hidden_states = self.mlp(hidden_states)
 		feed_forward_hidden_states = self.resid_dropout(feed_forward_hidden_states)
 		hidden_states = attn_outputs + feed_forward_hidden_states + residual
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		outputs = (hidden_states,)
 
 		if output_attentions:
@@ -703,6 +725,12 @@ class PhiModel(EasyDeLBaseModule):
 		hidden_states = inputs_embeds
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		for idx, block in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)

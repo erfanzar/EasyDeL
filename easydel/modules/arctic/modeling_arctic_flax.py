@@ -30,9 +30,10 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import (
 	ACT2FN,
+	HIDDEN_STATE_SHARDING,
 	auto_remat,
 	block_wise_ffn,
-	control_mlp_sharding,
+	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -263,10 +264,20 @@ class ArcticMLP(nn.Module):
 		self.act_fn = ACT2FN[self.config.hidden_act]
 
 	def __call__(self, hidden_states: chex.Array):
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HIDDEN_STATE_SHARDING,
+		)
 		w1 = self.act_fn(self.w1(hidden_states))
 		w3 = self.w3(hidden_states)
-		return self.w2(w1 * w3)
+		hidden_states = self.w2(w1 * w3)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HIDDEN_STATE_SHARDING,
+		)
+		return hidden_states
 
 
 class ArcticMoeBlock(nn.Module):
@@ -347,7 +358,11 @@ class ArcticMoeBlock(nn.Module):
 		Returns:
 			tp.Tuple[chex.Array, chex.Array]: Tuple containing the final hidden state and the router logits.
 		"""
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HIDDEN_STATE_SHARDING,
+		)
 
 		router_logits = self.gate(hidden_states).astype(  # no reshaping is needed
 			jnp.promote_types(self.dtype, jnp.float32)
@@ -504,6 +519,11 @@ class ArcticDecoderLayer(nn.Module):
 	) -> tp.Tuple[chex.Array, tp.Optional[chex.Array], chex.Array]:
 		residual_input = hidden_states
 		hidden_states = self.input_layernorm(hidden_states)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HIDDEN_STATE_SHARDING,
+		)
 		attn_out = self.self_attn(
 			hidden_states,
 			attention_mask,
@@ -675,6 +695,12 @@ class ArcticModel(EasyDeLBaseModule):
 
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HIDDEN_STATE_SHARDING,
+		)
 		for idx, layer in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
@@ -690,6 +716,13 @@ class ArcticModel(EasyDeLBaseModule):
 				frequencies=self.frequencies,
 			)
 			hidden_states = outputs[0]
+
+			hidden_states = control_runtime_sharding(
+				hidden_states,
+				self.config.partition_axis,
+				sharding_strategy=HIDDEN_STATE_SHARDING,
+			)
+
 			if output_attentions:
 				all_self_attns += (outputs[1],)
 			all_router_losses += (outputs[-1],)
@@ -810,7 +843,7 @@ class ArcticForCausalLM(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
-			return_dict=return_dict,
+			return_dict=True,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
@@ -823,7 +856,9 @@ class ArcticForCausalLM(EasyDeLBaseModule):
 			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
-		aux_loss = sum(outputs[-1]) * self.config.router_aux_loss_coef
+			
+		aux_loss = sum(outputs.all_router_losses) * self.config.router_aux_loss_coef
+
 		if not return_dict:
 			outputs = (lm_logits,) + tuple(
 				v
@@ -941,7 +976,7 @@ class ArcticForSequenceClassification(EasyDeLBaseModule):
 			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
+			return_dict=True,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
@@ -968,7 +1003,9 @@ class ArcticForSequenceClassification(EasyDeLBaseModule):
 				sequence_lengths = -1
 
 		pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
-		aux_loss = sum(transformer_outputs[-1]) * self.config.router_aux_loss_coef
+		aux_loss = (
+			sum(transformer_outputs.all_router_losses) * self.config.router_aux_loss_coef
+		)
 
 		if not return_dict:
 			output = (pooled_logits,) + transformer_outputs[1:] + (aux_loss,)

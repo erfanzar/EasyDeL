@@ -33,7 +33,9 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import (
 	ACT2FN,
+	HiddenStateSharding,
 	auto_remat,
+	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -207,9 +209,9 @@ class Llama4TextMLP(nn.Module):
 		self.activation_fn = ACT2FN[self.config.hidden_act]
 
 	def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
-		hidden_states = self.down_proj(
-			self.activation_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
-		)
+		gate = self.activation_fn(self.gate_proj(hidden_states))
+		up = self.up_proj(hidden_states)
+		hidden_states = self.down_proj(gate * up)
 		return hidden_states
 
 
@@ -684,6 +686,12 @@ class Llama4TextModel(EasyDeLBaseModule):
 		hidden_states = inputs_embeds
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		causal_mask = jnp.expand_dims(
 			_create_chunked_attention_mask(
 				self.config.attention_chunk_size,
@@ -819,6 +827,13 @@ class Llama4ForCausalLM(EasyDeLBaseModule):
 		)
 
 		hidden_states = outputs[0]
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+
 		if self.config.tie_word_embeddings:
 			lm_logits = jax.lax.dot_general(
 				hidden_states,
@@ -1317,12 +1332,24 @@ class Llama4VisionEncoderLayer(nn.Module):
 	):
 		residual = hidden_states
 		hidden_states = self.input_layernorm(hidden_states)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		hidden_states, attn_weights = self.self_attn(hidden_states, frequencies)
 		hidden_states = residual + hidden_states
 		residual = hidden_states
 		hidden_states = self.post_attention_layernorm(hidden_states)
 		hidden_states = self.mlp(hidden_states)
 		hidden_states = residual + hidden_states
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+
 		outputs = (hidden_states,)
 
 		if output_attentions:

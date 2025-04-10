@@ -31,8 +31,9 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import (
 	ACT2FN,
+	HiddenStateSharding,
 	auto_remat,
-	control_mlp_sharding,
+	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -534,9 +535,18 @@ class DbrxFFN(nn.Module):
 		)
 
 	def __call__(self, x: chex.Array) -> tp.Tuple[chex.Array, chex.Array]:
-		x = control_mlp_sharding(x, self.config.partition_axis)
+		x = control_runtime_sharding(
+			x,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		weights, top_weights, top_experts = self.router(x)
 		out = self.experts(x, weights, top_weights, top_experts)
+		out = control_runtime_sharding(
+			out,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		return out, weights
 
 
@@ -808,6 +818,13 @@ class DbrxModel(EasyDeLBaseModule):
 				frequencies=self.frequencies,
 			)
 			hidden_states = outputs[0]
+
+			hidden_states = control_runtime_sharding(
+				hidden_states,
+				self.config.partition_axis,
+				sharding_strategy=HiddenStateSharding,
+			)
+
 			if output_attentions:
 				all_attentions += (outputs[1],)
 			if output_router_logits:

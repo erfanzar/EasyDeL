@@ -28,9 +28,10 @@ from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
 from easydel.infra.utils import (
 	ACT2FN,
+	HiddenStateSharding,
 	auto_remat,
 	block_wise_ffn,
-	control_mlp_sharding,
+	control_runtime_sharding,
 	get_dot_general_by_bits,
 	with_sharding_constraint,
 )
@@ -462,7 +463,6 @@ class PhiMoeSparseMoeBlock(nn.Module):
 		"""
 		batch_size, sequence_length, hidden_dim = hidden_states.shape
 		hidden_states = hidden_states.reshape(-1, hidden_dim)
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
 
 		router_logits = self.gate(hidden_states).astype(  # no reshaping is needed
 			jnp.promote_types(self.dtype, jnp.float32)
@@ -629,6 +629,11 @@ class PhiMoeDecoderLayer(nn.Module):
 		residual = hidden_states
 
 		hidden_states = self.input_layernorm(hidden_states)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 
 		attn_out = self.self_attn(
 			hidden_states,
@@ -814,7 +819,13 @@ class PhiMoeModel(EasyDeLBaseModule):
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
 
-		hidden_states = inputs_embeds
+		hidden_states = control_runtime_sharding(
+			inputs_embeds,
+			self.config.partition_axis,
+			shorthand="B qS H",
+			decode_mode=1,
+		)
+
 		for idx, block in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)

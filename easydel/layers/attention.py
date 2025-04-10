@@ -133,7 +133,8 @@ def get_optimal_config() -> tp.Tuple[AttentionMechanisms, jnp.dtype]:
 				return AttentionMechanisms.FLASH_ATTN2, jnp.float32
 			return AttentionMechanisms.SPLASH, jnp.bfloat16
 		case "gpu":
-			return AttentionMechanisms.FLASH_ATTN2, jnp.bfloat16
+			return (AttentionMechanisms.FLASH_ATTN2, jnp.float16)
+			# float16 is better for flash attention
 		case _:
 			return AttentionMechanisms.VANILLA, jnp.bfloat16
 
@@ -340,50 +341,6 @@ class AttentionModule(nn.Module):
 		xk_out = xk_out.astype(xk.dtype)
 		return xq_out, xk_out
 
-	@property
-	def query_sharding(self):
-		return PartitionSpec(
-			self.config.partition_axis.batch_axis,
-			self.config.partition_axis.query_sequence_axis,
-			self.config.partition_axis.head_axis,
-			self.config.partition_axis.attention_dim_axis,
-		)
-
-	@property
-	def key_sharding(self):
-		return PartitionSpec(
-			self.config.partition_axis.batch_axis,
-			self.config.partition_axis.key_sequence_axis,
-			self.config.partition_axis.head_axis,
-			self.config.partition_axis.attention_dim_axis,
-		)
-
-	@property
-	def value_sharding(self):
-		return self.key_sharding
-
-	@property
-	def query_decode_sharding(self):
-		return PartitionSpec(
-			self.config.partition_axis.generation_batch_axis,
-			self.config.partition_axis.generation_query_sequence_axis,
-			self.config.partition_axis.generation_head_axis,
-			self.config.partition_axis.generation_attention_dim_axis,
-		)
-
-	@property
-	def key_decode_sharding(self):
-		return PartitionSpec(
-			self.config.partition_axis.generation_batch_axis,
-			self.config.partition_axis.generation_key_sequence_axis,
-			self.config.partition_axis.generation_head_axis,
-			self.config.partition_axis.generation_attention_dim_axis,
-		)
-
-	@property
-	def value_decode_sharding(self):
-		return self.key_decode_sharding
-
 	def apply_qk_shardings(
 		self,
 		q: jax.Array,
@@ -391,12 +348,11 @@ class AttentionModule(nn.Module):
 	) -> tp.Tuple[jax.Array, jax.Array]:
 		decode_mode = q.shape[1] == 1
 
-		if decode_mode:
-			q = with_sharding_constraint(q, self.query_decode_sharding)
-			k = with_sharding_constraint(k, self.key_decode_sharding)
-		else:
-			q = with_sharding_constraint(q, self.query_sharding)
-			k = with_sharding_constraint(k, self.key_sharding)
+		qspec = self.config.partition_axis.resolve_spec("B qS h D", decode_mode)
+		kspec = self.config.partition_axis.resolve_spec("B kS h D", decode_mode)
+
+		q = with_sharding_constraint(q, qspec)
+		k = with_sharding_constraint(k, kspec)
 		return q, k
 
 	def apply_qkv_shardings(
@@ -406,14 +362,12 @@ class AttentionModule(nn.Module):
 		v: jax.Array,
 	) -> tp.Tuple[jax.Array, jax.Array, jax.Array]:
 		decode_mode = q.shape[1] == 1
-		if decode_mode:
-			q = with_sharding_constraint(q, self.query_decode_sharding)
-			k = with_sharding_constraint(k, self.key_decode_sharding)
-			v = with_sharding_constraint(v, self.value_decode_sharding)
-		else:
-			q = with_sharding_constraint(q, self.query_sharding)
-			k = with_sharding_constraint(k, self.key_sharding)
-			v = with_sharding_constraint(v, self.value_sharding)
+
+		qspec = self.config.partition_axis.resolve_spec("B qS h D", decode_mode)
+		kvspec = self.config.partition_axis.resolve_spec("B kS h D", decode_mode)
+		q = with_sharding_constraint(q, qspec)
+		k = with_sharding_constraint(k, kvspec)
+		v = with_sharding_constraint(v, kvspec)
 		return q, k, v
 
 	def make_flexible_sliding_window(
@@ -703,7 +657,7 @@ class AttentionModule(nn.Module):
 				jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
 				jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
 			)
-		
+
 		return key, value, attention_mask, init_attention_bias
 
 	def shard_attention_prod(self, attn_output: jax.Array) -> jax.Array:
