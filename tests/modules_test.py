@@ -195,6 +195,7 @@ class EasyModelsTest(unittest.TestCase):
 			ed_model = ed_model.shard_model()
 			try:
 
+				@ed.utils.cjit
 				@jax.jit
 				def jited(ids):
 					return ed_model.compute_loss(
@@ -207,6 +208,7 @@ class EasyModelsTest(unittest.TestCase):
 				ed_output = jited(jax_input_ids)
 			except Exception:
 
+				@ed.utils.cjit
 				@jax.jit
 				def jited(ids):
 					return ed_model.compute_loss(
@@ -987,41 +989,41 @@ if __name__ == "__main__":
 	test = EasyModelsTest()
 	test.setUp()
 
-	# test.test_gemma3_text()  # Passed
-	# test.test_gemma3()  # Passed
-	# test.test_arctic()  # Passed
-	# test.test_cohere()  # Passed
-	# test.test_cohere2()  # Passed
-	# test.test_dbrx()  # Passed
-	# test.test_deepseek_v2()  # Passed
-	# test.test_deepseek_v3()  # Passed
-	# test.test_exaone()  # Passed
-	# test.test_falcon()  # Passed
-	# test.test_gemma()  # Passed
-	# test.test_gemma2()  # Passed
-	# test.test_gptj()  # Passed
-	# test.test_gpt_noex()  # Passed
-	# test.test_gpt2()  # Passed
-	# # test.test_grok1() # Not Tested Yet!
-	# test.test_internlm2()  # Passed
-	# test.test_llama()  # Passed
+	test.test_gemma3_text()  # Passed
+	test.test_gemma3()  # Passed
+	test.test_arctic()  # Passed
+	test.test_cohere()  # Passed
+	test.test_cohere2()  # Passed
+	test.test_dbrx()  # Passed
+	test.test_deepseek_v2()  # Passed
+	test.test_deepseek_v3()  # Passed
+	test.test_exaone()  # Passed
+	test.test_falcon()  # Passed
+	test.test_gemma()  # Passed
+	test.test_gemma2()  # Passed
+	test.test_gptj()  # Passed
+	test.test_gpt_noex()  # Passed
+	test.test_gpt2()  # Passed
+	# test.test_grok1() # Not Tested Yet!
+	test.test_internlm2()  # Passed
+	test.test_llama()  # Passed
 	# test.test_llama4()  # Passed
-	test.test_llama4_cond()  # Passed
-	# test.test_mamba()  # Passed
+	# test.test_llama4_cond()  # Passed
+	test.test_mamba()  # Passed
 	# test.test_mamba2()  # Passed - ReCheck
-	# test.test_mistral()  # Passed
-	# test.test_mixtral()  # Passed
-	# test.test_mpt()  # Passed
-	# test.test_olmo()  # Passed
-	# test.test_olmo2()  # Passed
-	# test.test_openelm()  # Passed
-	# test.test_phi()  # Passed
-	# test.test_phi3()  # Passed
+	test.test_mistral()  # Passed
+	test.test_mixtral()  # Passed
+	test.test_mpt()  # Passed
+	test.test_olmo()  # Passed
+	test.test_olmo2()  # Passed
+	test.test_openelm()  # Passed
+	test.test_phi()  # Passed
+	test.test_phi3()  # Passed
 	# test.test_phimoe()  # Failed v0.0.80 - N  Runtime
-	# test.test_qwen2()  # Passed
-	# test.test_qwen2_moe()  # Passed
-	# test.test_qwen2_vl()  # Passed
-	# test.test_qwen3()  # Passed
-	# test.test_qwen3_moe()  # Passed
-	# test.test_stablelm()  # Passed
+	test.test_qwen2()  # Passed
+	test.test_qwen2_moe()  # Passed
+	test.test_qwen2_vl()  # Passed
+	test.test_qwen3()  # Passed
+	test.test_qwen3_moe()  # Passed
+	test.test_stablelm()  # Passed
 	# -----------------------------------------------

@@ -26,8 +26,9 @@ from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
 from easydel.infra.utils import (
 	ACT2FN,
+	HiddenStateSharding,
 	auto_remat,
-	control_mlp_sharding,
+	control_runtime_sharding,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
@@ -162,10 +163,10 @@ class GPTNeoXAttention(AttentionModule):
 			attention_mask,
 			init_attention_bias,
 		) = self.concatenate(
-			query_states=query_states,
-			key_states=key_states,
+			query=query_states,
+			key=key_states,
+			value=value_states,
 			cache_view=cache_view,
-			value_states=value_states,
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,
 			fcm_mask=None,
@@ -245,11 +246,18 @@ class GPTNeoXMlp(nn.Module):
 		Returns:
 		    chex.Array: Output hidden states after processing through the MLP.
 		"""
-		hidden_states = control_mlp_sharding(
+		hidden_states = control_runtime_sharding(
 			hidden_states,
 			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
 		)
-		return self.dense_4h_to_h(self.act(self.dense_h_to_4h(hidden_states)))
+		hidden_states = self.dense_4h_to_h(self.act(self.dense_h_to_4h(hidden_states)))
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+		return hidden_states
 
 
 class GPTNeoXBlock(nn.Module):
@@ -505,6 +513,12 @@ class GPTNeoXModel(EasyDeLBaseModule):
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
 
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+
 		for idx, block in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
@@ -639,10 +653,16 @@ class GPTNeoXForCausalLM(EasyDeLBaseModule):
 		)
 		hidden_states = outputs[0]
 
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+
 		if self.config.tie_word_embeddings:
 			lm_logits = jax.lax.dot_general(
 				hidden_states,
-				self.gpt_neox.embed_in.embedding.value_states.T,
+				self.gpt_neox.embed_in.embedding.T,
 				(((hidden_states.ndim - 1), (0,)), ((), ())),
 			)
 		else:

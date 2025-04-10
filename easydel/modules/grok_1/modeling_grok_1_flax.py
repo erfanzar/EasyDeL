@@ -29,9 +29,10 @@ from easydel.infra.modeling_outputs import (
 	MoeModelOutput,
 )
 from easydel.infra.utils import (
+	HiddenStateSharding,
 	auto_remat,
 	block_wise_ffn,
-	control_mlp_sharding,
+	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -343,10 +344,20 @@ class Grok1BLockSparseMLP(nn.Module):
 		Returns:
 		    chex.Array: Output hidden states after processing through the block sparse MLP.
 		"""
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-		return self.linear_1(
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+		hidden_states = self.linear_1(
 			nn.gelu(self.linear(hidden_states)) * self.linear_v(hidden_states)
 		)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+		return hidden_states
 
 
 class Grok1SparseMoeBlock(nn.Module):
@@ -409,7 +420,11 @@ class Grok1SparseMoeBlock(nn.Module):
 		    tp.Tuple[chex.Array, chex.Array]: A tuple containing the output hidden states
 		        and the router logits.
 		"""
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 
 		router_logits = self.gate(hidden_states).astype(
 			jnp.promote_types(self.dtype, jnp.float32)
@@ -733,6 +748,12 @@ class Grok1Model(EasyDeLBaseModule):
 		hidden_states = inputs_embeds
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		for idx, block in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)

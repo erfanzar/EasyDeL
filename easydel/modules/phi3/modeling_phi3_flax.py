@@ -27,9 +27,10 @@ from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
 from easydel.infra.utils import (
 	ACT2FN,
+	HiddenStateSharding,
 	auto_remat,
 	block_wise_ffn,
-	control_mlp_sharding,
+	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -116,11 +117,21 @@ class Phi3MLP(nn.Module):
 		Returns:
 		    Array: Output hidden states after MLP transformation. Shape: (batch_size, sequence_length, hidden_size).
 		"""
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		up_states = self.gate_up_proj(hidden_states)
 		gate, up_states = jnp.split(up_states, 2, axis=-1)
 		up_states = up_states * self.activation_fn(gate)
-		return self.down_proj(up_states)
+		hidden_states = self.down_proj(up_states)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+		return hidden_states
 
 
 class Phi3Attention(AttentionModule):
@@ -463,6 +474,11 @@ class Phi3DecoderLayer(nn.Module):
 		"""
 		residual = hidden_states
 		hidden_states = self.input_layernorm(hidden_states)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 
 		attn_out = self.self_attn(
 			hidden_states,
@@ -493,6 +509,11 @@ class Phi3DecoderLayer(nn.Module):
 			feed_forward_hidden_states = self.mlp(hidden_states)
 
 		hidden_states = residual + self.resid_mlp_dropout(feed_forward_hidden_states)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		outputs = (hidden_states,)
 
 		if output_attentions:
@@ -654,7 +675,14 @@ class Phi3Model(EasyDeLBaseModule):
 			attention_mask = jnp.expand_dims(attention_mask, (1, 2))
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
-		hidden_states = inputs_embeds
+
+		hidden_states = control_runtime_sharding(
+			inputs_embeds,
+			self.config.partition_axis,
+			shorthand="B qS H",
+			decode_mode=1,
+		)
+
 		for idx, block in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)

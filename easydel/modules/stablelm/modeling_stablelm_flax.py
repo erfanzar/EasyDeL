@@ -26,9 +26,10 @@ from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
 from easydel.infra.utils import (
 	ACT2FN,
+	HiddenStateSharding,
 	auto_remat,
 	block_wise_ffn,
-	control_mlp_sharding,
+	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -117,11 +118,21 @@ class StableLmMLP(nn.Module):
 		Returns:
 		    jnp.ndarray: Output hidden states after MLP transformation.
 		"""
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-
-		return self.down_proj(
-			self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
 		)
+
+		gate = self.act_fn(self.gate_proj(hidden_states))
+		up = self.up_proj(hidden_states)
+		hidden_states = self.down_proj(gate * up)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+		return hidden_states
 
 
 class StableLmLayerNormPerHead(nn.Module):
@@ -555,6 +566,11 @@ class StableLmDecoderLayer(nn.Module):
 
 		residual = hidden_states
 		hidden_states = self.input_layernorm(hidden_states)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		attn_out = self.self_attn(
 			hidden_states,
 			attention_mask,
@@ -598,6 +614,11 @@ class StableLmDecoderLayer(nn.Module):
 		if output_attentions:
 			outputs += (self_attn_weights,)
 
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		return outputs
 
 
@@ -753,6 +774,12 @@ class StableLmModel(EasyDeLBaseModule):
 
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		for idx, block in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
@@ -898,6 +925,12 @@ class StableLmForCausalLM(EasyDeLBaseModule):
 			segment_ids=segment_ids,
 		)
 		hidden_states = outputs[0]
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 
 		if self.config.tie_word_embeddings:
 			lm_logits = jax.lax.dot_general(

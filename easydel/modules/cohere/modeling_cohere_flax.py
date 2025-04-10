@@ -29,9 +29,10 @@ from easydel.infra.modeling_outputs import (
 	SequenceClassifierOutput,
 )
 from easydel.infra.utils import (
+	HiddenStateSharding,
 	auto_remat,
 	block_wise_ffn,
-	control_mlp_sharding,
+	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -305,9 +306,18 @@ class CohereMLP(nn.Module):
 		self.up_proj = linear_class(config.hidden_size, config.intermediate_size)
 
 	def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-		hidden_states = self.down_proj(
-			jax.nn.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+		gate = jax.nn.silu(self.gate_proj(hidden_states))
+		up = self.up_proj(hidden_states)
+		hidden_states = self.down_proj(gate * up)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
 		)
 		return hidden_states
 
@@ -390,6 +400,11 @@ class CohereBlock(nn.Module):
 		"""
 		residual = hidden_states
 		hidden_states = self.input_layernorm(hidden_states)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		attn_outputs = self.self_attn(
 			hidden_states,
 			attention_mask,
@@ -413,12 +428,14 @@ class CohereBlock(nn.Module):
 				self.config.scan_mlp_chunk_size,
 			)
 		else:
-			feed_forward_hidden_states = self.mlp(
-				feed_forward_input,
-			)
+			feed_forward_hidden_states = self.mlp(feed_forward_input)
 
 		hidden_states = attn_output + feed_forward_hidden_states + residual
-
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		return (hidden_states,) + attn_outputs[1:]
 
 
@@ -525,6 +542,12 @@ class CohereModel(EasyDeLBaseModule):
 		hidden_states = inputs_embeds
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		for idx, block in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
@@ -661,6 +684,12 @@ class CohereForCausalLM(EasyDeLBaseModule):
 		)
 
 		hidden_states = outputs[0]
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 
 		if self.config.tie_word_embeddings:
 			lm_logits = jax.lax.dot_general(

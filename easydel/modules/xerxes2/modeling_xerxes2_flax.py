@@ -26,9 +26,10 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
 from easydel.infra.utils import (
+	HiddenStateSharding,
 	auto_remat,
 	block_wise_ffn,
-	control_mlp_sharding,
+	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -180,7 +181,7 @@ class Xerxes2Attention(AttentionModule):
 			key=k_pe,
 			frequencies=frequencies,
 		)
-		
+
 		query_states = (
 			jnp.zeros(
 				(batch_size, sequence_length, self.num_heads, self.qhead_dim),
@@ -276,10 +277,20 @@ class Xerxes2MLP(nn.Module):
 		)
 
 	def __call__(self, hidden_states):
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		up_states = self.gate_up_proj(hidden_states)
 		gate, up_states = jnp.split(up_states, 2, axis=-1)
-		return self.down_proj(up_states * nn.silu(gate))
+		hidden_states = self.down_proj(up_states * nn.silu(gate))
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+		return hidden_states
 
 
 class Xerxes2DecoderLayer(nn.Module):
@@ -353,6 +364,11 @@ class Xerxes2DecoderLayer(nn.Module):
 		residual = hidden_states
 
 		hidden_states = self.input_layernorm(hidden_states)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		hidden_states, attn_weight = self.self_attn(
 			hidden_states,
 			attention_mask,
@@ -379,6 +395,11 @@ class Xerxes2DecoderLayer(nn.Module):
 			hidden_states = self.mlp(hidden_states)
 		hidden_states = self.post_feedforward_layernorm(hidden_states)
 		hidden_states = residual + hidden_states
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		return hidden_states, attn_weight
 
 
@@ -475,6 +496,12 @@ class Xerxes2Model(EasyDeLBaseModule):
 		hidden_states = inputs_embeds
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		for idx, block in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
@@ -582,6 +609,13 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 		)
 
 		hidden_states = outputs[0]
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+
 		if self.config.tie_word_embeddings:
 			lm_logits = jax.lax.dot_general(
 				hidden_states,

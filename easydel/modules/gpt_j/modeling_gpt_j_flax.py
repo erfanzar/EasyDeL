@@ -26,8 +26,10 @@ from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
 from easydel.infra.utils import (
 	ACT2FN,
+	HiddenStateSharding,
 	auto_remat,
 	block_wise_ffn,
+	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -182,10 +184,10 @@ class GPTJAttention(AttentionModule):
 			attention_mask,
 			init_attention_bias,
 		) = self.concatenate(
-			query_states=query_states,
-			key_states=key_states,
+			query=query_states,
+			key=key_states,
+			value=value_states,
 			cache_view=cache_view,
-			value_states=value_states,
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,
 			fcm_mask=None,
@@ -397,7 +399,11 @@ class GPTJBlock(nn.Module):
 			feed_forward_hidden_states = self.mlp(hidden_states)
 		# residual connection
 		hidden_states = attn_output + feed_forward_hidden_states + residual
-
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		return (hidden_states,) + attn_outputs[1:]
 
 
@@ -680,6 +686,12 @@ class GPTJForCausalLM(EasyDeLBaseModule):
 		)
 
 		hidden_states = outputs[0]
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 
 		if self.config.tie_word_embeddings:
 			lm_logits = jax.lax.dot_general(

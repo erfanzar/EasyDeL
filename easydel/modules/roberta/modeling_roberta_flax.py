@@ -35,7 +35,9 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import (
 	ACT2FN,
+	HiddenStateSharding,
 	auto_remat,
+	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -887,6 +889,13 @@ class RobertaModel(EasyDeLBaseModule):
 			return_dict=return_dict,
 		)
 		hidden_states = outputs[0]
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+
 		pooled = self.pooler(hidden_states) if self.add_pooling_layer else None
 
 		if not return_dict:
@@ -1143,6 +1152,13 @@ class RobertaForTokenClassification(EasyDeLBaseModule):
 		)
 
 		hidden_states = outputs[0]
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+
 		hidden_states = self.dropout(hidden_states)
 		logits = self.classifier(hidden_states)
 
@@ -1215,6 +1231,12 @@ class RobertaForQuestionAnswering(EasyDeLBaseModule):
 		)
 
 		hidden_states = outputs[0]
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 
 		logits = self.qa_outputs(hidden_states)
 		start_logits, end_logits = logits.split(self.config.num_labels, axis=-1)
@@ -1300,6 +1322,13 @@ class RobertaForCausalLM(EasyDeLBaseModule):
 		)
 
 		hidden_states = outputs[0]
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+
 		if self.config.tie_word_embeddings:
 			shared_embedding = self.roberta.embeddings.word_embeddings.embedding.value
 		else:

@@ -26,9 +26,10 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
 from easydel.infra.utils import (
+	HiddenStateSharding,
 	auto_remat,
 	block_wise_ffn,
-	control_mlp_sharding,
+	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -404,8 +405,18 @@ class FalconMlp(nn.Module):
 		)
 
 	def __call__(self, x: chex.Array, deterministic: bool = True):
-		x = control_mlp_sharding(x, self.config.partition_axis)
-		return self.dense_4h_to_h(nn.gelu(self.dense_h_to_4h(x), approximate=False))
+		x = control_runtime_sharding(
+			x,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+		x = self.dense_4h_to_h(nn.gelu(self.dense_h_to_4h(x), approximate=False))
+		x = control_runtime_sharding(
+			x,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+		return x
 
 
 class FalconBlock(nn.Module):

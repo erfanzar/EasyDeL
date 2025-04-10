@@ -26,9 +26,10 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
 from easydel.infra.utils import (
+	HiddenStateSharding,
 	auto_remat,
 	block_wise_ffn,
-	control_mlp_sharding,
+	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -311,20 +312,36 @@ class XerxesMLP(nn.Module):
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
 		self.gate_proj = linear_class(
-			self.config.hidden_size, self.config.intermediate_size, rngs=rngs
+			self.config.hidden_size,
+			self.config.intermediate_size,
+			rngs=rngs,
 		)
 		self.up_proj = linear_class(
-			self.config.hidden_size, self.config.intermediate_size, rngs=rngs
+			self.config.hidden_size,
+			self.config.intermediate_size,
+			rngs=rngs,
 		)
 		self.down_proj = linear_class(
-			self.config.intermediate_size, self.config.hidden_size, rngs=rngs
+			self.config.intermediate_size,
+			self.config.hidden_size,
+			rngs=rngs,
 		)
 
 	def __call__(self, hidden_states):
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-		return self.down_proj(
-			self.act(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
 		)
+		gate = self.act(self.gate_proj(hidden_states))
+		up = self.up_proj(hidden_states)
+		hidden_states = self.down_proj(gate * up)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+		return hidden_states
 
 
 class XerxesSparseMoeBlock(nn.Module):
@@ -364,7 +381,11 @@ class XerxesSparseMoeBlock(nn.Module):
 		]
 
 	def __call__(self, hidden_states: chex.Array) -> tp.Tuple[chex.Array, chex.Array]:
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		router_logits = self.gate(hidden_states).astype(
 			jnp.promote_types(self.dtype, jnp.float32)
 		)
@@ -484,6 +505,11 @@ class XerxesDecoderLayer(nn.Module):
 		residual = hidden_states
 
 		hidden_states = self.input_layernorm(hidden_states)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		hidden_states, attn_weight = self.self_attn(
 			hidden_states,
 			attention_mask,
@@ -509,6 +535,11 @@ class XerxesDecoderLayer(nn.Module):
 			hidden_states = self.mlp(hidden_states)
 		hidden_states = self.post_feedforward_layernorm(hidden_states)
 		hidden_states = residual + hidden_states
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		return hidden_states, attn_weight
 
 
@@ -623,7 +654,13 @@ class XerxesModel(EasyDeLBaseModule):
 
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
-		hidden_states = inputs_embeds
+
+		hidden_states = control_runtime_sharding(
+			inputs_embeds,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+
 		for idx, block in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
@@ -640,6 +677,12 @@ class XerxesModel(EasyDeLBaseModule):
 				frequencies=self.frequencies,
 			)
 			hidden_states = outputs[0]
+
+			hidden_states = control_runtime_sharding(
+				hidden_states,
+				self.config.partition_axis,
+				sharding_strategy=HiddenStateSharding,
+			)
 
 			if output_attentions:
 				all_attentions += (outputs[1],)
@@ -748,6 +791,13 @@ class XerxesForCausalLM(EasyDeLBaseModule):
 			segment_ids=segment_ids,
 		)
 		hidden_states = outputs[0]
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+
 		if self.config.tie_word_embeddings:
 			lm_logits = jax.lax.dot_general(
 				hidden_states,

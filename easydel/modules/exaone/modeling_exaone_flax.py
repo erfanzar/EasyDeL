@@ -30,9 +30,10 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import (
 	ACT2FN,
+	HiddenStateSharding,
 	auto_remat,
 	block_wise_ffn,
-	control_mlp_sharding,
+	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -79,10 +80,20 @@ class ExaoneGatedMLP(nn.Module):
 		self.act_fn = ACT2FN[config.activation_function]
 
 	def __call__(self, hidden_states: chex.Array):
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-		return self.c_proj(
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+		hidden_states = self.c_proj(
 			self.act_fn(self.c_fc_0(hidden_states)) * self.c_fc_1(hidden_states)
 		)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+		return hidden_states
 
 
 class ExaoneAttentionInner(AttentionModule):
@@ -393,11 +404,14 @@ class ExaoneDecoderLayer(nn.Module):
 				self.config.scan_mlp_chunk_size,
 			)
 		else:
-			feed_forward_hidden_states = self.mlp(
-				hidden_states,
-			)
+			feed_forward_hidden_states = self.mlp(hidden_states)
 
 		hidden_states = residual + feed_forward_hidden_states
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		outputs = (hidden_states,)
 		if output_attentions:
 			outputs += (attention_output[1],)
@@ -653,6 +667,12 @@ class ExaoneForCausalLM(EasyDeLBaseModule):
 		)
 
 		hidden_states = outputs[0]
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 
 		if self.config.tie_word_embeddings:
 			lm_logits = jax.lax.dot_general(

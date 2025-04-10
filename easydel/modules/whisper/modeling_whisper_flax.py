@@ -41,7 +41,12 @@ from easydel.infra.modeling_outputs import (
 	Seq2SeqModelOutput,
 	SequenceClassifierOutput,
 )
-from easydel.infra.utils import ACT2FN, get_dot_general_by_bits
+from easydel.infra.utils import (
+	ACT2FN,
+	HiddenStateSharding,
+	control_runtime_sharding,
+	get_dot_general_by_bits,
+)
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.caching import (
 	TransformerCache,
@@ -951,6 +956,12 @@ class WhisperDecoder(EasyDeLBaseModule):
 		)
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 		for idx, decoder_layer in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
@@ -1366,6 +1377,12 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 
 		hidden_states = outputs[0]
 
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+
 		if self.config.tie_word_embeddings:
 			self.proj_out.kernel.value = (
 				self.model.decoder.embed_tokens.embedding.value.T.astype(self.param_dtype)
@@ -1428,6 +1445,12 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 			return_dict=return_dict,
 		)
 		hidden_states = outputs[0]
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 
 		if self.config.tie_word_embeddings:
 			self.proj_out.kernel.value = (

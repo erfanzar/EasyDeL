@@ -31,9 +31,10 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import (
 	ACT2FN,
+	HiddenStateSharding,
 	auto_remat,
 	block_wise_ffn,
-	control_mlp_sharding,
+	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -328,8 +329,22 @@ class MixtralBLockSparseTop2MLP(nn.Module):
 		self.act_fn = ACT2FN[self.config.hidden_act]
 
 	def __call__(self, hidden_states: chex.Array):
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
-		return self.w2(self.act_fn(self.w1(hidden_states)) * self.w3(hidden_states))
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+
+		w1 = self.act_fn(self.w1(hidden_states))
+		w3 = self.w3(hidden_states)
+		hidden_states = self.w2(w1 * w3)
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
+		return hidden_states
 
 
 class MixtralSparseMoeBlock(nn.Module):
@@ -395,7 +410,11 @@ class MixtralSparseMoeBlock(nn.Module):
 		]
 
 	def __call__(self, hidden_states: chex.Array) -> tp.Tuple[chex.Array, chex.Array]:
-		hidden_states = control_mlp_sharding(hidden_states, self.config.partition_axis)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 
 		router_logits = self.gate(hidden_states).astype(
 			jnp.promote_types(self.dtype, jnp.float32)
@@ -549,6 +568,11 @@ class MixtralDecoderLayer(nn.Module):
 		"""
 		residual = hidden_states
 		hidden_states = self.input_layernorm(hidden_states)
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 
 		attn_out = self.self_attn(
 			hidden_states,
@@ -750,6 +774,12 @@ class MixtralModel(EasyDeLBaseModule):
 		hidden_states = inputs_embeds
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
+
+		hidden_states = control_runtime_sharding(
+			hidden_states,
+			self.config.partition_axis,
+			sharding_strategy=HiddenStateSharding,
+		)
 
 		for idx, block in enumerate(self.layers):
 			if output_hidden_states:

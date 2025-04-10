@@ -25,13 +25,12 @@ from typing import List, Set
 import flax
 import flax.core
 import jax
-import jax.experimental
 import jax.tree_util
 import numpy as np
 from eformer.escale import PartitionAxis, with_sharding_constraint
 from einops import rearrange
 from flax import nnx as nn
-from jax.sharding import PartitionSpec
+from jax.sharding import PartitionSpec as Ps
 from tqdm.auto import tqdm
 
 from easydel.layers.linear import ParallelLinear
@@ -56,6 +55,10 @@ logger = get_logger(__name__)
 def quick_gelu(x):
 	return x * jax.nn.sigmoid(1.702 * x)
 
+
+HiddenStateSharding = dict(shorthand="B qS H", decode_mode=1)
+AttnQSharding = dict(shorthand="B qS h D", decode_mode=1)
+AttnKVSharding = dict(shorthand="B kS h D", decode_mode=1)
 
 ACT2FN = {
 	"gelu": partial(nn.gelu, approximate=False),
@@ -232,26 +235,24 @@ def block_wise_ffn(remat_ffn, inputs, chunk_size: int):
 		) from e
 
 
-def control_mlp_sharding(
-	x: jax.Array,
-	partition_axis: PartitionAxis,
-	force_spec: PartitionSpec = None,
+def control_runtime_sharding(
+	arr: jax.Array,
+	paxis: PartitionAxis,
+	shorthand: str = None,
+	decode_mode: bool | int = 1,
+	sharding_strategy: tp.Optional[dict] = None,
 ):
-	"""
-	handles MLP Shardings
-	"""
-	sqax = (
-		partition_axis.sequence_axis
-		if x.shape[1] != 1
-		else partition_axis.generation_query_sequence_axis
-	)
-	force_spec = force_spec or PartitionSpec(
-		partition_axis.batch_axis,
-		sqax,
-		partition_axis.hidden_state_axis,
-	)
-	x = with_sharding_constraint(x, sharding=force_spec)
-	return x
+	"""handles RunTime Shardings"""
+	if shorthand is None and sharding_strategy is None:
+		raise NotImplementedError("You should at least pass shorthand or sharding_stragedy")
+	if shorthand is None:
+		shorthand = sharding_strategy["shorthand"]
+		decode_mode = sharding_strategy["decode_mode"]
+	if isinstance(decode_mode, int):
+		decode_mode = arr.shape[decode_mode] == 1
+	specs = paxis.resolve_spec(shorthand, decode_mode)
+	arr = with_sharding_constraint(arr, sharding=specs)
+	return arr
 
 
 def is_flatten(pytree: dict):
@@ -993,6 +994,84 @@ class CompilationTracker:
 			self.first_time = False
 		else:
 			yield
+
+
+def mlp3d_sharding(paxis, decode_mode: bool = False) -> Ps:
+	if decode_mode:
+		return Ps(
+			paxis.generation_batch_axis,
+			paxis.generation_query_sequence_axis,
+			paxis.hidden_state_axis,
+		)
+	else:
+		return Ps(
+			paxis.batch_axis,
+			paxis.query_sequence_axis,
+			paxis.hidden_state_axis,
+		)
+
+
+def attention4d_sharding(paxis, isq: bool = False, decode_mode: bool = False) -> Ps:
+	if isq:
+		if decode_mode:
+			return Ps(
+				paxis.generation_batch_axis,
+				paxis.generation_query_sequence_axis,
+				paxis.generation_attention_dim_axis,
+				paxis.generation_head_axis,
+			)
+		else:
+			return Ps(
+				paxis.batch_axis,
+				paxis.query_sequence_axis,
+				paxis.attention_dim_axis,
+				paxis.head_axis,
+			)
+	else:
+		if decode_mode:
+			return Ps(
+				paxis.generation_batch_axis,
+				paxis.generation_key_sequence_axis,
+				paxis.generation_attention_dim_axis,
+				paxis.generation_head_axis,
+			)
+		else:
+			return Ps(
+				paxis.batch_axis,
+				paxis.key_sequence_axis,
+				paxis.attention_dim_axis,
+				paxis.head_axis,
+			)
+
+
+def attention3d_sharding(paxis, decode_mode: bool = False) -> Ps:
+	if decode_mode:
+		return Ps(
+			paxis.generation_batch_axis,
+			paxis.generation_query_sequence_axis,
+			paxis.generation_head_axis,
+		)
+	else:
+		return Ps(
+			paxis.batch_axis,
+			paxis.query_sequence_axis,
+			paxis.head_axis,
+		)
+
+
+def runtime3d_sharding(paxis, decode_mode: bool = False) -> Ps:
+	if decode_mode:
+		return Ps(
+			paxis.generation_batch_axis,
+			paxis.generation_query_sequence_axis,
+			paxis.generation_head_axis,
+		)
+	else:
+		return Ps(
+			paxis.batch_axis,
+			paxis.query_sequence_axis,
+			paxis.head_axis,
+		)
 
 
 @contextmanager

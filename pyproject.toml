@@ -35,7 +35,7 @@ classifiers = [
 python = ">=3.10,<3.14"
 jax = ">=0.5.1"
 jaxlib = ">=0.5.1"
-eformer = "0.0.25"
+eformer = "0.0.26"
 einops = "~0.8.0"
 transformers = ">=4.49.0"
 flax = "0.10.4"
