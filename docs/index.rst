@@ -94,54 +94,26 @@ To cite this Project
 Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed to enhance and streamline the training process of machine learning models. It focuses primarily on Jax/Flax and aims to provide convenient and effective solutions for training Flax/Jax Models on TPU/GPU for both Serving and Training purposes." 2023. https://github.com/erfanzar/EasyDeL
 
 .. toctree::
-    :hidden:
-    :maxdepth: 1
-    :caption: Getting Started
+   :maxdepth: 2
+   :caption: Contents:
 
-    install.md
-    contributing
-
-.. toctree::
-    :hidden:
-    :maxdepth: 1
-    :caption: APIs
-
-    api_docs/apis
-
-.. toctree::
-    :hidden:
-    :maxdepth: 1
-    :caption: Inference Engines
-
-    whisper_api.md
-    vinference_api.md
-
-.. toctree::
-    :hidden:
-    :maxdepth: 1
-    :caption: Trainers
-
-    trainers/dpo.md
-    trainers/grpo.md
-    trainers/orpo.md
-    trainers/sft.md
-    trainers/reward.md
-
-.. toctree::
-    :hidden:
-    :maxdepth: 1
-    :caption: Multimodality
-
-    multimodality/vision_language.md
-    multimodality/audio_language.md
-    multimodality/inference.md
-
-.. toctree::
-    :hidden:
-    :maxdepth: 1
-    :caption: TRC
-
-    trc-welcome.md
+   getting_started
+   trainers/base_trainer
+   trainers/trainer_protocol
+   install.md
+   contributing
+   api_docs/apis
+   whisper_api.md
+   vinference_api.md
+   trainers/dpo.md
+   trainers/grpo.md
+   trainers/orpo.md
+   trainers/sft.md
+   trainers/reward.md
+   multimodality/vision_language.md
+   multimodality/audio_language.md
+   multimodality/inference.md
+   trc-welcome.md
 
  
 
