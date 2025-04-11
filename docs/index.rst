@@ -62,6 +62,24 @@ EasyDeL provides powerful, production-ready serving solutions:
 - **Quantization Options**: Multiple precision options for optimal performance/quality trade-offs
 
 
+Installation on TPU Pods
+-----------------------
+
+For distributed installation on TPU pods, use the ``install_on_hosts`` script:
+
+.. code-block:: bash
+
+    python -m easydel.scripts.install_on_hosts --tpu-type v4-16 --source github
+
+This will install EasyDel and all required dependencies across all hosts in the specified TPU pod.
+Supported TPU types include v2, v3, v4, v5e, and v5p pod slices.
+
+Options:
+- ``--source``: Choose between PyPI package (``pypi``) or latest GitHub version (``github``)
+- ``--tpu-type``: Specify your TPU pod slice type (default: v4-16)
+- ``--num-tpu-hosts``: Override default host count if needed
+
+
 Future Updates and Vision 🚀
 ============================
 
