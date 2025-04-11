@@ -30,7 +30,7 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import (
 	ACT2FN,
-	HIDDEN_STATE_SHARDING,
+	HiddenStateSharding,
 	auto_remat,
 	block_wise_ffn,
 	control_runtime_sharding,
@@ -267,7 +267,7 @@ class ArcticMLP(nn.Module):
 		hidden_states = control_runtime_sharding(
 			hidden_states,
 			self.config.partition_axis,
-			sharding_strategy=HIDDEN_STATE_SHARDING,
+			sharding_strategy=HiddenStateSharding,
 		)
 		w1 = self.act_fn(self.w1(hidden_states))
 		w3 = self.w3(hidden_states)
@@ -275,7 +275,7 @@ class ArcticMLP(nn.Module):
 		hidden_states = control_runtime_sharding(
 			hidden_states,
 			self.config.partition_axis,
-			sharding_strategy=HIDDEN_STATE_SHARDING,
+			sharding_strategy=HiddenStateSharding,
 		)
 		return hidden_states
 
@@ -361,7 +361,7 @@ class ArcticMoeBlock(nn.Module):
 		hidden_states = control_runtime_sharding(
 			hidden_states,
 			self.config.partition_axis,
-			sharding_strategy=HIDDEN_STATE_SHARDING,
+			sharding_strategy=HiddenStateSharding,
 		)
 
 		router_logits = self.gate(hidden_states).astype(  # no reshaping is needed
@@ -522,7 +522,7 @@ class ArcticDecoderLayer(nn.Module):
 		hidden_states = control_runtime_sharding(
 			hidden_states,
 			self.config.partition_axis,
-			sharding_strategy=HIDDEN_STATE_SHARDING,
+			sharding_strategy=HiddenStateSharding,
 		)
 		attn_out = self.self_attn(
 			hidden_states,
@@ -699,7 +699,7 @@ class ArcticModel(EasyDeLBaseModule):
 		hidden_states = control_runtime_sharding(
 			hidden_states,
 			self.config.partition_axis,
-			sharding_strategy=HIDDEN_STATE_SHARDING,
+			sharding_strategy=HiddenStateSharding,
 		)
 		for idx, layer in enumerate(self.layers):
 			if output_hidden_states:
@@ -720,7 +720,7 @@ class ArcticModel(EasyDeLBaseModule):
 			hidden_states = control_runtime_sharding(
 				hidden_states,
 				self.config.partition_axis,
-				sharding_strategy=HIDDEN_STATE_SHARDING,
+				sharding_strategy=HiddenStateSharding,
 			)
 
 			if output_attentions:
@@ -856,7 +856,7 @@ class ArcticForCausalLM(EasyDeLBaseModule):
 			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
-			
+
 		aux_loss = sum(outputs.all_router_losses) * self.config.router_aux_loss_coef
 
 		if not return_dict:
