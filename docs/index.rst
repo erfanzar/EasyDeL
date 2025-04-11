@@ -74,6 +74,8 @@ For distributed installation on TPU pods, use the ``install_on_hosts`` script:
 This will install EasyDel and all required dependencies across all hosts in the specified TPU pod.
 Supported TPU types include v2, v3, v4, v5e, and v5p pod slices.
 
+For other TPU types you may need to overwrite that or customize the script.
+
 Options:
 - ``--source``: Choose between PyPI package (``pypi``) or latest GitHub version (``github``)
 - ``--tpu-type``: Specify your TPU pod slice type (default: v4-16)
