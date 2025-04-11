@@ -52,14 +52,23 @@ class SFTTrainer(Trainer):
 		formatting_func: tp.Optional[tp.Callable] = None,
 		data_collator: tp.Optional[DataCollatorForCompletionOnlyLM] = None,
 	):
-		if getattr(processing_class, "pad_token", None) is None:
-			processing_class.pad_token = processing_class.eos_token
+		tokenizer = processing_class
+		if hasattr(processing_class, "tokenizer"):
+			tokenizer = processing_class.tokenizer
+		if getattr(
+			tokenizer,
+			"pad_token",
+			None,
+		) is None and hasattr(
+			tokenizer,
+			"eos_token",
+		):
+			tokenizer.pad_token = tokenizer.eos_token
 		assert isinstance(arguments, SFTConfig), "passed argument must be a `SFTConfig`."
 
 		if formatting_func is None and arguments.dataset_text_field is None:
 			formatting_func = get_formatting_func_from_dataset(
-				train_dataset,
-				processing_class,
+				train_dataset, processing_class
 			)
 
 		if not arguments.packing:
@@ -250,10 +259,7 @@ class SFTTrainer(Trainer):
 					"The `formatting_func` should return a list of processed strings since it can lead to silent bugs."
 				)
 
-			return {
-				"input_ids": outputs["input_ids"],
-				"attention_mask": outputs["attention_mask"],
-			}
+			return outputs
 
 		signature_columns = ["input_ids", "labels", "attention_mask"]
 
@@ -325,11 +331,21 @@ class SFTTrainer(Trainer):
 		        an error during dataset packing.
 		"""
 		if dataset_text_field is not None or formatting_func is not None:
+			tokenizer = processing_class
+
+			if hasattr(processing_class, "tokenizer"):
+				tokenizer = processing_class.tokenizer
+
+			if getattr(tokenizer, "pad_token_id", None) is None and hasattr(
+				tokenizer, "eos_token_id"
+			):
+				tokenizer.pad_token_id = tokenizer.eos_token_id
 			if processing_class is None:
 				raise ValueError(
 					"You need to pass a processing_class when using `dataset_text_field` with `SFTTrainer`."
 				)
-
+			processing_class.eos_token_id = tokenizer.eos_token_id
+			processing_class.pad_token_id = tokenizer.pad_token_id
 			constant_length_iterator = create_constant_length_dataset(
 				processing_class=processing_class,
 				dataset=dataset,
@@ -339,7 +355,7 @@ class SFTTrainer(Trainer):
 				infinite=False,
 				num_of_sequences=num_of_sequences,
 				chars_per_token=chars_per_token,
-				eos_token_id=processing_class.eos_token_id,
+				eos_token_id=tokenizer.eos_token_id,
 				append_concat_token=append_concat_token,
 				add_special_tokens=add_special_tokens,
 			)
