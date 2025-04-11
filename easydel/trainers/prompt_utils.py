@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import typing as tp
 
 from datasets import Dataset, DatasetDict
@@ -21,6 +22,234 @@ from datasets import Dataset, DatasetDict
 from easydel.infra.utils import ProcessingClassType
 
 DatasetType = tp.TypeVar("DatasetType", Dataset, DatasetDict)
+
+InputDict = tp.Dict[str, str]
+InputListDict = tp.List[InputDict]
+InputListListDict = tp.List[tp.List[InputDict]]
+InputType = tp.Union[InputListListDict, InputListDict, InputDict]
+OpenAIMessageContentPart = tp.Dict[str, str]
+OpenAIMessage = tp.Dict[str, tp.Union[str, tp.List[OpenAIMessageContentPart]]]
+OutputDict = tp.Dict[str, str]
+OutputListDict = tp.List[OutputDict]
+OutputType = tp.Union[OutputDict, OutputListDict, None]
+OpenAIMessageList = tp.List[OpenAIMessage]
+
+
+def _convert_single_dict(source_dict: InputDict) -> tp.Optional[OpenAIMessage]:
+	"""
+	Converts a single source dictionary into the target OpenAI message format.
+	Handles variations in keys like 'content', 'text', 'message'.
+	"""
+	if not isinstance(source_dict, dict):
+		print(f"Warning: Expected a dictionary, but got {type(source_dict)}. Skipping.")
+		return None
+
+	working_dict = copy.deepcopy(source_dict)
+
+	role = "user"
+	content_text = ""
+	role_key_found = None
+	for key in working_dict:
+		if key.lower() == "role":
+			role_value = working_dict[key]
+			if isinstance(role_value, str):
+				role = role_value.lower()
+				if role not in ["user", "assistant", "system", "tool"]:
+					print(f"Warning: Non-standard role '{role}' found. Using it.")
+				role_key_found = key
+				break
+			else:
+				print(
+					f"Warning: 'role' value is not a string ({role_value}). Using default 'user'."
+				)
+				role_key_found = key
+				break
+	if role_key_found:
+		del working_dict[role_key_found]
+	content_keys_priority = ["content", "text", "message"]
+	content_key_found = None
+	for priority_key in content_keys_priority:
+		for key in working_dict:
+			if key.lower() == priority_key:
+				content_value = working_dict[key]
+				if isinstance(content_value, str):
+					content_text = content_value
+					content_key_found = key
+					break
+				else:
+					print(
+						f"Warning: Found content key '{key}' but value is not a string ({content_value}). Trying other keys or defaulting to empty."
+					)
+		if content_key_found:
+			break
+	target_message: OpenAIMessage = {
+		"role": role,
+		"content": [{"type": "text", "text": content_text}],
+	}
+	return target_message
+
+
+def reverse_openai_format(
+	openai_messages: OpenAIMessageList,
+	content_key_name: str = "content",
+) -> tp.Optional[OutputType]:
+	"""
+	Converts a list of OpenAI Chat Completion messages back into simpler formats.
+
+	Input Format Example:
+	[
+	    {
+	        "role": "user",
+	        "content": [{"type": "text", "text": "Hello AI."}]
+	    },
+	    {
+	        "role": "assistant",
+	        "content": [{"type": "text", "text": "Hello User!"}]
+	    }
+	]
+
+	Output Format Examples:
+	- If input has 1 message: {"role": "user", "content": "Hello AI."}
+	- If input has >1 message: [
+	      {"role": "user", "content": "Hello AI."},
+	      {"role": "assistant", "content": "Hello User!"}
+	  ]
+	- If input is empty: []
+
+	Args:
+	    openai_messages: A list of messages in the OpenAI format.
+	    content_key_name: The key name to use for the message text in the
+	                      output dictionaries (e.g., "content", "text"). Defaults to "content".
+
+	Returns:
+	    A single dictionary if only one message was processed,
+	    a list of dictionaries if multiple messages were processed,
+	    an empty list if the input was empty,
+	    or None if the input list structure is invalid.
+	"""
+	if not isinstance(openai_messages, list):
+		print(f"Error: Input must be a list, but got {type(openai_messages)}.")
+		return None
+
+	if not openai_messages:
+		return []
+	simple_messages: OutputListDict = []
+
+	for i, message in enumerate(openai_messages):
+		if not isinstance(message, dict):
+			print(f"Warning: Item at index {i} is not a dictionary. Skipping.")
+			continue
+
+		role = message.get("role")
+		content_list = message.get("content")
+
+		if not isinstance(role, str) or not role:
+			print(
+				f"Warning: Message at index {i} is missing or has invalid 'role'. Skipping."
+			)
+			continue
+
+		if not isinstance(content_list, list):
+			print(
+				f"Warning: Message at index {i} is missing or has invalid 'content' (must be a list). Skipping."
+			)
+			continue
+		message_text = ""
+		found_text = False
+		for part in content_list:
+			if isinstance(part, dict) and part.get("type") == "text":
+				text_val = part.get("text")
+				if isinstance(text_val, str):
+					if not found_text:
+						message_text = text_val
+						found_text = True
+		if not found_text:
+			print(
+				f"Warning: Message at index {i} (role: {role}) has no 'content' part with type 'text'. Using empty string."
+			)
+		simple_dict: OutputDict = {"role": role, content_key_name: message_text}
+		simple_messages.append(simple_dict)
+	if len(simple_messages) == 0:
+		print(
+			"Warning: Input list contained messages, but none could be processed successfully."
+		)
+		return []
+	elif len(simple_messages) == 1:
+		return simple_messages[0]
+	else:
+		return simple_messages
+
+
+def convert_to_openai_format(input_data: InputType) -> tp.List[OpenAIMessage]:
+	"""
+	Converts various input formats (list[list[dict]], list[dict], dict)
+	into the OpenAI Chat Completions message list format.
+
+	Target Format Example for one message:
+	{
+	    "role": "user",
+	    "content": [{"type": "text", "text": "message content here"}]
+	}
+
+	Args:
+	    input_data: Data in one of the supported formats.
+	                Keys like 'role', 'content', 'text', 'message' are searched
+	                case-insensitively within dictionaries.
+
+	Returns:
+	    A list of messages in the target OpenAI format. Returns an empty list
+	    if the input is invalid, cannot be parsed, or results in no valid messages.
+	"""
+	output_messages: tp.List[OpenAIMessage] = []
+	items_to_process: tp.List[InputDict] = []
+
+	if isinstance(input_data, list):
+		is_list_of_lists = False
+		if input_data and isinstance(input_data[0], list):
+			is_list_of_lists = True
+
+		if is_list_of_lists:
+			for sublist in input_data:
+				if isinstance(sublist, list):
+					for item in sublist:
+						if isinstance(item, dict):
+							items_to_process.append(item)
+						else:
+							print(f"Warning: Item in sublist is not a dict: {item}. Skipping.")
+				else:
+					print(
+						f"Warning: Item in outer list is not a list (expected list[list]): {sublist}. Skipping."
+					)
+		else:
+			for item in input_data:
+				if isinstance(item, dict):
+					items_to_process.append(item)
+				elif isinstance(item, list):
+					print(
+						f"Warning: Found a list inside a list that wasn't list[list] structure: {item}. Trying to process its dicts."
+					)
+					for sub_item in item:
+						if isinstance(sub_item, dict):
+							items_to_process.append(sub_item)
+						else:
+							print(
+								f"Warning: Item in nested list is not a dict: {sub_item}. Skipping."
+							)
+				else:
+					print(f"Warning: Item in list is not a dict: {item}. Skipping.")
+
+	elif isinstance(input_data, dict):
+		items_to_process.append(input_data)
+
+	else:
+		print(f"Error: Unsupported input type: {type(input_data)}. Expected list or dict.")
+		return []
+	for source_dict in items_to_process:
+		converted_message = _convert_single_dict(source_dict)
+		if converted_message:
+			output_messages.append(converted_message)
+
+	return output_messages
 
 
 def is_conversational(example: dict[str, tp.Any]) -> bool:
