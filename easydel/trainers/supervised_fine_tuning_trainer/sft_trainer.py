@@ -121,10 +121,7 @@ class SFTTrainer(Trainer):
 				)
 			if not _multiple:
 				eval_dataset = _eval_datasets["singleton"]
-		if (
-			processing_class.padding_side is not None
-			and processing_class.padding_side != "left"
-		):
+		if tokenizer.padding_side is not None and tokenizer.padding_side != "left":
 			warnings.warn(
 				"You passed a processing_class with `padding_side` not equal to `left` to the SFTTrainer. This might lead "
 				"to some unexpected behaviour due to overflow issues when training a model in half-precision. "
@@ -236,6 +233,9 @@ class SFTTrainer(Trainer):
 		"""
 		from datasets import Dataset
 
+		if dataset_text_field is None and formatting_func is None:
+			raise ValueError("please provide `dataset_text_field` or `formatting_func`.")
+
 		def tokenize(element):
 			inputs = (
 				element[dataset_text_field]
@@ -244,7 +244,7 @@ class SFTTrainer(Trainer):
 			)
 
 			outputs = processing_class(
-				inputs,
+				text=inputs,
 				add_special_tokens=add_special_tokens,
 				truncation=True,
 				padding="max_length",

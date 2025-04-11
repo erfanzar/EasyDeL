@@ -186,7 +186,7 @@ def create_constant_length_dataset(
 
 			# Tokenize all texts in the buffer
 			tokens = processing_class(
-				buffer,
+				text=buffer,
 				add_special_tokens=add_special_tokens,
 				truncation=False,
 			)
@@ -229,7 +229,9 @@ def create_constant_length_dataset(
 
 
 def _collate_batch(
-	examples, processing_class, pad_to_multiple_of: tp.Optional[int] = None
+	examples,
+	processing_class,
+	pad_to_multiple_of: tp.Optional[int] = None,
 ):
 	if isinstance(examples[0], (list, tuple)):
 		examples = [jnp.array(e, dtype=jnp.int64) for e in examples]
