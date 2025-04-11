@@ -592,13 +592,24 @@ class AttentionModule(nn.Module):
 			key_length = key.shape[1]
 			if causal_mask is not None:
 				causal_mask = causal_mask[:, :, :query_length, :key_length]
+				causal_mask = jnp.broadcast_to(
+					causal_mask,
+					(query.shape[0],) + causal_mask.shape[1:],
+				)
 				if token_type_ids is not None and query_length != 1:
 					token_type_mask = jnp.equal(
 						jnp.expand_dims(token_type_ids, 2),
 						jnp.expand_dims(token_type_ids, 1),
 					)
+					token_type_mask = jnp.where(
+						jnp.broadcast_to(
+							jnp.expand_dims(token_type_ids == 0, -1),
+							token_type_mask.shape,
+						),
+						False,
+						token_type_mask,
+					)
 
-					token_type_mask = token_type_mask.at[token_type_ids == 0].set(False)
 					token_type_mask = jnp.expand_dims(token_type_mask, 1)
 					sequence_length = token_type_ids.shape[1]
 
@@ -607,10 +618,7 @@ class AttentionModule(nn.Module):
 						causal_mask[:, :, :, :sequence_length],
 					)
 					causal_mask = causal_mask.at[:, :, :, :sequence_length].set(masked_portion)
-				causal_mask = jnp.broadcast_to(
-					causal_mask,
-					(query.shape[0],) + causal_mask.shape[1:],
-				)
+
 				if attention_mask.ndim == 2:
 					attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
 
