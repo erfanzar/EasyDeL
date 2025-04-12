@@ -24,7 +24,7 @@ from .api_server import (
 	vInferenceChatCompletionClient,
 )
 from .utilities import SampleState, vInferenceConfig, vInferencePreCompileConfig
-from .vinference import vInference
+from .vinference import PromptOutput, vInference
 
 __all__ = (
 	"ChatCompletionRequest",
@@ -40,4 +40,5 @@ __all__ = (
 	"vInferenceConfig",
 	"vInferencePreCompileConfig",
 	"vInference",
+	"PromptOutput",
 )

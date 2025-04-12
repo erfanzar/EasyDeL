@@ -177,9 +177,12 @@ class SplashAttn(AttentionImpl):
 		mpi = [0]
 		# query_partition_spec is like PB,PH,PS,PD
 		# v is like BSHD since it's not transposed yet
-		tparallel = self.metadata.mesh.shape[query_partition_spec[1]]
-		if (v.shape[2] % tparallel) == 0 and tparallel <= v.shape[2]:
-			pi = [0, 3]  # shard DP, FSDP and TP
+		gather_ps = query_partition_spec[1]
+		tparallel = self.metadata.mesh.shape[gather_ps] if gather_ps is not None else None
+		pi = [0]
+		if tparallel is not None:
+			if (v.shape[2] % tparallel) == 0 and tparallel <= v.shape[2]:
+				pi = [0, 3]  # shard DP, FSDP and TP
 		index, prefill_length = [None] * 2
 		if cache_view is not None:
 			index, prefill_length = cache_view.index, cache_view.prefill_length

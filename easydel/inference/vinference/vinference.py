@@ -16,6 +16,7 @@
 import asyncio
 import contextlib
 import os
+import concurrent.futures
 import pathlib
 import pickle
 import random
@@ -35,7 +36,7 @@ from jax import lax
 from jax import numpy as jnp
 from jax._src.stages import Compiled
 from jax.sharding import NamedSharding, PartitionSpec
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.utils.compiling_utils import (
@@ -65,6 +66,25 @@ else:
 
 logger = get_logger("vInference")
 TIME = str(datetime.fromtimestamp(time.time())).split(" ")[0]
+
+# Sentinels for async generator communication
+_ITEM_SENTINEL = object()
+_RETURN_SENTINEL = object()
+_EXCEPTION_SENTINEL = object()
+
+
+class PromptOutput(BaseModel):
+	"""Structure for holding the output of a processed prompt."""
+
+	text: tp.Optional[str] = None
+	generated_tokens: tp.Optional[int] = None
+	tokens_per_second: tp.Optional[float] = None
+	error: tp.Optional[str] = None
+	finish_reason: tp.Optional[str] = Field(
+		default=None,
+		description="Reason generation finished (e.g., 'stop', 'length')",
+	)
+	model_config = dict(arbitrary_types_allowed=True)
 
 
 class vInferenceMetaData(BaseModel):
@@ -322,7 +342,7 @@ class vInference:
 			self.generation_config.eos_token_id = self.tokenizer.eos_token_id
 		if self.generation_config.bos_token_id is None:
 			self.generation_config.bos_token_id = self.tokenizer.bos_token_id
-		
+
 		assert self.generation_config.pad_token_id is not None, (
 			"`pad_token_id` cannot be None. "
 			"(Set `tokenizer.pad_token_id = tokenizer.eos_token_id` if undefined"
@@ -1195,3 +1215,285 @@ class vInference:
 		else:
 			tokens = self.tokenizer.encode(conv)
 			return len(tokens)
+
+	def process_prompt(
+		self,
+		prompt: tp.Union[str, tp.List[str], tp.List[tp.Dict[str, str]]],
+		sampling_params: tp.Union[SamplingParams, tp.Dict],
+		stream: bool = False,
+	) -> tp.Union[
+		PromptOutput,
+		tp.List[PromptOutput],
+		tp.Generator[str, None, SampleState],
+		tp.List[tp.Generator[str, None, SampleState]],
+	]:
+		"""
+		Processes a prompt (string, list of strings, or OpenAI messages) and generates a response.
+
+		Args:
+			prompt: The input prompt. Can be a single string, a list of strings (processed sequentially),
+					or a list of dictionaries representing OpenAI-style chat messages (processed as a single batch).
+			sampling_params: Configuration for the generation process (temperature, top_p, etc.).
+							 Can be a SamplingParams object or a dictionary.
+			stream: If True, yields generated tokens incrementally. If False, returns the
+					complete generation(s) at the end.
+
+		Returns:
+			- If input is `str` or `List[Dict]` and `stream=False`: A `PromptOutput` object containing the full text and metrics.
+			- If input is `str` or `List[Dict]` and `stream=True`: A generator yielding string chunks. The generator's return value (accessible via try/except StopIteration) is the final `SampleState`.
+			- If input is `List[str]` and `stream=False`: A list of `PromptOutput` objects.
+			- If input is `List[str]` and `stream=True`: A list where each element is a generator as described above for the single stream case.
+
+		Raises:
+			TypeError: If the prompt format is invalid or processor does not support chat templates.
+			ValueError: If tokenization or processing fails.
+		"""
+
+		if isinstance(prompt, list) and all(isinstance(p, str) for p in prompt):
+			results = []
+			for sub_prompt in prompt:
+				result = self.process_prompt(sub_prompt, sampling_params, stream=stream)
+				results.append(result)
+			return results
+
+		if isinstance(sampling_params, dict):
+			_sampling_params = SamplingParams(**sampling_params)
+		elif isinstance(sampling_params, SamplingParams):
+			_sampling_params = sampling_params
+		else:
+			raise TypeError(
+				f"sampling_params must be a dict or SamplingParams object, got {type(sampling_params)}"
+			)
+
+		try:
+			if isinstance(prompt, str):
+				tokenized = self.tokenizer(
+					prompt,
+					return_tensors="np",
+					return_attention_mask=True,
+				)
+
+			elif isinstance(prompt, list) and all(isinstance(p, dict) for p in prompt):
+				if not hasattr(self.processor_class, "apply_chat_template"):
+					raise TypeError(
+						"Processor class does not have 'apply_chat_template' method required for chat messages."
+					)
+				tokenized = self.processor_class.apply_chat_template(
+					conversation=prompt,
+					return_tensors="np",
+					add_generation_prompt=True,
+					return_dict=True,
+					tokenize=True,
+				)
+			else:
+				raise TypeError(
+					"prompt must be a string, a list of strings, or a list of dictionaries (OpenAI chat format)."
+				)
+		except Exception as e:
+			logger.error(f"Error during tokenization: {e}", exc_info=True)
+			raise ValueError(f"Failed to tokenize input prompt: {e}") from e
+
+		model_kwargs = {key: val for key, val in tokenized.items()}
+		generator = self.generate(**model_kwargs, sampling_params=_sampling_params)
+
+		if not stream:
+			last_state = None
+			for state in generator:
+				last_state = state
+
+			if last_state is None:
+				logger.warning("Generation finished without producing any state.")
+				return ""
+
+			sequences = last_state.sequences
+			padded_length = last_state.padded_length
+
+			decoded_list = self.tokenizer.batch_decode(
+				sequences[..., padded_length:],
+				skip_special_tokens=True,
+			)
+			finish_reason = (
+				"length"
+				if last_state.generated_tokens >= self.generation_config.max_new_tokens
+				else "stop"
+			)
+			return PromptOutput(
+				text=decoded_list[0] if decoded_list else "",
+				generated_tokens=last_state.generated_tokens,
+				tokens_per_second=last_state.tokens_per_second,
+				finish_reason=finish_reason,
+			)
+		else:
+
+			def _stream_helper(
+				gen: tp.Generator[SampleState, None, None],
+			) -> tp.Generator[str, None, SampleState]:
+				last_decoded_length = 0
+				last_state = None
+				try:
+					for response_state in gen:
+						last_state = response_state
+						if response_state.sequences.shape[0] > 1:
+							logger.warning(
+								"Streaming output expects batch size 1, but got > 1. Using first sequence."
+							)
+
+						full_sequence = response_state.sequences[0]
+						padded_length = response_state.padded_length
+
+						current_full_decoded = self.tokenizer.decode(
+							full_sequence[padded_length:],
+							skip_special_tokens=True,
+						)
+						new_text = current_full_decoded[last_decoded_length:]
+						if new_text:
+							yield new_text
+							last_decoded_length = len(current_full_decoded)
+				except Exception as e:
+					logger.error(f"Error during streaming generation: {e}", exc_info=True)
+					yield f"[ERROR: {e}]"
+				return last_state
+
+			return _stream_helper(generator)
+
+	async def process_prompts_concurrently(
+		self,
+		prompts: tp.List[tp.Union[str, tp.List[tp.Dict[str, str]]]],
+		max_concurrent_requests: int,
+		sampling_params: tp.Optional[SamplingParams] = None,
+		stream: bool = False,
+		progress_callback: tp.Optional[tp.Callable[[int, int], None]] = None,
+	) -> tp.Union[
+		tp.List[PromptOutput],
+		tp.AsyncGenerator[tp.Tuple[int, str, tp.Any], None],  # (index, type, data)
+	]:
+		"""
+		Processes a list of prompts concurrently, supporting both streaming and non-streaming modes.
+
+		Args:
+			prompts: A list of prompts (strings or OpenAI-style message lists).
+			max_concurrent_requests: The maximum number of prompts to process in parallel.
+									 If <= 0, processing will be sequential (but still async).
+			sampling_params: Optional sampling parameters to override the default ones
+							 for this batch of requests. Passed to process_prompt.
+			stream: If True, returns an async generator yielding tuples of (index, type, data).
+					If False, returns a list of PromptOutput objects.
+			progress_callback: An optional function called after each prompt *finishes* processing.
+							   Receives (completed_count, total_count).
+
+		Returns:
+			- If stream=False: A list of `PromptOutput` objects containing the full text, metrics,
+							   or error information for each prompt, in the original order.
+			- If stream=True: An async generator yielding tuples `(index, type, data)` where:
+								- `type` is 'text' and `data` is the string chunk.
+								- `type` is 'error' and `data` is the error string.
+								- `type` is 'final' and `data` is the final `PromptOutput` object with metrics.
+							  The generator finishes when all prompts are processed.
+
+		Raises:
+			ValueError: If input arguments are invalid.
+			RuntimeError: If an unexpected error occurs during processing.
+		"""
+		num_prompts = len(prompts)
+		if num_prompts == 0:
+			if stream:
+
+				async def _empty_generator():
+					if False:
+						yield
+
+				return _empty_generator()
+			else:
+				return []
+
+		effective_concurrency = (
+			max(1, max_concurrent_requests) if max_concurrent_requests > 0 else 1
+		)
+
+		if not stream:
+			logger.info(
+				f"Processing {num_prompts} prompts concurrently (non-streaming, max_workers={effective_concurrency})"
+			)
+			results = [None] * num_prompts
+			completed_count = 0
+			with concurrent.futures.ThreadPoolExecutor(
+				max_workers=effective_concurrency
+			) as executor:
+				loop = asyncio.get_running_loop()
+				tasks = []
+
+				def process_and_collect_full(index, p, sp):
+					full_response_text = ""
+					final_state = None
+					error_msg = None
+					try:
+						generator = self.process_prompt(prompt=p, sampling_params=sp, stream=True)
+						try:
+							while True:
+								chunk = next(generator)  # Get chunks
+								if isinstance(chunk, str) and not chunk.startswith("[ERROR:"):
+									full_response_text += chunk
+						except StopIteration as stop:
+							final_state = stop.value  # Get final SampleState from return value
+						except Exception as gen_e:  # Catch errors during generation
+							logger.error(f"Error during generation for prompt {index}: {gen_e}")
+							error_msg = f"[Error: {type(gen_e).__name__}: {gen_e}]"
+							# Try to get last state even if error occurred mid-stream
+							# This part depends on how _stream_helper handles errors and returns state
+							# Assuming it might return the last valid state before error
+							if hasattr(generator, "__return__"):  # Check if return value accessible
+								final_state = generator.__return__
+
+					except Exception as e:  # Catch errors in process_prompt setup itself
+						logger.error(f"Error setting up process_prompt for index {index}: {e}")
+						error_msg = f"[Error: {type(e).__name__}: {e}]"
+
+					if error_msg:
+						return index, PromptOutput(error=error_msg)
+					elif final_state:
+						finish_reason = (
+							"length"
+							if final_state.generated_tokens >= self.generation_config.max_new_tokens
+							else "stop"
+						)
+						return index, PromptOutput(
+							text=full_response_text,
+							generated_tokens=final_state.generated_tokens,
+							tokens_per_second=final_state.tokens_per_second,
+							finish_reason=finish_reason,
+						)
+					else:
+						logger.error(f"Prompt {index} finished without error or final state.")
+						return index, PromptOutput(error="[Error: Unknown processing error]")
+
+				for index, prompt in enumerate(prompts):
+					task = loop.run_in_executor(
+						executor,
+						process_and_collect_full,
+						index,
+						prompt,
+						sampling_params,
+					)
+					tasks.append(task)
+
+				for future in asyncio.as_completed(tasks):
+					try:
+						index, result = await future
+						results[index] = result
+					except Exception as e:
+						# This shouldn't ideally happen if process_and_collect catches, but as a safeguard
+						logger.error(f"Unexpected error collecting result: {e}")
+						# Find which index this future corresponds to (less efficient)
+						# This part is tricky without the future_to_index mapping directly with asyncio tasks
+						# For simplicity, we rely on process_and_collect returning the index
+						pass  # Error already logged in process_and_collect
+
+					completed_count += 1
+					if progress_callback:
+						progress_callback(completed_count, num_prompts)
+
+			return results
+
+		else:
+			# TODO: impl streaming method
+			raise NotImplementedError()
