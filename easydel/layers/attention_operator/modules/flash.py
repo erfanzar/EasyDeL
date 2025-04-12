@@ -180,9 +180,11 @@ class FlashAttn(AttentionImpl):
 		bi = [0]  # only shard DP and FSDP
 
 		axis_index = value_partition_spec[1]
-		tparallel = self.metadata.mesh.shape[axis_index]
-		if (q.shape[2] % tparallel) == 0 and tparallel <= q.shape[2]:
-			pi = [0, 1]  # shard DP, FSDP and TP
+		tparallel = self.metadata.mesh.shape[axis_index] if axis_index is not None else None
+		pi = [0]
+		if tparallel is not None:
+			if (q.shape[2] % tparallel) == 0 and tparallel <= q.shape[2]:
+				pi = [0, 1]  # shard DP, FSDP and TP
 		if bias is not None:
 			if (bias.shape[1] % tparallel) == 0 and tparallel <= bias.shape[1]:
 				bi = [0, 1]
@@ -297,9 +299,11 @@ class FlashAttn(AttentionImpl):
 		pi = [0]  # only shard DP and FSDP
 		bi = [0]  # only shard DP and FSDP
 		axis_index = value_partition_spec[1]
-		tparallel = self.metadata.mesh.shape[axis_index]
-		if (q.shape[2] % tparallel) == 0 and tparallel <= q.shape[2]:
-			pi = [0, 2]  # shard DP, FSDP and TP
+		tparallel = self.metadata.mesh.shape[axis_index] if axis_index is not None else None
+		pi = [0]
+		if tparallel is not None:
+			if (q.shape[2] % tparallel) == 0 and tparallel <= q.shape[2]:
+				pi = [0, 2]  # shard DP, FSDP and TP
 		if bias is not None:
 			if (bias.shape[1] % tparallel) == 0 and tparallel <= bias.shape[1]:
 				pi = [0, 1]
