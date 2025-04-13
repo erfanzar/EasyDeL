@@ -177,6 +177,9 @@ class Registry:
 		"""
 
 		def wrapper(module: T) -> T:
+			from .mixins.protocol import printify_nnx
+			module.__str__ = printify_nnx
+			module.__repr__ = printify_nnx
 			module._model_task = task_type
 			module._model_type = model_type
 			self._task_registry[task_type][model_type] = ModuleRegistration(

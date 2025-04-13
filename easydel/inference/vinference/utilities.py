@@ -348,7 +348,7 @@ def create_sampling_step(
 			logits = logits_processor(state.sequences, logits, state.current_length)
 
 		if logits_warper is not None:
-			logits = logits_warper(logits, logits, state.current_length)
+			logits = logits_warper(state.sequences, logits, state.current_length)
 		next_token = jax.random.categorical(state.prng_key, logits, axis=-1)
 
 		# Ensure finished sequences continue generating pad tokens

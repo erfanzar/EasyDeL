@@ -799,13 +799,14 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		...
 
 	def __str__(self):
-		try:
-			return "EasyDeL-" + prettify_nnx(self)
-		except AttributeError:
-			return "EasyDeL-Partitions-" + super().__str__()
+		return printify_nnx(self)
 
 	def __repr__(self):
-		try:
-			return "EasyDeL-" + prettify_nnx(self)
-		except AttributeError:
-			return "EasyDeL-Partitions-" + super().__str__()
+		return printify_nnx(self)
+
+
+def printify_nnx(model):
+	try:
+		return "EasyDeL-" + prettify_nnx(model)
+	except AttributeError:
+		return "EasyDeL-Partitions"

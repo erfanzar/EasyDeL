@@ -133,6 +133,17 @@ class EasyDeLBaseModule(
 			parameters[key] = value.value
 		return parameters
 
+	def split_module(self):
+		return nn.split(self, nn.Param, ...)
+
+	@staticmethod
+	def merge_module(
+		graphdef: nn.GraphDef,
+		graphstate: nn.GraphState,
+		graphother: nn.GraphState,
+	):
+		return nn.merge(graphdef, graphstate, graphother)
+
 	@property
 	def graphdef(self) -> nn.GraphDef:
 		"""
