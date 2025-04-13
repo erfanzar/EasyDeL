@@ -848,7 +848,7 @@ class Mamba2ForCausalLM(EasyDeLBaseModule):
 		self,
 		batch_size: int,
 		max_length: int,
-		pad_token_id: int,
+		pad_token_id: int | None = None,
 		prefill_length: int | None = None,
 	):
 		return Mamba2Cache.init_cache(

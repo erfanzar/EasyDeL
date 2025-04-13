@@ -125,9 +125,16 @@ class EasyGenerationMixin:
 		self,
 		batch_size: int,
 		max_length: int,
-		pad_token_id: int,
+		pad_token_id: int | None = None,
 		prefill_length: int | None = None,
 	):
+		if pad_token_id is None:
+			if hasattr(self, "generation_config"):
+				pad_token_id = self.generation_config.pad_token_id
+			elif hasattr(self.config, "pad_token_id"):
+				pad_token_id = self.config.pad_token_id
+			else:
+				pad_token_id = 0
 		head_dim = getattr(self.config, "head_dim", None)
 		if head_dim is None:
 			head_dim = self.config.hidden_size // self.config.num_attention_heads

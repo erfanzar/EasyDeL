@@ -298,7 +298,7 @@ class TransformerCacheView(BaseCacheView):
 		self.value = quantizer(value_cache_updated)
 		self.index = with_sharding_constraint(index, batch_sharding)
 		attention_mask = with_sharding_constraint(attention_mask, batch_sharding)
-		
+
 		return key_cache_updated, value_cache_updated, attention_mask
 
 	@staticmethod
@@ -473,6 +473,26 @@ class TransformerCache(BaseCache):
 					prefill_length=prefill_length,
 				)
 				for layer_index in range(metadata.num_hidden_layers)
+			]
+		)
+
+	def to_pure(self):
+		return (
+			[[layer.key, layer.value, layer.index] for i, layer in enumerate(self.views)],
+			self.views[-1].metadata,
+		)
+
+	@classmethod
+	def from_pure(cls, pure, metadata):
+		return cls(
+			views=[
+				TransformerCacheView(
+					key=layer[0],
+					value=layer[1],
+					index=layer[2],
+					metadata=metadata,
+				)
+				for layer in pure
 			]
 		)
 
