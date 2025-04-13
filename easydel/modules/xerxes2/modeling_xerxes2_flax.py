@@ -635,6 +635,35 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 			past_key_values=outputs.past_key_values,
 		)
 
+	def create_cache_metadata(
+		self,
+		batch_size: int,
+		max_length: int,
+		pad_token_id: int | None = None,
+	):
+		if pad_token_id is None:
+			if hasattr(self, "generation_config"):
+				pad_token_id = self.generation_config.pad_token_id
+			elif hasattr(self.config, "pad_token_id"):
+				pad_token_id = self.config.pad_token_id
+			else:
+				pad_token_id = 0
+		head_dim = getattr(self.config, "head_dim", None)
+		if head_dim is None:
+			head_dim = self.config.hidden_size // self.config.num_attention_heads
+		num_key_value_heads = getattr(self.config, "num_key_value_heads", None)
+		if num_key_value_heads is None:
+			num_key_value_heads = self.config.num_attention_heads
+		return TransformerCacheMetaData.create(
+			partition_axis=self.config.partition_axis,
+			num_hidden_layers=self.config.num_hidden_layers,
+			batch_size=batch_size,
+			sequence_length=max_length,
+			num_heads=1,
+			key_dim=self.config.qk_rope_head_dim + self.config.qk_nope_head_dim,
+			value_dim=self.config.vhead_dim,
+		)
+
 	def init_cache(
 		self,
 		batch_size: int,
@@ -650,14 +679,8 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 				None,  # it's 1 by default
 				self.config.partition_axis.attention_dim_axis,
 			),
-			metadata=TransformerCacheMetaData.create(
-				partition_axis=self.config.partition_axis,
-				num_hidden_layers=self.config.num_hidden_layers,
-				batch_size=batch_size,
-				sequence_length=max_length,
-				num_heads=1,
-				key_dim=self.config.qk_rope_head_dim + self.config.qk_nope_head_dim,
-				value_dim=self.config.vhead_dim,
+			metadata=self.create_cache_metadata(
+				batch_size=batch_size, max_length=max_length, pad_token_id=pad_token_id
 			),
 			quantizer=self._quant_class(
 				quantization_method=self.config.kv_cache_quantization_method,
@@ -665,4 +688,5 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 				quantization_platform=self.config.platform,
 			),
 			mesh=self.config.mesh,
+			prefill_length=prefill_length,
 		)

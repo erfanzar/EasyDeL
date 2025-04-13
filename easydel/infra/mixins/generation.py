@@ -121,12 +121,11 @@ class EasyGenerationMixin:
 	_model_task: tp.Optional[str] = None
 	_model_type: tp.Optional[str] = None
 
-	def init_cache(
+	def create_cache_metadata(
 		self,
 		batch_size: int,
 		max_length: int,
 		pad_token_id: int | None = None,
-		prefill_length: int | None = None,
 	):
 		if pad_token_id is None:
 			if hasattr(self, "generation_config"):
@@ -141,6 +140,23 @@ class EasyGenerationMixin:
 		num_key_value_heads = getattr(self.config, "num_key_value_heads", None)
 		if num_key_value_heads is None:
 			num_key_value_heads = self.config.num_attention_heads
+		return TransformerCacheMetaData.create(
+			partition_axis=self.config.partition_axis,
+			num_hidden_layers=self.config.num_hidden_layers,
+			pad_token_id=pad_token_id,
+			batch_size=batch_size,
+			sequence_length=max_length,
+			num_heads=num_key_value_heads,
+			head_dim=head_dim,
+		)
+
+	def init_cache(
+		self,
+		batch_size: int,
+		max_length: int,
+		pad_token_id: int | None = None,
+		prefill_length: int | None = None,
+	):
 		return TransformerCache.init_cache(
 			dtype=self.dtype,
 			key_values_partition_specs=PartitionSpec(
@@ -149,14 +165,10 @@ class EasyGenerationMixin:
 				self.config.partition_axis.head_axis,
 				self.config.partition_axis.attention_dim_axis,
 			),
-			metadata=TransformerCacheMetaData.create(
-				partition_axis=self.config.partition_axis,
-				num_hidden_layers=self.config.num_hidden_layers,
-				pad_token_id=pad_token_id,
+			metadata=self.create_cache_metadata(
 				batch_size=batch_size,
-				sequence_length=max_length,
-				num_heads=num_key_value_heads,
-				head_dim=head_dim,
+				max_length=max_length,
+				pad_token_id=pad_token_id,
 			),
 			quantizer=self._quant_class(
 				quantization_method=self.config.kv_cache_quantization_method,
