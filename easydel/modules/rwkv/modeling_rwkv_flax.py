@@ -447,7 +447,6 @@ class RwkvModel(EasyDeLBaseModule):
 		use_cache: tp.Optional[bool] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
 	) -> tp.Union[tp.Tuple, RwkvOutput]:
 		output_attentions = (
 			output_attentions
@@ -463,9 +462,6 @@ class RwkvModel(EasyDeLBaseModule):
 			use_cache
 			if use_cache is not None
 			else (self.config.use_cache if not self.deterministic else False)
-		)
-		return_dict = (
-			return_dict if return_dict is not None else self.config.use_return_dict
 		)
 
 		if (input_ids is None) ^ (inputs_embeds is not None):
@@ -518,13 +514,6 @@ class RwkvModel(EasyDeLBaseModule):
 
 		if output_hidden_states:
 			all_hidden_states = all_hidden_states + (hidden_states,)
-
-		if not return_dict:
-			return tuple(
-				x
-				for x in [hidden_states, state, all_hidden_states, all_self_attentions]
-				if x is not None
-			)
 
 		return RwkvOutput(
 			last_hidden_state=hidden_states,
@@ -582,12 +571,7 @@ class RwkvForCausalLM(EasyDeLBaseModule):
 		use_cache: tp.Optional[bool] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
 	) -> tp.Union[tp.Tuple, RwkvCausalLMOutput]:
-		return_dict = (
-			return_dict if return_dict is not None else self.config.use_return_dict
-		)
-
 		rwkv_outputs = self.rwkv(
 			input_ids,
 			inputs_embeds=inputs_embeds,
@@ -595,14 +579,10 @@ class RwkvForCausalLM(EasyDeLBaseModule):
 			use_cache=use_cache,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 		hidden_states = rwkv_outputs[0]
 
 		logits = self.head(hidden_states)
-
-		if not return_dict:
-			return (logits,) + rwkv_outputs[1:]
 
 		return RwkvCausalLMOutput(
 			logits=logits,

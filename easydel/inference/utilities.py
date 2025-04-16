@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import field
+from functools import cached_property
 
 import jax
 from eformer.pytree import auto_pytree
@@ -70,6 +71,9 @@ class SamplingParams:
 	min_p: float = 0.0
 	suppress_tokens: list[int] = field(default_factory=lambda: list())
 
+	def __post_init__(self):
+		self.suppress_tokens = []  # not supported yet!
+
 	def get_logits_warper(self):
 		"""
 		Constructs a `LogitsProcessorList` containing the configured logits warpers.
@@ -106,6 +110,14 @@ class SamplingParams:
 		processors.append(RepetitionPenaltyLogitsProcessor(self.repetition_penalty))
 
 		return processors
+
+	@cached_property
+	def logits_processor(self):
+		return self.get_logits_processor()
+
+	@cached_property
+	def logits_warper(self):
+		return self.get_logits_warper()
 
 	__hash__ = hash_fn
 

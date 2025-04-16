@@ -25,8 +25,10 @@ from easydel.infra.base_module import (
 )
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
 	BaseModelOutput,
 	CausalLMOutput,
+	DecoderLayerOutput,
 	SequenceClassifierOutput,
 )
 from easydel.infra.utils import (
@@ -233,6 +235,7 @@ class MistralAttention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -262,12 +265,11 @@ class MistralAttention(AttentionModule):
 		)
 		attn_output = self.o_proj(attn_output)
 
-		outputs = (
-			(attn_output, attentions.attention_weights)
-			if output_attentions
-			else (attn_output,)
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=cache_view,
 		)
-		return outputs
 
 
 class MistralDecoderLayer(nn.Module):
@@ -348,7 +350,7 @@ class MistralDecoderLayer(nn.Module):
 			frequencies,
 		)
 
-		hidden_states = attention_output[0] + residual
+		hidden_states = attention_output.attention_output + residual
 		ffd_inp = self.post_attention_layernorm(hidden_states)
 		if self.config.use_scan_mlp:
 			feed_forward_hidden_states = block_wise_ffn(
@@ -358,10 +360,12 @@ class MistralDecoderLayer(nn.Module):
 			feed_forward_hidden_states = self.mlp(ffd_inp)
 
 		hidden_states = hidden_states + feed_forward_hidden_states
-		outputs = (hidden_states,)
-		if output_attentions:
-			outputs += (attention_output[1],)
-		return outputs
+
+		return DecoderLayerOutput(
+			hidden_states=hidden_states,
+			attention_weight=attention_output.attention_weight,
+			cache_view=attention_output.cache_view,
+		)
 
 
 @register_module(
@@ -436,8 +440,7 @@ class MistralModel(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: bool = True,
-	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+	) -> BaseModelOutput:
 		"""Forward pass through the Mistral model.
 
 		Args:
@@ -450,7 +453,7 @@ class MistralModel(EasyDeLBaseModule):
 			cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling.
 			output_attentions (bool, optional): Whether to return attention weights.
 			output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-			return_dict (bool, optional): Whether to return a model output object or a tuple.
+
 
 		Returns:
 			Union[BaseModelOutput, Tuple]: Model outputs (last hidden state, optional hidden states, optional attentions)
@@ -509,19 +512,17 @@ class MistralModel(EasyDeLBaseModule):
 				segment_ids=segment_ids,
 				frequencies=self.frequencies,
 			)
-			hidden_states = layer_outputs[0]
+			hidden_states = layer_outputs.hidden_states
 
 			if output_attentions:
-				all_attentions += (layer_outputs[1],)
+				all_attentions += (layer_outputs.attention_weight,)
+
+			past_key_values[idx] = layer_outputs.cache_view
 
 		hidden_states = self.norm(hidden_states)
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-		outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
-
-		if not return_dict:
-			return tuple(value for value in outputs if value is not None)
 
 		return BaseModelOutput(
 			last_hidden_state=hidden_states,
@@ -596,8 +597,7 @@ class MistralForCausalLM(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: bool = True,
-	) -> tp.Union[CausalLMOutput, tp.Tuple]:
+	) -> CausalLMOutput:
 		"""Forward pass through the Mistral model for causal language modeling.
 
 		Args:
@@ -610,7 +610,7 @@ class MistralForCausalLM(EasyDeLBaseModule):
 			cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling.
 			output_attentions (bool, optional): Whether to return attention weights.
 			output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-			return_dict (bool, optional): Whether to return a model output object or a tuple.
+
 
 		Returns:
 			Union[CausalLMOutput, Tuple]: Model outputs (logits, optional hidden states, optional attentions)
@@ -623,12 +623,11 @@ class MistralForCausalLM(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
-			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
 
-		hidden_states = outputs[0]
+		hidden_states = outputs.last_hidden_state
 
 		hidden_states = control_runtime_sharding(
 			hidden_states,
@@ -644,9 +643,6 @@ class MistralForCausalLM(EasyDeLBaseModule):
 			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
-
-		if not return_dict:
-			return (lm_logits,) + outputs[1:]
 
 		return CausalLMOutput(
 			logits=lm_logits,
@@ -722,8 +718,7 @@ class MistralForSequenceClassification(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: bool = True,
-	) -> tp.Union[SequenceClassifierOutput, tp.Tuple]:
+	) -> SequenceClassifierOutput:
 		"""Forward pass through the Mistral model for sequence classification.
 
 		This method processes input sequences through the Mistral model and applies
@@ -739,7 +734,7 @@ class MistralForSequenceClassification(EasyDeLBaseModule):
 			cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling.
 			output_attentions (bool, optional): Whether to return attention weights.
 			output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-			return_dict (bool, optional): Whether to return a model output object or a tuple.
+
 
 		Returns:
 			Union[SequenceClassifierOutput, Tuple]: Classification outputs including logits and optional model outputs
@@ -752,12 +747,11 @@ class MistralForSequenceClassification(EasyDeLBaseModule):
 			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
 
-		hidden_states = transformer_outputs[0]
+		hidden_states = transformer_outputs.last_hidden_state
 		logits = self.score(hidden_states)
 		if input_ids is not None:
 			batch_size = input_ids.shape[0]
@@ -779,10 +773,6 @@ class MistralForSequenceClassification(EasyDeLBaseModule):
 				sequence_lengths = -1
 
 		pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
-
-		if not return_dict:
-			output = (pooled_logits,) + transformer_outputs[1:]
-			return output
 
 		return SequenceClassifierOutput(
 			logits=pooled_logits,

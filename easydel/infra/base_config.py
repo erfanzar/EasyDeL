@@ -99,6 +99,7 @@ warnings.filterwarnings(
 
 
 warnings.filterwarnings("ignore", message="You are using a model of type")
+warnings.filterwarnings("ignore", message="Some donated buffers were not usable:")
 
 
 class EasyDeLBaseConfigDict(tp.TypedDict, total=False):

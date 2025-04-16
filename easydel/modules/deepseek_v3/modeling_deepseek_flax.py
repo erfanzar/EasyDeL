@@ -24,7 +24,12 @@ from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
+from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
+	BaseModelOutput,
+	CausalLMOutput,
+	DecoderLayerOutput,
+)
 from easydel.infra.utils import (
 	ACT2FN,
 	HiddenStateSharding,
@@ -596,6 +601,7 @@ class DeepseekV3Attention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -625,12 +631,11 @@ class DeepseekV3Attention(AttentionModule):
 		)
 		attn_output = self.o_proj(attn_output)
 
-		outputs = (
-			(attn_output, attentions.attention_weights)
-			if output_attentions
-			else (attn_output,)
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=cache_view,
 		)
-		return outputs
 
 
 class DeepseekV3DecoderLayer(nn.Module):
@@ -759,9 +764,7 @@ class DeepseekV3DecoderLayer(nn.Module):
 			output_attentions,
 			fcm_mask,
 		)
-		hidden_states, self_attn_weights = (
-			attn_out if output_attentions else (attn_out[0], None)
-		)
+		hidden_states = attn_out.attention_output
 		hidden_states = residual + hidden_states
 
 		# Fully Connected
@@ -775,12 +778,11 @@ class DeepseekV3DecoderLayer(nn.Module):
 			self.config.partition_axis,
 			sharding_strategy=HiddenStateSharding,
 		)
-		outputs = (hidden_states,)
-
-		if output_attentions:
-			outputs += (self_attn_weights,)
-
-		return outputs  # type:ignore
+		return DecoderLayerOutput(
+			hidden_states=hidden_states,
+			attention_weight=attn_out.attention_weight,
+			cache_view=attn_out.cache_view,
+		)
 
 
 @register_module(
@@ -876,8 +878,7 @@ class DeepseekV3Model(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+	) -> BaseModelOutput:
 		"""
 		Forward pass through the Deepseekv3 module.
 
@@ -891,7 +892,6 @@ class DeepseekV3Model(EasyDeLBaseModule):
 		    output_hidden_states (tp.Optional[bool]): If True, output hidden states.
 		    init_cache (bool): If True, initialize cache for decoding.
 		    deterministic (bool): If True, disable dropout.
-		    return_dict (bool): If True, return a dictionary of outputs.
 
 		Returns:
 		    BaseModelOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
@@ -947,19 +947,17 @@ class DeepseekV3Model(EasyDeLBaseModule):
 				cache_view=past_key_values.views[idx],
 				cache_metadata=cache_metadata,
 			)
-			hidden_states = output[0]
+			hidden_states = output.hidden_states
 
 			if output_attentions:
-				all_attentions += (output[1],)
+				all_attentions += (output.attention_weight,)
+
+			past_key_values[idx] = output.cache_view
 
 		hidden_states = self.norm(hidden_states)
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-		outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
-
-		if not return_dict:
-			return tuple(value for value in outputs if value is not None)
 
 		return BaseModelOutput(
 			last_hidden_state=hidden_states,
@@ -1038,8 +1036,7 @@ class DeepseekV3ForCausalLM(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[CausalLMOutput, tp.Tuple]:
+	) -> CausalLMOutput:
 		"""
 		Forward pass of the causal language model.
 
@@ -1053,10 +1050,10 @@ class DeepseekV3ForCausalLM(EasyDeLBaseModule):
 			output_hidden_states (Optional[bool], optional): Whether to output hidden states. Defaults to None.
 			past_key_values (Optional[TransformerCache | PagedAttentionCache], optional): Cached key/values. Defaults to None.
 			cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata], optional): Cache metadata. Defaults to None.
-			return_dict (bool, optional): Whether to return a dictionary or tuple. Defaults to True.
+
 
 		Returns:
-			CausalLMOutput | Tuple: The model outputs, either as a named tuple or a standard tuple.
+			CausalLMOutput: The model outputs, either as a named tuple or a standard tuple.
 		"""
 		outputs = self.model(
 			input_ids=input_ids,
@@ -1068,10 +1065,9 @@ class DeepseekV3ForCausalLM(EasyDeLBaseModule):
 			segment_ids=segment_ids,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
-		hidden_states = outputs[0]
+		hidden_states = outputs.last_hidden_state
 
 		hidden_states = control_runtime_sharding(
 			hidden_states,
@@ -1087,9 +1083,6 @@ class DeepseekV3ForCausalLM(EasyDeLBaseModule):
 			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
-
-		if not return_dict:
-			return (lm_logits,) + outputs[1:]
 
 		return CausalLMOutput(
 			logits=lm_logits,

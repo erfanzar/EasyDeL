@@ -105,12 +105,10 @@ def training_step(
 		rewards_chosen = module(
 			input_ids=minibatch["input_ids_chosen"],
 			attention_mask=minibatch["attention_mask_chosen"],
-			return_dict=True,
 		).logits
 		rewards_rejected = module(
 			input_ids=minibatch["input_ids_rejected"],
 			attention_mask=minibatch["attention_mask_rejected"],
-			return_dict=True,
 		).logits
 		if "margin" in minibatch:
 			loss = -jax.numpy.mean(
@@ -211,12 +209,10 @@ def evaluation_step(
 		rewards_chosen = module(
 			input_ids=batch["input_ids_chosen"],
 			attention_mask=batch["attention_mask_chosen"],
-			return_dict=True,
 		).logits
 		rewards_rejected = module(
 			input_ids=batch["input_ids_rejected"],
 			attention_mask=batch["attention_mask_rejected"],
-			return_dict=True,
 		).logits
 		if "margin" in batch:
 			loss = -jax.numpy.mean(

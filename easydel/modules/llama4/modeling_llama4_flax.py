@@ -15,7 +15,7 @@
 
 import math
 import typing as tp
-from functools import cached_property, partial
+from functools import partial
 
 import chex
 import jax
@@ -26,8 +26,11 @@ from flax import nnx as nn
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
 	BaseModelOutput,
 	CausalLMOutput,
+	DecoderLayerOutput,
+	EncoderLayerOutput,
 	ModelOutput,
 	SequenceClassifierOutput,
 )
@@ -103,6 +106,29 @@ def bmm(inputs, kernel, precision):
 		precision=precision,
 		optimize=True,
 	)
+
+
+@partial(jax.jit, static_argnums=(0, 1, 2, 3))
+def _vision_freqs(idx, hidden_size, num_attention_heads, rope_theta):
+	img_idx = jnp.arange(idx**2, dtype="i4").reshape(idx**2, 1)
+	img_idx = jnp.concatenate([img_idx, img_idx[:1]], axis=0)
+	img_idx = img_idx.at[-1, -1].set(-2)
+	frequencies_x = img_idx % idx
+	frequencies_y = img_idx // idx
+	freq_dim = hidden_size // num_attention_heads // 2
+	rope_arange = jnp.arange(0, freq_dim, 2)
+	rope_arange_sliced = rope_arange[: (freq_dim // 2)]
+	rope_freq = 1.0 / (rope_theta ** (rope_arange_sliced.astype("f4") / freq_dim))
+	rope_freq_broadcast = rope_freq[None, None, :]
+	freqs_x = jnp.repeat(
+		(frequencies_x + 1).astype("f4")[..., None] * rope_freq_broadcast, 2, axis=-1
+	)
+	freqs_y = jnp.repeat(
+		(frequencies_y + 1).astype("f4")[..., None] * rope_freq_broadcast, 2, axis=-1
+	)
+	freqs = jnp.concatenate([freqs_x, freqs_y], axis=-1)[..., ::2]
+	freqs = jnp.where(img_idx.reshape(-1, 1, 1) < 0, 0.0, freqs)
+	return jnp.exp(1j * freqs)
 
 
 def _create_chunked_attention_mask(
@@ -381,7 +407,7 @@ class Llama4TextAttention(AttentionModule):
 		output_attentions: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
 		frequencies: tp.Optional[chex.Array] = None,
-	) -> tp.Tuple[chex.Array, chex.Array]:
+	) -> AttentionLayerOutput:
 		batch_size, sequence_length = hidden_states.shape[:2]
 		input_shape = hidden_states.shape[:-1]
 		query_states, key_states, value_states = (
@@ -427,6 +453,7 @@ class Llama4TextAttention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -453,7 +480,11 @@ class Llama4TextAttention(AttentionModule):
 		attn_output = self.shard_attention_prod(attn_output)
 		attn_output = self.o_proj(attn_output)
 
-		return attn_output, attentions.attention_weights
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=cache_view,
+		)
 
 
 class Llama4TextDecoderLayer(nn.Module):
@@ -552,9 +583,8 @@ class Llama4TextDecoderLayer(nn.Module):
 			fcm_mask,
 			frequencies,
 		)
-		attn_output = attn_outputs[0]
 
-		hidden_states = hidden_states + attn_output
+		hidden_states = hidden_states + attn_outputs.attention_output
 
 		feed_forward_input = self.post_attention_layernorm(hidden_states)
 		# TODO: Support Chunked MLP for LLaMA4
@@ -574,10 +604,12 @@ class Llama4TextDecoderLayer(nn.Module):
 		hidden_states = hidden_states + feed_forward_hidden_states.reshape(
 			feed_forward_input.shape
 		)
-		outputs = (hidden_states,) + attn_outputs[1:]
-		if output_router_logits:
-			outputs += (router_logits,)
-		return outputs
+		return DecoderLayerOutput(
+			hidden_states=hidden_states,
+			attention_weight=attn_outputs.attention_weight,
+			router_logits=router_logits if output_router_logits else None,
+			cache_view=attn_outputs.cache_view,
+		)
 
 
 @register_module(
@@ -641,8 +673,7 @@ class Llama4TextModel(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: bool = True,
-	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+	) -> BaseModelOutput:
 		"""Forward pass through the Llama model.
 
 		Args:
@@ -655,7 +686,7 @@ class Llama4TextModel(EasyDeLBaseModule):
 		  cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling.
 		  output_attentions (bool, optional): Whether to return attention weights.
 		  output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-		  return_dict (bool, optional): Whether to return a model output object or a tuple.
+
 
 		Returns:
 		  Union[BaseModelOutput, Tuple]: Model outputs (last hidden state, optional hidden states, optional attentions)
@@ -717,21 +748,17 @@ class Llama4TextModel(EasyDeLBaseModule):
 				segment_ids=segment_ids,
 				frequencies=frequencies,
 			)
-			hidden_states = layer_outputs[0]
+			hidden_states = layer_outputs.hidden_states
 
 			if output_attentions:
-				all_attentions += (layer_outputs[1],)
+				all_attentions += (layer_outputs.attention_weight,)
+
+			past_key_values[idx] = layer_outputs.cache_view
 
 		hidden_states = self.norm(hidden_states)
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-			outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
-		else:
-			outputs = (hidden_states, all_attentions, past_key_values)
-
-		if not return_dict:
-			return tuple(v for v in outputs if v is not None)
 
 		return BaseModelOutput(
 			last_hidden_state=hidden_states,
@@ -794,8 +821,7 @@ class Llama4ForCausalLM(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: bool = True,
-	) -> tp.Union[CausalLMOutput, tp.Tuple]:
+	) -> CausalLMOutput:
 		"""Forward pass through the Llama model for causal language modeling.
 
 		Args:
@@ -808,7 +834,7 @@ class Llama4ForCausalLM(EasyDeLBaseModule):
 		  cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling.
 		  output_attentions (bool, optional): Whether to return attention weights.
 		  output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-		  return_dict (bool, optional): Whether to return a model output object or a tuple.
+
 
 		Returns:
 		  Union[CausalLMOutput, Tuple]: Model outputs (logits, optional hidden states, optional attentions)
@@ -821,12 +847,11 @@ class Llama4ForCausalLM(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
-			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
 
-		hidden_states = outputs[0]
+		hidden_states = outputs.last_hidden_state
 
 		hidden_states = control_runtime_sharding(
 			hidden_states,
@@ -842,9 +867,6 @@ class Llama4ForCausalLM(EasyDeLBaseModule):
 			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
-
-		if not return_dict:
-			return (lm_logits,) + outputs[1:]
 
 		return CausalLMOutput(
 			logits=lm_logits,
@@ -920,8 +942,7 @@ class Llama4ForSequenceClassification(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: bool = True,
-	) -> tp.Union[SequenceClassifierOutput, tp.Tuple]:
+	) -> SequenceClassifierOutput:
 		"""Forward pass through the Llama model for sequence classification.
 
 		This method processes input sequences through the Llama model and applies
@@ -937,7 +958,7 @@ class Llama4ForSequenceClassification(EasyDeLBaseModule):
 		  cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling.
 		  output_attentions (bool, optional): Whether to return attention weights.
 		  output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-		  return_dict (bool, optional): Whether to return a model output object or a tuple.
+
 
 		Returns:
 		  Union[SequenceClassifierOutput, Tuple]: Classification outputs including logits and optional model outputs
@@ -950,12 +971,11 @@ class Llama4ForSequenceClassification(EasyDeLBaseModule):
 			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
 
-		hidden_states = transformer_outputs[0]
+		hidden_states = transformer_outputs.last_hidden_state
 		logits = self.score(hidden_states)
 		if input_ids is not None:
 			batch_size = input_ids.shape[0]
@@ -977,10 +997,6 @@ class Llama4ForSequenceClassification(EasyDeLBaseModule):
 				sequence_lengths = -1
 
 		pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
-
-		if not return_dict:
-			output = (pooled_logits,) + transformer_outputs[1:]
-			return output
 
 		return SequenceClassifierOutput(
 			logits=pooled_logits,
@@ -1192,8 +1208,11 @@ class Llama4VisionAttention(AttentionModule):
 		)
 
 	def __call__(
-		self, hidden_states: chex.Array, frequencies: tp.Optional[chex.Array] = None
-	) -> tp.Tuple[chex.Array, chex.Array]:
+		self,
+		hidden_states: chex.Array,
+		frequencies: tp.Optional[chex.Array] = None,
+		output_attentions: bool = False,
+	) -> AttentionLayerOutput:
 		input_shape = hidden_states.shape[:-1]
 		hidden_shape = (*input_shape, -1, self.head_dim)
 		query_states, key_states, value_states = (
@@ -1220,13 +1239,15 @@ class Llama4VisionAttention(AttentionModule):
 			attention_mask=None,
 			segment_ids=None,
 			causal=False,
-			dropout_rng=self.rngs.params(),
 		)
 		attn_output = attentions.attention_outputs.reshape(*input_shape, -1)
 		attn_output = self.shard_attention_prod(attn_output)
 		attn_output = self.o_proj(attn_output)
 
-		return attn_output, attentions.attention_weights
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+		)
 
 
 class Llama4VisionMLP(nn.Module):
@@ -1337,8 +1358,12 @@ class Llama4VisionEncoderLayer(nn.Module):
 			self.config.partition_axis,
 			sharding_strategy=HiddenStateSharding,
 		)
-		hidden_states, attn_weights = self.self_attn(hidden_states, frequencies)
-		hidden_states = residual + hidden_states
+		attn_outputs = self.self_attn(
+			hidden_states,
+			frequencies,
+			output_attentions,
+		)
+		hidden_states = residual + attn_outputs.attention_output
 		residual = hidden_states
 		hidden_states = self.post_attention_layernorm(hidden_states)
 		hidden_states = self.mlp(hidden_states)
@@ -1350,12 +1375,10 @@ class Llama4VisionEncoderLayer(nn.Module):
 			sharding_strategy=HiddenStateSharding,
 		)
 
-		outputs = (hidden_states,)
-
-		if output_attentions:
-			outputs += (attn_weights,)
-
-		return outputs
+		return EncoderLayerOutput(
+			hidden_states=hidden_states,
+			attention_weight=attn_outputs.attention_weight,
+		)
 
 
 class Llama4VisionEncoder(nn.Module):
@@ -1392,8 +1415,7 @@ class Llama4VisionEncoder(nn.Module):
 		attention_mask: tp.Optional[jax.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
-	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+	) -> BaseModelOutput:
 		output_attentions = (
 			output_attentions
 			if output_attentions is not None
@@ -1403,9 +1425,6 @@ class Llama4VisionEncoder(nn.Module):
 			output_hidden_states
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
-		)
-		return_dict = (
-			return_dict if return_dict is not None else self.config.use_return_dict
 		)
 
 		encoder_states = () if output_hidden_states else None
@@ -1420,17 +1439,13 @@ class Llama4VisionEncoder(nn.Module):
 			)
 
 			if output_attentions:
-				all_attentions = all_attentions + (layer_outputs[1],)
+				all_attentions = all_attentions + (layer_outputs.attention_weight,)
 
-			hidden_states = layer_outputs[0]
+			hidden_states = layer_outputs.hidden_states
 
 		if output_hidden_states:
 			encoder_states = encoder_states + (hidden_states,)
 
-		if not return_dict:
-			return tuple(
-				v for v in [hidden_states, encoder_states, all_attentions] if v is not None
-			)
 		return BaseModelOutput(
 			last_hidden_state=hidden_states,
 			hidden_states=encoder_states,
@@ -1579,39 +1594,7 @@ class Llama4VisionModel(EasyDeLBaseModule):
 			precision=precision,
 			rngs=rngs,
 		)
-
-	@cached_property
-	def frequencies(self):
-		from easydel.infra.utils import ModuleCaches
-
-		idx = self.config.image_size // self.config.patch_size
-		img_idx = jnp.arange(idx**2, dtype="i4").reshape(idx**2, 1)
-		img_idx = jnp.concatenate([img_idx, img_idx[:1]], axis=0)
-		img_idx = img_idx.at[-1, -1].set(-2)
-		frequencies_x = img_idx % idx
-		frequencies_y = img_idx // idx
-		freq_dim = self.config.hidden_size // self.config.num_attention_heads // 2
-		rope_arange = jnp.arange(0, freq_dim, 2)
-		rope_arange_sliced = rope_arange[: (freq_dim // 2)]
-		rope_freq = 1.0 / (
-			self.config.rope_theta ** (rope_arange_sliced.astype("f4") / freq_dim)
-		)
-		rope_freq_broadcast = rope_freq[None, None, :]
-		freqs_x = jnp.repeat(
-			(frequencies_x + 1).astype("f4")[..., None] * rope_freq_broadcast,
-			2,
-			axis=-1,
-		)
-		freqs_y = jnp.repeat(
-			(frequencies_y + 1).astype("f4")[..., None] * rope_freq_broadcast,
-			2,
-			axis=-1,
-		)
-		freqs = jnp.concatenate([freqs_x, freqs_y], axis=-1)[..., ::2]
-		mask = img_idx.reshape(-1, 1, 1) < 0
-		freqs = jnp.where(mask, 0.0, freqs)
-		freq_cis = jnp.exp(1j * freqs)
-		return ModuleCaches(freq_cis)
+		self.vision_idx = self.config.image_size // self.config.patch_size
 
 	def __call__(
 		self,
@@ -1619,8 +1602,7 @@ class Llama4VisionModel(EasyDeLBaseModule):
 		attention_mask: tp.Optional[jax.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
-	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+	) -> BaseModelOutput:
 		output_attentions = (
 			output_attentions
 			if output_attentions is not None
@@ -1631,11 +1613,8 @@ class Llama4VisionModel(EasyDeLBaseModule):
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
 		)
-		return_dict = (
-			return_dict if return_dict is not None else self.config.use_return_dict
-		)
 
-		batch_size_times_num_tiles, num_channels, height, width = pixel_values.shape
+		batch_size_times_num_tiles = pixel_values.shape[0]
 		num_concurrent_media = 1
 		num_chunks = 1
 		hidden_states = self.patch_embedding(pixel_values)
@@ -1668,7 +1647,12 @@ class Llama4VisionModel(EasyDeLBaseModule):
 			hidden_states,
 			output_hidden_states=output_hidden_states,
 			output_attentions=output_attentions,
-			frequencies=self.frequencies,
+			frequencies=_vision_freqs(
+				self.vision_idx,
+				self.config.hidden_size,
+				self.config.num_attention_heads,
+				self.config.rope_theta,
+			),
 		)
 		hidden_states = output.last_hidden_state
 		hidden_states = self.layernorm_post(hidden_states)
@@ -1676,20 +1660,10 @@ class Llama4VisionModel(EasyDeLBaseModule):
 		hidden_states = self.vision_adapter(hidden_states)
 		all_hidden_states = output.hidden_states if output_hidden_states else None
 
-		if output_attentions:
-			attentions = output[2]
-		else:
-			attentions = None
-
-		if not return_dict:
-			return tuple(
-				v for v in [hidden_states, hidden_states, attentions] if v is not None
-			)
-
 		return BaseModelOutput(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
-			attentions=attentions,
+			attentions=output.attentions,
 		)
 
 
@@ -1786,7 +1760,6 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
 		inputs_embeds: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
 		**lm_kwargs,
 	):
 		if (input_ids is None) ^ (inputs_embeds is not None):
@@ -1801,9 +1774,6 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
 			output_hidden_states
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
-		)
-		return_dict = (
-			return_dict if return_dict is not None else self.config.use_return_dict
 		)
 		if input_ids is not None and self.config.image_token_index >= self.vocab_size:
 			special_image_mask = input_ids == self.config.image_token_index
@@ -1841,7 +1811,6 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
-			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 			**lm_kwargs,

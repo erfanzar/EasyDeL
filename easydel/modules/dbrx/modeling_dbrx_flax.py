@@ -25,6 +25,8 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
+	DecoderLayerOutput,
 	MoeCausalLMOutput,
 	MoeModelOutput,
 	SequenceClassifierOutput,
@@ -192,6 +194,7 @@ class DbrxAttention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -222,10 +225,11 @@ class DbrxAttention(AttentionModule):
 		attn_output = self.out_proj(attn_output)
 
 		attn_output = self.resid_dropout(attn_output)
-		outputs = (attn_output,)
-		if output_attentions:
-			outputs += (output_attentions,)
-		return outputs
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=cache_view,
+		)
 
 
 class DbrxNormAttentionNorm(nn.Module):
@@ -283,7 +287,7 @@ class DbrxNormAttentionNorm(nn.Module):
 		output_attentions: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
 		frequencies: tp.Optional[chex.Array] = None,
-	) -> tp.Tuple[chex.Array, chex.Array, tp.Optional[chex.Array]]:
+	) -> DecoderLayerOutput:
 		"""
 		Forward pass of the attentionNrom module.
 
@@ -298,12 +302,12 @@ class DbrxNormAttentionNorm(nn.Module):
 		    output_attentions (bool): If True, outputs attention weights alongside the hidden states.
 		    fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
 		Returns:
-		    tp.Tuple[chex.Array, chex.Array, tp.Optional[chex.Array]]: A tuple containing the residual_states, hidden states, and the attention weights.
+		    DecoderLayerOutput: A tuple containing the residual_states, hidden states, and the attention weights.
 		"""
 		residual_states = hidden_states
 		hidden_states = self.norm_1(hidden_states)
 
-		attn_out = self.attn(
+		attn_outputs = self.attn(
 			hidden_states=hidden_states,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
@@ -313,15 +317,23 @@ class DbrxNormAttentionNorm(nn.Module):
 			fcm_mask=fcm_mask,
 			frequencies=frequencies,
 			cache_view=cache_view,
+			cache_metadata=cache_metadata,
 		)
-		hidden_states, attn_weights = attn_out if output_attentions else (attn_out[0], None)
+		hidden_states = attn_outputs.attention_output
 		hidden_states = self.dropout(hidden_states)
 		hidden_states = hidden_states + residual_states
 
 		residual_states = hidden_states
 		hidden_states = self.norm_2(hidden_states)
 
-		return residual_states, hidden_states, attn_weights
+		return DecoderLayerOutput(
+			hidden_states=hidden_states,
+			residual_states=residual_states,
+			attention_weight=attn_outputs.attention_weight,
+			router_logits=None,
+			gate_loss=None,
+			cache_view=attn_outputs.cache_view,
+		)
 
 
 class DbrxExpertGLU(nn.Module):
@@ -603,7 +615,7 @@ class DbrxBlock(nn.Module):
 		output_router_logits: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
 		frequencies: tp.Optional[chex.Array] = None,
-	) -> tp.Tuple[chex.Array, chex.Array, tp.Optional[chex.Array]]:
+	) -> DecoderLayerOutput:
 		"""
 		Forward pass of the attentionNrom module.
 
@@ -619,10 +631,10 @@ class DbrxBlock(nn.Module):
 		    output_router_logits (bool): If True, outputs router logits.
 		    fcm_mask (tp.Optional[chex.Array]): fcm mask to be combined with attn mask and causal mask.
 		Returns:
-		    tp.Tuple[chex.Array, chex.Array, tp.Optional[chex.Array]]: A tuple containing the residual_states, hidden states, and the attention weights.
+		    DecoderLayerOutput: A tuple containing the residual_states, hidden states, and the attention weights.
 		"""
 
-		resid_states, hidden_states, self_attn_weights = self.norm_attn_norm(
+		decoder_output = self.norm_attn_norm(
 			hidden_states,
 			attention_mask,
 			position_ids,
@@ -634,19 +646,14 @@ class DbrxBlock(nn.Module):
 			fcm_mask,
 			frequencies,
 		)
-
+		hidden_states = decoder_output.hidden_states
 		hidden_states, router_logits = self.ffn(hidden_states)
-		hidden_states = resid_states + hidden_states
+		hidden_states = decoder_output.residual_states + hidden_states
 
-		outputs = (hidden_states,)
-
-		if output_attentions:
-			outputs += (self_attn_weights,)
-
-		if output_router_logits:
-			outputs += (router_logits,)
-
-		return outputs
+		return decoder_output.replace(
+			hidden_states=hidden_states,
+			router_logits=router_logits if output_router_logits else None,
+		)
 
 
 @register_module(
@@ -738,8 +745,7 @@ class DbrxModel(EasyDeLBaseModule):
 		output_router_logits: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> MoeModelOutput | tp.Tuple:
+	) -> MoeModelOutput:
 		"""
 		Forward pass of the model.
 
@@ -754,10 +760,10 @@ class DbrxModel(EasyDeLBaseModule):
 			output_router_logits (Optional[bool], optional): Whether to output router logits. Defaults to None.
 			past_key_values (Optional[TransformerCache | PagedAttentionCache], optional): Cached key/values. Defaults to None.
 			cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata], optional): Cache metadata. Defaults to None.
-			return_dict (bool, optional): Whether to return a dictionary or tuple. Defaults to True.
+
 
 		Returns:
-			MoeModelOutput | Tuple: The model outputs, either as a named tuple or a standard tuple.
+			MoeModelOutput: The model outputs, either as a named tuple or a standard tuple.
 		"""
 		if output_router_logits is None:
 			output_router_logits = self.config.output_router_logits
@@ -817,7 +823,7 @@ class DbrxModel(EasyDeLBaseModule):
 				output_router_logits=output_router_logits,
 				frequencies=self.frequencies,
 			)
-			hidden_states = outputs[0]
+			hidden_states = outputs.hidden_states
 
 			hidden_states = control_runtime_sharding(
 				hidden_states,
@@ -826,25 +832,15 @@ class DbrxModel(EasyDeLBaseModule):
 			)
 
 			if output_attentions:
-				all_attentions += (outputs[1],)
+				all_attentions += (outputs.attention_weight,)
 			if output_router_logits:
-				all_router_logits += (outputs[-1],)
-
+				all_router_logits += (outputs.router_logits,)
+			past_key_values[idx] = outputs.cache_view
 		hidden_states = self.norm_f(hidden_states)
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-		if not return_dict:
-			return tuple(
-				v
-				for v in [
-					hidden_states,
-					all_hidden_states,
-					all_attentions,
-					all_router_logits,
-				]
-				if v is not None
-			)
+
 		return MoeModelOutput(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
@@ -906,7 +902,6 @@ class DbrxForCausalLM(EasyDeLBaseModule):
 		output_router_logits: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
 	) -> MoeCausalLMOutput | tp.Tuple:
 		if output_router_logits is None:
 			output_router_logits = self.config.output_router_logits
@@ -920,11 +915,9 @@ class DbrxForCausalLM(EasyDeLBaseModule):
 			output_router_logits=output_router_logits,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
-			return_dict=True,
 			segment_ids=segment_ids,
 		)
 		logits = self.lm_head(outputs.last_hidden_state)
-		batch_size, seq_length, hd = logits.shape
 		aux_loss = None
 		if output_router_logits and outputs.router_logits is not None:
 			aux_loss = auxiliary_load_balancing_loss_func(
@@ -934,18 +927,6 @@ class DbrxForCausalLM(EasyDeLBaseModule):
 				attention_mask=attention_mask,
 			)
 			aux_loss += aux_loss * self.config.router_aux_loss_coef
-		if not return_dict:
-			outputs = (logits,) + tuple(
-				v
-				for v in [
-					aux_loss,
-					outputs.hidden_states,
-					outputs.attentions,
-					outputs.router_logits,
-				]
-				if v is not None
-			)
-			return outputs
 
 		return MoeCausalLMOutput(
 			aux_loss=aux_loss,
@@ -953,6 +934,7 @@ class DbrxForCausalLM(EasyDeLBaseModule):
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
 			router_logits=outputs.router_logits,
+			past_key_values=outputs.past_key_values,
 		)
 
 
@@ -1012,7 +994,6 @@ class DbrxForSequenceClassification(EasyDeLBaseModule):
 		output_router_logits: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
 	) -> SequenceClassifierOutput:
 		if output_router_logits is None:
 			output_router_logits = self.config.output_router_logits
@@ -1026,11 +1007,10 @@ class DbrxForSequenceClassification(EasyDeLBaseModule):
 			output_router_logits=output_router_logits,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
-			return_dict=True,
 			segment_ids=segment_ids,
 		)
 
-		hidden_states = transformer_outputs[0]
+		hidden_states = transformer_outputs.last_hidden_state
 		logits = self.score(hidden_states)
 		if input_ids is not None:
 			batch_size = input_ids.shape[0]
@@ -1061,9 +1041,6 @@ class DbrxForSequenceClassification(EasyDeLBaseModule):
 				attention_mask=attention_mask,
 			)
 			aux_loss += aux_loss * self.config.router_aux_loss_coef
-		if not return_dict:
-			output = (pooled_logits,) + transformer_outputs[1:] + (aux_loss,)
-			return output
 
 		return SequenceClassifierOutput(
 			logits=pooled_logits,

@@ -24,8 +24,10 @@ from flax import nnx as nn
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
 	BaseModelOutput,
 	CausalLMOutput,
+	DecoderLayerOutput,
 	SequenceClassifierOutput,
 )
 from easydel.infra.utils import (
@@ -245,6 +247,7 @@ class CohereAttention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -274,7 +277,11 @@ class CohereAttention(AttentionModule):
 		)
 		attn_output = self.o_proj(attn_output)
 
-		return attn_output, attentions.attention_weights
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=cache_view,
+		)
 
 
 class CohereMLP(nn.Module):
@@ -417,7 +424,6 @@ class CohereBlock(nn.Module):
 			fcm_mask,
 			frequencies,
 		)
-		attn_output = attn_outputs[0]
 
 		feed_forward_input = hidden_states
 
@@ -430,13 +436,21 @@ class CohereBlock(nn.Module):
 		else:
 			feed_forward_hidden_states = self.mlp(feed_forward_input)
 
-		hidden_states = attn_output + feed_forward_hidden_states + residual
+		hidden_states = (
+			attn_outputs.attention_output + feed_forward_hidden_states + residual
+		)
 		hidden_states = control_runtime_sharding(
 			hidden_states,
 			self.config.partition_axis,
 			sharding_strategy=HiddenStateSharding,
 		)
-		return (hidden_states,) + attn_outputs[1:]
+		return DecoderLayerOutput(
+			hidden_states=hidden_states,
+			attention_weight=attn_outputs.attention_weight,
+			router_logits=None,
+			gate_loss=None,
+			cache_view=attn_outputs.cache_view,
+		)
 
 
 @register_module(
@@ -497,8 +511,7 @@ class CohereModel(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+	) -> BaseModelOutput:
 		"""Forward pass through the core Cohere model.
 
 		Args:
@@ -511,7 +524,7 @@ class CohereModel(EasyDeLBaseModule):
 		    output_hidden_states (Optional[bool]): Whether to output hidden states.
 		    past_key_values (Optional[TransformerCache | PagedAttentionCache]): KV cache.
 		    cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata]): Cache metadata.
-		    return_dict (bool): Whether to return a dictionary output.
+
 
 		Returns:
 		    Union[BaseModelOutput, Tuple]: Model output.
@@ -563,19 +576,17 @@ class CohereModel(EasyDeLBaseModule):
 				segment_ids=segment_ids,
 				frequencies=self.frequencies,
 			)
-			hidden_states = layer_outputs[0]
+			hidden_states = layer_outputs.hidden_states
 
 			if output_attentions:
-				all_attentions += (layer_outputs[1],)
+				all_attentions += (layer_outputs.attention_weight,)
+
+			past_key_values[idx] = layer_outputs.cache_view
 
 		hidden_states = self.norm(hidden_states)
 
 		if output_hidden_states:
-			all_hidden_states = hidden_states[1] + (hidden_states,)
-		outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
-
-		if not return_dict:
-			return tuple(v for v in outputs if v is not None)
+			all_hidden_states = all_hidden_states + (hidden_states,)
 
 		return BaseModelOutput(
 			last_hidden_state=hidden_states,
@@ -639,8 +650,7 @@ class CohereForCausalLM(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[CausalLMOutput, tp.Tuple]:
+	) -> CausalLMOutput:
 		"""
 		Forward pass through the Cohere model for Causal Language Modeling.
 
@@ -654,7 +664,6 @@ class CohereForCausalLM(EasyDeLBaseModule):
 		    output_hidden_states (Optional[bool]): If True, output hidden states.
 		    past_key_values (Optional[TransformerCache | PagedAttentionCache]): KV cache for faster generation.
 		    cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
-		    return_dict (bool): If True, return a CausalLMOutput object.
 
 		Returns:
 		    Union[CausalLMOutput, Tuple]: Model output, including logits.
@@ -678,12 +687,11 @@ class CohereForCausalLM(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
-			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
 
-		hidden_states = outputs[0]
+		hidden_states = outputs.last_hidden_state
 
 		hidden_states = control_runtime_sharding(
 			hidden_states,
@@ -701,9 +709,6 @@ class CohereForCausalLM(EasyDeLBaseModule):
 			lm_logits = self.lm_head(hidden_states)
 
 		lm_logits = lm_logits * self.logit_scale
-
-		if not return_dict:
-			return (lm_logits,) + outputs[1:]
 
 		return CausalLMOutput(
 			logits=lm_logits,
@@ -780,8 +785,7 @@ class CohereForSequenceClassification(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[SequenceClassifierOutput, tp.Tuple]:
+	) -> SequenceClassifierOutput:
 		"""
 		Forward pass for sequence classification.
 
@@ -795,7 +799,7 @@ class CohereForSequenceClassification(EasyDeLBaseModule):
 		    output_hidden_states (Optional[bool]): Whether to output hidden states.
 		    past_key_values (Optional[TransformerCache | PagedAttentionCache]): KV cache.
 		    cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata]): Cache metadata.
-		    return_dict (bool): Whether to return a dictionary output.
+
 
 		Returns:
 		    Union[SequenceClassifierOutput, Tuple]: Classification output (logits and optional hidden states/attentions).
@@ -808,12 +812,11 @@ class CohereForSequenceClassification(EasyDeLBaseModule):
 			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
 
-		hidden_states = transformer_outputs[0]
+		hidden_states = transformer_outputs.last_hidden_state
 		logits = self.score(hidden_states)
 		if input_ids is not None:
 			batch_size = input_ids.shape[0]
@@ -835,10 +838,6 @@ class CohereForSequenceClassification(EasyDeLBaseModule):
 				sequence_lengths = -1
 
 		pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
-
-		if not return_dict:
-			output = (pooled_logits,) + transformer_outputs[1:]
-			return output
 
 		return SequenceClassifierOutput(
 			logits=pooled_logits,

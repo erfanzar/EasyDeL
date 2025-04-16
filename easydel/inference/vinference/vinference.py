@@ -1041,6 +1041,7 @@ class vInference:
 			logger.info("lowering `prefill`")
 			prefill_lowered = jax.jit(
 				prefill_fn,
+				donate_argnums=(3,),
 				static_argnums=(0, 4),
 				in_shardings=(
 					es.extract_shardings(self.graphstate),
@@ -1070,6 +1071,7 @@ class vInference:
 
 			decode_lowered = jax.jit(
 				decode_fn,
+				donate_argnums=(3,),
 				static_argnums=(0, 4),
 				in_shardings=(
 					es.extract_shardings(self.graphstate),

@@ -39,8 +39,10 @@ from jax import lax
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
 	BaseModelOutputWithPastAndCrossAttentions,
 	CausalLMOutputWithCrossAttentions,
+	DecoderLayerOutput,
 )
 from easydel.infra.utils import (
 	ACT2FN,
@@ -283,6 +285,7 @@ class GPT2Attention(AttentionModule):
 				value,
 				attention_mask,
 				init_attention_bias,
+				cache_view,
 			) = self.concatenate(
 				query=query,
 				key=key,
@@ -309,10 +312,11 @@ class GPT2Attention(AttentionModule):
 		attn_output = self.c_proj(attn_output)
 		attn_output = self.resid_dropout(attn_output)
 
-		outputs = (
-			(attn_output, attn.attention_weights) if output_attentions else (attn_output,)
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attn.attention_weights if output_attentions else None,
+			cache_view=cache_view,
 		)
-		return outputs
 
 
 class GPT2MLP(nn.Module):
@@ -517,9 +521,9 @@ class GPT2Block(nn.Module):
 			cache_metadata,
 			output_attentions,
 		)
-		attn_output = attn_outputs[0]
-		outputs = attn_outputs[1:]
-		hidden_states = attn_output + residual
+
+		hidden_states = attn_outputs.attention_output + residual
+		cross_attention = None
 		if encoder_hidden_states is not None:
 			if not hasattr(self, "crossattention"):
 				raise ValueError(
@@ -537,9 +541,8 @@ class GPT2Block(nn.Module):
 				None,
 				output_attentions,
 			)
-			attn_output = cross_attn_outputs[0]
-			hidden_states = residual + attn_output
-			outputs = outputs + cross_attn_outputs[1:]
+			cross_attention = cross_attn_outputs.attention_weight
+			hidden_states = residual + cross_attn_outputs.attention_output
 
 		residual = hidden_states
 		hidden_states = self.ln_2(hidden_states)
@@ -557,9 +560,13 @@ class GPT2Block(nn.Module):
 			self.config.partition_axis,
 			sharding_strategy=HiddenStateSharding,
 		)
-		outputs = (hidden_states,) + outputs
 
-		return outputs
+		return DecoderLayerOutput(
+			hidden_states=hidden_states,
+			attention_weight=attn_outputs.attention_weight,
+			cross_attention=cross_attention,
+			cache_view=attn_outputs.cache_view,
+		)
 
 
 @register_module(
@@ -647,7 +654,6 @@ class GPT2Model(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		"""Forward pass through the GPT2Model.
 
@@ -661,7 +667,7 @@ class GPT2Model(EasyDeLBaseModule):
 		    cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling. Defaults to None.
 		    output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
 		    output_hidden_states (bool, optional): Whether to return hidden states of all layers. Defaults to False.
-		    return_dict (bool, optional): Whether to return a model output object or a tuple. Defaults to True.
+		     Defaults to True.
 
 		Returns:
 		    Union[BaseModelOutputWithPastAndCrossAttentions, Tuple]: Model outputs (last hidden state, optional past KVs, optional hidden states, optional attentions, optional cross-attentions).
@@ -705,22 +711,15 @@ class GPT2Model(EasyDeLBaseModule):
 				cache_metadata=cache_metadata,
 				output_attentions=output_attentions,
 			)
-			hidden_states = layer_outputs[0]
+			hidden_states = layer_outputs.hidden_states
 
 			if output_attentions:
-				all_attentions += (layer_outputs[1],)
+				all_attentions += (layer_outputs.attention_weight,)
 
-				if encoder_hidden_states is not None:
-					all_cross_attentions += (layer_outputs[2],)
+			if encoder_hidden_states is not None:
+				all_cross_attentions += (layer_outputs.cross_attention,)
 
-		outputs = (
-			hidden_states,
-			all_hidden_states,
-			all_attentions,
-			all_cross_attentions,
-		)
-
-		hidden_states = outputs[0]
+			past_key_values[idx] = layer_outputs.cache_view
 
 		hidden_states = control_runtime_sharding(
 			hidden_states,
@@ -730,18 +729,12 @@ class GPT2Model(EasyDeLBaseModule):
 
 		hidden_states = self.ln_f(hidden_states)
 
-		if output_hidden_states:
-			all_hidden_states += (hidden_states,)
-		outputs = (hidden_states, all_hidden_states, all_attentions, all_cross_attentions)
-
-		if not return_dict:
-			return tuple(v for v in outputs if v is not None)
-
 		return BaseModelOutputWithPastAndCrossAttentions(
 			last_hidden_state=hidden_states,
-			hidden_states=outputs[1],
-			attentions=outputs[2],
-			cross_attentions=outputs[3],
+			hidden_states=all_hidden_states,
+			attentions=all_attentions,
+			cross_attentions=all_cross_attentions,
+			past_key_values=past_key_values,
 		)
 
 
@@ -765,7 +758,7 @@ class GPT2LMHeadModel(EasyDeLBaseModule):
 		rngs (nn.Rngs): Random number generators.
 	"""
 
-	loss_type: str = "ForCausalLMLoss"
+	loss_type: str = "ForCausalLM"
 
 	def __init__(
 		self,
@@ -813,7 +806,6 @@ class GPT2LMHeadModel(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		"""Forward pass through the GPT2LMHeadModel.
 
@@ -827,7 +819,7 @@ class GPT2LMHeadModel(EasyDeLBaseModule):
 		    cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling. Defaults to None.
 		    output_attentions (bool, optional): Whether to return attention weights. Defaults to False.
 		    output_hidden_states (bool, optional): Whether to return hidden states of all layers. Defaults to False.
-		    return_dict (bool, optional): Whether to return a model output object or a tuple. Defaults to True.
+		     Defaults to True.
 
 		Returns:
 		    Union[CausalLMOutputWithCrossAttentions, Tuple]: Model outputs (logits, optional past KVs, optional hidden states, optional attentions, optional cross-attentions).
@@ -842,11 +834,9 @@ class GPT2LMHeadModel(EasyDeLBaseModule):
 			encoder_attention_mask=encoder_attention_mask,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
-		hidden_states = outputs[0]
-
+		hidden_states = outputs.last_hidden_state
 		hidden_states = control_runtime_sharding(
 			hidden_states,
 			self.config.partition_axis,
@@ -861,9 +851,6 @@ class GPT2LMHeadModel(EasyDeLBaseModule):
 			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
-
-		if not return_dict:
-			return (lm_logits,) + outputs[1:]
 
 		return CausalLMOutputWithCrossAttentions(
 			logits=lm_logits,

@@ -418,6 +418,7 @@ class PixtralAttention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -446,12 +447,11 @@ class PixtralAttention(AttentionModule):
 		)
 		attn_output = self.o_proj(attn_output)
 
-		outputs = (
-			(attn_output, attentions.attention_weights)
-			if output_attentions
-			else (attn_output,)
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=cache_view,
 		)
-		return outputs
 
 
 class PixtralBlock(nn.Module):
@@ -562,7 +562,7 @@ class PixtralBlock(nn.Module):
 			frequencies,
 		)
 
-		hidden_states = attention_output[0] + residual
+		hidden_states = attention_output.attention_output + residual
 		ffd_inp = self.ffn_norm(hidden_states)
 		if self.config.use_scan_mlp:
 			feed_forward_hidden_states = block_wise_ffn(
@@ -572,10 +572,11 @@ class PixtralBlock(nn.Module):
 			feed_forward_hidden_states = self.feed_forward(ffd_inp)
 
 		hidden_states = hidden_states + feed_forward_hidden_states
-		outputs = (hidden_states,)
-		if output_attentions:
-			outputs += (attention_output[1],)
-		return outputs
+		return DecoderLayerOutput(
+			hidden_states=hidden_states,
+			attention_weight=attention_output.attention_weight,
+			cache_view=attention_output.cache_view,
+		)
 
 
 class PixtralTransformer(nn.Module):
@@ -638,8 +639,7 @@ class PixtralTransformer(nn.Module):
 		position_ids: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: bool = True,
-	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+	) -> BaseModelOutput:
 		"""Forward pass of the PixtralTransformer module.
 
 		Args:
@@ -653,12 +653,11 @@ class PixtralTransformer(nn.Module):
 		        Defaults to `config.output_attentions`.
 		    output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
 		        Defaults to `config.output_hidden_states`.
-		    return_dict (bool): Whether to return a `BaseModelOutput` object or a tuple. Defaults to True.
 
 		Returns:
-		    tp.Union[BaseModelOutput, tp.Tuple]: The transformer's output. If `return_dict` is True,
+		    BaseModelOutput: The transformer's output.
 		        returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
+		        and `attentions` (optional).
 		"""
 		all_attentions = () if output_attentions else None
 		all_hidden_states = () if output_hidden_states else None
@@ -695,17 +694,15 @@ class PixtralTransformer(nn.Module):
 				output_attentions=output_attentions,
 				position_embeddings=position_embeddings,
 			)
-			hidden_states = layer_outputs[0]
+			hidden_states = layer_outputs.hidden_states
 
 			if output_attentions:
-				all_attentions += (layer_outputs[1],)
+				all_attentions += (layer_outputs.attention_weight,)
+
+			past_key_values[idx] = layer_outputs.cache_view
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-		outputs = (hidden_states, all_hidden_states, all_attentions, None)
-
-		if not return_dict:
-			return tuple(value for value in outputs if value is not None)
 
 		return BaseModelOutput(
 			last_hidden_state=hidden_states,
@@ -802,7 +799,6 @@ class PixtralVisionModel(EasyDeLBaseModule):
 		pixel_values: tp.List[chex.Array],
 		output_hidden_states: tp.Optional[bool] = False,
 		output_attentions: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
 		*args,
 		**kwargs,
 	) -> tp.Union[tp.Tuple, BaseModelOutput]:
@@ -818,15 +814,13 @@ class PixtralVisionModel(EasyDeLBaseModule):
 		        Defaults to `config.output_hidden_states`.
 		    output_attentions (tp.Optional[bool]): Whether to return attention weights.
 		        Defaults to `config.output_attentions`.
-		    return_dict (tp.Optional[bool]): Whether to return a `BaseModelOutput` object or a tuple.
-		        Defaults to `config.use_return_dict`.
 		    *args: Additional positional arguments (unused).
 		    **kwargs: Additional keyword arguments (unused).
 
 		Returns:
-		    tp.Union[tp.Tuple, BaseModelOutput]: The model's output. If `return_dict` is True,
+		    tp.Union[tp.Tuple, BaseModelOutput]: The model's output.
 		        returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
+		        and `attentions` (optional).
 		"""
 		patch_embeds_list = [
 			self.patch_conv(jnp.expand_dims(img, 0).astype(self.dtype).transpose(0, 2, 3, 1))

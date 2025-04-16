@@ -44,7 +44,7 @@ def main():
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
 			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-			attn_mechanism=ed.AttentionMechanisms.AUTO,
+			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		),
 		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 		param_dtype=param_dtype,
@@ -109,7 +109,7 @@ def main():
 	print(response.tokens_per_second)
 
 	print("Stage 2 => Start Generation Process.")
-	sampling_params.top_p = 0.8
+	# sampling_params.top_p = 0.8
 	for response in inference.generate(**inputs, sampling_params=sampling_params):
 		...
 

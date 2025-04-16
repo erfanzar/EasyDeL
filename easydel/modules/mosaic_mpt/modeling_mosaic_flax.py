@@ -26,7 +26,12 @@ from jax import numpy as jnp
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
+from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
+	BaseModelOutput,
+	CausalLMOutput,
+	DecoderLayerOutput,
+)
 from easydel.infra.utils import (
 	HiddenStateSharding,
 	auto_remat,
@@ -248,6 +253,7 @@ class MptAttention(AttentionModule):
 			value_states,
 			attention_mask,
 			_,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -294,10 +300,10 @@ class MptAttention(AttentionModule):
 			)
 		)
 
-		return (
-			(attn_output, attention.attention_weights)
-			if output_attentions
-			else (attn_output,)
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attention.attention_weights,
+			cache_view=cache_view,
 		)
 
 
@@ -399,7 +405,7 @@ class MptBlock(nn.Module):
 		output_attentions: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
 	):
-		attn_out = self.attn(
+		attn_outputs = self.attn(
 			self.norm_1(hidden_states),
 			position_bias,
 			attention_mask,
@@ -410,14 +416,17 @@ class MptBlock(nn.Module):
 			output_attentions,
 			fcm_mask,
 		)
-		attn_outputs, attn_weights = attn_out if output_attentions else (attn_out[0], None)
-		hidden_states = self.resid_attn_dropout(attn_outputs) + hidden_states
-		output = self.ffn(self.norm_2(hidden_states), hidden_states)
-		outputs = (output,)
-		if output_attentions:
-			outputs += (attn_weights,)
 
-		return outputs
+		hidden_states = (
+			self.resid_attn_dropout(attn_outputs.attention_output) + hidden_states
+		)
+		output = self.ffn(self.norm_2(hidden_states), hidden_states)
+
+		return DecoderLayerOutput(
+			hidden_states=output,
+			attention_weight=attn_outputs.attention_weight,
+			cache_view=attn_outputs.cache_view,
+		)
 
 
 def build_mpt_alibi_tensor(num_heads, sequence_length, alibi_bias_max=8):
@@ -562,8 +571,7 @@ class MptModel(EasyDeLBaseModule):
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: bool = True,
-	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+	) -> BaseModelOutput:
 		all_hidden_states = () if output_hidden_states else None
 		all_attentions = () if output_attentions else None
 		if (input_ids is None) ^ (inputs_embeds is not None):
@@ -592,7 +600,7 @@ class MptModel(EasyDeLBaseModule):
 			past_key_values = TransformerCache.init_empty(len(self.blocks))
 
 		for idx, block in enumerate(self.blocks):
-			output = block(
+			layer_outputs = block(
 				hidden_states=hidden_states,
 				attention_mask=attention_mask,
 				causal_mask=self.causal_mask,
@@ -602,19 +610,15 @@ class MptModel(EasyDeLBaseModule):
 				position_bias=self.alibi,
 				segment_ids=segment_ids,
 			)
-			hidden_states = output[0]
+			hidden_states = layer_outputs.hidden_states
 			if output_attentions:
-				all_attentions += (output[-1],)
+				all_attentions += (layer_outputs.attention_weight,)
+			past_key_values[idx] = layer_outputs.cache_view
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
 		hidden_states = self.norm_f(hidden_states)
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-
-		outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
-
-		if not return_dict:
-			return tuple(value for value in outputs if value is not None)
 
 		return BaseModelOutput(
 			last_hidden_state=hidden_states,
@@ -702,8 +706,7 @@ class MptForCausalLM(EasyDeLBaseModule):
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: bool = True,
-	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+	) -> BaseModelOutput:
 		outputs: BaseModelOutput = self.transformer(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
@@ -713,7 +716,6 @@ class MptForCausalLM(EasyDeLBaseModule):
 			cache_metadata=cache_metadata,
 			output_hidden_states=output_hidden_states,
 			output_attentions=output_attentions,
-			return_dict=True,
 		)
 		last_hidden_state = outputs.last_hidden_state
 
@@ -725,9 +727,6 @@ class MptForCausalLM(EasyDeLBaseModule):
 			)
 		else:
 			logits = self.lm_head(last_hidden_state)
-
-		if not return_dict:
-			return (logits,) + outputs[1:]
 
 		return CausalLMOutput(
 			logits=logits,

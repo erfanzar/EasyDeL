@@ -25,7 +25,9 @@ from flax import nnx as nn
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
 	BaseModelOutput,
+	DecoderLayerOutput,
 	ModelOutput,
 )
 from easydel.infra.utils import (
@@ -791,6 +793,7 @@ class Qwen2VLAttention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -820,7 +823,11 @@ class Qwen2VLAttention(AttentionModule):
 				attn_output=self._merge_heads(attentions.attention_outputs)
 			)
 		)
-		return attn_output, attentions.attention_weights
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=cache_view,
+		)
 
 
 class Qwen2VLDecoderLayer(nn.Module):
@@ -900,8 +907,7 @@ class Qwen2VLDecoderLayer(nn.Module):
 			fcm_mask,
 			frequencies,
 		)
-		attn_output = attn_outputs[0]
-		hidden_states = hidden_states + attn_output
+		hidden_states = hidden_states + attn_outputs.attention_output
 
 		feed_forward_input = self.post_attention_layernorm(hidden_states)
 
@@ -920,7 +926,11 @@ class Qwen2VLDecoderLayer(nn.Module):
 			self.config.partition_axis,
 			sharding_strategy=HiddenStateSharding,
 		)
-		return (hidden_states,) + attn_outputs[1:]
+		return DecoderLayerOutput(
+			hidden_states=hidden_states,
+			attention_weight=attn_outputs.attention_weight,
+			cache_view=attn_outputs.cache_view,
+		)
 
 
 @register_module(
@@ -1124,8 +1134,7 @@ class Qwen2VLModel(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: bool = True,
-	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+	) -> BaseModelOutput:
 		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
 				"You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -1174,21 +1183,17 @@ class Qwen2VLModel(EasyDeLBaseModule):
 				segment_ids=segment_ids,
 				frequencies=self.frequencies,
 			)
-			hidden_states = layer_outputs[0]
+			hidden_states = layer_outputs.hidden_states
 
 			if output_attentions:
-				all_attentions += (layer_outputs[1],)
+				all_attentions += (layer_outputs.attention_weight,)
+
+			past_key_values[idx] = layer_outputs.cache_view
 
 		hidden_states = self.norm(hidden_states)
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-			outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
-		else:
-			outputs = (hidden_states, all_attentions, past_key_values)
-
-		if not return_dict:
-			return tuple(v for v in outputs if v is not None)
 
 		return BaseModelOutput(
 			last_hidden_state=hidden_states,
@@ -1267,7 +1272,6 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 		inputs_embeds: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
 		pixel_values: tp.Optional[chex.Array] = None,
 		pixel_values_videos: tp.Optional[chex.Array] = None,
 		image_grid_thw: tp.Optional[tuple] = None,
@@ -1285,9 +1289,6 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 			output_hidden_states
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
-		)
-		return_dict = (
-			return_dict if return_dict is not None else self.config.use_return_dict
 		)
 
 		if inputs_embeds is None:
@@ -1350,10 +1351,9 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 			inputs_embeds=inputs_embeds,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
-		hidden_states = outputs[0]
+		hidden_states = outputs.last_hidden_state
 
 		hidden_states = control_runtime_sharding(
 			hidden_states,
@@ -1362,10 +1362,6 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 		)
 
 		logits = self.lm_head(hidden_states)
-
-		if not return_dict:
-			output = (logits,) + outputs[1:]
-			return output
 
 		return Qwen2VLCausalLMOutputWithPast(
 			logits=logits,

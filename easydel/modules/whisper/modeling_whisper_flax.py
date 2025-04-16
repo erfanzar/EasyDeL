@@ -248,6 +248,7 @@ class WhisperAttention(AttentionModule):
 				value_states,
 				attention_mask,
 				init_attention_bias,
+				cache_view,
 			) = self.concatenate(
 				query=query_states,
 				key=key_states,
@@ -281,7 +282,7 @@ class WhisperAttention(AttentionModule):
 			self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
 		)
 
-		return attn_output, attentions.attention_outputs
+		return attn_output, attentions.attention_outputs, cache_view
 
 	def _split_heads(self, hidden_state) -> jnp.ndarray:
 		"""Splits the last dimension of the hidden state into (num_heads, head_dim)."""
@@ -402,7 +403,7 @@ class WhisperEncoderLayer(nn.Module):
 		"""
 		residual = hidden_states
 		hidden_states = self.self_attn_layer_norm(hidden_states)
-		hidden_states, attn_weights = self.self_attn(
+		hidden_states, attn_weights, _ = self.self_attn(
 			hidden_states=hidden_states,
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,
@@ -580,7 +581,7 @@ class WhisperDecoderLayer(nn.Module):
 		hidden_states = self.self_attn_layer_norm(hidden_states)
 
 		# Self Attention
-		hidden_states, self_attn_weights = self.self_attn(
+		hidden_states, self_attn_weights, cache_view = self.self_attn(
 			hidden_states=hidden_states,
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,
@@ -596,7 +597,7 @@ class WhisperDecoderLayer(nn.Module):
 			residual = hidden_states
 
 			hidden_states = self.encoder_attn_layer_norm(hidden_states)
-			hidden_states, cross_attn_weights = self.encoder_attn(
+			hidden_states, cross_attn_weights, _ = self.encoder_attn(
 				hidden_states=hidden_states,
 				causal_mask=causal_mask,
 				key_value_states=encoder_hidden_states,
@@ -618,7 +619,7 @@ class WhisperDecoderLayer(nn.Module):
 
 		if output_attentions:
 			outputs += (self_attn_weights, cross_attn_weights)
-
+		outputs += (cache_view,)
 		return outputs
 
 
@@ -736,7 +737,6 @@ class WhisperEncoder(EasyDeLBaseModule):
 		input_features: jnp.ndarray,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	) -> tuple[tp.Any | None, ...] | BaseModelOutput:
 		"""Forward pass of the Whisper encoder.
 
@@ -745,12 +745,10 @@ class WhisperEncoder(EasyDeLBaseModule):
 		        of shape (batch_size, num_mel_bins, sequence_length).
 		    output_attentions (bool): Whether to return attention weights (default: False).
 		    output_hidden_states (bool): Whether to return hidden states for all layers (default: False).
-		    return_dict (bool): Whether to return a `BaseModelOutput` object or a tuple (default: True).
 
 		Returns:
-		    BaseModelOutput | tuple: The encoder output. If `return_dict` is True, returns a `BaseModelOutput`
+		    BaseModelOutput | tuple: The encoder output. returns a `BaseModelOutput`
 		        containing `last_hidden_state`, `hidden_states` (optional), and `attentions` (optional).
-		        Otherwise, returns a tuple of these outputs.
 		"""
 		all_attentions = () if output_attentions else None
 		all_hidden_states = () if output_hidden_states else None
@@ -769,7 +767,6 @@ class WhisperEncoder(EasyDeLBaseModule):
 		hidden_states = jax.nn.gelu(self.conv2(hidden_states), approximate=False)
 
 		embed_positions = self.embed_positions(jnp.arange(self.config.max_source_positions))
-		# freeze the sinusoidal embeddings by stopping the back-prop
 		embed_positions = jax.lax.stop_gradient(embed_positions)
 		hidden_states = hidden_states + embed_positions
 
@@ -781,7 +778,8 @@ class WhisperEncoder(EasyDeLBaseModule):
 			dropout_probability = random.uniform(0, 1)
 			if not self.dropout_layer.deterministic and (
 				dropout_probability < self.layerdrop
-			):  # skip the layer
+			):
+				# skip the layer
 				layer_outputs = (None, None)
 			else:
 				layer_outputs = encoder_layer(
@@ -800,10 +798,6 @@ class WhisperEncoder(EasyDeLBaseModule):
 		hidden_states = self.layer_norm(hidden_states)
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-		outputs = (hidden_states, all_hidden_states, all_attentions)
-
-		if not return_dict:
-			return tuple(v for v in outputs if v is not None)
 
 		return BaseModelOutput(
 			last_hidden_state=hidden_states,
@@ -910,7 +904,6 @@ class WhisperDecoder(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	) -> tuple[tp.Any, ...] | BaseModelOutputWithPastAndCrossAttentions:
 		"""Forward pass of the Whisper decoder.
 
@@ -924,13 +917,12 @@ class WhisperDecoder(EasyDeLBaseModule):
 		    cache_metadata (tp.Optional[TransformerMetadata]): Metadata for paged attention.
 		    output_attentions (bool): Whether to return attention weights (default: False).
 		    output_hidden_states (bool): Whether to return hidden states for all layers (default: False).
-		    return_dict (bool): Whether to return a `BaseModelOutputWithPastAndCrossAttentions` object or a tuple (default: True).
 
 		Returns:
-		    BaseModelOutputWithPastAndCrossAttentions | tuple: The decoder output. If `return_dict` is True,
+		    BaseModelOutputWithPastAndCrossAttentions: The decoder output.
 		        returns a `BaseModelOutputWithPastAndCrossAttentions` containing `last_hidden_state`,
 		        `past_key_values` (if `use_cache` is True), `hidden_states` (optional), `attentions` (optional),
-		        and `cross_attentions` (optional). Otherwise, returns a tuple of these outputs.
+		        and `cross_attentions` (optional).
 		"""
 		inputs_embeds = self.embed_tokens(input_ids)
 		if position_ids is None:
@@ -970,7 +962,7 @@ class WhisperDecoder(EasyDeLBaseModule):
 			if not self.dropout_layer.deterministic and (
 				dropout_probability < self.layerdrop
 			):
-				layer_outputs = (None, None, None)
+				layer_outputs = (None, None, None, None)
 			else:
 				layer_outputs = decoder_layer(
 					hidden_states=hidden_states,
@@ -978,11 +970,11 @@ class WhisperDecoder(EasyDeLBaseModule):
 					causal_mask=self.causal_mask,
 					encoder_hidden_states=encoder_hidden_states,
 					encoder_attention_mask=None,
-					cache_view=past_key_values.views[idx],
+					cache_view=past_key_values[idx],
 					cache_metadata=cache_metadata,
 					output_attentions=output_attentions,
 				)
-
+			past_key_values[idx] = layer_outputs[-1]
 			hidden_states = layer_outputs[0]
 			if output_attentions:
 				all_self_attns += (layer_outputs[1],)
@@ -998,21 +990,12 @@ class WhisperDecoder(EasyDeLBaseModule):
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
 
-		outputs = [
-			hidden_states,
-			all_hidden_states,
-			all_self_attns,
-			all_cross_attentions,
-		]
-
-		if not return_dict:
-			return tuple(v for v in outputs if v is not None)
-
 		return BaseModelOutputWithPastAndCrossAttentions(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
 			attentions=all_self_attns,
 			cross_attentions=all_cross_attentions,
+			past_key_values=past_key_values,
 		)
 
 
@@ -1092,7 +1075,6 @@ class WhisperModel(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		"""Forward pass of the complete Whisper model (encoder + decoder).
 
@@ -1105,11 +1087,9 @@ class WhisperModel(EasyDeLBaseModule):
 		    cache_metadata (tp.Optional[TransformerMetadata]): Metadata for paged attention.
 		    output_attentions (bool): Whether to return attention weights (default: False).
 		    output_hidden_states (bool): Whether to return hidden states for all layers (default: False).
-		    return_dict (bool): Whether to return a `Seq2SeqModelOutput` object or a tuple (default: True).
 
 		Returns:
-		    Seq2SeqModelOutput | tuple: The model output. If `return_dict` is True, returns a `Seq2SeqModelOutput`.
-		        Otherwise, returns a tuple.
+		    Seq2SeqModelOutput: The model output. returns a `Seq2SeqModelOutput`.
 		"""
 		output_attentions = (
 			output_attentions
@@ -1121,7 +1101,6 @@ class WhisperModel(EasyDeLBaseModule):
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
 		)
-		return_dict = return_dict if return_dict is not None else self.config.return_dict
 		batch_size, sequence_length = decoder_input_ids.shape
 
 		if decoder_attention_mask is None:
@@ -1146,7 +1125,6 @@ class WhisperModel(EasyDeLBaseModule):
 			input_features=input_features,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
 		decoder_outputs = self.decoder(
@@ -1158,16 +1136,13 @@ class WhisperModel(EasyDeLBaseModule):
 			encoder_hidden_states=encoder_outputs[0],
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
-
-		if not return_dict:
-			return decoder_outputs + encoder_outputs
 
 		return Seq2SeqModelOutput(
 			last_hidden_state=decoder_outputs.last_hidden_state,
 			decoder_hidden_states=decoder_outputs.hidden_states,
 			decoder_attentions=decoder_outputs.attentions,
+			past_key_values=decoder_outputs.past_key_values,
 			cross_attentions=decoder_outputs.cross_attentions,
 			encoder_last_hidden_state=encoder_outputs.last_hidden_state,
 			encoder_hidden_states=encoder_outputs.hidden_states,
@@ -1184,7 +1159,6 @@ class WhisperModel(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		"""Performs decoding using the decoder module.
 
@@ -1197,7 +1171,6 @@ class WhisperModel(EasyDeLBaseModule):
 		    cache_metadata (tp.Optional[TransformerMetadata]): Metadata for paged attention.
 		    output_attentions (bool): Whether to return attention weights.
 		    output_hidden_states (bool): Whether to return hidden states for all layers.
-		    return_dict (bool): Whether to return a dictionary-like output.
 
 		Returns:
 		    BaseModelOutputWithPastAndCrossAttentions | tuple: Decoder output.
@@ -1212,7 +1185,6 @@ class WhisperModel(EasyDeLBaseModule):
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
 		)
-		return_dict = return_dict if return_dict is not None else self.config.return_dict
 		batch_size, sequence_length = decoder_input_ids.shape
 
 		if decoder_attention_mask is None:
@@ -1242,18 +1214,14 @@ class WhisperModel(EasyDeLBaseModule):
 			encoder_hidden_states=encoder_hidden_states,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
-
-		if not return_dict:
-			return decoder_outputs
 
 		return Seq2SeqModelOutput(
 			last_hidden_state=decoder_outputs.last_hidden_state,
 			decoder_hidden_states=decoder_outputs.hidden_states,
 			decoder_attentions=decoder_outputs.attentions,
 			cross_attentions=decoder_outputs.cross_attentions,
-			past_key_values=past_key_values,
+			past_key_values=decoder_outputs.past_key_values,
 		)
 
 	def encode(
@@ -1261,7 +1229,6 @@ class WhisperModel(EasyDeLBaseModule):
 		input_features: jnp.ndarray,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		"""Performs encoding using the encoder module.
 
@@ -1269,7 +1236,6 @@ class WhisperModel(EasyDeLBaseModule):
 		    input_features (jnp.ndarray): Input audio features.
 		    output_attentions (bool): Whether to return attention weights.
 		    output_hidden_states (bool): Whether to return hidden states for all layers.
-		    return_dict (bool): Whether to return a dictionary-like output.
 
 		Returns:
 		    BaseModelOutput | tuple: Encoder output.
@@ -1284,16 +1250,12 @@ class WhisperModel(EasyDeLBaseModule):
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
 		)
-		return_dict = return_dict if return_dict is not None else self.config.return_dict
 
 		encoder_outputs = self.encoder(
 			input_features=input_features,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
-		if not return_dict:
-			return encoder_outputs
 
 		return Seq2SeqModelOutput(
 			encoder_last_hidden_state=encoder_outputs.last_hidden_state,
@@ -1361,7 +1323,6 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		outputs = self.model(
 			input_features=input_features,
@@ -1370,7 +1331,6 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 			decoder_position_ids=decoder_position_ids,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
 		)
@@ -1390,10 +1350,6 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 
 		lm_logits = self.proj_out(hidden_states)
 
-		if not return_dict:
-			output = (lm_logits,) + outputs[1:]
-			return output
-
 		return Seq2SeqLMOutput(
 			logits=lm_logits,
 			decoder_hidden_states=outputs.decoder_hidden_states,
@@ -1402,6 +1358,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 			encoder_last_hidden_state=outputs.encoder_last_hidden_state,
 			encoder_hidden_states=outputs.encoder_hidden_states,
 			encoder_attentions=outputs.encoder_attentions,
+			past_key_values=outputs.past_key_values,
 		)
 
 	def decode(
@@ -1415,7 +1372,6 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
 	):
 		output_attentions = (
 			output_attentions
@@ -1427,7 +1383,6 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
 		)
-		return_dict = return_dict if return_dict is not None else self.config.return_dict
 
 		encoder_hidden_states = encoder_outputs[0]
 		if decoder_attention_mask is not None:
@@ -1442,7 +1397,6 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
-			return_dict=return_dict,
 		)
 		hidden_states = outputs[0]
 
@@ -1458,10 +1412,6 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 			)
 
 		lm_logits = self.proj_out(hidden_states)
-
-		if not return_dict:
-			output = (lm_logits,) + outputs[1:]
-			return output
 
 		return Seq2SeqLMOutput(
 			logits=lm_logits,
@@ -1480,7 +1430,6 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 		attention_mask: tp.Optional[jnp.ndarray] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
 		**kwargs,
 	):
 		output_attentions = (
@@ -1493,13 +1442,11 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
 		)
-		return_dict = return_dict if return_dict is not None else self.config.return_dict
 
 		return self.model.encode(
 			input_features=jnp.array(input_features, dtype="f4"),
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
 	def generate(
@@ -1742,7 +1689,6 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
 		encoder_outputs=None,
 		output_attentions=None,
 		output_hidden_states: bool = True,
-		return_dict: bool = True,
 	):
 		output_attentions = (
 			output_attentions
@@ -1754,16 +1700,12 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
 		)
-		return_dict = (
-			return_dict if return_dict is not None else self.config.use_return_dict
-		)
 
 		if encoder_outputs is None:
 			encoder_outputs = self.encoder(
 				input_features,
 				output_attentions=output_attentions,
 				output_hidden_states=output_hidden_states,
-				return_dict=return_dict,
 			)
 
 		if self.config.use_weighted_layer_sum:
@@ -1779,9 +1721,6 @@ class WhisperForAudioClassification(EasyDeLBaseModule):
 		pooled_output = jnp.mean(hidden_states, axis=1)
 
 		logits = self.classifier(pooled_output)
-
-		if not return_dict:
-			return (logits,) + encoder_outputs[1:]
 
 		return SequenceClassifierOutput(
 			logits=logits,

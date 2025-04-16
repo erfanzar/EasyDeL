@@ -23,7 +23,12 @@ from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
+from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
+	BaseModelOutput,
+	CausalLMOutput,
+	DecoderLayerOutput,
+)
 from easydel.infra.utils import (
 	ACT2FN,
 	HiddenStateSharding,
@@ -183,6 +188,7 @@ class GPTJAttention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -211,7 +217,11 @@ class GPTJAttention(AttentionModule):
 		attn_output = self.out_proj(attn_output)
 		attn_output = self.resid_dropout(attn_output)
 
-		return attn_output, attentions.attention_weights
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=cache_view,
+		)
 
 
 class GPTJMLP(nn.Module):
@@ -388,7 +398,7 @@ class GPTJBlock(nn.Module):
 			output_attentions,
 			frequencies,
 		)
-		attn_output = attn_outputs[0]
+		attn_output = attn_outputs.attention_output
 		if self.config.use_scan_mlp:
 			feed_forward_hidden_states = block_wise_ffn(
 				self.mlp,
@@ -404,7 +414,11 @@ class GPTJBlock(nn.Module):
 			self.config.partition_axis,
 			sharding_strategy=HiddenStateSharding,
 		)
-		return (hidden_states,) + attn_outputs[1:]
+		return DecoderLayerOutput(
+			hidden_states=hidden_states,
+			attention_weight=attn_outputs.attention_weight,
+			cache_view=attn_outputs.cache_view,
+		)
 
 
 @register_module(
@@ -498,7 +512,6 @@ class GPTJModel(EasyDeLBaseModule):
 		extra_embedding: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		"""Forward pass through the GPTJModel.
 
@@ -513,7 +526,7 @@ class GPTJModel(EasyDeLBaseModule):
 		    extra_embedding (chex.Array, optional): Additional embedding to add to input embeddings.
 		    output_attentions (bool, optional): Whether to return attention weights.
 		    output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-		    return_dict (bool, optional): Whether to return a model output object or a tuple.
+
 
 		Returns:
 		    Union[BaseModelOutput, Tuple]: Model outputs (last hidden state, optional hidden states, optional attentions)
@@ -554,7 +567,7 @@ class GPTJModel(EasyDeLBaseModule):
 		for idx, block in enumerate(self.h):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
-			hidden_states, attn_weight = block(
+			layer_outputs = block(
 				hidden_states=hidden_states,
 				attention_mask=attention_mask,
 				cache_view=past_key_values.views[idx],
@@ -565,17 +578,14 @@ class GPTJModel(EasyDeLBaseModule):
 				frequencies=self.frequencies,
 				causal_mask=self.causal_mask,
 			)
+			hidden_states = layer_outputs.hidden_states
 			if output_attentions:
-				all_attentions += (attn_weight,)
-
+				all_attentions += (layer_outputs.attention_weight,)
+			past_key_values[idx] = layer_outputs.cache_view
 		hidden_states = self.ln_f(hidden_states)
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-
-		outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
-		if not return_dict:
-			return tuple(v for v in outputs if v is not None)
 
 		return BaseModelOutput(
 			last_hidden_state=hidden_states,
@@ -651,7 +661,6 @@ class GPTJForCausalLM(EasyDeLBaseModule):
 		extra_embedding: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		"""Forward pass through the GPTJForCausalLM model.
 
@@ -666,7 +675,7 @@ class GPTJForCausalLM(EasyDeLBaseModule):
 		    extra_embedding (chex.Array, optional): Additional embedding to add to input embeddings.
 		    output_attentions (bool, optional): Whether to return attention weights.
 		    output_hidden_states (bool, optional): Whether to return hidden states of all layers.
-		    return_dict (bool, optional): Whether to return a model output object or a tuple.
+
 
 		Returns:
 		    Union[CausalLMOutput, Tuple]: Model outputs (logits, optional hidden states, optional attentions)
@@ -682,10 +691,9 @@ class GPTJForCausalLM(EasyDeLBaseModule):
 			position_ids=position_ids,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
-		hidden_states = outputs[0]
+		hidden_states = outputs.last_hidden_state
 
 		hidden_states = control_runtime_sharding(
 			hidden_states,
@@ -701,9 +709,6 @@ class GPTJForCausalLM(EasyDeLBaseModule):
 			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
-
-		if not return_dict:
-			return (lm_logits,) + outputs[1:]
 
 		return CausalLMOutput(
 			logits=lm_logits,

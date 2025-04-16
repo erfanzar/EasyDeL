@@ -58,6 +58,7 @@ class BaseCacheMetadata(ABC):
 		"""
 		pass
 
+
 @auto_pytree
 class BaseRunTimeMetadata:
 	"""
@@ -158,3 +159,42 @@ class BaseCache(ABC):
 		    Cache instance with uninitialized views
 		"""
 		pass
+
+	def __getitem__(self, index):
+		"""
+		Enable indexing to access cache views.
+
+		Args:
+				index: Index of the cache view to retrieve
+
+		Returns:
+				The cache view at the specified index
+		"""
+		return self.views[index]
+
+	def __setitem__(self, index, value):
+		"""
+		Enable item assignment to update cache views.
+
+		Args:
+				index: Index of the cache view to update
+				value: New cache view to assign
+		"""
+		self.views[index] = value
+
+	def __len__(self) -> int:
+		"""
+		Returns the number of cache views.
+
+		Returns:
+				The number of items in the `views` sequence.
+
+		Raises:
+				AttributeError: If `self.views` has not been initialized by a subclass.
+		"""
+		if not hasattr(self, "views"):
+			raise AttributeError(
+				"The 'views' attribute has not been initialized. "
+				"Ensure a concrete subclass initializes it."
+			)
+		return len(self.views)

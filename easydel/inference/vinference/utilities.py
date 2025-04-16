@@ -27,7 +27,7 @@ from jax.sharding import PartitionSpec
 from easydel.utils.compiling_utils import get_safe_hash_int
 from easydel.utils.helpers import get_logger
 
-from ..logits_process import LogitsProcessorList, hash_fn
+from ..logits_process import hash_fn
 from ..utilities import SamplingParams
 
 AmapType = tp.Mapping[str, tp.Dict[str, tp.Any]]
@@ -258,10 +258,6 @@ class SampleState:
 	    model_kwargs: A dictionary containing any additional arguments required by the
 	        model for the next generation step (e.g., attention cache/past key-values).
 	        The structure depends on the specific model implementation.
-	    generate_func_flops: Estimated Floating Point Operations (FLOPs) consumed by the
-	        main generation function (often the transformer forward pass). Defaults to -inf.
-	    interval_func_flops: Estimated FLOPs for any interval-specific function executed
-	        during generation (if applicable). Defaults to -inf.
 	    tokens_per_second: Estimated generation speed in tokens per second. Defaults to -inf.
 	    generated_tokens: The total count of tokens generated across all sequences in the
 	        current generation process up to this state. Defaults to 0.
@@ -281,8 +277,6 @@ class SampleState:
 	model_kwargs: tp.Union[tp.Dict[str, jax.Array], sharding.NamedSharding]
 
 	# vInference Ops
-	generate_func_flops: tp.Optional[float] = float("-inf")
-	interval_func_flops: tp.Optional[float] = float("-inf")
 	tokens_per_second: tp.Optional[float] = float("-inf")
 	generated_tokens: tp.Optional[int] = 0
 	padded_length: tp.Optional[int] = 0
@@ -292,8 +286,7 @@ class SampleState:
 
 
 def create_sampling_step(
-	logits_processor: LogitsProcessorList,
-	logits_warper: LogitsProcessorList,
+	sampling_params: SamplingParams,
 	eos_token_id: jax.Array,
 	pad_token_id: jax.Array,
 ) -> tp.Callable:
@@ -305,12 +298,7 @@ def create_sampling_step(
 	used within a generation loop (e.g., `jax.lax.scan`).
 
 	Args:
-	    logits_processor: A `LogitsProcessorList` containing functions to modify
-	        logits deterministically before sampling (e.g., applying temperature,
-	        filtering banned tokens). Applied sequentially.
-	    logits_warper: A `LogitsProcessorList` containing functions to modify the
-	        probability distribution derived from logits (e.g., top-k, top-p/nucleus
-	        sampling). Applied sequentially after `logits_processor`.
+	    sampling_params: A `SamplingParams`.
 	    eos_token_id: A JAX array containing the token ID(s) representing the
 	        end-of-sequence. Generation stops for a sequence once an EOS token is sampled.
 	    pad_token_id: The JAX array representing the padding token ID. Once a sequence
@@ -337,18 +325,21 @@ def create_sampling_step(
 		    SampleState: The updated generation state after one sampling step.
 		"""
 		model = nn.merge(graphdef, graphstate, graphother)
-		model_outputs = model(
-			input_ids=state.running_token,
-			return_dict=True,
-			**state.model_kwargs,
-		)
+		model_outputs = model(input_ids=state.running_token, **state.model_kwargs)
 
 		logits = model_outputs.logits[:, -1]
-		if logits_processor is not None:
-			logits = logits_processor(state.sequences, logits, state.current_length)
 
-		if logits_warper is not None:
-			logits = logits_warper(state.sequences, logits, state.current_length)
+		logits = sampling_params.logits_warper(
+			state.sequences,
+			logits,
+			state.current_length,
+		)
+		logits = sampling_params.logits_warper(
+			state.sequences,
+			logits,
+			state.current_length,
+		)
+
 		next_token = jax.random.categorical(state.prng_key, logits, axis=-1)
 
 		# Ensure finished sequences continue generating pad tokens
@@ -357,10 +348,12 @@ def create_sampling_step(
 			+ pad_token_id * state.is_sequence_finished
 		)
 		# Determine if the sequence is finished (EOS encountered or already finished)
-		next_sequence_finished = state.is_sequence_finished | jnp.isin(
-			next_token,
-			eos_token_id,
+
+		next_sequence_finished = jnp.logical_or(
+			state.generated_tokens >= (sampling_params.max_tokens * state.sequences.shape[0]),
+			state.is_sequence_finished | jnp.isin(next_token, eos_token_id),
 		)
+
 		next_token = next_token[:, None]  # Add dimension for dynamic update
 		# Update sequences with the new token
 		next_sequences = jax.lax.dynamic_update_slice(

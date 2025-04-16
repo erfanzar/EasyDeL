@@ -593,10 +593,9 @@ class Mamba2Mixer(nn.Module):
 					cache_params.ssm_states[self.layer_idx] = ssm_state
 
 				scan_output = self.norm(y, gate)
-				contextualized_states = self.out_proj(
-					scan_output.astype(dtype)
-				)  # [batch, seq_len, hidden_size]
-				return contextualized_states
+				contextualized_states = self.out_proj(scan_output.astype(dtype))
+				# [batch, seq_len, hidden_size]
+				return contextualized_states, cache_params
 
 
 class Mamba2Block(nn.Module):
@@ -648,14 +647,14 @@ class Mamba2Block(nn.Module):
 		hidden_states = self.norm(hidden_states)
 		if self.residual_in_fp32:
 			residual = residual.astype(jnp.float32)
-		hidden_states = self.mixer(
+		hidden_states, cache_params = self.mixer(
 			hidden_states,
 			cache_params,
 			cache_position,
 			attention_mask,
 		)
 		hidden_states = residual + hidden_states
-		return hidden_states
+		return hidden_states, cache_params
 
 
 @register_module(
@@ -713,7 +712,6 @@ class Mamba2Model(EasyDeLBaseModule):
 		inputs_embeds: tp.Optional[chex.Array] = None,
 		cache_params: tp.Optional[Mamba2Cache] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
 		cache_position: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 		**kwargs,
@@ -724,9 +722,6 @@ class Mamba2Model(EasyDeLBaseModule):
 			else self.config.output_hidden_states
 		)
 		all_hidden_states = () if output_hidden_states else None
-		return_dict = (
-			return_dict if return_dict is not None else self.config.use_return_dict
-		)
 
 		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
@@ -741,13 +736,13 @@ class Mamba2Model(EasyDeLBaseModule):
 			attention_mask = jnp.ones(inputs_embeds.shape[:2], dtype="i4")
 		hidden_states = inputs_embeds
 		for idx, block in enumerate(self.layers):
-			hidden_states = block(
+			hidden_states, cache_view = block(
 				hidden_states=hidden_states,
 				cache_params=cache_params.views[idx],
 				cache_position=cache_position,
 				attention_mask=attention_mask,
 			)
-
+			cache_params[idx] = cache_view
 			if output_hidden_states:
 				all_hidden_states = all_hidden_states + (hidden_states,)
 
@@ -755,11 +750,6 @@ class Mamba2Model(EasyDeLBaseModule):
 
 		if output_hidden_states:
 			all_hidden_states = all_hidden_states + (hidden_states,)
-
-		if not return_dict:
-			return tuple(
-				v for v in [hidden_states, cache_params, all_hidden_states] if v is not None
-			)
 
 		return Mamba2Output(
 			last_hidden_state=hidden_states,
@@ -813,15 +803,10 @@ class Mamba2ForCausalLM(EasyDeLBaseModule):
 		inputs_embeds: tp.Optional[chex.Array] = None,
 		cache_params: tp.Optional[Mamba2Cache] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
 		cache_position: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 		**kwargs,
 	) -> tp.Union[tp.Tuple, Mamba2CausalLMOutput]:
-		return_dict = (
-			return_dict if return_dict is not None else self.config.use_return_dict
-		)
-
 		mamba_outputs = self.backbone(
 			input_ids=input_ids,
 			inputs_embeds=inputs_embeds,
@@ -829,14 +814,10 @@ class Mamba2ForCausalLM(EasyDeLBaseModule):
 			cache_params=cache_params,
 			cache_position=cache_position,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
-		hidden_states = mamba_outputs[0]
+		hidden_states = mamba_outputs.last_hidden_state
 
 		logits = self.lm_head(hidden_states).astype(jnp.float32)
-
-		if not return_dict:
-			return (logits,) + mamba_outputs[1:]
 
 		return Mamba2CausalLMOutput(
 			logits=logits,

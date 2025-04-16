@@ -199,12 +199,22 @@ class CompletionResponse(BaseModel):
 	usage: UsageInfo
 
 
+# New model for streaming completion choices (OAI compatible)
+class CompletionStreamResponseChoice(BaseModel):
+	"""Represents a single choice within a streaming completion response chunk."""
+
+	index: int
+	text: str  # The delta text content
+	logprobs: tp.Optional[CompletionLogprobs] = None # Logprobs are usually None in streaming chunks
+	finish_reason: tp.Optional[tp.Literal["stop", "length"]] = None
+
+
 class CompletionStreamResponse(BaseModel):
 	"""Represents a streaming response from the completions endpoint."""
 
 	id: str = Field(default_factory=lambda: f"cmpl-{uuid.uuid4().hex}")
-	object: str = "text_completion.chunk"
+	object: str = "text_completion.chunk" # Correct object type for streaming
 	created: int = Field(default_factory=lambda: int(time.time()))
 	model: str
-	choices: tp.List[CompletionResponseChoice]
-	usage: UsageInfo
+	choices: tp.List[CompletionStreamResponseChoice] # Use the new streaming choice model
+	usage: tp.Optional[UsageInfo] = None # Usage is often None until the final chunk in OAI

@@ -24,8 +24,10 @@ from jax import numpy as jnp
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
 	BaseModelOutput,
 	CausalLMOutput,
+	DecoderLayerOutput,
 	SequenceClassifierOutput,
 )
 from easydel.infra.utils import (
@@ -231,6 +233,7 @@ class ExaoneAttentionInner(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -260,12 +263,11 @@ class ExaoneAttentionInner(AttentionModule):
 		)
 		attn_output = self.out_proj(attn_output)
 
-		outputs = (
-			(attn_output, attentions.attention_weights)
-			if output_attentions
-			else (attn_output,)
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=cache_view,
 		)
-		return outputs
 
 
 class ExaoneAttention(nn.Module):
@@ -306,6 +308,7 @@ class ExaoneAttention(nn.Module):
 			position_ids=position_ids,
 			causal_mask=causal_mask,
 			cache_view=cache_view,
+			cache_metadata=cache_metadata,
 			segment_ids=segment_ids,
 			output_attentions=output_attentions,
 			fcm_mask=fcm_mask,
@@ -381,7 +384,7 @@ class ExaoneDecoderLayer(nn.Module):
 	):
 		residual = hidden_states
 		hidden_states = self.ln_1(hidden_states)
-		attention_output = self.attn(
+		attn_outputs = self.attn(
 			hidden_states,
 			attention_mask,
 			position_ids,
@@ -394,7 +397,7 @@ class ExaoneDecoderLayer(nn.Module):
 			frequencies,
 		)
 
-		hidden_states = attention_output[0] + residual
+		hidden_states = attn_outputs.attention_output + residual
 		residual = hidden_states
 		hidden_states = self.ln_2(hidden_states)
 		if self.config.use_scan_mlp:
@@ -412,10 +415,12 @@ class ExaoneDecoderLayer(nn.Module):
 			self.config.partition_axis,
 			sharding_strategy=HiddenStateSharding,
 		)
-		outputs = (hidden_states,)
-		if output_attentions:
-			outputs += (attention_output[1],)
-		return outputs
+
+		return DecoderLayerOutput(
+			hidden_states=hidden_states,
+			attention_weight=attn_outputs.attention_weight,
+			cache_view=attn_outputs.cache_view,
+		)
 
 
 @register_module(
@@ -494,8 +499,7 @@ class ExaoneModel(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+	) -> BaseModelOutput:
 		all_attentions = () if output_attentions else None
 		all_hidden_states = () if output_hidden_states else None
 		if (input_ids is None) ^ (inputs_embeds is not None):
@@ -540,20 +544,17 @@ class ExaoneModel(EasyDeLBaseModule):
 				segment_ids=segment_ids,
 				frequencies=self.frequencies,
 			)
-			hidden_states = output[0]
+			hidden_states = output.hidden_states
 
 			if output_attentions:
-				all_attentions += (output[1],)
+				all_attentions += (output.attention_weight,)
+
+			past_key_values[idx] = output.cache_view
 
 		hidden_states = self.ln_f(hidden_states)
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-
-		outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
-
-		if not return_dict:
-			return tuple(value for value in outputs if value is not None)
 
 		return BaseModelOutput(
 			last_hidden_state=hidden_states,
@@ -633,8 +634,7 @@ class ExaoneForCausalLM(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[CausalLMOutput, tp.Tuple]:
+	) -> CausalLMOutput:
 		"""
 		Forward pass of the causal language model.
 
@@ -648,10 +648,10 @@ class ExaoneForCausalLM(EasyDeLBaseModule):
 			output_hidden_states (Optional[bool], optional): Whether to output hidden states. Defaults to None.
 			past_key_values (Optional[TransformerCache | PagedAttentionCache], optional): Cached key/values. Defaults to None.
 			cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata], optional): Cache metadata. Defaults to None.
-			return_dict (bool, optional): Whether to return a dictionary or tuple. Defaults to True.
+
 
 		Returns:
-			CausalLMOutput | Tuple: The model outputs, either as a named tuple or a standard tuple.
+			CausalLMOutput: The model outputs, either as a named tuple or a standard tuple.
 		"""
 		outputs = self.transformer(
 			input_ids=input_ids,
@@ -661,12 +661,11 @@ class ExaoneForCausalLM(EasyDeLBaseModule):
 			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
 
-		hidden_states = outputs[0]
+		hidden_states = outputs.last_hidden_state
 
 		hidden_states = control_runtime_sharding(
 			hidden_states,
@@ -682,9 +681,6 @@ class ExaoneForCausalLM(EasyDeLBaseModule):
 			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
-
-		if not return_dict:
-			return (lm_logits,) + outputs[1:]
 
 		return CausalLMOutput(
 			logits=lm_logits,
@@ -748,8 +744,7 @@ class ExaoneForSequenceClassification(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: bool = True,
-	) -> tp.Union[SequenceClassifierOutput, tp.Tuple]:
+	) -> SequenceClassifierOutput:
 		transformer_outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
@@ -758,12 +753,11 @@ class ExaoneForSequenceClassification(EasyDeLBaseModule):
 			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
 
-		hidden_states = transformer_outputs[0]
+		hidden_states = transformer_outputs.last_hidden_state
 		logits = self.score(hidden_states)
 		if input_ids is not None:
 			batch_size = input_ids.shape[0]
@@ -785,10 +779,6 @@ class ExaoneForSequenceClassification(EasyDeLBaseModule):
 				sequence_lengths = -1
 
 		pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
-
-		if not return_dict:
-			output = (pooled_logits,) + transformer_outputs[1:]
-			return output
 
 		return SequenceClassifierOutput(
 			logits=pooled_logits,

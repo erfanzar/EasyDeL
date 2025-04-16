@@ -23,7 +23,12 @@ from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
+from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
+	BaseModelOutput,
+	CausalLMOutput,
+	DecoderLayerOutput,
+)
 from easydel.infra.utils import (
 	ACT2FN,
 	HiddenStateSharding,
@@ -412,6 +417,7 @@ class StableLmAttention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -440,12 +446,11 @@ class StableLmAttention(AttentionModule):
 			self._merge_heads(attentions.attention_outputs)
 		)
 		attn_output = self.o_proj(attn_output)
-		outputs = (
-			(attn_output, attentions.attention_weights)
-			if output_attentions
-			else (attn_output,)
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=cache_view,
 		)
-		return outputs
 
 
 class StableLmDecoderLayer(nn.Module):
@@ -571,7 +576,7 @@ class StableLmDecoderLayer(nn.Module):
 			self.config.partition_axis,
 			sharding_strategy=HiddenStateSharding,
 		)
-		attn_out = self.self_attn(
+		attn_outputs = self.self_attn(
 			hidden_states,
 			attention_mask,
 			position_ids,
@@ -583,9 +588,6 @@ class StableLmDecoderLayer(nn.Module):
 			fcm_mask,
 			frequencies,
 		)
-		attn_out, self_attn_weights = (
-			(attn_out[0], attn_out[1]) if len(attn_out) == 2 else (attn_out[0], None)
-		)
 
 		if self.use_parallel_residual:
 			if self.config.use_scan_mlp:
@@ -596,9 +598,9 @@ class StableLmDecoderLayer(nn.Module):
 				hidden_states = self.mlp(hidden_states)
 
 			hidden_states = self.dropout(hidden_states)
-			hidden_states = hidden_states + residual + attn_out
+			hidden_states = hidden_states + residual + attn_outputs.attention_output
 		else:
-			residual = residual + attn_out
+			residual = residual + attn_outputs.attention_output
 			if self.config.use_scan_mlp:
 				hidden_states = block_wise_ffn(
 					self.mlp,
@@ -609,17 +611,17 @@ class StableLmDecoderLayer(nn.Module):
 				hidden_states = self.mlp(self.post_attention_layernorm(residual))
 			hidden_states = self.dropout(hidden_states)
 			hidden_states = hidden_states + residual
-		outputs = (hidden_states,)
-
-		if output_attentions:
-			outputs += (self_attn_weights,)
 
 		hidden_states = control_runtime_sharding(
 			hidden_states,
 			self.config.partition_axis,
 			sharding_strategy=HiddenStateSharding,
 		)
-		return outputs
+		return DecoderLayerOutput(
+			hidden_states=hidden_states,
+			attention_weight=attn_outputs.attention_weight,
+			cache_view=attn_outputs.cache_view,
+		)
 
 
 @register_module(
@@ -723,8 +725,7 @@ class StableLmModel(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+	) -> BaseModelOutput:
 		"""Forward pass of the StableLM model.
 
 		Args:
@@ -737,10 +738,9 @@ class StableLmModel(EasyDeLBaseModule):
 		    output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all layers (default defined by config).
 		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for caching.
 		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention (optional).
-		    return_dict (bool): Whether to return a `BaseModelOutput` object or a tuple (default: True).
 
 		Returns:
-		    tp.Union[BaseModelOutput, tp.Tuple]: The model output, either as a `BaseModelOutput` object or a tuple.
+		    BaseModelOutput: The model output, either as a `BaseModelOutput` object or a tuple.
 
 		Raises:
 		    ValueError: If both `input_ids` and `inputs_embeds` are provided or neither is provided.
@@ -795,19 +795,17 @@ class StableLmModel(EasyDeLBaseModule):
 				segment_ids=segment_ids,
 				frequencies=self.frequencies,
 			)
-			hidden_states = layer_outputs[0]
+			hidden_states = layer_outputs.hidden_states
 
 			if output_attentions:
-				all_attentions += (layer_outputs[1],)
+				all_attentions += (layer_outputs.attention_weight,)
+
+			past_key_values[idx] = layer_outputs.cache_view
 
 		hidden_states = self.norm(hidden_states)
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-		outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
-
-		if not return_dict:
-			return tuple(value for value in outputs if value is not None)
 
 		return BaseModelOutput(
 			last_hidden_state=hidden_states,
@@ -893,8 +891,7 @@ class StableLmForCausalLM(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[CausalLMOutput, tp.Tuple]:
+	) -> CausalLMOutput:
 		"""Forward pass of the StableLM model for Causal Language Modeling.
 
 		Args:
@@ -907,10 +904,9 @@ class StableLmForCausalLM(EasyDeLBaseModule):
 		    output_hidden_states (tp.Optional[bool]): Whether to output hidden states for all layers (default defined by config).
 		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for caching.
 		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention (optional).
-		    return_dict (bool): Whether to return a `CausalLMOutput` object or a tuple (default: True).
 
 		Returns:
-		    tp.Union[CausalLMOutput, tp.Tuple]: The model output, including logits, hidden states, and attentions.
+		    CausalLMOutput: The model output, including logits, hidden states, and attentions.
 		"""
 		outputs = self.model(
 			input_ids=input_ids,
@@ -920,11 +916,10 @@ class StableLmForCausalLM(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
-			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
-		hidden_states = outputs[0]
+		hidden_states = outputs.last_hidden_state
 
 		hidden_states = control_runtime_sharding(
 			hidden_states,
@@ -940,9 +935,6 @@ class StableLmForCausalLM(EasyDeLBaseModule):
 			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
-
-		if not return_dict:
-			return (lm_logits,) + outputs[1:]
 
 		return CausalLMOutput(
 			logits=lm_logits,

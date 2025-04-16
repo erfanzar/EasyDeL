@@ -24,6 +24,8 @@ from jax import numpy as jnp
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
+	DecoderLayerOutput,
 	MoeCausalLMOutput,
 	MoeModelOutput,
 	SequenceClassifierOutput,
@@ -185,6 +187,7 @@ class ArcticAttention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -213,7 +216,12 @@ class ArcticAttention(AttentionModule):
 			self._merge_heads(attentions.attention_outputs)
 		)
 		attn_output = self.o_proj(attn_output)
-		return attn_output, attentions.attention_weights
+
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=cache_view,
+		)
 
 
 class ArcticMLP(nn.Module):
@@ -516,7 +524,7 @@ class ArcticDecoderLayer(nn.Module):
 		output_attentions: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
 		frequencies: tp.Optional[chex.Array] = None,
-	) -> tp.Tuple[chex.Array, tp.Optional[chex.Array], chex.Array]:
+	) -> DecoderLayerOutput:
 		residual_input = hidden_states
 		hidden_states = self.input_layernorm(hidden_states)
 		hidden_states = control_runtime_sharding(
@@ -524,7 +532,7 @@ class ArcticDecoderLayer(nn.Module):
 			self.config.partition_axis,
 			sharding_strategy=HiddenStateSharding,
 		)
-		attn_out = self.self_attn(
+		attn_outputs = self.self_attn(
 			hidden_states,
 			attention_mask,
 			position_ids,
@@ -536,9 +544,7 @@ class ArcticDecoderLayer(nn.Module):
 			fcm_mask,
 			frequencies,
 		)
-		hidden_states, self_attn_weights = (
-			attn_out if output_attentions else (attn_out[0], None)
-		)
+		hidden_states = attn_outputs.attention_output
 		hidden_states = residual_input + hidden_states
 
 		residual_attn = hidden_states
@@ -555,12 +561,13 @@ class ArcticDecoderLayer(nn.Module):
 			hidden_states, gate_loss = self.block_sparse_moe(hidden_states)
 			hidden_states = residual_attn + hidden_states
 
-		outputs = (hidden_states,)
-		if output_attentions:
-			outputs += (self_attn_weights,)
-
-		outputs += (gate_loss,)
-		return outputs
+		return DecoderLayerOutput(
+			hidden_states=hidden_states,
+			attention_weight=attn_outputs.attention_weight,
+			router_logits=None,
+			cache_view=attn_outputs.cache_view,
+			gate_loss=gate_loss,
+		)
 
 
 @register_module(
@@ -637,8 +644,7 @@ class ArcticModel(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[MoeModelOutput, tp.Tuple]:
+	) -> MoeModelOutput:
 		"""Forward pass through the ArcticModel.
 
 		Args:
@@ -651,10 +657,9 @@ class ArcticModel(EasyDeLBaseModule):
 			output_hidden_states (Optional[bool]): Whether to return all hidden states.
 			past_key_values (Optional[TransformerCache | PagedAttentionCache]): Cached key/value states for faster decoding.
 			cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention cache.
-			return_dict (bool): Whether to return a MoeModelOutput object or a tuple.
 
 		Returns:
-			Union[MoeModelOutput, Tuple]: Model outputs, either as a dataclass or a tuple.
+			MoeModelOutput: Model outputs
 		"""
 		output_attentions = (
 			output_attentions
@@ -715,7 +720,7 @@ class ArcticModel(EasyDeLBaseModule):
 				segment_ids=segment_ids,
 				frequencies=self.frequencies,
 			)
-			hidden_states = outputs[0]
+			hidden_states = outputs.hidden_states
 
 			hidden_states = control_runtime_sharding(
 				hidden_states,
@@ -724,29 +729,23 @@ class ArcticModel(EasyDeLBaseModule):
 			)
 
 			if output_attentions:
-				all_self_attns += (outputs[1],)
-			all_router_losses += (outputs[-1],)
+				all_self_attns += (outputs.attention_weight,)
+
+			all_router_losses += (outputs.gate_loss,)
+
+			past_key_values[idx] = outputs.cache_view
 
 		hidden_states = self.norm(hidden_states)
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-		if not return_dict:
-			return tuple(
-				v
-				for v in [
-					hidden_states,
-					all_hidden_states,
-					all_self_attns,
-					all_router_losses,
-				]
-				if v is not None
-			)
+
 		return MoeModelOutput(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
 			attentions=all_self_attns,
 			all_router_losses=all_router_losses,
+			past_key_values=past_key_values,
 		)
 
 
@@ -816,7 +815,6 @@ class ArcticForCausalLM(EasyDeLBaseModule):
 		inputs_embeds: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: bool = True,
 	) -> MoeCausalLMOutput | tp.Tuple:
 		"""Forward pass through the ArcticForCausalLM model.
 
@@ -830,10 +828,9 @@ class ArcticForCausalLM(EasyDeLBaseModule):
 			inputs_embeds (Optional[chex.Array]): Input embeddings (alternative to input_ids).
 			output_attentions (Optional[bool]): Whether to return attention weights.
 			output_hidden_states (Optional[bool]): Whether to return all hidden states.
-			return_dict (bool): Whether to return a MoeCausalLMOutput object or a tuple.
 
 		Returns:
-			Union[MoeCausalLMOutput, Tuple]: Model outputs, including logits, either as a dataclass or a tuple.
+			Union[MoeCausalLMOutput, Tuple]: Model outputs, including logits
 		"""
 		outputs = self.model(
 			input_ids=input_ids,
@@ -843,11 +840,12 @@ class ArcticForCausalLM(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
-			return_dict=True,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
+
 		hidden_states = outputs.last_hidden_state
+
 		if self.config.tie_word_embeddings:
 			lm_logits = jax.lax.dot_general(
 				hidden_states,
@@ -859,25 +857,13 @@ class ArcticForCausalLM(EasyDeLBaseModule):
 
 		aux_loss = sum(outputs.all_router_losses) * self.config.router_aux_loss_coef
 
-		if not return_dict:
-			outputs = (lm_logits,) + tuple(
-				v
-				for v in [
-					aux_loss,
-					outputs.hidden_states,
-					outputs.attentions,
-					outputs.all_router_losses,
-				]
-				if v is not None
-			)
-			return outputs
-
 		return MoeCausalLMOutput(
 			aux_loss=aux_loss,
 			logits=lm_logits,
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
 			all_router_losses=outputs.all_router_losses,
+			past_key_values=outputs.past_key_values,
 		)
 
 
@@ -949,8 +935,7 @@ class ArcticForSequenceClassification(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: bool = True,
-	) -> tp.Union[SequenceClassifierOutput, tp.Tuple]:
+	) -> SequenceClassifierOutput:
 		"""Forward pass through the ArcticForSequenceClassification model.
 
 		Args:
@@ -963,11 +948,11 @@ class ArcticForSequenceClassification(EasyDeLBaseModule):
 			cache_metadata (Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention cache.
 			output_attentions (Optional[bool]): Whether to return attention weights.
 			output_hidden_states (Optional[bool]): Whether to return all hidden states.
-			return_dict (bool): Whether to return a SequenceClassifierOutput object or a tuple.
 
 		Returns:
-			Union[SequenceClassifierOutput, Tuple]: Model outputs, including classification logits, either as a dataclass or a tuple.
+			Union[SequenceClassifierOutput, Tuple]: Model outputs, including classification logits
 		"""
+
 		transformer_outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
@@ -976,12 +961,11 @@ class ArcticForSequenceClassification(EasyDeLBaseModule):
 			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=True,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
 
-		hidden_states = transformer_outputs[0]
+		hidden_states = transformer_outputs.last_hidden_state
 		logits = self.score(hidden_states)
 		if input_ids is not None:
 			batch_size = input_ids.shape[0]
@@ -1006,10 +990,6 @@ class ArcticForSequenceClassification(EasyDeLBaseModule):
 		aux_loss = (
 			sum(transformer_outputs.all_router_losses) * self.config.router_aux_loss_coef
 		)
-
-		if not return_dict:
-			output = (pooled_logits,) + transformer_outputs[1:] + (aux_loss,)
-			return output
 
 		return SequenceClassifierOutput(
 			logits=pooled_logits,

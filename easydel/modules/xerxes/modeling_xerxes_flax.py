@@ -24,7 +24,12 @@ from jax import lax
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
+from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
+	BaseModelOutput,
+	CausalLMOutput,
+	DecoderLayerOutput,
+)
 from easydel.infra.utils import (
 	HiddenStateSharding,
 	auto_remat,
@@ -248,6 +253,7 @@ class XerxesAttention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -276,10 +282,10 @@ class XerxesAttention(AttentionModule):
 			self._merge_heads(attentions.attention_outputs)
 		)
 		attn_output = self.o_proj(attn_output)
-		return (
-			(attn_output, attentions.attention_weights)
-			if output_attentions
-			else (attn_output, None)
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=cache_view,
 		)
 
 
@@ -510,7 +516,7 @@ class XerxesDecoderLayer(nn.Module):
 			self.config.partition_axis,
 			sharding_strategy=HiddenStateSharding,
 		)
-		hidden_states, attn_weight = self.self_attn(
+		attn_outputs = self.self_attn(
 			hidden_states,
 			attention_mask,
 			position_ids,
@@ -522,7 +528,7 @@ class XerxesDecoderLayer(nn.Module):
 			fcm_mask,
 			frequencies,
 		)
-		hidden_states = self.post_attention_layernorm(hidden_states)
+		hidden_states = self.post_attention_layernorm(attn_outputs.attention_output)
 		hidden_states = residual + hidden_states
 
 		residual = hidden_states
@@ -540,7 +546,11 @@ class XerxesDecoderLayer(nn.Module):
 			self.config.partition_axis,
 			sharding_strategy=HiddenStateSharding,
 		)
-		return hidden_states, attn_weight
+		return DecoderLayerOutput(
+			hidden_states=hidden_states,
+			attention_weight=attn_outputs.attention_weight,
+			cache_view=attn_outputs.cache_view,
+		)
 
 
 @register_module(
@@ -603,8 +613,7 @@ class XerxesModel(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+	) -> BaseModelOutput:
 		"""
 		Forward pass through the Xerxes module.
 
@@ -618,7 +627,6 @@ class XerxesModel(EasyDeLBaseModule):
 		    output_hidden_states (tp.Optional[bool]): If True, output hidden states.
 		    init_cache (bool): If True, initialize cache for decoding.
 		    deterministic (bool): If True, disable dropout.
-		    return_dict (bool): If True, return a dictionary of outputs.
 
 		Returns:
 		    BaseModelOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
@@ -694,9 +702,6 @@ class XerxesModel(EasyDeLBaseModule):
 		else:
 			outputs = (hidden_states,) + outputs[1:]
 
-		if not return_dict:
-			return tuple(v for v in outputs if v is not None)
-
 		return BaseModelOutput(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
@@ -757,8 +762,7 @@ class XerxesForCausalLM(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[CausalLMOutput, tp.Tuple]:
+	) -> CausalLMOutput:
 		"""
 		Forward pass through the Xerxes module.
 
@@ -772,7 +776,6 @@ class XerxesForCausalLM(EasyDeLBaseModule):
 		    output_hidden_states (tp.Optional[bool]): If True, output hidden states.
 		    init_cache (bool): If True, initialize cache for decoding.
 		    deterministic (bool): If True, disable dropout.
-		    return_dict (bool): If True, return a dictionary of outputs.
 
 		Returns:
 		    CausalLMOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
@@ -786,11 +789,10 @@ class XerxesForCausalLM(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
-			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
-		hidden_states = outputs[0]
+		hidden_states = outputs.last_hidden_state
 
 		hidden_states = control_runtime_sharding(
 			hidden_states,
@@ -808,9 +810,6 @@ class XerxesForCausalLM(EasyDeLBaseModule):
 			lm_logits = self.lm_head(hidden_states)
 
 		lm_logits = jax.nn.tanh(lm_logits / 30.0) * 30.0
-
-		if not return_dict:
-			return (lm_logits,) + outputs[1:]
 
 		return CausalLMOutput(
 			logits=lm_logits,

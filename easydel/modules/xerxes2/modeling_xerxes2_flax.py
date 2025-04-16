@@ -24,7 +24,12 @@ from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
+from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
+	BaseModelOutput,
+	CausalLMOutput,
+	DecoderLayerOutput,
+)
 from easydel.infra.utils import (
 	HiddenStateSharding,
 	auto_remat,
@@ -208,6 +213,7 @@ class Xerxes2Attention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -235,7 +241,11 @@ class Xerxes2Attention(AttentionModule):
 			self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
 		)
 
-		return attn_output, attentions.attention_weights
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=cache_view,
+		)
 
 
 class Xerxes2MLP(nn.Module):
@@ -369,7 +379,7 @@ class Xerxes2DecoderLayer(nn.Module):
 			self.config.partition_axis,
 			sharding_strategy=HiddenStateSharding,
 		)
-		hidden_states, attn_weight = self.self_attn(
+		attn_outputs = self.self_attn(
 			hidden_states,
 			attention_mask,
 			position_ids,
@@ -380,7 +390,7 @@ class Xerxes2DecoderLayer(nn.Module):
 			cache_metadata,
 			output_attentions,
 		)
-		hidden_states = self.post_attention_layernorm(hidden_states)
+		hidden_states = self.post_attention_layernorm(attn_outputs.attention_output)
 		hidden_states = residual + hidden_states
 
 		residual = hidden_states
@@ -400,7 +410,11 @@ class Xerxes2DecoderLayer(nn.Module):
 			self.config.partition_axis,
 			sharding_strategy=HiddenStateSharding,
 		)
-		return hidden_states, attn_weight
+		return DecoderLayerOutput(
+			hidden_states=hidden_states,
+			attention_weight=attn_outputs.attention_weight,
+			cache_view=attn_outputs.cache_view,
+		)
 
 
 @register_module(
@@ -467,8 +481,7 @@ class Xerxes2Model(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: bool = True,
-	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+	) -> BaseModelOutput:
 		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
 				"You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -517,21 +530,17 @@ class Xerxes2Model(EasyDeLBaseModule):
 				segment_ids=segment_ids,
 				frequencies=self.frequencies,
 			)
-			hidden_states = layer_outputs[0]
+			hidden_states = layer_outputs.hidden_states
 
 			if output_attentions:
-				all_attentions += (layer_outputs[1],)
+				all_attentions += (layer_outputs.attention_weight,)
+
+			past_key_values[idx] = layer_outputs.cache_view
 
 		hidden_states = self.norm(hidden_states)
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-			outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
-		else:
-			outputs = (hidden_states, all_attentions, past_key_values)
-
-		if not return_dict:
-			return tuple(v for v in outputs if v is not None)
 
 		return BaseModelOutput(
 			last_hidden_state=hidden_states,
@@ -593,8 +602,7 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: bool = True,
-	) -> tp.Union[CausalLMOutput, tp.Tuple]:
+	) -> CausalLMOutput:
 		outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
@@ -603,12 +611,11 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
-			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
 
-		hidden_states = outputs[0]
+		hidden_states = outputs.last_hidden_state
 
 		hidden_states = control_runtime_sharding(
 			hidden_states,
@@ -624,9 +631,6 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
-
-		if not return_dict:
-			return (lm_logits,) + outputs[1:]
 
 		return CausalLMOutput(
 			logits=lm_logits,

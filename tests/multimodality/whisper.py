@@ -19,8 +19,9 @@ def main():
 	REPO_ID = "openai/whisper-large-v3-turbo"
 	model = ed.AutoEasyDeLModelForSpeechSeq2Seq.from_pretrained(
 		REPO_ID,
-		dtype=jnp.bfloat16,
-		param_dtype=jnp.bfloat16,
+		dtype=jnp.float16,
+		param_dtype=jnp.float16,
+		auto_shard_model=True,
 	)
 	tokenizer = WhisperTokenizer.from_pretrained(REPO_ID)
 	processor = WhisperProcessor.from_pretrained(REPO_ID)

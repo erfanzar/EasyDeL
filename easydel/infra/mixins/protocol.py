@@ -217,8 +217,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: bool = True,
-	) -> tp.Union[CausalLMOutput, tp.Tuple]:
+	) -> CausalLMOutput:
 		"""
 		Forward pass for Causal Language Models (e.g., GPT).
 
@@ -233,11 +232,10 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		                     Useful for faster inference.
 		    output_attentions: Optional flag to return attention weights from each layer.
 		    output_hidden_states: Optional flag to return hidden states from each layer.
-		    return_dict: If True, returns a dictionary containing model outputs. Otherwise, return a tuple.
+
 
 		Returns:
-		    A CausalLMOutput if return_dict is True, or a tuple containing
-		    model outputs. See return type for more details.
+		    A CausalLMOutput. See return type for more details.
 		"""
 
 	@tp.overload
@@ -250,8 +248,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: bool = True,
-	) -> tp.Union[SequenceClassifierOutput, tp.Tuple]:
+	) -> SequenceClassifierOutput:
 		"""
 		Forward pass for Sequence Classification Models (e.g., BERT for sentiment analysis).
 
@@ -263,11 +260,10 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		    segment_ids: Optional array indicating segment IDs.
 		    output_attentions: Optional flag to return attention weights from each layer.
 		    output_hidden_states: Optional flag to return hidden states from each layer.
-		    return_dict: If True, returns a dictionary containing model outputs. Otherwise, return a tuple.
+
 
 		Returns:
-		   A SequenceClassifierOutput if return_dict is True, or a tuple containing
-		    model outputs. See return type for more details.
+		   A SequenceClassifierOutput. See return type for more details.
 		"""
 
 	@tp.overload
@@ -283,8 +279,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		output_router_logits: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[MoeModelOutput, tp.Tuple]:
+	) -> MoeModelOutput:
 		"""
 		Forward pass for Mixture-of-Experts (MoE) Models.
 
@@ -299,12 +294,11 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		    output_router_logits: Optional flag to return the router logits,
 		         which are used to determine which experts to use for each token.
 		    past_key_values: Optional cache containing key and value tensors from previous model passes.
-		    return_dict: If True, returns a dictionary containing model outputs. Otherwise, return a tuple.
+
 
 
 		Returns:
-		    A MoeModelOutput if return_dict is True, or a tuple containing
-		    model outputs. See return type for more details.
+		    A MoeModelOutput. See return type for more details.
 		"""
 
 	@tp.overload
@@ -320,8 +314,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		output_router_logits: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[MoeCausalLMOutput, tp.Tuple]:
+	) -> MoeCausalLMOutput:
 		"""
 		Forward pass for Mixture-of-Experts (MoE) Causal Language Models.
 
@@ -336,12 +329,11 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		    output_router_logits: Optional flag to return the router logits,
 		         which are used to determine which experts to use for each token.
 		    past_key_values: Optional cache containing key and value tensors from previous model passes.
-		    return_dict: If True, returns a dictionary containing model outputs. Otherwise, return a tuple.
+
 
 
 		Returns:
-		   A MoeCausalLMOutput if return_dict is True, or a tuple containing
-		    model outputs. See return type for more details.
+		   A MoeCausalLMOutput. See return type for more details.
 		"""
 
 	@tp.overload
@@ -350,8 +342,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		pixel_values: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
-	) -> tp.Union[ImageClassifierOutput, tp.Tuple]:
+	) -> ImageClassifierOutput:
 		"""Process image inputs through the CLIP vision encoder.
 
 		Args:
@@ -359,12 +350,9 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		        containing the pixel values of the images to encode.
 		    output_attentions: Optional bool indicating whether to return attention weights.
 		    output_hidden_states: Optional bool indicating whether to return all hidden states.
-		    return_dict: Optional bool indicating whether to return a ImageClassifierOutput
-		        object instead of a tuple.
 
 		Returns:
-		    Either a ImageClassifierOutput containing the model outputs or a tuple of
-		    tensors depending on return_dict.
+		    ImageClassifierOutput containing the model outputs.
 		"""
 		...
 
@@ -376,8 +364,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		position_ids: chex.Array,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
-	) -> tp.Union[CLIPTextModelOutput, tp.Tuple]:
+	) -> CLIPTextModelOutput:
 		"""Process text inputs through the CLIP text encoder.
 
 		Args:
@@ -390,12 +377,9 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		    output_attentions: Wheth
 		    def __call__(er to return attention weights. Defaults to False.
 		    output_hidden_states: Whether to return all hidden states. Defaults to False.
-		    return_dict: Whether to return a CLIPTextModelOutput object instead of a
-		        tuple. Defaults to True.
 
 		Returns:
-		    Either a CLIPTextModelOutput containing the model outputs or a tuple of
-		    tensors depending on return_dict.
+		    Either a CLIPTextModelOutput containing the model outputs.
 		"""
 		...
 
@@ -408,8 +392,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		position_ids: tp.Optional[chex.Array] = None,
 		output_attentions=None,
 		output_hidden_states=None,
-		return_dict=None,
-	) -> tp.Union[CLIPOutput, tp.Tuple]:
+	) -> CLIPOutput:
 		"""Process both text and image inputs through the full CLIP model.
 
 		This method handles the full CLIP model forward pass, encoding both text and image
@@ -426,12 +409,11 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		        position indices for text tokens.
 		    output_attentions: Whether to return attention weights.
 		    output_hidden_states: Whether to return all hidden states.
-		    return_dict: Whether to return a CLIPOutput object instead of a tuple.
+
 
 		Returns:
-		    Either a CLIPOutput containing the model outputs (including text embeddings,
-		    image embeddings, and their similarity) or a tuple of tensors depending on
-		    return_dict.
+		    CLIPOutput containing the model outputs (including text embeddings,
+		    image embeddings, and their similarity).
 		"""
 		...
 
@@ -448,7 +430,6 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: bool = True,
 		loss_config: tp.Optional[LossConfig] = None,
 		loss_kwargs: tp.Optional[tp.Dict] = None,
 	) -> tp.Tuple[CausalLMOutput, LossMetrics]:
@@ -465,7 +446,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		    past_key_values: Optional cache containing key and value tensors from previous model passes.
 		    output_attentions: Optional flag to return attention weights from each layer.
 		    output_hidden_states: Optional flag to return hidden states from each layer.
-		    return_dict: If True, returns a dictionary containing model outputs along with loss. Otherwise, return a tuple.
+
 
 		Returns:
 		    A CausalLMOutput and a tuple containing model outputs including the loss.
@@ -483,7 +464,6 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: bool = True,
 		loss_config: tp.Optional[LossConfig] = None,
 		loss_kwargs: tp.Optional[tp.Dict] = None,
 	) -> tp.Tuple[SequenceClassifierOutput, LossMetrics]:
@@ -499,7 +479,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		    segment_ids: Optional array indicating segment IDs.
 		    output_attentions: Optional flag to return attention weights from each layer.
 		    output_hidden_states: Optional flag to return hidden states from each layer.
-		    return_dict: If True, returns a dictionary containing model outputs along with loss. Otherwise, return a tuple.
+
 
 		Returns:
 		    A SequenceClassifierOutput and a tuple containing model outputs including the loss.
@@ -520,7 +500,6 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		output_router_logits: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
 		loss_config: tp.Optional[LossConfig] = None,
 		loss_kwargs: tp.Optional[tp.Dict] = None,
 	) -> tp.Tuple[MoeModelOutput, LossMetrics]:
@@ -538,7 +517,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		    output_hidden_states: Optional flag to return hidden states from each layer.
 		    output_router_logits: Optional flag to return the router logits.
 		    past_key_values: Optional cache containing key and value tensors from previous model passes.
-		    return_dict: If True, returns a dictionary containing model outputs along with loss. Otherwise, return a tuple.
+
 
 		Returns:
 		    A MoeModelOutput and a tuple containing model outputs including the loss.
@@ -559,7 +538,6 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		output_router_logits: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
 		loss_config: tp.Optional[LossConfig] = None,
 		loss_kwargs: tp.Optional[tp.Dict] = None,
 	) -> tp.Tuple[MoeCausalLMOutput, LossMetrics]:
@@ -577,7 +555,7 @@ class BaseModuleProtocol(metaclass=ABCMeta):
 		    output_hidden_states: Optional flag to return hidden states from each layer.
 		    output_router_logits: Optional flag to return the router logits.
 		    past_key_values: Optional cache containing key and value tensors from previous model passes.
-		    return_dict: If True, returns a dictionary containing model outputs along with loss. Otherwise, return a tuple.
+
 
 		Returns:
 		    A MoeCausalLMOutput and a tuple containing model outputs including the loss.

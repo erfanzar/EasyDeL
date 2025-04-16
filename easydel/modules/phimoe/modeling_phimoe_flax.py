@@ -25,7 +25,11 @@ from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
+from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
+	BaseModelOutput,
+	CausalLMOutput,
+)
 from easydel.infra.utils import (
 	ACT2FN,
 	HiddenStateSharding,
@@ -324,6 +328,7 @@ class PhiMoEAttention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -364,12 +369,11 @@ class PhiMoEAttention(AttentionModule):
 			)
 		attn_output = self.o_proj(attn_output)
 
-		outputs = (
-			(attn_output, attentions.attention_weights)
-			if output_attentions
-			else (attn_output,)
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=cache_view,
 		)
-		return outputs
 
 
 class PhiMoeSparseMoeBlock(nn.Module):
@@ -635,7 +639,7 @@ class PhiMoeDecoderLayer(nn.Module):
 			sharding_strategy=HiddenStateSharding,
 		)
 
-		attn_out = self.self_attn(
+		attn_outputs = self.self_attn(
 			hidden_states,
 			attention_mask,
 			position_ids,
@@ -762,8 +766,7 @@ class PhiMoeModel(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+	) -> BaseModelOutput:
 		"""Forward pass of the PhiMoeModel.
 
 		Args:
@@ -780,12 +783,11 @@ class PhiMoeModel(EasyDeLBaseModule):
 		        Defaults to `config.output_hidden_states`.
 		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for attention.
 		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
-		    return_dict (bool): Whether to return a `BaseModelOutput` object or a tuple.
 
 		Returns:
-		    tp.Union[BaseModelOutput, tp.Tuple]: The model's output. If `return_dict` is True,
+		    BaseModelOutput: The model's output.
 		        returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-		        `attentions` (optional), and `router_logits` (optional). Otherwise, returns a tuple with these elements.
+		        `attentions` (optional), and `router_logits` (optional).
 
 		Raises:
 		    ValueError: If neither `input_ids` nor `inputs_embeds` is provided.
@@ -841,20 +843,17 @@ class PhiMoeModel(EasyDeLBaseModule):
 				segment_ids=segment_ids,
 				frequencies=self.frequencies,
 			)
-			hidden_states = layer_outputs[0]
+			hidden_states = layer_outputs.hidden_states
 
 			if output_attentions:
-				all_attentions += (layer_outputs[1],)
+				all_attentions += (layer_outputs.attention_weight,)
+
+			past_key_values[idx] = layer_outputs.cache_view
 
 		hidden_states = self.norm(hidden_states)
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-
-		outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
-
-		if not return_dict:
-			return tuple(v for v in outputs if v is not None)
 
 		return BaseModelOutput(
 			last_hidden_state=hidden_states,
@@ -942,8 +941,7 @@ class PhiMoeForCausalLM(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[CausalLMOutput, tp.Tuple]:
+	) -> CausalLMOutput:
 		"""Forward pass of the PhiMoeForCausalLM model.
 
 		Args:
@@ -960,12 +958,12 @@ class PhiMoeForCausalLM(EasyDeLBaseModule):
 		        Defaults to `config.output_hidden_states`.
 		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for attention.
 		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
-		    return_dict (bool): Whether to return a `CausalLMOutput` object or a tuple.
+
 
 		Returns:
-		    tp.Union[CausalLMOutput, tp.Tuple]: The model's output. If `return_dict` is True,
+		    CausalLMOutput: The model's output.
 		        returns a `CausalLMOutput` object containing `logits`, `hidden_states` (optional),
-		        `attentions` (optional), and `router_logits` (optional). Otherwise, returns a tuple with these elements.
+		        `attentions` (optional), and `router_logits` (optional).
 		"""
 		outputs = self.model(
 			input_ids=input_ids,
@@ -975,7 +973,6 @@ class PhiMoeForCausalLM(EasyDeLBaseModule):
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			cache_metadata=cache_metadata,
-			return_dict=True,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
@@ -988,8 +985,6 @@ class PhiMoeForCausalLM(EasyDeLBaseModule):
 			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
-		if not return_dict:
-			return (lm_logits,) + outputs[0:]
 
 		return CausalLMOutput(
 			logits=lm_logits,

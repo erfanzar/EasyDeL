@@ -24,7 +24,12 @@ from jax import numpy as jnp
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
+from easydel.infra.modeling_outputs import (
+	BaseModelOutput,
+	CausalLMOutput,
+	AttentionLayerOutput,
+	DecoderLayerOutput,
+)
 from easydel.infra.utils import (
 	HiddenStateSharding,
 	auto_remat,
@@ -301,11 +306,13 @@ class FalconAttention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
 			value=value_states,
 			cache_view=cache_view,
+			cache_metadata=cache_metadata,
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,
 			fcm_mask=None,
@@ -330,7 +337,11 @@ class FalconAttention(AttentionModule):
 				batch_size, query_length, self.num_heads * self.head_dim
 			)
 			output_tensor = self.dense(attention_outputs)
-			return output_tensor, attention.attention_weights
+			return AttentionLayerOutput(
+				attention_output=output_tensor,
+				attention_weight=attention.attention_weights if output_attentions else None,
+				cache_view=cache_view,
+			)
 
 		else:
 			attention_scores = jnp.einsum(
@@ -364,9 +375,11 @@ class FalconAttention(AttentionModule):
 
 			output_tensor = self.dense(attn_output)
 
-			if output_attentions:
-				return output_tensor, attention_scores
-			return output_tensor, None
+			AttentionLayerOutput(
+				attention_output=output_tensor,
+				attention_weight=attention.attention_weights if output_attentions else None,
+				cache_view=cache_view,
+			)
 
 
 class FalconMlp(nn.Module):
@@ -531,7 +544,7 @@ class FalconBlock(nn.Module):
 		else:
 			attention_layernorm_out = self.input_layernorm(hidden_states)
 
-		attention_output, attn_score = self.self_attention(
+		attn_outputs = self.self_attention(
 			attention_layernorm_out,
 			attention_mask,
 			position_ids,
@@ -548,7 +561,7 @@ class FalconBlock(nn.Module):
 			if self.config.parallel_attn:
 				mlp_layernorm_out = attention_layernorm_out
 			else:
-				residual = dropout_add(self.dropout, attention_output, residual)
+				residual = dropout_add(self.dropout, attn_outputs.attention_output, residual)
 				mlp_layernorm_out = self.post_attention_layernorm(residual)
 
 		if self.config.use_scan_mlp:
@@ -561,10 +574,14 @@ class FalconBlock(nn.Module):
 			mlp_output = self.mlp(mlp_layernorm_out)
 
 		if self.config.new_decoder_architecture or self.config.parallel_attn:
-			mlp_output += attention_output
+			mlp_output += attn_outputs.attention_output
 
 		output = dropout_add(self.dropout_mlp, mlp_output, residual)
-		return output, attn_score
+		return DecoderLayerOutput(
+			hidden_states=output,
+			attention_weight=attn_outputs.attention_weight,
+			cache_view=attn_outputs.cache_view,
+		)
 
 
 @register_module(
@@ -625,8 +642,7 @@ class FalconModel(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+	) -> BaseModelOutput:
 		"""
 		Forward pass through the Falcon module.
 
@@ -640,7 +656,6 @@ class FalconModel(EasyDeLBaseModule):
 		    output_hidden_states (tp.Optional[bool]): If True, output hidden states.
 		    init_cache (bool): If True, initialize cache for decoding.
 		    deterministic (bool): If True, disable dropout.
-		    return_dict (bool): If True, return a dictionary of outputs.
 
 		Returns:
 		    BaseModelOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
@@ -675,7 +690,7 @@ class FalconModel(EasyDeLBaseModule):
 			past_key_values = TransformerCache.init_empty(len(self.h))
 		hidden_states = inputs_embeds
 		for idx, layer in enumerate(self.h):
-			hidden_states, score = layer(
+			layer_outputs = layer(
 				hidden_states=hidden_states,
 				alibi=alibi,
 				attention_mask=attention_mask,
@@ -687,17 +702,18 @@ class FalconModel(EasyDeLBaseModule):
 				segment_ids=segment_ids,
 				frequencies=self.frequencies,
 			)
+			hidden_states = layer_outputs.hidden_states
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
 			if output_attentions:
-				all_attentions += (score,)
+				all_attentions += (layer_outputs.attention_weight,)
+
+			past_key_values[idx] = layer_outputs.cache_view
+
 		hidden_states = self.ln_f(hidden_states)
+
 		if all_hidden_states is not None:
 			all_hidden_states += hidden_states
-		outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
-
-		if not return_dict:
-			return tuple(value for value in outputs if value is not None)
 
 		return BaseModelOutput(
 			last_hidden_state=hidden_states,
@@ -775,8 +791,7 @@ class FalconForCausalLM(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[CausalLMOutput, tp.Tuple]:
+	) -> CausalLMOutput:
 		"""
 		Forward pass through the Falcon module.
 
@@ -790,7 +805,6 @@ class FalconForCausalLM(EasyDeLBaseModule):
 		    output_hidden_states (tp.Optional[bool]): If True, output hidden states.
 		    init_cache (bool): If True, initialize cache for decoding.
 		    deterministic (bool): If True, disable dropout.
-		    return_dict (bool): If True, return a dictionary of outputs.
 
 		Returns:
 		    CausalLMOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
@@ -802,19 +816,13 @@ class FalconForCausalLM(EasyDeLBaseModule):
 			output_attentions=output_attentions,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
-			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			output_hidden_states=output_hidden_states,
 			segment_ids=segment_ids,
 		)
-		if return_dict:
-			hidden_state = outputs.last_hidden_state
-		else:
-			hidden_state = outputs[0]
+		hidden_state = outputs.last_hidden_state
 
 		logits = self.lm_head(hidden_state)
-		if not return_dict:
-			return (logits,) + outputs[1:]
 
 		return CausalLMOutput(
 			logits=logits,

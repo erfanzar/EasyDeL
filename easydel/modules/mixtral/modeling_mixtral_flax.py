@@ -25,6 +25,8 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
+	DecoderLayerOutput,
 	MoeCausalLMOutput,
 	MoeModelOutput,
 	SequenceClassifierOutput,
@@ -223,6 +225,7 @@ class MixtralAttention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -251,12 +254,11 @@ class MixtralAttention(AttentionModule):
 			self._merge_heads(attentions.attention_outputs)
 		)
 		attn_output = self.o_proj(attn_output)
-		outputs = (
-			(attn_output, attentions.attention_weights)
-			if output_attentions
-			else (attn_output,)
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=cache_view,
 		)
-		return outputs
 
 
 class MixtralBLockSparseTop2MLP(nn.Module):
@@ -544,7 +546,7 @@ class MixtralDecoderLayer(nn.Module):
 		output_router_logits: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
 		frequencies: tp.Optional[chex.Array] = None,
-	) -> tp.Tuple[chex.Array, chex.Array, tp.Optional[chex.Array]]:
+	) -> DecoderLayerOutput:
 		"""Forward pass of the MixtralDecoderLayer module.
 
 		Args:
@@ -561,7 +563,7 @@ class MixtralDecoderLayer(nn.Module):
 		    frequencies (tp.Optional[chex.Array]): Precomputed rotary frequency embeddings.
 
 		Returns:
-		    tp.Tuple[chex.Array, chex.Array, tp.Optional[chex.Array]]: A tuple containing:
+		    DecoderLayerOutput: A tuple containing:
 		        - hidden_states (chex.Array): The output hidden states.
 		        - attention_weights (chex.Array, optional): Attention weights if `output_attentions` is True.
 		        - router_logits (chex.Array, optional): Router logits if `output_router_logits` is True.
@@ -574,7 +576,7 @@ class MixtralDecoderLayer(nn.Module):
 			sharding_strategy=HiddenStateSharding,
 		)
 
-		attn_out = self.self_attn(
+		attn_outputs = self.self_attn(
 			hidden_states,
 			attention_mask,
 			position_ids,
@@ -586,9 +588,7 @@ class MixtralDecoderLayer(nn.Module):
 			fcm_mask,
 			frequencies,
 		)
-		hidden_states, self_attn_weights = (
-			attn_out if output_attentions else (attn_out[0], None)
-		)
+		hidden_states = attn_outputs.attention_output
 		hidden_states = residual + hidden_states
 
 		residual = hidden_states
@@ -596,12 +596,12 @@ class MixtralDecoderLayer(nn.Module):
 		hidden_states, router_logits = self.block_sparse_moe(hidden_states)
 		hidden_states = residual + hidden_states
 
-		outputs = (hidden_states,)
-		if output_attentions:
-			outputs += (self_attn_weights,)
-		if output_router_logits:
-			outputs += (router_logits,)
-		return outputs
+		return DecoderLayerOutput(
+			hidden_states=hidden_states,
+			attention_weight=attn_outputs.attention_weight,
+			router_logits=router_logits if output_router_logits else None,
+			cache_view=attn_outputs.cache_view,
+		)
 
 
 @register_module(
@@ -692,8 +692,7 @@ class MixtralModel(EasyDeLBaseModule):
 		output_router_logits: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> MoeModelOutput | tp.Tuple:
+	) -> MoeModelOutput:
 		"""Forward pass of the MixtralModel.
 
 		Args:
@@ -712,12 +711,12 @@ class MixtralModel(EasyDeLBaseModule):
 		        Defaults to `config.output_router_logits`.
 		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for attention.
 		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
-		    return_dict (bool): Whether to return a `MoeModelOutput` object or a tuple.
+
 
 		Returns:
-		    MoeModelOutput | tp.Tuple: The model's output. If `return_dict` is True,
+		    MoeModelOutput: The model's output.
 		        returns a `MoeModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-		        `attentions` (optional), and `router_logits` (optional). Otherwise, returns a tuple with these elements.
+		        `attentions` (optional), and `router_logits` (optional).
 
 		Raises:
 		    ValueError: If neither `input_ids` nor `inputs_embeds` is provided.
@@ -797,34 +796,24 @@ class MixtralModel(EasyDeLBaseModule):
 				frequencies=self.frequencies,
 			)
 
-			hidden_states = layer_outputs[0]
+			hidden_states = layer_outputs.hidden_states
 
 			if output_attentions:
-				all_self_attns += (layer_outputs[1],)
+				all_self_attns += (layer_outputs.attention_weight,)
 
 			if output_router_logits:
-				all_router_logits += (layer_outputs[-1],)
+				all_router_logits += (layer_outputs.router_logits,)
+
+			past_key_values[idx] = layer_outputs.cache_view
 
 		hidden_states = self.norm(hidden_states)
 
-		if output_hidden_states:
-			all_hidden_states += (hidden_states,)
-		if not return_dict:
-			return tuple(
-				v
-				for v in [
-					hidden_states,
-					all_hidden_states,
-					all_self_attns,
-					all_router_logits,
-				]
-				if v is not None
-			)
 		return MoeModelOutput(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
 			attentions=all_self_attns,
 			router_logits=all_router_logits,
+			past_key_values=past_key_values,
 		)
 
 
@@ -909,7 +898,6 @@ class MixtralForCausalLM(EasyDeLBaseModule):
 		output_router_logits: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
 	) -> MoeCausalLMOutput | tp.Tuple:
 		"""Forward pass of the MixtralForCausalLM model.
 
@@ -929,13 +917,12 @@ class MixtralForCausalLM(EasyDeLBaseModule):
 		        Defaults to `config.output_router_logits`.
 		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for attention.
 		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
-		    return_dict (bool): Whether to return a `MoeCausalLMOutput` object or a tuple.
 
 		Returns:
-		    MoeCausalLMOutput | tp.Tuple: The model's output. If `return_dict` is True,
+		    MoeCausalLMOutput: The model's output.
 		        returns a `MoeCausalLMOutput` object containing `logits`, `aux_loss` (optional),
 		        `hidden_states` (optional), `attentions` (optional), and `router_logits` (optional).
-		        Otherwise, returns a tuple with these elements.
+
 		"""
 		if output_router_logits is None:
 			output_router_logits = self.config.output_router_logits
@@ -949,11 +936,9 @@ class MixtralForCausalLM(EasyDeLBaseModule):
 			output_router_logits=output_router_logits,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
-			return_dict=True,
 			segment_ids=segment_ids,
 		)
 		logits = self.lm_head(outputs.last_hidden_state)
-		batch_size, seq_length, hd = logits.shape
 		aux_loss = None
 		if output_router_logits and outputs.router_logits is not None:
 			aux_loss = auxiliary_load_balancing_loss_func(
@@ -963,18 +948,6 @@ class MixtralForCausalLM(EasyDeLBaseModule):
 				attention_mask=attention_mask,
 			)
 			aux_loss += aux_loss * self.config.router_aux_loss_coef
-		if not return_dict:
-			outputs = (logits,) + tuple(
-				v
-				for v in [
-					aux_loss,
-					outputs.hidden_states,
-					outputs.attentions,
-					outputs.router_logits,
-				]
-				if v is not None
-			)
-			return outputs
 
 		return MoeCausalLMOutput(
 			aux_loss=aux_loss,
@@ -982,6 +955,7 @@ class MixtralForCausalLM(EasyDeLBaseModule):
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
 			router_logits=outputs.router_logits,
+			past_key_values=outputs.past_key_values,
 		)
 
 
@@ -1072,8 +1046,7 @@ class MixtralForSequenceClassification(EasyDeLBaseModule):
 		output_router_logits: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[SequenceClassifierOutput, tp.Tuple]:
+	) -> SequenceClassifierOutput:
 		"""Forward pass of the MixtralForSequenceClassification model.
 
 		Args:
@@ -1092,13 +1065,13 @@ class MixtralForSequenceClassification(EasyDeLBaseModule):
 		        Defaults to `config.output_router_logits`.
 		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for attention.
 		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
-		    return_dict (bool): Whether to return a `SequenceClassifierOutput` object or a tuple.
+
 
 		Returns:
-		    tp.Union[SequenceClassifierOutput, tp.Tuple]: The model's output. If `return_dict` is True,
+		   SequenceClassifierOutput: The model's output.
 		        returns a `SequenceClassifierOutput` object containing `logits`, `aux_loss` (optional),
 		        `hidden_states` (optional), `attentions` (optional), and `router_logits` (optional).
-		        Otherwise, returns a tuple with these elements.
+
 
 		Raises:
 		    ValueError: If `config.pad_token_id` is None and `batch_size > 1`.
@@ -1112,12 +1085,11 @@ class MixtralForSequenceClassification(EasyDeLBaseModule):
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			output_router_logits=output_router_logits,
-			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
 
-		hidden_states = transformer_outputs[0]
+		hidden_states = transformer_outputs.last_hidden_state
 		logits = self.score(hidden_states)
 		if input_ids is not None:
 			batch_size = input_ids.shape[0]
@@ -1148,9 +1120,6 @@ class MixtralForSequenceClassification(EasyDeLBaseModule):
 				attention_mask=attention_mask,
 			)
 			aux_loss += aux_loss * self.config.router_aux_loss_coef
-		if not return_dict:
-			output = (pooled_logits,) + transformer_outputs[1:] + (aux_loss,)
-			return output
 
 		return SequenceClassifierOutput(
 			logits=pooled_logits,
