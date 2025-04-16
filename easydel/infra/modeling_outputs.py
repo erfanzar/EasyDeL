@@ -20,7 +20,6 @@
 # Long-Term Benefits: While it might be a more opinionated choice, it reinforces the idea that
 #  infra is a central part of your system, and it will be better in the long term.
 # and i dont like to face `most likely due to a circular import` issue.
-import dataclasses
 import typing as tp
 from dataclasses import fields, is_dataclass
 
@@ -29,6 +28,11 @@ from eformer.pytree import auto_pytree
 from jax.core import Tracer
 
 from easydel.layers.caching import TransformerCache
+
+if tp.TYPE_CHECKING:
+	from easydel.layers.caching import TransformerCacheView, TransformerMetadata
+else:
+	TransformerCacheView, TransformerMetadata = [tp.Any] * 2
 
 
 def _is_array(array):
@@ -158,6 +162,31 @@ class ModelOutput(tp.OrderedDict):
 		callable, _args, *remaining = super().__reduce__()
 		args = tuple(getattr(self, field.name) for field in fields(self))
 		return callable, args, *remaining
+
+
+@auto_pytree
+class AttentionLayerOutput(ModelOutput):
+	attention_output: chex.Array
+	attention_weight: tp.Optional[chex.Array] = None
+	cache_view: tp.Optional[TransformerCacheView] = None
+
+
+@auto_pytree
+class EncoderLayerOutput(ModelOutput):
+	hidden_states: chex.Array
+	residual_states: tp.Optional[chex.Array] = None
+	attention_weight: tp.Optional[chex.Array] = None
+
+
+@auto_pytree
+class DecoderLayerOutput(ModelOutput):
+	hidden_states: chex.Array
+	residual_states: tp.Optional[chex.Array] = None
+	cross_attention: tp.Optional[chex.Array] = None
+	attention_weight: tp.Optional[chex.Array] = None
+	router_logits: tp.Optional[chex.Array] = None
+	gate_loss: tp.Optional[chex.Array] = None
+	cache_view: tp.Optional[TransformerCacheView] = None
 
 
 @auto_pytree

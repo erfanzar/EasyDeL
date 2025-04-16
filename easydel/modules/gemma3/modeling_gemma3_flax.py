@@ -25,8 +25,10 @@ from flax import nnx as nn
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
 	BaseModelOutput,
 	CausalLMOutput,
+	DecoderLayerOutput,
 	ModelOutput,
 	SequenceClassifierOutput,
 )
@@ -280,6 +282,7 @@ class Gemma3Attention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -327,10 +330,10 @@ class Gemma3Attention(AttentionModule):
 		)
 		attn_output = self.o_proj(attn_output)
 
-		return (
-			(attn_output, attentions.attention_weights)
-			if output_attentions
-			else (attn_output, None)
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=cache_view,
 		)
 
 
@@ -492,7 +495,7 @@ class Gemma3DecoderLayer(nn.Module):
 			self.config.partition_axis,
 			sharding_strategy=HiddenStateSharding,
 		)
-		hidden_states, attn_weight = self.self_attn(
+		attn_outputs = self.self_attn(
 			hidden_states,
 			attention_mask,
 			position_ids,
@@ -506,7 +509,7 @@ class Gemma3DecoderLayer(nn.Module):
 			frequencies,
 		)
 
-		hidden_states = self.post_attention_layernorm(hidden_states)
+		hidden_states = self.post_attention_layernorm(attn_outputs.attention_output)
 		hidden_states = residual + hidden_states
 
 		residual = hidden_states
@@ -522,7 +525,11 @@ class Gemma3DecoderLayer(nn.Module):
 
 		hidden_states = self.post_feedforward_layernorm(hidden_states)
 		hidden_states = residual + hidden_states
-		return hidden_states, attn_weight
+		return DecoderLayerOutput(
+			hidden_states=hidden_states,
+			attention_weight=attn_outputs.attention_weight,
+			cache_view=attn_outputs.cache_view,
+		)
 
 
 @register_module(
@@ -596,8 +603,7 @@ class Gemma3TextModel(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+	) -> BaseModelOutput:
 		"""
 		Forward pass through the Gemma2 module.
 
@@ -611,7 +617,6 @@ class Gemma3TextModel(EasyDeLBaseModule):
 		    output_hidden_states (tp.Optional[bool]): If True, output hidden states.
 		    init_cache (bool): If True, initialize cache for decoding.
 		    deterministic (bool): If True, disable dropout.
-		    return_dict (bool): If True, return a dictionary of outputs.
 
 		Returns:
 		    BaseModelOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
@@ -672,19 +677,17 @@ class Gemma3TextModel(EasyDeLBaseModule):
 				frequencies=self.frequencies,
 				default_frequencies=self.default_frequencies,
 			)
-			hidden_states = layer_outputs[0]
+			hidden_states = layer_outputs.hidden_states
 
 			if output_attentions:
-				all_attentions += (layer_outputs[1],)
+				all_attentions += (layer_outputs.attention_weight,)
+
+			past_key_values[idx] = layer_outputs.cache_view
 
 		hidden_states = self.norm(hidden_states)
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-		outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
-
-		if not return_dict:
-			return tuple(v for v in outputs if v is not None)
 
 		return BaseModelOutput(
 			last_hidden_state=hidden_states,
@@ -759,8 +762,7 @@ class Gemma3ForCausalLM(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[CausalLMOutput, tp.Tuple]:
+	) -> CausalLMOutput:
 		"""
 		Forward pass through the Gemma3 model.
 
@@ -775,7 +777,6 @@ class Gemma3ForCausalLM(EasyDeLBaseModule):
 		    output_hidden_states (tp.Optional[bool]): If True, output hidden states.
 		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Cached key values for faster inference.
 		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for cache handling.
-		    return_dict (bool): If True, return a dictionary of outputs.
 
 		Returns:
 		    CausalLMOutput | tp.Tuple: Model output, either as a named tuple or a standard tuple.
@@ -789,13 +790,12 @@ class Gemma3ForCausalLM(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
-			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 			token_type_ids=token_type_ids,
 		)
 
-		hidden_states = outputs[0]
+		hidden_states = outputs.last_hidden_state
 
 		hidden_states = control_runtime_sharding(
 			hidden_states,
@@ -815,9 +815,6 @@ class Gemma3ForCausalLM(EasyDeLBaseModule):
 		if self.config.final_logit_softcapping is not None:
 			cap = jnp.array(self.config.final_logit_softcapping, dtype=lm_logits.dtype)
 			lm_logits = cap * jax.nn.tanh(lm_logits / cap)
-
-		if not return_dict:
-			return (lm_logits,) + outputs[1:]
 
 		return CausalLMOutput(
 			logits=lm_logits,
@@ -881,8 +878,7 @@ class Gemma3ForSequenceClassification(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: bool = True,
-	) -> tp.Union[SequenceClassifierOutput, tp.Tuple]:
+	) -> SequenceClassifierOutput:
 		transformer_outputs = self.model(
 			input_ids=input_ids,
 			attention_mask=attention_mask,
@@ -890,12 +886,11 @@ class Gemma3ForSequenceClassification(EasyDeLBaseModule):
 			past_key_values=past_key_values,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
 
-		hidden_states = transformer_outputs[0]
+		hidden_states = transformer_outputs.last_hidden_state
 		logits = self.score(hidden_states)
 		if input_ids is not None:
 			batch_size = input_ids.shape[0]
@@ -917,10 +912,6 @@ class Gemma3ForSequenceClassification(EasyDeLBaseModule):
 				sequence_lengths = -1
 
 		pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
-
-		if not return_dict:
-			output = (pooled_logits,) + transformer_outputs[1:]
-			return output
 
 		return SequenceClassifierOutput(
 			logits=pooled_logits,
@@ -1070,7 +1061,6 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 		inputs_embeds: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
 		**lm_kwargs,
 	):
 		if (input_ids is None) ^ (inputs_embeds is not None):
@@ -1085,9 +1075,6 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 			output_hidden_states
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
-		)
-		return_dict = (
-			return_dict if return_dict is not None else self.config.use_return_dict
 		)
 		if input_ids is not None and self.config.image_token_index >= self.vocab_size:
 			special_image_mask = input_ids == self.config.image_token_index
@@ -1126,7 +1113,6 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
-			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			token_type_ids=token_type_ids,
 			segment_ids=None,

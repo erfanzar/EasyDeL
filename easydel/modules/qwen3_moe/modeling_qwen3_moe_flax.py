@@ -25,6 +25,8 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
+	DecoderLayerOutput,
 	MoeCausalLMOutput,
 	MoeModelOutput,
 	SequenceClassifierOutput,
@@ -473,6 +475,7 @@ class Qwen3MoeAttention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -500,12 +503,11 @@ class Qwen3MoeAttention(AttentionModule):
 		attn_output = self._merge_heads(attentions.attention_outputs)
 		attn_output = self.shard_attention_prod(attn_output)
 		attn_output = self.o_proj(attn_output)
-		outputs = (
-			(attn_output, attentions.attention_weights)
-			if output_attentions
-			else (attn_output,)
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=cache_view,
 		)
-		return outputs
 
 
 class Qwen3MoeDecoderLayer(nn.Module):
@@ -649,8 +651,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
 			fcm_mask,
 			frequencies,
 		)
-		attn_output = attn_outputs[0]
-		hidden_states = hidden_states + attn_output
+		hidden_states = hidden_states + attn_outputs.attention_output
 
 		feed_forward_input = self.post_attention_layernorm(hidden_states)
 
@@ -667,10 +668,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
 		else:
 			router_logits = None
 		hidden_states = hidden_states + feed_forward_hidden_states
-		outputs = (hidden_states,) + attn_outputs[1:]
-		if output_router_logits:
-			outputs += (router_logits,)
-		return outputs
+		return DecoderLayerOutput(
+			hidden_states=hidden_states,
+			attention_weight=attn_outputs.attention_weight,
+			router_logits=router_logits if output_router_logits else None,
+			cache_view=attn_outputs.cache_view,
+		)
 
 
 @register_module(
@@ -761,8 +764,7 @@ class Qwen3MoeModel(EasyDeLBaseModule):
 		output_router_logits: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[MoeModelOutput, tp.Tuple]:
+	) -> MoeModelOutput:
 		"""Forward pass of the Qwen3MoeModel.
 
 		Args:
@@ -779,12 +781,12 @@ class Qwen3MoeModel(EasyDeLBaseModule):
 		        Defaults to `config.output_hidden_states`.
 		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for attention.
 		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
-		    return_dict (bool): Whether to return a `MoeModelOutput` object or a tuple.
+
 
 		Returns:
-		    tp.Union[MoeModelOutput, tp.Tuple]: The model's output. If `return_dict` is True,
+		    MoeModelOutput: The model's output.
 		        returns a `MoeModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
+		        and `attentions` (optional).
 
 		Raises:
 		    ValueError: If neither `input_ids` nor `inputs_embeds` is provided.
@@ -848,24 +850,24 @@ class Qwen3MoeModel(EasyDeLBaseModule):
 				segment_ids=segment_ids,
 				frequencies=self.frequencies,
 			)
-			hidden_states = layer_outputs[0]
+			hidden_states = layer_outputs.hidden_states
 
 			if output_attentions:
-				all_attentions += (layer_outputs[1],)
+				all_attentions += (layer_outputs.attention_weight,)
+
+			past_key_values[idx] = layer_outputs.cache_view
 			if output_router_logits:
 				all_router_logits += (layer_outputs[-1],)
 
 		hidden_states = self.norm(hidden_states)
-		output = MoeModelOutput(
+
+		return MoeModelOutput(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
 			attentions=all_attentions,
 			past_key_values=past_key_values,
 			router_logits=all_router_logits,
 		)
-		if return_dict:
-			return output
-		return output.to_tuple()
 
 
 @register_module(
@@ -948,8 +950,7 @@ class Qwen3MoeForCausalLM(EasyDeLBaseModule):
 		output_router_logits: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[MoeCausalLMOutput, tp.Tuple]:
+	) -> MoeCausalLMOutput:
 		"""Forward pass of the Qwen3MoeForCausalLM model.
 
 		Args:
@@ -966,12 +967,11 @@ class Qwen3MoeForCausalLM(EasyDeLBaseModule):
 		        Defaults to `config.output_hidden_states`.
 		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for attention.
 		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
-		    return_dict (bool): Whether to return a `MoeCausalLMOutput` object or a tuple.
 
 		Returns:
-		    tp.Union[MoeCausalLMOutput, tp.Tuple]: The model's output. If `return_dict` is True,
+		    MoeCausalLMOutput: The model's output.
 		        returns a `MoeCausalLMOutput` object containing `logits`, `hidden_states` (optional),
-		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
+		        and `attentions` (optional).
 		"""
 		outputs = self.model(
 			input_ids=input_ids,
@@ -982,12 +982,11 @@ class Qwen3MoeForCausalLM(EasyDeLBaseModule):
 			output_router_logits=output_router_logits,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
-			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
 
-		hidden_states = outputs[0]
+		hidden_states = outputs.last_hidden_state
 
 		hidden_states = control_runtime_sharding(
 			hidden_states,
@@ -1013,9 +1012,6 @@ class Qwen3MoeForCausalLM(EasyDeLBaseModule):
 				attention_mask=attention_mask,
 			)
 			aux_loss += aux_loss * self.config.router_aux_loss_coef
-
-		if not return_dict:
-			return (lm_logits,) + outputs[1:]
 
 		return MoeCausalLMOutput(
 			logits=lm_logits,
@@ -1109,8 +1105,7 @@ class Qwen3MoeForSequenceClassification(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: bool = True,
-	) -> tp.Union[SequenceClassifierOutput, tp.Tuple]:
+	) -> SequenceClassifierOutput:
 		"""Forward pass of the Qwen3MoeForSequenceClassification model.
 
 		Args:
@@ -1127,12 +1122,12 @@ class Qwen3MoeForSequenceClassification(EasyDeLBaseModule):
 		    output_attentions (tp.Optional[bool]): Whether to return attention weights. Defaults to `config.output_attentions`.
 		    output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
 		        Defaults to `config.output_hidden_states`.
-		    return_dict (bool): Whether to return a `SequenceClassifierOutput` object or a tuple.
+
 
 		Returns:
-		    tp.Union[SequenceClassifierOutput, tp.Tuple]: The model's output. If `return_dict` is True,
+		    SequenceClassifierOutput: The model's output,
 		        returns a `SequenceClassifierOutput` object containing `logits`, `hidden_states` (optional),
-		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
+		        and `attentions` (optional).
 
 		Raises:
 		    ValueError: If `config.pad_token_id` is None and `batch_size > 1`.
@@ -1145,12 +1140,11 @@ class Qwen3MoeForSequenceClassification(EasyDeLBaseModule):
 			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
 
-		hidden_states = transformer_outputs[0]
+		hidden_states = transformer_outputs.last_hidden_state
 		logits = self.score(hidden_states)
 		if input_ids is not None:
 			batch_size = input_ids.shape[0]
@@ -1172,10 +1166,6 @@ class Qwen3MoeForSequenceClassification(EasyDeLBaseModule):
 				sequence_lengths = -1
 
 		pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
-
-		if not return_dict:
-			output = (pooled_logits,) + transformer_outputs[1:]
-			return output
 
 		return SequenceClassifierOutput(
 			logits=pooled_logits,

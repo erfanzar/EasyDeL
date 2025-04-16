@@ -24,10 +24,12 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
 	BaseModelOutput,
 	BaseModelOutputWithPooling,
 	CLIPOutput,
 	CLIPTextModelOutput,
+	EncoderLayerOutput,
 	ImageClassifierOutput,
 )
 from easydel.infra.utils import ACT2FN, HiddenStateSharding, control_runtime_sharding
@@ -372,7 +374,11 @@ class CLIPAttention(AttentionModule):
 		attn_output = self._merge_heads(attentions.attention_outputs)
 		attn_output = self.out_proj(attn_output)
 
-		return attn_output, attentions.attention_weights
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=None,
+		)
 
 
 class CLIPMLP(nn.Module):
@@ -521,7 +527,7 @@ class CLIPEncoderLayer(nn.Module):
 			causal_mask=causal_mask,
 			output_attentions=output_attentions,
 		)
-		hidden_states = attn_outputs[0]
+		hidden_states = attn_outputs.attention_output
 		hidden_states = residual + hidden_states
 
 		residual = hidden_states
@@ -529,9 +535,10 @@ class CLIPEncoderLayer(nn.Module):
 		hidden_states = self.mlp(hidden_states)
 		hidden_states = residual + hidden_states
 
-		outputs = (hidden_states,) + attn_outputs[1:]
-
-		return outputs
+		return EncoderLayerOutput(
+			hidden_states=hidden_states,
+			attention_weight=attn_outputs.attention_weight,
+		)
 
 
 class CLIPEncoder(nn.Module):
@@ -589,7 +596,6 @@ class CLIPEncoder(nn.Module):
 		attention_mask: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		"""
 		Forward pass for the CLIP encoder.
@@ -599,7 +605,7 @@ class CLIPEncoder(nn.Module):
 			attention_mask (Optional[chex.Array]): Attention mask.
 			output_attentions (bool): Whether to output attention weights.
 			output_hidden_states (bool): Whether to output all hidden states.
-			return_dict (bool): Whether to return a dictionary output.
+
 
 		Returns:
 			Union[BaseModelOutput, Tuple]: Encoder output (last hidden state, optional hidden states, optional attentions).
@@ -618,18 +624,13 @@ class CLIPEncoder(nn.Module):
 				causal_mask=self.causal_mask,
 				output_attentions=output_attentions,
 			)
-			hidden_states = layer_outputs[0]
+			hidden_states = layer_outputs.hidden_states
 
 			if output_attentions:
-				all_attentions += (layer_outputs[1],)
+				all_attentions += (layer_outputs.attention_weight,)
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-
-		outputs = (hidden_states,)
-
-		if not return_dict:
-			return tuple(v for v in outputs if v is not None)
 
 		return BaseModelOutput(
 			last_hidden_state=hidden_states,
@@ -697,7 +698,6 @@ class CLIPTextTransformer(EasyDeLBaseModule):
 		position_ids: chex.Array,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		"""Forward pass for the text transformer.
 
@@ -707,7 +707,7 @@ class CLIPTextTransformer(EasyDeLBaseModule):
 			position_ids (chex.Array): Position IDs.
 			output_attentions (bool): Whether to output attention weights.
 			output_hidden_states (bool): Whether to output all hidden states.
-			return_dict (bool): Whether to return a dictionary output.
+
 
 		Returns:
 			Union[BaseModelOutputWithPooling, Tuple]: Transformer output (last hidden state, pooled output, optional hidden states, optional attentions).
@@ -722,9 +722,6 @@ class CLIPTextTransformer(EasyDeLBaseModule):
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
 		)
-		return_dict = (
-			return_dict if return_dict is not None else self.config.use_return_dict
-		)
 
 		hidden_states = self.embeddings(input_ids=input_ids, position_ids=position_ids)
 
@@ -733,10 +730,9 @@ class CLIPTextTransformer(EasyDeLBaseModule):
 			attention_mask=attention_mask,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
-		last_hidden_state = encoder_outputs[0]
+		last_hidden_state = encoder_outputs.last_hidden_state
 		last_hidden_state = self.final_layer_norm(last_hidden_state)
 
 		if self.eos_token_id == 2:
@@ -749,9 +745,6 @@ class CLIPTextTransformer(EasyDeLBaseModule):
 				jnp.arange(last_hidden_state.shape[0]),
 				(input_ids == self.eos_token_id).argmax(axis=-1),
 			]
-
-		if not return_dict:
-			return (last_hidden_state, pooled_output) + encoder_outputs[1:]
 
 		return BaseModelOutputWithPooling(
 			last_hidden_state=last_hidden_state,
@@ -823,7 +816,6 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
 		pixel_values: tp.Optional[chex.Array] = None,
 		output_attentions=None,
 		output_hidden_states=None,
-		return_dict: bool = True,
 	):
 		"""Forward pass for the vision transformer.
 
@@ -831,7 +823,7 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
 			pixel_values (Optional[chex.Array]): Input pixel values.
 			output_attentions (Optional[bool]): Whether to output attention weights.
 			output_hidden_states (Optional[bool]): Whether to output all hidden states.
-			return_dict (bool): Whether to return a dictionary output.
+
 
 		Returns:
 			Union[BaseModelOutputWithPooling, Tuple]: Transformer output (last hidden state, pooled output, optional hidden states, optional attentions).
@@ -846,9 +838,7 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
 		)
-		return_dict = (
-			return_dict if return_dict is not None else self.config.use_return_dict
-		)
+
 		if pixel_values is not None and pixel_values.ndim == 4:
 			pixel_values = jnp.swapaxes(pixel_values, 1, 3)
 		hidden_states = self.embeddings(pixel_values)
@@ -858,15 +848,11 @@ class CLIPVisionTransformer(EasyDeLBaseModule):
 			inputs_embeds=hidden_states,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
-		last_hidden_state = encoder_outputs[0]
+		last_hidden_state = encoder_outputs.last_hidden_state
 		pooled_output = last_hidden_state[:, 0, :]
 		pooled_output = self.post_layernorm(pooled_output)
-
-		if not return_dict:
-			return (last_hidden_state, pooled_output) + encoder_outputs[1:]
 
 		return BaseModelOutputWithPooling(
 			last_hidden_state=last_hidden_state,
@@ -919,7 +905,6 @@ class CLIPTextModel(EasyDeLBaseModule):
 		position_ids: chex.Array,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		"""Forward pass for the bare CLIP text model.
 
@@ -929,7 +914,7 @@ class CLIPTextModel(EasyDeLBaseModule):
 			position_ids (chex.Array): Position IDs.
 			output_attentions (bool): Whether to output attention weights.
 			output_hidden_states (bool): Whether to output all hidden states.
-			return_dict (bool): Whether to return a dictionary output.
+
 
 		Returns:
 			Union[BaseModelOutputWithPooling, Tuple]: Model output.
@@ -940,7 +925,6 @@ class CLIPTextModel(EasyDeLBaseModule):
 			position_ids=position_ids,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
 
@@ -996,8 +980,7 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
 		position_ids: chex.Array,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
-	) -> tp.Union[CLIPTextModelOutput, tp.Tuple]:
+	) -> CLIPTextModelOutput:
 		"""Forward pass for the CLIP text model with projection.
 
 		Args:
@@ -1006,7 +989,7 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
 			position_ids (chex.Array): Position IDs.
 			output_attentions (bool): Whether to output attention weights.
 			output_hidden_states (bool): Whether to output all hidden states.
-			return_dict (bool): Whether to return a dictionary output.
+
 
 		Returns:
 			Union[CLIPTextModelOutput, Tuple]: Model output including projected text embeddings.
@@ -1017,14 +1000,10 @@ class CLIPTextModelWithProjection(EasyDeLBaseModule):
 			position_ids=position_ids,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
 		pooled_output = text_outputs[1]
 		text_embeds = self.text_projection(pooled_output)
-
-		if not return_dict:
-			return (text_embeds, text_outputs[0]) + text_outputs[2:]
 
 		return CLIPTextModelOutput(
 			text_embeds=text_embeds,
@@ -1085,7 +1064,6 @@ class CLIPVisionModel(EasyDeLBaseModule):
 		pixel_values: chex.Array,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		"""Forward pass for the bare CLIP vision model.
 
@@ -1093,7 +1071,7 @@ class CLIPVisionModel(EasyDeLBaseModule):
 			pixel_values (chex.Array): Input pixel values.
 			output_attentions (bool): Whether to output attention weights.
 			output_hidden_states (bool): Whether to output all hidden states.
-			return_dict (bool): Whether to return a dictionary output.
+
 
 		Returns:
 			Union[BaseModelOutputWithPooling, Tuple]: Model output.
@@ -1102,7 +1080,6 @@ class CLIPVisionModel(EasyDeLBaseModule):
 			pixel_values=pixel_values,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
 
@@ -1161,7 +1138,6 @@ class CLIPForImageClassification(EasyDeLBaseModule):
 		pixel_values: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
 	) -> tp.Union[tuple, ImageClassifierOutput]:
 		output_attentions = (
 			output_attentions
@@ -1173,15 +1149,11 @@ class CLIPForImageClassification(EasyDeLBaseModule):
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
 		)
-		return_dict = (
-			return_dict if return_dict is not None else self.config.use_return_dict
-		)
 
 		outputs = self.vision_model(
 			pixel_values,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
 		sequence_output = outputs[0]
@@ -1191,10 +1163,6 @@ class CLIPForImageClassification(EasyDeLBaseModule):
 			logits = self.classifier(sequence_output)
 		else:
 			logits = sequence_output
-
-		if not return_dict:
-			output = (logits,) + outputs[2:]
-			return output
 
 		return ImageClassifierOutput(
 			logits=logits,
@@ -1271,19 +1239,16 @@ class CLIPModel(EasyDeLBaseModule):
 		position_ids: tp.Optional[chex.Array] = None,
 		output_attentions=None,
 		output_hidden_states=None,
-		return_dict=None,
-	) -> tp.Union[CLIPOutput, tp.Tuple]:
+	) -> CLIPOutput:
 		if attention_mask is None and input_ids is not None:
 			attention_mask = jnp.ones_like(input_ids)
 		if position_ids is None and attention_mask is not None:
 			position_ids = attention_mask.cumsum(-1) - 1
-		return_dict = return_dict if return_dict is not None else self.config.return_dict
 
 		vision_outputs = self.vision_model(
 			pixel_values=pixel_values,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
 		text_outputs = self.text_model(
@@ -1292,7 +1257,6 @@ class CLIPModel(EasyDeLBaseModule):
 			position_ids=position_ids,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
 		image_embeds = vision_outputs[1]
@@ -1307,16 +1271,6 @@ class CLIPModel(EasyDeLBaseModule):
 		logit_scale = jnp.exp(self.logit_scale)
 		logits_per_text = jnp.matmul(text_embeds, image_embeds.T) * logit_scale
 		logits_per_image = logits_per_text.T
-
-		if not return_dict:
-			return (
-				logits_per_image,
-				logits_per_text,
-				text_embeds,
-				image_embeds,
-				text_outputs,
-				vision_outputs,
-			)
 
 		return CLIPOutput(
 			logits_per_image=logits_per_image,
@@ -1356,8 +1310,7 @@ class CLIPModel(EasyDeLBaseModule):
 		loss_kwargs=None,  # just to extract
 		**batch,
 	) -> tp.Tuple[tp.Any, CLIPOutput]:
-		batch.pop("return_dict", None)
-		outputs = self(**batch, return_dict=True)
+		outputs = self(**batch)
 
 		loss = LossMetrics(loss=clip_loss(outputs.logits_per_text))
 		outputs = outputs.replace(loss=loss.loss)

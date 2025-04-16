@@ -52,7 +52,7 @@ def main():
 		generation_config=ed.vInferenceConfig(
 			max_new_tokens=2048,
 			streaming_chunks=64,
-			num_return_sequences=1,
+			num_return_sequences=1, 
 		),
 		inference_name="LLaMA",
 	)

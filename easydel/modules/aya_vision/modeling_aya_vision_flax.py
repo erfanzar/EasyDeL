@@ -304,7 +304,6 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
 		inputs_embeds: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
 		**lm_kwargs,
 	):
 		"""Forward pass for the AyaVision model.
@@ -320,7 +319,6 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
 		    inputs_embeds (Optional[chex.Array]): Input embeddings (alternative to input_ids).
 		    output_attentions (Optional[bool]): Whether to output attentions.
 		    output_hidden_states (Optional[bool]): Whether to output hidden states.
-		    return_dict (Optional[bool]): Whether to return a dictionary output.
 		    **lm_kwargs: Additional arguments passed to the language model.
 
 		Returns:
@@ -338,9 +336,6 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
 			output_hidden_states
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
-		)
-		return_dict = (
-			return_dict if return_dict is not None else self.config.use_return_dict
 		)
 		if input_ids is not None and self.config.image_token_index >= self.vocab_size:
 			special_image_mask = input_ids == self.config.image_token_index
@@ -373,7 +368,7 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
-			return_dict=return_dict,
+
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 			**lm_kwargs,

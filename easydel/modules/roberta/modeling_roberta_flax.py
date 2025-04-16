@@ -25,9 +25,11 @@ from jax import numpy as jnp
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
 	BaseModelOutputWithPastAndCrossAttentions,
 	BaseModelOutputWithPoolingAndCrossAttentions,
 	CausalLMOutputWithCrossAttentions,
+	DecoderLayerOutput,
 	MultipleChoiceModelOutput,
 	QuestionAnsweringModelOutput,
 	SequenceClassifierOutput,
@@ -223,10 +225,12 @@ class RobertaSelfAttention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
 			cache_view=cache_view,
+			cache_metadata=cache_metadata,
 			value=value_states,
 			attention_mask=attention_mask,
 			causal_mask=causal_mask if self.causal else None,
@@ -264,8 +268,11 @@ class RobertaSelfAttention(AttentionModule):
 			attn_output.reshape(attn_output.shape[:2] + (-1,))
 		)
 
-		outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
-		return outputs
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attn_weights if output_attentions else None,
+			cache_view=cache_view,
+		)
 
 
 class RobertaSelfOutput(nn.Module):
@@ -357,18 +364,14 @@ class RobertaAttention(nn.Module):
 			causal_mask=causal_mask if self.causal else None,
 			layer_head_mask=layer_head_mask,
 			cache_view=cache_view,
+			cache_metadata=cache_metadata,
 			key_value_states=key_value_states,
 			output_attentions=output_attentions,
 		)
-		attn_output = attn_outputs[0]
-		hidden_states = self.output(attn_output, hidden_states)
 
-		outputs = (hidden_states,)
+		hidden_states = self.output(attn_outputs.attention_output, hidden_states)
 
-		if output_attentions:
-			outputs += (attn_outputs[1],)
-
-		return outputs
+		return attn_outputs.replace(attention_output=hidden_states)
 
 
 class RobertaIntermediate(nn.Module):
@@ -511,11 +514,13 @@ class RobertaLayer(nn.Module):
 			causal_mask=causal_mask,
 			layer_head_mask=layer_head_mask,
 			cache_view=cache_view,
+			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 		)
-		attention_output = attention_outputs[0]
+		attention_output = attention_outputs.attention_output
 
 		# Cross-Attention Block
+		cross_attention = None
 		if encoder_hidden_states is not None:
 			cross_attention_outputs = self.crossattention(
 				hidden_states=attention_output,
@@ -526,18 +531,16 @@ class RobertaLayer(nn.Module):
 				output_attentions=output_attentions,
 				causal_mask=causal_mask,
 			)
-			attention_output = cross_attention_outputs[0]
+			cross_attention = cross_attention_outputs.attention_output
 
 		hidden_states = self.intermediate(attention_output)
 		hidden_states = self.output(hidden_states, attention_output)
 
-		outputs = (hidden_states,)
-
-		if output_attentions:
-			outputs += (attention_outputs[1],)
-			if encoder_hidden_states is not None:
-				outputs += (cross_attention_outputs[1],)
-		return outputs
+		return DecoderLayerOutput(
+			hidden_states=hidden_states,
+			cross_attention=cross_attention,
+			cache_view=attention_output.cache_view,
+		)
 
 
 class RobertaEncoder(nn.Module):
@@ -581,7 +584,6 @@ class RobertaEncoder(nn.Module):
 		past_key_values: tp.Optional[TransformerCacheView] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		all_attentions = () if output_attentions else None
 		all_hidden_states = () if output_hidden_states else None
@@ -613,32 +615,25 @@ class RobertaEncoder(nn.Module):
 				output_attentions=output_attentions,
 			)
 
-			hidden_states = layer_outputs[0]
+			hidden_states = layer_outputs.hidden_states
 
 			if output_attentions:
-				all_attentions += (layer_outputs[1],)
+				all_attentions += (layer_outputs.attention_weight,)
 
-				if encoder_hidden_states is not None:
-					all_cross_attentions += (layer_outputs[2],)
+			past_key_values[i] = layer_outputs.cache_view
+
+			if encoder_hidden_states is not None:
+				all_cross_attentions += (layer_outputs.cross_attention,)
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-
-		outputs = (
-			hidden_states,
-			all_hidden_states,
-			all_attentions,
-			all_cross_attentions,
-		)
-
-		if not return_dict:
-			return tuple(v for v in outputs if v is not None)
 
 		return BaseModelOutputWithPastAndCrossAttentions(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
 			attentions=all_attentions,
 			cross_attentions=all_cross_attentions,
+			past_key_values=past_key_values,
 		)
 
 
@@ -856,7 +851,6 @@ class RobertaModel(EasyDeLBaseModule):
 		past_key_values: tp.Optional[tp.Tuple[tp.Tuple[chex.Array, chex.Array]]] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		# make sure `token_type_ids` is correctly initialized when not passed
 		if token_type_ids is None:
@@ -886,9 +880,8 @@ class RobertaModel(EasyDeLBaseModule):
 			past_key_values=past_key_values,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
-		hidden_states = outputs[0]
+		hidden_states = outputs.last_hidden_state
 
 		hidden_states = control_runtime_sharding(
 			hidden_states,
@@ -897,12 +890,6 @@ class RobertaModel(EasyDeLBaseModule):
 		)
 
 		pooled = self.pooler(hidden_states) if self.add_pooling_layer else None
-
-		if not return_dict:
-			# if pooled is None, don't return it
-			if pooled is None:
-				return (hidden_states,) + outputs[1:]
-			return (hidden_states, pooled) + outputs[1:]
 
 		return BaseModelOutputWithPoolingAndCrossAttentions(
 			last_hidden_state=hidden_states,
@@ -960,7 +947,6 @@ class RobertaForSequenceClassification(EasyDeLBaseModule):
 		head_mask,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		# Model
 		outputs = self.roberta(
@@ -971,14 +957,10 @@ class RobertaForSequenceClassification(EasyDeLBaseModule):
 			head_mask=head_mask,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
 		sequence_output = outputs[0]
 		logits = self.classifier(sequence_output)
-
-		if not return_dict:
-			return (logits,) + outputs[1:]
 
 		return SequenceClassifierOutput(
 			logits=logits,
@@ -1034,7 +1016,6 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
 		head_mask,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		num_choices = input_ids.shape[1]
 		input_ids = (
@@ -1065,7 +1046,6 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
 			head_mask=head_mask,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
 		pooled_output = outputs[1]
@@ -1073,9 +1053,6 @@ class RobertaForMultipleChoice(EasyDeLBaseModule):
 		logits = self.classifier(pooled_output)
 
 		reshaped_logits = logits.reshape(-1, num_choices)
-
-		if not return_dict:
-			return (reshaped_logits,) + outputs[2:]
 
 		return MultipleChoiceModelOutput(
 			logits=reshaped_logits,
@@ -1137,7 +1114,6 @@ class RobertaForTokenClassification(EasyDeLBaseModule):
 		head_mask,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		# Model
 		outputs = self.roberta(
@@ -1148,10 +1124,9 @@ class RobertaForTokenClassification(EasyDeLBaseModule):
 			head_mask=head_mask,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
-		hidden_states = outputs[0]
+		hidden_states = outputs.last_hidden_state
 
 		hidden_states = control_runtime_sharding(
 			hidden_states,
@@ -1161,9 +1136,6 @@ class RobertaForTokenClassification(EasyDeLBaseModule):
 
 		hidden_states = self.dropout(hidden_states)
 		logits = self.classifier(hidden_states)
-
-		if not return_dict:
-			return (logits,) + outputs[1:]
 
 		return TokenClassifierOutput(
 			logits=logits,
@@ -1216,7 +1188,6 @@ class RobertaForQuestionAnswering(EasyDeLBaseModule):
 		head_mask,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		# Model
 		outputs = self.roberta(
@@ -1227,10 +1198,9 @@ class RobertaForQuestionAnswering(EasyDeLBaseModule):
 			head_mask=head_mask,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
-		hidden_states = outputs[0]
+		hidden_states = outputs.last_hidden_state
 
 		hidden_states = control_runtime_sharding(
 			hidden_states,
@@ -1242,9 +1212,6 @@ class RobertaForQuestionAnswering(EasyDeLBaseModule):
 		start_logits, end_logits = logits.split(self.config.num_labels, axis=-1)
 		start_logits = start_logits.squeeze(-1)
 		end_logits = end_logits.squeeze(-1)
-
-		if not return_dict:
-			return (start_logits, end_logits) + outputs[1:]
 
 		return QuestionAnsweringModelOutput(
 			start_logits=start_logits,
@@ -1304,7 +1271,6 @@ class RobertaForCausalLM(EasyDeLBaseModule):
 		past_key_values: tp.Optional[tp.Tuple[tp.Tuple[chex.Array, chex.Array]]] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		# Model
 		outputs = self.roberta(
@@ -1318,10 +1284,9 @@ class RobertaForCausalLM(EasyDeLBaseModule):
 			past_key_values=past_key_values,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
-		hidden_states = outputs[0]
+		hidden_states = outputs.last_hidden_state
 
 		hidden_states = control_runtime_sharding(
 			hidden_states,
@@ -1335,9 +1300,6 @@ class RobertaForCausalLM(EasyDeLBaseModule):
 			shared_embedding = None
 
 		logits = self.lm_head(hidden_states, shared_embedding=shared_embedding)
-
-		if not return_dict:
-			return (logits,) + outputs[1:]
 
 		return CausalLMOutputWithCrossAttentions(
 			logits=logits,

@@ -23,7 +23,12 @@ from jax import numpy as jnp
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput, CausalLMOutput
+from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
+	BaseModelOutput,
+	CausalLMOutput,
+	DecoderLayerOutput,
+)
 from easydel.infra.utils import (
 	ACT2FN,
 	HiddenStateSharding,
@@ -275,6 +280,7 @@ class OpenELMMultiHeadCausalAttention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -303,7 +309,11 @@ class OpenELMMultiHeadCausalAttention(AttentionModule):
 			self.shard_attention_prod(self._merge_heads(attentions.attention_outputs))
 		)
 
-		return attn_output, attentions.attention_weights
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=cache_view,
+		)
 
 
 class OpenELMFeedForwardNetwork(nn.Module):
@@ -554,7 +564,7 @@ class OpenELMDecoderLayer(nn.Module):
 		residual = hidden_states
 		hidden_states = self.attn_norm(hidden_states)
 
-		hidden_states, self_attn_weights = self.attn(
+		attn_outputs = self.attn(
 			hidden_states,
 			attention_mask,
 			position_ids,
@@ -566,7 +576,7 @@ class OpenELMDecoderLayer(nn.Module):
 			fcm_mask,
 			frequencies,
 		)
-		hidden_states = residual + hidden_states
+		hidden_states = residual + attn_outputs.attention_output
 
 		# Fully Connected
 		residual = hidden_states
@@ -585,12 +595,11 @@ class OpenELMDecoderLayer(nn.Module):
 			self.config.partition_axis,
 			sharding_strategy=HiddenStateSharding,
 		)
-		outputs = (hidden_states,)
-
-		if output_attentions:
-			outputs += (self_attn_weights,)
-
-		return outputs  # type:ignore
+		return DecoderLayerOutput(
+			hidden_states=hidden_states,
+			attention_weight=attn_outputs.attention_weight,
+			cache_view=attn_outputs.cache_view,
+		)
 
 
 @register_module(
@@ -701,8 +710,7 @@ class OpenELMModel(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+	) -> BaseModelOutput:
 		"""Forward pass of the OpenELMModel.
 
 		Args:
@@ -719,12 +727,11 @@ class OpenELMModel(EasyDeLBaseModule):
 		        Defaults to `config.output_hidden_states`.
 		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for attention.
 		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
-		    return_dict (bool): Whether to return a `BaseModelOutput` object or a tuple.
 
 		Returns:
-		    tp.Union[BaseModelOutput, tp.Tuple]: The model's output. If `return_dict` is True,
+		    BaseModelOutput: The model's output.
 		        returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
+		        and `attentions` (optional).
 
 		Raises:
 		    ValueError: If neither `input_ids` nor `inputs_embeds` is provided.
@@ -768,7 +775,7 @@ class OpenELMModel(EasyDeLBaseModule):
 		for idx, layer in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
-			output = layer(
+			layer_outputs = layer(
 				hidden_states=hidden_states,
 				attention_mask=attention_mask,
 				cache_view=past_key_values.views[idx],
@@ -779,19 +786,17 @@ class OpenELMModel(EasyDeLBaseModule):
 				causal_mask=self.causal_mask,
 				frequencies=self.frequencies,
 			)
-			hidden_states = output[0]
+			hidden_states = layer_outputs.hidden_states
 
 			if output_attentions:
-				output_attentions += (output[1],)
+				output_attentions += (layer_outputs.attention_weight,)
+
+			past_key_values[idx] = layer_outputs.cache_view
 
 		hidden_states = self.norm(hidden_states)
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-		outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
-
-		if not return_dict:
-			return tuple(value for value in outputs if value is not None)
 
 		return BaseModelOutput(
 			last_hidden_state=hidden_states,
@@ -881,8 +886,7 @@ class OpenELMForCausalLM(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[CausalLMOutput, tp.Tuple]:
+	) -> CausalLMOutput:
 		"""Forward pass of the OpenELMForCausalLM model.
 
 		Args:
@@ -899,12 +903,12 @@ class OpenELMForCausalLM(EasyDeLBaseModule):
 		        Defaults to `config.output_hidden_states`.
 		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for attention.
 		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
-		    return_dict (bool): Whether to return a `CausalLMOutput` object or a tuple.
+
 
 		Returns:
-		    tp.Union[CausalLMOutput, tp.Tuple]: The model's output. If `return_dict` is True,
+		    CausalLMOutput: The model's output.
 		        returns a `CausalLMOutput` object containing `logits`, `hidden_states` (optional),
-		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
+		        and `attentions` (optional).
 		"""
 		outputs = self.transformer(
 			input_ids=input_ids,
@@ -915,11 +919,10 @@ class OpenELMForCausalLM(EasyDeLBaseModule):
 			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 			segment_ids=segment_ids,
 		)
 
-		hidden_states = outputs[0]
+		hidden_states = outputs.last_hidden_state
 
 		hidden_states = control_runtime_sharding(
 			hidden_states,
@@ -935,9 +938,6 @@ class OpenELMForCausalLM(EasyDeLBaseModule):
 			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
-
-		if not return_dict:
-			return (lm_logits,) + outputs[1:]
 
 		return CausalLMOutput(
 			logits=lm_logits,

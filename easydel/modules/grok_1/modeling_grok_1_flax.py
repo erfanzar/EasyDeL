@@ -25,6 +25,8 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
+	DecoderLayerOutput,
 	MoeCausalLMOutput,
 	MoeModelOutput,
 )
@@ -233,6 +235,7 @@ class Grok1Attention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -263,12 +266,11 @@ class Grok1Attention(AttentionModule):
 		attn_output = self.o_proj(attn_output)
 
 		attn_output = self.resid_dropout(attn_output)
-		outputs = (
-			(attn_output, attentions.attention_weights)
-			if output_attentions
-			else (attn_output,)
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=cache_view,
 		)
-		return outputs
 
 
 class Grok1BLockSparseMLP(nn.Module):
@@ -448,9 +450,13 @@ class Grok1SparseMoeBlock(nn.Module):
 				else self.layers[index](hidden_states)
 			)
 			expert_layer_output_exp = (
-				jnp.sum(jnp.multiply(selected_experts == index, routing_weights), axis=-1)[
-					:, :, None
-				]
+				jnp.sum(
+					jnp.multiply(
+						selected_experts == index,
+						routing_weights,
+					),
+					axis=-1,
+				)[:, :, None]
 				* expert_layer_output
 			)
 			final_hidden_state += expert_layer_output_exp
@@ -551,7 +557,7 @@ class Grok1DecoderLayer(nn.Module):
 		output_router_logits: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
 		frequencies: tp.Optional[chex.Array] = None,
-	) -> tp.Tuple[chex.Array, chex.Array, tp.Optional[chex.Array]]:
+	) -> DecoderLayerOutput:
 		"""Forward pass of the Grok1DecoderLayer module.
 
 		Args:
@@ -573,7 +579,7 @@ class Grok1DecoderLayer(nn.Module):
 		"""
 		residual = hidden_states
 		hidden_states = self.pre_attn_norm(hidden_states)
-		hidden_states, attention_weights = self.attn(
+		attn_outputs = self.attn(
 			hidden_states,
 			frequencies,
 			attention_mask,
@@ -585,7 +591,7 @@ class Grok1DecoderLayer(nn.Module):
 			output_attentions,
 			fcm_mask,
 		)
-
+		hidden_states = attn_outputs.attention_output
 		hidden_states = self.post_attn_norm(hidden_states)
 		hidden_states = residual + hidden_states
 
@@ -595,12 +601,12 @@ class Grok1DecoderLayer(nn.Module):
 		hidden_states = self.post_moe_norm(hidden_states)
 		hidden_states = residual + hidden_states
 
-		outputs = (hidden_states,)
-		if output_attentions:
-			outputs += (attention_weights,)
-		if output_router_logits:
-			outputs += (router_logits,)
-		return outputs
+		return DecoderLayerOutput(
+			hidden_states=hidden_states,
+			attention_weight=attn_outputs.attention_weight,
+			router_logits=router_logits if output_router_logits else None,
+			cache_view=attn_outputs.cache_view,
+		)
 
 
 @register_module(
@@ -686,8 +692,7 @@ class Grok1Model(EasyDeLBaseModule):
 		output_router_logits: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> MoeModelOutput | tp.Tuple:
+	) -> MoeModelOutput:
 		"""Forward pass through the Grok1Model.
 
 		Args:
@@ -701,10 +706,10 @@ class Grok1Model(EasyDeLBaseModule):
 		    output_router_logits (bool, optional): Whether to return router logits from MoE layers.
 		    past_key_values (TransformerCache | PagedAttentionCache, optional): Cache containing precomputed key/value states.
 		    cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling.
-		    return_dict (bool, optional): Whether to return a model output object or a tuple.
+
 
 		Returns:
-		    MoeModelOutput | Tuple: Model outputs (last hidden state, optional hidden states, optional attentions, optional router logits)
+		    MoeModelOutput: Model outputs (last hidden state, optional hidden states, optional attentions, optional router logits)
 		"""
 		output_attentions = (
 			output_attentions
@@ -770,34 +775,27 @@ class Grok1Model(EasyDeLBaseModule):
 				segment_ids=segment_ids,
 			)
 
-			hidden_states = layer_outputs[0]
+			hidden_states = layer_outputs.hidden_states
 
 			if output_attentions:
-				all_self_attns += (layer_outputs[1],)
+				all_self_attns += (layer_outputs.attention_weight,)
 
 			if output_router_logits:
-				all_router_logits += (layer_outputs[-1],)
+				all_router_logits += (layer_outputs.router_logits,)
+
+			past_key_values[idx] = layer_outputs.cache_view
 
 		hidden_states = self.norm(hidden_states)
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-		if not return_dict:
-			return tuple(
-				v
-				for v in [
-					hidden_states,
-					all_hidden_states,
-					all_self_attns,
-					all_router_logits,
-				]
-				if v is not None
-			)
+
 		return MoeModelOutput(
 			last_hidden_state=hidden_states,
 			hidden_states=all_hidden_states,
 			attentions=all_self_attns,
 			router_logits=all_router_logits,
+			past_key_values=past_key_values,
 		)
 
 
@@ -870,7 +868,6 @@ class Grok1ForCausalLM(EasyDeLBaseModule):
 		output_router_logits: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
 	) -> MoeCausalLMOutput | tp.Tuple:
 		"""Forward pass through the Grok1ForCausalLM model.
 
@@ -885,10 +882,10 @@ class Grok1ForCausalLM(EasyDeLBaseModule):
 		    output_router_logits (bool, optional): Whether to return router logits from MoE layers.
 		    past_key_values (TransformerCache | PagedAttentionCache, optional): Cache containing precomputed key/value states.
 		    cache_metadata (TransformerMetadata | PagedAttentionMetadata, optional): Metadata for cache handling.
-		    return_dict (bool, optional): Whether to return a model output object or a tuple.
+
 
 		Returns:
-		    MoeCausalLMOutput | Tuple: Model outputs (logits, optional auxiliary loss, optional hidden states, optional attentions, optional router logits)
+		    MoeCausalLMOutput: Model outputs (logits, optional auxiliary loss, optional hidden states, optional attentions, optional router logits)
 		"""
 		if output_router_logits is None:
 			output_router_logits = self.config.output_router_logits
@@ -902,12 +899,10 @@ class Grok1ForCausalLM(EasyDeLBaseModule):
 			output_router_logits=output_router_logits,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
-			return_dict=True,
 			segment_ids=segment_ids,
 		)
 		logits = self.lm_head(outputs.last_hidden_state)
 		logits = logits * self.output_multiplier_scale
-		batch_size, seq_length, hd = logits.shape
 		aux_loss = None
 		if output_router_logits and outputs.router_logits is not None:
 			aux_loss = auxiliary_load_balancing_loss_func(
@@ -917,18 +912,6 @@ class Grok1ForCausalLM(EasyDeLBaseModule):
 				attention_mask=attention_mask,
 			)
 			aux_loss += aux_loss * self.config.router_aux_loss_coef
-		if not return_dict:
-			outputs = (logits,) + tuple(
-				v
-				for v in [
-					aux_loss,
-					outputs.hidden_states,
-					outputs.attentions,
-					outputs.router_logits,
-				]
-				if v is not None
-			)
-			return outputs
 
 		return MoeCausalLMOutput(
 			aux_loss=aux_loss,
@@ -936,4 +919,5 @@ class Grok1ForCausalLM(EasyDeLBaseModule):
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
 			router_logits=outputs.router_logits,
+			past_key_values=outputs.past_key_values,
 		)

@@ -24,8 +24,10 @@ from jax import image as jimg
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
 	BaseModelOutput,
 	BaseModelOutputWithPooling,
+	EncoderLayerOutput,
 	ImageClassifierOutput,
 	ModelOutput,
 )
@@ -320,7 +322,10 @@ class SiglipAttention(AttentionModule):
 		attn_output = self._merge_heads(attentions.attention_outputs)
 		attn_output = self.out_proj(attn_output)
 
-		return attn_output, attentions.attention_weights
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+		)
 
 
 class SiglipMLP(nn.Module):
@@ -423,7 +428,7 @@ class SiglipEncoderLayer(nn.Module):
 			attention_mask=attention_mask,
 			output_attentions=output_attentions,
 		)
-		hidden_states = attn_outputs[0]
+		hidden_states = attn_outputs.attention_output
 		hidden_states = residual + hidden_states
 
 		residual = hidden_states
@@ -431,9 +436,10 @@ class SiglipEncoderLayer(nn.Module):
 		hidden_states = self.mlp(hidden_states)
 		hidden_states = residual + hidden_states
 
-		outputs = (hidden_states,) + attn_outputs[1:]
-
-		return outputs
+		return EncoderLayerOutput(
+			hidden_states=hidden_states,
+			attention_weight=attn_outputs.attention_weight,
+		)
 
 
 class SiglipEncoder(nn.Module):
@@ -468,7 +474,6 @@ class SiglipEncoder(nn.Module):
 		attention_mask: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		hidden_states = inputs_embeds
 		all_attentions = () if output_attentions else None
@@ -483,18 +488,13 @@ class SiglipEncoder(nn.Module):
 				attention_mask=attention_mask,
 				output_attentions=output_attentions,
 			)
-			hidden_states = layer_outputs[0]
+			hidden_states = layer_outputs.hidden_states
 
 			if output_attentions:
-				all_attentions += (layer_outputs[1],)
+				all_attentions += (layer_outputs.attention_weight,)
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-
-		outputs = (hidden_states,)
-
-		if not return_dict:
-			return tuple(v for v in outputs if v is not None)
 
 		return BaseModelOutput(
 			last_hidden_state=hidden_states,
@@ -559,7 +559,6 @@ class SiglipTextTransformer(EasyDeLBaseModule):
 		position_ids: chex.Array,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		output_attentions = (
 			output_attentions
@@ -570,9 +569,6 @@ class SiglipTextTransformer(EasyDeLBaseModule):
 			output_hidden_states
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
-		)
-		return_dict = (
-			return_dict if return_dict is not None else self.config.use_return_dict
 		)
 		input_shape = input_ids.shape
 		input_ids = input_ids.reshape(-1, input_shape[-1])
@@ -586,16 +582,12 @@ class SiglipTextTransformer(EasyDeLBaseModule):
 			attention_mask=attention_mask,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
-		last_hidden_state = encoder_outputs[0]
+		last_hidden_state = encoder_outputs.last_hidden_state
 		last_hidden_state = self.final_layer_norm(last_hidden_state)
 		pooled_output = last_hidden_state[:, -1, :]
 		pooled_output = self.head(pooled_output)
-
-		if not return_dict:
-			return (last_hidden_state, pooled_output) + encoder_outputs[1:]
 
 		return BaseModelOutputWithPooling(
 			last_hidden_state=last_hidden_state,
@@ -642,7 +634,6 @@ class SiglipTextModel(EasyDeLBaseModule):
 		position_ids: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
 	) -> tp.Union[tp.Tuple, BaseModelOutputWithPooling]:
 		return self.text_model(
 			input_ids=input_ids,
@@ -650,9 +641,6 @@ class SiglipTextModel(EasyDeLBaseModule):
 			position_ids=position_ids,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict
-			if return_dict is not None
-			else self.config.use_return_dict,
 		)
 
 
@@ -713,7 +701,6 @@ class SiglipVisionTransformer(EasyDeLBaseModule):
 		pixel_values,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
 		interpolate_pos_encoding: tp.Optional[bool] = False,
 	) -> tp.Union[tp.Tuple, BaseModelOutputWithPooling]:
 		output_attentions = (
@@ -726,9 +713,6 @@ class SiglipVisionTransformer(EasyDeLBaseModule):
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
 		)
-		return_dict = (
-			return_dict if return_dict is not None else self.config.use_return_dict
-		)
 
 		hidden_states = self.embeddings(
 			pixel_values,
@@ -739,15 +723,11 @@ class SiglipVisionTransformer(EasyDeLBaseModule):
 			inputs_embeds=hidden_states,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
-		last_hidden_state = encoder_outputs[0]
+		last_hidden_state = encoder_outputs.last_hidden_state
 		last_hidden_state = self.post_layernorm(last_hidden_state)
 		pooler_output = self.head(last_hidden_state) if self.use_head else None
-
-		if not return_dict:
-			return (last_hidden_state, pooler_output) + encoder_outputs[1:]
 
 		return BaseModelOutputWithPooling(
 			last_hidden_state=last_hidden_state,
@@ -910,14 +890,12 @@ class SiglipVisionModel(nn.Module):
 		pixel_values,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
 		interpolate_pos_encoding: bool = False,
 	) -> tp.Union[tp.Tuple, BaseModelOutputWithPooling]:
 		return self.vision_model(
 			pixel_values=pixel_values,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 			interpolate_pos_encoding=interpolate_pos_encoding,
 		)
 
@@ -987,7 +965,6 @@ class SiglipModel(EasyDeLBaseModule):
 		position_ids: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
 	) -> chex.Array:
 		output_attentions = (
 			output_attentions
@@ -999,9 +976,6 @@ class SiglipModel(EasyDeLBaseModule):
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
 		)
-		return_dict = (
-			return_dict if return_dict is not None else self.config.use_return_dict
-		)
 
 		text_outputs = self.text_model(
 			input_ids=input_ids,
@@ -1009,7 +983,6 @@ class SiglipModel(EasyDeLBaseModule):
 			position_ids=position_ids,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
 		pooled_output = text_outputs[1]
@@ -1021,7 +994,6 @@ class SiglipModel(EasyDeLBaseModule):
 		pixel_values: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
 		interpolate_pos_encoding: bool = False,
 	) -> chex.Array:
 		output_attentions = (
@@ -1034,15 +1006,11 @@ class SiglipModel(EasyDeLBaseModule):
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
 		)
-		return_dict = (
-			return_dict if return_dict is not None else self.config.use_return_dict
-		)
 
 		vision_outputs = self.vision_model(
 			pixel_values=pixel_values,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 			interpolate_pos_encoding=interpolate_pos_encoding,
 		)
 
@@ -1059,7 +1027,6 @@ class SiglipModel(EasyDeLBaseModule):
 		return_loss: tp.Optional[bool] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
 		interpolate_pos_encoding: bool = False,
 	) -> tp.Union[tp.Tuple, SiglipOutput]:
 		output_attentions = (
@@ -1072,15 +1039,11 @@ class SiglipModel(EasyDeLBaseModule):
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
 		)
-		return_dict = (
-			return_dict if return_dict is not None else self.config.use_return_dict
-		)
 
 		vision_outputs = self.vision_model(
 			pixel_values=pixel_values,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 			interpolate_pos_encoding=interpolate_pos_encoding,
 		)
 
@@ -1090,7 +1053,6 @@ class SiglipModel(EasyDeLBaseModule):
 			position_ids=position_ids,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
 		image_embeds = vision_outputs[1]
@@ -1124,17 +1086,6 @@ class SiglipModel(EasyDeLBaseModule):
 			loglik = jax.nn.log_sigmoid(m1_diag1 * logits_per_text)
 			nll = -jnp.sum(loglik, axis=-1)
 			loss = nll.mean()
-
-		if not return_dict:
-			output = (
-				logits_per_image,
-				logits_per_text,
-				text_embeds,
-				image_embeds,
-				text_outputs,
-				vision_outputs,
-			)
-			return ((loss,) + output) if loss is not None else output
 
 		return SiglipOutput(
 			loss=loss,
@@ -1196,7 +1147,6 @@ class SiglipForImageClassification(EasyDeLBaseModule):
 		labels: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: tp.Optional[bool] = None,
 		interpolate_pos_encoding: bool = False,
 	) -> tp.Union[tuple, ImageClassifierOutput]:
 		output_attentions = (
@@ -1209,15 +1159,11 @@ class SiglipForImageClassification(EasyDeLBaseModule):
 			if output_hidden_states is not None
 			else self.config.output_hidden_states
 		)
-		return_dict = (
-			return_dict if return_dict is not None else self.config.use_return_dict
-		)
 
 		outputs = self.vision_model(
 			pixel_values,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 			interpolate_pos_encoding=interpolate_pos_encoding,
 		)
 
@@ -1226,10 +1172,6 @@ class SiglipForImageClassification(EasyDeLBaseModule):
 		logits = jnp.mean(sequence_output, axis=1)
 		if self.use_classif:
 			logits = self.classifier(logits)
-
-		if not return_dict:
-			output = (logits,) + outputs[2:]
-			return output
 
 		return ImageClassifierOutput(
 			logits=logits,

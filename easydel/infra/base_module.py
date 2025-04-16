@@ -1334,8 +1334,7 @@ class EasyDeLBaseModule(
 
 		assert labels is not None, "`labels` can not be `None` for computing loss."
 		loss_kwargs = loss_kwargs or {}
-		batch.pop("return_dict", None)
-		outputs = self(**batch, return_dict=True)
+		outputs = self(**batch)
 
 		loss_output: LossMetrics = self.loss_function(
 			labels=labels,

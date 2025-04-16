@@ -24,6 +24,7 @@ from flax import nnx as nn
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,DecoderLayerOutput,
 	BaseModelOutput,
 	CausalLMOutput,
 	SequenceClassifierOutput,
@@ -328,6 +329,7 @@ class Qwen2Attention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -358,12 +360,11 @@ class Qwen2Attention(AttentionModule):
 		attn_output = self.o_proj(attn_output)
 
 		attn_output = self.resid_dropout(attn_output)
-		outputs = (
-			(attn_output, attentions.attention_weights)
-			if output_attentions
-			else (attn_output,)
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=cache_view,
 		)
-		return outputs
 
 
 class Qwen2DecoderLayer(nn.Module):
@@ -489,8 +490,7 @@ class Qwen2DecoderLayer(nn.Module):
 			fcm_mask,
 			frequencies,
 		)
-		attn_output = attn_outputs[0]
-		hidden_states = hidden_states + attn_output
+		hidden_states = hidden_states + attn_outputs.attention_output
 
 		feed_forward_input = self.post_attention_layernorm(hidden_states)
 
@@ -511,7 +511,11 @@ class Qwen2DecoderLayer(nn.Module):
 			self.config.partition_axis,
 			sharding_strategy=HiddenStateSharding,
 		)
-		return (hidden_states,) + attn_outputs[1:]
+		return DecoderLayerOutput(
+			hidden_states=hidden_states,
+			attention_weight=attn_outputs.attention_weight,
+			cache_view=attn_outputs.cache_view,
+		)
 
 
 @register_module(
@@ -602,8 +606,7 @@ class Qwen2Model(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[BaseModelOutput, tp.Tuple]:
+	) -> BaseModelOutput:
 		"""Forward pass of the Qwen2Model.
 
 		Args:
@@ -620,12 +623,11 @@ class Qwen2Model(EasyDeLBaseModule):
 		        Defaults to `config.output_hidden_states`.
 		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for attention.
 		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
-		    return_dict (bool): Whether to return a `BaseModelOutput` object or a tuple.
 
 		Returns:
-		    tp.Union[BaseModelOutput, tp.Tuple]: The model's output. If `return_dict` is True,
+		    BaseModelOutput: The model's output.
 		        returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
+		        and `attentions` (optional).
 
 		Raises:
 		    ValueError: If neither `input_ids` nor `inputs_embeds` is provided.
@@ -678,21 +680,17 @@ class Qwen2Model(EasyDeLBaseModule):
 				segment_ids=segment_ids,
 				frequencies=self.frequencies,
 			)
-			hidden_states = layer_outputs[0]
+			hidden_states = layer_outputs.hidden_states
 
 			if output_attentions:
-				all_attentions += (layer_outputs[1],)
+				all_attentions += (layer_outputs.attention_weight,)
+
+			past_key_values[idx] = layer_outputs.cache_view
 
 		hidden_states = self.norm(hidden_states)
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-			outputs = (hidden_states, all_hidden_states, all_attentions, past_key_values)
-		else:
-			outputs = (hidden_states, all_attentions, past_key_values)
-
-		if not return_dict:
-			return tuple(v for v in outputs if v is not None)
 
 		return BaseModelOutput(
 			last_hidden_state=hidden_states,
@@ -781,8 +779,7 @@ class Qwen2ForCausalLM(EasyDeLBaseModule):
 		output_hidden_states: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
-	) -> tp.Union[CausalLMOutput, tp.Tuple]:
+	) -> CausalLMOutput:
 		"""Forward pass of the Qwen2ForCausalLM model.
 
 		Args:
@@ -799,12 +796,12 @@ class Qwen2ForCausalLM(EasyDeLBaseModule):
 		        Defaults to `config.output_hidden_states`.
 		    past_key_values (tp.Optional[TransformerCache | PagedAttentionCache]): Precomputed key/value states for attention.
 		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
-		    return_dict (bool): Whether to return a `CausalLMOutput` object or a tuple.
+
 
 		Returns:
-		    tp.Union[CausalLMOutput, tp.Tuple]: The model's output. If `return_dict` is True,
+		    CausalLMOutput: The model's output.
 		        returns a `CausalLMOutput` object containing `logits`, `hidden_states` (optional),
-		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
+		        and `attentions` (optional).
 		"""
 		outputs = self.model(
 			input_ids=input_ids,
@@ -814,12 +811,11 @@ class Qwen2ForCausalLM(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
-			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
 
-		hidden_states = outputs[0]
+		hidden_states = outputs.last_hidden_state
 
 		hidden_states = control_runtime_sharding(
 			hidden_states,
@@ -835,9 +831,6 @@ class Qwen2ForCausalLM(EasyDeLBaseModule):
 			)
 		else:
 			lm_logits = self.lm_head(hidden_states)
-
-		if not return_dict:
-			return (lm_logits,) + outputs[1:]
 
 		return CausalLMOutput(
 			logits=lm_logits,
@@ -930,8 +923,7 @@ class Qwen2ForSequenceClassification(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
-		return_dict: bool = True,
-	) -> tp.Union[SequenceClassifierOutput, tp.Tuple]:
+	) -> SequenceClassifierOutput:
 		"""Forward pass of the Qwen2ForSequenceClassification model.
 
 		Args:
@@ -948,12 +940,12 @@ class Qwen2ForSequenceClassification(EasyDeLBaseModule):
 		    output_attentions (tp.Optional[bool]): Whether to return attention weights. Defaults to `config.output_attentions`.
 		    output_hidden_states (tp.Optional[bool]): Whether to return hidden states for all layers.
 		        Defaults to `config.output_hidden_states`.
-		    return_dict (bool): Whether to return a `SequenceClassifierOutput` object or a tuple.
+
 
 		Returns:
-		    tp.Union[SequenceClassifierOutput, tp.Tuple]: The model's output. If `return_dict` is True,
+		    SequenceClassifierOutput: The model's output,
 		        returns a `SequenceClassifierOutput` object containing `logits`, `hidden_states` (optional),
-		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
+		        and `attentions` (optional).
 
 		Raises:
 		    ValueError: If `config.pad_token_id` is None and `batch_size > 1`.
@@ -966,12 +958,11 @@ class Qwen2ForSequenceClassification(EasyDeLBaseModule):
 			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 		)
 
-		hidden_states = transformer_outputs[0]
+		hidden_states = transformer_outputs.last_hidden_state
 		logits = self.score(hidden_states)
 		if input_ids is not None:
 			batch_size = input_ids.shape[0]
@@ -993,10 +984,6 @@ class Qwen2ForSequenceClassification(EasyDeLBaseModule):
 				sequence_lengths = -1
 
 		pooled_logits = logits[jnp.arange(batch_size), sequence_lengths]
-
-		if not return_dict:
-			output = (pooled_logits,) + transformer_outputs[1:]
-			return output
 
 		return SequenceClassifierOutput(
 			logits=pooled_logits,

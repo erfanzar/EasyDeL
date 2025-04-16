@@ -105,10 +105,9 @@ def prefill_fn(
 
 	if state.running_token.shape[-1] > 1:
 		runner = create_sampling_step(
+			sampling_params=sampling_params,
 			eos_token_id=jnp.array(generation_config.eos_token_id, dtype=jnp.int32),
 			pad_token_id=jnp.array(generation_config.pad_token_id, dtype=jnp.int32),
-			logits_processor=sampling_params.get_logits_processor(),
-			logits_warper=sampling_params.get_logits_warper(),
 		)
 		runner = implicit(runner)
 		state = runner(
@@ -146,19 +145,12 @@ def decode_fn(
 		"""state termination condition fn."""
 		all_sequence_finished = jnp.all(state.is_sequence_finished)
 		streaming_loop_exit = state.current_length >= tlen
-		n_reached = state.generated_tokens >= (
-			sampling_params.max_tokens * state.sequences.shape[0]
-		)
-
-		endit = jax.lax.cond(n_reached, lambda x: True, lambda x: x, streaming_loop_exit)
-
-		return ~jnp.logical_or(all_sequence_finished, endit)
+		return ~jnp.logical_or(all_sequence_finished, streaming_loop_exit)
 
 	sampling_step = create_sampling_step(
+		sampling_params=sampling_params,
 		eos_token_id=jnp.array(generation_config.eos_token_id, dtype=jnp.int32),
 		pad_token_id=jnp.array(generation_config.pad_token_id, dtype=jnp.int32),
-		logits_processor=sampling_params.get_logits_processor(),
-		logits_warper=sampling_params.get_logits_warper(),
 	)
 
 	sampling_step = implicit(sampling_step)

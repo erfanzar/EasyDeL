@@ -630,7 +630,7 @@ class AttentionModule(nn.Module):
 				attention_mask = jnp.repeat(attention_mask, query.shape[1], -2)
 		else:
 			if isinstance(cache_view, TransformerCacheView):
-				key, value, attention_mask = cache_view.concatenate_to_cache(
+				key, value, attention_mask, cache_view = cache_view.concatenate_to_cache(
 					query=query,
 					key=key,
 					value=value,
@@ -666,7 +666,7 @@ class AttentionModule(nn.Module):
 				jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
 			)
 
-		return key, value, attention_mask, init_attention_bias
+		return key, value, attention_mask, init_attention_bias, cache_view
 
 	def shard_attention_prod(self, attn_output: jax.Array) -> jax.Array:
 		"""

@@ -40,6 +40,7 @@ from .api_models import (
 	CompletionResponse,
 	CompletionResponseChoice,
 	CompletionStreamResponse,
+	CompletionStreamResponseChoice,
 	CountTokenRequest,
 	DeltaMessage,
 	UsageInfo,
@@ -86,6 +87,7 @@ class vInferenceApiServer:
 		inference_map: tp.Union[tp.Dict[str, vInference], vInference] = None,
 		inference_init_call: tp.Optional[tp.Callable[[], vInference]] = None,
 		max_workers: int = 10,
+		allow_parallel_workload: bool = False,
 	) -> None:
 		"""
 		Initializes the vInferenceApiServer.
@@ -131,6 +133,7 @@ class vInferenceApiServer:
 
 		self.thread_pool = ThreadPoolExecutor(max_workers=max_workers)
 		self.logger = logger
+		self.allow_parallel_workload = allow_parallel_workload
 		self._register_endpoints()
 
 	@property
@@ -414,22 +417,13 @@ class vInferenceApiServer:
 		self,
 		request: ChatCompletionRequest,
 		inference: vInference,
-		ids: dict,
+		ids: tp.Dict,
 	) -> StreamingResponse:
-		"""
-		Generates a streaming chat response using Server-Sent Events.
+		"""Handle streaming response generation asynchronously."""
 
-		Args:
-		    request (ChatCompletionRequest): The original request.
-		    inference (vInference): The vInference instance.
-		    ids (dict): The tokenized input dictionary.
+		async def stream_results() -> tp.AsyncGenerator[bytes, tp.Any]:
+			prompt_tokens = inference.count_tokens(request.model_dump()["messages"])
 
-		Returns:
-		    StreamingResponse: A response that streams chunks of the generated text.
-		"""
-
-		async def stream_results() -> tp.AsyncGenerator[bytes, None]:
-			"""Asynchronous generator for streaming results."""
 			prompt_tokens = ids["input_ids"].shape[-1]
 			sampling_params = self._create_sampling_params_from_request(request)
 
@@ -437,120 +431,59 @@ class vInferenceApiServer:
 				"""The actual blocking generation call."""
 				yield from inference.generate(**ids, sampling_params=sampling_params)
 
-			# Run the blocking generator in the thread pool
-			generator = await asyncio.get_event_loop().run_in_executor(
-				self.thread_pool,
-				_blocking_generator,
-			)
+			async def _generate():
+				return await asyncio.get_event_loop().run_in_executor(
+					self.thread_pool,
+					_blocking_generator,
+				)
 
+			padded_sequence_length = None
 			current_token_index = 0
 			last_response_state = None
 
-			# For handling function calls during streaming
-			function_call_detected = False
-			function_call_chunks = []
-			function_call_result = None
-
 			try:
-				async for response_state in self._aiter_sync_generator(generator):
-					last_response_state = response_state
-					new_sequences = response_state.sequences
-					padded_length = response_state.padded_length
-					generated_tokens_so_far = response_state.generated_tokens
-					stream_chunk_size = inference.generation_config.streaming_chunks
-
-					# Determine the slice for the new tokens in this chunk
-					start_slice = padded_length + current_token_index * stream_chunk_size
-					end_slice = min(start_slice + stream_chunk_size, new_sequences.shape[-1])
-					token_slice = new_sequences[..., start_slice:end_slice]
-
-					if token_slice.shape[-1] == 0:
-						continue
+				async for response_state in self._aiter_generator(await _generate()):
+					if padded_sequence_length is None:
+						padded_sequence_length = response_state.padded_length
+					next_slice = slice(
+						padded_sequence_length,
+						padded_sequence_length + inference.generation_config.streaming_chunks,
+					)
+					padded_sequence_length += inference.generation_config.streaming_chunks
 
 					decoded_responses = await asyncio.get_event_loop().run_in_executor(
 						self.thread_pool,
 						inference.tokenizer.batch_decode,
-						token_slice,
+						response_state.sequences[..., next_slice],
 						True,  # skip_special_tokens
 					)
 
-					# Check for potential function call content
-					if hasattr(request, "functions") and request.functions:
-						# If we detect curly braces, we might be in a function call
-						for decoded_response in decoded_responses:
-							if "{" in decoded_response:
-								function_call_detected = True
-
-							if function_call_detected:
-								function_call_chunks.append(decoded_response)
-
-								# Try to parse if we have both opening and closing braces
-								if "{" in "".join(function_call_chunks) and "}" in "".join(
-									function_call_chunks
-								):
-									from json import JSONDecodeError, loads
-
-									try:
-										full_text = "".join(function_call_chunks)
-										json_start = full_text.find("{")
-										json_end = full_text.rfind("}") + 1
-										possible_json = full_text[json_start:json_end]
-
-										parsed = loads(possible_json)
-										if "name" in parsed and (
-											"arguments" in parsed or "params" in parsed
-										):
-											function_call_result = {
-												"name": parsed.get("name"),
-												"arguments": parsed.get(
-													"arguments", parsed.get("params", "{}")
-												),
-											}
-									except JSONDecodeError:
-										# Not complete JSON yet, continue collecting
-										pass
-
-					# Estimate usage info for the chunk (often approximate until the end)
 					chunk_usage = await self._create_usage_info_async(
 						prompt_tokens=prompt_tokens,
-						completion_tokens=generated_tokens_so_far,
-						total_tokens=prompt_tokens + generated_tokens_so_far,
+						completion_tokens=response_state.generated_tokens,
+						total_tokens=prompt_tokens + response_state.generated_tokens,
 						time_spent_computing=response_state._time_spent_computing,
 						tokens_per_second=response_state.tokens_per_second,
 					)
-
-					# If we're in function call mode and have detected a complete function call,
-					# we should send the function call content in the delta
-					delta_content = None if function_call_result else decoded_responses[0]
-					delta_function_call = function_call_result
 
 					stream_resp = ChatCompletionStreamResponse(
 						model=request.model,
 						choices=[
 							ChatCompletionStreamResponseChoice(
-								index=i,
+								index=current_token_index,
 								delta=DeltaMessage(
 									role="assistant" if current_token_index == 0 else None,
-									content=delta_content,
-									function_call=delta_function_call
-									if current_token_index == 0
-									else None,
+									content=decoded_response,
+									function_call=None,
 								),
-								finish_reason="function_call" if function_call_result else None,
+								finish_reason=None,
 							)
-							for i, decoded_response in enumerate(decoded_responses)
+							for _, decoded_response in enumerate(decoded_responses)
 						],
 						usage=chunk_usage,
 					)
-
+					last_response_state = response_state
 					current_token_index += 1
-
-					# If we've detected a complete function call, stop streaming content
-					if function_call_result:
-						yield (
-							"data: " + stream_resp.model_dump_json(exclude_unset=True) + "\n\n"
-						).encode("utf-8")
-						break
 
 					yield (
 						"data: " + stream_resp.model_dump_json(exclude_unset=True) + "\n\n"
@@ -562,9 +495,8 @@ class vInferenceApiServer:
 					f"data: {create_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, str(e)).body.decode()}"  # type: ignore
 					+ "\n\n"
 				).encode("utf-8")
-				return  # Stop generation on error
+				return
 
-			# Final response chunk with finish reason
 			if last_response_state is not None:
 				finish_reason = (
 					"length"
@@ -572,10 +504,6 @@ class vInferenceApiServer:
 					>= inference.generation_config.max_new_tokens
 					else "stop"
 				)
-
-				# For function calls, use the function_call finish reason
-				if function_call_result:
-					finish_reason = "function_call"
 
 				final_usage = await self._create_usage_info_async(
 					prompt_tokens=prompt_tokens,
@@ -588,13 +516,11 @@ class vInferenceApiServer:
 					model=request.model,
 					choices=[
 						ChatCompletionStreamResponseChoice(
-							index=i,
+							index=current_token_index,
 							delta=DeltaMessage(),  # Empty delta for final chunk
 							finish_reason=finish_reason,
 						)
-						for i in range(
-							last_response_state.sequences.shape[0]
-						)  # Match number of choices
+						for _ in decoded_responses
 					],
 					usage=final_usage,
 				)
@@ -604,24 +530,15 @@ class vInferenceApiServer:
 			else:
 				self.logger.warning("Streaming finished without producing any response state.")
 
-			yield ("data: [DONE]\n\n").encode("utf-8")
-
 		return StreamingResponse(stream_results(), media_type="text/event-stream")
 
-	async def _aiter_sync_generator(self, generator: tp.Generator) -> tp.AsyncGenerator:
-		"""Converts a synchronous generator to an asynchronous one using the thread pool."""
-		while True:
-			try:
-				# Get the next item from the generator in the thread pool
-				item = await asyncio.get_event_loop().run_in_executor(
-					self.thread_pool, next, generator
-				)
-				yield item
-			except StopIteration:
-				break
-			except Exception as e:
-				self.logger.exception(f"Exception in synchronous generator: {e}")
-				raise  # Re-raise the exception in the async context
+	async def _aiter_generator(self, generator):
+		"""Convert a regular generator to an async generator."""
+		for item in generator:
+			yield item
+			if self.allow_parallel_workload:
+				# give other threads a chance to work
+				await asyncio.sleep(0)
 
 	async def _create_usage_info_async(
 		self,
@@ -798,16 +715,17 @@ class vInferenceApiServer:
 			def _blocking_generator():
 				yield from inference.generate(**inputs, sampling_params=sampling_params)
 
-			generator = await asyncio.get_event_loop().run_in_executor(
-				self.thread_pool,
-				_blocking_generator,
-			)
+			async def _generate():
+				return await asyncio.get_event_loop().run_in_executor(
+					self.thread_pool,
+					_blocking_generator,
+				)
 
 			current_token_index = 0
 			last_response_state = None
 
 			try:
-				async for response_state in self._aiter_sync_generator(generator):
+				async for response_state in self._aiter_generator(await _generate()):
 					last_response_state = response_state
 					new_sequences = response_state.sequences
 					padded_length = response_state.padded_length
@@ -840,7 +758,7 @@ class vInferenceApiServer:
 					stream_resp = CompletionStreamResponse(
 						model=request.model,
 						choices=[
-							CompletionResponseChoice(
+							CompletionStreamResponseChoice(
 								text=decoded_response,
 								index=i,
 								finish_reason=None,
@@ -880,7 +798,7 @@ class vInferenceApiServer:
 				final_resp = CompletionStreamResponse(
 					model=request.model,
 					choices=[
-						CompletionResponseChoice(
+						CompletionStreamResponseChoice(
 							text="",  # Empty text for final chunk
 							index=i,
 							finish_reason=finish_reason,

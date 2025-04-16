@@ -386,6 +386,7 @@ class MiniMaxText01Attention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -415,7 +416,11 @@ class MiniMaxText01Attention(AttentionModule):
 				attn_output=self._merge_heads(attentions.attention_outputs)
 			)
 		)
-		return attn_output, attentions.attention_weights
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=cache_view,
+		)
 
 
 class MiniMaxText01MLP(nn.Module):
@@ -869,8 +874,7 @@ class MiniMaxText01Model(EasyDeLBaseModule):
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		output_router_logits: tp.Optional[bool] = None,
-		return_dict: bool = True,
-	) -> tp.Union[MoeModelOutput, tp.Tuple]:
+	) -> MoeModelOutput:
 		if (input_ids is None) ^ (inputs_embeds is not None):
 			raise ValueError(
 				"You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
@@ -924,10 +928,12 @@ class MiniMaxText01Model(EasyDeLBaseModule):
 				frequencies=self.frequencies,
 				slope_rate=sr[idx] * (1 - idx / (len(self.layers) - 1) + 1e-5),
 			)
-			hidden_states = layer_outputs[0]
+			hidden_states = layer_outputs.hidden_states
 
 			if output_attentions:
-				all_attentions += (layer_outputs[1],)
+				all_attentions += (layer_outputs.attention_weight,)
+
+			past_key_values[idx] = layer_outputs.cache_view
 			if output_router_logits:
 				all_router_logits += (layer_outputs[2],)
 
@@ -935,16 +941,6 @@ class MiniMaxText01Model(EasyDeLBaseModule):
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
-		outputs = (
-			hidden_states,
-			all_hidden_states,
-			all_attentions,
-			all_router_logits,
-			past_key_values,
-		)
-
-		if not return_dict:
-			return tuple(v for v in outputs if v is not None)
 
 		return MoeModelOutput(
 			last_hidden_state=hidden_states,
@@ -1008,7 +1004,6 @@ class MiniMaxText01ForCausalLM(EasyDeLBaseModule):
 		output_router_logits: tp.Optional[bool] = None,
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
-		return_dict: bool = True,
 	) -> MoeCausalLMOutput | tp.Tuple:
 		if output_router_logits is None:
 			output_router_logits = self.config.output_router_logits
@@ -1022,11 +1017,9 @@ class MiniMaxText01ForCausalLM(EasyDeLBaseModule):
 			output_router_logits=output_router_logits,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
-			return_dict=True,
 			segment_ids=segment_ids,
 		)
 		logits = self.lm_head(outputs.last_hidden_state)
-		batch_size, seq_length, hd = logits.shape
 		aux_loss = None
 		if output_router_logits and outputs.router_logits is not None:
 			aux_loss = auxiliary_load_balancing_loss_func(
@@ -1036,18 +1029,6 @@ class MiniMaxText01ForCausalLM(EasyDeLBaseModule):
 				attention_mask=attention_mask,
 			)
 			aux_loss += aux_loss * self.config.router_aux_loss_coef
-		if not return_dict:
-			outputs = (logits,) + tuple(
-				v
-				for v in [
-					aux_loss,
-					outputs.hidden_states,
-					outputs.attentions,
-					outputs.router_logits,
-				]
-				if v is not None
-			)
-			return outputs
 
 		return MoeCausalLMOutput(
 			aux_loss=aux_loss,
@@ -1055,4 +1036,5 @@ class MiniMaxText01ForCausalLM(EasyDeLBaseModule):
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
 			router_logits=outputs.router_logits,
+			past_key_values=outputs.past_key_values,
 		)

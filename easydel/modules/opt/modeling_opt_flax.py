@@ -41,7 +41,11 @@ from jax import lax
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput, MaskedLMOutput
+from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
+	BaseModelOutput,
+	MaskedLMOutput,
+)
 from easydel.infra.utils import ACT2FN, HiddenStateSharding, control_runtime_sharding
 from easydel.layers.attention import AttentionModule
 from easydel.layers.caching import (
@@ -233,6 +237,7 @@ class OPTAttention(AttentionModule):
 			value_states,
 			attention_mask,
 			init_attention_bias,
+			cache_view,
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
@@ -261,7 +266,11 @@ class OPTAttention(AttentionModule):
 		)
 		attn_output = self.out_proj(attn_output)
 
-		return attn_output, attentions.attention_weights
+		return AttentionLayerOutput(
+			attention_output=attn_output,
+			attention_weight=attentions.attention_weights if output_attentions else None,
+			cache_view=cache_view,
+		)
 
 
 class OPTDecoderLayer(nn.Module):
@@ -603,7 +612,6 @@ class OPTDecoder(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		"""Forward pass of the OPTDecoder.
 
@@ -617,12 +625,11 @@ class OPTDecoder(EasyDeLBaseModule):
 		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
 		    output_attentions (bool): Whether to return attention weights. Defaults to False.
 		    output_hidden_states (bool): Whether to return hidden states for all layers. Defaults to False.
-		    return_dict (bool): Whether to return a `BaseModelOutput` object or a tuple. Defaults to True.
 
 		Returns:
-		    tp.Union[BaseModelOutput, tp.Tuple]: The decoder's output. If `return_dict` is True,
+		    BaseModelOutput: The decoder's output.
 		        returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
+		        and `attentions` (optional).
 		"""
 		input_shape = input_ids.shape
 		input_ids = input_ids.reshape(-1, input_shape[-1])
@@ -684,11 +691,6 @@ class OPTDecoder(EasyDeLBaseModule):
 		if output_hidden_states:
 			all_hidden_states += (hidden_state,)
 
-		outputs = [hidden_state, all_hidden_states, all_self_attns]
-
-		if not return_dict:
-			return tuple(v for v in outputs if v is not None)
-
 		return BaseModelOutput(
 			last_hidden_state=hidden_state,
 			hidden_states=all_hidden_states,
@@ -747,7 +749,6 @@ class OPTModel(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		"""Forward pass of the OPTModel.
 
@@ -761,12 +762,11 @@ class OPTModel(EasyDeLBaseModule):
 		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
 		    output_attentions (bool): Whether to return attention weights. Defaults to False.
 		    output_hidden_states (bool): Whether to return hidden states for all layers. Defaults to False.
-		    return_dict (bool): Whether to return a `BaseModelOutput` object or a tuple. Defaults to True.
 
 		Returns:
-		    tp.Union[BaseModelOutput, tp.Tuple]: The model's output. If `return_dict` is True,
+		    BaseModelOutput: The model's output.
 		        returns a `BaseModelOutput` object containing `last_hidden_state`, `hidden_states` (optional),
-		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
+		        and `attentions` (optional).
 		"""
 		decoder_outputs = self.decoder(
 			input_ids=input_ids,
@@ -774,13 +774,9 @@ class OPTModel(EasyDeLBaseModule):
 			position_ids=position_ids,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
 		)
-
-		if not return_dict:
-			return decoder_outputs
 
 		return BaseModelOutput(
 			last_hidden_state=decoder_outputs.last_hidden_state,
@@ -862,7 +858,6 @@ class OPTForCausalLM(EasyDeLBaseModule):
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
 		output_hidden_states: bool = False,
-		return_dict: bool = True,
 	):
 		"""Forward pass of the OPTForCausalLM model.
 
@@ -876,12 +871,12 @@ class OPTForCausalLM(EasyDeLBaseModule):
 		    cache_metadata (tp.Optional[TransformerMetadata | PagedAttentionMetadata]): Metadata for paged attention.
 		    output_attentions (bool): Whether to return attention weights. Defaults to False.
 		    output_hidden_states (bool): Whether to return hidden states for all layers. Defaults to False.
-		    return_dict (bool): Whether to return a `CausalLMOutput` object or a tuple. Defaults to True.
+		     Defaults to True.
 
 		Returns:
-		    tp.Union[MaskedLMOutput, tp.Tuple]: The model's output. If `return_dict` is True,
+		    tp.Union[MaskedLMOutput, tp.Tuple]: The model's output.
 		        returns a `MaskedLMOutput` object containing `logits`, `hidden_states` (optional),
-		        and `attentions` (optional). Otherwise, returns a tuple with these elements.
+		        and `attentions` (optional).
 		"""
 		outputs = self.model(
 			input_ids=input_ids,
@@ -891,10 +886,9 @@ class OPTForCausalLM(EasyDeLBaseModule):
 			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
-			return_dict=return_dict,
 		)
 
-		hidden_states = outputs[0]
+		hidden_states = outputs.last_hidden_state
 
 		hidden_states = control_runtime_sharding(
 			hidden_states,
@@ -909,9 +903,6 @@ class OPTForCausalLM(EasyDeLBaseModule):
 
 		else:
 			lm_logits = self.lm_head(hidden_states)
-
-		if not return_dict:
-			return (lm_logits,) + outputs[1:]
 
 		return MaskedLMOutput(
 			logits=lm_logits,

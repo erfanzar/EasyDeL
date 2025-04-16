@@ -142,7 +142,7 @@ class TransformerCacheMetaData(BaseCacheMetadata):
 		)
 
 
-@auto_pytree
+@auto_pytree(frozen=False)
 class TransformerCacheView(BaseCacheView):
 	key: tp.Union[cx.Array, ImplicitArray]
 	value: tp.Union[cx.Array, ImplicitArray]
@@ -292,14 +292,20 @@ class TransformerCacheView(BaseCacheView):
 			jnp.arange(max_length) < index[0],
 			tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
 		)
-		attention_mask = jnp.logical_and(pad_mask, attention_mask)
 
-		self.key = quantizer(key_cache_updated)
-		self.value = quantizer(value_cache_updated)
-		self.index = with_sharding_constraint(index, batch_sharding)
-		attention_mask = with_sharding_constraint(attention_mask, batch_sharding)
-
-		return key_cache_updated, value_cache_updated, attention_mask
+		return (
+			key_cache_updated,
+			value_cache_updated,
+			with_sharding_constraint(
+				jnp.logical_and(pad_mask, attention_mask),
+				batch_sharding,
+			),
+			self.replace(
+				key=quantizer(key_cache_updated),
+				value=quantizer(value_cache_updated),
+				index=with_sharding_constraint(index, batch_sharding),
+			),
+		)
 
 	@staticmethod
 	def _update_cache_logic(
@@ -430,6 +436,10 @@ class TransformerCacheView(BaseCacheView):
 				self.__class__.__name__
 				+ f"(key={self.key}, value={self.value}, layer_index={self.layer_index})"
 			)
+
+	@property
+	def is_empty(self):
+		return self.key is None
 
 	__str__ = __repr__
 
