@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import contextlib
 import os
 import pathlib
 import pickle
@@ -27,18 +28,31 @@ from flax import struct
 from jax.sharding import NamedSharding, PartitionSpec
 from safetensors.flax import load_file as safe_load_file
 from safetensors.flax import save_file as safe_save_file
-
+from eformer.escale import PartitionAxis
+from easydel.infra.factory import TaskType
 from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import specs_to_name_sharding
 
 if tp.TYPE_CHECKING:
 	from jax.sharding import Mesh
 
+	from easydel.infra.base_config import EasyDeLBaseConfigDict
+	from easydel.infra.etils import (
+		EasyDeLBackends,
+		EasyDeLPlatforms,
+		EasyDeLQuantizationMethods,
+	)
 	from .base_module import EasyDeLBaseModule, PartitionLike
 else:
-	EasyDeLBaseModule = tp.Any
-	PartitionLike = tp.Any
-	Mesh = tp.Any
+	(
+		EasyDeLBaseModule,
+		PartitionLike,
+		Mesh,
+		EasyDeLBackends,
+		EasyDeLPlatforms,
+		EasyDeLQuantizationMethods,
+		EasyDeLBaseConfigDict,
+	) = [tp.Any] * 7
 
 WEIGHTS_NAME = "easydel-model.parameters"
 OPTIMIZER_NAME = "easydel-optstate.parameters"
@@ -401,7 +415,10 @@ class EasyDeLState(struct.PyTreeNode):
 		try:
 			# All processes load simultaneously
 			with open(struct_path, "rb") as f:
-				tdef = pickle.load(f)
+				try:
+					tdef, step = pickle.load(f)
+				except TypeError:  # in case that someone loading old version ...
+					tdef, step = pickle.load(f), 0
 
 			tensors = safe_load_file(str(optim_path))
 			ordered_params = [tensors[f"param_{i}"] for i in range(len(tensors))]
@@ -410,7 +427,7 @@ class EasyDeLState(struct.PyTreeNode):
 			opt_state = jax.tree_util.tree_unflatten(tdef, sharded_params)
 
 			logger.info(f"Optimizer state loaded from {load_directory}")
-			self = self.replace(opt_state=opt_state)
+			self = self.replace(opt_state=opt_state, step=step)
 			return self
 		except Exception as e:
 			logger.error(f"Optimizer load failed: {str(e)}")
@@ -459,7 +476,7 @@ class EasyDeLState(struct.PyTreeNode):
 			logger.info(f"Coordinated optimizer save through {optim_path}")
 
 			try:
-				tdef = jax.tree_util.tree_structure(self.opt_state)
+				tdef = jax.tree_util.tree_structure(self.opt_state), self.step
 				with open(struct_path, "wb") as f:
 					pickle.dump(tdef, f)
 
@@ -491,11 +508,155 @@ class EasyDeLState(struct.PyTreeNode):
 			enable=enable,
 		)
 
+	@classmethod
 	def load_state(
-		self,
+		cls,
 		load_directory: tp.Union[str, os.PathLike],
+		device: tp.Optional[jax.Device] = "cpu",
+		dtype: jax.numpy.dtype = jax.numpy.float32,
+		param_dtype: jax.numpy.dtype = jax.numpy.float32,
+		precision: tp.Optional[jax.lax.Precision] = None,
+		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
+		sharding_dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
+		sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+		partition_axis: tp.Optional[PartitionAxis] = None,
+		shard_attention_computation: bool = True,
+		shard_fns: tp.Optional[tp.Mapping[tuple, tp.Callable] | dict] = None,
+		backend: tp.Optional[EasyDeLBackends] = None,
+		platform: tp.Optional[EasyDeLPlatforms] = None,
+		config_kwargs: tp.Optional[EasyDeLBaseConfigDict] = None,
+		model_task: TaskType = TaskType.AUTO_BIND,
+		auto_shard_model: bool = False,
+		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]] = None,
+		quantization_platform: tp.Optional[EasyDeLPlatforms] = None,
+		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
+		quantization_block_size: int = 128,
+		quantization_pattern: tp.Optional[str] = None,
+		quantize_tensors: bool = True,
 		verbose: bool = True,
-	): ...
+		**kwargs,
+	):
+		"""Loads an EasyDeLState from a saved checkpoint directory.
+
+		This class method reconstructs the model configuration, loads the model
+		parameters, and optionally loads the optimizer state from files saved
+		previously using `save_state`. It handles various configurations for
+		device placement, data types, sharding, and quantization.
+
+		Args:
+				load_directory: Path to the directory containing the saved state
+						(configuration, model weights, and potentially optimizer state).
+				device: The JAX device (e.g., 'cpu', 'gpu', 'tpu') to load the model
+						onto. Defaults to 'cpu'.
+				dtype: The data type to use for computation (e.g., jax.numpy.float32).
+						Defaults to jax.numpy.float32.
+				param_dtype: The data type for the model parameters (e.g.,
+						jax.numpy.bfloat16). Defaults to jax.numpy.float32.
+				precision: The JAX precision level (e.g., jax.lax.Precision.HIGHEST).
+						Defaults to None.
+				sharding_axis_dims: A sequence defining the dimensions of the device
+						mesh for sharding (e.g., (1, -1, 1, 1)). Defaults to (1, -1, 1, 1).
+				sharding_dcn_axis_dims: Optional sequence for data-centric sharding
+						dimensions. Defaults to None.
+				sharding_axis_names: Names corresponding to the sharding axes (e.g.,
+						("dp", "fsdp", "tp", "sp")). Defaults to ("dp", "fsdp", "tp", "sp").
+				partition_axis: Configuration object for partitioning specific axes.
+						Defaults to None.
+				shard_attention_computation: If True, shards the attention computation
+						across devices. Defaults to True.
+				shard_fns: Optional mapping of parameter path tuples to custom sharding
+						functions. Defaults to None.
+				backend: The backend framework to use (e.g., EasyDeLBackends.JAX).
+						Defaults to None (auto-detected).
+				platform: The hardware platform (e.g., EasyDeLPlatforms.TPU).
+						Defaults to None (auto-detected).
+				config_kwargs: Optional dictionary of keyword arguments to override
+						in the loaded model configuration. Defaults to None.
+				model_task: The specific task type for the model (e.g., TaskType.CAUSAL_LM).
+						Defaults to TaskType.AUTO_BIND.
+				auto_shard_model: If True, automatically shards the loaded model and
+						optimizer state based on the provided sharding configuration.
+						Defaults to False.
+				partition_rules: Optional tuple of partition rules (regex, PartitionSpec)
+						to explicitly define sharding. Defaults to None (uses model config).
+				quantization_platform: Platform for quantization (e.g., EasyDeLPlatforms.TPU).
+						Defaults to None.
+				quantization_method: Quantization method (e.g., EasyDeLQuantizationMethods.AQT).
+						Defaults to None.
+				quantization_block_size: Block size for quantization methods like GPTQ.
+						Defaults to 128.
+				quantization_pattern: Regex pattern to match tensor names for quantization.
+						Defaults to None.
+				quantize_tensors: If True, applies quantization to the loaded tensors.
+						Defaults to True.
+				verbose: If True, logs detailed information during loading. Defaults to True.
+				**kwargs: Additional keyword arguments passed directly to the underlying
+						`EasyDeLBaseModule.from_pretrained` method.
+
+		Returns:
+				An EasyDeLState instance containing the loaded model, optimizer state
+				(if found and loaded), and associated configuration.
+
+		Raises:
+				FileNotFoundError: If the `load_directory` or essential files within it
+						(like configuration or model weights) are not found.
+				ValueError: If there are inconsistencies in the provided arguments or
+						loaded configuration.
+				# Note: Other exceptions from underlying calls like AutoEasyDeLConfig
+				# or EasyDeLBaseModule.from_pretrained might also be raised.
+		"""
+		from easydel.modules.auto.auto_configuration import AutoEasyDeLConfig
+		from .base_module import EasyDeLBaseModule
+
+		config = AutoEasyDeLConfig.from_pretrained(
+			load_directory,
+			sharding_axis_dims=sharding_axis_dims,
+			sharding_dcn_axis_dims=sharding_dcn_axis_dims,
+			sharding_axis_names=sharding_axis_names,
+			partition_axis=partition_axis,
+			from_torch=False,
+			backend=backend,
+			platform=platform,
+			model_task=model_task,
+		)
+		model_task = AutoEasyDeLConfig.bind_model_task(model_task, config.architectures)
+
+		class _BaseModuleLoader(EasyDeLBaseModule):
+			_model_task = model_task
+
+		model = _BaseModuleLoader.from_pretrained(
+			pretrained_model_name_or_path=load_directory,
+			device=device,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			sharding_axis_dims=sharding_axis_dims,
+			sharding_dcn_axis_dims=sharding_dcn_axis_dims,
+			sharding_axis_names=sharding_axis_names,
+			partition_axis=partition_axis,
+			shard_attention_computation=shard_attention_computation,
+			shard_fns=shard_fns,
+			backend=backend,
+			platform=platform,
+			config_kwargs=config_kwargs,
+			auto_shard_model=auto_shard_model,
+			partition_rules=partition_rules,
+			quantization_platform=quantization_platform,
+			quantization_method=quantization_method,
+			quantization_block_size=quantization_block_size,
+			quantization_pattern=quantization_pattern,
+			quantize_tensors=quantize_tensors,
+			verbose=verbose,
+			**kwargs,
+		)
+
+		state = cls.create(step=0, model=model)
+		cmg = jax.default_device(device) if device is not None else contextlib.nullcontext()
+		with cmg:
+			state = state.load_optimizer(load_directory=load_directory)
+		if auto_shard_model:
+			state = state.shard_optimizer_state()
+		return state
 
 	def shard_with_shape(self, shape) -> EasyDeLState:
 		"""

@@ -82,8 +82,8 @@ class BaseAutoEasyModel:
 		cls,
 		pretrained_model_name_or_path: str,
 		device: tp.Optional[jax.Device] = None,
-		dtype: jnp.dtype = jnp.float32,
-		param_dtype: jnp.dtype = jnp.float32,
+		dtype: jax.numpy.dtype = jax.numpy.float32,
+		param_dtype: jax.numpy.dtype = jax.numpy.float32,
 		precision: tp.Optional[jax.lax.Precision] = None,
 		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
 		sharding_dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
@@ -96,10 +96,12 @@ class BaseAutoEasyModel:
 		config_kwargs: tp.Optional[EasyDeLBaseConfigDict] = None,
 		auto_shard_model: bool = False,
 		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]] = None,
+		quantization_platform: tp.Optional[EasyDeLPlatforms] = None,
 		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
 		quantization_block_size: int = 128,
 		quantization_pattern: tp.Optional[str] = None,
 		quantize_tensors: bool = True,
+		verbose: bool = True,
 		from_torch: tp.Optional[bool] = None,
 		**kwargs,
 	) -> EasyDeLBaseModule:
@@ -137,55 +139,59 @@ class BaseAutoEasyModel:
 		if partition_axis is None:
 			partition_axis = PartitionAxis()
 		if from_torch is None:
-			from_torch = not cls._is_easydel(
-				pretrained_model_name_or_path=pretrained_model_name_or_path,
-			)
+			from_torch = not cls._is_easydel(pretrained_model_name_or_path)
 
 		if from_torch:
 			return cls._from_torch_pretrained(
 				pretrained_model_name_or_path=pretrained_model_name_or_path,
-				param_dtype=param_dtype,
+				device=device,
 				dtype=dtype,
-				shard_fns=shard_fns,
-				auto_shard_model=auto_shard_model,
+				param_dtype=param_dtype,
 				precision=precision,
+				sharding_axis_dims=sharding_axis_dims,
+				sharding_dcn_axis_dims=sharding_dcn_axis_dims,
+				sharding_axis_names=sharding_axis_names,
+				partition_axis=partition_axis,
+				shard_attention_computation=shard_attention_computation,
+				shard_fns=shard_fns,
 				backend=backend,
 				platform=platform,
-				partition_axis=partition_axis,
+				config_kwargs=config_kwargs,
+				auto_shard_model=auto_shard_model,
+				partition_rules=partition_rules,
+				quantization_platform=quantization_platform,
 				quantization_method=quantization_method,
 				quantization_block_size=quantization_block_size,
 				quantization_pattern=quantization_pattern,
 				quantize_tensors=quantize_tensors,
-				partition_rules=partition_rules,
-				sharding_axis_names=sharding_axis_names,
-				sharding_axis_dims=sharding_axis_dims,
-				sharding_dcn_axis_dims=sharding_dcn_axis_dims,
-				config_kwargs=config_kwargs,
-				device=device,
-				shard_attention_computation=shard_attention_computation,
+				verbose=verbose,
 				**kwargs,
 			)
 		cmg = jax.default_device(device) if device is not None else contextlib.nullcontext()
 		with cmg:
 			return cls._from_easydel_params(
-				auto_shard_model=auto_shard_model,
-				partition_axis=partition_axis,
+				pretrained_model_name_or_path=pretrained_model_name_or_path,
+				device=device,
+				dtype=dtype,
+				param_dtype=param_dtype,
+				precision=precision,
 				sharding_axis_dims=sharding_axis_dims,
 				sharding_dcn_axis_dims=sharding_dcn_axis_dims,
 				sharding_axis_names=sharding_axis_names,
+				partition_axis=partition_axis,
+				shard_attention_computation=shard_attention_computation,
 				shard_fns=shard_fns,
-				param_dtype=param_dtype,
-				config_kwargs=config_kwargs,
-				partition_rules=partition_rules,
-				precision=precision,
-				dtype=dtype,
 				backend=backend,
 				platform=platform,
-				pretrained_model_name_or_path=pretrained_model_name_or_path,
+				config_kwargs=config_kwargs,
+				auto_shard_model=auto_shard_model,
+				partition_rules=partition_rules,
+				quantization_platform=quantization_platform,
 				quantization_method=quantization_method,
 				quantization_block_size=quantization_block_size,
 				quantization_pattern=quantization_pattern,
 				quantize_tensors=quantize_tensors,
+				verbose=verbose,
 				**kwargs,
 			)
 
@@ -193,61 +199,9 @@ class BaseAutoEasyModel:
 	def _from_easydel_params(
 		cls,
 		pretrained_model_name_or_path: str,
-		dtype: jnp.dtype = jnp.float32,
-		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[jax.lax.Precision] = None,
-		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
-		sharding_dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
-		sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-		partition_axis: tp.Optional[PartitionAxis] = None,
-		shard_fns: tp.Optional[tp.Mapping[tuple, tp.Callable] | dict] = None,
-		backend: tp.Optional[EasyDeLBackends] = None,
-		platform: tp.Optional[EasyDeLPlatforms] = None,
-		config_kwargs: tp.Optional[dict] = None,
-		auto_shard_model: bool = False,
-		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]] = None,
-		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
-		quantization_platform: tp.Optional[EasyDeLPlatforms] = EasyDeLPlatforms.JAX,
-		quantization_block_size: int = 128,
-		quantization_pattern: tp.Optional[str] = None,
-		quantize_tensors: bool = True,
-		**kwargs,
-	):
-		"""Helper method to load a model from EasyDeL saved parameters."""
-
-		class Base(EasyDeLBaseModule):
-			_model_task = cls.model_task
-
-		return Base.from_pretrained(
-			pretrained_model_name_or_path=pretrained_model_name_or_path,
-			dtype=dtype,
-			precision=precision,
-			param_dtype=param_dtype,
-			partition_axis=partition_axis,
-			auto_shard_model=auto_shard_model,
-			shard_fns=shard_fns,
-			sharding_axis_dims=sharding_axis_dims,
-			sharding_dcn_axis_dims=sharding_dcn_axis_dims,
-			sharding_axis_names=sharding_axis_names,
-			backend=backend,
-			platform=platform,
-			config_kwargs=config_kwargs,
-			partition_rules=partition_rules,
-			quantization_method=quantization_method,
-			quantization_platform=quantization_platform,
-			quantization_block_size=quantization_block_size,
-			quantization_pattern=quantization_pattern,
-			quantize_tensors=quantize_tensors,
-			**kwargs,
-		)
-
-	@classmethod
-	def _from_torch_pretrained(
-		cls,
-		pretrained_model_name_or_path: str,
 		device: tp.Optional[jax.Device] = None,
-		dtype: jnp.dtype = jnp.float32,
-		param_dtype: jnp.dtype = jnp.float32,
+		dtype: jax.numpy.dtype = jax.numpy.float32,
+		param_dtype: jax.numpy.dtype = jax.numpy.float32,
 		precision: tp.Optional[jax.lax.Precision] = None,
 		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
 		sharding_dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
@@ -260,38 +214,162 @@ class BaseAutoEasyModel:
 		config_kwargs: tp.Optional[EasyDeLBaseConfigDict] = None,
 		auto_shard_model: bool = False,
 		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]] = None,
+		quantization_platform: tp.Optional[EasyDeLPlatforms] = None,
 		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
 		quantization_block_size: int = 128,
 		quantization_pattern: tp.Optional[str] = None,
 		quantize_tensors: bool = True,
+		verbose: bool = True,
 		**kwargs,
 	):
-		"""Helper method to load a model from PyTorch pretrained weights."""
+		"""Loads a model from EasyDeL saved parameters.
 
+		This is a helper method called by `from_pretrained` when the source
+		is identified as an EasyDeL checkpoint.
+
+		Args:
+		    pretrained_model_name_or_path (str): Path or name of the pretrained model.
+		    device (jax.Device, optional): Device to load the model on. Defaults to None.
+		    dtype (jnp.dtype, optional): Data type of the model. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype, optional): Data type of the model parameters. Defaults to jnp.float32.
+		    precision (jax.lax.Precision, optional): Precision for computations. Defaults to None.
+		    sharding_axis_dims (tp.Sequence[int], optional): Dimensions of each sharding axis. Defaults to (1, -1, 1, 1).
+		    sharding_dcn_axis_dims (tp.Optional[tp.Sequence[int]], optional): Dimensions for DCN sharding. Defaults to None.
+		    sharding_axis_names (tp.Sequence[str], optional): Names of the sharding axes. Defaults to ("dp", "fsdp", "tp", "sp").
+		    partition_axis (PartitionAxis, optional): Partitioning configuration. Defaults to None.
+		    shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
+		    shard_fns (tp.Optional[tp.Mapping[tuple, tp.Callable] | dict], optional): Custom sharding functions. Defaults to None.
+		    backend (tp.Optional[EasyDeLBackends], optional): Backend to use. Defaults to None.
+		    platform (tp.Optional[EasyDeLPlatforms], optional): Platform to use. Defaults to None.
+		    config_kwargs (tp.Optional[EasyDeLBaseConfigDict], optional): Configuration overrides. Defaults to None.
+		    auto_shard_model (bool, optional): Whether to automatically shard. Defaults to False.
+		    partition_rules (tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]], optional): Custom partition rules. Defaults to None.
+		    quantization_platform (tp.Optional[EasyDeLPlatforms], optional): Platform for quantization. Defaults to None.
+		    quantization_method (tp.Optional[EasyDeLQuantizationMethods], optional): Quantization method. Defaults to None.
+		    quantization_block_size (int): Block size for quantization. Defaults to 128.
+		    quantization_pattern (tp.Optional[str]): Pattern for quantization target modules. Defaults to None.
+		    quantize_tensors (bool): Whether to quantize tensors. Defaults to True.
+		    verbose (bool): Enable verbose logging. Defaults to True.
+		    **kwargs: Additional keyword arguments passed to the underlying `EasyDeLBaseModule.from_pretrained`.
+
+		Returns:
+		    EasyDeLBaseModule: The loaded and potentially sharded EasyDeL model module.
+		"""
+		class Base(EasyDeLBaseModule):
+			_model_task = cls.model_task
+
+		return Base.from_pretrained(
+			pretrained_model_name_or_path=pretrained_model_name_or_path,
+			device=device,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			sharding_axis_dims=sharding_axis_dims,
+			sharding_dcn_axis_dims=sharding_dcn_axis_dims,
+			sharding_axis_names=sharding_axis_names,
+			partition_axis=partition_axis,
+			shard_attention_computation=shard_attention_computation,
+			shard_fns=shard_fns,
+			backend=backend,
+			platform=platform,
+			config_kwargs=config_kwargs,
+			auto_shard_model=auto_shard_model,
+			partition_rules=partition_rules,
+			quantization_platform=quantization_platform,
+			quantization_method=quantization_method,
+			quantization_block_size=quantization_block_size,
+			quantization_pattern=quantization_pattern,
+			quantize_tensors=quantize_tensors,
+			verbose=verbose,
+			**kwargs,
+		)
+
+	@classmethod
+	def _from_torch_pretrained(
+		cls,
+		pretrained_model_name_or_path: str,
+		device: tp.Optional[jax.Device] = None,
+		dtype: jax.numpy.dtype = jax.numpy.float32,
+		param_dtype: jax.numpy.dtype = jax.numpy.float32,
+		precision: tp.Optional[jax.lax.Precision] = None,
+		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
+		sharding_dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
+		sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+		partition_axis: tp.Optional[PartitionAxis] = None,
+		shard_attention_computation: bool = True,
+		shard_fns: tp.Optional[tp.Mapping[tuple, tp.Callable] | dict] = None,
+		backend: tp.Optional[EasyDeLBackends] = None,
+		platform: tp.Optional[EasyDeLPlatforms] = None,
+		config_kwargs: tp.Optional[EasyDeLBaseConfigDict] = None,
+		auto_shard_model: bool = False,
+		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]] = None,
+		quantization_platform: tp.Optional[EasyDeLPlatforms] = None,
+		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
+		quantization_block_size: int = 128,
+		quantization_pattern: tp.Optional[str] = None,
+		quantize_tensors: bool = True,
+		verbose: bool = True,
+		**kwargs,
+	):
+		"""Loads a model from PyTorch pretrained weights.
+
+		This is a helper method called by `from_pretrained` when the source
+		is identified as a PyTorch checkpoint (or requires conversion).
+
+		Args:
+		    pretrained_model_name_or_path (str): Path or name of the pretrained model.
+		    device (jax.Device, optional): Device to load the model on. Defaults to None.
+		    dtype (jnp.dtype, optional): Data type of the model. Defaults to jnp.float32.
+		    param_dtype (jnp.dtype, optional): Data type of the model parameters. Defaults to jnp.float32.
+		    precision (jax.lax.Precision, optional): Precision for computations. Defaults to None.
+		    sharding_axis_dims (tp.Sequence[int], optional): Dimensions of each sharding axis. Defaults to (1, -1, 1, 1).
+		    sharding_dcn_axis_dims (tp.Optional[tp.Sequence[int]], optional): Dimensions for DCN sharding. Defaults to None.
+		    sharding_axis_names (tp.Sequence[str], optional): Names of the sharding axes. Defaults to ("dp", "fsdp", "tp", "sp").
+		    partition_axis (PartitionAxis, optional): Partitioning configuration. Defaults to None.
+		    shard_attention_computation (bool, optional): Whether to shard attention computation. Defaults to True.
+		    shard_fns (tp.Optional[tp.Mapping[tuple, tp.Callable] | dict], optional): Custom sharding functions. Defaults to None.
+		    backend (tp.Optional[EasyDeLBackends], optional): Backend to use. Defaults to None.
+		    platform (tp.Optional[EasyDeLPlatforms], optional): Platform to use. Defaults to None.
+		    config_kwargs (tp.Optional[EasyDeLBaseConfigDict], optional): Configuration overrides. Defaults to None.
+		    auto_shard_model (bool, optional): Whether to automatically shard. Defaults to False.
+		    partition_rules (tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]], optional): Custom partition rules. Defaults to None.
+		    quantization_platform (tp.Optional[EasyDeLPlatforms], optional): Platform for quantization. Defaults to None.
+		    quantization_method (tp.Optional[EasyDeLQuantizationMethods], optional): Quantization method. Defaults to None.
+		    quantization_block_size (int): Block size for quantization. Defaults to 128.
+		    quantization_pattern (tp.Optional[str]): Pattern for quantization target modules. Defaults to None.
+		    quantize_tensors (bool): Whether to quantize tensors. Defaults to True.
+		    verbose (bool): Enable verbose logging. Defaults to True.
+		    **kwargs: Additional keyword arguments passed to the underlying `EasyDeLBaseModule._from_torch_pretrained`.
+
+		Returns:
+		    EasyDeLBaseModule: The loaded, converted, and potentially sharded EasyDeL model module.
+		"""
 		class Base(EasyDeLBaseModule):
 			_model_task = cls.model_task
 
 		return Base._from_torch_pretrained(
 			pretrained_model_name_or_path=pretrained_model_name_or_path,
-			param_dtype=param_dtype,
+			device=device,
 			dtype=dtype,
-			shard_fns=shard_fns,
-			auto_shard_model=auto_shard_model,
+			param_dtype=param_dtype,
 			precision=precision,
+			sharding_axis_dims=sharding_axis_dims,
+			sharding_dcn_axis_dims=sharding_dcn_axis_dims,
+			sharding_axis_names=sharding_axis_names,
+			partition_axis=partition_axis,
+			shard_attention_computation=shard_attention_computation,
+			shard_fns=shard_fns,
 			backend=backend,
 			platform=platform,
-			partition_axis=partition_axis,
+			config_kwargs=config_kwargs,
+			auto_shard_model=auto_shard_model,
+			partition_rules=partition_rules,
+			quantization_platform=quantization_platform,
 			quantization_method=quantization_method,
 			quantization_block_size=quantization_block_size,
 			quantization_pattern=quantization_pattern,
 			quantize_tensors=quantize_tensors,
-			partition_rules=partition_rules,
-			sharding_axis_names=sharding_axis_names,
-			sharding_axis_dims=sharding_axis_dims,
-			sharding_dcn_axis_dims=sharding_dcn_axis_dims,
-			config_kwargs=config_kwargs,
-			device=device,
-			shard_attention_computation=shard_attention_computation,
+			verbose=verbose,
 			**kwargs,
 		)
 
@@ -329,19 +407,9 @@ class BaseAutoEasyModel:
 		commit_hash = None
 		pretrained_model_name_or_path = str(pretrained_model_name_or_path)
 		if os.path.isdir(pretrained_model_name_or_path):
-			if os.path.isfile(
-				os.path.join(
-					pretrained_model_name_or_path,
-					subfolder,
-					FLAX_WEIGHTS_NAME,
-				)
+			if not os.path.isfile(
+				os.path.join(pretrained_model_name_or_path, subfolder, FLAX_WEIGHTS_NAME)
 			):
-				archive_file = os.path.join(  # noqa
-					pretrained_model_name_or_path,
-					subfolder,
-					FLAX_WEIGHTS_NAME,
-				)
-			else:
 				raise EnvironmentError(
 					f"Error no file named {FLAX_WEIGHTS_NAME} found in"
 					f" directory {pretrained_model_name_or_path}"

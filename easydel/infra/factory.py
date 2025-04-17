@@ -53,6 +53,7 @@ class TaskType(str, Enum):
 	    SEQUENCE_CLASSIFICATION: Classifying entire sequences (e.g., sentiment analysis).
 	    AUDIO_CLASSIFICATION: Classifying audio data.
 	    IMAGE_CLASSIFICATION: Classifying images.
+			AUTO_BIND: Whenever to automatically decide what todo.
 	"""
 
 	CAUSAL_LM = "causal-language-model"
@@ -66,6 +67,7 @@ class TaskType(str, Enum):
 	SEQUENCE_CLASSIFICATION = "sequence-classification"
 	AUDIO_CLASSIFICATION = "audio-classification"
 	IMAGE_CLASSIFICATION = "image-classification"
+	AUTO_BIND = "auto-bind"
 
 
 @auto_pytree
@@ -178,6 +180,7 @@ class Registry:
 
 		def wrapper(module: T) -> T:
 			from .mixins.protocol import printify_nnx
+
 			module.__str__ = printify_nnx
 			module.__repr__ = printify_nnx
 			module._model_task = task_type

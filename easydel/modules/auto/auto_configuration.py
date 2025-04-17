@@ -68,6 +68,23 @@ def is_flatten(pytree: dict):
 
 
 class AutoEasyDeLConfig:
+	@staticmethod
+	def bind_model_task(model_task: TaskType, architectures: list[str] | str):
+		if model_task == TaskType.AUTO_BIND:
+			if isinstance(architectures, list):
+				assert len(architectures) == 1, (
+					"AutoBind is not supported for multi architecture loading!"
+				)
+				architectures = architectures[0]
+			import easydel as ed
+
+			module_class: ed.EasyDeLBaseModule = getattr(ed, architectures, None)
+			assert module_class is not None, (
+				f"we couldn't find {architectures} in easydel collections!"
+			)
+			model_task = module_class._model_task
+		return model_task
+
 	@classmethod
 	def from_pretrained(
 		cls,
@@ -109,10 +126,15 @@ class AutoEasyDeLConfig:
 		config = cls_main.from_pretrained(pretrained_model_name_or_path)
 		model_type: str = config.model_type
 
-		config_class = get_modules_by_type(model_type, model_task)[0]
+		config_class = get_modules_by_type(
+			model_type,
+			cls.bind_model_task(model_task, config.architectures),
+		)[0]
 		config = config_class.from_pretrained(pretrained_model_name_or_path)
+
 		if hasattr(config, "attach_custom_arguments"):
 			config.attach_custom_arguments()
+
 		config.add_basic_configurations(
 			axis_dims=sharding_axis_dims,
 			dcn_axis_dims=sharding_dcn_axis_dims,
