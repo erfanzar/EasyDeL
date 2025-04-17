@@ -14,9 +14,9 @@
 
 
 import asyncio
+import concurrent.futures
 import contextlib
 import os
-import concurrent.futures
 import pathlib
 import pickle
 import random
@@ -37,6 +37,7 @@ from jax import numpy as jnp
 from jax._src.stages import Compiled
 from jax.sharding import NamedSharding, PartitionSpec
 from pydantic import BaseModel, Field
+from transformers import ProcessorMixin
 
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.utils.compiling_utils import (
@@ -1205,13 +1206,30 @@ class vInference:
 		return self
 
 	@tp.overload
-	def count_tokens(self, messages: tp.List[tp.Dict[str, str]]): ...
+	def count_tokens(
+		self,
+		messages: tp.List[tp.Dict[str, str]],
+		oai_like: bool = False,
+	): ...
 
 	@tp.overload
-	def count_tokens(self, text: str): ...
+	def count_tokens(
+		self,
+		text: str,
+		oai_like: bool = False,
+	): ...
 
-	def count_tokens(self, conv: tp.Union[str, tp.List[tp.Dict[str, str]]]) -> int:
+	def count_tokens(
+		self,
+		conv: tp.Union[str, tp.List[tp.Dict[str, str]]],
+		oai_like: bool = False,
+	) -> int:
 		if isinstance(conv, list) and all(isinstance(item, dict) for item in conv):
+			if isinstance(self.processor_class, ProcessorMixin) and oai_like:
+				from easydel.trainers.prompt_utils import convert_to_openai_format
+
+				conv = convert_to_openai_format(conv)
+
 			tokens = self.processor_class.apply_chat_template(conv, tokenize=True)
 			return len(tokens)
 		else:

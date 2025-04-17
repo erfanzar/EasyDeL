@@ -35,6 +35,34 @@ OutputType = tp.Union[OutputDict, OutputListDict, None]
 OpenAIMessageList = tp.List[OpenAIMessage]
 
 
+def _is_valid_openai_message_list(data: tp.Any) -> bool:
+	"""
+	Checks if the input data strictly conforms to the OpenAIMessageList format
+	where content is specifically a list of parts (e.g., [{"type": "text", ...}]).
+	"""
+	if not isinstance(data, list):
+		return False
+
+	if not data:
+		return True
+	for item in data:
+		if not isinstance(item, dict):
+			return False
+		if "role" not in item or "content" not in item:
+			return False
+		if not isinstance(item.get("role"), str):
+			return False
+		content = item.get("content")
+		if not isinstance(content, list):
+			return False
+		for part in content:
+			if not isinstance(part, dict):
+				return False
+			if "type" not in part:
+				return False
+	return True
+
+
 def _convert_single_dict(source_dict: InputDict) -> tp.Optional[OpenAIMessage]:
 	"""
 	Converts a single source dictionary into the target OpenAI message format.
@@ -180,10 +208,13 @@ def reverse_openai_format(
 		return simple_messages
 
 
-def convert_to_openai_format(input_data: InputType) -> tp.List[OpenAIMessage]:
+def convert_to_openai_format(input_data: InputType) -> OpenAIMessageList:
 	"""
 	Converts various input formats (list[list[dict]], list[dict], dict)
 	into the OpenAI Chat Completions message list format.
+
+	If the input_data already conforms to the target OpenAIMessageList format
+	(specifically with content as list of parts), it is returned directly.
 
 	Target Format Example for one message:
 	{
@@ -192,20 +223,25 @@ def convert_to_openai_format(input_data: InputType) -> tp.List[OpenAIMessage]:
 	}
 
 	Args:
-	    input_data: Data in one of the supported formats.
-	                Keys like 'role', 'content', 'text', 'message' are searched
-	                case-insensitively within dictionaries.
+	    input_data: Data in one of the supported formats or already in the
+	                target OpenAIMessageList format. Keys like 'role',
+	                'content', 'text', 'message' are searched case-insensitively
+	                within dictionaries during conversion.
 
 	Returns:
 	    A list of messages in the target OpenAI format. Returns an empty list
-	    if the input is invalid, cannot be parsed, or results in no valid messages.
+	    if the input is invalid, cannot be parsed, results in no valid messages,
+	    or is an unsupported type. Returns the input directly if it already
+	    matches the target format.
 	"""
-	output_messages: tp.List[OpenAIMessage] = []
-	items_to_process: tp.List[InputDict] = []
+	if _is_valid_openai_message_list(input_data):
+		return tp.cast(OpenAIMessageList, input_data)
 
+	output_messages: OpenAIMessageList = []
+	items_to_process: tp.List[InputDict] = []
 	if isinstance(input_data, list):
 		is_list_of_lists = False
-		if input_data and isinstance(input_data[0], list):
+		if input_data and all(isinstance(sub_item, list) for sub_item in input_data):
 			is_list_of_lists = True
 
 		if is_list_of_lists:
@@ -214,35 +250,19 @@ def convert_to_openai_format(input_data: InputType) -> tp.List[OpenAIMessage]:
 					for item in sublist:
 						if isinstance(item, dict):
 							items_to_process.append(item)
-						else:
-							print(f"Warning: Item in sublist is not a dict: {item}. Skipping.")
-				else:
-					print(
-						f"Warning: Item in outer list is not a list (expected list[list]): {sublist}. Skipping."
-					)
 		else:
 			for item in input_data:
 				if isinstance(item, dict):
 					items_to_process.append(item)
 				elif isinstance(item, list):
-					print(
-						f"Warning: Found a list inside a list that wasn't list[list] structure: {item}. Trying to process its dicts."
-					)
 					for sub_item in item:
 						if isinstance(sub_item, dict):
 							items_to_process.append(sub_item)
-						else:
-							print(
-								f"Warning: Item in nested list is not a dict: {sub_item}. Skipping."
-							)
-				else:
-					print(f"Warning: Item in list is not a dict: {item}. Skipping.")
 
 	elif isinstance(input_data, dict):
 		items_to_process.append(input_data)
 
 	else:
-		print(f"Error: Unsupported input type: {type(input_data)}. Expected list or dict.")
 		return []
 	for source_dict in items_to_process:
 		converted_message = _convert_single_dict(source_dict)

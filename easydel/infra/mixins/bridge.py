@@ -115,7 +115,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		  float_dtype (dtype, optional): Data type for saving weights. Defaults to None.
 		  verbose (bool, optional): Whether to print verbose messages. Defaults to True.
 		  mismatch_allowed (bool, optional): If True allows mismatch in parameters. Defaults to True.
-			enable (bool): if True, allows file to be saved (used for multi-host saving models).
+		  enable (bool): if True, allows file to be saved (used for multi-host saving models).
 		"""
 
 		save_directory.mkdir(parents=True, exist_ok=True)
@@ -169,7 +169,7 @@ class EasyBridgeMixin(PushToHubMixin):
 		    float_dtype (dtype, optional): Data type for saving weights.
 		    verbose (bool, optional): Whether to print verbose messages. Defaults to True.
 		    mismatch_allowed (bool, optional): If True, allows mismatch in parameters while loading. Defaults to True.
-				enable (bool): if True, allows file to be saved (used for multi-host saving models).
+		    enable (bool): if True, allows file to be saved (used for multi-host saving models).
 		    **kwargs: Additional keyword arguments for Hugging Face Hub.
 		"""
 
@@ -499,10 +499,16 @@ class EasyBridgeMixin(PushToHubMixin):
 			platform=platform,
 			model_task=cls._model_task,
 		)
-
-		if config_kwargs:
-			for k, v in config_kwargs.items():
-				setattr(config, k, v)
+		config_kwargs = {} if config_kwargs is None else config_kwargs
+		config.add_basic_configurations(
+			axis_dims=sharding_axis_dims,
+			dcn_axis_dims=sharding_dcn_axis_dims,
+			axis_names=sharding_axis_names,
+			partition_axis=partition_axis,
+			backend=backend,
+			platform=platform,
+			**config_kwargs,
+		)
 
 		if commit_hash is None:
 			commit_hash = getattr(config, "_commit_hash", None)
@@ -604,6 +610,7 @@ class EasyBridgeMixin(PushToHubMixin):
 			quantize_tensors,
 			vebose,
 		)
+
 		if not quantize_tensors:  # already quantized
 			model = model.quantize(
 				method=quantization_method,

@@ -24,6 +24,7 @@ import uvicorn
 from eformer.pytree import auto_pytree
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
+from transformers import ProcessorMixin
 
 from easydel.inference.utilities import SamplingParams
 from easydel.utils.helpers import get_logger
@@ -88,6 +89,7 @@ class vInferenceApiServer:
 		inference_init_call: tp.Optional[tp.Callable[[], vInference]] = None,
 		max_workers: int = 10,
 		allow_parallel_workload: bool = False,
+		oai_like_processor: bool = True,
 	) -> None:
 		"""
 		Initializes the vInferenceApiServer.
@@ -104,7 +106,7 @@ class vInferenceApiServer:
 		        Defaults to None. Either `inference_map` or `inference_init_call` must be provided.
 		    max_workers (int): The maximum number of worker threads in the thread pool
 		        for handling inference requests. Defaults to 10.
-
+				oai_like_processor (bool): automatically upcast processor conversation to openai format.
 		Raises:
 		    AssertionError: If neither `inference_map` nor `inference_init_call` is provided,
 		        or if the provided values are not of the expected `vInference` type.
@@ -134,6 +136,7 @@ class vInferenceApiServer:
 		self.thread_pool = ThreadPoolExecutor(max_workers=max_workers)
 		self.logger = logger
 		self.allow_parallel_workload = allow_parallel_workload
+		self.oai_like_processor = oai_like_processor
 		self._register_endpoints()
 
 	@property
@@ -267,8 +270,13 @@ class vInferenceApiServer:
 		        other model inputs (like attention mask).
 		"""
 		conversation = request.model_dump(exclude_unset=True)["messages"]
+		processor = inference.processor_class
+		if isinstance(processor, ProcessorMixin) and self.oai_like_processor:
+			from easydel.trainers.prompt_utils import convert_to_openai_format
+
+			conversation = convert_to_openai_format(conversation)
 		try:
-			return inference.processor_class.apply_chat_template(
+			return processor.apply_chat_template(
 				conversation=conversation,
 				return_tensors="np",
 				add_generation_prompt=True,
@@ -422,7 +430,10 @@ class vInferenceApiServer:
 		"""Handle streaming response generation asynchronously."""
 
 		async def stream_results() -> tp.AsyncGenerator[bytes, tp.Any]:
-			prompt_tokens = inference.count_tokens(request.model_dump()["messages"])
+			prompt_tokens = inference.count_tokens(
+				request.model_dump()["messages"],
+				oai_like=self.oai_like_processor,
+			)
 
 			prompt_tokens = ids["input_ids"].shape[-1]
 			sampling_params = self._create_sampling_params_from_request(request)
