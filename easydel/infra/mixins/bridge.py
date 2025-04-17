@@ -88,12 +88,21 @@ class EasyBridgeMixin(PushToHubMixin):
 		"""
 		from easydel import __version__
 
+		# Retrieve attention mechanism from config, default to "vanilla" if not found
+		attn_mechanism = getattr(self.config, "attn_mechanism", "vanilla")
+		if not isinstance(attn_mechanism, str):  # Handle cases where it might be an Enum
+			try:
+				attn_mechanism = attn_mechanism.value
+			except AttributeError:
+				attn_mechanism = str(attn_mechanism).split(".")[-1].lower()  # Fallback
+
 		model_info = ModelInfo(
 			name=name,
 			type=self.__class__.__name__,
 			repo_id=repo_id,
 			model_type=self._model_type,
-			model_task=self._model_task,
+			model_task=self._model_task or "CausalLM",  # Default to CausalLM if not set
+			attn_mechanism=attn_mechanism,
 			version=__version__,
 		)
 		return ReadmeGenerator().generate_readme(model_info)

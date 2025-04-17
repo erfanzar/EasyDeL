@@ -13,9 +13,9 @@
 # limitations under the License.
 import os
 import typing as tp
-from dataclasses import field
+from dataclasses import dataclass, field
 from pathlib import Path
-from eformer.pytree import auto_pytree
+
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from easydel import __version__
@@ -24,43 +24,89 @@ from easydel.utils.helpers import get_logger
 logger = get_logger(__name__)
 
 JINJA_TEMPLATE = """
+{% set auto_class_map = {
+    "CausalLM": "AutoEasyDeLModelForCausalLM",
+    "SequenceClassification": "AutoEasyDeLModelForSequenceClassification",
+    "ImageTextToText": "AutoEasyDeLModelForImageTextToText",
+    "Vision2Seq": "AutoEasyDeLModelForVision2Seq",
+    "AudioToText": "AutoEasyDeLModelForAudioToText"
+} %}
+{% set auto_class = auto_class_map.get(model.model_task, "AutoEasyDeLModelForCausalLM") %}
+{% set attn_enum_map = {
+    "vanilla": "VANILLA",
+    "flash": "FLASH",
+    "flash_attn": "FLASH",
+    "flash_attention": "FLASH",
+    "flashattn": "FLASH",
+    "flash_attn2": "FLASH_ATTN2",
+    "flash_attention2": "FLASH_ATTN2",
+    "flashattn2": "FLASH_ATTN2",
+    "splash": "SPLASH",
+    "splash_attn": "SPLASH",
+    "splash_attention": "SPLASH",
+    "ring": "RING",
+    "ring_attn": "RING",
+    "ring_attention": "RING",
+    "paged": "PAGED",
+    "paged_attn": "PAGED",
+    "paged_attention": "PAGED",
+    "mistral": "MISTRAL"
+} %}
+{% set attn_enum = attn_enum_map.get(model.attn_mechanism.lower(), "VANILLA") %}
+
 ---
 tags:
 - EasyDeL
-- {{model.type}}
+- {{ model.type }}
+- {{ model.model_task }}
+- {{ model.attn_mechanism }}
 - safetensors
 - TPU
 - GPU
 - XLA
 - Flax
 ---
-# {{ model.name }}
+<div align="center">
+ <a href="https://github.com/erfanzar/EasyDeL">
+ <img src="https://raw.githubusercontent.com/erfanzar/easydel/main/images/easydel-logo-with-text.png" height="80">
+ </a>
+ <br>
+ [![EasyDeL](https://img.shields.io/badge/🤗_EasyDeL-{{ model.version }}-blue.svg)](https://github.com/erfanzar/EasyDeL)
+ [![Model Type](https://img.shields.io/badge/Model_Type-{{ model.type }}-green.svg)](https://github.com/erfanzar/EasyDeL)
+</div>
 
-[![EasyDeL](https://img.shields.io/badge/🤗_EasyDeL-{{ model.version }}-blue.svg)](https://github.com/erfanzar/EasyDeL)
-[![Model Type](https://img.shields.io/badge/Model_Type-{{ model.type }}-green.svg)](https://github.com/erfanzar/EasyDeL)
+# {{ model.name }}
 
 {{ model.description if model.description else "A model implemented using the EasyDeL framework, designed to deliver optimal performance for large-scale natural language processing tasks." }}
 
 ## Overview
 
+This model is built using [EasyDeL](https://github.com/erfanzar/EasyDeL), an open-source framework designed to enhance and streamline the training and serving process of machine learning models, with a primary focus on Jax/Flax on TPU/GPU at scale.
+
 {{ model.overview if model.overview else "EasyDeL provides an efficient, highly-optimized, and customizable machine learning model compatible with both GPU and TPU environments. Built with JAX, this model supports advanced features such as sharded model parallelism, making it suitable for distributed training and inference and customized kernels." }}
 
-## Features
+## Features Provided by EasyDeL
 
 {% if model.features %}
+**Model Specific Features:**
 {% for feature in model.features %}
 - {{ feature }}
 {% endfor %}
-{% else %}
-- **Efficient Implementation**: Built with JAX/Flax for high-performance computation.
-- **Multi-Device Support**: Optimized to run on TPU, GPU, and CPU environments for sharding model over 2^(1-1000+) of devices.
-- **Sharded Model Parallelism**: Supports model parallelism across multiple devices for scalability.
-- **Customizable Precision**: Allows specification of floating-point precision for performance optimization.
 {% endif %}
+
+**EasyDeL Framework Features:**
+
+- **Efficient Implementation**: Built with JAX/Flax for high-performance computation.
+- **Modern Architecture**: Built on Flax NNX for better integration, modularity, and performance.
+- **Multi-Device Support**: Optimized to run on TPU, GPU, and CPU environments.
+- **Sharded Model Parallelism**: Supports model parallelism across multiple devices for scalability (using `auto_shard_model=True`).
+- **Customizable Precision**: Allows specification of `dtype`, `param_dtype`, and `precision`.
+- **Advanced Serving**: Includes `vInference` engine and OpenAI-compatible API server.
+- **Optimized Kernels**: Integrates multiple attention mechanisms (like `{{ model.attn_mechanism }}`) and platform-specific optimizations.
 
 ## Installation
 
-To install EasyDeL, simply run:
+To use this model via EasyDeL, first install EasyDeL:
 
 ```bash
 pip install easydel
@@ -70,96 +116,124 @@ pip install easydel
 
 ### Loading the Pre-trained Model
 
-To load a pre-trained version of the model with EasyDeL:
+To load this pre-trained model with EasyDeL:
 
 ```python
-from easydel import AutoEasyDeLModelForCausalLM
+from easydel import {{ auto_class }}, EasyDeLBaseConfigDict, AttentionMechanisms
 from jax import numpy as jnp, lax
 
-max_length = None # can be set to use lower memory for caching
+# Define max_length if needed for memory optimization
+max_length = None
 
 # Load model and parameters
-model = AutoEasyDeLModelForCausalLM.from_pretrained(
+# Set auto_shard_model=True to automatically distribute across devices
+model = {{ auto_class }}.from_pretrained(
     "{{ model.repo_id }}",
-    config_kwargs=ed.EasyDeLBaseConfigDict(
-        use_scan_mlp=False,
-        attn_dtype=jnp.float16,
-        freq_max_position_embeddings=max_length,
-        mask_max_position_embeddings=max_length,
-        attn_mechanism=ed.AttentionMechanisms.FLASH_ATTN2
-    ), 
-    dtype=jnp.float16,
-    param_dtype=jnp.float16,
-    precision=lax.Precision("fastest"),
-    auto_shard_model=True, 
+    config_kwargs=EasyDeLBaseConfigDict(
+        # use_scan_mlp=False, # Set to True to potentially reduce memory usage
+        attn_dtype=jnp.float16, # Or jnp.bfloat16
+        # freq_max_position_embeddings=max_length, # Set if using RoPE and need truncation
+        # mask_max_position_embeddings=max_length, # Set if max length is defined
+        attn_mechanism=AttentionMechanisms.{{ attn_enum }} # Matches the mechanism used by this model
+    ),
+    dtype=jnp.float16, # Or jnp.bfloat16 - Computation data type
+    param_dtype=jnp.float16, # Or jnp.bfloat16 - Parameter data type
+    precision=lax.Precision("fastest"), # Like "default", "fastest", "high", "highest"
+    auto_shard_model=True, # Auto-shard across available devices
 )
 ```
 
 ## Supported Tasks
 
+
 {% if model.supported_tasks %}
-This model is well-suited for the following tasks:
+This model, loaded via EasyDeL, is well-suited for the following tasks:
 {% for task in model.supported_tasks %}
 - **{{ task }}**
 {% endfor %}
 {% else %}
-[Need more information]
+The primary task for this model is **{{ model.model_task }}**. Further specific supported tasks are not explicitly listed.
 {% endif %}
- 
+
+
 ## Limitations
 
 {% if model.limitations %}
+**Model Specific Limitations:**
 {% for limitation in model.limitations %}
 - {{ limitation }}
 {% endfor %}
-{% else %}
-- **Hardware Dependency**: Performance can vary significantly based on the hardware used.
-- **JAX/Flax Setup Required**: The environment must support JAX/Flax for optimal use.
-- **Experimental Features**: Some features (like custom kernel usage or ed-ops) may require additional configuration and tuning.
 {% endif %}
+
+**General Limitations:**
+
+- **Hardware Dependency**: Performance can vary significantly based on the hardware (TPU/GPU) used.
+- **JAX/Flax Setup Required**: The environment must support JAX/Flax for optimal use.
+- **Experimental Features**: Some EasyDeL features (like custom kernels) may require additional configuration.
+
+## License 📜
+
+EasyDeL is released under the Apache v2 license. The license for this specific model might differ; please consult the original model repository or documentation.
+
+```code
+# Apache License 2.0 (referring to EasyDeL Framework)
+# ... (Full license text usually included in the main repo) ...
+```
+
+## Citation
+
+If you use EasyDeL in your research or work, please cite it:
+
+```bibtex
+@misc{Zare Chavoshi_2023,
+    title={EasyDeL: An open-source library for enhancing and streamlining the training process of machine learning models},
+    url={https://github.com/erfanzar/EasyDeL},
+    author={Zare Chavoshi, Erfan},
+    year={2023}
+}
+```
+
+Please also consider citing the original paper or source for the **{{ model.name }}** model architecture if applicable.
 """
 
 
-@auto_pytree
+@dataclass
 class ModelInfo:
-	"""Model information container."""
+	"""
+	Model information container. Used to pass data to the Jinja template.
+	"""
 
-	name: str = field(
-		metadata={"help": "The name of the model."},
-	)
-	type: str = field(
-		metadata={"help": "The type of the model."},
-	)
-	repo_id: str = field(
-		metadata={"help": "The repository ID of the model."},
-	)
+	name: str = field(metadata={"help": "The name of the model."})
+	type: str = field(metadata={"help": "The type of the model."})
+	repo_id: str = field(metadata={"help": "The repository ID of the model."})
 	description: tp.Optional[str] = field(
-		default=None,
-		metadata={"help": "A description of the model."},
+		default=None, metadata={"help": "A description of the model."}
 	)
 	model_type: tp.Optional[str] = field(
-		default=None,
-		metadata={"help": "The model type."},
+		default=None, metadata={"help": "The model type."}
 	)
-	model_task: tp.Optional[str] = field(
-		default=None,
-		metadata={"help": "The model task."},
+	model_task: str = field(
+		default="CausalLM",
+		metadata={"help": "The model task (e.g., CausalLM, SequenceClassification)."},
+	)
+	attn_mechanism: str = field(
+		default="vanilla",
+		metadata={"help": "The attention mechanism used (e.g., vanilla, flash_attn2)."},
 	)
 	features: tp.Optional[tp.List[str]] = field(
-		default=None,
-		metadata={"help": "A list of features of the model."},
+		default=None, metadata={"help": "A list of features of the model."}
 	)
 	supported_tasks: tp.Optional[tp.List[str]] = field(
-		default=None,
-		metadata={"help": "A list of tasks supported by the model."},
+		default=None, metadata={"help": "A list of tasks supported by the model."}
 	)
 	limitations: tp.Optional[tp.List[str]] = field(
-		default=None,
-		metadata={"help": "A list of limitations of the model."},
+		default=None, metadata={"help": "A list of limitations of the model."}
 	)
 	version: str = field(
-		default=__version__,
-		metadata={"help": "The version of the model."},
+		default=__version__, metadata={"help": "The version of the model."}
+	)
+	overview: tp.Optional[str] = field(
+		default=None, metadata={"help": "Custom overview text for the model."}
 	)
 
 
@@ -198,14 +272,13 @@ class ReadmeGenerator:
 		Args:
 		    model_info: Model information
 		    output_path: tp.Optional path to save the README
-		    template_name: Name of the template to use
 
 		Returns:
 		    Generated README content
 		"""
 		try:
 			template = self.env.from_string(JINJA_TEMPLATE)
-			content = template.render(model=model_info)
+			content = template.render(model=model_info).replace("\n\n\n", "\n").strip() + "\n"
 
 			if output_path:
 				output_path = Path(output_path)
@@ -221,13 +294,28 @@ class ReadmeGenerator:
 			raise
 
 
-# Example usage
+# Example usage (for testing the generator script itself)
 if __name__ == "__main__":
-	model_info = ModelInfo(
-		name="LLaMA-2-7B-EasyDeL",
-		type="CausalLM",
-		repo_id="erfanzar/LLaMA-2-7B-EasyDeL",
+	# Create dummy model info for testing
+	test_model_info = ModelInfo(
+		name="TestModel-EasyDeL",
+		type="TestLM",
+		repo_id="test/test-model",
+		model_task="CausalLM",
+		attn_mechanism="flash_attn2",
+		description="This is a test description for the example usage.",
+		overview="This is a custom overview section for the test model.",
+		supported_tasks=["Text Generation", "Summarization"],
+		limitations=["May hallucinate.", "Requires significant compute."],
+		features=["Feature A", "Feature B"],
 	)
 
+	# Generate the README
 	generator = ReadmeGenerator()
-	readme = generator.generate_readme(model_info, "tmp-files/readme.md")
+	readme_content = generator.generate_readme(
+		test_model_info, output_path="tmp-test-readme.md"
+	)
+	print(f"Generated tmp-test-readme.md for model '{test_model_info.name}'")
+	# print("\n--- README Content ---")
+	# print(readme_content)
+	# print("--- End README Content ---")
