@@ -16,9 +16,9 @@
 from functools import partial
 
 import jax
+import jax.extend
 import triton
 from eformer.callib import triton_call
-from jax import core as jcore
 from jax import numpy as jnp
 from jax.interpreters import batching, mlir, xla
 from triton import language as tl
@@ -91,7 +91,6 @@ def _get_cuda_autotune_config():
 			},
 			num_stages=4,
 			num_warps=4,
-		
 		),
 	]
 
@@ -298,7 +297,7 @@ def _triton_call_matmul(A, B):
 	)
 
 
-triton_matmul_primitive = jcore.Primitive("triton_matmul_primitive")
+triton_matmul_primitive = jax.extend.core.Primitive("triton_matmul_primitive")
 
 
 def impt_prim(A, B):

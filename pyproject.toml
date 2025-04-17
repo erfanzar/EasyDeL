@@ -33,8 +33,8 @@ classifiers = [
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.14"
-jax = ">=0.5.1"
-jaxlib = ">=0.5.1"
+jax = ">=0.5.3"
+jaxlib = ">=0.5.3"
 eformer = "0.0.27"
 einops = "~0.8.0"
 transformers = ">=4.51.0"
