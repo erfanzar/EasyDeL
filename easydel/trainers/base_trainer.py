@@ -611,19 +611,19 @@ class BaseTrainer(BaseTrainerProtocol):
 		return step
 
 	def _manage_checkpoint_limit(self, save_directory):
-		def _save():
+		def _operate():
 			checkpoint_files = glob(os.path.join(save_directory, "run-*"))
 			checkpoint_files.sort(key=os.path.getmtime)
 			for old_save_directory in checkpoint_files[: -self.arguments.save_total_limit]:
 				shutil.rmtree(old_save_directory, ignore_errors=True)
 				logger.info(f"Removed old directory: {old_save_directory}")
 
-		if self.arguments.save_total_limit:
+		if self.arguments.save_total_limit is not None:
 			if self.arguments.process_zero_is_admin:
 				if self.is_process_zero:
-					_save()
+					_operate()
 			else:
-				_save()
+				_operate()
 
 	def _save_readme(self, save_directory):
 		with open(os.path.join(save_directory, "README.md"), "w") as f:
