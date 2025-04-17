@@ -48,7 +48,6 @@ if _check_bool_flag("EASYDEL_AUTO", True):
 		"--xla_gpu_enable_pipelined_all_gather=true  "
 		"--xla_gpu_enable_pipelined_reduce_scatter=true  "
 		"--xla_gpu_enable_pipelined_all_reduce=true  "
-		"--xla_gpu_enable_pipelined_collectives=false   "
 		"--xla_gpu_enable_reduce_scatter_combine_by_dim=false  "
 		"--xla_gpu_enable_all_gather_combine_by_dim=false  "
 		"--xla_gpu_enable_reduce_scatter_combine_by_dim=false  "
