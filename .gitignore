@@ -7,9 +7,7 @@ execute_command.sh
 .idea
 *.so
 *.slurm
-vengine
 env.ipynb
-vengine_runtime_test.py
 easydel/kernels/gpu_ops/paged_attention_triton/*
 env.py
 exp.py

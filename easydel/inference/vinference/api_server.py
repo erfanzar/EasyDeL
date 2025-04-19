@@ -30,7 +30,7 @@ from easydel.inference.utilities import SamplingParams
 from easydel.utils.helpers import get_logger
 from easydel.utils.lazy_import import is_package_available
 
-from .api_models import (
+from ..openai_api_modules import (
 	ChatCompletionRequest,
 	ChatCompletionResponse,
 	ChatCompletionResponseChoice,

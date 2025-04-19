@@ -35,6 +35,10 @@ if _check_bool_flag("EASYDEL_AUTO", True):
 	_getlogger("datasets").setLevel(30)
 
 	# Taking care of some optional GPU FLAGs
+	_os.environ["JAX_COMPILATION_CACHE_DIR"] = _os.getenv(
+		"JAX_COMPILATION_CACHE_DIR",
+		"/tmp/jax_cache",
+	)
 	_os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 	_os.environ["KMP_AFFINITY"] = "noverbose"
 	_os.environ["GRPC_VERBOSITY"] = "3"
@@ -98,6 +102,10 @@ _import_structure = {
 		"vInferenceApiServer",
 		"vInferenceConfig",
 		"vInferencePreCompileConfig",
+		"vDriver",
+		"vEngine",
+		"vSurge",
+		"vSurgeApiServer",
 		"vWhisperInference",
 		"vWhisperInferenceConfig",
 	],
@@ -451,10 +459,14 @@ if _tp.TYPE_CHECKING:
 	from . import utils
 	from .inference import (
 		SamplingParams,
+		vDriver,
+		vEngine,
 		vInference,
 		vInferenceApiServer,
 		vInferenceConfig,
 		vInferencePreCompileConfig,
+		vSurge,
+		vSurgeApiServer,
 		vWhisperInference,
 		vWhisperInferenceConfig,
 	)

@@ -228,7 +228,8 @@ class LlamaAttention(AttentionModule):
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
-			cache_view=cache_view,
+			cache_view=cache_view, 
+			cache_metadata=cache_metadata,
 			value=value_states,
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,

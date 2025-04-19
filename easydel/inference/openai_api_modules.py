@@ -83,9 +83,8 @@ class ChatCompletionRequest(BaseModel):
 	top_p: float = 1.0
 	top_k: int = 0
 	min_p: float = 0.0
-	suppress_tokens: tp.List[int] = Field(
-		default_factory=list
-	)  # Added for potential EasyDeL support
+	suppress_tokens: tp.List[int] = Field(default_factory=list)
+	# Added for potential EasyDeL support
 
 	# OpenAI native parameters (some may be ignored by vInference)
 	functions: tp.Optional[tp.List[FunctionDefinition]] = None
@@ -205,7 +204,9 @@ class CompletionStreamResponseChoice(BaseModel):
 
 	index: int
 	text: str  # The delta text content
-	logprobs: tp.Optional[CompletionLogprobs] = None # Logprobs are usually None in streaming chunks
+	logprobs: tp.Optional[CompletionLogprobs] = (
+		None  # Logprobs are usually None in streaming chunks
+	)
 	finish_reason: tp.Optional[tp.Literal["stop", "length"]] = None
 
 
@@ -213,8 +214,9 @@ class CompletionStreamResponse(BaseModel):
 	"""Represents a streaming response from the completions endpoint."""
 
 	id: str = Field(default_factory=lambda: f"cmpl-{uuid.uuid4().hex}")
-	object: str = "text_completion.chunk" # Correct object type for streaming
+	object: str = "text_completion.chunk"  # Correct object type for streaming
 	created: int = Field(default_factory=lambda: int(time.time()))
 	model: str
-	choices: tp.List[CompletionStreamResponseChoice] # Use the new streaming choice model
-	usage: tp.Optional[UsageInfo] = None # Usage is often None until the final chunk in OAI
+	choices: tp.List[CompletionStreamResponseChoice]  # Use the new streaming choice model
+	usage: tp.Optional[UsageInfo] = None
+	# Usage is often None until the final chunk in OAI
