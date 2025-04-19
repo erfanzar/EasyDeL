@@ -19,7 +19,6 @@ import jax
 import numpy as np
 from flax import nnx as nn
 from jax import numpy as jnp
-from eformer.jaximus import implicit
 from easydel.layers.caching.transformer.transformer_cache import TransformerCache
 
 from ..utilities import SamplingParams
@@ -345,7 +344,7 @@ class vEngine:
 		return None  # Placeholder: Implementation needed
 
 	@staticmethod
-	@implicit
+	# @implicit
 	@partial(jax.jit, static_argnums=(0, 5))
 	def prefill(
 		graphdef: nn.GraphDef,
@@ -427,7 +426,7 @@ class vEngine:
 		return generation_state, result
 
 	@staticmethod
-	@implicit
+	# @implicit
 	@partial(jax.jit, static_argnums=(0, 4), donate_argnums=(3,))
 	def decode(
 		graphdef: nn.GraphDef,

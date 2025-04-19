@@ -14,6 +14,12 @@
 
 from .api_server import vSurgeApiServer
 from .engine import vEngine
-from .vsurge import vDriver, vSurge
+from .driver import vDriver
+from .vsurge import vSurge
 
-__all__ = ("vEngine", "vDriver", "vSurge", "vSurgeApiServer")
+__all__ = (
+	"vEngine",
+	"vDriver",
+	"vSurge",
+	"vSurgeApiServer",
+)
