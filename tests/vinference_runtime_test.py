@@ -46,7 +46,7 @@ def main():
 			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 			attn_mechanism=ed.AttentionMechanisms.VANILLA,
 		),
-		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+		quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
 		param_dtype=param_dtype,
 		dtype=dtype,
 		partition_axis=partition_axis,
