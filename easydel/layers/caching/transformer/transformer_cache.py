@@ -276,12 +276,17 @@ class TransformerCacheView(BaseCacheView):
 		else:
 			attention_mask = attention_mask
 
+		def _maybe_materialize(x):
+			if hasattr(x, "materialize"):
+				x = x.materialize()
+			return x
+
 		@partial(jax.vmap, in_axes=(0, 0, 0), out_axes=(0))
 		def _update_kv(old, new, slot):
 			return lax.dynamic_update_slice(old, new.astype(old.dtype), (slot, 0, 0))
 
-		value_cache_updated = _update_kv(self.value, value, index)
-		key_cache_updated = _update_kv(self.key, key, index)
+		value_cache_updated = _update_kv(_maybe_materialize(self.value), value, index)
+		key_cache_updated = _update_kv(_maybe_materialize(self.key), key, index)
 
 		value_cache_updated = with_sharding_constraint(value_cache_updated, kv_sharding)
 		key_cache_updated = with_sharding_constraint(key_cache_updated, kv_sharding)
@@ -388,14 +393,59 @@ class TransformerCache(BaseCache):
 			]
 		)
 
-	def insert(self, other: TransformerCache, slot: int):
+	def insert(self, other: TransformerCache, slot: int, quantizer: EasyQuantizer):
 		for idx in range(len(self.views)):
 			view = self.views[idx]
 			oview = other.views[idx]
+			ometadata = oview.metadata
+			ometadata.batch_size = view.metadata.batch_size
+			paxis = ometadata.partition_axis
+			default_sharding = PartitionSpec(
+				paxis.batch_axis,
+				paxis.key_sequence_axis,
+				paxis.head_axis,
+				paxis.attention_dim_axis,
+			)
+			k_sharding = getattr(view.key, "sharding", default_sharding)
+			v_sharding = getattr(view.value, "sharding", default_sharding)
+			i_sharding = getattr(view.index, "index", PartitionSpec(default_sharding[0]))
+
+			def _maybe_materialize(x):
+				if hasattr(x, "materialize"):
+					x = x.materialize()
+				return x
+
 			self.views[idx] = view.replace(
-				key=jax.lax.dynamic_update_slice(view.key, oview.key, (slot, 0, 0, 0)),
-				value=jax.lax.dynamic_update_slice(view.value, oview.value, (slot, 0, 0, 0)),
-				index=jax.lax.dynamic_update_slice_in_dim(view.index, oview.index, slot, 0),
+				key=quantizer(
+					with_sharding_constraint(
+						lax.dynamic_update_slice(
+							_maybe_materialize(view.key),
+							oview.key,
+							(slot, 0, 0, 0),
+						),
+						k_sharding,
+					)
+				),
+				value=quantizer(
+					with_sharding_constraint(
+						lax.dynamic_update_slice(
+							_maybe_materialize(view.value),
+							oview.value,
+							(slot, 0, 0, 0),
+						),
+						v_sharding,
+					)
+				),
+				index=with_sharding_constraint(
+					lax.dynamic_update_slice_in_dim(
+						view.index,
+						oview.index,
+						slot,
+						0,
+					),
+					i_sharding,
+				),
+				metadata=ometadata,
 			)
 		return self
 

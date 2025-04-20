@@ -25,7 +25,7 @@ import jax
 from easydel.inference.utilities import SamplingParams
 from easydel.utils.helpers import get_logger
 from .driver import vDriver, AsyncMultifuture, ActiveRequest, ActiveRequestMetadata
-from .engine import vEngine
+from .vengine import vEngine
 from .utils import ReturnSample, is_byte_token, text_tokens_to_string
 
 if tp.TYPE_CHECKING:
@@ -85,6 +85,7 @@ class vSurgeRequest:
 		if self.metadata is None:
 			self.metadata = vSurgeMetadata()
 		self.is_client_side_tokenization = False
+		assert isinstance(self.prompt, str), "prompt should be a single string"
 
 
 class vSurge:

@@ -34,7 +34,7 @@ from jax import numpy as jnp
 from easydel.inference.utilities import SamplingParams
 from easydel.utils.helpers import get_logger
 
-from .engine import ResultTokens, vEngine
+from .vengine import ResultTokens, vEngine
 from .utils import (
 	ReturnSample,
 	pad_tokens,
@@ -224,12 +224,14 @@ class vDriver:
 	_decode_slots: list[queue.Queue[int]] = []
 	_active_requests: list[queue.Queue[tuple[int, ActiveRequest]]] = []
 	_interleaved_mode: bool = False
+	_detokenizing_blocks: int = 16
 
 	def __init__(
 		self,
 		prefill_engines: tp.Optional[list[vEngine] | vEngine] = None,
 		decode_engines: tp.Optional[list[vEngine] | vEngine] = None,
 		interleaved_mode: bool = False,
+		detokenizing_blocks: int = 16,
 	):
 		"""Initializes the vDriver.
 
@@ -261,6 +263,7 @@ class vDriver:
 		self._prefill_engines = prefill_engines
 		self._decode_engines = decode_engines
 		self._interleaved_mode = interleaved_mode
+		self._detokenizing_blocks = detokenizing_blocks
 		self._prefill_backlog = queue.Queue()
 
 		self._transfer_backlogs = [
@@ -273,7 +276,9 @@ class vDriver:
 			)
 			for idx, engine in enumerate(self._decode_engines)
 		}
-		self._detokenize_backlogs = [queue.Queue(8) for _ in self._decode_engines]
+		self._detokenize_backlogs = [
+			queue.Queue(detokenizing_blocks) for _ in self._decode_engines
+		]
 		self._decode_slots = [
 			queue.Queue(engine.max_concurrent_decodes) for engine in self._decode_engines
 		]
@@ -349,14 +354,13 @@ class vDriver:
 				padded_tokens = padded_valids = jnp.ones((1, length), "i4")
 				logger.info(f"Compiling PrefillEngine seqlen={length}")
 				prefill_engine.prefill(
-					graphdef=prefill_engine.graphdef,
 					graphstate=prefill_engine.graphstate,
 					graphothers=prefill_engine.graphothers,
 					tokens=padded_tokens,
 					valids=padded_valids,
-					max_length=prefill_engine.max_length,
-					sampling_params=None,
-					samples_per_slot=prefill_engine.samples_per_slot,
+					temperature=jnp.array([1], "f4"),
+					top_p=jnp.array([1], "f4"),
+					top_k=jnp.array([1], "i4"),
 					rngs=prefill_engine.prng_key,
 				)
 
@@ -455,22 +459,24 @@ class vDriver:
 			valids = jnp.array(content["attention_mask"])
 		else:
 			tokens, valids = content
-		sampling_params = SamplingParams(
-			max_tokens=0,
-			presence_penalty=request.presence_penalty,
-			frequency_penalty=request.frequency_penalty,
-			repetition_penalty=request.repetition_penalty,
-			min_p=request.min_p,
-			top_k=request.top_k,
-			top_p=request.top_p,
-			temperature=request.temperature,
+		return (
+			pad_tokens(
+				tokens=tokens,
+				valids=valids,
+				pad_token_id=processor.pad_token_id,
+				max_prefill_length=max_prefill_length,
+			),
+			SamplingParams(
+				max_tokens=0,
+				presence_penalty=request.presence_penalty,
+				frequency_penalty=request.frequency_penalty,
+				repetition_penalty=request.repetition_penalty,
+				min_p=request.min_p,
+				top_k=request.top_k,
+				top_p=request.top_p,
+				temperature=request.temperature,
+			),
 		)
-		return pad_tokens(
-			tokens=tokens,
-			valids=valids,
-			pad_token_id=processor.pad_token_id,
-			max_prefill_length=max_prefill_length,
-		), sampling_params
 
 	def _prefill_thread(self, idx: int):
 		"""Thread which runs in the background performing prefills."""
@@ -502,14 +508,13 @@ class vDriver:
 				prefill_engine.max_prefill_length,
 			)
 			prefill_result, first_token = prefill_engine.prefill(
-				graphdef=prefill_engine.graphdef,
 				graphstate=prefill_engine.graphstate,
 				graphothers=prefill_engine.graphothers,
 				tokens=padded_tokens,
 				valids=padded_valids,
-				max_length=prefill_engine.max_length,
-				sampling_params=sampling_params,
-				samples_per_slot=prefill_engine.samples_per_slot,
+				temperature=jnp.array([sampling_params.temperature], "f4"),
+				top_p=jnp.array([sampling_params.top_p], "f4"),
+				top_k=jnp.array([sampling_params.top_k], "i4"),
 				rngs=prefill_engine.prng_key,
 			)
 			request.prefill_result = prefill_result
@@ -617,7 +622,7 @@ class vDriver:
 
 		time_of_last_print = time.time()
 		while self.live:
-			if (time.time() - time_of_last_print) > 1:
+			if (time.time() - time_of_last_print) > 5:
 				logger.info(
 					"Decode thread making a decision with:"
 					f" prefill_backlog={self._prefill_backlog.qsize()}"
@@ -672,11 +677,9 @@ class vDriver:
 			)
 			# time_of_last_decode = time.time()
 			decode_state, sampled_tokens = decode_engine.decode(
-				graphdef=decode_engine.graphdef,
 				graphstate=decode_engine.graphstate,
 				graphothers=decode_engine.graphothers,
 				state=decode_state,
-				samples_per_slot=decode_engine.samples_per_slot,
 				rngs=decode_engine.prng_key,
 			)
 			# fn_call = time.time()

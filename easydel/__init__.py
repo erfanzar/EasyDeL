@@ -105,6 +105,7 @@ _import_structure = {
 		"vDriver",
 		"vEngine",
 		"vSurge",
+		"vSurgeRequest",
 		"vSurgeApiServer",
 		"vWhisperInference",
 		"vWhisperInferenceConfig",
@@ -466,6 +467,7 @@ if _tp.TYPE_CHECKING:
 		vInferenceConfig,
 		vInferencePreCompileConfig,
 		vSurge,
+		vSurgeRequest,
 		vSurgeApiServer,
 		vWhisperInference,
 		vWhisperInferenceConfig,
@@ -822,7 +824,7 @@ else:
 		extra_objects={"__version__": __version__},
 	)
 
-	_targeted_versions = ["0.0.27"]
+	_targeted_versions = ["0.0.28"]
 
 	from eformer import __version__ as _eform_version
 

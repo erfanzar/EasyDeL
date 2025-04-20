@@ -22,6 +22,7 @@ from .vsurge import (
 	vDriver,
 	vEngine,
 	vSurge,
+	vSurgeRequest,
 	vSurgeApiServer,
 )
 from .vwhisper import (
@@ -38,6 +39,7 @@ __all__ = (
 	"vDriver",
 	"vEngine",
 	"vSurge",
+	"vSurgeRequest",
 	"vSurgeApiServer",
 	"vWhisperInference",
 	"vWhisperInferenceConfig",
