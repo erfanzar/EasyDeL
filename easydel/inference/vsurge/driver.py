@@ -30,16 +30,17 @@ from concurrent import futures
 import jax
 import numpy as np
 from jax import numpy as jnp
+from transformers import ProcessorMixin
 
 from easydel.inference.utilities import SamplingParams
 from easydel.utils.helpers import get_logger
 
-from .vengine import ResultTokens, vEngine
 from .utils import (
 	ReturnSample,
 	pad_tokens,
 	process_result_tokens,
 )
+from .vengine import ResultTokens, vEngine
 
 if tp.TYPE_CHECKING:
 	from easydel.infra.base_module import EasyDeLBaseModule
@@ -224,14 +225,14 @@ class vDriver:
 	_decode_slots: list[queue.Queue[int]] = []
 	_active_requests: list[queue.Queue[tuple[int, ActiveRequest]]] = []
 	_interleaved_mode: bool = False
-	_detokenizing_blocks: int = 16
+	_detokenizing_blocks: int = 8
 
 	def __init__(
 		self,
 		prefill_engines: tp.Optional[list[vEngine] | vEngine] = None,
 		decode_engines: tp.Optional[list[vEngine] | vEngine] = None,
 		interleaved_mode: bool = False,
-		detokenizing_blocks: int = 16,
+		detokenizing_blocks: int = 8,
 	):
 		"""Initializes the vDriver.
 
@@ -340,20 +341,24 @@ class vDriver:
 			t.start()
 
 	def compile(self):
-		"""Compiles the prefill engines."""
-		self._compile_prefill()
+		"""Compiles engines."""
 
-	def _compile_prefill(self):
-		"""Compiles the prefill engines for various sequence lengths."""
-		for prefill_engine in self._prefill_engines:
+		for (
+			decode_engine,
+			prefill_engine,
+		) in zip(
+			self._decode_engines,
+			self._prefill_engines,
+		):
+			decode_state = decode_engine.init_decode_state()
 			max_prefill_length = prefill_engine.max_prefill_length
-			vals = prefill_engine.max_prefill_lengths[
-				: prefill_engine.max_prefill_lengths.index(max_prefill_length)
+			vals = prefill_engine.prefill_lengths[
+				: prefill_engine.prefill_lengths.index(max_prefill_length)
 			] + [max_prefill_length]
 			for length in vals:
 				padded_tokens = padded_valids = jnp.ones((1, length), "i4")
-				logger.info(f"Compiling PrefillEngine seqlen={length}")
-				prefill_engine.prefill(
+				logger.info(f"Compiling prefill-engine seqlen={length}")
+				state_new, _ = prefill_engine.prefill(
 					graphstate=prefill_engine.graphstate,
 					graphothers=prefill_engine.graphothers,
 					tokens=padded_tokens,
@@ -363,6 +368,16 @@ class vDriver:
 					top_k=jnp.array([1], "i4"),
 					rngs=prefill_engine.prng_key,
 				)
+				logger.info(f"Compiling decode-engine insert seqlen={length}")
+				decode_state = decode_engine.insert(state_new, decode_state, 0)
+
+			logger.info("Compiling decode-engine")
+			decode_engine.decode(
+				graphstate=decode_engine.graphstate,
+				graphothers=decode_engine.graphothers,
+				state=decode_state,
+				rngs=decode_engine.prng_key,
+			)
 
 	def stop(self):
 		"""Stops the driver and all background threads."""
@@ -433,6 +448,7 @@ class vDriver:
 		request: ActiveRequest,
 		processor: ProcessingClassType,
 		max_prefill_length: int,
+		prefill_lengths: list[int],
 	) -> tp.Tuple[tp.Tuple[jnp.ndarray, jnp.ndarray, int], SamplingParams]:
 		"""Tokenizes, pads, and prepares sampling parameters for a prefill request.
 
@@ -454,17 +470,22 @@ class vDriver:
 		"""
 		content = request.prefill_content
 		if isinstance(content, str):
-			content = processor(content, return_tensors="np", return_attention_mask=True)
+			content = processor(text=content, return_tensors="np", return_attention_mask=True)
 			tokens = jnp.array(content["input_ids"])
 			valids = jnp.array(content["attention_mask"])
 		else:
 			tokens, valids = content
+		if isinstance(processor, ProcessorMixin):
+			pad_token_id = processor.tokenizer.pad_token_id
+		else:
+			pad_token_id = processor.pad_token_id
 		return (
 			pad_tokens(
 				tokens=tokens,
 				valids=valids,
-				pad_token_id=processor.pad_token_id,
+				pad_token_id=pad_token_id,
 				max_prefill_length=max_prefill_length,
+				prefill_lengths=prefill_lengths,
 			),
 			SamplingParams(
 				max_tokens=0,
@@ -491,10 +512,7 @@ class vDriver:
 			if request is None:
 				break
 			request.metadata.prefill_dequeue_time = time.perf_counter()
-			logger.info(
-				f"Prefilling on prefill engine {idx} : "
-				f"prefill queue size, {self._prefill_backlog.qsize()}",
-			)
+
 			(
 				(
 					padded_tokens,
@@ -506,6 +524,11 @@ class vDriver:
 				request,
 				processor,
 				prefill_engine.max_prefill_length,
+				prefill_engine.prefill_lengths,
+			)
+			logger.info(
+				f"Prefilling on prefill engine {idx} : "
+				f"prefill queue size : {self._prefill_backlog.qsize()}, Token size {padded_valids.shape[-1]}",
 			)
 			prefill_result, first_token = prefill_engine.prefill(
 				graphstate=prefill_engine.graphstate,
@@ -675,23 +698,23 @@ class vDriver:
 			assert my_slots.qsize() < max_concurrent_decodes, (
 				"At this point we must have some requests inserted into the slots."
 			)
-			# time_of_last_decode = time.time()
+			time_of_last_decode = time.time()
 			decode_state, sampled_tokens = decode_engine.decode(
 				graphstate=decode_engine.graphstate,
 				graphothers=decode_engine.graphothers,
 				state=decode_state,
 				rngs=decode_engine.prng_key,
 			)
-			# fn_call = time.time()
+			fn_call = time.time()
 			sampled_tokens.copy_to_host_async()
 			my_detokenize_backlog.put((generate_timestep, sampled_tokens), block=True)
 			generate_timestep += 1
 			# TODO:Debug
-			# logger.info(
-			# 	f"Decode engine {idx} step {generate_timestep} - slots free : {my_slots_size} / {max_concurrent_decodes}, "
-			# 	f"took {(time.time() - time_of_last_decode) * 10**3}ms "
-			# 	f" func took {(fn_call - time_of_last_decode) * 10**3}ms "
-			# )
+			logger.info(
+				f"Decode engine {idx} step {generate_timestep} - slots free : {my_slots_size} / {max_concurrent_decodes}, "
+				f"took {(time.time() - time_of_last_decode) * 10**3}ms "
+				f" func took {(fn_call - time_of_last_decode) * 10**3}ms "
+			)
 
 	def _detokenize_thread(self, idx: int):
 		"""Detokenize sampled tokens and returns them to the user."""

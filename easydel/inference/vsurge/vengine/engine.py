@@ -15,8 +15,13 @@
 import typing as tp
 
 import jax
+from eformer import escale as es
 from flax import nnx as nn
 from jax import numpy as jnp
+from jax.sharding import NamedSharding as Ns
+from jax.sharding import PartitionSpec as Ps
+
+from easydel.utils.compiling_utils import cjit
 
 from .utilities import (
 	GenerationState,
@@ -49,7 +54,7 @@ class vEngine:
 		processor,
 		max_concurrent_decodes: int | None = None,
 		max_concurrent_prefill: int | None = None,
-		max_prefill_lengths: int | None = None,
+		prefill_lengths: int | None = None,
 		max_prefill_length: int | None = None,
 		max_length: int | None = None,
 		batch_size: int | None = None,
@@ -64,7 +69,7 @@ class vEngine:
 		        decoded concurrently. Defaults to the number of available JAX devices.
 		    max_concurrent_prefill: The maximum number of prefill requests that can be
 		        processed concurrently. Defaults to the number of available JAX devices.
-		    max_prefill_lengths: A list of integer bucket lengths to choose from for prefill.
+		    prefill_lengths: A list of integer bucket lengths to choose from for prefill.
 		        Defaults to `DEFAULT_PREFILL_BUCKETS`.
 		    max_prefill_length: The maximum allowed length for the initial prompt
 		        (prefill phase). Defaults to 4096.
@@ -84,13 +89,100 @@ class vEngine:
 			block_size=model.config.kv_cache_quantization_blocksize,
 			quantization_platform=model.config.platform,
 		)
-		self._max_prefill_lengths = max_prefill_lengths or DEFAULT_PREFILL_BUCKETS
+		self._max_prefill_lengths = prefill_lengths or DEFAULT_PREFILL_BUCKETS
 		self._max_concurrent_decodes = max_concurrent_decodes or jax.device_count()
 		self._max_concurrent_prefill = max_concurrent_prefill or jax.device_count()
 		self._max_prefill_length = max_prefill_length or 4096
 		self._max_length = max_length or 8192
 		self._batch_size = batch_size
 		self._prng_key = jax.random.PRNGKey(seed)
+		self._empty_sharding = Ns(model.mesh, Ps())
+		self._setup_functions()
+
+	def get_state_shardings(self, is_decode: bool = False):
+		paxis = self.model.config.partition_axis
+		kvps = Ps(
+			paxis.batch_axis if is_decode else None,
+			paxis.key_sequence_axis,
+			paxis.head_axis,
+			paxis.attention_dim_axis,
+		)
+		ieps = Ps(paxis.batch_axis) if is_decode else Ps()
+		idps = Ps(paxis.batch_axis, None) if is_decode else Ps()
+		return (
+			("tokens", idps),
+			("valids", idps),
+			("next_position_ids", idps),
+			("cache/views/[0-9]+/(key|value)/(scale|weight)", kvps),
+			("cache/views/[0-9]+/(key|value)/(packed|absmax)", kvps),
+			("cache/views/[0-9]+/(key|value)", kvps),
+			("cache/views/[0-9]+/index", ieps),
+			(".*", Ps()),
+		)
+
+	def _setup_functions(self):
+		with self.model.mesh:
+			self._prefill_state_sharding = jax.tree_util.tree_map(
+				lambda x: Ns(self.model.mesh, x),
+				es.match_partition_rules(
+					self.get_state_shardings(False),
+					jax.eval_shape(lambda: self.init_decode_state(is_prefill=True)),
+				),
+			)
+			self._decodes_state_sharding = jax.tree_util.tree_map(
+				lambda x: Ns(self.model.mesh, x),
+				es.match_partition_rules(
+					self.get_state_shardings(True),
+					jax.eval_shape(lambda: self.init_decode_state(is_prefill=False)),
+				),
+			)
+
+			self.continuous_prefill = cjit(
+				jax.jit(
+					continuous_prefill,
+					static_argnums=(0, 8),
+					in_shardings=(
+						es.extract_shardings(self.graphstate),
+						es.extract_shardings(self.graphothers),
+						self._empty_sharding,
+						self._empty_sharding,
+						self._empty_sharding,
+						self._empty_sharding,
+						self._empty_sharding,
+						None,
+						None,
+					),
+					out_shardings=(self._prefill_state_sharding, None),
+				),
+				static_argnums=(0, 8),
+			)
+			self.continuous_decode = jax.jit(
+				continuous_decode,
+				static_argnums=(0,),
+				donate_argnums=(3,),
+				in_shardings=(
+					es.extract_shardings(self.graphstate),
+					es.extract_shardings(self.graphothers),
+					self._decodes_state_sharding,
+					None,
+					None,
+				),
+				out_shardings=(self._decodes_state_sharding, None),
+			)
+			self.continuous_insert = cjit(
+				jax.jit(
+					continuous_insert,
+					donate_argnums=(0, 1),
+					static_argnums=(3,),
+					in_shardings=(
+						self._prefill_state_sharding,
+						self._decodes_state_sharding,
+						None,
+					),
+					out_shardings=self._decodes_state_sharding,
+				),
+				static_argnums=(3,),
+			)
 
 	@property
 	def samples_per_slot(self) -> int:
@@ -117,7 +209,7 @@ class vEngine:
 		return new_key
 
 	@property
-	def max_prefill_lengths(self) -> list[int]:
+	def prefill_lengths(self) -> list[int]:
 		"""Returns the configured list of max prefill length buckets for the engine."""
 		return self._max_prefill_lengths
 
@@ -156,24 +248,44 @@ class vEngine:
 
 		Currently returns None, indicating default or no specific sharding.
 		"""
-		return None
+		return self._prefill_state_sharding
 
-	def init_decode_state(self, *args, **kwargs) -> GenerationState:
+	def init_decode_state(
+		self,
+		is_prefill: bool = False,
+		*args,
+		**kwargs,
+	) -> GenerationState:
 		"""Initializes the GenerationState for a new sequence"""
 		concurrent_decode = self.max_concurrent_decodes
-		vocab_size = self.model.config.vocab_size
+		if is_prefill:
+			concurrent_decode = 1
+		paxis = self.model.config.partition_axis
+		if not is_prefill:
+			bsharing = Ns(self.model.mesh, Ps(paxis.batch_axis))
+		else:
+			bsharing = Ns(self.model.mesh, Ps())
+
+		seqlen = self.max_length if is_prefill else 1
+		vocab_size = getattr(self.model.config, "vocab_size", None)
+		if vocab_size is None and hasattr(self.model.config, "text_config"):
+			vocab_size = getattr(self.model.config.text_config, "vocab_size", None)
+		assert vocab_size is not None, "couldn't find `vocab_size` in model config"
 		with self.model.mesh:
 			return GenerationState(
-				logits=jnp.zeros((concurrent_decode, vocab_size), self.model.dtype),
+				logits=jnp.zeros(
+					(concurrent_decode, vocab_size), self.model.dtype, device=bsharing
+				),
 				cache=self.model.init_cache(concurrent_decode, self.max_length),
-				index=jnp.zeros((concurrent_decode, 1), "i4"),
-				tokens=jnp.zeros((concurrent_decode, 1), "i4"),
-				valids=jnp.zeros((concurrent_decode, self.max_length), "b1"),
-				next_position_ids=jnp.zeros((concurrent_decode, 1), "i4"),
-				temperature=jnp.zeros((concurrent_decode,), "f4"),
-				top_p=jnp.zeros((concurrent_decode,), "f4"),
-				top_k=jnp.zeros((concurrent_decode,), "i4"),
-				generated_tokens=jnp.zeros((concurrent_decode, 1), "i4"),
+				# this is 1 always
+				index=jnp.zeros((concurrent_decode, seqlen), "i4", device=bsharing),
+				tokens=jnp.zeros((concurrent_decode, seqlen), "i4", device=bsharing),
+				valids=jnp.zeros((concurrent_decode, self.max_length), "b1", device=bsharing),
+				next_position_ids=jnp.zeros((concurrent_decode, seqlen), "i4", device=bsharing),
+				temperature=jnp.zeros((concurrent_decode,), "f4", device=bsharing),
+				top_p=jnp.zeros((concurrent_decode,), "f4", device=bsharing),
+				top_k=jnp.zeros((concurrent_decode,), "i4", device=bsharing),
+				generated_tokens=jnp.zeros((concurrent_decode, 1), "i4", device=bsharing),
 			)
 
 	def free_resource(self, slot: int) -> bool:
@@ -229,18 +341,18 @@ class vEngine:
 		        - generation_state: The initial GenerationState for the decode loop.
 		        - result: A ResultTokens object containing the *first* generated token.
 		"""
-		return continuous_prefill(
-			graphdef=self.graphdef,
-			graphstate=graphstate,
-			graphothers=graphothers,
-			tokens=tokens,
-			valids=valids,
-			temperature=temperature,
-			top_p=top_p,
-			top_k=top_k,
-			max_length=self.max_length,
-			samples_per_slot=self.samples_per_slot,
-			rngs=rngs,
+		return self.continuous_prefill(
+			self.graphdef,
+			graphstate,
+			graphothers,
+			tokens,
+			valids,
+			temperature,
+			top_p,
+			top_k,
+			self.max_length,
+			self.samples_per_slot,
+			rngs,
 		)
 
 	def decode(
@@ -268,13 +380,13 @@ class vEngine:
 		        - next_generation_state: The updated GenerationState for the next iteration.
 		        - result: A ResultTokens object containing the newly generated token.
 		"""
-		return continuous_decode(
-			graphdef=self.graphdef,
-			graphstate=graphstate,
-			graphothers=graphothers,
-			state=state,
-			samples_per_slot=self.samples_per_slot,
-			rngs=rngs,
+		return self.continuous_decode(
+			self.graphdef,
+			graphstate,
+			graphothers,
+			state,
+			self.samples_per_slot,
+			rngs,
 		)
 
 	def insert(
@@ -304,11 +416,11 @@ class vEngine:
 		    prefix state with its cache potentially broadcasted. Needs clarification
 		    on the intended merging logic with `decode_state` and `slot`.
 		"""
-		return continuous_insert(
-			prefix=prefix,
-			decode_state=decode_state,
-			slot=slot,
-			quantizer=self._quantizer,
+		return self.continuous_insert(
+			prefix,
+			decode_state,
+			slot,
+			self._quantizer,
 		)
 
 	def bulk_insert(

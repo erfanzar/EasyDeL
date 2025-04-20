@@ -275,6 +275,19 @@ class LlavaForConditionalGeneration(EasyDeLBaseModule):
 			image_hidden_states=image_features if pixel_values is not None else None,
 		)
 
+	def init_cache(
+		self,
+		batch_size,
+		max_length,
+		pad_token_id=None,
+		prefill_length=None,
+	):
+		return self.language_model.init_cache(
+			batch_size,
+			max_length,
+			pad_token_id,
+			prefill_length,
+		)
 	def _get_compile_model_kwargs(
 		self,
 		batch_size: int,

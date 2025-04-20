@@ -15,7 +15,7 @@
 import typing as tp
 import warnings
 from enum import Enum
-from functools import cached_property
+from functools import cached_property, partial
 
 import einops
 import flax.nnx as nn
@@ -425,8 +425,8 @@ class AttentionModule(nn.Module):
 		               adjusted by the cache index if provided. Shape usually [batch, q_len].
 		"""
 
-		end_index = cache_view.index[0] if cache_view is not None else 0
-		inipos = jnp.cumsum(jnp.any(attention_mask, -1)[:, -1, :], axis=-1)
+		end_index = jnp.reshape(cache_view.index, (-1, 1)) if cache_view is not None else 0
+		inipos = jnp.cumsum(jnp.any(attention_mask, -1)[:, -1, :], axis=-1) 
 		return (inipos - (inipos >= 1)) + end_index
 
 	@cached_property
@@ -496,7 +496,7 @@ class AttentionModule(nn.Module):
 	@staticmethod
 	def _create_sliding_mask(
 		cache_pos: jnp.ndarray,
-		curr_index: int,
+		curr_index: jnp.ndarray,
 		cache_length: int,
 		sliding_windows: int,
 	):
@@ -512,28 +512,34 @@ class AttentionModule(nn.Module):
 		Returns:
 		    jnp.ndarray: A boolean mask where True indicates positions within the sliding window.
 		"""
-		total_tokens = curr_index + cache_pos.shape[1]
 
-		def _reconstruct_rotated_cache_positions():
-			cache_positions = jnp.arange(cache_length) + total_tokens - cache_length
-			cache_positions = (
-				jnp.zeros_like(cache_positions)
-				.at[cache_positions % cache_length]
-				.set(cache_positions)
+		@partial(jax.vmap, in_axes=(0, 0), out_axes=0)
+		def _map(bindex, cache_pos):
+			total_tokens = bindex + cache_pos.shape[1]
+
+			def _reconstruct_rotated_cache_positions():
+				cache_positions = jnp.arange(cache_length) + total_tokens - cache_length
+				cache_positions = (
+					jnp.zeros_like(cache_positions)
+					.at[cache_positions % cache_length]
+					.set(cache_positions)
+				)
+				return cache_positions
+
+			cache_positions = jax.lax.cond(
+				total_tokens <= cache_length,
+				lambda: jnp.arange(cache_length),
+				_reconstruct_rotated_cache_positions,
 			)
-			return cache_positions
 
-		cache_positions = jax.lax.cond(
-			total_tokens <= cache_length,
-			lambda: jnp.arange(cache_length),
-			_reconstruct_rotated_cache_positions,
-		)
+			cache_positions = cache_positions[None, None, :]
+			cache_pos = cache_pos[:, :, None]
+			sliding_mask = cache_positions > cache_pos - sliding_windows
+			sliding_mask *= cache_positions < cache_pos + sliding_windows
+			return sliding_mask
 
-		cache_positions = cache_positions[None, None, :]
-		cache_pos = cache_pos[:, :, None]
-		sliding_mask = cache_positions > cache_pos - sliding_windows
-		sliding_mask *= cache_positions < cache_pos + sliding_windows
-		return sliding_mask
+		mask = _map(curr_index, cache_pos[:, None, :])
+		return mask
 
 	@jax.named_scope("easydel-flax-attention-concatenate")
 	def concatenate(

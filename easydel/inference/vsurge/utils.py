@@ -19,6 +19,7 @@ from bisect import bisect_left
 import jax
 import numpy as np
 from jax import numpy as jnp
+from transformers import ProcessorMixin
 
 from .vengine import ResultTokens
 
@@ -86,7 +87,10 @@ def process_result_tokens(
 	slot_valid = slot_data.valid
 	slot_lengths = slot_data.lengths
 	samples, speculations = slot_tokens.shape
-	eos_token_id = processor.eos_token_id
+	if isinstance(processor, ProcessorMixin):
+		eos_token_id = processor.tokenizer.eos_token_id
+	else:
+		eos_token_id = processor.eos_token_id
 	if isinstance(eos_token_id, int):
 		eos_token_id = [eos_token_id]
 	complete = complete | (slot_lengths > slot_max_length)
@@ -175,7 +179,7 @@ def tokenize_and_pad(
 	return padded_tokens, padded_valids, padded_length
 
 
-DEFAULT_PREFILL_BUCKETS = [2**s for s in range(3, 24)]
+DEFAULT_PREFILL_BUCKETS = [2**s for s in range(5, 24)]
 
 
 def take_nearest_length(lengths: list[int], length: int) -> int:

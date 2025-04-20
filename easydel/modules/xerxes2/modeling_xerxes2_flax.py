@@ -684,7 +684,9 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 				self.config.partition_axis.attention_dim_axis,
 			),
 			metadata=self.create_cache_metadata(
-				batch_size=batch_size, max_length=max_length, pad_token_id=pad_token_id
+				batch_size=batch_size,
+				max_length=max_length,
+				pad_token_id=pad_token_id,
 			),
 			quantizer=self._quant_class(
 				quantization_method=self.config.kv_cache_quantization_method,
