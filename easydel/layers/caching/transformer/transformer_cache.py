@@ -397,14 +397,14 @@ class TransformerCache(BaseCache):
 		for idx in range(len(self.views)):
 			view = self.views[idx]
 			oview = other.views[idx]
-			ometadata = oview.metadata
-			ometadata.batch_size = view.metadata.batch_size
-			paxis = ometadata.partition_axis
+
+			metadata = view.metadata
+
 			default_sharding = PartitionSpec(
-				paxis.batch_axis,
-				paxis.key_sequence_axis,
-				paxis.head_axis,
-				paxis.attention_dim_axis,
+				metadata.partition_axis.batch_axis,
+				metadata.partition_axis.key_sequence_axis,
+				metadata.partition_axis.head_axis,
+				metadata.partition_axis.attention_dim_axis,
 			)
 			k_sharding = getattr(view.key, "sharding", default_sharding)
 			v_sharding = getattr(view.value, "sharding", default_sharding)
@@ -415,7 +415,7 @@ class TransformerCache(BaseCache):
 					x = x.materialize()
 				return x
 
-			self.views[idx] = view.replace(
+			self.views[idx] = self.views[idx].replace(
 				key=quantizer(
 					with_sharding_constraint(
 						lax.dynamic_update_slice(
@@ -437,15 +437,10 @@ class TransformerCache(BaseCache):
 					)
 				),
 				index=with_sharding_constraint(
-					lax.dynamic_update_slice_in_dim(
-						view.index,
-						oview.index,
-						slot,
-						0,
-					),
+					lax.dynamic_update_slice_in_dim(view.index, oview.index, slot, 0),
 					i_sharding,
 				),
-				metadata=ometadata,
+				metadata=view.metadata,
 			)
 		return self
 

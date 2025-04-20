@@ -368,7 +368,6 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
 			output_hidden_states=output_hidden_states,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
-
 			inputs_embeds=inputs_embeds,
 			segment_ids=segment_ids,
 			**lm_kwargs,
@@ -381,6 +380,20 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
 			image_hidden_states=image_features if pixel_values is not None else None,
+		)
+
+	def init_cache(
+		self,
+		batch_size,
+		max_length,
+		pad_token_id=None,
+		prefill_length=None,
+	):
+		return self.language_model.init_cache(
+			batch_size,
+			max_length,
+			pad_token_id,
+			prefill_length,
 		)
 
 	def _get_compile_model_kwargs(

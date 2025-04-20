@@ -26,7 +26,6 @@ from jax.sharding import PartitionSpec
 
 from easydel.layers.caching.transformer.transformer_cache import TransformerCache
 from easydel.layers.quantization.quantizers import EasyQuantizer
-from easydel.utils.compiling_utils import cjit
 
 
 if tp.TYPE_CHECKING:
@@ -288,8 +287,7 @@ def continuous_bulk_insert(
 		generated_tokens=gent,
 	)
 
-
-@partial(jax.jit, donate_argnums=(0, 1), static_argnums=(3,))
+ 
 def continuous_insert(
 	prefix: GenerationState,
 	decode_state: GenerationState,
@@ -330,8 +328,6 @@ def continuous_insert(
 	)
 
 
-@partial(cjit, static_argnames=["graphdef", "max_length"])
-@partial(jax.jit, static_argnames=["graphdef", "max_length"])
 def continuous_prefill(
 	graphdef: nn.GraphDef,
 	graphstate: nn.GraphState,
@@ -412,8 +408,6 @@ def continuous_prefill(
 	return generation_state, result
 
 
-@partial(cjit, static_argnames=["graphdef"])
-@partial(jax.jit, static_argnames=["graphdef"], donate_argnums=(3,))
 def continuous_decode(
 	graphdef: nn.GraphDef,
 	graphstate: nn.GraphState,

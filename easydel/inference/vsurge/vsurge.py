@@ -24,9 +24,10 @@ import jax
 
 from easydel.inference.utilities import SamplingParams
 from easydel.utils.helpers import get_logger
-from .driver import vDriver, AsyncMultifuture, ActiveRequest, ActiveRequestMetadata
-from .vengine import vEngine
+
+from .driver import ActiveRequest, ActiveRequestMetadata, AsyncMultifuture, vDriver
 from .utils import ReturnSample, is_byte_token, text_tokens_to_string
+from .vengine import vEngine
 
 if tp.TYPE_CHECKING:
 	from easydel.infra.base_module import EasyDeLBaseModule
@@ -159,7 +160,7 @@ class vSurge:
 		model: EasyDeLBaseModule,
 		processor: ProcessingClassType,
 		max_concurrent_decodes: int | None = None,
-		max_prefill_lengths: int | None = None,
+		prefill_lengths: int | None = None,
 		max_prefill_length: int | None = None,
 		max_length: int | None = None,
 		seed: int = 894,
@@ -176,7 +177,7 @@ class vSurge:
 		    processor: The tokenizer/processor instance.
 		    max_concurrent_decodes: Maximum number of concurrent decode requests
 		        the decode engine can handle.
-		    max_prefill_lengths: A list of prefill lengths to compile for the
+		    prefill_lengths: A list of prefill lengths to compile for the
 		        prefill engine.
 		    max_prefill_length: The maximum prefill length for the prefill engine.
 		    max_length: The maximum total sequence length for both engines.
@@ -192,7 +193,7 @@ class vSurge:
 					model=model,
 					processor=processor,
 					max_concurrent_prefill=1,
-					max_prefill_lengths=max_prefill_lengths,
+					prefill_lengths=prefill_lengths,
 					max_prefill_length=max_prefill_length,
 					max_length=max_length,
 					seed=seed,
@@ -227,7 +228,7 @@ class vSurge:
 		try:
 			if isinstance(text_or_conversation, str):
 				# Tokenize a single string
-				return len(self.processor(text_or_conversation)["input_ids"])
+				return len(self.processor(text=text_or_conversation)["input_ids"])
 			elif isinstance(text_or_conversation, list):
 				if hasattr(self.processor, "apply_chat_template"):
 					tokenized = self.processor.apply_chat_template(
@@ -246,7 +247,7 @@ class vSurge:
 							if isinstance(msg.get("content"), str)
 						]
 					)
-					return len(self.processor(full_text)["input_ids"])
+					return len(self.processor(text=full_text)["input_ids"])
 			else:
 				raise ValueError(
 					f"Unsupported input type for token counting: {type(text_or_conversation)}"

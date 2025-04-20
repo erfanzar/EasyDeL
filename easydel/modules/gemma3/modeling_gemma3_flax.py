@@ -294,16 +294,18 @@ class Gemma3Attention(AttentionModule):
 			fcm_mask=fcm_mask,
 			sliding_windows=None,
 		)
+
 		if self.is_sliding:
-			attention_mask = jnp.logical_and(
-				self._create_sliding_mask(
-					cache_pos=self.build_cache_pos(attention_mask, cache_view),
-					curr_index=cache_view.index[0] if cache_view is not None else 0,
-					cache_length=attention_mask.shape[-1],
-					sliding_windows=self.sliding_window,
-				),
-				attention_mask,
+			cache_pos = self.build_cache_pos(attention_mask, cache_view)
+			sliding_mask = self._create_sliding_mask(
+				cache_pos=cache_pos,
+				curr_index=cache_view.index
+				if cache_view is not None
+				else jnp.repeat(jnp.array([0], "i4").reshape(-1), query_states.shape[0], 0),
+				cache_length=attention_mask.shape[-1],
+				sliding_windows=self.sliding_window,
 			)
+			attention_mask = jnp.logical_and(sliding_mask, attention_mask)
 
 			def init_attention_bias():
 				return jax.lax.select(
@@ -1126,6 +1128,20 @@ class Gemma3ForConditionalGeneration(EasyDeLBaseModule):
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
 			image_hidden_states=image_features if pixel_values is not None else None,
+		)
+
+	def init_cache(
+		self,
+		batch_size,
+		max_length,
+		pad_token_id=None,
+		prefill_length=None,
+	):
+		return self.language_model.init_cache(
+			batch_size,
+			max_length,
+			pad_token_id,
+			prefill_length,
 		)
 
 	def _get_compile_model_kwargs(
