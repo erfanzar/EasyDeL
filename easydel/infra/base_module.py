@@ -742,6 +742,16 @@ class EasyDeLBaseModule(
 			mesh=mesh,
 		)[1]
 
+	def apply_out_shardings(self, out_shardings):
+		splits = self.split_module()
+
+		@partial(jax.jit, out_shardings=out_shardings)
+		def _call(graphstate, graphother):
+			return graphstate, graphother
+
+		splits[1:] = _call(*splits[1:])
+		return self.merge_module(*splits)
+
 	def fully_shard(self: SELF, partition_rules: PartitionLike = None) -> SELF:
 		"""
 		Applies JAX sharding constraints to all parameters based on the partition rules.

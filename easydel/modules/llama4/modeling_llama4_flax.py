@@ -1831,12 +1831,14 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
 		max_length,
 		pad_token_id=None,
 		prefill_length=None,
+		shardings=None,
 	):
 		return self.language_model.init_cache(
 			batch_size,
 			max_length,
 			pad_token_id,
 			prefill_length,
+			shardings,
 		)
 
 	def _get_compile_model_kwargs(

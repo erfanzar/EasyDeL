@@ -29,7 +29,7 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 )
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as Ps
-from easydel.kernels.tpu_ops import ragged_attention_pallas
+from easydel.kernels.tpu_ops.ragged_attention_pallas import pallas_ragged_decode
 from easydel.layers.caching.transformer.transformer_cache import TransformerCacheView
 from .._attention_impl import (
 	AttentionImpl,
@@ -126,12 +126,7 @@ class SplashAttn(AttentionImpl):
 		"""
 		query_lenght = q.shape[1]
 		value_lenght = v.shape[1]
-		if (
-			not causal
-			or ((query_lenght % 128) != 0)
-			or ((q.shape[-1] % 128) != 0)
-			or ((v.shape[-1] % 128) != 0)
-		):
+		if not causal or ((q.shape[-1] % 128) != 0) or ((v.shape[-1] % 128) != 0):
 			return VanillaAttn(self.metadata)(
 				q=q,
 				k=k,
@@ -172,17 +167,7 @@ class SplashAttn(AttentionImpl):
 		if mask is not None:
 			q_mask, kv_mask = self._split_attention_mask(mask)
 			q_mask, kv_mask = (q_mask.astype("i4"), kv_mask.astype("i4"))
-			# pallas dont support int1 or bool in shardmap idk why
-		pi = [0, 1, 3]
-		mpi = [0]
-		# query_partition_spec is like PB,PH,PS,PD
-		# v is like BSHD since it's not transposed yet
-		gather_ps = query_partition_spec[1]
-		tparallel = self.metadata.mesh.shape[gather_ps] if gather_ps is not None else None
-		pi = [0]
-		if tparallel is not None:
-			if (v.shape[2] % tparallel) == 0 and tparallel <= v.shape[2]:
-				pi = [0, 3]  # shard DP, FSDP and TP
+
 		index, prefill_length = [None] * 2
 		if cache_view is not None:
 			index, prefill_length = cache_view.index, cache_view.prefill_length
@@ -191,15 +176,43 @@ class SplashAttn(AttentionImpl):
 			shard_map,
 			mesh=self.metadata.mesh,
 			in_specs=(
-				self.create_stable_sharding(query_partition_spec, pi, dep=q),
-				self.create_stable_sharding(key_partition_spec, pi, dep=k),
-				self.create_stable_sharding(value_partition_spec, pi, dep=v),
-				self.create_stable_sharding(qkv_mask_partition_spec, mpi, dep=q_mask),
-				self.create_stable_sharding(qkv_mask_partition_spec, mpi, dep=kv_mask),
-				self.create_stable_sharding(views_partition_spec, mpi, dep=index),
-				self.create_stable_sharding(views_partition_spec, mpi, dep=prefill_length),
+				self.create_stable_sharding(
+					query_partition_spec,
+					dep=q,
+					tensor=q,
+				),
+				self.create_stable_sharding(
+					key_partition_spec,
+					dep=k,
+					tensor=k,
+				),
+				self.create_stable_sharding(
+					value_partition_spec,
+					dep=v,
+					tensor=v,
+				),
+				self.create_stable_sharding(
+					qkv_mask_partition_spec,
+					dep=q_mask,
+					tensor=q_mask,
+				),
+				self.create_stable_sharding(
+					qkv_mask_partition_spec,
+					dep=kv_mask,
+					tensor=kv_mask,
+				),
+				self.create_stable_sharding(
+					views_partition_spec,
+					dep=index,
+					tensor=index,
+				),
+				self.create_stable_sharding(
+					views_partition_spec,
+					dep=prefill_length,
+					tensor=prefill_length,
+				),
 			),
-			out_specs=self.create_stable_sharding(attention_partition_spec, pi),
+			out_specs=self.create_stable_sharding(attention_partition_spec, tensor=q),
 			check_rep=False,
 		)
 		def _wraped_flash_attn(q, k, v, q_mask, kv_mask, index, prefill_length):
@@ -226,10 +239,10 @@ class SplashAttn(AttentionImpl):
 			else:
 				out = jax.vmap(
 					functools.partial(
-						ragged_attention_pallas,
+						pallas_ragged_decode,
 						scale=sm_scale,
-						block_kv=512,
-						block_bs=32,
+						block_kv=1024,
+						block_bs=min(q.shape[0], 32),
 					),
 					(1, 1, 1, None, None),
 					1,

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import typing as tp
+from functools import cached_property
 
 import jax
 from eformer import escale as es
@@ -20,6 +21,7 @@ from flax import nnx as nn
 from jax import numpy as jnp
 from jax.sharding import NamedSharding as Ns
 from jax.sharding import PartitionSpec as Ps
+from transformers import ProcessorMixin
 
 from easydel.utils.compiling_utils import cjit
 
@@ -36,6 +38,11 @@ if tp.TYPE_CHECKING:
 	from easydel.infra import EasyDeLBaseModule
 else:
 	EasyDeLBaseModule = tp.Any
+
+
+import jax.experimental.layout as jlu
+
+AutoLayout = jlu.Layout(jlu.DeviceLocalLayout.AUTO)
 
 
 class vEngine:
@@ -107,16 +114,22 @@ class vEngine:
 			paxis.head_axis,
 			paxis.attention_dim_axis,
 		)
-		ieps = Ps(paxis.batch_axis) if is_decode else Ps()
-		idps = Ps(paxis.batch_axis, None) if is_decode else Ps()
+		bsharding = Ps(paxis.batch_axis) if is_decode else Ps()
+
 		return (
-			("tokens", idps),
-			("valids", idps),
-			("next_position_ids", idps),
+			("index", bsharding),
+			("logits", bsharding),
+			("tokens", bsharding),
+			("valids", bsharding),
+			("next_position_ids", bsharding),
+			("temperature", bsharding),
+			("top_p", bsharding),
+			("top_k", bsharding),
+			("generated_tokens", bsharding),
 			("cache/views/[0-9]+/(key|value)/(scale|weight)", kvps),
 			("cache/views/[0-9]+/(key|value)/(packed|absmax)", kvps),
 			("cache/views/[0-9]+/(key|value)", kvps),
-			("cache/views/[0-9]+/index", ieps),
+			("cache/views/[0-9]+/index", bsharding),
 			(".*", Ps()),
 		)
 
@@ -126,26 +139,29 @@ class vEngine:
 				lambda x: Ns(self.model.mesh, x),
 				es.match_partition_rules(
 					self.get_state_shardings(False),
-					jax.eval_shape(lambda: self.init_decode_state(is_prefill=True)),
+					jax.eval_shape(self.init_decode_state),
+					min_size=0,
 				),
 			)
 			self._decodes_state_sharding = jax.tree_util.tree_map(
 				lambda x: Ns(self.model.mesh, x),
 				es.match_partition_rules(
 					self.get_state_shardings(True),
-					jax.eval_shape(lambda: self.init_decode_state(is_prefill=False)),
+					jax.eval_shape(self.init_decode_state),
+					min_size=0,
 				),
 			)
 
 			self.continuous_prefill = cjit(
 				jax.jit(
 					continuous_prefill,
-					static_argnums=(0, 8),
+					static_argnums=(0, 9),
 					in_shardings=(
 						es.extract_shardings(self.graphstate),
 						es.extract_shardings(self.graphothers),
 						self._empty_sharding,
 						self._empty_sharding,
+						None,
 						self._empty_sharding,
 						self._empty_sharding,
 						self._empty_sharding,
@@ -154,20 +170,23 @@ class vEngine:
 					),
 					out_shardings=(self._prefill_state_sharding, None),
 				),
-				static_argnums=(0, 8),
+				static_argnums=(0, 9),
 			)
-			self.continuous_decode = jax.jit(
-				continuous_decode,
-				static_argnums=(0,),
-				donate_argnums=(3,),
-				in_shardings=(
-					es.extract_shardings(self.graphstate),
-					es.extract_shardings(self.graphothers),
-					self._decodes_state_sharding,
-					None,
-					None,
+			self.continuous_decode = cjit(
+				jax.jit(
+					continuous_decode,
+					static_argnums=(0,),
+					donate_argnums=(3,),
+					in_shardings=(
+						es.extract_shardings(self.graphstate),
+						es.extract_shardings(self.graphothers),
+						self._decodes_state_sharding,
+						None,
+						None,
+					),
+					out_shardings=(self._decodes_state_sharding, None),
 				),
-				out_shardings=(self._decodes_state_sharding, None),
+				static_argnums=(0,),
 			)
 			self.continuous_insert = cjit(
 				jax.jit(
@@ -183,6 +202,31 @@ class vEngine:
 				),
 				static_argnums=(3,),
 			)
+
+	@cached_property
+	def pad_token_id(self):
+		if isinstance(self.processor, ProcessorMixin):
+			pad_token_id = self.processor.tokenizer.pad_token_id
+		else:
+			pad_token_id = self.processor.pad_token_id
+		return pad_token_id
+
+	@cached_property
+	def eos_token_ids(self) -> list[int]:
+		eos_ids = []
+		if isinstance(self.processor, ProcessorMixin):
+			proc_eos_token_id = self.processor.tokenizer.eos_token_id
+		else:
+			proc_eos_token_id = self.processor.eos_token_id
+		if isinstance(proc_eos_token_id, int):
+			proc_eos_token_id = [proc_eos_token_id]
+		eos_ids = eos_ids + proc_eos_token_id
+		if hasattr(self.model, "generation_config"):
+			conf_eos = self.model.generation_config.eos_token_id
+			if isinstance(conf_eos, int):
+				conf_eos = [conf_eos]
+			eos_ids = eos_ids + conf_eos
+		return list(set(eos_ids))
 
 	@property
 	def samples_per_slot(self) -> int:
@@ -250,42 +294,28 @@ class vEngine:
 		"""
 		return self._prefill_state_sharding
 
-	def init_decode_state(
-		self,
-		is_prefill: bool = False,
-		*args,
-		**kwargs,
-	) -> GenerationState:
+	def init_decode_state(self, *args, **kwargs) -> GenerationState:
 		"""Initializes the GenerationState for a new sequence"""
 		concurrent_decode = self.max_concurrent_decodes
-		if is_prefill:
-			concurrent_decode = 1
 		paxis = self.model.config.partition_axis
-		if not is_prefill:
-			bsharing = Ns(self.model.mesh, Ps(paxis.batch_axis))
-		else:
-			bsharing = Ns(self.model.mesh, Ps())
-
-		seqlen = self.max_length if is_prefill else 1
+		sharding = Ns(self.model.mesh, Ps(paxis.batch_axis))
 		vocab_size = getattr(self.model.config, "vocab_size", None)
 		if vocab_size is None and hasattr(self.model.config, "text_config"):
 			vocab_size = getattr(self.model.config.text_config, "vocab_size", None)
 		assert vocab_size is not None, "couldn't find `vocab_size` in model config"
+		dt = self.model.dtype
 		with self.model.mesh:
 			return GenerationState(
-				logits=jnp.zeros(
-					(concurrent_decode, vocab_size), self.model.dtype, device=bsharing
-				),
+				logits=jnp.zeros((concurrent_decode, vocab_size), dt, device=sharding),
 				cache=self.model.init_cache(concurrent_decode, self.max_length),
-				# this is 1 always
-				index=jnp.zeros((concurrent_decode, seqlen), "i4", device=bsharing),
-				tokens=jnp.zeros((concurrent_decode, seqlen), "i4", device=bsharing),
-				valids=jnp.zeros((concurrent_decode, self.max_length), "b1", device=bsharing),
-				next_position_ids=jnp.zeros((concurrent_decode, seqlen), "i4", device=bsharing),
-				temperature=jnp.zeros((concurrent_decode,), "f4", device=bsharing),
-				top_p=jnp.zeros((concurrent_decode,), "f4", device=bsharing),
-				top_k=jnp.zeros((concurrent_decode,), "i4", device=bsharing),
-				generated_tokens=jnp.zeros((concurrent_decode, 1), "i4", device=bsharing),
+				index=jnp.zeros((concurrent_decode, 1), "i4", device=sharding),
+				tokens=jnp.zeros((concurrent_decode, 1), "i4", device=sharding),
+				valids=jnp.zeros((concurrent_decode, self.max_length), "b1", device=sharding),
+				next_position_ids=jnp.zeros((concurrent_decode, 1), "i4", device=sharding),
+				temperature=jnp.zeros((concurrent_decode,), "f4", device=sharding),
+				top_p=jnp.zeros((concurrent_decode,), "f4", device=sharding),
+				top_k=jnp.zeros((concurrent_decode,), "i4", device=sharding),
+				generated_tokens=jnp.zeros((concurrent_decode, 1), "i4", device=sharding),
 			)
 
 	def free_resource(self, slot: int) -> bool:
@@ -318,6 +348,7 @@ class vEngine:
 		graphothers: nn.GraphState,
 		tokens: jax.Array,
 		valids: jax.Array,
+		true_length: int,
 		temperature: jax.Array,
 		top_p: jax.Array,
 		top_k: jax.Array,
@@ -347,6 +378,7 @@ class vEngine:
 			graphothers,
 			tokens,
 			valids,
+			true_length,
 			temperature,
 			top_p,
 			top_k,

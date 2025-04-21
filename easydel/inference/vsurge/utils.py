@@ -19,7 +19,6 @@ from bisect import bisect_left
 import jax
 import numpy as np
 from jax import numpy as jnp
-from transformers import ProcessorMixin
 
 from .vengine import ResultTokens
 
@@ -61,6 +60,7 @@ def process_result_tokens(
 	slot_max_length: int,
 	result_tokens: ResultTokens,
 	complete: np.ndarray,
+	eos_token_id: list[int],
 	is_client_side_tokenization: bool = False,
 ) -> tp.Tuple[tp.List[ReturnSample], np.ndarray, list[int]]:
 	"""
@@ -87,10 +87,7 @@ def process_result_tokens(
 	slot_valid = slot_data.valid
 	slot_lengths = slot_data.lengths
 	samples, speculations = slot_tokens.shape
-	if isinstance(processor, ProcessorMixin):
-		eos_token_id = processor.tokenizer.eos_token_id
-	else:
-		eos_token_id = processor.eos_token_id
+
 	if isinstance(eos_token_id, int):
 		eos_token_id = [eos_token_id]
 	complete = complete | (slot_lengths > slot_max_length)

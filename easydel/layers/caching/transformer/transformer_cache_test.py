@@ -88,7 +88,7 @@ def transformer_cache(mesh, cache_metadata_config, quantizer, kv_spec):
 			mesh=mesh,
 			quantizer=quantizer,
 			dtype=jnp.float32,
-			key_values_partition_specs=kv_spec,
+			key_values_shardings=kv_spec,
 		)
 	return cache
 

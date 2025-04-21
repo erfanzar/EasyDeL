@@ -21,7 +21,6 @@ import time
 import typing as tp
 
 import jax
-
 from easydel.inference.utilities import SamplingParams
 from easydel.utils.helpers import get_logger
 
@@ -35,6 +34,7 @@ if tp.TYPE_CHECKING:
 else:
 	ProcessingClassType = tp.Any
 	EasyDeLBaseModule = tp.Any
+
 
 logger = get_logger("vSurge")
 

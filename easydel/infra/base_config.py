@@ -28,7 +28,7 @@ from transformers.configuration_utils import PretrainedConfig
 
 from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.helpers import check_bool_flag, get_logger
-
+from jax.sharding import NamedSharding as Ns, PartitionSpec as Ps
 from .etils import (
 	AVAILABLE_ATTENTION_MECHANISMS,
 	DEFAULT_ATTENTION_MECHANISM,
@@ -892,7 +892,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			rope_scaling=rope_config.to_dict(),
 		)
 
-		return ModuleCaches(frequencies)
+		return ModuleCaches(jax.device_put(frequencies, Ns(self.mesh, Ps())))
 
 	@staticmethod
 	def _create_causal_mask(target_length):
@@ -921,7 +921,12 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
 		target_length = self.granted_mask_max_position_embedding
 
-		return ModuleCaches(self._create_causal_mask(target_length))
+		return ModuleCaches(
+			jax.device_put(
+				self._create_causal_mask(target_length),
+				Ns(self.mesh, Ps()),
+			)
+		)
 
 	def get_fcm_mask(self, batch_size, seq_length, deterministic: bool):
 		if not deterministic and self.fcm_max_ratio > 0:

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from __future__ import annotations
+from eformer import escale as es
 
 import dataclasses
 import typing as tp
@@ -503,6 +504,7 @@ class AttentionImpl(BaseOperation):
 		preserved_indices: tp.List[int] = None,
 		clone_ps: tp.Optional[Ps] = None,
 		dep: tp.Optional[tp.Union[Ps, bool]] = True,
+		tensor: tp.Optional[jax.Array] = None,
 	) -> tp.Optional[Ps]:
 		"""
 		Helper to create a PartitionSpec, potentially preserving only certain axes.
@@ -531,7 +533,9 @@ class AttentionImpl(BaseOperation):
 			return None
 
 		if preserved_indices is None:
-			return state_ps
+			if tensor is None:
+				return state_ps
+			return es.get_corrected_named_sharding(tensor.shape, state_ps).spec
 
 		new_spec = [None] * len(state_ps)
 		for idx in preserved_indices:
