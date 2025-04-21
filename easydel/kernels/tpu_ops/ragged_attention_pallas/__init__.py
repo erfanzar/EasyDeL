@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ._caller import ragged_decode as pallas_ragged_decode
+from ._caller import ragged_attention as pallas_ragged_decode
 
 __all__ = ("pallas_ragged_decode",)

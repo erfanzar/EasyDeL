@@ -18,7 +18,7 @@ from functools import partial
 
 import chex as cx
 import jax
-from eformer.escale import with_sharding_constraint
+from eformer.escale import with_sharding_constraint, get_corrected_named_sharding
 from eformer.jaximus import ImplicitArray
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
@@ -165,13 +165,17 @@ class TransformerCacheView(BaseCacheView):
 				else key_values_shardings
 			)
 			mt = metadata
-			index_device = NamedSharding(mesh, PartitionSpec(device.spec[0]))
+			with mesh:
+				index_device = get_corrected_named_sharding(
+					(mt.batch_size,),
+					PartitionSpec(device.spec[0]),
+				)
 			kshape = (mt.batch_size, mt.sequence_length, mt.key_heads, mt.key_dim)
 			vshape = (mt.batch_size, mt.sequence_length, mt.value_heads, mt.value_dim)
 			prefill_length = (
 				jax.device_put(prefill_length, index_device)
 				if prefill_length is not None
-				else jnp.zeros((metadata.batch_size,), dtype=jnp.int32, device=index_device)
+				else jnp.zeros((mt.batch_size,), dtype=jnp.int32, device=index_device)
 			)
 			out = cls(
 				key=quantizer(jnp.zeros(shape=kshape, dtype=dtype, device=device)),
@@ -354,7 +358,10 @@ class TransformerCache(BaseCache):
 
 	def to_pure(self):
 		return (
-			[[layer.key, layer.value, layer.index] for i, layer in enumerate(self.views)],
+			[
+				[layer.key, layer.value, layer.index, layer.prefill_length]
+				for i, layer in enumerate(self.views)
+			],
 			self.views[-1].metadata,
 		)
 
@@ -366,6 +373,7 @@ class TransformerCache(BaseCache):
 					key=layer[0],
 					value=layer[1],
 					index=layer[2],
+					prefill_length=layer[3],
 					metadata=metadata,
 				)
 				for layer in pure

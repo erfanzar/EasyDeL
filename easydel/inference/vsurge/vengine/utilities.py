@@ -339,6 +339,7 @@ def continuous_prefill(
 	tokens: jax.Array,
 	valids: jax.Array,
 	true_length: int,
+	pad_token_id: int,
 	temperature: jax.Array,
 	top_p: jax.Array,
 	top_k: jax.Array,
@@ -365,7 +366,12 @@ def continuous_prefill(
 		position_ids,
 	):
 		model: EasyDeLBaseModule = nn.merge(gdef, gstate, gother)
-		past_key_values = model.init_cache(batch_size=batch_size, max_length=max_length)
+		prefill_length = jnp.array([input_ids.shape[-1] - true_length]) 
+		past_key_values = model.init_cache(
+			batch_size=batch_size,
+			max_length=max_length,
+			prefill_length=prefill_length,
+		)
 		with model.mesh:
 			return model(
 				input_ids=input_ids,

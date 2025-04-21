@@ -1,17 +1,3 @@
-# Copyright 2024 The JAX Authors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 # Copyright 2023 The EASYDEL Author @erfanzar (Erfan Zare Chavoshi).
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,149 +12,425 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This is a copied-edited version of
-# https://github.com/jax-ml/jax/blob/main/jax/experimental/pallas/ops/tpu/paged_attention
+import functools
 
-from functools import partial
+import numpy as np
 
 import jax
-from jax import numpy as jnp
+from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+import jax.numpy as jnp
+from jax.experimental import shard_map
 
-NUM_LANES = 128
+
+DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
+shard_map = shard_map.shard_map
 
 
-@partial(jax.named_call, name="ragged_decode_kernel")
-def ragged_decode_kernel_fwd(
-	# prefetch scalars:
-	start_ref,  # [batch_size] - Start indices for each sequence in the batch
-	length_ref,  # [batch_size] - Length of each sequence in the batch
-	chunked_start_ref,  # [batch_size // block_batch_size] - Chunked start indices
-	chunked_length_ref,  # [batch_size // block_batch_size] - Chunked sequence lengths
-	# inputs:
-	q_ref,  # [batch_size // block_batch_size, num_heads, head_dim] - Query tensor
-	k_ref,  # [batch_size // block_batch_size, block_kv_len, head_dim] - Key tensor
-	v_ref,  # [batch_size // block_batch_size, block_kv_len, head_dim] - Value tensor
-	qk_prev_ref,  # optional [batch_size // block_batch_size, num_heads, block_kv_len] - Precomputed query-key attention scores
-	# outputs:
-	o_ref,  # [batch_size // block_batch_size, num_heads, head_dim] - Output attention tensor
-	# scratch memory:
-	o_scratch_ref,  # [batch_size // block_batch_size, num_heads, head_dim] - Output scratch memory
-	l_scratch_ref,  # [batch_size // block_batch_size, num_heads, NUM_LANES] - Log-sum-exp scratch memory
-	m_scratch_ref,  # [batch_size // block_batch_size, num_heads, NUM_LANES] - Max value scratch memory
-	# parameters:
-	kv_seq_len: int,  # Total key/value sequence length
-	block_kv: int,  # Block size for key/value sequence dimension
-	block_bs: int,  # Block size for batch dimension
-	scale: float,  # Scaling factor for attention scores
+def get_mha_cost_estimate(shape_dtype):
+	"""Provides a Pallas CostEstimate for Multi-Head Attention.
+
+	Calculates an approximate cost estimate (FLOPs, transcendentals, bytes accessed)
+	for a Multi-Head Attention operation based on the input shapes and dtypes.
+	This is used to inform the Pallas compiler.
+
+	Args:
+	    shape_dtype: A tuple containing JAX ShapeDtypeStruct objects for the
+	        query, key, value, and lengths tensors. Expected shapes are:
+	        - query: [batch_size, 1, num_heads, head_dim]
+	        - key: [batch_size, seq_len, num_heads, head_dim]
+	        - value: [batch_size, seq_len, num_heads, head_dim]
+	        - lengths: [batch_size]
+
+	Returns:
+	    A pl.CostEstimate object containing the estimated costs.
+	"""
+	batch_size, _, num_heads, head_dim = shape_dtype[0].shape
+	seq_len = shape_dtype[1].shape[1]
+
+	# Approximate flops calculation for attention
+	# fmt: off
+	flops = batch_size * num_heads * seq_len * (
+    2 * head_dim +  # QK multiplication
+    seq_len +       # softmax
+    2 * head_dim    # V multiplication
+  )
+	# fmt: on
+
+	return pl.CostEstimate(
+		flops=flops,
+		transcendentals=batch_size * num_heads * seq_len,
+		bytes_accessed=int(sum(np.prod(s.shape) * s.dtype.itemsize for s in shape_dtype)),
+	)
+
+
+@functools.partial(jax.jit, static_argnames=["mask_value"])
+def reference_mqa(
+	q: jax.Array,
+	k: jax.Array,
+	v: jax.Array,
+	lengths: jax.Array,
+	starts: jax.Array,
+	*,
+	mask_value: float = DEFAULT_MASK_VALUE,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+	"""Multi query attention reference.
+
+	Args:
+	  q: A [batch_size, num_heads, head_dim] jax.Array.
+	  k: A [batch_size, seq_len, head_dim] jax.Array.
+	  v: A [batch_size, seq_len, head_dim] jax.Array.
+	  lengths: A i32[batch_size] jax.Array.
+		starts: A i32[batch_size] jax.Array.
+	  mask_value: The value used for padding in attention. By default it is a very
+	    negative floating point number.
+
+	Returns:
+	  The output of attention([batch_size, num_heads, head_dim]), along with the
+	  max logit ([batch_size, num_heads]) and softmax denominator ([batch_size,
+	  num_heads]).
+	"""
+	logits = jnp.einsum("bhd,btd->bht", q.astype(jnp.float32), k.astype(jnp.float32))
+	mask = jnp.arange(k.shape[1])[None] < lengths[:, None]
+
+	logits = logits + jnp.where(mask, 0.0, mask_value)[:, None]
+	logits_max = logits.max(axis=-1)
+
+	unnormalized = jnp.exp(logits - logits_max[..., None])
+	denominator = unnormalized.sum(axis=-1)
+	o = (
+		jnp.einsum("bht,btd->bhd", unnormalized.astype(v.dtype), v) / denominator[..., None]
+	)
+	return o, logits_max[..., None], denominator[..., None]
+
+
+@jax.jit
+def reference_mha(
+	q: jax.Array,
+	k: jax.Array,
+	v: jax.Array,
+	lengths: jax.Array,
+	*,
+	mask_value: float = DEFAULT_MASK_VALUE,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+	"""Multi head attention reference.
+
+	Args:
+	  q: A [batch_size, 1, num_heads, head_dim] jax.Array.
+	  k: A [batch_size, seq_len, num_heads, head_dim] jax.Array.
+	  v: A [batch_size, seq_len, num_heads, head_dim] jax.Array.
+	  lengths: A i32[batch_size] jax.Array.
+	  mask_value: The value used for padding in attention. By default it is a very
+	    negative floating point number.
+
+	Returns:
+	  The output of attention([batch_size, num_heads, head_dim]), along with the
+	  max logit ([batch_size, num_heads]) and softmax denominator ([batch_size,
+	  num_heads]).
+	"""
+	q = jnp.swapaxes(q, 1, 2)
+	k = jnp.swapaxes(k, 1, 2)
+	v = jnp.swapaxes(v, 1, 2)
+	return jax.vmap(
+		functools.partial(reference_mqa, mask_value=mask_value),
+		in_axes=(1, 1, 1, None),
+		out_axes=2,
+	)(q, k, v, lengths)
+
+
+@functools.partial(jax.jit, static_argnames=["mask_value"])
+def reference_gqa(
+	q: jax.Array,
+	k: jax.Array,
+	v: jax.Array,
+	lengths: jax.Array,
+	mask_value: float = DEFAULT_MASK_VALUE,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+	"""Vanilla attention GQA implementation for reference.
+
+	Args:
+	  q: A [batch_size, num_q_heads, head_dim] jax.Array.
+	  k: A [batch_size, num_kv_heads, max_seq_len, head_dim] jax.Array.
+	  v: A [batch_size, num_kv_heads, max_seq_len, head_dim] jax.Array.
+	  lengths: A i32[batch_size] jax.Array.
+	  mask_value: The value used for padding in attention. By default it is a very
+	    negative floating point number.
+
+	Returns:
+	  The output of attention([batch_size, num_heads, head_dim]), along with the
+	  max logit ([batch_size, num_heads]) and softmax denominator ([batch_size,
+	  num_heads]).
+	"""
+	batch_size, num_heads_q, head_dim = q.shape
+	_, num_heads_kv, seq_len, _ = k.shape
+	assert k.shape == v.shape
+	assert num_heads_q % num_heads_kv == 0
+
+	q = q.reshape(batch_size, num_heads_kv, num_heads_q // num_heads_kv, head_dim)
+
+	logits = jnp.einsum("bhgd,bhtd->bhgt", q.astype(jnp.float32), k.astype(jnp.float32))
+	mask = jnp.arange(seq_len)[None] < lengths[:, None]
+	logits = logits + jnp.where(mask, 0.0, mask_value)[:, None, None, :]
+	logits_max = logits.max(axis=-1)
+	unnormalized = jnp.exp(logits - logits_max[..., None])
+	denominator = unnormalized.sum(axis=-1)
+	o = (
+		jnp.einsum("bhgt,bhtd->bhgd", unnormalized.astype(v.dtype), v)
+		/ denominator[..., None]
+	)
+	logits_max = logits_max.reshape(batch_size, 1, num_heads_q, 1)
+	denominator = denominator.reshape(batch_size, 1, num_heads_q, 1)
+	o = o.reshape(batch_size, 1, num_heads_q, head_dim)
+	return o, logits_max, denominator
+
+
+def ragged_flash_attention_kernel(
+	lengths_ref,
+	q_ref,
+	k_ref,
+	v_ref,
+	o_ref,
+	m_ref,
+	l_ref,
+	*,
+	block_size: int,
+	mask_value: float,
 ):
+	"""Pallas kernel implementing Flash Attention for ragged sequences.
+
+	This kernel performs the core Flash Attention computation block by block,
+	handling variable sequence lengths specified by `lengths_ref`. It updates
+	the output (`o_ref`), maximum logit (`m_ref`), and softmax denominator (`l_ref`)
+	incrementally.
+
+	Args:
+	    lengths_ref: Reference to the lengths tensor [batch_size].
+	    q_ref: Reference to the query tensor block.
+	    k_ref: Reference to the key tensor block.
+	    v_ref: Reference to the value tensor block.
+	    o_ref: Reference to the output tensor block (accumulator).
+	    m_ref: Reference to the maximum logit tensor block (accumulator).
+	    l_ref: Reference to the softmax denominator tensor block (accumulator).
+	    block_size: The size of the blocks to process along the sequence length dimension.
+	    mask_value: The value used for masking padding tokens.
 	"""
-	Forward pass kernel for ragged batched attention decoding on TPU.
+	b, i = pl.program_id(0), pl.program_id(1)
 
-	This kernel implements the core attention mechanism for processing sequences of varying lengths
-	in a batched manner. It handles the computation of attention scores, softmax, and weighted
-	sum of values with numerical stability considerations.
-
-	The kernel processes data in blocks for efficient TPU utilization.
-	"""
-	del chunked_start_ref, chunked_length_ref
-	mask_value = jnp.finfo(o_scratch_ref.dtype).min
-	batch_idx, block_idx = pl.program_id(0), pl.program_id(1)
-
-	@pl.when(block_idx == 0)
+	@pl.when(i == 0)
 	def init():
-		"""Initialize scratch memory with appropriate values."""
-		m_scratch_ref[...] = jnp.full_like(m_scratch_ref, -jnp.inf)
-		l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
-		o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
+		m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
+		l_ref[...] = jnp.zeros_like(l_ref)
+		o_ref[...] = jnp.zeros_like(o_ref)
 
-	def resize(x, new_size_in_dim, axis=-1):
-		"""
-		Resize the shape of array x to the target size along axis `axis`.
+	length = lengths_ref[b]
 
-		Args:
-			x: Input array to resize
-			new_size_in_dim: Target size for the specified dimension
-			axis: Axis along which to resize (default: -1)
+	@pl.when(i * block_size < length)
+	def run():
+		q = q_ref[...].astype(jnp.float32)
+		k = k_ref[...].astype(jnp.float32)
+		v = v_ref[...].astype(jnp.float32)
+		m_prev, l_prev = m_ref[...], l_ref[...]
 
-		Returns:
-			Resized array with the specified dimension adjusted to new_size_in_dim
-		"""
-		if x.shape[axis] > new_size_in_dim:
-			assert axis in (-1, x.ndim - 1)
-			return x[..., :new_size_in_dim]
-		return pltpu.repeat(x, new_size_in_dim // x.shape[axis], axis=axis % x.ndim)
-
-	def loop_fn(batch_in_block, _):
-		"""Process a single batch element within the current block."""
-		global_batch_idx = block_bs * batch_idx + batch_in_block
-		seq_start, seq_length = start_ref[global_batch_idx], length_ref[global_batch_idx]
-		block_start, block_end = block_idx * block_kv, (block_idx + 1) * block_kv
-		should_compute = (seq_start < seq_length) & (
-			(block_start < seq_length) & (block_end >= seq_start)
+		qk = lax.dot_general(
+			q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
 		)
 
-		@pl.when(should_compute)
-		def compute():
-			"""Compute attention scores and update output for the current batch element."""
-			# compute query-key attention scores
-			query, key = q_ref[batch_in_block, ...], k_ref[batch_in_block, ...]
-			query_key_scores = jax.lax.dot_general(
-				query, key, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
-			)
-			if qk_prev_ref is not None:
-				query_key_scores += qk_prev_ref[batch_in_block, ...]
-			query_key_scores *= scale
-			position_indices = block_idx * block_kv + jax.lax.broadcasted_iota(
-				jnp.int32, query_key_scores.shape, dimension=1
-			)
-			attention_mask = (position_indices >= seq_start) & (position_indices < seq_length)
-			query_key_scores += jnp.where(attention_mask, 0, mask_value)
+		mask = i * block_size + jax.lax.broadcasted_iota(jnp.int32, qk.shape, 1) < length
+		qk = qk + jnp.where(mask, 0.0, mask_value)
+		m_curr = qk.max(axis=-1)
 
-			# adjust maximum shift value, shift and softmax
-			max_prev, log_sum_prev = (
-				m_scratch_ref[batch_in_block, ...],
-				l_scratch_ref[batch_in_block, ...],
-			)
-			max_curr = resize(jnp.max(query_key_scores, axis=-1)[:, None], max_prev.shape[-1])
-			max_next = jnp.maximum(max_prev, max_curr)
-			softmax_scores = jnp.exp(
-				query_key_scores - resize(max_next, query_key_scores.shape[-1])
-			)
-			log_sum_curr = jax.lax.broadcast_in_dim(
-				jnp.sum(softmax_scores, axis=-1), log_sum_prev.shape, (0,)
-			)
+		s_curr = jnp.exp(qk - m_curr[..., None])
+		l_curr = jax.lax.broadcast_in_dim(s_curr.sum(axis=-1), l_prev.shape, (0,))
+		o_curr_times_l_curr = jnp.dot(s_curr, v)
 
-			# compute the weighted sum of values
-			value = v_ref[batch_in_block, ...]
-			output_curr = jax.lax.dot_general(
-				softmax_scores,
-				value,
-				(((1,), (0,)), ((), ())),
-				preferred_element_type=jnp.float32,
-			)
+		m_curr = jax.lax.broadcast_in_dim(m_curr, m_prev.shape, (0,))
+		m_next = jnp.maximum(m_prev, m_curr)
+		alpha = jnp.exp(m_prev - m_next)
+		beta = jnp.exp(m_curr - m_next)
+		l_next = alpha * l_prev + beta * l_curr
+		l_next_safe = jnp.where(l_next == 0.0, 1.0, l_next)
 
-			# accumulate the results
-			output_prev = o_scratch_ref[batch_in_block, ...]
-			max_next = jnp.maximum(max_prev, max_curr)
-			alpha = jnp.exp(max_prev - max_next)
-			log_sum_next = log_sum_prev * alpha + log_sum_curr
-			log_sum_next_safe = log_sum_next
-			output_next = resize(alpha, output_prev.shape[-1]) * output_prev + output_curr
-
-			# store scratch values
-			m_scratch_ref[batch_in_block, ...] = max_next
-			l_scratch_ref[batch_in_block, ...] = log_sum_next_safe
-			o_scratch_ref[batch_in_block, ...] = output_next
-
-	jax.lax.fori_loop(0, block_bs, loop_fn, init_val=None)
-
-	@pl.when(block_idx == (kv_seq_len // block_kv) - 1)
-	def done():
-		"""Finalize the output by normalizing with the log-sum-exp values."""
-		log_sum = l_scratch_ref[...]  # noqa
-		log_sum_inv = jnp.where(log_sum == 0.0, 1.0, 1.0 / log_sum)
+		m_ref[...], l_ref[...] = m_next, l_next_safe
 		o_ref[...] = (
-			o_scratch_ref[...] * resize(log_sum_inv, o_scratch_ref.shape[-1])
+			(l_prev * alpha * o_ref[...] + beta * o_curr_times_l_curr) / l_next_safe
 		).astype(o_ref.dtype)
+
+
+def ragged_mqa(
+	q: jax.Array,
+	k: jax.Array,
+	v: jax.Array,
+	lengths: jax.Array,
+	*,
+	block_size: int = 256,
+	mask_value: float = DEFAULT_MASK_VALUE,
+	cost_estimate: pl.CostEstimate | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+	"""Ragged multi query attention.
+
+	Args:
+	  q: A [batch_size, 1, head_dim] jax.Array.
+	  k: A [batch_size, seq_len, head_dim] jax.Array.
+	  v: A [batch_size, seq_len, head_dim] jax.Array.
+	  lengths: A i32[batch_size] jax.Array.
+	  mask_value: The value used for padding in attention. By default it is a very
+	    negative floating point number.
+	  cost_estimate: A Pallas TPU cost estimate based on a reference implementation
+
+	Returns:
+	  The output of attention([batch_size, num_heads, head_dim]), along with the
+	  max logit ([batch_size, num_heads, 1]) and softmax denominator ([batch_size,
+	  num_heads, 1]).
+	"""
+	batch_size, num_heads, head_dim = q.shape
+	assert lengths.shape == (batch_size,)
+	assert lengths.dtype == jnp.int32
+	seq_len = k.shape[1]
+
+	def compute_ragged_block_indices(b, i, lengths_ref):
+		length = lengths_ref[b]
+		not_done = i * block_size < length
+		am_last_batch = b == batch_size - 1
+		last_good_block = lax.div(length, block_size) - 1
+		b_next = jnp.where(not_done, b, jnp.where(am_last_batch, b, b + 1))
+		i_next = jnp.where(not_done, i, jnp.where(am_last_batch, last_good_block, 0))
+		return b_next, i_next, 0
+
+	out, m, l = pl.pallas_call(  # noqa
+		functools.partial(
+			ragged_flash_attention_kernel,
+			block_size=block_size,
+			mask_value=mask_value,
+		),
+		grid_spec=pltpu.PrefetchScalarGridSpec(
+			num_scalar_prefetch=1,
+			in_specs=[
+				pl.BlockSpec((None, num_heads, head_dim), lambda b, i, _: (b, 0, 0)),
+				pl.BlockSpec((None, block_size, head_dim), compute_ragged_block_indices),
+				pl.BlockSpec((None, block_size, head_dim), compute_ragged_block_indices),
+			],
+			out_specs=[
+				pl.BlockSpec((None, num_heads, head_dim), lambda b, i, _: (b, 0, 0)),
+				pl.BlockSpec((None, num_heads, head_dim), lambda b, i, _: (b, 0, 0)),
+				pl.BlockSpec((None, num_heads, head_dim), lambda b, i, _: (b, 0, 0)),
+			],
+			grid=(batch_size, seq_len // block_size),
+		),
+		compiler_params={"mosaic": {"dimension_semantics": ("parallel", "arbitrary")}},
+		out_shape=[
+			jax.ShapeDtypeStruct((batch_size, num_heads, head_dim), jnp.float32),
+			jax.ShapeDtypeStruct((batch_size, num_heads, head_dim), jnp.float32),
+			jax.ShapeDtypeStruct((batch_size, num_heads, head_dim), jnp.float32),
+		],
+		cost_estimate=cost_estimate,
+	)(lengths, q, k, v)
+	return out, m[..., 0], l[..., 0]
+
+
+@functools.partial(
+	jax.jit,
+	static_argnames=["block_size", "mask_value"],
+)
+def ragged_mha(
+	query: jax.Array,
+	key: jax.Array,
+	value: jax.Array,
+	lengths: jax.Array,
+	*,
+	block_size: int = 256,
+	mask_value: float = DEFAULT_MASK_VALUE,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+	"""Ragged multi head attention.
+
+	Args:
+	  q: A [batch_size, 1, num_heads, head_dim] jax.Array.
+	  k: A [batch_size, seq_len, num_heads, head_dim] jax.Array.
+	  v: A [batch_size, seq_len, num_heads, head_dim] jax.Array.
+	  lengths: A i32[batch_size] jax.Array.
+	  block_size: Value defining the Pallas block length in the seq_len dimension
+	  mask_value: The value used for padding in attention. By default it is a very
+	    negative floating point number.
+
+	Returns:
+	  The output of attention([batch_size, num_heads, head_dim]), along with the
+	  max logit ([batch_size, num_heads, 1]) and softmax denominator ([batch_size,
+	  num_heads, 1]).
+	"""
+	shape_dtype = (query, key, value, lengths)
+	cost_estimate = get_mha_cost_estimate(shape_dtype)
+
+	query = jnp.swapaxes(query, 1, 2)
+	key = jnp.swapaxes(key, 1, 2)
+	value = jnp.swapaxes(value, 1, 2)
+	o, m, l = jax.vmap(  # noqa
+		functools.partial(
+			ragged_mqa,
+			block_size=block_size,
+			mask_value=mask_value,
+			cost_estimate=cost_estimate,
+		),
+		in_axes=(1, 1, 1, None),
+		out_axes=2,
+	)(query, key, value, lengths)
+	m = jnp.expand_dims(m, axis=-1)
+	l = jnp.expand_dims(l, axis=-1)  # noqa
+	o = o * l
+	return o, m, l
+
+
+@functools.partial(
+	jax.jit,
+	static_argnames=["block_size", "mask_value"],
+)
+def ragged_gqa(
+	query: jax.Array,
+	key: jax.Array,
+	value: jax.Array,
+	lengths: jax.Array,
+	*,
+	block_size: int = 256,
+	mask_value: float = DEFAULT_MASK_VALUE,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+	"""Ragged group query attention.
+
+	Args:
+	  q: A [batch_size, num_heads_q, head_dim] jax.Array.
+	  k: A [batch_size, seq_len, num_heads_kv, head_dim] jax.Array.
+	  v: A [batch_size, seq_len, num_heads_kv, head_dim] jax.Array.
+	  lengths: A i32[batch_size] jax.Array.
+	  block_size: Value defining the Pallas block length in the seq_len dimension
+	  mask_value: The value used for padding in attention. By default it is a very
+	    negative floating point number.
+
+	Returns:
+	  The output of attention([batch_size, num_heads, head_dim]), along with the
+	  max logit ([batch_size, num_heads, 1]) and softmax denominator ([batch_size,
+	  num_heads, 1]).
+	"""
+	shape_dtype = (query, key, value, lengths)
+	cost_estimate = get_mha_cost_estimate(shape_dtype)
+
+	batch_size, _, num_heads_q, head_dim = query.shape
+	_, _, num_heads_kv, _ = key.shape
+
+	query = query.reshape(batch_size, num_heads_kv, num_heads_q // num_heads_kv, head_dim)
+	key = jnp.swapaxes(key, 1, 2)
+	value = jnp.swapaxes(value, 1, 2)
+
+	o, m, l = jax.vmap(  # noqa
+		functools.partial(
+			ragged_mqa,
+			block_size=block_size,
+			mask_value=mask_value,
+			cost_estimate=cost_estimate,
+		),
+		in_axes=(1, 1, 1, None),
+		out_axes=1,
+	)(query, key, value, lengths)
+
+	m = jnp.reshape(m, (batch_size, 1, num_heads_q, 1))
+	l = jnp.reshape(l, (batch_size, 1, num_heads_q, 1))  # noqa
+	o = jnp.reshape(o, (batch_size, 1, num_heads_q, head_dim))
+	o = o * l
+	return o, m, l

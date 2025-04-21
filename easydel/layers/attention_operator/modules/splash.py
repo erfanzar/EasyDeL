@@ -29,8 +29,9 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 )
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as Ps
-from easydel.kernels.tpu_ops.ragged_attention_pallas import pallas_ragged_decode
+
 from easydel.layers.caching.transformer.transformer_cache import TransformerCacheView
+
 from .._attention_impl import (
 	AttentionImpl,
 	AttentionMetadata,
@@ -126,7 +127,12 @@ class SplashAttn(AttentionImpl):
 		"""
 		query_lenght = q.shape[1]
 		value_lenght = v.shape[1]
-		if not causal or ((q.shape[-1] % 128) != 0) or ((v.shape[-1] % 128) != 0):
+		if (
+			not causal
+			or ((q.shape[-1] % 128) != 0)
+			or ((v.shape[-1] % 128) != 0)
+			or (q.shape[1] == 1)
+		):
 			return VanillaAttn(self.metadata)(
 				q=q,
 				k=k,
@@ -216,10 +222,10 @@ class SplashAttn(AttentionImpl):
 			check_rep=False,
 		)
 		def _wraped_flash_attn(q, k, v, q_mask, kv_mask, index, prefill_length):
-			output_shape = q.shape[:-1] + (v.shape[-1],)
-			num_reps = q.shape[1] // k.shape[1]
-			q = q.reshape(q.shape[:-3] + (k.shape[-3], num_reps, q.shape[-2], q.shape[-1]))
 			if q.shape[-2] != 1:
+				output_shape = q.shape[:-1] + (v.shape[-1],)
+				num_reps = q.shape[1] // k.shape[1]
+				q = q.reshape(q.shape[:-3] + (k.shape[-3], num_reps, q.shape[-2], q.shape[-1]))
 				fn = jax.vmap(
 					jax.vmap(
 						make_splash_mqa_single_device(
@@ -235,19 +241,10 @@ class SplashAttn(AttentionImpl):
 				m = None
 				if kv_mask is not None:
 					m = SegmentIds(q_mask, kv_mask)
-				out = fn(q * sm_scale, k, v, m)
+				out = fn(q * sm_scale, k, v, m).reshape(output_shape)
 			else:
-				out = jax.vmap(
-					functools.partial(
-						pallas_ragged_decode,
-						scale=sm_scale,
-						block_kv=1024,
-						block_bs=min(q.shape[0], 32),
-					),
-					(1, 1, 1, None, None),
-					1,
-				)(q[..., 0, :], k, v, prefill_length, index)
-			return out.reshape(output_shape)
+				raise NotImplementedError()
+			return out
 
 		attn = _wraped_flash_attn(
 			q.transpose(0, 2, 1, 3).astype(dtype),
