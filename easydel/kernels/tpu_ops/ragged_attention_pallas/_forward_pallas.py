@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Update/ Added more features from Google version
+
 import functools
 
 import numpy as np
@@ -92,7 +94,7 @@ def reference_mqa(
 	  num_heads]).
 	"""
 	logits = jnp.einsum("bhd,btd->bht", q.astype(jnp.float32), k.astype(jnp.float32))
-	mask = jnp.arange(k.shape[1])[None] < lengths[:, None]
+	mask = (starts < jnp.arange(k.shape[1]))[None, :] < lengths[:, None]
 
 	logits = logits + jnp.where(mask, 0.0, mask_value)[:, None]
 	logits_max = logits.max(axis=-1)
@@ -111,13 +113,14 @@ def reference_mha(
 	k: jax.Array,
 	v: jax.Array,
 	lengths: jax.Array,
+	starts: jax.Array,
 	*,
 	mask_value: float = DEFAULT_MASK_VALUE,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
 	"""Multi head attention reference.
 
 	Args:
-	  q: A [batch_size, 1, num_heads, head_dim] jax.Array.
+	  q: A [batch_size, num_heads, head_dim] jax.Array.
 	  k: A [batch_size, seq_len, num_heads, head_dim] jax.Array.
 	  v: A [batch_size, seq_len, num_heads, head_dim] jax.Array.
 	  lengths: A i32[batch_size] jax.Array.
@@ -129,14 +132,11 @@ def reference_mha(
 	  max logit ([batch_size, num_heads]) and softmax denominator ([batch_size,
 	  num_heads]).
 	"""
-	q = jnp.swapaxes(q, 1, 2)
-	k = jnp.swapaxes(k, 1, 2)
-	v = jnp.swapaxes(v, 1, 2)
 	return jax.vmap(
 		functools.partial(reference_mqa, mask_value=mask_value),
-		in_axes=(1, 1, 1, None),
+		in_axes=(1, 1, 1, None, None),
 		out_axes=2,
-	)(q, k, v, lengths)
+	)(q, k, v, lengths, starts)
 
 
 @functools.partial(jax.jit, static_argnames=["mask_value"])
@@ -145,6 +145,7 @@ def reference_gqa(
 	k: jax.Array,
 	v: jax.Array,
 	lengths: jax.Array,
+	starts: jax.Array,
 	mask_value: float = DEFAULT_MASK_VALUE,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
 	"""Vanilla attention GQA implementation for reference.
@@ -170,7 +171,7 @@ def reference_gqa(
 	q = q.reshape(batch_size, num_heads_kv, num_heads_q // num_heads_kv, head_dim)
 
 	logits = jnp.einsum("bhgd,bhtd->bhgt", q.astype(jnp.float32), k.astype(jnp.float32))
-	mask = jnp.arange(seq_len)[None] < lengths[:, None]
+	mask = (starts < jnp.arange(seq_len)[None, :]) < lengths[:, None]
 	logits = logits + jnp.where(mask, 0.0, mask_value)[:, None, None, :]
 	logits_max = logits.max(axis=-1)
 	unnormalized = jnp.exp(logits - logits_max[..., None])
@@ -187,6 +188,7 @@ def reference_gqa(
 
 def ragged_flash_attention_kernel(
 	lengths_ref,
+	starts_ref,
 	q_ref,
 	k_ref,
 	v_ref,
@@ -224,8 +226,10 @@ def ragged_flash_attention_kernel(
 		o_ref[...] = jnp.zeros_like(o_ref)
 
 	length = lengths_ref[b]
+	start = starts_ref[b]
+	idex = i * block_size
 
-	@pl.when(i * block_size < length)
+	@pl.when((start < idex) & (idex < length))
 	def run():
 		q = q_ref[...].astype(jnp.float32)
 		k = k_ref[...].astype(jnp.float32)
@@ -262,6 +266,7 @@ def ragged_mqa(
 	k: jax.Array,
 	v: jax.Array,
 	lengths: jax.Array,
+	starts: jax.Array,
 	*,
 	block_size: int = 256,
 	mask_value: float = DEFAULT_MASK_VALUE,
@@ -274,6 +279,7 @@ def ragged_mqa(
 	  k: A [batch_size, seq_len, head_dim] jax.Array.
 	  v: A [batch_size, seq_len, head_dim] jax.Array.
 	  lengths: A i32[batch_size] jax.Array.
+	  starts: A i32[batch_size] jax.Array.
 	  mask_value: The value used for padding in attention. By default it is a very
 	    negative floating point number.
 	  cost_estimate: A Pallas TPU cost estimate based on a reference implementation
@@ -285,12 +291,21 @@ def ragged_mqa(
 	"""
 	batch_size, num_heads, head_dim = q.shape
 	assert lengths.shape == (batch_size,)
+	assert starts.shape == (batch_size,)
 	assert lengths.dtype == jnp.int32
+	assert starts.dtype == jnp.int32
 	seq_len = k.shape[1]
 
-	def compute_ragged_block_indices(b, i, lengths_ref):
+	def compute_ragged_block_indices(
+		b,
+		i,
+		lengths_ref,
+		starts_ref,
+	):
 		length = lengths_ref[b]
-		not_done = i * block_size < length
+		start = starts_ref[b]
+		idex = i * block_size
+		not_done = (start < idex) & (idex < length)
 		am_last_batch = b == batch_size - 1
 		last_good_block = lax.div(length, block_size) - 1
 		b_next = jnp.where(not_done, b, jnp.where(am_last_batch, b, b + 1))
@@ -304,16 +319,16 @@ def ragged_mqa(
 			mask_value=mask_value,
 		),
 		grid_spec=pltpu.PrefetchScalarGridSpec(
-			num_scalar_prefetch=1,
+			num_scalar_prefetch=2,
 			in_specs=[
-				pl.BlockSpec((None, num_heads, head_dim), lambda b, i, _: (b, 0, 0)),
+				pl.BlockSpec((None, num_heads, head_dim), lambda b, i, _, __: (b, 0, 0)),
 				pl.BlockSpec((None, block_size, head_dim), compute_ragged_block_indices),
 				pl.BlockSpec((None, block_size, head_dim), compute_ragged_block_indices),
 			],
 			out_specs=[
-				pl.BlockSpec((None, num_heads, head_dim), lambda b, i, _: (b, 0, 0)),
-				pl.BlockSpec((None, num_heads, head_dim), lambda b, i, _: (b, 0, 0)),
-				pl.BlockSpec((None, num_heads, head_dim), lambda b, i, _: (b, 0, 0)),
+				pl.BlockSpec((None, num_heads, head_dim), lambda b, i, _, __: (b, 0, 0)),
+				pl.BlockSpec((None, num_heads, head_dim), lambda b, i, _, __: (b, 0, 0)),
+				pl.BlockSpec((None, num_heads, head_dim), lambda b, i, _, __: (b, 0, 0)),
 			],
 			grid=(batch_size, seq_len // block_size),
 		),
@@ -324,7 +339,7 @@ def ragged_mqa(
 			jax.ShapeDtypeStruct((batch_size, num_heads, head_dim), jnp.float32),
 		],
 		cost_estimate=cost_estimate,
-	)(lengths, q, k, v)
+	)(lengths, starts, q, k, v)
 	return out, m[..., 0], l[..., 0]
 
 
@@ -337,6 +352,7 @@ def ragged_mha(
 	key: jax.Array,
 	value: jax.Array,
 	lengths: jax.Array,
+	starts: jax.Array,
 	*,
 	block_size: int = 256,
 	mask_value: float = DEFAULT_MASK_VALUE,
@@ -370,9 +386,9 @@ def ragged_mha(
 			mask_value=mask_value,
 			cost_estimate=cost_estimate,
 		),
-		in_axes=(1, 1, 1, None),
+		in_axes=(1, 1, 1, None, None),
 		out_axes=2,
-	)(query, key, value, lengths)
+	)(query, key, value, lengths, starts)
 	m = jnp.expand_dims(m, axis=-1)
 	l = jnp.expand_dims(l, axis=-1)  # noqa
 	o = o * l
@@ -388,6 +404,7 @@ def ragged_gqa(
 	key: jax.Array,
 	value: jax.Array,
 	lengths: jax.Array,
+	starts: jax.Array,
 	*,
 	block_size: int = 256,
 	mask_value: float = DEFAULT_MASK_VALUE,
@@ -425,9 +442,9 @@ def ragged_gqa(
 			mask_value=mask_value,
 			cost_estimate=cost_estimate,
 		),
-		in_axes=(1, 1, 1, None),
+		in_axes=(1, 1, 1, None, None),
 		out_axes=1,
-	)(query, key, value, lengths)
+	)(query, key, value, lengths, starts)
 
 	m = jnp.reshape(m, (batch_size, 1, num_heads_q, 1))
 	l = jnp.reshape(l, (batch_size, 1, num_heads_q, 1))  # noqa

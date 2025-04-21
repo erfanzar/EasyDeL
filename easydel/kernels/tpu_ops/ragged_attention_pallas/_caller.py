@@ -22,7 +22,7 @@ def ragged_attention(
 	key: jax.Array,
 	value: jax.Array,
 	lengths: jax.Array,
-	starts: jax.Array,  # Note: This parameter is defined but not used in the function body.
+	starts: jax.Array,  
 	*,
 	block_size: int = 256,
 	mask_value: float = DEFAULT_MASK_VALUE,
@@ -40,7 +40,7 @@ def ragged_attention(
 	    value: Value tensor with shape [batch_size, seq_len, num_kv_heads, head_dim].
 	    lengths: Integer tensor with shape [batch_size] indicating the true sequence
 	        length for each item in the batch.
-	    starts: Integer tensor indicating start indices (unused in current logic).
+	    starts: Integer tensor indicating start indices.
 	    block_size: The block size to use for Pallas kernels. Defaults to 256.
 	    mask_value: The value to use for masking attention logits. Defaults to
 	        a large negative number.
@@ -60,6 +60,7 @@ def ragged_attention(
 			key=key,
 			value=value,
 			lengths=lengths,
+			starts=starts,
 			block_size=block_size,
 			mask_value=mask_value,
 		)
@@ -70,6 +71,7 @@ def ragged_attention(
 			key=key,
 			value=value,
 			lengths=lengths,
+			starts=starts,
 			block_size=block_size,
 			mask_value=mask_value,
 		)

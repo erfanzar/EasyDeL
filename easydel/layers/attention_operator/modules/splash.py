@@ -39,6 +39,7 @@ from .._attention_impl import (
 	AttentionRegistry,
 )
 from .vanilla import VanillaAttn
+from easydel.kernels.tpu_ops import pallas_ragged_decode
 
 
 @AttentionRegistry.register
@@ -221,7 +222,7 @@ class SplashAttn(AttentionImpl):
 			out_specs=self.create_stable_sharding(attention_partition_spec, tensor=q),
 			check_rep=False,
 		)
-		def _wraped_flash_attn(q, k, v, q_mask, kv_mask, index, prefill_length):
+		def _wraped_flash_attn(q: jax.Array, k, v, q_mask, kv_mask, index, prefill_length):
 			if q.shape[-2] != 1:
 				output_shape = q.shape[:-1] + (v.shape[-1],)
 				num_reps = q.shape[1] // k.shape[1]
@@ -243,7 +244,13 @@ class SplashAttn(AttentionImpl):
 					m = SegmentIds(q_mask, kv_mask)
 				out = fn(q * sm_scale, k, v, m).reshape(output_shape)
 			else:
-				raise NotImplementedError()
+				return pallas_ragged_decode(
+					q.transpose(0, 2, 1, 3) * sm_scale,
+					k.transpose(0, 2, 1, 3),
+					v.transpose(0, 2, 1, 3),
+					index,
+					prefill_length,
+				)[0].transpose(0, 2, 1, 3)
 			return out
 
 		attn = _wraped_flash_attn(
