@@ -30,7 +30,6 @@ from concurrent import futures
 import jax
 import numpy as np
 from jax import numpy as jnp
-from transformers import ProcessorMixin
 
 from easydel.inference.utilities import SamplingParams
 from easydel.utils.helpers import get_logger
@@ -363,6 +362,7 @@ class vDriver:
 					graphothers=prefill_engine.graphothers,
 					tokens=padded_tokens,
 					valids=padded_valids,
+					true_length=0,
 					temperature=jnp.array([1], "f4"),
 					top_p=jnp.array([1], "f4"),
 					top_k=jnp.array([1], "i4"),
@@ -449,6 +449,7 @@ class vDriver:
 		processor: ProcessingClassType,
 		max_prefill_length: int,
 		prefill_lengths: list[int],
+		pad_token_id: int,
 	) -> tp.Tuple[tp.Tuple[jnp.ndarray, jnp.ndarray, int], SamplingParams]:
 		"""Tokenizes, pads, and prepares sampling parameters for a prefill request.
 
@@ -475,10 +476,7 @@ class vDriver:
 			valids = jnp.array(content["attention_mask"])
 		else:
 			tokens, valids = content
-		if isinstance(processor, ProcessorMixin):
-			pad_token_id = processor.tokenizer.pad_token_id
-		else:
-			pad_token_id = processor.pad_token_id
+
 		return (
 			pad_tokens(
 				tokens=tokens,
@@ -517,7 +515,7 @@ class vDriver:
 				(
 					padded_tokens,
 					padded_valids,
-					_,
+					true_length,
 				),
 				sampling_params,
 			) = self._process_prefill_content(
@@ -525,6 +523,7 @@ class vDriver:
 				processor,
 				prefill_engine.max_prefill_length,
 				prefill_engine.prefill_lengths,
+				prefill_engine.pad_token_id,
 			)
 			logger.info(
 				f"Prefilling on prefill engine {idx} : "
@@ -535,6 +534,7 @@ class vDriver:
 				graphothers=prefill_engine.graphothers,
 				tokens=padded_tokens,
 				valids=padded_valids,
+				true_length=true_length,
 				temperature=jnp.array([sampling_params.temperature], "f4"),
 				top_p=jnp.array([sampling_params.top_p], "f4"),
 				top_k=jnp.array([sampling_params.top_k], "i4"),
@@ -739,6 +739,7 @@ class vDriver:
 					slot=0,  # Prefill result is always at slot 0 conceptually
 					slot_max_length=request.max_tokens,
 					result_tokens=request_first_token,
+					eos_token_id=my_decode_engine.eos_token_ids,
 					is_client_side_tokenization=request.is_client_side_tokenization,
 					complete=request.complete,
 				)
@@ -781,6 +782,7 @@ class vDriver:
 							slot=slot,
 							slot_max_length=request.max_tokens,
 							result_tokens=result_tokens,
+							eos_token_id=my_decode_engine.eos_token_ids,
 							is_client_side_tokenization=request.is_client_side_tokenization,
 							complete=request.complete,
 						)

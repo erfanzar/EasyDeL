@@ -13,12 +13,12 @@
 # limitations under the License.
 from __future__ import annotations
 
-from functools import partial
 import typing as tp
+from functools import partial
 
 import chex as cx
 import jax
-from eformer.escale import PartitionAxis, with_sharding_constraint
+from eformer.escale import with_sharding_constraint
 from eformer.jaximus import ImplicitArray
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
@@ -43,8 +43,6 @@ else:
 class TransformerCacheMetaData(BaseCacheMetadata):
 	"""Metadata for transformer cache configuration."""
 
-	partition_axis: PartitionAxis
-	# Required fields
 	batch_size: int
 	sequence_length: int
 	num_hidden_layers: int
@@ -64,7 +62,6 @@ class TransformerCacheMetaData(BaseCacheMetadata):
 	@classmethod
 	def create(
 		cls,
-		partition_axis: PartitionAxis,
 		batch_size: int,
 		sequence_length: int,
 		num_hidden_layers: int,
@@ -82,7 +79,6 @@ class TransformerCacheMetaData(BaseCacheMetadata):
 		Create a TransformerCacheMetaData instance with validation.
 
 		Arguments:
-		    partition_axis: Partition axis.
 		    batch_size: Size of the batch.
 		    sequence_length: Length of the sequence.
 		    num_hidden_layers: number of hidden layers.
@@ -127,7 +123,6 @@ class TransformerCacheMetaData(BaseCacheMetadata):
 				)
 
 		return cls(
-			partition_axis=partition_axis,
 			batch_size=batch_size,
 			sequence_length=sequence_length,
 			num_hidden_layers=num_hidden_layers,
@@ -157,41 +152,31 @@ class TransformerCacheView(BaseCacheView):
 		cls,
 		metadata: TransformerCacheMetaData,
 		quantizer: EasyQuantizer,
-		key_values_partition_specs: PartitionSpec,
+		key_values_shardings: PartitionSpec,
 		dtype: jnp.dtype,
 		mesh: Mesh,
 		layer_index: tp.Optional[int] = None,
 		prefill_length: tp.Optional[jax.Array] = None,
 	):
 		with jax.named_scope("easydel-transformer-cacheview-init"):
-			device = NamedSharding(mesh=mesh, spec=key_values_partition_specs)
-
+			device = (
+				NamedSharding(mesh=mesh, spec=key_values_shardings)
+				if isinstance(key_values_shardings, PartitionSpec)
+				else key_values_shardings
+			)
+			mt = metadata
+			index_device = NamedSharding(mesh, PartitionSpec(device.spec[0]))
+			kshape = (mt.batch_size, mt.sequence_length, mt.key_heads, mt.key_dim)
+			vshape = (mt.batch_size, mt.sequence_length, mt.value_heads, mt.value_dim)
+			prefill_length = (
+				jax.device_put(prefill_length, index_device)
+				if prefill_length is not None
+				else jnp.zeros((metadata.batch_size,), dtype=jnp.int32, device=index_device)
+			)
 			out = cls(
-				key=quantizer(
-					jnp.zeros(
-						shape=(
-							metadata.batch_size,
-							metadata.sequence_length,
-							metadata.key_heads,
-							metadata.key_dim,
-						),
-						dtype=dtype,
-						device=device,
-					),
-				),
-				value=quantizer(
-					jnp.zeros(
-						shape=(
-							metadata.batch_size,
-							metadata.sequence_length,
-							metadata.value_heads,
-							metadata.value_dim,
-						),
-						dtype=dtype,
-						device=device,
-					)
-				),
-				index=jnp.zeros((metadata.batch_size,), dtype=jnp.int32),
+				key=quantizer(jnp.zeros(shape=kshape, dtype=dtype, device=device)),
+				value=quantizer(jnp.zeros(shape=vshape, dtype=dtype, device=device)),
+				index=jnp.zeros((metadata.batch_size,), dtype=jnp.int32, device=index_device),
 				prefill_length=prefill_length,
 				metadata=metadata,
 				layer_index=layer_index,
@@ -342,20 +327,14 @@ class TransformerCache(BaseCache):
 		mesh: Mesh,
 		quantizer: tp.Optional[EasyQuantizer] = None,
 		dtype: tp.Optional[jnp.dtype] = None,
-		key_values_partition_specs: tp.Optional[PartitionSpec] = None,
+		key_values_shardings: tp.Optional[PartitionSpec] = None,
 		prefill_length: tp.Optional[jax.Array] = None,
 	):
 		from easydel.infra.etils import EasyDeLQuantizationMethods
 		from easydel.layers.quantization.quantizers import EasyQuantizer
 
-		paxis = metadata.partition_axis
 		quantizer = quantizer or EasyQuantizer(EasyDeLQuantizationMethods.NONE)
-		key_values_partition_specs = key_values_partition_specs or PartitionSpec(
-			paxis.batch_axis,
-			paxis.key_sequence_axis,
-			paxis.head_axis,
-			paxis.attention_dim_axis,
-		)
+		key_values_shardings = key_values_shardings or PartitionSpec()
 		if dtype is None:
 			dtype = jnp.bfloat16
 		return cls(
@@ -363,7 +342,7 @@ class TransformerCache(BaseCache):
 				TransformerCacheView.init(
 					metadata=metadata,
 					quantizer=quantizer,
-					key_values_partition_specs=key_values_partition_specs,
+					key_values_shardings=key_values_shardings,
 					dtype=dtype,
 					mesh=mesh,
 					layer_index=layer_index,
@@ -398,17 +377,14 @@ class TransformerCache(BaseCache):
 			view = self.views[idx]
 			oview = other.views[idx]
 
-			metadata = view.metadata
-
-			default_sharding = PartitionSpec(
-				metadata.partition_axis.batch_axis,
-				metadata.partition_axis.key_sequence_axis,
-				metadata.partition_axis.head_axis,
-				metadata.partition_axis.attention_dim_axis,
-			)
+			default_sharding = PartitionSpec()
 			k_sharding = getattr(view.key, "sharding", default_sharding)
 			v_sharding = getattr(view.value, "sharding", default_sharding)
-			i_sharding = getattr(view.index, "index", PartitionSpec(default_sharding[0]))
+			i_sharding = getattr(
+				view.index,
+				"index",
+				PartitionSpec(getattr(default_sharding, "spec", [None])[0]),
+			)
 
 			def _maybe_materialize(x):
 				if hasattr(x, "materialize"):
@@ -437,7 +413,21 @@ class TransformerCache(BaseCache):
 					)
 				),
 				index=with_sharding_constraint(
-					lax.dynamic_update_slice_in_dim(view.index, oview.index, slot, 0),
+					lax.dynamic_update_slice_in_dim(
+						view.index,
+						oview.index,
+						slot,
+						0,
+					),
+					i_sharding,
+				),
+				prefill_length=with_sharding_constraint(
+					lax.dynamic_update_slice_in_dim(
+						view.prefill_length,
+						oview.prefill_length,
+						slot,
+						0,
+					),
 					i_sharding,
 				),
 				metadata=view.metadata,

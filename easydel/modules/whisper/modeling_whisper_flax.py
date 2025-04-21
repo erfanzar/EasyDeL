@@ -1557,6 +1557,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 		max_length: int,
 		pad_token_id: int,
 		prefill_length: int | None = None,
+		shardings=None,
 		attention_mask: tp.Optional[jax.Array] = None,
 		decoder_attention_mask: tp.Optional[jax.Array] = None,
 		encoder_outputs=None,
@@ -1572,6 +1573,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 			max_length,
 			pad_token_id,
 			prefill_length,
+			shardings,
 		)
 		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="b1")
 		if decoder_attention_mask is not None:

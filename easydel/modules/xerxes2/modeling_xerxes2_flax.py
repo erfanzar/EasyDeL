@@ -659,7 +659,6 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 		if num_key_value_heads is None:
 			num_key_value_heads = self.config.num_attention_heads
 		return TransformerCacheMetaData.create(
-			partition_axis=self.config.partition_axis,
 			num_hidden_layers=self.config.num_hidden_layers,
 			batch_size=batch_size,
 			sequence_length=max_length,
@@ -674,14 +673,19 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 		max_length: int,
 		pad_token_id: int | None = None,
 		prefill_length: int | None = None,
+		shardings: dict | None = None,
 	):
+		shardings = shardings or dict()
 		return TransformerCache.init_cache(
 			dtype=self.dtype,
-			key_values_partition_specs=PartitionSpec(
-				self.config.partition_axis.batch_axis,
-				self.config.partition_axis.key_sequence_axis,
-				None,  # it's 1 by default
-				self.config.partition_axis.attention_dim_axis,
+			key_values_shardings=shardings.get(
+				"key_value_shardings",
+				PartitionSpec(
+					self.config.partition_axis.batch_axis,
+					self.config.partition_axis.key_sequence_axis,
+					None,
+					self.config.partition_axis.attention_dim_axis,
+				),
 			),
 			metadata=self.create_cache_metadata(
 				batch_size=batch_size,

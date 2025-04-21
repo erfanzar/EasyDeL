@@ -831,7 +831,9 @@ class Mamba2ForCausalLM(EasyDeLBaseModule):
 		max_length: int,
 		pad_token_id: int | None = None,
 		prefill_length: int | None = None,
+		shardings: dict | None = None,
 	):
+		shardings = shardings or dict()
 		return Mamba2Cache.init_cache(
 			metadata=Mamba2CacheMetaData.create(
 				num_hidden_layers=self.config.num_hidden_layers,

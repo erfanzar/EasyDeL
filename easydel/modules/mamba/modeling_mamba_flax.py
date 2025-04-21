@@ -547,7 +547,9 @@ class MambaModel(EasyDeLBaseModule):
 		max_length: int,
 		pad_token_id: int | None = None,
 		prefill_length: int | None = None,
+		shardings: dict | None = None,
 	):
+		shardings = shardings or dict()
 		return MambaCache.init_cache(
 			dtype=self.dtype,
 			partition_specs=jax.sharding.PartitionSpec(
@@ -660,7 +662,9 @@ class MambaForCausalLM(EasyDeLBaseModule):
 		max_length: int,
 		pad_token_id: int | None = None,
 		prefill_length: int | None = None,
+		shardings: dict | None = None,
 	):
+		shardings = shardings or dict()
 		return MambaCache.init_cache(
 			dtype=self.dtype,
 			partition_specs=jax.sharding.PartitionSpec(

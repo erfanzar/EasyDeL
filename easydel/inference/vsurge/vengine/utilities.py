@@ -287,7 +287,7 @@ def continuous_bulk_insert(
 		generated_tokens=gent,
 	)
 
- 
+
 def continuous_insert(
 	prefix: GenerationState,
 	decode_state: GenerationState,
@@ -295,7 +295,11 @@ def continuous_insert(
 	quantizer: EasyQuantizer,
 ) -> GenerationState:
 	def update_idx1d(x, y):
-		return jax.lax.dynamic_update_slice(x, y, (slot,))
+		sharding = getattr(x, "sharding", PartitionSpec())
+		return with_sharding_constraint(
+			jax.lax.dynamic_update_slice(x, y, (slot,)),
+			sharding,
+		)
 
 	def update_idx2d(x, y):
 		sharding = getattr(x, "sharding", PartitionSpec())
@@ -334,6 +338,7 @@ def continuous_prefill(
 	graphothers: nn.GraphState,
 	tokens: jax.Array,
 	valids: jax.Array,
+	true_length: int,
 	temperature: jax.Array,
 	top_p: jax.Array,
 	top_k: jax.Array,
