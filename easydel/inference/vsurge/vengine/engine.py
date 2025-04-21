@@ -130,6 +130,7 @@ class vEngine:
 			("cache/views/[0-9]+/(key|value)/(packed|absmax)", kvps),
 			("cache/views/[0-9]+/(key|value)", kvps),
 			("cache/views/[0-9]+/index", bsharding),
+			("cache/views/[0-9]+/prefill_length", bsharding),
 			(".*", Ps()),
 		)
 
@@ -155,12 +156,13 @@ class vEngine:
 			self.continuous_prefill = cjit(
 				jax.jit(
 					continuous_prefill,
-					static_argnums=(0, 9),
+					static_argnums=(0, 10),
 					in_shardings=(
 						es.extract_shardings(self.graphstate),
 						es.extract_shardings(self.graphothers),
 						self._empty_sharding,
 						self._empty_sharding,
+						None,
 						None,
 						self._empty_sharding,
 						self._empty_sharding,
@@ -170,7 +172,7 @@ class vEngine:
 					),
 					out_shardings=(self._prefill_state_sharding, None),
 				),
-				static_argnums=(0, 9),
+				static_argnums=(0, 10),
 			)
 			self.continuous_decode = cjit(
 				jax.jit(
@@ -379,6 +381,7 @@ class vEngine:
 			tokens,
 			valids,
 			true_length,
+			self.pad_token_id,
 			temperature,
 			top_p,
 			top_k,

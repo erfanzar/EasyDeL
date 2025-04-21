@@ -263,7 +263,7 @@ def pad_tokens(
 	if jax_padding:
 		padded_tokens = jnp.array([padded_tokens])
 		padded_valids = jnp.array([padded_valids])
-	return padded_tokens, padded_valids, padded_length
+	return padded_tokens, padded_valids, true_length
 
 
 def is_byte_token(s: str) -> bool:
