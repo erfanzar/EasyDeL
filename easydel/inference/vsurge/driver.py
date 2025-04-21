@@ -341,43 +341,47 @@ class vDriver:
 
 	def compile(self):
 		"""Compiles engines."""
+		try:
+			for (
+				decode_engine,
+				prefill_engine,
+			) in zip(
+				self._decode_engines,
+				self._prefill_engines,
+			):
+				decode_state = decode_engine.init_decode_state()
+				max_prefill_length = prefill_engine.max_prefill_length
+				vals = prefill_engine.prefill_lengths[
+					: prefill_engine.prefill_lengths.index(max_prefill_length)
+				] + [max_prefill_length]
+				for length in vals:
+					padded_tokens = padded_valids = jnp.ones((1, length), "i4")
+					logger.info(f"Compiling prefill-engine seqlen={length}")
+					state_new, _ = prefill_engine.prefill(
+						graphstate=prefill_engine.graphstate,
+						graphothers=prefill_engine.graphothers,
+						tokens=padded_tokens,
+						valids=padded_valids,
+						true_length=0,
+						temperature=jnp.array([1], "f4"),
+						top_p=jnp.array([1], "f4"),
+						top_k=jnp.array([1], "i4"),
+						rngs=prefill_engine.prng_key,
+					)
+					logger.info(f"Compiling decode-engine insert seqlen={length}")
+					decode_state = decode_engine.insert(state_new, decode_state, 0)
 
-		for (
-			decode_engine,
-			prefill_engine,
-		) in zip(
-			self._decode_engines,
-			self._prefill_engines,
-		):
-			decode_state = decode_engine.init_decode_state()
-			max_prefill_length = prefill_engine.max_prefill_length
-			vals = prefill_engine.prefill_lengths[
-				: prefill_engine.prefill_lengths.index(max_prefill_length)
-			] + [max_prefill_length]
-			for length in vals:
-				padded_tokens = padded_valids = jnp.ones((1, length), "i4")
-				logger.info(f"Compiling prefill-engine seqlen={length}")
-				state_new, _ = prefill_engine.prefill(
-					graphstate=prefill_engine.graphstate,
-					graphothers=prefill_engine.graphothers,
-					tokens=padded_tokens,
-					valids=padded_valids,
-					true_length=0,
-					temperature=jnp.array([1], "f4"),
-					top_p=jnp.array([1], "f4"),
-					top_k=jnp.array([1], "i4"),
-					rngs=prefill_engine.prng_key,
+				logger.info("Compiling decode-engine")
+				decode_engine.decode(
+					graphstate=decode_engine.graphstate,
+					graphothers=decode_engine.graphothers,
+					state=decode_state,
+					rngs=decode_engine.prng_key,
 				)
-				logger.info(f"Compiling decode-engine insert seqlen={length}")
-				decode_state = decode_engine.insert(state_new, decode_state, 0)
-
-			logger.info("Compiling decode-engine")
-			decode_engine.decode(
-				graphstate=decode_engine.graphstate,
-				graphothers=decode_engine.graphothers,
-				state=decode_state,
-				rngs=decode_engine.prng_key,
-			)
+		except Exception:
+			traceback.print_exc()
+			self.stop()
+			exit(1)
 
 	def stop(self):
 		"""Stops the driver and all background threads."""
