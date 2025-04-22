@@ -19,6 +19,8 @@ import typing as tp
 import chex
 import jax.lax
 from chex import Array
+from eformer import common_types
+from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
@@ -32,10 +34,8 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import (
 	ACT2FN,
-	HiddenStateSharding,
 	auto_remat,
 	block_wise_ffn,
-	control_runtime_sharding,
 	get_dot_general_by_bits,
 	with_sharding_constraint,
 )
@@ -633,10 +633,10 @@ class PhiMoeDecoderLayer(nn.Module):
 		residual = hidden_states
 
 		hidden_states = self.input_layernorm(hidden_states)
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 
 		attn_outputs = self.self_attn(
@@ -821,11 +821,10 @@ class PhiMoeModel(EasyDeLBaseModule):
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
 
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			inputs_embeds,
-			self.config.partition_axis,
-			shorthand="B qS H",
-			decode_mode=1,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 
 		for idx, block in enumerate(self.layers):

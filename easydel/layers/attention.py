@@ -19,18 +19,14 @@ from functools import cached_property, partial
 
 import einops
 import flax.nnx as nn
-import jax
-import jax.experimental
-import jax.extend
-import jax.lib
-import jax.tree_util
 from chex import Array
-from eformer.escale import with_sharding_constraint
 from jax import NamedSharding, lax, random
 from jax import numpy as jnp
 from jax import tree_util as jtu
+import jax
 from jax.sharding import PartitionSpec
-
+from eformer.escale import apply_logical_sharding
+from eformer import common_types
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.layers.caching import (
 	PagedAttentionCacheView,
@@ -346,13 +342,16 @@ class AttentionModule(nn.Module):
 		q: jax.Array,
 		k: jax.Array,
 	) -> tp.Tuple[jax.Array, jax.Array]:
-		decode_mode = q.shape[1] == 1
-
-		qspec = self.config.partition_axis.resolve_spec("B qS h D", decode_mode)
-		kspec = self.config.partition_axis.resolve_spec("B kS h D", decode_mode)
-
-		q = with_sharding_constraint(q, qspec)
-		k = with_sharding_constraint(k, kspec)
+		q = apply_logical_sharding(
+			q,
+			dynamic_axes=common_types.AttnQSharding,
+			partition_manager=self.config.partition_manager,
+		)
+		k = apply_logical_sharding(
+			k,
+			dynamic_axes=common_types.AttnKVSharding,
+			partition_manager=self.config.partition_manager,
+		)
 		return q, k
 
 	def apply_qkv_shardings(
@@ -361,13 +360,21 @@ class AttentionModule(nn.Module):
 		k: jax.Array,
 		v: jax.Array,
 	) -> tp.Tuple[jax.Array, jax.Array, jax.Array]:
-		decode_mode = q.shape[1] == 1
-
-		qspec = self.config.partition_axis.resolve_spec("B qS h D", decode_mode)
-		kvspec = self.config.partition_axis.resolve_spec("B kS h D", decode_mode)
-		q = with_sharding_constraint(q, qspec)
-		k = with_sharding_constraint(k, kvspec)
-		v = with_sharding_constraint(v, kvspec)
+		q = apply_logical_sharding(
+			q,
+			dynamic_axes=common_types.AttnQSharding,
+			partition_manager=self.config.partition_manager,
+		)
+		k = apply_logical_sharding(
+			k,
+			dynamic_axes=common_types.AttnKVSharding,
+			partition_manager=self.config.partition_manager,
+		)
+		v = apply_logical_sharding(
+			v,
+			dynamic_axes=common_types.AttnKVSharding,
+			partition_manager=self.config.partition_manager,
+		)
 		return q, k, v
 
 	def make_flexible_sliding_window(
@@ -426,7 +433,7 @@ class AttentionModule(nn.Module):
 		"""
 
 		end_index = jnp.reshape(cache_view.index, (-1, 1)) if cache_view is not None else 0
-		inipos = jnp.cumsum(jnp.any(attention_mask, -1)[:, -1, :], axis=-1) 
+		inipos = jnp.cumsum(jnp.any(attention_mask, -1)[:, -1, :], axis=-1)
 		return (inipos - (inipos >= 1)) + end_index
 
 	@cached_property
@@ -640,12 +647,12 @@ class AttentionModule(nn.Module):
 					query=query,
 					key=key,
 					value=value,
-					attention_mask=attention_mask,
+					quantizer=self.quantizer,
 					causal_mask=causal_mask,
+					attention_mask=attention_mask,
 					cache_metadata=cache_metadata,
 					token_type_ids=token_type_ids,
-					kv_sharding=self.get_sharding_safely(cache_view.key),
-					quantizer=self.quantizer,
+					partition_manager=self.config.partition_manager,
 				)
 			elif isinstance(cache_view, PagedAttentionCacheView):
 				num_reps = query.shape[2] // key.shape[2]
@@ -688,17 +695,10 @@ class AttentionModule(nn.Module):
 		Returns:
 		    jax.Array: The input tensor with applied sharding constraints based on the config.
 		"""
-		return with_sharding_constraint(
-			arr=attn_output,
-			sharding=PartitionSpec(
-				self.config.partition_axis.batch_axis,
-				(
-					self.config.partition_axis.sequence_axis
-					if attn_output.shape[1] != 1
-					else None
-				),
-				self.config.partition_axis.hidden_state_axis,
-			),
+		return apply_logical_sharding(
+			x=attn_output,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 
 	def _merge_heads(self, hidden_states: jax.Array) -> jax.Array:

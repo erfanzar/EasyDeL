@@ -19,8 +19,9 @@ import typing as tp
 import chex
 import jax
 import jax.numpy as jnp
+from eformer import common_types
+from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
-from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -31,10 +32,8 @@ from easydel.infra.modeling_outputs import (
 	DecoderLayerOutput,
 )
 from easydel.infra.utils import (
-	HiddenStateSharding,
 	auto_remat,
 	block_wise_ffn,
-	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -287,18 +286,18 @@ class Xerxes2MLP(nn.Module):
 		)
 
 	def __call__(self, hidden_states):
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		up_states = self.gate_up_proj(hidden_states)
 		gate, up_states = jnp.split(up_states, 2, axis=-1)
 		hidden_states = self.down_proj(up_states * nn.silu(gate))
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		return hidden_states
 
@@ -374,10 +373,10 @@ class Xerxes2DecoderLayer(nn.Module):
 		residual = hidden_states
 
 		hidden_states = self.input_layernorm(hidden_states)
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		attn_outputs = self.self_attn(
 			hidden_states,
@@ -405,10 +404,10 @@ class Xerxes2DecoderLayer(nn.Module):
 			hidden_states = self.mlp(hidden_states)
 		hidden_states = self.post_feedforward_layernorm(hidden_states)
 		hidden_states = residual + hidden_states
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		return DecoderLayerOutput(
 			hidden_states=hidden_states,
@@ -510,10 +509,10 @@ class Xerxes2Model(EasyDeLBaseModule):
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
 
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		for idx, block in enumerate(self.layers):
 			if output_hidden_states:
@@ -617,10 +616,10 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 
 		hidden_states = outputs.last_hidden_state
 
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 
 		if self.config.tie_word_embeddings:
@@ -671,22 +670,14 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 		self,
 		batch_size: int,
 		max_length: int,
-		pad_token_id: int | None = None,
-		prefill_length: int | None = None,
+		starts: int | None = None,
 		shardings: dict | None = None,
+		pad_token_id: int | None = None,
 	):
 		shardings = shardings or dict()
 		return TransformerCache.init_cache(
 			dtype=self.dtype,
-			key_values_shardings=shardings.get(
-				"key_value_shardings",
-				PartitionSpec(
-					self.config.partition_axis.batch_axis,
-					self.config.partition_axis.key_sequence_axis,
-					None,
-					self.config.partition_axis.attention_dim_axis,
-				),
-			),
+			partition_manager=self.config.partition_manager,
 			metadata=self.create_cache_metadata(
 				batch_size=batch_size,
 				max_length=max_length,
@@ -698,5 +689,5 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
 				quantization_platform=self.config.platform,
 			),
 			mesh=self.config.mesh,
-			prefill_length=prefill_length,
+			starts=starts,
 		)

@@ -17,6 +17,8 @@ from functools import partial
 import chex
 import jax
 import jax.numpy as jnp
+from eformer import common_types
+from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax import image as jimg
@@ -31,7 +33,7 @@ from easydel.infra.modeling_outputs import (
 	ImageClassifierOutput,
 	ModelOutput,
 )
-from easydel.infra.utils import ACT2FN, HiddenStateSharding, control_runtime_sharding
+from easydel.infra.utils import ACT2FN
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
 from easydel.layers.linear import ParallelLinear
 
@@ -357,16 +359,16 @@ class SiglipMLP(nn.Module):
 		self.fc2 = linear_class(config.intermediate_size, config.hidden_size)
 
 	def __call__(self, hidden_states: chex.Array) -> chex.Array:
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		hidden_states = self.fc2(self.activation_fn(self.fc1(hidden_states)))
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		return hidden_states
 

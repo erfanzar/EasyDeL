@@ -597,6 +597,7 @@ def _fwd_attention_kernel_call(
 		dtype_index(q),
 		kernel=_attn_fwd,
 		out_shape=out_shape,
+		disable_verbose_logging=False,
 		grid=lambda META: (triton.cdiv(max_seqlen_q, META["BLOCK_M"]), batch * nheads_q),
 		name="triton::ops::_attn_fwd",
 		**metaparams,

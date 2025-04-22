@@ -27,7 +27,7 @@ import flax.core
 import jax
 import jax.tree_util
 import numpy as np
-from eformer.escale import PartitionAxis, with_sharding_constraint
+from eformer.escale import with_sharding_constraint
 from einops import rearrange
 from flax import nnx as nn
 from jax.sharding import PartitionSpec as Ps
@@ -55,10 +55,6 @@ logger = get_logger(__name__)
 def quick_gelu(x):
 	return x * jax.nn.sigmoid(1.702 * x)
 
-
-HiddenStateSharding = dict(shorthand="B qS H", decode_mode=1)
-AttnQSharding = dict(shorthand="B qS h D", decode_mode=1)
-AttnKVSharding = dict(shorthand="B kS h D", decode_mode=1)
 
 ACT2FN = {
 	"gelu": partial(nn.gelu, approximate=False),
@@ -233,26 +229,6 @@ def block_wise_ffn(remat_ffn, inputs, chunk_size: int):
 			"model config or in config_kwargs in AutoEasyDeLModelFor... or change `scan_mlp_chunk_size` "
 			f"in configs for more information read Docs.\nOriginal Error\n{e}"
 		) from e
-
-
-def control_runtime_sharding(
-	arr: jax.Array,
-	paxis: PartitionAxis,
-	shorthand: str = None,
-	decode_mode: bool | int = 1,
-	sharding_strategy: tp.Optional[dict] = None,
-):
-	"""handles RunTime Shardings"""
-	if shorthand is None and sharding_strategy is None:
-		raise NotImplementedError("You should at least pass shorthand or sharding_stragedy")
-	if shorthand is None:
-		shorthand = sharding_strategy["shorthand"]
-		decode_mode = sharding_strategy["decode_mode"]
-	if isinstance(decode_mode, int):
-		decode_mode = arr.shape[decode_mode] == 1
-	specs = paxis.resolve_spec(shorthand, decode_mode)
-	arr = with_sharding_constraint(arr, sharding=specs)
-	return arr
 
 
 def is_flatten(pytree: dict):

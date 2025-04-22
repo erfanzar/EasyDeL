@@ -18,6 +18,8 @@ from functools import partial
 
 import chex
 import jax
+from eformer import common_types
+from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import numpy as jnp
 
@@ -32,10 +34,8 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import (
 	ACT2FN,
-	HiddenStateSharding,
 	auto_remat,
 	block_wise_ffn,
-	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -272,18 +272,18 @@ class ArcticMLP(nn.Module):
 		self.act_fn = ACT2FN[self.config.hidden_act]
 
 	def __call__(self, hidden_states: chex.Array):
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		w1 = self.act_fn(self.w1(hidden_states))
 		w3 = self.w3(hidden_states)
 		hidden_states = self.w2(w1 * w3)
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		return hidden_states
 
@@ -366,10 +366,10 @@ class ArcticMoeBlock(nn.Module):
 		Returns:
 			tp.Tuple[chex.Array, chex.Array]: Tuple containing the final hidden state and the router logits.
 		"""
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 
 		router_logits = self.gate(hidden_states).astype(  # no reshaping is needed
@@ -527,10 +527,10 @@ class ArcticDecoderLayer(nn.Module):
 	) -> DecoderLayerOutput:
 		residual_input = hidden_states
 		hidden_states = self.input_layernorm(hidden_states)
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		attn_outputs = self.self_attn(
 			hidden_states,
@@ -547,6 +547,11 @@ class ArcticDecoderLayer(nn.Module):
 		hidden_states = attn_outputs.attention_output
 		hidden_states = residual_input + hidden_states
 
+		hidden_states = apply_logical_sharding(
+			hidden_states,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
+		)
 		residual_attn = hidden_states
 		if self.parallel_attn_mlp_res:
 			hidden_states = self.residual_layernorm(hidden_states)
@@ -560,6 +565,12 @@ class ArcticDecoderLayer(nn.Module):
 			hidden_states = self.post_attention_layernorm(hidden_states)
 			hidden_states, gate_loss = self.block_sparse_moe(hidden_states)
 			hidden_states = residual_attn + hidden_states
+
+		hidden_states = apply_logical_sharding(
+			hidden_states,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
+		)
 
 		return DecoderLayerOutput(
 			hidden_states=hidden_states,
@@ -701,10 +712,10 @@ class ArcticModel(EasyDeLBaseModule):
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
 
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		for idx, layer in enumerate(self.layers):
 			if output_hidden_states:
@@ -722,10 +733,10 @@ class ArcticModel(EasyDeLBaseModule):
 			)
 			hidden_states = outputs.hidden_states
 
-			hidden_states = control_runtime_sharding(
+			hidden_states = apply_logical_sharding(
 				hidden_states,
-				self.config.partition_axis,
-				sharding_strategy=HiddenStateSharding,
+				dynamic_axes=common_types.HiddenStateSharding,
+				partition_manager=self.config.partition_manager,
 			)
 
 			if output_attentions:

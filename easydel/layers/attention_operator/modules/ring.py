@@ -278,16 +278,16 @@ class RingAttn(AttentionImpl):
 		query_lenght = q.shape[1]
 		value_lenght = v.shape[1]
 
-		runtime_type = self.get_runtime_type(q=q, BTHD=True)
+		model_mode = self.get_mode(q=q, BTHD=True)
 
 		(
-			query_partition_spec,
-			key_partition_spec,
-			value_partition_spec,
-			bias_partition_spec,
-			mask_partition_spec,
-			attention_partition_spec,
-		) = self.metadata.get_partition_specs(runtime_type, True)
+			query_sharding,
+			key_sharding,
+			value_sharding,
+			bias_sharding,
+			mask_sharding,
+			attention_sharding,
+		) = self.metadata.get_shardings(model_mode, True)
 
 		blocksize_k = min(self.metadata.blocksize_k, value_lenght)
 		blocksize_q = min(self.metadata.blocksize_q, query_lenght)
@@ -300,10 +300,10 @@ class RingAttn(AttentionImpl):
 
 			output = with_sharding_constraint(
 				arr=blockwise_attn(
-					query=with_sharding_constraint(arr=q, sharding=query_partition_spec),
-					key=with_sharding_constraint(arr=k, sharding=key_partition_spec),
-					value=with_sharding_constraint(arr=v, sharding=value_partition_spec),
-					bias=with_sharding_constraint(arr=bias, sharding=bias_partition_spec),
+					query=with_sharding_constraint(arr=q, sharding=query_sharding),
+					key=with_sharding_constraint(arr=k, sharding=key_sharding),
+					value=with_sharding_constraint(arr=v, sharding=value_sharding),
+					bias=with_sharding_constraint(arr=bias, sharding=bias_sharding),
 					deterministic=deterministic,
 					dtype=dtype,
 					dropout_rng=dropout_rng,
@@ -315,7 +315,7 @@ class RingAttn(AttentionImpl):
 					causal=causal,
 					float32_logits=True,
 				),
-				sharding=attention_partition_spec,
+				sharding=attention_sharding,
 			)
 			return AttentionOutput(attention_weights=None, attention_outputs=output)
 
@@ -362,16 +362,16 @@ class RingAttn(AttentionImpl):
 		sm_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
 		dtype = self.metadata.runtime_dtype
 
-		runtime_type = self.get_runtime_type(q=q, BTHD=True)
+		model_mode = self.get_mode(q=q, BTHD=True)
 
 		(
-			query_partition_spec,
-			key_partition_spec,
-			value_partition_spec,
-			bias_partition_spec,
-			mask_partition_spec,
-			attention_partition_spec,
-		) = self.metadata.get_partition_specs(runtime_type, True)
+			query_sharding,
+			key_sharding,
+			value_sharding,
+			bias_sharding,
+			mask_sharding,
+			attention_sharding,
+		) = self.metadata.get_shardings(model_mode, True)
 
 		if mask is None and bias is None and init_bias is not None:
 			bias = init_bias()
@@ -395,13 +395,13 @@ class RingAttn(AttentionImpl):
 				causal_block_size=1 if causal else None,
 			),
 			in_specs=(
-				self.create_stable_sharding(query_partition_spec, dep=q),
-				self.create_stable_sharding(key_partition_spec, dep=k),
-				self.create_stable_sharding(value_partition_spec, dep=v),
-				self.create_stable_sharding(bias_partition_spec, [0], dep=b),
-				self.create_stable_sharding(Ps(query_partition_spec[0], None), dep=segment_ids),
+				self.create_stable_sharding(query_sharding, dep=q),
+				self.create_stable_sharding(key_sharding, dep=k),
+				self.create_stable_sharding(value_sharding, dep=v),
+				self.create_stable_sharding(bias_sharding, [0], dep=b),
+				self.create_stable_sharding(Ps(query_sharding[0], None), dep=segment_ids),
 			),
-			out_specs=self.create_stable_sharding(attention_partition_spec),
+			out_specs=self.create_stable_sharding(attention_sharding),
 			mesh=self.metadata.mesh,
 			check_rep=False,
 		)(
@@ -416,7 +416,7 @@ class RingAttn(AttentionImpl):
 			attention_weights=None,
 			attention_outputs=with_sharding_constraint(
 				arr=attn_output,
-				sharding=attention_partition_spec,
+				sharding=attention_sharding,
 			),
 		)
 

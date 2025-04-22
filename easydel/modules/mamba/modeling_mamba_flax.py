@@ -545,9 +545,9 @@ class MambaModel(EasyDeLBaseModule):
 		self,
 		batch_size: int,
 		max_length: int,
-		pad_token_id: int | None = None,
-		prefill_length: int | None = None,
+		starts: int | None = None,
 		shardings: dict | None = None,
+		pad_token_id: int | None = None,
 	):
 		shardings = shardings or dict()
 		return MambaCache.init_cache(
@@ -651,7 +651,7 @@ class MambaForCausalLM(EasyDeLBaseModule):
 		input_ids,
 		max_length: int,
 		pad_token_id: int,
-		prefill_length: int | None = None,
+		starts: int | None = None,
 		**kwargs,
 	):
 		return self.prepare_inputs_for_call(**{"cache": kwargs.get("cache", None)})
@@ -660,9 +660,9 @@ class MambaForCausalLM(EasyDeLBaseModule):
 		self,
 		batch_size: int,
 		max_length: int,
-		pad_token_id: int | None = None,
-		prefill_length: int | None = None,
+		starts: int | None = None,
 		shardings: dict | None = None,
+		pad_token_id: int | None = None,
 	):
 		shardings = shardings or dict()
 		return MambaCache.init_cache(

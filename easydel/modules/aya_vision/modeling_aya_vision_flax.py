@@ -386,16 +386,16 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
 		self,
 		batch_size,
 		max_length,
-		pad_token_id=None,
-		prefill_length=None,
+		starts=None,
 		shardings=None,
+		pad_token_id=None,
 	):
 		return self.language_model.init_cache(
 			batch_size,
 			max_length,
-			pad_token_id,
-			prefill_length,
+			starts,
 			shardings,
+			pad_token_id,
 		)
 
 	def _get_compile_model_kwargs(
@@ -462,7 +462,7 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
 		input_ids: chex.Array,
 		max_length: int,
 		pad_token_id: int,
-		prefill_length: int | None = None,
+		starts: int | None = None,
 		pixel_values: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 	):
@@ -481,7 +481,7 @@ class AyaVisionForConditionalGeneration(EasyDeLBaseModule):
 			input_ids=input_ids,
 			max_length=max_length,
 			pad_token_id=pad_token_id,
-			prefill_length=prefill_length,
+			starts=starts,
 			attention_mask=attention_mask,
 		)
 		model_inputs["pixel_values"] = pixel_values

@@ -715,10 +715,11 @@ class vDriver:
 			my_detokenize_backlog.put((generate_timestep, sampled_tokens), block=True)
 			generate_timestep += 1
 			# TODO:Debug
+			_took = (time.time() - time_of_last_decode) * 10**3
+			_exec = (fn_call - time_of_last_decode) * 10**3
 			logger.info(
 				f"Decode engine {idx} step {generate_timestep} - slots free : {my_slots_size} / {max_concurrent_decodes}, "
-				f"took {(time.time() - time_of_last_decode) * 10**3}ms "
-				f" func took {(fn_call - time_of_last_decode) * 10**3}ms "
+				f"took {_took:.2f}ms  | execution took {_exec:.2f}ms "
 			)
 
 	def _detokenize_thread(self, idx: int):

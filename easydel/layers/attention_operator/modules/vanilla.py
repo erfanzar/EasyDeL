@@ -113,15 +113,15 @@ class VanillaAttn(AttentionImpl):
 			if self.metadata.runtime_softmax_dtype is None
 			else self.metadata.runtime_softmax_dtype
 		)
-		runtime_type = self.get_runtime_type(q=q, BTHD=True)
+		model_mode = self.get_mode(q=q, BTHD=True)
 		(
-			query_partition_spec,
-			key_partition_spec,
-			value_partition_spec,
-			bias_partition_spec,
-			mask_partition_spec,
-			attention_partition_spec,
-		) = self.metadata.get_partition_specs(runtime_type, True)
+			query_sharding,
+			key_sharding,
+			value_sharding,
+			bias_sharding,
+			mask_sharding,
+			attention_sharding,
+		) = self.metadata.get_shardings(model_mode, True)
 		if mask is None and bias is None and init_bias is not None:
 			bias = init_bias()
 		with self.metadata.mesh:
@@ -132,17 +132,17 @@ class VanillaAttn(AttentionImpl):
 			b, ks, kh, d = k.shape
 			*_, vd = v.shape
 			num_reps = qh // kh
-			q = with_sharding_constraint(arr=q, sharding=query_partition_spec)
-			k = with_sharding_constraint(arr=k, sharding=key_partition_spec)
-			v = with_sharding_constraint(arr=v, sharding=value_partition_spec)
+			q = with_sharding_constraint(arr=q, sharding=query_sharding)
+			k = with_sharding_constraint(arr=k, sharding=key_sharding)
+			v = with_sharding_constraint(arr=v, sharding=value_sharding)
 
 			bias = (
-				with_sharding_constraint(arr=bias, sharding=bias_partition_spec)
+				with_sharding_constraint(arr=bias, sharding=bias_sharding)
 				if bias is not None
 				else bias
 			)
 			mask = (
-				with_sharding_constraint(arr=mask, sharding=mask_partition_spec)
+				with_sharding_constraint(arr=mask, sharding=mask_sharding)
 				if mask is not None
 				else mask
 			)
@@ -185,7 +185,7 @@ class VanillaAttn(AttentionImpl):
 			attention_weights=aw,
 			attention_outputs=with_sharding_constraint(
 				arr=attention,
-				sharding=attention_partition_spec,
+				sharding=attention_sharding,
 			),
 		)
 
