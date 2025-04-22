@@ -206,6 +206,7 @@ def pad_tokens(
 	prefill_lengths: tp.Optional[tp.List[int]] = None,
 	max_prefill_length: tp.Optional[int] = None,
 	jax_padding: bool = True,
+	right_padding: bool = False,
 	bos_token_id: int | None = None,  # Added for clarity, though not used
 	is_bos: bool = True,  # Added for clarity, though not used
 ) -> tp.Tuple[tp.Union[jax.Array, np.ndarray], tp.Union[jax.Array, np.ndarray], int]:
@@ -258,8 +259,9 @@ def pad_tokens(
 		padded_tokens = tokens[-padded_length:]
 		padded_valids = valids[-padded_length:]
 	else:
-		padded_tokens = np.pad(tokens, (padding, 0), constant_values=(pad_token_id,))
-		padded_valids = np.pad(valids, (padding, 0), constant_values=(0,))
+		paddin = (0, padding) if right_padding else (padding, 0)
+		padded_tokens = np.pad(tokens, paddin, constant_values=(pad_token_id,))
+		padded_valids = np.pad(valids, paddin, constant_values=(0,))
 	if jax_padding:
 		padded_tokens = jnp.array([padded_tokens])
 		padded_valids = jnp.array([padded_valids])
