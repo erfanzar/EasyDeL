@@ -380,6 +380,44 @@ class TransformerCache(BaseCache):
 			]
 		)
 
+	def insert_starts(self, starts, slot: int):
+		for idx in range(len(self.views)):
+			view = self.views[idx]
+			starts = jnp.array(starts).reshape(-1)
+			default_sharding = PartitionSpec()
+			i_sharding = getattr(
+				view.prefill_length,
+				"sharding",
+				PartitionSpec(getattr(default_sharding, "spec", [None])[0]),
+			)
+
+			self.views[idx] = self.views[idx].replace(
+				prefill_length=with_sharding_constraint(
+					lax.dynamic_update_slice_in_dim(view.prefill_length, starts, slot, 0),
+					i_sharding,
+				)
+			)
+		return self
+
+	def insert_index(self, index, slot: int):
+		for idx in range(len(self.views)):
+			view = self.views[idx]
+			index = jnp.array(index).reshape(-1)
+			default_sharding = PartitionSpec()
+			i_sharding = getattr(
+				view.index,
+				"sharding",
+				PartitionSpec(getattr(default_sharding, "spec", [None])[0]),
+			)
+
+			self.views[idx] = self.views[idx].replace(
+				index=with_sharding_constraint(
+					lax.dynamic_update_slice_in_dim(view.index, index, slot, 0),
+					i_sharding,
+				)
+			)
+		return self
+
 	def insert(self, other: TransformerCache, slot: int, quantizer: EasyQuantizer):
 		for idx in range(len(self.views)):
 			view = self.views[idx]
@@ -390,7 +428,7 @@ class TransformerCache(BaseCache):
 			v_sharding = getattr(view.value, "sharding", default_sharding)
 			i_sharding = getattr(
 				view.index,
-				"index",
+				"sharding",
 				PartitionSpec(getattr(default_sharding, "spec", [None])[0]),
 			)
 

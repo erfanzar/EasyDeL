@@ -488,6 +488,7 @@ class vDriver:
 				pad_token_id=pad_token_id,
 				max_prefill_length=max_prefill_length,
 				prefill_lengths=prefill_lengths,
+				right_padding=False,
 			),
 			SamplingParams(
 				max_tokens=0,
