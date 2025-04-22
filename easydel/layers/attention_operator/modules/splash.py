@@ -153,7 +153,7 @@ class SplashAttn(AttentionImpl):
 			bias_sharding,
 			mask_sharding,
 			attention_sharding,
-		) = self.metadata.get_shardings(model_mode, BTHD=False)
+		) = self.metadata.get_shardings(model_mode, BTHD=False, qkv_mni_sharding=True)
 		if mask is not None and mask.shape[0] != q.shape[0]:
 			num_reps_mask = q.shape[0] // mask.shape[0]
 			mask = jnp.repeat(mask, num_reps_mask, 0)
@@ -175,9 +175,9 @@ class SplashAttn(AttentionImpl):
 			q_mask, kv_mask = self._split_attention_mask(mask)
 			q_mask, kv_mask = (q_mask.astype("i4"), kv_mask.astype("i4"))
 
-		index, prefill_length = [None] * 2
+		index, starts = [None] * 2
 		if cache_view is not None:
-			index, prefill_length = cache_view.index, cache_view.prefill_length
+			index, starts = cache_view.index, cache_view.starts
 
 		@functools.partial(
 			shard_map,
@@ -215,14 +215,14 @@ class SplashAttn(AttentionImpl):
 				),
 				self.create_stable_sharding(
 					views_sharding,
-					dep=prefill_length,
-					tensor=prefill_length,
+					dep=starts,
+					tensor=starts,
 				),
 			),
 			out_specs=self.create_stable_sharding(attention_sharding, tensor=q),
 			check_rep=False,
 		)
-		def _wraped_flash_attn(q: jax.Array, k, v, q_mask, kv_mask, index, prefill_length):
+		def _wraped_flash_attn(q: jax.Array, k, v, q_mask, kv_mask, index, starts):
 			if q.shape[-2] != 1:
 				output_shape = q.shape[:-1] + (v.shape[-1],)
 				num_reps = q.shape[1] // k.shape[1]
@@ -244,13 +244,10 @@ class SplashAttn(AttentionImpl):
 					m = SegmentIds(q_mask, kv_mask)
 				out = fn(q * sm_scale, k, v, m).reshape(output_shape)
 			else:
-				return pallas_ragged_decode(
-					q.transpose(0, 2, 1, 3) * sm_scale,
-					k.transpose(0, 2, 1, 3),
-					v.transpose(0, 2, 1, 3),
-					index,
-					prefill_length,
-				)[0].transpose(0, 2, 1, 3)
+				q = q.transpose(0, 2, 1, 3) * sm_scale
+				k = k.transpose(0, 2, 1, 3)
+				v = v.transpose(0, 2, 1, 3)
+				return pallas_ragged_decode(q, k, v, index, starts)[0].transpose(0, 2, 1, 3)
 			return out
 
 		attn = _wraped_flash_attn(
@@ -260,7 +257,7 @@ class SplashAttn(AttentionImpl):
 			q_mask,
 			kv_mask,
 			index,
-			prefill_length,
+			starts,
 		).transpose(0, 2, 1, 3)
 
 		return AttentionOutput(attention_weights=None, attention_outputs=attn)

@@ -69,120 +69,117 @@ def get_mha_cost_estimate(shape_dtype):
 
 @functools.partial(jax.jit, static_argnames=["mask_value"])
 def reference_mqa(
-	q: jax.Array,
-	k: jax.Array,
-	v: jax.Array,
-	lengths: jax.Array,
-	starts: jax.Array,
+	q: jax.Array,  # Input shape from vmap(MHA): (B, 1, D)
+	k: jax.Array,  # Input shape from vmap(MHA): (B, T, D)
+	v: jax.Array,  # Input shape from vmap(MHA): (B, T, D)
+	lengths: jax.Array,  # (B,)
+	starts: jax.Array,  # Input: (B,)
 	*,
 	mask_value: float = DEFAULT_MASK_VALUE,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-	"""Multi query attention reference.
-
-	Args:
-	  q: A [batch_size, num_heads, head_dim] jax.Array.
-	  k: A [batch_size, seq_len, head_dim] jax.Array.
-	  v: A [batch_size, seq_len, head_dim] jax.Array.
-	  lengths: A i32[batch_size] jax.Array.
-		starts: A i32[batch_size] jax.Array.
-	  mask_value: The value used for padding in attention. By default it is a very
-	    negative floating point number.
-
-	Returns:
-	  The output of attention([batch_size, num_heads, head_dim]), along with the
-	  max logit ([batch_size, num_heads]) and softmax denominator ([batch_size,
-	  num_heads]).
-	"""
+	"""Multi query attention reference (Called by vmap in reference_mha)."""
+	seq_len = k.shape[1]
 	logits = jnp.einsum("bhd,btd->bht", q.astype(jnp.float32), k.astype(jnp.float32))
-	mask = (starts < jnp.arange(k.shape[1]))[None, :] < lengths[:, None]
+	mask = (starts[:, None] + jnp.arange(seq_len, dtype=jnp.int32)[None, :]) < lengths[
+		:, None
+	]
 
-	logits = logits + jnp.where(mask, 0.0, mask_value)[:, None]
+	logits = logits + jnp.where(mask[:, None, :], 0.0, mask_value)
+
 	logits_max = logits.max(axis=-1)
-
-	unnormalized = jnp.exp(logits - logits_max[..., None])
+	logits_shifted = logits - logits_max[..., None]
+	unnormalized = jnp.exp(logits_shifted)
 	denominator = unnormalized.sum(axis=-1)
+	safe_denominator = jnp.maximum(denominator, jnp.finfo(denominator.dtype).tiny)
+
 	o = (
-		jnp.einsum("bht,btd->bhd", unnormalized.astype(v.dtype), v) / denominator[..., None]
+		jnp.einsum("bht,btd->bhd", unnormalized.astype(v.dtype), v)
+		/ safe_denominator[..., None]
 	)
 	return o, logits_max[..., None], denominator[..., None]
 
 
-@jax.jit
+@jax.jit  # Keep JIT here
 def reference_mha(
-	q: jax.Array,
-	k: jax.Array,
-	v: jax.Array,
-	lengths: jax.Array,
-	starts: jax.Array,
+	q: jax.Array,  # Input: (B, 1, H, D)
+	k: jax.Array,  # Input: (B, T, H, D)
+	v: jax.Array,  # Input: (B, T, H, D)
+	lengths: jax.Array,  # Input: (B,)
+	starts: jax.Array,  # Input: (B,)
 	*,
 	mask_value: float = DEFAULT_MASK_VALUE,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
 	"""Multi head attention reference.
 
-	Args:
-	  q: A [batch_size, num_heads, head_dim] jax.Array.
-	  k: A [batch_size, seq_len, num_heads, head_dim] jax.Array.
-	  v: A [batch_size, seq_len, num_heads, head_dim] jax.Array.
-	  lengths: A i32[batch_size] jax.Array.
-	  mask_value: The value used for padding in attention. By default it is a very
-	    negative floating point number.
-
 	Returns:
-	  The output of attention([batch_size, num_heads, head_dim]), along with the
-	  max logit ([batch_size, num_heads]) and softmax denominator ([batch_size,
-	  num_heads]).
+	  o: [batch_size, 1, num_heads, head_dim]
+	  m: [batch_size, 1, num_heads, 1]
+	  l: [batch_size, 1, num_heads, 1]
 	"""
-	return jax.vmap(
+
+	q = jnp.swapaxes(q, 1, 2)
+	k = jnp.swapaxes(k, 1, 2)
+	v = jnp.swapaxes(v, 1, 2)
+
+	o, m, l = jax.vmap(  # noqa
 		functools.partial(reference_mqa, mask_value=mask_value),
 		in_axes=(1, 1, 1, None, None),
 		out_axes=2,
 	)(q, k, v, lengths, starts)
 
+	return o, m, l
+
 
 @functools.partial(jax.jit, static_argnames=["mask_value"])
 def reference_gqa(
-	q: jax.Array,
-	k: jax.Array,
-	v: jax.Array,
-	lengths: jax.Array,
-	starts: jax.Array,
+	q: jax.Array,  # Input shape expected by this ref impl: (B, Hq, D)
+	k: jax.Array,  # Input shape expected by this ref impl: (B, T, Hkv, D)
+	v: jax.Array,  # Input shape expected by this ref impl: (B, T, Hkv, D)
+	lengths: jax.Array,  # (B,)
+	starts: jax.Array,  # Input: (B,)
 	mask_value: float = DEFAULT_MASK_VALUE,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
 	"""Vanilla attention GQA implementation for reference.
 
-	Args:
-	  q: A [batch_size, num_q_heads, head_dim] jax.Array.
-	  k: A [batch_size, num_kv_heads, max_seq_len, head_dim] jax.Array.
-	  v: A [batch_size, num_kv_heads, max_seq_len, head_dim] jax.Array.
-	  lengths: A i32[batch_size] jax.Array.
-	  mask_value: The value used for padding in attention. By default it is a very
-	    negative floating point number.
-
 	Returns:
-	  The output of attention([batch_size, num_heads, head_dim]), along with the
-	  max logit ([batch_size, num_heads]) and softmax denominator ([batch_size,
-	  num_heads]).
+	  o: [batch_size, 1, num_q_heads, head_dim]
+	  m: [batch_size, 1, num_q_heads, 1]
+	  l: [batch_size, 1, num_q_heads, 1]
 	"""
-	batch_size, num_heads_q, head_dim = q.shape
-	_, num_heads_kv, seq_len, _ = k.shape
+	batch_size, _, num_heads_q, head_dim = q.shape
+	_, seq_len, num_heads_kv, k_head_dim = k.shape
 	assert k.shape == v.shape
-	assert num_heads_q % num_heads_kv == 0
-
-	q = q.reshape(batch_size, num_heads_kv, num_heads_q // num_heads_kv, head_dim)
+	assert head_dim == k_head_dim, f"Head dims mismatch: q={head_dim}, k={k_head_dim}"
+	assert num_heads_q % num_heads_kv == 0, (
+		f"num_heads_q={num_heads_q} not divisible by num_heads_kv={num_heads_kv}"
+	)
+	num_groups = num_heads_q // num_heads_kv
+	q = q.reshape(batch_size, num_heads_kv, num_groups, head_dim)
+	k = jnp.swapaxes(k, 1, 2)
+	v = jnp.swapaxes(v, 1, 2)
 
 	logits = jnp.einsum("bhgd,bhtd->bhgt", q.astype(jnp.float32), k.astype(jnp.float32))
-	mask = (starts < jnp.arange(seq_len)[None, :]) < lengths[:, None]
-	logits = logits + jnp.where(mask, 0.0, mask_value)[:, None, None, :]
+
+	mask = (
+		starts.reshape(-1, 1) + jnp.arange(seq_len, dtype=jnp.int32)[None, :]
+	) < lengths[:, None]
+	logits = logits + jnp.where(mask[:, None, None, :], 0.0, mask_value)
 	logits_max = logits.max(axis=-1)
-	unnormalized = jnp.exp(logits - logits_max[..., None])
+	logits_shifted = logits - logits_max[..., None]
+	unnormalized = jnp.exp(logits_shifted)
 	denominator = unnormalized.sum(axis=-1)
-	o = (
-		jnp.einsum("bhgt,bhtd->bhgd", unnormalized.astype(v.dtype), v)
-		/ denominator[..., None]
-	)
-	logits_max = logits_max.reshape(batch_size, 1, num_heads_q, 1)
-	denominator = denominator.reshape(batch_size, 1, num_heads_q, 1)
-	o = o.reshape(batch_size, 1, num_heads_q, head_dim)
+	safe_denominator = jnp.maximum(denominator, jnp.finfo(denominator.dtype).tiny)
+	o_unscaled = jnp.einsum("bhgt,bhtd->bhgd", unnormalized.astype(v.dtype), v)
+	o = o_unscaled / safe_denominator[..., None]
+	o = o.reshape(batch_size, num_heads_q, head_dim)
+	o = jnp.expand_dims(o, axis=1)
+
+	logits_max = logits_max.reshape(batch_size, num_heads_q)
+	logits_max = jnp.expand_dims(logits_max, axis=(1, 3))
+
+	denominator = denominator.reshape(batch_size, num_heads_q)
+	denominator = jnp.expand_dims(denominator, axis=(1, 3))
+
 	return o, logits_max, denominator
 
 
@@ -237,10 +234,14 @@ def ragged_flash_attention_kernel(
 		m_prev, l_prev = m_ref[...], l_ref[...]
 
 		qk = lax.dot_general(
-			q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+			q,
+			k,
+			(((1,), (1,)), ((), ())),
+			preferred_element_type=jnp.float32,
 		)
 
-		mask = i * block_size + jax.lax.broadcasted_iota(jnp.int32, qk.shape, 1) < length
+		offset = i * block_size + jax.lax.broadcasted_iota(jnp.int32, qk.shape, 1)
+		mask = (start < offset) & (offset < length)
 		qk = qk + jnp.where(mask, 0.0, mask_value)
 		m_curr = qk.max(axis=-1)
 

@@ -199,7 +199,12 @@ class AttentionMetadata:
 			blocksize_b=config.blocksize_b,
 		)
 
-	def get_shardings(self, mode: RUNTIME_MODE_TYPES, BTHD: bool = True):  # type:ignore
+	def get_shardings(
+		self,
+		mode: RUNTIME_MODE_TYPES,  # type:ignore
+		BTHD: bool = True,
+		qkv_mni_sharding: bool = False,
+	):
 		"""
 		Generates JAX PartitionSpecs for attention tensors based on runtime mode.
 
@@ -221,11 +226,21 @@ class AttentionMetadata:
 				mode=mode,
 			)
 			key_sharding = pama.resolve(
-				axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
+				axes=[
+					BATCH,
+					KV_LENGTH,
+					HEAD if qkv_mni_sharding else KV_HEAD,
+					HEAD_DIM if qkv_mni_sharding else KV_HEAD_DIM,
+				],
 				mode=mode,
 			)
 			value_sharding = pama.resolve(
-				axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
+				axes=[
+					BATCH,
+					KV_LENGTH,
+					HEAD if qkv_mni_sharding else KV_HEAD,
+					HEAD_DIM if qkv_mni_sharding else KV_HEAD_DIM,
+				],
 				mode=mode,
 			)
 		else:
@@ -235,11 +250,21 @@ class AttentionMetadata:
 				mode=mode,
 			)
 			key_sharding = pama.resolve(
-				axes=[BATCH, KV_HEAD, KV_LENGTH, KV_HEAD_DIM],
+				axes=[
+					BATCH,
+					HEAD if qkv_mni_sharding else KV_HEAD,
+					KV_LENGTH,
+					HEAD_DIM if qkv_mni_sharding else KV_HEAD_DIM,
+				],
 				mode=mode,
 			)
 			value_sharding = pama.resolve(
-				axes=[BATCH, KV_HEAD, KV_LENGTH, KV_HEAD_DIM],
+				axes=[
+					BATCH,
+					HEAD if qkv_mni_sharding else KV_HEAD,
+					KV_LENGTH,
+					HEAD_DIM if qkv_mni_sharding else KV_HEAD_DIM,
+				],
 				mode=mode,
 			)
 
