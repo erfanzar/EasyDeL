@@ -19,6 +19,8 @@ import chex
 import jax
 import jax.numpy as jnp
 import numpy as np
+from eformer import common_types
+from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
 
@@ -32,10 +34,8 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import (
 	ACT2FN,
-	HiddenStateSharding,
 	auto_remat,
 	block_wise_ffn,
-	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -649,18 +649,18 @@ class Qwen2VLMLP(nn.Module):
 		self.act_fn = ACT2FN[self.config.hidden_act]
 
 	def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		gate = self.act_fn(self.gate_proj(hidden_states))
 		up = self.up_proj(hidden_states)
 		hidden_states = self.down_proj(gate * up)
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 
 		return hidden_states
@@ -921,10 +921,10 @@ class Qwen2VLDecoderLayer(nn.Module):
 			feed_forward_hidden_states = self.mlp(feed_forward_input)
 
 		hidden_states = hidden_states + feed_forward_hidden_states
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		return DecoderLayerOutput(
 			hidden_states=hidden_states,
@@ -1163,10 +1163,10 @@ class Qwen2VLModel(EasyDeLBaseModule):
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
 
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		for idx, block in enumerate(self.layers):
 			if output_hidden_states:
@@ -1355,10 +1355,10 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 
 		hidden_states = outputs.last_hidden_state
 
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 
 		logits = self.lm_head(hidden_states)
@@ -1376,7 +1376,7 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 		input_ids,
 		max_length: int,
 		pad_token_id: int,
-		prefill_length: int | None = None,
+		starts: int | None = None,
 		past_key_values=None,
 		attention_mask=None,
 		inputs_embeds=None,
@@ -1390,13 +1390,14 @@ class Qwen2VLForConditionalGeneration(EasyDeLBaseModule):
 		batch_size, seq_length = input_ids.shape
 
 		if past_key_values is None:
-			if prefill_length is None:
-				prefill_length = self.compute_prefill_length(input_ids, pad_token_id)
+			if starts is None:
+				starts = self.compute_prefill_length(input_ids, pad_token_id)
 			past_key_values = self.init_cache(
 				batch_size,
 				max_length,
+				starts,
+				None,
 				pad_token_id,
-				prefill_length,
 			)
 
 		if inputs_embeds is not None:

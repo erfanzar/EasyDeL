@@ -18,13 +18,15 @@ from functools import partial
 
 import chex as cx
 import jax
-from eformer.escale import with_sharding_constraint, get_corrected_named_sharding
+from eformer import common_types
+from eformer.escale import PartitionManager, apply_logical_sharding
 from eformer.jaximus import ImplicitArray
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from jax.sharding import Mesh
+from jax.sharding import NamedSharding as Ns
 
 from .._abstracts import (
 	BaseCache,
@@ -37,6 +39,20 @@ if tp.TYPE_CHECKING:
 	from easydel.layers.quantization.quantizers import EasyQuantizer
 else:
 	EasyQuantizer = object
+
+
+NOT_GIVEN = common_types.NOT_GIVEN
+RUNTIME_MODE_TYPES = common_types.RUNTIME_MODE_TYPES
+BATCH = common_types.BATCH
+QUERY_LENGTH = common_types.QUERY_LENGTH
+KV_LENGTH = common_types.KV_LENGTH
+HEAD = common_types.HEAD
+KV_HEAD = common_types.KV_HEAD
+HEAD_DIM = common_types.HEAD_DIM
+KV_HEAD_DIM = common_types.KV_HEAD_DIM
+BIAS_HEAD_SEQ = common_types.BIAS_HEAD_SEQ
+BIAS_KV_SEQ = common_types.BIAS_KV_SEQ
+MODE_PREFILL = common_types.MODE_PREFILL
 
 
 @auto_pytree
@@ -143,45 +159,66 @@ class TransformerCacheView(BaseCacheView):
 	key: tp.Union[cx.Array, ImplicitArray]
 	value: tp.Union[cx.Array, ImplicitArray]
 	index: tp.Union[cx.Array, ImplicitArray]
-	prefill_length: tp.Optional[tp.Union[cx.Array, ImplicitArray]]
+	starts: tp.Union[cx.Array, ImplicitArray]
+
 	metadata: TransformerCacheMetaData
+
 	layer_index: tp.Optional[int] = None
 
 	@classmethod
 	def init(
 		cls,
+		mesh: Mesh,
+		dtype: jnp.dtype,
 		metadata: TransformerCacheMetaData,
 		quantizer: EasyQuantizer,
-		key_values_shardings: PartitionSpec,
-		dtype: jnp.dtype,
-		mesh: Mesh,
+		partition_manager: PartitionManager,
+		starts: tp.Optional[jax.Array] = None,
 		layer_index: tp.Optional[int] = None,
-		prefill_length: tp.Optional[jax.Array] = None,
 	):
 		with jax.named_scope("easydel-transformer-cacheview-init"):
-			device = (
-				NamedSharding(mesh=mesh, spec=key_values_shardings)
-				if isinstance(key_values_shardings, PartitionSpec)
-				else key_values_shardings
-			)
 			mt = metadata
-			with mesh:
-				index_device = get_corrected_named_sharding(
-					(mt.batch_size,),
-					PartitionSpec(device.spec[0]),
-				)
+
 			kshape = (mt.batch_size, mt.sequence_length, mt.key_heads, mt.key_dim)
 			vshape = (mt.batch_size, mt.sequence_length, mt.value_heads, mt.value_dim)
-			prefill_length = (
-				jax.device_put(prefill_length, index_device)
-				if prefill_length is not None
-				else jnp.zeros((mt.batch_size,), dtype=jnp.int32, device=index_device)
+
+			kshardings = Ns(
+				mesh,
+				partition_manager.resolve(
+					axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
+					mode=MODE_PREFILL,
+					shape=kshape,
+				),
+			)
+			vshardings = Ns(
+				mesh,
+				partition_manager.resolve(
+					axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
+					mode=MODE_PREFILL,
+					shape=vshape,
+				),
+			)
+			ishardings = Ns(
+				mesh,
+				partition_manager.resolve(
+					axes=[BATCH],
+					mode=MODE_PREFILL,
+					shape=(mt.batch_size,),
+				),
+			)
+			if starts is None:
+				starts = jnp.zeros((mt.batch_size,), dtype=jnp.int32)
+			starts = apply_logical_sharding(
+				starts,
+				axes=[BATCH],
+				mode=MODE_PREFILL,
+				partition_manager=partition_manager,
 			)
 			out = cls(
-				key=quantizer(jnp.zeros(shape=kshape, dtype=dtype, device=device)),
-				value=quantizer(jnp.zeros(shape=vshape, dtype=dtype, device=device)),
-				index=jnp.zeros((metadata.batch_size,), dtype=jnp.int32, device=index_device),
-				prefill_length=prefill_length,
+				key=quantizer(jnp.zeros(shape=kshape, dtype=dtype, device=kshardings)),
+				value=quantizer(jnp.zeros(shape=vshape, dtype=dtype, device=vshardings)),
+				index=jnp.zeros((metadata.batch_size,), dtype=jnp.int32, device=ishardings),
+				starts=starts,
 				metadata=metadata,
 				layer_index=layer_index,
 			)
@@ -193,10 +230,10 @@ class TransformerCacheView(BaseCacheView):
 		query: cx.Array,
 		key: cx.Array,
 		value: cx.Array,
+		quantizer: EasyQuantizer,
 		cache_metadata: tp.Optional[TransformerMetadata],
 		attention_mask: cx.Array,
-		kv_sharding: NamedSharding,  # Ensure this is NamedSharding
-		quantizer: EasyQuantizer,
+		partition_manager: PartitionManager,
 		causal_mask: tp.Optional[cx.Array] = None,
 		token_type_ids: tp.Optional[cx.Array] = None,
 	) -> tp.Tuple[cx.Array, cx.Array, cx.Array]:
@@ -209,7 +246,6 @@ class TransformerCacheView(BaseCacheView):
 		    value: Current value states to add to the cache.
 		    cache_metadata: Optional metadata. If provided and contains slot/length info, enables pooled caching.
 		    attention_mask: Base attention mask.
-		    kv_sharding: NamedSharding spec for the cache tensors.
 		    quantizer: Quantizer for the cache.
 		    causal_mask: Optional causal mask.
 		    token_type_ids: Optional token type IDs for segment masking.
@@ -222,7 +258,7 @@ class TransformerCacheView(BaseCacheView):
 		"""
 
 		num_updated_cache_vectors = query.shape[1]
-		batch_sharding = PartitionSpec(kv_sharding[0])
+
 		index = self.index
 		batch_dims, max_length, num_heads, depth_per_head = self.value.shape
 
@@ -277,8 +313,18 @@ class TransformerCacheView(BaseCacheView):
 		value_cache_updated = _update_kv(_maybe_materialize(self.value), value, index)
 		key_cache_updated = _update_kv(_maybe_materialize(self.key), key, index)
 
-		value_cache_updated = with_sharding_constraint(value_cache_updated, kv_sharding)
-		key_cache_updated = with_sharding_constraint(key_cache_updated, kv_sharding)
+		value_cache_updated = apply_logical_sharding(
+			value_cache_updated,
+			axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
+			mode=MODE_PREFILL,
+			partition_manager=partition_manager,
+		)
+		key_cache_updated = apply_logical_sharding(
+			key_cache_updated,
+			axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
+			mode=MODE_PREFILL,
+			partition_manager=partition_manager,
+		)
 
 		index = index + num_updated_cache_vectors
 
@@ -290,14 +336,21 @@ class TransformerCacheView(BaseCacheView):
 		return (
 			key_cache_updated,
 			value_cache_updated,
-			with_sharding_constraint(
+			apply_logical_sharding(
 				jnp.logical_and(pad_mask, attention_mask),
-				batch_sharding,
+				axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
+				mode=MODE_PREFILL,
+				partition_manager=partition_manager,
 			),
 			self.replace(
 				key=quantizer(key_cache_updated),
 				value=quantizer(value_cache_updated),
-				index=with_sharding_constraint(index, batch_sharding),
+				index=apply_logical_sharding(
+					index,
+					axes=[BATCH],
+					mode=MODE_PREFILL,
+					partition_manager=partition_manager,
+				),
 			),
 		)
 
@@ -327,39 +380,40 @@ class TransformerCache(BaseCache):
 	@classmethod
 	def init_cache(
 		cls,
-		metadata: TransformerCacheMetaData,
 		mesh: Mesh,
-		quantizer: tp.Optional[EasyQuantizer] = None,
+		metadata: TransformerCacheMetaData,
+		partition_manager: PartitionManager,
 		dtype: tp.Optional[jnp.dtype] = None,
-		key_values_shardings: tp.Optional[PartitionSpec] = None,
-		prefill_length: tp.Optional[jax.Array] = None,
+		starts: tp.Optional[jax.Array] = None,
+		quantizer: tp.Optional[EasyQuantizer] = None,
 	):
 		from easydel.infra.etils import EasyDeLQuantizationMethods
 		from easydel.layers.quantization.quantizers import EasyQuantizer
 
 		quantizer = quantizer or EasyQuantizer(EasyDeLQuantizationMethods.NONE)
-		key_values_shardings = key_values_shardings or PartitionSpec()
 		if dtype is None:
 			dtype = jnp.bfloat16
-		return cls(
-			views=[
-				TransformerCacheView.init(
-					metadata=metadata,
-					quantizer=quantizer,
-					key_values_shardings=key_values_shardings,
-					dtype=dtype,
-					mesh=mesh,
-					layer_index=layer_index,
-					prefill_length=prefill_length,
-				)
-				for layer_index in range(metadata.num_hidden_layers)
-			]
-		)
+		with mesh:
+			return cls(
+				views=[
+					# i have to somehow fix my OCD
+					TransformerCacheView.init(
+						mesh=mesh,
+						dtype=dtype,
+						starts=starts,
+						metadata=metadata,
+						quantizer=quantizer,
+						layer_index=layer_index,
+						partition_manager=partition_manager,
+					)
+					for layer_index in range(metadata.num_hidden_layers)
+				]
+			)
 
 	def to_pure(self):
 		return (
 			[
-				[layer.key, layer.value, layer.index, layer.prefill_length]
+				[layer.key, layer.value, layer.index, layer.starts]
 				for i, layer in enumerate(self.views)
 			],
 			self.views[-1].metadata,
@@ -373,64 +427,52 @@ class TransformerCache(BaseCache):
 					key=layer[0],
 					value=layer[1],
 					index=layer[2],
-					prefill_length=layer[3],
+					starts=layer[3],
 					metadata=metadata,
 				)
 				for layer in pure
 			]
 		)
 
-	def insert_starts(self, starts, slot: int):
+	def insert_starts(self, starts, slot: int, partition_manager: PartitionManager):
 		for idx in range(len(self.views)):
 			view = self.views[idx]
 			starts = jnp.array(starts).reshape(-1)
-			default_sharding = PartitionSpec()
-			i_sharding = getattr(
-				view.prefill_length,
-				"sharding",
-				PartitionSpec(getattr(default_sharding, "spec", [None])[0]),
-			)
 
 			self.views[idx] = self.views[idx].replace(
-				prefill_length=with_sharding_constraint(
-					lax.dynamic_update_slice_in_dim(view.prefill_length, starts, slot, 0),
-					i_sharding,
+				starts=apply_logical_sharding(
+					lax.dynamic_update_slice_in_dim(view.starts, starts, slot, 0),
+					axes=[BATCH],
+					mode=MODE_PREFILL,
+					partition_manager=partition_manager,
 				)
 			)
 		return self
 
-	def insert_index(self, index, slot: int):
+	def insert_index(self, index, slot: int, partition_manager: PartitionManager):
 		for idx in range(len(self.views)):
 			view = self.views[idx]
 			index = jnp.array(index).reshape(-1)
-			default_sharding = PartitionSpec()
-			i_sharding = getattr(
-				view.index,
-				"sharding",
-				PartitionSpec(getattr(default_sharding, "spec", [None])[0]),
-			)
-
 			self.views[idx] = self.views[idx].replace(
-				index=with_sharding_constraint(
+				index=apply_logical_sharding(
 					lax.dynamic_update_slice_in_dim(view.index, index, slot, 0),
-					i_sharding,
+					axes=[BATCH],
+					mode=MODE_PREFILL,
+					partition_manager=partition_manager,
 				)
 			)
 		return self
 
-	def insert(self, other: TransformerCache, slot: int, quantizer: EasyQuantizer):
+	def insert(
+		self,
+		other: TransformerCache,
+		slot: int,
+		quantizer: EasyQuantizer,
+		partition_manager: PartitionManager,
+	):
 		for idx in range(len(self.views)):
 			view = self.views[idx]
 			oview = other.views[idx]
-
-			default_sharding = PartitionSpec()
-			k_sharding = getattr(view.key, "sharding", default_sharding)
-			v_sharding = getattr(view.value, "sharding", default_sharding)
-			i_sharding = getattr(
-				view.index,
-				"sharding",
-				PartitionSpec(getattr(default_sharding, "spec", [None])[0]),
-			)
 
 			def _maybe_materialize(x):
 				if hasattr(x, "materialize"):
@@ -439,58 +481,43 @@ class TransformerCache(BaseCache):
 
 			self.views[idx] = self.views[idx].replace(
 				key=quantizer(
-					with_sharding_constraint(
+					apply_logical_sharding(
 						lax.dynamic_update_slice(
 							_maybe_materialize(view.key),
 							oview.key,
 							(slot, 0, 0, 0),
 						),
-						k_sharding,
+						axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
+						mode=MODE_PREFILL,
+						partition_manager=partition_manager,
 					)
 				),
 				value=quantizer(
-					with_sharding_constraint(
+					apply_logical_sharding(
 						lax.dynamic_update_slice(
 							_maybe_materialize(view.value),
 							oview.value,
 							(slot, 0, 0, 0),
 						),
-						v_sharding,
+						axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
+						mode=MODE_PREFILL,
+						partition_manager=partition_manager,
 					)
 				),
-				index=with_sharding_constraint(
-					lax.dynamic_update_slice_in_dim(
-						view.index,
-						oview.index,
-						slot,
-						0,
-					),
-					i_sharding,
+				index=apply_logical_sharding(
+					lax.dynamic_update_slice_in_dim(view.index, oview.index, slot, 0),
+					axes=[BATCH],
+					mode=MODE_PREFILL,
+					partition_manager=partition_manager,
 				),
-				prefill_length=with_sharding_constraint(
-					lax.dynamic_update_slice_in_dim(
-						view.prefill_length,
-						oview.prefill_length,
-						slot,
-						0,
-					),
-					i_sharding,
+				starts=apply_logical_sharding(
+					lax.dynamic_update_slice_in_dim(view.starts, oview.starts, slot, 0),
+					axes=[BATCH],
+					mode=MODE_PREFILL,
+					partition_manager=partition_manager,
 				),
 				metadata=view.metadata,
 			)
-		return self
-
-	def broadcast_shape(self, batch_size: int):
-		for idx in range(len(self.views)):
-			view = self.views[idx]
-			key, value = view.key, view.value
-
-			key = jnp.broadcast_to(key, (batch_size,) + key.shape[1:])
-			value = jnp.broadcast_to(value, (batch_size,) + value.shape[1:])
-
-			metadata = view.metadata
-			metadata.batch_size = batch_size
-			self.views[idx] = view.replace(key=key, value=value, metadata=metadata)
 		return self
 
 	@classmethod

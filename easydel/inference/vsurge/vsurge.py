@@ -418,4 +418,3 @@ class vSurge:
 				dummy_response,
 				buffered_response_list,
 			)
-		del buffered_response_list

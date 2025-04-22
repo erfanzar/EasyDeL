@@ -30,6 +30,7 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as Ps
 
+from easydel.kernels.tpu_ops import pallas_ragged_decode
 from easydel.layers.caching.transformer.transformer_cache import TransformerCacheView
 
 from .._attention_impl import (
@@ -39,7 +40,6 @@ from .._attention_impl import (
 	AttentionRegistry,
 )
 from .vanilla import VanillaAttn
-from easydel.kernels.tpu_ops import pallas_ragged_decode
 
 
 @AttentionRegistry.register
@@ -144,16 +144,16 @@ class SplashAttn(AttentionImpl):
 		sm_scale = self.metadata.softmax_scale
 		sm_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
 		dtype = self.metadata.runtime_dtype
-		runtime_type = self.get_runtime_type(q=q, BTHD=False)
+		model_mode = self.get_mode(q=q, BTHD=False)
 
 		(
-			query_partition_spec,
-			key_partition_spec,
-			value_partition_spec,
-			bias_partition_spec,
-			mask_partition_spec,
-			attention_partition_spec,
-		) = self.metadata.get_partition_specs(runtime_type, BTHD=False)
+			query_sharding,
+			key_sharding,
+			value_sharding,
+			bias_sharding,
+			mask_sharding,
+			attention_sharding,
+		) = self.metadata.get_shardings(model_mode, BTHD=False)
 		if mask is not None and mask.shape[0] != q.shape[0]:
 			num_reps_mask = q.shape[0] // mask.shape[0]
 			mask = jnp.repeat(mask, num_reps_mask, 0)
@@ -168,8 +168,8 @@ class SplashAttn(AttentionImpl):
 			block_q_dq=min(self.metadata.blocksize_q, query_lenght),
 			block_kv_dq=min(self.metadata.blocksize_k, value_lenght),
 		)
-		qkv_mask_partition_spec = Ps(query_partition_spec[0], query_partition_spec[2])
-		views_partition_spec = Ps(query_partition_spec[0])
+		qkv_mask_sharding = Ps(query_sharding[0], query_sharding[2])
+		views_sharding = Ps(query_sharding[0])
 		q_mask, kv_mask = [None] * 2
 		if mask is not None:
 			q_mask, kv_mask = self._split_attention_mask(mask)
@@ -184,42 +184,42 @@ class SplashAttn(AttentionImpl):
 			mesh=self.metadata.mesh,
 			in_specs=(
 				self.create_stable_sharding(
-					query_partition_spec,
+					query_sharding,
 					dep=q,
 					tensor=q,
 				),
 				self.create_stable_sharding(
-					key_partition_spec,
+					key_sharding,
 					dep=k,
 					tensor=k,
 				),
 				self.create_stable_sharding(
-					value_partition_spec,
+					value_sharding,
 					dep=v,
 					tensor=v,
 				),
 				self.create_stable_sharding(
-					qkv_mask_partition_spec,
+					qkv_mask_sharding,
 					dep=q_mask,
 					tensor=q_mask,
 				),
 				self.create_stable_sharding(
-					qkv_mask_partition_spec,
+					qkv_mask_sharding,
 					dep=kv_mask,
 					tensor=kv_mask,
 				),
 				self.create_stable_sharding(
-					views_partition_spec,
+					views_sharding,
 					dep=index,
 					tensor=index,
 				),
 				self.create_stable_sharding(
-					views_partition_spec,
+					views_sharding,
 					dep=prefill_length,
 					tensor=prefill_length,
 				),
 			),
-			out_specs=self.create_stable_sharding(attention_partition_spec, tensor=q),
+			out_specs=self.create_stable_sharding(attention_sharding, tensor=q),
 			check_rep=False,
 		)
 		def _wraped_flash_attn(q: jax.Array, k, v, q_mask, kv_mask, index, prefill_length):

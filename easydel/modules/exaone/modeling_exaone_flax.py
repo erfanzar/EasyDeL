@@ -18,6 +18,8 @@ import typing as tp
 
 import chex
 import jax
+from eformer import common_types
+from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import numpy as jnp
 
@@ -32,10 +34,8 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import (
 	ACT2FN,
-	HiddenStateSharding,
 	auto_remat,
 	block_wise_ffn,
-	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -82,18 +82,18 @@ class ExaoneGatedMLP(nn.Module):
 		self.act_fn = ACT2FN[config.activation_function]
 
 	def __call__(self, hidden_states: chex.Array):
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		hidden_states = self.c_proj(
 			self.act_fn(self.c_fc_0(hidden_states)) * self.c_fc_1(hidden_states)
 		)
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		return hidden_states
 
@@ -410,10 +410,10 @@ class ExaoneDecoderLayer(nn.Module):
 			feed_forward_hidden_states = self.mlp(hidden_states)
 
 		hidden_states = residual + feed_forward_hidden_states
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 
 		return DecoderLayerOutput(
@@ -667,10 +667,10 @@ class ExaoneForCausalLM(EasyDeLBaseModule):
 
 		hidden_states = outputs.last_hidden_state
 
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 
 		if self.config.tie_word_embeddings:

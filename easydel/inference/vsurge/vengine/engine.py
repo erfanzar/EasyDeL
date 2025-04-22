@@ -22,7 +22,7 @@ from jax import numpy as jnp
 from jax.sharding import NamedSharding as Ns
 from jax.sharding import PartitionSpec as Ps
 from transformers import ProcessorMixin
-
+from eformer import common_types
 from easydel.utils.compiling_utils import cjit
 
 from .utilities import (
@@ -43,6 +43,19 @@ else:
 import jax.experimental.layout as jlu
 
 AutoLayout = jlu.Layout(jlu.DeviceLocalLayout.AUTO)
+
+NOT_GIVEN = common_types.NOT_GIVEN
+RUNTIME_MODE_TYPES = common_types.RUNTIME_MODE_TYPES
+BATCH = common_types.BATCH
+QUERY_LENGTH = common_types.QUERY_LENGTH
+KV_LENGTH = common_types.KV_LENGTH
+HEAD = common_types.HEAD
+KV_HEAD = common_types.KV_HEAD
+HEAD_DIM = common_types.HEAD_DIM
+KV_HEAD_DIM = common_types.KV_HEAD_DIM
+BIAS_HEAD_SEQ = common_types.BIAS_HEAD_SEQ
+BIAS_KV_SEQ = common_types.BIAS_KV_SEQ
+MODE_PREFILL = common_types.MODE_PREFILL
 
 
 class vEngine:
@@ -96,6 +109,7 @@ class vEngine:
 			block_size=model.config.kv_cache_quantization_blocksize,
 			quantization_platform=model.config.platform,
 		)
+		self._partition_manager = model.config.partition_manager
 		self._max_prefill_lengths = prefill_lengths or DEFAULT_PREFILL_BUCKETS
 		self._max_concurrent_decodes = max_concurrent_decodes or jax.device_count()
 		self._max_concurrent_prefill = max_concurrent_prefill or jax.device_count()
@@ -107,14 +121,12 @@ class vEngine:
 		self._setup_functions()
 
 	def get_state_shardings(self, is_decode: bool = False):
-		paxis = self.model.config.partition_axis
-		kvps = Ps(
-			paxis.batch_axis if is_decode else None,
-			paxis.key_sequence_axis,
-			paxis.head_axis,
-			paxis.attention_dim_axis,
+		pmang = self.model.config.partition_manager
+		kvps = pmang.resolve(
+			axes=[BATCH if is_decode else "_", KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
+			mode=MODE_PREFILL,
 		)
-		bsharding = Ps(paxis.batch_axis) if is_decode else Ps()
+		bsharding = pmang.resolve(axes=[BATCH if is_decode else "_"], mode=MODE_PREFILL)
 
 		return (
 			("index", bsharding),
@@ -194,7 +206,7 @@ class vEngine:
 				jax.jit(
 					continuous_insert,
 					donate_argnums=(0, 1),
-					static_argnums=(3,),
+					static_argnums=(3, 4),
 					in_shardings=(
 						self._prefill_state_sharding,
 						self._decodes_state_sharding,
@@ -202,7 +214,7 @@ class vEngine:
 					),
 					out_shardings=self._decodes_state_sharding,
 				),
-				static_argnums=(3,),
+				static_argnums=(3, 4),
 			)
 
 	@cached_property
@@ -299,8 +311,10 @@ class vEngine:
 	def init_decode_state(self, *args, **kwargs) -> GenerationState:
 		"""Initializes the GenerationState for a new sequence"""
 		concurrent_decode = self.max_concurrent_decodes
-		paxis = self.model.config.partition_axis
-		sharding = Ns(self.model.mesh, Ps(paxis.batch_axis))
+		pmang = self.model.config.partition_manager
+
+		sharding = Ns(self.model.mesh, pmang.resolve(axes=[BATCH], mode=MODE_PREFILL))
+
 		vocab_size = getattr(self.model.config, "vocab_size", None)
 		if vocab_size is None and hasattr(self.model.config, "text_config"):
 			vocab_size = getattr(self.model.config.text_config, "vocab_size", None)
@@ -451,12 +465,14 @@ class vEngine:
 		    prefix state with its cache potentially broadcasted. Needs clarification
 		    on the intended merging logic with `decode_state` and `slot`.
 		"""
-		return self.continuous_insert(
-			prefix,
-			decode_state,
-			slot,
-			self._quantizer,
-		)
+		with self.model.mesh:
+			return self.continuous_insert(
+				prefix,
+				decode_state,
+				slot,
+				self._quantizer,
+				self._partition_manager,
+			)
 
 	def bulk_insert(
 		self,
@@ -488,9 +504,11 @@ class vEngine:
 		    results inserted at the specified slots.
 		"""
 
-		return continuous_bulk_insert(
-			prefix=prefix,
-			decode_state=decode_state,
-			slots=slots,
-			quantizer=self._quantizer,
-		)
+		with self.model.mesh:
+			return continuous_bulk_insert(
+				prefix=prefix,
+				decode_state=decode_state,
+				slots=slots,
+				quantizer=self._quantizer,
+				partition_manager=self._partition_manager,
+			)

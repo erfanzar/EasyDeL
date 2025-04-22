@@ -21,7 +21,7 @@ import chex
 import jax
 import jax.extend
 import jax.tree_util
-from eformer.escale import PartitionAxis
+from eformer.escale import PartitionAxis, PartitionManager
 from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 from transformers.configuration_utils import PretrainedConfig
@@ -37,6 +37,7 @@ from .etils import (
 	EasyDeLPlatforms,
 	EasyDeLQuantizationMethods,
 )
+from eformer.common_types import NOT_GIVEN
 
 if tp.TYPE_CHECKING:
 	from easydel.layers.rotary_embedding import RopeConfig
@@ -80,7 +81,7 @@ if EKERNEL_OPS:
 def set_attrs_smartly(self, attr_name: str, default: tp.Any, new_attr: tp.Any):
 	if not hasattr(self, attr_name):
 		setattr(self, attr_name, default)
-	if not new_attr == Ellipsis:
+	if new_attr is not NOT_GIVEN:
 		setattr(self, attr_name, new_attr)
 
 
@@ -471,41 +472,41 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
 	def add_basic_configurations(
 		self,
-		axis_dims: tp.Sequence[int] = ...,
-		dcn_axis_dims: tp.Optional[tp.Sequence[int]] = ...,
-		axis_names: tp.Sequence[str] = ...,
-		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = ...,
-		blocksize_k: int = ...,
-		blocksize_q: int = ...,
-		blocksize_b: int = ...,
-		partition_axis: PartitionAxis = ...,
-		shard_attention_computation: bool = ...,
-		use_sharded_kv_caching: bool = ...,
-		backend: tp.Optional[EasyDeLBackends] = ...,
-		platform: tp.Optional[EasyDeLPlatforms] = ...,
-		easy_method: tp.Literal["train", "serve", "convert"] = ...,
-		bits: tp.Optional[int] = ...,
-		scan_ring_attention: bool = ...,
-		scan_attention_layers: bool = ...,
-		use_sharding_constraint: bool = ...,
-		use_scan_mlp: bool = ...,
-		scan_mlp_chunk_size: int = ...,
-		sequence_axis_name: str = ...,
-		gradient_checkpointing: EasyDeLGradientCheckPointers = ...,
-		precompute_masks: bool = ...,
-		kv_cache_quantization_method: EasyDeLQuantizationMethods = ...,
-		kv_cache_quantization_blocksize: int = ...,
-		quantization_method: EasyDeLQuantizationMethods = ...,
-		quantization_blocksize: int = ...,
-		quantization_pattern: str = ...,
-		kv_cache_sharding_sequence_axis_name: tp.Union[str, tp.Tuple[str, ...]] = ...,
-		flash_attention_backward_pass_impl: tp.Literal["triton", "xla"] = ...,
-		attn_dtype: jnp.dtype = ...,
-		attn_softmax_dtype: jnp.dtype = ...,
-		hardware_abstraction: bool = ...,
-		pallas_m_block_size: int = ...,
-		pallas_k_block_size: int = ...,
-		pallas_n_block_size: int = ...,
+		axis_dims: tp.Sequence[int] = NOT_GIVEN,
+		dcn_axis_dims: tp.Optional[tp.Sequence[int]] = NOT_GIVEN,
+		axis_names: tp.Sequence[str] = NOT_GIVEN,
+		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = NOT_GIVEN,
+		blocksize_k: int = NOT_GIVEN,
+		blocksize_q: int = NOT_GIVEN,
+		blocksize_b: int = NOT_GIVEN,
+		partition_axis: PartitionAxis = NOT_GIVEN,
+		shard_attention_computation: bool = NOT_GIVEN,
+		use_sharded_kv_caching: bool = NOT_GIVEN,
+		backend: tp.Optional[EasyDeLBackends] = NOT_GIVEN,
+		platform: tp.Optional[EasyDeLPlatforms] = NOT_GIVEN,
+		easy_method: tp.Literal["train", "serve", "convert"] = NOT_GIVEN,
+		bits: tp.Optional[int] = NOT_GIVEN,
+		scan_ring_attention: bool = NOT_GIVEN,
+		scan_attention_layers: bool = NOT_GIVEN,
+		use_sharding_constraint: bool = NOT_GIVEN,
+		use_scan_mlp: bool = NOT_GIVEN,
+		scan_mlp_chunk_size: int = NOT_GIVEN,
+		sequence_axis_name: str = NOT_GIVEN,
+		gradient_checkpointing: EasyDeLGradientCheckPointers = NOT_GIVEN,
+		precompute_masks: bool = NOT_GIVEN,
+		kv_cache_quantization_method: EasyDeLQuantizationMethods = NOT_GIVEN,
+		kv_cache_quantization_blocksize: int = NOT_GIVEN,
+		quantization_method: EasyDeLQuantizationMethods = NOT_GIVEN,
+		quantization_blocksize: int = NOT_GIVEN,
+		quantization_pattern: str = NOT_GIVEN,
+		kv_cache_sharding_sequence_axis_name: tp.Union[str, tp.Tuple[str, ...]] = NOT_GIVEN,
+		flash_attention_backward_pass_impl: tp.Literal["triton", "xla"] = NOT_GIVEN,
+		attn_dtype: jnp.dtype = NOT_GIVEN,
+		attn_softmax_dtype: jnp.dtype = NOT_GIVEN,
+		hardware_abstraction: bool = NOT_GIVEN,
+		pallas_m_block_size: int = NOT_GIVEN,
+		pallas_k_block_size: int = NOT_GIVEN,
+		pallas_n_block_size: int = NOT_GIVEN,
 		**kwargs,
 	):
 		"""
@@ -949,6 +950,10 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		else:
 			fcm_mask = None
 		return fcm_mask
+
+	@property
+	def partition_manager(self):
+		return PartitionManager(self.partition_axis)
 
 	__hash__ = hash_fn
 

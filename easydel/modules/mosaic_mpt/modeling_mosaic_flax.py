@@ -19,6 +19,8 @@ from functools import cached_property, partial
 
 import chex
 import jax
+from eformer import common_types
+from eformer.escale import apply_logical_sharding
 from einops import rearrange
 from flax import nnx as nn
 from jax import lax
@@ -33,9 +35,7 @@ from easydel.infra.modeling_outputs import (
 	DecoderLayerOutput,
 )
 from easydel.infra.utils import (
-	HiddenStateSharding,
 	auto_remat,
-	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -112,18 +112,18 @@ class MptMLP(nn.Module):
 		)
 
 	def __call__(self, hidden_states: chex.Array, residual: chex.Array):
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		up = jax.nn.gelu(self.up_proj(hidden_states), approximate=False)
 		hidden_states = self.down_proj(up)
 
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		return self.hidden_dropout(hidden_states) + residual
 

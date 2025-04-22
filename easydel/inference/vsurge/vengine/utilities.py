@@ -23,7 +23,7 @@ from eformer.pytree import auto_pytree
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec
-
+from eformer.escale import PartitionManager
 from easydel.layers.caching.transformer.transformer_cache import TransformerCache
 from easydel.layers.quantization.quantizers import EasyQuantizer
 
@@ -247,6 +247,7 @@ def continuous_bulk_insert(
 	decode_state: GenerationState,
 	slots: list[int],
 	quantizer: EasyQuantizer,
+	partition_manager: PartitionManager,
 ) -> GenerationState:
 	def update_idx1d(x, y, s):
 		return jax.lax.dynamic_update_slice(x, y, (s,))
@@ -260,7 +261,12 @@ def continuous_bulk_insert(
 
 	@implicit
 	def _cache(mx_cache, prefix, slot):
-		return mx_cache.cache.insert(prefix.cache, quantizer=quantizer, slot=slot)
+		return mx_cache.cache.insert(
+			prefix.cache,
+			quantizer=quantizer,
+			slot=slot,
+			partition_manager=partition_manager,
+		)
 
 	for slot in slots:
 		logits = update_idx2d(decode_state.logits, prefix.logits, slot)
@@ -293,6 +299,7 @@ def continuous_insert(
 	decode_state: GenerationState,
 	slot: int,
 	quantizer: EasyQuantizer,
+	partition_manager: PartitionManager,
 ) -> GenerationState:
 	def update_idx1d(x, y):
 		sharding = getattr(x, "sharding", PartitionSpec())
@@ -310,7 +317,12 @@ def continuous_insert(
 
 	@implicit
 	def _cache(mx_cache, prefix):
-		return mx_cache.cache.insert(prefix.cache, quantizer=quantizer, slot=slot)
+		return mx_cache.cache.insert(
+			prefix.cache,
+			quantizer=quantizer,
+			slot=slot,
+			partition_manager=partition_manager,
+		)
 
 	return GenerationState(
 		logits=update_idx2d(decode_state.logits, prefix.logits),
@@ -366,11 +378,11 @@ def continuous_prefill(
 		position_ids,
 	):
 		model: EasyDeLBaseModule = nn.merge(gdef, gstate, gother)
-		prefill_length = jnp.array([input_ids.shape[-1] - true_length]) 
+		starts = jnp.array([input_ids.shape[-1] - true_length])
 		past_key_values = model.init_cache(
 			batch_size=batch_size,
 			max_length=max_length,
-			prefill_length=prefill_length,
+			starts=starts,
 		)
 		with model.mesh:
 			return model(

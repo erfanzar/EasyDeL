@@ -13,20 +13,21 @@
 # limitations under the License.
 
 from __future__ import annotations
-from eformer import escale as es
 
 import dataclasses
 import typing as tp
 from abc import abstractmethod
-from enum import Enum
 
 import einops
 import jax
-from eformer.escale import PartitionAxis
+from eformer import common_types
+from eformer import escale as es
+from eformer.escale import PartitionAxis, PartitionManager
+from eformer.pytree import auto_pytree
 from jax import Array
 from jax import numpy as jnp
 from jax.sharding import PartitionSpec as Ps
-from eformer.pytree import auto_pytree
+
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLBackends, EasyDeLPlatforms
 from easydel.utils.helpers import get_logger
@@ -34,6 +35,17 @@ from easydel.utils.helpers import get_logger
 from ..ops import BaseOperation
 
 logger = get_logger("EasyDeL-AttentionOperator")
+NOT_GIVEN = common_types.NOT_GIVEN
+RUNTIME_MODE_TYPES = common_types.RUNTIME_MODE_TYPES
+BATCH = common_types.BATCH
+QUERY_LENGTH = common_types.QUERY_LENGTH
+KV_LENGTH = common_types.KV_LENGTH
+HEAD = common_types.HEAD
+KV_HEAD = common_types.KV_HEAD
+HEAD_DIM = common_types.HEAD_DIM
+KV_HEAD_DIM = common_types.KV_HEAD_DIM
+BIAS_HEAD_SEQ = common_types.BIAS_HEAD_SEQ
+BIAS_KV_SEQ = common_types.BIAS_KV_SEQ
 
 
 @auto_pytree
@@ -51,20 +63,6 @@ class AttentionOutput:
 
 	attention_weights: tp.Optional[Array] = None
 	attention_outputs: tp.Optional[Array] = None
-
-
-class RuntimeType(Enum):
-	"""
-	Enumerates the possible runtime modes for attention operations.
-
-	Attributes:
-	    normal: Standard training or evaluation mode.
-	    generation: Autoregressive generation mode, often involving KV caching and
-	        single token decoding.
-	"""
-
-	normal = "normal"
-	generation = "generation"
 
 
 @auto_pytree
@@ -102,18 +100,19 @@ class AttentionMetadata:
 
 	runtime_dtype: jax.typing.DTypeLike
 	runtime_softmax_dtype: tp.Optional[jax.typing.DTypeLike] = None
-	sequence_axis_name: str = ...
-	mesh: tp.Optional[jax.sharding.Mesh] = ...
-	platform: EasyDeLPlatforms = ...
-	backend: EasyDeLBackends = ...
-	partition_axis: PartitionAxis = ...
+	sequence_axis_name: str = NOT_GIVEN
+	mesh: tp.Optional[jax.sharding.Mesh] = NOT_GIVEN
+	platform: EasyDeLPlatforms = NOT_GIVEN
+	backend: EasyDeLBackends = NOT_GIVEN
+	partition_axis: PartitionAxis = NOT_GIVEN
+	partition_manager: PartitionManager = NOT_GIVEN
 	base_config: tp.Optional[EasyDeLBaseConfig] = None
-	scan_ring_attention: bool = ...
-	softmax_scale: float = ...
-	dropout_prob: float = ...
-	blocksize_q: int = ...
-	blocksize_k: int = ...
-	blocksize_b: int = ...
+	scan_ring_attention: bool = NOT_GIVEN
+	softmax_scale: float = NOT_GIVEN
+	dropout_prob: float = NOT_GIVEN
+	blocksize_q: int = NOT_GIVEN
+	blocksize_k: int = NOT_GIVEN
+	blocksize_b: int = NOT_GIVEN
 
 	def __post_init__(self):
 		"""
@@ -135,12 +134,13 @@ class AttentionMetadata:
 		self.set_attrs_carefully("softmax_scale", None, "softmax_scale")
 		self.set_attrs_carefully("scan_ring_attention", True)
 		self.set_attrs_carefully("partition_axis", PartitionAxis())
+		self.set_attrs_carefully("partition_manager", PartitionManager(self.partition_axis))
 		self.set_attrs_carefully("sequence_axis_name", "sp", "sequence_axis_name", use_base_config=False)  # DON'T READ FROM CONFIG
 		self.set_attrs_carefully("backend", jax.default_backend(), "backend")
-		self.set_attrs_carefully("platform", ..., "platform") 
-		self.set_attrs_carefully("mesh", ..., "mesh") 
+		self.set_attrs_carefully("platform", NOT_GIVEN, "platform") 
+		self.set_attrs_carefully("mesh", NOT_GIVEN, "mesh") 
 		# fmt:on
-		if self.mesh == Ellipsis and self.base_config is None:
+		if self.mesh is NOT_GIVEN and self.base_config is None:
 			mesh = jax.interpreters.pxla.thread_resources.env.physical_mesh
 			assert not mesh.empty, (
 				"You should pass 'mesh' to `AttentionMetadata` or "
@@ -157,10 +157,10 @@ class AttentionMetadata:
 			)
 
 	def _safety_check(self):
-		"""Ensures no essential attributes are left uninitialized (as Ellipsis)."""
+		"""Ensures no essential attributes are left uninitialized (as NOT_GIVEN)."""
 		for field in dataclasses.fields(self):
 			val = getattr(self, field.name)
-			if val == Ellipsis:
+			if val is NOT_GIVEN:
 				raise ValueError(f"`{field.name}` shouldn't be ellipsis")
 
 	@classmethod
@@ -199,7 +199,7 @@ class AttentionMetadata:
 			blocksize_b=config.blocksize_b,
 		)
 
-	def get_partition_specs(self, mode: RuntimeType, BTHD: bool = True):
+	def get_shardings(self, mode: RUNTIME_MODE_TYPES, BTHD: bool = True):  # type:ignore
 		"""
 		Generates JAX PartitionSpecs for attention tensors based on runtime mode.
 
@@ -212,58 +212,57 @@ class AttentionMetadata:
 		    A tuple containing PartitionSpecs for:
 		    (query, key, value, bias, mask, attention_output)
 		"""
-		assert mode in RuntimeType, f"mode should be in `RuntimeType` but we got {mode}"
 
-		standmode = mode == RuntimeType.generation
-		batch_axis = self.partition_axis.batch_axis
-		head_axis = (
-			self.partition_axis.generation_head_axis
-			if standmode
-			else self.partition_axis.head_axis
-		)
-		query_seq_axis = (
-			self.partition_axis.generation_query_sequence_axis
-			if standmode
-			else self.partition_axis.query_sequence_axis
-		)
-		key_seq_axis = (
-			self.partition_axis.generation_key_sequence_axis
-			if standmode
-			else self.partition_axis.key_sequence_axis
-		)
-		attn_dim_axis = (
-			self.partition_axis.generation_attention_dim_axis
-			if standmode
-			else self.partition_axis.attention_dim_axis
-		)
-		bias_head_seq_axis = self.partition_axis.bias_head_sequence_axis
-		bias_key_seq_axis = self.partition_axis.bias_key_sequence_axis
-
+		pama = self.partition_manager
 		if BTHD:
 			# BTHD ordering
-			query_partition_spec = Ps(batch_axis, query_seq_axis, head_axis, attn_dim_axis)
-			key_partition_spec = Ps(batch_axis, key_seq_axis, head_axis, attn_dim_axis)
-			value_partition_spec = Ps(batch_axis, key_seq_axis, head_axis, attn_dim_axis)
+			query_sharding = pama.resolve(
+				axes=[BATCH, QUERY_LENGTH, HEAD, HEAD_DIM],
+				mode=mode,
+			)
+			key_sharding = pama.resolve(
+				axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
+				mode=mode,
+			)
+			value_sharding = pama.resolve(
+				axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
+				mode=mode,
+			)
 		else:
 			# BHTD ordering
-			query_partition_spec = Ps(batch_axis, head_axis, query_seq_axis, attn_dim_axis)
-			key_partition_spec = Ps(batch_axis, head_axis, key_seq_axis, attn_dim_axis)
-			value_partition_spec = Ps(batch_axis, head_axis, key_seq_axis, attn_dim_axis)
+			query_sharding = pama.resolve(
+				axes=[BATCH, HEAD, QUERY_LENGTH, HEAD_DIM],
+				mode=mode,
+			)
+			key_sharding = pama.resolve(
+				axes=[BATCH, KV_HEAD, KV_LENGTH, KV_HEAD_DIM],
+				mode=mode,
+			)
+			value_sharding = pama.resolve(
+				axes=[BATCH, KV_HEAD, KV_LENGTH, KV_HEAD_DIM],
+				mode=mode,
+			)
 
-		qk_extern = (query_seq_axis, bias_key_seq_axis)
+		qk_extern = (QUERY_LENGTH, BIAS_KV_SEQ)
 
-		bias_partition_spec = Ps(batch_axis, bias_head_seq_axis, *qk_extern)
-		mask_partition_spec = Ps(batch_axis, None, *qk_extern)
+		bias_sharding = pama.resolve(
+			axes=[BATCH, BIAS_HEAD_SEQ, *qk_extern],
+			mode=mode,
+		)
+		mask_sharding = pama.resolve(
+			axes=[BATCH, None, *qk_extern],
+			mode=mode,
+		)
 
-		attention_partition_spec = query_partition_spec
+		attention_sharding = query_sharding
 
 		return (
-			query_partition_spec,
-			key_partition_spec,
-			value_partition_spec,
-			bias_partition_spec,
-			mask_partition_spec,
-			attention_partition_spec,
+			query_sharding,
+			key_sharding,
+			value_sharding,
+			bias_sharding,
+			mask_sharding,
+			attention_sharding,
 		)
 
 	def set_attrs_carefully(
@@ -287,7 +286,7 @@ class AttentionMetadata:
 		        Defaults to `attr_name`.
 		    use_base_config: Whether to attempt retrieving the value from `base_config`.
 		"""
-		if not hasattr(self, attr_name) or getattr(self, attr_name, ...) == Ellipsis:
+		if not hasattr(self, attr_name) or getattr(self, attr_name, NOT_GIVEN) is NOT_GIVEN:
 			pn = attr_name if pickup_name is None else pickup_name
 			new_value = (
 				default
@@ -342,7 +341,7 @@ class AttentionImpl(BaseOperation):
 		    The `AttentionMetadata` instance passed during initialization.
 		"""
 
-	def get_runtime_type(self, q: jax.Array, BTHD: bool = True) -> RuntimeType:
+	def get_mode(self, q: jax.Array, BTHD: bool = True) -> RUNTIME_MODE_TYPES:  # type:ignore
 		"""
 		Determines the runtime mode (normal or generation) based on query shape.
 
@@ -351,12 +350,9 @@ class AttentionImpl(BaseOperation):
 		Args:
 		    q: The query tensor.
 		    BTHD: Boolean indicating tensor layout (True for B, T, H, D; False for B, H, T, D).
-
-		Returns:
-		    RuntimeType.generation if query sequence length is 1, else RuntimeType.normal.
 		"""
 		ingeneration = q.shape[1] == 1 if BTHD else q.shape[2] == 1
-		return RuntimeType.generation if ingeneration else RuntimeType.normal
+		return common_types.MODE_DECODE if ingeneration else common_types.MODE_TRAIN
 
 	def current_backend(self) -> tp.Literal["tpu", "gpu", "cpu"]:
 		"""

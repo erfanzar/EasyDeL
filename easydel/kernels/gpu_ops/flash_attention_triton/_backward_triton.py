@@ -1138,6 +1138,7 @@ def _bwd_attention_kernel_call(
 			batch_size * nheads_q,
 		),
 		kernel=_attn_bwd_preprocess,
+		disable_verbose_logging=False,
 		name="triton::ops::_attn_bwd_preprocess",
 	)
 
@@ -1194,6 +1195,7 @@ def _bwd_attention_kernel_call(
 		BLOCK_HEADDIM=BLOCK_HEADDIM,
 		BOOL_BIAS=BOOL_BIAS,
 		kernel=_attn_bwd,
+		disable_verbose_logging=False,
 		grid=lambda META: (
 			triton.cdiv(KSeq, META["BLOCK_N1"]) + triton.cdiv(QSeq, META["BLOCK_M2"]),
 			batch_size * nheads_q,

@@ -139,16 +139,16 @@ class FlashAttn(AttentionImpl):
 		sm_scale = self.metadata.softmax_scale
 		sm_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
 		dtype = self.metadata.runtime_dtype
-		runtime_type = self.get_runtime_type(q=q, BTHD=False)
+		model_mode = self.get_mode(q=q, BTHD=False)
 
 		(
-			query_partition_spec,
-			key_partition_spec,
-			value_partition_spec,
-			bias_partition_spec,
-			mask_partition_spec,
-			attention_partition_spec,
-		) = self.metadata.get_partition_specs(runtime_type, BTHD=False)
+			query_sharding,
+			key_sharding,
+			value_sharding,
+			bias_sharding,
+			mask_sharding,
+			attention_sharding,
+		) = self.metadata.get_shardings(model_mode, BTHD=False)
 
 		if mask is None and bias is None and init_bias is not None:
 			bias = init_bias()
@@ -180,12 +180,12 @@ class FlashAttn(AttentionImpl):
 			shard_map,
 			mesh=self.metadata.mesh,
 			in_specs=(
-				self.create_stable_sharding(query_partition_spec, dep=q, tensor=q),
-				self.create_stable_sharding(key_partition_spec, dep=k, tensor=k),
-				self.create_stable_sharding(value_partition_spec, dep=v, tensor=v),
-				self.create_stable_sharding(bias_partition_spec, dep=bias, tensor=bias),
+				self.create_stable_sharding(query_sharding, dep=q, tensor=q),
+				self.create_stable_sharding(key_sharding, dep=k, tensor=k),
+				self.create_stable_sharding(value_sharding, dep=v, tensor=v),
+				self.create_stable_sharding(bias_sharding, dep=bias, tensor=bias),
 			),
-			out_specs=self.create_stable_sharding(attention_partition_spec, tensor=q),
+			out_specs=self.create_stable_sharding(attention_sharding, tensor=q),
 			check_rep=False,
 		)
 		def _wraped_flash_attn(q, k, v, b):
@@ -211,7 +211,7 @@ class FlashAttn(AttentionImpl):
 			attention_weights=None,
 			attention_outputs=with_sharding_constraint(
 				arr=attn,
-				sharding=attention_partition_spec,
+				sharding=attention_sharding,
 			),
 		)
 
@@ -264,16 +264,16 @@ class FlashAttn(AttentionImpl):
 		sm_scale = self.metadata.softmax_scale
 		sm_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
 		dtype = self.metadata.runtime_dtype
-		runtime_type = self.get_runtime_type(q=q, BTHD=True)
+		model_mode = self.get_mode(q=q, BTHD=True)
 
 		(
-			query_partition_spec,
-			key_partition_spec,
-			value_partition_spec,
-			bias_partition_spec,
-			mask_partition_spec,
-			attention_partition_spec,
-		) = self.metadata.get_partition_specs(runtime_type, BTHD=True)
+			query_sharding,
+			key_sharding,
+			value_sharding,
+			bias_sharding,
+			mask_sharding,
+			attention_sharding,
+		) = self.metadata.get_shardings(model_mode, BTHD=True)
 		if mask is None and bias is None and init_bias is not None:
 			bias = init_bias()
 
@@ -288,13 +288,13 @@ class FlashAttn(AttentionImpl):
 			func,
 			mesh=self.metadata.mesh,
 			in_specs=(
-				self.create_stable_sharding(query_partition_spec, dep=q, tensor=q),
-				self.create_stable_sharding(key_partition_spec, dep=k, tensor=k),
-				self.create_stable_sharding(value_partition_spec, dep=v, tensor=v),
-				self.create_stable_sharding(mask_partition_spec, dep=mask, tensor=mask),
-				self.create_stable_sharding(bias_partition_spec, dep=bias, tensor=bias),
+				self.create_stable_sharding(query_sharding, dep=q, tensor=q),
+				self.create_stable_sharding(key_sharding, dep=k, tensor=k),
+				self.create_stable_sharding(value_sharding, dep=v, tensor=v),
+				self.create_stable_sharding(mask_sharding, dep=mask, tensor=mask),
+				self.create_stable_sharding(bias_sharding, dep=bias, tensor=bias),
 			),
-			out_specs=self.create_stable_sharding(attention_partition_spec, tensor=q),
+			out_specs=self.create_stable_sharding(attention_sharding, tensor=q),
 			check_rep=False,
 		)(
 			q.astype(dtype),
@@ -307,7 +307,7 @@ class FlashAttn(AttentionImpl):
 			attention_weights=None,
 			attention_outputs=with_sharding_constraint(
 				arr=attn,
-				sharding=attention_partition_spec,
+				sharding=attention_sharding,
 			),
 		)
 

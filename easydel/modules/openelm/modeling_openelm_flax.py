@@ -18,6 +18,8 @@ from functools import cached_property
 
 import chex
 import jax
+from eformer import common_types
+from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import numpy as jnp
 
@@ -31,10 +33,8 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import (
 	ACT2FN,
-	HiddenStateSharding,
 	auto_remat,
 	block_wise_ffn,
-	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -423,10 +423,10 @@ class OpenELMFeedForwardNetwork(nn.Module):
 		self.act = ACT2FN[config.activation_fn_name]
 
 	def __call__(self, hidden_states: chex.Array) -> chex.Array:
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 
 		if self.ffn_with_glu:
@@ -436,10 +436,10 @@ class OpenELMFeedForwardNetwork(nn.Module):
 		else:
 			hidden_states = self.proj_2(self.act(self.proj_1(hidden_states)))
 
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		return hidden_states
 
@@ -590,10 +590,10 @@ class OpenELMDecoderLayer(nn.Module):
 		else:
 			feed_forward_hidden_states = self.ffn(hidden_states)
 		hidden_states = residual + feed_forward_hidden_states
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		return DecoderLayerOutput(
 			hidden_states=hidden_states,
@@ -765,11 +765,10 @@ class OpenELMModel(EasyDeLBaseModule):
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
 
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			inputs_embeds,
-			self.config.partition_axis,
-			shorthand="B qS H",
-			decode_mode=1,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 
 		for idx, layer in enumerate(self.layers):
@@ -924,10 +923,10 @@ class OpenELMForCausalLM(EasyDeLBaseModule):
 
 		hidden_states = outputs.last_hidden_state
 
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 
 		if self.config.share_input_output_layers:

@@ -36,6 +36,8 @@ from functools import partial
 import chex
 import jax
 import jax.numpy as jnp
+from eformer import common_types
+from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 from jax import lax
 
@@ -46,7 +48,7 @@ from easydel.infra.modeling_outputs import (
 	BaseModelOutput,
 	MaskedLMOutput,
 )
-from easydel.infra.utils import ACT2FN, HiddenStateSharding, control_runtime_sharding
+from easydel.infra.utils import ACT2FN
 from easydel.layers.attention import AttentionModule
 from easydel.layers.caching import (
 	PagedAttentionCache,
@@ -399,10 +401,10 @@ class OPTDecoderLayer(nn.Module):
 		)
 		hidden_states = self.dropout_layer(hidden_states)
 		hidden_states = residual + hidden_states
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		if not self.do_layer_norm_before:
 			hidden_states = self.self_attn_layer_norm(hidden_states)
@@ -427,10 +429,10 @@ class OPTDecoderLayer(nn.Module):
 		# 350m applies layer norm AFTER attention
 		if not self.do_layer_norm_before:
 			hidden_states = self.final_layer_norm(hidden_states)
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		return hidden_states, self_attn_weights
 
@@ -661,10 +663,10 @@ class OPTDecoder(EasyDeLBaseModule):
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
 
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		for idx, decoder_layer in enumerate(self.layers):
 			if output_hidden_states:
@@ -890,10 +892,10 @@ class OPTForCausalLM(EasyDeLBaseModule):
 
 		hidden_states = outputs.last_hidden_state
 
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 
 		if self.config.tie_word_embeddings:
@@ -939,21 +941,21 @@ class OPTForCausalLM(EasyDeLBaseModule):
 		input_ids,
 		max_length: int,
 		pad_token_id: int,
-		prefill_length: int | None = None,
+		starts: int | None = None,
 		shardings=None,
 		attention_mask: tp.Optional[chex.Array] = None,
 	):
 		# initializing the cache
 		batch_size, seq_length = input_ids.shape
 
-		if prefill_length is None:
-			prefill_length = self.compute_prefill_length(input_ids, pad_token_id)
+		if starts is None:
+			starts = self.compute_prefill_length(input_ids, pad_token_id)
 		past_key_values = self.init_cache(
 			batch_size,
 			max_length,
-			pad_token_id,
-			prefill_length,
+			starts,
 			shardings,
+			pad_token_id,
 		)
 		# Note that usually one would have to put 0's in the attention_mask for x > input_ids.shape[-1] and x < cache_length.
 		# But since the decoder uses a causal mask, those positions are masked anyway.

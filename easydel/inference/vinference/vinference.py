@@ -492,7 +492,7 @@ class vInference:
 			input_ids=input_ids,
 			max_length=max_length,
 			pad_token_id=pad_token_id,
-			prefill_length=None,
+			starts=None,
 			**model_kwargs,
 		)
 

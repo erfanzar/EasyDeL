@@ -19,6 +19,8 @@ from functools import cached_property
 import chex
 import jax
 import jax.numpy as jnp
+from eformer import common_types
+from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
 
 from easydel.infra.base_module import EasyDeLBaseModule
@@ -33,9 +35,7 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import (
 	ACT2FN,
-	HiddenStateSharding,
 	auto_remat,
-	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -547,17 +547,17 @@ class DbrxFFN(nn.Module):
 		)
 
 	def __call__(self, x: chex.Array) -> tp.Tuple[chex.Array, chex.Array]:
-		x = control_runtime_sharding(
+		x = apply_logical_sharding(
 			x,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		weights, top_weights, top_experts = self.router(x)
 		out = self.experts(x, weights, top_weights, top_experts)
-		out = control_runtime_sharding(
+		out = apply_logical_sharding(
 			out,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		return out, weights
 
@@ -825,10 +825,10 @@ class DbrxModel(EasyDeLBaseModule):
 			)
 			hidden_states = outputs.hidden_states
 
-			hidden_states = control_runtime_sharding(
+			hidden_states = apply_logical_sharding(
 				hidden_states,
-				self.config.partition_axis,
-				sharding_strategy=HiddenStateSharding,
+				dynamic_axes=common_types.HiddenStateSharding,
+				partition_manager=self.config.partition_manager,
 			)
 
 			if output_attentions:

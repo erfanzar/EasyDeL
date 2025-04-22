@@ -614,7 +614,11 @@ class BaseTrainer(BaseTrainerProtocol):
 		def _operate():
 			checkpoint_files = glob(os.path.join(save_directory, "run-*"))
 			checkpoint_files.sort(key=os.path.getmtime)
-			for old_save_directory in checkpoint_files[: -self.arguments.save_total_limit]:
+			if self.arguments.save_total_limit == 0:
+				_do_dele = checkpoint_files
+			else:
+				_do_dele = checkpoint_files[: -self.arguments.save_total_limit]
+			for old_save_directory in _do_dele:
 				shutil.rmtree(old_save_directory, ignore_errors=True)
 				logger.info(f"Removed old directory: {old_save_directory}")
 

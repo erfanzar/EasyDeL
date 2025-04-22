@@ -20,6 +20,8 @@ from functools import partial
 import chex
 import jax
 import jax.numpy as jnp
+from eformer import common_types
+from eformer.escale import apply_logical_sharding
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
 
@@ -36,9 +38,7 @@ from easydel.infra.modeling_outputs import (
 )
 from easydel.infra.utils import (
 	ACT2FN,
-	HiddenStateSharding,
 	auto_remat,
-	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -718,10 +718,10 @@ class Llama4TextModel(EasyDeLBaseModule):
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
 
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		causal_mask = jnp.expand_dims(
 			_create_chunked_attention_mask(
@@ -853,10 +853,10 @@ class Llama4ForCausalLM(EasyDeLBaseModule):
 
 		hidden_states = outputs.last_hidden_state
 
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 
 		if self.config.tie_word_embeddings:
@@ -1353,10 +1353,10 @@ class Llama4VisionEncoderLayer(nn.Module):
 	):
 		residual = hidden_states
 		hidden_states = self.input_layernorm(hidden_states)
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		attn_outputs = self.self_attn(
 			hidden_states,
@@ -1369,10 +1369,10 @@ class Llama4VisionEncoderLayer(nn.Module):
 		hidden_states = self.mlp(hidden_states)
 		hidden_states = residual + hidden_states
 
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 
 		return EncoderLayerOutput(
@@ -1829,16 +1829,16 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
 		self,
 		batch_size,
 		max_length,
-		pad_token_id=None,
-		prefill_length=None,
+		starts=None,
 		shardings=None,
+		pad_token_id=None,
 	):
 		return self.language_model.init_cache(
 			batch_size,
 			max_length,
-			pad_token_id,
-			prefill_length,
+			starts,
 			shardings,
+			pad_token_id,
 		)
 
 	def _get_compile_model_kwargs(
@@ -1905,7 +1905,7 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
 		input_ids: chex.Array,
 		max_length: int,
 		pad_token_id: int,
-		prefill_length: int | None = None,
+		starts: int | None = None,
 		pixel_values: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 	):
@@ -1924,7 +1924,7 @@ class Llama4ForConditionalGeneration(EasyDeLBaseModule):
 			input_ids=input_ids,
 			max_length=max_length,
 			pad_token_id=pad_token_id,
-			prefill_length=prefill_length,
+			starts=starts,
 			attention_mask=attention_mask,
 		)
 		model_inputs["pixel_values"] = pixel_values

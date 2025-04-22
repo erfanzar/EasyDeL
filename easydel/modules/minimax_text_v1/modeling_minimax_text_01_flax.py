@@ -22,6 +22,8 @@ from functools import partial
 import chex
 import jax
 import jax.numpy as jnp
+from eformer import common_types
+from eformer.escale import apply_logical_sharding
 from einops import rearrange
 from flax import nnx as nn
 
@@ -29,15 +31,14 @@ from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
 from easydel.infra.loss_utils import auxiliary_load_balancing_loss_func
 from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
 	MoeCausalLMOutput,
 	MoeModelOutput,
 )
 from easydel.infra.utils import (
 	ACT2FN,
-	HiddenStateSharding,
 	auto_remat,
 	block_wise_ffn,
-	control_runtime_sharding,
 	get_dot_general_by_bits,
 )
 from easydel.layers.attention import AttentionModule, FlexibleAttentionModule
@@ -453,18 +454,18 @@ class MiniMaxText01MLP(nn.Module):
 		self.act_fn = ACT2FN[self.config.hidden_act]
 
 	def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		gate = self.act_fn(self.gate_proj(hidden_states))
 		up = self.up_proj(hidden_states)
 		hidden_states = self.down_proj(gate * up)
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		return hidden_states
 
@@ -499,18 +500,17 @@ class MiniMaxText01BlockSparseTop2MLP(nn.Module):
 		self.act_fn = ACT2FN[self.config.hidden_act]
 
 	def __call__(self, hidden_states: jnp.ndarray) -> jnp.ndarray:
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		current_hidden_states = self.act_fn(self.w1(hidden_states)) * self.w3(hidden_states)
 		current_hidden_states = self.w2(current_hidden_states)
-		hidden_states = control_runtime_sharding(
-			current_hidden_states,
-			self.config.partition_axis,
-			shorthand="B qS H",
-			decode_mode=1,
+		hidden_states = apply_logical_sharding(
+			hidden_states,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		return current_hidden_states
 
@@ -556,10 +556,10 @@ class MiniMaxText01SparseMoeBlock(nn.Module):
 		self.deterministic = False
 
 	def __call__(self, hidden_states: chex.Array) -> tp.Tuple[chex.Array, chex.Array]:
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		if not self.deterministic and self.jitter_noise > 0:
 			hidden_states *= jax.random.uniform(
@@ -751,10 +751,10 @@ class MiniMaxText01DecoderLayer(nn.Module):
 		residual = hidden_states
 
 		hidden_states = self.input_layernorm(hidden_states)
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 		if self.postnorm:
 			residual = hidden_states
@@ -904,10 +904,10 @@ class MiniMaxText01Model(EasyDeLBaseModule):
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
 
-		hidden_states = control_runtime_sharding(
+		hidden_states = apply_logical_sharding(
 			hidden_states,
-			self.config.partition_axis,
-			sharding_strategy=HiddenStateSharding,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
 		)
 
 		sr = compute_slops(nhd=self.config.num_attention_heads)

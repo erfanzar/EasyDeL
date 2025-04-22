@@ -23,7 +23,6 @@ import numpy as np
 from eformer.pytree import auto_pytree
 from jax import lax
 from jax import numpy as jnp
-from jax.sharding import PartitionSpec
 from transformers.generation.configuration_utils import GenerationConfig
 
 from easydel.inference.logits_process import (
@@ -153,22 +152,13 @@ class EasyGenerationMixin:
 		self,
 		batch_size: int,
 		max_length: int,
-		pad_token_id: int | None = None,
-		prefill_length: int | None = None,
+		starts: int | None = None,
 		shardings: dict | None = None,
+		pad_token_id: int | None = None,
 	):
-		shardings = shardings or dict()
 		return TransformerCache.init_cache(
 			dtype=self.dtype,
-			key_values_shardings=shardings.get(
-				"key_value_shardings",
-				PartitionSpec(
-					self.config.partition_axis.batch_axis,
-					self.config.partition_axis.key_sequence_axis,
-					self.config.partition_axis.head_axis,
-					self.config.partition_axis.attention_dim_axis,
-				),
-			),
+			partition_manager=self.config.partition_manager,
 			metadata=self.create_cache_metadata(
 				batch_size=batch_size,
 				max_length=max_length,
@@ -180,7 +170,7 @@ class EasyGenerationMixin:
 				quantization_platform=self.config.platform,
 			),
 			mesh=self.config.mesh,
-			prefill_length=prefill_length,
+			starts=starts,
 		)
 
 	@cached_property
@@ -198,7 +188,7 @@ class EasyGenerationMixin:
 		input_ids,
 		max_length: int,
 		pad_token_id: int,
-		prefill_length: int | None = None,
+		starts: int | None = None,
 		shardings: int | None = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 		token_type_ids: tp.Optional[chex.Array] = None,
@@ -217,13 +207,13 @@ class EasyGenerationMixin:
 		    position ids
 		"""
 		batch_size, seq_length = input_ids.shape
-		if prefill_length is None:
-			prefill_length = self.compute_prefill_length(input_ids, pad_token_id)
+		if starts is None:
+			starts = self.compute_prefill_length(input_ids, pad_token_id)
 		past_key_values = self.init_cache(
 			batch_size,
 			max_length,
 			pad_token_id,
-			prefill_length,
+			starts,
 			shardings,
 		)
 		sharding = input_ids.sharding if hasattr(input_ids, "sharding") else None
@@ -905,7 +895,7 @@ class EasyGenerationMixin:
 			input_ids,
 			max_length=max_length,
 			pad_token_id=pad_token_id,
-			prefill_length=None,
+			starts=None,
 			**model_kwargs,
 		)
 
@@ -1018,7 +1008,7 @@ class EasyGenerationMixin:
 				input_ids,
 				max_length=max_length,
 				pad_token_id=pad_token_id,
-				prefill_length=None,
+				starts=None,
 				**model_kwargs,
 			),
 		)
@@ -1202,7 +1192,7 @@ class EasyGenerationMixin:
 			flatten_beam_dim(input_ids),
 			max_length=max_length,
 			pad_token_id=pad_token_id,
-			prefill_length=None,
+			starts=None,
 			**model_kwargs,
 		)
 

@@ -829,9 +829,9 @@ class Mamba2ForCausalLM(EasyDeLBaseModule):
 		self,
 		batch_size: int,
 		max_length: int,
-		pad_token_id: int | None = None,
-		prefill_length: int | None = None,
+		starts: int | None = None,
 		shardings: dict | None = None,
+		pad_token_id: int | None = None,
 	):
 		shardings = shardings or dict()
 		return Mamba2Cache.init_cache(
