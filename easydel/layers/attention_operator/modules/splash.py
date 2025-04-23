@@ -187,16 +187,19 @@ class SplashAttn(AttentionImpl):
 					query_sharding,
 					dep=q,
 					tensor=q,
+					preserved_indices=[0, 2],
 				),
 				self.create_stable_sharding(
 					key_sharding,
 					dep=k,
 					tensor=k,
+					preserved_indices=[0, 2],
 				),
 				self.create_stable_sharding(
 					value_sharding,
 					dep=v,
 					tensor=v,
+					preserved_indices=[0, 2],
 				),
 				self.create_stable_sharding(
 					qkv_mask_sharding,
@@ -219,7 +222,11 @@ class SplashAttn(AttentionImpl):
 					tensor=starts,
 				),
 			),
-			out_specs=self.create_stable_sharding(attention_sharding, tensor=q),
+			out_specs=self.create_stable_sharding(
+				attention_sharding,
+				tensor=q,
+				preserved_indices=[0, 2],
+			),
 			check_rep=False,
 		)
 		def _wraped_flash_attn(q: jax.Array, k, v, q_mask, kv_mask, index, starts):

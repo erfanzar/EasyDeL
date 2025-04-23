@@ -209,12 +209,13 @@ class EasyGenerationMixin:
 		batch_size, seq_length = input_ids.shape
 		if starts is None:
 			starts = self.compute_prefill_length(input_ids, pad_token_id)
+
 		past_key_values = self.init_cache(
 			batch_size,
 			max_length,
-			pad_token_id,
 			starts,
 			shardings,
+			pad_token_id,
 		)
 		sharding = input_ids.sharding if hasattr(input_ids, "sharding") else None
 		extended_attention_mask = jnp.ones((batch_size, max_length), dtype="b1")

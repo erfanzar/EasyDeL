@@ -200,11 +200,12 @@ class RobertaSelfAttention(AttentionModule):
 		hidden_states,
 		attention_mask,
 		layer_head_mask,
-		causal_mask: tp.Optional[chex.Array] = None,
+		mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
 		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
 		key_value_states: tp.Optional[jnp.array] = None,
+		causal_mask: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 	):
 		is_cross_attention = key_value_states is not None
@@ -243,6 +244,7 @@ class RobertaSelfAttention(AttentionModule):
 				query_states=query_states,
 				key_states=key_states,
 				value_states=value_states,
+				mode=mode,
 				causal=True,
 				init_bias=init_attention_bias,
 				attention_mask=attention_mask,
@@ -352,15 +354,17 @@ class RobertaAttention(nn.Module):
 		hidden_states,
 		attention_mask,
 		layer_head_mask,
-		causal_mask: tp.Optional[chex.Array] = None,
+		mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
 		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
+		causal_mask: tp.Optional[chex.Array] = None,
 		key_value_states=None,
 		output_attentions: bool = False,
 	):
 		attn_outputs = self.self(
 			hidden_states=hidden_states,
 			attention_mask=attention_mask,
+			mode=mode,
 			causal_mask=causal_mask if self.causal else None,
 			layer_head_mask=layer_head_mask,
 			cache_view=cache_view,
@@ -500,11 +504,12 @@ class RobertaLayer(nn.Module):
 		hidden_states,
 		attention_mask,
 		layer_head_mask,
-		causal_mask: tp.Optional[chex.Array] = None,
+		mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
 		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		encoder_hidden_states: tp.Optional[chex.Array] = None,
 		encoder_attention_mask: tp.Optional[chex.Array] = None,
+		causal_mask: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 	):
 		# Self Attention
@@ -514,6 +519,7 @@ class RobertaLayer(nn.Module):
 			causal_mask=causal_mask,
 			layer_head_mask=layer_head_mask,
 			cache_view=cache_view,
+			mode=mode,
 			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,
 		)

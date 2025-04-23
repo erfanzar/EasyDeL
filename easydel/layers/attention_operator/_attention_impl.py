@@ -562,7 +562,12 @@ class AttentionImpl(BaseOperation):
 		for idx in preserved_indices:
 			new_spec[idx] = state_ps[idx] if clone_ps is None else clone_ps[idx]
 
-		return Ps(*new_spec)
+		sharding = Ps(*new_spec)
+
+		if tensor is None:
+			return sharding
+		else:
+			return es.get_corrected_named_sharding(tensor.shape, sharding).spec
 
 	def __call__(self, *args, **kwargs) -> AttentionOutput:
 		"""

@@ -258,6 +258,7 @@ class PhiMoEAttention(AttentionModule):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: tp.Optional[chex.Array | bool],
+		mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
 		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
@@ -343,6 +344,7 @@ class PhiMoEAttention(AttentionModule):
 			query_states=query_states,
 			key_states=key_states,
 			value_states=value_states,
+			mode=mode,
 			bias=None,
 			cache_metadata=cache_metadata,
 			cache_view=cache_view,
@@ -600,9 +602,10 @@ class PhiMoeDecoderLayer(nn.Module):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: tp.Optional[chex.Array | bool],
-		segment_ids: tp.Optional[chex.Array] = None,
+		mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
 		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		output_router_logits: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
@@ -644,6 +647,7 @@ class PhiMoeDecoderLayer(nn.Module):
 			attention_mask,
 			position_ids,
 			causal_mask,
+			mode,
 			cache_view,
 			cache_metadata,
 			segment_ids,
@@ -652,7 +656,8 @@ class PhiMoeDecoderLayer(nn.Module):
 			frequencies,
 		)
 		hidden_states, self_attn_weights = (
-			(attn_out[0], attn_out[1]) if len(attn_out) == 2 else (attn_out[0], None)
+			attn_outputs.attention_output,
+			attn_outputs.attention_weight,
 		)
 
 		hidden_states = residual + hidden_states
@@ -764,6 +769,7 @@ class PhiMoeModel(EasyDeLBaseModule):
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 	) -> BaseModelOutput:
@@ -818,6 +824,12 @@ class PhiMoeModel(EasyDeLBaseModule):
 			).astype(jnp.int32)
 		if attention_mask.ndim == 2:
 			attention_mask = jnp.expand_dims(attention_mask, (1, 2))
+		if mode is None:
+			mode = (
+				common_types.MODE_DECODE
+				if sequence_length == 1 and past_key_values is not None
+				else common_types.MODE_TRAIN
+			)
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
 
@@ -835,6 +847,7 @@ class PhiMoeModel(EasyDeLBaseModule):
 				hidden_states=hidden_states,
 				attention_mask=attention_mask,
 				position_ids=position_ids,
+				mode=mode,
 				cache_view=past_key_values.views[idx],
 				cache_metadata=cache_metadata,
 				causal_mask=self.causal_mask,
@@ -938,6 +951,7 @@ class PhiMoeForCausalLM(EasyDeLBaseModule):
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 	) -> CausalLMOutput:
@@ -968,6 +982,7 @@ class PhiMoeForCausalLM(EasyDeLBaseModule):
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
+			mode=mode,
 			past_key_values=past_key_values,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,

@@ -80,9 +80,8 @@ def reference_mqa(
 	"""Multi query attention reference (Called by vmap in reference_mha)."""
 	seq_len = k.shape[1]
 	logits = jnp.einsum("bhd,btd->bht", q.astype(jnp.float32), k.astype(jnp.float32))
-	mask = (starts[:, None] + jnp.arange(seq_len, dtype=jnp.int32)[None, :]) < lengths[
-		:, None
-	]
+	rages = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
+	mask = (starts.reshape(-1, 1) <= rages) < (rages < lengths.reshape(-1, 1))
 
 	logits = logits + jnp.where(mask[:, None, :], 0.0, mask_value)
 
@@ -160,9 +159,8 @@ def reference_gqa(
 
 	logits = jnp.einsum("bhgd,bhtd->bhgt", q.astype(jnp.float32), k.astype(jnp.float32))
 
-	mask = (
-		starts.reshape(-1, 1) + jnp.arange(seq_len, dtype=jnp.int32)[None, :]
-	) < lengths[:, None]
+	rages = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
+	mask = (starts.reshape(-1, 1) <= rages) < (rages < lengths.reshape(-1, 1))
 	logits = logits + jnp.where(mask[:, None, None, :], 0.0, mask_value)
 	logits_max = logits.max(axis=-1)
 	logits_shifted = logits - logits_max[..., None]
@@ -226,7 +224,7 @@ def ragged_flash_attention_kernel(
 	start = starts_ref[b]
 	idex = i * block_size
 
-	@pl.when((start < idex) & (idex < length))
+	@pl.when((start <= idex) & (idex < length))
 	def run():
 		q = q_ref[...].astype(jnp.float32)
 		k = k_ref[...].astype(jnp.float32)
@@ -241,7 +239,8 @@ def ragged_flash_attention_kernel(
 		)
 
 		offset = i * block_size + jax.lax.broadcasted_iota(jnp.int32, qk.shape, 1)
-		mask = (start < offset) & (offset < length)
+		
+		mask = (start <= offset) & (offset < length)
 		qk = qk + jnp.where(mask, 0.0, mask_value)
 		m_curr = qk.max(axis=-1)
 
@@ -306,7 +305,7 @@ def ragged_mqa(
 		length = lengths_ref[b]
 		start = starts_ref[b]
 		idex = i * block_size
-		not_done = (start < idex) & (idex < length)
+		not_done = (start <= idex) & (idex < length)
 		am_last_batch = b == batch_size - 1
 		last_good_block = lax.div(length, block_size) - 1
 		b_next = jnp.where(not_done, b, jnp.where(am_last_batch, b, b + 1))

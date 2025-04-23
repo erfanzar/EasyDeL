@@ -244,9 +244,10 @@ class GPT2Attention(AttentionModule):
 		hidden_states: chex.Array,
 		key_value_states: chex.Array,
 		attention_mask: chex.Array,
-		causal_mask: tp.Optional[chex.Array] = None,
+		mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
 		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
+		causal_mask: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 	):
 		"""Forward pass of the GPT2Attention module.
@@ -300,6 +301,7 @@ class GPT2Attention(AttentionModule):
 			query_states=query,
 			key_states=key,
 			value_states=value,
+			mode=mode,
 			init_bias=init_attention_bias,
 			cache_metadata=cache_metadata,
 			cache_view=cache_view,
@@ -487,12 +489,13 @@ class GPT2Block(nn.Module):
 	def __call__(
 		self,
 		hidden_states,
+		mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
 		attention_mask=None,
 		causal_mask=None,
-		encoder_hidden_states: tp.Optional[chex.Array] = None,
-		encoder_attention_mask: tp.Optional[chex.Array] = None,
 		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
+		encoder_hidden_states: tp.Optional[chex.Array] = None,
+		encoder_attention_mask: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 	):
 		"""Forward pass of the GPT2Block module.
@@ -512,13 +515,15 @@ class GPT2Block(nn.Module):
 		"""
 		residual = hidden_states
 		hidden_states = self.ln_1(hidden_states)
+
 		attn_outputs = self.attn(
 			hidden_states,
 			None,
 			attention_mask,
-			causal_mask,
+			mode,
 			cache_view,
 			cache_metadata,
+			causal_mask,
 			output_attentions,
 		)
 
@@ -537,8 +542,10 @@ class GPT2Block(nn.Module):
 				hidden_states,
 				encoder_hidden_states,
 				encoder_attention_mask,
-				causal_mask,
+				mode,
 				None,
+				None,
+				causal_mask,
 				output_attentions,
 			)
 			cross_attention = cross_attn_outputs.attention_weight
@@ -650,6 +657,7 @@ class GPT2Model(EasyDeLBaseModule):
 		position_ids: tp.Optional[chex.Array] = None,
 		encoder_hidden_states: tp.Optional[chex.Array] = None,
 		encoder_attention_mask: tp.Optional[chex.Array] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
@@ -695,6 +703,12 @@ class GPT2Model(EasyDeLBaseModule):
 		all_cross_attentions = (
 			() if (output_attentions and encoder_hidden_states is not None) else None
 		)
+		if mode is None:
+			mode = (
+				common_types.MODE_DECODE
+				if sequence_length == 1 and past_key_values is not None
+				else common_types.MODE_TRAIN
+			)
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.h))
 		for idx, block in enumerate(self.h):
@@ -705,6 +719,7 @@ class GPT2Model(EasyDeLBaseModule):
 				hidden_states=hidden_states,
 				attention_mask=attention_mask,
 				causal_mask=self.causal_mask,
+				mode=mode,
 				encoder_hidden_states=encoder_hidden_states,
 				encoder_attention_mask=encoder_attention_mask,
 				cache_view=past_key_values.views[idx],
@@ -802,6 +817,7 @@ class GPT2LMHeadModel(EasyDeLBaseModule):
 		position_ids: tp.Optional[chex.Array] = None,
 		encoder_hidden_states: tp.Optional[chex.Array] = None,
 		encoder_attention_mask: tp.Optional[chex.Array] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
@@ -828,6 +844,7 @@ class GPT2LMHeadModel(EasyDeLBaseModule):
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
+			mode=mode,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
 			encoder_hidden_states=encoder_hidden_states,

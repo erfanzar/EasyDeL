@@ -107,7 +107,8 @@ class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
 	axis_dims: tp.Sequence[int]
 	dcn_axis_dims: tp.Optional[tp.Sequence[int]]
 	axis_names: tp.Sequence[str]
-	attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS
+	attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS  # type:ignore
+	decode_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS  # type:ignore
 	blocksize_k: int
 	blocksize_q: int
 	blocksize_b: int
@@ -149,6 +150,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 	  axis_dims (tp.Sequence[int]): Dimensions of the axes. Default is (1, -1, 1, 1).
 	  axis_names (tp.Sequence[str]): Names of the axes. Default is ("dp", "fsdp", "tp", "sp").
 	  attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS): Attention mechanism to use. Default is DEFAULT_ATTENTION_MECHANISM.
+		decode_attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS): Attention mechanism to use for decode phase. Default is None.
 	  blocksize_k (int): Block size for key. Default is 128.
 	  blocksize_q (int): Block size for query. Default is 128.
 	  blocksize_b (int): Block size for batch. Default is 1.
@@ -194,6 +196,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
 		axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
 		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_ATTENTION_MECHANISM,
+		decode_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = None,
 		blocksize_k: int = 128,
 		blocksize_q: int = 128,
 		blocksize_b: int = 1,
@@ -248,6 +251,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		# fmt:off
 		self.easy_method = getattr(self, "easy_method", easy_method)
 		self.attn_mechanism = getattr(self, "attn_mechanism", attn_mechanism)
+		self.decode_attn_mechanism = getattr(self, "decode_attn_mechanism", decode_attn_mechanism)
 		self.blocksize_b = getattr(self, "blocksize_b", blocksize_b)
 		self.blocksize_k = getattr(self, "blocksize_k", blocksize_k)
 		self.blocksize_q = getattr(self, "blocksize_q", blocksize_q)
@@ -434,6 +438,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			"dcn_axis_dims",
 			"axis_names",
 			"attn_mechanism",
+			"decode_attn_mechanism",
 			"blocksize_k",
 			"blocksize_q",
 			"blocksize_b",
@@ -476,6 +481,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		dcn_axis_dims: tp.Optional[tp.Sequence[int]] = NOT_GIVEN,
 		axis_names: tp.Sequence[str] = NOT_GIVEN,
 		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = NOT_GIVEN,
+		decode_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = NOT_GIVEN,
 		blocksize_k: int = NOT_GIVEN,
 		blocksize_q: int = NOT_GIVEN,
 		blocksize_b: int = NOT_GIVEN,
@@ -516,6 +522,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		    axis_dims (tp.Sequence[int], optional): Specify the number of dimensions for each axis. Defaults to (1, -1, 1, 1).
 		    axis_names (tp.Sequence[str], optional): Set the names of the axes. Defaults to ("dp", "fsdp", "tp", "sp").
 		    attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS, optional): attention mechanism to use. Defaults to DEFAULT_ATTENTION_MECHANISM.
+				decode_attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS): Attention mechanism to use for decode phase. Default is None.
 		    blocksize_k (int, optional): block size of key_states. Defaults to 128.
 		    blocksize_q (int, optional): block size of query_states. Defaults to 128.
 		    blocksize_b (int, optional): block size of bias. Defaults to 1.
@@ -563,7 +570,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		set_attrs_smartly(self, "platform", "jax", platform)
 		set_attrs_smartly(self, "shard_attention_computation", True, shard_attention_computation)
 		set_attrs_smartly(self, "use_sharded_kv_caching", False, use_sharded_kv_caching)
-		set_attrs_smartly(self, "attn_mechanism", "jax_flash_attn2", attn_mechanism)
+		set_attrs_smartly(self, "attn_mechanism", "vanilla", attn_mechanism)
+		set_attrs_smartly(self, "decode_attn_mechanism", None, decode_attn_mechanism)
+
 		set_attrs_smartly(self, "easy_method", EasyMethod.TRAIN, easy_method)
 		set_attrs_smartly(self, "bits", None, bits)
 		set_attrs_smartly(self, "scan_attention_layers", True, scan_attention_layers)

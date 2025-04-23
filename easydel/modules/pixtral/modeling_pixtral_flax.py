@@ -25,7 +25,11 @@ from jax import numpy as jnp
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
-from easydel.infra.modeling_outputs import BaseModelOutput
+from easydel.infra.modeling_outputs import (
+	AttentionLayerOutput,
+	BaseModelOutput,
+	DecoderLayerOutput,
+)
 from easydel.infra.utils import (
 	ACT2FN,
 	auto_remat,
@@ -433,6 +437,7 @@ class PixtralAttention(AttentionModule):
 			query_states=query_states,
 			key_states=key_states,
 			value_states=value_states,
+			mode=common_types.MODE_TRAIN,
 			bias=None,
 			cache_metadata=None,
 			init_bias=init_attention_bias,
@@ -698,8 +703,6 @@ class PixtralTransformer(nn.Module):
 
 			if output_attentions:
 				all_attentions += (layer_outputs.attention_weight,)
-
-			past_key_values[idx] = layer_outputs.cache_view
 
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)

@@ -121,6 +121,7 @@ class DbrxAttention(AttentionModule):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: tp.Optional[chex.Array | bool],
+		mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
 		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
@@ -209,6 +210,7 @@ class DbrxAttention(AttentionModule):
 			query_states=query_states,
 			key_states=key_states,
 			value_states=value_states,
+			mode=mode,
 			bias=None,
 			cache_metadata=cache_metadata,
 			cache_view=cache_view,
@@ -281,6 +283,7 @@ class DbrxNormAttentionNorm(nn.Module):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: tp.Optional[chex.Array | bool],
+		mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
 		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
@@ -316,6 +319,7 @@ class DbrxNormAttentionNorm(nn.Module):
 			segment_ids=segment_ids,
 			fcm_mask=fcm_mask,
 			frequencies=frequencies,
+			mode=mode,
 			cache_view=cache_view,
 			cache_metadata=cache_metadata,
 		)
@@ -608,9 +612,10 @@ class DbrxBlock(nn.Module):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: tp.Optional[chex.Array | bool],
-		segment_ids: tp.Optional[chex.Array] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES],  # type:ignore
 		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		output_router_logits: bool = False,
 		fcm_mask: tp.Optional[chex.Array] = None,
@@ -639,6 +644,7 @@ class DbrxBlock(nn.Module):
 			attention_mask,
 			position_ids,
 			causal_mask,
+			mode,
 			cache_view,
 			cache_metadata,
 			segment_ids,
@@ -743,6 +749,7 @@ class DbrxModel(EasyDeLBaseModule):
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		output_router_logits: tp.Optional[bool] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 	) -> MoeModelOutput:
@@ -806,6 +813,12 @@ class DbrxModel(EasyDeLBaseModule):
 		all_hidden_states = ()
 		all_router_logits = ()
 		all_attentions = ()
+		if mode is None:
+			mode = (
+				common_types.MODE_DECODE
+				if sequence_length == 1 and past_key_values is not None
+				else common_types.MODE_TRAIN
+			)
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.blocks))
 		for idx, block in enumerate(self.blocks):
@@ -817,6 +830,7 @@ class DbrxModel(EasyDeLBaseModule):
 				position_ids=position_ids,
 				causal_mask=self.causal_mask,
 				segment_ids=segment_ids,
+				mode=mode,
 				cache_view=past_key_values.views[idx],
 				cache_metadata=cache_metadata,
 				output_attentions=output_attentions,
@@ -900,6 +914,7 @@ class DbrxForCausalLM(EasyDeLBaseModule):
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		output_router_logits: tp.Optional[bool] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 	) -> MoeCausalLMOutput | tp.Tuple:
@@ -913,6 +928,7 @@ class DbrxForCausalLM(EasyDeLBaseModule):
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			output_router_logits=output_router_logits,
+			mode=mode,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
 			segment_ids=segment_ids,
@@ -992,6 +1008,7 @@ class DbrxForSequenceClassification(EasyDeLBaseModule):
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
 		output_router_logits: tp.Optional[bool] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 	) -> SequenceClassifierOutput:
@@ -1005,6 +1022,7 @@ class DbrxForSequenceClassification(EasyDeLBaseModule):
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
 			output_router_logits=output_router_logits,
+			mode=mode,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
 			segment_ids=segment_ids,
