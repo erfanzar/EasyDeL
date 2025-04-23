@@ -142,7 +142,7 @@ class vEngine:
 			("cache/views/[0-9]+/(key|value)/(packed|absmax)", kvps),
 			("cache/views/[0-9]+/(key|value)", kvps),
 			("cache/views/[0-9]+/index", bsharding),
-			("cache/views/[0-9]+/prefill_length", bsharding),
+			("cache/views/[0-9]+/starts", bsharding),
 			(".*", Ps()),
 		)
 

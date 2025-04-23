@@ -86,19 +86,19 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 					query_sharding,
 					dep=q,
 					tensor=q,
-					preserved_indices=[0, 2],
+					preserved_indices=[0],
 				),
 				self.create_stable_sharding(
 					key_sharding,
 					dep=k,
 					tensor=k,
-					preserved_indices=[0, 2],
+					preserved_indices=[0],
 				),
 				self.create_stable_sharding(
 					value_sharding,
 					dep=v,
 					tensor=v,
-					preserved_indices=[0, 2],
+					preserved_indices=[0],
 				),
 				self.create_stable_sharding(
 					views_sharding,
@@ -114,7 +114,7 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 			out_specs=self.create_stable_sharding(
 				attention_sharding,
 				tensor=q,
-				preserved_indices=[0, 2],
+				preserved_indices=[0],
 			),
 			check_rep=True,
 		)
@@ -151,7 +151,11 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 		"""GPU forward pass. Delegates to `forward_native`."""
 		return self.forward_cuda(*args, **kwargs)
 
-	def forward_tpu(
+	def forward_tpu(self, *args, **kwargs) -> AttentionOutput:
+		"""TPU forward pass. Delegates to `forward_native`."""
+		return self.forward_native(*args, **kwargs)
+
+	def _forward_tpu(
 		self,
 		q: Array,
 		k: Array,
@@ -182,19 +186,19 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 					query_sharding,
 					dep=q,
 					tensor=q,
-					preserved_indices=[0, 2],
+					preserved_indices=[0],
 				),
 				self.create_stable_sharding(
 					key_sharding,
 					dep=k,
 					tensor=k,
-					preserved_indices=[0, 2],
+					preserved_indices=[0],
 				),
 				self.create_stable_sharding(
 					value_sharding,
 					dep=v,
 					tensor=v,
-					preserved_indices=[0, 2],
+					preserved_indices=[0],
 				),
 				self.create_stable_sharding(
 					views_sharding,
@@ -210,12 +214,18 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 			out_specs=self.create_stable_sharding(
 				attention_sharding,
 				tensor=q,
-				preserved_indices=[0, 2],
+				preserved_indices=[0],
 			),
-			check_rep=True,
+			check_rep=False,
 		)
 		def _compute(q, k, v, start, index):
-			return pallas_ragged_decode(q * sm_scale, k, v, index, start)
+			return pallas_ragged_decode(
+				q * sm_scale,
+				k,
+				v,
+				index.reshape(-1),
+				start.reshape(-1),
+			)[0]
 
 		attn_output = _compute(
 			q,
