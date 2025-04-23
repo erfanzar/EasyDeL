@@ -530,6 +530,7 @@ def extract_static_parameters(module):
 		"output_attentions",
 		"output_hidden_states",
 		"output_router_logits",
+		"mode",
 	]
 	obj = getattr(module, "__call__", None)  # noqa
 	if isinstance(obj, (types.FunctionType, types.MethodType)):
