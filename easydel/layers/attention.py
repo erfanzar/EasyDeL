@@ -19,14 +19,15 @@ from functools import cached_property, partial
 
 import einops
 import flax.nnx as nn
+import jax
 from chex import Array
+from eformer import common_types
+from eformer.escale import apply_logical_sharding
 from jax import NamedSharding, lax, random
 from jax import numpy as jnp
 from jax import tree_util as jtu
-import jax
 from jax.sharding import PartitionSpec
-from eformer.escale import apply_logical_sharding
-from eformer import common_types
+
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.layers.caching import (
 	PagedAttentionCacheView,
@@ -93,6 +94,7 @@ class AttentionMechanisms(str, Enum):
 	SDPA = "sdpa"
 	CUDA_FLASH_ATTN2 = "cuda_flash_attn2"
 	PAGED_ATTENTION = "paged_attention"
+	REGRESSIVE_DECODE = "autoregressive_decodeattn"
 
 
 def tpu_version_check(version: str = "v4"):
@@ -216,6 +218,12 @@ class FlexibleAttentionModule(nn.Module):
 			metadata=metadata,
 		)
 		self.deterministic = True
+		self.impl_decode = None
+		if base_config.decode_attn_mechanism is not None:
+			self.impl_decode = AttentionRegistry.create(
+				impl_name=base_config.decode_attn_mechanism,
+				metadata=metadata,
+			)
 
 	@jax.named_scope("easydel-flexible-attention")
 	def forward(
@@ -223,6 +231,7 @@ class FlexibleAttentionModule(nn.Module):
 		query_states: Array,
 		key_states: Array,
 		value_states: Array,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES],  # type:ignore
 		bias: tp.Optional[Array] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
@@ -255,10 +264,29 @@ class FlexibleAttentionModule(nn.Module):
 		"""
 		if isinstance(cache_view, PagedAttentionCacheView):
 			assert self.config.attn_mechanism == AttentionMechanisms.PAGED_ATTENTION
+
 		with self.config.mesh:
-			return jtu.tree_map(
-				lambda x: x.astype(self.impl.metadata.runtime_dtype),
-				self.impl(
+			if mode == common_types.MODE_DECODE:
+				assert cache_view is not None
+				callable_attn = self.impl if self.impl_decode is None else self.impl_decode
+				output = callable_attn(
+					q=query_states,
+					k=key_states,
+					v=value_states,
+					bias=bias,
+					starts=cache_view.starts,
+					indexs=cache_view.index,
+					cache_metadata=cache_metadata,
+					cache_view=cache_view,
+					init_bias=init_bias,
+					mask=attention_mask,
+					segment_ids=segment_ids,
+					causal=causal,
+					deterministic=self.deterministic,
+					dropout_rng=dropout_rng,
+				)
+			else:
+				output = self.impl(
 					q=query_states,
 					k=key_states,
 					v=value_states,
@@ -271,8 +299,9 @@ class FlexibleAttentionModule(nn.Module):
 					causal=causal,
 					deterministic=self.deterministic,
 					dropout_rng=dropout_rng,
-				),
-			)
+				)
+
+		return jtu.tree_map(lambda x: x.astype(self.impl.metadata.runtime_dtype), output)
 
 	__call__ = forward
 
@@ -556,6 +585,7 @@ class AttentionModule(nn.Module):
 		key: Array,
 		value: Array,
 		attention_mask: Array,
+		# mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
 		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		causal_mask: tp.Optional[Array] = None,

@@ -18,6 +18,7 @@ import typing as tp
 import chex
 import jax
 import jax.numpy as jnp
+from eformer import common_types
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
 
@@ -210,6 +211,7 @@ class LlavaForConditionalGeneration(EasyDeLBaseModule):
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		inputs_embeds: tp.Optional[chex.Array] = None,
@@ -259,6 +261,7 @@ class LlavaForConditionalGeneration(EasyDeLBaseModule):
 			position_ids=position_ids,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
+			mode=mode,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
 			inputs_embeds=inputs_embeds,

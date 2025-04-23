@@ -313,6 +313,7 @@ class SiglipAttention(AttentionModule):
 			query_states=query,
 			key_states=key,
 			value_states=value,
+			mode=common_types.MODE_TRAIN,
 			bias=None,
 			init_bias=lambda: attention_bias,
 			attention_mask=attention_mask,

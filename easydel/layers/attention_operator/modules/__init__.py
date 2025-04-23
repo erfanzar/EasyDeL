@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .decode_attn import AutoRegressiveDecodeAttn
 from .flash import FlashAttn
 from .paged_attn import PagedAttn
 from .ring import RingAttn
@@ -20,6 +21,7 @@ from .splash import SplashAttn
 from .vanilla import VanillaAttn
 
 __all__ = (
+	"AutoRegressiveDecodeAttn",
 	"FlashAttn",
 	"PagedAttn",
 	"RingAttn",

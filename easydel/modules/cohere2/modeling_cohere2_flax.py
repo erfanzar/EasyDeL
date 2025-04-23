@@ -200,6 +200,7 @@ class Cohere2Attention(AttentionModule):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: tp.Optional[chex.Array | bool],
+		mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
 		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
@@ -285,6 +286,7 @@ class Cohere2Attention(AttentionModule):
 			query_states=query_states,
 			key_states=key_states,
 			value_states=value_states,
+			mode=mode,
 			bias=None,
 			cache_metadata=cache_metadata,
 			cache_view=cache_view,
@@ -409,6 +411,7 @@ class Cohere2Block(nn.Module):
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
 		causal_mask: tp.Optional[chex.Array | bool],
+		mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
 		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		segment_ids: tp.Optional[chex.Array] = None,
@@ -444,6 +447,7 @@ class Cohere2Block(nn.Module):
 			attention_mask,
 			position_ids,
 			causal_mask,
+			mode,
 			cache_view,
 			cache_metadata,
 			segment_ids,
@@ -537,6 +541,7 @@ class Cohere2Model(EasyDeLBaseModule):
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 	) -> BaseModelOutput:
@@ -564,6 +569,12 @@ class Cohere2Model(EasyDeLBaseModule):
 				(batch_size, sequence_length),
 			).astype(jnp.int32)
 		hidden_states = inputs_embeds
+		if mode is None:
+			mode = (
+				common_types.MODE_DECODE
+				if sequence_length == 1 and past_key_values is not None
+				else common_types.MODE_TRAIN
+			)
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
 
@@ -580,6 +591,7 @@ class Cohere2Model(EasyDeLBaseModule):
 				hidden_states=hidden_states,
 				attention_mask=attention_mask,
 				position_ids=position_ids,
+				mode=mode,
 				cache_view=past_key_values.views[idx],
 				cache_metadata=cache_metadata,
 				causal_mask=self.causal_mask,
@@ -659,6 +671,7 @@ class Cohere2ForCausalLM(EasyDeLBaseModule):
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 	) -> CausalLMOutput:
@@ -685,6 +698,7 @@ class Cohere2ForCausalLM(EasyDeLBaseModule):
 			position_ids=position_ids,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
+			mode=mode,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
 			inputs_embeds=inputs_embeds,
@@ -771,6 +785,7 @@ class Cohere2ForSequenceClassification(EasyDeLBaseModule):
 		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: tp.Optional[bool] = None,
 		output_hidden_states: tp.Optional[bool] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 	) -> SequenceClassifierOutput:
@@ -778,6 +793,7 @@ class Cohere2ForSequenceClassification(EasyDeLBaseModule):
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
+			mode=mode,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,

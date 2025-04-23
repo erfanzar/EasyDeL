@@ -182,11 +182,12 @@ class OPTAttention(AttentionModule):
 	def __call__(
 		self,
 		hidden_states: chex.Array,
+		mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
+		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
+		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		causal_mask: tp.Optional[chex.Array] = None,
 		key_value_states: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
-		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
-		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 	) -> tp.Tuple[chex.Array]:
 		"""Forward pass of the OPTAttention module.
 
@@ -246,6 +247,7 @@ class OPTAttention(AttentionModule):
 			cache_view=cache_view,
 			value=value_states,
 			attention_mask=attention_mask,
+			cache_metadata=cache_metadata,
 			causal_mask=causal_mask,
 		)
 
@@ -253,6 +255,7 @@ class OPTAttention(AttentionModule):
 			query_states=query_states,
 			key_states=key_states,
 			value_states=value_states,
+			mode=mode,
 			init_bias=init_attention_bias,
 			attention_mask=attention_mask,
 			causal=self.causal,
@@ -365,10 +368,11 @@ class OPTDecoderLayer(nn.Module):
 	def __call__(
 		self,
 		hidden_states: chex.Array,
-		causal_mask: tp.Optional[chex.Array] = None,
-		attention_mask: tp.Optional[chex.Array] = None,
+		mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
 		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
+		causal_mask: tp.Optional[chex.Array] = None,
+		attention_mask: tp.Optional[chex.Array] = None,
 	) -> tp.Tuple[chex.Array]:
 		"""Forward pass of the OPTDecoderLayer.
 
@@ -396,8 +400,10 @@ class OPTDecoderLayer(nn.Module):
 		hidden_states, self_attn_weights = self.self_attn(
 			hidden_states=hidden_states,
 			attention_mask=attention_mask,
+			mode=mode,
 			causal_mask=causal_mask,
 			cache_view=cache_view,
+			cache_metadata=cache_metadata,
 		)
 		hidden_states = self.dropout_layer(hidden_states)
 		hidden_states = residual + hidden_states
@@ -610,6 +616,7 @@ class OPTDecoder(EasyDeLBaseModule):
 		input_ids: chex.Array,
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
@@ -660,6 +667,12 @@ class OPTDecoder(EasyDeLBaseModule):
 		if attention_mask.ndim == 2:
 			attention_mask = jnp.expand_dims(attention_mask, (1, 2))
 
+		if mode is None:
+			mode = (
+				common_types.MODE_DECODE
+				if sequence_length == 1 and past_key_values is not None
+				else common_types.MODE_TRAIN
+			)
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
 
@@ -676,6 +689,7 @@ class OPTDecoder(EasyDeLBaseModule):
 				hidden_states=hidden_states,
 				attention_mask=attention_mask,
 				output_attentions=output_attentions,
+				mode=mode,
 				past_key_values=past_key_values.views[idx],
 				cache_metadata=cache_metadata,
 			)
@@ -747,6 +761,7 @@ class OPTModel(EasyDeLBaseModule):
 		input_ids: chex.Array,
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
@@ -776,6 +791,7 @@ class OPTModel(EasyDeLBaseModule):
 			position_ids=position_ids,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
+			mode=mode,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
 		)
@@ -856,6 +872,7 @@ class OPTForCausalLM(EasyDeLBaseModule):
 		input_ids: chex.Array,
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		output_attentions: bool = False,
@@ -884,6 +901,7 @@ class OPTForCausalLM(EasyDeLBaseModule):
 			input_ids=input_ids,
 			attention_mask=attention_mask,
 			position_ids=position_ids,
+			mode=mode,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
 			output_attentions=output_attentions,

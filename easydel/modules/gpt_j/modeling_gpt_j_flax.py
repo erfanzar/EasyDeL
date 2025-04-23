@@ -139,10 +139,11 @@ class GPTJAttention(AttentionModule):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
-		causal_mask: tp.Optional[chex.Array] = None,
-		segment_ids: tp.Optional[chex.Array] = None,
+		mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
 		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
+		causal_mask: tp.Optional[chex.Array] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		frequencies: tp.Optional[chex.Array] = None,
 	):
@@ -202,6 +203,7 @@ class GPTJAttention(AttentionModule):
 			query_states=query_states,
 			key_states=key_states,
 			value_states=value_states,
+			mode=mode,
 			bias=None,
 			cache_metadata=cache_metadata,
 			cache_view=cache_view,
@@ -362,10 +364,11 @@ class GPTJBlock(nn.Module):
 		hidden_states: chex.Array,
 		attention_mask: chex.Array,
 		position_ids: chex.Array,
+		mode: common_types.RUNTIME_MODE_TYPES,  # type:ignore
 		causal_mask: tp.Optional[chex.Array] = None,
-		segment_ids: tp.Optional[chex.Array] = None,
 		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
+		segment_ids: tp.Optional[chex.Array] = None,
 		output_attentions: bool = False,
 		frequencies: tp.Optional[chex.Array] = None,
 	):
@@ -387,14 +390,16 @@ class GPTJBlock(nn.Module):
 		"""
 		residual = hidden_states
 		hidden_states = self.ln_1(hidden_states)
+
 		attn_outputs = self.attn(
 			hidden_states,
 			attention_mask,
 			position_ids,
-			causal_mask,
-			segment_ids,
+			mode,
 			cache_view,
 			cache_metadata,
+			causal_mask,
+			segment_ids,
 			output_attentions,
 			frequencies,
 		)
@@ -505,6 +510,7 @@ class GPTJModel(EasyDeLBaseModule):
 		input_ids: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		inputs_embeds: tp.Optional[chex.Array] = None,
@@ -560,6 +566,12 @@ class GPTJModel(EasyDeLBaseModule):
 			inputs_embeds + extra_embedding if extra_embedding is not None else inputs_embeds
 		)
 
+		if mode is None:
+			mode = (
+				common_types.MODE_DECODE
+				if sequence_length == 1 and past_key_values is not None
+				else common_types.MODE_TRAIN
+			)
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.h))
 
@@ -570,6 +582,7 @@ class GPTJModel(EasyDeLBaseModule):
 			layer_outputs = block(
 				hidden_states=hidden_states,
 				attention_mask=attention_mask,
+				mode=mode,
 				cache_view=past_key_values.views[idx],
 				cache_metadata=cache_metadata,
 				position_ids=position_ids,
@@ -654,6 +667,7 @@ class GPTJForCausalLM(EasyDeLBaseModule):
 		input_ids: tp.Optional[chex.Array] = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 		position_ids: tp.Optional[chex.Array] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		past_key_values: tp.Optional[TransformerCache | PagedAttentionCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		inputs_embeds: tp.Optional[chex.Array] = None,
@@ -686,6 +700,7 @@ class GPTJForCausalLM(EasyDeLBaseModule):
 			segment_ids=segment_ids,
 			attention_mask=attention_mask,
 			inputs_embeds=inputs_embeds,
+			mode=mode,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
 			position_ids=position_ids,

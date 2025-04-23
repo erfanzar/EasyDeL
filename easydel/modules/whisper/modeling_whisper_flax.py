@@ -206,6 +206,7 @@ class WhisperAttention(AttentionModule):
 		self,
 		hidden_states: jnp.ndarray,
 		key_value_states: tp.Optional[jnp.ndarray] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		cache_view: tp.Optional[TransformerCacheView] = None,
 		cache_metadata: tp.Optional[TransformerMetadata] = None,
 		attention_mask: tp.Optional[jnp.ndarray] = None,
@@ -268,6 +269,7 @@ class WhisperAttention(AttentionModule):
 			query_states=query_states,
 			key_states=key_states,
 			value_states=value_states,
+			mode=mode,
 			bias=None,
 			cache_metadata=cache_metadata,
 			cache_view=cache_view,
@@ -407,6 +409,7 @@ class WhisperEncoderLayer(nn.Module):
 			hidden_states=hidden_states,
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,
+			mode=common_types.MODE_TRAIN,  # or prefill?
 			cache_view=None,
 			key_value_states=None,
 		)
@@ -553,6 +556,7 @@ class WhisperDecoderLayer(nn.Module):
 		causal_mask: tp.Optional[jnp.ndarray] = None,
 		encoder_hidden_states: tp.Optional[jnp.ndarray] = None,
 		encoder_attention_mask: tp.Optional[jnp.ndarray] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		cache_view: tp.Optional[TransformerCacheView] = None,
 		cache_metadata: tp.Optional[TransformerMetadata] = None,
 		output_attentions: bool = True,
@@ -584,6 +588,7 @@ class WhisperDecoderLayer(nn.Module):
 		hidden_states, self_attn_weights, cache_view = self.self_attn(
 			hidden_states=hidden_states,
 			attention_mask=attention_mask,
+			mode=mode,
 			causal_mask=causal_mask,
 			cache_view=cache_view,
 			cache_metadata=cache_metadata,
@@ -899,7 +904,8 @@ class WhisperDecoder(EasyDeLBaseModule):
 		input_ids: jnp.ndarray,
 		attention_mask: jnp.ndarray,
 		position_ids: jnp.ndarray,
-		encoder_hidden_states: tp.Optional[jnp.ndarray] = None,
+		encoder_hidden_states: tp.Optional[jnp.ndarray] = None, 
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		past_key_values: tp.Optional[TransformerCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata] = None,
 		output_attentions: bool = False,
@@ -946,6 +952,12 @@ class WhisperDecoder(EasyDeLBaseModule):
 		all_cross_attentions = (
 			() if (output_attentions and encoder_hidden_states is not None) else None
 		)
+		if mode is None:
+			mode = (
+				common_types.MODE_DECODE
+				if input_ids.shape[1] == 1 and past_key_values is not None
+				else common_types.MODE_TRAIN
+			)
 		if past_key_values is None:
 			past_key_values = TransformerCache.init_empty(len(self.layers))
 
@@ -970,6 +982,7 @@ class WhisperDecoder(EasyDeLBaseModule):
 					causal_mask=self.causal_mask,
 					encoder_hidden_states=encoder_hidden_states,
 					encoder_attention_mask=None,
+					mode=mode,
 					cache_view=past_key_values[idx],
 					cache_metadata=cache_metadata,
 					output_attentions=output_attentions,
@@ -1071,6 +1084,7 @@ class WhisperModel(EasyDeLBaseModule):
 		decoder_input_ids: jnp.ndarray,
 		decoder_attention_mask: tp.Optional[jnp.ndarray] = None,
 		decoder_position_ids: tp.Optional[jnp.ndarray] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore 
 		past_key_values: tp.Optional[TransformerCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata] = None,
 		output_attentions: bool = False,
@@ -1131,6 +1145,7 @@ class WhisperModel(EasyDeLBaseModule):
 			input_ids=decoder_input_ids,
 			attention_mask=decoder_attention_mask,
 			position_ids=decoder_position_ids,
+			mode=mode,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
 			encoder_hidden_states=encoder_outputs[0],
@@ -1155,6 +1170,7 @@ class WhisperModel(EasyDeLBaseModule):
 		decoder_input_ids: jnp.ndarray,
 		decoder_attention_mask: tp.Optional[jnp.ndarray] = None,
 		decoder_position_ids: tp.Optional[jnp.ndarray] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		past_key_values: tp.Optional[TransformerCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata] = None,
 		output_attentions: bool = False,
@@ -1209,6 +1225,7 @@ class WhisperModel(EasyDeLBaseModule):
 			input_ids=decoder_input_ids,
 			attention_mask=decoder_attention_mask,
 			position_ids=decoder_position_ids,
+			mode=mode,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
 			encoder_hidden_states=encoder_hidden_states,
@@ -1319,6 +1336,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 		decoder_input_ids,
 		decoder_attention_mask: tp.Optional[jnp.ndarray] = None,
 		decoder_position_ids: tp.Optional[jnp.ndarray] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		past_key_values: tp.Optional[TransformerCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata] = None,
 		output_attentions: bool = False,
@@ -1331,6 +1349,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 			decoder_position_ids=decoder_position_ids,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
+			mode=mode,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
 		)
@@ -1368,6 +1387,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 		encoder_attention_mask: tp.Optional[jnp.ndarray] = None,
 		decoder_attention_mask: tp.Optional[jnp.ndarray] = None,
 		decoder_position_ids: tp.Optional[jnp.ndarray] = None,
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		past_key_values: tp.Optional[TransformerCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata] = None,
 		output_attentions: tp.Optional[bool] = None,
@@ -1395,6 +1415,7 @@ class WhisperForConditionalGeneration(EasyDeLBaseModule):
 			decoder_position_ids=decoder_position_ids,
 			output_attentions=output_attentions,
 			output_hidden_states=output_hidden_states,
+			mode=mode,
 			past_key_values=past_key_values,
 			cache_metadata=cache_metadata,
 		)

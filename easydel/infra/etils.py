@@ -157,6 +157,7 @@ AVAILABLE_ATTENTION_MECHANISMS = tp.Literal[
 	"cudnn",
 	"blockwise",
 	"sdpa",
+	"autoregressive_decodeattn",
 ]
 
 
