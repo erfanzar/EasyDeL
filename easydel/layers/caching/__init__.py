@@ -31,8 +31,8 @@ from .mamba2 import (
 	Mamba2Metadata,
 )
 from .paged_attention import (
+	HBMPageManager,
 	PagedAttentionCache,
-	PagedAttentionCacheManager,
 	PagedAttentionCacheMetaData,
 	PagedAttentionCacheView,
 	PagedAttentionMetadata,
@@ -52,7 +52,7 @@ __all__ = (
 	"PagedAttentionCache",
 	"PagedAttentionCacheMetaData",
 	"PagedAttentionCacheView",
-	"PagedAttentionCacheManager",
+	"HBMPageManager",
 	"PagedAttentionMetadata",
 	"TransformerCache",
 	"TransformerCacheMetaData",

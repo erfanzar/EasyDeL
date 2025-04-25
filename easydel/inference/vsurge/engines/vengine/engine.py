@@ -16,15 +16,17 @@ import typing as tp
 from functools import cached_property
 
 import jax
+from eformer import common_types
 from eformer import escale as es
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.sharding import NamedSharding as Ns
 from jax.sharding import PartitionSpec as Ps
 from transformers import ProcessorMixin
-from eformer import common_types
+
 from easydel.utils.compiling_utils import cjit
 
+from .._abstract import AbstractInferenceEngine
 from .utilities import (
 	GenerationState,
 	ResultTokens,
@@ -58,7 +60,7 @@ BIAS_KV_SEQ = common_types.BIAS_KV_SEQ
 MODE_PREFILL = common_types.MODE_PREFILL
 
 
-class vEngine:
+class vEngine(AbstractInferenceEngine):
 	"""
 	Core inference engine for EasyDeL models using NNX graphs.
 
@@ -99,7 +101,7 @@ class vEngine:
 		    seed: The random seed for initializing the PRNG key used in sampling.
 		        Defaults to 894.
 		"""
-		from ..utils import DEFAULT_PREFILL_BUCKETS
+		from ...utils import DEFAULT_PREFILL_BUCKETS
 
 		self.model = model
 		self.graphdef, self.graphstate, self.graphothers = model.split_module()

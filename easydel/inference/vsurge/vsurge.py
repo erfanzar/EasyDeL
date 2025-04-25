@@ -26,7 +26,7 @@ from easydel.utils.helpers import get_logger
 
 from .driver import ActiveRequest, ActiveRequestMetadata, AsyncMultifuture, vDriver
 from .utils import ReturnSample, is_byte_token, text_tokens_to_string
-from .vengine import vEngine
+from .engines import vEngine
 
 if tp.TYPE_CHECKING:
 	from easydel.infra.base_module import EasyDeLBaseModule

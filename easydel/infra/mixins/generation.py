@@ -39,6 +39,10 @@ from easydel.inference.logits_process import (
 	TopPLogitsWarper,
 )
 from easydel.layers.caching import TransformerCache, TransformerCacheMetaData
+from easydel.layers.caching.paged_attention.paged_attention_cache import (
+	PagedAttentionCache,
+	PagedAttentionCacheMetaData,
+)
 from easydel.utils.helpers import get_logger
 
 from ..base_config import EasyDeLBaseConfig
@@ -113,6 +117,13 @@ class BeamSearchState:
 	model_kwargs: tp.Dict[str, chex.Array]
 
 
+def _safepick(config, pickname):
+	vari = getattr(config, pickname, None)
+	if vari is None and hasattr(config, "text_config"):
+		vari = getattr(config.text_config, pickname, None)
+	return vari
+
+
 class EasyGenerationMixin:
 	config_class: tp.Type[EasyDeLBaseConfig]
 	config: EasyDeLBaseConfig
@@ -120,12 +131,81 @@ class EasyGenerationMixin:
 	_model_task: tp.Optional[str] = None
 	_model_type: tp.Optional[str] = None
 
+	def create_paged_metadata(
+		self,
+		page_size: int,
+		batch_size: int,
+		max_sequences: int,
+		dtype: jnp.dtype = jnp.bfloat16,
+		hbm_utilization: float = 0.875,
+	) -> PagedAttentionCacheMetaData:
+		"""
+		Creates the static configuration metadata required for initializing a Paged KV Cache.
+
+		This method gathers necessary parameters from the model's configuration
+		(like number of layers, heads, dimensions) and combines them with the provided
+		arguments to instantiate and return a `PagedAttentionCacheMetaData` object.
+		This metadata object defines the structure and allocation parameters for the paged cache.
+
+		Args:
+		    page_size (int): The number of tokens to store per cache page.
+		    batch_size (int): The maximum number of sequences to handle concurrently
+		        during the decode phase.
+		    max_sequences (int): The maximum sequence length the cache should be
+		        configured to support.
+		    dtype (jnp.dtype): The data type to assume for cache memory calculation.
+		        Defaults to jnp.bfloat16.
+		    hbm_utilization (float): The target fraction of High Bandwidth Memory (HBM)
+		        to allocate for the KV cache pages. Defaults to 0.875 (87.5%).
+
+		Returns:
+		    PagedAttentionCacheMetaData: An initialized metadata object containing the
+		        static configuration for the paged cache.
+		"""
+		num_hidden_layers = _safepick(self.config, "num_hidden_layers")
+		num_key_value_heads = _safepick(self.config, "num_key_value_heads")
+		num_attention_heads = _safepick(self.config, "num_attention_heads")
+		hidden_size = _safepick(self.config, "hidden_size")
+		if num_key_value_heads is None:
+			num_key_value_heads = num_attention_heads
+
+		head_dim = _safepick(self.config, "head_dim")
+		if head_dim is None:
+			head_dim = hidden_size // num_attention_heads
+		return PagedAttentionCacheMetaData.create(
+			mesh=self.mesh,
+			batch_size=batch_size,
+			dtype=dtype,
+			hbm_utilization=hbm_utilization,
+			kv_head_dim_size=head_dim,
+			max_sequences=max_sequences,
+			num_hidden_layers=num_hidden_layers,
+			num_kv_heads=num_key_value_heads,
+			page_size=page_size,
+		)
+
 	def create_cache_metadata(
 		self,
 		batch_size: int,
 		max_length: int,
 		pad_token_id: int | None = None,
-	):
+	) -> TransformerCacheMetaData:
+		"""
+		Creates the metadata required for initializing a standard (non-paged) KV Cache.
+
+		This method gathers parameters like layer count, head dimensions, and determines
+		the appropriate padding token ID to instantiate and return a
+		`TransformerCacheMetaData` object suitable for a standard sequential KV cache.
+
+		Args:
+		    batch_size (int): The batch size for which the cache is being configured.
+		    max_length (int): The maximum sequence length the cache needs to support.
+		    pad_token_id (int | None): The ID of the padding token. If None, it attempts
+		        to find it from `self.generation_config` or `self.config`, defaulting to 0.
+
+		Returns:
+		    TransformerCacheMetaData: An initialized metadata object for a standard KV cache.
+		"""
 		if pad_token_id is None:
 			if hasattr(self, "generation_config"):
 				pad_token_id = self.generation_config.pad_token_id
@@ -148,6 +228,83 @@ class EasyGenerationMixin:
 			head_dim=head_dim,
 		)
 
+	def init_pages(
+		self,
+		metadata: tp.Optional[PagedAttentionCacheMetaData] = None,
+		page_size: tp.Optional[int] = None,
+		batch_size: tp.Optional[int] = None,
+		max_sequences: tp.Optional[int] = None,
+		dtype: tp.Optional[jnp.dtype] = jnp.bfloat16,
+		hbm_utilization: tp.Optional[float] = None,
+	) -> PagedAttentionCache:
+		"""
+		Initializes and returns the actual Paged Attention KV Cache tensors.
+
+		This method orchestrates the creation of the `PagedAttentionCache`. It either uses
+		a pre-existing `PagedAttentionCacheMetaData` object passed via the `metadata`
+		argument, or if `metadata` is None, it first creates the metadata by calling
+		`self.create_paged_metadata` using the other provided arguments (page_size,
+		batch_size, etc.).
+
+		Finally, it calls `PagedAttentionCache.init_cache` to allocate the necessary
+		paged tensors (`key_pages`, `value_pages` for each layer) based on the
+		metadata, model's mesh, dtype, partition manager, and quantization settings.
+
+		Args:
+		    metadata (tp.Optional[PagedAttentionCacheMetaData]): An optional pre-configured
+		        metadata object. If provided, other arguments like page_size, batch_size etc.,
+		        are ignored for metadata creation.
+		    page_size (tp.Optional[int]): Number of tokens per page. Required if `metadata` is None.
+		    batch_size (tp.Optional[int]): Max concurrent sequences for decode. Required if `metadata` is None.
+		    max_sequences (tp.Optional[int]): Max supported sequence length. Required if `metadata` is None.
+		    dtype (tp.Optional[jnp.dtype]): Data type for memory calculation. Required if `metadata` is None.
+		        Defaults to jnp.bfloat16.
+		    hbm_utilization (tp.Optional[float]): Target HBM usage. Required if `metadata` is None.
+
+		Returns:
+		    PagedAttentionCache: An initialized PagedAttentionCache object containing the allocated
+		        cache tensors (views) for all layers.
+
+		Raises:
+		    AssertionError: If `metadata` is None and any of the required arguments
+		        (page_size, batch_size, max_sequences, dtype, hbm_utilization) are also None.
+		"""
+		if metadata is None:
+			assert page_size is not None, (
+				"if your not passing orginal metadata you should pass `page_size`"
+			)
+			assert batch_size is not None, (
+				"if your not passing orginal metadata you should pass `batch_size`"
+			)
+			assert max_sequences is not None, (
+				"if your not passing orginal metadata you should pass `max_sequences`"
+			)
+			assert dtype is not None, (
+				"if your not passing orginal metadata you should pass `dtype`"
+			)
+			assert hbm_utilization is not None, (
+				"if your not passing orginal metadata you should pass `hbm_utilization`"
+			)
+
+			metadata = self.create_paged_metadata(
+				page_size=page_size,
+				batch_size=batch_size,
+				max_sequences=max_sequences,
+				dtype=dtype,
+				hbm_utilization=hbm_utilization,
+			)
+		return PagedAttentionCache.init_cache(
+			mesh=self.config.mesh,
+			dtype=self.dtype,
+			metadata=metadata,
+			partition_manager=self.config.partition_manager,
+			quantizer=self._quant_class(
+				quantization_method=self.config.kv_cache_quantization_method,
+				block_size=self.config.kv_cache_quantization_blocksize,
+				quantization_platform=self.config.platform,
+			),
+		)
+
 	def init_cache(
 		self,
 		batch_size: int,
@@ -155,7 +312,27 @@ class EasyGenerationMixin:
 		starts: int | None = None,
 		shardings: dict | None = None,
 		pad_token_id: int | None = None,
-	):
+	) -> TransformerCache:
+		"""
+		Initializes and returns a standard (non-paged) Key-Value cache.
+
+		This method first creates the necessary metadata using `create_cache_metadata`
+		and then calls `TransformerCache.init_cache` to allocate and initialize
+		the cache tensors based on the model's configuration, dtype, sharding,
+		quantization settings, and provided batch size and maximum length.
+
+		Args:
+		    batch_size (int): The batch size for the cache.
+		    max_length (int): The maximum sequence length the cache needs to support.
+		    starts (int | None): Optional starting positions for the cache sequences.
+		        If provided, influences the initial state. Defaults to None (usually 0).
+		    shardings (dict | None): Optional dictionary specifying sharding configurations.
+		        (Note: This argument appears unused in the current implementation shown).
+		    pad_token_id (int | None): The ID of the padding token. If None, it's inferred.
+
+		Returns:
+		    TransformerCache: An initialized standard TransformerCache object.
+		"""
 		return TransformerCache.init_cache(
 			dtype=self.dtype,
 			partition_manager=self.config.partition_manager,
@@ -175,12 +352,34 @@ class EasyGenerationMixin:
 
 	@cached_property
 	def _quant_class(self):
+		"""
+		Cached property to access the EasyQuantizer class type.
+
+		Used internally to easily reference the quantization class without repeated imports.
+
+		Returns:
+		    type: The EasyQuantizer class.
+		"""
 		from easydel.layers.quantization.quantizers import EasyQuantizer
 
 		return EasyQuantizer
 
 	@staticmethod
-	def compute_prefill_length(array, padding_id):
+	def compute_prefill_length(array, padding_id) -> chex.Array:
+		"""
+		Calculates the number of non-padding tokens at the beginning of each sequence.
+
+		This is useful for determining the actual starting position in a KV cache when
+		dealing with left-padded inputs.
+
+		Args:
+		    array (chex.Array): The input token ID array, typically shape (batch_size, sequence_length).
+		    padding_id (int): The token ID used for padding.
+
+		Returns:
+		    chex.Array: An array of shape (batch_size,) containing the number of leading
+		        padding tokens for each sequence in the batch.
+		"""
 		return jnp.sum(jnp.cumsum(array != padding_id, axis=-1) == 0, axis=-1)
 
 	def prepare_inputs_for_generation(
@@ -192,19 +391,33 @@ class EasyGenerationMixin:
 		shardings: int | None = None,
 		attention_mask: tp.Optional[chex.Array] = None,
 		token_type_ids: tp.Optional[chex.Array] = None,
-	):
-		"""The prepare_inputs_for_generation function is used to prepare the inputs for a generation task.
+	) -> tp.Dict[str, tp.Any]:
+		"""
+		Sets up the initial inputs required for starting autoregressive generation.
+
+		This function initializes the Key-Value cache (`past_key_values`) using `init_cache`,
+		calculates the initial `position_ids` based on the input `attention_mask` (or assumes
+		a contiguous range if no mask is provided), and prepares an extended `attention_mask`
+		suitable for caching. It ensures inputs are placed on the correct devices/shards.
 
 		Args:
-		    self: Access variables that belong to the class
-		    input_ids: Pass in the input tokens
-		    max_length: Set the length of the sequence to be generated
-		    attention_mask: tp.Optional[chex.Array]: Mask the attention weights
-				token_type_ids: tp.Optional[chex.Array]: TokenTypeIds
+		    input_ids (chex.Array): The initial sequence of token IDs. Shape (batch_size, seq_length).
+		    max_length (int): The maximum sequence length that the KV cache should support.
+		    pad_token_id (int): The ID used for padding tokens. Used to calculate `starts` if not provided.
+		    starts (int | None): Optional pre-calculated starting positions (number of leading pads).
+		        If None, calculated using `compute_prefill_length`.
+		    shardings (dict | None): Optional sharding configuration passed to `init_cache`.
+		    attention_mask (tp.Optional[chex.Array]): An optional mask indicating which tokens
+		        should be attended to. Shape (batch_size, seq_length).
+		    token_type_ids (tp.Optional[chex.Array]): Optional segment IDs for models that use them.
 
 		Returns:
-		    A dictionary of the past_key_values, attention_mask and
-		    position ids
+		    dict: A dictionary containing the prepared inputs, typically including:
+		        - "past_key_values": The initialized KV cache.
+		        - "attention_mask": The extended attention mask for generation.
+		        - "position_ids": The calculated initial position IDs.
+		        - "token_type_ids": (Optional) Prepared token type IDs.
+		        This dictionary is then passed through `prepare_inputs_for_call`.
 		"""
 		batch_size, seq_length = input_ids.shape
 		if starts is None:
@@ -249,7 +462,28 @@ class EasyGenerationMixin:
 
 		return self.prepare_inputs_for_call(**calldict)
 
-	def update_inputs_for_generation(self, model_outputs, model_kwargs):
+	def update_inputs_for_generation(
+		self,
+		model_outputs,
+		model_kwargs,
+	) -> tp.Dict[str, tp.Any]:
+		"""
+		Updates the keyword arguments for the next generation step.
+
+		Specifically, it takes the `past_key_values` from the `model_outputs` of the
+		current step and updates the `model_kwargs` with them. It also increments the
+		`position_ids` by one for the next token prediction.
+
+		Args:
+		    model_outputs: The output object from the model's forward pass in the previous step
+		        (should contain a `past_key_values` attribute).
+		    model_kwargs (dict): The dictionary of keyword arguments used for the model call.
+		        This dictionary will be modified in-place or a new one returned.
+
+		Returns:
+		    dict: The updated `model_kwargs` dictionary ready for the next generation step.
+		"""
+
 		model_kwargs["past_key_values"] = model_outputs.past_key_values
 		model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
 		return model_kwargs
@@ -258,6 +492,17 @@ class EasyGenerationMixin:
 		self,
 		model_kwargs: tp.Dict[str, chex.Array],
 	) -> tp.Optional[tp.Mapping[str, tp.Dict[str, tp.Any]]]:
+		"""
+		Placeholder method to extract or create properties required for specific model types
+		from keyword arguments. Intended to be overridden by subclasses if needed.
+
+		Args:
+		    model_kwargs (dict): Keyword arguments passed to the model.
+
+		Returns:
+		    Optional[Mapping[str, Dict[str, Any]]]: Extracted properties or None.
+		        Defaults to returning None.
+		"""
 		return None
 
 	def _get_compile_model_kwargs(
@@ -273,7 +518,32 @@ class EasyGenerationMixin:
 		vision_width: tp.Optional[int] = None,
 		required_props: tp.Optional[tp.Mapping[str, tp.Dict[str, tp.Any]]] = None,
 		**kwargs,
-	):
+	) -> tp.Dict[str, tp.Any]:
+		"""
+		Generates a dictionary of placeholder keyword arguments needed for model compilation.
+
+		Creates dummy tensors (like `input_ids`, `attention_mask`) with the specified shapes
+		and sharding, along with necessary RNGs, to allow JAX to trace and compile the
+		model's forward pass without needing real data. This is often used for AOT compilation
+		or initialization checks. Specific models might override this to add more required inputs.
+
+		Args:
+		    batch_size (int): The batch size for the dummy inputs.
+		    input_tokens_length (int): The sequence length for the dummy inputs.
+		    input_sharding (jax.sharding.PartitionSpec): Sharding for the dummy inputs.
+		    rngs (jax.random.PRNGKey): RNG keys required by the model (e.g., for dropout).
+		    vision_included (bool): Flag indicating if vision inputs are needed (for multimodal).
+		    vision_batch_size (int): Batch size for dummy vision inputs.
+		    vision_channels (int): Channels for dummy vision inputs.
+		    vision_height (tp.Optional[int]): Height for dummy vision inputs.
+		    vision_width (tp.Optional[int]): Width for dummy vision inputs.
+		    required_props (tp.Optional[tp.Mapping[str, tp.Dict[str, tp.Any]]]): Optional
+		        additional properties extracted by `_create_required_props_from_kwargs`.
+		    **kwargs: Additional keyword arguments.
+
+		Returns:
+		    dict: A dictionary containing dummy keyword arguments suitable for model compilation.
+		"""
 		deteshape = (batch_size, input_tokens_length)
 		return dict(
 			input_ids=jnp.ones(deteshape, dtype="i4", device=input_sharding),
@@ -288,15 +558,22 @@ class EasyGenerationMixin:
 		kwargs: tp.Dict[str, tp.Any],
 	) -> tp.Dict[str, tp.Any]:
 		"""
-		Validates and filters arguments based on the method's signature.
+		Validates and filters arguments against a method's signature.
+
+		Inspects the signature of the provided `method` and filters the combined `args`
+		and `kwargs` to include only those parameters that are actually accepted by the method.
+		This prevents errors caused by passing unexpected arguments. Issues warnings for
+		skipped parameters.
 
 		Args:
-				method: The method to check signature against
-				args: Positional arguments
-				kwargs: Keyword arguments
+		    method (callable): The method whose signature should be checked.
+		    args (tuple): Positional arguments intended for the method.
+		    kwargs (dict): Keyword arguments intended for the method.
 
 		Returns:
-				tp.Dict[str, tp.Any]: Filtered kwargs containing only valid parameters
+		    dict: A dictionary containing only the keyword arguments that match the
+		        method's signature. Positional arguments are converted to keyword arguments
+		        based on their position.
 		"""
 		sig = inspect.signature(method)
 		valid_params = sig.parameters
@@ -341,9 +618,22 @@ class EasyGenerationMixin:
 		return filtered_kwargs
 
 	@staticmethod
-	def _run_loop_in_debug(cond_fn, body_fn, init_state):
+	def _run_loop_in_debug(cond_fn, body_fn, init_state) -> tp.Any:
 		"""
-		Run generation in untraced mode. This should only be used for debugging purposes.
+		Executes a conditional loop (`while cond_fn: state = body_fn(state)`) without JAX tracing.
+
+		This provides a standard Python loop execution equivalent to `jax.lax.while_loop`,
+		which is useful for debugging the loop's body function step-by-step, as JAX's
+		traced loops can be opaque. Should not be used in production code intended for JIT compilation.
+
+		Args:
+		    cond_fn (callable): A function that takes the current state and returns True
+		        if the loop should continue.
+		    body_fn (callable): A function that takes the current state and returns the next state.
+		    init_state (Any): The initial state for the loop.
+
+		Returns:
+		    Any: The final state after the loop terminates.
 		"""
 		state = init_state
 		while cond_fn(state):
@@ -354,7 +644,22 @@ class EasyGenerationMixin:
 		self,
 		input_ids,
 		model_kwargs,
-	):
+	) -> tp.Dict[str, tp.Any]:
+		"""
+		Prepares keyword arguments specifically for encoder-decoder model generation.
+
+		It separates arguments intended for the encoder, runs the `self.encode` method
+		with those arguments, and adds the resulting `encoder_outputs` to the `model_kwargs`.
+		This pre-computes the encoder representation needed by the decoder during generation.
+
+		Args:
+		    input_ids (chex.Array): The input token IDs for the encoder.
+		    model_kwargs (dict): The dictionary of keyword arguments. Encoder-specific
+		        arguments will be used, and `encoder_outputs` will be added.
+
+		Returns:
+		    dict: The updated `model_kwargs` dictionary containing `encoder_outputs`.
+		"""
 		encoder_kwargs = {
 			argument: value
 			for argument, value in model_kwargs.items()
@@ -370,6 +675,24 @@ class EasyGenerationMixin:
 		bos_token_id: int = None,
 		model_kwargs: tp.Optional[tp.Dict[str, chex.Array]] = None,
 	) -> chex.Array:
+		"""
+		Creates the initial `decoder_input_ids` tensor for encoder-decoder generation.
+
+		It checks if `decoder_input_ids` are already provided in `model_kwargs`. If not,
+		it determines the appropriate starting token ID (using `_get_decoder_start_token_id`)
+		and creates a tensor of shape (batch_size, 1) containing that ID repeated for each
+		sequence in the batch.
+
+		Args:
+		    batch_size (int): The number of sequences in the batch.
+		    decoder_start_token_id (int | None): Explicitly provided start token ID.
+		    bos_token_id (int | None): Explicitly provided BOS token ID (used if decoder start ID is missing).
+		    model_kwargs (dict | None): Optional dictionary of keyword arguments. If it contains
+		        "decoder_input_ids", those are returned directly and removed from the dict.
+
+		Returns:
+		    chex.Array: The initial `decoder_input_ids` tensor, shape (batch_size, 1).
+		"""
 		if model_kwargs is not None and "decoder_input_ids" in model_kwargs:
 			decoder_input_ids = model_kwargs.pop("decoder_input_ids")
 			if decoder_input_ids is not None:
@@ -388,6 +711,25 @@ class EasyGenerationMixin:
 		decoder_start_token_id: int = None,
 		bos_token_id: int = None,
 	) -> int:
+		"""
+		Determines the appropriate start token ID for the decoder during generation.
+
+		It prioritizes `decoder_start_token_id` if provided, then checks the model's
+		`generation_config`, then the main `config` (and its `decoder` sub-config if applicable),
+		falling back to `bos_token_id` from similar sources if the specific decoder start ID
+		is unavailable.
+
+		Args:
+		    decoder_start_token_id (int | None): Explicitly provided decoder start token ID.
+		    bos_token_id (int | None): Explicitly provided BOS token ID.
+
+		Returns:
+		    int: The determined decoder start token ID.
+
+		Raises:
+		    ValueError: If neither a `decoder_start_token_id` nor a `bos_token_id` can be found
+		        in any of the configurations.
+		"""
 		decoder_start_token_id = (
 			decoder_start_token_id
 			if decoder_start_token_id is not None
@@ -418,6 +760,20 @@ class EasyGenerationMixin:
 
 	@staticmethod
 	def _expand_to_num_beams(tensor, num_beams):
+		"""
+		Expands/repeats a tensor to match the number of beams for beam search.
+
+		It inserts a new dimension after the batch dimension and broadcasts/repeats
+		the tensor along that dimension `num_beams` times. For example, an input shape
+		(batch_size, seq_len, ...) becomes (batch_size, num_beams, seq_len, ...).
+
+		Args:
+		    tensor (chex.Array): The tensor to expand. Assumed to have batch size as the first dimension.
+		    num_beams (int): The number of beams to expand to.
+
+		Returns:
+		    chex.Array: The tensor expanded for beam search.
+		"""
 		return jnp.broadcast_to(
 			tensor[:, None], (tensor.shape[0], num_beams) + tensor.shape[1:]
 		)
