@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from .api_server import vSurgeApiServer
-from .vengine import vEngine
+from .engines import vEngine
 from .driver import vDriver
 from .vsurge import vSurge, vSurgeRequest
 

@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .engine import vEngine
-from .utilities import GenerationState, ResultTokens, SlotData
+from ._utils import ResultTokens, SlotData
+from .vengine import GenerationState, vEngine
 
-__all__ = ("GenerationState", "ResultTokens", "SlotData", "vEngine")
+__all__ = (
+	"ResultTokens",
+	"SlotData",
+	"GenerationState",
+	"vEngine",
+)

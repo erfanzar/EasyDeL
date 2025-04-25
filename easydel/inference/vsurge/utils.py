@@ -20,7 +20,7 @@ import jax
 import numpy as np
 from jax import numpy as jnp
 
-from .vengine import ResultTokens
+from .engines import ResultTokens
 
 if tp.TYPE_CHECKING:
 	from easydel.infra.utils import ProcessingClassType

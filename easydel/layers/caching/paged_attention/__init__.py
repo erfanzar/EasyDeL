@@ -11,18 +11,42 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from .managers import (
+	ActiveSequenceBatch,
+	AllocatedPrefillPages,
+	GenerationStepTask,
+	HBMPageManager,
+	InferenceScheduler,
+	InitialSequenceRequest,
+	ModelInputBatch,
+	ModelIOProcessor,
+	ModelOutputBatch,
+	ModelOutputSummary,
+	NextIterationPlan,
+	SlotPageAssignment,
+)
 from .paged_attention_cache import (
 	PagedAttentionCache,
-	PagedAttentionCacheManager,
 	PagedAttentionCacheMetaData,
 	PagedAttentionCacheView,
 	PagedAttentionMetadata,
 )
 
 __all__ = (
+	"InferenceScheduler",
+	"SlotPageAssignment",
+	"HBMPageManager",
+	"GenerationStepTask",
+	"ActiveSequenceBatch",
+	"ModelOutputSummary",
+	"InitialSequenceRequest",
+	"ModelIOProcessor",
+	"AllocatedPrefillPages",
+	"ModelInputBatch",
+	"ModelOutputBatch",
+	"NextIterationPlan",
 	"PagedAttentionCache",
 	"PagedAttentionCacheMetaData",
 	"PagedAttentionCacheView",
-	"PagedAttentionCacheManager",
 	"PagedAttentionMetadata",
 )

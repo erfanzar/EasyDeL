@@ -39,7 +39,7 @@ from .utils import (
 	pad_tokens,
 	process_result_tokens,
 )
-from .vengine import ResultTokens, vEngine
+from .engines import ResultTokens, vEngine
 
 if tp.TYPE_CHECKING:
 	from easydel.infra.base_module import EasyDeLBaseModule
