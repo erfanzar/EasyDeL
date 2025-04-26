@@ -16,6 +16,7 @@ import typing as tp
 
 import jax
 import numpy as np
+from jax import numpy as jnp
 
 
 if tp.TYPE_CHECKING:
@@ -131,3 +132,63 @@ class ResultTokens(tp.NamedTuple):
 
 	def __str__(self):
 		return f"ResultTokens(data={self.data})"
+
+
+def apply_temperature(logits, temperature):
+	return jax.lax.cond(
+		temperature != 0.0,
+		lambda x, temp: x / temp,
+		lambda *x: x[0],
+		logits,
+		temperature,
+	)
+
+
+def apply_top_k(logits, top_k):
+	vocab_size = logits.shape[-1]
+	effective_k = jnp.maximum(top_k, 1)
+	effective_k = jnp.minimum(effective_k, vocab_size).astype(jnp.int32)
+
+	def _filter_scores(s: jnp.ndarray) -> jnp.ndarray:
+		"""Applies the dynamic filtering logic."""
+		sorted_scores = jnp.sort(s, axis=-1)[:, ::-1]
+		k_index = effective_k - 1
+		k_index = jnp.maximum(0, k_index)
+		threshold = sorted_scores[:, k_index]
+		threshold = threshold[:, None]
+		mask = s >= threshold
+		return jnp.where(mask, s, -float("inf"))
+
+	def _identity(s: jnp.ndarray) -> jnp.ndarray:
+		"""Returns scores unchanged."""
+		return s
+
+	return jax.lax.cond(
+		(top_k > 0) & (effective_k < vocab_size),
+		_filter_scores,
+		_identity,
+		logits,
+	)
+
+
+def apply_top_p(logits, top_p):
+	def _apply(x):
+		topk_scores, topk_indices = jax.lax.top_k(x, x.shape[-1])
+
+		mask_scores = jnp.full_like(x, -float("inf"))
+		cumulative_probs = jax.nn.softmax(topk_scores, axis=-1).cumsum(axis=-1)
+		score_mask = cumulative_probs < top_p
+		score_mask = jnp.roll(score_mask, 1)
+		score_mask |= score_mask.at[:, 0].set(True)
+		score_mask = score_mask.at[:, :1].set(True)
+		topk_next_scores = jnp.where(score_mask, topk_scores, mask_scores)
+		x = jax.lax.sort_key_val(topk_indices, topk_next_scores)[-1]
+
+		return x
+
+	return jax.lax.cond(
+		(top_p > 0) & (top_p < 1),
+		_apply,
+		lambda x: jax.nn.softmax(x, axis=-1),
+		logits,
+	)
