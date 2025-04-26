@@ -26,7 +26,9 @@ from eformer import common_types
 from eformer import escale as es
 from eformer.jaximus import ImplicitArray
 from eformer.pytree import auto_pytree
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import Mesh
+from jax.sharding import NamedSharding as Ns
+from jax.sharding import PartitionSpec as Ps
 
 from .._abstracts import (
 	BaseCache,
@@ -234,7 +236,7 @@ class PagedAttentionCacheView(BaseCacheView):
 			shape=kv_pages_shape,
 		)
 
-		kv_pages_sharding = NamedSharding(mesh=mesh, spec=kv_pages_sharding)
+		kv_pages_sharding = Ns(mesh=mesh, spec=kv_pages_sharding)
 
 		with jax.named_scope("easydel-paged-attention-cache-init"):
 			key_pages = jnp.zeros(
@@ -548,11 +550,15 @@ class PagedAttentionMetadata:
 		)
 
 	@classmethod
-	def _init_decode_state(cls):
+	def init_empty(cls):
+		scalar = jax.device_put(
+			jnp.asarray(1e6, dtype=jnp.int32),
+			Ns(es.get_incontext_mesh(), Ps()),
+		)
 		return PagedAttentionMetadata(
-			prefill_length=jnp.asarray(0, dtype=jnp.int32),
-			prefill_position=jnp.asarray(0, dtype=jnp.int32),
-			prefill_page_table=jnp.asarray(0, dtype=jnp.int32),
-			decodes_position=jnp.asarray(0, dtype=jnp.int32),
-			decodes_page_table=jnp.asarray(0, dtype=jnp.int32),
+			prefill_length=scalar,
+			prefill_position=scalar,
+			prefill_page_table=scalar,
+			decodes_position=scalar,
+			decodes_page_table=scalar,
 		)
