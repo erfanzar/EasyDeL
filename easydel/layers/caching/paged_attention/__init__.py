@@ -12,18 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .managers import (
-	ActiveSequenceBatch,
-	AllocatedPrefillPages,
-	GenerationStepTask,
-	HBMPageManager,
 	InferenceScheduler,
-	InitialSequenceRequest,
-	ModelInputBatch,
+	HBMPageManager,
 	ModelIOProcessor,
+)
+from .types import (
+	SlotPageAssignment,
+	GenerationStepTask,
+	ActiveSequenceBatch,
+	InitialSequenceRequest,
+	AllocatedPrefillPages,
+	ModelInputBatch,
 	ModelOutputBatch,
 	ModelOutputSummary,
 	NextIterationPlan,
-	SlotPageAssignment,
 )
 from .paged_attention_cache import (
 	PagedAttentionCache,
