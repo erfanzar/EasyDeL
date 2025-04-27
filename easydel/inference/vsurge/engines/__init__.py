@@ -13,11 +13,6 @@
 # limitations under the License.
 
 from ._utils import ResultTokens, SlotData
-from .vengine import GenerationState, vEngine
+from .vengine import GenerationState, vDriver, vEngine
 
-__all__ = (
-	"ResultTokens",
-	"SlotData",
-	"GenerationState",
-	"vEngine",
-)
+__all__ = ("ResultTokens", "SlotData", "GenerationState", "vEngine", "vDriver")

@@ -26,7 +26,7 @@ from transformers import ProcessorMixin
 
 from easydel.utils.compiling_utils import cjit
 
-from .._abstract import AbstractInferenceEngine
+from .._abstract_engine import AbstractInferenceEngine
 from .utilities import (
 	GenerationState,
 	ResultTokens,

@@ -21,12 +21,18 @@ import time
 import typing as tp
 
 import jax
+
 from easydel.inference.utilities import SamplingParams
 from easydel.utils.helpers import get_logger
 
-from .driver import ActiveRequest, ActiveRequestMetadata, AsyncMultifuture, vDriver
+from .engines.vengine import (
+	ActiveRequest,
+	ActiveRequestMetadata,
+	AsyncMultifuture,
+	vDriver,
+	vEngine,
+)
 from .utils import ReturnSample, is_byte_token, text_tokens_to_string
-from .engines import vEngine
 
 if tp.TYPE_CHECKING:
 	from easydel.infra.base_module import EasyDeLBaseModule

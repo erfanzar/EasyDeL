@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .driver import vDriver
 from .engine import vEngine
 from .utilities import GenerationState
 
-__all__ = ("GenerationState", "vEngine")
+__all__ = ("GenerationState", "vEngine", "vDriver")
