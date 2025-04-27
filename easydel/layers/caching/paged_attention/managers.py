@@ -34,6 +34,7 @@ from .types import (
 	ModelInputBatch,
 	ModelOutputBatch,
 	NextIterationPlan,
+	SamplingParams,
 	SlotPageAssignment,
 )
 
@@ -301,6 +302,7 @@ class ModelIOProcessor:
 		next_token: jax.Array,
 		complete: jax.Array,
 		attn_meta: PagedAttentionMetadata,
+		sampling_params: SamplingParams,
 	) -> ModelOutputBatch:
 		"""
 		Processes the raw model output (logits converted to tokens) and completion flags
@@ -366,7 +368,7 @@ class ModelIOProcessor:
 				output.decodes_next_position,
 				-1,
 			)
-
+		output.next_sampling_params = sampling_params
 		return output
 
 	@staticmethod
@@ -430,6 +432,8 @@ class ModelIOProcessor:
 			input_ids = ongoing_prefill.token_ids
 			positions = ongoing_prefill.positions
 
+			sampling_params = ongoing_prefill.sampling_params
+
 			attn_meta.prefill_length = ongoing_prefill.length
 			attn_meta.prefill_position = ongoing_prefill.positions
 			attn_meta.prefill_page_table = ongoing_prefill.page_indices
@@ -437,6 +441,8 @@ class ModelIOProcessor:
 		elif ongoing_decodes.is_active:
 			input_ids = ongoing_decodes.token_ids
 			positions = ongoing_decodes.positions
+
+			sampling_params = ongoing_decodes.sampling_params
 
 			attn_meta.decodes_position = ongoing_decodes.positions
 			attn_meta.decodes_page_table = ongoing_decodes.page_table
@@ -450,6 +456,7 @@ class ModelIOProcessor:
 			input_ids,
 			ongoing_decodes.token_ids,
 			positions,
+			sampling_params,
 			attn_meta,
 		)
 
@@ -514,6 +521,7 @@ class ModelIOProcessor:
 			input_ids,
 			decodes_token_ids,
 			positions,
+			sampling_params,
 			attn_meta,
 		) = cls.prepare_model_input(
 			attn_meta,
@@ -529,11 +537,13 @@ class ModelIOProcessor:
 			decodes_state.token_ids = decodes_token_ids
 			decodes_state.positions = attn_meta.decodes_position
 			decodes_state.page_table = attn_meta.decodes_page_table
+			decodes_state.sampling_params = sampling_params
 
 		return ModelInputBatch(
 			input_ids=input_ids,
 			positions=positions,
 			attn_meta=attn_meta,
+			sampling_params=sampling_params,
 		)
 
 
