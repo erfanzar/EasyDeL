@@ -46,7 +46,7 @@ class SamplingParams:
 	top_p: jax.Array | float = np.array([1.0])
 	top_k: jax.Array | int = np.array([1])
 	max_tokens: jax.Array | int = np.array([32])
-	temperature: jax.Array | float = np.array([1.0])
+	temperature: jax.Array | float = np.array([0.0])
 
 	def insert_from_task(self, slot, task: GenerationStepTask):
 		assert task.sampling_params.top_p.size == 1
