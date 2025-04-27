@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import partial
 import typing as tp
 
 import jax
@@ -192,3 +193,12 @@ def apply_top_p(logits, top_p):
 		lambda x: jax.nn.softmax(x, axis=-1),
 		logits,
 	)
+
+
+@partial(jax.vmap, in_axes=(0, 0, 0, 0), out_axes=(0))
+def apply_filters(logits, top_p, top_k, temperature):
+	logits = jnp.expand_dims(logits, 0)
+	logits = apply_temperature(logits, temperature.astype(logits.dtype))
+	logits = apply_top_k(logits, top_k)
+	logits = apply_top_p(logits, top_p.astype(logits.dtype))
+	return logits[0]

@@ -26,7 +26,13 @@ from jax.sharding import PartitionSpec
 from easydel.layers.caching.transformer.transformer_cache import TransformerCache
 from easydel.layers.quantization.quantizers import EasyQuantizer
 
-from .._utils import ResultTokens, apply_temperature, apply_top_k, apply_top_p
+from .._utils import (
+	ResultTokens,
+	apply_temperature,
+	apply_top_k,
+	apply_top_p,
+	apply_filters,
+)
 
 if tp.TYPE_CHECKING:
 	from easydel.infra import EasyDeLBaseModule
@@ -291,15 +297,7 @@ def continuous_decode(
 	kv_cache = outputs.past_key_values
 	logits = outputs.logits[:, -1]
 
-	@partial(jax.vmap, in_axes=(0, 0, 0, 0), out_axes=(0))
-	def _apply_filters(logits, top_p, top_k, temperature):
-		logits = jnp.expand_dims(logits, 0)
-		logits = apply_temperature(logits, temperature.astype(logits.dtype))
-		logits = apply_top_k(logits, top_k)
-		logits = apply_top_p(logits, top_p.astype(logits.dtype))
-		return logits[0]
-
-	logits = _apply_filters(logits, state.top_p, state.top_k, state.temperature)
+	logits = apply_filters(logits, state.top_p, state.top_k, state.temperature)
 	next_token = jax.random.categorical(rngs, logits, axis=-1)[:, None]
 	lengths = jnp.full(
 		(batch_size, 1),

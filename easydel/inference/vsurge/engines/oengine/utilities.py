@@ -12,20 +12,92 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial
 
 import jax
+from flax import nnx as nn
 from jax import numpy as jnp
 
+from easydel.layers.caching.paged_attention import (
+	ModelInputBatch,
+	ModelOutputBatch,
+	PagedAttentionCache,
+)
+from easydel.layers.caching.paged_attention.managers import ModelIOProcessor
 
-from .._utils import apply_temperature, apply_top_k, apply_top_p
+from .._utils import apply_filters
 
 
-@partial(jax.vmap, in_axes=(0, 0, 0, 0), out_axes=(0))
-def _apply_filters(logits, top_p, top_k, temperature):
-	logits = jnp.expand_dims(logits, 0)
-	logits = apply_temperature(logits, temperature.astype(logits.dtype))
-	logits = apply_top_k(logits, top_k)
-	logits = apply_top_p(logits, top_p.astype(logits.dtype))
-	return logits[0]
+def execute_forward(
+	graphdef: nn.GraphDef,
+	graphgstate: nn.GraphState,
+	graphother: nn.GraphState,
+	model_inputs: ModelInputBatch,
+	eos_token_ids: jax.Array,
+	cache: PagedAttentionCache,
+	rngs: jax.random.PRNGKey,
+) -> ModelOutputBatch:
+	model = nn.merge(graphdef, graphgstate, graphother)
+	attn_meta = model_inputs.attn_meta
+	input_ids = model_inputs.input_ids
+	positions = model_inputs.positions
 
+	sampling_params = model_inputs.sampling_params
+
+	decode_mode = attn_meta.is_decode_mode()
+	expand_dim = 1 if decode_mode else 0
+	input_ids = jnp.expand_dims(input_ids, expand_dim)
+	positions = jnp.expand_dims(positions, expand_dim)
+	with model.mesh:
+		outputs = model(
+			input_ids=input_ids,
+			position_ids=positions,
+			past_key_values=cache,
+			cache_metadata=attn_meta,
+		)
+	logits = outputs.logits
+	cache = outputs.past_key_values
+
+	logits = apply_filters(
+		logits,
+		sampling_params.top_p,
+		sampling_params.top_k,
+		sampling_params.temperature,
+	).squeeze(expand_dim)
+
+	next_token = jax.random.categorical(rngs, logits, axis=-1)
+
+	complete = jnp.logical_or(
+		jnp.isin(next_token, eos_token_ids),
+		jnp.greater_equal(model_inputs.positions, sampling_params.max_tokens - 1),
+	)
+
+	padded_length = 0 if decode_mode else attn_meta.prefill_position.shape[0]
+
+	if len(attn_meta.decodes_position.shape) != 0 and padded_length != 0:
+		next_token = jnp.concatenate(
+			[
+				next_token.at[attn_meta.prefill_length - 1].get()[None],
+				next_token.at[padded_length:].get(),
+			]
+		)
+		complete = jnp.concatenate(
+			[
+				complete.at[attn_meta.prefill_length - 1].get()[None],
+				complete.at[padded_length:].get(),
+			]
+		)
+	elif padded_length != 0:
+		next_token = next_token.at[attn_meta.prefill_length - 1].get()[None]
+		complete = complete.at[attn_meta.prefill_length - 1].get()[None]
+
+	output = ModelIOProcessor.prepare_model_output(
+		next_token=next_token,
+		complete=complete,
+		attn_meta=attn_meta,
+		sampling_params=sampling_params,
+	)
+
+	return output, cache, jax.random.split(rngs, 2)[0]
+
+
+__all__ = ("execute_forward",)
