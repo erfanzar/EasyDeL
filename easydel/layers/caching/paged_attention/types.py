@@ -43,58 +43,61 @@ class SamplingParams:
 	    temperature (jax.Array): Sampling temperature.
 	"""
 
-	top_p: jax.Array
-	top_k: jax.Array
-	max_tokens: jax.Array
-	temperature: jax.Array
+	top_p: jax.Array | float = np.array([1.0])
+	top_k: jax.Array | int = np.array([1])
+	max_tokens: jax.Array | int = np.array([32])
+	temperature: jax.Array | float = np.array([1.0])
 
-	def __post_init__(self):
-		acceptin = (float, int)
+	def insert_from_task(self, slot, task: GenerationStepTask):
+		assert task.sampling_params.top_p.size == 1
+		self.top_p[slot] = task.sampling_params.top_p[0]
+		self.top_k[slot] = task.sampling_params.top_k[0]
+		self.max_tokens[slot] = task.sampling_params.max_tokens[0]
+		self.temperature[slot] = task.sampling_params.temperature[0]
 
-		if isinstance(self.top_p, acceptin):
-			self.top_p = jnp.array(float(self.top_p)).reshape(-1)
-		if isinstance(self.top_k, acceptin):
-			self.top_k = jnp.array(int(self.top_k)).reshape(-1)
-		if isinstance(self.max_tokens, acceptin):
-			self.max_tokens = jnp.array(int(self.max_tokens)).reshape(-1)
-		if isinstance(self.temperature, acceptin):
-			self.temperature = jnp.array(float(self.temperature)).reshape(-1)
-
-	def insert_from_task(self, slot: int, task: GenerationStepTask):
-		self.top_p[slot] = task.top_p
-		self.top_k[slot] = task.top_k
-		self.max_tokens[slot] = task.max_tokens
-		self.temperature[slot] = task.temperature
-
-	def insert_from_decode_state(
-		self,
-		insert_slots: jax.Array,
-		update: ActiveSequenceBatch,
-	):
-		self.top_p = self.top_p.at[insert_slots].set(update.sampling_params.top_p)
-		self.top_k = self.top_k.at[insert_slots].set(update.sampling_params.top_k)
-
-		self.max_tokens = self.max_tokens.at[insert_slots].set(
-			update.sampling_params.max_tokens
-		)
-		self.temperature = self.temperature.at[insert_slots].set(
-			update.sampling_params.temperature
-		)
-
-	def move_to_device(self, sharding: Ns):
-		assert self.is_active
-		self.top_p = jax.device_put(self.top_p, sharding)
-		self.top_k = jax.device_put(self.top_k, sharding)
-		self.max_tokens = jax.device_put(self.max_tokens, sharding)
-		self.temperature = jax.device_put(self.temperature, sharding)
+	def insert_decode_state(self, insert_slots: jax.Array, update: ActiveSequenceBatch):
+		smp = update.sampling_params
+		self.top_p = self.top_p.at[insert_slots].set(smp.top_p)
+		self.top_k = self.top_k.at[insert_slots].set(smp.top_k)
+		self.max_tokens = self.max_tokens.at[insert_slots].set(smp.max_tokens)
+		self.temperature = self.temperature.at[insert_slots].set(smp.temperature)
 
 	@classmethod
-	def init_numpy(cls, metadata: PagedAttentionMetadata):
+	def init_jax(cls, metadata: PagedAttentionCacheMetaData, sharding):
 		return cls(
-			top_p=jnp.full((metadata.batch_size,), 1, jnp.float32),
-			top_k=jnp.full((metadata.batch_size,), 0, jnp.int32),
-			max_tokens=jnp.full((metadata.batch_size,), 16, jnp.int32),
-			temperature=jnp.full((metadata.batch_size,), 1, jnp.float32),
+			top_p=jnp.full(
+				shape=(metadata.batch_size,),
+				fill_value=1,
+				dtype=jnp.float32,
+				device=sharding,
+			),
+			top_k=jnp.full(
+				shape=(metadata.batch_size,),
+				fill_value=1,
+				dtype=jnp.int32,
+				device=sharding,
+			),
+			max_tokens=jnp.full(
+				shape=(metadata.batch_size,),
+				fill_value=1e6,
+				dtype=jnp.int32,
+				device=sharding,
+			),
+			temperature=jnp.full(
+				shape=(metadata.batch_size,),
+				fill_value=1e6,
+				dtype=jnp.float32,
+				device=sharding,
+			),
+		)
+
+	@classmethod
+	def init_numpy(cls, metadata: PagedAttentionCacheMetaData):
+		return cls(
+			top_p=np.full((metadata.batch_size,), 1e6, dtype=np.float32),
+			top_k=np.full((metadata.batch_size,), 1e6, dtype=np.int32),
+			max_tokens=np.full((metadata.batch_size,), 1e6, dtype=np.int32),
+			temperature=np.full((metadata.batch_size,), 1e6, dtype=np.float32),
 		)
 
 	@classmethod
@@ -103,29 +106,7 @@ class SamplingParams:
 			jnp.asarray(1e6, dtype=jnp.int32),
 			Ns(es.get_incontext_mesh(), Ps()),
 		)
-		return cls(
-			top_p=scalar,
-			top_k=scalar,
-			max_tokens=scalar,
-			temperature=scalar,
-		)
-
-	@classmethod
-	def create(
-		cls,
-		metadata: PagedAttentionCacheMetaData,
-		mesh: common_types.Mesh,
-	):
-		d1replicate = Ns(mesh, Ps(None))
-		return cls(
-			top_p=jnp.full((metadata.batch_size,), 1, jnp.float32, device=d1replicate),
-			top_k=jnp.full((metadata.batch_size,), 0, jnp.int32, device=d1replicate),
-			max_tokens=jnp.full((metadata.batch_size,), 16, jnp.int32, device=d1replicate),
-			temperature=jnp.full((metadata.batch_size,), 1, jnp.float32, device=d1replicate),
-		)
-
-	def is_active(self):
-		return len(self.top_p.shape) > 0
+		return cls(top_p=scalar, top_k=scalar, max_tokens=scalar, temperature=scalar)
 
 
 @auto_pytree
@@ -148,12 +129,14 @@ class InitialSequenceRequest:
 	    prompt_token_ids (list[int]): The original list of token IDs for the complete prompt.
 	"""
 
+	# Runtime Arguments
 	token_ids: jax.Array
 	positions: jax.Array
 	page_indices: jax.Array
 
-	# sampling_params: SamplingParams
+	sampling_params: SamplingParams
 
+	# Scheduler Arguments
 	id: tp.Optional[str | int]
 	chunk_idx: tp.Optional[int]
 	chunk_size: tp.Optional[int]
@@ -180,8 +163,10 @@ class InitialSequenceRequest:
 		self.token_ids = prefill.token_ids
 		self.positions = prefill.positions
 		self.page_indices = np.array(prefill.page_indices)
+
+		self.sampling_params = prefill.sampling_params
+
 		self.length = length
-		# self.sampling_params = prefill.sampling_params
 
 	@classmethod
 	def init_empty(cls):
@@ -201,10 +186,10 @@ class InitialSequenceRequest:
 			chunk_idx=None,
 			token_ids=scalar,
 			positions=scalar,
+			sampling_params=SamplingParams.init_empty(),
 			chunk_size=512,
 			page_indices=scalar,
 			prompt_token_ids=None,
-			# sampling_params=SamplingParams.init_empty(),
 		)
 
 	@classmethod
@@ -215,7 +200,7 @@ class InitialSequenceRequest:
 		chunk_size: int,
 		prompt_token_ids: list[int],
 		prefill_length: tp.Optional[int] = None,
-		# sampling_params: tp.Optional[SamplingParams] = None,
+		sampling_params: tp.Optional[SamplingParams] = None,
 	):
 		"""
 		Factory method to create a InitialSequenceRequest from a list of prompt token IDs.
@@ -247,23 +232,40 @@ class InitialSequenceRequest:
 		token_ids = jax.device_put(padded_token_ids, sharding)
 		positions = np.arange(0, token_ids.shape[0])
 		positions = jax.device_put(positions, sharding)
-		# if sampling_params is None:
-		# 	sampling_params = SamplingParams(
-		# 		top_k=1,
-		# 		top_p=1,
-		# 		max_tokens=16,
-		# 		temperature=1,
-		# 	)
-		# sampling_params.move_to_device(sharding)
+		if sampling_params is None:
+			sampling_params = SamplingParams()
+
+		top_p = jax.device_put(
+			np.array([sampling_params.top_p]).reshape(-1),
+			sharding,
+		)
+		top_k = jax.device_put(
+			np.array([sampling_params.top_k]).reshape(-1),
+			sharding,
+		)
+		max_tokens = jax.device_put(
+			np.array([sampling_params.max_tokens]).reshape(-1),
+			sharding,
+		)
+		temperature = jax.device_put(
+			np.array([sampling_params.temperature]).reshape(-1),
+			sharding,
+		)
+
 		return InitialSequenceRequest(
 			id=uuid.uuid4(),
 			prompt_token_ids=prompt_token_ids,
 			chunk_idx=0,
-			# sampling_params=sampling_params,
 			chunk_size=chunk_size,
 			page_indices=page_indices,
 			token_ids=token_ids,
 			positions=positions,
+			sampling_params=SamplingParams(
+				top_p=top_p,
+				top_k=top_k,
+				max_tokens=max_tokens,
+				temperature=temperature,
+			),
 		)
 
 
@@ -316,6 +318,7 @@ class GenerationStepTask:
 	position: int
 	page_indices: list[int]
 	prefill_token_id: jax.Array
+	sampling_params: SamplingParams
 
 
 @auto_pytree
@@ -372,7 +375,8 @@ class ActiveSequenceBatch:
 	positions: jax.Array
 	page_table: jax.Array
 
-	# sampling_params: SamplingParams
+	# Inference Arguments
+	sampling_params: SamplingParams
 
 	available_slots: tp.Optional[queue.SimpleQueue]
 	active_slot_requests_map: tp.Optional[tp.Dict[int, GenerationStepTask]]
@@ -392,8 +396,8 @@ class ActiveSequenceBatch:
 
 		self.token_ids = self.token_ids.at[insert_slots].set(update.token_ids)
 		self.positions = self.positions.at[insert_slots].set(update.positions)
-		# self.sampling_params.insert_from_decode_state(insert_slots, update)
 		self.page_table = self.page_table.at[insert_slots, :].set(update.page_table)
+		self.sampling_params.insert_decode_state(insert_slots, update)
 
 		self.page_table = self.page_table.at[
 			update.page_update_slots,
@@ -422,15 +426,16 @@ class ActiveSequenceBatch:
 	def copy_decode(self, decode: ActiveSequenceBatch):
 		self.token_ids = decode.token_ids
 		self.positions = decode.positions
-		# self.sampling_params = decode.sampling_params
 		self.page_table = decode.page_table
+		self.sampling_params = decode.sampling_params
 
 	def insert_from_task(self, slot, task: GenerationStepTask):
 		assert isinstance(self.token_ids, list)
+
 		self.token_ids.append(task.prefill_token_id)
 		self.positions[slot] = task.position
-		# self.sampling_params.insert_from_task(slot, task)
 		self.page_table[slot] = np.array(task.page_indices)
+		self.sampling_params.insert_from_task(slot, task)
 
 	@classmethod
 	def init_numpy(cls, metadata: PagedAttentionCacheMetaData):
@@ -443,10 +448,10 @@ class ActiveSequenceBatch:
 			available_slots=None,
 			active_slot_requests_map=None,
 			context_lock=None,
+			sampling_params=SamplingParams.init_numpy(metadata),
 			page_update_slots=np.full((metadata.batch_size,), 1e6, dtype=np.int32),
 			page_update_page_idxs=np.full((metadata.batch_size,), 1e6, dtype=np.int32),
 			page_update_mapped_idxs=np.full((metadata.batch_size,), 1e6, dtype=np.int32),
-			# sampling_params=SamplingParams.init_numpy(metadata),
 		)
 
 	@classmethod
@@ -459,13 +464,13 @@ class ActiveSequenceBatch:
 			token_ids=scalar,
 			positions=scalar,
 			page_table=scalar,
+			sampling_params=SamplingParams.init_empty(),
 			available_slots=None,
 			active_slot_requests_map=None,
 			context_lock=None,
 			page_update_slots=scalar,
 			page_update_page_idxs=scalar,
 			page_update_mapped_idxs=scalar,
-			# sampling_params=SamplingParams.init_empty(),
 		)
 
 	@classmethod
@@ -507,9 +512,9 @@ class ActiveSequenceBatch:
 				dtype=jnp.int32,
 				device=d2replicate,
 			),
+			sampling_params=SamplingParams.init_jax(metadata, d1replicate),
 			available_slots=slots,
 			active_slot_requests_map={},
-			# sampling_params=SamplingParams.create(metadata, mesh),
 		)
 
 
@@ -528,6 +533,7 @@ class ModelInputBatch(xTree):
 	input_ids: jax.Array
 	positions: jax.Array
 	attn_meta: PagedAttentionMetadata
+	sampling_params: SamplingParams
 
 
 @auto_pytree
@@ -551,10 +557,14 @@ class ModelOutputBatch:
 
 	prefill_complete: jax.Array
 	decodes_completes: jax.Array
+
 	prefill_token_id: jax.Array
 	decodes_token_ids: jax.Array
+
 	prefill_next_position: jax.Array
 	decodes_next_position: jax.Array
+
+	next_sampling_params: SamplingParams
 
 	@classmethod
 	def init_empty(cls):
@@ -573,6 +583,7 @@ class ModelOutputBatch:
 			decodes_token_ids=vector,
 			prefill_next_position=vector,
 			decodes_next_position=scalar,
+			next_sampling_params=SamplingParams.init_empty(),
 		)
 
 

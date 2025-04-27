@@ -12,20 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from .managers import (
-	InferenceScheduler,
 	HBMPageManager,
+	InferenceScheduler,
 	ModelIOProcessor,
-)
-from .types import (
-	SlotPageAssignment,
-	GenerationStepTask,
-	ActiveSequenceBatch,
-	InitialSequenceRequest,
-	AllocatedPrefillPages,
-	ModelInputBatch,
-	ModelOutputBatch,
-	ModelOutputSummary,
-	NextIterationPlan,
 )
 from .paged_attention_cache import (
 	PagedAttentionCache,
@@ -33,9 +22,22 @@ from .paged_attention_cache import (
 	PagedAttentionCacheView,
 	PagedAttentionMetadata,
 )
+from .types import (
+	ActiveSequenceBatch,
+	AllocatedPrefillPages,
+	GenerationStepTask,
+	InitialSequenceRequest,
+	ModelInputBatch,
+	ModelOutputBatch,
+	ModelOutputSummary,
+	NextIterationPlan,
+	SamplingParams,
+	SlotPageAssignment,
+)
 
 __all__ = (
 	"InferenceScheduler",
+	"SamplingParams",
 	"SlotPageAssignment",
 	"HBMPageManager",
 	"GenerationStepTask",
