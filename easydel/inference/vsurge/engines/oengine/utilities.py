@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import typing as tp
 
 import jax
 from flax import nnx as nn
@@ -35,7 +36,31 @@ def execute_forward(
 	eos_token_ids: jax.Array,
 	cache: PagedAttentionCache,
 	rngs: jax.random.PRNGKey,
-) -> ModelOutputBatch:
+) -> tp.Union[ModelOutputBatch, PagedAttentionCache, jax.random.PRNGKey]:
+	"""Executes a single forward pass of the model using paged attention.
+
+	This function handles both the prefill and decode phases of generation.
+	It merges the model graph definition and states, performs the forward pass,
+	applies sampling filters to the logits, samples the next token, and
+	determines if the sequence generation is complete for each sequence in the batch.
+
+	Args:
+			graphdef: The static definition of the model graph (nn.GraphDef).
+			graphgstate: The trainable state of the model graph (nn.GraphState).
+			graphother: Other non-trainable state/variables of the model graph (nn.GraphState).
+			model_inputs: A `ModelInputBatch` containing token IDs, positions,
+					sampling parameters, and attention metadata for the current batch.
+			eos_token_ids: A JAX array containing the end-of-sequence token IDs.
+			cache: The `PagedAttentionCache` holding the current Key-Value cache state.
+			rngs: A JAX PRNG key used for sampling the next token.
+
+	Returns:
+			A tuple containing:
+					- output: A `ModelOutputBatch` with the generated next tokens and
+						their completion status.
+					- cache: The updated `PagedAttentionCache` after the forward pass.
+					- new_rng: A new JAX PRNG key split from the input `rngs` for future use.
+	"""
 	model = nn.merge(graphdef, graphgstate, graphother)
 	attn_meta = model_inputs.attn_meta
 	input_ids = model_inputs.input_ids
