@@ -33,14 +33,21 @@ from .paged_attention_cache import PagedAttentionCacheMetaData, PagedAttentionMe
 
 @auto_pytree
 class SamplingParams:
-	"""
-	Data class for sampling configuration parameters for text generation.
+	"""Configuration parameters for controlling text generation sampling.
+
+	This class holds parameters that influence the sampling process during
+	text generation, such as top-p (nucleus) sampling, top-k sampling,
+	maximum token generation, and temperature scaling.
 
 	Attributes:
-	    top_p (jax.Array): Nucleus sampling probability threshold.
-	    top_k (jax.Array): Top-k sampling token limit.
-	    max_tokens (jax.Array): Maximum number of tokens to generate.
-	    temperature (jax.Array): Sampling temperature.
+	    top_p (jax.Array | float): The probability threshold for nucleus sampling.
+	        Defaults to 1.0 (no nucleus sampling).
+	    top_k (jax.Array | int): The number of top probability tokens to consider
+	        for sampling. Defaults to 1 (greedy).
+	    max_tokens (jax.Array | int): The maximum number of tokens to generate
+	        for a sequence. Defaults to 32.
+	    temperature (jax.Array | float): The temperature for scaling logits before
+	        sampling. Defaults to 0.0 (deterministic).
 	"""
 
 	top_p: jax.Array | float = np.array([1.0])
@@ -48,7 +55,14 @@ class SamplingParams:
 	max_tokens: jax.Array | int = np.array([32])
 	temperature: jax.Array | float = np.array([0.0])
 
-	def insert_from_task(self, slot, task: GenerationStepTask):
+	def insert_from_task(self, slot: int, task: GenerationStepTask):
+		"""Inserts sampling parameters from a GenerationStepTask into a specific slot.
+
+		Args:
+		    slot (int): The batch slot index to insert the parameters into.
+		    task (GenerationStepTask): The task containing the sampling parameters
+		        to insert.
+		"""
 		assert task.sampling_params.top_p.size == 1
 		self.top_p[slot] = task.sampling_params.top_p[0]
 		self.top_k[slot] = task.sampling_params.top_k[0]
@@ -56,6 +70,13 @@ class SamplingParams:
 		self.temperature[slot] = task.sampling_params.temperature[0]
 
 	def insert_decode_state(self, insert_slots: jax.Array, update: ActiveSequenceBatch):
+		"""Updates sampling parameters in specified slots from an ActiveSequenceBatch.
+
+		Args:
+		    insert_slots (jax.Array): An array of slot indices to update.
+		    update (ActiveSequenceBatch): The batch containing the new sampling
+		        parameters.
+		"""
 		smp = update.sampling_params
 		self.top_p = self.top_p.at[insert_slots].set(smp.top_p)
 		self.top_k = self.top_k.at[insert_slots].set(smp.top_k)
@@ -63,7 +84,18 @@ class SamplingParams:
 		self.temperature = self.temperature.at[insert_slots].set(smp.temperature)
 
 	@classmethod
-	def init_jax(cls, metadata: PagedAttentionCacheMetaData, sharding):
+	def init_jax(
+		cls, metadata: PagedAttentionCacheMetaData, sharding: jax.sharding.NamedSharding
+	) -> "SamplingParams":
+		"""Initializes SamplingParams with JAX arrays on the specified device/sharding.
+
+		Args:
+		    metadata (PagedAttentionCacheMetaData): Metadata containing batch size.
+		    sharding (jax.sharding.NamedSharding): The JAX sharding configuration.
+
+		Returns:
+		    SamplingParams: An initialized SamplingParams object with JAX arrays.
+		"""
 		return cls(
 			top_p=jnp.full(
 				shape=(metadata.batch_size,),
@@ -92,7 +124,15 @@ class SamplingParams:
 		)
 
 	@classmethod
-	def init_numpy(cls, metadata: PagedAttentionCacheMetaData):
+	def init_numpy(cls, metadata: PagedAttentionCacheMetaData) -> SamplingParams:
+		"""Initializes SamplingParams with NumPy arrays.
+
+		Args:
+		    metadata (PagedAttentionCacheMetaData): Metadata containing batch size.
+
+		Returns:
+		    SamplingParams: An initialized SamplingParams object with NumPy arrays.
+		"""
 		return cls(
 			top_p=np.full((metadata.batch_size,), 1e6, dtype=np.float32),
 			top_k=np.full((metadata.batch_size,), 1e6, dtype=np.int32),
@@ -101,7 +141,12 @@ class SamplingParams:
 		)
 
 	@classmethod
-	def init_empty(cls):
+	def init_empty(cls) -> "SamplingParams":
+		"""Creates an empty SamplingParams placeholder with scalar JAX arrays.
+
+		Returns:
+		    SamplingParams: A placeholder SamplingParams object.
+		"""
 		scalar = jax.device_put(
 			jnp.asarray(1e6, dtype=jnp.int32),
 			Ns(es.get_incontext_mesh(), Ps()),
@@ -111,22 +156,32 @@ class SamplingParams:
 
 @auto_pytree
 class InitialSequenceRequest:
-	"""
-	Represents a new request that needs to be processed during the prefill phase
-	of paged attention. It holds information necessary to initialize the attention
-	state for a given prompt.
+	"""Represents a request for processing a new sequence during the prefill phase.
+
+	This class encapsulates the information needed to process a new input sequence
+	(prompt) in the paged attention mechanism. It includes the token IDs,
+	positions, allocated page indices, and associated metadata.
 
 	Attributes:
-	    id (str | int): A unique identifier for the request.
-	    chunk_idx (int): The index of the current chunk being processed for this request.
-	        Used when the prompt is processed in multiple chunks.
-	    token_ids (jax.Array): The JAX array containing the token IDs for the prefill phase.
-	        This might be padded to a fixed length.
-	    positions (jax.Array): The JAX array containing the corresponding positions for the token IDs.
-	    chunk_size (int): The size of the chunk being processed in this prefill step.
-	    page_indices (list[int]): A list to hold the indices of the HBM pages allocated
-	        for this request's KV cache. Initialized with zeros.
-	    prompt_token_ids (list[int]): The original list of token IDs for the complete prompt.
+	    token_ids (jax.Array): JAX array of token IDs for the prefill sequence,
+	        potentially padded. (Runtime Argument)
+	    positions (jax.Array): JAX array of position IDs corresponding to `token_ids`.
+	        (Runtime Argument)
+	    page_indices (jax.Array): JAX array holding the indices of HBM pages
+	        allocated for this request's KV cache. (Runtime Argument)
+	    sampling_params (SamplingParams): Sampling parameters for this specific
+	        request. (Runtime Argument)
+	    id (tp.Optional[str | int]): A unique identifier for the request.
+	        (Scheduler Argument)
+	    chunk_idx (tp.Optional[int]): The index of the current chunk being processed
+	        if the prompt is chunked. (Scheduler Argument)
+	    chunk_size (tp.Optional[int]): The size of the token chunk being processed
+	        in this prefill step. (Scheduler Argument)
+	    prompt_token_ids (tp.Optional[list[int]]): The original list of token IDs
+	        for the complete prompt. (Scheduler Argument)
+	    length (tp.Optional[jax.Array]): The actual length of the sequence processed
+	        so far (relevant for chunked prefill). Defaults to None.
+	        (Scheduler Argument)
 	"""
 
 	# Runtime Arguments
@@ -145,15 +200,24 @@ class InitialSequenceRequest:
 
 	@property
 	def is_active(self):
-		"""Whether the sequence request is active (token_ids non-empty)."""
+		"""Checks if the request is active (i.e., has associated token IDs).
+
+		Returns:
+		    bool: True if `token_ids` is a non-empty array, False otherwise.
+		"""
 		return len(self.token_ids.shape) > 0
 
 	def copy_prefill(self, prefill: InitialSequenceRequest):
-		"""
-		Copies relevant state from another InitialSequenceRequest.
+		"""Copies runtime state from another InitialSequenceRequest (prefill source).
+
+		This method updates the current request's runtime attributes (`token_ids`,
+		`positions`, `page_indices`, `sampling_params`, `length`) based on the
+		state of a source `prefill` request, typically used when advancing
+		through chunks of a long prompt.
 
 		Args:
-		    prefill (InitialSequenceRequest): Source request to copy state from.
+		    prefill (InitialSequenceRequest): The source request from which to copy
+		        runtime state.
 		"""
 		length = (prefill.chunk_idx + 1) * prefill.chunk_size
 		total_length = len(prefill.prompt_token_ids)
@@ -170,8 +234,10 @@ class InitialSequenceRequest:
 
 	@classmethod
 	def init_empty(cls):
-		"""
-		Creates an empty InitialSequenceRequest placeholder with default values.
+		"""Creates an empty InitialSequenceRequest placeholder.
+
+		Initializes attributes with placeholder scalar JAX arrays suitable for
+		use in contexts where a valid request might not be present (e.g., padding).
 
 		Returns:
 		    InitialSequenceRequest: A placeholder request object.
@@ -202,19 +268,25 @@ class InitialSequenceRequest:
 		prefill_length: tp.Optional[int] = None,
 		sampling_params: tp.Optional[SamplingParams] = None,
 	):
-		"""
-		Factory method to create a InitialSequenceRequest from a list of prompt token IDs.
+		"""Creates an InitialSequenceRequest from prompt token IDs.
+
+		This factory method takes a list of token IDs and prepares them for
+		the prefill phase, including padding, creating position IDs, initializing
+		page indices, and setting up sampling parameters. Arrays are placed
+		on the specified JAX mesh.
 
 		Args:
-		    mesh (common_types.Mesh): The JAX device mesh for distributing arrays.
-		    metadata (PagedAttentionCacheMetaData): Metadata about the paged attention cache configuration.
-		    chunk_size (int): The size of chunks for processing the prefill.
-		    prompt_token_ids (list[int]): The list of token IDs representing the input prompt.
-		    prefill_length (tp.Optional[int]): The target length for padding the prefill tokens.
+		    mesh (common_types.Mesh): The JAX device mesh for array distribution.
+		    metadata (PagedAttentionCacheMetaData): Paged attention cache configuration.
+		    chunk_size (int): The size for potential chunking during prefill.
+		    prompt_token_ids (list[int]): The input prompt token IDs.
+		    prefill_length (tp.Optional[int]): Target length for padding token IDs.
 		        Defaults to `metadata.max_sequences`.
+		    sampling_params (tp.Optional[SamplingParams]): Custom sampling parameters.
+		        If None, default parameters are used.
 
 		Returns:
-		    InitialSequenceRequest: An initialized InitialSequenceRequest object.
+		    InitialSequenceRequest: An initialized request object ready for prefill.
 		"""
 		if prefill_length is None:
 			prefill_length = metadata.max_sequences
@@ -271,12 +343,14 @@ class InitialSequenceRequest:
 
 @auto_pytree
 class AllocatedPrefillPages:
-	"""
-	Represents an update containing the indices of newly allocated HBM pages
-	during a prefill step.
+	"""Holds the indices of HBM pages allocated during a prefill step.
+
+	This simple structure is used to communicate which physical memory pages
+	have been assigned to a sequence during its prefill processing.
 
 	Attributes:
-	    page_indices (list[int]): A list of HBM page indices allocated for a prefill chunk.
+	    page_indices (list[int]): A list containing the indices of the HBM
+	        (High Bandwidth Memory) pages allocated for a specific prefill chunk.
 	"""
 
 	page_indices: list[int]
@@ -284,14 +358,17 @@ class AllocatedPrefillPages:
 
 @auto_pytree
 class SlotPageAssignment:
-	"""
-	Represents an update to a specific page mapping within the decode state's page table.
-	This is used when a new page needs to be assigned to a sequence during the decoding phase.
+	"""Represents the assignment of a physical page to a logical page slot.
+
+	During decoding, as sequences grow, new physical memory pages might be
+	allocated. This class represents the update instruction to map a specific
+	logical page index within a sequence's page table (identified by its `slot`)
+	to a newly allocated physical HBM page index (`mapped_idx`).
 
 	Attributes:
-	    slot (int): The slot index in the batch dimension corresponding to the sequence being updated.
-	    page_idx (int): The logical page index within the sequence's page table that needs updating.
-	    mapped_idx (int): The physical HBM page index that the logical page index should now point to.
+	    slot (int): The batch slot index of the sequence whose page table is updated.
+	    page_idx (int): The logical page index within the sequence's page table.
+	    mapped_idx (int): The physical HBM page index to map the logical page to.
 	"""
 
 	slot: int
@@ -301,16 +378,22 @@ class SlotPageAssignment:
 
 @auto_pytree
 class GenerationStepTask:
-	"""
-	Represents a request currently in the decoding (generation) phase.
+	"""Represents a sequence actively undergoing token generation (decoding).
+
+	This class holds the necessary information for a single sequence that is
+	currently in the decoding phase within the paged attention batch.
 
 	Attributes:
-	    id (str): The unique identifier of the original request.
-	    slot (int): The assigned slot index within the batch dimension for this request.
-	    position (int): The current sequence position (length) for this request during decoding.
-	    page_indices (list[int]): The list of HBM page indices currently allocated to this request.
-	    prefill_token_id (jax.Array): The token ID generated during the last step (prefill or decode)
-	        which is the input for the current decode step.
+	    id (str): The unique identifier tracing back to the original request.
+	    slot (int): The assigned batch slot index for this sequence.
+	    position (int): The current sequence length (position) for the next token.
+	    page_indices (list[int]): The list of physical HBM page indices allocated
+	        to this sequence's KV cache.
+	    prefill_token_id (jax.Array): The token ID generated in the *previous* step
+	        (either prefill or the last decode step), which serves as input for
+	        the *current* decode step.
+	    sampling_params (SamplingParams): The sampling parameters associated with
+	        this specific generation task.
 	"""
 
 	id: str
@@ -323,21 +406,27 @@ class GenerationStepTask:
 
 @auto_pytree
 class NextIterationPlan:
-	"""
-	Holds the results of a scheduling decision, indicating which operations (prefill, decode)
-	should be performed in the next model iteration and the necessary data updates.
+	"""Encapsulates the scheduling decisions for the next model iteration.
+
+	Based on available resources (like HBM pages and batch slots) and pending
+	requests, the scheduler produces this plan, detailing which prefill and
+	decode operations to execute next, along with necessary state updates.
 
 	Attributes:
-	    prefill_request (InitialSequenceRequest | None): The prefill request selected for the next iteration,
-	        or None if no prefill is scheduled.
-	    schedule_prefill (bool): Flag indicating whether a prefill operation should be run.
-	    schedule_decodes (bool): Flag indicating whether a decode operation should be run.
-	    prefill_pages_update (AllocatedPrefillPages | None): Contains the newly allocated pages if a
-	        prefill operation is scheduled and required page allocation.
-	    new_decodes_requests (list[GenerationStepTask]): A list of decode requests that are newly added
-	        to the batch in this scheduling step.
-	    decodes_state_page_updates (list[SlotPageAssignment]): A list of updates to the decode state's
-	        page table required for ongoing decode requests.
+	    prefill_request (InitialSequenceRequest): The prefill request scheduled for
+	        the next iteration. Can be an empty/placeholder request if no prefill
+	        is scheduled.
+	    schedule_prefill (bool): True if a prefill operation should be executed.
+	    schedule_decodes (bool): True if decode operations should be executed.
+	    prefill_pages_update (AllocatedPrefillPages): Contains the indices of pages
+	        newly allocated for the scheduled prefill request. Can be empty if no
+	        new pages were needed or no prefill is scheduled.
+	    new_decodes_requests (list[GenerationStepTask]): A list of sequences that
+	        are newly transitioning into the decode phase in this iteration (e.g.,
+	        after completing prefill).
+	    decodes_state_page_updates (list[SlotPageAssignment]): A list of updates
+	        to the page tables of sequences already in the decode phase, typically
+	        due to new page allocations for them.
 	"""
 
 	prefill_request: InitialSequenceRequest
@@ -353,22 +442,39 @@ class NextIterationPlan:
 
 @auto_pytree
 class ActiveSequenceBatch:
-	"""
-	Maintains the state required for the decoding phase of paged attention for a batch of requests.
-	This includes token IDs, positions, page tables, sampling parameters, and management of active slots.
+	"""Manages the batch state for sequences in the decoding phase.
+
+	This class holds the dynamic state for all sequences currently undergoing
+	token generation (decoding) within the paged attention batch. It includes
+	the input token IDs for the next step, current positions, page table mappings,
+	sampling parameters, and structures for managing available batch slots.
 
 	Attributes:
-	    token_ids (jax.Array): JAX array holding the most recently generated token ID for each active slot.
-	        Shape: (batch_size,).
-	    positions (jax.Array): JAX array holding the current sequence position (length) for each active slot.
-	        Initialized with -1 for inactive slots. Shape: (batch_size,).
-	    page_table (jax.Array): JAX array representing the mapping from logical page indices to physical
-	        HBM page indices for each active slot. Shape: (batch_size, num_pages_per_sequence).
-	    available_slots (queue.SimpleQueue): A queue holding the indices of batch slots that are currently free.
-	    active_slot_requests_map (dict[int, GenerationStepTask]): A dictionary mapping active slot indices
-	        to their corresponding GenerationStepTask objects.
-	    context_lock (threading.Lock): A lock to ensure thread-safe access and modification of the decode state,
-	        particularly `available_slots` and `active_slot_requests_map`.
+	    token_ids (jax.Array | tp.List[int]): JAX array (during model execution) or
+	        list (during host-side updates) holding the input token ID for the
+	        *next* decode step for each active slot. Shape: (batch_size,).
+	    positions (jax.Array): JAX array holding the current sequence position
+	        (length) for each active slot. Inactive slots might have a placeholder
+	        value (e.g., -1 or 1e6). Shape: (batch_size,).
+	    page_table (jax.Array): JAX array mapping logical page indices to physical
+	        HBM page indices for each sequence slot.
+	        Shape: (batch_size, num_pages_per_sequence).
+	    sampling_params (SamplingParams): Sampling parameters for all sequences
+	        in the batch. (Inference Argument)
+	    available_slots (tp.Optional[queue.SimpleQueue]): A queue managing indices
+	        of free batch slots. Used by the host-side scheduler. (Scheduler Argument)
+	    active_slot_requests_map (tp.Optional[tp.Dict[int, GenerationStepTask]]):
+	        A dictionary mapping active slot indices to their corresponding
+	        GenerationStepTask. Used by the host-side scheduler. (Scheduler Argument)
+	    context_lock (tp.Optional[threading.Lock]): A lock for thread-safe updates
+	        to scheduler-related attributes (`available_slots`,
+	        `active_slot_requests_map`). (Scheduler Argument)
+	    page_update_slots (tp.Optional[jax.Array]): Array storing slot indices for
+	        pending page table updates. (Internal State)
+	    page_update_page_idxs (tp.Optional[jax.Array]): Array storing logical page
+	        indices for pending page table updates. (Internal State)
+	    page_update_mapped_idxs (tp.Optional[jax.Array]): Array storing physical
+	        mapped indices for pending page table updates. (Internal State)
 	"""
 
 	token_ids: jax.Array | tp.List[int]
@@ -388,10 +494,23 @@ class ActiveSequenceBatch:
 
 	@property
 	def is_active(self):
-		"""Whether the sequence request is active (token_ids non-empty)."""
+		"""Checks if the batch state is active (i.e., has associated token IDs).
+
+		Returns:
+		    bool: True if `token_ids` is a non-empty array, False otherwise.
+		"""
 		return len(self.token_ids.shape) > 0
 
 	def insert_decode_state(self, insert_slots: jax.Array, update: ActiveSequenceBatch):
+		"""Updates the decode state in specified slots from another batch state.
+
+		This is typically used during JAX computation to incorporate updates from
+		newly scheduled decode tasks or page table modifications.
+
+		Args:
+		    insert_slots (jax.Array): An array of slot indices to update.
+		    update (ActiveSequenceBatch): The batch containing the new state to insert.
+		"""
 		update.token_ids = jnp.asarray(update.token_ids)
 
 		self.token_ids = self.token_ids.at[insert_slots].set(update.token_ids)
@@ -404,7 +523,16 @@ class ActiveSequenceBatch:
 			update.page_update_page_idxs,
 		].set(update.page_update_mapped_idxs)
 
-	def apply_assignment(self, assignment: SlotPageAssignment):
+	def apply_assignment(self, assignment: list[SlotPageAssignment]):
+		"""Applies page table assignments to the internal update arrays (host-side).
+
+		This method populates the `page_update_*` arrays based on a list of
+		`SlotPageAssignment` objects, preparing them for later use in JAX
+		computations (`insert_decode_state`).
+
+		Args:
+		    assignment (list[SlotPageAssignment]): A list of page assignments to apply.
+		"""
 		assert self.page_update_slots is not None
 		assert self.page_update_page_idxs is not None
 		assert self.page_update_mapped_idxs is not None
@@ -414,7 +542,15 @@ class ActiveSequenceBatch:
 			self.page_update_page_idxs[i] = update.page_idx
 			self.page_update_mapped_idxs[i] = update.mapped_idx
 
-	def pad_tokens(self, pad_length):
+	def pad_tokens(self, pad_length: int):
+		"""Pads the host-side token list with placeholder scalars.
+
+		Ensures the `token_ids` list (when used host-side) reaches the required
+		`pad_length` by appending placeholder scalar JAX arrays.
+
+		Args:
+		    pad_length (int): The target length for the `token_ids` list.
+		"""
 		scalar = jax.device_put(
 			jnp.asarray(1e6, dtype=jnp.int32),
 			Ns(es.get_incontext_mesh(), Ps()),
@@ -424,12 +560,31 @@ class ActiveSequenceBatch:
 			self.token_ids.append(scalar)
 
 	def copy_decode(self, decode: ActiveSequenceBatch):
+		"""Copies essential decode state from another ActiveSequenceBatch (host-side).
+
+		Updates the current object's `token_ids`, `positions`, `page_table`, and
+		`sampling_params` based on the source `decode` object. Assumes host-side
+		operation.
+
+		Args:
+		    decode (ActiveSequenceBatch): The source batch state to copy from.
+		"""
 		self.token_ids = decode.token_ids
 		self.positions = decode.positions
 		self.page_table = decode.page_table
 		self.sampling_params = decode.sampling_params
 
-	def insert_from_task(self, slot, task: GenerationStepTask):
+	def insert_from_task(self, slot: int, task: GenerationStepTask):
+		"""Inserts state from a GenerationStepTask into a specific slot (host-side).
+
+		Updates the host-side representations (`token_ids` list, `positions` array,
+		`page_table` array, `sampling_params`) for the given `slot` based on the
+		provided `task`.
+
+		Args:
+		    slot (int): The batch slot index to insert the task state into.
+		    task (GenerationStepTask): The task containing the state to insert.
+		"""
 		assert isinstance(self.token_ids, list)
 
 		self.token_ids.append(task.prefill_token_id)
@@ -438,7 +593,19 @@ class ActiveSequenceBatch:
 		self.sampling_params.insert_from_task(slot, task)
 
 	@classmethod
-	def init_numpy(cls, metadata: PagedAttentionCacheMetaData):
+	def init_numpy(cls, metadata: PagedAttentionCacheMetaData) -> ActiveSequenceBatch:
+		"""Initializes ActiveSequenceBatch with NumPy arrays for host-side use.
+
+		Creates the necessary arrays (`positions`, `page_table`, `page_update_*`)
+		using NumPy, suitable for manipulation outside JAX computations.
+		`token_ids` is initialized as an empty list.
+
+		Args:
+		    metadata (PagedAttentionCacheMetaData): Configuration metadata.
+
+		Returns:
+		    ActiveSequenceBatch: An initialized batch state object with NumPy arrays.
+		"""
 		return cls(
 			token_ids=[],
 			positions=np.full((metadata.batch_size,), 1e6, dtype=np.int32),
@@ -479,15 +646,19 @@ class ActiveSequenceBatch:
 		metadata: PagedAttentionCacheMetaData,
 		mesh: common_types.Mesh,
 	):
-		"""
-		Factory method to create and initialize a ActiveSequenceBatch object.
+		"""Creates and initializes an ActiveSequenceBatch for JAX execution.
+
+		This factory method sets up the `ActiveSequenceBatch` with JAX arrays
+		(`token_ids`, `positions`, `page_table`, `sampling_params`) appropriately
+		sharded across the provided `mesh`. It also initializes the host-side
+		scheduler components (`available_slots`, `active_slot_requests_map`).
 
 		Args:
-		    metadata (PagedAttentionCacheMetaData): Configuration metadata for the paged attention cache.
+		    metadata (PagedAttentionCacheMetaData): Paged attention cache configuration.
 		    mesh (common_types.Mesh): The JAX device mesh for array distribution.
 
 		Returns:
-		    ActiveSequenceBatch: An initialized ActiveSequenceBatch object with JAX arrays placed on the specified mesh.
+		    ActiveSequenceBatch: An initialized batch state ready for JAX operations.
 		"""
 		slots = queue.SimpleQueue()
 		for i in range(metadata.batch_size):
@@ -519,15 +690,20 @@ class ActiveSequenceBatch:
 
 
 class ModelInputBatch(xTree):
-	"""
-	Represents the consolidated input data structure passed to the model for a single
-	paged attention forward pass, potentially combining prefill and decode steps.
+	"""Consolidated input data for a single model forward pass in paged attention.
+
+	This structure gathers all necessary inputs for the model, potentially
+	combining data for both a prefill step and multiple decode steps into
+	a single batch structure suitable for the paged attention kernel.
 
 	Attributes:
-	    input_ids (jax.Array): Combined token IDs for both prefill (if any) and decode (if any) requests.
+	    input_ids (jax.Array): Combined token IDs for prefill and decode sequences.
 	    positions (jax.Array): Combined position IDs corresponding to `input_ids`.
-	    attn_meta (PagedAttentionMetadata): Metadata required by the paged attention mechanism,
-	        containing lengths, positions, and page tables for prefill and decode parts.
+	    attn_meta (PagedAttentionMetadata): Metadata required by the paged
+	        attention kernel, including sequence lengths, block tables, etc.,
+	        for both prefill and decode parts of the batch.
+	    sampling_params (SamplingParams): Combined sampling parameters for all
+	        sequences included in the batch.
 	"""
 
 	input_ids: jax.Array
@@ -538,21 +714,28 @@ class ModelInputBatch(xTree):
 
 @auto_pytree
 class ModelOutputBatch:
-	"""
-	Represents the output generated by the model after a paged attention forward pass,
-	separating results for prefill and decode phases.
+	"""Output generated by the model after a paged attention forward pass.
+
+	Contains the results from the model, separating outputs corresponding to the
+	prefill phase (if one was run) and the decode phase.
 
 	Attributes:
-	    prefill_complete (jax.Array): A scalar boolean JAX array indicating if the prefill operation
-	        (if scheduled) resulted in a completed sequence (e.g., EOS token).
-	    decodes_completes (jax.Array): A boolean JAX array indicating for each decode slot whether
-	        the generated token completed the sequence. Shape: (num_decode_requests,).
-	    prefill_token_id (jax.Array): The token ID generated by the prefill operation (if scheduled). Scalar.
-	    decodes_token_ids (jax.Array): The token IDs generated for each decode slot (if scheduled).
-	        Shape: (num_decode_requests,).
-	    prefill_next_position (jax.Array): The next position index for the prefill request after this step. Scalar.
-	    decodes_next_position (jax.Array): The next position indices for each decode request after this step.
-	        Shape: (num_decode_requests,). Contains -1 for completed sequences.
+	    prefill_complete (jax.Array): Scalar boolean JAX array. True if the prefill
+	        operation (if run) generated a completion token (e.g., EOS).
+	    decodes_completes (jax.Array): Boolean JAX array. Indicates for each sequence
+	        in the decode part of the batch whether a completion token was generated.
+	        Shape: (num_decode_sequences,).
+	    prefill_token_id (jax.Array): Scalar JAX array. The token ID generated by
+	        the prefill step (if run).
+	    decodes_token_ids (jax.Array): JAX array. The token IDs generated for each
+	        sequence in the decode part of the batch. Shape: (num_decode_sequences,).
+	    prefill_next_position (jax.Array): Scalar JAX array. The next position index
+	        for the sequence processed in the prefill step.
+	    decodes_next_position (jax.Array): JAX array. The next position indices for
+	        each sequence in the decode part of the batch. Completed sequences might
+	        have a special value (e.g., -1). Shape: (num_decode_sequences,).
+	    next_sampling_params (SamplingParams): Updated sampling parameters after the
+	        forward pass (e.g., potentially modified max_tokens).
 	"""
 
 	prefill_complete: jax.Array
@@ -589,18 +772,26 @@ class ModelOutputBatch:
 
 @auto_pytree
 class ModelOutputSummary:
-	"""
-	Contains the information needed to post-process the results of a model's forward pass
-	(ModelOutputBatch) and update the scheduler and decode state.
+	"""Summarizes model output for scheduler and state updates (host-side).
+
+	This structure extracts and organizes key information from the `ModelOutputBatch`
+	(which contains JAX arrays) into a format suitable for the host-side scheduler
+	to process and update its internal state (like `ActiveSequenceBatch`'s
+	scheduler attributes).
 
 	Attributes:
-	    prefill_request_id (str | None): The ID of the prefill request that was processed, or None.
-	    prefill_token_id (jax.Array): The token generated by the prefill step, or a placeholder.
-	    prefill_complete (jax.Array): Flag indicating if the prefill step completed the sequence.
-	    decodes_active_slots (list[int]): List of slot indices that were active during the decode phase.
-	    decodes_active_request_ids (list[str]): List of request IDs corresponding to the active decode slots.
-	    decodes_token_ids (jax.Array): Tokens generated for the active decode slots.
-	    decodes_completes (jax.Array): Flags indicating completion for each active decode slot.
+	    prefill_request_id (str | None): The ID of the prefill request processed in
+	        the last step, if any.
+	    prefill_token_id (jax.Array): The token ID generated by the prefill step.
+	    prefill_complete (jax.Array): Boolean flag indicating if the prefill step
+	        completed the sequence.
+	    decodes_active_slots (list[int]): List of batch slot indices that were active
+	        during the decode phase of the last step.
+	    decodes_active_request_ids (list[str]): List of request IDs corresponding to
+	        the `decodes_active_slots`.
+	    decodes_token_ids (jax.Array): Token IDs generated for the active decode slots.
+	    decodes_completes (jax.Array): Boolean flags indicating completion for each
+	        active decode slot.
 	"""
 
 	prefill_request_id: str | None
@@ -613,7 +804,21 @@ class ModelOutputSummary:
 	decodes_completes: jax.Array
 
 	@classmethod
-	def from_output(cls, output: ModelOutputBatch):
+	def from_output(cls, output: ModelOutputBatch) -> ModelOutputSummary:
+		"""Creates a ModelOutputSummary from a ModelOutputBatch.
+
+		Initializes the summary, copying relevant fields from the model output.
+		Scheduler-specific fields (`prefill_request_id`, `decodes_active_slots`,
+		`decodes_active_request_ids`) are initialized as empty/None and need to
+		be populated separately by the scheduler based on its knowledge of the
+		batch composition.
+
+		Args:
+		    output (ModelOutputBatch): The model output batch containing JAX arrays.
+
+		Returns:
+		    ModelOutputSummary: An initialized summary object ready for scheduler processing.
+		"""
 		return cls(
 			prefill_request_id=None,
 			prefill_token_id=output.prefill_token_id,
