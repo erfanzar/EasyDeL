@@ -83,6 +83,7 @@ class oEngine(AbstractInferenceEngine):
 	with Paged Attention, scheduling, and execution of model forward passes
 	for both prefill and decode steps.
 	"""
+
 	def __init__(
 		self,
 		model: EasyDeLBaseModule,
@@ -138,6 +139,14 @@ class oEngine(AbstractInferenceEngine):
 		self._empty_sharding = Ns(model.mesh, Ps())
 		self._setup_functions()
 
+	@property
+	def max_concurrent_prefill(self):
+		return self._max_concurrent_prefill
+
+	@property
+	def max_concurrent_decodes(self):
+		return self._max_concurrent_decodes
+
 	def get_state_shardings(self, is_decode: bool = False):
 		"""
 		Returns the sharding specifications for the engine's state.
@@ -168,19 +177,23 @@ class oEngine(AbstractInferenceEngine):
 			self.continuous_forward = cjit(
 				jax.jit(
 					execute_forward,
-					static_argnums=(0,), # graphdef is static
+					static_argnums=(0,),  # graphdef is static
 					in_shardings=(
-						self.graphstate_sharding, # Sharding for graphstate
-						self.graphother_sharding, # Sharding for graphothers
-						None, # Sharding for ModelIOProcessor input (handled internally)
-						None, # Sharding for eos_token_ids (broadcast)
-						self.storage_sharding, # Sharding for storage (KV cache)
-						None, # Sharding for prng_key (handled internally)
+						self.graphstate_sharding,  # Sharding for graphstate
+						self.graphother_sharding,  # Sharding for graphothers
+						None,  # Sharding for ModelIOProcessor input (handled internally)
+						None,  # Sharding for eos_token_ids (broadcast)
+						self.storage_sharding,  # Sharding for storage (KV cache)
+						None,  # Sharding for prng_key (handled internally)
 					),
-					out_shardings=(None, self.storage_sharding, None), # Output shardings for (output, updated_storage, _)
-					donate_argnums=(5,), # Donate the storage argument to avoid copying
+					out_shardings=(
+						None,
+						self.storage_sharding,
+						None,
+					),  # Output shardings for (output, updated_storage, _)
+					donate_argnums=(5,),  # Donate the storage argument to avoid copying
 				),
-				static_argnums=(0,), # graphdef is static for cjit as well
+				static_argnums=(0,),  # graphdef is static for cjit as well
 			)
 
 	@cached_property
@@ -249,14 +262,6 @@ class oEngine(AbstractInferenceEngine):
 		return self._batch_size
 
 	@property
-	def max_concurrent_decodes(self) -> int:
-		"""Maximum number of sequences that can be decoded concurrently.
-
-		This determines the batch size used during the decode phase.
-		"""
-		return self._max_concurrent_decodes
-
-	@property
 	def max_prefill_length(self) -> int:
 		"""Maximum allowed length for the initial prompt (prefill phase).
 
@@ -283,7 +288,7 @@ class oEngine(AbstractInferenceEngine):
 		Returns:
 		    The sharding specification for prefix destinations.
 		"""
-		pass # Implementation needed
+		pass  # Implementation needed
 
 	def init_decode_state(self, *args, **kwargs) -> ActiveSequenceBatch:
 		"""
@@ -351,14 +356,14 @@ class oEngine(AbstractInferenceEngine):
 				self.graphdef,
 				graphstate,
 				graphothers,
-				ModelIOProcessor.build_input( # Build the input for the forward pass
+				ModelIOProcessor.build_input(  # Build the input for the forward pass
 					iteration_plan=iteration_plan,
 					metadata=self.metadata,
 					decodes_state=state,
 				),
-				jnp.array(self.eos_token_ids).ravel(), # Provide EOS token IDs
-				self.storage, # Pass the current KV cache storage
-				self.prng_key, # Pass the PRNG key for sampling
+				jnp.array(self.eos_token_ids).ravel(),  # Provide EOS token IDs
+				self.storage,  # Pass the current KV cache storage
+				self.prng_key,  # Pass the PRNG key for sampling
 			)
 		return output
 

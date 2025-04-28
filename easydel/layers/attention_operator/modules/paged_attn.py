@@ -255,6 +255,8 @@ class PagedAttn(AttentionImpl):
 			dtype=q.dtype,
 		)
 		padded_prompt_length = cache_metadata.prefill_position.shape[0]
+
+		cache_view = cache_view.write_prefill_to_cache(k, v, cache_metadata)
 		prefill_output = self._prefill_tpu(
 			q=q[:padded_prompt_length, :, :],
 			k=k[:padded_prompt_length, :, :],
@@ -262,7 +264,7 @@ class PagedAttn(AttentionImpl):
 			cache_view=cache_view,
 			cache_metadata=cache_metadata,
 		)
-
+		cache_view = cache_view.write_decodes_to_cache(k, v, cache_metadata)
 		decodes_output = self._decodes_tpu(
 			q=q[padded_prompt_length:, :, :],
 			k=k[padded_prompt_length:, :, :],

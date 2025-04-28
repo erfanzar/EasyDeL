@@ -229,7 +229,7 @@ class oDriver(AbstractDriver):
 		return self.engine.processor
 
 	def _get_chunksize(self, length):
-		prefill_chunk_sizes = [512, 1024, 2048]
+		prefill_chunk_sizes = [128, 256, 512]
 		for size in prefill_chunk_sizes:
 			if length <= size:
 				return size
@@ -379,19 +379,16 @@ class oDriver(AbstractDriver):
 		for completed requests, calculates and updates Tokens Per Second (TPS),
 		and enqueues generated samples for the respective requests.
 		"""
-		while True:
-			# Get a summary from the process backlog (blocks until a summary is available)
+		while True: 
 			summary = self._process_backlog.get(block=True)
-			if summary is None:
-				# Exit loop if a None sentinel is received (signaling shutdown)
-				logger.info(" Received None, exiting summary processing loop.")
+			if summary is None: 
+				logger.info("Received None, exiting summary processing loop.")
 				return
 			logger.debug(
 				f"Received summary. Process backlog size: {self._process_backlog.qsize()}"
 			)
 			assert isinstance(summary, ModelOutputSummary)
-
-			# Convert numpy arrays in the summary to standard Python types
+ 
 			summary.prefill_token_id = np.asarray(summary.prefill_token_id).item()
 			summary.prefill_complete = np.asarray(summary.prefill_complete).item()
 
