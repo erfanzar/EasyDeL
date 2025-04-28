@@ -687,13 +687,18 @@ class AttentionModule(nn.Module):
 			elif isinstance(cache_view, PagedAttentionCacheView):
 				pop_axis = 1 if cache_metadata.is_decode_mode() else 0
 
-				key = key.squeeze(pop_axis)
-				value = value.squeeze(pop_axis)
-
 				if cache_metadata.is_decode_mode():
-					cache_view = cache_view.write_decodes_to_cache(key, value, cache_metadata)
-				else:
-					cache_view = cache_view.write_prefill_to_cache(key, value, cache_metadata)
+					cache_view = cache_view.write_decodes_to_cache(
+						key.squeeze(pop_axis),
+						value.squeeze(pop_axis),
+						cache_metadata,
+					)
+				elif cache_metadata.is_prefill_mode():
+					cache_view = cache_view.write_prefill_to_cache(
+						key.squeeze(pop_axis),
+						value.squeeze(pop_axis),
+						cache_metadata,
+					)
 
 			else:
 				raise NotImplementedError(

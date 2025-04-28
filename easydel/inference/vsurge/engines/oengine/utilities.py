@@ -93,7 +93,8 @@ def execute_forward(
 	selected_index = jax.random.categorical(rngs, prob)
 
 	next_token = indices[jnp.arange(0, indices.shape[0]), selected_index]
-
+	
+	# complete = jnp.isin(next_token, eos_token_ids)
 	complete = jnp.logical_or(
 		jnp.isin(next_token, eos_token_ids),
 		jnp.greater_equal(model_inputs.positions, sampling_params.max_tokens - 1),

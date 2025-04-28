@@ -153,6 +153,7 @@ class vSurge:
 		manager: tp.Optional[HBMPageManager] = None,
 		page_size: int = 128,
 		hbm_utilization: float = 0.6,
+		max_concurrent_prefill: int | None = None,
 		max_concurrent_decodes: int | None = None,
 		prefill_lengths: int | None = None,
 		max_prefill_length: int | None = None,
@@ -161,6 +162,7 @@ class vSurge:
 		vsurge_name: str | None = None,
 	) -> vSurge:
 		max_length = max_length or 8192
+		max_concurrent_prefill = max_concurrent_prefill or jax.device_count()
 		max_concurrent_decodes = max_concurrent_decodes or jax.device_count()
 		metadata = model.create_paged_metadata(
 			page_size=page_size,
@@ -181,7 +183,7 @@ class vSurge:
 					storage=storage,
 					manager=manager,
 					max_concurrent_decodes=max_concurrent_decodes,
-					max_concurrent_prefill=None,
+					max_concurrent_prefill=max_concurrent_prefill,
 					prefill_lengths=prefill_lengths,
 					max_prefill_length=max_prefill_length,
 					max_length=max_length,
