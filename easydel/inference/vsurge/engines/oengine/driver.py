@@ -229,11 +229,12 @@ class oDriver(AbstractDriver):
 		return self.engine.processor
 
 	def _get_chunksize(self, length):
-		prefill_chunk_sizes = [128, 256, 512]
-		for size in prefill_chunk_sizes:
-			if length <= size:
-				return size
-		return prefill_chunk_sizes[-1]
+		return 512
+		# prefill_chunk_sizes = [128, 256, 512]
+		# for size in prefill_chunk_sizes:
+		# 	if length <= size:
+		# 		return size
+		# return prefill_chunk_sizes[-1]
 
 	def _prepare_inputs(self):
 		"""
@@ -274,7 +275,6 @@ class oDriver(AbstractDriver):
 				max_prefill_length=self.engine.max_prefill_length,
 				prefill_lengths=self.engine.prefill_lengths,
 				sampling_params=SamplingParams(
-					top_k=request.top_k,
 					top_p=request.top_p,
 					max_tokens=request.max_tokens,
 					temperature=request.temperature,
@@ -379,16 +379,16 @@ class oDriver(AbstractDriver):
 		for completed requests, calculates and updates Tokens Per Second (TPS),
 		and enqueues generated samples for the respective requests.
 		"""
-		while True: 
+		while True:
 			summary = self._process_backlog.get(block=True)
-			if summary is None: 
+			if summary is None:
 				logger.info("Received None, exiting summary processing loop.")
 				return
 			logger.debug(
 				f"Received summary. Process backlog size: {self._process_backlog.qsize()}"
 			)
 			assert isinstance(summary, ModelOutputSummary)
- 
+
 			summary.prefill_token_id = np.asarray(summary.prefill_token_id).item()
 			summary.prefill_complete = np.asarray(summary.prefill_complete).item()
 
