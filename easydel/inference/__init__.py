@@ -19,11 +19,13 @@ from .vinference import (
 	vInferencePreCompileConfig,
 )
 from .vsurge import (
+	oDriver,
+	oEngine,
 	vDriver,
 	vEngine,
 	vSurge,
-	vSurgeRequest,
 	vSurgeApiServer,
+	vSurgeRequest,
 )
 from .vwhisper import (
 	vWhisperInference,
@@ -36,6 +38,8 @@ __all__ = (
 	"vInferenceApiServer",
 	"vInferenceConfig",
 	"vInferencePreCompileConfig",
+	"oDriver",
+	"oEngine",
 	"vDriver",
 	"vEngine",
 	"vSurge",

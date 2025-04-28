@@ -13,7 +13,10 @@
 # limitations under the License.
 
 import abc
+import datetime
 import typing as tp
+
+import jax
 
 if tp.TYPE_CHECKING:
 	from easydel.infra.base_module import EasyDeLBaseModule
@@ -78,3 +81,32 @@ class AbstractDriver(abc.ABC):
 		Returns the processor (tokenizer) associated with the driver's engines.
 		"""
 		raise NotImplementedError
+
+	def _get_model_name(self, model) -> str:
+		"""
+		Generate a standardized vsurge name combining model type, size, and timestamp.
+
+		Format: {model_type}-{size_in_B}B-{timestamp}
+		Example: llama-7.00B-20240311
+		"""
+		model_type = self._get_model_type(model)
+		model_size = self._calculate_model_size(model.graphstate)
+		timestamp = datetime.datetime.now().strftime("%Y%m%d")
+
+		return f"{model_type}-{model_size}B-{timestamp}"
+
+	def _get_model_type(self, model) -> str:
+		"""Get the model type, with fallback to 'unknown' if not found."""
+		return getattr(model.config, "model_type", "unknown").lower()
+
+	def _calculate_model_size(self, graphstate) -> str:
+		"""
+		Calculate model size in billions of parameters.
+		Returns formatted string with 2 decimal places.
+		"""
+		try:
+			num_params = sum(n.size for n in jax.tree_util.tree_flatten(graphstate)[0])
+			size_in_billions = num_params / 1e9
+			return f"{size_in_billions:.2f}"
+		except Exception:
+			return "unknown"

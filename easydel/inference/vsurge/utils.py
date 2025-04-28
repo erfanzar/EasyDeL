@@ -11,25 +11,32 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 from __future__ import annotations
 
 import asyncio
 import dataclasses
+import os
+import signal
 import threading
+import traceback
 import typing as tp
 from asyncio import futures
 from bisect import bisect_left
+from dataclasses import dataclass, field
+import uuid
 
 import jax
 import numpy as np
 from jax import numpy as jnp
 
-from .engines import ResultTokens
 
 if tp.TYPE_CHECKING:
 	from easydel.infra.utils import ProcessingClassType
+	from .engines._utils import ResultTokens
 else:
 	ProcessingClassType = tp.Any
+	ResultTokens = tp.Any
 
 
 V = tp.TypeVar("V")
@@ -142,6 +149,89 @@ class AsyncMultifuture(tp.Generic[V]):
 		if isinstance(value, _Exception):
 			raise value.exception
 		return value
+
+
+if tp.TYPE_CHECKING:
+	from easydel.infra import EasyDeLBaseModule
+else:
+	EasyDeLBaseModule = tp.Any
+
+
+@dataclass
+class ActiveRequestMetadata:
+	"""Inference request metadata."""
+
+	start_time: tp.Optional[float] = None
+
+	prefill_enqueue_time: tp.Optional[float] = None
+	prefill_dequeue_time: tp.Optional[float] = None
+
+	transfer_enqueue_time: tp.Optional[float] = None
+	transfer_dequeue_time: tp.Optional[float] = None
+
+	generate_enqueue_time: tp.Optional[float] = None
+	generate_dequeue_time: tp.Optional[float] = None
+
+	complete_time: tp.Optional[float] = None
+
+
+@dataclass
+class ActiveRequest:
+	"""Current state of the driver."""
+
+	max_tokens: int
+	return_channel: AsyncMultifuture[list[ReturnSample]]
+	top_p: float = 1.0
+	top_k: int = 0
+	min_p: float = 0.0
+	temperature: float = 0.0
+	presence_penalty: float = 0.0
+	frequency_penalty: float = 0.0
+	repetition_penalty: float = 1.0
+	complete: tp.Optional[np.ndarray] = None
+	prefill_result: tp.Any = None
+	prefill_content: tp.Optional[str | list[int]] = None
+	generate_timestep_added: tp.Optional[int] = None
+	is_client_side_tokenization: tp.Optional[bool] = False
+	# Metrics Tracking
+	decode_start_time: float | None = None
+	total_generated_tokens: int = 0
+	metadata: ActiveRequestMetadata = field(default_factory=ActiveRequestMetadata)
+
+	id: str = field(default_factory=uuid.uuid4)
+
+	def enqueue_samples(self, generated_samples: list[ReturnSample]):
+		"""Adds the generated sample(s) to return channel for current step.
+
+		Args:
+		  generated_samples: The generated sample(s) for current step.
+
+		This should be called only from within the Drivers background thread.
+		"""
+		self.return_channel.add_result(generated_samples)
+
+
+class SafeThread(threading.Thread):
+	"""Thread that kills the program if it fails.
+
+	If a driver thread goes down, we can't operate.
+	"""
+
+	def run(self):
+		"""Executes the thread's target function.
+
+		If the target function raises any exception, this method catches it,
+		prints the traceback, and forcefully kills the entire process using
+		`os.kill` with `signal.SIGKILL`. This ensures that if a critical
+		driver thread fails, the whole system stops, preventing potential
+		inconsistent states or hangs.
+		"""
+		try:
+			super().run()
+		except Exception as e:
+			print(f"Thread {self.name} encountered an error: {e}")
+			traceback.print_exc()
+			os.kill(os.getpid(), signal.SIGKILL)
 
 
 def process_result_tokens(

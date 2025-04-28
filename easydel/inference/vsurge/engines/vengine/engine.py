@@ -38,13 +38,11 @@ from .utilities import (
 
 if tp.TYPE_CHECKING:
 	from easydel.infra import EasyDeLBaseModule
+	from easydel.infra.utils import ProcessingClassType
 else:
 	EasyDeLBaseModule = tp.Any
+	ProcessingClassType = tp.Any
 
-
-import jax.experimental.layout as jlu
-
-AutoLayout = jlu.Layout(jlu.DeviceLocalLayout.AUTO)
 
 NOT_GIVEN = common_types.NOT_GIVEN
 RUNTIME_MODE_TYPES = common_types.RUNTIME_MODE_TYPES
@@ -73,7 +71,7 @@ class vEngine(AbstractInferenceEngine):
 	def __init__(
 		self,
 		model: EasyDeLBaseModule,
-		processor,
+		processor: ProcessingClassType,
 		max_concurrent_decodes: int | None = None,
 		max_concurrent_prefill: int | None = None,
 		prefill_lengths: int | None = None,

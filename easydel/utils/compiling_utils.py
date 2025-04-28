@@ -113,36 +113,41 @@ _leaf_types = (jax.Array, np.ndarray, int, float, bool, str, bytes, type(None))
 def _is_leaf_for_signature(node):
 	if isinstance(node, (jax.Array, np.ndarray)):
 		return True
-	if (
-		not isinstance(node, (list, tuple, dict))
-		and hasattr(node, "shape")
-		and hasattr(node, "dtype")
-	):
-		return True
 	if isinstance(node, _leaf_types):
 		return True
+	if not isinstance(node, (list, tuple, dict)):
+		try:
+			_ = node.shape
+			_ = node.dtype
+			return True
+		except AttributeError:
+			return False
 	return False
 
 
 def get_leaf_signature(leaf: tp.Any) -> tp.Hashable:
-	if hasattr(leaf, "shape") and hasattr(leaf, "dtype"):
+	if isinstance(leaf, (jax.Array, np.ndarray)) or (
+		hasattr(leaf, "shape") and hasattr(leaf, "dtype")
+	):
 		try:
 			shape = tuple(leaf.shape)
 			dtype_str = str(jax.dtypes.canonicalize_dtype(leaf.dtype))
 			return (shape, dtype_str)
 		except Exception:
 			return type(leaf)
-	return type(leaf)
+	else:
+		return type(leaf)
 
 
 def get_signature_tree_util(
 	args: tp.Tuple[tp.Any, ...],
 	kwargs: tp.Dict[str, tp.Any],
 ) -> tp.Tuple:
-	tree = (args, kwargs)
-	structure = jax.tree_util.tree_structure(tree, is_leaf=_is_leaf_for_signature)
-	leaves = jax.tree_util.tree_leaves(tree, is_leaf=_is_leaf_for_signature)
-	leaf_signatures = tuple(get_leaf_signature(leaf) for leaf in leaves)
+	leaves, structure = jax.tree_util.tree_flatten(
+		(args, kwargs),
+		is_leaf=_is_leaf_for_signature,
+	)
+	leaf_signatures = leaf_signatures = tuple(map(get_leaf_signature, leaves))
 	return (structure, leaf_signatures)
 
 

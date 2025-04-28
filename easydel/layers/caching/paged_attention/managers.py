@@ -145,15 +145,15 @@ class InferenceScheduler:
 		self.batch_size = manager.metadata.batch_size
 		self.max_seq_len = manager.metadata.max_sequences
 
-	def enqueue_prefill_req(self, req: InitialSequenceRequest):
+	def enqueue_prefill_request(self, request: InitialSequenceRequest):
 		"""Adds a prefill request to the prefill queue."""
-		self.prefill_queue.put(req)
+		self.prefill_queue.put(request)
 
-	def enqueue_decodes_req(self, req: GenerationStepTask):
+	def enqueue_decodes_request(self, request: GenerationStepTask):
 		"""Adds a completed prefill request to the decode queue."""
-		self.decodes_queue.put(req)
+		self.decodes_queue.put(request)
 
-	def schedule(
+	def create_plan(
 		self,
 		active_prefill: InitialSequenceRequest | None,
 		decodes_state: ActiveSequenceBatch,
@@ -227,13 +227,13 @@ class InferenceScheduler:
 				while (
 					decodes_state.available_slots.qsize() > 0 and self.decodes_queue.qsize() > 0
 				):
-					gr = self.decodes_queue.get_nowait()
-					if not gr:
+					decode_request = self.decodes_queue.get_nowait()
+					if not decode_request:
 						return None
 					slot = decodes_state.available_slots.get_nowait()
-					gr.slot = slot
-					decodes_state.active_slot_requests_map[slot] = gr
-					next_decodes_reqs.append(gr)
+					decode_request.slot = slot
+					decodes_state.active_slot_requests_map[slot] = decode_request
+					next_decodes_reqs.append(decode_request)
 
 				alloced_pages = self.manager.alloc_hbm_pages(
 					len(decodes_state.active_slot_requests_map)
@@ -244,14 +244,14 @@ class InferenceScheduler:
 					)
 
 				page_to_use = 0
-				for slot, req in decodes_state.active_slot_requests_map.items():
-					idx = req.position // self.manager.page_size
-					if req.position % self.manager.page_size != 0:
+				for slot, request in decodes_state.active_slot_requests_map.items():
+					idx = request.position // self.manager.page_size
+					if request.position % self.manager.page_size != 0:
 						continue
-					if idx >= len(req.page_indices):
+					if idx >= len(request.page_indices):
 						continue
 
-					req.page_indices[idx] = alloced_pages[page_to_use]
+					request.page_indices[idx] = alloced_pages[page_to_use]
 					decodes_state_page_updates.append(
 						SlotPageAssignment(
 							slot=slot,
@@ -276,9 +276,9 @@ class InferenceScheduler:
 		if not schedule_prefill and not schedule_decodes:
 			while True:
 				if self.prefill_queue.qsize() > 0 or self.decodes_queue.qsize() > 0:
-					return self.schedule(active_prefill, decodes_state)
+					return self.create_plan(active_prefill, decodes_state)
 
-		req = NextIterationPlan(
+		request = NextIterationPlan(
 			schedule_prefill=schedule_prefill,
 			schedule_decodes=schedule_decodes,
 			prefill_request=next_prefill_req,
@@ -286,7 +286,7 @@ class InferenceScheduler:
 			new_decodes_requests=next_decodes_reqs,
 			decodes_state_page_updates=decodes_state_page_updates,
 		)
-		return req
+		return request
 
 
 class ModelIOProcessor:
@@ -463,14 +463,14 @@ class ModelIOProcessor:
 	@classmethod
 	def build_input(
 		cls,
-		schedule: NextIterationPlan,
+		iteration_plan: NextIterationPlan,
 		metadata: PagedAttentionCacheMetaData,
 		decodes_state: ActiveSequenceBatch,
 	):
 		"""
 		Orchestrates the preparation of model inputs based on a scheduling decision.
 
-		It retrieves the necessary data from the `schedule` and `decodes_state`,
+		It retrieves the necessary data from the `iteration_plan` and `decodes_state`,
 		formats it (converting lists/numpy arrays to JAX arrays as needed), and
 		calls `prepare_model_input` to perform the JIT-compiled merging and updating.
 		It also updates the `decodes_state` (device arrays) based on the results
@@ -478,7 +478,7 @@ class ModelIOProcessor:
 
 		Args:
 		    cls: The class itself.
-		    schedule (NextIterationPlan): The output of the scheduler, indicating what to run.
+		    iteration_plan (NextIterationPlan): The output of the scheduler, indicating what to run.
 		    metadata (PagedAttentionCacheMetaData): Cache configuration.
 		    decodes_state (ActiveSequenceBatch): The current state of the decode batch.
 
@@ -499,23 +499,23 @@ class ModelIOProcessor:
 		chunk_size = 512
 		insert_slots = scalar
 
-		if schedule.schedule_prefill:
-			prefill = schedule.prefill_request
+		if iteration_plan.schedule_prefill:
+			prefill = iteration_plan.prefill_request
 			ongoing_prefill.copy_prefill(prefill=prefill)
 			chunk_id = prefill.chunk_idx
 			chunk_size = prefill.chunk_size
 
-		if schedule.schedule_decodes:
+		if iteration_plan.schedule_decodes:
 			ongoing_decodes.copy_decode(decodes_state)
 			ongoing_updates = ongoing_updates.init_numpy(metadata)
 			insert_slots = np.full((metadata.batch_size,), 1e6, dtype=np.int32)
-			for i, gr in enumerate(schedule.new_decodes_requests):
-				ongoing_updates.insert_from_task(i, gr)
-				insert_slots[i] = gr.slot
+			for i, decode_request in enumerate(iteration_plan.new_decodes_requests):
+				ongoing_updates.insert_from_task(i, decode_request)
+				insert_slots[i] = decode_request.slot
 			ongoing_updates.pad_tokens(
-				metadata.batch_size - len(schedule.new_decodes_requests)
+				metadata.batch_size - len(iteration_plan.new_decodes_requests)
 			)
-			ongoing_updates.apply_assignment(schedule.decodes_state_page_updates)
+			ongoing_updates.apply_assignment(iteration_plan.decodes_state_page_updates)
 
 		(
 			input_ids,
@@ -533,7 +533,7 @@ class ModelIOProcessor:
 			insert_slots,
 		)
 
-		if schedule.schedule_decodes:
+		if iteration_plan.schedule_decodes:
 			decodes_state.token_ids = decodes_token_ids
 			decodes_state.positions = attn_meta.decodes_position
 			decodes_state.page_table = attn_meta.decodes_page_table

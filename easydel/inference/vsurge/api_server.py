@@ -349,23 +349,6 @@ class vSurgeApiServer:
 		)
 
 		function_call_result = None
-		if hasattr(request, "functions") and request.functions:
-			from json import JSONDecodeError, loads
-
-			try:
-				# Look for function call patterns in the response
-				if "{" in final_response and "}" in final_response:
-					possible_json = final_response[
-						final_response.find("{") : final_response.rfind("}") + 1,
-					]
-					parsed = loads(possible_json)
-					if "name" in parsed and ("arguments" in parsed or "params" in parsed):
-						function_call_result = {
-							"name": parsed.get("name"),
-							"arguments": parsed.get("arguments", parsed.get("params", "{}")),
-						}
-			except JSONDecodeError:
-				...
 
 		usage = self._create_usage_info(
 			prompt_tokens=prompt_tokens,

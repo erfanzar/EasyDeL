@@ -25,8 +25,6 @@ from easydel.layers.caching.paged_attention import (
 )
 from easydel.layers.caching.paged_attention.managers import ModelIOProcessor
 
-from .._utils import apply_filters
-
 
 def execute_forward(
 	graphdef: nn.GraphDef,
@@ -79,17 +77,18 @@ def execute_forward(
 			past_key_values=cache,
 			cache_metadata=attn_meta,
 		)
-	logits = outputs.logits
+
+	logits = outputs.logits.squeeze(expand_dim)
 	cache = outputs.past_key_values
+	# TODO: we might need a kernel to be able to compute tok-k and top-p faster
+	probabilities = jax.nn.softmax(
+		logits / jnp.expand_dims(sampling_params.temperature, expand_dim),
+		axis=-1,
+	)
+	prob, indices = jax.lax.top_k(probabilities, 1)
+	selected_index = jax.random.categorical(rngs, prob)
 
-	logits = apply_filters(
-		logits,
-		sampling_params.top_p,
-		sampling_params.top_k,
-		sampling_params.temperature,
-	).squeeze(expand_dim)
-
-	next_token = jax.random.categorical(rngs, logits, axis=-1)
+	next_token = indices[jnp.arange(0, indices.shape[0]), selected_index]
 
 	complete = jnp.logical_or(
 		jnp.isin(next_token, eos_token_ids),

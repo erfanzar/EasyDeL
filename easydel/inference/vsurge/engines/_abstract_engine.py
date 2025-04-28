@@ -19,20 +19,15 @@ import jax
 from eformer import common_types
 from flax import nnx as nn
 
-from .vengine.utilities import (
-	GenerationState,
-	ResultTokens,
-)
 
 if tp.TYPE_CHECKING:
 	from easydel.infra import EasyDeLBaseModule
+	from .vengine.utilities import GenerationState, ResultTokens
 else:
 	EasyDeLBaseModule = tp.Any
+	GenerationState = tp.Any
+	ResultTokens = tp.Any
 
-
-import jax.experimental.layout as jlu
-
-AutoLayout = jlu.Layout(jlu.DeviceLocalLayout.AUTO)
 
 NOT_GIVEN = common_types.NOT_GIVEN
 RUNTIME_MODE_TYPES = common_types.RUNTIME_MODE_TYPES
@@ -55,18 +50,6 @@ class AbstractInferenceEngine(abc.ABC):
 	Defines the core interface for inference engines managing model state,
 	KV caching, and providing JIT-compiled functions for prefill and decode steps.
 	"""
-
-	@property
-	@abc.abstractmethod
-	def model(self) -> "EasyDeLBaseModule":
-		"""The underlying EasyDeL model."""
-		pass
-
-	@property
-	@abc.abstractmethod
-	def processor(self) -> tp.Any:
-		"""The processor (tokenizer/feature extractor) associated with the model."""
-		pass
 
 	@property
 	@abc.abstractmethod

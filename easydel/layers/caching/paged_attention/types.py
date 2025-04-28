@@ -17,7 +17,7 @@ from __future__ import annotations
 import queue
 import threading
 import typing as tp
-import uuid
+from bisect import bisect_left
 
 import jax
 import numpy as np
@@ -29,6 +29,8 @@ from jax.sharding import NamedSharding as Ns
 from jax.sharding import PartitionSpec as Ps
 
 from .paged_attention_cache import PagedAttentionCacheMetaData, PagedAttentionMetadata
+
+DEFAULT_PREFILL_BUCKETS = [2**s for s in range(9, 24)]
 
 
 @auto_pytree
@@ -154,6 +156,26 @@ class SamplingParams:
 		return cls(top_p=scalar, top_k=scalar, max_tokens=scalar, temperature=scalar)
 
 
+def take_nearest_length(lengths: list[int], length: int) -> int:
+	"""Gets the nearest length to the right in a set of lengths.
+
+	Uses binary search to find the smallest length in the `lengths` list that is
+	greater than or equal to the input `length`.
+
+	Args:
+	    lengths: A sorted list of integer lengths (e.g., prefill buckets).
+	    length: The target length to find the nearest value for.
+
+	Returns:
+	    The nearest length in `lengths` that is greater than or equal to `length`.
+	    If `length` is greater than all lengths in the list, returns the largest length.
+	"""
+	pos = bisect_left(lengths, length)
+	if pos == len(lengths):
+		return lengths[-1]
+	return lengths[pos]
+
+
 @auto_pytree
 class InitialSequenceRequest:
 	"""Represents a request for processing a new sequence during the prefill phase.
@@ -253,7 +275,7 @@ class InitialSequenceRequest:
 			token_ids=scalar,
 			positions=scalar,
 			sampling_params=SamplingParams.init_empty(),
-			chunk_size=512,
+			chunk_size=0,
 			page_indices=scalar,
 			prompt_token_ids=None,
 		)
@@ -261,11 +283,13 @@ class InitialSequenceRequest:
 	@classmethod
 	def create(
 		cls,
+		id: str,
 		mesh: common_types.Mesh,
 		metadata: PagedAttentionCacheMetaData,
 		chunk_size: int,
 		prompt_token_ids: list[int],
-		prefill_length: tp.Optional[int] = None,
+		max_prefill_length: tp.Optional[int] = None,
+		prefill_lengths: tp.Optional[tp.List[int]] = None,
 		sampling_params: tp.Optional[SamplingParams] = None,
 	):
 		"""Creates an InitialSequenceRequest from prompt token IDs.
@@ -288,17 +312,26 @@ class InitialSequenceRequest:
 		Returns:
 		    InitialSequenceRequest: An initialized request object ready for prefill.
 		"""
-		if prefill_length is None:
-			prefill_length = metadata.max_sequences
+		if max_prefill_length is None:
+			max_prefill_length = metadata.max_sequences
+		if prefill_lengths is None:
+			prefill_lengths = DEFAULT_PREFILL_BUCKETS
+
+		prefill_lengths = prefill_lengths[: prefill_lengths.index(max_prefill_length)]
+		prefill_lengths = prefill_lengths + [max_prefill_length]
 
 		sequence_length = len(prompt_token_ids)
-		paddlen = prefill_length - sequence_length
+		near_length = take_nearest_length(prefill_lengths, sequence_length)
+
+		paddlen = near_length - sequence_length
+
 		array = np.array(prompt_token_ids)
 
 		if paddlen < 0:
-			padded_token_ids = array[-paddlen:]
+			padded_token_ids = array[-near_length:]
 		else:
 			padded_token_ids = np.pad(array, (0, paddlen), constant_values=(0,))
+
 		sharding = Ns(mesh, Ps(None))
 		page_indices = [0] * metadata.num_pages_per_sequence
 		token_ids = jax.device_put(padded_token_ids, sharding)
@@ -316,7 +349,7 @@ class InitialSequenceRequest:
 			sharding,
 		)
 		max_tokens = jax.device_put(
-			np.array([sampling_params.max_tokens]).reshape(-1),
+			np.array([sampling_params.max_tokens + sequence_length]).reshape(-1),
 			sharding,
 		)
 		temperature = jax.device_put(
@@ -325,7 +358,7 @@ class InitialSequenceRequest:
 		)
 
 		return InitialSequenceRequest(
-			id=uuid.uuid4(),
+			id=id,
 			prompt_token_ids=prompt_token_ids,
 			chunk_idx=0,
 			chunk_size=chunk_size,
@@ -610,7 +643,9 @@ class ActiveSequenceBatch:
 			token_ids=[],
 			positions=np.full((metadata.batch_size,), 1e6, dtype=np.int32),
 			page_table=np.full(
-				(metadata.batch_size, metadata.num_pages_per_sequence), 1e6, dtype=np.int32
+				(metadata.batch_size, metadata.num_pages_per_sequence),
+				1e6,
+				dtype=np.int32,
 			),
 			available_slots=None,
 			active_slot_requests_map=None,
