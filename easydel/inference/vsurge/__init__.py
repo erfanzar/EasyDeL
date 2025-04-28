@@ -13,12 +13,14 @@
 # limitations under the License.
 
 from .api_server import vSurgeApiServer
-from .engines import vEngine, vDriver
+from .engines import oDriver, oEngine, vDriver, vEngine
 from .vsurge import vSurge, vSurgeRequest
 
 __all__ = (
-	"vEngine",
+	"oDriver",
+	"oEngine",
 	"vDriver",
+	"vEngine",
 	"vSurge",
 	"vSurgeApiServer",
 	"vSurgeRequest",

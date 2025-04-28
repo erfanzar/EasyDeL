@@ -14,6 +14,5 @@
 
 from .driver import vDriver
 from .engine import vEngine
-from .utilities import GenerationState
 
-__all__ = ("GenerationState", "vEngine", "vDriver")
+__all__ = ("vEngine", "vDriver")

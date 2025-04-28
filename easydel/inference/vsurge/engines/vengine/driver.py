@@ -14,124 +14,41 @@
 
 from __future__ import annotations
 
-import dataclasses
 import functools
 import itertools
-import os
 import queue
-import signal
-import threading
 import time
 import traceback
 import typing as tp
-
-from easydel.inference.vsurge.engines._abstract_driver import (
-	AbstractDriver,
-	ProcessingClassType,
-)
 
 import jax
 import numpy as np
 from jax import numpy as jnp
 
 from easydel.inference.utilities import SamplingParams
+from easydel.inference.vsurge.engines._abstract_driver import (
+	AbstractDriver,
+	ProcessingClassType,
+)
 from easydel.utils.helpers import get_logger
 
 from ...utils import (
+	ActiveRequest,
+	ResultTokens,
 	ReturnSample,
+	SafeThread,
 	pad_tokens,
 	process_result_tokens,
-	AsyncMultifuture,
-	ResultTokens,
 )
-
 from .engine import vEngine
 
 if tp.TYPE_CHECKING:
-	from easydel.infra.base_module import EasyDeLBaseModule
 	from easydel.infra.utils import ProcessingClassType
 else:
 	ProcessingClassType = tp.Any
-	EasyDeLBaseModule = tp.Any
+
 
 logger = get_logger("vSurge-Driver")
-
-
-@dataclasses.dataclass
-class ActiveRequestMetadata:
-	"""Inference request metadata."""
-
-	start_time: tp.Optional[float] = None
-
-	prefill_enqueue_time: tp.Optional[float] = None
-	prefill_dequeue_time: tp.Optional[float] = None
-
-	transfer_enqueue_time: tp.Optional[float] = None
-	transfer_dequeue_time: tp.Optional[float] = None
-
-	generate_enqueue_time: tp.Optional[float] = None
-	generate_dequeue_time: tp.Optional[float] = None
-
-	complete_time: tp.Optional[float] = None
-
-
-@dataclasses.dataclass
-class ActiveRequest:
-	"""Current state of the driver."""
-
-	max_tokens: int
-	return_channel: AsyncMultifuture[list[ReturnSample]]
-	top_p: float = 1.0
-	top_k: int = 0
-	min_p: float = 0.0
-	temperature: float = 0.0
-	presence_penalty: float = 0.0
-	frequency_penalty: float = 0.0
-	repetition_penalty: float = 1.0
-	complete: tp.Optional[np.ndarray] = None
-	prefill_result: tp.Any = None
-	prefill_content: tp.Optional[str | list[int]] = None
-	generate_timestep_added: tp.Optional[int] = None
-	is_client_side_tokenization: tp.Optional[bool] = False
-	# Metrics Tracking
-	decode_start_time: float | None = None
-	total_generated_tokens: int = 0
-	metadata: ActiveRequestMetadata = dataclasses.field(
-		default_factory=ActiveRequestMetadata
-	)
-
-	def enqueue_samples(self, generated_samples: list[ReturnSample]):
-		"""Adds the generated sample(s) to return channel for current step.
-
-		Args:
-		  generated_samples: The generated sample(s) for current step.
-
-		This should be called only from within the Drivers background thread.
-		"""
-		self.return_channel.add_result(generated_samples)
-
-
-class JetThread(threading.Thread):
-	"""Thread that kills the program if it fails.
-
-	If a driver thread goes down, we can't operate.
-	"""
-
-	def run(self):
-		"""Executes the thread's target function.
-
-		If the target function raises any exception, this method catches it,
-		prints the traceback, and forcefully kills the entire process using
-		`os.kill` with `signal.SIGKILL`. This ensures that if a critical
-		driver thread fails, the whole system stops, preventing potential
-		inconsistent states or hangs.
-		"""
-		try:
-			super().run()
-		except Exception as e:
-			print(f"Thread {self.name} encountered an error: {e}")
-			traceback.print_exc()
-			os.kill(os.getpid(), signal.SIGKILL)
 
 
 class vDriver(AbstractDriver):
@@ -210,7 +127,7 @@ class vDriver(AbstractDriver):
 		]
 
 		self._prefill_threads = [
-			JetThread(
+			SafeThread(
 				target=functools.partial(self._prefill_thread, idx),
 				name=f"prefill-{idx}",
 				daemon=True,
@@ -218,7 +135,7 @@ class vDriver(AbstractDriver):
 			for idx in range(len(self._prefill_engines))
 		]
 		self._transfer_threads = [
-			JetThread(
+			SafeThread(
 				target=functools.partial(
 					self._transfer_thread,
 					idx,
@@ -229,7 +146,7 @@ class vDriver(AbstractDriver):
 			for idx in range(len(self._prefill_engines))
 		]
 		self._decode_threads = [
-			JetThread(
+			SafeThread(
 				target=functools.partial(
 					self._decode_thread,
 					idx,
@@ -240,7 +157,7 @@ class vDriver(AbstractDriver):
 			for idx in range(len(self._decode_engines))
 		]
 		self.detokenize_threads = [
-			JetThread(
+			SafeThread(
 				target=functools.partial(
 					self._detokenize_thread,
 					idx,
@@ -269,6 +186,10 @@ class vDriver(AbstractDriver):
 			# Or raise a more specific error
 			raise TypeError("Request must be of type ActiveRequest")
 		self.place_request_on_prefill_queue(request)
+
+	@property
+	def driver_name(self):
+		return self._get_model_name(self._decode_engines[-1].model)
 
 	def compile(self):
 		"""Compiles engines."""

@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import dataclasses
-import datetime
 import queue
 import time
 import typing as tp
@@ -23,16 +22,26 @@ import typing as tp
 import jax
 
 from easydel.inference.utilities import SamplingParams
+from easydel.layers.caching.paged_attention import (
+	HBMPageManager,
+	PagedAttentionCache,
+)
 from easydel.utils.helpers import get_logger
 
-from .engines.vengine import (
-	ActiveRequest,
-	ActiveRequestMetadata,
-	AsyncMultifuture,
+from .engines import (
+	oDriver,
+	oEngine,
 	vDriver,
 	vEngine,
 )
-from .utils import ReturnSample, is_byte_token, text_tokens_to_string
+from .utils import (
+	ActiveRequest,
+	ActiveRequestMetadata,
+	AsyncMultifuture,
+	ReturnSample,
+	is_byte_token,
+	text_tokens_to_string,
+)
 
 if tp.TYPE_CHECKING:
 	from easydel.infra.base_module import EasyDeLBaseModule
@@ -98,7 +107,11 @@ class vSurgeRequest:
 class vSurge:
 	"""Orchestrates the interaction between client requests and the vDriver."""
 
-	def __init__(self, driver: vDriver, vsurge_name: str | None = None):
+	def __init__(
+		self,
+		driver: tp.Union[vDriver, oDriver],
+		vsurge_name: str | None = None,
+	):
 		"""Initializes the vSurge.
 
 		Args:
@@ -106,39 +119,7 @@ class vSurge:
 		        engines and processing threads.
 		"""
 		self._driver = driver
-		self._vsurge_name = vsurge_name or self._get_vsurge_name(
-			driver._decode_engines[-1].model
-		)
-
-	def _get_vsurge_name(self, model) -> str:
-		"""
-		Generate a standardized vsurge name combining model type, size, and timestamp.
-
-		Format: {model_type}-{size_in_B}B-{timestamp}
-		Example: llama-7.00B-20240311
-		"""
-		model_type = self._get_model_type(model)
-		model_size = self._calculate_model_size(model.graphstate)
-		timestamp = datetime.datetime.now().strftime("%Y%m%d")
-
-		return f"{model_type}-{model_size}B-{timestamp}"
-
-	def _get_model_type(self, model) -> str:
-		"""Get the model type, with fallback to 'unknown' if not found."""
-		return getattr(model.config, "model_type", "unknown").lower()
-
-	def _calculate_model_size(self, graphstate) -> str:
-		"""
-		Calculate model size in billions of parameters.
-		Returns formatted string with 2 decimal places.
-		"""
-		try:
-			num_params = sum(n.size for n in jax.tree_util.tree_flatten(graphstate)[0])
-			size_in_billions = num_params / 1e9
-			return f"{size_in_billions:.2f}"
-		except Exception as e:
-			logger.warning(f"Failed to calculate model size: {e}")
-			return "unknown"
+		self._vsurge_name = vsurge_name or driver.driver_name
 
 	def compile(self):
 		self.driver.compile()
@@ -157,11 +138,62 @@ class vSurge:
 		"""Returns the processor/tokenizer associated with the underlying driver."""
 		return self.driver.processor
 
+	def start(self):
+		return self.driver.start()
+
 	def stop(self):
 		return self.driver.stop()
 
 	@classmethod
-	def create(
+	def create_odriver(
+		cls,
+		model: EasyDeLBaseModule,
+		processor: ProcessingClassType,
+		storage: tp.Optional[PagedAttentionCache] = None,
+		manager: tp.Optional[HBMPageManager] = None,
+		page_size: int = 128,
+		hbm_utilization: float = 0.6,
+		max_concurrent_decodes: int | None = None,
+		prefill_lengths: int | None = None,
+		max_prefill_length: int | None = None,
+		max_length: int | None = None,
+		seed: int = 894,
+		vsurge_name: str | None = None,
+	) -> vSurge:
+		max_length = max_length or 8192
+		max_concurrent_decodes = max_concurrent_decodes or jax.device_count()
+		metadata = model.create_paged_metadata(
+			page_size=page_size,
+			batch_size=max_concurrent_decodes,
+			max_sequences=max_length,
+			dtype=model.dtype,
+			hbm_utilization=hbm_utilization,
+		)
+		if storage is None:
+			storage = model.init_pages(metadata=metadata)
+		if manager is None:
+			manager = HBMPageManager(metadata=metadata)
+		return vSurge(
+			driver=oDriver(
+				oEngine(
+					model=model,
+					processor=processor,
+					storage=storage,
+					manager=manager,
+					max_concurrent_decodes=max_concurrent_decodes,
+					max_concurrent_prefill=None,
+					prefill_lengths=prefill_lengths,
+					max_prefill_length=max_prefill_length,
+					max_length=max_length,
+					batch_size=max_concurrent_decodes,
+					seed=seed,
+				)
+			),
+			vsurge_name=vsurge_name,
+		)
+
+	@classmethod
+	def create_vdriver(
 		cls,
 		model: EasyDeLBaseModule,
 		processor: ProcessingClassType,
@@ -171,7 +203,7 @@ class vSurge:
 		max_length: int | None = None,
 		seed: int = 894,
 		vsurge_name: str | None = None,
-	):
+	) -> vSurge:
 		"""Creates a new instance of vSurge with configured vDriver and vEngines.
 
 		This class method provides a convenient way to instantiate the vSurge

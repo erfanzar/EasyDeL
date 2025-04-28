@@ -12,13 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial
 import typing as tp
+from functools import partial
 
 import jax
 import numpy as np
 from jax import numpy as jnp
-
 
 if tp.TYPE_CHECKING:
 	from easydel.infra import EasyDeLBaseModule

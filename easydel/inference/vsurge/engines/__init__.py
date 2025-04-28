@@ -12,7 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from ._abstract_driver import AbstractDriver
+from ._abstract_engine import AbstractInferenceEngine
 from ._utils import ResultTokens, SlotData
-from .vengine import GenerationState, vDriver, vEngine
+from .oengine import oDriver, oEngine
+from .vengine import vDriver, vEngine
 
-__all__ = ("ResultTokens", "SlotData", "GenerationState", "vEngine", "vDriver")
+__all__ = (
+	"AbstractDriver",
+	"AbstractInferenceEngine",
+	"ResultTokens",
+	"SlotData",
+	"vEngine",
+	"vDriver",
+	"oDriver",
+	"oEngine",
+)
