@@ -44,8 +44,6 @@ class SamplingParams:
 	Attributes:
 	    top_p (jax.Array | float): The probability threshold for nucleus sampling.
 	        Defaults to 1.0 (no nucleus sampling).
-	    top_k (jax.Array | int): The number of top probability tokens to consider
-	        for sampling. Defaults to 1 (greedy).
 	    max_tokens (jax.Array | int): The maximum number of tokens to generate
 	        for a sequence. Defaults to 32.
 	    temperature (jax.Array | float): The temperature for scaling logits before
@@ -53,7 +51,6 @@ class SamplingParams:
 	"""
 
 	top_p: jax.Array | float = np.array([1.0])
-	top_k: jax.Array | int = np.array([1])
 	max_tokens: jax.Array | int = np.array([32])
 	temperature: jax.Array | float = np.array([0.0])
 
@@ -67,7 +64,6 @@ class SamplingParams:
 		"""
 		assert task.sampling_params.top_p.size == 1
 		self.top_p[slot] = task.sampling_params.top_p[0]
-		self.top_k[slot] = task.sampling_params.top_k[0]
 		self.max_tokens[slot] = task.sampling_params.max_tokens[0]
 		self.temperature[slot] = task.sampling_params.temperature[0]
 
@@ -81,7 +77,6 @@ class SamplingParams:
 		"""
 		smp = update.sampling_params
 		self.top_p = self.top_p.at[insert_slots].set(smp.top_p)
-		self.top_k = self.top_k.at[insert_slots].set(smp.top_k)
 		self.max_tokens = self.max_tokens.at[insert_slots].set(smp.max_tokens)
 		self.temperature = self.temperature.at[insert_slots].set(smp.temperature)
 
@@ -103,12 +98,6 @@ class SamplingParams:
 				shape=(metadata.batch_size,),
 				fill_value=1,
 				dtype=jnp.float32,
-				device=sharding,
-			),
-			top_k=jnp.full(
-				shape=(metadata.batch_size,),
-				fill_value=1,
-				dtype=jnp.int32,
 				device=sharding,
 			),
 			max_tokens=jnp.full(
@@ -137,7 +126,6 @@ class SamplingParams:
 		"""
 		return cls(
 			top_p=np.full((metadata.batch_size,), 1e6, dtype=np.float32),
-			top_k=np.full((metadata.batch_size,), 1e6, dtype=np.int32),
 			max_tokens=np.full((metadata.batch_size,), 1e6, dtype=np.int32),
 			temperature=np.full((metadata.batch_size,), 1e6, dtype=np.float32),
 		)
@@ -153,7 +141,7 @@ class SamplingParams:
 			jnp.asarray(1e6, dtype=jnp.int32),
 			Ns(es.get_incontext_mesh(), Ps()),
 		)
-		return cls(top_p=scalar, top_k=scalar, max_tokens=scalar, temperature=scalar)
+		return cls(top_p=scalar, max_tokens=scalar, temperature=scalar)
 
 
 def take_nearest_length(lengths: list[int], length: int) -> int:
@@ -344,10 +332,6 @@ class InitialSequenceRequest:
 			np.array([sampling_params.top_p]).reshape(-1),
 			sharding,
 		)
-		top_k = jax.device_put(
-			np.array([sampling_params.top_k]).reshape(-1),
-			sharding,
-		)
 		max_tokens = jax.device_put(
 			np.array([sampling_params.max_tokens + sequence_length]).reshape(-1),
 			sharding,
@@ -367,7 +351,6 @@ class InitialSequenceRequest:
 			positions=positions,
 			sampling_params=SamplingParams(
 				top_p=top_p,
-				top_k=top_k,
 				max_tokens=max_tokens,
 				temperature=temperature,
 			),
