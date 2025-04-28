@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import typing as tp
 
 import jax
@@ -24,6 +25,9 @@ from easydel.layers.caching.paged_attention import (
 	PagedAttentionCache,
 )
 from easydel.layers.caching.paged_attention.managers import ModelIOProcessor
+
+
+FIXED_VSURGE_TOP_K = int(os.getenv("FIXED_VSURGE_TOP_K", "5"))
 
 
 def execute_forward(
@@ -85,7 +89,7 @@ def execute_forward(
 		logits / jnp.expand_dims(sampling_params.temperature, expand_dim),
 		axis=-1,
 	)
-	prob, indices = jax.lax.top_k(probabilities, 1)
+	prob, indices = jax.lax.top_k(probabilities, FIXED_VSURGE_TOP_K)
 	selected_index = jax.random.categorical(rngs, prob)
 
 	next_token = indices[jnp.arange(0, indices.shape[0]), selected_index]
