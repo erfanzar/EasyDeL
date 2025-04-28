@@ -21,18 +21,18 @@ import signal
 import threading
 import traceback
 import typing as tp
+import uuid
 from asyncio import futures
 from bisect import bisect_left
 from dataclasses import dataclass, field
-import uuid
 
 import jax
 import numpy as np
 from jax import numpy as jnp
 
-
 if tp.TYPE_CHECKING:
 	from easydel.infra.utils import ProcessingClassType
+
 	from .engines._utils import ResultTokens
 else:
 	ProcessingClassType = tp.Any
@@ -184,7 +184,7 @@ class ActiveRequest:
 	top_p: float = 1.0
 	top_k: int = 0
 	min_p: float = 0.0
-	temperature: float = 0.0
+	temperature: float = 0.7
 	presence_penalty: float = 0.0
 	frequency_penalty: float = 0.0
 	repetition_penalty: float = 1.0
