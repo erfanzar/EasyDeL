@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import queue
 import time
@@ -346,13 +347,13 @@ class vSurge:
 		for the final output.
 
 		Args:
-				  response: The list of ReturnSample objects from the current step.
-				  buffered_response_list: A list containing lists of ReturnSample objects
-				      from previous steps that were buffered.
+		      response: The list of ReturnSample objects from the current step.
+		      buffered_response_list: A list containing lists of ReturnSample objects
+		          from previous steps that were buffered.
 
 		Returns:
-				  A list of tuples, where each tuple represents a completed sample and
-				  contains: (decoded_string, all_token_ids, latest_tps, latest_num_generated_tokens).
+		      A list of tuples, where each tuple represents a completed sample and
+		      contains: (decoded_string, all_token_ids, latest_tps, latest_num_generated_tokens).
 		"""
 		current_response_with_flushed_buffer = list(zip(*buffered_response_list, response))
 		current_response_with_flushed_buffer = tp.cast(
@@ -466,28 +467,31 @@ class vSurge:
 		] = None,
 		stream: bool = False,
 	) -> tp.Union[tp.List[ReturnSample], tp.AsyncGenerator[tp.List[ReturnSample]]]:
-		"""Generates text completions for the given prompts and sampling parameters.
-
-		Mimics the basic functionality of vllm's generate method.
+		"""Generates text completions concurrently for the given prompts.
 
 		Args:
-			prompts: A single prompt string or a list of prompt strings.
-			sampling_params: A single SamplingParams object or a list of
-				SamplingParams objects. If None, default SamplingParams will be used.
-				If a single SamplingParams object is provided with multiple prompts,
-				it will be applied to all prompts. If a list is provided, it must
-				have the same length as the prompts list.
-			stream: If True, yields results as they are generated (online inference).
-				If False, waits for all results and returns a list (offline inference).
+		  prompts: A single prompt string or a list of prompt strings.
+		  sampling_params: A single SamplingParams object or a list of
+		    SamplingParams objects. If None, default SamplingParams will be used.
+		    If a single SamplingParams object is provided with multiple prompts,
+		    it will be applied to all prompts. If a list is provided, it must
+		    have the same length as the prompts list.
+		  stream: If True, yields results (List[ReturnSample]) from *any* request
+		    as they become available. The list corresponds to one generation step
+		    from one request. If False, waits for all requests to complete and
+		    returns a list containing one aggregated ReturnSample per prompt.
 
 		Returns:
-			If stream is True, an asynchronous generator yielding lists of ReturnSample.
-			If stream is False, a list of lists of ReturnSample, where each inner list
-			contains the final generated samples for a corresponding prompt.
+		  If stream is True: An async generator yielding lists of ReturnSample as
+		    steps complete across concurrent requests.
+		  If stream is False: A list of aggregated ReturnSample objects, one for
+		    each input prompt, after all requests have finished.
 
 		Raises:
-			ValueError: If the number of prompts and sampling_params lists do not match.
+		  ValueError: If the lengths of prompts and sampling_params lists mismatch.
+		  RuntimeError: If the underlying driver's queue is full.
 		"""
+
 		if isinstance(prompts, str):
 			prompts = [prompts]
 			if sampling_params is not None and not isinstance(
@@ -496,10 +500,7 @@ class vSurge:
 				raise ValueError(
 					"If prompts is a single string, sampling_params must be a single SamplingParams object or None."
 				)
-			if isinstance(sampling_params, SamplingParams):
-				sampling_params = [sampling_params]
-			else:
-				sampling_params = [SamplingParams()] * len(prompts)
+			sampling_params = [sampling_params if sampling_params else SamplingParams()]
 		elif isinstance(prompts, tp.Sequence):
 			if sampling_params is None:
 				sampling_params = [SamplingParams()] * len(prompts)
@@ -507,9 +508,7 @@ class vSurge:
 				sampling_params = [sampling_params] * len(prompts)
 			elif isinstance(sampling_params, tp.Sequence):
 				if len(prompts) != len(sampling_params):
-					raise ValueError(
-						"If prompts is a list, sampling_params must be a single SamplingParams object or a list of the same length."
-					)
+					raise ValueError("Lengths of prompts and sampling_params lists must match.")
 			else:
 				raise ValueError(
 					"sampling_params must be a SamplingParams object, a list of SamplingParams objects, or None."
@@ -517,48 +516,123 @@ class vSurge:
 		else:
 			raise ValueError("prompts must be a string or a sequence of strings.")
 
-		async def generate_async():
-			tasks = []
-			for prompt, params in zip(prompts, sampling_params):
-				request = vSurgeRequest.from_sampling_params(
-					prompt=prompt, sampling_params=params
-				)
-				tasks.append(self.complete(request))
-			results = []
-			for task in tasks:
-				request_results = []
-				async for response in task:
-					if stream:
-						yield response
-					request_results.append(response)
-				if not stream:
-					results.append(request_results)
-			if not stream:
-				yield results
+		if not prompts:
+			if stream:
+
+				async def empty_generator():
+					if False:
+						yield []
+
+				return empty_generator()
+			else:
+				return []
+
+		requests = [
+			vSurgeRequest.from_sampling_params(prompt=p, sampling_params=sp)
+			for p, sp in zip(prompts, sampling_params)
+		]
 
 		if stream:
-			return generate_async()
+			return self._generate_stream(requests)
 		else:
+			return await self._generate_batch(requests)
 
-			async def collect_results():
-				final_result = []
-				async for tasks in generate_async():
-					for result in tasks:
-						task_result = ReturnSample(
-							text="",
-							token_ids=[],
-							tokens_per_second=0.0,
-							num_generated_tokens=0,
-						)
-						for step_result in result:
-							res = step_result[0]
-							task_result.text += res.text
-							task_result.token_ids.extend(res.token_ids)
-							task_result.tokens_per_second += res.tokens_per_second
-							task_result.num_generated_tokens = res.num_generated_tokens
-						task_result.tokens_per_second /= len(result)
-						final_result.append(task_result)
+	async def _generate_stream(
+		self, requests: tp.List[vSurgeRequest]
+	) -> tp.AsyncGenerator[tp.List[ReturnSample]]:
+		"""Helper for concurrent streaming generation."""
+		q = asyncio.Queue()
+		tasks = set()
+		results_map: tp.Dict[asyncio.Task, tp.List[ReturnSample]] = {}
+		_SENTINEL = object()
 
-				return final_result
+		async def _run_completion(request: vSurgeRequest):
+			"""Runs self.complete and puts results (or sentinel/exception) in queue."""
+			try:
+				async for result_step in self.complete(request):
+					await q.put(result_step)
+			except Exception as e:
+				await q.put(e)
+			finally:
+				await q.put(_SENTINEL)
 
-			return await collect_results()
+		for req in requests:
+			task = asyncio.create_task(_run_completion(req))
+			tasks.add(task)
+			results_map[task] = []
+		finished_tasks = 0
+		while finished_tasks < len(requests):
+			item = await q.get()
+			if item is _SENTINEL:
+				finished_tasks += 1
+			elif isinstance(item, Exception):
+				for task in tasks:
+					if not task.done():
+						task.cancel()
+				await asyncio.gather(*tasks, return_exceptions=True)
+				raise item
+			else:
+				yield item
+			q.task_done()
+		await asyncio.gather(*tasks, return_exceptions=True)
+
+	async def _generate_batch(
+		self,
+		requests: tp.List[vSurgeRequest],
+	) -> tp.List[ReturnSample]:
+		"""Helper for concurrent batch generation."""
+
+		async def _collect_all_steps(request: vSurgeRequest) -> list[list[ReturnSample]]:
+			"""Consumes the complete generator and returns all steps."""
+			all_steps = []
+			async for step_result in self.complete(request):
+				all_steps.append(step_result)
+			return all_steps
+
+		tasks = [asyncio.create_task(_collect_all_steps(req)) for req in requests]
+		try:
+			results_per_request: list[list[list[ReturnSample]]] = await asyncio.gather(*tasks)
+		except Exception as e:
+			for task in tasks:
+				if not task.done():
+					task.cancel()
+			await asyncio.gather(*tasks, return_exceptions=True)
+			raise e
+
+		final_results: tp.List[ReturnSample] = []
+		for request_steps in results_per_request:
+			if not request_steps:
+				final_results.append(
+					ReturnSample(
+						text="", token_ids=[], tokens_per_second=0.0, num_generated_tokens=0
+					)
+				)
+				continue
+
+			aggregated_text = ""
+			aggregated_token_ids = []
+			total_tps = 0.0
+			final_num_generated_tokens = 0
+			num_steps = 0
+
+			for step_result in request_steps:
+				if step_result:
+					sample = step_result[0]
+					aggregated_text += sample.text
+					aggregated_token_ids.extend(sample.token_ids)
+					total_tps += sample.tokens_per_second
+					final_num_generated_tokens = sample.num_generated_tokens
+					num_steps += 1
+
+			average_tps = (total_tps / num_steps) if num_steps > 0 else 0.0
+
+			final_results.append(
+				ReturnSample(
+					text=aggregated_text,
+					token_ids=aggregated_token_ids,
+					tokens_per_second=average_tps,
+					num_generated_tokens=final_num_generated_tokens,
+				)
+			)
+
+		return final_results
