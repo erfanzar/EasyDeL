@@ -32,7 +32,6 @@ from jax import numpy as jnp
 
 if tp.TYPE_CHECKING:
 	from easydel.infra.utils import ProcessingClassType
-
 	from .engines._utils import ResultTokens
 else:
 	ProcessingClassType = tp.Any

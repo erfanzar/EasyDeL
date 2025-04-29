@@ -26,13 +26,7 @@ from jax.sharding import PartitionSpec
 from easydel.layers.caching.transformer.transformer_cache import TransformerCache
 from easydel.layers.quantization.quantizers import EasyQuantizer
 
-from .._utils import (
-	ResultTokens,
-	apply_temperature,
-	apply_top_k,
-	apply_top_p,
-	apply_filters,
-)
+from .._utils import ResultTokens, sample_top_p_efficient
 
 if tp.TYPE_CHECKING:
 	from easydel.infra import EasyDeLBaseModule
@@ -239,10 +233,12 @@ def continuous_prefill(
 	)
 	kv_cache = outputs.past_key_values
 	logits = outputs.logits[:, -1]
-	logits = apply_temperature(logits, temperature[0].astype(logits.dtype))
-	logits = apply_top_k(logits, top_k[0])
-	logits = apply_top_p(logits, top_p[0].astype(logits.dtype))
-	next_token = jax.random.categorical(rngs, logits, axis=-1)[:, None]
+	next_token = sample_top_p_efficient(
+		logits,
+		top_p.astype(logits.dtype),
+		temperature.astype(logits.dtype),
+		rngs,
+	)[:, None]
 	validity = jnp.ones_like(next_token, dtype="b1")
 	lengths = jnp.full((batch_size, 1), sequence_length + 1, dtype="i4")
 
@@ -297,8 +293,12 @@ def continuous_decode(
 	kv_cache = outputs.past_key_values
 	logits = outputs.logits[:, -1]
 
-	logits = apply_filters(logits, state.top_p, state.top_k, state.temperature)
-	next_token = jax.random.categorical(rngs, logits, axis=-1)[:, None]
+	next_token = sample_top_p_efficient(
+		logits,
+		state.top_p.astype(logits.dtype),
+		state.temperature.astype(logits.dtype),
+		rngs,
+	)[:, None]
 	lengths = jnp.full(
 		(batch_size, 1),
 		state.generated_tokens[:, -1:] + 1,

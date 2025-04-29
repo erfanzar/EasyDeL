@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import typing as tp
-from functools import partial
 
 import jax
 import numpy as np
@@ -134,70 +133,27 @@ class ResultTokens(tp.NamedTuple):
 		return f"ResultTokens(data={self.data})"
 
 
-def apply_temperature(logits, temperature):
-	return jax.lax.cond(
-		temperature != 0.0,
-		lambda x, temp: x / temp,
-		lambda *x: x[0],
-		logits,
-		temperature,
-	)
-
-
-def apply_top_k(logits, top_k):
+def sample_top_p_efficient(
+	logits: jax.Array,
+	top_p: jax.Array,
+	temperature: jax.Array,
+	rng: jax.random.PRNGKey,
+	top_k_for_computation: int = 50,
+) -> jax.Array:
 	vocab_size = logits.shape[-1]
-	effective_k = jnp.maximum(top_k, 1)
-	effective_k = jnp.minimum(effective_k, vocab_size).astype(jnp.int32)
-
-	def _filter_scores(s: jnp.ndarray) -> jnp.ndarray:
-		"""Applies the dynamic filtering logic."""
-		sorted_scores = jnp.sort(s, axis=-1)[:, ::-1]
-		k_index = effective_k - 1
-		k_index = jnp.maximum(0, k_index)
-		threshold = sorted_scores[:, k_index]
-		threshold = threshold[:, None]
-		mask = s >= threshold
-		return jnp.where(mask, s, -float("inf"))
-
-	def _identity(s: jnp.ndarray) -> jnp.ndarray:
-		"""Returns scores unchanged."""
-		return s
-
-	return jax.lax.cond(
-		(top_k > 0) & (effective_k < vocab_size),
-		_filter_scores,
-		_identity,
-		logits,
-	)
-
-
-def apply_top_p(logits, top_p):
-	def _apply(x):
-		topk_scores, topk_indices = jax.lax.top_k(x, x.shape[-1])
-
-		mask_scores = jnp.full_like(x, -float("inf"))
-		cumulative_probs = jax.nn.softmax(topk_scores, axis=-1).cumsum(axis=-1)
-		score_mask = cumulative_probs < top_p
-		score_mask = jnp.roll(score_mask, 1)
-		score_mask |= score_mask.at[:, 0].set(True)
-		score_mask = score_mask.at[:, :1].set(True)
-		topk_next_scores = jnp.where(score_mask, topk_scores, mask_scores)
-		x = jax.lax.sort_key_val(topk_indices, topk_next_scores)[-1]
-
-		return x
-
-	return jax.lax.cond(
-		(top_p > 0) & (top_p < 1),
-		_apply,
-		lambda x: jax.nn.softmax(x, axis=-1),
-		logits,
-	)
-
-
-@partial(jax.vmap, in_axes=(0, 0, 0, 0), out_axes=(0))
-def apply_filters(logits, top_p, top_k, temperature):
-	logits = jnp.expand_dims(logits, 0)
-	logits = apply_temperature(logits, temperature.astype(logits.dtype))
-	logits = apply_top_k(logits, top_k)
-	logits = apply_top_p(logits, top_p.astype(logits.dtype))
-	return logits[0]
+	effective_k = min(top_k_for_computation, vocab_size)
+	safe_temperature = jnp.where(temperature > 1e-6, temperature, 1.0)
+	scaled_logits = logits / jnp.expand_dims(safe_temperature, axis=-1)
+	top_k_logits, top_k_indices = jax.lax.top_k(scaled_logits, k=effective_k)
+	top_k_probs = jax.nn.softmax(top_k_logits, axis=-1)
+	cumulative_probs_k = jnp.cumsum(top_k_probs, axis=-1)
+	keep_mask_k = cumulative_probs_k <= jnp.expand_dims(top_p, axis=-1)
+	keep_mask_k = keep_mask_k.at[..., 0].set(True)
+	filtered_top_k_logits = jnp.where(keep_mask_k, top_k_logits, -jnp.inf)
+	sampled_k_index = jax.random.categorical(rng, filtered_top_k_logits)
+	next_token_index = jnp.take_along_axis(
+		top_k_indices,
+		jnp.expand_dims(sampled_k_index, axis=-1),
+		axis=-1,
+	).squeeze(-1)
+	return next_token_index
