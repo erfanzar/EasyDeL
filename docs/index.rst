@@ -125,6 +125,9 @@ Zare Chavoshi, Erfan. "EasyDeL, an open-source library, is specifically designed
    api_docs/apis
    whisper_api.md
    vinference_api.md
+	 vsurge_example
+   odrive_example
+   vsurge_api_server_example
    trainers/dpo.md
    trainers/grpo.md
    trainers/orpo.md
