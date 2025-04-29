@@ -110,7 +110,15 @@ def execute_forward(
 	sampling_params = model_inputs.sampling_params
 
 	decode_mode = attn_meta.is_decode_mode()
-	expand_dim = 1 if decode_mode else 0
+	prefill_mode = attn_meta.is_prefill_mode()
+	mixin_length = None
+	if prefill_mode:
+		expand_dim = 0 
+	else:
+		expand_dim = 1
+	if not prefill_mode and not decode_mode:
+		mixin_length = attn_meta.prefill_position.shape[0]
+
 	input_ids = jnp.expand_dims(input_ids, expand_dim)
 	positions = jnp.expand_dims(positions, expand_dim)
 	with model.mesh:
@@ -123,18 +131,45 @@ def execute_forward(
 
 	logits = outputs.logits.squeeze(expand_dim)
 	cache = outputs.past_key_values
-	next_token = sample_top_p_efficient(
-		logits=logits,
-		top_p=sampling_params.top_p,
-		temperature=sampling_params.temperature,
-		rng=rngs,
-	)
-	eos_token_reached = jnp.isin(next_token, eos_token_ids)
-	complete = jnp.logical_or(
-		eos_token_reached,
-		jnp.greater_equal(model_inputs.positions, sampling_params.max_tokens - 1),
-	)
+	if mixin_length is not None:
+		next_token_decode = sample_top_p_efficient(
+			logits=logits[mixin_length:],
+			top_p=sampling_params.top_p,
+			temperature=sampling_params.temperature,
+			rng=rngs,
+		)
+		complete_decode = jnp.isin(next_token_decode, eos_token_ids)
+		complete_decode = jnp.logical_or(
+			complete_decode,
+			jnp.greater_equal(
+				model_inputs.positions[mixin_length:],
+				sampling_params.max_tokens - 1,
+			),
+		)
+		next_token_prefill = sample_top_p_efficient(
+			logits=logits[:mixin_length],
+			top_p=jnp.asarray([0.95]),
+			temperature=jnp.asarray([0.4]),
+			rng=rngs,
+		)
+		complete_prefill = jnp.isin(next_token_prefill, eos_token_ids)
 
+		next_token = jnp.concatenate([next_token_prefill, next_token_decode])
+		complete = jnp.concatenate([complete_prefill, complete_decode])
+
+	else:
+		next_token = sample_top_p_efficient(
+			logits=logits,
+			top_p=sampling_params.top_p,
+			temperature=sampling_params.temperature,
+			rng=rngs,
+		)
+		complete = jnp.isin(next_token, eos_token_ids)
+
+		complete = jnp.logical_or(
+			complete,
+			jnp.greater_equal(model_inputs.positions, sampling_params.max_tokens - 1),
+		)
 	padded_length = 0 if decode_mode else attn_meta.prefill_position.shape[0]
 
 	if len(attn_meta.decodes_position.shape) != 0 and padded_length != 0:

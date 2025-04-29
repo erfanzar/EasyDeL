@@ -422,6 +422,8 @@ class ModelIOProcessor:
 				(ongoing_prefill.positions, ongoing_decodes.positions)
 			)
 
+			sampling_params = ongoing_decodes.sampling_params
+
 			attn_meta.prefill_length = ongoing_prefill.length
 			attn_meta.prefill_position = ongoing_prefill.positions
 			attn_meta.prefill_page_table = ongoing_prefill.page_indices

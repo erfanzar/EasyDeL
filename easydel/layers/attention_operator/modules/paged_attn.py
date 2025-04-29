@@ -255,8 +255,12 @@ class PagedAttn(AttentionImpl):
 			dtype=q.dtype,
 		)
 		padded_prompt_length = cache_metadata.prefill_position.shape[0]
-
-		cache_view = cache_view.write_prefill_to_cache(k, v, cache_metadata)
+		
+		cache_view = cache_view.write_prefill_to_cache(
+			k[:padded_prompt_length, :, :],
+			v[:padded_prompt_length, :, :],
+			cache_metadata,
+		)
 		prefill_output = self._prefill_tpu(
 			q=q[:padded_prompt_length, :, :],
 			k=k[:padded_prompt_length, :, :],
@@ -264,8 +268,12 @@ class PagedAttn(AttentionImpl):
 			cache_view=cache_view,
 			cache_metadata=cache_metadata,
 		)
-		cache_view = cache_view.write_decodes_to_cache(k, v, cache_metadata)
-		decodes_output = self._decodes_tpu(
+		cache_view = cache_view.write_decodes_to_cache(
+			k[padded_prompt_length:, :, :],
+			v[padded_prompt_length:, :, :],
+			cache_metadata,
+		)
+		decodes_output = self._decode_tpu(
 			q=q[padded_prompt_length:, :, :],
 			k=k[padded_prompt_length:, :, :],
 			v=v[padded_prompt_length:, :, :],
@@ -286,7 +294,7 @@ class PagedAttn(AttentionImpl):
 			start_index=padded_prompt_length,
 			axis=0,
 		)
-		return cache_view
+		return output
 
 	@jax.named_scope("easydel-pagedattn-tpu")
 	def forward_tpu(
@@ -405,7 +413,14 @@ class PagedAttn(AttentionImpl):
 		    AttentionOutput: The result of the attention computation with the sequence
 		        dimension restored.
 		"""
-		q = q.squeeze(1 if cache_metadata.is_decode_mode() else 0)
+		if cache_metadata.is_prefill_mode():
+			sq_axis = 0
+		else: 
+			sq_axis = 1
+
+		q = q.squeeze(sq_axis)
+		k = k.squeeze(sq_axis)
+		v = v.squeeze(sq_axis)
 
 		output = super().__call__(  # let use autoswitch ill add gpu kernels later.
 			q=q,
@@ -415,8 +430,5 @@ class PagedAttn(AttentionImpl):
 			cache_metadata=cache_metadata,
 			**ignore,
 		)
-		output.attention_outputs = jnp.expand_dims(
-			output.attention_outputs,
-			1 if cache_metadata.is_decode_mode() else 0,
-		)
+		output.attention_outputs = jnp.expand_dims(output.attention_outputs, sq_axis)
 		return output

@@ -321,7 +321,7 @@ class oDriver(AbstractDriver):
 				)
 			_exec = took() * 10**3
 			logger.info(
-				f"engine - used slots : {self.num_used_slots} / {self.engine.max_concurrent_decodes}, "
+				f"engine - used slots : {self.num_used_slots} / {self._max_locks}, "
 				f"execution time {_exec:.2f}ms "
 			)
 			logger.debug("engine.forward call completed.")
