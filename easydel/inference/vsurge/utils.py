@@ -62,7 +62,7 @@ class ReturnSample:
 	                        sample since the start of the decode phase. Optional.
 	"""
 
-	text: list[str]
+	text: list[str] | str
 	token_ids: list[int]
 	tokens_per_second: float | None = dataclasses.field(default=None)
 	num_generated_tokens: int | None = dataclasses.field(default=None)
