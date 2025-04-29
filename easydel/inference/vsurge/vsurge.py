@@ -199,7 +199,7 @@ class vSurge:
 	def create_vdriver(
 		cls,
 		model: EasyDeLBaseModule,
-		processor: ProcessingClassType,
+		processor: ProcessingClassType,  
 		max_concurrent_decodes: int | None = None,
 		prefill_lengths: int | None = None,
 		max_prefill_length: int | None = None,

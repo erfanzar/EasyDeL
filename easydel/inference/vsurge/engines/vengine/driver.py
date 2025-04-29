@@ -34,12 +34,12 @@ from easydel.utils.helpers import get_logger
 
 from ...utils import (
 	ActiveRequest,
-	ResultTokens,
 	ReturnSample,
 	SafeThread,
 	pad_tokens,
 	process_result_tokens,
 )
+from .._utils import ResultTokens
 from .engine import vEngine
 
 if tp.TYPE_CHECKING:
@@ -48,7 +48,7 @@ else:
 	ProcessingClassType = tp.Any
 
 
-logger = get_logger("vSurge-Driver")
+logger = get_logger("vSurge-vDriver")
 
 
 class vDriver(AbstractDriver):
@@ -166,6 +166,8 @@ class vDriver(AbstractDriver):
 			)
 			for idx in range(len(self._decode_engines))
 		]
+
+		self.live = False
 		self._all_threads = list(
 			itertools.chain(
 				self._prefill_threads,
@@ -177,6 +179,20 @@ class vDriver(AbstractDriver):
 		self.live = True
 		for t in self._all_threads:
 			t.start()
+
+	def start(self):
+		if not self.live:
+			self._all_threads = list(
+				itertools.chain(
+					self._prefill_threads,
+					self._transfer_threads,
+					self._decode_threads,
+					self.detokenize_threads,
+				)
+			)
+			self.live = True
+			for t in self._all_threads:
+				t.start()
 
 	# Add this method within the vDriver class
 	def submit_request(self, request: tp.Any):
@@ -237,40 +253,41 @@ class vDriver(AbstractDriver):
 
 	def stop(self):
 		"""Stops the driver and all background threads."""
-		self.live = False
+		if self.live:
+			self.live = False
 
-		all_backlogs = list(
-			itertools.chain(
-				[self._prefill_backlog],
-				self._transfer_backlogs,
-				self._decode_backlogs.values(),
-				self._detokenize_backlogs,
+			all_backlogs = list(
+				itertools.chain(
+					[self._prefill_backlog],
+					self._transfer_backlogs,
+					self._decode_backlogs.values(),
+					self._detokenize_backlogs,
+				)
 			)
-		)
 
-		while any(t.is_alive() for t in self._all_threads):
-			for q in all_backlogs:
-				while True:
-					try:
-						r = q.get_nowait()
-						if r is None:
-							continue
-						elif isinstance(r, ActiveRequest):
-							r.return_channel = None
-						else:  # detokenize backlog
-							_, r = r
-							if isinstance(r, ActiveRequest):
+			while any(t.is_alive() for t in self._all_threads):
+				for q in all_backlogs:
+					while True:
+						try:
+							r = q.get_nowait()
+							if r is None:
+								continue
+							elif isinstance(r, ActiveRequest):
 								r.return_channel = None
-					except queue.Empty:
-						break
+							else:  # detokenize backlog
+								_, r = r
+								if isinstance(r, ActiveRequest):
+									r.return_channel = None
+						except queue.Empty:
+							break
 
-			for q in all_backlogs:
-				try:
-					q.put_nowait(None)
-				except queue.Full:
-					pass
-		for t in self._all_threads:
-			t.join()
+				for q in all_backlogs:
+					try:
+						q.put_nowait(None)
+					except queue.Full:
+						pass
+			for t in self._all_threads:
+				t.join()
 
 	def get_total_concurrent_requests(self) -> int:
 		"""Gets the total number of concurrent requests the driver can handle."""

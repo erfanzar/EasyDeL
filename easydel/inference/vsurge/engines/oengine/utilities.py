@@ -24,49 +24,7 @@ from easydel.layers.caching.paged_attention import (
 	PagedAttentionCache,
 )
 from easydel.layers.caching.paged_attention.managers import ModelIOProcessor
-
-
-def sample_top_p_efficient(
-	logits: jax.Array,
-	top_p: jax.Array,
-	temperature: jax.Array,
-	rng: jax.random.PRNGKey,
-	top_k_for_computation: int = 50,
-) -> jax.Array:
-	if logits.ndim == 1:
-		logits = jnp.expand_dims(logits, axis=0)
-		batch_size = 1
-		input_was_1d = True
-	else:
-		batch_size = logits.shape[0]
-		input_was_1d = False
-
-	vocab_size = logits.shape[-1]
-	effective_k = min(top_k_for_computation, vocab_size)
-	if top_p.ndim == 0:
-		top_p = jnp.repeat(top_p, batch_size)
-	if temperature.ndim == 0:
-		temperature = jnp.repeat(temperature, batch_size)
-
-	safe_temperature = jnp.where(temperature > 1e-6, temperature, 1.0)
-	scaled_logits = logits / jnp.expand_dims(safe_temperature, axis=-1)
-	top_k_logits, top_k_indices = jax.lax.top_k(scaled_logits, k=effective_k)
-	top_k_probs = jax.nn.softmax(top_k_logits, axis=-1)
-	cumulative_probs_k = jnp.cumsum(top_k_probs, axis=-1)
-	keep_mask_k = cumulative_probs_k <= jnp.expand_dims(top_p, axis=-1)
-	keep_mask_k = keep_mask_k.at[..., 0].set(True)
-	filtered_top_k_logits = jnp.where(keep_mask_k, top_k_logits, -jnp.inf)
-	sampled_k_index = jax.random.categorical(rng, filtered_top_k_logits)
-	next_token_index = jnp.take_along_axis(
-		top_k_indices,
-		jnp.expand_dims(sampled_k_index, axis=-1),
-		axis=-1,
-	).squeeze(-1)
-
-	if input_was_1d:
-		next_token_index = next_token_index.squeeze(0)
-
-	return next_token_index
+from .._utils import sample_top_p_efficient
 
 
 def execute_forward(
@@ -113,7 +71,7 @@ def execute_forward(
 	prefill_mode = attn_meta.is_prefill_mode()
 	mixin_length = None
 	if prefill_mode:
-		expand_dim = 0 
+		expand_dim = 0
 	else:
 		expand_dim = 1
 	if not prefill_mode and not decode_mode:

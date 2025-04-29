@@ -74,7 +74,7 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 		q: Array,
 		k: Array,
 		v: Array,
-		cache_views: TransformerCacheView,
+		cache_view: TransformerCacheView,
 		**ignores,
 	) -> AttentionOutput:
 		"""
@@ -83,14 +83,14 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 		This implementation uses `shard_map` to distribute the computation and relies
 		on standard JAX operations (`einsum`, `softmax`). It calculates attention weights
 		between the single query token and the keys in the cache, applies masking
-		based on the valid range defined in `cache_views`, computes the softmax,
+		based on the valid range defined in `cache_view`, computes the softmax,
 		and finally computes the weighted sum of values.
 
 		Args:
 		    q (Array): Query tensor of shape (batch_size, 1, num_query_heads, head_dim).
 		    k (Array): Key tensor (from cache) of shape (batch_size, kv_sequence_length, num_kv_heads, head_dim).
 		    v (Array): Value tensor (from cache) of shape (batch_size, kv_sequence_length, num_kv_heads, head_dim).
-		    cache_views (TransformerCacheView): Contains metadata about the cache, specifically
+		    cache_view (TransformerCacheView): Contains metadata about the cache, specifically
 		        `starts` (start index for valid keys/values) and `index` (current index or length).
 		    **ignores: Ignored keyword arguments.
 
@@ -136,13 +136,13 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 				),
 				self.create_stable_sharding(
 					views_sharding,
-					dep=cache_views.index,
-					tensor=cache_views.index,
+					dep=cache_view.index,
+					tensor=cache_view.index,
 				),
 				self.create_stable_sharding(
 					views_sharding,
-					dep=cache_views.starts,
-					tensor=cache_views.starts,
+					dep=cache_view.starts,
+					tensor=cache_view.starts,
 				),
 			),
 			out_specs=self.create_stable_sharding(
@@ -173,8 +173,8 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 			q,
 			k,
 			v,
-			cache_views.starts.reshape(-1, 1),
-			cache_views.index.reshape(-1, 1),
+			cache_view.starts.reshape(-1, 1),
+			cache_view.index.reshape(-1, 1),
 		)
 		return AttentionOutput(
 			attention_weights=None,
@@ -203,7 +203,7 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 		q: Array,
 		k: Array,
 		v: Array,
-		cache_views: TransformerCacheView,
+		cache_view: TransformerCacheView,
 		**ignores,
 	) -> AttentionOutput:
 		"""
@@ -217,7 +217,7 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 		    q (Array): Query tensor of shape (batch_size, 1, num_query_heads, head_dim).
 		    k (Array): Key tensor (from cache) of shape (batch_size, kv_sequence_length, num_kv_heads, head_dim).
 		    v (Array): Value tensor (from cache) of shape (batch_size, kv_sequence_length, num_kv_heads, head_dim).
-		    cache_views (TransformerCacheView): Contains cache metadata (`starts`, `index`).
+		    cache_view (TransformerCacheView): Contains cache metadata (`starts`, `index`).
 		    **ignores: Ignored keyword arguments.
 
 		Returns:
@@ -262,13 +262,13 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 				),
 				self.create_stable_sharding(
 					views_sharding,
-					dep=cache_views.index,
-					tensor=cache_views.index,
+					dep=cache_view.index,
+					tensor=cache_view.index,
 				),
 				self.create_stable_sharding(
 					views_sharding,
-					dep=cache_views.starts,
-					tensor=cache_views.starts,
+					dep=cache_view.starts,
+					tensor=cache_view.starts,
 				),
 			),
 			out_specs=self.create_stable_sharding(
@@ -291,8 +291,8 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 			q,
 			k,
 			v,
-			cache_views.starts.reshape(-1, 1),
-			cache_views.index.reshape(-1, 1),
+			cache_view.starts.reshape(-1, 1),
+			cache_view.index.reshape(-1, 1),
 		)
 
 		return AttentionOutput(
@@ -331,8 +331,7 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 		q: Array,
 		k: Array,
 		v: Array,
-		starts: Array,
-		indexs: Array,
+		cache_view: TransformerCacheView,
 		**ignores,
 	) -> AttentionOutput:
 		"""
@@ -347,7 +346,7 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 		    q (Array): Query tensor.
 		    k (Array): Key tensor (from cache).
 		    v (Array): Value tensor (from cache).
-		    cache_views (TransformerCacheView): Cache metadata.
+		    cache_view (TransformerCacheView): Cache metadata.
 		    **kwargs: Additional keyword arguments passed to the underlying forward method.
 
 		Returns:
@@ -357,8 +356,7 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 			q=q,
 			k=k,
 			v=v,
-			starts=starts,
-			indexs=indexs,
+			cache_view=cache_view,
 			**ignores,
 		)
 

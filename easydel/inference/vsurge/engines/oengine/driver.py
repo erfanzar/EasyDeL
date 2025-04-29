@@ -89,6 +89,7 @@ class oDriver(AbstractDriver):
 		)
 		# Flag indicating if the driver is live and running
 		self.live = False
+		self.start()
 
 	@property
 	def driver_name(self):
@@ -166,16 +167,17 @@ class oDriver(AbstractDriver):
 		Signals the background threads to exit by putting None into their respective
 		queues and then waits for them to join.
 		"""
-		self.live = False
-		# Signal threads to exit
-		self._prepare_backlog.put(None)
-		self._process_backlog.put(None)
-		self.engine.scheduler.enqueue_prefill_request(None)
-		self.engine.scheduler.enqueue_decodes_request(None)
-		# Wait for threads to finish
-		self._process_summery_thread.join()
-		self._execution_loop_thread.join()
-		self._prepare_inputs_thread.join()
+		if self.live:
+			self.live = False
+			# Signal threads to exit
+			self._prepare_backlog.put(None)
+			self._process_backlog.put(None)
+			self.engine.scheduler.enqueue_prefill_request(None)
+			self.engine.scheduler.enqueue_decodes_request(None)
+			# Wait for threads to finish
+			self._process_summery_thread.join()
+			self._execution_loop_thread.join()
+			self._prepare_inputs_thread.join()
 
 	def submit_request(self, request: tp.Any):
 		"""
