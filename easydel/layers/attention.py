@@ -274,8 +274,6 @@ class FlexibleAttentionModule(nn.Module):
 					k=key_states,
 					v=value_states,
 					bias=bias,
-					starts=cache_view.starts,
-					indexs=cache_view.index,
 					cache_metadata=cache_metadata,
 					cache_view=cache_view,
 					init_bias=init_bias,
@@ -460,8 +458,10 @@ class AttentionModule(nn.Module):
 		    jax.Array: An array representing the position of each token in the sequence,
 		               adjusted by the cache index if provided. Shape usually [batch, q_len].
 		"""
-
-		end_index = jnp.reshape(cache_view.index, (-1, 1)) if cache_view is not None else 0
+		if isinstance(cache_view, TransformerCacheView):
+			end_index = jnp.reshape(cache_view.index, (-1, 1))
+		else:
+			end_index = 0
 		inipos = jnp.cumsum(jnp.any(attention_mask, -1)[:, -1, :], axis=-1)
 		return (inipos - (inipos >= 1)) + end_index
 
@@ -685,9 +685,21 @@ class AttentionModule(nn.Module):
 					partition_manager=self.config.partition_manager,
 				)
 			elif isinstance(cache_view, PagedAttentionCacheView):
-				num_reps = query.shape[2] // key.shape[2]
-				if num_reps != 1:
-					key, value = self.repeat_key_value(key=key, value=value, num_reps=num_reps)
+				pop_axis = 1 if cache_metadata.is_decode_mode() else 0
+
+				if cache_metadata.is_decode_mode():
+					cache_view = cache_view.write_decodes_to_cache(
+						key.squeeze(pop_axis),
+						value.squeeze(pop_axis),
+						cache_metadata,
+					)
+				elif cache_metadata.is_prefill_mode():
+					cache_view = cache_view.write_prefill_to_cache(
+						key.squeeze(pop_axis),
+						value.squeeze(pop_axis),
+						cache_metadata,
+					)
+
 			else:
 				raise NotImplementedError(
 					"requested type of CacheView is not supported for this attention module."

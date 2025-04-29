@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .driver import vDriver
 from .engine import vEngine
-from .utilities import GenerationState, ResultTokens, SlotData
 
-__all__ = ("GenerationState", "ResultTokens", "SlotData", "vEngine")
+__all__ = ("vEngine", "vDriver")

@@ -422,8 +422,9 @@ class StableLmAttention(AttentionModule):
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
-			cache_view=cache_view,
 			value=value_states,
+			cache_view=cache_view,
+			cache_metadata=cache_metadata,
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,
 			fcm_mask=fcm_mask,

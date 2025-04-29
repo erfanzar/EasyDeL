@@ -287,8 +287,9 @@ class Gemma3Attention(AttentionModule):
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
-			cache_view=cache_view,
 			value=value_states,
+			cache_view=cache_view,
+			cache_metadata=cache_metadata,
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,
 			token_type_ids=token_type_ids,
@@ -298,11 +299,17 @@ class Gemma3Attention(AttentionModule):
 
 		if self.is_sliding:
 			cache_pos = self.build_cache_pos(attention_mask, cache_view)
+			if isinstance(cache_view, TransformerCacheView):
+				curr_index = cache_view.index
+			else:
+				curr_index = jnp.repeat(
+					jnp.array([0], "i4").reshape(-1),
+					query_states.shape[0],
+					0,
+				)
 			sliding_mask = self._create_sliding_mask(
 				cache_pos=cache_pos,
-				curr_index=cache_view.index
-				if cache_view is not None
-				else jnp.repeat(jnp.array([0], "i4").reshape(-1), query_states.shape[0], 0),
+				curr_index=curr_index,
 				cache_length=attention_mask.shape[-1],
 				sliding_windows=self.sliding_window,
 			)

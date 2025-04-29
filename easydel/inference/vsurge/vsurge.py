@@ -15,18 +15,33 @@
 from __future__ import annotations
 
 import dataclasses
-import datetime
 import queue
 import time
 import typing as tp
 
 import jax
+
 from easydel.inference.utilities import SamplingParams
+from easydel.layers.caching.paged_attention import (
+	HBMPageManager,
+	PagedAttentionCache,
+)
 from easydel.utils.helpers import get_logger
 
-from .driver import ActiveRequest, ActiveRequestMetadata, AsyncMultifuture, vDriver
-from .utils import ReturnSample, is_byte_token, text_tokens_to_string
-from .vengine import vEngine
+from .engines import (
+	oDriver,
+	oEngine,
+	vDriver,
+	vEngine,
+)
+from .utils import (
+	ActiveRequest,
+	ActiveRequestMetadata,
+	AsyncMultifuture,
+	ReturnSample,
+	is_byte_token,
+	text_tokens_to_string,
+)
 
 if tp.TYPE_CHECKING:
 	from easydel.infra.base_module import EasyDeLBaseModule
@@ -60,7 +75,7 @@ class vSurgeRequest:
 	top_p: float = 1.0
 	top_k: int = 0
 	min_p: float = 0.0
-	temperature: float = 0.0
+	temperature: float = 0.7
 	presence_penalty: float = 0.0
 	frequency_penalty: float = 0.0
 	repetition_penalty: float = 1.0
@@ -92,7 +107,11 @@ class vSurgeRequest:
 class vSurge:
 	"""Orchestrates the interaction between client requests and the vDriver."""
 
-	def __init__(self, driver: vDriver, vsurge_name: str | None = None):
+	def __init__(
+		self,
+		driver: tp.Union[vDriver, oDriver],
+		vsurge_name: str | None = None,
+	):
 		"""Initializes the vSurge.
 
 		Args:
@@ -100,39 +119,7 @@ class vSurge:
 		        engines and processing threads.
 		"""
 		self._driver = driver
-		self._vsurge_name = vsurge_name or self._get_vsurge_name(
-			driver._decode_engines[-1].model
-		)
-
-	def _get_vsurge_name(self, model) -> str:
-		"""
-		Generate a standardized vsurge name combining model type, size, and timestamp.
-
-		Format: {model_type}-{size_in_B}B-{timestamp}
-		Example: llama-7.00B-20240311
-		"""
-		model_type = self._get_model_type(model)
-		model_size = self._calculate_model_size(model.graphstate)
-		timestamp = datetime.datetime.now().strftime("%Y%m%d")
-
-		return f"{model_type}-{model_size}B-{timestamp}"
-
-	def _get_model_type(self, model) -> str:
-		"""Get the model type, with fallback to 'unknown' if not found."""
-		return getattr(model.config, "model_type", "unknown").lower()
-
-	def _calculate_model_size(self, graphstate) -> str:
-		"""
-		Calculate model size in billions of parameters.
-		Returns formatted string with 2 decimal places.
-		"""
-		try:
-			num_params = sum(n.size for n in jax.tree_util.tree_flatten(graphstate)[0])
-			size_in_billions = num_params / 1e9
-			return f"{size_in_billions:.2f}"
-		except Exception as e:
-			logger.warning(f"Failed to calculate model size: {e}")
-			return "unknown"
+		self._vsurge_name = vsurge_name or driver.driver_name
 
 	def compile(self):
 		self.driver.compile()
@@ -151,11 +138,64 @@ class vSurge:
 		"""Returns the processor/tokenizer associated with the underlying driver."""
 		return self.driver.processor
 
+	def start(self):
+		return self.driver.start()
+
 	def stop(self):
 		return self.driver.stop()
 
 	@classmethod
-	def create(
+	def create_odriver(
+		cls,
+		model: EasyDeLBaseModule,
+		processor: ProcessingClassType,
+		storage: tp.Optional[PagedAttentionCache] = None,
+		manager: tp.Optional[HBMPageManager] = None,
+		page_size: int = 128,
+		hbm_utilization: float = 0.6,
+		max_concurrent_prefill: int | None = None,
+		max_concurrent_decodes: int | None = None,
+		prefill_lengths: int | None = None,
+		max_prefill_length: int | None = None,
+		max_length: int | None = None,
+		seed: int = 894,
+		vsurge_name: str | None = None,
+	) -> vSurge:
+		max_length = max_length or 8192
+		max_concurrent_prefill = max_concurrent_prefill or jax.device_count()
+		max_concurrent_decodes = max_concurrent_decodes or jax.device_count()
+		metadata = model.create_paged_metadata(
+			page_size=page_size,
+			batch_size=max_concurrent_decodes,
+			max_sequences=max_length,
+			dtype=model.dtype,
+			hbm_utilization=hbm_utilization,
+		)
+		if storage is None:
+			storage = model.init_pages(metadata=metadata)
+		if manager is None:
+			manager = HBMPageManager(metadata=metadata)
+		return vSurge(
+			driver=oDriver(
+				oEngine(
+					model=model,
+					processor=processor,
+					storage=storage,
+					manager=manager,
+					max_concurrent_decodes=max_concurrent_decodes,
+					max_concurrent_prefill=max_concurrent_prefill,
+					prefill_lengths=prefill_lengths,
+					max_prefill_length=max_prefill_length,
+					max_length=max_length,
+					batch_size=max_concurrent_decodes,
+					seed=seed,
+				)
+			),
+			vsurge_name=vsurge_name,
+		)
+
+	@classmethod
+	def create_vdriver(
 		cls,
 		model: EasyDeLBaseModule,
 		processor: ProcessingClassType,
@@ -165,7 +205,7 @@ class vSurge:
 		max_length: int | None = None,
 		seed: int = 894,
 		vsurge_name: str | None = None,
-	):
+	) -> vSurge:
 		"""Creates a new instance of vSurge with configured vDriver and vEngines.
 
 		This class method provides a convenient way to instantiate the vSurge
@@ -254,7 +294,6 @@ class vSurge:
 				)
 		except Exception as e:
 			logger.error(f"Error during token counting: {e}")
-			# Re-raise or handle as appropriate for the API
 			raise ValueError(f"Failed to count tokens: {e}") from e
 
 	def process_client_side_tokenization_response(self, response: list[ReturnSample]):
@@ -418,3 +457,108 @@ class vSurge:
 				dummy_response,
 				buffered_response_list,
 			)
+
+	async def generate(
+		self,
+		prompts: tp.Union[str, tp.Sequence[str]],
+		sampling_params: tp.Optional[
+			tp.Union[SamplingParams, tp.Sequence[SamplingParams]]
+		] = None,
+		stream: bool = False,
+	) -> tp.Union[tp.List[ReturnSample], tp.AsyncGenerator[tp.List[ReturnSample]]]:
+		"""Generates text completions for the given prompts and sampling parameters.
+
+		Mimics the basic functionality of vllm's generate method.
+
+		Args:
+			prompts: A single prompt string or a list of prompt strings.
+			sampling_params: A single SamplingParams object or a list of
+				SamplingParams objects. If None, default SamplingParams will be used.
+				If a single SamplingParams object is provided with multiple prompts,
+				it will be applied to all prompts. If a list is provided, it must
+				have the same length as the prompts list.
+			stream: If True, yields results as they are generated (online inference).
+				If False, waits for all results and returns a list (offline inference).
+
+		Returns:
+			If stream is True, an asynchronous generator yielding lists of ReturnSample.
+			If stream is False, a list of lists of ReturnSample, where each inner list
+			contains the final generated samples for a corresponding prompt.
+
+		Raises:
+			ValueError: If the number of prompts and sampling_params lists do not match.
+		"""
+		if isinstance(prompts, str):
+			prompts = [prompts]
+			if sampling_params is not None and not isinstance(
+				sampling_params, SamplingParams
+			):
+				raise ValueError(
+					"If prompts is a single string, sampling_params must be a single SamplingParams object or None."
+				)
+			if isinstance(sampling_params, SamplingParams):
+				sampling_params = [sampling_params]
+			else:
+				sampling_params = [SamplingParams()] * len(prompts)
+		elif isinstance(prompts, tp.Sequence):
+			if sampling_params is None:
+				sampling_params = [SamplingParams()] * len(prompts)
+			elif isinstance(sampling_params, SamplingParams):
+				sampling_params = [sampling_params] * len(prompts)
+			elif isinstance(sampling_params, tp.Sequence):
+				if len(prompts) != len(sampling_params):
+					raise ValueError(
+						"If prompts is a list, sampling_params must be a single SamplingParams object or a list of the same length."
+					)
+			else:
+				raise ValueError(
+					"sampling_params must be a SamplingParams object, a list of SamplingParams objects, or None."
+				)
+		else:
+			raise ValueError("prompts must be a string or a sequence of strings.")
+
+		async def generate_async():
+			tasks = []
+			for prompt, params in zip(prompts, sampling_params):
+				request = vSurgeRequest.from_sampling_params(
+					prompt=prompt, sampling_params=params
+				)
+				tasks.append(self.complete(request))
+			results = []
+			for task in tasks:
+				request_results = []
+				async for response in task:
+					if stream:
+						yield response
+					request_results.append(response)
+				if not stream:
+					results.append(request_results)
+			if not stream:
+				yield results
+
+		if stream:
+			return generate_async()
+		else:
+
+			async def collect_results():
+				final_result = []
+				async for tasks in generate_async():
+					for result in tasks:
+						task_result = ReturnSample(
+							text="",
+							token_ids=[],
+							tokens_per_second=0.0,
+							num_generated_tokens=0,
+						)
+						for step_result in result:
+							res = step_result[0]
+							task_result.text += res.text
+							task_result.token_ids.extend(res.token_ids)
+							task_result.tokens_per_second += res.tokens_per_second
+							task_result.num_generated_tokens = res.num_generated_tokens
+						task_result.tokens_per_second /= len(result)
+						final_result.append(task_result)
+
+				return final_result
+
+			return await collect_results()

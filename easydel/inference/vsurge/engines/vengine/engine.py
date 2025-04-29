@@ -16,15 +16,17 @@ import typing as tp
 from functools import cached_property
 
 import jax
+from eformer import common_types
 from eformer import escale as es
 from flax import nnx as nn
 from jax import numpy as jnp
 from jax.sharding import NamedSharding as Ns
 from jax.sharding import PartitionSpec as Ps
 from transformers import ProcessorMixin
-from eformer import common_types
+
 from easydel.utils.compiling_utils import cjit
 
+from .._abstract_engine import AbstractInferenceEngine
 from .utilities import (
 	GenerationState,
 	ResultTokens,
@@ -36,13 +38,11 @@ from .utilities import (
 
 if tp.TYPE_CHECKING:
 	from easydel.infra import EasyDeLBaseModule
+	from easydel.infra.utils import ProcessingClassType
 else:
 	EasyDeLBaseModule = tp.Any
+	ProcessingClassType = tp.Any
 
-
-import jax.experimental.layout as jlu
-
-AutoLayout = jlu.Layout(jlu.DeviceLocalLayout.AUTO)
 
 NOT_GIVEN = common_types.NOT_GIVEN
 RUNTIME_MODE_TYPES = common_types.RUNTIME_MODE_TYPES
@@ -58,7 +58,7 @@ BIAS_KV_SEQ = common_types.BIAS_KV_SEQ
 MODE_PREFILL = common_types.MODE_PREFILL
 
 
-class vEngine:
+class vEngine(AbstractInferenceEngine):
 	"""
 	Core inference engine for EasyDeL models using NNX graphs.
 
@@ -71,7 +71,7 @@ class vEngine:
 	def __init__(
 		self,
 		model: EasyDeLBaseModule,
-		processor,
+		processor: ProcessingClassType,
 		max_concurrent_decodes: int | None = None,
 		max_concurrent_prefill: int | None = None,
 		prefill_lengths: int | None = None,
@@ -99,7 +99,7 @@ class vEngine:
 		    seed: The random seed for initializing the PRNG key used in sampling.
 		        Defaults to 894.
 		"""
-		from ..utils import DEFAULT_PREFILL_BUCKETS
+		from ...utils import DEFAULT_PREFILL_BUCKETS
 
 		self.model = model
 		self.graphdef, self.graphstate, self.graphothers = model.split_module()

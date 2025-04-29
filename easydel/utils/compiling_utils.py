@@ -24,6 +24,7 @@ import warnings
 
 import jax
 from jax.experimental.serialize_executable import deserialize_and_load, serialize
+import numpy as np
 
 from .helpers import check_bool_flag, get_cache_dir
 
@@ -71,7 +72,7 @@ def cjit(
 		if static_argnames is not None:
 			for key in static_argnames:
 				dynamic_kwargs.pop(key, None)
-		signature = get_signature(dynamic_args, dynamic_kwargs)
+		signature = get_signature_tree_util(dynamic_args, dynamic_kwargs)
 		cache_key = (fn, signature)
 		if cache_key in COMPILED_CACHE:
 			compiled_func = COMPILED_CACHE[cache_key]
@@ -106,17 +107,48 @@ def get_safe_hash_int(text, algorithm="md5"):
 		raise Exception(f"Error generating hash: {str(e)}") from e
 
 
-def get_signature(args, kwargs) -> tp.Tuple:
-	"""Get a hashable signature of args/kwargs shapes and dtypes."""
+_leaf_types = (jax.Array, np.ndarray, int, float, bool, str, bytes, type(None))
 
-	def get_array_signature(x):
-		if hasattr(x, "shape") and hasattr(x, "dtype"):
-			return (tuple(x.shape), str(x.dtype))
-		return str(type(x))
 
-	args_sig = tuple(get_array_signature(arg) for arg in args)
-	kwargs_sig = tuple((k, get_array_signature(v)) for k, v in sorted(kwargs.items()))
-	return (args_sig, kwargs_sig)
+def _is_leaf_for_signature(node):
+	if isinstance(node, (jax.Array, np.ndarray)):
+		return True
+	if isinstance(node, _leaf_types):
+		return True
+	if not isinstance(node, (list, tuple, dict)):
+		try:
+			_ = node.shape
+			_ = node.dtype
+			return True
+		except AttributeError:
+			return False
+	return False
+
+
+def get_leaf_signature(leaf: tp.Any) -> tp.Hashable:
+	if isinstance(leaf, (jax.Array, np.ndarray)) or (
+		hasattr(leaf, "shape") and hasattr(leaf, "dtype")
+	):
+		try:
+			shape = tuple(leaf.shape)
+			dtype_str = str(jax.dtypes.canonicalize_dtype(leaf.dtype))
+			return (shape, dtype_str)
+		except Exception:
+			return type(leaf)
+	else:
+		return type(leaf)
+
+
+def get_signature_tree_util(
+	args: tp.Tuple[tp.Any, ...],
+	kwargs: tp.Dict[str, tp.Any],
+) -> tp.Tuple:
+	leaves, structure = jax.tree_util.tree_flatten(
+		(args, kwargs),
+		is_leaf=_is_leaf_for_signature,
+	)
+	leaf_signatures = leaf_signatures = tuple(map(get_leaf_signature, leaves))
+	return (structure, leaf_signatures)
 
 
 def get_hash_of_lowering(lowered_func: Lowered):
@@ -223,7 +255,7 @@ def cache_compiles(
 
 		@functools.wraps(func)
 		def wrapper(*args, **kwargs):
-			signature = (func_id, get_signature(args, kwargs))
+			signature = (func_id, get_signature_tree_util(args, kwargs))
 			if signature in COMPILED_CACHE:
 				for static_key in static_argnames:
 					kwargs.pop(static_key)

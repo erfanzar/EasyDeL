@@ -12,20 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
+import asyncio
 import dataclasses
+import os
+import signal
+import threading
+import traceback
 import typing as tp
+import uuid
+from asyncio import futures
 from bisect import bisect_left
+from dataclasses import dataclass, field
 
 import jax
 import numpy as np
 from jax import numpy as jnp
 
-from .vengine import ResultTokens
-
 if tp.TYPE_CHECKING:
 	from easydel.infra.utils import ProcessingClassType
+
+	from .engines._utils import ResultTokens
 else:
 	ProcessingClassType = tp.Any
+	ResultTokens = tp.Any
+
+
+V = tp.TypeVar("V")
 
 
 @dataclasses.dataclass
@@ -48,10 +62,176 @@ class ReturnSample:
 	                        sample since the start of the decode phase. Optional.
 	"""
 
-	text: list[str]
+	text: list[str] | str
 	token_ids: list[int]
 	tokens_per_second: float | None = dataclasses.field(default=None)
 	num_generated_tokens: int | None = dataclasses.field(default=None)
+
+
+class _Exception:
+	"""A class for propagating exceptions through a queue.
+
+	By wrapping them with a custom private class we ensure that any type
+	(including Exception) can be used as a V.
+	"""
+
+	def __init__(self, exception: Exception) -> None:
+		self.exception = exception
+
+
+class AsyncMultifuture(tp.Generic[V]):
+	"""AsyncMultifuture is like concurrent.futures.Future but supports returning
+
+	multiple results. It provides an unidirectional stream with buffering and
+	exception propagation.
+
+	Supports delivering results to an async Python event loop. Must be
+	constructed inside of the event loop.
+	"""
+
+	def __init__(self) -> None:
+		self._cancelled = threading.Event()
+		self._done = threading.Event()
+		self._loop = asyncio.get_running_loop()
+		self._queue = asyncio.Queue[V | _Exception]()
+
+	def cancel(self, unused: tp.Any = None) -> None:
+		"""Cancels the asyncmultifuture."""
+		# Needed for compatibility with grpc.aio.ServicerContext.add_done_callback.
+		del unused
+		self._cancelled.set()
+		self.set_exception(futures.CancelledError())
+
+	def cancelled(self) -> bool:
+		"""Returns whether the asyncmultifuture has been cancelled."""
+		return self._cancelled.is_set()
+
+	def done(self) -> bool:
+		"""AsyncMultifuture is done when it is finalized with close() or
+
+		set_exception().
+		"""
+		return self._done.is_set()
+
+	def set_exception(self, exception: Exception) -> None:
+		"""Stores the given exception in the asyncmultifuture.
+
+		The exception would be delivered after all previously added results are
+		yielded. set_exception can be called multiple times, however subsequent
+		calls will be ignored.
+
+		Args:
+		  exception: The exception to set.
+		"""
+		self._loop.call_soon_threadsafe(self._queue.put_nowait, _Exception(exception))
+		self._loop.call_soon_threadsafe(self._done.set)
+
+	def add_result(self, result: V) -> None:
+		"""Adds the result to the asyncmultifuture.
+
+		Caller must call .close() once all results are added.
+
+		Args:
+		  result: The result to add.
+		"""
+		self._loop.call_soon_threadsafe(self._queue.put_nowait, result)
+
+	def close(self) -> None:
+		"""Notifies the receiver that no more results would be added."""
+		self.set_exception(StopAsyncIteration())
+
+	def __aiter__(self) -> AsyncMultifuture:
+		return self
+
+	async def __anext__(self) -> V:
+		"""Returns the next value."""
+		value = await self._queue.get()
+		if isinstance(value, _Exception):
+			raise value.exception
+		return value
+
+
+if tp.TYPE_CHECKING:
+	from easydel.infra import EasyDeLBaseModule
+else:
+	EasyDeLBaseModule = tp.Any
+
+
+@dataclass
+class ActiveRequestMetadata:
+	"""Inference request metadata."""
+
+	start_time: tp.Optional[float] = None
+
+	prefill_enqueue_time: tp.Optional[float] = None
+	prefill_dequeue_time: tp.Optional[float] = None
+
+	transfer_enqueue_time: tp.Optional[float] = None
+	transfer_dequeue_time: tp.Optional[float] = None
+
+	generate_enqueue_time: tp.Optional[float] = None
+	generate_dequeue_time: tp.Optional[float] = None
+
+	complete_time: tp.Optional[float] = None
+
+
+@dataclass
+class ActiveRequest:
+	"""Current state of the driver."""
+
+	max_tokens: int
+	return_channel: AsyncMultifuture[list[ReturnSample]]
+	top_p: float = 1.0
+	top_k: int = 0
+	min_p: float = 0.0
+	temperature: float = 0.7
+	presence_penalty: float = 0.0
+	frequency_penalty: float = 0.0
+	repetition_penalty: float = 1.0
+	complete: tp.Optional[np.ndarray] = None
+	prefill_result: tp.Any = None
+	prefill_content: tp.Optional[str | list[int]] = None
+	generate_timestep_added: tp.Optional[int] = None
+	is_client_side_tokenization: tp.Optional[bool] = False
+	# Metrics Tracking
+	decode_start_time: float | None = None
+	total_generated_tokens: int = 0
+	metadata: ActiveRequestMetadata = field(default_factory=ActiveRequestMetadata)
+
+	id: str = field(default_factory=uuid.uuid4)
+
+	def enqueue_samples(self, generated_samples: list[ReturnSample]):
+		"""Adds the generated sample(s) to return channel for current step.
+
+		Args:
+		  generated_samples: The generated sample(s) for current step.
+
+		This should be called only from within the Drivers background thread.
+		"""
+		self.return_channel.add_result(generated_samples)
+
+
+class SafeThread(threading.Thread):
+	"""Thread that kills the program if it fails.
+
+	If a driver thread goes down, we can't operate.
+	"""
+
+	def run(self):
+		"""Executes the thread's target function.
+
+		If the target function raises any exception, this method catches it,
+		prints the traceback, and forcefully kills the entire process using
+		`os.kill` with `signal.SIGKILL`. This ensures that if a critical
+		driver thread fails, the whole system stops, preventing potential
+		inconsistent states or hangs.
+		"""
+		try:
+			super().run()
+		except Exception as e:
+			print(f"Thread {self.name} encountered an error: {e}")
+			traceback.print_exc()
+			os.kill(os.getpid(), signal.SIGKILL)
 
 
 def process_result_tokens(

@@ -104,6 +104,8 @@ _import_structure = {
 		"vInferencePreCompileConfig",
 		"vDriver",
 		"vEngine",
+		"oDriver",
+		"oEngine",
 		"vSurge",
 		"vSurgeRequest",
 		"vSurgeApiServer",
@@ -460,6 +462,8 @@ if _tp.TYPE_CHECKING:
 	from . import utils
 	from .inference import (
 		SamplingParams,
+		oDriver,
+		oEngine,
 		vDriver,
 		vEngine,
 		vInference,
@@ -467,8 +471,8 @@ if _tp.TYPE_CHECKING:
 		vInferenceConfig,
 		vInferencePreCompileConfig,
 		vSurge,
-		vSurgeRequest,
 		vSurgeApiServer,
+		vSurgeRequest,
 		vWhisperInference,
 		vWhisperInferenceConfig,
 	)

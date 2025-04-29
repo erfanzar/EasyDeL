@@ -23,6 +23,7 @@ from jax import random as jr
 from jax.experimental import shard_map
 from jax.sharding import PartitionSpec as Ps
 from easydel.kernels.tpu_ops import pallas_ragged_decode
+from easydel.layers.caching.transformer.transformer_cache import TransformerCacheView
 from .._attention_impl import (
 	AttentionImpl,
 	AttentionMetadata,
@@ -35,6 +36,19 @@ shard_map = shard_map.shard_map
 
 @AttentionRegistry.register
 class AutoRegressiveDecodeAttn(AttentionImpl):
+	"""
+	Attention implementation tailored for the autoregressive decoding step.
+
+	This class handles the attention mechanism when generating tokens one by one,
+	attending to the previously generated sequence stored in a cache. It utilizes
+	`shard_map` for distributed computation and supports different backends,
+	including a potential Pallas-optimized version for TPUs. It assumes the
+	query sequence length is 1.
+
+	Attributes:
+	    metadata (AttentionMetadata): Configuration metadata for the attention mechanism.
+	"""
+
 	@classmethod
 	def get_impl_name(cls) -> tp.Union[str, tp.Tuple[str]]:
 		"""
@@ -60,10 +74,30 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 		q: Array,
 		k: Array,
 		v: Array,
-		starts: Array,
-		indexs: Array,
+		cache_views: TransformerCacheView,
 		**ignores,
 	) -> AttentionOutput:
+		"""
+		Performs the native JAX/XLA forward pass for autoregressive decoding attention.
+
+		This implementation uses `shard_map` to distribute the computation and relies
+		on standard JAX operations (`einsum`, `softmax`). It calculates attention weights
+		between the single query token and the keys in the cache, applies masking
+		based on the valid range defined in `cache_views`, computes the softmax,
+		and finally computes the weighted sum of values.
+
+		Args:
+		    q (Array): Query tensor of shape (batch_size, 1, num_query_heads, head_dim).
+		    k (Array): Key tensor (from cache) of shape (batch_size, kv_sequence_length, num_kv_heads, head_dim).
+		    v (Array): Value tensor (from cache) of shape (batch_size, kv_sequence_length, num_kv_heads, head_dim).
+		    cache_views (TransformerCacheView): Contains metadata about the cache, specifically
+		        `starts` (start index for valid keys/values) and `index` (current index or length).
+		    **ignores: Ignored keyword arguments.
+
+		Returns:
+		    AttentionOutput: An object containing the attention outputs (`attention_outputs`)
+		        of shape (batch_size, 1, num_query_heads, head_dim). Attention weights are not returned.
+		"""
 		sm_scale = self.metadata.softmax_scale
 		sm_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
 		model_mode = self.get_mode(q=q, BTHD=True)
@@ -102,13 +136,13 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 				),
 				self.create_stable_sharding(
 					views_sharding,
-					dep=indexs,
-					tensor=indexs,
+					dep=cache_views.index,
+					tensor=cache_views.index,
 				),
 				self.create_stable_sharding(
 					views_sharding,
-					dep=starts,
-					tensor=starts,
+					dep=cache_views.starts,
+					tensor=cache_views.starts,
 				),
 			),
 			out_specs=self.create_stable_sharding(
@@ -139,8 +173,8 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 			q,
 			k,
 			v,
-			starts.reshape(-1, 1),
-			indexs.reshape(-1, 1),
+			cache_views.starts.reshape(-1, 1),
+			cache_views.index.reshape(-1, 1),
 		)
 		return AttentionOutput(
 			attention_weights=None,
@@ -148,11 +182,20 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 		)
 
 	def forward_gpu(self, *args, **kwargs) -> AttentionOutput:
-		"""GPU forward pass. Delegates to `forward_native`."""
+		"""
+		GPU forward pass for autoregressive decoding attention.
+
+		Currently delegates to `forward_cuda`.
+		"""
 		return self.forward_cuda(*args, **kwargs)
 
 	def forward_tpu(self, *args, **kwargs) -> AttentionOutput:
-		"""TPU forward pass. Delegates to `forward_native`."""
+		"""
+		TPU forward pass for autoregressive decoding attention.
+
+		Currently delegates to the native JAX/XLA implementation (`forward_native`).
+		Consider using `_forward_tpu` for potential Pallas optimization if available/enabled.
+		"""
 		return self.forward_native(*args, **kwargs)
 
 	def _forward_tpu(
@@ -160,10 +203,27 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 		q: Array,
 		k: Array,
 		v: Array,
-		starts: Array,
-		indexs: Array,
+		cache_views: TransformerCacheView,
 		**ignores,
 	) -> AttentionOutput:
+		"""
+		TPU-specific forward pass using the Pallas ragged decode kernel.
+
+		This method is intended for TPU execution and leverages the potentially
+		optimized `pallas_ragged_decode` kernel for better performance compared
+		to the native `einsum`-based implementation.
+
+		Args:
+		    q (Array): Query tensor of shape (batch_size, 1, num_query_heads, head_dim).
+		    k (Array): Key tensor (from cache) of shape (batch_size, kv_sequence_length, num_kv_heads, head_dim).
+		    v (Array): Value tensor (from cache) of shape (batch_size, kv_sequence_length, num_kv_heads, head_dim).
+		    cache_views (TransformerCacheView): Contains cache metadata (`starts`, `index`).
+		    **ignores: Ignored keyword arguments.
+
+		Returns:
+		    AttentionOutput: An object containing the attention outputs (`attention_outputs`)
+		        calculated by the Pallas kernel. Attention weights are not returned.
+		"""
 		sm_scale = self.metadata.softmax_scale
 		sm_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
 		model_mode = self.get_mode(q=q, BTHD=True)
@@ -202,13 +262,13 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 				),
 				self.create_stable_sharding(
 					views_sharding,
-					dep=indexs,
-					tensor=indexs,
+					dep=cache_views.index,
+					tensor=cache_views.index,
 				),
 				self.create_stable_sharding(
 					views_sharding,
-					dep=starts,
-					tensor=starts,
+					dep=cache_views.starts,
+					tensor=cache_views.starts,
 				),
 			),
 			out_specs=self.create_stable_sharding(
@@ -231,8 +291,8 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 			q,
 			k,
 			v,
-			starts.reshape(-1, 1),
-			indexs.reshape(-1, 1),
+			cache_views.starts.reshape(-1, 1),
+			cache_views.index.reshape(-1, 1),
 		)
 
 		return AttentionOutput(
@@ -241,15 +301,29 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 		)
 
 	def forward_cpu(self, *args, **kwargs) -> AttentionOutput:
-		"""CPU forward pass. Delegates to `forward_native`."""
+		"""
+		CPU forward pass for autoregressive decoding attention.
+
+		Delegates to the native JAX/XLA implementation (`forward_native`).
+		"""
 		return self.forward_native(*args, **kwargs)
 
 	def forward_cuda(self, *args, **kwargs) -> AttentionOutput:
-		"""CUDA GPU forward pass. Delegates to `forward_native`."""
+		"""
+		CUDA GPU forward pass for autoregressive decoding attention.
+
+		Delegates to the native JAX/XLA implementation (`forward_native`).
+		Future optimizations might add CUDA-specific kernels here.
+		"""
 		return self.forward_native(*args, **kwargs)
 
 	def forward_rocm(self, *args, **kwargs) -> AttentionOutput:
-		"""ROCm GPU forward pass. Delegates to `forward_native`."""
+		"""
+		ROCm GPU forward pass for autoregressive decoding attention.
+
+		Delegates to the native JAX/XLA implementation (`forward_native`).
+		Future optimizations might add ROCm-specific kernels here.
+		"""
 		return self.forward_native(*args, **kwargs)
 
 	def __call__(
@@ -261,6 +335,24 @@ class AutoRegressiveDecodeAttn(AttentionImpl):
 		indexs: Array,
 		**ignores,
 	) -> AttentionOutput:
+		"""
+		Makes the class instance callable.
+
+		This method routes the call to the appropriate backend-specific forward method
+		(e.g., `forward_tpu`, `forward_gpu`) based on the configuration determined
+		by the parent class `AttentionImpl`. It passes the necessary arguments:
+		query, key, value, and cache view information.
+
+		Args:
+		    q (Array): Query tensor.
+		    k (Array): Key tensor (from cache).
+		    v (Array): Value tensor (from cache).
+		    cache_views (TransformerCacheView): Cache metadata.
+		    **kwargs: Additional keyword arguments passed to the underlying forward method.
+
+		Returns:
+		    AttentionOutput: The result of the attention computation.
+		"""
 		return super().__call__(
 			q=q,
 			k=k,

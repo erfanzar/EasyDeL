@@ -961,7 +961,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		return fcm_mask
 
 	@property
-	def partition_manager(self):
+	def partition_manager(self) -> PartitionManager:
 		return PartitionManager(self.partition_axis)
 
 	__hash__ = hash_fn
