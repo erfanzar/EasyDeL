@@ -14,205 +14,44 @@
 
 from __future__ import annotations
 
-import asyncio
-import dataclasses
 import functools
 import itertools
-import os
 import queue
-import signal
-import threading
 import time
 import traceback
 import typing as tp
-from concurrent import futures
 
 import jax
 import numpy as np
 from jax import numpy as jnp
 
 from easydel.inference.utilities import SamplingParams
+from easydel.inference.vsurge.engines._abstract_driver import (
+	AbstractDriver,
+	ProcessingClassType,
+)
 from easydel.utils.helpers import get_logger
 
-from .utils import (
+from ...utils import (
+	ActiveRequest,
+	ResultTokens,
 	ReturnSample,
+	SafeThread,
 	pad_tokens,
 	process_result_tokens,
 )
-from .vengine import ResultTokens, vEngine
+from .engine import vEngine
 
 if tp.TYPE_CHECKING:
-	from easydel.infra.base_module import EasyDeLBaseModule
 	from easydel.infra.utils import ProcessingClassType
 else:
 	ProcessingClassType = tp.Any
-	EasyDeLBaseModule = tp.Any
 
-V = tp.TypeVar("V")
+
 logger = get_logger("vSurge-Driver")
 
 
-class _Exception:
-	"""A class for propagating exceptions through a queue.
-
-	By wrapping them with a custom private class we ensure that any type
-	(including Exception) can be used as a V.
-	"""
-
-	def __init__(self, exception: Exception) -> None:
-		self.exception = exception
-
-
-class AsyncMultifuture(tp.Generic[V]):
-	"""AsyncMultifuture is like concurrent.futures.Future but supports returning
-
-	multiple results. It provides an unidirectional stream with buffering and
-	exception propagation.
-
-	Supports delivering results to an async Python event loop. Must be
-	constructed inside of the event loop.
-	"""
-
-	def __init__(self) -> None:
-		self._cancelled = threading.Event()
-		self._done = threading.Event()
-		self._loop = asyncio.get_running_loop()
-		self._queue = asyncio.Queue[V | _Exception]()
-
-	def cancel(self, unused: tp.Any = None) -> None:
-		"""Cancels the asyncmultifuture."""
-		# Needed for compatibility with grpc.aio.ServicerContext.add_done_callback.
-		del unused
-		self._cancelled.set()
-		self.set_exception(futures.CancelledError())
-
-	def cancelled(self) -> bool:
-		"""Returns whether the asyncmultifuture has been cancelled."""
-		return self._cancelled.is_set()
-
-	def done(self) -> bool:
-		"""AsyncMultifuture is done when it is finalized with close() or
-
-		set_exception().
-		"""
-		return self._done.is_set()
-
-	def set_exception(self, exception: Exception) -> None:
-		"""Stores the given exception in the asyncmultifuture.
-
-		The exception would be delivered after all previously added results are
-		yielded. set_exception can be called multiple times, however subsequent
-		calls will be ignored.
-
-		Args:
-		  exception: The exception to set.
-		"""
-		self._loop.call_soon_threadsafe(self._queue.put_nowait, _Exception(exception))
-		self._loop.call_soon_threadsafe(self._done.set)
-
-	def add_result(self, result: V) -> None:
-		"""Adds the result to the asyncmultifuture.
-
-		Caller must call .close() once all results are added.
-
-		Args:
-		  result: The result to add.
-		"""
-		self._loop.call_soon_threadsafe(self._queue.put_nowait, result)
-
-	def close(self) -> None:
-		"""Notifies the receiver that no more results would be added."""
-		self.set_exception(StopAsyncIteration())
-
-	def __aiter__(self) -> AsyncMultifuture:
-		return self
-
-	async def __anext__(self) -> V:
-		"""Returns the next value."""
-		value = await self._queue.get()
-		if isinstance(value, _Exception):
-			raise value.exception
-		return value
-
-
-@dataclasses.dataclass
-class ActiveRequestMetadata:
-	"""Inference request metadata."""
-
-	start_time: tp.Optional[float] = None
-
-	prefill_enqueue_time: tp.Optional[float] = None
-	prefill_dequeue_time: tp.Optional[float] = None
-
-	transfer_enqueue_time: tp.Optional[float] = None
-	transfer_dequeue_time: tp.Optional[float] = None
-
-	generate_enqueue_time: tp.Optional[float] = None
-	generate_dequeue_time: tp.Optional[float] = None
-
-	complete_time: tp.Optional[float] = None
-
-
-@dataclasses.dataclass
-class ActiveRequest:
-	"""Current state of the driver."""
-
-	max_tokens: int
-	return_channel: AsyncMultifuture[list[ReturnSample]]
-	top_p: float = 1.0
-	top_k: int = 0
-	min_p: float = 0.0
-	temperature: float = 0.0
-	presence_penalty: float = 0.0
-	frequency_penalty: float = 0.0
-	repetition_penalty: float = 1.0
-	complete: tp.Optional[np.ndarray] = None
-	prefill_result: tp.Any = None
-	prefill_content: tp.Optional[str | list[int]] = None
-	generate_timestep_added: tp.Optional[int] = None
-	is_client_side_tokenization: tp.Optional[bool] = False
-	# Metrics Tracking
-	decode_start_time: float | None = None
-	total_generated_tokens: int = 0
-	metadata: ActiveRequestMetadata = dataclasses.field(
-		default_factory=ActiveRequestMetadata
-	)
-
-	def enqueue_samples(self, generated_samples: list[ReturnSample]):
-		"""Adds the generated sample(s) to return channel for current step.
-
-		Args:
-		  generated_samples: The generated sample(s) for current step.
-
-		This should be called only from within the Drivers background thread.
-		"""
-		self.return_channel.add_result(generated_samples)
-
-
-class JetThread(threading.Thread):
-	"""Thread that kills the program if it fails.
-
-	If a driver thread goes down, we can't operate.
-	"""
-
-	def run(self):
-		"""Executes the thread's target function.
-
-		If the target function raises any exception, this method catches it,
-		prints the traceback, and forcefully kills the entire process using
-		`os.kill` with `signal.SIGKILL`. This ensures that if a critical
-		driver thread fails, the whole system stops, preventing potential
-		inconsistent states or hangs.
-		"""
-		try:
-			super().run()
-		except Exception as e:
-			print(f"Thread {self.name} encountered an error: {e}")
-			traceback.print_exc()
-			os.kill(os.getpid(), signal.SIGKILL)
-
-
-class vDriver:
+class vDriver(AbstractDriver):
 	"""Drives the engines."""
 
 	_prefill_engines: list[vEngine]
@@ -288,7 +127,7 @@ class vDriver:
 		]
 
 		self._prefill_threads = [
-			JetThread(
+			SafeThread(
 				target=functools.partial(self._prefill_thread, idx),
 				name=f"prefill-{idx}",
 				daemon=True,
@@ -296,7 +135,7 @@ class vDriver:
 			for idx in range(len(self._prefill_engines))
 		]
 		self._transfer_threads = [
-			JetThread(
+			SafeThread(
 				target=functools.partial(
 					self._transfer_thread,
 					idx,
@@ -307,7 +146,7 @@ class vDriver:
 			for idx in range(len(self._prefill_engines))
 		]
 		self._decode_threads = [
-			JetThread(
+			SafeThread(
 				target=functools.partial(
 					self._decode_thread,
 					idx,
@@ -318,7 +157,7 @@ class vDriver:
 			for idx in range(len(self._decode_engines))
 		]
 		self.detokenize_threads = [
-			JetThread(
+			SafeThread(
 				target=functools.partial(
 					self._detokenize_thread,
 					idx,
@@ -338,6 +177,19 @@ class vDriver:
 		self.live = True
 		for t in self._all_threads:
 			t.start()
+
+	# Add this method within the vDriver class
+	def submit_request(self, request: tp.Any):
+		"""Submits a new request to the driver's processing queue."""
+		# Assuming ActiveRequest is the expected type internally
+		if not isinstance(request, ActiveRequest):
+			# Or raise a more specific error
+			raise TypeError("Request must be of type ActiveRequest")
+		self.place_request_on_prefill_queue(request)
+
+	@property
+	def driver_name(self):
+		return self._get_model_name(self._decode_engines[-1].model)
 
 	def compile(self):
 		"""Compiles engines."""
@@ -432,7 +284,7 @@ class vDriver:
 		self._prefill_backlog.put(request, block=False)
 
 	@property
-	def processor(self) -> ProcessingClassType:
+	def processor(self) -> ProcessingClassType:  # type:ignore
 		"""Returns the processor/tokenizer associated with the engines.
 
 		Assumes all engines (prefill and decode) use the same processor.
@@ -450,7 +302,7 @@ class vDriver:
 	def _process_prefill_content(
 		self,
 		request: ActiveRequest,
-		processor: ProcessingClassType,
+		processor: ProcessingClassType,  # type:ignore
 		max_prefill_length: int,
 		prefill_lengths: list[int],
 		pad_token_id: int,
