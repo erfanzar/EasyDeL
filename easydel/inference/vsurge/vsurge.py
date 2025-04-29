@@ -294,7 +294,6 @@ class vSurge:
 				)
 		except Exception as e:
 			logger.error(f"Error during token counting: {e}")
-			# Re-raise or handle as appropriate for the API
 			raise ValueError(f"Failed to count tokens: {e}") from e
 
 	def process_client_side_tokenization_response(self, response: list[ReturnSample]):
@@ -458,3 +457,108 @@ class vSurge:
 				dummy_response,
 				buffered_response_list,
 			)
+
+	async def generate(
+		self,
+		prompts: tp.Union[str, tp.Sequence[str]],
+		sampling_params: tp.Optional[
+			tp.Union[SamplingParams, tp.Sequence[SamplingParams]]
+		] = None,
+		stream: bool = False,
+	) -> tp.Union[tp.List[ReturnSample], tp.AsyncGenerator[tp.List[ReturnSample]]]:
+		"""Generates text completions for the given prompts and sampling parameters.
+
+		Mimics the basic functionality of vllm's generate method.
+
+		Args:
+			prompts: A single prompt string or a list of prompt strings.
+			sampling_params: A single SamplingParams object or a list of
+				SamplingParams objects. If None, default SamplingParams will be used.
+				If a single SamplingParams object is provided with multiple prompts,
+				it will be applied to all prompts. If a list is provided, it must
+				have the same length as the prompts list.
+			stream: If True, yields results as they are generated (online inference).
+				If False, waits for all results and returns a list (offline inference).
+
+		Returns:
+			If stream is True, an asynchronous generator yielding lists of ReturnSample.
+			If stream is False, a list of lists of ReturnSample, where each inner list
+			contains the final generated samples for a corresponding prompt.
+
+		Raises:
+			ValueError: If the number of prompts and sampling_params lists do not match.
+		"""
+		if isinstance(prompts, str):
+			prompts = [prompts]
+			if sampling_params is not None and not isinstance(
+				sampling_params, SamplingParams
+			):
+				raise ValueError(
+					"If prompts is a single string, sampling_params must be a single SamplingParams object or None."
+				)
+			if isinstance(sampling_params, SamplingParams):
+				sampling_params = [sampling_params]
+			else:
+				sampling_params = [SamplingParams()] * len(prompts)
+		elif isinstance(prompts, tp.Sequence):
+			if sampling_params is None:
+				sampling_params = [SamplingParams()] * len(prompts)
+			elif isinstance(sampling_params, SamplingParams):
+				sampling_params = [sampling_params] * len(prompts)
+			elif isinstance(sampling_params, tp.Sequence):
+				if len(prompts) != len(sampling_params):
+					raise ValueError(
+						"If prompts is a list, sampling_params must be a single SamplingParams object or a list of the same length."
+					)
+			else:
+				raise ValueError(
+					"sampling_params must be a SamplingParams object, a list of SamplingParams objects, or None."
+				)
+		else:
+			raise ValueError("prompts must be a string or a sequence of strings.")
+
+		async def generate_async():
+			tasks = []
+			for prompt, params in zip(prompts, sampling_params):
+				request = vSurgeRequest.from_sampling_params(
+					prompt=prompt, sampling_params=params
+				)
+				tasks.append(self.complete(request))
+			results = []
+			for task in tasks:
+				request_results = []
+				async for response in task:
+					if stream:
+						yield response
+					request_results.append(response)
+				if not stream:
+					results.append(request_results)
+			if not stream:
+				yield results
+
+		if stream:
+			return generate_async()
+		else:
+
+			async def collect_results():
+				final_result = []
+				async for tasks in generate_async():
+					for result in tasks:
+						task_result = ReturnSample(
+							text="",
+							token_ids=[],
+							tokens_per_second=0.0,
+							num_generated_tokens=0,
+						)
+						for step_result in result:
+							res = step_result[0]
+							task_result.text += res.text
+							task_result.token_ids.extend(res.token_ids)
+							task_result.tokens_per_second += res.tokens_per_second
+							task_result.num_generated_tokens = res.num_generated_tokens
+						task_result.tokens_per_second /= len(result)
+						final_result.append(task_result)
+
+				return final_result
+
+			return await collect_results()
