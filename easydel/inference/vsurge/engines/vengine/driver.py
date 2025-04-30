@@ -168,17 +168,6 @@ class vDriver(AbstractDriver):
 		]
 
 		self.live = False
-		self._all_threads = list(
-			itertools.chain(
-				self._prefill_threads,
-				self._transfer_threads,
-				self._decode_threads,
-				self.detokenize_threads,
-			)
-		)
-		self.live = True
-		for t in self._all_threads:
-			t.start()
 
 	def start(self):
 		if not self.live:

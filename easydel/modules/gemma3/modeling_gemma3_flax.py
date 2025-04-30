@@ -294,7 +294,7 @@ class Gemma3Attention(AttentionModule):
 			causal_mask=causal_mask,
 			token_type_ids=token_type_ids,
 			fcm_mask=fcm_mask,
-			sliding_windows=None,
+			sliding_window=None,
 		)
 
 		if self.is_sliding:
@@ -311,7 +311,7 @@ class Gemma3Attention(AttentionModule):
 				cache_pos=cache_pos,
 				curr_index=curr_index,
 				cache_length=attention_mask.shape[-1],
-				sliding_windows=self.sliding_window,
+				sliding_window=self.sliding_window,
 			)
 			attention_mask = jnp.logical_and(sliding_mask, attention_mask)
 
@@ -328,6 +328,7 @@ class Gemma3Attention(AttentionModule):
 			value_states=value_states,
 			mode=mode,
 			bias=None,
+			sliding_window=self.sliding_window,
 			cache_metadata=cache_metadata,
 			cache_view=cache_view,
 			init_bias=init_attention_bias,
