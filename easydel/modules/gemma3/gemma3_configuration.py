@@ -224,9 +224,12 @@ class Gemma3TextConfig(EasyDeLBaseConfig):
 		"""
 		fsdpsp_over_tp = PartitionSpec(("fsdp", "sp"), "tp")
 		tp_over_fsdpsp = PartitionSpec("tp", ("fsdp", "sp"))
+		tp = PartitionSpec("tp")
 		return (
 			("model/embed_tokens/embedding", fsdpsp_over_tp),
 			("self_attn/q_proj/kernel", tp_over_fsdpsp),
+			("self_attn/q_norm/kernel", tp),
+			("self_attn/k_norm/kernel", tp),
 			("self_attn/k_proj/kernel", tp_over_fsdpsp),
 			("self_attn/v_proj/kernel", tp_over_fsdpsp),
 			("self_attn/o_proj/kernel", fsdpsp_over_tp),
@@ -384,22 +387,6 @@ class Gemma3Config(EasyDeLBaseConfig):
 			Tuple[Tuple[str, PartitionSpec]]: A tuple of tuples, where each inner tuple contains a regex pattern
 			matching parameter names and the corresponding PartitionSpec for sharding those parameters across devices.
 		"""
-		fsdpsp_over_tp = PartitionSpec(("fsdp", "sp"), "tp")
-		tp_over_fsdpsp = PartitionSpec("tp", ("fsdp", "sp"))
-		return (
-			("language_model/model/embed_tokens/embedding", fsdpsp_over_tp),
-			("self_attn/q_proj/kernel", tp_over_fsdpsp),
-			("self_attn/k_proj/kernel", tp_over_fsdpsp),
-			("self_attn/v_proj/kernel", tp_over_fsdpsp),
-			("self_attn/o_proj/kernel", fsdpsp_over_tp),
-			("mlp/gate_proj/kernel", fsdpsp_over_tp),
-			("mlp/down_proj/kernel", tp_over_fsdpsp),
-			("mlp/up_proj/kernel", fsdpsp_over_tp),
-			("input_layernorm/kernel", PartitionSpec(None)),
-			("post_attention_layernorm/kernel", PartitionSpec(None)),
-			("pre_feedforward_layernorm/kernel", PartitionSpec(None)),
-			("post_feedforward_layernorm/kernel", PartitionSpec(None)),
-			("language_model/model/norm/kernel", PartitionSpec(None)),
-			("language_model/lm_head/kernel", fsdpsp_over_tp),
-			(".*", PartitionSpec(None)),
-		)
+		text_partitions = self.text_config.get_partition_rules(*args, **kwargs)
+		vision_partitions = self.vision_config.get_partition_rules(*args, **kwargs)
+		return text_partitions + vision_partitions

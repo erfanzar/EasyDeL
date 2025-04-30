@@ -370,7 +370,7 @@ class Qwen3Attention(AttentionModule):
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,
 			fcm_mask=fcm_mask,
-			sliding_windows=self.sliding_window,
+			sliding_window=self.sliding_window,
 		)
 
 		attentions = self.attention_performer.forward(
@@ -379,6 +379,7 @@ class Qwen3Attention(AttentionModule):
 			value_states=value_states,
 			mode=mode,
 			bias=None,
+			sliding_window=self.sliding_window,
 			cache_metadata=cache_metadata,
 			cache_view=cache_view,
 			init_bias=init_attention_bias,

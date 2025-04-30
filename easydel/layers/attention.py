@@ -233,6 +233,7 @@ class FlexibleAttentionModule(nn.Module):
 		value_states: Array,
 		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES],  # type:ignore
 		bias: tp.Optional[Array] = None,
+		sliding_window: tp.Optional[int] = None,
 		cache_metadata: tp.Optional[TransformerMetadata | PagedAttentionMetadata] = None,
 		cache_view: tp.Optional[TransformerCacheView | PagedAttentionCacheView] = None,
 		init_bias: tp.Optional[tp.Callable[[], Array]] = None,
@@ -266,38 +267,27 @@ class FlexibleAttentionModule(nn.Module):
 			assert self.config.attn_mechanism == AttentionMechanisms.PAGED_ATTENTION
 
 		with self.config.mesh:
+			input_dict = dict(
+				q=query_states,
+				k=key_states,
+				v=value_states,
+				bias=bias,
+				sliding_window=sliding_window,
+				cache_metadata=cache_metadata,
+				cache_view=cache_view,
+				init_bias=init_bias,
+				mask=attention_mask,
+				segment_ids=segment_ids,
+				causal=causal,
+				deterministic=self.deterministic,
+				dropout_rng=dropout_rng,
+			)
 			if mode == common_types.MODE_DECODE:
 				assert cache_view is not None
 				callable_attn = self.impl if self.impl_decode is None else self.impl_decode
-				output = callable_attn(
-					q=query_states,
-					k=key_states,
-					v=value_states,
-					bias=bias,
-					cache_metadata=cache_metadata,
-					cache_view=cache_view,
-					init_bias=init_bias,
-					mask=attention_mask,
-					segment_ids=segment_ids,
-					causal=causal,
-					deterministic=self.deterministic,
-					dropout_rng=dropout_rng,
-				)
+				output = callable_attn(**input_dict)
 			else:
-				output = self.impl(
-					q=query_states,
-					k=key_states,
-					v=value_states,
-					bias=bias,
-					cache_metadata=cache_metadata,
-					cache_view=cache_view,
-					init_bias=init_bias,
-					mask=attention_mask,
-					segment_ids=segment_ids,
-					causal=causal,
-					deterministic=self.deterministic,
-					dropout_rng=dropout_rng,
-				)
+				output = self.impl(**input_dict)
 
 		return jtu.tree_map(lambda x: x.astype(self.impl.metadata.runtime_dtype), output)
 
@@ -428,7 +418,7 @@ class AttentionModule(nn.Module):
 				cache_pos=self.build_cache_pos(attention_mask, cache_view),
 				curr_index=cache_view.index[0] if cache_view is not None else 0,
 				cache_length=attention_mask.shape[-1],
-				sliding_windows=sliding_window,
+				sliding_window=sliding_window,
 			),
 			attention_mask,
 		)
@@ -534,7 +524,7 @@ class AttentionModule(nn.Module):
 		cache_pos: jnp.ndarray,
 		curr_index: jnp.ndarray,
 		cache_length: int,
-		sliding_windows: int,
+		sliding_window: int,
 	):
 		"""
 		Creates a sliding window attention mask relative to cache positions.
@@ -543,7 +533,7 @@ class AttentionModule(nn.Module):
 		    cache_pos (jnp.ndarray): Position indices of query tokens relative to the start.
 		    curr_index (int): The current index offset in the KV cache.
 		    cache_length (int): The total length of the KV cache buffer.
-		    sliding_windows (int): The size of the sliding window.
+		    sliding_window (int): The size of the sliding window.
 
 		Returns:
 		    jnp.ndarray: A boolean mask where True indicates positions within the sliding window.
@@ -570,8 +560,8 @@ class AttentionModule(nn.Module):
 
 			cache_positions = cache_positions[None, None, :]
 			cache_pos = cache_pos[:, :, None]
-			sliding_mask = cache_positions > cache_pos - sliding_windows
-			sliding_mask *= cache_positions < cache_pos + sliding_windows
+			sliding_mask = cache_positions > cache_pos - sliding_window
+			sliding_mask *= cache_positions < cache_pos + sliding_window
 			return sliding_mask
 
 		mask = _map(curr_index, cache_pos[:, None, :])
@@ -591,7 +581,7 @@ class AttentionModule(nn.Module):
 		causal_mask: tp.Optional[Array] = None,
 		token_type_ids: tp.Optional[Array] = None,
 		fcm_mask: tp.Optional[Array] = None,
-		sliding_windows: tp.Optional[int] = None,
+		sliding_window: tp.Optional[int] = None,
 	) -> tp.Tuple[Array, Array, Array, tp.Callable[[], Array]]:
 		"""
 		Prepares inputs for attention calculation, handling KV caching and mask merging.
@@ -609,7 +599,7 @@ class AttentionModule(nn.Module):
 		    causal_mask (tp.Optional[Array], optional): Causal mask [1, 1, q_len, kv_len]. Defaults to None.
 		    token_type_ids (tp.Optional[Array], optional): Token type IDs for segment masking [Batch, q_len]. Defaults to None.
 		    fcm_mask (tp.Optional[Array], optional): Fused-Context-Mask (specific use case) [Batch, 1, q_len, kv_len]. Defaults to None.
-		    sliding_windows (tp.Optional[int], optional): Size of the sliding attention window. If None, not applied. Defaults to None.
+		    sliding_window (tp.Optional[int], optional): Size of the sliding attention window. If None, not applied. Defaults to None.
 
 		Returns:
 		    tp.Tuple[Array, Array, Array, tp.Callable[[], Array]]:
@@ -704,15 +694,15 @@ class AttentionModule(nn.Module):
 				raise NotImplementedError(
 					"requested type of CacheView is not supported for this attention module."
 				)
-		if sliding_windows is not None and attention_mask is not None:
+		if sliding_window is not None and attention_mask is not None:
 			sliding_window_mask = jnp.tril(
 				jnp.ones_like(attention_mask, dtype=jnp.bool),
-				k=-sliding_windows,
+				k=-sliding_window,
 			)
 			window_mask = jnp.where(sliding_window_mask, 0, 1)
 			attention_mask = jnp.logical_and(window_mask, attention_mask)
 			if attention_mask.shape[-1] <= 1:
-				attention_mask = attention_mask[:, :, :, -sliding_windows:]
+				attention_mask = attention_mask[:, :, :, -sliding_window:]
 
 		def init_attention_bias():
 			return lax.select(

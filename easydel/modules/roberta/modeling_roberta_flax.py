@@ -236,7 +236,7 @@ class RobertaSelfAttention(AttentionModule):
 			attention_mask=attention_mask,
 			causal_mask=causal_mask if self.causal else None,
 			fcm_mask=None,
-			sliding_windows=None,
+			sliding_window=None,
 		)
 
 		if layer_head_mask is None:

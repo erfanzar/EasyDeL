@@ -249,7 +249,7 @@ class Gemma2Attention(AttentionModule):
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,
 			fcm_mask=fcm_mask,
-			sliding_windows=self.sliding_window if bool((self.layer_idx % 2) == 0) else None,
+			sliding_window=self.sliding_window if bool((self.layer_idx % 2) == 0) else None,
 		)
 
 		attentions = self.attention_performer.forward(
@@ -258,6 +258,7 @@ class Gemma2Attention(AttentionModule):
 			value_states=value_states,
 			mode=mode,
 			bias=None,
+			sliding_window=self.sliding_window if bool((self.layer_idx % 2) == 0) else None,
 			cache_metadata=cache_metadata,
 			cache_view=cache_view,
 			init_bias=init_attention_bias,
