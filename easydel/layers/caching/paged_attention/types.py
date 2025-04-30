@@ -23,7 +23,7 @@ import jax
 import numpy as np
 from eformer import common_types
 from eformer import escale as es
-from eformer.pytree import auto_pytree, xTree
+from eformer.pytree import auto_pytree, xTree, field
 from jax import numpy as jnp
 from jax.sharding import NamedSharding as Ns
 from jax.sharding import PartitionSpec as Ps
@@ -50,9 +50,9 @@ class SamplingParams:
 	        sampling. Defaults to 0.0 (deterministic).
 	"""
 
-	top_p: jax.Array | float = np.array([1.0])
-	max_tokens: jax.Array | int = np.array([32])
-	temperature: jax.Array | float = np.array([0.0])
+	top_p: jax.Array | float = field(default_factory=lambda: np.array([1.0]))
+	max_tokens: jax.Array | int = field(default_factory=lambda: np.array([32]))
+	temperature: jax.Array | float = field(default_factory=lambda: np.array([0.0]))
 
 	def insert_from_task(self, slot: int, task: GenerationStepTask):
 		"""Inserts sampling parameters from a GenerationStepTask into a specific slot.

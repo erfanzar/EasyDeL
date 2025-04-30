@@ -148,6 +148,7 @@ _import_structure = {
 		"AttentionMetadata",
 		"AttentionRegistry",
 		"AttentionModule",
+		"FlexibleAttentionModule",
 	],
 	"modules": [],
 	"modules.arctic": [
@@ -511,6 +512,7 @@ if _tp.TYPE_CHECKING:
 		AttentionMetadata,
 		AttentionModule,
 		AttentionRegistry,
+		FlexibleAttentionModule,
 	)
 	from .modules.arctic import (
 		ArcticConfig,
