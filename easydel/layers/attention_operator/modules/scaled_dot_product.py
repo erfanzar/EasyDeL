@@ -106,7 +106,7 @@ class ScaledDotProductAttn(AttentionImpl):
 			jax.nn.dot_product_attention,
 			implementation="xla",
 			scale=sm_scale,
-			is_causal=causal if bias is None else False,
+			is_causal=(causal if model_mode != common_types.MODE_DECODE else False),
 		)
 
 		(
@@ -199,7 +199,7 @@ class ScaledDotProductAttn(AttentionImpl):
 			jax.nn.dot_product_attention,
 			implementation="cudnn",
 			scale=sm_scale,
-			is_causal=(causal if model_mode == common_types.MODE_TRAIN else False),
+			is_causal=(causal if model_mode != common_types.MODE_DECODE else False),
 		)
 
 		(
