@@ -136,7 +136,6 @@ class vEngine(AbstractInferenceEngine):
 			("next_position_ids", bsharding),
 			("temperature", bsharding),
 			("top_p", bsharding),
-			("top_k", bsharding),
 			("generated_tokens", bsharding),
 			("cache/views/[0-9]+/(key|value)/(scale|weight)", kvps),
 			("cache/views/[0-9]+/(key|value)/(packed|absmax)", kvps),
@@ -168,7 +167,7 @@ class vEngine(AbstractInferenceEngine):
 			self.continuous_prefill = cjit(
 				jax.jit(
 					continuous_prefill,
-					static_argnums=(0, 10),
+					static_argnums=(0, 9),
 					in_shardings=(
 						es.extract_shardings(self.graphstate),
 						es.extract_shardings(self.graphothers),
@@ -178,13 +177,12 @@ class vEngine(AbstractInferenceEngine):
 						None,
 						self._empty_sharding,
 						self._empty_sharding,
-						self._empty_sharding,
 						None,
 						None,
 					),
 					out_shardings=(self._prefill_state_sharding, None),
 				),
-				static_argnums=(0, 10),
+				static_argnums=(0, 9),
 			)
 			self.continuous_decode = cjit(
 				jax.jit(
@@ -330,7 +328,6 @@ class vEngine(AbstractInferenceEngine):
 				next_position_ids=jnp.zeros((concurrent_decode, 1), "i4", device=sharding),
 				temperature=jnp.zeros((concurrent_decode,), "f4", device=sharding),
 				top_p=jnp.zeros((concurrent_decode,), "f4", device=sharding),
-				top_k=jnp.zeros((concurrent_decode,), "i4", device=sharding),
 				generated_tokens=jnp.zeros((concurrent_decode, 1), "i4", device=sharding),
 			)
 
@@ -367,7 +364,6 @@ class vEngine(AbstractInferenceEngine):
 		true_length: int,
 		temperature: jax.Array,
 		top_p: jax.Array,
-		top_k: jax.Array,
 		rngs: jax.random.PRNGKey,
 	) -> tuple[GenerationState, ResultTokens]:
 		"""Performs the prefill step for initializing the generation process.
@@ -398,7 +394,6 @@ class vEngine(AbstractInferenceEngine):
 			self.pad_token_id,
 			temperature,
 			top_p,
-			top_k,
 			self.max_length,
 			self.samples_per_slot,
 			rngs,

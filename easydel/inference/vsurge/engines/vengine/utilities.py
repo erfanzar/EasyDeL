@@ -68,7 +68,6 @@ class GenerationState:
 	next_position_ids: jax.Array
 	temperature: jax.Array
 	top_p: jax.Array
-	top_k: jax.Array
 	generated_tokens: jax.Array
 
 
@@ -108,7 +107,6 @@ def continuous_bulk_insert(
 		pos = update_idx2d(decode_state.next_position_ids, prefix.next_position_ids, slot)
 		gent = update_idx2d(decode_state.generated_tokens, prefix.generated_tokens, slot)
 		top_p = update_idx1d(decode_state.top_p, prefix.top_p, slot)
-		top_k = update_idx1d(decode_state.top_k, prefix.top_k, slot)
 		temperature = update_idx1d(decode_state.temperature, prefix.temperature, slot)
 
 	return GenerationState(
@@ -119,7 +117,6 @@ def continuous_bulk_insert(
 		valids=valids,
 		temperature=temperature,
 		top_p=top_p,
-		top_k=top_k,
 		next_position_ids=pos,
 		generated_tokens=gent,
 	)
@@ -162,7 +159,6 @@ def continuous_insert(
 		tokens=update_idx2d(decode_state.tokens, prefix.tokens),
 		valids=update_idx2d(decode_state.valids, prefix.valids),
 		top_p=update_idx1d(decode_state.top_p, prefix.top_p),
-		top_k=update_idx1d(decode_state.top_k, prefix.top_k),
 		temperature=update_idx1d(decode_state.temperature, prefix.temperature),
 		next_position_ids=update_idx2d(
 			decode_state.next_position_ids,
@@ -185,7 +181,6 @@ def continuous_prefill(
 	pad_token_id: int,
 	temperature: jax.Array,
 	top_p: jax.Array,
-	top_k: jax.Array,
 	max_length: int,
 	samples_per_slot: int,
 	rngs: jax.random.PRNGKey,
@@ -240,7 +235,7 @@ def continuous_prefill(
 		rngs,
 	)[:, None]
 	validity = jnp.ones_like(next_token, dtype="b1")
-	lengths = jnp.full((batch_size, 1), sequence_length + 1, dtype="i4")
+	lengths = jnp.full((batch_size, 1), 0, dtype="i4")
 
 	result = ResultTokens(
 		data=jnp.concatenate([next_token, validity, lengths], axis=1),
@@ -257,7 +252,6 @@ def continuous_prefill(
 		valids=valids,
 		temperature=temperature,
 		top_p=top_p,
-		top_k=top_k,
 		next_position_ids=positions[:, -1:] + 1,
 		generated_tokens=jnp.zeros((batch_size, 1), dtype=jnp.int32),
 	)
@@ -320,7 +314,6 @@ def continuous_decode(
 		valids=state.valids,
 		temperature=state.temperature,
 		top_p=state.top_p,
-		top_k=state.top_k,
 		next_position_ids=state.next_position_ids + 1,
 		generated_tokens=state.generated_tokens + 1,
 	)

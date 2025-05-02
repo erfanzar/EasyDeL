@@ -222,7 +222,6 @@ class vDriver(AbstractDriver):
 						true_length=0,
 						temperature=jnp.array([1], "f4"),
 						top_p=jnp.array([1], "f4"),
-						top_k=jnp.array([1], "i4"),
 						rngs=prefill_engine.prng_key,
 					)
 					logger.info(f"Compiling decode-engine insert seqlen={length}")
@@ -354,7 +353,6 @@ class vDriver(AbstractDriver):
 				frequency_penalty=request.frequency_penalty,
 				repetition_penalty=request.repetition_penalty,
 				min_p=request.min_p,
-				top_k=request.top_k,
 				top_p=request.top_p,
 				temperature=request.temperature,
 			),
@@ -400,7 +398,6 @@ class vDriver(AbstractDriver):
 				true_length=true_length,
 				temperature=jnp.array([sampling_params.temperature], "f4"),
 				top_p=jnp.array([sampling_params.top_p], "f4"),
-				top_k=jnp.array([sampling_params.top_k], "i4"),
 				rngs=prefill_engine.prng_key,
 			)
 			request.prefill_result = prefill_result
@@ -596,7 +593,6 @@ class vDriver(AbstractDriver):
 				# Handling the very first token from prefill
 				request_first_token, request, _ = data
 				request_first_token = request_first_token.convert_to_numpy()
-
 				# Process the first token, but TPS/count are not meaningful yet
 				results_base, complete, num_valid_tokens_list = process_result_tokens(
 					processor=processor,
@@ -608,7 +604,6 @@ class vDriver(AbstractDriver):
 					complete=request.complete,
 				)
 				request.complete = complete
-
 				# Add placeholder metrics for the first token
 				final_results = []
 				for res_base, num_valid in zip(results_base, num_valid_tokens_list):
