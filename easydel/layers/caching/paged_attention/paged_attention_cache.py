@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 import typing as tp
+import warnings
 
 import chex as cx
 import jax
@@ -78,15 +79,32 @@ class PagedAttentionCacheMetaData(BaseCacheMetadata):
 	hbm_utilization: float
 
 	@staticmethod
-	def _usable_hbm(hbm_utilization: float, mesh: Mesh) -> int:
+	def _usable_hbm(
+		hbm_utilization: float,
+		mesh: Mesh,
+		head_sharding: str,
+		num_kv_heads: int,
+	) -> int:
 		"""
 		Calculates the usable HBM in bytes based on utilization factor and mesh.
 		(Internal helper method).
 		"""
 		per_device_memory_stats = jax.local_devices()[0].memory_stats()
+
 		limit = per_device_memory_stats["bytes_reservable_limit"]
 		used = per_device_memory_stats["bytes_in_use"]
-		return (int(limit * hbm_utilization) - used) * mesh.devices.size
+
+		shards = mesh.shape[head_sharding]
+
+		if num_kv_heads % shards != 0:
+			shards = 1
+			warnings.warn(
+				"Heads shardings is not possible, using 1 shard instead "
+				f"({num_kv_heads}&(tp={shards})={num_kv_heads % shards}).",
+				stacklevel=1,
+			)
+
+		return (int(limit * hbm_utilization) - used) * shards
 
 	@classmethod
 	def create(
@@ -99,6 +117,7 @@ class PagedAttentionCacheMetaData(BaseCacheMetadata):
 		num_kv_heads: int,
 		kv_head_dim_size: int,
 		hbm_utilization: float,
+		head_sharding: str = common_types.HEAD,
 		dtype: jnp.dtype = jnp.bfloat16,
 	) -> "PagedAttentionCacheMetaData":
 		"""
@@ -116,6 +135,7 @@ class PagedAttentionCacheMetaData(BaseCacheMetadata):
 		    num_kv_heads (int): Number of KV heads.
 		    kv_head_dim_size (int): Dimension of each KV head.
 		    hbm_utilization (float): Target HBM utilization fraction (0.0 to 1.0).
+				head_sharding (str): Sharding strategy for the heads.
 		    dtype (jnp.dtype): Data type used for cache size calculation.
 
 		Returns:
@@ -140,7 +160,13 @@ class PagedAttentionCacheMetaData(BaseCacheMetadata):
 		if not (0.0 < hbm_utilization < 1.0):
 			raise ValueError("`hbm_utilization` must be positive float value in range 0~1")
 
-		hbm_bytes = cls._usable_hbm(hbm_utilization, mesh)
+		hbm_bytes = cls._usable_hbm(
+			hbm_utilization,
+			mesh,
+			head_sharding,
+			num_kv_heads,
+		)
+
 		item_size = np.dtype(dtype).itemsize
 		per_kv_bytes = num_kv_heads * kv_head_dim_size * item_size * 2
 		num_pages_per_layer = (hbm_bytes // num_hidden_layers) // (page_size * per_kv_bytes)
