@@ -163,15 +163,19 @@ class EasyGenerationMixin:
 		        static configuration for the paged cache.
 		"""
 		num_hidden_layers = _safepick(self.config, "num_hidden_layers")
+
 		num_key_value_heads = _safepick(self.config, "num_key_value_heads")
 		num_attention_heads = _safepick(self.config, "num_attention_heads")
+
 		hidden_size = _safepick(self.config, "hidden_size")
+
 		if num_key_value_heads is None:
 			num_key_value_heads = num_attention_heads
 
 		head_dim = _safepick(self.config, "head_dim")
 		if head_dim is None:
 			head_dim = hidden_size // num_attention_heads
+
 		return PagedAttentionCacheMetaData.create(
 			mesh=self.mesh,
 			batch_size=batch_size,
@@ -181,6 +185,7 @@ class EasyGenerationMixin:
 			max_sequences=max_sequences,
 			num_hidden_layers=num_hidden_layers,
 			num_kv_heads=num_key_value_heads,
+			head_sharding=self.config.partition_axis.head_axis,
 			page_size=page_size,
 		)
 
