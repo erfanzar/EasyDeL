@@ -20,7 +20,6 @@ import typing as tp
 from bisect import bisect_left
 
 import jax
-import numpy as np
 from eformer import common_types
 from eformer import escale as es
 from eformer.pytree import auto_pytree, xTree, field
@@ -50,9 +49,9 @@ class SamplingParams:
 	        sampling. Defaults to 0.0 (deterministic).
 	"""
 
-	top_p: jax.Array | float = field(default_factory=lambda: np.array([1.0]))
-	max_tokens: jax.Array | int = field(default_factory=lambda: np.array([32]))
-	temperature: jax.Array | float = field(default_factory=lambda: np.array([0.0]))
+	top_p: jax.Array | float = field(default_factory=lambda: jnp.array([1.0]))
+	max_tokens: jax.Array | int = field(default_factory=lambda: jnp.array([32]))
+	temperature: jax.Array | float = field(default_factory=lambda: jnp.array([0.0]))
 
 	def insert_from_task(self, slot: int, task: GenerationStepTask):
 		"""Inserts sampling parameters from a GenerationStepTask into a specific slot.
@@ -63,9 +62,10 @@ class SamplingParams:
 		        to insert.
 		"""
 		assert task.sampling_params.top_p.size == 1
-		self.top_p[slot] = task.sampling_params.top_p[0]
-		self.max_tokens[slot] = task.sampling_params.max_tokens[0]
-		self.temperature[slot] = task.sampling_params.temperature[0]
+		sp = task.sampling_params
+		self.top_p = self.top_p.at[slot].set(sp.top_p[0])
+		self.max_tokens = self.max_tokens.at[slot].set(sp.max_tokens[0])
+		self.temperature = self.temperature.at[slot].set(sp.temperature[0])
 
 	def insert_decode_state(self, insert_slots: jax.Array, update: ActiveSequenceBatch):
 		"""Updates sampling parameters in specified slots from an ActiveSequenceBatch.
@@ -115,7 +115,7 @@ class SamplingParams:
 		)
 
 	@classmethod
-	def init_numpy(cls, metadata: PagedAttentionCacheMetaData) -> SamplingParams:
+	def init_vals(cls, metadata: PagedAttentionCacheMetaData) -> SamplingParams:
 		"""Initializes SamplingParams with NumPy arrays.
 
 		Args:
@@ -125,9 +125,9 @@ class SamplingParams:
 		    SamplingParams: An initialized SamplingParams object with NumPy arrays.
 		"""
 		return cls(
-			top_p=np.full((metadata.batch_size,), 1e6, dtype=np.float32),
-			max_tokens=np.full((metadata.batch_size,), 1e6, dtype=np.int32),
-			temperature=np.full((metadata.batch_size,), 1e6, dtype=np.float32),
+			top_p=jnp.full((metadata.batch_size,), 1e6, dtype=jnp.float32),
+			max_tokens=jnp.full((metadata.batch_size,), 1e6, dtype=jnp.int32),
+			temperature=jnp.full((metadata.batch_size,), 1e6, dtype=jnp.float32),
 		)
 
 	@classmethod
@@ -236,7 +236,7 @@ class InitialSequenceRequest:
 
 		self.token_ids = prefill.token_ids
 		self.positions = prefill.positions
-		self.page_indices = np.array(prefill.page_indices)
+		self.page_indices = jnp.array(prefill.page_indices)
 
 		self.sampling_params = prefill.sampling_params
 
@@ -313,31 +313,31 @@ class InitialSequenceRequest:
 
 		paddlen = near_length - sequence_length
 
-		array = np.array(prompt_token_ids)
+		array = jnp.array(prompt_token_ids)
 
 		if paddlen < 0:
 			padded_token_ids = array[-near_length:]
 		else:
-			padded_token_ids = np.pad(array, (0, paddlen), constant_values=(0,))
+			padded_token_ids = jnp.pad(array, (0, paddlen), constant_values=(0,))
 
 		sharding = Ns(mesh, Ps(None))
 		page_indices = [0] * metadata.num_pages_per_sequence
 		token_ids = jax.device_put(padded_token_ids, sharding)
-		positions = np.arange(0, token_ids.shape[0])
+		positions = jnp.arange(0, token_ids.shape[0])
 		positions = jax.device_put(positions, sharding)
 		if sampling_params is None:
 			sampling_params = SamplingParams()
 
 		top_p = jax.device_put(
-			np.array([sampling_params.top_p]).reshape(-1),
+			jnp.array([sampling_params.top_p]).reshape(-1),
 			sharding,
 		)
 		max_tokens = jax.device_put(
-			np.array([sampling_params.max_tokens + sequence_length]).reshape(-1),
+			jnp.array([sampling_params.max_tokens + sequence_length]).reshape(-1),
 			sharding,
 		)
 		temperature = jax.device_put(
-			np.array([sampling_params.temperature]).reshape(-1),
+			jnp.array([sampling_params.temperature]).reshape(-1),
 			sharding,
 		)
 
@@ -554,9 +554,11 @@ class ActiveSequenceBatch:
 		assert self.page_update_mapped_idxs is not None
 
 		for i, update in enumerate(assignment):
-			self.page_update_slots[i] = update.slot
-			self.page_update_page_idxs[i] = update.page_idx
-			self.page_update_mapped_idxs[i] = update.mapped_idx
+			self.page_update_slots = self.page_update_slots.at[i].set(update.slot)
+			self.page_update_page_idxs = self.page_update_page_idxs.at[i].set(update.page_idx)
+			self.page_update_mapped_idxs = self.page_update_mapped_idxs.at[i].set(
+				update.mapped_idx
+			)
 
 	def pad_tokens(self, pad_length: int):
 		"""Pads the host-side token list with placeholder scalars.
@@ -604,12 +606,12 @@ class ActiveSequenceBatch:
 		assert isinstance(self.token_ids, list)
 
 		self.token_ids.append(task.prefill_token_id)
-		self.positions[slot] = task.position
-		self.page_table[slot] = np.array(task.page_indices)
+		self.positions = self.positions.at[slot].set(task.position)
+		self.page_table = self.page_table.at[slot].set(jnp.array(task.page_indices))
 		self.sampling_params.insert_from_task(slot, task)
 
 	@classmethod
-	def init_numpy(cls, metadata: PagedAttentionCacheMetaData) -> ActiveSequenceBatch:
+	def init_vals(cls, metadata: PagedAttentionCacheMetaData) -> ActiveSequenceBatch:
 		"""Initializes ActiveSequenceBatch with NumPy arrays for host-side use.
 
 		Creates the necessary arrays (`positions`, `page_table`, `page_update_*`)
@@ -624,19 +626,19 @@ class ActiveSequenceBatch:
 		"""
 		return cls(
 			token_ids=[],
-			positions=np.full((metadata.batch_size,), 1e6, dtype=np.int32),
-			page_table=np.full(
+			positions=jnp.full((metadata.batch_size,), 1e6, dtype=jnp.int32),
+			page_table=jnp.full(
 				(metadata.batch_size, metadata.num_pages_per_sequence),
 				1e6,
-				dtype=np.int32,
+				dtype=jnp.int32,
 			),
 			available_slots=None,
 			active_slot_requests_map=None,
 			context_lock=None,
-			sampling_params=SamplingParams.init_numpy(metadata),
-			page_update_slots=np.full((metadata.batch_size,), 1e6, dtype=np.int32),
-			page_update_page_idxs=np.full((metadata.batch_size,), 1e6, dtype=np.int32),
-			page_update_mapped_idxs=np.full((metadata.batch_size,), 1e6, dtype=np.int32),
+			sampling_params=SamplingParams.init_vals(metadata),
+			page_update_slots=jnp.full((metadata.batch_size,), 1e6, dtype=jnp.int32),
+			page_update_page_idxs=jnp.full((metadata.batch_size,), 1e6, dtype=jnp.int32),
+			page_update_mapped_idxs=jnp.full((metadata.batch_size,), 1e6, dtype=jnp.int32),
 		)
 
 	@classmethod

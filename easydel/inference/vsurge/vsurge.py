@@ -161,6 +161,7 @@ class vSurge:
 		max_length: int | None = None,
 		seed: int = 894,
 		vsurge_name: str | None = None,
+		verbose: bool = True,
 	) -> vSurge:
 		max_length = max_length or 8192
 		max_concurrent_prefill = max_concurrent_prefill or jax.device_count()
@@ -178,7 +179,7 @@ class vSurge:
 			manager = HBMPageManager(metadata=metadata)
 		return vSurge(
 			driver=oDriver(
-				oEngine(
+				engine=oEngine(
 					model=model,
 					processor=processor,
 					storage=storage,
@@ -190,7 +191,8 @@ class vSurge:
 					max_length=max_length,
 					batch_size=max_concurrent_decodes,
 					seed=seed,
-				)
+				),
+				verbose=verbose,
 			),
 			vsurge_name=vsurge_name,
 		)
@@ -199,7 +201,7 @@ class vSurge:
 	def create_vdriver(
 		cls,
 		model: EasyDeLBaseModule,
-		processor: ProcessingClassType,  
+		processor: ProcessingClassType,
 		max_concurrent_decodes: int | None = None,
 		prefill_lengths: int | None = None,
 		max_prefill_length: int | None = None,
