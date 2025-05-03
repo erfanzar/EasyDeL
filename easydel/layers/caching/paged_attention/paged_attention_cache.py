@@ -83,7 +83,7 @@ class PagedAttentionCacheMetaData(BaseCacheMetadata):
 		Calculates the usable HBM in bytes based on utilization factor and mesh.
 		(Internal helper method).
 		"""
-		per_device_memory_stats = jax.devices()[0].memory_stats()
+		per_device_memory_stats = jax.local_devices()[0].memory_stats()
 		limit = per_device_memory_stats["bytes_reservable_limit"]
 		used = per_device_memory_stats["bytes_in_use"]
 		return (int(limit * hbm_utilization) - used) * mesh.devices.size
