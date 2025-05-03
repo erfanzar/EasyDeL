@@ -55,7 +55,7 @@ class oDriver(AbstractDriver):
 
 	_active_requests: list[queue.Queue[tuple[int, ActiveRequest]]] = []
 
-	def __init__(self, engine: oEngine):
+	def __init__(self, engine: oEngine, verbose: bool = True):
 		"""
 		Initializes the oDriver with a given oEngine.
 
@@ -87,6 +87,7 @@ class oDriver(AbstractDriver):
 			target=self._prepare_inputs,
 			name="_prepare_inputs",
 		)
+		self.loginfo = logger.info if verbose else logger.debug
 		# Flag indicating if the driver is live and running
 		self.live = False
 		self.start()
@@ -124,7 +125,7 @@ class oDriver(AbstractDriver):
 		inference engines. Currently, it's a placeholder.
 		"""
 		try:
-			logger.info("Compiling Decode Engine")
+			self.loginfo("Compiling Decode Engine")
 			with capture_time() as cap:
 				self.engine.forward(
 					self.engine.graphstate,
@@ -140,7 +141,7 @@ class oDriver(AbstractDriver):
 					),
 				)
 
-			logger.info(f"Decode Engine Compiled in {cap()}")
+			self.loginfo(f"Decode Engine Compiled in {cap()}")
 
 		except Exception:
 			traceback.print_exc()
@@ -251,13 +252,13 @@ class oDriver(AbstractDriver):
 			request = self._prepare_backlog.get(block=True)
 			if request is None:
 				break
-			logger.info(
+			self.loginfo(
 				f"PrepareInputs: Received request {request.id}. Prepare backlog size: {self._prepare_backlog.qsize()}"
 			)
 			self._active_requests_map[request.id] = request
 			self._max_allowed_requests.acquire()
 
-			logger.info(
+			self.loginfo(
 				f"PrepareInputs: Creating prefill request {request.id} for processing."
 			)
 			prompt_token_ids = (
@@ -283,7 +284,7 @@ class oDriver(AbstractDriver):
 				),
 			)
 
-			logger.info(
+			self.loginfo(
 				f"PrepareInputs: Enqueuing prefill request {initial_request.id} for processing."
 			)
 
@@ -306,7 +307,7 @@ class oDriver(AbstractDriver):
 			)
 			if iteration_plan is None:
 				# Exit loop if no iteration plan can be created (signaling shutdown or no active requests)
-				logger.info("No iteration plan created, exiting inference loop.")
+				self.loginfo("No iteration plan created, exiting inference loop.")
 				return
 			logger.debug(
 				f"Created iteration plan. Prefill: {iteration_plan.schedule_prefill}, "
@@ -322,7 +323,7 @@ class oDriver(AbstractDriver):
 					iteration_plan,
 				)
 			_exec = took() * 10**3
-			logger.info(
+			self.loginfo(
 				f"engine - used slots : {self.num_used_slots} / {self._max_locks}, "
 				f"execution time {_exec:.2f}ms "
 			)
@@ -384,7 +385,7 @@ class oDriver(AbstractDriver):
 		while True:
 			summary = self._process_backlog.get(block=True)
 			if summary is None:
-				logger.info("Received None, exiting summary processing loop.")
+				self.loginfo("Received None, exiting summary processing loop.")
 				return
 			logger.debug(
 				f"Received summary. Process backlog size: {self._process_backlog.qsize()}"
@@ -429,7 +430,7 @@ class oDriver(AbstractDriver):
 				request = self._active_requests_map[summary.prefill_request_id]
 				request.decode_start_time = None
 				request.total_generated_tokens = 0
-				logger.info(f"Processed prefill token for request {request.id}.")
+				self.loginfo(f"Processed prefill token for request {request.id}.")
 				request.enqueue_samples(
 					[
 						ReturnSample(
@@ -448,7 +449,7 @@ class oDriver(AbstractDriver):
 				# If prefill is complete, mark the request as complete, close its channel,
 				# remove it from the active requests map, and release the semaphore.
 				if summary.prefill_complete:
-					logger.info(
+					self.loginfo(
 						f"[Prefill]: Prefill complete for request {request.id}. Closing channel and releasing semaphore."
 					)
 					request.complete = True
@@ -476,7 +477,7 @@ class oDriver(AbstractDriver):
 				# Start timer on the first actual decode step for this request
 				if request.decode_start_time is None:
 					request.decode_start_time = time.perf_counter()
-					logger.info(f"Started decode timing for request {request.id} at slot {slot}.")
+					self.loginfo(f"Started decode timing for request {request.id} at slot {slot}.")
 
 				request.total_generated_tokens += 1
 				elapsed_time = time.perf_counter() - request.decode_start_time
@@ -502,7 +503,7 @@ class oDriver(AbstractDriver):
 
 				# Check if the decode for this request is complete
 				if slot < len(summary.decodes_completes) and summary.decodes_completes[slot]:
-					logger.info(
+					self.loginfo(
 						f"Decode complete for request {request.id} in slot {slot}. Closing channel and releasing semaphore."
 					)
 					# Mark the request as complete, close its channel, and release the semaphore

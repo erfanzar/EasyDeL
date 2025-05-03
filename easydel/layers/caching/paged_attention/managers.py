@@ -17,7 +17,6 @@ import queue
 from functools import partial
 
 import jax
-import numpy as np
 from eformer import escale as es
 from jax import numpy as jnp
 from jax.sharding import NamedSharding as Ns
@@ -509,11 +508,11 @@ class ModelIOProcessor:
 
 		if iteration_plan.schedule_decodes:
 			ongoing_decodes.copy_decode(decodes_state)
-			ongoing_updates = ongoing_updates.init_numpy(metadata)
-			insert_slots = np.full((metadata.batch_size,), 1e6, dtype=np.int32)
+			ongoing_updates = ongoing_updates.init_vals(metadata)
+			insert_slots = jnp.full((metadata.batch_size,), 1e6, dtype=jnp.int32)
 			for i, decode_request in enumerate(iteration_plan.new_decodes_requests):
 				ongoing_updates.insert_from_task(i, decode_request)
-				insert_slots[i] = decode_request.slot
+				insert_slots = insert_slots.at[i].set(decode_request.slot)
 			ongoing_updates.pad_tokens(
 				metadata.batch_size - len(iteration_plan.new_decodes_requests)
 			)
