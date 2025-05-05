@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from jax.sharding import PartitionSpec
+from eformer.common_types import ColumnWise, RowWise, Replicated
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -118,85 +118,33 @@ class RobertaConfig(EasyDeLBaseConfig):
 			**kwargs,
 		)
 
-	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model.
-
-		Args:
-		    fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
-		        Whether to use fully sharded data parallelism.
-
+		Get the partition rules for the RoBERTa model.
 		Returns:
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
+		pmag = self.partition_manager
 		return (
+			(r"embeddings/word_embeddings/embedding", pmag.resolve(ColumnWise)),
+			(r"embeddings/position_embeddings/embedding", pmag.resolve(Replicated)),
+			(r"embeddings/token_type_embeddings/embedding", pmag.resolve(Replicated)),
+			(r"attention/self/(query|key|value)/kernel", pmag.resolve(ColumnWise)),
+			(r"attention/output/dense/kernel", pmag.resolve(RowWise)),
+			(r"intermediate/dense/kernel", pmag.resolve(ColumnWise)),
+			(r"output/dense/kernel", pmag.resolve(RowWise)),
+			(r"pooler/dense/kernel", pmag.resolve(ColumnWise)),
+			(r"lm_head/dense/kernel", pmag.resolve(ColumnWise)),
+			(r"lm_head/decoder/kernel", pmag.resolve(ColumnWise)),
+			(r"classifier/dense/kernel", pmag.resolve(ColumnWise)),
+			(r"classifier/out_proj/kernel", pmag.resolve(RowWise)),
+			(r"qa_outputs/kernel", pmag.resolve(RowWise)),
+			(r".*LayerNorm/scale", pmag.resolve(Replicated)),
+			(r".*LayerNorm/bias", pmag.resolve(Replicated)),
 			(
-				(
-					"embeddings/(position_embeddings|token_type_embeddings)/embedding",
-					PartitionSpec(),
-				),
-				("embeddings/word_embeddings/embedding", PartitionSpec()),
-				(
-					"attention/self/(key|query|value)/kernel",
-					PartitionSpec("fsdp", "tp"),
-				),
-				("attention/self/(key|query|value)/bias", PartitionSpec()),
-				("attention/output/dense/kernel", PartitionSpec("tp", "fsdp")),
-				("attention/output/dense/bias", PartitionSpec()),
-				("(LayerNorm|layer_norm)/(bias|scale)", PartitionSpec()),
-				("intermediate/dense/kernel", PartitionSpec("fsdp", "tp")),
-				("intermediate/dense/bias", PartitionSpec("tp")),
-				("output/dense/kernel", PartitionSpec("tp", "fsdp")),
-				("output/dense/bias", PartitionSpec()),
-				("lm_head/dense/kernel", PartitionSpec()),
-				("lm_head/dense/bias", PartitionSpec()),
-				("lm_head/decoder/kernel", PartitionSpec("fsdp", "tp")),
-				("lm_head/decoder/bias", PartitionSpec("tp")),
-				(".*", PartitionSpec()),
-			)
-			if not fully_sharded_data_parallel
-			else (
-				(
-					"embeddings/(position_embeddings|token_type_embeddings)/embedding",
-					PartitionSpec(),
-				),
-				("embeddings/word_embeddings/embedding", PartitionSpec()),
-				(
-					"attention/self/(key|query|value)/kernel",
-					PartitionSpec(("fsdp", "sp")),
-				),
-				("attention/self/(key|query|value)/bias", PartitionSpec()),
-				("attention/output/dense/kernel", PartitionSpec(("fsdp", "sp"))),
-				("attention/output/dense/bias", PartitionSpec()),
-				("(LayerNorm|layer_norm)/(bias|scale)", PartitionSpec()),
-				("intermediate/dense/kernel", PartitionSpec(("fsdp", "sp"))),
-				("intermediate/dense/bias", PartitionSpec("sp")),
-				("output/dense/kernel", PartitionSpec(("fsdp", "sp"))),
-				("output/dense/bias", PartitionSpec()),
-				("lm_head/dense/kernel", PartitionSpec()),
-				("lm_head/dense/bias", PartitionSpec()),
-				("lm_head/decoder/kernel", PartitionSpec(("fsdp", "sp"))),
-				("lm_head/decoder/bias", PartitionSpec("sp")),
-				(".*", PartitionSpec()),
-			)
+				r".*/(query|key|value|dense|fc1|fc2|c_attn|q_attn|c_proj|c_fc|lm_head|classifier|qa_outputs)/bias",
+				pmag.resolve(Replicated),
+			),
+			(r"lm_head/bias", pmag.resolve(Replicated)),
+			(r".*", pmag.resolve(Replicated)),
 		)
-
-	def attach_custom_arguments(
-		self, gradient_checkpointing="nothing_saveable", **kwargs
-	):
-		"""
-		Attach custom arguments to the configuration.
-
-		This method allows attaching additional custom arguments to the configuration
-		that weren't part of the initial configuration.
-
-		Args:
-			gradient_checkpointing (`str`, *optional*, defaults to "nothing_saveable"):
-				What to save during gradient checkpointing. Choose one of "nothing_saveable",
-				"first_half_saveable", "full_saveable".
-			**kwargs:
-				Additional custom arguments to be attached to the configuration.
-		"""
-		self.gradient_checkpointing = gradient_checkpointing
-		for k, v in kwargs.items():
-			setattr(self, k, v)

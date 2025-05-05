@@ -1011,19 +1011,19 @@ if __name__ == "__main__":
 	# test.test_llama4_cond()  # Passed
 	# test.test_mamba()  # Passed
 	# test.test_mamba2()  # Passed - ReCheck
-	# test.test_mistral()  # Passed
-	# test.test_mixtral()  # Passed
-	# test.test_mpt()  # Passed
-	# test.test_olmo()  # Passed
-	# test.test_olmo2()  # Passed
-	# test.test_openelm()  # Passed
-	# test.test_phi()  # Passed
-	# test.test_phi3()  # Passed
-	# # test.test_phimoe()  # Failed v0.0.80 - N  Runtime
-	# test.test_qwen2()  # Passed
-	# test.test_qwen2_moe()  # Passed
-	# test.test_qwen2_vl()  # Passed
-	# test.test_qwen3()  # Passed
-	# test.test_qwen3_moe()  # Passed
-	# test.test_stablelm()  # Passed
+	test.test_mistral()  # Passed
+	test.test_mixtral()  # Passed
+	test.test_mpt()  # Passed
+	test.test_olmo()  # Passed
+	test.test_olmo2()  # Passed
+	test.test_openelm()  # Passed
+	test.test_phi()  # Passed
+	test.test_phi3()  # Passed
+	# test.test_phimoe()  # Failed v0.0.80 - N  Runtime
+	test.test_qwen2()  # Passed
+	test.test_qwen2_moe()  # Passed
+	test.test_qwen2_vl()  # Passed
+	test.test_qwen3()  # Passed
+	test.test_qwen3_moe()  # Passed
+	test.test_stablelm()  # Passed
 	# -----------------------------------------------

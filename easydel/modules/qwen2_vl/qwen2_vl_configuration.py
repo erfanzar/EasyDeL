@@ -13,8 +13,7 @@
 # limitations under the License.
 
 
-from jax.sharding import PartitionSpec
-
+from eformer.common_types import ColumnWise, RowWise, Replicated
 from easydel.infra.base_module import EasyDeLBaseConfig
 
 
@@ -24,26 +23,26 @@ class Qwen2VLVisionConfig(EasyDeLBaseConfig):
 	This class stores the configuration parameters for the vision encoder part of the Qwen2VL multimodal model.
 
 	Args:
-		depth (`int`, *optional*, defaults to 32):
-			Number of layers in the vision transformer.
-		embed_dim (`int`, *optional*, defaults to 1280):
-			Dimensionality of the embeddings produced by the vision encoder.
-		hidden_size (`int`, *optional*, defaults to 3584):
-			Dimensionality of the intermediate representations in the vision transformer.
-		hidden_act (`str`, *optional*, defaults to "quick_gelu"):
-			The non-linear activation function used in the vision transformer.
-		mlp_ratio (`int`, *optional*, defaults to 4):
-			Ratio of the hidden size to the intermediate size in the MLP layers.
-		num_heads (`int`, *optional*, defaults to 16):
-			Number of attention heads in the vision transformer.
-		in_channels (`int`, *optional*, defaults to 3):
-			Number of input channels for the image (typically 3 for RGB).
-		patch_size (`int`, *optional*, defaults to 14):
-			Size of the patches that the image is divided into.
-		spatial_merge_size (`int`, *optional*, defaults to 2):
-			The merge size for spatial dimensions in the vision transformer.
-		temporal_patch_size (`int`, *optional*, defaults to 2):
-			Size of the temporal patches when processing video input.
+	  depth (`int`, *optional*, defaults to 32):
+	    Number of layers in the vision transformer.
+	  embed_dim (`int`, *optional*, defaults to 1280):
+	    Dimensionality of the embeddings produced by the vision encoder.
+	  hidden_size (`int`, *optional*, defaults to 3584):
+	    Dimensionality of the intermediate representations in the vision transformer.
+	  hidden_act (`str`, *optional*, defaults to "quick_gelu"):
+	    The non-linear activation function used in the vision transformer.
+	  mlp_ratio (`int`, *optional*, defaults to 4):
+	    Ratio of the hidden size to the intermediate size in the MLP layers.
+	  num_heads (`int`, *optional*, defaults to 16):
+	    Number of attention heads in the vision transformer.
+	  in_channels (`int`, *optional*, defaults to 3):
+	    Number of input channels for the image (typically 3 for RGB).
+	  patch_size (`int`, *optional*, defaults to 14):
+	    Size of the patches that the image is divided into.
+	  spatial_merge_size (`int`, *optional*, defaults to 2):
+	    The merge size for spatial dimensions in the vision transformer.
+	  temporal_patch_size (`int`, *optional*, defaults to 2):
+	    Size of the temporal patches when processing video input.
 	"""
 
 	model_type = "qwen2_vl"
@@ -258,60 +257,45 @@ class Qwen2VLConfig(EasyDeLBaseConfig):
 
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model parameters for use with distributed training.
-
-		These rules define how model parameters should be partitioned across multiple devices
-		when using techniques like Fully Sharded Data Parallelism (FSDP), Sharded Parallelism (SP),
-		and Tensor Parallelism (TP).
-
+		Get the partition rules for the model.
 		Returns:
-			`tuple`: A tuple of tuples where each inner tuple contains:
-				- A regex pattern matching parameter names
-				- A PartitionSpec object specifying how to partition matching parameters
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
+		pmag = self.partition_manager
 		return (
-			# Language model embeddings
-			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-			# Language model attention layers
+			(r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
+			(r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
+			(r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
+			(r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
+			(r"mlp/.*proj/bias", pmag.resolve(Replicated)),
 			(
-				"layers/.*/self_attn/(q_proj|k_proj|v_proj)/kernel",
-				PartitionSpec("tp", ("fsdp", "sp")),
+				r"(input_layernorm|post_attention_layernorm)/kernel",
+				pmag.resolve(Replicated),
 			),
-			("layers/.*/self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("layers/.*/self_attn/(q_proj|k_proj|v_proj)/bias", PartitionSpec("tp")),
-			("layers/.*/self_attn/o_proj/bias", PartitionSpec(None)),
-			# Language model MLP layers
-			("layers/.*/mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("layers/.*/mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("layers/.*/mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("layers/.*/mlp/(gate_proj|down_proj|up_proj)/bias", PartitionSpec(None)),
-			# Language model norms
-			("layers/.*/input_layernorm/kernel", PartitionSpec(None)),
-			("layers/.*/post_attention_layernorm/kernel", PartitionSpec(None)),
-			("norm/kernel", PartitionSpec(None)),
-			# Language model head
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("lm_head/bias", PartitionSpec(None)),
-			# Visual model patch embedding
-			("patch_embed/proj/kernel", PartitionSpec(None, None, None, None, "tp")),
-			("patch_embed/proj/bias", PartitionSpec(None)),
-			# Visual model attention blocks
-			("blocks/.*/attn/qkv/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("blocks/.*/attn/qkv/bias", PartitionSpec(("fsdp", "sp"))),
-			("blocks/.*/attn/proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("blocks/.*/attn/proj/bias", PartitionSpec("tp")),
-			# Visual model MLP blocks
-			("blocks/.*/mlp/fc1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("blocks/.*/mlp/fc1/bias", PartitionSpec("tp")),
-			("blocks/.*/mlp/fc2/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("blocks/.*/mlp/fc2/bias", PartitionSpec("tp")),
-			# Visual model norms
-			("blocks/.*/norm1/(bias|scale)", PartitionSpec(None)),
-			("blocks/.*/norm2/(bias|scale)", PartitionSpec(None)),
-			# Visual model merger
-			("merger/ln_q/(bias|scale)", PartitionSpec(None)),
-			("merger/mlp/.*/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("merger/mlp/.*/bias", PartitionSpec("tp")),
-			# Catch-all for any remaining parameters
-			(".*", PartitionSpec(None)),
+			(r"norm/kernel", pmag.resolve(Replicated)),
+			(r"visual/patch_embed/proj/kernel", pmag.resolve(ColumnWise)),  #
+			(r"attn/qkv/kernel", pmag.resolve(ColumnWise)),
+			(r"attn/qkv/bias", pmag.resolve(Replicated)),
+			(r"attn/proj/kernel", pmag.resolve(RowWise)),
+			(r"attn/proj/bias", pmag.resolve(Replicated)),
+			(r"mlp/fc1/kernel", pmag.resolve(ColumnWise)),
+			(r"mlp/fc1/bias", pmag.resolve(Replicated)),
+			(r"mlp/fc2/kernel", pmag.resolve(RowWise)),
+			(r"mlp/fc2/bias", pmag.resolve(Replicated)),
+			(r"norm(1|2)/scale", pmag.resolve(Replicated)),
+			(r"norm(1|2)/bias", pmag.resolve(Replicated)),
+			(r"visual/merger/ln_q/scale", pmag.resolve(Replicated)),
+			(r"visual/merger/ln_q/bias", pmag.resolve(Replicated)),
+			(r"visual/merger/mlp/0/kernel", pmag.resolve(ColumnWise)),
+			(r"visual/merger/mlp/0/bias", pmag.resolve(Replicated)),
+			(r"visual/merger/mlp/2/kernel", pmag.resolve(RowWise)),
+			(r"visual/merger/mlp/2/bias", pmag.resolve(Replicated)),
+			(r"multi_modal_projector/linear_1/kernel", pmag.resolve(ColumnWise)),
+			(r"multi_modal_projector/linear_1/bias", pmag.resolve(Replicated)),
+			(r"lm_head/kernel", pmag.resolve(ColumnWise)),
+			(r"lm_head/bias", pmag.resolve(Replicated)),
+			(r".*bias", pmag.resolve(Replicated)),
+			(r".*", pmag.resolve(Replicated)),
 		)

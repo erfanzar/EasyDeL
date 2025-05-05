@@ -15,7 +15,7 @@
 
 import typing as tp
 
-from jax.sharding import PartitionSpec
+from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -176,51 +176,51 @@ class DeepseekV2Config(EasyDeLBaseConfig):
 		"""Initialize a new DeepseekV2Config instance.
 
 		Args:
-			vocab_size (int, optional): Size of the vocabulary. Defaults to 102400.
-			hidden_size (int, optional): Dimensionality of the embeddings and hidden states. Defaults to 4096.
-			intermediate_size (int, optional): Dimensionality of the MLP layer. Defaults to 11008.
-			moe_intermediate_size (int, optional): Dimensionality of the MoE intermediate layer. Defaults to 1407.
-			num_hidden_layers (int, optional): Number of hidden layers in the model. Defaults to 30.
-			num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
-			num_key_value_heads (int, optional): Number of key/value heads (for GQA). Defaults to 32.
-			n_shared_experts (int, optional): Number of shared MoE experts. Defaults to None.
-			n_routed_experts (int, optional): Number of routed MoE experts. Defaults to None.
-			ep_size (int, optional): Expert parallelism size. Defaults to 1.
-			routed_scaling_factor (float, optional): Scaling factor for routed experts. Defaults to 1.0.
-			kv_lora_rank (int, optional): Rank for KV LoRA. Defaults to 512.
-			q_lora_rank (int, optional): Rank for Q LoRA. Defaults to 1536.
-			qk_rope_head_dim (int, optional): Head dimension for QK with RoPE. Defaults to 64.
-			v_head_dim (int, optional): Head dimension for V. Defaults to 128.
-			qk_nope_head_dim (int, optional): Head dimension for QK without RoPE. Defaults to 128.
-			topk_method (str, optional): Method for top-k expert selection. Defaults to "gready".
-			n_group (int, optional): Number of expert groups. Defaults to None.
-			topk_group (int, optional): Top-k groups. Defaults to None.
-			num_experts_per_tok (int, optional): Number of experts per token. Defaults to None.
-			moe_layer_freq (int, optional): Frequency of MoE layers. Defaults to 1.
-			first_k_dense_replace (int, optional): First k dense layers to replace. Defaults to 0.
-			norm_topk_prob (bool, optional): Whether to normalize top-k probabilities. Defaults to False.
-			scoring_func (str, optional): Scoring function for expert selection. Defaults to "softmax".
-			aux_loss_alpha (float, optional): Weight for auxiliary loss. Defaults to 0.001.
-			seq_aux (bool, optional): Whether to use sequence auxiliary loss. Defaults to True.
-			hidden_act (str, optional): Activation function. Defaults to "silu".
-			max_position_embeddings (int, optional): Maximum sequence length. Defaults to 2048.
-			initializer_range (float, optional): Range for weight initialization. Defaults to 0.02.
-			rms_norm_eps (float, optional): Epsilon for RMS normalization. Defaults to 1e-6.
-			use_cache (bool, optional): Whether to use KV cache for generation. Defaults to True.
-			pad_token_id (int, optional): ID for padding token. Defaults to None.
-			bos_token_id (int, optional): ID for beginning of sequence token. Defaults to 100000.
-			eos_token_id (int, optional): ID for end of sequence token. Defaults to 100001.
-			pretraining_tp (int, optional): Tensor parallelism size during pretraining. Defaults to 1.
-			tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
-			rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
-			attention_bias (bool, optional): Whether to use bias in attention. Defaults to False.
-			attention_dropout (float, optional): Dropout rate for attention. Defaults to 0.0.
-			gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
-			use_scan_mlp (bool, optional): Whether to use scan for MLP computation. Defaults to False.
-			scan_mlp_chunk_size (int, optional): Chunk size for scan MLP. Defaults to 1024.
-			bits (int, optional): Quantization bits. Defaults to None.
-			rope_scaling (Dict[str, Union[str, float]], optional): RoPE scaling configuration. Defaults to None.
-			**kwargs: Additional arguments.
+		  vocab_size (int, optional): Size of the vocabulary. Defaults to 102400.
+		  hidden_size (int, optional): Dimensionality of the embeddings and hidden states. Defaults to 4096.
+		  intermediate_size (int, optional): Dimensionality of the MLP layer. Defaults to 11008.
+		  moe_intermediate_size (int, optional): Dimensionality of the MoE intermediate layer. Defaults to 1407.
+		  num_hidden_layers (int, optional): Number of hidden layers in the model. Defaults to 30.
+		  num_attention_heads (int, optional): Number of attention heads. Defaults to 32.
+		  num_key_value_heads (int, optional): Number of key/value heads (for GQA). Defaults to 32.
+		  n_shared_experts (int, optional): Number of shared MoE experts. Defaults to None.
+		  n_routed_experts (int, optional): Number of routed MoE experts. Defaults to None.
+		  ep_size (int, optional): Expert parallelism size. Defaults to 1.
+		  routed_scaling_factor (float, optional): Scaling factor for routed experts. Defaults to 1.0.
+		  kv_lora_rank (int, optional): Rank for KV LoRA. Defaults to 512.
+		  q_lora_rank (int, optional): Rank for Q LoRA. Defaults to 1536.
+		  qk_rope_head_dim (int, optional): Head dimension for QK with RoPE. Defaults to 64.
+		  v_head_dim (int, optional): Head dimension for V. Defaults to 128.
+		  qk_nope_head_dim (int, optional): Head dimension for QK without RoPE. Defaults to 128.
+		  topk_method (str, optional): Method for top-k expert selection. Defaults to "gready".
+		  n_group (int, optional): Number of expert groups. Defaults to None.
+		  topk_group (int, optional): Top-k groups. Defaults to None.
+		  num_experts_per_tok (int, optional): Number of experts per token. Defaults to None.
+		  moe_layer_freq (int, optional): Frequency of MoE layers. Defaults to 1.
+		  first_k_dense_replace (int, optional): First k dense layers to replace. Defaults to 0.
+		  norm_topk_prob (bool, optional): Whether to normalize top-k probabilities. Defaults to False.
+		  scoring_func (str, optional): Scoring function for expert selection. Defaults to "softmax".
+		  aux_loss_alpha (float, optional): Weight for auxiliary loss. Defaults to 0.001.
+		  seq_aux (bool, optional): Whether to use sequence auxiliary loss. Defaults to True.
+		  hidden_act (str, optional): Activation function. Defaults to "silu".
+		  max_position_embeddings (int, optional): Maximum sequence length. Defaults to 2048.
+		  initializer_range (float, optional): Range for weight initialization. Defaults to 0.02.
+		  rms_norm_eps (float, optional): Epsilon for RMS normalization. Defaults to 1e-6.
+		  use_cache (bool, optional): Whether to use KV cache for generation. Defaults to True.
+		  pad_token_id (int, optional): ID for padding token. Defaults to None.
+		  bos_token_id (int, optional): ID for beginning of sequence token. Defaults to 100000.
+		  eos_token_id (int, optional): ID for end of sequence token. Defaults to 100001.
+		  pretraining_tp (int, optional): Tensor parallelism size during pretraining. Defaults to 1.
+		  tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
+		  rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
+		  attention_bias (bool, optional): Whether to use bias in attention. Defaults to False.
+		  attention_dropout (float, optional): Dropout rate for attention. Defaults to 0.0.
+		  gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
+		  use_scan_mlp (bool, optional): Whether to use scan for MLP computation. Defaults to False.
+		  scan_mlp_chunk_size (int, optional): Chunk size for scan MLP. Defaults to 1024.
+		  bits (int, optional): Quantization bits. Defaults to None.
+		  rope_scaling (Dict[str, Union[str, float]], optional): RoPE scaling configuration. Defaults to None.
+		  **kwargs: Additional arguments.
 		"""
 		self.vocab_size = vocab_size
 		self.max_position_embeddings = max_position_embeddings
@@ -280,49 +280,37 @@ class DeepseekV2Config(EasyDeLBaseConfig):
 		Returns:
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
+		pmag = self.partition_manager  # Handles resolving strategies
 		return (
-			("embed_tokens/embedding", PartitionSpec(("sp", "fsdp"), "tp")),
-			("self_attn/q_a_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("self_attn/q_b_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("self_attn/kv_a_proj_with_mqa/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("self_attn/kv_b_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("self_attn/o_proj/kernel", PartitionSpec(("sp", "fsdp"), "tp")),
-			("self_attn/q_a_layernorm/kernel", PartitionSpec(None)),
-			("self_attn/kv_a_layernorm/kernel", PartitionSpec(None)),
-			("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("input_layernorm/kernel", PartitionSpec(None)),
-			("post_attention_layernorm/kernel", PartitionSpec(None)),
-			("model/norm/kernel", PartitionSpec(None)),
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			(".*", PartitionSpec(None)),
+			(r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
+			(r"self_attn/q_proj/kernel", pmag.resolve(ColumnWise)),
+			(r"self_attn/q_a_proj/kernel", pmag.resolve(ColumnWise)),
+			(r"self_attn/q_b_proj/kernel", pmag.resolve(ColumnWise)),
+			(r"self_attn/kv_a_proj_with_mqa/kernel", pmag.resolve(ColumnWise)),
+			(r"self_attn/kv_b_proj/kernel", pmag.resolve(ColumnWise)),
+			(r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
+			(r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
+			(r"self_attn/(q_a_layernorm|kv_a_layernorm)/kernel", pmag.resolve(Replicated)),
+			(r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
+			(r"mlp/gate/kernel", pmag.resolve(ColumnWise)),
+			(r"mlp/experts/\d+/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"mlp/experts/\d+/down_proj/kernel", pmag.resolve(RowWise)),
+			(
+				r".*(input_layernorm|post_attention_layernorm|norm)/kernel",
+				pmag.resolve(Replicated),
+			),
+			(r"lm_head/kernel", pmag.resolve(ColumnWise)),
+			(r".*bias", pmag.resolve(Replicated)),
+			(r".*", pmag.resolve(Replicated)),
 		)
-
-	@staticmethod
-	def get_weight_decay_exclusions():
-		"""Returns a tuple of parameter names for which weight decay should be excluded.
-
-		Returns:
-			tuple: An empty tuple, indicating no weight decay exclusions.
-		"""
-		return tuple()
-
-	@staticmethod
-	def rng_keys():
-		"""Returns the names of the random number generator keys used by the model.
-
-		Returns:
-			tuple: A tuple containing "params" and "dropout" as the RNG keys.
-		"""
-		return "params", "dropout", "fcm"
 
 	@property
 	def granted_freq_max_position_embedding(self) -> int:
 		"""Returns the maximum position embedding size for frequency-based position embeddings.
 
 		Returns:
-			int: The maximum position embedding size, falling back to max_position_embeddings if not explicitly set.
+		  int: The maximum position embedding size, falling back to max_position_embeddings if not explicitly set.
 		"""
 		return getattr(
 			self,
@@ -335,7 +323,7 @@ class DeepseekV2Config(EasyDeLBaseConfig):
 		"""Returns the maximum position embedding size for mask-based position embeddings.
 
 		Returns:
-			int: The maximum position embedding size, falling back to max_position_embeddings if not explicitly set.
+		  int: The maximum position embedding size, falling back to max_position_embeddings if not explicitly set.
 		"""
 		return getattr(
 			self,

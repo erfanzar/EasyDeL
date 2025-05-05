@@ -15,7 +15,7 @@
 
 import typing as tp
 
-from jax.sharding import PartitionSpec
+from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -309,85 +309,20 @@ class MptConfig(EasyDeLBaseConfig):
 
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model. This method defines how the model's parameters are
-		partitioned across devices for distributed training and inference.
-
-		Args:
-		    *args: Additional positional arguments (unused).
-		    **kwargs: Additional keyword arguments (unused).
-
+		Get the partition rules for the model.
 		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: A tuple of partition rules, where each rule is a tuple
-		        containing a regex pattern for parameter names and the corresponding `PartitionSpec`.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
+		pmag = self.partition_manager
 		return (
-			("wte/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-			("attn/Wqkv/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("attn/out_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("ffn/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("ffn/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("transformer/norm_1/scale", PartitionSpec(None)),
-			("transformer/norm_2/scale", PartitionSpec(None)),
-			("transformer/norm_f/scale", PartitionSpec(None)),
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			(".*", PartitionSpec(None)),
-		)
-
-	def attach_custom_arguments(
-		self,
-		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		bits: tp.Optional[int] = None,
-		**kwargs,
-	):
-		"""Attaches custom arguments to the configuration object.
-
-		This method allows adding or overriding configuration attributes dynamically.
-		It primarily sets attributes related to gradient checkpointing and quantization bits.
-
-		Args:
-		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
-		        Defaults to EasyDeLGradientCheckPointers.NONE.
-		    bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
-		    **kwargs: Additional keyword arguments (ignored).
-		"""
-		if hasattr(self, "attn_config"):
-			for k, v in self.attn_config.__dict__.items():
-				if not hasattr(self, k):
-					setattr(self, k, v)
-		basics = dict(bits=bits, gradient_checkpointing=gradient_checkpointing, **kwargs)
-		for k, v in basics.items():
-			if not hasattr(self, k):
-				setattr(self, k, v)
-		self.from_pt = False
-
-	@property
-	def granted_freq_max_position_embedding(self) -> int:
-		"""Returns the maximum position embedding size specifically for frequency-based position embeddings.
-
-		If `freq_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
-		`max_seq_len`.
-
-		Returns:
-		    int: The granted maximum position embedding size for frequency encoding.
-		"""
-		return getattr(
-			self,
-			"freq_max_position_embeddings",
-			self.max_position_embeddings,
-		)
-
-	@property
-	def granted_mask_max_position_embedding(self) -> int:
-		"""Returns the maximum position embedding size specifically for mask-based position embeddings.
-
-		If `mask_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
-		`max_seq_len`.
-
-		Returns:
-		    int: The granted maximum position embedding size for mask encoding.
-		"""
-		return getattr(
-			self,
-			"mask_max_position_embeddings",
-			self.max_position_embeddings,
+			(r"wte/embedding", pmag.resolve(ColumnWise)),
+			(r"attn/Wqkv/kernel", pmag.resolve(ColumnWise)),
+			(r"attn/out_proj/kernel", pmag.resolve(RowWise)),
+			(r"ffn/up_proj/kernel", pmag.resolve(ColumnWise)),
+			(r"ffn/down_proj/kernel", pmag.resolve(RowWise)),
+			(r".*/(norm_1|norm_2|norm_f)/scale", pmag.resolve(Replicated)),
+			(r".*/(norm_1|norm_2|norm_f)/bias", pmag.resolve(Replicated)),
+			(r"lm_head/kernel", pmag.resolve(ColumnWise)),
+			(r".*(Wqkv|out_proj|up_proj|down_proj|lm_head)/bias", pmag.resolve(Replicated)),
+			(r".*", pmag.resolve(Replicated)),
 		)

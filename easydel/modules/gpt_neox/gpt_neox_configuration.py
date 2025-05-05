@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from jax.sharding import PartitionSpec
+from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -151,55 +151,30 @@ class GPTNeoXConfig(EasyDeLBaseConfig):
 
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model. This method defines how the model's parameters are
-		partitioned across devices for distributed training and inference.
-
-		Args:
-		    *args: Additional positional arguments (unused).
-		    **kwargs: Additional keyword arguments (unused).
-
+		Get the partition rules for the model.
 		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: A tuple of partition rules, where each rule is a tuple
-		        containing a regex pattern for parameter names and the corresponding `PartitionSpec`.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
+		pmag = self.partition_manager
 		return (
-			("wte/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-			("attention/w_qkv/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("attention/w_qkv/bias", PartitionSpec(("fsdp", "sp"))),  # 1D for bias
-			("attention/wo/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("attention/wo/bias", PartitionSpec(("fsdp", "sp"))),  # 1D for bias
-			("mlp/dense_h_to_4h/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/dense_h_to_4h/bias", PartitionSpec(("fsdp", "sp"))),  # 1D for bias
-			("mlp/dense_4h_to_h/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("mlp/dense_4h_to_h/bias", PartitionSpec(("fsdp", "sp"))),  # 1D for bias
-			("post_attention_layernorm/(bias|scale)", PartitionSpec(None)),
-			("input_layernorm/(bias|scale)", PartitionSpec(None)),
-			("transformer/final_layer_norm/(scale|bias)", PartitionSpec(None)),
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			(".*", PartitionSpec(None)),
+			(r"embed_in/embedding", pmag.resolve(ColumnWise)),
+			(r"attention/query_key_value/kernel", pmag.resolve(ColumnWise)),
+			(r"attention/dense/kernel", pmag.resolve(RowWise)),
+			(r"mlp/dense_h_to_4h/kernel", pmag.resolve(ColumnWise)),
+			(r"mlp/dense_4h_to_h/kernel", pmag.resolve(RowWise)),
+			(r"lm_head/kernel", pmag.resolve(ColumnWise)),
+			(
+				r".*/(input_layernorm|post_attention_layernorm|final_layer_norm)/scale",
+				pmag.resolve(Replicated),
+			),
+			(
+				r".*/(input_layernorm|post_attention_layernorm|final_layer_norm)/bias",
+				pmag.resolve(Replicated),
+			),
+			(
+				r".*(query_key_value|dense|dense_h_to_4h|dense_4h_to_h|lm_head)/bias",
+				pmag.resolve(Replicated),
+			),
+			(r".*", pmag.resolve(Replicated)),
 		)
 
-	@staticmethod
-	def get_mesh_names():
-		"""Returns the mesh names used for model parallelism. For GPT-NeoX, it returns mesh names for
-		data parallelism ('dp'), fully sharded data parallelism ('fsdp'), tensor parallelism ('tp'),
-		and sequence parallelism ('sp').
-
-		Returns:
-		    tuple: A tuple containing the mesh names ("dp", "fsdp", "tp", "sp").
-		"""
-		return "dp", "fsdp", "tp", "sp"
-
-	def attach_custom_arguments(
-		self,
-		**kwargs,
-	):
-		"""Attaches custom arguments to the configuration object.
-
-		This method allows adding or overriding configuration attributes dynamically.
-		It primarily sets the `from_pt` attribute to False and ignores other keyword arguments.
-
-		Args:
-		    **kwargs: Additional keyword arguments (ignored).
-		"""
-		self.from_pt = False

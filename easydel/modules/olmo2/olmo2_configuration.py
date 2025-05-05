@@ -15,7 +15,7 @@
 
 import typing as tp
 
-from jax.sharding import PartitionSpec
+from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -34,58 +34,58 @@ class Olmo2Config(EasyDeLBaseConfig):
 
 
 	Args:
-			vocab_size (`int`, *optional*, defaults to 50304):
-					Vocabulary size of the Olmo2 model. Defines the number of different tokens that can be represented by the
-					`inputs_ids` passed when calling [`Olmo2Model`]
-			hidden_size (`int`, *optional*, defaults to 4096):
-					Dimension of the hidden representations.
-			intermediate_size (`int`, *optional*, defaults to 11008):
-					Dimension of the MLP representations.
-			num_hidden_layers (`int`, *optional*, defaults to 32):
-					Number of hidden layers in the Transformer decoder.
-			num_attention_heads (`int`, *optional*, defaults to 32):
-					Number of attention heads for each attention layer in the Transformer decoder.
-			num_key_value_heads (`int`, *optional*):
-					This is the number of key_value heads that should be used to implement Grouped Query Attention. If
-					`num_key_value_heads=num_attention_heads`, the model will use Multi Head Attention (MHA), if
-					`num_key_value_heads=1` the model will use Multi Query Attention (MQA) otherwise GQA is used. When
-					converting a multi-head checkpoint to a GQA checkpoint, each group key and value head should be constructed
-					by meanpooling all the original heads within that group. For more details checkout [this
-					paper](https://arxiv.org/pdf/2305.13245.pdf). If it is not specified, will default to
-					`num_attention_heads`.
-			hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
-					The non-linear activation function (function or string) in the decoder.
-			max_position_embeddings (`int`, *optional*, defaults to 2048):
-					The maximum sequence length that this model might ever be used with.
-			initializer_range (`float`, *optional*, defaults to 0.02):
-					The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
-			use_cache (`bool`, *optional*, defaults to `True`):
-					Whether or not the model should return the last key/values attentions (not used by all models). Only
-					relevant if `config.is_decoder=True`.
-			pad_token_id (`int`, *optional*, defaults to 1):
-					Padding token id.
-			bos_token_id (`int`, *optional*):
-					Beginning of stream token id.
-			eos_token_id (`int`, *optional*, defaults to 50279):
-					End of stream token id.
-			tie_word_embeddings (`bool`, *optional*, defaults to `False`):
-					Whether to tie weight embeddings
-			rope_theta (`float`, *optional*, defaults to 10000.0):
-					The base period of the RoPE embeddings.
-			rope_scaling (`tp.Dict`, *optional*):
-					Dictionary containing the scaling configuration for the RoPE embeddings. Currently supports two scaling
-					strategies: linear and dynamic. Their scaling factor must be a float greater than 1. The expected format is
-					`{"type": strategy name, "factor": scaling factor}`. When using this flag, don't update
-					`max_position_embeddings` to the expected new maximum. See the following thread for more information on how
-					these scaling strategies behave:
-					https://www.reddit.com/r/LocalLLaMA/comments/14mrgpr/dynamically_scaled_rope_further_increases/. This is an
-					experimental feature, subject to breaking API changes in future versions.
-			attention_bias (`bool`, defaults to `False`, *optional*, defaults to `False`):
-					Whether to use a bias in the query, key, value and output projection layers during self-attention.
-			attention_dropout (`float`, *optional*, defaults to 0.0):
-					The dropout ratio for the attention probabilities.
-			rms_norm_eps (`float`, *optional*, defaults to 1e-05):
-					The epsilon used by the rms normalization layers.
+	    vocab_size (`int`, *optional*, defaults to 50304):
+	        Vocabulary size of the Olmo2 model. Defines the number of different tokens that can be represented by the
+	        `inputs_ids` passed when calling [`Olmo2Model`]
+	    hidden_size (`int`, *optional*, defaults to 4096):
+	        Dimension of the hidden representations.
+	    intermediate_size (`int`, *optional*, defaults to 11008):
+	        Dimension of the MLP representations.
+	    num_hidden_layers (`int`, *optional*, defaults to 32):
+	        Number of hidden layers in the Transformer decoder.
+	    num_attention_heads (`int`, *optional*, defaults to 32):
+	        Number of attention heads for each attention layer in the Transformer decoder.
+	    num_key_value_heads (`int`, *optional*):
+	        This is the number of key_value heads that should be used to implement Grouped Query Attention. If
+	        `num_key_value_heads=num_attention_heads`, the model will use Multi Head Attention (MHA), if
+	        `num_key_value_heads=1` the model will use Multi Query Attention (MQA) otherwise GQA is used. When
+	        converting a multi-head checkpoint to a GQA checkpoint, each group key and value head should be constructed
+	        by meanpooling all the original heads within that group. For more details checkout [this
+	        paper](https://arxiv.org/pdf/2305.13245.pdf). If it is not specified, will default to
+	        `num_attention_heads`.
+	    hidden_act (`str` or `function`, *optional*, defaults to `"silu"`):
+	        The non-linear activation function (function or string) in the decoder.
+	    max_position_embeddings (`int`, *optional*, defaults to 2048):
+	        The maximum sequence length that this model might ever be used with.
+	    initializer_range (`float`, *optional*, defaults to 0.02):
+	        The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
+	    use_cache (`bool`, *optional*, defaults to `True`):
+	        Whether or not the model should return the last key/values attentions (not used by all models). Only
+	        relevant if `config.is_decoder=True`.
+	    pad_token_id (`int`, *optional*, defaults to 1):
+	        Padding token id.
+	    bos_token_id (`int`, *optional*):
+	        Beginning of stream token id.
+	    eos_token_id (`int`, *optional*, defaults to 50279):
+	        End of stream token id.
+	    tie_word_embeddings (`bool`, *optional*, defaults to `False`):
+	        Whether to tie weight embeddings
+	    rope_theta (`float`, *optional*, defaults to 10000.0):
+	        The base period of the RoPE embeddings.
+	    rope_scaling (`tp.Dict`, *optional*):
+	        Dictionary containing the scaling configuration for the RoPE embeddings. Currently supports two scaling
+	        strategies: linear and dynamic. Their scaling factor must be a float greater than 1. The expected format is
+	        `{"type": strategy name, "factor": scaling factor}`. When using this flag, don't update
+	        `max_position_embeddings` to the expected new maximum. See the following thread for more information on how
+	        these scaling strategies behave:
+	        https://www.reddit.com/r/LocalLLaMA/comments/14mrgpr/dynamically_scaled_rope_further_increases/. This is an
+	        experimental feature, subject to breaking API changes in future versions.
+	    attention_bias (`bool`, defaults to `False`, *optional*, defaults to `False`):
+	        Whether to use a bias in the query, key, value and output projection layers during self-attention.
+	    attention_dropout (`float`, *optional*, defaults to 0.0):
+	        The dropout ratio for the attention probabilities.
+	    rms_norm_eps (`float`, *optional*, defaults to 1e-05):
+	        The epsilon used by the rms normalization layers.
 
 
 	>>> from transformers import Olmo2Model, Olmo2Config
@@ -224,87 +224,36 @@ class Olmo2Config(EasyDeLBaseConfig):
 				f"`rope_scaling`'s factor field must be a float > 1, got {rope_scaling_factor}"
 			)
 
-	def attach_custom_arguments(
-		self,
-		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		use_scan_mlp: bool = False,
-		scan_mlp_chunk_size: int = 1024,
-		bits: tp.Optional[int] = None,
-	):
-		"""Attaches custom arguments to the configuration object.
-
-		This method allows adding or overriding configuration attributes dynamically.
-		It primarily sets attributes related to gradient checkpointing, MLP scanning, and quantization bits.
-
-		Args:
-		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
-		        Defaults to EasyDeLGradientCheckPointers.NONE.
-		    use_scan_mlp (bool, optional): Whether to use scan for MLP layers. Defaults to False.
-		    scan_mlp_chunk_size (int, optional): Chunk size for scan MLP. Defaults to 1024.
-		    bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
-		"""
-		self.gradient_checkpointing = gradient_checkpointing
-		self.use_scan_mlp = use_scan_mlp
-		self.scan_mlp_chunk_size = scan_mlp_chunk_size
-		self.bits = bits
-
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model. This method defines how the model's parameters are
-		partitioned across devices for distributed training and inference.
-
-		Args:
-		    *args: Additional positional arguments (unused).
-		    **kwargs: Additional keyword arguments (unused).
-
+		Get the partition rules for the model.
 		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: A tuple of partition rules, where each rule is a tuple
-		        containing a regex pattern for parameter names and the corresponding `PartitionSpec`.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
+		pmag = self.partition_manager
 		return (
-			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-			("self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("input_layernorm/kernel", PartitionSpec(None)),
-			("post_attention_layernorm/kernel", PartitionSpec(None)),
-			("model/norm/kernel", PartitionSpec(None)),
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			(".*", PartitionSpec(None)),
-		)
-
-	@property
-	def granted_freq_max_position_embedding(self) -> int:
-		"""Returns the maximum position embedding size specifically for frequency-based position embeddings.
-
-		If `freq_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
-		`max_position_embeddings`.
-
-		Returns:
-		    int: The granted maximum position embedding size for frequency encoding.
-		"""
-		return getattr(
-			self,
-			"freq_max_position_embeddings",
-			self.max_position_embeddings,
-		)
-
-	@property
-	def granted_mask_max_position_embedding(self) -> int:
-		"""Returns the maximum position embedding size specifically for mask-based position embeddings.
-
-		If `mask_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
-		`max_position_embeddings`.
-
-		Returns:
-		    int: The granted maximum position embedding size for mask encoding.
-		"""
-		return getattr(
-			self,
-			"mask_max_position_embeddings",
-			self.max_position_embeddings,
+			(r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
+			(r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
+			(r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
+			(r"self_attn/(q_norm|k_norm)/kernel", pmag.resolve(Replicated)),
+			(r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
+			(r"mlp/.*proj/bias", pmag.resolve(Replicated)),
+			(
+				r".*/(post_attention_layernorm|post_feedforward_layernorm|norm)/kernel",
+				pmag.resolve(Replicated),
+			),
+			(
+				r".*/(post_attention_layernorm|post_feedforward_layernorm|norm)/scale",
+				pmag.resolve(Replicated),
+			),
+			(
+				r".*/(post_attention_layernorm|post_feedforward_layernorm|norm)/bias",
+				pmag.resolve(Replicated),
+			),
+			(r"lm_head/kernel", pmag.resolve(ColumnWise)),
+			(r"score/kernel", pmag.resolve(RowWise)),
+			(r".*bias", pmag.resolve(Replicated)),
+			(r".*", pmag.resolve(Replicated)),
 		)

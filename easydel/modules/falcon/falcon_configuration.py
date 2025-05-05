@@ -15,8 +15,7 @@
 
 import typing as tp
 
-from jax.sharding import PartitionSpec
-
+from eformer.common_types import ColumnWise, Replicated, RowWise
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
@@ -128,33 +127,33 @@ class FalconConfig(EasyDeLBaseConfig):
 		"""Initialize a new FalconConfig instance.
 
 		Args:
-			vocab_size (int, optional): Size of the vocabulary. Defaults to 65024.
-			hidden_size (int, optional): Dimensionality of hidden layers. Defaults to 4544.
-			num_hidden_layers (int, optional): Number of hidden layers. Defaults to 32.
-			num_attention_heads (int, optional): Number of attention heads. Defaults to 71.
-			num_ln_in_parallel_attn (int, optional): Number of layer norms in parallel attention. Defaults to None.
-			layer_norm_epsilon (float, optional): Epsilon for layer normalization. Defaults to 1e-5.
-			initializer_range (float, optional): Range for weight initialization. Defaults to 0.02.
-			use_cache (bool, optional): Whether to use KV cache. Defaults to True.
-			hidden_dropout (float, optional): Dropout probability for hidden layers. Defaults to 0.0.
-			attention_dropout (float, optional): Dropout probability for attention. Defaults to 0.0.
-			num_kv_heads (int, optional): Number of key/value heads. Defaults to None (same as num_attention_heads).
-			alibi (bool, optional): Whether to use alibi attention. Defaults to False.
-			new_decoder_architecture (bool, optional): Whether to use new decoder architecture. Defaults to False.
-			multi_query (bool, optional): Whether to use multi-query attention. Defaults to True.
-			parallel_attn (bool, optional): Whether to use parallel attention. Defaults to True.
-			bias (bool, optional): Whether to use bias in linear layers. Defaults to False.
-			max_position_embeddings (int, optional): Maximum sequence length. Defaults to 2048.
-			rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
-			rope_scaling (dict, optional): RoPE scaling configuration. Defaults to None.
-			bos_token_id (int, optional): Beginning of sequence token ID. Defaults to 11.
-			eos_token_id (int, optional): End of sequence token ID. Defaults to 11.
-			ffn_hidden_size (int, optional): Size of feed-forward hidden layer. Defaults to None.
-			ff_factor (int, optional): Factor for feed-forward size. Defaults to None.
-			activation (str, optional): Activation function. Defaults to "gelu".
-			gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
-			bits (int, optional): Quantization bits. Defaults to None.
-			**kwargs: Additional arguments.
+		  vocab_size (int, optional): Size of the vocabulary. Defaults to 65024.
+		  hidden_size (int, optional): Dimensionality of hidden layers. Defaults to 4544.
+		  num_hidden_layers (int, optional): Number of hidden layers. Defaults to 32.
+		  num_attention_heads (int, optional): Number of attention heads. Defaults to 71.
+		  num_ln_in_parallel_attn (int, optional): Number of layer norms in parallel attention. Defaults to None.
+		  layer_norm_epsilon (float, optional): Epsilon for layer normalization. Defaults to 1e-5.
+		  initializer_range (float, optional): Range for weight initialization. Defaults to 0.02.
+		  use_cache (bool, optional): Whether to use KV cache. Defaults to True.
+		  hidden_dropout (float, optional): Dropout probability for hidden layers. Defaults to 0.0.
+		  attention_dropout (float, optional): Dropout probability for attention. Defaults to 0.0.
+		  num_kv_heads (int, optional): Number of key/value heads. Defaults to None (same as num_attention_heads).
+		  alibi (bool, optional): Whether to use alibi attention. Defaults to False.
+		  new_decoder_architecture (bool, optional): Whether to use new decoder architecture. Defaults to False.
+		  multi_query (bool, optional): Whether to use multi-query attention. Defaults to True.
+		  parallel_attn (bool, optional): Whether to use parallel attention. Defaults to True.
+		  bias (bool, optional): Whether to use bias in linear layers. Defaults to False.
+		  max_position_embeddings (int, optional): Maximum sequence length. Defaults to 2048.
+		  rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
+		  rope_scaling (dict, optional): RoPE scaling configuration. Defaults to None.
+		  bos_token_id (int, optional): Beginning of sequence token ID. Defaults to 11.
+		  eos_token_id (int, optional): End of sequence token ID. Defaults to 11.
+		  ffn_hidden_size (int, optional): Size of feed-forward hidden layer. Defaults to None.
+		  ff_factor (int, optional): Factor for feed-forward size. Defaults to None.
+		  activation (str, optional): Activation function. Defaults to "gelu".
+		  gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
+		  bits (int, optional): Quantization bits. Defaults to None.
+		  **kwargs: Additional arguments.
 		"""
 		self.vocab_size = vocab_size
 		n_embed = kwargs.pop("n_embed", None)
@@ -207,84 +206,25 @@ class FalconConfig(EasyDeLBaseConfig):
 		Returns:
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
+		pmag = self.partition_manager
 		return (
-			("word_embeddings/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
+			(r"word_embeddings/embedding", pmag.resolve(ColumnWise)),
+			(r"self_attention/query_key_value/kernel", pmag.resolve(ColumnWise)),
+			(r"self_attention/dense/kernel", pmag.resolve(RowWise)),
+			(r"mlp/dense_h_to_4h/kernel", pmag.resolve(ColumnWise)),
+			(r"mlp/dense_4h_to_h/kernel", pmag.resolve(RowWise)),
 			(
-				"self_attention/query_key_value/kernel",
-				PartitionSpec("tp", ("fsdp", "sp")),
-			),
-			("self_attention/dense/(kernel)", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/dense_4h_to_h/(kernel)", PartitionSpec("tp", ("fsdp", "sp"))),
-			("mlp/dense_h_to_4h/(kernel)", PartitionSpec(("fsdp", "sp"), "tp")),
-			("lm_head/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("transformer/ln_f/bias", PartitionSpec(("fsdp", "sp"))),
-			("transformer/ln_f/scale", PartitionSpec(("fsdp", "sp"))),
-			(
-				"transformer/post_attention_layernorm/scale",
-				PartitionSpec(("fsdp", "sp")),
+				r".*/(ln_attn|ln_mlp|input_layernorm|post_attention_layernorm|ln_f)/scale",
+				pmag.resolve(Replicated),
 			),
 			(
-				"transformer/post_attention_layernorm/bias",
-				PartitionSpec(("fsdp", "sp")),
+				r".*/(ln_attn|ln_mlp|input_layernorm|post_attention_layernorm|ln_f)/bias",
+				pmag.resolve(Replicated),
 			),
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			(".*", PartitionSpec(None)),
-		)
-
-	@staticmethod
-	def get_mesh_names():
-		"""Returns the mesh names used for model parallelism.
-
-		Returns:
-			tuple: A tuple containing "dp", "fsdp", and "tp" as the mesh names.
-		"""
-		return "dp", "fsdp", "tp", "sp"
-
-	def attach_custom_arguments(
-		self,
-		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		bits: tp.Optional[int] = None,
-		**kwargs,
-	):
-		"""Attach custom arguments to the configuration.
-
-		Args:
-			gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy. Defaults to EasyDeLGradientCheckPointers.NONE.
-			bits (int, optional): Quantization bits. Defaults to None.
-			**kwargs: Additional keyword arguments.
-
-		Returns:
-			FalconConfig: The updated configuration instance.
-		"""
-		basics = dict(bits=bits, gradient_checkpointing=gradient_checkpointing, **kwargs)
-		for key_states, value_states in basics.items():
-			if not hasattr(self, key_states):
-				setattr(self, key_states, value_states)
-
-		self.from_pt = False
-
-	@property
-	def granted_freq_max_position_embedding(self) -> int:
-		"""Returns the maximum position embedding size for frequency-based position embeddings.
-
-		Returns:
-			int: The maximum position embedding size, falling back to max_position_embeddings if not explicitly set.
-		"""
-		return getattr(
-			self,
-			"freq_max_position_embeddings",
-			self.max_position_embeddings,
-		)
-
-	@property
-	def granted_mask_max_position_embedding(self) -> int:
-		"""Returns the maximum position embedding size for mask-based position embeddings.
-
-		Returns:
-			int: The maximum position embedding size, falling back to max_position_embeddings if not explicitly set.
-		"""
-		return getattr(
-			self,
-			"mask_max_position_embeddings",
-			self.max_position_embeddings,
+			(r"lm_head/kernel", pmag.resolve(ColumnWise)),
+			(
+				r".*(query_key_value|dense|dense_h_to_4h|dense_4h_to_h|lm_head)/bias",
+				pmag.resolve(Replicated),
+			),
+			(r".*", pmag.resolve(Replicated)),
 		)

@@ -15,7 +15,7 @@
 
 import typing as tp
 
-from jax.sharding import PartitionSpec
+from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -185,35 +185,40 @@ class Phi3Config(EasyDeLBaseConfig):
 	def get_partition_rules(self, *args, **kwargs):
 		"""
 		Get the partition rules for the model.
-
 		Returns:
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
+		pmag = self.partition_manager
 		return (
-			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-			("norm/kernel", PartitionSpec(("fsdp", "sp"))),
-			("post_attention_layernorm/kernel", PartitionSpec(("fsdp", "sp"))),
-			("input_layernorm/kernel", PartitionSpec(("fsdp", "sp"))),
-			("mlp/gate_up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/down_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("self_attn/qkv_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			(".*", PartitionSpec(None)),
+			(r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
+			(r"self_attn/qkv_proj/kernel", pmag.resolve(ColumnWise)),
+			(r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
+			(r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
+			(r"mlp/gate_up_proj/kernel", pmag.resolve(ColumnWise)),
+			(r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
+			(r"mlp/.*proj/bias", pmag.resolve(Replicated)),
+			(
+				r".*/(input_layernorm|post_attention_layernorm|norm)/kernel",
+				pmag.resolve(Replicated),
+			),
+			(r"lm_head/kernel", pmag.resolve(ColumnWise)),
+			(r"score/kernel", pmag.resolve(RowWise)),
+			(r".*bias", pmag.resolve(Replicated)),
+			(r".*", pmag.resolve(Replicated)),
 		)
 
 	def _rope_scaling_validation(self):
 		"""Validate the `rope_scaling` configuration."""
 		"""Validates the `rope_scaling` configuration dictionary.
-		
-		Ensures that the `rope_scaling` dictionary contains the correct keys (`type`, `factor`)
-		and that the values are valid (type is 'linear', 'dynamic', or 'longrope', factor is > 1.0).
-		It also handles backward compatibility for 'su' and 'yarn' types, mapping them to 'longrope'.
-		
-		Raises:
-		    ValueError: If `rope_scaling` is not a dictionary, is missing keys,
-		        or has invalid values for `type` or `factor`.
-		"""
+    
+    Ensures that the `rope_scaling` dictionary contains the correct keys (`type`, `factor`)
+    and that the values are valid (type is 'linear', 'dynamic', or 'longrope', factor is > 1.0).
+    It also handles backward compatibility for 'su' and 'yarn' types, mapping them to 'longrope'.
+    
+    Raises:
+        ValueError: If `rope_scaling` is not a dictionary, is missing keys,
+            or has invalid values for `type` or `factor`.
+    """
 		if self.rope_scaling is None:
 			return
 

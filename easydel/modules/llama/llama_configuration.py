@@ -15,7 +15,7 @@
 
 import typing as tp
 
-from jax.sharding import PartitionSpec
+from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -48,8 +48,8 @@ class LlamaConfig(EasyDeLBaseConfig):
 	    max_position_embeddings (`int`, *optional*, defaults to 2048):
 	        The maximum sequence length that this model might ever be used with. Typically set this to something large
 	        just in case (e.g., 2048 or 4096).
-			head_dim (`int`, *optional*):
-					head_dim for attention qkv.
+	    head_dim (`int`, *optional*):
+	        head_dim for attention qkv.
 	    rms_norm_eps (`float`, *optional*, defaults to 1e-6):
 	        The epsilon used by the rms normalization layers.
 	    initializer_range (`float`, *optional*, defaults to 0.02):
@@ -172,107 +172,27 @@ class LlamaConfig(EasyDeLBaseConfig):
 
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model.
+		Get the partition rules for the Llama model.
 		Returns:
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
+		pmag = self.partition_manager
 		return (
-			("embed_tokens/embedding", PartitionSpec(("fsdp", "tp"), "sp")),
-			("self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/o_proj/kernel", PartitionSpec(("sp", "fsdp"), "tp")),
-			("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("input_layernorm/kernel", PartitionSpec(None)),
-			("post_attention_layernorm/kernel", PartitionSpec(None)),
-			("model/norm/kernel", PartitionSpec(None)),
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			(".*", PartitionSpec(None)),
-		)
-
-	def attach_custom_arguments(
-		self,
-		resid_pdrop: float = 0.0,
-		embd_pdrop: float = 0.0,
-		attention_dropout: float = 0.0,
-		tie_word_embeddings: bool = False,
-		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		fcm_min_ratio: float = 0.0,
-		fcm_max_ratio: float = 0.0,
-		number_rep_kv: int = 1,
-		bits: tp.Optional[int] = None,
-		rope_theta: float = 10000.0,
-		attention_bias: bool = False,
-		hidden_act: str = "silu",
-		scan_layers: bool = True,
-		**kwargs,
-	):
-		"""The attach_custom_arguments function adds the following arguments to the Transformer class:
-
-		Args:
-		    self: Refer to the current object
-		    resid_pdrop: float: Set the dropout rate for residual
-		        connections
-		    embd_pdrop: float: Set the probability of dropping an
-		        embedding
-		    attention_dropout: float: Set the probability of dropping
-		        out the attention layer
-		    tie_word_embeddings: bool: Tie the word embeddings to the
-		        decoder
-		    gradient_checkpointing: str: Control the amount of memory
-		        used by jax
-		    fcm_min_ratio: float: Control the minimum ratio of the
-		        number of chunks to be used in flash-based computation
-		    fcm_max_ratio: float: Set the maximum ratio of the number of
-		        input tokens to output tokens
-		    number_rep_kv: int: Determine how many times the key and
-		        value vectors are repeated
-		    bits: tp.Optional[int]: Determine the number of bits used in
-		        the quantization
-		    rope_theta: float : rope_theta for compute rope
-		    attention_bias: bool : whenever to use attention bias or no
-		    hidden_act: str : hidden_act for mlp
-		    scan_layers: bool: Determine whether to use scan layers or
-		        not
-		"""
-		self.scan_layers = scan_layers
-		self.embd_pdrop = embd_pdrop
-		self.number_rep_kv = number_rep_kv
-		self.resid_pdrop = resid_pdrop
-		self.rope_theta = rope_theta
-		self.attention_bias = attention_bias
-		self.attention_dropout = attention_dropout
-		self.hidden_act = hidden_act
-		self.tie_word_embeddings = tie_word_embeddings
-		self.gradient_checkpointing = gradient_checkpointing
-		self.fcm_min_ratio = fcm_min_ratio
-		self.fcm_max_ratio = fcm_max_ratio
-		self.bits = bits
-
-	@staticmethod
-	def get_weight_decay_exclusions():
-		return tuple()
-
-	@staticmethod
-	def rng_keys():
-		return "params", "dropout", "fcm"
-
-	@property
-	def granted_freq_max_position_embedding(self) -> int:
-		return getattr(
-			self,
-			"freq_max_position_embeddings",
-			self.max_position_embeddings,
-		)
-
-	@property
-	def granted_mask_max_position_embedding(self) -> int:
-		return getattr(
-			self,
-			"mask_max_position_embeddings",
-			self.max_position_embeddings,
+			(r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
+			(r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
+			(r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
+			(r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
+			(r"mlp/.*proj/bias", pmag.resolve(Replicated)),
+			(
+				r".*(input_layernorm|post_attention_layernorm|norm)/kernel",
+				pmag.resolve(Replicated),
+			),
+			(r"lm_head/kernel", pmag.resolve(ColumnWise)),
+			(r"score/kernel", pmag.resolve(RowWise)),
+			(r".*bias", pmag.resolve(Replicated)),
+			(r".*", pmag.resolve(Replicated)),
 		)
 
 
@@ -291,40 +211,29 @@ class VisionLlamaConfig(LlamaConfig):
 
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model.
+		Get the partition rules for the Llama model.
 		Returns:
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
+		pmag = self.partition_manager
 		return (
-			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-			("embed_vision/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-			("self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("input_layernorm/kernel", PartitionSpec(None)),
-			("post_attention_layernorm/kernel", PartitionSpec(None)),
-			("model/norm/kernel", PartitionSpec(None)),
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("vision_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			(".*", PartitionSpec(None)),
-		)
-
-	@property
-	def granted_freq_max_position_embedding(self) -> int:
-		return getattr(
-			self,
-			"freq_max_position_embeddings",
-			self.max_position_embeddings,
-		)
-
-	@property
-	def granted_mask_max_position_embedding(self) -> int:
-		return getattr(
-			self,
-			"mask_max_position_embeddings",
-			self.max_position_embeddings,
+			# Column-wise Sharding (split output dimensions)
+			(r".*attn/.*(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
+			# QKV Projections
+			(r".*mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
+			# MLP Up-Projections
+			(r".*embed_tokens/embedding", pmag.resolve(ColumnWise)),  # Token Embeddings
+			(r".*embed_vision/embedding", pmag.resolve(ColumnWise)),  # Vision Embeddings
+			(r".*lm_head/kernel", pmag.resolve(ColumnWise)),  # Language Model Head
+			(r".*vision_head/kernel", pmag.resolve(ColumnWise)),  # Vision Model Head
+			# Row-wise Sharding (split input dimensions)
+			(r".*attn/o_proj/kernel", pmag.resolve(RowWise)),  # Attention Output
+			(r".*mlp/down_proj/kernel", pmag.resolve(RowWise)),  # MLP Down-Projection
+			(r".*score/kernel", pmag.resolve(RowWise)),  # Sequence Classifier Head
+			# Replicated Parameters
+			(r".*bias", pmag.resolve(Replicated)),  # All biases
+			(r".*layernorm/scale", pmag.resolve(Replicated)),  # LayerNorm scales
+			(r".*rms_norm/scale", pmag.resolve(Replicated)),  # RMSNorm scales
+			(r".*norm/scale", pmag.resolve(Replicated)),  # Final LayerNorm scale
+			(r".*", pmag.resolve(Replicated)),
 		)

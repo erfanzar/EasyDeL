@@ -15,7 +15,7 @@
 
 import typing as tp
 
-from jax.sharding import PartitionSpec
+from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -196,44 +196,47 @@ class Qwen2MoeConfig(EasyDeLBaseConfig):
 			**kwargs,
 		)
 
-	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+	def get_partition_rules(self, *args, **kwargs):
 		"""
 		Get the partition rules for the model.
-
-		Args:
-		    fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
-		        Whether to use fully sharded data parallelism.
-
 		Returns:
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
+		pmag = self.partition_manager
 		return (
-			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-			("self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/o_proj/kernel", PartitionSpec(("sp", "fsdp"), "tp")),
-			("gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("shared_expert_gate/kernel", PartitionSpec(("fsdp", "sp"))),
-			("gate/kernel", PartitionSpec(("fsdp", "sp"))),
-			("input_layernorm/kernel", PartitionSpec(None)),
-			("post_attention_layernorm/kernel", PartitionSpec(None)),
-			("model/norm/kernel", PartitionSpec(None)),
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			(".*", PartitionSpec(("fsdp", "sp"))),
+			(r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
+			(r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
+			(r"self_attn/(q_proj|k_proj|v_proj)/bias", pmag.resolve(Replicated)),
+			(r"self_attn/o_proj/bias", pmag.resolve(Replicated)),
+			(r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
+			(r"mlp/.*proj/bias", pmag.resolve(Replicated)),
+			(r"block_sparse_moe/gate/kernel", pmag.resolve(ColumnWise)),
+			(r"block_sparse_moe/gate/bias", pmag.resolve(Replicated)),
+			(
+				r"block_sparse_moe/experts/\d+/(gate_proj|up_proj)/kernel",
+				pmag.resolve(ColumnWise),
+			),
+			(r"block_sparse_moe/experts/\d+/down_proj/kernel", pmag.resolve(RowWise)),
+			(r"block_sparse_moe/experts/\d+/.*bias", pmag.resolve(Replicated)),
+			(
+				r"block_sparse_moe/shared_expert/(gate_proj|up_proj)/kernel",
+				pmag.resolve(ColumnWise),
+			),
+			(r"block_sparse_moe/shared_expert/down_proj/kernel", pmag.resolve(RowWise)),
+			(r"block_sparse_moe/shared_expert/.*bias", pmag.resolve(Replicated)),
+			(r"block_sparse_moe/shared_expert_gate/kernel", pmag.resolve(ColumnWise)),
+			(r"block_sparse_moe/shared_expert_gate/bias", pmag.resolve(Replicated)),
+			(
+				r".*/(input_layernorm|post_attention_layernorm|norm)/kernel",
+				pmag.resolve(Replicated),
+			),
+			(r"lm_head/kernel", pmag.resolve(ColumnWise)),
+			(r"score/kernel", pmag.resolve(RowWise)),
+			(r".*bias", pmag.resolve(Replicated)),
+			(r".*", pmag.resolve(Replicated)),
 		)
-
-	@staticmethod
-	def get_weight_decay_exclusions():
-		"""Returns a tuple of parameter names for which weight decay should be excluded."""
-		return tuple()
-
-	@staticmethod
-	def rng_keys():
-		"""Returns the names of the random number generator keys used by the model."""
-		return "params", "dropout"
 
 	@property
 	def granted_freq_max_position_embedding(self) -> int:

@@ -15,7 +15,7 @@
 
 import typing as tp
 
-from jax.sharding import PartitionSpec
+from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -181,27 +181,26 @@ class PhiConfig(EasyDeLBaseConfig):
 	def get_partition_rules(self, *args, **kwargs):
 		"""
 		Get the partition rules for the model.
-
 		Returns:
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
+		pmag = self.partition_manager
 		return (
-			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-			("final_layernorm/(scale|bias)", PartitionSpec(None)),
-			("final_layernorm/(scale|bias)", PartitionSpec(None)),
-			("mlp/fc1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/fc1/bias", PartitionSpec("tp")),
-			("mlp/fc2/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("mlp/fc2/bias", PartitionSpec(("fsdp", "sp"))),
-			("self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/(q_proj|k_proj|v_proj)/bias", PartitionSpec("tp")),
-			("self_attn/dense/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("self_attn/dense/bias", PartitionSpec("tp")),
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("lm_head/bias", PartitionSpec("tp")),
-			(".*", PartitionSpec(None)),
+			(r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
+			(r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"self_attn/dense/kernel", pmag.resolve(RowWise)),
+			(r"self_attn/(q_layernorm|k_layernorm)/scale", pmag.resolve(Replicated)),
+			(r"self_attn/(q_layernorm|k_layernorm)/bias", pmag.resolve(Replicated)),
+			(r"mlp/fc1/kernel", pmag.resolve(ColumnWise)),
+			(r"mlp/fc2/kernel", pmag.resolve(RowWise)),
+			(r".*/(input_layernorm|final_layernorm)/scale", pmag.resolve(Replicated)),
+			(r".*/(input_layernorm|final_layernorm)/bias", pmag.resolve(Replicated)),
+			(r"lm_head/kernel", pmag.resolve(ColumnWise)),
+			(
+				r".*(q_proj|k_proj|v_proj|dense|fc1|fc2|lm_head)/bias",
+				pmag.resolve(Replicated),
+			),
+			(r".*", pmag.resolve(Replicated)),
 		)
 
 	@property

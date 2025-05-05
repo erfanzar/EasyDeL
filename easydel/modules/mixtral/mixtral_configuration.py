@@ -15,7 +15,7 @@
 
 import typing as tp
 
-from jax.sharding import PartitionSpec
+from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -215,92 +215,32 @@ class MixtralConfig(EasyDeLBaseConfig):
 
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model. This method defines how the model's parameters are
-		partitioned across devices for distributed training and inference.
-
-		Args:
-		    *args: Additional positional arguments (unused).
-		    **kwargs: Additional keyword arguments (unused).
-
+		Get the partition rules for the model.
 		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: A tuple of partition rules, where each rule is a tuple
-		        containing a regex pattern for parameter names and the corresponding `PartitionSpec`.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
+		pmag = self.partition_manager
 		return (
-			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-			("self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("w1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("w2/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("w3/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("gate/kernel", PartitionSpec(("fsdp", "sp"))),
-			("input_layernorm/kernel", PartitionSpec(None)),
-			("post_attention_layernorm/kernel", PartitionSpec(None)),
-			("model/norm/kernel", PartitionSpec(None)),
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			(".*", PartitionSpec(None)),
+			(r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
+			(r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
+			(r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
+			(r"block_sparse_moe/gate/kernel", pmag.resolve(ColumnWise)),
+			(r"block_sparse_moe/gate/bias", pmag.resolve(Replicated)),
+			(r"block_sparse_moe/experts/\d+/(w1|w3)/kernel", pmag.resolve(ColumnWise)),
+			(r"block_sparse_moe/experts/\d+/w2/kernel", pmag.resolve(RowWise)),
+			(r"block_sparse_moe/experts/\d+/.*bias", pmag.resolve(Replicated)),
+			(
+				r".*/(input_layernorm|post_attention_layernorm|norm)/kernel",
+				pmag.resolve(Replicated),
+			),
+			(r"lm_head/kernel", pmag.resolve(ColumnWise)),
+			(r"score/kernel", pmag.resolve(RowWise)),
+			(r".*bias", pmag.resolve(Replicated)),
+			(r".*", pmag.resolve(Replicated)),
 		)
 
-	def attach_custom_arguments(
-		self,
-		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		use_scan_mlp: bool = False,
-		scan_mlp_chunk_size: int = 1024,
-		number_rep_kv: int = 1,
-		bits: tp.Optional[int] = None,
-		attention_dropout: float = 0.0,
-		rope_scaling: tp.Dict[str, tp.Union[str, float]] = None,
-		attention_bias: bool = False,
-		initialization_of_moe: bool = False,
-		**kwargs,
-	):
-		"""The attach_custom_arguments function adds the following arguments to the model:
-
-		Args:
-		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
-		        Defaults to EasyDeLGradientCheckPointers.NONE.
-		    use_scan_mlp (bool, optional): Whether to use scan for MLP layers. Defaults to False.
-		    scan_mlp_chunk_size (int, optional): Chunk size for scan MLP. Defaults to 1024.
-		    number_rep_kv (int, optional): Number of repetitions for key/value heads. Defaults to 1.
-		    bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
-		    attention_dropout (float, optional): Dropout probability for attention. Defaults to 0.0.
-		    rope_scaling (tp.Dict[str, tp.Union[str, float]], optional): RoPE scaling configuration. Defaults to None.
-		    attention_bias (bool, optional): Whether to use bias in attention layers. Defaults to False.
-		    initialization_of_moe (bool, optional): Whether MoE layers are being initialized. Defaults to False.
-		    **kwargs: Additional keyword arguments (ignored).
-
-		Returns:
-		    A tuple of the following:
-		"""
-		self.attention_dropout = attention_dropout
-		self.attention_bias = attention_bias
-		self.rope_scaling = rope_scaling
-		self.number_rep_kv = number_rep_kv
-		self.gradient_checkpointing = gradient_checkpointing
-		self.use_scan_mlp = use_scan_mlp
-		self.scan_mlp_chunk_size = scan_mlp_chunk_size
-		self.bits = bits
-		self.initialization_of_moe = initialization_of_moe
-
-	@staticmethod
-	def get_weight_decay_exclusions():
-		"""Returns a tuple of parameter names for which weight decay should be excluded.
-
-		Returns:
-		    tuple: An empty tuple, indicating no specific weight decay exclusions for this model.
-		"""
-		return tuple()
-
-	@staticmethod
-	def rng_keys():
-		"""Returns the names of the random number generator keys used by the model.
-
-		Returns:
-		    tuple: A tuple containing "params", "dropout", and "jitter" as the RNG keys.
-		"""
-		return "params", "dropout"
+ 
 
 	@property
 	def granted_freq_max_position_embedding(self) -> int:

@@ -13,15 +13,63 @@
 # limitations under the License.
 
 
-# import typing as tp
-
-from jax.sharding import PartitionSpec
+from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
 from easydel.utils.helpers import get_logger
 
 logger = get_logger(__name__)
+
+
+def _get_partition_rules(self, *args, **kwargs):
+	"""
+	Get the partition rules for the model.
+	Returns:
+	    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+	"""
+	pmag = self.partition_manager
+	return (
+		(r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
+		(r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
+		(r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
+		(r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
+		(r"self_attn/qk_norm/scale", pmag.resolve(Replicated)),
+		(r"feed_forward/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
+		(r"feed_forward/down_proj/kernel", pmag.resolve(RowWise)),
+		(r"feed_forward/router/kernel", pmag.resolve(ColumnWise)),
+		(r"feed_forward/experts/gate_up_proj", pmag.resolve(ColumnWise)),
+		(r"feed_forward/experts/down_proj", pmag.resolve(RowWise)),
+		(
+			r"feed_forward/shared_expert/(gate_proj|up_proj)/kernel",
+			pmag.resolve(ColumnWise),
+		),
+		(r"feed_forward/shared_expert/down_proj/kernel", pmag.resolve(RowWise)),
+		(
+			r"(input_layernorm|post_attention_layernorm|pre_feedforward_layernorm|post_feedforward_layernorm|norm)/kernel",
+			pmag.resolve(Replicated),
+		),
+		(r"lm_head/kernel", pmag.resolve(ColumnWise)),
+		(r"patch_embedding/linear/kernel", pmag.resolve(ColumnWise)),
+		(r"class_embedding", pmag.resolve(Replicated)),
+		(r"positional_embedding_vlm", pmag.resolve(ColumnWise)),
+		(r"(layernorm_pre|layernorm_post)/scale", pmag.resolve(Replicated)),
+		(r"(layernorm_pre|layernorm_post)/bias", pmag.resolve(Replicated)),
+		(r"model/layers/\d+/self_attn/o_proj/kernel", pmag.resolve(RowWise)),
+		(r"model/layers/\d+/self_attn/.*proj/bias", pmag.resolve(Replicated)),
+		(r"model/layers/\d+/mlp/fc1/kernel", pmag.resolve(ColumnWise)),
+		(r"model/layers/\d+/mlp/fc2/kernel", pmag.resolve(RowWise)),
+		(r"model/layers/\d+/mlp/fc(1|2)/bias", pmag.resolve(Replicated)),
+		(r"vision_adapter/mlp/fc1/kernel", pmag.resolve(ColumnWise)),
+		(r"vision_adapter/mlp/fc2/kernel", pmag.resolve(RowWise)),
+		(r"vision_adapter/mlp/fc(1|2)/bias", pmag.resolve(Replicated)),
+		(r"multi_modal_projector/linear_1/kernel", pmag.resolve(ColumnWise)),
+		(r"multi_modal_projector/linear_1/bias", pmag.resolve(Replicated)),
+		(r"score/kernel", pmag.resolve(RowWise)),
+		(r"score/bias", pmag.resolve(Replicated)),
+		(r".*bias", pmag.resolve(Replicated)),
+		(r".*", pmag.resolve(Replicated)),
+	)
 
 
 @register_config("llama4_vision_model")
@@ -75,30 +123,7 @@ class Llama4VisionConfig(EasyDeLBaseConfig):
 		self.rope_theta = rope_theta
 		super().__init__(**kwargs)
 
-	def get_partition_rules(self, *args, **kwargs):
-		"""
-		Get the partition rules for the Llama4Vision model.
-		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
-		"""
-		return (
-			("patch_embedding/linear/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("class_embedding", PartitionSpec(None)),
-			("positional_embedding_vlm", PartitionSpec(None)),
-			("layernorm_pre/kernel", PartitionSpec(None)),
-			("layernorm_post/kernel", PartitionSpec(None)),
-			("model/layers/.*/self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("model/layers/.*/self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("model/layers/.*/self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("model/layers/.*/self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("model/layers/.*/mlp/fc1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("model/layers/.*/mlp/fc2/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("model/layers/.*/input_layernorm/kernel", PartitionSpec(None)),
-			("model/layers/.*/post_attention_layernorm/kernel", PartitionSpec(None)),
-			("vision_adapter/mlp/fc1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("vision_adapter/mlp/fc2/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			(".*", PartitionSpec(None)),
-		)
+	get_partition_rules = _get_partition_rules
 
 
 @register_config("llama4_text")
@@ -205,27 +230,7 @@ class Llama4TextConfig(EasyDeLBaseConfig):
 		)
 		self.attention_chunk_size = attention_chunk_size
 
-	def get_partition_rules(self, *args, **kwargs):
-		"""
-		Get the partition rules for the Llama4Text model.
-		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
-		"""
-		return (
-			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-			("self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("input_layernorm/kernel", PartitionSpec(None)),
-			("post_attention_layernorm/kernel", PartitionSpec(None)),
-			("model/norm/kernel", PartitionSpec(None)),
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			(".*", PartitionSpec(None)),
-		)
+	get_partition_rules = _get_partition_rules
 
 
 @register_config("llama4")
@@ -265,21 +270,7 @@ class Llama4Config(EasyDeLBaseConfig):
 
 		super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
-	def get_partition_rules(self, *args, **kwargs):
-		"""
-		Get the partition rules for the Llama4 model.
-		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
-		"""
-		text_rules = self.text_config.get_partition_rules(*args, **kwargs)
-		vision_rules = self.vision_config.get_partition_rules(*args, **kwargs)
-
-		# Add rules for the multi-modal projector
-		multimodal_rules = (
-			("multi_modal_projector/linear_1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-		)
-
-		return text_rules + vision_rules + multimodal_rules
+	get_partition_rules = _get_partition_rules
 
 
 __all__ = ["Llama4Config", "Llama4TextConfig", "Llama4VisionConfig"]

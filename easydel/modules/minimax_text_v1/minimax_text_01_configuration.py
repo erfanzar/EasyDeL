@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -157,46 +158,36 @@ class MiniMaxText01Config(EasyDeLBaseConfig):
 
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for distributing the MiniMaxText01 model parameters across multiple devices.
-
-		These rules define how parameters should be partitioned when using techniques like
-		Fully Sharded Data Parallelism (FSDP), Sharded Parallelism (SP), and Tensor Parallelism (TP).
-		Each rule consists of a regex pattern matching parameter names and a corresponding PartitionSpec.
-
+		Get the partition rules for the model.
 		Returns:
-		    tuple: A tuple of tuples where each inner tuple contains:
-		        - A regex pattern matching parameter names
-		        - A PartitionSpec object specifying how to partition matching parameters
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
-		from jax.sharding import PartitionSpec
-
+		pmag = self.partition_manager
 		return (
-			# Embeddings
-			("model/embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-			# Attention layers
-			("model/layers/.*/self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("model/layers/.*/self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("model/layers/.*/self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("model/layers/.*/self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			# MoE layers
+			# 1. Embeddings
+			(r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
+			(r"self_attn/(q_proj|k_proj|v_proj|qkv_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"self_attn/(o_proj|out_proj)/kernel", pmag.resolve(RowWise)),
+			(r"self_attn/output_gate/kernel", pmag.resolve(ColumnWise)),
+			(r"self_attn/norm/scale", pmag.resolve(Replicated)),
+			(r"self_attn/norm/bias", pmag.resolve(Replicated)),
+			(r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
+			(r"block_sparse_moe/gate/kernel", pmag.resolve(ColumnWise)),
+			(r"block_sparse_moe/gate/bias", pmag.resolve(Replicated)),
+			(r"block_sparse_moe/experts/\d+/(w1|w3)/kernel", pmag.resolve(ColumnWise)),
+			(r"block_sparse_moe/experts/\d+/w2/kernel", pmag.resolve(RowWise)),
+			(r"block_sparse_moe/experts/\d+/.*bias", pmag.resolve(Replicated)),
+			(r"shared_mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"shared_mlp/down_proj/kernel", pmag.resolve(RowWise)),
+			(r"shared_mlp/.*bias", pmag.resolve(Replicated)),
+			(r"coefficient/kernel", pmag.resolve(Replicated)),
+			(r"coefficient/bias", pmag.resolve(Replicated)),
 			(
-				"model/layers/.*/block_sparse_moe/experts/.*/w[13]/kernel",
-				PartitionSpec(("fsdp", "sp"), "tp"),
+				r".*/(input_layernorm|post_attention_layernorm|norm)/kernel",
+				pmag.resolve(Replicated),
 			),
-			(
-				"model/layers/.*/block_sparse_moe/experts/.*/w[24]/kernel",
-				PartitionSpec("tp", ("fsdp", "sp")),
-			),
-			(
-				"model/layers/.*/block_sparse_moe/gate/kernel",
-				PartitionSpec(("fsdp", "sp"), None),
-			),
-			# Normalization
-			("model/norm/kernel", PartitionSpec(None)),
-			("model/layers/.*/input_layernorm/kernel", PartitionSpec(None)),
-			("model/layers/.*/post_attention_layernorm/kernel", PartitionSpec(None)),
-			# LM head
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			# Catch-all
-			(".*", PartitionSpec(None)),
+			(r"lm_head/kernel", pmag.resolve(ColumnWise)),
+			(r"lm_head/bias", pmag.resolve(Replicated)),
+			(r".*bias", pmag.resolve(Replicated)),
+			(r".*", pmag.resolve(Replicated)),
 		)
