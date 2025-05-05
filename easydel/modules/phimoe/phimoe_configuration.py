@@ -15,7 +15,7 @@
 
 import typing as tp
 
-from jax.sharding import PartitionSpec
+from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -211,56 +211,35 @@ class PhiMoeConfig(EasyDeLBaseConfig):
 			**kwargs,
 		)
 
-	def attach_custom_arguments(
-		self,
-		bits: tp.Optional[int] = None,
-		embd_pdrop: float = 0.0,
-		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		**kwargs,
-	):
-		"""Attaches custom arguments to the configuration object.
-
-		This method allows dynamically adding or overriding configuration attributes.
-		It primarily sets attributes related to quantization, dropout, and gradient checkpointing.
-		Any additional keyword arguments are also set as attributes if they don't already exist.
-
-		Args:
-		    bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
-		    embd_pdrop (float, optional): Dropout probability for embeddings. Defaults to 0.0.
-		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
-		        Defaults to EasyDeLGradientCheckPointers.NONE.
-		    **kwargs: Additional keyword arguments to attach.
-		"""
-		self.bits = bits
-		self.embd_pdrop = embd_pdrop
-		self.gradient_checkpointing = gradient_checkpointing
-		for k, v in kwargs.items():
-			if not hasattr(self, k):
-				setattr(self, k, v)
-
-	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+	def get_partition_rules(self, *args, **kwargs):
 		"""
 		Get the partition rules for the model.
-
-		Args:
-		    fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
-		        Whether to use fully sharded data parallelism.
-
 		Returns:
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
+		pmag = self.partition_manager
 		return (
-			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-			("norm/kernel", PartitionSpec(("fsdp", "sp"))),
-			("post_attention_layernorm/kernel", PartitionSpec(("fsdp", "sp"))),
-			("input_layernorm/kernel", PartitionSpec(("fsdp", "sp"))),
-			("mlp/w1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/w3/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/w2/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("self_attn/qkv_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			(".*", PartitionSpec(None)),
+			(r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
+			(r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
+			(r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
+			(r"block_sparse_moe/gate/kernel", pmag.resolve(ColumnWise)),
+			(r"block_sparse_moe/gate/bias", pmag.resolve(Replicated)),
+			(r"block_sparse_moe/experts/\d+/(w1|w3)/kernel", pmag.resolve(ColumnWise)),
+			(r"block_sparse_moe/experts/\d+/w2/kernel", pmag.resolve(RowWise)),
+			(r"block_sparse_moe/experts/\d+/.*bias", pmag.resolve(Replicated)),
+			(
+				r".*/(input_layernorm|post_attention_layernorm|norm)/scale",
+				pmag.resolve(Replicated),
+			),
+			(
+				r".*/(input_layernorm|post_attention_layernorm|norm)/bias",
+				pmag.resolve(Replicated),
+			),
+			(r"lm_head/kernel", pmag.resolve(ColumnWise)),
+			(r"lm_head/bias", pmag.resolve(Replicated)),
+			(r".*bias", pmag.resolve(Replicated)),
+			(r".*", pmag.resolve(Replicated)),
 		)
 
 	def _rope_scaling_validation(self):
@@ -268,14 +247,14 @@ class PhiMoeConfig(EasyDeLBaseConfig):
 		Validate the `rope_scaling` configuration.
 		"""
 		"""Validates the `rope_scaling` configuration dictionary.
-		
-		Ensures that `rope_scaling` is a dictionary with the correct keys and value types
-		for the 'longrope' scaling type.
-		
-		Raises:
-		    ValueError: If `rope_scaling` is not a dictionary, is missing keys,
-		        or has invalid values/types for the 'longrope' configuration.
-		"""
+    
+    Ensures that `rope_scaling` is a dictionary with the correct keys and value types
+    for the 'longrope' scaling type.
+    
+    Raises:
+        ValueError: If `rope_scaling` is not a dictionary, is missing keys,
+            or has invalid values/types for the 'longrope' configuration.
+    """
 		if self.rope_scaling is None:
 			return
 
@@ -336,35 +315,3 @@ class PhiMoeConfig(EasyDeLBaseConfig):
 			raise ValueError(
 				f"`rope_scaling`'s original_max_position_embeddings field must be an integer, got {original_max_position_embeddings}"
 			)
-
-	@property
-	def granted_freq_max_position_embedding(self) -> int:
-		"""Returns the maximum position embedding size specifically for frequency-based position embeddings.
-
-		If `freq_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
-		`max_position_embeddings`.
-
-		Returns:
-		    int: The granted maximum position embedding size for frequency encoding.
-		"""
-		return getattr(
-			self,
-			"freq_max_position_embeddings",
-			self.max_position_embeddings,
-		)
-
-	@property
-	def granted_mask_max_position_embedding(self) -> int:
-		"""Returns the maximum position embedding size specifically for mask-based position embeddings.
-
-		If `mask_max_position_embeddings` is set, it returns that value. Otherwise, it falls back to
-		`max_position_embeddings`.
-
-		Returns:
-		    int: The granted maximum position embedding size for mask encoding.
-		"""
-		return getattr(
-			self,
-			"mask_max_position_embeddings",
-			self.max_position_embeddings,
-		)

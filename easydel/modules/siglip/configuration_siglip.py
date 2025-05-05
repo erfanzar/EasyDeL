@@ -13,13 +13,66 @@
 # limitations under the License.
 
 
-from jax.sharding import PartitionSpec
-
+from eformer.common_types import ColumnWise, RowWise, Replicated
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
 from easydel.utils import get_logger
 
 logger = get_logger(__name__)
+
+
+def _get_partition_rules(self, *args, **kwargs):
+	"""
+	Get the partition rules for the model.
+	Returns:
+	    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+	"""
+	pmag = self.partition_manager
+	return (
+		(r"embeddings/token_embedding/embedding", pmag.resolve(ColumnWise)),
+		(r"embeddings/position_embedding/embedding", pmag.resolve(Replicated)),
+		(r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
+		(r"self_attn/out_proj/kernel", pmag.resolve(RowWise)),
+		(r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
+		(r"mlp/fc1/kernel", pmag.resolve(ColumnWise)),
+		(r"mlp/fc2/kernel", pmag.resolve(RowWise)),
+		(r"mlp/fc(1|2)/bias", pmag.resolve(Replicated)),
+		(r"(layer_norm1|layer_norm2)/scale", pmag.resolve(Replicated)),
+		(r"(layer_norm1|layer_norm2)/bias", pmag.resolve(Replicated)),
+		(r"final_layer_norm/scale", pmag.resolve(Replicated)),
+		(r"final_layer_norm/bias", pmag.resolve(Replicated)),
+		(r"head/kernel", pmag.resolve(ColumnWise)),
+		(r"head/bias", pmag.resolve(Replicated)),
+		(r"embeddings/patch_embedding/kernel", pmag.resolve(ColumnWise)),
+		(r"embeddings/patch_embedding/bias", pmag.resolve(Replicated)),
+		(r"embeddings/position_embedding/embedding", pmag.resolve(ColumnWise)),
+		(r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
+		(r"self_attn/out_proj/kernel", pmag.resolve(RowWise)),
+		(r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
+		(r"mlp/fc1/kernel", pmag.resolve(ColumnWise)),
+		(r"mlp/fc2/kernel", pmag.resolve(RowWise)),
+		(r"mlp/fc(1|2)/bias", pmag.resolve(Replicated)),
+		(r"(layer_norm1|layer_norm2)/scale", pmag.resolve(Replicated)),
+		(r"(layer_norm1|layer_norm2)/bias", pmag.resolve(Replicated)),
+		(r"post_layernorm/scale", pmag.resolve(Replicated)),
+		(r"post_layernorm/bias", pmag.resolve(Replicated)),
+		(r"head/probe", pmag.resolve(Replicated)),
+		(r"head/attention/in_proj_weight", pmag.resolve(ColumnWise)),
+		(r"head/attention/in_proj_bias", pmag.resolve(Replicated)),
+		(r"head/attention/out_proj/kernel", pmag.resolve(RowWise)),
+		(r"head/attention/out_proj/bias", pmag.resolve(Replicated)),
+		(r"head/layernorm/scale", pmag.resolve(Replicated)),
+		(r"head/layernorm/bias", pmag.resolve(Replicated)),
+		(r"head/mlp/fc1/kernel", pmag.resolve(ColumnWise)),
+		(r"head/mlp/fc2/kernel", pmag.resolve(RowWise)),
+		(r"head/mlp/fc(1|2)/bias", pmag.resolve(Replicated)),
+		(r"logit_scale", pmag.resolve(Replicated)),
+		(r"logit_bias", pmag.resolve(Replicated)),
+		(r"classifier/kernel", pmag.resolve(RowWise)),
+		(r"classifier/bias", pmag.resolve(Replicated)),
+		(r".*bias", pmag.resolve(Replicated)),
+		(r".*", pmag.resolve(Replicated)),
+	)
 
 
 @register_config("siglip_text_model")
@@ -115,31 +168,7 @@ class SiglipTextConfig(EasyDeLBaseConfig):
 			projection_size if projection_size is not None else hidden_size
 		)
 
-	def get_partition_rules(self, *args, **kwargs):
-		"""
-		Get the partition rules for the model.
-		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
-		"""
-		return (
-			(
-				"encoder/layers/.*/self_attn/(q_proj|k_proj|v_proj)/kernel",
-				PartitionSpec(("fsdp", "sp"), "tp"),
-			),
-			(
-				"encoder/layers/.*/self_attn/out_proj/kernel",
-				PartitionSpec("tp", ("fsdp", "sp")),
-			),
-			("embeddings/token_embedding/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-			("embeddings/position_embedding/embedding", PartitionSpec(None, ("fsdp", "sp"))),
-			("encoder/layers/.*/mlp/fc1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("encoder/layers/.*/mlp/fc2/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("encoder/layers/.*/layer_norm[12]/(bias|scale)", PartitionSpec(None)),
-			("final_layer_norm/(bias|scale)", PartitionSpec(None)),
-			("head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("logit_(bias|scale)", PartitionSpec(None)),
-			(".*", PartitionSpec(None)),
-		)
+	get_partition_rules = _get_partition_rules
 
 
 @register_config("siglip_vision_model")
@@ -202,39 +231,7 @@ class SiglipVisionConfig(EasyDeLBaseConfig):
 		self.layer_norm_eps = layer_norm_eps
 		self.hidden_act = hidden_act
 
-	def get_partition_rules(self, *args, **kwargs):
-		"""
-		Get the partition rules for the model.
-		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
-		"""
-		return (
-			(
-				"embeddings/patch_embedding/kernel",
-				PartitionSpec(None, None, None, ("fsdp", "sp")),
-			),
-			(
-				"encoder/layers/.*/self_attn/(q_proj|k_proj|v_proj)/kernel",
-				PartitionSpec(("fsdp", "sp"), "tp"),
-			),
-			(
-				"encoder/layers/.*/self_attn/out_proj/kernel",
-				PartitionSpec("tp", ("fsdp", "sp")),
-			),
-			("embeddings/position_embedding/embedding", PartitionSpec(None, ("fsdp", "sp"))),
-			("encoder/layers/.*/mlp/fc1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("encoder/layers/.*/mlp/fc2/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("encoder/layers/.*/layer_norm[12]/(bias|scale)", PartitionSpec(None)),
-			("post_layernorm/(bias|scale)", PartitionSpec(None)),
-			("head/attention/in_proj_weight", PartitionSpec(("fsdp", "sp"), "tp")),
-			("head/attention/out_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("head/mlp/fc1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("head/mlp/fc2/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("head/layernorm/(bias|scale)", PartitionSpec(None)),
-			("head/probe", PartitionSpec(None, None, None)),
-			("logit_(bias|scale)", PartitionSpec(None)),
-			(".*", PartitionSpec(None)),
-		)
+	get_partition_rules = _get_partition_rules
 
 
 @register_config("siglip")
@@ -313,92 +310,7 @@ class SiglipConfig(EasyDeLBaseConfig):
 			**kwargs,
 		)
 
-	def get_partition_rules(self, *args, **kwargs):
-		"""
-		Get the partition rules for the SigLIP model parameters for use with distributed training.
-
-		These rules define how parameters should be partitioned across multiple devices
-		when using techniques like Fully Sharded Data Parallelism (FSDP), Sharded Parallelism (SP),
-		and Tensor Parallelism (TP). Each rule consists of a regex pattern for matching
-		parameter names and a corresponding PartitionSpec.
-
-		Returns:
-		    `tuple`: A tuple of tuples where each inner tuple contains:
-		        - A regex pattern matching parameter names
-		        - A PartitionSpec object specifying how to partition matching parameters
-		"""
-		return (
-			(
-				"text_model/embeddings/token_embedding/embedding",
-				PartitionSpec("tp", ("fsdp", "sp")),
-			),
-			(
-				"text_model/embeddings/position_embedding/embedding",
-				PartitionSpec(None, ("fsdp", "sp")),
-			),
-			(
-				"text_model/encoder/layers/.*/self_attn/(q_proj|k_proj|v_proj)/kernel",
-				PartitionSpec(("fsdp", "sp"), "tp"),
-			),
-			(
-				"text_model/encoder/layers/.*/self_attn/out_proj/kernel",
-				PartitionSpec("tp", ("fsdp", "sp")),
-			),
-			(
-				"text_model/encoder/layers/.*/mlp/fc1/kernel",
-				PartitionSpec(("fsdp", "sp"), "tp"),
-			),
-			(
-				"text_model/encoder/layers/.*/mlp/fc2/kernel",
-				PartitionSpec("tp", ("fsdp", "sp")),
-			),
-			("text_model/encoder/layers/.*/layer_norm[12]/(bias|scale)", PartitionSpec(None)),
-			("text_model/final_layer_norm/(bias|scale)", PartitionSpec(None)),
-			("text_model/head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			(
-				"vision_model/embeddings/patch_embedding/kernel",
-				PartitionSpec(None, None, None, ("fsdp", "sp")),
-			),
-			(
-				"vision_model/embeddings/position_embedding/embedding",
-				PartitionSpec(None, ("fsdp", "sp")),
-			),
-			(
-				"vision_model/encoder/layers/.*/self_attn/(q_proj|k_proj|v_proj)/kernel",
-				PartitionSpec(("fsdp", "sp"), "tp"),
-			),
-			(
-				"vision_model/encoder/layers/.*/self_attn/out_proj/kernel",
-				PartitionSpec("tp", ("fsdp", "sp")),
-			),
-			(
-				"vision_model/encoder/layers/.*/mlp/fc1/kernel",
-				PartitionSpec(("fsdp", "sp"), "tp"),
-			),
-			(
-				"vision_model/encoder/layers/.*/mlp/fc2/kernel",
-				PartitionSpec("tp", ("fsdp", "sp")),
-			),
-			(
-				"vision_model/encoder/layers/.*/layer_norm[12]/(bias|scale)",
-				PartitionSpec(None),
-			),
-			("vision_model/post_layernorm/(bias|scale)", PartitionSpec(None)),
-			(
-				"vision_model/head/attention/in_proj_weight",
-				PartitionSpec(("fsdp", "sp"), "tp"),
-			),
-			(
-				"vision_model/head/attention/out_proj/kernel",
-				PartitionSpec("tp", ("fsdp", "sp")),
-			),
-			("vision_model/head/mlp/fc1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("vision_model/head/mlp/fc2/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("vision_model/head/layernorm/(bias|scale)", PartitionSpec(None)),
-			("vision_model/head/probe", PartitionSpec(None, None, None)),
-			("logit_(bias|scale)", PartitionSpec(None)),
-			(".*", PartitionSpec(None)),
-		)
+	get_partition_rules = _get_partition_rules
 
 
 __all__ = ["SiglipConfig", "SiglipTextConfig", "SiglipVisionConfig"]

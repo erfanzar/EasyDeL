@@ -18,7 +18,7 @@
 import typing as tp
 import warnings
 
-from jax.sharding import PartitionSpec
+from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -284,62 +284,25 @@ class DbrxConfig(EasyDeLBaseConfig):
 			**kwargs,
 		)
 
-	@property
-	def granted_freq_max_position_embedding(self) -> int:
-		"""Returns the maximum position embedding size for frequency-based position embeddings.
-
-		Returns:
-			int: The maximum position embedding size, falling back to max_seq_len if not explicitly set.
-		"""
-		return getattr(
-			self,
-			"freq_max_position_embeddings",
-			self.max_position_embeddings,
-		)
-
-	@property
-	def granted_mask_max_position_embedding(self) -> int:
-		"""Returns the maximum position embedding size for mask-based position embeddings.
-
-		Returns:
-			int: The maximum position embedding size, falling back to max_seq_len if not explicitly set.
-		"""
-		return getattr(
-			self,
-			"mask_max_position_embeddings",
-			self.max_position_embeddings,
-		)
-
 	def get_partition_rules(self, *args, **kwargs):
-		"""Get the partition rules for the model parameters.
-
-		These rules define how parameters should be sharded across devices when using model parallelism.
-
-		Args:
-			*args: Variable length argument list.
-			**kwargs: Arbitrary keyword arguments.
-
-		Returns:
-			Tuple: A tuple of partition rules for different parameter patterns.
 		"""
+		Get the partition rules for the model.
+		Returns:
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+		"""
+		pmag = self.partition_manager  # Handles resolving strategies
 		return (
-			# Embeddings
-			("wte/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-			# Language model head
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("lm_head/bias", PartitionSpec(None)),
-			# Attention layers
-			("norm_attn_norm/attn/Wqkv/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("norm_attn_norm/attn/Wqkv/bias", PartitionSpec(None)),
-			("norm_attn_norm/attn/out_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("norm_attn_norm/attn/out_proj/bias", PartitionSpec(None)),
-			# MoE FFN layers
-			("ffn/experts/mlp/(v1|w1|w2)", PartitionSpec(("fsdp", "sp"), "tp")),
-			("ffn/router/layer/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("ffn/router/layer/bias", PartitionSpec(None)),
-			# Layer norms
-			("norm_attn_norm/norm_\\d+/(bias|scale)", PartitionSpec(None)),
-			("transformer/norm_f/(bias|scale)", PartitionSpec(None)),
-			# Catch-all
-			(".*", PartitionSpec(None)),
+			(r"wte/embedding", pmag.resolve(ColumnWise)),
+			(r"attn/Wqkv/kernel", pmag.resolve(ColumnWise)),
+			(r"attn/out_proj/kernel", pmag.resolve(RowWise)),
+			(r"attn/.*proj/bias", pmag.resolve(Replicated)),
+			(r"router/layer/kernel", pmag.resolve(ColumnWise)),
+			(r"experts/mlp/(w1|v1)", pmag.resolve(ColumnWise)),
+			(r"experts/mlp/w2", pmag.resolve(RowWise)),
+			(r".*/(norm_1|norm_2|norm_f)/scale", pmag.resolve(Replicated)),
+			(r".*/(norm_1|norm_2|norm_f)/bias", pmag.resolve(Replicated)),
+			(r"lm_head/kernel", pmag.resolve(ColumnWise)),
+			(r"score/kernel", pmag.resolve(RowWise)),
+			(r".*bias", pmag.resolve(Replicated)),
+			(r".*", pmag.resolve(Replicated)),
 		)

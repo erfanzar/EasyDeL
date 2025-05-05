@@ -15,7 +15,7 @@
 
 import typing as tp
 
-from jax.sharding import PartitionSpec
+from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -163,87 +163,21 @@ class MistralConfig(EasyDeLBaseConfig):
 		Returns:
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
+		pmag = self.partition_manager
 		return (
-			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-			("self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("input_layernorm/kernel", PartitionSpec(None)),
-			("post_attention_layernorm/kernel", PartitionSpec(None)),
-			("model/norm/kernel", PartitionSpec(None)),
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			(".*", PartitionSpec(None)),
-		)
-
-	def attach_custom_arguments(
-		self,
-		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		use_scan_mlp: bool = False,
-		scan_mlp_chunk_size: int = 1024,
-		number_rep_kv: int = 1,
-		bits: tp.Optional[int] = None,
-		attention_dropout: float = 0.0,
-		rope_scaling: tp.Dict[str, tp.Union[str, float]] = None,
-		attention_bias: bool = False,
-		**kwargs,
-	):
-		"""The attach_custom_arguments function adds the following arguments to the model:
-
-		Args:
-		    self: Bind the attributes and methods of a class to an
-		        instance of that class
-		    gradient_checkpointing: str: Determine whether to use
-		        gradient checkpointing
-		    use_scan_mlp: bool: Determine whether to use the scan_mlp
-		        function or notn
-		    scan_mlp_chunk_size: int: Chunk the input to the mlp
-		    number_rep_kv: int: Control the number of times that the key
-		        and value vectors are repeated
-		    bits: tp.Optional[int]: Specify the number of bits to use for
-		        quantization
-		    attention_dropout: float: Set the dropout rate for the
-		        attention layer
-		    attention_bias: bool: when ever to use attention_bias
-		    rope_scaling: tp.Dict[str, tp.Union[str, float]]: rope_scaling for
-		        rope
-
-		Returns:
-		    A tuple of the following:
-		"""
-
-		self.attention_bias = attention_bias
-		self.rope_scaling = rope_scaling
-		self.number_rep_kv = number_rep_kv
-		self.gradient_checkpointing = gradient_checkpointing
-		self.use_scan_mlp = use_scan_mlp
-		self.scan_mlp_chunk_size = scan_mlp_chunk_size
-		self.attention_dropout = attention_dropout
-		self.bits = bits
-
-	@staticmethod
-	def get_weight_decay_exclusions():
-		return tuple()
-
-	@staticmethod
-	def rng_keys():
-		return "params", "dropout", "fcm"
-
-	@property
-	def granted_freq_max_position_embedding(self) -> int:
-		return getattr(
-			self,
-			"freq_max_position_embeddings",
-			self.max_position_embeddings,
-		)
-
-	@property
-	def granted_mask_max_position_embedding(self) -> int:
-		return getattr(
-			self,
-			"mask_max_position_embeddings",
-			self.max_position_embeddings,
+			(r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
+			(r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
+			(r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
+			(r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
+			(r"mlp/.*proj/bias", pmag.resolve(Replicated)),
+			(
+				r".*(input_layernorm|post_attention_layernorm|norm)/kernel",
+				pmag.resolve(Replicated),
+			),
+			(r"lm_head/kernel", pmag.resolve(ColumnWise)),
+			(r"score/kernel", pmag.resolve(RowWise)),
+			(r".*bias", pmag.resolve(Replicated)),
+			(r".*", pmag.resolve(Replicated)),
 		)

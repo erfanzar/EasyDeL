@@ -15,6 +15,8 @@
 
 from jax.sharding import PartitionSpec
 
+from eformer.common_types import ColumnWise, Replicated, RowWise
+
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
 
@@ -120,27 +122,32 @@ class PixtralVisionConfig(EasyDeLBaseConfig):
 		self.initializer_range = initializer_range
 
 	def get_partition_rules(self, *args, **kwargs):
+		"""
+		Get the partition rules for the model.
+		Returns:
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
+		"""
+		pmag = self.partition_manager
 		return (
 			# Patch embedding convolution
 			("patch_conv/kernel", PartitionSpec(None, None, None, "tp")),
-			("patch_conv/bias", PartitionSpec(None)),
-			# Attention layers
-			("attention/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("attention/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("attention/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("attention/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("attention/q_proj/bias", PartitionSpec(None)),
-			("attention/k_proj/bias", PartitionSpec(None)),
-			("attention/v_proj/bias", PartitionSpec(None)),
-			("attention/o_proj/bias", PartitionSpec(None)),
-			# Feed forward layers
-			("feed_forward/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("feed_forward/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("feed_forward/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("feed_forward/(gate_proj|up_proj|down_proj)/bias", PartitionSpec(None)),
-			# Layer norms
-			("ln_pre/kernel", PartitionSpec(None)),
-			(".*_norm/kernel", PartitionSpec(None)),
-			# Catch-all
-			(".*", PartitionSpec(None)),
+			(r"ln_pre/kernel", pmag.resolve(Replicated)),
+			(
+				r"transformer/layers/\d+/attention/(q_proj|k_proj|v_proj)/kernel",
+				pmag.resolve(ColumnWise),
+			),
+			(r"transformer/layers/\d+/attention/o_proj/kernel", pmag.resolve(RowWise)),
+			(r"transformer/layers/\d+/attention/.*proj/bias", pmag.resolve(Replicated)),
+			(
+				r"transformer/layers/\d+/feed_forward/(gate_proj|up_proj)/kernel",
+				pmag.resolve(ColumnWise),
+			),
+			(r"transformer/layers/\d+/feed_forward/down_proj/kernel", pmag.resolve(RowWise)),
+			(r"transformer/layers/\d+/feed_forward/.*proj/bias", pmag.resolve(Replicated)),
+			(
+				r"transformer/layers/\d+/(attention_norm|ffn_norm)/kernel",
+				pmag.resolve(Replicated),
+			),
+			(r".*bias", pmag.resolve(Replicated)),
+			(r".*", pmag.resolve(Replicated)),
 		)

@@ -17,7 +17,8 @@ import typing as tp
 from numbers import Number
 
 from jax import numpy as jnp
-from jax.sharding import PartitionSpec
+
+from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -240,51 +241,28 @@ class OpenELMConfig(EasyDeLBaseConfig):
 
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model. This method defines how the model's parameters are
-		partitioned across devices for distributed training and inference.
-
-		Args:
-		    *args: Additional positional arguments (unused).
-		    **kwargs: Additional keyword arguments (unused).
-
+		Get the partition rules for the model.
 		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: A tuple of partition rules, where each rule is a tuple
-		        containing a regex pattern for parameter names and the corresponding `PartitionSpec`.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
-
+		pmag = self.partition_manager
 		return (
-			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-			("self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/gate_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("input_layernorm/kernel", PartitionSpec(None)),
-			("post_attention_layernorm/kernel", PartitionSpec(None)),
-			("model/norm/kernel", PartitionSpec(None)),
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			(".*", PartitionSpec(None)),
+			(r"token_embeddings/embedding", pmag.resolve(ColumnWise)),
+			(r"attn/qkv_proj/kernel", pmag.resolve(ColumnWise)),
+			(r"attn/out_proj/kernel", pmag.resolve(RowWise)),
+			(r"attn/(q_norm|k_norm)/kernel", pmag.resolve(Replicated)),
+			(r"attn/.*proj/bias", pmag.resolve(Replicated)),
+			(r"ffn/proj_1/kernel", pmag.resolve(ColumnWise)),
+			(r"ffn/proj_2/kernel", pmag.resolve(RowWise)),
+			(r"ffn/.*proj/bias", pmag.resolve(Replicated)),
+			(r".*/(attn_norm|ffn_norm|norm)/kernel", pmag.resolve(Replicated)),
+			(r"lm_head/kernel", pmag.resolve(ColumnWise)),
+			(r"lm_head/bias", pmag.resolve(Replicated)),
+			(r"classifier/kernel", pmag.resolve(ColumnWise)),
+			(r"classifier/bias", pmag.resolve(Replicated)),
+			(r".*bias", pmag.resolve(Replicated)),
+			(r".*", pmag.resolve(Replicated)),
 		)
-
-	@staticmethod
-	def get_weight_decay_exclusions():
-		"""Returns a tuple of parameter names for which weight decay should be excluded.
-
-		Returns:
-		    tuple: A tuple containing 'bias', 'normalization', and 'emb' as exclusions.
-		"""
-		return "bias", "normalization", "emb"
-
-	@staticmethod
-	def rng_keys():
-		"""Returns the names of the random number generator keys used by the model.
-
-		Returns:
-		    tuple: A tuple containing "params" and "dropout" as the RNG keys.
-		"""
-		return "params", "dropout"
 
 	def __post_init__(self) -> None:
 		"""Performs post-initialization checks and calculations.

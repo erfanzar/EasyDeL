@@ -13,7 +13,7 @@
 # limitations under the License.
 
 
-from jax.sharding import PartitionSpec
+from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -160,104 +160,31 @@ class OPTConfig(EasyDeLBaseConfig):
 		self._remove_final_layer_norm = _remove_final_layer_norm
 		self.from_pt = False
 
-	def get_partition_rules(self, fully_sharded_data_parallel: bool = True):
+	def get_partition_rules(self, *args, **kwargs):
 		"""
 		Get the partition rules for the model.
-
-		Args:
-		    fully_sharded_data_parallel (`bool`, *optional*, defaults to `True`):
-		        Whether to use fully sharded data parallelism.
-
 		Returns:
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
-		if not fully_sharded_data_parallel:
-			raise NotImplementedError
-		else:
-			return (".*", PartitionSpec(("fsdp", "sp")))
-
-	def attach_custom_arguments(
-		self,
-		vocab_size: int = 50272,
-		hidden_size: int = 768,
-		num_hidden_layers: int = 12,
-		ffn_dim: int = 3072,
-		max_position_embeddings: int = 2048,
-		do_layer_norm_before: bool = True,
-		_remove_final_layer_norm: bool = False,
-		word_embed_proj_dim: int = None,
-		dropout: float = 0.1,
-		attention_dropout: float = 0.0,
-		num_attention_heads: int = 12,
-		activation_function: str = "relu",
-		layerdrop: float = 0.0,
-		init_std: float = 0.02,
-		use_cache: bool = True,
-		pad_token_id: int = 1,
-		bos_token_id: int = 2,
-		eos_token_id: int = 2,
-		enable_bias: bool = True,
-		layer_norm_elementwise_affine: bool = True,
-		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		**kwargs,
-	):
-		"""Attaches custom arguments to the configuration object.
-
-		This method allows dynamically adding or overriding configuration attributes.
-		It iterates through the provided arguments and sets them as attributes
-		of the configuration object if they don't already exist.
-
-		Args:
-		    vocab_size (int, optional): Vocabulary size. Defaults to 50272.
-		    hidden_size (int, optional): Dimensionality of the encoder layers. Defaults to 768.
-		    num_hidden_layers (int, optional): Number of hidden layers. Defaults to 12.
-		    ffn_dim (int, optional): Dimensionality of the feed-forward layer. Defaults to 3072.
-		    max_position_embeddings (int, optional): Maximum sequence length. Defaults to 2048.
-		    do_layer_norm_before (bool, optional): Whether to apply layer norm before attention. Defaults to True.
-		    _remove_final_layer_norm (bool, optional): Whether to remove the final layer norm. Defaults to False.
-		    word_embed_proj_dim (int, optional): Dimension of the word embedding projection. Defaults to `hidden_size`.
-		    dropout (float, optional): Dropout probability. Defaults to 0.1.
-		    attention_dropout (float, optional): Attention dropout probability. Defaults to 0.0.
-		    num_attention_heads (int, optional): Number of attention heads. Defaults to 12.
-		    activation_function (str, optional): Activation function name. Defaults to "relu".
-		    layerdrop (float, optional): LayerDrop probability. Defaults to 0.0.
-		    init_std (float, optional): Initialization standard deviation. Defaults to 0.02.
-		    use_cache (bool, optional): Whether to use key/value cache. Defaults to True.
-		    pad_token_id (int, optional): Padding token ID. Defaults to 1.
-		    bos_token_id (int, optional): Beginning-of-sequence token ID. Defaults to 2.
-		    eos_token_id (int, optional): End-of-sequence token ID. Defaults to 2.
-		    enable_bias (bool, optional): Whether to use bias in linear layers. Defaults to True.
-		    layer_norm_elementwise_affine (bool, optional): Whether layer norm uses elementwise affine parameters.
-		        Defaults to True.
-		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
-		        Defaults to EasyDeLGradientCheckPointers.NONE.
-		    **kwargs: Additional keyword arguments to attach.
-		"""
-		basics = dict(
-			vocab_size=vocab_size,
-			hidden_size=hidden_size,
-			num_hidden_layers=num_hidden_layers,
-			ffn_dim=ffn_dim,
-			max_position_embeddings=max_position_embeddings,
-			do_layer_norm_before=do_layer_norm_before,
-			_remove_final_layer_norm=_remove_final_layer_norm,
-			word_embed_proj_dim=word_embed_proj_dim,
-			dropout=dropout,
-			attention_dropout=attention_dropout,
-			num_attention_heads=num_attention_heads,
-			activation_function=activation_function,
-			layerdrop=layerdrop,
-			init_std=init_std,
-			use_cache=use_cache,
-			pad_token_id=pad_token_id,
-			bos_token_id=bos_token_id,
-			eos_token_id=eos_token_id,
-			enable_bias=enable_bias,
-			layer_norm_elementwise_affine=layer_norm_elementwise_affine,
-			gradient_checkpointing=gradient_checkpointing,
-			**kwargs,
+		pmag = self.partition_manager
+		return (
+			(r"embed_tokens/embedding", pmag.resolve(ColumnWise)),
+			(r"embed_positions/embedding", pmag.resolve(Replicated)),
+			(r"project_in/kernel", pmag.resolve(ColumnWise)),
+			(r"project_out/kernel", pmag.resolve(RowWise)),
+			(
+				r"(self_attn|crossattention)/(q_proj|k_proj|v_proj|q_attn|c_attn)/kernel",
+				pmag.resolve(ColumnWise),
+			),
+			(r"(self_attn|crossattention)/out_proj/kernel", pmag.resolve(RowWise)),
+			(r"fc1/kernel", pmag.resolve(ColumnWise)),
+			(r"fc2/kernel", pmag.resolve(RowWise)),
+			(r".*/(self_attn_layer_norm|final_layer_norm)/scale", pmag.resolve(Replicated)),
+			(r".*/(self_attn_layer_norm|final_layer_norm)/bias", pmag.resolve(Replicated)),
+			(r"lm_head/kernel", pmag.resolve(ColumnWise)),
+			(
+				r".*(q_proj|k_proj|v_proj|q_attn|c_attn|out_proj|fc1|fc2|project_in|project_out|lm_head)/bias",
+				pmag.resolve(Replicated),
+			),
+			(r".*", pmag.resolve(Replicated)),
 		)
-		for k, v in basics.items():
-			if not hasattr(self, k):
-				setattr(self, k, v)
-		self.from_pt = False

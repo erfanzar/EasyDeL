@@ -15,7 +15,7 @@
 
 import typing as tp
 
-from jax.sharding import PartitionSpec
+from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -158,123 +158,24 @@ class GPTJConfig(EasyDeLBaseConfig):
 
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model. This method defines how the model's parameters are
-		partitioned across devices for distributed training and inference.
-
-		Args:
-		    *args: Additional positional arguments (unused).
-		    **kwargs: Additional keyword arguments (unused).
-
+		Get the partition rules for the model.
 		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: A tuple of partition rules, where each rule is a tuple
-		        containing a regex pattern for parameter names and the corresponding `PartitionSpec`.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
+		pmag = self.partition_manager
 		return (
-			("wte/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-			(
-				"attn/(k_proj|v_proj|q_proj)/kernel",
-				PartitionSpec("tp", ("fsdp", "sp")),
-			),
-			("attn/out_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/fc_out/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/fc_out/bias", PartitionSpec("tp")),
-			("mlp/fc_in/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("mlp/fc_in/bias", PartitionSpec(("fsdp", "sp"))),
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("lm_head/bias", PartitionSpec(("fsdp", "sp"))),
-			(".*", PartitionSpec(("fsdp", "sp"))),
+			(r"wte/embedding", pmag.resolve(ColumnWise)),
+			(r"attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"attn/out_proj/kernel", pmag.resolve(RowWise)),
+			(r"attn/.*proj/bias", pmag.resolve(Replicated)),
+			(r"mlp/fc_in/kernel", pmag.resolve(ColumnWise)),
+			(r"mlp/fc_out/kernel", pmag.resolve(RowWise)),
+			(r"mlp/fc_in/bias", pmag.resolve(Replicated)),
+			(r"mlp/fc_out/bias", pmag.resolve(Replicated)),
+			(r".*/(ln_1|ln_f)/scale", pmag.resolve(Replicated)),
+			(r".*/(ln_1|ln_f)/bias", pmag.resolve(Replicated)),
+			(r"lm_head/kernel", pmag.resolve(ColumnWise)),
+			(r"lm_head/bias", pmag.resolve(Replicated)),
+			(r".*bias", pmag.resolve(Replicated)),
+			(r".*", pmag.resolve(Replicated)),
 		)
-
-	@staticmethod
-	def get_mesh_names():
-		"""Returns the mesh names used for model parallelism. For GPT-J, it returns mesh names for
-		data parallelism ('dp'), fully sharded data parallelism ('fsdp'), sequence parallelism ('sp'),
-		and tensor parallelism ('tp').
-
-		Returns:
-		    tuple: A tuple containing the mesh names ("dp", "fsdp", "sp", "sp").
-		"""
-		return "dp", "fsdp", "sp", "sp"
-
-	def attach_custom_arguments(
-		self,
-		vocab_size: int = 50400,
-		n_positions: int = 2048,
-		n_embd: int = 4096,
-		n_layer: int = 28,
-		n_head: int = 16,
-		rotary_dim: int = 64,
-		n_inner: int = None,
-		activation_function: str = "gelu_new",
-		resid_pdrop: float = 0.0,
-		embd_pdrop: float = 0.0,
-		attn_pdrop: float = 0.0,
-		layer_norm_epsilon: float = 1e-5,
-		initializer_range: int = 0.02,
-		use_cache: int = True,
-		bos_token_id: int = 50256,
-		eos_token_id: int = 50256,
-		tie_word_embeddings: bool = False,
-		bits: tp.Optional[int] = None,
-		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		**kwargs,
-	):
-		"""Attaches custom arguments to the configuration object.
-
-		This method allows adding or overriding configuration attributes dynamically.
-		It iterates through a dictionary of basic configuration parameters and sets them
-		as attributes of the configuration object if they don't already exist.
-
-		Args:
-		    vocab_size (int, optional): Vocabulary size. Defaults to 50400.
-		    n_positions (int, optional): Maximum sequence length. Defaults to 2048.
-		    n_embd (int, optional): Hidden size. Defaults to 4096.
-		    n_layer (int, optional): Number of hidden layers. Defaults to 28.
-		    n_head (int, optional): Number of attention heads. Defaults to 16.
-		    rotary_dim (int, optional): Dimension for rotary position embeddings. Defaults to 64.
-		    n_inner (int, optional): Inner dimension of FFN. Defaults to None.
-		    activation_function (str, optional): Activation function. Defaults to "gelu_new".
-		    resid_pdrop (float, optional): Residual dropout probability. Defaults to 0.0.
-		    embd_pdrop (float, optional): Embedding dropout probability. Defaults to 0.0.
-		    attn_pdrop (float, optional): Attention dropout probability. Defaults to 0.0.
-		    layer_norm_epsilon (float, optional): Epsilon for layer normalization. Defaults to 1e-5.
-		    initializer_range (int, optional): Initializer range. Defaults to 0.02.
-		    use_cache (int, optional): Whether to use KV cache. Defaults to True.
-		    bos_token_id (int, optional): Beginning-of-sequence token ID. Defaults to 50256.
-		    eos_token_id (int, optional): End-of-sequence token ID. Defaults to 50256.
-		    tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
-		    bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
-		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
-		        Defaults to EasyDeLGradientCheckPointers.NONE.
-		    **kwargs: Additional keyword arguments.
-
-		Returns:
-		    GPTJConfig: The configuration object itself (self).
-		"""
-		basics = dict(
-			bits=bits,
-			vocab_size=vocab_size,
-			n_positions=n_positions,
-			n_embd=n_embd,
-			n_layer=n_layer,
-			n_head=n_head,
-			rotary_dim=rotary_dim,
-			n_inner=n_inner,
-			activation_function=activation_function,
-			resid_pdrop=resid_pdrop,
-			embd_pdrop=embd_pdrop,
-			attn_pdrop=attn_pdrop,
-			layer_norm_epsilon=layer_norm_epsilon,
-			initializer_range=initializer_range,
-			use_cache=use_cache,
-			bos_token_id=bos_token_id,
-			eos_token_id=eos_token_id,
-			tie_word_embeddings=tie_word_embeddings,
-			gradient_checkpointing=gradient_checkpointing,
-		)
-
-		for k, v in basics.items():
-			if not hasattr(self, k):
-				setattr(self, k, v)
-		self.from_pt = False
-		return self

@@ -15,8 +15,7 @@
 
 import typing as tp
 
-import jax
-
+from eformer.common_types import ColumnWise, Replicated, RowWise
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
 from easydel.infra.factory import register_config
@@ -193,47 +192,24 @@ class GPT2Config(EasyDeLBaseConfig):
 			**kwargs,
 		)
 
-	def attach_custom_arguments(
-		self,
-		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		bits: tp.Optional[int] = None,
-		**kwargs,
-	):
-		"""Attaches custom arguments to the configuration object.
-
-		This method allows adding or overriding configuration attributes dynamically.
-		It iterates through the provided arguments and sets them as attributes
-		of the configuration object if they don't already exist.
-
-		Args:
-		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
-		        Defaults to EasyDeLGradientCheckPointers.NONE.
-		    bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
-		    **kwargs: Additional keyword arguments to attach to the configuration.
-		"""
-		args = dict(gradient_checkpointing=gradient_checkpointing, bits=bits, **kwargs)
-		for k, v in args.items():
-			if not hasattr(self, k):
-				setattr(self, k, v)
-
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model. This method defines how the model's parameters are
-		partitioned across devices for distributed training and inference.
-
-		Args:
-		    *args: Additional positional arguments (unused).
-		    **kwargs: Additional keyword arguments (unused).
-
+		Get the partition rules for the model.
 		Returns:
-		    `tp.Tuple[tp.Tuple[str, jax.sharding.PartitionSpec]]`: A tuple of partition rules, where each rule is a tuple
-		        containing a regex pattern for parameter names and the corresponding `PartitionSpec`.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
+		pmag = self.partition_manager
 		return (
-			(
-				"wte/embedding",
-				jax.sharding.PartitionSpec(("fsdp", "sp"), "tp"),
-			),
-			("transformer/lm_head", jax.sharding.PartitionSpec(("fsdp", "sp"), "tp")),
-			(".*", jax.sharding.PartitionSpec(("fsdp", "sp"))),
+			(r"wte/embedding", pmag.resolve(ColumnWise)),
+			(r"wpe/embedding", pmag.resolve(Replicated)),
+			(r"(attn|crossattention)/c_attn/kernel", pmag.resolve(ColumnWise)),
+			(r"(attn|crossattention)/q_attn/kernel", pmag.resolve(ColumnWise)),
+			(r"(attn|crossattention)/c_proj/kernel", pmag.resolve(RowWise)),
+			(r"mlp/c_fc/kernel", pmag.resolve(ColumnWise)),
+			(r"mlp/c_proj/kernel", pmag.resolve(RowWise)),
+			(r".*/(ln_1|ln_2|ln_cross_attn|ln_f)/scale", pmag.resolve(Replicated)),
+			(r".*/(ln_1|ln_2|ln_cross_attn|ln_f)/bias", pmag.resolve(Replicated)),
+			(r"lm_head/kernel", pmag.resolve(ColumnWise)),
+			(r".*(c_attn|q_attn|c_proj|c_fc|lm_head)/bias", pmag.resolve(Replicated)),
+			(r".*", pmag.resolve(Replicated)),
 		)

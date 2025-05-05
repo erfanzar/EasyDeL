@@ -15,7 +15,7 @@
 
 import typing as tp
 
-from jax.sharding import PartitionSpec
+from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -171,69 +171,18 @@ class CohereConfig(EasyDeLBaseConfig):
 		Returns:
 		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
+		pmag = self.partition_manager  # Handles resolving strategies
 		return (
-			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-			("self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("linear/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("linear_1/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("linear_v/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("gate/kernel", PartitionSpec("tp")),
-			("post_attn_norm/kernel", PartitionSpec(None)),
-			("pre_attn_norm/kernel", PartitionSpec(None)),
-			("pre_moe_norm/kernel", PartitionSpec(None)),
-			("post_moe_norm/kernel", PartitionSpec(None)),
-			("model/norm/kernel", PartitionSpec(None)),
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			(".*", PartitionSpec(None)),
-		)
-
-	def attach_custom_arguments(
-		self,
-		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		bits: tp.Optional[int] = None,
-		**kwargs,
-	):
-		"""The attach_custom_arguments function adds the following arguments to the Transformer class:
-
-		Args:
-		    self: Refer to the current object
-		    gradient_checkpointing (EasyDeLGradientCheckPointers): Control the amount of memory used by jax
-		    bits (Optional[int]): Determine the number of bits used in the quantization
-		    **kwargs: Additional keyword arguments.
-		"""
-		self.gradient_checkpointing = gradient_checkpointing
-		self.bits = bits
-
-	@staticmethod
-	def get_weight_decay_exclusions():
-		"""Returns a tuple of parameter names for which weight decay should be excluded."""
-		return tuple()
-
-	@staticmethod
-	def rng_keys():
-		"""Returns the names of the random number generator keys used by the model."""
-		return "params", "dropout"
-
-	@property
-	def granted_freq_max_position_embedding(self) -> int:
-		"""Returns the maximum position embedding size for frequency-based position embeddings, falling back to max_position_embeddings."""
-		return getattr(
-			self,
-			"freq_max_position_embeddings",
-			self.max_position_embeddings,
-		)
-
-	@property
-	def granted_mask_max_position_embedding(self) -> int:
-		"""Returns the maximum position embedding size for mask-based position embeddings, falling back to max_position_embeddings."""
-		return getattr(
-			self,
-			"mask_max_position_embeddings",
-			self.max_position_embeddings,
+			(r"model/embed_tokens/embedding", pmag.resolve(ColumnWise)),
+			(r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"self_attn/o_proj/kernel", pmag.resolve(RowWise)),
+			(r"self_attn/(q_norm|k_norm)/kernel", pmag.resolve(Replicated)),
+			(r"mlp/(gate_proj|up_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"mlp/down_proj/kernel", pmag.resolve(RowWise)),
+			(r"input_layernorm/kernel", pmag.resolve(Replicated)),
+			(r"model/norm/kernel", pmag.resolve(Replicated)),
+			(r"lm_head/kernel", pmag.resolve(ColumnWise)),
+			(r"score/kernel", pmag.resolve(RowWise)),
+			(r".*bias", pmag.resolve(Replicated)),
+			(r".*", pmag.resolve(Replicated)),
 		)

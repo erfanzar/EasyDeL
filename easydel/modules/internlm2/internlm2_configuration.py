@@ -15,7 +15,7 @@
 
 import typing as tp
 
-from jax.sharding import PartitionSpec
+from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.etils import EasyDeLGradientCheckPointers
@@ -186,89 +186,23 @@ class InternLM2Config(EasyDeLBaseConfig):
 
 	def get_partition_rules(self, *args, **kwargs):
 		"""
-		Get the partition rules for the model. This method defines how the model's parameters are
-		partitioned across devices for distributed training and inference.
-
-		Args:
-		    *args: Additional positional arguments (unused).
-		    **kwargs: Additional keyword arguments (unused).
-
+		Get the partition rules for the model.
 		Returns:
-		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: A tuple of partition rules, where each rule is a tuple
-		        containing a regex pattern for parameter names and the corresponding `PartitionSpec`.
+		    `tp.Tuple[tp.Tuple[str, PartitionSpec]]`: The partition rules.
 		"""
+		pmag = self.partition_manager
 		return (
-			("embed_tokens/embedding", PartitionSpec(("fsdp", "sp"), "tp")),
-			("self_attn/q_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/k_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/v_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/o_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/gate_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("mlp/down_proj/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("mlp/up_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("input_layernorm/kernel", PartitionSpec(None)),
-			("post_attention_layernorm/kernel", PartitionSpec(None)),
-			("model/norm/kernel", PartitionSpec(None)),
-			("lm_head/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			(".*", PartitionSpec(None)),
+			(r"tok_embeddings/embedding", pmag.resolve(ColumnWise)),
+			(r"attention/wqkv/kernel", pmag.resolve(ColumnWise)),
+			(r"attention/wo/kernel", pmag.resolve(RowWise)),
+			(r"feed_forward/(w1|w3)/kernel", pmag.resolve(ColumnWise)),
+			(r"feed_forward/w2/kernel", pmag.resolve(RowWise)),
+			(r".*/(attention_norm|ffn_norm|norm)/kernel", pmag.resolve(Replicated)),
+			(r"output/kernel", pmag.resolve(ColumnWise)),
+			(r"score/kernel", pmag.resolve(RowWise)),
+			(r".*/(wqkv|wo|w1|w3|w2|output|score)/bias", pmag.resolve(Replicated)),
+			(r".*", pmag.resolve(Replicated)),
 		)
-
-	def attach_custom_arguments(
-		self,
-		tie_word_embeddings: bool = False,
-		gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
-		fcm_min_ratio: float = 0.0,
-		fcm_max_ratio: float = 0.0,
-		bits: tp.Optional[int] = None,
-		rope_theta: float = 10000.0,
-		hidden_act: str = "silu",
-		scan_layers: bool = True,
-		**kwargs,
-	):
-		"""Attaches custom arguments to the configuration object.
-
-		This method allows adding or overriding configuration attributes dynamically.
-		It iterates through the provided arguments and sets them as attributes
-		of the configuration object.
-
-		Args:
-		    tie_word_embeddings (bool, optional): Whether to tie input/output embeddings. Defaults to False.
-		    gradient_checkpointing (EasyDeLGradientCheckPointers, optional): Gradient checkpointing strategy.
-		        Defaults to EasyDeLGradientCheckPointers.NONE.
-		    fcm_min_ratio (float, optional): Minimum ratio for Flash Attention. Defaults to 0.0.
-		    fcm_max_ratio (float, optional): Maximum ratio for Flash Attention. Defaults to 0.0.
-		    bits (tp.Optional[int], optional): Quantization bits. Defaults to None.
-		    rope_theta (float, optional): Base value for RoPE. Defaults to 10000.0.
-		    hidden_act (str, optional): Activation function. Defaults to "silu".
-		    scan_layers (bool, optional): Whether to use scan layers. Defaults to True.
-		    **kwargs: Additional keyword arguments (ignored in this implementation).
-		"""
-		self.scan_layers = scan_layers
-		self.rope_theta = rope_theta
-		self.hidden_act = hidden_act
-		self.tie_word_embeddings = tie_word_embeddings
-		self.gradient_checkpointing = gradient_checkpointing
-		self.fcm_min_ratio = fcm_min_ratio
-		self.fcm_max_ratio = fcm_max_ratio
-		self.bits = bits
-
-	@staticmethod
-	def get_weight_decay_exclusions():
-		"""Returns a tuple of parameter names for which weight decay should be excluded.
-
-		Returns:
-		    tuple: An empty tuple, indicating no specific weight decay exclusions for this model.
-		"""
-		return tuple()
-
-	@staticmethod
-	def rng_keys():
-		"""Returns the names of the random number generator keys used by the model.
-
-		Returns:
-		    tuple: A tuple containing "params", "dropout", and "fcm" as the RNG keys.
-		"""
-		return "params", "dropout", "fcm"
 
 	@property
 	def granted_freq_max_position_embedding(self) -> int:

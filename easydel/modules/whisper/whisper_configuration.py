@@ -15,6 +15,7 @@
 
 import typing as tp
 
+from eformer.common_types import ColumnWise, Replicated, RowWise
 from jax.sharding import PartitionSpec
 
 from easydel.infra.base_module import EasyDeLBaseConfig
@@ -253,40 +254,46 @@ class WhisperConfig(EasyDeLBaseConfig):
 		Returns:
 		    tuple: Partition rules.
 		"""
+		pmag = self.partition_manager
 		return (
-			# Embeddings
-			(
-				"model/(encoder|decoder)/embed_tokens/embedding",
-				PartitionSpec("tp", ("fsdp", "sp")),
-			),
-			("model/(encoder|decoder)/embed_positions/embedding", PartitionSpec(None, "tp")),
-			# Projection output
-			("proj_out/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("proj_out/bias", PartitionSpec(None)),
-			# Encoder convolutions
 			("model/encoder/conv[12]/kernel", PartitionSpec(None, "tp", ("fsdp", "sp"))),
-			("model/encoder/conv[12]/bias", PartitionSpec("tp")),
-			# Self attention (both encoder and decoder)
-			("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("self_attn/(q_proj|k_proj|v_proj)/bias", PartitionSpec(("fsdp", "sp"))),
-			("self_attn/out_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("self_attn/out_proj/bias", PartitionSpec("tp")),
-			# Cross attention (decoder only)
+			(r"encoder/embed_positions/embedding", pmag.resolve(Replicated)),
+			(r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"self_attn/out_proj/kernel", pmag.resolve(RowWise)),
+			(r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
+			(r"fc1/kernel", pmag.resolve(ColumnWise)),
+			(r"fc2/kernel", pmag.resolve(RowWise)),
+			(r"fc(1|2)/bias", pmag.resolve(Replicated)),
+			(r"(self_attn_layer_norm|final_layer_norm)/scale", pmag.resolve(Replicated)),
+			(r"(self_attn_layer_norm|final_layer_norm)/bias", pmag.resolve(Replicated)),
+			(r"encoder/layer_norm/scale", pmag.resolve(Replicated)),
+			(r"encoder/layer_norm/bias", pmag.resolve(Replicated)),
+			(r"decoder/embed_tokens/embedding", pmag.resolve(ColumnWise)),
+			(r"decoder/embed_positions/embedding", pmag.resolve(Replicated)),
+			(r"self_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"self_attn/out_proj/kernel", pmag.resolve(RowWise)),
+			(r"self_attn/.*proj/bias", pmag.resolve(Replicated)),
+			(r"encoder_attn/(q_proj|k_proj|v_proj)/kernel", pmag.resolve(ColumnWise)),
+			(r"encoder_attn/out_proj/kernel", pmag.resolve(RowWise)),
+			(r"encoder_attn/.*proj/bias", pmag.resolve(Replicated)),
+			(r"fc1/kernel", pmag.resolve(ColumnWise)),
+			(r"fc2/kernel", pmag.resolve(RowWise)),
+			(r"fc(1|2)/bias", pmag.resolve(Replicated)),
 			(
-				"encoder_attn/(q_proj|k_proj|v_proj)/kernel",
-				PartitionSpec("tp", ("fsdp", "sp")),
+				r"(self_attn_layer_norm|encoder_attn_layer_norm|final_layer_norm)/scale",
+				pmag.resolve(Replicated),
 			),
-			("encoder_attn/(q_proj|k_proj|v_proj)/bias", PartitionSpec(("fsdp", "sp"))),
-			("encoder_attn/out_proj/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("encoder_attn/out_proj/bias", PartitionSpec("tp")),
-			# FFN layers (both encoder and decoder)
-			("fc1/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-			("fc1/bias", PartitionSpec("tp")),
-			("fc2/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-			("fc2/bias", PartitionSpec(None)),
-			# Layer norms
-			(".*layer_norm/(bias|scale)", PartitionSpec(None)),
-			(".*_layer_norm/(bias|scale)", PartitionSpec(None)),
-			# Catch-all
-			(".*", PartitionSpec(None)),
+			(
+				r"(self_attn_layer_norm|encoder_attn_layer_norm|final_layer_norm)/bias",
+				pmag.resolve(Replicated),
+			),
+			(r"decoder/layer_norm/scale", pmag.resolve(Replicated)),
+			(r"decoder/layer_norm/bias", pmag.resolve(Replicated)),
+			(r"proj_out/kernel", pmag.resolve(ColumnWise)),
+			(r"projector/kernel", pmag.resolve(ColumnWise)),
+			(r"projector/bias", pmag.resolve(Replicated)),
+			(r"classifier/kernel", pmag.resolve(RowWise)),
+			(r"classifier/bias", pmag.resolve(Replicated)),
+			(r".*bias", pmag.resolve(Replicated)),
+			(r".*", pmag.resolve(Replicated)),
 		)

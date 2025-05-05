@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "easydel"
-version = "0.1.4.1"
+version = "0.1.5"
 
 description = "Accelerate, Optimize performance with streamlined training and serving options with JAX."
 authors = ["Erfan Zare Chavoshi <Erfanzare810@gmail.com>"]
@@ -35,7 +35,7 @@ classifiers = [
 python = ">=3.10,<3.14"
 jax = ">=0.5.3"
 jaxlib = ">=0.5.3"
-eformer = "0.0.34"
+eformer = "0.0.36"
 einops = "~0.8.0"
 transformers = ">=4.51.0"
 flax = "0.10.4"

@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-from jax.sharding import PartitionSpec
+from eformer.common_types import ColumnWise, Replicated, RowWise
 
 from easydel.infra.base_module import EasyDeLBaseConfig
 from easydel.infra.factory import register_config
@@ -33,32 +32,45 @@ def _get_partition_rules(self, *arg, **kwargs):
 	Returns:
 		Tuple: A tuple of partition rules for model parameters.
 	"""
+	pmag = self.partition_manager  # Handles resolving strategies
 	return (
-		# Embeddings
-		("token_embedding/embedding", PartitionSpec("tp", ("fsdp", "sp"))),
-		("position_embedding/embedding", PartitionSpec(None, "tp")),
-		# Patch embedding and class embedding (vision specific)
-		("patch_embedding/kernel", PartitionSpec(None, None, None, "tp")),
-		("patch_embedding/bias", PartitionSpec(None)),
-		("class_embedding", PartitionSpec("tp")),
-		# Common attention layers
-		("self_attn/(q_proj|k_proj|v_proj)/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-		("self_attn/(out_proj|o_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-		("self_attn/(q_proj|k_proj|v_proj)/bias", PartitionSpec(("fsdp", "sp"))),
-		("self_attn/(out_proj|o_proj)/bias", PartitionSpec(None)),
-		# Common MLP layers
-		("mlp/(fc1|gate_proj)/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-		("mlp/(fc2|down_proj)/kernel", PartitionSpec("tp", ("fsdp", "sp"))),
-		("mlp/(fc1|gate_proj)/bias", PartitionSpec("tp")),
-		("mlp/(fc2|down_proj)/bias", PartitionSpec(None)),
-		# Layer norms
-		("layer_norm\\d*/(bias|scale)", PartitionSpec(None)),
-		(".*layernorm/(bias|scale)", PartitionSpec(None)),
-		# Projections
-		(".*projection/kernel", PartitionSpec(("fsdp", "sp"), "tp")),
-		(".*projection/bias", PartitionSpec(None)),
-		# Catch-all
-		(".*", PartitionSpec(None)),
+		# 1. Text Embeddings
+		(r"text_model/embeddings/token_embedding/embedding", pmag.resolve(ColumnWise)),
+		(r"text_model/embeddings/position_embedding/embedding", pmag.resolve(ColumnWise)),
+		(r"vision_model/embeddings/class_embedding", pmag.resolve(Replicated)),
+		(r"vision_model/embeddings/patch_embedding/kernel", pmag.resolve(ColumnWise)),
+		(r"vision_model/embeddings/patch_embedding/bias", pmag.resolve(Replicated)),
+		(r"vision_model/embeddings/position_embedding/embedding", pmag.resolve(ColumnWise)),
+		(
+			r"(text|vision)_model/encoder/layers/\d+/self_attn/(q_proj|k_proj|v_proj)/kernel",
+			pmag.resolve(ColumnWise),
+		),
+		(
+			r"(text|vision)_model/encoder/layers/\d+/self_attn/out_proj/kernel",
+			pmag.resolve(RowWise),
+		),
+		(
+			r"(text|vision)_model/encoder/layers/\d+/self_attn/.*proj/bias",
+			pmag.resolve(Replicated),
+		),
+		(
+			r"(text|vision)_model/encoder/layers/\d+/mlp/fc1/kernel",
+			pmag.resolve(ColumnWise),
+		),
+		(r"(text|vision)_model/encoder/layers/\d+/mlp/fc2/kernel", pmag.resolve(RowWise)),
+		(
+			r"(text|vision)_model/encoder/layers/\d+/mlp/fc(1|2)/bias",
+			pmag.resolve(Replicated),
+		),
+		(r".*norm.*/scale", pmag.resolve(Replicated)),
+		(r".*norm.*/bias", pmag.resolve(Replicated)),
+		(r"(visual|text)_projection/kernel", pmag.resolve(ColumnWise)),
+		(r"(visual|text)_projection/bias", pmag.resolve(Replicated)),
+		(r"logit_scale", pmag.resolve(Replicated)),
+		(r"classifier/kernel", pmag.resolve(RowWise)),
+		(r"classifier/bias", pmag.resolve(Replicated)),
+		(r".*bias", pmag.resolve(Replicated)),
+		(r".*", pmag.resolve(Replicated)),
 	)
 
 
