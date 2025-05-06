@@ -1164,7 +1164,7 @@ def compute_weight_stats(params, repattern: str):
 		pattern_search = ".".join([str(p) for p in path])
 		path = "/".join([str(p) for p in path])
 		if bool(re.match(repattern, pattern_search)):
-			stats[f"{path}/values"] = _create_histogram(weight)
+			stats[f"{path}/values"] = _create_values_histogram(weight)
 			stats[f"{path}/mean"] = jnp.mean(weight)
 			stats[f"{path}/std"] = jnp.std(weight)
 			stats[f"{path}/min"] = jnp.min(weight)
@@ -1173,7 +1173,7 @@ def compute_weight_stats(params, repattern: str):
 
 
 @jax.jit
-def _create_histogram(arr):
+def _create_values_histogram(arr):
 	edges = jnp.histogram_bin_edges(arr, 31)
 	arr = arr.reshape(1, -1)
 	left_edges = edges[:-1, None]
@@ -1182,4 +1182,4 @@ def _create_histogram(arr):
 	out = index.sum(axis=1, dtype=arr.dtype)
 	if out.size >= 1:
 		out = out.at[-1].add(1)
-	return out
+	return out, edges
