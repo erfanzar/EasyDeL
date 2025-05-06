@@ -368,7 +368,7 @@ class TrainingArguments:
 		metadata={"help": "The pattern to use to extract weight distribution."},
 	)
 	weight_distribution_log_steps: int = field(
-		default=0,
+		default=50,
 		metadata={"help": "log weight distribution every X steps."},
 	)
 
@@ -672,7 +672,7 @@ class TrainingArguments:
 				if key.endswith("/values"):
 					path: str = key[:-7]
 					path = path.replace("/", ".")
-					metrics[f"weights-histogram/{path}"] = np.array(value)
+					metrics[f"weights-histogram/{path}"] = (value[0].tolist(), value[1].tolist())
 				else:
 					key = key.replace("/", ".")
 					metrics[f"weights-information/{key}"] = float(value)
@@ -735,7 +735,7 @@ class TrainingArguments:
 			try:
 				if isinstance(value, (float, int)):
 					summary_writer.scalar(key, value, step)
-				elif isinstance(value, (list, tuple, np.ndarray, jnp.ndarray)):
+				elif isinstance(value, (list, np.ndarray, jnp.ndarray)):
 					summary_writer.histogram(key, np.array(value), step)
 			except Exception as e:
 				warnings.warn(f"Failed to log metric {key} to TensorBoard: {e}", stacklevel=1)
@@ -760,14 +760,21 @@ class TrainingArguments:
 		    - tp.Any exceptions during histogram creation are caught and logged, returning None in such cases.
 		"""
 		try:
-			if isinstance(value, jax.Array):
+			if isinstance(value, (jax.Array, np.generic)):
 				value = np.array(jax.device_get(value))
-			if value.dtype in [np.bfloat16]:
-				value = value.astype(np.float32)
-			value = value.astype(np.float16)
+				if value.dtype in [np.bfloat16]:
+					value = value.astype(np.float32)
+				value = value.astype(np.float16)
+				return wandb.Histogram(value)
+			if isinstance(value, tuple) and len(value) == 2:
+				histogram = wandb.Histogram(
+					np_histogram=(value[0][0], value[1][0]),
+					num_bins=31,
+				)
+				return histogram
 			return wandb.Histogram(value)
 		except Exception as e:
-			(f"Failed to create wandb histogram: {e}")
+			warnings.warn(f"Failed to create wandb histogram: {e}", stacklevel=1)
 			return None
 
 	def to_dict(self) -> tp.Dict[str, tp.Any]:
