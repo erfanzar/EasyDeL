@@ -25,10 +25,7 @@ from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
 from easydel.infra.loss_utils import LossMetrics
 from easydel.utils.helpers import capture_time, get_logger
 
-from ..base_trainer import (
-	BaseTrainer,
-	TrainerConfigureFunctionOutput,
-)
+from ..base_trainer import BaseTrainer, TrainerConfigureFunctionOutput
 from ..trainer_protocol import BaseProgressBar, MetricsTracker, StepMetrics
 from ._fn import evaluation_step, training_step
 from .modeling_output import TrainerOutput

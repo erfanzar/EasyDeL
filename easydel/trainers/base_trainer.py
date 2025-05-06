@@ -50,9 +50,7 @@ except ImportError:
 
 
 from easydel import __version__
-from easydel.infra.base_module import (
-	EasyDeLBaseModule,
-)
+from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.utils import Timers
 from easydel.utils.helpers import get_logger
 
@@ -494,30 +492,32 @@ class BaseTrainer(BaseTrainerProtocol):
 			"""
 			if hasattr(dataset, "__len__"):
 				total_data_len = len(dataset)
-				batch_size = (
-					self.arguments.total_batch_size if is_train else self.evaluation_batch_size
-				)
-				num_steps = (
-					(total_data_len + batch_size - 1)
-					// batch_size
-					* (self.arguments.num_train_epochs if is_train else 1)
-				)
-				max_steps = (
-					self.arguments.max_training_steps
-					if is_train
-					else self.arguments.max_evaluation_steps
-				)
-				steps = min(num_steps, max_steps) if max_steps else num_steps
 			else:
-				steps = (
-					self.arguments.max_training_steps
+				total_data_len = (
+					self.arguments.per_epoch_training_steps
 					if is_train
-					else self.arguments.max_evaluation_steps
+					else self.arguments.per_epoch_evaluation_steps
 				)
-				if not steps:
+				if total_data_len is None:
 					raise ValueError(
-						f"Specify the number of {'training' if is_train else 'evaluation'} steps for a generator/streaming dataset."
+						f"Specify the number of per epoch {'training' if is_train else 'evaluation'} "
+						"steps for a generator/streaming dataset."
 					)
+			batch_size = (
+				self.arguments.total_batch_size if is_train else self.evaluation_batch_size
+			)
+			num_steps = (
+				(total_data_len + batch_size - 1)
+				// batch_size
+				* (self.arguments.num_train_epochs if is_train else 1)
+			)
+			forced_steps = (
+				self.arguments.max_training_steps
+				if is_train
+				else self.arguments.max_evaluation_steps
+			)
+			steps = forced_steps if forced_steps is not None else num_steps
+
 			if is_train:
 				steps = steps // self.arguments.gradient_accumulation_steps
 			return steps

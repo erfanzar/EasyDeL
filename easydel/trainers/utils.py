@@ -71,16 +71,16 @@ class JaxDistributedConfig(object):
 
 # fmt:off
 def create_prompt_creator(processing_class):
-	def to_role_and_content(field):
-		return {
-			"conversation": [
-				{"role": "user", "content": field["conversation"][0]["input"]},
-				{"role": "assistant", "content": field["conversation"][0]["output"]},
-			]
-		}
-	def _pc(sample):
-		return conversations_formatting_function(processing_class, messages_field="conversation")(to_role_and_content(sample))
-	return _pc
+  def to_role_and_content(field):
+    return {
+      "conversation": [
+        {"role": "user", "content": field["conversation"][0]["input"]},
+        {"role": "assistant", "content": field["conversation"][0]["output"]},
+      ]
+    }
+  def _pc(sample):
+    return conversations_formatting_function(processing_class, messages_field="conversation")(to_role_and_content(sample))
+  return _pc
 # fmt:on
 
 
@@ -1164,9 +1164,22 @@ def compute_weight_stats(params, repattern: str):
 		pattern_search = ".".join([str(p) for p in path])
 		path = "/".join([str(p) for p in path])
 		if bool(re.match(repattern, pattern_search)):
-			stats[f"{path}/values"] = weight.flatten()
+			stats[f"{path}/values"] = _create_histogram(weight)
 			stats[f"{path}/mean"] = jnp.mean(weight)
 			stats[f"{path}/std"] = jnp.std(weight)
 			stats[f"{path}/min"] = jnp.min(weight)
 			stats[f"{path}/max"] = jnp.max(weight)
 	return stats
+
+
+@jax.jit
+def _create_histogram(arr):
+	edges = jnp.histogram_bin_edges(arr, 31)
+	arr = arr.reshape(1, -1)
+	left_edges = edges[:-1, None]
+	right_edges = edges[1:, None]
+	index = ((arr >= left_edges) & (arr < right_edges)).astype(arr.dtype)
+	out = index.sum(axis=1, dtype=arr.dtype)
+	if out.size >= 1:
+		out = out.at[-1].add(1)
+	return out

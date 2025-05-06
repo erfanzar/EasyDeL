@@ -121,13 +121,14 @@ class SFTTrainer(Trainer):
 				)
 			if not _multiple:
 				eval_dataset = _eval_datasets["singleton"]
-		if tokenizer.padding_side is not None and tokenizer.padding_side != "left":
-			warnings.warn(
-				"You passed a processing_class with `padding_side` not equal to `left` to the SFTTrainer. This might lead "
-				"to some unexpected behaviour due to overflow issues when training a model in half-precision. "
-				"You might consider adding `processing_class.padding_side = 'left'` to your code.",
-				stacklevel=1,
-			)
+		if hasattr(tokenizer, "padding_side"):
+			if tokenizer.padding_side is not None and tokenizer.padding_side != "left":
+				warnings.warn(
+					"You passed a processing_class with `padding_side` not equal to `left` to the SFTTrainer. This might lead "
+					"to some unexpected behaviour due to overflow issues when training a model in half-precision. "
+					"You might consider adding `processing_class.padding_side = 'left'` to your code.",
+					stacklevel=1,
+				)
 		if not isinstance(model, EasyDeLState):
 			model = model.to_state()
 		super().__init__(
