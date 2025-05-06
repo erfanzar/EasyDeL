@@ -17,6 +17,7 @@ from .direct_preference_optimization_trainer import DPOConfig, DPOTrainer
 from .group_relative_policy_optimization import GRPOConfig, GRPOTrainer
 from .odds_ratio_preference_optimization_trainer import ORPOConfig, ORPOTrainer
 from .packer import pack_sequences
+from .ray_scaler import RayDistributedTrainer
 from .reward_trainer import RewardConfig, RewardTrainer
 from .supervised_fine_tuning_trainer import SFTConfig, SFTTrainer
 from .trainer import Trainer
@@ -38,6 +39,7 @@ __all__ = (
 	"GRPOTrainer",
 	"ORPOConfig",
 	"ORPOTrainer",
+	"RayDistributedTrainer",
 	"RewardTrainer",
 	"RewardConfig",
 	"pack_sequences",

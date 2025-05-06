@@ -203,6 +203,14 @@ class TrainingArguments:
 		default=None,
 		metadata={"help": "The maximum number of training steps."},
 	)
+	per_epoch_training_steps: tp.Optional[int] = field(
+		default=None,
+		metadata={"help": "The maximum number of training step per each epoch."},
+	)
+	per_epoch_evaluation_steps: tp.Optional[int] = field(
+		default=None,
+		metadata={"help": "The maximum number of evaluation step per each epoch."},
+	)
 	model_name: str = field(
 		default="BaseTrainer",
 		metadata={"help": "The name of the model."},
