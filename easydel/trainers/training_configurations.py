@@ -13,7 +13,6 @@
 # limitations under the License.
 from __future__ import annotations
 
-import copy
 import functools
 import json
 import os
@@ -785,36 +784,6 @@ class TrainingArguments:
 			warnings.warn(f"Failed to create wandb histogram: {e}", stacklevel=1)
 			return None
 
-	def to_dict(self) -> tp.Dict[str, tp.Any]:
-		"""
-		Converts the TrainingArguments object into a dictionary.
-
-		Returns:
-		    tp.Dict[str, tp.Any]: A dictionary representation of the TrainingArguments.
-		"""
-		output = copy.deepcopy(self.__dict__)
-
-		for key, value in output.items():
-			if hasattr(value, "to_dict"):
-				value = value.to_dict()
-
-			output[key] = value
-
-		return output
-
-	@classmethod
-	def from_dict(cls, config: tp.Dict[str, tp.Any]):
-		"""
-		Creates a TrainingArguments instance from a dictionary.
-
-		Args:
-		    config (tp.Dict[str, tp.Any]): The configuration dictionary.
-
-		Returns:
-		    TrainingArguments: A TrainingArguments object initialized with values from the dictionary.
-		"""
-		return cls(**config)
-
 	@classmethod
 	def _dict_from_json_file(cls, json_file: tp.Union[str, os.PathLike]):
 		with open(json_file, encoding="utf-8") as reader:
@@ -829,6 +798,7 @@ class TrainingArguments:
 				`str`: String containing all the attributes that make up this configuration instance in JSON format.
 		"""
 		config_dict = self.to_dict()
+		config_dict["trainer_config_class"] = self.__class__.__name__
 		return json.dumps(config_dict, indent=2, sort_keys=True) + "\n"
 
 	@classmethod
@@ -845,6 +815,13 @@ class TrainingArguments:
 
 		"""
 		config_dict = cls._dict_from_json_file(json_file)
+		if "trainer_config_class" in config_dict.keys():
+			import easydel as ed
+
+			cls = getattr(ed, config_dict.pop("trainer_config_class"))
+			assert cls is not None, (
+				"We couldn't clearify the trainer config class from provided json."
+			)
 		return cls(**config_dict)
 
 	def save_arguments(self, json_file_path: tp.Union[str, os.PathLike]):
