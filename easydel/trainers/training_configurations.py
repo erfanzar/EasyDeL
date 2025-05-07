@@ -773,11 +773,12 @@ class TrainingArguments:
 					value = value.astype(np.float32)
 				value = value.astype(np.float16)
 				return wandb.Histogram(value)
-			if isinstance(value, tuple) and len(value) == 2:
-				histogram = wandb.Histogram(
-					np_histogram=(value[0][0], value[1][0]),
-					num_bins=31,
-				)
+			if isinstance(value, tuple):
+				if len(value) == 2:
+					histogram = wandb.Histogram(
+						np_histogram=(value[0][0], value[1][0]),
+						num_bins=64,
+					)
 				return histogram
 			return wandb.Histogram(value)
 		except Exception as e:

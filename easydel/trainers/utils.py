@@ -1174,7 +1174,7 @@ def compute_weight_stats(params, repattern: str):
 
 @jax.jit
 def _create_values_histogram(arr):
-	edges = jnp.histogram_bin_edges(arr, 31)
+	edges = jnp.histogram_bin_edges(arr, 64)
 	arr = arr.reshape(1, -1)
 	left_edges = edges[:-1, None]
 	right_edges = edges[1:, None]
