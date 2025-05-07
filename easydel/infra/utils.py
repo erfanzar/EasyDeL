@@ -25,6 +25,7 @@ from typing import List, Set
 import flax
 import flax.core
 import jax
+import jax.numpy as jnp
 import jax.tree_util
 import numpy as np
 from eformer.escale import with_sharding_constraint
@@ -56,6 +57,10 @@ def quick_gelu(x):
 	return x * jax.nn.sigmoid(1.702 * x)
 
 
+def relu_squared(x):
+	return jnp.square(jax.nn.relu(x))
+
+
 ACT2FN = {
 	"gelu": partial(nn.gelu, approximate=False),
 	"relu": nn.relu,
@@ -70,6 +75,7 @@ ACT2FN = {
 	"elu": nn.elu,
 	"softmax": nn.softmax,
 	"quick_gelu": quick_gelu,
+	"relu_squared": relu_squared,
 }
 
 ROPE_TYPES = tp.Optional[
