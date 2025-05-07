@@ -12,13 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from __future__ import annotations
-from eformer.pytree import auto_pytree
+
+import copy
 import functools
+import json
+import os
 import re
 import typing as tp
 import warnings
 from copy import deepcopy
-from dataclasses import field, fields
+from dataclasses import field
 from pathlib import Path
 
 import jax
@@ -27,6 +30,7 @@ import jax.experimental.multihost_utils
 import jax.numpy as jnp
 import numpy as np
 from eformer.optimizers import OptimizerFactory, SchedulerConfig
+from eformer.pytree import auto_pytree
 from jax.sharding import PartitionSpec
 
 from easydel.infra.errors import EasyDeLTimerError
@@ -466,6 +470,10 @@ class TrainingArguments:
 		"""
 		Checks and sets up variables for start.
 		"""
+
+		if not isinstance(self.step_partition_spec, PartitionSpec):
+			self.step_partition_spec = PartitionSpec(*tuple(self.step_partition_spec))
+
 		self.step_start_point = self.step_start_point or 0
 		self.eval_batch_size = (
 			self.eval_batch_size
@@ -784,10 +792,18 @@ class TrainingArguments:
 		Returns:
 		    tp.Dict[str, tp.Any]: A dictionary representation of the TrainingArguments.
 		"""
-		return {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
+		output = copy.deepcopy(self.__dict__)
+
+		for key, value in output.items():
+			if hasattr(value, "to_dict"):
+				value = value.to_dict()
+
+			output[key] = value
+
+		return output
 
 	@classmethod
-	def from_dict(cls, config: tp.Dict[str, tp.Any]) -> "TrainingArguments":
+	def from_dict(cls, config: tp.Dict[str, tp.Any]):
 		"""
 		Creates a TrainingArguments instance from a dictionary.
 
@@ -799,15 +815,48 @@ class TrainingArguments:
 		"""
 		return cls(**config)
 
-	def __repr__(self):
-		cls_name = self.__class__.__name__
-		field_lines = [
-			f"    {f.name}: {getattr(self, f.name)!r}".replace("\n", "\n    ")
-			for f in fields(self)
-		]
-		return f"{cls_name}(\n" + "\n".join(field_lines) + "\n)"
+	@classmethod
+	def _dict_from_json_file(cls, json_file: tp.Union[str, os.PathLike]):
+		with open(json_file, encoding="utf-8") as reader:
+			text = reader.read()
+		return json.loads(text)
 
-	__str__ = __repr__
+	def to_json_string(self) -> str:
+		"""
+		Serializes this instance to a JSON string.
+
+		Returns:
+				`str`: String containing all the attributes that make up this configuration instance in JSON format.
+		"""
+		config_dict = self.to_dict()
+		return json.dumps(config_dict, indent=2, sort_keys=True) + "\n"
+
+	@classmethod
+	def load_arguments(cls, json_file: tp.Union[str, os.PathLike]):
+		"""
+		Instantiates a [`PretrainedConfig`] from the path to a JSON file of parameters.
+
+		Args:
+				json_file (`str` or `os.PathLike`):
+						Path to the JSON file containing the parameters.
+
+		Returns:
+				[`PretrainedConfig`]: The configuration object instantiated from that JSON file.
+
+		"""
+		config_dict = cls._dict_from_json_file(json_file)
+		return cls(**config_dict)
+
+	def save_arguments(self, json_file_path: tp.Union[str, os.PathLike]):
+		"""
+		Save this instance to a JSON file.
+
+		Args:
+				json_file_path (`str` or `os.PathLike`):
+						Path to the JSON file in which this configuration instance's parameters will be saved.
+		"""
+		with open(json_file_path, "w", encoding="utf-8") as writer:
+			writer.write(self.to_json_string())
 
 	def _get_save_directory(self, create: bool = True) -> Path:
 		bd = Path(self.save_directory)

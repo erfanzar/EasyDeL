@@ -593,6 +593,10 @@ class BaseTrainer(BaseTrainerProtocol):
 		enable = True
 		if self.arguments.process_zero_is_admin and not self.arguments.is_process_zero:
 			enable = False
+		# if enable:
+		# 	directory_name.mkdir(exist_ok=True)
+		# 	self.arguments.save_arguments(directory_name / "easydel-training-arguments.json")
+
 		state.save_state(
 			save_directory=directory_name,
 			float_dtype=self.model.param_dtype,
