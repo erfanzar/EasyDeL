@@ -31,13 +31,23 @@ import jax
 import jax.extend
 import numpy as np
 import tqdm
+from eformer.escale import PartitionAxis
 from flax import nnx as nn
 from flax.core import unfreeze
+from jax import numpy as jnp
 from jax._src.stages import Compiled
+from jax.sharding import PartitionSpec
 
 import easydel
+from easydel.infra.base_config import EasyDeLBaseConfigDict
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.errors import EasyDeLBreakRequest, EasyDeLTimerError
+from easydel.infra.etils import (
+	EasyDeLBackends,
+	EasyDeLPlatforms,
+	EasyDeLQuantizationMethods,
+)
+from easydel.infra.factory import TaskType
 from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import CompilationTracker
 from easydel.utils.lazy_import import is_package_available
@@ -75,6 +85,7 @@ else:
 	IterableDataset = tp.Any
 
 logger = get_logger(__name__)
+DEFAULT_ARGS_JSON_NAME = "easydel-training-arguments.json"
 
 
 class BaseTrainer(BaseTrainerProtocol):
@@ -111,6 +122,80 @@ class BaseTrainer(BaseTrainerProtocol):
 
 		if self.arguments.track_memory:
 			self._initialize_memory_tracking()
+
+	def load_trainer_state(
+		cls,
+		load_directory: tp.Union[str, os.PathLike],
+		dataset_train: tp.Optional[Dataset] = None,
+		dataset_eval: tp.Optional[Dataset] = None,
+		data_collator: tp.Optional[tp.Callable] = None,
+		device: tp.Optional[jax.Device] = "cpu",
+		dtype: jnp.dtype = jnp.bfloat16,
+		param_dtype: jnp.dtype = jnp.bfloat16,
+		precision: tp.Optional[jax.lax.Precision] = None,
+		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
+		sharding_dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
+		sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+		partition_axis: tp.Optional[PartitionAxis] = None,
+		shard_attention_computation: bool = True,
+		shard_fns: tp.Optional[tp.Mapping[tuple, tp.Callable] | dict] = None,
+		backend: tp.Optional[EasyDeLBackends] = None,
+		platform: tp.Optional[EasyDeLPlatforms] = None,
+		config_kwargs: tp.Optional[EasyDeLBaseConfigDict] = None,
+		model_task: TaskType = TaskType.AUTO_BIND,
+		auto_shard_model: bool = True,
+		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]] = None,
+		quantization_platform: tp.Optional[EasyDeLPlatforms] = None,
+		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
+		quantization_block_size: int = 128,
+		quantization_pattern: tp.Optional[str] = None,
+		quantize_tensors: bool = True,
+		verbose: bool = True,
+		base_state: tp.Optional[tp.Type[EasyDeLState]] = None,
+		trainer_init_arguments: tp.Optional[tp.Dict[str, tp.Any]] = None,
+		**kwargs,
+	):
+		if base_state is None:
+			base_state = EasyDeLState
+		model_state = base_state.load_state(
+			load_directory=load_directory,
+			device=device,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			sharding_axis_dims=sharding_axis_dims,
+			sharding_dcn_axis_dims=sharding_dcn_axis_dims,
+			sharding_axis_names=sharding_axis_names,
+			partition_axis=partition_axis,
+			shard_attention_computation=shard_attention_computation,
+			shard_fns=shard_fns,
+			backend=backend,
+			platform=platform,
+			config_kwargs=config_kwargs,
+			model_task=model_task,
+			auto_shard_model=auto_shard_model,
+			partition_rules=partition_rules,
+			quantization_platform=quantization_platform,
+			quantization_method=quantization_method,
+			quantization_block_size=quantization_block_size,
+			quantization_pattern=quantization_pattern,
+			quantize_tensors=quantize_tensors,
+			verbose=verbose,
+			**kwargs,
+		)
+
+		load_args_path = Path(load_directory) / DEFAULT_ARGS_JSON_NAME
+		arguments = TrainingArguments.load_arguments(load_args_path)
+		if trainer_init_arguments is None:
+			trainer_init_arguments = {}
+		return cls(
+			arguments=arguments,
+			dataset_eval=dataset_eval,
+			dataset_train=dataset_train,
+			data_collator=data_collator,
+			model_state=model_state,
+			**trainer_init_arguments,
+		)
 
 	@property
 	def model(self):
@@ -591,11 +676,13 @@ class BaseTrainer(BaseTrainerProtocol):
 
 		logger.info(f"saving state {directory_name}.")
 		enable = True
+
 		if self.arguments.process_zero_is_admin and not self.arguments.is_process_zero:
 			enable = False
-		# if enable:
-		# 	directory_name.mkdir(exist_ok=True)
-		# 	self.arguments.save_arguments(directory_name / "easydel-training-arguments.json")
+
+		if enable:
+			directory_name.mkdir(exist_ok=True)
+			self.arguments.save_arguments(directory_name / DEFAULT_ARGS_JSON_NAME)
 
 		state.save_state(
 			save_directory=directory_name,
@@ -832,7 +919,7 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 		if (
 			self.arguments.loss_config is not None and self.arguments.loss_config.break_on_nan
 		):
-			if jax.numpy.isnan(metrics.loss):
+			if jnp.isnan(metrics.loss):
 				info = "Prevent Running Model Due to NaN Loss"
 				logger.info(info)
 				raise EasyDeLBreakRequest(info)

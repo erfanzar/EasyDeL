@@ -94,7 +94,7 @@ class BaseAutoEasyModel:
 		backend: tp.Optional[EasyDeLBackends] = None,
 		platform: tp.Optional[EasyDeLPlatforms] = None,
 		config_kwargs: tp.Optional[EasyDeLBaseConfigDict] = None,
-		auto_shard_model: bool = False,
+		auto_shard_model: bool = True,
 		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]] = None,
 		quantization_platform: tp.Optional[EasyDeLPlatforms] = None,
 		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
@@ -212,7 +212,7 @@ class BaseAutoEasyModel:
 		backend: tp.Optional[EasyDeLBackends] = None,
 		platform: tp.Optional[EasyDeLPlatforms] = None,
 		config_kwargs: tp.Optional[EasyDeLBaseConfigDict] = None,
-		auto_shard_model: bool = False,
+		auto_shard_model: bool = True,
 		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]] = None,
 		quantization_platform: tp.Optional[EasyDeLPlatforms] = None,
 		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
@@ -255,6 +255,7 @@ class BaseAutoEasyModel:
 		Returns:
 		    EasyDeLBaseModule: The loaded and potentially sharded EasyDeL model module.
 		"""
+
 		class Base(EasyDeLBaseModule):
 			_model_task = cls.model_task
 
@@ -301,7 +302,7 @@ class BaseAutoEasyModel:
 		backend: tp.Optional[EasyDeLBackends] = None,
 		platform: tp.Optional[EasyDeLPlatforms] = None,
 		config_kwargs: tp.Optional[EasyDeLBaseConfigDict] = None,
-		auto_shard_model: bool = False,
+		auto_shard_model: bool = True,
 		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]] = None,
 		quantization_platform: tp.Optional[EasyDeLPlatforms] = None,
 		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
@@ -344,6 +345,7 @@ class BaseAutoEasyModel:
 		Returns:
 		    EasyDeLBaseModule: The loaded, converted, and potentially sharded EasyDeL model module.
 		"""
+
 		class Base(EasyDeLBaseModule):
 			_model_task = cls.model_task
 
@@ -512,7 +514,7 @@ class BaseAutoEasyState:
 		backend: tp.Optional[EasyDeLBackends] = None,
 		platform: tp.Optional[EasyDeLPlatforms] = None,
 		config_kwargs: tp.Optional[EasyDeLBaseConfigDict] = None,
-		auto_shard_model: bool = False,
+		auto_shard_model: bool = True,
 		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]] = None,
 		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
 		quantization_block_size: int = 128,

@@ -23,12 +23,14 @@ from functools import partial
 import jax
 import optax
 from eformer import escale as es
+from eformer.escale import PartitionAxis
 from flax import nnx as nn
 from flax import struct
+from jax import numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
 from safetensors.flax import load_file as safe_load_file
 from safetensors.flax import save_file as safe_save_file
-from eformer.escale import PartitionAxis
+
 from easydel.infra.factory import TaskType
 from easydel.utils.helpers import get_logger
 from easydel.utils.traversals import specs_to_name_sharding
@@ -42,6 +44,7 @@ if tp.TYPE_CHECKING:
 		EasyDeLPlatforms,
 		EasyDeLQuantizationMethods,
 	)
+
 	from .base_module import EasyDeLBaseModule, PartitionLike
 else:
 	(
@@ -377,9 +380,7 @@ class EasyDeLState(struct.PyTreeNode):
 				return 0
 			leaves, _ = jax.tree_util.tree_flatten(pytree)
 			return sum(
-				leaf.size * leaf.itemsize
-				for leaf in leaves
-				if isinstance(leaf, jax.numpy.ndarray)
+				leaf.size * leaf.itemsize for leaf in leaves if isinstance(leaf, jnp.ndarray)
 			)
 
 		opt_state_size = calculate_size(self.opt_state)
@@ -436,7 +437,7 @@ class EasyDeLState(struct.PyTreeNode):
 	def save_state(
 		self,
 		save_directory: tp.Union[str, os.PathLike],
-		float_dtype: tp.Optional[jax.numpy.dtype] = None,
+		float_dtype: tp.Optional[jnp.dtype] = None,
 		verbose: bool = True,
 		mismatch_allowed: bool = True,
 		save_optimizer: bool = True,
@@ -450,7 +451,7 @@ class EasyDeLState(struct.PyTreeNode):
 
 		Args:
 		    save_directory (tp.Union[str, os.PathLike]): The directory to save the state to.
-		    float_dtype (tp.Optional[jax.numpy.dtype]): Optional dtype to cast floating-point
+		    float_dtype (tp.Optional[jnp.dtype]): Optional dtype to cast floating-point
 		        parameters to before saving. Defaults to None.
 		    verbose (bool): If True, logs information during saving. Defaults to True.
 		    mismatch_allowed (bool): Passed to `model.save_pretrained`, allows saving even if
@@ -513,8 +514,8 @@ class EasyDeLState(struct.PyTreeNode):
 		cls,
 		load_directory: tp.Union[str, os.PathLike],
 		device: tp.Optional[jax.Device] = "cpu",
-		dtype: jax.numpy.dtype = jax.numpy.float32,
-		param_dtype: jax.numpy.dtype = jax.numpy.float32,
+		dtype: jnp.dtype = jnp.bfloat16,
+		param_dtype: jnp.dtype = jnp.bfloat16,
 		precision: tp.Optional[jax.lax.Precision] = None,
 		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
 		sharding_dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
@@ -526,7 +527,7 @@ class EasyDeLState(struct.PyTreeNode):
 		platform: tp.Optional[EasyDeLPlatforms] = None,
 		config_kwargs: tp.Optional[EasyDeLBaseConfigDict] = None,
 		model_task: TaskType = TaskType.AUTO_BIND,
-		auto_shard_model: bool = False,
+		auto_shard_model: bool = True,
 		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec], ...]] = None,
 		quantization_platform: tp.Optional[EasyDeLPlatforms] = None,
 		quantization_method: tp.Optional[EasyDeLQuantizationMethods] = None,
@@ -548,10 +549,10 @@ class EasyDeLState(struct.PyTreeNode):
 						(configuration, model weights, and potentially optimizer state).
 				device: The JAX device (e.g., 'cpu', 'gpu', 'tpu') to load the model
 						onto. Defaults to 'cpu'.
-				dtype: The data type to use for computation (e.g., jax.numpy.float32).
-						Defaults to jax.numpy.float32.
+				dtype: The data type to use for computation (e.g., jnp.bfloat16).
+						Defaults to jnp.bfloat16.
 				param_dtype: The data type for the model parameters (e.g.,
-						jax.numpy.bfloat16). Defaults to jax.numpy.float32.
+						jnp.bfloat16). Defaults to jnp.bfloat16.
 				precision: The JAX precision level (e.g., jax.lax.Precision.HIGHEST).
 						Defaults to None.
 				sharding_axis_dims: A sequence defining the dimensions of the device
@@ -606,6 +607,7 @@ class EasyDeLState(struct.PyTreeNode):
 				# or EasyDeLBaseModule.from_pretrained might also be raised.
 		"""
 		from easydel.modules.auto.auto_configuration import AutoEasyDeLConfig
+
 		from .base_module import EasyDeLBaseModule
 
 		config = AutoEasyDeLConfig.from_pretrained(
