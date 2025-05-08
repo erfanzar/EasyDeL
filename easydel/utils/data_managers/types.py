@@ -155,7 +155,9 @@ class DatasetMixture:
 
 		"""
 		config_dict = cls._dict_from_json_file(json_file)
-		return cls(**config_dict)
+		mixture = cls(**config_dict)
+		mixture.informs = [TextDatasetInform(**inform) for inform in mixture.informs]
+		return mixture
 
 	def save_mixture(self, json_file_path: tp.Union[str, os.PathLike]):
 		"""
