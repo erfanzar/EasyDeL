@@ -25,6 +25,14 @@ from .compiling_utils import (
 	load_compiled_fn,
 	save_compiled_fn,
 )
+from .data_managers import (
+	DataManager,
+	DatasetLoadError,
+	DatasetMixture,
+	DatasetType,
+	TextDatasetInform,
+	VisualDatasetInform,
+)
 from .helpers import (
 	Timer,
 	Timers,
@@ -33,10 +41,7 @@ from .helpers import (
 	get_cache_dir,
 	get_logger,
 )
-from .lazy_import import (
-	LazyModule,
-	is_package_available,
-)
+from .lazy_import import LazyModule, is_package_available
 from .rngs_utils import GenerateRNG, JaxRNG
 
 __all__ = (
@@ -60,4 +65,10 @@ __all__ = (
 	"JaxRNG",
 	"is_package_available",
 	"LazyModule",
+	"DataManager",
+	"DatasetLoadError",
+	"DatasetMixture",
+	"DatasetType",
+	"TextDatasetInform",
+	"VisualDatasetInform",
 )

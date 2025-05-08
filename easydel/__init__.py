@@ -95,7 +95,15 @@ if _check_bool_flag("EASYDEL_AUTO", True):
 
 
 _import_structure = {
-	"utils": ["traversals"],
+	"utils": [
+		"traversals",
+		"DataManager",
+		"DatasetLoadError",
+		"DatasetMixture",
+		"DatasetType",
+		"TextDatasetInform",
+		"VisualDatasetInform",
+	],
 	"inference": [
 		"SamplingParams",
 		"vInference",
@@ -816,7 +824,15 @@ if _tp.TYPE_CHECKING:
 		TrainingArguments,
 		pack_sequences,
 	)
-	from .utils import traversals
+	from .utils import (
+		DataManager,
+		DatasetLoadError,
+		DatasetMixture,
+		DatasetType,
+		TextDatasetInform,
+		VisualDatasetInform,
+		traversals,
+	)
 	from .utils.parameters_transformation import (
 		module_to_huggingface_model,
 		module_to_torch,
