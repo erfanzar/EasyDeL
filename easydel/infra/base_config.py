@@ -345,22 +345,31 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		Returns:
 		    A jaxMesh
 		"""
+		sharding_axis_dims = (
+			[v for k, v in self.sharding_axis_dims.items()]
+			if isinstance(self.sharding_axis_dims, dict)
+			else self.sharding_axis_dims
+		)
+		sharding_axis_names = (
+			[v for k, v in self.sharding_axis_names.items()]
+			if isinstance(self.sharding_axis_names, dict)
+			else self.sharding_axis_names
+		)
+		sharding_dcn_axis_dims = (
+			[v for k, v in self.sharding_dcn_axis_dims.items()]
+			if isinstance(self.sharding_dcn_axis_dims, dict)
+			else self.sharding_dcn_axis_dims
+		)
 		return self.create_mesh(
-			sharding_axis_dims=(
-				[v for k, v in self.sharding_axis_dims.items()]
-				if isinstance(self.sharding_axis_dims, dict)
-				else self.sharding_axis_dims
-			),
-			sharding_axis_names=(
-				[v for k, v in self.sharding_axis_names.items()]
-				if isinstance(self.sharding_axis_names, dict)
-				else self.sharding_axis_names
-			),
-			sharding_dcn_axis_dims=(
-				[v for k, v in self.sharding_dcn_axis_dims.items()]
-				if isinstance(self.sharding_dcn_axis_dims, dict)
-				else self.sharding_dcn_axis_dims
-			),
+			sharding_axis_dims=tuple(sharding_axis_dims)
+			if sharding_axis_dims is not None
+			else sharding_axis_dims,
+			sharding_axis_names=tuple(sharding_axis_names)
+			if sharding_axis_names is not None
+			else sharding_axis_names,
+			sharding_dcn_axis_dims=tuple(sharding_dcn_axis_dims)
+			if sharding_dcn_axis_dims is not None
+			else sharding_dcn_axis_dims,
 			should_sort_granules_by_key=(
 				(
 					self.should_sort_granules_by_key

@@ -116,7 +116,7 @@ class DatasetMixture:
 	streaming: bool = True
 	text_target_field: str = "text"
 	image_target_field: str = "image"
-	batch_size: int = 32
+	batch_size: int = 1
 	shuffle_buffer_size: tp.Optional[int] = 1000
 	seed: tp.Optional[int] = 42
 

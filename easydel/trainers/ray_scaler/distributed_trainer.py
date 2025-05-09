@@ -16,6 +16,7 @@ import copy
 import glob
 import json
 import os
+import pathlib
 import typing as tp
 from functools import cached_property
 
@@ -124,6 +125,10 @@ class RayDistributedTrainer:
 	"""Default scaling variables for model configuration."""
 
 	CONFIG_VARIABLES: tp.Dict[str, tp.Any] = {
+		"dtype": jnp.bfloat16,
+		"param_dtype": jnp.bfloat16,
+		"precision": lax.Precision.HIGH,
+		"seed": 654,
 		"max_position_embeddings": 2**13,
 		"gradient_checkpointing": EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
 		"initializer_range": 0.02,
@@ -417,6 +422,12 @@ class RayDistributedTrainer:
 			rngs=nn.Rngs(seed),
 		)
 		model_instance = self.model_class
+		init_kwargs = copy.deepcopy(init_kwargs)
+
+		init_kwargs.pop("dtype", None)
+		init_kwargs.pop("param_dtype", None)
+		init_kwargs.pop("precision", None)
+		init_kwargs.pop("seed", None)
 
 		if lazy:
 			return model_instance.lazy_init(**init_kwargs)
@@ -438,6 +449,7 @@ class RayDistributedTrainer:
 	def load_state(
 		self,
 		load_directory: tp.Union[str, os.PathLike],
+		scaling_index,
 		**kwargs,
 	) -> EasyDeLState:
 		"""
@@ -450,13 +462,36 @@ class RayDistributedTrainer:
 		Returns:
 			The loaded EasyDeLState instance.
 		"""
-		checkpoint_files = glob.glob(os.path.join(load_directory, "run-*"))
-		checkpoint_files.sort(key=os.path.getmtime)
-		if len(checkpoint_files) != 0:
-			load_directory = checkpoint_files[-1]
+
+		def _create():
+			model = self.create_model(
+				config=self.create_config(scaling_index=scaling_index),
+				dtype=self.config_variables["dtype"],
+				param_dtype=self.config_variables["param_dtype"],
+				precision=self.config_variables["precision"],
+				seed=self.config_variables["seed"],
+			)
+			return self.state_class.create(step=0, model=model)
+
+		if pathlib.Path(load_directory).exists():
+			checkpoint_files = glob.glob(os.path.join(load_directory, "run-*"))
+			checkpoint_files.sort(key=os.path.getmtime)
+			if len(checkpoint_files) != 0:
+				load_directory = checkpoint_files[-1]
+			else:
+				load_directory = load_directory
+			if pathlib.Path(load_directory).exists():
+				try:
+					return self.state_class.load_state(load_directory=load_directory, **kwargs)
+				except Exception:
+					logger.info(
+						"failed to load from provided checkpoint path creating new model."
+					)
+					return _create()
+			else:
+				return _create()
 		else:
-			load_directory = load_directory
-		return self.state_class.load_state(load_directory=load_directory, **kwargs)
+			return _create()
 
 	def create_trainer(
 		self,
@@ -536,16 +571,12 @@ class RayDistributedTrainer:
 		scaling_index: int,
 		arguments: TrainingArguments,
 		dataset_train: Dataset,
-		dtype: jnp.dtype = jnp.bfloat16,
-		param_dtype: jnp.dtype = jnp.bfloat16,
-		precision: tp.Optional[lax.PrecisionLike] = None,
 		dataset_eval: tp.Optional[Dataset] = None,
 		data_collator: tp.Optional[tp.Callable] = None,
 		checkpoint_path: tp.Optional[tp.Union[str, os.PathLike]] = None,
 		model: tp.Optional[EasyDeLBaseModule] = None,
 		state: tp.Optional[EasyDeLState] = None,
 		load_state_kwargs: tp.Optional[tp.Dict[str, tp.Any]] = None,
-		seed: int = 684,
 	):
 		"""
 		Initializes a model (if not provided) and starts the training process.
@@ -555,9 +586,6 @@ class RayDistributedTrainer:
 				model needs to be created.
 			arguments: TrainingArguments for the trainer.
 			dataset_train: The training dataset.
-			dtype: Data type for model computations. Defaults to bfloat16.
-			param_dtype: Data type for model parameters. Defaults to bfloat16.
-			precision: JAX precision level. Defaults to `lax.Precision.HIGH`.
 			dataset_eval: Evaluation dataset (optional).
 			data_collator: Data collator function (optional).
 			checkpoint_path: Path to a checkpoint. Used if `model` and `state`
@@ -565,13 +593,10 @@ class RayDistributedTrainer:
 			model: An existing EasyDeLBaseModule instance (optional).
 			state: An existing EasyDeLState instance (optional).
 			load_state_kwargs: Arguments for loading state from checkpoint (optional).
-			seed: Random seed for model creation if needed. Defaults to 684.
 
 		Returns:
 			The result of the trainer's train() method.
 		"""
-		if precision is None:
-			precision = lax.Precision.HIGH
 
 		if state is None and model is None and checkpoint_path is None:
 			logger.info(
@@ -581,16 +606,20 @@ class RayDistributedTrainer:
 			config = self.create_config(scaling_index=scaling_index)
 			model = self.create_model(
 				config=config,
-				dtype=dtype,
-				param_dtype=param_dtype,
-				precision=precision,
-				seed=seed,
+				dtype=self.config_variables["dtype"],
+				param_dtype=self.config_variables["param_dtype"],
+				precision=self.config_variables["precision"],
+				seed=self.config_variables["seed"],
 			)
 			model = model.shard_model()
 		if checkpoint_path is not None:
 			if load_state_kwargs is None:
 				load_state_kwargs = self.config_variables
-			state = self.load_state(checkpoint_path, **load_state_kwargs)
+			state = self.load_state(
+				checkpoint_path,
+				scaling_index=scaling_index,
+				**load_state_kwargs,
+			)
 		trainer = self.create_trainer(
 			model=model,
 			state=state,
