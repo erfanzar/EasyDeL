@@ -371,7 +371,7 @@ if __name__ == "__main__":
 	a = jnp.astype(jr.randint(jr.key(3), (b, 1, qs, ks), 0, 4) > 2, "b1")
 	metadata = AttentionMetadata(
 		runtime_dtype=jnp.bfloat16,
-		base_config=EasyDeLBaseConfig(axis_dims=(1, 1, -1, 1)),
+		base_config=EasyDeLBaseConfig(sharding_axis_dims=(1, 1, -1, 1)),
 	)
 	attn = FlashAttn(metadata)
 	vanilla = VanillaAttn(metadata)

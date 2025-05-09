@@ -408,12 +408,15 @@ class BaseTrainer(BaseTrainerProtocol):
 			from eformer.escale import match_partition_rules
 
 			with self.model.mesh:
-				if self.arguments.init_tx:
+				if self.arguments.init_tx and self.model_state.opt_state is None:
 					self.model_state = self.model_state.init_tx(self.tx)
-
+				elif self.model_state.tx is None:
+					self.model_state = self.model_state.replace(tx=self.tx)
+					
 				shape = nn.eval_shape(lambda: self.model_state)
 				rules = self.model.config.get_partition_rules()
 				state_shardings = specs_to_name_sharding(match_partition_rules(rules, shape))
+				
 				self.state_shardings = state_shardings
 				self.model_state = self.model_state.shard_with_shape(state_shardings)
 

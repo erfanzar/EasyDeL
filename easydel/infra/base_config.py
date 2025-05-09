@@ -21,14 +21,17 @@ import chex
 import jax
 import jax.extend
 import jax.tree_util
+from eformer.common_types import NOT_GIVEN
 from eformer.escale import PartitionAxis, PartitionManager
 from eformer.pytree import auto_pytree
 from jax import numpy as jnp
+from jax.sharding import NamedSharding as Ns
+from jax.sharding import PartitionSpec as Ps
 from transformers.configuration_utils import PretrainedConfig
 
 from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.helpers import check_bool_flag, get_logger
-from jax.sharding import NamedSharding as Ns, PartitionSpec as Ps
+
 from .etils import (
 	AVAILABLE_ATTENTION_MECHANISMS,
 	DEFAULT_ATTENTION_MECHANISM,
@@ -37,7 +40,6 @@ from .etils import (
 	EasyDeLPlatforms,
 	EasyDeLQuantizationMethods,
 )
-from eformer.common_types import NOT_GIVEN
 
 if tp.TYPE_CHECKING:
 	from easydel.layers.rotary_embedding import RopeConfig
@@ -104,9 +106,9 @@ warnings.filterwarnings("ignore", message="Some donated buffers were not usable:
 
 
 class EasyDeLBaseConfigDict(tp.TypedDict, total=False):
-	axis_dims: tp.Sequence[int]
-	dcn_axis_dims: tp.Optional[tp.Sequence[int]]
-	axis_names: tp.Sequence[str]
+	sharding_axis_dims: tp.Sequence[int]
+	sharding_dcn_axis_dims: tp.Optional[tp.Sequence[int]]
+	sharding_axis_names: tp.Sequence[str]
 	attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS  # type:ignore
 	decode_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS  # type:ignore
 	blocksize_k: int
@@ -147,8 +149,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 	"""
 	Initialize the configuration for EasyDeL.
 	Args:
-	  axis_dims (tp.Sequence[int]): Dimensions of the axes. Default is (1, -1, 1, 1).
-	  axis_names (tp.Sequence[str]): Names of the axes. Default is ("dp", "fsdp", "tp", "sp").
+	  sharding_axis_dims (tp.Sequence[int]): Dimensions of the axes. Default is (1, -1, 1, 1).
+	  sharding_axis_names (tp.Sequence[str]): Names of the axes. Default is ("dp", "fsdp", "tp", "sp").
 	  attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS): Attention mechanism to use. Default is DEFAULT_ATTENTION_MECHANISM.
 		decode_attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS): Attention mechanism to use for decode phase. Default is None.
 	  blocksize_k (int): Block size for key. Default is 128.
@@ -192,9 +194,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
 	def __init__(
 		self,
-		axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
-		dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
-		axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
+		sharding_dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
+		sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
 		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = DEFAULT_ATTENTION_MECHANISM,
 		decode_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = None,
 		blocksize_k: int = 128,
@@ -232,9 +234,11 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		pallas_n_block_size: int = DEFAULT_PALLAS_N_BLOCK_SIZE,
 		**kwargs,
 	):
-		self.axis_dims = getattr(self, "axis_dims", axis_dims)
-		self.dcn_axis_dims = getattr(self, "dcn_axis_dims", dcn_axis_dims)
-		self.axis_names = getattr(self, "axis_names", axis_names)
+		self.sharding_axis_dims = getattr(self, "sharding_axis_dims", sharding_axis_dims)
+		self.sharding_dcn_axis_dims = getattr(
+			self, "sharding_dcn_axis_dims", sharding_dcn_axis_dims
+		)
+		self.sharding_axis_names = getattr(self, "sharding_axis_names", sharding_axis_names)
 		self.backend = getattr(
 			self,
 			"backend",
@@ -300,9 +304,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
 	@staticmethod
 	def create_mesh(
-		axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
-		axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
-		dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
+		sharding_axis_dims: tp.Sequence[int] = (1, -1, 1, 1),
+		sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
+		sharding_dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
 		process_is_granule: bool = False,
 		should_sort_granules_by_key: bool = True,
 		allow_split_physical_axes: bool = True,
@@ -320,9 +324,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 			backend = None
 
 		return create_mesh(
-			axis_dims=axis_dims,
-			axis_names=axis_names,
-			dcn_mesh_dims=dcn_axis_dims,
+			axis_dims=sharding_axis_dims,
+			axis_names=sharding_axis_names,
+			dcn_mesh_dims=sharding_dcn_axis_dims,
 			process_is_granule=process_is_granule,
 			should_sort_granules_by_key=should_sort_granules_by_key,
 			allow_split_physical_axes=allow_split_physical_axes,
@@ -332,7 +336,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 	@property
 	def mesh(self):
 		"""The mesh property is a helper property that creates a Mesh object from the
-		axis_dims and axis_names attributes of an object, which are assumed to be lists of integers and strings, respectively.
+		sharding_axis_dims and sharding_axis_names attributes of an object, which are assumed to be lists of integers and strings, respectively.
 		The platform attribute is also used if it exists.
 
 		Args:
@@ -342,20 +346,20 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		    A jaxMesh
 		"""
 		return self.create_mesh(
-			axis_dims=(
-				[v for k, v in self.axis_dims.items()]
-				if isinstance(self.axis_dims, dict)
-				else self.axis_dims
+			sharding_axis_dims=(
+				[v for k, v in self.sharding_axis_dims.items()]
+				if isinstance(self.sharding_axis_dims, dict)
+				else self.sharding_axis_dims
 			),
-			axis_names=(
-				[v for k, v in self.axis_names.items()]
-				if isinstance(self.axis_names, dict)
-				else self.axis_names
+			sharding_axis_names=(
+				[v for k, v in self.sharding_axis_names.items()]
+				if isinstance(self.sharding_axis_names, dict)
+				else self.sharding_axis_names
 			),
-			dcn_axis_dims=(
-				[v for k, v in self.dcn_axis_dims.items()]
-				if isinstance(self.dcn_axis_dims, dict)
-				else self.dcn_axis_dims
+			sharding_dcn_axis_dims=(
+				[v for k, v in self.sharding_dcn_axis_dims.items()]
+				if isinstance(self.sharding_dcn_axis_dims, dict)
+				else self.sharding_dcn_axis_dims
 			),
 			should_sort_granules_by_key=(
 				(
@@ -403,7 +407,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		Returns:
 		    The dimensions of the axes
 		"""
-		return self.axis_dims
+		return self.sharding_axis_dims
 
 	def get_axis_names(self) -> tp.Sequence[str]:
 		"""The get_axis_names function returns a list of the names of the axes.
@@ -414,7 +418,7 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		Returns:
 		    A list of the names of all axes
 		"""
-		return self.axis_names
+		return self.sharding_axis_names
 
 	def get_backend(self) -> str:
 		"""The get_backend function returns the backend that is currently being used.
@@ -434,9 +438,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
 	def read_basics_from_config(self, config: EasyDeLBaseConfig):
 		base_reads = [
-			"axis_dims",
-			"dcn_axis_dims",
-			"axis_names",
+			"sharding_axis_dims",
+			"sharding_dcn_axis_dims",
+			"sharding_axis_names",
 			"attn_mechanism",
 			"decode_attn_mechanism",
 			"blocksize_k",
@@ -477,9 +481,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
 	def add_basic_configurations(
 		self,
-		axis_dims: tp.Sequence[int] = NOT_GIVEN,
-		dcn_axis_dims: tp.Optional[tp.Sequence[int]] = NOT_GIVEN,
-		axis_names: tp.Sequence[str] = NOT_GIVEN,
+		sharding_axis_dims: tp.Sequence[int] = NOT_GIVEN,
+		sharding_dcn_axis_dims: tp.Optional[tp.Sequence[int]] = NOT_GIVEN,
+		sharding_axis_names: tp.Sequence[str] = NOT_GIVEN,
 		attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = NOT_GIVEN,
 		decode_attn_mechanism: AVAILABLE_ATTENTION_MECHANISMS = NOT_GIVEN,
 		blocksize_k: int = NOT_GIVEN,
@@ -519,8 +523,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 		It initializes all the attributes of an object, and it's called when you create a new instance of that class.
 
 		Args:
-		    axis_dims (tp.Sequence[int], optional): Specify the number of dimensions for each axis. Defaults to (1, -1, 1, 1).
-		    axis_names (tp.Sequence[str], optional): Set the names of the axes. Defaults to ("dp", "fsdp", "tp", "sp").
+		    sharding_axis_dims (tp.Sequence[int], optional): Specify the number of dimensions for each axis. Defaults to (1, -1, 1, 1).
+		    sharding_axis_names (tp.Sequence[str], optional): Set the names of the axes. Defaults to ("dp", "fsdp", "tp", "sp").
 		    attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS, optional): attention mechanism to use. Defaults to DEFAULT_ATTENTION_MECHANISM.
 				decode_attn_mechanism (AVAILABLE_ATTENTION_MECHANISMS): Attention mechanism to use for decode phase. Default is None.
 		    blocksize_k (int, optional): block size of key_states. Defaults to 128.
@@ -558,9 +562,9 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
 		"""
 		# fmt: off
-		set_attrs_smartly(self, "axis_dims", (1, -1, 1, 1), axis_dims)
-		set_attrs_smartly(self, "dcn_axis_dims", None, dcn_axis_dims)
-		set_attrs_smartly(self, "axis_names", ("dp", "fsdp", "tp", "sp"), axis_names)
+		set_attrs_smartly(self, "sharding_axis_dims", (1, -1, 1, 1), sharding_axis_dims)
+		set_attrs_smartly(self, "sharding_dcn_axis_dims", None, sharding_dcn_axis_dims)
+		set_attrs_smartly(self, "sharding_axis_names", ("dp", "fsdp", "tp", "sp"), sharding_axis_names)
 		set_attrs_smartly(self, "blocksize_q", 512, blocksize_q)
 		set_attrs_smartly(self, "blocksize_k", 512, blocksize_k)
 		set_attrs_smartly(self, "blocksize_b", 1, blocksize_b)
@@ -962,6 +966,8 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
 	@property
 	def partition_manager(self) -> PartitionManager:
+		if self.partition_axis is None:
+			self.partition_axis = PartitionAxis()
 		return PartitionManager(self.partition_axis)
 
 	__hash__ = hash_fn

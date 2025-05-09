@@ -335,7 +335,7 @@ if __name__ == "__main__":
 
 	metadata = AttentionMetadata(
 		runtime_dtype=jnp.bfloat16,
-		base_config=EasyDeLBaseConfig(axis_dims=(1, 1, 1, -1)),
+		base_config=EasyDeLBaseConfig(sharding_axis_dims=(1, 1, 1, -1)),
 	)
 
 	splash_attn = SplashAttn(metadata)

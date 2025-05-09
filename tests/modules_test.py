@@ -72,7 +72,7 @@ class EasyModelsTest(unittest.TestCase):
 		self.blocksize_q: int = 128
 		self.sequence_length = 1024
 		self.scan_mlp_chunk_size = self.sequence_length // 2
-		self.axis_dims = (1, 1, 1, -1)
+		self.sharding_axis_dims = (1, 1, 1, -1)
 		self.head_dim = self.hidden_size // self.num_attention_heads
 		self.use_parallel_residual = True
 		self.qk_layernorm = True
@@ -133,7 +133,7 @@ class EasyModelsTest(unittest.TestCase):
 			for k, v in extra_exec.items():
 				kwargs_easydel[k] = jnp.ones(v["shape"], dtype=getattr(jnp, v["dtype"]))
 				kwargs_torch[k] = torch.ones(v["shape"], dtype=getattr(torch, v["dtype"]))
-		config.axis_dims = self.axis_dims
+		config.sharding_axis_dims = self.sharding_axis_dims
 		config.pad_token_id = 0
 
 		hf_model = hf_module_class(config=copy.deepcopy(config))
@@ -359,7 +359,7 @@ class EasyModelsTest(unittest.TestCase):
 			n_heads=self.num_attention_heads,
 			n_layers=4,
 			attn_config=ed.MptAttentionConfig(),
-			axis_dims=(1, 1, 1, -1),
+			sharding_axis_dims=(1, 1, 1, -1),
 		)
 		res, err = self.create_test_for_models(
 			"mpt",
