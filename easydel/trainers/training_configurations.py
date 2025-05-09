@@ -481,6 +481,8 @@ class TrainingArguments:
 		)
 		if self.loss_config is None:
 			self.loss_config = LossConfig()
+		if isinstance(self.loss_config, dict):
+			self.loss_config = LossConfig(**self.loss_config)
 
 	@staticmethod
 	def _time_to_seconds(time_str: str) -> int:

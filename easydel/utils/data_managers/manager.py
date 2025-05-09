@@ -32,7 +32,7 @@ class DataManager:
 	"""Manager for handling datasets and their transformations."""
 
 	@staticmethod
-	def create_dataset_from_mixture(mixture: DatasetMixture):
+	def create_dataset_from_mixture(mixture: DatasetMixture) -> DS:
 		"""
 		Create a dataset from a mixture configuration.
 
