@@ -21,17 +21,17 @@ import typing as tp
 from functools import partial
 
 import jax
+import numpy as np
+from eformer import escale as es
+from eformer.escale.partition.constraints import AxisType
 from jax import Array, lax
 from jax import numpy as jnp
 from jax.experimental.shard_map import shard_map
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as Ps
-import numpy as np
-
-from eformer import escale as es
-from eformer.escale.partition.constraints import AxisType
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as Ps
 
 
-def calculate_mesh_dimension_size(axis_names: AxisType) -> int:
+def calculate_mesh_dimension_size(sharding_axis_names: AxisType) -> int:
 	"""
 	Calculates the total number of devices along the specified mesh dimension(s).
 
@@ -39,16 +39,16 @@ def calculate_mesh_dimension_size(axis_names: AxisType) -> int:
 	mesh dimension, providing the total size of the submesh defined by these axes.
 
 	Args:
-	    axis_names: A single mesh dimension name (str) or a sequence (list/tuple)
+	    sharding_axis_names: A single mesh dimension name (str) or a sequence (list/tuple)
 	               of mesh dimension names. For sequences, the order doesn't
 	               affect the result since multiplication is commutative.
 
 	Returns:
 	    int: The total number of devices in the submesh defined by the dimension(s).
-	         Returns 1 if axis_names is an empty sequence.
+	         Returns 1 if sharding_axis_names is an empty sequence.
 
 	Raises:
-	    TypeError: If axis_names is not a str or a sequence of str.
+	    TypeError: If sharding_axis_names is not a str or a sequence of str.
 
 	Examples:
 	    >>> calculate_mesh_dimension_size("data")  # Single dimension
@@ -56,43 +56,43 @@ def calculate_mesh_dimension_size(axis_names: AxisType) -> int:
 	    >>> calculate_mesh_dimension_size(["data", "model"])  # Multiple dimensions
 	    32
 	"""
-	if isinstance(axis_names, str):
+	if isinstance(sharding_axis_names, str):
 		# Size along a single axis dimension
-		return lax.psum(1, axis_name=axis_names)
-	elif isinstance(axis_names, (list, tuple)):
-		if not axis_names:
+		return lax.psum(1, axis_name=sharding_axis_names)
+	elif isinstance(sharding_axis_names, (list, tuple)):
+		if not sharding_axis_names:
 			return 1  # The size of a submesh with zero dimensions is 1
 
 		# Calculate the product of sizes along each specified axis
 		dimension_product = 1
-		for dimension in axis_names:
+		for dimension in sharding_axis_names:
 			dimension_product *= lax.psum(1, axis_name=dimension)
 		return dimension_product
 	else:
 		raise TypeError(
-			f"Input 'axis_names' must be a string or sequence (list/tuple), "
-			f"but got type {type(axis_names)}"
+			f"Input 'sharding_axis_names' must be a string or sequence (list/tuple), "
+			f"but got type {type(sharding_axis_names)}"
 		)
 
 
-def compute_device_linear_index(axis_names: AxisType) -> int:
+def compute_device_linear_index(sharding_axis_names: AxisType) -> int:
 	"""
 	Computes the linear index of the current device within the specified mesh dimensions.
 
 	This function flattens the multi-dimensional coordinates of the device within
-	the submesh defined by axis_names into a single integer index using row-major ordering.
+	the submesh defined by sharding_axis_names into a single integer index using row-major ordering.
 
 	Args:
-	    axis_names: A single mesh dimension name (str) or a sequence (list/tuple)
+	    sharding_axis_names: A single mesh dimension name (str) or a sequence (list/tuple)
 	               of mesh dimension names, ordered from major to minor dimensions.
 	               The order is important as it affects the resulting linear index.
 
 	Returns:
 	    int: The 0-based linear index of the current device within the submesh.
-	         Returns 0 if axis_names is an empty sequence.
+	         Returns 0 if sharding_axis_names is an empty sequence.
 
 	Raises:
-	    TypeError: If axis_names is not a str or a sequence of str.
+	    TypeError: If sharding_axis_names is not a str or a sequence of str.
 
 	Examples:
 	    >>> compute_device_linear_index("data")  # Single dimension
@@ -104,18 +104,18 @@ def compute_device_linear_index(axis_names: AxisType) -> int:
 	    The calculation assumes row-major ordering where the rightmost dimension
 	    varies fastest (similar to C-style arrays).
 	"""
-	if isinstance(axis_names, str):
+	if isinstance(sharding_axis_names, str):
 		# Index along a single axis dimension
-		return lax.axis_index(axis_name=axis_names)
-	elif isinstance(axis_names, (list, tuple)):
-		if not axis_names:
+		return lax.axis_index(axis_name=sharding_axis_names)
+	elif isinstance(sharding_axis_names, (list, tuple)):
+		if not sharding_axis_names:
 			return 0  # Index within a zero-dimensional submesh is 0
 
 		device_index = 0
 		stride = 1
 		# Iterate from the minor axis to the major axis (reverse of the input order)
 		# This implements row-major flattening: idx = sum(coord[dim] * stride[dim])
-		for dimension in reversed(axis_names):
+		for dimension in reversed(sharding_axis_names):
 			dimension_index = lax.axis_index(axis_name=dimension)
 			device_index += dimension_index * stride
 			# Update stride for the next (more major) dimension
@@ -124,8 +124,8 @@ def compute_device_linear_index(axis_names: AxisType) -> int:
 		return device_index
 	else:
 		raise TypeError(
-			f"Input 'axis_names' must be a string or sequence (list/tuple), "
-			f"but got type {type(axis_names)}"
+			f"Input 'sharding_axis_names' must be a string or sequence (list/tuple), "
+			f"but got type {type(sharding_axis_names)}"
 		)
 
 
@@ -155,8 +155,8 @@ def prepare_matrix_for_all_gather(
 	"""
 
 	def reshuffle_data(matrix: Array) -> Array:
-		device_idx = compute_device_linear_index(axis_names=partition_dims)
-		total_devices = calculate_mesh_dimension_size(axis_names=partition_dims)
+		device_idx = compute_device_linear_index(sharding_axis_names=partition_dims)
+		total_devices = calculate_mesh_dimension_size(sharding_axis_names=partition_dims)
 		chunk_size = matrix.shape[0] // total_devices
 		half_chunk_size = chunk_size // 2
 
@@ -220,8 +220,8 @@ def prepare_matrix_for_reduce_scatter(
 	"""
 
 	def reshuffle_data(matrix: Array) -> Array:
-		device_idx = compute_device_linear_index(axis_names=partition_dims)
-		total_devices = calculate_mesh_dimension_size(axis_names=partition_dims)
+		device_idx = compute_device_linear_index(sharding_axis_names=partition_dims)
+		total_devices = calculate_mesh_dimension_size(sharding_axis_names=partition_dims)
 		column_chunk_size = matrix.shape[1] // total_devices
 		half_column_chunk_size = column_chunk_size // 2
 
@@ -282,8 +282,8 @@ def perform_reduce_scatter_matmul(
 	    This implementation achieves better performance compared to naive distributed
 	    matrix multiplication by optimizing communication patterns.
 	"""
-	device_idx = compute_device_linear_index(axis_names=partition_dims)
-	total_devices = calculate_mesh_dimension_size(axis_names=partition_dims)
+	device_idx = compute_device_linear_index(sharding_axis_names=partition_dims)
+	total_devices = calculate_mesh_dimension_size(sharding_axis_names=partition_dims)
 	column_chunk_size = rhs.shape[1] // total_devices
 
 	# Start with the chunk one ahead of the current device
@@ -378,8 +378,8 @@ def perform_all_gather_matmul(
 	    This implementation achieves better performance compared to naive distributed
 	    matrix multiplication by optimizing communication patterns.
 	"""
-	device_idx = compute_device_linear_index(axis_names=partition_dims)
-	total_devices = calculate_mesh_dimension_size(axis_names=partition_dims)
+	device_idx = compute_device_linear_index(sharding_axis_names=partition_dims)
+	total_devices = calculate_mesh_dimension_size(sharding_axis_names=partition_dims)
 	row_chunk_size = rhs.shape[0] // total_devices
 
 	# Initialize result accumulator

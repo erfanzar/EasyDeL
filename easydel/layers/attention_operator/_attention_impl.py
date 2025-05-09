@@ -79,7 +79,7 @@ class AttentionMetadata:
 	    runtime_softmax_dtype: Optional JAX dtype for the softmax computation,
 	        allowing for higher precision if needed (e.g., float32).
 	    sequence_axis_name: The name used for the sequence axis in JAX parallelism
-	        (axis_names for pjit).
+	        (sharding_axis_names for pjit).
 	    mesh: The JAX device mesh for distributed computation. Must be provided
 	        or inferred from context.
 	    platform: The target hardware platform (e.g., TPU, GPU).

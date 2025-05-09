@@ -510,9 +510,9 @@ class EasyBridgeMixin(PushToHubMixin):
 		)
 		config_kwargs = {} if config_kwargs is None else config_kwargs
 		config.add_basic_configurations(
-			axis_dims=sharding_axis_dims,
-			dcn_axis_dims=sharding_dcn_axis_dims,
-			axis_names=sharding_axis_names,
+			sharding_axis_dims=sharding_axis_dims,
+			sharding_dcn_axis_dims=sharding_dcn_axis_dims,
+			sharding_axis_names=sharding_axis_names,
 			partition_axis=partition_axis,
 			backend=backend,
 			platform=platform,
@@ -735,9 +735,9 @@ class EasyBridgeMixin(PushToHubMixin):
 			config_class.attach_custom_arguments()
 		config_kwargs = {} if config_kwargs is None else config_kwargs
 		config_class.add_basic_configurations(
-			axis_dims=sharding_axis_dims,
-			dcn_axis_dims=sharding_dcn_axis_dims,
-			axis_names=sharding_axis_names,
+			sharding_axis_dims=sharding_axis_dims,
+			sharding_dcn_axis_dims=sharding_dcn_axis_dims,
+			sharding_axis_names=sharding_axis_names,
 			partition_axis=partition_axis,
 			backend=backend,
 			platform=platform,

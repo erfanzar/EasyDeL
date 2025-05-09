@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import copy
+import glob
+import json
 import os
 import typing as tp
 from functools import cached_property
@@ -22,6 +24,7 @@ from eformer.escale import PartitionAxis
 from flax import nnx as nn
 from jax import lax
 from jax import numpy as jnp
+from pydantic import BaseModel
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
 from easydel.infra import (
@@ -35,6 +38,10 @@ from easydel.layers.attention import AttentionMechanisms
 from easydel.modules.auto.auto_configuration import get_modules_by_type
 from easydel.utils.helpers import get_logger
 
+from ...utils.checkpoint_managers.streamer import (
+	DTYPE_TO_STRING_MAP,
+	STRING_TO_DTYPE_MAP,
+)
 from ..base_trainer import BaseTrainer
 from ..trainer.trainer import Trainer
 from ..training_configurations import TrainingArguments
@@ -45,6 +52,36 @@ else:
 	Dataset = tp.Any
 
 logger = get_logger("RayTrainer")
+
+
+class RayDistributedConfig(BaseModel):
+	pretrained_model_name_or_path: str
+	model_task: tp.Optional[TaskType] = None
+	model_type: tp.Optional[str] = None
+	config_scaling_variables: tp.Optional[tp.Dict[str, int]] = None
+	config_variables: tp.Optional[tp.Dict[str, tp.Any]] = None
+
+	def _saveing_preprocess(self):
+		for k, v in list(self.config_variables.items()):
+			if v in STRING_TO_DTYPE_MAP.values():
+				self.config_variables[k] = DTYPE_TO_STRING_MAP[v]
+
+		for k, v in list(self.config_scaling_variables.items()):
+			if v in STRING_TO_DTYPE_MAP.values():
+				self.config_scaling_variables[k] = DTYPE_TO_STRING_MAP[v]
+
+	def _loading_postprocess(self):
+		for k, v in list(self.config_variables.items()):
+			if v in DTYPE_TO_STRING_MAP.values():
+				self.config_variables[k] = STRING_TO_DTYPE_MAP[v]
+
+		for k, v in list(self.config_scaling_variables.items()):
+			if v in DTYPE_TO_STRING_MAP.values():
+				self.config_scaling_variables[k] = STRING_TO_DTYPE_MAP[v]
+		if "partition_axis" in self.config_variables.keys():
+			paxis = self.config_variables["partition_axis"]
+			if not isinstance(paxis, PartitionAxis):
+				self.config_variables["partition_axis"] = PartitionAxis(**paxis)
 
 
 class RayDistributedTrainer:
@@ -94,6 +131,7 @@ class RayDistributedTrainer:
 		"attn_mechanism": AttentionMechanisms.AUTO,
 		"attn_dtype": jnp.bfloat16,
 		"attn_softmax_dtype": jnp.bfloat16,
+		"sharding_axis_dims": (1, -1, 1, 1),
 	}
 	"""Default fixed variables for model configuration."""
 
@@ -183,6 +221,40 @@ class RayDistributedTrainer:
 
 		self.state_class = state_class if state_class is not None else EasyDeLState
 		self.trainer_module = trainer_module if trainer_module is not None else Trainer
+
+	@classmethod
+	def from_config(
+		cls,
+		path: tp.Union[str, os.PathLike],
+		model_class: tp.Optional[tp.Type[EasyDeLBaseModule]] = None,
+		state_class: tp.Optional[tp.Type[EasyDeLState]] = None,
+		trainer_module: tp.Optional[tp.Type[BaseTrainer | Trainer]] = None,
+	):
+		config = RayDistributedConfig(**json.load(open(path, "r")))
+
+		config._loading_postprocess()
+
+		return cls(
+			pretrained_model_name_or_path=config.pretrained_model_name_or_path,
+			model_task=config.model_task,
+			model_type=config.model_type,
+			config_scaling_variables=config.config_scaling_variables,
+			config_variables=config.config_variables,
+			trainer_module=trainer_module,
+			state_class=state_class,
+			model_class=model_class,
+		)
+
+	def save_config(self, path: tp.Union[str, os.PathLike]):
+		config = RayDistributedConfig(
+			pretrained_model_name_or_path=self.pretrained_model_name_or_path,
+			model_task=self.model_task,
+			model_type=self.model_type,
+			config_scaling_variables=self.config_scaling_variables,
+			config_variables=self.config_variables,
+		)
+		config._saveing_preprocess()
+		open(path, "w").write(config.model_dump_json(indent=2))
 
 	def load_processor(self) -> PreTrainedTokenizer:
 		"""
@@ -378,6 +450,12 @@ class RayDistributedTrainer:
 		Returns:
 			The loaded EasyDeLState instance.
 		"""
+		checkpoint_files = glob.glob(os.path.join(load_directory, "run-*"))
+		checkpoint_files.sort(key=os.path.getmtime)
+		if len(checkpoint_files) != 0:
+			load_directory = checkpoint_files[-1]
+		else:
+			load_directory = load_directory
 		return self.state_class.load_state(load_directory=load_directory, **kwargs)
 
 	def create_trainer(
@@ -509,7 +587,10 @@ class RayDistributedTrainer:
 				seed=seed,
 			)
 			model = model.shard_model()
-
+		if checkpoint_path is not None:
+			if load_state_kwargs is None:
+				load_state_kwargs = self.config_variables
+			state = self.load_state(checkpoint_path, **load_state_kwargs)
 		trainer = self.create_trainer(
 			model=model,
 			state=state,

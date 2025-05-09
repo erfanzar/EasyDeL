@@ -21,11 +21,13 @@ import jax.experimental
 import jax.experimental.multihost_utils
 import jax.numpy as jnp
 import msgpack
-import safetensors
+import numpy
+from eformer.jaximus import implicit
 from flax.serialization import to_bytes, to_state_dict
 from flax.struct import PyTreeNode
+from safetensors import flax as safe_flax
 from tqdm import tqdm
-from eformer.jaximus import implicit
+
 from easydel.utils.helpers import get_logger
 
 from ..traversals import flatten_dict, is_flatten, unflatten_dict
@@ -50,6 +52,40 @@ ALLOWED_DATA_TYPES = [
 	jnp.float_,
 ]
 
+STRING_TO_DTYPE_MAP = {
+	"bf16": jnp.bfloat16,
+	"bfloat16": jnp.bfloat16,
+	"fp16": jnp.float16,
+	"float16": jnp.float16,
+	"fp32": jnp.float32,
+	"float32": jnp.float32,
+	"fp64": jnp.float64,
+	"float64": jnp.float64,
+	"fp8": jnp.float8_e5m2,
+	"fp8_e4m3fn": jnp.float8_e4m3fn,
+	"fp8_e4m3fnuz": jnp.float8_e4m3fnuz,
+	"fp8_e4m3b11fnuz": jnp.float8_e4m3b11fnuz,
+	"fp8_e5m2": jnp.float8_e5m2,
+	"fp8_e5m2fnuz": jnp.float8_e5m2fnuz,
+	"float8_e4m3fn": jnp.float8_e4m3fn,
+	"float8_e4m3fnuz": jnp.float8_e4m3fnuz,
+	"float8_e4m3b11fnuz": jnp.float8_e4m3b11fnuz,
+	"float8_e5m2": jnp.float8_e5m2,
+	"float8_e5m2fnuz": jnp.float8_e5m2fnuz,
+}
+DTYPE_TO_STRING_MAP = {
+	jnp.bfloat16: "bf16",
+	jnp.float16: "fp16",
+	jnp.float32: "fp32",
+	jnp.float64: "fp64",
+	jnp.float8_e5m2: "fp8",
+	jnp.float8_e4m3fn: "fp8_e4m3fn",
+	jnp.float8_e4m3fnuz: "fp8_e4m3fnuz",
+	jnp.float8_e4m3b11fnuz: "fp8_e4m3b11fnuz",
+	jnp.float8_e5m2: "fp8_e5m2",
+	jnp.float8_e5m2fnuz: "fp8_e5m2fnuz",
+}
+
 
 @implicit
 def put_dtype(
@@ -70,29 +106,8 @@ def put_dtype(
 		return array
 
 	if isinstance(dtype, str):
-		dtype_map = {
-			"bf16": jnp.bfloat16,
-			"bfloat16": jnp.bfloat16,
-			"fp16": jnp.float16,
-			"float16": jnp.float16,
-			"fp32": jnp.float32,
-			"float32": jnp.float32,
-			"fp64": jnp.float64,
-			"float64": jnp.float64,
-			"fp8": jnp.float8_e5m2,
-			"fp8_e4m3fn": jnp.float8_e4m3fn,
-			"fp8_e4m3fnuz": jnp.float8_e4m3fnuz,
-			"fp8_e4m3b11fnuz": jnp.float8_e4m3b11fnuz,
-			"fp8_e5m2": jnp.float8_e5m2,
-			"fp8_e5m2fnuz": jnp.float8_e5m2fnuz,
-			"float8_e4m3fn": jnp.float8_e4m3fn,
-			"float8_e4m3fnuz": jnp.float8_e4m3fnuz,
-			"float8_e4m3b11fnuz": jnp.float8_e4m3b11fnuz,
-			"float8_e5m2": jnp.float8_e5m2,
-			"float8_e5m2fnuz": jnp.float8_e5m2fnuz,
-		}[dtype]
 		try:
-			dtype = dtype_map[dtype]
+			dtype = STRING_TO_DTYPE_MAP[dtype]
 		except KeyError as e:
 			raise ValueError(f"Unsupported dtype string: {dtype}") from e
 
@@ -182,7 +197,7 @@ class CheckpointManager:
 		Returns:
 			A tuple containing the loaded state dictionary and metadata.
 		"""
-		with safetensors.safe_open(path, framework="flax") as f:
+		with safe_flax.safe_open(path, framework="flax") as f:
 			metadata = f.metadata()
 			keys = list(f.keys())
 
@@ -248,10 +263,8 @@ class CheckpointManager:
 			path = "/dev/null"
 		state = to_state_dict(state)
 		gather_mismatch_count = 0
-
 		if not is_flatten(state):
 			state = flatten_dict(state, sep=".")
-
 		if gather_fns:
 			pbar_gather = tqdm(
 				list(state.keys()),
@@ -278,16 +291,18 @@ class CheckpointManager:
 					pbar_gather.set_postfix(gather_mismatch=gather_mismatch_count)
 					pbar_gather.update(1)
 
-		state = {
-			key: put_dtype(
-				jax.device_get(jnp.array(value)) if not isinstance(value, jax.Array) else value,
+		def _gather(x):
+			return put_dtype(
+				jax.device_get(jnp.array(x)) if not isinstance(x, (jax.Array)) else x,
 				float_dtype,
 			)
-			for key, value in state.items()
-			if value is not None
-		}
 
-		safetensors.flax.save_file(tensors=state, filename=path, metadata=metadata)
+		state = jax.tree_util.tree_map(
+			_gather,
+			state,
+			is_leaf=lambda x: isinstance(x, (jax.Array, numpy.generic, float, int)),
+		)
+		safe_flax.save_file(tensors=state, filename=path, metadata=metadata)
 		return path
 
 	@staticmethod

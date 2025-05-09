@@ -493,7 +493,7 @@ if __name__ == "__main__":
 	cu_mask = VanillaAttn._create_causal_mask(qs)[None, None, :, :].repeat(b, 0)
 	metadata = AttentionMetadata(
 		runtime_dtype=jnp.bfloat16,
-		base_config=EasyDeLBaseConfig(axis_dims=(1, 1, 1, -1)),
+		base_config=EasyDeLBaseConfig(sharding_axis_dims=(1, 1, 1, -1)),
 		blocksize_k=128,
 		blocksize_q=128,
 		backend="cpu",

@@ -136,9 +136,9 @@ class AutoEasyDeLConfig:
 			config.attach_custom_arguments()
 
 		config.add_basic_configurations(
-			axis_dims=sharding_axis_dims,
-			dcn_axis_dims=sharding_dcn_axis_dims,
-			axis_names=sharding_axis_names,
+			sharding_axis_dims=sharding_axis_dims,
+			sharding_dcn_axis_dims=sharding_dcn_axis_dims,
+			sharding_axis_names=sharding_axis_names,
 			partition_axis=partition_axis,
 			backend=backend,
 			platform=platform,
