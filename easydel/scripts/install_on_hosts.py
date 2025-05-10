@@ -12,7 +12,6 @@ Usage:
 Options:
     --tpu-type     TPU pod slice type (e.g. v4-16, v3-8)
     --source       Installation source: 'pypi' for PyPI package or 'github' for latest from GitHub
-    --num-tpu-hosts Override default host count for TPU type
 
 Example:
     python -m easydel.scripts.install_on_hosts --tpu-type v4-16 --source github
@@ -36,63 +35,8 @@ Example:
 import argparse
 import sys
 
-try:
-	import ray
-	from eformer.escale import tpexec as tpx
-except ImportError as e:
-	print(f"Error: Failed to import Ray or TPExecutor: {e}")
-	print(
-		"Please ensure Ray and the required 'eformer' library are installed and configured."
-	)
-	sys.exit(1)
-
-
-DEFAULT_KNOWN_TPU_TYPES = {
-	# TPU v2 Pod Slices
-	"v2-8": 1,
-	"v2-32": 4,
-	"v2-64": 8,
-	"v2-128": 16,
-	"v2-256": 32,
-	"v2-512": 64,
-	# TPU v3 Pod Slices
-	"v3-8": 1,
-	"v3-32": 4,
-	"v3-64": 8,
-	"v3-128": 16,
-	"v3-256": 32,
-	"v3-512": 64,
-	"v3-1024": 128,
-	"v3-2048": 256,
-	# TPU v4 Pod Slices
-	"v4-8": 1,
-	"v4-16": 2,
-	"v4-32": 4,
-	"v4-64": 8,
-	"v4-128": 16,
-	"v4-256": 32,
-	"v4-512": 64,
-	"v4-1024": 128,
-	"v4-2048": 256,
-	"v4-4096": 512,
-	# TPU v5e (Lite Efficiency) - Host counts can vary more here based on chips/host
-	"v5e-4": 1,
-	"v5e-8": 1,
-	"v5e-16": 2,
-	"v5e-32": 4,
-	"v5e-64": 8,
-	"v5e-128": 16,
-	"v5e-256": 32,
-	# TPU v5p (Performance)
-	"v5p-8": 1,
-	"v5p-16": 2,
-	"v5p-32": 4,
-	"v5p-64": 8,
-	"v5p-128": 16,
-	"v5p-256": 32,
-}
-
-# --- Ray Remote Functions ---
+import ray
+from eformer.executor.ray import execute, TpuAcceleratorConfig
 
 
 @ray.remote
@@ -110,13 +54,13 @@ def install_easydel_on_pods_pypi():
 		"https://download.pytorch.org/whl/cpu -qU"
 	)
 	print(f"Node {node_id}: Installation from PyPI complete.")
-	return True  # Indicate success
+	return True 
 
 
 @ray.remote
 def install_easydel_on_pods_github():
 	"""Installs EasyDel[tf] from GitHub head and other dependencies on Ray nodes."""
-	import os  # Import within the function
+	import os 
 
 	node_id = ray.get_runtime_context().get_node_id()
 	print(f"Node {node_id}: Installing EasyDel from GitHub head...")
@@ -131,7 +75,7 @@ def install_easydel_on_pods_github():
 		"https://download.pytorch.org/whl/cpu -qU"
 	)
 	print(f"Node {node_id}: Installation from GitHub head complete.")
-	return True  # Indicate success
+	return True
 
 
 def main():
@@ -151,19 +95,7 @@ def main():
 		"--tpu-type", type=str, default="v4-16", help="The type of TPU pod slice to use."
 	)
 
-	parser.add_argument(
-		"--num-tpu-hosts",
-		type=int,
-		default=None,
-		help=(
-			"Optional host counts (e.g., 2,8,16). "
-			"If provided, this overrides the internal default mapping."
-		),
-	)
-
 	args = parser.parse_args()
-
-	known_tpu_types = DEFAULT_KNOWN_TPU_TYPES
 
 	if args.source == "github":
 		install_func = install_easydel_on_pods_github
@@ -175,26 +107,14 @@ def main():
 	tpu_type = args.tpu_type
 	print(f"Selected TPU type: {tpu_type}")
 
-	if args.num_tpu_hosts is None:
-		num_hosts = known_tpu_types[tpu_type]
-	print(f"Determined number of hosts for {tpu_type}: {num_hosts}")
-
+	print(f"Determined number of hosts for {tpu_type}")
+	config = TpuAcceleratorConfig(tpu_version=tpu_type)
 	try:
 		print("Initializing Ray...")
 		ray.init("auto")
 		print(f"Ray initialized successfully. Cluster resources: {ray.cluster_resources()}")
-		print(
-			f"\nExecuting installation function on "
-			f"{num_hosts} host(s) of type '{tpu_type}' via TPUExecutor..."
-		)
 
-		results = ray.get(
-			tpx.TPUExecutor.execute(
-				install_func,
-				tpu_type=tpu_type,
-				num_hosts=num_hosts,
-			)
-		)
+		results = ray.get(execute(config)(install_func)())
 		print(
 			"\nExecution command sent. Waiting for remote tasks "
 			"(TPUExecutor might block or manage this)..."
