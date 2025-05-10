@@ -57,13 +57,13 @@ EasyDeL supports distributed execution with Ray, particularly for multi-host and
 For a 2x v4-64 TPU setup, run:
 
 ```shell
-eopod run "python -m eformer.escale.tpexec.tpu_patcher --tpu-version TPU-VERSION --tpu-slice TPU-SLICES --num-slices NUM_SLICES --internal-ips INTERNAL_IP1-SLICE1,INTERNAL_IP2-SLICE1,INTERNAL_IP3-SLICE1,INTERNAL_IP4-SLICE1,INTERNAL_IP1-SLICE2,INTERNAL_IP2-SLICE2,INTERNAL_IP3-SLICE2,INTERNAL_IP4-SLICE2 --self-job"
+eopod run "python -m eformer.executor.tpu_patch_ray --tpu-version TPU-VERSION --tpu-slice TPU-SLICES --num-slices NUM_SLICES --internal-ips INTERNAL_IP1-SLICE1,INTERNAL_IP2-SLICE1,INTERNAL_IP3-SLICE1,INTERNAL_IP4-SLICE1,INTERNAL_IP1-SLICE2,INTERNAL_IP2-SLICE2,INTERNAL_IP3-SLICE2,INTERNAL_IP4-SLICE2 --self-job"
 ```
 
 For a v4-256 TPU:
 
 ```shell
-eopod run "python -m eformer.escale.tpexec.tpu_patcher --tpu-version v4 --tpu-slice 256 --num-slices 1 --internal-ips <comma-separated-TPU-IPs> --self-job"
+eopod run "python -m eformer.executor.tpu_patch_ray --tpu-version v4 --tpu-slice 256 --num-slices 1 --internal-ips <comma-separated-TPU-IPs> --self-job"
 ```
 
 ## Usage Example
