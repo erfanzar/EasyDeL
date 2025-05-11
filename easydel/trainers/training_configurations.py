@@ -720,9 +720,10 @@ class TrainingArguments:
 					try:
 						wandb_metrics[key] = (
 							self._create_wandb_histogram(value)
-							if isinstance(value, (list, tuple, np.generic, jax.Array))
+							if isinstance(value, (float, int, list, tuple, np.generic, jax.Array))
 							else value
 						)
+						wandb_metrics = {k: v for k, v in wandb_metrics.items() if v is not None}
 					except Exception as e:
 						warnings.warn(f"Failed to log metric {key} to wandb: {e}", stacklevel=3)
 				try:
@@ -781,14 +782,16 @@ class TrainingArguments:
 					value = value.astype(np.float32)
 				value = value.astype(np.float16)
 				return wandb.Histogram(value)
-			if isinstance(value, tuple):
-				if len(value) == 2:
-					histogram = wandb.Histogram(
-						np_histogram=(value[0][0], value[1][0]),
-						num_bins=64,
-					)
-				return histogram
-			return wandb.Histogram(value)
+			if hasattr(value, "__len__"):
+				if isinstance(value, tuple):
+					if len(value) == 2:
+						histogram = wandb.Histogram(
+							np_histogram=(value[0][0], value[1][0]),
+							num_bins=64,
+						)
+					return histogram
+				return wandb.Histogram(value)
+			return value
 		except Exception as e:
 			warnings.warn(f"Failed to create wandb histogram: {e}", stacklevel=1)
 			return None
