@@ -868,7 +868,10 @@ class EasyDeLBaseModule(
 			)
 		return self
 
-	def to_state(self) -> EasyDeLState:
+	def to_state(
+		self,
+		state_class: tp.Optional[tp.Type[EasyDeLState]] = None,
+	) -> EasyDeLState:
 		"""
 		Converts the current module instance into an `EasyDeLState` object.
 
@@ -878,9 +881,18 @@ class EasyDeLBaseModule(
 		Returns:
 		    EasyDeLState: An EasyDeLState object representing the current model state.
 		"""
-		from easydel.infra.base_state import EasyDeLState
+		if state_class is None:
+			from easydel.infra.base_state import EasyDeLState
 
-		return EasyDeLState.create(step=0, model=self)
+			state_class = EasyDeLState
+
+		@partial(jax.jit, donate_argnums=(1, 2), static_argnums=(0,))
+		def _create_state(gstruct, gstate, gother):
+			return state_class.create(self.merge_module(gstruct, gstate, gother))
+
+		state = _create_state(*self.split_module())
+		state_class = state.model
+		return state
 
 	def to_torch(self, **kwargs):
 		"""
