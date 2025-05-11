@@ -114,6 +114,8 @@ class RayDistributedTrainer:
 	model_class: tp.Type[EasyDeLBaseModule]
 	state_class: tp.Type[EasyDeLState]
 
+	offload_device: str
+
 	trainer_module: tp.Type[BaseTrainer | Trainer]
 
 	CONFIG_SCALING_VARIABLES: tp.Dict[str, int] = {
@@ -150,6 +152,7 @@ class RayDistributedTrainer:
 		model_type: tp.Optional[str] = None,
 		model_class: tp.Optional[tp.Type[EasyDeLBaseModule]] = None,
 		state_class: tp.Optional[tp.Type[EasyDeLState]] = None,
+		offload_device: tp.Optional[str] = None,
 		trainer_module: tp.Optional[tp.Type[BaseTrainer | Trainer]] = None,
 		config_scaling_variables: tp.Optional[tp.Dict[str, int]] = None,
 		config_variables: tp.Optional[tp.Dict[str, tp.Any]] = None,
@@ -223,7 +226,7 @@ class RayDistributedTrainer:
 
 		self.model_task = model_task
 		self.model_type = model_type
-
+		self.offload_device = offload_device if offload_device is not None else "cpu"
 		self.state_class = state_class if state_class is not None else EasyDeLState
 		self.trainer_module = trainer_module if trainer_module is not None else Trainer
 
@@ -444,7 +447,9 @@ class RayDistributedTrainer:
 		Returns:
 			An EasyDeLState instance containing the model's parameters and state.
 		"""
-		return self.state_class.create(step=0, model=model)
+		state = model.to_state(self.state_class)
+		state = state.shard_state()
+		return state
 
 	def load_state(
 		self,
