@@ -562,6 +562,8 @@ class RayDistributedTrainer:
 			"A state must be available (from model, checkpoint, or direct input) to create a trainer."
 		)
 
+		state = state.shard_state()
+		del model  # free mem
 		return self.trainer_module(
 			arguments=arguments,
 			dataset_train=dataset_train,
@@ -608,15 +610,13 @@ class RayDistributedTrainer:
 				f"No model, state, or checkpoint provided. Creating a new model "
 				f"with scaling_index={scaling_index}."
 			)
-			config = self.create_config(scaling_index=scaling_index)
 			model = self.create_model(
-				config=config,
+				config=self.create_config(scaling_index=scaling_index),
 				dtype=self.config_variables["dtype"],
 				param_dtype=self.config_variables["param_dtype"],
 				precision=self.config_variables["precision"],
 				seed=self.config_variables["seed"],
-			)
-			model = model.shard_model()
+			).shard_model()
 		if checkpoint_path is not None:
 			if load_state_kwargs is None:
 				load_state_kwargs = self.config_variables
@@ -625,7 +625,8 @@ class RayDistributedTrainer:
 				scaling_index=scaling_index,
 				**load_state_kwargs,
 			)
-		trainer = self.create_trainer(
+
+		return self.create_trainer(
 			model=model,
 			state=state,
 			arguments=arguments,
@@ -634,8 +635,7 @@ class RayDistributedTrainer:
 			data_collator=data_collator,
 			checkpoint_path=checkpoint_path,
 			load_state_kwargs=load_state_kwargs,
-		)
-		return trainer.train()
+		).train()
 
 	def __repr__(self):
 		cls_name = self.__class__.__name__
