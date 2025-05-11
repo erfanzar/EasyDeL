@@ -888,7 +888,10 @@ class EasyDeLBaseModule(
 
 		@partial(jax.jit, donate_argnums=(1, 2), static_argnums=(0,))
 		def _create_state(gstruct, gstate, gother):
-			return state_class.create(self.merge_module(gstruct, gstate, gother))
+			return state_class.create(
+				step=0,
+				model=self.merge_module(gstruct, gstate, gother),
+			)
 
 		state = _create_state(*self.split_module())
 		state_class = state.model
