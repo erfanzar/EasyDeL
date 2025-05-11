@@ -375,6 +375,20 @@ class TrainingArguments:
 		metadata={"help": "log weight distribution every X steps."},
 	)
 
+	_can_log_metrics: tp.Optional[bool] = None
+
+	@property
+	def can_log_metrics(self):
+		if self._can_log_metrics is None:
+			if self.is_process_zero and not self.log_all_workers:
+				return False
+			return self.report_metrics
+		return self._can_log_metrics
+
+	@can_log_metrics.setter
+	def can_log_metrics(self, val):
+		self._can_log_metrics = val
+
 	@property
 	def offload_device(self):
 		return jax.devices(self.offload_device_type)[self.offload_device_index]
@@ -420,7 +434,6 @@ class TrainingArguments:
 		Sets up JAX distributed training based on the chosen backend and sharding configuration.
 		Determines the number of available devices and sets up the device mesh.
 		"""
-		self.available_backends = len(jax.devices(self.backend))
 
 		JaxDistributedConfig.initialize(self.jax_distributed_config)
 
@@ -456,14 +469,7 @@ class TrainingArguments:
 			self.use_wandb = False
 		if self.report_metrics and self.performance_mode:
 			logger.info("Metrics reporting disabled due to performance mode")
-			self.report_metrics = False
-		if self.report_metrics:
-			if not self.is_process_zero and not self.log_all_workers:
-				logger.info(
-					"Metrics reporting disabled and it's only working on process index 0 or "
-					"admin process (`log_all_workers` is `False`)."
-				)
-				self.report_metrics = False
+			self._can_log_metrics = False
 
 	def _ensure_variables(self):
 		"""
@@ -610,7 +616,7 @@ class TrainingArguments:
 		Returns:
 		    tp.Optional[wandb.sdk.wandb_run.Run]: The WandB run object if initialized, else None.
 		"""
-		if self.report_metrics:
+		if self.can_log_metrics:
 			if not self.use_wandb or wandb is None:
 				warnings.warn(
 					"you have used `use_wandb=True` but you haven't install wandb.",
@@ -647,7 +653,7 @@ class TrainingArguments:
 		  step (int): The current training step or iteration.
 		"""
 
-		if self.report_metrics:
+		if self.can_log_metrics:
 			filtered_metrics = {k: v for k, v in metrics.items() if v is not None}
 			metrics = {
 				self._restructure_metric_name(k): get_safe_arr(v)
@@ -817,7 +823,12 @@ class TrainingArguments:
 				[`PretrainedConfig`]: The configuration object instantiated from that JSON file.
 
 		"""
+
 		config_dict = cls._dict_from_json_file(json_file)
+		return cls.load_from_json(config_dict)
+
+	@classmethod
+	def load_from_json(cls, config_dict):
 		if "trainer_config_class" in config_dict.keys():
 			import easydel as ed
 

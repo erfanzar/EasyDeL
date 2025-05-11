@@ -631,3 +631,21 @@ class RayDistributedTrainer:
 			load_state_kwargs=load_state_kwargs,
 		)
 		return trainer.train()
+
+	def __repr__(self):
+		cls_name = self.__class__.__name__
+		items = []
+
+		for k, v in self.__dict__.items():
+			if not k.startswith("_"):
+				try:
+					repr_str = str(v).replace("\n", "\n  ")
+					if len(repr_str) > 200:
+						repr_str = f"{v.__class__.__name__}(...)"
+					items.append(f"  {k} : {repr_str}")
+				except TypeError:
+					items.append(f"  {k} : <unrepresentable>")
+
+		return f"{cls_name}(\n" + "\n".join(items) + "\n)"
+
+	__str__ = __repr__
