@@ -49,7 +49,7 @@ uvloop = "0.21.0"
 uvicorn = "^0.32.0"
 jinja2 = ">=3.1.5"
 datasets = ">=3.3.2"
-gcsfs = ">=2025.3.2"
+gcsfs = "*"
 zstandard = ">=0.23.0"
 
 tensorflow-datasets = { version = ">=4.9.6", optional = true }
