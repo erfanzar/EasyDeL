@@ -166,6 +166,7 @@ class vSurgeApiServer:
 			top_p=float(request.top_p),
 			min_p=float(request.min_p),
 			suppress_tokens=request.suppress_tokens,
+			stop=request.stop,
 		)
 
 	async def completions(self, request: CompletionRequest):
