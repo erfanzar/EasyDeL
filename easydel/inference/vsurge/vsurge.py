@@ -73,9 +73,13 @@ class vSurgeRequest:
 
 	prompt: str
 	max_tokens: int
+
 	top_p: float = 1.0
 	top_k: int = 0
 	min_p: float = 0.0
+
+	stop: tp.Optional[tp.Union[str, tp.List[str]]] = None
+
 	temperature: float = 0.7
 	presence_penalty: float = 0.0
 	frequency_penalty: float = 0.0
@@ -84,13 +88,19 @@ class vSurgeRequest:
 	is_client_side_tokenization: bool = False
 
 	@classmethod
-	def from_sampling_params(cls, prompt: str, sampling_params: SamplingParams):
+	def from_sampling_params(
+		cls,
+		prompt: str,
+		sampling_params: SamplingParams,
+		stop: tp.Optional[tp.Union[str, tp.List[str]]] = None,
+	):
 		return vSurgeRequest(
 			prompt=prompt,
 			max_tokens=sampling_params.max_tokens,
 			top_p=sampling_params.top_p,
 			top_k=sampling_params.top_k,
 			min_p=sampling_params.min_p,
+			stop=stop,
 			temperature=sampling_params.temperature,
 			presence_penalty=sampling_params.presence_penalty,
 			frequency_penalty=sampling_params.frequency_penalty,
@@ -364,11 +374,14 @@ class vSurge:
 		)
 		samples = []
 		for sample_responses in current_response_with_flushed_buffer:
+			
 			text = []
 			token_ids = []
+			
 			latest_response = sample_responses[-1]
 			tps = latest_response.tokens_per_second
 			num_gen_tokens = latest_response.num_generated_tokens
+			
 			for resp in sample_responses:
 				text.extend(resp.text)
 				token_ids.extend(resp.token_ids)
@@ -376,6 +389,8 @@ class vSurge:
 				ReturnSample(
 					text=text_tokens_to_string(text),
 					token_ids=token_ids,
+					accumulated_text=latest_response.accumulated_text[-1],
+					time_spent_computing=latest_response.time_spent_computing,
 					tokens_per_second=tps,
 					num_generated_tokens=num_gen_tokens,
 				)
@@ -417,6 +432,7 @@ class vSurge:
 			top_p=request.top_p,
 			top_k=request.top_k,
 			min_p=request.min_p,
+			stop=request.stop,
 			temperature=request.temperature,
 			presence_penalty=request.presence_penalty,
 			frequency_penalty=request.frequency_penalty,
@@ -451,6 +467,8 @@ class vSurge:
 				ReturnSample(
 					text=[],
 					token_ids=[],
+					accumulated_text=s.accumulated_text,
+					time_spent_computing=s.time_spent_computing,
 					tokens_per_second=s.tokens_per_second,
 					num_generated_tokens=s.num_generated_tokens,
 				)

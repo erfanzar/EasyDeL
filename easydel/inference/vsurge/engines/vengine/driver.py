@@ -590,13 +590,11 @@ class vDriver(AbstractDriver):
 			if data is None:
 				break
 			if isinstance(data[0], ResultTokens):
-				# Handling the very first token from prefill
 				request_first_token, request, _ = data
 				request_first_token = request_first_token.convert_to_numpy()
-				# Process the first token, but TPS/count are not meaningful yet
 				results_base, complete, num_valid_tokens_list = process_result_tokens(
 					processor=processor,
-					slot=0,  # Prefill result is always at slot 0 conceptually
+					slot=0,
 					slot_max_length=request.max_tokens,
 					result_tokens=request_first_token,
 					eos_token_id=my_decode_engine.eos_token_ids,
@@ -604,16 +602,17 @@ class vDriver(AbstractDriver):
 					complete=request.complete,
 				)
 				request.complete = complete
-				# Add placeholder metrics for the first token
 				final_results = []
 				for res_base, num_valid in zip(results_base, num_valid_tokens_list):
-					# Start tracking total generated tokens from the first valid one
+					request.accumulated_text = res_base.text
 					request.total_generated_tokens += num_valid
 					final_results.append(
 						ReturnSample(
 							text=res_base.text,
 							token_ids=res_base.token_ids,
-							tokens_per_second=0.0,  # Not applicable yet
+							time_spent_computing=0.0,
+							accumulated_text=request.accumulated_text,
+							tokens_per_second=0.0,
 							num_generated_tokens=request.total_generated_tokens,
 						)
 					)
@@ -626,13 +625,12 @@ class vDriver(AbstractDriver):
 				logger.info(f"TTFT duration: {first_token_return_time}ms")
 
 			elif isinstance(data[1], ResultTokens):
-				# Handling subsequent decode steps
 				generate_timestep_added, result_tokens = data
 				result_tokens = result_tokens.convert_to_numpy()
 
 				for slot, request in my_live_requests.items():
 					if request is not None:
-						# Start timer on the first actual decode step for this request
+						request: ActiveRequest = request
 						if request.decode_start_time is None:
 							request.decode_start_time = time.perf_counter()
 
@@ -645,12 +643,20 @@ class vDriver(AbstractDriver):
 							is_client_side_tokenization=request.is_client_side_tokenization,
 							complete=request.complete,
 						)
-
 						request.complete = complete
 						elapsed_time = time.perf_counter() - request.decode_start_time
 						final_step_results = []
-
 						for res_base, num_valid in zip(results_base, num_valid_tokens_list):
+							if len(res_base.text) > 0:
+								for idx, (accum, res) in enumerate(
+									zip(request.accumulated_text, res_base.text)
+								):
+									request.accumulated_text[idx] = accum + res
+							if request.stop is not None:
+								for stop_sign in request.stop:
+									for idx, accum in enumerate(request.accumulated_text):
+										if stop_sign in accum:
+											request.complete[idx] = True
 							request.total_generated_tokens += num_valid
 							tps = (
 								request.total_generated_tokens / elapsed_time
@@ -661,6 +667,8 @@ class vDriver(AbstractDriver):
 								ReturnSample(
 									text=res_base.text,
 									token_ids=res_base.token_ids,
+									time_spent_computing=elapsed_time,
+									accumulated_text=request.accumulated_text,
 									tokens_per_second=tps,
 									num_generated_tokens=request.total_generated_tokens,
 								)

@@ -431,15 +431,13 @@ class oDriver(AbstractDriver):
 				request.decode_start_time = None
 				request.total_generated_tokens = 0
 				self.loginfo(f"Processed prefill token for request {request.id}.")
+				ted = self.processor.decode(summary.prefill_token_id, skip_special_tokens=True)
+				request.accumulated_text = [ted]
 				request.enqueue_samples(
 					[
 						ReturnSample(
-							text=[
-								self.processor.decode(
-									summary.prefill_token_id,
-									skip_special_tokens=True,
-								)
-							],
+							text=[ted],
+							accumulated_text=request.accumulated_text,
 							token_ids=[summary.prefill_token_id],
 							tokens_per_second=0.0,  # TPS is not applicable for the single prefill token
 							num_generated_tokens=1,  # Count the prefill token
@@ -477,23 +475,30 @@ class oDriver(AbstractDriver):
 				# Start timer on the first actual decode step for this request
 				if request.decode_start_time is None:
 					request.decode_start_time = time.perf_counter()
-					self.loginfo(f"Started decode timing for request {request.id} at slot {slot}.")
+					self.loginfo(
+						f"Started decode timing for request {request.id} at slot {slot}."
+					)
 
 				request.total_generated_tokens += 1
 				elapsed_time = time.perf_counter() - request.decode_start_time
 				tokens_per_second = (
 					request.total_generated_tokens / elapsed_time if elapsed_time > 1e-6 else 0.0
 				)
+				ted = self.processor.decode(
+					summary.decodes_token_ids[slot], skip_special_tokens=True
+				)
 
+				request.accumulated_text[0] += ted
+				if request.stop is not None:
+					for stop_sign in request.stop:
+						if stop_sign in request.accumulated_text[0]:
+							request.complete = True
+							summary.decodes_completes[slot] = True
 				request.enqueue_samples(
 					[
 						ReturnSample(
-							text=[
-								self.processor.decode(
-									summary.decodes_token_ids[slot],
-									skip_special_tokens=True,
-								)
-							],
+							text=[ted],
+							accumulated_text=request.accumulated_text,
 							token_ids=[summary.decodes_token_ids[slot]],
 							tokens_per_second=tokens_per_second,
 							num_generated_tokens=request.total_generated_tokens,
@@ -501,15 +506,12 @@ class oDriver(AbstractDriver):
 					],
 				)
 
-				# Check if the decode for this request is complete
 				if slot < len(summary.decodes_completes) and summary.decodes_completes[slot]:
 					self.loginfo(
 						f"Decode complete for request {request.id} in slot {slot}. Closing channel and releasing semaphore."
 					)
-					# Mark the request as complete, close its channel, and release the semaphore
 					request.complete = True
 					request.return_channel.close()
 					self._max_allowed_requests.release()
-					# Remove the completed request from the active requests map
 					if request_id in self._active_requests_map:
 						del self._active_requests_map[request_id]
