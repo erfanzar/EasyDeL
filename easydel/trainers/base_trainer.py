@@ -98,7 +98,6 @@ class BaseTrainer(BaseTrainerProtocol):
 		dataset_eval: tp.Optional[Dataset] = None,
 		data_collator: tp.Optional[tp.Callable] = None,
 		finetune: bool = True,
-		checkpoint_path: tp.Optional[tp.Union[str, os.PathLike]] = None,
 		**deprecated_kwargs,
 	):
 		assert arguments is not None, "training argument must be passed to Trainers."
@@ -116,7 +115,6 @@ class BaseTrainer(BaseTrainerProtocol):
 		self.dataset_eval = dataset_eval
 		self.data_collator = data_collator
 		self.finetune = finetune
-		self.checkpoint_path = checkpoint_path
 		self._initialize_attributes()
 		self.initialize_trainer_utils()
 
@@ -357,7 +355,7 @@ class BaseTrainer(BaseTrainerProtocol):
 		"""
 		with self.timer("configure dataloaders"):
 			manager = (
-				jax.default_device(jax.devices(self.arguments.offload_device))
+				jax.default_device(jax.local_devices(backend=self.arguments.offload_device)[-1])
 				if self.arguments.offload_dataset
 				else contextlib2.nullcontext()
 			)
@@ -412,11 +410,11 @@ class BaseTrainer(BaseTrainerProtocol):
 					self.model_state = self.model_state.init_tx(self.tx)
 				elif self.model_state.tx is None:
 					self.model_state = self.model_state.replace(tx=self.tx)
-					
+
 				shape = nn.eval_shape(lambda: self.model_state)
 				rules = self.model.config.get_partition_rules()
 				state_shardings = specs_to_name_sharding(match_partition_rules(rules, shape))
-				
+
 				self.state_shardings = state_shardings
 				self.model_state = self.model_state.shard_with_shape(state_shardings)
 
@@ -741,6 +739,7 @@ class BaseTrainer(BaseTrainerProtocol):
 			return {
 				"platform": jax.local_devices()[0].platform.upper(),
 				"device_count": jax.device_count(),
+				"host_device_count": jax.local_device_count(),
 			}
 		except Exception as e:
 			logger.error(f"Error getting device info: {str(e)}")

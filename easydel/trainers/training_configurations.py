@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import datetime
 import functools
 import json
 import os
@@ -358,6 +359,10 @@ class TrainingArguments:
 		default=None,
 		metadata={"help": "The Weights & Biases entity."},
 	)
+	wandb_name: tp.Optional[str] = field(
+		default=None,
+		metadata={"help": "The Weights & Biases run name."},
+	)
 	warmup_steps: int = field(
 		default=0,
 		metadata={"help": "The number of warmup steps for the learning rate scheduler."},
@@ -380,7 +385,7 @@ class TrainingArguments:
 	@property
 	def can_log_metrics(self):
 		if self._can_log_metrics is None:
-			if self.is_process_zero and not self.log_all_workers:
+			if not self.is_process_zero and not self.log_all_workers:
 				return False
 			return self.report_metrics
 		return self._can_log_metrics
@@ -623,11 +628,18 @@ class TrainingArguments:
 					stacklevel=1,
 				)
 				return None
+			wandb_name = self.wandb_name
+
+			if wandb_name is None:
+				_time = datetime.datetime.now().strftime("%Y%m%d")
+				wandb_name = f"{self.model_name.lower()}-{_time}"
 
 			return wandb.init(
 				project=f"EasyDeL-{self.model_name}",
 				config=self.to_dict(),
-				tags=["EasyDeL", "JAX/Flax"],
+				save_code=True,
+				name=wandb_name,
+				tags=["EasyDeL", "Jax", "Train", "LLM", "VLM"],
 				entity=self.wandb_entity,
 			)
 		return None

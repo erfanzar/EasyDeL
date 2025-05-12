@@ -59,6 +59,7 @@ class RayDistributedConfig(BaseModel):
 	pretrained_model_name_or_path: str
 	model_task: tp.Optional[TaskType] = None
 	model_type: tp.Optional[str] = None
+	offload_device: tp.Optional[str] = None
 	config_scaling_variables: tp.Optional[tp.Dict[str, int]] = None
 	config_variables: tp.Optional[tp.Dict[str, tp.Any]] = None
 
@@ -248,6 +249,7 @@ class RayDistributedTrainer:
 			model_type=config.model_type,
 			config_scaling_variables=config.config_scaling_variables,
 			config_variables=config.config_variables,
+			offload_device=config.offload_device,
 			trainer_module=trainer_module,
 			state_class=state_class,
 			model_class=model_class,
@@ -258,6 +260,7 @@ class RayDistributedTrainer:
 			pretrained_model_name_or_path=self.pretrained_model_name_or_path,
 			model_task=self.model_task,
 			model_type=self.model_type,
+			offload_device=self.offload_device,
 			config_scaling_variables=self.config_scaling_variables,
 			config_variables=self.config_variables,
 		)
@@ -431,11 +434,11 @@ class RayDistributedTrainer:
 		init_kwargs.pop("param_dtype", None)
 		init_kwargs.pop("precision", None)
 		init_kwargs.pop("seed", None)
-
-		if lazy:
-			return model_instance.lazy_init(**init_kwargs)
-		else:
-			return model_instance(**init_kwargs)
+		with jax.default_device(jax.local_devices(backend=self.offload_device)[-1]):
+			if lazy:
+				return model_instance.lazy_init(**init_kwargs)
+			else:
+				return model_instance(**init_kwargs)
 
 	def convert_model_to_state(self, model: EasyDeLBaseModule) -> EasyDeLState:
 		"""
@@ -505,7 +508,7 @@ class RayDistributedTrainer:
 			param_dtype=self.config_variables["param_dtype"],
 			precision=self.config_variables["precision"],
 			seed=self.config_variables["seed"],
-		).shard_model()
+		)
 
 	def create_trainer(
 		self,
@@ -587,19 +590,25 @@ class RayDistributedTrainer:
 				f"No model, state, or checkpoint provided. Creating a new model "
 				f"with scaling_index={scaling_index}."
 			)
-			state = self.convert_model_to_state(self.create_model_from_config(scaling_index))
+			model = self.create_model_from_config(scaling_index=scaling_index)
+			state = self.convert_model_to_state(model)
 		elif checkpoint_path is not None:
-			if load_state_kwargs is None:
-				load_state_kwargs = self.config_variables
+			load_state_kwargs = (
+				self.config_variables if load_state_kwargs is None else load_state_kwargs
+			)
 			state = self.load_state(checkpoint_path, scaling_index, **load_state_kwargs)
 		elif model is not None:
 			state = self.convert_model_to_state(model)
+
+		del model
+		assert state is not None, "Couldn't load or verify state."
+
 		return self.create_trainer(
-			state=state,
 			arguments=arguments,
 			dataset_train=dataset_train,
 			dataset_eval=dataset_eval,
-			data_collator=data_collator, 
+			data_collator=data_collator,
+			state=state,
 		).train()
 
 	def __repr__(self):
