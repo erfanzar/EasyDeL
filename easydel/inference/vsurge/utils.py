@@ -32,6 +32,7 @@ from jax import numpy as jnp
 
 if tp.TYPE_CHECKING:
 	from easydel.infra.utils import ProcessingClassType
+
 	from .engines._utils import ResultTokens
 else:
 	ProcessingClassType = tp.Any
@@ -61,8 +62,10 @@ class ReturnSample:
 	                        sample since the start of the decode phase. Optional.
 	"""
 
-	text: list[str] | str
-	token_ids: list[int]
+	text: tp.Union[str, tp.List[str]]
+	token_ids: tp.List[int]
+	time_spent_computing: float = 0.0
+	accumulated_text: tp.Union[str, tp.List[str]] = None
 	tokens_per_second: float | None = dataclasses.field(default=None)
 	num_generated_tokens: int | None = dataclasses.field(default=None)
 
@@ -180,9 +183,13 @@ class ActiveRequest:
 
 	max_tokens: int
 	return_channel: AsyncMultifuture[list[ReturnSample]]
+
 	top_p: float = 1.0
 	top_k: int = 0
 	min_p: float = 0.0
+
+	stop: tp.Optional[tp.Union[str, tp.List[str]]] = None
+
 	temperature: float = 0.7
 	presence_penalty: float = 0.0
 	frequency_penalty: float = 0.0
@@ -198,6 +205,13 @@ class ActiveRequest:
 	metadata: ActiveRequestMetadata = field(default_factory=ActiveRequestMetadata)
 
 	id: str = field(default_factory=uuid.uuid4)
+
+	accumulated_text: tp.Optional[tp.Union[str, tp.List[str]]] = None
+
+	def __post_init__(self):
+		if self.stop is not None:
+			if isinstance(self.stop, str):
+				self.stop = [self.stop]
 
 	def enqueue_samples(self, generated_samples: list[ReturnSample]):
 		"""Adds the generated sample(s) to return channel for current step.
