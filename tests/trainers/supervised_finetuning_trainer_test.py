@@ -121,8 +121,6 @@ def main():
 		logging.warning("No GPU found, using CPU.")
 		devices = jax.devices("cpu")
 
-	jax.default_device(devices[0])
-
 	model, tokenizer = create_model_and_tokenizer()
 	train_dataset, eval_dataset = create_datasets()
 	sft_config = create_sft_config()

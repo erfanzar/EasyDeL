@@ -21,17 +21,15 @@ if tp.TYPE_CHECKING:
 else:
 	EasyDeLState = tp.Any
 
+CallFN: tp.TypeAlias = tp.Any | tp.Mapping[str, tp.Callable] | tp.Dict[str, tp.Callable]
+
 
 @auto_pytree
 class TrainerOutput:
 	state: EasyDeLState
 	mesh: tp.Optional[jax.sharding.Mesh]
 	checkpoint_manager: tp.Any
-	gather_fns: tp.Optional[
-		tp.Any | tp.Mapping[str, tp.Callable] | tp.Dict[str, tp.Callable]
-	] = None
-	shard_fns: tp.Optional[
-		tp.Any | tp.Mapping[str, tp.Callable] | tp.Dict[str, tp.Callable]
-	] = None
+	gather_fns: tp.Optional[CallFN] = None
+	shard_fns: tp.Optional[CallFN] = None
 	last_save_file_name: tp.Optional[str] = None
 	checkpoint_path: tp.Optional[str] = None

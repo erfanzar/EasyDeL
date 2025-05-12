@@ -34,11 +34,6 @@ if _check_bool_flag("EASYDEL_AUTO", True):
 	_getlogger("jax._src.mesh_utils").setLevel(30)
 	_getlogger("datasets").setLevel(30)
 
-	# Taking care of some optional GPU FLAGs
-	_os.environ["JAX_COMPILATION_CACHE_DIR"] = _os.getenv(
-		"JAX_COMPILATION_CACHE_DIR",
-		"/tmp/jax_cache",
-	)
 	_os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 	_os.environ["KMP_AFFINITY"] = "noverbose"
 	_os.environ["GRPC_VERBOSITY"] = "3"
@@ -848,7 +843,7 @@ else:
 		extra_objects={"__version__": __version__},
 	)
 
-	_targeted_versions = ["0.0.37"]
+	_targeted_versions = ["0.0.38"]
 
 	from eformer import __version__ as _eform_version
 

@@ -59,6 +59,7 @@ class RayDistributedConfig(BaseModel):
 	pretrained_model_name_or_path: str
 	model_task: tp.Optional[TaskType] = None
 	model_type: tp.Optional[str] = None
+	offload_device: tp.Optional[str] = None
 	config_scaling_variables: tp.Optional[tp.Dict[str, int]] = None
 	config_variables: tp.Optional[tp.Dict[str, tp.Any]] = None
 
@@ -248,6 +249,7 @@ class RayDistributedTrainer:
 			model_type=config.model_type,
 			config_scaling_variables=config.config_scaling_variables,
 			config_variables=config.config_variables,
+			offload_device=config.offload_device,
 			trainer_module=trainer_module,
 			state_class=state_class,
 			model_class=model_class,
@@ -258,6 +260,7 @@ class RayDistributedTrainer:
 			pretrained_model_name_or_path=self.pretrained_model_name_or_path,
 			model_task=self.model_task,
 			model_type=self.model_type,
+			offload_device=self.offload_device,
 			config_scaling_variables=self.config_scaling_variables,
 			config_variables=self.config_variables,
 		)
@@ -431,11 +434,11 @@ class RayDistributedTrainer:
 		init_kwargs.pop("param_dtype", None)
 		init_kwargs.pop("precision", None)
 		init_kwargs.pop("seed", None)
-
-		if lazy:
-			return model_instance.lazy_init(**init_kwargs)
-		else:
-			return model_instance(**init_kwargs)
+		with jax.default_device(jax.local_devices(backend=self.offload_device)[-1]):
+			if lazy:
+				return model_instance.lazy_init(**init_kwargs)
+			else:
+				return model_instance(**init_kwargs)
 
 	def convert_model_to_state(self, model: EasyDeLBaseModule) -> EasyDeLState:
 		"""
@@ -498,16 +501,22 @@ class RayDistributedTrainer:
 		else:
 			return _create()
 
+	def create_model_from_config(self, scaling_index: int):
+		return self.create_model(
+			config=self.create_config(scaling_index=scaling_index),
+			dtype=self.config_variables["dtype"],
+			param_dtype=self.config_variables["param_dtype"],
+			precision=self.config_variables["precision"],
+			seed=self.config_variables["seed"],
+		)
+
 	def create_trainer(
 		self,
 		arguments: TrainingArguments,
 		dataset_train: Dataset,
 		dataset_eval: tp.Optional[Dataset] = None,
 		data_collator: tp.Optional[tp.Callable] = None,
-		checkpoint_path: tp.Optional[tp.Union[str, os.PathLike]] = None,
-		model: tp.Optional[EasyDeLBaseModule] = None,
 		state: tp.Optional[EasyDeLState] = None,
-		load_state_kwargs: tp.Optional[tp.Dict[str, tp.Any]] = None,
 	) -> BaseTrainer | Trainer:
 		"""
 		Creates and configures a trainer instance.
@@ -523,11 +532,7 @@ class RayDistributedTrainer:
 			data_collator: Callable to collate data batches (optional).
 			checkpoint_path: Path to a checkpoint to load model state from.
 				If `model` or `state` is provided, this is ignored.
-			model: An initialized EasyDeLBaseModule. If provided, it's converted
-				to a state. Ignored if `state` is provided.
 			state: An EasyDeLState object. If provided, this is used directly.
-			load_state_kwargs: Additional arguments for `load_state` if
-				loading from `checkpoint_path`.
 
 		Returns:
 			An instance of the configured trainer (BaseTrainer or Trainer).
@@ -538,29 +543,6 @@ class RayDistributedTrainer:
 			FileNotFoundError: If `checkpoint_path` is provided but the
 				checkpoint is not found.
 		"""
-		if load_state_kwargs is None:
-			load_state_kwargs = {}
-
-		if state is None:
-			if model is not None:
-				logger.info("Converting provided model to state.")
-				state = self.convert_model_to_state(model=model)
-			elif checkpoint_path is not None:
-				logger.info(f"Loading state from checkpoint: {checkpoint_path}")
-				try:
-					state = self.load_state(load_directory=checkpoint_path, **load_state_kwargs)
-				except FileNotFoundError as e:
-					logger.error(f"Failed to load checkpoint from {checkpoint_path}: {e}")
-					raise e
-		elif checkpoint_path is not None and (model is not None or state is not None):
-			logger.warning(
-				f"Checkpoint path {checkpoint_path} provided but will be ignored as "
-				"model or state is already specified.",
-			)
-
-		assert state is not None, (
-			"A state must be available (from model, checkpoint, or direct input) to create a trainer."
-		)
 
 		return self.trainer_module(
 			arguments=arguments,
@@ -608,34 +590,27 @@ class RayDistributedTrainer:
 				f"No model, state, or checkpoint provided. Creating a new model "
 				f"with scaling_index={scaling_index}."
 			)
-			config = self.create_config(scaling_index=scaling_index)
-			model = self.create_model(
-				config=config,
-				dtype=self.config_variables["dtype"],
-				param_dtype=self.config_variables["param_dtype"],
-				precision=self.config_variables["precision"],
-				seed=self.config_variables["seed"],
+			model = self.create_model_from_config(scaling_index=scaling_index)
+			state = self.convert_model_to_state(model)
+		elif checkpoint_path is not None:
+			load_state_kwargs = (
+				self.config_variables if load_state_kwargs is None else load_state_kwargs
 			)
-			model = model.shard_model()
-		if checkpoint_path is not None:
-			if load_state_kwargs is None:
-				load_state_kwargs = self.config_variables
-			state = self.load_state(
-				checkpoint_path,
-				scaling_index=scaling_index,
-				**load_state_kwargs,
-			)
-		trainer = self.create_trainer(
-			model=model,
-			state=state,
+			state = self.load_state(checkpoint_path, scaling_index, **load_state_kwargs)
+			state = state.shard_state()
+		elif model is not None:
+			state = self.convert_model_to_state(model)
+
+		del model
+		assert state is not None, "Couldn't load or verify state."
+
+		return self.create_trainer(
 			arguments=arguments,
 			dataset_train=dataset_train,
 			dataset_eval=dataset_eval,
 			data_collator=data_collator,
-			checkpoint_path=checkpoint_path,
-			load_state_kwargs=load_state_kwargs,
-		)
-		return trainer.train()
+			state=state,
+		).train()
 
 	def __repr__(self):
 		cls_name = self.__class__.__name__
