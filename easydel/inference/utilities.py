@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import typing as tp
 from dataclasses import field
 from functools import cached_property
 
@@ -69,7 +70,8 @@ class SamplingParams:
 	top_p: float = 1.0
 	top_k: int = 0
 	min_p: float = 0.0
-	suppress_tokens: list[int] = field(default_factory=lambda: list())
+	suppress_tokens: tp.List[int] = field(default_factory=lambda: list())
+	stop: tp.Optional[tp.Union[tp.List[str], str]] = field(default=None)
 
 	def __post_init__(self):
 		self.suppress_tokens = []  # not supported yet!

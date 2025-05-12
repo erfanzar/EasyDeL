@@ -88,19 +88,14 @@ class vSurgeRequest:
 	is_client_side_tokenization: bool = False
 
 	@classmethod
-	def from_sampling_params(
-		cls,
-		prompt: str,
-		sampling_params: SamplingParams,
-		stop: tp.Optional[tp.Union[str, tp.List[str]]] = None,
-	):
+	def from_sampling_params(cls, prompt: str, sampling_params: SamplingParams):
 		return vSurgeRequest(
 			prompt=prompt,
 			max_tokens=sampling_params.max_tokens,
 			top_p=sampling_params.top_p,
 			top_k=sampling_params.top_k,
 			min_p=sampling_params.min_p,
-			stop=stop,
+			stop=sampling_params.stop,
 			temperature=sampling_params.temperature,
 			presence_penalty=sampling_params.presence_penalty,
 			frequency_penalty=sampling_params.frequency_penalty,
@@ -374,14 +369,13 @@ class vSurge:
 		)
 		samples = []
 		for sample_responses in current_response_with_flushed_buffer:
-			
 			text = []
 			token_ids = []
-			
+
 			latest_response = sample_responses[-1]
 			tps = latest_response.tokens_per_second
 			num_gen_tokens = latest_response.num_generated_tokens
-			
+
 			for resp in sample_responses:
 				text.extend(resp.text)
 				token_ids.extend(resp.token_ids)
@@ -398,8 +392,7 @@ class vSurge:
 		return samples
 
 	async def complete(
-		self,
-		request: vSurgeRequest,
+		self, request: vSurgeRequest
 	) -> tp.AsyncGenerator[tp.List[ReturnSample]]:
 		"""Initiates and streams the results of a text completion request.
 
