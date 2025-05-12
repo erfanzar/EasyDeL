@@ -597,6 +597,7 @@ class RayDistributedTrainer:
 				self.config_variables if load_state_kwargs is None else load_state_kwargs
 			)
 			state = self.load_state(checkpoint_path, scaling_index, **load_state_kwargs)
+			state = state.shard_state()
 		elif model is not None:
 			state = self.convert_model_to_state(model)
 

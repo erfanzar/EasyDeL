@@ -631,7 +631,7 @@ class TrainingArguments:
 			wandb_name = self.wandb_name
 
 			if wandb_name is None:
-				_time = datetime.datetime.now().strftime("%Y%m%d")
+				_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 				wandb_name = f"{self.model_name.lower()}-{_time}"
 
 			return wandb.init(
