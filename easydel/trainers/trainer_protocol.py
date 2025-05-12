@@ -146,8 +146,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 		model: EasyDeLBaseModule,
 		dataset_train: tp.Optional[Dataset] = None,
 		dataset_eval: tp.Optional[Dataset] = None,
-		finetune: bool = True,
-		checkpoint_path: tp.Optional[tp.Union[str, os.PathLike]] = None,
+		finetune: bool = True, 
 	):
 		"""
 		Initializes the trainer.

@@ -136,7 +136,6 @@ def main(use_iterable_dataset: bool = True):
 	if not devices:
 		logging.warning("No GPU found, using CPU.")
 		devices = jax.devices("cpu")
-	jax.default_device(devices[0])
 
 	model = create_model()
 	train_dataset = create_dummy_dataset(
