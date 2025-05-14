@@ -123,6 +123,7 @@ _import_structure = {
 		"LossConfig",
 		"PartitionAxis",
 		"PyTree",
+		"Rngs",
 		"auto_pytree",
 		"escale",
 	],
@@ -489,6 +490,7 @@ if _tp.TYPE_CHECKING:
 		LossConfig,
 		PartitionAxis,
 		PyTree,
+		Rngs,
 		auto_pytree,
 		escale,
 	)

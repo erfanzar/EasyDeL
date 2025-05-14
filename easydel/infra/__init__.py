@@ -15,6 +15,7 @@
 from eformer import escale
 from eformer.escale import PartitionAxis
 from eformer.pytree import PyTree, auto_pytree
+from flax.nnx import Rngs
 
 from .base_config import EasyDeLBaseConfig, EasyDeLBaseConfigDict
 from .base_module import EasyDeLBaseModule
@@ -29,6 +30,7 @@ __all__ = (
 	"LossConfig",
 	"PartitionAxis",
 	"PyTree",
+	"Rngs",
 	"auto_pytree",
 	"escale",
 )

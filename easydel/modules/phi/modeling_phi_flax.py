@@ -378,7 +378,7 @@ class PhiAttention(AttentionModule):
 		) = self.concatenate(
 			query=query_states,
 			key=key_states,
-			value=value_states, 
+			value=value_states,
 			cache_view=cache_view,
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,

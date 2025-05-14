@@ -1,6 +1,8 @@
 import os
 import sys
 
+from easydel.infra.loss_utils import LossConfig
+
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 # Local imports (assuming easydel is in parent directory or installed)
 dirname = os.path.dirname(os.path.abspath(__file__))
@@ -104,6 +106,7 @@ def create_training_args(
 	training_args = ed.TrainingArguments(
 		save_directory="tmp-files",
 		model_name="TrainerTest",
+		loss_config=LossConfig(z_loss=0.0008),
 		num_train_epochs=NUM_TRAIN_EPOCHS,
 		total_batch_size=TOTAL_BATCH_SIZE,
 		gradient_accumulation_steps=2,
@@ -120,6 +123,8 @@ def create_training_args(
 		save_steps=SAVE_STEPS,
 		save_total_limit=5,
 		save_optimizer_state=True,
+		per_epoch_training_steps=NUM_TRAIN_EXAMPLES,
+		per_epoch_evaluation_steps=NUM_TRAIN_EXAMPLES,
 		# training_time_limit="80Min",
 		optimizer=ed.EasyDeLOptimizers.ADAMW,
 		scheduler=ed.EasyDeLSchedulers.COSINE,
@@ -127,6 +132,7 @@ def create_training_args(
 		warmup_steps=warmup_steps,
 		report_steps=100,
 		log_steps=100,
+		progress_bar_type="json",
 	)
 	logging.info("Training arguments created.")
 	return training_args
@@ -135,10 +141,12 @@ def create_training_args(
 def main(use_iterable_dataset: bool = True):
 	model = create_model()
 	train_dataset = create_dummy_dataset(
-		NUM_TRAIN_EXAMPLES, use_iterable_dataset=use_iterable_dataset
+		NUM_TRAIN_EXAMPLES,
+		use_iterable_dataset=use_iterable_dataset,
 	)
 	eval_dataset = create_dummy_dataset(
-		NUM_EVAL_EXAMPLES, use_iterable_dataset=use_iterable_dataset
+		NUM_EVAL_EXAMPLES,
+		use_iterable_dataset=use_iterable_dataset,
 	)
 	training_args = create_training_args()
 

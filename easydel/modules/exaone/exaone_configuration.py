@@ -200,7 +200,6 @@ class ExaoneConfig(EasyDeLBaseConfig):
 			(r".*bias", pmag.resolve(Replicated)),
 			(r".*", pmag.resolve(Replicated)),
 		)
- 
 
 	@property
 	def granted_freq_max_position_embedding(self) -> int:

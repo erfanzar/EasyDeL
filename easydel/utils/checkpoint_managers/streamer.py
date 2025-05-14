@@ -26,7 +26,7 @@ from eformer.jaximus import implicit
 from flax.serialization import to_bytes, to_state_dict
 from flax.struct import PyTreeNode
 from safetensors import flax as safe_flax
-from tqdm import tqdm
+from tqdm.autonotebook import tqdm
 
 from easydel.utils.helpers import get_logger
 

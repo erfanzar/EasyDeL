@@ -19,6 +19,8 @@ import types
 import typing as tp
 import warnings
 from contextlib import contextmanager
+from dataclasses import dataclass
+from enum import Enum
 from functools import lru_cache, partial
 from typing import List, Set
 
@@ -30,7 +32,6 @@ import numpy as np
 from eformer.escale import with_sharding_constraint
 from einops import rearrange
 from flax import nnx as nn
-from jax.sharding import PartitionSpec as Ps
 from tqdm.auto import tqdm
 
 from easydel.layers.linear import ParallelLinear
@@ -973,82 +974,285 @@ class CompilationTracker:
 			yield
 
 
-def mlp3d_sharding(paxis, decode_mode: bool = False) -> Ps:
-	if decode_mode:
-		return Ps(
-			paxis.generation_batch_axis,
-			paxis.generation_query_sequence_axis,
-			paxis.hidden_state_axis,
+class ActivationType(str, Enum):
+	GELU = "gelu"
+	RELU = "relu"
+	SILU = "silu"
+	SWISH = "swish"
+	GELU_NEW = "gelu_new"
+	GELU_PYTORCH_TANH = "gelu_pytorch_tanh"
+	TANH = "tanh"
+	SIGMOID = "sigmoid"
+	LEAKY_RELU = "leaky_relu"
+	GLU = "glu"
+	ELU = "elu"
+	SOFTMAX = "softmax"
+	QUICK_GELU = "quick_gelu"
+
+
+def flop_activation(activation_type: ActivationType, dim: int) -> float:
+	"""Calculate FLOPs for different activation functions."""
+
+	# FLOPs per element for different activation functions
+	flops_per_element = {
+		ActivationType.GELU: 8,  # Approximation with several operations
+		ActivationType.GELU_NEW: 8,  # Approximation with tanh
+		ActivationType.GELU_PYTORCH_TANH: 8,  # Similar to GELU_NEW
+		ActivationType.RELU: 1,  # Just a max operation
+		ActivationType.SILU: 4,  # x * sigmoid(x) - sigmoid + multiplication
+		ActivationType.SWISH: 4,  # Same as SILU
+		ActivationType.TANH: 5,  # Approximation of tanh
+		ActivationType.SIGMOID: 4,  # Approximation of sigmoid
+		ActivationType.LEAKY_RELU: 2,  # Comparison + multiplication for negative slope
+		ActivationType.GLU: 5,  # Gated operation - sigmoid + multiplication
+		ActivationType.ELU: 2,  # Comparison + exp for negative values
+		ActivationType.SOFTMAX: 5,  # Similar cost as sigmoid + normalization
+		ActivationType.QUICK_GELU: 2,  # Simple approximation x * sigmoid(1.702 * x)
+	}
+	return flops_per_element.get(activation_type, 1) * dim
+
+
+class TaskType(str, Enum):
+	CAUSAL_LM = "causal-language-model"
+	VISION_LM = "vision-language-model"
+	IMAGE_TEXT_TO_TEXT = "image-text-to-text"
+	BASE_MODULE = "base-module"
+	BASE_VISION = "vision-module"
+	SEQUENCE_TO_SEQUENCE = "sequence-to-sequence"
+	SPEECH_SEQUENCE_TO_SEQUENCE = "speech-sequence-to-sequence"
+	ZERO_SHOT_IMAGE_CLASSIFICATION = "zero-shot-image-classification"
+	SEQUENCE_CLASSIFICATION = "sequence-classification"
+	AUDIO_CLASSIFICATION = "audio-classification"
+	IMAGE_CLASSIFICATION = "image-classification"
+	AUTO_BIND = "auto-bind"
+
+
+@dataclass
+class FlopCalcConfig:
+	# Core transformer body: for decoder-only and encoder-only models
+	hidden_dim: int
+	intermediate_dim: int
+	num_layers: int  # number of decoder (or encoder-only) layers
+	num_heads: int
+	kv_heads: int
+	head_dim: int
+	seq_len: int  # decoder (or encoder-only) sequence length
+
+	# Optional encoder for seq2seq / encoder-decoder
+	enc_num_layers: int = 0
+	enc_seq_len: int = 0
+
+	# MoE / GLU
+	glu: bool = False
+	num_experts: int = 1
+	num_shared_experts: int = 0
+	num_experts_per_tok: int = 1
+
+	# Task specifics
+	activation_type: ActivationType = ActivationType.GELU
+	task: TaskType = TaskType.AUTO_BIND
+	vocab_size: int = 0
+	num_labels: int = 0
+
+	# Vision tower (patch transformer)
+	vision_hidden_dim: int = 0
+	vision_intermediate_dim: int = 0
+	vision_num_layers: int = 0
+	vision_num_heads: int = 0
+	vision_seq_len: int = 0
+
+	include_loss: bool = False
+
+
+def flop_layernorm(hidden_dim: int) -> float:
+	return 8 * hidden_dim
+
+
+def flop_attention(
+	hidden_dim: int,
+	num_heads: int,
+	num_kv_heads: int,
+	head_dim: int,
+	seq_len: int,
+) -> float:
+	if head_dim is None:
+		head_dim = hidden_dim // num_heads
+	qkv_proj = 2 * hidden_dim * (num_heads * head_dim + 2 * num_kv_heads * head_dim)
+	dense_proj = 2 * hidden_dim * hidden_dim
+	key_query_logits = 2 * seq_len**2 * num_heads * head_dim
+	mask = 3 * seq_len * seq_len * num_heads
+	mask_value = 2 * seq_len * seq_len * head_dim * num_heads
+	seq_flops = key_query_logits + mask + mask_value
+	attn = seq_flops / seq_len
+	return qkv_proj + dense_proj + attn
+
+
+def flop_cross_attention(
+	hidden_dim: int,
+	num_heads: int,
+	enc_seq_len: int,
+	dec_seq_len: int,
+) -> float:
+	head_dim = hidden_dim // num_heads
+	proj = 2 * hidden_dim * hidden_dim
+	scores = 2 * head_dim * enc_seq_len * dec_seq_len * num_heads
+	softmax = 5 * enc_seq_len * dec_seq_len * num_heads
+	wsum = 2 * head_dim * enc_seq_len * dec_seq_len * num_heads
+	out_proj = 2 * hidden_dim * hidden_dim
+	return proj + scores + softmax + wsum + out_proj
+
+
+def flop_mlp(
+	cfg: FlopCalcConfig,
+	hidden_dim: int,
+	intermediate_dim: int,
+) -> float:
+	factor = 3 if cfg.glu else 2
+	base = factor * hidden_dim * intermediate_dim
+	total_ffn = base * (cfg.num_experts_per_tok + cfg.num_shared_experts)
+	activation_flops = flop_activation(
+		cfg.activation_type,
+		intermediate_dim * (cfg.num_experts_per_tok + cfg.num_shared_experts),
+	)
+
+	router = 2 * hidden_dim * cfg.num_experts if cfg.num_experts > 1 else 0
+	return 2 * total_ffn + activation_flops + router
+
+
+def flop_lm_head(hidden_dim: int, vocab_size: int) -> float:
+	return 2 * hidden_dim * vocab_size + 5 * vocab_size
+
+
+def flop_cls_head(hidden_dim: int, num_labels: int) -> float:
+	return 2 * hidden_dim * num_labels + 5 * num_labels
+
+
+def flop_loss(num_classes: int) -> float:
+	return 3 * num_classes + 2
+
+
+def flop_transformer_body(
+	layers: int,
+	seq_len: int,
+	hidden_dim: int,
+	intermediate_dim: int,
+	cfg: FlopCalcConfig,
+) -> float:
+	ln = 2 * flop_layernorm(hidden_dim)
+	att = flop_attention(
+		hidden_dim,
+		cfg.num_heads,
+		cfg.kv_heads,
+		cfg.head_dim,
+		seq_len,
+	)
+	mlp = flop_mlp(cfg, hidden_dim, intermediate_dim)
+	return layers * (ln + att + mlp)
+
+
+def flop_seq2seq(cfg: FlopCalcConfig) -> float:
+	enc = flop_transformer_body(
+		cfg.enc_num_layers,
+		cfg.enc_seq_len,
+		cfg.hidden_dim,
+		cfg.intermediate_dim,
+		cfg,
+	)
+	ln = 3 * flop_layernorm(cfg.hidden_dim)
+	self_att = flop_attention(
+		cfg.hidden_dim,
+		cfg.num_heads,
+		cfg.kv_heads,
+		cfg.head_dim,
+		cfg.seq_len,
+	)
+	cross_att = flop_cross_attention(
+		cfg.hidden_dim,
+		cfg.num_heads,
+		cfg.enc_seq_len,
+		cfg.seq_len,
+	)
+	mlp = flop_mlp(cfg, cfg.hidden_dim, cfg.intermediate_dim)
+	dec = cfg.num_layers * (ln + self_att + cross_att + mlp)
+	return enc + dec
+
+
+def flop_vision_tower(cfg: FlopCalcConfig) -> float:
+	return flop_transformer_body(
+		cfg.vision_num_layers,
+		cfg.vision_seq_len,
+		cfg.vision_hidden_dim,
+		cfg.vision_intermediate_dim,
+		cfg,
+	)
+
+
+def flops_per_token(cfg: FlopCalcConfig) -> float:
+	body_cost = 0
+	head_cost = 0
+	loss_cost = 0
+
+	if cfg.task == TaskType.CAUSAL_LM:
+		body_cost = flop_transformer_body(
+			cfg.num_layers,
+			cfg.seq_len,
+			cfg.hidden_dim,
+			cfg.intermediate_dim,
+			cfg,
 		)
+		head_cost = flop_lm_head(cfg.hidden_dim, cfg.vocab_size)
+		loss_cost = flop_loss(cfg.vocab_size) if cfg.include_loss else 0
+
+	elif cfg.task in {
+		TaskType.SEQUENCE_CLASSIFICATION,
+		TaskType.IMAGE_CLASSIFICATION,
+		TaskType.AUDIO_CLASSIFICATION,
+	}:
+		body_cost = flop_transformer_body(
+			cfg.num_layers,
+			cfg.seq_len,
+			cfg.hidden_dim,
+			cfg.intermediate_dim,
+			cfg,
+		)
+		head_cost = flop_cls_head(cfg.hidden_dim, cfg.num_labels)
+		loss_cost = flop_loss(cfg.num_labels) if cfg.include_loss else 0
+
+	elif cfg.task in {
+		TaskType.SEQUENCE_TO_SEQUENCE,
+		TaskType.SPEECH_SEQUENCE_TO_SEQUENCE,
+	}:
+		body_cost = flop_seq2seq(cfg)
+		head_cost = flop_lm_head(cfg.hidden_dim, cfg.vocab_size)
+		loss_cost = flop_loss(cfg.vocab_size) if cfg.include_loss else 0
+
+	elif cfg.task == TaskType.VISION_LM:
+		body_cost = flop_vision_tower(cfg)
+
+	elif cfg.task == TaskType.IMAGE_TEXT_TO_TEXT:
+		vision = flop_vision_tower(cfg)
+		text = flop_seq2seq(cfg)
+		body_cost = vision + text
+		head_cost = flop_lm_head(cfg.hidden_dim, cfg.vocab_size)
+		loss_cost = flop_loss(cfg.vocab_size) if cfg.include_loss else 0
+
+	elif cfg.task == TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION:
+		body_cost = flop_vision_tower(cfg)
+		head_cost = flop_cls_head(cfg.hidden_dim, cfg.num_labels)
+
+	elif cfg.task in {TaskType.BASE_MODULE, TaskType.BASE_VISION, TaskType.AUTO_BIND}:
+		body_cost = flop_transformer_body(
+			cfg.num_layers,
+			cfg.seq_len,
+			cfg.hidden_dim,
+			cfg.intermediate_dim,
+			cfg,
+		)
+
 	else:
-		return Ps(
-			paxis.batch_axis,
-			paxis.query_sequence_axis,
-			paxis.hidden_state_axis,
-		)
+		raise NotImplementedError(f"Unsupported task: {cfg.task}")
 
-
-def attention4d_sharding(paxis, isq: bool = False, decode_mode: bool = False) -> Ps:
-	if isq:
-		if decode_mode:
-			return Ps(
-				paxis.generation_batch_axis,
-				paxis.generation_query_sequence_axis,
-				paxis.generation_attention_dim_axis,
-				paxis.generation_head_axis,
-			)
-		else:
-			return Ps(
-				paxis.batch_axis,
-				paxis.query_sequence_axis,
-				paxis.attention_dim_axis,
-				paxis.head_axis,
-			)
-	else:
-		if decode_mode:
-			return Ps(
-				paxis.generation_batch_axis,
-				paxis.generation_key_sequence_axis,
-				paxis.generation_attention_dim_axis,
-				paxis.generation_head_axis,
-			)
-		else:
-			return Ps(
-				paxis.batch_axis,
-				paxis.key_sequence_axis,
-				paxis.attention_dim_axis,
-				paxis.head_axis,
-			)
-
-
-def attention3d_sharding(paxis, decode_mode: bool = False) -> Ps:
-	if decode_mode:
-		return Ps(
-			paxis.generation_batch_axis,
-			paxis.generation_query_sequence_axis,
-			paxis.generation_head_axis,
-		)
-	else:
-		return Ps(
-			paxis.batch_axis,
-			paxis.query_sequence_axis,
-			paxis.head_axis,
-		)
-
-
-def runtime3d_sharding(paxis, decode_mode: bool = False) -> Ps:
-	if decode_mode:
-		return Ps(
-			paxis.generation_batch_axis,
-			paxis.generation_query_sequence_axis,
-			paxis.generation_head_axis,
-		)
-	else:
-		return Ps(
-			paxis.batch_axis,
-			paxis.query_sequence_axis,
-			paxis.head_axis,
-		)
+	return body_cost + head_cost + loss_cost
 
 
 @contextmanager

@@ -313,7 +313,7 @@ class Trainer(BaseTrainer):
 					if self.scheduler is not None
 					else self.arguments.learning_rate,
 					epoch=epoch,
-					flops=self.get_runstage_flops(is_training=True),
+					flops_per_token=self._backward_flops_per_token,
 					batch_size=self.training_batch_size,
 					seq_length=self.arguments.max_sequence_length,
 					mean_loss=mean_loss,
@@ -403,7 +403,7 @@ class Trainer(BaseTrainer):
 					current_step=current_step,
 					learning_rate=0.000,
 					epoch=0,
-					flops=self.get_runstage_flops(is_training=False),
+					flops_per_token=self._forward_flops_per_token,
 					batch_size=self.evaluation_batch_size,
 					seq_length=self.arguments.max_sequence_length,
 					mean_loss=mean_loss,

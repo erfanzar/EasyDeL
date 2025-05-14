@@ -54,7 +54,10 @@ class SpecialLossNormalizingFactor(enum.Enum):
 	AVERAGE_PER_SEQUENCE = 3
 
 
-FACTOR_TYPE = tp.Optional[tp.Union[float, int, str, SpecialLossNormalizingFactor]]
+SLNF = SpecialLossNormalizingFactor
+
+
+FACTOR_TYPE = tp.Optional[tp.Union[float, int, str, SLNF]]
 
 
 @auto_pytree
@@ -111,6 +114,10 @@ class LossConfig:
 			"multi_label_classification",
 		]
 	] = None
+
+	def __post_init__(self):
+		if self.z_loss <= 0:
+			self.loss_normalizing_factor = SLNF.NO_WEIGHT_NUM_REAL_TARGET_TOKENS
 
 	def __repr__(self):
 		cls_name = self.__class__.__name__
@@ -324,7 +331,6 @@ def cross_entropy_with_logits(
 	logits_sum = jax.scipy.special.logsumexp(logits, axis=-1, keepdims=True)
 	log_softmax = logits - logits_sum
 	loss = -jnp.sum(targets * log_softmax, axis=-1)
-	# Calculate the z-loss
 	log_z = jax.scipy.special.logsumexp(logits, axis=-1)
 	total_z_loss = z_loss * jax.lax.square(log_z)
 	return loss, total_z_loss
@@ -353,15 +359,12 @@ def _cross_entropy_with_logits_fwd(
 	Forward pass for cross_entropy_with_logits VJP.
 	Calculates the loss and intermediates needed for the backward pass.
 	"""
-	max_logit = jnp.max(logits, axis=-1, keepdims=True)
+	max_logit = logits.max(axis=-1, keepdims=True)
 	shifted = logits - max_logit
 	exp_shifted = jnp.exp(shifted)
-	sum_exp = jnp.sum(exp_shifted, axis=-1)
-	log_sum_exp = jnp.log(sum_exp)
-	log_softmax = shifted - log_sum_exp[:, None]
+	sum_exp = jnp.sum(exp_shifted, axis=-1, keepdims=True)
+	log_softmax = shifted - jnp.log(sum_exp)
 	loss = -jnp.sum(targets * log_softmax, axis=-1)
-
-	# Calculate the z-loss and its components for backward pass
 	log_z = jnp.squeeze(jnp.log(sum_exp) + max_logit, axis=-1)
 	total_z_loss = z_loss * jax.lax.square(log_z)
 	loss += total_z_loss
@@ -391,7 +394,6 @@ def _cross_entropy_with_logits_bwd(
 	"""Backward-mode of `cross_entropy_with_logits`."""
 	g = g[0]
 	logits, targets, z_loss, exp_shifted, sum_exp, log_softmax, log_z = res
-
 	deriv = jnp.expand_dims(1 + 2 * z_loss * log_z, -1) * exp_shifted / sum_exp - targets
 	g_logits = jnp.expand_dims(g, axis=-1) * deriv
 	g_targets = -jnp.expand_dims(g, axis=-1) * log_softmax
@@ -500,7 +502,12 @@ def compute_weighted_cross_entropy_and_accuracy(
 	    A tuple containing the total loss, z-loss, sum of weights, and accuracy.
 	"""
 	total_loss, total_z_loss, weight_sum = compute_weighted_cross_entropy(
-		logits, targets, weights, label_smoothing, z_loss, loss_normalizing_factor
+		logits=logits,
+		targets=targets,
+		weights=weights,
+		label_smoothing=label_smoothing,
+		z_loss=z_loss,
+		loss_normalizing_factor=loss_normalizing_factor,
 	)
 
 	predictions = jnp.argmax(logits, axis=-1)
@@ -533,9 +540,7 @@ def cross_entropy_loss_and_accuracy(source, target, valid=None):
 	return loss, accuracy
 
 
-def convert_special_loss_normalizing_factor_to_enum(
-	x: str,
-) -> SpecialLossNormalizingFactor:
+def convert_special_loss_normalizing_factor_to_enum(x: str) -> SLNF:
 	"""
 	Converts a stringified version of SpecialLossNormalizingFactor to an enum.
 
@@ -547,13 +552,13 @@ def convert_special_loss_normalizing_factor_to_enum(
 	"""
 	x = x.upper()
 	if x == "NUM_REAL_TARGET_TOKENS":
-		return SpecialLossNormalizingFactor.NUM_REAL_TARGET_TOKENS
+		return SLNF.NUM_REAL_TARGET_TOKENS
 	if x == "NUM_TOTAL_TARGET_TOKENS":
-		return SpecialLossNormalizingFactor.NUM_TOTAL_TARGET_TOKENS
+		return SLNF.NUM_TOTAL_TARGET_TOKENS
 	if x == "AVERAGE_PER_SEQUENCE":
-		return SpecialLossNormalizingFactor.AVERAGE_PER_SEQUENCE
+		return SLNF.AVERAGE_PER_SEQUENCE
 	if x == "NO_WEIGHT_NUM_REAL_TARGET_TOKENS":
-		return SpecialLossNormalizingFactor.NO_WEIGHT_NUM_REAL_TARGET_TOKENS
+		return SLNF.NO_WEIGHT_NUM_REAL_TARGET_TOKENS
 	raise ValueError(f'Could not convert string "{x}" to SpecialLossNormalizingFactor')
 
 
@@ -602,7 +607,7 @@ def get_loss_normalizing_factor_and_weights(
 	"""
 	loss_weights = batch.get("decoder_loss_weights", None)
 	if loss_normalizing_factor is None or not isinstance(
-		loss_normalizing_factor, (str, SpecialLossNormalizingFactor)
+		loss_normalizing_factor, (str, SLNF)
 	):
 		return loss_normalizing_factor, loss_weights
 
@@ -615,11 +620,11 @@ def get_loss_normalizing_factor_and_weights(
 		loss_weights = jnp.asarray(batch["decoder_target_tokens"] > 0, jnp.float32)
 
 	output_normalizing_factor = None
-	if loss_normalizing_factor == SpecialLossNormalizingFactor.NUM_REAL_TARGET_TOKENS:
+	if loss_normalizing_factor == SLNF.NUM_REAL_TARGET_TOKENS:
 		output_normalizing_factor = jnp.sum(loss_weights)
-	elif loss_normalizing_factor == SpecialLossNormalizingFactor.NUM_TOTAL_TARGET_TOKENS:
+	elif loss_normalizing_factor == SLNF.NUM_TOTAL_TARGET_TOKENS:
 		output_normalizing_factor = jnp.prod(batch["decoder_target_tokens"].shape)
-	elif loss_normalizing_factor == SpecialLossNormalizingFactor.AVERAGE_PER_SEQUENCE:
+	elif loss_normalizing_factor == SLNF.AVERAGE_PER_SEQUENCE:
 		if "decoder_segment_ids" in batch:
 			norm_vec = _sum_weights_per_segment(
 				batch["decoder_positions"],
@@ -798,7 +803,9 @@ def fixed_cross_entropy(
 	mask = (
 		attention_mask if attention_mask is not None else (target != config.ignore_index)
 	)
-	nwn_cond = str(SpecialLossNormalizingFactor.NO_WEIGHT_NUM_REAL_TARGET_TOKENS)
+	nwn_cond = SLNF.NO_WEIGHT_NUM_REAL_TARGET_TOKENS
+	nwv_cond = SLNF.NO_WEIGHT_NUM_REAL_TARGET_TOKENS.value
+	loss_factor = config.loss_normalizing_factor
 	if config.reduction is not None:
 		(
 			loss,
@@ -812,22 +819,13 @@ def fixed_cross_entropy(
 		)
 		total_z_loss = 0.0
 		weight_sum = 1.0
-	elif config.loss_normalizing_factor in nwn_cond:
-		(
-			loss,
-			accuracy,
-		) = cross_entropy_loss_and_accuracy(
-			source=source,
-			target=target,
-			valid=mask,
-		)
+	elif loss_factor is nwn_cond or loss_factor is nwv_cond:
+		loss, accuracy = cross_entropy_loss_and_accuracy(source, target, mask)
 		total_z_loss = 0.0
 		weight_sum = 1.0
 	else:
 		if batch is None:
-			if config.loss_normalizing_factor in str(
-				SpecialLossNormalizingFactor.NUM_REAL_TARGET_TOKENS
-			):
+			if config.loss_normalizing_factor in str(SLNF.NUM_REAL_TARGET_TOKENS):
 				batch = {
 					"decoder_target_tokens": target,
 					"decoder_loss_weights": mask,
@@ -852,12 +850,13 @@ def fixed_cross_entropy(
 			z_loss=config.z_loss,
 			loss_normalizing_factor=loss_normalizing_factor,
 		)
+
 		loss = total_loss
 		if num_items_in_batch is not None:
 			loss = total_loss / num_items_in_batch
 		elif config.divide_weight_sum:
 			loss = total_loss / weight_sum
-
+		loss = loss + total_z_loss * (config.z_loss**2)
 	return LossMetrics(
 		loss=loss,
 		z_loss=total_z_loss,
