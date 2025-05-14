@@ -1265,10 +1265,12 @@ class EasyDeLBaseModule(
 		"""
 		from .utils import FlopCalcConfig, flops_per_token, ActivationType
 
-		if sequence_length is None:
-			sequence_length = self.config.granted_freq_max_position_embedding
 		config = self.config
 		text_config = getattr(config, "text_config", config)
+
+		if sequence_length is None:
+			sequence_length = text_config.granted_freq_max_position_embedding
+
 		num_heads = text_config.num_attention_heads
 		hidden_dim = text_config.hidden_size
 		fconf = FlopCalcConfig(
