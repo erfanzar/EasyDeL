@@ -1265,34 +1265,44 @@ class EasyDeLBaseModule(
 		"""
 		from .utils import FlopCalcConfig, flops_per_token, ActivationType
 
-		config = self.config
-		text_config = getattr(config, "text_config", config)
+		try:
+			config = self.config
+			text_config = getattr(config, "text_config", config)
+			vision_config = getattr(config, "vision_config", config)
+			if sequence_length is None:
+				sequence_length = text_config.granted_mask_max_position_embedding
 
-		if sequence_length is None:
-			sequence_length = text_config.granted_freq_max_position_embedding
+			num_heads = text_config.num_attention_heads
+			hidden_dim = text_config.hidden_size
+			fconf = FlopCalcConfig(
+				hidden_dim=hidden_dim,
+				intermediate_dim=text_config.intermediate_size,
+				num_layers=text_config.num_hidden_layers,
+				num_heads=num_heads,
+				activation_type=getattr(text_config, "hidden_act", ActivationType.SILU),
+				head_dim=getattr(text_config, "head_dim", hidden_dim // num_heads),
+				kv_heads=getattr(text_config, "num_key_value_heads", num_heads),
+				seq_len=sequence_length,
+				task=self._model_task,
+				vocab_size=text_config.vocab_size,
+				include_loss=include_loss,
+				num_labels=getattr(text_config, "num_labels", 0),
+				num_experts=getattr(text_config, "num_local_experts", 0),
+				num_experts_per_tok=getattr(text_config, "num_experts_per_tok", 0),
+				glu=getattr(text_config, "glu_mlp", True),
+				vision_hidden_dim=getattr(vision_config, "hidden_size", 0),
+				vision_intermediate_dim=getattr(vision_config, "intermediate_size", 0),
+				vision_num_heads=getattr(vision_config, "num_attention_heads", 0),
+				vision_num_layers=getattr(vision_config, "num_hidden_layers", 0),
+				vision_seq_len=getattr(vision_config, "max_position_embeddings", 0),
+			)
 
-		num_heads = text_config.num_attention_heads
-		hidden_dim = text_config.hidden_size
-		fconf = FlopCalcConfig(
-			hidden_dim=hidden_dim,
-			intermediate_dim=text_config.intermediate_size,
-			num_layers=text_config.num_hidden_layers,
-			num_heads=num_heads,
-			activation_type=getattr(text_config, "hidden_act", ActivationType.SILU),
-			head_dim=getattr(text_config, "head_dim", hidden_dim // num_heads),
-			kv_heads=getattr(text_config, "num_key_value_heads", num_heads),
-			seq_len=sequence_length,
-			task=self._model_task,
-			vocab_size=text_config.vocab_size,
-			include_loss=include_loss,
-			num_labels=getattr(text_config, "num_labels", 0),
-			num_experts=getattr(text_config, "num_local_experts", 0),
-			num_experts_per_tok=getattr(text_config, "num_experts_per_tok", 0),
-			glu=getattr(text_config, "glu_mlp", True),
-		)
-		flops = flops_per_token(fconf)
-		if include_backward:
-			flops *= 3
+			flops = flops_per_token(fconf)
+			if include_backward:
+				flops *= 3
+		except Exception:
+			warnings.warn("Calculating Flops Failed!", stacklevel=1)
+			flops = 1
 		return flops
 
 	def _flop(self, *args, **kwargs) -> tp.Optional[float]:
