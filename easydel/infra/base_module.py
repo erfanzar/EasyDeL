@@ -1245,6 +1245,54 @@ class EasyDeLBaseModule(
 		self = self.merge_params(unflatten_dict(current_state))
 		return self
 
+	def flops_per_token(
+		self,
+		sequence_length: tp.Optional[int] = None,
+		include_loss: bool = True,
+		include_backward: bool = False,
+	) -> float:
+		"""
+		Calculates the total FLOPs (Floating Point Operations) for the module per token.
+
+		This method should be implemented by subclasses to provide a
+		module-specific FLOPs calculation.
+
+		Returns:
+				float: The total FLOPs for the module.
+
+		Raises:
+				NotImplementedError: If the method is not implemented by the subclass.
+		"""
+		from .utils import FlopCalcConfig, flops_per_token, ActivationType
+
+		if sequence_length is None:
+			sequence_length = self.config.granted_freq_max_position_embedding
+		config = self.config
+		text_config = getattr(config, "text_config", config)
+		num_heads = text_config.num_attention_heads
+		hidden_dim = text_config.hidden_size
+		fconf = FlopCalcConfig(
+			hidden_dim=hidden_dim,
+			intermediate_dim=text_config.intermediate_size,
+			num_layers=text_config.num_hidden_layers,
+			num_heads=num_heads,
+			activation_type=getattr(text_config, "hidden_act", ActivationType.SILU),
+			head_dim=getattr(text_config, "head_dim", hidden_dim // num_heads),
+			kv_heads=getattr(text_config, "num_key_value_heads", num_heads),
+			seq_len=sequence_length,
+			task=self._model_task,
+			vocab_size=text_config.vocab_size,
+			include_loss=include_loss,
+			num_labels=getattr(text_config, "num_labels", 0),
+			num_experts=getattr(text_config, "num_local_experts", 0),
+			num_experts_per_tok=getattr(text_config, "num_experts_per_tok", 0),
+			glu=getattr(text_config, "glu_mlp", True),
+		)
+		flops = flops_per_token(fconf)
+		if include_backward:
+			flops *= 3
+		return flops
+
 	def _flop(self, *args, **kwargs) -> tp.Optional[float]:
 		"""
 		Estimates the FLOPs (Floating Point Operations) for a single forward pass (`__call__`).

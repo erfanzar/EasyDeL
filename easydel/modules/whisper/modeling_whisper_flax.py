@@ -904,7 +904,7 @@ class WhisperDecoder(EasyDeLBaseModule):
 		input_ids: jnp.ndarray,
 		attention_mask: jnp.ndarray,
 		position_ids: jnp.ndarray,
-		encoder_hidden_states: tp.Optional[jnp.ndarray] = None, 
+		encoder_hidden_states: tp.Optional[jnp.ndarray] = None,
 		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		past_key_values: tp.Optional[TransformerCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata] = None,
@@ -1084,7 +1084,7 @@ class WhisperModel(EasyDeLBaseModule):
 		decoder_input_ids: jnp.ndarray,
 		decoder_attention_mask: tp.Optional[jnp.ndarray] = None,
 		decoder_position_ids: tp.Optional[jnp.ndarray] = None,
-		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore 
+		mode: tp.Optional[common_types.RUNTIME_MODE_TYPES] = None,  # type:ignore
 		past_key_values: tp.Optional[TransformerCache] = None,
 		cache_metadata: tp.Optional[TransformerMetadata] = None,
 		output_attentions: bool = False,

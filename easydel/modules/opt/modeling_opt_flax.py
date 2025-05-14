@@ -247,7 +247,7 @@ class OPTAttention(AttentionModule):
 			value=value_states,
 			cache_view=cache_view,
 			cache_metadata=cache_metadata,
-			attention_mask=attention_mask, 
+			attention_mask=attention_mask,
 			causal_mask=causal_mask,
 		)
 

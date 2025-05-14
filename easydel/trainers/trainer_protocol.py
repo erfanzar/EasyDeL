@@ -26,7 +26,7 @@ import flax.core
 import jax
 import numpy as np
 import optax
-import tqdm
+from tqdm.autonotebook import tqdm
 from jax.sharding import Mesh
 from optax import GradientTransformation, Schedule
 from rich.progress import (
@@ -139,6 +139,9 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 	pruning_module: tp.Any
 	memory_monitor: tp.Any
 
+	_forward_flops_per_token: int
+	_backward_flops_per_token: int
+
 	@abstractmethod
 	def __init__(
 		self,
@@ -146,7 +149,7 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 		model: EasyDeLBaseModule,
 		dataset_train: tp.Optional[Dataset] = None,
 		dataset_eval: tp.Optional[Dataset] = None,
-		finetune: bool = True, 
+		finetune: bool = True,
 	):
 		"""
 		Initializes the trainer.
@@ -590,11 +593,6 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 		"""hook call before passing data to function (called in `_execute` functions)"""
 
 	@abstractmethod
-	def get_runstage_flops(self, is_training: bool) -> float:
-		"""Return the total number of FLOPs for the model."""
-		...
-
-	@abstractmethod
 	def _ensure_functions_compiled(self):
 		"""Ensure functions are compiled."""
 		...
@@ -627,7 +625,7 @@ class StepMetrics:
 		metrics: LossMetrics,
 		current_step: int,
 		epoch: int,
-		flops: float,
+		flops_per_token: float,
 		batch_size: int,
 		seq_length: int,
 		learning_rate: float,
@@ -638,38 +636,43 @@ class StepMetrics:
 		step_time = time.time() - self.step_start_time
 		total_time = time.time() - self.start_time
 
-		visited_tokens = seq_length * (current_step) * batch_size
-		throughput = (seq_length * batch_size) / step_time
-		flops_per_token = flops / visited_tokens
-		flops_per_sequence = flops / ((current_step) * batch_size)
+		execution_time = metrics.execution_time
+		flops = flops_per_token * seq_length
+		total_flops = flops * batch_size
+		tflops = total_flops / execution_time / 1e12
+		total_tokens = batch_size * seq_length
+		visited_tokens = total_tokens * current_step
+		throughput = total_tokens / execution_time
 
-		flops_pre_second = flops / step_time
-		flops_token_pre_second = flops / visited_tokens
-		flops_sequence_pre_second = flops / ((current_step) * batch_size)
 		mlperf_metrics = {
+			"mlperf/execution_time": float(execution_time),
 			"mlperf/flops": float(flops),
 			"mlperf/flops_per_token": float(flops_per_token),
-			"mlperf/flops_per_sequence": float(flops_per_sequence),
-			"mlperf/flops_pre_second": float(flops_pre_second),
-			"mlperf/flops_token_pre_second": float(flops_token_pre_second),
-			"mlperf/flops_sequence_pre_second": float(flops_sequence_pre_second),
-			"mlperf/throughput": throughput,
 			"mlperf/step_time": float(step_time),
-			"mlperf/execution_time": float(metrics.execution_time),
+			"mlperf/tflops": float(tflops),
+			"mlperf/throughput": throughput,
+			"mlperf/total_flops": float(total_flops),
 			"mlperf/total_time": float(total_time),
+			"mlperf/total_tokens": total_tokens,
 		}
+
 		loss = metrics.loss
 		z_loss = metrics.z_loss
+
 		basic_metrics = {
-			"loss": float(loss),
-			"z_loss": float(z_loss) if z_loss is not None else None,
-			"learning_rate": float(np.array(learning_rate).item()),
-			"step": int(current_step),
-			"perplexity": float(jnp.exp(loss)),
-			"visited_tokens": visited_tokens,
 			"epoch": int(epoch),
+			"execution_time": float(execution_time),
+			"learning_rate": float(np.array(learning_rate).item()),
+			"loss": float(loss),
+			"perplexity": float(jnp.exp(loss)),
+			"step": int(current_step),
+			"step_time": float(step_time),
+			"tflops": float(tflops),
+			"visited_tokens": visited_tokens,
+			"z_loss": float(z_loss) if z_loss is not None else None,
 			**extras,
 		}
+
 		if metrics.accuracy is not None:
 			basic_metrics["accuracy"] = float(metrics.accuracy)
 
@@ -832,7 +835,7 @@ class NullProgressBar(BaseProgressBar):
 class TqdmProgressBar(BaseProgressBar):
 	"""Wrapper for tqdm progress bar."""
 
-	def __init__(self, pbar: tqdm.tqdm):
+	def __init__(self, pbar: tqdm):
 		self.pbar = pbar
 
 	def update(self, n: int = 1) -> None:

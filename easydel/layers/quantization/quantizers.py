@@ -18,7 +18,7 @@ import typing as tp
 
 import chex
 import jax
-import tqdm
+from tqdm.autonotebook import tqdm
 from eformer.ops.quantization import Array8B, ArrayNF4
 from flax import nnx as nn
 
@@ -134,7 +134,7 @@ class EasyQuantizer:
 
 		pattern = re.compile(quantization_pattern)
 
-		with tqdm.tqdm(
+		with tqdm(
 			total=len([p[0] for p in iter_module_search(model, ParallelLinear)]),
 			desc=f"Quantizing to {self.quantization_method}",
 			disable=not verbose,

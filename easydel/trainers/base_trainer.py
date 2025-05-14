@@ -30,7 +30,7 @@ import flax.nnx
 import jax
 import jax.extend
 import numpy as np
-import tqdm
+from tqdm.autonotebook import tqdm
 from eformer.escale import PartitionAxis
 from flax import nnx as nn
 from flax.core import unfreeze
@@ -231,7 +231,18 @@ class BaseTrainer(BaseTrainerProtocol):
 		self.scheduler = getattr(self, "scheduler", None)
 		self.tx = getattr(self, "tx", None)
 
-		self.checkpoint_manager = getattr(self, "checkpoint_manager", None)  #
+		self._forward_flops_per_token = getattr(
+			self,
+			"_forward_flops_per_token",
+			self.model_state.model.flops_per_token(include_loss=True, include_backward=False),
+		)
+		self._backward_flops_per_token = getattr(
+			self,
+			"_backward_flops_per_token",
+			self.model_state.model.flops_per_token(include_loss=True, include_backward=True),
+		)
+
+		self.checkpoint_manager = getattr(self, "checkpoint_manager", None)
 		self.pruning_module = getattr(self.arguments, "pruning_module", None)
 		self.memory_monitor = getattr(self.arguments, "memory_monitor", None)
 
@@ -300,21 +311,7 @@ class BaseTrainer(BaseTrainerProtocol):
 	) -> tp.Tuple[tp.Dict[str, jax.Array], tp.Dict[str, tp.Union[float, int, str]]]:
 		return batch, {}
 
-	def get_runstage_flops(self, is_training) -> tp.Union[float, tp.Tuple[float, bool]]:
-		try:
-			function = (
-				self.sharded_training_step_function
-				if is_training
-				else self.sharded_evaluation_step_function
-			)
-			flops = function.cost_analysis()[0]["flops"]
-		except Exception:
-			flops = (
-				self.train_tracker.cached_flops
-				if is_training
-				else self.evalu_tracker.cached_flops
-			)
-		return flops
+
 
 	def _ensure_functions_compiled(self):
 		self.compile_aot()
@@ -935,12 +932,10 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 		return metrics
 
 	def start_training_hook(self):
-		self.get_runstage_flops(True)
 		self._setup_static_metrics()
 		self._training_time_start = time.time()
 
 	def start_evaluation_hook(self):
-		self.get_runstage_flops(False)
 		self._setup_static_metrics()
 		self._evaluation_time_start = time.time()
 
@@ -1102,7 +1097,7 @@ model = AutoEasyDeLModelForCausalLM.from_pretrained(
 		if rpr == "tqdm":
 			ncols = int(os.getenv("TQDM_NCOLS", "0"))
 			return TqdmProgressBar(
-				tqdm.tqdm(
+				tqdm(
 					total=total,
 					desc=desc,
 					disable=disabled,
