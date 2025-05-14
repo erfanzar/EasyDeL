@@ -1230,9 +1230,22 @@ def flops_per_token(cfg: FlopCalcConfig) -> float:
 		body_cost = flop_vision_tower(cfg)
 
 	elif cfg.task == TaskType.IMAGE_TEXT_TO_TEXT:
-		vision = flop_vision_tower(cfg)
-		text = flop_seq2seq(cfg)
-		body_cost = vision + text
+		try:
+			vision = flop_vision_tower(cfg)
+			text = flop_seq2seq(cfg)
+		except ZeroDivisionError:
+			vision = 0
+			text = 0
+
+		clm_head = flop_transformer_body(
+			cfg.num_layers,
+			cfg.seq_len,
+			cfg.hidden_dim,
+			cfg.intermediate_dim,
+			cfg,
+		)
+
+		body_cost = vision + text + clm_head
 		head_cost = flop_lm_head(cfg.hidden_dim, cfg.vocab_size)
 		loss_cost = flop_loss(cfg.vocab_size) if cfg.include_loss else 0
 
