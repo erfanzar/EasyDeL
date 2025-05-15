@@ -130,7 +130,6 @@ class Xerxes2Config(EasyDeLBaseConfig):
 			bits=bits,
 			**kwargs,
 		)
-		self.cache_implementation = "hybrid"
 
 	def get_partition_rules(self, *args, **kwargs):
 		"""

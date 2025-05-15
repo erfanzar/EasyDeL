@@ -54,6 +54,18 @@ from .xerxes_configuration import XerxesConfig as XerxesConfig
 logger = get_logger(__name__)
 
 
+class Identity(nn.Module):
+	def __init__(self): ...
+	def __call__(self, x):
+		return x
+
+
+class PostCross(nn.Module):
+	def __init__(self): ...
+	def __call__(self, x):
+		return jax.nn.tanh(x / 30.0) * 30.0
+
+
 class RMSNorm(nn.Module):
 	def __init__(
 		self,
@@ -86,6 +98,69 @@ class RMSNorm(nn.Module):
 			x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
 		output = self._norm(x).astype(self.dtype)
 		return (self.kernel.value.astype(self.dtype)) * output
+
+
+class XerxesMLP(nn.Module):
+	def __init__(
+		self,
+		config: XerxesConfig,
+		dtype: jnp.dtype = jnp.float32,
+		param_dtype: jnp.dtype = jnp.float32,
+		precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None,
+		*,
+		rngs: nn.Rngs,
+	):
+		self.config = config
+		self.dtype = dtype
+		self.param_dtype = param_dtype
+		self.precision = precision
+		self.rngs = rngs
+		kernel_init = jax.nn.initializers.normal(config.initializer_range)
+
+		self.act = (
+			nn.swish if config.swish_run else functools.partial(nn.gelu, approximate=True)
+		)
+		linear_class = functools.partial(
+			ParallelLinear,
+			use_bias=False,
+			dtype=dtype,
+			param_dtype=param_dtype,
+			precision=precision,
+			kernel_init=kernel_init,
+			rngs=rngs,
+			**get_dot_general_by_bits(config.bits, config.easy_method),
+		)
+		self.gate_proj = linear_class(
+			self.config.hidden_size,
+			self.config.intermediate_size,
+			rngs=rngs,
+		)
+		self.up_proj = linear_class(
+			self.config.hidden_size,
+			self.config.intermediate_size,
+			rngs=rngs,
+		)
+		self.down_proj = linear_class(
+			self.config.intermediate_size,
+			self.config.hidden_size,
+			rngs=rngs,
+		)
+
+	def __call__(self, hidden_states):
+		hidden_states = apply_logical_sharding(
+			hidden_states,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
+		)
+		gate = self.act(self.gate_proj(hidden_states))
+		up = self.up_proj(hidden_states)
+		hidden_states = self.down_proj(gate * up)
+		hidden_states = apply_logical_sharding(
+			hidden_states,
+			dynamic_axes=common_types.HiddenStateSharding,
+			partition_manager=self.config.partition_manager,
+		)
+		return hidden_states
 
 
 class XerxesAttention(AttentionModule):
@@ -151,6 +226,21 @@ class XerxesAttention(AttentionModule):
 			self.embed_dim,
 			rngs=rngs,
 		)
+
+		if config.xe_kvnorm:
+			self.q_norm = RMSNorm(
+				dim=self.head_dim,
+				eps=config.rms_norm_eps,
+				dtype=dtype,
+				param_dtype=param_dtype,
+			)
+			self.k_norm = RMSNorm(
+				dim=self.head_dim,
+				eps=config.rms_norm_eps,
+				dtype=dtype,
+				param_dtype=param_dtype,
+			)
+
 		self.attention_performer = FlexibleAttentionModule(
 			base_config=config,
 			softmax_scale=self.head_dim**-0.5,
@@ -236,6 +326,12 @@ class XerxesAttention(AttentionModule):
 			self.num_key_value_heads,
 			self.head_dim,
 		)
+
+		if self.config.xe_kvnorm:
+			# works better with zloss 5e-4
+			query_states = self.q_norm(query_states)
+			key_states = self.q_norm(key_states)
+
 		(
 			query_states,
 			key_states,
@@ -291,67 +387,6 @@ class XerxesAttention(AttentionModule):
 			attention_weight=attentions.attention_weights if output_attentions else None,
 			cache_view=cache_view,
 		)
-
-
-class XerxesMLP(nn.Module):
-	def __init__(
-		self,
-		config: XerxesConfig,
-		dtype: jnp.dtype = jnp.float32,
-		param_dtype: jnp.dtype = jnp.float32,
-		precision: tp.Optional[tp.Union[str, jax.lax.Precision]] = None,
-		*,
-		rngs: nn.Rngs,
-	):
-		self.config = config
-		self.dtype = dtype
-		self.param_dtype = param_dtype
-		self.precision = precision
-		self.rngs = rngs
-		kernel_init = jax.nn.initializers.normal(config.initializer_range)
-
-		self.act = functools.partial(nn.gelu, approximate=True)
-		linear_class = functools.partial(
-			ParallelLinear,
-			use_bias=False,
-			dtype=dtype,
-			param_dtype=param_dtype,
-			precision=precision,
-			kernel_init=kernel_init,
-			rngs=rngs,
-			**get_dot_general_by_bits(config.bits, config.easy_method),
-		)
-		self.gate_proj = linear_class(
-			self.config.hidden_size,
-			self.config.intermediate_size,
-			rngs=rngs,
-		)
-		self.up_proj = linear_class(
-			self.config.hidden_size,
-			self.config.intermediate_size,
-			rngs=rngs,
-		)
-		self.down_proj = linear_class(
-			self.config.intermediate_size,
-			self.config.hidden_size,
-			rngs=rngs,
-		)
-
-	def __call__(self, hidden_states):
-		hidden_states = apply_logical_sharding(
-			hidden_states,
-			dynamic_axes=common_types.HiddenStateSharding,
-			partition_manager=self.config.partition_manager,
-		)
-		gate = self.act(self.gate_proj(hidden_states))
-		up = self.up_proj(hidden_states)
-		hidden_states = self.down_proj(gate * up)
-		hidden_states = apply_logical_sharding(
-			hidden_states,
-			dynamic_axes=common_types.HiddenStateSharding,
-			partition_manager=self.config.partition_manager,
-		)
-		return hidden_states
 
 
 class XerxesSparseMoeBlock(nn.Module):
@@ -478,10 +513,12 @@ class XerxesDecoderLayer(nn.Module):
 			dtype=dtype,
 			param_dtype=param_dtype,
 		)
+		identity = config.xe_kvnorm and not config.xe_moe
+		self.identity = identity
 		self.input_layernorm = rms()
 		self.post_attention_layernorm = rms()
-		self.pre_feedforward_layernorm = rms()
-		self.post_feedforward_layernorm = rms()
+		self.pre_feedforward_layernorm = Identity() if identity else rms()
+		self.post_feedforward_layernorm = Identity() if identity else rms()
 
 	def __call__(
 		self,
@@ -513,16 +550,9 @@ class XerxesDecoderLayer(nn.Module):
 		Returns:
 		    tp.Tuple[chex.Array, chex.Array]: A tuple containing the attention output and the attention weights.
 		"""
-		residual = hidden_states
 
-		hidden_states = self.input_layernorm(hidden_states)
-		hidden_states = apply_logical_sharding(
-			hidden_states,
-			dynamic_axes=common_types.HiddenStateSharding,
-			partition_manager=self.config.partition_manager,
-		)
 		attn_outputs = self.self_attn(
-			hidden_states,
+			self.input_layernorm(hidden_states),
 			attention_mask,
 			position_ids,
 			causal_mask,
@@ -534,18 +564,27 @@ class XerxesDecoderLayer(nn.Module):
 			fcm_mask,
 			frequencies,
 		)
-		hidden_states = self.post_attention_layernorm(attn_outputs.attention_output)
-		hidden_states = residual + hidden_states
+		if self.identity:
+			hidden_states = hidden_states + attn_outputs.attention_output
+			residual = hidden_states
+			feed_forward_input = self.post_attention_layernorm(hidden_states)
 
-		residual = hidden_states
-		hidden_states = self.pre_feedforward_layernorm(hidden_states)
+		else:
+			normed = self.post_attention_layernorm(attn_outputs.attention_output)
+			hidden_states = hidden_states + normed
+			residual = hidden_states
+			feed_forward_input = self.pre_feedforward_layernorm(hidden_states)
+
 		if self.config.use_scan_mlp and not self.config.xe_moe:
-			hidden_states = block_wise_ffn(
-				self.mlp, hidden_states, self.config.scan_mlp_chunk_size
+			feed_forward_hidden_states = block_wise_ffn(
+				self.mlp,
+				feed_forward_input,
+				self.config.scan_mlp_chunk_size,
 			)
 		else:
-			hidden_states = self.mlp(hidden_states)
-		hidden_states = self.post_feedforward_layernorm(hidden_states)
+			feed_forward_hidden_states = self.mlp(feed_forward_input)
+
+		hidden_states = self.post_feedforward_layernorm(feed_forward_hidden_states)
 		hidden_states = residual + hidden_states
 		hidden_states = apply_logical_sharding(
 			hidden_states,
@@ -607,6 +646,7 @@ class XerxesModel(EasyDeLBaseModule):
 			dtype=dtype,
 			param_dtype=param_dtype,
 		)
+		self.embedding_scale = float(1 if config.xe_kvnorm else config.hidden_size**0.5)
 
 	def __call__(
 		self,
@@ -647,8 +687,7 @@ class XerxesModel(EasyDeLBaseModule):
 		if inputs_embeds is None:
 			inputs_embeds = self.embed_tokens(input_ids.astype("i4"))
 		batch_size, sequence_length, _ = inputs_embeds.shape
-
-		inputs_embeds = inputs_embeds * (self.config.hidden_size**0.5)
+		inputs_embeds = inputs_embeds * self.embedding_scale
 		assert sequence_length <= self.config.max_position_embeddings, (
 			f"Maximum Position Embedding Reached ! (Excepted <= {self.config.max_position_embeddings} got {sequence_length})"
 		)
@@ -681,7 +720,6 @@ class XerxesModel(EasyDeLBaseModule):
 			dynamic_axes=common_types.HiddenStateSharding,
 			partition_manager=self.config.partition_manager,
 		)
-
 		for idx, block in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
@@ -764,6 +802,8 @@ class XerxesForCausalLM(EasyDeLBaseModule):
 			rngs=rngs,
 			**get_dot_general_by_bits(config.bits, config.easy_method),
 		)
+		identity = config.xe_kvnorm and not config.xe_moe
+		self.post_pross = Identity() if identity else PostCross()
 
 	def __call__(
 		self,
@@ -825,10 +865,8 @@ class XerxesForCausalLM(EasyDeLBaseModule):
 		else:
 			lm_logits = self.lm_head(hidden_states)
 
-		lm_logits = jax.nn.tanh(lm_logits / 30.0) * 30.0
-
 		return CausalLMOutput(
-			logits=lm_logits,
+			logits=self.post_pross(lm_logits),
 			hidden_states=outputs.hidden_states,
 			attentions=outputs.attentions,
 			past_key_values=outputs.past_key_values,
