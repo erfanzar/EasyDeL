@@ -91,11 +91,13 @@ class XerxesConfig(EasyDeLBaseConfig):
 		initializer_range=0.02,
 		rms_norm_eps=1e-6,
 		use_cache=True,
+		swish_run=False,  # shown to better based on xerxes2-3b run.
 		pad_token_id=0,
 		eos_token_id=1,
 		bos_token_id=2,
 		num_local_experts: int = 4,
 		xe_moe: bool = True,
+		xe_kvnorm: bool = False,
 		num_experts_per_tok: int = 2,
 		tie_word_embeddings=False,
 		rope_theta=10000.0,
@@ -121,7 +123,9 @@ class XerxesConfig(EasyDeLBaseConfig):
 		self.rope_theta = rope_theta
 		self.num_local_experts = num_local_experts
 		self.num_experts_per_tok = num_experts_per_tok
+		self.swish_run = swish_run
 		self.xe_moe = xe_moe
+		self.xe_kvnorm = xe_kvnorm
 		super().__init__(
 			bos_token_id=bos_token_id,
 			eos_token_id=eos_token_id,
