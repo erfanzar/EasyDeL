@@ -63,14 +63,15 @@ from easydel import __version__
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.utils import Timers, readme_generator
 from easydel.utils.helpers import get_logger
-
-from .trainer_protocol import (
-	BaseProgressBar,
-	BaseTrainerProtocol,
+from .metrics import (
 	JSONProgressBar,
 	NullProgressBar,
 	RichProgressBar,
 	TqdmProgressBar,
+	BaseProgressBar,
+)
+from .trainer_protocol import (
+	BaseTrainerProtocol,
 	TrainerConfigureDataloaderOutput,
 	TrainerConfigureFunctionOutput,
 	TrainerConfigureModelOutput,
@@ -107,7 +108,8 @@ class BaseTrainer(BaseTrainerProtocol):
 			raise ValueError("Either model or model_state should be passed.")
 		elif model_state is None:
 			model_state = model.to_state()
-
+		if arguments.model_name is None:
+			arguments.model_name = getattr(model_state.model, "_model_type", "module")
 		self.arguments = arguments
 		self.model_state = model_state
 		self._model = flax.nnx.eval_shape(lambda: self.model_state.model)

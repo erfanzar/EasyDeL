@@ -28,7 +28,7 @@ NUM_TRAIN_EPOCHS = 4
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 3e-4
 WARMUP_STEPS = 5
-SAVE_STEPS = 10
+SAVE_STEPS = 100
 DO_LAST_SAVE = True
 # Derived Constants
 NUM_TRAIN_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
@@ -105,7 +105,6 @@ def create_training_args(
 	logging.info("Creating training arguments...")
 	training_args = ed.TrainingArguments(
 		save_directory="tmp-files",
-		model_name="TrainerTest",
 		loss_config=LossConfig(z_loss=0.0008),
 		num_train_epochs=NUM_TRAIN_EPOCHS,
 		total_batch_size=TOTAL_BATCH_SIZE,
@@ -116,7 +115,7 @@ def create_training_args(
 		do_eval=True,
 		max_sequence_length=sequence_length,
 		track_memory=True,
-		use_wandb=False,
+		use_wandb=True,
 		weight_distribution_log_steps=5,
 		learning_rate=learning_rate,
 		do_last_save=DO_LAST_SAVE,
@@ -126,11 +125,12 @@ def create_training_args(
 		per_epoch_training_steps=NUM_TRAIN_EXAMPLES,
 		per_epoch_evaluation_steps=NUM_TRAIN_EXAMPLES,
 		# training_time_limit="80Min",
+		wandb_entity="erfanzar",
 		optimizer=ed.EasyDeLOptimizers.ADAMW,
 		scheduler=ed.EasyDeLSchedulers.COSINE,
 		clip_grad=1.0,
 		warmup_steps=warmup_steps,
-		report_steps=100,
+		report_steps=10,
 		log_steps=100,
 		progress_bar_type="json",
 	)
