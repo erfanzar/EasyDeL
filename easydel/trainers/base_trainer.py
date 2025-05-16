@@ -61,7 +61,7 @@ except ImportError:
 
 from easydel import __version__
 from easydel.infra.base_module import EasyDeLBaseModule
-from easydel.utils import Timers
+from easydel.utils import Timers, readme_generator
 from easydel.utils.helpers import get_logger
 
 from .trainer_protocol import (
@@ -310,8 +310,6 @@ class BaseTrainer(BaseTrainerProtocol):
 		is_train: bool,
 	) -> tp.Tuple[tp.Dict[str, jax.Array], tp.Dict[str, tp.Union[float, int, str]]]:
 		return batch, {}
-
-
 
 	def _ensure_functions_compiled(self):
 		self.compile_aot()
@@ -744,76 +742,105 @@ class BaseTrainer(BaseTrainerProtocol):
 
 	def _get_information(self) -> str:
 		"""
-		Generate formatted information about the model and training setup.
+		Generate formatted information about the model and training setup using Jinja2.
 
 		Returns:
-		    str: Formatted markdown string containing model and training information
+		    str: Formatted markdown string containing model and training information.
 		"""
+
+		if self.config is None:
+			logger.warning(
+				"Model config is not available for README generation. "
+				"Ensure `_configure_model` has been called."
+			)
+			return (
+				f"# Partial Training Information for {self.arguments.model_name}\n"
+				f"Model configuration was not available at the time of README generation.\n"
+				f"Trained with EasyDeL v{__version__}."
+			)
+
 		device_info = self._get_device_info()
-		partition_rules = self._format_partition_rules()
+		partition_rules_str = self._format_partition_rules()
 
-		return f"""
-# {self.arguments.model_name}
+		_TASK_TYPE_TO_AUTO_CLASS_KEY = {
+			TaskType.CAUSAL_LM: "CausalLM",
+			TaskType.SEQUENCE_CLASSIFICATION: "SequenceClassification",
+			TaskType.IMAGE_TEXT_TO_TEXT: "ImageTextToText",
+			TaskType.VISION_LM: "ImageTextToText",
+			TaskType.BASE_MODULE: "",
+			TaskType.BASE_VISION: "",
+			TaskType.SEQUENCE_TO_SEQUENCE: "sequence-to-sequence",
+			TaskType.SPEECH_SEQUENCE_TO_SEQUENCE: "SpeechSeq2Seq",
+			TaskType.ZERO_SHOT_IMAGE_CLASSIFICATION: "ZeroShotImageClassification",
+			TaskType.AUDIO_CLASSIFICATION: "",
+			TaskType.IMAGE_CLASSIFICATION: "",
+			TaskType.AUTO_BIND: "",
+		}
+		model_actual_task_type = getattr(self.config, "task_type", TaskType.CAUSAL_LM)
+		if not isinstance(model_actual_task_type, TaskType):
+			model_actual_task_type = TaskType.CAUSAL_LM
+		model_task_for_template = _TASK_TYPE_TO_AUTO_CLASS_KEY.get(
+			model_actual_task_type, ""
+		)
 
-## 🚀 Trained With [EasyDeL](https://github.com/erfanzar/EasyDeL)
+		attn_config_value = getattr(self.config, "attn_mechanism", "vanilla")
+		if hasattr(attn_config_value, "value"):
+			attn_mechanism_for_template = str(attn_config_value.value)
+		else:
+			attn_mechanism_for_template = str(attn_config_value)
 
-EasyDeL is an open-source framework designed to enhance and streamline the training process of machine learning
-models. With a primary focus on Jax, EasyDeL aims to provide convenient and effective solutions for 
-training Flax/Jax models on TPU/GPU, for both serving and training purposes.
+		model_data = {
+			"name": self.arguments.model_name,
+			"architecture": str(getattr(self.config, "model_type", "N/A")),
+			"device_info": device_info,
+			"partition_rules_str": partition_rules_str,
+			"dtype_str": str(self.model.dtype) if self.model else "N/A",
+			"param_dtype_str": str(self.model.param_dtype) if self.model else "N/A",
+			"model_task_str": model_task_for_template,
+			"attn_mechanism_str": attn_mechanism_for_template,
+		}
 
-## 📦 Installation & Usage
- 
-```python
-from easydel import AutoEasyDeLModelForCausalLM
-from jax import numpy as jnp, lax
+		context = {
+			"arguments": self.arguments,
+			"config": self.config,
+			"model": model_data,
+			"easydel_version": __version__,
+		}
+		try:
+			from jinja2 import Environment, FileSystemLoader
 
-model = AutoEasyDeLModelForCausalLM.from_pretrained(
-    f"REPO_ID/{self.arguments.model_name}",
-    dtype=...,
-    param_dtype=...,
-    precision=lax.Precision("fastest"),
-    auto_shard_model=True,
-)
-```
+			env = Environment(
+				loader=FileSystemLoader(os.path.dirname(__file__)),
+				autoescape=False,
+			)
+			template = env.from_string(readme_generator.EASYDEL_TRAINER_README_TEMPLATE)
+			out = template.render(context).strip()
+			return out
+		except ImportError:
+			logger.warning(
+				"Jinja2 not installed. Falling back to basic README generation. "
+				"Install Jinja2 for a richer README: `pip install jinja2`"
+			)
 
-## 🔧 Training Configuration
+			return f"""
+# {self.arguments.model_name} - Trained with EasyDeL v{__version__}
 
-### Model Details
-- **Architecture**: {self.config.model_type}
-- **Platform**: {device_info["platform"]}
-- **Number of Devices**: {device_info["device_count"]}
+## Training Configuration (Basic)
+- Model Architecture: {model_data["architecture"]}
+- Platform: {device_info["platform"]} ({device_info["device_count"]} devices)
+- Learning Rate: {self.arguments.learning_rate}
+- Optimizer: {self.arguments.optimizer}
+- Epochs: {self.arguments.num_train_epochs}
+- Batch Size: {self.arguments.total_batch_size}
+- Sequence Length: {self.arguments.max_sequence_length}
+- Dtype: {model_data["dtype_str"]}
+- Params Dtype: {model_data["param_dtype_str"]}
 
-### Training Parameters
-- **Learning Rate**: {self.arguments.learning_rate} → {self.arguments.learning_rate_end}
-- **Optimizer**: {self.arguments.optimizer}
-- **Scheduler**: {self.arguments.scheduler}
-- **Warmup Steps**: {self.arguments.warmup_steps}
-- **Weight Decay**: {self.arguments.weight_decay}
-- **Loss Config**: {self.arguments.loss_config}
-
-### Training Setup
-- **Epochs**: {self.arguments.num_train_epochs}
-- **Batch Size**: {self.arguments.total_batch_size}
-- **Sequence Length**: {self.arguments.max_sequence_length} 
-- **Dtype**: {str(self.model.dtype)}
-- **Params Dtype**: {str(self.model.param_dtype)}
-
-### Advanced Configuration
-- **Gradient Checkpointing**: {self.model.config.gradient_checkpointing}  
-- **Gradient Accumulation Steps**: {self.arguments.gradient_accumulation_steps}
-- **Max Training Steps**: {self.arguments.max_training_steps}
-- **Max Evaluation Steps**: {self.arguments.max_evaluation_steps}
-- **Training Duration**: {self.arguments.training_time_limit}
-
-### Sharding Configuration
-```python
-# Partition Rules
-{partition_rules}
-```
-
----
-*Generated with EasyDeL v{__version__}*
+*Install Jinja2 for a more detailed README.*
 """
+		except Exception as e:
+			logger.error(f"Error generating README with Jinja2: {str(e)}")
+			return f"# Error during README generation for {self.arguments.model_name}"
 
 	def save_information(self, output_path: tp.Union[str, Path]) -> None:
 		"""

@@ -23,6 +23,146 @@ from easydel.utils.helpers import get_logger
 
 logger = get_logger(__name__)
 
+EASYDEL_TRAINER_README_TEMPLATE = """
+{%- set auto_class_map = {
+    "CausalLM": "AutoEasyDeLModelForCausalLM",
+    "SequenceClassification": "AutoEasyDeLModelForSequenceClassification",
+    "ImageTextToText": "AutoEasyDeLModelForImageTextToText",
+    "Vision2Seq": "AutoEasyDeLModelForVision2Seq",
+    "AudioToText": "AutoEasyDeLModelForAudioToText"
+} %}
+{%- set auto_class = auto_class_map.get(model.model_task_str, "AutoEasyDeLModelForCausalLM") %}
+{%- set attn_enum_map = {
+    "vanilla": "VANILLA",
+    "flash": "FLASH", "flash_attn": "FLASH", "flash_attention": "FLASH", "flashattn": "FLASH",
+    "flash_attn2": "FLASH_ATTN2", "flash_attention2": "FLASH_ATTN2", "flashattn2": "FLASH_ATTN2",
+    "splash": "SPLASH", "splash_attn": "SPLASH", "splash_attention": "SPLASH",
+    "ring": "RING", "ring_attn": "RING", "ring_attention": "RING",
+    "paged": "PAGED", "paged_attn": "PAGED", "paged_attention": "PAGED",
+    "mistral": "MISTRAL"
+} %}
+{%- set attn_enum = attn_enum_map.get(model.attn_mechanism_str.lower(), "VANILLA") %}
+{%- set jnp_param_dtype_for_template = model.param_dtype_str if model.param_dtype_str in ['bfloat16', 'float16', 'float32', 'float64'] else 'float16' %}
+
+---
+tags:
+- EasyDeL
+- {{ model.architecture }}
+- {{ model.model_task_str }}
+- {{ model.attn_mechanism_str }}
+- safetensors
+- Flax
+- JAX
+{% if model.device_info.platform != "UNKNOWN" %}
+- {{ model.device_info.platform }}
+{% endif %}
+---
+<p align="center">
+  <a href="https://github.com/erfanzar/EasyDeL">
+    <img src="https://raw.githubusercontent.com/erfanzar/easydel/main/images/easydel-logo-with-text.png" height="80">
+  </a>
+</p>
+<p align="center">
+  <a href="https://github.com/erfanzar/EasyDeL">
+    <img src="https://img.shields.io/badge/🤗_EasyDeL-v{{ easydel_version }}-blue.svg" />
+  </a>
+  <a href="https://github.com/erfanzar/EasyDeL">
+    <img src="https://img.shields.io/badge/Model_Arch-{{ model.architecture }}-green.svg" />
+  </a>
+</p>
+
+# Training Run: {{ model.name }}
+
+This document outlines the configuration and parameters used for training the model `{{ model.name }}` using the [EasyDeL](https://github.com/erfanzar/EasyDeL) library.
+
+EasyDeL is an open-source framework designed to enhance and streamline the training process of machine learning models, with a primary focus on JAX/Flax for TPU/GPU environments.
+
+## How to Load This Checkpoint
+
+You can load the checkpoint generated from this training run using EasyDeL as follows:
+
+```python 
+import easydel as ed
+from jax import numpy as jnp, lax
+
+# Path to the directory where this README.md is located
+repo_id = "user/model-id" # <-- TODO: Update this path with the actual save directory or model repo
+
+model = ed.{{ auto_class }}.from_pretrained(
+    repo_id,
+    config_kwargs=EasyDeLBaseConfigDict(
+        # use_scan_mlp=False, # Set to True to potentially reduce memory usage
+        attn_dtype=jnp.float16, # Or jnp.bfloat16
+        # freq_max_position_embeddings=max_length, # Set if using RoPE and need truncation
+        # mask_max_position_embeddings=max_length, # Set if max length is defined
+        attn_mechanism=ed.AttentionMechanisms.{{ attn_enum }} # Matches the mechanism used by this model
+    ),
+    dtype=jnp.float16, # Or jnp.bfloat16 - Computation data type
+    param_dtype=jnp.float16, # Or jnp.bfloat16 - Parameter data type
+    precision=lax.Precision("fastest"), # Like "default", "fastest", "high", "highest"
+    auto_shard_model=True, # Auto-shard across available devices
+)
+```
+*Note: Replace `checkpoint_path` with the actual path to the saved checkpoint directory.*
+*The `params` returned are ready to be used with the `model`.*
+
+## Training Configuration Summary
+
+### Model & Hardware
+
+- **Model Name (Run Name)**: `{{ model.name }}`
+- **Base Model Architecture**: `{{ model.architecture }}`
+- **Platform**: `{{ model.device_info.platform }}`
+- **Number of Devices Used**: `{{ model.device_info.device_count }}` (total), `{{ model.device_info.host_device_count }}` (local)
+- **EasyDeL Version**: `v{{ easydel_version }}`
+
+### Key Training Parameters
+
+- **Learning Rate (Start → End)**: `{{ arguments.learning_rate }}` {% if arguments.learning_rate_end is not none and arguments.learning_rate_end != arguments.learning_rate %}→ `{{ arguments.learning_rate_end }}`{% endif %}
+- **Optimizer**: `{{ arguments.optimizer }}`
+- **Scheduler**: `{{ arguments.scheduler }}`
+- **Warmup Steps**: `{{ arguments.warmup_steps }}`
+- **Weight Decay**: `{{ arguments.weight_decay }}`
+- **Loss Configuration**: `{{ arguments.loss_config | string }}`
+
+### Data & Batching
+
+- **Number of Training Epochs**: `{{ arguments.num_train_epochs }}`
+- **Total Batch Size (per step)**: `{{ arguments.total_batch_size }}`
+- **Maximum Sequence Length**: `{{ arguments.max_sequence_length }}`
+- **Gradient Accumulation Steps**: `{{ arguments.gradient_accumulation_steps }}`
+
+### Datatypes & Precision
+
+- **Computation `dtype`**: `{{ model.dtype_str }}`
+- **Parameter `param_dtype`**: `{{ model.param_dtype_str }}`
+- **Gradient Checkpointing Method**: `{{ config.gradient_checkpointing }}`
+- **Attention Mechanism Used in Training**: `{{ model.attn_mechanism_str }}` (can be loaded as `AttentionMechanisms.{{ attn_enum }}` if using `EasyDeLConfig`)
+
+### Run Control
+
+- **Max Training Steps**: `{{ arguments.max_training_steps if arguments.max_training_steps is not none else "Not Set" }}`
+- **Max Evaluation Steps**: `{{ arguments.max_evaluation_steps if arguments.max_evaluation_steps is not none else "Not Set" }}`
+- **Training Time Limit**: `{{ arguments.training_time_limit if arguments.training_time_limit is not none else "Not Set" }}`
+
+## Citation
+
+If you use EasyDeL in your research or work, please cite it:
+
+```bibtex
+@misc{Zare Chavoshi_2023,
+    title={EasyDeL: An open-source library for enhancing and streamlining the training process of machine learning models},
+    url={https://github.com/erfanzar/EasyDeL},
+    author={Zare Chavoshi, Erfan},
+    year={2023}
+}
+```
+
+---
+*This document was automatically generated by EasyDeL v{{ easydel_version }} during the training run.*
+"""
+
+
 JINJA_TEMPLATE = """
 {% set auto_class_map = {
     "CausalLM": "AutoEasyDeLModelForCausalLM",
@@ -66,14 +206,20 @@ tags:
 - XLA
 - Flax
 ---
-<div align="center">
- <a href="https://github.com/erfanzar/EasyDeL">
- <img src="https://raw.githubusercontent.com/erfanzar/easydel/main/images/easydel-logo-with-text.png" height="80">
- </a>
- <br>
- [![EasyDeL](https://img.shields.io/badge/🤗_EasyDeL-{{ model.version }}-blue.svg)](https://github.com/erfanzar/EasyDeL)
- [![Model Type](https://img.shields.io/badge/Model_Type-{{ model.type }}-green.svg)](https://github.com/erfanzar/EasyDeL)
-</div>
+<p align="center">
+  <a href="https://github.com/erfanzar/EasyDeL">
+    <img src="https://raw.githubusercontent.com/erfanzar/easydel/main/images/easydel-logo-with-text.png" height="80">
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/erfanzar/EasyDeL">
+    <img src="https://img.shields.io/badge/🤗_EasyDeL-{{ model.version }}-blue.svg" />
+  </a>
+  <a href="https://github.com/erfanzar/EasyDeL">
+    <img src="https://img.shields.io/badge/Model_Type-{{ model.type }}-green.svg" />
+  </a>
+</p>
 
 # {{ model.name }}
 
@@ -235,6 +381,10 @@ class ModelInfo:
 	overview: tp.Optional[str] = field(
 		default=None, metadata={"help": "Custom overview text for the model."}
 	)
+
+	def __post_init__(self):
+		if hasattr(self.model_type, "value"):
+			self.model_type = self.model_type.value
 
 
 class ReadmeGenerator:
