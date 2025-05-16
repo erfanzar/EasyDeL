@@ -18,6 +18,7 @@ import functools
 import json
 import os
 import re
+import traceback
 import typing as tp
 import warnings
 from copy import deepcopy
@@ -45,7 +46,8 @@ from easydel.infra.loss_utils import LossConfig
 from easydel.utils.compiling_utils import hash_fn
 from easydel.utils.helpers import get_logger
 
-from .utils import JaxDistributedConfig, compute_weight_stats
+from .metrics import MetricsHistogram, compute_weight_stats
+from .utils import JaxDistributedConfig
 
 try:
 	import wandb  # type: ignore # noqa: F821
@@ -215,8 +217,8 @@ class TrainingArguments:
 		default=None,
 		metadata={"help": "The maximum number of evaluation step per each epoch."},
 	)
-	model_name: str = field(
-		default="BaseTrainer",
+	model_name: tp.Optional[str] = field(
+		default=None,
 		metadata={"help": "The name of the model."},
 	)
 	model_parameters: tp.Optional[dict] = field(
@@ -372,7 +374,7 @@ class TrainingArguments:
 		metadata={"help": "The weight decay value."},
 	)
 	weight_distribution_pattern: str = field(
-		default=r".*?(layernorm|norm).*?",
+		default=r".*",
 		metadata={"help": "The pattern to use to extract weight distribution."},
 	)
 	weight_distribution_log_steps: int = field(
@@ -689,26 +691,46 @@ class TrainingArguments:
 		return metric_name
 
 	def log_weight_distribution(self, state, step: int):
+		"""Log weight distribution histograms and statistics.
+
+		Args:
+		    state: Model state containing parameters
+		    step: Current training step
+		"""
 		if self.weight_distribution_log_steps > 0 and (
 			(step % self.weight_distribution_log_steps) == 0
 		):
 			stats = compute_weight_stats(state.graphstate, self.weight_distribution_pattern)
+
 			stats = jax.experimental.multihost_utils.process_allgather(stats)
+
 			metrics = {}
-			for key, value in stats.items():
-				if key.endswith("/values"):
-					path: str = key[:-7]
-					path = path.replace("/", ".")
-					metrics[f"weights-histogram/{path}"] = (value[0].tolist(), value[1].tolist())
-				else:
-					key = key.replace("/", ".")
-					metrics[f"weights-information/{key}"] = float(value)
+			for key, histogram in stats.items():
+				try:
+					if isinstance(histogram, MetricsHistogram):
+						path = key.replace("/", ".")
+						metrics[f"weights-histogram/{path}"] = (
+							histogram.bin_counts.tolist(),
+							histogram.bin_edges.tolist(),
+						)
+
+						base_path = path.replace("/histogram", "")
+						metrics[f"weights-information/{base_path}/mean"] = float(histogram.mean)
+						metrics[f"weights-information/{base_path}/std"] = histogram.std.item()
+						metrics[f"weights-information/{base_path}/min"] = histogram.min.item()
+						metrics[f"weights-information/{base_path}/max"] = histogram.max.item()
+					else:
+						path = key.replace("/", ".")
+						metrics[f"weights-information/{path}"] = histogram
+				except Exception as e:
+					traceback.print_exc()
+					raise e
 			self.log_metrics(metrics, step)
 
 	def _log_to_wandb(
 		self,
-		metrics,
-		step,
+		metrics: tp.Dict[str, tp.Any],
+		step: int,
 		log_as: tp.Optional[tp.Literal["summary", "config"]] = None,
 	):
 		"""
@@ -717,10 +739,10 @@ class TrainingArguments:
 		This method processes the given metrics and logs them to wandb if it's enabled and properly initialized.
 
 		Args:
-		  metrics (dict): A dictionary of metrics to log. Keys are metric names, values are the metric values.
-		  step (int): The current step or iteration number.
+		    metrics: A dictionary of metrics to log. Keys are metric names, values are the metric values.
+		    step: The current step or iteration number.
+		    log_as: How to log the metrics (None for regular logging, "summary" for wandb.summary, "config" for wandb.config)
 		"""
-
 		if self.use_wandb and wandb is not None:
 			if log_as == "summary":
 				wandb.summary.update(metrics)
@@ -730,39 +752,68 @@ class TrainingArguments:
 				wandb_metrics = {}
 				for key, value in metrics.items():
 					try:
+						if isinstance(value, tuple) and len(value) == 2:
+							bin_counts, bin_edges = value
+							if isinstance(bin_counts, (list, jax.Array)) and isinstance(
+								bin_edges, (list, jax.Array)
+							):
+								bin_counts = np.array(bin_counts).reshape(-1)
+								bin_edges = np.array(bin_edges).reshape(-1)
+								np_histogram = (bin_counts, bin_edges)
+
+								wandb_metrics[key] = wandb.Histogram(np_histogram=np_histogram)
+								continue
+
 						wandb_metrics[key] = (
 							self._create_wandb_histogram(value)
 							if isinstance(value, (float, int, list, tuple, np.generic, jax.Array))
 							else value
 						)
-						wandb_metrics = {k: v for k, v in wandb_metrics.items() if v is not None}
+
 					except Exception as e:
 						warnings.warn(f"Failed to log metric {key} to wandb: {e}", stacklevel=3)
+
+				wandb_metrics = {k: v for k, v in wandb_metrics.items() if v is not None}
+
 				try:
 					wandb.log(wandb_metrics, step=step)
-				except Exception:
-					...
+				except Exception as e:
+					warnings.warn(f"Failed to log metrics to wandb: {e}", stacklevel=3)
 
 	def _log_to_tensorboard(
 		self,
-		metrics,
-		step,
+		metrics: tp.Dict[str, tp.Any],
+		step: int,
 		log_as: tp.Optional[tp.Literal["summary", "config"]] = None,
 	):
 		"""
 		Log metrics to TensorBoard.
 
-		This method processes the given metrics and logs them to TensorBoard.
-
 		Args:
-		    metrics (dict): A dictionary of metrics to log. Keys are metric names, values are the metric values.
-		    step (int): The current step or iteration number.
+		    metrics: A dictionary of metrics to log
+		    step: The current step or iteration number
+		    log_as: Currently not used for TensorBoard
 		"""
 		summary_writer = self.get_tensorboard()
 		for key, value in metrics.items():
 			try:
 				if isinstance(value, (float, int)):
 					summary_writer.scalar(key, value, step)
+				elif isinstance(value, tuple) and len(value) == 2:
+					bin_counts, bin_edges = value
+					if isinstance(bin_counts, (list, jax.Array)) and isinstance(
+						bin_edges, (list, jax.Array)
+					):
+						bin_counts = np.array(bin_counts)
+						bin_edges = np.array(bin_edges)
+						values = []
+						for i, count in enumerate(bin_counts):
+							if i < len(bin_edges) - 1:
+								bin_center = (bin_edges[i] + bin_edges[i + 1]) / 2
+								values.extend([bin_center] * int(count))
+
+						if values:
+							summary_writer.histogram(key, np.array(values), step)
 				elif isinstance(value, (list, np.ndarray, jnp.ndarray)):
 					summary_writer.histogram(key, np.array(value), step)
 			except Exception as e:
@@ -774,18 +825,11 @@ class TrainingArguments:
 		"""
 		Create a wandb.Histogram object from the given value.
 
-		This method handles the conversion of various data types to a format suitable for wandb histograms.
-
 		Args:
-		    value: The value to convert into a wandb.Histogram. Can be a list, tuple, numpy array, etc.
+		    value: The value to convert into a wandb.Histogram
 
 		Returns:
-		    wandb.Histogram or None: A wandb.Histogram object if successful, None if an error occurs.
-
-		Notes:
-		    - Non-numpy array inputs are converted to numpy arrays.
-		    - float16 and bfloat16 dtypes are converted to float32 to avoid potential issues.
-		    - tp.Any exceptions during histogram creation are caught and logged, returning None in such cases.
+		    wandb.Histogram or None: A wandb.Histogram object if successful, None if an error occurs
 		"""
 		try:
 			if isinstance(value, (jax.Array, np.generic)):
@@ -793,15 +837,6 @@ class TrainingArguments:
 				if value.dtype in [np.bfloat16]:
 					value = value.astype(np.float32)
 				value = value.astype(np.float16)
-				return wandb.Histogram(value)
-			if hasattr(value, "__len__"):
-				if isinstance(value, tuple):
-					if len(value) == 2:
-						histogram = wandb.Histogram(
-							np_histogram=(value[0][0], value[1][0]),
-							num_bins=64,
-						)
-					return histogram
 				return wandb.Histogram(value)
 			return value
 		except Exception as e:
@@ -819,7 +854,7 @@ class TrainingArguments:
 		Serializes this instance to a JSON string.
 
 		Returns:
-				`str`: String containing all the attributes that make up this configuration instance in JSON format.
+		    `str`: String containing all the attributes that make up this configuration instance in JSON format.
 		"""
 		config_dict = self.to_dict()
 		config_dict["trainer_config_class"] = self.__class__.__name__
@@ -831,11 +866,11 @@ class TrainingArguments:
 		Instantiates a [`PretrainedConfig`] from the path to a JSON file of parameters.
 
 		Args:
-				json_file (`str` or `os.PathLike`):
-						Path to the JSON file containing the parameters.
+		    json_file (`str` or `os.PathLike`):
+		        Path to the JSON file containing the parameters.
 
 		Returns:
-				[`PretrainedConfig`]: The configuration object instantiated from that JSON file.
+		    [`PretrainedConfig`]: The configuration object instantiated from that JSON file.
 
 		"""
 
@@ -858,8 +893,8 @@ class TrainingArguments:
 		Save this instance to a JSON file.
 
 		Args:
-				json_file_path (`str` or `os.PathLike`):
-						Path to the JSON file in which this configuration instance's parameters will be saved.
+		    json_file_path (`str` or `os.PathLike`):
+		        Path to the JSON file in which this configuration instance's parameters will be saved.
 		"""
 		with open(json_file_path, "w", encoding="utf-8") as writer:
 			writer.write(self.to_json_string())

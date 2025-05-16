@@ -22,7 +22,6 @@ import jax.numpy as jnp
 from eformer import common_types
 from eformer.escale import apply_logical_sharding
 from flax import nnx as nn
-from jax import lax
 
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.infra.factory import TaskType, register_module
@@ -47,6 +46,7 @@ from easydel.layers.caching import (
 	TransformerMetadata,
 )
 from easydel.layers.linear import ParallelLinear
+from easydel.layers.norms import RMSNorm
 from easydel.utils.helpers import get_logger
 
 from .xerxes_configuration import XerxesConfig as XerxesConfig
@@ -64,40 +64,6 @@ class PostCross(nn.Module):
 	def __init__(self): ...
 	def __call__(self, x):
 		return jax.nn.tanh(x / 30.0) * 30.0
-
-
-class RMSNorm(nn.Module):
-	def __init__(
-		self,
-		dim: int,
-		eps: float = 1e-6,
-		dtype: jnp.dtype = jnp.float32,
-		param_dtype: jnp.dtype = jnp.float32,
-	):
-		self.dim = dim
-		self.eps = eps
-		self.dtype = dtype
-		self.param_dtype = param_dtype
-		self.kernel = nn.Param(jnp.ones(self.dim, dtype=param_dtype))
-
-	def _norm(self, x: jnp.ndarray) -> jnp.ndarray:
-		return x / lax.sqrt(
-			jnp.square(x.astype(jnp.float32)).mean(-1, keepdims=True) + self.eps
-		)
-
-	def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-		if self.dtype in [
-			jnp.float8_e4m3b11fnuz,
-			jnp.float8_e4m3fn,
-			jnp.float8_e4m3fnuz,
-			jnp.float8_e5m2,
-			jnp.float8_e5m2fnuz,
-		]:
-			x = x.astype(jnp.float32)
-		else:
-			x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
-		output = self._norm(x).astype(self.dtype)
-		return (self.kernel.value.astype(self.dtype)) * output
 
 
 class XerxesMLP(nn.Module):
@@ -331,7 +297,6 @@ class XerxesAttention(AttentionModule):
 		)
 
 		if self.config.xe_kvnorm:
-			# works better with zloss 5e-4
 			query_states = self.q_norm(query_states)
 			key_states = self.k_norm(key_states)
 
@@ -381,9 +346,9 @@ class XerxesAttention(AttentionModule):
 			causal=True,
 			dropout_rng=self.rngs.params(),
 		)
-		attn_output = self.shard_attention_prod(
-			self._merge_heads(attentions.attention_outputs)
-		)
+
+		attn_output = self._merge_heads(attentions.attention_outputs)
+		attn_output = self.shard_attention_prod(attn_output)
 		attn_output = self.o_proj(attn_output)
 		return AttentionLayerOutput(
 			attention_output=attn_output,
@@ -402,6 +367,8 @@ class XerxesSparseMoeBlock(nn.Module):
 		*,
 		rngs: nn.Rngs,
 	):
+		assert config.swish_run is False
+
 		self.config = config
 		self.dtype = dtype
 		self.param_dtype = param_dtype
@@ -723,6 +690,7 @@ class XerxesModel(EasyDeLBaseModule):
 			dynamic_axes=common_types.HiddenStateSharding,
 			partition_manager=self.config.partition_manager,
 		)
+
 		for idx, block in enumerate(self.layers):
 			if output_hidden_states:
 				all_hidden_states += (hidden_states,)
@@ -739,7 +707,7 @@ class XerxesModel(EasyDeLBaseModule):
 				segment_ids=segment_ids,
 				frequencies=self.frequencies,
 			)
-			hidden_states = outputs[0]
+			hidden_states = outputs.hidden_states
 
 			hidden_states = apply_logical_sharding(
 				hidden_states,
@@ -748,7 +716,9 @@ class XerxesModel(EasyDeLBaseModule):
 			)
 
 			if output_attentions:
-				all_attentions += (outputs[1],)
+				all_attentions += (outputs.attention_weight,)
+
+			past_key_values[idx] = outputs.cache_view
 
 		hidden_states = self.norm(hidden_states)
 		if output_hidden_states:

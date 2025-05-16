@@ -13,12 +13,9 @@
 # limitations under the License.
 from __future__ import annotations
 
-import abc
 import os
-import time
 import typing as tp
 from abc import ABCMeta, abstractmethod
-from collections import defaultdict
 from pathlib import Path
 
 import flax
@@ -26,29 +23,20 @@ import flax.core
 import jax
 import numpy as np
 import optax
-from tqdm.autonotebook import tqdm
+from eformer.pytree import auto_pytree
 from jax.sharding import Mesh
 from optax import GradientTransformation, Schedule
-from rich.progress import (
-	Progress,
-	ProgressColumn,
-	Task,
-	TaskID,
-)
-from rich.text import Text
-from eformer.pytree import auto_pytree
+
 from easydel.infra.base_state import EasyDeLState
 from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import CompilationTracker
 from easydel.utils.checkpoint_managers.streamer import CheckpointManager
-from easydel.utils.traversals import flatten_dict
 
 try:
 	import wandb  # noqa: F821 # type:ignore
 except ImportError:
 	wandb = None
 
-from jax import numpy as jnp
 
 from easydel.infra.base_module import (
 	EasyDeLBaseConfig,
@@ -57,6 +45,7 @@ from easydel.infra.base_module import (
 from easydel.utils import Timers
 from easydel.utils.helpers import get_logger
 
+from .metrics import BaseProgressBar, MetricsTracker, StepMetrics
 from .training_configurations import MetricsType, TrainingArguments
 
 if tp.TYPE_CHECKING:
@@ -606,295 +595,3 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 	def __str__(self):
 		"""Return a string representation of the trainer."""
 		...
-
-
-class StepMetrics:
-	"""Handles calculation and tracking of training metrics."""
-
-	def __init__(self, arguments):
-		self.arguments = arguments
-		self.start_time = time.time()
-		self.step_start_time = time.time()
-
-	def start_step(self):
-		"""Mark the start of a training step."""
-		self.step_start_time = time.time()
-
-	def calculate(
-		self,
-		metrics: LossMetrics,
-		current_step: int,
-		epoch: int,
-		flops_per_token: float,
-		batch_size: int,
-		seq_length: int,
-		learning_rate: float,
-		mode: tp.Optional[tp.Literal["eval", "train"]] = None,
-		**extras,
-	) -> tp.Dict[str, float]:
-		"""Calculate comprehensive metrics for the training step."""
-		step_time = time.time() - self.step_start_time
-		total_time = time.time() - self.start_time
-
-		execution_time = metrics.execution_time
-		flops = flops_per_token * seq_length
-		total_flops = flops * batch_size
-		tflops = total_flops / execution_time / 1e12
-		total_tokens = batch_size * seq_length
-		visited_tokens = total_tokens * current_step
-		throughput = total_tokens / execution_time
-
-		mlperf_metrics = {
-			"mlperf/execution_time": float(execution_time),
-			"mlperf/flops": float(flops),
-			"mlperf/flops_per_token": float(flops_per_token),
-			"mlperf/step_time": float(step_time),
-			"mlperf/tflops": float(tflops),
-			"mlperf/throughput": throughput,
-			"mlperf/total_flops": float(total_flops),
-			"mlperf/total_time": float(total_time),
-			"mlperf/total_tokens": total_tokens,
-		}
-
-		loss = metrics.loss
-		z_loss = metrics.z_loss
-
-		basic_metrics = {
-			"epoch": int(epoch),
-			"execution_time": float(execution_time),
-			"learning_rate": float(np.array(learning_rate).item()),
-			"loss": float(loss),
-			"perplexity": float(jnp.exp(loss)),
-			"step": int(current_step),
-			"step_time": float(step_time),
-			"tflops": float(tflops),
-			"visited_tokens": visited_tokens,
-			"z_loss": float(z_loss) if z_loss is not None else None,
-			**extras,
-		}
-
-		if metrics.accuracy is not None:
-			basic_metrics["accuracy"] = float(metrics.accuracy)
-
-		if metrics.chosen_rewards is not None:
-			basic_metrics["chosen_rewards"] = float(jnp.mean(metrics.chosen_rewards).item())
-		if metrics.rejected_rewards is not None:
-			basic_metrics["rejected_rewards"] = float(
-				jnp.mean(metrics.rejected_rewards).item()
-			)
-		if metrics.other_metrics is not None:
-			basic_metrics.update(metrics.other_metrics)
-		if not self.arguments.performance_mode and (mode == "train" or mode is None):
-			detailed_metrics = self._calculate_detailed_metrics(metrics)
-			basic_metrics.update(detailed_metrics)
-		if mode is not None:
-			basic_metrics = {f"{mode}/{k}": v for k, v in basic_metrics.items()}
-		basic_metrics.update(mlperf_metrics)
-
-		return basic_metrics
-
-	def _calculate_detailed_metrics(self, metrics: LossMetrics):
-		"""Calculate additional detailed metrics."""
-		detailed_metrics = {}
-		getattr_in = lambda x: x if not hasattr(x, "value") else x.value  # noqa
-		if self.arguments.log_grad_norms:
-			if metrics.max_grad_norm is not None:
-				detailed_metrics.update(
-					{"train/max_grad_norm": getattr_in(metrics.max_grad_norm).tolist()}
-				)
-
-			if metrics.mean_grad_norm is not None:
-				detailed_metrics.update(
-					{"train/mean_grad_norm": getattr_in(metrics.mean_grad_norm).tolist()}
-				)
-
-			# Add per-layer gradient norms
-			if metrics.grad_norms is not None:
-				detailed_metrics.update(
-					{
-						f"grad_norm/{'.'.join([str(s) for s in layer_name])}": getattr_in(
-							grad_norm
-						).tolist()
-						for layer_name, grad_norm in flatten_dict(metrics.grad_norms).items()
-						if getattr_in(grad_norm) is not None
-					}
-				)
-
-		return detailed_metrics
-
-
-class MetricsTracker:
-	"""Tracks and aggregates training metrics over time."""
-
-	def __init__(self):
-		self.loss_sum = None
-		self.accuracy_sum = None
-		self.metrics_history = defaultdict(list)
-		self.step_offset = 0
-
-	def update(self, loss, accuracy, step):
-		"""Update tracked metrics with new values."""
-		with jax.spmd_mode("allow_all"):
-			self.loss_sum = loss if self.loss_sum is None else self.loss_sum + loss
-			mean_loss = self.loss_sum / (step - self.step_offset)
-			if accuracy != float("inf"):
-				if accuracy is None:
-					accuracy = 0.0
-				self.accuracy_sum = (
-					accuracy if self.accuracy_sum is None else self.accuracy_sum + accuracy
-				)
-				mean_accuracy = self.accuracy_sum / (step - self.step_offset)
-
-				return float(mean_loss), float(mean_accuracy)
-			return float(mean_loss)
-
-	def reset(self, step):
-		"""Reset tracked metrics."""
-		self.loss_sum = None
-		self.accuracy_sum = None
-		self.step_offset = step
-
-
-class MetricsColumn(ProgressColumn):
-	"""A custom progress column for displaying metrics."""
-
-	def __init__(self, metrics_to_show=None):
-		super().__init__()
-		self.metrics_to_show = metrics_to_show
-
-	def render(self, task: Task) -> Text:
-		"""Render the metrics in a organized way."""
-		if not task.fields.get("metrics"):
-			return Text("")
-
-		metrics = task.fields["metrics"]
-		display_items = []
-
-		for key, value in metrics.items():
-			if self.metrics_to_show is None:
-				if isinstance(value, float):
-					if abs(value) < 0.01 or abs(value) > 1000:
-						formatted_value = f"{value:.4e}"
-					else:
-						formatted_value = f"{value:.4f}"
-				else:
-					formatted_value = str(value)
-
-				display_items.append(f"{key}={formatted_value}")
-			else:
-				if any(metric in key for metric in self.metrics_to_show):
-					if isinstance(value, float):
-						if abs(value) < 0.01 or abs(value) > 1000:
-							formatted_value = f"{value:.4e}"
-						else:
-							formatted_value = f"{value:.4f}"
-					else:
-						formatted_value = str(value)
-
-					display_items.append(f"{key}={formatted_value}")
-
-		return Text(" • ".join(display_items), style="cyan")
-
-
-class BaseProgressBar(abc.ABC):
-	"""Abstract base class for progress bar implementations."""
-
-	@abc.abstractmethod
-	def update(self, n: int = 1) -> None:
-		pass
-
-	@abc.abstractmethod
-	def set_postfix(self, **kwargs) -> None:
-		pass
-
-	@abc.abstractmethod
-	def reset(self) -> None:
-		pass
-
-	@abc.abstractmethod
-	def close(self) -> None:
-		pass
-
-
-class NullProgressBar(BaseProgressBar):
-	"""Dummy progress bar that does nothing - useful for multiprocessing."""
-
-	def update(self, n: int = 1) -> None:
-		pass
-
-	def set_postfix(self, **kwargs) -> None:
-		pass
-
-	def reset(self) -> None:
-		pass
-
-	def close(self) -> None:
-		pass
-
-
-class TqdmProgressBar(BaseProgressBar):
-	"""Wrapper for tqdm progress bar."""
-
-	def __init__(self, pbar: tqdm):
-		self.pbar = pbar
-
-	def update(self, n: int = 1) -> None:
-		self.pbar.update(n)
-
-	def set_postfix(self, **kwargs) -> None:
-		self.pbar.set_postfix(**kwargs)
-
-	def reset(self) -> None:
-		self.pbar.n = 0
-		self.pbar.start_t = self.pbar._time()
-
-	def close(self) -> None:
-		self.pbar.close()
-
-
-class JSONProgressBar(BaseProgressBar):
-	"""Wrapper for JSON"""
-
-	def __init__(self, desc=""):
-		self.desc = desc
-
-	def update(self, n: int = 1) -> None: ...
-
-	def set_postfix(self, **kwargs) -> None:
-		for k in list(kwargs.keys()):
-			val = kwargs.get(k)
-			if hasattr(val, "size") and val.size == 1:
-				kwargs[k] = val.item()
-
-		print(kwargs)
-
-	def reset(self) -> None: ...
-
-	def close(self) -> None: ...
-
-
-class RichProgressBar(BaseProgressBar):
-	"""Wrapper for rich progress bar."""
-
-	def __init__(self, progress: Progress, task_id: TaskID):
-		"""Initialize RichProgressBar with an existing Progress instance and task_id."""
-		self.progress = progress
-		self.task_id = task_id
-		self._postfix = {}
-
-	def update(self, n: int = 1) -> None:
-		self.progress.update(self.task_id, advance=n)
-
-	def set_postfix(self, **kwargs) -> None:
-		self._postfix.update(kwargs)
-		self.progress.update(self.task_id, metrics=self._postfix)
-
-	def reset(self) -> None:
-		self.progress.reset(self.task_id)
-		self._postfix = {}
-
-	def close(self) -> None:
-		try:
-			self.progress.remove_task(self.task_id)
-		except KeyError:
-			pass

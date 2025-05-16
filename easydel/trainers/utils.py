@@ -13,21 +13,19 @@
 # limitations under the License.
 import logging
 import random
-import re
 import typing as tp
 import warnings
 from contextlib import contextmanager
-from functools import partial
-from eformer.pytree import auto_pytree
+
 import chex
 import jax
 import numpy as np
+from eformer.pytree import auto_pytree
 from jax import numpy as jnp
 from ml_collections import ConfigDict
 from ml_collections.config_dict import placeholder
 
 from easydel.infra.utils import ProcessingClassType
-from easydel.utils import traversals
 from easydel.utils.helpers import get_logger
 
 logger = get_logger(__name__)
@@ -1145,41 +1143,3 @@ def truncate_right(input_ids, stop_token_id, pad_token_id):
 	output_ids = jnp.where(idxs > trunc_idxs, pad_token_id, input_ids)
 	mask = jnp.where(idxs > trunc_idxs, 0, 1)
 	return output_ids, mask
-
-
-@partial(jax.jit, static_argnums=(1,))
-def compute_weight_stats(params, repattern: str):
-	"""Compute statistics for model weights in a JIT-compatible way.
-
-	Args:
-	    params: Model parameters
-	    repattern: parameters to analyze
-
-	Returns:
-	    Dictionary of weight statistics
-	"""
-	stats = {}
-	for path, weight in traversals.flatten_dict(params).items():
-		weight = weight.value
-		pattern_search = ".".join([str(p) for p in path])
-		path = "/".join([str(p) for p in path])
-		if bool(re.match(repattern, pattern_search)):
-			stats[f"{path}/values"] = _create_values_histogram(weight)
-			stats[f"{path}/mean"] = jnp.mean(weight)
-			stats[f"{path}/std"] = jnp.std(weight)
-			stats[f"{path}/min"] = jnp.min(weight)
-			stats[f"{path}/max"] = jnp.max(weight)
-	return stats
-
-
-@jax.jit
-def _create_values_histogram(arr):
-	edges = jnp.histogram_bin_edges(arr, 64)
-	arr = arr.reshape(1, -1)
-	left_edges = edges[:-1, None]
-	right_edges = edges[1:, None]
-	index = ((arr >= left_edges) & (arr < right_edges)).astype(arr.dtype)
-	out = index.sum(axis=1, dtype=arr.dtype)
-	if out.size >= 1:
-		out = out.at[-1].add(1)
-	return out, edges
