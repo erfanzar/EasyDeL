@@ -253,6 +253,9 @@ class XerxesAttention(AttentionModule):
 			self.head_dim,
 			True,
 		)
+		self.sliding_window = None
+		if not config.xe_kvnorm:
+			self.sliding_window = 4096 if bool((self.layer_idx % 2) == 0) else None
 
 	def _merge_heads(self, hidden_states):
 		"""
@@ -330,7 +333,7 @@ class XerxesAttention(AttentionModule):
 		if self.config.xe_kvnorm:
 			# works better with zloss 5e-4
 			query_states = self.q_norm(query_states)
-			key_states = self.q_norm(key_states)
+			key_states = self.k_norm(key_states)
 
 		(
 			query_states,
@@ -360,7 +363,7 @@ class XerxesAttention(AttentionModule):
 			attention_mask=attention_mask,
 			causal_mask=causal_mask,
 			fcm_mask=fcm_mask,
-			sliding_window=4096 if bool((self.layer_idx % 2) == 0) else None,
+			sliding_window=self.sliding_window,
 		)
 
 		attentions = self.attention_performer.forward(
@@ -369,7 +372,7 @@ class XerxesAttention(AttentionModule):
 			value_states=value_states,
 			mode=mode,
 			bias=None,
-			sliding_window=4096 if bool((self.layer_idx % 2) == 0) else None,
+			sliding_window=self.sliding_window,
 			cache_metadata=cache_metadata,
 			cache_view=cache_view,
 			init_bias=init_attention_bias,
