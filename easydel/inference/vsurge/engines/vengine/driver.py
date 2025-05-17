@@ -51,12 +51,25 @@ logger = get_logger("vSurge-vDriver")
 
 
 class vDriver(AbstractDriver):
-	"""
-	Drives the engines.
+	"""Drives the engines.
 
-	This class manages the prefill and decode engines, orchestrates the data transfer
-	between them, and handles tokenization and detokenization. It uses background
-	threads to perform these tasks concurrently.
+	The `vDriver` class manages the prefill and decode engines (`vEngine`),
+	orchestrates the data transfer between them, and handles tokenization and
+	detokenization. It uses background threads to perform these tasks concurrently,
+	allowing for high-throughput inference.
+
+	Attributes:
+	    _prefill_engines (list[vEngine]): List of vEngines used for the prefill stage.
+	    _decode_engines (list[vEngine]): List of vEngines used for the decode stage.
+	    _prefill_backlog (queue.Queue[ActiveRequest | None]): Queue for incoming prefill requests.
+	    _transfer_backlogs (list[queue.Queue[ActiveRequest]]): Queues for transferring requests from prefill to decode engines.
+	    _decode_backlogs (dict[int, queue.Queue[ActiveRequest]]): Queues for incoming decode requests, organized by engine index.
+	    _detokenize_backlogs (list[queue.Queue[ResultTokens]]): Queues for detokenizing results, organized by engine index.
+	    _decode_slots (list[queue.Queue[int]]): Queues for managing available decode slots in each engine.
+	    _active_requests (list[queue.Queue[tuple[int, ActiveRequest]]]): Queues for tracking active requests, organized by engine index.
+	    _interleaved_mode (bool): Flag indicating whether interleaved mode is enabled.
+	    _detokenizing_blocks (int): Number of detokenizing blocks.
+
 	"""
 
 	_prefill_engines: list[vEngine]
@@ -78,7 +91,7 @@ class vDriver(AbstractDriver):
 		detokenizing_blocks: int = 8,
 		verbose: bool = True,
 	):
-		"""Initializes the vDriver.
+		"""Initializes the `vDriver`.
 
 		Sets up the prefill and decode engines, backlogs (queues) for managing
 		requests between stages, available slots for concurrent decoding, and
@@ -86,9 +99,9 @@ class vDriver(AbstractDriver):
 		detokenize).
 
 		Args:
-		    prefill_engines: A single vEngine or a list of vEngines to be used
+		    prefill_engines: A single `vEngine` or a list of `vEngine`s to be used
 		        for the prefill stage. Defaults to an empty list.
-		    decode_engines: A single vEngine or a list of vEngines to be used
+		    decode_engines: A single `vEngine` or a list of `vEngine`s to be used
 		        for the decode stage. Defaults to an empty list.
 		    interleaved_mode: A boolean flag indicating whether the driver should
 		        operate in interleaved mode (potentially optimizing for latency
