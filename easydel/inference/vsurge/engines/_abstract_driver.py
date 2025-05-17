@@ -33,6 +33,18 @@ class AbstractDriver(abc.ABC):
 	Defines the essential interface that all driver implementations must provide.
 	"""
 
+	def _calculate_model_size(self, graphstate) -> str:
+		"""
+		Calculate model size in billions of parameters.
+		Returns formatted string with 2 decimal places.
+		"""
+		try:
+			num_params = sum(n.size for n in jax.tree_util.tree_flatten(graphstate)[0])
+			size_in_billions = num_params / 1e9
+			return f"{size_in_billions:.2f}"
+		except Exception:
+			return "unknown"
+
 	@abc.abstractmethod
 	def compile(self):
 		"""
@@ -45,40 +57,11 @@ class AbstractDriver(abc.ABC):
 		raise NotImplementedError
 
 	@abc.abstractmethod
-	def stop(self):
-		"""
-		Gracefully stops the driver and its associated background processes.
-
-		This method should ensure that all ongoing operations are completed or
-		cancelled safely, resources are released, and threads are joined.
-		"""
-		raise NotImplementedError
-
-	@abc.abstractmethod
 	def get_total_concurrent_requests(self) -> int:
 		"""
 		Returns the maximum number of concurrent requests the driver can handle.
 
 		This indicates the capacity of the driver's decoding stage.
-		"""
-		raise NotImplementedError
-
-	@abc.abstractmethod
-	def submit_request(self, request: tp.Any):
-		"""
-		Submits a new inference request to the driver.
-
-		Args:
-		    request: The inference request object. The specific type may vary
-		             depending on the implementation (e.g., ActiveRequest).
-		"""
-		raise NotImplementedError
-
-	@property
-	@abc.abstractmethod
-	def processor(self) -> ProcessingClassType:
-		"""
-		Returns the processor (tokenizer) associated with the driver's engines.
 		"""
 		raise NotImplementedError
 
@@ -99,14 +82,55 @@ class AbstractDriver(abc.ABC):
 		"""Get the model type, with fallback to 'unknown' if not found."""
 		return getattr(model.config, "model_type", "unknown").lower()
 
-	def _calculate_model_size(self, graphstate) -> str:
+	@abc.abstractmethod
+	def pause(self):
+		"""Pauses the driver."""
+		raise NotImplementedError
+
+	@property
+	@abc.abstractmethod
+	def processor(self) -> ProcessingClassType:
 		"""
-		Calculate model size in billions of parameters.
-		Returns formatted string with 2 decimal places.
+		Returns the processor (tokenizer) associated with the driver's engines.
 		"""
-		try:
-			num_params = sum(n.size for n in jax.tree_util.tree_flatten(graphstate)[0])
-			size_in_billions = num_params / 1e9
-			return f"{size_in_billions:.2f}"
-		except Exception:
-			return "unknown"
+		raise NotImplementedError
+
+	@abc.abstractmethod
+	def replace_graphstate(self, state):
+		"""Replaces the graph state of the driver."""
+		raise NotImplementedError
+
+	@abc.abstractmethod
+	def resume(self):
+		"""Resumes the driver."""
+		raise NotImplementedError
+
+	@abc.abstractmethod
+	def _setup_scheduler(self):
+		"""Sets up the scheduler."""
+		raise NotImplementedError
+
+	@abc.abstractmethod
+	def start(self):
+		"""Starts the driver and its associated background processes."""
+		raise NotImplementedError
+
+	@abc.abstractmethod
+	def stop(self):
+		"""
+		Gracefully stops the driver and its associated background processes.
+
+		This method should ensure that all ongoing operations are completed or
+		cancelled safely, resources are released, and threads are joined.
+		"""
+		raise NotImplementedError
+
+	@abc.abstractmethod
+	def submit_request(self, request: tp.Any):
+		"""
+		Submits a new inference request to the driver.
+		Args:
+		    request: The inference request object. The specific type may vary
+		             depending on the implementation (e.g., ActiveRequest).
+		"""
+		raise NotImplementedError
