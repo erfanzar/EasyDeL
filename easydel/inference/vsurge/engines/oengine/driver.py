@@ -113,7 +113,7 @@ class oDriver(AbstractDriver):
 		Compiles the underlying engines.
 
 		This method is intended to perform any necessary compilation steps for the
-		inference engines. Currently, it's a placeholder.
+		inference engines. Currently, it calls `_compile_decode` to compile the decode engine.
 		"""
 		try:
 			self._compile_decode()
@@ -146,8 +146,8 @@ class oDriver(AbstractDriver):
 		"""
 		Compiles the underlying engines.
 
-		This method is intended to perform any necessary compilation steps for the
-		inference engines. Currently, it's a placeholder.
+		This method compiles the decode engine by performing a forward pass with dummy inputs.
+		This ensures that the engine is ready for inference.
 		"""
 		try:
 			self.log("Compiling Decode Engine")
@@ -265,12 +265,21 @@ class oDriver(AbstractDriver):
 		"""
 		Background thread method for preparing inputs for inference.
 
-		It continuously retrieves requests from the prepare backlog,
+		This method continuously retrieves requests from the prepare backlog,
 		creates an InitialSequenceRequest, and enqueues it for prefill processing
 		by the engine's scheduler. It also acquires a semaphore to limit
 		the number of active requests.
 		"""
 		while True:
+			"""
+			Retrieves requests from the prepare backlog,
+			creates an InitialSequenceRequest, and enqueues it for prefill processing
+			by the engine's scheduler. It also acquires a semaphore to limit
+			the number of active requests.
+
+			Args:
+				request (ActiveRequest): The active request to prepare inputs for.
+			"""
 			request = self._prepare_backlog.get(block=True)
 			if request is None:
 				break
@@ -320,6 +329,17 @@ class oDriver(AbstractDriver):
 		and updates the internal state accordingly.
 		"""
 		while True:
+			"""
+			Background thread method for executing model inference.
+
+			It continuously creates an iteration plan using the engine's scheduler,
+			executes the engine's forward pass based on the plan, and processes
+			the resulting output summary. It handles both prefill and decode steps
+			and updates the internal state accordingly.
+
+			Args:
+				iteration_plan (NextIterationPlan): The plan for the current inference iteration.
+			"""
 			# Create an iteration plan based on the current active and decode states
 			iteration_plan = self.engine.scheduler.create_plan(
 				self._active_state,
@@ -403,6 +423,17 @@ class oDriver(AbstractDriver):
 		and enqueues generated samples for the respective requests.
 		"""
 		while True:
+			"""
+			Background thread method for processing model output summaries.
+
+			It continuously retrieves summaries from the process backlog,
+			handles completed prefill and decode requests, frees memory pages
+			for completed requests, calculates and updates Tokens Per Second (TPS),
+			and enqueues generated samples for the respective requests.
+
+			Args:
+				summary (ModelOutputSummary): The summary of the model output to process.
+			"""
 			summary = self._process_backlog.get(block=True)
 			if summary is None:
 				self.log("Received None, exiting summary processing loop.")

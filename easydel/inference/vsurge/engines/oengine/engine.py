@@ -275,7 +275,7 @@ class oEngine(AbstractInferenceEngine):
 		Returns:
 		    The sharding specification for prefix destinations.
 		"""
-		pass  # Implementation needed
+		raise NotImplementedError("get_prefix_destination_sharding method not implemented for oEngine.")
 
 	def init_decode_state(self, *args, **kwargs) -> ActiveSequenceBatch:
 		"""
@@ -299,7 +299,7 @@ class oEngine(AbstractInferenceEngine):
 		Returns:
 		    Always returns False as it's not implemented.
 		"""
-		return False  # Placeholder: Implementation needed
+		raise NotImplementedError("free_resource method not implemented for oEngine.")
 
 	@property
 	def colocated_cpus(self) -> tp.Union[list[jax.Device], None]:
@@ -312,7 +312,7 @@ class oEngine(AbstractInferenceEngine):
 		Returns:
 		    A list of colocated JAX CPU devices, or None if not implemented or available.
 		"""
-		return None  # Placeholder: Implementation needed
+		raise NotImplementedError("colocated_cpus method not implemented for oEngine.")
 
 	def forward(
 		self,
@@ -386,7 +386,7 @@ class oEngine(AbstractInferenceEngine):
 		Returns:
 		    A tuple containing the generation state after prefill and the result tokens.
 		"""
-		pass
+		raise NotImplementedError("Prefill method not implemented for oEngine.")
 
 	def decode(
 		self,
@@ -410,7 +410,7 @@ class oEngine(AbstractInferenceEngine):
 		Returns:
 		    A tuple containing the updated generation state and the generated result tokens.
 		"""
-		pass
+		raise NotImplementedError("Decode method not implemented for oEngine.")
 
 	def insert(
 		self,
@@ -432,7 +432,7 @@ class oEngine(AbstractInferenceEngine):
 		Returns:
 		    The updated decode state.
 		"""
-		pass
+		raise NotImplementedError("Insert method not implemented for oEngine.")
 
 	def bulk_insert(
 		self,
@@ -454,4 +454,4 @@ class oEngine(AbstractInferenceEngine):
 		Returns:
 		    The updated decode state.
 		"""
-		pass
+		raise NotImplementedError("Bulk insert method not implemented for oEngine.")

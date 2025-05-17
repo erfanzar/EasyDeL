@@ -62,10 +62,15 @@ class vEngine(AbstractInferenceEngine):
 	"""
 	Core inference engine for EasyDeL models using NNX graphs.
 
-	This engine manages the model state (split into graph definition, state, and
+	The vEngine manages the model state (split into graph definition, state, and
 	other parameters) and provides JIT-compiled functions for the prefill and
 	decode steps of autoregressive generation. It handles KV caching and
 	sampling.
+
+	The model state is split into three parts:
+	- `graphdef`: Represents the model architecture.
+	- `graphstate`: Represents the model weights.
+	- `graphothers`: Represents other non-trainable parameters.
 	"""
 
 	def __init__(
@@ -334,6 +339,10 @@ class vEngine(AbstractInferenceEngine):
 	def free_resource(self, slot: int) -> bool:
 		"""Frees resources associated with a specific inference slot. (Not Implemented)
 
+		This method is intended to release any resources (e.g., memory) associated
+		with a specific inference slot. Currently, it is not implemented and always
+		returns False.
+
 		Args:
 		    slot: The index of the slot to free.
 
@@ -347,7 +356,7 @@ class vEngine(AbstractInferenceEngine):
 		"""Returns CPU devices colocated with the engine's accelerator devices.
 
 		This information can be useful for optimizing data transfers between
-		host (CPU) and accelerator (GPU/TPU) memory. Currently returns None
+		host (CPU) and accelerator (GPU/TPU) memory. Currently, it returns None
 		as the implementation is pending.
 
 		Returns:
@@ -372,16 +381,21 @@ class vEngine(AbstractInferenceEngine):
 		the *first* token of the sequence. This function is JIT-compiled.
 
 		Args:
-		    graphstate: The NNX GraphState (parameters) of the model.
-		    graphothers: Other NNX state variables of the model.
+		    graphstate: The NNX GraphState (parameters) of the model (model weights).
+		    graphothers: Other NNX state variables of the model (non-trainable parameters).
 		    tokens: The input prompt token IDs (batch_size, sequence_length).
 		    valids: A boolean array indicating valid token positions in the input
 		        (batch_size, sequence_length or batch_size, max_length).
+		    true_length: The actual length of the input sequence.
+		    temperature: The temperature for sampling.
+		    top_p: The top-p value for sampling.
 		    rngs: A JAX PRNG key for sampling the first token.
 
 		Returns:
 		    A tuple containing:
 		        - generation_state: The initial GenerationState for the decode loop.
+		            This state contains the initialized KV cache and other necessary
+		            information for the decode step.
 		        - result: A ResultTokens object containing the *first* generated token.
 		"""
 		return self.continuous_prefill(
@@ -413,8 +427,8 @@ class vEngine(AbstractInferenceEngine):
 		allows the input state's cache to be modified in-place (donated).
 
 		Args:
-		    graphstate: The NNX GraphState (parameters) of the model.
-		    graphothers: Other NNX state variables of the model.
+		    graphstate: The NNX GraphState (parameters) of the model (model weights).
+		    graphothers: Other NNX state variables of the model (non-trainable parameters).
 		    state: The current GenerationState from the previous step. `state.cache`
 		        is marked for donation.
 		    rngs: A JAX PRNG key for sampling the next token.
@@ -422,6 +436,8 @@ class vEngine(AbstractInferenceEngine):
 		Returns:
 		    A tuple containing:
 		        - next_generation_state: The updated GenerationState for the next iteration.
+		            This state contains the updated KV cache and other necessary
+		            information for the next decode step.
 		        - result: A ResultTokens object containing the newly generated token.
 		"""
 		return self.continuous_decode(
@@ -441,24 +457,20 @@ class vEngine(AbstractInferenceEngine):
 	) -> GenerationState:
 		"""Inserts or updates a generation state, potentially for managing batches. (JIT-compiled)
 
-		This function seems designed to merge or update parts of the generation state,
-		possibly inserting a 'prefix' state (e.g., from a completed prefill) into
-		a larger batch state ('decode_state') at a specific 'slot'. The exact
-		mechanism for insertion isn't fully clear from the current implementation,
-		as it primarily focuses on broadcasting the prefix cache and returning the
-		prefix state. Both input states' caches are donated.
+		This function inserts the `prefix` GenerationState (typically from a completed
+		prefill operation) into the `decode_state` at the specified `slot`. This is
+		used to manage batches of independent sequences during inference.
+		Both input states' caches are donated.
 
 		Args:
-		    prefix: The GenerationState to potentially insert (e.g., from prefill).
+		    prefix: The GenerationState to insert (e.g., from prefill).
 		        Its cache is marked for donation.
 		    decode_state: The target GenerationState to update (e.g., the main decode loop state).
 		        Its cache is marked for donation.
-		    slot: The index within the batch where the insertion/update should occur.
+		    slot: The index within the batch where the insertion should occur.
 
 		Returns:
-		    An updated GenerationState. In the current implementation, it returns the
-		    prefix state with its cache potentially broadcasted. Needs clarification
-		    on the intended merging logic with `decode_state` and `slot`.
+		    An updated GenerationState.
 		"""
 		with self.model.mesh:
 			return self.continuous_insert(
