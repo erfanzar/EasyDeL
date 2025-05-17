@@ -47,12 +47,17 @@ if tp.TYPE_CHECKING:
 else:
 	ProcessingClassType = tp.Any
 
-
 logger = get_logger("vSurge-vDriver")
 
 
 class vDriver(AbstractDriver):
-	"""Drives the engines."""
+	"""
+	Drives the engines.
+
+	This class manages the prefill and decode engines, orchestrates the data transfer
+	between them, and handles tokenization and detokenization. It uses background
+	threads to perform these tasks concurrently.
+	"""
 
 	_prefill_engines: list[vEngine]
 	_decode_engines: list[vEngine]
@@ -71,6 +76,7 @@ class vDriver(AbstractDriver):
 		decode_engines: tp.Optional[list[vEngine] | vEngine] = None,
 		interleaved_mode: bool = False,
 		detokenizing_blocks: int = 8,
+		verbose: bool = True,
 	):
 		"""Initializes the vDriver.
 
@@ -87,6 +93,8 @@ class vDriver(AbstractDriver):
 		    interleaved_mode: A boolean flag indicating whether the driver should
 		        operate in interleaved mode (potentially optimizing for latency
 		        by prioritizing new requests). Defaults to False.
+		    detokenizing_blocks: The number of detokenizing blocks. Defaults to 8.
+		    verbose: Whether to log information. Defaults to True.
 		"""
 		if prefill_engines is None:
 			prefill_engines = []
@@ -98,103 +106,14 @@ class vDriver(AbstractDriver):
 
 		if not isinstance(decode_engines, list):
 			decode_engines = [decode_engines]
-
+		self._pause = False
 		self._prefill_engines = prefill_engines
 		self._decode_engines = decode_engines
 		self._interleaved_mode = interleaved_mode
 		self._detokenizing_blocks = detokenizing_blocks
-		self._prefill_backlog = queue.Queue()
-
-		self._transfer_backlogs = [
-			queue.Queue(1 if self._interleaved_mode else 4)
-			for i in range(len(self._prefill_engines))
-		]
-		self._decode_backlogs = {
-			idx: queue.Queue(
-				1 if self._interleaved_mode else engine.max_concurrent_decodes // 3
-			)
-			for idx, engine in enumerate(self._decode_engines)
-		}
-		self._detokenize_backlogs = [
-			queue.Queue(detokenizing_blocks) for _ in self._decode_engines
-		]
-		self._decode_slots = [
-			queue.Queue(engine.max_concurrent_decodes) for engine in self._decode_engines
-		]
-		_ = [
-			[self._decode_slots[idx].put(i) for i in range(engine.max_concurrent_decodes)]
-			for idx, engine in enumerate(self._decode_engines)
-		]
-
-		self._prefill_threads = [
-			SafeThread(
-				target=functools.partial(self._prefill_thread, idx),
-				name=f"prefill-{idx}",
-				daemon=True,
-			)
-			for idx in range(len(self._prefill_engines))
-		]
-		self._transfer_threads = [
-			SafeThread(
-				target=functools.partial(
-					self._transfer_thread,
-					idx,
-				),
-				name=f"transfer-{idx}",
-				daemon=True,
-			)
-			for idx in range(len(self._prefill_engines))
-		]
-		self._decode_threads = [
-			SafeThread(
-				target=functools.partial(
-					self._decode_thread,
-					idx,
-				),
-				name=f"decode-{idx}",
-				daemon=True,
-			)
-			for idx in range(len(self._decode_engines))
-		]
-		self.detokenize_threads = [
-			SafeThread(
-				target=functools.partial(
-					self._detokenize_thread,
-					idx,
-				),
-				name=f"detokenize-{idx}",
-			)
-			for idx in range(len(self._decode_engines))
-		]
-
+		self.log = logger.info if verbose else logger.debug
+		self._setup_scheduler()
 		self.live = False
-
-	def start(self):
-		if not self.live:
-			self._all_threads = list(
-				itertools.chain(
-					self._prefill_threads,
-					self._transfer_threads,
-					self._decode_threads,
-					self.detokenize_threads,
-				)
-			)
-			self.live = True
-			for t in self._all_threads:
-				t.start()
-
-	# Add this method within the vDriver class
-	def submit_request(self, request: tp.Any):
-		"""Submits a new request to the driver's processing queue."""
-		# Assuming ActiveRequest is the expected type internally
-		if not isinstance(request, ActiveRequest):
-			# Or raise a more specific error
-			raise TypeError("Request must be of type ActiveRequest")
-		self.place_request_on_prefill_queue(request)
-
-	@property
-	def driver_name(self):
-		return self._get_model_name(self._decode_engines[-1].model)
 
 	def compile(self):
 		"""Compiles engines."""
@@ -213,7 +132,7 @@ class vDriver(AbstractDriver):
 				] + [max_prefill_length]
 				for length in vals:
 					padded_tokens = padded_valids = jnp.ones((1, length), "i4")
-					logger.info(f"Compiling prefill-engine seqlen={length}")
+					self.log(f"Compiling prefill-engine seqlen={length}")
 					state_new, _ = prefill_engine.prefill(
 						graphstate=prefill_engine.graphstate,
 						graphothers=prefill_engine.graphothers,
@@ -224,58 +143,21 @@ class vDriver(AbstractDriver):
 						top_p=jnp.array([1], "f4"),
 						rngs=prefill_engine.prng_key,
 					)
-					logger.info(f"Compiling decode-engine insert seqlen={length}")
+					self.log(f"Compiling decode-engine insert seqlen={length}")
 					decode_state = decode_engine.insert(state_new, decode_state, 0)
 
-				logger.info("Compiling decode-engine")
+				self.log("Compiling decode-engine")
 				decode_engine.decode(
 					graphstate=decode_engine.graphstate,
 					graphothers=decode_engine.graphothers,
 					state=decode_state,
 					rngs=decode_engine.prng_key,
 				)
+				del decode_state
 		except Exception:
 			traceback.print_exc()
 			self.stop()
 			exit(1)
-
-	def stop(self):
-		"""Stops the driver and all background threads."""
-		if self.live:
-			self.live = False
-
-			all_backlogs = list(
-				itertools.chain(
-					[self._prefill_backlog],
-					self._transfer_backlogs,
-					self._decode_backlogs.values(),
-					self._detokenize_backlogs,
-				)
-			)
-
-			while any(t.is_alive() for t in self._all_threads):
-				for q in all_backlogs:
-					while True:
-						try:
-							r = q.get_nowait()
-							if r is None:
-								continue
-							elif isinstance(r, ActiveRequest):
-								r.return_channel = None
-							else:  # detokenize backlog
-								_, r = r
-								if isinstance(r, ActiveRequest):
-									r.return_channel = None
-						except queue.Empty:
-							break
-
-				for q in all_backlogs:
-					try:
-						q.put_nowait(None)
-					except queue.Full:
-						pass
-			for t in self._all_threads:
-				t.join()
 
 	def get_total_concurrent_requests(self) -> int:
 		"""Gets the total number of concurrent requests the driver can handle."""
@@ -283,139 +165,6 @@ class vDriver(AbstractDriver):
 			[e.max_concurrent_decodes for e in self._decode_engines]
 		)
 		return total_max_concurrent_decodes
-
-	def place_request_on_prefill_queue(self, request: ActiveRequest):
-		"""Used to place new requests for prefilling and generation."""
-		self._prefill_backlog.put(request, block=False)
-
-	@property
-	def processor(self) -> ProcessingClassType:  # type:ignore
-		"""Returns the processor/tokenizer associated with the engines.
-
-		Assumes all engines (prefill and decode) use the same processor.
-		Raises an error if no engines are configured.
-		"""
-		if self._prefill_engines:
-			return self._prefill_engines[0].processor
-		elif self._decode_engines:
-			return self._decode_engines[0].processor
-		else:
-			raise ValueError(
-				"No engines configured for the vDriver, cannot determine processor."
-			)
-
-	def _process_prefill_content(
-		self,
-		request: ActiveRequest,
-		processor: ProcessingClassType,  # type:ignore
-		max_prefill_length: int,
-		prefill_lengths: list[int],
-		pad_token_id: int,
-	) -> tp.Tuple[tp.Tuple[jnp.ndarray, jnp.ndarray, int], SamplingParams]:
-		"""Tokenizes, pads, and prepares sampling parameters for a prefill request.
-
-		Takes an `ActiveRequest`, extracts its `prefill_content` (which can be
-		a string or pre-tokenized IDs), tokenizes it using the provided
-		`processor` if necessary, pads the tokens to the appropriate length
-		based on `max_prefill_length` and internal buckets, and constructs
-		the `SamplingParams` object from the request's parameters.
-
-		Args:
-		    request: The ActiveRequest containing the prompt and sampling settings.
-		    processor: The tokenizer/processor instance.
-		    max_prefill_length: The maximum allowed length for the prefill sequence.
-
-		Returns:
-		    A tuple containing:
-		        - A nested tuple: (padded_tokens, padded_valids, padded_length)
-		        - The constructed SamplingParams object.
-		"""
-		content = request.prefill_content
-		if isinstance(content, str):
-			content = processor(text=content, return_tensors="np", return_attention_mask=True)
-			tokens = jnp.array(content["input_ids"])
-			valids = jnp.array(content["attention_mask"])
-		else:
-			tokens, valids = content
-
-		return (
-			pad_tokens(
-				tokens=tokens,
-				valids=valids,
-				pad_token_id=pad_token_id,
-				max_prefill_length=max_prefill_length,
-				prefill_lengths=prefill_lengths,
-				right_padding=False,
-			),
-			SamplingParams(
-				max_tokens=0,
-				presence_penalty=request.presence_penalty,
-				frequency_penalty=request.frequency_penalty,
-				repetition_penalty=request.repetition_penalty,
-				min_p=request.min_p,
-				top_p=request.top_p,
-				temperature=request.temperature,
-			),
-		)
-
-	def _prefill_thread(self, idx: int):
-		"""Thread which runs in the background performing prefills."""
-		logger.info(f"Spinning up prefill thread {idx}.")
-		prefill_engine = self._prefill_engines[idx]
-		processor = prefill_engine.processor
-
-		while self.live:
-			my_transfer_backlog = self._transfer_backlogs[idx]
-			request = self._prefill_backlog.get(block=True)
-
-			if request is None:
-				break
-			request.metadata.prefill_dequeue_time = time.perf_counter()
-
-			(
-				(
-					padded_tokens,
-					padded_valids,
-					true_length,
-				),
-				sampling_params,
-			) = self._process_prefill_content(
-				request,
-				processor,
-				prefill_engine.max_prefill_length,
-				prefill_engine.prefill_lengths,
-				prefill_engine.pad_token_id,
-			)
-			logger.info(
-				f"Prefilling on prefill engine {idx} : "
-				f"prefill queue size : {self._prefill_backlog.qsize()}, Token size {padded_valids.shape[-1]}",
-			)
-			prefill_result, first_token = prefill_engine.prefill(
-				graphstate=prefill_engine.graphstate,
-				graphothers=prefill_engine.graphothers,
-				tokens=padded_tokens,
-				valids=padded_valids,
-				true_length=true_length,
-				temperature=jnp.array([sampling_params.temperature], "f4"),
-				top_p=jnp.array([sampling_params.top_p], "f4"),
-				rngs=prefill_engine.prng_key,
-			)
-			request.prefill_result = prefill_result
-			request.complete = np.zeros((prefill_engine.samples_per_slot,), "b1")
-			my_detokenize_backlog = self._detokenize_backlogs[idx]
-			request.metadata.transfer_enqueue_time = time.perf_counter()
-			my_detokenize_backlog.put(
-				(first_token, request, request.metadata.prefill_dequeue_time),
-				block=True,
-			)
-
-			my_transfer_backlog.put(request, block=True)
-			logger.info(
-				f"Placed request on transfer queue {idx}, {my_transfer_backlog.qsize()} queued requests.",
-			)
-
-			del prefill_result
-			del request
 
 	def _jax_transfer_prefill_result(self, new_request: ActiveRequest, target_idx: int):
 		"""Transfers prefill result (KV cache) using JAX device placement.
@@ -426,156 +175,14 @@ class vDriver(AbstractDriver):
 		configuration. It blocks until the transfer is complete.
 
 		Args:
-			   new_request: The ActiveRequest containing the prefill_result.
-			   target_idx: The index of the target decode engine.
+		       new_request: The ActiveRequest containing the prefill_result.
+		       target_idx: The index of the target decode engine.
 		"""
 		new_request.prefill_result = jax.device_put(
 			new_request.prefill_result,
 			self._decode_engines[target_idx].get_prefix_destination_sharding(),
 		)
 		jax.block_until_ready(new_request.prefill_result)
-
-	def _ray_transfer_prefill_result(self, new_request: ActiveRequest, target_idx: int):
-		"""Transfers prefill result (KV cache) using Ray's transfer mechanism (if applicable).
-
-		This method is a placeholder for potential future integration with Ray
-		or other distributed computing frameworks that provide explicit data
-		transfer mechanisms between workers or devices. It assumes the target
-		decode engine has a `transfer` method.
-
-		Args:
-		    new_request: The ActiveRequest containing the prefill_result.
-		    target_idx: The index of the target decode engine.
-		"""
-		# Assuming self._decode_engines[target_idx] has a 'transfer' method for Ray
-		self._decode_engines[target_idx].transfer(new_request.prefill_result)
-
-	def _transfer_prefill_result(self, new_request: ActiveRequest, target_idx: int):
-		"""Selects and executes the appropriate KV cache transfer method.
-
-		This method acts as a dispatcher for transferring the prefill result
-		(KV cache) from the prefill engine's device to the target decode
-		engine's device. It currently defaults to using the JAX-specific
-		transfer method but can be extended to support other frameworks
-		like Ray by adding conditional logic based on the engine type or
-		configuration.
-
-		Args:
-		    new_request: The ActiveRequest containing the prefill_result.
-		    target_idx: The index of the target decode engine.
-		"""
-		self._jax_transfer_prefill_result(new_request, target_idx)
-
-	def _transfer_thread(self, idx: int):
-		"""Transfers the kv cache on an active request to the least full
-		generate backlog."""
-		transfer_backlog = self._transfer_backlogs[idx]
-
-		while self.live:
-			new_request = transfer_backlog.get(block=True)
-			if new_request is None:
-				break
-			new_request.metadata.transfer_dequeue_time = time.perf_counter()
-			target_idx = min(self._decode_backlogs.items(), key=lambda q: q[1].qsize())[0]
-			if not self._interleaved_mode:
-				logger.info(
-					f"Transferring prefill from prefill engine {idx} to Decode engine {target_idx}."
-				)
-				self._transfer_prefill_result(new_request, target_idx)
-			new_request.metadata.generate_enqueue_time = time.perf_counter()
-			self._decode_backlogs[target_idx].put(new_request, block=True)
-			logger.info(
-				"Successfully transferred prefill "
-				f"from prefill engine {idx} to Decode engine {target_idx} "
-				f"({self._decode_backlogs[target_idx].qsize()} requests now in backlog).",
-			)
-
-	def _decode_thread(self, idx: int):
-		"""Step token generation and insert prefills from backlog."""
-		logger.info(f"Spinning up decode thread {idx}.")
-
-		decode_engine = self._decode_engines[idx]
-		my_slots = self._decode_slots[idx]
-		my_decode_backlog = self._decode_backlogs[idx]
-		my_detokenize_backlog = self._detokenize_backlogs[idx]
-
-		generate_timestep = 0
-
-		decode_state = decode_engine.init_decode_state()
-
-		time_of_last_print = time.time()
-		while self.live:
-			if (time.time() - time_of_last_print) > 5:
-				logger.info(
-					"Decode thread making a decision with:"
-					f" prefill_backlog={self._prefill_backlog.qsize()}"
-					f" generate_free_slots={my_slots.qsize()}",
-				)
-				time_of_last_print = time.time()
-
-			max_concurrent_decodes = decode_engine.max_concurrent_decodes
-			while True:
-				my_slots_size = my_slots.qsize()
-
-				try:
-					slot = my_slots.get(block=False)
-				except queue.Empty:
-					break
-
-				block = my_slots_size == max_concurrent_decodes
-				if self._interleaved_mode:
-					block |= not self._prefill_backlog.empty()
-					block |= not self._transfer_backlogs[idx].empty()
-				try:
-					new_request = my_decode_backlog.get(block=block, timeout=1.0)
-					if new_request is None:
-						break
-					new_request.metadata.generate_dequeue_time = time.perf_counter()
-				except queue.Empty:
-					my_slots.put(slot, block=False)
-					if block:
-						continue
-					else:
-						break
-
-				if new_request is None:
-					return
-
-				logger.info(
-					f"Decode slice {idx} filling slot {slot} at step {generate_timestep}."
-				)
-
-				decode_state = decode_engine.insert(
-					prefix=new_request.prefill_result,
-					decode_state=decode_state,
-					slot=slot,
-				)
-				del new_request.prefill_result
-				new_request.generate_timestep_added = generate_timestep
-				new_request.complete = np.zeros((decode_engine.samples_per_slot,), "b1")
-				my_detokenize_backlog.put((slot, new_request), block=True)
-
-			assert my_slots.qsize() < max_concurrent_decodes, (
-				"At this point we must have some requests inserted into the slots."
-			)
-			time_of_last_decode = time.time()
-			decode_state, sampled_tokens = decode_engine.decode(
-				graphstate=decode_engine.graphstate,
-				graphothers=decode_engine.graphothers,
-				state=decode_state,
-				rngs=decode_engine.prng_key,
-			)
-			fn_call = time.time()
-			sampled_tokens.copy_to_host_async()
-			my_detokenize_backlog.put((generate_timestep, sampled_tokens), block=True)
-			generate_timestep += 1
-			# TODO:Debug
-			_took = (time.time() - time_of_last_decode) * 10**3
-			_exec = (fn_call - time_of_last_decode) * 10**3
-			logger.info(
-				f"Decode engine {idx} step {generate_timestep} - slots free : {my_slots_size} / {max_concurrent_decodes}, "
-				f"took {_took:.2f}ms  | execution took {_exec:.2f}ms "
-			)
 
 	def _detokenize_thread(self, idx: int):
 		"""Detokenize sampled tokens and returns them to the user."""
@@ -622,7 +229,7 @@ class vDriver(AbstractDriver):
 				first_token_return_time = (
 					time.perf_counter() - request.metadata.prefill_dequeue_time
 				) * 1000
-				logger.info(f"TTFT duration: {first_token_return_time}ms")
+				self.log(f"TTFT duration: {first_token_return_time}ms")
 
 			elif isinstance(data[1], ResultTokens):
 				generate_timestep_added, result_tokens = data
@@ -685,3 +292,414 @@ class vDriver(AbstractDriver):
 			else:
 				slot, active_request = data
 				my_live_requests[slot] = active_request
+
+	def _decode_thread(self, idx: int):
+		"""Step token generation and insert prefills from backlog."""
+		self.log(f"Spinning up decode thread {idx}.")
+
+		decode_engine = self._decode_engines[idx]
+		my_slots = self._decode_slots[idx]
+		my_decode_backlog = self._decode_backlogs[idx]
+		my_detokenize_backlog = self._detokenize_backlogs[idx]
+
+		generate_timestep = 0
+
+		decode_state = decode_engine.init_decode_state()
+
+		time_of_last_print = time.time()
+		while self.live:
+			if (time.time() - time_of_last_print) > 5:
+				self.log(
+					"Decode thread making a decision with:"
+					f" prefill_backlog={self._prefill_backlog.qsize()}"
+					f" generate_free_slots={my_slots.qsize()}",
+				)
+				time_of_last_print = time.time()
+
+			max_concurrent_decodes = decode_engine.max_concurrent_decodes
+			while True:
+				my_slots_size = my_slots.qsize()
+
+				try:
+					slot = my_slots.get(block=False)
+				except queue.Empty:
+					break
+
+				block = my_slots_size == max_concurrent_decodes
+				if self._interleaved_mode:
+					block |= not self._prefill_backlog.empty()
+					block |= not self._transfer_backlogs[idx].empty()
+				try:
+					new_request = my_decode_backlog.get(block=block, timeout=1.0)
+					if new_request is None:
+						break
+					new_request.metadata.generate_dequeue_time = time.perf_counter()
+				except queue.Empty:
+					my_slots.put(slot, block=False)
+					if block:
+						continue
+					else:
+						break
+
+				if new_request is None:
+					return
+
+				self.log(f"Decode slice {idx} filling slot {slot} at step {generate_timestep}.")
+
+				decode_state = decode_engine.insert(
+					prefix=new_request.prefill_result,
+					decode_state=decode_state,
+					slot=slot,
+				)
+				del new_request.prefill_result
+				new_request.generate_timestep_added = generate_timestep
+				new_request.complete = np.zeros((decode_engine.samples_per_slot,), "b1")
+				my_detokenize_backlog.put((slot, new_request), block=True)
+
+			assert my_slots.qsize() < max_concurrent_decodes, (
+				"At this point we must have some requests inserted into the slots."
+			)
+			time_of_last_decode = time.time()
+			decode_state, sampled_tokens = decode_engine.decode(
+				graphstate=decode_engine.graphstate,
+				graphothers=decode_engine.graphothers,
+				state=decode_state,
+				rngs=decode_engine.prng_key,
+			)
+			fn_call = time.time()
+			sampled_tokens.copy_to_host_async()
+			my_detokenize_backlog.put((generate_timestep, sampled_tokens), block=True)
+			generate_timestep += 1
+			# TODO:Debug
+			_took = (time.time() - time_of_last_decode) * 10**3
+			_exec = (fn_call - time_of_last_decode) * 10**3
+			self.log(
+				f"Decode engine {idx} step {generate_timestep} - slots free : {my_slots_size} / {max_concurrent_decodes}, "
+				f"took {_took:.2f}ms  | execution took {_exec:.2f}ms "
+			)
+
+	@property
+	def driver_name(self):
+		"""Returns the driver name."""
+		return self._get_model_name(self._decode_engines[-1].model)
+
+	def place_request_on_prefill_queue(self, request: ActiveRequest):
+		"""Used to place new requests for prefilling and generation."""
+		self._prefill_backlog.put(request, block=False)
+
+	@property
+	def processor(self) -> ProcessingClassType:  # type:ignore
+		"""Returns the processor/tokenizer associated with the engines.
+
+		Assumes all engines (prefill and decode) use the same processor.
+		Raises an error if no engines are configured.
+		"""
+		if self._prefill_engines:
+			return self._prefill_engines[0].processor
+		elif self._decode_engines:
+			return self._decode_engines[0].processor
+		else:
+			raise ValueError(
+				"No engines configured for the vDriver, cannot determine processor."
+			)
+
+	def _prefill_thread(self, idx: int):
+		"""Thread which runs in the background performing prefills."""
+		self.log(f"Spinning up prefill thread {idx}.")
+		prefill_engine = self._prefill_engines[idx]
+		processor = prefill_engine.processor
+		while self.live:
+			my_transfer_backlog = self._transfer_backlogs[idx]
+			request = self._prefill_backlog.get(block=True)
+			if request is None:
+				break
+			request.metadata.prefill_dequeue_time = time.perf_counter()
+
+			(
+				(
+					padded_tokens,
+					padded_valids,
+					true_length,
+				),
+				sampling_params,
+			) = self._process_prefill_content(
+				request,
+				processor,
+				prefill_engine.max_prefill_length,
+				prefill_engine.prefill_lengths,
+				prefill_engine.pad_token_id,
+			)
+			self.log(
+				f"Prefilling on prefill engine {idx} : "
+				f"prefill queue size : {self._prefill_backlog.qsize()}, Token size {padded_valids.shape[-1]}",
+			)
+			prefill_result, first_token = prefill_engine.prefill(
+				graphstate=prefill_engine.graphstate,
+				graphothers=prefill_engine.graphothers,
+				tokens=padded_tokens,
+				valids=padded_valids,
+				true_length=true_length,
+				temperature=jnp.array([sampling_params.temperature], "f4"),
+				top_p=jnp.array([sampling_params.top_p], "f4"),
+				rngs=prefill_engine.prng_key,
+			)
+			request.prefill_result = prefill_result
+			request.complete = np.zeros((prefill_engine.samples_per_slot,), "b1")
+			my_detokenize_backlog = self._detokenize_backlogs[idx]
+			request.metadata.transfer_enqueue_time = time.perf_counter()
+			my_detokenize_backlog.put(
+				(first_token, request, request.metadata.prefill_dequeue_time),
+				block=True,
+			)
+
+			my_transfer_backlog.put(request, block=True)
+			self.log(
+				f"Placed request on transfer queue {idx}, {my_transfer_backlog.qsize()} queued requests.",
+			)
+
+			del prefill_result
+			del request
+
+	def _process_prefill_content(
+		self,
+		request: ActiveRequest,
+		processor: ProcessingClassType,  # type:ignore
+		max_prefill_length: int,
+		prefill_lengths: list[int],
+		pad_token_id: int,
+	) -> tp.Tuple[tp.Tuple[jnp.ndarray, jnp.ndarray, int], SamplingParams]:
+		"""Tokenizes, pads, and prepares sampling parameters for a prefill request.
+
+		Takes an `ActiveRequest`, extracts its `prefill_content` (which can be
+		a string or pre-tokenized IDs), tokenizes it using the provided
+		`processor` if necessary, pads the tokens to the appropriate length
+		based on `max_prefill_length` and internal buckets, and constructs
+		the `SamplingParams` object from the request's parameters.
+
+		Args:
+		    request: The ActiveRequest containing the prompt and sampling settings.
+		    processor: The tokenizer/processor instance.
+		    max_prefill_length: The maximum allowed length for the prefill sequence.
+
+		Returns:
+		    A tuple containing:
+		        - A nested tuple: (padded_tokens, padded_valids, padded_length)
+		        - The constructed SamplingParams object.
+		"""
+		content = request.prefill_content
+		if isinstance(content, str):
+			content = processor(text=content, return_tensors="np", return_attention_mask=True)
+			tokens = jnp.array(content["input_ids"])
+			valids = jnp.array(content["attention_mask"])
+		else:
+			tokens, valids = content
+
+		return (
+			pad_tokens(
+				tokens=tokens,
+				valids=valids,
+				pad_token_id=pad_token_id,
+				max_prefill_length=max_prefill_length,
+				prefill_lengths=prefill_lengths,
+				right_padding=False,
+			),
+			SamplingParams(
+				max_tokens=0,
+				presence_penalty=request.presence_penalty,
+				frequency_penalty=request.frequency_penalty,
+				repetition_penalty=request.repetition_penalty,
+				min_p=request.min_p,
+				top_p=request.top_p,
+				temperature=request.temperature,
+			),
+		)
+
+	def _ray_transfer_prefill_result(self, new_request: ActiveRequest, target_idx: int):
+		"""Transfers prefill result (KV cache) using Ray's transfer mechanism (if applicable).
+
+		This method is a placeholder for potential future integration with Ray
+		or other distributed computing frameworks that provide explicit data
+		transfer mechanisms between workers or devices. It assumes the target
+		decode engine has a `transfer` method.
+
+		Args:
+		    new_request: The ActiveRequest containing the prefill_result.
+		    target_idx: The index of the target decode engine.
+		"""
+		# Assuming self._decode_engines[target_idx] has a 'transfer' method for Ray
+		self._decode_engines[target_idx].transfer(new_request.prefill_result)
+
+	def _setup_scheduler(self):
+		"""Sets up the scheduler."""
+		self._prefill_backlog = queue.Queue()
+
+		self._transfer_backlogs = [
+			queue.Queue(1 if self._interleaved_mode else 4)
+			for i in range(len(self._prefill_engines))
+		]
+		self._decode_backlogs = {
+			idx: queue.Queue(
+				1 if self._interleaved_mode else engine.max_concurrent_decodes // 3
+			)
+			for idx, engine in enumerate(self._decode_engines)
+		}
+		self._detokenize_backlogs = [
+			queue.Queue(self._detokenizing_blocks) for _ in self._decode_engines
+		]
+		self._decode_slots = [
+			queue.Queue(engine.max_concurrent_decodes) for engine in self._decode_engines
+		]
+		_ = [
+			[self._decode_slots[idx].put(i) for i in range(engine.max_concurrent_decodes)]
+			for idx, engine in enumerate(self._decode_engines)
+		]
+		self._prefill_threads = [
+			SafeThread(
+				target=functools.partial(self._prefill_thread, idx),
+				name=f"prefill-{idx}",
+				daemon=True,
+			)
+			for idx in range(len(self._prefill_engines))
+		]
+		self._transfer_threads = [
+			SafeThread(
+				target=functools.partial(self._transfer_thread, idx),
+				name=f"transfer-{idx}",
+				daemon=True,
+			)
+			for idx in range(len(self._prefill_engines))
+		]
+		self._decode_threads = [
+			SafeThread(
+				target=functools.partial(self._decode_thread, idx),
+				name=f"decode-{idx}",
+				daemon=True,
+			)
+			for idx in range(len(self._decode_engines))
+		]
+		self.detokenize_threads = [
+			SafeThread(
+				target=functools.partial(self._detokenize_thread, idx),
+				name=f"detokenize-{idx}",
+			)
+			for idx in range(len(self._decode_engines))
+		]
+
+	def replace_graphstate(self, state):
+		"""Replaces the graph state of the driver."""
+		for engine in self._decode_engines:
+			engine.graphstate = state
+		for engine in self._prefill_engines:
+			engine.graphstate = state
+
+	def start(self):
+		"""Starts the driver and its associated background processes."""
+		if not self.live:
+			self._all_threads = list(
+				itertools.chain(
+					self._prefill_threads,
+					self._transfer_threads,
+					self._decode_threads,
+					self.detokenize_threads,
+				)
+			)
+			self.live = True
+			for t in self._all_threads:
+				t.start()
+
+	def stop(self):
+		"""Stops the driver and all background threads."""
+		if self.live:
+			self.live = False
+
+			all_backlogs = list(
+				itertools.chain(
+					[self._prefill_backlog],
+					self._transfer_backlogs,
+					self._decode_backlogs.values(),
+					self._detokenize_backlogs,
+				)
+			)
+
+			while any(t.is_alive() for t in self._all_threads):
+				for q in all_backlogs:
+					while True:
+						try:
+							r = q.get_nowait()
+							if r is None:
+								continue
+							elif isinstance(r, ActiveRequest):
+								r.return_channel = None
+							else:  # detokenize backlog
+								_, r = r
+								if isinstance(r, ActiveRequest):
+									r.return_channel = None
+						except queue.Empty:
+							break
+
+				for q in all_backlogs:
+					try:
+						q.put_nowait(None)
+					except queue.Full:
+						pass
+			for t in self._all_threads:
+				t.join()
+
+	def resume(self):
+		"""Resumes the driver."""
+		if self._pause:
+			self._setup_scheduler()
+			self.start()
+			self._pause = False
+
+	def pause(self):
+		"""Pauses the driver."""
+		if not self._pause:
+			self.stop()
+			self._pause = True
+
+	def submit_request(self, request: tp.Any):
+		"""Submits a new request to the driver's processing queue."""
+		if not isinstance(request, ActiveRequest):
+			raise TypeError("Request must be of type ActiveRequest")
+		self.place_request_on_prefill_queue(request)
+
+	def _transfer_prefill_result(self, new_request: ActiveRequest, target_idx: int):
+		"""Selects and executes the appropriate KV cache transfer method.
+
+		This method acts as a dispatcher for transferring the prefill result
+		(KV cache) from the prefill engine's device to the target decode
+		engine's device. It currently defaults to using the JAX-specific
+		transfer method but can be extended to support other frameworks
+		like Ray by adding conditional logic based on the engine type or
+		configuration.
+
+		Args:
+		    new_request: The ActiveRequest containing the prefill_result.
+		    target_idx: The index of the target decode engine.
+		"""
+		self._jax_transfer_prefill_result(new_request, target_idx)
+
+	def _transfer_thread(self, idx: int):
+		"""Transfers the kv cache on an active request to the least full
+		generate backlog."""
+		transfer_backlog = self._transfer_backlogs[idx]
+
+		while self.live:
+			new_request = transfer_backlog.get(block=True)
+			if new_request is None:
+				break
+			new_request.metadata.transfer_dequeue_time = time.perf_counter()
+			target_idx = min(self._decode_backlogs.items(), key=lambda q: q[1].qsize())[0]
+			if not self._interleaved_mode:
+				self.log(
+					f"Transferring prefill from prefill engine {idx} to Decode engine {target_idx}."
+				)
+				self._transfer_prefill_result(new_request, target_idx)
+			new_request.metadata.generate_enqueue_time = time.perf_counter()
+			self._decode_backlogs[target_idx].put(new_request, block=True)
+			self.log(
+				"Successfully transferred prefill "
+				f"from prefill engine {idx} to Decode engine {target_idx} "
+				f"({self._decode_backlogs[target_idx].qsize()} requests now in backlog).",
+			)

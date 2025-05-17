@@ -56,20 +56,39 @@ logger = get_logger("vSurge")
 
 
 class vSurgeMetadata:
-	"""Tracks timing information for requests processed by the vsurge.
+	"""
+	Tracks timing information for requests processed by the vSurge.
 
 	Attributes:
-	    start_time: The time when the request processing started.
+	    start_time (float): The time when the request processing started.
 	"""
 
 	def __init__(self):
-		"""Initializes the metadata, capturing the current time as the start time."""
+		"""
+		Initializes the metadata, capturing the current time as the start time.
+		"""
 		self.start_time = time.time()
 
 
 @dataclasses.dataclass
 class vSurgeRequest:
-	"""Represents a request specifically for text completion."""
+	"""
+	Represents a request specifically for text completion.
+
+	Attributes:
+	    prompt (str): The input prompt for text completion.
+	    max_tokens (int): The maximum number of tokens to generate.
+	    top_p (float): The top-p probability threshold for sampling.
+	    top_k (int): The top-k tokens to consider for sampling.
+	    min_p (float): The minimum probability threshold for sampling.
+	    stop (Optional[Union[str, List[str]]]): The stop sequence(s) to terminate generation.
+	    temperature (float): The temperature for sampling.
+	    presence_penalty (float): The presence penalty for sampling.
+	    frequency_penalty (float): The frequency_penalty for sampling.
+	    repetition_penalty (float): The repetition penalty for sampling.
+	    metadata (vSurgeMetadata | None): The metadata associated with the request.
+	    is_client_side_tokenization (bool): Whether tokenization is handled client-side.
+	"""
 
 	prompt: str
 	max_tokens: int
@@ -89,6 +108,16 @@ class vSurgeRequest:
 
 	@classmethod
 	def from_sampling_params(cls, prompt: str, sampling_params: SamplingParams):
+		"""
+		Creates a vSurgeRequest instance from SamplingParams.
+
+		Args:
+		    prompt (str): The input prompt.
+		    sampling_params (SamplingParams): The sampling parameters.
+
+		Returns:
+		    vSurgeRequest: The created vSurgeRequest instance.
+		"""
 		return vSurgeRequest(
 			prompt=prompt,
 			max_tokens=sampling_params.max_tokens,
@@ -111,44 +140,97 @@ class vSurgeRequest:
 
 
 class vSurge:
-	"""Orchestrates the interaction between client requests and the vDriver."""
+	"""
+	Orchestrates the interaction between client requests and the vDriver.
+
+	Attributes:
+	    _driver (Union[vDriver, oDriver]): The underlying driver instance.
+	    _vsurge_name (str): The name of the vSurge instance.
+	"""
 
 	def __init__(
 		self,
 		driver: tp.Union[vDriver, oDriver],
 		vsurge_name: str | None = None,
 	):
-		"""Initializes the vSurge.
+		"""
+		Initializes the vSurge instance.
 
 		Args:
-		    driver: The vDriver instance that manages the underlying inference
-		        engines and processing threads.
+		    driver (Union[vDriver, oDriver]): The underlying driver instance.
+		    vsurge_name (str | None): The name of the vSurge instance.
 		"""
 		self._driver = driver
 		self._vsurge_name = vsurge_name or driver.driver_name
 
 	def compile(self):
+		"""
+		Compiles the underlying driver.
+		"""
 		self.driver.compile()
 
 	@property
 	def vsurge_name(self):
+		"""
+		Returns the name of the vSurge instance.
+
+		Returns:
+		    str: The name of the vSurge instance.
+		"""
 		return self._vsurge_name
 
 	@property
 	def driver(self):
-		"""Provides access to the underlying vDriver instance."""
+		"""
+		Provides access to the underlying vDriver instance.
+
+		Returns:
+		    Union[vDriver, oDriver]: The underlying driver instance.
+		"""
 		return self._driver
 
 	@property
 	def processor(self) -> ProcessingClassType:
-		"""Returns the processor/tokenizer associated with the underlying driver."""
+		"""
+		Returns the processor/tokenizer associated with the underlying driver.
+
+		Returns:
+		    ProcessingClassType: The processor/tokenizer instance.
+		"""
 		return self.driver.processor
 
 	def start(self):
+		"""
+		Starts the underlying driver.
+		"""
 		return self.driver.start()
 
 	def stop(self):
+		"""
+		Stops the underlying driver.
+		"""
 		return self.driver.stop()
+
+	def pause(self):
+		"""
+		Pauses the underlying driver.
+		"""
+		return self.driver.pause()
+
+	def resume(self):
+		"""
+		Resumes the underlying driver.
+		"""
+		return self.driver.resume()
+
+	def replace_graphstate(self, state):
+		"""
+		Replaces the graph state of the underlying driver.
+
+		Args:
+		    state: The new graph state.
+		"""
+		return self.driver.replace_graphstate(state=state)
 
 	@classmethod
 	def create_odriver(
@@ -167,7 +249,29 @@ class vSurge:
 		seed: int = 894,
 		vsurge_name: str | None = None,
 		verbose: bool = True,
-	) -> vSurge:
+	) -> 'vSurge':
+		"""
+		Creates a new instance of vSurge with an oDriver.
+
+		Args:
+		    model (EasyDeLBaseModule): The model instance.
+		    processor (ProcessingClassType): The processor/tokenizer instance.
+		    storage (Optional[PagedAttentionCache]): The storage for paged attention cache.
+		    manager (Optional[HBMPageManager]): The HBM page manager.
+		    page_size (int): The page size.
+		    hbm_utilization (float): The HBM utilization.
+		    max_concurrent_prefill (int | None): The maximum concurrent prefill requests.
+		    max_concurrent_decodes (int | None): The maximum concurrent decode requests.
+		    prefill_lengths (int | None): The prefill lengths.
+		    max_prefill_length (int | None): The maximum prefill length.
+		    max_length (int | None): The maximum total sequence length.
+		    seed (int): The random seed.
+		    vsurge_name (str | None): The name of the vSurge instance.
+		    verbose (bool): Whether to enable verbose mode.
+
+		Returns:
+		    vSurge: The created vSurge instance.
+		"""
 		max_length = max_length or 8192
 		max_concurrent_prefill = max_concurrent_prefill or jax.device_count()
 		max_concurrent_decodes = max_concurrent_decodes or jax.device_count()
@@ -211,29 +315,26 @@ class vSurge:
 		prefill_lengths: int | None = None,
 		max_prefill_length: int | None = None,
 		max_length: int | None = None,
-		seed: int = 894,
 		vsurge_name: str | None = None,
-	) -> vSurge:
-		"""Creates a new instance of vSurge with configured vDriver and vEngines.
-
-		This class method provides a convenient way to instantiate the vSurge
-		by setting up the necessary prefill and decode engines with the provided
-		model, processor, and configuration parameters.
+		verbose: bool = True,
+		seed: int = 894,
+	) -> 'vSurge':
+		"""
+		Creates a new instance of vSurge with a vDriver.
 
 		Args:
-		    model: The EasyDeLBaseModule instance representing the model.
-		    processor: The tokenizer/processor instance.
-		    max_concurrent_decodes: Maximum number of concurrent decode requests
-		        the decode engine can handle.
-		    prefill_lengths: A list of prefill lengths to compile for the
-		        prefill engine.
-		    max_prefill_length: The maximum prefill length for the prefill engine.
-		    max_length: The maximum total sequence length for both engines.
-		    seed: The random seed for reproducibility.
-		    vsurge_name: An optional name for the vsurge.
+		    model (EasyDeLBaseModule): The model instance.
+		    processor (ProcessingClassType): The processor/tokenizer instance.
+		    max_concurrent_decodes (int | None): The maximum concurrent decode requests.
+		    prefill_lengths (int | None): The prefill lengths.
+		    max_prefill_length (int | None): The maximum prefill length.
+		    max_length (int | None): The maximum total sequence length.
+		    vsurge_name (str | None): The name of the vSurge instance.
+		    verbose (bool): Whether to enable verbose mode.
+		    seed (int): The random seed.
 
 		Returns:
-		    A new instance of vSurge.
+		    vSurge: The created vSurge instance.
 		"""
 		return vSurge(
 			driver=vDriver(
@@ -253,22 +354,24 @@ class vSurge:
 					max_length=max_length,
 					seed=seed,
 				),
+				verbose=verbose,
 			),
 			vsurge_name=vsurge_name,
 		)
 
 	def count_tokens(self, text_or_conversation: tp.Union[str, list]) -> int:
-		"""Counts the number of tokens in a given string or conversation list.
+		"""
+		Counts the number of tokens in a given string or conversation list.
 
 		Uses the underlying driver's processor to tokenize the input and returns
 		the count of tokens.
 
 		Args:
-		    text_or_conversation: Either a single string or a list of
+		    text_or_conversation (Union[str, list]): Either a single string or a list of
 		        message dictionaries (like OpenAI chat format).
 
 		Returns:
-		    The total number of tokens in the input.
+		    int: The total number of tokens in the input.
 
 		Raises:
 		    ValueError: If the input type is invalid or tokenization fails.
