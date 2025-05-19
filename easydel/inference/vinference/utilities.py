@@ -520,5 +520,7 @@ class vInferenceConfig:
 		if self.sampling_params is None:
 			# Initialize default sampling parameters if none provided
 			self.sampling_params = SamplingParams(max_tokens=self.max_new_tokens)
+		self.sampling_params.n = None
+		self.sampling_params.stop = None
 
 	__hash__ = hash_fn

@@ -399,6 +399,8 @@ class vInference:
 						temperature=temperature,
 						top_k=top_k,
 						top_p=top_p,
+						stop=None,
+						n=None,
 					),
 				)
 			return vInferenceConfig(max_new_tokens=max_new_tokens)
@@ -868,6 +870,8 @@ class vInference:
 		if sampling_params is not None:
 			if sampling_params.max_tokens > self.generation_config.max_new_tokens:
 				sampling_params.max_tokens = self.generation_config.max_new_tokens
+			sampling_params.stop = None
+			sampling_params.n = None
 		# Initial generation step
 		state = self.execute_prefill(
 			state,
