@@ -20,11 +20,12 @@ import chex as cx
 import jax
 from eformer import common_types
 from eformer.escale import PartitionManager, apply_logical_sharding
-from eformer.jaximus import ImplicitArray
+from eformer.jaximus import ImplicitArray, register
 from eformer.pytree import auto_pytree
 from flax import nnx as nn
-from jax import lax
+from jax import Array, lax
 from jax import numpy as jnp
+from jax.extend.core import Primitive
 from jax.sharding import Mesh
 from jax.sharding import NamedSharding as Ns
 
@@ -53,6 +54,43 @@ KV_HEAD_DIM = common_types.KV_HEAD_DIM
 BIAS_HEAD_SEQ = common_types.BIAS_HEAD_SEQ
 BIAS_KV_SEQ = common_types.BIAS_KV_SEQ
 MODE_PREFILL = common_types.MODE_PREFILL
+
+
+@register("dynamic_update_slice")
+def _(
+	primitive: Primitive,
+	operand: ImplicitArray,
+	update: tp.Any,
+	*args,
+	**kwargs,
+):
+	operand = operand.materialize()
+	return primitive.bind(operand, update, *args)
+
+
+@register("dynamic_update_slice")
+def _(
+	primitive: Primitive,
+	operand: tp.Any,
+	update: ImplicitArray,
+	*args,
+	**kwargs,
+):
+	update = update.materialize()
+	return primitive.bind(operand, update, *args)
+
+
+@register("dynamic_update_slice")
+def _(
+	primitive: Primitive,
+	operand: ImplicitArray,
+	update: ImplicitArray,
+	*args,
+	**kwargs,
+):
+	operand = operand.materialize()
+	update = update.materialize()
+	return primitive.bind(operand, update, *args)
 
 
 @auto_pytree
@@ -470,23 +508,30 @@ class TransformerCache(BaseCache):
 		quantizer: EasyQuantizer,
 		partition_manager: PartitionManager,
 	):
+		def _maybe_materialize(x: ImplicitArray | Array):
+			if hasattr(x, "materialize"):
+				x = x.materialize()
+			return x
+
 		for idx in range(len(self.views)):
 			view = self.views[idx]
 			oview = other.views[idx]
 
-			def _maybe_materialize(x):
-				if hasattr(x, "materialize"):
-					x = x.materialize()
-				return x
+			new_val = lax.dynamic_update_slice(
+				_maybe_materialize(view.value),
+				_maybe_materialize(oview.value),
+				(slot, 0, 0, 0),
+			)
+			new_key = lax.dynamic_update_slice(
+				_maybe_materialize(view.key),
+				_maybe_materialize(oview.key),
+				(slot, 0, 0, 0),
+			)
 
 			self.views[idx] = self.views[idx].replace(
 				key=quantizer(
 					apply_logical_sharding(
-						lax.dynamic_update_slice(
-							_maybe_materialize(view.key),
-							oview.key,
-							(slot, 0, 0, 0),
-						),
+						new_key,
 						axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
 						mode=MODE_PREFILL,
 						partition_manager=partition_manager,
@@ -494,11 +539,7 @@ class TransformerCache(BaseCache):
 				),
 				value=quantizer(
 					apply_logical_sharding(
-						lax.dynamic_update_slice(
-							_maybe_materialize(view.value),
-							oview.value,
-							(slot, 0, 0, 0),
-						),
+						new_val,
 						axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
 						mode=MODE_PREFILL,
 						partition_manager=partition_manager,

@@ -13,10 +13,15 @@
 # limitations under the License.
 
 import asyncio
+import os
+import sys
+
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from jax import lax
 from jax import numpy as jnp
 from transformers import AutoTokenizer
+
 import easydel as ed
 
 
@@ -30,7 +35,7 @@ def main():
 
 	max_decode_length = 2048
 	max_prefill_length = 2048
-	max_concurrent_decodes = 8
+	max_concurrent_decodes = 16
 
 	max_length = max_prefill_length + max_decode_length
 
@@ -47,12 +52,12 @@ def main():
 			freq_max_position_embeddings=max_length,
 			mask_max_position_embeddings=max_length,
 			kv_cache_quantization_method=ed.EasyDeLQuantizationMethods.NONE,
-			attn_mechanism=ed.AttentionMechanisms.VANILLA,
+			attn_mechanism=ed.AttentionMechanisms.SDPA,
 			attn_dtype=jnp.bfloat16,
-			gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
+			gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NONE,
 		),
 		partition_axis=ed.PartitionAxis(kv_head_axis="tp"),
-		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
+		quantization_method=ed.EasyDeLQuantizationMethods.A8BIT,
 	)
 
 	surge = ed.vSurge.create_vdriver(

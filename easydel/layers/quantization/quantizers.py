@@ -152,3 +152,14 @@ class EasyQuantizer:
 					)
 				pbar.update(1)
 		return model
+
+	def __str__(self):
+		return (
+			self.__class__.__name__
+			+ f"(\n\tblock_size = {self.block_size}"
+			+ f"\n\tquantization_method = {self.quantization_method}"
+			+ f"\n\tquantization_platform = {self.quantization_platform}"
+			+ f"\n\tquantization_pattern = {self.quantization_pattern}\n)"
+		)
+
+	__repr__ = __str__
