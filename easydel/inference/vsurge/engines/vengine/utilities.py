@@ -144,9 +144,9 @@ def continuous_insert(
 		)
 
 	@implicit
-	def _cache(mx_cache, prefix):
-		return mx_cache.cache.insert(
-			prefix.cache,
+	def _cache(cache: TransformerCache, other: TransformerCache):
+		return cache.insert(
+			other,
 			quantizer=quantizer,
 			slot=slot,
 			partition_manager=partition_manager,
@@ -154,7 +154,7 @@ def continuous_insert(
 
 	return GenerationState(
 		logits=update_idx2d(decode_state.logits, prefix.logits),
-		cache=_cache(decode_state, prefix),
+		cache=_cache(decode_state.cache, prefix.cache),
 		index=update_idx2d(decode_state.index, prefix.index),
 		tokens=update_idx2d(decode_state.tokens, prefix.tokens),
 		valids=update_idx2d(decode_state.valids, prefix.valids),
