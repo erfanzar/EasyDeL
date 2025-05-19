@@ -67,11 +67,12 @@ class SamplingParams:
 	frequency_penalty: float = 0.0
 	repetition_penalty: float = 1.0
 	temperature: float = 0.7
-	top_p: float = 1.0
+	top_p: float = 0.95
 	top_k: int = 0
 	min_p: float = 0.0
 	suppress_tokens: tp.List[int] = field(default_factory=lambda: list())
 	stop: tp.Optional[tp.Union[tp.List[str], str]] = field(default=None)
+	n: tp.Optional[int] = field(default=1)
 
 	def __post_init__(self):
 		self.suppress_tokens = []  # not supported yet!

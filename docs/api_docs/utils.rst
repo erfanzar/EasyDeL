@@ -9,6 +9,7 @@ Utils
    utils_checkpoint_managers
    utils_cli_helpers
    utils_compiling_utils
+   utils_data_managers
    utils_graph_utils
    utils_helpers
    utils_lazy_import

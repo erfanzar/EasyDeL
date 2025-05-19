@@ -15,12 +15,26 @@
 import asyncio
 import typing as tp
 
-from .vsurge import vSurge
+from eformer.common_types import NOT_GIVEN, _Empty
+
 from easydel.infra.utils import ProcessingClassType
-from lm_eval.api.model import LM  # type:ignore
+from easydel.utils.helpers import get_logger
+
+from .vsurge import vSurge
+
+logger = get_logger("VSurgeLMEvalAdapter")
+
+try:
+	from lm_eval.api.model import LM  # type:ignore
+except Exception:
+	LM = object
+	logger.warn(
+		"consider installing lm_eval if you want to use `VSurgeLMEvalAdapter`.",
+		stacklevel=1,
+	)
 
 
-class EasyDeLLM(LM):
+class VSurgeLMEvalAdapter(LM):
 	"""Adapter for EasyDeL models to be compatible with lm-evaluation-harness.
 
 	This class inherits from lm_eval.api.model.LM to ensure compatibility with the harness,
@@ -34,8 +48,10 @@ class EasyDeLLM(LM):
 		processor: ProcessingClassType,
 		max_length: int = 8192,
 		max_new_tokens: int = 2048,
+		top_p: float = 0.95,
+		temperature: float = 0.1,
 	):
-		"""Initializes the EasyDeLLM adapter.
+		"""Initializes the VSurgeLMEvalAdapter.
 
 		Args:
 		    surge: An instance of `vSurge` for model inference.
@@ -46,9 +62,14 @@ class EasyDeLLM(LM):
 		self.max_length = max_length
 		self.tokenizer = processor
 		self.tokenizer.padding_side = "left"
+
 		if self.tokenizer.pad_token_id is None:
 			self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+		self.temperature = temperature
 		self.max_new_tokens = max_new_tokens
+		self.top_p = top_p
+
 		self.surge = surge
 		self.model = None
 		self.setup_complete = False
@@ -97,9 +118,9 @@ class EasyDeLLM(LM):
 	async def _generate_async(
 		self,
 		prompts: tp.List[str],
-		max_tokens: int = 128,
-		temperature: float = 0.0,
-		top_p: float = 1.0,
+		max_tokens: int | _Empty = NOT_GIVEN,
+		temperature: float | _Empty = NOT_GIVEN,
+		top_p: float | _Empty = NOT_GIVEN,
 		stop_sequences: tp.List[tp.List[str]] = None,
 	) -> tp.List[str]:
 		"""Generate responses for a list of prompts asynchronously.
@@ -120,38 +141,58 @@ class EasyDeLLM(LM):
 			await self._async_setup()
 		import easydel as ed
 
-		sampling_params = ed.SamplingParams(
-			max_tokens=max_tokens,
-			temperature=temperature,
-			top_p=top_p,
-		)
+		if max_tokens is NOT_GIVEN:
+			max_tokens = self.max_gen_toks
+
+		if top_p is NOT_GIVEN:
+			top_p = self.top_p
+
+		if temperature is NOT_GIVEN:
+			temperature = self.temperature
+
+		sampling_params_list = []
+		for i, _ in enumerate(prompts):
+			current_stop_seq = None
+			if stop_sequences and i < len(stop_sequences):
+				current_stop_seq = stop_sequences[i]
+
+			sampling_params_list.append(
+				ed.SamplingParams(
+					max_tokens=max_tokens,  # This should probably be self.max_gen_toks or a passed arg
+					temperature=temperature,
+					top_p=top_p,
+					stop=current_stop_seq if current_stop_seq else [],  # Ensure it's a list
+					n=1,
+				)
+			)
 
 		results = await self.surge.generate(
 			prompts=prompts,
-			sampling_params=sampling_params,
+			sampling_params=sampling_params_list,
 			stream=False,
 		)
-
 		generated_texts = []
 		for i, result_list in enumerate(results):
-			text = result_list.text
-
+			text = result_list.accumulated_text[0]
 			if stop_sequences and i < len(stop_sequences):
 				for stop in stop_sequences[i]:
 					if stop in text:
 						text = text[: text.find(stop)]
+			generated_texts.append(text)
 
-			prompt_len = len(prompts[i])
-			generated_texts.append(text[prompt_len:])
+		assert len(generated_texts) == len(prompts), (
+			f"Mismatch between prompts sent ({len(prompts)}) and results received "
+			f"({len(generated_texts)}) from surge.generate!."
+		)
 
 		return generated_texts
 
 	def _generate(
 		self,
 		prompts: tp.List[str],
-		max_tokens: int = 128,
-		temperature: float = 0.0,
-		top_p: float = 1.0,
+		max_tokens: int | _Empty = NOT_GIVEN,
+		temperature: float | _Empty = NOT_GIVEN,
+		top_p: float | _Empty = NOT_GIVEN,
 		stop_sequences: tp.List[tp.List[str]] = None,
 	) -> tp.List[str]:
 		"""Generate responses for a list of prompts synchronously.
@@ -161,8 +202,8 @@ class EasyDeLLM(LM):
 		Args:
 		    prompts: List of prompts to generate responses for.
 		    max_tokens: Maximum number of tokens to generate per prompt. Defaults to 128.
-		    temperature: Sampling temperature. Defaults to 0.0 (greedy decoding).
-		    top_p: Top-p sampling parameter. Defaults to 1.0.
+		    temperature: Sampling temperature. Defaults to NOT_GIVEN.
+		    top_p: Top-p sampling parameter. Defaults to NOT_GIVEN.
 		    stop_sequences: List of lists of stop sequences, one list per prompt.
 		                    Generation stops if any sequence in the corresponding list is encountered.
 		                    Defaults to None.
@@ -170,8 +211,7 @@ class EasyDeLLM(LM):
 		Returns:
 		    List of generated responses, with the prompt text removed.
 		"""
-
-		return asyncio.run(
+		out = asyncio.run(
 			self._generate_async(
 				prompts,
 				max_tokens,
@@ -180,6 +220,7 @@ class EasyDeLLM(LM):
 				stop_sequences,
 			)
 		)
+		return out
 
 	def _extract_choice_from_generation(self, generation: str) -> str:
 		"""Extract a multiple-choice answer (A, B, C, D) from generated text.
@@ -240,15 +281,10 @@ class EasyDeLLM(LM):
 
 			requests.append((prompt, stop_sequences))
 
-		contexts = [req[0] for req in requests]
-		stop_seqs_list = [req[1] for req in requests]
-
 		generations = self._generate(
-			contexts,
+			[req[0] for req in requests],
 			max_tokens=self.max_gen_toks,
-			temperature=0.1,
-			top_p=0.95,
-			stop_sequences=stop_seqs_list,
+			stop_sequences=[req[1] for req in requests],
 		)
 
 		return generations
@@ -307,7 +343,7 @@ class EasyDeLLM(LM):
 
 	def _model_call(self, inps):
 		"""
-		This method is not directly used by EasyDeLLM but is required by the LM interface.
+		This method is not directly used by VSurgeLMEvalAdapter but is required by the LM interface.
 
 		In our case, loglikelihood and greedy_until handle the model calls directly
 		by interacting with the `vSurge` instance.
@@ -315,12 +351,12 @@ class EasyDeLLM(LM):
 		Raises:
 		    NotImplementedError: This method is not implemented as it's not used.
 		"""
-		raise NotImplementedError("EasyDeLLM doesn't use _model_call directly")
+		raise NotImplementedError("VSurgeLMEvalAdapter doesn't use _model_call directly")
 
 	def _model_generate(self, context, max_length, eos_token_id):
 		"""Generate text from context.
 
-		This method is not directly used by EasyDeLLM but is required by the LM interface.
+		This method is not directly used by VSurgeLMEvalAdapter but is required by the LM interface.
 		Generation is handled by the `_generate` and `generate_until` methods.
 
 		Args:
@@ -331,7 +367,9 @@ class EasyDeLLM(LM):
 		Raises:
 		    NotImplementedError: This method is not implemented as it's not used.
 		"""
-		raise NotImplementedError("EasyDeLLM doesn't use _model_generate directly")
+		raise NotImplementedError(
+			"VSurgeLMEvalAdapter doesn't use _model_generate directly"
+		)
 
 	def loglikelihood(self, instances):
 		"""
@@ -374,11 +412,7 @@ class EasyDeLLM(LM):
 		if is_mc_task:
 			choices = "ABCD"
 			max_tokens = 5
-			generations = self._generate(
-				contexts,
-				max_tokens=max_tokens,
-				temperature=0.1,
-			)
+			generations = self._generate(contexts, max_tokens=max_tokens)
 
 			for i, (context, continuation, generation) in enumerate(
 				zip(contexts, continuations, generations)
@@ -416,7 +450,7 @@ class EasyDeLLM(LM):
 		    Each inner list contains pairs for each token in the sequence (except the first).
 		    Currently returns placeholder values.
 		"""
-		
+
 		token_lists = []
 		for instance in instances:
 			if len(instance.arguments) >= 1 and isinstance(instance.arguments[0], list):
@@ -456,5 +490,5 @@ class EasyDeLLM(LM):
 		    NotImplementedError: This method is not implemented as `generate_until` provides similar functionality.
 		"""
 		raise NotImplementedError(
-			"EasyDeLLM doesn't use greedy_until directly, use generate_until"
+			"VSurgeLMEvalAdapter doesn't use greedy_until directly, use generate_until"
 		)

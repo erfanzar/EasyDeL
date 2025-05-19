@@ -80,7 +80,7 @@ class ChatCompletionRequest(BaseModel):
 	frequency_penalty: float = 0.0
 	repetition_penalty: float = 1.0
 	temperature: float = 0.7
-	top_p: float = 1.0
+	top_p: float = 0.95
 	top_k: int = 0
 	min_p: float = 0.0
 	suppress_tokens: tp.List[int] = Field(default_factory=list)
@@ -158,7 +158,7 @@ class CompletionRequest(BaseModel):
 	frequency_penalty: float = 0.0
 	repetition_penalty: float = 1.0
 	temperature: float = 0.7
-	top_p: float = 1.0
+	top_p: float = 0.95
 	top_k: int = 0
 	min_p: float = 0.0
 	suppress_tokens: tp.List[int] = Field(default_factory=list)

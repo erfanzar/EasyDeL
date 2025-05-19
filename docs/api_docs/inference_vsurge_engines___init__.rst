@@ -1,7 +1,7 @@
-easydel.inference.vsurge.vengine.__init__
+easydel.inference.vsurge.engines.__init__
 =========================================
 
-.. automodule:: easydel.inference.vsurge.vengine.__init__
+.. automodule:: easydel.inference.vsurge.engines.__init__
     :members:
     :undoc-members:
     :show-inheritance:

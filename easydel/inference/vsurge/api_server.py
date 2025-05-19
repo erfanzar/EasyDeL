@@ -27,6 +27,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from transformers import ProcessorMixin
 
 from easydel.inference.utilities import SamplingParams
+from easydel.inference.vsurge.utils import ReturnSample
 from easydel.utils.helpers import get_logger
 from easydel.utils.lazy_import import is_package_available
 
@@ -46,7 +47,7 @@ from ..openai_api_modules import (
 	DeltaMessage,
 	UsageInfo,
 )
-from .vsurge import vSurge, vSurgeRequest
+from .vsurge import vSurge
 
 TIMEOUT_KEEP_ALIVE = 5.0
 
@@ -82,7 +83,7 @@ class vSurgeApiServer:
 	def __init__(
 		self,
 		vsurge_map: tp.Union[tp.Dict[str, vSurge], vSurge] = None,
-		max_workers: int = 10,
+		max_workers: int | None = None,
 		oai_like_processor: bool = True,
 	) -> None:
 		if isinstance(vsurge_map, vSurge):
@@ -165,6 +166,7 @@ class vSurgeApiServer:
 			top_k=int(request.top_k),
 			top_p=float(request.top_p),
 			min_p=float(request.min_p),
+			n=int(request.n),
 			suppress_tokens=request.suppress_tokens,
 			stop=request.stop,
 		)
@@ -327,50 +329,40 @@ class vSurgeApiServer:
 		"""
 		prompt_tokens = vsurge.count_tokens(content)
 		sampling_params = self._create_sampling_params_from_request(request)
-
-		response_state = None
-		final_response = ""
-		async for response_state in vsurge.complete(
-			request=vSurgeRequest.from_sampling_params(
-				prompt=content,
-				sampling_params=sampling_params,
-			)
-		):
-			final_response += response_state[0].text
-		response_state = response_state[0]
-		if response_state is None:
-			raise RuntimeError("Generation failed to produce any output state.")
-
-		generated_tokens = response_state.num_generated_tokens
-		time_spent_computing = 0
-		tokens_per_second = response_state.tokens_per_second
-
-		finish_reason = (
-			"length" if generated_tokens >= sampling_params.max_tokens else "stop"
+		response = await vsurge.generate(
+			prompts=content,
+			sampling_params=sampling_params,
+			stream=False,
 		)
 
-		function_call_result = None
+		if response is None:
+			raise RuntimeError("Generation failed to produce any output state.")
+
+		response: ReturnSample = response[0]
 
 		usage = self._create_usage_info(
 			prompt_tokens=prompt_tokens,
-			completion_tokens=generated_tokens,
-			total_tokens=prompt_tokens + generated_tokens,
-			time_spent_computing=time_spent_computing,
-			tokens_per_second=tokens_per_second,
+			completion_tokens=sum(response.num_generated_tokens),
+			total_tokens=prompt_tokens + sum(response.num_generated_tokens),
+			time_spent_computing=max(response.time_spent_computing),
+			tokens_per_second=max(response.tokens_per_second),
 		)
 		if isinstance(request, ChatCompletionRequest):
 			return ChatCompletionResponse(
 				model=request.model,
 				choices=[
 					ChatCompletionResponseChoice(
-						index=generated_tokens + 1,
+						index=response.num_generated_tokens[idx],
 						message=ChatMessage(
 							role="assistant",
-							content=final_response,
-							function_call=function_call_result,
+							content=response.accumulated_text[idx],
+							function_call=None,
 						),
-						finish_reason="function_call" if function_call_result else finish_reason,
+						finish_reason="length"
+						if response.num_generated_tokens[idx] >= sampling_params.max_tokens
+						else "stop",
 					)
+					for idx in range(len(response.text))
 				],
 				usage=usage,
 			)
@@ -379,10 +371,13 @@ class vSurgeApiServer:
 				model=request.model,
 				choices=[
 					CompletionResponseChoice(
-						index=generated_tokens + 1,
-						text=final_response,
-						finish_reason=finish_reason,
+						index=response.num_generated_tokens[idx],
+						text=response.accumulated_text[idx],
+						finish_reason="length"
+						if response.num_generated_tokens[idx] >= sampling_params.max_tokens
+						else "stop",
 					)
+					for idx in range(len(response.text))
 				],
 				usage=usage,
 			)
@@ -399,39 +394,40 @@ class vSurgeApiServer:
 
 		async def stream_results() -> tp.AsyncGenerator[bytes, tp.Any]:
 			prompt_tokens = vsurge.count_tokens(content)
-
 			sampling_params = self._create_sampling_params_from_request(request)
 
 			try:
-				async for response_state in vsurge.complete(
-					request=vSurgeRequest.from_sampling_params(
-						prompt=content,
-						sampling_params=sampling_params,
-					)
+				async for response_state in await vsurge.generate(
+					prompts=content,
+					sampling_params=sampling_params,
+					stream=True,
 				):
-					response_state = response_state[0]
+					response_state: ReturnSample = response_state[0]
+
 					chunk_usage = await self._create_usage_info_async(
 						prompt_tokens=prompt_tokens,
-						completion_tokens=response_state.num_generated_tokens,
-						total_tokens=prompt_tokens + response_state.num_generated_tokens,
-						time_spent_computing=0,
-						tokens_per_second=response_state.tokens_per_second,
+						completion_tokens=sum(response_state.num_generated_tokens),
+						total_tokens=prompt_tokens + sum(response_state.num_generated_tokens),
+						time_spent_computing=max(response_state.time_spent_computing),
+						tokens_per_second=max(response_state.tokens_per_second),
 					)
+
 					if isinstance(request, ChatCompletionRequest):
 						stream_resp = ChatCompletionStreamResponse(
 							model=request.model,
 							choices=[
 								ChatCompletionStreamResponseChoice(
-									index=response_state.num_generated_tokens,
+									index=response_state.num_generated_tokens[idx],
 									delta=DeltaMessage(
 										role="assistant"
-										if response_state.num_generated_tokens == 0
+										if response_state.num_generated_tokens[idx] == 0
 										else None,
-										content=response_state.text,
+										content=response_state.text[idx],
 										function_call=None,
 									),
 									finish_reason=None,
 								)
+								for idx in range(len(response_state.text))
 							],
 							usage=chunk_usage,
 						)
@@ -440,10 +436,11 @@ class vSurgeApiServer:
 							model=request.model,
 							choices=[
 								CompletionStreamResponseChoice(
-									text=response_state.text,
-									index=response_state.num_generated_tokens,
+									text=response_state.text[idx],
+									index=response_state.num_generated_tokens[idx],
 									finish_reason=None,
 								)
+								for idx in range(len(response_state.text))
 							],
 							usage=chunk_usage,
 						)
@@ -464,28 +461,26 @@ class vSurgeApiServer:
 				return
 
 			if last_response_state is not None:
-				finish_reason = (
-					"length"
-					if last_response_state.num_generated_tokens >= sampling_params.max_tokens
-					else "stop"
-				)
-
 				final_usage = await self._create_usage_info_async(
 					prompt_tokens=prompt_tokens,
-					completion_tokens=last_response_state.num_generated_tokens,
-					total_tokens=prompt_tokens + last_response_state.num_generated_tokens,
-					time_spent_computing=0,
-					tokens_per_second=last_response_state.tokens_per_second,
+					completion_tokens=sum(last_response_state.num_generated_tokens),
+					total_tokens=prompt_tokens + sum(last_response_state.num_generated_tokens),
+					time_spent_computing=max(last_response_state.time_spent_computing),
+					tokens_per_second=max(last_response_state.tokens_per_second),
 				)
 				if isinstance(request, ChatCompletionRequest):
 					final_resp = ChatCompletionStreamResponse(
 						model=request.model,
 						choices=[
 							ChatCompletionStreamResponseChoice(
-								index=last_response_state.num_generated_tokens + 1,
+								index=last_response_state.num_generated_tokens[idx],
 								delta=DeltaMessage(),
-								finish_reason=finish_reason,
+								finish_reason="length"
+								if last_response_state.num_generated_tokens[idx]
+								>= sampling_params.max_tokens
+								else "stop",
 							)
+							for idx in range(len(response_state.text))
 						],
 						usage=final_usage,
 					)
@@ -495,9 +490,13 @@ class vSurgeApiServer:
 						choices=[
 							CompletionStreamResponseChoice(
 								text="",
-								index=response_state.num_generated_tokens + 1,
-								finish_reason=finish_reason,
+								index=response_state.num_generated_tokens[idx],
+								finish_reason="length"
+								if last_response_state.num_generated_tokens[idx]
+								>= sampling_params.max_tokens
+								else "stop",
 							)
+							for idx in range(len(response_state.text))
 						],
 						usage=final_usage,
 					)
