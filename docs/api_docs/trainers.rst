@@ -8,9 +8,11 @@ Trainers
    trainers_base_trainer
    trainers_direct_preference_optimization_trainer
    trainers_group_relative_policy_optimization
+   trainers_metrics
    trainers_odds_ratio_preference_optimization_trainer
    trainers_packer
    trainers_prompt_utils
+   trainers_ray_scaler
    trainers_reward_trainer
    trainers_supervised_fine_tuning_trainer
    trainers_trainer

@@ -77,6 +77,10 @@ class GRPOConfig(TrainingArguments):
 		default=False,
 		metadata={"help": "whenever to skip extracting prompt from dataset."},
 	)
+	num_return_sequences: int = field(
+		default=8,
+		metadata={"help": "The number of responses to generate for each sequence."},
+	)
 
 	def __post_init__(self):
 		"""Post initialization to set dependent parameters."""

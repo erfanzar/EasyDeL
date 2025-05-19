@@ -115,6 +115,7 @@ _import_structure = {
 		"vWhisperInference",
 		"vWhisperInferenceConfig",
 	],
+	"inference.evals": ["VSurgeLMEvalAdapter"],
 	"infra": [
 		"EasyDeLBaseConfig",
 		"EasyDeLBaseConfigDict",
@@ -482,6 +483,7 @@ if _tp.TYPE_CHECKING:
 		vWhisperInference,
 		vWhisperInferenceConfig,
 	)
+	from .inference.evals import VSurgeLMEvalAdapter
 	from .infra import (
 		EasyDeLBaseConfig,
 		EasyDeLBaseConfigDict,

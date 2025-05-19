@@ -22,7 +22,7 @@ from lm_eval import evaluator
 from transformers import AutoTokenizer
 
 import easydel as ed
-from easydel.inference.evals import EasyDeLLM
+from easydel.inference.evals import VSurgeLMEvalAdapter
 
 
 @auto_pytree
@@ -120,7 +120,7 @@ def main():
 	3. Initializes the tokenizer and sets padding side and pad token ID.
 	4. Loads the EasyDeL model with specified configurations and sharding.
 	5. Creates a vSurge engine instance (vdriver or odriver) based on the configuration.
-	6. Wraps the model and engine in an EasyDeLLM adapter for compatibility with lm-eval.
+	6. Wraps the model and engine in an VSurgeLMEvalAdapter adapter for compatibility with lm-eval.
 	7. Runs the evaluation using `lm_eval.evaluator.simple_evaluate` on the specified tasks.
 	8. Saves the evaluation results to a JSON file.
 	9. Prints a summary of the evaluation results.
@@ -129,7 +129,7 @@ def main():
 	parser = ed.utils.DataClassArgumentParser(EvaluationConfig)
 	eval_config = parser.parse_args_into_dataclasses()[0]
 	print(eval_config)
-	print(f"Creating EasyDeLLM adapter for {eval_config.model}")
+	print(f"Creating VSurgeLMEvalAdapter adapter for {eval_config.model}")
 	if jax.default_backend() == "tpu":
 		dtype = param_dtype = jnp.bfloat16
 	else:
@@ -183,7 +183,7 @@ def main():
 			max_concurrent_decodes=eval_config.max_concurrent_decodes,
 		)
 
-	model = EasyDeLLM(
+	model = VSurgeLMEvalAdapter(
 		surge=surge,
 		processor=processor,
 		max_length=eval_config.max_length,

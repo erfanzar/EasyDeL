@@ -62,12 +62,13 @@ class ReturnSample:
 	                        sample since the start of the decode phase. Optional.
 	"""
 
-	text: tp.Union[str, tp.List[str]]
+	text: tp.List[str] | str
 	token_ids: tp.List[int]
 	time_spent_computing: float = 0.0
-	accumulated_text: tp.Union[str, tp.List[str]] = None
+	accumulated_text: tp.List[str] | str = None
 	tokens_per_second: float | None = dataclasses.field(default=None)
 	num_generated_tokens: int | None = dataclasses.field(default=None)
+	generation_idx: tp.Optional[int] = dataclasses.field(default=None)
 
 
 class _Exception:
@@ -184,9 +185,11 @@ class ActiveRequest:
 	max_tokens: int
 	return_channel: AsyncMultifuture[list[ReturnSample]]
 
-	top_p: float = 1.0
+	top_p: float = 0.95
 	top_k: int = 0
 	min_p: float = 0.0
+
+	n: int = 1
 
 	stop: tp.Optional[tp.Union[str, tp.List[str]]] = None
 
@@ -212,6 +215,9 @@ class ActiveRequest:
 		if self.stop is not None:
 			if isinstance(self.stop, str):
 				self.stop = [self.stop]
+			if isinstance(self.stop, list):
+				if isinstance(self.stop[0], list):
+					self.stop = self.stop[0]
 
 	def enqueue_samples(self, generated_samples: list[ReturnSample]):
 		"""Adds the generated sample(s) to return channel for current step.

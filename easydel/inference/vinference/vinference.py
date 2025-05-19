@@ -775,6 +775,7 @@ class vInference:
 		self._metrics_increase_queue()
 		if sampling_params is not None:
 			sampling_params.stop = None
+			sampling_params.n = None
 		try:
 			adjusted_kwargs, vinference_compile_config = self.adjust_kwargs(
 				input_ids=input_ids,

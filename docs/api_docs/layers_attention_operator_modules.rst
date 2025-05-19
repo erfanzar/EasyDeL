@@ -5,6 +5,7 @@ Modules
    :maxdepth: 2
 
    layers_attention_operator_modules___init__
+   layers_attention_operator_modules_decode_attn
    layers_attention_operator_modules_flash
    layers_attention_operator_modules_paged_attn
    layers_attention_operator_modules_ring

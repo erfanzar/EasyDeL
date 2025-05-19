@@ -45,14 +45,17 @@ else:
 logger = get_logger("vSurge-oDriver")
 
 
+
 class oDriver(AbstractDriver):
 	"""
-	oDriver is responsible for managing the inference process for the oEngine.
+	The oDriver class is responsible for managing the inference process for the oEngine,
+	which utilizes paged attention for memory-efficient inference.
+
 	It handles request submission, input preparation, inference execution,
 	and processing of model outputs. It utilizes background threads for
-	concurrent processing of different stages of the inference pipeline.
+	concurrent processing of different stages of the inference pipeline, optimizing
+	throughput and minimizing latency.
 	"""
-
 	_active_requests: list[queue.Queue[tuple[int, ActiveRequest]]] = []
 
 	def __init__(self, engine: oEngine, verbose: bool = True):
