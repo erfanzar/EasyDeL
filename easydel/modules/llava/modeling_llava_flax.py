@@ -88,8 +88,8 @@ class LlavaMultiModalProjector(nn.Module):
 	def __init__(
 		self,
 		config: LlavaConfig,
-		dtype: jnp.dtype = jnp.float32,
-		param_dtype: jnp.dtype = jnp.float32,
+		dtype: jnp.dtype = jnp.bfloat16,
+		param_dtype: jnp.dtype = jnp.bfloat16,
 		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
@@ -147,8 +147,8 @@ class LlavaForConditionalGeneration(EasyDeLBaseModule):
 	def __init__(
 		self,
 		config: LlavaConfig,
-		dtype: jnp.dtype = jnp.float32,
-		param_dtype: jnp.dtype = jnp.float32,
+		dtype: jnp.dtype = jnp.bfloat16,
+		param_dtype: jnp.dtype = jnp.bfloat16,
 		precision: jax.lax.PrecisionLike = None,
 		*,
 		rngs: nn.Rngs,
