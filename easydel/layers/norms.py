@@ -33,8 +33,8 @@ class RMSNorm(nn.Module):
 		self,
 		dim: int,
 		eps: float = 1e-6,
-		dtype: jnp.dtype = jnp.float32,
-		param_dtype: jnp.dtype = jnp.float32,
+		dtype: jnp.dtype = jnp.bfloat16,
+		param_dtype: jnp.dtype = jnp.bfloat16,
 		*,
 		rngs: tp.Optional[nn.Rngs] = None,
 	) -> None:

@@ -96,17 +96,17 @@ class RayDistributedTrainer:
 	training process.
 
 	Attributes:
-		model_task (TaskType): The task type of the model (e.g., Causal Language Modeling).
-		model_type (str): The type of the model (e.g., "llama", "mistral").
-		model_class (tp.Type[EasyDeLBaseModule]): The EasyDeL module class for the model.
-		state_class (tp.Type[EasyDeLState]): The EasyDeL state class for managing model state.
-		trainer_module (tp.Type[BaseTrainer | Trainer]): The trainer class to be used.
-		config_scaling_variables (tp.Dict[str, int]): Configuration parameters that scale
-			with the `scaling_index`.
-		config_variables (tp.Dict[str, tp.Any]): Fixed configuration parameters.
-		pretrained_model_name_or_path (str): Path or identifier for the pretrained model
-			or tokenizer.
-		_processor_loader_class (tp.Type[PreTrainedTokenizer]): The class used to load the tokenizer.
+	        model_task (TaskType): The task type of the model (e.g., Causal Language Modeling).
+	        model_type (str): The type of the model (e.g., "llama", "mistral").
+	        model_class (tp.Type[EasyDeLBaseModule]): The EasyDeL module class for the model.
+	        state_class (tp.Type[EasyDeLState]): The EasyDeL state class for managing model state.
+	        trainer_module (tp.Type[BaseTrainer | Trainer]): The trainer class to be used.
+	        config_scaling_variables (tp.Dict[str, int]): Configuration parameters that scale
+	                with the `scaling_index`.
+	        config_variables (tp.Dict[str, tp.Any]): Fixed configuration parameters.
+	        pretrained_model_name_or_path (str): Path or identifier for the pretrained model
+	                or tokenizer.
+	        _processor_loader_class (tp.Type[PreTrainedTokenizer]): The class used to load the tokenizer.
 	"""
 
 	model_task: TaskType
@@ -130,7 +130,7 @@ class RayDistributedTrainer:
 	CONFIG_VARIABLES: tp.Dict[str, tp.Any] = {
 		"dtype": jnp.bfloat16,
 		"param_dtype": jnp.bfloat16,
-		"precision": lax.Precision.HIGH,
+		"precision": lax.Precision.DEFAULT,
 		"seed": 654,
 		"max_position_embeddings": 2**13,
 		"gradient_checkpointing": EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
@@ -162,24 +162,24 @@ class RayDistributedTrainer:
 		Initializes the RayDistributedTrainer.
 
 		Args:
-			pretrained_model_name_or_path: Path or identifier for the pretrained
-				model or tokenizer. This is required.
-			model_task: The task type of the model. If None, it's inferred from
-				`model_class` or requires `model_type` to be set.
-			model_type: The type of the model. If None, it's inferred from
-				`model_class` or requires `model_task` to be set.
-			model_class: The EasyDeL module class. If None, it's determined using
-				`model_type` and `model_task`.
-			state_class: The EasyDeL state class. Defaults to `EasyDeLState`.
-			trainer_module: The trainer class. Defaults to `Trainer`.
-			config_scaling_variables: Custom scaling variables to override defaults.
-			config_variables: Custom fixed variables to override defaults.
+		        pretrained_model_name_or_path: Path or identifier for the pretrained
+		                model or tokenizer. This is required.
+		        model_task: The task type of the model. If None, it's inferred from
+		                `model_class` or requires `model_type` to be set.
+		        model_type: The type of the model. If None, it's inferred from
+		                `model_class` or requires `model_task` to be set.
+		        model_class: The EasyDeL module class. If None, it's determined using
+		                `model_type` and `model_task`.
+		        state_class: The EasyDeL state class. Defaults to `EasyDeLState`.
+		        trainer_module: The trainer class. Defaults to `Trainer`.
+		        config_scaling_variables: Custom scaling variables to override defaults.
+		        config_variables: Custom fixed variables to override defaults.
 
 		Raises:
-			AssertionError: If `model_class` is None and `model_type` or `model_task`
-				is also None.
-			AssertionError: If `model_task` and `model_type` are provided but
-				`model_class` is also provided (ambiguous).
+		        AssertionError: If `model_class` is None and `model_type` or `model_task`
+		                is also None.
+		        AssertionError: If `model_task` and `model_type` are provided but
+		                `model_class` is also provided (ambiguous).
 		"""
 		self.pretrained_model_name_or_path = pretrained_model_name_or_path
 
@@ -272,7 +272,7 @@ class RayDistributedTrainer:
 		Loads and returns the tokenizer/processor.
 
 		Returns:
-			The loaded PreTrainedTokenizer.
+		        The loaded PreTrainedTokenizer.
 		"""
 		base = self._processor_loader_class
 		processor = base.from_pretrained(self.pretrained_model_name_or_path)
@@ -292,7 +292,7 @@ class RayDistributedTrainer:
 		Provides cached access to the tokenizer/processor.
 
 		Returns:
-			The loaded PreTrainedTokenizer.
+		        The loaded PreTrainedTokenizer.
 		"""
 		return self.load_processor()
 
@@ -316,13 +316,13 @@ class RayDistributedTrainer:
 		Processes a single sample of data using the tokenizer.
 
 		Args:
-			sample: The input sample (e.g., text).
-			max_length: The maximum sequence length for padding/truncation.
-			padding_side: The side to pad on ('left' or 'right').
-				Defaults to "left".
+		        sample: The input sample (e.g., text).
+		        max_length: The maximum sequence length for padding/truncation.
+		        padding_side: The side to pad on ('left' or 'right').
+		                Defaults to "left".
 
 		Returns:
-			A dictionary of tokenized data (e.g., 'input_ids', 'attention_mask').
+		        A dictionary of tokenized data (e.g., 'input_ids', 'attention_mask').
 		"""
 		out = self.processor(
 			sample,
@@ -346,14 +346,14 @@ class RayDistributedTrainer:
 		Processes conversational data (messages) using the tokenizer's chat template.
 
 		Args:
-			messages: A list of messages in a conversational format compatible
-				with the tokenizer's chat template.
-			max_length: The maximum sequence length for padding/truncation.
-			padding_side: The side to pad on ('left' or 'right').
-				Defaults to "left".
+		        messages: A list of messages in a conversational format compatible
+		                with the tokenizer's chat template.
+		        max_length: The maximum sequence length for padding/truncation.
+		        padding_side: The side to pad on ('left' or 'right').
+		                Defaults to "left".
 
 		Returns:
-			A dictionary of tokenized data.
+		        A dictionary of tokenized data.
 		"""
 		out = self.processor.apply_chat_template(
 			messages,
@@ -376,11 +376,11 @@ class RayDistributedTrainer:
 		`self.config_scaling_variables`) to allow for easy scaling experiments.
 
 		Args:
-			scaling_index: An integer factor to scale certain configuration
-				parameters (e.g., hidden_size, num_attention_heads).
+		        scaling_index: An integer factor to scale certain configuration
+		                parameters (e.g., hidden_size, num_attention_heads).
 
 		Returns:
-			An EasyDeLBaseConfig instance.
+		        An EasyDeLBaseConfig instance.
 		"""
 		current_scaling_variables = {
 			k: v * scaling_index
@@ -408,18 +408,19 @@ class RayDistributedTrainer:
 		Creates an instance of the model.
 
 		Args:
-			config: The model configuration object.
-			dtype: The data type for computations (default: bfloat16).
-			param_dtype: The data type for model parameters (default: bfloat16).
-			precision: The JAX precision level (e.g., lax.Precision.DEFAULT).
-			seed: Random seed for model initialization.
-			lazy: If True, uses lazy initialization for the model. Defaults to False.
+		        config: The model configuration object.
+		        dtype: The data type for computations (default: bfloat16).
+		        param_dtype: The data type for model parameters (default: bfloat16).
+		        precision: The JAX precision level (e.g., lax.Precision.DEFAULT).
+		        seed: Random seed for model initialization.
+		        lazy: If True, uses lazy initialization for the model. Defaults to False.
 
 		Returns:
-			An instance of EasyDeLBaseModule.
+		        An instance of EasyDeLBaseModule.
 		"""
 		if precision is None:
-			precision = lax.Precision.HIGH
+			precision = lax.Precision.DEFAULT
+
 		init_kwargs = dict(
 			config=config,
 			dtype=dtype,
@@ -427,28 +428,22 @@ class RayDistributedTrainer:
 			precision=precision,
 			rngs=nn.Rngs(seed),
 		)
-		model_instance = self.model_class
-		init_kwargs = copy.deepcopy(init_kwargs)
 
-		init_kwargs.pop("dtype", None)
-		init_kwargs.pop("param_dtype", None)
-		init_kwargs.pop("precision", None)
-		init_kwargs.pop("seed", None)
 		with jax.default_device(jax.local_devices(backend=self.offload_device)[-1]):
 			if lazy:
-				return model_instance.lazy_init(**init_kwargs)
+				return self.model_class.lazy_init(**init_kwargs)
 			else:
-				return model_instance(**init_kwargs)
+				return self.model_class(**init_kwargs)
 
 	def convert_model_to_state(self, model: EasyDeLBaseModule) -> EasyDeLState:
 		"""
 		Converts an initialized model module to an EasyDeLState object.
 
 		Args:
-			model: The initialized EasyDeLBaseModule instance.
+		        model: The initialized EasyDeLBaseModule instance.
 
 		Returns:
-			An EasyDeLState instance containing the model's parameters and state.
+		        An EasyDeLState instance containing the model's parameters and state.
 		"""
 		state = model.to_state(self.state_class)
 		state = state.shard_state()
@@ -464,11 +459,11 @@ class RayDistributedTrainer:
 		Loads a model state from a specified directory.
 
 		Args:
-			load_directory: The directory from which to load the state.
-			**kwargs: Additional keyword arguments to pass to the state loading method.
+		        load_directory: The directory from which to load the state.
+		        **kwargs: Additional keyword arguments to pass to the state loading method.
 
 		Returns:
-			The loaded EasyDeLState instance.
+		        The loaded EasyDeLState instance.
 		"""
 
 		def _create():
@@ -526,22 +521,22 @@ class RayDistributedTrainer:
 		or using a directly provided state.
 
 		Args:
-			arguments: TrainingArguments for configuring the trainer.
-			dataset_train: The training dataset.
-			dataset_eval: The evaluation dataset (optional).
-			data_collator: Callable to collate data batches (optional).
-			checkpoint_path: Path to a checkpoint to load model state from.
-				If `model` or `state` is provided, this is ignored.
-			state: An EasyDeLState object. If provided, this is used directly.
+		        arguments: TrainingArguments for configuring the trainer.
+		        dataset_train: The training dataset.
+		        dataset_eval: The evaluation dataset (optional).
+		        data_collator: Callable to collate data batches (optional).
+		        checkpoint_path: Path to a checkpoint to load model state from.
+		                If `model` or `state` is provided, this is ignored.
+		        state: An EasyDeLState object. If provided, this is used directly.
 
 		Returns:
-			An instance of the configured trainer (BaseTrainer or Trainer).
+		        An instance of the configured trainer (BaseTrainer or Trainer).
 
 		Raises:
-			AssertionError: If no valid state can be obtained (from model,
-				checkpoint, or direct input).
-			FileNotFoundError: If `checkpoint_path` is provided but the
-				checkpoint is not found.
+		        AssertionError: If no valid state can be obtained (from model,
+		                checkpoint, or direct input).
+		        FileNotFoundError: If `checkpoint_path` is provided but the
+		                checkpoint is not found.
 		"""
 
 		return self.trainer_module(
@@ -569,20 +564,20 @@ class RayDistributedTrainer:
 		Initializes a model (if not provided) and starts the training process.
 
 		Args:
-			scaling_index: Index for scaling model configuration. Used if a new
-				model needs to be created.
-			arguments: TrainingArguments for the trainer.
-			dataset_train: The training dataset.
-			dataset_eval: Evaluation dataset (optional).
-			data_collator: Data collator function (optional).
-			checkpoint_path: Path to a checkpoint. Used if `model` and `state`
-				are None.
-			model: An existing EasyDeLBaseModule instance (optional).
-			state: An existing EasyDeLState instance (optional).
-			load_state_kwargs: Arguments for loading state from checkpoint (optional).
+		        scaling_index: Index for scaling model configuration. Used if a new
+		                model needs to be created.
+		        arguments: TrainingArguments for the trainer.
+		        dataset_train: The training dataset.
+		        dataset_eval: Evaluation dataset (optional).
+		        data_collator: Data collator function (optional).
+		        checkpoint_path: Path to a checkpoint. Used if `model` and `state`
+		                are None.
+		        model: An existing EasyDeLBaseModule instance (optional).
+		        state: An existing EasyDeLState instance (optional).
+		        load_state_kwargs: Arguments for loading state from checkpoint (optional).
 
 		Returns:
-			The result of the trainer's train() method.
+		        The result of the trainer's train() method.
 		"""
 
 		if state is None and model is None and checkpoint_path is None:

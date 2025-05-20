@@ -404,8 +404,8 @@ class EasyBridgeMixin(PushToHubMixin):
 		sharding_dcn_axis_dims: tp.Optional[tp.Sequence[int]] = None,
 		sharding_axis_names: tp.Sequence[str] = ("dp", "fsdp", "tp", "sp"),
 		partition_axis: PartitionAxis = PartitionAxis(),  # noqa
-		dtype: jnp.dtype = jnp.float32,
-		param_dtype: jnp.dtype = jnp.float32,
+		dtype: jnp.dtype = jnp.bfloat16,
+		param_dtype: jnp.dtype = jnp.bfloat16,
 		precision: jax.lax.PrecisionLike = jax.lax.Precision("fastest"),  # noqa
 		config_kwargs: tp.Optional[dict[str, tp.Any]] = None,
 		partition_rules: tp.Optional[tp.Tuple[tp.Tuple[str, PartitionSpec]]] = None,
