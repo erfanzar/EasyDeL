@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import typing as tp
-from functools import partial
 
 import jax
 import jax.experimental
@@ -102,33 +101,29 @@ class Trainer(BaseTrainer):
 			spec=PartitionSpec(),
 			mesh=self.model.mesh,
 		)
+		self._train_shared_fn_static_args = (
+			self.arguments.loss_config,
+			self.scheduler,
+			self.arguments.step_partition_spec,
+			self.arguments.gradient_accumulation_steps,
+		)
 
 		sharded_training_step_function = jax.jit(
-			partial(
-				training_step,
-				loss_config=self.arguments.loss_config,
-				partition_spec=self.arguments.step_partition_spec,
-				learning_rate_fn=self.scheduler,
-				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
-			),
-			static_argnames=[
-				"loss_config",
-				"partition_spec",
-				"learning_rate_fn",
-				"gradient_accumulation_steps",
-			],
+			training_step,
+			static_argnums=(2, 3, 4, 5),
 			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=(self.state_shardings, empty_sharding),
 			donate_argnums=(0,),
 		)
 
+		self._eval_shared_fn_static_args = (
+			self.arguments.step_partition_spec,
+			self.arguments.loss_config,
+		)
+
 		sharded_evaluation_step_function = jax.jit(
-			partial(
-				evaluation_step,
-				partition_spec=self.arguments.step_partition_spec,
-				loss_config=self.arguments.loss_config,
-			),
-			static_argnames=["partition_spec", "loss_config"],
+			evaluation_step,
+			static_argnums=(2, 3),
 			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=(empty_sharding),
 		)
@@ -420,14 +415,6 @@ class Trainer(BaseTrainer):
 			except (KeyboardInterrupt, EasyDeLTimerError, EasyDeLBreakRequest, TypeError):
 				break
 
-	@property
-	def _train_shared_fn_extra_args(self) -> tp.Tuple[tp.Any]:
-		return ()
-
-	@property
-	def _eval_shared_fn_extra_args(self) -> tp.Tuple[tp.Any]:
-		return ()
-
 	def _execute_eval_step(self, state, batch) -> LossMetrics:
 		"""
 		Executes a single evaluation step.
@@ -448,6 +435,7 @@ class Trainer(BaseTrainer):
 			state,
 			batch,
 			*self._eval_shared_fn_extra_args,
+			*self._eval_shared_fn_static_args,
 		)
 		if len(informations) != 0:
 			if metrics.other_metrics is not None:
@@ -497,6 +485,7 @@ class Trainer(BaseTrainer):
 					state,
 					batch,
 					*self._train_shared_fn_extra_args,
+					*self._train_shared_fn_static_args,
 				)
 			)
 

@@ -30,13 +30,13 @@ import flax.nnx
 import jax
 import jax.extend
 import numpy as np
-from tqdm.autonotebook import tqdm
 from eformer.escale import PartitionAxis
 from flax import nnx as nn
 from flax.core import unfreeze
 from jax import numpy as jnp
 from jax._src.stages import Compiled
 from jax.sharding import PartitionSpec
+from tqdm.autonotebook import tqdm
 
 import easydel
 from easydel.infra.base_config import EasyDeLBaseConfigDict
@@ -63,12 +63,13 @@ from easydel import __version__
 from easydel.infra.base_module import EasyDeLBaseModule
 from easydel.utils import Timers, readme_generator
 from easydel.utils.helpers import get_logger
+
 from .metrics import (
+	BaseProgressBar,
 	JSONProgressBar,
 	NullProgressBar,
 	RichProgressBar,
 	TqdmProgressBar,
-	BaseProgressBar,
 )
 from .trainer_protocol import (
 	BaseTrainerProtocol,
@@ -221,6 +222,38 @@ class BaseTrainer(BaseTrainerProtocol):
 	def evaluation_batch_size(self):
 		return self.arguments.eval_batch_size
 
+	@property
+	def _train_shared_fn_extra_args(self) -> tp.Tuple[tp.Any]:
+		return self._train_shared_fn_extra_args_
+
+	@property
+	def _eval_shared_fn_extra_args(self) -> tp.Tuple[tp.Any]:
+		return self._eval_shared_fn_extra_args_
+
+	@property
+	def _train_shared_fn_static_args(self) -> tp.Tuple[tp.Any]:
+		return self._train_shared_fn_static_args_
+
+	@property
+	def _eval_shared_fn_static_args(self) -> tp.Tuple[tp.Any]:
+		return self._eval_shared_fn_static_args_
+
+	@_train_shared_fn_static_args.setter
+	def _train_shared_fn_static_args(self, val):
+		self._train_shared_fn_static_args_ = val
+
+	@_eval_shared_fn_static_args.setter
+	def _eval_shared_fn_static_args(self, val):
+		self._eval_shared_fn_static_args_ = val
+
+	@_train_shared_fn_extra_args.setter
+	def _train_shared_fn_extra_args(self, val):
+		self._train_shared_fn_extra_args_ = val
+
+	@_eval_shared_fn_extra_args.setter
+	def _eval_shared_fn_extra_args(self, val):
+		self._eval_shared_fn_extra_args_ = val
+
 	def _initialize_attributes(self):
 		# Initialize all attributes with default values
 		self.timer = getattr(self, "timer", None)
@@ -270,6 +303,28 @@ class BaseTrainer(BaseTrainerProtocol):
 
 		self.train_tracker = getattr(self, "train_tracker", CompilationTracker())
 		self.evalu_tracker = getattr(self, "evalu_tracker", CompilationTracker())
+
+		self._train_shared_fn_static_args_ = getattr(
+			self,
+			"_train_shared_fn_static_args_",
+			{},
+		)
+		self._eval_shared_fn_static_args_ = getattr(
+			self,
+			"_eval_shared_fn_static_args_",
+			{},
+		)
+
+		self._train_shared_fn_extra_args_ = getattr(
+			self,
+			"_train_shared_fn_extra_args",
+			(),
+		)
+		self._eval_shared_fn_extra_args_ = getattr(
+			self,
+			"_eval_shared_fn_extra_args_",
+			(),
+		)
 
 	def _initialize_memory_tracking(self):
 		if not self.arguments.performance_mode:

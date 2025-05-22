@@ -365,35 +365,42 @@ class DPOTrainer(Trainer):
 		partial_concatenated_forward = partial(
 			concatenated_forward,
 			is_encoder_decoder=self.arguments.is_encoder_decoder,
-			padding_value=self.padding_value,
 			label_pad_token_id=self.arguments.label_pad_token_id,
+			padding_value=self.padding_value,
 			max_length=self.arguments.max_length,
-			loss_type=self.arguments.loss_type,
-			aux_loss_enabled=self.arguments.aux_loss_enabled,
 			truncation_mode=self.arguments.truncation_mode,
+			aux_loss_enabled=self.arguments.aux_loss_enabled,
+			loss_type=self.arguments.loss_type,
 		)
+
 		jited_concatenated_forward = jax.jit(
 			partial_concatenated_forward,
 			out_shardings=(empty_sharding,),
-			static_argnames=[
+			static_argnames=(
 				"is_encoder_decoder",
-				"padding_value",
 				"label_pad_token_id",
-				"aux_loss_enabled",
+				"padding_value",
+				"max_length",
 				"truncation_mode",
+				"aux_loss_enabled",
 				"loss_type",
-			],
-		)
-		sharded_training_step_function = jax.jit(
-			partial(
-				training_step,
-				learning_rate_fn=self.scheduler,
-				concatenated_forward=partial_concatenated_forward,
-				beta=self.arguments.beta,
-				label_smoothing=self.arguments.label_smoothing,
-				loss_type=self.arguments.loss_type,
-				reference_free=self.arguments.reference_free,
 			),
+		)
+
+		self._train_shared_fn_static_args = (
+			self.scheduler,
+			partial_concatenated_forward,
+			self.arguments.beta,
+			self.arguments.label_smoothing,
+			self.arguments.loss_type,
+			self.arguments.reference_free,
+			self.arguments.loss_config,
+			self.arguments.step_partition_spec,
+			self.arguments.gradient_accumulation_steps,
+		)
+
+		sharded_training_step_function = jax.jit(
+			training_step,
 			in_shardings=(
 				self.state_shardings,
 				empty_sharding,
@@ -401,39 +408,27 @@ class DPOTrainer(Trainer):
 			),
 			out_shardings=(self.state_shardings, empty_sharding),
 			donate_argnums=(0,),
-			static_argnames=[
-				"learning_rate_fn",
-				"concatenated_forward",
-				"beta",
-				"label_smoothing",
-				"loss_type",
-				"reference_free",
-			],
+			static_argnums=(3, 4, 5, 6, 7, 8, 9, 10, 11),
+		)
+
+		self._eval_shared_fn_static_args = (
+			partial_concatenated_forward,
+			self.arguments.beta,
+			self.arguments.label_smoothing,
+			self.arguments.loss_type,
+			self.arguments.reference_free,
+			self.arguments.step_partition_spec,
 		)
 
 		sharded_evaluation_step_function = jax.jit(
-			partial(
-				evaluation_step,
-				concatenated_forward=partial_concatenated_forward,
-				reference_state=self.reference_state,
-				beta=self.arguments.beta,
-				label_smoothing=self.arguments.label_smoothing,
-				loss_type=self.arguments.loss_type,
-				reference_free=self.arguments.reference_free,
-			),
+			evaluation_step,
 			in_shardings=(
 				self.state_shardings,
 				empty_sharding,
 				self.reference_state.shardings,
 			),
 			out_shardings=empty_sharding,
-			static_argnames=[
-				"concatenated_forward",
-				"beta",
-				"label_smoothing",
-				"loss_type",
-				"reference_free",
-			],
+			static_argnums=(3, 4, 5, 6, 7),
 		)
 		self.arguments.ensure_checkpoint_path()
 		self.concatenated_forward = jited_concatenated_forward

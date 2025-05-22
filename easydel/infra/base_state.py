@@ -81,13 +81,15 @@ class EasyDeLState(struct.PyTreeNode):
 	        Typically not directly part of the state but can be associated.
 	"""
 
-	step: int | jax.Array
-	graphdef: nn.GraphDef
-	graphstate: nn.GraphState
-	graphother: nn.GraphState
+	step: int | jax.Array = struct.field(pytree_node=True)
+	graphdef: nn.GraphDef = struct.field(pytree_node=False)
+
+	graphstate: nn.GraphState = struct.field(pytree_node=True)
+	graphother: nn.GraphState = struct.field(pytree_node=True)
+
 	tx: optax.GradientTransformation = struct.field(pytree_node=False)
 	opt_state: tp.Optional[optax.OptState] = struct.field(pytree_node=True)
-	apply_fn: tp.Optional[tp.Callable] = None
+	apply_fn: tp.Optional[tp.Callable] = struct.field(pytree_node=False, default=None)
 
 	def apply_gradients(self, *, grads):
 		"""

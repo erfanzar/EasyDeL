@@ -73,13 +73,13 @@ class ORPOTrainer(Trainer):
 			"You Have to pass arguments that will be used for training but you have passed"
 			"`arguments=None`"
 		)
-		assert isinstance(
-			arguments, ORPOConfig
-		), f"arguments type must be `ORPOConfig` but got {type(arguments)}"
+		assert isinstance(arguments, ORPOConfig), (
+			f"arguments type must be `ORPOConfig` but got {type(arguments)}"
+		)
 
-		assert (
-			processing_class is not None
-		), "processing_class must be specified to tokenize a DPO dataset."
+		assert processing_class is not None, (
+			"processing_class must be specified to tokenize a DPO dataset."
+		)
 		self.arguments = arguments
 		self.truncation_mode = arguments.truncation_mode
 		self.processing_class = processing_class
@@ -416,70 +416,60 @@ class ORPOTrainer(Trainer):
 		    TrainerConfigureFunctionOutput: An object containing the configured functions and other relevant information.
 		"""
 		mesh = self.model.mesh
+		empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=mesh)
+
 		partial_concatenated_forward = partial(
 			concatenated_forward,
 			is_encoder_decoder=self.arguments.is_encoder_decoder,
-			padding_value=self.arguments.padding_value,
 			label_pad_token_id=self.arguments.label_pad_token_id,
+			padding_value=self.arguments.padding_value,
 			max_length=self.arguments.max_length,
 		)
 		jited_concatenated_forward = jax.jit(
 			partial_concatenated_forward,
-			static_argnames=[
+			static_argnames=(
 				"is_encoder_decoder",
-				"padding_value",
 				"label_pad_token_id",
+				"padding_value",
 				"max_length",
-			],
-		)
-		empty_sharding = jax.sharding.NamedSharding(spec=PartitionSpec(), mesh=mesh)
-		sharded_training_step_function = jit(
-			partial(
-				orpo_step,
-				concatenated_forward=partial_concatenated_forward,
-				beta=self.arguments.beta,
-				learning_rate_fn=self.scheduler,
-				mode="train",
-				partition_spec=self.arguments.step_partition_spec,
-				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
-				loss_config=self.arguments.loss_config,
 			),
+		)
+
+		self._train_shared_fn_static_args = (
+			partial_concatenated_forward,
+			self.arguments.beta,
+			self.scheduler,
+			"train",
+			self.arguments.loss_config,
+			self.arguments.step_partition_spec,
+			self.arguments.gradient_accumulation_steps,
+		)
+
+		static_argnums = (2, 3, 4, 5, 6, 7, 8)
+
+		sharded_training_step_function = jit(
+			orpo_step,
 			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=(self.state_shardings, empty_sharding),
 			donate_argnums=(0,),
-			static_argnames=[
-				"concatenated_forward",
-				"beta",
-				"learning_rate_fn",
-				"mode",
-				"partition_spec",
-				"gradient_accumulation_steps",
-				"loss_config",
-			],
+			static_argnums=static_argnums,
+		)
+		
+		self._eval_shared_fn_static_args = (
+			partial_concatenated_forward,
+			self.arguments.beta,
+			self.scheduler,
+			"eval",
+			self.arguments.loss_config,
+			self.arguments.step_partition_spec,
+			self.arguments.gradient_accumulation_steps,
 		)
 
 		sharded_evaluation_step_function = jit(
-			partial(
-				orpo_step,
-				concatenated_forward=partial_concatenated_forward,
-				beta=self.arguments.beta,
-				learning_rate_fn=self.scheduler,
-				mode="eval",
-				partition_spec=self.arguments.step_partition_spec,
-				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
-				loss_config=self.arguments.loss_config,
-			),
+			orpo_step,
 			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=empty_sharding,
-			static_argnames=[
-				"concatenated_forward",
-				"beta",
-				"learning_rate_fn",
-				"mode",
-				"partition_spec",
-				"gradient_accumulation_steps",
-				"loss_config",
-			],
+			static_argnums=static_argnums,
 		)
 
 		self.arguments.ensure_checkpoint_path()

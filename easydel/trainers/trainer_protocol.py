@@ -131,6 +131,12 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 	_forward_flops_per_token: int
 	_backward_flops_per_token: int
 
+	_train_shared_fn_static_args_: tp.Tuple[tp.Any]
+	_train_shared_fn_extra_args_: tp.Tuple[tp.Any]
+
+	_eval_shared_fn_static_args_: tp.Tuple[tp.Any]
+	_eval_shared_fn_extra_args_: tp.Tuple[tp.Any]
+
 	@abstractmethod
 	def __init__(
 		self,
@@ -497,10 +503,15 @@ class BaseTrainerProtocol(metaclass=ABCMeta):
 	@property
 	@abstractmethod
 	def _train_shared_fn_extra_args(self) -> tp.Tuple[tp.Any]: ...
-
 	@property
 	@abstractmethod
 	def _eval_shared_fn_extra_args(self) -> tp.Tuple[tp.Any]: ...
+	@property
+	@abstractmethod
+	def _train_shared_fn_static_args(self) -> tp.Dict[str, tp.Any]: ...
+	@property
+	@abstractmethod
+	def _eval_shared_fn_static_args(self) -> tp.Dict[str, tp.Any]: ...
 
 	@abstractmethod
 	def _execute_eval_step(self, state, batch) -> LossMetrics:

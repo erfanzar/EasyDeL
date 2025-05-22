@@ -20,7 +20,7 @@ import jax
 from eformer.escale import with_sharding_constraint
 from flax import nnx as nn
 from jax import numpy as jnp
-from jax.sharding import PartitionSpec
+from jax.sharding import NamedSharding, PartitionSpec
 from transformers import AutoTokenizer
 
 from easydel.inference import vInference
@@ -77,7 +77,7 @@ def delete_tree(pytree):
 
 
 class GRPOTrainer(Trainer):
-	arguments: GRPOConfig
+	arguments: GRPOConfig  # type hinting
 
 	def __init__(
 		self,
@@ -121,10 +121,9 @@ class GRPOTrainer(Trainer):
 				raise ValueError(
 					"The number of reward processing classes must match the number of reward functions."
 				)
-		empty_sharding = jax.sharding.NamedSharding(
-			spec=jax.sharding.PartitionSpec(),
-			mesh=model.model.mesh,
-		)
+
+		empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=model.model.mesh)
+
 		for i, (reward_processing_class, reward_func) in enumerate(
 			zip(reward_processing_classes, reward_funcs)
 		):
@@ -281,65 +280,47 @@ class GRPOTrainer(Trainer):
 		"""
 		mesh = self.model.mesh
 
-		empty_sharding = jax.sharding.NamedSharding(
-			spec=jax.sharding.PartitionSpec(),
-			mesh=mesh,
+		empty_sharding = NamedSharding(spec=PartitionSpec(), mesh=mesh)
+
+		self._train_shared_fn_static_args = (
+			self.eos_token_id,
+			self.num_return_sequences,
+			self.arguments.beta,
+			self.arguments.max_prompt_length,
+			self.arguments.loss_config,
+			self.scheduler,
+			self.arguments.step_partition_spec,
+			self.arguments.gradient_accumulation_steps,
+			True,  # is_train
 		)
+
+		static_argnames = (2, 3, 4, 5, 6, 7, 8, 9, 10)
+
 		sharded_training_step_function = jax.jit(
-			partial(
-				grpo_step,
-				eos_token_id=self.eos_token_id,
-				num_generations=self.num_return_sequences,
-				beta=self.arguments.beta,
-				learning_rate_fn=self.scheduler,
-				partition_spec=self.arguments.step_partition_spec,
-				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
-				loss_config=self.arguments.loss_config,
-				prompt_length=self.arguments.max_prompt_length,
-				is_training=True,
-			),
+			grpo_step,
 			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=(self.state_shardings, empty_sharding),
 			donate_argnums=(0,),
-			static_argnames=[
-				"eos_token_id",
-				"num_generations",
-				"beta",
-				"learning_rate_fn",
-				"partition_spec",
-				"gradient_accumulation_steps",
-				"loss_config",
-				"prompt_length",
-				"is_training",
-			],
+			static_argnames=static_argnames,
+		)
+
+		self._eval_shared_fn_static_args = (
+			self.eos_token_id,
+			self.num_return_sequences,
+			self.arguments.beta,
+			self.arguments.max_prompt_length,
+			self.arguments.loss_config,
+			self.scheduler,
+			self.arguments.step_partition_spec,
+			self.arguments.gradient_accumulation_steps,
+			False,  # is_train
 		)
 
 		sharded_evaluation_step_function = jax.jit(
-			partial(
-				grpo_step,
-				eos_token_id=self.eos_token_id,
-				num_generations=self.num_return_sequences,
-				beta=self.arguments.beta,
-				learning_rate_fn=self.scheduler,
-				partition_spec=self.arguments.step_partition_spec,
-				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
-				loss_config=self.arguments.loss_config,
-				prompt_length=self.arguments.max_prompt_length,
-				is_training=False,
-			),
+			grpo_step,
 			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=(empty_sharding),
-			static_argnames=[
-				"eos_token_id",
-				"num_generations",
-				"beta",
-				"learning_rate_fn",
-				"partition_spec",
-				"gradient_accumulation_steps",
-				"loss_config",
-				"prompt_length",
-				"is_training",
-			],
+			static_argnames=static_argnames,
 		)
 
 		def _compute_refmodel_logps(graphtree, graphother, ids, mask, graphdef):
@@ -349,11 +330,8 @@ class GRPOTrainer(Trainer):
 			return get_per_token_logps(apply, ids, mask, self.arguments.max_prompt_length)
 
 		self.compute_refmodel_logps = jax.jit(
-			partial(
-				_compute_refmodel_logps,
-				graphdef=self.model_state.graphdef,
-			),
-			static_argnames=["graphdef"],
+			partial(_compute_refmodel_logps, graphdef=self.model_state.graphdef),
+			static_argnames=("graphdef"),
 			in_shardings=(
 				self.model_state.shardings.graphstate,
 				self.model_state.shardings.graphother,
@@ -408,7 +386,7 @@ class GRPOTrainer(Trainer):
 			ridmask = prompt_mask.repeat(self.num_generations, 0)
 			output = delete_tree(output)  # free kv memory
 			del output
-			
+
 			with capture_time() as token_logps_time_fn:
 				ref_per_token_logps = self.compute_refmodel_logps(
 					self.ref_state.graphstate,
