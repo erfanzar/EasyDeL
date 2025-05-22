@@ -182,19 +182,18 @@ class MetricsTracker:
 
 	def update(self, loss, accuracy, step):
 		"""Update tracked metrics with new values."""
-		with jax.spmd_mode("allow_all"):
-			self.loss_sum = loss if self.loss_sum is None else self.loss_sum + loss
-			mean_loss = self.loss_sum / (step - self.step_offset)
-			if accuracy != float("inf"):
-				if accuracy is None:
-					accuracy = 0.0
-				self.accuracy_sum = (
-					accuracy if self.accuracy_sum is None else self.accuracy_sum + accuracy
-				)
-				mean_accuracy = self.accuracy_sum / (step - self.step_offset)
+		self.loss_sum = loss if self.loss_sum is None else self.loss_sum + loss
+		mean_loss = self.loss_sum / (step - self.step_offset)
+		if accuracy != float("inf"):
+			if accuracy is None:
+				accuracy = 0.0
+			self.accuracy_sum = (
+				accuracy if self.accuracy_sum is None else self.accuracy_sum + accuracy
+			)
+			mean_accuracy = self.accuracy_sum / (step - self.step_offset)
 
-				return float(mean_loss), float(mean_accuracy)
-			return float(mean_loss)
+			return float(mean_loss), float(mean_accuracy)
+		return float(mean_loss)
 
 	def reset(self, step):
 		"""Reset tracked metrics."""
