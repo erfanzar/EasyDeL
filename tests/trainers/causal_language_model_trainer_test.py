@@ -1,13 +1,10 @@
 import os
 import sys
 
-from easydel.infra.loss_utils import LossConfig
-
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
-# Local imports (assuming easydel is in parent directory or installed)
 dirname = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(os.path.join(dirname, "..", ".."))
 
+sys.path.append(os.path.join(dirname, "..", ".."))
 import logging
 
 import flax
@@ -15,20 +12,21 @@ import jax.numpy as jnp
 from datasets import Dataset, IterableDataset
 
 import easydel as ed
+from easydel.infra.loss_utils import LossConfig
 
 # Configure logging
 logging.basicConfig(
-	level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+	level=logging.INFO,
+	format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
-# Constants
 TOTAL_BATCH_SIZE = 5
 UPPER = 2000
 NUM_TRAIN_EPOCHS = 4
 SEQUENCE_LENGTH = 128
 LEARNING_RATE = 3e-4
 WARMUP_STEPS = 5
-SAVE_STEPS = 100
+SAVE_STEPS = 100_000
 DO_LAST_SAVE = True
 # Derived Constants
 NUM_TRAIN_EXAMPLES = TOTAL_BATCH_SIZE * UPPER
@@ -126,6 +124,7 @@ def create_training_args(
 		per_epoch_evaluation_steps=NUM_TRAIN_EXAMPLES,
 		# training_time_limit="80Min",
 		wandb_entity="erfanzar",
+		model_name="CausalLanguageModelTrainerTest",
 		optimizer=ed.EasyDeLOptimizers.ADAMW,
 		scheduler=ed.EasyDeLSchedulers.COSINE,
 		clip_grad=1.0,

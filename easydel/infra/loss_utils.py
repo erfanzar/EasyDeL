@@ -29,6 +29,8 @@ from eformer.pytree import auto_pytree
 from jax import lax
 from jax.sharding import PartitionSpec
 
+from easydel.utils.compiling_utils import hash_fn
+
 
 @enum.unique
 class SpecialLossNormalizingFactor(enum.Enum):
@@ -128,6 +130,7 @@ class LossConfig:
 		return f"{cls_name}(\n" + "\n".join(field_lines) + "\n)"
 
 	__str__ = __repr__
+	__hash__ = hash_fn
 
 
 @auto_pytree

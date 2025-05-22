@@ -1,26 +1,25 @@
 import os
 
-# JAX configuration
 os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 
 import sys
 
-# Local imports (assuming easydel is in parent directory or installed)
 dirname = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(dirname, "..", ".."))
 
 import logging
+
+import easydel as ed
 
 import datasets
 import flax
 import jax.numpy as jnp
 from transformers import AutoTokenizer
 
-import easydel as ed
-
 # Configure logging
 logging.basicConfig(
-	level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+	level=logging.INFO,
+	format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
 
@@ -92,7 +91,7 @@ def create_model_and_tokenizer(model_name_or_path):
 def create_dpo_config(
 	model_name="direct_preference_optimization_trainer",
 	save_directory="tmp-files",
-	total_batch_size=8,
+	total_batch_size=1,
 	learning_rate=7e-5,
 	max_length=512,
 	max_completion_length=256,

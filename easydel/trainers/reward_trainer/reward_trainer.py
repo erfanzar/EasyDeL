@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import dataclasses
-from functools import partial
 import typing as tp
 import warnings
 
@@ -178,40 +177,31 @@ class RewardTrainer(Trainer):
 			spec=PartitionSpec(),
 			mesh=self.model.mesh,
 		)
+		self._train_shared_fn_static_args = (
+			self.arguments.loss_config,
+			self.scheduler,
+			self.arguments.step_partition_spec,
+			self.arguments.gradient_accumulation_steps,
+			self.arguments.center_rewards_coefficient,
+		)
 
 		sharded_training_step_function = jax.jit(
-			partial(
-				training_step,
-				loss_config=self.arguments.loss_config,
-				partition_spec=self.arguments.step_partition_spec,
-				learning_rate_fn=self.scheduler,
-				gradient_accumulation_steps=self.arguments.gradient_accumulation_steps,
-				center_rewards_coefficient=self.arguments.center_rewards_coefficient,
-			),
-			static_argnames=[
-				"partition_spec",
-				"loss_config",
-				"learning_rate_fn",
-				"gradient_accumulation_steps",
-				"center_rewards_coefficient",
-			],
+			training_step,
+			static_argnums=(2, 3, 4, 5, 6),
 			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=(self.state_shardings, empty_sharding),
 			donate_argnums=(0,),
 		)
 
+		self._eval_shared_fn_static_args = (
+			self.arguments.loss_config,
+			self.arguments.step_partition_spec,
+			self.arguments.center_rewards_coefficient,
+		)
+
 		sharded_evaluation_step_function = jax.jit(
-			partial(
-				evaluation_step,
-				partition_spec=self.arguments.step_partition_spec,
-				loss_config=self.arguments.loss_config,
-				center_rewards_coefficient=self.arguments.center_rewards_coefficient,
-			),
-			static_argnames=[
-				"partition_spec",
-				"loss_config",
-				"center_rewards_coefficient",
-			],
+			evaluation_step,
+			static_argnums=(2, 3, 4),
 			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=empty_sharding,
 		)
