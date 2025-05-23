@@ -59,6 +59,7 @@ def cjit(
 	fn: tp.Callable,
 	static_argnums: tp.Optional[tp.Tuple[str]] = None,
 	static_argnames: tp.Optional[tp.Tuple[int]] = None,
+	verbose: bool = True,
 ):
 	assert is_jit_wrapped(fn=fn), "function should be jit wrapped already"
 
@@ -78,7 +79,11 @@ def cjit(
 			compiled_func = COMPILED_CACHE[cache_key]
 			return compiled_func(*dynamic_args, **dynamic_kwargs)
 		lowered_func: Lowered = fn.lower(*args, **kwargs)
-		compiled_func = smart_compile(lowered_func, "cached-jit")
+		compiled_func = smart_compile(
+			lowered_func=lowered_func,
+			tag="cached-jit",
+			verbose=verbose,
+		)
 		COMPILED_CACHE[cache_key] = compiled_func
 
 		return compiled_func(*dynamic_args, **dynamic_kwargs)
@@ -161,6 +166,7 @@ def get_hash_of_lowering(lowered_func: Lowered):
 def smart_compile(
 	lowered_func: Lowered,
 	tag: tp.Optional[str] = None,
+	verbose: bool = True,
 ) -> Compiled:
 	func_hash = get_hash_of_lowering(lowered_func)
 	foldername = str(func_hash) if tag is None else f"{tag}-{func_hash}"
@@ -177,10 +183,11 @@ def smart_compile(
 			)
 			return compiled_func
 		except Exception as e:
-			warnings.warn(
-				f"couldn't load compiled function due to {e}" + post_fix,
-				stacklevel=4,
-			)
+			if verbose:
+				warnings.warn(
+					f"couldn't load compiled function due to {e}" + post_fix,
+					stacklevel=4,
+				)
 			compiled_func: Compiled = lowered_func.compile()
 			if ECACHE_COMPILES:
 				serialized, in_tree, out_tree = serialize(compiled_func)
@@ -188,10 +195,11 @@ def smart_compile(
 				try:
 					pickle.dump((serialized, in_tree, out_tree), open(filepath, "wb"))
 				except Exception as e:
-					warnings.warn(
-						f"couldn't save compiled function due to {e}" + post_fix,
-						stacklevel=4,
-					)
+					if verbose:
+						warnings.warn(
+							f"couldn't save compiled function due to {e}" + post_fix,
+							stacklevel=4,
+						)
 			return compiled_func
 	else:
 		compiled_func: Compiled = lowered_func.compile()
@@ -201,10 +209,11 @@ def smart_compile(
 				func_dir.mkdir(parents=True, exist_ok=True)
 				pickle.dump((serialized, in_tree, out_tree), open(filepath, "wb"))
 			except Exception as e:
-				warnings.warn(
-					f"couldn't save and serialize compiled function due to {e}" + post_fix,
-					stacklevel=4,
-				)
+				if verbose:
+					warnings.warn(
+						f"couldn't save and serialize compiled function due to {e}" + post_fix,
+						stacklevel=4,
+					)
 		return compiled_func
 
 

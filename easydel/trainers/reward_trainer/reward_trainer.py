@@ -29,8 +29,8 @@ from ..trainer import Trainer
 from ..utils import (
 	RewardDataCollatorWithPadding,
 )
+from ._fn import evaluation_step, training_step
 from .reward_config import RewardConfig
-from ._fn import training_step, evaluation_step
 
 if tp.TYPE_CHECKING:
 	from datasets import Dataset
@@ -185,9 +185,10 @@ class RewardTrainer(Trainer):
 			self.arguments.center_rewards_coefficient,
 		)
 
+		sharded_training_static_argnums = (2, 3, 4, 5, 6)
 		sharded_training_step_function = jax.jit(
 			training_step,
-			static_argnums=(2, 3, 4, 5, 6),
+			static_argnums=sharded_training_static_argnums,
 			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=(self.state_shardings, empty_sharding),
 			donate_argnums=(0,),
@@ -199,12 +200,16 @@ class RewardTrainer(Trainer):
 			self.arguments.center_rewards_coefficient,
 		)
 
+		sharded_evaluation_static_argnums = (2, 3, 4)
 		sharded_evaluation_step_function = jax.jit(
 			evaluation_step,
-			static_argnums=(2, 3, 4),
+			static_argnums=sharded_evaluation_static_argnums,
 			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=empty_sharding,
 		)
+
+		sharded_training_step_function.static_argnums_ = sharded_training_static_argnums
+		sharded_evaluation_step_function.static_argnums_ = sharded_evaluation_static_argnums
 
 		mesh = self.model.mesh
 		self.arguments.ensure_checkpoint_path()
