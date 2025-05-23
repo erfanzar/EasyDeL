@@ -1270,7 +1270,9 @@ class BaseTrainer(BaseTrainerProtocol):
 				k.replace("train/", "").replace("eval/", ""): v
 				for k, v in metrics.items()
 				if not (
-					k.startswith("mlperf/")
+					k.startswith("train-mlperf/")
+					or k.startswith("eval-mlperf/")
+					or k.startswith("mlperf/")
 					or k.startswith("train/grad_norm")
 					or k.startswith("eval/grad_norm")
 				)
