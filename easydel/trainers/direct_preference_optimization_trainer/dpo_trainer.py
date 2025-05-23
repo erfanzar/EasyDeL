@@ -399,6 +399,7 @@ class DPOTrainer(Trainer):
 			self.arguments.gradient_accumulation_steps,
 		)
 
+		sharded_training_static_argnums = (3, 4, 5, 6, 7, 8, 9, 10, 11)
 		sharded_training_step_function = jax.jit(
 			training_step,
 			in_shardings=(
@@ -408,7 +409,7 @@ class DPOTrainer(Trainer):
 			),
 			out_shardings=(self.state_shardings, empty_sharding),
 			donate_argnums=(0,),
-			static_argnums=(3, 4, 5, 6, 7, 8, 9, 10, 11),
+			static_argnums=sharded_training_static_argnums,
 		)
 
 		self._eval_shared_fn_static_args = (
@@ -420,6 +421,7 @@ class DPOTrainer(Trainer):
 			self.arguments.step_partition_spec,
 		)
 
+		sharded_evaluation_static_argnums = (3, 4, 5, 6, 7)
 		sharded_evaluation_step_function = jax.jit(
 			evaluation_step,
 			in_shardings=(
@@ -428,8 +430,12 @@ class DPOTrainer(Trainer):
 				self.reference_state.shardings,
 			),
 			out_shardings=empty_sharding,
-			static_argnums=(3, 4, 5, 6, 7),
+			static_argnums=sharded_evaluation_static_argnums,
 		)
+
+		sharded_training_step_function.static_argnums_ = sharded_training_static_argnums
+		sharded_evaluation_step_function.static_argnums_ = sharded_evaluation_static_argnums
+
 		self.arguments.ensure_checkpoint_path()
 		self.concatenated_forward = jited_concatenated_forward
 		checkpoint_manager = self.arguments.get_streaming_checkpointer()

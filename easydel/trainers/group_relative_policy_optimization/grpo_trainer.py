@@ -341,6 +341,9 @@ class GRPOTrainer(Trainer):
 			out_shardings=empty_sharding,
 		)
 
+		sharded_training_step_function.static_argnums_ = static_argnames
+		sharded_evaluation_step_function.static_argnums_ = static_argnames
+
 		self.arguments.ensure_checkpoint_path()
 		checkpoint_manager = self.arguments.get_streaming_checkpointer()
 

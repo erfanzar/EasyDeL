@@ -50,6 +50,7 @@ from easydel.infra.etils import (
 from easydel.infra.factory import TaskType
 from easydel.infra.loss_utils import LossMetrics
 from easydel.infra.utils import CompilationTracker
+from easydel.utils.compiling_utils import cjit
 from easydel.utils.lazy_import import is_package_available
 from easydel.utils.traversals import specs_to_name_sharding
 
@@ -446,8 +447,34 @@ class BaseTrainer(BaseTrainerProtocol):
 		"""
 		with self.timer("configure functions and sharding them"):
 			functions = self.configure_functions()
-			self.sharded_training_step_function = functions.sharded_training_step_function
-			self.sharded_evaluation_step_function = functions.sharded_evaluation_step_function
+			sharded_training_step_function = functions.sharded_training_step_function
+			sharded_evaluation_step_function = functions.sharded_evaluation_step_function
+			if self.arguments.use_cjit:
+				if hasattr(sharded_training_step_function, "static_argnums_"):
+					sharded_training_step_function = cjit(
+						fn=sharded_training_step_function,
+						static_argnums=sharded_training_step_function.static_argnums_,
+						verbose=False,
+					)
+				else:
+					logger.warning(
+						"sharded_training function doesn't contain `static_argnums_`, "
+						"using cjit will be skiped."
+					)
+
+				if hasattr(sharded_evaluation_step_function, "static_argnums_"):
+					sharded_evaluation_step_function = cjit(
+						fn=sharded_evaluation_step_function,
+						static_argnums=sharded_evaluation_step_function.static_argnums_,
+						verbose=False,
+					)
+				else:
+					logger.warning(
+						"sharded_evaluation function doesn't contain `static_argnums_`, "
+						"using cjit will be skiped."
+					)
+			self.sharded_training_step_function = sharded_training_step_function
+			self.sharded_evaluation_step_function = sharded_evaluation_step_function
 			self.mesh = functions.mesh
 			self.checkpoint_manager = functions.checkpoint_manager
 		self.timer.log("configure functions and sharding them")
