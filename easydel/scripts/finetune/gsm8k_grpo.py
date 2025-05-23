@@ -140,6 +140,7 @@ def main():
 			attn_softmax_dtype=runtime_config.attn_softmax_dtype,
 			kv_cache_quantization_method=runtime_config.kv_cache_quantization,
 			attn_mechanism=runtime_config.attn_mechanism,
+			gradient_checkpointing=ed.EasyDeLGradientCheckPointers.NOTHING_SAVEABLE,
 		),
 		quantization_method=ed.EasyDeLQuantizationMethods.NONE,
 		param_dtype=runtime_config.param_dtype,

@@ -301,7 +301,7 @@ class GRPOTrainer(Trainer):
 			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=(self.state_shardings, empty_sharding),
 			donate_argnums=(0,),
-			static_argnames=static_argnames,
+			static_argnums=static_argnames,
 		)
 
 		self._eval_shared_fn_static_args = (
@@ -320,7 +320,7 @@ class GRPOTrainer(Trainer):
 			grpo_step,
 			in_shardings=(self.state_shardings, empty_sharding),
 			out_shardings=(empty_sharding),
-			static_argnames=static_argnames,
+			static_argnums=static_argnames,
 		)
 
 		def _compute_refmodel_logps(graphtree, graphother, ids, mask, graphdef):
