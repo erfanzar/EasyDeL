@@ -281,7 +281,7 @@ def prefill_attention(
 		k_pages,
 		v_pages,
 	)
-	out = out.transpose((1, 0, 2)).reshape(chunk_size, -1).astype(q.dtype)
+	out = out.transpose((1, 0, 2)).astype(q.dtype)
 
 	return out
 
