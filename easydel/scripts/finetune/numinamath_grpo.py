@@ -164,7 +164,7 @@ def main():
 			eos_token_id=processor.eos_token_id,
 			pad_token_id=processor.pad_token_id,
 			max_new_tokens=max_completion_length,
-			streaming_chunks=32,
+			streaming_chunks=64,
 			sampling_params=ed.SamplingParams(
 				max_tokens=max_completion_length,
 				top_k=runtime_config.top_k,
@@ -221,9 +221,9 @@ def main():
 
 	SYSTEM_PROMPT = (
 		"A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
-		"first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
+		"first thinks about the think process in the mind and then provides the user with the answer. The think "
 		"process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
-		"<think> reasoning process here </think><answer> answer here </answer>"
+		"<think> think process here </think><answer> answer here </answer>"
 	)
 
 	dataset_id = "AI-MO/NuminaMath-TIR"

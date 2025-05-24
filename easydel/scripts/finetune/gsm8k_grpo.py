@@ -151,9 +151,9 @@ def main():
 
 	SYSTEM_PROMPT = """
 	Respond in the following format:
-	<reasoning>
+	<think>
 	...
-	</reasoning>
+	</think>
 	<answer>
 	...
 	</answer>
@@ -200,7 +200,7 @@ def main():
 
 	def strict_format_reward_func(completions, **kwargs) -> list[float]:
 		"""Reward function that checks if the completion has a specific format."""
-		pattern = r"^<reasoning>\n.*?\n</reasoning>\n<answer>\n.*?\n</answer>\n$"
+		pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>\n$"
 		responses = [completion[0]["content"] for completion in completions]
 		matches = [re.match(pattern, r) for r in responses]
 		return [
@@ -212,7 +212,7 @@ def main():
 
 	def soft_format_reward_func(completions, **kwargs) -> list[float]:
 		"""Reward function that checks if the completion has a specific format."""
-		pattern = r"<reasoning>.*?</reasoning>\s*<answer>.*?</answer>"
+		pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
 		responses = [completion[0]["content"] for completion in completions]
 		matches = [re.match(pattern, r) for r in responses]
 		return [
@@ -224,9 +224,9 @@ def main():
 
 	def count_xml(text) -> float:
 		count = 0.0
-		if text.count("<reasoning>\n") == 1:
+		if text.count("<think>\n") == 1:
 			count += runtime_config.xml_reward
-		if text.count("\n</reasoning>\n") == 1:
+		if text.count("\n</think>\n") == 1:
 			count += runtime_config.xml_reward
 		if text.count("\n<answer>\n") == 1:
 			count += runtime_config.xml_reward
@@ -254,7 +254,7 @@ def main():
 			eos_token_id=processor.eos_token_id,
 			pad_token_id=processor.pad_token_id,
 			max_new_tokens=max_completion_length,
-			streaming_chunks=32,
+			streaming_chunks=64,
 			sampling_params=ed.SamplingParams(
 				max_tokens=max_completion_length,
 				top_k=runtime_config.top_k,
