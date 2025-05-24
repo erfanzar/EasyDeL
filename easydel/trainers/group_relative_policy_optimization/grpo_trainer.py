@@ -11,6 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# NOTE: Reason why vInference instead of vSurge?
+# - faster generation with FSDP, SP | since vSurge is fast but really depends on TP.
+# - being able to customize top-k, rep penalty and ...
+# - easier to tweak if u wana use EP shardings.
+# - support images.
+# - support almost everysingle model inside easydel echosystem.
+
+
 import typing as tp
 from functools import partial
 
@@ -263,8 +272,15 @@ class GRPOTrainer(Trainer):
 			)
 		return dataset
 
-	def _all_gather(self, arr: jax.Array):
-		return with_sharding_constraint(arr, PartitionSpec())
+	@property
+	def step_sharding(self):
+		return NamedSharding(
+			mesh=self.model.mesh,
+			spec=self.arguments.step_partition_spec,
+		)
+
+	def _all_gather(self, arr: jax.Array) -> jax.Array:
+		return jax.device_put(arr, NamedSharding(self.model.mesh, PartitionSpec()))
 
 	def configure_functions(self) -> TrainerConfigureFunctionOutput:
 		"""
@@ -319,15 +335,16 @@ class GRPOTrainer(Trainer):
 		sharded_evaluation_step_function = jax.jit(
 			grpo_step,
 			in_shardings=(self.state_shardings, empty_sharding),
-			out_shardings=(empty_sharding),
+			out_shardings=empty_sharding,
 			static_argnums=static_argnames,
 		)
 
 		def _compute_refmodel_logps(graphtree, graphother, ids, mask, graphdef):
-			ids = with_sharding_constraint(ids, self.arguments.step_partition_spec)
-			mask = with_sharding_constraint(mask, self.arguments.step_partition_spec)
 			apply = flax.nnx.merge(graphdef, graphtree, graphother)
-			return get_per_token_logps(apply, ids, mask, self.arguments.max_prompt_length)
+			with apply.mesh:
+				ids = with_sharding_constraint(ids, self.arguments.step_partition_spec)
+				mask = with_sharding_constraint(mask, self.arguments.step_partition_spec)
+				return get_per_token_logps(apply, ids, mask, self.arguments.max_prompt_length)
 
 		self.compute_refmodel_logps = jax.jit(
 			partial(_compute_refmodel_logps, graphdef=self.model_state.graphdef),
@@ -394,7 +411,7 @@ class GRPOTrainer(Trainer):
 				ref_per_token_logps = self.compute_refmodel_logps(
 					self.ref_state.graphstate,
 					self.ref_state.graphother,
-					prompt_completion_ids,
+					self._all_gather(prompt_completion_ids),
 					self._all_gather(jnp.concatenate([ridmask, completion_mask], -1)),
 				)
 			token_logps_time = token_logps_time_fn()
@@ -502,14 +519,17 @@ class GRPOTrainer(Trainer):
 			metrics_dict[
 				getattr(reward_func, "__name__", None) or reward_func.__class__.__name__
 			] = jnp.mean(rewards_per_func[:, i])
+
+			# i don't care who you are and what you do.
+			# ill find you and ill gather u...
 		return (
 			{
-				"prompt_ids": prompt_ids,
-				"prompt_mask": prompt_mask,
-				"completion_ids": completion_ids,
-				"completion_mask": completion_mask,
+				"prompt_ids": self._all_gather(prompt_ids),
+				"prompt_mask": self._all_gather(prompt_mask),
+				"completion_ids": self._all_gather(completion_ids),
+				"completion_mask": self._all_gather(completion_mask),
 				"ref_per_token_logps": self._all_gather(ref_per_token_logps),
-				"advantages": advantages,
+				"advantages": self._all_gather(advantages),
 			},
 			metrics_dict,
 		)
