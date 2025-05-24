@@ -48,7 +48,7 @@ wandb = ">=0.18.5"
 uvloop = "0.21.0"
 uvicorn = "^0.32.0"
 jinja2 = ">=3.1.5"
-datasets = ">=3.3.2"
+datasets = ">=3.6.0"
 gcsfs = "*"
 zstandard = ">=0.23.0"
 
