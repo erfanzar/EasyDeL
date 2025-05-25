@@ -362,12 +362,12 @@ class PagedAttentionCacheView(BaseCacheView):
 			idx += 1
 			return (kp, vp), idx
 
-		idx = 0
-		(self.key_pages, self.value_pages), idx = jax.lax.while_loop(
+		(self.key_pages, self.value_pages), _ = jax.lax.while_loop(
 			update_cond,
 			per_page_update,
-			((self.key_pages, self.value_pages), idx),
+			((self.key_pages, self.value_pages), 0),
 		)
+
 		return self
 
 	def write_decodes_to_cache(

@@ -45,7 +45,6 @@ else:
 logger = get_logger("vSurge-oDriver")
 
 
-
 class oDriver(AbstractDriver):
 	"""
 	The oDriver class is responsible for managing the inference process for the oEngine,
@@ -56,6 +55,7 @@ class oDriver(AbstractDriver):
 	concurrent processing of different stages of the inference pipeline, optimizing
 	throughput and minimizing latency.
 	"""
+
 	_active_requests: list[queue.Queue[tuple[int, ActiveRequest]]] = []
 
 	def __init__(self, engine: oEngine, verbose: bool = True):
@@ -73,7 +73,6 @@ class oDriver(AbstractDriver):
 		self._max_allowed_requests = threading.Semaphore(self._max_locks)
 		self._prepare_backlog: queue.Queue[ActiveRequest] = queue.Queue()
 		self._process_backlog: queue.Queue[ModelOutputSummary] = queue.Queue()
-		self._active_state = None
 		self._active_requests_map: tp.Dict[str, ActiveRequest] = {}
 		self._decode_state = engine.init_decode_state()
 
@@ -262,7 +261,10 @@ class oDriver(AbstractDriver):
 		return self.engine.processor
 
 	def _get_chunksize(self, length):
-		return 512
+		for blk in self.engine._max_prefill_lengths:
+			if blk > length:
+				return blk
+		raise AssertionError("this part of code should be unreachable.")
 
 	def _prepare_inputs(self):
 		"""
@@ -300,7 +302,7 @@ class oDriver(AbstractDriver):
 				)
 				.ravel()
 				.tolist()
-			)
+			)[-self.engine._max_prefill_length :]
 			initial_request = InitialSequenceRequest.create(
 				id=request.id,
 				mesh=self.engine.model.mesh,
@@ -344,10 +346,7 @@ class oDriver(AbstractDriver):
 				iteration_plan (NextIterationPlan): The plan for the current inference iteration.
 			"""
 			# Create an iteration plan based on the current active and decode states
-			iteration_plan = self.engine.scheduler.create_plan(
-				self._active_state,
-				self._decode_state,
-			)
+			iteration_plan = self.engine.scheduler.create_plan(None, self._decode_state)
 			if iteration_plan is None:
 				# Exit loop if no iteration plan can be created (signaling shutdown or no active requests)
 				self.log("No iteration plan created, exiting inference loop.")
@@ -379,22 +378,20 @@ class oDriver(AbstractDriver):
 				prefill.chunk_idx += 1
 				start_idx = prefill.chunk_idx * prefill.chunk_size
 				prefill_length = len(prefill.prompt_token_ids)
-				# If there are more chunks to prefill, update the active state
+
 				if start_idx < prefill_length:
-					self._active_state = prefill
-				else:
-					# If prefill is complete, clear the active state and enqueue for decode
-					self._active_state = None
-					summary.prefill_request_id = iteration_plan.prefill_request.id
-					decodes_request = GenerationStepTask(
-						id=prefill.id,
-						slot=-1,  # Slot will be assigned by the scheduler
-						position=prefill_length,
-						page_indices=prefill.page_indices,
-						prefill_token_id=output.prefill_token_id,
-						sampling_params=prefill.sampling_params,
-					)
-					self.engine.scheduler.enqueue_decodes_request(decodes_request)
+					raise NotImplementedError("this part of code should be unreachable.")
+
+				summary.prefill_request_id = iteration_plan.prefill_request.id
+				decodes_request = GenerationStepTask(
+					id=prefill.id,
+					slot=-1,  # Slot will be assigned by the scheduler
+					position=prefill_length,
+					page_indices=prefill.page_indices,
+					prefill_token_id=output.prefill_token_id,
+					sampling_params=prefill.sampling_params,
+				)
+				self.engine.scheduler.enqueue_decodes_request(decodes_request)
 
 			# Handle decode scheduling and state updates
 			if iteration_plan.schedule_decodes:

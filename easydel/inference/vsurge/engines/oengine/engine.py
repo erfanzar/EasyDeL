@@ -116,11 +116,23 @@ class oEngine(AbstractInferenceEngine):
 			quantization_platform=model.config.platform,
 		)
 		self._partition_manager = model.config.partition_manager
-		self._max_prefill_lengths = prefill_lengths or [2**s for s in range(9, 24)]
 		self._max_concurrent_decodes = max_concurrent_decodes or jax.device_count()
 		self._max_concurrent_prefill = max_concurrent_prefill or jax.device_count()
-		self._max_prefill_length = max_prefill_length or 4096
 		self._max_length = max_length or 8192
+		self._max_prefill_length = self._max_length // 2
+		if prefill_lengths is None:
+			allowed_calls = {1 << i for i in range(4, 32)}
+
+			prefill_lengths = sorted(
+				{
+					i * manager.page_size
+					for i in range(1, (max_prefill_length // manager.page_size) + 1)
+					if (i * manager.page_size) in allowed_calls
+				}
+				| {max_prefill_length}
+			)
+
+		self._max_prefill_lengths = sorted(prefill_lengths)
 		self._batch_size = batch_size
 		self._prng_key = jax.random.PRNGKey(seed)
 		self._empty_sharding = Ns(model.mesh, Ps())
@@ -275,7 +287,9 @@ class oEngine(AbstractInferenceEngine):
 		Returns:
 		    The sharding specification for prefix destinations.
 		"""
-		raise NotImplementedError("get_prefix_destination_sharding method not implemented for oEngine.")
+		raise NotImplementedError(
+			"get_prefix_destination_sharding method not implemented for oEngine."
+		)
 
 	def init_decode_state(self, *args, **kwargs) -> ActiveSequenceBatch:
 		"""

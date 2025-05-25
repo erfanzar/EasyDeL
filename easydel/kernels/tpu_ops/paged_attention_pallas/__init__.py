@@ -15,6 +15,11 @@
 from ._paged_attention import (
 	paged_attention as pallas_paged_attention,
 	prefill_attention as pallas_prefill_attention,
+	chunked_prefill_attention as pallas_chunked_prefill_attention,
 )
 
-__all__ = ("pallas_paged_attention", "pallas_prefill_attention")
+__all__ = (
+	"pallas_paged_attention",
+	"pallas_prefill_attention",
+	"pallas_chunked_prefill_attention",
+)
