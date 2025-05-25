@@ -403,11 +403,16 @@ class ModelIOProcessor:
 		"""
 		if ongoing_prefill.is_active:
 			idx = chunk_id * chunk_size
+
 			ongoing_prefill.token_ids = jax.lax.dynamic_slice_in_dim(
-				ongoing_prefill.token_ids, idx, chunk_size
+				ongoing_prefill.token_ids,
+				idx,
+				chunk_size,
 			)
 			ongoing_prefill.positions = jax.lax.dynamic_slice_in_dim(
-				ongoing_prefill.positions, idx, chunk_size
+				ongoing_prefill.positions,
+				idx,
+				chunk_size,
 			)
 
 		if ongoing_decodes.is_active:
@@ -539,7 +544,7 @@ class ModelIOProcessor:
 			decodes_state.positions = attn_meta.decodes_position
 			decodes_state.page_table = attn_meta.decodes_page_table
 			decodes_state.sampling_params = sampling_params
-
+			
 		return ModelInputBatch(
 			input_ids=input_ids,
 			positions=positions,

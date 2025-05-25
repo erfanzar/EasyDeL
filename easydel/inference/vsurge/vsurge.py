@@ -379,6 +379,7 @@ class vSurge:
 		    vSurge: A new vSurge instance configured with an oDriver.
 		"""
 		max_length = max_length or 8192
+		max_prefill_length = max_prefill_length or max_length // 2
 		max_concurrent_prefill = max_concurrent_prefill or jax.device_count()
 		max_concurrent_decodes = max_concurrent_decodes or jax.device_count()
 		metadata = model.create_paged_metadata(
@@ -388,6 +389,24 @@ class vSurge:
 			dtype=model.dtype,
 			hbm_utilization=hbm_utilization,
 		)
+		if prefill_lengths is not None:
+			if max(prefill_lengths) != max_prefill_length:
+				raise ValueError(
+					"The maximum value in `prefill_lengths` must match `max_prefill_length`."
+				)
+		else:
+			allowed_calls = {1 << i for i in range(4, 32)}
+
+			prefill_lengths = sorted(
+				{
+					i * page_size
+					for i in range(1, (max_prefill_length // page_size) + 1)
+					if (i * page_size) in allowed_calls
+				}
+				| {max_prefill_length}
+			)
+
+			logger.info(f"Computed prefill lengths are {prefill_lengths}")
 		if storage is None:
 			storage = model.init_pages(metadata=metadata)
 		if manager is None:

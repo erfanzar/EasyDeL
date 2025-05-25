@@ -27,6 +27,8 @@ from ._forward_pallas import (
 	prefill_attention_impl,
 )
 
+MAX_SMEM_USAGE = 512 * 1024
+
 
 @jax.jit
 def _build_contiguous_kv_vectorized(
@@ -284,6 +286,17 @@ def prefill_attention(
 	out = out.transpose((1, 0, 2)).astype(q.dtype)
 
 	return out
+
+
+def chunked_prefill_attention(
+	q: jax.Array,
+	k_pages: jax.Array,
+	v_pages: jax.Array,
+	length: jax.Array,
+	page_indices: jax.Array,
+	sm_scale: tp.Optional[float] = None,
+):
+	return prefill_attention(q, k_pages, v_pages, length, page_indices, sm_scale)
 
 
 @functools.partial(

@@ -26,7 +26,7 @@ from jax.sharding import PartitionSpec as Ps
 
 from easydel.kernels.tpu_ops.paged_attention_pallas import (
 	pallas_paged_attention,
-	pallas_prefill_attention,
+	pallas_chunked_prefill_attention,
 )
 from easydel.layers.attention_operator._attention_impl import (
 	AttentionImpl,
@@ -140,7 +140,7 @@ class PagedAttn(AttentionImpl):
 			)
 		return shard_map(
 			partial(
-				pallas_prefill_attention,
+				pallas_chunked_prefill_attention,
 				sm_scale=self.metadata.softmax_scale,
 			),
 			mesh=self.metadata.mesh,
@@ -255,7 +255,7 @@ class PagedAttn(AttentionImpl):
 			dtype=q.dtype,
 		)
 		padded_prompt_length = cache_metadata.prefill_position.shape[0]
-		
+
 		cache_view = cache_view.write_prefill_to_cache(
 			k[:padded_prompt_length, :, :],
 			v[:padded_prompt_length, :, :],
@@ -415,7 +415,7 @@ class PagedAttn(AttentionImpl):
 		"""
 		if cache_metadata.is_prefill_mode():
 			sq_axis = 0
-		else: 
+		else:
 			sq_axis = 1
 
 		q = q.squeeze(sq_axis)
