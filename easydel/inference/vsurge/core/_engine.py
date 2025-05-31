@@ -24,15 +24,11 @@ from jax.sharding import NamedSharding as Ns
 from jax.sharding import PartitionSpec as Ps
 from transformers import ProcessorMixin
 
-from easydel.inference.vsurge.memory._page_manager import PageManager
 from easydel.layers.attention import AttentionMechanisms
 from easydel.utils.compiling_utils import cjit
 
-from ..utils import (
-    GenerationState,
-    ResultTokens,
-    calculate_pefill_lengths,
-)
+from ..memory import PageManager
+from ..utils import GenerationState, ResultTokens, calculate_pefill_lengths
 from ._functions import (
     continuous_bulk_free_state_slots,
     continuous_bulk_insert,
@@ -176,7 +172,7 @@ class vEngine:
             ("cache/views/[0-9]+/(key|value)/(scale|weight)", kvps),
             ("cache/views/[0-9]+/(key|value)/(packed|absmax)", kvps),
             ("cache/views/[0-9]+/(key|value)", kvps),
-            ("cache/views/[0-9]+/index", bsharding),
+            ("cache/views/[0-9]+/indexs", bsharding),
             ("cache/views/[0-9]+/starts", bsharding),
             (".*", Ps()),
         )
@@ -413,7 +409,7 @@ class vEngine:
         return False  # Placeholder: Implementation needed
 
     @property
-    def colocated_cpus(self) -> list[jax.Device] | None:
+    def colocated_cpus(self) -> list[jax.Device] | None:  # type:ignore
         """Returns CPU devices colocated with the engine's accelerator devices.
 
         This information can be useful for optimizing data transfers between

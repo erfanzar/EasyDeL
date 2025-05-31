@@ -192,7 +192,7 @@ class TransformerCacheMetaData(BaseCacheMetadata):
 class TransformerCacheView(BaseCacheView):
     key: cx.Array | ImplicitArray
     value: cx.Array | ImplicitArray
-    index: cx.Array | ImplicitArray
+    indexs: cx.Array | ImplicitArray
     starts: cx.Array | ImplicitArray
 
     metadata: TransformerCacheMetaData
@@ -252,7 +252,7 @@ class TransformerCacheView(BaseCacheView):
             out = cls(
                 key=quantizer(jnp.zeros(shape=kshape, dtype=dtype, device=kshardings)),
                 value=quantizer(jnp.zeros(shape=vshape, dtype=dtype, device=vshardings)),
-                index=jnp.zeros((metadata.batch_size,), dtype=jnp.int32, device=ishardings),
+                indexs=jnp.zeros((metadata.batch_size,), dtype=jnp.int32, device=ishardings),
                 starts=starts,
                 metadata=metadata,
                 layer_index=layer_index,
@@ -294,7 +294,7 @@ class TransformerCacheView(BaseCacheView):
         runtime_dtype = query.dtype
         num_updated_cache_vectors = query.shape[1]
 
-        index = self.index
+        indexs = self.indexs
         batch_dims, max_length, num_heads, depth_per_head = self.value.shape
 
         if attention_mask.ndim == 2:
@@ -317,7 +317,7 @@ class TransformerCacheView(BaseCacheView):
                     (1, num_updated_cache_vectors, max_length),
                 )
 
-            causal_mask = _mask_slice(causal_mask, self.index)
+            causal_mask = _mask_slice(causal_mask, self.indexs)
             if token_type_ids is not None and num_updated_cache_vectors != 1:
                 token_type_mask = jnp.equal(
                     jnp.expand_dims(token_type_ids, 2),
@@ -345,8 +345,8 @@ class TransformerCacheView(BaseCacheView):
         def _update_kv(old, new, slot):
             return lax.dynamic_update_slice(old, new.astype(old.dtype), (slot, 0, 0))
 
-        value_cache_updated = _update_kv(_maybe_materialize(self.value), value, index)
-        key_cache_updated = _update_kv(_maybe_materialize(self.key), key, index)
+        value_cache_updated = _update_kv(_maybe_materialize(self.value), value, indexs)
+        key_cache_updated = _update_kv(_maybe_materialize(self.key), key, indexs)
 
         value_cache_updated = apply_logical_sharding(
             value_cache_updated,
@@ -361,10 +361,10 @@ class TransformerCacheView(BaseCacheView):
             partition_manager=partition_manager,
         )
 
-        index = index + num_updated_cache_vectors
+        indexs = indexs + num_updated_cache_vectors
 
         pad_mask = jnp.broadcast_to(
-            (jnp.arange(max_length)[None, :] < index[:, None])[:, None, None, :],
+            (jnp.arange(max_length)[None, :] < indexs[:, None])[:, None, None, :],
             (batch_dims, 1, num_updated_cache_vectors, max_length),
         )
 
@@ -380,8 +380,8 @@ class TransformerCacheView(BaseCacheView):
             self.replace(
                 key=quantizer(key_cache_updated),
                 value=quantizer(value_cache_updated),
-                index=apply_logical_sharding(
-                    index,
+                indexs=apply_logical_sharding(
+                    indexs,
                     axes=[BATCH],
                     mode=MODE_PREFILL,
                     partition_manager=partition_manager,
@@ -444,7 +444,7 @@ class TransformerCache(BaseCache):
 
     def to_pure(self):
         return (
-            [[layer.key, layer.value, layer.index, layer.starts] for i, layer in enumerate(self.views)],
+            [[layer.key, layer.value, layer.indexs, layer.starts] for i, layer in enumerate(self.views)],
             self.views[-1].metadata,
         )
 
@@ -455,7 +455,7 @@ class TransformerCache(BaseCache):
                 TransformerCacheView(
                     key=layer[0],
                     value=layer[1],
-                    index=layer[2],
+                    indexs=layer[2],
                     starts=layer[3],
                     metadata=metadata,
                 )
@@ -483,8 +483,8 @@ class TransformerCache(BaseCache):
             view = self.views[idx]
             index = jnp.array(index).reshape(-1)
             self.views[idx] = self.views[idx].replace(
-                index=apply_logical_sharding(
-                    lax.dynamic_update_slice_in_dim(view.index, index, slot, 0),
+                indexs=apply_logical_sharding(
+                    lax.dynamic_update_slice_in_dim(view.indexs, index, slot, 0),
                     axes=[BATCH],
                     mode=MODE_PREFILL,
                     partition_manager=partition_manager,
@@ -536,8 +536,8 @@ class TransformerCache(BaseCache):
                         partition_manager=partition_manager,
                     )
                 ),
-                index=apply_logical_sharding(
-                    lax.dynamic_update_slice_in_dim(view.index, oview.index, slot, 0),
+                indexs=apply_logical_sharding(
+                    lax.dynamic_update_slice_in_dim(view.indexs, oview.indexs, slot, 0),
                     axes=[BATCH],
                     mode=MODE_PREFILL,
                     partition_manager=partition_manager,
@@ -569,4 +569,4 @@ class TransformerMetadata(BaseRunTimeMetadata):
     """
 
     postpadded: bool = False
-    index: int | None = None
+    indexs: int | None = None

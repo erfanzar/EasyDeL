@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 import typing as tp
 from enum import Enum, auto
 from functools import partial
@@ -50,7 +49,32 @@ HEAD_MOE_SHARIND = [common_types.DATA_PARALLEL, common_types.FULLY_SHARDED_DATA_
 
 
 class MoELayer(nn.Module):
-    """A Mixture of Experts (MoE) layer."""
+    """A Mixture of Experts (MoE) layer.
+
+    This layer implements a Mixture of Experts (MoE) layer for use in large-scale models.
+    The MoE layer consists of multiple experts, each of which is a neural network.
+    The input to the MoE layer is routed to a subset of the experts, and the outputs of the selected experts are
+    combined to produce the final output.
+
+    Attributes:
+        config: An instance of `EasyDeLBaseConfig` that holds the configuration parameters for the MoE layer.
+        rngs: A dictionary of PRNG keys for stochastic operations.
+        dtype: The data type used for computation (default: `jnp.bfloat16`).
+        param_dtype: The data type used for storing parameters (default: `jnp.bfloat16`).
+        precision: The precision used for matrix multiplications (default: `lax.Precision.DEFAULT`).
+        num_local_experts: The number of experts available on each device.
+        num_experts_per_tok: The number of experts to which each token is routed.
+        tiling_size: The tiling size used for `pallas_grouped_matmul`.
+        n_routing_groups: The number of routing groups used in `deepseek_routing`.
+        topk_routing_group: The number of top routing groups to select in `deepseek_routing`.
+        use_megablox: A boolean indicating whether to use the `pallas_grouped_matmul` kernel.
+        _collection_name: The name of the collection used to store the experts.
+        _w0_coll_name: The name of the collection used to store the weights for the first linear layer of the experts.
+        _w1_coll_name: The name of the collection used to store the weights for the second linear layer of the experts.
+        _wo_coll_name: The name of the collection used to store the weights for the output linear layer of the experts.
+        _ep: The name of the expert parallel axis.
+        _tp: The name of the tensor parallel axis.
+    """
 
     config: EasyDeLBaseConfig
     rngs: nn.Rngs
@@ -115,6 +139,14 @@ class MoELayer(nn.Module):
         self._available_tp = config.mesh.shape[self._tp]
 
     def _prepare_moe_inputs(self, hidden_states: HiddenState3d) -> FlattenState2d:
+        """Prepares the input hidden states for the MoE layer by applying logical sharding.
+
+        Args:
+            hidden_states: The input hidden states.
+
+        Returns:
+            The flattened and sharded hidden states.
+        """
         partition_manager = self.config.partition_manager
         return apply_logical_sharding(
             hidden_states,
@@ -123,6 +155,12 @@ class MoELayer(nn.Module):
         )
 
     def _collect_weights(self) -> tuple[list[WiType], list[WiType], list[WoType]]:
+        """Collects the weights from the experts.
+
+        Returns:
+            A tuple containing lists of weights for the first linear layer, the second linear layer,
+            and the output linear layer of the experts.
+        """
         _w0_collection = []
         _w1_collection = []
         _wo_collection = []
@@ -136,6 +174,12 @@ class MoELayer(nn.Module):
         return _w0_collection, _w1_collection, _wo_collection
 
     def _collect_stacked_weights(self) -> list[ExpertsWiType, ExpertsWiType, ExpertsWoType]:
+        """Collects the weights from the experts and stacks them into a single array.
+
+        Returns:
+            A list containing the stacked weights for the first linear layer, the second linear layer,
+            and the output linear layer of the experts.
+        """
         _w0_collection, _w1_collection, _wo_collection = self._collect_weights()
         return [
             x
@@ -158,6 +202,21 @@ class MoELayer(nn.Module):
         routed_scaling_factor: float = 1.0,
         score_function: str | None | tp.Literal["sigmoid"] = None,
     ) -> tuple[RouterLogits2d, RouterIndcies2d]:
+        """Selects the top-k experts for each token based on the router logits.
+
+        Args:
+            router_logits: The logits from the router.
+            bias_logits: Optional bias logits.
+            use_softmax: Whether to apply softmax to the weights.
+            random_routing: Whether to use random routing.
+            deepseek_routing: Whether to use deepseek routing.
+            scale_weights: Whether to scale the weights.
+            routed_scaling_factor: The scaling factor for the weights.
+            score_function: The score function to use.
+
+        Returns:
+            A tuple containing the weights and indices of the selected experts.
+        """
         resolver = self.config.partition_manager.resolve
         mode = common_types.MODE_DECODE if router_logits.shape[1] == 1 else common_types.MODE_TRAIN
 
@@ -207,6 +266,15 @@ class MoELayer(nn.Module):
         return weights, indices
 
     def _deepseek_routing(self, router_logits: chex.Array, bias_logits: chex.Array) -> tuple[chex.Array, chex.Array]:
+        """Implements the DeepSeek routing strategy.
+
+        Args:
+            router_logits: The logits from the router.
+            bias_logits: The bias logits.
+
+        Returns:
+            A tuple containing the weights and indices of the selected experts.
+        """
         n = router_logits.shape[0]
         expt = self.num_experts_per_tok
         num_experts = self.num_local_experts

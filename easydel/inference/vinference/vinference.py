@@ -1235,17 +1235,21 @@ class vInference:
 
         Args:
                 prompt: The input prompt. Can be a single string, a list of strings (processed sequentially),
-                                or a list of dictionaries representing OpenAI-style chat messages (processed as a single batch).
+                                or a list of dictionaries representing OpenAI-style chat messages
+                                (processed as a single batch).
                 sampling_params: Configuration for the generation process (temperature, top_p, etc.).
                                                  Can be a SamplingParams object or a dictionary.
                 stream: If True, yields generated tokens incrementally. If False, returns the
                                 complete generation(s) at the end.
 
         Returns:
-                - If input is `str` or `List[Dict]` and `stream=False`: A `PromptOutput` object containing the full text and metrics.
-                - If input is `str` or `List[Dict]` and `stream=True`: A generator yielding string chunks. The generator's return value (accessible via try/except StopIteration) is the final `SampleState`.
+                - If input is `str` or `List[Dict]` and `stream=False`: A `PromptOutput`
+                    object containing the full text and metrics.
+                - If input is `str` or `List[Dict]` and `stream=True`: A generator yielding string chunks.
+                    The generator's return value (accessible via try/except StopIteration) is the final `SampleState`.
                 - If input is `List[str]` and `stream=False`: A list of `PromptOutput` objects.
-                - If input is `List[str]` and `stream=True`: A list where each element is a generator as described above for the single stream case.
+                - If input is `List[str]` and `stream=True`: A list where each element is a generator as described above
+                    for the single stream case.
 
         Raises:
                 TypeError: If the prompt format is invalid or processor does not support chat templates.
@@ -1365,13 +1369,13 @@ class vInference:
         Args:
                 prompts: A list of prompts (strings or OpenAI-style message lists).
                 max_concurrent_requests: The maximum number of prompts to process in parallel.
-                                                                 If <= 0, processing will be sequential (but still async).
+                                         If <= 0, processing will be sequential (but still async).
                 sampling_params: Optional sampling parameters to override the default ones
-                                                 for this batch of requests. Passed to process_prompt.
+                                for this batch of requests. Passed to process_prompt.
                 stream: If True, returns an async generator yielding tuples of (index, type, data).
-                                If False, returns a list of PromptOutput objects.
+                        If False, returns a list of PromptOutput objects.
                 progress_callback: An optional function called after each prompt *finishes* processing.
-                                                   Receives (completed_count, total_count).
+                                   Receives (completed_count, total_count).
 
         Returns:
                 - If stream=False: A list of `PromptOutput` objects containing the full text, metrics,
@@ -1379,7 +1383,8 @@ class vInference:
                 - If stream=True: An async generator yielding tuples `(index, type, data)` where:
                                                         - `type` is 'text' and `data` is the string chunk.
                                                         - `type` is 'error' and `data` is the error string.
-                                                        - `type` is 'final' and `data` is the final `PromptOutput` object with metrics.
+                                                        - `type` is 'final' and `data` is the final `PromptOutput`
+                                                            object with metrics.
                                                   The generator finishes when all prompts are processed.
 
         Raises:
