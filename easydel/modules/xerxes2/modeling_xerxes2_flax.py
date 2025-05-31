@@ -679,7 +679,7 @@ class Xerxes2ForCausalLM(EasyDeLBaseModule):
     ):
         shardings = shardings or dict()
         return TransformerCache.init_cache(
-            dtype=self.dtype,
+            dtype=self.config.kvdtype,
             partition_manager=self.config.partition_manager,
             metadata=self.create_cache_metadata(
                 batch_size=batch_size,

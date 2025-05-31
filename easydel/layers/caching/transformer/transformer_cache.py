@@ -291,7 +291,7 @@ class TransformerCacheView(BaseCacheView):
                 - Updated value cache tensor (functional update).
                 - Final attention mask to be used (either original or calculated).
         """
-
+        runtime_dtype = query.dtype
         num_updated_cache_vectors = query.shape[1]
 
         index = self.index
@@ -369,8 +369,8 @@ class TransformerCacheView(BaseCacheView):
         )
 
         return (
-            key_cache_updated,
-            value_cache_updated,
+            key_cache_updated.astype(runtime_dtype),
+            value_cache_updated.astype(runtime_dtype),
             apply_logical_sharding(
                 jnp.logical_and(pad_mask, attention_mask),
                 axes=[BATCH, KV_LENGTH, KV_HEAD, KV_HEAD_DIM],
